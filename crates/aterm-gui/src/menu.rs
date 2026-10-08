@@ -229,10 +229,11 @@ pub(crate) enum MenuAction {
     /// — tag 34 — is folded into this one.)
     SoftwareUpdate,
     /// Version — the dedicated top-level menu-bar menu whose title shows `v<version>`
-    /// (glanceable build/version identity; a trailing ⬆️ while an update is staged or
-    /// freshly realized — see [`update_version_menu`]). Choosing its About item opens the
-    /// native About route, which carries the full build & versioning
+    /// (glanceable build/version identity; a trailing ⬆️ while an update is staged —
+    /// see [`update_version_menu`] and [`staged_for_version_menu`]). Choosing its About item
+    /// opens the native About route, which carries the full build & versioning
     /// details. Replaces the old floating top-right badge as the primary version surface.
+    /// Off macOS, Windows' tab-strip version label fires it too ([`version_slot_click`]).
     Version,
     /// ONE-CLICK UPDATE (`App::apply_update_or_details`): the Version menu's
     /// "⬆️ Install aterm v<staged> now" item / the palette's
@@ -240,8 +241,10 @@ pub(crate) enum MenuAction {
     /// "Update ready" notice pill / the off-macOS tab-strip ↻ all fire this. A
     /// strictly-newer STAGED build applies immediately (the same re-exec path
     /// `Wake::ApplyStagedUpdate` takes — no intermediate route change, per the owner's
-    /// "click-upgrade" ask); with nothing actually staged it falls back to the Software
-    /// Update route (honest details, never a silent dead click or a blind restart).
+    /// "click-upgrade" ask), unless it is on hold (`latched_activation_trial_spent`),
+    /// which opens the Software Update route like an empty stage; with nothing actually
+    /// staged it falls back to that route (honest details, never a silent dead click
+    /// or a blind restart).
     ApplyUpdate,
     /// Open aterm.toml — open the canonical config in Settings ▸ Manual's native,
     /// assisted editor. This is cross-platform and shares the exact document/save host.
@@ -408,11 +411,6 @@ pub(crate) enum MenuAction {
     // Fabric menu (round 19, SPEC19 §9): the menu bar's face of the fabric —
     // what `aterm fabric`, the inbox, the halt and the ledger already do on
     // the wire, reachable by a human from the bar.
-    /// Fleet — the Fabric menu's route to the Connection Map
-    /// (`App::open_connection_map`), and the item's help says so. A separate
-    /// fleet screen was retired 2026-09-25 (docs/FABRIC-LITERALLY-2026-09-19.md
-    /// §8 never committed to one). Instance-wide, never greyed.
-    Fleet,
     /// Inbox — THIS window's focused session's inbox, METADATA ONLY (the
     /// `inbox --peek --meta` rows: id, offset, sender, kind, trust — never a
     /// body), opened as a Markdown tab. Terminal-only: a native tab has no
@@ -557,8 +555,8 @@ impl MenuAction {
             MenuAction::DisconnectSession => 56,
             MenuAction::NextKitty => 57,
             // Round 19 (SPEC19 §9): the Fabric menu, Set Role…, the presence
-            // toggles. Dense from 58; the retired tags above stay retired.
-            MenuAction::Fleet => 58,
+            // toggles. Dense from 59; the retired tags above stay retired.
+            // 58 is retired (was Fleet).
             MenuAction::Inbox => 59,
             MenuAction::LedgerForSession => 60,
             MenuAction::HoldSession => 61,
@@ -640,7 +638,7 @@ impl MenuAction {
             55 => MenuAction::ConfigureConnection,
             56 => MenuAction::DisconnectSession,
             57 => MenuAction::NextKitty,
-            58 => MenuAction::Fleet,
+            // 58 retired (was Fleet) — see `tag`.
             59 => MenuAction::Inbox,
             60 => MenuAction::LedgerForSession,
             61 => MenuAction::HoldSession,
@@ -675,14 +673,16 @@ impl MenuAction {
 /// * `OpenLedger` — the `[keybindings]` action name of the ledger key, for a
 ///   script that reaches the Fabric menu's "Ledger for This Session" row by
 ///   the name it already knows ([`MenuAction::LedgerForSession`]).
-/// * `ShowFleet` / `ShowInbox` — the `Show…` spelling every earlier map row
-///   used, for the Fabric menu's Fleet and Inbox rows.
+/// * `Fleet` / `ShowFleet` — the Fabric menu's retired Fleet row, which opened
+///   the Connection Map ([`MenuAction::ShowConnectionMap`]).
+/// * `ShowInbox` — the `Show…` spelling every earlier map row used, for the
+///   Fabric menu's Inbox row.
 #[must_use]
 pub(crate) fn canonical_invoke_name(name: &str) -> &str {
     match name {
         "FavouriteSessionKitty" => "FavouriteKitty",
         "OpenLedger" => "LedgerForSession",
-        "ShowFleet" => "Fleet",
+        "Fleet" | "ShowFleet" => "ShowConnectionMap",
         "ShowInbox" => "Inbox",
         other => other,
     }
@@ -722,7 +722,7 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::DisconnectSession
             // The Fabric menu's SESSION rows (round 19): the inbox, the
             // ledger and the halt are the focused session's; the role is its
-            // metadata, like the pin. Fleet, the map and the three fabric
+            // metadata, like the pin. The map and the three fabric
             // commands are instance-wide and deliberately not listed.
             | MenuAction::Inbox
             | MenuAction::LedgerForSession
@@ -842,8 +842,9 @@ pub(crate) fn native_item_tip(action: MenuAction) -> String {
 
 /// The two View ▸ Presence checkables' LIVE state (`[presence] band` / `rim`,
 /// as the App currently applies them), so `validateMenuItem:` can stamp the
-/// checkmark synchronously when the menu opens. Published by
-/// `App::publish_presence_toggles` on load, reload and every toggle.
+/// checkmark synchronously when the menu opens. Published through
+/// [`set_presence_toggles`] by `App::adopt_presence_config` (load, reload),
+/// `App::set_presence_bit` (every toggle) and `App::sync_active_session`.
 static PRESENCE_BAND_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static PRESENCE_RIM_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
@@ -888,7 +889,7 @@ pub(crate) struct MenuLive {
     pub multi_tab: bool,
     /// A closed tab can be reopened (Reopen Closed Tab).
     pub can_reopen_closed_tab: bool,
-    /// A closed split view can be reinserted (Reopen Closed View).
+    /// A closed pane can be reopened (Reopen Closed Pane).
     pub can_reopen_closed_view: bool,
     /// Serious mode is on (its checkmark).
     pub serious_mode: bool,
@@ -1200,8 +1201,7 @@ impl MenuAction {
             | MenuAction::ShowConnectionMap
             | MenuAction::ConfigureConnection
             | MenuAction::DisconnectSession => OwnerOnly,
-            // The Fabric menu (round 19). Fleet is the map's twin (the
-            // aggregated view). Inbox puts a session's mail METADATA on the
+            // The Fabric menu (round 19). Inbox puts a session's mail METADATA on the
             // human's screen — a disclosure of the same class as the map. The
             // ledger runs a child on THIS instance's own socket and raises the
             // browser. Hold/Lift are the `hold` verb, which is Owner-class on
@@ -1210,8 +1210,7 @@ impl MenuAction {
             // `on`/`off` rewrite the machine's fabric (the round-13 verb is
             // Owner-only by its own doc), and `status` discloses the whole
             // fabric. No fine op expresses any of these.
-            MenuAction::Fleet
-            | MenuAction::Inbox
+            MenuAction::Inbox
             | MenuAction::LedgerForSession
             | MenuAction::HoldSession
             | MenuAction::LiftHold
@@ -1336,7 +1335,6 @@ impl MenuAction {
             | MenuAction::ShowConnectionMap
             | MenuAction::ConfigureConnection
             | MenuAction::DisconnectSession
-            | MenuAction::Fleet
             | MenuAction::Inbox
             | MenuAction::LedgerForSession
             | MenuAction::HoldSession
@@ -1373,7 +1371,8 @@ impl MenuAction {
             MenuAction::SoftwareUpdate => "Open Software Update and check for a newer build now.",
             MenuAction::Version => "Open About aterm from the version badge.",
             MenuAction::ApplyUpdate => {
-                "Apply the staged update in place; every shell keeps running."
+                "Install the staged update now; with none staged, or one on hold, open Software \
+                 Update."
             }
             MenuAction::Preferences => "Open aterm.toml in the assisted config editor.",
             MenuAction::Quit => "Quit aterm.",
@@ -1382,7 +1381,10 @@ impl MenuAction {
             MenuAction::OpenMarkdown => "Choose a local file and open it as read-only Markdown.",
             MenuAction::OpenEditor => "Choose a local file and open it in the editor.",
             MenuAction::ReopenClosedTab => "Reopen the tab closed most recently.",
-            MenuAction::ReopenClosedView => "Reinsert the split view closed most recently.",
+            MenuAction::ReopenClosedView => {
+                "Reopen the pane closed most recently where it was, or in a new tab if that \
+                 spot is gone."
+            }
             MenuAction::MoveTabToNewWindow => "Move this tab into a window of its own.",
             MenuAction::MoveTabToNextWindow => "Move this tab into the next window.",
             MenuAction::ViewSessionInNewWindow => {
@@ -1428,12 +1430,11 @@ impl MenuAction {
             MenuAction::ConnectToSession => {
                 "Choose a session to connect this one to, then confirm the direction."
             }
-            MenuAction::ShowConnectionMap => "Show every session connection in this aterm.",
+            MenuAction::ShowConnectionMap => {
+                "Show every session in this aterm and its connections."
+            }
             MenuAction::ConfigureConnection => "Change the direction of this session's connection.",
             MenuAction::DisconnectSession => "Dissolve this session's connection.",
-            MenuAction::Fleet => {
-                "Open the Connection Map: every session in this aterm and its connections."
-            }
             MenuAction::Inbox => {
                 "Open this session's inbox as a tab: who wrote, what kind, how trusted; \
                  never the text of a message."
@@ -1558,7 +1559,6 @@ impl MenuAction {
             "ShowConnectionMap" => Some(MenuAction::ShowConnectionMap),
             "ConfigureConnection" => Some(MenuAction::ConfigureConnection),
             "DisconnectSession" => Some(MenuAction::DisconnectSession),
-            "Fleet" => Some(MenuAction::Fleet),
             "Inbox" => Some(MenuAction::Inbox),
             "LedgerForSession" => Some(MenuAction::LedgerForSession),
             "HoldSession" => Some(MenuAction::HoldSession),
@@ -1777,7 +1777,7 @@ const FILE_MENU: &[MenuEntry] = &[
         mods: MenuMods::CommandShift,
     },
     Item {
-        label: "Reopen Closed View",
+        label: "Reopen Closed Pane",
         action: MenuAction::ReopenClosedView,
         key: "",
         mods: MenuMods::None,
@@ -1840,17 +1840,10 @@ const DRIVING_MENU: &[MenuEntry] = &[
 ];
 
 /// The FABRIC menu (round 19, SPEC19 §9) — the bar's face of the fabric,
-/// replacing the palette-only "Connections" section: the fleet, this
-/// session's inbox and ledger, the halt pair, the four connection rows
+/// replacing the palette-only "Connections" section: this session's inbox and ledger, the halt pair, the four connection rows
 /// (unchanged), and the three `aterm fabric` commands. Placed between View
 /// and Window, where an application's own menus go on macOS.
 const FABRIC_MENU: &[MenuEntry] = &[
-    Item {
-        label: "Fleet",
-        action: MenuAction::Fleet,
-        key: "",
-        mods: MenuMods::None,
-    },
     Item {
         label: "Inbox",
         action: MenuAction::Inbox,
@@ -2124,7 +2117,7 @@ const HELP_MENU: &[MenuEntry] = &[Item {
 
 /// The dedicated top-level Version menu. Its live macOS title is the runtime
 /// `v<version>` string (see [`version_menu_bar_title`] — with a trailing ⬆️ while an
-/// update is staged/realized); the model uses the stable "Version" placeholder (the
+/// update is staged); the model uses the stable "Version" placeholder (the
 /// model is only serialised off-macOS + in tests, where a runtime version string would
 /// be non-deterministic). Two items: the ONE-CLICK update apply first (the PRIMARY
 /// update affordance — the palette rewrites its label with the live staged/realized
@@ -2151,43 +2144,148 @@ const VERSION_MENU: &[MenuEntry] = &[
 /// `attention` holds. The live caller ([`update_version_menu`]) sets `attention` for a
 /// STAGED update ONLY — the always-visible bar badge means "an update is waiting, act
 /// on it", so an apply that re-execs into that build clears it at once. The post-update
-/// REALIZED celebration is NOT a bar badge; it lives in the menu's "Updated to aterm v… just
-/// now" row and its palette twin (self-dismissing after
+/// REALIZED celebration is NOT a bar badge; it lives in the menu's "Updated to aterm v…"
+/// row and its palette twin (self-dismissing after
 /// [`crate::relaunch_notice::REALIZED_ARROW_TTL`]). The color emoji is safe HERE:
 /// AppKit renders NSMenu titles/items with the system font + Apple Color Emoji
-/// fallback. In-window overlay surfaces (the palette rows) must use plain `↑`
-/// instead — the own-rendered text stack has no color-emoji face (verified coverage).
+/// fallback. In-window overlay surfaces (the palette rows, Windows' tab-strip
+/// version label) must use plain `↑` instead — the own-rendered text stack has no
+/// color-emoji face (verified coverage).
+///
+/// The text between the glyphs is [`version_signature`]'s FULL rung, the same
+/// string Windows' tab strip shows ([`strip_version_label`]): one signature, two
+/// surfaces, and the bar alone adds the colour glyphs AppKit can draw.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn version_menu_bar_title(attention: bool) -> String {
-    let base = if crate::build_info::IS_RELEASE_BUILD {
-        format!("v{}", crate::build_info::version_display())
+    let facts = VersionFacts::this_build();
+    // A dev build leads with the wrench (owner, 2026-08-16); a release does not.
+    let wrench = if facts.release {
+        ""
     } else {
-        // THE DEV SIGNATURE (owner, 2026-08-16: "some kind of marker in the
-        // menu bar where the version numbers are so that I know what is a
-        // development build … using the 3rd developer number and the hash").
-        // A release's third slot is always literal 0, so the DEV COUNTER in
-        // that slot (commits since the newest release tag) is an unambiguous
-        // non-release signature; the short hash pins WHICH dev build, and the
-        // trailing marker makes it readable at a glance without parsing
-        // numbers. A dirty tree keeps its `*`. The display version is
-        // display-only by contract, so none of this can reach an update
-        // comparison.
-        let v = crate::build_info::version_display();
-        let majmin = v.rsplit_once('.').map_or(v, |(mm, _)| mm);
-        let commit = crate::build_info::GIT_COMMIT;
-        let dirty = if commit.ends_with("-dirty") { "*" } else { "" };
-        let short: String = commit.chars().take(7).collect();
-        format!(
-            "\u{1F6E0}\u{FE0F} v{}.{}+g{short}{dirty} \u{00B7} DEV",
-            majmin,
-            crate::build_info::DEV_COMMITS,
-        )
+        "\u{1F6E0}\u{FE0F} "
     };
-    if attention {
-        format!("{base} \u{2B06}\u{FE0F}")
+    let signature = version_signature(facts, VersionRung::Full).unwrap_or_default();
+    let arrow = if attention { " \u{2B06}\u{FE0F}" } else { "" };
+    format!("{wrench}{signature}{arrow}")
+}
+
+/// How much of the version signature a surface has room for
+/// ([`version_signature`]). The macOS menu bar always shows [`Self::Full`];
+/// Windows' tab strip steps down to [`Self::Short`] before it hides the label
+/// (`tab_bar::layout_segments_with_version`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub(crate) enum VersionRung {
+    /// `v<version>` on a release; `v<maj.min>.<dev commits>+g<hash>[*] · DEV` on a
+    /// dev build.
+    Full,
+    /// A dev build without its hash: `v<maj.min>.<dev commits>[*] · DEV`. A release
+    /// has no short rung — `v<version>` is already as short as it is honest.
+    Short,
+}
+
+/// The compile-time facts a version signature is composed from — every one of them
+/// stamped by `build.rs` and read from [`crate::build_info`], never recalled.
+/// Separate from the constants so a test can compose every kind of build (release,
+/// dev, dirty, no git) from one test binary, which is always a clean or dirty dev
+/// build itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct VersionFacts<'a> {
+    /// A release lane produced the binary ([`crate::build_info::IS_RELEASE_BUILD`]).
+    pub(crate) release: bool,
+    /// The display version, `MAJOR.MINOR.0` ([`crate::build_info::version_display`]).
+    pub(crate) version: &'a str,
+    /// Commits since the newest release tag ([`crate::build_info::dev_commits`]).
+    pub(crate) dev_commits: &'a str,
+    /// The short commit, `-dirty` suffixed for a dirty tree
+    /// ([`crate::build_info::git_commit`]).
+    pub(crate) commit: &'a str,
+}
+
+impl VersionFacts<'static> {
+    /// The running binary's own facts.
+    #[must_use]
+    pub(crate) fn this_build() -> Self {
+        Self {
+            release: crate::build_info::IS_RELEASE_BUILD,
+            version: crate::build_info::version_display(),
+            dev_commits: crate::build_info::dev_commits(),
+            commit: crate::build_info::git_commit(),
+        }
+    }
+}
+
+/// THE VERSION SIGNATURE, without any glyph a surface adds around it: `v0.101.0` on
+/// a release, `v0.101.1576+g25a5963 · DEV` on a dev build (`*` after the hash for a
+/// dirty tree), and on the [`VersionRung::Short`] rung the dev form without its hash
+/// (`v0.101.1576 · DEV`). `None` only for a release's short rung, which has none.
+///
+/// THE DEV SIGNATURE (owner, 2026-08-16: "some kind of marker in the menu bar where
+/// the version numbers are so that I know what is a development build … using the
+/// 3rd developer number and the hash"). A release's third slot is always literal 0,
+/// so the DEV COUNTER in that slot (commits since the newest release tag) is an
+/// unambiguous non-release signature; the short hash pins WHICH dev build, and the
+/// trailing marker makes it readable at a glance without parsing numbers. A dirty
+/// tree keeps its `*` on both rungs. The display version is display-only by
+/// contract, so none of this can reach an update comparison.
+///
+/// The middle dot is U+00B7 with one space either side — a BMP character both the
+/// AppKit menu bar and the own-rendered UI face cover.
+#[must_use]
+pub(crate) fn version_signature(facts: VersionFacts<'_>, rung: VersionRung) -> Option<String> {
+    if facts.release {
+        return match rung {
+            VersionRung::Full => Some(format!("v{}", facts.version)),
+            VersionRung::Short => None,
+        };
+    }
+    let majmin = facts
+        .version
+        .rsplit_once('.')
+        .map_or(facts.version, |(mm, _)| mm);
+    let star = if facts.commit.ends_with("-dirty") {
+        "*"
     } else {
-        base
+        ""
+    };
+    let counter = facts.dev_commits;
+    Some(match rung {
+        VersionRung::Full => {
+            let short: String = facts.commit.chars().take(7).collect();
+            format!("v{majmin}.{counter}+g{short}{star} \u{00B7} DEV")
+        }
+        VersionRung::Short => format!("v{majmin}.{counter}{star} \u{00B7} DEV"),
+    })
+}
+
+/// The text of Windows' tab-strip VERSION LABEL (`tab_bar::TabHit::Version`): this
+/// build's [`version_signature`] at `rung`, plus ` ↑` (a space and U+2191) while
+/// `attention` holds — the macOS bar title's text without its colour glyphs, because
+/// the own-rendered strip has no colour-emoji face. `attention` is the bar's own
+/// staged-only rule ([`staged_for_version_menu`]), so a realized update never lights
+/// it. `None` for a release's short rung.
+#[must_use]
+pub(crate) fn strip_version_label(rung: VersionRung, attention: bool) -> Option<String> {
+    let signature = version_signature(VersionFacts::this_build(), rung)?;
+    Some(if attention {
+        format!("{signature} \u{2191}")
+    } else {
+        signature
+    })
+}
+
+/// What a click on the tab-strip version label fires: the Software Update details
+/// while an update is staged AND this platform has an updater to show
+/// ([`MenuAction::offered_on_this_platform`]), otherwise [`MenuAction::Version`] —
+/// Settings ▸ About, the macOS Version menu's About row. Never an install: the
+/// label names the build, and the strip's leading `↻` stays the one-click apply.
+/// On Windows, which has no updater, this is always `Version`.
+#[must_use]
+pub(crate) fn version_slot_click(attention: bool) -> MenuAction {
+    if attention && MenuAction::SoftwareUpdate.offered_on_this_platform() {
+        MenuAction::SoftwareUpdate
+    } else {
+        MenuAction::Version
     }
 }
 
@@ -2228,21 +2326,31 @@ pub(crate) fn version_menu_bar_title(attention: bool) -> String {
 /// label. The tail still ends on what the row DOES, so a manual-only latch says
 /// "try again now" and a scheduled retry says it will, instead of demanding an
 /// action that is already on its way.
+///
+/// `on_hold` is the build ON HOLD (`App::latched_activation_trial_spent`: its
+/// next start is the one its boot trial rolls back) — the same fact the click
+/// refuses on, whether or not the ledger still names the failures. Such a build
+/// is not offered at all: the row reads as the band's record does, "aterm vX is
+/// on hold", with the trouble's tail when there is one and otherwise that a
+/// newer release replaces it, and a press opens the details
+/// (`App::apply_update_or_details`), never that start.
 #[must_use]
 pub(crate) fn staged_apply_label(
     arrow: &str,
     build: u64,
     version: &str,
     trouble: Option<&ApplyTrouble>,
+    on_hold: bool,
 ) -> String {
-    let what = if version == crate::build_info::version_display() {
-        format!("build {build}")
-    } else {
-        format!("aterm v{version}")
-    };
-    match trouble {
-        None => format!("{arrow} Install {what} now"),
-        Some(trouble) => format!("{arrow} Install {what} — {}", trouble.row_tail()),
+    let what = crate::update_words::staged_build_name(build, version);
+    match (on_hold, trouble) {
+        (true, Some(trouble)) => format!("{arrow} {what} is on hold — {}", trouble.row_tail()),
+        (true, None) => format!(
+            "{arrow} {what} is on hold — {}",
+            crate::update_words::NEWER_RELEASE_REPLACES
+        ),
+        (false, None) => format!("{arrow} Install {what} now"),
+        (false, Some(trouble)) => format!("{arrow} Install {what} — {}", trouble.row_tail()),
     }
 }
 
@@ -2261,11 +2369,12 @@ pub(crate) fn realized_row_label(arrow: &str, version: &str) -> String {
 /// "Updated to aterm v…" row and its palette twin), so an apply
 /// that re-execs into the staged build (`staged` → `None`) clears the persistent bar
 /// badge the instant it lands, instead of leaving an arrow up for the full realized
-/// TTL that reads as "the update never resolved".
+/// TTL that reads as "the update never resolved". A staged build ON HOLD gets no
+/// arrow: no press may start it, and only a newer release moves it.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn bar_title_attention(staged_present: bool, _realized: bool) -> bool {
-    staged_present
+pub(crate) fn bar_title_attention(staged_present: bool, on_hold: bool, _realized: bool) -> bool {
+    staged_present && !on_hold
 }
 
 /// The staged update the Version menu may offer, given the RUNNING build: only one
@@ -2516,12 +2625,14 @@ pub(crate) fn install(
 pub fn show_handoff_target_version(_handle: &MenuHandle, _title: &str) {}
 
 /// Non-macOS stub: no native menu bar, so there is no Version menu to retitle/rebuild.
-/// The palette's Version-section rows are the cross-platform mirror of this state.
+/// The palette's Version-section rows are the cross-platform mirror of this state,
+/// and, on Windows, the tab strip's trailing version label ([`strip_version_label`]).
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn update_version_menu(
     _handle: &MenuHandle,
     _staged: Option<(u64, &str)>,
     _trouble: Option<&ApplyTrouble>,
+    _on_hold: bool,
     _realized: bool,
 ) {
 }
@@ -2643,6 +2754,26 @@ pub(crate) enum PrivacyPane {
     /// The per-app Files & Folders list — §3.7's repair route, where a folder
     /// row that was already answered can be turned back on.
     FilesAndFolders,
+    /// The Developer Tools list (`kTCCServiceDeveloperTool`,
+    /// `docs/DESIGN-macos-debugger-access-2026-09-29.md` §9.1): in Apple's
+    /// words, apps allowed to "run software locally that does not meet the
+    /// system's security policy"; whether a listed app's new programs skip the
+    /// first-run check is spike D14. A human adds an app there
+    /// with `+`; aterm only opens the page. `Privacy_DevTools` is a registered
+    /// anchor (the extension's `searchTerms`, TCC design Appendix A.2). On
+    /// macOS 26 the same page also holds the Processor Trace switch, a
+    /// different setting.
+    DeveloperTools,
+}
+
+impl PrivacyPane {
+    /// Every pane, for the tests that hold each to the same rules.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [
+        Self::FullDiskAccess,
+        Self::FilesAndFolders,
+        Self::DeveloperTools,
+    ];
 }
 
 /// Full Disk Access, through the modern Settings extension.
@@ -2671,6 +2802,16 @@ pub(crate) const SETTINGS_FILES_AND_FOLDERS: &str = "x-apple.systempreferences:c
 #[cfg(any(target_os = "macos", test))]
 const SETTINGS_FILES_AND_FOLDERS_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
+
+/// The Developer Tools list, through the modern Settings extension.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const SETTINGS_DEVELOPER_TOOLS: &str =
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools";
+
+/// The Developer Tools list, through the legacy pane id.
+#[cfg(any(target_os = "macos", test))]
+const SETTINGS_DEVELOPER_TOOLS_LEGACY: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools";
 
 /// The Privacy & Security page with NO anchor — the degradation target. It
 /// carries no `?`, which is the invariant
@@ -2701,6 +2842,11 @@ pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3
             SETTINGS_FILES_AND_FOLDERS_LEGACY,
             SETTINGS_PRIVACY_ROOT,
         ],
+        PrivacyPane::DeveloperTools => [
+            SETTINGS_DEVELOPER_TOOLS,
+            SETTINGS_DEVELOPER_TOOLS_LEGACY,
+            SETTINGS_PRIVACY_ROOT,
+        ],
     }
 }
 
@@ -2719,6 +2865,9 @@ pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static s
         }
         PrivacyPane::FilesAndFolders => {
             "System Settings \u{25b8} Privacy & Security \u{25b8} Files & Folders"
+        }
+        PrivacyPane::DeveloperTools => {
+            "System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools"
         }
     }
 }
@@ -3000,7 +3149,7 @@ mod macos {
         let version_item = attach_submenu(
             &main,
             &super::version_menu_bar_title(false),
-            build_version_menu(&target, None, None, false)?,
+            build_version_menu(&target, None, None, false, false)?,
         )?;
 
         // SAFETY: `+sharedApplication` is `-(id)` and is the main-thread AppKit
@@ -3039,14 +3188,19 @@ mod macos {
         handle: &MenuHandle,
         staged: Option<(u64, &str)>,
         trouble: Option<&super::ApplyTrouble>,
+        on_hold: bool,
         realized: bool,
     ) {
         let Some(_main_thread) = MainThread::new() else {
             return;
         };
-        let title =
-            super::version_menu_bar_title(super::bar_title_attention(staged.is_some(), realized));
-        let Some(submenu) = build_version_menu(&handle.target, staged, trouble, realized) else {
+        let title = super::version_menu_bar_title(super::bar_title_attention(
+            staged.is_some(),
+            on_hold,
+            realized,
+        ));
+        let Some(submenu) = build_version_menu(&handle.target, staged, trouble, on_hold, realized)
+        else {
             return;
         };
         set_version_menu(&_main_thread, handle, &title, &submenu);
@@ -3063,7 +3217,7 @@ mod macos {
         let Some(_main_thread) = MainThread::new() else {
             return;
         };
-        let Some(submenu) = build_version_menu(&handle.target, None, None, false) else {
+        let Some(submenu) = build_version_menu(&handle.target, None, None, false, false) else {
             return;
         };
         set_version_menu(&_main_thread, handle, title, &submenu);
@@ -3099,7 +3253,9 @@ mod macos {
     ///   * STAGED: "⬆️ Install aterm v<staged> now" (ONE click installs in place — the
     ///     owner's "click-upgrade" ask), then About, then
     ///     "Update details…" (the
-    ///     Software Update route stays reachable as the DETAILS surface).
+    ///     Software Update route stays reachable as the DETAILS surface). A build
+    ///     on hold reads "⬆️ aterm v<staged> is on hold — …" and its click opens
+    ///     those details ([`super::staged_apply_label`]).
     ///   * REALIZED (fresh post-update, no new stage): "⬆️ Updated to aterm v<current>"
     ///     (fires About — the celebration row is informative, not destructive),
     ///     then About.
@@ -3108,6 +3264,7 @@ mod macos {
         target: &MenuTarget,
         staged: Option<(u64, &str)>,
         trouble: Option<&super::ApplyTrouble>,
+        on_hold: bool,
         realized: bool,
     ) -> Option<Obj> {
         let menu = new_menu()?;
@@ -3115,7 +3272,7 @@ mod macos {
             add_item(
                 &menu,
                 target,
-                &super::staged_apply_label("\u{2B06}\u{FE0F}", build, version, trouble),
+                &super::staged_apply_label("\u{2B06}\u{FE0F}", build, version, trouble, on_hold),
                 MenuAction::ApplyUpdate,
                 "",
                 false,
@@ -3909,7 +4066,7 @@ mod tests {
         let badge = version_menu_bar_title(true);
 
         // The colliding case: staged build carries the SAME version string.
-        let same = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, running, None);
+        let same = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, running, None, false);
         assert!(
             same.contains("build 1785910394"),
             "a same-version staged build must be identified by its build number: {same}"
@@ -3921,7 +4078,7 @@ mod tests {
         );
 
         // The ordinary case is untouched: a genuinely different version is named.
-        let newer = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, "9.9.9", None);
+        let newer = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, "9.9.9", None, false);
         assert!(
             newer.contains("v9.9.9") && !newer.contains("build"),
             "a differing version is still named directly: {newer}"
@@ -3955,7 +4112,7 @@ mod tests {
     fn the_apply_row_admits_when_applying_has_already_been_tried() {
         use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
 
-        let clean = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", None);
+        let clean = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", None, false);
         assert_eq!(clean, "\u{2191} Install aterm v9.9.9 now");
 
         let trouble = ApplyTrouble::new(
@@ -3964,7 +4121,8 @@ mod tests {
             ApplyRetry::Scheduled,
         )
         .expect("two failed applies");
-        let troubled = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&trouble));
+        let troubled =
+            staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&trouble), false);
         assert!(
             troubled.contains("v9.9.9"),
             "the offer still names what it is offering: {troubled}"
@@ -3990,10 +4148,26 @@ mod tests {
         // The latched lane keeps the call to action, because there it is true.
         let latched = ApplyTrouble::new(2, "handoff proof ended ChildDied", ApplyRetry::ManualOnly)
             .expect("two failed applies");
-        let latched = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&latched));
+        let latched = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&latched), false);
         assert!(
-            latched.ends_with("try again now"),
+            latched.ends_with("try again now") && latched.contains("Install"),
             "a lane that has stopped names the action that resumes it: {latched}"
+        );
+        // A build on hold is offered no start: its next one is the launch its
+        // boot trial rolls back. The row reads as the band's record does.
+        let held = ApplyTrouble::new(2, "handoff proof ended ChildDied", ApplyRetry::NewerRelease)
+            .expect("two failed applies");
+        let held = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&held), true);
+        assert_eq!(
+            held,
+            "\u{2191} aterm v9.9.9 is on hold \u{2014} tried twice, didn\u{2019}t start; a newer \
+             release replaces it by itself"
+        );
+        // …and so is one whose failures the ledger no longer names: the hold is
+        // the fact the click refuses on, not the record.
+        assert_eq!(
+            staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", None, true),
+            "\u{2191} aterm v9.9.9 is on hold \u{2014} a newer release replaces it by itself"
         );
         // …and none of them asks for a restart: the apply is in place.
         assert!(
@@ -4055,7 +4229,6 @@ mod tests {
         MenuAction::ApplyUpdate,
         // Round 19: the Fabric menu (the four connection ids became BAR rows
         // there), Set Role…, and the two presence checkables.
-        MenuAction::Fleet,
         MenuAction::Inbox,
         MenuAction::LedgerForSession,
         MenuAction::HoldSession,
@@ -4224,7 +4397,11 @@ mod tests {
         );
         assert_eq!(
             MenuAction::from_invoke_name("ShowFleet"),
-            Some(MenuAction::Fleet)
+            Some(MenuAction::ShowConnectionMap)
+        );
+        assert_eq!(
+            MenuAction::from_invoke_name("Fleet"),
+            Some(MenuAction::ShowConnectionMap)
         );
         assert_eq!(
             MenuAction::from_invoke_name("ShowInbox"),
@@ -4233,7 +4410,7 @@ mod tests {
     }
 
     /// THE FABRIC MENU (SPEC19 §9): its rows, in order, are the tree the owner
-    /// asked for — Fleet, Inbox, the ledger with its accelerator, the halt
+    /// asked for — Inbox, the ledger with its accelerator, the halt
     /// pair, the four connection rows unchanged, then the three `aterm fabric`
     /// commands — and it sits where an app's own menu goes, between View and
     /// Window. Every row is Owner-only on the `invoke` fence, no exception;
@@ -4260,7 +4437,6 @@ mod tests {
         assert_eq!(
             rows,
             [
-                ("Fleet", MenuAction::Fleet),
                 ("Inbox", MenuAction::Inbox),
                 ("Ledger for This Session", MenuAction::LedgerForSession),
                 ("Hold This Session", MenuAction::HoldSession),
@@ -4301,7 +4477,6 @@ mod tests {
             assert!(super::requires_terminal_tab(a), "{a:?} is the session's");
         }
         for a in [
-            MenuAction::Fleet,
             MenuAction::ShowConnectionMap,
             MenuAction::FabricStatus,
             MenuAction::FabricOn,
@@ -4366,7 +4541,7 @@ mod tests {
         set_active_tab_is_terminal(false);
         assert!(!native_menu_action_enabled(MenuAction::HoldSession));
         assert!(!native_menu_action_enabled(MenuAction::Inbox));
-        assert!(native_menu_action_enabled(MenuAction::Fleet));
+        assert!(native_menu_action_enabled(MenuAction::ShowConnectionMap));
         set_active_tab_is_terminal(true);
     }
 
@@ -4386,7 +4561,10 @@ mod tests {
             super::native_menu_checked(MenuAction::TogglePresenceRim),
             Some(false)
         );
-        assert_eq!(super::native_menu_checked(MenuAction::Fleet), None);
+        assert_eq!(
+            super::native_menu_checked(MenuAction::ShowConnectionMap),
+            None
+        );
         super::set_presence_toggles(true, true);
         assert_eq!(
             MenuAction::TogglePresenceBand.invoke_authority(),
@@ -4568,10 +4746,6 @@ mod tests {
             // tool tip is no place for a shell line or a config key.
             assert!(!help.contains('`') && !help.contains('['), "{a:?}: {help}");
         }
-        assert!(
-            MenuAction::Fleet.help().contains("Connection Map"),
-            "Fleet says it opens the Connection Map"
-        );
         // The Controller presets spawn an ordinary shell that can read and type
         // into this session — not "a supervisor".
         assert!(!MenuAction::NewControllerTab.help().contains("supervisor"));
@@ -4842,7 +5016,7 @@ mod tests {
             app_line,
             "menu \"File\": New Window, New Terminal Tab, New Window With Identity…, \
              New Tab With Identity…, Driving ▸, Open Markdown…, \
-             Open File in Editor…, Reopen Closed Tab, Reopen Closed View, \
+             Open File in Editor…, Reopen Closed Tab, Reopen Closed Pane, \
              Move Tab to New Window, Move Tab to Next Window, Open Session in New Window, \
              Close Tab",
             "menu \"File ▸ Driving\": New Controlled Session in New Window, \
@@ -4853,7 +5027,7 @@ mod tests {
             "menu \"View\": Increase Font Size, Decrease Font Size, Actual Size, Split Right, \
              Split Down, Enter Full Screen, Presence Band, Presence Rim, Serious Mode, \
              Matrix Rain, Favourite This Kitty, Next Kitty, Command Palette…",
-            "menu \"Fabric\": Fleet, Inbox, Ledger for This Session, Hold This Session, \
+            "menu \"Fabric\": Inbox, Ledger for This Session, Hold This Session, \
              Lift Hold (This Session), Connect to Session…, Configure Connection…, \
              Disconnect Session…, Show Connection Map, Fabric Status, Turn Fabric On…, \
              Turn Fabric Off…",
@@ -5084,9 +5258,155 @@ mod tests {
         assert!(t.ends_with(" \u{00B7} DEV"), "the marker trails: {t}");
         assert!(t.contains("+g"), "the hash is pinned: {t}");
         assert!(
-            t.contains(&format!(".{}+", crate::build_info::DEV_COMMITS)),
+            t.contains(&format!(".{}+", crate::build_info::dev_commits())),
             "the third slot is the dev counter, not a release patch: {t}"
         );
+    }
+
+    /// THE SIGNATURE FOR EVERY KIND OF BUILD, on both rungs, composed from
+    /// synthetic facts — the test binary is one dev build, so this is the only
+    /// place a release, a dirty tree and a build without git are exercised.
+    #[test]
+    fn version_signature_composes_every_build_kind() {
+        use super::{VersionFacts, VersionRung, version_signature};
+        let facts = |release: bool, dev_commits: &'static str, commit: &'static str| VersionFacts {
+            release,
+            version: "0.101.0",
+            dev_commits,
+            commit,
+        };
+        let release = facts(true, "1576", "25a5963a4c21");
+        assert_eq!(
+            version_signature(release, VersionRung::Full).as_deref(),
+            Some("v0.101.0")
+        );
+        assert_eq!(
+            version_signature(release, VersionRung::Short),
+            None,
+            "a release has no short rung"
+        );
+        let dev = facts(false, "1576", "25a5963a4c21");
+        assert_eq!(
+            version_signature(dev, VersionRung::Full).as_deref(),
+            Some("v0.101.1576+g25a5963 \u{00B7} DEV")
+        );
+        assert_eq!(
+            version_signature(dev, VersionRung::Short).as_deref(),
+            Some("v0.101.1576 \u{00B7} DEV")
+        );
+        let dirty = facts(false, "1576", "25a5963a4c21-dirty");
+        assert_eq!(
+            version_signature(dirty, VersionRung::Full).as_deref(),
+            Some("v0.101.1576+g25a5963* \u{00B7} DEV")
+        );
+        assert_eq!(
+            version_signature(dirty, VersionRung::Short).as_deref(),
+            Some("v0.101.1576* \u{00B7} DEV"),
+            "the short rung keeps the dirty mark"
+        );
+        // No git at build time: `build.rs` stamps `unknown` and a zero counter,
+        // and the signature says exactly that rather than inventing a hash.
+        let no_git = facts(false, "0", "unknown");
+        assert_eq!(
+            version_signature(no_git, VersionRung::Full).as_deref(),
+            Some("v0.101.0+gunknown \u{00B7} DEV")
+        );
+        assert_eq!(
+            version_signature(no_git, VersionRung::Short).as_deref(),
+            Some("v0.101.0 \u{00B7} DEV")
+        );
+    }
+
+    /// ONE SIGNATURE, TWO SURFACES. The macOS bar title is the strip label's
+    /// text plus the colour glyphs only AppKit can draw: the wrench before it on
+    /// a dev build and ⬆️ after it under attention, where the strip writes a
+    /// plain ` ↑` instead.
+    #[test]
+    fn the_bar_title_is_the_strip_label_plus_its_colour_glyphs() {
+        use super::{VersionRung, strip_version_label, version_menu_bar_title};
+        let plain = strip_version_label(VersionRung::Full, false).expect("a full rung");
+        let wrench = if crate::build_info::IS_RELEASE_BUILD {
+            ""
+        } else {
+            "\u{1F6E0}\u{FE0F} "
+        };
+        for attention in [false, true] {
+            let arrow = if attention { " \u{2B06}\u{FE0F}" } else { "" };
+            assert_eq!(
+                version_menu_bar_title(attention),
+                format!("{wrench}{plain}{arrow}"),
+                "attention={attention}"
+            );
+        }
+        assert_eq!(
+            strip_version_label(VersionRung::Full, true),
+            Some(format!("{plain} \u{2191}")),
+            "the strip's attention mark is a plain U+2191 after one space"
+        );
+    }
+
+    /// The own-rendered strip has no colour-emoji face, so its label must never
+    /// carry one: no character past the BMP, no variation selector, and neither
+    /// of the bar's colour glyphs, on either rung, with or without attention.
+    #[test]
+    fn the_strip_label_carries_no_colour_emoji() {
+        use super::{VersionFacts, VersionRung, strip_version_label, version_signature};
+        for rung in [VersionRung::Full, VersionRung::Short] {
+            for attention in [false, true] {
+                let Some(label) = strip_version_label(rung, attention) else {
+                    assert!(
+                        crate::build_info::IS_RELEASE_BUILD && rung == VersionRung::Short,
+                        "only a release's short rung is absent"
+                    );
+                    continue;
+                };
+                for c in label.chars() {
+                    assert!(u32::from(c) <= 0xFFFF, "{c:?} is past the BMP in {label:?}");
+                    assert!(
+                        !matches!(c, '\u{FE0F}' | '\u{1F6E0}' | '\u{2B06}'),
+                        "{c:?} is a colour glyph in {label:?}"
+                    );
+                }
+                if !crate::build_info::IS_RELEASE_BUILD {
+                    assert!(label.contains(" \u{00B7} DEV"), "{label:?}");
+                }
+            }
+        }
+        let dirty = VersionFacts {
+            release: false,
+            version: "0.101.0",
+            dev_commits: "1576",
+            commit: "25a5963a4c21-dirty",
+        };
+        let short = version_signature(dirty, VersionRung::Short).expect("a dev short rung");
+        assert!(short.contains('*'), "a dirty short rung keeps `*`: {short}");
+    }
+
+    /// The label opens About — and the update details only where an update is
+    /// staged AND this platform has an updater to describe. It never installs.
+    #[test]
+    fn version_slot_click_opens_about_and_details_only_where_offered() {
+        use super::{MenuAction, version_slot_click};
+        assert_eq!(version_slot_click(false), MenuAction::Version);
+        let staged = version_slot_click(true);
+        if MenuAction::SoftwareUpdate.offered_on_this_platform() {
+            assert_eq!(staged, MenuAction::SoftwareUpdate);
+        } else {
+            assert_eq!(staged, MenuAction::Version);
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            staged,
+            MenuAction::Version,
+            "Windows has no updater, so the label is always About"
+        );
+        for attention in [false, true] {
+            assert_ne!(
+                version_slot_click(attention),
+                MenuAction::ApplyUpdate,
+                "a version label never installs"
+            );
+        }
     }
 
     /// The title an outgoing process publishes for its successor is the
@@ -5125,8 +5445,11 @@ mod tests {
         for stale in [running, running - 158_101] {
             let staged = super::staged_for_version_menu(Some((stale, "0.92.0")), running);
             assert_eq!(staged, None, "build {stale} is not newer than {running}");
-            let title =
-                super::version_menu_bar_title(super::bar_title_attention(staged.is_some(), false));
+            let title = super::version_menu_bar_title(super::bar_title_attention(
+                staged.is_some(),
+                false,
+                false,
+            ));
             assert_eq!(
                 title,
                 super::version_menu_bar_title(false),
@@ -5158,25 +5481,31 @@ mod tests {
     fn menu_bar_arrow_tracks_staged_not_realized() {
         // Action-needed staged update -> arrow.
         assert!(
-            super::bar_title_attention(true, false),
+            super::bar_title_attention(true, false, false),
             "staged shows the arrow"
         );
         // Fresh post-update celebration is NOT a persistent bar badge.
         assert!(
-            !super::bar_title_attention(false, true),
+            !super::bar_title_attention(false, false, true),
             "realized alone must not light the persistent bar arrow"
         );
         assert!(
-            !super::bar_title_attention(false, false),
+            !super::bar_title_attention(false, false, false),
             "quiet steady state: no arrow"
         );
         // If a newer build stages right after an update, staged still wins.
         assert!(
-            super::bar_title_attention(true, true),
+            super::bar_title_attention(true, false, true),
             "staged wins over realized"
         );
+        // A build on hold: no press may start it, so no act-now arrow.
+        assert!(
+            !super::bar_title_attention(true, true, false),
+            "a staged build on hold shows no arrow"
+        );
         // End to end: realized-only renders a plain title, no ⬆️ glyph.
-        let realized_only = super::version_menu_bar_title(super::bar_title_attention(false, true));
+        let realized_only =
+            super::version_menu_bar_title(super::bar_title_attention(false, false, true));
         assert!(
             !realized_only.contains('\u{2B06}'),
             "realized-only bar title carries no arrow: {realized_only}"
@@ -5317,10 +5646,7 @@ mod tests {
     /// alike.
     #[test]
     fn every_settings_deep_link_uses_the_dotted_scheme() {
-        for pane in [
-            super::PrivacyPane::FullDiskAccess,
-            super::PrivacyPane::FilesAndFolders,
-        ] {
+        for pane in super::PrivacyPane::ALL {
             for url in super::privacy_settings_urls(pane) {
                 assert!(
                     url.starts_with("x-apple.systempreferences:"),
@@ -5340,21 +5666,25 @@ mod tests {
             super::SETTINGS_FILES_AND_FOLDERS.ends_with("?Privacy_FilesAndFolders"),
             "the per-app repair route is anchored at Privacy_FilesAndFolders"
         );
+        assert!(
+            super::SETTINGS_DEVELOPER_TOOLS.ends_with("?Privacy_DevTools"),
+            "the Developer Tools list is anchored at Privacy_DevTools"
+        );
     }
 
     /// NEVER A DEAD END. None of these URLs is Apple-documented, so the last
     /// candidate must be a page with NO anchor at all: if both anchors stop
     /// resolving, Privacy & Security still opens and the caller falls back to
-    /// the route in words. Both panes must degrade to the SAME root — the
-    /// combined Files-and-Folders section lives on the one page — and only the
-    /// two registered anchors may ever appear, never a per-folder pseudo-anchor
+    /// the route in words. Every pane must degrade to the SAME root — the
+    /// sections live on the one page — and only the three registered anchors
+    /// may ever appear, never a per-folder pseudo-anchor
     /// (`Privacy_DocumentsFolder` and its siblings are not anchors; Appendix
     /// A.2).
     #[test]
     fn the_last_candidate_is_the_unanchored_pane_root() {
         let fda = super::privacy_settings_urls(super::PrivacyPane::FullDiskAccess);
-        let files = super::privacy_settings_urls(super::PrivacyPane::FilesAndFolders);
-        for urls in [&fda, &files] {
+        for urls in super::PrivacyPane::ALL.map(super::privacy_settings_urls) {
+            assert_eq!(urls[2], fda[2], "every pane degrades to the same page");
             let (root, anchored) = urls.split_last().expect("three candidates");
             assert!(
                 !root.contains('?'),
@@ -5367,23 +5697,24 @@ mod tests {
                 );
             }
         }
-        assert_eq!(fda[2], files[2], "both panes degrade to the same page");
-        for url in fda.iter().chain(files.iter()) {
+        for url in super::PrivacyPane::ALL
+            .iter()
+            .flat_map(|pane| super::privacy_settings_urls(*pane))
+        {
             let anchor = url.split_once('?').map(|(_, a)| a);
             assert!(
                 matches!(
                     anchor,
-                    None | Some("Privacy_AllFiles" | "Privacy_FilesAndFolders")
+                    None | Some(
+                        "Privacy_AllFiles" | "Privacy_FilesAndFolders" | "Privacy_DevTools"
+                    )
                 ),
                 "only a REGISTERED anchor may ship: {url:?}"
             );
         }
         // The words never claim a folder, and never claim what a grant covers —
         // that claim belongs to S4, which has not been run.
-        for pane in [
-            super::PrivacyPane::FullDiskAccess,
-            super::PrivacyPane::FilesAndFolders,
-        ] {
+        for pane in super::PrivacyPane::ALL {
             let words = super::privacy_settings_path_words(pane);
             assert!(
                 words.starts_with("System Settings"),
@@ -5406,10 +5737,7 @@ mod tests {
     /// someone tries.
     #[test]
     fn program_output_still_cannot_open_a_settings_pane() {
-        for pane in [
-            super::PrivacyPane::FullDiskAccess,
-            super::PrivacyPane::FilesAndFolders,
-        ] {
+        for pane in super::PrivacyPane::ALL {
             for url in super::privacy_settings_urls(pane) {
                 assert!(
                     !crate::is_safe_url(url),

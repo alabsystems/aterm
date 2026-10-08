@@ -1,61 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PURE RASTER EMISSION — the colour laws (the rainbow spectrum, light-theme
-//! ink, the fresh-ink glyph palette) and the quad/halo pushers. Every item
-//! here is a function of its arguments: no [`CursorGlow`] state, no clock.
+//! Pure raster emission: the colour rules (the rainbow spectrum, light-theme
+//! ink, the fresh-ink glyph palette) and the quad/halo pushers. Every item is
+//! a function of its arguments: no [`CursorGlow`] state, no clock.
 
 use super::*;
 
-/// The Comet debris GLINT's coverage, as a fraction of the grain's own — the
-/// diffraction spike is a highlight ON a grain of ice, so it is drawn dimmer
-/// than the grain that throws it.
-///
-/// It is a named constant because TWO sites must agree on it: the dealt grain
-/// that still draws the 4-point glint, and the UNDEALT grain that no longer
-/// does and is paid the glint's light instead (see the Comet arm of
-/// `emit_particles`). Split across two literals they would drift, and the drift
-/// would land as a brightness step between two grains of the same tail.
+/// The comet debris glint's coverage as a fraction of the grain's own (a
+/// highlight on a grain of ice is dimmer than the grain). Shared by the dealt
+/// grain that draws the glint and the undealt grain paid its light instead
+/// (the comet arm of `emit_particles`), so the two cannot drift.
 pub(super) const COMET_GLINT_COV: f32 = 0.5;
 
-/// THE SEVEN NAMES — the vocabulary every point-mark of this family snaps to,
-/// red → violet (`0x00RRGGBB`).
+/// The seven names every point-mark of this family snaps to, red → violet
+/// (`0x00RRGGBB`): canonical ROYGBIV (red, orange, yellow, green, blue,
+/// indigo, violet) in spectral order (owner, 2026-08-27).
 ///
-/// **`@generated` from [`crate::spectrum`] — do not edit by hand.** Each entry
-/// is `spectrum_stop(i)`, transcribed so it can stay a `const` (array lengths
-/// and const contexts across this file depend on it); `rainbow_bands_are_the_
-/// spectrum_stops` is what stops the transcription from drifting.
+/// `@generated` from [`crate::spectrum`]; do not edit by hand. Each entry is
+/// `spectrum_stop(i)`, transcribed so it can stay a `const`;
+/// `rainbow_bands_are_the_spectrum_stops` keeps the copy honest.
 ///
-/// THE SEVEN CONSTANT-LUMINANCE STOPS THIS REPLACES — `#FF0000 #B76E00 #838400
-/// #00942D #007CF8 #8066FF #CF1AFF`, every hue solved to carry red's relative
-/// luminance — were reversed on glass. Two measured reasons, both properties of
-/// holding the luminance flat rather than of the machinery: yellow at red's
-/// light is the olive `#838400` and green the bottle `#00942D`, so the trail
-/// read pale; and the arc that connected them sat **15.59 %** inside the
-/// design's cyan window (HSV `[165°, 200°]` at `S > 0.3`) with a dead-centre
-/// `#008E8E` in its table. See [`crate::spectrum`] for the whole reversal.
-///
-/// THE VALUES ARE CANONICAL ROYGBIV, and they are the owner's ruling
-/// (2026-08-27: *"a rainbow. like in the sky"*, *"do you know how to make a
-/// regular ROYGBIV rainbow color pallet? do that"*). Seven authored anchors —
-/// red, orange, yellow, green, blue, INDIGO, violet — in spectral order.
-///
-/// CYAN IS NOT A BAND, also the owner's ruling in the same breath (*"cyan isn't
-/// a color in the rainbow!"*), and it is simply true of the seven names. It does
-/// NOT follow that the green→blue interval must be destroyed to get there. The
-/// six-anchor arc this file used to transcribe carried a hand-built neutralized
-/// handoff over that one segment which drove the colour **95.3 %** of the way to
-/// flat grey at its midpoint — a hole where a seventh of the spectrum should be,
-/// which is the shape of the complaint that produced this palette, and which was
-/// separately PROVEN unreachable by any chroma-or-lightness lever: at the
-/// crossing the composited pixel was byte-identical `(58,75,80)` for every
-/// lightness from `V = 0.60` to `V = 1.00` once each colour took its own
-/// legibility ceiling. Seven authored anchors need no such special case — green
-/// and blue are adjacent stops on a continuous ramp, exactly as they are in the
-/// sky — so the handoff is deleted rather than retuned, and no cyan STRIPE is
-/// authored anywhere. What the arc does is CROSS the wedge on its way from green
-/// to blue, at full chroma and full value since 2026-09-15 (the owner, retiring
-/// the last of the anti-cyan machinery: *"this is legacy cruft. delete it"*).
+/// Cyan is not a band (owner, 2026-08-27). Green and blue are adjacent stops on
+/// a continuous ramp, so the arc crosses the cyan wedge between them at full
+/// chroma and value (owner, 2026-09-15) without any authored cyan stripe or
+/// neutralized handoff.
 pub(super) const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = [
     0x00FF_0000, // red
     0x00FF_7F00, // orange
@@ -66,238 +35,109 @@ pub(super) const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = [
     0x0094_00D3, // violet
 ];
 
-// ---- ADDITIVE-LIGHT BUDGET OVER TEXT (the legibility bound) ---------------
+// Additive-light budget over text (the legibility bound).
 //
-// The bed and the transients compose along DIFFERENT streams and their contrast
-// models differ:
+// The bed and the transients compose along different streams:
 //
 //   * the continuous bed rides `glow_under` (beneath the glyph pass), so it
-//     lifts only the GROUND — contrast is (unlit ink) vs (lit ground);
-//   * the transients ride `glow_halo` / `cursor_glow_add` ON TOP, lifting the
-//     INK AND the ground together — and once the ink saturates (`#C8D3F5` has
-//     only 55/44/10 per-channel headroom) the ground keeps climbing while the
-//     glyph is pinned at white, collapsing contrast.
+//     lifts only the ground: contrast is (unlit ink) vs (lit ground);
+//   * the transients ride `glow_halo` / `cursor_glow_add` on top, lifting ink
+//     and ground together; once the ink saturates (`#C8D3F5` has 55/44/10
+//     per-channel headroom) the ground keeps climbing and contrast collapses.
 //
-// A cap is derived against the 5.25:1 bar for its own stream, so a cap from one
-// stream is NOT interchangeable with a cap from the other.
+// Each cap is derived against the 5.25:1 bar for its own stream, so caps are
+// not interchangeable across streams.
 
-/// The TRANSIENT over-ink share (fresh-ink pop, crown, starfield, and — via
-/// `crate::cursor_glow::OVER_INK_COV_CAP` — the rainbow cursor's halo and
-/// twinkle). Worst case is the bed at 34 (ground only) plus 48 (ground AND
-/// ink), measured at 5.44:1 — above the 5.25 bar this crate certifies.
-// 47, DOWN FROM 48 ON THE CROSSING ROOF (2026-08-30). The ceiling is solved
-// against the arc's brightest over-ink colour, and the crossing's lift gave
-// the arc a brighter one: the roof's mint #80FFD3 at t 0.576. At 48 the
-// guarded contrast bar read 5.2692 against the 5.27 guard (the raw 5.25:1
-// still held) — a 0.0008 miss, but the guard exists so the raw bar is never
-// the thing on trial. One level restores the margin without touching the
-// guard, which is the direction the discipline allows.
+/// The transient over-ink share (fresh-ink pop, crown, starfield, and via
+/// `crate::cursor_glow::OVER_INK_COV_CAP` the rainbow cursor's halo and
+/// twinkle). Worst case is the bed at 34 (ground only) plus this (ground and
+/// ink), which stays above the 5.25:1 bar.
+// Solved against the arc's brightest over-ink colour (the mint `#80FFD3` at
+// t 0.576) with margin under the 5.27 contrast guard.
 pub(crate) const OVER_INK_COV_CAP: f32 = 47.0;
 
-/// **§8 (d): THE CARET IS THE BRIGHTEST THING IN THE EFFECT** — the least WCAG
-/// relative luminance the block cursor's fill may carry while the effect is
-/// live, on a `0..=255` scale.
+/// The caret is the brightest thing in the effect: the least WCAG relative
+/// luminance the block cursor's fill may carry while the effect is live, on a
+/// `0..=255` scale.
 ///
-/// **THE CLAUSE FAILED 24 TRIALS OUT OF 24.** A pure-white sparkle composited to
-/// luminance `255` every time, while the cursor cell peaked at `111..237` — and
-/// as low as `111..134` with the arc at the blue/violet end, where a saturated
-/// spectrum colour simply does not carry much light. In four trials of ten the
-/// winner sat two to eighteen cells back in the sparkle field; restricting the
-/// search to CHROMATIC pixels, the brightest was still somewhere else ten times
-/// out of ten. The eye lands on the brightest thing, and the brightest thing was
-/// never the cursor.
-///
-/// **BOTH SIDES HAVE TO MOVE, AND THE ARITHMETIC SAYS SO.** A saturated violet
-/// is `Y = 32/255`; a white dot is `255`. No cap on the sparkles that leaves
-/// them visible can get under a violet caret, and no lift of the caret that
-/// leaves it violet can get over a white dot. So the caret takes a FLOOR (it is
-/// a cursor; being findable is its job) and the sparkle field takes a CEILING
-/// derived from that floor.
-///
-/// `80` is chosen as the least floor that leaves the sparkle field alive: it
-/// lifts `23..30 %` of the arc on the shipped themes (the red/orange end and the
-/// violet end, where the caret's own colour is dark), costs at most `0.34` of
-/// saturation there, and leaves the field's own ceiling high enough that a
-/// sky sparkle keeps `62` of its `72` coverage. Raising it to `120` — enough to
-/// leave the sparkles entirely alone — pales `39..68 %` of the arc and turns the
-/// caret's red into a salmon, which is a different mark.
+/// A saturated violet is `Y = 32/255` and a white dot `255`, so neither side
+/// alone can win: the caret takes a floor and the sparkle field a ceiling
+/// derived from it. `80` is the least floor that leaves the field alive: it
+/// lifts 23-30 % of the arc (the red/orange and violet ends) at a cost of at
+/// most 0.34 saturation. A higher floor would pale most of the arc and turn
+/// the caret's red salmon.
 pub(crate) const RAINBOW_CARET_LIGHT_FLOOR: f32 = 80.0;
 
 /// The share of [`RAINBOW_CARET_LIGHT_FLOOR`] the sparkle field is allowed.
 ///
-/// A strict inequality is the whole of the clause, so the margin only has to be
-/// real; `0.9` leaves eight levels of luminance between the brightest sparkle
-/// and the dimmest caret, which is more than the `f32 -> u8` of either can move.
-///
-/// **IT IS A TERM IN THE LAW NOW, not only the statement of it.** It used to be
-/// test-gated, for the reason `SPECTRUM_CYAN_SAT_MIN` is: what the emitter read
-/// was [`RAINBOW_SPARKLE_COV_MAX`], a coverage, and this was the luminance that
-/// coverage had been solved from. §4's budget spends the FIELD's ceiling
-/// directly ([`rainbow_field_luminance`]), so the number is live and the two
-/// readings of it cannot drift.
+/// `0.9` leaves eight luminance levels between the brightest sparkle and the
+/// dimmest caret, more than either's `f32 -> u8` can move.
 pub(crate) const RAINBOW_SPARKLE_LIGHT_SHARE: f32 = 0.9;
 
-/// **THE SPARKLE FIELD'S OWN CEILING**, in additive coverage — what a starfield
+/// The sparkle field's own ceiling in additive coverage: what a starfield
 /// point-mark may ask for so its composited centre stays under
 /// [`RAINBOW_CARET_LIGHT_FLOOR`].
 ///
-/// DERIVED, and `certify_rainbow_sparkle_cov_max` re-derives it: a mote lays a
-/// skirt at `cov` and a core over it, so the pixel the eye reads carries
-/// [`crate::effect_util::STAR_STACK_ADD`] `· cov`; that pixel must sit at or
-/// under the sRGB level whose relative luminance is
-/// `RAINBOW_CARET_LIGHT_FLOOR · RAINBOW_SPARKLE_LIGHT_SHARE` (`Y = 72`, which is
-/// level `145`). `145 / 2.35 = 61`.
-///
-/// It REPLACES a clamp at `OVER_INK_COV_CAP · 1.5` (`72`), which was a
-/// legibility bound — how much light may land on the ink — and had nothing to
-/// say about which pixel on the screen is the brightest. Both bounds now apply;
-/// this is the tighter one.
+/// Derived (and re-derived by `certify_rainbow_sparkle_cov_max`): a mote's
+/// composited centre carries [`crate::effect_util::STAR_STACK_ADD`] `· cov`,
+/// which must sit at or under the sRGB level whose relative luminance is
+/// `RAINBOW_CARET_LIGHT_FLOOR · RAINBOW_SPARKLE_LIGHT_SHARE` (`Y = 72`, level
+/// `145`). `145 / 2.35 = 61`. Tighter than the `OVER_INK_COV_CAP · 1.5`
+/// legibility bound, which also applies.
 pub(super) const RAINBOW_SPARKLE_COV_MAX: f32 = 61.0;
 
-/// **THE SPARKLE CEILING MUST BE THE TIGHTER OF THE TWO BOUNDS**, checked by the
-/// compiler. A ceiling above what the emitter can already ask for is dead code
-/// dressed as a safety property — which is the mistake [`RAINBOW_STAR_COV`]'s own
-/// history records, in the other direction — and it would fail silently, at some
-/// momentum nobody happened to capture.
+/// The sparkle ceiling must be the tighter of the two bounds; a ceiling above
+/// what the emitter can already ask for would be dead code.
 const _: () = assert!(
     RAINBOW_SPARKLE_COV_MAX < OVER_INK_COV_CAP * 1.5,
     "the sparkle ceiling must bind before the legibility clamp"
 );
 
-// ---- §4, THE COMPOSITION RULE: ONE BUDGET, SPENT ONCE -------------------------------
+// The composition rule: one budget, spent once.
 //
-// **THE DEFECT.** Every ceiling above bounds ONE LAYER. Nothing bounded the
-// SUM, and light adds: the renderer composites every one of these streams with
-// `add_sat` onto the same pixels, so a frame in which each layer is
-// individually legal composites to `255` and STOPS. Measured on the shared test
-// compositor, at the shipped intensity, on one pixel of the leading:
+// Every ceiling above bounds one layer, but the renderer composites every
+// stream with `add_sat` onto the same pixels, so individually legal layers can
+// sum past 255 and clip. Clipping is a shape bug: the mark grows a flat
+// plateau with a cliff at each end, loses its falloff, and a field at 255
+// cannot sit under a caret.
 //
-// ```text
-//   the bed          74     (its own ceiling is 108)
-//   the plume core  106     (its own ceiling is 228 with its underglow)
-//   the halo tiers  105     (each halo's own peak is at most 46)
-//   ------------------------
-//   asked           285  ->  delivered 255, and the 30 levels over are not
-//                            merely lost: they are lost UNEVENLY, so the
-//                            mark grows a flat plateau with a cliff at each
-//                            end of it. 3.4 % of lit columns carried one.
-// ```
-//
-// Clipping is not a brightness bug, it is a SHAPE bug — the same argument
-// [`RAINBOW_WAKE_COMPOSITE_CAP`] already makes about the plume's own ramp,
-// applied to the frame instead of to one emitter. And it destroys the two
-// properties §8 asks for by name: a saturated pixel has no falloff left to be
-// smooth (the ledge), and a field that reaches `255` cannot be under a caret.
-//
-// **THE RULE.** One ledger, per row band and per device column, charged by
-// every additive layer the family emits in the order the emitter emits them.
-// The mark claims first and a companion takes what the mark left — which is
-// [`RAINBOW_WAKE_COMPOSITE_CAP`]'s own "one shared headroom" idiom, promoted
-// from the pair inside one emitter to the whole frame.
+// So one ledger per row band and device column is charged by every additive
+// layer in emission order; the mark claims first and a companion takes what is
+// left.
 
-/// **THE FIELD'S OWN CEILING** — the most light every OVER-INK stream together
-/// may put on one pixel outside the caret, in levels of one channel.
+/// The field's own ceiling: the most light every over-ink stream together may
+/// put on one pixel outside the caret, in levels of one channel.
 ///
-/// **DERIVED, and from the constant that already owns this claim.**
-/// [`RAINBOW_SPARKLE_COV_MAX`] solves for what ONE mote may ask so its
-/// composited centre stays under the sRGB level whose relative luminance is
-/// `RAINBOW_CARET_LIGHT_FLOOR · RAINBOW_SPARKLE_LIGHT_SHARE` — level `145`. It
-/// is the right solve and it was applied to the wrong thing: a ceiling on one
-/// mote says nothing about a FIELD of them, and §8's clause is about the
-/// brightest pixel of the frame, which is where several of them land together.
-/// This is that same level, held on the SUM.
+/// The same level [`RAINBOW_SPARKLE_COV_MAX`] solves for one mote (`145`),
+/// held on the sum, since the brightest pixel is where several land together.
 ///
-/// **AND IT IS SPENT IN LIGHT, NOT IN CHANNELS.** The clause is about
-/// luminance — *"the eye lands on the brightest thing"* — and a saturated
-/// spectrum colour carries a fraction of the light a white dot does at the same
-/// channel value: red at level `112` is `Y = 9` while white at `112` is
-/// `Y = 46`. So each lay spends what it is WORTH in light
-/// ([`white_equiv_level`]: the grey of the same relative luminance), and a
-/// chromatic plume is not charged a white star's price for the same byte. A
-/// ceiling in raw channel levels would be sound and useless — measured, it took
-/// the plume's nozzle from `112` to `12` to buy headroom for a luminance it was
-/// never spending.
-///
-/// **OVER THE GROUND, which is the correction that makes it bite.**
-/// `RAINBOW_SPARKLE_COV_MAX`'s own solve reads *"a mote's composited centre is
-/// `STAR_STACK_ADD · cov`, and that pixel must sit under level 145"* — the
-/// composited centre is `ground + STAR_STACK_ADD · cov`, and on the shipped
-/// dark ground that `38` is the difference between a field at luminance `72`
-/// and a field at `106`. Measured with the ceiling taken over black, the
-/// brightest thing in the frame was still a sparkle, at `106` against a caret
-/// at its `80` floor.
+/// Spent in light, not channels: each lay spends its white-equivalent level
+/// (the grey of the same relative luminance), so a chromatic plume is not
+/// charged a white star's price for the same byte. Measured over the ground
+/// (`ground + STAR_STACK_ADD · cov`), not over black.
 pub(crate) const RAINBOW_FIELD_LEVEL: f32 = 145.0;
 
-/// The two readings of the field's ceiling — the LEVEL
-/// [`RAINBOW_SPARKLE_COV_MAX`] was solved against and the LUMINANCE §4's budget
-/// spends — must be the same bound, or a mote could pass one and fail the
-/// other.
+/// The level [`RAINBOW_SPARKLE_COV_MAX`] was solved against and the luminance
+/// the budget spends must be the same bound.
 const _: () = assert!(RAINBOW_FIELD_LEVEL > 144.0 && RAINBOW_FIELD_LEVEL < 146.0);
 
-/// **HOW FAR THE FIELD MAY DISAGREE UNDER THE JUMP STREAK BEFORE THE MARK STOPS
-/// SPENDING CHROMA** — in `t`, the arc's own parameter.
+/// How far the field may disagree under the jump streak before the mark stops
+/// spending chroma, in `t` (the arc's parameter).
 ///
-/// See [`rainbow_streak_chroma`] for what it bounds. `0.02`
-/// is a fortieth of the arc, which is **1.6 keystrokes** at the shipped lay rate
-/// ([`RAINBOW_KITTY_HUE_STEP`]) — so the law is silent along a row (neighbouring
-/// columns are `0.0125` apart and the mark keeps every level of its chroma) and
-/// complete across a row BOUNDARY, where two readings are uncorrelated and
-/// their difference is `0.5` on average. Swept on the emitter's own corpus:
-/// `0.05` leaves 61 cyan px, `0.03` leaves 9, `0.02` leaves 0, and the cost at
-/// `0.02` is 0.6 % of the streak's coloured area.
-///
-/// **IT IS DERIVED NOW, IN KEYSTROKES, BECAUSE A LITERAL COULD NOT SURVIVE THE
-/// LAY RATE MOVING** (2026-08-31). The paragraph above states the bound in
-/// keystrokes and then transcribes the product; the transcription had since
-/// been tightened to `0.004` — a fifth of what the same paragraph argues for —
-/// and nothing tied the two together. When
-/// [`RAINBOW_TRAVERSE_SETTLED`] made one keystroke `1/36 = 0.0278` of the arc,
-/// that stale literal was **a seventh of a single cell's lay**: every station of
-/// a streak over a live mark saw its own transverse taps disagree by more than
-/// the whole budget and folded to grey. Measured on the emitter's own corpus at
-/// that moment: mean saturation loss against the arc **49.7 %** — a grey bar,
-/// which is a worse answer to *"the cursor meteor streak isn't a single colour,
-/// that's a rainbow!"* than a single colour would have been. Stated as a
-/// keystroke count times the live rate it cannot fall out of step again.
-///
-/// **AND IT HAS A FLOOR NOW, WHICH IS WHAT MAKES IT SILENT ALONG A ROW.** The
-/// paragraph above promises the law is *"silent along a row … and complete
-/// across a row BOUNDARY"*, but a single threshold on a `smoothstep` cannot be:
-/// the curve starts spending chroma at the first non-zero drift, and the
-/// transverse taps ALWAYS read a non-zero drift, because the stack is about
-/// `1.6` cells thick ([`RAINBOW_JUMP_FEATHER_WIDEN`]) and the field has a slope.
-/// Measured at the settled traverse: same-row drift `0.032`, which folded the
-/// streak to `keep = 0.09` — **5,520 of its ~10,800 coloured pixels rendered at
-/// mean saturation `0.094`, a grey bar**, while every other hue bucket in the
-/// same take sat at `0.82`-`0.97`. The floor is the drift a stack of the
-/// streak's own thickness legitimately reads; below it the mark keeps every
-/// level of its chroma, and the fold runs from there to a reading that can only
-/// be two different runs mixing.
-///
-/// **AND THE FLOOR IS A THIRD OF THE SPECTRUM, WHICH THE CYAN CENSUS PAID FOR.**
-/// The number is not a taste: with the fold switched off ENTIRELY, every cyan
-/// census that existed because of it measured zero on the emitter's own corpus
-/// (`lit=1,678,001 unruled=24,224 cyan=0` on the jump streak's own walk), and
-/// the zoom streak's on-arc census returned `0.000` loss on a population that is
-/// `S = 1.000` pure. Those censuses are all retired now — the anti-cyan rulings
-/// they enforced were what greyed the arc — so what is recorded here is the
-/// MEASUREMENT, which still stands: the seven-anchor palette retired the cyan
-/// hazard this fold was insurance against, and the fold is kept ONLY for the
-/// case the corpus cannot stage — a streak whose taps
-/// straddle two different runs on adjacent rows, where two readings are
-/// genuinely uncorrelated and average half the spectrum apart. A third of the
-/// cycle is past anything one mark's own slope can produce at any traverse and
-/// still well inside that. Anything tighter is measured harm: at `6` cells it
-/// still folded 1,702 px to `S = 0.66`, and at the retired `0.004` literal it
-/// folded 5,520 px to `S = 0.09`.
+/// Stated as a third of the cycle rather than a literal, so it tracks the lay
+/// rate. The streak's stack is about 1.6 cells thick and the field has a
+/// slope, so same-row taps
+/// always read some drift; below this floor the mark keeps all its chroma.
+/// Tighter floors grey the streak along a row. The fold only matters for taps
+/// straddling two different runs on adjacent rows, whose readings are
+/// uncorrelated and average half the spectrum apart.
 pub(super) const RAINBOW_STREAK_DRIFT_FLOOR: f32 = RAINBOW_CYCLE / 3.0;
-/// Where the fold is COMPLETE: a reading uncorrelated with the station's own,
-/// which across a row boundary averages `0.5` of the arc. A quarter of the arc
-/// is already far past anything one mark's own slope can produce.
+/// Where the fold is complete: an uncorrelated reading, which across a row
+/// boundary averages `0.5` of the arc.
 pub(super) const RAINBOW_STREAK_DRIFT_MAX: f32 = 0.5;
 
-// THE FLOOR ADMITS THE STACK'S OWN THICKNESS, and the fold still has room to
-// run past it — a floor at or above the max would switch the law off.
+// The floor admits the stack's own thickness and leaves the fold room to run;
+// a floor at or above the max would switch it off.
 const _: () = assert!(
     RAINBOW_STREAK_DRIFT_FLOOR >= 1.0 / RAINBOW_TRAVERSE_SETTLED
         && RAINBOW_STREAK_DRIFT_FLOOR < RAINBOW_STREAK_DRIFT_MAX
@@ -306,85 +146,31 @@ const _: () = assert!(
      and the fold must complete no later than the farthest two readings can be"
 );
 
-// **`rainbow_streak_chroma(drift)` bounds how far two adjacent samples may
-// drift before their SUM leaves the arc** — a statement about mixing two
-// different colours, not about which colours the palette authors.
-// **THE ONE TRANSVERSE PROFILE LIVES IN THE RENDERER** (step 11).
-// `rainbow_ribbon_across` stood here through step 10 and is now
-// [`aterm_render::ribbon_profile`], beside [`aterm_render::ribbon_beam`], which
-// is the only thing that evaluates it in production. That is where a
-// rasterization law belongs: the quads are emitted HOST-SIDE, so CPU/GPU parity
-// is structural rather than tested for, and a profile that lived in the producer
-// would have to be handed across that boundary to stay one law.
-//
-// `RAINBOW_RIBBON_CORE_SHARE` went with it as [`aterm_render::RIBBON_CORE_SHARE`],
-// for the same reason: the clamp that guarantees at least half of every reach is
-// falloff is the rasterizer's own invariant, not the caller's promise.
+// The transverse ribbon profile lives in the renderer
+// ([`aterm_render::ribbon_profile`], beside [`aterm_render::ribbon_beam`]),
+// with [`aterm_render::RIBBON_CORE_SHARE`]: the quads are rasterized
+// host-side, so CPU/GPU parity is structural.
 
-// ---- rainbow kitty HEAD CLEARANCE ---------------------------------------------------
-//
-// [`rainbow_ribbon_profile`] already ramps brightness with a spark's normalized
-// AGE, but age is only a proxy for distance-from-cursor, and a poor one: a
-// spark's life CHAINS to the observed cadence (up to
-// [`CursorGlow::RAINBOW_CHAIN_LIFE_MAX`]), so at a fast rhythm the profile's onset
-// stretches over dozens of cells and its crest sits seconds behind the hand,
-// while at a slow one the same law compresses into three. The ribbon is read in
-// SPACE — how many letters back the light gets bright — so the
-// clearance below is measured in CELLS and is therefore cadence-invariant: the
-// letters under and immediately behind the cursor keep a deliberately quiet
-// wash and the ribbon reaches its full body a few cells back, at every typing
-// speed. It MULTIPLIES the age profile (never replaces it), so the documented
-// onset/crest/feather law and every one of its endpoints survive untouched.
-//
-// Only same-row cells are dimmed: a wrapped or scrolled ribbon on another row
-// is nowhere near the letters being typed, so it keeps its full body (and a
-// hidden cursor — no known head — dims nothing at all). The emitter scales the
-// whole clearance by the momentum spine and never lets it cull a cell — see
-// the application site in `emit_rainbow` for both bounds.
-// ---- THE LIGHT-THEME INK RECIPE ---------------------------------------------
-//
-// One pair of numbers behind every source-over mark the rainbow kitty draws on
-// a white ground — the rails, the light twinkle, the meteor streak, the landing
-// stars, the delete sparkles. They were spelled inline at each site as a bare
-// `0.28` and a bare `150`, and a white-ground capture showed the result: every
-// transient read as PALE PASTEL CONFETTI, because a saturated hue only 28 % of
-// the way to black, composited at ~40 % centre alpha and then run through
-// `push_halo_over`'s radial falloff, lands a handful of counts off white
-// everywhere but the exact centre pixel.
-//
-// Naming them makes the light arms one system and lets the whole family gain
-// contrast in one place.
-/// Ceiling on the LUMA (0..255, Rec. 709) of any hue composited source-over on
+// Light-theme ink: every source-over mark the rainbow kitty draws on a white
+// ground (rails, light twinkle, meteor streak, landing stars, delete sparkles)
+// darkens through the named constants below, so the light arms are one system.
+/// Ceiling on the luma (0..255, Rec. 709) of any hue composited source-over on
 /// a white ground.
 ///
-/// A flat "mix `x` toward black" — which is what every light arm used to spell
-/// inline — is the wrong operator here, because the seven bands do not start
-/// anywhere near the same brightness: pure yellow's luma is 226 and pure blue's
-/// is 32, so ONE mix ratio leaves yellow and green tinting the paper while red
-/// and violet stain it. Normalizing to a luma target instead darkens each band
-/// by whatever IT needs, so a rainbow of light-theme marks reads as one
-/// material. 92/255 keeps every band a clear contrast INCREASE against white
-/// while leaving enough headroom that the hue is still obviously the hue.
-/// LOWERED 92 -> 68 after a white-ground review: at 92 the warm middle of the
-/// spectrum (yellow, tan, yellow-green) still composited to within a few counts
-/// of the paper, so a rainbow drawn on white visibly THINNED OUT in its middle
-/// while its violet/blue end stayed strong — "the ribbon looks like it has a
-/// hole in it". The bar has to be set by the WORST band, not an average one.
+/// A flat mix toward black is the wrong operator: pure yellow's luma is 226 and
+/// pure blue's 32, so one ratio leaves yellow tinting the paper while violet
+/// stains it. Normalizing to a luma target darkens each band by what it needs.
+/// The bar is set by the worst band (the warm middle), or the rainbow thins out
+/// in its middle on white.
 pub(super) const LIGHT_INK_MAX_LUMA: f32 = 68.0;
-/// Companion ceiling on any SINGLE channel. Luma alone is not enough: pure red
-/// has a luma of only 54, so a luma bar leaves it at a full-blast `FF` in the
-/// red channel — and the fresh-ink veil, which composites OVER the glyph, would
-/// then tint near-black ink to a dark red instead of merely greying its
-/// surround. Bounding the channel too keeps every band's darken honest against
-/// the INK as well as against the ground.
+/// Companion ceiling on any single channel. Pure red's luma is only 54, so a
+/// luma bar alone leaves it at `FF`, and the fresh-ink veil (composited over
+/// the glyph) would tint near-black ink dark red.
 pub(super) const LIGHT_INK_MAX_CHANNEL: f32 = 150.0;
-/// LEGIBILITY CEILING on any light-theme mark's per-pixel CENTRE over-alpha
-/// (`aterm_render::halo_over_cap`). Raised 150 → 190: at 150 the transients
-/// were bounded well under what legibility actually requires, and the bound
-/// that matters is the one this constant now states — `over_rgb(glyph, ink,
-/// cap)` keeps `(255−cap)/255` of the glyph, so near-black ink stays near-black
-/// and a white counter stays a light grey. Pinned by
-/// `light_ink_cap_keeps_glyphs_legible`.
+/// Legibility ceiling on any light-theme mark's per-pixel centre over-alpha
+/// (`aterm_render::halo_over_cap`): `over_rgb(glyph, ink, cap)` keeps
+/// `(255−cap)/255` of the glyph, so near-black ink stays near-black and a white
+/// counter stays light grey. Pinned by `light_ink_cap_keeps_glyphs_legible`.
 pub(super) const LIGHT_INK_ALPHA_CAP: f32 = 190.0;
 
 /// Rec. 709 luma of a `0x00RRGGBB` colour, 0..255. The one luminance the light
@@ -396,71 +182,45 @@ pub(super) fn luma709(rgb: u32) -> f32 {
         + 0.0722 * (rgb & 0xff) as f32
 }
 
-// ---- THE ONE LIGHT-INK RULE ------------------------------------------------
+// The one light-ink rule: there are two darkening policies on a light ground,
+// chosen by a mark's compositing role, never by which emitter draws it and
+// never mixed inside one event:
 //
-// There are exactly TWO darkening policies on a light ground, and which one a
-// mark takes is decided by its COMPOSITING ROLE — never by which emitter
-// happens to draw it, and never twice inside one event:
+//   * [`light_ink_bold`], leading-only: marks that land in the inter-line
+//     leading and never composite over a glyph (the rail, the rail-riding
+//     streak, the meteor nucleus, the landing bloom, the fresh-ink bar's
+//     tint). Vivid, because nothing they darken is ink.
+//   * [`light_ink`], may-touch-text: every star, sparkle and dot
+//     ([`push_twinkle_over`] applies it internally), the erase-poof grains and
+//     the cursor cat's exit flourish. Conservative.
 //
-//   * [`light_ink_bold`] — the LEADING-ONLY role. Marks that provably land in
-//     the inter-line leading and therefore never composite over a glyph: the
-//     rail, the rail-riding streak, the meteor nucleus, the landing bloom, and
-//     the fresh-ink bar's tint. Vivid, because nothing they darken is ink.
-//   * [`light_ink`] — the MAY-TOUCH-TEXT role. Everything else: every star,
-//     sparkle and dot ([`push_twinkle_over`] applies it INTERNALLY, so a star
-//     caller cannot get this wrong), the erase-poof grains, and the cursor
-//     cat's exit flourish. Conservative, because any of them can land on a
-//     letterform at any moment.
-//
-// The rule has to be stated because the two are NOT interchangeable: bold sits
-// at [`LIGHT_INK_BOLD_MAX_LUMA`] and conservative at [`LIGHT_INK_MAX_LUMA`], a
-// ~1.8x difference in ink weight. Composite both inside ONE landing and half
-// the event reads visibly washier than the other half, which is precisely what
-// a white-ground capture of a landing burst showed. Pinned by
+// Bold ink is about 1.8x the weight of conservative ink, so mixing them inside
+// one landing reads as half the event washed out. Pinned by
 // `one_light_ink_policy_per_compositing_role`.
 
-/// THE LEADING-ONLY INK — vivid, for marks that provably never touch a glyph.
+/// Leading-only ink: vivid, for marks that never touch a glyph.
 ///
-/// [`light_ink`] is deliberately conservative because its marks CAN land on
-/// text: it bounds the channel hard, which on white leaves the low channels
-/// showing enough paper through to read as grey. Three white-ground reviews
-/// converged on the same sentence — "the palette collapses on white",
-/// "desaturated olive/gray smear" — and this is the arithmetic behind it.
+/// [`light_ink`] bounds the channel hard because its marks can land on text,
+/// which on white lets paper show through the low channels and reads grey.
+/// Leading-only marks get:
 ///
-/// The marks that live wholly in the inter-line leading are under no such
-/// constraint, and they are the ones that carry the rainbow. They get:
+///   * one ink weight: every hue lands on [`LIGHT_INK_BOLD_MAX_LUMA`], so a
+///     sweep through the spectrum does not pulse light and dark;
+///   * the most saturation that weight allows, so low channels go as close to
+///     zero as the bar permits.
 ///
-///   * A SINGLE INK WEIGHT — every hue lands ON [`LIGHT_INK_BOLD_MAX_LUMA`], so
-///     a sweep that rolls the whole spectrum under a moving cursor keeps ONE
-///     weight instead of pulsing light and dark as the band changes.
-///   * THE MOST SATURATION THAT WEIGHT ALLOWS, so the low channels go as close
-///     to zero as the bar permits instead of letting paper through them. This
-///     is what separates "green" from "grey-green" once composited.
-///
-/// THE BAR NOW BINDS FOR ALL SEVEN BANDS. The retired recipe saturated to S = 1
-/// and then only ever SCALED DOWN — `k = min(luma_bar/y, channel_bar/hi, 1)` —
-/// so the bar could bind only for a hue whose own luma was already ABOVE it.
-/// At S = 1 that is true of orange, yellow and green and false of red, blue and
-/// violet, whose pure luma sits under the bar and can never be scaled UP to it
-/// without clipping past `FF`. The light underline therefore changed apparent
-/// weight with hue, as though drawn with different pens.
-///
-/// A hue below the bar can only be lifted to it by letting some white back in,
-/// so the recipe now solves for the pair `(S, V)` that hits the bar with the
-/// MAXIMUM saturation — scaling alone where that suffices (orange, yellow and
-/// green are byte-identical to the retired recipe) and backing saturation off
-/// only as far as the bar demands (red, blue, violet). That is the honest
-/// generalization of "one bar": the bar governs the weight, and saturation gets
-/// everything the bar has left over.
+/// Hues whose pure luma is above the bar (orange, yellow, green) are scaled
+/// down; hues below it (red, blue, violet) can only reach it by letting some
+/// white back in, so the recipe solves for the `(S, V)` that hits the bar with
+/// maximum saturation.
 pub(super) const LIGHT_INK_BOLD_MAX_LUMA: f32 = 120.0;
 pub(super) const LIGHT_INK_BOLD_MAX_CHANNEL: f32 = 215.0;
 
-/// [`light_ink`]'s vivid twin — see the constants above and THE ONE LIGHT-INK
-/// RULE. Normalizes `rgb` to its PURE hue (achromatic floor removed, peak
-/// renormalized to 1), then re-mixes it at the `(S, V)` that lands exactly on
+/// [`light_ink`]'s vivid twin (see the one light-ink rule above). Normalizes
+/// `rgb` to its pure hue (achromatic floor removed, peak renormalized to 1),
+/// then re-mixes it at the `(S, V)` that lands exactly on
 /// [`LIGHT_INK_BOLD_MAX_LUMA`] with as much saturation as
-/// [`LIGHT_INK_BOLD_MAX_CHANNEL`] leaves available. Channel ORDER is preserved,
-/// so every band is still recognisably its own colour. Pinned by
+/// [`LIGHT_INK_BOLD_MAX_CHANNEL`] leaves. Channel order is preserved. Pinned by
 /// `light_ink_bold_holds_one_ink_weight_across_the_spectrum`.
 #[inline]
 pub(super) fn light_ink_bold(rgb: u32) -> u32 {
@@ -474,15 +234,10 @@ pub(super) fn light_ink_bold(rgb: u32) -> u32 {
     if hi <= 0.5 {
         return 0; // a black input carries no hue to weigh
     }
-    // THE PURE HUE: `lo` is the white this colour was carrying; removing it and
-    // renormalizing gives the same hue at S = 1, V = 1 (peak channel exactly 1).
-    //
-    // AN ACHROMATIC INPUT IS NOT BLACK. `r == g == b` leaves a zero span, and
-    // the retired recipe divided by `max(span, 1e-3)` and multiplied by `hi` —
-    // which drove every channel of a WHITE input to 0, i.e. `light_ink_bold`
-    // silently returned BLACK for the single most common "invisible on paper"
-    // hue there is. A grey has no hue to saturate, so it simply keeps its
-    // ratios (all 1) and takes the bar as a neutral grey.
+    // The pure hue: `lo` is the white this colour carries; removing it and
+    // renormalizing gives the same hue at S = 1, V = 1. An achromatic input
+    // has zero span and no hue to saturate, so it keeps its ratios (all 1)
+    // and takes the bar as a neutral grey rather than turning black.
     let span = hi - lo;
     let pure = |c: f32| {
         if span <= 1e-3 { 1.0 } else { (c - lo) / span }
@@ -494,10 +249,9 @@ pub(super) fn light_ink_bold(rgb: u32) -> u32 {
     let yt = LIGHT_INK_BOLD_MAX_LUMA / 255.0;
     let vmax = LIGHT_INK_BOLD_MAX_CHANNEL / 255.0;
     // At value `v` and saturation `s` a channel is `v·(1 − s + s·c)` and the
-    // luma is `v·(1 − s + s·y0)`. Luma falls with `s` (for `y0 < 1`), so the
-    // most saturated solution takes `v` as high as the channel bar allows and
-    // then solves for `s`. `s ≥ 1` means scaling alone reaches the bar — the
-    // retired behaviour, kept byte-for-byte for the warm middle.
+    // luma `v·(1 − s + s·y0)`. Luma falls with `s` (for `y0 < 1`), so the most
+    // saturated solution takes `v` as high as the channel bar allows and then
+    // solves for `s`; `s ≥ 1` means scaling alone reaches the bar.
     let s = if y0 >= 1.0 - 1e-4 {
         0.0 // achromatic: nothing to desaturate
     } else {
@@ -508,13 +262,10 @@ pub(super) fn light_ink_bold(rgb: u32) -> u32 {
     (ch(pr) << 16) | (ch(pg) << 8) | ch(pb)
 }
 
-/// THE LIGHT-THEME INK: `rgb` scaled down (hue and saturation intact — every
-/// channel by the SAME factor) until it satisfies BOTH bars —
-/// [`LIGHT_INK_MAX_LUMA`] and [`LIGHT_INK_MAX_CHANNEL`]. A colour already under
-/// both is returned UNCHANGED, so the dark bands are not needlessly crushed.
-/// Scaling uniformly (rather than mixing toward black per-channel) is what
-/// preserves the hue: the band is still recognisably its own colour, just at
-/// ink weight. Pinned by `light_ink_darkens_every_band_to_one_bar`.
+/// Light-theme ink: `rgb` scaled uniformly (hue and saturation intact) until
+/// it satisfies both [`LIGHT_INK_MAX_LUMA`] and [`LIGHT_INK_MAX_CHANNEL`]. A
+/// colour already under both is returned unchanged. Pinned by
+/// `light_ink_darkens_every_band_to_one_bar`.
 #[inline]
 pub(super) fn light_ink(rgb: u32) -> u32 {
     let rgb = rgb & 0x00FF_FFFF;
@@ -530,13 +281,9 @@ pub(super) fn light_ink(rgb: u32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// THE COMPOSITING ROLE of one light-theme mark — see THE ONE LIGHT-INK RULE
-/// above. It is the ONE thing a light arm declares, and it picks BOTH halves of
-/// the recipe: the darkening policy and the centre over-alpha ceiling. Those
-/// two always agreed in intent and did not always agree in code — the flying
-/// shower's streak asked for the conservative CEILING while its ink came out of
-/// the leading-only policy, so a mark that can cross a glyph at any moment was
-/// drawn in the vivid ink reserved for marks that provably cannot.
+/// The compositing role of one light-theme mark (see the one light-ink rule).
+/// It picks both halves of the recipe, the darkening policy and the centre
+/// over-alpha ceiling, so the two cannot disagree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum InkRole {
     /// Provably confined to the inter-line leading (the rail line): nothing it
@@ -567,58 +314,36 @@ impl InkRole {
     }
 }
 
-// ---- rainbow kitty LIGHT-THEME RAILS ------------------------------------------------
-/// THE ONE SWEEP. Where a cell sits on the spectrum, given its column and the
-/// ribbon's own phase clock — the single source every mark that lands on the
-/// light rail line reads.
+// ---- rainbow kitty light-theme rails ----------------------------------------
+/// The one sweep: where a cell sits on the spectrum given its column and the
+/// ribbon's phase clock. Every mark on the light rail line reads it (rail,
+/// fresh-ink bar, glyph tint, and the [`crate::cursor_rainbow`] block cursor at
+/// its own column), so they are the same colour.
 ///
-/// The rail, fresh-ink bar, and glyph tint once hand-rolled this expression and
-/// could disagree. Centralizing the sweep keeps each caller on the same
-/// reflected coordinate law.
-///
-/// IT PING-PONGS. The seven bands are an ACYCLIC ramp (red at one end, violet at
-/// the other), so wrapping the position with `rem_euclid` walks violet
-/// straight back into red and prints a hard seam every `1 / SPREAD` ≈ 22
-/// columns. Reflecting instead — a triangle wave — runs red→violet→red with no
-/// discontinuity anywhere, which is what a spectrum drawn on a line should do.
-///
-/// THE CARET READS IT TOO. [`crate::cursor_rainbow`]'s block cursor used to run
-/// its own HSV wheel on its own clock, so the caret and the ribbon leaving it
-/// were literally two different rainbows meeting at one cell. It now resolves
-/// its hue through this sweep at its OWN column, so the block and the underline
-/// under it are the same colour.
+/// It ping-pongs: the seven bands are an acyclic ramp, so wrapping would print
+/// a violet-to-red seam every `1 / SPREAD` ≈ 22 columns. A triangle wave runs
+/// red→violet→red with no discontinuity.
 #[inline]
 pub(crate) fn rainbow_sweep_at(col: u16, phase: f32) -> f32 {
     rainbow_sweep_reflect(col as f32 * RAINBOW_LIGHT_RAIL_SPREAD + rainbow_sweep_phase(phase))
 }
 
-/// Fold an unbounded spectrum position onto the sweep's PING-PONG `0..1` —
-/// the reflection [`rainbow_sweep_at`] is built from, exposed so a caller that
-/// wants a spectrum position OFFSET from a resolved one (the caret's halo rings
-/// step outward along the wheel) folds it the one way this family folds.
+/// Fold an unbounded spectrum position onto the sweep's ping-pong `0..1`, for
+/// callers that offset a resolved position (the caret's halo rings step
+/// outward along the wheel).
 #[inline]
 pub(crate) fn rainbow_sweep_reflect(x: f32) -> f32 {
     let raw = x.rem_euclid(2.0);
     if raw <= 1.0 { raw } else { 2.0 - raw }
 }
 
-// THE CONTINUOUS DOOR IS GONE. `rainbow_spectrum_of` was a one-line wrapper on
-// [`spectrum`], and once the caret moved to the thing-arc its last caller was
-// `cursor_rainbow`, which is the one module that must NOT resolve the raw
-// gradient. Streaming BANDS — the ribbon, the plume, the jump path — call
-// `spectrum` directly, in this file, where the position they read it at is
-// resolved. A door that only a thing walked through is a door in the wrong wall.
-
 /// Resolve a reflected spectrum position for a persistent mark — the caret's
 /// read of the same field the ribbon paints, past the cycle's turnaround.
 #[inline]
 pub(crate) fn rainbow_thing_of(sweep: f32) -> u32 {
-    // THE CARET WEARS THE CYCLE, NOT THE OPEN ARC. This is the caret's and the
-    // lone cell's read of the same field the ribbon paints, and the field walks
-    // past violet now; clamping here would park the caret on violet while the
-    // band behind it kept advancing — the very split the "one field, one cell"
-    // law exists to forbid. Identity on `[0, 1]`, so every arc reading is the
-    // byte it always was.
+    // The caret wears the cycle, not the open arc: the field walks past violet,
+    // and clamping would park the caret while the band behind it advances.
+    // Identity on `[0, 1]`.
     let phase = rainbow_cycle_phase(sweep);
     if phase > 1.0 {
         return rainbow_cycle_ink(phase);
@@ -626,55 +351,25 @@ pub(crate) fn rainbow_thing_of(sweep: f32) -> u32 {
     spectrum(phase)
 }
 
-/// **THE DWELL IS OFF — the owner, 2026-08-30: "NO we don't want 'dwell' at
-/// the end … make it a fucking rainbow."** The sine re-pacing below parked
-/// 8-12 cells within ~20° of red or violet at every turnaround, and a resumed
-/// mark picked the walk up AT an end — the "flat red bar" the A/B judges
-/// ranked first. At `0.0` the fold is the pure triangle: every keystroke
-/// advances the arc at the mark's own solved rate, everywhere.
-///
-/// Blue and violet are still REACHED without it (the 2026-08-29 "yes we need
-/// blue and violet" ask): [`RAINBOW_TRAVERSE_PER_MARK`] `< 1` puts a
-/// turnaround inside every mark, and [`RAINBOW_LAID_END_PULL`] lands the
-/// nearest lay ON the anchor. What the dwell bought on top of that was
-/// LINGERING at the ends, and lingering is what read as monochrome.
-///
-/// (The original derivation, kept for the record: a monotone re-pacing
-/// `x − a·sin(2πx)/2π` hands more cells to the arc's two ends and fewer to
-/// its middle; every derived bound below is parametric on the constant, so
-/// `0.0` degrades each to the bare-triangle reading.)
+/// Re-pacing of the sweep's ends, off (`0.0`): the fold is the pure triangle,
+/// so every keystroke advances the arc at the mark's own rate. A positive value
+/// applies `x − a·sin(2πx)/2π`, handing more cells to the arc's ends, which
+/// lingers there and reads as monochrome. Derived bounds below are parametric
+/// on it (owner, 2026-08-30).
 pub(super) const RAINBOW_END_DWELL: f32 = 0.0;
 
-// ---- THE ONE VISIBLE FIELD (§2.1) -----------------------------------------
+// ---- the one visible field --------------------------------------------------
 //
 // Every layer reads a spark's cached, run-local classic position. Reflowing a
 // run keeps one red→violet geometry across its live cells; disjoint old marks
-// retain independent fields. The rolling hue, absolute-column sweep and hashes
-// remain only as ancillary clocks or fallbacks, never competing colour laws for
-// a live kitty mark.
-//
-// After this there is one field and everyone reads it, so "which rainbow is
-// this?" is not a question anyone can ask.
+// keep independent fields. The rolling hue, absolute-column sweep and hashes
+// are only ancillary clocks or fallbacks, never competing colour rules for a
+// live kitty mark.
 
-// THE FIELD THE CARET IS ABOUT TO LAY — the position the next keystroke will
-// stamp into the cell it echoes into.
-//
-// `rainbow_field_next` — the rolling-hue forecast of the caret's next lay —
-// is GONE: the classic field re-anchored the caret's read to the mark's own
-// geometry (owner, 2026-08-30), the navigation gate now pins the fresh caret
-// to the arc's start directly, and with its last test caller rewritten the
-// forecast had no reader left. The `+ 0.5` stamp identity it documented lives
-// on in the emitter's own `(self.hue + pos * 0.5).fract()` and its tests.
-
-/// THE ONE BAND. The named stop nearest a sweep position — the quantized
-/// spectrum every point-mark of this family snaps to (§2.3.3).
-///
-/// Quantized rather than continuous, deliberately: a discrete band is what
-/// makes red and violet nameable on a thin underline, and `is_fresh_ink_veil`
-/// needs the pop's colour to come from a finite set to stay independently
-/// assertable. What changed is *which* finite set — the seven stops of the one
-/// spectrum, resolved through [`spectrum_snap`], rather than six anchors this
-/// file owned.
+/// The one band: the named stop nearest a sweep position, the quantized
+/// spectrum every point-mark of this family snaps to (via [`spectrum_snap`]).
+/// Discrete so red and violet are nameable on a thin underline, and so
+/// `is_fresh_ink_veil` can assert the pop's colour from a finite set.
 #[inline]
 #[cfg(test)]
 pub(crate) fn rainbow_band_of(sweep: f32) -> u32 {
@@ -689,20 +384,14 @@ pub(crate) fn rainbow_band_at(col: u16, phase: f32) -> u32 {
     rainbow_band_of(rainbow_sweep_at(col, phase))
 }
 
-/// LEGIBILITY CEILING on a rail's per-pixel centre over-alpha. The rails live
-/// outside the glyph band, so this bounds how dark the LEADING can get (and how
-/// much two overlapping rails can compound), not the ink.
-/// RAISED 150 -> 200 across two white-ground reviews. The rail is the ONE
-/// continuous mark of this family on white — the "underline cursor trail" — and
-/// at the old ceiling it read as a pastel wash rather than a rainbow. It may go
-/// higher than [`LIGHT_INK_ALPHA_CAP`] precisely because it is NOT a transient
-/// over text: it lives wholly in the leading below the row (`DY − RY` = 0.49,
-/// clear of any descender), so nothing it darkens is ever a glyph.
+/// Legibility ceiling on a rail's per-pixel centre over-alpha. The rail lives
+/// wholly in the leading below the row (`DY − RY` = 0.49, clear of any
+/// descender), so this bounds how dark the leading gets (and how two rails
+/// compound), not the ink; hence it may exceed [`LIGHT_INK_ALPHA_CAP`].
 pub(super) const RAINBOW_LIGHT_RAIL_ALPHA_CAP: f32 = 236.0;
 
-/// How fast the band ramp sweeps ALONG the rails: per column, and per unit of
-/// the ribbon's own shared phase clock. Slow — the spectrum should flow, not
-/// strobe — and phase-driven, so it freezes exactly when the ribbon does.
+/// How fast the band ramp sweeps along the rails, per column and per unit of
+/// the ribbon's phase clock. Phase-driven, so it freezes when the ribbon does.
 pub(super) const RAINBOW_LIGHT_RAIL_SPREAD: f32 = 0.045;
 /// The integrated rainbow clock lives on this exact ring. Every consumer must
 /// complete a whole number of its own cycles across the ring so wrapping can
@@ -718,213 +407,104 @@ pub(super) fn rainbow_sweep_phase(phase: f32) -> f32 {
     (phase.rem_euclid(RAINBOW_PHASE_RING) * RAINBOW_LIGHT_RAIL_FLOW).rem_euclid(2.0)
 }
 
-/// Lift a standalone unit-turn animation clock onto the rainbow family's phase
-/// ring so one `0..1` turn traverses one WHOLE reflected spectrum cycle.
+/// Lift a standalone unit-turn animation clock onto the rainbow phase ring so
+/// one `0..1` turn traverses one whole reflected spectrum cycle.
 ///
-/// [`rainbow_sweep_at`] consumes the ribbon's `0..1024` phase domain, not unit
-/// turns. Passing a unit clock through unchanged advances only
-/// [`RAINBOW_LIGHT_RAIL_FLOW`] (about 0.35) of the period-two sweep and then
-/// jumps backward when that clock wraps. Dividing the complete period-two
-/// excursion by the family's flow preserves the one resolver while making the
-/// standalone wrap exact: turn `0` and turn `1` both resolve to sweep position
-/// zero, approached continuously from either side.
+/// [`rainbow_sweep_at`] consumes the ribbon's `0..1024` phase domain; a unit
+/// clock passed unchanged would cover only [`RAINBOW_LIGHT_RAIL_FLOW`] of the
+/// period-two sweep and jump back on wrap. Turn `0` and turn `1` both resolve
+/// to sweep position zero, approached continuously.
 #[inline]
 pub(crate) fn rainbow_phase_from_unit_turn(turn: f32) -> f32 {
     ((turn.rem_euclid(1.0) * 2.0) / RAINBOW_LIGHT_RAIL_FLOW).rem_euclid(RAINBOW_PHASE_RING)
 }
 
-// THE WAKE'S OWN PERSISTENCE IS DELETED TOO (`RAINBOW_WAKE_PERSIST = 0.30`,
-// retired 2026-09-16 with `GlowConfig::wake_persist_s`). It was the default
-// that dial carried — "the plume shows the last ~0.3 s of travel" — and after
-// §17.3 phase 7 deleted the walk that replayed a travel window it was a
-// default for nothing: every construction site in the tree wrote it into a
-// field no frame read. What decides how much recent typing you see today is
-// `Ribbon::cell_life` (priced from `cfg.duration`, floored at the phrase rest)
-// — see the tombstone on `GlowConfig` above.
-// THE WAKE'S OWN SPATIAL RATE IS DELETED (§2.1). `RAINBOW_WAKE_SWEEP_SPREAD`,
-// `RAINBOW_WAKE_SWEEP_TRAVEL`, `RAINBOW_WAKE_SWEEP_MIN` and
-// `rainbow_wake_sweep_spread` gave the plume a spectrum of its own, resolved at
-// a rate DERIVED PER FRAME from the plume's reach — `2.25 / reach_cells`, a 25x
-// range, and therefore a function of typing momentum.
-//
-// The whole apparatus was solving a problem the field does not have. Its own
-// doc records both horns: at a fixed 0.50 a hot 27.5-cell plume ping-ponged the
-// spectrum 6.9 times (owner: "it's more of just arbitrary colors?"), and at
-// v0.43's 0.15 a resting plume was nearly monochrome. Both are symptoms of the
-// plume owning a second spectrum: it had to pick a rate, and no rate serves both
-// ends of its own length range.
-//
-// Reading the FIELD removes the choice. The plume's colour at a column is the
-// colour of the cell it covers — the same cell the ribbon above it is drawing —
-// so a long plume shows exactly the spectrum the text under it was typed in,
-// never a repeat and never a smear, at any cadence, with nothing to tune.
+// The plume has no spectrum or persistence of its own: its colour at a column
+// is the colour of the cell it covers, the same cell the ribbon above it
+// draws, so a long plume shows the spectrum the text under it was typed in at
+// any cadence. How much recent typing shows is `Ribbon::cell_life` (priced
+// from `cfg.duration`, floored at the phrase rest).
 
-// THE LEADING IS NOT BEHIND LETTERFORMS, AND IT STOPS PAYING AS IF IT
-// WERE. `RAINBOW_BAND_COV_CAPS` is a ceiling on the light INK can be read
-// over — solved for the tall body's six slabs under the typed glyphs — and the
-// hybrid inherited it by sharing `rainbow_band_coverage`, so the strip in the
-// leading, the one part of the mark with no ink on it, was held to yellow's
-// `57` and composited to olive (`#4B4C12`, V `0.30`) between a brighter red
-// and blue. That is the dark middle third of every ribbon the owner reported
-// as *"black gaps in the underline"* and *"weird cutoffs in brightness"*
-// (2026-08-29), and it is what §4's zone table already forbids: *"Row
-// boundary ± the leading: the ribbon body — full strength."*
-//
-// So the strip carries a LIFT above its ink ceiling
-// (`aterm_render::RibbonVertex::lift`) — since 2026-08-30 a RATIO of the
-// cell's own equalized ink rather than a flat level, and no longer starved
-// by the falloff ledge budget: see `RAINBOW_STRIP_GAIN` and
-// `rainbow_spine_lift`. (The retired flat target `RAINBOW_SPINE_LEVEL =
-// 168` and its `RAINBOW_LEDGE_STEP_BUDGET = 34` pricing are recorded there.)
+// The leading carries no ink, so the ribbon strip there is not held to the ink
+// ceiling: it carries a lift above it (`aterm_render::RibbonVertex::lift`), a
+// ratio of the cell's own equalized ink, so the row boundary shows the ribbon
+// body at full strength.
 
-/// Compatibility bound for the retired laid-hue lattice. The live kitty field
-/// is instead bounded by [`RAINBOW_CLASSIC_UNROLL`] and cached in
-/// [`Spark::classic_t`]; this constant remains for the ancillary lattice's
-/// compile-time checks and negative controls.
+/// Adjacency bound for the ancillary laid-hue lattice, kept for its
+/// compile-time checks below; the live kitty field is bounded by the classic
+/// geometry.
 pub(super) const RAINBOW_UNDERLINE_SWEEP_MAX: f32 = 0.22;
 
-/// Reference step for the ancillary rainbow-kitty rolling hue clock. It still
-/// sequences per-spawn hue data and compatibility state, but it is not the
-/// visible ribbon's spatial rate; classic geometry supplies that rate.
+/// Reference step for the ancillary rainbow-kitty rolling hue clock. It
+/// sequences per-spawn hue data, not the visible ribbon's spatial rate
+/// (classic geometry supplies that).
 pub(super) const RAINBOW_KITTY_HUE_STEP: f32 = 0.0125;
 
-/// **THE SHORTEST TRAVERSE, IN CELLS.** A mark only a few cells long must not
-/// be handed a few-cell traverse: the per-cell hue step is `1 / T` of the arc
-/// and the arc's steepest stretch spends `1420°` per unit of traverse, so a tiny
-/// `T` walks the green→blue crossing in one cell and prints a band edge. At `26`
-/// the worst per-cell step is `55°`, about `3.6°` per device pixel at the shipped
-/// cell width — inside the per-pixel ceiling §8's acceptance measures, and the
-/// adjacency ceiling [`RAINBOW_UNDERLINE_SWEEP_MAX`] is checked against it below
-/// at compile time.
-///
-/// It is also the floor a GROWING mark lays at: the first cells of a burst are
-/// laid while the mark is two or three cells long, and they should carry the
-/// spectrum of the mark they are about to be part of.
+/// The shortest traverse, in cells. The per-cell hue step is `1 / T` of the
+/// arc, so a tiny `T` would print band edges. At `26` the worst per-cell step
+/// is `55°`, about `3.6°` per device pixel; [`RAINBOW_UNDERLINE_SWEEP_MAX`] is
+/// checked against it below. Also the floor a growing mark lays at, so a
+/// burst's first cells carry the spectrum of the mark they will be part of.
 pub(super) const RAINBOW_TRAVERSE_MIN_CELLS: f32 = 26.0;
 
-/// The short mark's traverse, in cells — `1/16` of the arc per cell, the
-/// value [`RAINBOW_CLASSIC_UNROLL`] resolves to. Sized against four gates at
-/// once: a FIVE-char word's last cell reaches yellow (`4/16 = 0.25` of the
-/// arc → hue 45°, five degrees past the yellow bin's edge — the sentinel's
-/// red→yellow short-word bar runs on "hello", and the five-key law pins the
-/// traverse at `<= ~17.3` from above, NOT the `~18.5` a six-char reading
-/// once claimed: at 18 "hello" topped at 37.8° and the bar read 4/5); the
-/// per-cell lay stays well under the adjacency ceiling (checked at compile
-/// time below); the crossing transit moves `1420°/16 ≈ 89°` per cell ≈
-/// `5.9°`/device px — inside §8's ~10°/px smoothness ceiling; and a 4-key
-/// line's head (`3/16 ≈ 0.19`) stays clear of the crossing.
-///
-/// **`14 -> 18 -> 16` (owner, 2026-08-30: "I don't like that the rainbow is
-/// advancing as fast as I'm typing. I'd like to advance slower").** The
-/// unroll IS the advance rate the eye reads at the caret while a line is
-/// young: one key moves the head `282°/T` of hue at any cadence. At `14`
-/// that was `20.1°` per keystroke — at 90 ms the head visibly churned
-/// through a named colour every three keys. `18` was calmer still
-/// (`15.7°`) but broke the five-key word's red→yellow floor; `16` is the
-/// calmest traverse the five-key law admits — `17.6°` per key, violet at 17
-/// cells, and past the unroll the walk keeps slowing as the span grows (the
-/// classic stretch).
+/// The short mark's traverse, in cells: `1/16` of the arc per cell. Sized so
+/// a five-char word's last cell reaches yellow (`4/16` of the arc → 45°), the
+/// per-cell lay stays under the adjacency ceiling (checked below), the
+/// crossing transit stays about `5.9°`/device px, and a 4-key line's head
+/// (`3/16`) stays clear of the crossing. It is also the calmest advance that
+/// still reaches yellow in five keys: `17.6°` per key, violet at 17 cells
+/// (owner, 2026-08-30).
 pub(super) const RAINBOW_SHORT_TRAVERSE_CELLS: f32 = 16.0;
 
-// THE SHORT WALK'S STEP obeys the same adjacency law as the clamp's: one
-// typed cell may never lay more than [`RAINBOW_UNDERLINE_SWEEP_MAX`] of the
-// spectrum, dwell re-pacing included.
+// The short walk's step obeys the same adjacency rule: one typed cell never
+// lays more than [`RAINBOW_UNDERLINE_SWEEP_MAX`] of the spectrum, end
+// re-pacing included.
 const _: () = assert!(
     (1.0 + RAINBOW_END_DWELL) / RAINBOW_SHORT_TRAVERSE_CELLS + RAINBOW_LAID_END_PULL
         <= RAINBOW_UNDERLINE_SWEEP_MAX,
     "the short walk's step must stay under the adjacency ceiling"
 );
 
-/// **THE SETTLED TRAVERSE, IN CELLS** — what one red→violet pass costs once a
-/// line is long, and the whole of the owner's 2026-08-31 ruling: *"I think we
-/// need to slowly advance the lead color as typing we dont' want to be stuck on
-/// purple do you understand?"*
+/// The settled traverse, in cells: what one red→violet pass costs once a line
+/// is long (owner, 2026-08-31).
 ///
-/// **THE DEFECT THIS REPLACES, MEASURED ON GLASS.** The classic field used to
-/// STRETCH one arc to fit the mark — [`CursorGlow::rainbow_classic_t`] divided
-/// by `span.max(`[`RAINBOW_CLASSIC_UNROLL`]`)` — so the head's own position was
-/// `span / span` the instant the mark outgrew the unroll: pinned at `1.0`,
-/// violet, forever. Filmed on an isolated 24x100 Nord instance typing 100 keys
-/// at 85 ms (`ctl image` per key, head cell read as composited HSV): head hue
-/// `277.3°, 277.8°, 277.6°, 278.4°, 282.4°` at keys 20/40/60/80/100 — **`5.1°`
-/// of travel across eighty keystrokes, `0.06°` per key.** Every one of those
-/// eighty keys laid the same purple. That is what the owner is seeing, and no
-/// amount of re-pacing a stretched arc can fix it: a traverse that is defined
-/// as the mark's own length cannot advance relative to the mark.
+/// The traverse is a length, not a function of the mark: an arc stretched to
+/// fit the mark would pin the head at `1.0` (violet) as soon as the mark
+/// outgrew the unroll. As a length, the head walks red→…→violet→red→… as long
+/// as typing lasts, at a rate bounded below by `1 /` this number.
 ///
-/// So the traverse stops being a function of the mark and becomes a LENGTH. The
-/// head then walks red→…→violet→red→… for as long as the typing lasts and never
-/// parks, because the walk's rate is bounded below by `1 /` this number.
-///
-/// **WHY `36` AND NOT THE UNROLL'S `16`.** The unroll's rate is `282°/16 =
-/// 17.6°` per key, and the owner has already ruled on it once from the other
-/// side (2026-08-30: *"I don't like that the rainbow is advancing as fast as
-/// I'm typing. I'd like to advance slower"*). The eye reads the arc in NAMES —
-/// seven of them over `282°`, so a named colour is `40.3°` wide. At `17.6°/key`
-/// a name changes every `2.3` keys, which at 90-110 ms cadence is a new colour
-/// four times a second: churn, which is the complaint. At `36` the rate is
-/// **`7.83°` per keystroke**, a name every `5.1` keys — about **half a second
-/// per named colour**, and a full red→violet pass in `36` keys, i.e. **`3.2 s`
-/// at 90 ms and `4.0 s` at 110 ms**. That is the "slow, deliberate sweep, order
-/// several seconds" the ruling asks for, and it is `2.25x` slower than the rate
-/// the owner called too fast.
-///
-/// **AND WHY IT MAY NOT GO MUCH HIGHER.** The bound was the green→blue
-/// crossing: on the retired arc it was far and away the steepest leg — `1420°`
-/// per unit of traverse, spending `1420/T` per cell — and a census kept its
-/// desaturated seam to ONE ribbon slab for traverses `26..=72`, two at `80` and
-/// beyond. `36` sits in the middle of that range with room on both sides.
-/// **THAT SEAM NO LONGER EXISTS** (2026-09-15): the crossing's authored roof,
-/// its saturation taper and its exemption from the spectrum's perceptual pace
-/// were the retired no-cyan ruling's machinery and are deleted, so the crossing
-/// is drawn at full chroma and spent at the same pace as every other leg — it
-/// is no longer the arc's steepest, and there is no pale seam for a traverse to
-/// widen. The number stands on the ruling above it (the rate the owner asked
-/// for) rather than on a crossing bound that has gone quiet.
+/// `36` gives `7.83°` of hue per keystroke: a named colour (about `40.3°`
+/// wide) every 5.1 keys, about half a second per name, and a full pass in
+/// 3.2-4.0 s at 90-110 ms cadence. Faster rates read as churn; much slower
+/// ones as a single colour.
 pub(super) const RAINBOW_TRAVERSE_SETTLED: f32 = 36.0;
 
-/// **THE WRAP, IN CELLS** — violet back to red, the one adjacency the arc has
-/// never had, and the price of a head that keeps advancing.
+/// The wrap in cells: violet back to red, the price of a head that keeps
+/// advancing.
 ///
-/// A periodic hue MUST close somewhere. The arc's own ends are violet
-/// (`#9400D3`, `282°`) and red (`#FF0000`, `0°`), and the short way between them
-/// runs UP through magenta and rose — `282° → 328° → 360°` — which is `78°` of
-/// hue that never approaches the cyan window `[165°, 200°]` and never loses
-/// saturation (both ends have `G = 0`, and so does every point of the lerp
-/// between them, so `S = 1.0` across the whole leg).
-///
-/// **THE LENGTH IS DERIVED, NOT CHOSEN: the wrap moves at exactly the crossing's
-/// own rate.** The green→blue crossing is the fastest transit the arc already
-/// contains and the only one the design already accepts and gates — `1420°` per
-/// unit of traverse, i.e. `1420/36 = 39.4°` per cell at the settled traverse.
-/// Asking the wrap to move no faster than that gives `78° / 39.4° = 1.98` cells.
-/// `2` is that number. The wrap is therefore not a cliff and not a new kind of
-/// event: it is a second crossing, the same speed as the first, in a part of the
-/// circle with no cyan in it.
+/// A periodic hue must close somewhere. The arc's ends are violet (`#9400D3`,
+/// `282°`) and red (`#FF0000`, `0°`); the short way between them runs through
+/// magenta (`282° → 360°`, `78°`), with `G = 0` throughout, so `S = 1.0` and
+/// it never nears cyan. The length makes the wrap move no faster than the
+/// green→blue crossing (`1420/36 = 39.4°` per cell): `78 / 39.4 ≈ 2` cells.
 pub(super) const RAINBOW_WRAP_CELLS: f32 = 2.0;
 
-/// The wrap as a SHARE of the arc, which is the unit the walk is stated in.
-///
-/// Expressed as a share rather than a cell count it stays at the crossing's rate
-/// at EVERY local rate the walk takes: at the unroll's `1/16` the wrap is `0.89`
-/// cells and spends `88°` there, against the crossing's own `1420/16 = 89°` — the
-/// same equality that sized it, holding at the other end of the walk.
+/// The wrap as a share of the arc (the unit the walk is stated in), so it
+/// keeps the crossing's rate at every local rate the walk takes.
 pub(super) const RAINBOW_WRAP_SHARE: f32 = RAINBOW_WRAP_CELLS / RAINBOW_TRAVERSE_SETTLED;
 
 /// One full turn of the spectrum in arc units: the red→violet arc (`1.0`) plus
 /// the wrap that closes it. [`rainbow_cycle_phase`] folds by this.
 pub(super) const RAINBOW_CYCLE: f32 = 1.0 + RAINBOW_WRAP_SHARE;
 
-// THE WALK NEVER PARKS: its rate is bounded below by the settled traverse, so
-// one more typed cell always moves the head. A zero here would be the defect
-// this law replaces, spelled as a constant.
+// The walk never parks: its rate is bounded below by the settled traverse,
+// so one more typed cell always moves the head.
 const _: () = assert!(
     RAINBOW_TRAVERSE_SETTLED > 0.0 && RAINBOW_TRAVERSE_SETTLED.is_finite(),
     "the settled traverse is the walk's lower bound on advance; it may not be zero"
 );
-// THE WRAP IS NO FASTER THAN THE CROSSING, which is the derivation above stated
-// as an inequality the compiler checks: the crossing spends `1420/T` per cell,
-// the wrap `78/W`, and the wrap may not be the steeper of the two.
+// The wrap is no faster than the crossing: the crossing spends `1420/T` per
+// cell, the wrap `78/W`.
 const _: () = assert!(
     78.0 / RAINBOW_WRAP_CELLS <= 1420.0 / RAINBOW_TRAVERSE_SETTLED,
     "the wrap may not move faster than the green-blue crossing it is paced against"
@@ -934,12 +514,9 @@ const _: () = assert!(
 /// arc, `(1, `[`RAINBOW_CYCLE`]`)` is the wrap that closes it.
 #[inline]
 pub(super) fn rainbow_cycle_phase(p: f32) -> f32 {
-    // THE FAST PATH IS THE COMMON PATH. Every short mark, every caret read at
-    // rest and every arc-domain caller hands this a number already inside one
-    // turn, and the hot ribbon calls it per slab per vertex — `rem_euclid` is a
-    // library `fmod` and it showed up as tens of microseconds a frame on the
-    // worst-case bench. One compare answers the common case; the general case is
-    // a multiply, a floor and a fused subtract rather than a call.
+    // Fast path: most callers pass a value already inside one turn, and the
+    // hot ribbon calls this per slab per vertex, so avoid `rem_euclid` (a
+    // library `fmod`) there.
     if (0.0..RAINBOW_CYCLE).contains(&p) {
         return p;
     }
@@ -947,13 +524,9 @@ pub(super) fn rainbow_cycle_phase(p: f32) -> f32 {
         return 0.0;
     }
     let folded = p - RAINBOW_CYCLE * (p * RAINBOW_CYCLE_INV).floor();
-    // The subtraction can land exactly on the period through rounding; the
-    // domain is half-open, so fold that one value down rather than out. Spelled
-    // as the same `contains` the fast path above uses, which is exact here
-    // rather than merely tidy: the two forms are De Morgan duals only when NaN
-    // is absent, and it is — `p` was proved finite three lines up, and the only
-    // way this expression reaches NaN is `inf - inf`, which needs an infinite
-    // `p`. An overflow to `-inf` lands outside the range either way.
+    // Rounding can land exactly on the period; the domain is half-open, so
+    // fold that value down. `p` is finite here, so NaN cannot reach this
+    // `contains`, and an overflow to `-inf` lands outside the range either way.
     if !(0.0..RAINBOW_CYCLE).contains(&folded) {
         return 0.0;
     }
@@ -963,15 +536,13 @@ pub(super) fn rainbow_cycle_phase(p: f32) -> f32 {
 /// Reciprocal of [`RAINBOW_CYCLE`], so the fold is a multiply.
 pub(super) const RAINBOW_CYCLE_INV: f32 = 1.0 / RAINBOW_CYCLE;
 
-/// **THE CYCLE'S COLOUR.** `spectrum` on the arc, and the wrap leg — violet to
-/// red the short way, through magenta — past it.
+/// The cycle's colour: `spectrum` on the arc, and past it the wrap leg,
+/// violet to red the short way through magenta.
 ///
-/// The join is exact at both ends and needs no easing: `spectrum(1.0)` IS the
-/// violet anchor `#9400D3` and `spectrum(0.0)` IS the red anchor `#FF0000`
-/// (the seven anchors are stored verbatim, wherever the pace put them —
-/// [`crate::spectrum::SPECTRUM_ANCHOR_AT`]), so this lerp starts and
-/// finishes on the same bytes the arc does. The leg holds `G = 0` throughout,
-/// so it is fully saturated at every point and cannot enter the cyan window.
+/// The join is exact at both ends: `spectrum(1.0)` is the violet anchor and
+/// `spectrum(0.0)` the red anchor (stored verbatim, see
+/// [`crate::spectrum::SPECTRUM_ANCHOR_AT`]). The leg holds `G = 0`, so it is
+/// fully saturated and never enters the cyan window.
 #[inline]
 pub(super) fn rainbow_cycle_ink(p: f32) -> u32 {
     let phase = rainbow_cycle_phase(p);
@@ -986,163 +557,85 @@ pub(super) fn rainbow_cycle_ink(p: f32) -> u32 {
     }
 }
 
-/// **THE LONGEST TRAVERSE, IN CELLS.** A screen-crossing run at full tilt can
-/// hold a mark of two hundred cells; letting the traverse follow it that far
-/// would spread one arc so thin that a whole word is one colour. Beyond this the
-/// mark simply carries more than one traverse again — which at that length is
-/// what a rainbow trail dragged across two wrapped lines should look like.
-///
-/// It is ALSO the number [`RAINBOW_LAID_END_REACH`] is sized against, because
-/// the slowest lay is the one whose cells sit closest together.
+/// The longest traverse, in cells. A screen-crossing run can hold a mark of
+/// two hundred cells; past this the mark carries more than one traverse rather
+/// than spreading one arc so thin that a word is one colour. Also the bound
+/// [`RAINBOW_LAID_END_REACH`] is sized against (the slowest lay).
 pub(super) const RAINBOW_TRAVERSE_MAX_CELLS: f32 = 144.0;
 
-/// PHASER's own step, in turns per typed cell. `0.14` — the rate every style's
-/// rolling hue used to turn at, doubled, so the fat beam visibly sweeps the
-/// spectrum instead of dwelling on one hue. Named beside its sibling for the
-/// same reason.
+/// Phaser's hue step, in turns per typed cell: fast enough that the fat beam
+/// visibly sweeps the spectrum.
 pub(super) const RAINBOW_PHASER_HUE_STEP: f32 = 0.14;
 
-/// **THE ROLLING HUE STEP FOR EVERY OTHER STYLE** — `0.07`, unchanged since it
-/// was the one shared number.
-///
-/// It exists as its own constant because [`RAINBOW_KITTY_HUE_STEP`] stopped
-/// being a shared one. For the kitty that number is now a SPATIAL rate solved
-/// against the ribbon's measured length; for sparkle, lumen, fire, laser, beam,
-/// water and comet it is what it always was — how fast the colour a grain or a
-/// wake is dealt turns as you type — and those styles have no ribbon whose
-/// length could solve it. Slowing them by the kitty's factor would be a change
-/// to seven styles nobody asked to change.
+/// The rolling hue step for the non-kitty styles (sparkle, lumen, fire, laser,
+/// beam, water, comet): how fast the colour a grain or wake is dealt turns as
+/// you type.
 pub(super) const RAINBOW_ROLL_HUE_STEP: f32 = 0.07;
 
-/// **THE LAY RATE**, in fractions of one red→violet traverse per typed cell —
-/// what the spectrum's spatial pace along the trail is, in the units every claim
-/// about the mark's colour is stated in.
-///
-/// The two constants above are a HUE step; this is what the fold makes of it, and
-/// it is the number the adjacency ceiling and every per-cell pin are about.
-/// `0.14`, unchanged: the laid fold's end-pull touches only the
-/// outermost [`RAINBOW_LAID_END_REACH`] of the arc, so the pace between cells
-/// anywhere else is exactly what it always was.
-///
-/// **IT IS THE PACE AT THE REFERENCE MARK, NOT AT EVERY MARK.** Since
-/// [`RAINBOW_TRAVERSE_PER_MARK`] the lay rate is solved per keystroke against
-/// the mark's own live length, so the pace on glass is `1 / T` for that mark's
-/// `T` — this number is what that resolves to at the `40`-cell traverse the
-/// fixed rate assumed, and it stays the unit every claim about the arc is
-/// stated in. The two numbers a bound has to be taken against are
-/// [`RAINBOW_LAID_SWEEP_MAX_PER_CELL`] (the fastest lay, through the dwell) and
-/// [`RAINBOW_LAID_END_PULL`] (the slowest).
+/// The lay rate of the ancillary lattice, in fractions of one red→violet
+/// traverse per typed cell, at the reference 40-cell traverse. Bounds are
+/// taken against [`RAINBOW_LAID_SWEEP_MAX_PER_CELL`] (fastest lay) and
+/// [`RAINBOW_LAID_SWEEP_MIN_PER_CELL`] (slowest).
 pub(super) const RAINBOW_LAID_SWEEP_PER_CELL: f32 = RAINBOW_KITTY_HUE_STEP * RAINBOW_LAID_HUE_SWEEP;
 
-/// **THE FASTEST ONE KEYSTROKE CAN EVER LAY**, in fractions of a traverse — the
-/// shortest traverse ([`RAINBOW_TRAVERSE_MIN_CELLS`]) walked at the steepest
-/// point of the dwell's re-pacing. Every adjacency bound is taken against THIS,
-/// not against the reference pace above, because the rate is now solved per
-/// mark.
+/// The fastest one keystroke can lay, in fractions of a traverse: the
+/// shortest traverse ([`RAINBOW_TRAVERSE_MIN_CELLS`]) at the steepest point of
+/// the end re-pacing. Every adjacency bound is taken against this.
 pub(super) const RAINBOW_LAID_SWEEP_MAX_PER_CELL: f32 =
     (1.0 + RAINBOW_END_DWELL) / RAINBOW_TRAVERSE_MIN_CELLS;
 
-/// **THE SLOWEST**, likewise — the longest traverse walked at the dwell's
-/// shallowest point, which is the arc's two ends. It is the gap between the two
-/// cells nearest a turnaround in the worst case, so the end-pull's flat landing
-/// zone must be narrower than this or two keystrokes could park on the same
-/// anchor — the parked-lay defect that killed the zero-slope turnaround.
+/// The slowest lay: the longest traverse at the re-pacing's shallowest point
+/// (the arc's ends). The end-pull's landing zone must be narrower, or two
+/// keystrokes could park on the same anchor.
 pub(super) const RAINBOW_LAID_SWEEP_MIN_PER_CELL: f32 =
     (1.0 - RAINBOW_END_DWELL) / RAINBOW_TRAVERSE_MAX_CELLS;
 
-/// **HOW WIDE THE END-PULL'S LANDING IS** — strictly inside
-/// [`RAINBOW_LAID_SWEEP_MIN_PER_CELL`], so at most ONE cell per turnaround can
-/// resolve to the exact anchor however slowly the mark is being laid. The
-/// compile-time clause below is what holds that.
+/// Width of the end-pull's landing, strictly inside
+/// [`RAINBOW_LAID_SWEEP_MIN_PER_CELL`], so at most one cell per turnaround
+/// resolves to the exact anchor. Checked at compile time below.
 pub(super) const RAINBOW_LAID_END_PULL: f32 = 0.003;
 
-/// **HOW CLOSE TO AN END THE LATTICE CAN LAND WITHOUT BEING ON IT** — half of
-/// one cell's lay, which is the whole of the violet defect.
-///
-/// A rolling hue advances [`RAINBOW_KITTY_HUE_STEP`] per typed cell and
-/// [`rainbow_sweep_reflect`] turns around at `t = 1`. The lattice therefore
-/// STRADDLES the turnaround rather than standing on it: the nearest cell to the
-/// turn sits at most half a step away in hue, which is exactly this much of the
-/// arc short of the end — and no nearer, which is what makes the pull below a
-/// GUARANTEE rather than a nudge. Measured on glass, 52 traverse tops over 30
-/// frames: median top hue `239.1°`, range `233.6..250.7`, and **not one reached
-/// the violet anchor's `255°`** — a median `0.07` of the arc short, which is half
-/// a lay, exactly as a uniform offset predicts.
-///
-/// The arc was never the problem: `spectrum(1.0)` is `#6633FF` and the table
-/// stores it verbatim. The SAMPLING never landed on it.
-///
-/// **AND THE HALF-STEP IS NOW TAKEN THROUGH THE DWELL.** The lattice still
-/// straddles the turnaround by half a lay, but that half-lay is measured in the
-/// RAW triangle and the end-dwell re-pacing compresses it by `1 - a` on the way
-/// out, so the shortfall on the arc is that much smaller. This is the worst case
-/// over the whole clamp range — the FASTEST lay
-/// ([`RAINBOW_TRAVERSE_MIN_CELLS`]), because a fast lay is the one whose cells
-/// sit furthest apart — and it is still what every claim about landing on an
-/// anchor is allowed to be wrong by.
+/// How close to an end the lattice can land without being on it: half of one
+/// cell's lay. The rolling hue advances [`RAINBOW_KITTY_HUE_STEP`] per cell and
+/// [`rainbow_sweep_reflect`] turns around at `t = 1`, so the lattice straddles
+/// the turnaround and its nearest cell is up to half a step short. The
+/// end-dwell re-pacing compresses that half-lay by `1 - a`. Taken at the
+/// fastest lay ([`RAINBOW_TRAVERSE_MIN_CELLS`]), whose cells sit furthest
+/// apart; it is what any claim about landing on an anchor may be off by.
 pub(super) const RAINBOW_LAID_END_REACH: f32 =
     (1.0 - RAINBOW_END_DWELL) * 0.5 / RAINBOW_TRAVERSE_MIN_CELLS;
 
-/// TURNS OF LAID HUE → SPECTRUM POSITION, the gain the laid fold applies.
-/// One turn of the engine's rolling hue therefore paints one complete
-/// red→violet→red ping-pong.
+/// Turns of laid hue → spectrum position: one turn of the rolling hue paints
+/// one complete red→violet→red ping-pong.
 ///
-/// IT MUST BE AN EVEN INTEGER, and that is the whole reason it is a named
-/// constant rather than a literal 2: [`rainbow_sweep_reflect`] has period 2, and
-/// the engine's hue is kept `.fract()`ed to `0..1`, so only an even gain makes
-/// the fold agree across the wrap. At 2 the hues 0.99 and 0.01 resolve to sweep
-/// 0.02 and 0.02 — the same near-red — instead of stepping violet→red and
-/// printing the magenta seam. At 4 the per-cell step (0.28) would also break
-/// [`RAINBOW_UNDERLINE_SWEEP_MAX`]; 2 is the only value that satisfies both.
+/// Must be an even integer: [`rainbow_sweep_reflect`] has period 2 and the hue
+/// is kept in `0..1`, so only an even gain agrees across the wrap (0.99 and
+/// 0.01 both resolve near red instead of printing a magenta seam). At 4 the
+/// per-cell step would break [`RAINBOW_UNDERLINE_SWEEP_MAX`], so 2 is the only
+/// value that satisfies both.
 pub(super) const RAINBOW_LAID_HUE_SWEEP: f32 = 2.0;
 
-// THE SUB-CELL RASTER GRAIN IS GONE WITH THE PER-CELL EMITTER.
-// `RAINBOW_UNDERLINE_SAMPLE_PX` fixed the mark's horizontal spectrum at two
-// device pixels, which is what a per-cell rasterizer needs to stop painting
-// cell-wide colour blocks. The mark is one polyline now and its major-axis
-// resolution is SOLVED against the quad budget by
-// [`CursorGlow::rainbow_ribbon_stride`] (floored at
-// [`CursorGlow::RAINBOW_RIBBON_SAMPLE_MIN`]), so a word gets four samples per
-// cell and a screen-crossing ribbon gets one — a fixed grain can only be too
-// coarse at one end of that range or too expensive at the other.
-
-/// THE ADJACENCY BOUND, CHECKED BY THE COMPILER. A retune of the hue step or of
-/// the fold's gain that pushed neighbouring cells further apart than
-/// [`RAINBOW_UNDERLINE_SWEEP_MAX`] would let the mark lay red beside violet —
-/// the one adjacency this family bans — and it would do so silently, at some
-/// trail length nobody happened to capture. So it fails the BUILD instead: the
-/// three constants are compile-time, and so is the relation between them.
-/// **AND IT IS TAKEN AGAINST THE FASTEST LAY THE RATE LAW CAN SOLVE TO**, not
-/// against the reference pace — since [`RAINBOW_TRAVERSE_PER_MARK`] the rate is
-/// a function of the mark, so a retune of the CLAMP or of the DWELL is the
-/// retune that could reach the banned adjacency, and both are in this clause.
+/// The adjacency bound, checked at compile time: a hue step, gain, clamp or
+/// dwell retune that pushed neighbouring cells further apart than
+/// [`RAINBOW_UNDERLINE_SWEEP_MAX`] (red beside violet) fails the build. Taken
+/// against the fastest lay.
 const _: () = assert!(
     RAINBOW_LAID_SWEEP_MAX_PER_CELL + RAINBOW_LAID_END_PULL <= RAINBOW_UNDERLINE_SWEEP_MAX,
     "one typed cell must step at most RAINBOW_UNDERLINE_SWEEP_MAX of the spectrum"
 );
 
-/// **THE LANDING IS NARROWER THAN THE SLOWEST LAY, CHECKED BY THE COMPILER.**
-/// The end-pull collapses the outermost [`RAINBOW_LAID_END_PULL`] of the fold
-/// onto the anchor. If two cells could ever fall inside that width, two
-/// consecutive keystrokes would lay the SAME field — the parked lay that
-/// `rainbow_ribbon_hue_advances_with_the_typed_text` bans and that killed the
-/// zero-slope turnaround built before this. The cells sit closest together at
-/// the slowest lay, at the dwell's shallowest point, which is exactly
-/// [`RAINBOW_LAID_SWEEP_MIN_PER_CELL`] — so the relation is arithmetic and
-/// belongs to the build.
+/// The end-pull's landing is narrower than the slowest lay
+/// ([`RAINBOW_LAID_SWEEP_MIN_PER_CELL`]), checked at compile time: otherwise
+/// two consecutive keystrokes could lay the same field (the parked lay
+/// `rainbow_ribbon_hue_advances_with_the_typed_text` bans).
 const _: () = assert!(
     RAINBOW_LAID_END_PULL < RAINBOW_LAID_SWEEP_MIN_PER_CELL,
     "the end-pull's landing must be narrower than one lay at the slowest rate"
 );
 
-/// **THE REFERENCE PACE IS A PACE THE LAW CAN ACTUALLY RESOLVE TO.** Every claim
-/// about this mark's colour — in the tests, in §8, in the notes above — is
-/// stated in [`RAINBOW_LAID_SWEEP_PER_CELL`], and that only means anything while
-/// the rate law can still produce it for some mark length. A retune of the clamp
-/// that put `0.025` outside the reachable range would leave the whole vocabulary
-/// describing a rate the engine never lays at. And the worst the fold's landing
-/// can be wrong by, plus one lay at the fastest rate, still has to sit inside the
-/// banned-adjacency ceiling.
+/// The reference pace [`RAINBOW_LAID_SWEEP_PER_CELL`] must be a pace the rate
+/// rule can resolve to for some mark length, and the landing error plus one
+/// fastest lay must stay inside the adjacency ceiling.
 const _: () = assert!(
     RAINBOW_LAID_SWEEP_MIN_PER_CELL <= RAINBOW_LAID_SWEEP_PER_CELL
         && RAINBOW_LAID_SWEEP_PER_CELL <= RAINBOW_LAID_SWEEP_MAX_PER_CELL
@@ -1150,51 +643,11 @@ const _: () = assert!(
     "the reference pace must be reachable and its landing error inside the ceiling"
 );
 
-// `RAINBOW_BODY_CENTRE` IS DELETED. It named the tall body's vertical MIDPOINT —
-// "the row of the red→violet stack a companion mark inherits its colour from" —
-// so the emitter and the head-colour seam could agree on the colour there. A
-// constant whose whole job was keeping two answers to "what colour is this cell"
-// in step. A cell has one position now, read from one field, so there is no
-// second answer to keep in step with, and no stack for a midpoint to be in.
+// The mark has one bright-above-body channel, the specular glint. Cadence
+// reaches the plume through `beat`, which drives the core's weight and its
+// thickness swell.
 
-// THE SHIMMER/RESERVATION TIE STOOD HERE AND IS MOOT ON THIS BRANCH.
-//
-// It was a `const _: () = assert!(MAGIC_ROOM * (1.0 + RAINBOW_IRID_AMP) <= 1.0)`,
-// checked at compile time because the two constants lived 3 000 lines apart and
-// the failure it prevented was silent: past `1 / (1 + IRID_AMP)` the SHIMMER's
-// own crest clamped against the uniform ceiling before the glint had added
-// anything, so the strip's brightest sub-sample pinned at the ceiling at every
-// phase and both magic channels went arithmetically dead at the top of their
-// range.
-//
-// The iridescence field is DELETED here — it was a ~2.7-cell lattice swinging
-// ±30 % of each cell's coverage, i.e. the loudest per-cell brightness term in
-// the emitter and a bead by construction — so there is no second magic channel
-// left to reserve against. `RAINBOW_IRID_AMP` and `rainbow_irid_noise` do not
-// exist in this crate, which is what makes the deletion safe rather than
-// convenient: a tie has nothing to bind. The property it protected — that the
-// surviving glint is live at the top of its range and still capped — is
-// measured directly by `rainbow_underline_magic_channels_are_live_and_capped`.
-
-// THE FILAMENT IS DELETED (step 4). A thin near-white nucleus was laid on the
-// spine inside the coloured body — `lerp_rgb(band, white, 0.25)` — as a SIXTH
-// treatment of the same six anchors: desaturated, off-anchor, drawn on top of an
-// already-off-anchor lerp. §3 rules it out on the coherence count, and its own
-// history is the corroboration: it was retuned twice (0.55 → 0.30 → 0.25)
-// chasing the pink it manufactured over the red band, because desaturating a
-// saturated hue toward white is how you make the colour the owner banned. The
-// mark's one bright-above-body channel is the specular glint, and §4 ranks it
-// alone at that job.
-//
-// THE SHOCK RINGS ARE DELETED (step 4). One expanding elliptical puff per live
-// keystroke, timed a beat late. §3: invisible at typing speed and read as noise
-// when you look for them — and every one of them was a full-strength band colour
-// at a keystroke position, which is the "lots of colors" half of the owner's
-// complaint. The cadence still reaches the plume: `beat` rides the same pulse
-// ring into the core's weight AND its thickness swell, which is the "bigger
-// impacts" the rings were added beside.
-
-// ---- the WAKE's LIGHT-THEME arm ----
+// ---- the wake's light-theme arm ----
 
 /// The contrast ratio the tint aims for against the theme's own ground: WCAG
 /// AA for small text.
@@ -1211,10 +664,9 @@ pub(super) const FRESH_INK_GLYPH_MIN_DELTA: i32 = 24;
 /// below the 1/255 quantization step, so the result is exact in u8 terms.
 pub(super) const FRESH_INK_GLYPH_BISECT: usize = 24;
 
-/// WCAG relative luminance of a `0x00RRGGBB` colour. The transfer is the
-/// piecewise sRGB one (a linear toe below 0.03928, a 2.4 power above), NOT a
-/// plain power law — the two disagree by enough near black to move a ratio
-/// across the AA line.
+/// WCAG relative luminance of a `0x00RRGGBB` colour, with the piecewise sRGB
+/// transfer (linear toe below 0.03928, 2.4 power above); a plain power law
+/// differs enough near black to move a ratio across the AA line.
 #[inline]
 pub(super) fn rel_luminance(c: u32) -> f32 {
     let ch = |sh: u32| {
@@ -1228,9 +680,8 @@ pub(super) fn rel_luminance(c: u32) -> f32 {
     0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0)
 }
 
-/// WCAG contrast ratio between two `0x00RRGGBB` colours. Named apart from
-/// the test module's own long-standing `contrast_ratio` helper, which returns
-/// `f64` and would silently shadow this one inside `mod tests`.
+/// WCAG contrast ratio between two `0x00RRGGBB` colours. Named apart from the
+/// test module's `f64` `contrast_ratio` helper, which would shadow it there.
 #[inline]
 pub(super) fn wcag_ratio(a: u32, b: u32) -> f32 {
     let (x, y) = (rel_luminance(a), rel_luminance(b));
@@ -1276,28 +727,20 @@ pub(super) enum GlyphInkSide {
     Light,
 }
 
-/// THE BOUND. The side the theme's ink is on, and the luminance every point of
-/// the tint path must satisfy — or `None` when this theme gets no tint at all.
+/// The side the theme's ink is on, and the luminance every point of the tint
+/// path must satisfy, or `None` when this theme gets no tint.
 ///
-/// WHY A LUMINANCE AND NOT A RATIO PER POINT. The tint is a per-channel lerp
-/// from the foreground to the band ink, so every channel of every intermediate
-/// colour lies in the BOX between the two endpoints' channels. `rel_luminance`
-/// is monotone non-decreasing in each channel, so the worst luminance anywhere
-/// on the path is bounded by the box CORNER — [`chan_max`] on the dark side,
-/// [`chan_min`] on the light side. Bounding that one corner bounds the whole
-/// path, with no sampling and no convexity argument (the sRGB toe makes the
-/// transfer slightly non-convex at its join, so a convexity argument would not
-/// actually hold).
+/// A luminance, not a per-point ratio: the tint is a per-channel lerp from
+/// the foreground to the band ink, so every intermediate colour lies in the
+/// box between the endpoints, and `rel_luminance` is monotone in each channel.
+/// The box corner ([`chan_max`] on the dark side, [`chan_min`] on the light
+/// side) bounds the whole path with no sampling.
 ///
-/// WHY `max(cap_AA, L(fg))` AND NOT THE RATIO ROUND-TRIP. When a theme's own
-/// body text sits BELOW AA — Solarized Light's `#657B83` on `#FDF6E3` is
-/// 4.13:1 — demanding AA of the tint would demand more than the theme delivers,
-/// and the honest bound is the theme's own ratio. Writing that as
-/// `(L(bg)+0.05)/min(4.5, contrast(fg,bg)) - 0.05` round-trips `L(fg)` through
-/// two divisions and lands an ulp BELOW it, which makes every candidate
-/// infeasible and collapses the palette. The `max` form is feasible at the
-/// foreground itself by identity, because both sides evaluate the same
-/// `rel_luminance(fg)`.
+/// `max(cap_AA, L(fg))` rather than a ratio round-trip: when the theme's own
+/// body text is below AA (Solarized Light's `#657B83` on `#FDF6E3` is 4.13:1),
+/// the bound is the theme's own ratio, and the round-trip through two
+/// divisions lands an ulp below `L(fg)` and makes every candidate infeasible.
+/// The `max` form is feasible at the foreground by identity.
 #[inline]
 pub(super) fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f32)> {
     // A sentinel (or any set high byte) is NOT a colour: masking it would read
@@ -1319,17 +762,15 @@ pub(super) fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f32)> {
     }
 }
 
-/// One band as GLYPH INK for this theme: saturated about zero, then walked along
-/// a one-parameter family toward black (dark side) or white (light side) until
-/// the BOX CORNER against the foreground satisfies the bound.
+/// One band as glyph ink for this theme: saturated, then walked along a
+/// one-parameter family toward black (dark side) or white (light side) until
+/// the box corner against the foreground satisfies the bound.
 ///
-/// The family is per-channel MONOTONE in `k` even after quantization, which is
-/// what makes bisection exact rather than approximate: the predicate is
-/// evaluated on the quantized candidate, so the answer that comes back is the
-/// answer that ships.
+/// The family is per-channel monotone in `k` even after quantization, and the
+/// predicate is evaluated on the quantized candidate, so bisection is exact.
 ///
-/// `None` when the band is achromatic (not a hue), or when even the extreme of
-/// the family cannot satisfy the bound.
+/// `None` when the band is achromatic, or when even the family's extreme
+/// cannot satisfy the bound.
 #[inline]
 pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f32) -> Option<u32> {
     let (r, g, b) = (
@@ -1370,9 +811,8 @@ pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f
         return Some(cand(1.0));
     }
     if !ok(cand(0.0)) {
-        // Even the extreme fails — the foreground alone already breaches the
-        // bound, which only happens on a theme this function should not have
-        // been asked about. Fail closed.
+        // Even the extreme fails: the foreground alone breaches the bound.
+        // Fail closed.
         return None;
     }
     let (mut lo_k, mut hi_k) = (0.0f32, 1.0f32);
@@ -1387,19 +827,16 @@ pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f
     Some(cand(lo_k))
 }
 
-/// ONE MEMOIZED FRESH-INK GLYPH PALETTE: the `(theme_fg, theme_bg)` key it was
-/// derived from, paired with the seven band inks — or with `None`, which is a
-/// memoized REFUSAL (a theme that gets no tint at all; see
-/// [`fresh_ink_glyph_palette`]). Named because the nesting is three deep at the
-/// field that holds it and reads as noise inline.
+/// One memoized fresh-ink glyph palette: the `(theme_fg, theme_bg)` key and
+/// the seven band inks, or `None` for a memoized refusal (see
+/// [`fresh_ink_glyph_palette`]).
 pub(super) type GlyphPaletteMemo = ((u32, u32), Option<[u32; RAINBOW_BANDS.len()]>);
 
 /// The seven band inks for one theme, or `None` when this theme gets no tint.
 ///
-/// ALL SEVEN OR NONE, deliberately. A per-band suppression would draw a rainbow
-/// with holes — the exact defect the [`LIGHT_INK_MAX_LUMA`] note records from a
-/// white-ground review — so if any band fails the chroma gates the whole layer
-/// stands down and the text simply keeps its own colour.
+/// All seven or none: a per-band suppression would draw a rainbow with holes,
+/// so if any band fails the chroma gates the whole layer stands down and the
+/// text keeps its own colour.
 pub(super) fn fresh_ink_glyph_palette(fg: u32, bg: u32) -> Option<[u32; RAINBOW_BANDS.len()]> {
     let (side, cap) = glyph_ink_bound(fg, bg)?;
     let mut out = [0u32; RAINBOW_BANDS.len()];
@@ -1415,17 +852,14 @@ pub(super) fn fresh_ink_glyph_palette(fg: u32, bg: u32) -> Option<[u32; RAINBOW_
     Some(out)
 }
 
-// ---- THE CLASSIC LANDING RING's GRADE -------------------------------------
+// ---- the classic landing ring's grade ---------------------------------------
 //
-// Owner, 2026-09-08: "a bigger impact splash that scales more with the distance
-// traveled". Rainbow Kitty's landing took the grade first (`timing::impact`,
-// `meteor::ring_ms`); this is the SAME magnitude applied to every other style's
-// ring — fire flash, water ripple, the light-theme veil and the dark square
-// outline all expand `classic_ring_radius_factor` wider and last
-// `classic_ring_life` longer. An 8-cell hop (impact 1.0) is byte-for-byte what
-// it was; a full-line Ctrl-A (impact 3.5) rings TWICE as wide for 300 ms —
-// the same numbers the kitty's ring reaches, so the two arts agree on how big
-// a jump felt.
+// The landing splash scales with distance travelled, for every non-kitty
+// style (fire flash, water ripple, light-theme veil, dark square outline)
+// (owner, 2026-09-08):
+// `classic_ring_radius_factor` widens and `classic_ring_life` lengthens with
+// impact. An 8-cell hop (impact 1.0) is ungraded; a full-line jump (impact
+// 3.5) rings twice as wide for 300 ms, matching the rainbow kitty's ring.
 
 /// Radius growth per unit of impact above 1: ×2.0 at the 3.5 cap
 /// (`1 + 0.4 · 2.5`). Rainbow Kitty's `RING_R_PER_IMPACT_CH` doubles its ring
@@ -1456,19 +890,17 @@ pub(super) fn classic_ring_life(base: f32, scale: f32) -> f32 {
     base * (1.0 + CLASSIC_RING_LIFE_PER_IMPACT * (impact - 1.0))
 }
 
-/// The comet colour for `style` at path position `pos` (0 tail .. 1 head) — the
-/// SINGLE ramp shared by the live animator ([`CursorGlow::comet_color`]) and the
-/// settings-card effect demo, so the preview can never drift from the real art.
-/// `hue` is the rolling rainbow phase in turns (rainbow/sparkle only).
+/// The comet colour for `style` at path position `pos` (0 tail .. 1 head):
+/// the single ramp shared by the live animator ([`CursorGlow::comet_color`])
+/// and the settings-card demo. `hue` is the rolling rainbow phase in turns
+/// (rainbow/sparkle only).
 pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, pos: f32) -> u32 {
     match style {
         GlowStyle::Lumen => lerp_rgb(accent, color, pos),
-        // COMET: an icy DUST tail. Far back the dust has dispersed — the accent
-        // dimmed toward a dark haze; the body brightens through the base hue;
-        // and the last quarter flash-freezes toward white-hot ice at the head
-        // (real comets whiten at the nucleus — sunlit fresh ice — while the
-        // tail is older, darker dust). The white cap stays BELOW pure white so
-        // the nucleus cursor's additive coma owns the brightest point on screen.
+        // Comet: an icy dust tail. Far back the accent dims toward a dark haze,
+        // the body brightens through the base hue, and the last quarter
+        // whitens toward ice at the head. The cap stays below pure white so
+        // the nucleus cursor's coma owns the brightest point.
         GlowStyle::Comet => {
             let dusty = lerp_rgb(accent, 0x0000_0000, 0.45);
             let body = lerp_rgb(dusty, color, pos);
@@ -1478,43 +910,32 @@ pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, po
                 body
             }
         }
-        // Phaser: `pos` is a HUE OFFSET in turns from the live sweep phase.
+        // Phaser: `pos` is a hue offset in turns from the live sweep phase.
         // The live animator passes each cell's laid-hue offset (see
-        // `emit_comet` — cells keep the colour they were laid in, so the band
-        // is a real spatial rainbow); the settings preview passes its tail→head
-        // path position, which renders the same laid-spectrum look one full
-        // turn across the preview band.
+        // `emit_comet`); the settings preview passes its tail→head position.
         GlowStyle::Phaser => hsv2rgb((hue + pos).fract(), 0.95, 1.0),
-        // CLASSIC keeps v0.28's HALF-turn sweep. The modern phaser above lays a
-        // FULL turn across the band — which is precisely the change that turned
-        // the old fine tracer into today's saturated rainbow bar — so the
-        // salvage must not share that arm. (The live classic engine resolves its
-        // own colour in `classic_wake`; this arm serves the settings preview,
-        // and the two must agree.)
+        // Classic keeps a half-turn sweep (the phaser lays a full turn). The
+        // live classic engine resolves its colour in `classic_wake`; this arm
+        // serves the settings preview and must agree with it.
         GlowStyle::Classic => hsv2rgb((hue + pos * 0.5).fract(), 0.95, 1.0),
         GlowStyle::Sparkle => hsv2rgb((hue + pos * 0.5).fract(), 0.95, 1.0),
         // The ribbon and cursor share this same continuous seven-anchor field.
         // This arm serves the lone-cell fallback and settings preview.
         GlowStyle::RainbowKitty => rainbow_cycle_ink(pos),
-        // Head capped just short of white (0.83 == the field's FIRE_IDX_MAX/1023)
-        // so the bloomed comet streak is a hot AMBER glow, not a white wash that
-        // swallows the letters under it (owner: "cannot read if the flame is too
-        // bright"). Tail still dies to deep red.
+        // Head capped short of white (0.83 == FIRE_IDX_MAX/1023) so the
+        // bloomed streak is amber and letters under it stay readable. Tail
+        // dies to deep red.
         GlowStyle::Fire => fire_ramp((pos).min(0.83)),
-        // Monochrome beam: the hue stays SATURATED almost to the tail tip (a
-        // laser is coherent light — it doesn't fade to smoke), rolling off only
-        // slightly. No white lerp — the filament layer supplies the only
-        // (capped) highlight, so the beam never flashes out of its own hue.
+        // Monochrome beam: the hue stays saturated almost to the tail tip,
+        // rolling off slightly. No white lerp; the filament layer supplies the
+        // only (capped) highlight.
         GlowStyle::Laser => lerp_rgb(0x0000_0000, color, 0.70 + 0.30 * pos),
-        // Coherent tube: near-uniform hue along the whole rod with only a
-        // gentle brightening toward the head — a beam of steady light has no
-        // tail-to-head drama; the BEAM_LAYERS' specular axis supplies the
-        // (capped) highlight.
+        // Coherent tube: near-uniform hue with a gentle brightening toward the
+        // head; the beam layers' specular axis supplies the highlight.
         GlowStyle::Beam => lerp_rgb(0x0000_0000, color, 0.60 + 0.40 * pos),
         GlowStyle::Water => water_ramp(pos), // deep-blue tail → bright-cyan crest
-        // Exhaustiveness only: the custom interpreter resolves colour through its
-        // OWN ramp closure (`custom_ramp_color`) and never calls this shared ramp
-        // for a pack, so this mono fallback is never emitted live (risk #3).
+        // Exhaustiveness only: a pack resolves colour through its own ramp
+        // (`custom_ramp_color`), so this fallback is never emitted live.
         GlowStyle::Custom => lerp_rgb(accent, color, pos),
     }
 }
@@ -1533,39 +954,23 @@ pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -
         // as it dies. The 0.55 white ceiling keeps every spark inside the 0.75
         // monochrome-hue law the laser test pins.
         GlowStyle::Laser => lerp_rgb(color, 0x00FF_FFFF, 0.55 * fade),
-        // Stardust mote: starlight — near-white when fresh, settling into the
-        // beam's ice-blue as it dims. (The live emitter draws its own white /
-        // ice / violet star tints; this shared ramp keeps the settings-preview
-        // dots in the same family.)
+        // Stardust mote: near-white when fresh, settling into the beam's
+        // ice-blue. (The live emitter draws its own star tints; this keeps the
+        // settings preview in the same family.)
         GlowStyle::Beam => lerp_rgb(color, 0x00FF_FFFF, 0.35 + 0.45 * fade),
-        // Comet debris: a GLINT of fresh-shed ice — near-white while young,
-        // cooling back into the tail's own hue as it dies, so the glitter reads
-        // as pieces OF the comet, never confetti in a foreign colour.
+        // Comet debris: a glint of shed ice, near-white while young, cooling
+        // into the tail's own hue.
         GlowStyle::Comet => lerp_rgb(color, 0x00FF_FFFF, 0.65 * fade),
-        // rainbow kitty debris: A NAMED STOP, never the open wheel.
-        //
-        // THE OWNER'S COMPLAINT, and this arm is where it was manufactured: *"I
-        // see lots of colors but it still doesn't feel coherent"* and *"Cyan
-        // isn't a rainbow color."* Every rainbow particle — the jump's shed
-        // glitter above all — carries a `hue` that is a UNIFORM RANDOM 0..1
-        // seed, and it used to fall through to the Sparkle arm below and be
-        // resolved as `hsv2rgb(hue, 0.85, 1.0)`: the FULL hue wheel, cyan and
-        // magenta included, at full saturation, thrown a dozen at a time across
-        // a screen-crossing jump.
-        //
-        // §2.3.3 of `docs/design/RAINBOW-TRAIL-ONE-STORY.md` is the rule and it
-        // is absolute: no point-mark ever samples the open gradient — stars,
-        // motes, veils and tints SNAP TO A NAMED STOP. So the seed is kept (it
-        // is what decorrelates one grain from the next) and it now selects a
-        // band index instead of an angle: if a jump sheds, it sheds the
-        // ribbon's own seven anchors and nothing else. The white core stays — it
-        // is a glint on the grain, not a hue.
+        // Rainbow kitty debris snaps to a named stop, never the open wheel
+        // (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2.3.3: point-marks never
+        // sample the open gradient). The uniform random seed still
+        // decorrelates grains but selects a band index, so a jump sheds only
+        // the ribbon's seven anchors. The white core is a glint, not a hue.
         GlowStyle::RainbowKitty => {
             lerp_rgb(spectrum_snap(hue.rem_euclid(1.0)), 0x00FF_FFFF, 0.35 * fade)
         }
-        // Sparkle: bright, slightly white-cored rainbow. This style's identity
-        // IS the open wheel; it is not the rainbow trail and it is not bound by
-        // the trail's anchor law.
+        // Sparkle: slightly white-cored rainbow. This style's identity is the
+        // open wheel; it is not bound by the trail's anchor rule.
         _ => lerp_rgb(hsv2rgb(hue, 0.85, 1.0), 0x00FF_FFFF, 0.35 * fade),
     }
 }
@@ -1587,59 +992,22 @@ pub(super) fn push_halo_over(
     if peak < 96 {
         return;
     }
-    // EFFECTS BOX (grid + head band): identity-exact at head 0; keeps every
-    // emitted band inside a row the renderers actually draw.
-    let (bl, br) = (geom.fx_left(), geom.fx_right());
-    let (bt, bb) = (geom.fx_top(), geom.fx_bot());
     let scale = (peak as f32 / 255.0).max(0.55);
-    let rxi = ((rx * scale).round() as i32).max(1);
-    let ryi = ((ry * scale).round() as i32).max(1);
-    let (cxi, cyi) = (cx.round() as i32, cy.round() as i32);
-    let x0 = (cxi - rxi).max(bl);
-    let x1 = (cxi + rxi).min(br);
-    let y0 = (cyi - ryi).max(bt);
-    let y1 = (cyi + ryi).min(bb);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    // The falloff centre is stored TRUE, or the halo is culled — the same law
-    // as [`push_halo`] above: a centre clamped into the box relocated the
-    // radial peak onto the edge for the sliver frames of anything sliding off
-    // the grid (2026-09-01 audit).
-    if cxi < 0 || cyi < 0 {
-        return;
-    }
-    let ch = geom.ch as i32;
-    let oy = geom.origin_y as i32;
-    let mut yy = y0;
-    while yy < y1 {
-        // Grid-row DAMAGE HINT, anchored at origin_y: an above-grid band tags
-        // row 0 (which opens the top scissor band), never a wrapped u16.
-        let row = (yy - oy).div_euclid(ch);
-        let band_end = (oy + (row + 1) * ch).min(y1);
-        out.push(RainHalo {
-            row: row.max(0) as u16,
-            x: x0 as u16,
-            y: yy as u16,
-            w: (x1 - x0) as u16,
-            h: (band_end - yy) as u16,
-            color,
-            cx: cxi as u16,
-            cy: cyi as u16,
-            rx: rxi as u16,
-            ry: ryi as u16,
-            mode: HaloMode::Over,
-        });
-        yy = band_end;
-    }
+    push_halo_rows(
+        out,
+        geom,
+        (cx, cy),
+        (rx * scale, ry * scale),
+        color,
+        HaloMode::Over,
+    );
 }
 
-/// THE ONE DASH. A velocity-aligned two-vertex AA beam trailing `trail_s`
-/// seconds of a particle's LIVE ballistic motion behind its position `(x, y)`
-/// — the shared renderer behind the Laser ablation spark, the rainbow kitty
-/// shooting-star body, and the Sparkle mini-comet. `tail` colours the trailing
-/// vertex at quarter coverage, `head` the tip at full; thickness and trail
-/// seconds are the knobs the three sites disagree on.
+/// The one dash: a velocity-aligned two-vertex AA beam trailing `trail_s`
+/// seconds of a particle's live ballistic motion behind `(x, y)`, shared by
+/// the laser ablation spark, the rainbow kitty shooting-star body and the
+/// sparkle mini-comet. `tail` colours the trailing vertex at quarter
+/// coverage, `head` the tip at full.
 #[allow(
     clippy::too_many_arguments,
     reason = "output + geometry + position + live velocity + trail/thickness knobs + \
@@ -1675,11 +1043,9 @@ pub(super) fn push_velocity_dash(
     comet_beam(out, geom.beam_clip(), &verts, thick, 1, 0.0);
 }
 
-/// Push one RADIAL halo of premultiplied peak light: its bounding rect is
-/// clamped to the WINDOW interior and SPLIT into per-cell-row [`RainHalo`] quads
-/// (the dirty gate + scissor stay exact) that all share the same centre and
-/// falloff radii — the renderer's shared radial rasterizer does the rest.
-/// Radii are floored to 1 (the parity contract's divide-by-zero guard).
+/// Push one radial halo of premultiplied peak light: its rect is clamped to
+/// the window interior and split into per-cell-row [`RainHalo`] quads sharing
+/// one centre and falloff radii. Radii are floored to 1.
 pub(super) fn push_halo(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -1692,30 +1058,36 @@ pub(super) fn push_halo(
     if peak == 0 {
         return;
     }
-    // EFFECTS BOX (grid + head band): identity-exact at head 0.
-    let (bl, br) = (geom.fx_left(), geom.fx_right());
-    let (bt, bb) = (geom.fx_top(), geom.fx_bot());
+    push_halo_rows(out, geom, (cx, cy), (rx, ry), peak, HaloMode::Add);
+}
+
+/// The radial-halo band walk behind [`push_halo`], [`push_halo_over`] and the
+/// kitty cursor's exit veils: the halo at `(cx, cy)` with radii `(rx, ry)`
+/// (rounded, floored to 1) is clamped to the effects box (grid + head band)
+/// and split into per-cell-row [`RainHalo`]s in `mode`, sharing centre and
+/// radii.
+pub(crate) fn push_halo_rows(
+    out: &mut Vec<RainHalo>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    (rx, ry): (f32, f32),
+    color: u32,
+    mode: HaloMode,
+) {
     let rxi = (rx.round() as i32).max(1);
     let ryi = (ry.round() as i32).max(1);
     let (cxi, cyi) = (cx.round() as i32, cy.round() as i32);
-    let x0 = (cxi - rxi).max(bl);
-    let x1 = (cxi + rxi).min(br);
-    let y0 = (cyi - ryi).max(bt);
-    let y1 = (cyi + ryi).min(bb);
-    if x1 <= x0 || y1 <= y0 || cxi < bl - rxi || cyi < bt - ryi || cxi > br + rxi || cyi > bb + ryi
-    {
+    let x0 = (cxi - rxi).max(geom.fx_left());
+    let x1 = (cxi + rxi).min(geom.fx_right());
+    let y0 = (cyi - ryi).max(geom.fx_top());
+    let y1 = (cyi + ryi).min(geom.fx_bot());
+    if x1 <= x0 || y1 <= y0 {
         return;
     }
-    // THE CENTRE IS THE FALLOFF'S TRUTH — store it, never clamp it into the
-    // box. Clamping `cxi` to `br` moved an off-right centre ONTO the edge, so
-    // the surviving 1..r-px sliver of a particle sliding off the grid rendered
-    // at 41-96% of peak radial weight where the true falloff says ~0 — a
-    // bright fringe pinned against the boundary that then popped off
-    // (2026-09-01 audit; both backends read this same field). A positive
-    // overshoot fits u16 (`br + rxi` is far under 65536); a NEGATIVE centre
-    // cannot be represented, so cull the halo instead — reachable only when
-    // the box starts at 0, and the surviving band is at most r px of the
-    // falloff's own dim tail.
+    // Store the true centre, never clamped into the box: a clamped off-edge
+    // centre would draw the surviving sliver near peak weight as a bright
+    // fringe. A positive overshoot fits u16; a negative centre cannot be
+    // represented, so the halo is culled (only its dim tail was visible).
     if cxi < 0 || cyi < 0 {
         return;
     }
@@ -1723,7 +1095,8 @@ pub(super) fn push_halo(
     let oy = geom.origin_y as i32;
     let mut yy = y0;
     while yy < y1 {
-        // Grid-row DAMAGE HINT, anchored at origin_y (above-grid bands tag row 0).
+        // Grid-row damage hint anchored at origin_y: an above-grid band tags
+        // row 0, never a wrapped u16.
         let row = (yy - oy).div_euclid(ch);
         let band_end = (oy + (row + 1) * ch).min(y1);
         out.push(RainHalo {
@@ -1732,45 +1105,28 @@ pub(super) fn push_halo(
             y: yy as u16,
             w: (x1 - x0) as u16,
             h: (band_end - yy) as u16,
-            color: peak,
+            color,
             cx: cxi as u16,
             cy: cyi as u16,
             rx: rxi as u16,
             ry: ryi as u16,
-            // Defaulted `mode: HaloMode::Add` — the historical light.
-            ..Default::default()
+            mode,
         });
         yy = band_end;
     }
 }
 
-/// THE ONE ROUND STARDUST GRAIN ON DARK GROUND — a radial mote drawn at the
-/// COMPOSITED LIGHT of the four-point plus it stands in for.
+/// A round stardust grain on dark ground: a radial mote drawn at the
+/// composited light of the four-point plus it stands in for.
 ///
-/// The stardust law swapped a population's silhouette, not its brightness, and
-/// on the additive arm those are not the same statement.
-/// [`push_twinkle_star`] lays THREE coincident marks on the crossing — the
-/// horizontal arm at `cov`, the vertical arm at `cov`, the nucleus at
-/// [`crate::effect_util::STAR_CORE_ADD`] — so the pixel the eye reads at a plus's centre
-/// carries [`crate::effect_util::STAR_STACK_ADD`] (2.35x) of the coverage its
-/// emitter asked for. One `push_halo` at that same `cov` peaks at `cov`: parity
-/// primitive-for-primitive, 2.35x darker in the middle. The owner asked for
-/// fewer crosses AND more light (2026-08-09, "many fewer of those cross
-/// sparkles", after 2026-08-08's "cute small stardust"), so every dealt grain
-/// that LOST its plus has to be priced against what that plus put on screen.
-///
-/// Two halos, exactly as [`crate::effect_util::push_dust_mote`] does it on the
-/// additive rect: the emitter's own SKIRT at `cov`, and a small HOT CORE at
-/// [`STAR_CORE`] of the radius carrying the rest of the stack. Paying the
-/// difference into a core rather than into the whole disc keeps the mark's TOTAL
-/// light where the plus had it — brightening the skirt to 2.35x would make the
-/// round grain 2.35x the light of the cross it replaced, which is a different
-/// wrong answer — and it keeps the mote's soft edge, which a flat 2.35x disc
-/// would blow out into a blob.
-///
-/// This is the helper the shooting-star head wrote out by hand first; every
-/// other additive stardust site now calls it, so the law has ONE spelling and a
-/// new emitter cannot quietly ship the 1x version again.
+/// [`push_twinkle_star`] lays three coincident marks at the crossing (two arms
+/// at `cov`, the nucleus at [`crate::effect_util::STAR_CORE_ADD`]), so a plus
+/// centre carries [`crate::effect_util::STAR_STACK_ADD`] (2.35x) of `cov`. One
+/// `push_halo` at `cov` would be 2.35x darker. So, as
+/// [`crate::effect_util::push_dust_mote`] does: a skirt at `cov` plus a small
+/// hot core at [`STAR_CORE`] of the radius carrying the rest. That keeps the
+/// total light where the plus had it and keeps the soft edge. Every additive
+/// stardust site calls this.
 pub(super) fn push_dust_halo(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -1787,11 +1143,45 @@ pub(super) fn push_dust_halo(
     // Floored at 1 px so the smallest grain still has a lit centre — the same
     // floor `push_dust_mote`'s `ceil(d/2).max(1)` core carries.
     let core = (r * STAR_CORE).max(1.0);
-    // Clamped at the byte, and the clamp is never a shortfall: above `cov` 188
-    // the skirt plus a 255 core already saturates the channel, which is what the
-    // plus's own 2.35x does anywhere above `cov` 109.
+    // Clamped at the byte; above `cov` 188 the skirt plus a 255 core already
+    // saturates, as the plus does above `cov` 109.
     let hot = (f32::from(cov) * (crate::effect_util::STAR_STACK_ADD - 1.0)).min(255.0) as u8;
     push_halo(out, geom, cx, cy, core, core, premul_rgb(rgb, hot));
+}
+
+/// The water ripple ring (the water landing and the droplet cursor's
+/// waterline): a flattened elliptical annulus at `(cx, cy)` with outer radii
+/// `(rx, ry)` and a `thick` px rim, laid as left/right additive slabs about
+/// half `ry` tall (at least 2 px).
+pub(crate) fn push_ripple_ring(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    (rx, ry): (f32, f32),
+    thick: f32,
+    premul: u32,
+) {
+    let rslab = ((ry * 0.5) as i32).max(2);
+    let mut dy = -(ry as i32);
+    while dy < ry as i32 {
+        let h = rslab.min(ry as i32 - dy);
+        let ym = (dy as f32 + h as f32 * 0.5) / ry;
+        let outer = rx * (1.0 - ym * ym).max(0.0).sqrt();
+        let inner_rx = (rx - thick).max(0.0);
+        let inner_ry = ry * (inner_rx / rx);
+        let inner = if inner_ry > 0.5 {
+            let yin = (dy as f32 + h as f32 * 0.5) / inner_ry;
+            inner_rx * (1.0 - yin * yin).max(0.0).sqrt()
+        } else {
+            0.0
+        };
+        let (o, i) = (outer as i32, inner as i32);
+        if o > i {
+            push_rect(out, geom, cx as i32 - o, cy as i32 + dy, o - i, h, premul);
+            push_rect(out, geom, cx as i32 + i, cy as i32 + dy, o - i, h, premul);
+        }
+        dy += h;
+    }
 }
 
 /// Fractional part (non-negative for non-negative input).
@@ -1799,12 +1189,9 @@ pub(super) fn fract(x: f32) -> f32 {
     x - x.floor()
 }
 
-/// The BEAM power envelope: full power for the first 40% of a spark's life,
-/// then ONE smooth cosine down to zero — the switch-off curve shared by the
-/// tube's brightness (both typing and jump sparks in `emit_comet`'s fade) and
-/// its thickness collapse (`core_thick`), so the rod dims and thins as a single
-/// object. Deterministic in `frac`, so tests and CPU/GPU parity see identical
-/// quads.
+/// The beam power envelope: full power for the first 40% of a spark's life,
+/// then one cosine down to zero. Shared by the tube's brightness and its
+/// thickness collapse (`core_thick`), so the rod dims and thins as one object.
 pub(super) fn beam_power(frac: f32) -> f32 {
     if frac < 0.40 {
         1.0
@@ -1813,8 +1200,9 @@ pub(super) fn beam_power(frac: f32) -> f32 {
     }
 }
 
-/// HSV (h,s,v all 0..1) → `0x00RRGGBB`.
-pub(super) fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
+/// HSV (h,s,v all 0..1; `h` in TURNS, any real — wrapped) → `0x00RRGGBB`:
+/// v0.28's colour wheel, the one the classic wake and the phaser also turn.
+pub(crate) fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
     let h = (h.fract() + 1.0).fract() * 6.0;
     let i = h.floor() as i32;
     let f = h - i as f32;

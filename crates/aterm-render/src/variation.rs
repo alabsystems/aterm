@@ -398,7 +398,7 @@ impl<'a> VariedFace<'a> {
 /// The caller is responsible for building `face` at the correct collection
 /// `index` and applying the variation coords BEFORE calling this — the byte-slice
 /// [`varied_glyph_raster`] wrapper above does exactly that. (Same convention as
-/// `ligature_shaping::shape_ligature_run_with_face`.)
+/// `ligature_shaping::RowShaper::new`.)
 #[must_use]
 pub fn varied_glyph_raster_with_face(
     face: &ttf_parser::Face,

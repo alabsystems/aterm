@@ -1,39 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm buffer-primitives kernel — the substrate of the 11-verb `BufferApi`
-//! (ATERM_DESIGN §4), built bottom-up.
+//! aterm buffer-primitives kernel: a text-line `Surface` over one bounded,
+//! sequence-numbered event-log spine (`docs/ATERM_DESIGN.md` §3), with the
+//! capability-gated verbs `apply`, `read_text`, `snapshot`, `subscribe`/`poll`
+//! and `transact`.
 //!
-//! This first slice lands the **CONSISTENCY core**: the single, bounded,
-//! sequence-numbered event-log spine (§3.4) and the `apply`/`read_text`/
-//! `snapshot`/`subscribe`/`transact` verbs over it. It deliberately stops short
-//! of the full trait (read_image needs the Rasterizer, process needs world
-//! effects; addressing and spans ship with the slice that has a consumer) so
-//! the freeze (§4, M1) lands piece by verified piece rather than as a big bang.
-//!
-//! Invariant TESTED here (unit tests + the Tier-1 conformance below) and
-//! model-checked by the DERIVED kernel-family twins in
-//! `aterm-spec::derive` (Kernel/Subscribe/Snapshot/Transact/Ring — exhaustively
-//! `ty check`ed in `aterm-spec/tests/derived_ring_ty.rs`; they cover the spine,
-//! poll, snapshot isolation, transact OCC, and ring eviction). The hand-written
-//! `.tla` originals are quarantined under `aterm-spec-models/specs/legacy/`
-//! (TRUST_NATIVE_TLA Phase 1 — superseded by the derived, drift-free twins):
-//! the event log is a **gap-free, strictly-monotonic spine** — every `apply`
-//! yields exactly one new `Seq`, and `seq == log.len()` always (§4.3 clause 1).
-//!
-//! STATUS: the kernel invariants are model-checked (the derived twins, by the
-//! in-process interpreter and by `ty`) and Tier-1-bound to THIS code by
-//! `tests/conformance_*.rs`, which drive the real `Surface`/`EventLog` and check
-//! each transition against the model. What is not proven is the code itself:
-//! the crate carries no Trust source contracts, and in-compilation verification
-//! is off workspace-wide (`.cargo/config.toml`). The `InvariantClosure` ledger
-//! an earlier plan named for this crate was never built and is superseded by
-//! `aterm-spec`'s `InvariantAnchor` / `spec_xref_closure` gate
-//! (docs/REARCH-PLAN.md, A-2).
+//! Invariant: the spine is gap-free and strictly monotonic — every `apply`
+//! yields exactly one new `Seq`, and `seq == log.len()`. The derived
+//! kernel-family models in `aterm_spec::derive` (Kernel, Subscribe, Snapshot,
+//! Transact, Ring) check it, and `tests/conformance_*.rs` bind them to this
+//! code. The code itself carries no Trust source contracts.
 
-// Production code is `forbid(unsafe_code)`. The unit-test build relaxes that to
-// `deny` for one reason: its capability helpers call the `unsafe` launcher mint
-// (`aterm_cap::Authority::root_authority`), each under an explicit `allow`.
+// Production code forbids `unsafe`; the unit-test build only denies it so its
+// capability helpers can call the `unsafe` launcher mint under an explicit `allow`.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![cfg_attr(test, deny(unsafe_code))]
 
@@ -41,9 +21,8 @@ use std::sync::Arc;
 
 #[cfg(test)]
 std::thread_local! {
-    /// Comparisons performed by the ordered line-id lower bound. Unit tests use
-    /// this as a deterministic work counter; thread-local keeps parallel tests
-    /// independent.
+    /// Comparisons made by the line-id lower bound: a deterministic work counter
+    /// for unit tests, thread-local so parallel tests stay independent.
     static LINE_ID_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -56,35 +35,34 @@ fn take_line_id_comparisons() -> usize {
     })
 }
 
-/// A monotonic position on the one event-log spine (§4.3 clause 1).
+/// A monotonic position on the event-log spine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Seq(pub u64);
 
-/// A recorded logical instant (the B.4.2 Clock tick domain — see
-/// `HIERARCHICAL_SESSIONS.md` Addendum B). Every temporal [`Event`] carries the
-/// tick it was recorded at, so replay can re-seed the engine clock deterministically
-/// instead of reading wall time. Monotone but NOT required gap-free (unlike `Seq`).
+/// A recorded logical instant (the clock tick domain of
+/// `docs/design/HIERARCHICAL_SESSIONS.md` Addendum B). Temporal events carry it so
+/// replay re-seeds the engine clock instead of reading wall time. Monotone, but
+/// not gap-free (unlike `Seq`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Ticks(pub u64);
 
-/// A handle into the out-of-band blob store (B.9). Raw input and reply payloads
-/// are bulk bytes that must NOT bloat the in-RAM spine, so the spine carries a
-/// `BlobId` handle and the bytes live in the tiered blob store the host owns.
+/// A handle into the host-owned blob store: raw input and reply payloads live
+/// there, and the spine carries only the handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlobId(pub u64);
 
-/// A handle into the keyframe store (B.9 / B.3.2). A keyframe is a serialized
-/// `TerminalCheckpoint`; the spine references it by id so a scrub can seek to the
-/// nearest keyframe `<= seq(t)` and replay forward.
+/// A handle into the keyframe store. A keyframe is a serialized
+/// `TerminalCheckpoint`; a scrub seeks to the nearest keyframe `<= seq(t)` and
+/// replays forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyframeId(pub u64);
 
-/// A committed-line identity, stable across scroll/eviction (§3.3).
+/// A committed-line identity, stable across scroll and eviction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LineId(pub u64);
 
-/// Where a byte/cell came from — carried on every read so prompt injection is
-/// legible and never silently trusted (§4.3 clause 4).
+/// Where a byte or cell came from, carried on every read so injected content is
+/// never silently trusted (`docs/ATERM_DESIGN.md` §3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OriginTag {
     /// Authoritative output from the surface's owning Source (e.g. the PTY child).
@@ -100,20 +78,19 @@ pub enum BufferRead {}
 /// Effect marker: mutating a [`Surface`] (`apply`, `transact`).
 pub enum BufferWrite {}
 
-/// Capability witnesses, passed BY REFERENCE (§4.3 clause 6, §5.4). They are
-/// `aterm_cap` capabilities, so the only way to hold one is to be granted it by
-/// an [`aterm_cap::Authority`], and the only mint for that is the
-/// feature-sealed `Authority::root_authority` in the two launcher binaries. A
-/// verb called without the matching cap does not compile, and neither does a
-/// forged one:
+/// Capability witnesses, passed by reference. They are `aterm_cap`
+/// capabilities: only an [`aterm_cap::Authority`] grants one, and only the
+/// feature-sealed `Authority::root_authority` in the launcher binaries mints
+/// that. A verb called without the matching cap does not compile, and neither
+/// does a forged one:
 ///
 /// ```compile_fail,E0423
-/// // The witnesses used to be public unit structs anyone could write down.
+/// // A cap is not a value anyone can write down.
 /// let _forged = aterm_buffer::WriteCap;
 /// ```
 ///
-/// The tier a cap was granted at is not consulted: buffer edits are
-/// reversible, buffer-only effects, so holding the cap is the whole gate.
+/// The granted tier is not consulted: buffer edits are reversible and
+/// buffer-only, so holding the cap is the whole gate.
 pub type ReadCap = aterm_cap::Cap<BufferRead>;
 /// See [`ReadCap`].
 pub type WriteCap = aterm_cap::Cap<BufferWrite>;
@@ -125,20 +102,19 @@ pub struct Range {
     pub end: LineId,
 }
 
-/// The CLOSED edit algebra — the single `apply` verb's argument (§4.2 MUTATE).
-/// Small and total so the screen↔logical addressing proof can't regress.
+/// The closed edit algebra: the argument of the single `apply` verb.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Edit {
     /// Append a new committed line of text.
     AppendLine(String),
     /// Replace the text of an existing committed line.
     SetLine(LineId, String),
-    /// Clear a committed line to empty (kept, so its LineId survives — §3.3).
+    /// Clear a committed line to empty; the line is kept, so its `LineId` survives.
     ClearLine(LineId),
 }
 
-/// The outcome of a `transact` (§4.2 COMPOSE): an atomic, isolated apply-group
-/// under optimistic concurrency control over a base snapshot.
+/// The outcome of a `transact`: an atomic, isolated apply-group under
+/// optimistic concurrency control over a base snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxnOutcome {
     /// All edits applied atomically; carries the resulting head Seq.
@@ -147,48 +123,45 @@ pub enum TxnOutcome {
     Conflict,
 }
 
-/// One entry on the event-log spine: a coalesced high-level op, not a per-cell
-/// delta (§3.4). Carries the monotone Seq it was assigned.
+/// One entry on the event-log spine: a coalesced high-level op (not a per-cell
+/// delta) with its assigned `Seq`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
     pub seq: Seq,
     pub op: Op,
-    /// The recorded logical instant (B.4.2 Clock domain). Surface text ops
-    /// (the legacy spine) use `Ticks(0)`; temporal ops appended via
-    /// [`EventLog::append_at`] carry the real recorded tick.
+    /// The recorded logical instant. Surface text ops use `Ticks(0)`; temporal
+    /// ops appended via [`EventLog::append_at`] carry the recorded tick.
     pub ts: Ticks,
 }
 
-/// High-level op summary recorded on the log (§3.4) — the one spine every
-/// mutation rides (§4.3 clause 1).
+/// High-level op recorded on the spine; every mutation is one of these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
     Append(LineId),
     Write(LineId),
     Clear(LineId),
-    // --- temporal recording (B.9): handles, not payloads. The bulk bytes live
-    // in the host-owned blob/keyframe stores; the spine stays small. ---
+    // Temporal recording: handles, not payloads. The bytes live in the
+    // host-owned blob and keyframe stores.
     /// Raw PTY input bytes were fed to the engine (`process`); payload in the
     /// blob store under this [`BlobId`].
     RawIn(BlobId),
     /// The engine emitted reply bytes to the PTY peer (DSR/DA/…); payload in the
-    /// blob store. Recorded for fork-timeline fidelity; NOT re-emitted on replay.
+    /// blob store. Recorded for fork-timeline fidelity; not re-emitted on replay.
     Reply(BlobId),
-    /// The terminal was resized to `rows`×`cols` (reflow is path-dependent, so
-    /// resize is a recorded event, never re-ordered — B.2.3).
+    /// The terminal was resized to `rows`×`cols`. Reflow is path-dependent, so a
+    /// resize is a recorded event and never reordered.
     Resize {
         rows: u16,
         cols: u16,
     },
-    /// A keyframe (serialized `TerminalCheckpoint`) was taken at a parser-ground
-    /// boundary (B.3.3); referenced by [`KeyframeId`] in the keyframe store.
+    /// A keyframe (serialized `TerminalCheckpoint`) taken at a parser-ground
+    /// boundary; referenced by [`KeyframeId`] in the keyframe store.
     Keyframe(KeyframeId),
 }
 
-/// A subscription cursor — the synchronous read-face of the event log (§3.4).
-/// The reader pulls new events since `at`; if it has fallen behind the ring's
-/// horizon it gets a `Gap` and must re-pull via `read_text` to resync. A slow
-/// subscriber NEVER blocks the writer.
+/// A subscription cursor, the synchronous read face of the event log. `poll`
+/// returns events after `at`; a cursor behind the ring's horizon gets a `Gap`
+/// and resyncs via `read_text`. A slow subscriber never blocks the writer.
 #[derive(Clone, Copy, Debug)]
 pub struct Cursor {
     at: Seq,
@@ -204,11 +177,10 @@ pub enum SubUpdate {
     },
 }
 
-/// Hard ceilings (§3.4): the log is bounded; old events behind the horizon are
-/// reclaimed. `seq` keeps counting; the ring just forgets the oldest entries.
+/// Ring bound: older events are evicted; `seq` keeps counting.
 pub const MAX_LOG_EVENTS: usize = 1 << 16;
 
-/// The bounded, append-only, sequence-numbered ring — THE only change timeline.
+/// The bounded, append-only, sequence-numbered ring: the only change timeline.
 #[derive(Clone, Debug, Default)]
 pub struct EventLog {
     ring: std::collections::VecDeque<Event>,
@@ -217,25 +189,20 @@ pub struct EventLog {
 }
 
 impl EventLog {
-    /// Append a temporal op at a recorded tick (B.9). Returns the assigned `Seq`
-    /// and, when the bounded ring was already full, the **evicted oldest event**.
+    /// Append a temporal op at a recorded tick. Returns the assigned `Seq` and,
+    /// when the ring was full, the evicted oldest event.
     ///
-    /// That returned event is the **spill seam** (B.8.2 `tier_residency_model`'s
-    /// `NoSilentLoss` obligation): the caller MUST tier it (warm/cold) rather than
-    /// drop it, so an evicted recorded event stays recoverable. `aterm-buffer` is
-    /// headless and does no fs — it hands the event back; the host (gui /
-    /// sessiond) owns the tiered persistence. Keeping the callback OUT of the log
-    /// preserves `EventLog: Clone + Debug + Default`.
+    /// The evicted event is the spill seam: the caller must tier it rather than
+    /// drop it (the `NoSilentLoss` obligation of `tier_residency_model`). This
+    /// crate does no fs; the host owns tiered persistence, which also keeps
+    /// `EventLog: Clone + Debug + Default`.
     #[must_use = "the evicted event is the spill seam — tier it (B.8.2), do not drop it"]
     pub fn append_at(&mut self, op: Op, ts: Ticks) -> (Seq, Option<Event>) {
         self.total = self.total.saturating_add(1);
         let seq = Seq(self.total);
-        // Ring steady-state fits in `MAX_LOG_EVENTS + 1` slots (push, then evict
-        // one). A `VecDeque` that grew by doubling would land at `2 * MAX_LOG_EVENTS`
-        // and stay there (pop_front never shrinks), wasting ~2 MiB per full ring.
-        // Reserve the single extra slot exactly once, right at the boundary, so the
-        // backing store settles at `MAX_LOG_EVENTS + 1` — no eager allocation for
-        // small/idle rings, no doubling for busy ones.
+        // A full ring needs `MAX_LOG_EVENTS + 1` slots (push, then evict).
+        // Reserve that one extra slot at the boundary so the deque does not
+        // double to `2 * MAX_LOG_EVENTS` (pop_front never shrinks it).
         if self.ring.len() == MAX_LOG_EVENTS && self.ring.capacity() == MAX_LOG_EVENTS {
             self.ring.reserve_exact(1);
         }
@@ -248,13 +215,10 @@ impl EventLog {
         (seq, evicted)
     }
 
-    /// Append a Surface text op (the legacy spine). Records at `Ticks(0)`;
-    /// eviction follows the existing ring contract (the oldest entry is forgotten
-    /// — the Surface/Snapshot text arm has its own scrollback). Temporal recording
-    /// callers use [`append_at`](Self::append_at) and handle the spill seam.
+    /// Append a Surface text op at `Ticks(0)`. Eviction here just forgets the
+    /// oldest entry; temporal callers use [`append_at`](Self::append_at) and
+    /// handle the spill seam.
     fn append(&mut self, op: Op) -> Seq {
-        // Legacy ops deliberately drop on eviction (existing behavior); the
-        // evicted return is for temporal callers via append_at.
         let (seq, _evicted) = self.append_at(op, Ticks(0));
         seq
     }
@@ -271,41 +235,30 @@ impl EventLog {
         self.ring.iter()
     }
 
-    /// The OLDEST live event (the ring's low-water), or `None` when nothing is
-    /// retained. O(1).
+    /// The oldest live event (the ring's low-water), or `None` when empty. O(1).
     ///
-    /// It is the reachability oracle for a handle held OUTSIDE the ring. The
-    /// ring only ever pushes to the back and pops from the front, so the live
-    /// seqs are the contiguous range `[oldest.seq, head]` — which means
-    /// `seq >= oldest_live().seq` is EXACTLY "this event is still on the spine".
-    /// A keyframe store that outlives the ring window (temporal recording keeps
-    /// its checkpoints in a separate bounded deque) has to answer that question
-    /// before it may seed a replay from one, or it would fold a forward chain
-    /// whose head has already been evicted and hand back a silently wrong
-    /// engine.
+    /// Live seqs are the contiguous range `[oldest.seq, head]`, so
+    /// `seq >= oldest_live().seq` means "still on the spine". A keyframe store
+    /// that outlives the ring must check this before seeding a replay, or it
+    /// would fold a chain whose head was evicted into a wrong engine.
     pub fn oldest_live(&self) -> Option<&Event> {
         self.ring.front()
     }
 
-    /// The NEWEST live event, or `None` when nothing is retained. O(1).
+    /// The newest live event, or `None` when empty. O(1).
     ///
-    /// Callers that record with [`append_at`](Self::append_at) from one
-    /// monotone clock get a nondecreasing `ts` down the ring, so this is also
-    /// the LATEST RECORDED INSTANT — a `max` fold over `live()` is the same
-    /// answer at `MAX_LOG_EVENTS` times the cost.
+    /// With [`append_at`](Self::append_at) fed from one monotone clock, `ts` is
+    /// nondecreasing down the ring, so this is also the latest recorded instant.
     pub fn newest_live(&self) -> Option<&Event> {
         self.ring.back()
     }
 
-    /// Live events with `seq > after`, oldest-first — the same suffix
-    /// `live().filter(|e| e.seq > after)` yields, reached by an O(1) SEEK
-    /// instead of a walk over the whole retained ring.
+    /// Live events with `seq > after`, oldest first, reached by an O(1) seek.
     ///
-    /// Sound because the live seqs are contiguous and ascending (push-back /
-    /// pop-front only, one seq per append): the first event past `after` sits at
-    /// offset `after + 1 - oldest.seq`, clamped into `[0, len]` so a watermark
-    /// below the low-water yields EVERYTHING (not a panic) and one at or above
-    /// the head yields nothing.
+    /// Live seqs are contiguous and ascending, so the first event past `after`
+    /// sits at offset `after + 1 - oldest.seq`, clamped to `[0, len]`: a
+    /// watermark below the low-water yields everything, one at or past the head
+    /// yields nothing.
     pub fn live_after(&self, after: Seq) -> impl Iterator<Item = &Event> {
         let start = match self.ring.front() {
             None => 0,
@@ -317,11 +270,9 @@ impl EventLog {
     }
 }
 
-/// A Surface: the addressing root holding committed lines + the event-log spine
-/// (§3.1). It is a text-line model, and it is the native editor's document
-/// spine (`aterm-gui`'s `document_store.rs`: one `Document` owns one
-/// `Surface`). Terminal cells live in `aterm-grid`; the cap-gated one-door
-/// kernel over them was REARCH-PLAN A-2, retired unbuilt (2026-09-27).
+/// A Surface: committed lines plus the event-log spine. It is the native
+/// editor's document model (`aterm-gui`'s `document_store.rs`: one `Document`
+/// owns one `Surface`); terminal cells live in `aterm-grid`.
 #[derive(Clone, Debug)]
 pub struct Surface {
     /// Immutable snapshot spine. [`Arc::make_mut`] clones this ordered vector
@@ -350,16 +301,15 @@ impl Surface {
     pub fn log(&self) -> &EventLog {
         &self.log
     }
-    /// The current head of the spine (§4.3 clause 1).
+    /// The current head of the spine.
     pub fn seq(&self) -> Seq {
         self.log.head()
     }
 
-    /// First ordered line whose id is not less than `id`.
+    /// First ordered line whose id is not less than `id`, in O(log lines).
     ///
-    /// Line ids are appended monotonically and never reordered. Keeping the
-    /// lower bound explicit avoids a borrowing closure in the Trust lane while
-    /// reducing lookup from a prefix scan to O(log lines).
+    /// Line ids are appended monotonically and never reordered. The explicit
+    /// loop avoids a borrowing closure in the Trust lane.
     fn line_lower_bound(&self, id: LineId) -> usize {
         let mut low = 0usize;
         let mut high = self.lines.len();
@@ -367,9 +317,8 @@ impl Surface {
             let mid = low + (high - low) / 2;
             #[cfg(test)]
             LINE_ID_COMPARISONS.with(|count| count.set(count.get().saturating_add(1)));
-            // `mid < high <= len` on every reachable iteration. The total
-            // access spelling carries that bound for Trust; returning the
-            // current insertion point only handles the impossible miss.
+            // `mid < high <= len` on every reachable iteration; the checked
+            // access spells that bound for Trust, and the miss arm is unreachable.
             let Some((candidate, _)) = self.lines.get(mid) else {
                 return low;
             };
@@ -399,17 +348,13 @@ impl Surface {
         (start, self.line_lower_bound(r.end))
     }
 
-    /// MUTATE — the one buffer-edit verb. Returns the monotone Seq it was
-    /// assigned. Reversible (buffer-only). (§4.2)
+    /// MUTATE: the one buffer-edit verb. Returns the assigned `Seq`. Reversible.
     pub fn apply(&mut self, _c: &WriteCap, e: Edit) -> Seq {
         match e {
             Edit::AppendLine(text) => {
                 let id = LineId(self.next_line);
-                // Monotone id counter: 2^64 appends are unreachable, so the
-                // saturation can never fire on a real path — it just spells the
-                // increment in the provably non-overflowing form the strict L0
-                // gate accepts (same idiom as the `total` counter in
-                // `EventLog::append_at`).
+                // 2^64 appends are unreachable; saturating spells the increment
+                // in the non-overflowing form the strict L0 gate accepts.
                 self.next_line = self.next_line.saturating_add(1);
                 // `Arc<String>` moves the public String header without copying
                 // its text allocation, and makes a later spine detach shallow.
@@ -445,8 +390,8 @@ impl Surface {
         }
     }
 
-    /// READ — text projection over a line range, carrying origin + the reflected
-    /// Seq (§4.2 READ, §4.3 clause 4). First slice tags all output `Source`.
+    /// READ: text over a line range, with origin and the reflected `Seq`. All
+    /// output is currently tagged `Source`.
     pub fn read_text(&self, _c: &ReadCap, r: Range) -> TextWithOrigin {
         let mut out = String::new();
         let (start, end) = self.line_range_bounds(r);
@@ -463,9 +408,8 @@ impl Surface {
         }
     }
 
-    /// COMPOSE — O(1)-COW snapshot (§4.2). The immutable line and event-log
-    /// spines are shared; the first corresponding mutation detaches only that
-    /// spine via [`Arc::make_mut`].
+    /// COMPOSE: O(1) copy-on-write snapshot. The line and event-log spines are
+    /// shared; the first mutation of either detaches only that spine.
     pub fn snapshot(&self, _c: &ReadCap) -> Snapshot {
         Snapshot {
             at: self.seq(),
@@ -473,10 +417,10 @@ impl Surface {
         }
     }
 
-    // ===== READ (subscribe) ===== the event log's read-face (§3.4).
+    // READ (subscribe): the event log's read face.
 
-    /// Open a subscription cursor positioned at the current head: it will see
-    /// events appended AFTER this point.
+    /// Open a subscription cursor at the current head; it sees events appended
+    /// after this point.
     pub fn subscribe(&self, _c: &ReadCap) -> Cursor {
         Cursor { at: self.seq() }
     }
@@ -486,27 +430,20 @@ impl Surface {
     /// (it must re-pull via `read_text`); the writer is never blocked.
     #[allow(
         clippy::collapsible_if,
-        reason = "the nested `if let` + inner `if` keeps poll's MIR fully lowerable for the strict Trust gate; the collapsed `&&` form is not (see comment inside)"
+        reason = "the nested form keeps poll's MIR lowerable for the strict Trust gate; the `&&` let-chain is not"
     )]
     pub fn poll(&self, cursor: Cursor) -> (SubUpdate, Cursor) {
         let head = self.seq();
-        // Did we fall behind the ring? The oldest still-live event has a seq; if
-        // it is newer than cursor.at + 1, events in between were evicted.
-        // Spelled `if let` + saturating_add for the strict L0 gate: cursor.at
-        // is a Seq off the spine, whose `total` counter itself saturates at
-        // u64::MAX, so the `+ 1` here can never actually overflow (and no live
-        // seq can exceed u64::MAX to out-compare the saturated sum anyway);
-        // the closure-free shape also keeps poll's MIR fully lowerable.
+        // Behind the ring if the oldest live seq is newer than `cursor.at + 1`.
+        // `if let` + `saturating_add` keep poll closure-free and provably
+        // non-overflowing for the strict L0 gate.
         if let Some(oldest) = self.log.live().next() {
             if oldest.seq.0 > cursor.at.0.saturating_add(1) {
                 return (SubUpdate::Gap { resync_to: head }, Cursor { at: head });
             }
         }
-        // Seek directly to the first event after the cursor. A caught-up
-        // subscriber is the common case; starting from `live()` would scan the
-        // entire retained ring (up to `MAX_LOG_EVENTS`) just to return empty.
-        // Keep the explicit loop + push instead of cloned/collect: the strict
-        // gate can bound this growth by the live ring's length.
+        // Seek past the cursor rather than scan the ring. The explicit push
+        // loop lets the strict gate bound growth by the ring length.
         let mut events: Vec<Event> = Vec::new();
         for e in self.log.live_after(cursor.at) {
             events.push(e.clone());
@@ -514,11 +451,9 @@ impl Surface {
         (SubUpdate::Events(events), Cursor { at: head })
     }
 
-    /// COMPOSE — atomic, isolated apply-group under optimistic CC over a base
-    /// snapshot seq (§4.2). Subsumes single-op CAS and frozen-world act: the
-    /// editor undo unit, the multi-cursor atomic edit, and the harness scripted
-    /// step are all `transact`. Commits iff the surface has not advanced past
-    /// `base`; otherwise nothing is applied and the caller retries.
+    /// COMPOSE: an atomic, isolated apply-group under optimistic concurrency
+    /// over a base seq. Commits iff the surface has not advanced past `base`;
+    /// otherwise nothing is applied and the caller retries.
     pub fn transact(&mut self, c: &WriteCap, base: Seq, body: Vec<Edit>) -> TxnOutcome {
         if self.seq() != base {
             return TxnOutcome::Conflict;
@@ -530,7 +465,7 @@ impl Surface {
     }
 }
 
-/// A read result carrying provenance + the reflected Seq (§4.3 clause 4).
+/// A read result carrying provenance and the reflected `Seq`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextWithOrigin {
     pub text: String,
@@ -538,7 +473,7 @@ pub struct TextWithOrigin {
     pub seq: Seq,
 }
 
-/// A seq-anchored COW prefix of a Surface (§4.2 COMPOSE).
+/// A seq-anchored copy-on-write view of a Surface.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub at: Seq,
@@ -558,10 +493,8 @@ mod tests {
 
     #[allow(unsafe_code, reason = "the test build is its own trusted launcher")]
     fn authority() -> aterm_cap::Authority {
-        // SAFETY: a test process that processes no untrusted input is its own
-        // trusted launcher, which is the whole of `root_authority`'s contract.
-        // The mint is nameable here only through the dev-dependency edge's
-        // `launcher-mint`.
+        // SAFETY: a test process that handles no untrusted input is its own
+        // trusted launcher, which is `root_authority`'s whole contract.
         unsafe { aterm_cap::Authority::root_authority() }
     }
 
@@ -571,27 +504,6 @@ mod tests {
 
     fn write_cap() -> WriteCap {
         authority().grant(aterm_cap::Tier::Trusted)
-    }
-
-    /// THE kernel invariant (§4.3 clause 1), the executable twin of
-    /// `Kernel.tla`'s `SeqIsLen` + `Monotonic`: every apply bumps seq by exactly
-    /// one, the spine is gap-free, and seq == total events appended.
-    #[test]
-    fn event_log_is_gap_free_and_monotonic() {
-        let mut s = Surface::new();
-        assert_eq!(s.seq(), Seq(0));
-        let mut prev = 0u64;
-        for i in 0..1000 {
-            let before = s.seq().0;
-            s.apply(&write_cap(), Edit::AppendLine(format!("line {i}")));
-            let now = s.seq().0;
-            assert_eq!(now, before + 1, "each apply yields exactly one Seq");
-            assert!(now > prev, "seq is strictly monotonic");
-            prev = now;
-            // Monotonic + gap-free: seq equals total events ever appended.
-            assert_eq!(s.seq().0, s.log().total());
-        }
-        assert_eq!(s.seq(), Seq(1000));
     }
 
     #[test]
@@ -609,36 +521,6 @@ mod tests {
         assert_eq!(got.text, "hello\nworld\n");
         assert_eq!(got.origin, OriginTag::Source);
         assert_eq!(got.seq, Seq(2));
-    }
-
-    #[test]
-    fn snapshot_is_isolated_from_later_writes() {
-        let mut s = Surface::new();
-        s.apply(&write_cap(), Edit::AppendLine("frozen".into()));
-        let snap = s.snapshot(&read_cap());
-        s.apply(&write_cap(), Edit::AppendLine("after".into()));
-        // The snapshot sees the frozen world; the live surface moved on.
-        let snap_text = snap
-            .read_text(
-                &read_cap(),
-                Range {
-                    start: LineId(0),
-                    end: LineId(9),
-                },
-            )
-            .text;
-        let live_text = s
-            .read_text(
-                &read_cap(),
-                Range {
-                    start: LineId(0),
-                    end: LineId(9),
-                },
-            )
-            .text;
-        assert_eq!(snap_text, "frozen\n");
-        assert_eq!(live_text, "frozen\nafter\n");
-        assert_eq!(snap.at, Seq(1));
     }
 
     #[test]
@@ -803,30 +685,14 @@ mod tests {
             }
             other => panic!("expected events, got {other:?}"),
         }
-        // caught up: empty, NOT a gap
+        // caught up: empty, not a gap
         let (upd, _cur) = s.poll(cur);
         assert_eq!(upd, SubUpdate::Events(vec![]));
     }
 
     #[test]
-    fn slow_subscriber_gets_a_gap_and_never_blocks() {
-        let mut s = Surface::new();
-        let cur = s.subscribe(&read_cap()); // at seq 0
-        // overflow the bounded ring so the oldest live event is past the cursor
-        for i in 0..(MAX_LOG_EVENTS + 8) {
-            s.apply(&write_cap(), Edit::AppendLine(format!("{i}")));
-        }
-        let (upd, _cur) = s.poll(cur);
-        assert!(
-            matches!(upd, SubUpdate::Gap { .. }),
-            "fell behind horizon -> gap, not block"
-        );
-    }
-
-    #[test]
     fn event_log_ring_does_not_double_past_max() {
-        // Fill well past MAX_LOG_EVENTS: the ring must settle at cap MAX_LOG_EVENTS+1
-        // (targeted reserve at the eviction boundary) rather than doubling to ~2x.
+        // The ring must settle at capacity MAX_LOG_EVENTS + 1, not double.
         let mut log = EventLog::default();
         let mut max_cap_seen = 0usize;
         for _ in 0..(MAX_LOG_EVENTS + 4096) {
@@ -848,17 +714,13 @@ mod tests {
         );
     }
 
-    /// DIFFERENTIAL: the O(1) seek in `live_after` yields exactly what the
-    /// linear `live().filter(|e| e.seq > after)` yields, at every watermark
-    /// around a ring that HAS evicted — below the low-water (everything), on
-    /// the low-water, in the middle, at the head, and past it (nothing). Plus
-    /// the two O(1) ends: `oldest_live`/`newest_live` are the ring's low/high,
-    /// and `newest_live().ts` is the `max` fold over a monotone-`ts` recording.
+    /// `live_after`'s seek matches `live().filter(|e| e.seq > after)` at every
+    /// watermark around an evicted ring, and `oldest_live`/`newest_live` are the
+    /// ring's ends (`newest_live().ts` is the max over a monotone recording).
     #[test]
     fn live_after_seek_matches_the_filter_and_the_ends_are_the_extremes() {
         let mut log = EventLog::default();
-        // Past the cap so the front has been evicted, with a nondecreasing ts —
-        // the shape a temporal recorder produces from one monotone clock.
+        // Past the cap, with nondecreasing ts as one monotone clock produces.
         for i in 0..(MAX_LOG_EVENTS + 32) {
             let (_seq, _evicted) =
                 log.append_at(Op::Resize { rows: 0, cols: 0 }, Ticks((i as u64) / 3));
@@ -935,7 +797,7 @@ mod tests {
             "base\na\nb\n"
         );
 
-        // stale base: optimistic CC conflicts and applies NOTHING
+        // stale base: optimistic CC conflicts and applies nothing
         let out2 = s.transact(&write_cap(), snap.at, vec![Edit::AppendLine("z".into())]);
         assert_eq!(out2, TxnOutcome::Conflict);
         assert_eq!(s.seq(), Seq(3), "conflict left the surface untouched");

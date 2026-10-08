@@ -10,8 +10,7 @@
 //! the control thread's refusals (never a wake), the owner token, the main
 //! thread's `wire::apply` replies, `OK recorded` for a note, the same id on
 //! every progress restate, `done` then `how=gone`, `dismiss` then `act`
-//! finding nothing, `appstatus` never listing a script's rows, and `help`
-//! carrying both rows.
+//! finding nothing, and `appstatus` never listing a script's rows.
 //!
 //! The client speaks the wire directly (`TOKEN <owner token> <verb …>`, the
 //! status line, then `<n>` rows for a Lines verb), so every assertion is on
@@ -30,10 +29,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::headless_boot;
 
 use headless_boot::Instance;
 
@@ -50,7 +46,9 @@ fn boot(tag: &str) -> Option<Instance> {
     )
 }
 
-const REPLY_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a reply may take before it is read as a hang (AGENTS.md: a hang
+/// detector is a minute, never a latency budget).
+const REPLY_DEADLINE: Duration = Duration::from_secs(60);
 
 fn token_path(inst: &Instance) -> PathBuf {
     let mut p = std::ffi::OsString::from(&inst.sock);
@@ -70,7 +68,7 @@ fn token(inst: &Instance) -> String {
 fn is_lines_verb(line: &str) -> bool {
     matches!(
         line.split_whitespace().next(),
-        Some("messages" | "appstatus" | "help")
+        Some("messages" | "appstatus")
     )
 }
 
@@ -165,7 +163,7 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     let b = rows.last().map_or(0, |r| row_id(r));
 
     // 2. A note from a script is a RECORD, never a row.
-    let a = status(&inst, "notice post system hello from a script");
+    let a = status(&inst, "notice post script hello from a script");
     assert!(a.starts_with("OK recorded message="), "{a}");
     let a = minted(&a);
     // aterm's own boot reports (a config note) may land beside it: the
@@ -184,7 +182,7 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     // 3. A failure is a held row, its detail in the log.
     let w = status(
         &inst,
-        "notice post system sev=warn key=deploy Deploy failed -- connection refused",
+        "notice post script sev=warn key=deploy Deploy failed -- connection refused",
     );
     assert!(w.starts_with("OK message="), "{w}");
     let w = minted(&w);
@@ -245,13 +243,13 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     assert_eq!(
         status(
             &inst,
-            "notice post system sev=warn one two three four five six seven"
+            "notice post script sev=warn one two three four five six seven"
         ),
         "ERR notice: title over 6 words; put the rest after --"
     );
     assert_eq!(
         status(&inst, "notice post update sev=warn Nope"),
-        "ERR notice: the toolchain, update and harness tags are aterm's own"
+        "ERR notice: that tag is aterm's own; post under script or a tag of your own"
     );
     assert!(
         status(&inst, "messages 0").starts_with("ERR usage: messages "),
@@ -265,28 +263,6 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
         assert!(
             !row.contains("wire.") && !row.contains("Building") && !row.contains("hello"),
             "a script's row in appstatus: {row}"
-        );
-    }
-
-    // 9. `help` carries both rows.
-    let (st, rows) = ctl(&inst, "help");
-    let count: usize = st
-        .strip_prefix("OK ")
-        .and_then(|t| t.split_whitespace().next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("help: {st}"));
-    assert!(count >= 112 && count == rows.len(), "help: {st}");
-    for (verb, summary) in [
-        ("messages", "the message log, one row each"),
-        (
-            "notice",
-            "record, show work in flight, end or press a message",
-        ),
-    ] {
-        assert!(
-            rows.iter()
-                .any(|r| r.split_whitespace().next() == Some(verb) && r.contains(summary)),
-            "no `{verb}` row in help"
         );
     }
 }

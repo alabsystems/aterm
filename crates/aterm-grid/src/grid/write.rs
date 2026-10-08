@@ -20,17 +20,19 @@ use super::{
     Cell, CellCoord, CellFlags, ColorType, ExtendedStyle, Grid, PackedColor, PackedColors, StyleId,
 };
 
-/// Collect columns in `[start, end)` whose current cell carries the
-/// HAS_EXTRAS flag — i.e. cells whose extras-map entry must be removed when
-/// a write overwrites them (#7456). Returns an empty `Vec` (no allocation)
-/// when none do. Callers must only invoke this when the extras map is
-/// non-empty (`!extras.is_empty()`), keeping plain writes branch-only.
+/// Collect columns in `[start, end)` whose cell carries the HAS_EXTRAS flag,
+/// i.e. whose extras-map entry must be removed when a write overwrites them.
+/// Returns an empty `Vec` (no allocation) when none do. Call only when the
+/// extras map is non-empty, keeping plain writes branch-only.
 #[cold]
 #[inline(never)]
 pub(super) fn stale_extras_cols(row: &crate::Row, start: u16, end: u16) -> Vec<u16> {
     let mut stale = Vec::new();
     for col in start..end {
         if row.get(col).is_some_and(Cell::has_extras) {
+            if stale.is_empty() {
+                stale.reserve_exact(usize::from(end.saturating_sub(col)));
+            }
             stale.push(col);
         }
     }
@@ -39,15 +41,13 @@ pub(super) fn stale_extras_cols(row: &crate::Row, start: u16, end: u16) -> Vec<u
 
 impl Grid {
     /// Remove the extras-map entries captured by [`stale_extras_cols`] for a
-    /// row that has just been overwritten (#7456).
+    /// row that has just been overwritten.
     ///
-    /// Overwriting a cell that carried extras (hyperlink, combining marks,
-    /// underline color, RGB overflow) previously left its HashMap entry
-    /// behind: invisible to readers (they gate on the cell's HAS_EXTRAS
-    /// flag) but leaking memory until the row scrolled off or was erased —
-    /// and resurfacing when a later styled write's `get_or_create` landed on
-    /// the same coordinate and merged stale data (e.g. an old hyperlink)
-    /// into the new cell.
+    /// Otherwise an overwritten cell's entry (hyperlink, combining marks,
+    /// underline color, RGB overflow) would linger, invisible (readers gate on
+    /// HAS_EXTRAS) but leaking, and a later styled write's `get_or_create` at
+    /// that coordinate would merge the stale data (e.g. an old hyperlink) into
+    /// the new cell.
     #[cold]
     #[inline(never)]
     pub(super) fn remove_stale_extras(&mut self, row: u16, cols: Vec<u16>) {
@@ -57,13 +57,12 @@ impl Grid {
     }
 
     /// Probe the old cell pair at `(row, col[, col+1])` for the HAS_EXTRAS
-    /// flag before a 1- or 2-cell overwrite (#7456). Returns which of the
-    /// two columns carry a (potentially stale) extras-map entry.
+    /// flag before a 1- or 2-cell overwrite. Returns which of the two columns
+    /// carry a (possibly stale) extras-map entry.
     ///
-    /// Cost model: one map-emptiness branch when the extras map is empty
-    /// (the common plain-text case — pays nothing else); otherwise one
-    /// cell-flag read per overwritten column, and a hash removal (via
-    /// [`Self::remove_stale_extras_pair`]) only for columns actually flagged.
+    /// Cost: one branch when the extras map is empty (the plain-text case);
+    /// otherwise one flag read per overwritten column, and a hash removal
+    /// ([`Self::remove_stale_extras_pair`]) only for flagged columns.
     #[inline]
     pub(crate) fn stale_extras_pair(&self, row: u16, col: u16, width: u16) -> (bool, bool) {
         if self.storage.extras.is_empty() {
@@ -83,8 +82,8 @@ impl Grid {
     }
 
     /// Remove the extras-map entries flagged by [`Self::stale_extras_pair`]
-    /// after the overwrite landed (#7456). Call only when the write
-    /// actually happened — a failed write must not drop live extras.
+    /// after the overwrite landed. Call only when the write happened; a failed
+    /// write must not drop live extras.
     #[inline]
     pub(crate) fn remove_stale_extras_pair(&mut self, row: u16, col: u16, stale: (bool, bool)) {
         if stale.0 || stale.1 {
@@ -120,30 +119,24 @@ impl Grid {
     /// - At region bottom: scroll region up
     /// - Above region bottom: move cursor down one row
     /// - Below region bottom: move down unless at screen bottom, then nothing
-    ///   (xterm xtermIndex: `cur_row > bot_marg` is CursorDown, which clamps
-    ///   at `max_row` — wrapping below the region NEVER scrolls the display;
-    ///   output keeps overwriting the last row from the wrap column)
+    ///   (xterm xtermIndex: `cur_row > bot_marg` is CursorDown, clamped at
+    ///   `max_row`, so wrapping below the region never scrolls the display)
     ///
-    /// Wrapped-line bookkeeping (DESTINATION convention — the row the wrapped
-    /// content flows INTO is marked wrapped):
-    /// - Mark wrapped when moving to a real next row.
-    /// - Mark wrapped when the scroll region scrolls on wrap, for BOTH a
-    ///   non-full region AND the full screen: the recycled destination row is a
-    ///   soft-wrap continuation, so the flag must survive the scroll or reflow /
-    ///   selection / copy will treat the continuation as a separate line.
+    /// The row the wrapped content flows into is marked wrapped:
+    /// - when moving to a real next row;
+    /// - when the scroll region scrolls on wrap, for both a partial region and
+    ///   the full screen: the recycled destination row is a soft-wrap
+    ///   continuation, so reflow / selection / copy must see it as one line.
     #[inline]
     pub(crate) fn advance_autowrap_line(&mut self) {
-        // THE WRAP FACT (kitty-motion §4.1): this fn is the one funnel every
-        // autowrap line advance resolves through, so the serial bumps HERE and
-        // nowhere else — unconditionally at entry, because even the clamped
-        // bottom-of-screen arm below (cursor pinned, column already reset to
-        // the margin) is a wrap the caret observer must be able to see.
+        // The wrap fact: every autowrap line advance goes through this fn, so
+        // the serial bumps here and nowhere else, unconditionally, since even
+        // the clamped bottom-of-screen arm below is a wrap the caret observer
+        // must see.
         self.storage.wrap_serial += 1;
-        // Determine whether cursor was within horizontal margins BEFORE moving it.
-        // When DECLRMM is active and cursor is within margins, wrap to the left
-        // margin; otherwise wrap to column 0.  Bug fix: previously cursor.col was
-        // set unconditionally to margins.left before the check, making the margin
-        // test always true and causing incorrect margined scrolls (#7565).
+        // Determine whether the cursor was within the horizontal margins before
+        // moving it: with DECLRMM active and the cursor inside, wrap to the left
+        // margin; otherwise to column 0.
         let margins = self.storage.horizontal_margins();
         let orig_col = self.storage.cursor.col;
         let in_margins = !margins.is_full(self.storage.cols)
@@ -159,21 +152,16 @@ impl Grid {
                 self.mark_row_wrapped(self.storage.cursor.row);
             }
             std::cmp::Ordering::Equal => {
-                // When DECLRMM is active and cursor was within margins,
-                // use rectangular scroll so cells outside the margin
-                // columns are not affected (#7454).
+                // With DECLRMM active and the cursor within the margins, use a
+                // rectangular scroll so cells outside the margins are untouched.
                 if in_margins {
                     self.scroll_region_up_margined(1, margins.left, margins.right);
                 } else {
                     self.scroll_region_up(1);
                 }
-                // The freshly-recycled destination row receives the soft-wrap
-                // continuation, so mark it wrapped to preserve wrap continuity
-                // for reflow / selection / copy — matching the `Less` branch.
-                // (Bugfix: a full-screen bottom scroll previously skipped this,
-                // breaking the continuation chain at the new bottom row, so copy
-                // emitted a spurious newline and resize/reflow split one logical
-                // line into two.)
+                // The recycled destination row receives the soft-wrap
+                // continuation, so mark it wrapped (as in the `Less` branch), or
+                // copy would add a newline and reflow would split the line.
                 self.mark_row_wrapped(self.storage.cursor.row);
             }
             std::cmp::Ordering::Greater => {
@@ -198,7 +186,7 @@ impl Grid {
     pub fn write_char(&mut self, c: char) {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
-        // Drop a stale extras-map entry before overwriting (#7456).
+        // Drop a stale extras-map entry before overwriting.
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
         let is_non_bmp = (c as u32) > Cell::MAX_DIRECT_CODEPOINT;
         // Write a BMP placeholder for non-BMP chars (Row only handles u16).
@@ -275,7 +263,7 @@ impl Grid {
 
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
-        // Drop a stale extras-map entry before overwriting (#7456).
+        // Drop a stale extras-map entry before overwriting.
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
         let is_non_bmp = (c as u32) > Cell::MAX_DIRECT_CODEPOINT;
         let write_c = if is_non_bmp { '\u{FFFD}' } else { c };
@@ -301,7 +289,7 @@ impl Grid {
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
     }
 
-    /// FAST PATH: Fill N consecutive cells with the same character and style.
+    /// Fast path: fill N consecutive cells with the same character and style.
     ///
     /// Creates a template `Cell` from the given ASCII byte and style, then
     /// bulk-writes it using `Row::fill_cell_run` (which lowers to a memset-like
@@ -328,7 +316,7 @@ impl Grid {
         let template = Cell::from_ascii_styled(byte, colors, flags);
         let mut written = 0;
         let mut remaining = count;
-        // #7456: hoisted per run — zero per-cell cost when the extras map
+        // hoisted per run — zero per-cell cost when the extras map
         // is empty (the common plain-text case).
         let scan_stale = !self.storage.extras.is_empty();
 
@@ -377,9 +365,9 @@ impl Grid {
 
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
-            // #7456: capture stale-extras columns before the fill clobbers
-            // the HAS_EXTRAS flags; entries are removed after the row
-            // borrow ends.
+            // Capture stale-extras columns before the overwrite clobbers the
+            // HAS_EXTRAS flags; the entries are removed after the row borrow
+            // ends.
             let stale = if scan_stale {
                 stale_extras_cols(row, cursor_col, cursor_col + to_write_u16)
             } else {
@@ -419,7 +407,7 @@ impl Grid {
         written
     }
 
-    /// FAST PATH: Write printable ASCII bytes directly as u64 cells (400+ MB/s).
+    /// Fast path: write printable ASCII bytes directly as u64 cells.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, default style, insert mode OFF, auto-wrap ON
     /// ENSURES: result <= ascii.len(), self.storage.cursor.row < self.storage.visible_rows
@@ -430,7 +418,7 @@ impl Grid {
         }
         let mut written = 0;
         let mut remaining = ascii;
-        // #7456: hoisted per run — zero per-cell cost when the extras map
+        // hoisted per run — zero per-cell cost when the extras map
         // is empty (the common plain-text case).
         let scan_stale = !self.storage.extras.is_empty();
         while !remaining.is_empty() {
@@ -480,9 +468,9 @@ impl Grid {
             // to_write bounded by effective_cols (u16) — saturate for safety
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
-            // #7456: capture stale-extras columns before the overwrite
-            // clobbers the HAS_EXTRAS flags; entries are removed after the
-            // row borrow ends. The hot write loop below stays untouched.
+            // Capture stale-extras columns before the overwrite clobbers the
+            // HAS_EXTRAS flags; the entries are removed after the row borrow
+            // ends.
             let stale = if scan_stale {
                 stale_extras_cols(row, cursor_col, cursor_col + to_write_u16)
             } else {
@@ -531,7 +519,7 @@ impl Grid {
         written
     }
 
-    /// FAST PATH: Write styled ASCII bytes with autowrap and deferred wrapping.
+    /// Fast path: write styled ASCII bytes with autowrap and deferred wrapping.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, no RGB overflow, insert mode OFF
     /// ENSURES: result <= ascii.len(), self.storage.cursor.row < self.storage.visible_rows
@@ -549,7 +537,7 @@ impl Grid {
         self.write_ascii_run_styled_packed(ascii, colors, flags, last_byte)
     }
 
-    /// FAST PATH: Write styled ASCII bytes with pre-computed packed colors.
+    /// Fast path: write styled ASCII bytes with pre-computed packed colors.
     ///
     /// Like `write_ascii_run_styled` but accepts pre-computed `PackedColors`
     /// to avoid redundant `convert_colors` when the caller already has them.
@@ -570,7 +558,7 @@ impl Grid {
 
         let mut written = 0;
         let mut remaining = ascii;
-        // #7456: hoisted per run — zero per-cell cost when the extras map
+        // hoisted per run — zero per-cell cost when the extras map
         // is empty (the common plain-text case).
         let scan_stale = !self.storage.extras.is_empty();
 
@@ -624,9 +612,9 @@ impl Grid {
             // to_write bounded by effective_cols (u16) — saturate for safety
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
-            // #7456: capture stale-extras columns before the overwrite
-            // clobbers the HAS_EXTRAS flags; entries are removed after the
-            // row borrow ends.
+            // Capture stale-extras columns before the overwrite clobbers the
+            // HAS_EXTRAS flags; the entries are removed after the row borrow
+            // ends.
             let stale = if scan_stale {
                 stale_extras_cols(row, cursor_col, cursor_col + to_write_u16)
             } else {

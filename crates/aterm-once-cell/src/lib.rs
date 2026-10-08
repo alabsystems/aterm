@@ -2,42 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `once_cell` — first-party replacement for the crates.io package of the same
-//! name. The package is `once_cell`; the directory is `crates/aterm-once-cell`
-//! (see the manifest for why the two names differ).
+//! name (the manifest says why the directory name differs).
 //!
-//! Upstream is a hand-written set of single-assignment cells built on
-//! `AtomicPtr`, `UnsafeCell` and a bespoke parking queue — the crate that
-//! existed because `std` had no `OnceLock` or `LazyLock`. `std` has both now,
-//! so this replacement is those cells expressed in terms of
+//! Upstream predates `std`'s `OnceLock`; this crate expresses the same cells over
 //! [`std::sync::OnceLock`], [`std::sync::Mutex`] and [`core::cell::Cell`], with
-//! no dependency and **no `unsafe` at all**.
+//! no dependencies and no `unsafe`. All thirteen consumers are third-party, so
+//! the `[patch.crates-io]` row is the only thing that reaches them.
 //!
-//! # What it retires
+//! # Liveness per consumer
 //!
-//! ```text
-//! all five cells   -1 package, -3,950 lines, -53 unsafe tokens
-//!                  (no build script, no proc macro — a leaf)
-//! ```
-//!
-//! `once_cell` is a LEAF: it has no dependencies of its own, so its dominator
-//! is itself in every cell, and — this is the part worth stating out loud —
-//! that was as true before the W6b flip as after it. The flip cut mac-arm's
-//! parent set from three to one (`rustls` alone, after `naga` and `wgpu-core`
-//! left with wgpu), which changes who is to blame but cannot change what
-//! carving the package removes. This row was always buyable and simply was not
-//! on anyone's list.
-//!
-//! Every one of its thirteen edges is third-party — `grep -rn once_cell
-//! crates/ tools/ apps/ --include='*.rs'` returns ZERO — so a call-site census
-//! reports nothing to rewrite and the patch table is the only lever that
-//! reaches it. Same shape as `cfg-if`, `profiling` and `log` before it.
-//!
-//! # THIS ONE IS LIVE CODE, and that is the whole difference from `core_maths`
-//!
-//! `crates/aterm-core-maths` replaces a crate that is linked and never called;
-//! its correctness argument is "no body of it runs". **That argument is not
-//! available here and must not be borrowed.** Measured against the resolved
-//! sources of all thirteen consumers:
+//! Unlike `crates/aterm-core-maths`, this code RUNS, so it must be right, not
+//! merely present. Measured against the consumers' resolved sources:
 //!
 //! ```text
 //! DEAD  (import sits under a `cfg` that is off in every cell)
@@ -59,17 +34,15 @@
 //!   wasm-bindgen-futures unsync::Lazy     wasm-gpu         Deref
 //!
 //! DEV-ONLY (outside every `targo --unverified forge` cell, but `cargo test` builds them)
-//!   criterion 0.5.1      sync::Lazy       5 statics
 //!   tempfile 3.27.0      sync::OnceCell   get_or_init, get
 //! ```
 //!
-//! So mac-arm — where `rustls` is the sole parent — is the ONLY cell on which
-//! this package is dead weight. On the other four it is running code, and the
-//! obligation is to be right, not merely to be present.
+//! On mac-arm, whose sole parent is `rustls`, the package is dead weight; on
+//! the other four cells it is running code.
 //!
 //! ## The contract that has teeth
 //!
-//! `wgpu-core`'s `ResourcePool::get_or_init` (src/pool.rs) leans on
+//! `wgpu-core`'s `ResourcePool::get_or_init` (src/pool.rs) relies on
 //! [`sync::OnceCell::get_or_try_init`] calling its closure **exactly once**
 //! across threads:
 //!
@@ -79,112 +52,74 @@
 //! if let Some(strong) = strong { return Ok(strong); }   // "I initialised it"
 //! ```
 //!
-//! `strong` being `Some` is how the caller decides it won the race. A
-//! best-effort implementation — check, compute, `set`, re-read — would let two
-//! threads both run the closure, both see `strong == Some`, and both return a
-//! DIFFERENT `Arc` for one key: two bind group layouts where the pool exists to
-//! guarantee one. wgpu-core's own `concurrent_creation_2_threads` test asserts
-//! the counter reaches 1. [`sync::OnceCell`] therefore serialises
-//! initialisation through a private [`Mutex`](std::sync::Mutex) rather than
-//! racing, and `tests/behaviour.rs` asserts it directly — against a
-//! deliberately racy control cell that the same test must catch.
+//! A check-compute-set implementation would let two threads both run the
+//! closure and return two different `Arc`s for one key. [`sync::OnceCell`]
+//! therefore serialises initialisation through a private
+//! [`Mutex`](std::sync::Mutex); `tests/behaviour.rs` asserts it, with a racy
+//! control cell the same test must catch.
 //!
-//! # Divergences, stated first because they are the risk
+//! # Divergences
 //!
-//! Each is deliberate, each is unreachable in this graph, and each fails
-//! CLOSED — as a compile error or a test failure, never as a quiet behaviour
-//! change.
+//! Each is deliberate, unreachable in this graph, and fails closed (a compile
+//! error or a test failure, never a quiet behaviour change).
 //!
-//! 1. **Upstream is `#![no_std]`-capable; this is not.** Upstream exists so
-//!    that code without `std` can have a `OnceCell`; this shim answers with
-//!    `std`. Every target aterm builds has `std`, `wasm32-unknown-unknown`
-//!    included. A genuine `no_std` build would fail to compile — loudly. Same
-//!    trade, and same justification, as `crates/aterm-core-maths`.
+//! 1. **Not `no_std`-capable.** Every target aterm builds has `std`,
+//!    `wasm32-unknown-unknown` included; a `no_std` build fails to compile.
 //!
-//! 2. **`race::OnceBox` blocks where upstream races.** Upstream's `race` module
-//!    is lock-free and documents that "if several threads concurrently run
-//!    `get_or_init`, more than one `f` can be called; however, all threads will
-//!    return the same value". Ours calls `f` exactly once. That is a STRICTER
-//!    guarantee which still satisfies the documented contract, and it also
-//!    never allocates a `Box` only to drop it. The one thing upstream permits
-//!    and this does not is REENTRANT initialisation: upstream's recursive
-//!    `get_or_init` merely wastes an allocation, ours deadlocks — exactly as
-//!    upstream's own `sync::OnceCell` does, and as its
-//!    `examples/reentrant_init_deadlocks.rs` documents for that type. No
-//!    consumer reenters; `ahash`'s closure is a `Box::new`.
+//! 2. **`race::OnceBox` blocks where upstream races.** Upstream documents that
+//!    concurrent `get_or_init` may call more than one `f` but returns one value
+//!    to all; ours calls `f` exactly once, which meets that contract. Reentrant
+//!    initialisation deadlocks here (as in upstream's `sync::OnceCell`) where
+//!    upstream's `race` merely wastes an allocation. No consumer reenters;
+//!    `ahash`'s closure is a `Box::new`.
 //!
-//! 3. **`with_value` is not `const`.** Upstream's `sync::OnceCell::with_value`
-//!    and `unsync::OnceCell::with_value` are `const fn`, which needs
-//!    `UnsafeCell` field construction; `std`'s `OnceLock` and
-//!    `core::cell::OnceCell` expose no const initialiser. Ours are plain `fn`.
-//!    Both are used only by this crate's own `Clone`/`From` impls; no consumer
-//!    calls either, and a `static` built from one would fail to compile.
+//! 3. **`with_value` is not `const`.** `std` exposes no const initialiser for
+//!    a filled `OnceLock` or `core::cell::OnceCell`. Only this crate's own
+//!    `Clone`/`From` impls call it.
 //!
-//! 4. **Sizes differ.** `sync::OnceCell<T>` is `OnceLock<T>` plus a `Mutex<()>`
-//!    gate where upstream is an `AtomicPtr` plus an `UnsafeCell<Option<T>>`;
-//!    `sync::Lazy` holds `Mutex<Option<F>>` where upstream holds
-//!    `Cell<Option<F>>` behind an `unsafe impl Sync`. Nothing in the graph
-//!    takes `size_of` of either. The `Mutex` is what buys divergence 2's
-//!    exactly-once guarantee and, with it, the `Sync` bound upstream spells by
-//!    hand: `Mutex<Option<F>>: Sync` requires `F: Send`, which is precisely
-//!    upstream's `unsafe impl<T, F: Send> Sync for Lazy<T, F>`.
+//! 4. **Sizes differ.** `sync::OnceCell<T>` adds a `Mutex<()>` gate;
+//!    `sync::Lazy` holds `Mutex<Option<F>>` where upstream holds a `Cell` behind
+//!    `unsafe impl Sync`. No consumer takes `size_of` of either. The `Mutex`
+//!    buys divergence 2's exactly-once guarantee and derives upstream's `Sync`
+//!    bound (`Mutex<Option<F>>: Sync` iff `F: Send`).
 //!
-//! 5. **Five upstream items are ABSENT, deliberately.**
-//!    `race::OnceNonZeroUsize`, `race::OnceBool`, `race::OnceRef`,
-//!    `sync::OnceCell::wait` and `sync::OnceCell::get_unchecked`. The first
-//!    three are `AtomicUsize`/`AtomicPtr` cells no consumer mentions; `wait`
-//!    has no `OnceLock` equivalent; `get_unchecked` is `unsafe` by signature
-//!    and this crate forbids `unsafe`. Using any of them is a COMPILE ERROR,
-//!    which is the fail-closed direction — and
-//!    `tests/consumers.rs::no_consumer_reaches_for_an_item_this_shim_omits`
-//!    walks the live consumer sources so the tripwire fires at test time rather
-//!    than at somebody else's build time.
+//! 5. **Five upstream items are absent.** `race::OnceNonZeroUsize`,
+//!    `race::OnceBool`, `race::OnceRef` (no consumer names them),
+//!    `sync::OnceCell::wait` (no `OnceLock` equivalent) and
+//!    `sync::OnceCell::get_unchecked` (`unsafe` by signature). Using one is a
+//!    compile error.
 //!
-//! 6. **Feature flags gate nothing.** All nine upstream feature names are
-//!    declared (a `[patch]` target must accept what its consumers ask for) and
-//!    all nine are inert. Four of them — `critical-section`,
-//!    `atomic-polyfill`, `parking_lot`, `portable-atomic` — would change
-//!    upstream's implementation, so `tests/consumers.rs` proves no cell enables
-//!    one.
+//! 6. **Feature flags gate nothing.** All nine upstream names are declared (a
+//!    `[patch]` target must accept them) and inert. `critical-section`,
+//!    `atomic-polyfill`, `parking_lot` and `portable-atomic` would change
+//!    upstream's implementation; `tests/consumers.rs` fails if a cell enables one.
 //!
-//! # The auto-trait surface is IDENTICAL, and two lines of it are hand-written
+//! # Auto traits match upstream
 //!
 //! `Send`, `Sync`, `UnwindSafe` and `RefUnwindSafe` were measured over both
-//! crates side by side across sixteen instantiations. Fourteen fall out of the
-//! fields and match upstream exactly. TWO DID NOT: `RefUnwindSafe` has a
-//! negative impl on `UnsafeCell`, which both `core::cell::OnceCell` and `Cell`
-//! contain, so [`unsync::OnceCell`] and [`unsync::Lazy`] came out
-//! `!RefUnwindSafe` where upstream's — which spell the impls out by hand at
-//! `once_cell-1.21.4/src/lib.rs:430` and `:729` — are not. That is a NARROWING
-//! of the public surface: a consumer sending `&unsync::OnceCell<T>` through
-//! `catch_unwind` compiles against upstream and not against a shim without
-//! those lines. Nothing asks for it today (`wasm-bindgen` hands
-//! `maybe_catch_unwind` an `AssertUnwindSafe`), and nothing here could have
-//! CAUGHT it either: all three `unsync` consumers are wasm-only and no wasm
-//! target is installed on the machine that runs this suite. Both impls are
-//! restored verbatim, and
-//! `tests/behaviour.rs::the_unwind_safety_surface_matches_upstream` pins all
-//! ten bounds so the next wrapper change cannot lose one quietly.
+//! crates across sixteen instantiations. Fourteen fall out of the fields. The
+//! other two need hand-written impls: `UnsafeCell` (inside both
+//! `core::cell::OnceCell` and `Cell`) is `!RefUnwindSafe`, so
+//! [`unsync::OnceCell`] and [`unsync::Lazy`] would be narrower than upstream's
+//! (`once_cell-1.21.4/src/lib.rs:430`, `:729`). No consumer asks for the
+//! bound (`wasm-bindgen` hands `maybe_catch_unwind` an `AssertUnwindSafe`), so
+//! compiling every consumer on every cell cannot catch losing it;
+//! `tests/behaviour.rs::the_unwind_safety_surface_matches_upstream` pins the
+//! surface.
 //!
-//! [`sync::Lazy`] is the one place this crate is deliberately WIDER than
-//! upstream: its `Mutex<Option<F>>` is unconditionally `RefUnwindSafe`, so it
-//! does not need `F: RefUnwindSafe`. Wider accepts every program upstream
-//! accepts, so it cannot break a consumer, and narrowing it back would cost a
-//! `PhantomData` for nobody.
+//! [`sync::Lazy`] is deliberately WIDER: its `Mutex<Option<F>>` is
+//! `RefUnwindSafe` without `F: RefUnwindSafe`. Wider accepts every program
+//! upstream accepts.
 //!
 //! # Poisoning
 //!
-//! Upstream has no locks and therefore no poisoning. The two `Mutex`es here are
-//! private and every acquisition ignores poisoning
-//! ([`PoisonError::into_inner`](std::sync::PoisonError::into_inner)), so a
-//! panic inside an initialiser leaves the cell empty and retryable — upstream's
-//! behaviour — instead of turning every later call into a panic of its own.
+//! Upstream has no locks. Every acquisition of the two private `Mutex`es here
+//! ignores poisoning ([`PoisonError::into_inner`](std::sync::PoisonError::into_inner)),
+//! so a panic inside an initialiser leaves the cell empty and retryable, as
+//! upstream does.
 
 #![deny(missing_docs)]
 #![deny(rust_2018_idioms)]
-// THE HEADLINE OF THIS ROW. Upstream carries 53 `unsafe` tokens; the whole
-// point of expressing these cells over `OnceLock`/`Mutex`/`Cell` is that the
-// replacement carries none, and this attribute is what keeps it that way.
 #![forbid(unsafe_code)]
 
 /// Single-threaded, non-blocking cells.
@@ -201,24 +136,11 @@ pub mod unsync {
     /// A cell which can be written to only once, without thread synchronisation.
     pub struct OnceCell<T>(CoreOnceCell<T>);
 
-    // UPSTREAM'S IMPL, KEPT VERBATIM, AND IT IS NOT DECORATION.
-    //
-    // `RefUnwindSafe` is an auto trait with a NEGATIVE impl on `UnsafeCell`,
-    // which `core::cell::OnceCell` contains — so wrapping std's cell silently
-    // makes this type `!RefUnwindSafe` where upstream's is, and a consumer that
-    // sends `&OnceCell<T>` through `catch_unwind` compiles against `once_cell`
-    // 1.21.4 and does NOT compile against the shim. Measured, not argued: a
-    // probe asserting the same sixteen bounds over both crates exits 0 on
-    // upstream and 101 here without these two impls, naming exactly
-    // `unsync::OnceCell` and `unsync::Lazy`. Restored so the two surfaces
-    // match; `tests/behaviour.rs::the_unwind_safety_surface_matches_upstream`
-    // is the tripwire.
-    //
-    // `UnwindSafe` needs no impl here and MUST NOT HAVE ONE: `UnsafeCell` is
-    // only `!RefUnwindSafe`, so the auto impl already gives exactly upstream's
-    // `T: UnwindSafe`, and a manual copy would be a coherence error. Same for
-    // both `Lazy`s and for everything in `sync` and `race`, all of which the
-    // probe found already identical.
+    // Upstream's impl, verbatim. `core::cell::OnceCell` contains an
+    // `UnsafeCell`, which is `!RefUnwindSafe`, so without this the type is
+    // narrower than upstream's (see "Auto traits" in the crate docs).
+    // `UnwindSafe` already matches through the auto impl; a manual one would be
+    // a coherence error.
     impl<T: RefUnwindSafe + UnwindSafe> RefUnwindSafe for OnceCell<T> {}
 
     impl<T> Default for OnceCell<T> {
@@ -361,19 +283,16 @@ pub mod unsync {
 
     /// A value which is initialised on first access.
     ///
-    /// `const fn new` carries NO bound on `F`, matching upstream. That is
-    /// load-bearing rather than cosmetic: `wasm-bindgen 0.2.108` builds its own
-    /// `LazyCell` inside an `impl<T, F>` with no `F: FnOnce() -> T` bound, so a
-    /// thin wrapper over [`core::cell::LazyCell`] — whose `new` IS bounded —
-    /// would fail to compile on both wasm cells.
+    /// `const fn new` carries no bound on `F`, matching upstream:
+    /// `wasm-bindgen 0.2.108` calls it inside an unbounded `impl<T, F>`, so a
+    /// wrapper over [`core::cell::LazyCell`] (whose `new` is bounded) would not
+    /// compile on either wasm cell.
     pub struct Lazy<T, F = fn() -> T> {
         cell: OnceCell<T>,
         init: Cell<Option<F>>,
     }
 
-    // Upstream's impl, for the reason given above `unsync::OnceCell`: `Cell`
-    // contains an `UnsafeCell` too, so without this line the type is
-    // `!RefUnwindSafe` where upstream's is not.
+    // Upstream's impl, for the reason given above `unsync::OnceCell`.
     impl<T, F: RefUnwindSafe> RefUnwindSafe for Lazy<T, F> where OnceCell<T>: RefUnwindSafe {}
 
     impl<T: fmt::Debug, F> fmt::Debug for Lazy<T, F> {
@@ -482,10 +401,9 @@ pub mod sync {
         inner: OnceLock<T>,
         /// Held across a user initialiser so that exactly one runs.
         ///
-        /// `OnceLock::get_or_init` already does this for the infallible case,
-        /// but there is no stable fallible form, and `wgpu-core` relies on the
-        /// fallible one being exactly-once (see the crate documentation). One
-        /// gate serves both entry points so the two cannot race each other.
+        /// `OnceLock` has no stable fallible `get_or_init`, and `wgpu-core`
+        /// needs the fallible one exactly-once. One gate serves both entry
+        /// points so they cannot race each other.
         gate: Mutex<()>,
     }
 
@@ -625,10 +543,8 @@ pub mod sync {
             if let Some(val) = self.get() {
                 return Ok(val);
             }
-            // POISONING IS IGNORED ON PURPOSE. A panic inside somebody else's
-            // `f` must leave this cell empty and retryable — upstream's
-            // behaviour, which has no locks to poison — not convert every
-            // later call into a panic of our own.
+            // Poisoning is ignored: a panic in another caller's `f` leaves the
+            // cell empty and retryable, as upstream does.
             let _guard = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
             // Re-check under the gate: another thread may have initialised the
             // cell between the fast path and the lock.
@@ -636,9 +552,8 @@ pub mod sync {
                 return Ok(val);
             }
             let val = f()?;
-            // The gate is held and the cell was empty under it, so the only way
-            // this can fail is a `set` that bypassed the gate — and there is
-            // none: `set`/`try_insert` both route through `get_or_init`.
+            // Cannot fail: the gate is held, the cell was empty under it, and
+            // every writer (`set`, `try_insert`) goes through the gate.
             let _ = self.inner.set(val);
             Ok(self
                 .get()
@@ -658,12 +573,9 @@ pub mod sync {
 
     /// A thread-safe value which is initialised on first access.
     ///
-    /// `Sync` is DERIVED rather than asserted: `Mutex<Option<F>>` is `Sync`
-    /// exactly when `F: Send`, and `OnceCell<T>` is `Sync` exactly when
-    /// `T: Send + Sync` — together, precisely the bound upstream spells out by
-    /// hand as `unsafe impl<T, F: Send> Sync for Lazy<T, F> where OnceCell<T>:
-    /// Sync`. Holding the initialiser in a `Mutex` instead of a `Cell` is what
-    /// lets this crate forbid `unsafe` and still keep `new` unbounded in `F`.
+    /// `Sync` is derived, not asserted: `Mutex<Option<F>>` is `Sync` iff
+    /// `F: Send` and `OnceCell<T>` iff `T: Send + Sync`, which is the bound
+    /// upstream writes as `unsafe impl<T, F: Send> Sync`.
     pub struct Lazy<T, F = fn() -> T> {
         cell: OnceCell<T>,
         init: Mutex<Option<F>>,
@@ -772,13 +684,10 @@ pub mod sync {
 
 /// Thread-safe cells for `no_std` code, in upstream's naming.
 ///
-/// Upstream's `race` module is lock-free — "racy" — and its cells may run an
-/// initialiser more than once. This replacement layers [`OnceBox`] over
-/// [`sync::OnceCell`] instead, which is a stricter guarantee that still meets
-/// upstream's documented contract; see divergence 2 in the crate documentation.
-///
-/// `OnceNonZeroUsize`, `OnceBool` and `OnceRef` are NOT provided — see
-/// divergence 5.
+/// [`OnceBox`](race::OnceBox) is layered over [`sync::OnceCell`], so it runs its initialiser
+/// exactly once where upstream's lock-free cell may run it more than once
+/// (divergence 2). `OnceNonZeroUsize`, `OnceBool` and `OnceRef` are absent
+/// (divergence 5).
 pub mod race {
     use core::fmt;
     use core::ptr;
@@ -788,9 +697,7 @@ pub mod race {
 
     impl<T> fmt::Debug for OnceBox<T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            // Upstream prints the raw `AtomicPtr` it stores. The address of the
-            // boxed value is the same fact by a different route, and `null` is
-            // what upstream prints for an empty cell.
+            // Upstream prints its raw `AtomicPtr`: the box's address, or null.
             let ptr = self.get().map_or(ptr::null(), |v| v as *const T);
             write!(f, "OnceBox({ptr:?})")
         }
@@ -837,9 +744,7 @@ pub mod race {
 
         /// Gets the contents, initialising them with `f` if the cell was empty.
         ///
-        /// Unlike upstream, `f` runs at most once — a stricter guarantee than
-        /// the "more than one `f` can be called" upstream documents, and one
-        /// its "all threads return the same value" promise still holds under.
+        /// `f` runs at most once, where upstream allows several (divergence 2).
         pub fn get_or_init<F>(&self, f: F) -> &T
         where
             F: FnOnce() -> Box<T>,

@@ -7,22 +7,9 @@
 //! caught at `Buggy = 1` on every invariant; the handoff's paths are walked as
 //! the owner meets them. Tier-1 is `aterm-gui/src/precommit_input_conformance.rs`.
 
-use aterm_spec::derive::{Model, native_update_precommit_input_model};
+use crate::walk::{only, walk};
+use aterm_spec::derive::native_update_precommit_input_model;
 use aterm_spec::{interp, verify};
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
-
-fn walk(m: &Model, actions: &[&str]) -> interp::State {
-    let mut state = m.init_state();
-    for action in actions {
-        assert!(m.fire(action, &mut state), "{action}: {state:?}");
-    }
-    state
-}
 
 #[test]
 fn precommit_input_proves_and_catches() {

@@ -144,15 +144,18 @@ pub const VENDORS: &[VendorSpec] = &[
         apple_team: "Q6L2SF6YDW",
         exposes: &["claude"],
         url_prefixes: &["https://downloads.claude.ai/claude-code-releases/"],
-        // `<v>/manifest.json` and its `.sig`, answered in place (measured 2026-09-22).
+        // `<v>/manifest.json` and its `.sig`, answered in place.
         digest_docs: &[DocPin {
             prefix: "https://downloads.claude.ai/claude-code-releases/",
             redirect_hosts: &[],
         }],
         // Claude's own updater writes a copy under `~/.local` that this name never runs.
-        shim_env: &["DISABLE_AUTOUPDATER=1"],
+        shim_env: &[
+            "DISABLE_AUTOUPDATER=1",
+            "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
+        ],
         // Print mode reading stream-json from a stdin the warm never writes (measured on
-        // 2.1.280, 2026-09-23): the bootstrap, feature and model-catalog fetches run and
+        // 2.1.280): the bootstrap, feature and model-catalog fetches run and
         // no `/v1/messages` call, no transcript and no hook or MCP server does; the warm
         // closes stdin and the CLI exits 0. Never `--bare` (it skips those very fetches)
         // and never `--init-only` (it exits racing them).
@@ -202,7 +205,7 @@ pub const VENDORS: &[VendorSpec] = &[
         ],
         shim_env: &[],
         // Lists the served models headless and rewrites `~/.codex/models_cache.json`, with
-        // no model turn (measured on 0.156.1, 2026-09-23). A debug subcommand: a release
+        // no model turn (measured on 0.156.1). A debug subcommand: a release
         // that drops it fails the warm, silently.
         warm: &["debug", "models"],
         floor: floor(0, 156, 1),
@@ -253,7 +256,13 @@ mod tests {
             ("Anthropic", Anchor::AnthropicOpenPgp, "Q6L2SF6YDW")
         );
         assert_eq!(claude.exposes, &["claude"]);
-        assert_eq!(claude.shim_env, &["DISABLE_AUTOUPDATER=1"]);
+        assert_eq!(
+            claude.shim_env,
+            &[
+                "DISABLE_AUTOUPDATER=1",
+                "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1"
+            ]
+        );
         assert_eq!(claude.floor.to_string(), "2.1.281");
         let codex = spec("codex").unwrap();
         assert_eq!(
@@ -270,7 +279,7 @@ mod tests {
         }
     }
 
-    /// THE WARM NEVER STARTS A TURN (2026-09-23): claude's warm is print mode over a stdin
+    /// THE WARM NEVER STARTS A TURN: claude's warm is print mode over a stdin
     /// the warm never writes — never `--bare` or `--init-only`, which skip or race the
     /// fetches it exists for — with no transcript and no hooks; and no warm argv carries a
     /// free operand, which print mode would send as a prompt.

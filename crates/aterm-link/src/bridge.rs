@@ -27,14 +27,13 @@
 //!   that moved the round trip by more than 2x — never on a timer — so the
 //!   endpoint's `fabric=` reads `connected` only while the broker actually
 //!   answers and `stalled` while this process is alive but its link is not
-//!   ([`Bridge::observe`], [`ACK_DEADLINE`]; round 13);
+//!   ([`Bridge::observe`], [`ACK_DEADLINE`]);
 //! * WRITES PRESENCE WITH MEANING: every hosted session's row carries `role=
 //!   detail= phase= title=` beside `attention=` — `phase=` the SERVER'S agent
 //!   verdict (`status agent=`, and the `EVENT … agent` push on each move),
 //!   relayed as the word it is: this crate reads no screen and links no
 //!   vendor reader. The row is republished only when a field changed and at
-//!   most once per 2 s. Never a word of the transcript ([`crate::presence`];
-//!   round 13, re-grounded 2026-09-23).
+//!   most once per 2 s. Never a word of the transcript ([`crate::presence`]).
 //!
 //! ## A NODE'S DISTINCT-SUBJECT BUDGET IS FINITE, AND NOTHING RECLAIMS IT
 //!
@@ -42,13 +41,12 @@
 //! from the log on every open, and a node's producer id is derived from an id the
 //! state dir mints once and keeps forever — so the budget does not clear on
 //! restart. This node mints one distinct subject per hosted session on
-//! `presence` and `ev`, plus one per `say/<kind>`: call it two to three per
-//! session over the node's lifetime — it was three to five before round 21 cut
-//! the `control` and `screen` faces — so a long-lived instance exhausts the
-//! budget somewhere past two thousand sessions. Past the bound every publish to
-//! a NEW subject is refused, which means a newly spawned session gets no
-//! presence row and no `ev` face while existing sessions keep working and
-//! nothing on the bus says why.
+//! `presence` and `ev`, plus one per `say/<topic>` the session broadcasts on:
+//! call it two to three per session over the node's lifetime — so a long-lived
+//! instance exhausts the budget somewhere past two thousand sessions. Past the
+//! bound every publish to a NEW subject is refused, which means a newly spawned
+//! session gets no presence row and no `ev` face while existing sessions keep
+//! working and nothing on the bus says why.
 //!
 //! DESIGN §5.2's stated mitigation — "the bridge collapses a session's `exited`
 //! presence row into an `ev` record after `--exited-keep <n>` (default 64)
@@ -62,9 +60,10 @@
 //! budget. The fix is a subject-RETIRE record in the astream broker that removes
 //! a subject from the index and decrements its producer's count (live and on
 //! rebuild); once the vendor/astream pin carries it, the bridge retires an exited
-//! session's two subjects. Until then the ceiling is real, it is roughly a
-//! thousand sessions per node id, and the recovery is minting a new node id
-//! (which abandons that node's mail lane by design).
+//! session's two subjects. Until then the ceiling is real, it is roughly two
+//! thousand sessions per node id (fewer for sessions that broadcast), and the
+//! recovery is minting a new node id (which abandons that node's mail lane by
+//! design).
 //!
 //! ## The two lanes to aterm, and why losing either one must END this process
 //!
@@ -74,30 +73,22 @@
 //! and §11.2's stated recovery is that "the instance relaunches the child with
 //! back-off". That recovery only exists if the child exits.
 //!
-//! A3 watched one lane. `Item::Closed(Source::Aterm)` came from the push
-//! reader alone, and every verb-lane failure was swallowed at its own call
-//! site, so a verb lane that died on its own left a live child draining and
-//! committing the inbox group into a dead socket while `child.wait()` blocked
-//! forever and the whole instance stayed halted. Both halves are now closed:
-//! [`crate::ctl::Ctl`] refuses to write a line aterm would drop the connection
-//! for, and [`Bridge::ctl_request`] turns a lane that IS lost into the closure
-//! notice the loop already knows how to act on.
+//! A verb lane that dies on its own must not leave a live child draining and
+//! committing the inbox group into a dead socket while `child.wait()` blocks
+//! forever: [`crate::ctl::Ctl`] refuses to write a line aterm would drop the
+//! connection for, and [`Bridge::ctl_request`] turns a lane that IS lost into
+//! the closure notice the loop already acts on.
 //!
 //! ## The path to a PTY: there is none
 //!
 //! NO BUS RECORD REACHES A PTY BY ANY PATH. Not "is checked before it does" —
-//! there is no function in this crate that writes to one. That is the round-21
-//! cut: the `term/in` drive face, the only thing that ever converted a record
-//! to keystrokes, is gone, and with it `feed`, `on_term_record`, the four
-//! §6.6 conditions, the holder table, the epochs' fencing role, the mirror
-//! leases and the feed journal. `no_bus_record_ever_reaches_a_pty` in
-//! `tests/bridge_e2e.rs` is the claim over it, and it is now a claim about an
-//! absence rather than about a check.
+//! there is no function in this crate that writes to one (the `term/in` drive
+//! face was cut). `no_bus_record_ever_reaches_a_pty` in
+//! `tests/world/bridge_e2e.rs` is the claim over that absence.
 //!
 //! THE SUBJECT STAYS RESERVED. The node ring still carries both `term` grants,
 //! because an older node on this wire may still publish one. Nothing in this
-//! crate parses or serves it (its parser and filter, whose only callers were
-//! their own tests, were deleted 2026-09-25).
+//! crate parses or serves it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -105,6 +96,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use astream_broker::Record as BrokerRecord;
+use aterm_hash::fnv1a_64;
 
 use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
@@ -154,10 +146,9 @@ const ACK_DEADLINE: Duration = Duration::from_secs(5);
 /// even though nothing was published — which is why the sweep runs only while
 /// it has a candidate to retire and not on a free-running clock. While one is
 /// standing this bridge does report about once a minute; when the set drains it
-/// stops, and a fleet that has never had a ghost never starts. A round-21
-/// review measured the version without that gate: every attached bridge on the
-/// fleet reported every 60 s for ever, and `fabric_link_age_ms=` could no
-/// longer exceed it.
+/// stops, and a fleet that has never had a ghost never starts. Without that
+/// gate every attached bridge reports every 60 s for ever, and
+/// `fabric_link_age_ms=` can never exceed it.
 const LINK_REFRESH: Duration = Duration::from_secs(2);
 
 /// The least gap between two reports made because the round trip MOVED by
@@ -179,11 +170,9 @@ const REFILL_FLOOR_SPAN: u64 = 4096;
 
 /// How often the roster and the LOCAL observations are re-read.
 ///
-/// FROM A DEADLINE, NOT FROM THE IDLE ARM. It used to be `ticks % 8` where
-/// `ticks` advanced only in the mailbox's `None` branch — reachable only after a
-/// full 250 ms with every queue empty — so a bridge receiving one item
-/// per 250 ms never ran it at all. The commit that made this argument for the
-/// other periodic duties left these behind, and what starves is not
+/// FROM A DEADLINE, NOT FROM THE IDLE ARM: the mailbox's `None` branch is
+/// reachable only after a full 250 ms with every queue empty, so a bridge
+/// receiving one item per 250 ms would never run it. What starves is not
 /// bookkeeping:
 /// [`Bridge::sample_local_control`] is the only producer of the per-session
 /// `detail=` the presence row carries, re-reads `status agent=` behind the
@@ -192,12 +181,7 @@ const REFILL_FLOOR_SPAN: u64 = 4096;
 /// `EVENT … meta` push has covered: one never read, one a `GAP` marked
 /// unread, or one whose re-read on a push or a watch's `sub` ack failed
 /// ([`Bridge::refresh_meta`]). A peer posting four times a second is enough
-/// to hold a node in that state indefinitely. (It was also the only producer
-/// of §6.6's rows 4 and 5, the conservative pause and the local-lease mirror;
-/// round 21 cut both with the drive face they decided for.)
-///
-/// The period is the one the tick gate used to produce (8 × 250 ms), so a quiet
-/// bridge pays exactly what it paid before and a busy one now pays it too.
+/// to hold a node in that state indefinitely.
 const ROSTER_REFRESH: Duration = Duration::from_millis(2_000);
 
 /// How often the retained presence rows under THIS node are swept for ghosts.
@@ -314,15 +298,12 @@ const WILL_SEQ_LOW: u64 = 0xFFFF_FFFF;
 /// delivered `kind=note demoted=<k>`: a stranger may put words in front of an
 /// agent, never an instruction (§8.4).
 ///
-/// EVERY `h-*` IS ACCEPTED WITHOUT BEING LISTED, and this constant's doc used to
-/// say otherwise — see [`Bridge::classify_kind`], which is where the predicate
-/// lives and argues itself. `h-` is a CAP-FORCED `<src>` segment, so a principal
-/// can only speak as a human if the broker's own grant binds it to one; the
-/// carve-out is why a human's `task` or `control` arrives as itself rather than
-/// demoted on a node whose operator listed nobody. (It also made §6.6's row 1,
-/// a human's `claim` "granted unconditionally", reachable there; that row went
-/// with the drive face in round 21, but the demotion carve-out is about mail
-/// and stands on its own.)
+/// EVERY `h-*` IS ACCEPTED WITHOUT BEING LISTED — see
+/// [`Bridge::classify_kind`], where the predicate lives and argues itself.
+/// `h-` is a CAP-FORCED `<src>` segment, so a principal can only speak as a
+/// human if the broker's own grant binds it to one; the carve-out is why a
+/// human's `task` or `control` arrives as itself rather than demoted on a node
+/// whose operator listed nobody.
 /// `--accept-from` therefore adds NON-human principals to the set, and adds
 /// nothing for a human who is already in it.
 ///
@@ -357,6 +338,57 @@ const ANSWER_KINDS: [&str; 3] = ["answer", "report", "ack"];
 /// The kinds that WAIT for a reply, and so are the only ones a `dl=` is a
 /// deadline FOR. The same two `post` turns `--wait` on by default for.
 const WAITING_KINDS: [&str; 2] = ["ask", "task"];
+
+/// How many NEW inbox lanes on one other node this process opens to answer
+/// that node: a verdict ([`Bridge::sender_lane`]) or a receipt
+/// ([`Bridge::receipt_lane`]) to a session this node has never written to.
+///
+/// THE SESSION IN SUCH A LANE IS THE OTHER NODE'S WORD. A node's record names
+/// the session it spoke for in its body (`from=`), and the lane
+/// `/f/<F>/in/<node>/<sid>/<self>` is a subject on THIS node's unreclaimed
+/// budget (the module header). Unbounded, a peer that rotated `from=` had this
+/// node mint one subject per refused record, or per receipt, at no cost to its
+/// own. Answering no first contact at all would leave the ordinary case
+/// without a verdict: a remote session's first message refused `ERR too large`
+/// or `ERR quota` would get only an `unnotified` here, and its `post
+/// --wait-ack` would read `expired`, not refused. So a lane the bus already
+/// holds is free, and this many more per node are opened
+/// ([`Bridge::may_answer_on`]); past them the answer is recorded unsent on the
+/// local session's own face, `reason=lane-cap` ([`NoLane::Capped`]).
+///
+/// 64 IS THE ENDPOINT'S PER-PEER ALLOWANCE (`SENDER_QUOTA`, aterm-gui
+/// `fabric.rs`), counted on the same cap-forced half, though that one bounds
+/// ring rows, which free up again, and this one spends subjects, which never
+/// do. A hostile node costs at most 64 lanes of two leaves each
+/// (`undeliverable`, `ack`), 128 of the 4096, per bridge process.
+///
+/// HONEST TRAFFIC PAYS IT TOO. Verdicts and receipts share the 64: once they
+/// are spent on one node, a verdict or a receipt to any further session of it
+/// this node has not written to is recorded `unnotified`/`unacked …
+/// reason=lane-cap` and retired, never sent later, and the asker's `post
+/// --wait-ack` reads `expired`. That holds for the rest of the process.
+///
+/// IN MEMORY, PER PROCESS, against a budget that survives restarts. Nothing a
+/// peer sends restarts this process (it reconnects to the broker in place),
+/// but every new bridge starts the count again: an aterm relaunch, a seamless
+/// update, the supervisor relaunching a bridge that exited. So the outage
+/// above ends at the next one, and a hostile peer gets 64 lanes per bridge
+/// lifetime, paced by events it cannot cause. A count kept on disk would make
+/// the outage permanent: every receipt to a new asker from a long-lived peer
+/// stopped for good once its 64th was answered, though a receipt to a
+/// first-contact asker is the ordinary case.
+const NEW_LANES_PER_NODE: usize = 64;
+
+/// Why a verdict ([`Bridge::sender_lane`]) or a receipt
+/// ([`Bridge::receipt_lane`]) has no lane to go on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoLane {
+    /// The record names no lane a bridge drains.
+    Undrained,
+    /// A new lane on another node past [`NEW_LANES_PER_NODE`]: recorded
+    /// `reason=lane-cap`, so an operator reads the cap, not a missing lane.
+    Capped,
+}
 
 /// Retry an already-due deadline after a broker read or publish failed. The
 /// first sweep is armed for the deadline itself; there is no quarter-second
@@ -476,10 +508,7 @@ fn parse_bridge_roster<'a>(
             io::Error::new(io::ErrorKind::InvalidData, "missing bridge roster nonce")
         })?;
         if sid == "-"
-            || nonce.len() != 32
-            || !nonce
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || !aterm_codec::hex::is_lower(nonce, 32)
             || locals.insert(local, sid.to_string()).is_some()
             || epochs.insert(sid.to_string(), nonce.to_string()).is_some()
         {
@@ -683,7 +712,7 @@ enum Fault {
     /// `SIGKILL` after a post's `Publish` is acked, before `outbox sent`.
     KillAfterPublish,
     /// LOSE THE VERB LANE, without killing the process, immediately before the
-    /// first `deliver` — the failure this bridge used to be unable to see.
+    /// first `deliver`.
     ///
     /// It is not a kill because the point is what happens while the process
     /// LIVES: the verb lane (fd 3) is gone, the push lane (fd 4) is not, and the
@@ -710,8 +739,8 @@ enum Fault {
     /// It is the precondition of the leak the `route =>` arm had: a drain that
     /// resolved a post, reserved its sequence and could not publish keeps the
     /// file (correctly — the retry needs it), and a LATER drain that resolves
-    /// the same address differently retires the post and used to walk away
-    /// from the file forever. Staging it needs the broker to refuse one publish
+    /// the same address differently retires the post and must not walk away
+    /// from the file. Staging it needs the broker to refuse one publish
     /// at one instant; a test cannot reach inside the connection, so the bridge
     /// stages it.
     FailPostPublishWhileMarked,
@@ -765,10 +794,24 @@ enum Fault {
     /// rows qualify, the `inc=` guard, the record published and the `ev` beside
     /// it are all the shipped path.
     SweepGhostsAtOnceWhileMarked,
+    /// Treat EVERY remembered ask as past its deadline for as long as a marker
+    /// file (`<state>/expire-deadlines-now`) exists: the sweep that records
+    /// `expired` runs on the next loop turn and its `d.at <= now` filter passes
+    /// every entry.
+    ///
+    /// A deadline is wall-clock milliseconds on purpose, and a test that wants
+    /// the verdict cannot assert about it by waiting the span out: a short one
+    /// races the scenario it needs to finish first (a loaded gate reddened the
+    /// 4 s and 10 s versions of X3 on a correct tree), a long one is a
+    /// thirty-second sleep. So the test stages the scenario under a deadline it
+    /// can never reach and the marker collapses the WAIT and nothing else: the
+    /// bus read that retires an answered ask, the one-verdict-per-ask check, the
+    /// `expired` record and the `ev` beside it are all the shipped path.
+    ExpireDeadlinesAtOnceWhileMarked,
     /// DROP the push lane's `EVENT <local> meta` line for as long as a marker
     /// file (`<state>/drop-meta-event`) exists.
     ///
-    /// Since 2026-09-23 that push is the ONLY path by which a `meta set
+    /// That push is the ONLY path by which a `meta set
     /// attention|role|title` made after a session's first read reaches its
     /// presence row: the roster round reads `meta` only for a slot never read
     /// or one a `GAP` marked unread. A test that sets `meta` and sees the row
@@ -785,10 +828,8 @@ impl Fault {
     /// step forever — the test would then be asserting about a bridge that never
     /// got past it, which is not the property.
     fn from_env(state: &StateDir) -> Self {
-        // A RELEASED BINARY HONOURS NO FAULT: `dev_seam!` is `None` there. See the
-        // type's own doc — the knob was documented test-only and gated by nothing,
-        // in a process whose death is the fail-closed halt of every session it
-        // governs.
+        // A RELEASED BINARY HONOURS NO FAULT: `dev_seam!` is `None` there. This
+        // process's death is the fail-closed halt of every session it governs.
         let Some(fault) = aterm_types::dev_seam!("ATERM_LINK_FAULT") else {
             return Fault::None;
         };
@@ -806,6 +847,9 @@ impl Fault {
             Some("skip-roster-outbox-while-marked") => Fault::SkipRosterOutboxWhileMarked,
             Some("oversize-deliver-line") => Fault::OversizeDeliverLine,
             Some("sweep-ghosts-at-once-while-marked") => Fault::SweepGhostsAtOnceWhileMarked,
+            Some("expire-deadlines-at-once-while-marked") => {
+                Fault::ExpireDeadlinesAtOnceWhileMarked
+            }
             Some("drop-meta-event-while-marked") => Fault::DropMetaEventWhileMarked,
             _ => Fault::None,
         }
@@ -817,26 +861,22 @@ impl Fault {
     /// never got past it.
     fn fired(self, state: &StateDir) {
         let _ = std::fs::write(state.root().join("fault-fired"), b"1\n");
-        eprintln!("aterm-link: ATERM_LINK_FAULT={self:?} — firing now");
+        eprintln!("aterm-link: ATERM_LINK_FAULT={self:?} fired");
     }
 
     /// Die HERE, running no destructors. Not `exit`: an orderly exit would run
     /// destructors, flush the connection and publish a clean goodbye — which is
     /// the opposite of what the rung is testing.
     ///
-    /// `aterm_uds::process::kill_self_now` and NOT a raw `kill(2)` here: it keeps
-    /// this module free of `unsafe`. §11.2 pins aterm's unsafe surface to the
-    /// cordon that already owns raw-descriptor syscalls (`aterm-uds`), and the
-    /// bridge's run loop is not that cordon — a reviewer auditing by the
-    /// documented rule would never look here. Not `abort()` either, which this
-    /// used until 2026-09-27: it satisfied every property the fault needs, but
-    /// `SIGABRT` is a core-dump signal, so macOS wrote a crash report for every
-    /// fault a test fired. `SIGKILL` stops the process at this call, runs no
-    /// destructor, flushes nothing, and writes no report.
+    /// `aterm_uds::process::kill_self_now` and NOT a raw `kill(2)`: it keeps
+    /// this module free of `unsafe` (§11.2 pins aterm's unsafe surface to
+    /// `aterm-uds`). Not `abort()`: `SIGABRT` is a core-dump signal, so macOS
+    /// writes a crash report for it. `SIGKILL` runs no destructor, flushes
+    /// nothing, and writes no report.
     fn fire(self, at: Fault, state: &StateDir) -> ! {
         assert_eq!(self, at);
         let _ = std::fs::write(state.root().join("fault-fired"), b"1\n");
-        eprintln!("aterm-link: ATERM_LINK_FAULT={at:?} — killing this process now");
+        eprintln!("aterm-link: ATERM_LINK_FAULT={at:?} fired: killing self");
         aterm_uds::process::kill_self_now()
     }
 }
@@ -851,12 +891,8 @@ pub struct Cap {
 /// Read a `--cap-file` through astream's ONE reader, [`astream_cap::capfile`]:
 /// `<grant> <tag-hex>` lines split at the LAST ASCII whitespace (a grant may hold
 /// a space), whole-line `#` comments and blank lines skipped, and a tag of exactly
-/// 64 hex digits.
-///
-/// This crate used to keep its own copy of that reader, and the two had drifted:
-/// it read a `#` comment as a malformed capability — so a ring file `asb`
-/// accepted made the bridge refuse ALL of it — and it took a tag of any even
-/// length. One parser for every face is the fix, and it lives with the mint.
+/// 64 hex digits. One parser for every face, living with the mint, so a ring
+/// file `asb` accepts is never refused here.
 ///
 /// # Errors
 ///
@@ -879,7 +915,6 @@ pub fn read_cap_file(path: &str) -> io::Result<Vec<Cap>> {
         .collect())
 }
 
-/// Everything `serve` was told.
 /// What this bridge last TOLD the endpoint about its broker link — the `link`
 /// verb's state on the sending side, so the record goes out on CHANGE and not
 /// on a clock (§7 forbids a heartbeat storm, and the endpoint's `fabric=` is
@@ -963,6 +998,7 @@ fn rtt_ms_of(rtt: Duration) -> u64 {
     u64::try_from(rtt.as_micros().div_ceil(1_000)).unwrap_or(u64::MAX)
 }
 
+/// Everything `serve` was told.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub fleet: String,
@@ -986,11 +1022,9 @@ pub struct Config {
     pub presence: Mode,
     /// `--receipts` / `[fabric] receipts`: whether an `inbox seen <id>
     /// handled|refused|deferred` on an `ask`/`task` row publishes `kind=ack
-    /// re=<off> verdict=<v>` onto the SENDER's inbox lane (R8). ON by default
-    /// since round 21, whichever way the bridge was set up — it used to be off
-    /// here and on for a node `aterm fabric on` had configured, and with it off
-    /// nothing can release a `post --wait-ack`. `--no-receipts` and `[fabric]
-    /// receipts = false` turn it off.
+    /// re=<off> verdict=<v>` onto the SENDER's inbox lane (R8). ON by default,
+    /// however the bridge was set up: with it off nothing can release a `post
+    /// --wait-ack`. `--no-receipts` and `[fabric] receipts = false` turn it off.
     pub receipts: bool,
 }
 
@@ -1181,6 +1215,11 @@ pub struct Bridge {
     committed: u64,
     /// Offsets this bridge has acked on its OWN lanes, for the self-lane check.
     self_acked: BTreeSet<u64>,
+    /// The inbox lanes on OTHER nodes this process opened to answer them, past
+    /// the ones the bus already held: at most [`NEW_LANES_PER_NODE`] per node
+    /// ([`Bridge::may_answer_on`]). Whole lanes, so a lane's node is its own
+    /// prefix and a receipt retried after a failed publish is not counted twice.
+    lanes_opened: BTreeSet<String>,
     /// `ask offset -> its deadline`, for every `ask`/`task` this node published
     /// with `dl=` and has not seen an [`ANSWER_KINDS`] reply to. Keyed by the
     /// OFFSET rather than the sid because a reply names the offset and nothing
@@ -1217,14 +1256,13 @@ pub struct Bridge {
     /// Whether [`Bridge::attach_broker`] is in progress. While it is, an ack
     /// is NOT reported as `link up` — the round trip is kept in
     /// `attach_rtt` and reported once the attach has COMPLETED — because a
-    /// link is not up until the bridge can do its job on it. Measured
-    /// 2026-09-14 (the round-13 review): a cap missing `ro:/f/<F>/fleet/>`
-    /// acked the presence publish (`link up`), was refused the halt read
-    /// (`link down reason=read`), redialed, and did that every back-off tick
-    /// for ever — `fabric=` flapping and twenty presence records in 8 s for
-    /// no new information (§7). Now the halt is read FIRST and nothing is
-    /// published until it answered, so a bridge that cannot finish its attach
-    /// reads a steady `stalled` and writes no record at all.
+    /// link is not up until the bridge can do its job on it. A cap missing
+    /// `ro:/f/<F>/fleet/>` would otherwise ack the presence publish (`link
+    /// up`), be refused the halt read (`link down reason=read`) and redial
+    /// every back-off tick — `fabric=` flapping and twenty presence records in
+    /// 8 s (§7). The halt is read FIRST and nothing is published until it
+    /// answered, so a bridge that cannot finish its attach reads a steady
+    /// `stalled` and writes no record at all.
     attaching: bool,
     /// The last ack's round trip observed during an attach, reported as the
     /// first `link up` when the attach completes.
@@ -1286,8 +1324,7 @@ impl Bridge {
         // execs, and an unflagged one survives the exec, so any spawn in that
         // window (`hostname`'s `uname -n` publishes the node row) would inherit
         // the lane and keep aterm's end from reading EOF, which is the
-        // fail-closed halt. [`Ctl::adopt`] moves each onto a close-on-exec copy
-        // (the product fd-hygiene sweep of 2026-09-27).
+        // fail-closed halt. [`Ctl::adopt`] moves each onto a close-on-exec copy.
         let (mut ctl, push, attachment) = match (&cfg.sock, &cfg.token) {
             (Some(sock), Some(token)) => (Ctl::connect(sock, token)?, None, Attachment::Observer),
             _ => (
@@ -1309,8 +1346,8 @@ impl Bridge {
             (Attachment::Inherited, true) => Attachment::Inherited,
             (_, _) => {
                 eprintln!(
-                    "aterm-link: OBSERVER MODE — aterm refused `outbox` ({}), so this bridge \
-                     carries no mail and applies no fleet halt",
+                    "aterm-link: OBSERVER MODE: aterm refused `outbox` ({}); \
+                     carries no mail, applies no fleet halt",
                     probe.header()
                 );
                 Attachment::Observer
@@ -1330,6 +1367,7 @@ impl Bridge {
             inc: 0,
             witnessed_dead: None,
             self_acked: state.self_acked(),
+            lanes_opened: BTreeSet::new(),
             deadlines: state.deadlines().into_iter().map(|d| (d.off, d)).collect(),
             asked: state.asked().into_iter().map(|a| (a.off, a.to)).collect(),
             expired: BTreeMap::new(),
@@ -1377,20 +1415,15 @@ impl Bridge {
     ///
     /// ## Why this wrapper exists at all
     ///
-    /// `Item::Closed(Source::Aterm)` — the only thing that makes [`Bridge::run`]
-    /// return — used to be produced in exactly ONE place, the reader that pumps
-    /// the PUSH descriptor (fd 4). Nothing produced it for the verb descriptor.
-    /// So when the verb lane died on its own — an over-long line, a framing
-    /// desync, a half-closed socket — every failure was swallowed at its own
-    /// call site (`deliver failed`, `outbox failed`, `write_hold` answering
-    /// false) and the child kept running: still attached to the broker, still
-    /// draining and committing the inbox group into a dead socket, still
-    /// publishing `state=live`. `fabric_launch::supervise` blocks in
-    /// `child.wait()`, so no relaunch was ever attempted. Meanwhile the near
-    /// end's `BridgeLostGuard` had already fired, holding every session the
-    /// bridge governed under `fabric-lost`. §11.2's stated recovery — "until a
-    /// bridge reconnects … the instance relaunches the child with back-off" —
-    /// could not happen, because the child never exited.
+    /// `Item::Closed(Source::Aterm)` is the only thing that makes
+    /// [`Bridge::run`] return, and the push reader (fd 4) cannot see the verb
+    /// lane (fd 3) die — an over-long line, a framing desync, a half-closed
+    /// socket. Without this, each call site swallows its failure and the child
+    /// keeps draining and committing the inbox group into a dead socket while
+    /// `fabric_launch::supervise` blocks in `child.wait()` and the near end's
+    /// `BridgeLostGuard` holds every session under `fabric-lost`. §11.2's
+    /// recovery — "the instance relaunches the child with back-off" — needs the
+    /// child to exit.
     ///
     /// A LOST LANE IS NOT A REFUSED LINE. [`Ctl`] latches the first I/O failure
     /// and reports it through [`Ctl::lost`]; a line this client declined to
@@ -1574,15 +1607,10 @@ impl Bridge {
     /// §3.3 makes `ev` a per-owner face (`/f/<F>/pub/<owner>/ev`, owner =
     /// `<node>/<sid>` or `<node>/node`) and §10 says an applied `term/in`
     /// "leaves an `ev` record `applied re=M seq=<n>` on the SESSION's `ev`
-    /// face". A3 published every one of them on the node face with the session
-    /// named only inside the pct-encoded payload — so the causal pointer §10
-    /// asks for belonged to no partition any reader could name, and a reader
-    /// scoped to `ro:/f/<F>/pub/<n>/<sid>/>` could not see its own session's
-    /// `ev` either. (The consistent-cut auditor that made the first half of
-    /// that concrete, `replay.rs`, was cut in round 21: nothing was ever built
-    /// that called it. The placement is still right, and
-    /// `a_sessions_ev_records_are_attributable_to_that_session` still pins it,
-    /// now against `subject::session_face` — the function that mints it.)
+    /// face". On the node face a session's record would belong to no partition
+    /// a reader could name, and a reader scoped to `ro:/f/<F>/pub/<n>/<sid>/>`
+    /// could not see its own session's `ev`.
+    /// `a_sessions_ev_records_are_attributable_to_that_session` pins it.
     fn publish_ev_for(&mut self, sid: Option<&str>, payload: &str) {
         let subject = self.ev_face(sid);
         let body = format!(
@@ -1692,39 +1720,29 @@ impl Bridge {
     /// only REMOVE a node from the candidate set, never add one, so it fails
     /// safe against a rogue too.
     ///
-    /// ## `attention=` HAS A WRITER, and `fabric=` no longer has a false one
+    /// ## `attention=`, and no `fabric=`
     ///
-    /// §4.2's presence body specifies `attention=`; A10's whole rung is
-    /// `notify --on attention`, A8's glance guarantees the column, and §9.3
-    /// sells `ls --attention` as the way to see every escalation on every host.
-    /// Nothing in the fabric ever published the field, so in a real fleet every
-    /// one of those readers had no writer: the notifier could never fire and
-    /// the column was always `-`. It is read from the session's own `meta`
+    /// §4.2's presence body specifies `attention=`: `notify --on attention`,
+    /// glance's column and `ls --attention` read it. It is read from the session's own `meta`
     /// (aterm's `attention` is "the typed needs-human escalation") on the roster
     /// round, capped at [`crate::glance::ATTENTION_CAP`], and carried through
     /// pct-encoded exactly as it arrives.
     ///
-    /// ## AND SO DO `role=`, `detail=`, `phase=` AND `title=` (round 13)
+    /// ## `role=`, `detail=`, `phase=` AND `title=`
     ///
-    /// §4.2 names `role=` and `detail=` too, and `ls` printed `-` for both
-    /// because nothing wrote them. They are written now, with the one a
+    /// §4.2 names `role=` and `detail=` too; they are written with the one a
     /// manager actually needs — `phase=` (busy | idle | prompt | question |
     /// limited | survey: the server's `agent=` verdict, relayed) — from the
     /// fields this bridge keeps per session ([`crate::presence`]).
     /// `presence = "minimal"` writes `attention=` alone. NEVER TRANSCRIPT TEXT:
     /// every token is a word this bridge chose, a number, or a `meta` value.
     ///
-    /// `fabric=` is GONE from a session row, and that is the honest direction.
-    /// It was the literal `connected`, and the only `Will` this bridge registers
-    /// is on the NODE face — so when a bridge died the node row flipped to
-    /// `state=gone fabric=disconnected` while every session row stayed retained
-    /// at `fabric=connected` until a bridge came back. `glance.rs` names the
-    /// field one of the two a human actually reads and defines it as "whether
-    /// that session's node can still be reached", and glance is a pass-through:
-    /// a constant that the documented question can never be answered by is worse
-    /// than an absent token, because `GUARANTEED` renders a missing one as `-`
-    /// — "unknown" — which is the truth. The node's own row still carries it,
-    /// where the will keeps it honest.
+    /// A session row carries no `fabric=`. The only `Will` this bridge
+    /// registers is on the NODE face, so when a bridge dies the node row flips
+    /// to `state=gone fabric=disconnected` while every session row stays
+    /// retained; a constant `connected` there would lie, while glance renders a
+    /// missing token as `-` ("unknown"), which is the truth. The node's own row
+    /// carries it, where the will keeps it honest.
     fn publish_session_presence(&mut self, sid: &str, state: &str) {
         // THE FIRST ROW ALREADY MEANS SOMETHING: a live row is read before it
         // is first published, whichever path publishes it (admission, an
@@ -1809,21 +1827,12 @@ impl Bridge {
                 self.pending_admit.insert(sid);
             }
         }
-        // PRUNED TO THE ROSTER. A3 only ever ADDED to these maps:
-        // `session-exited` removed an entry when its line arrived, and nothing
-        // reconciled any of them with the roster.
-        //
-        // EVERY PER-SID MAP, and the queue — four of them now, six before round
-        // 21 took `holders` and `pending` with the drive face. The first fix
-        // pruned three and left `local`, `presence` (then `attention`) and
-        // `screen_gen`: declared in the same struct, written on the same roster
-        // round, keyed by the same sids, removed by nothing anywhere. Sids are
-        // 128-bit and never reused and the bridge is resident for the life of
-        // the instance, so those grew with every tab ever opened. Each is a
-        // pure CACHE of an observation about a live session — the last `status`
-        // sample, the last published `attention=`, the last published screen
-        // generation — so dropping a departed session's entry can lose nothing:
-        // the next holder of that sid does not exist.
+        // EVERY PER-SID MAP, and the queue, IS PRUNED TO THE ROSTER: a
+        // `session-exited` line may never arrive, sids are 128-bit and never
+        // reused, and the bridge lives as long as the instance, so an unpruned
+        // map grows with every tab ever opened. Each is a pure CACHE of an
+        // observation about a live session, so dropping a departed session's
+        // entry loses nothing.
         //
         // `every_per_sid_map_is_pruned_to_the_roster` reads the struct rather
         // than this list, so the next map added is covered the day it is added.
@@ -1942,11 +1951,9 @@ impl Bridge {
     ///
     /// A MISSING `seen/<sid>` REFILLS FROM A BOUNDED FLOOR, which is the
     /// direction the state dir's own table has always claimed ("the refill
-    /// starts lower and the ring dedups on `off=`"). A3 returned instead, so a
-    /// half-lost state dir — a restore from a backup taken before `seen/`
-    /// existed, a partial `rm`, a disk error — silently made every
-    /// delivered-but-unseen row unreachable forever: the group cursor is per
-    /// node and is already past them. Returning failed in the LOSING direction.
+    /// starts lower and the ring dedups on `off=`"). Returning instead would
+    /// make every delivered-but-unseen row of a half-lost state dir unreachable
+    /// forever: the group cursor is per node and is already past them.
     ///
     /// FROM THE FLOOR, NOT FROM ZERO, and the difference is the whole care. The
     /// broker's `Fetch` is a linear scan bounded per page by its own scan budget
@@ -1954,8 +1961,8 @@ impl Bridge {
     /// from zero would walk the entire log once per freshly seen session —
     /// unbounded work on the session-creation path, bought to repair a state
     /// dir that is usually intact. [`REFILL_FLOOR_SPAN`] behind the head is
-    /// bounded, is strictly more than the nothing A3 offered, and covers the
-    /// window a lost watermark can actually be hiding rows in.
+    /// bounded and covers the window a lost watermark can actually be hiding
+    /// rows in.
     fn refill(&mut self, sid: &str) -> bool {
         let filter = format!("/f/{}/in/{}/{sid}/>", self.cfg.fleet, self.node);
         let from = match self.state.seen_off(sid) {
@@ -2022,14 +2029,10 @@ impl Bridge {
     ///
     /// The commit is last on purpose: at-least-once cursor plus an idempotent
     /// sink is what makes the whole path exactly-once. That argument requires
-    /// the commit to be CONDITIONAL on the sink having answered. A3 committed
-    /// unconditionally, so a `deliver` whose reply never arrived — the socket
-    /// died mid-request, aterm was mid-teardown — advanced the durable group
-    /// cursor past a record the endpoint never took. Nothing recovered it:
-    /// `refill` starts from a persisted `seen_off`, which only ever covers rows
-    /// the endpoint acknowledged, and no `ev` was published, so the sender was
-    /// not told either. The record stayed on the log forever and no bridge ever
-    /// offered it again.
+    /// the commit to be CONDITIONAL on the sink having answered: a commit after
+    /// a `deliver` whose reply never arrived would advance the durable group
+    /// cursor past a record the endpoint never took, and nothing recovers it
+    /// (`refill` starts from `seen_off`, which covers only acknowledged rows).
     ///
     /// [`Delivery::Unaccounted`] is exactly the LOST LANE — the one outcome that
     /// says nothing about whether the endpoint saw the row. Leaving the cursor
@@ -2185,7 +2188,7 @@ impl Bridge {
         off: u64,
         expect: u64,
     ) -> Delivery {
-        // THE KIND IS IN THE BODY, not in the subject (round 23): `to=say:<t>`
+        // THE KIND IS IN THE BODY, not in the subject: `to=say:<t>`
         // spends its one leaf on the TOPIC, because the topic is what
         // subscribers name and the subject budget is unreclaimed. An absent or
         // unknown `kind=` decodes to `None` and is a `note` — the floor, not a
@@ -2285,7 +2288,17 @@ impl Bridge {
             // nobody ever gets.
             let _ = self.refresh_sessions();
             if !self.epochs.contains_key(&addr.sid) {
-                self.record_undeliverable(off, Some(&addr.sid.clone()), Reject::NotHosted);
+                // ON THE NODE'S FACE, THE SID IN THE PAYLOAD. A sid this node
+                // does not host has no face of its own here, and the sender
+                // chose it: published on `…/<sid>/ev`, every distinct one was a
+                // new subject on this node's unreclaimed budget (the module
+                // header), so a peer's mail could spend the subjects its next
+                // sessions need. The node face is one subject however many.
+                self.publish_ev(&format!(
+                    "undeliverable off={off} reason={} sid={}",
+                    Reject::NotHosted.token(),
+                    addr.sid
+                ));
                 return Delivery::Accounted;
             }
         }
@@ -2372,13 +2385,10 @@ impl Bridge {
         } = row;
         let trust = trust_of(&addr.src, body.via.is_some());
         let from = self.render_from(addr, body);
-        // A `control` RECORD IS NOW AN ORDINARY INBOX ROW (round 21). It used
-        // to also MOVE something — §6.6's handover, which took the keyboard for
-        // the claimant and decided who a later `term/in` would be fed from —
-        // and that is gone with the drive face. `control` stays in
-        // `body::KINDS` and in `DEMOTE_UNLESS_ACCEPTED` because an older node
-        // on the wire still sends one and it must still arrive, and be demoted
-        // from an unlisted principal, like any other addressed kind.
+        // A `control` RECORD IS AN ORDINARY INBOX ROW. It stays in
+        // `body::KINDS` and `DEMOTE_UNLESS_ACCEPTED` because an older node on
+        // the wire still sends one, and it must arrive (and be demoted from an
+        // unlisted principal) like any other addressed kind.
         let mut line = format!(
             "deliver {} off={off} from={from} kind={kind} trust={trust}",
             addr.sid
@@ -2504,12 +2514,9 @@ impl Bridge {
         if cut && outcome == Delivery::Accounted && topic.is_none() {
             self.publish_ev_for(
                 Some(&addr.sid),
-                // BOTH NUMBERS IN THE SAME UNIT. `len=` is the body's decoded
-                // length; `sent=` used to be the pct-ENCODED prefix's, and an
-                // escape is three bytes per non-graphic one, so the row that
-                // exists to make the loss auditable overstated what arrived by
-                // up to 3x. The prefix is decoded back to answer in the unit
-                // `len=` is already in.
+                // BOTH NUMBERS IN THE SAME UNIT: `len=` is the decoded body
+                // length, so `sent=` decodes the pct-encoded prefix (an escape
+                // is three bytes) rather than overstate what arrived by 3x.
                 &format!(
                     "truncated off={off} len={} sent={}",
                     body.text.len(),
@@ -2568,22 +2575,11 @@ impl Bridge {
     ///
     /// ## EVERY HUMAN IS ACCEPTED
     ///
-    /// `--accept-from` is EMPTY by default, so with no carve-out a human's
-    /// `task` or `control` arrived DEMOTED on every node whose operator had not
-    /// pre-listed them by name — and §8.4's own spelling of the mitigation,
-    /// `--accept-from h-*`, is refused at startup by `subject::is_principal`
-    /// (`*` is not in `[a-z0-9-]`), so there was no way to express "every
-    /// human" either.
-    ///
-    /// The case that first made this unacceptable is gone: it used to make
-    /// §6.6's row 1 — an `h-*` `claim` "granted unconditionally" — literally
-    /// unreachable, because the keyboard moved off the CLASSIFIED kind, so a
-    /// human's demoted `control` never reached the handoff table and every
-    /// following `term/in` under that claim was refused `reason=holder`. Round
-    /// 21 cut the drive face, so nothing moves a keyboard now. The rule stands
-    /// on the narrower ground it always also had: a demoted `task` is a `note`,
-    /// and a manager's human cannot hand a worker work on a node that has not
-    /// heard of them.
+    /// `--accept-from` is EMPTY by default, and §8.4's spelling of "every
+    /// human", `--accept-from h-*`, is refused at startup by
+    /// `subject::is_principal` (`*` is not in `[a-z0-9-]`). Without the
+    /// carve-out a human's `task` would arrive as a `note` on every node whose
+    /// operator had not pre-listed them by name.
     ///
     /// It is not a widening of anyone's authority: `h-` is a CAP-FORCED `<src>`
     /// segment (§4.3), so a principal can only speak as a human if the broker's
@@ -2600,7 +2596,7 @@ impl Bridge {
     }
 
     /// [`Bridge::classify_kind`], after one more rule — and whether it applied:
-    /// A REPLY COUNTS ONLY FROM WHERE THE ASK WENT (round 16 review). A node's
+    /// A REPLY COUNTS ONLY FROM WHERE THE ASK WENT. A node's
     /// ring grants it `rw,p=<N>:/f/<F>/in/*/*/<N>/*` — every lane on the fleet,
     /// as itself — so a third node could publish `ack re=<off>
     /// verdict=handled` onto an asker's lane for a task it was never sent, and
@@ -2608,22 +2604,37 @@ impl Bridge {
     /// recipient's inbox still held the task) and its deadline. The `<src>`
     /// segment is the broker's word; where the ask went is this bridge's own
     /// record ([`Bridge::reply_from`]). A reply-kind record naming an ask of
-    /// ours from anyone else is STRAY: a receipt arrives as what it is —
-    /// `kind=note demoted=ack` — and no stray reply settles anything (the
-    /// caller's `late`/deadline arm reads the flag). An offset this bridge has
+    /// ours from anyone else is STRAY, and arrives as what it is — `kind=note
+    /// demoted=ack`, `demoted=answer`, `demoted=report` — so no stray reply
+    /// settles anything: not the deadline (the caller's `late`/deadline arm
+    /// reads the flag), and not a reader that settles on the first `answer
+    /// re=<off>` it is shown (`aterm drive task --wait` did, and printed a third
+    /// node's guess at the offset as the worker's result). An offset this bridge has
     /// no record of (older than the table, or asked before it existed) is
     /// judged as before. ONE function for the live delivery and the refill,
     /// so a refilled row reads exactly as it did the first time.
+    ///
+    /// AND AN `expired` COUNTS ONLY FROM THIS NODE. It is the asker's own
+    /// bridge's verdict ([`Bridge::expire_deadlines`] publishes it under this
+    /// node's `<src>`, and [`Bridge::settled_on_bus`] counts it from nowhere
+    /// else), so one from any other node is stray whatever offset it names:
+    /// delivered undemoted, a third node's `expired re=<off>` ended the asker's
+    /// `post --wait-ack` with `ERR expired` while the recipient still held the
+    /// task.
     fn classify_delivery(
         &self,
         addr: &subject::InAddr,
         body: &Body,
     ) -> (String, Option<String>, bool) {
-        let stray = ANSWER_KINDS.contains(&addr.kind.as_str())
-            && body
-                .re
-                .is_some_and(|re| self.reply_from(re, &addr.src) == Some(false));
-        if stray && addr.kind == "ack" {
+        let stray = if addr.kind == "expired" {
+            addr.src != self.node
+        } else {
+            ANSWER_KINDS.contains(&addr.kind.as_str())
+                && body
+                    .re
+                    .is_some_and(|re| self.reply_from(re, &addr.src) == Some(false))
+        };
+        if stray {
             return ("note".to_string(), Some(addr.kind.clone()), true);
         }
         let (kind, demoted) = self.classify_kind(addr, body);
@@ -2655,15 +2666,30 @@ impl Bridge {
             // "never evicts an `h-*` row ahead of anyone else's". Claiming to be
             // a human is outside the residual, so it is refused at the door and
             // the record is attributed to the node itself.
+            //
+            // AND ONLY ONE OF ITS OWN: a session THIS node hosts, or one §6.1's
+            // pin places on another node, is not the sender's, so its claim to
+            // speak for it is outside the residual too. `s-w@n-evil` beside the
+            // real `s-w@<its node>` differs only in the attested half, and a
+            // reader matching the sid took the forgery for the worker's report
+            // (the supervisor's turn) or its answer (`drive task`).
             Some(sid)
                 if addr.src.starts_with("n-")
                     && sid.starts_with("s-")
-                    && subject::is_principal(sid) =>
+                    && subject::is_principal(sid)
+                    && (addr.src == self.node || self.may_speak_for(&addr.src, sid)) =>
             {
                 format!("{sid}@{}", addr.src)
             }
             _ => addr.src.clone(),
         }
+    }
+
+    /// Whether another node `src` may claim `sid` as one of its sessions: not
+    /// when this node hosts it, nor when the sid is pinned to a third node (the
+    /// TOFU pin a bare `@<sid>` post wrote, [`Bridge::pinned_node_for`]).
+    fn may_speak_for(&self, src: &str, sid: &str) -> bool {
+        !self.epochs.contains_key(sid) && self.state.pins().get(sid).is_none_or(|n| n == src)
     }
 
     /// Record a refusal: an `ev` on the owning digest, and — where there is a
@@ -2698,9 +2724,11 @@ impl Bridge {
     /// exists to end, reachable by a stranger's oversized `via=`.
     ///
     /// So a local refusal produces exactly what an endpoint `ERR` produces: an
-    /// `ev` on the addressed session's face, a verdict on the sender's lane, and
-    /// `Accounted`, because the cursor moving past a record whose fate is on the
-    /// bus is the correct outcome and the only one that terminates.
+    /// `ev` on the addressed session's face, the sender's notice
+    /// ([`Bridge::notify_sender_undeliverable`]: a verdict on its lane, or
+    /// `unnotified` where this node may not answer there), and `Accounted`,
+    /// because the cursor moving past a record whose fate is on the bus is the
+    /// correct outcome and the only one that terminates.
     fn refuse_locally(
         &mut self,
         addr: &subject::InAddr,
@@ -2718,31 +2746,23 @@ impl Bridge {
 
     /// Tell a sender their message did not land, ON THEIR OWN LANE.
     ///
-    /// §6.2 makes the per-sender quota safe by promising the sender a verdict:
-    /// the 65th is refused at `deliver` and the bridge records an `undeliverable`
-    /// (`re=<off>`, text `not delivered: quota`) on the sender's lane. A3 built
-    /// that lane two ways and both were wrong for the traffic that actually
-    /// arrives:
+    /// §6.2 makes the per-sender quota safe by telling the sender: the 65th is
+    /// refused at `deliver` and the bridge records an `undeliverable`
+    /// (`re=<off>`, text `not delivered: quota`) on the sender's lane. A sender
+    /// on another node is answered on a lane this node has not written to only
+    /// within that node's [`NEW_LANES_PER_NODE`]: past it the refusal is
+    /// recorded `unnotified … reason=lane-cap` on the addressed session's face,
+    /// and the sender's wait ends at its deadline.
     ///
-    /// * a non-`s-` sender got `/f/<F>/in/p/<src>/…`, but the `<src>` of a
-    ///   message from a session behind a bridge is that node's principal (§6.1),
-    ///   and a node drains `/f/<F>/in/<node>/>` — never the `p/` owner path,
-    ///   which is §6.3's DIRECT-principal lane. The verdict was published,
-    ///   authorized, and drained by nobody;
-    /// * an `s-` sender got THIS node's own subtree under THIS node's own
-    ///   `<src>`, so the notice came straight back through this bridge's own
-    ///   group drain, tripped the self-lane check (the publish offset was never
-    ///   registered the way `drain_outbox` registers one) and published
-    ///   `cap-compromised` — a false compromise alarm the node raised against
-    ///   itself, on a path an attacker triggers at will by filling a peer's
-    ///   quota.
-    ///
-    /// The address is now built from what the record actually carries. A remote
+    /// The address is built from what the record actually carries. A remote
     /// node's message names the session it spoke for (`from=<sid>`, attested by
     /// the cap-forced `<src>`), and THAT session's lane on THAT node is where the
-    /// answer goes. A local `s-` sender is routed through [`Bridge::resolve_to`],
-    /// the one place that knows where an address lives — and its offset is
-    /// registered as ours before anything else can see it.
+    /// answer goes, within [`NEW_LANES_PER_NODE`]. A local `s-` sender is routed
+    /// through [`Bridge::resolve_to`], the one place that knows where an address
+    /// lives — and its offset is registered as ours before anything else can see
+    /// it; otherwise the notice would come back through this bridge's own drain
+    /// and trip the self-lane check as a false `cap-compromised`. (The `p/<src>`
+    /// owner path is §6.3's DIRECT-principal lane, which no node drains.)
     fn notify_sender_undeliverable(
         &mut self,
         addr: &subject::InAddr,
@@ -2763,24 +2783,34 @@ impl Bridge {
             );
             return;
         }
-        let Some(prefix) = self.sender_lane(addr, body) else {
-            // NO LANE, SAID OUT LOUD. A node that spoke for no session has no
-            // deliverable inbox owner path (`<node>/node` is not a `<sid>`, and
-            // parsing one would be refused as malformed at the far end), so the
-            // honest record is that the verdict could not be addressed — not a
-            // publish into a lane nobody drains.
-            self.publish_ev_for(
-                Some(&addr.sid),
-                &format!("unnotified off={off} src={} reason={why}", addr.src),
-            );
-            return;
+        let prefix = match self.sender_lane(addr, body) {
+            Ok(prefix) => prefix,
+            Err(no) => {
+                // NO LANE, SAID OUT LOUD. A node that spoke for no session has
+                // no deliverable inbox owner path (`<node>/node` is not a
+                // `<sid>`, and parsing one would be refused as malformed at the
+                // far end), so the honest record is that the verdict could not
+                // be addressed — not a publish into a lane nobody drains. A
+                // node whose new lanes are spent ([`NEW_LANES_PER_NODE`]) is
+                // named as such: the refusal's own reason is already on this
+                // face, under the same `off`.
+                let reason = match no {
+                    NoLane::Undrained => why,
+                    NoLane::Capped => "lane-cap",
+                };
+                self.publish_ev_for(
+                    Some(&addr.sid),
+                    &format!("unnotified off={off} src={} reason={reason}", addr.src),
+                );
+                return;
+            }
         };
         let subject = format!("{prefix}/undeliverable");
         let mut notice = Body::new(crate::now_ms());
         notice.re = Some(off);
         notice.from = Some(addr.sid.clone());
         notice.text = format!("not delivered: {why}");
-        let encoded = notice.encode(None);
+        let encoded = notice.encode();
         self.publish_own(&subject, &encoded);
     }
 
@@ -2796,13 +2826,11 @@ impl Bridge {
     /// principal that sent the ask — the thing a sender's `post --wait-ack` and
     /// `await inbox re=<off>` wait for.
     ///
-    /// DRIVEN BY THE ENDPOINT'S QUEUE, NOT BY AN EVENT. This used to publish
-    /// straight from the `inbox-seen` event, and an event exists once: a bridge
-    /// reconnecting to the broker drops it with the rest of its mailbox, a
-    /// failed publish only logged it, and a relaunched bridge never sees the
-    /// ones emitted while it was gone. A receipt given in any of those windows
-    /// never reached the sender, and the recipient could not resend it (the
-    /// endpoint records a word once per row per change). The queue is a PEEK,
+    /// DRIVEN BY THE ENDPOINT'S QUEUE, NOT BY AN EVENT. An `inbox-seen` event
+    /// exists once: a reconnect drops it with the rest of the mailbox, a failed
+    /// publish only logs it, and a relaunched bridge never sees the ones emitted
+    /// while it was gone — and the recipient cannot resend it (the endpoint
+    /// records a word once per row per change). The queue is a PEEK,
     /// drained after every attach and at every start exactly like the posts, so
     /// nothing in those windows is lost; the event is only the prompt trigger.
     ///
@@ -2817,12 +2845,16 @@ impl Bridge {
     /// a `from=` that is not a principal, a verdict that is not one of the three
     /// words, or a kind that does not wait publishes nothing — and is RETIRED
     /// (`off=-`), as is every receipt a bridge with receipts turned off is handed,
-    /// so the queue never holds what this bridge will never send.
+    /// so the queue never holds what this bridge will never send. So is one to a
+    /// session on another node that would open a lane past
+    /// [`NEW_LANES_PER_NODE`] (its sid is that node's word), recorded `unacked
+    /// … reason=lane-cap`.
     ///
     /// # Errors
     ///
-    /// A publish the broker did not take, or a sequence that could not be
-    /// reserved: the receipt STAYS OWED and the next drain retries it under the
+    /// A publish the broker did not take, a sequence that could not be
+    /// reserved, or a read that could not say whether the sender's lane is
+    /// held: the receipt STAYS OWED and the next drain retries it under the
     /// same sequence — the rule a post the broker cannot take already follows
     /// ("the broker will come back, and the whole point of the queue is to
     /// survive that").
@@ -2834,13 +2866,20 @@ impl Bridge {
             self.retire_receipt(r, None);
             return Ok(());
         }
-        let Some(prefix) = self.receipt_lane(&r.from) else {
-            self.publish_ev_for(
-                Some(&r.sid),
-                &format!("unacked re={} verdict={} reason=no-lane", r.off, r.verdict),
-            );
-            self.retire_receipt(r, None);
-            return Ok(());
+        let prefix = match self.receipt_lane(&r.from)? {
+            Ok(prefix) => prefix,
+            Err(no) => {
+                let reason = match no {
+                    NoLane::Undrained => "no-lane",
+                    NoLane::Capped => "lane-cap",
+                };
+                self.publish_ev_for(
+                    Some(&r.sid),
+                    &format!("unacked re={} verdict={} reason={reason}", r.off, r.verdict),
+                );
+                self.retire_receipt(r, None);
+                return Ok(());
+            }
         };
         let subject = format!("{prefix}/ack");
         let seq = match self.state.receipt_seq(&r.sid, r.rid) {
@@ -2856,7 +2895,7 @@ impl Bridge {
         receipt.from = Some(r.sid.clone());
         receipt.verdict = Some(r.verdict.clone());
         receipt.text = format!("marked {} by the recipient", r.verdict);
-        let encoded = receipt.encode(None);
+        let encoded = receipt.encode();
         let (at, deduped) = self.publish_at(seq, &subject, &encoded)?;
         // OURS BEFORE ANYTHING CAN SEE IT, as a post's landing is: a receipt
         // for a sender on this node lands on our own lane, and the self-lane
@@ -2901,12 +2940,17 @@ impl Bridge {
     }
 
     /// The six-segment `in` prefix a receipt for the sender an endpoint row
-    /// names as `from=` goes to, or `None` when there is no lane a bridge
-    /// drains. The three renderings [`Bridge::render_from`] produces, read
-    /// back: `s-<sid>@n-<node>` is that session's lane on that node;
-    /// `h-*`/`a-*` hold their own `p/` lane (§6.3); a bare `s-*` is routed
-    /// like any address; a bare `n-*` spoke for no session and has no lane.
-    fn receipt_lane(&mut self, from: &str) -> Option<String> {
+    /// names as `from=` goes to, or why there is none. The three renderings
+    /// [`Bridge::render_from`] produces, read back: `s-<sid>@n-<node>` is that
+    /// session's lane on that node, while [`Bridge::may_answer_on`] allows it
+    /// (the sid is that node's word); `h-*`/`a-*` hold their own `p/` lane
+    /// (§6.3); a bare `s-*` is routed like any address; a bare `n-*` spoke for
+    /// no session and has no lane.
+    ///
+    /// # Errors
+    ///
+    /// [`Bridge::may_answer_on`]'s read.
+    fn receipt_lane(&mut self, from: &str) -> io::Result<Result<String, NoLane>> {
         let fleet = self.cfg.fleet.clone();
         if let Some((sid, node)) = from.split_once('@') {
             if !(sid.starts_with("s-")
@@ -2914,23 +2958,25 @@ impl Bridge {
                 && node.starts_with("n-")
                 && subject::is_principal(node))
             {
-                return None;
+                return Ok(Err(NoLane::Undrained));
             }
-            return Some(format!("/f/{fleet}/in/{node}/{sid}/{}", self.node));
+            let lane = format!("/f/{fleet}/in/{node}/{sid}/{}", self.node);
+            let allowed = self.may_answer_on(node, &lane)?;
+            return Ok(allowed.then_some(lane).ok_or(NoLane::Capped));
         }
         if !subject::is_principal(from) {
-            return None;
+            return Ok(Err(NoLane::Undrained));
         }
         if from.starts_with("s-") {
-            return match self.resolve_to(&format!("@{from}"), None) {
-                Route::To(prefix) => Some(prefix),
-                _ => None,
-            };
+            return Ok(match self.resolve_to(&format!("@{from}"), None) {
+                Route::To(prefix) => Ok(prefix),
+                _ => Err(NoLane::Undrained),
+            });
         }
         if from.starts_with("n-") {
-            return None;
+            return Ok(Err(NoLane::Undrained));
         }
-        Some(format!("/f/{fleet}/in/p/{from}/{}", self.node))
+        Ok(Ok(format!("/f/{fleet}/in/p/{from}/{}", self.node)))
     }
 
     // -----------------------------------------------------------------------
@@ -2950,10 +2996,9 @@ impl Bridge {
     /// ([`fetched_lines`]) — which fills the parked wait and touches no ring.
     ///
     /// A REFUSED ANSWER IS FOLLOWED BY `err=refused`, so the parked read ends
-    /// now. It used to be logged and nothing else: the slot stayed pending, the
-    /// next drain listed it again, and a record the endpoint would not take
-    /// (one over its body bound) was fetched and refused every drain — 35 bus
-    /// reads for one read — until the read timed out.
+    /// now. Otherwise the slot stays pending and a record the endpoint will not
+    /// take (one over its body bound) is fetched and refused on every drain
+    /// until the read times out.
     fn answer_fetch(&mut self, sid: &str, off: u64) {
         let lines = match self
             .fetch_record(sid, off)
@@ -3043,14 +3088,14 @@ impl Bridge {
     }
 
     /// The six-segment `in` prefix a verdict for this record's SENDER goes to,
-    /// or `None` when there is no lane that can be drained.
-    fn sender_lane(&mut self, addr: &subject::InAddr, body: &Body) -> Option<String> {
+    /// or why there is no lane that can be drained.
+    fn sender_lane(&mut self, addr: &subject::InAddr, body: &Body) -> Result<String, NoLane> {
         let fleet = self.cfg.fleet.clone();
         if addr.src.starts_with("s-") {
             // A session address: routed, pin and roster and all.
             return match self.resolve_to(&format!("@{}", addr.src), None) {
-                Route::To(prefix) => Some(prefix),
-                _ => None,
+                Route::To(prefix) => Ok(prefix),
+                _ => Err(NoLane::Undrained),
             };
         }
         if addr.src.starts_with("n-") {
@@ -3059,11 +3104,70 @@ impl Bridge {
             let sid = body
                 .from
                 .as_deref()
-                .filter(|s| s.starts_with("s-") && subject::is_principal(s))?;
-            return Some(format!("/f/{fleet}/in/{}/{sid}/{}", addr.src, self.node));
+                .filter(|s| s.starts_with("s-") && subject::is_principal(s))
+                .ok_or(NoLane::Undrained)?;
+            let lane = format!("/f/{fleet}/in/{}/{sid}/{}", addr.src, self.node);
+            // BUT THE SID IS THE SENDER'S WORD, and the lane a subject on THIS
+            // node's budget ([`Bridge::may_answer_on`]). A read that fails
+            // sends no verdict, and is no reason to name the cap.
+            return match self.may_answer_on(&addr.src, &lane) {
+                Ok(true) => Ok(lane),
+                Ok(false) => Err(NoLane::Capped),
+                Err(_) => Err(NoLane::Undrained),
+            };
         }
         // A human or a service holds its own `ro:/f/<F>/in/p/<p>/>` lane (§6.3).
-        Some(format!("/f/{fleet}/in/p/{}/{}", addr.src, self.node))
+        Ok(format!("/f/{fleet}/in/p/{}/{}", addr.src, self.node))
+    }
+
+    /// Whether this node may answer on `lane`, the inbox lane of the session on
+    /// `node` a record named: the one rule a verdict ([`Bridge::sender_lane`])
+    /// and a receipt ([`Bridge::receipt_lane`]) share ([`NEW_LANES_PER_NODE`]
+    /// says why there is one).
+    ///
+    /// A lane on THIS node is free: only a record under this node's own cap
+    /// names one, so its sid is this bridge's own `from=`, budgeted with the
+    /// sessions the node hosts. So is a lane this process opened before, and one
+    /// the bus already holds a record under — a post, a receipt, an earlier
+    /// verdict, which only this node's cap can publish there — read with one
+    /// `Last` stopped at the first row: what an answer adds there is one leaf
+    /// beside a lane this node already spends on. Anything else is a NEW lane,
+    /// opened while `node` has fewer than [`NEW_LANES_PER_NODE`].
+    ///
+    /// # Errors
+    ///
+    /// The read that would say whether the lane is held.
+    fn may_answer_on(&mut self, node: &str, lane: &str) -> io::Result<bool> {
+        if node == self.node || self.lanes_opened.contains(lane) {
+            return Ok(true);
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the broker is unreachable",
+            ));
+        };
+        let mut held = false;
+        let started = Instant::now();
+        let answer = conn.last_walk(&format!("{lane}/*"), "", 1, |_| {
+            held = true;
+            Ok(astream_broker::Walk::Stop)
+        });
+        self.observe(started, answer, Some("read"))?;
+        if held {
+            return Ok(true);
+        }
+        let peer = format!("/f/{}/in/{node}/", self.cfg.fleet);
+        let opened = self
+            .lanes_opened
+            .range(peer.clone()..)
+            .take_while(|l| l.starts_with(&peer))
+            .count();
+        if opened >= NEW_LANES_PER_NODE {
+            return Ok(false);
+        }
+        self.lanes_opened.insert(lane.to_string());
+        Ok(true)
     }
 
     /// Publish a record and REMEMBER IT AS OURS when it lands on one of this
@@ -3229,15 +3333,19 @@ impl Bridge {
     /// EXACTLY ONE `expired` PER ASK, by the same read: a verdict this bridge
     /// (or a dead predecessor) already put on the lane is found there and the
     /// entry is retired without a second one.
-    fn expire_deadlines(&mut self) {
+    fn expire_deadlines(&mut self, at_once: bool) {
         if self.conn.is_none() {
             return;
         }
         let now = crate::now_ms();
+        // [`Fault::ExpireDeadlinesAtOnceWhileMarked`] moves the line every
+        // deadline is judged against and nothing else; `now` still stamps the
+        // verdict.
+        let judged_at = if at_once { u64::MAX } else { now };
         let due: Vec<Deadline> = self
             .deadlines
             .values()
-            .filter(|d| d.at <= now)
+            .filter(|d| d.at <= judged_at)
             .take(DEADLINE_SWEEP_MAX)
             .cloned()
             .collect();
@@ -3273,7 +3381,7 @@ impl Bridge {
                     verdict.re = Some(d.off);
                     verdict.dl = Some(d.dl);
                     verdict.text = format!("no reply within {}", span_of(d.dl));
-                    let encoded = verdict.encode(None);
+                    let encoded = verdict.encode();
                     match self.publish_own_off(&subject, &encoded) {
                         Ok(at) => {
                             self.remember_expired(d.off, &d.sid);
@@ -3350,10 +3458,9 @@ impl Bridge {
     }
 
     /// Record one offset as ours, in memory and durably, keeping both halves the
-    /// SAME size. The in-memory set used to grow one entry per publish for the
-    /// life of the process while its durable twin kept only the newest
-    /// [`SELF_ACK_KEEP`]; a restart then reloaded the short one and the check
-    /// answered "forged" to records the long one had called ours.
+    /// SAME size ([`SELF_ACK_KEEP`]): a longer in-memory set would, after a
+    /// restart reloads the short durable one, answer "forged" to records it had
+    /// called ours.
     fn remember_self_ack(&mut self, off: u64) {
         self.self_acked.insert(off);
         while self.self_acked.len() > SELF_ACK_KEEP {
@@ -3397,14 +3504,11 @@ impl Bridge {
         }
         let (body, _) = Body::decode(raw);
         let on = body.unknown.get("state").is_some_and(|s| s == "on");
-        // THE HUMAN'S OWN WORDS, carried through. A3 read `state=` and dropped
-        // `reason=` on the floor, so every held agent was told `reason=fleet-halt`
-        // — true, and useless: §5.3's whole point is that the reason reaches the
-        // agent — every PTY-reaching verb on a held session answers `ERR halted
-        // reason=<r> origin=…`, and `inbox` carries it (round 25 cut the
-        // `PreToolUse` hook that also printed it to the model, 59c3bee59) — and
-        // "main broken, hold everything" is what stops an agent from re-trying its
-        // way around a halt it cannot see the cause of. It arrives pct-encoded (a
+        // THE HUMAN'S OWN WORDS, carried through: §5.3's point is that the
+        // reason reaches the agent — every PTY-reaching verb on a held session
+        // answers `ERR halted reason=<r> origin=…`, and `inbox` carries it — so
+        // "main broken, hold everything" stops an agent re-trying its way
+        // around a halt it cannot see the cause of. It arrives pct-encoded (a
         // body token has no spaces) and is passed on in that form, which is
         // exactly what `hold … reason=<pct>` takes; [`halt_reason_token`] bounds
         // and sanitizes it anyway, because a reason is a stranger's bytes.
@@ -3424,19 +3528,12 @@ impl Bridge {
         // THE ACK IS ONE RETAINED SUBJECT PER NODE, NAMING THE BARRIER IT
         // ANSWERS — not one subject per barrier.
         //
-        // A3 published to `…/node/ack/<off>`, a fresh subject for every halt
-        // record on AND off. The broker bounds a producer at
-        // `MAX_SUBJECTS_PER_PRODUCER` = 4096, rebuilt from the log on every
-        // open, and a node's producer id is derived from an id the state dir
-        // mints once and keeps forever — so a fleet whose humans toggled the
-        // halt two thousand times, or one cap-holding human publishing 4096
-        // halt records in a burst, permanently spent that node's whole subject
-        // budget. Past the bound EVERY publish from the node fails, including
-        // the `live` presence row `attach_broker` refuses to continue without,
-        // so no bridge on that node can ever attach again and every session it
-        // hosts stays held `fabric-lost`. There is no recovery short of minting
-        // a new node id, which abandons that node's mail lane by design. T9's
-        // "log flooding" residual became permanent damage.
+        // A subject per halt record (`…/node/ack/<off>`) would let a fleet
+        // whose humans toggled the halt two thousand times, or one cap-holding
+        // human publishing 4096 halt records, permanently spend the node's
+        // subject budget (see the module doc): past it EVERY publish from the
+        // node fails, including the `live` presence row `attach_broker` will
+        // not continue without, so no bridge on that node can attach again.
         //
         // One subject carrying `re=<off>` costs the producer exactly one subject
         // for the life of the node, and a quorum fold over
@@ -3463,13 +3560,11 @@ impl Bridge {
         // `attach_broker` will not continue without. Sizing the ack at one subject
         // is the fail-safe direction; losing a per-barrier history is the price,
         // and it is written here because the design file still describes the
-        // per-barrier shape. (`tui.rs`'s `/barrier` text did too, until round 21
-        // deleted the module.)
+        // per-barrier shape.
         //
         // AND IT IS NOT REPUBLISHED FOR HISTORY. The fleet face resubscribes
-        // from offset 0 on every reconnect, and A3 kept no memory of what it had
-        // answered, so each reconnect re-appended one ack per historical halt.
-        // The watermark is durable for the same reason the sequence is.
+        // from offset 0 on every reconnect; without a durable watermark each
+        // reconnect would re-append one ack per historical halt.
         if self.state.halt_acked().is_some_and(|have| have >= *off) {
             return;
         }
@@ -3581,10 +3676,8 @@ impl Bridge {
     ///
     /// Nothing lifts it. `apply_halt` is a state check over the bridge's own
     /// belief, and the belief says "not held"; the fleet publishes nothing,
-    /// because nothing changed on the bus. A3 shipped that deadlock and never met
-    /// it, because nothing it did needed a PTY after a bridge crash. A7 does: the
-    /// first thing the replacement bridge tries is the interrupted keystroke, and
-    /// it answers `ERR halted` forever.
+    /// because nothing changed on the bus. The session answers `ERR halted`
+    /// forever.
     ///
     /// **The fix is convergence, not ordering.** Tightening the order would have
     /// meant teaching the guard to skip a hold when a newer bridge had already
@@ -3610,9 +3703,9 @@ impl Bridge {
         eprintln!(
             "aterm-link: {sid}: {}",
             if on {
-                "holding it: the fleet halt stands"
+                "held: fleet halt stands"
             } else {
-                "releasing it: no fleet halt stands"
+                "released: no fleet halt"
             }
         );
         self.write_hold(sid, on, &reason);
@@ -3644,14 +3737,10 @@ impl Bridge {
     /// reconnects … or a human lifts it at the GUI", and the endpoint's own note
     /// says a reconnecting bridge "lifts what it wants lifted with `hold off`".
     ///
-    /// **A3 never wrote that `hold off`.** Its only lift was inside
-    /// [`Bridge::apply_halt`], behind a state check that a fresh process always
-    /// reads as "not held" — so nothing was ever written, and every session a
-    /// crashed bridge had touched stayed drive-held for the life of the
-    /// instance. It cost A3 and A5 nothing because neither drove a PTY after a
-    /// crash; A7 does, and a keystroke replayed into a session still held
-    /// `fabric-lost` answers `ERR halted` forever. Both halves of §6.5's repair
-    /// depend on this.
+    /// [`Bridge::apply_halt`] alone cannot write that `hold off`: its state
+    /// check reads "not held" in a fresh process, so every session a crashed
+    /// bridge touched would stay held for the life of the instance. Both halves
+    /// of §6.5's repair depend on this.
     ///
     /// ## Why it is still fail-closed
     ///
@@ -3676,13 +3765,13 @@ impl Bridge {
     /// published between the two arrives on the fleet subscription, which
     /// resumes at the mark THIS read returns — gap-free across the seam, so
     /// the window between the snapshot and the subscribe is covered without
-    /// replaying the fleet's whole history to cover it (round 21).
+    /// replaying the fleet's whole history to cover it.
     fn read_fleet_halts(&mut self) -> Option<(Vec<BrokerRecord>, u64)> {
         let filter = format!("/f/{}/fleet/*/halt", self.cfg.fleet);
         let conn = self.conn.as_mut()?;
         // A WALK THAT DID NOT FINISH IS NOT AN ANSWER, and this is the one
-        // caller where that distinction lifts a fleet halt. The old loop stopped
-        // on an empty page, which the broker's own API says is not the end —
+        // caller where that distinction lifts a fleet halt. An empty page is not
+        // the end, per the broker's own API —
         // `/f/<F>/fleet/` shares an index with a subtree that grows one entry per
         // (member, barrier) and per session ever spawned, so a scan-bound cut is
         // reachable — and the "no halt row exists" that follows an incomplete
@@ -3775,21 +3864,13 @@ impl Bridge {
     /// against this bridge's own view, the one thing that catches a drop guard
     /// landing after a reconcile), and, off the same reply, the `detail=` and
     /// `agent=` the presence row carries. `meta` (`attention=`, `role=`,
-    /// `title=`) is NOT read here any more: it arrives as `EVENT <local> meta
+    /// `title=`) is NOT read here: it arrives as `EVENT <local> meta
     /// …` on the push lane and is re-read on that push ([`Bridge::on_event`]),
     /// or on the first round after a `GAP` said a push may be lost. The
     /// server's `agent=` verdict is pushed the same way (`EVENT <local> agent
     /// <word> …`); the round's `status` is the backstop for a coalesced one.
     ///
-    /// IT WAS THE LOCAL HALF OF §6.6. Two of that table's rows were local
-    /// observations rather than bus events — row 4, the conservative pause that
-    /// parked a session at `human?` when something moved it that the bridge had
-    /// not caused, and row 5, the mirror of a local socket driver's `lease
-    /// acquire` onto the bus as `holder=owner-cli:<h>` — and both existed only
-    /// to decide who a `term/in` would be accepted from. Round 21 cut the drive
-    /// face, and `watch_held_control`, `baseline_local`, `DRIVEN_KEEP`,
-    /// `SETTLE_QUIET` and the `driven`/`settled`/`unaccounted` accounting went
-    /// with it. What is left is a sampler, not a policy.
+    /// A sampler, not a policy.
     fn sample_local_control(&mut self) {
         if self.attachment == Attachment::Observer {
             return;
@@ -4120,13 +4201,8 @@ impl Bridge {
     /// a disagreement, and the sample is taken FIRST so a `None` returns before
     /// any state moves ([`Bridge::status_sample`]).
     ///
-    /// Round 21 cut the rest. This used to be §6.6's rows 4 and 5 — the
-    /// conservative pause that parked a driven row at `human?`, and the mirror
-    /// of aterm's own local lease onto the bus — and both existed only to
-    /// decide who was allowed to send a `term/in`. With the drive face gone
-    /// there is no such decision to make. The later `revision=` gate on this
-    /// bridge's own screen read also went; the batched row still validates the
-    /// field for compatibility with the ordinary status record.
+    /// The batched row still validates `revision=` for compatibility with the
+    /// ordinary status record; nothing here gates on it.
     fn observe_local_control(&mut self, sid: &str, sample: Option<StatusSample>) {
         let Some(sample) = sample else {
             return;
@@ -4175,8 +4251,7 @@ impl Bridge {
     /// retained at `state=live` — forever, because presence is a last-value
     /// face and nothing supersedes a row whose writer is dead.
     ///
-    /// Measured on the owner's machine 2026-09-20: `aterm fabric status` had
-    /// been reporting, with no way to ever stop,
+    /// `aterm fabric status` then reports, with no way to ever stop,
     ///
     /// ```text
     /// ! the bus advertises @s-d5a5de326f33873b6167 live on n-1b631315bf5cae35 —
@@ -4184,8 +4259,8 @@ impl Bridge {
     ///   is undeliverable
     /// ```
     ///
-    /// and the warning is RIGHT — mail to that sid is undeliverable. What was
-    /// missing is anyone to fix it.
+    /// and the warning is RIGHT — mail to that sid is undeliverable. This sweep
+    /// is what fixes it.
     ///
     /// ## Why it is safe to write someone else's row
     ///
@@ -4366,7 +4441,7 @@ impl Bridge {
     /// the whole repair to a path that a busy node — the only node whose push
     /// lane coalesces — does not reach.
     ///
-    /// The order matters and is the order the idle arm used to state: the local
+    /// The order matters: the local
     /// sample first — it is where a stale `fabric-lost` hold is corrected — and
     /// the roster next, so a session admitted this round is admitted against a
     /// hold this round has already reconciled.
@@ -4376,9 +4451,8 @@ impl Bridge {
         let _ = self.refresh_sessions();
         self.admit_fresh_sessions();
         // A session that appeared while a halt was standing must be held too — a
-        // SET question, not a cardinality one. A3 compared `before.len()` with
-        // the new length, so a round in which one session exited and another was
-        // created left the new one un-held: same count, no reassert.
+        // SET question, not a cardinality one: a round in which one session
+        // exited and another was created has the same count.
         let after: Vec<String> = self.locals.values().cloned().collect();
         if before != after {
             self.reassert_halt();
@@ -4530,10 +4604,8 @@ impl Bridge {
     /// bounds the writes ([`Bridge::publish_presence_if_due`]).
     ///
     /// ONE MECHANISM: this is the only invalidation of a `meta` read besides a
-    /// `GAP`'s, which marks every slot at once. It is the same idea upstream
-    /// shipped as a separate `meta_sampled` cache (d7f56e116, 2026-09-24),
-    /// kept here as the slot's own `sampled` flag so there is one cache bit,
-    /// not two that can disagree.
+    /// `GAP`'s, which marks every slot at once. It is the slot's own `sampled`
+    /// flag, so there is one cache bit, not two that can disagree.
     fn refresh_meta(&mut self, sid: &str) {
         if let Some(slot) = self.presence.get_mut(sid) {
             slot.sampled = false;
@@ -4562,11 +4634,7 @@ impl Bridge {
     /// this hashes the JSON encoding of the rows array, and the two therefore
     /// disagree for every screen there is. §6.6 says so in as many words —
     /// `fp16` "is deliberately NOT byte-identical to aterm's own `turn`
-    /// `hash=` … so the two must never be compared" — and this comment used to
-    /// say the opposite, which is an invitation to build a `serial=`-fenced
-    /// approval out of a `hash=` a driver already has and watch every record it
-    /// fences be refused `reason=gen` for a units mismatch two doc comments
-    /// asserted away.
+    /// `hash=` … so the two must never be compared".
     ///
     /// `None` when the screen cannot be read, and that REFUSES a `serial=`-bearing
     /// record rather than admitting it — an unreadable screen is not a matching
@@ -4631,8 +4699,8 @@ impl Bridge {
         // the window between aterm dropping it and the `session-exited` item
         // being taken off the mailbox — routed the post to the node's own `in`
         // face and the endpoint was told `off=<n>`: LANDED, for a session that
-        // no longer exists and will never fetch it. Measured 2026-09-14 on a
-        // loaded machine: 2 of 16 concurrent runs, the drain resolving
+        // no longer exists and will never fetch it. Measured on a loaded
+        // machine: 2 of 16 concurrent runs, the drain resolving
         // `hosted=true` 67 ms before the bridge took `session-exited` off its
         // own queue. A door that gives up must ask; a door that COMMITS must ask
         // too, and this is the only side that can lose a message.
@@ -4644,9 +4712,10 @@ impl Bridge {
         // publishes nothing, and its key keeps naming whatever record it named
         // — the broker's dedup, not the route, is what makes a re-post under it
         // one record, so a later re-post that does route still answers the
-        // first record's offset `dup=1`. (A receipt to `s-<sid>@n-<node>` names
-        // its lane outright and reads no roster: the sender's own node accounts
-        // for a sender that has gone, as `undeliverable reason=not-hosted`.)
+        // first record's offset `dup=1`. (A receipt to `s-<sid>@n-<node>` reads
+        // no roster: its lane is that session's on that node, within
+        // [`NEW_LANES_PER_NODE`], and the sender's own node accounts for a
+        // sender that has gone, as `undeliverable reason=not-hosted`.)
         // The same read prunes the deadline table to the askers still here.
         //
         // ONE READ PER DRAIN, not one per post, and only when there is something
@@ -4693,7 +4762,7 @@ impl Bridge {
                     body.dl = post.dl;
                     body.via = post.via.clone();
                     body.text = String::from_utf8_lossy(&post.body).into_owned();
-                    let encoded = body.encode(None);
+                    let encoded = body.encode();
                     // THE SEQUENCE IS PINNED TO THE POST, reserved durably before
                     // the publish and reused verbatim on every retry. `outbox` is
                     // a peek, so a bridge that died between the `Publish` and the
@@ -4869,41 +4938,24 @@ impl Bridge {
     /// `@s-<sid>` routes only when exactly one node advertises that sid "**and**
     /// the sender's bridge has pinned that (sid → node) pair **on first sight**"
     /// — first sight meaning a PRESENCE ADVERTISEMENT, which the claiming node
-    /// had to hold its own cap to publish. A3 also pinned on the EXPLICIT-node
-    /// arm, where the node segment comes straight out of a session's own
-    /// `post to=` argument: `post` is owner-class and every in-session
-    /// `aterm-ctl @self` is Owner (§8.1), so the stated adversary — a
-    /// prompt-injected worker with a shell — could write the durable pin table
-    /// with one message and no capability at all, permanently making a peer's
-    /// sid `ERR ambiguous` for every sender on the node (or, before the real
-    /// host came up, routing its mail onto a lane of the attacker's choosing).
-    /// The table survives every restart, and the only undo is deleting the file
-    /// (§11.2's `aterm-link pin` override was cut unbuilt in 622e40af6).
+    /// had to hold its own cap to publish.
     ///
-    /// An address that NAMES its node needs no pin — the sender already said
-    /// where it is going. So the explicit arm now reads the table and never
-    /// writes it: a sid pinned to a DIFFERENT node is the §6.1 conflict and is
-    /// refused rather than silently redirected (which is what returning the
-    /// pinned node used to do to a sender who had explicitly asked for another),
-    /// and an unpinned sid routes where it was told without leaving a mark.
+    /// An address that NAMES its node needs no pin, so the explicit arm reads
+    /// the table and never writes it. Its node segment comes straight from a
+    /// session's own `post to=`, and every in-session `aterm-ctl @self` is
+    /// Owner (§8.1): pinning there would let a prompt-injected worker write the
+    /// durable pin table with one message and no capability, permanently making
+    /// a peer's sid `ERR ambiguous` (the only undo is deleting the file). A sid
+    /// pinned to a DIFFERENT node is the §6.1 conflict and is refused rather
+    /// than silently redirected; an unpinned sid routes where it was told
+    /// without leaving a mark.
     fn resolve_to(&mut self, to: &str, from_sid: Option<&str>) -> Route {
         let to = crate::pct::decode(to);
         let fleet = self.cfg.fleet.clone();
-        // §4.2/§5.1's broadcast face: `/f/<F>/pub/<owner>/say/<kind>`, owner =
-        // `<node>/<sid>`. The verb table, `POST_USAGE` and §11.2's serve spec
-        // all name `to=say`, `cmd_post` accepts it and answers `OK <id>`, and
-        // the tui renders and publishes it — but A3's `resolve_to` answered
-        // `Unroutable`, so every such post was retired `off=- reason=unroutable`
-        // and vanished from `inbox` with no verdict a non-waiting sender ever
-        // sees. A verb row promising a target that always fails is a first-rank
-        // doc defect in a crate whose catalog IS its contract, so the route is
-        // implemented rather than the promise withdrawn — the withdrawal would
-        // have to happen in `cmd_post` and the verb table, which are the
-        // endpoint's.
-        // `say` and `say:<topic>` — the BROADCAST face. The subject's last
-        // segment is the topic (`say` alone means the topic "say", so every
-        // address that worked before still does), and the kind moves into the
-        // body: round 23 spends that segment on the thing subscribers name.
+        // `say` and `say:<topic>` — §4.2/§5.1's BROADCAST face,
+        // `/f/<F>/pub/<node>/<sid>/say/<topic>`. The last segment is the topic
+        // (`say` alone means the topic "say") because that is what subscribers
+        // name; the kind moves into the body.
         if to == "say" || to.starts_with("say:") {
             let topic = to.strip_prefix("say:").unwrap_or("say");
             if !subject::is_topic(topic) {
@@ -4998,15 +5050,9 @@ impl Bridge {
     /// ([`Bridge::publish_session_presence`]); counting those would make every
     /// watched session ambiguous the moment somebody opened an observer.
     ///
-    /// AND SO ARE THE ROWS THAT SAY THE SESSION IS GONE. This took the map's
-    /// KEYS and threw the `state=` away, while [`Bridge::holder_is_live`] read
-    /// the same rows and answered on `state == "live"` — so a session whose
-    /// only row is the `state=exited` withdrawal its own node published was
-    /// simultaneously not live ("who can act") and the single routing
-    /// candidate ("where do I send"), which is the disagreement
-    /// `holder_is_live`'s doc says can never happen. It also wrote a PERMANENT
-    /// TOFU pin for a sid that no longer exists. One predicate, one word, one
-    /// place: `holder_is_live` now asks this function.
+    /// AND SO ARE THE ROWS THAT SAY THE SESSION IS GONE: a session whose only
+    /// row is its node's `state=exited` withdrawal is no routing candidate,
+    /// and must not earn a PERMANENT TOFU pin for a sid that no longer exists.
     fn advertisers(&mut self, sid: &str) -> BTreeSet<String> {
         self.roster_rows(sid)
             .into_iter()
@@ -5386,30 +5432,15 @@ impl Bridge {
         // It is a last-value face — `on_fleet_record` keeps only
         // `fleet/h-*/halt`, and the standing verdict is the newest row per
         // human — so the `Last` read whose answer `apply_fleet_halts` REBUILDS
-        // `self.halts` from is already the whole state. Subscribing from zero
-        // after it re-delivered every halt record ever published to re-derive
-        // the state that read had just derived, and `state.rs`'s `halt-acked`
-        // exists only to stop the node re-answering each one: "the fleet face
-        // resubscribes from offset 0 on every reconnect, so without this the
-        // node re-answers every halt in the fleet's history at every
-        // reconnect."
+        // `self.halts` from is already the whole state. A replay from zero is
+        // not merely redundant: `on_fleet_record` APPLIES each halt as it
+        // arrives, so the first `state=on` in the log would hold every session
+        // until the walk reached its matching `off`.
         //
-        // AND THE REPLAY WAS NOT MERELY REDUNDANT. `on_fleet_record` APPLIES
-        // each halt as it arrives, so the walk re-applied every barrier the
-        // fleet ever carried: the first `state=on` in the log held every
-        // session on this instance until the walk reached its matching `off`,
-        // a hold nothing on the bus justified and one this attach had already
-        // computed the correct answer to moments earlier.
-        //
-        // The mark closes the window the old comment worried about instead of
-        // paying for it — `Request::Last`'s own doc says a subscribe from a
-        // page's `next` tails on gap-free from that page's snapshot, so a halt
-        // published between the read and this subscribe still arrives, exactly
-        // once.
-        // THE FLEET FACE, ON ITS OWN CONNECTION. This was a loop over two faces
-        // until round 21 took the drive face's; one subscription does not need
-        // one, and a loop over a single element reads as though a second is
-        // expected.
+        // `Request::Last`'s own doc says a subscribe from a page's `next` tails
+        // on gap-free from that page's snapshot, so a halt published between
+        // the read and this subscribe still arrives, exactly once.
+        // THE FLEET FACE, ON ITS OWN CONNECTION.
         {
             let (client, closer) = match self.connect() {
                 Ok(c) => c,
@@ -5673,8 +5704,10 @@ impl Bridge {
             }
             // AND THE DEADLINES (R8). The broker holds no timers; this clock is
             // the only one that can say an ask went unanswered.
-            if !self.deadlines.is_empty() && Instant::now() >= self.deadline_due {
-                self.expire_deadlines();
+            let expire_now = self.fault == Fault::ExpireDeadlinesAtOnceWhileMarked
+                && self.state.root().join("expire-deadlines-now").exists();
+            if !self.deadlines.is_empty() && (expire_now || Instant::now() >= self.deadline_due) {
+                self.expire_deadlines(expire_now);
                 self.arm_deadline_sweep(true, true);
             }
             // A roster round may have discovered a new session whose refill
@@ -5782,12 +5815,9 @@ fn note_ctl_loss(ctl: &Ctl, mailbox: &Mailbox, err: Option<&io::Error>) {
 ///
 /// Unaccounted is the LOST LANE alone — the reply never came and the connection
 /// is gone, so nothing anywhere says what happened and the cursor must not move
-/// past it. It used to mean "any `Err` from `ctl_request`", which folded in the
-/// writer's own over-long-line refusal: a deterministic, permanent, local
-/// refusal handled as a transient transport blip, with no `ev`, no verdict, and
-/// an absolute group commit from the next record that stepped over it.
-/// [`Ctl::lost`] is the question that separates the two, which is the whole
-/// reason that flag exists.
+/// past it. It is NOT "any `Err` from `ctl_request`": the writer's own
+/// over-long-line refusal is deterministic, permanent and local, and earns an
+/// `ev` and a verdict. [`Ctl::lost`] separates the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delivery {
     Accounted,
@@ -6036,6 +6066,10 @@ fn span_of(ms: u64) -> String {
 /// The rows array is delimited by `{"rows":[` and `],"cursor":`, and neither
 /// can occur inside a row: a `"` in a row is JSON-escaped, so a row can never
 /// contain the unescaped quote either bracket needs.
+///
+/// `<fp16>` is FNV-1a/64 ([`fnv1a_64`], the hash `status` stamps `hash=` with)
+/// over DIFFERENT BYTES: this rows array, not the plain screen text, so the two
+/// values never agree and §6.6 forbids comparing them. See [`Bridge::live_gen`].
 #[must_use]
 pub fn gen_of_frame(frame: &str) -> Option<String> {
     let seq = frame
@@ -6050,35 +6084,6 @@ pub fn gen_of_frame(frame: &str) -> Option<String> {
         .split_once("],\"cursor\":")?
         .0;
     Some(format!("{seq}:{:016x}", fnv1a_64(rows.as_bytes())))
-}
-
-/// FNV-1a over 64 bits — the same HASH aterm's own turn path uses
-/// (`crates/aterm-gui/src/turn_ledger.rs`), recomputed here rather than
-/// depended on: `aterm-gui` is a binary crate this one does not link, and §11.2
-/// pins the dependency set.
-///
-/// The same function over DIFFERENT BYTES: `turn`'s `hash=` is taken over the
-/// plain screen text and this one over a `text --json` rows array, so the two
-/// values never agree and §6.6 forbids comparing them. See
-/// [`Bridge::live_gen`].
-///
-/// THE PRIME IS THE ONE FNV PUBLISHES, and until round 22 it was not: this read
-/// `0x1000_0000_01b3`, which is 2^44 + 0x1b3, where FNV-64's multiplier is
-/// 2^40 + 0x1b3. The doc above already claimed to be "the same HASH" as
-/// `turn_ledger`'s and was not, and because the multiply only carries low bits
-/// upward the two agreed in their bottom forty bits and diverged above them —
-/// which is exactly how it was found, by a report that hashed a screen
-/// here and compared it with the `hash=` `status` stamps. Nothing persisted a
-/// value: [`gen_of_frame`]'s token is only ever compared with another token
-/// from this same function, so the repair changes no recorded state.
-/// [`the_prime_is_fnvs_own`] pins it against the published vectors.
-pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 /// The default a halt with no `reason=` is held under. It still names the
@@ -6102,18 +6107,7 @@ const HALT_REASON_MAX: usize = 128;
 /// the endpoint sanitizes too, and that is deliberate belt-and-braces at a seam
 /// where the input is a stranger's.
 fn halt_reason_token(raw: Option<&str>) -> String {
-    let mut out = String::with_capacity(HALT_REASON_MAX);
-    for byte in raw.unwrap_or_default().bytes() {
-        if out.len() == HALT_REASON_MAX {
-            break;
-        }
-        if byte.is_ascii_graphic() {
-            out.push(byte as char);
-        }
-    }
-    while out.ends_with('%') || (out.len() >= 2 && out.as_bytes()[out.len() - 2] == b'%') {
-        out.pop();
-    }
+    let out = crate::presence::clamp_pct(raw.unwrap_or_default(), HALT_REASON_MAX);
     if out.is_empty() {
         return HALT_REASON_DEFAULT.to_string();
     }
@@ -6134,15 +6128,11 @@ fn halt_reason_token(raw: Option<&str>) -> String {
 ///   attributed at all, and a row from an incarnation whose death nobody
 ///   witnessed may belong to a sibling that is alive right now.
 ///
-/// ROUND 21 SHIPPED THIS AS `inc > self_inc => skip`, WHICH IS THE WRONG WAY
-/// ROUND. `self.inc` is `max(local, bus) + 1`, so a bridge attaching SECOND on
-/// a shared state dir always outranks the first: the older sibling's rows are
-/// ALL below it, and all of them were retired after five minutes, alive or not.
-/// The guard read as though it protected a sibling and in fact protected only a
-/// FUTURE one, which cannot exist while this process is the one sweeping.
+/// NOT `inc > self_inc => skip`: `self.inc` is `max(local, bus) + 1`, so a
+/// bridge attaching SECOND on a shared state dir outranks the first, and every
+/// row of the live older sibling would be retired after five minutes.
 ///
-/// AND THE OBVIOUS REPAIR IS ALSO WRONG. `inc <= witnessed_dead` looks like the
-/// generous reading of "and everything older" — but a surviving OLDER sibling
+/// AND NOT `inc <= witnessed_dead` EITHER: a surviving OLDER sibling
 /// does not rewrite the node face when a younger one's will fires, so a node
 /// face reading `state=gone inc=K` proves K dead and says nothing whatever
 /// about `K-1`. The equality is the whole of what is proven, so the equality is
@@ -6168,7 +6158,7 @@ fn replier_of(subject: &str) -> Option<String> {
 }
 
 /// This host's name, for the presence row's `host=` — §7's second column of the
-/// cross-host `ls`, and the field `main.rs`'s header calls "the real answer"
+/// cross-host `ls`, and the field `cli.rs`'s header calls "the real answer"
 /// a session row's `-` points at.
 ///
 /// `$HOSTNAME` ALONE WAS NEVER AN ANSWER ON THE SHIPPED PLATFORM. It is a bash
@@ -6209,10 +6199,10 @@ fn hostname() -> String {
             return h;
         }
         for uname in ["/usr/bin/uname", "/bin/uname"] {
-            let out = std::process::Command::new(uname)
+            let out = aterm_uds::spawnfd::command(uname)
                 .arg("-n")
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
                 .output();
             if let Some(h) = out
                 .ok()
@@ -6230,13 +6220,8 @@ fn hostname() -> String {
 
 /// Mint a node id: `n-<16 hex>`, once, from the OS CSPRNG.
 fn mint_node_id() -> String {
-    let mut b = [0u8; 8];
-    aterm_uds::rand::fill(&mut b).expect("the OS CSPRNG");
-    let mut s = String::from("n-");
-    for byte in b {
-        s.push_str(&format!("{byte:02x}"));
-    }
-    s
+    let token = aterm_uds::rand::hex_token::<8>().expect("the OS CSPRNG");
+    format!("n-{token}")
 }
 
 /// One post read out of an `outbox` frame.
@@ -6911,15 +6896,16 @@ mod tests {
             }
         }
         mailbox.push_aterm_closed();
-        // The retry delay a defect would sleep through is a minute; "promptly"
-        // is under half of it. The close is already queued, so the correct wait
-        // returns at once, and a descheduled test thread is not read as a wait
-        // that slept through the backoff.
-        const RETRY: Duration = Duration::from_secs(60);
+        // The retry delay a defect would sleep through is five minutes;
+        // "promptly" is a minute's hang detector (AGENTS.md), never a latency
+        // budget. The close is already queued, so the correct wait returns at
+        // once, and a descheduled test thread is not read as a wait that slept
+        // through the backoff.
+        const RETRY: Duration = Duration::from_secs(300);
         let start = Instant::now();
         assert!(wait_for_retry_or_aterm_close(&mailbox, RETRY, |_| {}));
         assert!(
-            start.elapsed() < RETRY / 2,
+            start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "a closed aterm lane must interrupt the backoff promptly"
         );
         assert!(model.fire("Closed", &mut closed));
@@ -7098,21 +7084,7 @@ mod tests {
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
-    /// **THE PRIME IS FNV'S OWN.** Pinned against the vectors FNV publishes,
-    /// because the value this returns is compared with a hash another crate
-    /// computes (`aterm-gui`'s `turn_ledger::fnv1a_64`, which `status` stamps a
-    /// screen with and a stamped report's rows are held against).
-    /// A multiplier of `0x1000_0000_01b3` — 2^44 + 0x1b3, which this was —
-    /// agrees with the real thing in the bottom forty bits and nowhere above,
-    /// so nothing but a cross-crate comparison or a published vector catches it.
-    #[test]
-    fn the_prime_is_fnvs_own() {
-        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
-    }
-
-    /// One unrelated say row used to call `StateDir::set_topics` (and fsync)
+    /// One unrelated say row must not call `StateDir::set_topics` (and fsync)
     /// once for EVERY topic subscriber. The returned set is exactly the set
     /// `advance_frontier` persists; check the real files as well as that set.
     #[test]
@@ -7190,18 +7162,10 @@ mod tests {
     /// one-node case, at unit level.**
     ///
     /// Two bridges CAN share a state dir and therefore a node id; `fabric.rs`
-    /// records the measured 2026-09-14 case where one did. The pair is
+    /// records a measured case where one did. The pair is
     /// pathological but it is reachable, and the sweep publishes `state=exited`
     /// over somebody's presence row, so the guard is the difference between
     /// retiring a ghost and taking a live agent off the fleet roster.
-    ///
-    /// ROUND 21'S GUARD GOT THIS BACKWARDS and the shape of the mistake is worth
-    /// keeping: it skipped `inc > self.inc`, which reads as "do not touch a
-    /// sibling" and in fact means "do not touch a FUTURE incarnation" — one that
-    /// cannot exist while this process is the one sweeping. Because `self.inc`
-    /// is `max(local, bus) + 1`, the bridge that attaches SECOND always
-    /// outranks the first, so every row the older LIVE sibling had published was
-    /// below the guard and was retired after five minutes.
     ///
     /// Driven through [`adoptable`] rather than through two real bridges: what
     /// is being asserted is the predicate, and a second broker, a second aterm
@@ -7237,23 +7201,11 @@ mod tests {
 
     /// **EVERY PER-SID MAP ON `Bridge` IS RECONCILED WITH THE LIVE ROSTER.**
     ///
-    /// aterm ships no evidence manifest, so a bound that is not enforced
-    /// somewhere is a bound that lasts until the next author. `refresh_sessions`
-    /// prunes the maps a departed session leaves behind, and the first version
-    /// of that fix covered THREE of the six — `local`, `attention` and
-    /// `screen_gen` were declared in the same struct, written on the same
-    /// round, keyed by the same sids and reconciled by nothing, so the bridge's
-    /// resident footprint grew with every tab ever opened for the life of the
-    /// instance.
-    ///
-    /// This reads the STRUCT rather than a list, so the next map is covered the
-    /// day it is added — which is the shape of the mistake, not the instance of
-    /// it. Round 21 proved both halves in one round: it ADDED `ghosts` and this
-    /// test caught it on the first run (it is the exception that proves the
-    /// rule, named in the loop with the reason its entries must outlive their
-    /// session), and it REMOVED three — `holders` and `pending` with the drive
-    /// face, `screen_gen` with the screen face — which is why the closing
-    /// assertion no longer counts them.
+    /// `refresh_sessions` prunes the maps a departed session leaves behind;
+    /// an unpruned one grows with every tab ever opened for the life of the
+    /// instance. This reads the STRUCT rather than a list, so the next map is
+    /// covered the day it is added (`ghosts` is the named exception, whose
+    /// entries must outlive their session).
     #[test]
     fn every_per_sid_map_is_pruned_to_the_roster() {
         let src = include_str!("bridge.rs");
@@ -7297,16 +7249,10 @@ mod tests {
         }
         // THE SCAN ITSELF STILL WORKS — asserted by NAME, not by a count.
         //
-        // This line used to be `checked >= 6`, then `>= 4` after round 21's
-        // drive-face cut took `holders` and `pending`, and it would have gone
-        // to `>= 3` an hour later when the `--screen` cut took `screen_gen`. A
-        // number that has to be edited by every cut is not a guard, it is a
-        // chore that eventually gets edited without being thought about. What
-        // the floor was ever FOR is catching a loop that silently stopped
-        // matching the struct — a field reformatted onto two lines, a type
-        // alias, a rename — and `epochs` answers that: it is the sid set this
-        // node hosts, the one map here that cannot go without the bridge losing
-        // its roster.
+        // A count would need editing on every cut. What this catches is a loop
+        // that silently stopped matching the struct — a field reformatted onto
+        // two lines, a type alias, a rename — and `epochs` is the one map here
+        // that cannot go without the bridge losing its roster.
         assert!(
             checked.contains(&"epochs"),
             "the field scan matched no `epochs` — this loop has stopped reading \
@@ -7320,31 +7266,6 @@ mod tests {
                 "`{set}` is keyed by a sid and nothing reconciles it with the roster"
             );
         }
-    }
-
-    /// **AN IDLE TIMEOUT ISSUES NO CONTROL ROUND TRIP.** The old idle arm
-    /// drained the outbox every 250 ms even when nothing was queued; the pushed
-    /// `post` event and the roster backstop now own outbox discovery
-    /// (`tests/r1_bridge_backstop.rs` drives the backstop on the real bridge),
-    /// so the arm a quiet bridge wakes into must stay empty of control traffic.
-    #[test]
-    fn an_idle_timeout_issues_no_control_round_trip() {
-        let src = include_str!("bridge.rs");
-        let timeout_arm = src
-            .split_once("match self.mailbox.take(wait) {")
-            .expect("the bridge parks until its next real duty")
-            .1
-            .split_once("None => {")
-            .expect("an idle timeout has an explicit arm")
-            .1
-            .split_once("\n                }")
-            .expect("the idle timeout arm ends")
-            .0;
-        assert!(
-            !timeout_arm.contains("drain_outbox") && !timeout_arm.contains("ctl_request"),
-            "an idle timeout must not issue a control round trip; a pushed `post` \
-             and the roster backstop own outbox discovery"
-        );
     }
 
     /// **`host=` HAS A WRITER ON THE PLATFORM THIS SHIPS ON.**
@@ -7522,8 +7443,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch");
         let path = dir.join("caps");
         let (a, b) = ("0a".repeat(32), "ff".repeat(32));
-        // A `#` comment line, as `asb` writes and reads them, is skipped — the
-        // bridge used to refuse the whole ring over it.
+        // A `#` comment line, as `asb` writes and reads them, is skipped.
         std::fs::write(
             &path,
             format!("# this node's ring\nro:/f/F/pub a/> {a}\n\nrw,p=n-1:/f/F/in/> {b}\n"),
@@ -7544,10 +7464,7 @@ mod tests {
     /// A LOST VERB LANE BECOMES THE LOOP'S EXIT, and a refused line does not.
     ///
     /// `Item::Closed(Source::Aterm)` is the only thing that makes `Bridge::run`
-    /// return, and it used to be produced by the PUSH reader alone. A verb lane
-    /// that died on its own left the child alive — draining and committing into
-    /// a dead socket while `child.wait()` blocked forever and aterm's
-    /// fail-closed guard held every session the bridge governed. The two halves
+    /// return, and the push reader cannot see the verb lane die. The two halves
     /// of the distinction are pinned together here because getting either one
     /// wrong is a fleet outage: a loss that produced no notice is the permanent
     /// halt, and a REFUSAL that produced one would exit the bridge over a single
@@ -7647,14 +7564,11 @@ mod tests {
     /// EVERY VARIABLE-LENGTH FIELD ON THE `deliver` LINE IS BOUNDED, and the one
     /// that was not is the one a stranger fills in.
     ///
-    /// Round 1 put the request-line bound in one place and sized the BODY budget
-    /// from it. `via=` sits on the same line, is copied verbatim off a record
-    /// whose head runs to the broker's 16 MiB ceiling, and was checked by nothing
-    /// on this side — so the prefix alone went past the bound, the body budget
-    /// saturated to zero, and the finished line was still unsendable. The
-    /// arithmetic is pinned here beside the grammar, because the two together are
-    /// the property: a chain this predicate accepts cannot make the line
-    /// unsendable, whatever else it carries.
+    /// `via=` sits on the same line as the body, is copied verbatim off a record
+    /// whose head runs to the broker's 16 MiB ceiling, and the BODY budget is
+    /// sized from what is left. The arithmetic is pinned here beside the
+    /// grammar, because the two together are the property: a chain this
+    /// predicate accepts cannot make the line unsendable.
     #[test]
     fn a_via_chain_is_bounded_by_grammar_and_by_length() {
         assert!(via_ok("h-andrew"));
@@ -7796,12 +7710,17 @@ mod tests {
     /// builds the bridge through `Bridge::new` (this half answers its `outbox`
     /// probe), spawns a `cat` that lives until this half lets it go, and exits.
     /// Both near ends must then read EOF at once, with the `cat` provably still
-    /// alive (the product fd-hygiene sweep of 2026-09-27).
+    /// alive.
     #[test]
     fn a_child_the_bridge_spawns_inherits_neither_aterm_lane() {
         use std::io::{BufRead, Read, Write};
         use std::os::unix::net::UnixStream;
         const CHILD: &str = "ATERM_LINK_TEST_INHERITED_BRIDGE";
+        /// How long a read that MUST end may take — the probe, the EOFs once
+        /// the bridge half is gone — before it is read as a hang (AGENTS.md: a
+        /// hang detector is a minute, never a latency budget). A lane leaked to
+        /// the `cat` never ends: it fails at this bound.
+        const HANG_DETECTOR: Duration = Duration::from_secs(60);
         if let Some(state_dir) = std::env::var_os(CHILD) {
             // THE BRIDGE HALF, on the inherited numbers.
             let _bridge = Bridge::new(Config {
@@ -7829,47 +7748,45 @@ mod tests {
         let state_dir = std::env::temp_dir().join(format!(
             "al-inherit-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
+            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
         ));
+        use aterm_uds::spawnfd::{ChildStdio, LaneCommand};
         let (near_verb, far_verb) = UnixStream::pair().expect("socketpair");
         let (near_push, far_push) = UnixStream::pair().expect("socketpair");
-        let mut cmd = std::process::Command::new(std::env::current_exe().expect("this binary"));
+        // The bridge half's stdin (and so `cat`'s): a socket whose other end
+        // this half holds.
+        let (mut hold_cat, cat_stdin) = UnixStream::pair().expect("socketpair");
+        let mut cmd = LaneCommand::new(std::env::current_exe().expect("this binary"));
         cmd.args([
             "--exact",
             "bridge::tests::a_child_the_bridge_spawns_inherits_neither_aterm_lane",
             "--test-threads",
             "1",
         ])
-        .env(CHILD, &state_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null());
+        .env_exactly(
+            std::env::vars_os()
+                .filter(|(k, _)| k != CHILD)
+                .chain([(CHILD.into(), state_dir.clone().into_os_string())]),
+        )
+        .stdin(ChildStdio::Fd(cat_stdin.into()))
+        .stdout(ChildStdio::Null);
         let mut child = aterm_uds::spawnfd::spawn_with_two_fds(
             cmd,
             std::os::fd::OwnedFd::from(far_verb),
             std::os::fd::OwnedFd::from(far_push),
         )
         .expect("spawn the bridge half");
-        let mut hold_cat = child.stdin.take().expect("a piped stdin");
 
         // The one request `Bridge::new` makes of its verb lane. Every read
         // bound is set while its socket is still connected: Darwin refuses
         // `SO_RCVTIMEO` (EINVAL) on one whose peer is gone, and the bridge half
         // cannot finish (and exit) before the reply below.
-        near_push
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        near_verb
-            .set_read_timeout(Some(Duration::from_secs(60)))
-            .unwrap();
+        near_push.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
+        near_verb.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
         let mut verb = std::io::BufReader::new(near_verb.try_clone().unwrap());
         let mut line = String::new();
         verb.read_line(&mut line).expect("the outbox probe");
         assert_eq!(line, "outbox\n", "the bridge half never reached its probe");
-        near_verb
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
         (&near_verb).write_all(b"OK 0\n").unwrap();
         let status = child.wait().expect("reap the bridge half");
         assert!(status.success(), "the bridge half failed: {status:?}");
@@ -8065,7 +7982,7 @@ mod tests {
     /// recording every `topic ls` it is asked. Either answer can be made an `ERR`
     /// ([`FakeVerbLane::refuse_roster`], [`FakeVerbLane::refuse_reads`]).
     struct FakeVerbLane {
-        dir: std::path::PathBuf,
+        dir: aterm_tempfile::TempDir,
         sessions: Arc<std::sync::Mutex<Vec<(u64, String)>>>,
         topics: Arc<std::sync::Mutex<BTreeMap<String, Vec<String>>>>,
         reads: Arc<std::sync::Mutex<Vec<String>>>,
@@ -8083,15 +8000,16 @@ mod tests {
         /// its head.
         fn bridge(sessions: &[(u64, &str)]) -> (Self, Bridge) {
             use std::io::{BufRead, BufReader, Write};
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!("al-v{}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("the fixture dir");
-            let sock = dir.join("v.sock");
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("al-v")
+                .tempdir()
+                .expect("the fixture dir");
+            let sock = dir.path().join("v.sock");
+            let broker = dir.path().join("no-broker").to_string_lossy().into_owned();
+            let state_dir = dir.path().join("state").to_string_lossy().into_owned();
             let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the lane");
             let lane = FakeVerbLane {
-                dir: dir.clone(),
+                dir,
                 sessions: Arc::new(std::sync::Mutex::new(
                     sessions.iter().map(|(l, s)| (*l, s.to_string())).collect(),
                 )),
@@ -8185,10 +8103,10 @@ mod tests {
             });
             let bridge = Bridge::new(Config {
                 fleet: "f".to_string(),
-                broker: dir.join("no-broker").to_string_lossy().into_owned(),
+                broker,
                 transport: Transport::Unix,
                 cap_files: Vec::new(),
-                state_dir: dir.join("state").to_string_lossy().into_owned(),
+                state_dir,
                 accept_from: Vec::new(),
                 sock: Some(sock.to_string_lossy().into_owned()),
                 token: Some("t".to_string()),
@@ -8243,12 +8161,6 @@ mod tests {
         }
     }
 
-    impl Drop for FakeVerbLane {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
     #[test]
     fn a_broadcast_with_no_topics_advances_the_head_without_decoding_its_body() {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
@@ -8271,10 +8183,275 @@ mod tests {
             "s-a".to_string(),
             BTreeMap::from([("quiet".to_string(), TopicCursor { next: 6 })]),
         );
-        bridge.on_say_record(&(6, subject, Body::new(0).encode(None)));
+        bridge.on_say_record(&(6, subject, Body::new(0).encode()));
         assert_eq!(crate::body::decode_calls(), decoded + 1);
         assert_eq!(lane.delivery_offsets(), [6]);
         assert_eq!(bridge.topics["s-a"]["quiet"].next, 7);
+    }
+
+    /// **A NODE SPEAKS FOR ITS OWN SESSIONS, AND A STRAY REPLY IS NO REPLY.**
+    /// Another node's ring lets it publish onto every lane, as itself: its claim
+    /// to speak for a session THIS node hosts, or one pinned to a third node, is
+    /// attributed to the node, and its `answer`/`report` naming an ask that went
+    /// elsewhere arrives demoted, like a stray `ack` — so neither a supervisor's
+    /// report fold nor `drive task --wait` can take it for the worker's word.
+    /// Another node's `expired` is demoted too: only the asker's own bridge
+    /// records one. The recipient's own reply, and a node's claim to its own
+    /// session, are unchanged.
+    #[test]
+    fn a_remote_node_cannot_speak_for_a_local_session_or_answer_anothers_ask() {
+        let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-mgr")]);
+        bridge.epochs.insert("s-w".to_string(), "e".to_string());
+        let local = bridge.node.clone();
+        let addr = |src: &str, kind: &str| subject::InAddr {
+            node: local.clone(),
+            sid: "s-mgr".to_string(),
+            src: src.to_string(),
+            kind: kind.to_string(),
+        };
+        let mut body = Body::new(0);
+        body.from = Some("s-w".to_string());
+        assert_eq!(
+            bridge.render_from(&addr(&local, "report"), &body),
+            format!("s-w@{local}")
+        );
+        assert_eq!(
+            bridge.render_from(&addr("n-evil", "report"), &body),
+            "n-evil"
+        );
+        body.from = Some("s-far".to_string());
+        assert_eq!(
+            bridge.render_from(&addr("n-far", "report"), &body),
+            "s-far@n-far"
+        );
+        // A sid pinned to its node (a bare `@s-far` post wrote the pin) is that
+        // node's alone.
+        bridge.state.pin("s-far", "n-far").expect("pin");
+        assert_eq!(
+            bridge.render_from(&addr("n-far", "report"), &body),
+            "s-far@n-far"
+        );
+        assert_eq!(
+            bridge.render_from(&addr("n-evil", "report"), &body),
+            "n-evil"
+        );
+
+        bridge.asked.insert(91, local.clone());
+        let mut reply = Body::new(0);
+        reply.re = Some(91);
+        for kind in ["answer", "report", "ack"] {
+            assert_eq!(
+                bridge.classify_delivery(&addr("n-evil", kind), &reply),
+                ("note".to_string(), Some(kind.to_string()), true),
+                "a stray {kind}"
+            );
+            assert_eq!(
+                bridge.classify_delivery(&addr(&local, kind), &reply),
+                (kind.to_string(), None, false),
+                "the recipient's {kind}"
+            );
+        }
+        // An `expired` is the asker's own bridge's word, and stray from
+        // anyone else.
+        assert_eq!(
+            bridge.classify_delivery(&addr("n-evil", "expired"), &reply),
+            ("note".to_string(), Some("expired".to_string()), true),
+            "a third node's expired"
+        );
+        assert_eq!(
+            bridge.classify_delivery(&addr(&local, "expired"), &reply),
+            ("expired".to_string(), None, false),
+            "this node's own expired"
+        );
+    }
+
+    /// **A STRANGER'S MAIL SPENDS A BOUNDED SHARE OF THIS NODE'S BUDGET.** The
+    /// broker never gives a producer's distinct subjects back (the module
+    /// header), so a segment the sender chose must not become a new subject
+    /// per record. A refusal for a sid this node does not host goes on the
+    /// node face, naming the sid. A lane another node names by `from=` is
+    /// opened for a verdict or a receipt alike only within
+    /// [`NEW_LANES_PER_NODE`] for that node, and past it the answer is
+    /// recorded unsent, naming the cap; a lane the bus already holds, another
+    /// node's first contact and any number of lanes on this node stay
+    /// answerable.
+    #[cfg(unix)]
+    #[test]
+    fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
+        const SID: &str = "s-host";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let (conn, _) = bridge.connect().unwrap();
+        bridge.conn = Some(conn);
+        assert!(bridge.refresh_sessions().is_ok());
+        let node = bridge.node.clone();
+
+        for (off, ghost) in [(10, "s-ghost1"), (11, "s-ghost2")] {
+            let subject = format!("/f/f/in/{node}/{ghost}/n-evil/note");
+            let outcome = bridge.deliver_record(off, &subject, b"v=1 t=1 text=x");
+            assert_eq!(outcome, Delivery::Accounted);
+        }
+        // A local session once wrote to `s-known` on that node.
+        let known = format!("/f/f/in/n-evil/s-known/{node}");
+        bridge
+            .publish(&format!("{known}/note"), b"v=1 t=1 text=hi")
+            .unwrap();
+        let refuse = |bridge: &mut Bridge, off: u64, from: &str| {
+            let subject = format!("/f/f/in/{node}/{SID}/n-evil/note");
+            let raw = format!("v=1 t=1 from={from} via=NOT-A-PRINCIPAL text=x");
+            let outcome = bridge.deliver_record(off, &subject, raw.as_bytes());
+            assert_eq!(outcome, Delivery::Accounted);
+        };
+        // A first contact is answered: the ordinary case. Then the rest of
+        // that node's new lanes are spent.
+        refuse(&mut bridge, 20, "s-first");
+        for i in 1..NEW_LANES_PER_NODE {
+            let fill = format!("/f/f/in/n-evil/s-fill{i}/{node}");
+            assert!(bridge.may_answer_on("n-evil", &fill).unwrap(), "{fill}");
+        }
+        refuse(&mut bridge, 21, "s-x");
+        refuse(&mut bridge, 22, "s-known");
+        for (rid, from) in [(1, "s-y@n-evil"), (2, "s-first@n-evil"), (3, "s-z@n-other")] {
+            let owed = OwedReceipt {
+                sid: SID.to_string(),
+                rid,
+                off: 30 + rid,
+                verdict: "handled".to_string(),
+                kind: "ask".to_string(),
+                from: from.to_string(),
+            };
+            bridge.send_receipt(&owed).unwrap();
+        }
+        // A lane on this node is free however many there are: only this
+        // node's own cap names one, so its sid is our own word.
+        for i in 0..=NEW_LANES_PER_NODE {
+            let mine = format!("/f/f/in/{node}/s-local{i}/{node}");
+            assert!(bridge.may_answer_on(&node, &mine).unwrap(), "{mine}");
+        }
+        // And a local sender's record asks no roster: one that has left is
+        // still answered on its own lane.
+        let local = format!("/f/f/in/{node}/{SID}/{node}/note");
+        let raw = b"v=1 t=1 from=s-gone via=NOT-A-PRINCIPAL text=x";
+        let off = bridge.publish_own_off(&local, raw).unwrap();
+        assert_eq!(bridge.deliver_record(off, &local, raw), Delivery::Accounted);
+
+        let (mut reader, _) = bridge.connect().unwrap();
+        let (rows, _) = reader.last_all("/f/f/>").unwrap();
+        let subjects: Vec<&str> = rows.iter().map(|(_, s, _)| s.as_str()).collect();
+        assert!(
+            !subjects.iter().any(|s| s.contains("s-ghost")),
+            "a sid this node does not host became a subject: {subjects:#?}"
+        );
+        let lanes_on = |peer: &str| -> BTreeSet<&str> {
+            let prefix = format!("/f/f/in/{peer}/");
+            subjects
+                .iter()
+                .copied()
+                .filter(|s| s.starts_with(&prefix))
+                .collect()
+        };
+        let first = format!("/f/f/in/n-evil/s-first/{node}");
+        assert_eq!(
+            lanes_on("n-evil"),
+            BTreeSet::from([
+                format!("{first}/undeliverable").as_str(),
+                format!("{first}/ack").as_str(),
+                format!("{known}/note").as_str(),
+                format!("{known}/undeliverable").as_str(),
+            ]),
+            "the first contact and the held lane, and no lane past the bound"
+        );
+        assert_eq!(
+            lanes_on("n-other"),
+            BTreeSet::from([format!("/f/f/in/n-other/s-z/{node}/ack").as_str()]),
+            "another node's first contact draws on its own allowance"
+        );
+        let gone = format!("/f/f/in/{node}/s-gone/{node}/undeliverable");
+        assert!(subjects.contains(&gone.as_str()), "{subjects:#?}");
+
+        let ev_of = |face: &str, reader: &mut Conn| -> Vec<String> {
+            let (rows, _) = reader.fetch(0, face, 256).unwrap();
+            rows.iter()
+                .filter(|(_, s, _)| s == face)
+                .filter_map(|(_, _, raw)| {
+                    let ev = Body::decode(raw).0.unknown.get("ev")?.clone();
+                    Some(crate::pct::decode(&ev))
+                })
+                .collect()
+        };
+        let node_ev = ev_of(&subject::node_face("f", &node, "ev"), &mut reader);
+        for (off, ghost) in [(10, "s-ghost1"), (11, "s-ghost2")] {
+            let want = format!("undeliverable off={off} reason=not-hosted sid={ghost}");
+            assert!(node_ev.contains(&want), "{want} in {node_ev:#?}");
+        }
+        let host_ev = ev_of(&subject::session_face("f", &node, SID, "ev"), &mut reader);
+        for want in [
+            "unnotified off=21 src=n-evil reason=lane-cap",
+            "unacked re=31 verdict=handled reason=lane-cap",
+        ] {
+            assert!(
+                host_ev.iter().any(|e| e == want),
+                "past the bound the answer is recorded unsent: {want} in {host_ev:#?}"
+            );
+        }
+    }
+
+    /// **A READ THAT CANNOT SAY WHETHER A LANE IS HELD ANSWERS NOTHING AND
+    /// RETIRES NOTHING.** A receipt whose sender's lane could not be read stays
+    /// owed for the next drain (retired as having no lane, it was lost for
+    /// good), and a verdict goes on no lane the read could not clear. Closing
+    /// the real broker connection before the read is the failure seam.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_lane_read_keeps_the_receipt_owed_and_sends_no_verdict() {
+        const SID: &str = "s-host";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let owed = OwedReceipt {
+            sid: SID.to_string(),
+            rid: 1,
+            off: 31,
+            verdict: "handled".to_string(),
+            kind: "ask".to_string(),
+            from: "s-y@n-evil".to_string(),
+        };
+        let addr = subject::InAddr {
+            node: bridge.node.clone(),
+            sid: SID.to_string(),
+            src: "n-evil".to_string(),
+            kind: "note".to_string(),
+        };
+        let mut body = Body::new(0);
+        body.from = Some("s-y".to_string());
+
+        let (conn, closer) = bridge.connect().unwrap();
+        bridge.conn = Some(conn);
+        closer.close();
+        assert!(
+            bridge.send_receipt(&owed).is_err(),
+            "the receipt stays owed"
+        );
+        assert!(bridge.conn.is_none(), "a failed read discards the socket");
+        let (conn, closer) = bridge.connect().unwrap();
+        bridge.conn = Some(conn);
+        closer.close();
+        assert_eq!(
+            bridge.sender_lane(&addr, &body),
+            Err(NoLane::Undrained),
+            "no verdict, and no claim that the cap refused it"
+        );
+
+        // The next drain sends it.
+        let (conn, _) = bridge.connect().unwrap();
+        bridge.conn = Some(conn);
+        bridge.send_receipt(&owed).unwrap();
+        assert_eq!(lane.delivery_offsets().len(), 1, "retired with its offset");
     }
 
     /// Tier-1 for `FabricRefillRetry`: the group's durable cursor has already
@@ -8288,8 +8465,8 @@ mod tests {
     fn failed_refill_retries_old_mail_before_live_group_delivery() {
         const SID: &str = "s-refill";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
-        let socket = lane.dir.join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.join("broker.log")).unwrap();
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
 
@@ -8370,8 +8547,8 @@ mod tests {
     fn failed_live_admission_keeps_new_group_mail_behind_old_refill() {
         const SID: &str = "s-live-refill";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
-        let socket = lane.dir.join("broker.sock");
-        let broker = astream_broker::Broker::open(lane.dir.join("broker.log")).unwrap();
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
         let _server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
 
@@ -8770,9 +8947,9 @@ mod tests {
     /// read, the ack's; the retry it proves happens on the round path. This
     /// refuses the ack's read AND the next round's, so the round's read path —
     /// the one the attach, a GAP and a `session-created` share — is the one that
-    /// must not record a refusal as done. Found by the round-3 review: with that
-    /// path recording a refused read, every other test here still passed, and a
-    /// watched session whose reads were refused twice was never read again.
+    /// must not record a refusal as done: otherwise a watched session whose
+    /// reads were refused twice is never read again, and every other test here
+    /// still passes.
     #[test]
     fn a_refused_round_read_stays_owed_like_a_refused_ack_read() {
         const T: &str = "s-t";

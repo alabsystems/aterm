@@ -110,7 +110,7 @@ pub const NEVER_SET_PREFIXES: &[&str] = &["LD_", "DYLD_"];
 
 /// The variables that mean "self-update off" to the vendor tools atpkg manages —
 /// Claude Code reads both. An env naming one earns the "own updater is off here"
-/// fix-line; any other env is spelled as `runs with …`.
+/// fix-line; any other env is spelled as `runs with …` (`; also runs with …` beside one).
 pub const SELF_UPDATE_SWITCHES: &[&str] = &["DISABLE_AUTOUPDATER", "DISABLE_UPDATES"];
 
 /// The sidecar file name suffix: `store/<program>/<build>.shim-env`.
@@ -189,6 +189,7 @@ impl ShimEnv {
     /// to a person (`which`, `doctor`). An entry naming one of [`SELF_UPDATE_SWITCHES`]:
     /// `Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)` for a vendor-direct
     /// program, `its own updater is off here (…)` for any other; else `runs with
+    /// NAME=VALUE`; any other variable beside a switch follows it, `; also runs with
     /// NAME=VALUE`. `None` for an empty env. It states the env and nothing about the
     /// version: the row beside it says whether that is the vendor's latest, a hold or a
     /// rollback. NEVER part of the canonical state string — `status.toml` and the Packages
@@ -198,25 +199,32 @@ impl ShimEnv {
         if self.0.is_empty() {
             return None;
         }
-        let self_update = self
+        let spell = |entries: &[&(String, String)]| {
+            entries
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // The switches that turn the updater off are the parenthesis; any other variable
+        // the shim exports is said after it, not labelled an updater setting.
+        let (updater, other): (Vec<_>, Vec<_>) = self
             .0
             .iter()
-            .any(|(n, _)| SELF_UPDATE_SWITCHES.contains(&n.as_str()));
-        if !self_update {
-            let mut s = String::from("runs with ");
-            s.push_str(&self.spelled());
-            return Some(s);
+            .partition(|(n, _)| SELF_UPDATE_SWITCHES.contains(&n.as_str()));
+        if updater.is_empty() {
+            return Some(format!("runs with {}", self.spelled()));
         }
         let mut s = match crate::vendor_direct::spec(program) {
-            Some(spec) => {
-                let mut s = String::from(spec.product);
-                s.push_str("'s own updater is off here (");
-                s
-            }
+            Some(spec) => format!("{}'s own updater is off here (", spec.product),
             None => String::from("its own updater is off here ("),
         };
-        s.push_str(&self.spelled());
+        s.push_str(&spell(&updater));
         s.push(')');
+        if !other.is_empty() {
+            s.push_str("; also runs with ");
+            s.push_str(&spell(&other));
+        }
         Some(s)
     }
 
@@ -470,7 +478,7 @@ mod tests {
                 .unwrap()
                 .fix_line("tool")
                 .as_deref(),
-            Some("its own updater is off here (DISABLE_UPDATES=1, FOO=bar)")
+            Some("its own updater is off here (DISABLE_UPDATES=1); also runs with FOO=bar")
         );
         assert_eq!(
             ShimEnv::admit(&raw(&["FOO=bar"]))
@@ -486,8 +494,7 @@ mod tests {
     /// the rule reads as NONE (fail-closed), and `remove_sidecar` takes it away.
     #[test]
     fn the_sidecar_round_trips_and_fails_closed() {
-        let root = std::env::temp_dir().join(format!("atpkg-shim-env-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testdir::dir("atpkg-shim-env-");
         let build_dir = root.join("store").join("claude").join("2026082701");
         std::fs::create_dir_all(&build_dir).unwrap();
         let env = ShimEnv::admit(&raw(&["DISABLE_AUTOUPDATER=1", "B=2"])).unwrap();

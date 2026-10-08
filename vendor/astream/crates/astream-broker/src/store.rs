@@ -612,8 +612,8 @@ pub(crate) fn subject_bound_msg(producer_id: u64) -> String {
 /// advisory locks is tolerated (the lock is a guard, not the durability mechanism).
 /// The OS releases the lock when the process dies, so a crashed broker never leaves a
 /// stale lock behind (unlike a lock FILE would).
-// `File::try_lock` / `unlock` are std-stable since 1.89; the toolchain is pinned at
-// 1.95 by rust-toolchain.toml, only the workspace's declared `rust-version` (1.85) lags.
+// `File::try_lock` / `unlock` are std-stable since 1.89, the workspace's declared
+// `rust-version`; the toolchain itself is Trust (rust-toolchain.toml).
 fn lock_exclusive(file: &File, path: &Path) -> io::Result<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),

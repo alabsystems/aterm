@@ -141,7 +141,7 @@ pub(crate) fn notification() -> (String, String) {
         // NOT "will never": `clear()` drops the stranded latch on the first readable
         // check, so the honest claim is the one the body makes — this Mac stays put
         // UNTIL the cause is fixed.
-        "aterm is not updating on this machine".to_string(),
+        crate::STRANDED_TITLE.to_string(),
         body,
     )
 }

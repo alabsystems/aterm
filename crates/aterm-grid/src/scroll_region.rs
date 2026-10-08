@@ -30,10 +30,8 @@ impl ScrollRegion {
     }
 }
 
-/// Horizontal margin bounds for DECSLRM (left and right, inclusive, 0-indexed).
-///
-/// VT420+: Left/right margins restrict cursor movement and line operations
-/// within the margin boundaries. Only active when DECLRMM (mode 69) is enabled.
+/// DECSLRM horizontal margins (left and right, inclusive, 0-indexed). They bound
+/// cursor movement and line operations only while DECLRMM (mode 69) is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HorizontalMargins {
     /// Left column margin (inclusive, 0-indexed).

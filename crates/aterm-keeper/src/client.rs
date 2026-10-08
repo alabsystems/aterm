@@ -9,9 +9,14 @@
 //! The client checks the KEEPER too before it sends a single master (§5.7):
 //! the same uid, and under [`IdentityPolicy::Designated`] the same code — a
 //! same-uid process that bound the socket first would otherwise receive a
-//! live duplicate of every terminal.
+//! live duplicate of every terminal. Code alone is not enough: every signed
+//! build meets the Developer ID requirement, and a genuine keeper started
+//! under `--identity uid` (or an older one, which states no policy) offers a
+//! crashed window's masters to any same-uid process. So a window that checks
+//! code also reads the policy the keeper states in its WELCOME, and registers
+//! nothing with a keeper that does not require code too.
 //!
-//! The window drives it through `aterm-gui`'s `keeper_link` (P3, opt-in): the
+//! The window drives it through `aterm-gui`'s `keeper_link` (opt-in): the
 //! boot HELLO on a [`KeeperClient`], then a [`KeeperLink`] started on that same
 //! connection.
 //!
@@ -26,7 +31,7 @@ use std::time::Duration;
 use aterm_uds::CtlStream;
 
 use crate::frameio::{Incoming, read_frame, write_frame};
-use crate::identity::{CheckError, Identity};
+use crate::identity::{CheckError, Identity, IdentityPolicy};
 use crate::wire::{CAP_LINK, CAP_SENDS_BYE, Frame, MarkerRef, MasterHeader, PROTO, PeerClass};
 
 /// One OFFER as the window receives it: the master, its fixed header, and the
@@ -39,9 +44,10 @@ pub struct Offered {
     pub meta: Vec<u8>,
 }
 
-/// A keeper that answered but failed this build's identity check (§5.7): the
-/// payload of the `PermissionDenied` error [`KeeperClient::connect`] returns,
-/// so a caller can tell it from a socket it may not open
+/// A keeper that answered but failed this build's identity check (§5.7), or
+/// whose WELCOME states a weaker policy than the window's own: the payload of
+/// the `PermissionDenied` error [`KeeperClient::connect`] and the HELLOs
+/// return, so a caller can tell it from a socket it may not open
 /// ([`refused_identity`]).
 #[derive(Debug)]
 pub struct NotThisBuild(pub String);
@@ -69,7 +75,7 @@ fn check_failed(e: CheckError) -> io::Error {
         CheckError::Refused(why) => {
             io::Error::new(io::ErrorKind::PermissionDenied, NotThisBuild(why))
         }
-        CheckError::Unchecked(why) => io::Error::other(why),
+        CheckError::Unchecked(why) | CheckError::Unanswered(why) => io::Error::other(why),
     }
 }
 
@@ -77,20 +83,53 @@ fn check_failed(e: CheckError) -> io::Error {
 #[derive(Debug)]
 pub struct KeeperClient {
     stream: CtlStream,
+    /// The policy this client checked the keeper under, which the keeper's
+    /// own must be no weaker than ([`KeeperClient::served`]).
+    policy: IdentityPolicy,
 }
 
 impl KeeperClient {
-    /// Dial `path`, check the keeper's identity, and set a read timeout.
+    /// Dial `path`, check the keeper's identity (within `timeout`: the check
+    /// waits on macOS's trustd), and set a read timeout.
     ///
     /// # Errors
     /// The dial failing, the keeper failing the identity check (a
-    /// [`NotThisBuild`] inside `PermissionDenied`), or the check not running.
+    /// [`NotThisBuild`] inside `PermissionDenied`), or the check not running
+    /// (trustd not answering within `timeout` among the reasons).
     pub fn connect(path: &Path, identity: &Identity, timeout: Duration) -> io::Result<Self> {
         let stream = CtlStream::connect(path)?;
-        identity.check(&stream).map_err(check_failed)?;
+        identity.check(&stream, timeout).map_err(check_failed)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            policy: identity.policy(),
+        })
+    }
+
+    /// Whether a keeper whose WELCOME stated `served` may be handed this
+    /// window's masters: under [`IdentityPolicy::Designated`], only one that
+    /// states it requires the same of its own peers (§5.7). A keeper at the
+    /// same-uid floor, or one too old to say, is refused like a keeper of
+    /// another build (a [`NotThisBuild`]): its code passed, and it would
+    /// still offer an orphaned master to any same-uid process.
+    fn served(&self, served: Option<IdentityPolicy>) -> io::Result<()> {
+        match (self.policy, served) {
+            (IdentityPolicy::SameUid, _) | (_, Some(IdentityPolicy::Designated)) => Ok(()),
+            (IdentityPolicy::Designated, other) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                NotThisBuild(match other {
+                    Some(IdentityPolicy::SameUid) => {
+                        "the keeper admits any same-uid peer (--identity uid), not only this \
+                         build's code"
+                            .to_string()
+                    }
+                    _ => "the keeper does not say it admits only this build's code (an older \
+                          keeper)"
+                        .to_string(),
+                }),
+            )),
+        }
     }
 
     /// Send a frame (with its descriptor, for REGISTER).
@@ -139,7 +178,12 @@ impl KeeperClient {
             None,
         )?;
         let n = match self.recv()?.map(|i| i.frame) {
-            Some(Frame::Welcome { offers, .. }) => offers,
+            Some(Frame::Welcome {
+                offers, identity, ..
+            }) => {
+                self.served(identity)?;
+                offers
+            }
             other => return Err(protocol(format!("expected WELCOME, got {other:?}"))),
         };
         let mut offers = Vec::with_capacity(usize::from(n));
@@ -177,7 +221,11 @@ impl KeeperClient {
             None,
         )?;
         match self.recv()?.map(|i| i.frame) {
-            Some(Frame::Welcome { offers: 0, .. }) => Ok(()),
+            Some(Frame::Welcome {
+                offers: 0,
+                identity,
+                ..
+            }) => self.served(identity),
             other => Err(protocol(format!(
                 "expected an empty WELCOME, got {other:?}"
             ))),
@@ -284,7 +332,8 @@ type Queued = (LinkOp, Option<SyncSender<bool>>);
 
 /// The window's link: a worker thread that owns the connection, reconnects
 /// after a keeper restart and re-registers every master it still holds a
-/// duplicate of (§5.3 step 9).
+/// duplicate of (§5.3 step 9), then tells the keeper every RELEASE of a
+/// registered master it could not write while the connection was down.
 #[derive(Debug)]
 pub struct KeeperLink {
     tx: SyncSender<Queued>,
@@ -372,6 +421,16 @@ impl KeeperLink {
 
 type Held = std::collections::BTreeMap<u64, (OwnedFd, MasterHeader, Vec<u8>)>;
 
+/// The registered masters whose RELEASE the link could not write, by rdev. A
+/// LIVE keeper that saw only this window's link drop still holds the records
+/// the dropped connection claimed, and the reconnect registers only what the
+/// window still holds: a RELEASE lost with the connection left a closed tab's
+/// shell in custody until the whole window ended. Told to the next connection
+/// after its registrations; a keeper that never held the master (it
+/// restarted) refuses it as NotClaimant, which the link drains. Bounded by
+/// [`LINK_QUEUE`]: a window never grows without limit on the keeper's behalf.
+type Owed = std::collections::BTreeSet<u64>;
+
 /// What one queued op sends once connected.
 enum Send {
     Register(u64),
@@ -397,6 +456,7 @@ fn link_worker(
     // restarted keeper can be told again — and the newest META of each.
     let mut held: Held = std::collections::BTreeMap::new();
     let mut metas: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
+    let mut owed: Owed = Owed::new();
     let mut client: Option<KeeperClient> = booted;
     let mut backoff = Duration::from_millis(50);
     let mut next_try = std::time::Instant::now();
@@ -410,20 +470,37 @@ fn link_worker(
             client = None;
         }
         let bye = matches!(op, Some(LinkOp::Bye));
+        // The RELEASE of a master this link registered: one that must reach a
+        // keeper even when this turn cannot write it.
+        let mut must_reach = None;
         let send = op.and_then(|op| match op {
             LinkOp::Register {
                 master,
                 header,
                 tag,
             } => {
+                // A new master at a reused device number: an owed RELEASE of
+                // the old one must not close it.
+                owed.remove(&header.rdev);
                 held.insert(header.rdev, (master, header, tag));
                 Some(Send::Register(header.rdev))
             }
-            // A master this link never registered is nothing to release.
+            // A master this link never registered may still be one the keeper
+            // OFFERED on this connection — the boot HELLO's, which this worker
+            // runs on (`start_on`) — and the keeper honours a RELEASE from the
+            // connection an offer was made to: a recovering window releases an
+            // offer it could not place (`aterm-gui`'s `keeper_link::Claim`).
+            // Dropped here, the keeper kept its copy, the shell ran on unseen,
+            // and the window's end returned it to Orphaned for the next launch.
+            // Sent only on a live connection: an offer does not survive its
+            // connection, and on any other the keeper refuses it (drained).
             LinkOp::Release { rdev } => {
                 metas.remove(&rdev);
-                held.remove(&rdev)
-                    .map(|_| Send::Frame(Frame::Release { rdev }))
+                let registered = held.remove(&rdev).is_some();
+                if registered {
+                    must_reach = Some(rdev);
+                }
+                (registered || client.is_some()).then_some(Send::Frame(Frame::Release { rdev }))
             }
             LinkOp::Meta { rdev, meta } => {
                 if !held.contains_key(&rdev) {
@@ -435,8 +512,8 @@ fn link_worker(
             LinkOp::Pending { pid } => Some(Send::Frame(Frame::Pending { pid })),
             LinkOp::Bye => Some(Send::Frame(Frame::Bye)),
         });
-        // An idle link with nothing held has nothing to tell a keeper.
-        if send.is_none() && held.is_empty() {
+        // An idle link with nothing held or owed has nothing to tell a keeper.
+        if send.is_none() && held.is_empty() && owed.is_empty() {
             if let Some(ack) = ack {
                 let _ = ack.try_send(false);
             }
@@ -445,7 +522,7 @@ fn link_worker(
         let fresh = client.is_none();
         // A caller waiting on this op does not wait out a backoff.
         if fresh && (ack.is_some() || std::time::Instant::now() >= next_try) {
-            client = reconnect(path, identity, build, marker, &held, &metas);
+            client = reconnect(path, identity, build, marker, &held, &metas, &mut owed);
             if client.is_some() {
                 backoff = Duration::from_millis(50);
             } else {
@@ -454,8 +531,10 @@ fn link_worker(
             }
         }
         let (Some(c), Some(send)) = (client.as_ref(), send) else {
-            // No keeper (the op is dropped, and what is held is told to the
-            // next keeper at the reconnect), or an idle turn.
+            // No keeper (the op is dropped, and what is held, and every owed
+            // RELEASE, is told to the next keeper at the reconnect), or an
+            // idle turn.
+            owe(&mut owed, must_reach);
             if let Some(ack) = ack {
                 let _ = ack.try_send(false);
             }
@@ -477,12 +556,23 @@ fn link_worker(
         }
         if sent.is_err() {
             client = None;
+            owe(&mut owed, must_reach);
         }
         if bye {
             // Nothing follows a quit: the window is about to `exit(0)`, and the
             // keeper reads the BYE, then this connection's end.
             return;
         }
+    }
+}
+
+/// Keep the RELEASE of `rdev`, a master this link registered, for the next
+/// connection.
+fn owe(owed: &mut Owed, rdev: Option<u64>) {
+    if let Some(rdev) = rdev
+        && owed.len() < LINK_QUEUE
+    {
+        owed.insert(rdev);
     }
 }
 
@@ -493,6 +583,7 @@ fn reconnect(
     marker: Option<&MarkerRef>,
     held: &Held,
     metas: &std::collections::BTreeMap<u64, Vec<u8>>,
+    owed: &mut Owed,
 ) -> Option<KeeperClient> {
     let c = KeeperClient::connect(path, identity, Duration::from_secs(2)).ok()?;
     // A link registers; it takes no offers (the boot HELLO does, through the
@@ -511,6 +602,12 @@ fn reconnect(
         )
         .ok()?;
     }
+    // Then every RELEASE the last connection could not carry: the keeper
+    // takes one from any link of the process whose dropped link claimed it.
+    for rdev in owed.iter() {
+        c.send(&Frame::Release { rdev: *rdev }, None).ok()?;
+    }
+    owed.clear();
     Some(c)
 }
 
@@ -521,6 +618,17 @@ mod tests {
     use crate::wire::Birth;
     use std::os::unix::fs::MetadataExt as _;
     use std::time::Instant;
+
+    /// `trustd` going silent after the one probe refuses every later check
+    /// through the process's gate: the machine's moment, never the code's.
+    const TRUSTD_SILENT: &str =
+        "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
+
+    /// Whether `why` is the identity check's words for a gate that refused it
+    /// unanswered (`identity::unanswered`).
+    fn trustd_silent(why: &str) -> bool {
+        why.starts_with("macOS's code-signing service (trustd) is not answering")
+    }
 
     fn serve(sock: &Path) -> Server {
         Server::bind(ServeConfig {
@@ -550,6 +658,9 @@ mod tests {
     #[test]
     fn a_listener_of_other_code_is_refused_as_not_this_build() {
         use std::os::unix::fs::PermissionsExt as _;
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("akl-other-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
@@ -568,7 +679,8 @@ mod tests {
         // refused, so the dial is retried until it reaches the listener.
         let started = Instant::now();
         let refused = loop {
-            match KeeperClient::connect(&sock, &own, Duration::from_secs(2)) {
+            // The check's own deadline is a hang detector too, not a budget.
+            match KeeperClient::connect(&sock, &own, Duration::from_secs(60)) {
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -584,6 +696,9 @@ mod tests {
         let _ = nc.kill();
         let _ = nc.wait();
         let e = refused.expect_err("nc is not this build's code");
+        if trustd_silent(&e.to_string()) {
+            panic!("{TRUSTD_SILENT}: {e}");
+        }
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
         assert!(refused_identity(&e), "{e}");
 
@@ -598,6 +713,82 @@ mod tests {
             .expect_err("a socket this process may not open");
         assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied, "{denied}");
         assert!(!refused_identity(&denied), "{denied}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §5.7: a window that checks code hands nothing to a keeper at the
+    /// same-uid floor, though that keeper's code passes (it is this very
+    /// build): such a keeper offers a crashed window's masters to any same-uid
+    /// process. Both HELLOs — the link's, which then registers, and the boot
+    /// one — are refused as not this build's. CONTROL: the same build serving
+    /// under its designated requirement is accepted by both.
+    #[test]
+    fn a_keeper_at_the_uid_floor_is_refused_by_a_window_that_checks_code() {
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("akl-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let own = || Identity::for_self(IdentityPolicy::Designated).expect("own");
+        for (name, keeper, accepted) in [
+            ("uid.sock", Identity::same_uid(), false),
+            ("designated.sock", own(), true),
+        ] {
+            let sock = dir.join(name);
+            let mut server = Server::bind(ServeConfig {
+                socket: sock.clone(),
+                identity: keeper,
+                relaunch: Relauncher::Unavailable,
+                version: "test".into(),
+                test_drop_custody: false,
+            })
+            .expect("bind");
+            let window = std::thread::spawn(move || {
+                let id = own();
+                // The check's deadline is a hang detector, not a budget.
+                let dial = || KeeperClient::connect(&sock, &id, Duration::from_secs(60));
+                let link = dial()?.hello_link("t", None);
+                let boot = dial()?.hello_app("t").map(|_| ());
+                Ok::<_, io::Error>((link, boot))
+            });
+            // The window's own deadlines (the check's, then each exchange's
+            // read timeout) are the hang detectors; no second timer races them.
+            while !window.is_finished() {
+                server.step(20).expect("step");
+            }
+            // Every unchecked turn-away the keeper made, kept though a later
+            // check passed: the boot dial's pass must not hide the link's.
+            let keeper_gate_silent = server
+                .test_unchecked_ever()
+                .iter()
+                .any(|why| trustd_silent(why));
+            let joined = window.join().expect("the window thread");
+            // A check of either side that `trustd` did not answer — the
+            // window's of the keeper, or the designated keeper's of the window
+            // — is COULD NOT RUN, never a verdict on the code.
+            let silent = |e: &io::Error| trustd_silent(&e.to_string()) || keeper_gate_silent;
+            if let Err(e) = &joined
+                && silent(e)
+            {
+                panic!("{TRUSTD_SILENT}: {name}: {e}");
+            }
+            let (link, boot) = joined.expect("the keeper's code is this build's");
+            for (what, got) in [("link", link), ("boot", boot)] {
+                if let Err(e) = &got
+                    && silent(e)
+                {
+                    panic!("{TRUSTD_SILENT}: {what} HELLO to {name}: {e}");
+                }
+                if accepted {
+                    got.unwrap_or_else(|e| panic!("{what} HELLO to {name}: {e}"));
+                } else {
+                    let e = got.expect_err(what);
+                    assert!(refused_identity(&e), "{what} HELLO to {name}: {e}");
+                    assert!(e.to_string().contains("--identity uid"), "{e}");
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -617,6 +808,11 @@ mod tests {
             unchecked.to_string(),
             "the kernel did not give the peer's audit token"
         );
+        let unanswered = check_failed(CheckError::Unanswered(
+            "macOS's code-signing service (trustd) is not answering".into(),
+        ));
+        assert!(!refused_identity(&unanswered), "{unanswered}");
+        assert_eq!(unanswered.kind(), io::ErrorKind::Other, "{unanswered}");
     }
 
     /// §5.3 step 9: a keeper that restarts is told again what the window
@@ -651,6 +847,61 @@ mod tests {
         });
         link.shutdown();
         drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A LIVE keeper drops this window's link (a failed write, a malformed
+    /// frame) while the window lives, and a tab closes while no reconnect can
+    /// succeed: that RELEASE must still reach the keeper once one does. The
+    /// reconnect registers only what the window still holds, so dropped here
+    /// the closed tab's record stayed claimed by the dead connection and its
+    /// shell lived on in the keeper until the whole window ended.
+    #[test]
+    fn a_release_the_link_could_not_write_is_told_to_the_next_connection() {
+        let base = std::env::temp_dir();
+        let dir = base.join(format!("akl-rel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sock = dir.join("k.sock");
+        let aside = dir.join("k.aside");
+        let mut server = serve(&sock);
+        let register = |path: &str, local_id| {
+            let master = std::fs::File::open(path).expect("open");
+            let rdev = master.metadata().expect("stat").rdev();
+            let op = LinkOp::Register {
+                master: OwnedFd::from(master),
+                header: MasterHeader {
+                    rdev,
+                    shell_pid: std::process::id(),
+                    shell_birth: Birth::default(),
+                    local_id,
+                },
+                tag: Vec::new(),
+            };
+            (rdev, op)
+        };
+        let (closed, closed_op) = register("/dev/null", 1);
+        let (kept, kept_op) = register("/dev/zero", 2);
+        assert_ne!(closed, kept);
+        let link = KeeperLink::start(sock.clone(), Identity::same_uid(), "t".into()).expect("link");
+        assert!(link.enqueue(closed_op));
+        assert!(link.enqueue(kept_op));
+        step_until(&mut server, "the keeper holds both", |s| {
+            s.holds(closed) && s.holds(kept)
+        });
+        // The keeper lives (its listener too, under another name), but drops
+        // the link, and no reconnect can reach it.
+        std::fs::rename(&sock, &aside).expect("move the keeper's socket aside");
+        server.test_drop_connections();
+        // Waited for, so the test knows the link tried and could not write it.
+        let written = link.send_and_wait(LinkOp::Release { rdev: closed }, Duration::from_secs(60));
+        assert!(!written, "no keeper was reachable");
+        std::fs::rename(&aside, &sock).expect("restore the keeper's socket");
+        step_until(&mut server, "the RELEASE reaches the keeper", |s| {
+            !s.holds(closed)
+        });
+        assert!(server.holds(kept), "the open tab stays in custody");
+        link.shutdown();
+        drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -693,8 +944,13 @@ mod tests {
         assert!(pending && bye, "written: pending={pending} bye={bye}");
         assert!(!after, "no op is written after the BYE");
         assert_eq!(
-            server.core().pending_successor().map(|p| p.pid),
-            Some(1),
+            server
+                .core()
+                .pending_successors()
+                .iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+            [1],
             "the PENDING arrived before the BYE"
         );
         assert!(server.holds(rdev), "the RELEASE after the BYE never came");
@@ -723,10 +979,13 @@ mod tests {
             },
             tag: Vec::new(),
         }));
+        // The op is given five minutes, so a link that waited them out is told
+        // from a refusal by a minute's hang detector (AGENTS.md), never a
+        // latency budget.
         let started = Instant::now();
-        assert!(!link.send_and_wait(LinkOp::Pending { pid: 1 }, Duration::from_secs(60)));
+        assert!(!link.send_and_wait(LinkOp::Pending { pid: 1 }, Duration::from_secs(300)));
         assert!(
-            started.elapsed() < Duration::from_secs(30),
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "refused without waiting out the bound: {:?}",
             started.elapsed()
         );

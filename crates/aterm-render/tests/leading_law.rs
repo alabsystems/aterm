@@ -87,7 +87,6 @@ fn half_leading_splits_within_one_px() {
 /// at the default line-height, after `set_line_height`, and after the
 /// `set_adjust_baseline` escape hatch (which shifts baseline only, never the
 /// cell box).
-#[cfg(feature = "embedded-font")]
 #[test]
 fn renderer_geometry_follows_the_law_live() {
     let bytes = std::fs::read(concat!(

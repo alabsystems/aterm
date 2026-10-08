@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! COMPILE-TIME temporal gate for the scrollback-offload detach-window
-//! protocol. The embedded exhaustive interpreter always runs while BUILDING
-//! aterm-grid; Trust `ty` additionally checks the same obligations wherever it
-//! is installed. A violated invariant (or a vacuous one that fails to catch the
-//! reintroduced bug) fails `cargo build` / `cargo check`, not merely tests.
-//! ONE source of truth: the model is `include!`d from
-//! `offload_window_spec.rs`, shared with the conformance test, so it cannot drift.
+//! Compile-time temporal gate for the scrollback-offload detach window and the
+//! unified retention limit. The embedded exhaustive interpreter runs while
+//! building aterm-grid, and Trust `ty` rechecks the same obligations where
+//! installed; a violated or vacuous invariant fails the build. The models are
+//! `include!`d from the spec files shared with the conformance tests.
 
 use aterm_spec::derive::Model;
 use aterm_spec::ty_model;
@@ -24,10 +22,8 @@ fn main() {
     gate_retention_limit();
 }
 
-/// COMPILE-TIME gate for the unified total retention limit (audit E1): the
-/// `TotalBounded` invariant must PROVE at `Buggy=0` and be CAUGHT at `Buggy=1`
-/// (the pre-unification store-cap-equals-limit split), so the one-total-limit
-/// contract can neither regress nor go vacuous.
+/// Gate for the unified total retention limit: `TotalBounded` proves at
+/// `Buggy=0` and is caught at `Buggy=1`.
 fn gate_retention_limit() {
     let m = retention_limit_model();
     report(
@@ -44,19 +40,12 @@ fn gate_offload_window() {
     );
 }
 
-/// A discharged gate prints NOTHING: a violated or vacuous invariant already
-/// panics inside `prove_and_catch_scalar` and fails the build, and this crate is
-/// a dependency of the app, so a `cargo:warning` here was two lines on every
-/// build that restated the build's own success.
+/// A discharged gate prints nothing; a violated or vacuous invariant already
+/// panics inside `prove_and_catch_scalar`.
 ///
-/// Note what is NOT here: a "ty missing, gate skipped" outcome. Both models are
-/// scalar, so `prove_and_catch_scalar` guarantees the embedded interpreter
-/// discharged them exhaustively; a missing `ty` costs the escalation tier only,
-/// which is why the `Interpreter` arm succeeds. `TyOnly` would mean the
-/// interpreter did NOT run — impossible for a scalar model, and a build failure
-/// if a future edit makes one of these models function-valued, because a compile
-/// gate that quietly degrades to "checked only on machines that happen to have
-/// the toolchain" is the exact failure this build script exists to prevent.
+/// Both models are scalar, so the interpreter always discharges them and a
+/// missing `ty` costs only the escalation tier. `TyOnly` (interpreter did not
+/// run) fails the build: the gate must not depend on the toolchain installed.
 fn report(name: &str, covered: Covered) {
     match covered {
         Covered::Interpreter | Covered::InterpreterAndTy => {}

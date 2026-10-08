@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! aterm-effects' integration suite: ONE test binary for every file listed
+//! below, instead of one linked and started per file.
+//!
+//! Each file keeps its path (every `tests/<file>.rs` citation still resolves)
+//! and its own `#[test]`s; a test is named `<file>::<test>` here. The shared
+//! helpers are mounted ONCE, first: `common` (the budget knob), `trail_host`
+//! (the host seam, whose `core_deref!` macro the modules below use — hence
+//! `#[macro_use]` and its place before them) and `walk_census`; each file
+//! reaches them as `crate::<helper>`.
+//!
+//! Sharing a process was checked, not assumed: no file below sets or removes an
+//! environment variable, installs a hook, re-executes itself or keeps a
+//! process global (the one `thread_local!`, in `walk_census`, is per thread).
+//! The four files that install a `#[global_allocator]` and assert exact
+//! allocation counts are their own `[[test]]`s in `Cargo.toml`.
+//!
+//! `autotests = false`: a `tests/*.rs` file that is neither a `mod` line here
+//! nor a `[[test]]` of its own NEVER COMPILES. Run one file's tests with
+//! `targo --unverified test -p aterm-effects --test effects_suite -- <file>::`;
+//! its ignored reports and perf gates with `-- <file>:: --ignored`, never a bare
+//! `--ignored`, which would start every wall-clock gate in the suite at once.
+
+mod common;
+#[macro_use]
+mod trail_host;
+mod walk_census;
+
+mod abandoned_ribbon;
+mod animal_art_quality;
+mod busy_status_rows_keep_their_brand;
+mod cat_art_quality;
+mod claude_wrap_band;
+mod codex_background_redraw;
+mod codex_particle_replay;
+mod composer_box_growth_wrap;
+mod composer_growth_follows;
+mod composer_multiline_wrap;
+mod console_contact_observation;
+mod console_cursor_home;
+mod console_handoff_conformance;
+mod console_hidden_cursor_coverage;
+mod console_idle_output;
+mod console_life_conformance;
+mod console_life_erase_conformance;
+mod console_life_geometry;
+mod console_life_wakes;
+mod console_pet_escort_lead;
+mod console_pet_visibility_hold;
+mod console_pet_z_order_hold;
+mod console_sparse_ink_motion;
+mod copies_are_not_moves;
+mod copy_beside_the_line;
+mod cursor_bench;
+mod cursor_cat_conformance;
+mod erased_under_its_twin;
+mod hop_wake_fold;
+mod ink_wrap_line_fill_repro;
+mod jump_over_fading_band;
+mod keys_typed_at_the_line_start;
+mod kitty_activation_conformance;
+mod licensed_insert_band;
+mod licensed_typed_parity;
+mod midline_insert_band;
+mod midline_insert_colour_seam;
+mod moved_again_without_a_key;
+mod moves_are_followed;
+mod new_line_fade;
+mod nova_channel_budget;
+mod nova_phase_conformance;
+mod output_streak_attribution;
+mod output_streak_conformance;
+mod partial_release;
+mod pet_art_quality;
+mod pet_coordinate_seams;
+mod pet_degenerate_geometry;
+mod pet_escort_primacy;
+mod pet_follows_a_hidden_caret;
+mod pet_holds_through_a_torn_frame;
+mod pet_position_authority;
+mod pet_resident_standoff;
+mod phrase_pause_gaps;
+mod relaid_composer_echo;
+mod review_real_bytes;
+mod revived_line_keeps_its_stops;
+mod ribbon_arrival_conformance;
+mod ribbon_coalesced_wrap;
+mod ribbon_follow_conformance;
+mod ribbon_row_hold_conformance;
+mod scrub_gaps;
+mod shed_frame_is_still_a_heard_key;
+mod the_owners_composer_gaps;
+mod torn_edit_gaps;
+mod torn_read_gaps;
+mod torn_repaint_hidden_caret;
+mod wake_and_landing_walk_origins;
+mod walk_continuity_census;
+mod web_binding_parity;
+mod wrap_code_reflow;
+mod wrapped_composer_band;
+mod zsh_isearch_band;

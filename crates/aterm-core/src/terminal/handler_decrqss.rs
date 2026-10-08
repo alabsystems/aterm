@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! DECRQSS (Request Selection or Setting) handler for the terminal.
-//!
-//! This module handles DECRQSS queries which allow applications to query
-//! the terminal's current settings. The terminal responds with DECRPSS
-//! (Report Selection or Setting).
+//! DECRQSS (Request Selection or Setting) handler: applications query a
+//! current setting and the terminal answers with DECRPSS.
 //!
 //! Supported queries:
 //! - SGR (m): Current text attributes
@@ -19,29 +16,22 @@
 //! - DECSLPP (t): Lines per page (terminal height)
 //! - DECTCEM (?25): Text cursor enable mode
 //! - DECOM (?6): Origin mode
-//!
-//! Extracted from handler.rs as part of large files refactor.
 
 use crate::grid::{CellFlags, PackedColor};
 
 use super::CursorStyle;
 use super::handler::TerminalHandler;
 
-/// DECSCL second parameter for 7-bit C1 control transmission (S7C1T).
-///
-/// aterm has a fixed 7-bit C1 *transmission* policy: it implements no S7C1T/S8C1T
-/// switch and `handle_decscl` ignores the requested C1 mode, so the terminal never
-/// emits 8-bit C1 bytes. The DECSCL report is therefore invariantly `2` here, named
-/// rather than a magic literal. (`1` would be the 8-bit / S8C1T value, which aterm
-/// never reports.)
+/// DECSCL second parameter for 7-bit C1 control transmission (S7C1T). aterm
+/// has no S7C1T/S8C1T switch and `handle_decscl` ignores the requested C1 mode,
+/// so it never emits 8-bit C1 bytes and always reports `2` (`1` would be
+/// S8C1T).
 const DECSCL_C1_TRANSMISSION_7BIT: u8 = 2;
 
-/// Describes how a DECRQSS payload is assembled into the final response.
-///
-/// Most queries return a parameter string that is followed by the original
-/// query mnemonic (e.g. `"0"` + `"m"` -> `"0m"`).  DEC private-mode queries
-/// return a self-contained string that already includes the trailing `h`/`l`
-/// final character and must NOT have the mnemonic appended again.
+/// How a DECRQSS payload is assembled into the response. Most queries return
+/// parameters followed by the query mnemonic (`"0"` + `"m"` -> `"0m"`); DEC
+/// private-mode queries return a string already ending in `h`/`l`, with no
+/// mnemonic appended.
 enum DecrqssPayload {
     /// Payload is followed by the filtered original query mnemonic `Pt`.
     WithPt(String),
@@ -89,12 +79,9 @@ impl TerminalHandler<'_> {
             return;
         };
 
-        // Match the setting mnemonic.
-        //
-        // Most queries produce `WithPt` -- the payload precedes the original
-        // query mnemonic in the response.  DEC private-mode queries produce
-        // `Full` because the response already contains the `h`/`l` final
-        // character and the mnemonic must not be appended again.
+        // Match the setting mnemonic. Most queries produce `WithPt` (payload,
+        // then the mnemonic); DEC private-mode queries produce `Full`, which
+        // already ends in `h`/`l`.
         let response: Option<DecrqssPayload> = match pt {
             // SGR - Select Graphic Rendition
             "m" => Some(DecrqssPayload::WithPt(self.decrqss_sgr())),
@@ -172,11 +159,8 @@ impl TerminalHandler<'_> {
 
         match response {
             Some(payload) => {
-                // Success response: DCS 1 $ r <body> ST
-                //
-                // Security: Filter dcs_data to remove escape sequences and control
-                // characters that could be interpreted when the response is echoed
-                // back to a shell. Only printable ASCII is safe to echo.
+                // Success: DCS 1 $ r <body> ST. dcs_data is filtered to printable
+                // ASCII, since the response may be echoed back to a shell.
                 let mut response_bytes = Vec::new();
                 response_bytes.extend_from_slice(b"\x1bP1$r");
                 match payload {
@@ -212,7 +196,7 @@ impl TerminalHandler<'_> {
 
         // Collect the active attributes; the leading default-reset "0" is
         // prepended at the end (xterm parity) so replaying the report
-        // reproduces this exact style over ANY current state.
+        // reproduces this exact style over any current state.
         if self.style.flags.contains(CellFlags::BOLD) {
             params.push("1".to_string());
         }
@@ -256,7 +240,7 @@ impl TerminalHandler<'_> {
         }
 
         // Overline (SGR 53) -- encoded as SUPERSCRIPT | SUBSCRIPT
-        // Check overline FIRST since it contains both bits
+        // Check overline first since it contains both bits
         if self.style.flags.contains(CellFlags::OVERLINE) {
             params.push("53".to_string());
         } else if self.style.flags.contains(CellFlags::SUPERSCRIPT) {
@@ -268,7 +252,7 @@ impl TerminalHandler<'_> {
         }
 
         // Underline color (SGR 58)
-        // Indexed colors are stored as 0x02_0000NN, RGB as 0x01_RRGGBB (#7445).
+        // Indexed colors are stored as 0x02_0000NN, RGB as 0x01_RRGGBB.
         if let Some(color) = self.transient.current_underline_color {
             let type_byte = (color >> 24) & 0xFF;
             if type_byte == 0x02 {
@@ -345,17 +329,9 @@ impl TerminalHandler<'_> {
     /// contains just the parameters -- not the intermediate `"` byte.
     fn decrqss_decscl(&self) -> String {
         let level = self.modes.vt_level.decscl_param();
-        // Second parameter reports the C1 control *transmission* mode:
-        // 1 = 8-bit (S8C1T), 2 = 7-bit (S7C1T).
-        //
-        // This is the engine's REAL, invariant state — not a placeholder. aterm
-        // implements no S7C1T/S8C1T switch and `handle_decscl` deliberately ignores
-        // the requested C1 mode (see handler_state.rs::handle_decscl), so the
-        // terminal never transmits 8-bit C1 bytes. 7-bit is also the safe posture:
-        // 8-bit C1 *interpretation* is off by default for injection safety (see
-        // state.rs), and transmitting 8-bit C1 would be the mirror hazard. So the
-        // report is fixed at 7-bit and sourced from one named constant rather than a
-        // magic literal.
+        // The second parameter is the C1 transmission mode (1 = 8-bit S8C1T,
+        // 2 = 7-bit S7C1T). aterm has no switch and `handle_decscl` ignores the
+        // requested mode, so it always transmits 7-bit and reports that.
         format!("{level};{DECSCL_C1_TRANSMISSION_7BIT}")
     }
 
@@ -525,7 +501,7 @@ impl TerminalHandler<'_> {
     /// - `?12h` (set): cursor blinks
     /// - `?12l` (reset): cursor steady
     fn decrqss_cursor_blink(&self) -> String {
-        // The blink bit of the cursor STYLE — the fact the renderer acts on.
+        // The blink bit of the cursor style — the fact the renderer acts on.
         // See `set_cursor_blink` (handler_dec_refinement.rs).
         if self.modes.cursor_style.blinks() {
             "?12h".to_string()

@@ -57,7 +57,9 @@ pub(crate) fn stack() -> Option<Vec<String>> {
 }
 
 /// Deepest stack the capture walks. A run-loop spin sits ~20 frames down; the
-/// cap bounds the time the main thread stays suspended.
+/// cap bounds the time the main thread stays suspended. The capture is
+/// macOS's (`imp`); elsewhere only the tests walk a synthetic stack.
+#[cfg(any(target_os = "macos", test))]
 const MAX_FRAMES: usize = 64;
 
 /// The frame-walk decision, over a memory reader, so it is testable on a
@@ -65,6 +67,7 @@ const MAX_FRAMES: usize = 64;
 /// must climb strictly upward; the walk stops at a null, misaligned or
 /// non-increasing frame pointer, an unreadable record, or a zero return
 /// address. `strip` removes pointer-authentication bits.
+#[cfg(any(target_os = "macos", test))]
 fn walk(
     pc: u64,
     fp: u64,
@@ -442,7 +445,7 @@ mod tests {
         // wall window: under a loaded parallel suite the spinner may get a
         // fraction of a core, and the claim is only that the reading moves.
         let before = cpu_time().expect("thread_info on the registered thread");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let mut used = Duration::ZERO;
         while used < Duration::from_millis(50) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));

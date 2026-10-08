@@ -28,12 +28,15 @@
 //! nothing panics, and names the fixture, the window and the panic's
 //! location when something does.
 
+use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use aterm_phase::prompt::fixtures as fx;
+use aterm_phase::{Program, Reading};
 
 /// One screen to sweep: where it came from and its rows.
 struct Screen {
@@ -162,18 +165,28 @@ fn truncated(rows: &[String], width: usize) -> Vec<String> {
 
 /// Every call the sweep makes on one window.
 fn read_all(w: &[String]) {
-    let _ = aterm_phase::read(Some("claude"), w, None);
-    let _ = aterm_phase::read(Some("claude"), w, Some(2));
-    let _ = aterm_phase::read(None, w, None);
-    let _ = aterm_phase::read(Some("codex"), w, Some(0));
-    for col in [0, 1, 200] {
+    // `read` is a function of its arguments alone, so each reading is taken
+    // once and its box handed to `read_box` from that one reading. The
+    // cursor's column enters a reading only as its `suggestion` (the one
+    // `ScreenReader::read`, which no reader overrides), so a reading that
+    // differs from one already taken only by that column is not taken again
+    // (the reader was 2/3 of the sweep's CPU, Claude Code's 9/10 of that):
+    // * Claude Code's with the cursor at column 2 is the reading without it
+    //   plus `continuation_suggestion(w, 2)`, called with the other columns;
+    // * the screen-identified reading (`read(None, …)`) is `identify`'s
+    //   reader's `read(w, None)`: for Claude Code that is `claude`, for
+    //   Codex `codex` (whose suggestion at column 0 `read` computes too), so
+    //   only the generic reader's is read here.
+    // `the_sweep_reads_each_reading_it_skips_already` holds both, on every
+    // screen at every width.
+    let claude = aterm_phase::read(Some("claude"), w, None);
+    let codex = aterm_phase::read(Some("codex"), w, Some(0));
+    let by_screen = aterm_phase::identify(None, w);
+    let generic = (by_screen.program() == Program::Generic).then(|| by_screen.read(w, None));
+    for col in [0, 1, 2, 200] {
         let _ = aterm_phase::continuation_suggestion(w, col);
     }
-    for reading in [
-        aterm_phase::read(Some("claude"), w, None),
-        aterm_phase::read(None, w, None),
-        aterm_phase::read(Some("codex"), w, Some(0)),
-    ] {
+    for reading in [Some(claude), generic, Some(codex)].into_iter().flatten() {
         if let Some(p) = reading.prompt {
             read_box(&p);
         }
@@ -184,6 +197,9 @@ fn read_all(w: &[String]) {
     }
     let _ = aterm_phase::prompt_box_span(w);
     let _ = aterm_phase::prompt_box_first_row(w);
+    let _ = w
+        .get(aterm_phase::busy_zone_start(w)..)
+        .expect("the live zone starts on the screen");
     let _ = aterm_phase::transcript_end(w);
     let _ = aterm_phase::status_row_stall(w, w);
     if let Some(rest) = w.get(1..) {
@@ -238,11 +254,30 @@ fn read_box(p: &aterm_phase::PromptV2) {
 std::thread_local! {
     /// Where the last panic on this thread happened (the hook's record).
     static LAST_PANIC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// This thread is one of the sweep's: its panics are the hook's to
+    /// record. Another test's, while the hook is installed, are printed.
+    static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// One window that panicked: the fixture, the window, the location and the
-/// message.
+/// message. Each distinct window is read once: the reader is a function of
+/// the rows alone, and half the sweep's windows repeat one already read — a
+/// shared footer, a blank run, the narrow cuts (2026-09-30, the fixture
+/// files: 162,884 of 321,033 windows distinct).
 fn check(name: &str, what: &str, w: &[String], failures: &Mutex<Vec<String>>) {
+    // Sharded by hash: one set under one lock had the sweep's threads
+    // queueing on it.
+    static READ: [Mutex<BTreeSet<u64>>; 64] = [const { Mutex::new(BTreeSet::new()) }; 64];
+    let mut h = std::hash::DefaultHasher::new();
+    w.hash(&mut h);
+    let h = h.finish();
+    if !READ[(h % 64) as usize]
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(h)
+    {
+        return;
+    }
     if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| read_all(w))) {
         let msg = payload
             .downcast_ref::<&str>()
@@ -259,19 +294,31 @@ fn check(name: &str, what: &str, w: &[String], failures: &Mutex<Vec<String>>) {
     }
 }
 
-/// The windows of one screen: every tail and head cut, and the middles of
-/// heights 1..=12 — all of them when `every_middle`, else one in five (by a
-/// fixed stride offset per height, so a rerun sweeps the same windows).
-fn sweep(name: &str, rows: &[String], every_middle: bool, failures: &Mutex<Vec<String>>) {
+/// Part `part` of `parts` of the windows of one screen: every tail and head
+/// cut, and the middles of heights 1..=12 — all of them when `every_middle`,
+/// else one in five (by a fixed stride offset per height, so a rerun sweeps
+/// the same windows). The parts are disjoint and together are the whole: part
+/// `p` takes the cuts at `k ≡ p (mod parts)` — a tail `rows[k..]` and a head
+/// `rows[..k]` together are `n` rows whatever `k`, so the parts weigh the same
+/// — and the middles starting at `s ≡ p`, and part 0 the whole screen.
+fn sweep(
+    name: &str,
+    rows: &[String],
+    every_middle: bool,
+    (part, parts): (usize, usize),
+    failures: &Mutex<Vec<String>>,
+) {
     let n = rows.len();
-    check(name, "whole", rows, failures);
-    for k in 0..=n {
+    if part == 0 {
+        check(name, "whole", rows, failures);
+    }
+    for k in (part..=n).step_by(parts) {
         check(name, &format!("tail rows[{k}..]"), &rows[k..], failures);
         check(name, &format!("head rows[..{k}]"), &rows[..k], failures);
     }
     let tallest = if full() { n } else { 12.min(n) };
     for h in 1..=tallest {
-        for s in 0..=n - h {
+        for s in (part..=n - h).step_by(parts) {
             if every_middle || full() || (s + h) % 5 == 0 {
                 check(
                     name,
@@ -282,6 +329,23 @@ fn sweep(name: &str, rows: &[String], every_middle: bool, failures: &Mutex<Vec<S
             }
         }
     }
+}
+
+/// How many parts one cut of an `n`-row screen is swept in ([`sweep`]): its
+/// tail and head cuts are quadratic in its rows, and as one job per cut the
+/// 528-row capture's seven were the run's wall (2026-10-05: its whole cut 50 s
+/// of an 86 s run on 6 threads, every other job under 6 s).
+fn parts_for(n: usize) -> usize {
+    n.div_ceil(32).max(1)
+}
+
+/// One job of the sweep: a screen as captured, cut to a width, or (the full
+/// sweep) with one row dropped and doubled.
+#[derive(Clone, Copy)]
+enum Cut {
+    Whole,
+    Width(usize),
+    Edit(usize),
 }
 
 /// The widths each row is also cut to.
@@ -298,6 +362,10 @@ fn full() -> bool {
 fn the_reader_never_panics_on_any_window_of_any_fixture() {
     let prev = panic::take_hook();
     panic::set_hook(Box::new(|info| {
+        if !SWEEPING.get() {
+            eprintln!("{info}");
+            return;
+        }
         let at = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
@@ -307,32 +375,55 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
     let started = Instant::now();
     let all = screens();
     let failures = Mutex::new(Vec::new());
+    // One job per screen, cut and part ([`parts_for`]), tallest screen first:
+    // the sweep of one tall capture is quadratic in its rows (every tail and
+    // head), and as one job per screen the 528-row capture was the run's wall
+    // on a single thread (2026-09-30: 62 s of wall for 152 s of CPU on 14
+    // threads), as one job per cut still (2026-10-05).
+    let widths: Vec<usize> = if full() {
+        (1..=80).collect()
+    } else {
+        WIDTHS.to_vec()
+    };
+    let mut jobs: Vec<(&Screen, Cut, (usize, usize))> = Vec::new();
+    for s in &all {
+        let parts = parts_for(s.rows.len());
+        for cut in std::iter::once(Cut::Whole).chain(widths.iter().map(|&w| Cut::Width(w))) {
+            jobs.extend((0..parts).map(|p| (s, cut, (p, parts))));
+        }
+        if full() {
+            jobs.extend((0..s.rows.len()).map(|k| (s, Cut::Edit(k), (0, 1))));
+        }
+    }
+    jobs.sort_by_key(|(s, _, _)| std::cmp::Reverse(s.rows.len()));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
+                SWEEPING.set(true);
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(s) = all.get(i) else { break };
-                    sweep(&s.name, &s.rows, true, &failures);
-                    let widths: Vec<usize> = if full() {
-                        (1..=80).collect()
-                    } else {
-                        WIDTHS.to_vec()
+                    let Some(&(s, cut, part)) = jobs.get(i) else {
+                        break;
                     };
-                    for w in widths {
-                        let cut = truncated(&s.rows, w);
-                        sweep(&format!("{} @width {w}", s.name), &cut, false, &failures);
-                    }
-                    if full() {
-                        for k in 0..s.rows.len() {
+                    match cut {
+                        Cut::Whole => sweep(&s.name, &s.rows, true, part, &failures),
+                        Cut::Width(w) => sweep(
+                            &format!("{} @width {w}", s.name),
+                            &truncated(&s.rows, w),
+                            false,
+                            part,
+                            &failures,
+                        ),
+                        Cut::Edit(k) => {
                             let mut dropped = s.rows.clone();
                             dropped.remove(k);
                             sweep(
                                 &format!("{} row {k} dropped", s.name),
                                 &dropped,
                                 false,
+                                part,
                                 &failures,
                             );
                             let mut doubled = s.rows.clone();
@@ -341,6 +432,7 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
                                 &format!("{} row {k} doubled", s.name),
                                 &doubled,
                                 false,
+                                part,
                                 &failures,
                             );
                         }
@@ -377,5 +469,47 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+}
+
+/// What [`read_all`] leaves out is a reading it already took: on every
+/// screen, whole and at every width, Claude Code's reading with the cursor at
+/// column 2 is its reading without one plus `continuation_suggestion(rows, 2)`,
+/// and the screen-identified reading of a screen identified as Claude Code's
+/// or Codex's is that program's reading (Codex's without its suggestion). If
+/// a reader ever reads the cursor anywhere else, this fails, and the sweep
+/// must take those readings again.
+#[test]
+fn the_sweep_reads_each_reading_it_skips_already() {
+    for s in screens() {
+        for width in std::iter::once(None).chain(WIDTHS.iter().copied().map(Some)) {
+            let rows = width.map_or_else(|| s.rows.clone(), |w| truncated(&s.rows, w));
+            let at = || format!("{} @width {width:?}", s.name);
+            let claude = aterm_phase::read(Some("claude"), &rows, None);
+            let codex = aterm_phase::read(Some("codex"), &rows, Some(0));
+            assert_eq!(
+                aterm_phase::read(Some("claude"), &rows, Some(2)),
+                Reading {
+                    suggestion: aterm_phase::continuation_suggestion(&rows, 2),
+                    ..claude.clone()
+                },
+                "{}",
+                at()
+            );
+            let by_screen = aterm_phase::read(None, &rows, None);
+            match by_screen.program {
+                Program::Claude => assert_eq!(by_screen, claude, "{}", at()),
+                Program::Codex => assert_eq!(
+                    by_screen,
+                    Reading {
+                        suggestion: None,
+                        ..codex
+                    },
+                    "{}",
+                    at()
+                ),
+                Program::Generic => {}
+            }
+        }
     }
 }

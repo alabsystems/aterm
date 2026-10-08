@@ -154,13 +154,23 @@ pub(crate) fn load_for_launch(path: &Path) -> Loaded {
 /// id — a stable sort, so a record's own lines (all in one file) keep their
 /// order and the ring stays oldest-first (design ruling 200).
 pub(crate) fn load_tail(path: &Path, tail: u64) -> Loaded {
+    let (lines, skipped) = tail_lines(path, tail);
+    let mut log = MessageLog::empty();
+    log.replay_all(lines);
+    Loaded { log, skipped }
+}
+
+/// The decoded lines of the last `tail` bytes across the pair (and the wire's
+/// pair), in replay order, and how many the codec refused. The launch load
+/// builds the ring from them; a successor's Commit reads them AGAIN
+/// ([`aterm_messages::MessageCenter::catch_up`]) for what its parent wrote
+/// while the two overlapped.
+pub(crate) fn tail_lines(path: &Path, tail: u64) -> (Vec<LogLine>, usize) {
     let mut lines = Vec::new();
     let mut skipped = read_pair(path, tail, &mut lines);
     skipped += read_pair(&wire_path(path), tail.min(WIRE_TAIL_BYTES), &mut lines);
     lines.sort_by_key(LogLine::id);
-    let mut log = MessageLog::empty();
-    log.replay_all(lines);
-    Loaded { log, skipped }
+    (lines, skipped)
 }
 
 /// The last `tail` bytes across `path` and its `.1`, decoded into `out`
@@ -396,6 +406,15 @@ impl Writer {
     #[cfg(test)]
     fn unattended(path: &Path, cap: usize) -> (Writer, mpsc::Receiver<Job>) {
         Self::open(path, cap, BUDGET, WIRE_BUDGET).expect("a temp file opens")
+    }
+
+    /// A writer whose thread never answers: every [`Self::flush_within`]
+    /// waits out its whole bound, as one throttled behind a busy disk does.
+    /// The second value holds the channel open while the test keeps it.
+    #[cfg(test)]
+    pub(crate) fn stalled(path: &Path) -> (Writer, Box<dyn std::any::Any>) {
+        let (writer, rx) = Self::unattended(path, 1);
+        (writer, Box::new(rx))
     }
 
     /// Append `lines`, oldest first, in that order on disk, each to its

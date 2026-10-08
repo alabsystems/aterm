@@ -2,28 +2,19 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A scratch directory, removed on drop.
-struct Scratch(PathBuf);
+/// A scratch directory at a canonical path, removed on drop.
+struct Scratch(aterm_tempfile::TempDir);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-git-config-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        Self(std::fs::canonicalize(&dir).expect("canonical scratch"))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonical scratch");
+        Self(
+            aterm_tempfile::Builder::new()
+                .prefix(&format!("aterm-git-config-{tag}-"))
+                .tempdir_in(base)
+                .expect("scratch dir"),
+        )
     }
 }
 
@@ -46,7 +37,7 @@ fn git(dir: &Path, args: &[&str]) {
 /// A fresh repository with nothing configured beyond `git init`'s defaults.
 fn repo(tag: &str) -> Scratch {
     let s = Scratch::new(tag);
-    git(&s.0, &["init", "-q", "."]);
+    git(s.0.path(), &["init", "-q", "."]);
     s
 }
 
@@ -150,9 +141,8 @@ fn a_directory_this_check_cannot_resolve_is_refused() {
 }
 
 /// Every wrapper the classifier's head check sees through, this check sees
-/// through too — each of these the classifier approves as a read, and before
-/// the two shared one reading of a segment each was `Ok(None)` here: no
-/// config check at all (the 2026-09-26 review's scratch binary).
+/// through too: each of these is approved as a read by the classifier and
+/// gets its config check here.
 #[test]
 fn a_git_behind_a_wrapper_is_still_placed() {
     let home = Path::new("/Users//o");
@@ -340,19 +330,21 @@ fn an_index_hook_is_a_hazard() {
 #[test]
 fn a_clean_repository_loads_nothing_that_runs() {
     let r = repo("clean");
-    let v = isolated().view(&r.0, &|_| false).expect("git config");
+    let v = isolated().view(r.0.path(), &|_| false).expect("git config");
     assert!(
         v.config
             .iter()
             .any(|(scope, k, _)| scope == "local" && k == "core.bare"),
         "the repository's own config is read: {v:?}"
     );
-    assert_eq!(hazard(&v, &reads_in(&r.0)), None, "{v:?}");
+    assert_eq!(hazard(&v, &reads_in(r.0.path())), None, "{v:?}");
     // Outside any repository: nothing either.
     let plain = Scratch::new("plain");
-    let v = isolated().view(&plain.0, &|_| false).expect("git config");
+    let v = isolated()
+        .view(plain.0.path(), &|_| false)
+        .expect("git config");
     assert_eq!(v.index_hook, None);
-    assert_eq!(hazard(&v, &reads_in(&plain.0)), None, "{v:?}");
+    assert_eq!(hazard(&v, &reads_in(plain.0.path())), None, "{v:?}");
 }
 
 #[test]
@@ -367,15 +359,18 @@ fn each_dangerous_key_in_the_repository_is_seen() {
         let r = repo("key");
         if key.starts_with("filter.") {
             // A filter runs only where the attributes select it.
-            std::fs::write(r.0.join(".gitattributes"), "* filter=x\n").unwrap();
-            git(&r.0, &["add", ".gitattributes"]);
+            std::fs::write(r.0.path().join(".gitattributes"), "* filter=x\n").unwrap();
+            git(r.0.path(), &["add", ".gitattributes"]);
         }
-        git(&r.0, &["config", key, "touch /tmp/aterm-git-config-pwn"]);
-        let v = isolated().view(&r.0, &|_| false).expect("git config");
-        let why = hazard(&v, &reads_in(&r.0)).unwrap_or_else(|| panic!("{key}: {v:?}"));
+        git(
+            r.0.path(),
+            &["config", key, "touch /tmp/aterm-git-config-pwn"],
+        );
+        let v = isolated().view(r.0.path(), &|_| false).expect("git config");
+        let why = hazard(&v, &reads_in(r.0.path())).unwrap_or_else(|| panic!("{key}: {v:?}"));
         assert!(why.contains(key), "{why}");
         // A subdirectory of the worktree sees the same configuration.
-        let sub = r.0.join("sub");
+        let sub = r.0.path().join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         assert!(hazard(&isolated().view(&sub, &|_| false).unwrap(), &reads_in(&sub)).is_some());
     }
@@ -385,21 +380,27 @@ fn each_dangerous_key_in_the_repository_is_seen() {
 fn an_included_file_and_the_global_config_are_seen() {
     // include.path pulling a hazard in.
     let r = repo("include");
-    let inc = r.0.join("inc.cfg");
+    let inc = r.0.path().join("inc.cfg");
     std::fs::write(&inc, "[core]\n\tfsmonitor = ./evil.sh\n").unwrap();
-    git(&r.0, &["config", "include.path", inc.to_str().unwrap()]);
-    let why =
-        hazard(&isolated().view(&r.0, &|_| false).unwrap(), &reads_in(&r.0)).expect("included");
+    git(
+        r.0.path(),
+        &["config", "include.path", inc.to_str().unwrap()],
+    );
+    let why = hazard(
+        &isolated().view(r.0.path(), &|_| false).unwrap(),
+        &reads_in(r.0.path()),
+    )
+    .expect("included");
     assert!(why.contains("core.fsmonitor"), "{why}");
 
     // The global file — and includeIf in it.
     let clean = repo("global");
-    let global = clean.0.join("global.cfg");
+    let global = clean.0.path().join("global.cfg");
     std::fs::write(&global, "[diff]\n\texternal = /tmp/evil\n").unwrap();
     let probe = WorkerEnv::hermetic(Some(&global));
     let why = hazard(
-        &probe.view(&clean.0, &|_| false).unwrap(),
-        &reads_in(&clean.0),
+        &probe.view(clean.0.path(), &|_| false).unwrap(),
+        &reads_in(clean.0.path()),
     )
     .expect("global");
     assert!(
@@ -413,24 +414,27 @@ fn an_included_file_and_the_global_config_are_seen() {
 fn an_executable_post_index_change_hook_is_seen() {
     use std::os::unix::fs::PermissionsExt;
     let r = repo("hook");
-    let hook = r.0.join(".git/hooks/post-index-change");
+    let hook = r.0.path().join(".git/hooks/post-index-change");
     std::fs::write(&hook, "#!/bin/sh\ntouch /tmp/aterm-git-config-pwn\n").unwrap();
     // Not executable: git would not run it.
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(isolated().view(&r.0, &|_| false).unwrap().index_hook, None);
+    assert_eq!(
+        isolated().view(r.0.path(), &|_| false).unwrap().index_hook,
+        None
+    );
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let v = isolated().view(&r.0, &|_| false).unwrap();
-    assert!(hazard(&v, &reads_in(&r.0)).is_some_and(|w| w.contains("post-index-change")));
+    let v = isolated().view(r.0.path(), &|_| false).unwrap();
+    assert!(hazard(&v, &reads_in(r.0.path())).is_some_and(|w| w.contains("post-index-change")));
     // core.hooksPath moves it.
     let r = repo("hookspath");
-    std::fs::create_dir_all(r.0.join("h")).unwrap();
-    let moved = r.0.join("h/post-index-change");
+    std::fs::create_dir_all(r.0.path().join("h")).unwrap();
+    let moved = r.0.path().join("h/post-index-change");
     std::fs::write(&moved, "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o755)).unwrap();
-    git(&r.0, &["config", "core.hooksPath", "h"]);
+    git(r.0.path(), &["config", "core.hooksPath", "h"]);
     assert!(
         isolated()
-            .view(&r.0, &|_| false)
+            .view(r.0.path(), &|_| false)
             .unwrap()
             .index_hook
             .is_some()
@@ -440,8 +444,8 @@ fn an_executable_post_index_change_hook_is_seen() {
 #[test]
 fn a_directory_that_does_not_exist_is_read_at_its_nearest_ancestor() {
     let r = repo("ancestor");
-    git(&r.0, &["config", "core.fsmonitor", "./evil.sh"]);
-    let missing = r.0.join("not/yet");
+    git(r.0.path(), &["config", "core.fsmonitor", "./evil.sh"]);
+    let missing = r.0.path().join("not/yet");
     assert!(
         hazard(
             &isolated().view(&missing, &|_| false).unwrap(),
@@ -471,10 +475,10 @@ fn add_submodule(sup: &Path, from: &Path, at: &str) {
 /// A clean repository with one commit, to be a submodule's origin.
 fn origin(tag: &str) -> Scratch {
     let r = repo(tag);
-    std::fs::write(r.0.join("f"), "x\n").unwrap();
-    git(&r.0, &["add", "f"]);
+    std::fs::write(r.0.path().join("f"), "x\n").unwrap();
+    git(r.0.path(), &["add", "f"]);
     git(
-        &r.0,
+        r.0.path(),
         &[
             "-c",
             "user.name=t",
@@ -488,22 +492,23 @@ fn origin(tag: &str) -> Scratch {
     r
 }
 
-/// A superproject's `git status` runs git in each populated submodule, with
-/// that submodule's config (`.git/modules/<name>/config`) — measured by the
-/// 2026-09-26 review: an fsmonitor set there ran on a clean `git status` in
-/// the superproject, whose own `git config --list` showed nothing. The check
-/// views every populated submodule, recursively. NEGATIVE CONTROL: the same
-/// superproject with a clean submodule loads nothing that runs.
+/// A superproject's `git status` runs git in each populated submodule with
+/// that submodule's config (`.git/modules/<name>/config`), which the
+/// superproject's own `git config --list` does not show. The check views every
+/// populated submodule, recursively. Negative control: a clean submodule
+/// loads nothing that runs.
 #[test]
 fn a_submodules_own_config_is_seen() {
     let from = origin("sub-origin");
     let sup = repo("super");
-    add_submodule(&sup.0, &from.0, "sub");
-    let v = isolated().view(&sup.0, &|_| false).expect("git config");
+    add_submodule(sup.0.path(), from.0.path(), "sub");
+    let v = isolated()
+        .view(sup.0.path(), &|_| false)
+        .expect("git config");
     assert_eq!(v.submodules.len(), 1, "{v:?}");
-    assert_eq!(hazard(&v, &reads_in(&sup.0)), None, "clean: {v:?}");
+    assert_eq!(hazard(&v, &reads_in(sup.0.path())), None, "clean: {v:?}");
 
-    let sub = sup.0.join("sub");
+    let sub = sup.0.path().join("sub");
     git(
         &sub,
         &[
@@ -512,13 +517,15 @@ fn a_submodules_own_config_is_seen() {
             "touch /tmp/aterm-git-config-pwn",
         ],
     );
-    // What the review measured: the superproject's own config is clean.
-    let own = isolated().view(&sup.0, &|_| false).expect("git config");
+    // The superproject's own config is clean.
+    let own = isolated()
+        .view(sup.0.path(), &|_| false)
+        .expect("git config");
     assert!(
         !own.config.iter().any(|(_, k, _)| k == "core.fsmonitor"),
         "{own:?}"
     );
-    let why = hazard(&own, &reads_in(&sup.0)).expect("the submodule's fsmonitor");
+    let why = hazard(&own, &reads_in(sup.0.path())).expect("the submodule's fsmonitor");
     assert!(
         why.contains("submodule") && why.contains("core.fsmonitor"),
         "{why}"
@@ -526,9 +533,9 @@ fn a_submodules_own_config_is_seen() {
     // Nested one level deeper: the submodule's own submodule.
     let inner_from = origin("inner-origin");
     let mid_from = origin("mid-origin");
-    add_submodule(&mid_from.0, &inner_from.0, "inner");
+    add_submodule(mid_from.0.path(), inner_from.0.path(), "inner");
     git(
-        &mid_from.0,
+        mid_from.0.path(),
         &[
             "-c",
             "user.name=t",
@@ -540,9 +547,9 @@ fn a_submodules_own_config_is_seen() {
         ],
     );
     let top = repo("top");
-    add_submodule(&top.0, &mid_from.0, "mid");
+    add_submodule(top.0.path(), mid_from.0.path(), "mid");
     git(
-        &top.0,
+        top.0.path(),
         &[
             "-c",
             "protocol.file.allow=always",
@@ -555,18 +562,18 @@ fn a_submodules_own_config_is_seen() {
     );
     assert_eq!(
         hazard(
-            &isolated().view(&top.0, &|_| false).unwrap(),
-            &reads_in(&top.0)
+            &isolated().view(top.0.path(), &|_| false).unwrap(),
+            &reads_in(top.0.path())
         ),
         None
     );
     git(
-        &top.0.join("mid/inner"),
+        &top.0.path().join("mid/inner"),
         &["config", "diff.external", "/tmp/evil"],
     );
     let why = hazard(
-        &isolated().view(&top.0, &|_| false).unwrap(),
-        &reads_in(&top.0),
+        &isolated().view(top.0.path(), &|_| false).unwrap(),
+        &reads_in(top.0.path()),
     )
     .expect("nested");
     assert!(why.contains("diff.external"), "{why}");
@@ -574,53 +581,63 @@ fn a_submodules_own_config_is_seen() {
 
 /// A filter driver runs only on a path whose attributes select it: `git lfs
 /// install` writes `filter.lfs.*` into every global config, and a repository
-/// with no `filter=lfs` attribute never runs it — escalating on it would be the
-/// blanket escalation the owner ruled out. The moment an attribute selects the
-/// driver for a tracked path, it is a hazard.
+/// with no `filter=lfs` attribute never runs it. The moment an attribute
+/// selects the driver for a tracked path, it is a hazard.
 #[test]
 fn a_filter_driver_counts_only_where_the_attributes_select_it() {
     let r = repo("filter");
-    std::fs::write(r.0.join("a.bin"), "x\n").unwrap();
-    git(&r.0, &["add", "a.bin"]);
-    let global = r.0.join("global.cfg");
+    std::fs::write(r.0.path().join("a.bin"), "x\n").unwrap();
+    git(r.0.path(), &["add", "a.bin"]);
+    let global = r.0.path().join("global.cfg");
     std::fs::write(
         &global,
         "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n",
     )
     .unwrap();
     let probe = WorkerEnv::hermetic(Some(&global));
-    let v = probe.view(&r.0, &|_| false).expect("git config");
+    let v = probe.view(r.0.path(), &|_| false).expect("git config");
     assert_eq!(v.filters_selected, Some(Vec::new()), "{v:?}");
-    assert_eq!(hazard(&v, &reads_in(&r.0)), None, "no path selects lfs");
+    assert_eq!(
+        hazard(&v, &reads_in(r.0.path())),
+        None,
+        "no path selects lfs"
+    );
 
-    std::fs::write(r.0.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
-    let v = probe.view(&r.0, &|_| false).expect("git config");
+    std::fs::write(r.0.path().join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+    let v = probe.view(r.0.path(), &|_| false).expect("git config");
     assert_eq!(v.filters_selected, Some(vec!["lfs".to_string()]), "{v:?}");
-    let why = hazard(&v, &reads_in(&r.0)).expect("selected");
+    let why = hazard(&v, &reads_in(r.0.path())).expect("selected");
     assert!(why.contains("filter.lfs."), "{why}");
 
     // A driver the attributes name but no config defines runs nothing, and
     // a configured one no path selects stays quiet beside a selected one.
     let only_other = repo("filter-other");
-    std::fs::write(only_other.0.join("a.bin"), "x\n").unwrap();
-    std::fs::write(only_other.0.join(".gitattributes"), "*.bin filter=other\n").unwrap();
-    git(&only_other.0, &["add", "."]);
-    git(&only_other.0, &["config", "filter.x.clean", "touch /tmp/p"]);
+    std::fs::write(only_other.0.path().join("a.bin"), "x\n").unwrap();
+    std::fs::write(
+        only_other.0.path().join(".gitattributes"),
+        "*.bin filter=other\n",
+    )
+    .unwrap();
+    git(only_other.0.path(), &["add", "."]);
+    git(
+        only_other.0.path(),
+        &["config", "filter.x.clean", "touch /tmp/p"],
+    );
     assert_eq!(
         hazard(
-            &isolated().view(&only_other.0, &|_| false).unwrap(),
-            &reads_in(&only_other.0)
+            &isolated().view(only_other.0.path(), &|_| false).unwrap(),
+            &reads_in(only_other.0.path())
         ),
         None
     );
     git(
-        &only_other.0,
+        only_other.0.path(),
         &["config", "filter.other.clean", "touch /tmp/p"],
     );
     assert!(
         hazard(
-            &isolated().view(&only_other.0, &|_| false).unwrap(),
-            &reads_in(&only_other.0)
+            &isolated().view(only_other.0.path(), &|_| false).unwrap(),
+            &reads_in(only_other.0.path())
         )
         .is_some_and(|w| w.contains("filter.other.clean"))
     );
@@ -633,26 +650,26 @@ fn a_filter_driver_counts_only_where_the_attributes_select_it() {
 fn the_check_never_runs_the_fsmonitor_it_finds() {
     use std::os::unix::fs::PermissionsExt;
     let r = repo("fsm-run");
-    std::fs::write(r.0.join("f"), "x\n").unwrap();
-    git(&r.0, &["add", "f"]);
-    let ran = r.0.join("RAN");
-    let script = r.0.join("fsm.sh");
+    std::fs::write(r.0.path().join("f"), "x\n").unwrap();
+    git(r.0.path(), &["add", "f"]);
+    let ran = r.0.path().join("RAN");
+    let script = r.0.path().join("fsm.sh");
     std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     git(
-        &r.0,
+        r.0.path(),
         &["config", "core.fsmonitor", script.to_str().unwrap()],
     );
     // A configured filter too, so the attribute read would be wanted.
-    git(&r.0, &["config", "filter.x.clean", "cat"]);
-    let v = isolated().view(&r.0, &|_| false).expect("git config");
-    assert!(hazard(&v, &reads_in(&r.0)).is_some_and(|w| w.contains("core.fsmonitor")));
+    git(r.0.path(), &["config", "filter.x.clean", "cat"]);
+    let v = isolated().view(r.0.path(), &|_| false).expect("git config");
+    assert!(hazard(&v, &reads_in(r.0.path())).is_some_and(|w| w.contains("core.fsmonitor")));
     assert!(
         !ran.exists(),
         "the check ran the fsmonitor it was checking for"
     );
-    // NEGATIVE CONTROL: the probe is live — a real status does run it.
-    git(&r.0, &["status", "--short"]);
+    // Negative control: the probe is live — a real status does run it.
+    git(r.0.path(), &["status", "--short"]);
     assert!(
         ran.exists(),
         "the fixture's fsmonitor never runs, so the check proves nothing"
@@ -663,20 +680,26 @@ fn the_check_never_runs_the_fsmonitor_it_finds() {
 
 /// The worker's own `GIT_CONFIG_*` is configuration its git reads load
 /// (scope `command`): the view is read in the worker's environment.
-/// NEGATIVE CONTROL: the same repository, the worker without it.
+/// Negative control: the same repository, the worker without it.
 #[test]
 fn the_workers_git_config_variables_are_seen() {
     let r = repo("worker-env");
     assert_eq!(
-        hazard(&isolated().view(&r.0, &|_| false).unwrap(), &reads_in(&r.0)),
+        hazard(
+            &isolated().view(r.0.path(), &|_| false).unwrap(),
+            &reads_in(r.0.path())
+        ),
         None
     );
     let worker = isolated()
         .with("GIT_CONFIG_VALUE_0=./evil.sh")
         .with("GIT_CONFIG_KEY_0=core.fsmonitor")
         .with("GIT_CONFIG_COUNT=1");
-    let why = hazard(&worker.view(&r.0, &|_| false).unwrap(), &reads_in(&r.0))
-        .expect("the worker's fsmonitor");
+    let why = hazard(
+        &worker.view(r.0.path(), &|_| false).unwrap(),
+        &reads_in(r.0.path()),
+    )
+    .expect("the worker's fsmonitor");
     assert!(
         why.contains("core.fsmonitor") && why.contains("command"),
         "{why}"
@@ -689,11 +712,18 @@ fn the_workers_git_config_variables_are_seen() {
 fn the_workers_external_diff_is_a_hazard() {
     let r = repo("ext-diff");
     let worker = isolated().with("GIT_EXTERNAL_DIFF=/tmp/evil");
-    let why = hazard(&worker.view(&r.0, &|_| false).unwrap(), &reads_in(&r.0)).expect("a hazard");
+    let why = hazard(
+        &worker.view(r.0.path(), &|_| false).unwrap(),
+        &reads_in(r.0.path()),
+    )
+    .expect("a hazard");
     assert!(why.contains("GIT_EXTERNAL_DIFF"), "{why}");
     let worker = isolated().with("GIT_EXTERNAL_DIFF=");
     assert_eq!(
-        hazard(&worker.view(&r.0, &|_| false).unwrap(), &reads_in(&r.0)),
+        hazard(
+            &worker.view(r.0.path(), &|_| false).unwrap(),
+            &reads_in(r.0.path())
+        ),
         None
     );
 }
@@ -706,12 +736,12 @@ fn the_workers_external_diff_is_a_hazard() {
 #[test]
 fn what_only_git_config_reads_does_not_hide_the_effective_config() {
     let r = repo("git-config-var");
-    git(&r.0, &["config", "core.fsmonitor", "./evil.sh"]);
-    let empty = r.0.join("empty.cfg");
+    git(r.0.path(), &["config", "core.fsmonitor", "./evil.sh"]);
+    let empty = r.0.path().join("empty.cfg");
     std::fs::write(&empty, "").unwrap();
     let hidden = Command::new("git")
         .args(["config", "--list"])
-        .current_dir(&r.0)
+        .current_dir(r.0.path())
         .env("GIT_CONFIG", &empty)
         .output()
         .expect("git config");
@@ -719,13 +749,16 @@ fn what_only_git_config_reads_does_not_hide_the_effective_config() {
         !String::from_utf8_lossy(&hidden.stdout).contains("core.fsmonitor"),
         "the control: GIT_CONFIG hides the repository's config"
     );
-    let trace = r.0.join("trace.log");
+    let trace = r.0.path().join("trace.log");
     let worker = isolated()
         .with(&format!("GIT_CONFIG={}", empty.display()))
         .with(&format!("GIT_TRACE={}", trace.display()));
     assert!(
-        hazard(&worker.view(&r.0, &|_| false).unwrap(), &reads_in(&r.0))
-            .is_some_and(|w| w.contains("core.fsmonitor"))
+        hazard(
+            &worker.view(r.0.path(), &|_| false).unwrap(),
+            &reads_in(r.0.path())
+        )
+        .is_some_and(|w| w.contains("core.fsmonitor"))
     );
     assert!(!trace.exists(), "the probe wrote a trace");
 }
@@ -733,7 +766,7 @@ fn what_only_git_config_reads_does_not_hide_the_effective_config() {
 /// The probe runs the git the WORKER's `PATH` finds — a git whose own
 /// (compiled-in) configuration differs from this process's is read as it
 /// is. Here a wrapper that adds a configuration stands in for such a git.
-/// NEGATIVE CONTROL: the worker without it on its `PATH`.
+/// Negative control: the worker without it on its `PATH`.
 #[cfg(unix)]
 #[test]
 fn the_git_on_the_workers_path_is_the_one_read() {
@@ -743,7 +776,7 @@ fn the_git_on_the_workers_path_is_the_one_read() {
         .git_program(&|_| false)
         .expect("a git on this PATH");
     let bin = Scratch::new("bin");
-    let wrapper = bin.0.join("git");
+    let wrapper = bin.0.path().join("git");
     std::fs::write(
         &wrapper,
         format!(
@@ -755,17 +788,20 @@ fn the_git_on_the_workers_path_is_the_one_read() {
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!(
         "PATH={}:{}",
-        bin.0.display(),
+        bin.0.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
     let why = hazard(
-        &isolated().with(&path).view(&r.0, &|_| false).unwrap(),
-        &reads_in(&r.0),
+        &isolated().with(&path).view(r.0.path(), &|_| false).unwrap(),
+        &reads_in(r.0.path()),
     )
     .expect("the worker's git");
     assert!(why.contains("core.fsmonitor"), "{why}");
     assert_eq!(
-        hazard(&isolated().view(&r.0, &|_| false).unwrap(), &reads_in(&r.0)),
+        hazard(
+            &isolated().view(r.0.path(), &|_| false).unwrap(),
+            &reads_in(r.0.path())
+        ),
         None
     );
 }
@@ -783,12 +819,12 @@ fn a_worker_path_that_cannot_name_the_git_is_refused() {
         "PATH=/nonexistent-aterm-git-dir",
     ] {
         assert!(
-            isolated().with(path).view(&r.0, &|_| false).is_err(),
+            isolated().with(path).view(r.0.path(), &|_| false).is_err(),
             "{path}"
         );
     }
     assert!(
-        WorkerEnv::default().view(&r.0, &|_| false).is_err(),
+        WorkerEnv::default().view(r.0.path(), &|_| false).is_err(),
         "no PATH"
     );
 }

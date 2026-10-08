@@ -29,8 +29,7 @@ no supervisor, because it launders unreviewed work as reviewed. So:
 The worker will announce "all tests pass" / "done". Do not take its word. Run the
 check yourself — the tests, the build, `git diff`, the exit code — and decide from
 THAT. The gap between what a worker claims and what the ground truth shows is the
-whole reason you are in this loop. (Observed for real: a worker reported "all
-tests pass" having written only the implementation and no test file at all.)
+whole reason you are in this loop.
 
 ## The window already supervises every agent session
 
@@ -47,31 +46,23 @@ with a journal beside it (`<sid>.journal.jsonl`):
   Bash under any header (`(unsandboxed)`, `(runs on …)`, `· from` a workflow, a
   subagent, a plugin) whatever vendor note it carries, the rm circuit breaker of every
   kind included, and Edit/Write/Read, a workflow, Fetch, a network request, Chrome, a
-  skill, Monitor, an MCP tool's box, and a box taller than the pane by the options it
-  shows; a model's or extra usage's consent too (never credits the account turned off,
-  turned back on); never
+  skill, Monitor, an MCP tool's box; a model's or extra usage's consent too (never
+  credits the account turned off, turned back on); never
   "don't ask again", a session grant or a mode switch, and never a purchase (buy, add
   funds, upgrade, a spend limit raised: the option that waits instead, else the box's
   `No`) — the folder-trust dialog (its form listing the folder's pre-approved
   permissions too: the ledger names them), plan mode's approval (its yes that grants no
   standing mode, `Yes, manually approve edits`), Claude Code's model-refusal pause (its
   switch while `model_fallback` is set; no other box's model switch is ever pressed),
-  Codex's rate-limit nudge (its switch only when Codex's own usage reading is at 90% or
-  more, and only to save the work: Codex's goal stopped — an Esc on any turn it runs
-  while switched, at most three, then a person is told — one commit-and-push-then-stop
-  turn on the cheaper model, stopped with one Esc if it is still working after 15
-  minutes and its save judged there, the thread put back on its own model and effort,
-  then held with nothing typed until the window resets, the hold recorded once in plain
-  words; nothing of it typed into a thread that fell into a sandbox, a turn a person
-  started not stopped once their keystroke is seen in it (but a message they sent before
-  the switch that Codex starts under the box is taken as Codex's own and stopped, as is
-  a turn a restarted supervisor finds more than 30 minutes past their last keystroke, or
-  one first seen busy more than 30 seconds after it once their grace ends; and no goal
-  turn is spared for a person's message before the switch), and a turn's end under a
-  Codex background terminal, however it ended, still the switch's next step —
-  `rate_nudge`; every other nudge keeps the model, never its never-show-again). A setup
+  Codex's rate-limit nudge (its switch only at 90% or more of Codex's own usage reading,
+  and only to save the work: `rate_nudge` in `aterm help harness`; every other nudge
+  keeps the model, never its never-show-again). A setup
   dialog, a proposed goal or a Computer Use grant is declined, its yes settling
-  something for good. A box a rule below proves keeps that rule in the ledger; every
+  something for good. A box taller than the pane is pressed at no level: it is answered
+  once the pane shows it whole and is a person's until then (in a bypass session one
+  whose foot flags an rm is declined with that note), and no press ever chooses an
+  answer kept for later asks (`don't ask`, `keep allowing`, `always`, `from now on`, …).
+  A box a rule below proves keeps that rule in the ledger; every
   other press carries
   `unproven: <why no rule proved it>`. A press that did not land is pressed again on a
   pause that doubles to a minute, the session badged only once it has missed for 2
@@ -79,8 +70,8 @@ with a journal beside it (`<sid>.journal.jsonl`):
   therefore the worker's own: the box no longer stops it. `approve = "safe"` answers only what a rule proves safe (a read-only
   Bash box, a Read box under a trust root or a system/scratch root and outside the secrets
   list, the rm breaker's possibly-empty-variable kind in a bypass session under a scratch
-  root, the trust dialog for the session's own folder); `"none"` nothing. It dismisses the session
-  survey (`0`, never a rating).
+  root, the trust dialog for the session's own folder); `"none"` nothing. It dismisses Claude Code's rating
+  surveys (`0`, never a rating).
 - **It answers a question dialog** (AskUserQuestion) whatever `approve` says — a question
   is no permission — with its recommended option (`answer-recommended@v1`, `[harness]
   answer_questions`, on by default; Settings: search "question"): the `(Recommended)`
@@ -95,29 +86,36 @@ with a journal beside it (`<sid>.journal.jsonl`):
   (its dialogs come to you — how you take a worker's questions; answer one with `aterm
   drive answer "@$SID" <n|label>`, its token from `aterm drive phase`'s `box` line as
   `--box`) or `recommended`; `meta unset questions` hands it back, and a dialog already
-  waiting is answered within 2 s. A dialog its own keys answered is told once: `CHOSE …
-  policy=recommended <question → answer>`, `chose` on the band.
+  waiting is answered within 2 s. `long-term` or `short-term` (the session word, or
+  `[harness] question_priority`) has the WORKER decide: the supervisor types that word's
+  fixed policy text into the free-text row and presses Enter on it (prose questions get
+  the same text); where it cannot, it answers with the recommended option. A dialog its
+  own keys answered is told once: `CHOSE … policy=<word> <question → answer>`.
 - **At a usage limit** — whatever `approve` says — it answers Claude Code's usage-limit
   dialog (`What do you want to do?`) by choosing `Wait here, then continue automatically
   …` by its label (`limit-wait@v1`, `[harness] limit_wait`, on by default), so the session
-  goes on by itself at the reset; never `Stop`, usage credits, an upgrade or a reset
-  claim, and a menu without that row is yours.
+  goes on by itself at the reset; never `Stop`, usage credits, an upgrade, or a reset
+  that claims at once, and a menu without that row is yours. A limit reset
+  the owner's plan offers in that dialog is taken only under `[harness] limit_reset =
+  true` (`limit-reset@v1`, in front of the wait, and only with `resume_limits` on):
+  BUILT, OFF BY DEFAULT, NEVER RUN AGAINST A REAL WALL. It takes one only through the
+  dialog's own reset row and its confirmation, with keys alone; it never types a
+  command for a reset, and a confirmation that does not read exactly is closed with the
+  reset kept.
 - **It types:** `keep going` (or accepts the worker's own continuation suggestion) when
   a turn ends — a worker whose turns keep ending short (under 2 minutes of work) on a
   back-off that doubles, 2 minutes to an hour, never escalated as "done"; a worker that
   says it is done (`nothing left to do`, `what would you like me to work on?`) is asked
-  once instead — "If the task is finished and verified, reply DONE and stop; otherwise
-  continue" (`continue-done-check@v1`) — and when it says done again nothing more is
-  typed until you or a person types; nothing into a session nobody has asked anything
+  once instead — "If the task is finished and verified, reply with ATERM-TASK-DONE on a
+  line by itself and stop; otherwise continue" (`continue-done-check@v1`) — and when it
+  says done again nothing more is typed until you or a person types; a report whose last
+  line is `ATERM-TASK-DONE` ends the task at once (`finished@v1`); nothing into a session nobody has asked anything
   yet (its launch screen, no turn); `answer_text`
   (decide yourself, prefer reversible steps, keep going) when the worker asks a question
   or for a decision, and only "take the option that deletes, overwrites and force-pushes
-  nothing" when it names an irreversible act; after an API error, a try that quotes
-  Claude Code's own error line instead of `keep going` (never an ask): a network never
-  reached, or a certificate or proxy refused, 1, 2, 5, then every 5 min (in a window,
-  within about a minute of the API measured reachable again, and nothing for up to 15
-  min while it is measured down), a reply cut off at once, the server's own failure or
-  an overload for ever (1, 5, 15, 30, then every 60 min); a continuation after a usage
+  nothing" when it names an irreversible act; after an API error or overload, a
+  retry quoting Claude Code's own error line (never an ask), for ever on a back-off
+  (`aterm help harness` has the schedule); a continuation after a usage
   or spend limit's reset (never buying anything); on a model-bucket limit a relaunch on the
   fallback model (`--model opus`, session-only — never `/model`, which saves the default
   for every new session) and back at its reset (a bucket asking consent to go on on
@@ -125,13 +123,17 @@ with a journal beside it (`<sid>.journal.jsonl`):
   A continuation the worker never takes is acted again on the back-off.
 - **It brings the agent back:** a Claude Code that crashed (its `sessions/<pid>.json`
   left behind) or a Codex that crashed (its shell says so: a SIGKILL, a failure) is
-  relaunched in its tab on its own conversation and told to carry on at its first idle
-  point; a newer installed build is taken at an idle point (the notice, the agent's
-  READY, the restart, the carry-on — `upgrade = false` takes it away). A graceful exit
+  relaunched in its tab on its own conversation where aterm can (a Claude Code whose
+  launch flags it can carry, else the warning names its `claude --resume` line; a Codex
+  whose conversation `codex resume` lists) and told to carry on at its first idle
+  point; a newer installed build is taken only at a genuinely idle point, nothing typed
+  before or after it (`upgrade_ask = true` restores the notice, the agent's READY and
+  the carry-on; `upgrade = false` takes it away). A graceful exit
   — `/exit` from anyone, ctrl-d, a `kill` — is someone's decision and is left alone, as
   is a launch's own end (`-p`). A worker frozen ten minutes (`status input=stalled`)
-  with nobody's hand on it is ended (`signal term`, once; `stall_term_after_s`, 0 never)
-  and relaunched; one that outlives the term is left to a person's `signal kill`.
+  with nobody's hand on it is WARNED about once (a Messages record) and left running
+  (`stall_term_after_s`, 0 never); `stall_term = true` ends it instead (`signal term`,
+  once) for its relaunch.
 - **A person wins:** within `human_grace_s` (120 s) of a person's keystroke, click,
   scroll or IME composition in the session through a window (`status human_ms=`, `EVENT <local> human`;
   control-socket writes, yours included, are not a person) — or of a draft in the
@@ -143,15 +145,17 @@ with a journal beside it (`<sid>.journal.jsonl`):
   beyond `approve`, a question under `answer_questions = false`, a written
   `continue_per_hour` spent, a lost login's browser step: the session's keyed
   `attention` (`owner=supervisor`) reads `claude <kind>: <command, path or question>
-  (<why>)`, which is one menu-bar row and one native notification. The host posts no
-  mail; a `drive watch --mail` of yours posts one `kind=ask` per point, only while
+  (<why>)`: one menu-bar row (and one desktop notification with `desktop_alerts = true`;
+  default off). The host posts no
+  mail; a `drive watch` of yours posts one `kind=ask` per point to your inbox (`--inbox`,
+  else your own session), only while
   `fabric=connected`.
 - **See it:** `aterm ctl ls` / `status` show `supervisor=aterm-harness@<pid>` (the live
   claim), `program=`, the server's `agent=` verdict (`busy|prompt|question|idle|
   wall:<kind>|…`) and `human_ms=`; `meta` shows the attention.
 - **Turn it off:** the Harness switch in Settings (search "harness"), or `enabled =
   false` under `[harness]` in aterm.toml (each policy has its own key: `aterm help
-  harness`; every key can only take power away). **Answer only the proven boxes:**
+  harness`). **Answer only the proven boxes:**
   "Approve permission boxes" set to `safe` in Settings (search "approve"), or `approve =
   "safe"`. A headless instance supervises too unless `headless = false`.
 
@@ -193,12 +197,7 @@ Two ways in:
   the human's keystrokes, in that window, never yours; aterm never reads the login.
   `aterm ctl --sock "$SOCK" identities` lists the identities and which live sessions carry each; `identities forget
   worker confirm=worker` removes the directory once no session uses it (sign out in the
-  agent first — a macOS keychain login is not aterm's to remove). On an older build without
-  `identity=`, the spawn is `ERR usage`; fall back to the instance's first session
-  (`aterm ctl --sock "$SOCK" ls | awk 'NR==1{print $3}'`) and know the worker then shares
-  your login.
-  On older builds that compound line reads `detail=cd` (the first word, not the segment
-  that runs), so when `detail=` is a shell builtin confirm the worker is up with `text`.
+  agent first — a macOS keychain login is not aterm's to remove).
   The worker is anything interactive or long-running — `claude` here, but
   `codex`/`gemini`, a REPL, or `make build` work the same way; substitute the
   launch command. Use a **plain** session — NOT `spawn connected=controller`, which injects
@@ -271,8 +270,7 @@ prints `MAIL`; read its inbox row, but do not assign it to the next turn. `task`
 the one-line `Inbox: task @<off>` as a turn, only when the worker is idle (a busy
 one gets the mail alone: re-nudge at its next EVENT).
 `task --wait` parks for the `answer|report|ack` that carries `re=<off>` and prints it.
-The steps below are the same loop by hand, and what `watch` does for you; an older
-`aterm` answers `unknown command 'phase'`.
+The steps below are the same loop by hand, and what `watch` does for you.
 
 1. **SWEEP** — cheapest possible change check.
    ```sh
@@ -299,8 +297,9 @@ The steps below are the same loop by hand, and what `watch` does for you; an old
    spinner, `Waiting for N …` a workflow or a background agent, or a done row still
    counting a shell; and the footer under its bottom rule (`esc to interrupt`, `· N
    shell(s) ·`, a workflow's `◯ … agents done`). A monitor still running (`· N monitor(s)
-   ·`, `N monitor(s) still running`) is busy too, but soft: a question or a limit notice
-   outranks it, since a persistent monitor can run for as long as the worker lives. A
+   ·`, `N monitor(s) still running`) is busy too, but soft: a question, a limit notice or
+   another wall the turn ended on (an API error, a lost login, a full context) outranks
+   it, since a persistent monitor can run for as long as the worker lives. A
    status row above the transcript is history, not a signal; `phase` prints `reason
    <where>: <rule>` under `busy` so you can check which one fired. The footer does not
    always say `esc to interrupt` while a turn runs, so the status row is the first signal
@@ -310,36 +309,34 @@ The steps below are the same loop by hand, and what `watch` does for you; an old
    gutter (`message <text>` and `reset <text|->` follow) — never the worker's own words
    about limits, and never a notice something was said after. `question` = the last
    thing it said, above the composer, ends in `?`. Manual form:
-   `aterm ctl "@$SID" text tail=40` (an older build answers `ERR usage` — read the full
-   `text`) and this table:
+   `aterm ctl "@$SID" text tail=40` and this table:
 
    | you see | do |
    |---|---|
-   | `busy` — a live spinner or `Waiting for N …` row just above the composer, `esc to interrupt`, or a shell or monitor still running | WAIT — not a review point yet. A monitor alone is soft busy: a question or a limit notice under it reads `question` / `limited`, because a monitor can run for hours |
+   | `busy` — a live spinner or `Waiting for N …` row just above the composer, `esc to interrupt`, or a shell or monitor still running | WAIT — not a review point yet. A monitor alone is soft busy: a question, a limit notice or another wall under it reads `question` / `limited` / `idle`, because a monitor can run for hours |
    | the busy indicator that *was* there is now gone | the turn finished → go REVIEW |
    | `prompt` — a live box, named by its TITLE (`kind <k>` follows: `bash`, `edit`, `read`, `workflow`, `tool`, `trust`, `question`, …), with or without an `Esc to cancel` row (Fetch, the network request, Chrome and the plan, held-message and goal dialogs draw none) | **`kind question` is NOT a permission box**: it is an AskUserQuestion dialog for the human — even one reading `Do you want to proceed?` over `1. Yes / 2. No` — so never press it as an approval (a guard on `Do.you.want.to.proceed` matches it too). The window's host answers it with its recommended option unless `[harness] answer_questions = false`, and so does your own `drive watch` unless `--no-answer`. Otherwise answer it from your notes (pick its option, or `Type something.`) or ESCALATE. Any other kind: read WHAT it asks. Matches the task and is safe → approve GUARDED on a row the box shows: `aterm ctl "@$SID" key if=Do.you.want.to.proceed 1` (the option's number, or `enter`); `OK skipped seq=<n>` = NO VISIBLE ROW matched your regex and nothing was pressed — which is equally true when the box is GONE and when a *different* box is up (an Edit box asks `Do you want to make this edit to …?`, a workflow box `Run a dynamic workflow?`). Re-read the screen and classify what is actually there; re-pressing the same guard just skips again. Surprising, destructive, or off-task → deny (`key escape`) and redirect, or ESCALATE |
    | Claude Code's permission prompt: the command line, then `Do you want to proceed?` with numbered options — `1.` Yes (this once), `2.` Yes and don't ask again for a SCOPE (`git log *`, `allow reading from <dir>`), one option `switch to auto mode`, the last `No`; footer `Esc to cancel · Tab to amend` | classify the COMMAND LINE, not the box — the `classify` line `phase` printed, or `aterm drive classify '<command>'`. Read-only and the scope on option 2 is a read-only grant → option 2 (it removes a whole class of future prompts; see *Auto-approving reads*). A write or delete → judge that one command; option 1 at most, never the scope grant. **Never pick `switch to auto mode` unless the human said so.** Off-task or unsafe → `key escape` and redirect, or ESCALATE |
-   | `limited` — its last turn ended on a usage or rate limit notice (`You've hit your session limit · resets 7:30pm`) | the worker cannot act until the limit resets or its model is switched; anything you send it fails. Decide per the human's policy — wait for `reset`, switch with `/model`, or ESCALATE — and never keep driving into the wall |
-   | `question` — a prose question, composer idle | answer it with a `turn`, from your notes (the window's host answers it itself with `answer_text` unless `[harness] answer_questions = false`) |
+   | `limited` — its last turn ended on a usage or rate limit notice (`You've hit your session limit · resets 7:30pm`) | the worker cannot act until the limit resets or its model is switched; anything you send it fails. Decide per the human's policy — wait for `reset`, switch with `/model`, or ESCALATE; a drive sent before then hits the same wall |
+   | `question` — a prose question, composer idle | answer it with a `turn`, from your notes (the window's host answers it itself with `answer_text` — a priority word's policy text under `long-term`/`short-term` — unless `[harness] answer_questions = false` and the session has no priority word of its own) |
    | `idle` — nothing running, no box, no question | the turn is over → go REVIEW |
    | a non-TUI worker (build/script/REPL) still streaming output (`drive phase` says `busy`; `ctl status` says `phase=running`) | WAIT — for these, completion is a returned shell prompt or `phase=exited`, at which point go REVIEW via the **exit code + expected artifacts**, not a busy indicator |
-   | a shell prompt where an *interactive agent* used to be | that agent exited — under the window's host a crashed Claude Code is relaunched on its conversation within seconds (`aterm harness ledger` / the journal's `HOST` lines say so); a graceful exit is not: check why, relaunch + re-brief, or ESCALATE (a build returning to the prompt is normal completion, see the row above) |
-   | anything you cannot confidently read | **NEVER type into an unknown screen** — ESCALATE |
+   | a shell prompt where an *interactive agent* used to be | that agent exited — under the window's host a crashed Claude Code is relaunched on its conversation within seconds where aterm can (`aterm help harness` says where; otherwise the warning names its `claude --resume` line), and `aterm harness ledger` / the journal's `HOST` lines show the relaunch; a graceful exit is not relaunched: check why, relaunch + re-brief, or ESCALATE (a build returning to the prompt is normal completion, see the row above) |
+   | anything you cannot confidently read | read it first (`text tail=20 trim`, `image`): a key sent blind lands wherever that program's focus is; still unreadable → ESCALATE |
 
    **No hook answers a box.** aterm installs nothing into the worker: a box is answered
    by the supervisor's policy above or by a person, and
    `phase` prints the box's `note` rows (the vendor's own reason) after `description`.
    A box the policy does not press is escalated: the worker's `attention` reads `claude
    <kind>: <command, path or question> (<why no rule approved it>)` (`ls` shows `meta=1`,
-   `status` reads `level=attention`), and under `watch --mail` you get ONE kind=ask per
+   `status` reads `level=attention`), and a `watch` with a manager inbox posts you ONE kind=ask per
    review point while `fabric=connected` — the same box back after the worker worked is
    asked again; the badge clears when the box is gone — your `key`/`turn` answering it
    is what the loop waits on.
 
    **The placeholder rule.** Text in the composer with the cursor at column 2 is Claude
-   Code's DIM suggestion, not typed input and not a question — measured: `❯ m7 is
-   reachable as ssh m7, go` was a suggestion, not a human. Typing would have pushed the
-   cursor right of the text. Check `aterm ctl "@$SID" cursor` (`OK <row> 2 …`) or `cell
+   Code's DIM suggestion, not typed input and not a question: typing would have pushed
+   the cursor right of the text. Check `aterm ctl "@$SID" cursor` (`OK <row> 2 …`) or `cell
    <row> 2` (attrs `dim`). `phase` classifies from the rows above the composer, so a
    suggestion reads `idle`; `supervise` applies the rule itself before it backspaces a
    stray digit. Never act on a suggestion as if the worker had said it.
@@ -350,7 +347,7 @@ The steps below are the same loop by hand, and what `watch` does for you; an old
    - **revise** — ground truth fails / work is wrong → drive the correction.
    - **answer** — it asked something → drive the answer.
    - **done** — ground truth PROVES completion for THIS objective (tests pass, exit 0, the expected artifact exists — whatever the objective's check actually is) → STOP.
-   - **escalate** — unsafe, surprising, or you cannot tell → STOP for a human.
+   - **escalate** — unsafe, surprising, or you cannot tell → flag it for a human (`attention`, below); that one decision waits for them, the rest of the run does not.
 
    **Read the worker's final message with `aterm drive report "@$SID" --final`, not
    the screen:** `--final` prints only its LAST message block — from its last `⏺`
@@ -362,8 +359,7 @@ The steps below are the same loop by hand, and what `watch` does for you; an old
 
    **The whole report, when you do need it, is `aterm drive report "@$SID"`, not
    the screen:** Claude Code runs on the alternate screen, so what scrolled off its top
-   is gone from `text` — measured, 7 of the 35 message blocks of one worker turn were
-   still on the screen; a lost one reported a broken build. `report` joins the rows the
+   is gone from `text`. `report` joins the rows the
    host kept (`offscreen`) with the screen's, from your turn's `❯` row down, verbatim.
    `report complete=1 …` = nothing was lost; `complete=0 reason=…` = rows may be missing
    (the reason says why) — say so, and lean harder on the ground truth. Either way it is
@@ -376,27 +372,23 @@ The steps below are the same loop by hand, and what `watch` does for you; an old
    Keep the instruction to **one line with balanced quotes and parens**. Claude
    Code's composer treats Enter as a newline (not submit) while a bracket is open,
    so a truncated or unbalanced instruction silently piles up in the input box and
-   never runs. The `settle=` pattern is **ONE whitespace-free token**: the client
-   joins argv with single spaces and the server re-splits the line on whitespace,
-   so shell quotes do not survive the wire — `settle=gone:'esc to interrupt'` arms
-   the regex `esc` and TYPES `to interrupt timeout=600000 <instruction>` into the
-   worker as the message, with the timeout left at its 240 s default. Write
-   `esc.to.interrupt`; `.` is regex, not the shell's business. Neither idle-settle
-   nor prompt-matching is a completion signal for an interactive worker. Measured:
-   `turn idle=3000` settled after 4.5 s while Claude Code was still thinking — its
-   screen sits static for 3+ s mid-turn. And the composer glyph (Claude Code `❯`,
-   Codex `»`) is on screen the *entire* time it thinks, so matching it returns
-   mid-turn too. The signal that holds is the busy footer DISAPPEARING — `esc to
+   never runs. The `settle=` pattern is **ONE whitespace-free token**: the server
+   re-splits the line on whitespace, so `settle=gone:'esc to interrupt'` arms the
+   regex `esc` and TYPES `to interrupt timeout=600000 <instruction>` into the worker
+   as the message, with the timeout left at its 240 s default. Write `esc.to.interrupt`. Neither idle-settle nor
+   prompt-matching is a completion signal for an interactive worker: Claude Code's
+   screen sits static for 3+ s mid-turn, and the composer glyph (Claude Code `❯`,
+   Codex `»`) is on screen the *entire* time it thinks. The signal that holds is the busy footer DISAPPEARING — `esc to
    interrupt` in Claude Code; substitute the worker's own footer text.
    `settle=gone:` first waits (bounded by `submit_window`, default 2000 ms) for the
    footer to APPEAR after the submit, then for it to LEAVE; a footer never seen in
    that window silently degrades the turn to idle-settle, so WAIT still confirms
-   with `await gone`. On a build whose `turn` has no `settle=gone:`, drive with
-   `turn idle=2500 …` and treat its return as *submitted*, not *finished*: WAIT
-   decides completion.
+   with `await gone`.
 
 4. **WAIT** — block on the one session most likely to move next. Never busy-poll;
-   never park more than one waiter (each holds a control lane).
+   never park more than one waiter: each parked wait holds one of the 64 wait
+   slots every tab shares (past them, one of 4 request slots; then `ERR control
+   server busy`).
    ```sh
    aterm drive await-turn "@$SID" --timeout 600000   # block until the phase is not busy, print it like `phase`; exit 124 = still busy
    ```
@@ -408,22 +400,9 @@ The steps below are the same loop by hand, and what `watch` does for you; an old
    ```sh
    aterm ctl "@$SID" await gone esc.to.interrupt timeout=600000   # OK gone <seq> = turn finished | OK timeout = still busy
    ```
-   The regex is ONE token (`esc.to.interrupt`): a quoted `'esc to interrupt'` is
-   re-split on the wire, arms `esc`, and drops the rest (`aterm ctl` prints a stderr
-   `note:` first, and still sends it). `await gone` is
-   level-triggered: if the footer is already absent it returns at once, so arm it
-   only after the footer is up (right after your `turn`, or after a read showed
-   it). `OK timeout` (exit 124) is an answer — still busy — not an error. A build
-   with no `gone` answers `ERR usage: await <idle <ms>|seq [<n>]|match <re> …|block|…>`
-   — a grammar with no `gone` in it; fall back to this loop until the footer is
-   absent:
-   ```sh
-   aterm ctl "@$SID" await idle 4000 timeout=300000       # settled? exit 124 = still busy = an answer
-   aterm ctl "@$SID" text | grep -c 'esc to interrupt'    # read the footer: nonzero = NOT done, idle or not
-   aterm ctl "@$SID" await seq timeout=15000              # footer still up + idle → wait for fresh output, re-read
-   ```
-   Do not skip the middle read: idle alone is exactly the false positive measured
-   above.
+   The regex is ONE token, as above. `await gone` is level-triggered: if the footer
+   is already absent it returns at once, so arm it only after the footer is up
+   (right after your `turn`, or after a read showed it).
 
 ### Run the loop unattended: `aterm drive supervise`
 
@@ -437,7 +416,10 @@ window's approval policy decides every box under your `[harness]` — capped by
 secrets list, the rm breaker under a scratch root, the trust dialog for the session's own
 folder); without the flag it answers every box, as the host does, and `--approve none`
 answers nothing — save the usage-limit dialog's wait row, which every level chooses
-(`limit_wait`). The press is GUARDED by the row
+(`limit_wait`); this loop never takes a limit reset (`limit_reset`, built and off by
+default, never run against a real wall, is the window's host's alone, through the
+dialog's own reset row and its confirmation, no command typed).
+The press is GUARDED by the row
 that was judged, plus the read's generation (`key if=<that row> if-gen=<g> 1`), so a box
 swapped between the read and the press matches nothing; one line `approved read-only:
 <command>` (`approved (<rule>): …` for the others) goes to `--notes`, and the loop
@@ -486,18 +468,26 @@ standing rules ride in every continuation it does type from `[harness] rules_fil
   however quick the worker was. An identical screen that the worker somehow reached
   again is the one case it stays quiet about: if a line you expected does not come,
   `aterm drive phase` it.
-- **`EVENT survey seq=<n> dismiss with: aterm ctl @<sid> key 'if=^●.How.is.Claude.doing'
-  0` is Claude Code's session survey, and it is never yours to answer.** It is printed
-  once when `● How is Claude doing this session?` over `1: Bad    2: Fine   3: Good   0:
+- **`EVENT survey seq=<n>[ kind=<k>] dismiss with: aterm ctl @<sid> key
+  'if=^●.How.is.Claude.doing' 0` is one of Claude Code's rating surveys, and it is never
+  yours to answer.** It is printed once when `● How is Claude doing this session?` (or the
+  long-context, plugin or memory card, `kind=<name>`) over `1: Bad    2: Fine   3: Good   0:
   Dismiss` appears above the composer (`aterm drive phase` and `await-turn` end with
   `survey 0` while it is open), and again if it comes back after going. While it is open,
   a turn whose first character is 1, 2 or 3 is taken as the HUMAN's rating of the
-  session: never rate it for them. Run the command it names — `0`, guarded on the
-  survey's own row, quoted for zsh — before your next `turn`. Unless `[harness]
-  dismiss_surveys = false`, the loop presses that `0` itself (never while a box is up)
-  and prints `DISMISSED survey seq=<n>` once the survey has gone; if it is still there,
-  you get the `EVENT survey` line, and it presses the `0` again on a growing back-off
-  (badging the session from the second miss) until the survey goes. A monitor that filters the lines keeps that one too: `aterm drive watch
+  session: never rate it for them. Run the command the line prints — `0`, guarded on THAT
+  card's own question row, quoted for zsh; a guard typed from memory names only the
+  session survey — before your next `turn`. Unless `[harness] dismiss_surveys = false`,
+  the loop presses that `0` itself (never while a box is up; on a busy read too, once per
+  appearance) and prints `DISMISSED survey seq=<n>[ kind=<k>]` once the survey has gone;
+  if it is still there, you get the `EVENT survey` line, and it presses the `0` again on a
+  growing back-off (the host is told from the second miss, and no tab is marked) until the survey goes. The
+  drafted-feedback card ("Bug report drafted"), the transcript-share question and the
+  web-setup offer are NOT surveys and are never pressed: a manager must not press the
+  drafted-feedback card's `0` either (the first opens a question, and the next turns the
+  feature off in the settings). **A line that says `not pressed (…)` names no command:**
+  the loop withheld the `0` on purpose — read the card (`aterm ctl <sid> text`) and decide;
+  never improvise an unguarded `key 0`. A monitor that filters the lines keeps that one too: `aterm drive watch
   … | grep --line-buffered -E '^(EVENT|APPROVED|CHOSE|DISMISSED|CONTINUED|TYPED|RESTARTED|MAIL|EXTEND|RECONNECT|WATCHING|TIMEOUT|EXIT)'`.
 - **`EVENT context seq=<n> <v>% until auto-compact` means the worker is about to compact;
   `EVENT compacted seq=<n>` means it has.** Claude Code parks `1% until auto-compact`
@@ -528,9 +518,9 @@ standing rules ride in every continuation it does type from `[harness] rules_fil
   point handed over never is (a question turn's report does not become the next
   turn's); `--report-window` (default 120 s) bounds only a report from before the turn
   was seen to begin. A question, a prompt and a limit notice are never held for mail.
-  `MAIL lane off: <why>` once means the lane could not run (no fabric, an older host)
+  `MAIL off: <why>` once means mail could not be watched (no fabric, an older host)
   and the lines are as without the flag from then on. The process ends with its last
-  line: the lane's parked wait is cut short.
+  line: its parked mail wait is cut short.
 - **`--report` counts what was said** when there is no mail: each idle, question and
   limited EVENT carries `complete=<0|1> rows=<n>` before its summary (`EVENT idle
   seq=812 complete=1 rows=57 …`) — the `report` of everything the worker said since
@@ -560,8 +550,8 @@ standing rules ride in every continuation it does type from `[harness] rules_fil
   `continuing shortly`) names that time as its reset and stays on the screen while the
   worker resumes under it; nothing is typed there and nothing is raised (it is handled),
   unless the worker has not gone on 10 minutes past that time — then it is continued. Otherwise, unless `[harness]
-  resume_limits = false`, it CONTINUES the worker, as the owner would: a minute past the
-  reset, or as soon as the screen leaves the notice (a `/login`, a `/model` line), `keep
+  resume_limits = false`, it CONTINUES the worker, as the owner would: 150 s past the
+  reset (each session of an account up to a minute later), or as soon as the screen leaves the notice (a `/login`, a `/model` line), `keep
   going` (with `rules_file`'s standing rules), at an idle composer with nothing typed,
   guarded — `CONTINUED seq=<n> rule=usage-resume@v1 <text>`; the notice again after it
   waits 10 min, then 30 — and a limit it waits out raises no badge. Under
@@ -571,6 +561,16 @@ standing rules ride in every continuation it does type from `[harness] rules_fil
   works again (the first busy read after an auto-continue notice; else when it answers).
   It invents no work beyond `keep going`: the LAST DIRECTIVE IS YOURS TO RESEND — the
   journal and `aterm ctl "@$SID" history` show it. Never keep driving into the wall.
+  The event is raised whatever the worker's footer counts as running: a shell, monitor or
+  workflow behind the wall does not hide it, and a `Goal paused · …` echo under it is read
+  through to the row that caused it. A limit whose reset is a bare clock time is placed on
+  when it was drawn, and sessions on one account spread up to a minute past the reset so they
+  do not all type at once. A wall the loop waits on is remembered while its rows are off the
+  screen (a scroll back, a `/model` under it). What only a person can answer (a lost login, a
+  spend limit no reset ends, a model limit the tab cannot switch off, a cleared `/goal`, a full
+  context three `/compact`s cannot shrink) is a journal line,
+  `EXCEPTION seq=<n> kind=<word> when=<later|now> <why> => <action>`, and
+  `CLEARED seq=<n> exception=<word> …` when it ends: read it before deciding to intervene.
 - **A worker without Claude Code's composer** (a build, a REPL) gets an EVENT each time
   its output pauses for 2 s and its last rows changed — for a build you are only waiting
   on, `aterm drive await-turn` or `aterm ctl "@$SID" await block` is the better tool.
@@ -586,13 +586,10 @@ standing rules ride in every continuation it does type from `[harness] rules_fil
 
 ### A usage limit — the worker's, and your own
 
-Measured 2026-09-15 16:51 → 2026-09-17 08:55: the manager's and the worker's Claude Code
-drew on ONE account. Its weekly limit hit both at once — the worker stopped at an idle
-composer under `You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)`,
-the manager's workflow lost its last stage, the watcher printed `EVENT limited`, ran out its
-`--max-s` and exited — and nobody could act for two days, while a finished A/B sat unread.
-When the owner logged in under another account, a one-line question was answered in 23 s. Three
-things keep that from happening again:
+A manager and a worker on ONE account hit its limit together: the worker stops at an idle
+composer under `You've hit your weekly limit · resets …`, the manager's workflow loses its
+stage, the watcher prints `EVENT limited`, runs out its `--max-s` and exits — and nobody
+acts until the reset. Three things prevent that:
 
 1. **Run the watcher as a plain process** under your harness's background monitor (Claude
    Code's Monitor tool), never as a stage of a workflow that a limit can end: `aterm drive
@@ -630,10 +627,10 @@ nudged=0|1` once the post LANDED (`off=` is what the worker's `inbox` row shows 
 answer carries as `re=`). It reads the worker's phase once and, ONLY when idle, types
 the one-line `Inbox: task @<off>` as a turn (not waited on); a busy worker gets the mail
 alone and reads it at its next look — nothing wakes it for mail. A post that did not land
-is the error in the server's words:
-`queued=1` means it
-is in the outbox and WILL land when a bridge drains it (never re-post), `no-bridge=1`
-that this instance has no bridge at all. `--wait` parks `await inbox` on your inbox for
+is the error in the server's words: `queued=1` or `ERR timeout id=<n>` means it is in
+the outbox and WILL land when a bridge drains it (a re-post duplicates it), `no-bridge=1`
+that this instance has no bridge to drain it, `unroutable|ambiguous|undeliverable` that
+the address is wrong. `--wait` parks `await inbox` on your inbox for
 the `answer|report|ack` with `re=<off>` (bounded by `--deadline`, else `--timeout`, and
 re-armed past the host's 600 s clamp on one wait) and prints its MAIL line and body;
 `TIMEOUT …` / exit 124 when none came.
@@ -678,7 +675,7 @@ aterm drive classify 'git log --oneline -5'                    # read-only      
 
 `read-only` (exit 0) or `not-read-only <reason>` (exit 1) — pure, no host needed; the
 same function `phase` prints as its `classify` line and `supervise --approve safe` acts
-on. Its rules, each paid for by a misclassification in a real session: the line is read
+on. Its rules: the line is read
 as the shell reads it first (a `#` comment ends at its newline, a here-document body is
 data, and `$'…'` with an escape, a `${…}` holding a quote or a substitution, or an
 unterminated quote refuses); quoted strings are then dropped (a `>` inside a `git
@@ -712,23 +709,28 @@ Log every auto-approval in the notes file — the command line, the option chose
 and why it qualified — so the human can audit what you waved through; `supervise
 --notes` writes `approved read-only: <command>` for you.
 
-## Bounded autonomy — this IS the safety floor, not optional
+## Bounded autonomy — the limits, and what each one tells you
 
-- **Budget.** Pick a max number of drives before you stop and report. Decrement
-  per drive; at zero, ESCALATE. Never loop unbounded.
-- **No-progress breaker.** If you drive 2–3 times and `revision` never advances,
-  the worker is wedged or ignoring you — STOP and escalate; do not keep driving.
-- **Escalate** = raise a needs-human flag and stop acting:
+- **Budget.** A drive budget is a limit you (or the human) choose for a run; aterm imposes
+  none. Decrement per drive; when it runs out, flag it (below) with where the work stands,
+  and weigh the progress before you extend it — an unbounded loop is how a wedged worker
+  burns a day.
+- **No-progress signal.** 2–3 drives with no `revision` advance means the worker is wedged
+  or not reading you, and the same text again is unlikely to move it: change the input
+  (read the screen, `signal int`, re-brief) or flag it.
+- **Escalate** = flag a decision that is a human's, and carry on with what you can decide:
   ```sh
   aterm ctl "@$SID" meta set attention '<why a human is needed>'
   ```
   A non-empty `attention` is the typed escalation aterm's menu-bar UI badges.
-- **Yield to a human.** A person's input through the window shows as `status human_ms=`
-  (and `EVENT <local> human` on `subscribe … events`); your control writes never set it.
-  Hold off while `human_ms=` is under 120000, and when told to stand down, STOP. Yield to
-  another *socket* driver via the lease: if `aterm ctl "@$SID" lease status` shows a
-  holder that is not you, do not drive.
-- **Never type into a screen you cannot read.** Unknown → escalate, every time.
+- **A person at the keyboard wins.** A person's input through the window shows as `status
+  human_ms=` (and `EVENT <local> human` on `subscribe … events`); your control writes never
+  set it. Under 120000 a person is typing there, and a person who tells you to stand down
+  has taken the session back. Another *socket* driver holding the lease (`aterm ctl
+  "@$SID" lease status` names a holder that is not you) owns the session's input until it
+  releases it.
+- **An unknown screen**: read it before you type (`text`, `image`); a key sent blind lands
+  wherever that program's focus happens to be.
 
 ## Report when you stop
 

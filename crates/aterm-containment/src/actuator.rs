@@ -2,30 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Spawn-seam containment actuator — the bridge from the policy DATA MODEL
-//! (mode → [`Capabilities`](crate::Capabilities)) to a real, logged decision at
-//! the one place aterm forks a child shell.
+//! Spawn-seam containment actuator: turns the policy data model (mode →
+//! [`Capabilities`](crate::Capabilities)) into a logged decision at the one
+//! place aterm forks a child shell.
 //!
-//! ## What is enforced (`ATERM_DESIGN` §0.1 / §5.6) — the one scope statement
+//! ## What is enforced (`ATERM_DESIGN` §0.1 / §5.6)
 //!
-//! The rest of this crate maps a [`ContainmentMode`] to a
-//! [`Capabilities`](crate::Capabilities) set; that mapping enforces nothing by
-//! itself. This module turns it into a [`SpawnDecision`] that both launchers
-//! (`aterm` and the window) consult BEFORE handing the PTY seam a spawn
-//! capability, and audits it. Per mode:
+//! The mode → capabilities mapping enforces nothing by itself. This module
+//! produces a [`SpawnDecision`] that both launchers (`aterm` and the window)
+//! consult before handing the PTY seam a spawn capability, and audits it:
 //!
 //! | Mode | Enforced |
 //! |---|---|
 //! | Master, User | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
-//! | Safety | Hardened resource limits (`aterm-sandbox`: rlimits on Unix, the Job Object on Windows). No OS sandbox, on any platform. |
-//! | Containment | The hardened limits PLUS the OS sandbox below — and on a platform without one, NO SHELL (see "Fail closed"). |
+//! | Safety | Hardened resource limits (`aterm-sandbox`: rlimits on Unix, the Job Object on Windows). No OS sandbox. |
+//! | Containment | The hardened limits plus the OS sandbox below; on a platform without one, no shell. |
 //!
-//! **The Containment OS sandbox (macOS Seatbelt).** The spawn is wrapped with
-//! `/usr/bin/sandbox-exec -p <SBPL>`, the profile from [`crate::sbpl::profile_for`]
-//! (its module doc lists the rules in order). The kernel then, for the child shell
-//! and everything it runs:
+//! The Containment OS sandbox (macOS Seatbelt) wraps the spawn with
+//! `/usr/bin/sandbox-exec -p <SBPL>`, the profile from
+//! [`crate::sbpl::profile_for`] (whose module doc lists the rules). For the
+//! child shell and everything it runs, the kernel:
 //!
 //! - denies ALL network (`(deny network*)`);
+//! - refuses every task port but a process's own — control, read, inspect and
+//!   name, its own children's included — so a contained `lldb`/`debugserver`
+//!   cannot attach to anything ([`crate::sbpl`] rule 2);
 //! - confines WRITES to the temp roots (`/private/tmp`, `/private/var/tmp`, the
 //!   user's own `$TMPDIR`) and `/dev`, plus the shell's own history files, so
 //!   nothing it does can plant code that a later unsandboxed shell runs
@@ -39,19 +40,16 @@
 //!   private-data stores (`~/Documents`, `~/Desktop`, `~/Downloads`, media, and the
 //!   local Mail / Messages / keychain / cookies / browser-profile databases).
 //!
-//! Other READS stay allowed so a normal `$SHELL` works (dyld, `path_helper`, the rc
-//! files, `/dev/tty`): a deny-by-default READ allowlist breaks the shell and is
-//! not pursued. Every rule is proven against the live kernel by the enforcement
-//! tests in this module. [`SpawnDecision::Permit::sbpl`] carries the per-user
-//! profile; the PTY seam refuses to spawn if the wrapper binary is missing.
+//! Other reads stay allowed so a normal `$SHELL` works. Every rule is proven
+//! against the live kernel by the enforcement tests here.
+//! [`SpawnDecision::Permit::sbpl`] carries the per-user profile; the PTY seam
+//! refuses to spawn if the wrapper binary is missing.
 //!
-//! **Fail closed.** Decided by the owner 2026-09-25: `Containment` NEVER degrades
-//! to a weaker posture. Where [`os_sandbox_actuated`] is false — Linux, Windows,
-//! every non-macOS target — [`decide`] returns [`SpawnDecision::Deny`] naming the
-//! platform gap, and both launchers exit without starting a shell. That refusal
-//! is the product off macOS: Containment is macOS-only by scope (decided
-//! 2026-09-27 under the owner's standing direction; `docs/ATERM_DESIGN.md` §5.6
-//! — Landlock/seccomp are not the launch target).
+//! Fail closed: `Containment` never degrades. Where [`os_sandbox_actuated`] is
+//! false (every non-macOS target), [`decide`] returns [`SpawnDecision::Deny`]
+//! naming the gap and both launchers exit without a shell. Containment is
+//! macOS-only by scope (`docs/ATERM_DESIGN.md` §5.6)
+//! (owner, 2026-09-25; 2026-09-27).
 
 use crate::audit::{log_denial, log_posture};
 use crate::capability::{NetworkCapability, ProcessCapability};
@@ -65,51 +63,40 @@ const SUBSYSTEM: &str = "spawn";
 /// Both launchers print it verbatim.
 pub const NO_OS_SANDBOX_REASON: &str = "the sandbox exists only on macOS, so no shell was started";
 
-/// Whether THIS BUILD/PLATFORM can actuate a real OS sandbox at the spawn seam:
-/// `true` only on macOS (Seatbelt via `sandbox-exec`). What that sandbox enforces
-/// is the module doc's scope statement; where this is `false`, `Containment`
-/// spawns are refused. Use [`network_sandbox_actuated`] for the per-mode answer.
+/// Whether this build/platform can actuate a real OS sandbox at the spawn
+/// seam: `true` only on macOS (Seatbelt via `sandbox-exec`). Where `false`,
+/// `Containment` spawns are refused. See [`network_sandbox_actuated`] for the
+/// per-mode answer.
 #[must_use]
 pub const fn os_sandbox_actuated() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// Whether the OS NETWORK sandbox is actually in force for a spawn in `mode`.
-///
-/// `true` iff this build/platform can actuate ([`os_sandbox_actuated`]) AND the
-/// mode's network policy is [`None`](crate::NetworkCapability::None) (i.e.
-/// `Containment` — the only mode that denies network). For every other mode the
-/// policy permits network, so no sandbox is applied and this is `false`.
-///
-/// This is the truthful per-spawn statement the audit log and the GUI use: it is
-/// `true` ONLY for the spawn that is genuinely wrapped in `sandbox-exec` with the
-/// network-deny profile — never flipped optimistically.
+/// Whether the OS network sandbox is in force for a spawn in `mode`: `true`
+/// iff [`os_sandbox_actuated`] and the mode's network policy is
+/// [`None`](crate::NetworkCapability::None) (only `Containment`). This is the
+/// per-spawn statement the audit log and the GUI use.
 #[must_use]
 pub fn network_sandbox_actuated(mode: ContainmentMode) -> bool {
     os_sandbox_actuated() && ContainmentPolicy::network(mode) == NetworkCapability::None
 }
 
 /// The actuated decision for the single spawn seam, given a containment mode.
-///
-/// Not `Copy`: the `Permit` variant carries an owned, per-user `sbpl` `String`
-/// (the profile embeds the canonicalized `$HOME` paths, so it is not a
-/// `&'static`). It stays `Clone`.
+/// Not `Copy`: `Permit` carries the owned per-user `sbpl` profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SpawnDecision {
     /// Spawning the initial shell is permitted.
     ///
     /// `os_sandbox` records whether a real OS sandbox backs this spawn (see
-    /// [`network_sandbox_actuated`]): `true` only for a `Containment` spawn on
-    /// macOS, where the launcher MUST wrap the child in `sandbox-exec` with `sbpl`.
-    /// When `false`, an explicit audit line was logged so an OS-unconfined posture
-    /// is never silent.
+    /// [`network_sandbox_actuated`]): `true` only for `Containment` on macOS,
+    /// where the launcher must wrap the child in `sandbox-exec` with `sbpl`.
+    /// When `false`, an explicit audit line was logged.
     ///
-    /// `sbpl`, when `Some`, is the per-user Seatbelt profile string the launcher
-    /// passes to `/usr/bin/sandbox-exec -p <sbpl>`. It is `Some` exactly when
-    /// `os_sandbox` is `true`. The launcher fails CLOSED if it cannot apply a
-    /// `Some(sbpl)` (e.g. the wrapper binary is missing): it must NOT spawn an
-    /// unsandboxed shell when the policy demands the sandbox.
+    /// `sbpl` is `Some` exactly when `os_sandbox` is `true`: the per-user
+    /// profile for `/usr/bin/sandbox-exec -p <sbpl>`. A launcher that cannot
+    /// apply it (e.g. the wrapper is missing) must not spawn an unsandboxed
+    /// shell.
     Permit {
         /// The mode this decision was made for.
         mode: ContainmentMode,
@@ -142,22 +129,18 @@ impl SpawnDecision {
     }
 }
 
-/// Decide — and AUDIT — whether the single PTY spawn seam may run for `mode`,
-/// and (for `Containment`) how the OS sandbox backs it.
+/// Decide, and audit, whether the single PTY spawn seam may run for `mode`,
+/// and for `Containment` how the OS sandbox backs it (`ATERM_DESIGN` §5.6).
 ///
-/// This is the seam wiring required by `ATERM_DESIGN` §5.6: the spawn is gated on
-/// the containment decision and the chosen mode is logged. For `Containment` on
-/// macOS the returned [`SpawnDecision::Permit`] carries `os_sandbox: true` and the
-/// per-user SBPL profile the launcher MUST apply via `sandbox-exec`. For
-/// `Containment` anywhere else it is [`SpawnDecision::Deny`] with
-/// [`NO_OS_SANDBOX_REASON`] — never a silently weaker shell. For every other mode
-/// `os_sandbox` is `false`, `sbpl` is `None`, and an audit line records that no OS
-/// sandbox is in force.
+/// `Containment` on macOS: [`SpawnDecision::Permit`] with `os_sandbox: true`
+/// and the per-user SBPL profile the launcher must apply. `Containment`
+/// elsewhere: [`SpawnDecision::Deny`] with [`NO_OS_SANDBOX_REASON`]. Every
+/// other mode: `os_sandbox` false, `sbpl` `None`, and an audit line saying no
+/// OS sandbox is in force.
 ///
-/// The initial interactive shell is otherwise permitted in every mode (including
-/// `Containment`/`NoFork`, whose contract is "exec only, for the initial
-/// shell"). A hypothetical future `ProcessCapability` below `NoFork` would
-/// fail closed via [`SpawnDecision::Deny`].
+/// The initial interactive shell is otherwise permitted in every mode
+/// (`Containment`/`NoFork` means "exec only, for the initial shell"); a future
+/// `ProcessCapability` below `NoFork` would get [`SpawnDecision::Deny`].
 #[must_use]
 pub fn decide(mode: ContainmentMode) -> SpawnDecision {
     decide_on(
@@ -173,8 +156,7 @@ pub fn decide(mode: ContainmentMode) -> SpawnDecision {
 fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>) -> SpawnDecision {
     let process_cap = ContainmentPolicy::process(mode);
     let denies_network = ContainmentPolicy::network(mode) == NetworkCapability::None;
-    // Containment demands the OS sandbox. Where the platform has none, refuse
-    // the spawn outright — the owner's fail-closed ruling (2026-09-25).
+    // Containment demands the OS sandbox; without one, refuse the spawn (owner, 2026-09-25).
     if denies_network && !sandbox_available {
         log_denial(SUBSYSTEM, "spawn initial shell", mode, NO_OS_SANDBOX_REASON);
         return SpawnDecision::Deny {
@@ -182,10 +164,8 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
             reason: NO_OS_SANDBOX_REASON,
         };
     }
-    // Resolve the OS sandbox posture for this mode. `os_sandbox` is true ONLY for a
-    // Containment spawn on a platform that can actuate (macOS); `sbpl` is the
-    // per-user profile in that case and `None` otherwise. The two are kept in
-    // lockstep (sbpl.is_some() == os_sandbox).
+    // `os_sandbox` is true only for Containment where the platform can actuate;
+    // `sbpl` is then the per-user profile (`sbpl.is_some() == os_sandbox`).
     let os_sandbox = denies_network && sandbox_available;
     let scoped: Option<(String, bool)> = if os_sandbox {
         crate::sbpl::profile_for_scoped(ContainmentPolicy::capabilities(mode), home)
@@ -200,10 +180,8 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
         "sbpl must be Some iff os_sandbox"
     );
 
-    // Audit the OS-sandbox posture for the chosen mode through the containment
-    // audit target so operators see one stream. These are POSTURE records, NOT
-    // denials — they use `log_posture` (no `DENIED:` prefix) so a denial-stream
-    // filter never miscounts a permitted/actuated spawn as a security denial.
+    // Posture records, not denials: `log_posture` (no `DENIED:` prefix), so a
+    // denial-stream filter never counts a permitted spawn.
     if os_sandbox {
         log_posture(
             SUBSYSTEM,
@@ -212,13 +190,11 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
             applied_posture(home_scoped),
         );
     } else {
-        // Explicit, non-silent record that no OS sandbox is in force for this mode
-        // (its policy permits network). Safety's hardened limits apply as rlimits
-        // on Unix and through the Job Object on Windows
-        // (`aterm_sandbox::Limits::shell_default`); Master and User keep
-        // aterm's own (`Limits::inherit`, chosen by both launchers) — the
-        // launching shell's for a session, launchd's for the window — so their
-        // record claims no limits.
+        // Explicit record that no OS sandbox is in force (the policy permits
+        // network). Safety's hardened limits apply as rlimits on Unix and via
+        // the Job Object on Windows (`aterm_sandbox::Limits::shell_default`);
+        // Master and User keep aterm's own (`Limits::inherit`), so their record
+        // claims no limits.
         log_posture(
             SUBSYSTEM,
             "os-network-sandbox",
@@ -231,7 +207,7 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
         );
     }
     match process_cap {
-        // Every currently-defined capability permits the INITIAL shell.
+        // Every currently-defined capability permits the initial shell.
         ProcessCapability::Full | ProcessCapability::Restricted | ProcessCapability::NoFork => {
             SpawnDecision::Permit {
                 mode,
@@ -250,18 +226,18 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
     }
 }
 
-/// What an applied sandbox enforces, from what its profile holds (pass
-/// [`SpawnDecision::Permit`]'s `home_scoped`): the shell-history allowance and
-/// the credential and private-data read denies are joined onto `$HOME`, so a
-/// home that did not resolve gets neither, and a `$HOME` other than the
-/// account's home leaves that home's stores readable. The aterm.log posture
-/// record and the window's `--verbose` line both print this one wording.
+/// What an applied sandbox enforces, given [`SpawnDecision::Permit`]'s
+/// `home_scoped`: the history allowance and the credential and private-data
+/// denies are joined onto `$HOME`, so an unresolved home gets neither, and a
+/// `$HOME` other than the account's leaves that account's stores readable.
+/// Shared wording for the aterm.log posture record and the window's
+/// `--verbose` line.
 #[must_use]
 pub fn applied_posture(home_scoped: bool) -> &'static str {
     if home_scoped {
-        "OS sandbox applied: no network; writes only to temp dirs and shell history; no access to credential stores or private data under $HOME"
+        "OS sandbox applied: no network; no debugger attach (no task port but a process's own); writes only to temp dirs and shell history; no access to credential stores or private data under $HOME"
     } else {
-        "OS sandbox applied: no network; writes only to temp dirs; $HOME did not resolve, so credential stores and private data can still be read"
+        "OS sandbox applied: no network; no debugger attach (no task port but a process's own); writes only to temp dirs; $HOME did not resolve, so credential stores and private data can still be read"
     }
 }
 
@@ -271,9 +247,8 @@ mod tests {
 
     #[test]
     fn os_sandbox_actuation_matches_platform() {
-        // The build/platform capability: macOS can actuate (sandbox-exec), other
-        // platforms cannot. This is the truthful platform claim — NOT a per-spawn
-        // claim (that is `network_sandbox_actuated`).
+        // The platform capability (not per-spawn; that is
+        // `network_sandbox_actuated`).
         assert_eq!(os_sandbox_actuated(), cfg!(target_os = "macos"));
     }
 
@@ -319,8 +294,8 @@ mod tests {
 
     #[test]
     fn containment_fails_closed_without_an_os_sandbox() {
-        // The owner's ruling (2026-09-25): on a platform with no OS sandbox the
-        // Containment spawn is REFUSED, naming the gap — never a weaker shell.
+        // On a platform with no OS sandbox the Containment spawn is refused,
+        // naming the gap (owner, 2026-09-25).
         assert_eq!(
             decide_on(ContainmentMode::Containment, false, None),
             SpawnDecision::Deny {
@@ -360,7 +335,7 @@ mod tests {
     #[test]
     fn permit_carries_sbpl_iff_network_sandbox_actuated() {
         // Containment on macOS: Permit{os_sandbox:true, sbpl:Some(profile)} where
-        // the profile begins with the network deny. Everything else:
+        // the profile begins with the base profile. Everything else:
         // Permit{os_sandbox:false, sbpl:None}. The sbpl and the os_sandbox flag are
         // always in lockstep.
         for mode in [
@@ -393,8 +368,8 @@ mod tests {
                     );
                     if let Some(profile) = sbpl {
                         assert!(
-                            profile.starts_with(crate::sbpl::NETWORK_DENY_PROFILE),
-                            "{mode} sbpl must begin with the network deny; got {profile}"
+                            profile.starts_with(crate::sbpl::BASE_PROFILE),
+                            "{mode} sbpl must begin with the base profile; got {profile}"
                         );
                     }
                 }
@@ -405,10 +380,8 @@ mod tests {
 
     #[test]
     fn non_containment_spawn_is_never_os_sandboxed() {
-        // The byte-identical-spawn guarantee at the decision layer: User (the
-        // default interactive mode), Safety, and Master must ALL come back with
-        // os_sandbox=false and sbpl=None, so the launcher applies no sandbox-exec
-        // wrap and the spawn is exactly as before.
+        // User (the default), Safety and Master get os_sandbox=false and
+        // sbpl=None, so the launcher applies no sandbox-exec wrap.
         for mode in [
             ContainmentMode::User,
             ContainmentMode::Safety,
@@ -438,6 +411,10 @@ mod tests {
         let homeless = applied_posture(false);
         assert!(!homeless.contains("no access"), "{homeless}");
         assert!(!homeless.contains("shell history"), "{homeless}");
+        // The task-port pair is in the base profile, so it holds with no home too.
+        for posture in [applied_posture(true), homeless] {
+            assert!(posture.contains("no debugger attach"), "{posture}");
+        }
     }
 
     /// `home_scoped` is decided by whether the home resolved, not by whether a
@@ -491,15 +468,10 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // ENFORCEMENT PROOF (macOS) — the whole point of the actuation.
-    //
-    // These tests spawn a probe via the EXACT same `sandbox-exec -p <sbpl> <prog>
-    // <args>` wrapping the actuator/launcher uses, attempt an operation the
-    // profile denies, and assert it FAILS — proving the Seatbelt sandbox actually
-    // enforces on this box. Without these passing, `os_sandbox_actuated()` must
-    // NOT report macOS as actuating.
-    // ===================================================================
+    // Enforcement proof (macOS). These tests spawn a probe via the same
+    // `sandbox-exec -p <sbpl> <prog> <args>` wrapping the launcher uses,
+    // attempt an operation the profile denies, and assert it fails. Without
+    // them passing, `os_sandbox_actuated()` must not report macOS as actuating.
 
     /// Build the sandbox-exec argv the launcher builds: `sandbox-exec -p <sbpl>
     /// <prog> <args...>`. Mirrors the wrap done in `aterm-pty::spawn_shell`.
@@ -510,12 +482,9 @@ mod tests {
         cmd
     }
 
-    /// PROOF 1 (network) — HERMETIC, no external network. A loopback TCP listener
-    /// is bound in this (parent) test process; a probe (`/usr/bin/nc`) tries to
-    /// connect to it. WITHOUT the sandbox the connect SUCCEEDS; with the SAME
-    /// `sandbox-exec -p '(deny network*)'` wrap the actuator emits, the connect
-    /// FAILS. The differential against the one live listener — only the sandbox
-    /// wrap changed — is the proof Seatbelt denies network on this box.
+    /// Proof 1 (network), hermetic: a loopback TCP listener in this process; a
+    /// probe (`/usr/bin/nc`) connects without the sandbox and fails with the
+    /// actuator's `sandbox-exec -p '(deny network*)'` wrap.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_network_deny_blocks_loopback_connect() {
@@ -532,11 +501,11 @@ mod tests {
         else {
             panic!("Containment on macOS must actuate the network sandbox; got {sbpl:?}");
         };
-        // The full per-user profile begins with the exact network deny (it may also
-        // carry the secret-dir denies); the network deny is what THIS proof tests.
-        assert!(profile.starts_with(crate::sbpl::NETWORK_DENY_PROFILE));
+        // The full per-user profile begins with the base profile (it may also carry
+        // the secret-dir denies); its network deny is what THIS proof tests.
+        assert!(profile.starts_with(crate::sbpl::BASE_PROFILE));
 
-        // Loopback listener in the PARENT. An accept thread keeps draining so the
+        // Loopback listener in the parent. An accept thread keeps draining so the
         // control connect completes cleanly; bound to port 0 (kernel-assigned).
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().unwrap().port();
@@ -557,9 +526,8 @@ mod tests {
         // `-G`/`-w` bound nc's connect time so a deny fails fast instead of hanging.
         let nc_args = ["-G", "2", "-w", "2", "-z", "127.0.0.1", port_s.as_str()];
 
-        // CONTROL: no sandbox → the loopback connect SUCCEEDS (rc == 0). This
-        // proves the probe + listener work, so a failure under the sandbox is
-        // attributable to the sandbox, not a broken probe.
+        // Control: no sandbox, the loopback connect succeeds, so a failure
+        // under the sandbox is the sandbox's.
         let control = std::process::Command::new("/usr/bin/nc")
             .args(nc_args)
             .output()
@@ -571,8 +539,7 @@ mod tests {
             String::from_utf8_lossy(&control.stderr),
         );
 
-        // SANDBOXED: same probe, same listener, wrapped in the actuator's
-        // `sandbox-exec -p '(deny network*)'` → the connect MUST FAIL.
+        // Sandboxed: same probe and listener; the connect must fail.
         let sandboxed = sandbox_wrap(&profile, "/usr/bin/nc", &nc_args)
             .output()
             .expect("run nc under sandbox-exec");
@@ -584,30 +551,21 @@ mod tests {
             String::from_utf8_lossy(&sandboxed.stderr),
         );
 
-        // Tidy up the accept thread (a connect we never made would block it on
-        // the 2nd accept; drop the listener by letting the thread time-bound
-        // itself — it returns after the control connect's single accept and one
-        // more accept attempt which the OS may immediately error once we exit).
-        // We do not join unconditionally to avoid a hang if the 2nd accept blocks;
-        // instead make a throwaway connect to unblock it, then join.
+        // Unblock the accept thread's second accept with a throwaway connect,
+        // then join.
         let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         let _ = accepter.join();
     }
 
-    /// PROOF 2 (explicit EPERM string) — the same `sandbox-exec -p <sbpl> <prog>`
-    /// wrap, but with a file-read-deny profile over a real temp file, so the
-    /// kernel's denial surfaces as the exact "Operation not permitted" (EPERM)
-    /// text. This nails the enforcement SEMANTICS (it is a permission denial, not
-    /// some unrelated failure) using the same wrapping mechanism. NOTE: the path
-    /// is CANONICALIZED — `/tmp` is a symlink to `/private/tmp` on macOS and
-    /// Seatbelt matches the canonical path, so a non-canonical literal would NOT
-    /// match (a footgun this test deliberately avoids and documents).
+    /// Proof 2 (EPERM): the same wrap with a file-read-deny profile over a real
+    /// temp file, so the denial surfaces as "Operation not permitted". The path
+    /// is canonicalized, since Seatbelt matches `/private/tmp`, not `/tmp`.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_file_read_deny_yields_operation_not_permitted() {
         use std::io::Write;
 
-        // A real temp file with known contents, then its CANONICAL path.
+        // A real temp file with known contents, then its canonical path.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("aterm-sbpl-enforce-{}.txt", std::process::id()));
         {
@@ -660,12 +618,9 @@ mod tests {
         );
     }
 
-    /// PROOF 3 (SHELL-COMPAT, FULL generated Containment profile) — the whole point
-    /// of `(allow default)` + targeted denies: a NORMAL shell must keep working.
-    /// We take the EXACT profile the actuator hands the launcher for `Containment`
-    /// (network deny + the canonicalized secret-dir denies, scoped under the real
-    /// `$HOME`) and run an ordinary command pipeline under it. It MUST exit 0 with
-    /// the expected output — i.e. the secret-scoping did NOT break the shell.
+    /// Proof 3 (shell compatibility): an ordinary command pipeline under the
+    /// exact `Containment` profile the actuator produces (scoped under the real
+    /// `$HOME`) exits 0 with the expected output.
     #[cfg(target_os = "macos")]
     #[test]
     fn shell_compat_full_containment_profile_keeps_a_normal_shell_working() {
@@ -678,12 +633,11 @@ mod tests {
         else {
             panic!("Containment on macOS must actuate the OS sandbox; got {decision:?}");
         };
-        // It is the network deny PLUS a file deny — never a blanket FS deny.
-        assert!(profile.starts_with(crate::sbpl::NETWORK_DENY_PROFILE));
+        // It is the base profile PLUS a file deny — never a blanket FS deny.
+        assert!(profile.starts_with(crate::sbpl::BASE_PROFILE));
 
-        // Ordinary, non-secret operations: echo, pwd, a directory listing, and a
-        // read of a normal system file that exists on macOS. None of these touch a
-        // secret path, so all must succeed under the full Containment profile.
+        // Ordinary operations (echo, pwd, a listing, a read of a system file)
+        // touch no secret path and must succeed.
         let out = sandbox_wrap(
             &profile,
             "/bin/sh",
@@ -708,20 +662,17 @@ mod tests {
         );
     }
 
-    /// PROOF 4 (SECRET-DENY + TARGETED scope, FULL generated Containment profile) —
-    /// the security payload. Under the EXACT actuator profile for `Containment`:
-    ///   (a) a probe file planted inside a denied secret dir (`$HOME/.aws`) is NOT
-    ///       readable — `cat` fails with EPERM ("Operation not permitted"); AND
-    ///   (b) a NON-secret file (`/etc/hosts`) IS still readable (exit 0).
-    /// (a)+(b) together prove the deny is TARGETED at the secret set, not a blanket
-    /// filesystem deny. The probe is created under a real secret dir and cleaned up.
+    /// Proof 4 (targeted secret deny): under the exact `Containment` profile,
+    /// (a) a probe file inside `$HOME/.aws` is not readable (EPERM), and (b)
+    /// `/etc/hosts` still is, so the deny targets the secret set rather than
+    /// the filesystem. The probe file is cleaned up.
     #[cfg(target_os = "macos")]
     #[test]
     fn secret_deny_full_containment_profile_blocks_secret_but_allows_nonsecret() {
         use std::io::Write;
 
         // Need a real, resolvable $HOME for the profile to scope under. If $HOME is
-        // somehow unset in the test env, the profile is network-only and this proof
+        // somehow unset in the test env, the profile is the base one and this proof
         // is not applicable — skip rather than false-pass.
         let Ok(home) = std::env::var("HOME") else {
             eprintln!("HOME unset in test env — skipping secret-deny proof");
@@ -765,20 +716,20 @@ mod tests {
         let control_ok = control.status.success()
             && String::from_utf8_lossy(&control.stdout).contains("SECRET-DENY-PROBE");
 
-        // (a) SANDBOXED read of the secret probe → MUST be denied (EPERM).
+        // (a) sandboxed read of the secret probe → must be denied (EPERM).
         let denied = sandbox_wrap(&profile, "/bin/cat", &[secret_probe_s.as_str()])
             .output()
             .expect("run cat on secret probe under Containment profile");
         let denied_stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
         let denied_stdout = String::from_utf8_lossy(&denied.stdout).into_owned();
 
-        // (b) SANDBOXED read of a NON-secret file (/etc/hosts) → MUST succeed.
+        // (b) sandboxed read of a NON-secret file (/etc/hosts) → must succeed.
         let allowed = sandbox_wrap(&profile, "/bin/cat", &["/etc/hosts"])
             .output()
             .expect("run cat on /etc/hosts under Containment profile");
         let allowed_ok = allowed.status.success();
 
-        // Clean up the probe (and the dir if we created it) BEFORE asserting, so a
+        // Clean up the probe (and the dir if we created it) before asserting, so a
         // failed assert never leaks the user's real ~/.aws contents or our probe.
         let _ = std::fs::remove_file(&secret_probe);
         if !dir_pre_existed {
@@ -804,7 +755,7 @@ mod tests {
             denied_stderr.contains("Operation not permitted"),
             "expected EPERM 'Operation not permitted' denying the secret; got stderr={denied_stderr:?}",
         );
-        // (b) non-secret still allowed → the scope is TARGETED, not blanket.
+        // (b) non-secret still allowed → the scope is targeted, not blanket.
         assert!(
             allowed_ok,
             "OVER-BROAD DENY: a NON-secret file (/etc/hosts) was NOT readable under \
@@ -853,7 +804,7 @@ mod tests {
     /// has its own proof, 5b, over a scratch `$HOME`, since whether the real
     /// one's history file gets it depends on what that file is). Each probe
     /// opens for append without writing a byte, and anything a failed deny
-    /// would have created is removed. CONTROL: under the network deny alone the
+    /// would have created is removed. CONTROL: under the base profile alone the
     /// same `$HOME` probe is writable, so its denial is the write confinement's.
     #[cfg(target_os = "macos")]
     #[test]
@@ -904,9 +855,9 @@ mod tests {
         // No LaunchAgents directory yet: planting one is creating it.
         let agents_made = !agents_existed
             && sandboxed_sh_ok(&profile, &format!("mkdir '{}'", launch_agents.display()));
-        // CONTROL: the `$HOME` probe under the network deny alone — writable,
+        // CONTROL: the `$HOME` probe under the base profile alone — writable,
         // so its denial above is the write confinement's.
-        let control_ok = sandboxed_append_ok(crate::sbpl::NETWORK_DENY_PROFILE, &denied[0]);
+        let control_ok = sandboxed_append_ok(crate::sbpl::BASE_PROFILE, &denied[0]);
         if agents_made {
             let _ = std::fs::remove_dir(&launch_agents);
         }
@@ -943,12 +894,9 @@ mod tests {
         }
     }
 
-    /// A scratch `$HOME` for a live proof that must plant files: under the test
-    /// binary's target directory, which lies outside every
-    /// [`crate::sbpl::WRITABLE_ROOTS`] entry on a normal checkout. `None` (the
-    /// proof says so and stops) where the target directory is itself under a
-    /// writable root, since every write there is allowed and the proof would
-    /// prove nothing.
+    /// A scratch `$HOME` under the test binary's target directory, outside
+    /// every [`crate::sbpl::WRITABLE_ROOTS`] entry. `None` (and the proof stops)
+    /// where the target directory is itself under a writable root.
     #[cfg(target_os = "macos")]
     fn scratch_home_outside_writable_roots(tag: &str) -> Option<std::path::PathBuf> {
         let exe = std::env::current_exe().ok()?;
@@ -971,22 +919,20 @@ mod tests {
         Some(home)
     }
 
-    /// PROOF 5b (HISTORY, FULL generated Containment profile over a scratch
-    /// `$HOME`) — the history allowance works, and cannot be turned into a write
-    /// anywhere else.
+    /// Proof 5b (history, over a scratch `$HOME`): the history allowance works
+    /// and cannot become a write anywhere else.
     ///
-    /// - zsh saves its history there as it does at a prompt (lock, append, and a
-    ///   save-by-copy through `.zsh_history.new`) with no error;
-    /// - the contained shell cannot make a history name a symlink — neither to
-    ///   `$HOME` nor to `~/.zshrc` — nor hard-link `~/.zshrc` there;
-    /// - a symlink already at a history name carries no write: Seatbelt judges
-    ///   the file it resolves to, which is not allowed;
-    /// - the next session's profile, generated over a `~/.zsh_history` pointed
-    ///   at `$HOME` (planted from outside, since the session may not), names no
-    ///   part of `$HOME`, and that session cannot write `~/.zshrc` or create
-    ///   `~/Library/LaunchAgents`.
+    /// - zsh saves history as at a prompt (lock, append, save-by-copy through
+    ///   `.zsh_history.new`) with no error;
+    /// - the contained shell cannot make a history name a symlink (to `$HOME`
+    ///   or `~/.zshrc`) nor hard-link `~/.zshrc` there;
+    /// - a symlink already at a history name carries no write (Seatbelt judges
+    ///   its target);
+    /// - the next session's profile, over a `~/.zsh_history` pointed at `$HOME`
+    ///   from outside, names no part of `$HOME`, and that session cannot write
+    ///   `~/.zshrc` or create `~/Library/LaunchAgents`.
     ///
-    /// CONTROL: the same `~/.zshrc` append succeeds under the network deny alone.
+    /// CONTROL: the same `~/.zshrc` append succeeds under the base profile alone.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_history_allowance_widens_nothing() {
@@ -1041,7 +987,7 @@ mod tests {
         let second = generate();
         let zshrc_second = sandboxed_append_ok(&second, &zshrc);
         let agents_second = sandboxed_sh_ok(&second, &format!("mkdir -p {}", q(&agents)));
-        let control = sandboxed_append_ok(crate::sbpl::NETWORK_DENY_PROFILE, &zshrc);
+        let control = sandboxed_append_ok(crate::sbpl::BASE_PROFILE, &zshrc);
         let zshrc_after = std::fs::read_to_string(&zshrc).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&home);
 
@@ -1087,9 +1033,8 @@ mod tests {
         );
     }
 
-    /// PROOF 6 (LOGIN SHELL) — the user's own login shell, rc files and all,
-    /// starts and exits 0 under the full Containment profile: the write
-    /// confinement and the denies do not break `$SHELL -lic`.
+    /// Proof 6 (login shell): the user's own login shell, rc files and all,
+    /// exits 0 under the full Containment profile (`$SHELL -lic`).
     #[cfg(target_os = "macos")]
     #[test]
     fn shell_compat_login_shell_runs_under_containment() {
@@ -1111,6 +1056,315 @@ mod tests {
             out.status.code(),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// The probe child's target, handed down by [`enforcement_proof_task_ports_stay_outside`].
+    #[cfg(target_os = "macos")]
+    const TASK_PORT_TARGET: &str = "ATERM_TASK_PORT_PROBE_TARGET";
+
+    /// Re-entered by PROOF 7 under a profile: asks for its own control port and
+    /// for the target's control, read, inspect and name ports, and prints the
+    /// `kern_return_t`s (`self=<c> target=<c>/<r>/<i>/<n>`). Run alone it does
+    /// nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "PROOF 7's probe child; runs only when that proof re-enters it"]
+    fn task_port_probe_child() {
+        type ForPid = unsafe extern "C" fn(
+            libc::mach_port_t,
+            libc::pid_t,
+            *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+        unsafe extern "C" {
+            static mach_task_self_: libc::mach_port_t;
+            fn task_for_pid(
+                target_tport: libc::mach_port_t,
+                pid: libc::pid_t,
+                task: *mut libc::mach_port_t,
+            ) -> libc::kern_return_t;
+            fn task_read_for_pid(
+                target_tport: libc::mach_port_t,
+                pid: libc::pid_t,
+                task: *mut libc::mach_port_t,
+            ) -> libc::kern_return_t;
+            fn task_inspect_for_pid(
+                target_tport: libc::mach_port_t,
+                pid: libc::pid_t,
+                task: *mut libc::mach_port_t,
+            ) -> libc::kern_return_t;
+            fn task_name_for_pid(
+                target_tport: libc::mach_port_t,
+                pid: libc::pid_t,
+                task: *mut libc::mach_port_t,
+            ) -> libc::kern_return_t;
+        }
+        let Some(target) = std::env::var(TASK_PORT_TARGET)
+            .ok()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        else {
+            return;
+        };
+        let ask = |flavor: ForPid, pid: libc::pid_t| {
+            let mut port: libc::mach_port_t = 0;
+            // SAFETY: `mach_task_self_` is libSystem's cached send right to this
+            // task, initialised before `main`; each `task_*_for_pid` writes `port`
+            // only on success, and the leaked right dies with this process.
+            unsafe { flavor(mach_task_self_, pid, &raw mut port) }
+        };
+        let flavors: [ForPid; 4] = [
+            task_for_pid,
+            task_read_for_pid,
+            task_inspect_for_pid,
+            task_name_for_pid,
+        ];
+        let target_ports: Vec<String> = flavors
+            .iter()
+            .map(|&flavor| ask(flavor, target).to_string())
+            .collect();
+        println!(
+            "TASK_PORTS self={} target={}",
+            ask(task_for_pid, std::process::id().cast_signed()),
+            target_ports.join("/")
+        );
+    }
+
+    /// PROOF 7 (TASK PORTS, FULL generated Containment profile) — a contained
+    /// process cannot take any task port — control, read, inspect or name — of a
+    /// process outside the sandbox (the `lldb`/`debugserver` escape, silent once
+    /// macOS developer mode is on), and keeps its own. The target is an ad-hoc copy of `/bin/sleep` signed with
+    /// `get-task-allow`, the one kind of target an unentitled requester is granted
+    /// with no prompt; the requester is this test binary, which carries no
+    /// debugger entitlement, so no path here is meant to raise the administrator
+    /// dialog — but one did: on 2026-09-30, on a machine with developer mode off,
+    /// the probe sat under an open SecurityAgent prompt until it was killed. So
+    /// the probe is bounded, and a prompt fails this proof by name.
+    /// CONTROL: under `(allow default)` alone the same probe IS granted the
+    /// target's port, so the denial is the profile's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enforcement_proof_task_ports_stay_outside() {
+        // Re-signing a copy of an Apple binary waits on trustd.
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
+        struct Target(std::process::Child);
+        impl Drop for Target {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let sleeper = dir.path().join("sleep");
+        let entitlements = dir.path().join("get-task-allow.plist");
+        std::fs::copy("/bin/sleep", &sleeper).expect("copy /bin/sleep");
+        std::fs::write(
+            &entitlements,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict>\
+             <key>com.apple.security.get-task-allow</key><true/></dict></plist>\n",
+        )
+        .expect("write the entitlements");
+        // Under a hang detector: a codesign macOS stops answering mid-run fails
+        // this test in a minute instead of hanging the suite.
+        let signed = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command("/usr/bin/codesign")
+                .args(["--force", "--sign", "-", "--entitlements"])
+                .arg(&entitlements)
+                .arg(&sleeper),
+            std::time::Instant::now() + aterm_uds::deadline::CODESIGN_HANG,
+        )
+        .expect("run codesign");
+        assert!(
+            signed.status.success(),
+            "ad-hoc signing the target failed: {}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+        let target = Target(
+            std::process::Command::new(&sleeper)
+                .arg("60")
+                .spawn()
+                .expect("start the target"),
+        );
+        let exe = std::env::current_exe().expect("this test binary");
+        let probe = |profile: &str| {
+            let exe = exe.to_str().expect("utf8 test binary path");
+            let mut child = sandbox_wrap(
+                profile,
+                exe,
+                &[
+                    "--exact",
+                    "actuator::tests::task_port_probe_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ],
+            )
+            .env(TASK_PORT_TARGET, target.0.id().to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the probe child");
+            // BOUNDED. A `task_for_pid` that macOS answers with the
+            // administrator dialog blocks until a person answers it, and an
+            // unattended gate has nobody: measured 2026-09-30 on a machine with
+            // developer mode off, the child sat at 0% CPU under an open
+            // SecurityAgent prompt for 1h37m and held `tools/verify.sh` with it.
+            // A probe that has not answered in PROBE_DEADLINE fails, naming
+            // that cause, instead of waiting for ever. A hang detector, never a
+            // latency budget: an answered probe ends in milliseconds.
+            const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+            let started = std::time::Instant::now();
+            while child.try_wait().expect("poll the probe child").is_none() {
+                if started.elapsed() >= PROBE_DEADLINE {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the probe child under {profile:?} did not answer in {PROBE_DEADLINE:?}: \
+                         its task_for_pid is most likely waiting on the macOS administrator \
+                         dialog (developer mode off; see `DevToolsSecurity -status`), which \
+                         this proof's premise says cannot be raised — a finding about this \
+                         machine, not a pass"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let out = child.wait_with_output().expect("collect the probe child");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            // `--nocapture` puts the reading on the harness's own `test … ` line.
+            let ports = stdout
+                .lines()
+                .find_map(|line| line.split_once("TASK_PORTS "))
+                .map(|(_, ports)| ports.trim().to_string());
+            ports.unwrap_or_else(|| {
+                panic!(
+                    "no TASK_PORTS line from the probe child; stdout={stdout:?} stderr={:?}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+        };
+
+        let control = probe("(version 1)(allow default)");
+        assert_eq!(
+            control, "self=0 target=0/0/0/0",
+            "CONTROL: an unsandboxed-equivalent probe must be granted every port, \
+             or the denial below proves nothing"
+        );
+        let contained = probe(&containment_profile());
+        let refused_all = contained
+            .strip_prefix("self=0 target=")
+            .is_some_and(|target| target.split('/').all(|kr| kr != "0"));
+        assert!(
+            refused_all,
+            "DENY FAILED: under the Containment profile the probe must keep its own \
+             task port and be refused every flavor of the outside target's; got {contained:?}"
+        );
+    }
+
+    /// What tells [`launch_broker_probe_child`] to probe.
+    #[cfg(target_os = "macos")]
+    const BROKER_PROBE: &str = "ATERM_LAUNCH_BROKER_PROBE";
+
+    /// Re-entered by PROOF 8 under a profile: asks bootstrap for a send right to
+    /// each of [`crate::sbpl::DENIED_LAUNCH_BROKERS`] and prints the
+    /// `kern_return_t`s (`BROKERS <kr>/<kr>/…`). It only looks the names up; it
+    /// never sends a message, so nothing is launched. Run alone it does nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "PROOF 8's probe child; runs only when that proof re-enters it"]
+    fn launch_broker_probe_child() {
+        unsafe extern "C" {
+            static bootstrap_port: libc::mach_port_t;
+            static mach_task_self_: libc::mach_port_t;
+            fn bootstrap_look_up(
+                bp: libc::mach_port_t,
+                service_name: *const libc::c_char,
+                sp: *mut libc::mach_port_t,
+            ) -> libc::kern_return_t;
+            fn mach_port_deallocate(
+                task: libc::mach_port_t,
+                name: libc::mach_port_t,
+            ) -> libc::kern_return_t;
+        }
+        if std::env::var_os(BROKER_PROBE).is_none() {
+            return;
+        }
+        let codes: Vec<String> = crate::sbpl::DENIED_LAUNCH_BROKERS
+            .iter()
+            .map(|name| {
+                let name = std::ffi::CString::new(*name).expect("a service name has no NUL");
+                let mut port: libc::mach_port_t = 0;
+                // SAFETY: `bootstrap_port` is libSystem's bootstrap send right,
+                // initialised before `main`; `bootstrap_look_up` reads the C
+                // string and writes `port` only on success.
+                let kr = unsafe { bootstrap_look_up(bootstrap_port, name.as_ptr(), &raw mut port) };
+                if port != 0 {
+                    // SAFETY: `port` is a send right this call just received.
+                    unsafe { mach_port_deallocate(mach_task_self_, port) };
+                }
+                kr.to_string()
+            })
+            .collect();
+        println!("BROKERS {}", codes.join("/"));
+    }
+
+    /// PROOF 8 (LAUNCH BROKERS, FULL generated Containment profile) — a contained
+    /// process gets no port to Launch Services or the Apple Events daemon, each of
+    /// which starts or drives a process that does not inherit the sandbox (`open`
+    /// of a `.command` file, a scripted app). CONTROL: under `(allow default)`
+    /// alone every lookup succeeds, so the refusal is the profile's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enforcement_proof_launch_brokers_denied() {
+        let exe = std::env::current_exe().expect("this test binary");
+        let probe = |profile: &str| {
+            let exe = exe.to_str().expect("utf8 test binary path");
+            let mut cmd = sandbox_wrap(
+                profile,
+                exe,
+                &[
+                    "--exact",
+                    "actuator::tests::launch_broker_probe_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ],
+            );
+            // A lookup answers at once and asks nobody anything (unlike PROOF 7's
+            // `task_for_pid`, which can wait on the administrator dialog).
+            let out = cmd
+                .env(BROKER_PROBE, "1")
+                .output()
+                .expect("run the probe child");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            stdout
+                .lines()
+                .find_map(|line| line.split_once("BROKERS "))
+                .map(|(_, codes)| codes.trim().to_string())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no BROKERS line from the probe child; stdout={stdout:?} stderr={:?}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )
+                })
+        };
+
+        let control = probe("(version 1)(allow default)");
+        assert!(
+            control.split('/').all(|kr| kr == "0"),
+            "CONTROL: an unsandboxed-equivalent probe must reach every launch broker, \
+             or the denial below proves nothing; got {control:?}"
+        );
+        let contained = probe(&containment_profile());
+        assert!(
+            contained.split('/').all(|kr| kr != "0"),
+            "DENY FAILED: under the Containment profile every launch-broker lookup must be \
+             refused; got {contained:?} for {:?}",
+            crate::sbpl::DENIED_LAUNCH_BROKERS
         );
     }
 

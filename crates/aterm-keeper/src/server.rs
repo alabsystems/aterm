@@ -28,7 +28,7 @@ use aterm_uds::exitwatch::ExitWatch;
 
 use crate::core::{ConnId, Holders, KeeperCore, KeeperEnv, MarkerEvidence, Out, Rdev};
 use crate::frameio::{Incoming, read_frame, write_frame};
-use crate::identity::Identity;
+use crate::identity::{CheckError, Identity};
 use crate::sys::{self, POLLERR, POLLHUP, POLLIN, PollFd};
 use crate::wire::{Birth, Frame, MarkerRef, MasterHeader, PROTO};
 
@@ -88,6 +88,9 @@ pub struct Server {
     started: Instant,
     own_pid: u32,
     refused_dials: u64,
+    /// Why the last dial refused UNCHECKED was, as last printed: printed once
+    /// per reason, not once per dial, and forgotten at the next admitted dial.
+    unchecked_said: Option<String>,
     /// Frames read after their writer's exit had already arrived, before the
     /// exit was recorded ([`Server::drain_pid`]).
     frames_behind_exit: u64,
@@ -97,6 +100,10 @@ pub struct Server {
     /// `EMFILE` would.
     #[cfg(test)]
     test_fail_next_dup: bool,
+    /// A TEST SEAM: every reason a dial was turned away unchecked, never
+    /// cleared ([`Server::test_unchecked_ever`]).
+    #[cfg(test)]
+    test_unchecked_ever: Vec<String>,
 }
 
 /// A per-connection receive/send budget: once a frame's header has arrived,
@@ -117,19 +124,32 @@ struct Env<'a> {
     _p: std::marker::PhantomData<&'a ()>,
 }
 
+impl Env<'_> {
+    /// What one device's scan means to the core.
+    fn verdict(&self, scan: aterm_uds::holders::HolderScan) -> Holders {
+        if !scan.holders.is_empty() {
+            Holders::Held(scan.holders)
+        // A peer of ours whose table could not be read may hold it. A peer
+        // that has died is not one of them, judged or not: the scan reads an
+        // exited process as holding nothing (`ESRCH`: the kernel closed its
+        // descriptors at the exit).
+        } else if scan.unreadable.iter().any(|p| self.peer_pids.contains(p)) {
+            Holders::Unknown
+        } else {
+            Holders::None
+        }
+    }
+}
+
 impl KeeperEnv for Env<'_> {
     fn holders(&mut self, rdev: Rdev) -> Holders {
-        match aterm_uds::holders::scan_rdev_holders(rdev, &[self.own_pid]) {
-            Ok(scan) if !scan.holders.is_empty() => Holders::Held(scan.holders),
-            // A peer of ours whose table could not be read may hold it. A
-            // peer that has died is not one of them, judged or not: the scan
-            // reads an exited process as holding nothing (`ESRCH`: the kernel
-            // closed its descriptors at the exit).
-            Ok(scan) if scan.unreadable.iter().any(|p| self.peer_pids.contains(p)) => {
-                Holders::Unknown
-            }
-            Ok(_) => Holders::None,
-            Err(_) => Holders::Unknown,
+        self.holders_of(&[rdev]).pop().unwrap_or(Holders::Unknown)
+    }
+    /// ONE walk of the uid's processes for the whole set, none for an empty one.
+    fn holders_of(&mut self, rdevs: &[Rdev]) -> Vec<Holders> {
+        match aterm_uds::holders::scan_holders_of(rdevs, &[self.own_pid]) {
+            Ok(scans) => scans.into_iter().map(|scan| self.verdict(scan)).collect(),
+            Err(_) => rdevs.iter().map(|_| Holders::Unknown).collect(),
         }
     }
     fn shell_alive(&mut self, pid: u32, birth: Birth) -> bool {
@@ -244,10 +264,13 @@ impl Server {
             started: Instant::now(),
             own_pid: std::process::id(),
             refused_dials: 0,
+            unchecked_said: None,
             frames_behind_exit: 0,
             replies_lost: 0,
             #[cfg(test)]
             test_fail_next_dup: false,
+            #[cfg(test)]
+            test_unchecked_ever: Vec::new(),
         })
     }
 
@@ -347,9 +370,29 @@ impl Server {
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-            if self.identity.check(&stream).is_err() {
-                self.refused_dials += 1;
-                continue;
+            // The code check waits on macOS's trustd, under its hang detector
+            // (`identity::PEER_CHECK_HANG`), so a silent trustd stalls the loop
+            // that long, once — while it stays silent every later dial is
+            // refused at once (`aterm_uds::deadline::TRUST`).
+            match self.identity.check(&stream, IO_TIMEOUT) {
+                Ok(()) => self.unchecked_said = None,
+                Err(CheckError::Refused(_)) => {
+                    self.refused_dials += 1;
+                    continue;
+                }
+                Err(CheckError::Unchecked(why) | CheckError::Unanswered(why)) => {
+                    self.refused_dials += 1;
+                    #[cfg(test)]
+                    self.test_unchecked_ever.push(why.clone());
+                    if self.unchecked_said.as_deref() != Some(why.as_str()) {
+                        eprintln!(
+                            "keeper: turned away a connection whose identity could not be \
+                             verified: {why}"
+                        );
+                        self.unchecked_said = Some(why);
+                    }
+                    continue;
+                }
             }
             let Ok(pid) = aterm_uds::fdpass::peer_pid(&stream) else {
                 self.refused_dials += 1;
@@ -574,6 +617,9 @@ impl Server {
                         proto: PROTO,
                         offers,
                         version: self.version.clone(),
+                        // What a window that checks code reads before it
+                        // registers a master here (§5.7).
+                        identity: Some(self.identity.policy()),
                     };
                     self.send(conn, &frame, None);
                 }
@@ -705,6 +751,32 @@ impl Server {
     #[must_use]
     pub fn holds(&self, rdev: Rdev) -> bool {
         self.custody.contains_key(&rdev)
+    }
+
+    /// A TEST SEAM: end every connection as a read error or a failed write
+    /// does (a stalled link, a malformed frame) while the peers' processes
+    /// live on. Each socket is SHUT DOWN before it is dropped: with a mere
+    /// close, 4 of 8 whole-suite runs left the connection open — the link's
+    /// next write succeeded into a socket nobody read (another holder of the
+    /// descriptor, most likely a child a concurrent test spawned while it was
+    /// not yet close-on-exec); serially, never.
+    #[cfg(test)]
+    pub(crate) fn test_drop_connections(&mut self) {
+        let ids: Vec<ConnId> = self.conns.keys().copied().collect();
+        for id in ids {
+            if let Some(c) = self.conns.get(&id) {
+                let _ = c.stream.shutdown(std::net::Shutdown::Both);
+            }
+            self.drop_conn(id);
+        }
+    }
+
+    /// Why this keeper turned each dial away unchecked (its accept check could
+    /// not run), never cleared by a later admitted dial: a test tells a
+    /// `trustd` that went silent from a verdict on the dialer.
+    #[cfg(test)]
+    pub(crate) fn test_unchecked_ever(&self) -> &[String] {
+        &self.test_unchecked_ever
     }
 }
 
@@ -856,19 +928,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A fresh PTY master (a device no other process holds) and its rdev.
-    /// Opened close-on-exec (std's `open` always is): a child a sibling test
-    /// spawns must not inherit it, or that child holds it for its life and
-    /// the keeper rightly offers it to no one.
+    /// A fresh PTY master (a device no other process holds) and its rdev,
+    /// from aterm-pty's `open_pty_pair`. Close-on-exec from the open: a child
+    /// a sibling test spawns must not inherit it, or that child holds it for
+    /// its life and the keeper rightly offers it to no one. A `/dev/ptmx`
+    /// open that lost XNU's race for a pty minor to another opener, in this
+    /// process or any other (`EREDRIVEOPEN`, -6), is redriven there: a bare
+    /// open of the device failed this module's tests with it, 3 runs in 2,000
+    /// beside a parallel opener. The slave is closed at once; the keeper
+    /// holds and offers masters only.
     fn a_pty_master() -> (OwnedFd, Rdev) {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        const O_NOCTTY: i32 = 0x20000;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(O_NOCTTY)
-            .open("/dev/ptmx")
-            .expect("a fresh PTY master");
+        use std::os::fd::FromRawFd as _;
+        let (master, slave) = aterm_pty::open_pty_pair().expect("a fresh PTY pair");
+        // SAFETY: two fresh descriptors this function alone owns.
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        drop(slave);
+        let file = std::fs::File::from(master);
         let rdev = file.metadata().expect("fstat").rdev();
         (OwnedFd::from(file), rdev)
     }
@@ -919,8 +995,7 @@ mod tests {
         bye_read: bool,
         claim_read: bool,
         /// The orphan is Orphaned again after B's EOF: an offer is made to a
-        /// connection, and returns when that connection is gone (round-seven
-        /// update audit, finding 65).
+        /// connection, and returns when that connection is gone.
         returned_at_eof: bool,
         replies_lost: u64,
         dropped_at_eof: bool,
@@ -1050,8 +1125,8 @@ mod tests {
     /// recipient reads the WELCOME and then EOF, and the frames it wrote
     /// behind the HELLO being answered — its claim, its BYE — are still read;
     /// the connection is dropped at its EOF, not before, and the offer
-    /// returns to Orphaned at that EOF (finding 65: nothing registers on a
-    /// connection that is gone). Dropping the connection at the
+    /// returns to Orphaned at that EOF (nothing registers on a connection that
+    /// is gone). Dropping the connection at the
     /// failed duplicate lost the claim and the BYE: a quit then reads as a
     /// crash, its shells kept.
     /// NEGATIVE CONTROL: the same run with the duplicate made delivers the

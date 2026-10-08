@@ -9,7 +9,7 @@
 //! `MenuTarget::menuAction:` uses ([`crate::menu`]). Active native-tab commands share the
 //! surface but carry an exact window/view/generation target and enter their reducer as
 //! `AppEvent::Action` only while that identity remains current.
-//! Modelled on `app_about.rs`; every mutator just `request_redraw`s (the state change rides
+//! Every mutator just `request_redraw`s (the state change rides
 //! in `RepaintKey::settings_fp` via [`crate::WindowState::overlay_fp`]), and the frosted card
 //! is built by the shared `splice_settings_panel`.
 
@@ -130,6 +130,9 @@ impl App {
         let staged_trouble = staged
             .as_ref()
             .and_then(|(build, _)| self.apply_trouble_for(*build));
+        let staged_on_hold = staged
+            .as_ref()
+            .is_some_and(|(build, _)| self.latched_activation_trial_spent(*build));
         let realized = if self.serious_mode_enabled() {
             None
         } else {
@@ -192,7 +195,6 @@ impl App {
         PaletteLive {
             has_selection,
             can_rename,
-            settings_open: self.settings_tab_open(),
             rain_on,
             kitty_favourited,
             serious_mode: self.serious_mode_enabled(),
@@ -222,6 +224,7 @@ impl App {
             presence_rim: self.presence_rim_on(),
             staged,
             staged_trouble,
+            staged_on_hold,
             realized,
             // Reduced motion pins the realized celebration fade at full alpha.
             // Serious mode removes the decorative row altogether above.
@@ -557,8 +560,7 @@ impl App {
 
     /// While the palette is open on `wid`, drive it from the keyboard and SWALLOW every key
     /// (return `true`): printable chars filter, Backspace deletes, Up/Down move, Enter
-    /// activates, Esc closes. Closed ⇒ `false` (keys flow normally). Mirrors
-    /// `on_key_about_mode`, checked just before it in `on_key`.
+    /// activates, Esc closes. Closed ⇒ `false` (keys flow normally).
     pub(crate) fn on_key_palette_mode(
         &mut self,
         wid: crate::WindowId,
@@ -592,8 +594,8 @@ impl App {
     }
 
     /// The ENGINE-NEUTRAL twin of [`Self::on_key_palette_mode`] — reached by controller
-    /// `key`/`text` verbs (introspection CONTROL of the overlay), mirroring
-    /// `about_input_event`. The caller still swallows the event from the PTY.
+    /// `key`/`text` verbs (introspection CONTROL of the overlay). The caller still
+    /// swallows the event from the PTY.
     pub(crate) fn palette_input_event(
         &mut self,
         wid: crate::WindowId,
@@ -1225,6 +1227,55 @@ mod tests {
         assert_ne!(
             filtered_fp, open_fp,
             "swallowed input changes visible pixels"
+        );
+    }
+
+    /// A theme change that is NOT an OS appearance flip — a colour-only config
+    /// reload, a theme-catalog reload, or a program's OSC 11 background — reaches
+    /// an OPEN overlay card: the palette's model fingerprint and the geometry are
+    /// unchanged, so the card cache must key on the theme it paints with, or it
+    /// keeps compositing the previous colours until the next keystroke.
+    #[test]
+    fn open_palette_card_re_rasterizes_on_a_live_theme_swap() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // The terminal overlay sizes itself against the composed frame's rows.
+        app.windows.get_mut(&wid).unwrap().input_scratch.cells = vec![Vec::new(); 24];
+        app.palette_enter();
+        app.splice_settings_panel(wid);
+        let card = |app: &App| {
+            app.windows[&wid]
+                .settings_card
+                .as_ref()
+                .map(|card| (card.fp, card.geom, card.rgba.clone()))
+                .expect("an open palette rasterizes a card")
+        };
+        let (fp, geom, rgba) = card(&app);
+
+        // The reload path: `apply_theme_live` with the OS appearance untouched.
+        let old = app.theme;
+        let swapped = aterm_render::Theme {
+            fg: old.fg ^ 0x00ff_ffff,
+            bg: old.bg ^ 0x00ff_ffff,
+            cursor: old.cursor ^ 0x00ff_ffff,
+            selection: old.selection ^ 0x00ff_ffff,
+        };
+        app.apply_theme_live(swapped);
+        app.splice_settings_panel(wid);
+        let (fp2, geom2, rgba2) = card(&app);
+        assert_eq!(fp2, fp, "a theme swap does not touch the palette model");
+        assert_ne!(geom2, geom, "the painted theme is part of the cache key");
+        assert_ne!(rgba2, rgba, "the open card repaints in the new colours");
+
+        // The OSC 11 path: the live default background the card tints off.
+        app.windows.get_mut(&wid).unwrap().input_scratch.default_bg = 0x0012_3456;
+        app.splice_settings_panel(wid);
+        let (fp3, geom3, rgba3) = card(&app);
+        assert_eq!(fp3, fp, "a program's background does not touch the model");
+        assert_ne!(geom3, geom2, "the live background is part of the cache key");
+        assert_ne!(
+            rgba3, rgba2,
+            "the open card re-tints off the new background"
         );
     }
 }

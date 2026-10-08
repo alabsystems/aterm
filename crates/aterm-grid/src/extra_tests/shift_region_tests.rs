@@ -6,9 +6,7 @@
 
 use super::*;
 
-// =============================================================================
 // shift_region_up_by
-// =============================================================================
 
 #[test]
 fn cell_extras_shift_region_up_by_basic() {
@@ -78,9 +76,7 @@ fn cell_extras_shift_region_up_by_deletes_top_row_explicitly() {
     assert_eq!(extras.len(), 1, "top-row extras should be deleted");
 }
 
-// =============================================================================
 // shift_region_down_by
-// =============================================================================
 
 #[test]
 fn cell_extras_shift_region_down_by_basic() {
@@ -130,9 +126,7 @@ fn cell_extras_shift_region_down_by_zero_is_noop() {
     assert!(extras.get(CellCoord::new(2, 0)).is_some());
 }
 
-// =============================================================================
-// Algorithm audit boundary cases (#4335)
-// =============================================================================
+// Boundary cases
 
 #[test]
 fn shift_region_up_single_row_region_deletes_only_top() {
@@ -210,9 +204,8 @@ fn shift_region_down_n_exceeds_region_drops_all_in_region() {
 
     extras.shift_region_down_by(1, 3, 5);
 
-    // Row 0 preserved (below region), row 4 preserved (above region).
-    // Rows 1-3 shifted by 5 → rows 6-8, but drop_start = 3 - (5-1) = 3-4 → saturates to 0.
-    // All rows >= 0 inside [1,3] are in drop zone, so all region rows dropped.
+    // Rows 0 and 4 are outside the region and kept. Shifting rows 1-3 by 5
+    // saturates drop_start to 0, so every region row is dropped.
     assert!(
         extras.get(CellCoord::new(0, 0)).is_some(),
         "row 0 preserved"

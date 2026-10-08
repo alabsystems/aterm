@@ -5,21 +5,15 @@
 //! of what it decided, one JSON object per line, so `aterm drive ledger` can
 //! replay how the loop ran.
 //!
-//! Measured on 2026-09-14: the watcher's `--notes` file held none of its own
-//! EVENT, APPROVED or DISMISSED decisions — only the manager's hand-written
-//! lines — so nothing could say when the worker stopped, how long the manager
-//! took to answer, or what was waved through.
-//!
-//! Every line either loop prints is journaled as it is printed — `watch`'s
-//! stdout lines, `supervise`'s stderr lines, and for `supervise` the lines
-//! `watch` would have printed for what it decides silently (its approvals, its
-//! review point, its TIMEOUT or the error it ends on, as an `EXIT` line) — as
+//! Every line either loop prints is journaled as it is printed (`watch`'s
+//! stdout, `supervise`'s stderr, and for `supervise` the lines `watch` would
+//! have printed for what it decides silently), as
 //!
 //! ```text
 //! {"t":<unix ms>,"sid":"<sid>"|null,
 //!  "kind":"event|approved|declined|dismissed|reconnect|timeout|exit|mail|extend|escalated|
 //!          cleared|continued|typed|restarted|waiting|skipped|unverified|limited|unproven|
-//!          dialog|chose|probe",
+//!          dialog|chose|exception|probed|reset|probe",
 //!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|
 //!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
@@ -52,9 +46,27 @@
 //! reads, never handed to a person: `approval_loop.rs`), and the question
 //! answer's `CHOSE seq=<n> rule=answer-recommended@v1 policy=<word>
 //! <question → answer | …>` (`chose`, said once a dialog the loop's own keys
-//! answered is done). A journal an
-//! earlier build wrote still reads: its `PROBE <sent|deferred> seq=<n> …`
-//! is `probe`, the probe's outcome an EVENT under `resumed`,
+//! answered is done), and the point only a person can answer,
+//! `EXCEPTION seq=<n> kind=<word> when=<later|now> <why> => <action>`
+//! (`exception`; its end is `CLEARED seq=<n> exception=<word> after=<s>s
+//! <what cleared it>`, a `cleared`; a reader older than the word shows it as
+//! `other`), and so is the accounts probe's `PROBED seq=<n>
+//! rule=usage-probe@v1 /usage session=<p|?>% week=<p|?>%` (`probed`; printed
+//! where a settled panel was sampled, journal-only as `… /usage no sample
+//! (<word>)` where none was: `turn_end_loop`'s `usage_probe`). A probe the
+//! roster said was due and the loop did NOT run is a `skipped` under that
+//! rule, its summary the gate that shut: `SKIPPED seq=<n>
+//! rule=usage-probe@v1 gate=<word>[ host=<word>]` (printed, once a point:
+//! `turn_end_loop`'s `probe_shut`; the words are the policy's `ProbeGate`).
+//! No new leading word: an earlier build's `PROBE …` is another thing. And
+//! so is a limit reset's `RESET seq=<n> rule=limit-reset@v1 <what>`
+//! (`reset`; `reset_loop`): `confirmed (<the confirmation's head as read>)`
+//! where its Enter was written, then how the step ended — `used (<n> left)`
+//! (printed), `lifted`, `kept (<why>)`, `failed (<why>)`, `unread` (journal
+//! only). A reset passed over at a dialog is a `skipped` under that rule
+//! (`gate=<word>` or `host=<word>`, once a mount), its waits `waiting`. A
+//! journal an earlier build wrote still reads: its `PROBE <sent|deferred>
+//! seq=<n> …` is `probe`, the probe's outcome an EVENT under `resumed`,
 //! `still-limited`, `rebriefed` or `rebrief-failed`. The file is opened
 //! append-only, created `0600` when missing; a failure to open or write it is
 //! said ONCE on stderr and never stops the loop — the journal is a record of
@@ -186,7 +198,8 @@ impl JournalRecord {
                 }
             }
             "CONTINUED" | "TYPED" | "RESTARTED" | "WAITING" | "SKIPPED" | "UNVERIFIED"
-            | "LIMITED" | "UNPROVEN" | "DIALOG" | "DECLINED" | "CHOSE" => {
+            | "LIMITED" | "UNPROVEN" | "DIALOG" | "DECLINED" | "CHOSE" | "EXCEPTION" | "PROBED"
+            | "RESET" => {
                 rec.kind = word.to_ascii_lowercase();
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
@@ -283,9 +296,7 @@ pub fn json_str(s: &str) -> String {
 
 /// The current time, Unix milliseconds.
 pub fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    aterm_time::unix_millis().map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX))
 }
 
 /// The open journal of one loop (or none).
@@ -354,7 +365,7 @@ impl Journal {
 
     /// Append one line that is already a JSON object (the approval ledger's
     /// rows, [`super::approvals`]), under the same open-once, warn-once rule
-    /// as [`Self::record`]. Answers whether the line is ON RECORD: `false`
+    /// as [`Self::record`]. Answers whether the line is on record: `false`
     /// with no journal, or when the write failed (a full disk) — for a
     /// caller that must not act on what it could not record (the disk
     /// journal's intent rows).
@@ -383,7 +394,7 @@ impl Journal {
             .map_or_else(String::new, |p| p.display().to_string());
         let _ = writeln!(
             warn,
-            "aterm-drive: journal {path}: {why} — the loop goes on without it"
+            "aterm drive: journal {path}: {why} — the loop goes on without it"
         );
         let _ = warn.flush();
     }
@@ -541,7 +552,7 @@ mod tests {
             (r.phase.as_str(), r.report, r.complete, r.rows),
             ("idle-no-report", None, Some(true), Some(689))
         );
-        // The limit episode's lines (round 17): printed and journal-only.
+        // The limit episode's lines: printed and journal-only.
         let r = rec("EXTEND until=2026-09-19T18:10:00Z reset=Sep 19 at 11am (America/Los_Angeles)");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -592,6 +603,97 @@ mod tests {
                 "policy=recommended Which colour? → Blue"
             )
         );
+        // The accounts probe's line: the rule is the phase, what was read
+        // (or why nothing was) the summary. NEGATIVE CONTROLS: an earlier
+        // build's `PROBE …` line is still `probe`, its first word the phase;
+        // a word nothing here knows is `other`, its line whole.
+        let r = rec("PROBED seq=102 rule=usage-probe@v1 /usage session=1% week=10%");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            (
+                "probed",
+                "usage-probe@v1",
+                Some(102),
+                "/usage session=1% week=10%"
+            )
+        );
+        let r = rec("PROBED seq=102 rule=usage-probe@v1 /usage no sample (fold)");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
+            ("probed", "usage-probe@v1", "/usage no sample (fold)")
+        );
+        // A limit reset's lines: `reset`, the rule its phase, what came of
+        // the step its summary — and a reset passed over is a `skipped`
+        // under that rule. NEGATIVE CONTROL: the lowercase word is `other`.
+        for (line, summary) in [
+            (
+                "RESET seq=41 rule=limit-reset@v1 confirmed (Refills your weekly limit now)",
+                "confirmed (Refills your weekly limit now)",
+            ),
+            (
+                "RESET seq=41 rule=limit-reset@v1 used (1 left)",
+                "used (1 left)",
+            ),
+            (
+                "RESET seq=41 rule=limit-reset@v1 kept (inexact-early)",
+                "kept (inexact-early)",
+            ),
+            ("RESET seq=41 rule=limit-reset@v1 unread", "unread"),
+        ] {
+            let r = rec(line);
+            assert_eq!(
+                (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+                ("reset", "limit-reset@v1", Some(41), summary)
+            );
+        }
+        let r = rec("SKIPPED seq=41 rule=limit-reset@v1 host=attempted");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
+            ("skipped", "limit-reset@v1", "host=attempted")
+        );
+        assert_eq!(rec("reset seq=41 rule=limit-reset@v1 unread").kind, "other");
+        // A due probe NOT run: a `skipped` under the probe's rule, the gate
+        // that shut its summary — and, for a claim the host refused, the
+        // host's word after it. Every gate's word reads so.
+        let r = rec("SKIPPED seq=102 rule=usage-probe@v1 gate=not-live");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            ("skipped", "usage-probe@v1", Some(102), "gate=not-live")
+        );
+        let r = rec("SKIPPED seq=102 rule=usage-probe@v1 gate=claim host=not-early");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
+            ("skipped", "usage-probe@v1", "gate=claim host=not-early")
+        );
+        for gate in crate::supervise::policy::turn_end::ProbeGate::ALL {
+            let line = format!("SKIPPED seq=7 rule=usage-probe@v1 gate={}", gate.word());
+            let r = rec(&line);
+            assert_eq!(
+                (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary),
+                (
+                    "skipped",
+                    "usage-probe@v1",
+                    Some(7),
+                    format!("gate={}", gate.word())
+                ),
+                "{line}"
+            );
+        }
+        // NEGATIVE CONTROL: the example's other spelling, `PROBE skipped
+        // gate=…`, would read as an earlier build's limit probe — its kind
+        // `probe`, no rule — which is why the line is not spelled so.
+        let r = rec("PROBE skipped gate=not-live");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq),
+            ("probe", "skipped", None)
+        );
+        let r = rec("PROBE sent seq=9 keep going");
+        assert_eq!((r.kind.as_str(), r.phase.as_str()), ("probe", "sent"));
+        let r = rec("PROBING seq=102 rule=usage-probe@v1 /usage");
+        assert_eq!(
+            (r.kind.as_str(), r.summary.as_str()),
+            ("other", "PROBING seq=102 rule=usage-probe@v1 /usage")
+        );
         let r = rec("TYPED seq=7 rule=context-compact@v1 /compact");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
@@ -628,7 +730,7 @@ mod tests {
                 "until=2026-09-19T18:10:00Z overloaded retry 1 of 3"
             )
         );
-        // A question decision's rows (O3): the rule is the phase, the rows
+        // A question decision's rows: the rule is the phase, the rows
         // the summary.
         let r = rec("DIALOG seq=31 rule=answer-recommended@v1 ──── ⏎  ☐ Colors ⏎ ❯ 1. Dark");
         assert_eq!(
@@ -672,6 +774,31 @@ mod tests {
             );
             assert_eq!(r.seq, Some(if phase == "rebriefed" { 104 } else { 103 }));
         }
+    }
+
+    /// A point only a person can answer is its own kind, and its end is a
+    /// `cleared`: a reader older than the word shows it as `other`.
+    #[test]
+    fn an_exception_line_is_its_own_kind() {
+        let rec = |line: &str| JournalRecord::of_line(1_789_407_079_123, Some("@s-1"), line, None);
+        let r = rec(
+            "EXCEPTION seq=88 kind=spend when=later Its usage credits are used up, and no time \
+             window ends that. => Add usage credits in claude.ai settings.",
+        );
+        assert_eq!((r.kind.as_str(), r.seq), ("exception", Some(88)));
+        assert!(
+            r.summary
+                .starts_with("kind=spend when=later Its usage credits"),
+            "{}",
+            r.summary
+        );
+        assert!(
+            r.summary
+                .ends_with("=> Add usage credits in claude.ai settings.")
+        );
+        let r = rec("CLEARED seq=91 exception=spend after=1422s the agent working");
+        assert_eq!((r.kind.as_str(), r.seq), ("cleared", Some(91)));
+        assert_eq!(r.summary, "exception=spend after=1422s the agent working");
     }
 
     /// The JSON round-trips, escapes what it must, and prints `null` for what

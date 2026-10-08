@@ -28,9 +28,8 @@
 //! shared `support/launch_isolation.rs` fixture (a private HOME and every XDG
 //! root, no inherited `ATERM_*`/`ATPKG_*`, the auto-update / priming / packages
 //! fences, `SHELL=/bin/sh`), and every client call pinned with `--sock`. That
-//! harness keys its scratch dir on the test-binary pid, so two booting tests in
-//! one binary would collide — which is why this is its own file, under its own
-//! `athl-<pid>` name.
+//! harness keys its scratch dir on the test-binary pid, so this file's boots
+//! carry their own `athl` prefix, distinct from every other file in the suite.
 
 #![cfg(target_os = "macos")]
 
@@ -39,10 +38,7 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::{headless_boot, launch_isolation};
 
 use headless_boot::{Instance, log_tail};
 
@@ -248,9 +244,9 @@ fn probe(tool: &ProbeTool, pid: u32) -> Result<Posture, String> {
 }
 
 /// The one honest reason this test cannot run at all, as a SKIP reason: no
-/// probe tool. (The gate's `--skip-gui-smoke` is the windowed smoke's opt-out;
+/// probe tool. (The gate's `--no-windows` is the windowed stages' opt-out;
 /// this test opens no window, so it has none — until 2026-09-24 it read the
-/// `ATERM_SKIP_GUI_SMOKE` export that flag replaced.) A missing WindowServer session
+/// `ATERM_SKIP_GUI_SMOKE` export a flag replaced.) A missing WindowServer session
 /// (an SSH login, a CI box) is deliberately NOT a skip — `ioreg -c IOHIDSystem`
 /// exits 0 whether or not the class matches, so the `gui_smoke_unavailable`
 /// rung it would copy never fires, and skipping on `SSH_CONNECTION` would

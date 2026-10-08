@@ -24,7 +24,8 @@ impl Scrollback {
     }
 
     /// Monotonic count of lines DROPPED by memory-pressure eviction (the byte
-    /// budget's cold-tier FIFO) — real retention loss, surfaced OUT-OF-BAND
+    /// budget's cold-tier FIFO) or LOST with a quarantined warm block (one that
+    /// never decoded again) — real retention loss, surfaced OUT-OF-BAND
     /// (audit E10a: no sentinel content is ever injected). User-requested
     /// `set_line_limit` truncation is intentional and NOT counted.
     #[must_use]

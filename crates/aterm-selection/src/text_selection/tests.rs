@@ -707,9 +707,6 @@ fn test_adjust_for_row_splice_clears_only_after_real_history_eviction() {
 /// instead of calling `contains()` per cell (which recomputes `normalized_start`
 /// and `normalized_end` on every invocation), render paths should call
 /// `normalized_bounds()` once and use `PrecomputedSelectionBounds::contains()`.
-///
-/// Related: #3179 finding #5 (claimed fixed, but renderer.rs, build.rs,
-/// instanced.rs still use per-cell `contains()` instead of precomputed bounds).
 #[test]
 fn precomputed_bounds_equivalent_to_contains_linear() {
     let rows = 12_i32;
@@ -1343,9 +1340,7 @@ fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
     assert!(archived.is_in_progress());
     assert_eq!(archived.selection_type(), SelectionType::Block);
 
-    // The SHAPE claim: one delta describes every regime at once. A live span and an
-    // archived span move by the same 4 rows, which is what makes this a relabel and
-    // not the piecewise map it used to be.
+    // A live span and an archived span move by the same 4 rows: one relabel.
     let mut degenerate = TextSelection::new();
     degenerate.start_selection(1, 0, SelectionSide::Left, SelectionType::Simple);
     degenerate.update_selection(1, 1, SelectionSide::Right);
@@ -1361,19 +1356,10 @@ fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
 
 /// A rows-only SHRINK is MONOTONIC, so no span can be torn by it.
 ///
-/// This test is the negative of one that used to assert the opposite. The shrink
-/// once demoted the bottom live rows into history, INSERTING them between the
-/// existing scrollback and the rows that stayed on screen — a non-monotonic map,
-/// under which a span crossing the cut remapped to a reversed, WIDER range. Since
-/// anchors are a row RANGE rather than a set (the copy walk is
-/// `first_row..=last_row`, and the normalized bounds take min/max independently),
-/// such a span copied rows the user never selected, so the primitive cleared it.
-///
-/// Cursor anchoring makes the map a pure relabel, and a monotonic map cannot
-/// reverse a span. The spans that had to be sacrificed now SURVIVE intact, which is
-/// strictly better for the user: a height drag no longer destroys a highlight that
-/// happens to cross the cut. Should the rows-only shapes ever stop anchoring at the
-/// cursor, this test fails and the guard must come back with them.
+/// Anchors are a row RANGE (the copy walk is `first_row..=last_row`), so a
+/// non-monotonic map would reverse a span crossing the cut and copy rows the user
+/// never selected. Should rows-only shapes stop anchoring at the cursor, this
+/// test fails.
 #[test]
 fn a_shrink_spares_a_span_that_crosses_the_cut() {
     // 10 visible rows -> 6. A span over live rows 4..=7 crosses the old cut.
@@ -1389,11 +1375,10 @@ fn a_shrink_spares_a_span_that_crosses_the_cut() {
     assert_eq!(sel.end().row, 3);
     assert!(
         sel.start().row <= sel.end().row,
-        "ORDER is the property the old map could not keep: a reversed range copies \
-         rows the user never selected"
+        "a reversed range copies rows the user never selected"
     );
 
-    // …and the scrollback-into-live span, which the demoted rows used to split.
+    // …and a span from scrollback into the live rows.
     let mut across = TextSelection::new();
     across.start_selection(-3, 0, SelectionSide::Left, SelectionType::Simple);
     across.update_selection(2, 5, SelectionSide::Right);

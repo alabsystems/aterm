@@ -524,13 +524,8 @@ mod tests {
         ToolName::new(name).unwrap()
     }
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-ops-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-ops-{label}-"))
     }
 
     /// Install a program build with one binary + shim + channel activation.

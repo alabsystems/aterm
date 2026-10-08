@@ -194,14 +194,15 @@ const MODE: &str = "ATERM_OBJC_BOUND_DRIVE_MODE";
 const HANG_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long anything that MUST complete — a dispatched drop, a `get_on_main`,
-/// the drop-less child — may take before it is called hung.
+/// the drop-less child — may take before it is called hung: a hang detector
+/// (a minute), never a latency budget.
 ///
 /// Generous on purpose, and free when the code is right, because every such
 /// wait returns the moment it completes: this runs in the workspace test run
 /// beside other lanes' compiles, and a FALSE "it hung" would be the worst
 /// outcome this file could produce.
 #[cfg(target_os = "macos")]
-const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(not(target_os = "macos"))]
 fn run() -> i32 {

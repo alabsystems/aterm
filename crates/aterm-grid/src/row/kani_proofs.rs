@@ -4,31 +4,18 @@
 
 use super::*;
 
-// =============================================================================
-// Kani Stub Constructors
-// =============================================================================
-//
-// These constructors are optimized for Kani/CBMC verification by avoiding
-// loops with symbolic bounds that cause state explosion.
+// Kani stub constructors: no loops with symbolic bounds, which cause state
+// explosion under CBMC.
 
 #[cfg(kani)]
 impl Row {
-    /// Create a row for Kani verification without cell initialization loop.
-    ///
-    /// Unlike `Row::new`, this skips the `for cell in cells.iter_mut()` loop
-    /// that initializes cells to `Cell::EMPTY`. The allocated page memory is
-    /// already zeroed, which is sufficient for property verification.
-    ///
-    /// # Usage
-    ///
-    /// Use this in Kani proofs instead of `Row::new` when you don't need
-    /// initialized cell content (e.g., cursor/bounds proofs).
+    /// Create a row for Kani without the cell initialization loop; the page
+    /// memory is already zeroed. Use it in proofs that need no cell content
+    /// (cursor/bounds proofs).
     #[must_use]
     pub(crate) fn kani_stub(cols: u16, pages: &mut PageStore) -> Self {
-        // Allocate cells without initialization loop.
-        // PageStore provides zeroed memory, so cells contain zero bytes.
-        // For verification, we only care about bounds and invariants,
-        // not actual cell content.
+        // PageStore memory is zeroed; the proofs only need bounds and
+        // invariants, not cell content.
         let cells = pages.alloc_slice::<Cell>(cols);
         Self {
             cells,
@@ -37,19 +24,13 @@ impl Row {
         }
     }
 
-    /// Create a Row from a raw mutable Cell slice.
-    ///
-    /// This avoids PageStore allocation entirely, providing O(1) construction
-    /// for Kani verification. The slice is typically backed by a static array.
-    ///
-    /// # Arguments
-    ///
-    /// * `cells_slice` - Mutable reference to a Cell slice
+    /// Create a Row from a raw mutable Cell slice (typically a static array),
+    /// with no PageStore allocation.
     ///
     /// # Safety
     ///
-    /// The slice must remain valid for the lifetime of the Row.
-    /// Only used in Kani proofs where lifetime is bounded by proof execution.
+    /// The slice must remain valid for the lifetime of the Row (bounded by the
+    /// proof's execution).
     #[must_use]
     pub(crate) fn kani_mock(cells_slice: &mut [Cell]) -> Self {
         let cells = PageSlice::from_raw(cells_slice);
@@ -67,9 +48,8 @@ mod proofs {
     use super::super::super::PackedColor;
     use super::*;
 
-    /// write_char_styled uses unsafe get_unchecked after a bounds guard.
-    /// Verify that for all symbolic col values, the method either succeeds
-    /// (in-bounds) or returns false (out-of-bounds) without UB.
+    /// write_char_styled (unchecked access after a bounds guard) succeeds in
+    /// bounds and returns false out of bounds, for every symbolic col, without UB.
     #[kani::proof]
     fn row_write_char_styled_bounds_safe() {
         let col: u16 = kani::any();
@@ -205,17 +185,11 @@ mod proofs {
         );
     }
 
-    // =========================================================================
-    // StyleId write method proofs
-    // =========================================================================
-    //
-    // These prove the unsafe get_unchecked / get_unchecked_mut calls in
-    // style_id_write.rs are guarded by correct bounds checks.
+    // StyleId write proofs: the unchecked accesses in style_id_write.rs are
+    // guarded by correct bounds checks.
 
-    /// write_char_with_style_id uses unsafe get_unchecked after a bounds
-    /// guard. Verify that for all symbolic col values, the method either
-    /// succeeds (in-bounds) or returns false (out-of-bounds) without UB,
-    /// and that len is updated correctly on success.
+    /// write_char_with_style_id succeeds in bounds and returns false out of
+    /// bounds, for every symbolic col, without UB; len is updated on success.
     #[kani::proof]
     fn row_write_char_with_style_id_bounds_safe() {
         use super::super::super::style::StyleId;
@@ -245,9 +219,8 @@ mod proofs {
         }
     }
 
-    /// write_wide_char_with_style_id uses unsafe get_unchecked for the
-    /// primary cell and continuation. Verify correct success/failure for
-    /// all symbolic col values and that len stays bounded.
+    /// write_wide_char_with_style_id succeeds or fails correctly for every
+    /// symbolic col, and len stays bounded.
     #[kani::proof]
     fn row_write_wide_char_with_style_id_bounds_safe() {
         use super::super::super::style::StyleId;
@@ -276,9 +249,8 @@ mod proofs {
         }
     }
 
-    /// write_wide_char_with_style_id with pre-existing wide chars exercises
-    /// the unsafe fixup path when overwriting wide character halves via the
-    /// StyleId API.
+    /// write_wide_char_with_style_id over existing wide chars exercises the
+    /// unsafe fixup path.
     #[kani::proof]
     fn row_write_wide_char_with_style_id_overlap_safe() {
         use super::super::super::style::StyleId;
@@ -303,12 +275,8 @@ mod proofs {
         );
     }
 
-    // =========================================================================
-    // Direct get_unchecked / get_unchecked_mut proofs
-    // =========================================================================
-    //
-    // These prove the unsafe unchecked accessors return the same result as
-    // the safe checked API when the precondition (col < cols()) holds.
+    // Unchecked accessors return the same result as the checked API when
+    // col < cols() holds.
 
     /// For all symbolic col values satisfying col < cols(), verify that
     /// `get_unchecked(col)` returns the same cell as `get(col).unwrap()`.
@@ -342,9 +310,8 @@ mod proofs {
         );
     }
 
-    /// For all symbolic col values satisfying col < cols(), verify that
-    /// `get_unchecked_mut(col)` returns a mutable reference to the same
-    /// cell as `get_mut(col).unwrap()`.
+    /// For every symbolic col < cols(), `get_unchecked_mut(col)` refers to the
+    /// same cell as `get_mut(col).unwrap()`.
     #[kani::proof]
     fn row_get_unchecked_mut_equivalence() {
         let col: u16 = kani::any();
@@ -379,9 +346,7 @@ mod proofs {
         );
     }
 
-    // =========================================================================
     // Row::new initialization proof
-    // =========================================================================
 
     /// Verify that Row::new initializes all cells to Cell::EMPTY,
     /// sets len to 0, and cols() equals the requested width.
@@ -465,9 +430,8 @@ mod proofs {
         }
     }
 
-    /// fixup_wide_chars_in_range iterates a cell range accessing cells[col]
-    /// and cells[col+1]. Verify no panic with pre-existing wide characters
-    /// and symbolic (start_col, count) inputs.
+    /// fixup_wide_chars_in_range does not panic with existing wide chars and
+    /// symbolic (start_col, count).
     #[kani::proof]
     #[kani::unwind(9)]
     fn row_fixup_wide_chars_in_range_bounds_safe() {
@@ -491,9 +455,8 @@ mod proofs {
         // Row width preserved (fixup must not corrupt the cell slice)
         kani::assert(row.cols() == 8, "fixup must not change row width");
 
-        // Verify no orphaned WIDE char at the left boundary:
-        // If start_col > 0, cells[start_col - 1] must NOT be WIDE unless
-        // cells[start_col] is still its WIDE_CONTINUATION partner.
+        // No orphaned WIDE at the left boundary: cells[start_col - 1] is WIDE
+        // only if cells[start_col] is still its continuation.
         let start = start_col as usize;
         let cells = row.as_slice();
         if start > 0 && start < 8 {
@@ -506,9 +469,8 @@ mod proofs {
             }
         }
 
-        // Verify no orphaned WIDE_CONTINUATION at the right boundary:
-        // If actual_end < 8, cells[actual_end] must NOT be WIDE_CONTINUATION
-        // unless cells[actual_end - 1] is its WIDE partner.
+        // No orphaned WIDE_CONTINUATION at the right boundary: cells[actual_end]
+        // is a continuation only if cells[actual_end - 1] is its WIDE partner.
         let end = (start_col.saturating_add(count) as usize).min(8);
         if end > 0 && end < 8 {
             let post = cells[end].flags();

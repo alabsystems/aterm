@@ -34,11 +34,11 @@ use crate::{changelog, ledger, publish};
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aterm_spec::derive::{Model, release_claim_landing_model};
 use aterm_spec::interp::State;
-use ledger::{ClaimPlan, GitCli, GitRunner, RunOut};
+use ledger::testing::Git;
+use ledger::{ClaimPlan, GitRunner, RunOut};
 
 /// The seed line's build — ordinal 1 in the model. Claims run with `now = 0`, so
 /// every build is exactly its predecessor plus one and the ordinals stay small.
@@ -51,7 +51,7 @@ const SEED_CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Added\n- **T
                               notes.\n";
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = ledger::testing::git()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -67,13 +67,14 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn identity(repo: &Path) {
-    for (key, value) in [
-        ("user.name", "claim model"),
-        ("user.email", "claim-model@aterm.invalid"),
-        ("commit.gpgsign", "false"),
-    ] {
-        git(repo, &["config", key, value]);
-    }
+    ledger::testing::config(
+        repo,
+        &[
+            ("user.name", "claim model"),
+            ("user.email", "claim-model@aterm.invalid"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 }
 
 fn ordinal(build: u64) -> i64 {
@@ -86,29 +87,23 @@ fn ordinal(build: u64) -> i64 {
 // --------------------------------------------------------------------------
 
 struct Fixture {
-    root: PathBuf,
+    _root: aterm_tempfile::TempDir,
     origin: PathBuf,
     rival: PathBuf,
     work: PathBuf,
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 impl Fixture {
     fn new(label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-claim-landing-{label}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        git(&root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-claim-landing-{label}-"))
+            .tempdir()
+            .unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
         let origin = root.join("origin.git");
-        git(&root, &["clone", "-q", origin.to_str().unwrap(), "rival"]);
+        ledger::testing::config(&origin, &[]);
+        git(root, &["clone", "-q", origin.to_str().unwrap(), "rival"]);
         let rival = root.join("rival");
         identity(&rival);
         git(&rival, &["symbolic-ref", "HEAD", "refs/heads/main"]);
@@ -123,11 +118,11 @@ impl Fixture {
         git(&rival, &["add", "-A"]);
         git(&rival, &["commit", "-q", "-m", "the published commit"]);
         git(&rival, &["push", "-q", "-u", "origin", "main"]);
-        git(&root, &["clone", "-q", origin.to_str().unwrap(), "work"]);
+        git(root, &["clone", "-q", origin.to_str().unwrap(), "work"]);
         let work = root.join("work");
         identity(&work);
         Fixture {
-            root,
+            _root: dir,
             origin,
             rival,
             work,
@@ -252,7 +247,7 @@ enum Event {
 type EnvAction<'a> = Box<dyn FnOnce() -> (Env, View) + 'a>;
 
 struct Hooked<'a> {
-    inner: GitCli,
+    inner: Git,
     events: RefCell<Vec<Event>>,
     first_push: RefCell<Option<EnvAction<'a>>>,
 }
@@ -471,7 +466,7 @@ impl Harness {
         let rival = self.fix.rival.clone();
         let origin = self.fix.origin.clone();
         let hooked = Hooked {
-            inner: GitCli::new(&self.fix.work),
+            inner: Git::new(&self.fix.work),
             events: RefCell::new(Vec::new()),
             first_push: RefCell::new(during.map(|env| {
                 Box::new(move || {

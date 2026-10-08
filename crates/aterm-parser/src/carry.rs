@@ -21,6 +21,7 @@
 //! which CAN, SUB and ESC leave as they always do.
 
 use crate::state::State;
+use crate::utf8::Utf8Prefix;
 use crate::{MAX_INTERMEDIATES, MAX_OSC_DATA, MAX_PARAMS, Parser};
 
 /// The most OSC payload bytes a carry holds. An OSC whose collected head is
@@ -33,20 +34,31 @@ pub const OSC_CARRY_CAP: usize = 4096;
 /// sequence missing its last byte.
 pub const UTF8_TAIL_MAX: usize = 3;
 
+/// The state a hooked DCS string is carried in ([`Parser::carry_unhooking`]):
+/// the SOS/PM/APC string state, restored with no APC consumer, whose
+/// transitions are `DcsPassthrough`'s for every byte
+/// (`tests::carry::the_hooked_string_carry_reads_every_byte_as_the_hooked_string`
+/// pins the table and drives both parsers through every one- and two-byte
+/// tail, in both C1 modes).
+pub const HOOKED_STRING_CARRY: State = State::SosPmApcString;
+
 /// A parser's partial state, as data (see the module docs).
 ///
 /// `state` is where the parser stands. The CSI fields (`params`,
 /// `subparam_mask`, `current_param`, `param_started`, `last_was_colon`) are
 /// meaningful in `CsiParam` and `CsiIntermediate`; `intermediates` in
 /// `EscapeIntermediate` and the CSI states; `osc`/`osc_overflowed` in
-/// `OscString`; `utf8_tail`/`utf8_expected` in `Ground`. Every other field is
-/// empty — [`Parser::carry`] writes it so and [`Parser::restore_carry`]
-/// demands it.
+/// `OscString`; `utf8_tail`/`utf8_expected` in `Ground`; `string_utf8_tail` in
+/// `DcsIgnore` and `SosPmApcString`. Every other field is empty —
+/// [`Parser::carry`] writes it so and [`Parser::restore_carry`] demands it.
 ///
 /// DCS strings (before their hook) are carried as `DcsIgnore`, and SOS, PM
 /// and APC strings as `SosPmApcString` with no APC consumer: the successor
 /// swallows the rest of the string up to its terminator instead of printing
-/// it (the tail of a sixel or kitty-graphics payload is base64 as text).
+/// it (the tail of a sixel or kitty-graphics payload is base64 as text). A
+/// HOOKED DCS string, when the caller asks for one ([`Parser::carry_unhooking`]),
+/// is carried as `SosPmApcString` with no consumer too: that state reads every
+/// byte exactly as `DcsPassthrough` does.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParserCarry {
     /// The parser state.
@@ -73,6 +85,13 @@ pub struct ParserCarry {
     pub utf8_tail: Vec<u8>,
     /// The length of the character `utf8_tail` begins (0 without a tail).
     pub utf8_expected: u8,
+    /// The head of a split UTF-8 character that a DCS or APC string's payload
+    /// ends in (at most [`UTF8_TAIL_MAX`] bytes): with C1 controls off, a
+    /// `0x9C` that continues it is the character's byte, not the 8-bit ST, so
+    /// the successor must know it is there. A carry from a build before this
+    /// field has none, and one this build writes reads, to such a build, as a
+    /// string whose next `0x9C` ends it (serde ignores the unknown field).
+    pub string_utf8_tail: Vec<u8>,
 }
 
 impl ParserCarry {
@@ -101,9 +120,11 @@ pub enum CarryRefusal {
     Intermediates,
     /// An OSC payload over [`OSC_CARRY_CAP`], or one beside `osc_overflowed`.
     Osc,
-    /// A UTF-8 tail that is not the prefix the parser collects: a lead byte
-    /// (`0xC0..=0xF7`) with `utf8_expected` its length, then continuation
-    /// bytes, shorter than that length.
+    /// A UTF-8 tail (`utf8_tail`, or `string_utf8_tail`) that is not the
+    /// prefix the parser collects: a byte that begins a well-formed sequence
+    /// (`0xC2..=0xF4`) — with `utf8_expected` its length — then the
+    /// continuation bytes a well-formed prefix of it allows (Unicode Table
+    /// 3-7), shorter than that length.
     Utf8Tail,
     /// A field set that the state does not use.
     FieldOutsideState,
@@ -125,17 +146,6 @@ impl std::fmt::Display for CarryRefusal {
 }
 
 impl std::error::Error for CarryRefusal {}
-
-/// The UTF-8 sequence length `start_utf8` assigns a lead byte, or `None` for a
-/// byte that does not start a multi-byte sequence there.
-fn utf8_len_for_lead(lead: u8) -> Option<u8> {
-    match lead {
-        0xC0..=0xDF => Some(2),
-        0xE0..=0xEF => Some(3),
-        0xF0..=0xF7 => Some(4),
-        _ => None,
-    }
-}
 
 impl Parser {
     /// The parser's partial state as a [`ParserCarry`] — a pure read.
@@ -182,11 +192,51 @@ impl Parser {
             }
             State::DcsEntry | State::DcsParam | State::DcsIntermediate | State::DcsIgnore => {
                 carry.state = State::DcsIgnore;
+                carry.string_utf8_tail = self.string_utf8.as_slice().to_vec();
             }
-            State::SosPmApcString => {}
+            State::SosPmApcString => {
+                carry.string_utf8_tail = self.string_utf8.as_slice().to_vec();
+            }
             State::DcsPassthrough => return None,
         }
         Some(carry)
+    }
+
+    /// [`Parser::carry`], and in `DcsPassthrough` too: a hooked DCS string is
+    /// carried as one to IGNORE to its terminator, so its tail is swallowed
+    /// rather than printed. Whether that loses anything is the HOOKED
+    /// HANDLER's question — this parser cannot see what its hook collected —
+    /// so the caller decides when to take it: `aterm-core`'s checkpoint takes
+    /// it when the handler keeps nothing (a string it only consumes, such as a
+    /// tmux passthrough wrapper) or holds a picture a stream's next frame
+    /// replaces (a sixel), and never for a query whose reply would be lost
+    /// (round eight of the update audit, finding 57). A pure read.
+    ///
+    /// The carried state is `SosPmApcString` with no APC consumer, because its
+    /// transitions are `DcsPassthrough`'s byte for byte
+    /// ([`HOOKED_STRING_CARRY`]): every byte stays in the string — DEL, the
+    /// C1 range and every UTF-8 byte included — except CAN and SUB (to Ground,
+    /// executed), ESC (to Escape) and the 8-bit ST `0x9C` (to Ground), in
+    /// either C1 mode, since both states are exempt from the C1 guard; with C1
+    /// off, a `0x9C` inside a UTF-8 character stays in either string, and the
+    /// head of one the payload ends in rides as `string_utf8_tail`. With no
+    /// consumer it delivers nothing, as the handler that keeps nothing does.
+    /// `DcsIgnore`, the first choice, was not exact then (the review of round
+    /// eight's fix): it had no entry at or above `0x80`, so a UTF-8 lead byte
+    /// in a tmux control-mode line or a kitty command left the string and the
+    /// rest printed as text, and with C1 off an 8-bit ST was dropped and the
+    /// string swallowed the real output after it, up to the next ESC. The
+    /// table has since given `DcsIgnore` those entries
+    /// (`tests::c1::an_ignored_dcs_reads_every_byte_as_a_hooked_one`), which
+    /// the live parser needed too. Every consumer that restores a carry at all
+    /// accepts `SosPmApcString`.
+    #[must_use]
+    pub fn carry_unhooking(&self) -> ParserCarry {
+        self.carry().unwrap_or_else(|| ParserCarry {
+            state: HOOKED_STRING_CARRY,
+            string_utf8_tail: self.string_utf8.as_slice().to_vec(),
+            ..ParserCarry::default()
+        })
     }
 
     /// Whether [`Parser::carry`] holds this parser's partial sequence only as
@@ -215,6 +265,22 @@ impl Parser {
         }
     }
 
+    /// Whether the sequence [`Parser::carry_swallows_sequence`] names is a
+    /// PICTURE — an APC string with its consumer started (a kitty-graphics
+    /// command) or an OSC 1337 payload (an iTerm2 inline image) — whose loss
+    /// a graphics stream's next frame makes good. An OSC 52 clipboard write,
+    /// any other OSC and an unhooked DCS header are not: nothing replaces
+    /// them. A pure read.
+    #[must_use]
+    pub fn carry_swallows_picture(&self) -> bool {
+        self.carry_swallows_sequence()
+            && match self.state {
+                State::SosPmApcString => true,
+                State::OscString => self.osc_data.starts_with(b"1337;"),
+                _ => false,
+            }
+    }
+
     /// Install `carry` (see [`Parser::carry`]) after validating it; on `Err`
     /// the parser is untouched.
     ///
@@ -225,7 +291,7 @@ impl Parser {
     /// bits only below `params.len()`, at most [`MAX_INTERMEDIATES`]
     /// intermediates in `0x20..=0x2F` (and the CSI private markers
     /// `0x3C..=0x3F` in a CSI state), an OSC payload of at most
-    /// [`OSC_CARRY_CAP`] bytes, a UTF-8 tail that is a prefix the parser itself
+    /// [`OSC_CARRY_CAP`] bytes, UTF-8 tails that are prefixes the parser itself
     /// collects, and every field the state does not use empty.
     ///
     /// C1-control interpretation is this parser's own setting and is kept.
@@ -250,6 +316,8 @@ impl Parser {
         }
         self.utf8_len = u8::try_from(carry.utf8_tail.len()).unwrap_or(0);
         self.utf8_expected = carry.utf8_expected;
+        self.string_utf8 =
+            Utf8Prefix::from_bytes(&carry.string_utf8_tail).unwrap_or(Utf8Prefix::NONE);
         Ok(())
     }
 
@@ -327,20 +395,20 @@ impl Parser {
         {
             return Err(CarryRefusal::FieldOutsideState);
         }
-        match carry.utf8_tail.split_first() {
-            None if carry.utf8_expected == 0 => {}
-            None => return Err(CarryRefusal::Utf8Tail),
-            Some((&lead, continuation)) => {
-                let Some(expected) = utf8_len_for_lead(lead) else {
-                    return Err(CarryRefusal::Utf8Tail);
-                };
-                if carry.utf8_expected != expected
-                    || carry.utf8_tail.len() >= usize::from(expected)
-                    || !continuation.iter().all(|&b| (0x80..=0xBF).contains(&b))
-                {
-                    return Err(CarryRefusal::Utf8Tail);
-                }
-            }
+        match Utf8Prefix::from_bytes(&carry.utf8_tail) {
+            Some(prefix) if prefix.expected() == carry.utf8_expected => {}
+            _ => return Err(CarryRefusal::Utf8Tail),
+        }
+
+        // A string payload's UTF-8 head: the same prefixes, and only in the
+        // two string states a carry names.
+        if !carry.string_utf8_tail.is_empty()
+            && !matches!(carry.state, State::DcsIgnore | State::SosPmApcString)
+        {
+            return Err(CarryRefusal::FieldOutsideState);
+        }
+        if Utf8Prefix::from_bytes(&carry.string_utf8_tail).is_none() {
+            return Err(CarryRefusal::Utf8Tail);
         }
         Ok(())
     }

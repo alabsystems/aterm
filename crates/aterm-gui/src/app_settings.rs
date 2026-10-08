@@ -2,20 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! Native Settings-tab host glue: singleton view discovery, open/focus/close, stable
-//! route navigation, and compatibility control projections. The retired Settings card
-//! survives only as the `cfg(test)` `Overlay::Settings` slot that [`App::settings_enter`]
-//! and [`App::settings_exit`] fill and clear; production cannot construct it.
+//! route navigation, and compatibility control projections. Settings is never a window
+//! overlay: the retired Settings card is gone, and shipping Settings is this native tab.
 
 use crate::App;
 
-/// `/usr/bin/tccutil`'s presence, read at most once per process.
-///
-/// One `metadata()` of a file in `/usr/bin`: no `tccd`, no `WindowServer`,
-/// nothing protected — but the Security page republishes on every event-loop
-/// park while it is visible, and a stat per park buys nothing. The file cannot
-/// meaningfully change under a running process, and `TccutilPresence::Unknown`
-/// fails CLOSED inside `reset_offer`, so a destructive button is never offered
-/// on an unproven tool.
+/// `/usr/bin/tccutil`'s presence, read at most once per process: the Security page
+/// republishes on every park while visible, and the file cannot meaningfully change
+/// under a running process. `TccutilPresence::Unknown` fails closed inside
+/// `reset_offer`, so a destructive button is never offered on an unproven tool.
 fn tccutil_presence_once() -> aterm_containment::TccutilPresence {
     static PRESENCE: std::sync::OnceLock<aterm_containment::TccutilPresence> =
         std::sync::OnceLock::new();
@@ -93,16 +88,23 @@ impl App {
         let window = self.windows.get(&wid)?;
         let active = window.tab_set.active_id();
         let focused = window.tab_set.active().map(|tab| tab.focus);
-        self.settings_tabs_in_window(wid)
-            .into_iter()
-            .min_by_key(|(index, tab, _, view)| {
-                (
-                    usize::from(Some(*tab) != active),
-                    usize::from(Some(*view) != focused),
-                    *index,
-                    view.get(),
-                )
-            })
+        // The first leaf with the smallest key, in visit order — what
+        // `min_by_key` over the collected leaves picked, without the `Vec`.
+        let mut best_key: Option<(usize, usize, usize, u64)> = None;
+        let mut best = None;
+        self.visit_settings_tabs_in_window(wid, |index, tab, instance, view| {
+            let key = (
+                usize::from(Some(tab) != active),
+                usize::from(Some(view) != focused),
+                index,
+                view.get(),
+            );
+            if best_key.is_none_or(|min| key < min) {
+                best_key = Some(key);
+                best = Some((index, tab, instance, view));
+            }
+        });
+        best
     }
 
     /// Resolve one Settings view in `wid`. The ordering mirrors
@@ -205,26 +207,11 @@ impl App {
             .any(|wid| self.settings_tab_in_window(wid).is_some())
     }
 
-    /// THE PER-PARK SETTINGS OBSERVATION HOP.
-    ///
-    /// `retry_title_observations` calls this once per event-loop park, which
-    /// makes it the process's only regular "publish live runtime observations
-    /// into Settings" moment. Two things ride it, and both are equality-gated
-    /// no-ops when nothing changed:
-    ///
-    /// 1. the Smart Titles runtime observation
-    ///    ([`Self::publish_settings_title_summary_health`]);
-    /// 2. the macOS file-access posture (design §3.4), which the Security page
-    ///    is specified to re-poll *while it is visible* — and which also drains
-    ///    that page's *Ask for folder access now* press, because the warm-up
-    ///    worker is `App`-owned and a Settings reducer cannot reach `App`.
-    ///
-    /// The NAME is still the Smart Titles one, for the benefit of its five
-    /// existing call sites in `title_summary.rs`. The consent half no longer
-    /// depends on this pairing: `about_to_wait` calls
-    /// [`Self::sync_settings_consent_posture`] by its own name on every park
-    /// (2026-09-10), because a Settings ▸ Security opened by any route other
-    /// than a native-view action showed no posture at all otherwise.
+    /// The per-park Settings observation hop, called once per event-loop park by
+    /// `retry_title_observations`. It publishes the Smart Titles runtime observation
+    /// ([`Self::publish_settings_title_summary_health`]), equality-gated so an unchanged
+    /// observation is a no-op. The macOS file-access posture is published separately by
+    /// `about_to_wait` through [`Self::sync_settings_consent_posture`].
     pub(crate) fn sync_settings_title_summary_health(&mut self) {
         self.publish_settings_title_summary_health();
         self.sync_settings_consent_posture();
@@ -235,19 +222,12 @@ impl App {
     /// this is the live provider/locality/readiness/error projection. The update
     /// is equality-gated and only redraws windows whose view actually changed.
     fn publish_settings_title_summary_health(&mut self) {
-        // This runs once per event-loop park (`retry_title_observations`), and
-        // the common case is that no Settings view exists anywhere. Settings is
-        // a process-singleton controller, so NO live instance proves no window
-        // presents it: the per-window/per-tab walk below (one `leaves()` heap
-        // allocation per tab) and the health projection (up to four `String`
-        // clones plus two schedule scans) are then both pure waste.
-        //
-        // `instance_by_kind` scans the handful of live native apps and
-        // allocates nothing, and it is conservative in the safe direction: an
-        // instance with no attached view merely falls through to the walk,
-        // which then finds no target exactly as it does today. It is NOT
-        // `settings_tab_open()` — that helper re-runs this very walk, so
-        // guarding with it would double the cost in the case that matters.
+        // This runs on every park, and usually no Settings view exists. Settings is a
+        // process-singleton controller, so no live instance proves no window presents
+        // it, and the per-tab walk and health projection below can be skipped.
+        // `instance_by_kind` allocates nothing and errs safe (an instance with no view
+        // just falls through to the walk). Not `settings_tab_open()`, which re-runs the
+        // walk.
         if self
             .native_runtime
             .instance_by_kind(crate::native_app::AppKind::Settings)
@@ -267,10 +247,8 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        // Hoisted below the target search: with no target the whole body was
-        // already a no-op, so the projection's allocations bought nothing.
-        // `title_summary_health()` is `&self` and side-effect-free, which is
-        // what makes the reorder behaviour-identical.
+        // Built after the target search: with no target the projection is wasted.
+        // `title_summary_health()` is `&self` and side-effect-free.
         let health = self.title_summary_health();
         for (wid, view) in targets {
             let changed = match self.native_runtime.view_state_mut(view) {
@@ -293,25 +271,17 @@ impl App {
         }
     }
 
-    /// Publish the macOS file-access posture into every open Settings view and
-    /// perform any outstanding *Ask for folder access now* press (design §3.4,
-    /// §3.5, §3.7).
+    /// Publish the macOS file-access posture into every open Settings view and perform
+    /// any outstanding *Ask for folder access now* press.
     ///
-    /// Shaped exactly like [`Self::sync_settings_title_summary_health`], for the
-    /// same reasons: Settings is a process singleton, so NO live instance proves
-    /// no window presents it and the cheap `instance_by_kind` guard comes first;
-    /// the projection is equality-gated so an unchanged posture repaints
-    /// nothing.
+    /// Shaped like [`Self::sync_settings_title_summary_health`]: the cheap
+    /// `instance_by_kind` guard comes first, and the projection is equality-gated.
     ///
-    /// Two properties this function is responsible for:
-    ///
-    /// * **It never reaches the OS on a headless instance.** It returns before
-    ///   touching the probe, and the gesture arms it installs are chosen by
-    ///   `ConsentGestures::for_instance`, whose headless arm cannot contact
+    /// * It never reaches the OS on a headless instance: it returns before the probe,
+    ///   and `ConsentGestures::for_instance`'s headless arm cannot contact
     ///   `NSWorkspace` or spawn anything.
-    /// * **The warm-up gesture is drained BEFORE the projection is built**, so
-    ///   the rows published in the same pass already read *asking…* rather than
-    ///   showing a press that appears to have done nothing.
+    /// * The warm-up gesture is drained before the projection is built, so rows
+    ///   published in the same pass already read *asking…*.
     pub(crate) fn sync_settings_consent_posture(&mut self) {
         if self
             .native_runtime
@@ -320,15 +290,15 @@ impl App {
         {
             return;
         }
-        // EVERY Settings view: a window can hold more than one (a split, a
-        // reopened tab), and a request left on the one not chosen would wait.
+        // Every Settings view: a window can hold more than one (a split, a reopened
+        // tab), and a request left on an unchosen one would wait.
         let mut views = Vec::new();
         for &wid in self.windows.keys() {
             self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
         }
-        // Every view shares the process's record of the owner's declines, and
-        // every confirmed press is performed now. Both run on every host: a
-        // headless view's arms reach no OS, and `begin_*` refuse there.
+        // Every view shares the process's record of the user's declines, and every
+        // confirmed press is performed now. Both run on every host: a headless view's
+        // arms reach no OS, and `begin_*` refuse there.
         let quiet = std::sync::Arc::clone(&self.owner_quiet);
         for (_, view) in &views {
             if let Some(crate::native_app::AppViewState::Settings(state)) =
@@ -343,10 +313,20 @@ impl App {
         if !cfg!(target_os = "macos") || self.headless {
             return;
         }
-        // Only a view actually ON the Security page carries the block, and this
-        // runs on every event-loop park. Reading the route first keeps the cost
-        // of an open-but-elsewhere Settings tab at one enum compare per window
-        // instead of a probe read and a row clone.
+        self.publish_security_page(views);
+    }
+
+    /// The Security page's half of [`Self::sync_settings_consent_posture`], over
+    /// `views` (every Settings view): build the block once and hand it to each view
+    /// on the Security route. The Developer Tools row may start its `log show` only
+    /// while one of those views is on screen ([`Self::settings_view_on_screen`]);
+    /// otherwise it is served from its slot, so a Security page left in a
+    /// background tab or a hidden window starts nothing (debugger design §9.1,
+    /// O12).
+    fn publish_security_page(&mut self, views: Vec<(crate::WindowId, crate::tab_model::ViewId)>) {
+        // Only a view on the Security page carries the block, and this runs every park:
+        // reading the route first keeps an open-but-elsewhere Settings tab at one enum
+        // compare per window.
         let targets = views
             .into_iter()
             .filter(|(_, view)| {
@@ -360,9 +340,28 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        let access = self.macos_access_projection();
+        let on_screen = targets
+            .iter()
+            .any(|&(wid, view)| self.settings_view_on_screen(wid, view));
+        let access = self.macos_access_projection(on_screen);
         let gestures = crate::native_settings::ConsentGestures::for_instance(self.headless);
         self.publish_macos_access(&targets, &access, gestures);
+    }
+
+    /// Whether `view` is on screen: a leaf of its window's active tab, in a window
+    /// the OS does not report occluded (minimized or fully covered).
+    fn settings_view_on_screen(
+        &self,
+        wid: crate::WindowId,
+        view: crate::tab_model::ViewId,
+    ) -> bool {
+        self.windows.get(&wid).is_some_and(|window| {
+            !window.occluded
+                && window
+                    .tab_set
+                    .active()
+                    .is_some_and(|tab| tab.root.leaves().contains(&view))
+        })
     }
 
     /// Hand the Security block's projection, and the gesture arms, to each of
@@ -396,23 +395,22 @@ impl App {
         }
     }
 
-    /// THE GESTURE DRAIN for [`Self::sync_settings_consent_posture`], over the
-    /// Settings views it found (all of them, every window).
+    /// The gesture drain for [`Self::sync_settings_consent_posture`], over every
+    /// Settings view it found.
     fn drain_settings_gesture_requests(
         &mut self,
         views: &[(crate::WindowId, crate::tab_model::ViewId)],
     ) {
-        // THE GESTURE DRAIN. `WarmupState`, its bounded automatic-apply hold and
-        // the retire worker are `App`-owned (§3.5, §3.7) and a Settings reducer
-        // cannot reach `App`, so the press is recorded on the view and performed
-        // here — from EVERY Settings view, whatever page it shows now. A press the
-        // owner confirmed on Security is performed at this park even if the view
-        // has since navigated away, never later when some other path brings it
-        // back. `begin_consent_warmup` and `begin_claimant_retire` re-check every
-        // gate themselves, so a stale request cannot smuggle a worker past config.
+        // `WarmupState`, its bounded automatic-apply hold and the retire worker are
+        // `App`-owned and a Settings reducer cannot reach `App`, so the press is recorded
+        // on the view and performed here, from every Settings view whatever page it now
+        // shows: a press confirmed on Security runs at this park even if the view has
+        // navigated away. `begin_consent_warmup` and `begin_claimant_retire` re-check
+        // every gate, so a stale request cannot start a worker past config.
         let mut requested_by = Vec::new();
         let mut opened = false;
         let mut retire = None;
+        let mut debugger = None;
         for &(wid, view) in views {
             if let Some(crate::native_app::AppViewState::Settings(state)) =
                 self.native_runtime.view_state_mut(view)
@@ -422,6 +420,11 @@ impl App {
                 }
                 opened |= state.take_consent_open_request();
                 retire = retire.or(state.take_claimant_retire_request());
+                // One change at a time: the first confirmed press is taken up;
+                // one confirmed in another view behind the same alert is
+                // drained too, and `begin_debugger_access_change` would refuse
+                // it as in flight anyway.
+                debugger = debugger.or(state.take_debugger_change_request());
             }
         }
         // Every yes still waiting is taken up here — started, or refused and
@@ -456,6 +459,18 @@ impl App {
             // (`MacosAccess::retire_status`) until the next press starts.
             self.claimant_retire_refusal = self.begin_claimant_retire(plan).err();
         }
+        if let Some((change, answer)) = debugger {
+            // The refusal, if any, rides the debugger row's facts
+            // (`DebuggerFacts::refusal`) until the next press starts.
+            let refusal = self.begin_debugger_access_change(change, answer).err();
+            if let Some(why) = refusal {
+                aterm_log::info!(
+                    "debugger access: the confirmed change started nothing: {}",
+                    why.words()
+                );
+            }
+            self.debugger_change.note_refusal(refusal);
+        }
         // The page's Open Privacy & Security… is the card's Open Settings by
         // another door: the same `opened` marker, and the same watch for the ✓.
         if opened {
@@ -463,11 +478,11 @@ impl App {
         }
     }
 
-    /// Assemble what the Security page renders: `App` state, the CACHED probe,
-    /// and one `proc_pidpath` for the image anchor. `SpikeEvidence::UNMEASURED` is
-    /// what it publishes, so the panel's coverage claim stays gated on a named
-    /// field rather than on prose.
-    fn macos_access_projection(&mut self) -> crate::native_settings::MacosAccess {
+    /// Assemble what the Security page renders: `App` state, the cached probe, and one
+    /// `proc_pidpath` for the image anchor. It publishes `SpikeEvidence::UNMEASURED`, so
+    /// the panel's coverage claim stays gated on a named field. `on_screen` says whether
+    /// a Security view is visible, which alone lets the Developer Tools row dispatch.
+    fn macos_access_projection(&mut self, on_screen: bool) -> crate::native_settings::MacosAccess {
         let facts = self.consent_panel_facts();
         let warmup_offered = self.config.privacy_enabled()
             && self.config.privacy_warmup() == crate::app_config::PrivacyWarmup::OnRequest;
@@ -481,9 +496,8 @@ impl App {
             .claimants(facts.bundle_id.as_deref(), facts.enabled);
         crate::native_settings::MacosAccess {
             enabled: facts.enabled,
-            // Read FRESH, never cached: the whole point is that it changes
-            // under a running process when an apply renames the bundle out
-            // from under it and boot-health deletes it.
+            // Read fresh: it changes under a running process when an apply renames
+            // the bundle away and boot-health deletes it.
             anchor: aterm_containment::image_anchor(),
             fda: facts.fda,
             probe: facts.probe,
@@ -501,17 +515,62 @@ impl App {
             warmup_offered,
             warmup_live,
             warmup_rows,
-            // A reset is reported only by the gesture that ran it, and the view
-            // keeps that report across these republishes
-            // (`replace_macos_access`); the host never invents one, and a
-            // successor process inherits none.
+            // A reset is reported only by the gesture that ran it, and the view keeps
+            // that report across republishes (`replace_macos_access`); the host never
+            // invents one, and a successor process inherits none.
             reset: None,
             claimants: claimants.map(|(census, _age)| census),
             trash_tool: crate::consent_retire::trash_tool_present(),
             retire_live: self.claimant_retire.is_live(),
             retired: self.claimant_retire.report(),
             retire_status: self.claimant_retire_status(),
+            debugger: self.debugger_access_facts(),
+            devtools: self.devtools_access_facts(on_screen),
         }
+    }
+
+    /// What the Security page's Developer Tools row renders (debugger design
+    /// §9.1): the CACHED devtools slot answer, with tccd's answer aged in whole
+    /// minutes so the equality-gated republish repaints at most once a minute.
+    /// Only while the page is `on_screen` does a stale answer dispatch its one
+    /// bounded `log show` worker off this thread (the render never waits on
+    /// it); otherwise nothing is started ([`ConsentState::devtools_cached`]).
+    ///
+    /// [`ConsentState::devtools_cached`]: crate::control_privacy::ConsentState::devtools_cached
+    fn devtools_access_facts(&self, on_screen: bool) -> crate::native_settings::DevToolsFacts {
+        let gate = self.config.privacy_probe_gate();
+        let observer_off = self.config.privacy_observer_off();
+        let row = if on_screen {
+            self.consent.devtools(gate, observer_off)
+        } else {
+            self.consent.devtools_cached(gate, observer_off)
+        };
+        crate::native_settings::DevToolsFacts {
+            enabled: gate.permits(),
+            probe: row.probe(),
+            answer_minutes: row.answer_age_ms().map(|ms| ms / 60_000),
+        }
+    }
+
+    /// What the Security page's debugger row renders (design §3.3): the CACHED
+    /// `DebuggerSlot` answer — a stale one dispatches its bounded worker off
+    /// this thread, exactly as the FDA and census reads here do, and the
+    /// render never waits on it — and the change lane's state: a change in
+    /// flight (this process's or a predecessor's), whether any button may be
+    /// live, the recorded mode and its origin, drift, the last outcome and the
+    /// last refusal. A completed answer is handed to the lane first, so the
+    /// press guard and the page read the same observation.
+    pub(crate) fn debugger_access_facts(&mut self) -> crate::debugger_access::DebuggerFacts {
+        let gate = self.config.privacy_probe_gate();
+        let row = self.consent.debugger(gate);
+        if !row.pending() {
+            let step = self
+                .debugger_change
+                .observe(row.probe(), crate::debugger_access::now_secs());
+            self.apply_debugger_step(step);
+        }
+        self.debugger_change
+            .facts(gate.permits(), row.probe(), row.self_hardened())
     }
 
     /// The Security block's *Move to Trash* status row: under way, refused before
@@ -531,11 +590,10 @@ impl App {
         Some(crate::consent_retire::summary(moved, report.len()))
     }
 
-    /// Locate the native Settings presentation targeted by compatibility control
-    /// verbs. Prefer the front window, then any other live presentation of the
-    /// process-singleton controller. Returning the real view state and stable IDs
-    /// lets inspection compile the same semantic tree as paint instead of reviving
-    /// the retired overlay's parallel projection.
+    /// Locate the native Settings presentation targeted by compatibility control verbs:
+    /// the front window first, then any other live presentation of the singleton. The
+    /// real view state and stable ids let inspection compile the same semantic tree as
+    /// paint.
     pub(crate) fn native_settings_view_target(
         &self,
     ) -> Option<(
@@ -561,11 +619,10 @@ impl App {
         self.native_settings_front_view_target_matching(None)
     }
 
-    /// Locate a live presentation of one exact Settings route for a compatibility
-    /// alias in the front window's active tab. This is deliberately distinct from the
-    /// generic `controls prefs` target: `controls about` and `controls update` must either
-    /// inspect the page photographed by `window about|update` or report that it is not
-    /// frontmost, never serialize a background or parallel retired model.
+    /// Locate a live presentation of one exact Settings route for a compatibility alias
+    /// in the front window's active tab. Distinct from the generic `controls prefs`
+    /// target: `controls about` and `controls update` inspect the page `window
+    /// about|update` photographs or report that it is not frontmost.
     pub(crate) fn native_settings_route_view_target(
         &self,
         route: crate::native_settings::SettingsRoute,
@@ -578,21 +635,12 @@ impl App {
         self.native_settings_front_view_target_matching(Some(route))
     }
 
-    /// Legacy overlay-model access retained only for the old model-level tests.
-    /// Production control inspection uses [`Self::native_settings_view_target`]
-    /// and the native compiled semantic tree.
+    /// Overlay-model access for the model-level tests. Production control inspection
+    /// uses [`Self::native_settings_view_target`] and the native compiled semantic tree.
     #[cfg(test)]
     pub(crate) fn native_settings_legacy_state(&self) -> Option<&crate::settings::SettingsState> {
         self.native_settings_view_target()
             .map(|(_, _, _, state)| &state.legacy)
-    }
-
-    /// Host window for the retired Settings overlay used by tests. Production
-    /// Settings is a native tab and never enters the window overlay slot.
-    #[cfg(test)]
-    fn settings_host_mut(&mut self) -> Option<&mut crate::WindowState> {
-        let wid = self.frontmost_window?;
-        self.windows.get_mut(&wid)
     }
 
     /// Select the process-singleton Settings app in the FRONTMOST window,
@@ -610,11 +658,9 @@ impl App {
         self.open_settings_tab_in_window(wid, route)
     }
 
-    /// [`Self::open_settings_tab`] in a NAMED window (design §3.9): the message
-    /// band, a screen reader's activate on it and the Messages page's own
-    /// actions pass the window the press landed in, so a press in a background
-    /// window opens the page there and raises it — the bars' press switched
-    /// the frontmost window instead.
+    /// [`Self::open_settings_tab`] in a named window: the message band, a screen reader's
+    /// activate on it and the Messages page's actions pass the window the press landed
+    /// in, so a press in a background window opens the page there and raises it.
     pub(crate) fn open_settings_tab_in_window(
         &mut self,
         wid: crate::WindowId,
@@ -657,22 +703,21 @@ impl App {
                         | crate::native_updater_service::UpdaterPhase::Available
                         | crate::native_updater_service::UpdaterPhase::Downloading
                 );
-                let app = crate::native_app::NativeApp::Settings(
+                let app = crate::native_app::NativeApp::Settings(Box::new(
                     crate::native_settings::SettingsApp::new_at_config_revision(
                         self.update_snapshot(checking),
                         snapshot.revision,
                     ),
-                );
+                ));
                 self.install_new_native_tab(wid, app, view_state, presentation)
             };
             let Ok((instance, tab_id, view)) = install else {
                 return false;
             };
-            // The singleton controller is shared independently of any one
-            // presentation. Attaching a view from `snapshot` is therefore the
-            // synchronization point: update both its OCC base and the view
-            // projection from the same canonical revision before either can
-            // emit an edit. This also keeps staged/no-view lifecycle paths safe.
+            // The singleton controller is shared independently of any presentation, so
+            // attaching a view from `snapshot` is the synchronization point: its OCC base
+            // and projection come from the same canonical revision before either can
+            // emit an edit.
             let _ = self.native_runtime.dispatch(
                 instance,
                 view,
@@ -698,15 +743,11 @@ impl App {
             if !focused {
                 return false;
             }
-            // A last-tab close parks the logical window behind `pending_close`
-            // until its main-loop caller can escalate with an ActiveEventLoop.
-            // An explicit reopen can race that escalation (or recover a window
-            // left behind by an older caller), so installing/focusing a real tab
-            // must cancel the stale empty-window teardown before another wake
-            // observes it. Cancel it through the one helper, which also drops
-            // the attribution that close stashed: the teardown that consumes it
-            // is exactly what is NOT going to run, and left behind it would be
-            // journalled on this window's next scope-less close.
+            // A last-tab close parks the logical window behind `pending_close` until its
+            // main-loop caller escalates. An explicit reopen can race that, so installing
+            // or focusing a real tab cancels the stale teardown first, through the helper
+            // that also drops the close's stashed attribution (otherwise journalled on
+            // this window's next scope-less close).
             crate::app_tabs::cancel_pending_close(ws);
             ws.last_present = None;
         }
@@ -717,28 +758,24 @@ impl App {
         self.sync_settings_title_summary_health();
         if route == crate::native_settings::SettingsRoute::SoftwareUpdate {
             self.acknowledge_native_update_attention();
-            // The screen paints the reducer's snapshot, and the reducer only learns
-            // ledger changes on a reconcile. Opening the screen IS the moment the
-            // user wants the current verdict (a check that failed persistently
-            // stages nothing, so nothing else would have imported it).
+            // The screen paints the reducer's snapshot, which learns ledger changes only
+            // on a reconcile; opening the screen is when the user wants the current
+            // verdict.
             self.request_native_update_reconcile(
                 crate::app_native::NativeUpdateReconcilePurpose::Refresh,
             );
         }
-        // Seed + refresh the shared Packages projection whenever Settings
-        // surfaces: publication is memory-only (the controller starts honest
-        // "unobserved"), and the status collection runs on a worker thread —
-        // never a status.toml parse on the event loop.
+        // Seed and refresh the shared Packages projection whenever Settings surfaces:
+        // publication is memory-only (the controller starts "unobserved"), and status
+        // collection runs on a worker, never on the event loop.
         self.publish_native_packages_state();
         self.start_native_packages_refresh();
-        // And the Messages projection, unconditionally (design §4.2): a
-        // Settings tab opened at the Messages route — a band row's
-        // `Details ›`, the menu, the control verb — reads the log as it is
-        // now, not as the 2 Hz gate last let it through.
+        // And the Messages projection, unconditionally: a Settings tab opened at the
+        // Messages route (a band row's `Details ›`, the menu, the control verb) reads
+        // the log as it is now, not as the 2 Hz gate last let it through.
         self.publish_native_messages_state();
-        // The Security page's "This Mac" card confirms the [machine] settings from
-        // a fresh `atpkg machine` read every time Settings surfaces — never from a
-        // remembered posture.
+        // The Security page's "This Mac" card reads `[machine]` from a fresh `atpkg
+        // machine` every time Settings surfaces.
         self.start_native_machine_refresh();
         let action_id = if route == crate::native_settings::SettingsRoute::Manual {
             crate::native_ui::ActionId::new("settings/manual/open")
@@ -749,17 +786,14 @@ impl App {
             id: action_id,
             value: None,
         });
-        // Reuse the exact human/semantic-action host path.  The old direct
-        // runtime dispatch threw away `InvalidateOwnPresentation` and
-        // `RepaintSelf`, leaving the model on the requested route while the
-        // retained app-render tray still held the previous page.
+        // The human/semantic-action host path, so `InvalidateOwnPresentation` and
+        // `RepaintSelf` are honoured and the retained render tray shows the new route.
         if self.dispatch_native_view_event(wid, view, action).is_err() {
             return false;
         }
-        // AFTER the route action, not before it: the block only exists on the
-        // Security page, and an already-open tab reaches that page through the
-        // dispatch above. Publishing here means opening Settings ▸ Security
-        // shows a live posture immediately instead of on the next park.
+        // After the route action: the block exists only on the Security page, which an
+        // open tab reaches through the dispatch above, so Settings ▸ Security shows a
+        // live posture immediately.
         self.sync_settings_consent_posture();
         self.sync_active_session();
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -819,10 +853,9 @@ impl App {
         removed
     }
 
-    /// Apply the compatibility `settings [open|close]` request while keeping
-    /// process singleton identity separate from per-window presentation. An
-    /// explicit open always addresses the current front window; toggle and
-    /// close retain their historical process-wide meaning.
+    /// Apply the compatibility `settings [open|close]` request, keeping singleton
+    /// identity separate from per-window presentation. An explicit open addresses the
+    /// front window; toggle and close act process-wide.
     pub(crate) fn apply_settings_open_request(&mut self, open: Option<bool>) -> bool {
         match open {
             Some(true) => {
@@ -841,48 +874,6 @@ impl App {
         self.settings_tab_open()
     }
 
-    /// Put the retired Settings card in the front window's overlay slot (no-op if already
-    /// there): a modal that consumes input, for tests that need an open overlay.
-    #[cfg(test)]
-    pub(crate) fn settings_enter(&mut self) {
-        // The modal steals the mouse: settle any in-flight divider/selection drag
-        // first, or its swallowed release leaves the drag running under the panel.
-        if let Some(wid) = self.frontmost_window {
-            self.settle_pointer_drags(wid);
-        }
-        // Build the snapshot before the mutable window borrow (borrow split).
-        let state = crate::settings::SettingsState::from_config_with_trail_pack_ids(
-            &self.config,
-            &self.config_assets.trail_packs.ids,
-        );
-        if let Some(ws) = self.settings_host_mut()
-            && ws.settings().is_none()
-        {
-            // Mutual exclusion is STRUCTURAL now: assigning the one `overlay` slot drops
-            // whatever About/Palette was there — no manual "clear the other two".
-            ws.overlay = Some(crate::overlay::Overlay::Settings(state));
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-        }
-        self.overlay_a11y_update();
-    }
-
-    /// Close the Settings overlay on the front window (no-op if already closed). The
-    /// `settings_fp` key term drops to `0`, so the next frame repaints the clean terminal.
-    #[cfg(test)]
-    pub(crate) fn settings_exit(&mut self) {
-        if let Some(ws) = self.settings_host_mut()
-            && ws.settings().is_some()
-        {
-            ws.overlay = None;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-        }
-        self.overlay_a11y_update();
-    }
-
     /// `settings section <name>` (socket): navigate the OPEN native Settings tab to the
     /// parsed stable route. The control parser accepts visible labels and compatibility
     /// aliases before this main-thread boundary; no retired category is representable
@@ -899,11 +890,10 @@ impl App {
             .ok_or_else(|| "could not focus the native Settings tab".to_string())
     }
 
-    /// The typing-sound audition, decided BEFORE a config swap against the
-    /// latch: a native-window pick or a hand edit that CHANGES the voice
-    /// returns it for one audition after the swap; re-applying the voice
-    /// already latched is silent; startup never reaches the swap. Pure over
-    /// `(next config, latch)` so the dedupe law is provable.
+    /// The typing-sound audition, decided before a config swap against the latch: a
+    /// native-window pick or hand edit that changes the voice returns it for one
+    /// audition after the swap; re-applying the latched voice is silent; startup never
+    /// reaches the swap. Pure over `(next config, latch)`.
     pub(crate) fn typing_sound_to_audition_on_swap(
         &self,
         next: &crate::app_config::Config,
@@ -912,18 +902,15 @@ impl App {
         (next_voice != self.typing_sound_auditioned).then_some(next_voice)
     }
 
-    /// THE TYPING-SOUND AUDITION — "picking a voice plays one keystroke of
-    /// it, so you choose by ear." One [`aterm_effects::trail_sound::SoundKind::Typed`]
-    /// cue in `voice`, exactly as the loudness ladder measures a keystroke
-    /// (`mix_meter`'s stance: pan 0, heat 0.5, hue 0, `Tone::Technical`, no
-    /// bed) at the user's volume, riding the current trail look (which only
-    /// matters under `auto`, where the audition IS today's sound). Gated by
-    /// the SAME predicate the key-time click uses
-    /// ([`crate::app_input::keystroke_click_audible`]): a live audio host, the
-    /// "Music effects" master, a non-zero volume, and serious mode allowing
-    /// terminal sound — so the preview can never speak where a keystroke
-    /// could not. Latches `typing_sound_auditioned` either way, so re-applying
-    /// the same voice does not play it twice.
+    /// Play one keystroke of `voice` so a voice is chosen by ear: one
+    /// [`aterm_effects::trail_sound::SoundKind::Typed`] cue as the loudness ladder
+    /// measures a keystroke (`mix_meter`'s stance: pan 0, heat 0.5, hue 0,
+    /// `Tone::Technical`, no bed) at the user's volume, on the current trail look.
+    /// Gated by the key-time click's predicate
+    /// ([`crate::app_input::keystroke_click_audible`]: a live audio host, the "Music
+    /// effects" master, non-zero volume, serious mode allowing sound), so the preview
+    /// never speaks where a keystroke could not. Latches `typing_sound_auditioned`
+    /// either way.
     pub(crate) fn audition_typing_sound(&mut self, voice: aterm_effects::trail_sound::SoundVoice) {
         use aterm_effects::trail_sound::{SoundEvent, SoundGesture, SoundKind};
         self.typing_sound_auditioned = voice;
@@ -949,18 +936,16 @@ impl App {
             gain: volume,
             tone: aterm_effects::tone::Tone::Technical,
             bed: false,
-            // The picker's audition is the PLAIN keystroke — the tier-1 floor
-            // the roster is compared on. A shifted probe would audition every
-            // voice an octave up.
+            // The plain keystroke, the floor the roster is compared on; a shifted probe
+            // would audition every voice an octave up.
             shifted: false,
         });
     }
 
-    /// Push the FRONT window's OPEN overlay accessibility tree (Settings / About / Palette /
-    /// Update, or an empty root when closed) to its AccessKit adapter. A no-op without the
-    /// `a11y-accesskit` feature; under it, a no-op unless a screen reader is attached
-    /// (`update_if_active`). Called by every overlay mutator, so opening/mutating ANY surface
-    /// refreshes the tree — not just Settings.
+    /// Push the front window's open overlay accessibility tree (Settings / About /
+    /// Palette / Update, or an empty root) to its AccessKit adapter. A no-op without the
+    /// `a11y-accesskit` feature, or unless a screen reader is attached
+    /// (`update_if_active`). Called by every overlay mutator.
     pub(crate) fn overlay_a11y_update(&mut self) {
         #[cfg(a11y_tree)]
         if let Some(wid) = self.frontmost_window {
@@ -968,18 +953,15 @@ impl App {
         }
     }
 
-    /// Build the accessibility tree for window `wid`'s OPEN overlay (Settings / About /
-    /// Palette / Update) — or an empty root when nothing is open — and hand it to that
-    /// window's AccessKit adapter. The tree fans out through [`crate::overlay::OverlayModel::a11y`]
-    /// off the SAME model the pixels + `controls` verb read, so which surface is live routes
-    /// itself (a missing variant is a compile error, not a Settings-only fallback to empty).
+    /// Build the accessibility tree for window `wid`'s open overlay (Settings / About /
+    /// Palette / Update), or its grid or native tree when none is open, and hand it to
+    /// the window's AccessKit adapter. Overlays fan out through
+    /// [`crate::overlay::OverlayModel::a11y`] off the same model the pixels and
+    /// `controls` verb read.
     ///
-    /// PERF: bails before building ANYTHING unless an OS a11y client has actually attached
-    /// ([`crate::WindowState::a11y_active`]). The whole body below is thrown away by
-    /// `update_if_active` while the adapter is inactive — it just used to be thrown away
-    /// *after* walking every visible cell into a string, on every present. Attachment always
-    /// arrives as `InitialTreeRequested`, which raises the latch and then publishes here, so
-    /// the first tree a screen reader sees is unchanged.
+    /// Returns before building anything unless an OS a11y client has attached
+    /// ([`crate::WindowState::a11y_active`]); attachment arrives as
+    /// `InitialTreeRequested`, which raises the latch and then publishes here.
     #[cfg(a11y_tree)]
     pub(crate) fn push_a11y_tree(&mut self, wid: crate::WindowId) {
         self.push_a11y_tree_with_plan(wid, None);
@@ -998,21 +980,18 @@ impl App {
         {
             return;
         }
-        // DEFAULT-2: with NO overlay open, publish the live terminal GRID (its visible text,
-        // read-only) so a screen reader reads the terminal itself — previously this handed
-        // AccessKit an empty root and VoiceOver announced nothing. Build the grid snapshot
-        // BEFORE the mutable window borrow below (both borrow `self`). An overlay keeps its
-        // own tree.
+        // With no overlay open, publish the live terminal grid (visible text, read-only).
+        // The grid snapshot is built before the mutable window borrow below (both borrow
+        // `self`). An overlay keeps its own tree.
         let has_overlay = self
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.overlay.is_some());
-        // A native frame stages its projection from the exact CompiledUi used for paint.
-        // Initial-tree requests before first paint compile one projection here. `None`
-        // means the front content is terminal; `Some(Err)` is a native projection failure
-        // and must fail closed rather than announce a hidden terminal grid.
-        // A `match`, not `map_or_else`: both arms need `&mut self`, and handing two
-        // closures to one call asks the borrow checker to hold both at once.
+        // A native frame stages its projection from the CompiledUi used for paint;
+        // initial-tree requests before first paint compile one here. `None` means the
+        // front content is terminal; `Some(Err)` is a native projection failure and fails
+        // closed rather than announce a hidden terminal grid. A `match`, since both arms
+        // need `&mut self`.
         let native_update = (!has_overlay)
             .then(|| match frame_plan {
                 Some(plan) => self.take_native_accessibility_update_from_plan(wid, plan),
@@ -1022,11 +1001,9 @@ impl App {
         let grid_snap = (!has_overlay && native_update.is_none())
             .then(|| self.grid_snapshot(wid))
             .flatten();
-        // The grid's on-screen geometry and the tab strip it sits under. Both are read
-        // from state the frame ALREADY computed (`win_cell_size`/`win_pad_top` metrics,
-        // and the very `tab_segments` the mouse hit-tests against), so this adds no
-        // layout work — and, like everything else here, it is only reached once an OS
-        // a11y client has attached.
+        // The grid's on-screen geometry and its tab strip, both read from state the frame
+        // already computed (`win_cell_size`/`win_pad_top`, and the `tab_segments` the mouse
+        // hit-tests), so no layout work is added.
         let grid_geometry = grid_snap
             .is_some()
             .then(|| self.grid_a11y_geometry(wid))
@@ -1036,10 +1013,9 @@ impl App {
         } else {
             Vec::new()
         };
-        // The rest of what the frame carries beyond its rows: the split panes it was
-        // composed from, the painted selection, and the find panel's own field. All read
-        // from the SAME presented `input_scratch` the rows came from, so a screen reader
-        // is described the frame that is on the glass, not a fresher one.
+        // Split panes, painted selection and the find field, all read from the same
+        // presented `input_scratch` as the rows, so the reader is told the frame on the
+        // glass.
         let initial_grid_plan = if grid_snap.is_some() && frame_plan.is_none() {
             self.active_visible_leaf_plan(wid)
         } else {
@@ -1060,16 +1036,15 @@ impl App {
             .is_some()
             .then(|| self.grid_a11y_find(wid))
             .flatten();
-        // The chrome messages this window is showing. Built for the GRID tree only: an
-        // overlay and a native tab app own the whole tree while they are up, and the
-        // bands/cards are not on their glass either.
+        // Chrome messages, for the grid tree only: an overlay or native tab app owns the
+        // whole tree while up, and the bands are not on its glass.
         let grid_messages = if grid_snap.is_some() {
             self.grid_a11y_messages(wid)
         } else {
             Vec::new()
         };
-        // The window's chrome title, so the accessible WINDOW is named the same thing the
-        // titlebar names it. Cloned out before the mutable borrow below.
+        // The window's chrome title, so the accessible window is named as the titlebar.
+        // Cloned out before the mutable borrow below.
         let window_title = self
             .windows
             .get(&wid)
@@ -1078,8 +1053,8 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        // Build eagerly to an owned value BEFORE the mutable adapter borrow: the immutable
-        // `&ws.overlay` field borrow ends once `update` is materialised, freeing `ws.a11y`.
+        // Built to an owned value before the mutable adapter borrow: the `&ws.overlay`
+        // borrow ends once `update` exists, freeing `ws.a11y`.
         let (update, published) = match &ws.overlay {
             Some(o) => (crate::overlay::OverlayModel::a11y(o.model()), None),
             None => match native_update {
@@ -1115,18 +1090,17 @@ impl App {
         adapter.update_if_active(move || update);
     }
 
-    /// Where window `wid`'s visible grid (and the tab strip above it) landed in the client
-    /// area, in PHYSICAL pixels — the space `accesskit_winit` reports root window bounds
-    /// in. Straight from the window's own metrics, the same numbers the frame was laid out
-    /// with; `None` for an unknown window or a degenerate cell size, in which case the
-    /// tree simply omits geometry (the Text interface is unaffected).
+    /// Where window `wid`'s visible grid (and the tab strip above it) sits in the client
+    /// area, in physical pixels (the space `accesskit_winit` reports root bounds in),
+    /// from the window's own metrics. `None` for an unknown window or degenerate cell
+    /// size; the tree then omits geometry (the Text interface is unaffected).
     #[cfg(a11y_tree)]
     fn grid_a11y_geometry(
         &self,
         wid: crate::WindowId,
     ) -> Option<crate::accesskit_tree::GridGeometry> {
-        // An unknown window would silently fall back to the SHARED backend metrics, which
-        // is another window's geometry — fail closed instead.
+        // An unknown window would fall back to the shared backend metrics, another
+        // window's geometry; fail closed instead.
         if !self.windows.contains_key(&wid) {
             return None;
         }
@@ -1135,9 +1109,8 @@ impl App {
             return None;
         }
         let strip_rows = usize::from(self.tab_strip_rows);
-        // The strip band starts below the top pad + chrome headroom; the GRID starts below
-        // the band — exactly `native_content_origin_y`, and exactly where `grid_snapshot`
-        // re-bases the cursor to.
+        // The strip starts below the top pad and chrome headroom; the grid starts below
+        // the strip (`native_content_origin_y`, where `grid_snapshot` re-bases the cursor).
         let strip_y = self.win_pad_top(wid).saturating_add(self.win_head(wid));
         Some(crate::accesskit_tree::GridGeometry {
             origin_x: self.win_pad(wid) as f64,
@@ -1149,7 +1122,14 @@ impl App {
             // The bar band sits between the strip and grid row 0 — the same
             // arithmetic `native_content_origin_y` uses, from the other end.
             bars_y: (strip_y + strip_rows * ch) as f64,
-            bar_h: if self.message_band_rows == 0 {
+            // One row tall whenever a bar row is up, including the presence row (bar
+            // row 0) with no band row below it.
+            bar_h: if self.message_band_rows == 0
+                && self
+                    .windows
+                    .get(&wid)
+                    .is_none_or(|ws| ws.presence.rows == 0)
+            {
                 0.0
             } else {
                 ch as f64
@@ -1157,17 +1137,13 @@ impl App {
         })
     }
 
-    /// The in-grid tab strip of window `wid` as publishable a11y items, or empty when
-    /// there is nothing a screen reader should be told about.
+    /// The in-grid tab strip of window `wid` as publishable a11y items, or empty.
     ///
-    /// Empty unless the strip is actually ON SCREEN (`tab_strip_rows > 0`) and holds at
-    /// least two tabs: a solo strip is painted as the window TITLE, not a switcher (see
-    /// `TabSegment::solo`), so publishing a one-item tab list would announce a control
-    /// that is not there. Labels come from the window's `strip_titles_scratch` and column
-    /// spans from its cached `tab_segments` — the very buffers the last paint filled and
-    /// the mouse hit-tests against, so the announced tab and the clickable tab are the
-    /// same one by construction. The label is announced WHOLE, not as the chip's cut, so
-    /// it takes the whole-string cap the strip itself does not
+    /// Empty unless the strip is on screen (`tab_strip_rows > 0`) with at least two tabs:
+    /// a solo strip paints the window title (`TabSegment::solo`). Labels come from
+    /// `strip_titles_scratch` and spans from the cached `tab_segments`, the buffers the
+    /// last paint filled and the mouse hit-tests, so announced and clickable tabs agree.
+    /// The label is announced whole, not as the chip's cut
     /// (`title_summary::whole_label`).
     #[cfg(a11y_tree)]
     fn grid_a11y_tabs(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridTab> {
@@ -1204,23 +1180,17 @@ impl App {
             .collect()
     }
 
-    /// Window `wid`'s visible SPLIT PANES as one publishable terminal document each, or
-    /// empty when the frame is a single document.
+    /// Window `wid`'s visible split panes as one terminal document each, or empty for a
+    /// single document.
     ///
-    /// A composed split tiles every pane onto the same frame rows with a divider column
-    /// between them, so the whole-frame projection reads as two unrelated programs' output
-    /// spliced together on every line — with nothing to say which half is which, or which
-    /// one the keyboard is in. Slicing each pane's rectangle out of the SAME composed
-    /// cells the frame was drawn from restores one document per pane without inventing a
-    /// second source of truth.
+    /// A composed split tiles panes onto the same rows with a divider, so the whole
+    /// frame splices unrelated output; each pane's rectangle is sliced from the same
+    /// composed cells the frame was drawn from.
     ///
-    /// Empty for a single pane and for a ZOOMED tab — the same `len() > 1 && !is_zoomed()`
-    /// predicate `splice_find_bar` uses, because a zoomed pane genuinely renders through
-    /// the single-pane path and IS one document.
-    ///
-    /// A pane's id slot is its position in the layout. Closing a pane therefore renumbers
-    /// the survivors' rows, which is correct: a closed pane is a structural change, not a
-    /// line of output, and the consumer should rebuild rather than diff.
+    /// Empty for one pane and for a zoomed tab (the `len() > 1 && !is_zoomed()`
+    /// predicate `splice_find_bar` uses). A pane's id slot is its layout position, so
+    /// closing a pane renumbers the survivors: a structural change the consumer
+    /// rebuilds rather than diffs.
     #[cfg(a11y_tree)]
     fn grid_a11y_panes(
         &self,
@@ -1286,23 +1256,18 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// The PAINTED selection covering one published document — the whole visible grid
-    /// (`row_off = 0`, the full column range) or one pane's rectangle.
+    /// The painted selection covering one published document: the whole visible grid
+    /// (`row_off = 0`, full column range) or one pane's rectangle.
     ///
-    /// Read from `RenderInput::selection_row_key`, the renderer's OWN per-row, per-entry
-    /// selection list, so the reader and the glass are told from the SAME SOURCE. Not
-    /// exact equality at every edge: the band is painted per CELL through
-    /// `TextSelection::contains_cell`, which snaps a double-width glyph whole, while this
-    /// list is the damage key and is content-independent — an edge landing on a wide
-    /// LEAD paints one column past what the span states. The divergence is one cell at a
-    /// wide glyph's boundary and never a whole run, which is what makes the spans usable
-    /// here at all. The per-ENTRY form is what makes a split honest —
-    /// the hull `selection_row_span` returns would merge two panes' spans into one that
-    /// covers the divider between them.
+    /// Read from `RenderInput::selection_row_key`, the renderer's per-row, per-entry
+    /// selection list. The painted band snaps a double-width glyph whole
+    /// (`TextSelection::contains_cell`) while this list is content-independent, so an
+    /// edge on a wide lead can differ by one cell, never a whole run. The per-entry form
+    /// keeps a split's panes apart (the `selection_row_span` hull would span the
+    /// divider).
     ///
-    /// `None` for no selection AND for one that collapses to a point after clipping, so a
-    /// click that selected nothing leaves the terminal's own caret published rather than
-    /// dragging it to the press.
+    /// `None` for no selection and for one that collapses to a point after clipping, so
+    /// a click that selected nothing leaves the caret published.
     #[cfg(a11y_tree)]
     fn grid_a11y_selection(
         &self,
@@ -1319,9 +1284,8 @@ impl App {
         for (row, line) in snap.value().split_inclusive('\n').enumerate() {
             ws.input_scratch
                 .selection_row_key(strip + row_off + row, &mut keys);
-            // Clip each entry to this document's columns and take the hull of what
-            // survives: within one pane's box the entries cannot overlap, and for the
-            // single-document case there is only ever one.
+            // Clip each entry to this document's columns and take the hull: within one
+            // pane's box entries cannot overlap, and a single document has only one.
             let Some((lo, hi)) = keys
                 .iter()
                 .filter_map(|k| {
@@ -1345,18 +1309,16 @@ impl App {
         (anchor != focus).then_some(crate::accesskit_tree::GridSpan { anchor, focus })
     }
 
-    /// The find panel's query FIELD for window `wid`, or `None` when find mode is not up.
+    /// The find panel's query field for window `wid`, or `None` when find mode is off.
     ///
-    /// The panel paints as terminal cells, so its text already reaches the grid document —
-    /// as anonymous output, with the caret still on the shell prompt. This is the node that
-    /// makes it a field a screen reader can be IN: the live query, the caret inside it, and
-    /// the panel's own answer (`match 2 of 7`, `no matches`, `bad regex`) plus the active
-    /// modes as the description. The strings mirror `FindBarView`'s, so what is announced
-    /// and what is painted say the same thing.
+    /// The panel paints as terminal cells, so its text reaches the grid document as
+    /// anonymous output; this node makes it a field: the live query, the caret inside
+    /// it, and the panel's answer (`match 2 of 7`, `no matches`, `bad regex`) plus the
+    /// active modes as the description, mirroring `FindBarView`'s strings.
     #[cfg(a11y_tree)]
     fn grid_a11y_find(&self, wid: crate::WindowId) -> Option<crate::accesskit_tree::GridFind> {
         let search = self.windows.get(&wid)?.search.as_ref()?;
-        // `SearchState::cursor` is a BYTE offset on a char boundary; the a11y caret is a
+        // `SearchState::cursor` is a byte offset on a char boundary; the a11y caret is a
         // character index into the same string.
         let caret = search
             .query
@@ -1376,39 +1338,25 @@ impl App {
         })
     }
 
-    /// The CHROME MESSAGES window `wid` is showing right now — the surfaces that speak to
-    /// the user unprompted and then leave.
+    /// The chrome messages window `wid` is showing now: surfaces that speak unprompted
+    /// and then leave, which a screen reader cannot find by exploring. Their words reach
+    /// the grid document as anonymous cells; this adds a node per row with its role,
+    /// capsules and place. Robi's tip bubble is decoration and never announced.
     ///
-    /// These are the one class of surface a screen reader cannot find by exploring: by
-    /// the time the user goes looking, a band row has folded. They paint as terminal
-    /// cells, so their words did reach the grid document as anonymous output; what this
-    /// adds is a node per row with its role, its capsules and its place. The retired
-    /// transient card (slot 0) is gone: its producers are band rows, and Robi's tip
-    /// bubble — what survived of it — is a DECORATION, never announced (design D7, R23).
+    /// Every entry is gated on the same predicate as the pixels (the committed
+    /// `message_band_rows`), so a message is announced exactly when it is on this
+    /// window's glass.
     ///
-    /// EVERY ENTRY IS GATED ON THE SAME PREDICATE THE PIXELS ARE. The band rows ask the
-    /// committed `message_band_rows`, so a message is announced when and only when it is
-    /// on the glass of THIS window.
+    /// A band row speaks `title[ · detail[0]]`, its first detail line whole and only
+    /// where the row paints it as its excerpt, and leaves the rest to the Details press.
+    /// Pictographic joints are spoken as words (`aterm_messages::glass::speakable`: `→`
+    /// as "did you mean", `×` between numbers as "by", `▸` as a pause). The spoken
+    /// sentence is width-independent (a resize never re-announces) and changes only with
+    /// the work's phase; `stats` ride the description with the capsules' full labels,
+    /// so a live region never floods.
     ///
-    /// AND EVERY ENTRY IS THE ROW'S OWN SENTENCE. What a live region says is spoken in
-    /// full the instant it changes, so a band row speaks `title[ · detail[0]]` — its
-    /// first detail line WHOLE, width-independent, and only where the row paints it as
-    /// its excerpt (ruling 77: speech follows paint) — and leaves the rest of its detail
-    /// to the Details press. The band's pictographic joints are said as words
-    /// (`aterm_messages::glass::speakable`: `→` as "did you mean", `×` between numbers
-    /// as "by", `▸` as a pause).
-    ///
-    /// The split between the announced sentence and the description is deliberate and is
-    /// what keeps a live region from becoming a flood: a band row's spoken sentence
-    /// (design §3.5 — width-independent, so a resize that re-shapes the painted excerpt
-    /// never re-announces a row) changes only when the work moves to a new phase, while
-    /// its `stats` tick with every megabyte and ride the description with the capsules'
-    /// full labels. Announcing the figures would say the row aloud a hundred times on
-    /// the way to 100%.
-    ///
-    /// A row that ASKS — a question, or a consequential capsule — is published as an
-    /// alert (politely), like a failure: "you are being asked something", not status
-    /// news (review 2026-09-24).
+    /// A row that asks (a question, or a consequential capsule) is a polite alert, like
+    /// a failure.
     #[cfg(a11y_tree)]
     fn grid_a11y_messages(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridMessage> {
         use crate::accesskit_tree::{ChromeMessage, GridMessage};
@@ -1417,8 +1365,8 @@ impl App {
         };
         let mut out: Vec<GridMessage> = Vec::new();
 
-        // THE PRESENCE BAND FIRST (round 19): it is painted directly under the strip,
-        // above the bars, in the one row its window committed — so it is bar row 0 and
+        // The presence band first: it is painted directly under the strip,
+        // above the bars, in the one row its window committed, so it is bar row 0 and
         // every bar below it moves down by that row. Its sentence is the band's words
         // ("driven by manager, turn 41"); the fitted line is the detail.
         let presence_rows = usize::from(ws.presence.rows);
@@ -1442,7 +1390,7 @@ impl App {
             let capsules: Vec<crate::accesskit_tree::BandCapsule> = layout
                 .capsules
                 .iter()
-                // A blanked capsule (an echo's spent `Stop paste`, ruling 235)
+                // A blanked capsule (an echo's spent `Stop paste`)
                 // keeps its cells and has nothing to say.
                 .filter(|c| !c.full_label.is_empty())
                 .map(|c| crate::accesskit_tree::BandCapsule {
@@ -1460,19 +1408,20 @@ impl App {
                     let Some(message) = ChromeMessage::band_row(row) else {
                         continue;
                     };
-                    // The DESCRIPTION (design §10.10): the time words as a
-                    // reader says them (the ETA, or how long work with no
-                    // fraction has run), the load words, the stats, then the
-                    // capsules' full labels — read on demand, never announced.
+                    // The description: the time words as a reader says them (the ETA,
+                    // or how long fraction-less work has run), the load words, the
+                    // stats, then the capsules' full labels; read on demand, never
+                    // announced.
                     let now = std::time::Instant::now();
                     let busy = live.activity() == 2;
-                    // The work's own clock — the one the band's elapsed words
-                    // read — so the description never disagrees with the paint:
-                    // a busy row says how long it has run; a determinate row
-                    // says what is LEFT, and nothing while its estimate is
-                    // hidden (its slot is blank then, ruling 241).
+                    // The work's own clock, the one the band's elapsed words read, so
+                    // the description agrees with the paint: a busy row, and any row
+                    // the layout gives an elapsed slot (a level such as the strain
+                    // gauge paints `for 41 s`), says how long it has run; a determinate
+                    // row says what is left, and nothing while its estimate is hidden
+                    // (its slot is blank then).
                     let ran = now.saturating_duration_since(live.started_at);
-                    let time_words = if busy {
+                    let time_words = if busy || layout.elapsed.is_some() {
                         aterm_messages::progress::elapsed_spoken(ran)
                     } else {
                         aterm_messages::progress::eta_spoken(live.track.eta(now))
@@ -1501,9 +1450,9 @@ impl App {
                     .flatten()
                     .collect::<Vec<_>>()
                     .join("; ");
-                    // The NAME: the title, and `detail[0]` only where the row
-                    // shows it as its excerpt (E1) — width- and time-free, so
-                    // a countdown never re-announces the row.
+                    // The name: the title, and `detail[0]` only where the row shows it
+                    // as its excerpt; width- and time-free, so a countdown never
+                    // re-announces the row.
                     let detail0 = if live.msg.excerpt {
                         live.msg.detail.first().map_or("", String::as_str)
                     } else {
@@ -1520,10 +1469,9 @@ impl App {
                             .as_ref()
                             .and_then(|m| m.fill_permille)
                             .map(|f| f32::from(f) / 1000.0),
-                        // A failure, or a question: an alert either way. A
-                        // measured level (the strain row) that turns Warn at
-                        // Critical memory pressure is still a gauge: it stays a
-                        // progress indicator valued by it (ruling 208).
+                        // A failure or a question is an alert. A measured level (the
+                        // strain row) that turns Warn at Critical memory pressure stays
+                        // a progress indicator valued by it.
                         alarm: (matches!(
                             live.msg.severity,
                             aterm_messages::Severity::Warn | aterm_messages::Severity::Error
@@ -1534,17 +1482,17 @@ impl App {
                                 .actions
                                 .iter()
                                 .any(aterm_messages::Intent::is_consequential),
-                        // A press on the body is the row's `Details ›` — Settings ▸
-                        // Messages at this entry (`App::press_message_body`) — and so
-                        // is a screen reader's activate; each capsule, the `Details ›`
-                        // included, is a button of its own.
+                        // A press on the body is the row's `Details ›` (Settings ▸
+                        // Messages at this entry, `App::press_message_body`), and so is a
+                        // screen reader's activate; each capsule, `Details ›` included,
+                        // is its own button.
                         activates: true,
                         bar_row: Some(bar_row),
                         capsules,
                     });
                 }
-                // An echo is the band's end of its own indicator: not a row,
-                // not pressable, not announced (design §10.10).
+                // An echo is the band's end of its own indicator: not a row, not
+                // pressable, not announced.
                 aterm_messages::RowKind::Echo(_) => {}
                 aterm_messages::RowKind::Overflow { .. } => {
                     out.push(GridMessage {
@@ -1558,24 +1506,23 @@ impl App {
                         // activate on it opens the page, like a press anywhere on it.
                         activates: true,
                         bar_row: Some(bar_row),
-                        // The node IS the link: its words are the whole row (ruling
-                        // 259), and the tree publishes capsule children only
-                        // under the three message-row slots.
+                        // The node is the link: its words are the whole row, and the
+                        // tree publishes capsule children only under the three
+                        // message-row slots.
                         capsules: Vec::new(),
                     });
                 }
             }
         }
 
-        // The multi-line-paste confirmation: a question, and on this platform the only
-        // one the pastejacking guard asks. Announced ASSERTIVELY (see
-        // `ChromeMessage::politeness`) because nothing reaches the PTY until it is
-        // answered, and the answer keys are the description because they never change.
+        // The multi-line-paste confirmation, the pastejacking guard's only question on
+        // this platform. Assertive (see `ChromeMessage::politeness`) because nothing
+        // reaches the PTY until it is answered; the risk and the answer keys are the description.
         if let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) {
             out.push(GridMessage {
                 message: ChromeMessage::PasteConfirm,
                 text: crate::paste_banner::question(pending.text()),
-                detail: Some(crate::paste_banner::ANSWER_KEYS.to_string()),
+                detail: Some(crate::paste_banner::announcement_detail()),
                 busy: false,
                 progress: None,
                 alarm: false,
@@ -1589,10 +1536,9 @@ impl App {
             });
         }
 
-        // The close/quit confirmation (Windows, `close_confirm`): the question the
-        // native dialog used to ask, announced the way that dialog was — assertively,
-        // as an alert dialog — with the two answer keys as its description. Same
-        // no-Click rule as the paste question: an activate names neither answer.
+        // The close/quit confirmation (Windows, `close_confirm`), announced assertively
+        // as an alert dialog with the two answer keys as its description. Like the
+        // paste question, an activate names neither answer.
         if let Some(pending) = self.close_banner.as_ref().filter(|p| p.wid == wid) {
             out.push(GridMessage {
                 message: ChromeMessage::CloseConfirm,
@@ -1613,12 +1559,9 @@ impl App {
 
     /// A screen reader activated one of window `wid`'s chrome messages.
     ///
-    /// RE-CHECKED, NOT TRUSTED. The request names a node from a tree published some
-    /// frames ago; the card may have faded and the band may have folded since. Every arm
-    /// therefore asks the SAME live question the pointer path asks before it does
-    /// anything, so an activate can never reach a surface a click could not — which on
-    /// the update pill is the difference between "apply the staged build" and "re-exec
-    /// the app from a patch of blank terminal".
+    /// The request names a node from a tree published frames ago, so every arm asks the
+    /// same live question the pointer path asks before acting, and an activate can never
+    /// reach a surface a click could not.
     #[cfg(a11y_tree)]
     fn activate_a11y_message(
         &mut self,
@@ -1630,12 +1573,11 @@ impl App {
             // The presence band informs and never activates (`activates: false`); a
             // stale activate on it is a no-op, like a click on it.
             ChromeMessage::PresenceStatus => {}
-            // The band's own click route (`App::press_band`): a row's activate is
-            // the body's press — its `Details ›`, Settings ▸ Messages at that entry
-            // in THIS window (`App::press_message_body`, the one press rule shared
-            // with the mouse) — and a capsule's is that capsule. Re-resolved through
-            // the width law at this window's width and gated on the row still
-            // occupying a committed row, so an activate on a folded row does nothing.
+            // The band's own click route (`App::press_band`): a row's activate is the
+            // body's press (its `Details ›`, Settings ▸ Messages at that entry in this
+            // window, via `App::press_message_body`), and a capsule's is that capsule.
+            // Re-resolved through the width law at this window's width and gated on the
+            // row still being committed, so an activate on a folded row does nothing.
             ChromeMessage::BandRow0 | ChromeMessage::BandRow1 | ChromeMessage::BandRow2 => {
                 if let Some(id) = self.committed_band_message(wid, message.band_row_index()) {
                     self.press_message_body(wid, id);
@@ -1656,9 +1598,8 @@ impl App {
                     let _ = self.perform_intent(wid, id, intent);
                 }
             }
-            // The overflow row is one link: Settings ▸ Messages, top of the log, in
-            // this window — gated on the band still carrying an overflow row, so a
-            // stale activate opens nothing.
+            // The overflow row is one link (Settings ▸ Messages, top of the log, in this
+            // window), gated on the band still carrying an overflow row.
             ChromeMessage::BandOverflow => {
                 let cols = self.windows.get(&wid).map(|ws| usize::from(ws.cols));
                 let overflow = cols.is_some_and(|cols| {
@@ -1672,16 +1613,16 @@ impl App {
                     let _ = self.open_messages_entry(wid, None);
                 }
             }
-            // No Click in the published tree. The paste and close questions are
-            // answered by Enter/Escape and a generic activate names neither answer,
-            // which on a security or destructive prompt must not be guessed.
+            // No Click in the published tree: the paste and close questions are answered
+            // by Enter/Escape, and a generic activate must not guess a security or
+            // destructive answer.
             ChromeMessage::PasteConfirm | ChromeMessage::CloseConfirm => {}
         }
     }
 
-    /// The message on committed band row `row` of window `wid` right now, or
-    /// `None` when that row is not committed, is the overflow link, or holds
-    /// no message any more — the live re-check every a11y activate makes.
+    /// The message on committed band row `row` of window `wid` now, or `None` when the
+    /// row is not committed, is the overflow link, or holds no message: the live
+    /// re-check every a11y activate makes.
     #[cfg(a11y_tree)]
     fn committed_band_message(
         &self,
@@ -1699,7 +1640,7 @@ impl App {
         }
     }
 
-    /// P2: handle an event from a window's AccessKit adapter (delivered as
+    /// Handle an event from a window's AccessKit adapter (delivered as
     /// `Wake::Accessibility`): the OS a11y client requesting the initial tree, an action
     /// request from a screen reader, or deactivation.
     #[cfg(a11y_tree)]
@@ -1709,9 +1650,9 @@ impl App {
             return;
         };
         match event.window_event {
-            // The OS a11y client is initialising — hand it the live overlay's tree. This is
-            // the ONLY edge that says "someone is actually listening": raise the latch first
-            // so the publish below (and every later present) is allowed to build a tree.
+            // The OS a11y client is initialising: hand it the live tree. This is the only
+            // edge that says someone is listening, so raise the latch first so this
+            // publish and every later present build a tree.
             AkWindowEvent::InitialTreeRequested => {
                 crate::a11y_backend::note_at_client();
                 if let Some(ws) = self.windows.get_mut(&wid) {
@@ -1721,10 +1662,9 @@ impl App {
             }
             // A screen reader activated/focused a control → drive the live overlay's model.
             AkWindowEvent::ActionRequested(req) => self.on_accessibility_action(wid, req),
-            // The client detached. Drop the latch so presents stop building trees nobody
-            // reads; a later re-attach re-fires `InitialTreeRequested` (the platform adapter
-            // returns to its inactive state, so it re-runs the activation handler). Never
-            // fires on macOS, whose winit adapter installs no deactivation handler.
+            // The client detached: drop the latch so presents stop building trees. A
+            // re-attach re-fires `InitialTreeRequested`. Never fires on macOS, whose
+            // winit adapter installs no deactivation handler.
             AkWindowEvent::AccessibilityDeactivated => {
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.a11y_active = false;
@@ -1735,17 +1675,16 @@ impl App {
 
     /// Route an OS accessibility `ActionRequest` to whichever overlay is live on `wid`,
     /// branching on [`crate::overlay::OverlayKind`] so each surface decodes the request with
-    /// the SAME id scheme its `a11y()` builder minted (a mismatch would silently misroute a
-    /// screen-reader Click):
-    /// - **Palette** — a filtered row id contains its current target-set epoch and slot:
-    ///   Focus moves the cursor, Click selects then activates the command (a disabled row
-    ///   carries no Click, and a delayed request from an old tab/generation is rejected).
+    /// the same id scheme its `a11y()` builder minted:
+    /// - **Palette**: a filtered row id carries its target-set epoch and slot; Focus
+    ///   moves the cursor, Click selects then activates the command (a disabled row has
+    ///   no Click, and a request from an old tab/generation is rejected).
     #[cfg(a11y_tree)]
     fn on_accessibility_action(&mut self, wid: crate::WindowId, req: accesskit::ActionRequest) {
         use crate::overlay::OverlayKind;
-        // Screen-reader actions bypass keyboard/pointer ingress. Even an
-        // ignored/stale request is a newer external-input boundary and must
-        // close the cursor-move licence before any local early return.
+        // Screen-reader actions bypass keyboard/pointer ingress, so even an ignored or
+        // stale request is a newer external-input boundary and closes the cursor-move
+        // licence before any early return.
         self.clear_move_license(wid);
         let kind = self
             .windows
@@ -1753,11 +1692,10 @@ impl App {
             .and_then(|ws| ws.overlay.as_ref())
             .map(crate::overlay::Overlay::kind);
         let Some(kind) = kind else {
-            // No overlay: the published tree is either a native tab app's projection or
-            // the terminal grid. Only the grid tree mints tab ids, and it mints them in a
-            // range no other builder uses, so decoding one here cannot steal a native
-            // app's request. Focus and Click both mean "show me this tab" — a tab strip
-            // has no separate select-vs-activate step.
+            // No overlay: the tree is a native tab app's projection or the terminal
+            // grid. Only the grid mints tab ids, in a range no other builder uses, so
+            // decoding one cannot steal a native app's request. Focus and Click both
+            // mean "show me this tab".
             if matches!(
                 req.action,
                 accesskit::Action::Click | accesskit::Action::Focus
@@ -1772,9 +1710,8 @@ impl App {
                 self.push_a11y_tree(wid);
                 return;
             }
-            // A chrome MESSAGE the reader activated. Its id range is its own (well below
-            // the tab range `tab_index_for` refuses), so this cannot steal a native app's
-            // request either.
+            // A chrome message the reader activated; its id range is its own (below the
+            // tab range `tab_index_for` refuses).
             if req.action == accesskit::Action::Click
                 && let Some(message) =
                     crate::accesskit_tree::ChromeMessage::from_node(req.target_node)
@@ -1786,9 +1723,6 @@ impl App {
             return;
         };
         match kind {
-            #[cfg(test)]
-            // The retired Settings card publishes an empty tree: nothing to act on.
-            OverlayKind::Settings => {}
             OverlayKind::Palette => {
                 let Some(idx) = self
                     .windows
@@ -1853,9 +1787,8 @@ impl App {
                     }
                 }
             }
-            // The session picker — the palette's id scheme verbatim: Focus
-            // moves the cursor, Click chooses; stale-epoch nodes decode to
-            // nothing.
+            // The session picker, with the palette's id scheme: Focus moves the cursor,
+            // Click chooses; stale-epoch nodes decode to nothing.
             OverlayKind::SessionPicker => {
                 let Some(idx) = self
                     .windows
@@ -1893,10 +1826,9 @@ impl App {
                     _ => {}
                 }
             }
-            // The connection map — the palette's id scheme over its chip/arrow
-            // items: Focus moves the cursor, Click selects then activates
-            // (chip raises; a flow runs the inline confirm two-step, so a
-            // screen-reader Click can never disconnect unconfirmed).
+            // The connection map, with the palette's id scheme over chip/arrow items:
+            // Focus moves the cursor, Click selects then activates (a flow runs the
+            // inline confirm two-step, so a Click never disconnects unconfirmed).
             OverlayKind::ConnectionMap => {
                 let Some(idx) = self
                     .windows
@@ -1976,22 +1908,12 @@ mod tests {
         effect: CursorDependent,
         now: Instant,
     ) {
-        let geom = crate::cursor_glow::Geom {
-            cw: 8,
-            ch: 16,
-            rows: 24,
-            cols: 80,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 640,
-            win_h: 384,
-            head: 0,
-        };
+        let geom = crate::geom_24x80_for_test();
         let cur = Some((2, 4));
         let mut quads = Vec::new();
         match effect {
             CursorDependent::Rainbow => {
-                ws.cursor_fx.rainbow.tick(
+                ws.fx.cursor_mut().rainbow.tick(
                     cur,
                     now,
                     1.0,
@@ -2010,10 +1932,10 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_fx.rainbow.is_active());
+                assert!(ws.fx.cursor_mut().rainbow.is_active());
             }
             CursorDependent::Droplet => {
-                ws.cursor_fx.droplet.tick(
+                ws.fx.cursor_mut().droplet.tick(
                     cur,
                     now,
                     1.0,
@@ -2024,10 +1946,10 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_fx.droplet.is_active());
+                assert!(ws.fx.cursor_mut().droplet.is_active());
             }
             CursorDependent::BeamRod => {
-                ws.cursor_fx.beamrod.tick(
+                ws.fx.cursor_mut().beamrod.tick(
                     cur,
                     now,
                     1.0,
@@ -2042,10 +1964,10 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_fx.beamrod.is_active());
+                assert!(ws.fx.cursor_mut().beamrod.is_active());
             }
             CursorDependent::Comet => {
-                ws.cursor_fx.comet.tick(
+                ws.fx.cursor_mut().comet.tick(
                     cur,
                     now,
                     1.0,
@@ -2058,10 +1980,10 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_fx.comet.is_active());
+                assert!(ws.fx.cursor_mut().comet.is_active());
             }
             CursorDependent::Phaser => {
-                ws.cursor_fx.phaser.tick(
+                ws.fx.cursor_mut().phaser.tick(
                     cur,
                     now,
                     0.25,
@@ -2071,13 +1993,13 @@ mod tests {
                     &crate::cursor_phaser::PhaserConfig {
                         enabled: true,
                         intensity: 1.0,
-                        // This fixture only needs a CHARGED emitter; the base is
-                        // the scheduler's business, not this test's.
+                        // This fixture only needs a charged emitter; the base is the
+                        // scheduler's business.
                         base: None,
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_fx.phaser.is_active());
+                assert!(ws.fx.cursor_mut().phaser.is_active());
             }
             CursorDependent::Trail => {
                 let cfg = crate::cursor_trail::TrailConfig {
@@ -2089,18 +2011,23 @@ mod tests {
                     warmth: 0.0,
                 };
                 let mut cells = Vec::new();
-                ws.cursor_fx.trail.tick(Some((2, 1)), now, &cfg, &mut cells);
+                ws.fx
+                    .cursor_mut()
+                    .trail
+                    .tick(Some((2, 1)), now, &cfg, &mut cells);
                 // The scripted three-cell preview hop is a deliberate generic
                 // gesture, not a one-glyph echo (which correctly takes the
                 // large-delta re-anchor path).
-                ws.cursor_fx.trail.note_synthetic_move(now);
-                ws.cursor_fx.trail.tick(cur, now, &cfg, &mut cells);
-                assert!(ws.cursor_fx.trail.is_active());
+                ws.fx.cursor_mut().trail.note_synthetic_move(now);
+                ws.fx.cursor_mut().trail.tick(cur, now, &cfg, &mut cells);
+                assert!(ws.fx.cursor_mut().trail.is_active());
             }
             CursorDependent::Cat => {
-                ws.cursor_cat
+                ws.fx
+                    .companions_mut()
+                    .cursor_cat
                     .on_collect(now, aterm_effects::kitty_registry::KittyLook::default());
-                assert!(ws.cursor_cat.is_active());
+                assert!(ws.fx.companions_mut().cursor_cat.is_active());
             }
             CursorDependent::WordDecoration => {
                 panic!("word decorations need the terminal snapshot helper")
@@ -2122,8 +2049,8 @@ mod tests {
             term.process(b"\r\nhello kitty friend");
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
         }
-        app.splice_word_decorations_for_test(wid, now);
-        assert!(app.windows[&wid].word_decos.is_active(now));
+        app.capture_words(wid, now);
+        assert!(app.windows[&wid].fx.decos().is_active(now));
     }
 
     fn activate_dependent(app: &mut App, effect: CursorDependent, now: Instant) {
@@ -2139,12 +2066,10 @@ mod tests {
     }
 
     fn activate_all_terminal_dependents(app: &mut App, now: Instant) {
-        // The word-decoration fixture exercises the real shared render tick.
-        // That tick correctly settles cursor-body engines whose styles are not
-        // enabled by this app's config, so establish the decoration first and
-        // charge the independent scheduler inputs afterwards. Otherwise this
-        // supposedly non-vacuous native-boundary test arrives with its rainbow
-        // body already dormant.
+        // The fixture runs the real shared render tick, which settles cursor-body
+        // engines whose styles this config does not enable, so establish the
+        // decoration first and charge the scheduler inputs afterwards, or the rainbow
+        // body arrives dormant.
         activate_dependent(app, CursorDependent::WordDecoration, now);
         for effect in CURSOR_DEPENDENTS {
             if matches!(effect, CursorDependent::WordDecoration) {
@@ -2155,9 +2080,8 @@ mod tests {
         let ws = app.windows.get_mut(&crate::WindowId(0)).expect("window 0");
         ws.next_trail_tick = Some(now + Duration::from_millis(16));
         ws.last_trail_fire = Some(now);
-        // The chrome-decoration lane is a scheduler input too, and unlike the
-        // cursor engines it is not focus-gated — so arm it here or the native
-        // boundary below is only asserted for the effects that never needed it.
+        // The chrome-decoration lane is a scheduler input with no focus gate, so arm it
+        // here too.
         ws.note_deco_animating(now);
         assert!(ws.cursor_fx_active(now, true));
         assert!(ws.terminal_effect_frame_active(now, true));
@@ -2172,21 +2096,21 @@ mod tests {
         );
         // These latches deliberately survive the switch. The canonical-front
         // gate, not destructive state loss, is what makes them scheduler-inert.
-        assert!(ws.cursor_fx.rainbow.is_active());
-        assert!(ws.cursor_fx.droplet.is_active());
-        assert!(ws.cursor_fx.beamrod.is_active());
-        assert!(ws.cursor_fx.comet.is_active());
-        assert!(ws.cursor_fx.phaser.is_active());
-        assert!(ws.cursor_cat.is_active());
-        assert!(ws.word_decos.is_active(now));
+        assert!(ws.fx.cursor().rainbow.is_active());
+        assert!(ws.fx.cursor().droplet.is_active());
+        assert!(ws.fx.cursor().beamrod.is_active());
+        assert!(ws.fx.cursor().comet.is_active());
+        assert!(ws.fx.cursor().phaser.is_active());
+        assert!(ws.fx.companions().cursor_cat.is_active());
+        assert!(ws.fx.decos().is_active(now));
         assert!(!ws.cursor_fx_active(now, true));
         assert!(!ws.cursor_fx_active(now, false));
         assert!(!ws.terminal_effect_frame_active(now, true));
         assert_eq!(ws.static_cursor_cat_deadline(now, false, false), None);
-        // The decoration latch is the one input with no focus gate of its own,
-        // so the canonical-front boundary is the ONLY thing keeping Robi from
-        // pacing a native tab. `park_terminal_effect_scheduler` drops it on the
-        // way through; a terminal that comes back refreshes it on frame one.
+        // The decoration latch has no focus gate of its own, so the canonical-front
+        // boundary alone keeps Robi from pacing a native tab:
+        // `park_terminal_effect_scheduler` drops it; a returning terminal refreshes it on
+        // frame one.
         assert!(!ws.deco_anim_frame_active(now));
         assert_eq!(ws.next_trail_tick, None);
         assert_eq!(ws.last_trail_fire, None);
@@ -2203,13 +2127,13 @@ mod tests {
                 // The feline word can also report a collectible. Keep this arm
                 // isolated so omitting WordDecorations from the shared set could
                 // not be masked by the cat predicate.
-                ws.cursor_cat = crate::kitty_cursor::CursorCat::default();
+                ws.fx.companions_mut().cursor_cat = crate::kitty_cursor::CursorCat::default();
             }
             let dependents = ws.cursor_dependents_need_frame_cadence(now, true);
             assert!(dependents, "{effect:?} must request frame cadence");
             assert_eq!(
                 ws.cursor_fx_active(now, true),
-                ws.cursor_fx.glow.is_active() || dependents,
+                ws.fx.cursor_mut().glow.is_active() || dependents,
                 "activity/cadence equality drifted for {effect:?}"
             );
             assert!(
@@ -2237,7 +2161,7 @@ mod tests {
             "ordinary sync kept the same terminal"
         );
         assert!(
-            ws.cursor_fx.trail.is_active(),
+            ws.fx.cursor().trail.is_active(),
             "ordinary sync must not wipe live effects"
         );
         assert!(ws.cursor_fx_active(now, true));
@@ -2248,12 +2172,10 @@ mod tests {
         );
     }
 
-    /// THE HEADLESS FENCE for the macOS access block (design §3.3 guardrail 2,
-    /// `AGENTS.md` rule 5). A headless instance — which is what every unit test
-    /// is — opens the Security page, the per-park observation hop runs, and NO
-    /// posture is published: no probe is read, no `NSWorkspace` is touched, and
-    /// the page carries no block to press. The 2026-08-17 incident is exactly
-    /// the shape this forbids.
+    /// Headless fence for the macOS access block (`AGENTS.md`, "never let a headless
+    /// code path reach WindowServer"): a headless instance opens the Security page, the
+    /// per-park hop runs, and no posture is published: no probe read, no `NSWorkspace`,
+    /// no block to press.
     #[test]
     fn a_headless_security_page_publishes_no_consent_posture_and_touches_no_probe() {
         let mut app = App::headless_for_test();
@@ -2363,9 +2285,9 @@ mod tests {
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::KeyboardInput));
         assert!(app.close_settings_tabs());
 
-        // Advance the service while there is no Settings view/controller to
-        // receive ConfigChanged. The reopened view observes this exact value,
-        // so its first edit must not pretend to have been authored at revision 1.
+        // Advance the service with no Settings view to receive ConfigChanged. The
+        // reopened view observes this value, so its first edit must not claim
+        // revision 1.
         app.native_config_service
             .replace_external("copy_on_select = true\n".to_string())
             .expect("valid external config");
@@ -2378,29 +2300,13 @@ mod tests {
 
     #[test]
     fn native_settings_tab_reuses_identity_and_never_fabricates_a_terminal() {
-        const CHILD: &str = "ATERM_NATIVE_SETTINGS_TAB_IDENTITY_CHILD";
         const ROOT: &str = "ATERM_NATIVE_SETTINGS_TAB_IDENTITY_ROOT";
-        const EXACT: &str = concat!(
-            "app_settings::tests::",
-            "native_settings_tab_reuses_identity_and_never_fabricates_a_terminal"
-        );
-        if std::env::var_os(CHILD).is_none() {
-            let root = std::env::temp_dir().join(format!(
-                "aterm-native-settings-tab-identity-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", EXACT, "--nocapture"])
-                .env(CHILD, "1")
-                .env(ROOT, &root)
-                .env("XDG_CONFIG_HOME", &root)
-                .env("RUST_TEST_THREADS", "1")
-                .status()
-                .expect("launch isolated native Settings-tab identity test");
-            let _ = std::fs::remove_dir_all(root);
-            assert!(status.success());
+        if !crate::test_alone::in_child() {
+            let root = aterm_tempfile::TempDir::new().unwrap();
+            crate::test_alone::run_alone_with(&[
+                (ROOT, root.path().as_os_str()),
+                ("XDG_CONFIG_HOME", root.path().as_os_str()),
+            ]);
             return;
         }
 
@@ -2449,9 +2355,8 @@ mod tests {
             );
         }
 
-        // Manual deliberately opens the canonical config Editor instead of
-        // pretending to be another settings pane. Returning from it must still
-        // recover the original Settings presentation.
+        // Manual opens the canonical config Editor rather than another settings pane;
+        // returning from it must recover the original Settings presentation.
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Manual));
         assert!(
             root.join("aterm/aterm.toml").is_file(),
@@ -2523,10 +2428,10 @@ mod tests {
                 let _ = tx.send(());
             },
         ));
-        rx.recv_timeout(std::time::Duration::from_secs(10))
+        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the worker finished");
-        // A second press refused while that move ran is superseded by the move
-        // ending: the status is the move's, not a refusal that is no longer so.
+        // A second press refused while that move ran is superseded when the move ends:
+        // the status is the move's.
         app.claimant_retire_refusal =
             Some("a move is already under way, or its worker could not start");
         let before = app.consent.census_generation_for_test();
@@ -2544,7 +2449,7 @@ mod tests {
             before + 1,
             "and invalidated the census, since the disk changed"
         );
-        let access = app.macos_access_projection();
+        let access = app.macos_access_projection(true);
         assert_eq!(
             access.retired,
             Some(vec![(
@@ -2559,7 +2464,7 @@ mod tests {
             std::path::PathBuf::from("/A/x.app.rollback"),
             aterm_containment::consent::Retired::Moved,
         )]);
-        let moved = app.macos_access_projection();
+        let moved = app.macos_access_projection(true);
         assert_eq!(
             moved.retire_status.as_deref(),
             Some("Moved 1 copy to the Trash."),
@@ -2586,7 +2491,7 @@ mod tests {
             std::path::PathBuf::from("/A/x.app.rollback"),
             aterm_containment::consent::Retired::Moved,
         )]);
-        let access = app.macos_access_projection();
+        let access = app.macos_access_projection(true);
         app.publish_macos_access(
             &[(wid, view)],
             &access,
@@ -2606,6 +2511,92 @@ mod tests {
         assert_eq!(
             copy.retired,
             vec!["Moved to the Trash: /A/x.app.rollback.".to_string()]
+        );
+    }
+
+    /// The Developer Tools row starts its `log show` only while a Security view
+    /// is on screen (debugger design §9.1, O12). A Security page in a background
+    /// tab, or in a window the OS reports occluded, is served from the slot and
+    /// starts nothing, however many parks publish it; the same view in its
+    /// window's active tab, in a window not occluded, dispatches once (the
+    /// positive control).
+    #[test]
+    fn a_hidden_security_page_starts_no_devtools_probe() {
+        use aterm_containment::{DevToolProbe, DevToolProbeLabel, ProbeGate};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn counting(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+            RUNS.fetch_add(1, Ordering::AcqRel);
+            DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest)
+        }
+        fn subject() -> Option<&'static str> {
+            Some("com.example.subject")
+        }
+        let mut app = App::headless_for_test();
+        app.consent.set_devtools_arms_for_test(counting, subject);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.consent.set_devtools_wake(std::sync::Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+        let (settings, _, _, view) = app.settings_tab_in_window(wid).expect("a Settings tab");
+        let publish = |app: &mut App| {
+            for _ in 0..3 {
+                app.publish_security_page(vec![(wid, view)]);
+            }
+        };
+
+        let other = (0..app.windows.get_mut(&wid).expect("window 0").tab_set.len())
+            .find(|&index| index != settings)
+            .expect("the window holds another tab");
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .expect("window 0")
+                .tab_set
+                .switch_to_index(other)
+        );
+        assert!(!app.settings_view_on_screen(wid, view));
+        publish(&mut app);
+        assert_eq!(RUNS.load(Ordering::Acquire), 0, "a background tab ran it");
+        assert!(app.consent.devtools_slot_idle_for_test());
+
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .expect("window 0")
+                .tab_set
+                .switch_to_index(settings)
+        );
+        app.windows.get_mut(&wid).expect("window 0").occluded = true;
+        assert!(!app.settings_view_on_screen(wid, view));
+        publish(&mut app);
+        assert_eq!(RUNS.load(Ordering::Acquire), 0, "an occluded window ran it");
+        assert!(app.consent.devtools_slot_idle_for_test());
+
+        // The positive control: on screen, one worker for every park.
+        app.windows.get_mut(&wid).expect("window 0").occluded = false;
+        assert!(app.settings_view_on_screen(wid, view));
+        publish(&mut app);
+        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the worker publishes");
+        publish(&mut app);
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("a Settings view");
+        };
+        assert_eq!(
+            state
+                .macos_access_for_test()
+                .expect("published")
+                .devtools
+                .probe
+                .label,
+            DevToolProbeLabel::NoRecentRequest,
+            "the page reads the answer it got"
         );
     }
 
@@ -2637,6 +2628,193 @@ mod tests {
         assert_eq!(
             state.feedback.as_deref(),
             Some(format!("Nothing was asked: {why}.").as_str())
+        );
+    }
+
+    /// A confirmed debugger-access press is drained at the park and handed to
+    /// `begin_debugger_access_change`, whose gates refuse it on a headless
+    /// instance before any arm is reached; the refusal rides the row's facts,
+    /// nothing is in flight, and the park arms no deadline for it.
+    #[test]
+    fn a_confirmed_debugger_change_on_a_headless_instance_starts_nothing_and_says_why() {
+        use aterm_containment::consent::DebuggerChange;
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+        let (_, view) = app.active_native_view(wid).expect("Settings view");
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state_mut(view)
+        else {
+            panic!("a Settings view");
+        };
+        state.record_debugger_change_for_test(DebuggerChange::On);
+        app.sync_settings_consent_posture();
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state_mut(view)
+        else {
+            panic!("a Settings view");
+        };
+        assert_eq!(state.take_debugger_change_request(), None, "drained");
+        let facts = app.debugger_access_facts();
+        assert_eq!(
+            facts.refusal,
+            Some(crate::debugger_access::Refusal::NoWindow)
+        );
+        assert_eq!(facts.in_flight, None);
+        assert_eq!(
+            facts.probe.label,
+            aterm_containment::consent::DebuggerProbeLabel::RefusedDisabled,
+            "the inert probe arm: nothing was consulted"
+        );
+        assert!(!facts.offers(DebuggerChange::On) && !facts.offers(DebuggerChange::Off));
+        assert_eq!(
+            app.begin_debugger_access_change(
+                DebuggerChange::Off,
+                crate::native_settings::OwnerAnswer::yes_for_test()
+            ),
+            Err(crate::debugger_access::Refusal::NoWindow)
+        );
+        app.tick_debugger_access();
+        assert!(
+            !app.debugger_change.records_asked(),
+            "headless: nothing is read"
+        );
+        assert_eq!(
+            app.next_debugger_change_deadline(std::time::Instant::now()),
+            None
+        );
+    }
+
+    /// THE `WF(Notice)` SITE, App level (debugger design §5.1, §5.4): while a
+    /// change is under way the App folds the lane's `RESULT_RECHECK` into the
+    /// park, and the park's own consent-lane tick takes a result whose wake
+    /// never came and re-probes. The headless guard is the lane's `windowed`
+    /// flag, so a windowed lane stands in here; nothing spawns a process — the
+    /// job is armed and published by hand, and the probe arm is inert.
+    #[test]
+    fn a_debugger_change_under_way_is_folded_into_the_park_and_read_by_its_tick() {
+        use crate::debugger_access::{DebuggerChangeLane, Outcome, RESULT_RECHECK};
+        use crate::metrics::DeadlineOwner;
+        use aterm_containment::consent::{
+            DebuggerChange, DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,
+            DevtoolsChangeRun, DevtoolsChild,
+        };
+        let fold = |app: &App, now: std::time::Instant| {
+            let (mut deadline, mut owner) = (None, DeadlineOwner::None);
+            app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
+            (deadline, owner)
+        };
+        let mut app = App::headless_for_test();
+        app.debugger_change = DebuggerChangeLane::with_liveness(|_| false);
+        let now = std::time::Instant::now();
+        app.tick_consent_lanes(now);
+        assert!(app.debugger_change.records_asked(), "the records are read");
+        assert_eq!(fold(&app, now).0, None, "an idle lane arms nothing");
+        app.debugger_change.observe(
+            DebuggerProbe {
+                mode: DebuggerMode::Disabled,
+                member: DebuggerMember::Admin,
+                label: DebuggerProbeLabel::StatusOk,
+            },
+            1,
+        );
+        let job = app
+            .debugger_change
+            .begin(
+                DebuggerChange::On,
+                crate::native_settings::OwnerAnswer::yes_for_test(),
+            )
+            .expect("a confirmed press over the precondition")
+            .job();
+        let slot = app.debugger_change.slot();
+        let child = DevtoolsChild {
+            pid: 4242,
+            birth: None,
+        };
+        slot.publish_spawned(job, child);
+        app.tick_consent_lanes(now);
+        let flight = app.debugger_access_facts().in_flight;
+        assert!(flight.is_some(), "the park read the spawned child");
+        assert_eq!(
+            fold(&app, now),
+            (Some(now + RESULT_RECHECK), DeadlineOwner::DebuggerChange),
+            "a child in flight keeps the park re-reading"
+        );
+        // The child exits; its wake is dropped (an uncommitted handoff).
+        slot.publish_result(
+            job,
+            DevtoolsChangeRun::Exited {
+                code: Some(0),
+                stdout_head: String::new(),
+                stderr_head: String::new(),
+            },
+        );
+        app.tick_consent_lanes(now);
+        let facts = app.debugger_access_facts();
+        assert_eq!(facts.in_flight, None, "the result was taken");
+        assert_eq!(
+            facts.last_outcome,
+            Some(Outcome::Unobserved(DebuggerChange::On)),
+            "and re-probed: the inert arm reads nothing, and says so"
+        );
+        assert_eq!(fold(&app, now).0, None, "ended: nothing left to arm");
+    }
+
+    /// What a lane step asks of the host: an unchanged re-probe is the owner's
+    /// decline (the shared quiet doubles, nothing retries), and an observed
+    /// transition is a RECORD under `privacy.debugger`, never a row.
+    #[test]
+    fn a_debugger_change_that_reads_unchanged_is_a_decline_and_an_observed_one_a_record() {
+        use crate::debugger_access::{DebuggerRecord, DriftStep, LaneStep, Outcome};
+        use aterm_containment::consent::DebuggerChange;
+        let mut app = App::headless_for_test();
+        assert!(
+            !app.owner_quiet
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_quiet_now_for_test()
+        );
+        app.apply_debugger_step(LaneStep {
+            outcome: Some(Outcome::Changed(DebuggerChange::On)),
+            drift: DriftStep {
+                record: Some(DebuggerRecord::On),
+                write: None,
+            },
+            ..LaneStep::default()
+        });
+        assert!(
+            !app.owner_quiet
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_quiet_now_for_test(),
+            "a change that landed is no decline"
+        );
+        let record = app
+            .messages
+            .log()
+            .records()
+            .next_back()
+            .expect("the change is on record");
+        assert_eq!(
+            record.key.as_deref(),
+            Some(crate::message_reporters::KEY_DEBUGGER_ACCESS)
+        );
+        assert!(
+            app.messages
+                .live_by_key(crate::message_reporters::KEY_DEBUGGER_ACCESS)
+                .is_none(),
+            "a record never takes the glass"
+        );
+        app.apply_debugger_step(LaneStep {
+            outcome: Some(Outcome::NotChanged(DebuggerChange::On)),
+            ..LaneStep::default()
+        });
+        assert!(
+            app.owner_quiet
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_quiet_now_for_test(),
+            "Cancel in macOS's dialog quiets the page like Cancel in aterm's"
         );
     }
 
@@ -2865,9 +3043,8 @@ mod tests {
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         assert_eq!(app.windows[&wid].tab_set.len(), 2);
 
-        // Retire the original terminal tab so this becomes the supported
-        // native-only shape produced by recursive restore/detach. `false` means
-        // the closed terminal was not the window's final canonical tab.
+        // Close the original terminal tab to reach the native-only shape produced by
+        // recursive restore/detach. `false`: it was not the window's final tab.
         assert!(!app.close_tab_at(wid, 0));
         assert_eq!(app.windows[&wid].tab_set.len(), 1);
         assert!(app.settings_tab_open());
@@ -3018,9 +3195,8 @@ mod tests {
         app
     }
 
-    /// The audition is gated exactly like a keystroke: the "Music effects"
-    /// master off, a zero volume, or serious mode ⇒ nothing is pushed (the
-    /// latch still moves, so no later reload plays it either).
+    /// The audition is gated like a keystroke: the "Music effects" master off, zero
+    /// volume, or serious mode pushes nothing (and the latch still moves).
     #[test]
     fn the_audition_is_gated_like_a_keystroke() {
         let mut app = app_with_capture();
@@ -3048,16 +3224,15 @@ mod tests {
         assert_eq!(app.typing_sound_auditioned, SoundVoice::Mech);
     }
 
-    /// The reload path auditions a CHANGED voice once and an unchanged one
-    /// never: the swap latches the voice it played, so re-applying the same
-    /// config (or an alias of it) is silent.
+    /// The reload path auditions a changed voice once and an unchanged one never:
+    /// re-applying the same config (or an alias) is silent.
     #[test]
     fn a_config_swap_auditions_only_a_changed_voice_and_never_twice() {
         let mut app = app_with_capture();
         let mut next = app.config.clone();
         // Startup voice (auto) → an unchanged reload: silent.
         assert_eq!(app.typing_sound_to_audition_on_swap(&next), None);
-        // A hand edit / native pick that CHANGES the voice: one audition.
+        // A hand edit or native pick that changes the voice: one audition.
         next.trail_sound_style = Some("droplet".into());
         assert_eq!(
             app.typing_sound_to_audition_on_swap(&next),
@@ -3067,7 +3242,7 @@ mod tests {
         app.audition_typing_sound(SoundVoice::Of(GlowStyle::Water));
         assert_eq!(captured_typed(&mut app).len(), 1);
         assert_eq!(app.typing_sound_to_audition_on_swap(&next), None);
-        // Aliases dedupe by VOICE, not spelling: `water` is still droplet.
+        // Aliases dedupe by voice, not spelling: `water` is still droplet.
         next.trail_sound_style = Some(" Water ".into());
         assert_eq!(app.typing_sound_to_audition_on_swap(&next), None);
         // Clearing the key back to auto from a file edit auditions auto once.
@@ -3078,11 +3253,10 @@ mod tests {
         );
     }
 
-    /// PERF/CONTRACT: `push_a11y_tree` builds the whole visible-screen tree eagerly and only
-    /// then offers it to `update_if_active`, so the adapter's own "is anyone listening?" test
-    /// arrives far too late to save the work. The window's `a11y_active` latch is what moves
-    /// that test to the front — it must start DOWN (the adapter exists for every OS window,
-    /// attached or not), rise on the attach edge, and fall again on detach.
+    /// `push_a11y_tree` builds the whole tree before `update_if_active` checks for a
+    /// listener, so the window's `a11y_active` latch moves that check to the front: it
+    /// starts down (every OS window has an adapter), rises on attach, and falls on
+    /// detach.
     #[cfg(a11y_tree)]
     #[test]
     fn accessibility_publish_latches_on_attach_and_clears_on_detach() {
@@ -3138,10 +3312,9 @@ mod tests {
             .expect("presented focused leaf")
             .clone();
 
-        // Negative controls: advance BOTH the live cardinality and the focused
-        // leaf's geometry without composing another frame. Re-resolving the
-        // legacy tree here would describe three panes and the shrunken live
-        // rectangle over the still-presented two-pane cell snapshot.
+        // Negative controls: advance the live pane count and the focused leaf's
+        // geometry without composing a frame. Re-resolving the tree from live state
+        // would describe three panes over the presented two-pane snapshot.
         app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Horizontal);
         let live = app
             .active_visible_leaf_plan(wid)
@@ -3221,19 +3394,20 @@ mod tests {
         let mut trail = Vec::new();
         {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.cursor_fx
+            ws.fx
+                .cursor_mut()
                 .glow
                 .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow);
-            ws.cursor_fx
+            ws.fx
+                .cursor_mut()
                 .trail
                 .tick(Some((0, 0)), now, &trail_cfg, &mut trail);
-            ws.cursor_fx.glow.note_synthetic_move(now);
-            ws.cursor_fx.trail.note_synthetic_move(now);
-            // The synthetic note licenses the move it is about to make: the
-            // engines' own predicate, since `move_candidate_pending` retired
-            // with the admission-scoreboard rework.
-            assert!(ws.cursor_fx.glow.move_licensed(now));
-            assert!(ws.cursor_fx.trail.move_licensed(now));
+            ws.fx.cursor_mut().glow.note_synthetic_move(now);
+            ws.fx.cursor_mut().trail.note_synthetic_move(now);
+            // The synthetic note licenses the move it is about to make (the engines'
+            // own predicate).
+            assert!(ws.fx.cursor_mut().glow.move_licensed(now));
+            assert!(ws.fx.cursor_mut().trail.move_licensed(now));
         }
 
         let winit_id = winit::window::WindowId::from(17u64);
@@ -3250,17 +3424,19 @@ mod tests {
         let ws = app.windows.get_mut(&wid).unwrap();
         // …and an a11y action that targets no live node revokes that licence,
         // so the move it would have decorated draws nothing.
-        assert!(!ws.cursor_fx.glow.move_licensed(now));
-        assert!(!ws.cursor_fx.trail.move_licensed(now));
+        assert!(!ws.fx.cursor_mut().glow.move_licensed(now));
+        assert!(!ws.fx.cursor_mut().trail.move_licensed(now));
         let moved = now + Duration::from_millis(1);
         assert_eq!(
-            ws.cursor_fx
+            ws.fx
+                .cursor_mut()
                 .glow
                 .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow),
             0
         );
         assert_eq!(
-            ws.cursor_fx
+            ws.fx
+                .cursor_mut()
                 .trail
                 .tick(Some((0, 1)), moved, &trail_cfg, &mut trail),
             0
@@ -3269,11 +3445,10 @@ mod tests {
     }
 }
 
-/// THE PRODUCTION WIRING for the chrome-message live regions: the `App` methods that read
-/// the live window and decide what a screen reader is told. The pure `accesskit_tree`
-/// layer is covered in its own module against hand-built inputs; everything interesting
-/// about these surfaces — which band is on the glass, how wide the frame cut it, whether a
-/// card is still clickable — lives here, on a real `App`.
+/// The production wiring for chrome-message live regions: the `App` methods that read
+/// the live window and decide what a screen reader is told (which band is on the
+/// glass, how the frame cut it), on a real `App`. The pure `accesskit_tree` layer is
+/// tested in its own module.
 #[cfg(all(test, a11y_tree))]
 mod a11y_message_wiring_tests {
     use std::time::Instant;
@@ -3288,12 +3463,9 @@ mod a11y_message_wiring_tests {
             .unwrap_or_else(|| panic!("{kind:?} is not published"))
     }
 
-    /// A BAND ROW IS ANNOUNCED WHERE IT IS PAINTED, AND ONLY WHILE IT IS. The tree
-    /// reads the same committed `message_band_rows` the splice trims its painted rows
-    /// to, so a row the frame has not committed is not described at all; and the
-    /// volatile figures stay out of the spoken half, because the announcement fires on
-    /// that half CHANGING and a byte counter there would say the row aloud all the way
-    /// to 100%.
+    /// A band row is announced where it is painted, and only while it is: the tree reads
+    /// the committed `message_band_rows` the splice trims to, and volatile figures stay
+    /// out of the spoken half so a byte counter never re-announces the row.
     #[test]
     fn a_band_row_is_announced_at_the_row_it_reserves_and_only_while_it_holds_it() {
         let mut app = App::headless_for_test();
@@ -3304,8 +3476,8 @@ mod a11y_message_wiring_tests {
             bytes_done: done * 1024 * 1024,
             bytes_total: 480 * 1024 * 1024,
         };
-        // A person asked (Check for Updates): the download is their wait and
-        // takes the row (design ruling 220).
+        // A person asked (Check for Updates): the download is their wait and takes the
+        // row.
         app.note_update_check_asked(true);
         app.note_update_progress(&downloading(120));
         assert_eq!(
@@ -3342,9 +3514,8 @@ mod a11y_message_wiring_tests {
         );
         assert_eq!(band.capsules[0].label, "Details \u{203a}");
 
-        // Further bytes move the description and leave the announced sentence alone
-        // (through the reporter's seam, which restates the live row: a byte tick is
-        // never a new row).
+        // Further bytes move the description and leave the announced sentence alone (a
+        // byte tick restates the live row, never a new one).
         app.note_update_progress(&downloading(400));
         let later = message(&app, wid, ChromeMessage::BandRow0);
         assert_eq!(later.text, band.text, "no announcement for a byte count");
@@ -3359,16 +3530,17 @@ mod a11y_message_wiring_tests {
         );
     }
 
-    /// A ROW THAT ASKS IS AN ALERT, NOT STATUS NEWS (review 2026-09-24): the Full
-    /// Disk Access question reaches assistive technology as something the person is
-    /// being asked — the alert role, at the band's polite politeness — like a failure,
-    /// while work in flight stays a progress indicator.
+    /// A row that asks is an alert, not status: the Full Disk Access question reaches
+    /// assistive technology with the alert role at the band's polite politeness, while
+    /// work in flight stays a progress indicator.
     #[test]
     fn a_decision_row_is_an_alert() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.prepare_terminal_capture_grid(wid).unwrap();
-        app.post_message(crate::message_reporters::file_access_question());
+        app.post_message(crate::message_reporters::file_access_question(
+            &crate::consent_card::NeedWords::sample(),
+        ));
         let ask = message(&app, wid, ChromeMessage::BandRow0);
         assert_eq!(ask.text, crate::consent_card::FDA_TITLE);
         assert!(ask.alarm, "a question is an alert");
@@ -3381,9 +3553,8 @@ mod a11y_message_wiring_tests {
         assert!(work.busy);
     }
 
-    /// THE STRAIN ROW IS A GAUGE EVEN WHEN IT WARNS (ruling 208): at Critical
-    /// memory pressure the row turns Warn, and it is still a progress indicator
-    /// valued by its level — never an alert that hides the gauge.
+    /// The strain row is a gauge even when it warns: at Critical memory pressure it turns
+    /// Warn and stays a progress indicator valued by its level.
     #[test]
     fn a_warn_strain_row_stays_a_progress_indicator() {
         let mut app = App::headless_for_test();
@@ -3407,10 +3578,9 @@ mod a11y_message_wiring_tests {
         assert_eq!(row.progress, Some(0.96), "valued by the gauge");
     }
 
-    /// ROBI'S BUBBLE IS A DECORATION (design D7, R23): what survived of the retired
-    /// transient card is never announced — not while it is armed, not while it is on
-    /// THIS window's glass — so the tree holds no node for it and a stale activate on the
-    /// retired slot 0 decodes to nothing (`ChromeMessage::from_node`).
+    /// Robi's bubble is decoration: never announced, armed or on this window's glass, so
+    /// the tree holds no node for it and an activate on slot 0 decodes to nothing
+    /// (`ChromeMessage::from_node`).
     #[test]
     fn robis_bubble_is_never_announced_even_on_this_windows_glass() {
         let mut app = App::headless_for_test();
@@ -3438,12 +3608,9 @@ mod a11y_message_wiring_tests {
         );
     }
 
-    /// A RESIZE NEVER RE-ANNOUNCES A BAND ROW (design §3.5, §7.2): the spoken
-    /// sentence is the title and the FULL first detail line — width-independent
-    /// — so one row at 60 and at 160 columns is announced once, while the
-    /// excerpt the frame paints is shaped differently at each width. The
-    /// description (stats and the capsules' full labels) is width-independent
-    /// too.
+    /// A resize never re-announces a band row: the spoken sentence (title and full first
+    /// detail line) is width-independent, so a row at 60 and at 160 columns is announced
+    /// once while the painted excerpt differs. The description is width-independent too.
     #[test]
     fn a_resize_never_reannounces_a_band_row() {
         let mut app = App::headless_for_test();
@@ -3456,9 +3623,8 @@ mod a11y_message_wiring_tests {
             1,
             crate::toolchain_words::HookDialect::Zsh,
         );
-        // The installed words at a row's hold: a record since the silent lane
-        // (2026-09-22), but the longest detail line a toolchain row has carried,
-        // which is what this pin needs.
+        // The installed words at a row's hold: the longest detail line a toolchain row
+        // carries, which this pin needs.
         app.post_message(
             crate::toolchain_words::installed(&pill).hold(aterm_messages::Hold::Default),
         );
@@ -3490,13 +3656,10 @@ mod a11y_message_wiring_tests {
         app.windows.get_mut(&wid).expect("headless window").cols = 80;
     }
 
-    /// ACTIVATING A BAND ROW PERFORMS ITS BODY PRESS, AND A CAPSULE CHILD THAT
-    /// CAPSULE'S INTENT (design §7.2, §2.2): a screen reader's activate on the
-    /// row is the mouse's body press — the row's `Details ›`, Settings ▸
-    /// Messages at that entry in THIS window — the `Details ›` child is
-    /// published with its full label and does the same, an authored child
-    /// performs its own intent, and an activate on a row the frame no longer
-    /// carries does nothing.
+    /// Activating a band row performs its body press (the row's `Details ›`, Settings ▸
+    /// Messages at that entry in this window); the `Details ›` child carries its full
+    /// label and does the same; an authored child performs its own intent; an activate
+    /// on a row the frame no longer carries does nothing.
     #[test]
     fn activating_a_band_row_performs_its_body_press_and_a_capsule_child_its_intent() {
         let mut app = App::headless_for_test();
@@ -3579,8 +3742,7 @@ mod a11y_message_wiring_tests {
             settings(&app).map(|(route, _)| route),
             Some(crate::native_settings::SettingsRoute::Messages)
         );
-        // The row is gone: a stale activate names a slot the frame no longer
-        // carries, and nothing happens.
+        // The row is gone: a stale activate names a slot the frame no longer carries.
         assert!(app.resolve_message(id, aterm_messages::Outcome::Ok));
         assert!(
             app.grid_a11y_messages(wid)
@@ -3593,15 +3755,11 @@ mod a11y_message_wiring_tests {
         assert!(app.messages.live(id).is_none());
     }
 
-    /// A11Y ACTIVATE ON A ROW OPENS DETAILS (design §4.5, §7.2): a screen
-    /// reader's activate on ANY committed band row — the second as much as
-    /// the first — is that row's `Details ›`: Settings ▸ Messages at that
-    /// entry in this window, the row read (a held one folds off the glass;
-    /// the row count holds through its quiet), the row beside it untouched;
-    /// an activate on a slot the frame no longer carries does nothing; the
-    /// overflow link's activate opens the page unselected and reads no row;
-    /// and with no overflow row on the band that activate is stale and
-    /// opens nothing.
+    /// An a11y activate on any committed band row opens that row's `Details ›` (Settings
+    /// ▸ Messages at that entry in this window), reads the row (a held one folds; the row
+    /// count holds through its quiet) and leaves its neighbour alone. An activate on a
+    /// slot no longer carried does nothing; the overflow link's activate opens the page
+    /// unselected and reads no row, and is stale without an overflow row.
     #[test]
     fn a11y_activate_on_a_row_opens_details() {
         let settings = |app: &App, wid: WindowId| {
@@ -3763,10 +3921,9 @@ mod a11y_message_wiring_tests {
         assert_eq!(settings(&app, wid), None, "nothing opened");
     }
 
-    /// A COUNTDOWN NEVER RE-ANNOUNCES A ROW (design §10.10): a download whose
-    /// ETA has latched carries it in the DESCRIPTION, as a reader says it
-    /// ("about … left"); the spoken name is the title alone and does not move
-    /// as the bytes arrive and the countdown runs.
+    /// A countdown never re-announces a row: a download's latched ETA rides the
+    /// description as a reader says it ("about … left"); the spoken name is the title
+    /// alone.
     #[test]
     fn a_countdown_never_reannounces_a_row() {
         let mut app = App::headless_for_test();
@@ -3817,11 +3974,9 @@ mod a11y_message_wiring_tests {
         assert_eq!(later.text, first.text, "the countdown is never announced");
     }
 
-    /// A HIDDEN ESTIMATE IS NOT SPOKEN (ruling 241, withdrawing review
-    /// round 3's "running for N seconds"): until a download's estimate
-    /// latches its ETA slot is blank, so the description says no time at all
-    /// — it leads with the stats, read without the paint's alignment
-    /// padding; the name is the title.
+    /// A hidden estimate is not spoken: until a download's ETA latches its slot is
+    /// blank, so the description leads with the stats (without paint's alignment
+    /// padding); the name is the title.
     #[test]
     fn a_hidden_estimate_is_not_described() {
         let mut app = App::headless_for_test();
@@ -3849,5 +4004,71 @@ mod a11y_message_wiring_tests {
             "one read, no estimate: no time words, the stats lead unpadded"
         );
         assert_eq!(row.text, "Downloading aterm v0.91.0");
+    }
+
+    // ---- band geometry and description ---------------------------------------
+
+    /// The presence row is bar row 0; its node's rectangle is `bars_y .. bars_y + ch`
+    /// whether or not a message band row sits below it.
+    #[test]
+    fn r44_hb3_the_presence_rows_node_keeps_its_rectangle_with_no_band_row() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.presence.words = Some(crate::presence::Words {
+                sentence: "driven, turn 41".to_string(),
+                ..crate::presence::Words::default()
+            });
+            ws.presence.rows = 1;
+        }
+        assert_eq!(app.message_band_rows, 0, "no band row");
+        let presence = message(&app, wid, ChromeMessage::PresenceStatus);
+        assert_eq!(presence.bar_row, Some(0));
+        let (_, ch) = app.win_cell_size(wid);
+        let g = app.grid_a11y_geometry(wid).expect("geometry");
+        assert_eq!(
+            g.bar_h, ch as f64,
+            "the presence row's node has no rectangle while the band is empty"
+        );
+    }
+
+    /// The description joins the time words the band's elapsed slot reads: a level row
+    /// (the strain gauge) paints `for 41 s`, so its description says how long it has run.
+    #[test]
+    fn r44_hb6_a_level_rows_description_says_how_long_it_has_run() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let now = Instant::now();
+        let base = now - std::time::Duration::from_secs(41);
+        let msg = aterm_messages::Message::new(
+            aterm_messages::tags::SYSTEM,
+            aterm_messages::Severity::Warn,
+            "Typing slowed by 'yes'",
+        )
+        .meter(aterm_messages::Meter::level(600, "6 of 8 cores"))
+        .hold(aterm_messages::Hold::STANDING);
+        app.messages
+            .post(msg, crate::messages_host::wall_stamp_now(), base);
+        app.settle_messages(now);
+        assert_eq!(app.message_band_rows, 1);
+        let cols = usize::from(app.windows[&wid].cols);
+        let layout = app.band_presentation(cols).rows[0].clone();
+        assert!(
+            layout.elapsed.is_some(),
+            "the level's elapsed slot is painted"
+        );
+        let row = message(&app, wid, ChromeMessage::BandRow0);
+        let description = row.detail.clone().unwrap_or_default();
+        let ran = |s: u64| {
+            aterm_messages::progress::elapsed_spoken(std::time::Duration::from_secs(s))
+                .expect("past the floor")
+        };
+        assert!(
+            description.starts_with(&ran(41)) || description.starts_with(&ran(42)),
+            "the paint says how long it has run; the description {description:?} does not"
+        );
     }
 }

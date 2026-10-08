@@ -484,7 +484,16 @@ pub(super) fn worker_loop(
     let mut ollama = ManagedOllama::new(ollama_controller);
     let mut clients = WorkerClientCache::default();
     loop {
-        let job = match requests.recv_timeout(WORKER_REAP_INTERVAL) {
+        // Poll for a daemon exit only while one is owned; otherwise park until
+        // the next job or shutdown (only this thread installs a daemon).
+        let next = if ollama.controller.owns_daemon() {
+            requests.recv_timeout(WORKER_REAP_INTERVAL)
+        } else {
+            requests
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        let job = match next {
             Ok(job) => job,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(exited) = ollama.reap() {

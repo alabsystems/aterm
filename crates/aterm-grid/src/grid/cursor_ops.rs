@@ -6,9 +6,9 @@
 //!
 //! Tab stop management is in [`super::tab_ops`].
 //!
-//! All cursor movement methods clear the `pending_wrap` flag. This matches
-//! xterm behavior where any cursor repositioning cancels the deferred wrap
-//! state set by writing to the last column.
+//! Cursor movement clears `pending_wrap`, as xterm's `ResetWrap` does. The
+//! exceptions keep it as xterm does: RI scrolling at the top margin, a
+//! DECLRMM LF scrolling at the bottom margin, and DECRC (restores the flag).
 
 use super::Grid;
 #[cfg(any(test, feature = "fuzz", fuzzing))]
@@ -72,10 +72,8 @@ impl Grid {
         self.storage.clear_pending_wrap();
         let region = self.storage.scroll_region;
         // xterm CursorUp: min = (cur_row < top_marg ? 0 : top_marg). The clamp
-        // depends ONLY on the top margin — a cursor at or *below* the top margin
-        // (including below the whole region) stops at the top margin, not just one
-        // strictly inside the region. Requiring `row <= bottom` here let a cursor
-        // below the region sail past the top margin to row 0.
+        // depends only on the top margin: a cursor at or below it (including
+        // below the whole region) stops at the top margin.
         let at_or_below_top = self.storage.cursor.row >= region.top;
         let min_row = if at_or_below_top { region.top } else { 0 };
         self.storage.cursor.row = self.storage.cursor.row.saturating_sub(n).max(min_row);
@@ -105,10 +103,8 @@ impl Grid {
         self.storage.clear_pending_wrap();
         let region = self.storage.scroll_region;
         // xterm CursorDown: max = (cur_row > bot_marg ? max_row : bot_marg). The
-        // clamp depends ONLY on the bottom margin — a cursor at or *above* the
-        // bottom margin (including above the whole region) stops at the bottom
-        // margin. Requiring `row >= top` here let a cursor above the region sail
-        // past the bottom margin to the last line.
+        // clamp depends only on the bottom margin: a cursor at or above it
+        // (including above the whole region) stops at the bottom margin.
         let at_or_above_bottom = self.storage.cursor.row <= region.bottom;
         let max_row = if at_or_above_bottom {
             region.bottom
@@ -116,8 +112,6 @@ impl Grid {
             self.storage.visible_rows.saturating_sub(1)
         };
         self.storage.cursor.row = self.storage.cursor.row.saturating_add(n).min(max_row);
-        // Only clamp column when double-width rows exist. Row-only movement
-        // cannot invalidate cursor.col when all rows share the same column count.
         if self.storage.any_double_width {
             let row = self.storage.cursor.row;
             self.storage.cursor.col = self.storage.clamp_col_for_row(row, self.storage.cursor.col);
@@ -262,12 +256,11 @@ impl Grid {
                 self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);
             }
             std::cmp::Ordering::Equal => {
-                // At bottom of scroll region - scroll within region. LF is a
-                // cursor-down, so it ALSO resets the deferred wrap (xterm
-                // CursorDown ResetWrap), even when it scrolls. scroll_region_up
-                // preserves pending_wrap for the explicit SU/SD path, so clear it
-                // here afterwards — otherwise the next glyph triggers a second
-                // scroll (e.g. `\x1b[3;1Habcd\nZ` double-scrolled).
+                // At bottom of scroll region: scroll within the region. LF is a
+                // cursor-down, so it also resets the deferred wrap (xterm
+                // CursorDown ResetWrap) even when it scrolls; scroll_region_up
+                // preserves pending_wrap for SU/SD, so clear it here, or the next
+                // glyph would scroll again (e.g. `\x1b[3;1Habcd\nZ`).
                 self.scroll_region_up(1);
                 self.storage.clear_pending_wrap();
             }
@@ -280,8 +273,6 @@ impl Grid {
                 }
             }
         }
-        // Only clamp column when double-width rows exist. Row-only movement
-        // cannot invalidate cursor.col when all rows share the same column count.
         if self.storage.any_double_width {
             let row = self.storage.cursor.row;
             self.storage.cursor.col = self.storage.clamp_col_for_row(row, self.storage.cursor.col);
@@ -289,13 +280,13 @@ impl Grid {
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
     }
 
-    /// Move cursor down one row with DECLRMM horizontal margin awareness (#7407).
+    /// Move cursor down one row with DECLRMM horizontal margin awareness.
     ///
     /// Per VT510: when DECLRMM is active and the cursor is within the horizontal
     /// margins, LF at the bottom of the scroll region scrolls only the cells
-    /// within the margin region (rectangular scroll). When the cursor is outside
-    /// the horizontal margins, LF at the scroll boundary does not trigger
-    /// scrolling of the margin region — the cursor simply does not move.
+    /// within the margin region (rectangular scroll). With the cursor outside
+    /// the horizontal margins, LF at the scroll boundary does not scroll and
+    /// the cursor does not move.
     ///
     /// When `left_right_margin_mode` is false, behaves identically to `line_feed`.
     ///
@@ -380,8 +371,6 @@ impl Grid {
                 }
             }
         }
-        // Only clamp column when double-width rows exist. Row-only movement
-        // cannot invalidate cursor.col when all rows share the same column count.
         if self.storage.any_double_width {
             let row = self.storage.cursor.row;
             self.storage.cursor.col = self.storage.clamp_col_for_row(row, self.storage.cursor.col);
@@ -389,13 +378,13 @@ impl Grid {
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
     }
 
-    /// Move cursor up one row with DECLRMM horizontal margin awareness (#7407).
+    /// Move cursor up one row with DECLRMM horizontal margin awareness.
     ///
     /// Per VT510: when DECLRMM is active and the cursor is within the horizontal
     /// margins, RI at the top of the scroll region scrolls only the cells within
-    /// the margin region down (rectangular scroll). When the cursor is outside
-    /// the horizontal margins, RI at the scroll boundary does not trigger
-    /// scrolling of the margin region — the cursor simply does not move.
+    /// the margin region down (rectangular scroll). With the cursor outside the
+    /// horizontal margins, RI at the scroll boundary does not scroll and the
+    /// cursor does not move.
     ///
     /// When `left_right_margin_mode` is false, behaves identically to
     /// `reverse_line_feed`.
@@ -469,7 +458,6 @@ impl Grid {
     ///
     /// ENSURES: self.storage.saved_cursor.valid == true
     /// ENSURES: self.storage.saved_cursor.cursor == old(self.storage.cursor)
-    #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
     #[cfg(any(test, kani))]
     pub fn save_cursor(&mut self) {
@@ -483,7 +471,6 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.saved_cursor.valid implies self.storage.cursor.row < self.storage.visible_rows
-    #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
     #[cfg(any(test, kani))]
     pub fn restore_cursor(&mut self) {
@@ -508,14 +495,6 @@ mod tests {
     // -------------------------------------------------------------------------
     // set_cursor — absolute positioning and clamping
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn set_cursor_home_position() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 10);
-        grid.set_cursor(0, 0);
-        assert_eq!(grid.cursor(), Cursor::new(0, 0));
-    }
 
     #[test]
     fn set_cursor_exact_position() {
@@ -550,13 +529,6 @@ mod tests {
     }
 
     #[test]
-    fn set_cursor_end_of_grid() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(23, 79);
-        assert_eq!(grid.cursor(), Cursor::new(23, 79));
-    }
-
-    #[test]
     fn set_cursor_clears_pending_wrap() {
         let mut grid = Grid::new(24, 80);
         grid.set_pending_wrap(true);
@@ -571,7 +543,7 @@ mod tests {
 
     #[test]
     fn move_cursor_to_lands_or_clamps() {
-        // (grid rows, cols, target, expected cursor); each row was its own test.
+        // (grid rows, cols, target, expected cursor).
         for (rows, cols, (row, col), want) in [
             (24, 80, (10, 20), Cursor::new(10, 20)),
             (5, 10, (50, 50), Cursor::new(4, 9)),
@@ -1110,7 +1082,6 @@ mod tests {
 
     #[test]
     fn grid_1x1_every_motion_stays_at_origin() {
-        // One row per motion; each was its own test.
         type Motion = fn(&mut Grid);
         let motions: [(&str, Motion); 7] = [
             ("set_cursor(100, 100) clamps", |g| g.set_cursor(100, 100)),

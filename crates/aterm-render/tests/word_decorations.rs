@@ -13,8 +13,9 @@ use aterm_render::{
     compute_dirty_rows,
 };
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// A settled (frame-over-frame identical) LIFTED additive sparkle: `dy != 0`
@@ -45,10 +46,7 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
 
 #[test]
 fn paw_over_blend_paints_the_target_cell_only() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 12);
     term.process(b"i love cats");
@@ -89,10 +87,7 @@ fn paw_over_blend_paints_the_target_cell_only() {
 
 #[test]
 fn add_blend_only_brightens() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 12);
     term.process(b"fuck this");
@@ -219,10 +214,7 @@ fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
 /// a fresh full render byte-for-byte.
 #[test]
 fn settled_lifted_add_deco_with_dirt_on_its_row_stays_byte_stable() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (_, ch) = rend.cell_size();
     let (rows, cols) = (8usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);

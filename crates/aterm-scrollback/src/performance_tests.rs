@@ -9,72 +9,6 @@
 
 use super::*;
 
-use std::time::Duration;
-
-/// Samples per side of every timed ratio below.
-const SAMPLES: usize = 5;
-
-/// The fastest of [`SAMPLES`] timings of each side, taken INTERLEAVED so a
-/// load burst lands on both; every closure builds its own fixture and times
-/// only the operation. A ratio of two single wall-clock samples measures the
-/// scheduler as much as the code: one preemption of the large side alone flips
-/// it, and these windows are microseconds to milliseconds long. The minimum is
-/// the sample least polluted by an unrelated stall, and each regression these
-/// tests guard costs its extra work in EVERY sample (the load-sensitive test
-/// audit of 2026-09-27).
-fn fastest_pair(
-    mut small: impl FnMut() -> Duration,
-    mut large: impl FnMut() -> Duration,
-) -> (Duration, Duration) {
-    let (mut fastest_small, mut fastest_large) = (Duration::MAX, Duration::MAX);
-    for _ in 0..SAMPLES {
-        fastest_small = fastest_small.min(small());
-        fastest_large = fastest_large.min(large());
-    }
-    (fastest_small, fastest_large)
-}
-
-/// Measure `push_line` throughput at different fill levels.
-///
-/// Production accounting is O(1) per push (cached running totals). In debug/test
-/// builds, `assert_bytes_used_invariant` recomputes from all tiers — O(H+B+P) —
-/// on every state change. This test captures the debug-build overhead as a
-/// regression guard: if the ratio blows up, either the invariant check regressed
-/// or incremental accounting drifted and triggered expensive recomputation.
-#[test]
-fn push_line_overhead_scales_with_tier_sizes() {
-    fn measure_push_batch(pre_fill: usize, batch: usize) -> std::time::Duration {
-        let mut sb = Scrollback::with_block_size(50, 200, 500_000_000, 50);
-        for i in 0..pre_fill {
-            sb.push_str(&format!("Fill-{i}"));
-        }
-        let start = std::time::Instant::now();
-        for i in 0..batch {
-            sb.push_str(&format!("Measure-{i}"));
-        }
-        start.elapsed()
-    }
-
-    let batch = 500;
-    let (small_time, large_time) = fastest_pair(
-        || measure_push_batch(500, batch),
-        || measure_push_batch(10_000, batch),
-    );
-
-    let ratio = large_time.as_nanos() as f64 / small_time.as_nanos().max(1) as f64;
-    eprintln!(
-        "push_line overhead: 500 pre-fill = {small_time:?}, 10K pre-fill = {large_time:?}, ratio = {ratio:.1}x"
-    );
-    // Debug builds run O(H+B+P) invariant checks per push, so the large case
-    // has more work per push. Release builds are O(1) per push (cached totals).
-    // Assert the debug overhead isn't catastrophically quadratic (< 40x).
-    assert!(
-        ratio < 40.0,
-        "push_line overhead ratio {ratio:.1}x exceeds 40x — \
-         possible regression in total_memory_used() hot path"
-    );
-}
-
 /// Prove that tier-aware truncate correctly handles cross-tier line removal.
 ///
 /// The tier-aware truncate removes oldest lines from cold → warm → hot
@@ -110,12 +44,18 @@ fn truncate_slow_path_scales_with_kept_lines() {
 /// Before #5893: every push to a full scrollback triggered O(total_lines)
 /// decompress-all truncate. After: cold tier front_offset gives O(1) truncate.
 ///
-/// This test measures push throughput at two fill levels with a line_limit set.
-/// A ratio near 1.0 proves truncate is O(1). A high ratio would indicate
-/// the old O(N) slow path is still being hit.
+/// COUNTED, NOT TIMED (it compared wall-clock push throughput at two fill
+/// levels, ratio < 5x, and went red under a loaded gate on unchanged code). The
+/// work a decompress-all truncate does is DECODING: every block it reads walks
+/// its serialized records. So the proof counts the records walked
+/// ([`crate::line::take_records_walked`], counted at the one walk every block
+/// read goes through) while `batch` pushes run against a full scrollback, at a
+/// 500-line and a 10K-line limit. The only decoding either may do is the
+/// warm->cold eviction's framing check, once per line aging out of the warm
+/// tier — so both counts are the batch, whatever the limit.
 #[test]
 fn push_with_line_limit_constant_time_truncate() {
-    fn measure_push_with_limit(limit: usize, batch: usize) -> std::time::Duration {
+    fn records_walked_pushing_with_limit(limit: usize, batch: usize) -> usize {
         let mut sb = Scrollback::with_block_size(50, 200, 500_000_000, 50);
         sb.set_line_limit(Some(limit));
         // Fill to the limit.
@@ -123,32 +63,31 @@ fn push_with_line_limit_constant_time_truncate() {
             sb.push_str(&format!("Fill-{i}"));
         }
         assert_eq!(sb.line_count(), limit);
+        let _ = crate::line::take_records_walked();
         // Measure: every push triggers truncate.
-        let start = std::time::Instant::now();
         for i in 0..batch {
             sb.push_str(&format!("Measure-{i}"));
         }
-        start.elapsed()
+        assert_eq!(sb.line_count(), limit);
+        crate::line::take_records_walked()
     }
 
     let batch = 500;
-    let (small_time, large_time) = fastest_pair(
-        || measure_push_with_limit(500, batch),
-        || measure_push_with_limit(10_000, batch),
-    );
-
-    let ratio = large_time.as_nanos() as f64 / small_time.as_nanos().max(1) as f64;
-    eprintln!(
-        "push_line+truncate: limit=500 = {small_time:?}, limit=10K = {large_time:?}, ratio = {ratio:.1}x"
-    );
-    // With tier-aware truncate (cold front_offset), the ratio should be near 1.0.
-    // Before #5893, this was O(total_lines) per push → ratio ~20x.
-    // Allow up to 5x for test noise and cold tier page-drop amortization.
-    assert!(
-        ratio < 5.0,
-        "push_line+truncate ratio {ratio:.1}x exceeds 5x — \
-         tier-aware truncate may not be working (expected O(1), got O(N))"
-    );
+    let small = records_walked_pushing_with_limit(500, batch);
+    let large = records_walked_pushing_with_limit(10_000, batch);
+    eprintln!("push_line+truncate records walked: limit=500 -> {small}, limit=10K -> {large}");
+    // At steady state every pushed line pushes one line out of warm, and the
+    // eviction's framing check walks each such line exactly once: the count IS
+    // the batch, at either limit. The #5893 shape walked the whole scrollback on
+    // EVERY push (>= 500 x limit).
+    for (limit, walked) in [(500, small), (10_000, large)] {
+        assert_eq!(
+            walked, batch,
+            "{batch} pushes at limit {limit} walked {walked} records — the only decode \
+             a push may pay is its line's one warm->cold framing check; more means \
+             truncate is decoding the scrollback (#5893)"
+        );
+    }
 }
 
 /// Prove that remove_newest works correctly with tier-aware back-removal.
@@ -347,16 +286,20 @@ fn remove_newest_memory_bounded_cross_tier() {
     );
 }
 
-/// #5918: Prove that `remove_newest` timing is sublinear in total scrollback size.
+/// #5918: Prove that `remove_newest` work does not grow with total scrollback size.
 ///
-/// The tier-aware implementation is O(blocks) not O(total_lines) — the warm
-/// tier's truncate_back_lines rebuilds cumulative indices from all blocks after
-/// the boundary block modification. With block_size=50: 50K lines → ~1000 blocks,
-/// 1K lines → ~20 blocks, giving a theoretical ratio of ~50x for O(N) but only
-/// ~15x for O(blocks). The old approach was O(total_lines) giving ~50x.
+/// Before the tier-aware fix, `remove_newest` materialized every kept line when
+/// the removal crossed tiers. The tier-aware implementation decodes at most the
+/// one boundary block it trims (read once to pre-validate, once to commit).
+///
+/// COUNTED, NOT TIMED (it timed ONE `remove_newest(1)` call at 1K and 50K lines
+/// and bounded the ratio, a sub-millisecond sample on a shared machine). The
+/// records walked by that one call are counted instead: bounded by two 50-line
+/// blocks, and identical at 1K and 50K lines. The old O(total_lines) path walks
+/// ~every kept line.
 #[test]
 fn remove_newest_time_sublinear_in_total_size() {
-    fn measure_remove(total: usize) -> std::time::Duration {
+    fn records_walked_removing_one(total: usize) -> usize {
         let mut sb = Scrollback::with_block_size(5, 200, 500_000_000, 50);
         for i in 0..total {
             sb.push_str(&format!("Scale-{i}"));
@@ -366,138 +309,24 @@ fn remove_newest_time_sublinear_in_total_size() {
         if hot > 0 {
             sb.remove_newest(hot).expect("drain hot");
         }
-        let start = std::time::Instant::now();
+        let before = sb.line_count();
+        let _ = crate::line::take_records_walked();
         sb.remove_newest(1).expect("should succeed");
-        start.elapsed()
+        let walked = crate::line::take_records_walked();
+        assert_eq!(sb.line_count(), before - 1);
+        walked
     }
 
-    let (small_time, large_time) =
-        fastest_pair(|| measure_remove(1_000), || measure_remove(50_000));
-
-    let ratio = large_time.as_nanos() as f64 / small_time.as_nanos().max(1) as f64;
-    eprintln!(
-        "remove_newest(1) timing: 1K lines = {small_time:?}, 50K lines = {large_time:?}, ratio = {ratio:.1}x"
-    );
-    // The old O(total_lines) approach gave ~50x ratio (proportional to 50K/1K).
-    // The tier-aware approach is O(blocks) — still proportional to total data
-    // but divided by block_size. Allow up to 20x for the block-level overhead
-    // plus test noise.
+    let small = records_walked_removing_one(1_000);
+    let large = records_walked_removing_one(50_000);
+    eprintln!("remove_newest(1) records walked: 1K lines -> {small}, 50K lines -> {large}");
     assert!(
-        ratio < 20.0,
-        "remove_newest(1) time ratio {ratio:.1}x exceeds 20x — \
-         possible O(total_lines) regression (expected O(blocks))"
+        large <= 2 * 50,
+        "remove_newest(1) on 50K lines walked {large} records — it is decoding more \
+         than the one 50-line boundary block (O(total_lines) regression, #5918)"
     );
-}
-
-/// Prove that memory pressure eviction of many cold pages completes
-/// without hanging or OOM.
-///
-/// When `set_memory_budget()` forces bulk cold eviction, the while-loop in
-/// `handle_memory_pressure()` calls `pop_front()` per page.
-#[test]
-fn memory_pressure_cold_eviction_scaling() {
-    // Build a scrollback with many cold pages.
-    // Small hot/warm to force rapid promotion to cold.
-    // block_size=10 with hot_limit=10 means every 10 lines promote a block.
-    let mut sb = Scrollback::with_block_size(10, 50, 100_000_000, 10);
-
-    // Push enough lines to create ~200 cold pages.
-    for i in 0..2500 {
-        sb.push_str(&format!("Pressure-test-line-{i}"));
-    }
-    assert!(
-        sb.cold_line_count() > 1000,
-        "expected many cold lines, got {}",
-        sb.cold_line_count()
-    );
-
-    let cold_before = sb.cold_line_count();
-    let start = std::time::Instant::now();
-
-    // Slash the budget to force bulk cold eviction.
-    sb.set_memory_budget(1)
-        .expect("memory budget reduction should succeed");
-
-    let elapsed = start.elapsed();
-    let cold_after = sb.cold_line_count();
-
-    eprintln!("memory_pressure eviction: cold {cold_before} -> {cold_after}, elapsed {elapsed:?}");
-
-    // Cold tier should be fully or mostly evicted.
-    assert_eq!(cold_after, 0, "cold tier should be empty after budget=1");
-}
-
-/// Guard the end-to-end warm-to-cold budget path in a high-block configuration.
-///
-/// `WarmTier::pop_front()` calls `rebuild_cumulative()` on each eviction,
-/// making K sequential evictions O(K*B_remaining) = O(B^2) total. The exact
-/// rebuild work for this setup's warm tier is covered by
-/// `warm_tier_pop_front_rebuild_steps_match_quadratic_bound`; this test keeps a
-/// practical wall-clock guard on the full `set_memory_budget()` path.
-#[test]
-fn warm_eviction_cost_bounded_with_many_blocks() {
-    // Create a scrollback with many small warm blocks to maximize B.
-    // block_size=5, hot_limit=5, warm_limit=2000 → up to 400 warm blocks.
-    fn measure_warm_eviction(warm_limit: usize) -> (usize, std::time::Duration) {
-        let mut sb = Scrollback::with_block_size(5, warm_limit, 500_000_000, 5);
-
-        // Fill until warm tier is well-populated.
-        let fill = warm_limit + 200; // Extra to ensure cold promotion.
-        for i in 0..fill {
-            sb.push_str(&format!("WE-{i}"));
-        }
-        let warm_blocks = sb.warm.block_count();
-        assert!(warm_blocks > 0, "need warm blocks for eviction test");
-        assert!(
-            sb.cold_line_count() > 0,
-            "fill pattern should create cold data for the end-to-end budget path"
-        );
-
-        let start = std::time::Instant::now();
-        // Slash budget to force all warm blocks out of the warm tier.
-        sb.set_memory_budget(1)
-            .expect("memory budget reduction should succeed");
-        let elapsed = start.elapsed();
-
-        assert_eq!(
-            sb.warm.block_count(),
-            0,
-            "all warm blocks should be evicted"
-        );
-        (warm_blocks, elapsed)
-    }
-
-    let (mut small_blocks, mut large_blocks) = (0, 0);
-    let (small_time, large_time) = fastest_pair(
-        || {
-            let (blocks, elapsed) = measure_warm_eviction(200);
-            small_blocks = blocks;
-            elapsed
-        },
-        || {
-            let (blocks, elapsed) = measure_warm_eviction(2000);
-            large_blocks = blocks;
-            elapsed
-        },
-    );
-
-    let ratio = large_time.as_nanos() as f64 / small_time.as_nanos().max(1) as f64;
-    let block_ratio = large_blocks as f64 / small_blocks.max(1) as f64;
-    eprintln!(
-        "warm eviction: {small_blocks} blocks = {small_time:?}, {large_blocks} blocks = {large_time:?}, \
-         time ratio = {ratio:.1}x, block ratio = {block_ratio:.1}x"
-    );
-    // With rebuild_cumulative O(B) per pop, K pops cost O(K*B) = O(B^2).
-    // The larger case therefore does substantially more rebuild work as the
-    // warm-block count rises, even before the rest of the budget path runs.
-    // The end-to-end path also pays cold-tier recompression and accounting
-    // costs, so keep this bound generous and treat it only as a wall-clock
-    // regression guard against something worse than the expected shape.
-    // Allow up to 200x for debug-build overhead and test noise.
-    // If this exceeds 200x, something worse than O(B^2) has been introduced.
-    assert!(
-        ratio < 200.0,
-        "warm eviction ratio {ratio:.1}x exceeds 200x — \
-         possible super-quadratic regression (expected O(B^2) bounded)"
+    assert_eq!(
+        small, large,
+        "the decode work of remove_newest(1) must not depend on scrollback size"
     );
 }

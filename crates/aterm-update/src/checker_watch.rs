@@ -1,21 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE UPDATE CHECKER'S HEARTBEAT (the 2026-09-22/23 update audit, plan P2-1).
+//! THE UPDATE CHECKER'S HEARTBEAT.
 //!
-//! On the owner's machine the background check loop went silent for 4.6 days in a
-//! live process: from 1788394817 onward it logged nothing, v0.74.0 and v0.75.0 were
-//! published inside that window and never staged, and the machine left 0.73 only
-//! when a fresh process started, 11.9 days after 0.74 shipped. Nothing noticed. The
-//! loop was one thread, spawned once, never supervised: its `JoinHandle` was
-//! dropped, a panic ended it, and it took the machine-wide `checker.lock` with a
-//! BLOCKING `flock` while holding this process's check lane — so one stopped or
-//! hung sibling process parked it (and every manual check behind it) forever. The
-//! only trace a stall left was `stale_check=` on `aterm ctl update status`, four
-//! hours in, for whoever thought to ask.
+//! The background check loop is one long-lived thread; a panic, or a stopped or hung
+//! sibling holding `checker.lock`, can silence it for days with nothing noticing.
 //!
-//! This module is the half of the fix that makes a stall VISIBLE. The loop stamps a
-//! heartbeat — when, in which [`CheckerPhase`], under which generation — at the top
+//! This module makes a stall VISIBLE. The loop stamps a heartbeat — when, in which [`CheckerPhase`], under which generation — at the top
 //! of every cycle, around the lock wait and the check, and in the settings-miss
 //! branch; [`classify`] judges it against the phase's own budget; and the window's
 //! watchdog (`aterm-gui`'s `update_checker_watch`) turns a stale verdict into a log
@@ -46,9 +37,8 @@
 //! A cycle holds this process's check lane (and the machine-wide `checker.lock`)
 //! from its lock wait to the end of its check, so a generation that stalls THERE
 //! keeps both, and the replacement the watchdog starts finds the lane busy on every
-//! cycle. The replacement stamps, so its own heartbeat is fresh — and the stall
-//! used to vanish from `aterm ctl update status` the moment it started, while no
-//! check could run. The lane holder is therefore kept beside the heartbeat
+//! cycle. The replacement stamps, so its own heartbeat is fresh while no check can
+//! run. The lane holder is therefore kept beside the heartbeat
 //! ([`CheckerWatch::hold_lane`]): when the watchdog retires a generation that holds
 //! it, that generation's last stamp is kept there, and [`standing_stall`] names it
 //! for as long as it holds the lane ([`CheckerBeat::blocked_by`]).
@@ -106,7 +96,8 @@ impl CheckerPhase {
         }
     }
 
-    /// The phase's wire word — what `aterm ctl update status` and the log print.
+    /// The phase's wire word, which `aterm ctl update status` prints; log lines use
+    /// [`Self::words`].
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -118,6 +109,21 @@ impl CheckerPhase {
             Self::Waiting => "waiting",
         }
     }
+
+    /// The phase in a person's words, for the log lines that name it (the window's
+    /// stall warning, `aterm_gui::update_words::checker_stalled_body`, says the
+    /// same).
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Settings => "reading its settings",
+            Self::BundleProbe => "reading the installed app",
+            Self::LockWait => "waiting for another aterm's check to finish",
+            Self::Checking => "checking for a new version",
+            Self::Waiting => "waiting between checks",
+        }
+    }
 }
 
 /// How long one cycle waits for the machine-wide `checker.lock` before recording a
@@ -127,21 +133,18 @@ impl CheckerPhase {
 /// curl's `--max-time 30`): a sibling's routine check ends well inside it, so the
 /// wait still turns into the ordinary "a sibling just checked" skip. A holder past it
 /// is downloading — this process could only duplicate that — or it is stopped or
-/// hung, which is exactly the holder that used to park this thread forever.
+/// hung.
 pub const CHECKER_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// After how many consecutive cycles that found `checker.lock` held past
 /// [`CHECKER_LOCK_WAIT`] BY A HOLDER SHOWING NO PROGRESS a process stops deferring
-/// to it and checks without the lock (round four of the 2026-09 update robustness
-/// work, plan item 14). A holder that is checking rewrites the lock while it works
+/// to it and checks without the lock. A holder that is checking rewrites the lock while it works
 /// (the check loop's holder beat, a download included), so a deferral to one is
 /// the ordinary kind and counts toward nothing; three cycles in a row — each an
 /// interval apart — behind a lock nobody has written is a holder that is not
 /// making progress: an aterm STOPPED mid-check (a `SIGSTOP`, a ctrl-z of a terminal
 /// session running one), or hung. Cycles alone could not tell that holder from one
-/// twenty minutes into a download on a slow link (the round-four review).
-/// Deferring to it for good stopped every update check on the machine with no
-/// notice. The gate is a cost device, never a correctness one: checking without it
+/// deep in a download on a slow link. The gate is a cost device, never a correctness one: checking without it
 /// costs one request per interval while the holder stays stopped, and the stage
 /// lock (bounded, `install::BACKGROUND_LOCK_WAIT`) still serializes the download.
 /// The window's watchdog raises its warning when a streak reaches it
@@ -575,6 +578,16 @@ impl CheckerWatch {
         self.settings_misses.store(0, Ordering::Relaxed);
         Some(next)
     }
+
+    /// The replacement [`Self::supersede`] counted was never started (its
+    /// thread could not be created): give its slot back, so the count and the
+    /// budget name only checkers that ran. Its `Starting` stamp stays, goes
+    /// stale, and the watchdog's next look tries again.
+    pub fn unstarted(&self) {
+        let _ = self
+            .respawns
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
 }
 
 /// The check lane marked held by one generation ([`CheckerWatch::hold_lane`]);
@@ -606,10 +619,8 @@ pub fn checker_snapshot() -> Option<CheckerBeat> {
 }
 
 /// A consecutive-repeat counter that decides which repeats deserve a log line: the
-/// first of a streak, then every `every`-th, then the streak's end. The settings
-/// misses and the `checker.lock` deferrals both used to say either nothing at all
-/// (the settings branch slept five seconds and looped, forever, with no line) or
-/// would say the same line every cycle — neither is a log.
+/// first of a streak, then every `every`-th, then the streak's end (the settings
+/// misses and the `checker.lock` deferrals), never the same line every cycle.
 #[derive(Clone, Copy, Debug)]
 pub struct StreakLog {
     consecutive: u64,
@@ -710,7 +721,7 @@ mod tests {
     /// budget: a waiting loop may be quiet for twice the loop's longest wait,
     /// a lock wait only for twice its bound, and a check for twice the longest
     /// non-download step — so a checker parked on a lock is called out in
-    /// minutes, not after the four hours `stale_check=` used to need.
+    /// minutes.
     #[test]
     fn a_stamp_is_stale_past_twice_its_phase_budget_plus_slack_and_not_before() {
         let slack = STALL_SLACK.as_secs();
@@ -850,6 +861,11 @@ mod tests {
         }
         assert_eq!(watch.supersede(live), None, "MAX_RESPAWNS is a ceiling");
         assert_eq!(watch.snapshot().unwrap().respawns, MAX_RESPAWNS);
+        // A replacement whose thread could not be created gives its slot back:
+        // the count names only checkers that ran, and the next look may retry.
+        watch.unstarted();
+        assert_eq!(watch.snapshot().unwrap().respawns, MAX_RESPAWNS - 1);
+        assert!(watch.supersede(live).is_some(), "the slot is spent again");
     }
 
     /// A STALL INSIDE THE LANE OUTLIVES ITS REPLACEMENT. The generation that

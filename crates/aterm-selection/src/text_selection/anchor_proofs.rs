@@ -4,8 +4,7 @@
 
 //! Kani proofs for `SelectionAnchor` ordering and constructors (INV-SEL-19 through INV-SEL-28).
 //!
-//! These are the non-tautological anchor proofs retained from the original
-//! text-selection verification batch after removing derive-only checks (#2740).
+//! Derive-only checks are omitted; these are the non-tautological ones.
 
 use super::*;
 

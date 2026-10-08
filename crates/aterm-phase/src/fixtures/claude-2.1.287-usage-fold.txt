@@ -1,0 +1,51 @@
+# claude-code 2.1.287 · MEASURED 2026-10-01 by the accounts probe's live check (docs/SPEC-claude-accounts-probe-2026-10-01.md §6): `aterm ctl text --json` rows of a private headless aterm (150x50), 2005 ms after the Enter that ran `/usage` (the same run as claude-2.1.287-usage-settled.txt) · THE USAGE TAB WITH ITS TAIL UNDER THE FOLD: the contributing block filled in, the last row ending in the vendor's `↓`, the cancel hint below the grid · no row names the login
+
+✻ Baked for 0s · done 9:20 PM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.1635
+   Total duration (API):  1s
+   Total duration (wall): 2m 0s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage by model:
+       claude-haiku-4-5:  897 input, 11 output, 0 cache read, 0 cache write ($0.0010)
+        claude-opus-5-5:  2 input, 4 output, 25.1k cache read, 19.7k cache write ($0.1625)
+   Prompt cache (main):   1 request · 56% of input tokens from cache · no misses · warm (1h TTL, last activity 46s ago)
+
+   Current session
+   ▌                                                  1% used
+   Resets 2am (America/Los_Angeles)
+
+   Current week (all models)
+   █████                                              10% used
+   Resets Oct 8 at 9am (America/Los_Angeles)
+
+   Current week (Fable)
+                                                      0% used
+   Resets Oct 8 at 9am (America/Los_Angeles)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Last 24h · these are independent characteristics of your usage, not a breakdown
+
+   100% of your usage came from subagent-heavy sessions
+    Each subagent runs its own requests. Be deliberate about spawning them — and
+    consider configuring a cheaper model for simpler subagents.
+
+   100% of your usage came from sessions active for 8+ hours
+    These are often background/loop sessions. Continuous usage can add up quickly
+    so make sure it is intentional.
+
+   93% of your usage was at >150k context
+    Longer sessions are more expensive even when cached. /compact mid-task, /clear
+    when switching to new tasks.
+
+   84% of your usage came from subagents under "workflow-subagent"
+    If this runs frequently, consider configuring its subagents with a cheaper
+    model or tightening their prompts.
+
+   Subagents               % of usage                                                                                                               ↓

@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — silent, signature-pinned in-app updater that pulls notarized releases from GitHub, verifies and stages them, and hands the live session to the new build in place (the next-launch swap is only the fallback)."
+description = "aterm — signature-pinned in-app updater: stages verified releases and hands the live session to the new build in place."
 
 [features]
 default = []
@@ -25,19 +25,14 @@ dev-seams = ["aterm-update-core/dev-seams"]
 aterm-toml = { workspace = true }
 serde = { workspace = true }
 # The Linux lane's compiled binary identity crosses as JSON
-# (`binary_identity_json`, and the candidate's identity probe in `linux.rs`). No
-# check reads the GitHub Releases API any more: the one lane reads the download
-# host, whose manifest is TOML.
-# First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
-# untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
-# behind it; `serde_json` survives only as that crate's [dev-dependencies] oracle.
+# (`binary_identity_json`, and the candidate's identity probe in `linux.rs`).
 aterm-json = { workspace = true }
-# renamex_np(RENAME_SWAP) for the atomic bundle swap (the .app-only syscall that
-# stays here). Already a workspace dependency (used by the control socket).
+# renamex_np(RENAME_SWAP) for the atomic bundle swap.
 libc = { workspace = true }
-# The shared RFC3339 / Howard-Hinnant civil-calendar math (`aterm_types::rfc3339`);
-# already in the dependency graph via aterm-update-core.
+# The shared RFC3339 civil-calendar math (`aterm_types::rfc3339`).
 aterm-types = { workspace = true }
+# The workspace's one epoch-clock read (`aterm_time::unix_secs`).
+aterm-time = { workspace = true }
 # The artifact-agnostic, portable update primitives (Source resolution, FileLock +
 # same_volume, the download host's curl plumbing, ensure_private_dir, sha256_file, the
 # pin idiom).
@@ -46,31 +41,31 @@ aterm-update-core = { workspace = true }
 # land in the app log file (visible for a Finder-launched .app, unlike stderr).
 aterm-log = { workspace = true }
 # Decode the base64-pinned paper master (32 raw bytes) for its fingerprint.
-# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
-# to the retired `base64` package's `general_purpose::STANDARD` engine by
-# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
-# point every trust path uses: canonical padding REQUIRED and no trailing bits,
-# so a pinned key has exactly one spelling.
+# `decode_strict`: canonical padding required and no trailing bits, so a pinned
+# key has exactly one spelling.
 aterm-codec = { workspace = true }
-# Shipping introspection fingerprints the decoded compile-time update key. This
-# reports the key the verifier actually consumes, independent of optimizer/lipo
-# treatment of the source base64 literal.
+# Fingerprints the decoded compile-time update key (the bytes the verifier
+# consumes, not the base64 literal).
 aterm-digest = { workspace = true }
 # The ONE audited entropy surface (`aterm_uds::rand`) for the re-exec nonce —
-# no hand-rolled `/dev/urandom` reads here (that pattern caused the 2026-07-04/05
-# kernel panics). aterm-uds has an empty deps section, so no cycle.
+# never a hand-rolled `/dev/urandom` read (that pattern caused kernel panics).
+# aterm-uds has no dependencies, so no cycle.
 aterm-uds = { workspace = true }
 # Optional source↔spec anchor support. The real Tier-1 conformance test gets the
 # same crate through `[dev-dependencies]` below.
 aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The one trustd probe and skip line (`aterm_uds::deadline::trust_service_silent`).
+aterm-uds = { workspace = true, features = ["test-support"] }
 # Signing side (Ed25519KeyPair::from_seed_unchecked + .sign) for the roster-chain
 # fixtures; the verifying side is `aterm_update_core::roster`'s.
 ring = { version = "0.17.14" }
 # Tier-1 binds the real updater reducers to their single-source derived models;
 # production builds retain no spec dependency.
 aterm-spec = { workspace = true }
+# Test scratch directories removed on drop.
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,0 +1,12 @@
+# claude-code 2.1.287 · COMPOSED 2026-10-02, never captured: the texts are the bundle's (the grant row's label N:L335446@11772 as the grammar `Wm` N:L335446@14326 draws it for a grant with no end date (the parenthetical removed), the rows' order N:L361856@28434 (the stop row, the grant row or the weekly row in ONE slot, the wait row, the credits row); N is the 2.1.287 strings dump docs/SPEC-claude-accounts-resets-2026-10-02.md cites), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; same Dialog component), the values are invented · OPEN: replace with a capture (SPEC §6) · the same dialog with a BARE `Use your reset now`: no count and no day, so not the grant row the reader takes
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Use your reset now
+     3. Wait here, then continue automatically at Oct 9 at 5am
+     4. Switch to usage credits
+
+   Enter to confirm · Esc to cancel

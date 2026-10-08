@@ -8,7 +8,8 @@
 
 use std::fmt::Write as _;
 
-use super::{AgentPhase, CTX_WARN_PCT, Hand, Host, Level, Link, Slot, StoryVerb, Tone};
+use super::{AgentPhase, CTX_WARN_PCT, Hand, Host, Level, Link, Slot, StoryVerb, Tone, WallAnswer};
+use crate::text::truncate;
 use crate::{Duration, Instant};
 
 /// The six slots, composed. Each is a whole string; [`Words::fit`] lays them
@@ -256,18 +257,6 @@ fn width(s: &str) -> usize {
     s.chars().count()
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if width(s) <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let mut t: String = s.chars().take(max - 1).collect();
-    t.push('\u{2026}');
-    t
-}
-
 /// The row's OWN vocabulary — the glyphs that spell a hand, a hold, mail, the
 /// link, a story, a trust verdict, a reset — and its two separators (two
 /// spaces between slots, ` · ` between clauses). None of it may arrive inside
@@ -415,10 +404,9 @@ pub fn prompt_band_word(detail: Option<&str>) -> String {
 /// stopped 41s · input queued           stopped with input queued for 41s; resume it
 /// ```
 ///
-/// It takes the slot AHEAD of typed attention (2026-09-24): the incident's
-/// band read the supervisor's "answer this box" for 2h41m over a program that
-/// could read no answer. The duration counts from the oldest unread byte
-/// (`since`).
+/// It takes the slot AHEAD of typed attention: an "answer this box" over a
+/// program that reads no input asks for an answer it cannot take. The
+/// duration counts from the oldest unread byte (`since`).
 #[must_use]
 pub(crate) fn stall_words(
     since: Instant,
@@ -505,9 +493,8 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
         .agent
         .as_ref()
         // A phase the reader could not name is no phase to print (ruling
-        // 366): `unknown 3m35s` told a person nothing but that aterm could
-        // not read the screen. The row falls through to the shell's word or
-        // the dash; `status phase=unknown` keeps the fact.
+        // 366): the row falls through to the shell's word or the dash;
+        // `status phase=unknown` keeps the fact.
         .filter(|a| !matches!(a.phase, AgentPhase::Unknown))
     {
         let word = agent.phase.band_word();
@@ -525,8 +512,14 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
                 // the time TO it (design §1; the mock counts down) — never the
                 // time since the limit began, which is the story's to tell.
                 // A wall the harness retries prints its NEXT TRY the same way
-                // (`can't reach the API → 14:05 · 3m`) and speaks it as one.
-                if let Some(r) = reset {
+                // (`can't reach the API → 14:05 · 3m00s`) and speaks it as one
+                // — while it is ahead: once its time has come (`until`
+                // reached) the try is made or the loop is not making it
+                // (parked behind a hold, restarting, the machine asleep), and
+                // the wall names its cause alone again. A reset a wall names
+                // itself keeps its arrow after the countdown ends.
+                let next_try_past = V::wall_retries(*kind) && until.is_some_and(|u| u <= now);
+                if let Some(r) = reset.as_ref().filter(|_| !next_try_past) {
                     clauses.push(format!("\u{2192} {r}"));
                     spoken = if V::wall_retries(*kind) {
                         format!("{word}, next try {r}")
@@ -539,6 +532,19 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
                     .filter(|d| !d.is_zero())
                 {
                     clauses.push(fmt_dur(left));
+                }
+                // Who answers it (`WallAnswer`): the row is the record that the
+                // harness resumes the wall, and where a person can lift it
+                // faster, the ONE thing to do — calm words, never an alert.
+                match slot.wall_answer {
+                    WallAnswer::Nobody => {}
+                    WallAnswer::Harness => spoken.push_str(", resumes by itself"),
+                    WallAnswer::HarnessAsks(action) => {
+                        if reset.is_none() {
+                            clauses.push(format!("\u{2192} {action}"));
+                        }
+                        let _ = write!(spoken, ", resumes by itself, or sooner: {action}");
+                    }
                 }
                 (word.to_string(), clauses, spoken)
             }
@@ -572,8 +578,7 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
     }
 
     // mail — no slot at all while there is none to tell (ruling 366): a
-    // `✉0` on every row was a count of nothing, in a glyph a person has to
-    // learn.
+    // `✉0` is a count of nothing.
     let m = &slot.mail;
     let mut mail = if m.unread > 0 || m.pending > 0 || m.dropped > 0 || m.queued > 0 {
         format!("\u{2709}{}", m.unread)
@@ -601,8 +606,7 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
         }
     }
 
-    // ctx
-    // The context LEFT (`<n>% until auto-compact`, `<n>% context left`).
+    // ctx: the context LEFT (`<n>% until auto-compact`, `<n>% context left`).
     let ctx = match slot.agent.as_ref().and_then(|a| a.context_pct) {
         Some(pct) if pct <= CTX_WARN_PCT => format!("ctx {pct}% left \u{26a0}"),
         Some(pct) => format!("ctx {pct}% left"),

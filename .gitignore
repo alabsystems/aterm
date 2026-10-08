@@ -60,14 +60,17 @@ target-trust
 # it leaving a `target-tippy` symlink untracked. Nothing tracked starts with
 # `target` at the root.
 /target-*
+# …and the Spotlight-excluded `target.noindex` a root `target` symlink points
+# at, until 2026-10-02 ignored only by a checkout's own `.git/info/exclude`,
+# which the Trust lane's clean test no longer reads (tools/trust-gate-all.sh
+# `tree_clean`: only the tree's rules ignore a path). No trailing slash, as above.
+/target.noindex
 
 # The merge gate's snapshot lock and trash (crates/aterm-verify).
 /.aterm-verify/
 
 # One-shot Trust/verification campaign scratch — raw sweep logs and gap dumps are
-# regenerable evidence, not source. Keep them out of the tree so they stop drifting
-# stale against main (removed in the cruft cleanup; see PROOF_CARRYING_PERFORMANCE.md
-# for the durable write-up).
+# regenerable evidence, not source.
 sweep*-logs/
 /fleet-gaps.json
 
@@ -120,14 +123,6 @@ __pycache__/
 # content matches only this rule, and no script under `tools/` or `scripts/`
 # names it — so ignoring it hides no tracked or trackable input.
 /.fabric-wt/
-
-# THE DELIVERED LANE 1 MIRROR — 78 MB of `.crate` tarballs that must never
-# enter git (docs/THIRD_PARTY_SURFACE_PLAN.md, Lane 1: the mirror is delivered
-# as a signed bundle, not as repository content). `tools/cargo-mirror-config.toml`
-# points cargo's `local-registry` at exactly this path, so it is where
-# `targo --unverified forge mirror unbundle --out mirror` lands; unignored, it would stop
-# `targo --unverified ship cut` at `gates::clean_tree` the moment anyone delivered one.
-/mirror/
 
 # `ty`'s result cache (`.ty/cache.json`), written into the working directory of
 # whatever ran it — for the Tier-1 suites, the crate directory. It keys entries

@@ -9,21 +9,14 @@ license.workspace = true
 repository.workspace = true
 description = "aterm's portable clock: exactly `std::time` on every target that has one (a re-export, byte-identical), a performance.now()/Date.now() shim on wasm32-unknown-unknown where std's clock panics."
 
-# Native carries NO dependency at all — the whole crate is `pub use std::time::…`
-# there. Only the browser arm needs anything.
+# Native has no dependencies: the crate is `pub use std::time::…` there.
 [dependencies]
 
-# wasm32-unknown-unknown has no clock syscall: `std::time::Instant::now()`
-# panics with "time not implemented on this platform". The browser's clocks are
-# JS functions, so reaching them needs the same wasm-bindgen the three wasm
-# frontends already link (aterm-wasm / aterm-gpu-web / aterm-effects-web) —
-# PINNED to their exact version, because wasm-bindgen's generated glue and its
-# CLI must agree exactly. No js-sys, no web-sys: two `extern` declarations are
-# the entire browser surface this needs.
-# The predicate is wasm32-unknown-unknown EXACTLY: wasm32-wasip1 and
-# wasm32-unknown-emscripten are wasm targets that DO have a working `std::time`,
-# take the native arm, and must not pull wasm-bindgen for a `performance` object
-# their runtime does not have. This is the predicate `web-time` keyed on.
+# The browser clocks are JS functions, reached through the wasm-bindgen the
+# wasm frontends (aterm-wasm, aterm-gpu-web) link, pinned to their exact
+# version because the generated glue and the CLI must agree. Only
+# wasm32-unknown-unknown: wasm32-wasip1 and wasm32-unknown-emscripten have a
+# working `std::time` and take the native arm.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = "=0.2.108"
 

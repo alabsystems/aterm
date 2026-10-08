@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! **The bridge's prompt wake, and the roster backstop behind it.**
+//!
+//! A queued bus fetch or a post wakes the bridge through its own push event;
+//! when that event is lost, the roster round still delivers the post. Every
+//! assertion is an `until` over an observable the bridge publishes.
+
+use crate::harness;
+
+use aterm_spec::derive::fabric_outbox_wake_model;
+use harness::{until, World, FLEET};
+
+/// A newly parked bus fetch wakes the bridge through its `fetch` timeline
+/// event. The test fault disables only the periodic outbox drain, so the reply
+/// proves that the real prompt event path carried the request.
+#[test]
+fn a_queued_fetch_has_a_prompt_event_without_the_roster_drain() {
+    let w = World::boot_with(
+        "r2fetch",
+        &[],
+        &[("ATERM_LINK_FAULT", "skip-roster-outbox-while-marked")],
+    );
+    w.wait_ready();
+    let (_a, b) = w.two_sessions();
+    let presence = format!("/f/{FLEET}/pub/{}/{b}/presence", w.node);
+    until("the bridge to adopt the fetcher's session", || {
+        let mut broker = w.god();
+        let (rows, _) = broker.last(&presence, "", 8).ok()?;
+        rows.iter()
+            .any(|(_, subject, body)| {
+                *subject == presence && String::from_utf8_lossy(body).contains("state=live")
+            })
+            .then_some(())
+    });
+    // AND THE PUSH LANE TO WATCH IT. The presence row is published by the
+    // bridge's roster read, which can list the new session before the push
+    // lane adopts it; a watch pushes only what is recorded after its seed, so
+    // a fetch event recorded in that window reaches no bridge, and with the
+    // roster drain disabled nothing answers. `watchers>=1` is aterm's own
+    // word that the seed happened (the adoption path registers only after it
+    // seeds, aterm-gui subscribe.rs), and every later event follows it.
+    until("the push lane to watch the fetcher's session", || {
+        w.verb("who")
+            .rows()
+            .iter()
+            .find(|row| row.split_whitespace().nth(1) == Some(b.as_str()))
+            .and_then(|row| {
+                row.split_whitespace()
+                    .find_map(|t| t.strip_prefix("watchers="))
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .is_some_and(|n| n >= 1)
+            .then_some(())
+    });
+    std::fs::write(w.state.join("skip-roster-outbox"), b"1\n").unwrap();
+
+    let off = 1_000_000;
+    // A HANG DETECTOR, NOT A DEADLINE. The endpoint bounds one parked read at
+    // 10 s (`ERR timeout off=`) and frees its slot, so on a loaded machine the
+    // read is asked again, recording another `fetch` event, until the minute's
+    // hang detector. Promptness is proved by WHICH path answered — the roster
+    // drain is disabled and `fault-fired` says the event arrived — not by a
+    // clock.
+    let reply = until("the pushed fetch to be answered", || {
+        let reply = w.verb(&format!("@{b} inbox get @{off}"));
+        (!reply.header().starts_with("ERR timeout")).then_some(reply)
+    });
+    let timeline = w.verb(&format!("@{b} timeline 20"));
+    let events = timeline.rows().join("\n");
+    assert!(
+        reply
+            .header()
+            .starts_with(&format!("ERR no such record off={off}")),
+        "the pushed fetch was answered through the broker: {} — event_fired={} timeline:\n{events}\nlog:\n{}",
+        reply.header(),
+        w.state.join("fault-fired").exists(),
+        w.log_tail()
+    );
+    assert!(
+        events.contains(&format!("kind=fetch off={off}")),
+        "the endpoint recorded the push event: {events}"
+    );
+    assert!(
+        w.state.join("fault-fired").exists(),
+        "the bridge received the fetch event, rather than a roster fallback"
+    );
+
+    let model = fabric_outbox_wake_model();
+    let mut state = model.init_state();
+    assert!(model.fire("Queue", &mut state), "the real fetch was queued");
+    assert!(
+        model.action_enabled("PromptDrain", &state),
+        "the real fetch event enables the prompt drain"
+    );
+    assert!(model.fire("PromptDrain", &mut state));
+    assert_eq!(state["delivered"], 1);
+}
+
+/// A post whose push event was lost still reaches its recipient on the roster
+/// backstop. The marker holds the fault open until the bridge acknowledges the
+/// dropped event, so a normal post event cannot make this test pass by accident.
+#[test]
+fn a_lost_post_event_is_delivered_by_the_roster_backstop() {
+    let w = World::boot_with(
+        "r2postdrop",
+        &[],
+        &[("ATERM_LINK_FAULT", "drop-post-event-while-marked")],
+    );
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    std::fs::write(w.state.join("drop-post-event"), b"1\n").unwrap();
+
+    let posted = w.verb(&format!("@{a} post to=@{b} kind=note backstop-only"));
+    assert!(posted.ok(), "{}", posted.header());
+    let model = fabric_outbox_wake_model();
+    let mut state = model.init_state();
+    assert!(model.fire("Queue", &mut state), "the real post was queued");
+    until("the bridge to discard the prompt post event", || {
+        w.state.join("fault-fired").exists().then_some(())
+    });
+    assert!(model.fire("LoseEvent", &mut state));
+    let _ = std::fs::remove_file(w.state.join("drop-post-event"));
+    // A hang detector: the backstop is the only path left, and it runs every
+    // roster round (2 s), so a minute is dozens of rounds — and the wait ends at
+    // the first one that delivers.
+    let row = until(
+        "the roster backstop to deliver a post without its event",
+        || {
+            w.inbox(&b)
+                .into_iter()
+                .find(|r| r.contains("backstop-only"))
+        },
+    );
+    assert!(row.contains("kind=note"), "{row}");
+    for _ in 0..2 {
+        assert!(model.fire("BackstopTick", &mut state));
+    }
+    assert_eq!(state["delivered"], 1, "the real inbox received the post");
+}

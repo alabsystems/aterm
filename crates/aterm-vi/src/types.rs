@@ -3,10 +3,7 @@
 // Author: Andrew Yates
 
 //! Vi mode types: motions, coordinates, search state, and marks.
-//!
-//! These types are independent of the grid implementation and can be
-//! used by both aterm-core internals and external consumers (the
-//! Alacritty bridge, FFI callers, etc.).
+//! Independent of the grid implementation.
 
 #[cfg(not(kani))]
 use std::collections::HashMap;
@@ -26,12 +23,8 @@ type ViMarksMap = HashMap<char, ViPoint>;
 
 /// A scrollback-aware point for vi mode navigation.
 ///
-/// Row 0 is the top of the visible screen. Negative values index into
-/// scrollback. The column is 0-indexed.
-///
-/// This decouples vi navigation from the grid's internal `u16` row/col
-/// coordinate system, allowing motions to operate across the visible
-/// screen and scrollback uniformly.
+/// Row 0 is the top of the visible screen; negative rows index into
+/// scrollback, so motions treat screen and scrollback uniformly.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Default)]
 pub struct ViPoint {
     /// Logical line: 0 = visible top, negative = scrollback.

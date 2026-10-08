@@ -2,6 +2,9 @@
 # Copyright 2026 Andrew Yates
 [package]
 name = "aterm-session"
+# Integration tests are declared below, not discovered. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -49,3 +52,28 @@ libc = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "session_suite"
+path = "tests/session_suite.rs"
+
+# Alone: a counting #[global_allocator].
+[[test]]
+name = "spill_bound"
+path = "tests/spill_bound.rs"
+
+# Alone: reads the process-wide owned-master count that any sink moves.
+[[test]]
+name = "owned_master_census"
+path = "tests/owned_master_census.rs"
+
+# Alone: (macOS) inheritable pty slaves, and concurrent `openpty` calls across
+# files race.
+[[test]]
+name = "input_backlog_pty"
+path = "tests/input_backlog_pty.rs"
+
+# Alone: (macOS) opens inheritable ptys that a sibling's child could hold.
+[[test]]
+name = "conformance_input_unread"
+path = "tests/conformance_input_unread.rs"

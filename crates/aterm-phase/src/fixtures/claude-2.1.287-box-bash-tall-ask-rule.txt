@@ -1,0 +1,50 @@
+# claude-code 2.1.287 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a 60-line Bash command under an ask rule Bash(touch:*), taller than the 50-row pane: the head is off the screen
+ │ touch lab-tall-21.txt
+ │ touch lab-tall-22.txt
+ │ touch lab-tall-23.txt
+ │ touch lab-tall-24.txt
+ │ touch lab-tall-25.txt
+ │ touch lab-tall-26.txt
+ │ touch lab-tall-27.txt
+ │ touch lab-tall-28.txt
+ │ touch lab-tall-29.txt
+ │ touch lab-tall-30.txt
+ │ touch lab-tall-31.txt
+ │ touch lab-tall-32.txt
+ │ touch lab-tall-33.txt
+ │ touch lab-tall-34.txt
+ │ touch lab-tall-35.txt
+ │ touch lab-tall-36.txt
+ │ touch lab-tall-37.txt
+ │ touch lab-tall-38.txt
+ │ touch lab-tall-39.txt
+ │ touch lab-tall-40.txt
+ │ touch lab-tall-41.txt
+ │ touch lab-tall-42.txt
+ │ touch lab-tall-43.txt
+ │ touch lab-tall-44.txt
+ │ touch lab-tall-45.txt
+ │ touch lab-tall-46.txt
+ │ touch lab-tall-47.txt
+ │ touch lab-tall-48.txt
+ │ touch lab-tall-49.txt
+ │ touch lab-tall-50.txt
+ │ touch lab-tall-51.txt
+ │ touch lab-tall-52.txt
+ │ touch lab-tall-53.txt
+ │ touch lab-tall-54.txt
+ │ touch lab-tall-55.txt
+ │ touch lab-tall-56.txt
+ │ touch lab-tall-57.txt
+ │ touch lab-tall-58.txt
+ │ touch lab-tall-59.txt
+ │ touch lab-tall-60.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Permission rule Bash(touch:*) requires confirmation for this command.
+ /permissions to update rules
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

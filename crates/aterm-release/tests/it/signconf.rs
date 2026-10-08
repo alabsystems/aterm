@@ -106,8 +106,12 @@ fn the_private_key_never_reaches_a_debug_line() {
 
 // ---- helpers -------------------------------------------------------------
 
+/// A fresh scratch dir: emptied first, because the name repeats whenever a pid
+/// does, and a `.aterm/machine.key` an earlier run left there made the
+/// "nothing provisioned" case resolve credentials.
 fn tempdir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("aterm-signconf-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -257,6 +261,8 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
         flag_pub,
         "an explicit --release-credentials outranks ambient machine state"
     );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 /// Fail closed on a HALF-provisioned machine: a key that exists but is
@@ -281,4 +287,6 @@ fn a_present_but_unsafe_machine_key_is_an_error_not_a_fallthrough() {
         err.contains("machine.key"),
         "the refusal names the offending file: {err}"
     );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
 }

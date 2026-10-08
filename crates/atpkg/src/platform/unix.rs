@@ -1,10 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Unix backend of [`crate::platform`]. Every function here is the crate's
-//! ORIGINAL behavior moved verbatim — symlink activation, `chmod 0600`/mode setting,
-//! `statvfs` free-space, `getuid`-based ownership predicates, and `execve` — so a
-//! Unix build is byte-for-byte identical to before the platform abstraction existed.
+//! The Unix backend of [`crate::platform`]: symlink activation, `sh` exec-stub shims,
+//! POSIX mode setting, `statvfs` free space, `getuid`-based ownership predicates and
+//! `execve`.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
@@ -17,11 +16,11 @@ use std::process::Command;
 use aterm_types::fs_restricted::dir_safe_for_private_write;
 
 /// Appended to a tool name to form the concrete executable name. Empty on Unix.
-/// Applied ONLY by [`crate::store::ToolName::exe_file`] — that both suffixes are `""` here is
-/// precisely why appending either by hand went unnoticed until the Windows backend landed.
+/// Applied ONLY by [`crate::store::ToolName::exe_file`]: both suffixes are `""` here, so a
+/// hand-written append would go unnoticed until a Windows build.
 pub const EXE_SUFFIX: &str = "";
 /// Appended to a tool name to form the concrete `bin/` shim filename. Empty on Unix
-/// (the shim is a bare symlink named `<tool>`). Applied ONLY by
+/// (the shim is an exec stub named `<tool>`). Applied ONLY by
 /// [`crate::store::ToolName::shim_file`] and stripped ONLY by
 /// [`crate::store::ToolName::from_shim_file`].
 pub const SHIM_SUFFIX: &str = "";
@@ -74,14 +73,13 @@ pub fn kill_process_group(leader: u32) {
 /// which is NOT `$HOME`.
 ///
 /// The difference is load-bearing for the `[machine]` settings. `defaults` (cfprefsd)
-/// resolves the per-host preference domain from the account, and IGNORES `$HOME`:
-/// measured 2026-09-14, `HOME=/tmp/x defaults -currentHost write com.aterm.probe …`
-/// landed in the REAL `~/Library/Preferences/ByHost/`. So a process pointed at a
-/// synthetic home — every integration test in this crate, a `sudo -H`, a CI job — would
-/// still write the real account's Universal Control keys, and did, before the guard that
-/// calls this existed. Read through `/etc/passwd` this would be wrong on macOS, where
-/// local accounts live in Open Directory and are absent from that file; `getpwuid` asks
-/// the directory service.
+/// resolves the per-host preference domain from the account, and IGNORES `$HOME`
+/// (measured: `HOME=/tmp/x defaults -currentHost write com.aterm.probe …` landed in the
+/// REAL `~/Library/Preferences/ByHost/`). So a process pointed at a synthetic home —
+/// every integration test in this crate, a `sudo -H`, a CI job — would still write the
+/// real account's Universal Control keys. Read through `/etc/passwd` this would be wrong
+/// on macOS, where local accounts live in Open Directory and are absent from that file;
+/// `getpwuid` asks the directory service.
 ///
 /// `None` when the account cannot be resolved; the caller treats that as "cannot prove
 /// this is the real home" and does not write.
@@ -148,12 +146,10 @@ pub fn exclude_from_backup(dir: &Path) {
         return; // an interior NUL cannot name a real path
     };
     // READ BEFORE WRITING. A `setxattr(2)` that stores the very value already there still
-    // moves the directory's `st_ctime` (measured on APFS, 2026-09-15), and this runs on the
-    // prefix at every store-lock acquisition — every `repair`, `gc`, install and update
-    // pass. tippy snapshots the ctime of every ancestor of the executable it runs, and the
-    // prefix is one for the store and for every exec root, so the re-write aborted every
-    // tippy in flight ("ancestor … changed identity or contents", measured in a hermetic
-    // prefix the same day). An attribute that already holds the value is left alone.
+    // moves the directory's `st_ctime` (measured on APFS), and this runs on the prefix at
+    // every store-lock acquisition — every `repair`, `gc`, install and update pass. tippy
+    // snapshots the ctime of every ancestor of the executable it runs, so a re-write
+    // aborts every tippy in flight ("ancestor … changed identity or contents").
     #[cfg(target_os = "macos")]
     {
         let mut have = [0u8; 64];
@@ -219,7 +215,7 @@ pub fn spotlight_query(scope: &Path, filename: &str) -> Option<bool> {
     #[cfg(target_os = "macos")]
     {
         let predicate = format!("kMDItemFSName == \"{filename}\"");
-        let mut cmd = Command::new("/usr/bin/mdfind");
+        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/mdfind");
         cmd.arg("-onlyin").arg(scope.as_os_str()).arg(&predicate);
         let stdout = bounded_stdout(&mut cmd)?;
         // Any non-whitespace byte is a printed path. Tested byte-wise rather than with
@@ -238,36 +234,24 @@ pub fn spotlight_query(scope: &Path, filename: &str) -> Option<bool> {
 /// Whether Spotlight indexing is enabled for the volume holding `path`, per `mdutil -s`.
 ///
 /// `mdutil` ANSWERS FOR A VOLUME, NOT FOR A DIRECTORY, so `path` is resolved to its MOUNT
-/// POINT first. Measured 2026-09-02 on macOS 26.6.2 (25G83), as a non-root user:
+/// POINT first. Measured on macOS 26.6.2 (25G83), as a non-root user:
 ///
 /// ```text
 /// mdutil -s /System/Volumes/Data        -> Indexing enabled.
 /// mdutil -s /Users                      -> Indexing enabled.
 /// mdutil -s /Users//example/aterm         -> Error: unknown indexing state.
-/// mdutil -s /Users//example/aterm/target  -> Error: unknown indexing state.
 /// ```
 ///
-/// Handed the deep path its caller has (`verify`'s scope is a repo's parent directory),
-/// the status-line read ([`mdutil_index_state`]) finds no state and this answers `None` on
-/// every realistic input — which made the `IndexingDisabled` refinement dead code, and
-/// told a user who had just run the documented remedy `mdutil -i off /System/Volumes/Data`
-/// to "re-run on a less busy machine" after a 20 s wait. The mount point comes from
-/// `statfs(2)`'s `f_mntonname` rather than from walking up by `st_dev`, because on this
-/// APFS volume group `/` and `/System/Volumes/Data` report the SAME `st_dev` (16777231,
-/// measured) and a dev walk would answer for the read-only system volume instead of the
-/// data volume the build output is on.
+/// The mount point comes from `statfs(2)`'s `f_mntonname` rather than from walking up by
+/// `st_dev`: on an APFS volume group `/` and `/System/Volumes/Data` report the SAME
+/// `st_dev`, and a dev walk would answer for the read-only system volume.
 ///
-/// `None` when it could not be asked — which is ORDINARY here, not exceptional: the
-/// "unknown indexing state" line above is printed on stdout with exit 0, and this reads it
-/// as `None` exactly as it should.
+/// `None` when it could not be asked — ORDINARY here: "unknown indexing state" is printed
+/// on stdout with exit 0.
 ///
-/// The binary is `/usr/bin/mdutil`. It is NOT in `/usr/sbin` — the plausible spelling,
-/// and the one this function was first written with; `ls` on this machine on 2026-09-02
-/// shows `/usr/bin/mdutil` and no `/usr/sbin/mdutil`. `Command::new` on a path that does
-/// not exist fails to spawn, so the wrong prefix would not have failed loudly: it would
-/// have made this primitive answer `None` forever, on every machine, while looking like a
-/// working probe — the inert-and-silent failure `crate::noindex` exists to stop shipping.
-/// Absolute either way, never `PATH`, mirroring `install::run_tool`.
+/// The binary is `/usr/bin/mdutil` — NOT `/usr/sbin`, where a wrong guess would fail to
+/// spawn and answer `None` forever while looking like a working probe. Absolute, never
+/// `PATH`, mirroring `install::run_tool`.
 ///
 /// This REFINES A MESSAGE and nothing more. No verdict depends on it: an unindexed volume
 /// and a saturated one both produce `Verdict::Unknown` in [`crate::noindex`], and this
@@ -279,18 +263,29 @@ pub fn spotlight_query(scope: &Path, filename: &str) -> Option<bool> {
 pub fn spotlight_index_state(path: &Path) -> Option<crate::platform::IndexState> {
     #[cfg(target_os = "macos")]
     {
-        let volume = mount_point_of(path);
-        let asked = volume.as_deref().unwrap_or(path);
-        let mut cmd = Command::new("/usr/bin/mdutil");
-        cmd.arg("-s").arg(asked.as_os_str());
-        let stdout = bounded_stdout(&mut cmd)?;
-        mdutil_index_state(&stdout)
+        spotlight_index_state_within(path, BOUNDED_CEILING)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = path;
         None
     }
+}
+
+/// [`spotlight_index_state`] with the caller's ceiling on `mdutil`'s answer.
+#[cfg(target_os = "macos")]
+fn spotlight_index_state_within(
+    path: &Path,
+    ceiling: std::time::Duration,
+) -> Option<crate::platform::IndexState> {
+    let volume = mount_point_of(path);
+    let asked = volume.as_deref().unwrap_or(path);
+    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/mdutil");
+    cmd.arg("-s").arg(asked.as_os_str());
+    let (true, stdout) = bounded_stdout_inner(&mut cmd, ceiling)? else {
+        return None;
+    };
+    mdutil_index_state(&stdout)
 }
 
 /// What one `mdutil -s <volume>` answer says, for [`spotlight_index_state`]: is a probe that
@@ -346,7 +341,7 @@ pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
     {
         let read = |key: &str| {
             use crate::machine::KeyRead;
-            let mut cmd = Command::new("/usr/bin/defaults");
+            let mut cmd = aterm_uds::spawnfd::command("/usr/bin/defaults");
             cmd.arg("-currentHost")
                 .arg("read")
                 .arg(UNIVERSAL_CONTROL_DOMAIN)
@@ -391,7 +386,7 @@ pub fn universal_control_disable() -> bool {
     #[cfg(target_os = "macos")]
     {
         UNIVERSAL_CONTROL_KEYS.iter().all(|key| {
-            let mut cmd = Command::new("/usr/bin/defaults");
+            let mut cmd = aterm_uds::spawnfd::command("/usr/bin/defaults");
             cmd.arg("-currentHost")
                 .arg("write")
                 .arg(UNIVERSAL_CONTROL_DOMAIN)
@@ -408,9 +403,8 @@ pub fn universal_control_disable() -> bool {
 }
 
 /// The mount point of the volume holding `path` (`statfs(2)`'s `f_mntonname`), or `None`
-/// when `statfs` failed — a path that does not exist, or a name too long to make a
-/// `CString`. The one caller ([`spotlight_index_state`]) falls back to `path` itself,
-/// which is no worse than the behaviour before this existed.
+/// when `statfs` failed — a path that does not exist, or a name that cannot be a
+/// `CString`. The one caller ([`spotlight_index_state`]) then falls back to `path`.
 #[cfg(target_os = "macos")]
 fn mount_point_of(path: &Path) -> Option<PathBuf> {
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -438,49 +432,42 @@ fn mount_point_of(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&bytes)))
 }
 
-/// Run `cmd` with a bounded wall clock, killing and reaping it on timeout; its stdout on
-/// a zero exit, `None` on a spawn failure, a non-zero exit or the deadline.
-///
-/// The deadline loop is `doctor::output_bounded`'s, copied rather than shared because
-/// that one is private to `doctor` and this file may not depend on it. It is here for the
-/// reason that one exists: a Spotlight query against a rebuilding index is precisely the
-/// wedged probe it was written for, and the machine this runs on is by hypothesis the
-/// busy one — 18 rustc processes and `mds` grinding 2.0 TB is what
-/// [`crate::noindex`] was written after.
-///
-/// stderr is `null` because `mdfind` writes `[UserQueryParser] Loading keywords and
-/// predicates for locale "en_US"` there on a perfectly healthy query (reproduced
-/// 2026-09-02: twice, on the bare-token spelling; the `kMDItemFSName` predicate spelling
-/// this file uses was quiet). Nulled for BOTH callers regardless, so a later change of
-/// query spelling cannot start leaking parser chatter into a user's report.
-///
-/// Reading stdout only after the child exits cannot deadlock on a full pipe here: both
-/// callers ask a question whose answer is one unique probe token or one `mdutil` line, so
-/// it is far inside the pipe buffer.
 /// [`bounded_stdout`], but keeping the child's SUCCESS bit instead of folding a nonzero
-/// exit into `None`.
-///
-/// `defaults read` uses exit 1 with empty output to mean "this key is not set", which is
-/// a real answer about the machine; the caller needs to tell it apart from a read that
-/// did not happen.
+/// exit into `None`: `defaults read` uses exit 1 with empty output to mean "this key is
+/// not set", a real answer the caller must tell apart from a read that did not happen.
 #[cfg(target_os = "macos")]
-fn bounded_exit_and_stdout(cmd: &mut Command) -> Option<(bool, Vec<u8>)> {
-    bounded_stdout_inner(cmd)
+fn bounded_exit_and_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<(bool, Vec<u8>)> {
+    bounded_stdout_inner(cmd, BOUNDED_CEILING)
 }
 
+/// Run `cmd` with a bounded wall clock ([`BOUNDED_CEILING`]); its stdout on a zero exit,
+/// `None` on a spawn failure, a non-zero exit or the deadline.
 #[cfg(target_os = "macos")]
-fn bounded_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
-    match bounded_stdout_inner(cmd)? {
+fn bounded_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<Vec<u8>> {
+    match bounded_stdout_inner(cmd, BOUNDED_CEILING)? {
         (true, out) => Some(out),
         (false, _) => None,
     }
 }
 
+/// How long a production probe waits for its child before killing it and answering `None`.
 #[cfg(target_os = "macos")]
-fn bounded_stdout_inner(cmd: &mut Command) -> Option<(bool, Vec<u8>)> {
+const BOUNDED_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The deadline loop behind [`bounded_stdout`]: kills and reaps the child at `ceiling`. A
+/// Spotlight query against a rebuilding index is exactly the wedged probe this bounds.
+///
+/// stderr is `null` because `mdfind` writes `[UserQueryParser] Loading keywords …` there
+/// on a healthy query; nulled for every caller so parser chatter never reaches a report.
+/// Reading stdout only after the child exits cannot deadlock on a full pipe: every
+/// answer is one probe path, one `mdutil` line or one `defaults` value.
+#[cfg(target_os = "macos")]
+fn bounded_stdout_inner(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    ceiling: std::time::Duration,
+) -> Option<(bool, Vec<u8>)> {
+    use aterm_uds::spawnfd::Stdio;
     use std::io::Read as _;
-    use std::process::Stdio;
-    const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
     const POLL: std::time::Duration = std::time::Duration::from_millis(10);
     let mut child = cmd
         .stdin(Stdio::null())
@@ -488,7 +475,7 @@ fn bounded_stdout_inner(cmd: &mut Command) -> Option<(bool, Vec<u8>)> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = std::time::Instant::now() + CEILING;
+    let deadline = std::time::Instant::now() + ceiling;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -558,12 +545,9 @@ pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
 /// strongly — nothing below root can swap a component. This shape is for a genuinely
 /// shared multi-user store.
 ///
-/// CORRECTION 2026-08-18: this used to say a root-owned chain additionally carried
-/// "PATHNAME EXECUTION AUTHORITY, which a user-owned path cannot", and that Trust's
-/// verified launcher rejects a user-owned toolchain outright. Not true of current
-/// Trust: its default `CallerOwned` mode admits a component owned by root OR by the
-/// invoking identity (`process_authority.rs` — and it REFUSES to authenticate at all
-/// when targo runs as root). A user-owned 0700 prefix proves fine.
+/// Trust's default `CallerOwned` mode admits a component owned by root OR by the invoking
+/// identity (`process_authority.rs`; it REFUSES to authenticate at all when targo runs as
+/// root), so a user-owned 0700 prefix proves fine too.
 ///
 /// Deliberately NOT "root-owned OR ours": admitting our own uid here would let the
 /// system prefix fall back to exactly the property the verified lane refuses.
@@ -646,6 +630,18 @@ pub fn open_create_write(path: &Path, mode: u32) -> io::Result<File> {
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(mode)
+        .open(path)
+}
+
+/// Create `path` for writing with initial permission `mode`, failing
+/// [`io::ErrorKind::AlreadyExists`] when the NAME already resolves to anything —
+/// `O_CREAT|O_EXCL`, which follows no symlink and which the filesystem answers by its own
+/// name equality (case-insensitive APFS, Unicode normalization), not by the bytes asked.
+pub fn open_create_new_write(path: &Path, mode: u32) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
         .mode(mode)
         .open(path)
 }
@@ -771,12 +767,9 @@ pub fn install_shim_to_env(
 }
 
 /// The shim [`install_shim_to_env`] lays, RENDERED but not written: an EXEC STUB, not a
-/// symlink — see `platform::sh_shim_content` for why (Trust's `targo` refuses to
-/// authenticate when its own `current_exe` is a symlink or a non-canonical path, so a
-/// symlinked shim made the product's headline tool fail on 100% of successful installs;
-/// `exec` hands the process image to the real binary at its real path, which also keeps
-/// its sysroot siblings resolvable). Written by [`crate::lay`] — temp+rename, `0755` — so a
-/// shim on the user's PATH is never briefly absent or half-written.
+/// symlink (`platform::sh_shim_content` says why). Written by [`crate::lay`] —
+/// temp+rename, `0755` — so a shim on the user's PATH is never briefly absent or
+/// half-written.
 ///
 /// ROUTED WHEN AN EXEC ROOT STANDS. The body carries the guard line of
 /// `platform::sh_shim_content_routed` exactly when [`crate::compat::route_for_shim`]
@@ -784,9 +777,8 @@ pub fn install_shim_to_env(
 /// `None` for every other program, every build without a root and every target outside
 /// this shim's prefix. Deciding it HERE, in the one function every shim writer renders
 /// through (`install_tools_env`, the alias and agents reconciles, flow's restore,
-/// linkmode's unlink), is what keeps a writer from laying a plain shim beside a root
-/// that the next reconcile would have to route again; with no root the body is today's
-/// shim byte for byte.
+/// linkmode's unlink), keeps a writer from laying a plain shim beside a root that the
+/// next reconcile would have to route again; with no root the body is the plain shim.
 pub fn shim_executable_to_env(
     shim: &Path,
     target: &Path,
@@ -825,24 +817,6 @@ pub fn install_twin_to_env(
     crate::lay::write_in_process(&twin_executable_to_env(shim, target, env, prelude)?)
 }
 
-/// Wrap `s` in single quotes for safe embedding in a `/bin/sh` script, escaping any embedded
-/// single quote as the POSIX `'\''` sequence. A shim name only ever reaches here after
-/// `shim_allowed` (no `/`, no NUL, non-empty), but that gate does NOT forbid other shell
-/// metacharacters, so the failing-shim body must never let a crafted `exposes` name break out
-/// of the quoted string.
-fn sh_single_quote(s: &str) -> String {
-    let mut out = String::from("'");
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 /// Install a **failing tombstone shim** at `shim` — a tiny `sh` script that prints
 /// `message` to stderr and exits 70 (`EX_SOFTWARE`). Written atomically (temp `0755` +
 /// `rename(2)`), replacing whatever shim (symlink or file) was there.
@@ -852,7 +826,7 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
     // exits 70 (EX_SOFTWARE), a clear nonzero.
     let script = format!(
         "#!/bin/sh\nprintf '%s\\n' {} 1>&2\nexit 70\n",
-        sh_single_quote(message)
+        crate::stub::sh_single_quote(message)
     );
 
     // Atomic install through the one executable writer (`crate::lay`): a sibling temp,
@@ -862,18 +836,12 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
     crate::lay::write_in_process(&crate::lay::Executable::new(shim, script.as_bytes()))
 }
 
-/// Resolve the store/checkout target a `bin/<tool>` shim points at, or `None` if there is
-/// no shim. On Unix the shim is a symlink, so this is exactly its `read_link`. A tombstone
-/// (a regular file, not a symlink) yields `None`.
+/// Resolve the store/checkout target a `bin/<tool>` shim execs, or `None` for no shim or
+/// a TOMBSTONE (no `exec` line). `active_builds`, `prune_stale_shims` and gc's retention
+/// all key on it. A symlink shim from an older atpkg still resolves until the next
+/// activation rewrites it as a stub.
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
-    // Parses the exec stub rather than reading a link. Every store answer is built on
-    // this — `active_builds`, `prune_stale_shims`, gc's retention — so it must return
-    // exactly what `read_link` used to. A TOMBSTONE (a failing notice script with no
-    // `exec` line) yields `None`, mirroring `read_link`'s `Err` for a non-symlink.
-    //
-    // A symlink left by an older atpkg still resolves, so an in-place upgrade keeps
-    // working until the next activation rewrites the shim as a stub.
     if let Ok(target) = fs::read_link(shim) {
         return Some(target);
     }
@@ -909,7 +877,7 @@ pub fn exec_or_run(command: &mut Command) -> io::Error {
 /// hand the shell its prompt back over the child's last lines.
 ///
 /// A SIGTERM or SIGHUP sent to this process alone is PASSED ON to the child, and this
-/// process waits on (review, 2026-09-26). Those are how a supervisor ends a run — `kill
+/// process waits on. Those are how a supervisor ends a run — `kill
 /// <pid>`, `timeout`, a closed tab — and the pid it holds is the holder's: a packer
 /// `exec`s into `aterm pkg lease`. Died of it, the holder let the lease go while the
 /// command ran on UNLEASED and unwatched (measured: holder exit 143, its `sh` child still
@@ -925,7 +893,7 @@ pub fn exec_or_run(command: &mut Command) -> io::Error {
 /// # Errors
 /// The wait's.
 pub fn wait_standing_aside(
-    child: &mut std::process::Child,
+    child: &mut aterm_uds::spawnfd::TransparentChild,
 ) -> io::Result<std::process::ExitStatus> {
     use std::sync::atomic::Ordering;
     let pid = libc::pid_t::try_from(child.id()).unwrap_or(0);
@@ -1017,7 +985,6 @@ mod tests {
     /// The four answers `mdutil -s` gives, and the one it gives when it cannot say.
     /// "Index is read-only." is its own state — a low-disk-space hold, not a setting. Only
     /// the status line is read: a volume whose name carries a state word is not that state.
-    #[cfg(target_os = "macos")]
     #[test]
     fn every_mdutil_state_line_is_read() {
         use crate::platform::IndexState;
@@ -1054,12 +1021,48 @@ mod tests {
         assert_eq!(mdutil_index_state(b""), None);
     }
 
-    /// `mdutil` answers for a VOLUME. Handed the deep path its caller has, it prints
-    /// "Error: unknown indexing state." and this layer answers `None` — which made
-    /// `noindex`'s `IndexingDisabled` refinement dead code on every realistic input.
-    /// Measured 2026-09-02 on macOS 26.6.2 (25G83):
-    ///   mdutil -s /System/Volumes/Data       -> Indexing enabled.
-    ///   mdutil -s /Users//example/aterm        -> Error: unknown indexing state.
+    /// Why `mdutil` reports no index state for the volume at `mount` — its own words —
+    /// or `None` when it does ("Indexing enabled." / "Indexing disabled."). Read on both
+    /// streams under a one-minute hang detector: with the Spotlight server off it answers
+    /// "Spotlight server is disabled." in ~10 s, and the gate's environment can answer
+    /// differently from a login shell.
+    fn mount_index_state_unreadable(mount: &Path) -> Option<String> {
+        let Ok(mut child) = std::process::Command::new("/usr/bin/mdutil")
+            .arg("-s")
+            .arg(mount)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        else {
+            return Some("mdutil could not be started".to_owned());
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                use std::io::Read as _;
+                let mut out = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_string(&mut out);
+                }
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut out);
+                }
+                return if out.contains("Indexing enabled") || out.contains("Indexing disabled") {
+                    None
+                } else {
+                    Some(out.split_whitespace().collect::<Vec<_>>().join(" "))
+                };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Some("mdutil did not answer within a minute".to_owned())
+    }
+
+    /// `mdutil` answers for a VOLUME. Handed a deep path it prints "Error: unknown
+    /// indexing state.", which would leave `noindex`'s `IndexingDisabled` refinement
+    /// unreachable on every realistic input.
     #[test]
     fn the_indexing_switch_is_asked_at_the_mount_point_not_at_a_deep_path() {
         let deep = std::fs::canonicalize(std::env::temp_dir()).unwrap();
@@ -1074,17 +1077,27 @@ mod tests {
             "a temp directory is never itself a mount point — if this is equal, nothing \
              was resolved and `mdutil` is still being handed the deep path"
         );
-        // NOTE: `starts_with` does NOT hold on macOS. Measured 2026-09-02, the mount point
-        // of `/private/var/folders/…/T` is `/System/Volumes/Data`, which is not a path
-        // prefix of it — APFS firmlinks make the mount table and the path namespace two
-        // different things. That is precisely why this is `statfs`, not string surgery.
+        // `starts_with` does NOT hold on macOS: the mount point of `/private/var/folders/…/T`
+        // is `/System/Volumes/Data` (APFS firmlinks), which is why this is `statfs`, not
+        // string surgery.
         //
-        // The regression this pins: before the resolution above, every realistic caller
-        // (`noindex::verify`'s scope is a repo's parent) got `None` here, so the
-        // `IndexingDisabled` refinement was unreachable and a user who had just run
-        // `mdutil -i off /System/Volumes/Data` was told to re-run on a less busy machine.
+        // The property needs a mount point whose index state mdutil can report; on a Mac
+        // whose Spotlight server is off (or an environment where mdutil cannot answer) there
+        // is none, so say so with mdutil's own words and stop.
+        if let Some(why) = mount_index_state_unreadable(&mount) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "skipped here: mdutil reports no index state for {} ({why}), so there is \
+                 nothing for a deep path to read",
+                mount.display()
+            );
+            return;
+        }
+        // The production probe's 5 s ceiling is no part of this property; under load mdutil
+        // can take longer, so the test grants it the one-minute hang detector.
         assert!(
-            spotlight_index_state(&deep).is_some(),
+            spotlight_index_state_within(&deep, aterm_spec::wait::MUST_HAPPEN).is_some(),
             "the volume's index state must be READABLE for a deep path; `None` here means \
              the refinement is dead code again"
         );
@@ -1097,13 +1110,10 @@ mod tests {
     /// moves `st_ctime` — which tippy's ancestor check reads, so a `repair` or `gc` aborted
     /// every tippy running from that store. A second call moves no stamp; a drifted mode
     /// (too tight, group-writable, a sticky bit) is still forced to `0755`; a symlink at
-    /// the name is refused and the directory it names left as it was. (A reviewer showed
-    /// the whole lib suite green with the mode check removed, 2026-09-15.)
+    /// the name is refused and the directory it names left as it was.
     #[test]
     fn a_shared_dir_already_0755_is_not_rewritten_and_a_drifted_one_is_forced() {
-        let root = std::env::temp_dir().join(format!("atpkg-shared-dir-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::testdir::dir("atpkg-shared-dir-");
         let dir = root.join("prefix");
         let stamp = |p: &Path| {
             let m = fs::symlink_metadata(p).unwrap();

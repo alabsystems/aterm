@@ -3,35 +3,17 @@
 
 //! The zlib COMPRESSOR the PNG encoder needs (RFC 1950 + RFC 1951).
 //!
-//! aterm already had the other half: `aterm_codec::inflate` decompresses, and
-//! the decoder in this crate uses it. Nothing in the tree could WRITE a deflate
-//! stream, which is the only reason `png` (and through it `flate2`,
-//! `miniz_oxide`, `fdeflate`, `simd-adler32`, `crc32fast` and `adler2`) was
-//! still linked.
-//!
-//! ## What this is, and what it deliberately is not
+//! The other half is `aterm_codec::inflate`.
 //!
 //! Fixed-Huffman blocks (RFC 1951 §3.2.6) over a greedy LZ77 match finder with a
 //! 32 KiB window and hash-chained candidates. No dynamic Huffman tables, no
-//! block-splitting heuristics, no lazy matching.
+//! block-splitting heuristics, no lazy matching. Every stream it emits is a
+//! VALID zlib stream.
 //!
-//! A dynamic-Huffman encoder would beat this on entropy. The trade was accepted
-//! on the expectation of losing some ratio for a large reduction in surface —
-//! and then MEASURED, because an expectation is not a number.
-//!
-//! `tests/oracle.rs::compression_ratio_against_the_oracle_is_recorded` re-encodes
-//! 60 images from the repository's own corpus through both stacks. Result at the
-//! time of writing: 31,157,948 raw bytes become 3,304,492 through this encoder
-//! and 3,876,652 through `png` — this one is **0.85x the size**, i.e. slightly
-//! SMALLER. The reason is not that fixed Huffman beats dynamic Huffman; it is
-//! that `png`'s default compression setting is `Fast`, and the per-row adaptive
-//! filter selection in `encode::filter_image` matters more for image data than
-//! the entropy stage does. The test keeps that number honest, and its assertion
-//! is deliberately loose (fail only past 3x) because it guards against a
-//! compressor that has stopped compressing, not against a few percent of drift.
-//!
-//! Every stream this emits is a VALID zlib stream, so `png`, `flate2`, `zlib`
-//! and every browser read it; that equality is what the differential test pins.
+//! Dynamic Huffman would win on entropy, but measured on 60 corpus images
+//! (31,157,948 raw bytes) this encoder wrote 3,304,492 bytes against `png`'s
+//! 3,876,652 (0.85x): `png` defaulted to `Fast`, and the per-row adaptive
+//! filter in `encode::filter_image` matters more than the entropy stage.
 
 /// LSB-first bit sink, the bit order DEFLATE packs into bytes.
 ///

@@ -7,8 +7,7 @@
 //!
 //! Every claim in this file comes from binding and header inspection plus a
 //! cross-target `cargo check`, done on macOS. **No Windows behaviour has been
-//! observed.** The differential oracle in [`super::tests`] cannot reach this
-//! arm; it only runs where the incumbent's Apple arm runs. Treat this as
+//! observed.** [`super::tests`] does not reach this arm. Treat this as
 //! reviewed-and-compiled, not as verified: the accept/reject matrix that the
 //! Apple arm has been driven through has no counterpart here until someone runs
 //! it on Windows.

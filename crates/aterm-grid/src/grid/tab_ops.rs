@@ -2,22 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tab stop management operations.
+//! Tab stop operations: HT/CHT (CSI Ps I), CBT (CSI Ps Z), HTS (ESC H), TBC
+//! (CSI Ps g) and the default every-8 reset.
 //!
-//! Handles horizontal tab stop features:
-//! - Tab forward (HT / CHT — CSI Ps I)
-//! - Back tab (CBT — CSI Ps Z)
-//! - Tab stop set (HTS — ESC H)
-//! - Tab stop clear (TBC — CSI Ps g)
-//! - Tab stop reset (default every-8 pattern)
-//!
-//! Forward tab motion (HT/CHT) PRESERVES the `pending_wrap` flag — xterm's
-//! `TabToNextStop()` (tabs.c) only calls `set_cur_col` and never touches
-//! `screen->do_wrap`, so a TAB issued while wrap is pending leaves the
-//! cursor at the margin with the wrap still pending (the next printable
-//! wraps). Since `pending_wrap` is only ever set at the line's last
-//! writable column — where no further tab stop exists — preserving it
-//! never strands the flag mid-line.
+//! Tab motion keeps `pending_wrap`, as xterm's `TabToNextStop()` and
+//! `TabToPrevStop()` never touch `do_wrap`. The flag is only set at the line's
+//! last writable column, where no further tab stop exists.
 
 use super::{Grid, row_u16};
 
@@ -29,9 +19,7 @@ impl Grid {
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
     #[inline]
     pub fn tab(&mut self) {
-        // NOTE: pending_wrap is deliberately preserved (xterm TabToNextStop
-        // never touches do_wrap; see module docs).
-        // Find the next tab stop after the current column
+        // pending_wrap is preserved (see module docs).
         let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
         let start = usize::from(self.storage.cursor.col.saturating_add(1));
         let end = usize::from(max_col);
@@ -54,12 +42,8 @@ impl Grid {
         );
     }
 
-    /// Margin-aware tab (move to next tab stop, respecting DECLRMM).
-    ///
-    /// Per VT510: when DECLRMM is active and the cursor is within the
-    /// horizontal margin region, HT stops at the right margin instead of
-    /// the last column. When the cursor is outside the margins, HT uses
-    /// the screen edge as the boundary — matching CUF behavior (#7461).
+    /// Margin-aware tab (DECLRMM): inside the horizontal margins HT stops at the
+    /// right margin; outside them it uses the screen edge, like CUF.
     #[inline]
     pub fn tab_margin(&mut self, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -96,10 +80,7 @@ impl Grid {
         }
     }
 
-    /// Tab forward by n stops.
-    ///
-    /// Implements CHT (Cursor Horizontal Tab) - CSI Ps I.
-    /// Moves cursor forward through n tab stops.
+    /// Tab forward by n stops (CHT, CSI Ps I).
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col >= old(self.storage.cursor.col)
@@ -120,21 +101,13 @@ impl Grid {
         }
     }
 
-    /// Back tab (move to previous tab stop).
-    ///
-    /// Implements CBT (Cursor Backward Tabulation) - CSI Ps Z.
-    /// Moves cursor to the previous tab stop, or column 0 if no prior tab stop exists.
+    /// Back tab (CBT, CSI Ps Z): move to the previous tab stop, or column 0.
     ///
     /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     #[inline]
     pub fn back_tab(&mut self) {
-        // NOTE: pending_wrap is deliberately preserved, exactly as in `tab()`.
-        // xterm's `TabToPrevStop` (tabs.c) never calls `ResetWrap`, and the
-        // `set_cur_col` it does call is a plain assignment
-        // (`#define set_cur_col(screen, value) screen->cur_col = value`,
-        // xterm.h) — so a back tab leaves `do_wrap` armed just as a forward tab
-        // does. Clearing it here cancelled a wrap xterm keeps.
-        // Find the previous tab stop before the current column
+        // pending_wrap is preserved, as in `tab()` (xterm's `TabToPrevStop`
+        // never calls `ResetWrap`).
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
         let current = usize::from(self.storage.cursor.col).min(max_col);
         if current == 0 {
@@ -150,35 +123,17 @@ impl Grid {
         self.storage.cursor.col = 0;
     }
 
-    /// Margin-aware back tab (CBT) — ORIGIN MODE decides whether the left
-    /// margin binds, not DECLRMM.
+    /// Margin-aware back tab (CBT): origin mode decides whether the left margin
+    /// binds, not DECLRMM.
     ///
-    /// VT510 states CBT's floor without ever naming a margin: "If an attempt is
-    /// made to move the active position past the first character position on the
-    /// line, then the active position stays at column one." DECOM is the page
-    /// that turns "column one" into "the left margin" — set, "the cursor cannot
-    /// move outside of the margins"; reset, "the cursor can move outside of the
-    /// margins". Composing the two gives the gate directly, and it is the gate
-    /// xterm implements (tabs.c `TabToPrevStop` clamps to `ScrnLeftMargin` only
-    /// inside `if (xw->flags & ORIGIN)`) and the one Ghostty spells out in a
-    /// comment: `// With origin mode enabled, our leftmost limit is the left
-    /// margin.` (`horizontalTabBack`). xterm's `ScrnLeftMargin` is itself 0
-    /// unless DECLRMM is on, so BOTH flags must be set for the margin to bind —
-    /// hence the two parameters here.
+    /// VT510's CBT stops at column one, and DECOM turns "column one" into "the
+    /// left margin". xterm's `TabToPrevStop` clamps to `ScrnLeftMargin` only
+    /// under ORIGIN, as does Ghostty's `horizontalTabBack`; `ScrnLeftMargin` is
+    /// 0 unless DECLRMM is on, so both flags must be set (hence two parameters).
+    /// CUB clamps on the margin unconditionally; CBT does not.
     ///
-    /// This used to gate on DECLRMM alone, justified as "matching CUB behavior".
-    /// That is the inference xterm and Ghostty both declined to make: each
-    /// clamps CUB on the left margin unconditionally and still leaves CBT
-    /// origin-gated, a few hundred lines away in the same file. CUB is a
-    /// cursor-motion primitive; CBT is defined against tab stops and column one.
-    ///
-    /// A cursor ALREADY LEFT of the left margin is not dragged right onto it.
-    /// xterm does drag it — `if (next_column < left) next_column = left;` then
-    /// `set_cur_col` — which makes a BACKWARD tab move the cursor forward.
-    /// Ghostty cannot, because its bound is a loop guard (`if (x <= left_limit)
-    /// return;`), and it pins the case in `test "Terminal: horizontal tab back
-    /// with cursor before left margin"`. CBT is backward motion by definition,
-    /// so we follow Ghostty and stand still.
+    /// A cursor already left of the left margin stands still rather than being
+    /// dragged forward onto it (as Ghostty does; xterm drags it).
     #[inline]
     pub fn back_tab_margin(&mut self, left_right_margin_mode: bool, origin_mode: bool) {
         if !(left_right_margin_mode && origin_mode) {
@@ -206,8 +161,6 @@ impl Grid {
     }
 
     /// Back tab by n stops.
-    ///
-    /// Moves cursor backward through n tab stops.
     ///
     /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     #[inline]

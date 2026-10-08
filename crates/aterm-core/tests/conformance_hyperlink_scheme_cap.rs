@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the host-minted OSC-8 hyperlink scheme capability
-//! (orca deep-links §7, #4384).
+//! Tier-1 conformance for the host-minted OSC-8 hyperlink scheme capability.
 //!
-//! Drives the REAL shipping `Terminal` host API
-//! (`authorize_hyperlink_scheme` / `revoke_hyperlink_scheme`) and the real
-//! OSC-8 gate, projects the live authorization state onto
-//! `hyperlink_scheme_cap_model`'s variables, and checks every transition
-//! against the derived model — including the at-capacity refusal at the TRUE
-//! `MAX_EXTRA_SCHEMES` bound (the model's `Cap` equals it) and the
-//! never-allow refusal. The OSC-8 acceptance DECISION is bound via
-//! `Model::action_enabled("Accept")` ⟺ the gate's observable behavior.
+//! Drives the real `Terminal` host API (`authorize_hyperlink_scheme` /
+//! `revoke_hyperlink_scheme`) and OSC-8 gate, projects the authorization state
+//! onto `hyperlink_scheme_cap_model`, and checks every transition, including
+//! the at-capacity refusal at `MAX_EXTRA_SCHEMES` (the model's `Cap`) and the
+//! never-allow refusal. The acceptance decision is bound via
+//! `Model::action_enabled("Accept")`.
 //!
-//! Includes a NEGATIVE control: a fabricated never-allow admission is
-//! rejected by the model, so a green run is never vacuous.
+//! Negative control: a fabricated never-allow admission is rejected.
 
 use std::collections::BTreeMap;
 
@@ -104,7 +100,7 @@ fn real_terminal_scheme_mints_refusals_and_gate_refine_the_model() {
     assert!(gate_accepts_orca(&mut term));
     bind_transition(&model, &mut state, "Accept", project(&term));
 
-    // Fill the remaining slots up to the REAL bound (model Cap == engine cap).
+    // Fill the remaining slots up to the real bound (model Cap == engine cap).
     for other in ["alpha", "beta", "gamma"] {
         assert!(term.authorize_hyperlink_scheme(other));
         bind_transition(&model, &mut state, "AuthorizeOther", project(&term));
@@ -130,8 +126,8 @@ fn real_terminal_scheme_mints_refusals_and_gate_refine_the_model() {
     assert!(!model.action_enabled("Accept", &state));
     assert!(!gate_accepts_orca(&mut term));
 
-    // NEGATIVE CONTROL (non-vacuity): a fabricated never-allow admission must
-    // NOT be admitted as a RefuseNeverAllow transition of the Buggy=0 model.
+    // Negative control: a fabricated never-allow admission is not a
+    // RefuseNeverAllow transition of the Buggy=0 model.
     let mut forged = state.clone();
     forged.insert("never", 1);
     let (conforms, _) = verify::validate_transition_tiered(

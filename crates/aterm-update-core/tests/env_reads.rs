@@ -3,14 +3,9 @@
 
 //! NO ENVIRONMENT ALTERNATIVES IN A SHIPPED BINARY — the owner's rule, mechanised.
 //!
-//! 2026-09-22, verbatim: *"audit all these env flags and bullshit. I really don't like
-//! them. I want the one true best batteries included default on path. Delete
-//! alternatives. in the future, we could add settings, but NOT ENV VARS those are for
-//! development."* Phase 4 of `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`
-//! deleted the update system's user-facing knobs (`ATPKG_DISABLE`, `ATPKG_TOKEN`,
-//! `ATERM_NO_AUTO_UPDATE`, `ATERM_UPDATE_OWNER`, the runtime `GITHUB_TOKEN`/`GH_TOKEN`
-//! rungs, …) and moved every development seam behind `aterm_types::dev_seam!`, which a
-//! release build compiles to `None`. This test is what keeps it that way: it scans the
+//! A person's controls are settings and flags; environment variables are for
+//! development, behind `aterm_types::dev_seam!`, which a release build compiles to
+//! `None` (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md` §4). This test scans the
 //! source of every first-party crate the shipped `aterm` binary links (the dependency
 //! closure of `crates/aterm`, read from the manifests — dev- and build-dependencies
 //! excluded) for environment READS of `ATERM_*` / `ATPKG_*` / `GITHUB_TOKEN` /
@@ -23,20 +18,16 @@
 //! * [`DEV_SEAMS`] — read ONLY through `aterm_types::dev_seam!`; a plain `env::var` of
 //!   one of these names is a failure, because that read would ship.
 //!
-//! There is no fourth list. Until 2026-09-24 an `OUT_OF_SCOPE` list held the modes and
-//! the renderer/font/GPU, launch, control-socket, fabric and verify-gate knobs outside
-//! the update system, so the ratchet could hold while each waited for its own audit.
-//! The three audits emptied it (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`
-//! §4.1.2–§4.1.4) and it is gone: a NEW name read anywhere in shipped code fails here
-//! until somebody decides, in this file, which of the three it is — or makes it a
-//! flag or an `aterm.toml` key and lists the old name in [`RETIRED`].
+//! There is no fourth list: a NEW name read anywhere in shipped code fails here until
+//! somebody decides, in this file, which of the three it is — or makes it a flag or an
+//! `aterm.toml` key and lists the old name in [`RETIRED`].
 //!
 //! [`RETIRED`] names the deleted knobs. None may be read by any first-party source — the
 //! doctor's presence-only detector ([`RETIRED_DETECTOR`]), which tells a person that an
 //! export of one no longer does anything, excepted — and none may reappear on an
 //! allow-list.
 //!
-//! "Read" is PRESUMED (2026-09-23 review). Every mention of a family name in release
+//! "Read" is PRESUMED. Every mention of a family name in release
 //! code — a string literal that is exactly the name, or a use of a `const` holding one —
 //! counts as a run-time read unless it is provably not one: an argument (at any depth) of
 //! a writer (`Command::env`/`env_remove`/`envs`, `env::set`/`unset`, `set_var`,
@@ -44,22 +35,13 @@
 //! a [`WRITE_TABLES`] table (the child-environment deny list), the doctor's
 //! [`RETIRED_DETECTOR`], or a listed [`MENTIONS`] entry. A reader call around it at any
 //! depth decides the kind: `dev_seam!` (a seam), `env!`/`option_env!` (a stamp), anything
-//! in an `env` module or with `env` in its name (run time). The first version counted a
-//! name only as a recognised reader's DIRECT first argument, and six shapes of a
-//! retired-knob read passed it (`aterm_log::env::read`, a `for` loop over names,
-//! `OsStr::new` inside the reader, a helper without `env` in its name, a `vars()`
-//! comparison, `&*CONST`); presumption also found three real reads it had missed
-//! (`aterm-verify`'s `var_path`). A retired name inside any string's CONTENT, or in a
+//! in an `env` module or with `env` in its name (run time). A retired name inside any
+//! string's CONTENT, or in a
 //! script file a shipped crate carries under `src/` (the shell integration), fails too:
 //! a shell reads the environment where no Rust call is there to see it.
 //! `#[cfg(test)]` items, test-only modules and `tests/`, `benches/`, `examples/` and
 //! build scripts are not release code and are skipped. Comments never count: the scan
 //! runs over a lexed copy of each file with comments and string contents masked.
-//!
-//! It replaces `veto_flag_rule.rs`, which pinned HOW four boolean update knobs were read
-//! (`env_flag_engaged`): three of the four no longer exist, and the fourth
-//! (`ATERM_DEBUG_SEAMLESS_REEXEC`) is a development seam read through `dev_seam!` and
-//! `env_flag_engaged` both (`crates/aterm-gui/src/app_update_screen.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -73,6 +55,18 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     // atpkg's shell hook → the shell integration, and a pass → its own children.
     "ATPKG_AGENTS",
     "ATPKG_SPAWNER_PID",
+    // atpkg's rc block → the processes of a shell that sourced it: the warm reads
+    // it in the environment it inherited, to tell the person's shell setup from a
+    // window's (`SHELL_MARK`, crates/atpkg/src/warm.rs).
+    "ATPKG_BIN",
+    // The warm → its own login-shell probe's `env -0`: the record that says the probe
+    // ran and printed (`ASKED_MARK`, crates/atpkg/src/warm.rs). Removed from the probe's
+    // environment, so only the probe's own argument sets it.
+    "ATPKG_WARM_ASKED",
+    // A managed agent's `bin/` shim → the atpkg it execs for `<agent> update`: the
+    // re-entry guard, so that atpkg's own run of the vendor binary is not caught
+    // again (`REENTRY_VAR`, crates/atpkg/src/selfupdate.rs).
+    "__ATPKG_SELFUPDATE_PID",
     // Every child of the window, and the session identity it hands a shell.
     "ATERM_CHILD",
     "ATERM_SESSION_ID",
@@ -85,6 +79,20 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_UPDATE_EXPECTED_BUILD",
     "ATERM_UPDATE_EXPECTED_COMMIT",
     "ATERM_UPDATE_EXPECTED_DMG_SHA256",
+    // The cold lane's budget for one artifact, carried across its own `exec` and
+    // read and cleared by the relaunched image before its boot apply
+    // (`COLD_LANE_BUDGET_ENV`, crates/aterm-gui/src/app_update_handoff.rs).
+    "ATERM_UPDATE_COLD_LANE_BUDGET",
+    // A running window's update successor (cold `exec` or seamless launch): its
+    // first session does not run the launch's `-e` again; read and cleared at the
+    // window's entry before any session spawns (`RELAUNCH_OF_RUNNING_ENV`,
+    // crates/aterm-update/src/relaunch.rs).
+    "ATERM_RELAUNCH_OF_RUNNING",
+    // The cold lane's `exec` → the update it lands: what the parent's update-health
+    // warnings had said, so the landing records their healing; taken at the
+    // window's entry before any session spawns (`COLD_LANE_HEALTH_SAID_ENV`,
+    // crates/aterm-gui/src/app_update_handoff.rs).
+    "ATERM_UPDATE_HEALTH_SAID",
     "ATERM_SEAMLESS_FDS",
     "ATERM_SEAMLESS_LAYOUT",
     "ATERM_SEAMLESS_MANIFEST",
@@ -107,11 +115,27 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     // the dial (`crates/aterm-gui/src/handoff_warm_hint.rs`). Never authenticated and
     // never folded into a digest; a stale one costs only a warm miss.
     "ATERM_HANDOFF_WARM_HINT",
-    // The fork-lane parent → its successor: the launcher's own soft RLIMIT_NOFILE, so
-    // the successor's shells get what the launcher gave (a forked successor inherits
-    // the parent's RAISED limit and never claims): `ENV_LAUNCHER_NOFILE`
-    // (`crates/aterm-gui/src/handoff_rendezvous.rs`). Never set for any other child.
+    // The fork-lane parent and the cold lane's exec → the successor: the launcher's own
+    // soft RLIMIT_NOFILE, so the successor's shells get what the launcher gave (a forked
+    // or exec'd successor keeps the parent's RAISED limit and never claims):
+    // `ENV_LAUNCHER_NOFILE` (`crates/aterm-gui/src/handoff_rendezvous.rs`). Never set
+    // for any other child.
     "ATERM_HANDOFF_LAUNCHER_NOFILE",
+    // Beside it, on the same two lanes: the soft limit the predecessor held before
+    // a PARK raised it, so a successor that inherits that raise starts an older
+    // successor of its own at the limit it would have held without it
+    // (`ENV_PARK_RAISED_FROM`, the same file). Never set for any other child.
+    "ATERM_HANDOFF_PARK_RAISED_FROM",
+    // The parent → its successor, on both lanes beside its identity: what the parent
+    // reads of the successor's exit (`passing75`: it files 75 transient), so a refused
+    // intake is sent 75 only by a parent that reads it (`ENV_EXIT_CAPS`,
+    // `crates/aterm-gui/src/seamless.rs`). Never set for any other child.
+    "ATERM_HANDOFF_EXIT_CAPS",
+    // The PTY keeper → itself across its own `exec` into its copy of its code: the
+    // executable it was started as, whose socket, label and relaunch bundle it
+    // keeps. Read only by a keeper that runs from a copy under `keeper-code/`
+    // (`ORIGIN_ENV`, crates/aterm-keeper/src/code.rs; round eight, finding 14).
+    "ATERM_KEEPER_ORIGIN",
     // The window/session → the shell integration it injects (its directory, the
     // zsh ZDOTDIR hand-back, the per-shell nonce and the file a re-key of it lands in,
     // the loaded guard, WSL's cwd), and the controller-spawn observation hint.
@@ -183,6 +207,12 @@ const DEV_SEAMS: &[&str] = &[
     "ATERM_DEBUG_CLIPBOARD_FILE",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
+    // The render epoch's class seam (aterm-gui `resize_epoch`).
+    "ATERM_NUDGE_CLASS",
+    // A launched successor that dies before its rendezvous dial
+    // (handoff_rendezvous.rs `debug_die_before_dial`), for live checks of how
+    // soon the outgoing process stops waiting for it.
+    "ATERM_DEBUG_DIE_BEFORE_DIAL",
     // The fabric push lane's step hold (subscribe.rs `push_held`): the bridge race
     // test in aterm-link parks the lane between adoption and drain to force the
     // interleaving deterministically.
@@ -207,6 +237,12 @@ const DEV_SEAMS: &[&str] = &[
     "ATERM_NO_FULLSIZE_CONTENT",
     "ATERM_TRACE_LATENCY",
     "ATERM_TRACE_SPAWN",
+    // The rainbow kitty engine's hole tripwire (aterm-effects rainbow_kitty/holes.rs,
+    // 2026-09-30): prints the engine's state on the first frame of a dark column
+    // inside a lit typed line to stderr as `TRAILHOLE` lines (the engine keeps the
+    // records, aterm-gui writes them). `aterm ctl trail` stays the release answer;
+    // this is the development recorder for a hole a probe has not reproduced.
+    "ATERM_TRACE_TRAIL_HOLES",
     "ATERM_WATCHDOG",
     // The session group's audit (2026-09-24): test isolation of the state root (a
     // release launch isolates with a scratch `$HOME`), the binary `fabric on`
@@ -225,17 +261,18 @@ const DEV_SEAMS: &[&str] = &[
     "ATERM_FABRIC_TRACE",
     "ATERM_FABRIC_FAIL_MINT_AT",
     "ATERM_FABRIC_HOME",
-    // The landing's review (2026-09-24): the e2e harness's bridge command for the
-    // debug instances it launches. It sat on INTERNAL_PROTOCOL, but nothing in aterm
-    // sets it for a child (the child-environment deny list strips it); it was a
-    // person's override of `[fabric] command`, which is the one spelling now.
+    // The live upgrade's settle (aterm-agent `upgrade::quiet_s`, 2026-10-06): the
+    // live suite's upgrade tests shorten the 20 s idle settle they are not about.
+    "ATERM_UPGRADE_QUIET_S",
+    // The e2e harness's bridge command for the debug instances it launches. Not
+    // INTERNAL_PROTOCOL: nothing in aterm sets it for a child (the child-environment
+    // deny list strips it); a person's spelling is `[fabric] command`.
     "ATERM_FABRIC_COMMAND",
 ];
 
-/// The deleted knobs: Phase 4's (2026-09-23), and the env audit's (2026-09-24: the
-/// render, session and devtools groups, `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`
-/// §4.1's decision tables) — each replaced by a setting or a flag, or by nothing. Read
-/// by nothing, allow-listed nowhere.
+/// The deleted knobs (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md` §4.1's
+/// decision tables) — each replaced by a setting or a flag, or by nothing. Read by
+/// nothing, allow-listed nowhere.
 const RETIRED: &[&str] = &[
     "ATPKG_DISABLE",
     "ATPKG_TOKEN",
@@ -308,7 +345,8 @@ const RETIRED: &[&str] = &[
     "ATERM_FABRIC_FLEET",
     // 2026-09-24, the verify gate: `--root` and `--base` already existed; the rest
     // are its flags (`--stage-timeout`, `--test-threads`, `--log`/`--no-log`,
-    // `--snapshot`, `--timings`, `--skip-gui-smoke`, `--machine-lock-dir`).
+    // `--snapshot`, `--timings`, `--skip-gui-smoke` (`--no-windows` since
+    // 2026-09-29), `--machine-lock-dir`).
     "ATERM_VERIFY_ROOT",
     "ATERM_VERIFY_BASE",
     "ATERM_VERIFY_STAGE_TIMEOUT",
@@ -1412,11 +1450,9 @@ fn a_mention_entry_never_excuses_a_reader_call() {
 /// — a reader call's argument at any depth, a const's use, and anything the scanner
 /// cannot prove is not one.
 ///
-/// The seven shapes a review (2026-09-23) passed through the first version, which knew a
-/// read only as a recognised reader's direct first argument, are all here: the
-/// workspace's `aterm_log::env::read`, a `for` loop over names, `OsStr::new` inside the
-/// reader, a helper with no `env` in its name, a `vars()` comparison, a `&*` const, and a
-/// plain const. Measured before the fix: only the plain const was found.
+/// Seven read shapes: the workspace's `aterm_log::env::read`, a `for` loop over names,
+/// `OsStr::new` inside the reader, a helper with no `env` in its name, a `vars()`
+/// comparison, a `&*` const, and a plain const.
 #[test]
 fn the_scanner_reads_calls_not_mentions() {
     let dir = std::env::temp_dir().join(format!("aterm-env-reads-{}", std::process::id()));

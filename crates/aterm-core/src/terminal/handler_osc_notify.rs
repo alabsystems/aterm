@@ -2,20 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OSC desktop-notification handlers for the terminal.
+//! OSC desktop-notification handlers: OSC 9 (simple), OSC 99 (kitty protocol:
+//! title/body/urgency, multi-part) and OSC 777 (rxvt-unicode `notify`).
 //!
-//! This module contains handlers for the three notification OSC families:
-//! - OSC 9: simple notification (Terminal / ConEmu style)
-//! - OSC 99: kitty desktop-notification protocol (title/body/urgency, multi-part)
-//! - OSC 777: rxvt-unicode `notify` notification
-//!
-//! All three paths are gated by the host's notification authorization
-//! (`TerminalConfig::allow_notifications`, applied by
+//! All three are gated by `TerminalConfig::allow_notifications` (applied by
 //! [`Terminal::apply_config`](super::Terminal::apply_config) into
-//! `modes.allow_notifications`). When the host has not authorized
-//! notifications (the post-#7918 default), the parser path cannot reach a
-//! callback. Wiring a callback alone is insufficient — the host must also
-//! authorize dispatch.
+//! `modes.allow_notifications`), off by default. Wiring a callback alone does
+//! not let the parser reach it; the host must also authorize dispatch.
 
 use super::handler::TerminalHandler;
 use aterm_types::osc::{Notification, NotificationUrgency, TaskbarProgress};
@@ -39,9 +32,9 @@ impl TerminalHandler<'_> {
     /// Format: `ESC ] 9 ; message BEL` (or ST terminator).
     ///
     /// The `9;4;st;pr` ConEmu *taskbar progress* sub-protocol is a distinct,
-    /// benign UI feature (a 0-100 progress value + state) — NOT a notification.
+    /// benign UI feature (a 0-100 progress value + state) — not a notification.
     /// It carries no message text, so it is processed into [`Terminal::taskbar_progress`]
-    /// unconditionally and is NOT gated behind notification authorization; it
+    /// unconditionally and is not gated behind notification authorization; it
     /// never reaches the notification callback. Everything else is treated as a
     /// notification body and forwarded to the simple notification callback
     /// registered via [`Terminal::set_notification_callback`][cb].
@@ -140,10 +133,9 @@ impl TerminalHandler<'_> {
 
         let text = sanitize_notification(&payload);
 
-        // Build/update the accumulator entry for this notification. Every id-less
-        // chunk shares ONE key, as kitty treats a missing `i` as one default id.
-        // A fresh `\0anon-N` key per chunk (to 2026-09-12) meant an id-less `d=0`
-        // chunk could never be completed, so 64 of them filled the map for good.
+        // Build/update the accumulator entry. Every id-less chunk shares one
+        // key, as kitty treats a missing `i` as one default id, so an id-less
+        // `d=0` chunk can be completed and cannot fill the map.
         let key = id
             .clone()
             .unwrap_or_else(|| ANON_NOTIFICATION_KEY.to_string());
@@ -170,7 +162,7 @@ impl TerminalHandler<'_> {
             }
         } else if self.notifications.pending.len() < MAX_PENDING_NOTIFICATIONS {
             // More chunks expected — re-insert for accumulation. The cap is checked
-            // HERE, after this key's own entry was removed: a continuing id always
+            // here, after this key's own entry was removed: a continuing id always
             // has room, and a final chunk is never refused by it.
             self.notifications.pending.insert(key, entry);
         }
@@ -228,9 +220,6 @@ enum Osc99Payload {
     Body,
 }
 
-/// Rejoin OSC params from `start..` with `;`, returning `None` if there is no
-/// param at `start`. The VTE OSC parser splits on `;`, so a payload containing
-/// literal semicolons arrives as multiple params; this reconstructs it.
 /// Parse a ConEmu OSC 9;4 taskbar-progress body into a [`TaskbarProgress`].
 ///
 /// The `message` is the part after `9;` — i.e. `"4"`, `"4;st"`, or `"4;st;pr"`,
@@ -274,42 +263,25 @@ fn append_notification_field(field: &mut Option<String>, text: &str) {
     value.push_str(&text[..text.floor_char_boundary(room)]);
 }
 
+/// Rejoin OSC params from `start..` with `;`, returning `None` if there is no
+/// param at `start`. The OSC parser splits on `;`, so a payload containing
+/// literal semicolons arrives as multiple params; this reconstructs it.
 fn join_params(params: &[&[u8]], start: usize) -> Option<String> {
     if params.len() <= start {
         return None;
     }
-    let mut bytes = params[start].to_vec();
-    for extra in &params[start + 1..] {
-        bytes.push(b';');
-        bytes.extend_from_slice(extra);
-    }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(String::from_utf8_lossy(&params[start..].join(&b';')).into_owned())
 }
 
 /// Strip control characters and BiDi-override codepoints from a notification
 /// field, then truncate to [`MAX_NOTIFICATION_FIELD_BYTES`] at a UTF-8
 /// boundary.
 ///
-/// Mirrors the title sanitizer in `handler_osc.rs`: notification surfaces (like
-/// title bars) render outside the grid's BiDi-security filter, so the strip is
-/// unconditional. Removes:
-/// - C0 controls (0x00-0x1F) except tab (0x09)
-/// - C1 controls (0x80-0x9F)
-/// - BiDi directional overrides (U+202A-U+202E, U+2066-U+2069), CVE-2021-42574
+/// The strip is the title sanitizer's ([`super::handler_osc::sanitize_title`]):
+/// notification surfaces, like title bars, render outside the grid's
+/// BiDi-security filter.
 fn sanitize_notification(text: &str) -> String {
-    let filtered: String = text
-        .chars()
-        .filter(|&c| {
-            if c == '\t' {
-                return true;
-            }
-            let code = c as u32;
-            if code <= 0x1F || (0x80..=0x9F).contains(&code) {
-                return false;
-            }
-            !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-        })
-        .collect();
+    let filtered = super::handler_osc::sanitize_title(text);
     if filtered.len() <= MAX_NOTIFICATION_FIELD_BYTES {
         filtered
     } else {
@@ -401,7 +373,7 @@ mod tests {
 
     #[test]
     fn osc_9_4_sets_taskbar_progress_without_authorization() {
-        // Taskbar progress is benign UI state, NOT gated by notification auth.
+        // Taskbar progress is benign UI state, not gated by notification auth.
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b]9;4;1;50\x07");
         assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Normal(50)));
@@ -493,11 +465,9 @@ mod tests {
         captured
     }
 
-    /// Id-less `d=0` chunks used to take a fresh key each, so none could ever be
-    /// completed, and once 64 sat in the pending map the capacity check (which ran
-    /// before the `done` check) rejected every later OSC 99 until a full reset.
-    /// They now share one default id: the flood stays one pending entry, the next
-    /// id-less final chunk completes it, and a fresh id is never refused.
+    /// Id-less `d=0` chunks share one default id: a flood stays one pending
+    /// entry, the next id-less final chunk completes it, and a fresh id is never
+    /// refused for capacity.
     #[test]
     fn osc_99_anonymous_nonfinal_chunks_do_not_starve_final_notifications() {
         let mut term = Terminal::new(24, 80);
@@ -526,7 +496,7 @@ mod tests {
         );
         assert!(term.notifications.pending.is_empty());
 
-        // A full map of distinct in-flight ids must not reject a FINAL chunk.
+        // A full map of distinct in-flight ids must not reject a final chunk.
         for i in 0..MAX_PENDING_NOTIFICATIONS {
             term.process(format!("\x1b]99;i={i}:d=0;t\x07").as_bytes());
         }
@@ -538,7 +508,7 @@ mod tests {
         );
     }
 
-    /// Same-kind chunks are CONCATENATED (the doc's "accumulated"), not replaced.
+    /// Same-kind chunks are concatenated (the doc's "accumulated"), not replaced.
     #[test]
     fn osc_99_same_kind_chunks_concatenate() {
         let mut term = Terminal::new(24, 80);

@@ -3,12 +3,11 @@
 
 //! E2E: a real `Turn` driven over an L3 loopback-TLS relay.
 //!
-//! Wires the full remote stack exactly the way production does — `RelayClient` -> a
-//! `dial_and_relay_pinned` driver -> real rustls 1.3 with a channel-bound capability ->
-//! `accept_and_relay` listener -> the remote's authoritative control socket (here a
-//! tiny mock responder). Proves the agent `Turn` drives a REMOTE aterm end-to-end,
-//! byte-identically to a local one, with predicates evaluated on the remote host —
-//! the "identical either way" promise, over TLS.
+//! Wires the full remote stack as production does: `RelayClient` -> a
+//! `dial_and_relay_pinned` driver -> rustls 1.3 with a channel-bound capability
+//! -> `accept_and_relay` listener -> the remote's control socket (a mock
+//! responder). The agent `Turn` drives a remote aterm byte-identically to a
+//! local one, with predicates evaluated on the remote host.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

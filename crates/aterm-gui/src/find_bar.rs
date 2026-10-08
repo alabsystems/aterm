@@ -36,9 +36,12 @@
 //! screen. Two qualifiers say otherwise and survive at EVERY width — the ladder
 //! shortens by dropping the `i/` position, never the marker:
 //!
-//! * `+` — the index was capped (history deeper than `search_history_lines`), so
-//!   the total is a floor. Spelled out as `(partial history)` where the status
-//!   zone is wide enough.
+//! * `+` — the total is a floor. Where the status zone is wide enough the bar
+//!   names why: the depth cap (`none in newest 100,000 lines`, narrower
+//!   `none in newest 100k`; `3/7+ (newest 100,000 lines)` for hits; the limit
+//!   is `search_history_lines`), the match limit (`1/100000+ (match limit)`),
+//!   or a rewrap (below); a floor with none of these still reads
+//!   `(partial history)`.
 //! * `…` — the terminal changed since the count was taken (output arrived, the
 //!   screen repainted). The search is deliberately not re-run per PTY batch, so
 //!   the number is a past census and can be wrong in EITHER direction; it
@@ -131,9 +134,16 @@ pub(crate) struct FindBarView {
     pub is_regex: bool,
     /// The query was an invalid regex (regex mode only) — shown as `bad regex`.
     pub regex_error: bool,
-    /// Scrollback ran deeper than the search index cap (older history unsearched), so a
-    /// zero-match reads `no matches (partial history)` rather than a definitive miss.
+    /// The count is a floor (`+`): older history went unsearched, the list hit the
+    /// match limit, or a rewrap held the history away. A zero-match is then never a
+    /// bare `no matches`.
     pub truncated: bool,
+    /// How many of the newest lines the depth cap let the search read; `None` when
+    /// it read the whole buffer. A zero-match reads `no matches in newest 100,000
+    /// lines` where it fits.
+    pub searched_lines: Option<usize>,
+    /// The list stopped at the match limit: `1/100000+ (match limit)`.
+    pub match_capped: bool,
     /// The terminal changed since `total` was counted — new output, a repaint, a
     /// `clear` — and the search is deliberately NOT re-run per PTY batch (that is
     /// one full scan per burst on the UI thread). The count is therefore a past
@@ -220,27 +230,26 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     if v.query.is_empty() {
         return None;
     }
-    // The two qualifiers, in one place because every form below carries them and
+    // The qualifiers, in one place because every form below carries them and
     // NO form is allowed to drop them to fit: a shortened count that has quietly
     // shed its `+` or `…` is a bare assertion the bar knows is not true. The
-    // ladder therefore shortens by dropping the `i/` position (which the user can
-    // still read off the highlight) and never the marker.
+    // ladder therefore shortens the WORDS first (`100,000` to `100k`, then the
+    // marks alone), then drops the `i/` position (which the user can still read
+    // off the highlight), and never the marker.
     //
-    // `+`: the index was capped, so `total` is a floor — there may be more in the
-    // history it could not reach. `…`: the terminal has changed since `total` was
-    // counted, so it is a past census and can be off in either direction.
-    let mark = match (v.truncated, v.stale) {
-        (true, true) => "+…",
-        (true, false) => "+",
-        (false, true) => "…",
-        (false, false) => "",
+    // `+`: the count is a floor — the depth cap stopped the search (`newest
+    // 100,000 lines`), the list hit the match limit, or a rewrap held the
+    // history away. `…`: the terminal has changed since `total` was counted, so
+    // it is a past census and can be off in either direction.
+    let facts = crate::app_search::CountFacts {
+        truncated: v.truncated,
+        stale: v.stale,
+        history_away: v.history_away,
+        searched_lines: v.searched_lines,
+        match_capped: v.match_capped,
     };
-    let spelled = match (v.truncated, v.stale) {
-        (true, true) => " (partial history, stale)",
-        (true, false) => " (partial history)",
-        (false, true) => " (stale)",
-        (false, false) => "",
-    };
+    let mark = facts.mark();
+    let stale_mark = if v.stale { "…" } else { "" };
     let (candidates, fg, bold) = if v.regex_error {
         (
             vec!["bad regex".to_string(), "invalid".to_string()],
@@ -265,34 +274,35 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
             c.label,
             false,
         )
-    } else if v.history_away {
-        // Hits on the screen while the rest of the history is away: a floor,
-        // with its `+`, and the reason where it fits.
-        (
-            vec![
-                format!("{}/{}{mark} (rewrapping)", v.idx, v.total),
-                format!("{}/{}{mark}", v.idx, v.total),
-                format!("{}{mark}", v.total),
-            ],
-            c.value,
-            true,
-        )
     } else if v.total == 0 {
-        (
-            vec![
-                format!("no matches{spelled}"),
-                format!("no matches{mark}"),
-                format!("0 hits{mark}"),
-            ],
-            c.warn,
-            false,
-        )
+        use crate::app_search::parenthesized;
+        let mut forms = vec![format!(
+            "{}{}",
+            facts.none_base(false),
+            parenthesized(&facts.none_words())
+        )];
+        if let (Some(long), Some(short)) = (facts.depth(false), facts.depth(true)) {
+            // The depth cap stopped it: how far it searched outlives every
+            // other word, down to the bare mark.
+            let short_count = short.trim_end_matches(" lines");
+            forms.push(format!("none in {long}{stale_mark}"));
+            forms.push(format!("none in {short}{stale_mark}"));
+            forms.push(format!("none in {short_count}{stale_mark}"));
+        }
+        forms.push(format!("no matches{mark}"));
+        forms.push(format!("0 hits{mark}"));
+        (forms, c.warn, false)
     } else {
+        // Hits: the cause where it fits (`match limit`, `newest 100,000 lines`,
+        // `rewrapping`, `stale`), then the marks alone.
+        use crate::app_search::parenthesized;
+        let (i, n, plus) = (v.idx, v.total, facts.plus());
         (
             vec![
-                format!("{}/{}{spelled}", v.idx, v.total),
-                format!("{}/{}{mark}", v.idx, v.total),
-                format!("{}{mark}", v.total),
+                format!("{i}/{n}{plus}{}", parenthesized(&facts.hit_words(false))),
+                format!("{i}/{n}{plus}{}", parenthesized(&facts.hit_words(true))),
+                format!("{i}/{n}{mark}"),
+                format!("{n}{mark}"),
             ],
             c.value,
             true,
@@ -627,6 +637,8 @@ mod tests {
             is_regex: false,
             regex_error: false,
             truncated: false,
+            searched_lines: None,
+            match_capped: false,
             stale: false,
             history_away: false,
         }
@@ -1126,6 +1138,43 @@ mod tests {
             90,
         ));
         assert!(narrow.contains("no matches+"), "{narrow}");
+        // The depth cap stopped it: how far it searched, as wide as fits, and
+        // never `partial history` for a search the code can name.
+        let capped = |cols: usize| {
+            let p = paint(
+                &FindBarView {
+                    truncated: true,
+                    searched_lines: Some(100_000),
+                    ..view("needle")
+                },
+                cols,
+            );
+            text(&p.rows[p.field_row])
+        };
+        for (cols, want) in [
+            (220, "none in newest 100,000 lines"),
+            (168, "none in newest 100,000 lines"),
+            (150, "none in newest 100k lines"),
+            (120, "none in newest 100k"),
+            (90, "no matches+"),
+        ] {
+            let row = capped(cols);
+            assert!(row.contains(want), "{cols} cols: {row}");
+            assert!(!row.contains("partial history"), "{cols} cols: {row}");
+        }
+        // The match limit is not a history cut.
+        let full = all(&paint(
+            &FindBarView {
+                idx: 1,
+                total: 100_000,
+                truncated: true,
+                match_capped: true,
+                ..view("e")
+            },
+            180,
+        ));
+        assert!(full.contains("1/100000+ (match limit)"), "{full}");
+        assert!(!full.contains("history"), "{full}");
         let s = all(&paint(
             &FindBarView {
                 is_regex: true,

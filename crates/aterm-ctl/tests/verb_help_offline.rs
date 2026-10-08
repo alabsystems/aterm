@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TEST G of `docs/AUDIT-cli-per-verb-help-2026-08-31.md`: `aterm ctl` parses
-//! `<verb> --help` CLIENT-SIDE, without a socket. Every verb the client knows —
-//! every row of the protocol table and every client verb — asked with `--help`
-//! against a socket path that cannot exist exits 0, prints the verb's entry, and
-//! never reports a connect error. Before 2026-09-27 every protocol verb failed
-//! it: the rewrite to `help <verb>` still dialled the socket.
+//! `aterm ctl` answers `<verb> --help` client-side, without a socket. Every
+//! verb the client knows (every protocol-table row and every client verb),
+//! asked with `--help` against a socket path that cannot exist, exits 0,
+//! prints the verb's entry, and reports no connect error.
 //!
 //! No live aterm session is discovered or addressed: the socket named does not
 //! exist, and the child runs with every inherited `ATERM_*` variable removed.
 
 use std::process::{Command, Output, Stdio};
 
-/// The client verbs `--help` documents in its CLIENT VERBS block (they are not
-/// in the protocol table; the lib's `CLIENT_HELP_VERBS`).
+/// The client verbs `--help` documents in its client-verbs block (not in the
+/// protocol table; the lib's `CLIENT_HELP_VERBS`).
 const CLIENT_VERBS: [&str; 4] = ["ls", "instances", "windows", "mux"];
 
 fn ask_help(verb: &str) -> Output {
@@ -73,8 +71,8 @@ fn every_verb_help_is_answered_without_a_socket() {
     assert!(checked > 80, "only {checked} verbs were asked");
 }
 
-/// NEGATIVE CONTROL: a name no table knows still goes to the server, so with a
-/// dead socket it fails — the client answers only what it can answer truthfully.
+/// Negative control: a name no table knows goes to the server, so with a dead
+/// socket it fails.
 #[test]
 fn an_unknown_verbs_help_still_needs_the_server() {
     let out = ask_help("nonesuch-verb");
@@ -86,11 +84,9 @@ fn an_unknown_verbs_help_still_needs_the_server() {
     );
 }
 
-/// An explicit `help <protocol verb>` is the SERVER's question — its `cmd_help`
-/// answers for its own build, which may differ from this client's — so it still
-/// dials, and with a dead socket it fails. Only the `<verb> --help` form is
-/// answered from the client's table. FAILED between 5ef621a9b and the review of
-/// 2026-09-27, when `help text` was answered locally too.
+/// An explicit `help <protocol verb>` is the server's question (its `cmd_help`
+/// answers for its own build), so it dials and fails on a dead socket; only
+/// `<verb> --help` is answered from the client's table.
 #[test]
 fn an_explicit_help_verb_still_asks_the_server() {
     let out = ctl(&["help", "text"]);

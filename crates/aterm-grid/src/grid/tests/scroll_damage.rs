@@ -5,13 +5,7 @@
 //! Targeted damage tests.
 
 use super::*;
-
-fn write_marker_line(grid: &mut Grid, marker: char) {
-    grid.carriage_return();
-    grid.write_char(marker);
-    grid.carriage_return();
-    grid.line_feed();
-}
+use crate::grid::test_support::write_marker_line;
 
 fn collect_dirty_rows(grid: &Grid) -> Vec<u16> {
     grid.damage()
@@ -68,9 +62,9 @@ fn top_visible_absolute_row_tracks_the_display_offset() {
     );
 }
 
-// `scroll_to_absolute_row` lifts a target absolute row to the top visible line,
-// clamping a below-live target to the live bottom and an evicted-age target to
-// the top of scrollback — and never violates DisplayOffsetValid.
+// `scroll_to_absolute_row` puts a target absolute row at the top, clamping a
+// below-live target to the live bottom and an evicted one to the top of
+// scrollback, never violating DisplayOffsetValid.
 #[test]
 fn scroll_to_absolute_row_places_target_at_top_and_clamps() {
     let mut grid = build_scrollback_grid(5, 10, 50, 30);
@@ -128,9 +122,7 @@ fn clamp_display_offset_small_delta_marks_bottom_rows() {
     assert_eq!(collect_dirty_rows(&grid), vec![3, 4]);
 }
 
-// =========================================================================
-// content_gen (P1.0): advances on CONTENT mutation, NOT on viewport scroll.
-// =========================================================================
+// content_gen: advances on content mutation, not on viewport scroll.
 
 /// content_gen is initialized NONZERO in every construct path, so a reader can
 /// use `0` as a "never observed" sentinel.
@@ -171,7 +163,7 @@ fn content_gen_advances_on_content_mutations() {
     assert!(g4 > g3, "scroll_region_up must advance content_gen");
 }
 
-/// A pure VIEWPORT scroll (scroll_display) damages the grid but must NOT advance
+/// A pure viewport scroll (scroll_display) damages the grid but must not advance
 /// content_gen — this is the content/viewport divergence at the heart of P1.0.
 #[test]
 fn content_gen_unchanged_on_viewport_scroll() {
@@ -213,60 +205,56 @@ fn content_gen_unchanged_on_noop_scroll_up() {
     assert_eq!(grid.content_gen(), before, "scroll_up(0) is a no-op");
 }
 
-proptest::proptest! {
-    /// content_gen never decreases across any op (content OR viewport); and
-    /// whenever the LIVE row text (read at display_offset == 0, i.e. the actual
-    /// content, not the windowed view) changes, content_gen strictly increases.
-    ///
-    /// Viewport ops (`scroll_display`/`scroll_to_top`) change which scrollback
-    /// lines `row_text` returns, so the text comparison is only meaningful when
-    /// the viewport is snapped to live (display_offset == 0). We snap to bottom
-    /// before each text snapshot so the comparison reflects content, not window.
-    #[test]
-    fn content_gen_tracks_row_text_changes(
-        ops in proptest::collection::vec(0u8..6, 1..40)
-    ) {
+/// content_gen never decreases across any op (content OR viewport); and
+/// whenever the LIVE row text (read at display_offset == 0, i.e. the actual
+/// content, not the windowed view) changes, content_gen strictly increases.
+///
+/// Viewport ops (`scroll_display`/`scroll_to_top`) change which scrollback
+/// lines `row_text` returns, so the text comparison is only meaningful when
+/// the viewport is snapped to live (display_offset == 0). We snap to bottom
+/// before each text snapshot so the comparison reflects content, not window.
+#[test]
+fn content_gen_tracks_row_text_changes() {
+    let mut rng = aterm_spec::rng::XorShift::new(0xC0_57E7_6E11);
+    let mut next = move |n: u64| rng.below(n);
+    for _ in 0..256 {
         let mut grid = Grid::with_scrollback(6, 12, 200);
-
-        for op in ops {
+        for _ in 0..1 + next(39) {
             // Snapshot LIVE content (snap viewport to bottom first). Snapping is
             // itself viewport-only and must not advance content_gen.
             grid.scroll_to_bottom();
             let gen_before = grid.content_gen();
             let text_before: Vec<Option<String>> =
                 (0..grid.rows()).map(|r| grid.row_text(r)).collect();
-            proptest::prop_assert_eq!(
+            assert_eq!(
                 grid.content_gen(),
                 gen_before,
                 "scroll_to_bottom (viewport-only) must not advance content_gen"
             );
 
-            match op {
+            match next(6) {
                 0 => grid.write_char('A'),
                 1 => grid.erase_line(),
                 2 => grid.scroll_up(1),
                 3 => grid.line_feed(),
-                4 => grid.scroll_display(1),   // viewport-only
-                _ => grid.scroll_to_top(),     // viewport-only
+                4 => grid.scroll_display(1), // viewport-only
+                _ => grid.scroll_to_top(),   // viewport-only
             }
 
-            // Never decreases (holds for content AND viewport ops).
+            // Never decreases (holds for content and viewport ops).
             let gen_after_op = grid.content_gen();
-            proptest::prop_assert!(
+            assert!(
                 gen_after_op >= gen_before,
-                "content_gen decreased: {} -> {}", gen_before, gen_after_op
+                "content_gen decreased: {gen_before} -> {gen_after_op}"
             );
 
-            // Re-snap to live and compare CONTENT.
+            // Re-snap to live and compare content.
             grid.scroll_to_bottom();
             let text_after: Vec<Option<String>> =
                 (0..grid.rows()).map(|r| grid.row_text(r)).collect();
-            let gen_after = grid.content_gen();
-
-            // If the live content changed, content_gen must have advanced.
             if text_after != text_before {
-                proptest::prop_assert!(
-                    gen_after > gen_before,
+                assert!(
+                    grid.content_gen() > gen_before,
                     "live row text changed but content_gen did not advance"
                 );
             }

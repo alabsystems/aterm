@@ -1,64 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ROBI, the resident helper robot — ported from the user's Nitro Keyboard
-//! game, where he lives on the menu screens, hops around the furniture, and
-//! hands out tips.
+//! Robi, the resident helper robot (from the Nitro Keyboard game, where he
+//! hops around the menu screens and hands out tips).
 //!
-//! In aterm he is a PERMANENT RESIDENT: once born (config on, motion allowed)
-//! he is on the glass at all times, cycling forever through his repertoire —
-//! walk along the prompt line (the row the caret is typing on — his
-//! "textbox"), jumping jacks with a starter tip, extend a ladder up past the
-//! top of the grid, climb it, swing across the tab bar like MONKEY BARS with
-//! a deeper tip, drop, and rest. Two tips per cycle, drawn deterministically
-//! from a wide bank (aterm features, shell tricks, Claude Code tricks), so
-//! every cycle keeps teaching new things. Typing his name (`robi` / `robot`)
-//! restarts the cycle on the spot — he hustles over and greets you.
+//! Once born (config on, motion allowed) he stays on the glass, cycling through
+//! his repertoire: walk along the prompt line (the caret's row), jumping jacks
+//! with a starter tip, extend a ladder past the top of the grid, climb it,
+//! swing across the tab bar like monkey bars with a deeper tip, drop, and rest.
+//! Two tips per cycle, drawn deterministically from a bank (aterm features,
+//! shell tricks, Claude Code tricks). Typing his name (`robi` / `robot`)
+//! restarts the cycle: he hustles over and greets you.
 //!
-//! ## Clockless (the [`crate::dog_cameo`] discipline)
+//! ## Clockless
 //!
-//! Everything is a PURE FUNCTION of `(birth instant, seed, now, geometry)`:
-//! no timers, no randomness at tick time. The host re-requests presents only
-//! while the evaluated frame says [`RobiFrame::animating`] — his idle stands
-//! are deliberately STATIC (a statuesque robot is in character), so a resting
-//! Robi costs zero wakes and simply resumes his rounds on the next natural
-//! redraw. Reduced motion and serious mode are host gates: under either he is
-//! not on the glass at all (bypass-to-final-state, the matrix-rain rule).
+//! Everything is a pure function of `(birth instant, seed, now, geometry)`, as
+//! in [`crate::dog_cameo`]. The host re-requests presents only while the frame
+//! says [`RobiFrame::animating`]; idle stands are static, so a resting Robi
+//! costs no wakes and resumes on the next natural redraw. Reduced motion and
+//! serious mode are host gates: under either he is not drawn at all.
 //!
-//! ## Geometry contract
+//! ## Geometry
 //!
-//! All positions are PRE-SPLICE GRID pixels — the same frame
-//! [`FreeSprite`](aterm_core::render::FreeSprite) speaks. Negative `y` is
-//! above row 0: the strip-splice shifts sprites down by the tab-strip height,
-//! so `y ∈ [-strip_px, 0)` lands ON the in-grid tab bar, and anything higher
-//! reaches the titlebar band (the head allowance). The host resolves where
-//! the monkey-bar hand line actually is ([`RobiSense::bar_y`]) and where the
-//! handholds sit ([`RobiSense::handholds`]) — tab-chip centers when a strip
-//! exists, an even rhythm otherwise — so the brain never needs to know which
-//! tab flavour is on screen. The host also hands over the window's vertical
-//! extent ([`RobiSense::win_top`] / [`RobiSense::win_bot`]): every evaluated
-//! scene — body and ladder both — is clamped fully inside it (owner
-//! directive: he is never CLIPPED by a window edge), and a window too small
-//! to hold his body at all HIDES him ([`RobiShow::frame`] → `None`) rather
-//! than clipping him.
+//! Positions are pre-splice grid pixels, as
+//! [`FreeSprite`](aterm_core::render::FreeSprite) uses. Negative `y` is above
+//! row 0: the strip splice shifts sprites down by the tab-strip height, so
+//! `y ∈ [-strip_px, 0)` lands on the in-grid tab bar and higher reaches the
+//! titlebar band. The host resolves the monkey-bar hand line
+//! ([`RobiSense::bar_y`]) and the handholds ([`RobiSense::handholds`]: tab-chip
+//! centres when a strip exists, an even rhythm otherwise), and hands over the
+//! window's vertical extent ([`RobiSense::win_top`] / [`RobiSense::win_bot`]).
+//! Every scene, body and ladder, is clamped inside it; a window too small for
+//! his body hides him ([`RobiShow::frame`] → `None`) rather than clipping him.
 //!
 //! ## Caret avoidance
 //!
-//! The caret's ROW is his floor; its COLUMN is the user's workspace. Every
-//! stationary ground scene — the jumping jacks, both idle stands, the long
-//! rest — keeps his body center at least [`caret_clearance`] away from the
-//! caret column's center: the per-cycle stage marks are pushed to the nearer
-//! edge of that exclusion zone (the far edge when the grid margin leaves the
-//! nearer side no room; unchanged when the grid is too narrow for either),
-//! and since the walks TARGET those marks, he also aims away with no
-//! special-casing. Still a pure function of `(birth, seed, now, sense)`: the
-//! zone is re-derived from the live caret on every evaluation, so a caret
-//! arriving under a resting Robi displaces him on the next natural redraw —
-//! typing is what repaints, so no wake is armed and the zero-cost-idle
-//! contract holds. Exempt on purpose: mid-walk positions (strolling PAST the
-//! typist is fine; loitering on the word being typed is not) and the whole
-//! ladder/climb/bars arc — the ladder must stay planted on `holds[0]`, and
-//! up there he is above the text anyway.
+//! The caret's row is his floor; its column is the user's workspace. Every
+//! stationary ground scene (jumping jacks, both idle stands, the long rest)
+//! keeps his body centre at least [`caret_clearance`] from the caret column's
+//! centre: the stage marks move to the nearer edge of that zone (the far edge
+//! when the grid margin leaves no room; unchanged when the grid is too narrow
+//! for either), and since walks target those marks he aims away too. The zone
+//! is re-derived from the live caret each evaluation, so typing (which
+//! repaints) displaces a resting Robi with no extra wake. Exempt: mid-walk
+//! positions (passing the typist is fine) and the ladder/climb/bars arc (the
+//! ladder stays planted on `holds[0]`, and he is above the text there).
 
 use aterm_time::Instant;
 
@@ -66,36 +52,29 @@ use crate::genome;
 use crate::robi_glyphs_gen::RobiGlyphId;
 use crate::word_decorations::EffectGeom;
 
-/// Robi's on-screen height in rows in a SMALL window — and the floor of the
-/// window-scaled height ([`art_rows`]). Taller than the shared atlas's 2-row
-/// host-tile ceiling on purpose: the emitter bakes him at full size and
-/// splits the texels into vertically stacked slices, each under the ceiling.
+/// Robi's height in rows in a small window, and the floor of the window-scaled
+/// height ([`art_rows`]). Taller than the atlas's 2-row host-tile ceiling: the
+/// emitter bakes him full size and splits him into stacked slices under it.
 pub const ART_ROWS: f32 = 3.2;
 
-/// Ceiling of the window-scaled height ([`art_rows`]) — what the shared atlas
-/// can actually hold him at. Two structural caps bound his box, and the WIDTH
-/// one binds first: a tile may be at most `4·cell_h` wide (`CatBaker::slot_w`,
-/// the §5.2 cap made structural) and at most `2·cell_h` tall per slice, of
-/// which the emitter stacks four. `5.4 · ART_ASPECT ≈ 3.93` cell-heights wide
-/// clears the width cap with rounding room, and 5.4 rows is under the 8-row
-/// height ceiling. Overshooting is NOT a squashed robot but an INVISIBLE one:
-/// `host_tile` refuses an oversized tile, the body never resolves, and he
-/// silently keeps whatever size he was last baked at.
+/// Ceiling of the window-scaled height ([`art_rows`]). The width cap binds
+/// first: a tile is at most `4·cell_h` wide (`CatBaker::slot_w`) and `2·cell_h`
+/// tall per slice (the emitter stacks four). `5.4 · ART_ASPECT ≈ 3.93`
+/// cell-heights clears the width cap with rounding room. Overshooting makes him
+/// invisible, not squashed: `host_tile` refuses the tile and he keeps his last
+/// baked size.
 pub const ART_ROWS_MAX: f32 = 5.4;
 
-/// The share of the window's HEIGHT Robi fills. A helper who reads at 3.2
-/// rows in a 32-row window is a speck in a 70-row fullscreen one — rows are
-/// not a size, they are a count. Sizing him as a FRACTION of the viewport
-/// keeps him the same apparent size on any window: [`ART_ROWS`] ÷ 32 rows.
+/// The share of the window's height Robi fills ([`ART_ROWS`] ÷ 32 rows), so he
+/// keeps the same apparent size in any window.
 const ART_ROWS_PER_ROW: f32 = ART_ROWS / 32.0;
 
-/// Robi's on-screen height in rows for a given viewport — [`ART_ROWS`] in a
-/// 32-row window, growing with the window up to [`ART_ROWS_MAX`].
+/// Robi's height in rows for a viewport: [`ART_ROWS`] in a 32-row window,
+/// growing with the window up to [`ART_ROWS_MAX`].
 ///
-/// THE one sizing law: the brain ([`RobiShow::frame`]), the emitter
-/// (`WordDecorations::robi`) and the host's speech-bubble anchor all derive
-/// his box from this, so his body, his ladder, his footing and his tip can
-/// never disagree about how big he is.
+/// The one sizing law: the brain ([`RobiShow::frame`]), the emitter
+/// (`WordDecorations::robi`) and the host's speech-bubble anchor all derive his
+/// box from it.
 #[must_use]
 pub fn art_rows(geom: &EffectGeom) -> f32 {
     (f32::from(geom.rows) * ART_ROWS_PER_ROW).clamp(ART_ROWS, ART_ROWS_MAX)
@@ -104,13 +83,10 @@ pub fn art_rows(geom: &EffectGeom) -> f32 {
 /// Authored pose viewbox aspect (width ÷ height) — `robi.py`'s 128 × 176.
 pub const ART_ASPECT: f32 = 128.0 / 176.0;
 
-/// The caret-avoidance half-width in grid px: how far Robi's body CENTER
-/// must stay from the caret column's center while he loiters on the ground
-/// (see the module doc's "Caret avoidance"). Half his body width plus two
-/// cells — at that distance his nearest edge clears a full two columns of
-/// whatever is being typed, close enough to keep the user company, far
-/// enough that he never squats on the word under the cursor. Shared with the
-/// tests so the law is pinned in one place, like [`art_rows`].
+/// Caret-avoidance half-width in grid px: how far Robi's body centre stays from
+/// the caret column's centre while he loiters on the ground. Half his body
+/// width plus two cells, so his nearest edge clears two columns of whatever is
+/// being typed. Shared with the tests.
 #[must_use]
 pub fn caret_clearance(geom: &EffectGeom) -> i32 {
     let body_w = (art_rows(geom) * ART_ASPECT * f32::from(geom.cell_h)).round() as i32;
@@ -125,15 +101,12 @@ pub const FEET_FRAC: f32 = 170.0 / 176.0;
 /// (`GRIP_Y / VB_H` in `robi.py`).
 pub const GRIP_FRAC: f32 = 10.0 / 176.0;
 
-/// Robi's drawn-body SIZE in px for a viewport — `(w, h)`: `h` is the
-/// rounded [`art_rows`] height, `w` follows [`ART_ASPECT`] under the shared
-/// atlas's `4·cell_h` slot cap (`CatBaker::slot_w`). The cap is the ATLAS
-/// CONTRACT, not a taste: a wider tile is REFUSED by `host_tile` and the
-/// body silently stops resolving — [`ART_ROWS_MAX`] is chosen to stay
-/// inside it, so the clamp only ever catches rounding. ONE copy of the law,
-/// the pet's `body_px` discipline: the emitter (`WordDecorations::robi`)
-/// bakes with it and the host's dismiss hit-box derives from it, so the
-/// click box IS the sprite, not a model of it.
+/// Robi's drawn-body size `(w, h)` in px for a viewport: `h` is the rounded
+/// [`art_rows`] height, `w` follows [`ART_ASPECT`] under the atlas's `4·cell_h`
+/// slot cap (`CatBaker::slot_w`), which `host_tile` enforces by refusing wider
+/// tiles; [`ART_ROWS_MAX`] stays inside it, so the clamp only catches rounding.
+/// The emitter (`WordDecorations::robi`) bakes with it and the host's dismiss
+/// hit-box derives from it, so the click box is the sprite.
 #[must_use]
 pub fn body_size_px(geom: &EffectGeom) -> (u16, u16) {
     let h = ((art_rows(geom) * f32::from(geom.cell_h)).round() as i32).clamp(1, i32::from(u16::MAX))
@@ -145,12 +118,11 @@ pub fn body_size_px(geom: &EffectGeom) -> (u16, u16) {
     (w, h)
 }
 
-/// Place a `w × h` body at an evaluated frame's anchor: the dest rect
-/// `(x0, x1, y0, y1)` (right/bottom exclusive, grid px) — top from the
-/// anchor fraction ([`FEET_FRAC`] / [`GRIP_FRAC`]), `frame.x` a CENTER.
-/// Split from `body_px` because the emitter must place the RESOLVED tile
-/// with the same law — on a bake miss that is `robi_last_body` at the
-/// PREVIOUS size, the one accepted transient.
+/// Place a `w × h` body at a frame's anchor: the dest rect `(x0, x1, y0, y1)`
+/// (right/bottom exclusive, grid px), top from the anchor fraction
+/// ([`FEET_FRAC`] / [`GRIP_FRAC`]), `frame.x` a centre. Separate from
+/// `body_px` because the emitter places the resolved tile with it, which on a
+/// bake miss is `robi_last_body` at the previous size.
 #[must_use]
 pub fn body_rect_px(frame: &RobiFrame, w: u16, h: u16) -> (i32, i32, i32, i32) {
     let anchor_frac = match frame.anchor {
@@ -162,12 +134,10 @@ pub fn body_rect_px(frame: &RobiFrame, w: u16, h: u16) -> (i32, i32, i32, i32) {
     (x0, x0 + i32::from(w), top, top + i32::from(h))
 }
 
-/// Robi's LIVE drawn body for one evaluated frame, in grid px —
-/// [`body_size_px`] placed by [`body_rect_px`]: exactly the dest rect the
-/// emitter draws when the bake resolves at the current size. `None` when
-/// nothing is on glass (`alpha == 0`) or the cell metrics are degenerate —
-/// the same frames the emitter draws nothing for, which is what clears a
-/// host's stashed hit-box.
+/// Robi's live drawn body for one frame in grid px: [`body_size_px`] placed by
+/// [`body_rect_px`], the rect the emitter draws when the bake resolves. `None`
+/// when nothing is drawn (`alpha == 0`) or the cell metrics are degenerate,
+/// which clears a host's stashed hit-box.
 #[must_use]
 #[cfg(test)]
 pub fn body_px(frame: &RobiFrame, geom: &EffectGeom) -> Option<(i32, i32, i32, i32)> {
@@ -185,13 +155,10 @@ pub const LADDER_ASPECT: f32 = 48.0 / 32.0;
 /// 3.2-row body (the NK original's 34px ladder against his 90px frame).
 pub const LADDER_W_ROWS: f32 = 1.05;
 
-/// The ladder tile's baked size `(w, h)` in px for a viewport — ONE copy of
-/// the segment law, like [`body_size_px`]: the emitter
+/// The ladder tile's baked size `(w, h)` in px: the emitter
 /// (`WordDecorations::robi`) bakes with it, and the window clamp
-/// ([`RobiShow::frame`]) reads the same numbers because the emitter's
-/// segment stack may overshoot `ladder.top_y` by up to a quarter tile (its
-/// reach-the-bar slack) — the clamp must hold the STACK inside the window,
-/// not just the abstract extent.
+/// ([`RobiShow::frame`]) reads it because the segment stack may overshoot
+/// `ladder.top_y` by up to a quarter tile.
 #[must_use]
 pub fn ladder_tile_px(geom: &EffectGeom) -> (u16, u16) {
     // The authored proportion against his body, so the ladder grows with him
@@ -206,10 +173,9 @@ pub fn ladder_tile_px(geom: &EffectGeom) -> (u16, u16) {
 /// resolve). Fixed-size so [`RobiSense`] stays `Copy`.
 pub const MAX_HANDHOLDS: usize = 8;
 
-// ── one cycle of his rounds (ms within the cycle) ──────────────────────────
-// The cycle opens with the greeting (walk + jacks + tip) so a name-summon —
-// which restarts the cycle — answers within a few seconds, exactly like
-// clicking NK Robi. Idle stands are static (no wakes; see the module doc).
+// ── One cycle of his rounds (ms within the cycle) ──────────────────────────
+// The cycle opens with the greeting (walk, jacks, tip), so a name-summon (which
+// restarts the cycle) answers within a few seconds. Idle stands are static.
 pub const FADE_IN_MS: u64 = 200;
 pub const WALK_A_END: u64 = 2_500;
 pub const JACKS_END: u64 = 10_500;
@@ -244,8 +210,8 @@ const CLIMB_FRAME_MS: u64 = 250;
 /// One handhold-to-handhold swing on the monkey bars.
 const SWING_MS: u64 = 960;
 
-/// What a tip is about — used to pick a STARTER tip for the jacks scene and a
-/// non-starter tip for the bars scene.
+/// What a tip is about: picks a starter tip for the jacks scene and a
+/// non-starter for the bars scene.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TipKind {
     /// Getting-started aterm guidance (shown during the jumping jacks).
@@ -265,22 +231,33 @@ pub struct RobiTip {
     pub text: &'static str,
 }
 
-/// The tip bank. Robi's LAW (carried over from Nitro Keyboard): tips are
-/// on-topic, straightforward, and correct — every aterm claim here names a
-/// real feature of this build, and every command is the real spelling.
+/// The tip bank. Tips are on-topic, straightforward and correct: every aterm
+/// claim names a real feature and every command is the real spelling.
 pub const ROBI_TIPS: &[RobiTip] = &[
     // ── starters ──────────────────────────────────────────────────────────
+    #[cfg(target_os = "macos")]
     RobiTip {
         kind: TipKind::Starter,
         text: "Welcome to aterm! Press Cmd+, any time to open Settings.",
+    },
+    #[cfg(not(target_os = "macos"))]
+    RobiTip {
+        kind: TipKind::Starter,
+        text: "Welcome to aterm! Press Ctrl+, any time to open Settings.",
     },
     RobiTip {
         kind: TipKind::Starter,
         text: "Pick a cursor trail in Settings > Top Settings: phaser, fire, water, comet, beam...",
     },
+    #[cfg(target_os = "macos")]
     RobiTip {
         kind: TipKind::Starter,
         text: "Cmd+F opens find. Esc closes it again.",
+    },
+    #[cfg(not(target_os = "macos"))]
+    RobiTip {
+        kind: TipKind::Starter,
+        text: "Ctrl+Shift+F opens find. Esc closes it again.",
     },
     RobiTip {
         kind: TipKind::Starter,
@@ -305,7 +282,7 @@ pub const ROBI_TIPS: &[RobiTip] = &[
     },
     RobiTip {
         kind: TipKind::Aterm,
-        text: "Feeling blocky? Set display_font = \"pixel\" in aterm.toml.",
+        text: "Feeling blocky? Turn on Pixel in Settings > Text & Fonts.",
     },
     RobiTip {
         kind: TipKind::Aterm,
@@ -315,13 +292,14 @@ pub const ROBI_TIPS: &[RobiTip] = &[
         kind: TipKind::Aterm,
         text: "The Settings search box finds any knob — just start typing its name.",
     },
+    #[cfg(target_os = "macos")]
     RobiTip {
         kind: TipKind::Aterm,
         text: "aterm updates itself quietly — the Version menu shows what's staged.",
     },
     RobiTip {
         kind: TipKind::Aterm,
-        text: "Type dog in different languages. Chien! Perro! Hund! They all count.",
+        text: "After enough typing, dog, chien, perro or hund all summon the puppy.",
     },
     // ── terminal tricks ───────────────────────────────────────────────────
     RobiTip {
@@ -344,13 +322,20 @@ pub const ROBI_TIPS: &[RobiTip] = &[
         kind: TipKind::Terminal,
         text: "Ctrl+U wipes the whole line. Ctrl+W eats one word.",
     },
+    #[cfg(target_os = "macos")]
     RobiTip {
         kind: TipKind::Terminal,
         text: "Pipe anything into pbcopy to send it to your clipboard.",
     },
+    #[cfg(target_os = "macos")]
     RobiTip {
         kind: TipKind::Terminal,
         text: "open . opens the current folder in Finder.",
+    },
+    #[cfg(not(target_os = "macos"))]
+    RobiTip {
+        kind: TipKind::Terminal,
+        text: "Alt+. pastes the last argument of your previous command.",
     },
     RobiTip {
         kind: TipKind::Terminal,
@@ -415,9 +400,8 @@ pub struct RobiFrame {
     pub ladder: Option<RobiLadder>,
     /// Index into [`ROBI_TIPS`] while a bubble should be up.
     pub tip: Option<u16>,
-    /// Whether this scene is in motion. `false` = a static idle stand: the
-    /// host must NOT arm another wake for it (he resumes on the next natural
-    /// redraw — the zero-cost-idle contract).
+    /// Whether this scene is in motion. `false` is a static idle stand: the
+    /// host arms no wake for it.
     pub animating: bool,
 }
 
@@ -433,11 +417,9 @@ pub struct RobiSense {
     /// Handhold x-centers in grid px, left→right, `handhold_count` valid.
     pub handholds: [i32; MAX_HANDHOLDS],
     pub handhold_count: u8,
-    /// The window's TOP edge in grid px (≤ 0 — how far above row 0 the glass
-    /// really extends: `-(pad_top + head + strip_px)`). The brain clamps his
-    /// body and ladder into `win_top..win_bot` so no scene is ever clipped
-    /// by a window edge; a window too small to hold his body hides him
-    /// instead ([`RobiShow::frame`] → `None`).
+    /// The window's top edge in grid px (≤ 0: `-(pad_top + head + strip_px)`).
+    /// The brain clamps body and ladder into `win_top..win_bot`; a window too
+    /// small for his body hides him ([`RobiShow::frame`] → `None`).
     pub win_top: i32,
     /// The window's BOTTOM edge in grid px (≥ `rows·cell_h` — the bottom
     /// padding sits below the grid). The other half of the `win_top` clamp.
@@ -506,20 +488,15 @@ impl RobiShow {
         let margin = body_w / 2 + 2;
         let clamp_x = |x: i32| x.clamp(margin, (grid_w - margin).max(margin));
 
-        // THE WINDOW CLAMP (owner directive: "he must never be clipped by
-        // the window edge"). `win_top..win_bot` is the window's vertical
-        // extent in grid px; the fit test first — a window too small to hold
-        // his drawn body HIDES him (clamping a body that cannot fit would
-        // clip it at one edge or the other). Horizontal fit is against the
-        // grid (stricter than the padded window), the same margin `clamp_x`
-        // keeps.
+        // The window clamp: a window too small for his drawn body hides him
+        // (clamping would clip it). Horizontal fit is against the grid, the
+        // margin `clamp_x` keeps.
         let body_h = i32::from(body_size_px(&g).1);
         if grid_w < 2 * margin || body_h > sense.win_bot - sense.win_top {
             return None;
         }
-        // The vertical body clamp — the SAME top law as [`body_rect_px`]
-        // (anchor fraction, same rounding), so the drawn rect lands exactly
-        // inside `win_top..win_bot`, not approximately.
+        // Vertical body clamp with the same top law as [`body_rect_px`], so the
+        // drawn rect lands exactly inside `win_top..win_bot`.
         let clamp_anchor_y = |anchor_y: i32, anchor: RobiAnchor| -> i32 {
             let frac = match anchor {
                 RobiAnchor::Feet => FEET_FRAC,
@@ -529,9 +506,8 @@ impl RobiShow {
             let top = (anchor_y - off).clamp(sense.win_top, sense.win_bot - body_h);
             top + off
         };
-        // The ladder clamp: the emitter's segment stack overshoots `top_y`
-        // by up to a quarter tile ([`ladder_tile_px`] — its reach-the-bar
-        // slack), so the top holds that much inside the edge.
+        // Ladder clamp: the segment stack overshoots `top_y` by up to a quarter
+        // tile ([`ladder_tile_px`]), so the top keeps that much inside.
         let ladder_lh = i32::from(ladder_tile_px(&g).1);
         let clamp_ladder = |l: RobiLadder| RobiLadder {
             x: l.x,
@@ -542,10 +518,9 @@ impl RobiShow {
         // The "textbox" ground: the bottom edge of the caret's row.
         let ground = (i32::from(sense.cursor.0) + 1) * ch;
 
-        // Caret avoidance (module doc): a ground mark inside the exclusion
-        // zone around the caret column steps to the nearer zone edge, the far
-        // edge when `clamp_x` pulls the nearer one back inside, and stays put
-        // only when the grid is too narrow to honor either side.
+        // Caret avoidance: a ground mark inside the zone around the caret column
+        // steps to the nearer edge, the far edge when `clamp_x` pulls the nearer
+        // one back inside, and stays only when the grid is too narrow for both.
         let caret_cx = i32::from(sense.cursor.1) * cw + cw / 2;
         let clearance = caret_clearance(&g);
         let avoid_x = |x: i32| -> i32 {
@@ -572,18 +547,17 @@ impl RobiShow {
         let cycle = t / CYCLE_MS;
         let p = t % CYCLE_MS;
 
-        // Per-cycle stage marks (deterministic wander): where he does the
-        // jacks and where he rests, as grid fractions. Caret-avoided — these
-        // are exactly the spots he LOITERS on, and they double as the walk
-        // targets, so avoidance here steers the walks away too.
+        // Per-cycle stage marks (deterministic wander): where he does the jacks
+        // and rests, as grid fractions. Caret-avoided; they are also the walk
+        // targets, so the walks steer away too.
         let frac = |c: u64, salt: u64| -> f32 {
             (genome::mix(self.seed ^ c.rotate_left(11) ^ salt) % 1000) as f32 / 1000.0
         };
         let x_jacks = avoid_x(((0.30 + 0.40 * frac(cycle, 1)) * grid_w as f32) as i32);
         let x_rest = avoid_x(((0.50 + 0.40 * frac(cycle, 2)) * grid_w as f32) as i32);
-        // Where this cycle's opening walk starts: the previous cycle's rest
-        // spot (avoided the same way, so the cycle seam has no position pop)
-        // — or, on the very first cycle, the right edge (his entrance).
+        // Where this cycle's opening walk starts: the previous cycle's rest spot
+        // (avoided the same way, so the seam has no pop), or on the first cycle
+        // the right edge.
         let x_from = if cycle == 0 {
             (grid_w - margin).max(margin)
         } else {
@@ -699,10 +673,9 @@ impl RobiShow {
         } else if p < DROP_END {
             let pr = fraction(p, BARS_END, DROP_END);
             let y = lerp_i(hang_feet, ground, pr * pr);
-            // He hops off SIDEWAYS when the caret waits below the last hold —
-            // the drop lands on `x_land`, so the following stand needs no
-            // corrective shuffle (with the caret elsewhere this lerp is a
-            // constant and the drop is byte-identical to the straight fall).
+            // He hops off sideways when the caret is below the last hold, so the
+            // drop lands on `x_land` and the next stand needs no shuffle (with
+            // the caret elsewhere this is the straight fall).
             (
                 RobiGlyphId::RobiJacks0,
                 lerp_i(clamp_x(holds[n - 1]), x_land, pr),
@@ -783,14 +756,8 @@ fn ms_since(now: Instant, at: Instant) -> u64 {
 }
 
 /// Deterministic tip pick: filter the bank by `want`, index by the seed.
-///
-/// Allocation-free ON PURPOSE (PET-02): this runs on every frame of a tip
-/// window (~13.7 % of all presented frames while Robi is on), and the old
-/// form re-collected a `Vec` over the 27-entry const bank each call only to
-/// index it once and drop it. Two passes over `ROBI_TIPS` instead: count the
-/// matches, then walk to the k-th one. `filter` preserves source order, so
-/// the k-th survivor IS the `pool[k]` the Vec held — the returned index is
-/// bit-identical for every `(seed, want)` pair.
+/// Allocation-free (it runs every frame of a tip window): count the matches,
+/// then walk to the k-th, which preserves source order.
 fn pick_tip(seed: u64, want: impl Fn(TipKind) -> bool) -> u16 {
     let n = ROBI_TIPS.iter().filter(|tip| want(tip.kind)).count();
     debug_assert!(n > 0);
@@ -802,10 +769,8 @@ fn pick_tip(seed: u64, want: impl Fn(TipKind) -> bool) -> u16 {
         .nth(k)
     {
         Some((i, _)) => i as u16,
-        // `k < n` by construction, so this arm is reachable only when the
-        // bank has NO match at all — the same impossible state the old form
-        // met by indexing into an empty Vec (a panic there too; the
-        // tip-bank test pins every `want` at five-plus matches).
+        // `k < n`, so this is reachable only if the bank has no match; the
+        // tip-bank test pins every `want` at five or more.
         None => unreachable!("pick_tip: no ROBI_TIPS entry matches `want`"),
     }
 }
@@ -874,13 +839,10 @@ mod tests {
         }
     }
 
-    /// THE sizing law. A helper sized in ROWS is a speck in a fullscreen
-    /// window, so his height tracks the viewport — but only up to what the
-    /// shared atlas can hold. The ceiling is not cosmetic: a body wider than
-    /// `4·cell_h` (`CatBaker::slot_w`) is REFUSED by `host_tile`, and the
-    /// emitter then keeps re-drawing the last body that did bake — the robot
-    /// stops growing instead of failing loudly. Sweeping every reachable
-    /// viewport against the slot width is what makes that unfakeable.
+    /// The sizing law: height tracks the viewport up to what the shared atlas
+    /// holds. A body wider than `4·cell_h` (`CatBaker::slot_w`) is refused by
+    /// `host_tile` and the robot silently stops growing, so every reachable
+    /// viewport is swept against the slot width.
     #[test]
     fn art_rows_scales_with_the_window_and_always_fits_the_atlas_slot() {
         let g = |rows: u16| EffectGeom {
@@ -921,10 +883,8 @@ mod tests {
         }
     }
 
-    /// THE body law, pinned the way the pet pins `PetFrame::body_px`: the
-    /// SAME functions the emitter bakes and places by are what a host's
-    /// dismiss hit-box reads, so this test is what keeps the click box from
-    /// drifting off the drawn robot when the clamp or an anchor changes.
+    /// The body law: the functions the emitter bakes and places by are what the
+    /// host's dismiss hit-box reads, keeping the click box on the drawn robot.
     #[test]
     fn body_px_is_the_emitters_body_law() {
         let g = sense().geom; // 10×20 cells, 30 rows ⇒ art_rows = ART_ROWS
@@ -944,9 +904,8 @@ mod tests {
         };
         // Feet: top = anchor_y − round(64·FEET_FRAC) = 580 − 62; center-x.
         assert_eq!(body_px(&stand, &g), Some((477, 524, 518, 582)));
-        // Grip hangs him from the hands — a bar ABOVE row 0 keeps its
-        // negative overhang (the host's strip splice owns the shift):
-        // top = −10 − round(64·GRIP_FRAC) = −14.
+        // Grip hangs him from the hands; a bar above row 0 keeps its negative
+        // overhang (the strip splice owns the shift): top = −10 − round(64·GRIP_FRAC) = −14.
         let hang = RobiFrame {
             anchor: RobiAnchor::Grip,
             anchor_y: -10,
@@ -1006,9 +965,9 @@ mod tests {
         );
     }
 
-    /// The cycle hits every promised beat: textbox walk, jumping jacks with a
-    /// STARTER tip, a ladder that extends, a climb, monkey bars with a deeper
-    /// tip, the drop, and the rest stands.
+    /// The cycle hits every beat: prompt-line walk, jumping jacks with a starter
+    /// tip, the ladder extending, a climb, monkey bars with a deeper tip, the
+    /// drop, and the rest stands.
     #[test]
     fn the_rounds_hit_every_beat() {
         let base = t0();
@@ -1124,14 +1083,10 @@ mod tests {
         );
     }
 
-    /// THE WINDOW CLAMP (owner directive: never clipped by a window edge).
-    /// A shallow window — NO headroom above row 0, NO padding below the
-    /// grid, the bar line above the top edge (the chromeless-window band),
-    /// the caret on the TOP row so every ground scene would naturally poke
-    /// his head past the top — must keep his DRAWN body ([`body_px`], the
-    /// emitter's own placement law) and his ladder stack (top segment
-    /// overshoot included, [`ladder_tile_px`]) fully inside the window, in
-    /// every scene of every cycle.
+    /// The window clamp: a shallow window (no headroom above row 0, no padding
+    /// below, the bar line above the top edge, the caret on the top row) keeps
+    /// his drawn body ([`body_px`]) and ladder stack (top overshoot included,
+    /// [`ladder_tile_px`]) inside the window in every scene of every cycle.
     #[test]
     fn every_scene_stays_inside_a_shallow_window() {
         let base = t0();
@@ -1166,9 +1121,8 @@ mod tests {
         }
     }
 
-    /// A window too small to hold his body HIDES him — `frame` → `None`, no
-    /// clipped sliver — and he walks right back once the window can hold him
-    /// again (still born; hiding is per-evaluation, not a state change).
+    /// A window too small for his body hides him (`frame` → `None`), and he
+    /// returns once it can hold him (hiding is per-evaluation, not state).
     #[test]
     fn a_window_too_small_to_hold_him_hides_him() {
         let base = t0();
@@ -1204,10 +1158,9 @@ mod tests {
         }
     }
 
-    /// CARET AVOIDANCE: every scene where he LOITERS on the ground — the
-    /// jumping jacks, both idle stands, the long rest — keeps his body center
-    /// at least [`caret_clearance`] from the caret column's center, wherever
-    /// the caret is and whichever cycle's marks are in play.
+    /// Caret avoidance: every ground loiter (jacks, idle stands, rest) keeps his
+    /// body centre at least [`caret_clearance`] from the caret column's centre,
+    /// for any caret and any cycle's marks.
     #[test]
     fn stationary_scenes_stay_out_of_the_typists_column() {
         let base = t0();
@@ -1233,10 +1186,9 @@ mod tests {
         }
     }
 
-    /// CARET AVOIDANCE is PURE and keeps the zero-wake idle contract: park
-    /// the caret exactly where he would otherwise rest and he stands aside —
-    /// still `animating == false`, and two probes of the identical sense
-    /// seconds apart evaluate to the identical static frame.
+    /// Caret avoidance is pure and keeps the zero-wake idle contract: with the
+    /// caret where he would rest he stands aside, still `animating == false`,
+    /// and two probes seconds apart give the same static frame.
     #[test]
     fn a_caret_parked_under_a_resting_robi_displaces_him_purely() {
         let base = t0();
@@ -1269,9 +1221,8 @@ mod tests {
         );
     }
 
-    /// The ladder/climb arc is EXEMPT from caret avoidance: the ladder must
-    /// stay planted on `holds[0]` even with the caret right beneath it (up
-    /// there he is above the text anyway).
+    /// The ladder/climb arc is exempt from caret avoidance: the ladder stays
+    /// planted on `holds[0]` even with the caret beneath it.
     #[test]
     fn the_ladder_stays_planted_even_with_the_caret_beneath_it() {
         let base = t0();

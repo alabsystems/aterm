@@ -3,12 +3,18 @@
 //
 //! Derived TLA+: one source of truth for a state machine, two faithful backends.
 //!
+//! "Derived" here means the spec and the interpreter are generated from ONE
+//! AUTHORED model. It does not mean derived from the code: the model is written
+//! by a person (as a [`Model`] value or through `ty_model!`), so it can drift
+//! from the code it describes, and Tier 1 below is what ties them. Deriving a
+//! model from the code itself is Trust's job (its D-11(e); design only in the
+//! Trust repo's `docs/design/2026-09-29-descriptor-protocols-as-compiler-errors.md`).
+//!
 //! The specs in `aterm-spec-models/specs/` are hand-written `.tla` files — they
-//! can drift from the code. This module is the *derivation half* of
-//! `docs/RFC-ty-embed-derived-tla.md`: a [`Model`] is a first-class Rust value
-//! describing a bounded state machine (constants, variables, guarded actions,
-//! invariants) over a small expression language [`Expr`]. From that ONE source we
-//! generate BOTH:
+//! can drift from the code. This module is the alternative to them: a
+//! [`Model`] is a first-class Rust value describing a bounded state machine
+//! (constants, variables, guarded actions, invariants) over a small
+//! expression language [`Expr`]. From that ONE source we generate BOTH:
 //!
 //!   - [`Model::to_tla`] / [`Model::to_cfg`] — a complete, `ty`-checkable TLA+
 //!     module + config (the embedded spec), and
@@ -27,6 +33,39 @@
 //! The expression language is intentionally small (what the bounded-ring model
 //! needs); it grows as real models demand. The translation is mechanical:
 //! `<=` ⇒ `=<`, `if/else` ⇒ `IF/THEN/ELSE`, `&&`/`||` ⇒ `/\`/`\/`.
+//!
+//! # The workflow, and what each tier proves
+//!
+//! `AGENTS.md` ("Formal models are AUTHORED") holds the steps; this is what each
+//! step's result means. Every result must say which tier it reached.
+//!
+//! - **Tier 0 — the model.** `ty check` (or the in-process interpreter) explores
+//!   the generated spec exhaustively within its bounds. It proves a property *of
+//!   the model*, nothing about the code. Non-vacuity comes from a `Buggy` branch
+//!   per invariant that the checker must refute
+//!   (`crates/aterm-spec/tests/derived_ring_ty.rs` is the pattern).
+//! - **Tier 1 — conformance.** A crate's `tests/conformance_*.rs` drives the real
+//!   code, projects each reachable state onto the model's variables, and checks
+//!   every observed transition against the same model: through its own guards and
+//!   invariants, or with `ty trace validate` against [`Model::transition_spec`],
+//!   plus a negative control that must be rejected
+//!   (`aterm-buffer/tests/conformance_eventlog.rs` is the first). It binds model
+//!   and executable over the states the test reaches, not over all inputs. The
+//!   projection is written by hand and is the soundness pin: a wrong one can make
+//!   conformance pass vacuously, which is why the negative control is required.
+//! - **Tier 2 — refinement for all inputs** ("every real transition is allowed by
+//!   the model") is not built here. It is Trust's model-to-program refinement
+//!   work.
+//!
+//! `ty_model!` (`aterm-spec-macros`) is sugar over this module: a macro-written
+//! model produces the byte-identical spec of the equivalent hand-built [`Model`]
+//! (`crates/aterm-spec/tests/macro_ring.rs` pins this). Known limits: `Expr` is
+//! scalar (bounded integers and booleans), so function- or array-valued state
+//! needs an `Expr` extension first; bounds are finite; and a single-action model
+//! must not name its action `Append`, which clashes with a `ty` Sequences builtin.
+//! (`ty trace validate` checks `Next` on every transition, not only the first,
+//! as re-verified against the `ty` 0.10.0 source on 2026-06-18; pinning `Init`
+//! to each predecessor keeps each transition independently checkable.)
 
 use std::collections::BTreeMap;
 
@@ -52,7 +91,7 @@ impl Value {
         trust_verify,
         trust::contract_panic(message_contains = "expected Int, got Bool")
     )]
-    fn as_int(self) -> i64 {
+    pub(crate) fn as_int(self) -> i64 {
         match self {
             Value::Int(i) => i,
             // Unreachable for well-typed models (see above): fail closed.
@@ -63,7 +102,7 @@ impl Value {
         trust_verify,
         trust::contract_panic(message_contains = "expected Bool, got Int")
     )]
-    fn as_bool(self) -> bool {
+    pub(crate) fn as_bool(self) -> bool {
         match self {
             Value::Bool(b) => b,
             // Unreachable for well-typed models (see above): fail closed.
@@ -535,13 +574,6 @@ impl Model {
         v
     }
 
-    /// Constants as an evaluation environment base.
-    // Skip: same audited `collect::<BTreeMap>` alloc class as `init_state`.
-    #[cfg_attr(trust_verify, trust::skip)]
-    fn const_env(&self) -> BTreeMap<&'static str, i64> {
-        self.consts.iter().copied().collect()
-    }
-
     /// The evaluation environment for `state`: the model's constants, then the
     /// state's variables on top (so a state variable SHADOWS a same-named
     /// constant — exactly the order the by-name entry points have always used).
@@ -555,12 +587,22 @@ impl Model {
     /// per (state, invariant). One full-registry BMC sweep built ~1.6M throwaway
     /// maps this way (~109k states x ~8.9 actions + ~5.8 invariants); hoisting it
     /// takes the sweep from 2.54 s to 0.75 s in release, byte-identical results.
-    // Skip: same audited `collect`/`extend` alloc class as `const_env` and
-    // `init_state`. Model-derivation machinery, same tier as `successors`.
+    // Skip: the audited `BTreeMap` clone/entry alloc class of `init_state`.
+    // Model-derivation machinery, same tier as `successors`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn eval_env(&self, state: &BTreeMap<&'static str, i64>) -> BTreeMap<&'static str, i64> {
-        let mut env = self.const_env();
-        env.extend(state.iter().map(|(k, v)| (*k, *v)));
+        // The state's map copied whole (a structural clone compares no keys),
+        // then each constant the state does not bind. The same map as the
+        // constants collected and then extended by the state: a state variable still shadows a
+        // same-named constant, and of two same-named constants the LAST still
+        // wins (hence the reverse walk with `or_insert`). Building it the other
+        // way round re-inserted every state variable by name, string-comparing
+        // it against a dozen others, and `memcmp` led the profile of every
+        // by-name walk (2026-10-06).
+        let mut env = state.clone();
+        for (k, v) in self.consts.iter().rev() {
+            env.entry(*k).or_insert(*v);
+        }
         env
     }
 
@@ -581,29 +623,29 @@ impl Model {
         self.render(&const_names, &init)
     }
 
-    /// Generate the module with a PARAMETERIZED `Init`: each variable starts at a
-    /// fresh CONSTANT `<var>_init`. This lets any predecessor state be the start —
-    /// used for strict per-transition conformance against real code (Tier 1):
-    /// validating a two-step trace `[prev, next]` with `Init` pinned to `prev`
-    /// strictly checks that `Next` admits the real `prev -> next` transition.
+    /// Generate the module with an OPEN `Init` (`Init == TRUE`): any state may be
+    /// the start. Used for strict per-transition conformance against real code
+    /// (Tier 1): a two-step trace `[prev, next]` starts wherever its step 0 says,
+    /// so validating it strictly checks that `Next` admits the real
+    /// `prev -> next` transition.
+    ///
+    /// Open since 2026-10-01. It was PARAMETERIZED — `Init == v = v_init` with a
+    /// CONSTANT `<var>_init` per variable, which [`Model::transition_cfg`] pinned
+    /// to `prev` — and on step 0 that is the same tautology `TRUE` is, since the
+    /// trace's step 0 and the pin were both rendered from `prev`. Actions, `Next`
+    /// and `vars` come from the one shared renderer, and `<var>_init` appeared
+    /// only in `Init`, so step 1 is judged exactly as before. What the pin cost
+    /// was a cfg per `prev`: aterm-agent's footer suite handed `ty` 2,688
+    /// distinct cfgs for one byte-identical spec, where the open form needs one
+    /// per `(model, overrides)`.
     pub fn transition_spec(&self) -> String {
-        let mut const_names: Vec<String> =
-            self.consts.iter().map(|(n, _)| (*n).to_string()).collect();
-        for v in &self.vars {
-            const_names.push(format!("{}_init", v.name));
-        }
-        let init = self
-            .vars
-            .iter()
-            .map(|v| format!("{} = {}_init", v.name, v.name))
-            .collect::<Vec<_>>()
-            .join(" /\\ ");
-        self.render(&const_names, &init)
+        let const_names: Vec<String> = self.consts.iter().map(|(n, _)| (*n).to_string()).collect();
+        self.render(&const_names, "TRUE")
     }
 
     /// Shared renderer: emit the module given the CONSTANT names and the `Init`
     /// body. Actions, `Next`, `Spec`, and invariants are identical across the
-    /// concrete and parameterized-`Init` forms — one source for both.
+    /// concrete and open-`Init` forms — one source for both.
     // Skip: the `filter(..).collect()` chain drives closure bodies that are
     // absent callees, plus String/Vec allocs. Spec-model TLA+ rendering,
     // same tier as `eval`/`to_tla`.
@@ -715,17 +757,14 @@ impl Model {
 
     /// Config for [`transition_spec`](Self::transition_spec): binds each model
     /// constant (with optional `overrides`, e.g. the real ring capacity instead of
-    /// the small exhaustive-check bound) and pins each `<var>_init` to `init`. Used
-    /// for per-transition conformance — `ty trace validate --spec` then strictly
-    /// checks the real `prev -> next` step against the derived `Next`.
-    // Skip: BTreeSet/BTreeMap keyed build + `Extend`/format (absent std
-    // bodies). Spec-model cfg emission, same tier as `to_tla`.
+    /// the small exhaustive-check bound). Used for per-transition conformance —
+    /// `ty trace validate --spec` then strictly checks the real `prev -> next`
+    /// step against the derived `Next`. It names no state: the spec's `Init` is
+    /// open, so one cfg serves every transition of a `(model, overrides)`.
+    // Skip: `Extend`/format (absent std bodies). Spec-model cfg emission, same
+    // tier as `to_tla`.
     #[cfg_attr(trust_verify, trust::skip)]
-    pub fn transition_cfg(
-        &self,
-        init: &BTreeMap<&'static str, i64>,
-        overrides: &[(&'static str, i64)],
-    ) -> String {
+    pub fn transition_cfg(&self, overrides: &[(&'static str, i64)]) -> String {
         let mut s = String::new();
         for (n, default) in &self.consts {
             let val = overrides
@@ -734,10 +773,6 @@ impl Model {
                 .map(|(_, v)| *v)
                 .unwrap_or(*default);
             s.push_str(&format!("CONSTANT {n} = {val}\n"));
-        }
-        for v in &self.vars {
-            let val = init.get(v.name).copied().unwrap_or(v.init);
-            s.push_str(&format!("CONSTANT {}_init = {val}\n", v.name));
         }
         s.push_str("SPECIFICATION Spec\nCHECK_DEADLOCK FALSE\n");
         s
@@ -988,6 +1023,8 @@ mod models_atpkg_session_index_retry;
 mod models_atpkg_vendor_pending;
 mod models_broadcast_checkpoint;
 mod models_broadcast_head;
+mod models_chrome_regrow;
+mod models_consent;
 mod models_console_life;
 mod models_control_bind_retry;
 mod models_control_preparation;
@@ -996,6 +1033,9 @@ mod models_crash_journal;
 mod models_desktop_alert_debt;
 mod models_driver_geometry;
 mod models_effects;
+mod models_exceptions_digest;
+mod models_exceptions_ends;
+mod models_exceptions_once;
 mod models_fabric_enable;
 mod models_fabric_outbox_wake;
 mod models_foreground_handback;
@@ -1005,6 +1045,9 @@ mod models_gui;
 mod models_harness;
 mod models_harness_goal;
 mod models_harness_host;
+mod models_harness_policy_writer;
+mod models_harness_progress;
+mod models_harness_state_collection;
 mod models_input;
 mod models_keeper;
 mod models_lights;
@@ -1022,6 +1065,7 @@ mod models_program_resolution;
 mod models_rainbow_composer_newline;
 mod models_rainbow_continuity;
 mod models_rainbow_short_wrap;
+mod models_relaunch_prompt;
 mod models_release;
 mod models_release_publish_once;
 mod models_render;
@@ -1038,19 +1082,26 @@ mod models_screen_generation;
 mod models_session;
 mod models_subscribe_announcement;
 mod models_supervise;
+mod models_supervise_accounts;
 mod models_title_summary;
+mod models_trust_facts;
 mod models_typed_rekey;
 mod models_update;
 mod models_update_activation_observation;
+mod models_update_carried_health;
 mod models_update_check_coordination;
 mod models_update_editor_carry;
 mod models_update_environment_repair;
 mod models_update_history_carry;
+mod models_update_launched_dial_wait;
 mod models_update_parallel_attach;
+mod models_update_parent_diet;
 mod models_update_precommit_input;
 mod models_update_retired_intent;
+mod models_update_roster_freshness;
 mod models_update_settings_draft_carry;
 mod models_update_successor_warm;
+mod models_update_trial_give_back;
 mod models_update_web_cache;
 mod models_update_window_show;
 
@@ -1075,6 +1126,8 @@ pub use models_atpkg_session_index_retry::atpkg_session_index_retry_model;
 pub use models_atpkg_vendor_pending::atpkg_vendor_pending_check_model;
 pub use models_broadcast_checkpoint::broadcast_cursor_checkpoint_model;
 pub use models_broadcast_head::broadcast_head_subscription_model;
+pub use models_chrome_regrow::{chrome_regrow_floor_liveness, chrome_regrow_floor_model};
+pub use models_consent::{debugger_access_change_liveness, debugger_access_change_model};
 pub use models_console_life::*;
 pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
 pub use models_control_preparation::native_update_control_preparation_model;
@@ -1083,6 +1136,9 @@ pub use models_crash_journal::crash_journal_claim_model;
 pub use models_desktop_alert_debt::desktop_alert_debt_model;
 pub use models_driver_geometry::{driver_geometry_liveness, driver_geometry_model};
 pub use models_effects::*;
+pub use models_exceptions_digest::exceptions_digest_model;
+pub use models_exceptions_ends::{exceptions_digest_ends_liveness, exceptions_digest_ends_model};
+pub use models_exceptions_once::exceptions_once_model;
 pub use models_fabric_enable::*;
 pub use models_fabric_outbox_wake::{
     fabric_outbox_wake_model, fabric_reconnect_backoff_model, fabric_refill_retry_model,
@@ -1096,10 +1152,17 @@ pub use models_gui::*;
 pub use models_harness::*;
 pub use models_harness_goal::*;
 pub use models_harness_host::{
-    harness_codex_exit_witness_model, harness_exit_record_model, harness_handoff_claim_model,
-    harness_leave_model, harness_relaunch_on_exit_model, harness_restored_carry_model,
-    harness_restored_first_attempt_model, harness_upgrade_look_model,
-    harness_worker_lifecycle_model,
+    harness_codex_exit_witness_model, harness_commit_owed_model, harness_exit_record_model,
+    harness_handoff_claim_model, harness_leave_model, harness_relaunch_on_exit_model,
+    harness_restored_carry_model, harness_restored_first_attempt_model, harness_upgrade_age_model,
+    harness_upgrade_look_model, harness_worker_lifecycle_model,
+};
+pub use models_harness_policy_writer::{
+    harness_policy_one_writer_liveness, harness_policy_one_writer_model,
+};
+pub use models_harness_progress::*;
+pub use models_harness_state_collection::{
+    harness_upgrade_state_collection_liveness, harness_upgrade_state_collection_model,
 };
 pub use models_input::input_unread_gate_model;
 pub use models_keeper::{
@@ -1122,11 +1185,12 @@ pub use models_program_resolution::program_resolution_retry_model;
 pub use models_rainbow_composer_newline::rainbow_composer_newline_gate_model;
 pub use models_rainbow_continuity::*;
 pub use models_rainbow_short_wrap::rainbow_short_wrap_park_model;
+pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
 pub use models_release::*;
 pub use models_release_publish_once::release_publish_once_model;
 pub use models_render::*;
 pub use models_rendezvous_grant::native_update_rendezvous_grant_model;
-pub use models_resize_render::resize_render_model;
+pub use models_resize_render::{repaint_nudge_liveness, repaint_nudge_model, resize_render_model};
 pub use models_resize_row_reuse::resize_row_reuse_model;
 pub use models_ribbon_follow::*;
 pub use models_ribbon_release_restoration::*;
@@ -1138,16 +1202,26 @@ pub use models_screen_generation::observation_screen_generation_model;
 pub use models_session::*;
 pub use models_subscribe_announcement::subscribe_announcement_order_model;
 pub use models_supervise::{
-    supervisor_break_offer_model, supervisor_claim_model, supervisor_codex_rate_nudge_liveness,
-    supervisor_codex_rate_nudge_model, supervisor_decline_keys_model, supervisor_done_check_model,
-    supervisor_focus_choice_model, supervisor_host_turn_end_model, supervisor_network_wall_model,
-    supervisor_question_answer_model, supervisor_stall_remedy_model, supervisor_turn_end_model,
+    supervisor_box_ask_model, supervisor_break_offer_model, supervisor_claim_model,
+    supervisor_codex_rate_nudge_liveness, supervisor_codex_rate_nudge_model,
+    supervisor_decline_keys_model, supervisor_done_check_model, supervisor_focus_choice_model,
+    supervisor_host_turn_end_model, supervisor_model_switch_liveness,
+    supervisor_model_switch_model, supervisor_network_wall_model, supervisor_question_answer_model,
+    supervisor_question_text_model, supervisor_stall_remedy_model, supervisor_survey_press_model,
+    supervisor_turn_end_model, supervisor_usage_wall_liveness, supervisor_usage_wall_model,
     upgrade_attended_turn_end_model, upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
 };
+pub use models_supervise_accounts::{
+    supervisor_account_rotation_liveness, supervisor_account_rotation_model,
+    supervisor_limit_reset_claim_liveness, supervisor_limit_reset_confirmation_liveness,
+    supervisor_limit_reset_model, supervisor_usage_probe_liveness, supervisor_usage_probe_model,
+};
 pub use models_title_summary::*;
+pub use models_trust_facts::trust_facts_reuse_model;
 pub use models_typed_rekey::typed_rekey_model;
 pub use models_update::*;
 pub use models_update_activation_observation::native_update_activation_observation_model;
+pub use models_update_carried_health::native_update_carried_health_model;
 pub use models_update_check_coordination::{
     native_update_boot_health_lock_model, native_update_check_join_model,
     native_update_check_receipt_model, native_update_check_wait_model,
@@ -1156,18 +1230,26 @@ pub use models_update_check_coordination::{
 pub use models_update_editor_carry::native_update_editor_carry_model;
 pub use models_update_environment_repair::native_update_environment_repair_model;
 pub use models_update_history_carry::native_update_history_carry_model;
+pub use models_update_launched_dial_wait::{
+    native_update_launched_dial_wait_liveness, native_update_launched_dial_wait_model,
+};
 pub use models_update_parallel_attach::{
     native_update_successor_attach_liveness, native_update_successor_attach_model,
+};
+pub use models_update_parent_diet::{
+    native_update_speculative_sidecar_liveness, native_update_speculative_sidecar_model,
 };
 pub use models_update_precommit_input::native_update_precommit_input_model;
 pub use models_update_retired_intent::{
     native_update_failure_target_model, native_update_retired_intent_model,
 };
+pub use models_update_roster_freshness::native_update_roster_freshness_model;
 pub use models_update_settings_draft_carry::native_update_settings_draft_carry_model;
 pub use models_update_successor_warm::{
     native_update_successor_warm_before_claim_liveness,
     native_update_successor_warm_before_claim_model,
 };
+pub use models_update_trial_give_back::native_update_trial_give_back_model;
 pub use models_update_web_cache::native_update_web_cache_model;
 pub use models_update_window_show::native_update_window_show_model;
 
@@ -1763,6 +1845,9 @@ mod tests {
     fn ring_generates_expected_tla() {
         let tla = ring_model().to_tla();
         // Spot-check the mechanical translation (<= => =<, if => IF/THEN/ELSE).
+        // The MODULE lines here and below pin the kernel family's derived twins
+        // by name (Evict.tla is `Ring`; Kernel, Subscribe, Snapshot, Transact),
+        // as the deleted tests/derived_coverage.rs did.
         assert!(tla.contains("---- MODULE Ring ----"), "{tla}");
         assert!(tla.contains("CONSTANT MaxSeq, Cap, Buggy"), "{tla}");
         assert!(tla.contains("VARIABLES seq, lo"), "{tla}");
@@ -1792,30 +1877,22 @@ mod tests {
     }
 
     #[test]
-    fn transition_spec_parameterizes_init_but_shares_the_action() {
+    fn transition_spec_opens_init_but_shares_the_action() {
         let m = ring_model();
         let tla = m.transition_spec();
-        assert!(
-            tla.contains("CONSTANT MaxSeq, Cap, Buggy, seq_init, lo_init"),
-            "{tla}"
-        );
-        assert!(
-            tla.contains("Init == seq = seq_init /\\ lo = lo_init"),
-            "{tla}"
-        );
+        assert!(tla.contains("CONSTANT MaxSeq, Cap, Buggy\n"), "{tla}");
+        assert!(tla.contains("Init == TRUE\n"), "{tla}");
         // The action / Next / Spec are the SAME source as the concrete form.
         assert!(
             tla.contains("Push == seq =< MaxSeq - 1 /\\ seq' = seq + 1 /\\ lo' = (IF"),
             "{tla}"
         );
-        let mut init = BTreeMap::new();
-        init.insert("seq", 42i64);
-        init.insert("lo", 1i64);
-        let cfg = m.transition_cfg(&init, &[("Cap", 65536), ("MaxSeq", 1_000_000)]);
-        assert!(cfg.contains("CONSTANT Cap = 65536"), "{cfg}");
-        assert!(cfg.contains("CONSTANT MaxSeq = 1000000"), "{cfg}");
-        assert!(cfg.contains("CONSTANT seq_init = 42"), "{cfg}");
-        assert!(cfg.contains("CONSTANT lo_init = 1"), "{cfg}");
+        let cfg = m.transition_cfg(&[("Cap", 65536), ("MaxSeq", 1_000_000)]);
+        assert_eq!(
+            cfg,
+            "CONSTANT MaxSeq = 1000000\nCONSTANT Cap = 65536\nCONSTANT Buggy = 0\n\
+             SPECIFICATION Spec\nCHECK_DEADLOCK FALSE\n"
+        );
     }
 
     #[test]
@@ -1841,6 +1918,7 @@ mod tests {
     #[test]
     fn subscribe_emits_parenthesized_disjunction_guard_and_eq() {
         let tla = subscribe_model().to_tla();
+        assert!(tla.contains("---- MODULE Subscribe ----"), "{tla}");
         // The disjunctive guard MUST be parenthesized, else `/\` captures it.
         assert!(
             tla.contains(
@@ -1888,6 +1966,7 @@ mod tests {
     #[test]
     fn transact_emits_conjunctive_guards() {
         let tla = transact_model().to_tla();
+        assert!(tla.contains("---- MODULE Transact ----"), "{tla}");
         assert!(
             tla.contains(
                 "CommitClean == active = 1 /\\ seq = tbase /\\ seq =< MaxSeq - K /\\ \
@@ -1905,6 +1984,7 @@ mod tests {
     #[test]
     fn kernel_and_snapshot_generate_expected_tla() {
         let k = kernel_model().to_tla();
+        assert!(k.contains("---- MODULE Kernel ----"), "{k}");
         assert!(
             k.contains("Emit == seq =< MaxSeq - 1 /\\ count' = count + 1 /\\ seq' = (IF Buggy = 1 THEN seq + 2 ELSE seq + 1)"),
             "{k}"
@@ -1912,6 +1992,7 @@ mod tests {
         assert!(k.contains("Next == Emit"), "{k}");
         assert!(k.contains("SeqIsCount == seq = count"), "{k}");
         let s = snapshot_model().to_tla();
+        assert!(s.contains("---- MODULE Snapshot ----"), "{s}");
         assert!(
             s.contains("Write == seq =< MaxSeq - 1 /\\ seq' = seq + 1 /\\ leaked' = (IF Buggy = 1 /\\ snapped = 1 THEN 1 ELSE leaked) /\\ UNCHANGED << snapped >>"),
             "{s}"

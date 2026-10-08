@@ -39,9 +39,26 @@ use aterm_render::deco::{
     pattern_spans_into, resolve_deco_metrics,
 };
 use aterm_render::{
-    ColumnGlyph, Renderer, Theme, strike_overline_rects, undercurl_coverage, undercurl_supported,
-    undercurl_tile_col, underline_band, underline_rects,
+    ColumnGlyph, Renderer, Theme, overline_rect, strike_rect, undercurl_coverage,
+    undercurl_supported, undercurl_tile_col, underline_band, underline_rects_into,
 };
+
+/// The rects one `underline_rects_into` emission pushes, as a fresh `Vec`.
+#[allow(clippy::too_many_arguments)]
+fn underline_rects(
+    style: UnderlineStyle,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    cell_w: usize,
+    cell_h: usize,
+    deco: DecoMetrics,
+    curly_mask: bool,
+) -> Vec<[usize; 4]> {
+    let mut out = Vec::new();
+    underline_rects_into(&mut out, style, x0, y0, w, cell_w, cell_h, deco, curly_mask);
+    out
+}
 
 // ---------------------------------------------------------------------------
 // (4) clamping — decoration bands always inside the cell, for ALL font tables.
@@ -254,7 +271,7 @@ fn resolved_bands_conform_to_the_deco_band_containment_model() {
 //     the `deco_phase` ty model).
 // ---------------------------------------------------------------------------
 
-/// Paint the rects of one `underline_rects` emission into a coverage grid.
+/// Paint the rects of one underline emission into a coverage grid.
 fn paint(grid: &mut [Vec<bool>], rects: &[[usize; 4]]) {
     for &[x, y, w, h] in rects {
         for row in grid.iter_mut().skip(y).take(h) {
@@ -667,8 +684,9 @@ fn curly_gates_on_the_shared_mask_predicate() {
 // CROSS-CUTTING THEOREM (c) — DECORATION NEVER CLIPS.
 //
 // Every rectangle any decoration WRITE PATH emits — the underline emitter
-// (`underline_rects`, all six `UnderlineStyle`s incl. the AA-masked and legacy
-// square-wave curl) and the strike/overline emitter (`strike_overline_rects`) —
+// (`underline_rects_into`, all six `UnderlineStyle`s incl. the AA-masked and
+// legacy square-wave curl) and the strike/overline emitters (`strike_rect`,
+// `overline_rect`) —
 // stays entirely inside its run's band: horizontally within `[x0, x0+w)` and
 // vertically within `[y0, y0+cell_h)`. No decoration ever bleeds into the row
 // above/below or past the drawn run, for ANY style, ANY (integer) DecoMetrics —
@@ -751,22 +769,24 @@ fn decoration_writes_stay_within_the_run_band() {
                                     checked += 1;
                                 }
                                 // Strike + overline share the same containment law.
-                                for (st, ov) in [(true, false), (false, true), (true, true)] {
-                                    let rects =
-                                        strike_overline_rects(st, ov, x0, y0, w, cell_h, dm);
-                                    for r in &rects {
-                                        assert_contained(
-                                            *r,
-                                            x0,
-                                            y0,
-                                            w,
-                                            cell_h,
-                                            UnderlineStyle::None,
-                                            false,
-                                        );
-                                        if r[1] == y0 {
-                                            top_reached = true;
-                                        }
+                                for r in [
+                                    strike_rect(x0, y0, w, cell_h, dm),
+                                    overline_rect(x0, y0, w, cell_h, dm),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                {
+                                    assert_contained(
+                                        r,
+                                        x0,
+                                        y0,
+                                        w,
+                                        cell_h,
+                                        UnderlineStyle::None,
+                                        false,
+                                    );
+                                    if r[1] == y0 {
+                                        top_reached = true;
                                     }
                                 }
                             }

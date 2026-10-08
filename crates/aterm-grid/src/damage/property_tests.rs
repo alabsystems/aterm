@@ -5,9 +5,6 @@
 //! Additional acceptance-level tests for damage tracking.
 
 use super::*;
-use proptest::collection::vec;
-use proptest::prelude::*;
-use proptest::test_runner::Config as ProptestConfig;
 use std::collections::BTreeMap;
 
 #[test]
@@ -39,23 +36,19 @@ fn merged_damage_iterator_full_damage_yields_single_rect() {
     assert_eq!(rects, vec![DamageRect::new(0, 6, 0, 20)]);
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        failure_persistence: None,
-        .. ProptestConfig::default()
-    })]
-
-    #[test]
-    fn mark_random_cells_tracks_expected_rows_and_bounds(
-        cells in vec((0u16..64, 0u16..128), 0..256)
-    ) {
-        const ROWS: u16 = 64;
-        const COLS: u16 = 128;
-
+/// Random cell marks: the damaged rows and per-row column bounds are exactly
+/// the rows marked and the min/max column marked in each.
+#[test]
+fn mark_random_cells_tracks_expected_rows_and_bounds() {
+    const ROWS: u16 = 64;
+    const COLS: u16 = 128;
+    let mut rng = aterm_spec::rng::XorShift::new(0xDA3A_6E00_0BAD_F00D);
+    let mut next = move |n: u64| rng.below(n);
+    for _ in 0..256 {
         let mut damage = Damage::new(ROWS);
         let mut expected = BTreeMap::<u16, (u16, u16)>::new();
-
-        for (row, col) in cells {
+        for _ in 0..next(256) {
+            let (row, col) = (next(64) as u16, next(128) as u16);
             damage.mark_cell(row, col);
             expected
                 .entry(row)
@@ -68,7 +61,7 @@ proptest! {
 
         let expected_rows: Vec<_> = expected.keys().copied().collect();
         let actual_rows: Vec<_> = damage.damaged_rows(ROWS).collect();
-        prop_assert_eq!(actual_rows, expected_rows);
+        assert_eq!(actual_rows, expected_rows);
 
         let expected_bounds: Vec<_> = expected
             .iter()
@@ -76,6 +69,6 @@ proptest! {
             .filter(|bounds| !bounds.is_empty())
             .collect();
         let actual_bounds: Vec<_> = damage.iter_bounds(ROWS, COLS).collect();
-        prop_assert_eq!(actual_bounds, expected_bounds);
+        assert_eq!(actual_bounds, expected_bounds);
     }
 }

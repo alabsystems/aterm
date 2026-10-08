@@ -1,0 +1,28 @@
+# claude-code 2.1.283 · MEASURED 2026-09-28 21:22 PDT on the owner's tab 1 (the same replay, 41 minutes after the sibling `…-wrapup-waiting-measured.txt`): the turn has ENDED on the session limit — a `⏺ Goal check-in: background work still running` cause row, the `⎿` block, the `Goal paused` echo, a second workflow notice with its own `⎿` block, the done row `✻ Churned for 4h 18m 23s · done 9:22 PM · 1 shell still running`, the composer with Claude's dim suggestion (its words replaced) and, under it, the wrap-up banner AND the vendor's `While you wait` row over the bypass footer's `· 1 shell ·`. The worker's prose and the workflow's title are replaced by neutral text; every vendor row is byte for byte.
+⏺ The workflows are still running; I will report when they finish.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+⏺ Goal check-in: background work still running
+  ⎿ You've hit your session limit · resets 9:50pm (America/Los_Angeles)
+     Use your limit reset to reset it now: clau.de/reset
+     /usage-credits to finish what you’re working on.
+
+⏺ Goal paused · usage limit reached · send a message after it resets to continue
+
+✻ Waiting for 1 dynamic workflow to finish
+
+⏺ Dynamic workflow "an example wave with a title long enough to wrap onto a second row of the
+transcript, as the measured one did" completed · 4h 18m 23s
+  ⎿ You've hit your session limit · resets 9:50pm (America/Los_Angeles)
+     Use your limit reset to reset it now: clau.de/reset
+     /usage-credits to finish what you’re working on.
+
+✻ Churned for 4h 18m 23s · done 9:22 PM · 1 shell still running
+                                                                                 ✔ Update installed · Restart to update◎ /goal active (1d)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xhigh ─
+❯ commit and align with main, then continue
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Usage limit reached · limit resets 9:50pm · clau.de/wrap-up · /upgrade to keep using Claude Code
+  ⚠ While you wait, start a new cloud session with a $250 credit
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage

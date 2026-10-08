@@ -2,13 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Character and line insertion, deletion, and erase operations.
+//! Character, line and column insertion, deletion and erase.
 //!
-//! Character-level: ICH (Insert Character), DCH (Delete Character),
-//! ECH (Erase Character) — operate within a single row at the cursor.
-//!
-//! Line-level: IL (Insert Line), DL (Delete Line) — operate within
-//! the scroll region, shifting rows vertically.
+//! - Character: ICH, DCH, ECH, within the cursor row.
+//! - Line: IL, DL, shifting rows within the scroll region.
+//! - Column: DECIC, DECDC, SL, SR, DECBI, DECFI, shifting columns within the
+//!   scroll region and horizontal margins.
 
 use super::{Grid, row_u16};
 use crate::row::LineSize;
@@ -49,16 +48,12 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
-            // Fill BCE RGB in vacated cells at cursor position after shift (#7685).
+            // Fill BCE RGB in vacated cells at cursor position after shift.
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
-            // SELECTION CUSTODY — ICH is a CONTENT-REPLACEMENT op in exactly the
-            // class EL is: it shifts the row's tail right under whatever highlight is
-            // painted there, so a copy afterwards returns text shifted by `count`
-            // columns — text the user never selected. It recorded nothing until now,
-            // which is the silent-failure direction the design calls the worst
-            // outcome. One row of damage, the cursor's, like EL. NOT
-            // `damage_selection_scroll_region`: that also invalidates host coordinate
-            // caches, and ICH moves cells within a row without moving any ROW.
+            // ICH shifts the row's tail right under any highlight, replacing
+            // content like EL, so record one row of selection damage (the
+            // cursor's). Not `damage_selection_scroll_region`: that also
+            // invalidates host coordinate caches, and ICH moves no row.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
@@ -92,11 +87,10 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
-            // Fill BCE RGB in vacated cells at end of line after shift (#7685).
+            // Fill BCE RGB in vacated cells at end of line after shift.
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
-            // SELECTION CUSTODY — DCH shifts the row's tail LEFT under a live
-            // highlight; see `insert_chars` for why this is EL's class and why the
-            // band is one row with no host-coordinate invalidation.
+            // DCH shifts the row's tail left under a live highlight; see
+            // `insert_chars` for the one-row damage.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
@@ -106,7 +100,7 @@ impl Grid {
     ///
     /// When `left_right_margin_mode` is true, shifts only within the
     /// horizontal margins. Otherwise falls back to `insert_chars`.
-    /// Uses the BCE cursor template for fill (#7522).
+    /// Uses the BCE cursor template for fill.
     #[inline]
     pub fn insert_chars_margin(&mut self, count: u16, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -119,7 +113,7 @@ impl Grid {
         let margins = self.storage.horizontal_margins();
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
         // Only bound by margins when cursor is inside them. When cursor is
-        // outside the margin region, fall back to screen-edge bounding (#7580).
+        // outside the margin region, fall back to screen-edge bounding.
         let in_margins = cursor_col >= margins.left && cursor_col <= margins.right;
         let right_bound = if in_margins {
             margins.right.saturating_add(1).min(effective_cols)
@@ -140,8 +134,8 @@ impl Grid {
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
-            // SELECTION CUSTODY — the margined ICH replaces content exactly as the
-            // unmargined one does; see `insert_chars`.
+            // The margined ICH replaces content like the unmargined one; see
+            // `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
@@ -151,7 +145,7 @@ impl Grid {
     ///
     /// When `left_right_margin_mode` is true, shifts only within the
     /// horizontal margins. Otherwise falls back to `delete_chars`.
-    /// Uses the BCE cursor template for fill (#7522).
+    /// Uses the BCE cursor template for fill.
     #[inline]
     pub fn delete_chars_margin(&mut self, count: u16, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -163,7 +157,7 @@ impl Grid {
         let cursor_col = self.storage.cursor.col;
         let margins = self.storage.horizontal_margins();
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
-        // Only bound by margins when cursor is inside them (#7580).
+        // Only bound by margins when cursor is inside them.
         let in_margins = cursor_col >= margins.left && cursor_col <= margins.right;
         let right_bound = if in_margins {
             margins.right.saturating_add(1).min(effective_cols)
@@ -184,8 +178,8 @@ impl Grid {
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
-            // SELECTION CUSTODY — the margined DCH replaces content exactly as the
-            // unmargined one does; see `insert_chars`.
+            // The margined DCH replaces content like the unmargined one; see
+            // `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
@@ -194,23 +188,15 @@ impl Grid {
     /// Erase `count` characters at cursor position without shifting.
     ///
     /// Replaces characters with blanks in place. Does not shift remaining characters.
-    /// Uses the BCE cursor template for fill per VT420/xterm spec (#7522).
+    /// Uses the BCE cursor template for fill per VT420/xterm.
     /// This implements the ECH (Erase Character) CSI sequence.
     ///
-    /// ECH IS NOT BOUNDED BY THE DECLRMM MARGINS. The comment that used to sit
-    /// here claimed the opposite and cited the spec for it; the VT510 ECH page
-    /// says, in one sentence, "ECH works inside or outside the scrolling
-    /// margins", and DECSLRM's page is what makes those margins the horizontal
-    /// scrolling region. xterm agrees by construction — `do_erase_char`
-    /// (util.c) is a call to `ClearRight`, the same function EL 0 uses, and
-    /// `ClearRight` bounds by `MaxCols(screen)`. Ghostty's `eraseChars` bounds
-    /// by `self.cols - cursor.x` and has no out-of-margin early return at all;
-    /// iTerm2's `eraseCharactersAfterCursor:` bounds by `size.width`.
-    ///
-    /// The margins DO bind the SHIFTING operations in this file — `insert_chars`
-    /// (ICH) and `delete_chars` (DCH) — which is the split VT510 draws with
-    /// "ICH/DCH has no effect outside the scrolling margins". See the module
-    /// note in `erase.rs`.
+    /// ECH is not bounded by the DECLRMM margins: VT510 says "ECH works inside
+    /// or outside the scrolling margins". xterm's `do_erase_char` (util.c)
+    /// calls `ClearRight`, bounded by `MaxCols(screen)`; Ghostty's `eraseChars`
+    /// and iTerm2's `eraseCharactersAfterCursor:` likewise ignore margins.
+    /// The margins do bind the shifting ops here, ICH and DCH ("no effect
+    /// outside the scrolling margins"); see the module note in `erase.rs`.
     #[inline]
     pub fn erase_chars(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
@@ -227,21 +213,16 @@ impl Grid {
                 .extras
                 .clear_range(cursor_row, cursor_col, cursor_col + count);
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
-            // SELECTION CUSTODY — ECH blanks cells in place, which is what EL does,
-            // and a program repainting a field with `\e[40X` instead of `\e[K`
-            // differed from one that used EL only in which op got a mark. It gets the
-            // same one-row band; see `insert_chars`.
+            // ECH blanks cells in place like EL, so it gets the same one-row
+            // selection damage; see `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
-            // An ECH that runs through the last column it can reach clears the
-            // row's right part exactly as EL 0 does, so it breaks the wrap into
-            // the row below the same way (`clear_wrap_into_next_row`). One that
-            // stops short leaves the right part's text, and the row still
-            // continues into the next: xterm's `ClearRight` breaks the link on
-            // every ECH, but conhost paints a blank run INSIDE a row as ECH then
-            // CUF and goes on writing that row (measured in an aterm cast of pwsh
-            // under ConPTY, 2026-09-22: `CSI H CSI 28 X … CSI 28 C` then the
-            // rest of row 0), so a short ECH says nothing about the row's end.
+            // An ECH running through the last column it can reach clears the
+            // row's right part as EL 0 does, so it breaks the wrap into the row
+            // below (`clear_wrap_into_next_row`). A shorter one leaves the row
+            // continuing: conhost paints a blank run inside a row as ECH then CUF
+            // and keeps writing that row, so a short ECH says nothing about the
+            // row's end.
             if cursor_col + count == right_bound {
                 self.clear_wrap_into_next_row(cursor_row);
             }
@@ -271,18 +252,15 @@ impl Grid {
         let region = self.storage.scroll_region;
 
         // Per VT510: IL has no effect if cursor is outside scroll region.
-        // Check BEFORE moving cursor column — a no-op IL must not change
-        // the cursor position at all (#7543).
+        // Checked before moving the cursor column: a no-op IL must not move
+        // the cursor.
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
 
-        // The deferred wrap dies with the insert, NOT with the request: xterm's
-        // `InsertLine` (util.c) returns on the margin test BEFORE it reaches
-        // `ResetWrap(screen)`, so an IL the cursor position rejects leaves the
-        // parked wrap armed. Resetting it above the guard cancelled a wrap that
-        // xterm keeps, and the next printable then landed on this row instead of
-        // the next one.
+        // The deferred wrap resets only once the insert happens: xterm's
+        // `InsertLine` (util.c) returns on the margin test before `ResetWrap`,
+        // so a rejected IL keeps the parked wrap.
         self.storage.clear_pending_wrap();
 
         // Per ECMA-48 §8.3.67: IL moves the active position to the line
@@ -292,7 +270,7 @@ impl Grid {
         self.storage.cursor.col = self.storage.horizontal_margins().left;
 
         // Row index arithmetic requires display_offset == 0. Reset
-        // defensively for callers that may not have done so. (#5019)
+        // defensively for callers that may not have done so.
         self.reset_display_offset_with_damage();
 
         let start_row = usize::from(cursor_row);
@@ -307,15 +285,12 @@ impl Grid {
         }
 
         // Batch shift CellExtras within [cursor_row, region.bottom]: O(E) regardless of count.
-        // Insert lines shifts content DOWN, so shift extras down.
-        let shift_n = row_u16(count.min(end_row - start_row));
         self.storage
             .extras
-            .shift_region_down_by(cursor_row, region.bottom, shift_n);
+            .shift_region_down_by(cursor_row, region.bottom, row_u16(shift_n));
 
-        // Clear the inserted rows with BCE fill (#7522).
-        // Reset line size to SingleWidth so DECDWL flags don't leak from
-        // recycled rows that previously had double-width attributes.
+        // Clear the inserted rows with BCE fill, resetting line size to
+        // SingleWidth so DECDWL does not leak from recycled rows.
         let fill = self.storage.cursor_template;
         let clear_end = (start_row + count).min(end_row);
         for row in start_row..clear_end {
@@ -324,22 +299,17 @@ impl Grid {
                 r.erase_with(fill);
             }
         }
-        // Fill BCE RGB in vacated rows after shift (#7685).
+        // Fill BCE RGB in vacated rows after shift.
         self.fill_bce_rgb_rows(cursor_row..row_u16(clear_end));
 
-        // Invalidate selection — IL shifts visible content within the scroll
-        // region, so selection coordinates become stale (same as scroll_region_down).
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // IL is confined to the scroll region, which is the selection damage;
+        // selections outside it (including scrollback) survive.
         //
-        // Recorded AS A BAND: rows `cursor_row..=region.bottom` went DOWN by the
-        // clamped count, the bottom rows left the band — the same shape as a region
-        // scroll down, so a host translating bands keeps its marks on their lines
-        // (a vim `:set scrolloff` insert, a tmux pane). A count past `i16` is not a
-        // program's shape; it takes the poisoning path.
-        match i16::try_from(count.min(end_row - start_row)) {
+        // Recorded as a band: rows `cursor_row..=region.bottom` went down by the
+        // clamped count and the bottom rows left the band (like a region scroll
+        // down), so a host translating bands keeps its marks on their lines. A
+        // count past `i16` takes the poisoning path.
+        match i16::try_from(shift_n) {
             Ok(delta) => {
                 self.damage_selection_scroll_region_as_band(cursor_row, region.bottom, delta);
             }
@@ -378,7 +348,7 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let region = self.storage.scroll_region;
         // Per VT510: IL has no effect if cursor is outside scroll region.
-        // Check BEFORE moving cursor column (#7530).
+        // Check BEFORE moving cursor column.
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
@@ -392,9 +362,9 @@ impl Grid {
         }
 
         self.storage.cursor.col = margins.left;
-        // Both margin tests are xterm's, and both come BEFORE its
-        // `ResetWrap(screen)` — a IL the cursor position rejects leaves the
-        // parked wrap armed (util.c `InsertLine`).
+        // Both margin tests come before xterm's `ResetWrap(screen)`, so an IL
+        // the cursor position rejects keeps the parked wrap (util.c
+        // `InsertLine`).
         self.storage.clear_pending_wrap();
         self.reset_display_offset_with_damage();
 
@@ -407,9 +377,9 @@ impl Grid {
         let width = right_usize + 1 - left_usize;
         let cols = self.storage.cols as usize;
 
-        // Copy cells downward within [left, right] — bottom-to-top to avoid
-        // overwriting source data (same pattern as scroll_region_down_margined).
-        // Hoist buffer outside loop to avoid per-row heap allocation (#7468).
+        // Copy cells downward within [left, right], bottom-to-top to avoid
+        // overwriting source data (as in scroll_region_down_margined), with one
+        // buffer reused across rows.
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in (n..region_size).rev() {
             let dst_row = row_u16(top + dst_offset);
@@ -428,20 +398,18 @@ impl Grid {
                         *c = buf[i];
                     }
                 }
-                // Wide char fixup at rectangle boundaries (#7500).
-                // Whole-row rect copy: no per-cell authoritative signal, keep the
-                // char==' ' spacer heuristic (true).
+                // Wide char fixup at rectangle boundaries. Whole-row rect copy:
+                // no per-cell authoritative signal, so keep the char==' ' spacer
+                // heuristic (true).
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The get_mut writes above bypass len maintenance: copying blank
-                // source cells over the dst row's tail content leaves len stale-high
-                // (#7522 phantom trailing spaces via row_text/search/scrollback).
-                // Recompute the true content extent per modified row (never
-                // over-shrinks; margined IL/DL is off the hot path).
+                // The get_mut writes bypass len maintenance: blank source cells
+                // copied over the dst tail leave len stale-high (phantom trailing
+                // spaces). Recompute per modified row (never over-shrinks).
                 dst.recompute_len();
             }
         }
 
-        // Clear the top n rows within margins (the inserted blank lines) with BCE fill (#7522).
+        // Clear the top n rows within margins (the inserted blank lines) with BCE fill.
         let fill = self.storage.cursor_template;
         for clear_offset in 0..n {
             let clear_row = row_u16(top + clear_offset);
@@ -451,19 +419,18 @@ impl Grid {
                         *c = fill;
                     }
                 }
-                // Wide char fixup at rectangle boundaries (#7500).
+                // Wide char fixup at rectangle boundaries.
                 r.fixup_wide_boundary(left_usize, right_usize, cols, true);
                 // The BCE fill via get_mut bypasses len maintenance: an empty
-                // cursor_template can orphan the tail (stale-high), a colored one
-                // extends it (stale-low). Recompute the true extent (#7522).
+                // cursor_template can orphan the tail, a colored one extends it.
+                // Recompute the true extent.
                 r.recompute_len();
             }
         }
 
         // Shift extras down within the margin rectangle to match the cell
-        // shift, then clear the vacated top rows. Using shift_rect_down_by
-        // preserves hyperlinks, RGB colors, combining marks, and underline
-        // colors that would be destroyed by clear_rect (#7455).
+        // shift, then clear the vacated top rows; shift_rect_down_by keeps
+        // hyperlinks, RGB colors, combining marks and underline colors.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "n <= region_size <= visible_rows, fits u16"
@@ -475,7 +442,7 @@ impl Grid {
             margins.right,
             n as u16,
         );
-        // Fill BCE RGB in vacated top rect after shift (#7685).
+        // Fill BCE RGB in vacated top rect after shift.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "n <= region_size <= visible_rows, fits u16"
@@ -485,10 +452,7 @@ impl Grid {
             margins.left..margins.right.saturating_add(1),
         );
 
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
@@ -516,8 +480,8 @@ impl Grid {
         let region = self.storage.scroll_region;
 
         // Per VT510: DL has no effect if cursor is outside scroll region.
-        // Check BEFORE moving cursor column — a no-op DL must not change
-        // the cursor position at all (#7543).
+        // Checked before moving the cursor column: a no-op DL must not move
+        // the cursor.
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
@@ -534,7 +498,7 @@ impl Grid {
         self.storage.cursor.col = self.storage.horizontal_margins().left;
 
         // Row index arithmetic requires display_offset == 0. Reset
-        // defensively for callers that may not have done so. (#5019)
+        // defensively for callers that may not have done so.
         self.reset_display_offset_with_damage();
 
         let start_row = usize::from(cursor_row);
@@ -549,15 +513,12 @@ impl Grid {
         }
 
         // Batch shift CellExtras within [cursor_row, region.bottom]: O(E) regardless of count.
-        // Delete lines shifts content UP, so shift extras up.
-        let shift_n = row_u16(count.min(end_row - start_row));
         self.storage
             .extras
-            .shift_region_up_by(cursor_row, region.bottom, shift_n);
+            .shift_region_up_by(cursor_row, region.bottom, row_u16(shift_n));
 
-        // Clear the bottom rows of the scroll region with BCE fill (#7522).
-        // Reset line size to SingleWidth so DECDWL flags don't leak from
-        // recycled rows that previously had double-width attributes.
+        // Clear the bottom rows of the scroll region with BCE fill, resetting
+        // line size to SingleWidth so DECDWL does not leak from recycled rows.
         let fill = self.storage.cursor_template;
         let clear_start = end_row.saturating_sub(count).max(start_row);
         for row in clear_start..end_row {
@@ -566,20 +527,16 @@ impl Grid {
                 r.erase_with(fill);
             }
         }
-        // Fill BCE RGB in vacated bottom rows after shift (#7685).
+        // Fill BCE RGB in vacated bottom rows after shift.
         self.fill_bce_rgb_rows(row_u16(clear_start)..row_u16(end_row));
 
-        // Invalidate selection — DL shifts visible content within the scroll
-        // region, so selection coordinates become stale (same as scroll_region_up).
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // DL is confined to the scroll region, which is the selection damage;
+        // selections outside it (including scrollback) survive.
         //
-        // Recorded AS A BAND: rows `cursor_row..=region.bottom` went UP by the
-        // clamped count (the deleted rows left the band, the vacated bottom rows are
-        // blank) — the mirror of `insert_lines` above.
-        match i16::try_from(count.min(end_row - start_row)) {
+        // Recorded as a band: rows `cursor_row..=region.bottom` went up by the
+        // clamped count (deleted rows left the band, vacated bottom rows are
+        // blank), mirroring `insert_lines`.
+        match i16::try_from(shift_n) {
             Ok(rows) => {
                 self.damage_selection_scroll_region_as_band(cursor_row, region.bottom, -rows);
             }
@@ -618,7 +575,7 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let region = self.storage.scroll_region;
         // Per VT510: DL has no effect if cursor is outside scroll region.
-        // Check BEFORE moving cursor column (#7530).
+        // Check BEFORE moving cursor column.
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
@@ -632,9 +589,9 @@ impl Grid {
         }
 
         self.storage.cursor.col = margins.left;
-        // Both margin tests are xterm's, and both come BEFORE its
-        // `ResetWrap(screen)` — a DL the cursor position rejects leaves the
-        // parked wrap armed (util.c `DeleteLine`).
+        // Both margin tests come before xterm's `ResetWrap(screen)`, so a DL
+        // the cursor position rejects keeps the parked wrap (util.c
+        // `DeleteLine`).
         self.storage.clear_pending_wrap();
         self.reset_display_offset_with_damage();
 
@@ -647,9 +604,9 @@ impl Grid {
         let width = right_usize + 1 - left_usize;
         let cols = self.storage.cols as usize;
 
-        // Copy cells upward within [left, right] — top-to-bottom to avoid
-        // overwriting source data (same pattern as scroll_region_up_margined).
-        // Hoist buffer outside loop to avoid per-row heap allocation (#7468).
+        // Copy cells upward within [left, right], top-to-bottom to avoid
+        // overwriting source data (as in scroll_region_up_margined), with one
+        // buffer reused across rows.
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in 0..(region_size - n) {
             let dst_row = row_u16(top + dst_offset);
@@ -668,21 +625,19 @@ impl Grid {
                         *c = buf[i];
                     }
                 }
-                // Wide char fixup at rectangle boundaries (#7500).
-                // Whole-row rect copy: no per-cell authoritative signal, keep the
-                // char==' ' spacer heuristic (true).
+                // Wide char fixup at rectangle boundaries. Whole-row rect copy:
+                // no per-cell authoritative signal, so keep the char==' ' spacer
+                // heuristic (true).
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The get_mut writes above bypass len maintenance: copying blank
-                // source cells over the dst row's tail content leaves len stale-high
-                // (#7522 phantom trailing spaces via row_text/search/scrollback).
-                // Recompute the true content extent per modified row (never
-                // over-shrinks; margined IL/DL is off the hot path).
+                // The get_mut writes bypass len maintenance: blank source cells
+                // copied over the dst tail leave len stale-high (phantom trailing
+                // spaces). Recompute per modified row (never over-shrinks).
                 dst.recompute_len();
             }
         }
 
         // Clear the bottom n rows within margins (vacated by the upward shift)
-        // with BCE fill (#7522).
+        // with BCE fill.
         let fill = self.storage.cursor_template;
         for clear_offset in (region_size - n)..region_size {
             let clear_row = row_u16(top + clear_offset);
@@ -692,19 +647,18 @@ impl Grid {
                         *c = fill;
                     }
                 }
-                // Wide char fixup at rectangle boundaries (#7500).
+                // Wide char fixup at rectangle boundaries.
                 r.fixup_wide_boundary(left_usize, right_usize, cols, true);
                 // The BCE fill via get_mut bypasses len maintenance: an empty
-                // cursor_template can orphan the tail (stale-high), a colored one
-                // extends it (stale-low). Recompute the true extent (#7522).
+                // cursor_template can orphan the tail, a colored one extends it.
+                // Recompute the true extent.
                 r.recompute_len();
             }
         }
 
-        // Shift extras up within the margin rectangle to match the cell
-        // shift. Using shift_rect_up_by preserves hyperlinks, RGB colors,
-        // combining marks, and underline colors that would be destroyed
-        // by clear_rect (#7455).
+        // Shift extras up within the margin rectangle to match the cell shift;
+        // shift_rect_up_by keeps hyperlinks, RGB colors, combining marks and
+        // underline colors.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "n <= region_size <= visible_rows, fits u16"
@@ -716,7 +670,7 @@ impl Grid {
             margins.right,
             n as u16,
         );
-        // Fill BCE RGB in vacated bottom rect after shift (#7685).
+        // Fill BCE RGB in vacated bottom rect after shift.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "n <= region_size <= visible_rows, fits u16"
@@ -729,10 +683,7 @@ impl Grid {
             );
         }
 
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
@@ -785,10 +736,10 @@ impl Grid {
         for row_idx in region.top..=region.bottom {
             if let Some(row) = self.row_mut(row_idx) {
                 row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill);
-                // Wide char fixup at rectangle boundaries. `insert_chars_bounded_fill`
-                // already fixed genuine boundary orphans authoritatively, so suppress
-                // the ambiguous spacer-clear (it would only blank a protected space
-                // outside the region — codex round-7 finding).
+                // Wide char fixup at rectangle boundaries.
+                // `insert_chars_bounded_fill` already fixed genuine boundary
+                // orphans, so skip the ambiguous spacer-clear (it could blank a
+                // protected space outside the region).
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
                     usize::from(margins.right),
@@ -802,10 +753,7 @@ impl Grid {
             self.fill_bce_rgb_range(row_idx, cursor_col, cursor_col + count);
         }
 
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
@@ -853,9 +801,9 @@ impl Grid {
         for row_idx in region.top..=region.bottom {
             if let Some(row) = self.row_mut(row_idx) {
                 row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill);
-                // Wide char fixup at rectangle boundaries. `delete_chars_bounded_fill`
-                // already fixed genuine boundary orphans authoritatively; suppress the
-                // ambiguous spacer-clear (protected-space corruption — codex round-7).
+                // Wide char fixup at rectangle boundaries.
+                // `delete_chars_bounded_fill` already fixed genuine boundary
+                // orphans, so skip the ambiguous spacer-clear.
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
                     usize::from(margins.right),
@@ -869,10 +817,7 @@ impl Grid {
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
         }
 
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
@@ -901,9 +846,8 @@ impl Grid {
         for row_idx in region.top..=region.bottom {
             if let Some(row) = self.row_mut(row_idx) {
                 row.delete_chars_bounded_fill(left, count, right_bound, fill);
-                // Genuine orphans already fixed by the bounded shift; suppress the
-                // ambiguous spacer-clear (codex round-7: SL blanked a protected space
-                // one column past the right margin).
+                // Genuine orphans were already fixed by the bounded shift, so skip
+                // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
                     usize::from(margins.right),
@@ -916,10 +860,7 @@ impl Grid {
                 .shift_cols_left(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
         }
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
@@ -947,8 +888,8 @@ impl Grid {
         for row_idx in region.top..=region.bottom {
             if let Some(row) = self.row_mut(row_idx) {
                 row.insert_chars_bounded_fill(left, count, right_bound, fill);
-                // Genuine orphans already fixed by the bounded shift; suppress the
-                // ambiguous spacer-clear (protected-space corruption — codex round-7).
+                // Genuine orphans were already fixed by the bounded shift, so skip
+                // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
                     usize::from(margins.right),
@@ -961,10 +902,7 @@ impl Grid {
                 .shift_cols_right(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, left, left + count);
         }
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
@@ -997,8 +935,8 @@ impl Grid {
         for row_idx in region.top..=region.bottom {
             if let Some(row) = self.row_mut(row_idx) {
                 row.insert_chars_bounded_fill(left, 1, right_bound, fill);
-                // Genuine orphans already fixed by the bounded shift; suppress the
-                // ambiguous spacer-clear (protected-space corruption — codex round-7).
+                // Genuine orphans were already fixed by the bounded shift, so skip
+                // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
                     usize::from(left),
                     usize::from(right),
@@ -1012,10 +950,7 @@ impl Grid {
             self.fill_bce_rgb_range(row_idx, left, left + 1);
         }
 
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
@@ -1044,8 +979,8 @@ impl Grid {
         for row_idx in region.top..=region.bottom {
             if let Some(row) = self.row_mut(row_idx) {
                 row.delete_chars_bounded_fill(left, 1, right_bound, fill);
-                // Genuine orphans already fixed by the bounded shift; suppress the
-                // ambiguous spacer-clear (protected-space corruption — codex round-7).
+                // Genuine orphans were already fixed by the bounded shift, so skip
+                // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
                     usize::from(left),
                     usize::from(right),
@@ -1059,10 +994,7 @@ impl Grid {
             self.fill_bce_rgb_range(row_idx, right_bound - 1, right_bound);
         }
 
-        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
-        // that is the damage. A selection in scrollback — or anywhere outside the
-        // region — is untouched, where the old sentinel killed every selection
-        // anywhere on any of these ops.
+        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
@@ -1074,6 +1006,7 @@ mod tests {
     use super::*;
     use crate::cell::CellFlags;
     use crate::cell_colors::PackedColor;
+    use crate::grid::test_support::wrapped_pair;
 
     /// Helper: read the character at (row, col), returning space for empty cells.
     fn char_at(grid: &Grid, row: u16, col: u16) -> char {
@@ -1358,19 +1291,6 @@ mod tests {
         grid.move_cursor_to(0, 0);
         grid.erase_chars(4);
         assert!(row_trimmed(&grid, 1).starts_with("ROW1DATA"));
-    }
-
-    /// Row 0 `ABCDE` autowrapped into row 1 `FG` (a continuation), 5 columns.
-    fn wrapped_pair() -> Grid {
-        let mut grid = Grid::new(4, 5);
-        for c in "ABCDEFG".chars() {
-            grid.write_char_wrap(c);
-        }
-        assert!(
-            grid.row(1).is_some_and(|r| r.is_wrapped()),
-            "precondition: row 1 continues row 0"
-        );
-        grid
     }
 
     #[test]
@@ -1960,7 +1880,7 @@ mod tests {
     }
 
     // =========================================================================
-    // DECLRMM IL/DL horizontal-containment (#7530 follow-up)
+    // DECLRMM IL/DL horizontal containment
     // =========================================================================
 
     /// IL with DECLRMM active is a no-op when the cursor column is outside the
@@ -2021,10 +1941,10 @@ mod tests {
         assert!(row_trimmed(&grid, 1).contains("AAA"));
     }
 
-    /// Regression (codex round-17 review): margined IL/DL and scroll_region_*_
-    /// margined write cells via get_mut, bypassing len maintenance. When the
-    /// margined copy blanks a row's tail content, Row.len must still shrink —
-    /// otherwise row_text/search/scrollback emit phantom trailing spaces (#7522).
+    /// Margined IL/DL and scroll_region_*_margined write cells via get_mut,
+    /// bypassing len maintenance; when the margined copy blanks a row's tail,
+    /// Row.len must still shrink, or row_text/search/scrollback emit phantom
+    /// trailing spaces.
     #[test]
     fn test_dl_margined_shrinks_len_when_blanks_cover_tail() {
         let mut grid = Grid::new(24, 80);
@@ -2052,7 +1972,7 @@ mod tests {
     }
 
     // =========================================================================
-    // DECIC/DECDC vertical-region containment (#7530 mirror)
+    // DECIC/DECDC vertical-region containment
     // =========================================================================
 
     /// DECIC is a no-op when the cursor row is outside the vertical scroll

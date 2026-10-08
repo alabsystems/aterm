@@ -9,8 +9,8 @@ use crate::{Cell, CellFlags, Grid, StyleId};
 
 #[test]
 fn resize_to_one_column_preserves_protected_cells() {
-    // Regression test for #1286: PROTECTED cells share bit with WIDE_CHAR_SPACER
-    // and were incorrectly dropped during narrow reflow.
+    // PROTECTED cells (sharing bit 10 with the wide spacer) survive narrow
+    // reflow.
     let mut grid = Grid::new(2, 4);
 
     // Write a protected cell ('P' with PROTECTED flag) at position 0
@@ -77,10 +77,8 @@ fn resize_to_one_column_preserves_protected_cells_with_reflow() {
 
 #[test]
 fn resize_to_one_column_preserves_protected_cell_after_wide_char() {
-    // Edge case: protected cell at position 2 (after wide char + spacer).
-    // This is the crucial test case because WIDE_CHAR_SPACER and PROTECTED share the
-    // same bit (1<<10). The fix ensures that we only skip cells that actually follow
-    // a replaced wide char, not any cell with the PROTECTED flag.
+    // A protected cell right after a wide char + spacer: only cells following a
+    // replaced wide char are skipped, not every cell with bit 10 set.
     let mut grid = Grid::new(2, 4);
 
     // Write wide char at position 0-1

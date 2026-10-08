@@ -4,65 +4,45 @@
 //! The `wasm32` clock: a monotonic [`Instant`] over `performance.now()` and a
 //! wall-clock [`SystemTime`] over `Date.now()`.
 //!
-//! # This module is compiled on native too — under `cfg(test)`
-//!
-//! `wasm32-unknown-unknown` needs its own std and the Trust toolchain ships
-//! none, so the `wasm-cpu` and `wasm-gpu` cells of `xtask gate cells-foreign`
-//! (and `xtask gate cells`) type-check this crate on rustup's `stable`. That
-//! proves it still COMPILES; it executes nothing. A browser-only module
-//! would therefore be code that no test on the machine writing it can reach —
-//! which is exactly how a clock ships broken.
-//!
-//! So everything here except the two JS bindings and the `now()` calls that use
-//! them is target-independent, and the module is compiled into the NATIVE test
-//! build as well. The `tests` at the bottom drive the same arithmetic the
-//! browser will run, on a box with no wasm target installed. What remains
-//! genuinely unverifiable locally is two `extern` declarations and the two
-//! one-line `now()` bodies that call them.
+//! The wasm cells only type-check this module, so it is also compiled into the
+//! native test build: everything except the two JS bindings and the `now()`
+//! calls that use them is target-independent, and the `tests` below drive the
+//! same arithmetic the browser runs.
 
 use core::ops::{Add, AddAssign, Sub, SubAssign};
 use core::time::Duration;
 
-/// The browser's two clock functions.
-///
-/// Declared as bare bindings rather than reached through `js-sys`/`web-sys`,
-/// because two function imports do not need a typed DOM binding layer — and
-/// because `js_namespace` resolves the global at CALL time, so one build works
-/// in a window, a worker and a worklet alike.
+/// The browser's two clock functions, as bare bindings rather than through
+/// `js-sys`/`web-sys`. `js_namespace` resolves the global at call time, so one
+/// build works in a window, a worker and a worklet.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod js {
     use wasm_bindgen::prelude::wasm_bindgen;
 
-    // `unsafe extern` is the edition-2024 spelling of a foreign block. It says
-    // nothing about how these are CALLED: `#[wasm_bindgen]` consumes the block
-    // and emits its own safe wrappers, because neither function is declared
-    // `unsafe fn`.
+    // `unsafe extern` is the edition-2024 spelling of a foreign block;
+    // `#[wasm_bindgen]` consumes it and emits safe wrappers.
     #[wasm_bindgen]
     unsafe extern "C" {
-        /// `performance.now()` — milliseconds since the document's time
-        /// origin, monotonic, sub-millisecond where the embedder allows it.
+        /// `performance.now()`: milliseconds since the document's time origin,
+        /// monotonic, sub-millisecond where the embedder allows it.
         #[wasm_bindgen(js_namespace = performance, js_name = now)]
         pub fn performance_now() -> f64;
 
-        /// `Date.now()` — integer milliseconds since the Unix epoch, wall
-        /// clock, and free to jump when the host's clock is corrected.
+        /// `Date.now()`: integer milliseconds since the Unix epoch, wall clock,
+        /// free to jump when the host's clock is corrected.
         #[wasm_bindgen(js_namespace = Date, js_name = now)]
         pub fn date_now() -> f64;
     }
 }
 
-/// Convert JS milliseconds to a [`Duration`], TOTALLY.
+/// Convert JS milliseconds to a [`Duration`], totally.
 ///
 /// `Duration::from_secs_f64` panics on a negative or non-finite input, and a
-/// browser clock is not obliged to be either: cross-origin isolation, Spectre
-/// clamping and tab suspension all perturb it, and `NaN` is a legal `f64` for a
-/// binding to return. Everything unusable floors to zero, which is the only
-/// answer that keeps a terminal drawing.
+/// browser clock may return either (clamping, tab suspension, `NaN`).
+/// Everything unusable floors to zero.
 ///
-/// Whole milliseconds are split from the fraction BEFORE scaling, so precision
-/// does not decay as the time origin ages: after an hour `ms` is ~3.6e6, and a
-/// naive `ms * 1e6` nanosecond conversion would have spent the mantissa on the
-/// integer part.
+/// Whole milliseconds are split from the fraction before scaling, so precision
+/// does not decay as the time origin ages.
 fn duration_from_millis_f64(ms: f64) -> Duration {
     if !ms.is_finite() || ms <= 0.0 {
         return Duration::ZERO;
@@ -84,8 +64,8 @@ fn duration_from_millis_f64(ms: f64) -> Duration {
             whole as u64
         }
     };
-    // `frac` is in `[0, 1)`, so the nanosecond part is in `[0, 1e6)` — always
-    // inside `Duration`'s subsec range, so the sum below can never carry.
+    // `frac` is in `[0, 1)`, so the nanosecond part is in `[0, 1e6)`, inside
+    // `Duration`'s subsec range, so the sum below never carries.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -95,11 +75,9 @@ fn duration_from_millis_f64(ms: f64) -> Duration {
     Duration::from_millis(millis).saturating_add(Duration::from_nanos(u64::from(nanos)))
 }
 
-/// A measurement of the browser's MONOTONIC clock — the `wasm32` stand-in for
-/// `std::time::Instant`, with the same contract.
-///
-/// Opaque by construction: the only meaning an `Instant` has is its difference
-/// from another one.
+/// A measurement of the browser's monotonic clock: the `wasm32` stand-in for
+/// `std::time::Instant`, with the same contract. Only differences between two
+/// instants have meaning.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Instant(Duration);
 
@@ -111,15 +89,13 @@ impl Instant {
         Self::from_js_millis(js::performance_now())
     }
 
-    /// Build from a raw JS millisecond reading. The single seam the native
-    /// tests drive, so the conversion and every operation below are exercised
-    /// without a browser.
+    /// Build from a raw JS millisecond reading: the seam the native tests drive.
     fn from_js_millis(ms: f64) -> Self {
         Self(duration_from_millis_f64(ms))
     }
 
-    /// Time elapsed from `earlier` to `self`, SATURATING to zero when `earlier`
-    /// is the later of the two — matching `std` since 1.60.
+    /// Time elapsed from `earlier` to `self`, saturating to zero when `earlier`
+    /// is the later of the two, as `std` does.
     #[must_use]
     pub fn duration_since(&self, earlier: Self) -> Duration {
         self.saturating_duration_since(earlier)
@@ -200,17 +176,17 @@ impl Sub<Instant> for Instant {
 /// The anchor of [`SystemTime`]: 1970-01-01 00:00:00 UTC.
 pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::ZERO);
 
-/// A measurement of the browser's WALL clock — the `wasm32` stand-in for
+/// A measurement of the browser's wall clock: the `wasm32` stand-in for
 /// `std::time::SystemTime`.
 ///
 /// Not monotonic: the value can move backwards when the host's clock is
-/// corrected, which is exactly why
-/// [`duration_since`](SystemTime::duration_since) returns a `Result`.
+/// corrected, which is why [`duration_since`](SystemTime::duration_since)
+/// returns a `Result`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SystemTime(Duration);
 
 impl SystemTime {
-    /// The anchor, as an associated constant — the `std` spelling.
+    /// The anchor, as an associated constant (the `std` spelling).
     pub const UNIX_EPOCH: Self = UNIX_EPOCH;
 
     /// Read the wall clock.
@@ -220,7 +196,7 @@ impl SystemTime {
         Self::from_js_millis(js::date_now())
     }
 
-    /// Build from a raw JS millisecond reading — the native tests' seam.
+    /// Build from a raw JS millisecond reading: the native tests' seam.
     fn from_js_millis(ms: f64) -> Self {
         Self(duration_from_millis_f64(ms))
     }
@@ -228,9 +204,8 @@ impl SystemTime {
     /// Time elapsed from `earlier` to `self`.
     ///
     /// # Errors
-    /// When `earlier` is LATER than `self` — the clock moved backwards, or the
-    /// caller passed the arguments the other way round. The error carries the
-    /// magnitude of the reversal, as `std` does.
+    /// When `earlier` is later than `self` (the clock moved backwards, or the
+    /// arguments are swapped). The error carries the magnitude, as in `std`.
     pub fn duration_since(&self, earlier: Self) -> Result<Duration, SystemTimeError> {
         self.0
             .checked_sub(earlier.0)
@@ -297,7 +272,7 @@ impl SubAssign<Duration> for SystemTime {
 pub struct SystemTimeError(Duration);
 
 impl SystemTimeError {
-    /// How far the second time is AHEAD of the first.
+    /// How far the second time is ahead of the first.
     #[must_use]
     pub fn duration(&self) -> Duration {
         self.0
@@ -318,7 +293,7 @@ mod tests {
         Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH, duration_from_millis_f64,
     };
 
-    /// The clock conversion is TOTAL: every `f64` a browser binding could
+    /// The clock conversion is total: every `f64` a browser binding could
     /// return produces a `Duration` rather than a panic.
     #[test]
     fn millisecond_conversion_is_total() {
@@ -357,9 +332,8 @@ mod tests {
         );
     }
 
-    /// Sub-microsecond resolution survives an AGED time origin — the reason
-    /// the whole part is split off before scaling. A tab open for an hour must
-    /// still be able to distinguish two frames.
+    /// Sub-microsecond resolution survives an hour-old time origin, so two
+    /// frames stay distinguishable.
     #[test]
     fn resolution_survives_an_aged_time_origin() {
         let hour_ms = 3_600_000.0_f64;
@@ -418,8 +392,8 @@ mod tests {
         assert_eq!(a.checked_add(Duration::MAX), None);
     }
 
-    /// `SystemTime` is anchored at the epoch, and a backwards step is an ERROR
-    /// carrying the magnitude — never a panic and never a wrap.
+    /// `SystemTime` is anchored at the epoch, and a backwards step is an error
+    /// carrying the magnitude, never a panic or a wrap.
     #[test]
     fn system_time_reports_backwards_steps() {
         let t0 = SystemTime::from_js_millis(1_700_000_000_000.0);

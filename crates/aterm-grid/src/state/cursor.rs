@@ -27,54 +27,30 @@ pub struct GridCursorState {
     /// Tab stops (true = tab stop at this column).
     /// Default tab stops are every 8 columns.
     pub tab_stops: Vec<bool>,
-    /// TBC 3 (`CSI 3 g`, "clear ALL tab stops") has been issued and no reset has
-    /// re-established the defaults since.
-    ///
-    /// The array is sized lazily and a resize only ever GROWS it, seeding the
-    /// columns it adds with the every-8 default — so clearing only the columns
-    /// that exist today let a later WIDEN resurrect default stops beyond the old
-    /// width, stops the application had explicitly erased reappearing because
-    /// the window got bigger. xterm has no such seam: its tab array is a fixed
-    /// 1024-column bitmap that `TabZonk` clears whole.
-    ///
-    /// This says the same thing — "no stop at any column" — without inflating an
-    /// array whose LENGTH is observable: the seamless update checkpoint
-    /// serialises this vector and validates it against the grid width, so
-    /// widening it to `MAX_GRID_COLS` broke that handoff (measured: 4096 where
-    /// the checkpoint required 120).
+    /// TBC 3 (`CSI 3 g`) cleared all tab stops and no reset has restored the
+    /// defaults since. A resize grows the array seeding every-8 defaults in new
+    /// columns; this flag suppresses that seeding, so a widen cannot resurrect
+    /// cleared stops. The array's length stays the grid width, which the
+    /// checkpoint validates.
     pub tab_defaults_suppressed: bool,
-    /// Deferred wrap flag (xterm `wrapnext` / `do_wrap`).
+    /// Deferred wrap flag (xterm `do_wrap`).
     ///
-    /// When a printable character is written to the last column, the cursor
-    /// stays at the last column with this flag set. The next printable
-    /// character triggers the actual wrap (advance to next line). Any cursor
-    /// movement command (CR, LF, BS, CUP, etc.) clears this flag without
-    /// wrapping, allowing the cursor to be repositioned from the last column.
-    ///
-    /// This matches xterm/VT220 behavior and is critical for applications
-    /// that write exactly `cols` characters per line followed by newlines.
+    /// Writing the last column leaves the cursor there with this flag set; the
+    /// next printable performs the wrap. Cursor movement (CR, LF, BS, CUP, ...)
+    /// clears it without wrapping.
     pub pending_wrap: bool,
-    /// BCE (Background Color Erase) template cell.
+    /// BCE (background colour erase) template cell.
     ///
     /// Erase operations (ED, EL, ECH, IL, DL, scroll) fill cells with this
-    /// template instead of `Cell::EMPTY`. The template carries the current
-    /// SGR background color so that erased areas inherit the active background.
-    /// Updated by the terminal handler whenever the SGR background changes.
-    ///
-    /// Per VT420/xterm BCE specification (#7522).
+    /// template instead of `Cell::EMPTY`, so erased areas inherit the current
+    /// SGR background. Updated whenever the SGR background changes.
     pub cursor_template: Cell,
-    /// BCE background RGB value for truecolor backgrounds.
+    /// BCE background RGB for truecolor backgrounds.
     ///
-    /// When `Some([r, g, b])`, erase/fill/scroll operations must write this
-    /// RGB value into `RgbColorRing` for every cell they fill with
-    /// `cursor_template`. Without this, the cell's `PackedColors` says "RGB
-    /// mode" but the actual (R, G, B) values are lost because they live in
-    /// the ring buffer, not inline in the 8-byte cell.
-    ///
-    /// `None` when the current SGR background is default or indexed (the
-    /// 4-byte `PackedColors` in `cursor_template` is self-contained).
-    ///
-    /// Fixes #7685.
+    /// When `Some([r, g, b])`, erase/fill/scroll operations write this RGB into
+    /// `RgbColorRing` for every cell they fill with `cursor_template`, since the
+    /// cell's `PackedColors` only records RGB mode. `None` for a default or
+    /// indexed background (self-contained in `cursor_template`).
     pub cursor_template_bg_rgb: Option<[u8; 3]>,
     /// Presentation-oriented state layered under cursor/region state.
     pub presentation: GridPresentationState,
@@ -207,11 +183,7 @@ impl GridCursorState {
         self.pending_wrap
     }
 
-    /// Clear any deferred wrap request.
-    ///
-    /// Uses a conditional store to avoid writing when already false.
-    /// Eliminates unnecessary store-buffer traffic in the common case
-    /// (pending_wrap is only set at the last column).
+    /// Clear any deferred wrap request (skips the store when already false).
     #[inline]
     pub(crate) fn clear_pending_wrap(&mut self) {
         if self.pending_wrap {
@@ -226,9 +198,6 @@ impl GridCursorState {
     }
 
     /// Consume the deferred wrap request, returning whether one was pending.
-    ///
-    /// Uses a conditional store: avoids the write when pending_wrap is
-    /// already false (the common case — wrap is only set at last column).
     #[must_use]
     #[inline]
     pub(crate) fn take_pending_wrap(&mut self) -> bool {
@@ -274,11 +243,9 @@ impl GridCursorState {
         self.scroll_region
     }
 
-    /// Set the scroll region (DECSTBM).
-    ///
-    /// `top` and `bottom` are 0-indexed row numbers.
-    /// Out-of-bounds `bottom` is clamped to `visible_rows - 1` (xterm behavior).
-    /// If top >= clamped bottom, the region is reset to full screen.
+    /// Set the scroll region (DECSTBM), 0-indexed rows. An out-of-bounds
+    /// `bottom` clamps to `visible_rows - 1` (xterm); if top >= bottom the
+    /// region resets to full screen.
     #[inline]
     pub(crate) fn set_scroll_region(&mut self, top: u16, bottom: u16, visible_rows: u16) {
         // Clamp bottom to the last visible row (xterm compatibility).
@@ -303,11 +270,8 @@ impl GridCursorState {
         self.horizontal_margins
     }
 
-    /// Set horizontal margins (DECSLRM, VT420+).
-    ///
-    /// `left` and `right` are 0-indexed column numbers.
-    /// Only has effect when DECLRMM (mode 69) is enabled.
-    /// If left >= right or either is out of bounds, the margins are reset to full width.
+    /// Set horizontal margins (DECSLRM), 0-indexed columns; effective only with
+    /// DECLRMM (mode 69). Invalid or out-of-bounds margins reset to full width.
     #[inline]
     pub(crate) fn set_horizontal_margins(&mut self, left: u16, right: u16, cols: u16) {
         if left < right && right < cols {
@@ -339,21 +303,9 @@ impl GridCursorState {
         }
     }
 
-    /// Clear EVERY tab stop (TBC 3) — including the columns this grid does not
-    /// yet have.
-    ///
-    /// The array is widened to [`crate::MAX_GRID_COLS`] first, because a resize
-    /// only ever GROWS it (see `GridStorage::resize_viewport_state`) and seeds
-    /// the columns it adds with the every-8 default. Clearing only the columns
-    /// that exist today therefore let a later widen RESURRECT default stops at
-    /// 8-column spacing beyond the old width — stops the application had
-    /// explicitly erased, reappearing because the window got wider.
-    ///
-    /// xterm has no such seam: its tab array is a fixed 1024-column bitmap that
-    /// `TabZonk` clears whole, and `ScreenResize` never touches it. Widening the
-    /// array here is the same statement — "no stop at any column" — in a grid
-    /// that sizes its array lazily. The cost is one 4 KiB `Vec<bool>` on the
-    /// grids of applications that actually issue TBC 3.
+    /// Clear every tab stop (TBC 3), including columns a later widen adds (via
+    /// `tab_defaults_suppressed`). Like xterm's `TabZonk`, which clears its
+    /// whole bitmap and is never re-seeded by `ScreenResize`.
     #[inline]
     pub(crate) fn clear_all_tab_stops(&mut self) {
         self.tab_defaults_suppressed = true;

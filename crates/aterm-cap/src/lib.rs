@@ -1,44 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Owns-correctness capabilities (ATERM_DESIGN WS-G).
+//! Owns-correctness capabilities.
 //!
-//! A [`Cap<E>`] authorizes effect `E` at a trust [`Tier`]. `Cap` carries a
-//! private `_seal` field, so no `Cap { .. }` literal exists outside this crate;
-//! the only way to obtain one is [`Authority::grant`]. An [`Authority`] is the
-//! single minting authority and is itself minted by exactly one entry point,
-//! [`Authority::root_authority`], which is `unsafe`.
+//! A [`Cap<E>`] authorizes effect `E` at a trust [`Tier`]. A function that
+//! performs a privileged effect takes a `&Cap<ThatEffect>`, so calling it
+//! without the capability is a type error; [`require`] is the canonical gate.
 //!
-//! ## What is guaranteed
+//! Two properties hold:
 //!
-//! TWO distinct properties, both delivered:
-//!
-//! 1. **No struct-literal forgery (Rust privacy).** Because `Cap`'s and
-//!    `Authority`'s fields are private, no code outside this crate can write
-//!    `Cap { .. }` / `Authority { .. }`. Capabilities flow only from a held
-//!    `Authority`.
-//! 2. **No-mint-reachability (feature-sealed mint + machine-checked property;
-//!    ATERM_DESIGN §5.4).** [`Authority::root_authority`] is sealed behind the
-//!    `launcher-mint` cargo feature (or a crate's own `test` cfg): the symbol
-//!    exists ONLY for the trusted launcher binaries that enable the feature, so no
-//!    engine crate can even *name* the mint — a parser / handler / extension path
-//!    cannot reach a mint site because it is absent from that crate's compiled
-//!    surface. The property is proven abstractly by
-//!    [`aterm_spec::derive::mint_reachability_model`] (invariant `NoUntrustedTop`,
-//!    model-checked by `ty`) and bound to the real tree by the source-scan gate
-//!    `crates/aterm-cap/tests/mint_reachability.rs`: exactly the two launchers
-//!    enable the feature, and no production code outside a launcher reaches the
-//!    mint. The `unsafe` keyword is retained as an audit marker carrying the
-//!    "call once, from the trusted launcher" contract.
-//!
-//! The **effect layer**: a function that performs a privileged effect takes a
-//! `&Cap<ThatEffect>`, so it is a type error to call it without first having been
-//! granted the capability. [`require`] is the canonical gate.
-//!
-//! STATUS: no-struct-forgery is sound-by-construction (privacy); the grant/tier/
-//! effect-gate behaviour is tested below; no-mint-reachability (§5.4) is delivered
-//! via the `launcher-mint` feature seal + `mint_reachability_model` (`ty`) +
-//! `tests/mint_reachability.rs` (source-scan).
+//! 1. No struct-literal forgery: `Cap`'s and `Authority`'s fields are private,
+//!    so capabilities flow only from a held [`Authority`] via
+//!    [`Authority::grant`].
+//! 2. No mint reachability (`docs/ATERM_DESIGN.md` §5.4): the one mint,
+//!    [`Authority::root_authority`], is `unsafe` and sealed behind the
+//!    `launcher-mint` feature (or this crate's `test` cfg), which only the
+//!    trusted launchers enable, so no engine crate can name it. The property is
+//!    proven by [`aterm_spec::derive::mint_reachability_model`] (invariant
+//!    `NoUntrustedTop`) and bound to the tree by
+//!    `crates/aterm-cap/tests/mint_reachability.rs`.
 
 use std::marker::PhantomData;
 
@@ -74,11 +54,9 @@ impl Tier {
 
 /// A capability authorizing effect marker `E`, at a trust [`Tier`].
 ///
-/// The `_seal` private field prevents struct-literal forgery: outside this crate
-/// there is no way to name it, so no `Cap { .. }` literal can construct a `Cap`.
-/// The only source is [`Authority::grant`], which requires holding an
-/// [`Authority`]. (This is the no-struct-forgery property; no-mint-reachability
-/// (§5.4) is the separate `launcher-mint` feature seal — see the crate docs.)
+/// The private `_seal` field prevents struct-literal forgery outside this
+/// crate; the only source is [`Authority::grant`], which requires holding an
+/// [`Authority`].
 pub struct Cap<E> {
     tier: Tier,
     _effect: PhantomData<fn() -> E>,
@@ -86,12 +64,9 @@ pub struct Cap<E> {
 }
 
 /// A private, un-nameable witness. It is `Copy` (so a granted [`Cap`] can be
-/// copied) but still unconstructable outside this crate — copying one requires
+/// copied) but unconstructable outside this crate: copying one requires
 /// already holding it, which requires the [`Authority`]. This blocks struct
-/// literals only. That no code path reaches the mint (§5.4 no-mint-reachability)
-/// is supplied separately: the `launcher-mint` feature seal on
-/// `Authority::root_authority`, `tests/mint_reachability.rs`, and
-/// `aterm_spec::derive::mint_reachability_model`.
+/// literals only; the mint seal is the `launcher-mint` feature.
 #[derive(Clone, Copy)]
 struct Seal;
 
@@ -109,10 +84,8 @@ impl<E> Cap<E> {
     }
 }
 
-// Capabilities are copyable witnesses (passing one around does not consume it).
-// Hand-written (not derived) so the impls do NOT add a spurious `E: Clone`/
-// `E: Copy` bound — `E` is a phantom effect marker, never a value. The `Copy`
-// type's canonical `clone` is `*self` (identical bytes: same tier, same seal).
+// Capabilities are copyable witnesses. Hand-written (not derived) so the impls
+// add no spurious `E: Clone`/`E: Copy` bound: `E` is a phantom effect marker.
 impl<E> Clone for Cap<E> {
     fn clone(&self) -> Self {
         *self
@@ -139,45 +112,28 @@ pub struct Authority {
 }
 
 impl Authority {
-    /// Mint the process root authority. **The sealed root-authority mint** (§5.4):
-    /// whoever obtains the returned value can grant ANY capability at ANY tier, so
-    /// this is the most powerful operation in the process.
+    /// Mint the process root authority, from which any capability at any tier
+    /// can be granted: the most powerful operation in the process.
     ///
-    /// It is `unsafe` deliberately — not because it can trigger memory unsafety,
-    /// but to make every mint site a greppable, audited, opt-in `unsafe` block,
-    /// and to make the safety contract a *requirement of the caller* rather than
-    /// ambient authority any code could exercise. There is intentionally **no
-    /// safe public path** to an `Authority`.
-    ///
-    /// Beyond `unsafe`, the mint is **sealed behind the `launcher-mint` feature**
-    /// (see `# Sealing` below), so untrusted engine crates cannot even name it —
-    /// the machine-checked no-mint-reachability boundary (§5.4), not merely
-    /// trusted-launcher discipline.
+    /// It is `unsafe` not for memory safety but so every mint site is a
+    /// greppable, audited `unsafe` block; there is no safe public path to an
+    /// `Authority`.
     ///
     /// # Safety
     ///
-    /// The caller MUST be the trusted launcher / process entry point, and MUST
-    /// call this AT MOST ONCE, before any untrusted input is processed. Granting
-    /// or leaking the returned `Authority` (or caps minted from it) to untrusted
-    /// code defeats the entire capability model.
+    /// The caller must be the trusted launcher / process entry point, and must
+    /// call this at most once, before any untrusted input is processed. Leaking
+    /// the returned `Authority` (or caps minted from it) to untrusted code
+    /// defeats the capability model.
     ///
-    /// # Sealing — no-mint-reachability (ATERM_DESIGN §5.4)
+    /// # Sealing
     ///
-    /// This constructor is **sealed behind the `launcher-mint` cargo feature** (or
-    /// the crate's own `test` cfg): only the trusted launcher binaries (`aterm-gui`,
-    /// `aterm-cli`) enable that feature, so for every other crate the symbol does not
-    /// exist and **cannot be named — even inside an `unsafe` block**. That is the
-    /// no-mint-reachability seal: no parser / control handler / extension path can
-    /// reach a mint, because the mint is not in its compiled surface. It stays
-    /// `unsafe` (the audit marker) and `#[doc(hidden)]` (an unwelcoming, undiscoverable
-    /// shape).
-    ///
-    /// The property is proven abstractly by
-    /// [`aterm_spec::derive::mint_reachability_model`] (invariant `NoUntrustedTop`,
-    /// model-checked by `ty`) and bound to the real tree by the source-scan
-    /// conformance gate `tests/mint_reachability.rs`: exactly the two
-    /// launcher binaries enable `launcher-mint`, and no library/engine crate reaches
-    /// the mint in production code.
+    /// Sealed behind the `launcher-mint` cargo feature (or this crate's `test`
+    /// cfg): only the trusted launchers (`aterm-gui`, `aterm-cli`) enable it,
+    /// so for every other crate the symbol does not exist and cannot be named,
+    /// even in an `unsafe` block. Proven by
+    /// [`aterm_spec::derive::mint_reachability_model`] and bound to the tree by
+    /// `tests/mint_reachability.rs`.
     #[cfg(any(test, feature = "launcher-mint"))]
     #[doc(hidden)]
     #[must_use]
@@ -234,8 +190,8 @@ impl std::error::Error for Denied {}
 /// Zero-size effect markers naming a privileged effect a [`Cap`] authorizes. A
 /// function performing the effect takes `&Cap<ThisEffect>`.
 pub mod effects {
-    /// Authorizes spawning a child process (the PTY shell). The single spawn seam
-    /// (`aterm-pty`) should require `Cap<Spawn>`.
+    /// Authorizes spawning a child process (the PTY shell). The spawn seam
+    /// (`aterm-pty`) requires a `Cap<Spawn>` of at least `Trusted` tier.
     pub enum Spawn {}
 }
 
@@ -280,12 +236,9 @@ mod tests {
         assert_eq!(require(&certified, Tier::Trusted), Ok(()));
     }
 
-    // Demonstrates the effect layer: a privileged op that is impossible to call
-    // without a Cap<Spawn> of sufficient tier. (The no-STRUCT-FORGERY property is
-    // a compile-time fact — a `Cap { .. }` literal does not compile outside the
-    // crate because the `_seal` field is private. The separate no-mint-reachability
-    // property (§5.4) is the `launcher-mint` feature seal, gated by
-    // `tests/mint_reachability.rs`.)
+    // The effect layer: a privileged op that cannot be called without a
+    // Cap<Spawn> of sufficient tier. (Struct-literal forgery is a compile-time
+    // impossibility: the `_seal` field is private.)
     #[test]
     fn effect_gated_operation() {
         fn privileged_spawn(cap: &Cap<Spawn>) -> Result<&'static str, Denied> {
@@ -305,20 +258,5 @@ mod tests {
         let c: Cap<Spawn> = authority.grant(Tier::Trusted);
         let d = c; // Copy, not move
         assert_eq!(c.tier(), d.tier());
-    }
-
-    // Acceptance (CAP-1): minting the root authority is ONLY reachable through
-    // the `unsafe` audited entry. The mint compiles and works inside an `unsafe`
-    // block; there is no safe public path. A SAFE call —
-    //   `let _ = Authority::root_authority();`
-    // — does NOT compile (it requires `unsafe`), which is the whole point; we
-    // assert the unsafe path here and document that the safe path is a type error.
-    #[test]
-    fn root_authority_requires_unsafe_and_then_grants() {
-        // SAFETY: single-threaded test, no untrusted input — trusted-launcher
-        // contract trivially holds.
-        let authority = unsafe { Authority::root_authority() };
-        let spawn: Cap<Spawn> = authority.grant(Tier::Certified);
-        assert_eq!(spawn.tier(), Tier::Certified);
     }
 }

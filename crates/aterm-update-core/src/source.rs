@@ -10,8 +10,7 @@
 
 /// Default GitHub owner of the release repository (the `OWNER` in
 /// `github.com/OWNER/REPO`) — THE channel of every shipped binary. A development build
-/// may repoint it through the GUI's `[update] owner` config ([`REPOINT_IS_A_DEV_SEAM`]);
-/// the `$ATERM_UPDATE_OWNER` override is gone (2026-09-23, R2: no env alternatives).
+/// may repoint it through the GUI's `[update] owner` config ([`REPOINT_IS_A_DEV_SEAM`]).
 ///
 /// NOT a hand-maintained literal: `build.rs` derives it from the single tracked
 /// source of truth — `[workspace.metadata.aterm] update_channel` in the workspace
@@ -59,8 +58,8 @@ pub const ATPKG_INDEX_OWNER: &str = env!("ATERM_ATPKG_INDEX_OWNER");
 
 /// Whether this build honours a REPOINTED update source (`[update]` owner/repo in
 /// aterm.toml): only a development build does — `debug_assertions`, or this crate's
-/// `dev-seams` feature, which the release cutter never enables. The owner's rule
-/// (2026-09-23): one true path; alternatives are for development. A shipped binary
+/// `dev-seams` feature, which the release cutter never enables: one true path;
+/// alternatives are for development. A shipped binary
 /// reads its compiled channel and names a configured repoint once in the log.
 pub const REPOINT_IS_A_DEV_SEAM: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 
@@ -137,7 +136,7 @@ pub fn pick_slug(origin: &str, value: Option<&str>, default: &str) -> String {
         if is_valid_slug(v) {
             return v.to_string();
         }
-        warn_invalid(&format!("{origin} = {v:?}"));
+        warn_invalid(origin, v, default);
     }
     default.to_string()
 }
@@ -162,13 +161,10 @@ pub fn is_valid_slug(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Warn that a configured update source was ignored because it isn't a valid
-/// owner/repo name.
-fn warn_invalid(what: &str) {
-    aterm_log::warn!(
-        "aterm-update: ignoring invalid update source {what} (not a valid GitHub \
-         owner/repo name); falling back"
-    );
+/// Warn that the setting `origin` was ignored because `value` isn't a valid GitHub
+/// name, and say which `default` is used instead. The setting names its component.
+fn warn_invalid(origin: &str, value: &str, default: &str) {
+    aterm_log::warn!("ignoring {origin} = {value:?}: not a valid GitHub name; using {default}");
 }
 
 #[cfg(test)]
@@ -255,7 +251,7 @@ mod tests {
         assert_eq!(s.repo, DEFAULT_REPO);
     }
 
-    /// THE REPOINT IS A DEVELOPMENT SEAM (2026-09-23). A development build honours a
+    /// THE REPOINT IS A DEVELOPMENT SEAM. A development build honours a
     /// configured `[update]` owner/repo; a shipped binary reads its compiled channel
     /// whatever the file says — and a test build is a development build, so the
     /// shipped posture is pinned through [`Source::resolve_with`].

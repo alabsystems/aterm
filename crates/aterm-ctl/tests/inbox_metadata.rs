@@ -1,47 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exercise the actual CLI's stdout/stderr split against a private protocol peer:
-//! the line-framed verbs whose header carries facts the rows do not (`inbox`,
-//! `offscreen`).
-//! No live aterm session is discovered or addressed by these tests.
+//! The CLI's stdout/stderr split against a private protocol peer, for the
+//! line-framed verbs whose header carries facts the rows do not (`inbox`,
+//! `offscreen`). No live aterm session is discovered or addressed.
 
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn run_inbox(args: &[&str], reply: &[u8]) -> Output {
     run_verb("inbox", args, reply)
 }
 
 fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
     // Keep the socket below macOS's short sun_path limit.
-    let directory = PathBuf::from("/tmp").join(format!(
-        "at-inbox-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&directory)
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("at-inbox-")
+        .tempdir_in("/tmp")
         .unwrap();
-    let scratch = Scratch(directory);
-    let socket = scratch.0.join("peer.sock");
+    let socket = scratch.path().join("peer.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-ctl"));
@@ -51,7 +32,7 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
         }
     }
     // No `--timeout 2`: the CLI's exchange deadline is not what these tests
-    // judge, and 2 s of it timed how soon THIS process was scheduled to answer.
+    // judge, and 2 s of it timed how soon this process was scheduled to answer.
     let mut cli = command
         .arg("--sock")
         .arg(&socket)
@@ -62,16 +43,10 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // THE WAIT ENDS ON THE CLI, NEVER ON A CLOCK (2026-09-25). The peer's 5 s
-    // bound started before the spawn, so it charged the CLI's exec and start
-    // to "CLI never connected". The gate relinks `aterm-ctl`, and this file's
-    // tests are the first to exec it; a fresh executable's first exec parks in
-    // macOS's AppleSystemPolicy hook until syspolicyd assesses it (fresh test
-    // binaries included, docs/HANDOFF-intel-mac-2026-09-14.md §5; bc2918c70
-    // measured 0.4 s idle and ~13 s with the assessor busy), and six of them
-    // start at once on a loaded machine. The CLI cannot park before its
-    // `connect` (a listening Unix socket answers at once), so it either
-    // connects or exits: those two events end the wait.
+    // The wait ends on the CLI, never on a clock: the CLI either connects or
+    // exits. A fresh executable's first exec can stall for seconds in macOS's
+    // policy assessment on a loaded machine, so a fixed bound would blame the
+    // CLI for its own start-up.
     let mut connection = loop {
         match listener.accept() {
             Ok((connection, _)) => break connection,
@@ -88,17 +63,15 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
             Err(error) => panic!("accept: {error}"),
         }
     };
-    // macOS (like every BSD) hands `accept` a socket that INHERITS the
-    // listener's O_NONBLOCK: a CLI preempted between `connect` and its request
-    // write would read as EAGAIN (`Os { code: 35, kind: WouldBlock }`). The
-    // read blocks with no timeout — it ends on the request line, or on EOF if
-    // the CLI exits without sending one.
+    // On macOS (as on every BSD) an accepted socket inherits the listener's
+    // O_NONBLOCK, so a CLI preempted before its request write would read as
+    // EAGAIN. Block with no timeout: the read ends on the request line or EOF.
     connection.set_nonblocking(false).unwrap();
     let mut request = String::new();
     BufReader::new(&connection).read_line(&mut request).unwrap();
     connection.write_all(reply).unwrap();
     connection.flush().unwrap();
-    // Hang up after the reply, as the peer thread's return used to.
+    // Hang up after the reply.
     drop(connection);
     let output = cli.wait_with_output().unwrap();
     let expected = std::iter::once("@s-0123456789abcdef0123")

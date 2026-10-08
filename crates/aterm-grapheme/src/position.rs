@@ -4,11 +4,11 @@
 
 //! Grapheme position conversion, cell assignment, and segmentation utilities.
 
+use crate::grid::grid_graphemes;
 #[cfg(any(test, kani))]
 use crate::types::Grapheme;
 #[cfg(any(test, kani))]
-use crate::width::grapheme_width;
-use crate::width::split_graphemes;
+use crate::width::{grapheme_width, split_graphemes};
 
 /// Find the grapheme cluster that contains a given byte offset.
 ///
@@ -52,22 +52,28 @@ pub fn grapheme_at_column(s: &str, column: usize) -> Option<Grapheme<'_>> {
     None
 }
 
-/// Convert a byte offset to a display column.
+/// Convert a byte offset to a GRID column: the number of terminal cells the
+/// clusters that start before `byte_offset` occupy.
 ///
 /// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
-/// ENSURES: returns a column in `0..=grapheme_width(s).display_width`.
+/// ENSURES: returns a column in `0..=str_grid_columns(s)`, and
+/// `byte_to_column(s, s.len()) == str_grid_columns(s)`.
 ///
-/// Returns the column position after accounting for all graphemes that
-/// start before the byte offset. Byte offsets that fall inside a grapheme
-/// map to the column after that grapheme.
+/// Columns are the grid's (see [`grid_graphemes`]), not display width: every
+/// caller measures text it extracted from the grid against grid columns (the
+/// soft-wrap join pads each row out to the grid width; the double-click word
+/// walk asks whether a clicked cell lies past the text). A Devanagari conjunct
+/// is one cluster that LOOKS one cell wide and OCCUPIES three, so charging
+/// display width put every later column two cells left of its text. Byte
+/// offsets that fall inside a grapheme map to the column after that grapheme.
 pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
-    let mut column = 0;
+    let mut column = 0usize;
 
-    for g in split_graphemes(s) {
+    for g in grid_graphemes(s) {
         if g.byte_offset >= byte_offset {
             return column;
         }
-        column += g.width;
+        column = g.end_col;
     }
 
     column
@@ -93,32 +99,25 @@ pub fn column_to_byte(s: &str, column: usize) -> usize {
     s.len()
 }
 
-/// Convert a display column to a character index.
+/// Convert a GRID column to a character index.
 ///
 /// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns a character index in `0..=s.chars().count()`.
 ///
-/// Returns the character index at the start of the grapheme that covers
-/// the given column. Columns inside a wide grapheme map to that grapheme's
-/// first character index. Zero-width graphemes (standalone combining marks,
-/// ZWJ, ZWNJ) are treated as occupying 1 column for mapping purposes,
-/// consistent with `column_to_byte` and `grapheme_at_column`.
+/// Returns the character index at the start of the grapheme whose grid cells
+/// (see [`grid_graphemes`], not display width) cover the given column. Columns
+/// inside a multi-cell grapheme map to that grapheme's first character index.
+/// A grapheme the grid folds into the cell before it (a zero-width format
+/// character, the `ය` of Sinhala `ක්‍ය`) is drawn in that cell, which the
+/// grapheme before it already names, so a column maps to it never.
 pub fn column_to_char_index(s: &str, column: usize) -> usize {
-    let mut current_col = 0usize;
     let mut char_index = 0usize;
 
-    for g in split_graphemes(s) {
-        // Zero-width graphemes (standalone combining marks, ZWJ, ZWNJ) are
-        // treated as occupying at least 1 column for column-to-position
-        // mapping, matching the convention in column_to_byte, assign_cells,
-        // and grapheme_at_column.
-        let effective_width = g.width.max(1);
-        let next_col = current_col + effective_width;
-        if column < next_col {
+    for g in grid_graphemes(s) {
+        if column < g.end_col {
             return char_index;
         }
-        current_col = next_col;
-        char_index += g.text.chars().count();
+        char_index = char_index.saturating_add(g.text.chars().count());
     }
 
     char_index

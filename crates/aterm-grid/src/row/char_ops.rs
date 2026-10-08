@@ -23,8 +23,8 @@ impl Row {
 
     /// Insert `count` cells filled with `fill` at `col`, shifting existing cells right.
     ///
-    /// Like `insert_chars()` but fills the gap with `fill` instead of `Cell::EMPTY`,
-    /// supporting BCE (Background Color Erase) (#7522).
+    /// Like `insert_chars()` but fills the gap with `fill` instead of
+    /// `Cell::EMPTY` (BCE).
     pub fn insert_chars_fill(&mut self, col: u16, count: u16, fill: Cell) {
         if count == 0 || col >= self.cols() {
             return;
@@ -38,21 +38,16 @@ impl Row {
         // Wide character fixup: insertion at a boundary that bisects a wide
         // character pair creates orphaned halves that must be cleared.
 
-        // Left boundary: if inserting at a WIDE_CONTINUATION, the insertion
-        // bisects the pair. Orphan BOTH halves to `fill`: the WIDE head at
-        // col-1, AND the continuation at col itself. Clearing only the head
-        // would shift the continuation right (below) still carrying its stale
-        // WIDE_CONTINUATION flag — a later insert/erase at that cell would then
-        // treat the unrelated cell to its left as a wide head and wrongly clear
-        // it (e.g. `中\b\x1b[4he#` lost the inserted `e`).
+        // Left boundary: inserting at a wide continuation bisects the pair, so
+        // set both halves to `fill`: the head at col-1 and the continuation at
+        // col. Clearing only the head would shift the continuation right with a
+        // stale WIDE_CONTINUATION bit, and a later edit there would treat the
+        // cell to its left as a wide head (e.g. `中\b\x1b[4he#` losing `e`).
         //
-        // Use the context-aware `is_cell_wide_continuation`: bit 10 (WIDE_CONTINUATION)
-        // aliases PROTECTED, so neither a raw `cells[col].WIDE_CONTINUATION` test (fires
-        // on a DECSCA-protected cell at col) nor a lone `cells[col-1].WIDE` test (fires on
-        // a dangling WIDE head whose continuation was overwritten by a narrow cell, e.g.
-        // `中` then `A` at col, losing the `A`) is correct alone. The helper requires BOTH
-        // bit 10 on cells[col] AND a WIDE head at col-1 (round-5 DECCRA / round-7/8
-        // aliasing-class fix).
+        // `is_cell_wide_continuation` requires bit 10 on cells[col] and a WIDE
+        // head at col-1: bit 10 aliases PROTECTED, so a raw bit test would fire on
+        // a protected cell, and a lone `cells[col-1].WIDE` test on a head whose
+        // continuation was overwritten by a narrow cell (`中` then `A`).
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
             self.cells[col] = fill;
@@ -83,10 +78,9 @@ impl Row {
         self.flags |= RowFlags::DIRTY;
         if old_len == 0 || col >= old_len {
             // No prior content was shifted. With an EMPTY fill the row stays
-            // empty, so `len` is unchanged. But a BCE (non-empty) fill writes
-            // visible background-colored blanks in [col, fill_end); those must
-            // be counted in `len` or render_row hides them (xterm/alacritty
-            // show them). Recalculate over the filled region (#7522 gap).
+            // empty and `len` is unchanged; a BCE (non-empty) fill writes visible
+            // background blanks in [col, fill_end), which `len` must count or
+            // render_row hides them.
             if !fill.is_empty() {
                 self.recalculate_len_up_to(fill_end);
             }
@@ -118,7 +112,7 @@ impl Row {
     /// Delete `count` cells at `col` with BCE fill, shifting remaining cells left.
     ///
     /// Like `delete_chars()` but fills vacated positions with `fill` instead of
-    /// `Cell::EMPTY`, supporting BCE (Background Color Erase) (#7522).
+    /// `Cell::EMPTY` (BCE).
     pub fn delete_chars_fill(&mut self, col: u16, count: u16, fill: Cell) {
         if count == 0 || col >= self.cols() {
             return;
@@ -132,13 +126,9 @@ impl Row {
         // Wide character fixup: deletion at a boundary that bisects a wide
         // character pair creates orphaned halves that must be cleared.
 
-        // Left boundary: if col is the continuation of a WIDE head at col-1, deleting
-        // it orphans the head — clear the head too. Use the context-aware
-        // `is_cell_wide_continuation` (requires bit 10 on cells[col] AND a WIDE head at
-        // col-1): a lone `cells[col-1].WIDE` test would blank a live head whose
-        // continuation was overwritten by a narrow cell at col, and a raw
-        // `cells[col].WIDE_CONTINUATION` test would fire on a DECSCA-protected cell at col
-        // (bit-10 aliasing; round-7/8 fix).
+        // Left boundary: if col is the continuation of a WIDE head at col-1,
+        // deleting it orphans the head, so clear the head too, using the
+        // context-aware `is_cell_wide_continuation` (see `insert_chars_fill`).
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
         }
@@ -150,11 +140,9 @@ impl Row {
         if self.cells[last_deleted].flags().contains(CellFlags::WIDE) && src_start < cols {
             self.cells[src_start] = fill;
         }
-        // NOTE: no separate WIDE_CONTINUATION check on cells[src_start] — a genuine
-        // orphaned continuation there always has its WIDE head at src_start-1 ==
-        // last_deleted, already handled by the WIDE check above. A raw
-        // WIDE_CONTINUATION test here would only ever fire (falsely) on a
-        // DECSCA-protected cell shifting into col and silently destroy it.
+        // No separate WIDE_CONTINUATION check on cells[src_start]: a genuine
+        // orphan there has its head at src_start-1 == last_deleted, handled above,
+        // and a raw bit test would fire on a protected cell shifting into col.
 
         // Shift cells left using copy_within (single memmove).
         let shift_len = cols - src_start;
@@ -171,22 +159,18 @@ impl Row {
 
         self.flags |= RowFlags::DIRTY;
         if old_len == 0 || col >= old_len {
-            // No prior content beyond the cursor was shifted. With an EMPTY
-            // fill the row stays empty. A BCE (non-empty) fill writes visible
-            // background-colored blanks at the right end ([fill_start, cols));
-            // those must be counted in `len` or render_row hides them
-            // (xterm/alacritty show them). Recalculate over the whole row
-            // (#7522 gap).
+            // No content beyond the cursor was shifted. With an EMPTY fill the
+            // row stays empty; a BCE (non-empty) fill writes visible blanks at the
+            // right end ([fill_start, cols)), which `len` must count or render_row
+            // hides them. Recalculate over the whole row.
             if !fill.is_empty() {
                 self.recalculate_len_up_to(cols);
             }
             return;
         }
         // With a BCE (non-empty) fill the vacated right-margin cells
-        // ([cols-count, cols)) are background-colored and therefore non-empty,
-        // so `len` must extend to the row edge instead of shrinking by `count`.
-        // The plain `old_len - count` shrink is only valid for an EMPTY fill
-        // (#7522 gap).
+        // ([cols-count, cols)) are non-empty, so `len` extends to the row edge;
+        // the plain `old_len - count` shrink holds only for an EMPTY fill.
         if !fill.is_empty() {
             self.recalculate_len_up_to(cols);
             return;
@@ -194,16 +178,12 @@ impl Row {
         let delete_end = col + count;
         if delete_end < old_len {
             // Fast path: a dense tail shrinks by exactly `count`. But the
-            // right-boundary wide fixup above (lines 146-149) clears an EXTRA cell
-            // — the deleted WIDE head's orphaned continuation at src_start ==
-            // col+count. When that continuation was the row's last content
-            // (old_len == col+count+1), the shift moves the now-empty cell into the
-            // tail, so the true extent is one less than old_len - count and the
-            // plain shrink leaves len stale-high (phantom trailing space through
-            // row_text/search/scrollback). Guard exactly like erase_chars_with:
-            // recalc only when the new last cell turns out empty (never
-            // over-shrinks, preserves the dense-tail fast path). #7522 write/erase
-            // len class — delete_chars_fill was the last DCH primitive missing it.
+            // right-boundary wide fixup above clears an extra cell, the deleted
+            // head's continuation at src_start == col+count; when that was the
+            // row's last content (old_len == col+count+1), the plain shrink leaves
+            // len one too high (a phantom trailing space in
+            // row_text/search/scrollback). Recalculate only when the new last cell
+            // is empty, as erase_chars_with does (never over-shrinks).
             let cand = old_len - count;
             self.len = u16_from_usize(cand);
             if cand > 0 && self.cells[cand - 1].is_empty() {
@@ -215,8 +195,8 @@ impl Row {
     }
 
     /// Insert `count` cells at `col`, shifting cells right up to `right_bound`,
-    /// with BCE fill (#7522). Cells shifted past `right_bound` are discarded;
-    /// used when DECLRMM horizontal margins restrict the shift region (#7320).
+    /// with BCE fill. Cells shifted past `right_bound` are discarded; used when
+    /// DECLRMM horizontal margins restrict the shift region.
     pub fn insert_chars_bounded_fill(
         &mut self,
         col: u16,
@@ -233,19 +213,17 @@ impl Row {
         let count = count as usize;
         let rb = right_bound as usize;
 
-        // Wide character fixup at left boundary. Use the context-aware
-        // `is_cell_wide_continuation` (bit 10 on cells[col] AND a WIDE head at col-1):
-        // neither a lone `cells[col-1].WIDE` test (blanks a live head whose continuation
-        // was overwritten) nor a raw `cells[col].WIDE_CONTINUATION` test (fires on a
-        // DECSCA-protected cell at col, whose col-1 is OUTSIDE the region) is correct
-        // alone (bit-10 aliasing; round-7/8 fix).
+        // Left-boundary wide fixup via the context-aware
+        // `is_cell_wide_continuation` (bit 10 on cells[col] and a WIDE head at
+        // col-1). Bit 10 aliases PROTECTED, so a raw WIDE_CONTINUATION test would
+        // fire on a protected cell, and a lone `cells[col-1].WIDE` test on a head
+        // whose continuation was overwritten by a narrow cell.
         if self.is_cell_wide_continuation(col as u16) {
-            // Bisecting a wide pair: orphan BOTH halves to `fill`. Clearing only
-            // the head at col-1 would leave the continuation at col carrying its
-            // stale WIDE_CONTINUATION bit (bit 10, aliases PROTECTED) to be shifted
-            // right by copy_within below — a phantom protected spacer that a later
-            // selective erase (DECSED/DECSEL) then skips, and which keeps the wide
-            // char's bg/attrs. Mirror insert_chars_fill, which clears both halves.
+            // Bisecting a wide pair: set both halves to `fill`. Clearing only the
+            // head would let copy_within shift the continuation right with its
+            // stale bit 10 (aliasing PROTECTED): a phantom protected spacer that
+            // selective erases skip and that keeps the wide char's bg/attrs. As in
+            // insert_chars_fill.
             self.cells[col - 1] = fill;
             self.cells[col] = fill;
         }
@@ -259,9 +237,9 @@ impl Row {
             self.cells[shift_end - 1] = fill;
         }
 
-        // Wide character fixup at outer right boundary: if cells[rb-1] is WIDE,
-        // its continuation at cells[rb] is outside the bounded region and will
-        // be orphaned when cells[rb-1] is overwritten by the shift (#7492).
+        // Wide fixup at the outer right boundary: if cells[rb-1] is WIDE, its
+        // continuation at cells[rb] is outside the region and is orphaned when
+        // the shift overwrites cells[rb-1].
         if rb < self.cells.len() && self.cells[rb - 1].flags().contains(CellFlags::WIDE) {
             self.cells[rb] = fill;
         }
@@ -283,7 +261,7 @@ impl Row {
     }
 
     /// Delete `count` cells at `col`, shifting cells left within `right_bound`,
-    /// with BCE fill (#7522).
+    /// with BCE fill.
     pub fn delete_chars_bounded_fill(
         &mut self,
         col: u16,
@@ -300,12 +278,11 @@ impl Row {
         let count = count as usize;
         let rb = right_bound as usize;
 
-        // Wide character fixup at left boundary. Use the context-aware
-        // `is_cell_wide_continuation` (bit 10 on cells[col] AND a WIDE head at col-1):
-        // neither a lone `cells[col-1].WIDE` test (blanks a live head whose continuation
-        // was overwritten) nor a raw `cells[col].WIDE_CONTINUATION` test (fires on a
-        // DECSCA-protected cell at col, whose col-1 is OUTSIDE the region) is correct
-        // alone (bit-10 aliasing; round-7/8 fix).
+        // Left-boundary wide fixup via the context-aware
+        // `is_cell_wide_continuation` (bit 10 on cells[col] and a WIDE head at
+        // col-1). Bit 10 aliases PROTECTED, so a raw WIDE_CONTINUATION test would
+        // fire on a protected cell, and a lone `cells[col-1].WIDE` test on a head
+        // whose continuation was overwritten by a narrow cell.
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
         }
@@ -318,14 +295,13 @@ impl Row {
         if self.cells[last_deleted].flags().contains(CellFlags::WIDE) && src_start < rb {
             self.cells[src_start] = fill;
         }
-        // NOTE: no separate WIDE_CONTINUATION check on cells[src_start] — a genuine
-        // orphan there has its WIDE head at src_start-1 == last_deleted, already
-        // handled above. A raw WIDE_CONTINUATION test would only misfire on a
-        // DECSCA-protected cell shifting into col and silently destroy it.
+        // No separate WIDE_CONTINUATION check on cells[src_start]: a genuine
+        // orphan there has its head at src_start-1 == last_deleted, handled
+        // above, and a raw bit test would fire on a protected cell.
 
-        // Wide character fixup at outer right boundary: if cells[rb-1] is WIDE,
-        // its continuation at cells[rb] is outside the bounded region and will
-        // be orphaned when cells[rb-1] is overwritten by the fill (#7492).
+        // Wide fixup at the outer right boundary: if cells[rb-1] is WIDE, its
+        // continuation at cells[rb] is outside the region and is orphaned when
+        // the fill overwrites cells[rb-1].
         if rb < self.cells.len() && self.cells[rb - 1].flags().contains(CellFlags::WIDE) {
             self.cells[rb] = fill;
         }
@@ -358,10 +334,10 @@ impl Row {
         self.erase_chars_with(col, count, Cell::EMPTY);
     }
 
-    /// Erase `count` cells starting at `col` with a BCE fill cell (#7522).
+    /// Erase `count` cells starting at `col` with a BCE fill cell.
     ///
-    /// Like `erase_chars()` but fills with `fill` instead of `Cell::EMPTY`,
-    /// supporting BCE (Background Color Erase) per VT420/xterm spec.
+    /// Like `erase_chars()` but fills with `fill` instead of `Cell::EMPTY`
+    /// (BCE per VT420/xterm).
     pub fn erase_chars_with(&mut self, col: u16, count: u16, fill: Cell) {
         if count == 0 || col >= self.cols() {
             return;
@@ -376,13 +352,9 @@ impl Row {
         // Wide character fixup: erasure at a boundary that bisects a wide
         // character pair creates orphaned halves that must be cleared.
 
-        // Left boundary: if col is the continuation of a WIDE head at col-1, erasing
-        // it orphans the head — clear the head too. Use the context-aware
-        // `is_cell_wide_continuation` (bit 10 on cells[col] AND a WIDE head at col-1):
-        // neither a lone `cells[col-1].WIDE` test (blanks a live head whose continuation
-        // was overwritten by a narrow cell at col) nor a raw `cells[col].WIDE_CONTINUATION`
-        // test (fires on a DECSCA-protected cell at col) is correct alone (bit-10
-        // aliasing; round-7/8 fix).
+        // Left boundary: if col is the continuation of a WIDE head at col-1,
+        // erasing it orphans the head, so clear the head too, using the
+        // context-aware `is_cell_wide_continuation` (see `insert_chars_fill`).
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
         }
@@ -404,20 +376,18 @@ impl Row {
             let new_end = end.max(old_len);
             self.len = u16_from_usize(new_end);
         } else if col < old_len && self.cells[old_len - 1].is_empty() {
-            // The previous last-content cell (old_len - 1) is now empty — either
-            // it was inside the erase range or it was the orphaned WIDE
-            // continuation cleared at index `end` above (the `end >= old_len`
-            // guard misses that case when the wide pair is the row's tail).
-            // `old_len - 1` is in bounds since `col < old_len` implies old_len >= 1.
+            // The previous last content cell (old_len - 1) is now empty: it was
+            // inside the erase range, or it was the wide continuation cleared at
+            // `end` above (which an `end >= old_len` guard would miss).
+            // `col < old_len` implies old_len >= 1, so the index is in bounds.
             self.recalculate_len_up_to(old_len);
         }
     }
 
     /// Selectively erase `count` cells starting at `col`, without shifting.
     ///
-    /// Like [`erase_chars`](Self::erase_chars) but respects DECSCA character
-    /// protection: protected cells are skipped. Per VT420/VT510, ECH honours
-    /// the character protection attribute (#7523).
+    /// Like [`erase_chars`](Self::erase_chars) but skips DECSCA-protected
+    /// cells: per VT420/VT510, ECH honours character protection.
     ///
     /// Uses the context-aware [`is_cell_protected`](Self::is_cell_protected)
     /// check to correctly handle wide characters.
@@ -434,16 +404,12 @@ impl Row {
         let old_len = self.len as usize;
         let mut any_erased = false;
 
-        // Left boundary fixup: if the first cell in the range is a
-        // WIDE_CONTINUATION of an unprotected WIDE cell outside the
-        // range, clearing the continuation creates an orphaned WIDE
-        // cell. Clear the WIDE head too — AND the in-range continuation
-        // at `col` itself. Once the head at col-1 is cleared to a non-WIDE
-        // fill, is_cell_protected(col) reads the continuation's bit 10 (which
-        // aliases PROTECTED) as protected, so the forward loop below would
-        // SKIP col and leave a phantom protected spacer. Mirrors the sibling
-        // erase primitives selective_clear_range / selective_wipe_range,
-        // which clear both halves for exactly this reason (bit-10 class).
+        // Left boundary: if the first cell is the continuation of an unprotected
+        // WIDE cell outside the range, clear that head and the continuation at
+        // `col`. Once the head is non-WIDE, is_cell_protected(col) would read
+        // the continuation's bit 10 (aliasing PROTECTED) as protected and the
+        // loop would skip it, leaving a phantom protected spacer. As in
+        // selective_clear_range / selective_wipe_range.
         if col > 0
             && self.cells[col]
                 .flags()
@@ -471,12 +437,10 @@ impl Row {
 
         if any_erased {
             self.flags |= RowFlags::DIRTY;
-            // Do NOT gate on `end >= old_len`: the WIDE-head co-clear above clears
-            // cells[c+1], which for c == end-1 is cells[end], ONE column past the
-            // range. When that was the tail content (old_len == end + 1) the old
-            // guard missed it and len stayed stale-high. recalculate_len_up_to(old_len)
-            // rescans the prefix and never over-shrinks (matches selective_clear_range
-            // / selective_wipe_range / clear_range).
+            // Not gated on `end >= old_len`: the WIDE-head co-clear above clears
+            // cells[c+1], which for c == end-1 is cells[end], one past the range;
+            // when that was the tail (old_len == end + 1) such a gate would leave
+            // len stale-high. recalculate_len_up_to(old_len) never over-shrinks.
             if col < old_len && self.cells[old_len - 1].is_empty() {
                 self.recalculate_len_up_to(old_len);
             }

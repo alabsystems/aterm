@@ -1,86 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NEW LINE'S FADE (2026-09-14) — the owner, on the 0.85 dev build, Claude
-//! Code in the front window: *"the 0.85 trail is much better though I noticed
-//! that when I went to a new line that the contrail disappeared versus nicely
-//! fading"*.
+//! The new line's fade: when Enter submits in Claude Code, the composer is
+//! cleared and every glyph under the band goes blank at once. The band must fade
+//! out, not vanish (owner, 2026-09-14).
 //!
-//! What he pressed was Enter, and in Claude Code Enter SUBMITS: the composer
-//! is cleared, so every glyph under the band goes blank at once. Two
-//! mechanisms shipped in `2f15705bc` both answered that with the 120 ms melt
-//! that was designed for STALE LIGHT OVER REPLACED TEXT (an input box re-laid
-//! elsewhere — light sitting under the WRONG letters, his "stray rainbow"):
-//! the content witness retired every blanked cell on `RETIRE_MELT_S`, and a
-//! declined row-change relocation retired the whole abandoned row on the same
-//! clock whether or not its text had moved. Where different glyphs sit under
-//! the band that speed is right. It is wrong when nothing sits under the
-//! light at all — then the mark has nothing to be wrong over, and it should
-//! leave the way a row the hand left leaves everywhere else: through its own
-//! swoosh, the retract drawn farthest-first into the hand over
-//! `RETRACT_DUR_S + RETRACT_FADE_S` = 0.64 s, the head the last light to go.
+//! The content witness's 120 ms melt (`RETIRE_MELT_S`) is for stale light over
+//! replaced text (an input box re-laid elsewhere, light under the wrong
+//! letters). When nothing sits under the light, the mark leaves as any row the
+//! hand left does: through its own swoosh, the retract drawn farthest-first into
+//! the hand over `RETRACT_DUR_S + RETRACT_FADE_S` = 0.64 s, the head last.
 //!
-//! Every law below runs at the HOST seam — a real `aterm_core::terminal::
-//! Terminal` driven byte for byte, its rows sampled exactly as `app_render.rs`'s
-//! frame hold samples them, ticked through `CursorGlow::tick` — and reads the row's
-//! COVERAGE CENSUS frame by frame: the share of the row's pixel band the bed's
-//! quads cover, weighted by their opacity, the same number the on-glass
-//! measurement takes from `image` captures
-//! (`docs/measured/new-line-fade-2026-09-14.md`). Each law says whether it was
-//! RED on main.
+//! Every law runs at the host seam (a real `aterm_core::terminal::Terminal`
+//! driven byte for byte, rows sampled as `app_render.rs`'s frame hold does,
+//! ticked through `CursorGlow::tick`) and reads the row's coverage census frame
+//! by frame: the share of the row's pixel band the bed's quads cover, weighted
+//! by opacity, the same number an on-glass `image` capture measures.
 
+use crate::common::{
+    caret_sample, note_blink, observe_caret_row, observe_ribbon_rows, rainbow_cfg,
+};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::ribbon::{
     RETIRE_MELT_S, RETRACT_DUR_S, RETRACT_FADE_S, SWOOSH_TOTAL_S,
 };
-use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
 const ROWS: usize = 24;
 const COLS: usize = 80;
 const CW: usize = 8;
 const CH: usize = 16;
-
-fn geom() -> Geom {
-    Geom {
-        cw: CW,
-        ch: CH,
-        rows: ROWS,
-        cols: COLS,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (COLS * CW) as u16,
-        win_h: (ROWS * CH) as u16,
-        head: 0,
-    }
-}
-
-/// The owner's setup: rainbow kitty at intensity 0.70.
-fn cfg() -> GlowConfig {
-    GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
-    }
-}
 
 /// The host: one terminal, one glow engine, one clock.
 struct Host {
@@ -106,8 +57,8 @@ impl Host {
         let mut h = Self {
             term,
             glow: CursorGlow::default(),
-            cfg: cfg(),
-            g: geom(),
+            cfg: rainbow_cfg(),
+            g: crate::common::geom(ROWS, COLS, CW, CH),
             now,
             out: Vec::new(),
             row_buf: Vec::new(),
@@ -118,29 +69,15 @@ impl Host {
         h
     }
 
-    /// EXACTLY the frame hold, then the tick: sample the cursor, the repaint blink,
-    /// the caret row's probe, and the rows the resident ribbon occupies —
-    /// all from the terminal AFTER the last `process` — then advance the
-    /// engine one frame.
+    /// The frame hold then the tick: sample the cursor, repaint blink, caret row
+    /// probe and the ribbon's rows from the terminal after the last `process`,
+    /// then advance one frame.
     fn frame(&mut self) {
-        let c = self.term.cursor();
-        let cur = self.term.cursor_visible().then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink_seen {
-            self.blink_seen = epoch;
-            self.glow.note_repaint_blink(self.now);
-        }
+        let (c, cur) = caret_sample(&self.term);
+        note_blink(&self.term, &mut self.glow, &mut self.blink_seen, self.now);
         self.glow.note_context(self.term.is_alternate_screen());
-        self.term
-            .row_cols_into(usize::from(c.row), &mut self.row_buf);
-        self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            self.glow.observe_ribbon_row(r, &self.row_buf);
-        }
+        observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+        observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
     }
@@ -172,10 +109,9 @@ impl Host {
         }
     }
 
-    /// THE ENTER KEY, 90 ms after the last key: the app_input seam arms the
-    /// return hint (`note_return`), the PTY answers `bytes` — a shell's
-    /// `\r\n` and its next prompt, or a composer's clear-and-redraw — and
-    /// the frame presents. Not a typed key: it renews no row.
+    /// Enter, 90 ms after the last key: the return hint is armed (`note_return`),
+    /// the PTY answers `bytes` (a shell's `\r\n` and next prompt, or a composer's
+    /// clear-and-redraw), and the frame presents. Renews no row.
     fn ret(&mut self, bytes: &[u8]) {
         self.now += Duration::from_millis(90);
         self.glow.note_return(self.now);
@@ -233,9 +169,9 @@ impl Host {
             .collect()
     }
 
-    /// The bed's quads whose vertical extent covers the CENTRE of `row`'s
-    /// pixel band this frame. The centre, not the damage-row tag: the tall
-    /// body reaches a tenth of a cell into the row above.
+    /// The bed's quads whose vertical extent covers the centre of `row`'s pixel
+    /// band this frame (the tall body reaches a tenth of a cell into the row
+    /// above, so the damage-row tag is not used).
     fn row_quads(&self, row: u16) -> impl Iterator<Item = &GlowQuad> {
         let centre = f32::from(self.g.origin_y) + (f32::from(row) + 0.5) * CH as f32;
         self.glow.under_quads().iter().filter(move |q| {
@@ -249,10 +185,8 @@ impl Host {
         self.row_quads(row).next().is_some()
     }
 
-    /// THE ROW'S COVERAGE CENSUS: the share of `row`'s pixel width the bed's
-    /// quads cover this frame, each weighted by its source-over opacity —
-    /// one number per frame, the same census the on-glass measurement takes
-    /// from `image` captures.
+    /// The row's coverage census: the share of `row`'s pixel width the bed's
+    /// quads cover this frame, weighted by source-over opacity.
     fn coverage(&self, row: u16) -> f32 {
         let sum: f32 = self
             .row_quads(row)
@@ -287,8 +221,8 @@ impl Host {
         self.glow.v2_status().map_or(0, |s| s.retired)
     }
 
-    /// `ribbon_followed=`: the cells the follow pass carried to another
-    /// row with their text (2026-09-21).
+    /// `ribbon_followed=`: cells the follow pass carried to another row with
+    /// their text.
     fn followed(&self) -> u64 {
         self.glow.v2_status().map_or(0, |s| s.followed)
     }
@@ -310,9 +244,9 @@ struct Sample {
     resident: usize,
 }
 
-/// The first instant a census reads zero light and never reads light again.
-/// The retract's last frames are sub-pixel and sub-alpha, so the glass goes
-/// dark a few frames before the cells leave the pool ([`empty_at`]).
+/// The first instant a census reads zero light and never light again. The
+/// retract's last frames are sub-pixel and sub-alpha, so the glass goes dark a
+/// few frames before the cells leave the pool ([`empty_at`]).
 fn dark_at(curve: &[Sample]) -> Option<f32> {
     let last_lit = curve.iter().rposition(|s| s.cov > 0.0)?;
     curve.get(last_lit + 1).map(|s| s.t)
@@ -331,13 +265,11 @@ fn worst_step(curve: &[Sample]) -> f32 {
         .fold(0.0, f32::max)
 }
 
-/// The largest frame-to-frame RISE in coverage. The light itself never
-/// brightens (every term of `Ribbon::env_of` is non-increasing once the hand
-/// has stopped), but the census reads QUADS — a `u16` width and a `u8` alpha
-/// per run — and the retract moves every run boundary toward the caret each
-/// frame, so a boundary rounding to the next pixel while the alpha drops one
-/// step can read a hair brighter: on the shell Enter's own swoosh this is
-/// under [`RISE_TOL`], and the submit's exit must not exceed it.
+/// The largest frame-to-frame rise in coverage. The light never brightens once
+/// the hand stops (`Ribbon::env_of` is non-increasing), but the census reads
+/// quads (a `u16` width and `u8` alpha per run) and the retract moves run
+/// boundaries each frame, so pixel rounding can read a hair brighter; the shell
+/// Enter's swoosh stays under [`RISE_TOL`], and the submit's must too.
 fn max_rise(curve: &[Sample]) -> f32 {
     curve
         .windows(2)
@@ -364,9 +296,8 @@ fn fmt(curve: &[Sample]) -> String {
         .join(" ")
 }
 
-/// The swoosh's retract, on the glass: its light reads zero no earlier than
-/// this after the exit began (the census's own floor — the retract's
-/// `0.40 + 0.24 s` less the sub-pixel, sub-alpha tail of its last frames).
+/// The swoosh's retract on glass reads zero no earlier than this after the exit
+/// began (the retract's `0.40 + 0.24 s` less its sub-pixel, sub-alpha tail).
 const GLASS_DARK_FLOOR_S: f32 = 0.5;
 /// …and its cells leave the pool no earlier than this: the light's own clock.
 const POOL_EMPTY_FLOOR_S: f32 = 0.6;
@@ -398,20 +329,19 @@ fn hello(row: u16) -> Host {
     h
 }
 
-/// The composer's clear on Enter, Claude Code's shape: inside a DECTCEM hide
-/// bracket the input row is erased, the prompt put back, the caret parked
-/// after it — on the same row.
+/// Claude Code's composer clear on Enter: inside a DECTCEM hide bracket the
+/// input row is erased, the prompt put back and the caret parked after it, on
+/// the same row.
 const SUBMIT_SAME_ROW: &[u8] = b"\x1b[?25l\x1b[6;1H\x1b[2K> \x1b[6;3H\x1b[?25h";
 
 /// The same submit when the transcript grew under it: the old input row is
 /// erased and the empty composer is re-laid two rows down, the caret with it.
 const SUBMIT_TWO_ROWS_DOWN: &[u8] = b"\x1b[?25l\x1b[6;1H\x1b[2K\x1b[8;1H> \x1b[8;3H\x1b[?25h";
 
-/// The ordinary graceful exit every other law is measured against: a
-/// shell's Enter — the typed line stays on screen, the caret opens the next
-/// row on a new prompt. The band the hand left goes out through its own
-/// swoosh (the retract, farthest-first, then the fade). This is what the
-/// owner sees on a plain shell and what he expected on the submit.
+/// The graceful exit the other laws are measured against: a shell's Enter (the
+/// typed line stays, the caret opens the next row on a new prompt). The band
+/// the hand left goes out through its swoosh (retract farthest-first, then the
+/// fade).
 fn shell_enter_control() -> Vec<Sample> {
     let mut c = composed(5);
     c.ret(b"\r\n> ");
@@ -421,16 +351,12 @@ fn shell_enter_control() -> Vec<Sample> {
     c.census(5, 1200, 16)
 }
 
-/// **THE OWNER'S GESTURE.** `> hello world`, Enter: Claude Code clears the
-/// composer and parks the caret after the prompt on the SAME row. The band
-/// has nothing under it any more — not the wrong letters, no letters — so it
-/// leaves through its own swoosh: no cell takes the fast melt, the row's
-/// cohort goes into its retract on the next plan, the row's coverage census
-/// decays MONOTONELY over the retract's own `RETRACT_DUR_S + RETRACT_FADE_S`
-/// (0.64 s) and reaches zero, with no frame-to-frame drop larger than the
-/// shell Enter's own worst step. RED on main at "the band goes out over at
-/// least 0.6 s": the witness stamped every cell on the 120 ms melt and the
-/// row was dark inside 0.15 s — "the contrail disappeared".
+/// `> hello world`, Enter: Claude Code clears the composer and parks the caret
+/// after the prompt on the same row. The band has nothing under it, so it
+/// leaves through its swoosh: no cell takes the fast melt, the row's cohort
+/// retracts on the next plan, and the row's coverage decays monotonically over
+/// `RETRACT_DUR_S + RETRACT_FADE_S` (0.64 s) to zero, with no frame-to-frame drop
+/// larger than the shell Enter's worst step.
 #[test]
 fn a_submit_that_clears_the_composer_lets_the_band_leave_through_its_own_swoosh_not_a_cut() {
     let control = shell_enter_control();
@@ -510,11 +436,9 @@ fn a_submit_that_clears_the_composer_lets_the_band_leave_through_its_own_swoosh_
     );
 }
 
-/// The frame after the submit, structurally: the blanked row's cohort is
-/// ABANDONED and RETRACTING — the swoosh's own retract arm, the one that
-/// draws the band into the hand farthest-first with the head last — and not
-/// one of its cells carries a retirement stamp. RED on main: every cell was
-/// `leaving()` on the melt.
+/// The frame after the submit: the blanked row's cohort is abandoned and
+/// retracting (the swoosh's retract arm, farthest-first, head last), and no
+/// cell carries a retirement stamp.
 #[test]
 fn the_blanked_band_is_drawn_into_the_hand_by_the_swoosh_s_retract_not_stamped() {
     let mut h = composed(5);
@@ -549,11 +473,9 @@ fn the_blanked_band_is_drawn_into_the_hand_by_the_swoosh_s_retract_not_stamped()
 }
 
 /// The transcript grew under the submit: the old input row is erased and the
-/// EMPTY composer is re-laid two rows down, the caret with it — a row-change
-/// relocation with a Return behind it, and nothing under the old band. The
-/// same exit: monotone, over the retract's span, no cut. RED on main at
-/// "over at least 0.6 s" (the witness's melt, and the relocation's own
-/// `retire_row` when the bracket hid the caret across a frame).
+/// empty composer re-laid two rows down with the caret, a row-change
+/// relocation with a Return behind it and nothing under the old band. Same
+/// exit: monotone, over the retract's span.
 #[test]
 fn a_submit_that_moves_the_cleared_composer_down_fades_the_old_row_the_same_way() {
     let control = shell_enter_control();
@@ -604,12 +526,10 @@ fn a_submit_that_moves_the_cleared_composer_down_fades_the_old_row_the_same_way(
     assert!(!h.lit(7), "…and nothing was ever lit on the new row");
 }
 
-/// The same submit with the composer's clear and its re-lay split across a
-/// frame — the caret HIDDEN when the clear lands, shown a frame later — the
-/// way a multi-KiB Ink frame lands through 1024-byte PTY reads. The witness
-/// sees the blank on the hidden frame; the hidden→visible relocation is
-/// declined (no bridge vouches for two rows). Still the swoosh, not the cut.
-/// RED on main at "no cell took the fast melt" (both mechanisms fired).
+/// The same submit with the clear and re-lay split across a frame (the caret
+/// hidden when the clear lands, shown a frame later), as a multi-KiB Ink frame
+/// lands through 1024-byte PTY reads. The witness sees the blank on the hidden
+/// frame and the hidden→visible relocation is declined; still the swoosh.
 #[test]
 fn a_submit_split_across_a_hidden_frame_still_leaves_through_the_swoosh() {
     let mut h = composed(5);
@@ -653,13 +573,10 @@ fn a_submit_split_across_a_hidden_frame_still_leaves_through_the_swoosh() {
     );
 }
 
-/// **A ROW CHANGE WITH INTACT TEXT, the LICENSED Return.** `hello world` at a
-/// shell prompt, Enter: the typed line stays on screen, the caret opens the
-/// next row. The old row is not retired at all — no cell is stamped,
-/// `ribbon_retired=` does not move — and the band lives its own life: it
-/// goes out through its own swoosh, monotonely, over the retract's span.
-/// GREEN on main: this is the exit the owner expected, verified here so the
-/// fix is measured against it.
+/// A row change with intact text (the licensed Return): `hello world` at a shell
+/// prompt, Enter. The old row is not retired (no stamp, `ribbon_retired=`
+/// unchanged) and the band goes out through its own swoosh, monotonically, over
+/// the retract's span.
 #[test]
 fn a_shell_s_enter_leaves_the_typed_row_s_band_to_its_own_swoosh() {
     let mut h = hello(5);
@@ -686,15 +603,11 @@ fn a_shell_s_enter_leaves_the_typed_row_s_band_to_its_own_swoosh() {
     assert_eq!(h.retired(), 0);
 }
 
-/// **A DECLINED RELOCATION WITH THE OLD ROW'S GLYPHS INTACT MOVES ONLY THE
-/// MIRROR.** `hello world` on row 5; the caret is hidden across a frame and
-/// reappears four rows down with no key behind the move (a program's caret
-/// round trip) and the typed text still where it was. The band is not
-/// retired — no stamp, no count, still lit through its grace — and lives its
-/// own life; the mirror follows, so the next key lays on the new row. RED on
-/// main at "no cell of the intact row is stamped": `retire_declined_hidden_
-/// relocation` retired the whole old row on the 120 ms melt whether or not
-/// its text had moved.
+/// A declined relocation with the old row's glyphs intact moves only the mirror:
+/// `hello world` on row 5, the caret hidden across a frame and reappearing four
+/// rows down with no key (a program's caret round trip) and the text in place.
+/// The band is not retired (no stamp, no count, lit through its grace), and the
+/// mirror follows, so the next key lays on the new row.
 #[test]
 fn a_declined_hidden_relocation_with_the_old_row_s_text_intact_moves_only_the_mirror() {
     let mut h = hello(5);
@@ -738,22 +651,12 @@ fn a_declined_hidden_relocation_with_the_old_row_s_text_intact_moves_only_the_mi
     assert!(!h.lit(5));
 }
 
-/// **AND WHEN THE TEXT WENT WITH THE CARET, THE BAND GOES WITH IT.** The
-/// same hidden relocation, but the screen was cleared and `hello world`
-/// re-drawn on the caret's new row — an input box re-laid elsewhere.
-///
-/// RE-PINNED 2026-09-21 (the band follows its text; `rk::witness`'s follow
-/// pass, `Engine::follow_rows`). Until then this pinned the fast melt: the
-/// witness saw the run's glyphs gone from its row and present on the
-/// caret's and retired the band on `RETIRE_MELT_S` — light left where the
-/// text used to be was the stray the melt was built for. Now the run's
-/// glyphs are found two rows down at their own columns, gone from their
-/// own row, and the run is TRANSLATED there with its clocks intact: no
-/// cell is stamped, nothing is retired, and the band stands under the
-/// text the hand typed, on the caret's row. The stray fix is not regressed
-/// — a relocation whose text is NOT found retires exactly as before
-/// (`a_relocated_input_box_retires_the_band_…`'s sibling in
-/// `abandoned_ribbon.rs`, and the true re-layout control in
+/// When the text went with the caret, the band goes with it: the same hidden
+/// relocation, but the screen cleared and `hello world` redrawn on the caret's
+/// new row. The follow pass (`rk::witness`, `Engine::follow_rows`) finds the
+/// glyphs two rows down at their own columns and translates the run there with
+/// its clocks intact: nothing stamped or retired. A relocation whose text is not
+/// found still retires (`abandoned_ribbon.rs`, and the re-layout control in
 /// `composer_box_growth_wrap.rs`).
 #[test]
 fn a_declined_hidden_relocation_whose_text_went_with_it_carries_the_band_with_it() {
@@ -787,22 +690,16 @@ fn a_declined_hidden_relocation_whose_text_went_with_it_carries_the_band_with_it
     assert!(h.lit(7));
 }
 
-/// The transcript's spinner, as Claude Code paints it on the row the
-/// composer left: different glyphs under every column of `hello world` but
-/// the tenth, which stays blank.
+/// The transcript's spinner as Claude Code paints it on the row the composer
+/// left: different glyphs under every column of `hello world` but the tenth,
+/// which stays blank.
 const SPINNER: &[u8] = b"* Thinking about it (esc to interrupt)";
 
-/// The blanked band is COUNTED — `ribbon_retired=` says a band went out
-/// because its text went, as against expiring — and it is counted ONCE:
-/// a second walk over the same blank names nothing, the spinner landing
-/// under the released band a few frames on stamps every cell for the fast
-/// melt without moving the count (the cells were counted when they were
-/// released; the melt only changed their clock), and a second clear under
-/// the melting cells names nothing either. GREEN on main for the first
-/// count (every cell was stamped), RED at "no cell is stamped"; RED before
-/// the fix-up at "the count does not move": the released records were
-/// dropped, the cells were re-armed over the spinner, and the second clear
-/// released — and counted — them again, 11 → 22.
+/// The blanked band is counted in `ribbon_retired=` (it went because its text
+/// went) and counted once: a second walk over the blank names nothing, the
+/// spinner landing under the released band stamps every cell for the fast melt
+/// without moving the count, and a second clear under the melting cells names
+/// nothing either.
 #[test]
 fn a_released_band_is_counted_once_on_ribbon_retired() {
     let want: Vec<u16> = (2..2 + TEXT.len() as u16).collect();
@@ -839,19 +736,12 @@ fn a_released_band_is_counted_once_on_ribbon_retired() {
     assert_eq!(h.retired(), TEXT.len() as u64);
 }
 
-/// **DIFFERENT TEXT LANDING UNDER A RELEASED BAND IS REPLACED TEXT.** The
-/// realistic Claude Code shape: the composer's clear lands on a hidden frame
-/// (an Ink frame split across 1024-byte PTY reads), and the NEXT frame paints
-/// the transcript's spinner on the row the composer left and re-lays the
-/// empty composer two rows down. The band was released on the hidden frame —
-/// nothing under it — but now the WRONG letters sit under it: the
-/// stray-rainbow shape the 120 ms melt was built for. Every cell is stamped
-/// on the frame the spinner lands (the one column the spinner leaves blank
-/// goes with its run), the row is dark inside 150 ms, monotone, and the
-/// count does not move. RED before the fix-up: the released records were
-/// dropped with the release, so the next walk ARMED the cells over the
-/// spinner instead — light under the wrong letters for the rest of the
-/// 0.64 s retract.
+/// Different text landing under a released band is replaced text. The
+/// composer's clear lands on a hidden frame and the next frame paints the
+/// spinner on the row the composer left and re-lays the empty composer two rows
+/// down. The released records are kept, so every cell is stamped on the
+/// spinner's frame (the blank column goes with its run), the row is dark inside
+/// 150 ms, monotonically, and the count does not move.
 #[test]
 fn a_released_band_that_different_text_lands_under_it_a_frame_later_melts_fast() {
     let want: Vec<u16> = (2..2 + TEXT.len() as u16).collect();
@@ -900,16 +790,14 @@ fn a_released_band_that_different_text_lands_under_it_a_frame_later_melts_fast()
     assert!(!h.lit(7), "row 7 holds no typed text: dark");
 }
 
-/// Claude Code's same-row submit that paints ONE glyph on the column of the
-/// Space typed between `ab` and `cd` (`> ab cd` on row 5): the row cleared,
-/// the prompt put back, a `*` on 0-based column 4, the caret parked after
-/// the prompt.
+/// Claude Code's same-row submit painting one glyph on the column of the Space
+/// typed between `ab` and `cd` (`> ab cd` on row 5): the row cleared, the prompt
+/// put back, a `*` at 0-based column 4, the caret after the prompt.
 const SUBMIT_GLYPH_ON_THE_SPACE: &[u8] = b"\x1b[?25l\x1b[6;1H\x1b[2K> \x1b[6;5H*\x1b[6;3H\x1b[?25h";
 
-/// The census of HOLES: for each frame over `ms` (16 ms apart, the frame
-/// the census began on first), whether `row`'s bed has an unlit pixel at
-/// the row's centre with a lit one on each side of it — the band punched
-/// through, as the eye reads it. Returns the seconds of each such frame.
+/// The census of holes: for each frame over `ms` (16 ms apart, starting with the
+/// current frame), whether `row`'s bed has an unlit pixel at the row's centre
+/// with lit ones on both sides. Returns the seconds of each such frame.
 fn hole_frames(h: &mut Host, row: u16, ms: u64) -> Vec<f32> {
     let holed = |h: &Host| {
         let mut lit = vec![false; COLS * CW];
@@ -939,19 +827,12 @@ fn hole_frames(h: &mut Host, row: u16, ms: u64) -> Vec<f32> {
     }
 }
 
-/// **A GLYPH THE CLEAR PAINTS ON A TYPED SPACE LEAVES WITH THE SWOOSH**
-/// (2026-09-24, the review of `Witness::landed_goes_with_its_run`). `> ab
-/// cd`, then the same-row submit with a spinner glyph painted on the
-/// Space's column in the batch that clears the row. The letters are
-/// released and swoosh into the hand over the retract's `0.64 s`; the
-/// Space's cell — under a glyph that is not its text — goes WITH them,
-/// on the same swoosh. The band is never punched through while it drains:
-/// no frame has an unlit pixel between two lit ones on the row.
-///
-/// RED before the fix, measured by the review: the landed cell took the
-/// content witness's `0.12 s` melt while its run-mates swooshed, a zero-
-/// alpha gap at x = 31..39 for 17 consecutive frames, t = 0.112..0.368 s.
-/// The plain submit (the control) had none, then and now.
+/// A glyph the clear paints on a typed Space leaves with the swoosh
+/// (`Witness::landed_goes_with_its_run`). `> ab cd`, then the same-row submit
+/// with a spinner glyph painted on the Space's column. The letters are released
+/// and swoosh into the hand over 0.64 s, and the Space's cell goes with them
+/// rather than taking the 0.12 s melt, so the band is never punched through
+/// while it drains. The plain submit is the control.
 #[test]
 fn a_glyph_the_clear_paints_on_a_typed_space_leaves_with_the_swoosh_not_ahead_of_it() {
     for (submit, what) in [

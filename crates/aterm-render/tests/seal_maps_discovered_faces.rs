@@ -91,10 +91,8 @@ fn ink(r: &mut Renderer, ch: char) -> (FaceId, usize) {
 
 #[test]
 fn the_seal_maps_every_discovered_face_and_does_not_grow_rss_by_their_size() {
-    let Some(mut r) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let rss_before = max_rss_bytes();
     let started = std::time::Instant::now();
     let sources = r.seal_admitted_font_sources();

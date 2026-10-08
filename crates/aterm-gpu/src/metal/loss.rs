@@ -1,75 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DEVICE-LOSS LATCH — the first-party answer to a callback Metal does
+//! The device-loss latch, standing in for the device-lost callback Metal does
 //! not have.
 //!
-//! # Why this exists, and why it is its own module
-//!
-//! The shipped `wgpu` path handles device loss through
-//! `Device::set_device_lost_callback` (`crate::lib.rs:625`): the callback sets
-//! an `AtomicBool`, `GpuRenderer::device_lost` (`renderer.rs:5691`) exposes it,
-//! and `aterm-gui`'s `failed_present_route` (`app_render.rs:1998`) drives a
-//! process-wide downgrade to the CPU renderer off it. That chain has ZERO
-//! tests of the latch itself anywhere in the workspace — only the pure routing
-//! function is tested (`app_render.rs:3531`), never the flag flipping — and
-//! nothing external can flip it on demand (control socket, CLI and env were
-//! all checked). A first-party Metal backend cannot inherit the callback at
-//! all, because **Metal has no device-lost callback**: the observable signals
-//! are per-command-buffer — `-[MTLCommandBuffer status]` reaching
+//! The wgpu path handles loss through `Device::set_device_lost_callback`,
+//! which sets the flag behind `GpuContext::device_lost`, and `aterm-gui`
+//! downgrades to the CPU renderer off it. Metal's signals are per command
+//! buffer instead: `-[MTLCommandBuffer status]` reaching
 //! `MTLCommandBufferStatusError` and the `NSError`'s `MTLCommandBufferError`
-//! code — plus (rare, eGPU-only) device removal, which also surfaces as the
-//! `DeviceRemoved` command-buffer error code.
+//! code (eGPU removal also surfaces as `DeviceRemoved`). Every submission
+//! (offscreen pass, compute dispatch, present) carries its own status, so this
+//! is its own module; the swapchain consumes it.
 //!
-//! This is a separate module rather than a corner of `swapchain.rs` because
-//! the signal is NOT swapchain-shaped: every submission — an offscreen bg
-//! pass, a compute parity dispatch, a present — carries its own status and
-//! error, and the classification below applies to all of them identically.
-//! The swapchain consumes this module (its `PresentTicket` reports a
-//! [`CbOutcome`]); it does not own it.
+//! # Classification
 //!
-//! # The classification
+//! Codes and statuses from `Metal.framework/Headers/MTLCommandBuffer.h`:
 //!
-//! Codes are pinned from the macOS SDK header
-//! (`Metal.framework/Headers/MTLCommandBuffer.h:107-121`; statuses at
-//! `:56-63`). Two classes:
+//! * RETRYABLE (the device and encoded state are fine): `Timeout` (2) and
+//!   `OutOfMemory` (8).
+//! * LOST: `Internal` (1), `PageFault` (3), `AccessRevoked` (4),
+//!   `NotPermitted` (7), `InvalidResource` (9), `Memoryless` (10),
+//!   `DeviceRemoved` (11), `StackOverflow` (12), and, failing closed, any
+//!   unknown code, an `Error` status with a nil `NSError`, and any status
+//!   outside the enum, so an unknown failure latches instead of retrying
+//!   against a faulting device.
 //!
-//! * **RETRYABLE** — the submission failed for a reason that does not impeach
-//!   the device or the encoded state, so resubmitting (or rebuilding the one
-//!   frame) is sound: `Timeout` (2, "execution took too long" — one overlong
-//!   command buffer, the device is fine) and `OutOfMemory` (8 — transient
-//!   allocation pressure).
-//! * **LOST** — resubmission would fault again or the device is gone for this
-//!   process: `Internal` (1), `PageFault` (3, the classic GPU-hang/restart
-//!   signal), `AccessRevoked` (4), `NotPermitted` (7), `InvalidResource` (9),
-//!   `Memoryless` (10), `DeviceRemoved` (11, the eGPU unplug), `StackOverflow`
-//!   (12) — and, fail-closed, any code this module does not recognize, any
-//!   `Error` status carrying a nil `NSError`, and any status value outside the
-//!   header's enum. An unknown failure must latch rather than spin a retry
-//!   loop against a faulting device.
+//! # Testing limits
 //!
-//! For calibration: `wgpu-hal-29.0.3`'s Metal backend never inspects
-//! `MTLCommandBufferError` at all (grep its `src/metal/` for the type — zero
-//! hits), so the shipped path's device-loss signal on macOS is coarser than
-//! this one. The latch is not a port of wgpu's behaviour; it is the piece
-//! wgpu never built.
-//!
-//! # What CANNOT be tested here, honestly
-//!
-//! Producing a REAL `MTLCommandBufferStatusError` on a healthy GPU means
-//! wrecking real GPU state (an actual page fault, an actual hang) from inside
-//! the test suite of a terminal the owner is running — and on Apple Silicon a
-//! provoked GPU restart is process-visible far beyond this test binary. So the
-//! real-error arm of [`outcome_of`] is exercised through [`classify`]'s
-//! injection seam (the pure function IS the classification; `outcome_of` is a
-//! two-selector read feeding it), and the real-FFI path is pinned on the arm a
-//! healthy device CAN produce: a committed, waited command buffer reading back
-//! `Completed` through the same selectors. The residue a real device loss
-//! would test beyond this — that a faulting driver actually reports status 5
-//! with a code from the header's enum — is Apple's documented contract, and no
-//! test on a healthy box can probe it. eGPU physical removal is likewise
-//! untestable on Apple Silicon (no eGPU support exists on arm64 Macs); its
-//! signal is the `DeviceRemoved` code above, which the injection seam covers.
+//! A real `MTLCommandBufferStatusError` cannot be produced on a healthy GPU
+//! without wrecking GPU state. The error arms are exercised through
+//! [`classify`] (the pure classification that [`outcome_of`] feeds), and the
+//! real FFI path is pinned on the arm a healthy device produces: a committed,
+//! waited command buffer reading `Completed`. eGPU removal cannot occur on
+//! Apple silicon; its code is covered by the injection seam.
 
 use std::sync::OnceLock;
 
@@ -85,12 +49,10 @@ pub(crate) const STATUS_SCHEDULED: usize = 3;
 pub(crate) const STATUS_COMPLETED: usize = 4;
 pub(crate) const STATUS_ERROR: usize = 5;
 
-/// `MTLCommandBufferError` codes (`MTLCommandBuffer.h:107-121`). `Blacklisted`
-/// is the deprecated spelling of `AccessRevoked` and shares 4.
-/// Header-defined "no error" code — present in `MTLCommandBuffer.h:112`. A
-/// status of Error carrying code 0 is contradictory; it stays LOST (fail
-/// closed), but it is named rather than lumped with codes the header never
-/// defined. A judge caught the pinned-constants block skipping it.
+// `MTLCommandBufferError` codes (`MTLCommandBuffer.h`). `Blacklisted` is the
+// deprecated spelling of `AccessRevoked` (4).
+/// The header's "no error" code. An `Error` status carrying code 0 is
+/// contradictory and stays LOST (fail closed), but is named.
 pub(crate) const ERROR_NONE: isize = 0;
 pub(crate) const ERROR_INTERNAL: isize = 1;
 pub(crate) const ERROR_TIMEOUT: isize = 2;
@@ -108,9 +70,8 @@ pub(crate) const ERROR_STACK_OVERFLOW: isize = 12;
 pub(crate) enum CbOutcome {
     /// `MTLCommandBufferStatusCompleted` — the work ran.
     Completed,
-    /// Status 0..=3 — the command buffer has not finished; the caller asked
-    /// before `waitUntilCompleted`/the completion point. A programming error
-    /// at the call site, NOT a device signal: it neither retries nor latches.
+    /// Status 0..=3: the command buffer has not finished. A call-site
+    /// programming error, not a device signal; it neither retries nor latches.
     Unfinished { status: usize },
     /// The submission failed without impeaching the device — resubmit or
     /// rebuild the frame.
@@ -125,28 +86,20 @@ pub(crate) enum CbOutcome {
 
 /// Classify one command buffer's `(status, error code)` pair.
 ///
-/// This pure function is the module's INJECTION SEAM: every error code the
-/// header defines can be fed through here without wrecking a real GPU, and
-/// [`outcome_of`] is nothing but two property reads feeding it — so the tests
-/// exercise the entire classification on injected values and the real FFI on
-/// the one arm a healthy device can produce (`Completed`).
+/// The injection seam: every header code can be fed through here without
+/// wrecking a GPU, and [`outcome_of`] is two property reads feeding it.
 ///
 /// `error_code` is `-[NSError code]` when status is `Error` and the error is
-/// non-nil; `None` otherwise. The error object on an `MTLCommandBuffer` is
-/// documented to be in `MTLCommandBufferErrorDomain` (`MTLCommandBuffer.h:66-70`
-/// declares the domain alongside the property), so the code is interpreted
-/// against that domain's enum without a string compare on the domain name.
+/// non-nil, else `None`. The error is documented to be in
+/// `MTLCommandBufferErrorDomain`, so the code is read against that enum
+/// without comparing the domain string.
 pub(crate) const fn classify(status: usize, error_code: Option<isize>) -> CbOutcome {
     match status {
         STATUS_COMPLETED => CbOutcome::Completed,
         STATUS_NOT_ENQUEUED..=STATUS_SCHEDULED => CbOutcome::Unfinished { status },
         STATUS_ERROR => match error_code {
-            // Timeout carries no LOCAL retry budget on purpose: the OS is
-            // the loop's terminator, not this module — repeated timeouts and
-            // hangs escalate to AccessRevoked ("too many timeouts or hangs",
-            // MTLCommandBuffer.h), which IS latched. A perpetually-timing-out
-            // device therefore reaches the latch through the OS's own
-            // escalation, one hop later than a local counter would.
+            // No local retry budget: the OS escalates repeated timeouts and
+            // hangs to AccessRevoked, which latches.
             Some(ERROR_TIMEOUT) => CbOutcome::Retryable {
                 code: ERROR_TIMEOUT,
                 name: "MTLCommandBufferErrorTimeout",
@@ -187,11 +140,8 @@ pub(crate) const fn classify(status: usize, error_code: Option<isize>) -> CbOutc
     }
 }
 
-/// `-[MTLCommandBuffer status]`, raw.
-///
-/// Safe: an `NSUInteger` property read on a live command buffer, with no
-/// ordering precondition — Metal defines the property as readable from any
-/// thread at any point in the command buffer's lifetime.
+/// `-[MTLCommandBuffer status]`, raw. Safe: an `NSUInteger` property readable
+/// from any thread at any time.
 pub(crate) fn command_buffer_status(cb: Id) -> usize {
     // SAFETY: `-status` is an `NSUInteger` getter on a live `MTLCommandBuffer`.
     unsafe {
@@ -200,17 +150,13 @@ pub(crate) fn command_buffer_status(cb: Id) -> usize {
     }
 }
 
-/// `-[MTLCommandBuffer error]`'s code, or `None` when the error is nil.
-///
-/// The pool is pushed BEFORE the property read for the same reason the
-/// `error:` out-param entry points in `ffi` push theirs first: the getter can
-/// autorelease the `NSError` into the calling frame, and the code is copied
-/// out before the pool pops.
+/// `-[MTLCommandBuffer error]`'s code, or `None` when nil. The pool is pushed
+/// before the read because the getter can autorelease the `NSError`; the code
+/// is copied out before the pool pops.
 fn command_buffer_error_code(cb: Id) -> Option<isize> {
     let _pool = AutoreleasePool::new();
-    // SAFETY: `-error` returns a BORROWED `NSError` (or nil) owned by the pool
-    // above; `-code` is an `NSInteger` getter on it, read while the pool is
-    // live.
+    // SAFETY: `-error` returns a borrowed `NSError` (or nil) owned by the pool;
+    // `-code` is read while the pool lives.
     unsafe {
         let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
         let err = get(cb, sel(c"error"));
@@ -223,10 +169,7 @@ fn command_buffer_error_code(cb: Id) -> Option<isize> {
 }
 
 /// Read a command buffer's `(status, error code)` and [`classify`] it.
-///
-/// Meaningful once the command buffer has FINISHED (after
-/// `waitUntilCompleted`, or from a completion point); consulted earlier it
-/// honestly reports [`CbOutcome::Unfinished`].
+/// Meaningful once finished; earlier it reports [`CbOutcome::Unfinished`].
 pub(crate) fn outcome_of(cb: Id) -> CbOutcome {
     let status = command_buffer_status(cb);
     let code = if status == STATUS_ERROR {
@@ -238,16 +181,11 @@ pub(crate) fn outcome_of(cb: Id) -> CbOutcome {
 }
 
 /// The sticky latch: once any submission classifies [`CbOutcome::Lost`], the
-/// device is lost for good and every later query says so.
+/// device is lost for good.
 ///
-/// The Metal twin of the `AtomicBool` behind `GpuContext::device_lost`
-/// (`crate::lib.rs:255`), with two deliberate differences: it records WHY (the
-/// first loss's classification, which the wgpu callback throws away after
-/// logging), and it is driven by [`CbOutcome`]s the caller feeds it rather
-/// than by a driver callback — because Metal has none to give.
-///
-/// Naturally `Send + Sync` (an `OnceLock<String>` and nothing else — no raw
-/// pointers, so the module's no-`unsafe impl` rule is not even tempted).
+/// The Metal twin of the flag behind `GpuContext::device_lost`, except that it
+/// records why (the first loss's classification) and is fed [`CbOutcome`]s by
+/// callers rather than a driver callback. `Send + Sync` by construction.
 #[derive(Debug, Default)]
 pub(crate) struct LossLatch {
     /// Debug-only feed counter — see [`Self::record`] for why it exists.
@@ -255,13 +193,8 @@ pub(crate) struct LossLatch {
     fed: std::sync::atomic::AtomicUsize,
     /// Set exactly once, by the FIRST `Lost` outcome recorded.
     lost: OnceLock<String>,
-    /// Whether an `EncodeSession` currently holds this latch — the seal that
-    /// makes "one latch, one queue" TRUE rather than asserted. `Frame::
-    /// present` proves session-vs-swapchain wiring by `Arc::ptr_eq` on the
-    /// latch, which is only as strong as latch-identity => queue-identity;
-    /// a second session on the same latch broke that silently (probed
-    /// 2026-08-31: a rogue same-latch session presented on a queue the
-    /// rendering never used, and every runtime check passed). Bound in
+    /// Whether an `EncodeSession` holds this latch, so one latch means one
+    /// queue (which `Frame::present`'s `Arc::ptr_eq` check relies on). Bound in
     /// [`crate::metal::encoder::EncodeSession::new`], released on its drop.
     encode_bound: std::sync::atomic::AtomicBool,
 }
@@ -276,9 +209,8 @@ impl LossLatch {
         }
     }
 
-    /// Claim this latch for THE encode session. `false` means a session
-    /// already holds it and the caller must refuse to construct — the
-    /// cross-queue-present seal (see `encode_bound`).
+    /// Claim this latch for the encode session. `false` means one already holds
+    /// it and the caller must refuse to construct.
     pub(crate) fn try_bind_encode_session(&self) -> bool {
         self.encode_bound
             .compare_exchange(
@@ -301,13 +233,8 @@ impl LossLatch {
     /// `Completed`, `Unfinished` and `Retryable` never move it; the first
     /// `Lost` sets it forever.
     pub(crate) fn record(&self, outcome: &CbOutcome) {
-        // Debug builds count EVERY feed, loss or not. A judge proved the
-        // `settle` call inside `wait_outcome` was the one unarmed line in the
-        // loss wiring — a healthy GPU only ever hands it `Completed`, whose
-        // record is a no-op, so a planted skip stayed green and only a REAL
-        // device loss would have exposed the regression. The counter makes
-        // "the latch was fed" observable on the Completed path too, and the
-        // frame-cycle test asserts it per ticket.
+        // Debug builds count every feed, including `Completed`, so tests can
+        // check the latch is fed even when nothing is lost.
         #[cfg(debug_assertions)]
         self.fed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let CbOutcome::Lost { .. } = outcome {
@@ -317,9 +244,8 @@ impl LossLatch {
         }
     }
 
-    /// Debug-only: how many outcomes have been fed through [`Self::record`].
-    /// Exists so a test can pin that `wait_outcome` feeds the latch even when
-    /// every outcome is `Completed` — see the comment in `record`.
+    /// Debug-only: outcomes fed through [`Self::record`], so a test can check
+    /// `wait_outcome` feeds the latch on `Completed` too.
     #[cfg(debug_assertions)]
     #[cfg(test)]
     pub(crate) fn fed_count(&self) -> usize {
@@ -340,21 +266,11 @@ impl LossLatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metal::ffi::{Device, Obj};
+    use crate::metal::ffi::Obj;
+    use crate::metal::test_support::device;
 
-    /// Every test that needs a GPU skips LOUDLY on a machine without one.
-    fn device() -> Option<Device> {
-        let d = Device::preferred();
-        if d.is_none() {
-            crate::stderr_line!("SKIP: no Metal device on this machine");
-        }
-        d
-    }
-
-    /// THE CLASSIFICATION, swept over every code the SDK header defines plus
-    /// the fail-closed arms — the injected-error half of the latch's contract.
-    /// This is the test the wgpu device-loss path never had: every observable
-    /// error signal, classified, with the retry/latch line drawn explicitly.
+    /// Every header code plus the fail-closed arms, classified, with the
+    /// retry/latch line drawn explicitly.
     #[test]
     fn every_error_code_classifies_as_declared() {
         // The one healthy terminal state.
@@ -431,10 +347,8 @@ mod tests {
         ));
     }
 
-    /// THE LATCH IS STICKY AND SELECTIVE: it never flips on `Completed`,
-    /// `Unfinished` or `Retryable`; it flips on the first `Lost`; it stays
-    /// flipped through everything that follows; and the FIRST loss's reason is
-    /// the one it keeps.
+    /// The latch never flips on `Completed`, `Unfinished` or `Retryable`,
+    /// flips on the first `Lost`, stays flipped, and keeps the first reason.
     #[test]
     fn the_latch_flips_only_on_lost_and_stays_flipped() {
         let latch = LossLatch::new();
@@ -475,11 +389,8 @@ mod tests {
         );
     }
 
-    /// THE REAL FFI PATH, on the one arm a healthy GPU can produce: a real
-    /// command buffer, committed and waited, reads back `Completed` through
-    /// the same two selectors a real loss would use — and the latch stays
-    /// unlost. The error arms of `outcome_of` ride the injection seam above;
-    /// this pins that the seam's inputs come off live objects correctly.
+    /// A real command buffer, committed and waited, reads `Completed` through
+    /// the same selectors a real loss would use, and the latch stays unlost.
     #[test]
     fn a_real_completed_command_buffer_reports_completed_and_never_latches() {
         let Some(dev) = device() else { return };
@@ -487,10 +398,8 @@ mod tests {
         let latch = LossLatch::new();
 
         let _pool = AutoreleasePool::new();
-        // SAFETY: `commandBuffer` returns an AUTORELEASED command buffer owned
-        // by the pool above; it is retained into `cb` so the reads below hold
-        // a live +1 regardless of pool timing. `commit`/`waitUntilCompleted`
-        // are plain void messages on it.
+        // SAFETY: `commandBuffer` returns an autoreleased buffer, retained into
+        // `cb`; `commit`/`waitUntilCompleted` are void messages on it.
         let cb: Obj = unsafe {
             let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
             let raw = get(queue.id(), sel(c"commandBuffer"));

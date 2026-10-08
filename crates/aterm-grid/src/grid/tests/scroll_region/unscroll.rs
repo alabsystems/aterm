@@ -6,31 +6,17 @@ use super::*;
 #[test]
 fn grid_unscroll_from_scrollback_basic() {
     // Create grid with tiered scrollback
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    let mut grid = tiered_grid(4, 10, 2);
 
     // Write numbered lines and scroll them off
-    for i in 0..8 {
-        grid.carriage_return();
-        for c in format!("Line {i}").chars() {
-            grid.write_char(c);
-        }
-        if i < 7 {
-            grid.line_feed();
-        }
-    }
+    write_numbered_lines(&mut grid, 8);
 
-    // Now we have some content in scrollback and visible:
-    // Scrollback should have lines 0-3 (the ones pushed off)
-    // Visible should have lines 4-7
+    // Scrollback holds lines 0-3; the screen shows lines 4-7.
     assert_eq!(
         grid.tiered_scrollback_lines(),
         2,
         "8 lines on a 4-row grid with ring scrollback 2 should leave 2 tiered lines"
     );
-
-    // Remember what was on row 0 before unscroll (for debugging if needed)
-    let _visible_before = grid.row(0).map(|r| r.to_string()).unwrap_or_default();
 
     // Unscroll 2 lines from scrollback
     let unscrolled = grid.unscroll_from_scrollback(2);
@@ -39,15 +25,61 @@ fn grid_unscroll_from_scrollback_basic() {
         "requesting 2 lines should recover the 2 newest history lines"
     );
 
-    // The top rows should now contain content from scrollback
-    // Row 0 should have content (not blank like scroll_region_down)
-    let row0_after = grid.row(0).map(|r| r.to_string()).unwrap_or_default();
-    let row1_after = grid.row(1).map(|r| r.to_string()).unwrap_or_default();
+    // The top rows should now contain content from scrollback (not blank like
+    // scroll_region_down): the NEWEST history (the ring's Lines 2-3), in order —
+    // not the tiered store's Lines 0-1, which are older.
+    assert_eq!(row_text(&grid, 0), "Line 2");
+    assert_eq!(row_text(&grid, 1), "Line 3");
+}
 
-    // The NEWEST history (the ring's Lines 2-3), in order — not the tiered
-    // store's Lines 0-1, which are older.
-    assert_eq!(row0_after.trim_end(), "Line 2");
-    assert_eq!(row1_after.trim_end(), "Line 3");
+/// A `rows`×`cols` grid over a tiered store with a `ring`-line ring.
+fn tiered_grid(rows: u16, cols: u16, ring: usize) -> Grid {
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    Grid::with_tiered_scrollback(rows, cols, ring, scrollback)
+}
+
+/// Push a 4-row grid (ring 2) into history with four `{prefix}{i}` lines written
+/// on the bottom row, then unscroll all four back; returns the unscrolled count.
+fn scroll_four_off_then_unscroll(grid: &mut Grid, prefix: &str) -> usize {
+    for i in 0..4 {
+        grid.set_cursor(3, 0);
+        for c in format!("{prefix}{i}").chars() {
+            grid.write_char(c);
+        }
+        grid.line_feed();
+    }
+
+    let scrollback_available = grid.scrollback_lines();
+    assert_eq!(
+        scrollback_available, 4,
+        "4 bottom-row scrolls on a 4-row grid should leave 4 history lines (2 ring, 2 tiered)"
+    );
+
+    let unscrolled = grid.unscroll_from_scrollback(scrollback_available.min(4));
+    assert_eq!(
+        unscrolled, 4,
+        "unscroll should recover all 4 history lines, ring and tiered"
+    );
+    unscrolled
+}
+
+/// Four line feeds on a 4-row grid with no ring push row 0 straight into the
+/// tiered store; unscroll brings that one line back.
+fn feed_row0_off_then_unscroll(grid: &mut Grid) {
+    for _ in 0..4 {
+        grid.line_feed();
+    }
+    let sb_count = grid.tiered_scrollback_lines();
+    assert_eq!(
+        sb_count, 1,
+        "four line feeds on a 4-row grid with direct tiered scrollback should offload exactly 1 line"
+    );
+
+    let unscrolled = grid.unscroll_from_scrollback(sb_count.min(4));
+    assert_eq!(
+        unscrolled, 1,
+        "unscroll should recover the single available tiered line"
+    );
 }
 
 fn write_numbered_lines(grid: &mut Grid, count: usize) {
@@ -62,21 +94,20 @@ fn write_numbered_lines(grid: &mut Grid, count: usize) {
     }
 }
 
-fn row_text(grid: &Grid, row: u16) -> String {
-    grid.row(row)
-        .map(|r| r.to_string())
-        .unwrap_or_default()
-        .trim_end()
-        .to_string()
+/// Row `row` as a string (empty when absent).
+fn row_string(grid: &Grid, row: u16) -> String {
+    grid.row(row).map(|r| r.to_string()).unwrap_or_default()
 }
 
-/// Kitty CSI + T restores the lines DIRECTLY above the viewport — the ring's
-/// newest — and removes them from the END of history. It used to read and remove
-/// the tiered store's newest lines, which are older than every ring line.
+fn row_text(grid: &Grid, row: u16) -> String {
+    row_string(grid, row).trim_end().to_string()
+}
+
+/// Kitty CSI + T restores the lines directly above the viewport (the ring's
+/// newest) and removes them from the end of history.
 #[test]
 fn grid_unscroll_restores_newest_ring_lines_in_order() {
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    let mut grid = tiered_grid(4, 10, 2);
     write_numbered_lines(&mut grid, 8);
     // History Lines 0-3: ring = Lines 2-3, tiered store = Lines 0-1.
     assert_eq!(grid.scrollback_lines(), 4);
@@ -101,8 +132,7 @@ fn grid_unscroll_restores_newest_ring_lines_in_order() {
 /// from it, not fall back to a blank scroll that discards the bottom rows.
 #[test]
 fn grid_unscroll_ring_only_history_is_not_a_blank_scroll() {
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 100, scrollback);
+    let mut grid = tiered_grid(4, 10, 100);
     write_numbered_lines(&mut grid, 6);
     assert_eq!(grid.tiered_scrollback_lines(), 0);
     assert_eq!(grid.scrollback_lines(), 2);
@@ -120,11 +150,10 @@ fn grid_unscroll_ring_only_history_is_not_a_blank_scroll() {
     );
 }
 
-/// A pull spanning the ring AND the store keeps age order across the seam.
+/// A pull spanning the ring and the store keeps age order across the seam.
 #[test]
 fn grid_unscroll_spanning_ring_and_store_keeps_age_order() {
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    let mut grid = tiered_grid(4, 10, 2);
     write_numbered_lines(&mut grid, 8);
 
     assert_eq!(grid.unscroll_from_scrollback(3), 3);
@@ -162,8 +191,7 @@ fn grid_unscroll_no_scrollback_fallback() {
 
 #[test]
 fn grid_unscroll_zero_does_nothing() {
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    let mut grid = tiered_grid(4, 10, 2);
 
     // Write content
     grid.write_char('X');
@@ -176,8 +204,7 @@ fn grid_unscroll_zero_does_nothing() {
 
 #[test]
 fn grid_unscroll_limited_by_available_scrollback() {
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    let mut grid = tiered_grid(4, 10, 2);
 
     // Write just 2 lines to get minimal scrollback
     for c in "Line0".chars() {
@@ -208,7 +235,7 @@ fn grid_unscroll_limited_by_available_scrollback() {
     // Try to unscroll more than available
     let unscrolled = grid.unscroll_from_scrollback(100);
 
-    // Limited by ALL history (2 ring + 1 tiered) and the region size.
+    // Limited by all history (2 ring + 1 tiered) and the region size.
     assert_eq!(
         unscrolled, 3,
         "unscroll should clamp to the 3 history lines, ring and tiered"
@@ -219,8 +246,7 @@ fn grid_unscroll_limited_by_available_scrollback() {
 #[test]
 fn grid_unscroll_with_scroll_region() {
     // Test unscroll with non-full scroll region (DECSTBM)
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(8, 20, 2, scrollback);
+    let mut grid = tiered_grid(8, 20, 2);
 
     // Write content on all rows
     for row in 0..8 {
@@ -248,11 +274,9 @@ fn grid_unscroll_with_scroll_region() {
     // Set a scroll region in the middle (rows 2-5)
     grid.set_scroll_region(2, 5);
 
-    // Remember content before unscroll
-    let row0_before = grid.row(0).map(|r| r.to_string()).unwrap_or_default();
-    let row1_before = grid.row(1).map(|r| r.to_string()).unwrap_or_default();
-    let row6_before = grid.row(6).map(|r| r.to_string()).unwrap_or_default();
-    let row7_before = grid.row(7).map(|r| r.to_string()).unwrap_or_default();
+    // Remember the rows outside the region before unscroll
+    let outside = [0u16, 1, 6, 7];
+    let before: Vec<String> = outside.iter().map(|&r| row_string(&grid, r)).collect();
 
     // Unscroll 2 lines
     let unscrolled = grid.unscroll_from_scrollback(2);
@@ -262,32 +286,17 @@ fn grid_unscroll_with_scroll_region() {
     );
 
     // Rows outside scroll region should be unchanged
-    assert_eq!(
-        grid.row(0).map(|r| r.to_string()).unwrap_or_default(),
-        row0_before,
-        "Row 0 (outside region) should be unchanged"
-    );
-    assert_eq!(
-        grid.row(1).map(|r| r.to_string()).unwrap_or_default(),
-        row1_before,
-        "Row 1 (outside region) should be unchanged"
-    );
-    assert_eq!(
-        grid.row(6).map(|r| r.to_string()).unwrap_or_default(),
-        row6_before,
-        "Row 6 (outside region) should be unchanged"
-    );
-    assert_eq!(
-        grid.row(7).map(|r| r.to_string()).unwrap_or_default(),
-        row7_before,
-        "Row 7 (outside region) should be unchanged"
-    );
+    for (&r, before) in outside.iter().zip(&before) {
+        assert_eq!(
+            &row_string(&grid, r),
+            before,
+            "Row {r} (outside region) should be unchanged"
+        );
+    }
 
     // Top rows of scroll region (2, 3) should have scrollback content
-    let row2_after = grid.row(2).map(|r| r.to_string()).unwrap_or_default();
-    let row3_after = grid.row(3).map(|r| r.to_string()).unwrap_or_default();
     assert!(
-        !row2_after.is_empty() || !row3_after.is_empty(),
+        !row_string(&grid, 2).is_empty() || !row_string(&grid, 3).is_empty(),
         "Scroll region top rows should have scrollback content"
     );
 }
@@ -297,8 +306,7 @@ fn grid_unscroll_preserves_attributes() {
     use crate::cell::{CellFlags, PackedColor};
 
     // Create grid with scrollback
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 20, 2, scrollback);
+    let mut grid = tiered_grid(4, 20, 2);
 
     // Write styled content (red foreground, bold)
     let fg = PackedColor::indexed(196); // Red
@@ -310,27 +318,8 @@ fn grid_unscroll_preserves_attributes() {
         grid.write_char_styled(c, fg, bg, flags);
     }
 
-    // Scroll content into scrollback
-    for i in 0..4 {
-        grid.set_cursor(3, 0);
-        for c in format!("Line{i}").chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-    }
-
-    let scrollback_available = grid.scrollback_lines();
-    assert_eq!(
-        scrollback_available, 4,
-        "4 bottom-row scrolls on a 4-row grid should leave 4 history lines (2 ring, 2 tiered)"
-    );
-
-    // Unscroll to bring styled content back
-    let unscrolled = grid.unscroll_from_scrollback(scrollback_available.min(4));
-    assert_eq!(
-        unscrolled, 4,
-        "unscroll should recover all 4 history lines, ring and tiered"
-    );
+    // Scroll the styled content into scrollback and back
+    scroll_four_off_then_unscroll(&mut grid, "Line");
 
     // Check if any restored row has non-default colors or flags
     let mut found_styled = false;
@@ -367,8 +356,7 @@ fn grid_unscroll_preserves_attributes() {
 #[test]
 fn grid_unscroll_preserves_wrapped_flag() {
     // Create grid with scrollback
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    let mut grid = tiered_grid(4, 10, 2);
 
     // Write a long line that wraps (more than 10 columns)
     grid.set_cursor(0, 0);
@@ -385,27 +373,8 @@ fn grid_unscroll_preserves_wrapped_flag() {
         row.set_wrapped(true);
     }
 
-    // Scroll the wrapped content into scrollback
-    for i in 0..4 {
-        grid.set_cursor(3, 0);
-        for c in format!("Scroll{i}").chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-    }
-
-    let scrollback_available = grid.scrollback_lines();
-    assert_eq!(
-        scrollback_available, 4,
-        "4 bottom-row scrolls on a 4-row grid should leave 4 history lines (2 ring, 2 tiered)"
-    );
-
-    // Unscroll to bring wrapped content back
-    let unscrolled = grid.unscroll_from_scrollback(scrollback_available.min(4));
-    assert_eq!(
-        unscrolled, 4,
-        "unscroll should recover all 4 history lines, ring and tiered"
-    );
+    // Scroll the wrapped content into scrollback and back
+    let unscrolled = scroll_four_off_then_unscroll(&mut grid, "Scroll");
 
     // Check if any restored row has the wrapped flag
     // Note: fill_row_from_line at scroll.rs:509 sets row.set_wrapped(line.is_wrapped())
@@ -427,15 +396,14 @@ fn grid_unscroll_preserves_wrapped_flag() {
     );
 }
 
-/// Regression: fill_row_from_line must restore hyperlinks from scrollback (#1982).
+/// fill_row_from_line restores hyperlinks from scrollback.
 #[test]
 fn grid_unscroll_restores_hyperlinks() {
     use crate::extra::CellCoord;
     use std::sync::Arc;
 
     // max_scrollback = 0 so rows go directly to tiered scrollback with hyperlinks preserved
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 0, scrollback);
+    let mut grid = tiered_grid(4, 10, 0);
 
     // Write "Hello" on row 0 with a hyperlink on columns 0-4
     let url: Arc<str> = Arc::from("https://example.com");
@@ -450,19 +418,9 @@ fn grid_unscroll_restores_hyperlinks() {
     }
 
     // Scroll exactly 4 times: LF 1-3 move cursor, LF 4 triggers scroll_up(1)
-    // pushing original row 0 (with hyperlinks) to tiered scrollback
-    for _ in 0..4 {
-        grid.line_feed();
-    }
-    let scrollback_count = grid.tiered_scrollback_lines();
-    assert_eq!(
-        scrollback_count, 1,
-        "four line feeds on a 4-row grid with direct tiered scrollback should offload exactly 1 line"
-    );
-
-    // Unscroll 1 line to bring the hyperlinked line back to row 0
-    let unscrolled = grid.unscroll_from_scrollback(1);
-    assert_eq!(unscrolled, 1, "Should have unscrolled exactly 1 line");
+    // pushing original row 0 (with hyperlinks) to tiered scrollback; unscroll
+    // 1 line to bring the hyperlinked line back to row 0
+    feed_row0_off_then_unscroll(&mut grid);
 
     // Row 0 should have the hyperlink restored from scrollback
     assert!(
@@ -478,22 +436,14 @@ fn grid_unscroll_restores_hyperlinks() {
     );
 }
 
-/// Regression test: fill_row_from_line must restore wide characters at correct
-/// column positions, including WIDE_CONTINUATION cells.
-///
-/// When wide (CJK) characters are scrolled into scrollback and then unscrolled
-/// back into the visible grid, fill_row_from_line must advance the column
-/// counter by 2 for wide chars and create WIDE_CONTINUATION cells.
-///
-/// Bug: #2413 — fill_row_from_line previously advanced col by 1 per char,
-/// placing wide characters as single-width and shifting subsequent characters.
+/// fill_row_from_line places wide characters at their columns: col advances by
+/// 2 and a WIDE_CONTINUATION cell follows each wide char.
 #[test]
 fn grid_unscroll_wide_char_column_alignment() {
     use crate::cell::{CellFlags, PackedColor};
 
     // Create grid with scrollback (max_scrollback=2 like other tests)
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 20, 2, scrollback);
+    let mut grid = tiered_grid(4, 20, 2);
 
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
@@ -520,21 +470,8 @@ fn grid_unscroll_wide_char_column_alignment() {
         assert_eq!(row0.get(3).unwrap().char(), 'B');
     }
 
-    // Scroll content into scrollback (6 scrolls like other tests)
-    for i in 0..4 {
-        grid.set_cursor(3, 0);
-        for c in format!("Line{i}").chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-    }
-
-    let scrollback_count = grid.scrollback_lines();
-    assert_eq!(scrollback_count, 4);
-
-    // Unscroll to bring the wide char line back
-    let unscrolled = grid.unscroll_from_scrollback(scrollback_count.min(4));
-    assert_eq!(unscrolled, 4);
+    // Scroll the wide char line into scrollback and back
+    scroll_four_off_then_unscroll(&mut grid, "Line");
 
     // Search for the restored wide char line among all visible rows
     let mut found_wide_char_row = false;
@@ -572,19 +509,14 @@ fn grid_unscroll_wide_char_column_alignment() {
     );
 }
 
-/// Wide character at the last column during unscroll should be dropped,
-/// not written as a single-width cell. Matches Row::write_wide_char
-/// rejection behavior and TLA+ WideCharNotAtEnd invariant.
-///
-/// Bug: #2413 — fill_row_from_line else branch wrote wide chars as
-/// single-width when they couldn't fit at the terminal edge.
+/// A wide character at the last column during unscroll is dropped, not written
+/// single-width (as Row::write_wide_char rejects it; WideCharNotAtEnd).
 #[test]
 fn grid_unscroll_wide_char_at_last_col_dropped() {
     use crate::cell::{CellFlags, PackedColor};
 
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
     // 5 columns wide — wide char at col 4 cannot fit (needs cols 4+5)
-    let mut grid = Grid::with_tiered_scrollback(4, 5, 2, scrollback);
+    let mut grid = tiered_grid(4, 5, 2);
 
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
@@ -604,11 +536,8 @@ fn grid_unscroll_wide_char_at_last_col_dropped() {
     grid.set_cursor(0, 4);
     grid.write_char('E');
 
-    // Now manually construct a scrollback Line with a wide char that would
-    // land at the last column when restored to a 5-col grid.
-    // Line: "ABCD中" — the wide char is char_idx 4, would need cols 4-5
-    // but grid only has 5 cols (0-4).
-    // We scroll enough to push row 0 into scrollback, then unscroll.
+    // A scrollback line "ABCD中" whose wide char lands at the last column of a
+    // 5-col grid once restored.
 
     for i in 0..6 {
         grid.set_cursor(3, 0);
@@ -635,7 +564,7 @@ fn grid_unscroll_wide_char_at_last_col_dropped() {
         if let Some(row) = grid.row(row_idx)
             && row.get(0).map(|c| c.char()) == Some('A')
         {
-            // Col 4 (last col) must NOT have the WIDE flag
+            // Col 4 (last col) must not have the WIDE flag
             let last_cell = row.get(4).unwrap();
             assert!(
                 !last_cell.is_wide(),
@@ -646,52 +575,25 @@ fn grid_unscroll_wide_char_at_last_col_dropped() {
     }
 }
 
-/// Scrollback round-trip preserves CURLY_UNDERLINE, SUPERSCRIPT, and
-/// SUBSCRIPT flags. CellAttrs::VISUAL_FLAGS_MASK must include bits 11-13.
-///
-/// Regression test for #2415: CellAttrs::VISUAL_FLAGS_MASK was 0x01FF
-/// (bits 0-8 only), silently dropping SUPERSCRIPT, SUBSCRIPT, and
-/// CURLY_UNDERLINE during scrollback serialization.
+/// Scrollback round-trip preserves CURLY_UNDERLINE, SUPERSCRIPT and SUBSCRIPT:
+/// CellAttrs::VISUAL_FLAGS_MASK covers bits 11-13.
 #[test]
 fn grid_unscroll_preserves_extended_visual_flags() {
     use crate::cell::{CellFlags, PackedColor};
 
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 20, 2, scrollback);
+    let mut grid = tiered_grid(4, 20, 2);
 
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Write cells with extended visual flags on row 0:
-    // col 0: 'C' with CURLY_UNDERLINE
-    // col 1: 'S' with SUPERSCRIPT
-    // col 2: 'B' with SUBSCRIPT
+    // Row 0: 'C' curly-underlined, 'S' superscript, 'B' subscript.
     grid.set_cursor(0, 0);
     grid.write_char_styled('C', fg, bg, CellFlags::CURLY_UNDERLINE);
     grid.write_char_styled('S', fg, bg, CellFlags::SUPERSCRIPT);
     grid.write_char_styled('B', fg, bg, CellFlags::SUBSCRIPT);
 
-    // Scroll row 0 into scrollback
-    for i in 0..4 {
-        grid.set_cursor(3, 0);
-        for c in format!("Line{i}").chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-    }
-
-    let sb_count = grid.scrollback_lines();
-    assert_eq!(
-        sb_count, 4,
-        "4 bottom-row scrolls on a 4-row grid should leave 4 history lines (2 ring, 2 tiered)"
-    );
-
-    // Unscroll to bring styled content back
-    let unscrolled = grid.unscroll_from_scrollback(sb_count.min(4));
-    assert_eq!(
-        unscrolled, 4,
-        "unscroll should recover all 4 history lines, ring and tiered"
-    );
+    // Scroll row 0 into scrollback and back
+    scroll_four_off_then_unscroll(&mut grid, "Line");
 
     // Find the restored row starting with 'C'
     let mut found = false;
@@ -732,23 +634,14 @@ fn grid_unscroll_preserves_extended_visual_flags() {
     );
 }
 
-/// Regression: fill_row_from_line must handle combining marks as part of
-/// the preceding base character's grapheme cluster, not as separate cells.
-///
-/// Bug: fill_row_from_line iterates text character-by-character and places
-/// each char in its own cell. Combining marks (width 0) like U+0301 (acute
-/// accent) occupy their own column, shifting all subsequent content right
-/// and corrupting column alignment.
-///
-/// Expected: "e\u{0301}" (é) occupies 1 column
-/// Actual:   'e' at col 0, '\u{0301}' at col 1 (2 columns — wrong)
+/// fill_row_from_line keeps a combining mark in its base character's cell:
+/// "e\u{0301}" occupies one column.
 #[test]
 fn grid_unscroll_combining_mark_not_split() {
     use crate::extra::CellCoord;
 
     // max_scrollback=0 for direct tiered scrollback
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 0, scrollback);
+    let mut grid = tiered_grid(4, 10, 0);
 
     // Write 'e' at col 0, then store combining acute accent in extras.
     grid.set_cursor(0, 0);
@@ -761,22 +654,8 @@ fn grid_unscroll_combining_mark_not_split() {
     grid.set_cursor(0, 1);
     grid.write_char('x');
 
-    // Scroll to push row 0 into scrollback.
-    for _ in 0..4 {
-        grid.line_feed();
-    }
-    let sb_count = grid.tiered_scrollback_lines();
-    assert_eq!(
-        sb_count, 1,
-        "four line feeds on a 4-row grid with direct tiered scrollback should offload exactly 1 line"
-    );
-
-    // Unscroll to bring the combining-mark row back.
-    let unscrolled = grid.unscroll_from_scrollback(sb_count.min(4));
-    assert_eq!(
-        unscrolled, 1,
-        "unscroll should recover the single available tiered line"
-    );
+    // Push row 0 into scrollback and unscroll the combining-mark row back.
+    feed_row0_off_then_unscroll(&mut grid);
 
     // Find the restored row with 'e' at col 0.
     let mut found = false;
@@ -786,9 +665,7 @@ fn grid_unscroll_combining_mark_not_split() {
         {
             found = true;
 
-            // BUG: fill_row_from_line places U+0301 as a separate cell
-            // at col 1, pushing 'x' to col 2. The combining mark should
-            // be attached to 'e' at col 0, and 'x' should remain at col 1.
+            // U+0301 belongs to 'e' at col 0, so 'x' stays at col 1.
             let col1_char = row.get(1).map(|c| c.char());
             assert_eq!(
                 col1_char,
@@ -806,13 +683,7 @@ fn grid_unscroll_combining_mark_not_split() {
     );
 }
 
-/// Regression: fill_row_from_line must handle ZWJ emoji sequences as a single
-/// grapheme unit, not as separate wide/zero-width cells.
-///
-/// Bug: ZWJ sequences like 👨‍👩‍👧 (man ZWJ woman ZWJ girl) are stored in the
-/// Line text as multiple codepoints. fill_row_from_line splits these into
-/// individual cells: '👨' wide at col 0-1, ZWJ at col 2, '👩' wide at col 3-4,
-/// etc. The ZWJ sequence should occupy 2 columns total (one wide cell).
+/// fill_row_from_line keeps a ZWJ emoji sequence as one wide cell (2 columns).
 #[test]
 fn grid_unscroll_zwj_emoji_not_split() {
     use std::sync::Arc;
@@ -820,8 +691,7 @@ fn grid_unscroll_zwj_emoji_not_split() {
     use crate::cell::{Cell, CellFlags, PackedColor};
     use crate::extra::CellCoord;
 
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 20, 0, scrollback);
+    let mut grid = tiered_grid(4, 20, 0);
 
     // Write a family emoji (ZWJ sequence) at col 0-1 via overflow + extras.
     let zwj_text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧
@@ -844,31 +714,15 @@ fn grid_unscroll_zwj_emoji_not_split() {
     grid.set_cursor(0, 2);
     grid.write_char('Z');
 
-    // Scroll to push row 0 into scrollback.
-    for _ in 0..4 {
-        grid.line_feed();
-    }
-    let sb_count = grid.tiered_scrollback_lines();
-    assert_eq!(
-        sb_count, 1,
-        "four line feeds on a 4-row grid with direct tiered scrollback should offload exactly 1 line"
-    );
-
-    // Unscroll to bring the ZWJ emoji row back.
-    let unscrolled = grid.unscroll_from_scrollback(sb_count.min(4));
-    assert_eq!(
-        unscrolled, 1,
-        "unscroll should recover the single available tiered line"
-    );
+    // Push row 0 into scrollback and unscroll the ZWJ emoji row back.
+    feed_row0_off_then_unscroll(&mut grid);
 
     // Find the restored row.
     let mut found = false;
     for row_idx in 0..4u16 {
         if let Some(row) = grid.row(row_idx) {
-            // Look for 'Z' — in correct reconstruction it's at col 2.
-            // In the buggy version, the ZWJ sequence is split into multiple
-            // cells (man=2 cols, ZWJ=1 col, woman=2 cols, ZWJ=1 col, girl=2 cols)
-            // pushing 'Z' to col 8 or beyond.
+            // Correct reconstruction puts 'Z' at col 2; a split ZWJ sequence
+            // would push it to col 8 or beyond.
             if row.get(2).map(|c| c.char()) == Some('Z') {
                 found = true;
                 // ZWJ should occupy cols 0-1, 'Z' at col 2. Correct!
@@ -883,25 +737,14 @@ fn grid_unscroll_zwj_emoji_not_split() {
     );
 }
 
-/// Regression test for #4248: unscroll must remove recovered lines from
-/// scrollback. Without the fix, scrollback retains duplicates of lines
-/// that were already placed back into the visible grid.
+/// Unscroll removes the recovered lines from scrollback (no duplicates).
 #[test]
 fn grid_unscroll_removes_lines_from_scrollback() {
     // ring_buffer_size=2: capacity = rows(4) + 2 = 6 rows.
     // Writing 8 lines overflows by 2 → 2 lines pushed to tiered scrollback.
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    let mut grid = tiered_grid(4, 10, 2);
 
-    for i in 0..8 {
-        grid.carriage_return();
-        for c in format!("Line {i}").chars() {
-            grid.write_char(c);
-        }
-        if i < 7 {
-            grid.line_feed();
-        }
-    }
+    write_numbered_lines(&mut grid, 8);
 
     let sb_before = grid.scrollback_lines();
     assert_eq!(
@@ -926,18 +769,9 @@ fn grid_unscroll_removes_lines_from_scrollback() {
 fn grid_unscroll_all_empties_scrollback() {
     // ring_buffer_size=2: capacity = rows(4) + 2 = 6 rows.
     // Writing 8 lines overflows by 2 → 2 lines in tiered scrollback.
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    let mut grid = tiered_grid(4, 10, 2);
 
-    for i in 0..8 {
-        grid.carriage_return();
-        for c in format!("Line {i}").chars() {
-            grid.write_char(c);
-        }
-        if i < 7 {
-            grid.line_feed();
-        }
-    }
+    write_numbered_lines(&mut grid, 8);
 
     let sb_before = grid.scrollback_lines();
     assert_eq!(
@@ -956,8 +790,8 @@ fn grid_unscroll_all_empties_scrollback() {
     );
 }
 
-/// Regression test for #4521: unscroll must abort entirely when any scrollback
-/// line fails to decompress, preserving the original scrollback data intact.
+/// Unscroll aborts entirely when any scrollback line fails to decompress,
+/// leaving scrollback intact.
 // Uses aterm-scrollback's disk-tier-gated DiskBackedScrollback APIs.
 #[cfg(feature = "disk-tier")]
 #[test]
@@ -967,9 +801,8 @@ fn grid_unscroll_aborts_on_decompression_failure() {
     let temp_dir = aterm_tempfile::tempdir().expect("create temp dir");
     let cold_path = temp_dir.path().join("scrollback.dtrm");
 
-    // Zero-size hot/warm tiers + block_size=1: every line except the most
-    // recent flows through hot → warm → cold immediately. After 20 pushes,
-    // 19 lines are on disk (cold) and 1 is in hot (memory).
+    // Zero-size hot/warm tiers and block_size=1: after 20 pushes, 19 lines are
+    // cold (on disk) and 1 is hot.
     let config = DiskBackedScrollbackConfig::new(&cold_path)
         .with_hot_limit(0)
         .with_warm_limit(0)
@@ -984,23 +817,16 @@ fn grid_unscroll_aborts_on_decompression_failure() {
     assert_eq!(storage.line_count(), 20);
     assert!(std::fs::metadata(&cold_path).map_or(0, |m| m.len()) > 0);
 
-    // Truncate cold file to just the 32-byte header, removing all page data.
-    // The DiskColdTier's in-memory page index still references pages beyond
-    // byte 32, but reads will fail with I/O errors (seek past EOF).
-    // Previous approach (overwriting first 64 bytes) only corrupted the
-    // oldest pages at the file start, but unscroll reads the NEWEST cold
-    // pages from the file tail — those were never corrupted.
+    // Truncate the cold file to its 32-byte header. The in-memory page index
+    // still references the newest pages at the file tail, so reads fail.
     #[cfg(unix)]
     std::fs::OpenOptions::new()
         .write(true)
         .open(&cold_path)
         .and_then(|f| f.set_len(32))
         .expect("truncate cold file");
-    // Windows twin: the cold tier holds the file MAPPED, and Windows refuses to
-    // shrink a user-mapped file (ERROR_USER_MAPPED_FILE), so corrupt by
-    // OVERWRITING every page byte past the 32-byte header with garbage instead.
-    // This corrupts the NEWEST pages at the file tail too (the concern the
-    // truncation approach was chosen for), and the ineffective-corruption skip
+    // Windows refuses to shrink a mapped file (ERROR_USER_MAPPED_FILE), so
+    // overwrite every page byte past the 32-byte header instead; the skip
     // below still guards the premise.
     #[cfg(windows)]
     {
@@ -1027,10 +853,8 @@ fn grid_unscroll_aborts_on_decompression_failure() {
     let sb_before = storage.line_count();
     let mut grid = Grid::with_tiered_scrollback(4, 20, 0, storage);
 
-    // Unscroll 4 lines: line 19 (newest, in hot) succeeds, but lines
-    // 16-18 (in cold) fail because page data was truncated →
-    // try_read_scrollback_lines returns None → unscroll aborts with 0,
-    // grid and scrollback unchanged.
+    // Unscroll 4: line 19 (hot) reads, lines 16-18 (cold) fail, so unscroll
+    // aborts with 0 and leaves grid and scrollback unchanged.
     let unscrolled = grid.unscroll_from_scrollback(4);
     assert_eq!(unscrolled, 0, "Unscroll must abort when any line fails");
 

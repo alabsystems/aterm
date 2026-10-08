@@ -3,7 +3,7 @@
 
 //! Streaming search: derived TLA+ spec + Tier-1 binding to the REAL engine.
 //!
-//! Three layers, per `docs/RFC-ty-embed-derived-tla.md` (ONE registered Rust
+//! Three layers, per `aterm_spec::derive`'s module docs (ONE registered Rust
 //! model — `aterm_spec::derive::streaming_search_model()` — feeds all of them,
 //! the SAME `Model` the compile-time gate in `build.rs`, the Tier-0 tests in
 //! aterm-spec, the global strict-vacuity audit, and trust-ir spec-link check,

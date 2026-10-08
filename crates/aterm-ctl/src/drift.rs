@@ -1,37 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cast drift` on the client: the ONE spelling, whoever computes it.
+//! `cast drift` on the client.
 //!
 //! `aterm ctl [@<sid>] cast drift [max_runs=<k>] [rows=<n>] [seed=…]` asks the
 //! server first. A server that knows the verb answers `OK <n> verdict=…` and
-//! the rows, printed as they come. A server that PREDATES it answers the bare
-//! `cast` (its dispatch reads only `cast frames` as a sub-form), so the reply is
-//! `OK <nbytes>` and an asciicast body — told apart by the header having no
-//! `verdict=`. Then, when the binary running this client links the engine (the
-//! one `aterm` binary hands the analyzer in through [`LocalVerbs`]), the client
-//! computes the SAME report itself from what that server can serve: `status`
-//! (for the cut), `text`, `cursor`, `modes` and `cast`, read-only verbs all, so
-//! the audit is safe to aim at a tab a person is using. Its header says
-//! `computed=client`.
+//! the rows. One that predates it answers the bare `cast` (`OK <nbytes>` and an
+//! asciicast body, no `verdict=`); then, when the binary links the engine
+//! ([`LocalVerbs`]), the client computes the same report from read-only verbs
+//! (`status`, `text`, `cursor`, `modes`, `cast`), so it is safe against a tab
+//! in use. Its header says `computed=client`.
 //!
-//! THROUGH A RELAY (2026-09-28): `aterm ctl dial <name> [@<sid>] cast drift …`
-//! asks the REMOTE the same way, every request sent as `dial <name> …` and
-//! every reply framed as the remote's answer to the verb after the head
-//! ([`Route`]). A remote that predates the verb gets the same client-side
-//! report, its material read through the relay too; the refusal stays only
-//! for a relay that cannot carry those reads (the error names why).
+//! Through a relay, `aterm ctl dial <name> [@<sid>] cast drift …` asks the
+//! remote the same way, each request sent as `dial <name> …` and each reply
+//! framed as the remote's answer ([`Route`]). Only a relay that cannot carry
+//! the reads is refused.
 //!
-//! The OFFLINE form reads saved files and needs no socket:
+//! The offline form reads saved files and needs no socket:
 //! `aterm ctl cast drift --file <cast> [--screen <text>] [--until <t>] [k=v…]`
 //! (with no screen it compares the faithful replay with the stable one:
 //! `fidelity=-`).
 //!
-//! WHY INJECTED, NOT LINKED: this crate is the dependency-free client (it links
-//! `aterm-types` and `aterm-uds` only), and the analysis folds recordings
-//! through the terminal engine. The one binary already links the engine, so it
-//! passes a plain `fn` in ([`main_entry_with`](crate::main_entry_with)): no
-//! global registration, no new dependency here, and the standalone dev
+//! The analyzer is injected, not linked: this crate is the dependency-free
+//! client (`aterm-types` and `aterm-uds` only), and the `aterm` binary, which
+//! links the engine, passes a plain `fn` in
+//! ([`main_entry_with`](crate::main_entry_with)). The standalone dev
 //! `aterm-ctl` says by name that it cannot compute the report.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -40,14 +33,13 @@ use std::time::Duration;
 
 use super::{
     StdoutSink, TargetOrigin, byte_count, converse, converse_served, drain_refusal_tail,
-    malformed_header_error, read_bounded_line, read_status_line, read_token_for, send_request,
-    send_served, stderr_line, stdout_handle, stream_count,
+    malformed_header_error, read_bounded_line, read_status_line, send_request, send_served,
+    stderr_line, stdout_handle, stream_count,
 };
 
-/// Verbs this client answers IN-PROCESS when the binary embedding it links the
-/// engine. The one `aterm` binary passes them to
-/// [`main_entry_with`](crate::main_entry_with); the standalone `aterm-ctl`
-/// passes [`LocalVerbs::NONE`].
+/// Verbs this client answers in-process when its binary links the engine. The
+/// `aterm` binary passes them to [`main_entry_with`](crate::main_entry_with);
+/// the standalone `aterm-ctl` passes [`LocalVerbs::NONE`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalVerbs {
     /// The `cast drift` analyzer (`aterm_control::cast_drift` behind an adapter).
@@ -75,15 +67,14 @@ pub enum DriftCut {
     File,
 }
 
-/// Which aterm made the recording, for the one engine behavior the replays
-/// must match: the RESIZE UNDO (2026-09-28), with which a flap with nothing
-/// output between its halves moves nothing. An aterm without it shifted its
-/// screen on every such flap, and a replay with the undo cannot reproduce that.
+/// Which aterm made the recording, for the one engine behaviour the replays
+/// must match: the resize undo, under which a flap with no output between its
+/// halves moves nothing. An aterm without it shifts its screen on every flap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriftPeer {
     /// An aterm older than `cast drift` (the live fallback, direct or through
-    /// `dial`), and so older than the undo, which landed after the verb: the
-    /// replays drop it (`undo=off`).
+    /// `dial`), and so older than the resize undo: the replays drop it
+    /// (`undo=off`).
     PreUndo,
     /// Not known (saved files): the replays keep the undo, and drop it only
     /// when that alone reproduces the given screen.
@@ -130,7 +121,7 @@ pub(crate) struct Route<'a> {
 }
 
 impl Route<'_> {
-    /// The request as the REMOTE (or the one server) reads it:
+    /// The request as the remote (or the one server) reads it:
     /// `[@<selector> ]<verb>` — what its reply is framed by.
     fn framed(&self, verb: &str) -> String {
         let mut r = String::new();
@@ -181,7 +172,7 @@ pub(crate) fn is_cast_drift(rest: &[String]) -> bool {
 }
 
 /// Whether the reply to `request` (by its `verb`) is a `cast drift` report,
-/// whose HEADER carries the verdict and so leads the rows on stdout.
+/// whose header carries the verdict and so leads the rows on stdout.
 pub(crate) fn is_drift_request(verb: &str, request: &str) -> bool {
     let tail = request
         .strip_prefix('@')
@@ -261,10 +252,7 @@ fn parse_offline(tail: &[String]) -> io::Result<Option<Offline>> {
 
 fn no_analyzer_error(what: &str) -> io::Error {
     let mut msg = String::from(what);
-    msg.push_str(
-        "; this client does not link the engine the replay needs — run it as `aterm ctl …` \
-         (the one aterm binary computes it client-side)",
-    );
+    msg.push_str("; this client does not link the engine — run it as `aterm ctl …`");
     io::Error::other(msg)
 }
 
@@ -278,7 +266,7 @@ fn screen_rows(text: &str) -> Vec<String> {
 
 /// The offline form, answered with no socket: `Ok(None)` when `parts` is not
 /// it (the caller goes on to dial). A `@<selector>` with the offline flags is a
-/// usage error: the files ARE the session.
+/// usage error: the files are the session.
 pub(crate) fn offline_entry(parts: &[String], local: &LocalVerbs) -> io::Result<Option<ExitCode>> {
     let (selector, rest) = match parts.first() {
         Some(s) if s.starts_with('@') => (Some(s), &parts[1..]),
@@ -350,9 +338,9 @@ fn print_report(report: Result<String, String>) -> io::Result<ExitCode> {
     }
 }
 
-/// A request a server answered `ERR …`: the request and its status line,
-/// kept apart so a caller can tell WHO refused (the local relay's `ERR dial …`,
-/// or the remote's own answer carried through it).
+/// A request a server answered `ERR …`: the request and its status line, kept
+/// apart so a caller can tell who refused (the local relay's `ERR dial …`, or
+/// the remote's own answer).
 #[derive(Debug)]
 struct Refused {
     request: String,
@@ -367,12 +355,10 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// Whether `e`, from a read sent through `dial`, is the RELAY failing — the
-/// transport (a connection that closed, reset, refused or timed out) or the
-/// local server's own `ERR dial …` — rather than the remote answering. A
-/// remote's refusal (`ERR no such session`, the tab closed between the probe
-/// and the reads), a reply of the wrong shape or a cast that is not UTF-8
-/// came through a relay that worked, and is reported as itself.
+/// Whether `e`, from a read sent through `dial`, is the relay failing (the
+/// transport, or the local server's own `ERR dial …`) rather than the remote
+/// answering. A remote refusal, a wrong-shaped reply or a non-UTF-8 cast came
+/// through a working relay and is reported as itself.
 fn relay_failed(e: &io::Error) -> bool {
     if let Some(refused) = e
         .get_ref()
@@ -416,12 +402,12 @@ fn fetch(
     let request = route.line(verb);
     let framed = route.framed(verb);
     let request = request.as_str();
-    converse(path, origin, deadline, |stream| {
+    converse(path, origin, deadline, |stream, token| {
         stream.set_read_timeout(deadline)?;
         stream.set_write_timeout(deadline)?;
         let mut line = String::from(request);
         line.push('\n');
-        send_request(&stream, read_token_for(path).as_deref(), &line)?;
+        send_request(&stream, token, &line)?;
         let mut reader = BufReader::new(&stream);
         let mut status = String::new();
         if read_status_line(&mut reader, &mut status)? == 0 {
@@ -601,20 +587,19 @@ enum Probe {
 }
 
 /// Send `request` (`[@<sid> ]cast drift …\n`) and read the answer. A report
-/// (`OK <n> verdict=…`) is printed header first; an `ERR` goes to stderr as
-/// `exchange` reports one; a lone byte count is an older server's bare cast,
-/// read off the socket and dropped.
+/// (`OK <n> verdict=…`) is printed header first; an `ERR` goes to stderr as in
+/// `exchange`; a lone byte count is an older server's bare cast, read and
+/// dropped.
 fn probe(
     path: &str,
     origin: TargetOrigin,
     request: &str,
     deadline: Option<Duration>,
 ) -> io::Result<Probe> {
-    // `exchange`'s connect phase ([`converse_served`]): a connection no instance
-    // accepted is reported as that in seconds, not after `deadline`, and a busy
-    // listener's refusal as itself. The client-side fallback's own reads
-    // ([`fetch`]) follow only once this connection has proved the instance is
-    // serving.
+    // `exchange`'s connect phase ([`converse_served`]): an unaccepted connection
+    // is reported within seconds, and a busy listener's refusal as itself. The
+    // fallback's own reads ([`fetch`]) run only once this connection proved the
+    // instance is serving.
     let served = converse_served(path, origin, deadline, |stream| {
         if let Some(code) = send_served(&stream, request.as_bytes())? {
             return Ok(Probe::Answered(code));
@@ -647,9 +632,9 @@ fn probe(
             out.flush()?;
             return Ok(Probe::Answered(ExitCode::SUCCESS));
         }
-        // A lone byte count is the BARE cast an older server answers for any `cast
-        // <word>` but `frames`: consume it (the connection stays orderly), and let
-        // the caller compute the report.
+        // A lone byte count is the bare cast an older server answers for any
+        // `cast <word>` but `frames`: consume it and let the caller compute the
+        // report.
         let n = match (tail.split_whitespace().count(), byte_count(tail)) {
             (1, Some(n)) => n,
             _ => return Err(malformed_header_error(status)),
@@ -721,10 +706,8 @@ fn live_with(
     };
     let m = match read_material(path, origin, route, deadline, settle) {
         Ok(m) => m,
-        // Only the RELAY's failure is the refusal: through it the remote is
-        // asked the same read-only verbs a local fallback asks. Anything the
-        // remote itself answered (a tab that closed meanwhile, a reply of the
-        // wrong shape) is reported as it is, as on the direct route.
+        // Only the relay's failure is a refusal; anything the remote itself
+        // answered is reported as it is, as on the direct route.
         Err(e) if route.dial.is_some() && relay_failed(&e) => {
             let mut why =
                 String::from("the relay could not carry the reads a client-side report needs (");
@@ -736,10 +719,9 @@ fn live_with(
     };
     stderr_line(if route.dial.is_some() {
         "the aterm this `dial` reached predates `cast drift`; computed client-side through the \
-         relay from its status, text, cursor, modes and cast (computed=client)"
+         relay (computed=client)"
     } else {
-        "this aterm predates `cast drift`; computed client-side from its status, text, cursor, \
-         modes and cast (computed=client)"
+        "this aterm predates `cast drift`; computed client-side (computed=client)"
     })?;
     let job = CastDriftJob {
         cast: &m.cast,
@@ -813,8 +795,7 @@ mod tests {
     }
 
     /// [`echo`], refusing a job that does not name the peer the live fallback
-    /// computes against: an aterm older than the verb, so older than the
-    /// resize undo.
+    /// computes against (an aterm older than the verb and the resize undo).
     fn echo_pre_undo(job: &CastDriftJob<'_>) -> Result<String, String> {
         if job.peer == DriftPeer::PreUndo {
             echo(job)
@@ -848,11 +829,10 @@ mod tests {
         ))
     }
 
-    /// The fallback end to end against a mock OLDER server: it answers `cast
-    /// drift` with the bare cast, so the client reads status/text/cursor/modes/
-    /// cast itself (a stamp that does not move: quiescent) and hands the
-    /// analyzer the material — and the standalone client without one refuses
-    /// by name instead of misreading the byte body as rows.
+    /// The fallback end to end against a mock older server that answers `cast
+    /// drift` with the bare cast: the client reads status/text/cursor/modes/
+    /// cast itself (unmoved stamp: quiescent) and hands the analyzer the
+    /// material; the standalone client without one refuses by name.
     #[cfg(unix)]
     #[test]
     fn an_older_server_gets_the_report_computed_client_side() {
@@ -999,10 +979,10 @@ mod tests {
         }
     }
 
-    /// `dial <name> [@<sid>] cast drift` against a remote that PREDATES the
-    /// verb: the report is computed here from the remote's own status, text,
-    /// cursor, modes and cast, every read sent through the relay head and
-    /// framed as the remote's answer (the cast's byte body, the text's rows).
+    /// `dial <name> [@<sid>] cast drift` against a remote that predates the
+    /// verb: the report is computed from the remote's status, text, cursor,
+    /// modes and cast, each read sent through the relay and framed as the
+    /// remote's answer.
     #[cfg(unix)]
     #[test]
     fn a_relayed_older_remote_gets_the_report_computed_client_side() {
@@ -1043,9 +1023,8 @@ mod tests {
         let _ = sock.parent().map(std::fs::remove_dir);
     }
 
-    /// The refusal stays for a relay that cannot carry the reads: the remote
-    /// answered the bare cast, but the relay refuses the next request. The
-    /// error names the relay and why, and still says how to get a report.
+    /// A relay that refuses the follow-up reads: the error names the relay and
+    /// why, and says how to get a report.
     #[cfg(unix)]
     #[test]
     fn a_relay_that_cannot_carry_the_reads_is_refused_by_name() {
@@ -1090,10 +1069,8 @@ mod tests {
         let _ = sock.parent().map(std::fs::remove_dir);
     }
 
-    /// A read the REMOTE refused came through a relay that worked: the tab
-    /// closed between the probe and the reads, so the remote answers `ERR no
-    /// such session`. That is reported as itself, as on the direct route —
-    /// never framed as the relay failing, with advice to upgrade the remote.
+    /// A remote refusal (`ERR no such session`, the tab closed between probe
+    /// and reads) is reported as itself, never as the relay failing.
     #[cfg(unix)]
     #[test]
     fn a_remote_refusal_through_a_working_relay_is_not_blamed_on_the_relay() {

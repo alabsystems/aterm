@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HarnessModelLadder, Tier-1: WHEN the live upgrade takes a due model move
-//! (`aterm_agent::harness::upgrade_models::model_moves_now`), driven over
-//! every reachable state of the derived model and projected back onto it.
+//! HarnessModelLadder, Tier-1: when the live upgrade takes a due model move
+//! (`aterm_agent::harness::upgrade_models::model_moves_now`), driven over every
+//! reachable state of the derived model and projected back onto it.
 //!
-//! The model is a hand-written description; this is what makes it a statement
-//! about the code that compiled. At every reachable readable state the REAL
-//! decision must agree with the model's guards — `VisitMoves` enabled exactly
-//! where `model_moves_now` answers a move, `VisitWaits` exactly where it waits
-//! — and each observed transition is validated against the model on every
-//! installed tier. The negative controls: forged successors the model must
-//! refuse, and the incident's own rule (move only on a cold cache), which must
-//! disagree with the model somewhere reachable — or the bind proves nothing.
+//! At every reachable readable state the real decision agrees with the model's
+//! guards (`VisitMoves` exactly where `model_moves_now` answers a move,
+//! `VisitWaits` exactly where it waits), and each observed transition is
+//! validated on every installed tier. Negative controls: forged successors the
+//! model must refuse, and a cold-cache-only rule, which must disagree with the
+//! model somewhere reachable.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -138,10 +136,9 @@ fn the_real_ladder_is_the_models_ladder_at_every_reachable_state() {
     assert!(decided > 0);
 }
 
-/// THE CAUGHT NEGATIVE CONTROL: the incident's rule — a due move taken only on
-/// a cold cache — must disagree with the model at a reachable state, and the
-/// disagreement must be the incident itself (warm, a build restart in hand).
-/// A bind the old code would also have passed would prove nothing.
+/// The caught negative control: a due move taken only on a cold cache must
+/// disagree with the model at a reachable state, and the disagreement must be
+/// the case it misses (warm, a build restart in hand).
 #[test]
 fn the_incidents_cold_only_rule_is_caught_by_the_bind() {
     let model = harness_model_ladder_model();
@@ -159,7 +156,7 @@ fn the_incidents_cold_only_rule_is_caught_by_the_bind() {
         caught.iter().any(|s| s["cold"] == 0 && s["restart"] == 1),
         "the incident (warm, a build restart in hand) is not among the catches: {caught:?}"
     );
-    // And the real ladder is NOT caught there.
+    // And the real ladder is not caught there.
     for s in &caught {
         assert_eq!(
             real_moves(s),

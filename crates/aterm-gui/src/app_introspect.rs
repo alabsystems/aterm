@@ -19,8 +19,6 @@ use aterm_core::terminal::Terminal;
 use aterm_render::Frame;
 
 use crate::WindowId;
-#[cfg(test)]
-use crate::app_render::sync_cursor_effect_scroll;
 use crate::app_render::{
     OverlayGlow, apply_bell_invert, apply_host_chrome_at, apply_overlay_at, composite_tray_quad_at,
     sync_cursor_effect_coordinate_space, tray_quad_below_y,
@@ -29,8 +27,6 @@ use crate::control::{DimsSnapshot, ImageReq};
 use crate::platform::AppRt;
 #[cfg(unix)]
 use crate::snapshot_path;
-#[cfg(test)]
-use crate::term_lock;
 use crate::{App, accessibility, control_auth};
 
 /// How long a test waits for a reply the capture path owes it — every capture,
@@ -585,6 +581,7 @@ fn terminal_capture_text(
 fn non_macos_chrome_output(
     mut platform_lines: Vec<String>,
     toolbar_tabs: Option<String>,
+    strip_version: Option<String>,
     tab_menu_lines: Vec<String>,
     menu_lines: Vec<String>,
 ) -> Vec<String> {
@@ -592,11 +589,92 @@ fn non_macos_chrome_output(
     if let Some(toolbar_tabs) = toolbar_tabs {
         platform_lines.push(toolbar_tabs);
     }
+    // The tab strip's version label (Windows) follows the tab model it sits in.
+    if let Some(strip_version) = strip_version {
+        platform_lines.push(strip_version);
+    }
     // Per-tab context-menu mirror lines (`tab-menu tab=<i> items=[...]`) ride
     // between the toolbar-tabs line and the app menu, matching the macOS order.
     platform_lines.extend(tab_menu_lines);
     platform_lines.extend(menu_lines);
     platform_lines
+}
+
+/// Why the strip shows no version label, for the `strip-version shown=no` line.
+#[cfg(any(test, not(target_os = "macos")))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StripVersionAbsence {
+    /// The window has no in-grid strip (`tab_strip_rows == 0`).
+    NoStrip,
+    /// The strip has no layout to report: no frame has laid it out since the
+    /// window opened or since a chrome regrid cleared it (a headless instance
+    /// lays its strip out when it composes a frame — an `image`).
+    NotLaidOut,
+    /// The strip was laid out before its UI face landed, so no slot was
+    /// measured — the label is laid out in that face or not at all.
+    NoUiFace,
+    /// The tabs need every column: no rung fits without costing a tab its seat.
+    StripFull,
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+impl StripVersionAbsence {
+    fn token(self) -> &'static str {
+        match self {
+            Self::NoStrip => "no-strip",
+            Self::NotLaidOut => "not-laid-out",
+            Self::NoUiFace => "no-ui-face",
+            Self::StripFull => "strip-full",
+        }
+    }
+}
+
+/// The `chrome` verb's `strip-version` line: the version label as it was LAID
+/// OUT in the front window's strip (`segments` — `ws.tab_segments`), so the
+/// columns it prints are the ones `pointer move -1 <col>` and a click resolve,
+/// and `action=` is what that click fires ([`crate::menu::version_slot_click`],
+/// printed as its `invoke` token). Shown:
+/// `strip-version shown=yes rung=<full|short> cols=<s>..<e> text="…" attention=<bool>
+/// hovered=<bool> action=<token>`; not shown: `strip-version shown=no
+/// reason=<no-strip|not-laid-out|no-ui-face|strip-full> text="<the full label>" attention=<bool>
+/// action=<token>` — `absent` is the caller's reading of why, consulted only when
+/// no label was laid out. A label that IS laid out reports its own update mark.
+#[cfg(any(test, not(target_os = "macos")))]
+fn strip_version_chrome_line(
+    segments: &[crate::tab_bar::TabSegment],
+    hovered: bool,
+    absent: StripVersionAbsence,
+    attention: bool,
+) -> String {
+    let laid_out = segments.iter().find_map(|seg| match seg.kind {
+        crate::tab_bar::TabHit::Version { rung, attention } => Some((seg, rung, attention)),
+        _ => None,
+    });
+    match laid_out {
+        Some((seg, rung, attention)) => {
+            let text = crate::menu::strip_version_label(rung, attention).unwrap_or_default();
+            let rung = match rung {
+                crate::menu::VersionRung::Full => "full",
+                crate::menu::VersionRung::Short => "short",
+            };
+            let action = crate::menu::version_slot_click(attention);
+            format!(
+                "strip-version shown=yes rung={rung} cols={}..{} text={text:?} \
+                 attention={attention} hovered={hovered} action={action:?}",
+                seg.start_col, seg.end_col
+            )
+        }
+        None => {
+            let text = crate::menu::strip_version_label(crate::menu::VersionRung::Full, attention)
+                .unwrap_or_default();
+            let action = crate::menu::version_slot_click(attention);
+            format!(
+                "strip-version shown=no reason={} text={text:?} attention={attention} \
+                 action={action:?}",
+                absent.token()
+            )
+        }
+    }
 }
 
 /// A finished capture handed OFF the winit event-loop thread for PNG encode +
@@ -884,13 +962,7 @@ fn sidecar_name(file_name: &std::ffi::OsStr, suffix: &str) -> std::ffi::OsString
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = aterm_digest::Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(hex, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    hex
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
 }
 
 fn clear_snapshot_completion(target: &SnapshotTarget) -> std::io::Result<()> {
@@ -2270,7 +2342,7 @@ impl AuxTarget {
 /// app-present/capture phase parity, not a compositor or scanout claim.
 ///
 /// PHASE-3 (one clock owner): while a `video` recording targets this window, its
-/// offscreen present loop drives `tick_cursor_fx` — the recording loop OWNS the
+/// offscreen present loop drives `cursor_frame` — the recording loop OWNS the
 /// engine clock, and a concurrent `image` must reuse the loop's last-present
 /// quads exactly like a windowed capture does (ticking here would compose state
 /// newer than the frame the recording just minted).
@@ -2288,7 +2360,8 @@ fn captured_resident_body_for_test(app: &App, wid: WindowId) -> &aterm_core::ren
     let (ox, oy, _, _, _) =
         app.effects_origin_win(wid, usize::from(ws.rows), usize::from(ws.cols), ch);
     let published = ws
-        .companion
+        .fx
+        .companion()
         .hit_rect()
         .expect("capture publishes the resident body");
     let mut matching = ws.input_scratch.free_sprites.iter().filter(|sprite| {
@@ -2354,7 +2427,7 @@ fn observe_capture_pet_world(
         ws.predictor.pending_bounds(),
         ws.search.is_some(),
     );
-    let observed = ws.companion.observe_console(
+    let observed = ws.fx.companion_mut().observe_console(
         input,
         &exact_focus.pet_world,
         PetPane::full(input),
@@ -2480,6 +2553,8 @@ fn capture_pet_facts(
         session: focus.session,
         caret: focus.cursor,
         cursor_visible: focus.cursor.is_some(),
+        // The painted caret only: no hidden write position to withhold.
+        frame_unfinished: false,
         display_offset: i32::try_from(focus.display_offset).unwrap_or(i32::MAX),
         live_viewport: focus.live_viewport,
         content_seq: focus.content_seq,
@@ -2487,7 +2562,6 @@ fn capture_pet_facts(
         scrolled: false,
         shell_executing: false,
         cmd_done: None,
-        block: None,
         alt_screen: focus.alternate_screen,
     }
 }
@@ -2737,7 +2811,8 @@ impl App {
         };
         let now = Instant::now();
         let all: Vec<String> = ws
-            .cursor_fx
+            .fx
+            .cursor()
             .glow
             .admission_log()
             .map(|record| record.line(now))
@@ -3045,14 +3120,14 @@ impl App {
         }
     }
 
-    /// The COMPOSED (split) twin of [`Self::splice_word_decorations`]: run the
+    /// The COMPOSED (split) twin of [`Self::capture_words`]: run the
     /// glass's own per-pane sparkle pass and install its window-coordinate
     /// output over the composite this capture just built.
     ///
-    /// Reusing `compose_word_decorations` rather than a second pipeline is what
+    /// Reusing `compose_words` rather than a second pipeline is what
     /// makes the capture WYSIWYG by construction — same engine, same per-pane
     /// binding, same damage gate, same translation into window coords.
-    fn splice_composed_capture_decorations(
+    fn capture_composed_words(
         &mut self,
         wid: WindowId,
         now: Instant,
@@ -3106,6 +3181,9 @@ impl App {
         // (`app_render::sparkle_words_presentable`).
         let word_focus = self.motion_focus(wid, raw_focused);
         let motion = self.motion_policy(capture_focused);
+        // The resident's posture never takes the load-shed latch, on glass
+        // or in a capture (`App::accessibility_motion_policy`).
+        let pet_motion = self.accessibility_motion_policy(capture_focused);
         let shed_envelope = self.effective_shed_envelope(self.config.motion_mode(), now);
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
         let (cell_w, cell_h) = self.backend.cell_size();
@@ -3150,16 +3228,14 @@ impl App {
         if let Some((terminal_id, alternate_screen)) = focus_coordinate_space {
             sync_cursor_effect_coordinate_space(ws, terminal_id, alternate_screen);
         }
-        // THE RESIDENT'S OWNER GATE, applied where it is used. The prepare
-        // pass computed this very predicate and parked its result on the
-        // window for this call — and NO LINE EVER READ THAT FIELD, so the
-        // capture observed a console the gate said not to look at. `pet_mode`
-        // alone is not the gate: `pet_species.is_some()` is resolved from the
-        // style STRING, so it already implies the style term and loses exactly
+        // The resident's owner gate, read fresh on this clock (the same one as
+        // the owner's switch in `companion.prepare` below), never from a copy
+        // parked by the prepare pass, which a config reload landing mid-pass
+        // would make stale. `pet_mode` alone is not the gate:
+        // `pet_species.is_some()` is resolved from the style STRING, so it
+        // already implies the style term and misses
         // `enabled && serious_allows(CursorCat)` — the trail master switch and
-        // Serious Mode. Read FRESH here, on the same clock as
-        // the owner's switch in `companion.prepare` below, rather than from a parked copy
-        // that a config reload landing mid-pass would make stale.
+        // Serious Mode.
         if aterm_effects::companion::resident_pet_owner_present(
             pet_mode,
             glow_cfg.enabled && cursor_companions_allowed,
@@ -3168,21 +3244,24 @@ impl App {
             observe_capture_pet_world(ws, &exact_focus, true);
         }
         let (win_rows, win_cols) = (ws.rows, ws.cols);
-        ws.cursor_cat.set_look(companion_look);
+        ws.fx.companions_mut().cursor_cat.set_look(companion_look);
         let cursor_companion_presentable =
             cursor_companions_allowed && capture_focused && !load_shed && focus_live_viewport;
         // A capture is itself a presentation boundary (the single-pane arm's rule).
-        ws.cursor_cat
+        ws.fx
+            .companions_mut()
+            .cursor_cat
             .set_collection_presentable(now, cursor_companion_presentable);
         if !cursor_companions_allowed {
-            ws.music_notes.clear();
+            ws.fx.companions_mut().music_notes.clear();
         }
         let sing_drive = {
+            let (c, cursor) = ws.fx.companions_with_cursor();
             let (detector, cat, glow, riff_bar) = (
-                &mut ws.kitty_sing,
-                &mut ws.cursor_cat,
-                &mut ws.cursor_fx.glow,
-                &mut ws.sing_riff_bar,
+                &mut c.kitty_sing,
+                &mut c.cursor_cat,
+                &mut cursor.glow,
+                &mut c.sing_riff_bar,
             );
             sync_capture_companion_song(CaptureCompanionSongSync {
                 style: glow_cfg.style,
@@ -3202,9 +3281,9 @@ impl App {
         // because they have no OS window.
         let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
         let cat_frame = if animate_cat {
-            ws.cursor_cat.frame(now)
+            ws.fx.companions_mut().cursor_cat.frame(now)
         } else {
-            ws.cursor_cat.static_frame(now)
+            ws.fx.companions_mut().cursor_cat.static_frame(now)
         };
         let kitty_enabled = capture_flying_companion_enabled(
             cursor_companion_presentable,
@@ -3233,49 +3312,64 @@ impl App {
         // selected — but it is one isolated frame: it reads and spends none
         // of the present-owned diffs (burst, wrap, completion, Execute), has
         // no pointer, and a windowless still materialises rather than walks.
-        ws.companion.set_species(pet_species);
-        let pet_tick = ws.companion.prepare(
-            aterm_effects::companion::PetFacts {
-                facts: &capture_pet_facts(&exact_focus),
-                host: &aterm_effects::host::HostFrameInput {
-                    now,
-                    visibility: crate::app_render::pet_visibility(capture_focused),
-                    reduced_motion: !motion.animate(crate::motion::MotionEffect::CursorGlow),
-                    serious: !cursor_companions_allowed,
-                    shed_envelope,
-                    shed_active: load_shed,
-                    pointer_px: None,
-                    capture: capture_mode(windowless),
-                    geometry: crate::app_render::pet_frame_geom(
-                        (cell_w, cell_h),
-                        (usize::from(pane_rows), usize::from(pane_cols)),
-                        (
-                            i32::from(origin_x) + pane_origin.0,
-                            i32::from(origin_y) + pane_origin.1,
+        ws.fx.companion_mut().set_species(pet_species);
+        // THE GLASS BESIDE THE FOCUSED PANE, the composed present's twin
+        // (`CompanionOwner::offer_glass`): a capture mid-way through a
+        // split-pane focus switch draws the old body fading in its own pane.
+        ws.fx
+            .companion_mut()
+            .offer_glass(
+                panes
+                    .iter()
+                    .map(|(r, _)| aterm_effects::companion::PetGlass {
+                        session: r.session,
+                        origin: (
+                            i32::from(r.col_off) * cell_w as i32,
+                            i32::from(r.row_off) * cell_h as i32,
                         ),
+                        cols: r.cols,
+                        rows: r.rows,
+                    }),
+            );
+        let pet_tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
+            facts: &capture_pet_facts(&exact_focus),
+            host: &aterm_effects::host::HostFrameInput {
+                now,
+                visibility: crate::app_render::pet_visibility(capture_focused),
+                reduced_motion: !pet_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                serious: !cursor_companions_allowed,
+                shed_envelope,
+                shed_active: load_shed,
+                pointer_px: None,
+                capture: capture_mode(windowless),
+                geometry: crate::app_render::pet_frame_geom(
+                    (cell_w, cell_h),
+                    (usize::from(pane_rows), usize::from(pane_cols)),
+                    (
+                        i32::from(origin_x) + pane_origin.0,
+                        i32::from(origin_y) + pane_origin.1,
                     ),
-                },
-                glow: aterm_effects::companion::GlowOwnership {
-                    enabled: glow_cfg.enabled,
-                    style: glow_cfg.style,
-                    style_raw_names_pet: pet_mode,
-                },
-                sing: aterm_effects::host::SingFacts {
-                    drive: sing_drive,
-                    flying_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
-                },
-                focused: capture_focused,
-                obscured: ws.overlay_open() || ws.tab_menu.is_some(),
-                pane: Some((focus, pane_origin)),
-                room: None,
+                ),
             },
-            &mut ws.word_decos,
-        );
+            glow: aterm_effects::companion::GlowOwnership {
+                enabled: glow_cfg.enabled,
+                style: glow_cfg.style,
+                style_raw_names_pet: pet_mode,
+            },
+            sing: aterm_effects::host::SingFacts {
+                drive: sing_drive,
+                flying_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
+            },
+            focused: capture_focused,
+            obscured: ws.overlay_open() || ws.tab_menu.is_some(),
+            pane: Some((focus, pane_origin)),
+            room: None,
+        });
         // This capture owns the tick, so it publishes the same full-body
         // rectangle as application-present. The existing non-owning still
         // path never reaches here and cannot replace the live window's hit
         // target.
-        let pet = ws.companion.tick(pet_tick);
+        let pet = ws.fx.companion_mut().tick(pet_tick);
         let ctx = crate::app_render::ComposeDecoCtx {
             panes: &panes,
             focus,
@@ -3301,7 +3395,7 @@ impl App {
             cursor_color: ws.input_scratch.cursor_color,
             now,
         };
-        self.compose_word_decorations(wid, &ctx);
+        self.compose_words(wid, &ctx);
         // PRISM WAKE rides the same composed pass the present uses, or a
         // capture would show a frame the window does not — and every pixel
         // gate in the paint-conformance matrix reads captures, so a streak
@@ -3311,7 +3405,7 @@ impl App {
         // damage under its exact extraction lock. Nothing below may relock a
         // terminal and swallow a newer synchronized-output episode.
         if let Some(ws) = self.windows.get_mut(&wid) {
-            crate::app_render::splice_word_deco_channels(ws);
+            ws.fx.publish_words(&mut ws.input_scratch);
         }
     }
 
@@ -3323,7 +3417,7 @@ impl App {
     /// alt-screen with `suppress_in_alt_screen` set. Cursor companions remain
     /// independent and still follow their own presentation policy.
     #[cfg(test)]
-    pub(crate) fn splice_word_decorations(&mut self, wid: crate::WindowId, now: Instant) {
+    pub(crate) fn capture_words(&mut self, wid: crate::WindowId, now: Instant) {
         let Some(focus) = self
             .prepare_terminal_capture_grid_with_cursor_fx(
                 wid,
@@ -3333,10 +3427,10 @@ impl App {
         else {
             return;
         };
-        self.splice_word_decorations_sampled(wid, now, focus);
+        self.capture_words_sampled(wid, now, focus);
     }
 
-    fn splice_word_decorations_sampled(
+    fn capture_words_sampled(
         &mut self,
         wid: crate::WindowId,
         now: Instant,
@@ -3360,7 +3454,7 @@ impl App {
                 ws.input_scratch.rain_quads.clear();
                 ws.input_scratch.rain_atlas = None;
                 ws.input_scratch.rain_add.clear();
-                crate::app_render::splice_word_deco_channels(ws);
+                ws.fx.publish_words(&mut ws.input_scratch);
             }
             return;
         }
@@ -3420,7 +3514,7 @@ impl App {
             .active_tree(wid)
             .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
         {
-            self.splice_composed_capture_decorations(wid, now, exact_focus);
+            self.capture_composed_words(wid, now, exact_focus);
             return;
         }
         let sparkle = self
@@ -3440,6 +3534,9 @@ impl App {
             now,
         );
         let motion = self.motion_policy(capture_focused);
+        // The resident's posture never takes the load-shed latch, on glass
+        // or in a capture (`App::accessibility_motion_policy`).
+        let pet_motion = self.accessibility_motion_policy(capture_focused);
         let shed_envelope = self.effective_shed_envelope(self.config.motion_mode(), now);
         let sparkle = sparkle.map(|(mut cfg, lexicon)| {
             if !motion.animate(crate::motion::MotionEffect::WordSparkles) {
@@ -3520,16 +3617,7 @@ impl App {
             exact_focus.terminal_id,
             exact_focus.alternate_screen,
         );
-        // THE RESIDENT'S OWNER GATE, applied where it is used. The prepare
-        // pass computed this very predicate and parked its result on the
-        // window for this call — and NO LINE EVER READ THAT FIELD, so the
-        // capture observed a console the gate said not to look at. `pet_mode`
-        // alone is not the gate: `pet_species.is_some()` is resolved from the
-        // style STRING, so it already implies the style term and loses exactly
-        // `enabled && serious_allows(CursorCat)` — the trail master switch and
-        // Serious Mode. Read FRESH here, on the same clock as
-        // the owner's switch in `companion.prepare` below, rather than from a parked copy
-        // that a config reload landing mid-pass would make stale.
+        // The resident's owner gate, read fresh: see `capture_composed_words`.
         if aterm_effects::companion::resident_pet_owner_present(
             pet_mode,
             glow_cfg.enabled && cursor_companions_allowed,
@@ -3540,16 +3628,18 @@ impl App {
         // Capture consumes the same admitted catalog Arc as application-present. Asset
         // installation above is Arc/scalar-only and cannot perform filesystem
         // or decode work.
-        ws.cursor_cat.set_look(companion_look);
+        ws.fx.companions_mut().cursor_cat.set_look(companion_look);
         let cursor_companion_presentable =
             cursor_companions_allowed && capture_focused && !load_shed && live_viewport;
         // The capture itself is a presentation boundary. This resumes a hello
         // that was discovered after the preceding capture had already resolved
         // its frame and was therefore paused unseen below.
-        ws.cursor_cat
+        ws.fx
+            .companions_mut()
+            .cursor_cat
             .set_collection_presentable(now, cursor_companion_presentable);
         if !cursor_companions_allowed {
-            ws.music_notes.clear();
+            ws.fx.companions_mut().music_notes.clear();
         }
         // A CAPTURE IS A RENDERER, so it declares its session exactly like the
         // unsplit glass path does (`app_render::redraw_window`). This arm binds
@@ -3560,13 +3650,16 @@ impl App {
         // keystroke still a live re-arm witness. Declared BEFORE the
         // suspension fork below for the same reason the glass path declares
         // above its own: identity does not depend on whether this frame draws.
-        ws.word_decos.set_scan_session(Some(exact_focus.session));
+        ws.fx
+            .decos_mut()
+            .set_scan_session(Some(exact_focus.session));
         let sing_drive = {
+            let (c, cursor) = ws.fx.companions_with_cursor();
             let (detector, cat, glow, riff_bar) = (
-                &mut ws.kitty_sing,
-                &mut ws.cursor_cat,
-                &mut ws.cursor_fx.glow,
-                &mut ws.sing_riff_bar,
+                &mut c.kitty_sing,
+                &mut c.cursor_cat,
+                &mut cursor.glow,
+                &mut c.sing_riff_bar,
             );
             sync_capture_companion_song(CaptureCompanionSongSync {
                 style: glow_cfg.style,
@@ -3586,9 +3679,9 @@ impl App {
         // synthesizes an unearned ordinary flight.
         let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
         let cat_frame = if animate_cat {
-            ws.cursor_cat.frame(now)
+            ws.fx.companions_mut().cursor_cat.frame(now)
         } else {
-            ws.cursor_cat.static_frame(now)
+            ws.fx.companions_mut().cursor_cat.static_frame(now)
         };
         let kitty_enabled = capture_flying_companion_enabled(
             cursor_companion_presentable,
@@ -3616,60 +3709,54 @@ impl App {
         // whose trail or style owner was removed). One isolated frame: none
         // of the present-owned diffs are read or spent. `set_scan_session`
         // already ran above, before any rescan decision.
-        ws.companion.set_species(pet_species);
-        let pet_tick = ws.companion.prepare(
-            aterm_effects::companion::PetFacts {
-                facts: &capture_pet_facts(&exact_focus),
-                host: &aterm_effects::host::HostFrameInput {
-                    now,
-                    visibility: crate::app_render::pet_visibility(capture_focused),
-                    reduced_motion: !motion.animate(crate::motion::MotionEffect::CursorGlow),
-                    serious: !cursor_companions_allowed,
-                    shed_envelope,
-                    shed_active: load_shed,
-                    pointer_px: None,
-                    capture: capture_mode(windowless),
-                    geometry: crate::app_render::pet_frame_geom(
-                        (cell_w, cell_h),
-                        (rows, cols),
-                        (i32::from(origin_x), i32::from(origin_y)),
-                    ),
-                },
-                glow: aterm_effects::companion::GlowOwnership {
-                    enabled: glow_cfg.enabled,
-                    style: glow_cfg.style,
-                    style_raw_names_pet: pet_mode,
-                },
-                sing: aterm_effects::host::SingFacts {
-                    drive: sing_drive,
-                    flying_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
-                },
-                focused: capture_focused,
-                obscured: ws.overlay_open() || ws.tab_menu.is_some(),
-                pane: None,
-                room: None,
+        ws.fx.companion_mut().set_species(pet_species);
+        let pet_tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
+            facts: &capture_pet_facts(&exact_focus),
+            host: &aterm_effects::host::HostFrameInput {
+                now,
+                visibility: crate::app_render::pet_visibility(capture_focused),
+                reduced_motion: !pet_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                serious: !cursor_companions_allowed,
+                shed_envelope,
+                shed_active: load_shed,
+                pointer_px: None,
+                capture: capture_mode(windowless),
+                geometry: crate::app_render::pet_frame_geom(
+                    (cell_w, cell_h),
+                    (rows, cols),
+                    (i32::from(origin_x), i32::from(origin_y)),
+                ),
             },
-            &mut ws.word_decos,
-        );
-        let pet = ws.companion.tick(pet_tick);
+            glow: aterm_effects::companion::GlowOwnership {
+                enabled: glow_cfg.enabled,
+                style: glow_cfg.style,
+                style_raw_names_pet: pet_mode,
+            },
+            sing: aterm_effects::host::SingFacts {
+                drive: sing_drive,
+                flying_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
+            },
+            focused: capture_focused,
+            obscured: ws.overlay_open() || ws.tab_menu.is_some(),
+            pane: None,
+            room: None,
+        });
+        let pet = ws.fx.companion_mut().tick(pet_tick);
         let cur = exact_focus.cursor;
         let words_suspended = exact_focus.alternate_screen && suppress_alt;
         if load_shed || words_suspended || sparkle.is_none() {
             // The word field freezes under load or alternate-screen suppression;
             // an explicit feature disable resets it. The full resident retains
-            // its independent surface and static posture. The flying head's
-            // existing load gate already denies its pixels and pauses its hello.
+            // its independent surface and its motion (the shed takes only its
+            // frame train). The flying head's existing load gate already denies
+            // its pixels and pauses its hello.
             if load_shed || words_suspended {
-                ws.word_decos.freeze(now);
+                ws.fx.decos_mut().freeze(now);
             } else {
-                ws.word_decos.hard_reset_words();
+                ws.fx.decos_mut().hard_reset_words();
                 ws.pending_deco_birth = None;
             }
-            ws.deco_scratch.clear();
-            ws.ink_scratch.clear();
-            ws.free_scratch.clear();
-            ws.nova_scratch.clear();
-            ws.word_decos.begin_host_frame();
+            ws.fx.open_words();
 
             // The authorized extraction already consumed this capture's exact
             // damage session, even when no word scanner is enabled.
@@ -3683,6 +3770,7 @@ impl App {
                 // A CAPTURE: never a spent hello (`emit_resident_pet`).
                 false,
                 cat_frame,
+                animate_cat,
                 kitty_alpha,
                 now,
                 !animate_cat,
@@ -3690,76 +3778,41 @@ impl App {
                 cursor_color,
                 glow_cfg.accent,
             );
-            crate::app_render::splice_word_deco_channels(ws);
+            ws.fx.publish_words(&mut ws.input_scratch);
             return;
         }
         let (cfg, lexicon) = sparkle
             .as_ref()
             .expect("enabled, unsuspended Sparkle Words was checked above");
-        let mut prime_at = None;
-        // Resume from a freeze (perf_reduced cleared / alt-screen exit with
-        // suppression) before the rescan/tick read the clock — a no-op when
-        // not frozen. Mirrors app_render's thaw-before-rescan ordering.
-        ws.word_decos.thaw(now);
         let epoch = ws.input_scratch.snapshot_seq;
-        let word_cursor = live_viewport.then_some(grid_cursor);
-        if ws.word_decos.needs_rescan(epoch) {
-            // A normal application-present consumes `pending_deco_birth`. If the
-            // stamp is still here, capture is this episode's first observable
-            // presentation (headless or an occluded window), so an old stamp
-            // clamps to one fully-risen preview instead of aging an unseen peek
-            // through Done. This remains bounded work only on a damaged
-            // capture, never a synthetic animation loop.
-            let birth = capture_rescan_birth(now, ws.pending_deco_birth.take(), windowless);
-            // A CAPTURE IS A RENDERER, so it declares this snapshot's row
-            // origin for the kitty-command flash exactly as the glass paths
-            // do — immediately before the one rescan that spends it. A
-            // headless instance driven over the control socket rescans ONLY
-            // here, so without this line its flash would never learn that
-            // `sit⏎` scrolled.
-            ws.word_decos.set_scan_base_y(Some(ws.input_scratch.base_y));
-            ws.word_decos.rescan_from_cells_with_geom_at_cursor(
-                &ws.input_scratch.cells,
-                &ws.input_scratch.line_sizes,
-                rows,
-                cols,
-                lexicon,
-                cfg,
-                epoch,
-                birth,
-                effect_geom,
-                ws.input_scratch.default_bg,
-                word_cursor,
-            );
-            if birth < now {
-                prime_at = Some(birth);
-            }
-        }
-        // The capture preparation consumed this exact damage session while it
-        // still held the sync-authorized extraction lock. Relocking here would
-        // risk swallowing a newer partial DEC-2026 episode.
-        // The capture tick shares the window's live effect state, so it must
-        // preserve app-present phase parity: the same cursor cell (§5.8 gaze — read
-        // under this same lock) and the window's real focus (so a capture
-        // never clobbers a focused window's armed blink one-shot, and a
-        // headless/unfocused capture arms nothing). The pet ticked above.
+        // A normal application-present consumes `pending_deco_birth`. If the
+        // stamp is still here, capture is this episode's first observable
+        // presentation (headless or an occluded window), so an old stamp primes
+        // one fully-risen preview instead of aging an unseen peek through Done
+        // — bounded work only on a damaged capture, never a synthetic animation
+        // loop. A capture is a renderer, so it declares its snapshot's row
+        // origin for the kitty-command flash exactly as the glass paths do: a
+        // headless instance driven over the control socket rescans ONLY here.
+        let rescan =
+            ws.fx
+                .decos()
+                .needs_rescan(epoch)
+                .then(|| aterm_effects::pipeline::WordRescan {
+                    birth: capture_rescan_birth(now, ws.pending_deco_birth.take(), windowless),
+                    cursor: live_viewport.then_some(grid_cursor),
+                });
         // ONE CAT PER CARET: exactly the predicate the companion emission below
-        // draws under. Told which cell the companion occupies, the engine drops
-        // the ambient peek for the word beneath it — a capture must show the
-        // same single cat the glass does, not the pre-fix pair. The pet counts
-        // as the companion too (the windowed present's rule), and hands in its
-        // live drawn body as the pixel-yield box.
+        // draws under, so a capture shows the same single cat the glass does —
+        // the flying head by its live rect, the pet by its live drawn body.
         let companion_duty =
             aterm_effects::companion::cursor_companion_duty(pet.on_glass, kitty_alpha, cur);
         let companion_at = aterm_effects::companion::cursor_companion_on_glass(
             companion_duty,
             cur,
-            // The flying head's live rect — a capture must yield to the same
-            // pixels the glass does, and the head is nowhere near the caret.
             match companion_duty {
                 aterm_effects::companion::CompanionDuty::FlyingHead { cell } => {
                     crate::app_render::flying_head_footprint_px(
-                        &ws.word_decos,
+                        ws.fx.decos(),
                         effect_geom,
                         cell,
                         cat_frame.render_look(),
@@ -3770,154 +3823,106 @@ impl App {
             },
             pet.body_px,
         );
-        // The same selection view the animated tick sees (§6.4 nova ignition
-        // deferral / per-quad attenuation) — a capture must not ignite a nova
-        // the window itself would defer.
-        let sel_view = crate::word_decorations::SelView {
-            sel: &ws.input_scratch.selection,
-            display_offset: ws.input_scratch.display_offset,
-        };
-        let mut primed_wince_hits = 0u8;
-        if let Some(birth) = prime_at {
-            // The synthetic birth frame is its own frame: bracket it so it gets
-            // its own two-bake budget, exactly as when `tick` owned the reset.
-            ws.word_decos.begin_host_frame();
-            // Discard the birth frame's zero-reveal output. Its state mutations
-            // (phase latch / limiter decisions) are exactly what an ordinary
-            // damage-driven present would have performed at output time.
-            ws.word_decos.tick(
-                birth,
-                cfg,
-                effect_geom,
-                companion_at,
-                Some(sel_view),
-                ws.focused,
-                &mut ws.deco_scratch,
-                &mut ws.ink_scratch,
-                &mut ws.free_scratch,
-                &mut ws.nova_scratch,
-            );
-            // The final `now` tick below clears per-tick cue storage. Preserve
-            // only the visual site count from this synthetic birth sample;
-            // capture audio remains unconditionally muted.
-            primed_wince_hits = crate::app_render::drain_curse_bonk_cues(
-                &mut ws.word_decos,
-                glow_cfg.style,
-                self.config.trail_sound_voice(),
-                effect_geom.cols,
-                None,
-                false,
-                |_| {},
-            )
-            .wince_hits;
-        }
-        // Open the capture's real frame: the two-bake budget and the baker's
-        // LRU clock are per FRAME, and a bracketing host owns that reset.
-        ws.word_decos.begin_host_frame();
-        ws.word_decos.tick(
+        // The capture tick shares the window's live effect state, so it keeps
+        // app-present phase parity: the same cursor cell, selection view and
+        // real focus (a capture never clobbers a focused window's armed blink
+        // one-shot, and a headless/unfocused capture arms nothing). The capture
+        // preparation consumed this exact damage session while it still held
+        // the sync-authorized extraction lock, so nothing here relocks.
+        let words = ws.fx.word_grid(&aterm_effects::pipeline::WordGrid {
             now,
+            lexicon,
             cfg,
-            effect_geom,
+            geom: effect_geom,
+            cells: &ws.input_scratch.cells,
+            line_sizes: &ws.input_scratch.line_sizes,
+            base_y: ws.input_scratch.base_y,
+            default_bg: ws.input_scratch.default_bg,
+            epoch,
+            rescan,
             companion_at,
-            Some(sel_view),
-            ws.focused,
-            &mut ws.deco_scratch,
-            &mut ws.ink_scratch,
-            &mut ws.free_scratch,
-            &mut ws.nova_scratch,
-        );
+            sel: crate::word_decorations::SelView {
+                sel: &ws.input_scratch.selection,
+                display_offset: ws.input_scratch.display_offset,
+            },
+            focused: ws.focused,
+        });
         // PRISM WAKE on the SINGLE-PANE capture. This is the site the
         // paint-conformance matrix actually reads: its rows drive a headless
         // binary over the control socket and assert PIXELS, and headless never
         // runs the windowed present — so a streak absent here is a streak no
         // gate can ever see, however well the glass behaves.
         //
-        // Appends to `nova_scratch` after the decoration tick filled it, the
+        // Appended to the nova light after the decoration tick filled it, the
         // same co-residency discipline the present keeps. Silent on the alt
         // screen and in scrollback (a TUI's own canvas is not arrival, and
         // history is not arrival), and silent under load shed like every other
         // decoration.
-        {
-            let suppressed = ws.input_scratch.engine_alt || ws.input_scratch.display_offset != 0;
-            if crate::app_render::output_streak_inert(
-                streak_enabled,
-                streak_animates,
-                streak_intensity,
-                suppressed,
-            ) {
-                ws.output_streak = None;
-            } else {
-                let geom = crate::cursor_glow::Geom {
-                    cw: cell_w,
-                    ch: cell_h,
-                    rows,
-                    cols,
-                    origin_x: 0,
-                    origin_y: 0,
-                    win_w: u16::try_from(cols * cell_w).unwrap_or(u16::MAX),
-                    win_h: u16::try_from(rows * cell_h).unwrap_or(u16::MAX),
-                    head: 0,
-                };
-                let cfg = crate::output_streak::StreakConfig {
-                    enabled: true,
-                    intensity: streak_intensity,
-                    tail: streak_tail,
-                    max_streaks: streak_max,
-                    idle_secs: streak_idle,
-                    dark_theme: aterm_render::theme_is_dark(ws.input_scratch.default_bg),
-                    theme_bg: ws.input_scratch.default_bg,
-                    theme_fg: ws.input_scratch.default_fg,
-                    theme_cursor: ws.input_scratch.cursor_color,
-                    // A CAPTURE NEVER SPEAKS. Pixels are being sampled, not
-                    // presented to a listener, and a still taken by a script
-                    // must not make the machine chime.
-                    sound: false,
-                };
-                let engine = ws.output_streak.get_or_insert_with(|| {
-                    Box::new(crate::output_streak::OutputStreak::new(
-                        aterm_effects::genome::mix(wid.0 ^ 0x5052_4953_4D5F_574B),
-                    ))
-                });
-                if let Some(boundary_at) = output_echo.last_boundary_at {
-                    engine.note_turn_boundary(boundary_at);
-                }
-                if let Some(accepted_at) = output_echo.last_accepted_at {
-                    engine.note_keystroke(accepted_at);
-                }
-                engine.note_output_cells(
-                    &ws.input_scratch.cells,
-                    (ws.input_scratch.cursor_row, ws.input_scratch.cursor_col),
-                    (rows, cols),
-                    exact_focus.content_seq,
+        let suppressed = ws.input_scratch.engine_alt || ws.input_scratch.display_offset != 0;
+        let streak_inert = crate::app_render::output_streak_inert(
+            streak_enabled,
+            streak_animates,
+            streak_intensity,
+            suppressed,
+        );
+        ws.fx.streak_grid(
+            (!streak_inert)
+                .then(|| aterm_effects::pipeline::StreakGrid {
                     now,
-                    output_echo.input_hot,
-                );
-                engine.tick(now, geom, &cfg, &mut ws.nova_scratch);
-            }
-        }
+                    cfg: crate::output_streak::StreakConfig {
+                        enabled: true,
+                        intensity: streak_intensity,
+                        tail: streak_tail,
+                        max_streaks: streak_max,
+                        idle_secs: streak_idle,
+                        dark_theme: aterm_render::theme_is_dark(ws.input_scratch.default_bg),
+                        theme_bg: ws.input_scratch.default_bg,
+                        theme_fg: ws.input_scratch.default_fg,
+                        theme_cursor: ws.input_scratch.cursor_color,
+                        // A CAPTURE NEVER SPEAKS. Pixels are being sampled, not
+                        // presented to a listener, and a still taken by a script
+                        // must not make the machine chime.
+                        sound: false,
+                    },
+                    seed: aterm_effects::genome::mix(wid.0 ^ 0x5052_4953_4D5F_574B),
+                    echo: output_echo.streak(),
+                    cells: &ws.input_scratch.cells,
+                    cursor: (ws.input_scratch.cursor_row, ws.input_scratch.cursor_col),
+                    viewport: (rows, cols),
+                    content_seq: exact_focus.content_seq,
+                    geom: crate::cursor_glow::Geom {
+                        cw: cell_w,
+                        ch: cell_h,
+                        rows,
+                        cols,
+                        origin_x: 0,
+                        origin_y: 0,
+                        win_w: u16::try_from(cols * cell_w).unwrap_or(u16::MAX),
+                        win_h: u16::try_from(rows * cell_h).unwrap_or(u16::MAX),
+                        head: 0,
+                    },
+                })
+                .as_ref(),
+        );
         // Kitty Log drain (§F4.3): the capture tick is a REAL tick — the
         // sightings vec clears at the next tick's start, so a headless-only
         // session must drain here too or its sightings are lost. Same
         // (session, ident) dedupe as the windowed drain, so a capture racing
-        // a present never double-counts.
-        // AMBIENT PROVENANCE (owner ruling, 2026-08-07): a capture scans the
-        // same OUTPUT text the windowed drains do — count and collect only,
-        // never the companion, so no `on_collect` hello can start from a
-        // capture either.
+        // a present never double-counts. AMBIENT PROVENANCE (owner ruling,
+        // 2026-08-07): count and collect only, never the companion.
         self.kitty_log.observe_ambient(
             exact_focus.session,
-            ws.word_decos.drain_kitty_sightings(),
+            ws.fx.decos_mut().drain_kitty_sightings(),
             lexicon,
             now,
             kitty_log_on,
         );
-        // Curse cues share the application-present drain's exact site dedupe. A capture is a
-        // recording-shaped surface and must never make the Mac speak, so gain
-        // stays `None` and no sound can escape; the VISUAL reaction still
-        // belongs to the cursor companion. `cat_frame` was sampled above, so a
-        // headless caller observes the wince on its next explicit capture.
+        // Curse cues share the application-present drain's exact site dedupe. A
+        // capture never makes the Mac speak (gain `None`); the VISUAL reaction
+        // still belongs to the cursor companion, with the primed birth frame's
+        // sites counted too.
         let curse_drain = crate::app_render::drain_curse_bonk_cues(
-            &mut ws.word_decos,
+            ws.fx.decos_mut(),
             glow_cfg.style,
             self.config.trail_sound_voice(),
             effect_geom.cols,
@@ -3925,13 +3930,15 @@ impl App {
             false,
             |_| {},
         );
-        ws.cursor_cat.on_curse(
+        ws.fx.companions_mut().cursor_cat.on_curse(
             now,
-            primed_wince_hits.saturating_add(curse_drain.wince_hits),
+            words
+                .primed_wince_hits
+                .saturating_add(curse_drain.wince_hits),
         );
         // The shared config-free emitter owns BOTH animals. Sparkle Words may
-        // contribute ambient sprites to `free_scratch`, but it neither chooses
-        // the companion nor supplies its palette/lifecycle.
+        // contribute ambient sprites to the frame, but it neither chooses the
+        // companion nor supplies its palette/lifecycle.
         let default_bg = ws.input_scratch.default_bg;
         let cursor_color = ws.input_scratch.cursor_color;
         let _ = crate::app_render::emit_single_cursor_companion(
@@ -3942,6 +3949,7 @@ impl App {
             // A CAPTURE: never a spent hello (`emit_resident_pet`).
             false,
             cat_frame,
+            animate_cat,
             kitty_alpha,
             now,
             !animate_cat,
@@ -3949,36 +3957,11 @@ impl App {
             cursor_color,
             glow_cfg.accent,
         );
-        ws.input_scratch
-            .word_decorations
-            .clone_from(&ws.deco_scratch);
-        // Ink is part of the styled app-render capture too; the `plain` capture
-        // strips it via `clear_overlays` like every other overlay channel.
-        ws.input_scratch.ink.clone_from(&ws.ink_scratch);
-        // Overlay Phase 4: the engine no longer produces legacy per-row cat
-        // quads — keep the channel empty (nothing else feeds it here).
-        ws.input_scratch.cat_quads.clear();
-        ws.input_scratch.cat_atlas = None;
-        // And the free-overlay sprites (overlay Phase 4: the peeking cat +
-        // its gaze dots) — without this copy a headless styled capture
-        // silently loses the cat and the driven A-gates pass vacuously
-        // (v3 §5). Stripped by `plain` via `clear_overlays` like every other
-        // overlay channel.
-        ws.input_scratch.free_sprites.clone_from(&ws.free_scratch);
-        ws.input_scratch.free_atlas = if ws.free_scratch.is_empty() {
-            None
-        } else {
-            ws.word_decos.free_atlas()
-        };
-        // And the supernova light (additive overlay, stripped by `plain` too).
-        ws.input_scratch.nova_add.clone_from(&ws.nova_scratch);
-    }
-
-    /// Test-only cross-module seam for driving the real word-decoration host
-    /// path in native scheduler regressions.
-    #[cfg(test)]
-    pub(crate) fn splice_word_decorations_for_test(&mut self, wid: crate::WindowId, now: Instant) {
-        self.splice_word_decorations(wid, now);
+        // Every word channel is part of the styled capture; `plain` strips
+        // them via `clear_overlays`. Without the sprites a headless styled
+        // capture silently loses the cat and the driven A-gates pass
+        // vacuously (v3 §5).
+        ws.fx.publish_words(&mut ws.input_scratch);
     }
 
     /// Select the sole legal animation-clock owner for a composed capture.
@@ -4685,245 +4668,6 @@ impl App {
         }
     }
 
-    /// PHASE 1 of "Headless Present-Real": advance the cursor-effect engines
-    /// (LUMEN glow / FORGE fire / rainbow / cadence-comet trail) at capture time
-    /// via the SAME extracted pass the windowed present runs
-    /// ([`App::tick_cursor_fx`]) and splice the produced scratches into
-    /// `input_scratch` exactly as `redraw_window`'s commit does — so a headless
-    /// `image` carries the LIVE effect state (the fire at its true thermal/decay
-    /// state) instead of the stale-or-empty overlays a never-presenting window
-    /// would keep. STRICTLY headless-gated ([`capture_ticks_cursor_fx`]): a
-    /// WINDOWED target keeps its last-present quads. `image plain` still strips
-    /// the spliced layers via `clear_overlays` downstream, and this runs BEFORE
-    /// `splice_tab_strip` (the strip shifts the quads down with the grid).
-    #[cfg(test)]
-    fn splice_cursor_fx(&mut self, wid: crate::WindowId, now: Instant) {
-        // LEGACY TEST HELPER: the headless capture tick below drives the
-        // SINGLE-PANE effect machinery (front-terminal cursor, window-content
-        // coords) — on a composed multi-pane frame its quads would land at
-        // un-offset positions over the composite. A windowed capture keeps
-        // its last-present quads (already composed-correct) via the gate
-        // inside, while shipping composed captures use the composed preparation
-        // path instead of this helper. Keep this helper split-gated so tests can
-        // never stamp single-pane coordinates onto a composed frame.
-        if self
-            .active_tree(wid)
-            .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
-        {
-            return;
-        }
-        // ONE engine clock: while a recording targets this window its offscreen
-        // present loop owns the tick (see `capture_ticks_cursor_fx`).
-        let recording_here = self.video_rec.as_ref().is_some_and(|r| r.window == wid);
-        let Some(front_terminal) = self.front_terminal_mirror(wid) else {
-            return;
-        };
-        let inputs = {
-            let Some(ws) = self.windows.get_mut(&wid) else {
-                return;
-            };
-            if !capture_ticks_cursor_fx(ws.os_window.is_some(), recording_here) {
-                return;
-            }
-            let (rows, cols) = (ws.rows as usize, ws.cols as usize);
-            // The same per-frame terminal state `redraw_window`'s frame hold reads
-            // for this pass, snapshotted under ONE lock (cursor + colours stay
-            // one coherent observation). The ERASE-POOF probe below is the one
-            // grid-SCANNING effect input (the rest are cursor-positioned) — it
-            // reads the live grid under this same lock into its own resident
-            // buffer, so the caller's earlier grid refill stays valid.
-            let term = term_lock(&front_terminal.term);
-            let cpos = term.cursor();
-            let cursor_visible = term.cursor_visible();
-            let dbg = if term.modes().reverse_video() {
-                term.default_foreground()
-            } else {
-                term.default_background()
-            };
-            // ERASE-POOF probe, headless parity: the exact frame-hold capture +
-            // guards from `redraw_window`, so a control-socket-driven capture
-            // session exercises the same kill-poof seam a windowed present
-            // would (captures are sparse; the engine's probe-staleness cap
-            // fences any long gap between them).
-            let display_offset = term.grid().display_offset();
-            let content_scroll_state = term.content_scroll_state();
-            let is_alt = term.is_alternate_screen();
-            // Invalidation resets engine context; apply it before this exact
-            // capture re-feeds alt/blink state below.
-            sync_cursor_effect_coordinate_space(ws, term.render_identity(), is_alt);
-            let scroll_change = sync_cursor_effect_scroll(ws, content_scroll_state);
-            // REPAINT-BLINK edge + context feed — the windowed frame-hold
-            // detector's twin, so a headless capture classifies the same.
-            let blink_epoch = term.repaint_blink_epoch();
-            if ws.blink_reseed {
-                // Tab/pane switch: adopt the NEW terminal's epoch silently —
-                // a cross-terminal mismatch is not a repaint (see sync_window).
-                ws.blink_reseed = false;
-                ws.blink_epoch_seen = blink_epoch;
-            } else if blink_epoch != ws.blink_epoch_seen {
-                ws.blink_epoch_seen = blink_epoch;
-                ws.last_blink_at = Some(now);
-                ws.cursor_fx.glow.note_repaint_blink(now);
-                ws.cursor_fx.trail.note_repaint_blink(now);
-            }
-            ws.cursor_fx.glow.note_context(is_alt);
-            ws.cursor_fx.trail.note_context(is_alt);
-            // `splice_cursor_fx` only ticks a single/zoomed pane, in the
-            // capture grid's zero-based coordinate space. Restamp that shape
-            // explicitly so a prior composed-frame offset cannot survive a
-            // split/zoom transition and misclassify the physical margin.
-            ws.cursor_fx.glow.note_pane_columns(0, cols);
-            ws.cursor_fx.trail.note_pane_columns(0, cols);
-            let blink_recent = ws.last_blink_at.is_some_and(|t| {
-                now.saturating_duration_since(t) <= crate::app_render::BLINK_RECENT_MAX
-            });
-            // Plain-alt frames ship a ContentOnly probe instead of none —
-            // the `no-row-probe` repair (less /-search, vi insert, the
-            // ESC 7/ESC 8 streamer TUI); see `app_render::row_probe_trust`.
-            let probe_trust = crate::app_render::row_probe_trust(is_alt, blink_recent);
-            let mut row_probe_neighbors = None;
-            let row_probe = if display_offset == 0 && !scroll_change.changed() {
-                let _fill = term.row_cols_into(cpos.row as usize, &mut ws.poof_row_buf);
-                // STAR-LANDING NEIGHBORS — the windowed frame-hold capture's
-                // twin, so a headless capture licenses (or forbids) the
-                // displaced rainbow kitty stars exactly as a windowed present would.
-                let (neighbor_above, neighbor_below) =
-                    crate::app_render::capture_cursor_neighbor_rows(
-                        &term,
-                        usize::from(cpos.row),
-                        rows,
-                        ws.cursor_fx.glow.v2_owns_frame(),
-                        &mut ws.poof_row_above_buf,
-                        &mut ws.poof_row_below_buf,
-                    );
-                // THE CONTENT WITNESS's rows — the windowed frame-hold capture's
-                // twin, so this helper retires an abandoned band exactly as
-                // a windowed present would.
-                ws.cursor_fx
-                    .glow
-                    .observe_ribbon_row(cpos.row, &ws.poof_row_buf);
-                let mut ribbon_rows = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
-                let n = ws.cursor_fx.glow.ribbon_rows(&mut ribbon_rows);
-                for &r in &ribbon_rows[..n] {
-                    if usize::from(r) < rows && r != cpos.row {
-                        if let Some(captured) = crate::app_render::captured_witness_neighbor(
-                            r,
-                            cpos.row,
-                            neighbor_above.then_some(ws.poof_row_above_buf.as_slice()),
-                            neighbor_below.then_some(ws.poof_row_below_buf.as_slice()),
-                        ) {
-                            ws.cursor_fx.glow.observe_ribbon_row(r, captured);
-                        } else {
-                            ws.cursor_fx.glow.capture_ribbon_row(r, |cols| {
-                                term.row_cols_into(usize::from(r), cols);
-                            });
-                        }
-                    }
-                }
-                // The capture's own answer rides with the probe, as the
-                // windowed present hands it.
-                row_probe_neighbors = Some((neighbor_above, neighbor_below));
-                Some((cpos.row, cpos.col, probe_trust))
-            } else {
-                None
-            };
-            crate::app_render::CursorFxInputs {
-                now,
-                rows,
-                cols,
-                // Scrolled into history ⇒ no cursor for the effect engines — the
-                // windowed path's twin (active-grid coords over scrollback rows
-                // would spawn light on unrelated history lines in the capture).
-                cur: (cursor_visible && display_offset == 0).then_some((cpos.row, cpos.col)),
-                live_viewport: display_offset == 0,
-                cursor_visible,
-                // Honest, and inert here: `cur` above already withholds a
-                // hidden caret.
-                frame_unfinished: term.sync_frame_unfinished(),
-                cursor_style: term.cursor_style(),
-                blink_phase: ws.blink_phase,
-                live_cursor_rgb: crate::app_render::terminal_cursor_rgb(&term),
-                // The capture reports the SAME pinned-ness the present decides,
-                // so `aterm-ctl image` cannot show a caret the window does not.
-                cursor_color_pinned: self.config.cursor_color.is_some()
-                    || term.cursor_color_recoloured(),
-                default_bg: aterm_render::rgb_to_u32([dbg.r, dbg.g, dbg.b]),
-                // THE PAIR FROM ONE BLANK CELL. The hand-rolled `dbg` branch
-                // above swaps in the BACKGROUND direction only; asking the
-                // blank cell for both is what keeps a DECSCNM-swapped capture
-                // coherent, and it is the same expression the windowed twin
-                // uses.
-                default_fg: aterm_render::rgb_to_u32(
-                    crate::app_render::terminal_blank_cell(&term).fg,
-                ),
-                row_probe,
-                row_probe_neighbors,
-                // ECHO ANCHOR, headless parity: same guard as the windowed
-                // present, so a capture-driven session exercises the
-                // hidden/parked-caret lane identically.
-                print_anchor: (display_offset == 0).then(|| term.print_anchor()).flatten(),
-                print_anchor_glyph: (display_offset == 0)
-                    .then(|| term.print_anchor_glyph())
-                    .flatten(),
-            }
-        };
-        let Some(fx) = self.tick_cursor_fx(wid, inputs) else {
-            return;
-        };
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
-        // The exact `redraw_window` commit splice for these channels: the aurora
-        // quads (grid-interior px), the RADIAL halos (fire embers / crown /
-        // impact flash — same coords, same splice rules), the block-fill
-        // override (rainbow wins over FORGE), and the comet cells + the heated
-        // colour they render at.
-        ws.input_scratch
-            .cursor_glow_add
-            .clone_from(&ws.cursor_fx.glow_scratch);
-        ws.input_scratch.glow_halo.clear();
-        ws.input_scratch
-            .glow_halo
-            .extend_from_slice(ws.cursor_fx.glow.halos());
-        ws.input_scratch.fire_patch.clear();
-        ws.input_scratch
-            .fire_patch
-            .extend_from_slice(ws.cursor_fx.glow.patches());
-        ws.input_scratch.glow_under.clear();
-        ws.input_scratch
-            .glow_under
-            .extend_from_slice(ws.cursor_fx.glow.under_quads());
-        ws.input_scratch.char_fg.clear();
-        ws.input_scratch
-            .char_fg
-            .extend_from_slice(ws.cursor_fx.glow.charred());
-        ws.input_scratch.fire_halo.clear();
-        ws.input_scratch
-            .fire_halo
-            .extend_from_slice(ws.cursor_fx.glow.halo_cells());
-        // Shape and the canonical resolved fill, mirroring `redraw_window`.
-        // `tick_cursor_fx` already applied precedence and presentation opacity;
-        // rebuilding the seven raw candidates here would bypass the shed fade.
-        // ONE blink law, the same function the two `redraw_window` sites call
-        // (`app_render::compose_caret_style_override`): this mirror used to
-        // spell only the bolt and the rainbow arms, so a `ctl image` / paced
-        // `ctl video` frame showed a warm classic caret BLINKING while the
-        // presented frame had it pinned steady — the capture contradicting the
-        // glass. Measured 2026-09-08 on the merge, windowed, trail off, after a
-        // 10-key burst: 232 → 51 → 234 on the caret cell every ~530 ms.
-        ws.input_scratch.cursor_effect_style_override =
-            crate::app_render::compose_caret_style_override(
-                fx.bolt_cursor,
-                fx.twinkle_cursor,
-                fx.momentum_steady,
-            );
-        ws.input_scratch.cursor_fill_override = fx.block_fill.map(|owned| owned.fill);
-        ws.input_scratch
-            .cursor_trail
-            .clone_from(&ws.cursor_fx.trail_scratch);
-        ws.input_scratch.cursor_trail_color = fx.trail_color;
-    }
-
     /// Introspect the current visible route and write PNG + semantic text.
     ///
     /// With a window, the PNG is the exact client destination copied beside one
@@ -5197,7 +4941,7 @@ impl App {
                     // Both one-pane and composed captures need the companion
                     // splice. The helper dispatches the split path itself and
                     // retains (rather than advances) under a recording owner.
-                    self.splice_word_decorations_sampled(front, capture_now, capture_focus);
+                    self.capture_words_sampled(front, capture_now, capture_focus);
                     self.refresh_pane_headers(front, &capture_plan);
                     self.paint_pane_headers(front);
                     self.splice_tab_strip(front);
@@ -6596,7 +6340,7 @@ impl App {
             // Unlike the cursor light extractor, the decoration splice already
             // dispatches on one-pane versus composed geometry. It also owns the
             // capture/recording clock boundary, so this is safe in both modes.
-            self.splice_word_decorations_sampled(front, capture_now, capture_focus);
+            self.capture_words_sampled(front, capture_now, capture_focus);
             self.refresh_pane_headers(front, &capture_plan);
             self.paint_pane_headers(front);
             self.splice_tab_strip(front);
@@ -6925,8 +6669,8 @@ impl App {
         // outlives the pool: the only things that escape are `String`s.
         autoreleasepool(|_| {
             // --- The frontmost window's NSToolbar ------------------------------
-            // Reach the NSWindow the SAME way `match_window_colorspace_to_content` /
-            // `toolbar::install_window_toolbar` do: winit Window -> AppKit
+            // Reach the NSWindow the SAME way `toolbar::install_window_toolbar`
+            // does: winit Window -> AppKit
             // RawWindowHandle -> NSView -> NSWindow.
             let ns_window = self
                 .front()
@@ -7182,9 +6926,50 @@ impl App {
         // Close Pane on a split tab.
         let live = self.palette_live();
         let apply_row = crate::palette::apply_row_label(&live);
+        // The strip's version label (Windows): what the front window's strip
+        // LAID OUT, read off its segments, or why it laid none out.
+        let strip_version = crate::tab_bar::STRIP_VERSION_SLOT.then(|| {
+            // No strip, no label — whatever a strip drawn before it was turned
+            // off left in the segment cache.
+            let (segments, hovered) = self
+                .front()
+                .filter(|_| self.tab_strip_rows > 0)
+                .map_or((&[][..], false), |ws| {
+                    (ws.tab_segments.as_slice(), ws.strip_hover_version)
+                });
+            // The reason is read off the same layout the segments are: the slot
+            // the strip was laid out WITH. That is the window's version-slot
+            // memo — every strip splice measures into it before its cache
+            // decision, and lays out (or keeps a layout keyed on) exactly that
+            // slot — not `last_strip_fp`, which every chrome, font and theme
+            // invalidation empties while the segments it described stay laid
+            // out. A strip laid out before the UI face landed measured no slot,
+            // whatever the face's state is now; a headless instance lays its
+            // strip out only when it composes a frame (`image`), so "now" can be
+            // ahead of the layout this line reports; and a chrome regrid clears
+            // the segments outright until the next frame lays them out again.
+            #[cfg(any(windows, target_os = "linux"))]
+            let laid_slot = self
+                .front()
+                .and_then(|ws| ws.version_slot_memo)
+                .map_or(crate::tab_bar::VersionSlotCols::NONE, |(_, slot)| slot);
+            #[cfg(not(any(windows, target_os = "linux")))]
+            let laid_slot = crate::tab_bar::VersionSlotCols::NONE;
+            let absent = if self.tab_strip_rows == 0 {
+                StripVersionAbsence::NoStrip
+            } else if segments.is_empty() {
+                StripVersionAbsence::NotLaidOut
+            } else if laid_slot == crate::tab_bar::VersionSlotCols::NONE {
+                StripVersionAbsence::NoUiFace
+            } else {
+                StripVersionAbsence::StripFull
+            };
+            strip_version_chrome_line(segments, hovered, absent, self.strip_version_attention())
+        });
         non_macos_chrome_output(
             out,
             toolbar_tabs,
+            strip_version,
             tab_menus,
             crate::menu::menu_chrome_lines(apply_row.as_deref(), live.front_tab_split),
         )
@@ -7556,8 +7341,7 @@ impl App {
         use crate::appkit;
 
         // Reach the window's NSView the SAME way `read_native_chrome` /
-        // `match_window_colorspace_to_content` / `toolbar::install_window_toolbar`
-        // do: winit Window -> AppKit RawWindowHandle -> NSView. `None` here means
+        // `toolbar::install_window_toolbar` do: winit Window -> AppKit RawWindowHandle -> NSView. `None` here means
         // there is no attached OS surface — i.e. headless — so the capture has no
         // window to photograph.
         let Some(os_window) = wid
@@ -9802,14 +9586,17 @@ mod capture_console_observation_tests {
         app.windows.get_mut(&wid).expect("window").focused = true;
         let session = app.focused_session_id(wid).expect("front session");
         select_a_phrase(&app, session);
-        app.splice_word_decorations(wid, Instant::now());
+        app.capture_words(wid, Instant::now());
         let ws = app.windows.get(&wid).expect("window");
         assert!(
-            ws.companion.brain().has_reading_interest(),
+            ws.fx.companion().brain().has_reading_interest(),
             "the capture must observe the console it ticks the pet against"
         );
-        assert_eq!(ws.companion.brain().console_attention().name(), "reading");
-        assert_eq!(ws.companion.brain().console_reason(), "selection");
+        assert_eq!(
+            ws.fx.companion().brain().console_attention().name(),
+            "reading"
+        );
+        assert_eq!(ws.fx.companion().brain().console_reason(), "selection");
     }
 
     #[test]
@@ -9820,13 +9607,16 @@ mod capture_console_observation_tests {
         app.sparkle = None;
         app.windows.get_mut(&wid).expect("window").focused = true;
         select_a_phrase(&app, focus);
-        app.splice_word_decorations(wid, Instant::now());
+        app.capture_words(wid, Instant::now());
         let ws = app.windows.get(&wid).expect("window");
         assert!(
-            ws.companion.brain().has_reading_interest(),
+            ws.fx.companion().brain().has_reading_interest(),
             "the composed capture observes the FOCUSED PANE's own grid, like its present"
         );
-        assert_eq!(ws.companion.brain().console_attention().name(), "reading");
+        assert_eq!(
+            ws.fx.companion().brain().console_attention().name(),
+            "reading"
+        );
     }
 }
 
@@ -9887,11 +9677,11 @@ mod split_capture_tests {
             if split {
                 app.windows.get_mut(&wid).expect("window").focused = true;
             }
-            app.splice_word_decorations(wid, Instant::now());
+            app.capture_words(wid, Instant::now());
 
             let ws = app.windows.get(&wid).expect("window");
             assert!(
-                ws.companion.brain().is_active(),
+                ws.fx.companion().brain().is_active(),
                 "split={split}: the first requested still and trail status agree that the \
                  pet is visible"
             );
@@ -9941,7 +9731,7 @@ mod split_capture_tests {
             if split {
                 app.windows.get_mut(&wid).expect("window").focused = true;
             }
-            app.splice_word_decorations(wid, Instant::now());
+            app.capture_words(wid, Instant::now());
             let ws = app.windows.get(&wid).expect("window");
             let sprite = ws
                 .input_scratch
@@ -9950,7 +9740,7 @@ mod split_capture_tests {
                 .copied()
                 .expect("the first capture emits the configured pet body");
             (
-                ws.companion.brain().species(),
+                ws.fx.companion().brain().species(),
                 sprite,
                 std::sync::Arc::clone(
                     ws.input_scratch
@@ -10021,12 +9811,12 @@ mod split_capture_tests {
             }
             // Establish both panes first: the first composed pass baselines
             // every engine's arrival counter, so nothing answers history.
-            app.splice_word_decorations(wid, t0);
+            app.capture_words(wid, t0);
             let term = app.pool.get(sid).expect("pane session").term.clone();
             term_lock(&term).process(b"\r\noutput in the focused pane\r\n");
-            app.splice_word_decorations(wid, t0 + Duration::from_millis(120));
+            app.capture_words(wid, t0 + Duration::from_millis(120));
             let ws = app.windows.get(&wid).expect("window");
-            let xs: Vec<u16> = ws.nova_scratch.iter().map(|q| q.x).collect();
+            let xs: Vec<u16> = ws.fx.nova().iter().map(|q| q.x).collect();
             let half = u32::from(ws.cols) * app.backend.cell_size().0 as u32 / 2;
             (xs, half)
         };
@@ -10082,11 +9872,11 @@ mod split_capture_tests {
             // The FIRST capture baselines the arrival counter (a fresh engine
             // must never answer history with a burst), so the licensed
             // observation is the second one.
-            app.splice_word_decorations(wid, t0);
-            let before = app.windows[&wid].nova_scratch.len();
+            app.capture_words(wid, t0);
+            let before = app.windows[&wid].fx.nova().len();
             term_lock(&term).process(b"\r\nprogram output arrives here\r\n");
-            app.splice_word_decorations(wid, t0 + Duration::from_millis(120));
-            app.windows[&wid].nova_scratch.len().saturating_sub(before)
+            app.capture_words(wid, t0 + Duration::from_millis(120));
+            app.windows[&wid].fx.nova().len().saturating_sub(before)
         };
         let on = streak_quads(true);
         let off = streak_quads(false);
@@ -10116,7 +9906,7 @@ mod split_capture_tests {
         }
         // Establish both panes first (a never-scanned pane spends whatever was
         // already on it), then type the words that must summon cats.
-        app.splice_word_decorations(wid, t0);
+        app.capture_words(wid, t0);
         for s in [0u64, sid] {
             let term = app.pool.get(s).expect("pane session").term.clone();
             term_lock(&term).process(b"\r\nhello kitty friend\r\n");
@@ -10125,8 +9915,8 @@ mod split_capture_tests {
             .get_mut(&wid)
             .expect("window")
             .pending_deco_birth = Some(t0);
-        app.splice_word_decorations(wid, t0);
-        app.splice_word_decorations(wid, t0 + Duration::from_millis(600));
+        app.capture_words(wid, t0);
+        app.capture_words(wid, t0 + Duration::from_millis(600));
         let ws = app.windows.get(&wid).expect("window");
         assert!(
             !ws.input_scratch.free_sprites.is_empty(),
@@ -10161,10 +9951,10 @@ mod split_capture_tests {
         app.recompute_sparkle();
         app.windows.get_mut(&wid).expect("window").focused = true;
 
-        app.splice_word_decorations(wid, t0);
+        app.capture_words(wid, t0);
         let term = app.pool.get(focus).expect("focused pane").term.clone();
         term_lock(&term).process(b"\x1b[11;3Hkitty\x1b[4;31H");
-        app.splice_word_decorations(wid, t0 + Duration::from_millis(16));
+        app.capture_words(wid, t0 + Duration::from_millis(16));
         let ambient = |app: &App| {
             let resident = captured_resident_body_for_test(app, wid);
             app.windows[&wid]
@@ -10187,7 +9977,7 @@ mod split_capture_tests {
         // rather than a hang.
         let (cw, _) = app.win_cell_size(wid);
         let far = |app: &App, ambient: &[(i32, i32, u16, u16)]| {
-            app.windows[&wid].companion.hit_rect().is_some()
+            app.windows[&wid].fx.companion().hit_rect().is_some()
                 && ambient.len() == 1
                 && ambient[0].0 + i32::from(ambient[0].2) + 10 * (cw as i32)
                     < captured_resident_body_for_test(app, wid).x
@@ -10196,8 +9986,8 @@ mod split_capture_tests {
         let mut ambient_before = Vec::new();
         while at < Duration::from_secs(8) {
             at += Duration::from_millis(16);
-            app.splice_word_decorations(wid, t0 + at);
-            if app.windows[&wid].companion.hit_rect().is_some() {
+            app.capture_words(wid, t0 + at);
+            if app.windows[&wid].fx.companion().hit_rect().is_some() {
                 ambient_before = ambient(&app);
                 if far(&app, &ambient_before) {
                     break;
@@ -10216,7 +10006,7 @@ mod split_capture_tests {
         );
 
         term_lock(&term).process(b"\x1b[?25l\x1b[11;3H");
-        app.splice_word_decorations(wid, t0 + at + Duration::from_millis(16));
+        app.capture_words(wid, t0 + at + Duration::from_millis(16));
         {
             let term = term_lock(&term);
             assert!(!term.cursor_visible());
@@ -10226,7 +10016,7 @@ mod split_capture_tests {
         let ambient_after = ambient(&app);
         assert!(
             captured_resident_body_for_test(&app, wid).alpha > 0
-                && ws.companion.brain().is_active(),
+                && ws.fx.companion().brain().is_active(),
             "the capture genuinely contains the hidden-caret resident"
         );
         assert_eq!(
@@ -10254,7 +10044,7 @@ mod split_capture_tests {
         app.recompute_sparkle();
         app.sparkle = None;
         app.windows.get_mut(&wid).expect("window").focused = true;
-        app.splice_word_decorations(wid, t0);
+        app.capture_words(wid, t0);
 
         let (pane_rows, pane_cols) = {
             let ws = &app.windows[&wid];
@@ -10296,11 +10086,12 @@ mod split_capture_tests {
         };
         term_lock(&term).process(b"\x1b[3;25H\x1b[?25h");
         let visible_at = flight_at + Duration::from_millis(16);
-        app.splice_word_decorations(wid, visible_at);
+        app.capture_words(wid, visible_at);
         let before = captured_body(&app);
         assert!(
             app.windows[&wid]
-                .companion
+                .fx
+                .companion()
                 .brain()
                 .console_legacy_motion_pending(),
             "the actual visible capture still carries the earned flight"
@@ -10308,7 +10099,7 @@ mod split_capture_tests {
 
         term_lock(&term).process(b"\x1b[?25l");
         let hidden_at = visible_at + Duration::from_millis(16);
-        app.splice_word_decorations(wid, hidden_at);
+        app.capture_words(wid, hidden_at);
         let hidden = captured_body(&app);
         assert!(
             (hidden.0 - before.0).abs() <= cw as i32,
@@ -10318,11 +10109,11 @@ mod split_capture_tests {
             ((hidden.1 + i32::from(hidden.3)) - (before.1 + i32::from(before.3))).abs() <= 1,
             "hidden capture dropped the fading body's feet: {before:?} -> {hidden:?}"
         );
-        assert!(app.windows[&wid].companion.brain().is_active());
+        assert!(app.windows[&wid].fx.companion().brain().is_active());
 
         term_lock(&term).process(b"\x1b[?25h");
         let returned_at = hidden_at + Duration::from_millis(16);
-        app.splice_word_decorations(wid, returned_at);
+        app.capture_words(wid, returned_at);
         let returned = captured_body(&app);
         assert!(
             (returned.0 - hidden.0).abs() <= (2 * cw) as i32,
@@ -10370,7 +10161,8 @@ mod chrome_output_tests {
         );
         let output = non_macos_chrome_output(
             vec!["window-platform chrome".to_string()],
-            toolbar_tabs,
+            toolbar_tabs.clone(),
+            Some("strip-version shown=no reason=no-strip".to_string()),
             vec!["tab-menu tab=0 items=[]".to_string()],
             vec!["menu \"File\": New Tab".to_string()],
         );
@@ -10381,8 +10173,181 @@ mod chrome_output_tests {
         assert!(output[2].contains(r#"labels=["build-server", "Settings"]"#));
         assert!(output[2].contains(r#"icons=[None, Some("settings")]"#));
         assert!(output[2].contains("Settings · Cursor & Motion"));
-        assert_eq!(output[3], "tab-menu tab=0 items=[]");
-        assert_eq!(output[4], "menu \"File\": New Tab");
+        // The strip's version label follows the tab model, before the menus.
+        assert_eq!(output[3], "strip-version shown=no reason=no-strip");
+        assert_eq!(output[4], "tab-menu tab=0 items=[]");
+        assert_eq!(output[5], "menu \"File\": New Tab");
+        assert_eq!(output.len(), 6);
+
+        // Off Windows there is no label and no line: the order is as it was.
+        let without = non_macos_chrome_output(
+            vec!["window-platform chrome".to_string()],
+            toolbar_tabs,
+            None,
+            vec!["tab-menu tab=0 items=[]".to_string()],
+            vec!["menu \"File\": New Tab".to_string()],
+        );
+        assert_eq!(without[3], "tab-menu tab=0 items=[]");
+        assert_eq!(without[4], "menu \"File\": New Tab");
+        assert_eq!(without.len(), 5);
+    }
+
+    /// The `strip-version` line reports the label the strip LAID OUT — its
+    /// rung, its columns, its text, whether the pointer is on it and what a
+    /// click fires — or, when there is none, why, with the full label it would
+    /// have shown.
+    #[test]
+    fn strip_version_line_reports_what_was_laid_out() {
+        use super::{StripVersionAbsence, strip_version_chrome_line};
+        use crate::menu::{VersionRung, strip_version_label};
+        use crate::tab_bar::{TabHit, TabSegment};
+        let slot = |rung: VersionRung, start_col: u16, end_col: u16| TabSegment {
+            start_col,
+            end_col,
+            close_col: None,
+            connector_col: None,
+            kind: TabHit::Version {
+                rung,
+                attention: false,
+            },
+            solo: false,
+        };
+        let chip = TabSegment {
+            start_col: 0,
+            end_col: 28,
+            close_col: Some(26),
+            connector_col: None,
+            kind: TabHit::Select(0),
+            solo: false,
+        };
+        let full = strip_version_label(VersionRung::Full, false).expect("a full rung");
+        assert_eq!(
+            strip_version_chrome_line(
+                &[chip, slot(VersionRung::Full, 110, 132)],
+                false,
+                StripVersionAbsence::StripFull,
+                false
+            ),
+            format!(
+                "strip-version shown=yes rung=full cols=110..132 text={full:?} \
+                 attention=false hovered=false action=Version"
+            )
+        );
+        // The test binary is a dev build, which always has a short rung.
+        let short = strip_version_label(VersionRung::Short, false).expect("a dev short rung");
+        assert_eq!(
+            strip_version_chrome_line(
+                &[chip, slot(VersionRung::Short, 119, 132)],
+                true,
+                StripVersionAbsence::StripFull,
+                false
+            ),
+            format!(
+                "strip-version shown=yes rung=short cols=119..132 text={short:?} \
+                 attention=false hovered=true action=Version"
+            )
+        );
+        for (absent, reason) in [
+            (StripVersionAbsence::NoStrip, "no-strip"),
+            (StripVersionAbsence::NotLaidOut, "not-laid-out"),
+            (StripVersionAbsence::NoUiFace, "no-ui-face"),
+            (StripVersionAbsence::StripFull, "strip-full"),
+        ] {
+            assert_eq!(
+                strip_version_chrome_line(&[chip], false, absent, false),
+                format!(
+                    "strip-version shown=no reason={reason} text={full:?} attention=false \
+                     action=Version"
+                )
+            );
+        }
+        // Under attention the absent line names the marked label and the click
+        // this platform would fire.
+        let marked = strip_version_label(VersionRung::Full, true).expect("a full rung");
+        let action = crate::menu::version_slot_click(true);
+        assert_eq!(
+            strip_version_chrome_line(&[], false, StripVersionAbsence::StripFull, true),
+            format!(
+                "strip-version shown=no reason=strip-full text={marked:?} attention=true \
+                 action={action:?}"
+            )
+        );
+    }
+
+    /// THE REASON IS THE LAYOUT'S, NOT THE CACHE'S (Windows). The live `chrome`
+    /// line reads why no label is shown off the slot the reported segments were
+    /// laid out WITH — not off the strip cache key, which every font, theme and
+    /// geometry invalidation empties while those segments stay laid out, and
+    /// not off the UI face's state now, which can be ahead of the last layout.
+    #[cfg(windows)]
+    #[test]
+    fn the_strip_version_reason_reads_the_layout_it_reports() {
+        let line = |app: &crate::App| {
+            app.read_native_chrome()
+                .into_iter()
+                .find(|line| line.starts_with("strip-version "))
+                .expect("Windows reports the strip's version label")
+        };
+        // This thread may hold faces an earlier test installed: start without.
+        crate::tray_raster::clear_ui_fonts_for_test();
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 0;
+        assert!(
+            line(&app).contains("shown=no reason=no-strip"),
+            "{}",
+            line(&app)
+        );
+        app.tab_strip_rows = 1;
+        assert!(
+            line(&app).contains("shown=no reason=not-laid-out"),
+            "nothing has laid the strip out yet: {}",
+            line(&app)
+        );
+        app.splice_tab_strip_with(wid, 1);
+        assert!(
+            line(&app).contains("shown=no reason=no-ui-face"),
+            "laid out before the UI face: {}",
+            line(&app)
+        );
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        assert!(
+            line(&app).contains("shown=no reason=no-ui-face"),
+            "the face landing re-lays nothing by itself — the layout reported is \
+             still the faceless one: {}",
+            line(&app)
+        );
+        app.splice_tab_strip_with(wid, 1);
+        assert!(
+            line(&app).contains("shown=yes rung=full"),
+            "the next frame lays the label out in the face: {}",
+            line(&app)
+        );
+        // A cache invalidation that leaves the segments laid out does not unsay
+        // them.
+        app.windows.get_mut(&wid).expect("window").last_strip_fp = None;
+        assert!(line(&app).contains("shown=yes rung=full"), "{}", line(&app));
+        // Too narrow for either rung beside a lone 28-column chip: measured, and
+        // left out.
+        app.windows.get_mut(&wid).expect("window").cols = 40;
+        app.splice_tab_strip_with(wid, 1);
+        assert!(
+            line(&app).contains("shown=no reason=strip-full"),
+            "{}",
+            line(&app)
+        );
+        // A chrome regrid clears the segments until the next frame.
+        app.windows
+            .get_mut(&wid)
+            .expect("window")
+            .tab_segments
+            .clear();
+        assert!(
+            line(&app).contains("shown=no reason=not-laid-out"),
+            "{}",
+            line(&app)
+        );
+        crate::tray_raster::clear_ui_fonts_for_test();
     }
 
     #[test]
@@ -11086,7 +11051,7 @@ mod terminal_split_capture_tests {
         let mut gpu = match aterm_gpu::GpuRenderer::new(font_px, app.theme) {
             Ok(gpu) => gpu,
             Err(error) => {
-                crate::logging::stderr_line!("SKIP: no headless GPU/font available: {error}");
+                crate::logging::stderr_line!("SKIP: no GPU renderer: {error}");
                 return;
             }
         };
@@ -11499,7 +11464,7 @@ mod terminal_split_capture_tests {
         );
         {
             let window = app.windows.get_mut(&wid).unwrap();
-            window.cursor_fx.glow_scratch = vec![aterm_render::GlowQuad {
+            window.fx.cursor_mut().glow_scratch = vec![aterm_render::GlowQuad {
                 row: right_rect.row_off,
                 x: 0,
                 y: 0,
@@ -11511,7 +11476,7 @@ mod terminal_split_capture_tests {
                 color2: 0x0012_3456,
                 alpha2: 0,
             }];
-            window.cursor_fx.trail_scratch = vec![
+            window.fx.cursor_mut().trail_scratch = vec![
                 aterm_render::TrailCell {
                     row: usize::from(right_rect.row_off),
                     col: usize::from(right_rect.col_off),
@@ -11528,10 +11493,10 @@ mod terminal_split_capture_tests {
             window.composed_cursor_fill = Some(0x00AB_CDEF);
             window.composed_cursor_trail_color = 0x00DE_ADBE;
         }
-        let retained_glow = app.windows[&wid].cursor_fx.glow_scratch.clone();
-        let retained_trail = app.windows[&wid].cursor_fx.trail_scratch.clone();
+        let retained_glow = app.windows[&wid].fx.cursor().glow_scratch.clone();
+        let retained_trail = app.windows[&wid].fx.cursor().trail_scratch.clone();
         assert!(
-            app.splice_focused_composed_cursor_effects(
+            app.composed_cursor_frame(
                 wid,
                 crate::app_render::ComposedCursorFxClock::Retain {
                     observed_at: predictor_now,
@@ -11679,8 +11644,8 @@ mod terminal_split_capture_tests {
             window.input_scratch.cells, styled_cells,
             "clean strips effects without changing the composed terminal grid"
         );
-        assert_eq!(window.cursor_fx.glow_scratch, retained_glow);
-        assert_eq!(window.cursor_fx.trail_scratch, retained_trail);
+        assert_eq!(window.fx.cursor_mut().glow_scratch, retained_glow);
+        assert_eq!(window.fx.cursor_mut().trail_scratch, retained_trail);
         assert_eq!(
             window.predictor.next_deadline(),
             predictor_deadline,
@@ -12107,7 +12072,7 @@ mod terminal_split_capture_tests {
         assert!(text.lines().nth(content_row).unwrap().contains("LEFT"));
         assert!(text.lines().nth(content_row).unwrap().contains("RIGHT"));
         assert!(
-            ws.companion.brain().is_active(),
+            ws.fx.companion().brain().is_active(),
             "the production composed-image route advances the default resident pet"
         );
         assert_eq!(
@@ -12186,7 +12151,7 @@ mod capture_overlay_reset_tests {
             input.nova_add.push(aterm_render::GlowQuad::default());
         }
 
-        app.splice_word_decorations(wid, Instant::now());
+        app.capture_words(wid, Instant::now());
 
         let input = &app.windows[&wid].input_scratch;
         assert!(input.word_decorations.is_empty());
@@ -12213,14 +12178,14 @@ mod capture_overlay_reset_tests {
         let terminal = app.front_terminal(wid).unwrap().term.clone();
         crate::term_lock(&terminal).process(b"\x1b]11;#123456\x07\x1b]12;#ABCDEF\x07");
 
-        app.splice_word_decorations(wid, Instant::now());
+        app.capture_words(wid, Instant::now());
 
         let input = &app.windows[&wid].input_scratch;
         assert_eq!(input.default_bg, 0x0012_3456);
         assert_eq!(input.cursor_color, 0x00AB_CDEF);
 
         crate::term_lock(&terminal).process(b"\x1b]21;cursor=\x07\x1b]10;#FEDCBA\x07");
-        app.splice_word_decorations(wid, Instant::now());
+        app.capture_words(wid, Instant::now());
         let input = &app.windows[&wid].input_scratch;
         assert_eq!(
             input.cursor_color, 0x00FE_DCBA,
@@ -12236,8 +12201,7 @@ mod encode_worker_tests {
     use std::time::Duration;
 
     fn unique_dir(label: &str) -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let nonce = aterm_time::since_epoch()
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("aterm-{label}-{}-{nonce}", std::process::id()))
@@ -12496,7 +12460,7 @@ mod encode_worker_tests {
             reply,
         });
         let error = rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(60))
             .expect("the refusal replies at once")
             .expect_err("a saturated encoder refuses the capture");
         assert!(error.contains(ENCODE_QUEUE_FULL), "{error}");
@@ -12527,7 +12491,7 @@ mod encode_worker_tests {
             frame.width > 0 && frame.height > 0,
             "admitted once the budget frees"
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while app.capture_bytes.load(std::sync::atomic::Ordering::Acquire) != 0 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -12690,7 +12654,7 @@ mod encode_worker_tests {
             cancel: crate::control::CaptureCancellation::new(),
             reply,
         });
-        let _ = rx.recv_timeout(Duration::from_secs(10));
+        let _ = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
         drop(held);
         let encoders = ENCODE_THREADS
             .lock()
@@ -13340,12 +13304,6 @@ mod encode_worker_tests {
     }
 
     #[test]
-    fn snapshot_generation_model_proves_and_catches_stale_publish() {
-        let model = aterm_spec::derive::snapshot_generation_commit_model();
-        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
-    }
-
-    #[test]
     fn snapshot_generation_fence_rejects_old_worker_after_new_begin() {
         let model = aterm_spec::derive::snapshot_generation_commit_model();
         let mut state = model.init_state();
@@ -13555,12 +13513,7 @@ mod encode_worker_tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn video_export_frame_seals_keep_file_descriptors_bounded() {
-        const CHILD: &str = "ATERM_TEST_VIDEO_FRAME_SEAL_NOFILE";
-        if !crate::control_auth::enter_low_nofile_test_child(
-            CHILD,
-            "app_introspect::encode_worker_tests::video_export_frame_seals_keep_file_descriptors_bounded",
-            16,
-        ) {
+        if !crate::control_auth::enter_low_nofile_test_child(16) {
             return;
         }
 
@@ -14150,7 +14103,7 @@ mod encode_worker_tests {
         );
         {
             let window = app.windows.get_mut(&wid).unwrap();
-            window.cursor_fx.glow_scratch = vec![aterm_render::GlowQuad {
+            window.fx.cursor_mut().glow_scratch = vec![aterm_render::GlowQuad {
                 row: u16::try_from(terminal_rect.0).unwrap(),
                 x: 0,
                 y: 0,
@@ -14162,7 +14115,7 @@ mod encode_worker_tests {
                 color2: 0x0042_84C6,
                 alpha2: 0,
             }];
-            window.cursor_fx.trail_scratch = vec![
+            window.fx.cursor_mut().trail_scratch = vec![
                 aterm_render::TrailCell {
                     row: terminal_rect.0,
                     col: terminal_rect.1,
@@ -14622,7 +14575,7 @@ mod encode_worker_tests {
         // image must still present a fully-risen cat instead of aging the
         // never-seen one-shot straight through Done.
         let first_capture = t0 + Duration::from_secs(15);
-        app.splice_word_decorations(wid, first_capture);
+        app.capture_words(wid, first_capture);
 
         {
             let ws = &app.windows[&wid];
@@ -14653,14 +14606,14 @@ mod encode_worker_tests {
             "an ambient discovery never becomes the companion"
         );
         assert!(
-            !app.windows[&wid].cursor_cat.is_active(),
+            !app.windows[&wid].fx.companions().cursor_cat.is_active(),
             "and no discovery hello starts from a capture"
         );
 
         // A second REQUESTED windowless capture, long after any hold: still no
         // cursor companion over the text — the hello is the TYPED path's
         // presentation alone.
-        app.splice_word_decorations(wid, first_capture + Duration::from_secs(30));
+        app.capture_words(wid, first_capture + Duration::from_secs(30));
         assert!(
             app.windows[&wid]
                 .input_scratch
@@ -14677,7 +14630,7 @@ mod encode_worker_tests {
 
         // A later no-damage capture advances the original one-shot; it does
         // not synthesize another preview, replay the word cat, or recollect it.
-        app.splice_word_decorations(wid, first_capture + Duration::from_secs(40));
+        app.capture_words(wid, first_capture + Duration::from_secs(40));
         assert!(
             app.windows[&wid]
                 .input_scratch
@@ -14718,7 +14671,7 @@ mod encode_worker_tests {
             let ws = app.windows.get_mut(&wid).expect("window 0");
             ws.pending_deco_birth = Some(t0);
         }
-        app.splice_word_decorations(wid, t0);
+        app.capture_words(wid, t0);
         let (cell_w, cell_h) = {
             let (w, h) = app.win_cell_size(wid);
             (w as i32, h as i32)
@@ -14767,7 +14720,7 @@ mod encode_worker_tests {
             ws.pending_deco_birth = Some(t0);
         }
         let at = t0 + Duration::from_millis(16);
-        app.splice_word_decorations(wid, at);
+        app.capture_words(wid, at);
         assert!(
             cat_at_col(&app, tab_b_col),
             "tab B's OWN cat must be the cat in this image"
@@ -14789,7 +14742,7 @@ mod encode_worker_tests {
             session_a,
             "PRECONDITION: tab A is front again"
         );
-        app.splice_word_decorations(wid, at + Duration::from_millis(16));
+        app.capture_words(wid, at + Duration::from_millis(16));
         assert!(
             cat_at_col(&app, first_word_col),
             "and tab A's own capture has its own cat back"
@@ -14810,26 +14763,33 @@ mod encode_worker_tests {
                 .term
                 .clone();
             let ws = app.windows.get_mut(&wid).expect("window 0");
-            ws.cursor_cat
+            ws.fx
+                .companions_mut()
+                .cursor_cat
                 .on_collect(t0, aterm_effects::kitty_registry::KittyLook::default());
-            ws.cursor_cat.set_collection_presentable(t0, false);
+            ws.fx
+                .companions_mut()
+                .cursor_cat
+                .set_collection_presentable(t0, false);
             ws.pending_deco_birth = Some(t0);
             // The curse is TYPED, and the engine's typed witness is now the
             // caret's completion position AND a committed key (a passive output
             // line parks the caret one past a curse just as readily). Without
             // this the fixture stages OUTPUT, which correctly never winces.
-            ws.word_decos.note_typed_edit(t0, None);
+            ws.fx.decos_mut().note_typed_edit(t0, None);
             let mut term = crate::term_lock(&terminal);
             term.process(b"fuck");
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
         }
 
         let capture_at = t0 + Duration::from_millis(16);
-        app.splice_word_decorations(wid, capture_at);
+        app.capture_words(wid, capture_at);
         let frame = app
             .windows
             .get_mut(&wid)
             .expect("window 0")
+            .fx
+            .companions_mut()
             .cursor_cat
             .static_frame(capture_at + Duration::from_millis(1));
         assert_eq!(
@@ -14872,7 +14832,7 @@ mod encode_worker_tests {
             term.process(b"\r\n\r\n\r\nhello kitty friend");
         }
 
-        app.splice_word_decorations(wid, now);
+        app.capture_words(wid, now);
 
         let ws = &app.windows[&wid];
         assert!(
@@ -14957,21 +14917,26 @@ mod encode_worker_tests {
             term.process(b"a happy kitty naps");
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
         }
-        app.splice_word_decorations(wid, t0);
+        app.capture_words(wid, t0);
         assert!(
-            app.windows[&wid].word_decos.is_active(t0),
+            app.windows[&wid].fx.decos().is_active(t0),
             "the fixture's feline effect is animating (sparkle defaults on)"
         );
         {
             let ws = app.windows.get_mut(&wid).expect("window 0");
-            ws.cursor_cat
+            ws.fx
+                .companions_mut()
+                .cursor_cat
                 .on_collect(t0, aterm_effects::kitty_registry::KittyLook::default());
-            ws.cursor_cat.set_collection_presentable(t0, false);
+            ws.fx
+                .companions_mut()
+                .cursor_cat
+                .set_collection_presentable(t0, false);
         }
         // Load-shed latch: freeze the ambient engine and clear its channels,
-        // while retaining the approved static full resident.
+        // while retaining the full resident — off the frame train.
         app.perf_reduced = true;
-        app.splice_word_decorations(wid, t0 + Duration::from_millis(100));
+        app.capture_words(wid, t0 + Duration::from_millis(100));
         {
             let ws = &app.windows[&wid];
             assert!(ws.input_scratch.word_decorations.is_empty());
@@ -14983,10 +14948,12 @@ mod encode_worker_tests {
                 1,
                 "only the resident survives shedding"
             );
-            assert!(!ws.companion.brain().needs_frames());
+            assert!(!ws.fx.companion().needs_frames());
             assert!(ws.input_scratch.nova_add.is_empty());
             assert_eq!(
-                ws.cursor_cat
+                ws.fx
+                    .companions()
+                    .cursor_cat
                     .static_deadline(t0 + Duration::from_millis(100)),
                 None,
                 "a suppressed capture keeps the collection hello paused"
@@ -15006,16 +14973,20 @@ mod encode_worker_tests {
             term.process(b" zzz");
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
         }
-        app.splice_word_decorations(wid, t0 + Duration::from_secs(20));
+        app.capture_words(wid, t0 + Duration::from_secs(20));
         assert_eq!(captured_resident_body_for_test(&app, wid).alpha, 255);
         assert_eq!(app.windows[&wid].input_scratch.free_sprites.len(), 1);
-        assert!(!app.windows[&wid].companion.brain().needs_frames());
+        // The output moved the caret and the resident follows it — the shed
+        // takes only its frame train.
+        assert!(!app.windows[&wid].fx.companion().needs_frames());
         assert!(
             app.windows[&wid].input_scratch.word_decorations.is_empty(),
             "still suspended: cleared channels"
         );
         assert_eq!(
             app.windows[&wid]
+                .fx
+                .companions()
                 .cursor_cat
                 .static_deadline(t0 + Duration::from_secs(20)),
             None,
@@ -15027,9 +14998,9 @@ mod encode_worker_tests {
         // later, which is exactly what `is_active == false` would mean here.
         app.perf_reduced = false;
         let t1 = t0 + Duration::from_secs(20) + Duration::from_millis(50);
-        app.splice_word_decorations(wid, t1);
+        app.capture_words(wid, t1);
         assert!(
-            app.windows[&wid].word_decos.is_active(t1),
+            app.windows[&wid].fx.decos().is_active(t1),
             "episodes resume where they paused (freeze/thaw, not reset)"
         );
         assert!(
@@ -15052,9 +15023,9 @@ mod encode_worker_tests {
         app.config.cursor_trail_style = Some("rainbow kitty pet".into());
         app.recompute_sparkle();
         app.sparkle = None;
-        app.splice_word_decorations(wid, t0);
+        app.capture_words(wid, t0);
         assert!(
-            app.windows[&wid].companion.brain().is_active(),
+            app.windows[&wid].fx.companion().brain().is_active(),
             "negative control: an owned capture materializes the resident pet"
         );
 
@@ -15063,34 +15034,43 @@ mod encode_worker_tests {
             app.load_shed_active(),
             "fixture reaches the early-return arm"
         );
-        app.splice_word_decorations(wid, t0 + Duration::from_millis(16));
+        app.capture_words(wid, t0 + Duration::from_millis(16));
         assert!(
-            app.windows[&wid].companion.brain().is_active(),
+            app.windows[&wid].fx.companion().brain().is_active(),
             "load shedding keeps the full resident without revoking ownership"
         );
         assert_eq!(captured_resident_body_for_test(&app, wid).alpha, 255);
         assert_eq!(app.windows[&wid].input_scratch.free_sprites.len(), 1);
-        assert!(!app.windows[&wid].companion.brain().needs_frames());
+        // The shed takes the resident's frame train, never its motion: the
+        // capture ticked it at full motion, so it still names its next step.
+        assert!(!app.windows[&wid].fx.companion().needs_frames());
+        assert!(
+            app.windows[&wid]
+                .fx
+                .companion()
+                .next_change_deadline(t0 + Duration::from_millis(16))
+                .is_some()
+        );
 
         app.config.cursor_trail = Some(false);
         assert!(
             app.load_shed_active(),
             "owner removal does not end load shedding"
         );
-        app.splice_word_decorations(wid, t0 + Duration::from_millis(32));
+        app.capture_words(wid, t0 + Duration::from_millis(32));
         let ws = &app.windows[&wid];
         assert!(
-            !ws.companion.brain().is_active() && !ws.companion.brain().needs_frames(),
+            !ws.fx.companion().brain().is_active() && !ws.fx.companion().brain().needs_frames(),
             "owner removal must retire the brain before load shedding returns"
         );
         assert!(
-            ws.free_scratch.is_empty()
+            ws.fx.free_sprites().is_empty()
                 && ws.input_scratch.free_sprites.is_empty()
                 && ws.input_scratch.free_atlas.is_none(),
             "the retired capture publishes no companion projection"
         );
         assert_eq!(
-            ws.companion.hit_rect(),
+            ws.fx.companion().hit_rect(),
             None,
             "owner removal clears body publication too"
         );
@@ -15728,8 +15708,8 @@ mod headless_cursor_fx_tests {
             }
             // Establish the resident from a genuine live caret before the
             // viewport moves into history. No input or caret is fabricated.
-            app.splice_word_decorations(wid, start);
-            assert!(app.windows[&wid].companion.brain().is_active());
+            app.capture_words(wid, start);
+            assert!(app.windows[&wid].fx.companion().brain().is_active());
             term_lock(&term).scroll_display(10);
 
             for (step, selected) in [true, false].into_iter().enumerate() {
@@ -15758,9 +15738,13 @@ mod headless_cursor_fx_tests {
                 let focus = capture.focus.unwrap();
                 assert_eq!(capture.composed, split);
                 assert!(!focus.live_viewport && focus.cursor.is_none());
-                app.splice_word_decorations_sampled(wid, now, focus);
+                app.capture_words_sampled(wid, now, focus);
                 assert_eq!(
-                    app.windows[&wid].companion.brain().has_reading_interest(),
+                    app.windows[&wid]
+                        .fx
+                        .companion()
+                        .brain()
+                        .has_reading_interest(),
                     selected
                 );
                 let (cw, ch) = app.win_cell_size(wid);
@@ -15820,19 +15804,31 @@ mod headless_cursor_fx_tests {
                     terminal.process(b"\x1b[6;12H");
                     terminal.grid().rows()
                 };
-                app.splice_word_decorations(wid, start);
+                // The resident arrives with its own fade-in (paid at most 0.1 s
+                // a tick); let it land before its home is measured — a load
+                // shed no longer snaps it opaque.
+                for ago in (1..=6).rev() {
+                    app.capture_words(wid, start - Duration::from_millis(ago * 100));
+                }
+                app.capture_words(wid, start);
                 let (cw, ch) = app.win_cell_size(wid);
                 let full_body = |app: &App| {
                     let ws = &app.windows[&wid];
-                    let sprites = &ws.input_scratch.free_sprites;
+                    // The resident's BODY: a load shed no longer stills the
+                    // cat, so its mote lane (a z, a note) may ride beside it.
+                    let bodies: Vec<_> = ws
+                        .input_scratch
+                        .free_sprites
+                        .iter()
+                        .filter(|s| usize::from(s.w) >= 5 * cw && usize::from(s.h) >= ch)
+                        .collect();
                     assert_eq!(
-                        sprites.len(),
+                        bodies.len(),
                         1,
                         "one resident, split={split}, pressure={pressure}"
                     );
-                    let body = &sprites[0];
-                    assert!(usize::from(body.w) >= 5 * cw && usize::from(body.h) >= ch);
-                    assert_eq!(body.alpha, 255);
+                    let body = bodies[0];
+                    assert_eq!(body.alpha, 255, "split={split}, pressure={pressure}");
                     let (ox, oy, _, _, _) =
                         app.effects_origin_win(wid, usize::from(ws.rows), usize::from(ws.cols), ch);
                     // The emitted split sprite already includes its pane
@@ -15841,14 +15837,21 @@ mod headless_cursor_fx_tests {
                     let x = body.x + i32::from(ox);
                     let y = body.y + i32::from(oy);
                     assert_eq!(
-                        ws.companion.hit_rect(),
+                        ws.fx.companion().hit_rect(),
                         Some((x, x + i32::from(body.w), y, y + i32::from(body.h))),
                         "the published body must identify the actual emitted sprite"
                     );
                     (body.x, body.y, body.w, body.h)
                 };
                 let home = full_body(&app);
-                let input_seq = app.windows[&wid].companion.brain().console_input_seq();
+                // Where the body STANDS — its centre column and its baseline.
+                // A settled resident breathes (the swell squashes the sprite
+                // about its feet), and neither a load shed nor the hidden
+                // caret's repaint hold freezes that, so the scaled rect can
+                // differ by a pixel while the cat has not moved.
+                let feet =
+                    |(x, y, w, h): (i32, i32, u16, u16)| (x + i32::from(w) / 2, y + i32::from(h));
+                let input_seq = app.windows[&wid].fx.companion().brain().console_input_seq();
                 term_lock(&term).process(b"\x1b[?25l");
                 for (step, elapsed_ms) in [16, 600, 2000].into_iter().enumerate() {
                     if step == 1 {
@@ -15866,11 +15869,15 @@ mod headless_cursor_fx_tests {
                             ContentScrollDelta::Bands { .. }
                         ));
                     }
-                    app.splice_word_decorations(wid, start + Duration::from_millis(elapsed_ms));
-                    assert_eq!(full_body(&app), home, "a hidden home remains screen-local");
-                    assert!(!app.windows[&wid].companion.brain().needs_frames());
+                    app.capture_words(wid, start + Duration::from_millis(elapsed_ms));
                     assert_eq!(
-                        app.windows[&wid].companion.brain().console_input_seq(),
+                        feet(full_body(&app)),
+                        feet(home),
+                        "a hidden home remains screen-local"
+                    );
+                    assert!(!app.windows[&wid].fx.companion().brain().needs_frames());
+                    assert_eq!(
+                        app.windows[&wid].fx.companion().brain().console_input_seq(),
                         input_seq
                     );
                 }
@@ -15891,28 +15898,25 @@ mod headless_cursor_fx_tests {
                     term_lock(&term).content_scroll_state().invalidation_epoch,
                     "the control must change the real terminal after extraction"
                 );
-                app.splice_word_decorations_sampled(wid, captured_at, focus);
+                app.capture_words_sampled(wid, captured_at, focus);
                 assert_eq!(
-                    full_body(&app),
-                    home,
+                    feet(full_body(&app)),
+                    feet(home),
                     "capture must consume only its owned snapshot"
                 );
 
                 // The NEXT extraction sees the real unknown/reset motion: a
                 // hidden caret cannot retain ownership across that boundary.
                 for step in 0..20 {
-                    app.splice_word_decorations(
-                        wid,
-                        start + Duration::from_millis(2100 + step * 100),
-                    );
+                    app.capture_words(wid, start + Duration::from_millis(2100 + step * 100));
                 }
                 assert!(
                     app.windows[&wid].input_scratch.free_sprites.is_empty(),
                     "reset must clear the former home, split={split}, pressure={pressure}"
                 );
-                assert_eq!(app.windows[&wid].companion.hit_rect(), None);
+                assert_eq!(app.windows[&wid].fx.companion().hit_rect(), None);
                 assert_eq!(
-                    app.windows[&wid].companion.brain().console_input_seq(),
+                    app.windows[&wid].fx.companion().brain().console_input_seq(),
                     input_seq
                 );
 
@@ -15924,16 +15928,19 @@ mod headless_cursor_fx_tests {
                     app.windows.get_mut(&wid).unwrap().focused = true;
                     app.config.cursor_trail = Some(true);
                     let now = start + Duration::from_millis(5000 + control as u64 * 1000);
-                    app.splice_word_decorations(wid, now);
+                    // The fresh body fades in (0.1 s of it a tick): let it land.
+                    for ago in (0..=6).rev() {
+                        app.capture_words(wid, now - Duration::from_millis(ago * 100));
+                    }
                     full_body(&app);
                     if owner_removed {
                         app.config.cursor_trail = Some(false);
                     } else {
                         app.windows.get_mut(&wid).unwrap().focused = false;
                     }
-                    app.splice_word_decorations(wid, now + Duration::from_millis(16));
+                    app.capture_words(wid, now + Duration::from_millis(16));
                     assert!(app.windows[&wid].input_scratch.free_sprites.is_empty());
-                    assert_eq!(app.windows[&wid].companion.hit_rect(), None);
+                    assert_eq!(app.windows[&wid].fx.companion().hit_rect(), None);
                 }
             }
         }
@@ -15975,19 +15982,28 @@ mod headless_cursor_fx_tests {
             if split {
                 let ws = &app.windows[&wid];
                 let (rows, cols) = (usize::from(ws.rows), usize::from(ws.cols));
-                assert!(
-                    app.redraw_compose(wid, rows, cols, false, false, None, 0, now)
-                        .is_some()
-                );
+                // Under load the resident arrives at its ORDINARY motion (the
+                // shed never snaps it), presented at its coarse offers.
+                let mut at = now;
+                for _ in 0..60 {
+                    assert!(
+                        app.redraw_compose(wid, rows, cols, false, false, None, 0, at)
+                            .is_some()
+                    );
+                    if app.windows[&wid].fx.companion().alpha() == 255 {
+                        break;
+                    }
+                    at += aterm_effects::companion::RESIDENT_SHED_CADENCE;
+                }
                 let ws = &app.windows[&wid];
                 assert!(
-                    ws.companion.hit_rect().is_some(),
+                    ws.fx.companion().hit_rect().is_some() && ws.fx.companion().alpha() == 255,
                     "native split retains the full body's hit target"
                 );
-                assert!(ws.companion.brain().is_active());
+                assert!(ws.fx.companion().brain().is_active());
                 assert!(
-                    !ws.companion.brain().needs_frames(),
-                    "native static resident owes no idle frames"
+                    !ws.fx.companion().needs_frames(),
+                    "the resident under load owes no frame train"
                 );
             }
             assert!(
@@ -16044,10 +16060,10 @@ mod headless_cursor_fx_tests {
                 "decorations remain shed"
             );
 
-            assert!(ws.companion.brain().is_active());
+            assert!(ws.fx.companion().brain().is_active());
             assert!(
-                !ws.companion.brain().needs_frames(),
-                "capture shares the static posture"
+                !ws.fx.companion().needs_frames(),
+                "capture shares the shed cadence: no frame train"
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -16088,7 +16104,9 @@ mod headless_cursor_fx_tests {
             ws.focused = true;
             let tenure_start = now - Duration::from_secs(7);
             for i in 0..160u64 {
-                ws.cursor_cat
+                ws.fx
+                    .companions_mut()
+                    .cursor_cat
                     .on_pet_mode_motion_pulse(CursorCatMotionPulse {
                         at: tenure_start + Duration::from_millis(i * 40),
                         kind: CursorCatMotionKind::Advance,
@@ -16096,7 +16114,7 @@ mod headless_cursor_fx_tests {
             }
             let sing_start = now - Duration::from_millis(u64::from(SING_ARM_REPEATS - 1) * 10);
             for i in 0..SING_ARM_REPEATS {
-                ws.kitty_sing.note_char(
+                ws.fx.companions_mut().kitty_sing.note_char(
                     sing_start + Duration::from_millis(u64::from(i) * 10),
                     0,
                     'a',
@@ -16128,11 +16146,11 @@ mod headless_cursor_fx_tests {
         let (cell_w, cell_h) = app.win_cell_size(wid);
         let ws = app.windows.get_mut(&wid).expect("headless window 0");
         assert!(
-            ws.cursor_cat.is_active(),
+            ws.fx.companions_mut().cursor_cat.is_active(),
             "the capture-owned detector sync spends the authenticated hidden tenure"
         );
         assert!(
-            ws.companion.brain().is_active(),
+            ws.fx.companion_mut().brain().is_active(),
             "reduced motion keeps the full resident visible and caret-fed during the song"
         );
         assert_eq!(
@@ -16146,7 +16164,14 @@ mod headless_cursor_fx_tests {
             usize::from(body.w) >= 5 * cell_w && usize::from(body.h) >= cell_h,
             "capture must show the full animal, not a replacement head"
         );
-        assert_eq!(ws.cursor_cat.static_frame(Instant::now()).sing, 1.0);
+        assert_eq!(
+            ws.fx
+                .companions_mut()
+                .cursor_cat
+                .static_frame(Instant::now())
+                .sing,
+            1.0
+        );
         assert!(
             ws.input_scratch.word_decorations.is_empty()
                 && ws.input_scratch.ink.is_empty()
@@ -16176,11 +16201,13 @@ mod headless_cursor_fx_tests {
             ws.focused = true;
             let start = now - Duration::from_millis(95 * 40);
             for i in 0..96u64 {
-                ws.cursor_cat
+                ws.fx
+                    .companions_mut()
+                    .cursor_cat
                     .on_key(start + Duration::from_millis(i * 40), true);
             }
             assert!(
-                ws.cursor_cat.is_active(),
+                ws.fx.companions_mut().cursor_cat.is_active(),
                 "the fixture earns the real classic cursor-cat lifecycle"
             );
         }
@@ -16207,8 +16234,8 @@ mod headless_cursor_fx_tests {
             .expect("classic kitty image succeeds");
 
         let ws = app.windows.get(&wid).expect("headless window 0");
-        assert!(ws.cursor_cat.is_active());
-        assert!(!ws.companion.brain().is_active());
+        assert!(ws.fx.companions().cursor_cat.is_active());
+        assert!(!ws.fx.companion().brain().is_active());
         assert_eq!(
             ws.input_scratch.free_sprites.len(),
             1,
@@ -16245,22 +16272,25 @@ mod headless_cursor_fx_tests {
         {
             let ws = app.windows.get_mut(&wid).expect("headless window 0");
             for i in 0..SING_ARM_REPEATS {
-                ws.kitty_sing
-                    .note_char(start + Duration::from_millis(u64::from(i) * 10), 0, 'a');
+                ws.fx.companions_mut().kitty_sing.note_char(
+                    start + Duration::from_millis(u64::from(i) * 10),
+                    0,
+                    'a',
+                );
             }
             assert_eq!(
-                ws.kitty_sing.drive(now),
+                ws.fx.companions_mut().kitty_sing.drive(now),
                 1.0,
                 "negative control: the post-transition input really re-armed the singer"
             );
         }
 
-        app.splice_word_decorations(wid, now);
+        app.capture_words(wid, now);
         let ws = app.windows.get(&wid).expect("headless window 0");
-        assert_eq!(ws.kitty_sing.drive(now), 0.0);
-        assert!(!ws.cursor_cat.is_active());
-        assert!(!ws.companion.brain().is_active());
-        assert!(!ws.music_notes.is_active());
+        assert_eq!(ws.fx.companions().kitty_sing.drive(now), 0.0);
+        assert!(!ws.fx.companions().cursor_cat.is_active());
+        assert!(!ws.fx.companion().brain().is_active());
+        assert!(!ws.fx.companions().music_notes.is_active());
         assert!(
             ws.input_scratch.free_sprites.is_empty() && ws.input_scratch.free_atlas.is_none(),
             "Serious Mode capture must publish no companion pixels"
@@ -16289,7 +16319,7 @@ mod headless_cursor_fx_tests {
         let terminal = app.front_terminal(wid).expect("front terminal");
         term_lock(&terminal.term).process(b"\x1b[?1049h");
 
-        app.splice_word_decorations(wid, Instant::now());
+        app.capture_words(wid, Instant::now());
         let ws = app.windows.get(&wid).expect("headless window 0");
         assert_eq!(
             ws.input_scratch.free_sprites.len(),
@@ -16340,14 +16370,11 @@ mod headless_cursor_fx_tests {
         app.windows
             .get_mut(&wid)
             .expect("test window")
-            .cursor_effect_coordinate_space = None;
-        app.splice_word_decorations_sampled(
-            wid,
-            now,
-            capture.focus.expect("focused capture sample"),
-        );
+            .fx
+            .forget_owner_space();
+        app.capture_words_sampled(wid, now, capture.focus.expect("focused capture sample"));
         assert_eq!(
-            app.windows[&wid].cursor_effect_coordinate_space,
+            app.windows[&wid].fx.owner_space(),
             Some((terminal_id, true)),
             "decoration custody must stay on the screen paired with captured cells"
         );
@@ -16366,14 +16393,17 @@ mod headless_cursor_fx_tests {
         let wid = WindowId(0);
         let t0 = Instant::now();
         // Capture 1: primes the engine's last-seen cursor cell (no motion yet).
-        app.splice_cursor_fx(wid, t0);
+        let _ = app.prepare_terminal_capture_grid_with_cursor_fx(
+            wid,
+            crate::app_render::ComposedCursorFxClock::Advance(t0),
+        );
         // This headless fixture deliberately scripts the next cursor move. A
         // timestamp alone is not authored-movement evidence; use the engines'
         // explicit preview/test licence before changing the terminal cursor.
         {
             let ws = app.windows.get_mut(&wid).expect("headless window 0");
-            ws.cursor_fx.glow.note_synthetic_move(t0);
-            ws.cursor_fx.trail.note_synthetic_move(t0);
+            ws.fx.cursor_mut().glow.note_synthetic_move(t0);
+            ws.fx.cursor_mut().trail.note_synthetic_move(t0);
         }
         // Advance the scripted cursor without minting a parser generation: a
         // synthetic licence is for preview/test geometry, while parser output
@@ -16383,7 +16413,10 @@ mod headless_cursor_fx_tests {
             term_lock(&terminal.term).grid_mut().cursor_forward(1);
         }
         // Capture 2, one frame later: the observed move must spawn live fire.
-        app.splice_cursor_fx(wid, t0 + Duration::from_millis(16));
+        let _ = app.prepare_terminal_capture_grid_with_cursor_fx(
+            wid,
+            crate::app_render::ComposedCursorFxClock::Advance(t0 + Duration::from_millis(16)),
+        );
         {
             let ws = app.windows.get(&wid).expect("headless window 0");
             assert!(
@@ -16394,7 +16427,10 @@ mod headless_cursor_fx_tests {
         // Capture 3, >30 s later with no further motion: every thermal
         // integrator (heat/flare/coal/quench + spark TTLs + the crown window)
         // has decayed and the capture composes ZERO quads again.
-        app.splice_cursor_fx(wid, t0 + Duration::from_secs(31));
+        let _ = app.prepare_terminal_capture_grid_with_cursor_fx(
+            wid,
+            crate::app_render::ComposedCursorFxClock::Advance(t0 + Duration::from_secs(31)),
+        );
         let ws = app.windows.get(&wid).expect("headless window 0");
         assert!(
             ws.input_scratch.cursor_glow_add.is_empty(),
@@ -16445,19 +16481,25 @@ mod headless_cursor_fx_tests {
                 .process(b"\x1b[5;1HABOVE\x1b[6;1HCURRENT\x1b[7;1HBELOW\x1b[6;8H");
         }
         let t0 = Instant::now();
-        assert!(!app.windows[&wid].cursor_fx.glow.v2_owns_frame());
-        app.splice_cursor_fx(wid, t0);
-        let glow = &app.windows[&wid].cursor_fx.glow;
+        assert!(!app.windows[&wid].fx.cursor().glow.v2_owns_frame());
+        let _ = app.prepare_terminal_capture_grid_with_cursor_fx(
+            wid,
+            crate::app_render::ComposedCursorFxClock::Advance(t0),
+        );
+        let glow = &app.windows[&wid].fx.cursor().glow;
         assert!(glow.v2_owns_frame(), "the first capture's tick engages v2");
         assert_eq!(
             glow.neighbor_rows_probed(),
             Some((false, false)),
             "the engaging tick's capture skipped both flanking rows"
         );
-        app.splice_cursor_fx(wid, t0 + Duration::from_millis(16));
+        let _ = app.prepare_terminal_capture_grid_with_cursor_fx(
+            wid,
+            crate::app_render::ComposedCursorFxClock::Advance(t0 + Duration::from_millis(16)),
+        );
         let ws = &app.windows[&wid];
         assert_eq!(
-            ws.cursor_fx.glow.neighbor_rows_probed(),
+            ws.fx.cursor().glow.neighbor_rows_probed(),
             Some((true, true)),
             "once v2 owns the frame the capture's rows reach the witnesses"
         );

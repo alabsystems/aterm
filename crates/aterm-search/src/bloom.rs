@@ -32,6 +32,8 @@
 //! probes every trigram of the query: `false` means definitely absent, `true`
 //! means possibly present (verify with the actual search).
 
+use aterm_hash::{FNV64_OFFSET, FNV64_PRIME};
+
 /// Number of hash functions (k=7 is optimal for 1% FPR with m/n ~= 10)
 const K: usize = 7;
 
@@ -73,12 +75,6 @@ fn take_set_bit_ops() -> usize {
         v
     })
 }
-
-/// FNV-1a prime
-const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
-
-/// FNV-1a offset basis
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// Bloom filter for fast set membership testing.
 ///
@@ -341,15 +337,15 @@ impl BloomFilter {
         // Compute both hashes in a single pass.
         // h1: Standard FNV-1a
         // h2: FNV-1a with different seed and rotated intermediate values
-        let mut h1 = FNV_OFFSET;
-        let mut h2 = FNV_OFFSET.rotate_left(17); // Different seed
+        let mut h1 = FNV64_OFFSET;
+        let mut h2 = FNV64_OFFSET.rotate_left(17); // Different seed
 
         for &b in bytes {
             let b64 = u64::from(b);
             h1 ^= b64;
-            h1 = h1.wrapping_mul(FNV_PRIME);
+            h1 = h1.wrapping_mul(FNV64_PRIME);
             h2 ^= b64;
-            h2 = h2.wrapping_mul(FNV_PRIME);
+            h2 = h2.wrapping_mul(FNV64_PRIME);
         }
 
         // Final mixing for h2 to ensure independence

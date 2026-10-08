@@ -11,12 +11,10 @@
 use super::state::GridStorage;
 use super::*;
 
-// Kani Stub Constructor: verification-optimized Grid constructors that avoid
-// state explosion from symbolic loop bounds. Uses Row::kani_stub + manually
-// unrolled creation with concrete bounds. KANI_MAX_ROWS/KANI_MAX_COLS in grid::mod.
-//
-// NOTE: kani_tab_stops moved to aterm-grid (state/cursor.rs) as part of Batch 2A
-// extraction (#5757). GridCursorState::default_tab_stops() calls it directly.
+// Kani stub constructors: verification-optimized Grid constructors that avoid
+// state explosion from symbolic loop bounds, using Row::kani_stub and
+// concrete-bound unrolled creation (KANI_MAX_ROWS/KANI_MAX_COLS in grid::mod).
+// Tab stops come from GridCursorState::default_tab_stops (state/cursor.rs).
 
 #[cfg(kani)]
 impl Grid {
@@ -147,15 +145,12 @@ impl Grid {
     }
 
     // =========================================================================
-    // Array-Backed Mock Constructor (true O(1))
+    // Array-backed mock constructor (O(1))
     // =========================================================================
     //
-    // Grid::kani_mock completely avoids PageStore allocation by using a static
-    // Cell array. This provides true O(1) construction with zero state explosion.
-    //
-    // The trade-off is fixed dimensions (KANI_MOCK_ROWS × KANI_MOCK_COLS).
-    // For proofs that need symbolic dimensions, use concrete fixed values
-    // rather than kani::any() with bounds.
+    // Grid::kani_mock avoids PageStore allocation by using a caller-provided
+    // Cell array, at fixed dimensions (KANI_MOCK_ROWS × KANI_MOCK_COLS). Proofs
+    // needing other sizes use concrete values rather than bounded kani::any().
 
     /// Fixed row count for kani_mock.
     ///
@@ -225,10 +220,9 @@ impl Grid {
 mod proofs {
     use super::*;
 
-    /// Kani Grid stubs preserve the same init invariants as production.
-    ///
-    /// This is a genuine proof — it constructs a real Grid via kani_stub_with_scrollback
-    /// and verifies structural invariants hold for all valid input combinations.
+    /// Kani Grid stubs preserve the same init invariants as production: a real
+    /// Grid built via kani_stub_with_scrollback satisfies the structural
+    /// invariants for all valid inputs.
     #[kani::proof]
     fn kani_stub_with_scrollback_preserves_init_invariants() {
         let rows: u16 = kani::any();
@@ -249,16 +243,11 @@ mod proofs {
 
     /// RowsNonEmpty and RingHeadValid invariants preserved after resize.
     ///
-    /// The resize operation rebuilds the row buffer via adjust_row_count.
-    /// This proves that for any valid resize target with concrete initial
-    /// dimensions, the ring buffer retains at least one row and ring_head
-    /// stays within bounds.
-    ///
-    /// Non-trivial: adjust_row_count may drain rows (shrinking) or add new
-    /// rows (growing), and linearizes the ring buffer via rotate_left.
-    /// A bug in drain bounds or ring_head reset would violate these invariants.
-    /// The `% self.rows.len()` modular arithmetic throughout Grid depends on
-    /// RowsNonEmpty; violation would cause division-by-zero.
+    /// Resize rebuilds the row buffer via adjust_row_count, which may drain or
+    /// add rows and linearizes the ring via rotate_left. For any valid target
+    /// from concrete initial dimensions, at least one row remains and
+    /// ring_head stays in bounds; the `% self.rows.len()` arithmetic throughout
+    /// Grid depends on RowsNonEmpty.
     #[kani::proof]
     fn rows_non_empty_preserved_after_resize() {
         let mut grid = Grid::kani_stub(4, 8);

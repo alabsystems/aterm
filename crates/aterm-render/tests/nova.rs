@@ -22,8 +22,9 @@ use aterm_render::{
     DirtyDecision, GlowQuad, Renderer, Theme, WindowCpu, compute_dirty_rows, premul_rgb,
 };
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// A single-row nova quad covering cell `(row, col)` — the emitter's row-band
@@ -49,10 +50,7 @@ fn quad_at(cw: usize, ch: usize, row: u16, col: usize, color: u32) -> GlowQuad {
 /// the LUMEN aurora is proven byte-exact against the GPU with.
 #[test]
 fn nova_adds_exact_premultiplied_light_over_background() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 8);
     term.process(b"\x1b[?25l"); // pure background, no glyphs, no cursor
@@ -169,10 +167,7 @@ fn multi_row_nova_marks_every_quad_row_on_change() {
 /// (byte-stable, no double-add), and clearing it restores the exact base bytes.
 #[test]
 fn cached_path_nova_never_accumulates_and_clears_without_ghosting() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let mut win = WindowCpu::new();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(4, 16);

@@ -19,10 +19,19 @@ spec-anchors = ["dep:aterm-spec"]
 # The descriptor, peer, process-birth, exit-watch, spawn and holder-scan
 # primitives: the cordoned unsafe crate the keeper's OS half is built on.
 aterm-uds = { workspace = true }
+# The workspace's one FNV-1a/64, for a dev keeper's per-path label. Dependency-free.
+aterm-hash = { workspace = true }
 aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
+# The one trustd probe and skip line, and the bounded child runner for the
+# tests' own codesign spawns (`aterm_uds::deadline`).
+aterm-uds = { workspace = true, features = ["test-support"] }
+# The tests' real PTYs (kernel_custody's pairs, the server tests' masters):
+# both ends close-on-exec from birth, and a `/dev/ptmx` open that lost the
+# kernel's race redriven. Tests only: the keeper itself links aterm-uds alone.
+aterm-pty = { workspace = true }
 
 [lints]
 workspace = true

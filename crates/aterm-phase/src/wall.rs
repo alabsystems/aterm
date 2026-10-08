@@ -77,6 +77,10 @@ pub enum WallKind {
     Spend,
     /// The context is full (`Context limit reached · /compact or /clear to
     /// continue`, `Prompt is too long`): `/compact` moves it, waiting does not.
+    /// A `/compact` that failed (`Compaction failed · conversation could not
+    /// be reduced below the context limit`, `Error during compaction: …`) left
+    /// it as full as it was, and its row is the same wall, bar a detail that
+    /// names a wall of its own.
     Context,
     /// The login is gone (`Not logged in · Please run /login`, `API Error:
     /// 401 Invalid API key · Please run /login`, `Login expired · Please run
@@ -218,6 +222,13 @@ pub enum Tag {
     Context,
     Auth,
     Overloaded,
+    /// An account the harness cannot lift from here (seat
+    /// type, admin allocation, group cap, org switched off): read as
+    /// [`WallKind::Spend`] — waited out on the limit ladder, with a person
+    /// told once ([`aterm-agent`'s exception]).
+    Blocked,
+    /// `Goal paused · the request was rate limited`.
+    RateLimit,
 }
 
 /// THE phrase table: the first row whose phrase occurs in a notice's head
@@ -236,8 +247,44 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("fast mode", Tag::NotAWall),
     ("request was aborted", Tag::NotAWall),
     ("update installed", Tag::NotAWall),
+    // The auto-continue lifecycle's notices that are NOT a
+    // standing limit (2.1.283/284): the reset came (`Usage limit reset ·
+    // continuing automatically`, `Usage limit available again · continuing
+    // now`, the stale `(Your) usage limit has reset · press enter to
+    // continue`) and the 284 countdown toast (`Continuing automatically at
+    // 4pm · esc to cancel`).
+    ("usage limit has reset", Tag::NotAWall),
+    ("usage limit reset", Tag::NotAWall),
+    ("usage limit available again", Tag::NotAWall),
+    ("continuing automatically", Tag::NotAWall),
+    // The weekly session reset's own texts (READ in the 2.1.287 bundle,
+    // never seen on a screen): its answer `Session limit reset · next reset
+    // available {date} · …` says the limit is GONE, and its row's label, its
+    // footer notice (`/limit-reset to reset your session limit now · …`),
+    // its failure (`Couldn't reset your session limit right now · …`) and
+    // its pending line (`Resetting your session limit…`) name the limit
+    // beside the verb `reset` without being a notice of one. Ahead of
+    // `session limit`, which with that verb is a standing session wall.
+    ("session limit reset", Tag::NotAWall),
+    ("reset your session limit", Tag::NotAWall),
+    ("resetting your session limit", Tag::NotAWall),
     ("context limit reached", Tag::Context),
     ("prompt is too long", Tag::Context),
+    ("context exceeds", Tag::Context),
+    // A `/compact` that FAILS draws a `⎿` row of its own under its `❯ /compact`
+    // echo and no done row (2.1.286, MEASURED 2026-10-01): the context is as full
+    // as it was, and that row is the full context's wall. Read as no wall, the
+    // supervisor took it for a compaction that worked and looped (six `/compact`
+    // and six `keep going` in 2 min 42 s, then twelve acts an hour). `Compaction
+    // failed · conversation could not be reduced below the context limit` is the
+    // vendor's `exhausted`; `Error during compaction: <detail>` wraps any other
+    // failure of the request, and `classify_wall` lets a detail that names a
+    // wall with its own answer (a lost login, no credit) win before this row is
+    // looked up. Not `Not enough messages to compact` (a person's `/compact` on
+    // a short chat) and not `Compacted (ctrl+o to see full summary)`: no wall.
+    ("compaction failed", Tag::Context),
+    ("error during compaction", Tag::Context),
+    ("the request was rate limited", Tag::RateLimit),
     ("temporarily limiting requests", Tag::Overloaded),
     ("repeated overloaded errors", Tag::Overloaded),
     ("overloaded", Tag::Overloaded),
@@ -251,6 +298,11 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("invalid auth token", Tag::Auth),
     ("authentication failed", Tag::Auth),
     ("authentication error", Tag::Auth),
+    ("authentication required", Tag::Auth),
+    (
+        "your organization has disabled api key authentication",
+        Tag::Auth,
+    ),
     ("token expired", Tag::Auth),
     ("weekly limit", Tag::Weekly),
     ("weekly usage limit", Tag::Weekly),
@@ -271,6 +323,15 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("usage credit limit", Tag::Spend),
     ("credit balance", Tag::Spend),
     ("out of usage", Tag::Spend),
+    ("your seat type doesn't include", Tag::Blocked),
+    ("your usage allocation has been disabled", Tag::Blocked),
+    ("your group's usage limit is set to", Tag::Blocked),
+    ("this service is disabled for your org", Tag::Blocked),
+    (
+        "your organization has disabled claude subscription access",
+        Tag::Blocked,
+    ),
+    ("extra usage is required for long context", Tag::Blocked),
     ("session limit", Tag::Session),
     ("5-hour limit", Tag::Session),
     ("usage limit", Tag::Session),
@@ -294,6 +355,51 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
             .to_string(),
         None => lower,
     };
+    // Two notices the vendor files under authentication that
+    // pass by themselves — `Authentication error · This may be a temporary
+    // network issue, please try again` and `Could not refresh your login
+    // because another Claude Code process is refreshing it … Try again in a
+    // minute` — are an API that was not reached, never a lost login.
+    if lower.contains("temporary network issue")
+        || lower.contains("another claude code process is refreshing it")
+    {
+        return Some(WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Unreachable,
+        });
+    }
+    // `Goal cleared after an unrecoverable error
+    // (<label>): "<goal>". Run /goal again to continue.` is the goal loop's
+    // echo of a cause that ended it; the label says which.
+    if let Some(rest) = lower.strip_prefix("goal cleared after an unrecoverable error (") {
+        return match rest.split(')').next().unwrap_or_default() {
+            "authentication failed" | "organization verification required" => Some(WallKind::Auth),
+            "credit balance too low" => Some(WallKind::Spend),
+            "context limit reached" => Some(WallKind::Context),
+            _ => None,
+        };
+    }
+    // `Error during compaction: <detail>` is a `/compact` whose own request failed.
+    // Where the detail names a wall with an answer of its own (a lost login, no
+    // credit, a usage limit, a model's bucket) that wall stands, as it did before
+    // the wrapper was read: `/compact` is no answer to them. Anything else (an
+    // API error, a network error) leaves the context as full as it was.
+    let bare = lower
+        .strip_prefix("error:")
+        .map_or(lower.as_str(), str::trim_start);
+    if let Some(detail) = bare.strip_prefix("error during compaction:") {
+        return match classify_wall(detail) {
+            kind @ Some(
+                WallKind::Auth
+                | WallKind::UsageSession
+                | WallKind::UsageWeekly
+                | WallKind::Spend
+                | WallKind::ModelBucket { .. },
+            ) => kind,
+            _ => Some(WallKind::Context),
+        };
+    }
     let head = notice_head(&lower);
     // `API Error: 529 Overloaded` keeps its number for the code; the table
     // reads the words.
@@ -322,13 +428,18 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
         Some(Tag::Model) => Some(WallKind::ModelBucket {
             consent: lower.contains("prompt to confirm") || lower.contains("continuing on "),
         }),
-        Some(Tag::Spend) => Some(WallKind::Spend),
+        Some(Tag::Spend | Tag::Blocked) => Some(WallKind::Spend),
+        Some(Tag::RateLimit) => Some(WallKind::ApiError {
+            code: Some(429),
+            retryable: true,
+            cause: ApiCause::Server,
+        }),
         Some(Tag::Context) => Some(WallKind::Context),
         Some(Tag::Auth) => Some(WallKind::Auth),
         Some(Tag::Overloaded) => Some(WallKind::Overloaded),
         // The exact `Request timed out` is drawn under `⎿` with no prefix:
         // the whole row, never a tool's line that begins so.
-        None if api || lower.trim() == "request timed out" => api_error(head, &lower),
+        None if api || crate::text::trim(&lower) == "request timed out" => api_error(head, &lower),
         None => None,
     }
 }
@@ -344,7 +455,7 @@ fn notice_head(text: &str) -> &str {
                 || (c == '.' && text[i + 1..].chars().next().is_none_or(char::is_whitespace))
         })
         .map_or(text.len(), |(i, _)| i);
-    text[..end].trim()
+    crate::text::trim(&text[..end])
 }
 
 /// The verbs a usage, model-bucket or spend notice opens with.
@@ -545,13 +656,13 @@ pub fn login_restored(rows: &[String]) -> bool {
     let restored = rows[last]
         .trim_start()
         .strip_prefix('⎿')
-        .is_some_and(|out| out.trim_start().starts_with("Login successful"));
+        .is_some_and(|out| crate::text::trim_start(out).starts_with("Login successful"));
     restored
         && rows[..last]
             .iter()
             .rev()
-            .find(|r| !r.trim().is_empty() && crate::phase::leading_spaces(r) == 0)
-            .is_some_and(|r| r.trim_end() == "❯ /login")
+            .find(|r| !crate::text::trim(r).is_empty() && crate::phase::leading_spaces(r) == 0)
+            .is_some_and(|r| crate::text::trim_end(r) == "❯ /login")
 }
 
 /// How far above the composer's top rule [`memory_wall`] looks: the live
@@ -564,10 +675,9 @@ const MEMORY_ROWS: usize = 6;
 /// (`restart and resume with claude --continue`); the whole message when it
 /// has no such tail.
 ///
-/// WHY (robustness backlog item 2, 2026-09-26): `claude --continue` resumes
-/// the NEWEST conversation filed under the working directory, and four live
-/// Claude Code processes shared one directory on the owner's Mac that day —
-/// a person following the banner's words in one tab resumes a sibling's
+/// WHY: `claude --continue` resumes the NEWEST conversation filed under the
+/// working directory, and several live Claude Code processes can share one
+/// directory — a person following the banner's words in one tab resumes a sibling's
 /// conversation. aterm names the tab's own (`aterm_agent::harness::resume`),
 /// so whatever of the banner it quotes stops at the fact.
 #[must_use]
@@ -613,9 +723,8 @@ pub fn memory_banner_head(message: &str) -> &str {
 ///
 /// The column rule is not asked under a status row because the banner is 75
 /// columns wide: at aterm's default 80 columns it starts at column 3, left
-/// of both the hint column and a hint's column-6 floor, and the first cut
-/// of this reader, which asked it everywhere, read nothing at 82 columns or
-/// fewer, under the very spinner the incident had (review of 2026-09-24).
+/// of both the hint column and a hint's column-6 floor, so a reader that
+/// asked it everywhere would read nothing at 82 columns or fewer.
 ///
 /// A transcript row quoting the banner starts at the transcript's columns,
 /// not the hint column, a draft quoting it is under the top rule, and a
@@ -633,16 +742,16 @@ pub fn memory_banner_head(message: &str) -> &str {
 #[must_use]
 pub fn memory_wall(rows: &[String]) -> Option<Wall> {
     use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge, status_block};
-    let anchor = crate::anchors::anchor_text("wall.memory");
+    let anchor = const { crate::anchors::anchor_text("wall.memory") };
     let frame = composer_frame(rows)?;
-    let width = rows[frame.bottom].trim_end().chars().count();
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     let block = status_block(rows, frame.top);
     let from = block
         .status
         .unwrap_or(block.from)
         .max(frame.top.saturating_sub(MEMORY_ROWS));
     (from..frame.top).rev().find_map(|i| {
-        let row = rows[i].trim_end();
+        let row = crate::text::trim_end(&rows[i]);
         if row.chars().count() + 3 < width {
             return None;
         }
@@ -677,7 +786,7 @@ fn in_queued_message(rows: &[String], status: usize, i: usize) -> bool {
     (status + 1..=i)
         .rev()
         .map(|j| rows[j].as_str())
-        .find(|row| row.trim().is_empty() || !row.starts_with(char::is_whitespace))
+        .find(|row| crate::text::trim(row).is_empty() || !row.starts_with(char::is_whitespace))
         .is_some_and(|row| row.starts_with('❯'))
 }
 
@@ -688,7 +797,7 @@ fn right_segment(row: &str) -> (usize, &str) {
     match row.rfind("  ") {
         Some(gap) => (row[..gap + 2].chars().count(), &row[gap + 2..]),
         None => {
-            let t = row.trim_start();
+            let t = crate::text::trim_start(row);
             (row.chars().count() - t.chars().count(), t)
         }
     }
@@ -697,6 +806,280 @@ fn right_segment(row: &str) -> (usize, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vendor's own limit catalog (Claude Code 2.1.283 and 2.1.284: the
+    /// limit functions, the auto-continue notices, the `/goal` interruption
+    /// table, the authentication notices), one string per row and the kind the
+    /// reader must give it. Nineteen of these read as something else before the
+    /// catalog was classified: an account limit no reset ends was no wall, a
+    /// notice that the reset came was a limit still standing, and a network
+    /// hiccup filed under authentication was a lost login.
+    #[test]
+    fn the_vendor_limit_catalog_classifies() {
+        let catalog: &[(&str, Option<WallKind>)] = &[
+            (
+                "You've hit your weekly limit · resets 4pm (America/Los_Angeles)",
+                Some(WallKind::UsageWeekly),
+            ),
+            (
+                "You've hit your session limit · resets 3pm (America/Los_Angeles)",
+                Some(WallKind::UsageSession),
+            ),
+            (
+                "You've hit your Opus limit · resets 4pm (America/Los_Angeles)",
+                Some(WallKind::ModelBucket { consent: false }),
+            ),
+            (
+                "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
+                Some(WallKind::ModelBucket { consent: false }),
+            ),
+            (
+                "You've reached your Fable limit. /model to switch models.",
+                Some(WallKind::ModelBucket { consent: false }),
+            ),
+            (
+                "Fable 5 requires usage credits. Run /usage-credits to continue or switch models with /model.",
+                Some(WallKind::ModelBucket { consent: false }),
+            ),
+            (
+                "You're out of usage credits. Run /usage-credits to keep using Fable or /model to switch models.",
+                Some(WallKind::Spend),
+            ),
+            (
+                "You're out of extra usage · resets 4pm",
+                Some(WallKind::Spend),
+            ),
+            (
+                "You've hit your monthly spend limit.",
+                Some(WallKind::Spend),
+            ),
+            (
+                "You've hit your team's shared budget. /model to switch models.",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Your org is out of usage · add funds to continue",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Your org is out of usage · contact your admin",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Your seat type doesn't include usage credits",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Your seat type doesn't include extra usage",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Your usage allocation has been disabled by your admin",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Your group's usage limit is set to $0",
+                Some(WallKind::Spend),
+            ),
+            (
+                "This service is disabled for your org",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Your organization has disabled Claude subscription access · Sign in again",
+                Some(WallKind::Spend),
+            ),
+            ("Credit balance is too low", Some(WallKind::Spend)),
+            (
+                "Usage limit reached · continuing automatically at 2:10pm · esc to cancel",
+                Some(WallKind::UsageSession),
+            ),
+            (
+                "Usage limit reached · continuing automatically when it resets · esc to cancel",
+                Some(WallKind::UsageSession),
+            ),
+            (
+                "Usage limit reached · continuing shortly · esc to cancel",
+                Some(WallKind::UsageSession),
+            ),
+            (
+                "Usage limit reached again · continuing automatically at 2:10pm · esc to cancel",
+                Some(WallKind::UsageSession),
+            ),
+            ("Continuing automatically at 2:10pm · esc to cancel", None),
+            ("Usage limit reset · continuing automatically", None),
+            ("Usage limit available again · continuing now", None),
+            ("Usage limit has reset · press enter to continue", None),
+            ("Your usage limit has reset · press enter to continue", None),
+            (
+                "Automatic continue cancelled · /rate-limit-options to re-arm",
+                None,
+            ),
+            (
+                "Automatic continue stopped · the usage limit now resets more than 24 hours out, so this task will not resume on its own (/rate-limit-options to wait anyway)",
+                None,
+            ),
+            (
+                "Automatic continue was turned off · this task will not resume on its own",
+                None,
+            ),
+            (
+                "Goal paused · usage limit reached · send a message after it resets to continue",
+                Some(WallKind::UsageSession),
+            ),
+            (
+                "Goal paused · usage limit reached · continues automatically when it resets",
+                Some(WallKind::UsageSession),
+            ),
+            (
+                "Goal paused · the request was rate limited · send a message to retry",
+                Some(WallKind::ApiError {
+                    code: Some(429),
+                    retryable: true,
+                    cause: ApiCause::Server,
+                }),
+            ),
+            (
+                "Goal paused · the API rejected the last request · send a message to continue, or run /goal clear",
+                None,
+            ),
+            (
+                "Goal paused · the last turn could not finish · send a message to continue",
+                None,
+            ),
+            (
+                "Goal paused · a hook ended the turn · send a message to continue",
+                None,
+            ),
+            (
+                "Goal still active · the API was unavailable or the connection dropped · retrying in 5 min (2/3) · send a message to retry now",
+                None,
+            ),
+            (
+                "Goal paused after 3 automatic retries · the API was unavailable or the connection dropped · send a message to continue",
+                None,
+            ),
+            (
+                "Goal cleared after an unrecoverable error (authentication failed): \"x\". Run /goal again to continue.",
+                Some(WallKind::Auth),
+            ),
+            (
+                "Goal cleared after an unrecoverable error (credit balance too low): \"x\". Run /goal again to continue.",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Goal cleared after an unrecoverable error (context limit reached): \"x\". Run /goal again to continue.",
+                Some(WallKind::Context),
+            ),
+            (
+                "Goal cleared after an unrecoverable error (model unavailable): \"x\". Run /goal again to continue.",
+                None,
+            ),
+            (
+                "Authentication error · This may be a temporary network issue, please try again",
+                Some(WallKind::ApiError {
+                    code: None,
+                    retryable: true,
+                    cause: ApiCause::Unreachable,
+                }),
+            ),
+            (
+                "Authentication error · The gateway could not authenticate with its upstream provider — contact your gateway administrator",
+                Some(WallKind::Auth),
+            ),
+            (
+                "Could not refresh your login because another Claude Code process is refreshing it (or exited mid-refresh) · Try again in a minute",
+                Some(WallKind::ApiError {
+                    code: None,
+                    retryable: true,
+                    cause: ApiCause::Unreachable,
+                }),
+            ),
+            ("Login expired · Please run /login", Some(WallKind::Auth)),
+            (
+                "OAuth token revoked · Please run /login",
+                Some(WallKind::Auth),
+            ),
+            ("Not logged in · Please run /login", Some(WallKind::Auth)),
+            (
+                "Authentication required · Sign in again to continue",
+                Some(WallKind::Auth),
+            ),
+            (
+                "Invalid API key · Fix external API key",
+                Some(WallKind::Auth),
+            ),
+            (
+                "Your organization has disabled API key authentication · Sign in again with your claude.ai account",
+                Some(WallKind::Auth),
+            ),
+            (
+                "There's an issue with the selected model (x). It may not exist or you may not have access to it. Run /model to pick a different model.",
+                None,
+            ),
+            (
+                "Context exceeds the 200000-token limit · run /compact",
+                Some(WallKind::Context),
+            ),
+            (
+                "Extra usage is required for long context · run /extra-usage",
+                Some(WallKind::Spend),
+            ),
+        ];
+        assert_eq!(catalog.len(), 55);
+        for (text, want) in catalog {
+            assert_eq!(classify_wall(text), *want, "{text}");
+        }
+    }
+
+    /// The auto-continue's lifecycle notices say a limit is over, cancelled or
+    /// armed for the next reset; none of them is a limit standing. NEGATIVE
+    /// CONTROL: the same words with `Usage limit reached` in front still are.
+    #[test]
+    fn the_lifecycle_notices_are_no_wall() {
+        for text in [
+            "Usage limit reset · continuing automatically",
+            "Usage limit available again · continuing now",
+            "Usage limit has reset · press enter to continue",
+            "Your usage limit has reset · press enter to continue",
+            "Continuing automatically at 2:10pm · esc to cancel",
+            "Automatic continue cancelled · /rate-limit-options to re-arm",
+            "Automatic continue was turned off · this task will not resume on its own",
+        ] {
+            assert_eq!(classify_wall(text), None, "{text}");
+        }
+        assert_eq!(
+            classify_wall(
+                "Usage limit reached · continuing automatically at 2:10pm · esc to cancel"
+            ),
+            Some(WallKind::UsageSession)
+        );
+    }
+
+    /// `Authentication error` and a refresh another process is doing are the
+    /// network, tried again on its ladder, never the lost login a person must
+    /// answer. NEGATIVE CONTROL: a gateway that cannot authenticate, and a
+    /// plain `Authentication required`, are the login.
+    #[test]
+    fn authentication_that_passes_by_itself_is_the_network_not_the_login() {
+        let network = Some(WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Unreachable,
+        });
+        for text in [
+            "Authentication error · This may be a temporary network issue, please try again",
+            "Could not refresh your login because another Claude Code process is refreshing it (or exited mid-refresh) · Try again in a minute",
+        ] {
+            assert_eq!(classify_wall(text), network, "{text}");
+        }
+        for text in [
+            "Authentication error · The gateway could not authenticate with its upstream provider — contact your gateway administrator",
+            "Authentication required · Sign in again to continue",
+        ] {
+            assert_eq!(classify_wall(text), Some(WallKind::Auth), "{text}");
+        }
+    }
 
     /// Every phrase the binary and the captures carry lands on its kind.
     #[test]
@@ -826,6 +1209,22 @@ mod tests {
                     cause: ApiCause::CutOff,
                 }),
             ),
+            (
+                "Your seat type doesn't include usage credits",
+                Some(WallKind::Spend),
+            ),
+            (
+                "Goal paused · the request was rate limited · send a message to retry",
+                Some(WallKind::ApiError {
+                    code: Some(429),
+                    retryable: true,
+                    cause: ApiCause::Server,
+                }),
+            ),
+            (
+                "Context exceeds the 200000-token limit · run /compact",
+                Some(WallKind::Context),
+            ),
         ];
         for (text, want) in cases {
             assert_eq!(classify_wall(text), *want, "{text}");
@@ -854,6 +1253,9 @@ mod tests {
             "Updated the usage limit docs",
             "Checked the weekly limit handling in the parser",
             "The parser now reads the Fable limit notice too, and the session limit one.",
+            "Usage limit has reset · press enter to continue",
+            "Usage limit available again · continuing now",
+            "Continuing automatically at 3pm · esc to cancel",
         ] {
             assert_eq!(classify_wall(text), None, "{text}");
         }
@@ -863,8 +1265,11 @@ mod tests {
     use crate::prompt::fixtures::{
         API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_ENOTFOUND_80,
         API_ERROR_ENOTFOUND_80_MEASURED, API_ERROR_ENOTFOUND_MEASURED,
-        API_ERROR_QUEUED_SENT_MEASURED, API_ERROR_SLEEP, API_ERROR_TWICE_MEASURED, END_529,
-        END_OFFER, END_SESSION_LIMIT, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, composer, rows, screen,
+        API_ERROR_QUEUED_SENT_MEASURED, API_ERROR_SLEEP, API_ERROR_TWICE_MEASURED,
+        COMPACT_ERROR_500_MEASURED, COMPACT_FAILED_3_MEASURED, COMPACT_FAILED_FIRST_MEASURED,
+        COMPACT_NOT_ENOUGH_MEASURED, COMPACT_SUCCEEDED_MEASURED,
+        CONTEXT_WALL_COMPACT_MENU_MEASURED, CONTEXT_WALL_MEASURED, END_529, END_OFFER,
+        END_SESSION_LIMIT, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, composer, rows, screen,
     };
 
     fn framed(body: &[&str], footer: &str) -> Vec<String> {
@@ -937,11 +1342,11 @@ mod tests {
     /// THE LOGIN WALL OF 2026-09-27 (tab `s-b5cf2faabac5ce5127bd`): Claude
     /// Code 2.1.281 answered every turn for nine hours with its synthetic
     /// `authentication_failed` row, drawn `⏺ Login expired · Please run
-    /// /login` in column 0 — and main's reader read that screen idle with NO
-    /// wall (the same words under the `⎿` gutter it read as `auth`), so the
-    /// supervisor continued it and the upgrade announced into it. Read now
-    /// as the auth wall, from the vendor's error row: alone, over a done
-    /// row, wrapped by a narrow window, and in its other measured wording;
+    /// /login` in column 0 — read as idle with NO wall (the same words under
+    /// the `⎿` gutter read as `auth`), so the supervisor continued it and
+    /// the upgrade announced into it. Read as the auth wall,
+    /// from the vendor's error row: alone, over a done row, wrapped by a
+    /// narrow window, and in its other measured wording;
     /// an `API Error` in the same form is its own kind. The screen stays
     /// idle for every other reader (`worker_phase`, `limit_notice`).
     #[test]
@@ -1151,6 +1556,15 @@ mod tests {
     /// `Context limit reached` is a wall of its own, and not a usage limit
     /// (it read `limited` before); a subagent quota, a subagent budget and
     /// fast mode's fallback are no wall at all, in the gutter or the footer.
+    ///
+    /// So is the row of a `/compact` that FAILED — `Compaction failed · …`,
+    /// `Error during compaction: …`, drawn under the `❯ /compact` echo with no
+    /// done row after it: the context is as full as it was, and read as no
+    /// wall the supervisor took the failure for a
+    /// compaction that worked. Claude Code 2.1.286's own screens (MEASURED
+    /// 2026-10-01). NEGATIVE CONTROLS: `Compacted (ctrl+o to see full
+    /// summary)` and a person's `/compact` on a chat with `Not enough
+    /// messages to compact.` are no wall.
     #[test]
     fn context_is_its_own_wall_and_the_quota_notices_are_none() {
         const CONTEXT: &str = "Context limit reached · /compact or /clear to continue";
@@ -1173,6 +1587,77 @@ mod tests {
             let r = framed(&["⏺ Fanning out.", &format!("  ⎿  {quota}"), ""], FOOTER);
             assert_eq!(wall(&r), None, "{quota}");
             assert_eq!(worker_phase(&r), Phase::Idle, "{quota}");
+        }
+        // The screens of a full context and of its `/compact`.
+        for (name, capture, notice) in [
+            (
+                "the wall",
+                CONTEXT_WALL_MEASURED,
+                Some("Context limit reached · /compact or /clear to continue"),
+            ),
+            (
+                "a failed /compact",
+                COMPACT_FAILED_FIRST_MEASURED,
+                Some(
+                    "Compaction failed · conversation could not be reduced below the context limit",
+                ),
+            ),
+            (
+                "the third failure in a row",
+                COMPACT_FAILED_3_MEASURED,
+                Some(
+                    "Compaction failed · conversation could not be reduced below the context limit",
+                ),
+            ),
+            (
+                "a /compact whose request failed, wrapped",
+                COMPACT_ERROR_500_MEASURED,
+                Some("Error during compaction: API Error: 500 Internal server error."),
+            ),
+            ("a compaction that worked", COMPACT_SUCCEEDED_MEASURED, None),
+            ("nothing to compact", COMPACT_NOT_ENOUGH_MEASURED, None),
+            (
+                "the wall with `/compact` typed and the slash menu open (2.1.292)",
+                CONTEXT_WALL_COMPACT_MENU_MEASURED,
+                Some("Context limit reached · /compact or /clear to continue"),
+            ),
+        ] {
+            let r = screen(capture);
+            let found = wall(&r);
+            match (notice, found) {
+                (Some(head), Some(w)) => {
+                    assert_eq!(
+                        (w.kind, w.placement),
+                        (WallKind::Context, Placement::Gutter),
+                        "{name}"
+                    );
+                    assert!(w.message.starts_with(head), "{name}: {}", w.message);
+                }
+                (None, None) => {}
+                (want, got) => panic!("{name}: wanted {want:?}, read {got:?}"),
+            }
+            assert_eq!(limit_notice(&r), None, "{name}");
+            assert_eq!(worker_phase(&r), Phase::Idle, "{name}");
+        }
+        // The detail of a failed compaction wins where it names a wall with an
+        // answer of its own: a lost login met by `/compact` is still a lost login
+        // (measured: the wrapper first read as Context hid both, and the
+        // supervisor retried `/compact` for ever instead of `/login`).
+        for (text, kind) in [
+            (
+                "Error during compaction: Invalid API key · Fix external API key",
+                WallKind::Auth,
+            ),
+            (
+                "Error during compaction: Credit balance is too low",
+                WallKind::Spend,
+            ),
+            (
+                "Error during compaction: API Error: Connection to the API was lost (ECONNRESET).",
+                WallKind::Context,
+            ),
+        ] {
+            assert_eq!(classify_wall(text), Some(kind), "{text}");
         }
     }
 
@@ -1267,9 +1752,8 @@ mod tests {
     /// the hint column: at aterm's default 80 columns it starts at column 3.
     /// Under a status row every row down to the top rule is the live zone —
     /// no transcript row sits there — so there it is read at every width it
-    /// fits, 80 included, where the first cut of this reader read nothing
-    /// (the review of 2026-09-24: `None` at 82 columns or fewer, however
-    /// busy the spinner over it).
+    /// fits, 80 included (a column-6 floor reads `None` at 82 columns or
+    /// fewer, however busy the spinner over it).
     #[test]
     fn the_memory_banner_reads_at_every_width_under_a_spinner() {
         use crate::prompt::fixtures::MEMORY_BANNER_BUSY;
@@ -1773,5 +2257,55 @@ mod tests {
             FOOTER,
         );
         assert_eq!(wall(&longer), None, "only the whole row");
+    }
+
+    /// THE DRIFT CANARY FOR THE PHRASE TABLE. The reader names a wall by
+    /// [`PHRASES`], and a vendor build that words a notice differently reads
+    /// as no wall — behind a shell, as `busy` for as long as the shell runs.
+    /// Every row (lowercased) must be in the
+    /// store claude's binary, but for the rows older builds carry and neither
+    /// 2.1.283 nor 2.1.284 does (measured). It RUNS wherever a binary is found
+    /// (`$ATERM_CLAUDE_BIN`, else `aterm pkg which claude`), so the next gate
+    /// after a build lands names what moved; without a binary it says so
+    /// loudly and returns — a canary that could not look has not passed.
+    #[test]
+    fn every_wall_phrase_is_in_the_store_claude() {
+        /// Rows of [`PHRASES`] that older builds carry and 2.1.283 and 2.1.284
+        /// do not (`strings -a` of both, 2026-09-28).
+        const OLDER_BUILDS: &[&str] = &[
+            "repeated overloaded errors",
+            "weekly rate limit",
+            "seven-day limit",
+            "haiku limit",
+            "reached your limit",
+            "limit will reset",
+        ];
+        let path = crate::anchors::canary_binary("claude", "ATERM_CLAUDE_BIN");
+        let Some(bytes) = path
+            .and_then(|p| std::fs::read(p).ok())
+            .filter(|bytes| crate::anchors::looks_like_a_build(bytes))
+        else {
+            eprintln!(
+                "CANARY NOT RUN: no claude binary found (set ATERM_CLAUDE_BIN, or `aterm pkg \
+                 install claude`) — the wall phrases are NOT checked against a build"
+            );
+            return;
+        };
+        let lower = bytes.to_ascii_lowercase();
+        // The vendor draws `\u{b7}` and `\u{2019}` from escapes, and drops
+        // number tokens from a notice's head before the table reads it.
+        let missing: Vec<&str> = PHRASES
+            .iter()
+            .map(|(p, _)| *p)
+            .filter(|p| !OLDER_BUILDS.contains(p))
+            .filter(|p| {
+                !crate::anchors::contains_bytes(&lower, p.replace('\'', "\u{2019}").as_bytes())
+                    && !crate::anchors::contains_bytes(&lower, p.as_bytes())
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "wall phrases the store claude no longer carries: {missing:?}"
+        );
     }
 }

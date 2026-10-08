@@ -17,9 +17,9 @@ fn beam_parses_to_its_own_style() {
     assert!(GlowStyle::Beam.has_particles());
 }
 
-/// A jumped BEAM is ONE SOLID ROD spanning the whole leap (the full-vector
-/// rule it shares with laser) — no lightning bolts, only a modest wake of
-/// weightless stardust — and it drains to exactly empty.
+/// A jumped beam is one solid rod spanning the whole leap (the full-vector
+/// rule it shares with laser), with no lightning bolts and only a modest wake
+/// of weightless stardust, and it drains to exactly empty.
 #[test]
 fn beam_jump_is_one_clean_full_vector_rod() {
     let g = geom();
@@ -70,11 +70,9 @@ fn beam_jump_is_one_clean_full_vector_rod() {
     assert_eq!(fp, 0, "the rod decays to exactly empty");
 }
 
-/// POWER-DOWN LAW: past its full-power hold the rod THINS — the lit
-/// vertical extent at the rod's midpoint collapses toward a hairline as
-/// the brightness dies, so the switch-off reads as one object powering
-/// down (every bloom layer is a multiple of `core_thick`, so the extent
-/// tracks the collapse).
+/// Power-down law: past its full-power hold the rod thins, the lit vertical
+/// extent at its midpoint collapsing toward a hairline as brightness dies
+/// (every bloom layer is a multiple of `core_thick`).
 #[test]
 fn beam_powers_down_thinner() {
     let g = geom();
@@ -115,8 +113,8 @@ fn beam_powers_down_thinner() {
     );
 }
 
-/// TYPING CONTINUITY: at a human cadence the tube never goes dark between
-/// keys — the chained spark lifetimes keep the rod lit mid-rhythm.
+/// Typing continuity: at a human cadence the tube never goes dark between
+/// keys; chained spark lifetimes keep the rod lit mid-rhythm.
 #[test]
 fn beam_typing_never_goes_dark_mid_rhythm() {
     let g = geom();
@@ -136,9 +134,8 @@ fn beam_typing_never_goes_dark_mid_rhythm() {
             &mut out,
         );
         if i > 1 {
-            // Since the stardust law the wake's body rides the HALO
-            // stream (round motes); the quad stream carries the rod and
-            // the dealt star accents. Lit is lit on either channel.
+            // The wake's body rides the halo stream (round motes); the quad
+            // stream carries the rod and the dealt star accents. Either counts.
             assert!(
                 lum(&out) > 0 || !glow.halos().is_empty(),
                 "key {i}: the rod went dark inside a 150ms rhythm"
@@ -150,9 +147,9 @@ fn beam_typing_never_goes_dark_mid_rhythm() {
     }
 }
 
-/// COOL-LIGHT LAW: with the photon ice-blue default the whole tube — body,
-/// sheen, halo, white-mixed specular axis — keeps blue at least as strong
-/// as red on every emitted quad, across spawn and power-down frames.
+/// Cool-light law: with the ice-blue default the whole tube (body, sheen,
+/// halo, white-mixed specular axis) keeps blue at least as strong as red on
+/// every emitted quad, across spawn and power-down frames.
 #[test]
 fn beam_stays_cool_light() {
     let g = geom();

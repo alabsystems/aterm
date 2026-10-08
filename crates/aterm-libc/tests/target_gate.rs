@@ -1,64 +1,27 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! TARGET-GATE PARITY: every triple this repository configures a build lane for must be a
+//! Target-gate parity: every triple this repository configures a build lane for must be a
 //! cell `crates/aterm-libc/src/lib.rs` accepts.
 //!
-//! THE CLASS THIS GUARDS. `libc` is at the bottom of aterm's graph, so its target gate is the
-//! FIRST thing a cross build meets and the last word on which triples exist. The gate is a
-//! closed list ending in `compile_error!`, on purpose — an unlisted target must stop rather
-//! than inherit some other cell's numbers. The cost of a closed list is that adding a lane
-//! somewhere else in the repo does not add a cell here, and the failure is not subtle: the
-//! lane dies on line one of the graph, before a single line of the platform code it was
-//! opened to validate is read. Nothing about the lane's own configuration looks wrong
-//! afterwards, which is why it can stay dead for days.
+//! `libc` is the bottom of the graph and its gate is a closed list ending in
+//! `compile_error!`, so a lane added elsewhere without a cell here dies before any platform
+//! code is read, while its own configuration looks fine (`x86_64-pc-windows-gnu` sat dead
+//! that way from the libc swap until 2026-09-16).
 //!
-//! IT DID. `.cargo/config.toml` has carried a `[target.x86_64-pc-windows-gnu]` linker/ar pair
-//! for the Windows cfg-validation cross-build since long before this crate existed, and
-//! `rust-toolchain.toml` names that build among the lanes that ride upstream stable. When
-//! aterm's first-party `libc` replaced the crates.io package, `x86_64-pc-windows-gnu` was not
-//! among the cells it listed, and the lane died on this gate. `crates/aterm/Cargo.toml` had
-//! recorded it as "dead since the libc swap" — a comment, read by nobody with a compiler.
-//! Measured on x86_64 Linux, 2026-09-16, at the commit before this file:
+//! Lanes are read from committed configuration:
 //!
-//! ```text
-//! $ cargo +stable check --target x86_64-pc-windows-gnu -p aterm
-//! error: aterm-libc has no generated ABI cell for this target
-//!   --> crates/aterm-libc/src/lib.rs:129:1
-//! error: could not compile `libc` (lib) due to 1 previous error
-//! ```
+//!   * `.cargo/config.toml` — every `[target.<triple>]` table (`cfg(...)` tables skipped);
+//!   * `crates/aterm-forge/src/resolve.rs` — the `default_cells()` triples (`xtask gate
+//!     cells`);
+//!   * `tools/cross-cell-gate.tsv` — the triple column of every `cshim` row.
 //!
-//! THE LAW. Read the triples this repository names as build lanes out of its own committed
-//! configuration, and require the gate to accept every one of them:
+//! One-directional: a cell no lane names (`x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`,
+//! whose lanes live in release scripts) is not a violation.
 //!
-//!   * `.cargo/config.toml` — every `[target.<triple>]` table (the `cfg(...)` tables are not
-//!     triples and are skipped). A linker or an `ar` configured for a triple is this repo
-//!     saying it builds for that triple.
-//!   * `crates/aterm-forge/src/resolve.rs` — the `default_cells()` triples, which is what
-//!     `xtask gate cells` really compiles.
-//!   * `tools/cross-cell-gate.tsv` — the triple column of every `cshim` row, each of which
-//!     exists so that a named triple can be type-checked on a box without its C toolchain.
-//!
-//! ONE-DIRECTIONAL, deliberately. A cell the gate accepts and no lane names is not a
-//! violation: `x86_64-apple-darwin` (the release's compat slice) and
-//! `aarch64-unknown-linux-gnu` are real targets whose lanes live in `aterm-release`'s build
-//! plan and in the shipped Linux release script rather than in a config table, and a law that
-//! demanded a `[target.…]` entry for them would be a law about where lanes are written down.
-//! The direction that has teeth is the one that was violated.
-//!
-//! SCOPE AND LIMITS, said out loud so a green run is not read as more than it is:
-//!
-//!   * This is a STRING law over committed text, not a compile. It proves the gate would not
-//!     reject the lane; it does not prove the lane builds. `xtask gate cells` is the repo's
-//!     authority on that and stays it — this file is the cheap standing guard that rides
-//!     along with `cargo test` on whatever box the change is being written on, the same
-//!     bargain `crates/atpkg/tests/platform_cfg_parity.rs` states for its own class.
-//!   * The triple is decomposed the way rustc spells its `target_*` cfgs
-//!     (`<arch>-<vendor>-<os>[-<env>]`, `darwin` reading as `macos`), because the gate is
-//!     written in those cfgs and a triple is the only thing the lanes write down. A cell
-//!     predicate this file cannot parse is treated as MATCHING NOTHING, so an unreadable gate
-//!     fails loudly rather than passing vacuously.
-//!   * Only this crate's gate. The class is repo-wide; this is where a lane dies first.
+//! This is a string check over committed text, not a compile; `xtask gate cells` proves the
+//! lane builds. Triples decompose the way rustc spells `target_*` cfgs (`darwin` reads as
+//! `macos`), and a gate arm this file cannot parse matches nothing, so it fails loudly.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -314,12 +277,9 @@ fn every_configured_build_lane_is_a_cell_this_crate_accepts() {
     }
     assert!(
         dead.is_empty(),
-        "these triples have a build lane in this repository and NO cell in \
-         crates/aterm-libc/src/lib.rs, so every build of that lane dies on `aterm-libc has no \
-         generated ABI cell for this target` before one line of platform code is read:\n{}\n\n\
-         Add the cell to the `#[cfg(not(any(…)))]` list. A Windows or wasm cell needs no \
-         generated module — nothing in aterm's graph names a libc item there — but it does \
-         need to be LISTED, because the list is the whole of the policy.",
+        "build lanes with no cell in crates/aterm-libc/src/lib.rs (their builds stop at its \
+         compile_error!):\n{}\n\
+         Add each to the `#[cfg(not(any(…)))]` list; a Windows or wasm row needs no module.",
         dead.join("\n")
     );
 }
@@ -330,8 +290,8 @@ fn the_scan_still_sees_the_gate() {
     let cells = gate_cells();
     assert!(
         cells.len() >= 6,
-        "the gate parser found only {} cell(s) in crates/aterm-libc/src/lib.rs; it has carried \
-         at least six since the Windows-gnu cell landed. The parser or the gate changed shape.",
+        "gate parser found {} cell(s) in crates/aterm-libc/src/lib.rs, expected at least 6; \
+         the parser or the gate changed shape",
         cells.len()
     );
     assert!(
@@ -348,8 +308,7 @@ fn the_scan_still_sees_the_gate() {
     ] {
         assert!(
             !triples.is_empty(),
-            "no build-lane triple was read out of {source}; the reader is broken or the file \
-             changed shape, and a lane list that silently empties makes this guard vacuous"
+            "no build-lane triple read from {source}; the reader or the file changed shape"
         );
         for t in &triples {
             assert!(
@@ -362,24 +321,20 @@ fn the_scan_still_sees_the_gate() {
 
 #[test]
 fn the_law_can_say_no() {
-    // The matcher must be able to REFUSE, or a green run means nothing. The example has to
-    // be a triple this product genuinely does not ship: `aarch64-pc-windows-msvc` was the
-    // original one, and it stopped being honest the day that cell landed (2026-09-17) —
-    // which is exactly the trap this assertion exists to catch, so it now names two triples
-    // no lane, no cell and no artifact row in this repository mentions.
+    // The matcher must be able to refuse, or a green run means nothing. The refused triples
+    // must be ones no lane, cell or artifact row in this repository names.
     let cells = gate_cells();
     for refused in ["i686-unknown-linux-gnu", "aarch64-pc-windows-gnu"] {
         let facts = facts_of(refused).expect("a four-field triple decomposes");
         assert!(
             !cells.iter().any(|c| c.admits(&facts)),
-            "the gate now accepts `{refused}`. If that is deliberate, this test is the place \
-             to say so — and `the_law_can_say_no` needs a different refused triple."
+            "the gate now accepts `{refused}`; if deliberate, pick a different refused triple"
         );
     }
     let x64_win_gnu = facts_of("x86_64-pc-windows-gnu").expect("a four-field triple decomposes");
     assert!(
         cells.iter().any(|c| c.admits(&x64_win_gnu)),
-        "the gate no longer accepts x86_64-pc-windows-gnu — the cell this file was written for"
+        "the gate no longer accepts x86_64-pc-windows-gnu"
     );
 }
 

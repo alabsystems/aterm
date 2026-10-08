@@ -3,6 +3,10 @@
 
 [package]
 name = "aterm-types"
+# Integration tests are declared below, not discovered: every file is a module
+# of the one `types_suite` binary. With autotests off a `tests/*.rs` file listed
+# nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,24 +21,17 @@ serde = ["dep:serde"]
 # buildplan pins it). Declared here because `dev_seam!` reads the CALLING crate's
 # `dev-seams` feature, and this crate's own test calls it.
 dev-seams = []
-# NO PLATFORM FEATURE LIVES HERE, and that is load-bearing. The K-2 winit->engine
-# key map used to sit behind an optional `winit-keymap = ["dep:winit"]` feature
-# whose comment promised that "the FFI/bridge consumers of aterm-types never pull
-# winit". Cargo unifies features across a workspace resolve, so `cargo build
-# --workspace` enabled it for every consumer and `aterm-ctl` — which declares
-# only aterm-types + aterm-uds — linked AppKit/Carbon/ApplicationServices/
-# CoreGraphics/CoreVideo/CoreFoundation/Foundation/libobjc, ~1.7 ms of dyld work
-# per exec before `main`, on a route that calls none of it. The map now lives in
-# its own crate (`crates/aterm-winit-keymap`), which is the version of that
-# promise Cargo can actually keep. Adding an optional platform dependency back to
-# THIS manifest re-opens the hole for every consumer at once; put it in a crate
-# of its own instead.
+# NO PLATFORM FEATURE LIVES HERE. Cargo unifies features across a workspace
+# resolve, so an optional platform dependency here links into every consumer
+# (an optional winit dep once cost `aterm-ctl` ~1.7 ms of AppKit dyld work per
+# exec). Put platform code in a crate of its own, as `aterm-winit-keymap` is.
 
 [dependencies]
 aterm-alloc = { workspace = true }
-aterm-error = { workspace = true }
-# F11-4 (#7941): MutexExt::lock_or_recover logs poison recoveries so
-# silently-recovered poisoning is never invisible to observability.
+# FNV-1a/64 for `RowsFence::hash_rows`, the screen's `hash=` stamp, which must be
+# the one hash the server and every client compute. Dependency-free.
+aterm-hash = { workspace = true }
+# MutexExt::lock_or_recover logs each poison recovery.
 aterm-log = { workspace = true }
 # Internal clock seam: std::time on native (byte-identical), JS clock on wasm32 so
 # `current_time_ms()` doesn't panic "time not implemented".
@@ -43,7 +40,10 @@ serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
-proptest = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "types_suite"
+path = "tests/types_suite.rs"

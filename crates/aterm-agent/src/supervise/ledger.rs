@@ -1,40 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive ledger`: how the manager loop ran, replayed — the owner asked
-//! for "some kind of way to visualize how you are seeing messages and
-//! managing". One timeline joins four sources:
+//! `aterm drive ledger`: how the manager loop ran, replayed as one timeline
+//! joining four sources:
 //!
-//! 1. the WORKER's turn ledger (`history`): every turn the manager typed,
-//!    when it started, how long the `turn` verb took, how it settled;
-//! 2. the watcher's JOURNAL (`watch --journal`, [`super::journal`]), when
-//!    given: every EVENT, APPROVED, DISMISSED, RECONNECT, TIMEOUT and EXIT
-//!    line, with the Unix time it was printed;
-//! 3. the MANAGER's fabric mail with that worker: this session's `inbox
-//!    --peek --meta` rows from it and the `post` rows of this session's
-//!    `timeline` addressed to it (read without listing or handling anything);
-//! 4. for each turn, the size of the worker's reply in rows, from ONE
-//!    `offscreen tail=… screen=1` read joined the way `report` joins it: the
-//!    rows from the turn's `❯` row to the next turn's.
+//! 1. the worker's turn ledger (`history`): every turn the manager typed, when
+//!    it started, how long it took, how it settled;
+//! 2. the watcher's journal (`watch --journal`, [`super::journal`]), when
+//!    given, with the Unix time each line was printed;
+//! 3. the manager's fabric mail with that worker (`inbox --peek --meta` and
+//!    `timeline` rows, read without handling anything);
+//! 4. each turn's reply size in rows, from one `offscreen tail=… screen=1`
+//!    read joined the way `report` joins it.
 //!
-//! The ledger, the inbox and the timeline are stamped by the aterm process's
-//! own clock (milliseconds since it started its clock, not wall time); the
-//! journal by the wall clock. They are put on one axis by where each process
-//! started its clock, which the HOST says ([`LedgerHost::anchor`]; the CLI
-//! uses the birth time of the instance's control socket — measured on
-//! 2026-09-14 within 0.12 s of the fabric bus's own wall-clock stamps on the
-//! same messages, where the process's start time was 5.3 s early). A turn
-//! carried from an earlier process by a self-update (`carried=1`) is on that
-//! process's clock, and has no time here.
-//!
-//! A source that cannot be read is named in SOURCES and the rest is printed.
+//! The ledger, inbox and timeline are stamped by the aterm process's own clock
+//! (milliseconds since it started its clock); the journal by the wall clock.
+//! They share an axis through the process's clock anchor
+//! ([`LedgerHost::anchor`]; the CLI uses the control socket's birth time). A
+//! turn carried from an earlier process by a self-update (`carried=1`) has no
+//! time here. A source that cannot be read is named in SOURCES and the rest is
+//! printed.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use super::journal::{JournalRecord, json_str, read_journal};
 use super::limit::{civil, days_from_civil};
-use super::mail::{bare_sid, field};
+use super::mail::{bare_sid, field, is_from_session};
 use super::report::{
     MARKER_CHARS, Mark, OffscreenError, PASTED, decimal, is_user_row, join, parse_offscreen,
     paste_fits, paste_like, pct_decode, user_text, without_verb,
@@ -198,14 +190,15 @@ pub struct Mail {
 }
 
 /// The `inbox --peek --meta` rows from `worker` (`msg … t=<ms> from=<sid@node>
-/// kind=… trust=… len=…`) with their process-clock `t`, and the ids of the
-/// posts to it that have not landed (`post <id> to=… off=-`).
+/// kind=… trust=… len=…`, the whole principal: [`is_from_session`]) with their
+/// process-clock `t`, and the ids of the posts to it that have not landed
+/// (`post <id> to=… off=-`).
 fn inbox_rows(body: &str, worker: &str) -> (Vec<(u64, Mail)>, Vec<u64>) {
     let mut got = Vec::new();
     let mut pending = Vec::new();
     for row in body.lines() {
         if row.starts_with("msg ") {
-            if field(row, "from").map(bare_sid) != Some(worker) {
+            if !field(row, "from").is_some_and(|from| is_from_session(from, worker)) {
                 continue;
             }
             let t = field(row, "t").and_then(decimal);
@@ -221,7 +214,7 @@ fn inbox_rows(body: &str, worker: &str) -> (Vec<(u64, Mail)>, Vec<u64>) {
                 },
             ));
         } else if let Some(rest) = row.strip_prefix("post ")
-            && field(row, "to").map(bare_sid) == Some(worker)
+            && field(row, "to").map(bare_sid) == Some(bare_sid(worker))
             && let Some(id) = rest.split(' ').next().and_then(decimal)
         {
             pending.push(id);
@@ -503,7 +496,7 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     match ask(ctl, &["@self", "inbox", "--peek", "--meta"]) {
         Ok(r) => {
             mail_ok = true;
-            let (got, pending) = inbox_rows(&r.stdout, &worker);
+            let (got, pending) = inbox_rows(&r.stdout, &opts.worker);
             mail_notes.push(format!("{} message(s) from {at} in the inbox", got.len()));
             mail.extend(got.into_iter().map(|(t, m)| Mail {
                 t: Some(place(manager_epoch, t)),
@@ -547,17 +540,12 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     }
     mail.sort_by_key(|m| m.t);
 
-    // When the worker stopped: the first EVENT that ended on words after
-    // each turn began, before the next one did.
+    // When the worker stopped: the first EVENT that ended on words after each
+    // turn began, before the next one did.
     //
-    // ONLY WITH A CLOCK. `turn.t` is a PROCESS-clock stamp placed on an epoch;
-    // without an anchor that epoch is the `fallback` above (the newest turn
-    // read is taken as now, so the ORDER still reads), while a journal record's
-    // `t` is a wall clock the watcher wrote. `stopped - t` across those two is
-    // not a duration, and the summary's `working` span, the TIMELINE's
-    // `working <span>` and the HTML's long bar would all print it as one —
-    // while `manager latency` on the same render says the clock could not be
-    // placed. What cannot be placed claims no latency, here too.
+    // Only with a clock: without an anchor `turn.t` is a process-clock stamp
+    // on a fallback epoch, so `stopped - t` against the journal's wall clock is
+    // not a duration. What cannot be placed claims no latency.
     let starts: Vec<Option<i64>> = turns.iter().map(|t| t.t).collect();
     for (i, turn) in turns.iter_mut().enumerate().filter(|_| aligned) {
         let Some(start) = turn.t else { continue };
@@ -595,12 +583,11 @@ fn ended_on_words(phase: &str) -> bool {
     )
 }
 
-/// The worker's reply to each turn, in rows: ONE `offscreen tail=<n> max=<n>
+/// The worker's reply to each turn, in rows: one `offscreen tail=<n> max=<n>
 /// screen=1` read, joined as `report` joins it; each turn's `❯` row found by
 /// its text (the first 60 characters, whitespace aside, or a `[Pasted text …]`
 /// row that fits), in order; a reply is its rows down to the next turn's row
-/// found (to the transcript's end for the last), blank rows at its end
-/// aside.
+/// (to the transcript's end for the last), trailing blank rows aside.
 type ReplySize = (Result<usize, String>, Vec<u64>);
 
 fn reply_sizes<C: Ctl>(
@@ -1069,7 +1056,7 @@ pub struct Item {
     pub what: String,
     /// The whole of it (the HTML's hover).
     pub full: String,
-    /// The DURATION/LATENCY column.
+    /// The duration/latency column.
     pub dur: String,
     /// A turn's bar: where the `turn` verb settled.
     pub end: Option<i64>,

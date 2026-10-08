@@ -1,30 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REGRESSION: an in-session update refused to apply — on every release, on
-//! every attempt, until a hand restart — on any desk where a full-screen app
-//! had been started from a shell prompt on the LAST row and the grid then
-//! lost a row.
+//! A saved cursor below the last row survives a checkpoint.
 //!
-//! Measured 2026-09-22 on the owner's daily driver (v0.87.0 → v0.90.0, six
-//! refusals in the log, every one `session N: meta out of bounds at 55x149
-//! with 0 carried line(s)`): the "update staged" status bar takes one row of
-//! chrome, so every 56-row session was 55 rows when the park ran. The Claude
-//! Code tab had entered the alternate screen (1049, which saves the cursor
-//! into the main DECSC slot exactly as DECSC does) from a prompt on row 55.
-//! The engine, like xterm, never touches that slot on a resize and clamps only
-//! when DECRC or the 1049 exit finally reads it (`Grid::set_cursor`) — so the
-//! checkpoint honestly carried `saved_cursor_main.cursor_row == 55` at
-//! `rows == 55`, and the handoff wire's predicate demanded every saved cursor
-//! strictly inside the grid.
+//! An app that enters the alternate screen (1049 saves the cursor into the
+//! main DECSC slot) from a prompt on the last row, followed by a one-row
+//! shrink, leaves the slot one row past the grid. Like xterm, the engine never
+//! touches the slot on resize and clamps only when DECRC or the 1049 exit
+//! reads it (`Grid::set_cursor`). So the checkpoint carries the slot raw, and
+//! the handoff wire bounds a DECSC slot by the engine's ceiling
+//! (`seamless::checkpoint_meta_bound_violation`), not by the grid.
 //!
-//! The wire's bound on a DECSC slot is now the engine's ceiling (see
-//! `seamless::checkpoint_meta_bound_violation`), and the slot travels RAW.
-//! This fix's first draft clamped the slot at capture instead; it was measured
-//! lossy — the successor grows back to 56 rows seconds after Commit and its
-//! 1049 exit then landed one row above the live engine's — and the tests
-//! below pin the raw carry, the same-size parity AND the grow-back parity that
-//! draft would have failed.
+//! Clamping at capture would be lossy: a successor that grows back would
+//! restore the cursor one row above the live engine's. The tests pin the raw
+//! carry, same-size parity and grow-back parity.
 
 use aterm_core::terminal::Terminal;
 
@@ -33,7 +22,7 @@ const COLS: u16 = 149;
 /// The producer's real carry target (`seamless::max_handoff_history_lines`).
 const CARRY: usize = 256;
 
-/// A 56-row primary screen with the shell prompt on its LAST row, as a tab
+/// A 56-row primary screen with the shell prompt on its last row, as a tab
 /// that has scrolled looks when `claude` is typed into it.
 fn prompt_on_the_last_row() -> Terminal {
     let mut t = Terminal::new(ROWS, COLS);
@@ -45,9 +34,9 @@ fn prompt_on_the_last_row() -> Terminal {
     t
 }
 
-/// The desk itself: 1049 from the last row, then the one-row shrink the
-/// status bar causes. The checkpoint carries the slot as the engine holds it
-/// — on a row the grid no longer has — and that is the state the wire admits.
+/// 1049 from the last row, then a one-row shrink: the checkpoint carries the
+/// slot as the engine holds it, on a row the grid no longer has, and the wire
+/// admits it.
 #[test]
 fn a_shrink_after_entering_the_alternate_screen_carries_the_saved_cursor_raw() {
     let mut t = prompt_on_the_last_row();
@@ -106,7 +95,7 @@ fn a_shrink_carries_the_alternate_screen_saved_cursor_raw() {
     assert_eq!(saved.cursor_row, ROWS - 1);
 }
 
-/// SAME-SIZE PARITY. Read at the shrunken size, the raw slot is clamped by
+/// Same-size parity. Read at the shrunken size, the raw slot is clamped by
 /// the 1049 exit on both engines: the live one and one restored from the
 /// checkpoint land on the same cell, the new last row.
 #[test]
@@ -124,7 +113,7 @@ fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_at_the_sam
     assert_eq!(live.cursor().row, ROWS - 2);
 }
 
-/// GROW-BACK PARITY — the production sequence. The outgoing process parks at
+/// grow-back parity — the production sequence. The outgoing process parks at
 /// 55 rows; the successor restores at 55, its "finishing" bar folds seconds
 /// later and every session grows back to 56; the user quits the full-screen
 /// app. The slot was saved on row 55 and the grid has row 55 again, so the

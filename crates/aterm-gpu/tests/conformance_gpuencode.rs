@@ -1,32 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Tier-1 trace conformance: bind the REAL frame-encode slice-precondition decision
-//! to the external `GpuEncode.tla` design spec (TRUST_NATIVE_TLA Phase 2, GPU
-//! FRAME-ENCODE safety).
+//! Tier-1 trace conformance: binds the real frame-encode slice decision to
+//! the `GpuEncode.tla` design spec.
 //!
-//! `GpuEncode.tla` is model-checked in the abstract by aterm-spec-models'
-//! `model_check.rs` (Tier-0: it proves `NeverSliceEmpty` — a bg vertex buffer is
-//! sliced/bound ONLY when it holds ≥1 instance — and catches the unconditional-slice
-//! panic at `Buggy=TRUE`). This test ties that to the code that runs: the bg-instance
-//! `Encode` step calls `bg_buf.slice(..)` exactly when [`aterm_gpu::should_slice`]
-//! (the real gate inside `InstanceBuf::upload`, refactored to be GPU-free) returns
-//! `true`. The FULL GPU encode needs a live wgpu device (so it cannot be driven
-//! headlessly in CI), but the slice DECISION — which IS the modeled property — is
-//! pure, so we drive it directly: build a trajectory of `Append` steps (the CPU cell
-//! walk pushing one `BgInstance` per non-default-bg cell) followed by an `Encode`
-//! whose `sliced` is the REAL `should_slice(bgInst * stride)`, and `ty trace validate
-//! --spec` each transition against `GpuEncode`'s `Next`.
+//! aterm-spec-models' `model_check.rs` checks `GpuEncode.tla` in the abstract
+//! (`NeverSliceEmpty`: a bg vertex buffer is sliced only when it holds ≥1
+//! instance; `Buggy=TRUE` catches an unconditional slice). Here the `Encode`
+//! step's `sliced` is the real [`aterm_gpu::should_slice`] (the GPU-free gate
+//! inside `VertexBuffer::upload_via` and the Metal `upload_stream`), driven
+//! after a run of `Append` steps (one `BgInstance` per non-default-bg cell),
+//! and each transition is checked with
+//! `ty trace validate --spec` against `GpuEncode`'s `Next`.
 //!
-//! METHOD — strict per-transition validation: each transition is a 2-step trace with
-//! `Init` pinned to `prev` via a hardcoded-`Init` variant of the COMMITTED spec
-//! (mechanical `Init`-line rewrite; action/invariant bodies verbatim → no drift).
-//! TWO negative controls — (a) `Encode` of an EMPTY frame (`bgInst = 0`) that slices
-//! anyway (the 4ab4eb9 panic), and (b) an `Encode` that fails to slice a NON-empty
-//! frame — MUST be ty-REJECTED, so a pass is never vacuous.
+//! Each transition is a 2-step trace with `Init` pinned to `prev` via a
+//! rewritten `Init` line of the committed spec (actions and invariants
+//! verbatim). Two negative controls must be rejected: encoding an empty frame
+//! (`bgInst = 0`) that slices anyway, and a non-empty frame that fails to
+//! slice.
 //!
-//! `ty` is located by the same fixed canonical path search; absent `ty` the test
-//! FAILS (honesty ratchet, no skip path).
+//! Without `ty` installed the test reports that and returns.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,14 +29,10 @@ use aterm_spec::verify::ty_escalation;
 
 /// Spec `CONSTANT MaxCells` (from `GpuEncode.cfg`).
 const MAX_CELLS: i64 = 4;
-/// Bytes per `BgInstance` (the renderer's packed `rect:[u16;4] + color:[u8;4]`),
-/// so a non-empty `bgInst` count maps to a non-empty byte stream — the input
-/// `should_slice` actually sees in `InstanceBuf::upload(aterm_bits::cast_slice(&bg))`.
+/// Bytes per `BgInstance` (`rect:[u16;4] + color:[u8;4]`), so a non-empty
+/// `bgInst` maps to the non-empty byte stream `should_slice` sees in
+/// `VertexBuffer::upload_via(.., aterm_bits::cast_slice(&bg))`.
 const STRIDE: usize = 12;
-
-// VERIFICATION GATE (honesty ratchet, batteries-on) in `aterm_spec::verify`:
-// verification is always required — an absent Trust `ty` FAILS the test with the
-// install hint (`aterm pkg install ty`).
 
 /// Abstract spec state `<<bgInst, encoded, sliced>>`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -136,16 +125,15 @@ fn validate(
     )
     .expect("write cfg");
     std::fs::write(&trace_f, transition_trace(prev, next, action)).expect("write trace");
-    let out = Command::new(ty)
-        .arg("trace")
+    let mut cmd = Command::new(ty);
+    cmd.arg("trace")
         .arg("validate")
         .arg(&trace_f)
         .arg("--spec")
         .arg(&spec_f)
         .arg("--config")
-        .arg(&cfg_f)
-        .output()
-        .expect("run ty trace validate");
+        .arg(&cfg_f);
+    let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty trace validate");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -154,8 +142,8 @@ fn validate(
     (out.status.success(), combined)
 }
 
-/// Drive a frame: `n` Appends, then one Encode whose `sliced` is the REAL
-/// `should_slice` decision over the bg-instance byte stream. Returns the
+/// Drive a frame: `n` Appends, then one Encode whose `sliced` is the real
+/// `should_slice` over the bg-instance bytes. Returns the
 /// `(prev, next, action)` transitions.
 fn drive_frame(n: i64) -> Vec<(GeState, GeState, &'static str)> {
     let mut steps = Vec::new();
@@ -179,8 +167,8 @@ fn drive_frame(n: i64) -> Vec<(GeState, GeState, &'static str)> {
 
 #[test]
 fn real_gpu_encode_slice_decision_conforms_to_gpuencode_spec() {
-    // TIERED (VERIFY-1): a committed hand-written `.tla` — external-tool
-    // obligation; runs only where the Trust toolchain is installed.
+    // External-tool obligation on a committed `.tla`: runs only where `ty` is
+    // installed.
     let Some(ty) = ty_escalation("GpuEncode conformance") else {
         return;
     };
@@ -191,10 +179,9 @@ fn real_gpu_encode_slice_decision_conforms_to_gpuencode_spec() {
 
     let mut validated = 0usize;
 
-    // POSITIVE — both regimes:
-    //   * a ZERO-cell frame (the degenerate one that triggered the panic): 0 Appends,
-    //     then Encode → should_slice(0) == false → sliced stays FALSE (the FIX).
-    //   * non-empty frames (1..MaxCells fills): Encode → should_slice(>0) == true.
+    // Positive, both regimes:
+    //   * a zero-cell frame: Encode → should_slice(0) == false → not sliced;
+    //   * non-empty frames (1..MaxCells): Encode → should_slice(>0) == true.
     for n in 0..=MAX_CELLS {
         let steps = drive_frame(n);
         // Sanity: the real decision matches the modeled NeverSliceEmpty precondition.
@@ -215,8 +202,8 @@ fn real_gpu_encode_slice_decision_conforms_to_gpuencode_spec() {
         }
     }
 
-    // NEGATIVE CONTROL (a) — the 4ab4eb9 panic: Encode an EMPTY frame (bgInst=0) that
-    // slices anyway. `NeverSliceEmpty` forbids it; ty MUST reject.
+    // Negative control (a): encode an empty frame that slices anyway;
+    // `NeverSliceEmpty` forbids it.
     let empty = GeState {
         bg_inst: 0,
         encoded: false,
@@ -233,9 +220,8 @@ fn real_gpu_encode_slice_decision_conforms_to_gpuencode_spec() {
         "NEGATIVE CONTROL (slice an EMPTY bg buffer — the wgpu panic) MUST be rejected\n--- ty ---\n{o}"
     );
 
-    // NEGATIVE CONTROL (b) — the dual: a NON-empty frame whose Encode fails to slice
-    // (sliced=FALSE while bgInst>0). The committed `Encode` sets `sliced'=(bgInst>0)`,
-    // so a held-FALSE is not an admitted transition; ty MUST reject.
+    // Negative control (b): a non-empty frame whose Encode does not slice. The
+    // spec's `Encode` sets `sliced'=(bgInst>0)`, so this is not admitted.
     let two = GeState {
         bg_inst: 2,
         encoded: false,

@@ -212,8 +212,7 @@ pub const DECO_ATLAS_MAX_DIM: usize = 2048;
 
 /// Number of sprites in the shared deco atlas: the 7 sparkle-word glyphs plus
 /// the undercurl tile (slot [`UNDERCURL_SPRITE`]). The GPU const-asserts its
-/// sprite table against this so the layouts can never drift. (It was 9 until
-/// 2026-09-27, when the orca splash's droplet sprite went with the orca class.)
+/// sprite table against this so the layouts can never drift.
 pub const DECO_ATLAS_SPRITES: usize = 8;
 
 /// The undercurl's sprite slot in the shared deco atlas.

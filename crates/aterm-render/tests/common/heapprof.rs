@@ -213,10 +213,9 @@ impl Prof {
                 &raw mut hash,
             )
         } as usize;
-        let mut key: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut key = aterm_hash::FNV64_OFFSET;
         for f in frames.iter().take(n) {
-            key ^= *f as u64;
-            key = key.wrapping_mul(0x1000_0000_01b3);
+            key = aterm_hash::fnv_mix_u64(key, *f as u64);
         }
         {
             let mut st = lock();

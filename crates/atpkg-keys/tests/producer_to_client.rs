@@ -21,7 +21,7 @@
 //!   2. `bash tools/atpkg-index.sh` against that prefix — the actual shipping script, with
 //!      the actual `atpkg-keys` binary doing the signing.
 //!   3. `atpkg verify-index` over the emitted quad — the actual shipping client verifier,
-//!      invoked the way `docs/ATPKG-KEY-MANAGEMENT.md` tells an operator to invoke it.
+//!      invoked the way `docs/RELEASE-KEYS.md` tells an operator to invoke it.
 //!
 //! Step 3 is deliberately run by the TEST as well as by the script. If the two ever
 //! disagree about what the chain is, this file is what goes red.
@@ -37,11 +37,12 @@
 
 #![cfg(unix)]
 
-use std::io::Read as _;
-use std::os::unix::io::FromRawFd as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
+
+use crate::pty::Pty;
+
+use aterm_spec::wait::MUST_HAPPEN;
 
 /// Far enough out that no fixture here can go stale, and unambiguously synthetic.
 const FAR_FUTURE: &str = "2099-01-01T00:00:00Z";
@@ -88,11 +89,11 @@ fn atpkg_bin() -> PathBuf {
     p
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("atpkg-producer").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+fn scratch(name: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("atpkg-producer-{name}-"))
+        .tempdir()
+        .expect("scratch dir")
 }
 
 fn s(p: &Path) -> String {
@@ -109,119 +110,31 @@ fn unarmed_pins() -> &'static str {
      pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n"
 }
 
-// ---------------------------------------------------------------------------
-// A real controlling terminal, built rather than inherited.
-//
-// `atpkg-keys setup` refuses to run without one — it has a master to deliver and nowhere
-// to deliver it (see provision_cli.rs, which proves that refusal). A test harness's own
-// terminal is not a fixture, so this builds a pty pair and makes it the child's
-// controlling terminal while stdout stays a pipe.
-// ---------------------------------------------------------------------------
-
-static PTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct Pty {
-    master: std::fs::File,
-    slave: String,
-}
-
-impl Pty {
-    fn open() -> Self {
-        // `ptsname(3)` writes into a static buffer, so the open-and-name sequence is
-        // serialised rather than left to `cargo test`'s thread scheduling.
-        let _guard = PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the POSIX pty-opening sequence, each call checked. The only pointer we
-        // take is `ptsname`'s, and it is copied out before the lock is released.
-        unsafe {
-            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(fd >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
-            assert_eq!(libc::grantpt(fd), 0, "grantpt");
-            assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
-            let name = libc::ptsname(fd);
-            assert!(!name.is_null(), "ptsname");
-            let slave = std::ffi::CStr::from_ptr(name)
-                .to_str()
-                .expect("a pty path is ASCII")
-                .to_string();
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            Self {
-                master: std::fs::File::from_raw_fd(fd),
-                slave,
-            }
-        }
-    }
-
-    fn spawn(&self, home: &Path, args: &[&str]) -> Child {
-        let slave = std::ffi::CString::new(self.slave.clone()).expect("no NUL in a pty path");
-        let mut cmd = Command::new(keys_bin());
-        cmd.args(args)
-            .env("HOME", home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // SAFETY: everything in the hook is async-signal-safe (`setsid`, `open`, `ioctl`)
-        // and touches no state shared with the parent; `slave` lives in the closure.
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let fd = libc::open(slave.as_ptr(), libc::O_RDWR);
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::ioctl(fd, libc::c_ulong::from(libc::TIOCSCTTY), 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        cmd.spawn().expect("the atpkg-keys binary runs")
-    }
-
-    fn drain(&mut self, into: &mut String) {
-        let mut buf = [0u8; 4096];
-        loop {
-            match self.master.read(&mut buf) {
-                Ok(0) => return,
-                Ok(n) => into.push_str(&String::from_utf8_lossy(&buf[..n])),
-                // EAGAIN (nothing yet) and EIO (the child is gone) both mean stop.
-                Err(_) => return,
-            }
-        }
-    }
-
-    /// Type a line at the terminal, the way a human would.
-    fn type_line(&mut self, line: &str) {
-        use std::io::Write as _;
-        self.master
-            .write_all(line.as_bytes())
-            .and_then(|()| self.master.write_all(b"\n"))
-            .and_then(|()| self.master.flush())
-            .expect("typing at the terminal");
-    }
-}
+// `atpkg-keys setup` refuses to run without a controlling terminal — it has a master to
+// deliver and nowhere to deliver it (see provision_cli.rs, which proves that refusal) — so
+// it runs on the suite's pty fixture (`crate::pty`).
 
 /// `atpkg-keys setup --id <id>` inside `home`, on a terminal it does not have to inherit.
 /// Returns the run's stdout, which carries the master's PUBLIC key (the phrase itself goes
 /// to the terminal and nowhere else — proved in `provision_cli.rs`, relied on here).
 fn run_setup(home: &Path, id: &str, pins: &Path, roster: &Path) -> String {
     let mut pty = Pty::open();
-    let mut child = pty.spawn(
-        home,
-        &[
-            "setup",
-            "--id",
-            id,
-            "--pins",
-            &s(pins),
-            "--roster",
-            &s(roster),
-        ],
-    );
+    let mut cmd = Command::new(keys_bin());
+    cmd.args([
+        "setup",
+        "--id",
+        id,
+        "--pins",
+        &s(pins),
+        "--roster",
+        &s(roster),
+    ])
+    .env("HOME", home)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = pty.spawn(cmd);
     let mut terminal = String::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + MUST_HAPPEN;
     let mut retyped = false;
     loop {
         pty.drain(&mut terminal);
@@ -269,6 +182,8 @@ fn run_setup(home: &Path, id: &str, pins: &Path, roster: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 struct Prefix {
+    /// The scratch tree `home` names, removed when the test drops the prefix.
+    _scratch: aterm_tempfile::TempDir,
     home: PathBuf,
     pins: PathBuf,
     roster: PathBuf,
@@ -282,7 +197,8 @@ struct Prefix {
 impl Prefix {
     /// Everything `atpkg-keys setup` writes, plus a two-program spec for the indexer.
     fn provision(label: &str) -> Self {
-        let home = scratch(label);
+        let scratch = scratch(label);
+        let home = scratch.path().to_path_buf();
         let pins = home.join("pins.rs");
         std::fs::write(&pins, unarmed_pins()).expect("unarmed anchor fixture");
         let roster = home.join("dist/aterm-machines.toml");
@@ -309,6 +225,7 @@ impl Prefix {
         .expect("program spec");
 
         Self {
+            _scratch: scratch,
             out: home.join("out"),
             home,
             pins,
@@ -350,7 +267,7 @@ impl Prefix {
     /// `ROSTER` to the absolute `<repo>/dist/aterm-machines.toml`.
     ///
     /// That combination is one file under two spellings, and it is the shape
-    /// `docs/ATPKG-KEY-MANAGEMENT.md` tells an operator to use. `run_indexer` cannot reach
+    /// `docs/RELEASE-KEYS.md` tells an operator to use. `run_indexer` cannot reach
     /// it: it always passes an explicit `OUT` in a directory of its own, which is precisely
     /// why the default configuration was the one shape no test covered.
     ///
@@ -454,7 +371,7 @@ impl Prefix {
     }
 
     /// THE CLIENT'S OWN VERIFIER, over the four assets the producer staged for publication.
-    /// Exactly the invocation `docs/ATPKG-KEY-MANAGEMENT.md` gives an operator.
+    /// Exactly the invocation `docs/RELEASE-KEYS.md` gives an operator.
     fn client_verify(&self) -> Output {
         let roster = self.out.join("aterm-machines.toml");
         Command::new(atpkg_bin())
@@ -1324,11 +1241,8 @@ fn a_successful_publish_prints_no_absolute_home_path() {
         "these producer lines carry an absolute $HOME path into output meant for a public \
          repo:\n{leaked:#?}"
     );
-    // This used to pin ONE known out-of-scope leak (atpkg-keys' own `wrote <path>` line)
-    // so a second would surface here rather than in a pasted release note. That line is
-    // fixed — `sign` now collapses `$HOME` to `~` like every producer line — so the
-    // assertion is what it always wanted to be: NOTHING in the whole transcript carries
-    // an absolute home path.
+    // Nothing else in the transcript carries an absolute home path either (`sign`
+    // collapses `$HOME` to `~` like every producer line).
     let others: Vec<&str> = log
         .lines()
         .filter(|l| !l.starts_with("atpkg-index:") && !l.starts_with("atpkg-publish-lib:"))

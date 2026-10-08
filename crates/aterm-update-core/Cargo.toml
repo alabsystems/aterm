@@ -20,12 +20,13 @@ dev-seams = []
 # Reuse the single source-of-truth private-dir ownership predicate (no drift with
 # the control socket's Application Support hardening).
 aterm-types = { workspace = true }
+# The roster clock (`roster::now_unix`) reads the workspace's one epoch accessor.
+aterm-time = { workspace = true }
 # Route diagnostics through the global logger aterm-gui installs, so they land in
 # the app log file (visible for a Finder-launched .app, unlike stderr).
 aterm-log = { workspace = true }
 # The shared release-manifest wire type (src/manifest.rs): ONE serde struct the
-# publisher (crates/aterm-release) and the updater client both compile against,
-# so field agreement is compiler-enforced rather than hand-synced.
+# publisher (crates/aterm-release) and the updater client both compile against.
 serde = { workspace = true }
 aterm-toml = { workspace = true }
 # Ed25519 verification of the master-signed MACHINE ROSTER (src/roster.rs). The chain
@@ -39,12 +40,15 @@ aterm-toml = { workspace = true }
 # crate — and the `deny.toml` version floor already covers it.
 ring = { version = "0.17.14", default-features = false }
 # Decode the base64 master + machine Ed25519 public keys (32 raw bytes each).
-# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
-# to the retired `base64` package's `general_purpose::STANDARD` engine by
-# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
-# point every trust path uses: canonical padding REQUIRED and no trailing bits,
-# so a pinned key has exactly one spelling.
+# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# the entry point every trust path uses: canonical padding REQUIRED and no
+# trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
+# `aterm_uds::spawnfd::command`: the `Command` every child here is built with, so
+# none inherits a descriptor of this process above stdio (`tools/grep_guard.sh`
+# B27), and on Windows a caller with no console (the window) gives its curl and
+# certutil children a WINDOWLESS console instead of a visible one.
+aterm-uds = { workspace = true }
 
 # flock(2) for the apply/stage critical sections + getuid(2) for the private-dir
 # ownership check. The two narrow syscalls with no safe std wrapper (POSIX-only;
@@ -53,14 +57,15 @@ aterm-codec = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# The one trustd probe and skip line (`aterm_uds::deadline::trust_service_silent`).
+aterm-uds = { workspace = true, features = ["test-support"] }
 # The Linux binary-identity round-trip test reads its JSON back through the
 # workspace's own parser; the library itself writes no JSON.
 aterm-json = { workspace = true }
 # The roster tests must SIGN deterministic fixtures with obviously-synthetic seeds
 # (`Ed25519KeyPair::from_seed_unchecked` + `.sign`), which needs ring's `alloc` feature.
 # Re-declaring ring here with DEFAULT features pulls alloc into the TEST build only, so
-# the normal build still proves the no-alloc verify path compiles on its own. Mirrors
-# atpkg's arrangement exactly.
+# the normal build still proves the no-alloc verify path compiles on its own.
 ring = { version = "0.17.14" }
 
 [lints]

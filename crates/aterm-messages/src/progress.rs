@@ -67,8 +67,13 @@ pub struct ProgressTrack {
     last_advance: Option<Instant>,
     /// When the series began (its first reading), and how many readings
     /// since moved `done` forward: a count's own pace ([`COUNT_STALL_GAPS`]).
+    /// Every held phase's span is added to `began` when the phase ends, so the
+    /// pace is the count's own and never the plateau it sat through (ruling
+    /// 266).
     began: Option<Instant>,
     advances: u32,
+    /// When the held phase now running began (its first held reading).
+    held_from: Option<Instant>,
     projections: VecDeque<(Instant, Instant)>,
     anchor: Option<Instant>,
     /// How long past `anchor` the latch may stand with nothing new: the
@@ -98,9 +103,18 @@ impl ProgressTrack {
             self.anchor = None;
         }
         // A held phase ended (ruling 266): the count's patience restarts
-        // here, so the plateau it sat through is not read as a stall.
+        // here, so the plateau it sat through is not read as a stall — nor
+        // folded into the count's pace, which would stretch its patience by
+        // the plateau for every phase the pass holds.
         if self.unit == Some(Unit::HeldSteps) && a.unit != Unit::HeldSteps {
             self.last_advance = Some(now);
+            if let Some(from) = self.held_from.take() {
+                let held = now.saturating_duration_since(from);
+                self.began = self.began.and_then(|b| b.checked_add(held));
+            }
+        }
+        if a.unit == Unit::HeldSteps && self.held_from.is_none() {
+            self.held_from = Some(now);
         }
         self.unit = Some(a.unit);
         if let Some(n) = self.newest
@@ -234,7 +248,7 @@ impl ProgressTrack {
     /// stalled once bytes stopped for [`STALL_AFTER`]; the latched completion
     /// counting down, and `<5 s left` past it only for the overdue grace (the
     /// estimate ran out with nothing new: steps and items have no stall to
-    /// rescue them, review 2026-09-24); hidden otherwise.
+    /// rescue them); hidden otherwise.
     #[must_use]
     pub fn eta(&self, now: Instant) -> Eta {
         let Some(newest) = self.newest else {
@@ -257,9 +271,9 @@ impl ProgressTrack {
     /// When the stream reads "stalled" if nothing arrives, once it has moved
     /// at all: bytes [`STALL_AFTER`] after the last advance; a COUNT (steps,
     /// items) after [`COUNT_STALL_GAPS`] of its own mean gaps between
-    /// advances, never sooner than bytes (design ruling 265) — a count that
-    /// stopped used to count its estimate down to `<5 s left` at a frozen
-    /// fill and then go blank, never saying it had stalled.
+    /// advances, never sooner than bytes (design ruling 265), so a stopped
+    /// count says it stalled instead of counting down to `<5 s left` and
+    /// going blank.
     fn stall_at(&self) -> Option<Instant> {
         if !self.advanced {
             return None;
@@ -374,11 +388,9 @@ fn secs_up(d: Duration) -> u64 {
 }
 
 /// The words for `s` whole seconds left; `None` past a day. Under five
-/// seconds the honest word is `<5 s left` (`5 s` beside 0.5 s left read as a
-/// promise of five more seconds, review 2026-09-23). Every form ends in
-/// `left`, which already says it is an estimate: the `~` the long form wore
-/// until round 12 said it twice and made the one number the owner reads for
-/// ("how long to wait") the widest thing in its slot (design ruling 241).
+/// seconds the honest word is `<5 s left` (`5 s` beside 0.5 s left reads as a
+/// promise of five more seconds). Every form ends in `left`, which already
+/// says it is an estimate, so no `~` (design ruling 241).
 fn eta_words_secs(s: u64, short: bool) -> Option<String> {
     let (n, long_unit, short_unit) = if s < 5 {
         return Some(if short { "<5s left" } else { "<5 s left" }.to_string());
@@ -479,8 +491,8 @@ pub fn eta_spoken(eta: Eta) -> Option<String> {
 /// How long busy work has run, LABELLED (design ruling 241): nothing under
 /// [`ELAPSED_AFTER`], then `for 12 s` … `for 59 s`, `for 1 min` … `for 59
 /// min`, `for 1 h` … `for 999 h` — floored. Never a bare clock: `0:41` next
-/// to a time slot that later says `30 s left` read as seven seconds LEFT
-/// where it meant seven seconds gone (round-12 critics). `short` is the
+/// to a time slot that later says `30 s left` reads as seconds LEFT, not
+/// gone. `short` is the
 /// slot's sacrifice form ([`crate::ELAPSED_SHORT_W`] cells): `for 12s`,
 /// `for 3m`, `for 2h` — the same numbers, changing at the same instants.
 #[must_use]

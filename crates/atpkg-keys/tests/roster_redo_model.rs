@@ -18,7 +18,6 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use aterm_spec::derive::{Model, roster_pair_redo_model};
 use aterm_spec::interp::{self, State};
@@ -35,24 +34,22 @@ const TARGET_SIGNATURE: &[u8] = b"target signature";
 const FOREIGN_BODY: &[u8] = b"foreign body";
 const FOREIGN_SIGNATURE: &[u8] = b"foreign signature";
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 struct Fixture {
-    root: PathBuf,
+    _root: aterm_tempfile::TempDir,
     roster: PathBuf,
 }
 
 impl Fixture {
     fn new(label: &str, predecessor_present: bool) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "atpkg-roster-redo-model-{label}-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create roster model fixture");
-        let roster = root.join("aterm-machines.toml");
-        let fixture = Self { root, roster };
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-roster-redo-model-{label}-"))
+            .tempdir()
+            .expect("create roster model fixture");
+        let roster = root.path().join("aterm-machines.toml");
+        let fixture = Self {
+            _root: root,
+            roster,
+        };
         if predecessor_present {
             std::fs::write(&fixture.roster, PREDECESSOR_BODY).expect("write predecessor body");
             std::fs::write(fixture.signature(), PREDECESSOR_SIGNATURE)
@@ -102,12 +99,6 @@ impl Fixture {
         );
         drop(committed);
         lock
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

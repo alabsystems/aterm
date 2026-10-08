@@ -1,12 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! SHA-256, transcribed from FIPS 180-4 section 6.2.
-//!
-//! No SIMD, no SHA-NI, no `unsafe`, no lookup trickery -- the reference
-//! algorithm written so that a reader with the standard open beside them can
-//! check every line. See the crate docs for why aterm carries this instead of
-//! `sha2`.
+//! SHA-256, transcribed from FIPS 180-4 section 6.2: the reference algorithm,
+//! checkable line by line against the standard.
 
 /// The SHA-256 block size, in bytes (FIPS 180-4 sec. 1: 512 bits).
 pub(crate) const BLOCK_LEN: usize = 64;
@@ -55,14 +51,8 @@ const K: [u32; 64] = [
 
 /// A streaming SHA-256 hasher.
 ///
-/// Drop-in for `sha2::Sha256` across aterm's call sites: [`Sha256::new`],
-/// [`Sha256::update`], [`Sha256::finalize`] and the one-shot
-/// [`Sha256::digest`].
-///
-/// [`finalize`](Sha256::finalize) returns a plain `[u8; 32]` rather than a
-/// `GenericArray`, which is what let the `digest`/`typenum` tower go. An array
-/// derefs to `&[u8]`, so `hex(&h.finalize())` still compiles, and
-/// `h.finalize().into()` still resolves through the identity `From`.
+/// [`finalize`](Sha256::finalize) returns a plain `[u8; 32]`; it derefs to
+/// `&[u8]` and converts with the identity `From`.
 ///
 /// # Example
 ///
@@ -84,15 +74,10 @@ pub struct Sha256 {
     /// compresses the buffer the instant it fills, so `finalize` can always
     /// write its `0x80` byte without a bounds check.
     buf_len: usize,
-    /// Total message length in BYTES.
-    ///
-    /// Counted in bytes, not bits, and widened to `u64` on the way in. Holding
-    /// this in a `u32` (or counting bits in one) is the classic SHA
-    /// implementation bug: it wraps silently at 512 MiB of input and produces a
-    /// digest that disagrees with every other implementation on Earth. FIPS
-    /// 180-4 caps a message at 2^64 - 1 bits, so the shift to bits in
-    /// `finalize` cannot overflow for any message that is legal in the first
-    /// place.
+    /// Total message length in bytes, as `u64`. A `u32` (or a bit count in
+    /// one) would wrap at 512 MiB; FIPS 180-4 caps a message at 2^64 - 1
+    /// bits, so the shift to bits in `finalize` cannot overflow for a legal
+    /// message.
     len: u64,
 }
 
@@ -124,11 +109,9 @@ impl Sha256 {
             self.buf_len += take;
             data = &data[take..];
             if self.buf_len < BLOCK_LEN {
-                // `take` consumed all of `data` without filling the block, so
-                // there is nothing else to do. Returning here is load-bearing:
-                // falling through would run the tail-copy below with an empty
-                // `data` and reset `buf_len` to 0, silently discarding the
-                // bytes just buffered.
+                // `take` consumed all of `data` without filling the block.
+                // Returning is required: the tail copy below would reset
+                // `buf_len` to 0 and discard the buffered bytes.
                 debug_assert!(data.is_empty());
                 return;
             }
@@ -137,8 +120,7 @@ impl Sha256 {
             self.buf_len = 0;
         }
 
-        // Whole blocks stream straight out of the caller's slice: no copy into
-        // `buf`, which is the difference between "simple" and "needlessly slow".
+        // Whole blocks compress straight from the caller's slice, uncopied.
         let (blocks, rest) = data.as_chunks::<BLOCK_LEN>();
         for block in blocks {
             compress(&mut self.state, block);
@@ -162,12 +144,9 @@ impl Sha256 {
         self.buf[self.buf_len] = 0x80;
         self.buf_len += 1;
 
-        // If fewer than 8 bytes are left after the 0x80 the length field does
-        // not fit, so the padding spills into a SECOND block: zero-fill and
-        // compress this one, then lay the length into a fresh all-zero block.
-        // A message of 56..=63 bytes mod 64 takes this path; getting it wrong
-        // is the other classic SHA bug, and it hides until someone hashes a
-        // 56-byte file.
+        // With fewer than 8 bytes left after the 0x80, the length field spills
+        // into a second block: zero-fill and compress this one, then lay the
+        // length into a fresh zero block (messages of 56..=63 bytes mod 64).
         if self.buf_len > BLOCK_LEN - 8 {
             self.buf[self.buf_len..].fill(0);
             let block = self.buf;
@@ -204,9 +183,8 @@ impl Default for Sha256 {
 }
 
 impl std::fmt::Debug for Sha256 {
-    /// Deliberately opaque: a hasher's interior is partially-consumed message
-    /// material, which is exactly the thing that should not fall into a log
-    /// line.
+    /// Opaque: a hasher's interior is partially consumed message material,
+    /// which must not reach a log line.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sha256").finish_non_exhaustive()
     }
@@ -330,9 +308,10 @@ mod tests {
 
     #[test]
     fn padding_boundary_lengths_stream_identically() {
-        // 55 fits the length field; 56..=63 and 64 force a second padding
-        // block; 64 is also an exact block. Each must agree with the digest
-        // reached by feeding one byte at a time.
+        // 55 fits the length field; 56..=63 spill the length into a second
+        // padding block; 64 is an exact block followed by one padding-only
+        // block. Each must agree with the digest reached by feeding one byte
+        // at a time.
         for len in [0usize, 1, 54, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128] {
             let msg: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let one_shot = Sha256::digest(&msg);
@@ -347,12 +326,9 @@ mod tests {
 
     #[test]
     fn the_length_field_is_64_bits_wide() {
-        // 4 GiB of message is 2^35 bits -- everything above bit 31 of the
-        // length field. Only the padding block depends on `len`, so this pins
-        // the encoding without moving 4 GiB of bytes. Without it, narrowing
-        // `bit_len` to a u32 passes the ENTIRE suite (mutation-checked) while
-        // disagreeing with every other SHA-256 on any input over 512 MiB --
-        // which `aterm_release::dmg::sha256_file` hashes on every cut.
+        // 4 GiB of message is 2^35 bits, exercising the length field above bit
+        // 31. Only the padding block depends on `len`, so this pins the
+        // encoding without hashing 4 GiB.
         let mut h = Sha256::new();
         h.len = 1 << 32;
         let got = h.finalize();

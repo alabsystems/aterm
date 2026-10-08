@@ -168,7 +168,7 @@ fn operator_event_delivery_real_claim_cas_matches_model() {
     assert_eq!(reclaimed.len(), 1);
     assert!(!reclaimed[0].escalated);
     assert!(matches!(
-        queue.status(event_id).expect("status").status,
+        queue.snapshot(event_id).expect("status").status,
         EventStatus::Queued
     ));
     let queued_again = state_after(
@@ -189,7 +189,7 @@ fn operator_event_delivery_real_claim_cas_matches_model() {
         "operator delivery first reclaim",
     );
 
-    // NEGATIVE CONTROL: an off-by-one cap compare escalates this first expiry.
+    // Negative control: an off-by-one cap compare escalates this first expiry.
     // The real reclaim requeued it (`!reclaimed[0].escalated`); the model must
     // refuse the early escalation too.
     let forged_early_escalation = state_after(
@@ -243,7 +243,7 @@ fn operator_event_delivery_real_claim_cas_matches_model() {
         "operator delivery stale claimant refusal",
     );
 
-    // NEGATIVE CONTROL: reproduce the forbidden stale-token regression. This is
+    // Negative control: reproduce the forbidden stale-token resolution. This is
     // exactly the `Buggy=1` successor and must not be admitted by healthy Next.
     let forged_stale_resolution = state_after(
         &claimed_second,
@@ -317,7 +317,7 @@ fn operator_event_delivery_real_redelivery_cap_matches_model() {
     let outcomes = queue.reclaim_expired_at(second.expires_at_ms).unwrap();
     assert_eq!(outcomes.len(), 1);
     assert!(outcomes[0].escalated);
-    let snapshot = queue.status(event_id).unwrap();
+    let snapshot = queue.snapshot(event_id).unwrap();
     assert!(snapshot.escalated);
     assert_eq!(snapshot.redelivery_count, 2);
     assert_eq!(snapshot.condition, AttentionCondition::Escalation);
@@ -382,7 +382,7 @@ fn operator_event_delivery_real_redelivery_cap_matches_model() {
     let final_outcome = queue.reclaim_expired_at(final_claim.expires_at_ms).unwrap();
     assert_eq!(final_outcome.len(), 1);
     assert!(matches!(
-        queue.status(event_id).unwrap().status,
+        queue.snapshot(event_id).unwrap().status,
         EventStatus::InDoubt { token: Some(ref token), .. }
             if token == &final_claim.token
     ));
@@ -395,7 +395,7 @@ fn operator_event_delivery_real_redelivery_cap_matches_model() {
         "operator delivery expired human escalation",
     );
 
-    // NEGATIVE CONTROL: an in-doubt record without its claimant's token can
+    // Negative control: an in-doubt record without its claimant's token can
     // never be reconciled. The real one kept the token (asserted above) and a
     // token-scoped reconciliation resolves it; the tokenless successor is refused.
     let forged_tokenless = state_after(&final_in_doubt, &[("token", 0)]);
@@ -447,7 +447,7 @@ fn operator_wal_core_orphan_recovery_and_human_reconciliation_match_model() {
         .begin_action_at(event_id, &claim.token, "turn", &action_hash, 101)
         .expect("intent is durable before mutation");
     assert!(matches!(
-        queue.status(event_id).unwrap().status,
+        queue.snapshot(event_id).unwrap().status,
         EventStatus::ActionInFlight { .. }
     ));
     let intent = state_after(&initial, &[("phase", 1), ("intent_durable", 1)]);
@@ -466,7 +466,7 @@ fn operator_wal_core_orphan_recovery_and_human_reconciliation_match_model() {
         Err(OperatorError::ActionInFlight(found)) if found == event_id
     ));
     assert!(matches!(
-        queue.status(event_id).unwrap().status,
+        queue.snapshot(event_id).unwrap().status,
         EventStatus::ActionInFlight { .. }
     ));
     let forged_ack = state_after(&intent, &[("phase", 4), ("resolved", 1)]);
@@ -482,14 +482,13 @@ fn operator_wal_core_orphan_recovery_and_human_reconciliation_match_model() {
     // run. This is only the durable queue's recovery binding; the genuine
     // `MutateOnce` binding lives beside the shipping GUI transaction helper.
     drop(queue);
-    let (reopened, report) =
-        DurableQueue::open_with_report(directory.path(), 2, wal_config()).unwrap();
+    let reopened = DurableQueue::open(directory.path(), 2, wal_config()).unwrap();
     assert!(
-        report.records_replayed >= 4,
+        reopened.recovery_report().records_replayed >= 4,
         "epoch/manage/enqueue/claim/intent replayed"
     );
     assert!(matches!(
-        reopened.status(event_id).unwrap().status,
+        reopened.snapshot(event_id).unwrap().status,
         EventStatus::InDoubt { token: Some(_), .. }
     ));
     let in_doubt = state_after(&intent, &[("phase", 3), ("in_doubt", 1)]);
@@ -531,7 +530,7 @@ fn operator_wal_core_orphan_recovery_and_human_reconciliation_match_model() {
 
     let replayed = DurableQueue::open(directory.path(), 3, wal_config()).unwrap();
     assert!(matches!(
-        replayed.status(event_id).unwrap().status,
+        replayed.snapshot(event_id).unwrap().status,
         EventStatus::Resolved {
             resolution: Resolution::Acted,
             reconciliation_note: Some(ref note),
@@ -614,7 +613,7 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
         "LatchFault",
         "operator durable fleet-fault latch",
     );
-    // NEGATIVE CONTROL: a fault committed without its marker. The failed-write
+    // Negative control: a fault committed without its marker. The failed-write
     // path itself is driven by `operator_fleet_fault_failed_marker_write_commits_no_fault`.
     assert_rejected(
         &model,
@@ -700,7 +699,7 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
         roster_reconciled,
         "a refused clear commits nothing and keeps the marker"
     );
-    // NEGATIVE CONTROL: the clear committed past both in-doubt scans, the API's
+    // Negative control: the clear committed past both in-doubt scans, the API's
     // and the apply's (`operator.rs`'s `wal_apply_backstops` pins the second).
     let unscanned = state_after(&roster_reconciled, &[("phase", 4)]);
     assert_rejected(
@@ -782,7 +781,7 @@ fn operator_fleet_fault_failed_marker_write_commits_no_fault() {
     );
     assert!(latched.is_err(), "an unwritable marker must fail the latch");
 
-    // NEGATIVE CONTROL: what the swallowed error would have left durable.
+    // Negative control: what the swallowed error would have left durable.
     let unowned = state_after(&healthy, &[("phase", 2)]);
     assert_rejected(
         &model,
@@ -884,7 +883,7 @@ fn operator_leadership_real_lock_and_epoch_fence_match_model() {
         "operator leadership stale writer refusal",
     );
 
-    // NEGATIVE CONTROL: accepting A's old epoch after takeover is rejected.
+    // Negative control: accepting A's old epoch after takeover is rejected.
     let forged_stale_write = state_after(&b_wrote, &[("accepted_epoch", 1), ("stale_accepted", 1)]);
     assert_rejected(
         &model,

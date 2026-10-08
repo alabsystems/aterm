@@ -3,8 +3,6 @@
 // Author: Andrew Yates
 
 //! Tests for the grid cell module.
-//!
-//! Extracted from cell.rs (#1977).
 
 use super::*;
 
@@ -112,10 +110,8 @@ fn set_char_clears_complex_flag() {
 
 #[test]
 fn new_non_bmp_stores_replacement() {
-    // Cell::new() with non-BMP characters stores U+FFFD (replacement char)
-    // instead of silently dropping. This documents the API contract that
-    // set_char() also follows in release mode (debug builds catch misuse
-    // via debug_assert).
+    // Cell::new() stores U+FFFD for non-BMP characters rather than dropping
+    // them (set_char() does the same in release; debug builds assert).
     let emoji_cell = Cell::new('\u{1F600}'); // 😀
     assert_eq!(emoji_cell.char(), '\u{FFFD}');
     assert_eq!(emoji_cell.char_data(), '\u{FFFD}' as u16);
@@ -188,9 +184,7 @@ fn cell_style_id_color_accessors_return_none() {
     assert!(!cell.bg_needs_overflow());
 }
 
-// =========================================================================
 // StyleId tests
-// =========================================================================
 
 #[test]
 fn cell_with_style_id_default() {
@@ -304,9 +298,7 @@ fn cell_flags_uses_style_id() {
     assert!(combined.contains(CellFlags::WIDE));
 }
 
-// =========================================================================
-// HAS_EXTRAS flag tests (#5551)
-// =========================================================================
+// HAS_EXTRAS flag tests
 
 #[test]
 fn cell_has_extras_default_false() {
@@ -362,9 +354,7 @@ fn cell_from_ascii_styled_with_extras_flag() {
     assert_eq!(cell.char(), 'X');
 }
 
-// =========================================================================
-// Cell memory layout (#7649): the three fields sit at fixed bit offsets
-// =========================================================================
+// Cell memory layout: the three fields sit at fixed bit offsets
 
 /// Verify that the packed cell representation allows efficient single-load access
 /// to char_data without any shift (it's at byte offset 0).

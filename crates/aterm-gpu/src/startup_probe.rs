@@ -1,60 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! COLD-BUILD SUB-PHASE PROBE — the inside of the one startup phase that had no
-//! drill-down.
+//! Cold-build sub-phase timing: the breakdown of the frontend's
+//! `backend_finalize` startup phase.
 //!
-//! The frontend's startup ledger (`aterm-gui::metrics`) partitions
-//! Rust-main → first-present into exclusive phases, and its `backend_finalize`
-//! phase is a single `handle.join()` on the backend-build worker. Everything the
-//! worker does — wgpu instance/adapter/device acquisition, the parallel font
-//! thread, and every render pipeline — therefore collapses into ONE opaque
-//! number. That number was recorded at 300.83 ms median on macOS on 2026-07-30
-//! and read as the largest phase of startup; three separate optimizations were
-//! proposed inside it and all three were refused for being unsizeable.
+//! The frontend's startup ledger (`aterm-gui::metrics`) splits Rust-main to
+//! first-present into exclusive phases; `backend_finalize` is one
+//! `handle.join()` on the backend-build worker, so the worker's work (wgpu
+//! instance/adapter/device, the parallel font thread, render pipelines) is one
+//! opaque number there. Normally the worker has finished before the join, its
+//! work hidden under window creation. These legs record the split where the
+//! work happens; `aterm-gui` folds them into its ledger. This crate publishes
+//! nothing itself.
 //!
-//! **THE 300 ms PHASE IS NOT THERE, AND THIS PROBE IS WHAT PROVED IT.** With
-//! the drill-down wired, `backend_finalize` measures **0.01 ms median, 0.02 ms
-//! max over 40 fresh processes**, and the worker had already finished before
-//! the join was reached in EVERY sample — the build's 35.76 ms of real work is
-//! entirely hidden under window creation
-//! (`docs/measured/arena/2026-08-23-start-backend-finalize-drilldown-dev-smoke.md`;
-//! Apple M5 Max, **DEV-SMOKE / NON-PUBLISHABLE**, single-arm). The 300.83 ms
-//! figure comes from the 2026-07-30 font-seal A/B in the same lane and the same
-//! class, and is superseded: do not size work against it again.
+//! ## Rules
 //!
-//! This module is the ns-resolution split of that construction, recorded WHERE
-//! the work happens (this crate) and read back by the frontend, which cannot see
-//! in here. It publishes nothing itself: `aterm-gui` folds these legs into its
-//! `metrics` ledger beside the phases they explain.
-//!
-//! The module keeps earning its place regardless of how small the phase turned
-//! out to be. A phase nobody can see is a phase people invent numbers for —
-//! this one collected three — and the legs below are the standing instrument
-//! that would catch it growing teeth for real: a slower adapter, a fatter
-//! pipeline set, or a launch path fast enough that the join starts waiting
-//! again. This probe reports the cost; it does not assert the cost is large.
-//!
-//! ## Rules, matching the startup ledger's own conventions
-//!
-//! * **Nanoseconds.** Every slot is a `u64` ns duration, like every other
-//!   startup number; the wire converts to ms once, at the emitter.
-//! * **First-write-wins.** A process has ONE cold build. A later rebuild — a
-//!   GPU-loss recovery, a live font/theme reload that recreates a context, a
-//!   second `GpuRenderer` in a test — must never overwrite the launch timeline,
-//!   so [`record`] admits a leg only while its slot is still zero.
-//! * **Zero means UNSET, never "instant".** A genuinely sub-ns leg records as
-//!   1 ns so the sentinel stays unambiguous, and a leg that never ran (the CPU
-//!   fallback path takes no GPU leg at all) reads 0 and makes the frontend's
-//!   `startup_gpu_valid` false rather than fabricating a partition.
-//! * **Durations, not stamps.** The legs run on two threads (the worker and the
-//!   font thread it spawns) with no shared epoch, and a duration needs none.
-//!   The one cross-thread QUESTION — how much of the worker was already done
-//!   when the join was reached — is answered on the frontend side, where both
-//!   ends of that interval are `Instant`s on one clock.
+//! * Nanoseconds: every slot is a `u64` duration; the wire converts to ms.
+//! * First write wins: a process has one cold build, so a later rebuild (GPU
+//!   loss recovery, a context recreated on reload, a second renderer in a test)
+//!   never overwrites it; [`record`] admits a leg only while its slot is zero.
+//! * Zero means unset: a sub-ns leg records as 1 ns, and a leg that never ran
+//!   (the CPU fallback) reads 0, making the frontend's `startup_gpu_valid`
+//!   false.
+//! * Durations, not stamps: legs run on two threads with no shared epoch. How
+//!   much of the worker was done when the join was reached is computed on the
+//!   frontend side, where both ends share a clock.
 //!
 //! Cost: one `Instant::now()` pair and one relaxed compare-exchange per leg,
-//! ~30 for the entire process lifetime, none of them on a frame path.
+//! about 30 per process, none on a frame path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -62,13 +35,10 @@ use aterm_time::Duration;
 #[cfg(wgpu_arm)]
 use aterm_time::Instant;
 
-/// The exclusive legs of one cold GPU-renderer build.
-///
-/// Ordered as the worker executes them. [`Leg::FontThread`] is the one
-/// PARALLEL leg — it runs on the font thread spawned by
-/// `GpuRenderer::new_with_family` and overlaps the four GPU legs above it, so it
-/// is deliberately NOT part of the exclusive sum; [`Leg::FontJoin`] is the
-/// exclusive slice, the wait the GPU leg actually paid for it.
+/// The exclusive legs of one cold GPU-renderer build, in execution order.
+/// [`Leg::FontThread`] runs in parallel on the font thread spawned by
+/// `GpuRenderer::new_with_family` and is not part of the exclusive sum;
+/// [`Leg::FontJoin`] is the wait the GPU leg paid for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Leg {
@@ -83,18 +53,16 @@ pub enum Leg {
     /// PARALLEL: system font discovery, face parse, and the ASCII prewarm, on
     /// the font thread. Overlaps every GPU leg; not in the exclusive sum.
     FontThread = 4,
-    /// The GPU leg's wait at the font-thread join — the EXCLUSIVE cost of the
-    /// font work, i.e. however much of [`Leg::FontThread`] did not fit under
-    /// the GPU legs.
+    /// The GPU leg's wait at the font-thread join: the part of
+    /// [`Leg::FontThread`] that did not fit under the GPU legs.
     FontJoin = 5,
     /// The main cell shader module (one WGSL parse/compile submission).
     PipeShader = 6,
     /// Uniform buffer/bind-group and glyph-atlas layout + sampler.
     PipeUniformAtlas = 7,
-    /// The cell render pipelines a COLD BUILD creates (see [`cell_pipeline_ns`]
-    /// for the per-pipeline split). Three since the effect pipelines went
-    /// demand-driven — `renderer::EffectPipelines` builds the other nine the
-    /// first frame that binds them, which for the shipped defaults is never.
+    /// The cell render pipelines a cold build creates (see
+    /// [`cell_pipeline_ns`]). Effect pipelines are built on first use
+    /// (`renderer::EffectPipelines`).
     PipeCell = 8,
     /// Blit shader, layouts, NEAREST sampler, invert uniform.
     PipeBlit = 9,
@@ -115,19 +83,10 @@ pub enum Leg {
 /// usize + 1`) so the array length is visible at its definition.
 pub const LEG_COUNT: usize = 15;
 
-/// How many cell render pipelines `build_cell_pipelines` builds, each timed
-/// individually. THREE — the background fill, the mono glyph pass, and the
-/// colour-emoji pass, the only cell pipelines a frame with the shipped defaults
-/// binds.
-///
-/// It was TWELVE until the effect pipelines went demand-driven. That eager
-/// twelve measured **157.92 ms** on a dx12 Windows launch, of which **136.13 ms**
-/// was the nine effect pipelines (`fire_add` 57.21 + `fire_over` 53.86 alone
-/// were two thirds), and every one of those milliseconds landed on
-/// time-to-first-present. The nine now live in `renderer::EffectPipelines`,
-/// built the first frame that binds them — which for `cursor_trail = false`,
-/// `hdr_glow = false` is never. This constant is the standing proof: if it ever
-/// grows back, a launch is paying for pixels again.
+/// Cell render pipelines `build_cell_pipelines` builds and times individually:
+/// background fill, mono glyphs and colour emoji, the only ones a default frame
+/// binds. Effect pipelines are built on demand (`renderer::EffectPipelines`);
+/// if this grows, launch is paying for effect pipelines again.
 pub const CELL_PIPELINE_COUNT: usize = 3;
 
 /// Names of the [`CELL_PIPELINE_COUNT`] slots, in build order. Read by the
@@ -139,16 +98,12 @@ static CELL_PIPELINE_NS: [AtomicU64; CELL_PIPELINE_COUNT] =
     [const { AtomicU64::new(0) }; CELL_PIPELINE_COUNT];
 
 /// Clamp a measured duration into the slot encoding: saturate at `u64::MAX` ns
-/// (295 years — unreachable, but a cast must not wrap) and floor at 1 ns so a
-/// recorded leg is never mistaken for an unset one.
+/// and floor at 1 ns so a recorded leg is never read as unset.
 fn slot_ns(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1)
 }
 
-/// Record `elapsed` for `leg`, first write wins.
-///
-/// A slot that is already non-zero belongs to the cold build and is left alone;
-/// see the module docs for why later rebuilds must not overwrite it.
+/// Record `elapsed` for `leg`, first write wins (see the module docs).
 pub fn record(leg: Leg, elapsed: Duration) {
     let _ = LEG_NS[leg as usize].compare_exchange(
         0,
@@ -168,11 +123,8 @@ pub(crate) fn timed<T>(leg: Leg, build: impl FnOnce() -> T) -> T {
 }
 
 /// Close the cell pipeline at `index` against `since` and return the stamp the
-/// NEXT pipeline should close against.
-///
-/// A running split rather than a wrapper around each `create_render_pipeline`
-/// call: the twelve descriptors are 40-line literals, and threading a closure
-/// through each one would restate every one of them.
+/// next pipeline closes against. A running split, since wrapping each
+/// descriptor literal in a closure would restate them all.
 #[cfg(wgpu_arm)]
 pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
     let now = Instant::now();
@@ -198,28 +150,14 @@ pub fn cell_pipeline_ns() -> [u64; CELL_PIPELINE_COUNT] {
     std::array::from_fn(|index| CELL_PIPELINE_NS[index].load(Ordering::Relaxed))
 }
 
-/// THE DEMAND-BUILD LEDGER: how many effect pipelines this PROCESS has compiled
-/// on demand, and the wall time it spent doing it.
-///
-/// Process-global (not per-renderer) for the same reason the legs above are: the
-/// question a reader asks is "what did this launch compile", and the H1
-/// fail-soft path can build a SECOND renderer whose per-instance counters would
-/// answer only for itself.
-///
-/// UNLIKE the legs, these ACCUMULATE rather than first-write-wins: an effect
-/// switched on at minute ten is exactly the event worth seeing, so a later build
-/// must add to the ledger, not be discarded as "not the cold build".
-///
-/// This is the standing proof of the whole demand-driven design. A default
-/// launch must read `0 builds / 0 ns` for as long as it draws no effect; the
-/// moment it reads non-zero without an effect having been switched on, the gate
-/// has re-eagerised and a launch is paying for pixels again.
+/// Effect pipelines this process has compiled on demand, and the wall time
+/// spent. Process-global, since a fail-soft rebuild can create a second
+/// renderer. Accumulates (unlike the legs), because an effect enabled later is
+/// worth seeing. A default launch that draws no effect reads zero.
 static EFFECT_BUILDS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
-/// WHICH slots were built, as a bitmask over `renderer::EffectPipeline as usize`.
-/// The count alone says a launch paid for something; only the mask says WHAT, and
-/// "what" is the whole diagnostic — a stray `deco_over` from an editor's undercurl
-/// and a re-eagerised `fire_add` are the same `1` but very different news.
+/// Which effect slots were built, as a bitmask over
+/// `renderer::EffectPipeline as usize`, so a reading says what was paid for.
 static EFFECT_BUILT_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Book one demand-built effect pipeline (slot `index`) into the ledger.
@@ -232,9 +170,8 @@ pub(crate) fn record_effect_build(index: usize, elapsed: Duration) {
     }
 }
 
-/// `(count, nanoseconds, slot bitmask)` of effect pipelines this process has
-/// demand-built. `(0, 0, 0)` is the healthy reading for a launch with the shipped
-/// defaults.
+/// `(count, nanoseconds, slot bitmask)` of demand-built effect pipelines;
+/// `(0, 0, 0)` for a launch with default settings.
 pub fn effect_build_ledger() -> (u64, u64, u64) {
     (
         EFFECT_BUILDS.load(Ordering::Relaxed),

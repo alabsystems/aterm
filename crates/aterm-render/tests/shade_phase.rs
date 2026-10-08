@@ -182,15 +182,12 @@ fn shade_phase_key_folds_only_shades() {
 /// across the whole run — including every cell seam — whatever the host
 /// font's cell width turns out to be, and with an ODD interior pad (which
 /// flips every cell's absolute phase; pre-fix, an odd pad or an odd cell
-/// width broke the period at seams). Skips without a system font.
+/// width broke the period at seams).
 #[test]
 fn rendered_shade_run_is_globally_periodic() {
     use aterm_core::terminal::Terminal;
-    let Some(mut r) = aterm_render::Renderer::from_system(18.0, aterm_render::Theme::default())
-    else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = aterm_render::Renderer::from_system(18.0, aterm_render::Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     r.set_pad(1); // odd pad: every cell origin parity flips
     let (cw, ch) = r.cell_size();
     let (rows, cols) = (2usize, 12usize);

@@ -357,6 +357,192 @@ fn basic_word_boundaries_bidi_controls_split_words() {
     }
 }
 
+/// Words a format control spells, each of which a double-click must select
+/// whole: the Persian half space between two letters that would otherwise join,
+/// a joiner next to a virama picking a conjunct's form, a script's own format
+/// controls between two of its letters, and (no control) a virama and a
+/// prepended number sign.
+const JOINED_WORDS: [(&str, &str); 12] = [
+    (
+        "Persian ZWNJ",
+        "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+    ),
+    (
+        "Persian ZWNJ after a right-joining letter",
+        "\u{062F}\u{06CC}\u{0648}\u{200C}\u{0647}\u{0627}",
+    ),
+    (
+        "Marathi eyelash ra",
+        "\u{0926}\u{0930}\u{094D}\u{200D}\u{092F}\u{093E}",
+    ),
+    ("Sinhala sri", "\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}"),
+    (
+        "Devanagari half form",
+        "\u{0915}\u{094D}\u{200D}\u{0937}\u{093E}",
+    ),
+    (
+        "Devanagari explicit virama",
+        "\u{0915}\u{094D}\u{200C}\u{0937}",
+    ),
+    (
+        "Bengali ya-phala",
+        "\u{09B0}\u{200D}\u{09CD}\u{09AF}\u{09BE}\u{09AC}",
+    ),
+    (
+        "Hindi virama",
+        "\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947}",
+    ),
+    ("prepended end of ayah", "\u{06DD}\u{0661}\u{0662}\u{0663}"),
+    (
+        "Mongolian vowel separator",
+        "\u{182C}\u{1820}\u{1837}\u{180E}\u{1820}",
+    ),
+    (
+        "Egyptian hieroglyph quadrat",
+        "\u{13000}\u{13431}\u{13437}\u{13001}\u{13430}\u{13002}\u{13438}\u{13003}",
+    ),
+    ("Duployan letter overlap", "\u{1BC00}\u{1BCA0}\u{1BC01}"),
+];
+
+/// A ZWNJ or ZWJ that spells a word belongs to it. UAX #29 never breaks a word
+/// at one (WB4), and the scripts that use them need them inside words: Persian
+/// writes `می‌خواهم` with a half space, Marathi spells eyelash ra and Sinhala
+/// `ශ්‍රී` with a ZWJ after the virama, Bengali spells ya-phala `র‍্য` with a ZWJ
+/// before it. Every byte and every column of each word selects all of it, under
+/// the default classifier, the builtin rules and configured separators alike.
+#[test]
+fn a_joiner_that_spells_a_word_belongs_to_it() {
+    let mut separated = SmartSelection::new();
+    separated.set_word_separators(Some(" "));
+    for (name, word) in JOINED_WORDS {
+        let text = format!("x {word} y");
+        let span = Some((2, 2 + word.len()));
+        for (i, _) in word.char_indices() {
+            assert_eq!(
+                SmartSelection::basic_word_boundaries(&text, 2 + i),
+                span,
+                "{name}: byte {i}"
+            );
+            assert_eq!(
+                separated.word_boundaries_at(&text, 2 + i),
+                span,
+                "{name}: byte {i}, separators"
+            );
+        }
+        let columns = aterm_grapheme::str_grid_columns(&text);
+        let cells = Some((2, columns - 2));
+        for smart in [&SmartSelection::with_builtin_rules(), &separated] {
+            for column in 2..columns - 2 {
+                assert_eq!(
+                    smart.word_boundaries_at_column(&text, column),
+                    cells,
+                    "{name}: column {column}"
+                );
+            }
+        }
+    }
+}
+
+/// An invisible character between two words still separates them: a joiner
+/// between two letters that never join (`foo`‍`bar`, where it does no work), a
+/// bidi override, isolate or mark, the word joiner, ZWSP and BOM. Invisible
+/// characters must not weld two words together. A joiner at either end of a
+/// run belongs to no word, and a click on any of them selects nothing.
+#[test]
+fn an_invisible_character_between_two_words_still_splits_them() {
+    for (left, invisible, right) in [
+        ("foo", '\u{200D}', "bar"),
+        ("foo", '\u{200C}', "bar"),
+        ("abc", '\u{202E}', "def"),
+        ("a", '\u{2060}', "b"),
+        ("x", '\u{200E}', "y"),
+        ("ab", '\u{2066}', "cd"),
+        ("ab", '\u{061C}', "cd"),
+        ("ab", '\u{200B}', "cd"),
+        ("ab", '\u{FEFF}', "cd"),
+        // A script's own format control between letters of another script (the
+        // Mongolian vowel separator was a space before Unicode 6.3), and the
+        // controls that spell no word: interlinear annotation, a musical beam,
+        // the language tag.
+        ("ab", '\u{180E}', "cd"),
+        ("\u{0628}", '\u{180E}', "\u{0628}"),
+        ("ab", '\u{13430}', "cd"),
+        ("ab", '\u{1BCA0}', "cd"),
+        ("ab", '\u{FFF9}', "cd"),
+        ("ab", '\u{FFFA}', "cd"),
+        ("ab", '\u{1D173}', "cd"),
+        ("ab", '\u{E0001}', "cd"),
+        // Two Arabic letters a ZWJ joins anyway, and a Latin letter beside one.
+        ("\u{0628}", '\u{200D}', "x"),
+        ("x", '\u{200C}', "\u{0628}"),
+    ] {
+        let text = format!("{left}{invisible}{right}");
+        let at = left.len();
+        let after = at + invisible.len_utf8();
+        let mut separated = SmartSelection::new();
+        separated.set_word_separators(Some(" "));
+        for smart in [&SmartSelection::new(), &separated] {
+            assert_eq!(
+                smart.word_boundaries_at(&text, 0),
+                Some((0, at)),
+                "{text:?}"
+            );
+            assert_eq!(smart.word_boundaries_at(&text, at), None, "{text:?}");
+            assert_eq!(
+                smart.word_boundaries_at(&text, after),
+                Some((after, text.len())),
+                "{text:?}"
+            );
+        }
+    }
+    // A joiner that ends or starts a run: next to a virama, but with no word
+    // character on its other side.
+    for text in ["\u{0915}\u{094D}\u{200D} x", "x \u{200C}\u{0915}"] {
+        let joiner = text.find(['\u{200C}', '\u{200D}']).unwrap();
+        assert_eq!(
+            SmartSelection::basic_word_boundaries(text, joiner),
+            None,
+            "{text:?}"
+        );
+    }
+    let text = "\u{0915}\u{094D}\u{200D} x";
+    assert_eq!(SmartSelection::basic_word_boundaries(text, 0), Some((0, 6)));
+}
+
+/// A prepended concatenation mark (`Grapheme_Cluster_Break=Prepend`: the
+/// Arabic number sign, end of ayah, the Syriac abbreviation mark) opens the
+/// grapheme cluster of the character AFTER it (GB9b), and UAX #29 counts it
+/// part of that word. A click on the cluster's column lands on the mark's
+/// byte, so the walk must take the mark into the word after it. Double-click
+/// on any digit of `۝١٢٣` selects all three.
+#[test]
+fn a_prepended_mark_belongs_to_the_word_after_it() {
+    let words = [
+        "\u{06DD}\u{0661}\u{0662}\u{0663}", // ۝١٢٣, end of ayah
+        "\u{0600}123",                      // Arabic number sign
+        "\u{070F}\u{0721}\u{072A}\u{0722}", // ܏ܡܪܢ, Syriac abbreviation mark
+        "\u{110BD}123",                     // Kaithi number sign
+    ];
+    let mut separated = SmartSelection::new();
+    separated.set_word_separators(Some(" "));
+    for word in words {
+        let text = format!("x {word} y");
+        for smart in [
+            &SmartSelection::new(),
+            &SmartSelection::with_builtin_rules(),
+            &separated,
+        ] {
+            for column in 2..5 {
+                assert_eq!(
+                    smart.word_boundaries_at_column(&text, column),
+                    Some((2, 5)),
+                    "{word:?} clicked at column {column}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn basic_word_boundaries_cyrillic() {
     // "Привет" = 6 chars, each 2 bytes UTF-8 = 12 bytes
@@ -435,34 +621,47 @@ fn column_to_byte_pos_uses_display_columns_for_wide_chars() {
 }
 
 #[test]
-fn test_byte_pos_to_column_ascii() {
+fn test_byte_span_to_columns_ascii() {
     let text = "hello world";
-    assert_eq!(byte_pos_to_column(text, 0), 0);
-    assert_eq!(byte_pos_to_column(text, 5), 5);
-    assert_eq!(byte_pos_to_column(text, 11), 11);
+    assert_eq!(byte_span_to_columns(text, 0, 0), (0, 0));
+    assert_eq!(byte_span_to_columns(text, 0, 5), (0, 5));
+    assert_eq!(byte_span_to_columns(text, 6, 11), (6, 11));
 }
 
 #[test]
-fn test_byte_pos_to_column_cjk() {
+fn test_byte_span_to_columns_cjk() {
     let text = "日本test";
     // "日" = 3 bytes, width 2; "本" = 3 bytes, width 2; "test" = 4 bytes, width 4
-    assert_eq!(byte_pos_to_column(text, 0), 0); // start of "日"
-    assert_eq!(byte_pos_to_column(text, 3), 2); // start of "本"
-    assert_eq!(byte_pos_to_column(text, 6), 4); // start of "t"
-    assert_eq!(byte_pos_to_column(text, 10), 8); // end
+    assert_eq!(byte_span_to_columns(text, 0, 3), (0, 2)); // "日"
+    assert_eq!(byte_span_to_columns(text, 3, 6), (2, 4)); // "本"
+    assert_eq!(byte_span_to_columns(text, 6, 10), (4, 8)); // "test"
+}
+
+/// Columns follow the grid's fold across cluster boundaries: Sinhala `ක්‍ය`
+/// is two UAX #29 clusters the grid draws in ONE cell, so `ය` alone is drawn
+/// in `ක`'s cell and `ක්‍යා` is two cells (`ක්‍ය`, `ා`): a double-click on the
+/// `z` after it finds the `z`, not the space before it.
+#[test]
+fn word_columns_follow_the_grids_fold_across_clusters() {
+    let yansaya = "a \u{0D9A}\u{0DCA}\u{200D}\u{0DBA} z";
+    let ya = yansaya.find('\u{0DBA}').unwrap();
+    assert_eq!(byte_span_to_columns(yansaya, ya, ya + 3), (2, 3));
+    assert_eq!(column_to_byte_pos(yansaya, 4), yansaya.len() - 1, "`z`");
+    let text = "a \u{0D9A}\u{0DCA}\u{200D}\u{0DBA}\u{0DCF} z";
+    assert_eq!(column_to_byte_pos(text, 5), text.len() - 1, "`z`");
+    let smart = SmartSelection::default();
+    assert_eq!(smart.word_boundaries_at_column(text, 5), Some((5, 6)));
 }
 
 #[test]
 fn test_word_boundaries_at_column_cjk_with_space() {
-    // Regression test for #5685: smart_word_at passes column as byte position.
-    // "日本 test" — CJK word, space, ASCII word.
+    // "日本 test": a column must not be read as a byte offset (#5685).
     let text = "日本 test";
     // Bytes:   0..3="日", 3..6="本", 6=" ", 7..11="test"
     // Columns: 0-1="日", 2-3="本", 4=" ", 5-8="test"
     let smart = SmartSelection::default();
 
-    // Column 5 = start of "test" (after CJK + space).
-    // Without the fix, column 5 was passed as byte position 5 (inside "本").
+    // Column 5 = start of "test"; byte 5 would be inside "本".
     let bounds = smart.word_boundaries_at_column(text, 5);
     assert!(bounds.is_some(), "should find word at column 5");
     let (start_col, end_col) = bounds.unwrap();
@@ -477,6 +676,30 @@ fn test_word_boundaries_at_column_cjk_with_space() {
     assert_eq!(end_col, 4, "CJK word end column");
 }
 
+/// A column at or past the end of the text names an empty cell, not the last
+/// word. The column→byte step maps every such column to `text.len()`, and the
+/// byte walk clamped that onto the last character, so the web build's
+/// double-click (`Terminal::smart_word_at`) on the blank cells right of
+/// `https://example.com` selected `com`.
+#[test]
+fn test_word_boundaries_at_column_past_the_text_is_none() {
+    let smart = SmartSelection::with_builtin_rules();
+    let text = "see https://example.com";
+    assert_eq!(smart.word_boundaries_at_column(text, 5), Some((4, 23)));
+    assert_eq!(smart.word_boundaries_at_column(text, 22), Some((4, 23)));
+    for column in [23, 24, 59] {
+        assert_eq!(
+            smart.word_boundaries_at_column(text, column),
+            None,
+            "column {column}"
+        );
+    }
+    assert_eq!(smart.word_boundaries_at_column("", 0), None);
+    // `日本` occupies columns 0..4: column 3 is its last cell, 4 is past it.
+    assert_eq!(smart.word_boundaries_at_column("日本", 3), Some((0, 4)));
+    assert_eq!(smart.word_boundaries_at_column("日本", 4), None);
+}
+
 #[test]
 fn test_word_boundaries_at_column_ascii_matches_byte() {
     // For pure ASCII, column and byte positions are identical.
@@ -488,43 +711,6 @@ fn test_word_boundaries_at_column_ascii_matches_byte() {
     assert_eq!(
         byte_bounds, col_bounds,
         "ASCII: byte and column results should match"
-    );
-}
-
-#[test]
-fn test_word_boundaries_at_column_cjk_regression_5685() {
-    // Regression proof for #5685: demonstrates the bug by comparing old API
-    // (word_boundaries_at, byte-indexed) vs new API (word_boundaries_at_column,
-    // column-indexed) when given a column index on CJK text.
-    //
-    // "日本 test" — CJK chars are 3 bytes each, 2 display columns each.
-    // Bytes:   0..3="日", 3..6="本", 6=" ", 7..11="test"
-    // Columns: 0-1="日", 2-3="本", 4=" ", 5-8="test"
-    let text = "日本 test";
-    let smart = SmartSelection::default();
-
-    // A terminal UI asks "what word is at column 5?" (the "t" in "test").
-    let column = 5_usize;
-
-    // OLD API: treats column as byte position → byte 5 is inside "本" (bytes 3..6).
-    // This returns the CJK word "日本" in byte offsets — completely wrong for
-    // a caller that meant column 5.
-    let old_result = smart.word_boundaries_at(text, column);
-    assert_eq!(old_result, Some((0, 6)), "old API: byte 5 → CJK word bytes");
-
-    // NEW API: converts column→byte first, then byte→column on output.
-    // Returns the correct word "test" in column coordinates.
-    let new_result = smart.word_boundaries_at_column(text, column);
-    assert_eq!(
-        new_result,
-        Some((5, 9)),
-        "new API: column 5 → 'test' columns"
-    );
-
-    // The two results are DIFFERENT — this proves the bug existed.
-    assert_ne!(
-        old_result, new_result,
-        "CJK text: byte-indexed and column-indexed results must differ"
     );
 }
 

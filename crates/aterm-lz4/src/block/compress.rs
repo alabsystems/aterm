@@ -6,9 +6,7 @@
 
 //! The compression algorithm.
 //!
-//! We make use of hash tables to find duplicates. This gives a reasonable compression ratio with a
-//! high performance. It has fixed memory usage, which contrary to other approaches, makes it less
-//! memory hungry.
+//! A fixed-size hash table finds duplicates: a reasonable ratio, high speed, fixed memory.
 
 use crate::block::END_OFFSET;
 use crate::block::LZ4_MIN_LENGTH;
@@ -28,19 +26,16 @@ use super::{CompressError, WINDOW_SIZE};
 
 /// Increase step size after 1<<INCREASE_STEPSIZE_BITSHIFT non matches
 const INCREASE_STEPSIZE_BITSHIFT: usize = 5;
-/// `1 << INCREASE_STEPSIZE_BITSHIFT`, hoisted to a const so the search loop's
-/// step computation is a (verifier-friendly) constant divide, not a runtime
-/// shift — identical unsigned semantics.
+/// `1 << INCREASE_STEPSIZE_BITSHIFT`, so the search loop divides by a
+/// constant (linear arithmetic for the verifier) instead of shifting.
 const INCREASE_STEPSIZE: usize = 1 << INCREASE_STEPSIZE_BITSHIFT;
 
 /// Native-endian `usize` bytes read from the prefix of `s`, by-byte.
 ///
-/// Replaces the `s.try_into()` slice-to-array conversion, whose absent std
-/// body the native verifier cannot prove panic-free. The mask keeps the store
-/// provably in bounds regardless of the loop-carried bound (the file's
-/// hashtable-`clear` idiom); the panic-free `get` reads a missing byte as 0.
-/// Byte-identical to `s[..N].try_into().unwrap()` whenever `s.len() >= N`,
-/// which every caller guarantees (`get(..N)` / `chunks_exact(N)`).
+/// Replaces `s.try_into()`, whose absent std body the verifier cannot prove
+/// panic-free. The `% N` keeps the store provably in bounds; a missing byte
+/// reads as 0. Identical to `s[..N].try_into().unwrap()` when `s.len() >= N`,
+/// which every caller guarantees.
 #[cfg(target_pointer_width = "64")]
 #[inline]
 fn ne_usize_bytes(s: &[u8]) -> [u8; core::mem::size_of::<usize>()] {
@@ -56,11 +51,8 @@ fn ne_usize_bytes(s: &[u8]) -> [u8; core::mem::size_of::<usize>()] {
 
 #[inline]
 pub(super) fn get_batch(input: &[u8], n: usize) -> u32 {
-    // `get(n..n+4)` yields a length-4 slice; build the array by-byte with
-    // `get().unwrap_or(0)` (panic-free, no bounds obligation) instead of the
-    // slice-to-array `try_into`, whose absent std body the native lane cannot
-    // prove panic-free. Byte-identical on every in-bounds (real) call; the
-    // out-of-range case returns 0, matching the old `None` arm.
+    // By-byte `get`s instead of slice→array `try_into` (absent std body the
+    // verifier cannot prove panic-free). Out of range reads as 0.
     let s = input.get(n..n.saturating_add(4)).unwrap_or(&[]);
     u32::from_ne_bytes([
         s.first().copied().unwrap_or(0),
@@ -74,12 +66,8 @@ pub(super) fn get_batch(input: &[u8], n: usize) -> u32 {
 #[inline]
 pub(super) fn get_batch_arch(input: &[u8], n: usize) -> usize {
     const USIZE_SIZE: usize = core::mem::size_of::<usize>();
-    // Every caller guarantees `n + USIZE_SIZE <= input.len()` (cursor
-    // invariants of the compression loop), but the modular verifier cannot
-    // carry that across the call boundary. The clamped `get` + zero fallback
-    // is byte-identical on all in-bounds (i.e. all real) calls and mirrors
-    // the hardened `get_batch` above.
-    // See `get_batch`: by-byte construction avoids the absent-std `try_into`.
+    // Callers guarantee `n + USIZE_SIZE <= input.len()`; the verifier cannot
+    // see that across the call, so clamp as `get_batch` does.
     let s = input.get(n..n.saturating_add(USIZE_SIZE)).unwrap_or(&[]);
     usize::from_ne_bytes(ne_usize_bytes(s))
 }
@@ -138,11 +126,8 @@ fn count_same_bytes(input: &[u8], cur: &mut usize, source: &[u8], candidate: usi
     let cand_slice = source.get(candidate..).unwrap_or(&[]);
 
     let mut num = 0usize;
-    // `as_chunks::<USIZE_SIZE>()` yields `&[u8; USIZE_SIZE]` arrays, so
-    // `from_ne_bytes` takes them directly — no slice-to-array `try_into`
-    // (whose absent std body the native lane cannot prove panic-free) and no
-    // by-byte reconstruction. Pair count and bytes are identical to the
-    // previous `chunks_exact` zip.
+    // `as_chunks` yields arrays `from_ne_bytes` takes directly: no slice→array
+    // `try_into` for the verifier to choke on.
     let (cur_blocks, _) = cur_slice.as_chunks::<USIZE_SIZE>();
     let (cand_blocks, _) = cand_slice.as_chunks::<USIZE_SIZE>();
     for (block1, block2) in cur_blocks.iter().zip(cand_blocks) {
@@ -162,9 +147,8 @@ fn count_same_bytes(input: &[u8], cur: &mut usize, source: &[u8], candidate: usi
         }
     }
 
-    // If we're here we may have 1 to 7 bytes left to check close to the end of input
-    // or source slices. Since this is rare occurrence we mark it cold to get better
-    // ~5% better performance.
+    // 1 to 7 bytes may be left near the end of input or source. Rare, so
+    // cold: ~5% faster.
     #[cold]
     fn count_same_bytes_tail(a: &[u8], b: &[u8], offset: usize) -> usize {
         a.iter()
@@ -190,26 +174,17 @@ fn write_integer(output: &mut impl Sink, mut n: usize) {
     // requires 2 branches of bound check (due to the possibility of add overflows)
     // the simple byte at a time implementation below is faster in most cases.
     while n >= 0xFF {
-        // Trust gate: the `n >= 0xFF` loop guard makes `n - 0xFF` provably
-        // non-negative, but the bound is loop-carried and the gate cannot discharge
-        // the subtraction-underflow obligation without a loop invariant. `wrapping_sub`
-        // is byte-identical here (no wrap ever occurs under the guard) and carries no
-        // underflow obligation — the same idiom used in `aterm_types::trust_fmt`.
+        // Never wraps under the loop guard; `wrapping_sub` spares the verifier
+        // an underflow obligation it cannot discharge without a loop invariant.
         n = n.wrapping_sub(0xFF);
         push_byte(output, 0xFF);
     }
     push_byte(output, n as u8);
 }
 
-/// Thin generic-Sink forwarder for slice writes — the `extend_from_slice`
-/// analogue of `push_byte`. `#[inline]` so it is zero-cost at runtime.
-///
-/// Trust: isolates the `<S as Sink>::extend_from_slice` open-world dispatch
-/// (unknown until monomorphization) into a single `#[trust::skip]` site, exactly
-/// as `push_byte` does for `Sink::push`. The concrete `SliceSink::extend_from_slice`
-/// takes documented `#[trust::skip]` responsibility for its capacity contract;
-/// this forwarder rests on that, keeping every CALLER's own bounds/arithmetic
-/// obligations verified (they no longer contain the generic dispatch).
+/// `extend_from_slice` forwarder, like `push_byte` for `push`: isolates the
+/// generic `Sink` dispatch (unknown until monomorphization) in one skipped
+/// site so callers' own obligations stay verified.
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn push_slice(output: &mut impl Sink, s: &[u8]) {
@@ -219,10 +194,7 @@ fn push_slice(output: &mut impl Sink, s: &[u8]) {
 /// Handle the last bytes from the input as literals
 #[cold]
 fn handle_last_literals(output: &mut impl Sink, input: &[u8], start: usize) {
-    // `start` is always a cursor into `input` (`start <= input.len()`), but
-    // the verifier cannot see that invariant across the call boundary. The
-    // clamped tail slice is identical when it holds and discharges both the
-    // `len - start` underflow and the slice-bounds obligations.
+    // `start <= input.len()` always; the clamp lets the verifier see it.
     let tail = input.get(start..).unwrap_or(&[]);
     let lit_len = tail.len();
 
@@ -244,22 +216,12 @@ fn backtrack_match(
     source: &[u8],
     candidate: &mut usize,
 ) {
-    // Note: Even if iterator version of this loop has less branches inside the loop it has more
-    // branches before the loop. That in practice seems to make it slower than the while version
-    // below. The bounds checks stay: the crate is `forbid(unsafe_code)`, so there is no
-    // unchecked index to trade them for (see the loop body for why each one is spelled as it is).
+    // A `while` beats the iterator form, which branches more before the loop.
     while *candidate > 0 && *cur > literal_start {
-        // `*cur <= input.len()` and `*candidate <= source.len()` are cursor
-        // invariants of the compression loop the verifier cannot carry across
-        // this call, so index via `get`: identical when they hold. The
-        // predecessor positions are computed with `checked_sub` + `break` —
-        // `None` is unreachable under the loop guard (`*candidate > 0`,
-        // `*cur > literal_start >= 0`), but the verifier havocs the `&mut`
-        // cursors across iterations and cannot re-derive the guard, so the
-        // explicit break discharges the underflow obligations while being
-        // behavior-identical. Note the out-of-bounds arm must `break`
-        // explicitly — comparing the `Option`s directly would treat two
-        // `None`s as a match and loop forever.
+        // `get` and `checked_sub` restate cursor invariants the verifier
+        // loses across the `&mut` havoc; their `None` arms are unreachable.
+        // Each must `break`: comparing the `Option`s would match two `None`s
+        // and loop forever.
         let (cur_prev, cand_prev) = match (cur.checked_sub(1), candidate.checked_sub(1)) {
             (Some(c), Some(k)) => (c, k),
             _ => break,
@@ -297,23 +259,12 @@ fn backtrack_match(
 /// `USE_DICT`: Disables usage of ext_dict (it'll panic if a non-empty slice is used).
 /// In other words, this generates more optimized code when an external dictionary isn't used.
 ///
-/// A similar const argument could be used to disable the Prefix mode (eg. USE_PREFIX),
-/// which would impose `input_pos == 0 && input_stream_offset == 0`. Experiments didn't
-/// show significant improvement though.
-// Intentionally avoid inlining.
-// Empirical tests revealed it to be rarely better but often significantly detrimental.
-// Skip: the encode HOT LOOP's `cur - anchor` class offsets/match-lengths are
-// loop-carried arithmetic that needs LOOP-INVARIANT SYNTHESIS. The loop-CHC
-// safety-query scaffolding is in the installed seal (trust 81743ae977 and
-// 2e78b3049c, both ancestors of 321aaeda7), but it does not discharge these:
-// measured 2026-09-27 with this skip removed (`targo trust check -p aterm-lz4
-// --lib --allow-l0-gaps`), this function reads INCONCLUSIVE — 21 obligations,
-// 8 proved, 13 unknown. Source rewrites here were measured NET-NEGATIVE by the
-// ratchet (C7) and reverted. Same classification as the skip'd DECODE hot
-// loop (decompress_internal): byte-exact round-trip property tests + the fuzz
-// corpus cover both. Needed from $HOME/trust, in a promoted seal: loop-invariant
-// discharge of these rows; re-measure with the command above after each
-// `aterm pkg update trust`.
+// Not inlined: measured rarely better, often much worse.
+// Skip: the hot loop's offsets and match lengths need loop-invariant
+// synthesis. Without the skip (seal 321aaeda7, `targo trust check -p
+// aterm-lz4 --lib --allow-l0-gaps`) it reads 8 of 21 proved; rewrites
+// measured net-negative. Round-trip tests and the decode fuzz cover it.
+// Re-measure after each `aterm pkg update trust`.
 #[cfg_attr(trust_verify, trust::skip)]
 #[inline(never)]
 pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
@@ -338,11 +289,9 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
     } else {
         assert!(ext_dict.is_empty());
     }
-    // `Sink::pos() <= Sink::capacity()` holds for every in-crate Sink, but the
-    // trait carries no contract the verifier can use, so the bare `-` carries
-    // an undischargeable underflow obligation. saturating_sub is identical
-    // whenever the invariant holds (and degrades to the same `OutputTooSmall`
-    // error, never a panic, for a hypothetical Sink that violates it).
+    // `pos() <= capacity()` holds for every in-crate Sink but is no trait
+    // contract; saturating keeps it verifiable and yields `OutputTooSmall`
+    // for a Sink that broke it.
     if output.capacity().saturating_sub(output.pos())
         < get_maximum_output_size(input.len() - input_pos)
     {
@@ -352,16 +301,11 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
     let output_start_pos = output.pos();
     if input.len() - input_pos < LZ4_MIN_LENGTH {
         handle_last_literals(output, input, input_pos);
-        // `pos()` is monotone for every in-crate Sink (writes only advance
-        // it), but that is an impl invariant the trait doesn't carry;
-        // saturating_sub is identical whenever it holds.
+        // `pos()` only advances; saturating states that for the verifier.
         return Ok(output.pos().saturating_sub(output_start_pos));
     }
 
-    // `ext_dict.len() <= input_stream_offset` is asserted above for USE_DICT
-    // and trivially true (len 0) otherwise, but the `is_empty()` assertion is
-    // opaque to the verifier's arithmetic; saturating_sub is identical when
-    // the invariant holds.
+    // Never saturates: asserted above (`is_empty()` is opaque to the verifier).
     let ext_dict_stream_offset = input_stream_offset.saturating_sub(ext_dict.len());
     let end_pos_check = input.len() - MFLIMIT;
     let mut literal_start = input_pos;
@@ -388,18 +332,11 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
         // In this loop we search for duplicates via the hashtable. 4bytes or 8bytes are hashed and
         // compared.
         loop {
-            // `x / INCREASE_STEPSIZE` == `x >> INCREASE_STEPSIZE_BITSHIFT` for
-            // unsigned x and a power-of-two divisor; the division form is pure
-            // linear arithmetic for the Level-0 gate (no bitvector round-trip).
             step_size = non_match_count / INCREASE_STEPSIZE;
-            // `non_match_count` and `next_cur` are monotone search cursors: the
-            // loop exits (via `cur > end_pos_check` below) once `cur` passes
-            // `input.len() - MFLIMIT < isize::MAX`, so neither can approach
-            // `u64::MAX` on any real input. Spelling the steps saturating is
-            // therefore behavior-identical, and it drops the two add-overflow
-            // obligations the verifier would otherwise have to discharge over
-            // the havocked (post-`&mut`-call) cursor range — the dominant cost
-            // that made this function's Level-0 gate solver-pathological.
+            // Both cursors stay within a few steps of `input.len()` (the exit
+            // below fires once `cur` passes `end_pos_check`), so saturating
+            // never fires; it drops two overflow obligations that made this
+            // function's gate solver-pathological.
             non_match_count = non_match_count.saturating_add(1);
 
             cur = next_cur;
@@ -411,24 +348,14 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
                 // See the `saturating_sub` note on the early-exit above.
                 return Ok(output.pos().saturating_sub(output_start_pos));
             }
-            // Find a candidate in the dictionary with the hash of the current four bytes.
-            // Unchecked is safe as long as the values from the hash function don't exceed the size
-            // of the table. This is ensured by right shifting the hash values
-            // (`dict_bitshift`) to fit them in the table
-
-            // [Bounds Check]: Can be elided due to `end_pos_check` above
+            // Find a candidate in the dictionary by the hash of the current bytes.
             let hash = T::get_hash_at(input, cur);
             candidate = dict.get_at(hash);
-            // `cur + input_stream_offset` cannot overflow on any real input
-            // (USE_DICT asserts `input_stream_offset + input.len() <=
-            // isize::MAX` above, and `cur <= end_pos_check < input.len()`),
-            // but the loop-carried bound on `cur` is invisible to the
-            // per-block Level-0 gate; saturating_add is identical whenever the
-            // bound holds. Upstream's two "Sanity check … may fail if we lost
-            // history" debug_asserts are retired rather than adapted: their
-            // own comments document legitimate executions that fire them
-            // (lost history), i.e. they were spurious dev-profile panics, and
-            // the distance check below already skips such candidates safely.
+            // Cannot overflow (USE_DICT asserts `input_stream_offset +
+            // input.len() <= isize::MAX` above), but `cur`'s bound is
+            // loop-carried. Upstream's
+            // lost-history debug_asserts are dropped: legitimate inputs fire
+            // them, and the distance check below skips such candidates.
             let cur_abs = cur.saturating_add(input_stream_offset);
             dict.put_at(hash, cur_abs);
 
@@ -437,24 +364,16 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
             //   candidate actually matches what we search for.
             // - We can address up to 16-bit offset, hence we are only able to address the candidate
             //   if its offset is less than or equals to 0xFFFF.
-            // A candidate ahead of `cur` (impossible for the in-crate
-            // HashTables, whose stored positions are past cursors) is skipped
-            // by the same guard that enforces the 16-bit distance: the total
-            // spelling gives the verifier the `candidate <= cur_abs` and
-            // `cur_abs - candidate <= MAX_DISTANCE` facts the casts below
-            // need, where the unguarded `cur_abs - candidate` carried an
-            // undischargeable underflow obligation.
+            // The `candidate > cur_abs` arm (impossible: tables store past
+            // positions) gives the verifier the facts the casts below need.
             if candidate > cur_abs || cur_abs - candidate > MAX_DISTANCE {
                 continue;
             }
 
             if candidate >= input_stream_offset {
                 // match within input
-                // `MAX_DISTANCE == u16::MAX` and the guard above bounds
-                // `cur_abs - candidate <= MAX_DISTANCE`, so the `%` is a no-op
-                // and the cast is exact — the mask idiom (see `get_at`) states
-                // the sub-2^16 bound structurally, which the cast obligation
-                // needs where the guard relation alone decorrelates.
+                // The guard bounds the distance by `MAX_DISTANCE == u16::MAX`,
+                // so `%` is a no-op that states the bound for the cast.
                 offset = ((cur_abs - candidate) % 65536) as u16;
                 candidate -= input_stream_offset;
                 candidate_source = input;
@@ -462,29 +381,16 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
                 // match within ext dict
                 // Same mask idiom as the in-input arm above.
                 offset = ((cur_abs - candidate) % 65536) as u16;
-                // `candidate >= ext_dict_stream_offset` holds whenever history
-                // is intact (upstream's retired debug_assert); saturating_sub
-                // is identical then, and a lost-history candidate yields
-                // position 0 — whose bytes then fail the `cand_bytes ==
-                // curr_bytes` match check below, exactly like any hash
-                // collision.
+                // Lost history saturates to position 0, which then fails the
+                // byte comparison below like any hash collision.
                 candidate = candidate.saturating_sub(ext_dict_stream_offset);
                 candidate_source = ext_dict;
             } else {
-                // Match is not reachable anymore
-                // eg. compressing an independent block frame w/o clearing
-                // the matches tables, only increasing input_stream_offset.
-                // (Upstream carried a "Lost history in prefix mode"
-                // debug_assert here; like the other two lost-history
-                // tripwires it fires on legitimate degenerate usage — a
-                // spurious dev-profile panic — and the `continue` already
-                // handles the state safely, so it is retired.)
+                // Match no longer reachable, e.g. tables kept across
+                // independent blocks with only `input_stream_offset` growing.
                 continue;
             }
-            // [Bounds Check]: Candidate is coming from the Hashmap. It can't be out of bounds, but
-            // impossible to prove for the compiler and remove the bounds checks.
             let cand_bytes: u32 = get_batch(candidate_source, candidate);
-            // [Bounds Check]: Should be able to be elided due to `end_pos_check`.
             let curr_bytes: u32 = get_batch(input, cur);
 
             if cand_bytes == curr_bytes {
@@ -502,26 +408,17 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
         );
 
         // The length (in bytes) of the literals section.
-        // `backtrack_match` only ever decrements `cur` while it stays above
-        // `literal_start`, so `cur >= literal_start` here; the verifier
-        // havocs `cur` across the `&mut` call, so spell the subtraction
-        // saturating — identical when the invariant holds.
+        // `cur >= literal_start` after `backtrack_match`; saturating states it
+        // for the verifier, which havocs `cur` across the `&mut` call.
         let lit_len = cur.saturating_sub(literal_start);
 
-        // Generate the higher half of the token. `cur` and `candidate` both
-        // index within `input`/`candidate_source` (len < isize::MAX) and
-        // MINMATCH = 4, so neither `+ MINMATCH` can overflow on a real input;
-        // saturating is identical and removes the two add-overflow obligations
-        // the verifier cannot otherwise bound after the preceding `&mut` calls.
+        // Both are in-bounds cursors; saturating never fires (verifier havoc).
         cur = cur.saturating_add(MINMATCH);
         candidate = candidate.saturating_add(MINMATCH);
         let duplicate_length = count_same_bytes(input, &mut cur, candidate_source, candidate);
 
-        // Note: The `- 2` offset was copied from the reference implementation, it could be
-        // arbitrary.
-        // `cur >= MINMATCH (= 4) > 2` here (`count_same_bytes` only advances
-        // it), but the verifier havocs `cur` across the `&mut` call;
-        // saturating is identical when the invariant holds.
+        // The `- 2` is the reference implementation's. `cur >= MINMATCH > 2`,
+        // so saturating never fires.
         let hash_pos = cur.saturating_sub(2);
         let hash = T::get_hash_at(input, hash_pos);
         dict.put_at(hash, hash_pos.saturating_add(input_stream_offset));
@@ -537,10 +434,6 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
         }
 
         // Now, write the actual literals.
-        //
-        // The unsafe version copies blocks of 8bytes, and therefore may copy up to 7bytes more than
-        // needed. This is safe, because the last 12 bytes (MF_LIMIT) are handled in
-        // handle_last_literals.
         copy_literals_wild(output, input, literal_start, lit_len);
         // write the offset in little endian.
         push_u16(output, offset);
@@ -555,12 +448,8 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
 }
 
 #[inline]
-// Trust: a thin forwarder to the generic `<S as Sink>::push`, whose impl is
-// unknown until monomorphization (undecidable open-world dispatch pre-mono). The
-// concrete `Sink` used here is `SliceSink`, whose `push` already takes documented
-// `#[trust::skip]` responsibility for its capacity contract; this forwarder rests
-// on that, matching the workspace's thin-generic-forwarder skip pattern
-// (`aterm_types::trust_fmt::DebugAsDisplay::fmt`).
+// Skip: forwards the generic `Sink::push` (impl unknown until
+// monomorphization); `SliceSink::push` owns the capacity contract.
 #[cfg_attr(trust_verify, trust::skip)]
 fn push_byte(output: &mut impl Sink, el: u8) {
     output.push(el);
@@ -573,24 +462,12 @@ fn push_u16(output: &mut impl Sink, el: u16) {
 
 #[inline(always)] // (always) necessary otherwise compiler fails to inline it
 fn copy_literals_wild(output: &mut impl Sink, input: &[u8], input_start: usize, len: usize) {
-    // `input_start + len <= input.len()` by the compression loop's cursor
-    // invariant (`input_start..input_start + len` is the literal run just
-    // scanned), which the verifier cannot carry across this call. The
-    // clamped `get` is identical when the invariant holds.
+    // The literal run just scanned is in bounds; the clamp states it.
     let lits = input
         .get(input_start..input_start.saturating_add(len))
         .unwrap_or(&[]);
-    // `lits.len() == len` whenever the cursor invariant holds, so the wild
-    // call `extend_from_slice_wild(lits, len)` — which copies `lits` and
-    // advances `pos` by `len` — is exactly `extend_from_slice(lits)`. The
-    // non-wild spelling is behavior-identical on every real execution
-    // (same copy, same `pos` advance, same inner `slice_copy`), and on a
-    // violated invariant it advances by the clamped `lits.len()` instead of
-    // corrupting `pos` past the initialized prefix. Upstream's contract
-    // assert lived inside the trust::skip'd wild method, where an explicit
-    // assert! leaks an unbindable obligation into every caller (fatal
-    // absent-callee row — trust flip-1); this call shape needs no assert
-    // at all.
+    // `lits.len() == len`, so this equals upstream's
+    // `extend_from_slice_wild(lits, len)` and needs no contract assert.
     push_slice(output, lits)
 }
 
@@ -606,8 +483,7 @@ pub(crate) fn compress_into_sink_with_dict<const USE_DICT: bool>(
     output: &mut impl Sink,
     mut dict_data: &[u8],
 ) -> Result<usize, CompressError> {
-    // saturating_add: two real slice lens cannot overflow usize, but each is
-    // unbounded to the verifier; saturation is exact for every real input.
+    // Two real slice lengths cannot overflow; saturating is for the verifier.
     if dict_data.len().saturating_add(input.len()) < u16::MAX as usize {
         let mut dict = HashTable4KU16::new();
         init_dict(&mut dict, &mut dict_data);
@@ -621,28 +497,20 @@ pub(crate) fn compress_into_sink_with_dict<const USE_DICT: bool>(
 
 #[inline]
 fn init_dict<T: HashTable>(dict: &mut T, dict_data: &mut &[u8]) {
-    // Read the `&mut &[u8]` ONCE into a local slice: every fact below is then
-    // about one value, where the double deref-read (`dict_data.len()` for the
-    // start index, `dict_data[..]` for the slice) decorrelates under the
-    // verifier's deref-store havoc and leaves the bounds check undischargeable.
+    // Read the `&mut &[u8]` once: two deref-reads decorrelate under the
+    // verifier's havoc and leave the bounds check undischargeable.
     let data = *dict_data;
     if data.len() > WINDOW_SIZE {
-        // Plain `-` on purpose: the dominating `len > WINDOW_SIZE` guard
-        // discharges the underflow obligation, and the subtraction's VALUE
-        // definition (`start == len - WINDOW_SIZE`) is what proves the slice
-        // bound `start <= len`. (`saturating_sub` is opaque to the verifier —
-        // it drops the value relation and leaves the bound undischargeable.)
+        // Plain `-` on purpose: the guard discharges underflow, and its value
+        // proves the slice bound (`saturating_sub` would hide that relation).
         *dict_data = &data[data.len() - WINDOW_SIZE..];
     }
     let mut i = 0usize;
-    // `i` is bounded by `dict_data.len() <= isize::MAX`, so these saturating
-    // adds never actually saturate; they just discharge the no-overflow
-    // obligations (the verifier cannot carry the loop bound on `i`).
+    // `i <= dict_data.len()`: saturating never fires (loop-carried bound).
     while i.saturating_add(core::mem::size_of::<usize>()) <= dict_data.len() {
         let hash = T::get_hash_at(dict_data, i);
         dict.put_at(hash, i);
-        // Note: The 3 byte step was copied from the reference implementation, it could be
-        // arbitrary.
+        // The 3-byte step is the reference implementation's.
         i = i.saturating_add(3);
     }
 }
@@ -651,14 +519,7 @@ fn init_dict<T: HashTable>(dict: &mut T, dict_data: &mut &[u8]) {
 /// Can be used to preallocate capacity on the output vector
 #[inline]
 pub const fn get_maximum_output_size(input_len: usize) -> usize {
-    // `input_len` is a real buffer length (<= isize::MAX bytes can exist,
-    // and real inputs are far smaller than usize::MAX / 110), so the
-    // multiplication never actually saturates; saturating just discharges
-    // the overflow obligation. The header `+ 20` likewise cannot overflow
-    // after `/ 100` (the quotient is <= usize::MAX / 100), so folding the
-    // constant header into a single `saturating_add(20)` is identical on
-    // every input while removing the raw checked-add panic boundary the
-    // hardened verifier could not certify.
+    // Never saturates for a real buffer length; saturating is for the verifier.
     (input_len.saturating_mul(110) / 100).saturating_add(20)
 }
 
@@ -670,9 +531,7 @@ fn compress_into_vec_with_dict<const USE_DICT: bool>(
     mut dict_data: &[u8],
 ) -> Vec<u8> {
     let prepend_size_num_bytes = if prepend_size { 4 } else { 0 };
-    // `get_maximum_output_size` is bounded by ~1.1x a real buffer length, so
-    // the `+ 4` never actually saturates; saturating just discharges the
-    // no-overflow obligation (the callee's bound is opaque to the verifier).
+    // ~1.1x a real length: `+ 4` never saturates (callee bound is opaque).
     let max_compressed_size =
         get_maximum_output_size(input.len()).saturating_add(prepend_size_num_bytes);
     if dict_data.len() <= 3 {
@@ -681,33 +540,23 @@ fn compress_into_vec_with_dict<const USE_DICT: bool>(
     let mut compressed = {
         let mut compressed: Vec<u8> = vec![0u8; max_compressed_size];
         let out = if prepend_size {
-            // `max_compressed_size >= 20 + 4` here (`get_maximum_output_size`
-            // returns at least 20), but that bound is opaque across the call
-            // boundary; `get_mut` + empty fallback is identical when it holds.
+            // `max_compressed_size >= 24`; `get_mut` states it for the verifier.
             if let Some(header) = compressed.get_mut(..4) {
-                // The size header is a `u32` by wire format, so the cast
-                // truncates for (impossible, > 4 GiB) inputs. Masking first
-                // produces the same bits for EVERY input — `as u32` already
-                // truncates to the low 32 bits — while making the truncation
-                // explicit and the value provably in-range for the verifier.
+                // The wire header is a `u32`; the mask makes the truncation
+                // `as u32` already does explicit for the verifier.
                 header.copy_from_slice(&((input.len() & u32::MAX as usize) as u32).to_le_bytes());
             }
             compressed.get_mut(4..).unwrap_or_default()
         } else {
             &mut compressed[..]
         };
-        // Deliberate invariant guard: the output was sized with
-        // `get_maximum_output_size`, so `OutputTooSmall` is unreachable on
-        // real inputs and this panic exists only to loudly detect an internal
-        // bug. The modular verifier cannot see that cross-function sizing
-        // invariant and reports the panic reachable — that refutation is
-        // accepted by design.
+        // Sized by `get_maximum_output_size`, so `OutputTooSmall` means an
+        // internal bug. The verifier reports this reachable; accepted.
         let compressed_len =
             compress_into_sink_with_dict::<USE_DICT>(input, &mut SliceSink::new(out, 0), dict_data)
                 .unwrap();
 
-        // `compressed_len <= the vec's length <= isize::MAX`, so `+ 4` never
-        // actually saturates; it just discharges the no-overflow obligation.
+        // `compressed_len` fits the vec: never saturates.
         compressed.truncate(prepend_size_num_bytes.saturating_add(compressed_len));
         compressed
     };

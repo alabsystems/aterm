@@ -8,7 +8,7 @@
 //! implement so that `aterm-search` can scan them without depending on their
 //! concrete types. Lives in `aterm-types` so that both `aterm-search` (trait
 //! consumer) and `aterm-scrollback` (trait implementor) can use it without
-//! creating a coupling inversion (#5759).
+//! creating a coupling inversion.
 
 /// Content provider trait for streaming search.
 ///

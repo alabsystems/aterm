@@ -1,0 +1,19 @@
+# claude-code 2.1.286 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50), the managed 2.1.286 launched by path against a local stub of the API · the rating's THANKS step, drawn for 5 s after the pending one: `Thanks for the feedback!` over the follow-up offer `(Optional) Press [1] to tell us what went wrong · /feedback` (the scratch folder is redacted at equal width)
+ ▐▛███▛█   Claude Code v2.1.286
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.XXXX/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Crunched for 0s · done 1:38 AM
+
+Thanks for the feedback!
+(Optional) Press [1] to tell us what went wrong · /feedback
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

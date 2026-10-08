@@ -2,21 +2,11 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Damage tracking for efficient rendering.
+//! Damage tracking: only cells changed since the last frame are re-rendered.
 //!
-//! Only re-render cells that have changed since the last frame.
-//!
-//! ## Design
-//!
-//! - Track damaged row ranges using bitsets for O(1) marking and efficient iteration
-//! - Support full damage (resize, scroll, clear screen)
-//! - Support partial damage (individual cell changes)
-//! - O(1) damage queries
-//! - Fast iteration using `trailing_zeros()` to skip undamaged regions
-//! - Column-level damage bounds for fine-grained GPU rendering
-//! - Rectangle merging to reduce draw calls
-//!
-//! ## Usage
+//! Damaged rows are bitsets (O(1) marking, iteration skipping clean rows via
+//! `trailing_zeros()`), with per-row column bounds and rectangle merging for
+//! the GPU; resize, scroll and clear use full damage.
 //!
 //! ```rust,ignore
 //! use aterm_grid::Damage;
@@ -113,10 +103,7 @@ impl Damage {
         }
     }
 
-    /// Mark a wide (double-width) cell pair as damaged in a single call.
-    ///
-    /// Equivalent to `mark_cell(row, col); mark_cell(row, col + 1)` but
-    /// avoids the redundant bounds check, bit OR, and min/max.
+    /// Mark a wide cell pair as damaged in one call (one bounds check).
     #[inline]
     pub(crate) fn mark_wide_cell(&mut self, row: u16, col: u16) {
         match self {
@@ -132,12 +119,9 @@ impl Damage {
         matches!(self, Damage::Full)
     }
 
-    /// This session's MARK-CALL clock (D-2 row-revision fold), or `None` under
-    /// [`Damage::Full`], which keeps no tracker and therefore no clock.
-    ///
-    /// `None` is not "no marks": it means the clock cannot answer, so the fold's
-    /// full arm must re-stamp unconditionally rather than treat the session as
-    /// unchanged. See [`DamageTracker::mark_seq`].
+    /// This session's mark-call clock, or `None` under [`Damage::Full`], which
+    /// keeps no tracker. `None` means the clock cannot answer, so callers must
+    /// re-stamp unconditionally. See [`DamageTracker::mark_seq`].
     #[must_use]
     #[inline]
     pub(crate) fn mark_seq(&self) -> Option<u64> {
@@ -174,11 +158,8 @@ impl Damage {
         }
     }
 
-    /// Reset damage tracking (call after render).
-    ///
-    /// Reuses existing allocations when the row count hasn't changed (the common
-    /// frame-to-frame case), avoiding a heap alloc+free pair per frame. Falls
-    /// back to fresh allocation only when transitioning from `Full` state.
+    /// Reset damage tracking (call after render), reusing allocations when the
+    /// row count is unchanged.
     pub(crate) fn reset(&mut self, rows: u16) {
         match self {
             Damage::Partial(tracker) => tracker.clear(rows),
@@ -186,10 +167,8 @@ impl Damage {
         }
     }
 
-    /// Iterate over damaged rows.
-    ///
-    /// For `Full` damage, yields all rows 0..rows.
-    /// For `Partial` damage, uses bitset operations to efficiently skip undamaged rows.
+    /// Iterate over damaged rows: all rows for `Full`, bitset scan for
+    /// `Partial`.
     pub fn damaged_rows(&self, rows: u16) -> DamagedRowIterator<'_> {
         match self {
             Damage::Full => DamagedRowIterator::Full {
@@ -202,11 +181,8 @@ impl Damage {
         }
     }
 
-    /// Iterate over damaged rows with their column bounds.
-    ///
-    /// This is the primary API for renderers. Each yielded `LineDamageBounds`
-    /// contains the row index and the column range [left, right) that needs
-    /// to be redrawn.
+    /// Iterate over damaged rows with their column range [left, right) (the
+    /// primary renderer API).
     pub fn iter_bounds(&self, rows: u16, cols: u16) -> DamageBoundsIterator<'_> {
         DamageBoundsIterator::new(self, self.damaged_rows(rows), cols)
     }
@@ -221,10 +197,7 @@ impl Damage {
         }
     }
 
-    /// Iterate over merged damage rectangles.
-    ///
-    /// This is useful for GPU rendering where batching adjacent rows
-    /// into rectangles reduces draw calls.
+    /// Iterate over merged damage rectangles (fewer GPU draw calls).
     #[cfg(any(test, kani))]
     pub fn iter_merged(&self, rows: u16, cols: u16) -> MergedDamageIterator<'_> {
         MergedDamageIterator::new(self, rows, cols)

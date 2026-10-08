@@ -42,7 +42,7 @@
 //!
 //! Once a connection issues `subscribe` and the verb authorizes, [`crate::control`]
 //! FLIPS that connection to push mode: it stops reading requests and enters
-//! [`push_loop`]. A subscribed connection is PUSH-ONLY for the rest of its life —
+//! [`push_loop_with_peer_probe`]. A subscribed connection is PUSH-ONLY for the rest of its life —
 //! the client reads `DELTA`/`EVENT`/`GAP` frames and never sends another verb.
 
 use std::collections::HashMap;
@@ -63,7 +63,7 @@ use crate::turn_ledger::TurnLedger;
 /// per-target `ReadScreen` gate in [`crate::control`] authorizes, one resolved
 /// selector at a time. Public fields and NO authority attached: a `TargetStreams`
 /// value says what to emit, never for whom. That is safe only because every target
-/// handed to [`push_loop`] has already passed the gate individually.
+/// handed to [`push_loop_with_peer_probe`] has already passed the gate individually.
 ///
 /// Instance-wide streams deliberately do NOT live here (see [`InstanceStreams`]):
 /// the gate loops over the selectors the client named, so it can only ever speak
@@ -148,7 +148,7 @@ impl TargetStreams {
 /// What the client ASKED for at INSTANCE scope, before any authority check. Parsing
 /// produces this and nothing else consumes it but [`InstanceStreams::authorize`] —
 /// the request and the grant are different types precisely so a parse result cannot
-/// be handed to [`push_loop`] by mistake.
+/// be handed to [`push_loop_with_peer_probe`] by mistake.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct RequestedInstance {
     /// The INSTANCE-lifecycle stream (not per-target): emit `EVENT * session-created
@@ -192,10 +192,10 @@ pub(crate) struct RequestedInstance {
 /// outside this module the ONLY way to a value with `sessions` set is
 /// [`InstanceStreams::authorize`], which demands a [`Scope`]. (`Default` is derived
 /// and yields the empty set, which is why deriving it is safe.) That
-/// unconstructibility IS the fix: [`push_loop`] seeds its watermark from the store's
-/// entire live-session roster — a read no per-target gate ever authorized — and
-/// taking this type instead of [`RequestedInstance`] makes reaching that roster
-/// impossible without a scope decision.
+/// unconstructibility IS the fix: [`push_loop_with_peer_probe`] seeds its
+/// watermark from the store's entire live-session roster — a read no per-target
+/// gate ever authorized — and taking this type instead of [`RequestedInstance`]
+/// makes reaching that roster impossible without a scope decision.
 ///
 /// The same shape carries forward: a future instance-wide stream (a fleet or
 /// cross-instance roster) added to [`RequestedInstance`] inherits the check by
@@ -402,7 +402,7 @@ impl Requested {
 }
 
 /// The subscription knobs that carry NO authority: where each stream resumes from
-/// and how a wake is rendered. Grouped into ONE parameter so [`push_loop`]'s two
+/// and how a wake is rendered. Grouped into ONE parameter so [`push_loop_with_peer_probe`]'s two
 /// authority-bearing arguments — [`TargetStreams`] and [`InstanceStreams`] — stay
 /// visibly separate in the signature rather than being buried in a flat option list,
 /// which is exactly how the instance-scoped `sessions` flag came to travel with five
@@ -674,9 +674,10 @@ impl SubscriberSet {
 ///
 /// The multiplex `<local>` tag on every frame is the process-local CHANNEL id (the
 /// registry key as a string). It is NOT the `s-…` sid — a compact per-connection
-/// handle. The `run_subscribe` ack maps each `<local>` to its stable sid via one
-/// `sub <local> <sid>` line, so a client that subscribed by `@s-…`/`@.` can
-/// demultiplex frames back to the sids it knows.
+/// handle. The subscription's ack ([`push_loop_with_peer_probe`] writes it)
+/// maps each `<local>` to its stable sid via one `sub <local> <sid>` line, so a
+/// client that subscribed by `@s-…`/`@.` can demultiplex frames back to the sids
+/// it knows.
 struct Watch {
     /// The process-local id (the registry key + the `<local>` frame tag).
     local_id: u64,
@@ -687,7 +688,8 @@ struct Watch {
     last_sent_seq: u64,
     /// The alt-screen flag as of the last content DELTA. An alt swap (1049) does
     /// NOT touch the main grid's `content_seq` (the poll path's compound cache key
-    /// keys on both for exactly this reason — control_query.rs:665), so a swap
+    /// keys on both, `(key_alt, key_seq)` in control_query, for exactly this
+    /// reason), so a swap
     /// whose seq happens to match `last_sent_seq` would be INVISIBLE to a pure seq
     /// compare. A flip is treated like a backward seq: GAP + full resync frame.
     last_alt: bool,
@@ -700,9 +702,10 @@ struct Watch {
     /// DELTA. The `visible` bit matches the poll `cursor` verb's `<visible>` field.
     last_cursor: (u16, u16, bool, &'static str),
     /// A cheap fingerprint of the RENDER state that changes the styled output
-    /// WITHOUT bumping `content_seq`: dynamic/palette colors, DECSCNM, and the
-    /// cursor + selection overlays (including their geometry). Recolor, selection,
-    /// and pure caret changes mark damage but do not advance the content sequence,
+    /// WITHOUT bumping `content_seq`: dynamic/palette colors, DECSCNM, the host
+    /// style policy, and the cursor + selection overlays (including their
+    /// geometry). Recolor, selection, a style-policy reload and pure caret changes
+    /// mark damage but do not advance the content sequence,
     /// so a seq-gated `cells` subscriber would otherwise retain stale colors or
     /// rectangles until the next glyph write. When this signature changes at an
     /// unchanged seq we re-emit the content frame (no GAP — the delta cursor is
@@ -817,6 +820,18 @@ impl std::fmt::Display for Tag {
 /// token, resolving it to a stable sid via the ack's `sub <local> <sid>` map.
 fn sid_tag(local_id: u64) -> String {
     Tag::Channel(local_id).to_string()
+}
+
+/// [`sid_tag`] formatted into a caller's stack buffer: the same decimal digits
+/// (a `u64` has at most 20), without the heap `String` a per-tick producer that
+/// usually emits nothing would allocate and throw away.
+fn sid_on_stack(local_id: u64, buf: &mut [u8; 20]) -> &str {
+    let len = {
+        let mut w = &mut buf[..];
+        let _ = write!(w, "{local_id}");
+        20 - w.len()
+    };
+    std::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 
 /// One CONTIGUOUS run of already-formatted wire bytes plus the channel it belongs to.
@@ -956,63 +971,37 @@ fn frame_cursor(sid: &str, seq: u64, row: u16, col: u16, visible: bool, style: &
 }
 
 /// A cheap fingerprint of the RENDER state that changes the styled output without
-/// advancing `content_seq` (see [`Watch::last_render_sig`]): DECTCEM visibility,
-/// cursor position/style, DECSCNM reverse-video, the dynamic default fg/bg +
-/// cursor/selection colours, the side-adjusted selection kind/range, and the full
-/// 256-entry palette. Bounded (256 palette reads + a few dynamics per wake), and
-/// only computed for a `screen`/`cells` subscriber — negligible next to the grid
-/// gather this lets us SKIP when nothing changed. (Note: `palette_color` scans the
-/// override list, so a heavy live OSC-4 theme makes each read O(overrides), not
-/// strictly O(1) — still a small constant, well under the styled gather it avoids.)
-fn render_sig(t: &Terminal) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |b: u8| {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    mix(u8::from(t.cursor_visible()));
-    mix(u8::from(t.reverse_video()));
+/// advancing `content_seq` (see [`Watch::last_render_sig`]): the overlays — DECTCEM
+/// visibility, cursor position/style/colour, the side-adjusted selection kind and
+/// range, the selection colours — and everything a cell's colours are RESOLVED
+/// against, taken from aterm-core's own list ([`Terminal::presentation_fingerprint`]:
+/// the palette, the default colours, DECSCNM and the host style policy, which a
+/// config reload changes with no output and no seq). Bounded (one 256-entry palette
+/// pass + a few dynamics per wake), and only computed for a `screen`/`cells`
+/// subscriber and a `screen` read's etag — negligible next to the grid gather this
+/// lets us SKIP when nothing changed.
+pub(crate) fn render_sig(t: &Terminal) -> u64 {
+    let mut h = aterm_hash::Fnv1a64::new();
+    h.write_u8(u8::from(t.cursor_visible()));
     let cursor = t.cursor();
-    for byte in cursor.row.to_le_bytes() {
-        mix(byte);
-    }
-    for byte in cursor.col.to_le_bytes() {
-        mix(byte);
-    }
-    for byte in crate::control::cursor_style_name(t.cursor_style()).bytes() {
-        mix(byte);
-    }
+    h.write(&cursor.row.to_le_bytes());
+    h.write(&cursor.col.to_le_bytes());
+    h.write(crate::control::cursor_style_name(t.cursor_style()).as_bytes());
     // Delimit the variable-length style name from the next field.
-    mix(0);
-    for c in [t.default_foreground(), t.default_background()] {
-        mix(c.r);
-        mix(c.g);
-        mix(c.b);
-    }
-    match t.cursor_color() {
-        Some(c) => {
-            mix(1);
-            mix(c.r);
-            mix(c.g);
-            mix(c.b);
-        }
-        None => mix(0),
-    }
-    for color in [t.selection_background(), t.selection_foreground()] {
+    h.write_u8(0);
+    for color in [
+        t.cursor_color(),
+        t.selection_background(),
+        t.selection_foreground(),
+    ] {
         match color {
-            Some(c) => {
-                mix(1);
-                mix(c.r);
-                mix(c.g);
-                mix(c.b);
-            }
-            None => mix(0),
+            Some(c) => h.write(&[1, c.r, c.g, c.b]),
+            None => h.write_u8(0),
         }
     }
     let selection = t.text_selection();
     match selection.project_range(t.cols().saturating_sub(1)) {
         Some(projected) => {
-            mix(1);
             let kind = match selection.selection_type() {
                 aterm_core::selection::SelectionType::Simple => 0,
                 aterm_core::selection::SelectionType::Block => 1,
@@ -1020,30 +1009,16 @@ fn render_sig(t: &Terminal) -> u64 {
                 aterm_core::selection::SelectionType::Lines => 3,
                 _ => u8::MAX,
             };
-            mix(kind);
-            mix(u8::from(projected.is_block));
-            for byte in projected.start_row.to_le_bytes() {
-                mix(byte);
-            }
-            for byte in projected.start_col.to_le_bytes() {
-                mix(byte);
-            }
-            for byte in projected.end_row.to_le_bytes() {
-                mix(byte);
-            }
-            for byte in projected.end_col.to_le_bytes() {
-                mix(byte);
-            }
+            h.write(&[1, kind, u8::from(projected.is_block)]);
+            h.write(&projected.start_row.to_le_bytes());
+            h.write(&projected.start_col.to_le_bytes());
+            h.write(&projected.end_row.to_le_bytes());
+            h.write(&projected.end_col.to_le_bytes());
         }
-        None => mix(0),
+        None => h.write_u8(0),
     }
-    for i in 0..=255u8 {
-        let c = t.palette_color(i);
-        mix(c.r);
-        mix(c.g);
-        mix(c.b);
-    }
-    h
+    h.write(&t.presentation_fingerprint().to_le_bytes());
+    h.finish()
 }
 
 /// Format a styled CELLS DELTA — the lossless styled-screen frame pushed live.
@@ -1067,8 +1042,11 @@ fn drain_bytes_frames(watch: &Watch) -> Vec<Frame> {
     let Some(bs) = &watch.byte_sub else {
         return Vec::new();
     };
-    let sid = sid_tag(watch.local_id);
     let (bursts, dropped) = bs.drain();
+    if dropped == 0 && bursts.is_empty() {
+        return Vec::new();
+    }
+    let sid = sid_tag(watch.local_id);
     let mut out: Vec<u8> = Vec::new();
     if dropped > 0 {
         out.extend_from_slice(format!("GAP {sid} bytes-dropped={dropped}\n").as_bytes());
@@ -1077,9 +1055,6 @@ fn drain_bytes_frames(watch: &Watch) -> Vec<Frame> {
         out.extend_from_slice(format!("BYTES {sid} {}\n", burst.len()).as_bytes());
         out.extend_from_slice(&burst);
         out.push(b'\n');
-    }
-    if out.is_empty() {
-        return Vec::new();
     }
     vec![Frame::raw(Tag::Channel(watch.local_id), out)]
 }
@@ -1734,7 +1709,8 @@ fn sample_engine_events(
 /// bumps `content_seq`) emits nothing. A wake always re-reads the LATEST state, so
 /// N coalesced producer wakes collapse into ONE delta carrying the newest grid.
 fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Vec<Frame> {
-    let sid = sid_tag(watch.local_id);
+    let mut sid_buf = [0u8; 20];
+    let sid = sid_on_stack(watch.local_id, &mut sid_buf);
     let mut out = String::new();
 
     if streams.wants_content() {
@@ -1813,13 +1789,13 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
         // its payload was gathered, so this respects the requested stream set.
         let emit = |out: &mut String, seq: u64| {
             if let Some(r) = rows.as_ref() {
-                out.push_str(&frame_screen(&sid, seq, r));
+                out.push_str(&frame_screen(sid, seq, r));
             }
             if let Some((cr, cc, cv, cs)) = cur {
-                out.push_str(&frame_cursor(&sid, seq, cr, cc, cv, cs));
+                out.push_str(&frame_cursor(sid, seq, cr, cc, cv, cs));
             }
             if let Some(p) = cells_payload.as_ref() {
-                out.push_str(&frame_cells(&sid, seq, p));
+                out.push_str(&frame_cells(sid, seq, p));
             }
         };
         // An alt-screen swap (1049) does not move the main grid's content_seq, so a
@@ -1832,7 +1808,7 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             // The engine's content seq moved BACKWARD (reset / engine rebuild) OR the
             // alt buffer swapped: the client's prior delta cursor is meaningless —
             // signal a resync and send a full frame.
-            out.push_str(&frame_gap(&sid, seq));
+            out.push_str(&frame_gap(sid, seq));
             watch.last_sent_seq = seq;
             watch.last_alt = alt;
             emit(&mut out, seq);
@@ -1848,7 +1824,7 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             // `every-frame` mode: re-emit the styled frame on an unchanged seq so a
             // fast-repainting TUI's transient states are observable (animation
             // fidelity). Only `cells` re-emits; screen/cursor stay coalesced.
-            out.push_str(&frame_cells(&sid, seq, p));
+            out.push_str(&frame_cells(sid, seq, p));
             content_framed = false;
         } else {
             content_framed = false;
@@ -1867,7 +1843,7 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
                 watch.last_cursor = cur;
             } else if cur != watch.last_cursor {
                 let (cr, cc, cv, cs) = cur;
-                out.push_str(&frame_cursor(&sid, seq, cr, cc, cv, cs));
+                out.push_str(&frame_cursor(sid, seq, cr, cc, cv, cs));
                 watch.last_cursor = cur;
             }
         }
@@ -1897,26 +1873,26 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             watch.last_title.as_deref(),
         );
         watch.last_block_id =
-            drain_block_events(&sid, &engine.blocks, watch.last_block_id, &mut out);
-        watch.last_turn_id = drain_turn_events(&watch.turns, &sid, watch.last_turn_id, &mut out);
+            drain_block_events(sid, &engine.blocks, watch.last_block_id, &mut out);
+        watch.last_turn_id = drain_turn_events(&watch.turns, sid, watch.last_turn_id, &mut out);
         // The resize ledger is evaluated first, so a `render` verdict it
         // records on the timeline this wake is pushed by the timeline drain
         // right below, in the same frame.
         watch.last_resize_id = drain_resize_events(
             &watch.timeline,
-            &sid,
+            sid,
             watch.last_resize_id,
             engine.resize,
             &mut out,
         );
         watch.last_timeline_id =
-            drain_timeline_events(&watch.timeline, &sid, watch.last_timeline_id, &mut out);
-        watch.last_title = drain_title_event(&sid, engine.title, watch.last_title.take(), &mut out);
-        watch.last_bell = drain_bell_event(&sid, engine.bell, watch.last_bell, &mut out);
+            drain_timeline_events(&watch.timeline, sid, watch.last_timeline_id, &mut out);
+        watch.last_title = drain_title_event(sid, engine.title, watch.last_title.take(), &mut out);
+        watch.last_bell = drain_bell_event(sid, engine.bell, watch.last_bell, &mut out);
     }
 
     if streams.mail {
-        drain_mail_events(watch, &sid, &mut out);
+        drain_mail_events(watch, sid, &mut out);
     }
 
     if out.is_empty() {
@@ -1940,7 +1916,7 @@ pub(crate) type ResolvedTarget = (
 
 /// Build one target's send cursors — the per-`Watch` seeding, in ONE place.
 ///
-/// It was inline in [`push_loop`]'s `map`, which was fine while the target set
+/// It was inline in [`push_loop_with_peer_probe`]'s `map`, which was fine while the target set
 /// was frozen at subscribe time. A `@*` subscription ADOPTS sessions later, and
 /// an adopted watch has to be seeded by exactly the same rules or it would
 /// replay a backlog (empty watermarks) or start blind (wrong watermarks). One
@@ -2091,26 +2067,16 @@ struct PushCursors {
     adopt_seq: u64,
 }
 
-#[cfg(test)]
-pub(crate) fn push_loop<W: Write>(
-    registry: &Subscribers,
-    store: &Store,
-    targets: &[ResolvedTarget],
-    scopes: PushScopes,
-    opts: PushOptions,
-    writer: &mut W,
-) {
-    push_loop_with_peer_probe(registry, store, targets, scopes, opts, "", writer, || false);
-}
-
 /// The production push loop with an explicit peer-liveness probe.
 ///
 /// A push-only connection can remain completely quiet for hours. A dead reader
 /// therefore cannot be discovered by waiting for the next write: doing so pins a
 /// reserved subscription worker forever when the target is quiet. `peer_gone` is
 /// sampled on every bounded liveness wake and must be non-blocking (or tightly
-/// bounded). The control-socket host supplies a read-side EOF/HUP probe; the
-/// generic [`push_loop`] wrapper keeps in-memory/test writers source-compatible.
+/// bounded). The control-socket host supplies a read-side EOF/HUP probe. A
+/// test's probe is also the one hook the loop calls on its own thread between
+/// a wake's bounded wait and its closing pass, which is where a test that must
+/// act at that instant acts.
 ///
 /// `handshake` is the subscription's ack — `OK subscribe <n>` and one `sub
 /// <local> <sid>` line per target, formatted by the control dispatch — and it
@@ -2222,11 +2188,11 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
 /// The push loop proper: the catch-up wake, then one wake per notify (or per bounded
 /// timeout) until the client hangs up or every watched session has closed.
 ///
-/// Split out of [`push_loop`] purely so `?` on [`Gone`] can carry the "client is
+/// Split out of [`push_loop_with_peer_probe`] purely so `?` on [`Gone`] can carry the "client is
 /// gone" exit, which is what collapses the six copies of
 /// `if writer.write_all(..).is_err() { return; }` the old body carried — the shape
 /// that let each write site disagree about whether it stamped, flushed or drained.
-/// (It cannot be `push_loop` itself: `Gone` is private and `push_loop` is `pub`.)
+/// (It cannot be the loop itself: `Gone` is private and the loop is `pub(crate)`.)
 #[allow(
     clippy::too_many_arguments,
     reason = "the internal pump borrows each independently-owned subscription cursor and the nonblocking peer probe"
@@ -2675,16 +2641,19 @@ fn drain_membership(
     };
     let mut out = Vec::with_capacity(picked.len() + 1);
     for (target, sid) in picked {
-        // Register for wakes BEFORE building the watch, so a burst that lands
-        // between the two still wakes us. (It could not be lost either way — a
-        // wake re-reads the session's CURRENT state — but registering second
-        // would mean the first burst waited for the 250 ms liveness tick.)
+        // SEED, THEN REGISTER — the main path's rule (see its "REGISTER AFTER
+        // THE WATCHES ARE SEEDED"). A screen's content would survive either
+        // order, since a wake re-reads it whole; an event stream's would not: a
+        // timeline row recorded between a register and the seed is folded into
+        // the seed and pushed to nobody (the bridge's `fetch` event was, in the
+        // 2026-10-06 world-suite red). Seeding first costs at most one 250 ms
+        // liveness tick for a burst that lands in between, and loses nothing.
+        watches.push(new_watch(&target, streams, opts));
         sub.watch(target.0);
         out.push(Frame::text(
             Tag::Instance,
             format!("sub {} {sid}\n", target.0),
         ));
-        watches.push(new_watch(&target, streams, opts));
     }
     if !roster.is_empty() {
         out.push(Frame::text(Tag::Instance, roster));
@@ -2764,28 +2733,11 @@ fn prune_closed(store: &Store, watches: &mut Vec<Watch>) -> Vec<Closing> {
     dead.into_iter().map(Closing).collect()
 }
 
-/// BENCH-ONLY driver for the `events` DIGEST (`benches/subscribe_digest.rs`) —
-/// the `bench_support` precedent applied inside this module.
-///
-/// WHY IT LIVES HERE. The thing that has to be timed is [`frames_for_watch`],
-/// the per-target per-wake body the push loop runs, and the [`Watch`] it mutates
-/// — both module-private, as they should be. A bench is an EXTERNAL target and
-/// sees neither. This module is the one seam they are driven through; it is
-/// gated on the `bench-support` feature (and on `test`, where
-/// `work_count_tests` drives the same digest fixture for the idle-wake COUNT),
-/// which no shipping build enables, and it contains NO logic of its own beyond
-/// fixture construction: `wake` calls the shipping function directly, in the
-/// same loop shape `pump` uses.
-///
-/// WHAT THE FIXTURE HAS TO GET RIGHT. A `Watch` seeded with `None` watermarks
-/// would emit the entire retained backlog on its first wake and then be silent —
-/// which would price the wrong thing twice over. So the watermarks here are
-/// seeded exactly as [`push_loop`] seeds them (live highs, so `events` is a live
-/// stream and never a replay), and the bench PROVES that with a two-sided guard:
-/// an idle wake must produce zero bytes, and a wake after a real ledger append
-/// must produce a frame.
-#[cfg(any(test, feature = "bench-support"))]
-pub(crate) mod bench_seam {
+/// Test fixture for the `events` DIGEST: K watched targets whose ledgers are
+/// filled to a requested depth, woken through the shipping [`frames_for_watch`]
+/// with watermarks seeded exactly as [`push_loop_with_peer_probe`] seeds them.
+#[cfg(test)]
+pub(crate) mod digest_fixture {
     use super::{TargetStreams, Watch, frames_for_watch};
     use crate::session_timeline::SessionTimeline;
     use crate::turn_ledger::{TurnLedger, TurnRecord};
@@ -2813,7 +2765,7 @@ pub(crate) mod bench_seam {
         /// `targets` watches, each carrying `blocks` shell blocks, `turns` turn
         /// records and `timeline` timeline events. Depths above the shipping caps
         /// simply saturate — [`Self::retained`] reports what was actually reached
-        /// so the bench can assert on the real numbers rather than the asked-for
+        /// so the test can assert on the real numbers rather than the asked-for
         /// ones.
         /// NOT named `new`: the lock-order census resolves a held one-hop call
         /// by callee NAME, so a `fn new` here captured every `Vec::new()` and
@@ -2848,7 +2800,7 @@ pub(crate) mod bench_seam {
                         t.process(CYCLE);
                     }
                     // A settled title, so the title watermark seeds to a real value.
-                    t.process(b"\x1b]2;bench\x07");
+                    t.process(b"\x1b]2;fixture\x07");
                 }
                 let ledger = Arc::new(Mutex::new(TurnLedger::default()));
                 {
@@ -2884,7 +2836,7 @@ pub(crate) mod bench_seam {
 
         /// ONE wake: the shipping per-target body for every watch, in the loop
         /// shape `pump` runs it in. Returns the total frame bytes produced —
-        /// `0` is what an idle wake must produce, and the bench asserts it.
+        /// `0` is what an idle wake must produce.
         pub(crate) fn wake(&mut self, woke: bool) -> usize {
             let mut bytes = 0usize;
             for w in &mut self.watches {
@@ -2896,7 +2848,7 @@ pub(crate) mod bench_seam {
         }
 
         /// What the fixture ACTUALLY reached on target 0: `(blocks, turns,
-        /// timeline events)`. The lower half of the bench's reach guard — a
+        /// timeline events)`. The fixture's reach guard — a
         /// fixture that failed to fill the ledgers would price an empty scan.
         pub(crate) fn retained(&self) -> (usize, usize, usize) {
             // Bound to NAMED locals rather than locked through `self.terms[0]`
@@ -2912,11 +2864,11 @@ pub(crate) mod bench_seam {
             (
                 fixture_term
                     .lock()
-                    .expect("bench engine")
+                    .expect("fixture engine")
                     .all_blocks()
                     .count(),
-                fixture_turns.lock().expect("bench ledger").len(),
-                fixture_timeline.lock().expect("bench timeline").len(),
+                fixture_turns.lock().expect("fixture ledger").len(),
+                fixture_timeline.lock().expect("fixture timeline").len(),
             )
         }
 
@@ -2932,7 +2884,7 @@ pub(crate) mod bench_seam {
                 id += 1;
                 fixture_ledger
                     .lock()
-                    .expect("bench ledger")
+                    .expect("fixture ledger")
                     .push(turn_record(id));
             }
             self.next_turn_id = id;
@@ -2949,7 +2901,7 @@ pub(crate) mod bench_seam {
         timeline: &Arc<Mutex<SessionTimeline>>,
     ) -> Watch {
         let (last_block_id, last_title, last_bell) = {
-            let t = term.lock().expect("bench engine");
+            let t = term.lock().expect("fixture engine");
             (
                 t.all_blocks()
                     .filter(|b| b.is_complete())
@@ -2963,7 +2915,7 @@ pub(crate) mod bench_seam {
         // the struct literal below would hold the first guard (a temporary)
         // across the second and deadlock on this non-reentrant mutex.
         let (last_timeline_id, last_resize_id) = {
-            let tl = timeline.lock().expect("bench timeline");
+            let tl = timeline.lock().expect("fixture timeline");
             (tl.high_id(), tl.resizes().high_row())
         };
         Watch {
@@ -2978,7 +2930,7 @@ pub(crate) mod bench_seam {
             last_render_sig: 0,
             last_block_id,
             turns: turns.clone(),
-            last_turn_id: turns.lock().expect("bench ledger").high_id(),
+            last_turn_id: turns.lock().expect("fixture ledger").high_id(),
             timeline: timeline.clone(),
             last_timeline_id,
             last_resize_id,
@@ -2987,85 +2939,6 @@ pub(crate) mod bench_seam {
             byte_sub: None,
             non_coalesced: false,
         }
-    }
-
-    /// The INSTANCE ROSTER tick: rebuild the live-sid set, then run the SHIPPING
-    /// set-diff against the last one. This is what a `sessions` subscriber pays
-    /// on every 250 ms wake, changed or not.
-    ///
-    /// WHAT IS REAL AND WHAT IS MODELLED, stated plainly so the number is not
-    /// over-claimed. The DIFF is the shipping function, called directly. The
-    /// REBUILD is modelled: `SessionStore::live_sids` walks a `HashMap` of
-    /// registered handles and allocates one `String` per session, and this
-    /// walks a `HashSet` of the same sid strings and allocates one `String` per
-    /// session. Allocation count, string width and hashing are therefore
-    /// identical; the gap is the container being walked (and the store's
-    /// uncontended `RwLock` read, which the roster journal does not remove
-    /// anyway). Building the real thing would need a registered `SessionHandle`,
-    /// which needs a whole `SessionCtx` — a fixture that exists only behind
-    /// `#[cfg(test)]` and would have to be duplicated here to be reachable, at
-    /// which point it could drift from the real handle shape. Naming the gap is
-    /// the more honest trade.
-    #[cfg(feature = "bench-support")]
-    pub(crate) struct RosterRebuild {
-        /// The set as the subscriber last saw it (its watermark, pre-journal).
-        known: std::collections::HashSet<String>,
-        /// The instance's live sids right now.
-        live: std::collections::HashSet<String>,
-        /// Source of fresh sids for [`Self::churn`].
-        next: u64,
-    }
-
-    #[cfg(feature = "bench-support")]
-    impl RosterRebuild {
-        /// An instance with `sessions` live sessions, and a subscriber already
-        /// caught up to them (so the first tick is an UNCHANGED one).
-        pub(crate) fn new(sessions: usize) -> Self {
-            let live: std::collections::HashSet<String> =
-                (0..sessions as u64).map(sid_string).collect();
-            RosterRebuild {
-                known: live.clone(),
-                live,
-                next: sessions as u64,
-            }
-        }
-
-        /// ONE wake of the pre-journal roster body: rebuild the set, diff it,
-        /// adopt it. Returns the emitted bytes — `0` on an unchanged tick, which
-        /// is the state the bench measures and asserts.
-        pub(crate) fn tick(&mut self) -> usize {
-            // Models `SessionStore::live_sids` (see the type doc): one owned
-            // `String` per live session, collected into a fresh set.
-            let live: std::collections::HashSet<String> =
-                self.live.iter().map(|s| s.to_string()).collect();
-            let mut out = String::new();
-            super::diff_session_events(&live, &self.known, &|_| "", &mut out);
-            self.known = live;
-            out.len()
-        }
-
-        /// Retire one session and open another — so the NEXT tick has a real
-        /// created + exited pair to report. The upper half of the reach guard:
-        /// a diff that emitted nothing after this would not be running.
-        pub(crate) fn churn(&mut self) {
-            if let Some(victim) = self.live.iter().next().cloned() {
-                self.live.remove(&victim);
-            }
-            self.live.insert(sid_string(self.next));
-            self.next += 1;
-        }
-
-        /// How many sessions this instance has live — the lower reach guard.
-        pub(crate) fn sessions(&self) -> usize {
-            self.live.len()
-        }
-    }
-
-    /// A stable sid string of the shipped width (`s-` + 16 lowercase hex), so the
-    /// modelled rebuild allocates and hashes the same bytes the real one does.
-    #[cfg(feature = "bench-support")]
-    fn sid_string(i: u64) -> String {
-        format!("s-{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
     }
 
     /// A small, realistic turn record (the ledger clamps text itself).
@@ -3141,8 +3014,8 @@ mod tests {
 
     /// `@*` ADOPTION IS OWNER-ONLY, at the type level. The capability has no
     /// public constructor that can produce a permissive value from a non-Owner
-    /// scope, so a future caller that forgets the refusal in `run_subscribe`
-    /// still cannot grant it — the same invariant `InstanceStreams::authorize`
+    /// scope, so a future caller that forgets the refusal in
+    /// `run_subscribe_with_peer_probe` still cannot grant it — the same invariant `InstanceStreams::authorize`
     /// carries for the instance `sessions` stream, and for the same reason: a
     /// live target set names sessions the subscriber could not have named.
     #[test]
@@ -3190,7 +3063,7 @@ mod tests {
         // The adopted session really does wake us.
         registry.lock().unwrap().notify(2);
         assert!(
-            sub.wait(Duration::from_millis(500)),
+            sub.wait(aterm_spec::wait::MUST_HAPPEN),
             "a notify on the adopted session wakes the subscription"
         );
 
@@ -3289,7 +3162,10 @@ mod tests {
 
         // A notify on our session wakes us.
         reg.lock().unwrap().notify(7);
-        assert!(sub.wait(Duration::from_millis(200)), "our notify must wake");
+        assert!(
+            sub.wait(aterm_spec::wait::MUST_HAPPEN),
+            "our notify must wake"
+        );
     }
 
     /// COALESCING: a flood of notifies between two `wait`s collapses to a single
@@ -3307,7 +3183,10 @@ mod tests {
             reg.lock().unwrap().notify(1);
         }
         // Exactly one wake is pending (coalesced); the second wait times out.
-        assert!(sub.wait(Duration::from_millis(200)), "first wake delivered");
+        assert!(
+            sub.wait(aterm_spec::wait::MUST_HAPPEN),
+            "first wake delivered"
+        );
         assert!(
             !sub.wait(Duration::from_millis(20)),
             "flood coalesced to one wake"
@@ -3333,23 +3212,6 @@ mod tests {
         reg.lock().unwrap().notify(5);
     }
 
-    /// A STALLED subscriber (never calls `wait`) cannot block or backpressure the
-    /// producer: 100k notifies complete instantly while the slot stays full.
-    #[test]
-    fn stalled_subscriber_never_blocks_producer() {
-        let reg = new_registry();
-        let _sub = SubscriberSet::register(&reg, &[3]); // never wait()ed: wedged
-        let start = std::time::Instant::now();
-        for _ in 0..100_000 {
-            reg.lock().unwrap().notify(3);
-        }
-        // If notify blocked on a full slot this would never finish; assert it is fast.
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "producer not blocked by stall"
-        );
-    }
-
     /// Multiplex: one subscription watching two sessions is woken by EITHER.
     #[test]
     fn one_subscription_watches_multiple_sessions() {
@@ -3357,7 +3219,7 @@ mod tests {
         let sub = SubscriberSet::register(&reg, &[10, 20]);
         reg.lock().unwrap().notify(20);
         assert!(
-            sub.wait(Duration::from_millis(200)),
+            sub.wait(aterm_spec::wait::MUST_HAPPEN),
             "woken by either watched session"
         );
     }
@@ -4106,6 +3968,49 @@ mod tests {
         );
     }
 
+    /// A config reload of the host STYLE POLICY (`bold_is_bright`,
+    /// `faint_opacity`) re-colours bold and dim cells with no output and no seq
+    /// move, and nothing wakes a subscriber for it: the re-emit comes from the
+    /// render signature, read on the 250 ms liveness tick (`woke == false`).
+    #[test]
+    fn style_policy_reload_reemits_cells_on_the_liveness_tick() {
+        use aterm_core::config::TerminalConfig;
+        type Reload = (&'static str, fn(&mut TerminalConfig));
+        let reloads: [Reload; 2] = [
+            ("bold_is_bright", |c| c.bold_is_bright = !c.bold_is_bright),
+            ("faint_opacity", |c| c.faint_opacity = 0.9),
+        ];
+        let term = Arc::new(Mutex::new(Terminal::new(4, 8)));
+        let mut config = TerminalConfig::default();
+        crate::term_lock(&term).apply_config(&config);
+        crate::term_lock(&term).process(b"\x1b[1;33mB\x1b[0m \x1b[2mD\x1b[0m");
+        let streams = TargetStreams {
+            cells: true,
+            ..Default::default()
+        };
+        let mut w = watch_on(1, &term);
+        assert!(wake_text(&mut w, streams, true).contains(" cells "));
+        assert!(
+            wake_text(&mut w, streams, false).is_empty(),
+            "the premise: an idle tick re-emits nothing"
+        );
+        for (name, change) in reloads {
+            let seq = crate::term_lock(&term).content_seq();
+            change(&mut config);
+            crate::term_lock(&term).apply_config(&config);
+            assert_eq!(
+                crate::term_lock(&term).content_seq(),
+                seq,
+                "{name}: the premise: a reload bumps no content_seq"
+            );
+            let f = wake_text(&mut w, streams, false);
+            assert!(
+                f.contains("cells ") && f.contains(&format!("seq={seq} ")),
+                "{name}: the reload re-emits a cells DELTA at the unchanged seq: {f:?}"
+            );
+        }
+    }
+
     /// Text selection mutates render state without advancing `content_seq`.
     /// A coalesced cells-only subscriber must still receive the typed,
     /// side-adjusted selection (including a sparse blank tail), and clearing it
@@ -4627,70 +4532,12 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// THE EXIT LEDGER ON THE WIRE — the deterministic half. A `subscribe … events`
-    /// watch seeded exactly as [`push_loop`] seeds it ([`new_watch`], at the live
-    /// timeline high, so the `spawned` row is history) is pruned by the shipping
-    /// liveness verdict after a control-socket `close` deregisters its session, and
-    /// its final pass ([`Closing::drain`]) is BYTE-EXACTLY the `closing` row the
-    /// store wrote — `reason=ctl-close by=<caller>` — followed by `exited`. Nothing
-    /// else: the `state-change state=closed` written beside it is not a wire kind
-    /// (`exited` is that fact), and equality, not `contains`, is what proves it.
-    #[test]
-    fn a_ctl_close_reaches_a_live_events_watch_as_closing_then_exited() {
-        let store = crate::session_store::new_store();
-        let h = crate::session_store::test_handle(7);
-        let target: ResolvedTarget = (
-            7,
-            h.term.clone(),
-            h.ctx.byte_fanout.clone(),
-            h.ctx.turns.clone(),
-            h.ctx.timeline.clone(),
-            h.ctx.fabric.clone(),
-        );
-        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
-        let streams = TargetStreams {
-            events: true,
-            ..Default::default()
-        };
-        let mut watches = vec![new_watch(&target, streams, &PushOptions::default())];
-        // Live and idle: a wake pushes nothing (the seed hides `spawned`), and the
-        // liveness verdict keeps the watch.
-        assert!(
-            frames_for_watch(&mut watches[0], streams, true).is_empty(),
-            "a fresh watch replays no history"
-        );
-        assert!(
-            prune_closed(&store, &mut watches).is_empty(),
-            "alive: nothing to prune"
-        );
-
-        // The `close` verb's deregistration, as `retire_session_registration`
-        // performs it under the attribution the `Wake::CloseSession` arm opens.
-        store
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .deregister_local_as(
-                7,
-                crate::session_store::ExitReason::CtlClose,
-                crate::session_store::ExitActor::Sid("s-boss".into()),
-            );
-
-        let mut closing = prune_closed(&store, &mut watches);
-        assert!(watches.is_empty(), "the dead watch left the live set");
-        let out = text(
-            &closing
-                .pop()
-                .expect("handed back, not dropped")
-                .drain(streams),
-        );
-        assert_eq!(
-            out, "EVENT 7 closing reason=ctl-close by=s-boss\nEVENT 7 exited\n",
-            "why, then that: the ledger row precedes the end-of-stream marker, and \
-             nothing else leaks"
-        );
-    }
-
-    /// The same fact through the shipping [`push_loop`], end to end, with the close
+    /// THE EXIT LEDGER ON THE WIRE. A `subscribe … events` watch whose session a
+    /// control-socket `close` deregisters gets, BYTE-EXACTLY, the `closing` row the
+    /// store wrote — `reason=ctl-close by=<caller>` — followed by `exited`, and nothing
+    /// else: no history replayed, and the `state-change state=closed` written beside
+    /// it is not a wire kind (`exited` is that fact). Through the shipping
+    /// [`push_loop_with_peer_probe`], end to end, with the close
     /// landing AFTER the loop has seeded and caught up. The peer probe is the one
     /// hook the loop calls on its own thread strictly after the catch-up wake, so
     /// deregistering from inside it is race-free where a feeder thread would have
@@ -5224,7 +5071,7 @@ mod tests {
     /// unreachable and anything dropped before it is silent loss (the protocol
     /// promises `GAP` as the ONLY loss marker).
     ///
-    /// The session here is already gone when [`push_loop`] starts, so the first
+    /// The session here is already gone when [`push_loop_with_peer_probe`] starts, so the first
     /// liveness pass classifies it dead before ANY live per-watch pass can run for
     /// it — which means every byte in the output below came from [`Closing::drain`]
     /// and from nowhere else. That is the exact ordering the old `Vec::retain` broke:
@@ -5241,25 +5088,16 @@ mod tests {
         let registry = new_registry();
         let mut sink: Vec<u8> = Vec::new();
 
-        // `push_loop` subscribes to the fan-out itself, so the burst must be teed
-        // from another thread once that subscription exists — a burst teed before it
-        // has no queue to land in. The 40ms delay lands inside the first 250ms wait.
-        let feeder = {
-            let fan = fan.clone();
-            std::thread::spawn(move || {
-                // Wait on the FACT, not a timer. The tee must land after push_loop
-                // has subscribed (a burst teed earlier has no queue) but before its
-                // single 250ms wait expires — a 40ms sleep raced both edges: a
-                // descheduled feeder tees too late, a descheduled push_loop has not
-                // subscribed yet. `subscriber_count` makes the ordering explicit and
-                // removes the window entirely.
-                while fan.subscriber_count() == 0 {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                fan.tee(&Arc::from(&b"tail-bytes"[..]));
-            })
-        };
-        push_loop(
+        // `push_loop` subscribes to the fan-out itself, and its first wake's
+        // closing pass drains the dead watch: the burst must land between the
+        // two. It is teed from the loop's OWN peer probe, which that wake asks
+        // after its bounded wait and before the closing pass — an instant in the
+        // loop's order, not a race against its 250 ms wait. A feeder thread raced
+        // both edges, a sleep-paced one on either side and a fact-paced one
+        // (`subscriber_count`) still on the far one: descheduled past the wait,
+        // it teed after the drain, into nothing.
+        let mut teed = false;
+        push_loop_with_peer_probe(
             &registry,
             &store,
             &targets,
@@ -5269,9 +5107,17 @@ mod tests {
                 adopt: AdoptScope::none(),
             },
             PushOptions::default(),
+            "",
             &mut sink,
+            || {
+                if !std::mem::replace(&mut teed, true) {
+                    assert!(fan.subscriber_count() > 0, "push_loop subscribed first");
+                    fan.tee(&Arc::from(&b"tail-bytes"[..]));
+                }
+                false
+            },
         );
-        feeder.join().unwrap();
+        assert!(teed, "REACH: the loop woke once and the burst was teed");
 
         let out = String::from_utf8_lossy(&sink).into_owned();
         let bytes_at = out.find("BYTES 11 10\ntail-bytes\n");
@@ -5361,22 +5207,10 @@ mod tests {
         };
         let registry = new_registry();
         let mut sink: Vec<u8> = Vec::new();
-        let feeder = {
-            let fan = fan.clone();
-            std::thread::spawn(move || {
-                // Wait on the FACT, not a timer. The tee must land after push_loop
-                // has subscribed (a burst teed earlier has no queue) but before its
-                // single 250ms wait expires — a 40ms sleep raced both edges: a
-                // descheduled feeder tees too late, a descheduled push_loop has not
-                // subscribed yet. `subscriber_count` makes the ordering explicit and
-                // removes the window entirely.
-                while fan.subscriber_count() == 0 {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                fan.tee(&Arc::from(&b"last"[..]));
-            })
-        };
-        push_loop(
+        // Teed from the loop's own peer probe, between its subscription and the
+        // first closing pass — see the test above.
+        let mut teed = false;
+        push_loop_with_peer_probe(
             &registry,
             &store,
             &targets,
@@ -5386,9 +5220,17 @@ mod tests {
                 adopt: AdoptScope::none(),
             },
             PushOptions::default(),
+            "",
             &mut sink,
+            || {
+                if !std::mem::replace(&mut teed, true) {
+                    assert!(fan.subscriber_count() > 0, "push_loop subscribed first");
+                    fan.tee(&Arc::from(&b"last"[..]));
+                }
+                false
+            },
         );
-        feeder.join().unwrap();
+        assert!(teed, "REACH: the loop woke once and the burst was teed");
         let out = String::from_utf8_lossy(&sink).into_owned();
         assert!(
             out.contains("BYTES 13 4\nlast\n"),
@@ -5463,15 +5305,18 @@ mod tests {
         }
     }
 
-    /// The peer-liveness probe as a DEADLINE, so a scripted scenario that never
-    /// completes ends the loop instead of hanging the suite — the test then
-    /// fails on whatever did not happen.
-    fn gone_after(secs: u64) -> impl FnMut() -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    /// The peer-liveness probe as a HANG DETECTOR, so a scripted scenario that
+    /// never completes ends the loop instead of hanging the suite — the test
+    /// then fails on whatever did not happen. Every scenario ends itself, by
+    /// its sink hanging up, so a correct run never meets this; a bound of a
+    /// few seconds ended a slow-but-correct one before it finished.
+    fn hang_detector() -> impl FnMut() -> bool {
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         move || std::time::Instant::now() > deadline
     }
 
-    /// A handle carved into the tuple `run_subscribe` hands the push loop.
+    /// A handle carved into the tuple `run_subscribe_with_peer_probe` hands the
+    /// push loop.
     fn target_of(h: &crate::session_store::SessionHandle) -> ResolvedTarget {
         (
             h.local_id,
@@ -5563,10 +5408,11 @@ mod tests {
                     .collect(),
             );
             if self.reads.len() == 1 {
-                assert!(
+                assert_eq!(
                     self.ctx
                         .fabric
                         .topic_add(PROBE_TOPIC, "head", &self.ctx.timeline),
+                    Ok(true),
                     "a fresh session holds no opt-in yet"
                 );
             }
@@ -5658,7 +5504,7 @@ mod tests {
             PushOptions::default(),
             "",
             &mut sink,
-            gone_after(20),
+            hang_detector(),
         );
         let wire = std::mem::take(&mut sink.wire);
         drop(sink);
@@ -5721,9 +5567,11 @@ mod tests {
         let kick = {
             let (store, registry) = (store.clone(), registry.clone());
             std::thread::spawn(move || {
-                while registry.lock().unwrap().watchers(1) == 0 {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the push loop watches session 1",
+                    || (registry.lock().unwrap().watchers(1) > 0).then_some(()),
+                );
                 store.write().unwrap_or_else(|p| p.into_inner()).register(s);
             })
         };
@@ -5750,7 +5598,7 @@ mod tests {
             PushOptions::default(),
             "",
             &mut sink,
-            gone_after(20),
+            hang_detector(),
         );
         let wire = std::mem::take(&mut sink.wire);
         drop(sink);
@@ -5928,8 +5776,9 @@ mod tests {
         let mut sink = Scripted::new(|line: &str| {
             if line == ack && !added {
                 added = true;
-                assert!(
+                assert_eq!(
                     ctx.fabric.topic_add(PROBE_TOPIC, "head", &ctx.timeline),
+                    Ok(true),
                     "a fresh session holds no opt-in yet"
                 );
             }
@@ -5942,7 +5791,7 @@ mod tests {
             &registry,
             Scope::Owner,
             &mut sink,
-            gone_after(5),
+            hang_detector(),
         );
         let wire = std::mem::take(&mut sink.wire);
         drop(sink);
@@ -6006,7 +5855,7 @@ mod tests {
             &registry,
             Scope::Owner,
             &mut sink,
-            gone_after(10),
+            hang_detector(),
         );
         let wire = std::mem::take(&mut sink.wire);
         drop(sink);

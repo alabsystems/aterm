@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A SESSION LAUNCH PRINTS NOTHING ABOUT UPDATES (Phase 2 of
-//! `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`, 2026-09-22): nothing prints
-//! into a shell the user did not ask to update.
+//! A SESSION LAUNCH PRINTS NOTHING ABOUT UPDATES
+//! (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`): nothing prints into a
+//! shell the user did not ask to update.
 //!
 //! The real binary as a person launches it: `aterm --session` with a REAL terminal on
 //! stdin (the interactive lane — the one that spawns the background work) over a scratch
@@ -11,15 +11,11 @@
 //! own greeting asks for a terminal on stderr too, so a pipe there keeps it out of the way;
 //! the assertion is on every byte, not on one line.) Three machines:
 //!
-//! * a store that has never completed a pass — until 2026-09-22 every launch printed
-//!   `atpkg: no update check has run yet on this machine — …`;
-//! * a MALFORMED `[packages]` table — the launch read `aterm.toml` once per consumer and
-//!   printed a five-line "ignoring malformed aterm.toml" block per read, 25 lines before the
-//!   prompt (review, 2026-09-22);
+//! * a store that has never completed a pass;
+//! * a MALFORMED `[packages]` table;
 //! * the reroute ENGAGED over a store whose `reroute/` cannot be made, with a retired
-//!   `tracked_install` key and a configured prefix this user cannot write — every one of
-//!   which printed on stderr, the lay failure from a thread beside the
-//!   live shell.
+//!   `tracked_install` key and a configured prefix this user cannot write (the lay
+//!   failure comes from a thread beside the live shell).
 //!
 //! Nothing here reaches the machine: every root is private ([`launch_isolation`]), no
 //! one-shot `aterm pkg update` is spawned (the lane's own pass slot is claimed in the
@@ -40,7 +36,9 @@ use std::time::{Duration, Instant};
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-/// The session gets this long to start the shell, run `exit` and leave.
+/// The session gets this long to start the shell, run `exit` and leave, and
+/// its pipes this long to close after it: a hang detector (AGENTS.md), never a
+/// latency budget.
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// The `[machine]` table every fixture carries: nothing on the host is touched.
@@ -90,16 +88,12 @@ fn make_prefix(root: &Path) -> PathBuf {
 
 /// Claim the session lane's pass slot NOW in the scratch prefix, so a launch with
 /// packages enabled spawns no pass: the machine-wide rule the lane runs on
-/// (`pkg_check::claim` on `session-pass.stamp`) says a sibling just started one. The
-/// environment kill switch this used to take is gone (2026-09-23).
+/// (`pkg_check::claim` on `session-pass.stamp`) says a sibling just started one.
 fn hold_the_pass(root: &Path) {
     let layout = atpkg::store::Layout {
         prefix: make_prefix(root),
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs();
+    let now = aterm_time::unix_secs().expect("clock");
     std::fs::write(layout.session_pass_stamp(), format!("{now}\n")).expect("claim the slot");
 }
 
@@ -108,37 +102,18 @@ fn hold_the_pass(root: &Path) {
 /// carries `--no-reroute`.
 fn launch(root: &Path, reroute: bool) -> (String, String) {
     // Every spawn in this binary is a `launch`, and each opens a pty: held from the
-    // `openpty` until this launch's own slave copies are dropped, this lock keeps a
-    // sibling launch's `aterm` from inheriting THIS pty's slave (openpty opens both
-    // ends inheritable, and std's stderr pipe is made close-on-exec non-atomically
-    // on macOS). An inherited slave lives as long as the sibling's session, and this
-    // launch's terminal drain would wait on it past its 10 s grace (the fd-copy
-    // sweep of 2026-09-27).
+    // open until this launch's own slave copies are dropped, this lock keeps a
+    // sibling launch's `aterm` from inheriting THIS launch's descriptors. The pty's
+    // ends are close-on-exec from birth (`aterm_pty::open_pty_pair`), but std's
+    // stderr pipe is made close-on-exec non-atomically on macOS. An inherited
+    // descriptor lives as long as the sibling's session, and this launch's drains
+    // would wait on it past their 10 s grace (the fd-copy sweep of 2026-09-27).
     static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let spawning = SPAWN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (mut master, mut slave) = (-1, -1);
-    // SAFETY: `openpty` writes the two fds through its out-params; the trailing three are
-    // NULL, which the API defines as "default termios and window size".
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
-    for fd in [master, slave] {
-        // SAFETY: `fd` is a live descriptor `openpty` just returned.
-        assert_eq!(
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
-            0
-        );
-    }
-    // SAFETY: both fds come from the successful `openpty` above and are owned here.
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    // SAFETY: both fds come from the successful open above and are owned here.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
@@ -193,7 +168,7 @@ fn launch(root: &Path, reroute: bool) -> (String, String) {
     // Bounded joins: a descendant holding a pipe or the slave past the session's exit
     // must fail this test, never wedge the suite.
     let join = |drain: std::thread::JoinHandle<Vec<u8>>, what: &str| -> String {
-        let grace = Instant::now() + Duration::from_secs(10);
+        let grace = Instant::now() + DEADLINE;
         while !drain.is_finished() {
             assert!(
                 Instant::now() < grace,

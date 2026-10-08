@@ -118,14 +118,8 @@ impl LevelFilter {
     /// ```
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        // A flat sequence of ASCII-case-insensitive comparisons against string
-        // literals. This is exactly a `.iter().find()` over a six-entry name/level
-        // table, but written without materializing that `[(&str, LevelFilter); 6]`
-        // const: iterating it forces an array-to-slice unsize coercion whose
-        // fat-pointer element type carries the `LevelFilter` discriminant-index
-        // metadata, which the verifier cannot lower. Each `eq_ignore_ascii_case`
-        // lowers to plain byte comparisons with no pointer cast, so behavior is
-        // identical (same names, same trimming, `None` otherwise).
+        // An if-chain, not a lookup table: iterating a `[(&str, LevelFilter); 6]`
+        // needs an array-to-slice unsize coercion the verifier cannot lower.
         let s = s.trim();
         if s.eq_ignore_ascii_case("off") {
             Some(LevelFilter::Off)
@@ -206,24 +200,15 @@ fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     if clean && msg.len() <= cap {
         return Cow::Borrowed(msg);
     }
-    // Capacity is a single compile-time constant so the verifier can bound the
-    // reservation below its per-allocation ceiling: the loop below caps output at
-    // `cap` (never above `MAX_ALERT_RECORD_BYTES`) and appends at most a 3-byte
-    // `…`, so the owned string never exceeds `MAX_ALERT_RECORD_BYTES + 3`.
-    // Reserving `MAX_ALERT_RECORD_BYTES + 4` is a fixed hint that only affects the
-    // reservation, not the bytes pushed, so the returned value is byte-identical
-    // (a `.min(msg.len())` would only ever under-reserve for tiny inputs — never
-    // change output). The `+ 4` is folded in a `const` item so the function body
-    // carries no runtime add and the operand reaching `with_capacity` is a plain
-    // literal the verifier can bound.
+    // A constant capacity, so the verifier can bound the reservation: output is
+    // at most `cap <= MAX_ALERT_RECORD_BYTES` plus a 3-byte `…`. The add lives in
+    // a `const` so `with_capacity` receives a plain literal.
     const OUT_CAPACITY: usize = MAX_ALERT_RECORD_BYTES + 4;
     let cap = cap.min(MAX_ALERT_RECORD_BYTES);
     let mut out = String::with_capacity(OUT_CAPACITY);
     for c in msg.chars() {
-        // Guard on the bytes ACTUALLY pushed. A control char becomes U+FFFD (3
-        // bytes), not its own `len_utf8()` (1 byte for C0/DEL), so measuring the
-        // original width would let a control char at the boundary push `out` past
-        // `cap + 3` and silently reallocate past the reservation.
+        // Measure the bytes actually pushed: a 1-byte control char becomes a
+        // 3-byte U+FFFD, and the original width would overrun the reservation.
         let (pushed, pushed_len) = if c.is_control() {
             ('\u{FFFD}', '\u{FFFD}'.len_utf8())
         } else {
@@ -365,14 +350,9 @@ impl std::error::Error for SetLoggerError {}
 
 /// Log a record. Called by the macros; not intended for direct use.
 #[doc(hidden)]
-// Panic-freedom here is inherently unprovable in this crate: the body dispatches
-// through `LOGGER: OnceLock<&dyn Log>` (std absent-callee `OnceLock::get`) into a
-// runtime-chosen `dyn Log::{enabled,log}` impl. Both the OnceLock read and the
-// virtual calls are total in every real logger, but the fail-closed verifier
-// cannot see their bodies. The concrete logger impl's safety is established by its
-// OWN verification, so this is the textbook `#[trust::skip]` case — and with the
-// native-bundle skip-exclusion fix, callers (every `log!` site) demote this to a
-// non-fatal expected-absent-callee assumption instead of inheriting a fatal row.
+// Skipped by the verifier: the body calls `OnceLock::get` and a runtime-chosen
+// `dyn Log` impl, neither of which it can see. Each concrete logger is verified
+// on its own, and `log!` call sites treat this as an expected absent callee.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn __log(
     level: Level,
@@ -484,19 +464,14 @@ macro_rules! trace {
 /// site, so the mutations at least cannot race EACH OTHER or a same-process reader
 /// that takes the same lock.
 ///
-/// This lives in `aterm-log` for one reason: it is the workspace's dependency-free
-/// leaf that everything already links (`aterm-types`, `aterm-update`,
-/// `aterm-update-core`, `aterm-core`, `aterm-gui`, …). A lock only serializes the
-/// mutators that SHARE it, so a per-crate lock would be theatre — the whole point
-/// is that the one binary has one lock.
+/// It lives in `aterm-log` because this is the dependency-free leaf every crate
+/// links: a lock only serializes the mutators that share it, so the one binary
+/// needs one lock.
 ///
 /// **This does not make environment mutation safe.** It bounds the in-process race
 /// between our own writers; a `getenv` in a C library on another thread is still
-/// unsynchronized. Every caller must therefore still be a genuine
-/// single-threaded-startup or trusted-launcher path, and say why. The helpers are
-/// deliberately few and narrow (take / unset / set / scoped), because the only
-/// defensible uses in this codebase are startup handoff, launcher intent, and a
-/// test that must own one variable for the length of one call.
+/// unsynchronized. Every caller must still be a single-threaded startup,
+/// trusted-launcher or test path, and say why.
 pub mod env {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard};
@@ -520,15 +495,13 @@ pub mod env {
 
     /// The one blessed `remove_var`. Callers hold [`ENV_LOCK`].
     fn remove_locked(key: &OsStr) {
-        // `env_mutation` is a Trust-compiler lint, so its `allow` rides the two cfgs only
-        // a Trust compiler sets — `trust_verify` (a verifying lane) and `clean_islands`
-        // (the off-switch lane `.cargo/config.toml` configures); an upstream lane (the
-        // Linux/Windows cells, the x86_64 compat slice) has no such lint to name.
+        // `env_mutation` is a Trust-only lint, so its `allow` is gated on the cfgs
+        // only Trust lanes set (`trust_verify`, `clean_islands`); upstream lanes
+        // have no such lint.
         //
-        // SAFETY: the documented contract of this module — the caller is a
-        // single-threaded startup, trusted-launcher, or single-test-binary path,
-        // and this is one of the two blessed mutation sites in the workspace,
-        // reached only with `ENV_LOCK` held.
+        // SAFETY: the module contract — the caller is a single-threaded startup,
+        // trusted-launcher or test path, and this is one of the two blessed
+        // mutation sites, reached only with `ENV_LOCK` held.
         #[cfg_attr(
             any(trust_verify, clean_islands),
             allow(
@@ -663,19 +636,8 @@ pub mod env {
 mod tests {
     use super::*;
 
-    // Note: since set_logger can only be called once per process and tests
-    // run in the same process, we test the internal __log function directly
-    // and the macro expansion separately.
-
-    // `max_level` is a process-global singleton. Tests that both MUTATE it and
-    // ASSERT on its value race each other under the default parallel test
-    // runner (one test's `set_max_level` clobbers another's between its set and
-    // its assert). Serialize exactly those tests on this lock. Tests that only
-    // set the level without asserting it (so they can't observe a race) don't
-    // need it, but taking the lock is harmless. Uses the std Mutex — no new dep.
-    // `.unwrap_or_else(|e| e.into_inner())` so a panic in one guarded test
-    // (which poisons the lock) doesn't cascade into spurious failures in the
-    // others; we only need mutual exclusion, not poison propagation.
+    // Serializes tests that set the process-global max level and then assert it.
+    // Callers recover a poisoned lock so one failing test does not cascade.
     static LEVEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -705,9 +667,8 @@ mod tests {
     }
 
     #[test]
-    fn test_max_level_default_is_off() {
+    fn test_max_level_round_trips() {
         let _guard = LEVEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Verify the round-trip for max_level.
         set_max_level(LevelFilter::Debug);
         assert_eq!(max_level(), LevelFilter::Debug);
         set_max_level(LevelFilter::Off);
@@ -849,11 +810,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_record_control_char_at_boundary_stays_within_reservation() {
-        // A C0 control char is 1 byte but is pushed as U+FFFD (3 bytes). With the
-        // cap guard measuring the ORIGINAL width, a control char landing at the
-        // byte boundary would push `out` to MAX_RECORD_BYTES + 5 (past the reserved
-        // MAX_RECORD_BYTES + 4) and silently reallocate. Guarding on the pushed
-        // width keeps the owned string within MAX_RECORD_BYTES + '…'.len_utf8().
+        // A 1-byte control char at the boundary is pushed as 3-byte U+FFFD.
         let msg = "a".repeat(MAX_RECORD_BYTES - 1) + "\u{01}" + "a";
         let out = sanitize_record(&msg);
         assert!(out.len() <= MAX_RECORD_BYTES + '…'.len_utf8());
@@ -926,9 +883,8 @@ mod env_tests {
         super::env::unset(KEY);
     }
 
-    /// A PANICKING body still restores: an override that outlived a failing test
-    /// would silently corrupt every later test in the binary, which is precisely
-    /// the failure the hand-rolled restore guards this replaces were written for.
+    /// A panicking body still restores: a leaked override would corrupt every
+    /// later test in the binary.
     #[test]
     fn scoped_restores_even_when_the_body_panics() {
         const KEY: &str = "ATERM_LOG_TEST_SCOPED_PANIC";

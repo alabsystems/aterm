@@ -47,8 +47,8 @@ pub const STALE_WAIT: Duration = Duration::from_secs(30);
 pub const PASTING: &str = "Pasting";
 
 /// How long a paste's program may take none of it before the row says so
-/// (round 18, day four, D8: `Pasting 12 MB 0%` stood 37 s with no word that
-/// it waited on the program, which had stopped reading). A few of the
+/// (D8: `Pasting 12 MB 0%` must not stand with no word that it waits on a
+/// program that stopped reading). A few of the
 /// paste's own samples: a program that reads in bursts is never called
 /// stopped between two of them.
 pub(crate) const PASTE_UNREAD_AFTER: Duration = Duration::from_secs(3);
@@ -139,7 +139,9 @@ pub fn lines_words(n: u64) -> String {
     } else if n >= M - K / 2 {
         let t = (n.saturating_mul(10) + M / 2) / M;
         format!("{}.{}M", t / 10, t % 10)
-    } else if n >= 10 * K {
+    } else if n >= 10 * K - K / 20 {
+        // As the M branch: a figure that would round to ten of the tenths
+        // unit is the whole unit (`10K`, never `10.0K`).
         format!("{}K", (n + K / 2) / K)
     } else if n >= K {
         let t = (n.saturating_mul(10) + K / 2) / K;
@@ -487,8 +489,7 @@ mod tests {
         }
     }
 
-    /// A PASTE THE PROGRAM IS NOT READING SAYS SO (round 18, day four, D8:
-    /// `Pasting 12 MB 0%` for 37 s, no word of what it waited on). Once the
+    /// A PASTE THE PROGRAM IS NOT READING SAYS SO (D8). Once the
     /// program has taken none of it for [`PASTE_UNREAD_AFTER`], the row's
     /// excerpt names the program and how long; the words go as soon as it
     /// reads again. NEGATIVE CONTROL: a paste that keeps moving, and one

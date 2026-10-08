@@ -59,9 +59,6 @@ compatibility** — a copy installed from a pre-migration release will never
 select a new one and must be reinstalled once (see the installer in
 [README ▸ Install](README.md#install)).
 
-Some compatibility and regression tests still contain historical strings from
-that scheme. Those are fixtures, not version claims.
-
 ## The public source snapshot
 
 The public source snapshot carries the workspace version exactly as committed —

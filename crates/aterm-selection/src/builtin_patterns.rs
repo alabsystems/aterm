@@ -14,22 +14,15 @@ use super::rules::{RulePriority, SelectionRule, SelectionRuleKind};
 pub(crate) struct BuiltinRules;
 
 impl BuiltinRules {
-    // URL pattern: matches http, https, ftp, file URLs
-    // Captures the protocol and the rest of the URL
-    // Uses non-greedy matching to avoid capturing trailing punctuation
+    // http, https, ftp and file URLs; the last character excludes trailing
+    // punctuation.
     const URL_PATTERN: &'static str =
         r#"(?i)(?:https?|ftp|file)://[^\s<>\[\](){}'"`,;|\\^]+[^\s<>\[\](){}'"`,;|\\^.!?:]"#;
 
-    // File path pattern: matches absolute and relative paths
-    // Unix: /path/to/file, ./relative, ../parent
-    // Windows: C:\path\to\file, .\relative
-    // A path is one or more `/`-joined segments with an optional prefix: `/` (absolute),
-    // `.`/`..` (explicitly relative), `~` (home), or a first SEGMENT — `crates/x/y.rs`.
-    // The bare-relative shape matters: without it the leftmost match inside
-    // `crates/aterm-gui/src/lib.rs` began at its first slash, and a double-click on a
-    // relative path copied `/aterm-gui/src/lib.rs` — the first segment dropped and a
-    // leading `/` added, an absolute path that does not exist (glass hunt, m17-tower,
-    // 2026-09-01, finding 3). A Windows drive path keeps its own alternative.
+    // One or more `/`-joined segments with an optional prefix: `~`, `.`/`..`, or a
+    // bare first segment (`crates/x/y.rs`; without it the match would start at the
+    // first slash and drop that segment). Windows drive paths are a second
+    // alternative.
     const FILE_PATH_PATTERN: &'static str = r"(?:~|\.{1,2}|[a-zA-Z0-9._-]+)?(?:/[a-zA-Z0-9._-]+)+/?|[A-Za-z]:[/\\](?:[a-zA-Z0-9._-]+[/\\])*[a-zA-Z0-9._-]+";
 
     // Email pattern: RFC 5321 compliant (simplified)
@@ -41,9 +34,7 @@ impl BuiltinRules {
     // IPv6 pattern (simplified - matches most common formats)
     const IPV6_PATTERN: &'static str = r"\[?(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}|::)\]?(?::\d{1,5})?";
 
-    // Git hash pattern: 7-40 hex characters
-    // Uses word boundaries to avoid matching partial hex strings
-    // Note: This may match within larger hex strings at word boundaries
+    // Git hash: 7-40 hex characters between word boundaries.
     const GIT_HASH_PATTERN: &'static str = r"\b[0-9a-fA-F]{7,40}\b";
 
     // Double-quoted string

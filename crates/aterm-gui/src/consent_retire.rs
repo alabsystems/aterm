@@ -2,21 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The Security panel's *Move to Trash* for conflicting copies of aterm
-//! (design §3.7, the third repair).
+//! (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md`, "Security page").
 //!
-//! A copy on disk that claims aterm's bundle id with a different code
-//! requirement resets the Full Disk Access grant for every copy whenever it
-//! asks (`aterm_containment::consent`, "The claimant census"). The panel lists
-//! such copies and, for an ad-hoc or unsigned one beside a running copy whose
-//! grant survives updates, offers to move it to the Trash. This is the worker
-//! behind that button.
+//! A copy that claims aterm's bundle id with a different code requirement
+//! resets the Full Disk Access grant for every copy whenever it asks
+//! (`aterm_containment::consent`, "The claimant census"). The panel offers to
+//! move such a copy to the Trash when the census reads it as offered
+//! (`consent::TrashOffer`); this is the worker behind that button.
 //!
-//! An owner gesture only: the press is confirmed in an AppKit alert no control
-//! verb can answer, and there is no verb, config key or automatic trigger. Off
-//! the main thread it re-checks before touching anything — a fresh census, the
-//! copy's identity again right before the move, whether a process runs from it
-//! — and then moves it with `/usr/bin/trash`, the Finder's own move, so the
-//! copy stays recoverable.
+//! Owner gesture only: an AppKit alert no control verb can answer confirms the
+//! press, and no verb, config key or automatic trigger starts it. Off the main
+//! thread it re-checks (a fresh census, the copy's identity right before the
+//! move, whether a process runs from it) and moves the copy with
+//! `/usr/bin/trash`, so it stays recoverable.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -121,9 +119,9 @@ impl RetireState {
         }
     }
 
-    /// The worker's slot, locked. A GUARD-RETURNING helper: registered in the
-    /// lock-order census's `GUARD_HELPERS` (identity `shared`, the same `Arc` the
-    /// worker thread locks by that name), so its callers' holds are graphed.
+    /// The worker's slot, locked. A guard-returning helper registered in the
+    /// lock-order census's `GUARD_HELPERS` (identity `shared`, the `Arc` the
+    /// worker thread locks by that name), so callers' holds are graphed.
     fn retire_slot(&self) -> std::sync::MutexGuard<'_, Slot> {
         self.shared.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -211,12 +209,12 @@ pub(crate) fn summary(moved: usize, of: usize) -> String {
 /// Move `path` to the Trash with [`TRASH_TOOL`], bounded by [`TRASH_CEILING`].
 /// The error is the system's own reason when it gave one.
 fn trash_with_tool(path: &Path) -> Result<(), String> {
-    use std::process::{Command, Stdio};
+    use aterm_uds::spawnfd::Stdio;
     // Census paths are absolute, so the argument can never read as an option.
     if !path.is_absolute() {
         return Err("not an absolute path".to_string());
     }
-    let mut child = Command::new(TRASH_TOOL)
+    let mut child = aterm_uds::spawnfd::command(TRASH_TOOL)
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -278,6 +276,7 @@ mod tests {
             signing: if running { "developer-id" } else { "adhoc" },
             team: None,
             running,
+            links: Vec::new(),
         };
         Claimants {
             found: vec![
@@ -301,7 +300,7 @@ mod tests {
     }
 
     fn wait_for_report(state: &RetireState) -> RetireReport {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while state.is_live() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -324,7 +323,7 @@ mod tests {
             PathBuf::from("/A/x.app"),
         ];
         assert!(state.start("x".to_string(), plan, move || tx.send(()).unwrap()));
-        rx.recv_timeout(Duration::from_secs(10))
+        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the worker wakes the loop");
         assert_eq!(
             wait_for_report(&state),
@@ -371,10 +370,9 @@ mod tests {
         let _ = wait_for_report(&state);
     }
 
-    /// A windowed instance's arms ARE the checks the design names: a fresh
-    /// census, the per-copy identity re-read, the process-table walk and the
-    /// trash tool — so no test double can stand in for them in production. A
-    /// headless one gets the inert arms, which move nothing.
+    /// A windowed instance gets the real checks (census, identity re-read,
+    /// process-table walk, trash tool); a headless one gets inert arms that move
+    /// nothing.
     #[test]
     fn the_live_arms_are_the_real_checks() {
         fn same(a: &RetireArms, b: &RetireArms) -> bool {
@@ -433,27 +431,22 @@ mod tests {
         assert_eq!(trash_refusal("Code=4 \"\""), None);
     }
 
-    /// NO CONTROL MODULE CAN RAISE A CONSENT SURFACE. Starting the warm-up puts a
-    /// system modal on the owner's screen, the observer is off unless the owner
-    /// enables it, and retiring a claimant moves a copy of the app: a program
-    /// inside a session must reach none of them, so none of their entry points
-    /// may appear in any control module. Reading the warm-up's rows is harmless
-    /// and deliberately not listed. `app act` is generic, so its refusal is
-    /// pinned by behaviour in `app_control`'s tests; this pins the vocabulary.
+    /// No control module names an entry point that raises a consent surface (the
+    /// warm-up's system modal, the observer, a claimant retire, a debugger-access
+    /// change). Reading the warm-up's rows is harmless and not listed; `app act`'s
+    /// refusal is pinned by behaviour in `app_control`'s tests.
     #[test]
     fn no_control_module_names_a_consent_raising_entry_point() {
         const ENTRY_POINTS: &[&str] = &[
-            // the warm-up (design §3.5)
+            // the warm-up
             "begin_consent_warmup",
             "WarmupState::start",
             "consent_warmup::WarmupProbe",
             // the observer
             "consent_observer",
-            // the claimant retire: what STARTS a move, including the App's worker
-            // field itself (`self.claimant_retire.start(…)` would skip
-            // `begin_claimant_retire`'s gates). Reading whether the trash tool
-            // exists (`trash_tool_present`, used by the `privacy` verb's note) is
-            // not one.
+            // the claimant retire: what starts a move, including the App's worker
+            // field (`self.claimant_retire.start(…)` would skip
+            // `begin_claimant_retire`'s gates). `trash_tool_present` only reads.
             "begin_claimant_retire",
             "retire_claimants",
             "RetireState",
@@ -498,9 +491,8 @@ mod tests {
         }
     }
 
-    /// The live tool, on a path that is not there: it runs, moves nothing, and
-    /// the refusal is its own reason. (A successful move is not exercised here:
-    /// it would put a file in this account's real Trash on every run.)
+    /// The live tool on a missing path runs, moves nothing, and reports its own
+    /// refusal. A successful move is not exercised: it would touch the real Trash.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_trash_tool_names_why_it_could_not_move_a_copy() {

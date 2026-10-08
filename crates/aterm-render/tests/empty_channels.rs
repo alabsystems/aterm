@@ -298,10 +298,8 @@ const CHANNELS: &[Channel] = &[
 
 #[test]
 fn every_empty_channel_is_byte_identical_and_clear_overlays_restores_the_bare_frame() {
-    let Some(mut rend) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     // Deterministic pixels: a lazy fallback parse landing between two renders
     // could recolour a "must not change" frame.
     rend.debug_block_on_lazy_fallbacks();

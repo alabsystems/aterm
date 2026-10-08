@@ -5,9 +5,7 @@
 //! Grid indexing types for terminal coordinates.
 //!
 //! Provides `Line`, `Column`, `Point`, and related types used to address
-//! cells in a terminal grid. Extracted from `aterm-alacritty-bridge` to
-//! `aterm-types` so any consumer can use grid coordinates without depending
-//! on the bridge crate (#3828).
+//! cells in a terminal grid.
 
 use std::fmt;
 use std::ops::{Add, Sub};

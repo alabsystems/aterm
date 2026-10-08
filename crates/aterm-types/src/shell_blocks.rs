@@ -30,38 +30,6 @@ pub enum BlockState {
     Complete,
 }
 
-/// Named absolute row span with exclusive end semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RowSpan {
-    /// Absolute start row, inclusive.
-    pub start_row: u64,
-    /// Absolute end row, exclusive.
-    pub end_row_exclusive: u64,
-}
-
-impl RowSpan {
-    /// Create a new absolute row span with an exclusive end row.
-    #[must_use]
-    pub const fn new(start_row: u64, end_row_exclusive: u64) -> Self {
-        Self {
-            start_row,
-            end_row_exclusive,
-        }
-    }
-
-    /// Return the number of rows in the span.
-    #[must_use]
-    pub const fn row_count(self) -> u64 {
-        self.end_row_exclusive.saturating_sub(self.start_row)
-    }
-
-    /// Convert back to the legacy tuple representation.
-    #[must_use]
-    pub const fn as_tuple(self) -> (u64, u64) {
-        (self.start_row, self.end_row_exclusive)
-    }
-}
-
 /// An output block representing a command and its output as an atomic unit.
 ///
 /// Blocks are the fundamental abstraction for agent workflows:
@@ -188,34 +156,24 @@ impl OutputBlock {
         matches!(self.exit_code, Some(code) if code != 0)
     }
 
-    /// Get the typed row span for the command portion of this block.
+    /// Absolute `(start, end_exclusive)` rows of the command portion of this
+    /// block.
     #[must_use]
-    pub fn command_row_span(&self) -> Option<RowSpan> {
+    pub fn command_rows(&self) -> Option<(u64, u64)> {
         let start = self.command_start_row?;
         let end = self
             .output_start_row
             .unwrap_or(self.end_row.unwrap_or(start.saturating_add(1)));
-        Some(RowSpan::new(start, end))
+        Some((start, end))
     }
 
-    /// Get the typed row span for the output portion of this block.
-    #[must_use]
-    pub fn output_row_span(&self) -> Option<RowSpan> {
-        let start = self.output_start_row?;
-        let end = self.end_row.unwrap_or(start.saturating_add(1));
-        Some(RowSpan::new(start, end))
-    }
-
-    /// Compatibility shim for callers still using tuple row ranges.
-    #[must_use]
-    pub fn command_rows(&self) -> Option<(u64, u64)> {
-        self.command_row_span().map(RowSpan::as_tuple)
-    }
-
-    /// Compatibility shim for callers still using tuple row ranges.
+    /// Absolute `(start, end_exclusive)` rows of the output portion of this
+    /// block.
     #[must_use]
     pub fn output_rows(&self) -> Option<(u64, u64)> {
-        self.output_row_span().map(RowSpan::as_tuple)
+        let start = self.output_start_row?;
+        let end = self.end_row.unwrap_or(start.saturating_add(1));
+        Some((start, end))
     }
 }
 

@@ -1,38 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE BAND UNDER CODEX'S COMPOSER IS ONE RUN, ON EVERY FRAME** (2026-09-16
-//! — the owner, on the shipped 0.86.0: *"there is still this gapping issue
-//! that arises in codex, it seems to happen when doing backword and editing"*).
+//! The band under Codex's composer is one run, on every frame, through word
+//! hops and edits.
 //!
-//! Codex 0.154.0 (ratatui, per-cell diff) paints an ambient BRAILLE PARTICLE
-//! field into the blank cells of its composer on every ~150 ms frame — `⠁ ⠄ ⠈
-//! ⢀`, dim grey, inside a `?2026` synchronized-update bracket. The particles
-//! drift, so a SPACE the user typed flips `' '` → `'⠈'` → `' '` while the words
-//! either side of it stand unchanged; the caret parking on such a cell (an
-//! Alt+Right word hop lands on the space after the word) clears the particle to
-//! a plain space and the next frame paints it back. A typed space can even be
-//! ECHOED as a particle, because Codex draws the particle in the cell the
-//! moment it is blank.
+//! Codex (ratatui, per-cell diff) paints an ambient Braille particle field
+//! into the blank cells of its composer on every ~150 ms frame (`⠁ ⠄ ⠈ ⢀`,
+//! dim grey, inside a `?2026` synchronized-update bracket). The particles
+//! drift, so a space the user typed flips `' '` → `'⠈'` → `' '` while the
+//! words either side stand unchanged; the caret parking on such a cell (an
+//! Alt+Right word hop lands on the space after the word) clears the particle
+//! and the next frame paints it back. A typed space can even be echoed as a
+//! particle, because Codex draws the particle in the cell the moment it is
+//! blank.
 //!
-//! This file replays Codex's REAL bytes — `fixtures/codex-particles-2026-09-16.ptylog`,
-//! recorded under a PTY wrapper inside a headless aterm instance while the
-//! owner's gesture was driven through the keyboard seam (type a line, Alt+Left
-//! ×3, type a word, Alt+Right ×3, type two letters) — through a real
-//! [`Terminal`], sampled exactly as `app_render.rs`'s frame hold samples it, fed to
-//! [`CursorGlow`] with the hints the app stamps for those keys, and censuses the
-//! PLAN's coverage on the composer row every 8 ms.
-//!
-//! Measured on glass before this, same fixture, same build: the band read
-//! `#########.#.#######` for over a second — persistent one-cell holes EXACTLY
-//! on the two spaces the hops had parked the caret on — and during plain typing
-//! the band fell from 33 lit cells to 9 within 600 ms where zsh keeps 38.
+//! This file replays Codex's real bytes
+//! (`fixtures/codex-particles-2026-09-16.ptylog`: type a line, Alt+Left ×3,
+//! type a word, Alt+Right ×3, type two letters) through a real [`Terminal`],
+//! sampled as `app_render.rs`'s frame hold samples it, fed to [`CursorGlow`]
+//! with the hints the app stamps for those keys, and censuses the plan's
+//! coverage on the composer row every 8 ms.
 
+use crate::common::{
+    LIT_COV, caret_sample, coverage, geom, holes_of, is_arrow, note_blink, observe_caret_row,
+    observe_ribbon_rows, rainbow_cfg, sync_scroll, unhex,
+};
 use aterm_core::render::GlowQuad;
-use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_core::terminal::{ContentScrollState, Terminal};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::TypedClass;
-use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use aterm_spec::derive::{rainbow_typed_continuity_model, same_caret_typed_echo_model};
 use std::time::{Duration, Instant};
 
@@ -43,17 +39,13 @@ const CW: usize = 7;
 const CH: usize = 14;
 /// The frame train.
 const FRAME_MS: u64 = 8;
-/// A cell counts as LIT at this planned coverage — the pixel census on glass
-/// calls a cell lit at 20% of the bed.
-const LIT_COV: u8 = 20;
 /// Replay stops before the take's exit keys (Ctrl+C ×2, then Ctrl+D).
 const END_MS: u64 = 9_500;
 
 const FIXTURE: &str = include_str!("fixtures/codex-particles-2026-09-16.ptylog");
-/// Codex 0.155.1 under installed aterm v0.90, 56×137 at 24 px, with the
-/// owner's wrapped composer shape. The first `a` key is at 8893 ms and its
-/// complete synchronized echo at 8916 ms; the `and ` run naturally retires
-/// before the `introspection` continuation at 10887 ms.
+/// Codex's wrapped composer at 56×137, 24 px. The first `a` key is at
+/// 8893 ms and its complete synchronized echo at 8916 ms; the `and ` run
+/// retires before the `introspection` continuation at 10887 ms.
 const WRAPPED_FIXTURE: &str = include_str!("fixtures/codex-wrapped-composer-2026-09-22.ptylog");
 /// A second 24 px take where the host first presented `and ` in one batch:
 /// `a` was 391 ms old at the 10.0 s frame while the trailing space was fresh.
@@ -71,13 +63,6 @@ enum Event {
     In(Vec<u8>),
     /// Controller `turn` fences the previous turn's movement licence.
     ClearLicence,
-}
-
-fn unhex(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    (0..b.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex"))
-        .collect()
 }
 
 fn events(fixture: &str) -> Vec<(u64, Event)> {
@@ -102,43 +87,13 @@ fn events(fixture: &str) -> Vec<(u64, Event)> {
         .collect()
 }
 
-fn geom(rows: usize, cols: usize, cw: usize, ch: usize) -> Geom {
-    Geom {
-        cw,
-        ch,
-        rows,
-        cols,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (cols * cw) as u16,
-        win_h: (rows * ch) as u16,
-        head: 0,
-    }
-}
-
 /// The owner's config as the take ran it: rainbow kitty, tall body, the
 /// default intensity 1.0, dark.
 fn cfg() -> GlowConfig {
     GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
         duration: Duration::from_millis(260),
-        length: 18,
         intensity: 1.0,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
+        ..rainbow_cfg()
     }
 }
 
@@ -151,11 +106,10 @@ struct RowCensus {
     map: String,
     lit: usize,
     holes: Vec<usize>,
-    /// Interior gaps in the ribbon's own LIVE cells on the row — a column
+    /// Interior gaps in the ribbon's own live cells on the row: a column
     /// between two live cells that no live cell owns. The plan's coverage
-    /// feathers across a one-cell gap, so the pixel census on glass sees a
-    /// dark column the coverage census does not: this is the ribbon's own
-    /// account of it.
+    /// feathers across a one-cell gap, so this catches a dark column the
+    /// coverage census does not.
     cell_gaps: Vec<usize>,
 }
 
@@ -181,8 +135,8 @@ struct Host {
     /// Reproduce a host frame slip while Codex echoes two keys separately.
     suppress_frames_ms: Option<(u64, u64)>,
     suppress_extra_ms: Option<(u64, u64)>,
-    /// The glass capture cadence; ordinary fixture tests keep the dense
-    /// train, while the screenshot regression uses its measured 5 Hz.
+    /// The frame cadence: ordinary fixture tests keep the dense train, the
+    /// screenshot regression uses the glass capture's 5 Hz.
     frame_ms: u64,
     present_on_output: bool,
     census: Vec<RowCensus>,
@@ -224,52 +178,19 @@ impl Host {
     /// EXACTLY the host's own order: `sync_cursor_effect_scroll`, then LOCK
     /// A's samples, then the tick.
     fn frame(&mut self) {
-        let scroll = self.term.content_scroll_state();
-        match ContentScrollState::delta_since(self.scroll, scroll) {
-            ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged => {}
-            ContentScrollDelta::Translate(rows) => {
-                self.glow.note_scroll(rows);
-                self.glow.drop_row_probe();
-            }
-            ContentScrollDelta::Bands { first_seq, count } => {
-                for i in 0..u64::from(count) {
-                    let m = scroll.band(first_seq + i);
-                    self.glow.note_band_move(m.top, m.bottom, m.delta);
-                }
-                self.glow.drop_row_probe();
-            }
-            ContentScrollDelta::Invalidate => self.glow.curtain(self.now),
-        }
-        self.scroll = Some(scroll);
-        let c = self.term.cursor();
-        let cur = self.term.cursor_visible().then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink {
-            self.blink = epoch;
-            self.glow.note_repaint_blink(self.now);
-        }
-        let alt = self.term.is_alternate_screen();
-        self.glow.note_context(alt);
+        sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
+        let (c, cur) = caret_sample(&self.term);
+        note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
+        self.glow.note_context(self.term.is_alternate_screen());
         self.glow.observe_print_anchor(self.term.print_anchor());
-        self.term
-            .row_cols_into(usize::from(c.row), &mut self.row_buf);
-        self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            self.glow.observe_ribbon_row(r, &self.row_buf);
-        }
+        observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+        observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
         self.record(c.row, c.col);
         self.dump_cells();
     }
 
-    /// The frame train up to `ms`. While Codex's `?2026` bracket is open the
-    /// host WITHHOLDS the present (SYNC-1, `app_render.rs`), so the frame hold never
-    /// samples a torn frame: the train holds with it.
     /// `CODEX_REPLAY_CELLS=<ms-from>:<ms-to>` prints every ribbon cell on the
     /// composer row for the frames in that window: column, layer, cohort,
     /// whether it is leaving, and its cohort's clock.
@@ -287,19 +208,7 @@ impl Host {
             return;
         }
         let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-        let mut cov = vec![0u8; self.g.cols];
-        for sg in rib.plan_segments() {
-            let r = ((sg.spine / self.g.ch as f32) - 0.5).floor();
-            let col = (sg.x / self.g.cw as f32).floor();
-            if r >= 0.0
-                && col >= 0.0
-                && r as usize == usize::from(row)
-                && (col as usize) < self.g.cols
-            {
-                let i = col as usize;
-                cov[i] = cov[i].max(sg.cov);
-            }
-        }
+        let cov = coverage(&self.glow, self.g, row);
         let mut cells: Vec<_> = rib.cells().iter().filter(|c| c.row == row).collect();
         cells.sort_by_key(|c| c.col);
         let mut s = format!("t={ms:6} cells:");
@@ -401,9 +310,7 @@ impl Host {
                 );
             }
             [0x7f] => self.glow.note_backspace_erasing(self.now, Some(1)),
-            b if b.starts_with(b"\x1b[") && matches!(b.last(), Some(b'A' | b'B' | b'C' | b'D')) => {
-                self.glow.note_motion(self.now);
-            }
+            b if is_arrow(b) => self.glow.note_motion(self.now),
             _ => {}
         }
     }
@@ -411,37 +318,12 @@ impl Host {
     /// This frame's census of the PLAN's coverage on the composer row.
     fn record(&mut self, caret_row: u16, caret_col: u16) {
         let Some(row) = self.composer_row else { return };
-        let mut cov = vec![0u8; self.g.cols];
-        {
-            let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-            for sg in rib.plan_segments() {
-                let r = ((sg.spine / self.g.ch as f32) - 0.5).floor();
-                let col = (sg.x / self.g.cw as f32).floor();
-                if r < 0.0 || col < 0.0 {
-                    continue;
-                }
-                if r as usize == usize::from(row) && (col as usize) < self.g.cols {
-                    let i = col as usize;
-                    cov[i] = cov[i].max(sg.cov);
-                }
-            }
-        }
+        let cov = coverage(&self.glow, self.g, row);
         let lit: Vec<usize> = (0..self.g.cols).filter(|&i| cov[i] >= LIT_COV).collect();
         if lit.len() < 2 {
             return;
         }
-        let mut holes = Vec::new();
-        let mut run = 0usize;
-        for &v in &cov[lit[0]..=lit[lit.len() - 1]] {
-            if v >= LIT_COV {
-                if run > 0 {
-                    holes.push(run);
-                }
-                run = 0;
-            } else {
-                run += 1;
-            }
-        }
+        let holes = holes_of(&cov).into_iter().map(|(_, len)| len).collect();
         let caret = if caret_row == row {
             caret_col
         } else {
@@ -535,10 +417,9 @@ fn replay_with(fixture: &str, end_ms: u64, mut h: Host) -> Host {
     h
 }
 
-/// **THE OWNER'S OWN GESTURE, CODEX'S OWN BYTES.** Type a line, three word hops
-/// back, a word typed inside it, three word hops forward, two letters at the
-/// end. RED before the fix: the two spaces the forward hops parked the caret on
-/// stay dark for over a second while the words either side of them are lit.
+/// A line, three word hops back, a word typed inside it, three word hops
+/// forward, two letters at the end: the two spaces the forward hops parked
+/// the caret on stay lit with the words either side of them.
 #[test]
 fn a_backward_edit_in_codex_never_punches_a_hole_in_the_band() {
     let h = replay();
@@ -550,11 +431,9 @@ fn a_backward_edit_in_codex_never_punches_a_hole_in_the_band() {
     assert!(h.broken().is_empty(), "{}", h.report("codex-g1"));
 }
 
-/// **A SPACE ECHOED AS A PARTICLE IS STILL THE USER'S SPACE.** While the line
-/// is being typed, no navigation has happened and nothing was erased, so the
-/// band has no reason to leave the row: the light under the first word must
-/// still be standing when the last word is typed, as it is in zsh. RED before
-/// the fix: the band fell from 33 cells to 9 in 600 ms of plain typing.
+/// A space echoed as a particle is still the user's space. While the line
+/// is typed, with no navigation and nothing erased, the light under the
+/// first word still stands when the last word is typed, as it does in zsh.
 #[test]
 fn plain_typing_under_codex_keeps_the_whole_line_lit() {
     let h = replay();
@@ -580,14 +459,11 @@ fn plain_typing_under_codex_keeps_the_whole_line_lit() {
     );
 }
 
-/// **THE HAND'S OWN CELLS ARE ONE INTERVAL WHILE IT TYPES.** The plan feathers
-/// its coverage across a missing column, so the two tests above did not see
-/// what the pixel census on glass saw: the first key of the mid-line insert —
-/// typed over a lit cell the hops had brought the caret back onto — laid no
-/// cell, and its column stood dark for the rest of the line. RED before
-/// `Ribbon::sweep` re-laid a cell older than the key: every frame from the
-/// insert to the last key carried a one-cell gap in the ribbon's live cells
-/// at the insert column.
+/// The hand's own cells are one interval while it types. The plan feathers
+/// coverage across a missing column, so this checks the ribbon's live cells:
+/// the first key of the mid-line insert, typed over a lit cell the hops
+/// brought the caret back onto, re-lays a cell there (`Ribbon::sweep`), and
+/// no frame from the insert to the last key has a gap at the insert column.
 #[test]
 fn a_key_typed_over_the_band_gets_its_own_cell() {
     let h = replay();
@@ -1066,12 +942,12 @@ fn ordinary_first_a_reanchor_is_cached_for_the_first_resumed_frame() {
     }
 }
 
-/// The screenshot's `and ` prefix was typed on the wrapped row and lit on
-/// its first frames. After the measured 1.74 s key gap its natural swoosh
-/// removed those cells, yet Codex left their exact text on the same row.
-/// The first resumed key must rejoin that text on its own frame. Five hertz
-/// and two rendered warm-up frames match the live glass control; presenting
-/// each PTY packet would hide the expiry transition under extra frames.
+/// The `and ` prefix was typed on the wrapped row and lit on its first
+/// frames. After a 1.74 s key gap its swoosh removed those cells, yet Codex
+/// left their exact text on the same row; the first resumed key rejoins
+/// that text on its own frame. Five hertz and two rendered warm-up frames
+/// match the live glass cadence; presenting each PTY packet would hide the
+/// expiry transition under extra frames.
 #[test]
 fn codex_same_row_continuation_restores_the_exact_retired_prefix() {
     let separate_turns = wrapped_with_licence_clear();
@@ -1124,9 +1000,8 @@ fn dormant_typed_run_adds_no_idle_work_after_natural_exit() {
 }
 
 /// The live `ctl turn` path clears movement credits between the two typing
-/// bursts. This is the exact control boundary that erased the cache before
-/// the fix; preserving content evidence here still requires a fresh typed
-/// echo to rejoin it.
+/// bursts. Content evidence survives that boundary, and still requires a
+/// fresh typed echo to rejoin it.
 fn wrapped_with_licence_clear() -> String {
     // `turn` fences both the first measured burst and its continuation.
     let fixture = WRAPPED_FIXTURE

@@ -2,7 +2,7 @@
 // Load-bearing: the constant-time compares are pinned by tests that call the
 // private `verify_diff` / `verify_attach_diff`. If `verify` / `verify_attach`
 // stopped deciding through them, they would be dead outside `cfg(test)`, and this
-// makes that a build failure of `cargo test -p astream-cap` (the doctest build).
+// makes that a build failure of `targo --unverified test -p astream-cap` (the doctest build).
 #![deny(dead_code)]
 //! `astream-cap` — the unforgeable capability mint: the capability/ACL half of
 //! "SSH" for untrusted-network use (the doctrine's "sound, unforgeable capability

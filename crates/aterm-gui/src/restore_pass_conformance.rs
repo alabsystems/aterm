@@ -2,24 +2,21 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of where the layout rebuild runs and what the adoption
-//! proof waits for (warm successor P3, the parallel attach) to
+//! proof waits for, against
 //! `aterm_spec::derive::native_update_successor_attach_model`
 //! (`NativeUpdateSuccessorAttach`).
 //!
-//! Every reachable state of the committed model is projected onto the
-//! SHIPPING decisions: a headless App's own lane and queue reads
-//! (`App::restore_pass_handoff_lane`, `App::restore_pass_queued`), the site
-//! decision both call sites make (`restore_pass_due`, `FirstAttach` in
-//! `resumed` and `Park` in `about_to_wait`), and the proof's paint decision
-//! over real `WindowState`s (`handoff_paint_proven`, fed the drained queues as
-//! `App::maybe_signal_handoff_ready` feeds it). Each of the App's guarded
-//! steps — `RebuildAtAttach`, `LeaveResume`, `RebuildAtPark`, `Prove` — must be
-//! enabled in the model exactly when the real code takes it.
+//! Every reachable model state is projected onto the shipping decisions: a
+//! headless App's lane and queue reads (`App::restore_pass_handoff_lane`,
+//! `App::restore_pass_queued`), the site decision both call sites make
+//! (`restore_pass_due`: `FirstAttach` in `resumed`, `Park` in `about_to_wait`),
+//! and the proof's paint decision over real `WindowState`s
+//! (`handoff_paint_proven`, fed as `App::maybe_signal_handoff_ready` feeds it).
+//! Each guarded step (`RebuildAtAttach`, `LeaveResume`, `RebuildAtPark`,
+//! `Prove`) must be enabled in the model exactly when the real code takes it.
 //!
-//! NEGATIVE CONTROL: the same real decisions against `Buggy = 1` (the attach
-//! pass on the cold lane, the handoff lane waiting for the park, a proof at
-//! window 0's first present) must disagree somewhere, so a pass is never
-//! vacuous.
+//! Negative control: the same decisions against `Buggy = 1` must disagree
+//! somewhere, so a pass is never vacuous.
 
 use std::collections::BTreeSet;
 
@@ -105,7 +102,7 @@ fn window(painted: bool) -> WindowState {
     ws
 }
 
-/// Which of the App's guarded steps the SHIPPING code takes in `s`.
+/// Which of the App's guarded steps the shipping code takes in `s`.
 fn real_steps(real: &mut Real, s: &State, alt: bool) -> BTreeSet<&'static str> {
     let lane = s["lane"];
     let mut steps = BTreeSet::new();

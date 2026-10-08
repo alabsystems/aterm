@@ -19,8 +19,6 @@
 
 //! Tiered scrollback storage for terminal emulators.
 //!
-//! Extracted from `aterm-core` as part of the monolith split (#2341).
-//!
 //! ## Design
 //!
 //! Three-tier architecture for memory efficiency:
@@ -70,9 +68,8 @@
 //!
 //! ## Verification
 //!
-//! - TLA+ spec: `tla/Scrollback.tla`
-//! - Kani proofs: `tier_transition_preserves_count`, `line_limit_enforced`
-//! - Property tests: line count always accurate, no data loss
+//! - Kani proofs (`kani_proofs.rs`, `lz4_kani.rs`, `disk_kani.rs`), e.g.
+//!   `tier_transition_preserves_count`, `line_limit_enforced`
 
 #![deny(missing_docs)]
 #![deny(clippy::all)]
@@ -237,8 +234,9 @@ pub struct Scrollback {
     /// When set, older lines are discarded when this limit is exceeded.
     line_limit: Option<usize>,
     /// Monotonic count of lines DROPPED by memory-pressure eviction (cold-tier
-    /// FIFO under the byte budget) — real retention loss, exposed out-of-band
-    /// (audit E10a). User-requested `set_line_limit` truncation is NOT counted.
+    /// FIFO under the byte budget) or lost with a quarantined warm block —
+    /// real retention loss, exposed out-of-band (audit E10a). User-requested
+    /// `set_line_limit` truncation is NOT counted.
     pressure_evicted_lines: u64,
     /// Monotonic count of history lines that crossed the IMAGE RETENTION
     /// HORIZON — see
@@ -532,6 +530,12 @@ pub(crate) fn count_image_rows(lines: &[Line]) -> u64 {
 // Tests for the top-level Scrollback type and integration tests.
 #[cfg(test)]
 mod tests;
+
+// Never-panic fuzz of the decode surfaces (was tests/fuzz_decode.rs, which only
+// compiled under `cfg(any(fuzzing, feature = "fuzz"))` and so ran nowhere in the
+// gate). Runs in every lib test build; `fuzz` only deepens it.
+#[cfg(test)]
+mod decode_fuzz_tests;
 
 // Tests for disk-backed scrollback.
 #[cfg(all(test, feature = "disk-tier"))]

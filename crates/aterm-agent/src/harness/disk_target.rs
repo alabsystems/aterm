@@ -2,157 +2,123 @@
 // Copyright 2026 Andrew Yates
 
 //! A CARGO BUILD DIRECTORY, MEASURED — and the one thing in it the harness
-//! reclaims: an IDLE PROFILE'S `incremental/`, never the directory.
+//! reclaims: an IDLE PROFILE'S `incremental/`, never the directory (but for
+//! a gone owner's, below the floor: the exception below).
 //!
-//! # What is reclaimed, and what never is
+//! Incremental state is the largest share of a debug build directory and losing
+//! it costs only speed. Nothing else is touched (`deps/`, `build/`,
+//! `.fingerprint/`, uplifted binaries, `doc/`, locks, anything through a
+//! symlink): cargo releases its locks before running tests, which read `deps/`.
 //!
-//! A build directory holds more than cargo can make again, and more than a
-//! rebuild costs nothing to redo: the uplifted binaries `aterm pkg link` puts
-//! on PATH, a criterion baseline, coverage and nextest reports, `doc/`, and —
-//! behind a checkout's `target -> target.noindex` link — the directory the
-//! link needs to exist. So the unit of reclaim is ONE cache of each idle cargo
-//! PROFILE: its [`INCREMENTAL`] directory, rustc's incremental-compilation
-//! state. It is the largest share of a debug build directory
-//! (`crates/aterm-verify/src/disk.rs`, `caller_incremental_dirs`: 26 GB of a
-//! 47 GB tree, measured 2026-09-21) and losing it costs nothing but speed: a
-//! test binary, a doctest and an uplifted binary never read it, and the next
-//! build of each crate is a full compile of that crate instead of an
-//! incremental one. NOTHING ELSE IS TOUCHED — not the build directory or its
-//! `CACHEDIR.TAG`, not `deps/`, `build/` or `.fingerprint/`, not an uplifted
-//! binary, `examples/`, `doc/`, a lock file, a sibling, or anything reached
-//! through a symlink.
+//! - A profile is a directory holding one of [`CARGO_LOCKS`] and cargo's layout,
+//!   found by one bounded walk that never follows a symlink or crosses devices;
+//!   a truncated walk disqualifies the whole directory. Nested surveyed build
+//!   directories decide their own profiles ([`reclaim_leaving`]).
+//! - Last used is the newest mtime in [`CLOCK_DIRS`]. A profile is idle after
+//!   `disk.target_stale_days` whole days, and never within
+//!   [`PRESSURE_MIN_IDLE_S`].
+//! - Below the free-space floor, [`reclaim_lru`] also takes non-idle profiles,
+//!   least recently used first, one at a time while the caller re-measures.
 //!
-//! Deeper tiers (`.fingerprint/`, `deps/`, `build/`) are a documented
-//! follow-up and are NOT taken here: cargo releases its locks before it runs
-//! tests, doctests or a runner, and those DO read `deps/` and `build/`, so
-//! removing them needs run-phase protection this module does not have.
+//! `incremental/` is the ONLY unit, by design: `deps/`, `build/` and
+//! `.fingerprint/` are `targo clean`'s. Cargo releases its locks before it
+//! runs tests, doctests or a runner, and those read `deps/` and `build/`, so
+//! no lock proves them unused (decided 2026-09-30 under the owner's standing
+//! direction: a boundary, not a follow-up).
+//!
+//! ONE EXCEPTION, decided 2026-10-01: below the floor, a build directory
+//! whose OWNER IS GONE — an ended Claude Code session's scratch build, the
+//! cells cache of a removed checkout (`super::discover`'s owners) — goes
+//! WHOLE ([`reclaim_whole`]). The boundary's reason — no lock proves a test
+//! run is not reading `deps/` — is answered there by what IS running: right
+//! before the reclaim opens it, no process of this user may have its
+//! working directory, its executable or an open file in the build directory
+//! or the owner's folder (`super::discover::unused`, a scan of the process
+//! table), on top of the owner being gone — no running Claude Code names
+//! the session, nothing of it was written for the quiet window, checked
+//! again under every lock.
+//! It also needs the stronger marker, a signed `CACHEDIR.TAG` (the
+//! specification's mark of a directory whose contents can be regenerated),
+//! holds every one of every profile's locks for the delete, and deletes
+//! through the handle it pinned.
 //!
 //! # A profile, found at any depth
 //!
-//! A PROFILE is a directory holding one of cargo's build locks
-//! ([`CARGO_LOCKS`]) AND cargo's layout (`.fingerprint/` or `deps/`):
-//! `<target>/debug`, `<target>/<triple>/release`, a custom profile, a nested
-//! build directory's own. They are found by ONE bounded walk of the build
-//! directory that never follows a symlink, never crosses onto another device
-//! and never enters a profile's caches. A walk cut short — entries, time, or a
-//! directory deeper than [`MAX_PROFILE_DEPTH`] — makes the whole build
-//! directory NOT a candidate. (Cargo never writes a lock at a build
-//! directory's ROOT; the clock that used to be read there never existed.)
-//! When a build directory found this way is ALSO named for the survey, its
-//! own survey decides its profiles, and the outer directory's reclaim
-//! passes them over ([`reclaim_leaving`]).
+//! # Idle
 //!
-//! # When a profile is idle
+//! Last used is the newest mtime of what a compile writes ([`CLOCK_DIRS`]):
+//! never a lock's (a lock keeps its creation time), never the profile
+//! directory's, and never `incremental/`'s (the reclaim's own unlinks write
+//! it). A profile last used `disk.target_stale_days` or more whole days ago
+//! (default one) is idle, and never one written within
+//! [`PRESSURE_MIN_IDLE_S`].
 //!
-//! LAST USED is the newest mtime of what a compile writes: the profile's
-//! `.fingerprint/`, `deps/` and `build/`, and `examples/` ([`CLOCK_DIRS`]) —
-//! never a lock's (a lock file keeps its creation time: on this machine
-//! `debug/.cargo-lock` read Sep 21 while `debug/` was written Sep 24), never
-//! the profile directory's, and never `incremental/`'s: the reclaim itself
-//! writes that one (an unlink writes its parent's mtime), so a delete that
-//! kept one entry would otherwise make the profile look used today and hold
-//! the rest back for another whole window. A compile that writes
-//! `incremental/` writes its outputs into `deps/` too. A profile last used
-//! `disk.target_stale_days` or more whole days ago (by default one: a profile
-//! built within the last 24 hours is never idle) is idle — and never one
-//! written into within [`PRESSURE_MIN_IDLE_S`], which only a window of `0`
-//! days could otherwise reach.
+//! A failing compile writes no output into `deps/`, so a checkout whose builds
+//! keep failing reads as last used at its last success; under pressure its
+//! cache may go before a more recently built idle one. That costs speed only.
 //!
-//! A known limit of this clock: a compile that FAILS writes no output into
-//! `deps/` (it may still rewrite `incremental/`, which the clock ignores), so
-//! a checkout whose builds keep failing — an agent fixing compile errors,
-//! with cargo releasing its locks between runs — reads as last used at its
-//! last successful build. Under pressure its `incremental/` can then go
-//! ahead of a profile that is idle but was built more recently. It costs
-//! speed only (the next build compiles those crates in full), and the idle
-//! window had the same property. The newest `.fingerprint/<unit>/` entry
-//! might date a failed compile too (cargo keeps a unit's diagnostics there;
-//! not measured here), and is not read: it is one more walk per profile.
-//!
-//! # Under pressure: least recently used first ([`reclaim_lru`])
+//! # Under pressure ([`reclaim_lru`])
 //!
 //! Below the floor (`disk.auto_free_gib`) an idle window alone frees nothing
-//! on a machine whose agents build in every checkout daily (measured
-//! 2026-09-27 and 2026-09-28). So there a profile INSIDE the window is a
-//! candidate too, one at a time and oldest LAST USED first, and the caller
-//! re-measures free space before each and stops once the volume is back
-//! above the floor plus a margin (`super::apply_auto`). The same locks,
-//! device and symlink rules hold, and the unit is still only `incremental/`.
-//! Two more rules hold for such a profile, checked in the survey and again
-//! under its locks: it was written into no later than the survey saw (a
-//! compile since means a build is using it, and it is no longer the least
-//! recently used), and not within the last [`PRESSURE_MIN_IDLE_S`] (a build
-//! that just finished is usually followed by another within minutes — an
-//! agent's edit-build-test loop runs cargo again and again, releasing the
-//! locks between runs — and that build would write the cache back at once,
-//! so taking it frees nothing that stays free and costs a full rebuild).
+//! when agents build in every checkout daily, so profiles inside the window
+//! are candidates too, one at a time, least recently used first; the caller
+//! re-measures free space before each and stops above the floor plus a margin
+//! (`super::apply_auto`). Such a profile must, in the survey and again under
+//! its locks, have been written no later than the survey saw, and not within
+//! [`PRESSURE_MIN_IDLE_S`] (an edit-build-test loop would rewrite the cache at
+//! once).
 //!
 //! # Reclaiming one profile ([`reclaim`])
 //!
-//! Every step is relative to a directory handle: the build directory is
-//! opened component by component from `/` with `O_NOFOLLOW` (so a component
-//! swapped for a symlink after the survey is refused), and every profile,
-//! lock and cache below it is reached from that handle the same way, never
-//! leaving the build directory's device.
+//! Every step is relative to a directory handle: the build directory is opened
+//! component by component from `/` with `O_NOFOLLOW`, and every profile, lock
+//! and cache below is reached from that handle, never leaving its device.
 //!
-//! 1. Take cargo's build locks EXCLUSIVELY, WITHOUT WAITING, with
-//!    `std::fs::File::try_lock` (`flock`): first every lock that exists — one
-//!    that cannot be taken means a build holds it, and the profile is skipped
-//!    with nothing created — then each that is missing (an older cargo takes
-//!    only `.cargo-lock`), CREATED only now that the removal proceeds. A lock
-//!    that cannot be created (a full disk, a read-only directory) skips the
-//!    profile: nothing is removed without all of cargo's locks held. A lock
-//!    file is never deleted.
-//! 2. Under the locks, re-derive: still a profile, still idle (under
-//!    pressure: not written into since the survey, nor within
-//!    [`PRESSURE_MIN_IDLE_S`]), `incremental/` still a real directory on the
-//!    build directory's device.
-//! 3. Delete `incremental/` — never following a symlink (a link is unlinked,
-//!    its target kept), never entering another device — STILL HOLDING every
-//!    lock, so no cargo can start a compile in the profile until the delete
-//!    is done. An entry that cannot be deleted is reported and the rest is
-//!    still deleted.
-//! 4. Release the locks — by `LOCK_UN` ([`HeldLock`]), never by the close
-//!    alone, as every lock this module takes is released (the report's probe
-//!    too: every one is taken by [`HeldLock::try_take`], the module's one
-//!    `try_lock`): a child any thread of this process is spawning holds a
-//!    copy of each descriptor until its exec, and a lock released only by the
-//!    close stays held in it that long.
+//! 1. Take cargo's build locks exclusively without waiting (`flock` via
+//!    `try_lock`): every existing lock first (one held means a build is
+//!    running, and the profile is skipped with nothing created), then each
+//!    missing one, created only now. A lock that cannot be created skips the
+//!    profile. A lock file is never deleted.
+//! 2. Under the locks, re-derive: still a profile, still idle (under pressure:
+//!    not written since the survey nor within [`PRESSURE_MIN_IDLE_S`]),
+//!    `incremental/` still a real directory on the same device.
+//! 3. Delete `incremental/` while holding every lock, never following a
+//!    symlink (a link is unlinked, its target kept) or entering another
+//!    device. An entry that cannot be deleted is reported; the rest still go.
+//! 4. Release the locks by `LOCK_UN` ([`HeldLock`]), never by close alone: a
+//!    child being spawned holds copies of every descriptor until its exec.
 //!
-//! What is counted as freed is what an unlink released: the blocks of each
-//! deleted file that was its LAST name (a file hard-linked elsewhere — rustc
-//! links incremental objects into `deps/` — frees nothing and is not counted).
-//! An APFS clone's shared blocks cannot be told apart from its own, so for a
-//! cloned file the figure is an upper bound; a file this process cannot open
-//! to measure is still deleted but not counted, so there it errs low.
+//! Freed bytes are the blocks of each deleted file that was its last name (a
+//! file hard-linked into `deps/` frees nothing and is not counted). An APFS
+//! clone's shared blocks are indistinguishable from its own, so there the
+//! figure is an upper bound; a file that cannot be opened to measure is
+//! deleted but not counted.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::discover::{Origin, Owned};
 use super::{
     CACHEDIR_SIGNATURE, MAX_WALK_ENTRIES, RUSTC_INFO, Removed, Witness, age_days,
-    cachedir_tag_signed, mtime_of,
+    cachedir_tag_signed, mtime_of, walk_bytes,
 };
 use held::HeldLock;
 
 /// The build locks cargo takes in each profile: `.cargo-lock` (every cargo),
-/// and since 1.97 `.cargo-build-lock` and `.cargo-artifact-lock`. All are
-/// `flock`-held for a whole compile (measured 2026-09-25 on this machine's
-/// build directories, which hold all three in each profile and none at the
-/// root).
+/// and since 1.97 `.cargo-build-lock` and `.cargo-artifact-lock`, each
+/// `flock`-held for a whole compile. None is written at a build directory's
+/// root.
 pub const CARGO_LOCKS: &[&str] = &[".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
 
-/// THE ONE CACHE EVER RECLAIMED: rustc's incremental-compilation state.
+/// The one cache ever reclaimed: rustc's incremental-compilation state.
 pub const INCREMENTAL: &str = "incremental";
 
 /// A profile's cache directories: the walk never enters them.
 pub const CACHE_DIRS: &[&str] = &[".fingerprint", "deps", "build", "incremental"];
 
-/// What dates a profile: the directories a compile writes, and `examples/`
-/// (a build of examples writes there and nowhere else a directory mtime
-/// shows). NOT `incremental/`, which the reclaim's own unlinks write (the
-/// module docs).
+/// What dates a profile: the directories a compile writes, and `examples/`.
+/// Not `incremental/`, which the reclaim's own unlinks write.
 pub const CLOCK_DIRS: &[&str] = &[".fingerprint", "deps", "build", "examples"];
 
 /// Root entries that mark SOURCE. A build directory holding any of them at
@@ -177,13 +143,9 @@ pub const MAX_PROFILE_DEPTH: usize = 12;
 /// The profile walk's wall-clock budget.
 pub const PROFILE_WALK_WALL: Duration = Duration::from_secs(10);
 
-/// A profile a compile wrote into within this many seconds is never
-/// reclaimed (the module docs say why): ten minutes. Named for the pressure
-/// pass, where it decides, it holds for EVERY reclaim — the idle pass too,
-/// which matters only for `target_stale_days = 0` (every longer window is
-/// already past it). A TARGET, not a measurement — long enough to cover the
-/// pause between an agent's cargo runs, short enough that a checkout left
-/// alone for a coffee break is reachable.
+/// A profile a compile wrote into within this many seconds (ten minutes) is
+/// never reclaimed, by either pass: long enough to cover the pause between an
+/// agent's cargo runs, short enough to reach a checkout left alone briefly.
 pub const PRESSURE_MIN_IDLE_S: i64 = 10 * 60;
 
 /// The deepest tree the deletion descends; deeper is kept and reported,
@@ -215,7 +177,7 @@ impl WalkBudget {
 pub struct Profile {
     /// Its path.
     pub path: PathBuf,
-    /// LAST USED: the newest mtime of its [`CLOCK_DIRS`]. Never a lock's.
+    /// Last used: the newest mtime of its [`CLOCK_DIRS`]. Never a lock's.
     pub last_used: Option<i64>,
     /// Does it hold a real (not linked) [`INCREMENTAL`] directory with
     /// anything in it? An empty one (a release profile's, a
@@ -236,9 +198,8 @@ pub struct Profile {
 /// One build directory, with the facts that decide it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetDir {
-    /// Its path, CANONICAL: the reclaim opens it again component by component
-    /// without following a symlink, so the path the report names is the real
-    /// one.
+    /// Its canonical path: the reclaim reopens it component by component
+    /// without following symlinks, so the report names the real one.
     pub path: PathBuf,
     /// The marker that proves a build tool laid it, when one was found.
     pub marker: Option<String>,
@@ -251,11 +212,17 @@ pub struct TargetDir {
     /// The device it lives on ([`dev_of`]), when that could be read: the
     /// pressure pass takes only from the volume whose free space it measured.
     pub device: Option<u64>,
-    /// Were its RECENT profiles probed for locks and sized too
-    /// ([`assess_under`] under pressure)? Only the idle ones are otherwise,
-    /// so a recent profile's `in_use` and `bytes` would say nothing, and the
-    /// pressure pass makes no row from them.
+    /// Were its recent profiles also probed for locks and sized
+    /// ([`assess_under`] under pressure)? Otherwise only idle ones are, and the
+    /// pressure pass makes no row from the rest.
     pub probed_recent: bool,
+    /// How it was found ([`Origin::Named`]: named by the caller).
+    pub origin: Origin,
+    /// Whether its owner is gone ([`super::discover::Owners`]).
+    pub owned: Owned,
+    /// Its whole size ([`total_bytes`]) and whether that is a floor, when it
+    /// was sized: what the report's largest-hogs list reads.
+    pub total: Option<(u64, bool)>,
 }
 
 impl TargetDir {
@@ -282,12 +249,12 @@ impl TargetDir {
             })
     }
 
-    /// The profiles the PRESSURE pass may take ([`reclaim_lru`]), and each
+    /// The profiles the pressure pass may take ([`reclaim_lru`]), and each
     /// other recent one with why it is kept. A candidate holds a non-empty
-    /// `incremental/`, is INSIDE the idle window (an idle one is the idle
-    /// pass's, taken whole), has no build holding its locks, and was last
-    /// written at least [`PRESSURE_MIN_IDLE_S`] before `now`. None when the
-    /// directory does not clear its [`Self::fences`].
+    /// `incremental/`, is inside the idle window (idle ones belong to the idle
+    /// pass), has no build holding its locks, and was last written at least
+    /// [`PRESSURE_MIN_IDLE_S`] before `now`. None when the directory fails its
+    /// [`Self::fences`].
     #[must_use]
     pub fn pressure_candidates(
         &self,
@@ -315,7 +282,7 @@ impl TargetDir {
                 kept.push((
                     p,
                     format!(
-                        "written into {} ago, inside the {} every build keeps even under pressure",
+                        "written into {} ago; no reclaim takes a profile built in the last {}",
                         human_age(age),
                         human_age(PRESSURE_MIN_IDLE_S)
                     ),
@@ -363,10 +330,9 @@ pub fn human_age(secs: i64) -> String {
     }
 }
 
-/// Is a profile last used at `last_used` idle at `now`: `threshold_days`
-/// whole days old, and never written into within [`PRESSURE_MIN_IDLE_S`]
-/// (which only a window of 0 days could reach)? An unknown clock is never
-/// idle.
+/// Is a profile last used at `last_used` idle at `now`: `threshold_days` whole
+/// days old and not written within [`PRESSURE_MIN_IDLE_S`]? An unknown clock
+/// is never idle.
 fn idle(last_used: Option<i64>, now: i64, threshold_days: i64) -> bool {
     last_used.is_some_and(|m| {
         age_days(now, m) >= threshold_days && now.saturating_sub(m) >= PRESSURE_MIN_IDLE_S
@@ -396,7 +362,7 @@ pub(super) fn target_witness(
         let newest = t.profiles.iter().filter_map(|p| p.last_used).max();
         if newest.is_some_and(|m| age_days(now, m) >= threshold_days) {
             return Err(format!(
-                "every profile was written into within the last {}, which every build keeps",
+                "every profile was written into within the last {}; no reclaim takes one that recent",
                 human_age(PRESSURE_MIN_IDLE_S)
             ));
         }
@@ -439,9 +405,8 @@ pub fn assess(path: &Path, now: i64, threshold_days: i64, budget: WalkBudget) ->
     assess_under(path, now, threshold_days, false, budget)
 }
 
-/// [`assess`], and under `pressure` (free space below the floor) EVERY
-/// profile holding an `incremental/` probed and sized, recent ones too: the
-/// pressure pass may take any of them, least recently used first.
+/// [`assess`], and under `pressure` (free space below the floor) every profile
+/// holding an `incremental/` probed and sized, recent ones too.
 #[must_use]
 pub fn assess_under(
     path: &Path,
@@ -455,8 +420,14 @@ pub fn assess_under(
     if td.fences().is_ok() {
         td.probed_recent = pressure;
         for p in &mut td.profiles {
-            if p.incremental && (pressure || idle(p.last_used, now, threshold_days)) {
+            let idle_cache = p.incremental && idle(p.last_used, now, threshold_days);
+            // Under pressure EVERY profile's locks are probed — one without
+            // an `incremental/` too: a build directory whose owner is gone
+            // goes whole, and only if no build holds any of them.
+            if pressure || idle_cache {
                 p.in_use = locks_held(&p.path);
+            }
+            if p.incremental && (pressure || idle_cache) {
                 let dir = p.path.join(INCREMENTAL);
                 let (bytes, partial) = cache_bytes(&dir, dev_of(&p.path));
                 p.bytes = bytes;
@@ -465,6 +436,31 @@ pub fn assess_under(
         }
     }
     Some(td)
+}
+
+/// The whole size of the build directory at `dir` — each file's allocated
+/// blocks, shared evenly among its hard links (rustc links an uplifted
+/// binary to its `deps/` twin, both inside), never through a symlink and
+/// never onto another device — and whether the walk stopped at
+/// [`MAX_WALK_ENTRIES`]. An estimate: what removing it whole would release,
+/// and what the report's largest-hogs list says it holds.
+#[must_use]
+pub fn total_bytes(dir: &Path) -> (u64, bool) {
+    let dev = dev_of(dir);
+    walk_bytes(dir, |meta| same_dev(meta, dev), shared_blocks)
+}
+
+/// The blocks of the file `meta` describes, divided among its links.
+fn shared_blocks(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        meta.blocks().saturating_mul(512) / meta.nlink().max(1)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
 }
 
 /// The device the directory at `path` lives on — a link FOLLOWED, as the
@@ -514,6 +510,9 @@ fn facts(path: &Path, budget: WalkBudget) -> Option<TargetDir> {
         profiles,
         device: dev_of(path),
         probed_recent: false,
+        origin: Origin::Named,
+        owned: Owned::NotOwned,
+        total: None,
     })
 }
 
@@ -541,7 +540,7 @@ fn holds_cache(dir: &Path) -> bool {
         && std::fs::read_dir(dir).is_ok_and(|mut rd| rd.next().is_some())
 }
 
-/// A profile's LAST USED clock: the newest mtime of its [`CLOCK_DIRS`].
+/// A profile's last-used clock: the newest mtime of its [`CLOCK_DIRS`].
 fn profile_clock(profile: &Path) -> Option<i64> {
     CLOCK_DIRS
         .iter()
@@ -549,43 +548,34 @@ fn profile_clock(profile: &Path) -> Option<i64> {
         .max()
 }
 
-/// THE ONE WAY THIS MODULE TAKES A LOCK. [`HeldLock`]'s field is private to
-/// `held`, so [`HeldLock::try_take`] is the only `try_lock` in this module and
-/// the only way to hold what it takes — the report's probe ([`locks_held`])
-/// and the reclaim (`fd::take_lock`) alike, and the tests' probes too. No
-/// lock taken here can be released by a close alone again: until 2026-09-28
-/// the probe had a `try_lock` of its own, and a variant of it releasing by
-/// the close passed every test of this module while it failed them in full
-/// runs under load.
+/// The one way this module takes a lock: [`HeldLock`]'s field is private to
+/// `held`, so [`HeldLock::try_take`] is the module's only `try_lock` and the
+/// only way to hold what it takes (the report's probe [`locks_held`], the
+/// reclaim's `fd::take_lock`, and the tests' probes). No lock taken here can
+/// be released by close alone.
 mod held {
     use std::io;
 
-    /// One of cargo's build locks, held by this process: released by
-    /// `LOCK_UN` when it drops, NEVER by the close alone. An `flock(2)` lives
-    /// on the open file description, and while any thread of this process is
-    /// mid-spawn the child holds a copy of every descriptor — close-on-exec
-    /// ones included — until its exec. A lock released only by the close
-    /// stays held in that child meanwhile: a cargo started then waits out a
-    /// build nobody is running, and the next report or reclaim skips the
-    /// profile because "a build holds" it. `LOCK_UN` strips the lock from the
-    /// description itself, every inherited copy included — the release of
-    /// the other `flock` guards in this crate (`upgrade_drive::SweepLock`,
-    /// `operator::ProcessLock`). Pinned for the reclaim by
-    /// `a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec`,
-    /// and for the probe by
-    /// `a_probed_lock_is_released_while_a_child_forked_under_the_probe_has_yet_to_exec`.
+    /// One of cargo's build locks held by this process, released by `LOCK_UN`
+    /// on drop. An `flock(2)` lives on the open file description, which a child
+    /// mid-spawn keeps until its exec, so releasing by close alone would leave
+    /// it held there.
     pub(super) struct HeldLock(std::fs::File);
 
     impl HeldLock {
-        /// Take `file`'s `flock` exclusively, WITHOUT WAITING. `Ok(None)`:
+        /// Take `file`'s `flock` exclusively without waiting. `Ok(None)`:
         /// someone holds it.
         pub(super) fn try_take(file: std::fs::File) -> io::Result<Option<HeldLock>> {
-            // Ascription load-bearing — the lock-order census's File evidence
-            // (aterm-census `is_file_binding_rhs`), as in aterm-update-core's
-            // `lock_open`: it keeps this site categorized as the cross-process
-            // advisory lock it is.
+            // The ascription is the lock-order census's File evidence
+            // (aterm-census `is_file_binding_rhs`), keeping this site
+            // categorized as a cross-process advisory lock.
             let file: std::fs::File = file;
-            match file.try_lock() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the guard's own take: its Drop releases by LOCK_UN"
+            )]
+            let taken = file.try_lock();
+            match taken {
                 Ok(()) => Ok(Some(HeldLock(file))),
                 Err(std::fs::TryLockError::WouldBlock) => Ok(None),
                 Err(std::fs::TryLockError::Error(e)) => Err(e),
@@ -600,14 +590,10 @@ mod held {
     }
 }
 
-/// A TEST'S BUILD: one of cargo's locks held as a build holds it — taken
-/// through the module's one `try_lock` ([`HeldLock::try_take`]) and released
-/// by `LOCK_UN` when it drops, a panic's unwind included. A stand-in that
-/// released it by the close alone would leave it held in any child a sibling
-/// test is spawning, and the next probe or reclaim would read a build nobody
-/// is running ([`HeldLock`] says why) — so every test of the build-cache
-/// reclaim that simulates a build takes its lock through this, or through
-/// [`HeldLock`] itself.
+/// A test's build: one of cargo's locks held as a build holds it, taken through
+/// [`HeldLock::try_take`] and released by `LOCK_UN` on drop (unwind included).
+/// Every test simulating a build takes its lock through this or [`HeldLock`],
+/// so no sibling test's spawned child keeps it held.
 #[cfg(test)]
 pub(crate) struct Build {
     _lock: HeldLock,
@@ -626,11 +612,10 @@ impl Build {
     }
 }
 
-/// Why a build holds one of `profile`'s locks right now, or `None`. Each lock
-/// that exists is taken exclusively without waiting and released at once, by
-/// `LOCK_UN` ([`HeldLock`]); a missing one is NOT created (a report writes
-/// nothing into a build directory), and a lock that is a symlink or cannot be
-/// probed reads as held — the safe side.
+/// Why a build holds one of `profile`'s locks right now, or `None`. Each
+/// existing lock is taken exclusively without waiting and released at once by
+/// `LOCK_UN` ([`HeldLock`]); a missing one is not created (a report writes
+/// nothing), and a lock that is a symlink or cannot be probed reads as held.
 fn locks_held(profile: &Path) -> Option<String> {
     locks_held_with(profile, &mut |_| {})
 }
@@ -669,34 +654,7 @@ fn locks_held_with(profile: &Path, hook: &mut dyn FnMut(&Path)) -> Option<String
 /// A report's estimate; the reclaim counts what it actually unlinked.
 #[must_use]
 pub fn cache_bytes(dir: &Path, dev: Option<u64>) -> (u64, bool) {
-    let mut total: u64 = 0;
-    let mut seen = 0usize;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            seen += 1;
-            if seen > MAX_WALK_ENTRIES {
-                return (total, true);
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                if same_dev(&meta, dev) {
-                    stack.push(entry.path());
-                }
-            } else {
-                total = total.saturating_add(released(&meta));
-            }
-        }
-    }
-    (total, false)
+    walk_bytes(dir, |meta| same_dev(meta, dev), released)
 }
 
 /// Is `meta` on the device `dev` (any, when `dev` is unknown)?
@@ -776,27 +734,23 @@ pub enum Stage {
     Released,
 }
 
-/// RECLAIM ONE BUILD DIRECTORY'S IDLE `incremental/` CACHES — the one
-/// removal primitive of [`super::Class::CargoTargets`], for the host's tick
-/// and the hand-run verb alike ([`super::remover`]). The module docs say what
-/// it does, step by step.
+/// Reclaim one build directory's idle `incremental/` caches: the one removal
+/// primitive of [`super::Class::CargoTargets`], for the host's tick and the
+/// hand-run verb ([`super::remover`]). The module docs give the steps.
 ///
 /// # Errors
 ///
-/// The path is not absolute, a component of it is a symlink, or it is not a
-/// directory; it is on another device than `judge.device`; it no longer
-/// clears its fences; or not one byte was reclaimed (each profile's reason is
-/// in the message).
+/// The path is not absolute, a component is a symlink, or it is not a
+/// directory; it is on another device than `judge.device`; it no longer clears
+/// its fences; or not one byte was reclaimed (each profile's reason is in the
+/// message).
 pub fn reclaim(path: &Path, judge: &Judge) -> io::Result<Removed> {
     reclaim_with(path, judge, &mut |_, _| {})
 }
 
-/// [`reclaim`], LEAVING every profile inside one of `leave` — the build
-/// directories named inside this one, each of which decides its own profiles
-/// (the report's `speaker`): its own row takes them, or its own survey kept
-/// them because a build held one. Walked again under this directory's
-/// handle, such a profile is passed over as a profile that is not idle is,
-/// its locks never taken.
+/// [`reclaim`], leaving every profile inside one of `leave`: build directories
+/// named inside this one, which decide their own profiles. Such a profile is
+/// passed over like a non-idle one, its locks never taken.
 ///
 /// # Errors
 ///
@@ -819,14 +773,11 @@ pub fn reclaim_with(
     fd::reclaim(path, judge, Select::Idle { leave: &[] }, hook)
 }
 
-/// UNDER PRESSURE, RECLAIM ONE PROFILE'S `incremental/` — the profile at
+/// Under pressure, reclaim one profile's `incremental/`: the profile at
 /// `profile` in the build directory at `path`, idle or not, as the pressure
-/// pass picks them, least recently used first (the module docs). The same
-/// steps as [`reclaim`]: the build directory pinned without following a
-/// link, its fences again, every one of the profile's locks held for the
-/// whole delete, nothing on another device than `judge.device`. Under the
-/// locks it is re-derived: still one of this build directory's profiles,
-/// written into no later than `seen` (the survey's LAST USED) and not within
+/// pass picks them. The same steps as [`reclaim`]; under the locks it is
+/// re-derived as still one of this build directory's profiles, written no
+/// later than `seen` (the survey's last used) and not within
 /// [`PRESSURE_MIN_IDLE_S`] of `judge.now`.
 ///
 /// # Errors
@@ -852,6 +803,61 @@ pub fn reclaim_lru_with(
     fd::reclaim(path, judge, Select::Lru { profile, seen }, hook)
 }
 
+/// BELOW THE FLOOR, A BUILD DIRECTORY WHOSE OWNER IS GONE, WHOLE — the one
+/// removal of a whole build directory (`super::Witness::OwnerGone`: a Claude
+/// Code session no process runs, a cells cache of a removed checkout). The
+/// same discipline as [`reclaim`]: the directory pinned component by
+/// component without following a link, on `judge.device`; its fences again
+/// — and the stronger marker a whole removal needs, a signed `CACHEDIR.TAG`
+/// (the Cache Directory Tagging Specification's mark of a directory whose
+/// contents can be regenerated); its profiles found again by the bounded
+/// walk of this handle, at least one, and EVERY lock of every one of them
+/// taken (a held one refuses the whole directory, nothing deleted); under
+/// them, the profiles found AGAIN and refused if any appeared since (a new
+/// target triple's profile, made after the first walk, holds a lock this
+/// reclaim never took), every profile re-dated: written into no later than
+/// `seen` (the survey's newest LAST USED) and not within `quiet_s` of
+/// `judge.now`, and the caller's `check` asked (the owner still gone, no
+/// process using it: `super::discover::recheck`). Then the tree is deleted
+/// THROUGH THE HANDLE pinned at the start — its contents by that handle, the
+/// emptied directory last by name only if the name still names it — still
+/// holding every lock, cargo's lock files last in each directory, so a cargo
+/// that starts meanwhile waits on them; and the locks released by
+/// `LOCK_UN`. The bytes are what the unlinks released.
+///
+/// # Errors
+///
+/// As [`reclaim`]; the marker is not a signed `CACHEDIR.TAG`; it holds no
+/// profile; a build holds a lock; a profile appeared since the first walk;
+/// a profile was written into since the survey or inside the quiet window;
+/// `check` refused; or nothing was removed.
+pub fn reclaim_whole(
+    path: &Path,
+    judge: &Judge,
+    seen: i64,
+    quiet_s: i64,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> io::Result<Removed> {
+    reclaim_whole_with(path, judge, seen, quiet_s, check, &mut |_, _| {})
+}
+
+/// [`reclaim_whole`] with a hook told each [`Stage`] (a test's probe; the
+/// path is the build directory's).
+///
+/// # Errors
+///
+/// As [`reclaim_whole`].
+pub fn reclaim_whole_with(
+    path: &Path,
+    judge: &Judge,
+    seen: i64,
+    quiet_s: i64,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    hook: &mut dyn FnMut(Stage, &Path),
+) -> io::Result<Removed> {
+    fd::reclaim_whole(path, judge, seen, quiet_s, check, hook)
+}
+
 /// Which profiles one reclaim of a build directory takes.
 #[derive(Debug, Clone, Copy)]
 enum Select<'a> {
@@ -866,7 +872,7 @@ enum Select<'a> {
     Lru {
         /// The profile.
         profile: &'a Path,
-        /// Its LAST USED as the survey read it.
+        /// Its last used as the survey read it.
         seen: i64,
     },
 }
@@ -881,14 +887,15 @@ impl Select<'_> {
                     return None;
                 }
                 Some(match clock {
+                    None => "its caches' clock could not be read".to_owned(),
                     Some(m) if age_days(judge.now, m) >= judge.threshold_days => format!(
-                        "no longer idle: written into {} ago, inside the {} every build keeps",
+                        "no longer idle: written into {} ago; no reclaim takes a profile built in the last {}",
                         human_age(judge.now.saturating_sub(m)),
                         human_age(PRESSURE_MIN_IDLE_S)
                     ),
-                    _ => format!(
+                    Some(m) => format!(
                         "no longer idle: written into {}d ago, under the {}d threshold",
-                        clock.map_or(0, |m| age_days(judge.now, m)),
+                        age_days(judge.now, m),
                         judge.threshold_days
                     ),
                 })
@@ -906,7 +913,7 @@ impl Select<'_> {
                 let age = judge.now.saturating_sub(m);
                 (age < PRESSURE_MIN_IDLE_S).then(|| {
                     format!(
-                        "written into {} ago, inside the {} every build keeps even under pressure",
+                        "written into {} ago; no reclaim takes a profile built in the last {}",
                         human_age(age),
                         human_age(PRESSURE_MIN_IDLE_S)
                     )
@@ -958,9 +965,9 @@ mod fd {
         Ok(st.st_dev)
     }
 
-    /// Open the directory at the absolute `path`, component by component
-    /// from `/`, NEVER following a symlink at any of them: a component that
-    /// is (or has become) a link refuses the whole path.
+    /// Open the directory at the absolute `path` component by component from
+    /// `/`, never following a symlink: a component that is (or became) a link
+    /// refuses the whole path.
     pub(super) fn pin(path: &Path) -> io::Result<OwnedFd> {
         if !path.is_absolute() {
             return Err(io::Error::other("not an absolute path"));
@@ -987,6 +994,20 @@ mod fd {
             }
         }
         Ok(fd)
+    }
+
+    /// A build directory the survey measured that is no longer there —
+    /// something else removed it, or the folder holding it, since — said as
+    /// that (`NotFound`); any other error as it is.
+    fn gone_since(e: io::Error) -> io::Error {
+        if e.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no longer a candidate: it is gone (something else removed it since the survey)",
+            )
+        } else {
+            e
+        }
     }
 
     /// `name` under `parent` as a directory handle, `None` when it is not a
@@ -1149,10 +1170,9 @@ mod fd {
         Ok(fd)
     }
 
-    /// Take the lock `name` under `dir` exclusively without waiting;
-    /// `create` makes it when absent, `0666` under the umask as cargo's own
-    /// `OpenOptions` does — a private `0600` would lock another member of a
-    /// shared build directory's group out of every later build.
+    /// Take the lock `name` under `dir` exclusively without waiting; `create`
+    /// makes it when absent, `0666` under the umask as cargo does (a private
+    /// `0600` would lock group members out of a shared build directory).
     /// `Ok(None)`: someone holds it.
     fn take_lock(dir: &OwnedFd, name: &str, create: bool) -> io::Result<Option<HeldLock>> {
         let mut flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
@@ -1237,12 +1257,11 @@ mod fd {
         kept: Vec<String>,
     }
 
-    /// THE ONE DELETION: `name` under `parent` — a directory emptied and
-    /// removed, never followed, never entered on another device than `on`;
-    /// anything else unlinked, its released blocks counted only once the
-    /// unlink succeeded and only when it was the file's last name. A failure
-    /// is recorded and the rest is still tried; a directory that kept
-    /// anything is not removed.
+    /// The one deletion: `name` under `parent`. A directory is emptied and
+    /// removed, never followed or entered on another device than `on`; anything
+    /// else is unlinked, its blocks counted only after the unlink succeeded and
+    /// only when it was the file's last name. A failure is recorded and the
+    /// rest still tried; a directory that kept anything is not removed.
     fn remove_tree_at(
         parent: &OwnedFd,
         name: &OsStr,
@@ -1290,7 +1309,10 @@ mod fd {
         }
         let kept = out.kept.len();
         match names(&fd) {
-            Ok(children) => {
+            Ok(mut children) => {
+                // cargo's lock files LAST: a cargo starting meanwhile waits
+                // on a lock still held, rather than on a fresh file it made.
+                children.sort_by_key(|c| CARGO_LOCKS.iter().any(|l| c == l));
                 for child in children {
                     remove_tree_at(&fd, &child, &here, on, depth + 1, out);
                 }
@@ -1362,6 +1384,173 @@ mod fd {
         })
     }
 
+    /// Remove the build directory at `path` WHOLE ([`super::reclaim_whole`]).
+    pub(super) fn reclaim_whole(
+        path: &Path,
+        judge: &Judge,
+        seen: i64,
+        quiet_s: i64,
+        check: &mut dyn FnMut() -> Result<(), String>,
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> io::Result<Removed> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(io::Error::other("not a plain absolute path"));
+        };
+        let parent_fd = pin(parent).map_err(gone_since)?;
+        let root = match dirfd::openat(&parent_fd, name, dir_flags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(e) if e.0 == libc::ENOENT => return Err(gone_since(e.into())),
+            Err(e) if e.0 == libc::ENOTDIR || e.0 == libc::ELOOP => {
+                return Err(io::Error::other(
+                    "no longer a candidate: not a directory (nothing is reached through a link)",
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let root_dev = dev(&root)?;
+        if judge.device.is_some_and(|d| d != root_dev) {
+            return Err(io::Error::other(
+                "no longer a candidate: it is on another volume than the one measured",
+            ));
+        }
+        let refuse = |why: String| io::Error::other(format!("no longer a candidate: {why}"));
+        let (marker, holds_source) = root_facts(path);
+        let (profiles, cut) = find_at(&root, path, WalkBudget::SHIPPED);
+        let marker = TargetDir {
+            path: path.to_path_buf(),
+            marker,
+            holds_source,
+            walk_cut_short: cut,
+            profiles: Vec::new(),
+            device: Some(root_dev),
+            probed_recent: false,
+            origin: super::Origin::Named,
+            owned: super::Owned::NotOwned,
+            total: None,
+        }
+        .fences()
+        .map_err(refuse)?;
+        if marker != "CACHEDIR.TAG" {
+            return Err(refuse(format!(
+                "only a signed CACHEDIR.TAG lets a whole build directory go, and it carries {marker}"
+            )));
+        }
+        if profiles.is_empty() {
+            return Err(refuse("it holds no cargo profile".to_owned()));
+        }
+        // 1. Every lock of every profile, exclusively, without waiting.
+        let mut held = Vec::new();
+        for profile in &profiles {
+            let fd = reopen(&root, path, profile, root_dev).map_err(|e| refuse(e.to_string()))?;
+            held.extend(take_all(&fd, profile).map_err(refuse)?);
+            // 2. Re-dated under its locks.
+            let Some(clock) = clock_at(&fd) else {
+                return Err(refuse(format!(
+                    "{}: its caches' clock could not be read",
+                    profile.display()
+                )));
+            };
+            if clock > seen {
+                return Err(refuse(format!(
+                    "{} was written into since the survey",
+                    profile.display()
+                )));
+            }
+            let age = judge.now.saturating_sub(clock);
+            if age < quiet_s {
+                return Err(refuse(format!(
+                    "{} was written into {} ago",
+                    profile.display(),
+                    super::human_age(age)
+                )));
+            }
+        }
+        hook(Stage::Locked, path);
+        // Under the locks: the profiles found again — one made since the
+        // first walk holds a lock this reclaim never took.
+        let (mut again, cut) = find_at(&root, path, WalkBudget::SHIPPED);
+        let mut before = profiles.clone();
+        again.sort();
+        before.sort();
+        if cut.is_some() || again != before {
+            return Err(refuse(
+                "its profiles changed since they were locked (a build started a new one)"
+                    .to_owned(),
+            ));
+        }
+        // The caller's own checks, under the locks: the owner still gone,
+        // nothing running from it.
+        check().map_err(refuse)?;
+        // The name still names the directory pinned.
+        let same = |fd: &OwnedFd| dirfd::fstat(fd).map(|st| (st.st_dev, st.st_ino));
+        let named = |parent: &OwnedFd| -> io::Result<bool> {
+            Ok(match open_dir(parent, name)? {
+                Some(fd) => same(&fd)? == same(&root)?,
+                None => false,
+            })
+        };
+        if !named(&parent_fd)? {
+            return Err(refuse("its name now names another directory".to_owned()));
+        }
+        hook(Stage::Deleting, path);
+        // 3. Delete it, every lock still held: its contents THROUGH THE
+        // HANDLE pinned above (a directory swapped in under its name since
+        // is never entered), cargo's lock files last; then the emptied
+        // directory, by name, only while the name still names it.
+        let mut deleted = Deleted::default();
+        match names(&root) {
+            Ok(mut children) => {
+                children.sort_by_key(|c| CARGO_LOCKS.iter().any(|l| c == l));
+                for child in children {
+                    remove_tree_at(&root, &child, path, root_dev, 1, &mut deleted);
+                }
+            }
+            Err(e) => deleted.kept.push(format!("{}: {e}", path.display())),
+        }
+        let mut gone = false;
+        if deleted.kept.is_empty() {
+            if named(&parent_fd)? {
+                match dirfd::unlinkat(&parent_fd, name, AtFlags::REMOVEDIR) {
+                    Ok(()) => gone = true,
+                    Err(e) => {
+                        deleted
+                            .kept
+                            .push(format!("{}: {}", path.display(), io::Error::from(e)))
+                    }
+                }
+            } else {
+                deleted.kept.push(format!(
+                    "{}: its name now names another directory, which is left",
+                    path.display()
+                ));
+            }
+        }
+
+        // 4. Release the locks: `LOCK_UN`, each ([`HeldLock`]).
+        drop(held);
+        hook(Stage::Released, path);
+        if !gone && deleted.bytes == 0 {
+            let mut why = deleted.kept;
+            if why.is_empty() {
+                why.push("nothing could be removed".to_owned());
+            }
+            return Err(io::Error::other(format!(
+                "nothing reclaimed — {}",
+                why.join("; ")
+            )));
+        }
+        Ok(Removed {
+            bytes: deleted.bytes,
+            units: if gone {
+                vec![path.to_path_buf()]
+            } else {
+                Vec::new()
+            },
+            skipped: Vec::new(),
+            trouble: deleted.kept,
+        })
+    }
+
     /// Reclaim the build directory at `path`: the profiles `select` names.
     pub(super) fn reclaim(
         path: &Path,
@@ -1369,14 +1558,14 @@ mod fd {
         select: Select<'_>,
         hook: &mut dyn FnMut(Stage, &Path),
     ) -> io::Result<Removed> {
-        let root = pin(path)?;
+        let root = pin(path).map_err(gone_since)?;
         let root_dev = dev(&root)?;
         if judge.device.is_some_and(|d| d != root_dev) {
             return Err(io::Error::other(
                 "no longer a candidate: it is on another volume than the one measured",
             ));
         }
-        // The fences again, the profiles from the walk of THIS handle.
+        // The fences again, the profiles from the walk of this handle.
         let (marker, holds_source) = root_facts(path);
         let (profiles, cut) = find_at(&root, path, WalkBudget::SHIPPED);
         TargetDir {
@@ -1387,6 +1576,9 @@ mod fd {
             profiles: Vec::new(),
             device: Some(root_dev),
             probed_recent: false,
+            origin: super::Origin::Named,
+            owned: super::Owned::NotOwned,
+            total: None,
         }
         .fences()
         .map_err(|why| io::Error::other(format!("no longer a candidate: {why}")))?;
@@ -1415,10 +1607,9 @@ mod fd {
                     continue;
                 }
             };
-            // Not a candidate at all (no incremental/ or an empty one, or not
-            // selected — for the idle pass, written into inside the window):
-            // no lock taken, and nothing is created. Only the one profile the
-            // pressure pass named is reported, since it was asked for.
+            // Not a candidate (no or empty incremental/, or not selected: for
+            // the idle pass, written inside the window): no lock taken, nothing
+            // created. Only the profile the pressure pass named is reported.
             let refused = if holds_cache_at(&fd) {
                 select.refuses(clock_at(&fd), judge)
             } else {
@@ -1479,6 +1670,16 @@ mod fd {
         _path: &Path,
         _judge: &Judge,
         _select: Select<'_>,
+        _hook: &mut dyn FnMut(Stage, &Path),
+    ) -> io::Result<Removed> {
+        Err(io::Error::other("reclaiming build caches is unix-only"))
+    }
+    pub(super) fn reclaim_whole(
+        _path: &Path,
+        _judge: &Judge,
+        _seen: i64,
+        _quiet_s: i64,
+        _check: &mut dyn FnMut() -> Result<(), String>,
         _hook: &mut dyn FnMut(Stage, &Path),
     ) -> io::Result<Removed> {
         Err(io::Error::other("reclaiming build caches is unix-only"))

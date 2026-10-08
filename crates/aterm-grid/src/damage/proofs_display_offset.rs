@@ -5,21 +5,16 @@
 
 use super::*;
 
-/// No panics for any bounded input combination, and result is consistent
-/// with the None/Full/partial classification.
-///
-/// The function contains two `expect()` calls on `u16::try_from()` that
-/// could panic if the delta or `rows - delta` exceeded u16. This proof
-/// verifies neither path panics for all bounded inputs.
+/// No panics for any bounded input (neither `u16::try_from().expect()` fires),
+/// and the result matches the None/Full/partial classification.
 #[kani::proof]
 fn display_offset_damage_no_panic() {
     let old_offset: usize = kani::any();
     let new_offset: usize = kani::any();
     let visible_rows: u16 = kani::any();
 
-    // Bound offsets to keep CBMC tractable — the function's arithmetic
-    // only depends on delta (|old-new|) vs visible_rows, so bounding
-    // offsets to u16::MAX range covers all code paths.
+    // The arithmetic depends only on delta vs visible_rows, so offsets bounded
+    // to the u16 range cover every path.
     kani::assume(old_offset <= usize::from(u16::MAX));
     kani::assume(new_offset <= usize::from(u16::MAX));
 

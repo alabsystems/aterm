@@ -11,18 +11,12 @@
 //! run nor the credit); a split flap's risk downgraded to `unverified` on
 //! `Buggy = 4`; and the flap a spinner tick splits replayed on `Buggy = 5` (a
 //! draw closing every run, main's grouping before the integration). Each
-//! mutant breaks exactly its claims over the whole bounded space.
+//! mutant breaks exactly its claims over the whole bounded space. The epoch judge
+//! (the engine's debt, read as one epoch) is proved with them, its blind-spot
+//! schedules replayed, and its mutants 6, 7 and 8 each break their one claim.
 
-use aterm_spec::{derive::Model, derive::resize_render_model, interp, verify};
-
-/// `model` with only the invariant `name` kept: the interpreter's whole-space
-/// check of that one claim.
-fn only(model: &Model, name: &str) -> Model {
-    let mut one = model.clone();
-    one.invariants.retain(|inv| inv.name == name);
-    assert_eq!(one.invariants.len(), 1, "{name} is an invariant");
-    one
-}
+use crate::walk::only;
+use aterm_spec::{derive::resize_render_model, interp, verify};
 
 /// The mutant `buggy` breaks every one of `claims` somewhere in the bounded
 /// space and every other invariant nowhere.
@@ -482,12 +476,137 @@ fn a_net_zero_risk_is_never_downgraded_to_unverified() {
     }
 }
 
+/// The ledger's named blind spot, closed twice: a flap an app frame splits was
+/// two net-changed runs, and the run judge said only `unverified`
+/// (`verdict = 2`) once it was drawn on; the run judge now joins them
+/// (`verdict = 1`). The engine's debt does not depend on run shape: the
+/// same schedule leaves `debt = 1` with the geometry back at the epoch's start,
+/// and the epoch says `desync-risk` (`ev = 1`) for a program the ledger judges,
+/// `unjudged` (`ev = 2`) for one it does not. The historical size-difference
+/// judge, which the ledger used before, reads sizes that agree and says ok.
+#[test]
+fn a_flap_an_app_frame_splits_is_judged_as_one_epoch() {
+    let model = resize_render_model();
+    let schedule = ["Demote", "Draw", "Grow", "Step", "Evaluate"];
+    let run = |judged: bool| {
+        let mut state = model.init_state();
+        if judged {
+            assert!(model.fire("Classify", &mut state));
+        }
+        for action in schedule {
+            assert!(model.fire(action, &mut state), "{action}: {state:?}");
+        }
+        state
+    };
+    let judged = run(true);
+    assert_eq!(
+        (judged["debt"], judged["disp"], judged["eg"], judged["geom"]),
+        (1, 1, 0, 0),
+        "one row owed, the geometry back at the epoch's start"
+    );
+    assert_eq!(judged["ev"], 1, "a judged program is accused");
+    // The run judge now joins the halves a draw splits (a draw on displaced
+    // rows is no sign the handler read the smaller size), so it agrees; the
+    // epoch's word does not depend on that grouping. The grouping that
+    // closed every run on a draw (`Buggy = 5`) could only say unverified
+    // here, and the epoch still accuses.
+    assert_eq!(judged["verdict"], 1, "the run judge agrees");
+    let closing = interp::with_buggy(&model, 5);
+    let mut split = closing.init_state();
+    assert!(closing.fire("Classify", &mut split));
+    for action in schedule {
+        assert!(closing.fire(action, &mut split), "{action}: {split:?}");
+    }
+    assert_eq!(
+        (split["verdict"], split["ev"]),
+        (2, 1),
+        "a draw-closes-every-run judge says unverified, the epoch says desync-risk"
+    );
+    let unlearned = run(false);
+    assert_eq!(unlearned["ev"], 2, "an unlearned program reads unjudged");
+    for state in [&judged, &unlearned] {
+        for invariant in [
+            "EpochFlagsTheResidual",
+            "EpochNoFalseAlarm",
+            "OnlyAJudgedProgramIsAccused",
+            "DebtIsTheDisplacement",
+        ] {
+            assert!(
+                model.check_invariant(invariant, state),
+                "{invariant}: {state:?}"
+            );
+        }
+    }
+
+    // The historical judge on the same schedule: sizes agree, so ok, over a
+    // screen one row up.
+    let historical = interp::with_buggy(&model, 1);
+    let mut missed = historical.init_state();
+    for action in ["Demote", "Draw", "Grow", "Step", "Evaluate"] {
+        assert!(historical.fire(action, &mut missed), "{action}: {missed:?}");
+    }
+    assert_eq!(missed["ev"], 0);
+    assert!(!historical.check_invariant("EpochFlagsTheResidual", &missed));
+}
+
+/// An UNDRAWN residual: a mode set between the halves drops the undo, nothing
+/// is drawn, and the screen is one row up all the same. The run judge waits for
+/// a draw that may never come; the epoch judges the debt at the risk wait.
+#[test]
+fn an_undrawn_residual_is_judged_after_the_risk_wait() {
+    let model = resize_render_model();
+    let mut state = model.init_state();
+    assert!(model.fire("Classify", &mut state));
+    for action in ["Demote", "Output", "Grow", "Evaluate"] {
+        assert!(model.fire(action, &mut state), "{action}: {state:?}");
+    }
+    assert_eq!((state["debt"], state["drew"], state["ev"]), (1, 0, 1));
+    assert_eq!(state["verdict"], 0, "the run judge has seen no draw");
+}
+
+/// A quiet flap owes nothing, and a class-unknown program is never accused: the
+/// engine's undo brings `debt` back to zero, and a program that has not shown it
+/// clears the screen on a resize reads `unjudged`, whatever the debt.
+#[test]
+fn a_quiet_flap_owes_nothing_and_an_unknown_program_is_never_accused() {
+    let model = resize_render_model();
+    let mut quiet = model.init_state();
+    for action in ["Demote", "Grow", "Evaluate"] {
+        assert!(model.fire(action, &mut quiet), "{action}: {quiet:?}");
+    }
+    assert_eq!((quiet["debt"], quiet["eg"], quiet["ev"]), (0, 0, 0));
+
+    let mut trim = model.init_state();
+    for action in ["Trim", "Evaluate"] {
+        assert!(model.fire(action, &mut trim), "{action}: {trim:?}");
+    }
+    assert_eq!((trim["debt"], trim["ev"]), (0, 0), "a trim owes nothing");
+
+    // A changed-size read is a full repaint: the debt and the epoch end.
+    let mut healed = model.init_state();
+    for action in ["Demote", "Step", "Evaluate"] {
+        assert!(model.fire(action, &mut healed), "{action}: {healed:?}");
+    }
+    assert_eq!((healed["debt"], healed["disp"], healed["ev"]), (0, 0, 0));
+
+    // The class becomes known once, and only the accusation depends on it.
+    let mut learned = model.init_state();
+    assert!(model.fire("Classify", &mut learned));
+    assert!(!model.action_enabled("Classify", &learned), "once");
+}
+
 /// Every named mutant breaks exactly its claims anywhere in the bounded
 /// space: 2 `NoSilentPass`; 3 the verdict both ways and the displaced render
 /// both ways (a time-closed run is left `silent`, or booked, whatever the
-/// undo later hands back); 4 and 5 `RiskIsFlagged`.
+/// undo later hands back); 4 and 5 `RiskIsFlagged`; and for the epoch judge 6
+/// (accuse an unlearned program) `OnlyAJudgedProgramIsAccused`, 7 (forget the
+/// residual) `EpochFlagsTheResidual`, 8 (answer whenever the geometry is at the
+/// epoch's start, owed or not) `EpochNoFalseAlarm`.
+///
+/// Three tests over disjoint mutants (each walk is its own whole space):
+/// the verdict's 2 and 3, the risk's 4 and 5, the epoch judge's 6, 7 and 8.
 #[test]
-fn each_named_mutant_breaks_exactly_its_claims() {
+fn each_named_mutant_breaks_exactly_its_claims_the_verdict_s() {
     breaks_exactly(2, &["NoSilentPass"]);
     breaks_exactly(
         3,
@@ -498,8 +617,19 @@ fn each_named_mutant_breaks_exactly_its_claims() {
             "NoFalseDisplaced",
         ],
     );
+}
+
+#[test]
+fn each_named_mutant_breaks_exactly_its_claims_the_risk_s() {
     breaks_exactly(4, &["RiskIsFlagged"]);
     breaks_exactly(5, &["RiskIsFlagged"]);
+}
+
+#[test]
+fn each_named_mutant_breaks_exactly_its_claims_the_epoch_judge_s() {
+    breaks_exactly(6, &["OnlyAJudgedProgramIsAccused"]);
+    breaks_exactly(7, &["EpochFlagsTheResidual"]);
+    breaks_exactly(8, &["EpochNoFalseAlarm"]);
 }
 
 /// Each invariant, alone, is falsified by the `Buggy = 1` family (the

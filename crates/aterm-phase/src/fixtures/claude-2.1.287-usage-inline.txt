@@ -1,0 +1,45 @@
+# claude-code 2.1.287 · MEASURED 2026-10-01 by the accounts probe's live check (docs/SPEC-claude-accounts-probe-2026-10-01.md §6): `aterm ctl text --json` rows of a private headless aterm (150x50; Claude Code started as `CLAUDE_CODE_NO_FLICKER=0 claude`, the INLINE renderer, the main screen), 255 ms after the Enter that ran `/usage` · THE SETTINGS PANEL UNDER THE INLINE RENDERER: the `❯ /usage` row left in the transcript, a full-width `─` rule, the header TWO columns in · the capture's first six rows (the launch line and the banner: two the live check masked, one naming a scratch path) are NOT KEPT, so every row index here is six less than on the grid
+❯ Reply with the one word ok.
+
+⏺ ok
+
+✻ Brewed for 0s · done 9:30 PM
+
+❯ /usage
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Settings  Status   Config   Usage   Stats
+
+  Session
+
+  Total cost:            $0.0813
+  Total duration (API):  1s
+  Total duration (wall): 18s
+  Total code changes:    0 lines added, 0 lines removed
+  Usage by model:
+      claude-haiku-4-5:  897 input, 9 output, 0 cache read, 0 cache write ($0.0009)
+       claude-opus-5-5:  2 input, 4 output, 35.6k cache read, 9.1k cache write ($0.0803)
+  Prompt cache (main):   1 request · 80% of input tokens from cache · no misses · warm (1h TTL, last activity 13s ago)
+
+  Current session
+  █                                                  2% used
+  Resets 2am (America/Los_Angeles)
+
+  Current week (all models)
+  █████                                              10% used
+  Resets Oct 8 at 9am (America/Los_Angeles)
+
+  Current week (Fable)
+                                                     0% used
+  Resets Oct 8 at 9am (America/Los_Angeles)
+
+  What's contributing to your limits usage?
+  Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+  Scanning local sessions…
+
+  Usage credits
+  Usage credits are off · /usage-credits to turn them on
+
+  Esc to cancel
+

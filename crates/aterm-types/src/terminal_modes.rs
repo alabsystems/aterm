@@ -2,12 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal mode flags shared across aterm crates.
-//!
-//! Extracted from `aterm-core::terminal::types::modes` to keep the terminal
-//! module focused on runtime state while preserving the canonical mode
-//! contract for checkpointing, bridge integration, and API consumers
-//! (Part of #5663, #2341).
+//! Terminal mode flags shared across aterm crates: the canonical mode contract
+//! for checkpointing, bridge integration, and API consumers.
 
 use crate::mouse::{MouseEncoding, MouseMode};
 use crate::{Appearance, BiDiMode, CursorStyle, ParagraphDirection, VtLevel};
@@ -58,8 +54,7 @@ pub struct TerminalModes {
     /// **Default: `false` (fail-closed, #7782).** Hosts that want programs to
     /// write to the system clipboard opt in explicitly via
     /// [`authorize_clipboard_access(ClipboardAccess::Write)`](super::super::Terminal::authorize_clipboard_access)
-    /// (or the FFI `aterm_terminal_set_allow_osc52_set_v2`) after wiring a
-    /// clipboard callback. This matches the "host policy bit" posture used
+    /// after wiring a clipboard callback. This matches the "host policy bit" posture used
     /// for `allow_window_ops`, `allow_osc52_query`, `allow_notifications`,
     /// and `allow_palette_reconfigure`: wiring the callback is one signal,
     /// but a second explicit policy call is required before parser-origin
@@ -228,8 +223,7 @@ pub struct TerminalModes {
     ///
     /// **Default: `false` (fail-closed, #7918).** Hosts must explicitly opt
     /// in via [`set_allow_notifications`](super::super::Terminal::set_allow_notifications)
-    /// (or the FFI `aterm_terminal_set_allow_notifications_v2`) after wiring
-    /// a notification callback. This matches the "host policy bit" posture
+    /// after wiring a notification callback. This matches the "host policy bit" posture
     /// used for `allow_window_ops` and `allow_osc52_query`: wiring the
     /// callback is one signal, but a second explicit policy call is
     /// required before parser-origin OSC 9/99/777 sequences can reach the
@@ -272,7 +266,7 @@ pub struct TerminalModes {
     /// no response), and the drop is counted in
     /// `ShellIntegrationAuth::dropped_count` for host-side metrics.
     ///
-    /// Comparison is constant-time, matching the `modal_auth` precedent.
+    /// Comparison is constant-time (`constant_time_eq_32`).
     ///
     /// **Default: `false` (minimum-disruption landing).** This parallels
     /// `allow_palette_reconfigure`: the security improvement is opt-in until
@@ -333,8 +327,8 @@ impl TerminalModes {
             auto_wrap: true,
             bidi_arrow_swap: true,
             // #7782: fail-closed. Hosts must opt in via
-            // `authorize_clipboard_access(Write)` (or the FFI v2 setter)
-            // after wiring a clipboard callback. See
+            // `authorize_clipboard_access(Write)` after wiring a clipboard
+            // callback. See
             // `TerminalModes::allow_osc52_set` doc for rationale.
             allow_osc52_set: false,
             // #7918 HN-P1: fail-closed. Hosts must opt in after wiring a

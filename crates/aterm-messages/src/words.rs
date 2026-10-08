@@ -30,11 +30,8 @@ pub fn relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM:SS UTC` — a local twin of
-/// `aterm_types::rfc3339::format_rfc3339` (no aterm-types dependency), and
-/// it SAYS the zone: the page's meta line and the clipboard sit beside local
-/// clocks (the terminal's own, the presence row's `Session started 19:10`),
-/// and a bare `02:10:28` seven hours off them reads as a wrong clock, not a
-/// different one (Phase 2 review).
+/// `aterm_types::rfc3339::format_rfc3339` (no aterm-types dependency). It
+/// names the zone: beside local clocks a bare UTC time reads as a wrong clock.
 #[must_use]
 pub fn stamp_words(at_unix_ms: u64) -> String {
     let secs = at_unix_ms / 1000;
@@ -55,10 +52,8 @@ pub fn stamp_words(at_unix_ms: u64) -> String {
 /// seconds from UTC: `Today 12:53:49 PM`, `Yesterday 9:02:11 AM`, else the
 /// day as its header says it ([`day_heading`]: `Thursday 9:02:11 AM`,
 /// `Tuesday, 15 September, 9:02:11 AM`) — the local date the meta line of an
-/// expanded entry says, beside the relative words its row already shows.
-/// Round 18, day four (D14): an ISO `2026-09-24 10:30:00 AM` sat under a
-/// `Thursday` header. Copy keeps the UTC stamp ([`stamp_words`]). Pure: the
-/// host supplies the offset.
+/// expanded entry says, never an ISO date under a weekday header. Copy keeps
+/// the UTC stamp ([`stamp_words`]). Pure: the host supplies the offset.
 #[must_use]
 pub fn local_words(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> String {
     let local = |ms: u64| {
@@ -87,20 +82,25 @@ pub fn local_words(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> String {
 }
 
 /// How long ago `at` was, SPOKEN (design ruling 262): [`relative_words`] with
-/// its abbreviations said whole — `6 hours ago`, `1 minute ago`, `just now`.
+/// its abbreviations said whole — `6 hours ago`, `1 minute ago`, `just now` —
+/// and past a day the time ELAPSED (`36 hours ago`, `3 days ago`), never a
+/// calendar word, which could contradict the LOCAL day header the row sits
+/// under (ruling 273). Elapsed time holds in every zone.
 #[must_use]
 pub fn spoken_relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
-    let words = relative_words(now_unix_ms, at_unix_ms);
-    let whole = |n: &str, unit: &str| {
-        let plural = if n == "1" { "" } else { "s" };
+    let ago = now_unix_ms.saturating_sub(at_unix_ms);
+    let whole = |n: u64, unit: &str| {
+        let plural = if n == 1 { "" } else { "s" };
         format!("{n} {unit}{plural} ago")
     };
-    if let Some(n) = words.strip_suffix(" min ago") {
-        whole(n, "minute")
-    } else if let Some(n) = words.strip_suffix(" h ago") {
-        whole(n, "hour")
+    if ago < MS_PER_MIN {
+        "just now".to_string()
+    } else if ago < MS_PER_HOUR {
+        whole(ago / MS_PER_MIN, "minute")
+    } else if ago < 2 * MS_PER_DAY {
+        whole(ago / MS_PER_HOUR, "hour")
     } else {
-        words
+        whole(ago / MS_PER_DAY, "day")
     }
 }
 
@@ -286,11 +286,10 @@ pub(crate) fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
 }
 
 /// The closed table a Complete echo reads a title's leading present
-/// participle through: only the verbs a band title uses, or plausibly will —
-/// a script's own titles too (ruling 270: day three's `Deploying site`,
-/// `Generating thumbnails` and `Rendering the video` were logged, delivered,
-/// in their in-flight words).
-const FINISHED_VERBS: [(&str, &str); 40] = [
+/// participle through: the verbs band titles use or plausibly will, a
+/// script's own titles (ruling 270) and this crate's wait rows included, so
+/// no finished record keeps its in-flight words.
+const FINISHED_VERBS: [(&str, &str); 43] = [
     ("Downloading", "Downloaded"),
     ("Installing", "Installed"),
     ("Updating", "Updated"),
@@ -331,6 +330,9 @@ const FINISHED_VERBS: [(&str, &str); 40] = [
     ("Resizing", "Resized"),
     ("Cleaning", "Cleaned"),
     ("Analyzing", "Analyzed"),
+    ("Pasting", "Pasted"),
+    ("Rewrapping", "Rewrapped"),
+    ("Removing", "Removed"),
 ];
 
 /// A work title in its FINISHED form (design ruling 154): `Downloading aterm
@@ -419,7 +421,7 @@ mod tests {
         assert_eq!(local_words(at, at, 0), "Today 3:53:20 PM");
         assert_eq!(local_words(at, at, -7 * 3600), "Today 8:53:20 AM");
         assert_eq!(local_words(at + MS_PER_DAY, at, 0), "Yesterday 3:53:20 PM");
-        // Round 18 (D14): an older day as its header says it, never ISO.
+        // An older day as its header says it, never ISO.
         assert_eq!(local_words(at + 3 * MS_PER_DAY, at, 0), "Sunday 3:53:20 PM");
         assert_eq!(
             local_words(at + 30 * MS_PER_DAY, at, 0),
@@ -433,6 +435,15 @@ mod tests {
         );
         assert_eq!(spoken_relative_words(at + MS_PER_MIN, at), "1 minute ago");
         assert_eq!(spoken_relative_words(at, at), "just now");
+        // Past a day, the time elapsed, never a calendar word.
+        assert_eq!(
+            spoken_relative_words(at + 36 * MS_PER_HOUR, at),
+            "36 hours ago"
+        );
+        assert_eq!(
+            spoken_relative_words(at + 3 * MS_PER_DAY + MS_PER_HOUR, at),
+            "3 days ago"
+        );
     }
 
     #[test]
@@ -620,6 +631,7 @@ mod tests {
             retired_unix_ms: None,
             retired_at: None,
             last_action: None,
+            later: false,
         };
         assert_eq!(
             copy_text(&rec),

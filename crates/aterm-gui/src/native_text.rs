@@ -4,8 +4,8 @@
 //! Persistent balanced UTF-8 text storage for native documents.
 //!
 //! Leaves are bounded UTF-8 chunks; branches cache byte/newline counts and AVL height.
-//! Cloning a snapshot is O(1), byte split/replace and line lookup are logarithmic in the
-//! number of chunks, and untouched subtrees are structurally shared. `DocumentStore`
+//! Cloning a snapshot is O(1), byte split/replace is logarithmic in the number of chunks,
+//! the line count is cached, and untouched subtrees are structurally shared. `DocumentStore`
 //! lowers the resulting text through its authoritative `aterm_buffer::Surface` commit.
 
 use std::ops::Range;

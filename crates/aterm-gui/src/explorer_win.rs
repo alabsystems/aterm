@@ -13,38 +13,15 @@
 #![cfg(windows)]
 
 use core::ptr;
-use std::ffi::OsStr;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 
-type Hkey = isize;
-const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as Hkey;
-const REG_SZ: u32 = 1;
-const KEY_WRITE: u32 = 0x0002_0006;
-const REG_OPTION_NON_VOLATILE: u32 = 0;
+use crate::win_ffi::{
+    HKEY_CURRENT_USER, Hkey, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegSetValueExW, wide,
+};
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
-    fn RegCreateKeyExW(
-        hkey: Hkey,
-        subkey: *const u16,
-        reserved: u32,
-        class: *const u16,
-        options: u32,
-        sam: u32,
-        security: *const core::ffi::c_void,
-        result: *mut Hkey,
-        disposition: *mut u32,
-    ) -> i32;
-    fn RegSetValueExW(
-        hkey: Hkey,
-        name: *const u16,
-        reserved: u32,
-        ty: u32,
-        data: *const u8,
-        cb: u32,
-    ) -> i32;
-    fn RegCloseKey(hkey: Hkey) -> i32;
     fn RegDeleteTreeW(hkey: Hkey, subkey: *const u16) -> i32;
 }
 
@@ -55,13 +32,6 @@ const VERBS: [(&str, &str); 3] = [
     (r"Software\Classes\Directory\shell\aterm", "%1"),
     (r"Software\Classes\Drive\shell\aterm", "%1"),
 ];
-
-fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
 
 fn create_key(subkey: &str) -> io::Result<Hkey> {
     let sub = wide(subkey);

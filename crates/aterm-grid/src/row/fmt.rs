@@ -10,10 +10,8 @@ impl std::fmt::Display for Row {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for cell in &self.as_slice()[..self.len() as usize] {
             if !cell.is_wide_continuation() {
-                // NUL (empty cell) → space, matching push_cell_text() in
-                // content.rs. Without this, scrollback text extraction via
-                // Line::to_string() can contain literal NUL bytes while
-                // visible-row extraction converts them to spaces (#7465).
+                // NUL (empty cell) → space, as push_cell_text() does, so
+                // scrollback text matches visible-row text.
                 let ch = cell.char();
                 f.write_char(if ch == '\0' { ' ' } else { ch })?;
             }

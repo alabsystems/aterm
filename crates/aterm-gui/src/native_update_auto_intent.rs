@@ -260,6 +260,28 @@ pub(crate) enum ArmDecision {
     Set(u64),
 }
 
+/// Whether arming `incoming_build` owes the candidate's pre-park read (its
+/// verdict and the handoff policy it seals) now: whenever it is newer than the
+/// running build and nothing already armed outranks it — not only when the
+/// automatic lane takes it (round eight of the update audit, U35). A person's
+/// Install on the fork lane parks before its worker verifies, so with
+/// `[update] auto_apply = false` (`Clear`), or a build latched manual-only
+/// (`SuppressManualOnly`), a policy first read there was read only after the
+/// capture it was sealed to forbid. `Keep` reads nothing: an armed intent at
+/// least as new was read when it was set.
+#[must_use]
+pub(crate) fn arm_reads_candidate(
+    decision: ArmDecision,
+    incoming_build: u64,
+    current_build: u64,
+) -> bool {
+    match decision {
+        ArmDecision::Set(_) => true,
+        ArmDecision::Clear | ArmDecision::SuppressManualOnly => incoming_build > current_build,
+        ArmDecision::Keep => false,
+    }
+}
+
 /// Reduce one durable stage notification into persistent intent. Active updater
 /// work is intentionally not an input: ordering may delay application, never
 /// erase knowledge that a newer build arrived.
@@ -407,7 +429,7 @@ pub(crate) enum StructuralLatchDecision {
     aterm_spec::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "DayPasses",
-        reason = "The monotonic clock passing the re-sample deadline; the host reads it into `resample_due`."
+        reason = "A day passing on the re-sample deadline, the Mac's sleep counted (`App::count_sleep_toward_update_deadlines`); the host reads it into `resample_due`."
     )
 )]
 #[cfg_attr(
@@ -423,7 +445,7 @@ pub(crate) enum StructuralLatchDecision {
     aterm_spec::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "RetryDue",
-        reason = "The monotonic clock passing a refused retire's retry deadline (`AutoApplyStructuralVerdict::newer_retry`); the host reads it into `unspent_newer_download` / `newer_download_waiting`."
+        reason = "A refused retire's retry deadline (`AutoApplyStructuralVerdict::newer_retry`) passing, the Mac's sleep counted (`App::count_sleep_toward_update_deadlines`); the host reads it into `unspent_newer_download` / `newer_download_waiting`."
     )
 )]
 #[cfg_attr(
@@ -432,6 +454,14 @@ pub(crate) enum StructuralLatchDecision {
         machine = "NativeUpdateStructuralLatch",
         action = "TrialUnreadable",
         reason = "The installed facts ceasing to report the latched build (the facts worker drops a yanked bundle newer than the running one); the host reads it as `trial_room: None`, and its bound on such looks is `App::look_at_structural_latch`'s."
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateStructuralLatch",
+        action = "TrialUnproven",
+        reason = "A facts read that could not prove the installed bundle at all (a passing refusal: `spctl` past its ceiling), which the facts worker reports as `installed_unproven`; the host reads it as `trial_room: None`, and its own bound on such looks is `App::look_over_unproven_reads`'s."
     )
 )]
 #[cfg_attr(
@@ -582,6 +612,92 @@ pub(crate) fn finish(result: AttemptResult) -> AttemptDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A STAGE A PERSON INSTALLS IS READ WHEN IT ARMS, TOO (round eight of the
+    /// update audit, U35). With `[update] auto_apply = false` the lane clears
+    /// every stage, and before the fix only `Set` started the pre-park read, so
+    /// a person's Install on the fork lane parked under a policy nobody had read
+    /// and ran the capture the release sealed it to forbid. RED before the fix:
+    /// nothing read a stage the lane did not take.
+    #[test]
+    fn a_stage_a_person_installs_is_read_when_it_arms() {
+        let off = |incoming_build| ArmFacts {
+            enabled: false,
+            current_build: 10,
+            armed_build: None,
+            armed_exact: false,
+            manual_only_exact: false,
+            manual_only_build: None,
+            incoming_build,
+        };
+        assert_eq!(arm(off(11)), ArmDecision::Clear);
+        assert!(arm_reads_candidate(arm(off(11)), 11, 10), "auto_apply off");
+        let latched = ArmFacts {
+            enabled: true,
+            manual_only_exact: true,
+            manual_only_build: Some(11),
+            ..off(11)
+        };
+        assert_eq!(arm(latched), ArmDecision::SuppressManualOnly);
+        assert!(
+            arm_reads_candidate(arm(latched), 11, 10),
+            "latched manual-only"
+        );
+        let on = ArmFacts {
+            enabled: true,
+            ..off(11)
+        };
+        assert!(
+            arm_reads_candidate(arm(on), 11, 10),
+            "the automatic lane, as before"
+        );
+        // Negative controls: nothing newer than the running build, and an
+        // armed intent at least as new (read when it was set).
+        assert!(!arm_reads_candidate(arm(off(10)), 10, 10));
+        assert!(!arm_reads_candidate(arm(off(9)), 9, 10));
+        let kept = ArmFacts {
+            armed_build: Some(12),
+            ..on
+        };
+        assert_eq!(arm(kept), ArmDecision::Keep);
+        assert!(!arm_reads_candidate(arm(kept), 11, 10));
+        // Wired where the stage arms, ahead of the decision's own arms.
+        let src = include_str!("app_native.rs");
+        let asks_at = src
+            .find("arm_reads_candidate(decision, build, current_build)")
+            .expect("arming asks");
+        let reads_at = asks_at
+            + src[asks_at..]
+                .find("self.spawn_staged_handoff_preverification(build);")
+                .expect("and reads");
+        let acts_at = reads_at
+            + src[reads_at..]
+                .find("match decision {")
+                .expect("then acts on the decision");
+        assert!(
+            reads_at - asks_at < 120 && acts_at - reads_at < 120,
+            "the read is the one guarded right before the decision's arms"
+        );
+        // Counted in the arming function only: a later re-read of a stage held
+        // for its roster confirmation (`App::start_fresh_preverification`, round
+        // eight, #503) is no arm-time read.
+        let arm_fn = src
+            .find("pub(crate) fn arm_native_auto_apply(")
+            .expect("the arming function");
+        let arm_end = arm_fn
+            + 1
+            + src[arm_fn + 1..]
+                .find("\n    pub(crate) fn ")
+                .expect("the arming function ends");
+        assert!(arm_fn < asks_at && asks_at < arm_end, "asked while arming");
+        assert_eq!(
+            src[arm_fn..arm_end]
+                .matches("self.spawn_staged_handoff_preverification(build);")
+                .count(),
+            1,
+            "one arm-time read, not one per arm"
+        );
+    }
 
     #[test]
     fn stage_wake_arms_independently_of_work_ordering() {

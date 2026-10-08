@@ -391,16 +391,9 @@ fn target(value: &str) -> Result<LinuxTarget, String> {
         .ok_or_else(|| format!("unsupported Linux handoff target {value:?}"))
 }
 
-fn hex(value: &str, size: usize) -> bool {
-    value.len() == size
-        && value
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-}
-
 pub fn check_identity(version: &str, build: u64, commit: &str) -> Result<(), String> {
     crate::ledger::check_version_shape(version).map_err(|e| e.to_string())?;
-    if build == 0 || !hex(commit, 40) {
+    if build == 0 || !aterm_codec::hex::is_lower(commit, 40) {
         return Err(
             "Linux worker requires a positive claimed build and full lowercase source commit"
                 .into(),
@@ -428,7 +421,7 @@ impl Artifact {
                 &self.compiler_provenance_sha256,
             ]
             .into_iter()
-            .all(|v| hex(v, 64))
+            .all(|v| aterm_codec::hex::is_lower(v, 64))
             || !self
                 .compiler_version
                 .lines()
@@ -718,10 +711,9 @@ fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
         output
             .set_permissions(fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
-        output.sync_all().map_err(|e| e.to_string())?;
+        crate::durable::sync_all(&output).map_err(|e| e.to_string())?;
         fs::rename(&temp, destination).map_err(|e| e.to_string())?;
-        File::open(destination.parent().ok_or("Linux artifact has no parent")?)
-            .and_then(|f| f.sync_all())
+        crate::durable::sync_dir(destination.parent().ok_or("Linux artifact has no parent")?)
             .map_err(|e| e.to_string())
     })();
     if result.is_err() {
@@ -913,7 +905,7 @@ pub fn run_worker(
             .open(&receipt)
             .map_err(|e| e.to_string())?;
         file.write_all(text.as_bytes())
-            .and_then(|()| file.sync_all())
+            .and_then(|()| crate::durable::sync_all(&file))
             .map_err(|e| e.to_string())?;
         println!(
             "Linux local handoff ready: {} (unsigned; only ship cut may publish it)",
@@ -932,27 +924,13 @@ pub fn run_worker(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    struct Scratch(PathBuf);
-    impl Scratch {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "aterm-linux-handoff-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&dir).unwrap();
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(dir)
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    /// A private (0700) scratch directory, removed on drop.
+    fn scratch() -> aterm_tempfile::TempDir {
+        aterm_tempfile::Builder::new()
+            .prefix("aterm-linux-handoff-")
+            .tempdir()
+            .unwrap()
     }
 
     fn fixture(dir: &Path, target: LinuxTarget) -> Artifact {
@@ -1000,17 +978,17 @@ mod tests {
 
     #[test]
     fn imports_both_architectures_and_binds_signed_manifest_fields() {
-        let source = Scratch::new();
-        let dist = Scratch::new();
+        let source = scratch();
+        let dist = scratch();
         for t in TARGETS {
-            fixture(&source.0, t);
+            fixture(source.path(), t);
         }
-        let mut handoff = Handoff::new(&source.0, &[], &[]).unwrap();
+        let mut handoff = Handoff::new(source.path(), &[], &[]).unwrap();
         handoff
-            .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
+            .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
             .unwrap();
         handoff
-            .verify_staged(&dist.0, "0.100.0", 100, &"a".repeat(40))
+            .verify_staged(dist.path(), "0.100.0", 100, &"a".repeat(40))
             .unwrap();
         let mut manifest = manifest();
         handoff.stamp(&mut manifest).unwrap();
@@ -1023,28 +1001,28 @@ mod tests {
 
     #[test]
     fn explicit_native_subset_is_honest_and_default_refuses_missing_worker() {
-        let source = Scratch::new();
-        let dist = Scratch::new();
-        fixture(&source.0, LinuxTarget::Aarch64);
+        let source = scratch();
+        let dist = scratch();
+        fixture(source.path(), LinuxTarget::Aarch64);
         assert!(
-            Handoff::new(&source.0, &[], &[])
+            Handoff::new(source.path(), &[], &[])
                 .unwrap()
-                .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
+                .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
                 .is_err()
         );
         let mut handoff =
-            Handoff::new(&source.0, &[LinuxTarget::Aarch64.triple().into()], &[]).unwrap();
+            Handoff::new(source.path(), &[LinuxTarget::Aarch64.triple().into()], &[]).unwrap();
         handoff
-            .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
+            .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
             .unwrap();
         let mut manifest = manifest();
         handoff.stamp(&mut manifest).unwrap();
         assert!(manifest.linux_x86_64.is_none());
         assert!(manifest.linux_aarch64.is_some());
-        assert!(Handoff::new(&source.0, &["riscv64".into()], &[]).is_err());
+        assert!(Handoff::new(source.path(), &["riscv64".into()], &[]).is_err());
         assert!(
             Handoff::new(
-                &source.0,
+                source.path(),
                 &[
                     LinuxTarget::Aarch64.triple().into(),
                     LinuxTarget::Aarch64.triple().into()
@@ -1057,35 +1035,37 @@ mod tests {
 
     #[test]
     fn resume_refuses_changed_provenance_and_tampered_staged_bytes() {
-        let source = Scratch::new();
-        let dist = Scratch::new();
-        let mut artifact = fixture(&source.0, LinuxTarget::Aarch64);
+        let source = scratch();
+        let dist = scratch();
+        let mut artifact = fixture(source.path(), LinuxTarget::Aarch64);
         let mut handoff =
-            Handoff::new(&source.0, std::slice::from_ref(&artifact.target), &[]).unwrap();
+            Handoff::new(source.path(), std::slice::from_ref(&artifact.target), &[]).unwrap();
         handoff
-            .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
+            .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
             .unwrap();
         let frozen: Handoff =
             aterm_toml::from_str(&aterm_toml::to_string(&handoff).unwrap()).unwrap();
         assert_eq!(frozen, handoff);
         artifact.compiler_sha256 = "f".repeat(64);
         fs::write(
-            source.0.join(format!("{}.handoff.toml", artifact.asset)),
+            source
+                .path()
+                .join(format!("{}.handoff.toml", artifact.asset)),
             aterm_toml::to_string(&artifact).unwrap(),
         )
         .unwrap();
         assert!(
             handoff
-                .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
+                .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
                 .unwrap_err()
                 .contains("changed")
         );
-        let mut data = fs::read(dist.0.join(&artifact.asset)).unwrap();
+        let mut data = fs::read(dist.path().join(&artifact.asset)).unwrap();
         data[70] ^= 1;
-        fs::write(dist.0.join(&artifact.asset), data).unwrap();
+        fs::write(dist.path().join(&artifact.asset), data).unwrap();
         assert!(
             frozen
-                .verify_staged(&dist.0, "0.100.0", 100, &"a".repeat(40))
+                .verify_staged(dist.path(), "0.100.0", 100, &"a".repeat(40))
                 .unwrap_err()
                 .contains("hash")
         );
@@ -1093,19 +1073,19 @@ mod tests {
 
     #[test]
     fn wrong_build_commit_arch_and_symlink_are_refused() {
-        let source = Scratch::new();
-        let dist = Scratch::new();
-        let mut artifact = fixture(&source.0, LinuxTarget::Aarch64);
+        let source = scratch();
+        let dist = scratch();
+        let mut artifact = fixture(source.path(), LinuxTarget::Aarch64);
         assert!(artifact.validate("0.100.0", 101, &"a".repeat(40)).is_err());
         assert!(artifact.validate("0.100.0", 100, &"b".repeat(40)).is_err());
         artifact.target = LinuxTarget::X86_64.triple().into();
         assert!(
             artifact
-                .verify_file(&source.0.join(&artifact.asset))
+                .verify_file(&source.path().join(&artifact.asset))
                 .is_err()
         );
-        let alias = dist.0.join("alias");
-        std::os::unix::fs::symlink(source.0.join(&artifact.asset), &alias).unwrap();
+        let alias = dist.path().join("alias");
+        std::os::unix::fs::symlink(source.path().join(&artifact.asset), &alias).unwrap();
         assert!(artifact.verify_file(&alias).is_err());
         assert!(check_identity("0.100.0", 0, &"a".repeat(40)).is_err());
         assert!(check_identity("0.100.0", 1, "short").is_err());
@@ -1113,8 +1093,8 @@ mod tests {
 
     #[test]
     fn the_channel_release_requires_every_signed_raw_asset_exactly_once() {
-        let source = Scratch::new();
-        let artifact = fixture(&source.0, LinuxTarget::Aarch64);
+        let source = scratch();
+        let artifact = fixture(source.path(), LinuxTarget::Aarch64);
         let mut published = crate::channel::required_asset_names("0.100.0", false, false);
         assert!(
             crate::channel::validate_channel_asset_set(
@@ -1298,10 +1278,10 @@ mod tests {
 
     #[test]
     fn workers_must_build_a_declared_target_once() {
-        let dir = Scratch::new();
+        let dir = scratch();
         let aarch64 = LinuxTarget::Aarch64.triple().to_string();
         let handoff = Handoff::new(
-            &dir.0,
+            dir.path(),
             std::slice::from_ref(&aarch64),
             &["aarch64=h:/r".into()],
         )
@@ -1309,7 +1289,7 @@ mod tests {
         assert_eq!(handoff.workers.len(), 1);
         assert!(
             Handoff::new(
-                &dir.0,
+                dir.path(),
                 std::slice::from_ref(&aarch64),
                 &["x86_64=h:/r".into()]
             )
@@ -1317,44 +1297,61 @@ mod tests {
             "a worker for an architecture the cut does not declare"
         );
         assert!(
-            Handoff::new(&dir.0, &[], &["aarch64=a:/r".into(), "aarch64=b:/r".into()]).is_err(),
+            Handoff::new(
+                dir.path(),
+                &[],
+                &["aarch64=a:/r".into(), "aarch64=b:/r".into()]
+            )
+            .is_err(),
             "two workers for one architecture"
         );
     }
 
     #[test]
     fn only_this_cuts_valid_pair_counts_as_already_built() {
-        let dir = Scratch::new();
+        let dir = scratch();
         let target = LinuxTarget::Aarch64;
         let commit = "a".repeat(40);
         assert!(
-            !pair_is_current(&dir.0, target, "0.100.0", 100, &commit),
+            !pair_is_current(dir.path(), target, "0.100.0", 100, &commit),
             "nothing there"
         );
-        fixture(&dir.0, target);
-        assert!(pair_is_current(&dir.0, target, "0.100.0", 100, &commit));
+        fixture(dir.path(), target);
+        assert!(pair_is_current(dir.path(), target, "0.100.0", 100, &commit));
         // A dry run's (or a failed claim's) pair: same file names, other build.
-        assert!(!pair_is_current(&dir.0, target, "0.100.0", 101, &commit));
         assert!(!pair_is_current(
-            &dir.0,
+            dir.path(),
+            target,
+            "0.100.0",
+            101,
+            &commit
+        ));
+        assert!(!pair_is_current(
+            dir.path(),
             target,
             "0.100.0",
             100,
             &"b".repeat(40)
         ));
         assert!(!pair_is_current(
-            &dir.0,
+            dir.path(),
             LinuxTarget::X86_64,
             "0.100.0",
             100,
             &commit
         ));
         // A torn copy: the executable no longer matches its receipt.
-        let asset = dir.0.join(target.asset_name("0.100.0"));
+        let asset = dir.path().join(target.asset_name("0.100.0"));
         let mut bytes = fs::read(&asset).unwrap();
         bytes.truncate(70);
         fs::write(&asset, bytes).unwrap();
-        assert!(!pair_is_current(&dir.0, target, "0.100.0", 100, &commit));
+        assert!(!pair_is_current(
+            dir.path(),
+            target,
+            "0.100.0",
+            100,
+            &commit
+        ));
     }
 
     #[test]

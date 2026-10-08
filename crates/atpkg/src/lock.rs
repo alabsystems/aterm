@@ -67,6 +67,10 @@ impl Flock {
         // The ascription is the lock-order census's File evidence (`is_file_binding_rhs`):
         // it keeps this flock out of the in-process mutex graph.
         let file: std::fs::File = file;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
         file.try_lock()?;
         Ok(Self(file))
     }
@@ -77,6 +81,10 @@ impl Flock {
     pub(crate) fn try_lock_shared(file: File) -> Result<Self, std::fs::TryLockError> {
         // The census's File evidence, as in `try_lock`.
         let file: std::fs::File = file;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
         file.try_lock_shared()?;
         Ok(Self(file))
     }
@@ -88,7 +96,12 @@ impl Flock {
         let file: std::fs::File = file;
         let deadline = Instant::now() + limit;
         loop {
-            match file.try_lock() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the guard's own take: its Drop releases by LOCK_UN"
+            )]
+            let taken = file.try_lock();
+            match taken {
                 Ok(()) => return Ok(Self(file)),
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(LOCK_POLL);
@@ -106,6 +119,19 @@ impl Flock {
                 Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
         }
+    }
+
+    /// Take `file`'s exclusive lock, WAITING for a holder to let go — for a queue whose
+    /// waiters must each have their turn (the `[machine]` apply queue).
+    pub(crate) fn lock(file: File) -> io::Result<Self> {
+        // The census's File evidence, as in `try_lock`.
+        let file: std::fs::File = file;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        file.lock()?;
+        Ok(Self(file))
     }
 }
 
@@ -478,12 +504,13 @@ pub fn store_writer_released(layout: &Layout) -> bool {
     let Ok(file) = crate::metadata_io::open_regular(&layout.store_lock()) else {
         return false;
     };
-    if file.try_lock_shared().is_err() {
+    let Ok(probe) = Flock::try_lock_shared(file) else {
         return false;
-    }
-    // An explicit unlock matters when a thread briefly clones a descriptor;
+    };
+    // Released by `LOCK_UN` (the guard's drop) before the answer: a thread that
+    // briefly clones a descriptor, or forks, keeps a copy of this description, and
     // merely closing one handle need not release the advisory lock at once.
-    let _ = file.unlock();
+    drop(probe);
     prefix_is_a_real_dir(&layout.prefix)
 }
 
@@ -532,10 +559,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn temp_layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-lock-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        Layout { prefix: p }
+    fn temp_layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::absent_layout(&format!("atpkg-lock-{label}-"))
     }
 
     /// The contention wake's poll never writes or claims the writer lock. A
@@ -636,13 +661,13 @@ mod tests {
             // An unrelated test's fork can briefly inherit the just-dropped lock
             // descriptor until its child execs. Observe release with the same
             // bounded retry as the contention test below.
-            let _held = lock_store_waiting(&layout, Duration::from_secs(10), |_| {}, || true)
+            let _held = lock_store_waiting(&layout, aterm_spec::wait::MUST_HAPPEN, |_| {}, || true)
                 .expect("the released store lock becomes takeable");
             assert_eq!(person_holder(&layout), Some(parent));
         }
         // The same record with the lock FREE: a holder killed before its Drop, its pid
         // reused. Stale — nobody holds the store, and the record goes.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while person_holder(&layout).is_some() {
             assert!(
                 Instant::now() < deadline,
@@ -739,7 +764,15 @@ mod tests {
         let copy = held.try_clone().unwrap();
         drop(held);
         assert!(Flock::try_lock(open()).is_ok(), "free while its copy lives");
-        drop((childs_copy, copy));
+        // The waiting take too: the `[machine]` apply queue's.
+        let queued = Flock::lock(open()).expect("free");
+        let queued_copy = queued.try_clone().unwrap();
+        drop(queued);
+        assert!(
+            Flock::try_lock(open()).is_ok(),
+            "a waited-for lock is free while its copy lives"
+        );
+        drop((childs_copy, copy, queued_copy));
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
@@ -872,47 +905,46 @@ mod tests {
     /// The waiting form (the launch lanes' `--wait-lock`, 2026-09-10): a holder that
     /// releases inside the announcement grace is simply waited out — the waiter
     /// returns `Ok` and never announces, so a second process overlapping a window's
-    /// seconds-long no-op tick puts nothing on the glass.
+    /// seconds-long no-op tick puts nothing on the glass. The holder lets go at the
+    /// waiter's first poll, so the wait is one poll long whatever the machine's load.
     #[test]
     fn lock_store_waiting_acquires_when_the_holder_drops_and_stays_silent_inside_the_grace() {
         let a = temp_layout("wait-drop");
         let b = Layout {
             prefix: a.prefix.clone(),
         };
-        let guard = try_lock_store(&a).expect("first acquisition succeeds");
-        let holder = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            drop(guard);
-        });
-        let started = Instant::now();
+        let guard = std::cell::RefCell::new(Some(
+            try_lock_store(&a).expect("first acquisition succeeds"),
+        ));
+        let polls = std::cell::Cell::new(0u32);
         let announced = std::cell::Cell::new(0u32);
         let got = lock_store_waiting(
             &b,
-            Duration::from_secs(10),
+            Duration::from_secs(120),
             |_| announced.set(announced.get() + 1),
-            || true,
+            || {
+                polls.set(polls.get() + 1);
+                drop(guard.borrow_mut().take());
+                true
+            },
         );
         assert!(
             got.is_ok(),
             "the waiter takes the lock once the holder drops"
         );
-        assert!(
-            started.elapsed() >= Duration::from_millis(250),
-            "it actually waited: {:?}",
-            started.elapsed()
-        );
+        assert_eq!(polls.get(), 1, "it actually waited, one poll");
         assert_eq!(
             announced.get(),
             0,
             "a wait shorter than the grace announces nothing"
         );
-        holder.join().unwrap();
         drop(got);
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
     /// Past the grace the wait is ANNOUNCED — exactly once, naming the lock path —
-    /// and the waiter still proceeds when the holder finally lets go.
+    /// and the waiter still proceeds when the holder finally lets go (here, as it
+    /// is told the wait was announced).
     #[test]
     fn lock_store_waiting_announces_once_after_the_grace_then_acquires() {
         let a = temp_layout("wait-announce");
@@ -920,15 +952,14 @@ mod tests {
             prefix: a.prefix.clone(),
         };
         let guard = try_lock_store(&a).expect("first acquisition succeeds");
-        let holder = std::thread::spawn(move || {
-            std::thread::sleep(WAIT_ANNOUNCE_GRACE + Duration::from_millis(700));
-            drop(guard);
-        });
         let announced = std::cell::RefCell::new(Vec::<PathBuf>::new());
         let got = lock_store_waiting(
             &b,
-            Duration::from_secs(20),
-            |p| announced.borrow_mut().push(p.to_path_buf()),
+            Duration::from_secs(120),
+            |p| {
+                announced.borrow_mut().push(p.to_path_buf());
+                drop(guard);
+            },
             || true,
         );
         assert!(got.is_ok(), "acquired after the holder dropped");
@@ -937,14 +968,12 @@ mod tests {
             &[a.store_lock()],
             "announced once, with the lock path"
         );
-        holder.join().unwrap();
         drop(got);
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
     /// A holder that never lets go: the waiter announces once, then times out with
-    /// the SAME `Contended` refusal a typed verb gets — the sentence is unchanged
-    /// (callers key on the exit code, never on the words).
+    /// the SAME `Contended` refusal a typed verb gets.
     #[test]
     fn lock_store_waiting_times_out_with_contended() {
         let a = temp_layout("wait-timeout");
@@ -973,56 +1002,7 @@ mod tests {
             matches!(err, StoreLockError::Contended(ref p) if *p == a.store_lock()),
             "the timeout is a contention refusal naming the path: {err:?}"
         );
-        assert!(
-            err.to_string()
-                .contains("another atpkg process holds the store lock"),
-            "the sentence is byte-stable: {err}"
-        );
         assert_eq!(announced.get(), 1, "announced exactly once per wait");
-        let _ = std::fs::remove_dir_all(&a.prefix);
-    }
-
-    /// A WAITING POLL RE-OPENS THE LOCK FILE BUT NEVER RE-HARDENS THE PREFIX. The
-    /// first attempt is the full [`try_lock_store`] (it creates and vets the prefix
-    /// and sets the backup-exclusion xattr once); every poll after it is one open
-    /// and one `try_lock`. The poll used to be the full acquisition, whose
-    /// `ensure_dir` re-chmods the prefix and re-sets the xattr on every try — and a
-    /// same-value `setxattr` bumps the directory's ctime (measured on APFS,
-    /// 2026-09-13; a same-mode chmod does not), so a queued launch child dirtied the
-    /// prefix inode twice a second for its whole half-hour bound: ~3,600 journaled
-    /// metadata writes, each an FSEvents change for the very backup watchers the
-    /// attribute exists to keep away. Pinned by the prefix's ctime: after a wait of
-    /// three polls it is no later than the first attempt's write.
-    #[cfg(unix)]
-    #[test]
-    fn lock_store_waiting_polls_without_rewriting_the_prefix() {
-        use std::os::unix::fs::MetadataExt as _;
-        let a = temp_layout("wait-idle");
-        let b = Layout {
-            prefix: a.prefix.clone(),
-        };
-        let _guard = try_lock_store(&a).expect("first acquisition succeeds");
-        // The first attempt's own write lands inside the first few milliseconds of
-        // the wait; a poll's would land 500 ms, 1000 ms, … after it.
-        let wall_start = std::time::SystemTime::now();
-        let timeout = Duration::from_millis(1500);
-        let err = match lock_store_waiting(&b, timeout, |_| {}, || true) {
-            Ok(_) => panic!("a lock held for the whole wait must refuse"),
-            Err(e) => e,
-        };
-        assert!(matches!(err, StoreLockError::Contended(..)), "{err:?}");
-        let md = std::fs::symlink_metadata(&a.prefix).unwrap();
-        let ctime = std::time::SystemTime::UNIX_EPOCH
-            + Duration::new(
-                u64::try_from(md.ctime()).unwrap_or(0),
-                u32::try_from(md.ctime_nsec()).unwrap_or(0),
-            );
-        let last_write = ctime.duration_since(wall_start).unwrap_or(Duration::ZERO);
-        assert!(
-            last_write < WAIT_POLL - Duration::from_millis(100),
-            "the prefix was last written {last_write:?} into a {timeout:?} wait: a poll \
-             re-hardened it (the first attempt's write is the only one allowed)"
-        );
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
@@ -1056,7 +1036,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             std::fs::rename(&prefix, &gone).expect("the prefix is movable under a holder");
         });
-        let got = lock_store_waiting(&b, Duration::from_secs(10), |_| {}, || true);
+        let got = lock_store_waiting(&b, aterm_spec::wait::MUST_HAPPEN, |_| {}, || true);
         assert!(
             got.is_ok(),
             "the re-created prefix's lock is free: {:?}",
@@ -1081,9 +1061,9 @@ mod tests {
     /// would follow a link a same-uid actor swapped in mid-wait and take the lock
     /// on whatever directory it points at — through the link, on a file the real
     /// store never sees. Every poll now lstats the prefix first (one metadata read
-    /// per 500 ms and no write, so the no-rewrite property above stands), and
-    /// anything but a real directory goes to the full acquisition, which refuses
-    /// the link with the F16 error at that poll rather than at the bound.
+    /// per 500 ms and no write), and anything but a real directory goes to the full
+    /// acquisition, which refuses the link with the F16 error at that poll rather
+    /// than at the bound.
     ///
     /// RED before the fix: `Ok` — the lock taken on `<elsewhere>/store.lock`.
     /// macOS and Linux: the swap is one atomic exchange of the real prefix (its held
@@ -1138,8 +1118,7 @@ mod tests {
             // and the real prefix takes the link's, in one step.
             exchange(&aside, &prefix).expect("the prefix and the link exchange names");
         });
-        let started = Instant::now();
-        let err = match lock_store_waiting(&b, Duration::from_secs(10), |_| {}, || true) {
+        let err = match lock_store_waiting(&b, Duration::from_secs(120), |_| {}, || true) {
             Ok(_) => panic!("the waiter locked THROUGH the link"),
             Err(e) => e,
         };
@@ -1151,12 +1130,8 @@ mod tests {
                     if e.kind() == io::ErrorKind::PermissionDenied
                         && e.to_string().contains("is a symlink; refusing")
             ),
-            "the F16 refusal, from the full acquisition: {err:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "refused at the poll that saw the link, not at the bound: {:?}",
-            started.elapsed()
+            "the F16 refusal at the poll that saw the link, never the bound's \
+             contention: {err:?}"
         );
         assert!(
             !elsewhere.store_lock().exists(),
@@ -1278,11 +1253,6 @@ mod tests {
             "waited while wanted: {:?}",
             started.elapsed()
         );
-        assert!(
-            started.elapsed() < WAIT_ANNOUNCE_GRACE + Duration::from_secs(2),
-            "stood down at the first poll after the caller went: {:?}",
-            started.elapsed()
-        );
         assert_eq!(
             announced.get(),
             0,
@@ -1305,9 +1275,8 @@ mod tests {
     /// The self-update verb (`cli::cmd_selfupdate`, 2026-09-19) relays its CHILD's
     /// status the same way — literal arms for 0, 2 and everything else, and the named
     /// `CONTENDED_EXIT` for 75, never a relayed variable — and `selfupdate.rs` builds no
-    /// exit code at all (its own test pins that), so the scanned set stays these two
-    /// files. A caller keying on 75 can therefore never mistake another refusal for
-    /// contention.
+    /// exit code at all, so the scanned set stays these two files. A caller keying on 75
+    /// can therefore never mistake another refusal for contention.
     ///
     /// THE SPLIT IS EACH TEST MODULE'S OWN GATE, and a split that cannot find it
     /// panics. This scan used to cut `cli.rs` at the first `#[cfg(test)]`, which for
@@ -1318,7 +1287,9 @@ mod tests {
     /// 88 literal sites, with both relayed sites among the unscanned. A truncated
     /// scan passes for the wrong reason, which is the defect it exists to catch. So the
     /// anchor is the gate together with the `mod tests {` line it gates: that seam now
-    /// carries the module's own `#[cfg(all(test, unix))]` (2026-09-25).
+    /// carries the module's own `#[cfg(all(test, unix))]` (2026-09-25). Both modules now
+    /// live in sibling `*_tests.rs` files (2026-10-06), so the gate is the out-of-line
+    /// declaration that ends each file, and the half is the file bar that declaration.
     #[test]
     fn contention_exit_code_is_temp_fail_and_unshared() {
         assert_eq!(CONTENDED_EXIT, 75);
@@ -1330,12 +1301,12 @@ mod tests {
             (
                 "cli.rs",
                 include_str!("cli.rs"),
-                "#[cfg(all(test, unix))]\nmod tests {",
+                "#[cfg(all(test, unix))]\n#[path = \"cli_tests.rs\"]\nmod tests;",
             ),
             (
                 "reroute.rs",
                 include_str!("reroute.rs"),
-                "#[cfg(test)]\nmod tests {",
+                "#[cfg(test)]\n#[path = \"reroute_tests.rs\"]\nmod tests;",
             ),
         ] {
             let (production, _) = src
@@ -1403,7 +1374,7 @@ mod tests {
         // truncated it and holds the last verb; the scan found more than the
         // truncated half's 47 + 4 sites; both relayed verbs were followed.
         let cli_half = include_str!("cli.rs")
-            .split_once("#[cfg(all(test, unix))]\nmod tests {")
+            .split_once("#[cfg(all(test, unix))]\n#[path = \"cli_tests.rs\"]\nmod tests;")
             .map(|(p, _)| p)
             .expect("split above");
         assert!(

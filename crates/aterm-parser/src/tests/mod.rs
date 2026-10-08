@@ -11,9 +11,11 @@ mod batch;
 mod c1;
 mod carry;
 mod csi;
+mod empty_params;
 mod invariants;
 mod performance;
 mod refinement;
+mod string_cancel;
 mod subparams;
 mod table_validity;
 mod utf8_errors;
@@ -34,7 +36,10 @@ struct RecordingSink {
     dcs_unhooks: usize,
     apc_starts: usize,
     apc_data: Vec<u8>,
+    /// APC strings ended by ST (`apc_end(false)`).
     apc_ends: usize,
+    /// APC strings canceled by CAN or SUB (`apc_end(true)`).
+    apc_cancels: usize,
 }
 
 impl ActionSink for RecordingSink {
@@ -109,8 +114,12 @@ impl ActionSink for RecordingSink {
     fn apc_put(&mut self, byte: u8) {
         self.apc_data.push(byte);
     }
-    fn apc_end(&mut self) {
-        self.apc_ends += 1;
+    fn apc_end(&mut self, canceled: bool) {
+        if canceled {
+            self.apc_cancels += 1;
+        } else {
+            self.apc_ends += 1;
+        }
     }
 }
 

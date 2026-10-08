@@ -561,7 +561,7 @@ fn authenticated_probe_is_bounded_and_rejects_loader_identity_and_exit_failures(
         &manifest,
         native().unwrap(),
         &f.context.dir,
-        Duration::from_secs(1),
+        aterm_spec::wait::MUST_HAPPEN,
     )
     .unwrap();
     for body in ["exit 3", "printf 'not json'", "while :; do :; done"] {
@@ -789,6 +789,10 @@ fn old_and_new_live_builds_share_one_source_cooldown_without_minute_polling() {
     ));
 }
 
+/// Linux only: it runs a real native executable through the Linux loader, which a
+/// copy of `/bin/sh` is only on Linux (macOS kills a copy of an Apple binary off
+/// the system volume, with a crash report).
+#[cfg(target_os = "linux")]
 #[test]
 fn bootstrap_executes_real_authenticated_native_inode_after_closing_all_writers() {
     let mut f = Fixture::new();
@@ -832,6 +836,8 @@ fn bootstrap_executes_real_authenticated_native_inode_after_closing_all_writers(
     );
 }
 
+/// Linux only, for the same reason: it runs the restored copy of `/bin/sh`.
+#[cfg(target_os = "linux")]
 #[test]
 fn rollback_inode_is_executable_immediately_after_rename_before_receipt_commit() {
     let mut f = Fixture::new();
@@ -976,22 +982,20 @@ fn state_symlinks_shared_directories_and_tampered_backups_are_refused() {
     assert_eq!(hash_file(&f.context.target).unwrap(), current);
 }
 
+/// A yank is the one signing fact a rollback respects: a build below the signed
+/// minimum-build floor never comes back, and refusing lowers no floor. A revoked
+/// signer is not one ([`a_rotated_signers_build_still_comes_back_from_a_crash_loop`]).
 #[test]
-fn rollback_respects_minimum_and_revocation_without_lowering_any_floor() {
-    for revoke in [false, true] {
-        let mut f = Fixture::new();
-        f.state.installed.machine_id = Some("old-machine".into());
-        f.apply().unwrap();
-        if revoke {
-            f.state.revoked_machines.push("old-machine".into());
-        } else {
-            f.state.min_build = 11;
-        }
-        let current = hash_file(&f.context.target).unwrap();
-        assert!(rollback_locked(&f.context, &mut f.state).is_err());
-        assert_eq!(hash_file(&f.context.target).unwrap(), current);
-        assert_eq!(f.state.high_water, 11);
-    }
+fn rollback_respects_the_minimum_without_lowering_any_floor() {
+    let mut f = Fixture::new();
+    f.state.installed.machine_id = Some("old-machine".into());
+    f.apply().unwrap();
+    f.state.min_build = 11;
+    let current = hash_file(&f.context.target).unwrap();
+    assert!(rollback_locked(&f.context, &mut f.state).is_err());
+    assert_eq!(hash_file(&f.context.target).unwrap(), current);
+    assert_eq!(f.state.high_water, 11);
+    assert_eq!(f.state.min_build, 11);
 }
 
 #[test]
@@ -1226,15 +1230,57 @@ fn trial_on_disk(f: &Fixture) -> Trial {
         .expect("a trial")
 }
 
+/// A start's clock as [`session_started_in`] and [`boot_in`] ask it, under the lock,
+/// reading `now`.
+fn reads(now: impl Into<StartClock>) -> impl FnOnce() -> Result<StartClock, String> {
+    let now = now.into();
+    move || Ok(now)
+}
+
 /// A session of the file at the install path: the new build's identity and inode.
-fn session_start(f: &Fixture, now_unix: i64) -> bool {
+fn session_start(f: &Fixture, now: impl Into<StartClock>) -> bool {
+    start_in(f, Lane::Session, reads(now))
+}
+
+/// A start of the file at the install path in `lane`, through that lane's own entry
+/// ([`session_started_in`], [`boot_in`]: the unlocked look, the lock, the count), with
+/// its clock read when the entry asks.
+fn start_in(f: &Fixture, lane: Lane, now: impl FnOnce() -> Result<StartClock, String>) -> bool {
     let inode = fs::metadata(&f.context.target).unwrap();
-    session_started_in(
+    let actual = || Ok((inode.dev(), inode.ino()));
+    let commit = "b".repeat(40);
+    match lane {
+        Lane::Session => session_started_in(&f.context, 11, &commit, actual, now),
+        Lane::Window => boot_in(&f.context, 11, &commit, actual, now),
+    }
+    .unwrap()
+}
+
+/// A session start as [`session_start`], answering also the stamp it left on the trial
+/// when it was one of the budget's starts ([`session_started_stamping_in`]).
+fn session_start_stamping(f: &Fixture, now: i64) -> (bool, Option<StartClock>) {
+    let inode = fs::metadata(&f.context.target).unwrap();
+    session_started_stamping_in(
         &f.context,
         11,
         &"b".repeat(40),
         || Ok((inode.dev(), inode.ino())),
-        now_unix,
+        reads(now),
+    )
+    .unwrap()
+}
+
+/// That session, still up with its shell silent, deferring the verdict at `now`
+/// ([`defer_session_verdict_in`]).
+fn session_defer(f: &Fixture, own: &StartClock, now: i64) -> bool {
+    let inode = fs::metadata(&f.context.target).unwrap();
+    defer_session_verdict_in(
+        &f.context,
+        11,
+        &"b".repeat(40),
+        || Ok((inode.dev(), inode.ino())),
+        own,
+        reads(now),
     )
     .unwrap()
 }
@@ -1249,12 +1295,12 @@ fn session_confirm(f: &Fixture) -> Confirmed {
 }
 
 /// A window of the file at the install path starting, and its first frame.
-fn window_start(f: &Fixture, now_unix: i64) -> bool {
-    window_start_as(f, 11, 'b', now_unix)
+fn window_start(f: &Fixture, now: impl Into<StartClock>) -> bool {
+    window_start_as(f, 11, 'b', now)
 }
 
 /// A window of release `build` (whose commit is `commit` forty times) starting.
-fn window_start_as(f: &Fixture, build: u64, commit: char, now_unix: i64) -> bool {
+fn window_start_as(f: &Fixture, build: u64, commit: char, now: impl Into<StartClock>) -> bool {
     let inode = fs::metadata(&f.context.target).unwrap();
     let _lock = f.context.lock().unwrap();
     let mut state = f.context.read_state().unwrap().unwrap();
@@ -1264,7 +1310,7 @@ fn window_start_as(f: &Fixture, build: u64, commit: char, now_unix: i64) -> bool
         build,
         &commit.to_string().repeat(40),
         (inode.dev(), inode.ino()),
-        now_unix,
+        now,
     )
     .unwrap()
 }
@@ -1287,7 +1333,7 @@ fn window_confirm_as(f: &Fixture, build: u64, commit: char) -> bool {
     .unwrap()
 }
 
-/// A COPY USED ONLY FROM THE TERMINAL FINISHES ITS UPDATE (2026-09-28). Its session
+/// A COPY USED ONLY FROM THE TERMINAL FINISHES ITS UPDATE. Its session
 /// lane's check installed the update, and only a window counted or confirmed a start,
 /// so nothing ever finished it: `check_locked` stopped at "launch an aterm window once"
 /// on every later check, for good. Driven through the session lane's own entry
@@ -1344,7 +1390,7 @@ fn a_session_on_the_old_file_does_not_confirm() {
             10,
             &"a".repeat(40),
             || Ok((old.dev(), old.ino())),
-            minute(0),
+            reads(minute(0)),
         )
         .unwrap()
     );
@@ -1364,13 +1410,13 @@ fn a_session_on_the_old_file_does_not_confirm() {
     assert!(awaiting_start(&state).is_some());
 }
 
-/// A SESSION DOES NOT VOUCH FOR A BUILD WHOSE WINDOW HAS NOT CONFIRMED (the round-four
-/// review). Two windows of the new build crash before their first frame; the person
-/// opens a terminal and types `aterm` to find out why — the natural move, and the one
-/// that used to confirm the trial for the whole file: its window starts then stopped
-/// counting, and a build that cannot open a window stayed installed for good. Now the
-/// session's prompt confirms the session lane only: its window starts go on counting,
-/// from zero, and the fourth that never confirms rolls the install back.
+/// A SESSION DOES NOT VOUCH FOR A BUILD WHOSE WINDOW HAS NOT CONFIRMED. Two windows of the
+/// new build crash before their first frame; the person opens a terminal and types `aterm`
+/// to find out why — the natural move, and the one that used to confirm the trial for the
+/// whole file: its window starts then stopped counting, and a build that cannot open a
+/// window stayed installed for good. Now the session's prompt confirms the session lane
+/// only: its window starts go on counting, from zero, and the fourth that never confirms
+/// rolls the install back.
 ///
 /// FAILS WITHOUT THE FIX: the session's confirmation settled the whole file, and every
 /// window start after it returned early; nothing rolled back.
@@ -1408,7 +1454,7 @@ fn a_window_that_has_not_confirmed_still_decides_after_a_session_confirms() {
     );
 }
 
-/// A WINDOW STILL OWES ITS VERDICT AFTER A SESSION CONFIRMED (the round-four review).
+/// A WINDOW STILL OWES ITS VERDICT AFTER A SESSION CONFIRMED.
 /// A session confirms first — checks and applies run again — and a window of the same
 /// build crashes at every start later: its starts still count, from a clean count, and
 /// the start past the budget rolls the build back. The clean count matters as much: six
@@ -1490,13 +1536,243 @@ fn a_burst_of_session_starts_never_rolls_back_the_build_its_first_prompt_confirm
     assert_eq!(state.rejected_build, 11);
 }
 
-/// A CRASH LOOP FASTER THAN THE SETTLE WINDOW IS STILL ROLLED BACK (the round-four
-/// review): `aterm --headless` under a systemd unit with `Restart=always` and
-/// `RestartSec=5`, on a build that crashes at every start. Every start used to restamp,
-/// so each found the one five seconds before it young and none rolled back — and while
-/// the trial stood unconfirmed, checks and applies waited, so no fixed release could
-/// install either. Now the starts past the budget share the budget's last stamp, and the
-/// first one a whole window after it rolls back.
+/// A BURST OF HEALTHY BUT SILENT SESSION STARTS IS NOT ROLLED BACK BY THE NEXT TAB.
+/// Four tabs restored
+/// within a second, each running `aterm`, put the trial past its three-start budget,
+/// stamped at the third. Their shells print nothing for more than a window (an rc file
+/// waiting on a cold automount home), so none confirms, and a fifth tab opened at 21 s
+/// found the stamp settled and rolled the healthy build back, refusing it for good.
+/// A silent session confirms nothing, which is right, so nothing else kept the burst's
+/// window honest.
+///
+/// Now the budget's last start, still up and still silent half a window on, moves the
+/// stamp to that moment, ONCE: the fifth tab is young against the move, and a build that
+/// still never speaks is rolled back one window after it. Only that start's own stamp
+/// moves (an earlier start's was replaced), only once, and never one already settled.
+///
+/// CONTROL: the same burst with no deferral rolls back at the fifth tab, as before.
+#[test]
+fn a_silent_session_still_up_buys_its_burst_one_more_window() {
+    let t0 = minute(0);
+    // Four tabs within a second: the budget's three, the last at `t0 + 1`, and one past.
+    let burst = |f: &Fixture| {
+        let mut stamps = Vec::new();
+        for (tab, at) in [t0, t0, t0 + 1, t0 + 1].into_iter().enumerate() {
+            let (starts_trial, stamped) = session_start_stamping(f, at);
+            assert!(
+                starts_trial,
+                "tab {tab} of the burst is a start of the trial"
+            );
+            stamps.push(stamped);
+        }
+        assert_eq!(trial_on_disk(f).starts, 4);
+        assert_eq!(
+            stamps[3], None,
+            "the start past the budget leaves the stamp as it was"
+        );
+        stamps
+    };
+
+    // CONTROL: no deferral, and the fifth tab at 21 s rolls the healthy build back.
+    let mut silent = Fixture::new();
+    silent.apply().unwrap();
+    burst(&silent);
+    assert!(!session_start(&silent, t0 + 21));
+    let state = silent.context.read_state().unwrap().unwrap();
+    assert_eq!(
+        (state.installed.build, state.rejected_build),
+        (10, 11),
+        "PRECONDITION: without the deferral the burst is rolled back"
+    );
+
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let stamps = burst(&f);
+    let first = stamps[0].clone().expect("the first start stamped");
+    let own = stamps[2].clone().expect("the budget's last start stamped");
+    assert_eq!(own, StartClock::from(t0 + 1));
+    assert!(
+        !session_defer(&f, &own, t0 + 1),
+        "no move to the moment of the stamp itself"
+    );
+    // A stamp an earlier start of the budget left is not the trial's any more.
+    assert!(!session_defer(&f, &first, t0 + 10));
+    // Half a window on, still up and silent: the stamp moves, once.
+    assert!(session_defer(&f, &own, t0 + 11));
+    assert_eq!(trial_on_disk(&f).start_clock(), StartClock::from(t0 + 11));
+    assert!(!session_defer(&f, &own, t0 + 12), "once");
+    assert!(!trial_on_disk(&f).healthy, "the move confirms nothing");
+    // The fifth tab, before any prompt: young against the move.
+    assert!(
+        session_start(&f, t0 + 21),
+        "no rollback for one more window"
+    );
+    assert_eq!(f.context.read_state().unwrap().unwrap().installed.build, 11);
+    // A build that still never speaks is rolled back a window after the move.
+    assert!(!session_start(&f, t0 + 31));
+    let state = f.context.read_state().unwrap().unwrap();
+    assert_eq!((state.installed.build, state.rejected_build), (10, 11));
+
+    // A healthy one confirms at its first prompt, as any start does.
+    let mut confirmed = Fixture::new();
+    confirmed.apply().unwrap();
+    let stamps = burst(&confirmed);
+    assert!(session_defer(
+        &confirmed,
+        stamps[2].as_ref().expect("stamped"),
+        t0 + 11
+    ));
+    assert!(session_start(&confirmed, t0 + 21));
+    assert_eq!(session_confirm(&confirmed), Confirmed::Yes);
+    assert!(trial_on_disk(&confirmed).healthy);
+
+    // A move that lands late, the stamp already settled, defers nothing: the verdict is
+    // due, and the next start delivers it.
+    let mut late = Fixture::new();
+    late.apply().unwrap();
+    let stamps = burst(&late);
+    let own = stamps[2].clone().expect("stamped");
+    assert!(!session_defer(
+        &late,
+        &own,
+        t0 + 1 + crate::linux_trial::START_SETTLES_SECS
+    ));
+    assert!(!session_start(&late, t0 + 21));
+}
+
+/// A SILENT SESSION'S DEFERRAL OUTLASTS A HELD UPDATE LOCK. The update lock is taken within
+/// half a second or not at all, and at the third tab's +10 s another tab's start can hold
+/// it while it hashes the executable — longer than that on the cold disk the deferral
+/// exists for. The deferral got ONE try: it failed busy, nothing tried again, and the next
+/// tab a window on rolled the healthy build back after all. Driven through the shipping
+/// retry ([`defer_session_verdict_retrying`]) with a sibling's lock held over the first
+/// try: that try fails [`LOCK_BUSY`], the pause lets the lock go, the second lands, and the
+/// fifth tab at 21 s is kept.
+///
+/// CONTROLS: one try under the held lock, as before, loses the move and the fifth tab
+/// rolls back; the shell speaking in the pause ends the tries; a stamp no longer young
+/// ends them with no pause; and a refusal is an answer, never tried again.
+#[test]
+fn a_silent_session_s_deferral_outlasts_a_held_update_lock() {
+    let t0 = minute(0);
+    let commit = "b".repeat(40);
+    // Four tabs within a second; the stamp the budget's last one left.
+    let burst = |f: &Fixture| {
+        let stamps = [t0, t0, t0 + 1, t0 + 1]
+            .into_iter()
+            .map(|at| session_start_stamping(f, at))
+            .collect::<Vec<_>>();
+        assert!(stamps.iter().all(|(starts_trial, _)| *starts_trial));
+        stamps[2]
+            .1
+            .clone()
+            .expect("the budget's last start stamped")
+    };
+    let try_at = |f: &Fixture, own: &StartClock, now: i64| {
+        let inode = fs::metadata(&f.context.target).unwrap();
+        defer_session_verdict_in(
+            &f.context,
+            11,
+            &commit,
+            || Ok((inode.dev(), inode.ino())),
+            own,
+            reads(now),
+        )
+    };
+
+    // CONTROL: one try, as before. The held lock loses the move for good.
+    let mut once = Fixture::new();
+    once.apply().unwrap();
+    let own = burst(&once);
+    {
+        let _sibling = once.context.lock().unwrap();
+        assert_eq!(try_at(&once, &own, t0 + 11), Err(LOCK_BUSY.to_string()));
+    }
+    assert!(
+        !session_start(&once, t0 + 21),
+        "PRECONDITION: a move lost to the lock leaves the burst to be rolled back"
+    );
+
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let own = burst(&f);
+    let mut sibling = Some(f.context.lock().unwrap());
+    let mut tries = Vec::new();
+    let mut pauses = Vec::new();
+    let moved = defer_session_verdict_retrying(
+        &own,
+        || {
+            let answer = try_at(&f, &own, t0 + 11);
+            tries.push(answer.clone());
+            answer
+        },
+        || Ok(StartClock::from(t0 + 11)),
+        |pause| {
+            pauses.push(pause);
+            sibling = None;
+            true
+        },
+    );
+    assert!(moved, "the try after the pause lands");
+    assert_eq!(tries, [Err(LOCK_BUSY.to_string()), Ok(true)]);
+    assert_eq!(pauses, [SESSION_DEFER_RETRY]);
+    assert_eq!(trial_on_disk(&f).start_clock(), StartClock::from(t0 + 11));
+    assert!(!trial_on_disk(&f).healthy, "the move confirms nothing");
+    assert!(session_start(&f, t0 + 21), "the fifth tab is kept");
+
+    // The shell spoke in the pause: its confirmation counts now, and no try follows.
+    let mut spoke = Fixture::new();
+    spoke.apply().unwrap();
+    let own = burst(&spoke);
+    let _sibling = spoke.context.lock().unwrap();
+    let mut tries = 0;
+    assert!(!defer_session_verdict_retrying(
+        &own,
+        || {
+            tries += 1;
+            try_at(&spoke, &own, t0 + 11)
+        },
+        || Ok(StartClock::from(t0 + 11)),
+        |_| false,
+    ));
+    assert_eq!(tries, 1);
+
+    // A stamp no longer young: the verdict is due, and nothing waits for the lock.
+    assert!(!defer_session_verdict_retrying(
+        &own,
+        || Err(LOCK_BUSY.to_string()),
+        || Ok(StartClock::from(
+            t0 + 1 + crate::linux_trial::START_SETTLES_SECS
+        )),
+        |_| panic!("no pause once the stamp has settled"),
+    ));
+    // Nor a clock that cannot be read.
+    assert!(!defer_session_verdict_retrying(
+        &own,
+        || Err(LOCK_BUSY.to_string()),
+        || Err("no clock".to_string()),
+        |_| panic!("no pause without a clock"),
+    ));
+    // A refusal is an answer.
+    let mut tries = 0;
+    assert!(!defer_session_verdict_retrying(
+        &own,
+        || {
+            tries += 1;
+            Ok(false)
+        },
+        || Ok(StartClock::from(t0 + 11)),
+        |_| panic!("a refusal is not tried again"),
+    ));
+    assert_eq!(tries, 1);
+}
+
+/// A CRASH LOOP FASTER THAN THE SETTLE WINDOW IS STILL ROLLED BACK: `aterm --headless`
+/// under a systemd unit with `Restart=always` and `RestartSec=5`, on a build that crashes
+/// at every start. Every start used to restamp, so each found the one five seconds before
+/// it young and none rolled back — and while the trial stood unconfirmed, checks and
+/// applies waited, so no fixed release could install either. Now the starts past the budget
+/// share the budget's last stamp, and the first one a whole window after it rolls back.
 ///
 /// FAILS WITHOUT THE FIX: all sixty starts below are kept.
 #[test]
@@ -1623,7 +1899,7 @@ fn rollback_copies(f: &Fixture) -> Vec<String> {
 /// baseline, build 0, under any floor). When that successor fails its starts, the
 /// rollback is refused — and so was every later start, check, apply, reinstall and
 /// `aterm update rollback`, all waiting on the trial, for good. The same holds for a
-/// rollback target whose signer was revoked. Now the start past the budget ends the
+/// rollback target whose kept copy is gone. Now the start past the budget ends the
 /// trial, keeping the build and saying why, and a newer release installs over it.
 ///
 /// FAILS WITHOUT THE FIX: the fourth start's rollback refusal is an error out of the
@@ -1631,13 +1907,14 @@ fn rollback_copies(f: &Fixture) -> Vec<String> {
 /// refused while it waits.
 #[test]
 fn a_trial_no_rollback_can_be_taken_from_ends_and_the_copy_updates_again() {
-    for revoke in [false, true] {
+    for copy_gone in [false, true] {
         let mut f = Fixture::new();
         f.state.installed.machine_id = Some("old-machine".into());
         f.apply().unwrap();
         let mut state = f.context.read_state().unwrap().unwrap();
-        if revoke {
-            state.revoked_machines.push("old-machine".into());
+        if copy_gone {
+            let trial = state.trial.as_ref().unwrap();
+            fs::remove_file(f.context.backup(&trial.old)).unwrap();
         } else {
             state.min_build = 11;
         }
@@ -1660,6 +1937,58 @@ fn a_trial_no_rollback_can_be_taken_from_ends_and_the_copy_updates_again() {
         stage_release(&mut f, 12, 3, 'c');
         f.apply().expect("a newer release installs over it");
         assert_eq!(f.state.installed.build, 12);
+    }
+}
+
+/// A MACHINE ROTATION STRANDS NO CRASH-LOOPING UPDATE. Reformatting a release machine means
+/// a new id and a revocation of the old one (`aterm_update_core::Roster::machine`), so the
+/// first release cut after it carries a roster that revokes the machine that signed the
+/// build every copy runs. When that release fails its starts, the build it replaced comes
+/// back: its kept copy is the executable this copy installed and ran, proved by its digest,
+/// and restoring it is no new acceptance. Revocation stops future acceptance; it does not
+/// uninstall (docs/RELEASE-KEYS.md), and a build a revocation must not leave installed is
+/// the yank's, which the rollback still respects
+/// ([`rollback_respects_the_minimum_without_lowering_any_floor`]). `aterm update rollback`
+/// takes it back the same way.
+///
+/// FAILS WITHOUT THE FIX: the start past the budget ended the trial with "can't come
+/// back (the machine that signed it is no longer trusted)" and kept build 11, which
+/// does not start, until a newer release installed over it; a build that dies at
+/// start runs no check to find one.
+#[test]
+fn a_rotated_signers_build_still_comes_back_from_a_crash_loop() {
+    for manual in [false, true] {
+        let mut f = Fixture::new();
+        f.state.installed.machine_id = Some("m3".into());
+        let old = f.state.installed.clone();
+        // The release check that admits 11 records the roster's revocation of m3.
+        f.state.revoked_machines.push("m3".into());
+        f.context.save(&f.state).unwrap();
+        f.apply().unwrap();
+        assert_eq!(trial_on_disk(&f).old.machine_id.as_deref(), Some("m3"));
+        if manual {
+            let mut state = f.context.read_state().unwrap().unwrap();
+            rollback_locked(&f.context, &mut state).expect("aterm update rollback");
+        } else {
+            for n in 0..MAX_TRIAL_STARTS {
+                assert!(window_start(&f, minute(i64::from(n))), "start {n} is a try");
+            }
+            assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS))));
+        }
+        let state = f.context.read_state().unwrap().unwrap();
+        assert_eq!(
+            hash_file(&f.context.target).unwrap(),
+            old.sha256,
+            "manual={manual}: {}",
+            state.outcome
+        );
+        assert_eq!(state.installed.build, 10, "manual={manual}");
+        assert_eq!(state.rejected_build, 11, "manual={manual}");
+        assert!(state.trial.is_none(), "manual={manual}");
+        assert!(
+            state.revoked_machines.contains(&"m3".to_string()),
+            "the revocation stands for every future acceptance"
+        );
     }
 }
 
@@ -1747,7 +2076,7 @@ fn save_as_098(f: &Fixture) {
     write_atomic(&path, aterm_toml::to_string(&older).unwrap().as_bytes()).unwrap();
 }
 
-/// AN OLDER BUILD'S SAVE MID-TRIAL KEEPS THE WINDOW'S VERDICT (round six). On Linux the
+/// AN OLDER BUILD'S SAVE MID-TRIAL KEEPS THE WINDOW'S VERDICT. On Linux the
 /// process that installs an update is the old build, and it keeps running and checking
 /// after it: every save it makes rewrites the whole record in its own shape, without
 /// the fields it does not know. A session confirmed the new build and a window of it
@@ -1791,7 +2120,7 @@ fn an_older_builds_save_mid_trial_keeps_the_window_verdict() {
     assert!(state.trial.unwrap().window_proven);
 }
 
-/// A HEADLESS INSTANCE CONFIRMS THE SESSION LANE ONLY (round six). It opens no window,
+/// A HEADLESS INSTANCE CONFIRMS THE SESSION LANE ONLY. It opens no window,
 /// so it starts through the session lane (`aterm_update::linux_session_started`, in
 /// place of the window's boot count) and its confirmation at its bound socket confirms
 /// that lane ([`confirm_lane`]). A trial a session confirmed still owes its window's
@@ -1901,7 +2230,7 @@ fn a_newer_install_over_a_window_that_never_confirmed_rolls_back_past_it() {
     );
 }
 
-/// EACH UPDATE KEEPS ONE ROLLBACK COPY (round six). Every apply hard-links the
+/// EACH UPDATE KEEPS ONE ROLLBACK COPY. Every apply hard-links the
 /// executable it replaces into the update directory, where it is the last name of that
 /// file; nothing ever removed one, so every update of a copy's life left a whole
 /// executable on disk. Now an install keeps only the copy its trial can restore, and a
@@ -1936,7 +2265,7 @@ fn each_update_keeps_only_the_rollback_copy_its_trial_can_restore() {
     assert!(rollback_copies(&f).is_empty());
 }
 
-/// A WINDOW OF A SETTLED INSTALL LEAVES THE RECORDED OUTCOME ALONE (round six). An
+/// A WINDOW OF A SETTLED INSTALL LEAVES THE RECORDED OUTCOME ALONE. An
 /// install stays on record, confirmed, until the next one, and every window's first
 /// frame confirmed it again: the outcome became "aterm X is installed" on every window
 /// launch, over a failing check's reason, which then showed nowhere. A lane already
@@ -2064,39 +2393,45 @@ fn derived_transaction_model_proves_and_catches_missing_prepare_and_binds_shippi
     );
 }
 
-/// AN INHERITED ROLLBACK TARGET MUST STILL BE ONE THE COPY MAY TAKE (round six). A
+/// AN INHERITED ROLLBACK TARGET MUST STILL BE ONE THE COPY MAY TAKE. A
 /// session confirmed 11 and one window of it crashed, so 12 would keep 11's rollback
-/// target, 10. But 12 carries a yank floor above 10 (or 10's signer is revoked by the
-/// time 12 installs): 10 can never come back. 12's trial rolls back to 11 instead,
-/// which is permitted and proven for sessions — as it did before 12 kept its
-/// predecessor's target at all.
+/// target, 10. But 12 carries a yank floor above 10: 10 can never come back. 12's
+/// trial rolls back to 11 instead, which is permitted and proven for sessions — as it
+/// did before 12 kept its predecessor's target at all.
+///
+/// A revocation of 10's signer by the time 12 installs (the machine was reformatted)
+/// rules nothing out: 12 keeps 10 as its target and a crash
+/// loop restores it, as it restores any build this copy ran.
 ///
 /// FAILS WITHOUT THE FIX: 12's trial took 10, no copy of 11 was kept, and 12's
 /// crashing windows ended the trial with 12 kept ("can't come back").
 #[test]
-fn an_inherited_rollback_target_a_yank_or_revocation_ruled_out_is_not_inherited() {
-    for revoke in [false, true] {
+fn an_inherited_rollback_target_a_yank_ruled_out_is_not_inherited() {
+    for yank in [true, false] {
         let mut f = Fixture::new();
         f.state.installed.machine_id = Some("old-machine".into());
         f.context.save(&f.state).unwrap();
+        let ten = f.state.installed.clone();
         f.apply().unwrap();
         assert!(session_start(&f, minute(0)));
         assert_eq!(session_confirm(&f), Confirmed::Yes);
         assert!(window_start(&f, minute(1)), "a window of 11 crashes");
         let eleven = trial_on_disk(&f).new;
         stage_release(&mut f, 12, 3, 'c');
-        if revoke {
-            f.state.revoked_machines.push("old-machine".into());
-        } else {
+        if yank {
             let text = String::from_utf8(f.proof.appcast.clone()).unwrap();
             f.proof.appcast = format!("{text}min_build = 11\n").into_bytes();
             f.resign();
+        } else {
+            f.state.revoked_machines.push("old-machine".into());
         }
         f.apply().unwrap();
-        assert_eq!(trial_on_disk(&f).old.build, 11, "revoke={revoke}");
+        let target = if yank { &eleven } else { &ten };
+        assert_eq!(trial_on_disk(&f).old.build, target.build, "yank={yank}");
         assert_eq!(
             rollback_copies(&f),
-            vec![format!("rollback-{}", eleven.sha256)]
+            vec![format!("rollback-{}", target.sha256)],
+            "yank={yank}"
         );
         for n in 2..2 + i64::from(MAX_TRIAL_STARTS) {
             assert!(window_start_as(&f, 12, 'c', minute(n)));
@@ -2108,14 +2443,14 @@ fn an_inherited_rollback_target_a_yank_or_revocation_ruled_out_is_not_inherited(
             minute(2 + i64::from(MAX_TRIAL_STARTS))
         ));
         let state = f.context.read_state().unwrap().unwrap();
-        assert_eq!(state.installed.build, 11, "revoke={revoke}");
-        assert_eq!(hash_file(&f.context.target).unwrap(), eleven.sha256);
+        assert_eq!(state.installed.build, target.build, "yank={yank}");
+        assert_eq!(hash_file(&f.context.target).unwrap(), target.sha256);
         assert_eq!(state.rejected_build, 12);
     }
 }
 
-/// AN OLDER BUILD'S SAVE IN THE MIDDLE OF A BURST DOES NOT ROLL A HEALTHY BUILD BACK
-/// (round six). A terminal restoring its tabs starts several sessions at once; a
+/// AN OLDER BUILD'S SAVE IN THE MIDDLE OF A BURST DOES NOT ROLL A HEALTHY BUILD BACK.
+/// A terminal restoring its tabs starts several sessions at once; a
 /// running 0.98's save between the budget's last start and the next one drops the
 /// start stamp, and "no stamp" read as the plain budget, so the next start of the
 /// burst rolled back, and refused for good, a build none of whose starts had had the
@@ -2156,6 +2491,265 @@ fn an_older_builds_save_mid_burst_does_not_roll_a_healthy_build_back() {
     let state = g.context.read_state().unwrap().unwrap();
     assert_eq!(state.installed.build, 10);
     assert_eq!(state.rejected_build, 11);
+}
+
+/// `unix` on the wall clock, read with `secs` on boot `boot`'s steady clock.
+fn clock_at(unix: i64, boot: &str, secs: i64) -> StartClock {
+    StartClock {
+        unix,
+        steady: Some(Steady {
+            clock: format!("{boot} time:[4026531834]"),
+            secs,
+        }),
+    }
+}
+
+/// A CLOCK STEP IN THE MIDDLE OF A BURST ROLLS NO HEALTHY BUILD BACK. Six restored tabs
+/// start inside a second; each start is its own process, judged against the stamp the one
+/// before it left. On a board with no battery-backed clock (booted hours behind until NTP
+/// sets it), or a dual-boot machine whose clock keeps local time, the wall clock steps in
+/// the middle of such a burst: the fourth start read the third as an hour settled, or
+/// stamped in the future, and rolled back, and refused for good, a build none of whose
+/// starts had had a second to print a prompt. The age is now read on the steady clock both
+/// starts share. A crash loop still rolls back however the wall clock moves, and across a
+/// boot, where no steady clock spans both starts, the wall clock judges as before.
+///
+/// FAILS WITHOUT THE FIX: each stepped burst's fourth start rolled 11 back (installed
+/// 10, rejected 11).
+#[test]
+fn a_clock_step_mid_burst_rolls_no_healthy_build_back() {
+    let t0 = minute(0);
+    let settles = crate::linux_trial::START_SETTLES_SECS;
+    for step in [3_600, -3_600, -1] {
+        let mut f = Fixture::new();
+        f.apply().unwrap();
+        for _ in 0..MAX_TRIAL_STARTS {
+            assert!(session_start(&f, clock_at(t0, "boot-a", 500)));
+        }
+        // NTP steps the wall clock; the burst's next start, the same steady second.
+        assert!(
+            session_start(&f, clock_at(t0 + step, "boot-a", 500)),
+            "step {step}: the burst's next start is a try"
+        );
+        assert_eq!(session_confirm(&f), Confirmed::Yes, "step {step}");
+        let state = f.context.read_state().unwrap().unwrap();
+        assert_eq!(state.installed.build, 11, "step {step}: {}", state.outcome);
+        assert_eq!(state.rejected_build, 0, "step {step}");
+    }
+    // A crash loop is rolled back whatever the wall clock does meanwhile: a settle
+    // window on the steady clock after the budget's last start.
+    for step in [3_600, -3_600, 0] {
+        let mut g = Fixture::new();
+        g.apply().unwrap();
+        for _ in 0..MAX_TRIAL_STARTS {
+            assert!(session_start(&g, clock_at(t0, "boot-a", 500)));
+        }
+        assert!(
+            session_start(&g, clock_at(t0 + step, "boot-a", 500 + settles - 1)),
+            "step {step}: still young on the steady clock"
+        );
+        assert!(
+            !session_start(&g, clock_at(t0 + step, "boot-a", 500 + settles)),
+            "step {step}: settled on the steady clock"
+        );
+        let state = g.context.read_state().unwrap().unwrap();
+        assert_eq!(state.installed.build, 10, "step {step}");
+        assert_eq!(state.rejected_build, 11, "step {step}");
+    }
+    // Across a boot no steady clock spans both starts: the wall clock judges, as it
+    // did before, and so does a start that read no steady clock.
+    for next in [
+        clock_at(t0 + 3_600, "boot-b", 7),
+        StartClock::from(t0 + 3_600),
+    ] {
+        let mut h = Fixture::new();
+        h.apply().unwrap();
+        for _ in 0..MAX_TRIAL_STARTS {
+            assert!(session_start(&h, clock_at(t0, "boot-a", 500)));
+        }
+        assert!(!session_start(&h, next.clone()), "{next:?}");
+        assert_eq!(
+            h.context.read_state().unwrap().unwrap().rejected_build,
+            11,
+            "{next:?}"
+        );
+    }
+}
+
+/// Whether this copy's update lock is held right now, by anyone, this process's own
+/// count included (each take opens its own descriptor of the lock file): a take that
+/// may not wait is refused.
+fn the_lock_is_held(f: &Fixture) -> bool {
+    FileLock::acquire_within(&f.context.dir.join("lock"), Duration::ZERO)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+}
+
+/// A burst's clock as one of its starts reads it: the boot's monotonic second, which
+/// `steady` holds at the read, and the wall clock as far past `t0` as that is past 500.
+/// Read only with the lock held, or the test fails.
+fn monotonic<'a>(
+    f: &'a Fixture,
+    steady: &'a std::cell::Cell<i64>,
+    t0: i64,
+) -> impl FnOnce() -> Result<StartClock, String> + 'a {
+    move || {
+        assert!(
+            the_lock_is_held(f),
+            "a start reads its clock holding the lock"
+        );
+        let secs = steady.get();
+        Ok(clock_at(t0 + secs - 500, "boot-a", secs))
+    }
+}
+
+/// A START THAT WAITED ON THE LOCK ROLLS NO HEALTHY BUILD BACK. The starts of a burst wait
+/// on the copy's update lock in no particular order (a `try_lock` poll every 50 ms), and
+/// each holder hashes the executable, so the waits are real. Each start read its clock
+/// BEFORE it waited: a fourth start that read steady second 500, then waited out three
+/// starts that read 501, was judged against a predecessor stamped a second in its future,
+/// which is no young start, and it rolled back, and refused for good, a healthy build
+/// before its first prompt, with no clock step at all. In both lanes
+/// ([`session_started_in`], [`boot_in`]) a start now reads its clock holding the lock, so
+/// after the start counted before it read its own: on one boot's monotonic clock the age
+/// between them is never negative.
+///
+/// FAILS WITHOUT THE FIX: a start's clock was the reading it took before the wait,
+/// which the negative control replays: handed to the same locked count, steady 500
+/// after three starts at 501 rolls 11 back (installed 10, rejected 11). The count
+/// still reads a stamp in its future as no young start, so a wrong clock delays no
+/// verdict ([`crate::linux_trial::start_is_young`]); the lock order is what keeps the
+/// burst's own skew from being one.
+#[test]
+fn a_start_that_waited_on_the_lock_rolls_no_healthy_build_back() {
+    let t0 = minute(0);
+    for lane in [Lane::Session, Lane::Window] {
+        let mut f = Fixture::new();
+        f.apply().unwrap();
+        assert!(
+            !the_lock_is_held(&f),
+            "{lane:?}: the probe sees a free lock"
+        );
+        // The burst's fourth start begins at steady 500 and finds the trial pending;
+        // the three before it take the lock first, a second later.
+        let steady = std::cell::Cell::new(500);
+        let began = clock_at(t0, "boot-a", 500);
+        steady.set(501);
+        for _ in 0..MAX_TRIAL_STARTS {
+            assert!(start_in(&f, lane, monotonic(&f, &steady, t0)), "{lane:?}");
+        }
+        assert_eq!(
+            trial_on_disk(&f).start_clock(),
+            clock_at(t0 + 1, "boot-a", 501),
+            "{lane:?}"
+        );
+        // Then the fourth holds the lock, and reads its clock.
+        assert!(
+            start_in(&f, lane, monotonic(&f, &steady, t0)),
+            "{lane:?}: the burst's fourth start is a try"
+        );
+        let state = f.context.read_state().unwrap().unwrap();
+        assert_eq!(state.installed.build, 11, "{lane:?}: {}", state.outcome);
+        assert_eq!(state.rejected_build, 0, "{lane:?}");
+
+        // Negative control: the reading it took before the wait, as it was counted.
+        let mut g = Fixture::new();
+        g.apply().unwrap();
+        for _ in 0..MAX_TRIAL_STARTS {
+            assert!(start_in(&g, lane, reads(clock_at(t0 + 1, "boot-a", 501))));
+        }
+        assert!(!start_in(&g, lane, reads(began)), "{lane:?}");
+        let state = g.context.read_state().unwrap().unwrap();
+        assert_eq!(
+            (state.installed.build, state.rejected_build),
+            (10, 11),
+            "{lane:?}"
+        );
+    }
+    // The shipping entries hand over the clock itself, to be read under the lock, not
+    // a reading taken before it.
+    let src: String = include_str!("../linux.rs").split_whitespace().collect();
+    for entry in ["boot_in(", "session_started_stamping_in("] {
+        assert!(
+            src.contains(&format!(
+                "{entry}context,current_build,current_commit,proc_self_inode,start_clock,)"
+            )),
+            "{entry} is handed `start_clock` unread"
+        );
+    }
+    // And so is a silent session's deferral, which stamps as a start does, and its
+    // retry, which asks the stamp's youth before each pause.
+    assert!(
+        src.contains(
+            "defer_session_verdict_in(context,current_build,current_commit,proc_self_inode,&own,\
+             start_clock,)"
+        ),
+        "the deferral is handed `start_clock` unread"
+    );
+    assert!(
+        src.contains("},start_clock,pause,)"),
+        "the deferral's retry is handed `start_clock` unread"
+    );
+    let early = src
+        .match_indices("start_clock()")
+        .filter(|(at, _)| !src[..*at].ends_with('.') && !src[..*at].ends_with("fn"))
+        .count();
+    assert_eq!(early, 0, "no start reads its clock before the lock");
+}
+
+/// THE STEADY CLOCK NAMES ITS BOOT AND NEVER RUNS BACK. Read twice, it
+/// names the same clock (the boot id and the time namespace) and has not gone back; a
+/// boot with no name to read gives no steady stamp, and that start is judged on the
+/// wall clock alone. The stamp crosses the record and an older build reads that record
+/// (its save drops the stamp, as it drops the wall-clock one).
+#[test]
+fn the_steady_clock_names_its_boot_and_never_runs_back() {
+    let mut f = Fixture::new();
+    let boot = f.root.join("boot_id");
+    let namespace = f.root.join("time-ns");
+    fs::write(&boot, "0f5a1c6e-3b0e-4c55-9d4e-6c1f2a7b9e10\n").unwrap();
+    std::os::unix::fs::symlink("time:[4026531834]", &namespace).unwrap();
+    let first = steady_clock(&boot, &namespace).expect("a named boot reads a steady clock");
+    let second = steady_clock(&boot, &namespace).unwrap();
+    assert_eq!(
+        first.clock,
+        "0f5a1c6e-3b0e-4c55-9d4e-6c1f2a7b9e10 time:[4026531834]"
+    );
+    assert_eq!(first.clock, second.clock);
+    assert!(second.secs >= first.secs, "{first:?} then {second:?}");
+    assert_eq!(
+        steady_clock(&boot, &f.root.join("no-namespace"))
+            .unwrap()
+            .clock,
+        "0f5a1c6e-3b0e-4c55-9d4e-6c1f2a7b9e10 ",
+        "a kernel with no time namespaces"
+    );
+    fs::write(&boot, "\n").unwrap();
+    assert_eq!(steady_clock(&boot, &namespace), None, "an empty boot id");
+    assert_eq!(
+        steady_clock(&f.root.join("absent"), &namespace),
+        None,
+        "no boot id"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        steady_clock(Path::new(BOOT_ID), Path::new(TIME_NAMESPACE)).is_some(),
+        "Linux names its boot"
+    );
+
+    f.apply().unwrap();
+    let stamp = clock_at(minute(0), "boot-a", 500);
+    assert!(session_start(&f, stamp.clone()));
+    assert_eq!(
+        trial_on_disk(&f).start_clock(),
+        stamp,
+        "the record keeps both"
+    );
+    save_as_098(&f);
+    assert_eq!(
+        trial_on_disk(&f).start_clock(),
+        StartClock::default(),
+        "an older build reads the record, and its save drops both stamps"
+    );
 }
 
 /// AN OLDER BUILD'S SAVE BEFORE EVERY START STILL ROLLS A CRASH LOOP BACK. The 0.98
@@ -2284,6 +2878,61 @@ fn a_kept_copy_that_is_not_its_build_ends_the_trial_and_is_not_inherited() {
     );
 }
 
+/// A KEPT COPY THE ROLLBACK WOULD REFUSE TO OPEN ENDS THE TRIAL TOO, AND IS NEVER
+/// INHERITED. The rollback opens its copy as an executable
+/// (`checked_file(.., true)`), but the refusal above hashed it as a plain file: a copy
+/// that lost its exec bit (or became group-writable) passed with the right digest,
+/// and the rollback then failed `unsafe update file` at every start past the budget,
+/// the trial pending for good. And an inherited copy of that kind made every apply
+/// of every newer release fail with the same error.
+///
+/// FAILS WITHOUT THE FIX: the fourth start is an error out of the count, and the
+/// second fixture's apply fails `unsafe update file`.
+#[test]
+fn a_kept_copy_the_rollback_would_refuse_ends_the_trial_and_is_not_inherited() {
+    use std::os::unix::fs::PermissionsExt;
+    // 0o000 and 0o111: a copy we may not READ fails the rollback's open with
+    // `EACCES` at every try — a fact, never a retry.
+    for mode in [0o644, 0o775, 0o000, 0o111] {
+        let spoil = |f: &Fixture, identity: &Identity| {
+            fs::set_permissions(f.context.backup(identity), fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        let mut f = Fixture::new();
+        let ten = f.state.installed.clone();
+        f.apply().unwrap();
+        spoil(&f, &ten);
+        for n in 0..MAX_TRIAL_STARTS {
+            assert!(window_start(&f, minute(i64::from(n))));
+        }
+        assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS))));
+        let state = f.context.read_state().unwrap().unwrap();
+        assert!(state.trial.is_none(), "mode {mode:o}: the trial is over");
+        assert_eq!(state.installed.build, 11);
+        assert!(awaiting_start(&state).is_none());
+        assert!(
+            state.outcome.contains("not safe to restore"),
+            "mode {mode:o}: {}",
+            state.outcome
+        );
+
+        let mut g = Fixture::new();
+        g.apply().unwrap();
+        assert!(session_start(&g, minute(0)));
+        assert_eq!(session_confirm(&g), Confirmed::Yes);
+        assert!(window_start(&g, minute(1)), "a window of 11 crashes");
+        spoil(&g, &ten);
+        stage_release(&mut g, 12, 3, 'c');
+        g.apply()
+            .unwrap_or_else(|error| panic!("mode {mode:o}: a newer release installs: {error}"));
+        assert_eq!(
+            trial_on_disk(&g).old.build,
+            11,
+            "mode {mode:o}: a copy the rollback would refuse is not inherited"
+        );
+    }
+}
+
 /// A master-signed roster at `seq` listing `machines` (id, key) and revoking `revoked`.
 fn roster_with(
     seq: u64,
@@ -2310,7 +2959,7 @@ fn roster_with(
     (bytes, signature)
 }
 
-/// A STOLEN KEY'S MINIMUM-BUILD FLOOR GOES WITH THE KEY (round seven, H1 finding 2).
+/// A STOLEN KEY'S MINIMUM-BUILD FLOOR GOES WITH THE KEY.
 /// The thief's appcast, signed by a machine the roster still lists, carries
 /// `min_build = 9_999_999_999`; the floor ratchets there. The owner revokes the
 /// machine and ships the next genuine release: before the fix, `check_locked` refused
@@ -2351,7 +3000,7 @@ fn a_revoked_machines_minimum_build_floor_is_withdrawn() {
     assert!(durable.revoked_machines.contains(&"thief".to_string()));
 }
 
-/// A HELD STAGE STAYS APPLICABLE AFTER THE ROSTER MOVES (round seven, H1 finding 34).
+/// A HELD STAGE STAYS APPLICABLE AFTER THE ROSTER MOVES.
 /// Build 11 is staged and held (automatic apply off) under roster 1. A check of a head
 /// with no Linux executable admits roster 2 — a machine joined — which ratchets the
 /// floor. `aterm update apply` then re-authorized the saved roster-1 proof against a
@@ -2512,4 +3161,729 @@ fn a_refused_head_whose_roster_was_admitted_still_reproves_the_held_stage() {
     assert!(refused.is_err());
     assert_eq!(n.state.roster_floor, 1);
     assert_eq!(Proof::read(&n.context.dir).unwrap().roster, before);
+}
+
+/// How many files `run` hashed on this thread ([`HASHED`]).
+fn hashes_in<T>(run: impl FnOnce() -> T) -> (T, u32) {
+    let before = HASHED.with(std::cell::Cell::get);
+    let value = run();
+    (value, HASHED.with(std::cell::Cell::get) - before)
+}
+
+/// The fixture's release, staged and held for `aterm update apply`
+/// (`[update] auto_apply = false`).
+fn hold_stage(f: &mut Fixture) {
+    let provider = settings_provider(false);
+    let source = provider().unwrap().source;
+    finish_candidate(
+        &f.context,
+        &mut f.state,
+        &f.proof,
+        Pins {
+            masters: &[&f.master],
+        },
+        &source,
+        &provider,
+        |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(f.state.staged.as_ref().map(|stage| stage.build), Some(11));
+}
+
+/// A HELD DOWNLOAD IS HASHED ONCE, NOT AT
+/// EVERY PASS. Every aterm process's background loop ends each one-minute pass with
+/// `status()`, the ~29 of 30 passes that check nothing included, and its stage check
+/// read and hashed the whole held candidate (about 100 MB) every time: one window and
+/// ten sessions hashed it eleven times a minute for as long as it was held. The
+/// stage's bytes are now hashed again only when the file is not the one last hashed
+/// (another inode, size, or change time).
+///
+/// FAILS WITHOUT THE FIX: sixty idle passes hashed the candidate sixty times.
+///
+/// NEGATIVE CONTROLS: a candidate changed in place (to bytes of the same size with a
+/// new modification time, or to a new size), or replaced, is hashed again and judged
+/// on its bytes: a changed one is no longer offered, the right bytes are. The controls
+/// never trust a write alone to move the file's times: a filesystem clock ticks
+/// coarsely on a Linux kernel without multigrain timestamps (before 6.13), so a
+/// same-size rewrite within the fixture's own tick moves no part of the stamp
+/// ([`FileStamp`]).
+#[test]
+fn a_held_stage_is_hashed_once_not_at_every_pass() {
+    let mut f = Fixture::new();
+    hold_stage(&mut f);
+    let (offered, hashed) = hashes_in(|| {
+        (0..60)
+            .map(|_| linux_status(&f.context, &f.state).staged_build)
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        offered.iter().all(|build| *build == Some(11)),
+        "{offered:?}"
+    );
+    assert!(
+        hashed <= 1,
+        "sixty passes hashed the held stage {hashed} times"
+    );
+
+    let candidate = f.context.dir.join("candidate");
+    let bytes = fs::read(&candidate).unwrap();
+    // A day before the stamped modification time: a stamp of its own, at any clock.
+    let modified =
+        fs::metadata(&candidate).unwrap().modified().unwrap() - Duration::from_secs(86_400);
+    let set_modified = |at: std::time::SystemTime| {
+        File::options()
+            .write(true)
+            .open(&candidate)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(at))
+            .unwrap();
+    };
+    let mut changed = bytes.clone();
+    changed[100] ^= 1;
+    fs::write(&candidate, &changed).unwrap();
+    set_modified(modified);
+    let (offered, hashed) = hashes_in(|| linux_status(&f.context, &f.state).staged_build);
+    assert_eq!(
+        (offered, hashed),
+        (None, 1),
+        "changed in place, same size: hashed again"
+    );
+    // A new size, under the modification time just stamped: only the size is sure to
+    // be new.
+    let mut longer = bytes.clone();
+    longer.push(0);
+    fs::write(&candidate, &longer).unwrap();
+    set_modified(modified);
+    let (offered, hashed) = hashes_in(|| linux_status(&f.context, &f.state).staged_build);
+    assert_eq!(
+        (offered, hashed),
+        (None, 1),
+        "changed in place, new size: hashed again"
+    );
+
+    let replacement = f.context.dir.join("replacement");
+    fs::write(&replacement, &bytes).unwrap();
+    fs::rename(&replacement, &candidate).unwrap();
+    let (offered, hashed) = hashes_in(|| linux_status(&f.context, &f.state).staged_build);
+    assert_eq!((offered, hashed), (Some(11), 1), "replaced: hashed again");
+    fs::remove_file(&candidate).unwrap();
+    assert_eq!(linux_status(&f.context, &f.state).staged_build, None);
+}
+
+/// THE START OF A SESSION OR A WINDOW HASHES
+/// NOTHING. Whether a copy runs the background check loop was asked of `status()`,
+/// synchronously on the starting thread, so every new `aterm` session hashed the held
+/// candidate before its shell started, and every window during its startup. It asks
+/// the small state record alone.
+#[test]
+fn whether_the_check_loop_runs_is_asked_without_hashing() {
+    let mut f = Fixture::new();
+    hold_stage(&mut f);
+    let (enrolled, hashed) = hashes_in(|| enrolled_in(&f.context));
+    assert_eq!((enrolled, hashed), (true, 0));
+    fs::remove_file(f.context.dir.join("state.toml")).unwrap();
+    assert!(
+        !enrolled_in(&f.context),
+        "a copy with no record is not enrolled"
+    );
+    let src: String = include_str!("../linux.rs").split_whitespace().collect();
+    let start = src
+        .find("pub(crate)fnspawn_background_check_with_settings(")
+        .expect("the background loop");
+    let gate = &src[start..start + src[start..].find("std::thread::Builder").unwrap()];
+    assert!(
+        gate.contains("context().is_ok_and(enrolled_in)") && !gate.contains("status("),
+        "the loop's gate reads the record alone: {gate}"
+    );
+}
+
+/// The copy's update lock, held as another aterm holds it: its own descriptor of the
+/// lock file, which this process's [`Context::lock`] then waits on and gives up.
+fn another_aterm_holds_the_lock(f: &Fixture) -> aterm_update_core::FileLock {
+    aterm_update_core::FileLock::acquire(&f.context.dir.join("lock")).unwrap()
+}
+
+/// A WINDOW OF A SETTLED INSTALL STARTS
+/// WITHOUT THE UPDATE LOCK OR A HASH. After the first update the trial record stays
+/// for good, settled, and every later window launch ran the boot lane before its
+/// window existed: it took the copy's update lock, and the start count's recovery
+/// read and hashed the whole executable, only to find that a window start counts for
+/// nothing. While another aterm held the lock (a download, a probe) the launch also
+/// waited half a second and logged a deferred apply. The boot lane now takes the
+/// unlocked look at the record first, as the window's confirmation and the session
+/// lane do.
+///
+/// FAILS WITHOUT THE FIX: with the lock held the window start fails `LOCK_BUSY`, and
+/// without it the start hashes the executable.
+///
+/// NEGATIVE CONTROL: a trial whose window lane still owes its verdict (a session
+/// confirmed it) is counted under the lock, so a window start then waits for it.
+#[test]
+fn a_window_of_a_settled_install_starts_without_the_lock_or_a_hash() {
+    let commit = "b".repeat(40);
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    assert!(window_start(&f, minute(0)));
+    assert!(window_confirm(&f));
+    let unasked = || -> Result<(u64, u64), String> { panic!("no inode is asked") };
+    let (started, hashed) =
+        hashes_in(|| boot_in(&f.context, 11, &commit, unasked, reads(minute(1))));
+    assert_eq!((started, hashed), (Ok(false), 0));
+    let held = another_aterm_holds_the_lock(&f);
+    let (started, hashed) =
+        hashes_in(|| boot_in(&f.context, 11, &commit, unasked, reads(minute(2))));
+    assert_eq!((started, hashed), (Ok(false), 0), "the lock is not taken");
+    drop(held);
+
+    let mut g = Fixture::new();
+    g.apply().unwrap();
+    assert!(session_start(&g, minute(0)));
+    assert_eq!(session_confirm(&g), Confirmed::Yes);
+    let _held = another_aterm_holds_the_lock(&g);
+    assert_eq!(
+        boot_in(&g.context, 11, &commit, unasked, reads(minute(1))),
+        Err(LOCK_BUSY.to_string()),
+        "the window lane still owes its verdict"
+    );
+}
+
+/// A VETOED AUTOMATIC INSTALL KEEPS THE TRIAL IT
+/// WOULD HAVE REPLACED. 10→11 is installed; a terminal session confirmed 11, and one
+/// window start of it was counted and never confirmed (its window crashes). A check
+/// stages 12 and installs it by itself, and the install's prepared intent replaced the
+/// record's trial; then the last look at the settings vetoed the replacement (the
+/// window's settings answer timed out, aterm.toml was mid-save, or `auto_apply` was
+/// switched off during the probe), and abandoning the intent set the trial to none.
+/// 11's window starts no longer counted, `aterm update rollback` had nothing to roll
+/// back, and the next install of 12 took 11, whose window crashes, as its rollback
+/// target. The intent now keeps the trial it displaced, and abandoning it puts that
+/// trial back.
+///
+/// FAILS WITHOUT THE FIX: the trial on disk is gone after the veto.
+#[test]
+fn a_vetoed_automatic_install_keeps_the_trial_it_would_have_replaced() {
+    let mut f = Fixture::new();
+    let baseline = f.state.installed.clone();
+    f.apply().unwrap();
+    assert!(session_start(&f, minute(0)));
+    assert_eq!(session_confirm(&f), Confirmed::Yes);
+    assert!(window_start(&f, minute(1)), "a window of 11 crashes");
+    stage_release(&mut f, 12, 3, 'c');
+    let source = settings_provider(true)().unwrap().source;
+    let vetoed = std::sync::Arc::new(AtomicBool::new(false));
+    let provider: crate::CheckSettingsProvider = {
+        let vetoed = std::sync::Arc::clone(&vetoed);
+        let source = source.clone();
+        std::sync::Arc::new(move || {
+            (!vetoed.load(Ordering::SeqCst)).then(|| crate::CheckSettings {
+                source: source.clone(),
+                auto_apply: true,
+            })
+        })
+    };
+    let mut probes = 0;
+    let held = finish_candidate(
+        &f.context,
+        &mut f.state,
+        &f.proof,
+        Pins {
+            masters: &[&f.master],
+        },
+        &source,
+        &provider,
+        |_, _, _| {
+            probes += 1;
+            if probes == 2 {
+                vetoed.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(held.contains("`aterm update apply` installs it"), "{held}");
+    assert_eq!(probes, 2, "the install was prepared");
+    let trial = trial_on_disk(&f);
+    assert_eq!((trial.old.build, trial.new.build), (10, 11));
+    assert_eq!(trial.phase, Phase::Installed);
+    assert!(trial.healthy && !trial.window_proven);
+    assert_eq!(trial.starts, 1, "the window start still counts");
+    assert_eq!(
+        rollback_copies(&f),
+        vec![format!("rollback-{}", baseline.sha256)]
+    );
+    assert_eq!(f.state.staged.as_ref().map(|stage| stage.build), Some(12));
+    // The person's install of the held stage rolls back past 11, as it would have.
+    f.apply().unwrap();
+    let trial = trial_on_disk(&f);
+    assert_eq!((trial.old.build, trial.new.build), (10, 12));
+}
+
+/// A REPLACEMENT THAT FAILED AFTER ITS INTENT
+/// WAS WRITTEN KEEPS THE TRIAL TOO. The rename onto the executable failed; the next
+/// locked look at the record abandons the intent (the old executable is still
+/// installed) and puts the displaced trial back. An intent whose rename landed is
+/// finished as before, and drops it.
+#[test]
+fn an_abandoned_install_intent_puts_the_displaced_trial_back() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    assert!(session_start(&f, minute(0)));
+    assert_eq!(session_confirm(&f), Confirmed::Yes);
+    assert!(window_start(&f, minute(1)));
+    let before = trial_on_disk(&f);
+    stage_release(&mut f, 12, 3, 'c');
+    let pins = Pins {
+        masters: &[&f.master],
+    };
+    let failed = apply_with_checkpoints(
+        &f.context,
+        &mut f.state,
+        &f.proof,
+        pins,
+        |_, _, _| Ok(()),
+        |at| {
+            if at == Checkpoint::Prepared {
+                Err("replace Linux executable: Read-only file system (os error 30)".into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        trial_on_disk(&f).phase,
+        Phase::Prepared,
+        "the intent is durable"
+    );
+    // A running 0.98 reads the intent and its displaced trial (and abandons it to no
+    // trial, as it always has).
+    let text = fs::read_to_string(f.context.dir.join("state.toml")).unwrap();
+    assert!(text.contains("displaced"), "{text}");
+    let _: v098::State = aterm_toml::from_str(&text).expect("0.98 reads the record");
+    let mut state = f.context.read_state().unwrap().unwrap();
+    recover(&f.context, &mut state).unwrap();
+    let trial = trial_on_disk(&f);
+    assert_eq!(
+        (trial.old.build, trial.new.build, trial.phase, trial.starts),
+        (10, 11, Phase::Installed, 1)
+    );
+    assert_eq!(
+        (trial.healthy, trial.window_proven),
+        (before.healthy, before.window_proven)
+    );
+
+    // NEGATIVE CONTROL: the install that lands replaces the trial, displaced and all.
+    f.state = state;
+    f.apply().unwrap();
+    let trial = trial_on_disk(&f);
+    assert_eq!((trial.old.build, trial.new.build), (10, 12));
+    let text = fs::read_to_string(f.context.dir.join("state.toml")).unwrap();
+    assert!(!text.contains("displaced"), "{text}");
+}
+
+/// A HAND INSTALL OWES NO RECOVERY NOTICE, THROUGH THE COPY'S OWN RECORD. Checks fail
+/// persistently with a stage held, and the window's loop announced it; the person
+/// installs the held stage by hand, and the install zeroes the record's failure count.
+/// The loop's next pass checks nothing (it is not due) and reads the record: no
+/// recovery is owed, since no check has run.
+///
+/// FAILS WITHOUT THE FIX: that pass announced "aterm auto-update recovered".
+#[test]
+fn a_manual_install_after_failing_checks_announces_no_recovery() {
+    use crate::linux_notice::{Announcer, Pass, Record};
+    let pass = |state: &State| {
+        (
+            state.outcome.clone(),
+            state.failing_checks,
+            state.updated_at.clone(),
+        )
+    };
+    let tick = |notice: &mut Announcer,
+                (outcome, failing_checks, updated_at): &(String, u32, String)| {
+        notice.tick(Pass {
+            outcome,
+            failing_checks: *failing_checks,
+            updated_at,
+            record: Record::Kept,
+            took_lock: true,
+        })
+    };
+    let mut f = Fixture::new();
+    hold_stage(&mut f);
+    let mut notice = Announcer::new("2026-09-28T10:00:00Z".into());
+    f.state.outcome = "machine roster signature refused".into();
+    f.state.failing_checks = 3;
+    f.state.failing_kind = "linux-update".into();
+    f.state.updated_at = "2026-09-28T10:30:00Z".into();
+    f.context.save(&f.state).unwrap();
+    assert!(tick(&mut notice, &pass(&f.state)).is_some(), "announced");
+    f.apply().unwrap();
+    let installed = f.context.read_state().unwrap().unwrap();
+    assert_eq!(installed.failing_checks, 0, "the install zeroes the count");
+    assert_eq!(tick(&mut notice, &pass(&installed)), None, "no check ran");
+}
+
+/// A DUE PASS THAT WAITS ON THE
+/// TRIAL IS NO CHECK. Checks fail persistently with a stage held, and the window's loop
+/// announced it; the person installs the held stage by hand, and no new aterm starts
+/// before the next check falls due. That pass reads no channel (the installed update
+/// waits on its trial), and was booked as a check all the same: the record's last check
+/// moved to it and its streak was cleared, so the loop said that updates work again
+/// with the refusal that failed the checks still in place. Through the loop's own pass
+/// (`check_recording_in`) on the fixture copy.
+///
+/// FAILS WITHOUT THE FIX: the pass stamped `updated_at`, and the loop announced the
+/// recovery.
+///
+/// NEGATIVE CONTROL: a check recorded since the announcement does answer it.
+#[test]
+fn a_due_pass_that_waits_on_the_trial_announces_no_recovery() {
+    use crate::linux_notice::{Announcer, Pass, Record};
+    let tick = |notice: &mut Announcer,
+                (status, record, took_lock): &(crate::UpdateStatus, Record, bool)| {
+        notice.tick(Pass {
+            outcome: &status.outcome,
+            failing_checks: status.failing_checks,
+            updated_at: &status.updated_at,
+            record: *record,
+            took_lock: *took_lock,
+        })
+    };
+    let mut f = Fixture::new();
+    hold_stage(&mut f);
+    let failed = "2026-09-28T10:30:00Z";
+    f.state.outcome = "machine roster signature refused".into();
+    f.state.failing_checks = 3;
+    f.state.failing_kind = "linux-update".into();
+    f.state.updated_at = failed.into();
+    f.context.save(&f.state).unwrap();
+    let mut notice = Announcer::new("2026-09-28T10:00:00Z".into());
+    let announced = (status_in(Ok(&f.context), 10), Record::Kept, true);
+    assert!(tick(&mut notice, &announced).is_some(), "announced");
+    f.apply().unwrap();
+
+    let due = check_recording_in(Ok(&f.context), 11, &settings_provider(false), false);
+    assert_eq!(
+        (due.1, due.2),
+        (Record::Kept, true),
+        "the pass is on record"
+    );
+    let state = f.context.read_state().unwrap().unwrap();
+    assert!(state.last_attempt_unix > 0, "the pass was due and ran");
+    assert!(
+        state.outcome.contains("update checks wait until then"),
+        "{}",
+        state.outcome
+    );
+    assert_eq!(state.updated_at, failed, "no check is on record");
+    assert_eq!(state.check_build, 0, "nor the build that made one");
+    assert_eq!(tick(&mut notice, &due), None, "no check ran");
+
+    let mut checked = state;
+    checked.updated_at = "2026-09-28T15:00:00Z".into();
+    checked.outcome = "Up to date".into();
+    f.context.save(&checked).unwrap();
+    assert_eq!(
+        tick(
+            &mut notice,
+            &(status_in(Ok(&f.context), 11), Record::Kept, true)
+        ),
+        Some((
+            crate::HEALTH_RECOVERED_TITLE.to_string(),
+            "manifest".to_string()
+        ))
+    );
+}
+
+/// A PASS THAT FAILED BEFORE THE LOCK SAYS
+/// NOTHING OF IT, through the loop's own pass (`check_recording_in`) on the fixture copy.
+/// Another aterm holds the copy's update lock (a stopped `aterm update check`), and the
+/// window was told after two hours of busy passes. One pass then finds the window's
+/// settings unreadable (its main-thread answer timed out): it fails before it reaches
+/// the lock, so it took no lock, and the notice it is handed must stay standing. A pass
+/// that takes the lock once the holder is gone answers it.
+///
+/// FAILS WITHOUT THE FIX: the settings failure announced "updates work again" while
+/// the lock was still held.
+#[test]
+fn a_pass_that_never_reached_the_lock_does_not_say_it_came_free() {
+    use crate::linux_notice::{Announcer, Pass, Record};
+    let tick = |notice: &mut Announcer,
+                (status, record, took_lock): &(crate::UpdateStatus, Record, bool)| {
+        notice.tick(Pass {
+            outcome: &status.outcome,
+            failing_checks: status.failing_checks,
+            updated_at: &status.updated_at,
+            record: *record,
+            took_lock: *took_lock,
+        })
+    };
+    let mut f = Fixture::new();
+    // No check is due, so the pass that takes the lock reads no channel.
+    f.state.check_owner = "alabsystems".into();
+    f.state.check_repo = "aterm".into();
+    f.state.next_check_unix = i64::MAX;
+    f.context.save(&f.state).unwrap();
+    let mut notice = Announcer::new("2026-09-28T10:00:00Z".into());
+    let holder = another_aterm_holds_the_lock(&f);
+    let busy = check_recording_in(Ok(&f.context), 10, &settings_provider(false), false);
+    assert_eq!(
+        (busy.1, busy.2),
+        (Record::Busy, false),
+        "{}",
+        busy.0.outcome
+    );
+    let said = (0..120)
+        .filter_map(|_| tick(&mut notice, &busy))
+        .collect::<Vec<_>>();
+    assert_eq!(said.len(), 1, "PRECONDITION: the lock's notice is said");
+
+    let unreadable: crate::CheckSettingsProvider = std::sync::Arc::new(|| None);
+    let stalled = check_recording_in(Ok(&f.context), 10, &unreadable, false);
+    assert_eq!(
+        (stalled.1, stalled.2),
+        (Record::Lost, false),
+        "a failure before the lock: {}",
+        stalled.0.outcome
+    );
+    assert_eq!(
+        tick(&mut notice, &stalled),
+        None,
+        "no recovery while the lock is held"
+    );
+
+    drop(holder);
+    let freed = check_recording_in(Ok(&f.context), 10, &settings_provider(false), false);
+    assert!(freed.2, "the pass took the lock: {}", freed.0.outcome);
+    assert_eq!(
+        tick(&mut notice, &freed),
+        Some((
+            crate::HEALTH_RECOVERED_TITLE.to_string(),
+            "manifest".to_string()
+        )),
+        "the lock came free"
+    );
+}
+
+/// Leave a full-size temp named as `stem`'s writer names it, as a process killed in
+/// the middle of writing it does.
+fn leave_temp(f: &Fixture, stem: &str) -> PathBuf {
+    let path = f.context.dir.join(format!(
+        "{stem}-{}",
+        aterm_uds::rand::hex_token::<16>().unwrap()
+    ));
+    fs::write(&path, vec![7u8; 1 << 20]).unwrap();
+    path
+}
+
+/// WHAT A KILLED WRITER LEFT IN THE UPDATE
+/// FOLDER IS REMOVED. Closing the tab whose session's loop was downloading, or quitting
+/// the window, killed the process with `download-<nonce>` half written (up to the
+/// executable's size, about 100 MB); the next check used a fresh nonce, so each
+/// interrupted download of each release left another. So did a killed probe, record
+/// write or bootstrap copy. Every writer of those names holds the copy's update lock
+/// while the file exists, so one found under the lock is a dead writer's, and the
+/// next install, check or rollback removes it.
+///
+/// FAILS WITHOUT THE FIX: all of them remain after the install.
+///
+/// NEGATIVE CONTROL: names no writer makes, and the stage itself, stay.
+#[test]
+fn what_a_killed_writer_left_in_the_update_folder_is_removed() {
+    let mut f = Fixture::new();
+    let stems = [
+        "download",
+        "restore",
+        "probe-output",
+        "probe-error",
+        "record",
+        "bootstrap",
+    ];
+    let left: Vec<_> = stems.iter().map(|stem| leave_temp(&f, stem)).collect();
+    let kept = [
+        f.context.dir.join("download-notes"),
+        f.context.dir.join(format!("download-{}", "A".repeat(32))),
+        f.context.dir.join(format!("downloaded-{}", "a".repeat(32))),
+    ];
+    for path in &kept {
+        fs::write(path, b"not a temp").unwrap();
+    }
+    f.apply().unwrap();
+    for path in &left {
+        assert!(!path.exists(), "{} remains", path.display());
+    }
+    for path in &kept {
+        assert!(path.exists(), "{} was removed", path.display());
+    }
+}
+
+/// A ROLLBACK COPY THAT FAILED IS REMOVED. A
+/// crash-looping build past its budget rolls back at a start, copying the kept build to
+/// `restore-<nonce>` first; a copy that failed (the disk full, `EFBIG`) or did not
+/// match was left behind, and every later start retried and left another, each using
+/// up whatever space the person had just freed. The writer now removes its own temp
+/// when it fails ([`fresh_written`]), and the rollback sweeps what a killed one left.
+///
+/// FAILS WITHOUT THE FIX: the earlier start's partial copy remains.
+#[test]
+fn a_failed_rollback_copy_is_removed() {
+    let mut f = Fixture::new();
+    let failed = fresh_written(&f.context.dir, "restore", |file, _| {
+        file.write_all(&[7u8; 4096]).map_err(|e| e.to_string())?;
+        Err("File too large (os error 27)".into())
+    });
+    assert_eq!(failed, Err("File too large (os error 27)".to_string()));
+    let restores = |f: &Fixture| {
+        fs::read_dir(&f.context.dir)
+            .unwrap()
+            .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+            .filter(|name| name.starts_with("restore-"))
+            .count()
+    };
+    assert_eq!(restores(&f), 0, "the failed writer removed its own temp");
+
+    f.apply().unwrap();
+    let partial = leave_temp(&f, "restore");
+    let mut start = 0;
+    while window_start(&f, minute(start)) {
+        start += 1;
+    }
+    assert_eq!(f.context.read_state().unwrap().unwrap().installed.build, 10);
+    assert!(
+        !partial.exists(),
+        "the earlier start's partial copy remains"
+    );
+    assert_eq!(restores(&f), 0);
+}
+
+/// A RELEASE THIS SYSTEM CANNOT RUN SAYS WHY.
+/// The channel publishes a build linked against a newer glibc than this distro has.
+/// Its identity probe never starts: the dynamic loader prints "version `GLIBC_2.39'
+/// not found" and exits, and the check failed with "identity probe exited exit status:
+/// 127", the loader's words deleted unread. Nobody could tell from the window's notice
+/// or `aterm update status` that the build cannot run here. The probe's first line of
+/// stderr is now the reason, and a loader's refusal is named as one.
+///
+/// FAILS WITHOUT THE FIX: the refusal does not name GLIBC_2.99.
+#[test]
+fn a_candidate_the_loader_refuses_says_why() {
+    let f = Fixture::new();
+    let manifest = Manifest::parse(std::str::from_utf8(&f.proof.appcast).unwrap()).unwrap();
+    let script = f.root.join("identity-probe");
+    let probe = |body: &str| {
+        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        probe_candidate(
+            &script,
+            &manifest,
+            native().unwrap(),
+            &f.context.dir,
+            aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap_err()
+    };
+    let refused = probe(
+        "echo \"$0: /lib/x86_64-linux-gnu/libc.so.6: version \\`GLIBC_2.99' not found \
+         (required by $0)\" >&2\nexit 127",
+    );
+    assert_eq!(
+        refused,
+        "aterm 0.11.0 can\u{2019}t run on this system: /lib/x86_64-linux-gnu/libc.so.6: \
+         version `GLIBC_2.99' not found"
+    );
+    assert!(!refused.contains(&*script.to_string_lossy()), "{refused}");
+    // A missing symbol version that is not glibc's is a loader refusal too.
+    let refused = probe(
+        "echo \"$0: /usr/lib/libstdc++.so.6: version \\`CXXABI_1.3.15' not found \
+         (required by $0)\" >&2\nexit 127",
+    );
+    assert_eq!(
+        refused,
+        "aterm 0.11.0 can\u{2019}t run on this system: /usr/lib/libstdc++.so.6: \
+         version `CXXABI_1.3.15' not found"
+    );
+    // Any other failure keeps its status, and says what it said.
+    let refused = probe("echo 'unknown command: identity' >&2\nexit 2");
+    assert_eq!(
+        refused,
+        "aterm 0.11.0 failed when checked here (exit status: 2): unknown command: identity"
+    );
+    let refused = probe("exit 3");
+    assert_eq!(
+        refused,
+        "aterm 0.11.0 failed when checked here (exit status: 3)"
+    );
+    assert!(fs::read_dir(&f.context.dir).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("probe-")
+    }));
+}
+
+/// A RELEASE WHOSE PROBE FAILED IS NOT
+/// DOWNLOADED AGAIN. A failed probe stages nothing, and only a stage on record was
+/// reused, so every check downloaded the same signed bytes again (about 100 MB, after
+/// 1 h, 2 h, 4 h, then every 8 h) until a runnable release shipped. The candidate the
+/// probe refused is still the release's bytes, so a check of the same release probes
+/// it again instead (cheap, and it installs once the system can run it).
+///
+/// FAILS WITHOUT THE FIX: the refused candidate is not reusable.
+///
+/// NEGATIVE CONTROL: a candidate that is not the release's bytes is downloaded again.
+#[test]
+fn a_release_whose_probe_failed_is_not_downloaded_again() {
+    let mut f = Fixture::new();
+    let provider = settings_provider(true);
+    let source = provider().unwrap().source;
+    let pins = Pins {
+        masters: &[&f.master],
+    };
+    let manifest = Manifest::parse(std::str::from_utf8(&f.proof.appcast).unwrap()).unwrap();
+    let refused = finish_candidate(
+        &f.context,
+        &mut f.state,
+        &f.proof,
+        pins,
+        &source,
+        &provider,
+        |_, manifest, _| {
+            Err(format!(
+                "aterm {} can\u{2019}t run on this system: version `GLIBC_2.99' not found",
+                manifest.version
+            ))
+        },
+    );
+    assert!(refused.is_err());
+    assert!(f.state.staged.is_none(), "nothing is staged");
+    assert!(reusable_stage(
+        &f.context,
+        &f.state,
+        &manifest,
+        native().unwrap()
+    ));
+    // The system can run it now: the next check installs the bytes already here.
+    finish_candidate(
+        &f.context,
+        &mut f.state,
+        &f.proof,
+        pins,
+        &source,
+        &provider,
+        |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(f.state.installed.build, 11);
+
+    let g = Fixture::new();
+    let mut bytes = fs::read(g.context.dir.join("candidate")).unwrap();
+    bytes[100] ^= 1;
+    fs::write(g.context.dir.join("candidate"), bytes).unwrap();
+    assert!(!reusable_stage(
+        &g.context,
+        &g.state,
+        &manifest,
+        native().unwrap()
+    ));
 }

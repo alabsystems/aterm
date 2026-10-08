@@ -3,16 +3,9 @@
 
 //! `aterm-png` — first-party PNG decode and encode, replacing the `png` crate.
 //!
-//! ## Why
-//!
-//! `png` cost 33,439 lines across SEVEN packages (`png`, `flate2`,
-//! `miniz_oxide`, `fdeflate`, `simd-adler32`, `crc32fast`, `adler2`) for a
-//! surface aterm uses narrowly and knows exactly: decode an 8-bit image to RGBA,
-//! and encode an RGB/RGBA/indexed framebuffer. Most of that tonnage is the
-//! DEFLATE stack, and aterm already carried half of it — `aterm_codec::inflate`
-//! — for its own reasons. This crate supplies the PNG container, the filters,
-//! and the compressor half that was missing, and reuses the inflate that was
-//! already there rather than importing a second one.
+//! Covers what aterm uses: decode any base PNG to its samples or RGBA, and
+//! encode 8-bit framebuffers. Inflate is `aterm_codec::inflate`; this crate
+//! adds the container, the filters and the compressor.
 //!
 //! ## Scope, stated as limits
 //!
@@ -21,9 +14,7 @@
 //! INDEXED with a `tRNS` chunk; Apple sbix are RGBA), user wallpapers, inline
 //! images pasted into the terminal, and AppKit's own window-capture output.
 //! So: all five colour types, bit depths 1/2/4/8/16, `PLTE`, `tRNS`, and Adam7
-//! interlacing. Adam7 is IMPLEMENTED rather than refused precisely because a
-//! user's wallpaper is allowed to be interlaced and refusing it would be a
-//! silent regression.
+//! interlacing (a wallpaper may be interlaced).
 //!
 //! What is NOT here, and is not needed: `gAMA`/`iCCP` colour management,
 //! animation (APNG), 16-bit OUTPUT (every consumer takes `STRIP_16`), and
@@ -33,53 +24,43 @@
 //!
 //! ## Malformed input: render it, do not refuse it
 //!
-//! The inputs are not aterm's to choose, so the default on a file that breaks a
-//! rule is to produce the same picture the retired crate produced, not to
-//! refuse. A colour-emoji strike with one stray palette index used to make the
-//! whole glyph disappear; that is a worse failure than one wrong pixel. So an
-//! index past `PLTE` renders opaque black, a `tRNS` longer than the palette is
-//! ignored, a `tRNS` colour key is masked to the sample width, a zero-length
-//! chunk is absent rather than present-and-empty, and bytes after the end of the
-//! zlib stream inside `IDAT` are simply not part of it. Each of those is pinned
-//! by a differential test naming the case.
+//! A file that breaks a pixel-level rule renders as the retired `png` crate
+//! rendered it: one wrong pixel beats a blank emoji glyph. So an index past
+//! `PLTE` renders opaque black, a `tRNS` longer than the palette is ignored, a
+//! `tRNS` colour key is masked to the sample width, a zero-length chunk is
+//! absent, and bytes after the end of the zlib stream inside `IDAT` are not
+//! part of it. Each is pinned by a test naming the case.
 //!
-//! Structure is where it stays strict, because the retired crate was: a
-//! duplicate `PLTE`, a `tRNS` before `PLTE` and `IDAT` chunks interrupted by
-//! another chunk are all REFUSED, as they were before.
+//! Structure stays strict, as `png` was: a duplicate `PLTE`, a `tRNS` before
+//! `PLTE` and `IDAT` chunks interrupted by another chunk are refused.
 //!
-//! There is ONE deliberate divergence, and it is a memory bound rather than a
-//! format opinion. Image data that decompresses to more than the header's
-//! geometry plus one maximal DEFLATE stored block (65,535 bytes — the largest
-//! single block of padding an encoder can emit) is refused with
-//! [`DecodingError::ExcessImageData`]. `png` decodes such a file, because it
-//! stops reading once it has enough rows. The excess is unbounded and nothing
-//! will ever read it, so it is treated as a decompression bomb; the separate
-//! error exists so it is never reported as corruption.
+//! One deliberate divergence, a memory bound: image data that decompresses to
+//! more than the header's geometry plus one maximal DEFLATE stored block
+//! (65,535 bytes, the largest single block of padding) is refused with
+//! [`DecodingError::ExcessImageData`] (`png` stopped reading once it had its
+//! rows). The excess is unbounded, so it is treated as a decompression bomb,
+//! with its own error so it is never reported as corruption.
 //!
 //! Encoding covers what aterm writes: 8-bit Grayscale/RGB/RGBA/Indexed with
 //! optional `PLTE`/`tRNS`/`sRGB`. See [`deflate`] for the compressor's
 //! deliberate ratio trade.
 //!
-//! ## The oracle
+//! ## Tests
 //!
-//! `png` is kept as a `[dev-dependencies]` ORACLE. `tests/oracle.rs` asserts
-//! byte-identical decoded buffers over the repository's own 969-file PNG corpus
-//! and over a synthesized matrix covering every (colour type x bit depth x
-//! interlace x tRNS x palette length) combination the format allows — under all
-//! FOUR points of the public transform surface, not merely the pair the shipped
-//! call sites use, because a chunk that promotes Rgb to Rgba changes the output
-//! SHAPE and only `EXPAND` alone can see it. It cross-decodes every encoder
-//! output with `png` and every `png` output with this decoder, and it carries a
-//! named case for each malformed-input rule above. See that file's header for
-//! what each check pins.
+//! `tests/decode_encode.rs` pins the decoded output of a synthesized matrix
+//! covering every (colour type x bit depth x interlace x tRNS x palette length)
+//! combination under all four transform settings (byte-identical to `png`'s),
+//! and a named case for each malformed-input rule above.
 
 mod checksum;
 mod decode;
 mod deflate;
 mod encode;
+mod rgba;
 
 pub use decode::{Decoder, Reader};
 pub use encode::{Encoder, Writer};
+pub use rgba::decode_rgba8;
 
 /// How samples are laid out per pixel. The discriminants are PNG's own IHDR
 /// colour-type codes, so the wire value and the enum are the same number.
@@ -237,9 +218,10 @@ impl std::ops::BitOr for Transformations {
 ///
 /// A few hundred bytes of PNG can declare a 4-gigapixel image; the point of this
 /// is that such a file is REFUSED before anything is allocated for it, rather
-/// than aborting the process on a failed allocation. Checked against the
-/// decompressed scanline buffer and the output buffer, both computed from the
-/// header before either exists.
+/// than aborting the process on a failed allocation. Checked against the output
+/// buffer, computed from the header before it exists: the image data is
+/// inflated a scanline at a time, so nothing else a decode allocates grows with
+/// the image.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     /// Maximum bytes the decoder may allocate for one image.
@@ -248,8 +230,7 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        // The `png` crate's own default, so a consumer that sets no limit gets
-        // the same admission decisions it did before.
+        // The `png` crate's default.
         Self {
             bytes: 1024 * 1024 * 64,
         }
@@ -360,8 +341,7 @@ impl std::fmt::Display for DecodingError {
 
 impl std::error::Error for DecodingError {}
 
-/// Lets a decode sit inside an `io::Result` chain with `?`, as the retired
-/// crate's error did — several dump/capture helpers are written that way.
+/// Lets a decode sit inside an `io::Result` chain with `?`.
 impl From<DecodingError> for std::io::Error {
     fn from(e: DecodingError) -> Self {
         let text = e.to_string();
@@ -404,9 +384,7 @@ impl std::fmt::Display for EncodingError {
 
 impl std::error::Error for EncodingError {}
 
-/// The encoding twin of the conversion above: `write_header()?` inside a
-/// function returning `io::Result<()>` is the shape every gallery/dump helper
-/// in the tree uses.
+/// Lets an encode sit inside an `io::Result` chain with `?`.
 impl From<EncodingError> for std::io::Error {
     fn from(e: EncodingError) -> Self {
         let text = e.to_string();

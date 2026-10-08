@@ -164,9 +164,8 @@ fn the_renderer_spells_no_pipeline_state_of_its_own() {
     );
 }
 
-/// The shipping Metal path reads the same rows. `metal/blit.rs` used to spell
-/// the blit's write mask and blend by hand, citing `renderer.rs` LINE NUMBERS
-/// in a comment — which is documentation, not coupling, and goes stale silently.
+/// The shipping Metal path reads the same rows: `metal/blit.rs` spells no
+/// write mask or blend of its own.
 #[test]
 fn the_metal_blit_spells_no_pipeline_state_of_its_own() {
     assert!(

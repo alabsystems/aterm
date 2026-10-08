@@ -18,5 +18,25 @@ description = "aterm's unified message engine — the platform-neutral model, gl
 # construction and links nothing the wasm canary would have to pin.
 aterm-time = { workspace = true }
 
+# Tier-1 binds (AGENTS.md, derived models): the tests drive the shipping
+# `MessageCenter` in lock step with a `ty_model!` model. aterm-spec depends only
+# on aterm-spec-macros, so there is no cycle, and a dev-dependency
+# is not linked into the library (the wasm canary still sees one dependency).
+[dev-dependencies]
+aterm-spec = { workspace = true }
+# TEST-ONLY: the control wire's percent escape, the encoder every host injects
+# as `enc` (`aterm_control::wire::pct_encode` re-exports it), so the tests pin
+# the bytes the socket carries. Dev-dependencies never enter the shipped or
+# wasm32 graph; the crate's one dependency above is unchanged.
+aterm-codec = { workspace = true }
+
+# The seal on a persistent hold (`Hold::Standing`, `Hold::Ask`) has no public
+# constructor, so a HOST's fixture that needs a bare persistent row cannot write
+# one. This feature (a dev-dependency of the hosts, off in every shipped build)
+# gives them `Hold::STANDING` / `Hold::asking(..)` and lends a fixture the
+# adopted ask the engine's own tests get, so it stands exactly as it did.
+[features]
+test-fixtures = []
+
 [lints]
 workspace = true

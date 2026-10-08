@@ -1,27 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE OWNER'S TWO COMPOSER GAPS, AND THE RAINBOW LIT THROUGH BOTH**
-//! (the owner's screenshots of 2026-09-25).
+//! Two composer gaps, and the rainbow lit through both.
 //!
-//! Claude Code's composer at the owner's 113 columns, modelled row for row:
-//! the text wraps at `COLS - 4`, the box is bottom-anchored between its two
-//! rules and grows UP a row when the text needs one more. Keys are stamped at
-//! the press; the app echoes each one LATE and batched, and aterm's frames
-//! run on a 16.7 ms train.
+//! Claude Code's composer at 113 columns, modelled row for row: the text wraps
+//! at `COLS - 4`, the box is bottom-anchored between its two rules and grows up
+//! a row when the text needs one. Keys are stamped at the press; the app echoes
+//! each late and batched, and aterm's frames run on a 16.7 ms train.
 //!
-//! * `wit hthe▯cu [Image #1]`: typing BEFORE a trailing `[Image #1]`, the
-//!   Space after `hthe` pushed the placeholder onto a new row; the box grew in
-//!   the SAME frame the Space echoed, and the caret moved `(R, c) → (R-1,
-//!   c+1)` before the follow pass had seen the text move. That echo had no
-//!   sweep to lay it (`rainbow_kitty::Engine::lay_crossed_echo`).
-//! * `interrupted`, wrapped while the app STALLED: only its `i` had echoed
-//!   when the word wrapped, and the rest came in ONE late repaint, so the
-//!   relay placed a one-letter word before the caret and the batch's cells
-//!   stayed dark (`rainbow_kitty::Ribbon::note_rewrap_start`: the landing
-//!   row's own sample says where the relaid text starts).
+//! * `wit hthe▯cu [Image #1]`: typing before a trailing `[Image #1]`, the Space
+//!   after `hthe` pushes the placeholder onto a new row; the box grows in the
+//!   same frame the Space echoes, and the caret moves `(R, c) → (R-1, c+1)`
+//!   before the follow pass sees the text move. That echo is laid by
+//!   `rainbow_kitty::Engine::lay_crossed_echo`.
+//! * `interrupted`, wrapped while the app stalls: only its `i` has echoed when
+//!   the word wraps, and the rest comes in one late repaint.
+//!   `rainbow_kitty::Ribbon::note_rewrap_start` reads where the relaid text
+//!   starts from the landing row's own sample, so the batch's cells are lit.
 //!
-//! NON-VACUITY: each case asserts the move it exists for really happened.
+//! Non-vacuity: each case asserts the move it exists for really happened.
 
 #![allow(
     dead_code,
@@ -781,9 +778,9 @@ fn a_space_that_grows_the_box_lights_its_own_cell() {
     }
 }
 
-/// The owner's first screen, stalled: `interrupted` typed at the end of the
-/// second line; its `n`'s echo held `stall` ms, so the wrap's repaint brings
-/// the whole word at once.
+/// The first screen, stalled: `interrupted` typed at the end of the second
+/// line; its `n`'s echo held `stall` ms, so the wrap's repaint brings the
+/// whole word at once.
 fn interrupted_wrapped_in_a_stall(gap: u64, stall: u64, at_key: usize) -> Sim {
     let mut s = Sim::new("workspace");
     s.verbose = true;

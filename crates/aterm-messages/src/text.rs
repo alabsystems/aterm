@@ -9,24 +9,17 @@
 
 use crate::{GLASS_TITLE_CHARS, GLASS_TITLE_WORDS, PIECE_SEP};
 
-/// Strip control characters (terminal escape-sequence injection) and the
-/// invisible FORMAT characters a spoof rides on — the bidi overrides,
-/// isolates and marks (U+202A–U+202E, U+2066–U+2069, U+061C), the
-/// zero-width joiners, spaces and marks (U+200B–U+200F, U+FEFF), the word
-/// joiner and invisible operators (U+2060–U+2064), the deprecated format
-/// controls (U+206A–U+206F), the soft hyphen (U+00AD), the Mongolian vowel
-/// separator (U+180E), the interlinear annotation controls (U+FFF9–U+FFFB),
-/// the tag characters (U+E0001, U+E0020–U+E007F), every noncharacter
-/// (U+FDD0–U+FDEF and each plane's last two) and the line and paragraph
-/// separators (U+2028, U+2029) — then cap length before a string reaches a
-/// cell (design ruling 196: an invisible character inside `Build:` would
-/// get a clause past the glass title form). The
-/// cap is in characters, applied after the strip; an elided tail is marked
-/// with `…` — so an elided result is `cap + 1` chars long, the
-/// `atpkg::progress::sanitize_for_tty` shape (re-implemented here so the
-/// crate takes no dependency on it; the format-character strip is this
-/// crate's own hardening, because the band prints paths and commands that a
-/// reversed run could forge, and the log page copies them to a clipboard).
+/// Strip control characters (escape-sequence injection) and the invisible
+/// format characters a spoof rides on ([`is_stripped`]: bidi controls,
+/// zero-width characters, tag characters, noncharacters, line and paragraph
+/// separators), then cap length before a string reaches a cell (design
+/// ruling 196: an invisible character inside `Build:` would get a clause
+/// past the glass title form). The cap is in characters, applied after the
+/// strip; an elided tail is marked `…`, so an elided result is `cap + 1`
+/// chars — the `atpkg::progress::sanitize_for_tty` shape, re-implemented to
+/// avoid the dependency. The format strip is this crate's own: the band
+/// prints paths and commands a reversed run could forge, and the log page
+/// copies them to a clipboard.
 #[must_use]
 pub(crate) fn sanitize(s: &str, cap: usize) -> String {
     let mut out = String::with_capacity(s.len().min(cap.saturating_add(4)));
@@ -42,7 +35,7 @@ pub(crate) fn sanitize(s: &str, cap: usize) -> String {
 
 /// A control character, or one of the invisible format characters that
 /// re-orders or hides what follows it.
-fn is_stripped(c: char) -> bool {
+pub(crate) fn is_stripped(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
@@ -64,8 +57,8 @@ fn is_stripped(c: char) -> bool {
         || u32::from(c) & 0xfffe == 0xfffe
 }
 
-/// `s` in at most `max` chars, the last one `…` when it was cut
-/// (`status_bars.rs:2645`). `max == 0` is the empty string.
+/// `s` in at most `max` chars, the last one `…` when it was cut. `max == 0`
+/// is the empty string.
 #[must_use]
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     let n = s.chars().count();
@@ -151,7 +144,7 @@ pub fn char_width(s: &str) -> usize {
     s.chars().count()
 }
 
-/// A detail that ALWAYS keeps its command, and now its file name. Sanitized
+/// A detail that ALWAYS keeps its command and its file name. Sanitized
 /// like every other cell string; when longer than `cap`, a detail made of
 /// ` · `-joined pieces first sheds its trailing pieces WHOLE, last piece
 /// first, down to the piece that holds the command sentence. Still too long,
@@ -161,7 +154,7 @@ pub fn char_width(s: &str) -> usize {
 /// (`~/…` or `/…`, no spaces) has the path cut from the LEFT keeping the
 /// file name ([`shape_path`]); plain prose is cut on a word boundary. The
 /// result is at most `cap` chars, ellipsis included. Pure, so the width law
-/// is testable on literal values (ported from status_bars.rs:329-405).
+/// is testable on literal values.
 #[must_use]
 pub fn shape_detail(detail: &str, cap: usize) -> String {
     let mut clean = sanitize(detail, usize::MAX);
@@ -169,12 +162,10 @@ pub fn shape_detail(detail: &str, cap: usize) -> String {
         return clean;
     }
     // A CORRECTION — `windw_padding → window_padding` — cut is the right
-    // side alone (design ruling 261): the fix is what the person types, and
-    // a cut that kept the typo kept the one word that is wrong. Its ARROW
-    // stays (ruling 306: `Misspelled setting · window_padding` named the
-    // right spelling as the misspelled one), and a fix too long for the cap
-    // with it is not cut — a clipped key is a key that is not there — but
-    // dropped whole.
+    // side alone (design ruling 261): the fix is what the person types. Its
+    // ARROW stays (ruling 306), so the fix never reads as the misspelling,
+    // and a fix too long for the cap is dropped whole, never clipped: a
+    // clipped key is a key that is not there.
     if let Some((_, fix)) = clean.split_once(" \u{2192} ")
         && !fix.contains(" \u{2192} ")
         && !fix.trim().is_empty()
@@ -225,11 +216,11 @@ pub fn shape_detail(detail: &str, cap: usize) -> String {
 const MIN_HEAD_WORDS: usize = 2;
 const MIN_HEAD_CELLS: usize = 12;
 
-/// An excerpt's LEAD CLAUSE — its words before its first joint, a `: ` or
-/// the ` · ` that ends its first piece, whichever comes first — where they
-/// are a whole statement on their own (design rulings 402 and 404; round
-/// 38, day ten, D3, and its review): at least [`MIN_HEAD_WORDS`] words and
-/// [`MIN_HEAD_CELLS`] cells, with no command quoting, and words after it.
+/// An excerpt's LEAD CLAUSE — its words before its first joint, a `: ` or the
+/// ` · ` that ends its first piece, whichever comes first — where they are a
+/// whole statement on their own (design rulings 402 and 404): at least
+/// [`MIN_HEAD_WORDS`] words and [`MIN_HEAD_CELLS`] cells, with no command
+/// quoting, and words after it.
 /// `behind for 7 h: its turn is still running` → `behind for 7 h`; `tab 1
 /// for 7 h · tab 3 for 2 h` → `tab 1 for 7 h`; `was: …`, `line 3: …` and
 /// `tab 1 · …` say nothing alone, and half a quoted command is never kept.
@@ -281,11 +272,8 @@ fn keep_command(clean: &str, command: usize, cap: usize) -> String {
             out.truncate(space);
         }
         out = out.trim_end().to_string();
-        // A cut head is a CLAUSE or nothing: fewer than two words, or fewer
-        // than twelve cells, and the count stands without what it counts
-        // ("1… `…`", the installed row at 80 cols once ruling 19 took the
-        // meter and left it room for a detail) — the prose goes whole and
-        // the command stands alone.
+        // A cut head is a CLAUSE or nothing: below two words or twelve
+        // cells ("1… `…`") the prose goes whole and the command stands alone.
         if out.split_whitespace().count() < MIN_HEAD_WORDS || char_width(&out) < MIN_HEAD_CELLS {
             return tail.to_string();
         }
@@ -303,7 +291,12 @@ fn keep_command(clean: &str, command: usize, cap: usize) -> String {
     let kept = shaped
         .strip_suffix('\u{2026}')
         .map_or(shaped.len(), str::len);
-    let command_len = tail[1..].find('`').map(|close| close + 2);
+    // The command runs to the backtick CLOSING the first one in the tail —
+    // after `Run ` when the anchor is a `Run \`…\`` sentence, where the tail
+    // does not start at the backtick (ruling 415).
+    let command_len = tail
+        .find('`')
+        .and_then(|open| tail[open + 1..].find('`').map(|close| open + 1 + close + 1));
     if command_len.is_some_and(|len| kept >= len) {
         shaped
     } else {
@@ -443,8 +436,7 @@ pub(crate) fn trim_words(s: &str, cap: usize) -> String {
 
 /// The WORDS of a title: whitespace tokens carrying a letter, so a route's
 /// `▸`, a name's `&` and a bare number — the `2` of `in tab 2` — spend no
-/// word (review 2026-09-24; the strain row's `Typing slowed by yes in tab 2`,
-/// design ruling 207).
+/// word (design ruling 207).
 #[must_use]
 pub fn title_words(title: &str) -> usize {
     title
@@ -562,9 +554,7 @@ mod tests {
         // Hostile text is sanitized first.
         assert_eq!(split_sentence("a\u{1b}[31mb", 240), vec!["a[31mb"]);
         // A sentence of any length is one pass (each cut looks at its own head
-        // only): four megabytes of words — thousands of lines — split and
-        // rejoin exactly; searched and re-measured whole per line, as the first
-        // cut did, this was quadratic and ran for minutes.
+        // only): megabytes of words split and rejoin exactly, in linear time.
         let huge: String = (0..400_000)
             .map(|n| format!("w{n}"))
             .collect::<Vec<_>>()
@@ -631,9 +621,9 @@ mod tests {
         }
     }
 
-    /// Invariant 15b (port of status_bars.rs:4991 / :5067): a detail of ` · `
-    /// pieces sheds its trailing pieces WHOLE before it cuts inside one; a
-    /// cut detail keeps its command and the prose carries the ellipsis.
+    /// Invariant 15b: a detail of ` · ` pieces sheds its trailing pieces WHOLE
+    /// before it cuts inside one; a cut detail keeps its command and the prose
+    /// carries the ellipsis.
     #[test]
     fn a_command_survives_the_cut() {
         let pointer = "undo: `aterm pkg doctor` prints the revert";
@@ -648,7 +638,7 @@ mod tests {
         }
         // Narrower than the pointer: the cut lands inside the pointer, on a
         // WORD, with its command whole — never the front of the revert and
-        // never a mid-word stub (`prints the reve…`, review 2026-09-22).
+        // never a mid-word stub (`prints the reve…`).
         assert_eq!(
             shape_detail(&detail, 35),
             "`aterm pkg doctor` prints the\u{2026}"
@@ -676,18 +666,9 @@ mod tests {
         assert_eq!(d.chars().count(), 12);
     }
 
-    /// A CUT HEAD IS A CLAUSE OR NOTHING (review 2026-09-22). With the meter
-    /// gone from the installed row (ruling 19) the 80-col row had room for a
-    /// detail, and the cut read "1… `. ~/.aterm/shell.d/00-atpkg.zsh`": the
-    /// count without its clause, in front of the command — exactly the
-    /// reading the pill's own pin forbade (`lib.rs`
-    /// `the_pills_frozen_clause_survives_the_cut_with_its_count`, retired
-    /// with the pill's row by the silent toolchain lane, upstream dbf97ecff;
-    /// the band's `the_frozen_tab_note_keeps_its_command_whole_wherever_it_fits`
-    /// keeps the law on glass).
-    /// A head fragment shorter than two words or twelve cells is dropped
-    /// whole and the command stands alone; a clause survives with the
-    /// ellipsis on the prose, as before.
+    /// A CUT HEAD IS A CLAUSE OR NOTHING: a head fragment shorter than two
+    /// words or twelve cells ("1… `…`") is dropped whole and the command
+    /// stands alone; a clause survives with the ellipsis on the prose.
     #[test]
     fn a_stub_head_gives_way_to_the_command_whole() {
         let command = "`. ~/.aterm/shell.d/00-atpkg.zsh`";
@@ -727,8 +708,8 @@ mod tests {
         }
     }
 
-    /// Invariant 24b (port of status_bars.rs:4894): escape sequences, bells
-    /// and other control characters never reach a cell string.
+    /// Invariant 24b: escape sequences, bells and other control characters
+    /// never reach a cell string.
     #[test]
     fn hostile_text_is_sanitized_before_it_becomes_a_message() {
         let bad = "bad\u{1b}[31m thing\u{7}\r\n\ttail";

@@ -1,28 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LUMEN WAKE release performance gates.
+//! Lumen wake release performance gates.
 //!
 //! ```sh
-//! cargo test -p aterm-effects --release --test cursor_bench -- --ignored --nocapture --test-threads=1
+//! targo --unverified test -p aterm-effects --release --test effects_suite -- cursor_bench:: \
+//!     --ignored --nocapture --test-threads=1
 //! # the same gates on a host with no measurement on record — scales the four
 //! # ABSOLUTE wall-clock bounds only (p90 500 / median 500 / p90 1 000 /
 //! # p90 2 000 µs); the quad caps, shares and fixture checks are never scaled
 //! # (see `common::budget_scale`):
-//! RK_FRAME_COST_BUDGET_SCALE=2 cargo test -p aterm-effects --release --test cursor_bench \
-//!     -- --ignored --nocapture --test-threads=1
+//! RK_FRAME_COST_BUDGET_SCALE=2 targo --unverified test -p aterm-effects --release \
+//!     --test effects_suite -- cursor_bench:: --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! The knob is the one `tests/rainbow_kitty_v2_frame_cost.rs` reads — one name
-//! across both gates, so a host's scale is set once; every red prints the
-//! effective bound beside the reference and the scale it came from.
-
-mod common;
+//! The scale knob is shared with `tests/rainbow_kitty_v2_frame_cost.rs`; every
+//! red prints the effective bound beside the reference and its scale.
 
 use std::time::{Duration, Instant};
 
+use crate::common::{BUDGET_SCALE_VAR, budget_scale, scaled_budget_us};
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use common::{BUDGET_SCALE_VAR, budget_scale, scaled_budget_us};
 
 const ITERATIONS: usize = 300;
 
@@ -166,7 +164,7 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture, min_total
 /// day — so the floor follows the design: 3,600 is 11% under the lowest
 /// post-merge reading.
 #[test]
-#[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
+#[ignore = "perf gate: run manually: --release --test effects_suite -- cursor_bench:: --ignored --nocapture --test-threads=1"]
 fn bench_cursor_rainbow_frozen_sweep_baseline() {
     benchmark_with(
         GlowStyle::RainbowKitty,
@@ -184,9 +182,8 @@ fn bench_cursor_rainbow_frozen_sweep_baseline() {
 /// it cannot observe geometry growth after the deliberate budget edge. It is
 /// deliberately harsher than a claim about ordinary human cadence.
 ///
-/// This is the deterministic half of that gate: a normal test run checks the
-/// amount of real render work, not a host scheduler's clock. The release-only
-/// timing probe below is deliberately supplementary.
+/// The deterministic half: checks the amount of render work, not host timing;
+/// the release-only timing probe below is supplementary.
 #[test]
 fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
     let config = config(GlowStyle::RainbowKitty);
@@ -227,14 +224,11 @@ fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
         under > 2_000,
         "fixture must reach the active tall ribbon ({under} quads)"
     );
-    // The ribbon's DECLARED share of `MAX_QUADS`, restated here because a
-    // `tests/` target cannot see the private `RAINBOW_RIBBON_QUAD_BUDGET` the
-    // emitter solves against. It moved `1/2 -> 5/8` on 2026-08-31: at retina
-    // metrics a full-width 100-cell tall line costs ~77 quads per cell even at
-    // one slab, so half the budget made the cap shed the TAIL of exactly the
-    // long lines the owner types (the missing red end). The law this gate
-    // states is unchanged — the ribbon stays inside its own share, and the
-    // frame-wide headroom assert below is what keeps the companions honest.
+    // The ribbon's declared share of `MAX_QUADS` (5/8), restated because a
+    // `tests/` target cannot see `RAINBOW_RIBBON_QUAD_BUDGET`. At retina
+    // metrics a full-width tall line costs ~77 quads per cell, so a smaller
+    // share would shed the tail of long lines. The ribbon stays inside its
+    // share; the frame-wide headroom assert below bounds the companions.
     assert!(
         under * 8 <= 16_384 * 5,
         "default tall ribbon spent more than its five-eighths normalized share: {under}"
@@ -247,7 +241,7 @@ fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
 }
 
 #[test]
-#[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
+#[ignore = "perf gate: run manually: --release --test effects_suite -- cursor_bench:: --ignored --nocapture --test-threads=1"]
 fn bench_cursor_rainbow_hot_ribbon_worstcase() {
     // The shipping-default tall presentation is the renderer's real
     // high-geometry rainbow path. The cold frozen-clock gate above cannot

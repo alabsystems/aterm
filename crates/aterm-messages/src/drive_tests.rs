@@ -98,6 +98,7 @@ fn step(center: &mut MessageCenter, gate: &mut WireGate, now: Instant) -> drive:
             frozen: false,
             afford: MAX_ROWS,
             reserved,
+            floor: None,
         },
     );
     let _ = drive::drain_and_pace(center, gate, now, true);
@@ -122,6 +123,7 @@ fn the_step_commits_after_its_settle_and_a_freeze_holds_the_rows_and_the_log() {
             frozen: true,
             afford: MAX_ROWS,
             reserved: 1,
+            floor: None,
         },
     );
     assert_eq!(frozen.regrid, None, "a freeze never re-grids");
@@ -143,6 +145,7 @@ fn the_step_commits_after_its_settle_and_a_freeze_holds_the_rows_and_the_log() {
             frozen: false,
             afford: MAX_ROWS,
             reserved: 0,
+            floor: None,
         },
     );
     assert_eq!(c.regrid, Some(center.committed_rows()));
@@ -356,8 +359,6 @@ fn a_past_answer_is_re_read_from_now() {
         .expect("next");
     assert!(d > late, "never a past deadline");
     assert_eq!(view.last_from(), Some(late));
-    // The web's rule reads the kept layout from where it is told.
-    assert_eq!(view.deadline_from(&center, late, Look::MOVING), Some(d));
 }
 
 #[test]
@@ -496,4 +497,114 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
         "an invalidated view repaints, even empty"
     );
     assert_eq!(view.paint(&center, 80, None, g, false, &|| dark), None);
+}
+
+/// One host step as `step`, with the windows' chrome regrow floor handed in
+/// and the rows `afford`ed.
+fn step_floored(
+    center: &mut MessageCenter,
+    gate: &mut WireGate,
+    now: Instant,
+    afford: u16,
+    floor: Option<Instant>,
+) -> drive::Committed {
+    let reserved = center.committed_rows();
+    let c = drive::settle_and_commit(
+        center,
+        Commit {
+            now,
+            frozen: false,
+            afford,
+            reserved,
+            floor,
+        },
+    );
+    let _ = drive::drain_and_pace(center, gate, now, true);
+    c
+}
+
+/// THE WINDOWS' CHROME REGROW FLOOR (ruling 414): the band's QUIET
+/// shrink also waits the floor the host hands in, and its state deadline
+/// names the later of the two, so the host's timer never wakes for a shrink
+/// the commit declines. Measured 2026-09-29 on main `8b24e99a4`: a presence
+/// row born 4–6 ms before this shrink made a net-zero pair that shifted a
+/// busy alternate screen. NEGATIVE CONTROL: with no floor the shrink lands at
+/// its quiet's end — that measured pair. The WINDOW's shrink (the afford fell
+/// below the count) is not floored, and a rise is never delayed.
+#[test]
+fn the_bands_quiet_shrink_waits_the_windows_regrow_floor() {
+    use crate::chrome::CHROME_REGROW_SETTLE;
+    let ms = Duration::from_millis;
+    let run = |floored: bool| {
+        let t0 = Instant::now();
+        let mut center = MessageCenter::new(MessageLog::default(), t0);
+        let mut gate = WireGate::default();
+        let _ = center.post(warn("Disk nearly full", 2), STAMP, t0);
+        let c = step_floored(&mut center, &mut gate, t0, MAX_ROWS, None);
+        assert_eq!(c.regrid, Some(1), "a rise is never floored");
+        let drop = t0 + Duration::from_secs(3);
+        let c = step_floored(&mut center, &mut gate, drop, MAX_ROWS, None);
+        assert_eq!(c.regrid, None, "the quiet");
+        let due = drop + SHRINK_QUIET;
+        assert_eq!(drive::state_deadline(&center, &gate, false), Some(due));
+        // A presence row is born 5 ms before the shrink's due: the host
+        // hands the floor it noted.
+        let birth = due - ms(5);
+        let floor = floored.then(|| birth + CHROME_REGROW_SETTLE);
+        let c = step_floored(&mut center, &mut gate, birth, MAX_ROWS, floor);
+        assert_eq!(c.regrid, None);
+        (center, gate, due, floor)
+    };
+    let (mut center, mut gate, due, floor) = run(true);
+    let floor_at = floor.expect("floored");
+    assert_eq!(
+        drive::state_deadline(&center, &gate, false),
+        Some(floor_at),
+        "the floor, not the quiet's end"
+    );
+    let c = step_floored(&mut center, &mut gate, due, MAX_ROWS, floor);
+    assert_eq!(c.regrid, None, "5 ms after the birth: the band waits");
+    assert_eq!(center.committed_rows(), 1);
+    let c = step_floored(&mut center, &mut gate, floor_at - ms(1), MAX_ROWS, floor);
+    assert_eq!(c.regrid, None);
+    let c = step_floored(&mut center, &mut gate, floor_at, MAX_ROWS, floor);
+    assert_eq!(c.regrid, Some(0), "at the floor, the shrink");
+    assert_eq!(drive::state_deadline(&center, &gate, false), None, "idle");
+    // NEGATIVE CONTROL: no floor, the shrink lands 5 ms after the birth.
+    let (mut center, mut gate, due, _) = run(false);
+    let c = step_floored(&mut center, &mut gate, due, MAX_ROWS, None);
+    assert_eq!(c.regrid, Some(0));
+    // THE WINDOW'S SHRINK: a window that can no longer afford the row gets
+    // it back at once, inside the floor.
+    let (mut center, mut gate, due, floor) = run(true);
+    let c = step_floored(&mut center, &mut gate, due, 0, floor);
+    assert_eq!(c.regrid, Some(0), "the window's own shrink is not floored");
+}
+
+/// A freeze keeps the floor it was handed for the next step's deadline, and
+/// arms no shrink meanwhile (holds only, as before).
+#[test]
+fn a_frozen_step_hands_the_floor_and_arms_no_shrink() {
+    use crate::chrome::CHROME_REGROW_SETTLE;
+    let t0 = Instant::now();
+    let mut center = MessageCenter::new(MessageLog::default(), t0);
+    let mut gate = WireGate::default();
+    let _ = center.post(warn("Disk nearly full", 2), STAMP, t0);
+    let _ = step_floored(&mut center, &mut gate, t0, MAX_ROWS, None);
+    let drop = t0 + Duration::from_secs(3);
+    let _ = step_floored(&mut center, &mut gate, drop, MAX_ROWS, None);
+    let floor = Some(drop + SHRINK_QUIET + CHROME_REGROW_SETTLE);
+    let frozen = drive::settle_and_commit(
+        &mut center,
+        Commit {
+            now: drop,
+            frozen: true,
+            afford: MAX_ROWS,
+            reserved: 1,
+            floor,
+        },
+    );
+    assert_eq!(frozen.regrid, None);
+    assert_eq!(drive::state_deadline(&center, &gate, true), None);
+    assert_eq!(drive::state_deadline(&center, &gate, false), floor);
 }

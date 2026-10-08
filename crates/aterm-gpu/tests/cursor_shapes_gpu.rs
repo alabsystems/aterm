@@ -13,21 +13,16 @@
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{Frame, RenderInput, Renderer, Theme};
 
-mod common;
-use common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
+use crate::common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
 
 const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
 const PX: f32 = 18.0;
 
-/// Per-channel closeness to a packed `0x00RRGGBB` colour. Tolerance is 2 LSB, not 1:
-/// at a GLYPH-EDGE pixel the GPU's fixed-function linear blend can round 1 LSB below
-/// the CPU's f64 sRGB blend, and that single LSB is enough to push one edge pixel
-/// across a hard ±1 band — making the exact `cursor_positions` set differ by one
-/// element on some GPUs (reproduced on NVIDIA Blackwell/Vulkan). This is the accepted
-/// sub-perceptual cross-backend AA rounding (the whole-frame parity gate is `delta<=8`
-/// everywhere), NOT a rendering error. ±2 admits only that edge LSB: bg (0x111318) and
-/// fg (0xD0D0D0) sit ~200 LSB from the cursor green, so the flat-fill shape-count
-/// assertions (underline/bar/hollow) still count exactly the same pixels.
+/// Per-channel closeness to a packed `0x00RRGGBB` colour, within 2 LSB: at a
+/// glyph-edge pixel the GPU's fixed-function blend can round 1 LSB below the
+/// CPU's f64 sRGB blend, which on some GPUs moves one edge pixel across a ±1
+/// band. bg (0x111318) and fg (0xD0D0D0) are ~200 LSB from the cursor green,
+/// so the shape-count assertions still count exactly the same pixels.
 fn near_cursor(p: u32) -> bool {
     near_color(p, CURSOR)
 }
@@ -129,9 +124,16 @@ struct Shape {
     inside: fn(usize, usize, usize, usize) -> bool,
 }
 
+/// The rects a `style` cursor paints in a `cw`x`ch` cell at the origin.
+fn cursor_rects(style: CursorStyle, cw: usize, ch: usize) -> Vec<[usize; 4]> {
+    let mut rects = Vec::new();
+    aterm_render::for_each_cursor_rect(style, 0, 0, cw, ch, |rect| rects.push(rect));
+    rects
+}
+
 /// The bolt's per-row strip union (the frontend's laser-lightning override).
 fn bolt_rects(cw: usize, ch: usize) -> Vec<[usize; 4]> {
-    aterm_render::cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch)
+    cursor_rects(CursorStyle::Bolt, cw, ch)
 }
 
 const SHAPES: &[Shape] = &[
@@ -243,7 +245,7 @@ fn gpu_steady_bar_fill_override_matches_cpu_without_theme_flash() {
         "steady-bar override CPU/GPU output diverges by {delta} > 8"
     );
 
-    let rects = aterm_render::cursor_rects(CursorStyle::SteadyBar, 0, 0, cw, ch);
+    let rects = cursor_rects(CursorStyle::SteadyBar, cw, ch);
     let area: usize = rects.iter().map(|&[_, _, w, h]| w * h).sum();
     for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
         assert_eq!(
@@ -285,10 +287,7 @@ fn gpu_effect_shape_precedence_and_clear_overlays_match_cpu() {
     input.cursor_effect_style_override = Some(CursorStyle::Bolt);
 
     let effect = parity_input(&mut cpu, &mut gpu, &mut win, &input, "effect-bolt");
-    let bolt_area: usize = aterm_render::cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch)
-        .iter()
-        .map(|&[_, _, w, h]| w * h)
-        .sum();
+    let bolt_area: usize = bolt_rects(cw, ch).iter().map(|&[_, _, w, h]| w * h).sum();
     assert_eq!(cursor_positions(&effect).len(), bolt_area);
     assert_eq!(input.cursor_style, CursorStyle::SteadyUnderline);
 

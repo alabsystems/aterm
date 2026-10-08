@@ -4,7 +4,7 @@
 
 //! Paragraph direction hint for BiDi text layout.
 //!
-//! Extracted from `aterm-bidi` to break the dependency cycle between
+//! Lives here to break the dependency cycle between
 //! `aterm-core` (which stores `ParagraphDirection` in `TerminalModes`)
 //! and `aterm-bidi` (which implements the resolution algorithm).
 

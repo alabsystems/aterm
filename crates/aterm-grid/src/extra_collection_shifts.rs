@@ -2,11 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Region and column shift operations for [`CellExtras`].
-//!
-//! Extracted from `extra_collection.rs` for file size compliance.
-//! These methods handle scroll-region shifts and insert/delete character
-//! column shifts — all O(E) drain-rebuild since they affect subsets of rows.
+//! Region and column shift operations for [`CellExtras`]: scroll-region
+//! shifts and insert/delete character column shifts, all O(E) drain-rebuild
+//! since they affect subsets of rows.
 
 use aterm_hash::FxHashMap;
 
@@ -23,11 +21,9 @@ impl CellExtras {
     /// Combines offset compaction and region shift into one pass to avoid
     /// the double drain-rebuild that `compact()` + shift would require.
     pub(crate) fn shift_region_up_by(&mut self, top: u16, bottom: u16, n: u16) {
-        // Shift the dense rings (RGB truecolor + complex chars) the SAME way as
-        // the HashMap below, instead of wiping them wholesale. The old wipe
-        // dropped truecolor for EVERY cell — including rows outside the scrolled
-        // region — because ring-only entries are never spilled to the HashMap
-        // (#7458 follow-up: preserve unaffected cells' colors).
+        // Shift the dense rings (RGB truecolor + complex chars) the same way as
+        // the HashMap below; ring-only entries never spill to the HashMap, so a
+        // wholesale wipe would drop truecolor for rows outside the region.
         self.shift_rings_region_up(top, bottom, n);
         if n == 0 || self.data.is_empty() {
             return;
@@ -71,7 +67,7 @@ impl CellExtras {
     /// the double drain-rebuild that `compact()` + shift would require.
     pub(crate) fn shift_region_down_by(&mut self, top: u16, bottom: u16, n: u16) {
         // Shift the dense rings the SAME way as the HashMap — see
-        // shift_region_up_by (#7458 follow-up).
+        // shift_region_up_by.
         self.shift_rings_region_down(top, bottom, n);
         if n == 0 || self.data.is_empty() {
             return;
@@ -110,7 +106,7 @@ impl CellExtras {
     /// Entries outside the column range `[left, right]` are preserved unchanged.
     /// Entries outside the row range `[top, bottom]` are preserved unchanged.
     ///
-    /// Used by `scroll_region_up_margined` (DECLRMM) (#7415).
+    /// Used by `scroll_region_up_margined` (DECLRMM).
     pub(crate) fn shift_rect_up_by(
         &mut self,
         top: u16,
@@ -120,7 +116,7 @@ impl CellExtras {
         n: u16,
     ) {
         // Shift the dense rings within the rect the SAME way as the HashMap —
-        // see shift_region_up_by (#7458 follow-up).
+        // see shift_region_up_by.
         self.shift_rings_rect_up(top, bottom, left, right, n);
         if n == 0 || self.data.is_empty() {
             return;
@@ -161,7 +157,7 @@ impl CellExtras {
     /// Rows `[top, bottom - n]` within the column range shift down by `n`.
     /// Entries outside the column range or row range are preserved unchanged.
     ///
-    /// Used by `scroll_region_down_margined` (DECLRMM) (#7415).
+    /// Used by `scroll_region_down_margined` (DECLRMM).
     pub(crate) fn shift_rect_down_by(
         &mut self,
         top: u16,
@@ -171,7 +167,7 @@ impl CellExtras {
         n: u16,
     ) {
         // Shift the dense rings within the rect the SAME way as the HashMap —
-        // see shift_region_up_by (#7458 follow-up).
+        // see shift_region_up_by.
         self.shift_rings_rect_down(top, bottom, left, right, n);
         if n == 0 || self.data.is_empty() {
             return;
@@ -207,18 +203,14 @@ impl CellExtras {
     /// Extract every entry on `internal_row` in `[start_col, max_col)`, removing
     /// it from the map, and return the `(col, extra)` pairs.
     ///
-    /// The map is keyed by the exact coordinate being searched for, so the
-    /// column range — always <= `cols` wide, since ICH/DCH clamp to the right
-    /// margin — can be probed directly in O(width) hash lookups instead of
-    /// iterating every key in the grid-wide map (O(E), where E counts entries on
-    /// ALL rows). On a hyperlink-saturated screen E reaches thousands while
-    /// width is ~200, so the scan is the wrong side of that trade. The scan is
-    /// still cheaper when the map is small relative to the range, so pick per
-    /// call: a nearly-empty map is faster to walk than to probe 200 times.
+    /// The map is keyed by coordinate, so the column range (at most `cols`
+    /// wide) can be probed in O(width) lookups instead of iterating every key
+    /// in the grid-wide map (O(E), all rows). A scan is still cheaper when the
+    /// map is small relative to the range, so each call picks.
     ///
-    /// Extraction order differs between the two branches (ascending column vs
-    /// HashMap order); that is unobservable because the caller's reinsert loop
-    /// is order-independent and the shift is injective on destination keys.
+    /// The two branches extract in different orders, which is unobservable:
+    /// the caller's reinsert loop is order-independent and the shift is
+    /// injective on destination keys.
     fn take_row_range(
         &mut self,
         internal_row: u16,
@@ -260,9 +252,8 @@ impl CellExtras {
     /// Only extracts and reinserts entries on the target row — non-target rows
     /// are never moved and no new HashMap is allocated.
     pub fn shift_cols_right(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
-        // Shift the dense rings on this row the SAME way as the HashMap, instead
-        // of wiping them — preserves truecolor/complex chars of the unaffected
-        // cells (and other rows) on ICH (#7458 follow-up).
+        // Shift the dense rings on this row the same way as the HashMap, keeping
+        // unaffected cells' truecolor/complex chars (and other rows') on ICH.
         self.shift_rings_cols_right(row, start_col, count, max_col);
         if count == 0 || self.data.is_empty() {
             return;
@@ -270,14 +261,10 @@ impl CellExtras {
         #[cfg(any(test, feature = "testing"))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let internal_row = self.internal_row(row);
-        // Two-phase extract-then-reinsert: collect all affected entries first,
-        // then reinsert shifted versions. This avoids ordering issues where a
-        // shifted destination overlaps with a not-yet-processed source key.
-        // Only extract columns within [start_col, max_col); columns at or beyond
-        // max_col are outside the margin boundary (DECLRMM) and must be preserved
-        // in place, mirroring shift_cols_left. Without the upper bound, an entry
-        // already past max_col would be extracted and then dropped by the reinsert
-        // guard below, silently losing its extras (#7458 follow-up).
+        // Extract all affected entries, then reinsert shifted, so a destination
+        // cannot collide with a not-yet-processed source key. Only columns in
+        // [start_col, max_col) are extracted; entries at or past max_col are
+        // outside the margin (DECLRMM) and stay in place, as in shift_cols_left.
         let extracted = self.take_row_range(internal_row, start_col, max_col);
         for (col, extra) in extracted {
             let new_col = col.saturating_add(count);
@@ -298,7 +285,7 @@ impl CellExtras {
     /// are never moved and no new HashMap is allocated.
     pub(crate) fn shift_cols_left(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
         // Shift the dense rings on this row the SAME way as the HashMap — see
-        // shift_cols_right (#7458 follow-up).
+        // shift_cols_right.
         self.shift_rings_cols_left(row, start_col, count, max_col);
         if count == 0 || self.data.is_empty() {
             return;
@@ -604,9 +591,8 @@ mod tests {
     #[test]
     fn test_shift_cols_right_preserves_beyond_max_col() {
         let mut extras = CellExtras::new();
-        // Entry at col 70 which is >= max_col (50) should be preserved in place.
-        // Repro for DECLRMM: right margin at col 49 (max_col=50), an extra at
-        // col 70 must NOT be extracted-then-dropped by the shift.
+        // An entry at col 70 >= max_col (50), past a DECLRMM right margin at col
+        // 49, stays in place rather than being extracted and dropped.
         insert(&mut extras, 0, 70, extra_with_fg(70, 0, 0));
         insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
 
@@ -899,9 +885,9 @@ mod tests {
     // =========================================================================
 
     // =========================================================================
-    // RGB-RING shifts (#7458 follow-up): truecolor lives ONLY in the dense ring
-    // (set via set_rgb_ring_range), never spilled to the HashMap. The shift ops
-    // must move/clear only the affected ring cells and PRESERVE everyone else.
+    // RGB-ring shifts: truecolor set via set_rgb_ring_range lives only in the
+    // dense ring, never in the HashMap. Shift ops must move/clear only the
+    // affected ring cells and keep everything else.
     // =========================================================================
 
     /// Helper: write a bg RGB into the dense ring at (row, col).

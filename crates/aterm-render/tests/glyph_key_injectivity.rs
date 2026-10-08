@@ -50,6 +50,7 @@ const CLASSES: &[GlyphClass] = &[
     GlyphClass::Mono,
     GlyphClass::Rgba,
     GlyphClass::RgbaGid,
+    GlyphClass::RgbaCluster,
     GlyphClass::MonoGid,
 ];
 

@@ -16,30 +16,16 @@ use super::{
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hardened_roundtrips_through_toml() {
-    let original = profiles::hardened();
-    let ser = original.to_toml().expect("hardened serializes");
-    let parsed: Policy = aterm_toml::from_str(&ser).expect("hardened parses");
-    assert_eq!(
-        original, parsed,
-        "hardened policy round-trip must be lossless"
-    );
-}
-
-#[test]
-fn standard_roundtrips_through_toml() {
-    let original = profiles::standard();
-    let ser = original.to_toml().expect("standard serializes");
-    let parsed: Policy = aterm_toml::from_str(&ser).expect("standard parses");
-    assert_eq!(original, parsed);
-}
-
-#[test]
-fn permissive_roundtrips_through_toml() {
-    let original = profiles::permissive();
-    let ser = original.to_toml().expect("permissive serializes");
-    let parsed: Policy = aterm_toml::from_str(&ser).expect("permissive parses");
-    assert_eq!(original, parsed);
+fn builtin_profiles_roundtrip_through_toml() {
+    for original in [
+        profiles::permissive(),
+        profiles::standard(),
+        profiles::hardened(),
+    ] {
+        let ser = original.to_toml().expect("serializes");
+        let parsed: Policy = aterm_toml::from_str(&ser).expect("parses");
+        assert_eq!(original, parsed, "{:?}", original.profile);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -60,13 +46,9 @@ fn refinement_unmatched_default_is_monotone() {
 
 #[test]
 fn refinement_holds_over_all_sequences_and_origins() {
-    // The refinement invariant in FULL: for EVERY (sequence, origin), the
-    // stricter profile is never looser than the looser one, i.e.
-    // rank(hardened) >= rank(standard) >= rank(permissive) (higher rank = stricter;
-    // see `response_rank`). The test above only covers the unmatched default.
-    // Verify it here over a comprehensive CONCRETE grid:
-    // every sequence the default profiles carry a rule for, plus several unmatched
-    // fall-throughs, evaluated under all 8 origins.
+    // For every (sequence, origin): rank(hardened) >= rank(standard) >=
+    // rank(permissive), higher rank = stricter. The grid is every sequence the
+    // profiles rule on plus unmatched fall-throughs, under all 8 origins.
     use super::selector::DispatchedSequence;
     let s = |x: &str| x.to_owned();
     let seqs: Vec<DispatchedSequence> = vec![
@@ -153,7 +135,7 @@ fn hardened_denies_unmatched() {
 }
 
 // ---------------------------------------------------------------------------
-// Hardened-specific invariants from techlead brief
+// Hardened-specific invariants
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -184,21 +166,15 @@ fn hardened_requires_shell_integration_nonce() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn all_builtin_profiles_stamp_current_schema_version() {
-    for p in [
-        profiles::permissive(),
-        profiles::standard(),
-        profiles::hardened(),
+fn builtin_profiles_stamp_schema_version_and_tag() {
+    for (p, tag) in [
+        (profiles::permissive(), Profile::Permissive),
+        (profiles::standard(), Profile::Standard),
+        (profiles::hardened(), Profile::Hardened),
     ] {
         assert_eq!(p.schema_version, SCHEMA_VERSION);
+        assert_eq!(p.profile, tag);
     }
-}
-
-#[test]
-fn builtin_profiles_carry_correct_profile_tag() {
-    assert_eq!(profiles::permissive().profile, Profile::Permissive);
-    assert_eq!(profiles::standard().profile, Profile::Standard);
-    assert_eq!(profiles::hardened().profile, Profile::Hardened);
 }
 
 // ---------------------------------------------------------------------------
@@ -331,16 +307,8 @@ fn manually_built_policy_roundtrips() {
 // OriginTag trust lattice — exhaustive order proofs
 // ---------------------------------------------------------------------------
 //
-// The lattice has only 8 elements, so enumerating all pairs/triples is a
-// COMPLETE proof (not a sample) of its order-theoretic invariants. These pin the
-// load-bearing structure the policy engine relies on — in particular that `Host`
-// is the top (dominates every origin) and `NetworkUntrusted` is the bottom (the
-// "allow from any origin" floor the default profiles gate on via
-// `origin_min = NetworkUntrusted`, e.g. the permissive "response any" rule). Any
-// accidental reordering, rank collision, or inversion fails HERE rather than
-// silently changing which origins may run which escape sequences. (This ordering
-// is deliberately distinct from `aterm_provenance::OriginTag`'s — a separate
-// byte-taint lattice whose bottom is `Pty`; see the `OriginTag` type docs.)
+// With 8 elements, enumerating all pairs/triples is a complete proof, not a
+// sample.
 
 /// Every `OriginTag` variant, most- to least-trusted.
 const ALL_ORIGINS: [OriginTag; 8] = [

@@ -1,0 +1,32 @@
+# claude-code 2.1.292 · MEASURED 2026-10-06, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the proposed-goal dialog (the `ProposeGoal` tool, behind the server flag `tengu_propose_goal`, here seeded in the scratch config's `cachedGrowthBookFeatures`): FOOTERLESS, drawn in the Pane, so its title, its dashed brackets and its options sit at column TWO where the permission frame's sit at one (the 2.1.282 fixture of it is hand-built at column one); `❯ Not now` first
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.AxLp/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Brewed for 0s · done 5:27 PM
+
+❯ toolstart
+
+⏺ ProposeGoal(Propose goal: All tests in test/auth pass (bun test exits 0))
+
+⏺ Tool call done.
+
+✻ Churned for 0s · done 5:27 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Claude proposes a goal
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+   All tests in test/auth pass (bun test exits 0)
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+  Approving sets this as the session goal, like running /goal: after each turn a separate check decides whether the condition is met, and
+  Claude keeps working until it is. Claude has finished its current work — approving starts it working again, toward this goal. Esc dismisses
+  without setting it.
+
+  ❯ Not now
+    Set this goal

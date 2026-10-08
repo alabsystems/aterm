@@ -1,36 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE UNREACHED-INSTANCE CENSUS — the aterm windows and headless instances
-//! running as this user that no control socket in the rendezvous directory
-//! reaches. `aterm doctor` prints it. REPORTED, NEVER STOPPED.
+//! The unreached-instance census: aterm windows and headless instances running
+//! as this user that no control socket in the rendezvous directory reaches.
+//! `aterm doctor` prints it; nothing is stopped.
 //!
-//! WHY IT EXISTS (gap #36, measured 2026-09-26): `./aterm-before --headless`, a
-//! test instance whose harness died, had been running for eleven days holding a
-//! shell. `aterm ctl ls` never showed it — its socket lived in the scratch
-//! directory its harness made — so nothing on the machine said it was there.
-//! The lifeline (`aterm_uds::lifeline`) keeps harnesses from leaking the next
-//! one; this census is how a person learns of one that already leaked, or of
-//! any window no client can reach.
+//! An instance is a process of this user whose program is `aterm` or an
+//! `aterm-…` copy, started in window mode (`--headless` or `--window` before
+//! any `-e` payload, the `aterm-gui` name, or an app bundle's binary with no
+//! arguments), and not a verb (`aterm ctl …`) or a forced `--session`. A bare
+//! `aterm` in a terminal is a session, serves no socket, and is not counted.
 //!
-//! WHAT COUNTS as an instance: a process of this user whose program is `aterm` or
-//! an `aterm-…` copy of it, started in WINDOW mode — `--headless` or `--window`
-//! before any `-e` payload, the `aterm-gui` name, or an app bundle's binary with
-//! no arguments — and neither a verb (`aterm ctl …`, `aterm pkg …`) nor a forced
-//! `--session`. A bare `aterm` in a terminal is a session: it serves no socket,
-//! and is not counted. Everything else in the process table is ignored.
+//! An instance is reached when its pid is published in the rendezvous
+//! directory (an `aterm-<pid>.sock`, or a `graph/` entry naming it), the same
+//! walk `aterm ctl instances`, `ls` and `windows` make
+//! ([`crate::local_instances`]). A published instance that does not reply is
+//! `aterm ctl ls`'s concern; a foreign one (a private `--control-sock` with no
+//! readable token, published through its graph entry) counts as reached and
+//! `aterm ctl instances` names it.
 //!
-//! WHAT REACHES one: its pid is published in the rendezvous directory — an
-//! `aterm-<pid>.sock` there, or a `graph/` entry naming it — the same walk
-//! `aterm ctl instances`, `ls` and `windows` make ([`crate::local_instances`]).
-//! Publication is the question, not an answer: an instance that is published
-//! but does not reply is a different problem that `aterm ctl ls` already names.
-//!
-//! NEVER KILLED. Whether an unreached instance should end is its owner's call —
-//! it may be a person's deliberate `--no-control-sock` window, or a harness run
-//! still in progress. The census names each one (pid, age, command line) and
-//! stops. When it cannot look — no process table, a rendezvous directory it
-//! cannot read — it says it did not measure, never "none".
+//! Each unreached instance is named (pid, age, command line); whether it
+//! should end is its owner's call. When the census cannot look (no process
+//! table, an unreadable rendezvous directory) it says it did not measure,
+//! never "none". The lifeline (`aterm_uds::lifeline`) keeps harnesses from
+//! leaking instances in the first place.
 
 use std::collections::BTreeSet;
 
@@ -82,30 +75,26 @@ pub struct Census {
 /// Take the census of this machine, now.
 ///
 /// # Errors
-/// The words for a census that was NOT taken: the rendezvous directory could not
-/// be resolved or read, or the process table could not be read. Never an empty
-/// census standing in for "could not look".
+/// The rendezvous directory or the process table could not be read; never an
+/// empty census standing in for "could not look".
 #[cfg(unix)]
 pub fn window_census() -> Result<Census, String> {
     let (outcome, targets) = crate::inspect_fleet();
+    let targets = targets.into_iter().map(crate::Target::listed).collect();
     let (dir, published) = published_in(outcome, targets)?;
     let table = process_table()?;
     census_of(&table, std::process::id(), &published, dir)
 }
 
-/// What the rendezvous walk says is PUBLISHED: the directory's words and the
-/// pids it names — PURE over [`crate::inspect_fleet`]'s answer.
+/// What the rendezvous walk says is published: the directory's words and the
+/// pids it names, pure over [`crate::inspect_fleet`]'s answer.
 ///
-/// A directory that does not EXIST is an answer, not a failure to look: nothing
-/// has published there, so every instance is unreached from here. That is the
-/// census's own question at its sharpest — a machine whose instances were all
-/// started by harnesses with private sockets has no rendezvous directory at all
-/// (measured 2026-09-26: `aterm doctor` there said "not measured" beside a
-/// running instance it could have named).
+/// A directory that does not exist is an answer: nothing has published there,
+/// so every instance is unreached.
 ///
 /// # Errors
-/// The directory could not be resolved or could not be read: then nothing is
-/// known about what is published, and the census is not taken.
+/// The directory could not be resolved or read; nothing is known about what
+/// is published, and the census is not taken.
 #[cfg(any(unix, test))]
 fn published_in(
     outcome: crate::DirOutcome,
@@ -140,12 +129,11 @@ pub fn window_census() -> Result<Census, String> {
 }
 
 /// The census over an explicit process table, the caller's own pid (whose row
-/// names the user to count for) and the published pids — PURE, so every
+/// names the user to count for) and the published pids; pure, so every
 /// classification is table-testable.
 ///
 /// # Errors
-/// `own_pid` has no row in `table`: without it the census cannot tell whose
-/// processes to count, and does not guess.
+/// `own_pid` has no row in `table`, so the user to count for is unknown.
 pub fn census_of(
     table: &[ProcRow],
     own_pid: u32,
@@ -259,10 +247,9 @@ fn age_words(secs: u64) -> String {
     }
 }
 
-/// The process table, from two `ps` reads joined by pid: the program column can
-/// hold spaces and so can the command line, so each has to be the LAST column
-/// of its own read. A process born or gone between the reads is simply not in
-/// both, and is skipped.
+/// The process table, from two `ps` reads joined by pid: the program column
+/// and the command line can both hold spaces, so each is the last column of
+/// its own read. A process present in only one read is skipped.
 ///
 /// # Errors
 /// `ps` could not be run, or printed nothing a row could be read from.
@@ -285,11 +272,11 @@ fn ps(columns: &[&str]) -> Result<String, String> {
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
         .unwrap_or("ps");
-    let out = std::process::Command::new(program)
+    let out = aterm_uds::spawnfd::command(program)
         .args(["-A", "-ww"])
         .args(columns)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .output()
         .map_err(|e| format!("the process table could not be read (`ps`: {e})"))?;
     if !out.status.success() {
@@ -349,9 +336,9 @@ mod tests {
         }
     }
 
-    /// The table this machine had on 2026-09-26, reduced: the owner's app, the
-    /// eleven-day orphan, a test binary whose name starts with `aterm`, a session,
-    /// a client verb, another user's instance — and the doctor itself.
+    /// A reduced process table: a user's app, a long-lived orphan, a test
+    /// binary whose name starts with `aterm`, a session, a client verb, another
+    /// user's instance, and the doctor itself.
     fn table() -> Vec<ProcRow> {
         vec![
             row(
@@ -389,10 +376,9 @@ mod tests {
         ]
     }
 
-    /// THE CENSUS: the published window is reached, the eleven-day orphan is
-    /// named with its age and command line, and nothing else is counted — not
-    /// the test binary, the session, the client verb, the forced session, the
-    /// other user's instance, or the doctor.
+    /// The published window is reached, the orphan is named with its age and
+    /// command line, and nothing else is counted (test binary, session, client
+    /// verb, forced session, other user's instance, doctor).
     #[test]
     fn it_names_the_unreached_instance_and_ignores_the_reached_one() {
         let published = BTreeSet::from([7641]);
@@ -422,9 +408,9 @@ mod tests {
         assert!(err.contains("missing from the process table"), "{err}");
     }
 
-    /// Window mode is read the way the front door reads it: before the `-e`
-    /// payload only, a verb or `--session` wins, the `aterm-gui` name and a bare
-    /// bundle launch are windows, and a socket switched off is said so.
+    /// Window mode is read as the front door reads it: before the `-e` payload
+    /// only, a verb or `--session` wins, the `aterm-gui` name and a bare bundle
+    /// launch are windows, and a disabled socket is reported.
     #[test]
     fn window_mode_is_read_from_the_launch_flags() {
         let is_window = |program: &str, command: &str| {
@@ -487,10 +473,10 @@ mod tests {
         );
     }
 
-    /// What is published, per rendezvous answer: a directory's pids (a legacy
-    /// graph entry's placeholder 0 is no pid); a directory that does not exist
-    /// publishes nothing, so every instance is unreached — counted, not "not
-    /// measured"; one that cannot be resolved or read is not a census at all.
+    /// What is published per rendezvous answer: a directory's pids (a graph
+    /// entry's placeholder 0 is no pid); a missing directory publishes nothing,
+    /// so every instance is unreached; an unresolvable or unreadable one is not
+    /// a census.
     #[test]
     fn a_missing_directory_publishes_nothing_and_an_unreadable_one_is_not_measured() {
         use std::path::PathBuf;
@@ -529,6 +515,27 @@ mod tests {
         let err =
             published_in(crate::DirOutcome::Unresolvable, Vec::new()).expect_err("not measured");
         assert!(err.contains("cannot resolve"), "{err}");
+    }
+
+    /// A foreign instance (private socket outside the rendezvous directory,
+    /// found through its graph entry) is published, so the census counts it as
+    /// reached and never names it; `aterm ctl`'s foreign hint points at its own
+    /// report rows for that reason.
+    #[test]
+    fn a_published_foreign_instance_counts_as_reached() {
+        use std::path::PathBuf;
+        let targets = vec![
+            (7641, "/r/aterm-7641.sock".to_string()),
+            (67548, "/var/folders/xy/T/at.Q1/a.sock".to_string()),
+        ];
+        let found = crate::DirOutcome::Found {
+            path: PathBuf::from("/r"),
+            n: 2,
+        };
+        let (dir, published) = published_in(found, targets).expect("found");
+        assert!(published.contains(&67548), "the graph entry publishes it");
+        let census = census_of(&table(), 100, &published, dir).expect("census");
+        assert_eq!((census.instances, census.unreached.len()), (2, 0));
     }
 
     /// Ages read the way a person reads them, oldest first in the census.

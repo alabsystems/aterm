@@ -44,8 +44,7 @@ impl DiskBackedScrollbackConfig {
     /// Create a new config with the given cold storage path.
     ///
     /// The line limit defaults to [`DEFAULT_LINE_LIMIT`] — see the field
-    /// docs and [`with_line_limit`](Self::with_line_limit) /
-    /// [`with_unlimited_lines`](Self::with_unlimited_lines).
+    /// docs and [`with_unlimited_lines`](Self::with_unlimited_lines).
     #[must_use]
     pub fn new(cold_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -56,13 +55,6 @@ impl DiskBackedScrollbackConfig {
             line_limit: Some(DEFAULT_LINE_LIMIT),
             cold_config: DiskColdConfig::new(cold_path),
         }
-    }
-
-    /// Set the total-line limit (lines retained across all tiers).
-    #[must_use]
-    pub fn with_line_limit(mut self, limit: usize) -> Self {
-        self.line_limit = Some(limit);
-        self
     }
 
     /// Remove the total-line limit (scrollback bounded only by memory budget
@@ -370,9 +362,7 @@ impl DiskBackedScrollback {
     /// walk's switch from bulk segment decodes to borrowed hot lines
     /// (`ScrollbackStorage::dense_from`).
     pub(crate) fn hot_start(&self) -> usize {
-        self.cold
-            .line_count()
-            .saturating_add(self.warm.line_count())
+        crate::iter::hot_start_tiers(&self.cold, &self.warm)
     }
 
     /// Bulk read for the streaming iterators (ST-6): owned lines from `idx`
@@ -384,40 +374,7 @@ impl DiskBackedScrollback {
     // (each individually classified: guarded-index / decode class).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn read_segment(&self, idx: usize) -> crate::iter::SegmentResult {
-        let cold_count = self.cold.line_count();
-        let warm_count = self.warm.line_count();
-
-        if idx < cold_count {
-            self.cold.take_lines_from(idx).map_err(|e| {
-                // Skip the rest of the undecodable page, clamped into the
-                // cold range; `max(1)` guarantees forward progress even
-                // against a degenerate segment length.
-                let skip = self
-                    .cold
-                    .segment_len_at(idx)
-                    .min(cold_count.saturating_sub(idx))
-                    .max(1);
-                (e, skip)
-            })
-        } else if idx < cold_count.saturating_add(warm_count) {
-            let warm_idx = idx.saturating_sub(cold_count);
-            self.warm.take_lines_from(warm_idx).map_err(|e| {
-                let skip = self
-                    .warm
-                    .segment_len_at(warm_idx)
-                    .min(warm_count.saturating_sub(warm_idx))
-                    .max(1);
-                (e, skip)
-            })
-        } else {
-            let hot_idx = idx.saturating_sub(cold_count).saturating_sub(warm_count);
-            match self.hot.get(hot_idx) {
-                Some(line) => Ok(vec![line.clone()]),
-                // In-range index with no hot line: stale aggregate count —
-                // surface as end-of-data exactly like the old `Ok(None)`.
-                None => Ok(Vec::new()),
-            }
-        }
+        crate::iter::read_segment_tiers(&self.cold, &self.warm, &self.hot, idx)
     }
 
     /// Get a line by reverse index (0 = newest).

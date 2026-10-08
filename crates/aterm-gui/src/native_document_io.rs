@@ -51,14 +51,10 @@ impl ContentFingerprint {
     pub(crate) fn of(bytes: &[u8]) -> Self {
         // FNV-1a with a final length mix. Unlike DefaultHasher, this encoding is stable
         // across processes and Rust releases, which a durable journal requires.
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash ^= bytes.len() as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        Self(hash)
+        Self(aterm_hash::fnv_mix_u64(
+            aterm_hash::fnv1a_64(bytes),
+            bytes.len() as u64,
+        ))
     }
 }
 

@@ -31,6 +31,10 @@ description = "First-party `cfg_if!` macro for aterm (replaces the crates.io cfg
 [lib]
 name = "cfg_if"
 path = "src/lib.rs"
+# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
+# gate while still being linked and executed. Off; doctests are governed
+# separately and still run.
+test = false
 
 [features]
 # Upstream declares exactly one feature, and it is unreachable here: features
@@ -49,13 +53,9 @@ rustc-dep-of-std = []
 # which is why `-e features` reports `default` for a package whose feature table
 # has no such key.
 
-# NO `[dev-dependencies]` ON THE UPSTREAM CRATE, AND THAT IS A DELIBERATE
-# DEPARTURE FROM THIS WAVE'S USUAL DIFFERENTIAL PATTERN.
+# NO `[dev-dependencies]` ON THE UPSTREAM CRATE.
 #
-# The pattern everywhere else in the repo — crates/aterm-grapheme keeps
-# `unicode-width`, crates/aterm-hash's oracle keeps its reference — works
-# because the reference crate is a DIFFERENT package that no patch touches.
-# Here the reference would be `cfg-if` itself, and `[patch.crates-io]` rewrites
+# The reference would be `cfg-if` itself, and `[patch.crates-io]` rewrites
 # EVERY crates-io edge in the workspace, dev edges included. Measured, not
 # guessed: with the patch entry in place, `cargo metadata` resolves
 #

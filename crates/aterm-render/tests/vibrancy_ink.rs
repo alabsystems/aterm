@@ -119,11 +119,8 @@ fn negative_control_a_translucent_ink_would_be_caught() {
 fn renderer_background_opacity_roundtrips_and_clamps() {
     // Tier-1: the SHIPPING renderer accessor clamps to the same [0,1] domain the
     // policy assumes, and defaults to solid.
-    let Some(mut r) = aterm_render::Renderer::from_system(18.0, aterm_render::Theme::default())
-    else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = aterm_render::Renderer::from_system(18.0, aterm_render::Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     assert_eq!(
         r.background_opacity(),
         1.0,

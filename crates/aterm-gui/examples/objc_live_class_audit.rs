@@ -18,11 +18,11 @@
 //!
 //! * `windowDidResize:`'s argument retyped [`aterm_objc::Id`] ->
 //!   [`aterm_objc::Bool`], so the class registers `v@:B` where
-//!   `NSWindowDelegate` says `v@:@`. `cargo build -p aterm-gui` exit 0,
-//!   `cargo test -p aterm-objc --test winit_seam` 6/6 PASS, and the DRIVEN
-//!   EVENT LOG was byte-equivalent to clean head — a delegate row AppKit
-//!   reaches by direct `objc_msgSend` with an argument the body never reads
-//!   cannot show the damage by being called.
+//!   `NSWindowDelegate` says `v@:@`. `targo --unverified build -p aterm-gui`
+//!   exit 0, `targo --unverified test -p aterm-objc --test winit_seam` 6/6
+//!   PASS, and the DRIVEN EVENT LOG was byte-equivalent to clean head — a
+//!   delegate row AppKit reaches by direct `objc_msgSend` with an argument the
+//!   body never reads cannot show the damage by being called.
 //! * `NSWindowDelegate` deleted from the `protocols:` list. Build 0, tests 6/6
 //!   PASS. Every encoding still correct; the class simply stopped SAYING it was
 //!   a window delegate, which is the question AppKit asks before it will treat

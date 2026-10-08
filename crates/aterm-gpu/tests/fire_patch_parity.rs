@@ -1,44 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// FIRE-PATCH (`RenderInput.fire_patch`) CPU/GPU byte parity — the EMBERFORGE
-// per-pixel procedural fire field, plumbed end-to-end. Every covered device
-// pixel evaluates the shared pure-integer field (`aterm_render::fire_field`
-// on the CPU; the op-for-op `fs_fire_add`/`fs_fire_over` WGSL twins on the
-// GPU), so the stream inherits the STRONGEST bar in the harness: BYTE-EXACT
-// CPU==GPU (delta 0), the `glow_halo`/`rain_add` contract at full art scale.
+// Fire-patch (`RenderInput.fire_patch`) CPU/GPU byte parity. Every covered
+// pixel evaluates the shared integer fire field (`aterm_render::fire_field`
+// on the CPU, the `fs_fire_add`/`fs_fire_over` WGSL equivalents on the GPU),
+// so the bar is byte-exact CPU==GPU.
 //
 // Covered:
-//   * base frames WITHOUT fire are byte-exact CPU==GPU (delta 0), so the
-//     measured fire delta is effect-only;
-//   * a SYNTHETIC burn field over block text — multiple temps, strengths,
-//     leans, cov_caps, multi-row patches, edge-clipped quads — is BYTE-EXACT,
-//     across font sizes including 4K-class cells and multiple phases;
-//   * `FireMode::Over` (the light-theme ink-fire): a mixed Add+Over field is
-//     BYTE-EXACT over dark AND white frames, and on white the ink visibly
-//     DARKENS the ground (the smoke-on-light-theme law, fire edition);
-//   * the damaged/cached path: an ANIMATING burn (advancing phase) that also
-//     moves rows must MISS the GPU dirty gate, repaint the prev∪cur patch
-//     rows (the `fire_patch_changed` discipline), and land byte-exact with
-//     no ghost at the vacated rows;
-//   * the SEAM LAW: one wide patch vs the same burn split into many narrow
-//     patches renders BYTE-IDENTICAL frames on each backend (the field is a
-//     pure function of absolute coordinates — zero seams);
-//   * the NO-OP LAW: `clear_overlays` restores the bare frame byte-exactly
-//     (the fire_patch row of `tests/empty_channels_gpu.rs`);
-//   * DETERMINISM: the same input renders the same bytes twice.
+//   * base frames without fire are byte-exact, so the fire delta is
+//     effect-only;
+//   * a synthetic burn field (temps, strengths, leans, cov_caps, multi-row
+//     and edge-clipped patches) is byte-exact across font sizes and phases;
+//   * `FireMode::Over` (light-theme ink fire): a mixed Add+Over field is
+//     byte-exact over dark and white frames, and darkens the white ground;
+//   * the cached path: an animating burn that moves rows misses the dirty
+//     gate, repaints prev∪cur patch rows and leaves no ghost;
+//   * seams: one wide patch and the same burn split into narrow patches
+//     render identically per backend;
+//   * `clear_overlays` restores the bare frame exactly;
+//   * the same input renders the same bytes twice.
 //
-// Gated: no GPU or no font -> the tests no-op (return), like the other parity
-// gates. Byte-exact CPU==GPU gates additionally skip on downlevel
-// (sRGB-offscreen) adapters via `additive_is_byte_exact`, the glow idiom.
-// Backend-internal laws (seam, no-op, determinism) hold on ANY adapter and
-// are asserted unconditionally.
+// No GPU or no font: no-op. Cross-backend byte-exact checks also skip on
+// downlevel (sRGB-offscreen) adapters via `additive_is_byte_exact`;
+// backend-internal properties are asserted on any adapter.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{FireMode, FirePatch, Theme, WindowCpu};
 
-mod common;
-use common::{assert_byte_exact, backends, bb, gg, max_channel_delta, rr};
+use crate::common::{assert_byte_exact, backends, bb, block_text_term, gg, max_channel_delta, rr};
 
 /// Summed-RGB luminance proxy (monotone per channel, so ordering is exact).
 fn luma(p: u32) -> i32 {
@@ -61,12 +50,10 @@ struct Burn {
     mode: FireMode,
 }
 
-/// Emit one burn as its legal per-row-band patches (the producer contract):
-/// the covered rect spans the flame's full vertical reach (root down at
-/// `base_y`, tongues overshooting to ~1.2·peak_h above it), clamped to the
-/// grid interior, split at cell-row boundaries — each slice tagged with its
-/// own `row` while SHARING the burn's field parameters, so the field is
-/// continuous across the slices.
+/// Emit one burn as per-row-band patches: the rect spans the flame's reach
+/// (root at `base_y`, tongues up to ~1.2·peak_h above), clamped to the grid
+/// and split at cell-row boundaries. Each slice carries its own `row` and
+/// shares the burn's field parameters, so the field is continuous.
 fn emit_burn(out: &mut Vec<FirePatch>, b: Burn, ch: usize, grid_w: usize, grid_h: usize) {
     let x0 = b.x.min(grid_w);
     let x1 = (b.x + b.w).min(grid_w);
@@ -165,11 +152,9 @@ fn synthetic_burns(phase: u32, ch: usize, grid_w: usize, grid_h: usize) -> Vec<F
     out
 }
 
-/// THE fire-patch parity pin. The base frame is procedural full-block glyphs
-/// over background — byte-exact CPU==GPU (delta 0) — so the fire delta below
-/// is the stream's alone. The synthetic burn field is composited over that
-/// text on both backends at MULTIPLE PHASES: the frames must be
-/// BYTE-IDENTICAL (the shared-integer-field parity contract).
+/// Fire-patch parity: the base frame is byte-exact, so the fire delta is the
+/// stream's alone. The synthetic field over block text at several phases must
+/// be byte-identical on both backends.
 #[test]
 fn fire_patch_synthetic_field_is_byte_exact_over_text() {
     let theme = Theme::default();
@@ -178,11 +163,7 @@ fn fire_patch_synthetic_field_is_byte_exact_over_text() {
     };
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process("\x1b[?25l".as_bytes());
-    for r in 1..8usize {
-        term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
-    }
+    let mut term = block_text_term(rows, cols, 1..8);
     let (_cw, ch) = cpu.cell_size();
     let (grid_w, grid_h) = (cols * cpu.cell_size().0, rows * ch);
 
@@ -233,9 +214,8 @@ fn fire_patch_synthetic_field_is_byte_exact_over_text() {
     }
 }
 
-/// 4K-CLASS CELLS: the same parity pin at a 44 px font (cell heights in the
-/// ~50-100 px range — the field's DPI-scaled anatomy at full resolution),
-/// over a glyph-free frame so the base is trivially byte-exact.
+/// The same parity at a 44 px font (cells ~50-100 px tall), over a
+/// glyph-free frame.
 #[test]
 fn fire_patch_byte_exact_at_4k_class_cells() {
     let theme = Theme::default();
@@ -289,12 +269,10 @@ fn light_theme() -> Theme {
     }
 }
 
-/// THE `FireMode::Over` parity pin, over BOTH grounds: a mixed Add+Over burn
-/// field (the Over ink dead over an Add ember — the overlap exercises the
-/// Add-then-Over split order) over block text must be BYTE-EXACT CPU==GPU on
-/// a dark frame AND on a light text-on-white frame. On the white ground the
-/// ink-fire must visibly DARKEN the frame (additive fire cannot), so the
-/// byte-exact gate is provably non-vacuous on the path that matters.
+/// `FireMode::Over` parity: a mixed Add+Over field (Over ink overlapping an
+/// Add ember, exercising split order) over block text is byte-exact on a dark
+/// frame and a text-on-white frame. On white the ink fire must visibly darken
+/// the frame, so the check is non-vacuous.
 #[test]
 fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
     for (label, theme) in [("dark", Theme::default()), ("light", light_theme())] {
@@ -303,11 +281,7 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
         };
         let mut win = aterm_gpu::WindowGpu::new();
         let (rows, cols) = (10usize, 40usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process("\x1b[?25l".as_bytes());
-        for r in 1..8usize {
-            term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
-        }
+        let mut term = block_text_term(rows, cols, 1..8);
         let (cw, ch) = cpu.cell_size();
         let (grid_w, grid_h) = (cols * cw, rows * ch);
 
@@ -406,12 +380,10 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
     }
 }
 
-/// DAMAGED/CACHED-PATH parity: the per-frame presentation hot path. Frame A
-/// places a burn (priming both caches); frame B advances its PHASE by one
-/// 16 ms tick AND moves it to different rows — the exact animating-producer
-/// shape. The change must MISS the GPU dirty gate (`fire_patch_changed`),
-/// repaint the prev∪cur patch rows, and land byte-exact with no ghost at the
-/// vacated rows.
+/// Cached-path parity: frame A places a burn; frame B advances its phase by
+/// one 16 ms tick and moves it to other rows. The change misses the dirty
+/// gate (`fire_patch_changed`), repaints prev∪cur patch rows, and lands
+/// byte-exact with no ghost.
 #[test]
 fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
     let theme = Theme::default();
@@ -494,11 +466,9 @@ fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
     }
 }
 
-/// THE SEAM LAW: the field is a pure function of ABSOLUTE pixel coordinates
-/// plus shared burn parameters, so ONE wide patch and the SAME burn split
-/// into many narrow patches must render BYTE-IDENTICAL frames — zero seams.
-/// Pinned on the CPU unconditionally and on the GPU against itself (a
-/// backend-internal law needing no cross-backend gate), in both modes.
+/// Seams: the field is a pure function of absolute pixel coordinates, so one
+/// wide patch and the same burn split into narrow patches render identical
+/// frames. Checked on the CPU and GPU (each against itself), both modes.
 #[test]
 fn seam_law_split_patches_byte_identical_to_one_wide() {
     let theme = Theme::default();
@@ -595,12 +565,10 @@ fn fire_patch_determinism_same_bytes_twice() {
     assert_eq!(gpu_1, gpu_2, "GPU fire render must be deterministic");
 }
 
-/// HEAD-BAND PARITY: with a chrome head band (`set_head`) AND interior padding
-/// (`set_pad`) on BOTH backends, a WINDOW-ABSOLUTE burn rooted in the grid's
-/// top row whose tongues overshoot ABOVE the grid — into the head band
-/// (`y < pad + head`, row tag 0, the damage-hint contract) — must render
-/// BYTE-EXACT CPU==GPU, and the band pixels must actually carry flame on both
-/// backends (the fire really escapes the grid; row-0 tags open the top strip).
+/// Head-band parity: with a chrome head band (`set_head`) and padding
+/// (`set_pad`), a window-absolute burn rooted in the grid's top row whose
+/// tongues reach into the head band (row tag 0) renders byte-exact, and the
+/// band pixels carry flame on both backends.
 #[test]
 fn fire_patch_head_band_parity_cpu_matches_gpu() {
     const P: usize = 6; // interior pad (px per edge)
@@ -636,9 +604,8 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
         "head-band base must be byte-exact so the fire delta is effect-only"
     );
 
-    // (b) One strong burn rooted in the grid's FIRST row, WINDOW-ABSOLUTE
-    // (the producer contract): its tongues overshoot above `grid_top`. Bands
-    // anchor at `grid_top`; the above-grid slice carries row tag 0.
+    // One strong burn rooted in the first row, window-absolute: its tongues
+    // overshoot above `grid_top`; the above-grid slice carries row tag 0.
     let base_y = grid_top + ch / 2;
     let peak_h = (2 * ch) as u16;
     let reach = (peak_h as usize) * 6 / 5 + 2;

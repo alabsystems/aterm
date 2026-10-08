@@ -1,37 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The "update ready" nudge STATE (proof-carrying DSU, RFC Rung 2). The nudge itself is
-//! the ⬆️-suffixed VERSION menu title + its one-click "Install aterm v<staged> now"
-//! item (see `crate::menu::update_version_menu` / the palette's
-//! Version row), plus
-//! the subtle LEADING `↻` icon in the off-macOS tab strip (see [`crate::tab_bar`]
-//! `TabHit::Update`) — chrome, not a disruptive banner. This module holds only the small
-//! pieces of App state that drive it: which build/version is staged (the repaint
-//! fingerprint), and the post-update REALIZED-arrow timing (TTL + fade law + bucket).
+//! App state behind the "update ready" nudge: the ⬆️-suffixed version menu title and
+//! its "Install aterm v<staged> now" item (`crate::menu::update_version_menu`, the
+//! palette's Version row), plus the leading `↻` in the off-macOS tab strip
+//! ([`crate::tab_bar`] `TabHit::Update`). Holds the staged build/version (the repaint
+//! fingerprint) and the post-update realized-arrow timing (TTL, fade law, bucket).
 
 use std::time::Duration;
 
-/// How long the post-update "realized" ⬆️ arrow decorates the version menu (and the
-/// palette's Version section) before it decays away — the owner's ask: a realized
-/// upgrade arrow "that fades away after so many minutes", drawing attention to the
-/// version-number menu without a permanent badge.
+/// How long the post-update "realized" ⬆️ arrow decorates the version menu and the
+/// palette's Version section before it has faded out.
 pub(crate) const REALIZED_ARROW_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// The realized-arrow fade re-present granularity: the palette fingerprint folds the
-/// elapsed bucket at this quantum (and the `about_to_wait` sweep arms one wake per
-/// bucket edge), so an OPEN palette fades progressively — one present per step, never
-/// per-frame churn (the notice.rs quantized-fp pattern, stretched to minutes).
+/// Fade re-present quantum: the palette fingerprint folds the elapsed bucket and the
+/// `about_to_wait` sweep arms one wake per bucket edge, so an open palette fades one
+/// present per step rather than per frame.
 pub(crate) const REALIZED_BUCKET: Duration = Duration::from_secs(30);
 
 /// Full-strength hold before the realized arrow starts fading (mirrors the notice
 /// pill's hold-then-fade shape: the fresh-upgrade moment reads at full alpha first).
 const REALIZED_HOLD: Duration = Duration::from_secs(120);
 
-/// The realized-arrow alpha at `elapsed` since the post-update boot: `1.0` through the
-/// hold, then a linear ramp to `0.0` at [`REALIZED_ARROW_TTL`]. Pure — the palette
-/// painter and the unit tests share this one law. (Under `MotionPolicy::Reduced` the
-/// caller freezes alpha at full instead of sampling this.)
+/// Realized-arrow alpha at `elapsed` since the post-update boot: `1.0` through the
+/// hold, then linear to `0.0` at [`REALIZED_ARROW_TTL`]. Under `MotionPolicy::Reduced`
+/// the caller holds full alpha instead.
 pub(crate) fn realized_alpha(elapsed: Duration) -> f32 {
     if elapsed <= REALIZED_HOLD {
         return 1.0;
@@ -40,16 +33,14 @@ pub(crate) fn realized_alpha(elapsed: Duration) -> f32 {
     ((REALIZED_ARROW_TTL.as_secs_f32() - elapsed.as_secs_f32()) / fade).clamp(0.0, 1.0)
 }
 
-/// The ~30s fade bucket index at `elapsed` — the quantized time term folded into the
-/// palette fingerprint (and compared by the sweep) so each bucket edge repaints exactly
-/// once while the arrow is live.
+/// Fade bucket index at `elapsed`, folded into the palette fingerprint so each bucket
+/// edge repaints once while the arrow is live.
 pub(crate) fn realized_bucket(elapsed: Duration) -> u64 {
     elapsed.as_secs() / REALIZED_BUCKET.as_secs()
 }
 
-/// The "a strictly-newer build is staged" nudge state (global, App-level). Set from a
-/// `Wake::UpdateStaged`; drives the version-menu ⬆️ / tab-strip `↻` alert + the
-/// `RepaintKey::relaunch_fp`.
+/// App-level "a strictly newer build is staged" state, set from `Wake::UpdateStaged`;
+/// drives the version-menu ⬆️, the tab-strip `↻` and `RepaintKey::relaunch_fp`.
 #[derive(Clone, Debug)]
 pub(crate) struct RelaunchNotice {
     /// The staged build number (the dismiss key: a newer build re-arms the nudge).

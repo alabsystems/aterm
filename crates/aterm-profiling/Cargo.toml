@@ -71,3 +71,9 @@ type-check = []
 
 [lints]
 workspace = true
+
+[lib]
+# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
+# gate while still being linked and executed. Off; doctests are governed
+# separately and still run.
+test = false

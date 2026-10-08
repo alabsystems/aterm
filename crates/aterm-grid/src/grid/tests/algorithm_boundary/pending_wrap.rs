@@ -4,31 +4,17 @@
 
 //! Pending wrap conformance tests.
 //!
-//! Verifies that operations which should clear the `pending_wrap` flag
-//! (xterm's `do_wrap`) actually do so, and that the ones xterm leaves alone keep
-//! it. Per xterm (`util.c` / `charproc.c`), these cancel the deferred wrap:
-//! insert/delete character/line (ICH/DCH/IL/DL — but IL and DL only once
-//! their row/column margin tests PASS, since xterm returns above its
-//! `ResetWrap`), erase-character (ECH), the
-//! ED 0/1/2 and EL 0/1/2 erases (`ClearRight`, `ClearInLine2` and
-//! `ClearScreen` all call `ResetWrap`), the selective DECSEL/DECSED erases
-//! (DECSEL 0 always; DECSED 0 except at the origin, reachable only on a line one
-//! character wide, where xterm's `do_erase_display` reduces it to DECSED 2;
-//! modes 1/2 and that origin case unless every cell of the span is protected,
-//! because `ClearInLine2` returns before `ResetWrap` when its span holds no
-//! unprotected cell), DECALN, and
-//! entering the alternate screen with CSI ?1049 h (its `ClearScreen` runs
-//! last). Scrolls (SU/SD), TAB and CBT, ED 3 and the rectangle ops keep it.
-//!
-//! Part of #5351 (deferred wrapping conformance).
+//! Which operations clear `pending_wrap` (xterm's `do_wrap`) and which keep it.
+//! Per xterm (`util.c` / `charproc.c`) these clear it: ICH/DCH, IL/DL once their
+//! margin tests pass, ECH, ED 0/1/2 and EL 0/1/2, the selective DECSEL/DECSED
+//! erases (unless every cell of the span is protected, except DECSEL 0 and
+//! DECSED 0 away from the origin, which always clear), DECALN, and CSI ?1049 h.
+//! SU/SD, TAB and CBT, ED 3 and the rectangle ops keep it.
 
 use super::super::*;
 
-/// Helper: create a grid and set pending_wrap by writing to the last column.
-///
-/// Uses `write_char_wrap` (deferred autowrap) so the cursor advances through
-/// each column and sets `pending_wrap = true` when the last column is written.
-/// `write_char` alone does not trigger deferred wrap.
+/// A grid with pending_wrap set by writing the last column via
+/// `write_char_wrap` (`write_char` alone does not defer the wrap).
 fn grid_with_pending_wrap(rows: u16, cols: u16) -> Grid {
     let mut grid = Grid::new(rows, cols);
     grid.set_cursor(0, 0);
@@ -44,13 +30,9 @@ fn grid_with_pending_wrap(rows: u16, cols: u16) -> Grid {
     grid
 }
 
-// ========================================================================
-// IL / DL — Insert / Delete Lines
-// ========================================================================
+// IL / DL
 
-/// IL (Insert Lines) must clear pending_wrap.
-///
-/// xterm: `InsertLine()` calls `ResetWrap(screen)`.
+/// IL clears pending_wrap (xterm `InsertLine()` calls `ResetWrap`).
 #[test]
 fn insert_lines_clears_pending_wrap() {
     let mut grid = grid_with_pending_wrap(5, 5);
@@ -63,10 +45,10 @@ fn insert_lines_clears_pending_wrap() {
     );
 }
 
-/// AN IL/DL THE CURSOR POSITION REJECTS KEEPS THE PARKED WRAP.
+/// An IL/DL the cursor position rejects keeps the parked wrap.
 ///
-/// xterm's `InsertLine` and `DeleteLine` (util.c) test the margins and RETURN
-/// before they reach `ResetWrap(screen)`:
+/// xterm's `InsertLine` and `DeleteLine` (util.c) test the margins and return
+/// before `ResetWrap(screen)`:
 ///
 /// ```c
 /// if (!ScrnIsRowInMargins(screen, screen->cur_row)
@@ -76,14 +58,7 @@ fn insert_lines_clears_pending_wrap() {
 /// ResetWrap(screen);
 /// ```
 ///
-/// So the deferred wrap dies with the INSERT, not with the request. aterm reset
-/// it as the first statement of all four entry points, which cancelled a wrap
-/// xterm keeps: the next printable then landed on this row instead of wrapping
-/// to the next one, because `do_wrap` is consumed by the next printable
-/// wherever the cursor sits (charproc.c: `if (screen->do_wrap) { WrapLine(xw); }`).
-///
-/// Each refusal is pinned beside the in-range case that must STILL clear, so a
-/// blanket "never resets" cannot pass this.
+/// Each refusal sits beside the in-range case that still clears.
 #[test]
 fn insert_lines_outside_the_scroll_region_keeps_pending_wrap() {
     let mut grid = grid_with_pending_wrap(5, 5);
@@ -101,7 +76,7 @@ fn insert_lines_outside_the_scroll_region_keeps_pending_wrap() {
         "an IL the region test rejects must leave the wrap armed (xterm returns before ResetWrap)"
     );
 
-    // POSITIVE CONTROL: the same IL with the cursor INSIDE the region still resets.
+    // Positive control: the same IL with the cursor inside the region resets.
     grid.set_scroll_region(0, 4);
     grid.insert_lines(1);
     assert!(
@@ -123,7 +98,7 @@ fn delete_lines_outside_the_scroll_region_keeps_pending_wrap() {
         "a DL the region test rejects must leave the wrap armed"
     );
 
-    // POSITIVE CONTROL.
+    // Positive control.
     grid.set_scroll_region(0, 4);
     grid.delete_lines(1);
     assert!(
@@ -132,10 +107,8 @@ fn delete_lines_outside_the_scroll_region_keeps_pending_wrap() {
     );
 }
 
-/// IL outside the DECLRMM horizontal margins keeps the wrap.
-///
-/// The column test is xterm's too (`screen->cur_col < left || > right`), and it
-/// sits in the same `return` that precedes `ResetWrap`.
+/// IL outside the DECLRMM horizontal margins keeps the wrap (xterm's column
+/// test is in the same early return).
 #[test]
 fn insert_lines_outside_the_horizontal_margins_keeps_pending_wrap() {
     let mut grid = grid_with_pending_wrap(5, 5);
@@ -150,7 +123,7 @@ fn insert_lines_outside_the_horizontal_margins_keeps_pending_wrap() {
         "an IL the column-margin test rejects must leave the wrap armed"
     );
 
-    // POSITIVE CONTROL: margins that CONTAIN the parked column still reset it.
+    // Positive control: margins containing the parked column reset it.
     grid.set_horizontal_margins(2, 4);
     grid.insert_lines_margined(1, true);
     assert!(
@@ -172,7 +145,7 @@ fn delete_lines_outside_the_horizontal_margins_keeps_pending_wrap() {
         "a DL the column-margin test rejects must leave the wrap armed"
     );
 
-    // POSITIVE CONTROL.
+    // Positive control.
     grid.set_horizontal_margins(2, 4);
     grid.delete_lines_margined(1, true);
     assert!(
@@ -181,9 +154,7 @@ fn delete_lines_outside_the_horizontal_margins_keeps_pending_wrap() {
     );
 }
 
-/// DL (Delete Lines) must clear pending_wrap.
-///
-/// xterm: `DeleteLine()` calls `ResetWrap(screen)`.
+/// DL clears pending_wrap (xterm `DeleteLine()` calls `ResetWrap`).
 #[test]
 fn delete_lines_clears_pending_wrap() {
     let mut grid = grid_with_pending_wrap(5, 5);
@@ -196,14 +167,10 @@ fn delete_lines_clears_pending_wrap() {
     );
 }
 
-// ========================================================================
-// Scroll operations PRESERVE pending_wrap
-// ========================================================================
+// Scroll operations keep pending_wrap
 
-/// CSI S (Scroll Up) must PRESERVE pending_wrap.
-///
-/// xterm: CASE_SU -> `xtermScroll()`, which explicitly saves and restores
-/// `screen->do_wrap` around the scroll (util.c `save_wrap`).
+/// CSI S (SU) keeps pending_wrap: xterm's `xtermScroll()` saves and restores
+/// `do_wrap`.
 #[test]
 fn scroll_region_up_preserves_pending_wrap() {
     let mut grid = grid_with_pending_wrap(5, 5);
@@ -214,9 +181,7 @@ fn scroll_region_up_preserves_pending_wrap() {
     );
 }
 
-/// CSI T (Scroll Down) must PRESERVE pending_wrap.
-///
-/// xterm: CASE_SD -> `RevScroll()`, which never touches `screen->do_wrap`.
+/// CSI T (SD) keeps pending_wrap: xterm's `RevScroll()` never touches `do_wrap`.
 #[test]
 fn scroll_region_down_preserves_pending_wrap() {
     let mut grid = grid_with_pending_wrap(5, 5);
@@ -238,12 +203,9 @@ fn scroll_up_preserves_pending_wrap() {
     );
 }
 
-/// LF always clears pending_wrap — it is a cursor-down (xterm CursorDown ends
-/// with ResetWrap), whether it moves the cursor or scrolls at the region bottom.
-/// (Only the explicit SU/SD CSI ops preserve it, via xtermScroll save_wrap; those
-/// don't go through line_feed.) A scrolling LF that kept the flag would make the
-/// next glyph trigger a second scroll — verified against xterm.js (cursorX 3, not
-/// 4, after `\x1b[3;1Habcd\n`).
+/// LF always clears pending_wrap (xterm `CursorDown` ends with `ResetWrap`),
+/// whether it moves the cursor or scrolls at the region bottom; otherwise the
+/// next glyph would scroll a second time.
 #[test]
 fn line_feed_always_clears_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 5);
@@ -287,16 +249,10 @@ fn save_restore_cursor_preserves_pending_wrap() {
     );
 }
 
-// ========================================================================
-// Tab / Back Tab — clear pending_wrap
-// ========================================================================
+// Tab / back tab keep pending_wrap
 
-/// HT (Tab) must PRESERVE pending_wrap.
-///
-/// xterm: `TabToNextStop()` (tabs.c) only calls `set_cur_col` and never
-/// touches `screen->do_wrap` — a TAB issued while wrap is pending leaves
-/// the cursor at the margin with the wrap still pending, so the next
-/// printable wraps instead of overprinting the last column.
+/// HT keeps pending_wrap: xterm's `TabToNextStop()` never touches `do_wrap`, so
+/// the next printable wraps instead of overprinting the last column.
 #[test]
 fn tab_preserves_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 20);
@@ -310,15 +266,8 @@ fn tab_preserves_pending_wrap() {
     assert_eq!(grid.cursor_col(), 19, "cursor stays at the last column");
 }
 
-/// CBT (Back Tab) must PRESERVE pending_wrap, exactly like its forward twin.
-///
-/// xterm's `TabToPrevStop` (tabs.c) never calls `ResetWrap`, and the
-/// `set_cur_col` it does call is a plain assignment — `#define
-/// set_cur_col(screen, value) screen->cur_col = value` (xterm.h) — so a back
-/// tab leaves `do_wrap` armed just as HT does. The rule recorded here before
-/// ("Back tab repositions the cursor, cancelling the deferred wrap state") was
-/// not xterm's: moving the cursor is not what resets the wrap, an explicit
-/// `ResetWrap` is, and CBT has none.
+/// CBT keeps pending_wrap like HT: xterm's `TabToPrevStop` only assigns
+/// `cur_col` and never calls `ResetWrap`.
 #[test]
 fn back_tab_preserves_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 20);
@@ -351,18 +300,11 @@ fn back_tab_margin_preserves_pending_wrap() {
     );
 }
 
-// ========================================================================
-// wrap_serial — the emulator wrap fact (kitty-motion §4.1)
-// ========================================================================
+// wrap_serial: the emulator wrap fact
 
-/// `wrap_serial` bumps exactly once per RESOLVED autowrap line and never on
-/// a hard newline.
-///
-/// The serial is the host-facing wrap FACT: a parked `pending_wrap` is not
-/// yet a wrap (xterm defers the advance until the next printable), the
-/// resolving glyph is exactly one wrap, and CR+LF — the same caret shape on
-/// glass — must stay invisible to it, or the pet's fold would eat honest
-/// Enter presses.
+/// `wrap_serial` bumps once per resolved autowrap and never on a hard newline:
+/// a parked `pending_wrap` is not yet a wrap, the resolving glyph is one wrap,
+/// and CR+LF stays invisible to it.
 #[test]
 fn wrap_serial_counts_resolved_wraps_and_ignores_hard_newlines() {
     let mut grid = grid_with_pending_wrap(3, 5);

@@ -1,24 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exact allocation regression for the kitty-command TRICK FLASH.
+//! Exact allocation regression for the kitty-command trick flash.
 //!
-//! The flash has two halves on paths that must not allocate. The NOTE runs on
-//! the input path at a boundary key (`WordDecorations::note_trick_typed`, with
-//! `revoke_trick_flash` and `trick_flash_phase` beside it): its law is O(word
-//! length) into fixed inline buffers, whatever the word — Thai under combining
-//! marks, the full 32-character window, one character too many, nothing at
-//! all. The PAINT runs once per presented frame for about a second: at most 32
-//! cells merged into the host's resident `ink` scratch, which has its capacity
-//! after the first frame.
+//! Two halves run on paths that must not allocate. The note runs on the input
+//! path at a boundary key (`WordDecorations::note_trick_typed`, with
+//! `revoke_trick_flash` and `trick_flash_phase` beside it): O(word length) into
+//! fixed inline buffers, whatever the word (Thai under combining marks, the
+//! full 32-character window, one too many, nothing at all). The paint runs once
+//! per frame for about a second: at most 32 cells merged into the host's
+//! resident `ink` scratch, which has its capacity after the first frame.
 //!
 //! The rescan half is not pinned here: it lends the engine's resident row
-//! buffer, and the scan pass around it has its own allocation story.
+//! buffer, and the scan pass has its own allocation story.
 //!
-//! ONE `#[test]` IN ITS OWN BINARY, like `typed_tricks_alloc.rs`: the counter
-//! is a process-global allocator switched by a global flag, so a second test
-//! running in parallel would bleed its allocations into the count and make the
-//! pin flaky. Do not add tests to this file.
+//! One `#[test]` in its own binary, like `typed_tricks_alloc.rs`: the counter
+//! is a process-global allocator switched by a global flag, so a parallel test
+//! would bleed into the count. Do not add tests to this file.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -100,8 +98,8 @@ fn a_flash_costs_the_input_path_and_the_frame_path_no_allocation() {
     let too_long = "x".repeat(TrickLexicon::MAX_SURFACE_CHARS + 1);
     let shapes: [&str; 6] = ["", "\u{200d}", "นั่ง", &too_long, &window, "sit"];
 
-    // THE INPUT PATH. No flash has started yet, so no note is debounced away
-    // before its character loop: each one really walks its word.
+    // The input path. No flash has started, so no note is debounced before
+    // its character loop: each one walks its word.
     let mut pending = 0usize;
     let allocations = allocations_during(|| {
         for word in shapes {
@@ -127,7 +125,7 @@ fn a_flash_costs_the_input_path_and_the_frame_path_no_allocation() {
     );
     assert_eq!(ink.len(), 3, "one cell per glyph of `sit`");
 
-    // THE FRAME PATH, from the ramp through the hold: every frame repaints
+    // The frame path, from the ramp through the hold: every frame repaints
     // all three cells and fingerprints differently.
     let (mut painted, mut changed, mut last_fp) = (0usize, 0usize, 0u64);
     let allocations = allocations_during(|| {

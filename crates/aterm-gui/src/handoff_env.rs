@@ -6,13 +6,14 @@
 //!
 //! An update handoff hands its successor authority through the process
 //! environment: the manifest, nonce, layout and descriptor list
-//! (`ATERM_SEAMLESS_*`), the readiness and Commit pipes, the parent's identity,
-//! the rendezvous and its claim, the proof term, the grant capabilities and the
-//! control-socket witness (`ATERM_HANDOFF_*`). Until this module every one of
-//! them was read — and the launched lane's claimed descriptors were even
-//! WRITTEN, by `ClaimedHandoff::publish` — through `std::env` at the point of
-//! use, so the whole intake had to sit on the single-threaded prologue of
-//! `main_entry`: `set_var`/`remove_var` are unsound beside any other thread.
+//! (`ATERM_SEAMLESS_*`), the readiness and Commit pipes, the parent's identity
+//! and exit capabilities, the rendezvous and its claim, the proof term, the
+//! grant capabilities and the control-socket witness (`ATERM_HANDOFF_*`). Until
+//! this module every one of them was read — and the launched lane's claimed
+//! descriptors were even WRITTEN, by `ClaimedHandoff::publish` — through
+//! `std::env` at the point of use, so the whole intake had to sit on the
+//! single-threaded prologue of `main_entry`: `set_var`/`remove_var` are unsound
+//! beside any other thread.
 //!
 //! [`HandoffEnv::capture`] reads AND CLEARS every one of those names ONCE, as
 //! the first thing `main_entry` does, before any thread exists. Everything
@@ -46,9 +47,9 @@ use std::ffi::{OsStr, OsString};
 
 /// Every process-environment name a successor reads as handoff authority on
 /// THIS platform — and so every name [`HandoffEnv::capture`] takes out of the
-/// process. Per platform exactly as the readers were: the rendezvous and the
-/// parent identity are unix-only, the proof term and the grant capabilities
-/// ride only beside a rendezvous (macOS). `names_are_the_readers_constants`
+/// process. Per platform exactly as the readers were: the rendezvous, the
+/// parent identity and the parent's exit capabilities are unix-only, the proof
+/// term and the grant capabilities ride only beside a rendezvous (macOS). `names_are_the_readers_constants`
 /// pins each spelling to the constant its reader names it by.
 pub(crate) const HANDOFF_ENV_KEYS: &[&str] = &[
     "ATERM_SEAMLESS_MANIFEST",
@@ -67,6 +68,10 @@ pub(crate) const HANDOFF_ENV_KEYS: &[&str] = &[
     "ATERM_HANDOFF_PARENT_PID",
     #[cfg(unix)]
     "ATERM_HANDOFF_PARENT_BIRTH",
+    // What the parent reads of this process's exit (round eight, finding 0):
+    // published beside its identity on both lanes, taken before any shell.
+    #[cfg(unix)]
+    "ATERM_HANDOFF_EXIT_CAPS",
     #[cfg(target_os = "macos")]
     "ATERM_HANDOFF_GRANT_CAPS",
     #[cfg(target_os = "macos")]
@@ -77,6 +82,10 @@ pub(crate) const HANDOFF_ENV_KEYS: &[&str] = &[
     "ATERM_HANDOFF_WARM_HINT",
     #[cfg(target_os = "macos")]
     "ATERM_HANDOFF_LAUNCHER_NOFILE",
+    // Beside it: the limit the predecessor held before a park raised it
+    // (round eight's second review of #3), for an older successor of this one.
+    #[cfg(target_os = "macos")]
+    "ATERM_HANDOFF_PARK_RAISED_FROM",
 ];
 
 /// The handoff authority this process was launched with, held in memory.
@@ -173,7 +182,9 @@ impl HandoffEnv {
     /// Set `key` to `value` — the launched lane's granted descriptors landing
     /// where the fork lane's arrive (`handoff_rendezvous::ClaimedIntake`). The
     /// snapshot is this process's own memory: no other thread can observe it,
-    /// so unlike the `set_var` it replaces this is sound at any point.
+    /// so unlike the `set_var` it replaces this is sound at any point. The
+    /// launched lane (`handoff_rendezvous`) is macOS's.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn set(&mut self, key: &'static str, value: impl Into<OsString>) {
         let value = value.into();
         let _ = self.take(key);
@@ -239,7 +250,8 @@ pub(crate) fn through_process_env<T>(
 /// (`handoff_rendezvous::claim_incoming`), `ClaimOk` (`ClaimedIntake::install`),
 /// `TakeOwned` (`seamless::take_incoming_from`), `Adopt`
 /// (`seamless::take_commit_fd_from`) and, from P2, `SpawnWarm`
-/// (`crate::warm_order`) and `Reshape` (`crate::warm_miss_px`), all driven by
+/// (`crate::warm_order`), `Reshape` (`crate::warm_miss_px`) and `Rewarm`
+/// (`crate::warm_config_moved`), all driven by
 /// `seamless::handoff_env_conformance`.
 #[cfg(test)]
 mod waivers {
@@ -263,6 +275,13 @@ mod waivers {
         reason = "The environment: the outgoing process's window changed between its launch-time \
                   hint and its capture. `warm_miss_px`'s Tier-1 drives the real hint parser over \
                   stale and hostile hints."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
+        action = "ConfigEdit",
+        reason = "The environment: the outgoing process applies an edit to aterm.toml, or to a \
+                  theme file or feed it names, during the dial's hold. `warm_config_moved`'s \
+                  Tier-1 writes the edit into a real file between the real reads."
     )]
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
@@ -348,6 +367,14 @@ mod waivers {
     )]
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
+        action = "PresentUnderStaleConfig",
+        reason = "The Buggy=1 mutant: a carried present under the config the early warm read \
+                  after the outgoing process applied an edit (P2 as first built); no shipping \
+                  code (`main_entry` warms the config again first), replayed and caught by the \
+                  conformance."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
         action = "JoinWorkerBeforeDial",
         reason = "The Buggy=1 liveness mutant: a prologue that joins its backend worker before \
                   the dial; no shipping code (the worker is joined only at the first attach)."
@@ -420,6 +447,7 @@ mod tests {
             crate::seamless::ENV_CLAIM,
             crate::seamless::ENV_PARENT_PID,
             crate::seamless::ENV_PARENT_BIRTH,
+            crate::seamless::ENV_EXIT_CAPS,
         ]);
         #[cfg(target_os = "macos")]
         readers.extend([
@@ -427,6 +455,7 @@ mod tests {
             crate::handoff_rendezvous::ENV_PROOF_TERM,
             crate::handoff_warm_hint::ENV_WARM_HINT,
             crate::handoff_rendezvous::ENV_LAUNCHER_NOFILE,
+            crate::handoff_rendezvous::ENV_PARK_RAISED_FROM,
         ]);
         let mut captured = HANDOFF_ENV_KEYS.to_vec();
         readers.sort_unstable();

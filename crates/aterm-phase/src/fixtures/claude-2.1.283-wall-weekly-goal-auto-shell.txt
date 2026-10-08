@@ -1,0 +1,14 @@
+# claude-code 2.1.283 · HAND-BUILT 2026-09-28 from the 2.1.283/284 binaries' `/goal` notice for a quota wall whose auto-continue is ARMED (`Goal paused · usage limit reached · continues automatically when it resets`; the other variant is claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt's), on the measured weekly wall block and a background shell · a wall Claude Code will continue by itself
+⏺ Dynamic workflow "an example wave" completed · 4h 42m 19s
+  ⎿  You've hit your weekly limit · resets 4pm (America/Los_Angeles)
+     Use your limit reset to reset it now: clau.de/reset
+     /usage-credits to finish what you’re working on.
+
+⏺ Goal paused · usage limit reached · continues automatically when it resets
+
+✻ Sautéed for 1d 2h 58m · done 12:19 PM · 1 shell still running
+                                                                                 ◎ /goal active (1d)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xhigh ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage

@@ -4,11 +4,9 @@
 
 //! Inline images survive the scroll-off → history → materialize round trip.
 //!
-//! An image cell carries a `CellExtra` and NO glyph, so a row that holds only a
-//! picture has `Row::len() == 0`. Every text-driven path in this crate is bounded
-//! by that length, which is why the extraction has its own full-width pass and
-//! why these tests use zero-length rows on purpose: they are the shape the defect
-//! lived in.
+//! An image cell carries a `CellExtra` and no glyph, so an image-only row has
+//! `Row::len() == 0`; text paths are bounded by that length, so extraction has
+//! its own full-width pass. These tests use zero-length rows on purpose.
 
 use std::sync::Arc;
 
@@ -24,6 +22,7 @@ fn placement(rows: u16, cols: u16) -> Arc<ImageData> {
         rows,
         z_index: 0,
         band_lift_px: 0,
+        cell_offset_px: (0, 0),
         scaling: ImageScaling::Fit,
         source_rect: None,
     })
@@ -116,9 +115,8 @@ fn a_scrolled_off_image_row_round_trips_through_a_line_back_to_per_cell_refs() {
 
 #[test]
 fn an_image_row_still_materializes_as_empty_text() {
-    // The picture must not leak spaces into the row's content: a live image row
-    // extracts as "", and a scrolled-back one has to agree or copying history
-    // would yield whitespace the screen never showed.
+    // An image row extracts as "" whether live or scrolled back, so copying
+    // history yields no phantom whitespace.
     let mut grid = Grid::new(4, 20);
     stamp(&mut grid, 0, &placement(1, 6), 0, 6);
     let extras = scrolled_extras(&grid, 0);
@@ -130,10 +128,8 @@ fn an_image_row_still_materializes_as_empty_text() {
 
 #[test]
 fn the_ring_fast_materializer_agrees_with_the_line_round_trip_on_an_image_row() {
-    // `materialize_from_row_extras` short-circuits a zero-length row — which is
-    // EVERY image-only row. If it returned a blank row while the round trip
-    // returned the picture, a ring-tier read and a tiered read of the same
-    // history would disagree.
+    // `materialize_from_row_extras` short-circuits zero-length rows (every
+    // image-only row); ring-tier and tiered reads of the same history agree.
     let mut grid = Grid::new(4, 20);
     let image = placement(2, 4);
     stamp(&mut grid, 0, &image, 1, 4);

@@ -54,7 +54,8 @@ fn spec_shifted(c: char) -> Option<char> {
     })
 }
 
-/// THEOREM (refinement, `a7_keyboard_shift/shift_refines_spec.smt2` twin): for
+/// THEOREM (refinement; the `a7_keyboard_shift` `.smt2` lemmas state the spec
+/// alone, so this Rust test is the only half that binds the engine): for
 /// every key with a distinct shifted glyph, the engine's single shift map
 /// `shifted_character` — the one BOTH the legacy and Kitty paths now use —
 /// equals the independent spec. A second shift table that disagreed (the
@@ -118,46 +119,26 @@ fn uppercase_only_shift_is_caught_by_the_spec() {
     );
 }
 
-/// Regression test: write_u32 with values >= 2,000,000,000 must not
-/// infinite-loop or produce incorrect output.
+/// `write_u32` renders every magnitude, zero and `u32::MAX` included.
 ///
-/// Bug #2775: The original implementation used `u32` for the divisor.
-/// When val >= 2B, `divisor * 10` overflowed u32, causing an infinite
+/// Regression (bug #2775): values >= 2,000,000,000 must not infinite-loop or
+/// produce incorrect output. The original implementation used `u32` for the
+/// divisor. When val >= 2B, `divisor * 10` overflowed u32, causing an infinite
 /// loop in the digit-extraction while loop. Fix: use u64 for divisor.
 #[test]
-fn write_u32_two_billion_boundary() {
-    let mut buf = Vec::new();
-    write_u32(&mut buf, 2_000_000_000);
-    assert_eq!(buf, b"2000000000");
-}
-
-#[test]
-fn write_u32_max() {
-    let mut buf = Vec::new();
-    write_u32(&mut buf, u32::MAX); // 4294967295
-    assert_eq!(buf, b"4294967295");
-}
-
-#[test]
-fn write_u32_zero() {
-    let mut buf = Vec::new();
-    write_u32(&mut buf, 0);
-    assert_eq!(buf, b"0");
-}
-
-#[test]
-fn write_u32_small_values() {
-    let mut buf = Vec::new();
-    write_u32(&mut buf, 1);
-    assert_eq!(buf, b"1");
-
-    buf.clear();
-    write_u32(&mut buf, 97); // 'a' codepoint
-    assert_eq!(buf, b"97");
-
-    buf.clear();
-    write_u32(&mut buf, 999_999_999);
-    assert_eq!(buf, b"999999999");
+fn write_u32_renders_every_magnitude() {
+    for (val, want) in [
+        (0, "0"),
+        (1, "1"),
+        (97, "97"), // 'a' codepoint
+        (999_999_999, "999999999"),
+        (2_000_000_000, "2000000000"),
+        (u32::MAX, "4294967295"),
+    ] {
+        let mut buf = Vec::new();
+        write_u32(&mut buf, val);
+        assert_eq!(buf, want.as_bytes(), "write_u32({val})");
+    }
 }
 
 // =========================================================================
@@ -283,6 +264,11 @@ fn release_encodes_to_nothing_without_report_event_types() {
 /// complete mode space without REPORT_ALL_KEYS_AS_ESC, bare and Shift-only
 /// Characters/Space therefore emit no release bytes. This is the exact Codex
 /// mode (1|2|4) regression: `ESC[99;1:3u` must never be fabricated for `c`.
+///
+/// The spec's "type reset" escape hatch rides the same boundary: releases of
+/// the legacy recovery keys Enter/Tab/Backspace are silent in every modifier
+/// form unless report-all is set (below REPORT_EVENT_TYPES the release-silence
+/// theorem above already covers them), and report-all opts them in.
 #[test]
 fn text_and_recovery_key_releases_require_report_all_keys() {
     let text_keys = [Key::Character('a'), Key::Named(NamedKey::Space)];
@@ -321,6 +307,19 @@ fn text_and_recovery_key_releases_require_report_all_keys() {
             }
         }
     }
+    // The same key is reported once report-all crosses the explicit boundary.
+    assert_eq!(
+        encode_key_with_event(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::empty(),
+            KeyboardMode::DISAMBIGUATE_ESC_CODES
+                | KeyboardMode::REPORT_EVENT_TYPES
+                | KeyboardMode::REPORT_ALL_KEYS_AS_ESC,
+            KeyEventType::Release,
+        ),
+        b"\x1b[13;1:3u",
+        "report-all opts Enter releases in"
+    );
 }
 
 /// THEOREM (distinguishability): in EVERY mode, a reported (non-empty) release
@@ -560,61 +559,6 @@ fn modifier_keys_silent_in_every_mode_without_report_all() {
 }
 
 // =========================================================================
-// ENTER/TAB/BACKSPACE RELEASE escape hatch — the spec's "type reset" clause:
-// releases of these legacy recovery keys are silent unless report-all is set,
-// in every modifier form.
-// =========================================================================
-
-#[test]
-fn escape_hatch_key_releases_silent_without_report_all() {
-    for bits in 0u32..(1u32 << KEYBOARD_MODE_DEFINED_BITS) {
-        let mode = KeyboardMode::from_bits_truncate(bits as u16);
-        if mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC) {
-            continue;
-        }
-        for key in [NamedKey::Enter, NamedKey::Tab, NamedKey::Backspace] {
-            for mods in [
-                Modifiers::empty(),
-                Modifiers::SHIFT,
-                Modifiers::CTRL,
-                Modifiers::ALT,
-                Modifiers::CTRL | Modifiers::SHIFT,
-            ] {
-                let got =
-                    encode_key_with_event(&Key::Named(key), mods, mode, KeyEventType::Release);
-                assert!(
-                    got.is_empty(),
-                    "{key:?} release must be silent — mods={mods:?} mode={mode:?} got={got:?}"
-                );
-            }
-        }
-    }
-    // The same key is reported once report-all crosses the explicit boundary.
-    let events = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
-    assert!(
-        encode_key_with_event(
-            &Key::Named(NamedKey::Enter),
-            Modifiers::SHIFT,
-            events,
-            KeyEventType::Release,
-        )
-        .is_empty(),
-        "modified recovery-key releases stay silent without report-all"
-    );
-    let report_all = events | KeyboardMode::REPORT_ALL_KEYS_AS_ESC;
-    assert_eq!(
-        encode_key_with_event(
-            &Key::Named(NamedKey::Enter),
-            Modifiers::empty(),
-            report_all,
-            KeyEventType::Release,
-        ),
-        b"\x1b[13;1:3u",
-        "report-all opts Enter releases in"
-    );
-}
-
-// =========================================================================
 // Functional-form witnesses: the spec's functional table forms are permanent
 // (not gated on report-all), F3 is tilde-only (its CSI R form was REMOVED for
 // colliding with the Cursor Position Report), and keypad keys fold onto their
@@ -806,6 +750,8 @@ fn shift_enter_concrete_witnesses() {
         encode_enter(KeyboardMode::empty(), Modifiers::SHIFT),
         vec![0x0a]
     );
+    // Ctrl+Enter keeps the CR (the win32 record, not this, is Ctrl+Enter's LF).
+    assert_eq!(encode_enter(KeyboardMode::empty(), Modifiers::CTRL), b"\r");
     // Kitty disambiguate: Shift+Enter is the CSI-u report (what an app that DOES
     // negotiate the protocol — like Ghostty/Kitty — receives).
     let kitty = KeyboardMode::DISAMBIGUATE_ESC_CODES;
@@ -1235,98 +1181,50 @@ fn win32_input_is_not_a_kitty_flag() {
 }
 
 #[test]
-fn win32_shift_enter_is_a_record_pair_with_cr() {
-    // Shift+Enter: SHIFT_PRESSED (0x10), UnicodeChar CR (13) — the record a
-    // physical Shift+Enter carries under Windows Terminal, NOT aterm's Unix
-    // Shift+Enter LF policy. Measured 2026-09-22: `[Console]::ReadKey` reports
-    // `Enter MODS=Shift CHAR=13` for these bytes, PSReadLine runs AddLine on
-    // them, and cmd.exe's cooked reader runs the pending line on them (as it
-    // does under WT) where it stayed inert on an LF record no Windows keyboard
-    // produces.
-    assert_eq!(
-        encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, WIN32),
-        win32_enter_pair(13, 0x10)
-    );
-    assert_eq!(
-        encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, WIN32),
-        b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"
-    );
-}
-
-#[test]
-fn win32_ctrl_enter_and_ctrl_shift_enter_carry_lf() {
-    // CTRL decides the char: LF (10), Windows' own translation of Ctrl+Enter
-    // (the one conhost applies in reverse to a bare 0x0A), with or without
-    // Shift held beside it.
-    assert_eq!(
-        encode_key(&Key::Named(NamedKey::Enter), Modifiers::CTRL, WIN32),
-        win32_enter_pair(10, 0x08)
-    );
-    assert_eq!(
-        encode_key(
-            &Key::Named(NamedKey::Enter),
+fn win32_enter_chords_are_record_pairs_and_plain_enter_stays_legacy() {
+    let enter = Key::Named(NamedKey::Enter);
+    for (mods, want) in [
+        // Shift+Enter: SHIFT_PRESSED (0x10), UnicodeChar CR (13) — the record a
+        // physical Shift+Enter carries under Windows Terminal, NOT aterm's Unix
+        // Shift+Enter LF policy. Measured 2026-09-22: `[Console]::ReadKey` reports
+        // `Enter MODS=Shift CHAR=13` for these bytes, PSReadLine runs AddLine on
+        // them, and cmd.exe's cooked reader runs the pending line on them (as it
+        // does under WT) where it stayed inert on an LF record no Windows keyboard
+        // produces.
+        (Modifiers::SHIFT, win32_enter_pair(13, 0x10)),
+        // CTRL decides the char: LF (10), Windows' own translation of Ctrl+Enter
+        // (the one conhost applies in reverse to a bare 0x0A), with or without
+        // Shift held beside it.
+        (Modifiers::CTRL, win32_enter_pair(10, 0x08)),
+        (
             Modifiers::CTRL | Modifiers::SHIFT,
-            WIN32
+            win32_enter_pair(10, 0x18),
         ),
-        win32_enter_pair(10, 0x18)
-    );
-}
-
-#[test]
-fn win32_alt_rides_along_on_a_shift_or_ctrl_chord() {
-    // ALT adds LEFT_ALT_PRESSED (0x02) and changes nothing else: the char
-    // still follows CTRL alone (CR without it, LF with it).
-    assert_eq!(
-        encode_key(
-            &Key::Named(NamedKey::Enter),
+        // ALT adds LEFT_ALT_PRESSED (0x02) and changes nothing else: the char
+        // still follows CTRL alone (CR without it, LF with it).
+        (
             Modifiers::SHIFT | Modifiers::ALT,
-            WIN32
+            win32_enter_pair(13, 0x12),
         ),
-        win32_enter_pair(13, 0x12)
-    );
-    assert_eq!(
-        encode_key(
-            &Key::Named(NamedKey::Enter),
-            Modifiers::CTRL | Modifiers::ALT,
-            WIN32
-        ),
-        win32_enter_pair(10, 0x0a)
-    );
-    assert_eq!(
-        encode_key(
-            &Key::Named(NamedKey::Enter),
+        (Modifiers::CTRL | Modifiers::ALT, win32_enter_pair(10, 0x0a)),
+        (
             Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT,
-            WIN32
+            win32_enter_pair(10, 0x1a),
         ),
-        win32_enter_pair(10, 0x1a)
-    );
-}
-
-#[test]
-fn win32_plain_and_alt_enter_stay_legacy() {
-    // Both measured working through conhost's legacy translation: plain Enter
-    // is CR, Alt+Enter is Meta-Enter. Neither needs — or gets — a record.
+        // Both measured working through conhost's legacy translation: plain Enter
+        // is CR, Alt+Enter is Meta-Enter. Neither needs — or gets — a record.
+        (Modifiers::empty(), b"\r".to_vec()),
+        (Modifiers::ALT, b"\x1b\r".to_vec()),
+        // CapsLock/NumLock are lock state, not chord modifiers: a plain Enter with
+        // CapsLock lit is still a plain Enter.
+        (Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK, b"\r".to_vec()),
+    ] {
+        assert_eq!(encode_key(&enter, mods, WIN32), want, "{mods:?}+Enter");
+    }
+    // The oracle's Shift+Enter pair, byte for byte.
     assert_eq!(
-        encode_key(&Key::Named(NamedKey::Enter), Modifiers::empty(), WIN32),
-        b"\r"
-    );
-    assert_eq!(
-        encode_key(&Key::Named(NamedKey::Enter), Modifiers::ALT, WIN32),
-        b"\x1b\r"
-    );
-}
-
-#[test]
-fn win32_lock_bits_do_not_make_a_chord() {
-    // CapsLock/NumLock are lock state, not chord modifiers: a plain Enter with
-    // CapsLock lit is still a plain Enter.
-    assert_eq!(
-        encode_key(
-            &Key::Named(NamedKey::Enter),
-            Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
-            WIN32
-        ),
-        b"\r"
+        encode_key(&enter, Modifiers::SHIFT, WIN32),
+        b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"
     );
 }
 
@@ -1970,25 +1868,4 @@ fn win32_numpad_enter_chord_is_an_enhanced_key_record() {
     assert_eq!(encode_key(&kp, Modifiers::empty(), app), b"\x1bOM");
     // The release stand-down covers the keypad chord too.
     assert!(encode_key_with_event(&kp, Modifiers::SHIFT, WIN32, KeyEventType::Release).is_empty());
-}
-
-#[test]
-fn without_win32_input_shift_enter_is_still_the_lf_policy() {
-    // The Unix contract is untouched: no 9001, no records, LF for Shift+Enter.
-    assert_eq!(
-        encode_key(
-            &Key::Named(NamedKey::Enter),
-            Modifiers::SHIFT,
-            KeyboardMode::empty()
-        ),
-        b"\n"
-    );
-    assert_eq!(
-        encode_key(
-            &Key::Named(NamedKey::Enter),
-            Modifiers::CTRL,
-            KeyboardMode::empty()
-        ),
-        b"\r"
-    );
 }

@@ -311,14 +311,6 @@ mod x86_simd {
     }
 }
 
-// This re-export exists solely for `crate::simd_csi`; every call site inside
-// this module reaches `x86_simd::has_avx2()` directly. `simd_csi` became
-// `#[cfg(test)]`-only when the speculative CSI parameter pre-parse was removed
-// from production, so the `test` cfg here tracks it — without it this would be
-// an unused import in an ordinary x86_64 build.
-#[cfg(all(target_arch = "x86_64", not(kani), test))]
-pub(crate) use x86_simd::has_avx2;
-
 // =============================================================================
 // aarch64 SIMD (NEON)
 // =============================================================================

@@ -1,150 +1,66 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS Metal backend — FOUNDATION ONLY, not yet a renderer.
+//! The macOS Metal backend: the renderer's armed arm on macOS, with `wgpu`
+//! kept only as the test oracle every armed row, frame and present is
+//! byte-compared against.
 //!
-//! # What this is, precisely
+//! # Pieces
 //!
-//! THE ROW retires `wgpu` and `softbuffer` on the macOS cell behind first-party
-//! code. This module lands the pieces of that work that can be built AND
-//! PROVEN today:
+//! 1. [`ffi`]: the hand-written Objective-C binding to Metal (no
+//!    `CAMetalLayer`; that lives in [`swapchain`] with the QuartzCore link).
+//! 2. [`shaders`]: aterm's shaders ported from WGSL to MSL, so `naga` is not
+//!    needed.
+//! 3. `blit` (tests): the present blit end to end on Metal, held byte-identical
+//!    to the wgpu blit.
+//! 4. Pipeline and encoder state the renderer sets (colour write mask,
+//!    scissor, viewport, sampler filters, compile options), each proven by a
+//!    GPU readback, since Metal's defaults are permissive and a missing setter
+//!    is silent (see `tests`).
+//! 5. [`pipelines`]: builds `MTLRenderPipelineState`s from
+//!    [`crate::pipeline_table`], the same rows `renderer.rs` builds its wgpu
+//!    pipelines from, so no entry point, blend, mask, layout or target role is
+//!    spelled twice.
+//! 6. [`loss`]: the device-loss latch. Metal has no device-lost callback; the
+//!    signal is per-command-buffer status, classified RETRYABLE or LOST and
+//!    latched sticky.
+//! 7. [`swapchain`]: `CAMetalLayer` by class name, with a bounded acquire,
+//!    present in scheduled-safe order, and the frame boundary as a type.
 //!
-//! 1. [`ffi`] — the hand-written Objective-C binding to Metal. Metal ONLY:
-//!    there is no `CAMetalLayer` in `ffi` — the present-path surface lives in
-//!    [`swapchain`], which owns the QuartzCore link beside the code that
-//!    needs it (the empty link that used to sit in `ffi` beside a false claim
-//!    was removed, and the honest one landed where its header promised).
-//! 2. [`shaders`] — all six of aterm's shaders ported from WGSL to MSL, so that
-//!    `naga` (212,320 of the lines this row exists to remove) is not needed to
-//!    reach Metal.
-//! 3. `blit` — the present-path blit, end to end on Metal: pipeline, sampler,
-//!    uniform, render pass and readback. This is the ONE experiment
-//!    `docs/measured/wgpu-metal-decision-2026-08-30.md` §8 makes the whole row
-//!    conditional on, and it is GREEN — see below.
-//! 4. The PIPELINE AND ENCODER STATE `renderer.rs`'s pipelines actually set,
-//!    each proven on the GPU by a readback rather than by the presence of a
-//!    selector: the colour write mask (ten of the eighteen pipelines are
-//!    `ColorWrites::COLOR`, and Metal's default is ALL), the scissor rect and
-//!    viewport (seven call sites in `renderer.rs`, and the default is the whole
-//!    attachment), the sampler filters (three of four `renderer.rs` samplers are
-//!    LINEAR, and the default is nearest), and the compile options
-//!    `preserveInvariance` / `languageVersion`. Every default here is the
-//!    permissive one, so each of these was silently missing rather than a
-//!    compile error — see `tests`.
-//! 5. [`pipelines`] — the OTHER consumer of [`crate::pipeline_table`]. All
-//!    eighteen pipelines are now DECLARED once, in a backend-neutral table, and
-//!    built twice: `renderer.rs` makes `wgpu` pipelines out of the rows and
-//!    this module makes `MTLRenderPipelineState`s out of the same rows. Nothing
-//!    on either side re-spells an entry point, a blend factor, a write mask, a
-//!    vertex layout or a colour-target role, so the drift a judge found in the
-//!    four hand-written pipeline tests this replaced has nowhere left to live.
-//! 6. [`loss`] — the DEVICE-LOSS LATCH. Metal has no `wgpu`-style device-lost
-//!    callback; the observable signal is per-command-buffer status/error, and
-//!    `loss` classifies it (RETRYABLE vs LOST, latched sticky) with the tests
-//!    the shipped `wgpu` latch never had.
-//! 7. [`swapchain`] — THE SWAPCHAIN. `CAMetalLayer` by class name through the
-//!    runtime: every configured axis documented against
-//!    `wgpu-hal-29.0.3/src/metal/surface.rs` line by line, acquire with a
-//!    BOUNDED failure mode where wgpu blocks forever, present in the
-//!    scheduled-safe order, and the frame boundary encoded as a type
-//!    (`Frame` borrows the swapchain mutably until presented or discarded).
+//! `build_glow_boost_pipeline` is one `create_render_pipeline` site used for
+//! two rows (HDR crown and SDR twin), so there is one more pipeline than
+//! call sites.
 //!
-//! SEVENTEEN CALL SITES, EIGHTEEN PIPELINES: `build_glow_boost_pipeline` is one
-//! `create_render_pipeline` site parameterised twice, for the EDR crown and its
-//! SDR twin. Counts elsewhere in this module that say "seventeen" are counting
-//! sites.
+//! # Blit differential
 //!
-//! # THE §8 GATE: PASSED
+//! [`tests::blit_matches_wgpu_byte_for_byte`] sends the same offscreen texels
+//! and 112 `BlitUniform` bytes through the wgpu blit and the Metal one and
+//! requires every byte to agree, over the four control-flow arms of `fs_blit`
+//! (exact-fit passthrough, bell invert, oversized with bands, cropped with the
+//! drop overlay). Each planted mutation (wrong uniform slot, sRGB destination,
+//! 1-LSB invert change, band colour, overlay alpha, crop origin) fails only
+//! the arms that reach it.
 //!
-//! The decision document names a single falsifiable experiment and a refusal
-//! condition: port `build_blit_resources` + `BLIT_SHADER` to Metal, hold the
-//! byte-identical blit assertions green, or REFUSE the row.
+//! # The armed backend and its oracle
 //!
-//! [`tests::blit_matches_wgpu_byte_for_byte`] is that experiment, run as a
-//! DIFFERENTIAL rather than as a property check: the same offscreen texels and
-//! the same 112 `BlitUniform` bytes go through the shipped `wgpu` blit and
-//! through the first-party Metal one, and every byte of both outputs must
-//! agree. Measured on an Apple M5 Max, over the four control-flow arms of
-//! `fs_blit` — 156,226 pixels, **0 differing**:
+//! [`crate::renderer`] selects this backend at construction on macOS. `wgpu`
+//! remains on macOS only behind the `wgpu-oracle` feature for this crate's
+//! tests, so differentials can disarm a renderer onto the wgpu arm and compare.
+//! The module is `#[cfg(target_os = "macos")]` in `lib.rs`; other platforms
+//! keep their wgpu/softbuffer paths.
 //!
-//! | arm | destination | pixels | differing |
-//! |---|---|---:|---:|
-//! | exact fit, passthrough | 264x126 | 33,264 | 0 |
-//! | exact fit, bell invert | 264x126 | 33,264 | 0 |
-//! | oversized, W1 bands | 301x149 | 44,849 | 0 |
-//! | cropped + drop overlay | 301x149 | 44,849 | 0 |
+//! # CPU parity
 //!
-//! The gate is FALSIFIABLE, and that was checked rather than assumed. Five
-//! mutations were planted and the results recorded:
-//!
-//! | mutation | caught | first divergence |
-//! |---|---|---|
-//! | uniform bound at `[[buffer(1)]]` instead of `(2)` | YES, arm 1 | 24,752/33,264 |
-//! | destination `Rgba8UnormSrgb` (the §4.1 gamma double-encode) | YES, arm 1 | 24,752/33,264 |
-//! | `1.0 - rgb` → `1.0 - rgb * 0.99` (1 LSB) | YES, arm 2 only | 2,679/33,264 |
-//! | band colour scaled 0.9 | YES, arms 3-4 only | 11,585/44,849 |
-//! | overlay `mix` alpha halved | YES, arm 4 only | 32,472/44,849 |
-//! | crop origin ignored (`p.y < 0.0`) | YES, arm 4 only | 792/44,849 |
-//!
-//! Two of those matter beyond "the test works". The **sRGB destination** is the
-//! exact defect class §4.1 predicts a port would ship and records as invisible
-//! to all 274 existing `aterm-gpu` tests; this gate moves 74% of the frame on
-//! it. And each mutation fails ONLY the arms that reach it, so the four cases
-//! are independently non-vacuous rather than one assertion counted four times.
-//!
-//! One planted mutation was NOT caught and is recorded because it is evidence
-//! about the shader, not about the gate: `edge < border_px` → `edge <=` changes
-//! nothing, because `edge` is a distance between half-pixel centres and an
-//! integer thickness and is therefore never exactly equal to it. That is an
-//! inert edit, not a hole.
-//!
-//! # What this is NOT
-//!
-//! It is **not** wired into [`crate::renderer`], and nothing outside this
-//! module calls it. `GpuRenderer` is still `wgpu` on every cell, including
-//! macOS; `crates/aterm-gpu/Cargo.toml` still names `wgpu` for macOS; and the
-//! `forge survey` figure for the mac-arm cell is unmoved at 91 packages /
-//! 1,275,882 lines. The renderer is 18,194 lines holding 1,073 `wgpu::`
-//! references across 95 distinct items, 129 `GpuRenderer` fields, 17 pipelines,
-//! 10 render passes and 7 bind-group layouts; translating that is a separate,
-//! much larger phase. What the §8 gate above establishes is that the phase is
-//! WORTH STARTING — not that it has started. Landing this module first means the shader port — the
-//! part with a real correctness contract — is reviewable and testable on its
-//! own, before any of that plumbing moves.
-//!
-//! There is also no seam to hide behind yet: `docs/measured/gpu-seam-2026-08-30.md`
-//! DESIGNED one (three traits plus a cfg-selected module) but no `seam.rs` was
-//! ever written, so "gate the new backend behind the seam" has nothing to gate
-//! against. This module is therefore gated the only way it currently can be —
-//! `#[cfg(target_os = "macos")]` at its declaration in `lib.rs` — and every
-//! other cell keeps the wgpu/softbuffer paths byte-for-byte untouched.
-//!
-//! # The parity contract, and how it was checked
-//!
-//! Two of aterm's fragment shaders are not free-floating art: `fs_rain_glow`
-//! and `fs_fire_add`/`fs_fire_over` reproduce `aterm_render`'s pure-integer
-//! CPU field math OP-FOR-OP, and a differential is the referee. Those ports
-//! were verified against the CPU by evaluating the SHIPPED MSL functions in a
-//! verification-only compute kernel and diffing against
-//! `aterm_render::fire_field` / `aterm_render::halo_weight`:
-//!
-//! * fire: 10 parameter sets, 85,120 pixels (36,462 with non-zero output),
-//!   covering zero and maximum temp/strength, both lean extremes, `phase ==
-//!   u32::MAX`, minimum `cell_h`, maximum `peak_h`, negative pixel coordinates
-//!   and the top-fade band — **0 differing pixels**.
-//! * rain halo: 6 parameter sets, 34,000 pixels, including the centre clamp,
-//!   degenerate ellipses and negative coordinates — **0 differing pixels**.
-//!
-//! The one construct that made this delicate is the arithmetic right shift.
-//! `fire_core` shifts a possibly-NEGATIVE `int` right (`(body0 - 128) * edge >>
-//! 8`), and the parity depends on that being sign-replicating. WGSL defines
-//! `i32 >>` as arithmetic and MSL pins the same for signed types, so the twins
-//! agree; this is NOT the C++ implementation-defined case.
+//! `fs_rain_glow` and `fs_fire_add`/`fs_fire_over` reproduce `aterm_render`'s
+//! integer field math op for op. The tests evaluate the shipped MSL functions
+//! in a compute kernel and diff them against `aterm_render::fire_field` and
+//! `aterm_render::halo_weight` over edge-case parameter sets. The parity relies
+//! on `>>` of a negative `int` being arithmetic, which both WGSL and MSL
+//! define for signed types.
 
-// The armed renderer reaches this module on macOS. The parts only the
-// verification ladder uses — the `blit` experiment, the compute/parity
-// kernels, the read-back getters — are `#[cfg(test)]`, so they stay in the
-// tests that make the shader port trustworthy without shipping.
+// The armed renderer uses this module on macOS; the verification-only parts
+// (the `blit` experiment, parity kernels, readback getters) are
+// `#[cfg(test)]`.
 
 pub(crate) mod acquire_worker;
 #[cfg(test)]
@@ -158,6 +74,74 @@ pub(crate) mod resources;
 pub(crate) mod shaders;
 pub(crate) mod swapchain;
 
+/// The helpers every GPU test module under `metal` shares.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::ffi::{self, Device, Obj};
+
+    /// A device for GPU tests, or `None` (with a loud skip message) on a machine
+    /// without one.
+    ///
+    /// Uses [`Device::preferred`], the device the Metal arm renders on: on a
+    /// dual-GPU Mac the system default is the discrete GPU while the wgpu arm
+    /// asks for the low-power one, and two GPUs can round a blended channel
+    /// differently.
+    pub(crate) fn device() -> Option<Device> {
+        let d = Device::preferred();
+        if d.is_none() {
+            crate::stderr_line!("SKIP: no Metal device");
+        }
+        d
+    }
+
+    /// `cell.metal`'s 16-byte `Uniforms` block: `float2 screen`,
+    /// `float text_blend`, `float pad`, laid out identically in `repr(C)`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(crate) struct CellUniforms {
+        pub(crate) screen: [f32; 2],
+        pub(crate) text_blend: f32,
+        pub(crate) pad: f32,
+    }
+
+    /// # Safety
+    /// `T` must be `repr(C)` and free of padding-sensitive invariants; the
+    /// bytes are copied straight into a GPU-visible buffer.
+    pub(crate) unsafe fn as_bytes<T: Copy>(v: &T) -> &[u8] {
+        // SAFETY: `T: Copy` + `repr(C)`; read-only, lives only for the copy.
+        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), size_of::<T>()) }
+    }
+
+    /// A bare `CALayer` (+1) — the stand-in for an NSView's root layer (and,
+    /// in the swapchain stacking tests, for wgpu's leftover CAMetalLayer).
+    pub(crate) fn plain_calayer() -> Obj {
+        let _pool = ffi::AutoreleasePool::new();
+        // SAFETY: alloc/init, +1, exactly as `Swapchain::new_layer`.
+        unsafe {
+            let alloc: unsafe extern "C" fn(ffi::ClassPtr, ffi::Sel) -> ffi::Id = ffi::msg();
+            let raw = alloc(ffi::class(c"CALayer"), ffi::sel(c"alloc"));
+            let init: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+            Obj::from_owned(init(raw, ffi::sel(c"init"))).expect("CALayer init")
+        }
+    }
+
+    /// `-[CALayer sublayers].count` (0 when the property is nil).
+    pub(crate) fn sublayer_count(layer: &Obj) -> usize {
+        let _pool = ffi::AutoreleasePool::new();
+        // SAFETY: `sublayers` returns a +0 NSArray (or nil) owned by the
+        // pool; `count` is an NSUInteger getter on it.
+        unsafe {
+            let get: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+            let arr = get(layer.id(), ffi::sel(c"sublayers"));
+            if arr.is_null() {
+                return 0;
+            }
+            let count: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> usize = ffi::msg();
+            count(arr, ffi::sel(c"count"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ffi::{
@@ -166,58 +150,13 @@ mod tests {
         PixelFormat, RenderPipelineDescriptor, SamplerDesc, TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
         TEXTURE_USAGE_RENDER_TARGET, TEXTURE_USAGE_SHADER_READ,
     };
+    use super::test_support::{CellUniforms, as_bytes, device, plain_calayer, sublayer_count};
     use super::{ffi, shaders};
 
-    /// Every test here needs a GPU. A machine without one (a VM, a sandbox that
-    /// denies the device) should SKIP rather than fail, but a machine WITH one
-    /// must actually run the checks — so the skip is loud.
-    ///
-    /// It is [`Device::preferred`], the device the metal arm renders on, not the
-    /// system default: on a dual-GPU Mac the system default is the discrete GPU
-    /// while the wgpu arm these rows compare against asks for the low-power one
-    /// (`power_preference_from_env`), and two GPUs round a blended channel
-    /// differently. Measured on an Intel HD 630 + Radeon Pro 560 MacBook Pro
-    /// (macOS 13.7.8): with the system default here and in `MetalBlit::new`
-    /// (whose only caller is this harness), eight byte-for-byte rows were red
-    /// by a max channel delta of 1. Four more went red the same way through
-    /// renderer.rs's three differential helpers, which take `preferred` too.
-    fn device() -> Option<Device> {
-        let d = Device::preferred();
-        if d.is_none() {
-            crate::stderr_line!("SKIP: no Metal device on this machine");
-        }
-        d
-    }
-
-    // THE FOUR HAND-WRITTEN PIPELINE TESTS THAT USED TO BE HERE ARE GONE.
-    //
-    // `bg_pipeline_builds_with_the_real_vertex_layout`,
-    // `fire_pipeline_builds_with_the_real_vertex_layout`,
-    // `glyph_pipeline_builds_on_the_srgb_view_format` and
-    // `hdr_glow_pipeline_builds_on_rgba16float` each re-spelled ONE pipeline's
-    // blend factors, write mask and attachment format in Metal terms — and all
-    // four had drifted from `renderer.rs`, in mutually inconsistent ways: the
-    // fire and bg tests attached `Bgra8Unorm` where the renderer attaches
-    // `Rgba8Unorm`, the glyph test `Bgra8UnormSrgb` where the renderer attaches
-    // `Rgba8UnormSrgb`, and the EDR test substituted `(Zero, One)` on the alpha
-    // channel where `renderer.rs:9339` says `alpha: add` — passing only because
-    // `fs_hdr_glow` happens to emit alpha `0.0`. Their doc comments claimed
-    // they validated "the blend state" and "the EDR arm"; they validated that
-    // Metal accepts *a* pipeline.
-    //
-    // `super::pipelines::tests::every_table_row_builds_a_metal_pipeline`
-    // replaces all four with a sweep of ALL EIGHTEEN rows of THE PIPELINE
-    // TABLE, on both swapchain formats — the same rows `renderer.rs` builds its
-    // `wgpu` pipelines from, so there is nothing left to re-spell.
-
     // -----------------------------------------------------------------
-    // THE PARITY DIFFERENTIAL.
-    //
-    // `fs_fire_*` and `fs_rain_glow*` are not free art: they reproduce
-    // `aterm_render`'s pure-integer CPU field math OP-FOR-OP so the CPU and GPU
-    // rasterizers agree byte-for-byte. These tests are the referee, and they
-    // run the SHIPPED MSL functions (the kernels are concatenated onto
-    // `cell.metal`) against the SHIPPED CPU functions.
+    // CPU parity differential: `fs_fire_*` and `fs_rain_glow*` reproduce
+    // `aterm_render`'s integer field math. The shipped MSL functions
+    // (kernels concatenated onto `cell.metal`) run against the CPU functions.
     // -----------------------------------------------------------------
 
     #[repr(C)]
@@ -252,20 +191,13 @@ mod tests {
         w: i32,
     }
 
-    /// # Safety
-    /// `T` must be `repr(C)` and free of padding-sensitive invariants; it is
-    /// copied verbatim into a GPU-visible buffer.
-    unsafe fn as_bytes<T: Copy>(v: &T) -> &[u8] {
-        // SAFETY: `T: Copy` and `repr(C)`; the slice is read-only and lives
-        // only for the copy into the Metal buffer.
-        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), size_of::<T>()) }
-    }
-
     /// EMBERFORGE: the MSL fire field must equal `aterm_render::fire_field`
     /// exactly, at every pixel, for every parameter extreme.
     #[test]
     fn fire_field_matches_the_cpu_bit_for_bit() {
-        use aterm_render::fire_field::{FireFieldParams, fire_field_add, fire_field_over};
+        use aterm_render::fire_field::{
+            FireFieldParams, FireRow, fire_precomp, fire_shade_add, fire_shade_over, fire_top_fade,
+        };
 
         let Some(dev) = device() else { return };
         let lib = dev
@@ -275,9 +207,8 @@ mod tests {
         let pso = dev.new_compute_pipeline(&kf).expect("fire compute pso");
         let queue = dev.new_command_queue().expect("queue");
 
-        // A case is the GPU param block plus the row count. Spelled through a
-        // constructor rather than a bare 13-tuple so each column is named once
-        // and the table below stays one line per case.
+        // A case is the GPU param block plus the row count, built through a
+        // constructor so each column is named once.
         #[expect(clippy::too_many_arguments, reason = "one named column per field")]
         const fn case(
             base_y: i32,
@@ -313,10 +244,9 @@ mod tests {
             )
         }
 
-        // Covers: the baseline, zero temp/strength, both lean extremes at
-        // maximum heat, `phase == u32::MAX`, the top-fade band, minimum cell
-        // height with maximum peak, a degenerate peak, negative pixel
-        // coordinates, and an offset region.
+        // Baseline, zero temp/strength, both lean extremes at max heat,
+        // `phase == u32::MAX`, the top-fade band, minimum cell height with max
+        // peak, a degenerate peak, negative coordinates, an offset region.
         let cases = [
             case(200, 120, 12345, 180, 220, -37, 255, 18, 40, 0, 60, 64, 160),
             case(200, 120, 0, 0, 0, 0, 255, 18, 40, 0, 60, 48, 160),
@@ -380,12 +310,17 @@ mod tests {
                 cell_h: p.cell_h,
                 top_fade_y: p.top_fade_y,
             };
+            let pc = fire_precomp(&cpu);
             for y in 0..h {
+                let py = y0 + y;
+                let tf = fire_top_fade(py, &cpu);
+                let mut row = FireRow::new(py, x0, &cpu, &pc);
                 for x in 0..w {
                     let i = (y * w + x) as usize;
-                    let (px, py) = (x0 + x, y0 + y);
-                    let add = fire_field_add(px, py, &cpu);
-                    let (ink, alpha) = fire_field_over(px, py, &cpu);
+                    let px = x0 + x;
+                    let c = row.core(px);
+                    let add = fire_shade_add(&c, &cpu, tf);
+                    let (ink, alpha) = fire_shade_over(&c, &cpu, tf);
                     assert_eq!(g_add[i], add, "fire ADD mismatch at ({px},{py}) {cpu:?}");
                     assert_eq!(g_ink[i], ink, "fire INK mismatch at ({px},{py}) {cpu:?}");
                     assert_eq!(
@@ -495,9 +430,8 @@ mod tests {
                     let i = (y * w + x) as usize;
                     let (px, py) = (x0 + x, y0 + y);
                     let ny = halo_row_ny(py - cy, ry * ry);
-                    // The shader clamps the live weight to 255; the CPU leaves
-                    // that to its callers (`draw_rain_add`), so clamp here to
-                    // compare the same quantity.
+                    // The shader clamps the weight to 255; the CPU leaves that
+                    // to `draw_rain_add`, so clamp here too.
                     let wt = halo_weight(px - cx, ny, rx * rx).min(255);
                     let m = |c: i32| ((c * wt + 127) / 255) as u32;
                     assert_eq!(g_wt[i], wt as u32, "halo WEIGHT mismatch at ({px},{py})");
@@ -514,19 +448,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // THE PIPELINE AND ENCODER STATE SURFACE.
-    //
-    // Every check below is a READBACK, because every piece of state here is
-    // invisible to a test that only asks whether the pass ran: Metal's default
-    // write mask is ALL, its default scissor and viewport are the whole
-    // attachment, and its default sampler filter is nearest. A pipeline that
-    // silently drops the mask builds exactly as happily as one that honours it.
+    // Pipeline and encoder state. Every check is a readback: Metal's defaults
+    // (write mask ALL, whole-attachment scissor and viewport, nearest
+    // filtering) make a dropped setter silent.
     // -----------------------------------------------------------------
 
     /// The 32-byte `Probe` uniform in `shaders/state_probe.metal`: `float4`
-    /// colour at 0, `float2` destination size at 16, `float2` pad at 24. Every
-    /// member is <= 16 bytes and naturally aligned, so MSL's `constant` layout
-    /// and this `repr(C)` agree member for member.
+    /// colour at 0, `float2` destination size at 16, `float2` pad at 24.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct ProbeUniform {
@@ -586,10 +514,8 @@ mod tests {
             b
         }
 
-        /// A render-target texture pre-loaded with `fill` repeated over every
-        /// texel, so a pass using [`LoadAction::Load`] starts from KNOWN bytes
-        /// and anything the pass leaves alone is byte-exact rather than a
-        /// float-rounded clear.
+        /// A render target pre-filled with `fill`, so a `LoadAction::Load` pass
+        /// starts from known bytes and untouched texels stay byte-exact.
         fn filled_target(&self, format: PixelFormat, w: usize, h: usize, fill: &[u8]) -> ffi::Obj {
             assert_eq!(fill.len(), format.bytes_per_texel(), "fill is one texel");
             let tex = self
@@ -607,9 +533,8 @@ mod tests {
                 .cycle()
                 .take(w * h * fill.len())
                 .collect();
-            // SAFETY: `tex` was just created 2-D at `format`, `w` x `h`, with
-            // the descriptor's default non-Private storage; `bytes` is exactly
-            // `w * h` texels of that format and the stride matches the row.
+            // SAFETY: `tex` is 2-D `format`, `w` x `h`, non-Private storage;
+            // `bytes` is exactly `w * h` texels with a matching stride.
             unsafe {
                 ffi::texture_upload(
                     &tex,
@@ -627,32 +552,22 @@ mod tests {
             let n = row * pass.dst_h;
             let rb = self.dev.new_buffer(n).expect("readback");
             ffi::draw_and_read(&self.queue, pass, &rb, row).expect("probe pass runs");
-            // SAFETY: `rb` is shared storage of exactly `n` bytes and
-            // `draw_and_read` returned only after
-            // `waitUntilCompleted`, so the GPU's writes are visible.
+            // SAFETY: `rb` is shared storage of exactly `n` bytes, and
+            // `draw_and_read` returned after `waitUntilCompleted`.
             unsafe { ffi::buffer_bytes(&rb, n) }
         }
     }
 
-    /// A1. THE COLOUR WRITE MASK, one channel at a time.
+    /// The colour write mask, one channel at a time.
     ///
-    /// `set_color_attachment` used to set format and blend and nothing else, so
-    /// every pipeline it built got Metal's default `MTLColorWriteMaskAll` —
-    /// while nine of `renderer.rs`'s seventeen are `wgpu::ColorWrites::COLOR`,
-    /// "RGB-only write-mask so it never perturbs the alpha the blit relies on"
-    /// (`renderer.rs:3759`).
+    /// Many renderer pipelines use an RGB-only mask so they never disturb the
+    /// alpha the blit relies on; Metal's default is all channels. The setup is
+    /// a destination with alpha 64/255 (a translucent window) under one
+    /// One/One draw whose fragment emits alpha 1.0 (as `fs_fire_add` and
+    /// `fs_rain_glow` do): the default mask ends at alpha 255, `COLOR` at 64.
     ///
-    /// The setup is the reaching input, not a synthetic one: a destination
-    /// holding alpha 64/255 (a translucent window, `renderer.rs:8721`) under ONE
-    /// `One`/`One` additive draw whose fragment emits alpha 1.0 — which is
-    /// exactly what `fs_fire_add` (`cell.metal:362`) and `fs_rain_glow`
-    /// (`cell.metal:139`) emit. Under the default mask the glass finishes at
-    /// alpha 255; under `COLOR` it finishes at 64. Measured here, both arms.
-    ///
-    /// All six masks are checked rather than just those two, because the bit
-    /// order in `MTLPixelFormat.h` is NOT the channel order (alpha is bit 0,
-    /// red is bit 3) and a transposed pair would still pass an ALL-vs-COLOR
-    /// test.
+    /// All six masks are checked because Metal's bit order (alpha is bit 0,
+    /// red bit 3) is not the channel order.
     #[test]
     fn color_write_mask_gates_each_channel_on_the_gpu() {
         let Some(dev) = device() else { return };
@@ -747,13 +662,8 @@ mod tests {
         }
     }
 
-    /// A2. `-setScissorRect:` must actually clip.
-    ///
-    /// `renderer.rs` sets a scissor at six sites (`:8847 :8850 :8870 :9812
-    /// :10382 :14808`) — the shimmer region, the EDR crown's `crown_scissor`,
-    /// and the effect bands. Without this selector every one of those passes is
-    /// inexpressible, and the failure is silent: a missing scissor draws MORE,
-    /// not less, so nothing errors.
+    /// `-setScissorRect:` must clip. A missing scissor draws more, not less,
+    /// so nothing errors without this check.
     #[test]
     fn scissor_rect_clips_the_fullscreen_draw() {
         let Some(dev) = device() else { return };
@@ -767,16 +677,9 @@ mod tests {
         assert_clipped_to(&got, sc.x, sc.y, sc.width, sc.height, "scissor");
     }
 
-    /// A2. `-setViewport:` must confine the draw the same way.
-    ///
-    /// `renderer.rs:8846` sets one before every scissored pass. The fullscreen
-    /// triangle covers the whole clip volume, so after the viewport transform
-    /// its coverage is exactly the viewport rect — anything outside comes from
-    /// NDC outside `[-1,1]` and is clipped.
-    ///
-    /// Checked separately from the scissor because they are separate state:
-    /// a backend that wired `setViewport:` to `setScissorRect:` (or dropped one
-    /// of the two) passes either test alone.
+    /// `-setViewport:` must confine the draw. The fullscreen triangle's
+    /// coverage after the viewport transform is exactly the viewport rect.
+    /// Checked separately from the scissor, since they are separate state.
     #[test]
     fn viewport_confines_the_fullscreen_draw() {
         let Some(dev) = device() else { return };
@@ -791,10 +694,8 @@ mod tests {
         let p = StateProbe::new(dev);
         assert_clipped_to(&clip_probe(&p, Some(vp), None), 4, 3, 6, 5, "viewport");
 
-        // `MtlViewport::full_2d` is the constructor `renderer.rs:8846` uses, and
-        // it must be a NO-OP: the whole attachment stated explicitly and no
-        // viewport at all have to produce the same frame, or its arithmetic is
-        // wrong in a way only a partial viewport would ever reveal.
+        // `MtlViewport::full_2d` must be a no-op: the whole attachment stated
+        // explicitly equals no viewport.
         let full = clip_probe(&p, Some(MtlViewport::full_2d(CLIP_W, CLIP_H)), None);
         assert_eq!(
             full,
@@ -877,10 +778,8 @@ mod tests {
     }
 
     /// Draw `fs_probe_sample` over a `dw` x `dh` destination, fetching a
-    /// `sw` x `sh` RGBA8 source through `desc`, and hand back the destination
-    /// bytes. Shared by the two filter probes below, whose whole difference is
-    /// the direction of the scale — which is what decides WHICH filter the
-    /// hardware consults.
+    /// `sw` x `sh` RGBA8 source through `desc`, and return the destination
+    /// bytes. The scale direction decides which filter the hardware consults.
     fn sample_through(
         p: &StateProbe,
         (sw, sh): (usize, usize),
@@ -894,9 +793,8 @@ mod tests {
             .dev
             .new_texture_2d(FMT, sw, sh, TEXTURE_USAGE_SHADER_READ)
             .expect("sample source");
-        // SAFETY: `src` was just created 2-D `Rgba8Unorm` at `sw` x `sh` with
-        // the descriptor's default non-Private storage; `src_bytes` was length-
-        // checked above and the stride is one row of it.
+        // SAFETY: `src` is 2-D `Rgba8Unorm` at `sw` x `sh`, non-Private;
+        // `src_bytes` was length-checked and the stride is one row.
         unsafe { ffi::texture_upload(&src, MtlRegion::full_2d(sw, sh), src_bytes, sw * 4) };
 
         let pso = p.pipeline("fs_probe_sample", FMT, ColorWriteMask::ALL, None);
@@ -926,23 +824,13 @@ mod tests {
         )
     }
 
-    /// A3. `setMagFilter:` must reach the sampled bytes — proven by a
-    /// MAGNIFYING pass, which is the only kind that consults it.
+    /// `setMagFilter:` reaches the sampled bytes, proven by a magnifying pass
+    /// (the only kind that consults it). Several renderer samplers are linear
+    /// (bloom, tray, shimmer, which samples sub-texel displacements).
     ///
-    /// `new_sampler` used to return a bare `MTLSamplerDescriptor` — nearest,
-    /// nearest, clampToEdge — and the FFI declared no filter setter at all,
-    /// while three of `renderer.rs`'s four samplers are LINEAR: bloom
-    /// (`:3806`), tray (`:4962`), and shimmer, which reuses the bloom sampler
-    /// (`:3145`) and samples at DISPLACED sub-texel positions, where nearest
-    /// quantizes the whole heat-haze displacement away.
-    ///
-    /// A 2x2 checkerboard read into a 4x4 destination puts every sample a
-    /// quarter texel off centre — inside the magnification regime (scale
-    /// factor 1/2, LOD < 0), so the MAG filter and only the MAG filter decides
-    /// the bytes. This probe used to be the module's whole filter coverage
-    /// while its failure message claimed `setMinFilter:` too; deleting the
-    /// min-filter write stayed green here, which is why
-    /// [`sampler_min_filter_changes_the_minified_bytes`] exists.
+    /// A 2x2 checkerboard read into 4x4 puts every sample a quarter texel off
+    /// centre, so only the mag filter decides the bytes. The min filter is
+    /// covered by [`sampler_min_filter_changes_the_minified_bytes`].
     #[test]
     fn sampler_mag_filter_changes_the_magnified_bytes() {
         let Some(dev) = device() else { return };
@@ -993,28 +881,19 @@ mod tests {
         );
     }
 
-    /// A3b. `setMinFilter:` must reach the sampled bytes — which only a
-    /// MINIFYING pass can prove, and no probe did: the magnification probe
-    /// above leaves the min filter unconsulted, so deleting the
-    /// `setMinFilter:` write kept the whole suite green while three of
-    /// `renderer.rs`'s four samplers say `min_filter: Linear`.
+    /// `setMinFilter:` reaches the sampled bytes, proven by a minifying pass.
     ///
-    /// 4x4 -> 2x2 (scale factor 2, LOD +1) puts every destination sample at
-    /// the CORNER of one 2x2 source quadrant — destination centres 0.25/0.75
-    /// map to source texel coordinates 1.0/3.0 — so a linear minifying fetch
-    /// is the exact quarter-weight average of its quadrant while a nearest
-    /// fetch returns one pure texel of it. The two mixed quadrants (one dark
-    /// texel among three bright, and the mirror) make those answers
-    /// unconfusable: ~191 and ~64 against a pure 0 or 255. The two constant
-    /// quadrants are controls where the filters MUST agree.
+    /// 4x4 -> 2x2 puts every sample at the corner of a 2x2 source quadrant, so
+    /// linear minification averages the quadrant while nearest returns one
+    /// texel. Two mixed quadrants (~191 and ~64 against 0 or 255) tell them
+    /// apart; two constant quadrants are controls where they must agree.
     #[test]
     fn sampler_min_filter_changes_the_minified_bytes() {
         let Some(dev) = device() else { return };
         let p = StateProbe::new(dev);
 
-        // Red channel of the 4x4 source, one row per line. Quadrants:
-        // top-left (0,0)=0 rest 255 -> avg 191.25; top-right (2,0)=255 rest 0
-        // -> avg 63.75; bottom-left all 255; bottom-right all 0.
+        // Red channel of the 4x4 source, one row per line. Quadrant averages:
+        // top-left 191.25, top-right 63.75, bottom-left 255, bottom-right 0.
         #[rustfmt::skip]
         let red: [u8; 16] = [
               0, 255,   255,   0,
@@ -1051,22 +930,11 @@ mod tests {
         );
     }
 
-    /// A4. The compile options must be SET, and set to what we chose.
-    ///
-    /// `new_library` compiled every MSL library with `options = nil`, taking the
-    /// defaults. `wgpu-hal` deliberately does not
-    /// (`wgpu-hal-29.0.3/src/metal/device.rs:227-232`): it sets
-    /// `preserveInvariance` and pins `languageVersion`. Without invariance the
-    /// compiler may contract the same vertex-position arithmetic differently in
-    /// two libraries — and `cell.metal`'s `to_ndc` and `hdr_glow.metal`'s inline
-    /// `2.0 * px.x / hu.screen.x - 1.0` compute the SAME quad corner, because
-    /// the EDR crown re-emits the aurora quads the cell pass drew.
-    ///
-    /// Both properties are round-tripped rather than merely written, because a
-    /// mistyped `msg` prototype is the failure mode this file's whole
-    /// convention exists to prevent, and a write that lands in the wrong
-    /// register is otherwise silent. Each is set to TWO different values so the
-    /// pair proves the setter, independent of whatever the OS defaults to.
+    /// The library compile options are set and round-trip: `preserveInvariance`
+    /// (so `cell.metal`'s `to_ndc` and `hdr_glow.metal`'s inline NDC math
+    /// compute the same quad corners, as the HDR crown re-emits aurora quads)
+    /// and a pinned `languageVersion`, as wgpu-hal sets them. Each is set to two
+    /// values so the setter is proven independent of the OS default.
     #[test]
     fn compile_options_pin_invariance_and_the_language_version() {
         let Some(dev) = device() else { return };
@@ -1147,16 +1015,10 @@ mod tests {
         assert_eq!(PixelFormat::from_raw(252), None);
     }
 
-    /// B1. A readback stride too small for the destination format must be
-    /// REFUSED, not forwarded to `copyFromTexture:…destinationBytesPerRow:`.
-    ///
-    /// `super::blit` sized its readback with a hardcoded `dw * 4` for a
-    /// destination of `self.format`, and `PixelFormat::Rgba16Float` is 8 bytes
-    /// per texel. An 8x8 `Rgba16Float` copy at 32 bytes per row instead of 64
-    /// COMPLETES SILENTLY with Metal's validation layer off — status 4, error
-    /// nil — which is how `cargo test` runs; only `MTL_DEBUG_LAYER=1
-    /// METAL_DEVICE_WRAPPER_TYPE=1` says "destinationBytesPerRow(32) must be >=
-    /// (64)". So the check has to live in the FFI, where it runs unconditionally.
+    /// A readback stride too small for the destination format is refused
+    /// rather than forwarded to `copyFromTexture:…destinationBytesPerRow:`,
+    /// which completes silently with the validation layer off. `Rgba16Float`
+    /// is 8 bytes per texel.
     #[test]
     fn the_readback_stride_is_checked_against_the_destination_format() {
         let Some(dev) = device() else { return };
@@ -1203,8 +1065,7 @@ mod tests {
             draw: None,
         };
 
-        // Deliberately OVERSIZED, so the only thing wrong in the bad case is
-        // the stride — this is the precise call that used to be accepted.
+        // Deliberately oversized, so only the stride is wrong in the bad case.
         let rb = p.dev.new_buffer(good * H).expect("readback");
         let err = ffi::draw_and_read(&p.queue, &pass, &rb, bad)
             .expect_err("a 32-byte row on a 64-byte-per-row destination must be refused");
@@ -1220,11 +1081,8 @@ mod tests {
             .expect_err("a readback one byte short must be refused");
         assert!(err.contains("511") && err.contains("512"), "got: {err}");
 
-        // And an extent past the attachment. The readback here is sized
-        // GENEROUSLY for the oversized extent on purpose: with a tight buffer
-        // the length check above refuses it first and the extent check is never
-        // reached, which is how this assertion silently stopped arming during
-        // the mutation sweep. Only the extent check can refuse this call.
+        // An extent past the attachment, with a readback sized generously so
+        // the length check does not refuse it first.
         let wide = W + 1;
         let wide_row = wide * FMT.bytes_per_texel();
         let roomy = p.dev.new_buffer(wide_row * H).expect("roomy readback");
@@ -1238,39 +1096,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // THE VERTEX PATH. `pipelines::tests::every_table_row_builds_a_metal_
-    // pipeline` proves the eighteen rows are ACCEPTED; nothing proved any of
-    // them DREW until this section. A pipeline that builds is not a pipeline
-    // that draws: the instance stream at vertex-buffer slot 0 — where the MSL
-    // uniform blocks live — produced status Completed, error nil, GPU
-    // validation silent, and 0 texels.
+    // The vertex path: a pipeline that builds is not one that draws. An
+    // instance stream at vertex-buffer slot 0 (where MSL uniform blocks live)
+    // completes with no error and draws nothing.
     // -----------------------------------------------------------------
 
-    /// `cell.metal`'s 16-byte `Uniforms` block: `float2 screen`,
-    /// `float text_blend`, `float pad`. Every member is <= 16 bytes and
-    /// naturally aligned, so MSL's `constant` layout and this `repr(C)` agree
-    /// member for member.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CellUniforms {
-        screen: [f32; 2],
-        text_blend: f32,
-        pad: f32,
-    }
-
-    /// C1. A REAL INSTANCED ROW, drawn and read back — `Pipeline::Bg`, the row
-    /// whose slot-0 failure was the measured proof. One draw arms four axes at
-    /// once, each with a distinct wrong picture:
+    /// A real instanced row (`Pipeline::Bg`) drawn and read back. One draw
+    /// checks four axes, each failing differently:
     ///
-    /// * **the stream slot** ([`ffi::INSTANCE_STREAM_SLOT`]): at 0 the draw
-    ///   completes and paints NOTHING (measured: 0 of 64 expected texels);
-    /// * **`Unorm8x4`'s normalization** (`metal_attr_format`): as plain
-    ///   `UChar4` the mid-range colours below arrive as 40.0..200.0 instead of
-    ///   0.15..0.78 and saturate to 255 — which is why the colours are
-    ///   mid-range and not primaries;
-    /// * **attribute offsets**: zeroed, the colour re-reads the rect bytes;
-    /// * **the stride**: doubled, instance 1 reads the zero sentinel and the
-    ///   second quad vanishes.
+    /// * the stream slot ([`ffi::INSTANCE_STREAM_SLOT`]): at 0 nothing paints;
+    /// * `Unorm8x4` normalization (`metal_attr_format`): as `UChar4` the
+    ///   mid-range colours saturate to 255;
+    /// * attribute offsets: zeroed, the colour re-reads the rect bytes;
+    /// * the stride: doubled, the second quad vanishes.
     #[test]
     fn the_bg_row_draws_its_instance_stream_at_the_deconflicted_slot() {
         use crate::pipeline_table::Pipeline;
@@ -1297,10 +1135,8 @@ mod tests {
         const C0: [u8; 4] = [200, 40, 120, 255];
         const C1: [u8; 4] = [40, 200, 90, 255];
 
-        // Two tight 12-byte `BgInstance`s (`[u16;4]` rect + `[u8;4]` colour),
-        // then 24 bytes of zero SENTINEL: a doubled stride reads instance 1
-        // from the sentinel, gets a zero-extent rect, and deterministically
-        // draws nothing instead of reading past the buffer.
+        // Two 12-byte `BgInstance`s then 24 zero bytes: a doubled stride reads
+        // instance 1 from the zeros and draws nothing rather than overrunning.
         let mut stream: Vec<u8> = Vec::new();
         for (rect, colour) in [([0u16, 0, 8, 8], C0), ([8u16, 8, 8, 8], C1)] {
             for v in rect {
@@ -1350,9 +1186,8 @@ mod tests {
                 src_tex: None,
                 sampler: None,
                 uniform: None,
-                // `vs_bg` takes `constant Uniforms& u [[buffer(0)]]` — the very
-                // binding the stream must stay clear of; the slot is the row's
-                // own BindSpec column, not a spelled 0.
+                // `vs_bg` binds uniforms at `[[buffer(0)]]`, which the stream
+                // must avoid; the slot comes from the row's `BindSpec`.
                 vertex_uniform: Some((
                     &ubuf,
                     spec.binds
@@ -1374,10 +1209,9 @@ mod tests {
         // `draw_and_read` returned (it waits on the command buffer).
         let got = unsafe { ffi::buffer_bytes(&rb, row * H) };
 
-        // fs_bg emits `s2l(colour)` into an attachment that re-encodes on
-        // store, so the readback returns the instance's own sRGB bytes; 1 LSB
-        // of headroom covers the f32 decode/encode round trip on the mid-range
-        // channels. Everything outside the two rects must be the clear.
+        // `fs_bg` emits `s2l(colour)` into an sRGB attachment, so readback
+        // returns the instance's sRGB bytes (±1 LSB). Everything outside the
+        // two rects is the clear.
         let close = |g: u8, w: u8| (i16::from(g) - i16::from(w)).unsigned_abs() <= 1;
         let mut drawn = 0usize;
         for (i, texel) in got.as_chunks::<4>().0.iter().enumerate() {
@@ -1410,10 +1244,8 @@ mod tests {
         assert_eq!(drawn, 128, "two 8x8 instances cover 128 texels");
     }
 
-    /// `tray.metal`'s 32-byte `Tray` uniform: `float4 rect`, `float2 fb`,
-    /// `float2 pad` — the std140 twin of the Rust `TrayUniform`, restated here
-    /// because the vertex stage binds it at `[[buffer(2)]]` (no `[[stage_in]]`
-    /// in `vs_tray`, so no slot to dodge; the WGSL binding survived the port).
+    /// `tray.metal`'s 32-byte `Tray` uniform (`float4 rect`, `float2 fb`,
+    /// `float2 pad`), bound at vertex `[[buffer(2)]]`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct TrayUniformBytes {
@@ -1422,17 +1254,10 @@ mod tests {
         pad: [f32; 2],
     }
 
-    /// C2. THE TRAY ROW'S TOPOLOGY IS DRAW STATE, AND IT IS CONSUMED.
-    ///
-    /// `PipelineSpec::topology` had no Metal consumer at all: topology is
-    /// pipeline state in `wgpu` and an argument to `drawPrimitives:` in Metal,
-    /// so `pipelines::build` dropped the tray's `TriangleStrip` with nothing
-    /// to notice. This draws the REAL tray row — `vs_tray` + `fs_tray`, the
-    /// row's own `ALPHA_BLENDING` and present-format target — through
-    /// `metal_primitive_type(spec.topology)` and requires every texel of the
-    /// card covered. The same 4 vertices as a `TriangleList` are ONE triangle
-    /// (`v0 v1 v2`, the upper-left half); the lower-right stays at the fill
-    /// and the corner assertion below names the exact texel that dies.
+    /// Topology is draw state in Metal: the tray row (`vs_tray` + `fs_tray`)
+    /// is drawn through `metal_primitive_type(spec.topology)` and must cover
+    /// every card texel. As a `TriangleList` the same 4 vertices are one
+    /// triangle and the lower-right corner stays unfilled.
     #[test]
     fn the_tray_strip_covers_the_whole_card() {
         use crate::pipeline_table::{Pipeline, Topology};
@@ -1535,10 +1360,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // THE GATE. `wgpu-metal-decision-2026-08-30.md` §8 makes the whole row
-    // conditional on ONE experiment: port `build_blit_resources` + `BLIT_SHADER`
-    // to Metal and hold the byte-identical blit assertions green, or REFUSE.
-    // Everything below is that experiment.
+    // Blit differential: the Metal blit must match the wgpu blit byte for byte.
     // -----------------------------------------------------------------------
 
     use aterm_core::terminal::Terminal;
@@ -1551,9 +1373,8 @@ mod tests {
     const ROWS: usize = 6;
     const COLS: usize = 24;
 
-    /// The same representative frame `tests/blit_invert.rs` uses: a prompt, a
-    /// glyph, and saturated red/green/blue SGR runs, so the differential runs
-    /// over real glyph coverage and real colour, not a synthetic gradient.
+    /// A representative frame (prompt, glyph, saturated SGR runs), so the
+    /// differential covers real glyph coverage and colour.
     fn representative_input() -> RenderInput {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         term.process(b"$ blit check >_\r\n");
@@ -1562,24 +1383,8 @@ mod tests {
         term.cell_frame(ROWS, COLS)
     }
 
-    /// The readback packs `((255 - a) << 24) | (r << 16) | (g << 8) | b`
-    /// (`lib.rs::try_read_back`). Undo it to recover the texel bytes the blit
-    /// actually sampled — every channel is recoverable, so this is lossless and
-    /// the Metal arm samples the SAME texels the wgpu arm did.
-    fn frame_to_rgba8(f: &Frame) -> Vec<u8> {
-        let mut out = Vec::with_capacity(f.pixels.len() * 4);
-        for &p in &f.pixels {
-            out.push(((p >> 16) & 0xff) as u8);
-            out.push(((p >> 8) & 0xff) as u8);
-            out.push((p & 0xff) as u8);
-            out.push((255 - ((p >> 24) & 0xff)) as u8);
-        }
-        out
-    }
-
-    /// The Metal spelling of a [`BlitTestTarget`]. Two enums rather than one
-    /// because `BlitTestTarget` reaches `renderer.rs` and a `wgpu` type may not
-    /// cross into this module — see the type's own doc.
+    /// The Metal spelling of a [`BlitTestTarget`] (no `wgpu` type crosses into
+    /// this module).
     fn metal_format(t: BlitTestTarget) -> PixelFormat {
         match t {
             BlitTestTarget::Rgba8Unorm => PixelFormat::Rgba8Unorm,
@@ -1596,81 +1401,47 @@ mod tests {
         border_scale_q4: 0,
     };
 
-    /// One differential case: a name, the destination, the uniform arms, and
-    /// how much bigger than the source the destination is (which is what turns
-    /// the W1 remainder-band branch on).
+    /// One differential case: name, destination, uniform arms, and how much
+    /// larger than the source the destination is (enabling the band branch).
     struct Case {
         name: &'static str,
         target: BlitTestTarget,
         fx: BlitTestEffects,
         extra_w: u32,
         extra_h: u32,
-        /// Blit the TRANSLUCENT source (rendered at `background_opacity < 1`)
-        /// rather than the opaque one, so `c.a` actually varies per pixel and
-        /// the `translucent` arm is non-vacuous inside the content rect too —
-        /// not only on the bands.
+        /// Blit the translucent source (`background_opacity < 1`), so `c.a`
+        /// varies per pixel inside the content rect.
         translucent_source: bool,
-        /// Blit a CHROME source (rendered with a metered chrome bleed whose
-        /// `ChromeBleed::first` is this), so the uniform carries a non-zero
-        /// `chrome_y1` and the bands beside the chrome rows take the
-        /// edge-continuation arm (design ruling 55); `Some(1)` leaves the rows
-        /// above on the padding, so `chrome_y0` is non-zero and the arm's lower
-        /// bound is exercised too. `None` blits a source without chrome.
+        /// Blit a chrome source with this `ChromeBleed::first`, so the uniform
+        /// carries non-zero `chrome_y1` (and `chrome_y0` for `Some(1)`) and the
+        /// bands beside chrome rows take the edge-continuation arm. `None` has
+        /// no chrome.
         chrome_first: Option<usize>,
     }
 
-    /// THE FALSIFIABLE GATE: the first-party Metal blit must be BYTE-IDENTICAL
-    /// to the shipped wgpu blit, on the same source texels and the same 112
-    /// uniform bytes, across every arm of `fs_blit` this harness can reach.
-    ///
-    /// This is deliberately stronger than `tests/blit_invert.rs` and
-    /// `tests/blit_bands.rs`. Those assert PROPERTIES of one backend's output
-    /// (`out == src`, `out == 255 - src`, "the bands are the theme background"),
-    /// which a second backend can satisfy while still differing: a half-texel
-    /// offset in the fullscreen triangle, an sRGB-typed destination, a filtered
-    /// fetch instead of `read()`, or a swapped binding slot all preserve those
-    /// properties on the arms they cover. Pinning byte equality against the
-    /// shipped backend over real glyph pixels leaves none of that anywhere to
-    /// hide — measured: an `Rgba8UnormSrgb` destination (the gamma
-    /// double-encode of `wgpu-metal-decision-2026-08-30.md` §4.1, which that
-    /// document records as invisible to all 274 existing tests) moves 24,752 of
-    /// 33,264 pixels here.
-    ///
-    /// # What each case reaches
-    ///
-    /// `fs_blit` branches on EIGHT uniform fields plus the in-bounds test. The
-    /// first four cases are the geometry and effect arms the gate started with;
-    /// the rest were added because the gate covered three of the eight and the
-    /// destination format it used was not the one aterm presents to.
+    /// The Metal blit must be byte-identical to the wgpu blit on the same
+    /// source texels and 112 uniform bytes, across every reachable `fs_blit`
+    /// arm. Byte equality catches differences that property tests
+    /// (`tests/blit_invert.rs`, `tests/blit_bands.rs`) miss: a half-texel offset,
+    /// an sRGB-typed destination, a filtered fetch, a swapped binding slot.
     ///
     /// | # | case | destination | reaches |
     /// |--:|---|---|---|
     /// | 1 | exact fit, passthrough | `Rgba8Unorm` | the in-bounds fetch |
     /// | 2 | exact fit, bell invert | `Rgba8Unorm` | `flag` |
-    /// | 3 | oversized, W1 bands | `Rgba8Unorm` | the out-of-bounds band path + `content_off` |
+    /// | 3 | oversized, bands | `Rgba8Unorm` | the band path and `content_off` |
     /// | 4 | cropped + drop overlay | `Rgba8Unorm` | `overlay`, `visible_y`/`visible_h`, `border_px` |
-    /// | 5 | **the presented format** | **`Bgra8Unorm`** | everything in 4, on what `pick_surface_format` actually chooses |
-    /// | 6 | **linear->sRGB re-encode** | `Rgba8Unorm` | **`encode_srgb`** — `blit.metal`'s `l2s`, which macOS pins off |
-    /// | 7 | **translucent glass** | `Bgra8Unorm` | **`translucent`**, content alpha AND band alpha |
-    /// | 8 | **premultiplied glass** | `Bgra8Unorm` | **`premult`** over `translucent` |
-    /// | 9 | **the EDR arm** | **`Rgba16Float`** | **`hdr`** — `hdr_grid_encode3`, the grid clamp law |
-    /// | 10 | **EDR + scRGB white** | `Rgba16Float` | **`sdr_white_scale`**, on the grid AND the bands |
+    /// | 5 | presented format | `Bgra8Unorm` | case 4 on `pick_surface_format`'s choice |
+    /// | 6 | linear->sRGB re-encode | `Rgba8Unorm` | `encode_srgb` (`blit.metal`'s `l2s`) |
+    /// | 7 | translucent glass | `Bgra8Unorm` | `translucent`, content and band alpha |
+    /// | 8 | premultiplied glass | `Bgra8Unorm` | `premult` over `translucent` |
+    /// | 9 | HDR | `Rgba16Float` | `hdr` (`hdr_grid_encode3`) |
+    /// | 10 | HDR + scRGB white | `Rgba16Float` | `sdr_white_scale`, grid and bands |
     ///
-    /// Cases 9 and 10 are also what CONFIRMS the readback-stride fix: an
-    /// `Rgba16Float` destination is eight bytes per texel, and the `* 4` this
-    /// module used to hardcode sized both the buffer and
-    /// `destinationBytesPerRow` at half what the copy needs — which Metal
-    /// accepts silently with its validation layer off.
-    ///
-    /// STILL UNCOVERED, stated rather than implied: nothing drives `hdr`
-    /// together with `translucent`/`premult` (the production EDR present is
-    /// opaque, so that combination has no shipping caller), and `encode_srgb`
-    /// is exercised as a FORCED bit rather than as the downlevel adapter would
-    /// send it — this machine has no GLES adapter to produce a genuinely
-    /// sRGB-typed offscreen. The `edge < border_px` boundary remains inert for
-    /// the reason the module header records: `edge` is a distance between
-    /// half-pixel centres and an integer thickness, so it is never exactly
-    /// equal to it.
+    /// Cases 9 and 10 also check the 8-byte-per-texel readback stride. Not
+    /// covered: `hdr` with `translucent`/`premult` (no production caller), and
+    /// `encode_srgb` from a real downlevel adapter (it is forced here). The
+    /// `edge < border_px` boundary is inert because `edge` is never an integer.
     #[test]
     fn blit_matches_wgpu_byte_for_byte() {
         if device().is_none() {
@@ -1679,27 +1450,25 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
         let mut win = WindowGpu::new();
         let input = representative_input();
 
-        // TWO repaints, and only two. Every opaque case blits the SAME resident
-        // offscreen; the two translucent cases blit a second one rendered at
-        // `background_opacity = 0.55`, so the offscreen alpha varies per pixel
-        // and the `translucent` arm is not satisfied trivially by an all-opaque
-        // frame. Both are captured before any blit runs, because a blit leaves
-        // `win.offscreen` untouched and the source must be fixed for the whole
-        // sweep.
+        // Two sources, both captured before any blit: every opaque case blits
+        // one offscreen, the translucent cases a second at
+        // `background_opacity = 0.55` so alpha varies per pixel.
         let opaque = gpu.render_input(&mut win, &input, None);
         let (sw, sh) = (opaque.width as u32, opaque.height as u32);
         assert!(sw > 0 && sh > 3, "renderer produced an empty offscreen");
-        let opaque_rgba = frame_to_rgba8(&opaque);
+        // Unpacking the readback is lossless, so the Metal arm samples the
+        // SAME texels the wgpu arm did.
+        let opaque_rgba = opaque.rgba_bytes();
 
         gpu.set_background_opacity(0.55);
         let glass = gpu.render_input(&mut win, &input, None);
@@ -1708,16 +1477,15 @@ mod tests {
             (sw, sh),
             "the translucent repaint changed the offscreen size"
         );
-        let glass_rgba = frame_to_rgba8(&glass);
+        let glass_rgba = glass.rgba_bytes();
         assert!(
             glass_rgba.as_chunks::<4>().0.iter().any(|c| c[3] != 255),
             "the translucent source is fully opaque, so the `translucent` arm \
              would be vacuous inside the content rect"
         );
 
-        // THE CHROME SOURCE: two chrome rows, the second METERED (its own
-        // gutter tones), so the edge-continuation arm has three distinct tones
-        // to carry into the bands.
+        // Chrome source: two chrome rows, the second metered, so the
+        // edge-continuation arm carries three distinct tones.
         let chrome_bleed = |first: usize| aterm_render::ChromeBleed {
             rows: 2,
             first,
@@ -1737,12 +1505,12 @@ mod tests {
         gpu.set_background_opacity(1.0);
         gpu.set_chrome_bleed(Some(chrome_bleed(0)));
         let chrome = gpu.render_input(&mut win, &input, None);
-        let chrome_rgba = frame_to_rgba8(&chrome);
+        let chrome_rgba = chrome.rgba_bytes();
         // …and the same band below a SURFACELESS strip row (`first: 1`, macOS's
         // in-grid strip): the strip row and the lip above keep the padding.
         gpu.set_chrome_bleed(Some(chrome_bleed(1)));
         let strip = gpu.render_input(&mut win, &input, None);
-        let strip_rgba = frame_to_rgba8(&strip);
+        let strip_rgba = strip.rgba_bytes();
         gpu.set_chrome_bleed(None);
 
         let crop = PresentCrop {
@@ -1904,9 +1672,8 @@ mod tests {
         let mut blits: Vec<(BlitTestTarget, MetalBlit)> = Vec::new();
         for c in cases {
             let (dw, dh) = (sw + c.extra_w, sh + c.extra_h);
-            // The wgpu arm re-renders the source it needs. `render_input` is
-            // deterministic for a fixed input and opacity, so this reproduces
-            // the exact texels captured above rather than a new frame.
+            // The wgpu arm re-renders its source; `render_input` is
+            // deterministic, so these are the texels captured above.
             gpu.set_chrome_bleed(c.chrome_first.map(chrome_bleed));
             let src_rgba = if c.translucent_source {
                 gpu.set_background_opacity(0.55);
@@ -1934,9 +1701,8 @@ mod tests {
                 "BlitUniform grew: add the member to `shaders/blit.metal`'s \
                  `Blit` struct before widening this constant"
             );
-            // `chrome_y1` rides bytes 28..32 (the old accent alpha's slot) and
-            // `chrome_y0` bytes 96..100: the chrome cases must actually carry
-            // the end, the strip case the start, and the others neither.
+            // `chrome_y1` rides bytes 28..32 and `chrome_y0` bytes 96..100: the
+            // chrome cases carry the end, the strip case the start.
             let chrome_y1 =
                 f32::from_ne_bytes([uniform[28], uniform[29], uniform[30], uniform[31]]);
             let chrome_y0 =
@@ -1972,52 +1738,20 @@ mod tests {
                 .run(src_rgba, sw, sh, &uniform, dw, dh)
                 .unwrap_or_else(|e| panic!("[{}] Metal blit failed: {e}", c.name));
 
-            assert_eq!(
-                actual.len(),
-                expected.len(),
-                "[{}] readback size mismatch — the destination stride is wrong \
-                 on one side (this is exactly what an Rgba16Float `* 4` does)",
-                c.name
+            let texel = metal_format(c.target).bytes_per_texel();
+            assert_row_bytes_identical(
+                &format!("[{}] THE METAL BLIT on {:?}", c.name, c.target),
+                "Measure the cause before touching tolerance",
+                dw as usize,
+                texel,
+                &expected,
+                &actual,
             );
-            if actual != expected {
-                let texel = match c.target {
-                    BlitTestTarget::Rgba16Float => 8,
-                    _ => 4,
-                };
-                let mut diffs = 0usize;
-                let mut first = None;
-                for (i, (e, a)) in expected
-                    .chunks_exact(texel)
-                    .zip(actual.chunks_exact(texel))
-                    .enumerate()
-                {
-                    if e != a {
-                        diffs += 1;
-                        if first.is_none() {
-                            first = Some((i, e.to_vec(), a.to_vec()));
-                        }
-                    }
-                }
-                let (i, e, a) = first.expect("the buffers differ, so some texel differs");
-                let (x, y) = (i % dw as usize, i / dw as usize);
-                panic!(
-                    "[{}] METAL BLIT IS NOT BYTE-IDENTICAL TO wgpu on {:?}: {diffs} of {} \
-                     texels differ; first at ({x},{y}): wgpu {e:02x?} != metal {a:02x?}",
-                    c.name,
-                    c.target,
-                    expected.len() / texel
-                );
-            }
             crate::stderr_line!(
                 "  [{}] {dw}x{dh} {:?}: byte-identical over {} texels",
                 c.name,
                 c.target,
-                expected.len()
-                    / if c.target == BlitTestTarget::Rgba16Float {
-                        8
-                    } else {
-                        4
-                    }
+                expected.len() / texel
             );
         }
         // Leave the renderer as it was found.
@@ -2025,41 +1759,24 @@ mod tests {
         gpu.set_chrome_bleed(None);
     }
 
-    /// W2 — THE GLYPH DIFFERENTIAL, the ladder's row 1: the first TEXTURED,
-    /// `GlyphInstance`-layout, `ALPHA_BLENDING` row, drawn through the
-    /// SHIPPED wgpu path (`renderer.rs::glyph_row_bytes_for_test`: the real
-    /// `glyph_pipeline`, the real shared uniforms at group 0, a fresh R8
-    /// atlas through the real `atlas_bgl` + NEAREST sampler at group 1) and
-    /// through the first-party Metal path — the SAME atlas bytes uploaded via
-    /// `texture_upload`, bound per THE PIPELINE TABLE's `BindSpec` column,
-    /// the same instance stream drawn through the W1 ENCODER
-    /// (`EncodeSession` -> `CommandBuffer` -> `PassEncoder`), read back over
-    /// the same command buffer — and compared BYTE FOR BYTE.
+    /// Glyph row differential: the textured, `GlyphInstance`-layout,
+    /// alpha-blended glyph row drawn through the wgpu path
+    /// (`renderer.rs::glyph_row_bytes_for_test`) and through the Metal path
+    /// (same atlas bytes, `BindSpec` binds, the encoder), compared byte for
+    /// byte.
     ///
-    /// # What this row adds over bg (each a new differential axis)
+    /// Axes beyond the bg row:
     ///
-    /// * **R8Unorm atlas + NEAREST sampling**: the atlas is a value sweep
-    ///   (i*31 mod 251 — full range, mostly mid values, because 0/255
-    ///   saturate identically under several misdeclarations), and the third
-    ///   instance samples a QUARTER window (uv 0.25..0.75) so its sample
-    ///   points sit at x.25/x.75 inside texels — a filter drift (LINEAR for
-    ///   NEAREST), a flipped v, or an off-by-one atlas row all move bytes.
-    /// * **ALPHA_BLENDING as built** (the bg row could only arm REPLACE):
-    ///   coverage-driven fragment alpha over a clear AND over both opaque
-    ///   quads (instance 3 overlaps 1 and 2; overlap inside one instanced
-    ///   call is ordered by instance index on both APIs).
-    /// * **The FRAGMENT-stage uniform bind** (`fs_glyph` reads `text_blend`
-    ///   at fragment `[[buffer(0)]]` — the one cell row with a fragment
-    ///   buffer): the `text_blend = true` arm routes every interior-coverage
-    ///   texel through the corrected-alpha remap (`s2l`/`l2s` pow curves), so
-    ///   a missing or misplaced fragment-buffer bind and any transcendental
-    ///   divergence between the WGSL and MSL twins both land here.
+    /// * R8 atlas with nearest sampling: a mid-range value sweep, with the
+    ///   third instance sampling a quarter window so filter, flip or row
+    ///   offsets move bytes.
+    /// * Alpha blending over the clear and over both opaque quads (instance
+    ///   order resolves overlap on both APIs).
+    /// * The fragment-stage uniform (`fs_glyph` reads `text_blend`): the
+    ///   `text_blend = true` arm runs the corrected-coverage remap.
     ///
-    /// 16x16 target, dyadic rects — a byte diff is a STATE or MATH diff,
-    /// never a rasterisation coin flip. Byte-identical is the bar the bg row
-    /// set; if this row cannot meet it, the failure message carries the
-    /// per-arm first divergence so the CAUSE (sampling? sRGB? blending?
-    /// remap math?) is measured, not guessed.
+    /// 16x16 target with dyadic rects, so a diff is a state or math diff, not
+    /// rasterization. Failures report the first divergence per arm.
     #[test]
     fn glyph_row_matches_wgpu_byte_for_byte() {
         use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -2071,21 +1788,21 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
 
         const W: usize = 16;
         const H: usize = 16;
         const AW: usize = 8;
         const AH: usize = 8;
-        // (rect, uv, colour, bg): two full-window glyphs over the atlas, one
-        // overlapping quarter-window glyph. Mid-range colours; bg values with
-        // real luminance gaps so the text_blend arm's remap gate opens.
+        // (rect, uv, colour, bg): two full-window glyphs and one overlapping
+        // quarter-window glyph; bg values with luminance gaps open the remap
+        // gate.
         const INSTANCES: [crate::renderer::GlyphFixtureInstance; 3] = [
             (
                 [0.0, 0.0, 8.0, 8.0],
@@ -2140,9 +1857,8 @@ mod tests {
             .new_sampler(SamplerDesc::NEAREST_CLAMP)
             .expect("nearest sampler");
 
-        // The stream bytes are packed HERE against GLYPH_LAYOUT's law (tight
-        // 40-byte instances: f32x4 rect, f32x4 uv, u8x4 colour, u8x4 bg, all
-        // little-endian) rather than borrowed from the wgpu arm's struct.
+        // Stream bytes packed here per `GLYPH_LAYOUT` (40-byte instances), not
+        // borrowed from the wgpu struct.
         let mut stream: Vec<u8> = Vec::new();
         for (rect, uv, colour, bg) in INSTANCES {
             for v in rect {
@@ -2168,9 +1884,8 @@ mod tests {
         let mint = super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
         let row = W * fmt.bytes_per_texel();
 
-        // BOTH text-blend arms: `false` isolates sampling + ALPHA_BLENDING;
-        // `true` additionally routes interior coverage through the corrected
-        // remap and makes the fragment-stage uniform bind load-bearing.
+        // Both arms: `false` isolates sampling and blending; `true` adds the
+        // corrected remap and the fragment uniform bind.
         for text_blend in [false, true] {
             let expected = gpu.glyph_row_bytes_for_test(
                 (&atlas_bytes, AW as u32, AH as u32),
@@ -2218,8 +1933,7 @@ mod tests {
                     })
                     .expect("glyph pass");
                 pass.set_pipeline(&pso);
-                // EVERY index below is read off the row's BindSpec column —
-                // the consumer side of W2 item 1.
+                // Every index below is read off the row's BindSpec column.
                 pass.set_vertex_buffer(
                     &ubuf,
                     binds
@@ -2248,47 +1962,18 @@ mod tests {
             );
             // SAFETY: shared storage, sized `row * H`, terminal above.
             let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-
-            assert_eq!(
-                actual.len(),
-                expected.len(),
-                "readback size mismatch — one arm's row stride is wrong"
+            assert_row_bytes_identical(
+                &format!("THE METAL GLYPH ROW (text_blend={text_blend})"),
+                "Localize the cause before touching tolerance: \
+                 all-covered-texels-differ is a bind/sampling fault, overlap-only \
+                 is blending, text_blend=true-only is the remap's transcendental \
+                 math, delta<=1 everywhere is rounding — measure and report per \
+                 the map's W2 contract",
+                W,
+                4,
+                &expected,
+                &actual,
             );
-            if actual != expected {
-                let mut diffs = 0usize;
-                let mut first = None;
-                let mut max_delta = 0u8;
-                for (i, (e, a)) in expected
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(actual.as_chunks::<4>().0.iter())
-                    .enumerate()
-                {
-                    if e != a {
-                        diffs += 1;
-                        for (ec, ac) in e.iter().zip(a) {
-                            max_delta = max_delta.max(ec.abs_diff(*ac));
-                        }
-                        if first.is_none() {
-                            first = Some((i, e.to_vec(), a.to_vec()));
-                        }
-                    }
-                }
-                let (i, e, a) = first.expect("the buffers differ, so some texel differs");
-                let (x, y) = (i % W, i / W);
-                panic!(
-                    "THE METAL GLYPH ROW IS NOT BYTE-IDENTICAL TO wgpu \
-                     (text_blend={text_blend}): {diffs} of {} texels differ, max \
-                     channel delta {max_delta}; first at ({x},{y}): wgpu {e:02x?} != \
-                     metal {a:02x?}. Localize the cause before touching tolerance: \
-                     all-covered-texels-differ is a bind/sampling fault, \
-                     overlap-only is blending, text_blend=true-only is the remap's \
-                     transcendental math, delta<=1 everywhere is rounding — \
-                     measure and report per the map's W2 contract",
-                    W * H
-                );
-            }
             crate::stderr_line!(
                 "glyph differential (text_blend={text_blend}) on {}: byte-identical \
                  over {} texels",
@@ -2298,30 +1983,15 @@ mod tests {
         }
     }
 
-    /// W3 — THE COLOR-GLYPH DIFFERENTIAL, the ladder's row 2 (the COLOR
-    /// PATH): the first RGBA-ATLAS row, drawn through the SHIPPED wgpu path
-    /// (`renderer.rs::color_glyph_row_bytes_for_test`: the real
-    /// `color_glyph_pipeline`, the real group-0 uniforms, a fresh RGBA atlas
-    /// through the real `atlas_bgl` + NEAREST sampler — the exact pair the
-    /// colour arm of `create_atlas_texture` binds) and through the
-    /// first-party Metal path — the SAME atlas bytes through the W3 resource
-    /// mint, bound per THE PIPELINE TABLE's `BindSpec`, drawn through the W1
-    /// encoder — and compared BYTE FOR BYTE.
+    /// Colour-glyph row differential: the RGBA-atlas row through the wgpu path
+    /// (`renderer.rs::color_glyph_row_bytes_for_test`) and the Metal path,
+    /// compared byte for byte.
     ///
-    /// # What this row adds over rows 0/1 (each a new differential axis)
-    ///
-    /// * **Rgba8Unorm atlas sampling** (`fs_glyph_color` reads straight RGBA
-    ///   and emits `(s2l(c.rgb), c.a)`): the atlas value sweep varies every
-    ///   channel INDEPENDENTLY, mostly mid-range, so a channel-order swap
-    ///   (RGBA vs BGRA), a UChar4 misdeclaration and a dropped-alpha
-    ///   misdeclaration each move bytes;
-    /// * **atlas-carried alpha driving ALPHA_BLENDING**: the mono rows'
-    ///   coverage came from R8; here translucency arrives per-texel in the
-    ///   atlas's OWN alpha channel, over the clear and over an opaque quad
-    ///   (instance 3 overlaps 1 and 2 with a quarter-uv window);
-    /// * **the instance `color` field is INERT to this fragment** — packed
-    ///   with distinct garbage on both arms, so a fragment that wrongly
-    ///   consults it (a `fs_glyph` twin mix-up) diverges.
+    /// * RGBA atlas sampling (`fs_glyph_color` emits `(s2l(c.rgb), c.a)`) with
+    ///   every channel varied independently, so channel swaps or
+    ///   misdeclarations move bytes;
+    /// * atlas alpha drives the blend, over the clear and an opaque quad;
+    /// * the instance `color` field holds garbage and must not be read.
     #[test]
     fn color_glyph_row_matches_wgpu_byte_for_byte() {
         use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -2335,21 +2005,21 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
 
         const W: usize = 16;
         const H: usize = 16;
         const AW: usize = 8;
         const AH: usize = 8;
-        // (rect, uv, colour, bg): two full-window quads over the atlas, one
-        // overlapping quarter-window quad. The colour/bg fields are distinct
-        // garbage on purpose — `fs_glyph_color` must not read them.
+        // (rect, uv, colour, bg): two full-window quads and one overlapping
+        // quarter-window quad; colour/bg are garbage `fs_glyph_color` must
+        // ignore.
         const INSTANCES: [crate::renderer::GlyphFixtureInstance; 3] = [
             (
                 [0.0, 0.0, 8.0, 8.0],
@@ -2390,8 +2060,7 @@ mod tests {
             H as u32,
         );
 
-        // The Metal arm: the same table row, first-party, resources through
-        // the W3 mint.
+        // The Metal arm: the same table row, resources through the sealed mint.
         let spec = Pipeline::ColorGlyph.spec();
         let binds = spec.binds;
         let lib = super::pipelines::compile(&dev, spec).expect("cell.metal compiles");
@@ -2501,44 +2170,17 @@ mod tests {
         );
         // SAFETY: shared storage, sized `row * H`, terminal above.
         let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "readback size mismatch — one arm's row stride is wrong"
+        assert_row_bytes_identical(
+            "THE METAL COLOR-GLYPH ROW",
+            "Localize before touching tolerance: all-covered-differ is a \
+             bind/sampling fault, channel-rotated bytes are an RGBA/BGRA order \
+             fault, alpha-only is the dropped-alpha misdeclaration, delta<=1 \
+             everywhere is rounding — measure and report per the map's W3 contract",
+            W,
+            4,
+            &expected,
+            &actual,
         );
-        if actual != expected {
-            let (mut diffs, mut first, mut max_delta) = (0usize, None, 0u8);
-            for (i, (e, a)) in expected
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(actual.as_chunks::<4>().0.iter())
-                .enumerate()
-            {
-                if e != a {
-                    diffs += 1;
-                    for (ec, ac) in e.iter().zip(a) {
-                        max_delta = max_delta.max(ec.abs_diff(*ac));
-                    }
-                    if first.is_none() {
-                        first = Some((i, e.to_vec(), a.to_vec()));
-                    }
-                }
-            }
-            let (i, e, a) = first.expect("the buffers differ, so some texel differs");
-            let (x, y) = (i % W, i / W);
-            panic!(
-                "THE METAL COLOR-GLYPH ROW IS NOT BYTE-IDENTICAL TO wgpu: {diffs} of \
-                 {} texels differ, max channel delta {max_delta}; first at ({x},{y}): \
-                 wgpu {e:02x?} != metal {a:02x?}. Localize before touching tolerance: \
-                 all-covered-differ is a bind/sampling fault, channel-rotated bytes \
-                 are an RGBA/BGRA order fault, alpha-only is the dropped-alpha \
-                 misdeclaration, delta<=1 everywhere is rounding — measure and \
-                 report per the map's W3 contract",
-                W * H
-            );
-        }
         crate::stderr_line!(
             "colour-glyph differential on {}: byte-identical over {} texels",
             dev.name(),
@@ -2546,28 +2188,15 @@ mod tests {
         );
     }
 
-    /// W3 — THE DECO PAIR DIFFERENTIAL, rows 9/10 THROUGH THE ALIASED VIEWS:
-    /// deco_over (ALPHA_BLENDING, sRGB view) then deco_add (raw One/One ADD,
-    /// RGB-only mask, UNORM view) into ONE texture's two typed views — the
-    /// FORMAT LAW's other half, the additive axis, byte-compared against the
-    /// SHIPPED wgpu path (`renderer.rs::deco_rows_bytes_for_test`, which
-    /// demand-builds the real `deco_over_pipeline`/`deco_add_pipeline` and
-    /// draws into the real `offscreen_texture` machinery's alias pair).
+    /// Deco pair differential: deco_over (alpha blend, sRGB view) then deco_add
+    /// (One/One, RGB-only mask, Unorm view) into one texture's two views,
+    /// compared with the wgpu path (`renderer.rs::deco_rows_bytes_for_test`).
     ///
-    /// # What this pair adds (each a new differential axis)
-    ///
-    /// * **the Unorm/sRGB ALIAS as a write path**: pass 1's linear-light
-    ///   blend and pass 2's raw byte add must land in the SAME storage with
-    ///   no re-encode between them — an alias view that decodes on store, or
-    ///   a pass-2 target built against the sRGB format, moves every added
-    ///   byte;
-    /// * **additive saturation**: overlapping add quads push channels past
-    ///   255, where One/One on Unorm8 clamps exactly like the CPU `add_sat`
-    ///   — a float-space add that tone-curves instead of clamping diverges;
-    /// * **WriteMask::Color under load**: pass 2 must leave pass 1's ALPHA
-    ///   bytes untouched — an all-channels mask lands in the alpha plane;
-    /// * **`cov * color.a` opacity** (`fs_deco_over`/`fs_deco_add` both scale
-    ///   coverage by instance alpha): the a=128 and a=140 instances arm it.
+    /// * The alias as a write path: both passes land in the same storage with
+    ///   no re-encode between them.
+    /// * Additive saturation clamps like the CPU `add_sat`.
+    /// * The colour-only mask leaves pass 1's alpha untouched.
+    /// * `cov * color.a` opacity, armed by a=128 and a=140 instances.
     #[test]
     fn deco_over_and_add_rows_match_wgpu_through_the_unorm_alias() {
         use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -2581,21 +2210,20 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
 
         const W: usize = 16;
         const H: usize = 16;
         const AW: usize = 8;
         const AH: usize = 8;
-        // Over pass (row 9): one opaque full-uv sprite, one HALF-OPACITY
-        // quarter-uv sprite overlapping it (cov * 128/255 arms the opacity
-        // product on the blending row).
+        // Over pass: an opaque full-uv sprite and a half-opacity quarter-uv
+        // sprite overlapping it.
         const OVER: [crate::renderer::GlyphFixtureInstance; 2] = [
             (
                 [0.0, 0.0, 8.0, 8.0],
@@ -2610,9 +2238,8 @@ mod tests {
                 [0, 0, 0, 255],
             ),
         ];
-        // Add pass (row 10): two quads overlapping each other AND the over
-        // content — the double-add region saturates channels (the add_sat
-        // clamp axis), and a=140 arms the premultiply.
+        // Add pass: two quads overlapping each other and the over content, so
+        // the double-add region saturates; a=140 arms the premultiply.
         const ADD: [crate::renderer::GlyphFixtureInstance; 2] = [
             (
                 [2.0, 2.0, 8.0, 8.0],
@@ -2791,49 +2418,18 @@ mod tests {
         );
         // SAFETY: shared storage, sized `row * H`, terminal above.
         let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "readback size mismatch — one arm's row stride is wrong"
+        assert_row_bytes_identical(
+            "THE METAL DECO PAIR",
+            "Localize before touching tolerance: alpha-only diffs are a WriteMask \
+             fault on row 10, diffs confined to the add rects are the alias/format \
+             axis (a re-encode between the passes), saturated-channel diffs are the \
+             add_sat clamp, overlap-only diffs on the over rects are row 9's blend — \
+             measure and report per the map's W3 contract",
+            W,
+            4,
+            &expected,
+            &actual,
         );
-        if actual != expected {
-            let (mut diffs, mut first, mut max_delta) = (0usize, None, 0u8);
-            let mut alpha_only = true;
-            for (i, (e, a)) in expected
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(actual.as_chunks::<4>().0.iter())
-                .enumerate()
-            {
-                if e != a {
-                    diffs += 1;
-                    if e[..3] != a[..3] {
-                        alpha_only = false;
-                    }
-                    for (ec, ac) in e.iter().zip(a) {
-                        max_delta = max_delta.max(ec.abs_diff(*ac));
-                    }
-                    if first.is_none() {
-                        first = Some((i, e.to_vec(), a.to_vec()));
-                    }
-                }
-            }
-            let (i, e, a) = first.expect("the buffers differ, so some texel differs");
-            let (x, y) = (i % W, i / W);
-            panic!(
-                "THE METAL DECO PAIR IS NOT BYTE-IDENTICAL TO wgpu: {diffs} of {} \
-                 texels differ, max channel delta {max_delta}, alpha_only={alpha_only}; \
-                 first at ({x},{y}): wgpu {e:02x?} != metal {a:02x?}. Localize before \
-                 touching tolerance: alpha-only diffs are a WriteMask fault on row 10, \
-                 diffs confined to the add rects are the alias/format axis (a re-encode \
-                 between the passes), saturated-channel diffs are the add_sat clamp, \
-                 overlap-only diffs on the over rects are row 9's blend — measure and \
-                 report per the map's W3 contract",
-                W * H
-            );
-        }
         crate::stderr_line!(
             "deco over+add differential on {}: byte-identical over {} texels \
              (both views of one storage)",
@@ -2842,17 +2438,12 @@ mod tests {
         );
     }
 
-    /// W6a — THE ARMED-PRODUCTION DIFFERENTIAL: `render_input` through TWO
-    /// renderers on identical input — one on the shipped wgpu arm, one ARMED
-    /// (`arm_metal_for_test`, the in-process arming hook) so
-    /// its `encode_frame` tail runs the PRODUCTION Metal path end to end:
-    /// the lazy arm mint on this thread, the arm-side stream/atlas/PSO
-    /// caches, the one shared ladder, and `metal_try_read_back` — not the W4
-    /// replay harness. Byte-identical Frames, N=5 (the paint-conformance
-    /// rule). NON-VACUITY: the armed renderer must report its arm live, the
-    /// armed window must hold a METAL offscreen and NO wgpu offscreen (the
-    /// wgpu tail never ran for it), and the wgpu twin must hold the reverse
-    /// — so a silent degrade to the wgpu tail cannot pass as agreement.
+    /// Armed production differential: `render_input` through a wgpu renderer
+    /// and an armed one (`arm_metal_for_test`), whose `encode_frame` runs the
+    /// production Metal path end to end (lazy arm mint, arm caches, the shared
+    /// walker, `metal_try_read_back`). Byte-identical frames, N=5. The armed
+    /// window must hold only a Metal offscreen and the wgpu twin only a wgpu
+    /// one, so a silent degrade cannot pass.
     #[test]
     fn armed_production_render_input_matches_the_wgpu_arm_byte_for_byte() {
         const N: usize = 5;
@@ -2862,11 +2453,11 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -2880,33 +2471,12 @@ mod tests {
                 armed.metal_render_armed(),
                 "run {run}: the armed renderer must have minted its Metal arm"
             );
-            assert_eq!(
-                (expected.width, expected.height),
-                (actual.width, actual.height),
-                "run {run}: frame geometry diverged"
+            assert_frames_identical(
+                &format!("run {run}: THE ARMED PRODUCTION FRAME"),
+                "Measure the cause before touching tolerance",
+                &expected,
+                &actual,
             );
-            if expected.pixels != actual.pixels {
-                let diffs = expected
-                    .pixels
-                    .iter()
-                    .zip(&actual.pixels)
-                    .filter(|(e, a)| e != a)
-                    .count();
-                let first = expected
-                    .pixels
-                    .iter()
-                    .zip(&actual.pixels)
-                    .position(|(e, a)| e != a)
-                    .expect("some pixel differs");
-                panic!(
-                    "run {run}: THE ARMED PRODUCTION FRAME IS NOT BYTE-IDENTICAL to \
-                     wgpu: {diffs} of {} px differ, first at index {first} \
-                     (wgpu {:08x} != metal {:08x})",
-                    expected.pixels.len(),
-                    expected.pixels[first],
-                    actual.pixels[first],
-                );
-            }
         }
         assert!(
             armed_win.metal_offscreen.is_some(),
@@ -2930,20 +2500,12 @@ mod tests {
         );
     }
 
-    /// W6b — THE ARMED INLINE-IMAGE DIFFERENTIAL (the map's W6a deferral
-    /// "inline-image planes on the armed arm", closed): `render_input` with a
-    /// REAL OSC-1337 inline-image screen through the wgpu arm and the ARMED
-    /// PRODUCTION Metal arm — the retained CPU-side texel stack
-    /// (`ImagePlane::metal_texels`) re-mints the plane on the Metal side and
-    /// the image draw groups join the armed plan. Byte-identical, N=5, on
-    /// TWO inputs: the second adds a translucent second image so the plane
-    /// REBUILD path (a moved `epoch` key ⇒ armed re-mint + re-upload) and
-    /// the image alpha-blend axis are both live mid-test.
-    ///
-    /// NON-VACUITY: the armed plan must contain at least one image stream
-    /// (a fixture that decodes nothing would compare two image-free frames
-    /// and prove no closure), and the armed window's plane must hold its
-    /// resident texels with a moving epoch across the rebuild.
+    /// Armed inline-image differential: `render_input` with a real OSC 1337
+    /// image through the wgpu arm and the armed Metal arm (which re-mints the
+    /// plane from `ImagePlane::metal_texels`). Byte-identical, N=5, on two
+    /// inputs; the second adds a translucent image so the plane rebuild (moved
+    /// `epoch`) and image alpha blending are exercised. The armed plan must
+    /// contain an image stream and the plane's epoch must move.
     #[test]
     fn armed_inline_image_plane_matches_the_wgpu_arm_byte_for_byte() {
         use crate::renderer::StreamId;
@@ -2954,11 +2516,11 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -3017,10 +2579,8 @@ mod tests {
         };
 
         let mut first_epoch = None;
-        // Phase 2 keeps phase 1's footprints and changes ONLY the second
-        // image's texels: the plane rebuilds at IDENTICAL dims, so the
-        // rebuild EPOCH is the one moving key component — the axis that
-        // keeps a stale same-size plane impossible on the armed arm.
+        // Phase 2 changes only the second image's texels at identical dims, so
+        // the rebuild epoch is the one moving key component.
         for (phase, input) in [
             (0u32, input_for(None)),
             (1, input_for(Some([220, 40, 160, 128]))),
@@ -3046,33 +2606,12 @@ mod tests {
                     "phase {phase} run {run}: the fixture decoded no image draw — \
                      the differential would be vacuous (plan: {plan:?})"
                 );
-                assert_eq!(
-                    (expected.width, expected.height),
-                    (actual.width, actual.height),
-                    "phase {phase} run {run}: frame geometry diverged"
+                assert_frames_identical(
+                    &format!("phase {phase} run {run}: THE ARMED IMAGE-PLANE FRAME"),
+                    "Measure the cause before touching tolerance",
+                    &expected,
+                    &actual,
                 );
-                if expected.pixels != actual.pixels {
-                    let diffs = expected
-                        .pixels
-                        .iter()
-                        .zip(&actual.pixels)
-                        .filter(|(e, a)| e != a)
-                        .count();
-                    let first = expected
-                        .pixels
-                        .iter()
-                        .zip(&actual.pixels)
-                        .position(|(e, a)| e != a)
-                        .expect("some pixel differs");
-                    panic!(
-                        "phase {phase} run {run}: THE ARMED IMAGE-PLANE FRAME IS NOT \
-                         BYTE-IDENTICAL to wgpu: {diffs} of {} px differ, first at \
-                         index {first} (wgpu {:08x} != metal {:08x})",
-                        expected.pixels.len(),
-                        expected.pixels[first],
-                        actual.pixels[first],
-                    );
-                }
             }
             // NON-VACUITY: resident texels + a moving epoch across the rebuild.
             let (epoch, has_texels) = armed_win
@@ -3098,19 +2637,11 @@ mod tests {
         );
     }
 
-    /// W6b — THE ARMED READBACK-EFFECTS DIFFERENTIAL (three W6a deferrals
-    /// closed at once): `render_input` with the comet BLOOM, the heat
-    /// SHIMMER (phase pinned) and a settings-card TRAY all live, through the
-    /// wgpu arm and the ARMED PRODUCTION Metal arm — the in-place
-    /// bloom/shimmer/tray passes on the Metal offscreen against their
-    /// shipped wgpu twins. Byte-identical x N=5.
-    ///
-    /// NON-VACUITY per layer (byte-level, not counters): with the SAME armed
-    /// renderer, turning each layer off must MOVE the armed bytes — a pass
-    /// that silently did not run cannot pass as agreement. THE SKIP MIRROR:
-    /// after N identical-card presents each arm must have uploaded the card
-    /// exactly once (`tray_uploads`), and a changed card exactly once more —
-    /// the wgpu unchanged-bytes discipline, mirrored and measured.
+    /// Armed readback-effects differential: `render_input` with bloom, shimmer
+    /// (phase pinned) and a tray card live, wgpu vs armed, byte-identical x N=5.
+    /// Turning each layer off must change the armed bytes. After N identical
+    /// cards each arm has uploaded once (`tray_uploads`), and a changed card
+    /// once more.
     #[test]
     fn armed_readback_effects_match_the_wgpu_arm_byte_for_byte() {
         const N: usize = 5;
@@ -3120,11 +2651,11 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -3190,37 +2721,16 @@ mod tests {
             let expected = wg.render_input(&mut wg_win, &input, Some(tray(card_a)));
             let actual = armed.render_input(&mut armed_win, &input, Some(tray(card_a)));
             assert!(armed.metal_render_armed(), "run {run}: arm must be live");
-            assert_eq!(
-                (expected.width, expected.height),
-                (actual.width, actual.height),
-                "run {run}: frame geometry diverged"
+            assert_frames_identical(
+                &format!("run {run}: THE ARMED EFFECTS FRAME"),
+                "Localize by layer: turn the bloom, shimmer and tray off one at a \
+                 time and re-diff",
+                &expected,
+                &actual,
             );
-            if expected.pixels != actual.pixels {
-                let diffs = expected
-                    .pixels
-                    .iter()
-                    .zip(&actual.pixels)
-                    .filter(|(e, a)| e != a)
-                    .count();
-                let first = expected
-                    .pixels
-                    .iter()
-                    .zip(&actual.pixels)
-                    .position(|(e, a)| e != a)
-                    .expect("some pixel differs");
-                panic!(
-                    "run {run}: THE ARMED EFFECTS FRAME IS NOT BYTE-IDENTICAL to \
-                     wgpu: {diffs} of {} px differ, first at index {first} \
-                     (wgpu {:08x} != metal {:08x}). Localize by layer: turn the \
-                     bloom, shimmer and tray off one at a time and re-diff",
-                    expected.pixels.len(),
-                    expected.pixels[first],
-                    actual.pixels[first],
-                );
-            }
             armed_frame = Some(actual);
         }
-        // THE SKIP MIRROR, measured: N identical cards = ONE upload per arm.
+        // N identical cards: one upload per arm.
         assert_eq!(
             (wg.tray_uploads(), armed.tray_uploads()),
             (1, 1),
@@ -3271,20 +2781,13 @@ mod tests {
         );
     }
 
-    /// W6b — THE ARMED TAP-RING DIFFERENTIAL (the W5/W6a deferral "the
-    /// production VideoTap/PresentedFrameTap ring is wgpu-only", closed):
-    /// the PRODUCTION ring with METAL staging slots rides the armed §2
-    /// Submit B onto a REAL standalone first-party swapchain drawable — the
-    /// copy appended before commit, the harvest STATUS-POLLED off a probe
-    /// of that very command buffer — and every harvested frame must be
-    /// BYTE-IDENTICAL to the drawable bytes the same present produced
-    /// (which the present differentials already pin to wgpu). The one-shot
-    /// `PresentedFrameTap` arm captures the first present the same way.
-    ///
-    /// NON-VACUITY: three DIFFERENT inputs produce three DIFFERENT expected
-    /// byte sets (a ring replaying one stale frame cannot pass), the take
-    /// must hold exactly N frames with zero drops, and the recording is
-    /// proven to have ridden the armed arm (`metal_render_armed`).
+    /// Armed tap-ring differential: the production ring with Metal staging
+    /// slots rides the armed Submit B onto a real standalone drawable (copy
+    /// before commit, status-polled harvest), and every harvested frame must
+    /// equal the drawable bytes of the same present. The one-shot
+    /// `PresentedFrameTap` captures the first present the same way. Three
+    /// different inputs, exactly N frames, zero drops, and the armed arm
+    /// verified (`metal_render_armed`).
     #[test]
     fn armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte() {
         const N: usize = 3;
@@ -3294,7 +2797,7 @@ mod tests {
         let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no renderer/font: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
@@ -3387,20 +2890,12 @@ mod tests {
         );
     }
 
-    /// W6b — THE ARMED SCISSOR DIFFERENTIAL (the W6a deferral "scissored
-    /// dirty-row repaint on armed presents", closed): the SAME typed-then-
-    /// scrolled present sequence through the wgpu arm and the ARMED arm,
-    /// with the residency RE-KEYED onto the Metal offscreen
-    /// (`PresentPrev::on_metal`). Every step's presented bytes must be
-    /// byte-identical across the arms, AND the CADENCE must be identical:
-    /// same `scissor_taken`, same `full_repaints`, same `scroll_rescues` —
-    /// an armed arm that silently fell back to Full on every present (the
-    /// W6a behavior) fails the cadence assert by name.
-    ///
-    /// The E7 whole-row scroll rescue rides the same sequence
-    /// (`scroll_display` notches with the cursor hidden — the
-    /// scroll_blit_gpu fixture recipe), so the armed
-    /// `metal_shift_offscreen_band_px` rescue path is byte-verified too.
+    /// Armed scissor differential: the same typed-then-scrolled present
+    /// sequence through the wgpu arm and the armed arm (residency keyed by
+    /// `PresentPrev::on_metal`). Every step's bytes must match, and so must
+    /// the cadence (`scissor_taken`, `full_repaints`, `scroll_rescues`). The
+    /// scroll notches exercise the whole-row rescue
+    /// (`metal_shift_offscreen_band_px`).
     #[test]
     fn armed_scissored_present_cadence_matches_wgpu_byte_for_byte() {
         if device().is_none() {
@@ -3409,11 +2904,11 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -3426,8 +2921,8 @@ mod tests {
         let mut wg_win = WindowGpu::new();
         let mut armed_win = WindowGpu::new();
 
-        // Scrollback with overshooting glyphs (the E7 fixture recipe),
-        // cursor hidden so the rescue's cursor clause stays quiet.
+        // Scrollback with overshooting glyphs, cursor hidden so the rescue's
+        // cursor clause stays quiet.
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         term.process(b"\x1b[?25l");
         for i in 0..60 {
@@ -3444,30 +2939,17 @@ mod tests {
             let e = wg.present_input_readback(wg_win, input);
             let a = armed.present_input_readback(armed_win, input);
             assert!(armed.metal_render_armed(), "step {step}: arm live");
-            assert_eq!(
-                (e.width, e.height),
-                (a.width, a.height),
-                "step {step} ({what}): geometry diverged"
+            assert_frames_identical(
+                &format!("step {step} ({what}): THE ARMED SCISSORED PRESENT"),
+                "Measure the cause before touching tolerance",
+                &e,
+                &a,
             );
-            if e.pixels != a.pixels {
-                let diffs = e
-                    .pixels
-                    .iter()
-                    .zip(&a.pixels)
-                    .filter(|(x, y)| x != y)
-                    .count();
-                panic!(
-                    "step {step} ({what}): THE ARMED SCISSORED PRESENT IS NOT \
-                     BYTE-IDENTICAL to wgpu: {diffs} of {} px differ",
-                    e.pixels.len()
-                );
-            }
             step += 1;
         };
 
-        // Warm frame (Full on both), then three typed deltas (Dirty scissor
-        // on both), then six scroll notches (E7 rescue on both), then one
-        // more typed delta after the scroll (Dirty again).
+        // Warm frame (Full), three typed deltas (Dirty), six scroll notches
+        // (rescue), one more typed delta (Dirty).
         let input = term.cell_frame(ROWS, COLS);
         check(
             &mut wg,
@@ -3514,7 +2996,7 @@ mod tests {
             );
         }
 
-        // THE CADENCE MIRROR — and the scissor's non-vacuity.
+        // The cadence must match, and the scissor must be taken.
         assert_eq!(
             (wg.scissor_taken(), wg.full_repaints(), wg.scroll_rescues()),
             (
@@ -3547,15 +3029,9 @@ mod tests {
         );
     }
 
-    /// W6b — SUBMIT-A PIPELINING, armed and byte-verified (the W6a deferral
-    /// "every Submit A is waited", closed): N frames through the armed
-    /// PRODUCTION path must stay byte-identical to wgpu while the arm
-    /// provably (a) HOLDS each frame's Submit A in flight at return — the
-    /// pipelining itself — and (b) WAITS exactly the previous one at the
-    /// top of the next frame's staging, before any shared-storage rewrite
-    /// (the discipline). A regression that quietly re-waits every submit
-    /// fails (b)'s growth pattern check... by staying byte-identical but
-    /// never holding an in-flight handle, which fails (a) by name.
+    /// Submit-A pipelining: N armed frames stay byte-identical to wgpu while the
+    /// arm (a) holds each frame's Submit A in flight at return and (b) waits
+    /// exactly the previous one at the top of the next frame's staging.
     #[test]
     fn armed_submit_a_pipelines_and_stays_byte_identical() {
         const N: usize = 6;
@@ -3565,11 +3041,11 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -3606,24 +3082,12 @@ mod tests {
         );
     }
 
-    /// THE PIPELINING WAIT POLLS BEFORE IT PARKS, AND ANY PARK IS PRICED.
-    ///
-    /// `await_frame_slot` resolves to `waitUntilCompleted`, which takes NO
-    /// timeout: on a contended GPU the UI thread sits in it before a single
-    /// instance stream is staged, and that wait lands INSIDE the present's work
-    /// timer — so it reached the frontend as `frame_render`, counted against
-    /// `slow_frames`, and fed the load-shed latch as if compose were the
-    /// producer. The wait itself is load-bearing (the shared-storage rewrite
-    /// discipline: resident buffers may not be rewritten under a live Submit
-    /// A), so it STAYS. What changed is that it polls first and clocks whatever
-    /// park remains.
-    ///
-    /// On a steady armed loop the prior Submit A is long terminal by the next
-    /// frame's staging — the readback between them is ordered behind it on the
-    /// one queue — so every staging wait must take the poll arm and book ZERO
-    /// park. NON-VACUITY: `awaited` proves the wait really ran and really
-    /// consumed each prior, so the zero reads "polled and found terminal", not
-    /// "never waited".
+    /// The pipelining wait polls before parking and prices any park.
+    /// `await_frame_slot` resolves to the timeout-less `waitUntilCompleted`;
+    /// the wait is required (no shared-buffer rewrite under a live Submit A),
+    /// but on a steady loop the prior Submit A is already terminal, so every
+    /// staging wait takes the poll arm and books zero park. `awaited` proves
+    /// the wait ran.
     #[test]
     fn the_staging_wait_polls_first_and_books_no_park_on_a_steady_loop() {
         const N: usize = 4;
@@ -3633,7 +3097,7 @@ mod tests {
         let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no renderer/font: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
@@ -3671,18 +3135,11 @@ mod tests {
         );
     }
 
-    /// W6b — THE MULTI-WINDOW STALE-LAYER DISARM EDGE (W6a deferral 7,
-    /// closed and ARMED): window A attaches its armed swapchain under its
-    /// parent layer (the REAL `metal_attach_surface`); window B's attach
-    /// FAILS (no parent layer) and DISARMS the renderer; window A's next
-    /// present runs the disarm sweep, which must DROP its armed surface —
-    /// and `Swapchain::drop`'s `removeFromSuperlayer` discipline must leave
-    /// A's parent with ZERO sublayers, so the wgpu layer underneath
-    /// presents visibly instead of under a stale Metal frame.
-    ///
-    /// NON-VACUITY: the attach really parented (1 sublayer before the
-    /// disarm), the disarm really happened (`metal_render_armed` flips),
-    /// and the sweep is a no-op for a window that never armed.
+    /// Multi-window disarm edge: window A attaches an armed swapchain; window
+    /// B's attach fails (no parent layer) and disarms the renderer; A's next
+    /// present must drop its armed surface so A's parent has zero sublayers.
+    /// Also checks the attach parented, the disarm happened, and the sweep is
+    /// a no-op for a never-armed window.
     #[test]
     fn a_disarm_unparents_the_previously_armed_windows_stale_layer() {
         if device().is_none() {
@@ -3692,7 +3149,7 @@ mod tests {
         let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no renderer/font: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
@@ -3716,14 +3173,14 @@ mod tests {
         );
         let mut a_metal = Some(ms);
 
-        // While ARMED, the sweep must not touch window A's surface.
+        // While armed, the sweep must not touch window A's surface.
         armed.metal_disarm_sweep(&mut a_metal);
         assert!(
             a_metal.is_some() && sublayer_count(&parent) == 1,
             "the sweep is a no-op while the renderer is armed"
         );
 
-        // Window B's attach fails (no parent layer) — THE DISARM.
+        // Window B's attach fails (no parent layer), which disarms.
         assert!(
             armed.metal_attach_for_test(None, 64, 48).is_none(),
             "window B's attach must fail without a parent layer"
@@ -3758,53 +3215,18 @@ mod tests {
         );
     }
 
-    /// The disarm-edge test's CALayer helpers (the swapchain stacking
-    /// tests' recipe, local to this module's tests).
-    fn plain_calayer() -> ffi::Obj {
-        let _pool = ffi::AutoreleasePool::new();
-        // SAFETY: alloc/init, +1, exactly as `Swapchain::new_layer`.
-        unsafe {
-            let alloc: unsafe extern "C" fn(ffi::ClassPtr, ffi::Sel) -> ffi::Id = ffi::msg();
-            let raw = alloc(ffi::class(c"CALayer"), ffi::sel(c"alloc"));
-            let init: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
-            ffi::Obj::from_owned(init(raw, ffi::sel(c"init"))).expect("CALayer init")
-        }
-    }
-
-    fn sublayer_count(layer: &ffi::Obj) -> usize {
-        let _pool = ffi::AutoreleasePool::new();
-        // SAFETY: `sublayers` returns a +0 NSArray (or nil) owned by the
-        // pool; `count` is an NSUInteger getter on it.
-        unsafe {
-            let get: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
-            let arr = get(layer.id(), ffi::sel(c"sublayers"));
-            if arr.is_null() {
-                return 0;
-            }
-            let count: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> usize = ffi::msg();
-            count(arr, ffi::sel(c"count"))
-        }
-    }
-
-    /// W6a — THE ARMED PRESENT DIFFERENTIAL, and THE TRANSLUCENT HOLE
-    /// (map §6, judged W6 hole 1): `background_opacity` -> the present path
-    /// -> PRESENTED BYTES, end to end, with a GENUINELY TRANSLUCENT
-    /// destination on BOTH arms — alpha compared byte for byte, not dropped.
+    /// Armed present differential with a translucent destination:
+    /// `background_opacity` through the present path to presented bytes, alpha
+    /// compared, on both arms.
     ///
-    /// * wgpu arm: the SHIPPED `present_to_view` body driven with a
-    ///   PostMultiplied-shaped destination (`wgpu_present_bytes_for_test`) —
-    ///   the way the shipped swapchain presents translucent glass; the W5
-    ///   harness's virtual arm was structurally opaque and could never
-    ///   reach this.
-    /// * Metal arm: the PRODUCTION armed present (`encode_present_frame`
-    ///   full + the real `metal_encode_submit_b`) onto a REAL standalone
-    ///   first-party swapchain drawable whose layer is `opaque = false`.
+    /// * wgpu: the `present_to_view` body with a PostMultiplied-shaped
+    ///   destination (`wgpu_present_bytes_for_test`).
+    /// * Metal: the production armed present onto a standalone drawable whose
+    ///   layer is `opaque = false`.
     ///
-    /// Both arms run opaque (1.0) AND translucent (0.55), N=5 each,
-    /// letterboxed (+9/+7 destination so the bands' alpha is armed too).
-    /// NON-VACUITY: the translucent run must contain sub-255 alpha on both
-    /// arms and must differ from the opaque run — an accidentally-opaque
-    /// harness (the W5 defect class) fails here by name.
+    /// Opaque (1.0) and translucent (0.55), N=5 each, letterboxed (+9/+7). The
+    /// translucent run must contain sub-255 alpha and differ from the opaque
+    /// run.
     #[test]
     fn armed_present_translucency_matches_wgpu_end_to_end() {
         const N: usize = 5;
@@ -3817,11 +3239,11 @@ mod tests {
             let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
                 Ok(g) => g,
                 Err(e) => {
-                    crate::stderr_line!("SKIP: no wgpu renderer/font: {e}");
+                    crate::stderr_line!("SKIP: no GPU renderer: {e}");
                     return;
                 }
             };
-            // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+            // Selection defaults to Metal; the wgpu oracle twin disarms.
             wg.disarm_metal_for_test();
             wg.set_background_opacity(opacity);
             let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
@@ -3842,36 +3264,14 @@ mod tests {
                     armed.metal_render_armed(),
                     "{label} run {run}: the armed renderer minted its arm"
                 );
-                assert_eq!(
-                    expected.len(),
-                    actual.len(),
-                    "{label} run {run}: destination byte size"
+                assert_row_bytes_identical(
+                    &format!("{label} run {run}: THE ARMED PRESENT"),
+                    "Alpha is compared too — measure the cause before touching tolerance",
+                    dw as usize,
+                    4,
+                    &expected,
+                    &actual,
                 );
-                if expected != actual {
-                    let diffs = expected
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .zip(actual.as_chunks::<4>().0)
-                        .filter(|(e, a)| e != a)
-                        .count();
-                    let first = expected
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .zip(actual.as_chunks::<4>().0)
-                        .position(|(e, a)| e != a)
-                        .expect("some texel differs");
-                    let (x, y) = (first % dw as usize, first / dw as usize);
-                    panic!(
-                        "{label} run {run}: THE ARMED PRESENT IS NOT BYTE-IDENTICAL to \
-                         the wgpu present: {diffs} of {} texels differ (alpha included), \
-                         first at ({x},{y}): wgpu {:02x?} != metal {:02x?}",
-                        (dw * dh) as usize,
-                        expected.as_chunks::<4>().0[first],
-                        actual.as_chunks::<4>().0[first],
-                    );
-                }
                 let sub255 = actual
                     .as_chunks::<4>()
                     .0
@@ -3904,17 +3304,11 @@ mod tests {
         }
     }
 
-    /// W6 flip-drill — THE ARMED VIRTUAL-PRESENT DIFFERENTIAL: the headless
-    /// present seam (`present_virtual`) plus the UNCHANGED tap ring
-    /// (`virtual_presented_snapshot_current` — the `PresentedFrameTap`
-    /// machinery the recording ring and `ctl image`'s virtual arm share),
-    /// wgpu arm vs ARMED arm, byte-identical INCLUDING the tap's own
-    /// harvest/swizzle — so a headless capture (the paint matrix's whole
-    /// evidence channel) judges the armed present's actual bytes. N=5 (the
-    /// paint-conformance rule). NON-VACUITY: the armed window must hold the
-    /// Metal offscreen AND the Metal virtual destination and NO wgpu
-    /// offscreen (a silent degrade to the wgpu tail cannot pass as
-    /// agreement); the wgpu twin holds the reverse.
+    /// Armed virtual-present differential: `present_virtual` plus the tap ring
+    /// (`virtual_presented_snapshot_current`), wgpu vs armed, byte-identical
+    /// including the tap's harvest and swizzle. N=5. The armed window must hold
+    /// the Metal offscreen and virtual destination and no wgpu offscreen; the
+    /// wgpu twin the reverse.
     #[test]
     fn armed_virtual_present_feeds_the_unchanged_tap_ring_byte_for_byte() {
         const N: usize = 5;
@@ -3924,11 +3318,11 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        // Selection defaults to Metal; the wgpu oracle twin disarms.
         wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
@@ -3960,33 +3354,14 @@ mod tests {
                 (actual.w, actual.h),
                 "run {run}: captured geometry diverged"
             );
-            if expected.rgba != actual.rgba {
-                let diffs = expected
-                    .rgba
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(actual.rgba.as_chunks::<4>().0)
-                    .filter(|(e, a)| e != a)
-                    .count();
-                let first = expected
-                    .rgba
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(actual.rgba.as_chunks::<4>().0)
-                    .position(|(e, a)| e != a)
-                    .expect("some texel differs");
-                let (x, y) = (first % expected.w as usize, first / expected.w as usize);
-                panic!(
-                    "run {run}: THE ARMED VIRTUAL PRESENT'S TAP CAPTURE IS NOT \
-                     BYTE-IDENTICAL to wgpu's: {diffs} of {} texels differ, first at \
-                     ({x},{y}): wgpu {:02x?} != metal {:02x?}",
-                    (expected.w * expected.h) as usize,
-                    expected.rgba.as_chunks::<4>().0[first],
-                    actual.rgba.as_chunks::<4>().0[first],
-                );
-            }
+            assert_row_bytes_identical(
+                &format!("run {run}: THE ARMED VIRTUAL PRESENT'S TAP CAPTURE"),
+                "Measure the cause before touching tolerance",
+                expected.w as usize,
+                4,
+                &expected.rgba,
+                &actual.rgba,
+            );
         }
         assert!(
             armed_win.metal_offscreen.is_some(),
@@ -4011,12 +3386,8 @@ mod tests {
         crate::stderr_line!("armed virtual-present tap differential: byte-identical x {N} runs");
     }
 
-    /// W4 item 4 — THE FULL-FRAME DIFFERENTIAL: `render_input`'s frame, wgpu
-    /// vs Metal, BYTE-EQUAL, on deterministic fixtures shaped like the
-    /// existing parity suites (`gpu_matches_cpu`, `glow_parity`,
-    /// `glow_halo_parity`, `nova_parity`, `rain_parity`, `fire_patch_parity`,
-    /// `free_parity`/`cat_parity`, the M1b scroll tests). One gate sweeps the
-    /// ladder's remaining frame rows because the fixtures drive them:
+    /// Full-frame differential: `render_input`'s frame, wgpu vs Metal, byte
+    /// equal, on fixtures shaped like the parity suites:
     ///
     /// | fixture | rows driven (beyond bg=0 / glyph=1) |
     /// |---|---|
@@ -4025,17 +3396,13 @@ mod tests {
     /// | glow_halo | 4 (`glow_add`), 5 (`rain_glow`), 6 (`rain_glow_over`) |
     /// | nova | 4 (`nova_add` through `glow_add`) |
     /// | rain | 5/6 (rain halos, both modes), 11 (rain sprites) |
-    /// | fire | 7 (`fire_add`), 8 (`fire_over`), 4 (`glow_under`), 9-pipe glyph halo over the MONO atlas |
+    /// | fire | 7 (`fire_add`), 8 (`fire_over`), 4 (`glow_under`), glyph halo over the mono atlas |
     /// | sprites | 11 (`sprite_over`: free under+over, cats) |
-    /// | scroll | the band-shift twin over the routed copy verbs |
+    /// | scroll | the band-shift twin over the copy verbs |
     ///
-    /// The wgpu arm is the SHIPPED `render_input`; the Metal arm replays the
-    /// recorded frame plan through the ONE shared walker on the W1 encoder
-    /// (`GpuRenderer::frame_differential_for_test` documents what is shared
-    /// vs independent). Each fixture runs N=5 — the paint-conformance rule:
-    /// never trust one run of anything GPU-shaped — and byte-identical is the
-    /// bar (six ladder rows already meet it; a divergence here demands a
-    /// measured cause, never a loosened tolerance).
+    /// The wgpu arm is `render_input`; the Metal arm replays the recorded plan
+    /// through the shared walker (see
+    /// `GpuRenderer::frame_differential_for_test`). N=5 per fixture.
     #[test]
     fn full_frame_render_input_matches_wgpu_byte_for_byte() {
         use aterm_core::render::{
@@ -4052,14 +3419,14 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
-        // Bloom and shimmer are PRESENT-time layers (rows 12/13, W5); the
+        // Bloom and shimmer are present-time layers (rows 12/13); the
         // encode-plan replay compares the offscreen before them.
         gpu.set_bloom(false);
         gpu.set_shimmer(false);
@@ -4206,13 +3573,8 @@ mod tests {
                 ry: ch16,
                 mode: HaloMode::Over,
             });
-            // SECOND instance per mode-stream, judged in: every RainGlow
-            // stream in every fixture carried exactly ONE instance, and
-            // per-instance stride is never applied for instance 0 — so a
-            // stride fault on rows 5/6 could not move a byte (a stride+4
-            // plant rode the full gate GREEN while the same plant on the
-            // multi-instance glyph stream went RED 3,186 px). Instance 1 is
-            // what makes the stride load-bearing.
+            // A second instance per mode stream, so per-instance stride is
+            // exercised (instance 0 never applies it).
             input.rain_add.push(RainHalo {
                 row: 5,
                 x: 3 * cw16,
@@ -4242,9 +3604,8 @@ mod tests {
             fixtures.push(("rain", input, &[S::RainAdd, S::RainAddOver, S::RainUnder]));
         }
 
-        // 5. fire: the EMBERFORGE field, Add AND Over patches, with the
-        //    under-glyph light, charred ink and the contrast halo
-        //    (fire_patch_parity + glow_under_parity's shape).
+        // 5. fire: Add and Over patches with under-glyph light, charred ink
+        //    and the contrast halo.
         {
             let mut input = base_input();
             input.glow_under.push(GlowQuad {
@@ -4275,9 +3636,7 @@ mod tests {
                     cell_h: ch16,
                     mode,
                 });
-                // Instance 1 per mode — the stride-load-bearing twin (see
-                // the rain fixture's judged note; one FirePatch was one
-                // FireInstance, so rows 7/8's stride was unswept).
+                // Instance 1 per mode, so the stride is exercised.
                 input.fire_patch.push(FirePatch {
                     row: 4,
                     x: ((2 + i * 4) * cw) as u16,
@@ -4368,10 +3727,8 @@ mod tests {
             fixtures.push(("scroll", input, &[S::Bg, S::Glyph]));
         }
 
-        // 7b. scroll_down: the NEGATIVE glide (the elastic-overscroll
-        //     bounce) — the staged move's other sign, exposing the TOP strip
-        //     (W4-judge: the positive fixture alone left `delta < 0`'s
-        //     src/dst swap undriven on the Metal twin).
+        // 7b. scroll_down: the negative glide (overscroll bounce), exposing
+        //     the top strip and swapping src/dst.
         {
             let mut input = base_input();
             input.scroll_frac_px = -(ch as i32 / 2).max(1);
@@ -4397,10 +3754,8 @@ mod tests {
                     }
                     Err(e) => panic!("{name} run {run}: {e}"),
                     Ok(Some((expected, actual))) => {
-                        // NON-VACUITY: the fixture must actually DRIVE the
-                        // streams whose rows it claims to sweep — an empty
-                        // stream compares two identical no-draws and arms
-                        // nothing.
+                        // The fixture must drive the streams it claims to
+                        // sweep.
                         let drawn = gpu.last_frame_plan_streams_for_test();
                         for want in must_drive {
                             assert!(
@@ -4409,36 +3764,13 @@ mod tests {
                                  plan never drew it — the sweep is vacuous"
                             );
                         }
-                        assert_eq!(
-                            (expected.width, expected.height),
-                            (actual.width, actual.height),
-                            "{name} run {run}: frame dims diverged"
+                        assert_frames_identical(
+                            &format!("{name} run {run}: THE METAL FULL FRAME"),
+                            "Measure the cause (pipeline state? view alias? clear \
+                             encode? sampler? shader twin?) — never loosen the tolerance.",
+                            &expected,
+                            &actual,
                         );
-                        if expected.pixels != actual.pixels {
-                            let mut diffs = 0usize;
-                            let mut first = None;
-                            for (i, (e, a)) in
-                                expected.pixels.iter().zip(&actual.pixels).enumerate()
-                            {
-                                if e != a {
-                                    diffs += 1;
-                                    if first.is_none() {
-                                        first = Some((i, *e, *a));
-                                    }
-                                }
-                            }
-                            let (i, e, a) = first.expect("some pixel differs");
-                            let (x, y) = (i % expected.width, i / expected.width);
-                            panic!(
-                                "{name} run {run}: THE METAL FULL FRAME IS NOT \
-                                 BYTE-IDENTICAL TO wgpu — {diffs} of {} pixels \
-                                 differ; first at ({x},{y}): wgpu {e:08x} != metal \
-                                 {a:08x}. Measure the cause (pipeline state? view \
-                                 alias? clear encode? sampler? shader twin?) — \
-                                 never loosen the tolerance.",
-                                expected.pixels.len()
-                            );
-                        }
                         if run == N - 1 {
                             results.push(format!(
                                 "{name}: byte-identical over {} pixels x {N} runs",
@@ -4486,17 +3818,11 @@ mod tests {
         }
     }
 
-    /// W4-judge item 2a — THE WORST-CASE COALESCED PLAN. The common frame is
-    /// one pass; the risky frames are the ones with PASS BOUNDARIES, where
-    /// load-op inheritance (later passes must Load what pass 0 stored), the
-    /// per-pass tracker resets and the view switches between the sRGB alias
-    /// and the Unorm face all engage. The full-frame fixtures above reach 3
-    /// passes at most; this fixture forces the maximum the differential can
-    /// reach — 5 passes, the full alternation sRGB|Unorm|sRGB|Unorm|sRGB
-    /// (BASE_BG | GLOW_UNDER | BASE_FG | GLOW | FREE_OVER+CURSOR) — and
-    /// byte-compares both arms N times. (The 6/7-pass shapes need the wdeco
-    /// deco-atlas groups, which this harness REFUSES by design — deco rows
-    /// keep W3's dedicated differential.)
+    /// Worst-case coalesced plan: forces five passes
+    /// (sRGB|Unorm|sRGB|Unorm|sRGB: BASE_BG | GLOW_UNDER | BASE_FG | GLOW |
+    /// FREE_OVER+CURSOR), exercising load inheritance, tracker resets and view
+    /// switches, byte-compared N times. Deco groups (6/7 passes) are covered by
+    /// the deco differential.
     #[test]
     fn the_worst_case_five_pass_plan_is_byte_identical_across_arms() {
         use aterm_core::render::{
@@ -4514,12 +3840,12 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
         gpu.set_bloom(false);
         gpu.set_shimmer(false);
@@ -4581,8 +3907,7 @@ mod tests {
                 ry: ch16,
                 mode,
             });
-            // Instance 1 per mode — the stride-load-bearing twin (see the
-            // rain fixture's judged note).
+            // Instance 1 per mode: the twin whose stride matters.
             input.rain_add.push(RainHalo {
                 row: 4,
                 x: ((3 + i * 4) * cw) as u16,
@@ -4657,25 +3982,13 @@ mod tests {
                             "{want:?} missing from the worst-case plan — the sweep is vacuous"
                         );
                     }
-                    assert_eq!(
-                        (expected.width, expected.height),
-                        (actual.width, actual.height),
-                        "run {run}: frame dims diverged"
+                    assert_frames_identical(
+                        &format!("run {run}: THE WORST-CASE 5-PASS FRAME"),
+                        "Measure the pass boundary that broke (load inheritance? view \
+                         switch? tracker reset?), never loosen the tolerance",
+                        &expected,
+                        &actual,
                     );
-                    if expected.pixels != actual.pixels {
-                        let diffs = expected
-                            .pixels
-                            .iter()
-                            .zip(&actual.pixels)
-                            .filter(|(e, a)| e != a)
-                            .count();
-                        panic!(
-                            "run {run}: the worst-case 5-pass frame diverged on {diffs} of {} \
-                             pixels — measure the pass boundary that broke (load inheritance? \
-                             view switch? tracker reset?), never loosen the tolerance",
-                            expected.pixels.len()
-                        );
-                    }
                     if run == N - 1 {
                         crate::stderr_line!(
                             "worst-case 5-pass plan: byte-identical over {} pixels x {N} runs",
@@ -4687,24 +4000,15 @@ mod tests {
         }
     }
 
-    /// W4-judge item 2b — THE SCISSORED LOAD FRAME. `render_input` is always
-    /// a FULL repaint (Clear + no scissor), so every fixture above replays
-    /// pass 0 as Clear; the pass law's OTHER half — `FrameLoad::Load` reading
-    /// the prior frame's texels with a one-band dirty scissor clipping every
-    /// pass — only arises on the PRESENT path's dirty diff. This drives that
-    /// exact production sequence (present A full, present B dirty), seeds the
-    /// Metal offscreen with the pre-encode offscreen bytes, replays B's
-    /// recorded Load+scissor plan on both arms, and asserts:
+    /// Scissored Load frame: drives present A (full) then present B (dirty),
+    /// seeds the Metal offscreen with the pre-encode bytes, replays B's recorded
+    /// Load+scissor plan on both arms, and asserts:
     ///
-    ///   * arm vs arm: the full post-B offscreen is byte-identical;
-    ///   * SCISSOR ISOLATION (a shared-bug detector the differential alone
-    ///     cannot provide): every row outside the recorded band still holds
-    ///     the seed's bytes, bit for bit.
+    ///   * the post-B offscreen is byte-identical across arms;
+    ///   * every row outside the recorded band still holds the seed's bytes.
     ///
-    /// The fixture pins a static ember glow on the row it edits so the
-    /// scissored plan still crosses a view boundary (sRGB base | Unorm glow |
-    /// sRGB cursor = 3 passes) — Load inheritance at a boundary, under a
-    /// scissor, is the enumerated risky shape.
+    /// A static glow on the edited row keeps the plan at three passes, so load
+    /// inheritance at a view boundary runs under a scissor.
     #[test]
     fn the_scissored_load_frame_is_byte_identical_across_arms() {
         use aterm_render::{GlowQuad, premul_rgb};
@@ -4716,12 +4020,12 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
         gpu.set_bloom(false);
         gpu.set_shimmer(false);
@@ -4730,22 +4034,17 @@ mod tests {
         let cw16 = cw as u16;
         let ch16 = ch as u16;
 
-        // A and B differ in exactly one row's text; both carry the SAME
-        // static glow on that row, so the dirty diff stays narrow while the
-        // scissored plan keeps its Unorm pass.
+        // A and B differ in one row's text and share a static glow there, so the
+        // dirty diff stays narrow while the plan keeps its Unorm pass.
         let build = |txt: &[u8]| -> RenderInput {
             let mut term = Terminal::new(ROWS as u16, COLS as u16);
             term.process(b"$ scissored load frame\r\n");
             term.process(b"steady row stays put\r\n");
             term.process(txt);
             let mut input = term.cell_frame(ROWS, COLS);
-            // The glow is KEYED to the edited row (the dirty filter's key) but
-            // its RECT spans three rows — the aurora bleed shape — so the
-            // recorded one-band scissor is LOAD-BEARING: without it, the
-            // replay would re-add glow light over rows the Load preserved
-            // (they already hold the seed's glow) and double it. A fixture
-            // whose quads all sat inside the band would leave the scissor
-            // untestable — clipped or not, the bytes would agree.
+            // The glow is keyed to the edited row but its rect spans three rows,
+            // so the recorded scissor is load-bearing: without it the replay
+            // would re-add glow over Load-preserved rows.
             input.cursor_glow_add.push(GlowQuad {
                 row: 2,
                 x: cw16,
@@ -4804,29 +4103,12 @@ mod tests {
                     Err(e) => panic!("run {run}: {e}"),
                     Ok(Some(f)) => f,
                 };
-            assert_eq!(
-                (expected.width, expected.height),
-                (actual.width, actual.height)
+            assert_frames_identical(
+                &format!("run {run}: THE SCISSORED LOAD FRAME (scissor {sx},{sy} {sw}x{sh})"),
+                "Measure the cause, never loosen the tolerance",
+                &expected,
+                &actual,
             );
-            if expected.pixels != actual.pixels {
-                let mut diffs = 0usize;
-                let mut first = None;
-                for (i, (e, x)) in expected.pixels.iter().zip(&actual.pixels).enumerate() {
-                    if e != x {
-                        diffs += 1;
-                        if first.is_none() {
-                            first = Some((i % expected.width, i / expected.width, *e, *x));
-                        }
-                    }
-                }
-                let (fx, fy, e, x) = first.expect("some pixel differs");
-                panic!(
-                    "run {run}: the scissored LOAD frame diverged on {diffs} of {} pixels; \
-                     first at ({fx},{fy}) wgpu {e:08x} != metal {x:08x} (scissor was \
-                     {sx},{sy} {sw}x{sh}) — measure the cause, never loosen the tolerance",
-                    expected.pixels.len()
-                );
-            }
             // Scissor isolation against the SEED — catches a shared
             // both-arms-ignore-the-scissor bug the arm comparison cannot.
             for y in 0..h as usize {
@@ -4847,31 +4129,20 @@ mod tests {
         crate::stderr_line!("scissored Load frame: byte-identical + isolated x {N} runs");
     }
 
-    /// W5 — THE PRESENT-PATH DIFFERENTIAL: one cropped, LETTERBOXED present
-    /// through the SHIPPED wgpu body (`present_virtual_cropped` →
-    /// `present_to_view`) with its presented destination captured by the
-    /// virtual snapshot tap, against the METAL arm replaying §2 Submit B —
-    /// compose copy → bloom extract (row 4) → bloom composite (row 12) →
-    /// shimmer (row 13) → tray (row 17) → the "aterm-gpu blit pass" (row 16,
-    /// `setViewport` + scissor letterbox) — on a REAL first-party swapchain
-    /// frame cycle (standalone layer, bounded acquire, tap copy before
-    /// commit, `presentDrawable:` after, ticket status-polled). BYTE-
-    /// IDENTICAL is the bar, per arm, on all three routing classes:
+    /// Present-path differential: one cropped, letterboxed present through the
+    /// wgpu body (`present_virtual_with_crop` → `present_to_view`, captured by
+    /// the virtual snapshot tap) against the Metal arm replaying Submit B
+    /// (compose copy, bloom extract and composite, shimmer, tray, letterbox
+    /// blit) on a real standalone swapchain frame cycle. Byte-identical on:
     ///
-    /// * `fx_tray` — bloom + shimmer + card: the full `use_present_off`
-    ///   route (every optional pass live);
-    /// * `fx_only` — bloom + shimmer, no card;
-    /// * `plain` — every effect off: the blit samples the offscreen
-    ///   DIRECTLY (the `use_present_off == false` arm).
+    /// * `fx_tray`: bloom, shimmer and card;
+    /// * `fx_only`: bloom and shimmer;
+    /// * `plain`: no effects, the blit samples the offscreen directly.
     ///
-    /// The destination deliberately exceeds the frame by odd remainders
-    /// (+9, +7) so `content_off` is non-zero and the letterbox bands are
-    /// load-bearing on both arms; the crown rows (14/15) are armed by their
-    /// own byte differentials (the SDR envelope is wall-clock-attacked, so
-    /// this fixture pins it OFF and asserts so). N=5 per class — the paint
-    /// rule. NON-VACUITY: the fx_tray capture must differ from plain (the
-    /// effect passes moved presented bytes), and the letterbox band must
-    /// hold the live terminal background exactly.
+    /// The destination exceeds the frame by +9/+7 so the letterbox bands
+    /// matter. The SDR crown is pinned off (its envelope is wall-clock). N=5
+    /// per class. `fx_tray` must differ from `plain`, and the band must hold
+    /// the live background.
     #[test]
     fn present_path_matches_wgpu_virtual_present_byte_for_byte() {
         use aterm_core::render::FirePatch;
@@ -4886,12 +4157,12 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
         gpu.set_shimmer_phase_for_test(Some(0.37));
         gpu.set_sdr_glow_boost(0.0);
@@ -4919,9 +4190,8 @@ mod tests {
                 alpha2: 0,
             });
         }
-        // The FIRE-style marker the shimmer gate keys on (`shimmer_live`): a
-        // zero-area patch marks the style live without rasterizing a field
-        // pixel, so the effect bytes stay those of the glow stream alone.
+        // A zero-area fire patch marks the fire style live for `shimmer_live`
+        // without rasterizing any field pixel.
         input.fire_patch = vec![FirePatch::default()];
 
         // A deterministic straight-alpha card: full-range colour sweep, alpha
@@ -4976,42 +4246,17 @@ mod tests {
                     "{name}: every pass this class claims must actually encode \
                      (a None shimmer region or empty glow stream arms nothing)"
                 );
-                assert_eq!(expected.len(), actual.len(), "{name}: capture sizes");
-                if expected != actual {
-                    let mut diffs = 0usize;
-                    let mut firstpx = None;
-                    let mut max_delta = 0u8;
-                    for (i, (e, a)) in expected
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .zip(actual.as_chunks::<4>().0.iter())
-                        .enumerate()
-                    {
-                        if e != a {
-                            diffs += 1;
-                            for (ec, ac) in e.iter().zip(a) {
-                                max_delta = max_delta.max(ec.abs_diff(*ac));
-                            }
-                            if firstpx.is_none() {
-                                firstpx = Some((i, e.to_vec(), a.to_vec()));
-                            }
-                        }
-                    }
-                    let (i, e, a) = firstpx.expect("bytes differ, so a texel differs");
-                    let (x, y) = (i % dw as usize, i / dw as usize);
-                    panic!(
-                        "THE METAL PRESENT IS NOT BYTE-IDENTICAL TO wgpu \
-                         ({name}, run {run}): {diffs} of {} px differ, max channel \
-                         delta {max_delta}; first at ({x},{y}): wgpu {e:02x?} != \
-                         metal {a:02x?}. Localize before touching tolerance: \
-                         band-only diffs are the letterbox uniform, diffs inside \
-                         the dilated glow bbox are the bloom pair, region-rect \
-                         diffs are the shimmer, card-rect diffs are the tray \
-                         blend, everything-diffs is the compose copy or the blit",
-                        (dw * dh) as usize
-                    );
-                }
+                assert_row_bytes_identical(
+                    &format!("THE METAL PRESENT ({name}, run {run})"),
+                    "Localize before touching tolerance: band-only diffs are the \
+                     letterbox uniform, diffs inside the dilated glow bbox are the \
+                     bloom pair, region-rect diffs are the shimmer, card-rect diffs \
+                     are the tray blend, everything-diffs is the compose copy or the blit",
+                    dw as usize,
+                    4,
+                    &expected,
+                    &actual,
+                );
                 // Steady-state parity too: run 0 is the cold path (fresh
                 // offscreen, full copy), later runs the resident path.
                 if let Some(f) = &first {
@@ -5044,9 +4289,8 @@ mod tests {
             "bloom+shimmer+tray must move presented bytes vs the plain present \
              — an inert sequence armed nothing"
         );
-        // NON-VACUITY 2: the letterbox band holds the live terminal bg
-        // exactly (the +9/+7 remainder means the bottom-right corner is BAND
-        // on every class).
+        // The letterbox band holds the live terminal bg (the bottom-right
+        // corner is band in every class).
         let (dw, dh) = (dest.0 as usize, dest.1 as usize);
         let corner = &plain[(dh - 1) * dw * 4 + (dw - 1) * 4..][..4];
         let want = [
@@ -5065,12 +4309,13 @@ mod tests {
         );
     }
 
-    /// Shared W5 row-differential comparator: byte-for-byte, with the first
-    /// divergence localized (texel coordinates + both spellings) so a red
-    /// run names its CAUSE class before anyone reaches for tolerance.
-    #[allow(clippy::cast_possible_truncation, reason = "test extents")]
+    /// Shared wgpu-vs-Metal comparator: byte for byte over `w`-wide rows of
+    /// `texel`-byte texels, reporting the first divergence (coordinates, both
+    /// values, max delta, alpha-only). `name` says what diverged; `hint` maps
+    /// divergence shapes to causes.
     fn assert_row_bytes_identical(
         name: &str,
+        hint: &str,
         w: usize,
         texel: usize,
         expected: &[u8],
@@ -5084,9 +4329,8 @@ mod tests {
         if expected == actual {
             return;
         }
-        let mut diffs = 0usize;
-        let mut first = None;
-        let mut max_delta = 0u8;
+        let colour = texel * 3 / 4;
+        let (mut diffs, mut first, mut max_delta, mut alpha_only) = (0usize, None, 0u8, true);
         for (i, (e, a)) in expected
             .chunks_exact(texel)
             .zip(actual.chunks_exact(texel))
@@ -5094,36 +4338,44 @@ mod tests {
         {
             if e != a {
                 diffs += 1;
+                alpha_only &= e[..colour] == a[..colour];
                 for (ec, ac) in e.iter().zip(a) {
                     max_delta = max_delta.max(ec.abs_diff(*ac));
                 }
-                if first.is_none() {
-                    first = Some((i, e.to_vec(), a.to_vec()));
-                }
+                first.get_or_insert((i, e, a));
             }
         }
         let (i, e, a) = first.expect("bytes differ, so a texel differs");
-        let (x, y) = (i % w, i / w);
         panic!(
-            "THE METAL {name} ROW IS NOT BYTE-IDENTICAL TO wgpu: {diffs} texels \
-             differ, max byte delta {max_delta}; first at ({x},{y}): wgpu \
-             {e:02x?} != metal {a:02x?}. Localize the cause before touching \
-             tolerance — all-texels is a bind/uniform fault, edge-only is \
-             filtering, seed-region-only is the Load, delta<=1 is rounding"
+            "{name} IS NOT BYTE-IDENTICAL TO wgpu: {diffs} of {} texels differ, max \
+             byte delta {max_delta}, alpha_only={alpha_only}; first at ({},{}): wgpu \
+             {e:02x?} != metal {a:02x?}. {hint}",
+            expected.len() / texel,
+            i % w,
+            i / w,
         );
     }
 
-    /// W5 — ROWS 14/15, the crown pair from ONE fixture: `hdr_glow` onto a
-    /// SEEDED `Rgba16Float` Load target (One/One additive, the s2l decode's
-    /// BOTH branches armed by a dark and a bright instance, the headroom
-    /// clamp armed by boost*lin > headroom) and `sdr_glow` onto a seeded
-    /// `Bgra8Unorm` Load target (SCREEN blend spending the seed's leftover
-    /// headroom). Three instances — instance-1+ stride load-bearing (the W4
-    /// judge's lesson) — overlapping so blend ORDER is armed; the crown
-    /// scissor clips the third instance so the scissor is load-bearing; the
-    /// non-zero `content_off` arms the W1 band placement in `vs_hdr_glow`.
-    /// f16 comparison is BIT equality on the raw halves — same GPU, same
-    /// blend, no tolerance.
+    /// [`assert_row_bytes_identical`]'s twin for a packed [`Frame`]: the
+    /// geometry, then every pixel as straight RGBA bytes.
+    fn assert_frames_identical(name: &str, hint: &str, expected: &Frame, actual: &Frame) {
+        assert_eq!(
+            (expected.width, expected.height),
+            (actual.width, actual.height),
+            "{name}: frame geometry diverged"
+        );
+        if expected.pixels != actual.pixels {
+            let (e, a) = (expected.rgba_bytes(), actual.rgba_bytes());
+            assert_row_bytes_identical(name, hint, expected.width, 4, &e, &a);
+        }
+    }
+
+    /// Crown pair from one fixture: `hdr_glow` onto a seeded `Rgba16Float`
+    /// target (One/One, both `s2l` branches, the headroom clamp) and `sdr_glow`
+    /// onto a seeded `Bgra8Unorm` target (screen blend). Three overlapping
+    /// instances exercise stride and blend order; the scissor clips the third;
+    /// a non-zero `content_off` exercises band placement. f16 compared as raw
+    /// bits.
     #[test]
     fn crown_rows_match_wgpu_byte_for_byte() {
         use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -5135,12 +4387,12 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no GPU renderer: {e}");
                 return;
             }
         };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        // Selection defaults to Metal; this test drives the wgpu oracle arm,
+        // so it disarms the default.
         gpu.disarm_metal_for_test();
         const W: usize = 20;
         const H: usize = 14;
@@ -5148,9 +4400,8 @@ mod tests {
         const BOOST: f32 = 4.0;
         const HEADROOM: f32 = 1.2;
         const SCISSOR: [u32; 4] = [3, 2, 17, 12];
-        // (rect, colour): a bright quad (headroom clamp engages at boost 4),
-        // a DARK quad (the s2l lo branch: c <= 0.04045), and an overlapping
-        // quad the scissor partially clips.
+        // (rect, colour): a bright quad (headroom clamp at boost 4), a dark
+        // quad (the `s2l` low branch), and an overlapping partially clipped one.
         const INSTANCES: [([u16; 4], [u8; 4]); 3] = [
             ([1, 1, 8, 6], [240, 160, 80, 255]),
             ([5, 3, 6, 5], [9, 6, 3, 255]),
@@ -5288,7 +4539,16 @@ mod tests {
             );
             // SAFETY: shared storage, terminal above.
             let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-            assert_row_bytes_identical(name, W, texel, expected, &actual);
+            assert_row_bytes_identical(
+                &format!("THE METAL {name} ROW"),
+                "Localize the cause before touching tolerance — all-texels is a \
+                 bind/uniform fault, edge-only is filtering, seed-region-only is \
+                 the Load, delta<=1 is rounding",
+                W,
+                texel,
+                expected,
+                &actual,
+            );
             crate::stderr_line!(
                 "{name} differential on {}: byte-identical over {} texels \
                  ({} target, 3 instances, scissored Load, content_off armed)",

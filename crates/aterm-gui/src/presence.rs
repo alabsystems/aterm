@@ -1,32 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PRESENCE — a window shows who is driving it: this host's SENSING half.
+//! Presence (a window shows who is driving it): this host's sensing half.
 //!
-//! The row's pure core — the facts, the per-session slot and its story, the
-//! levels, the rim, the chip, the words and their width law, the tones, the
-//! painted cells and the per-window view — is the engine's
-//! (`aterm_messages::presence`, design ruling 348: the owner's "design the
-//! logic in aterm core and then keep the osx layer lightweight so that we can
-//! make this cross platform"). It is re-exported here under the names every
-//! call site has always used; the generic types are pinned to this host's
-//! [`Native`] seam ([`Slot`], [`Facts`], [`AgentPhase`], [`AgentReading`]).
+//! The row's pure core (facts, the per-session slot and its story, levels, rim,
+//! chip, words and their width law, tones, painted cells and the per-window
+//! view) lives in the engine (`aterm_messages::presence`) so it stays
+//! cross-platform. It is re-exported here under the names call sites use, with
+//! the generic types pinned to this host's [`Native`] seam ([`Slot`], [`Facts`],
+//! [`AgentPhase`], [`AgentReading`]).
 //!
 //! What stays here is what only a host can do: the wakes that carry a change
-//! from the control and bridge threads to the main thread ([`install_proxy`]),
-//! the agent verdict — `aterm_phase`'s screen readers over the [`live_zone`]
+//! from the control and bridge threads to the main thread ([`install_proxy`]);
+//! the agent verdict, `aterm_phase`'s screen readers over the [`live_zone`]
 //! with the terminal's cursor ([`agent_verdict`], run by the status sweep in
-//! `session_status.rs`, at most 4 Hz per session and never per frame; the
-//! test-only [`classifier_calls`] counter is the gate's proof) — the words
-//! for an API error's cause and a wall's wire word, the reset clock that
-//! places a limit notice's reset time on this machine's clock
-//! ([`countdown_to_reset`]), and [`Native`], the seam the engine reads a
-//! wall, an input stall, this process's harness and the wire's percent codec
-//! through. The App's side (`app_presence.rs`) gathers each session's facts,
-//! hosts the engine's presence driver (`aterm_messages::presence::drive`,
-//! ruling 353) and paints the row the engine lays out. The row's pure
-//! `Slot`/`words` tests are the engine's (`presence_tests.rs`, over a test
-//! seam); the tests here prove this host's sensing and its seam.
+//! `session_status.rs` at most 4 Hz per session, never per frame; the test-only
+//! [`classifier_calls`] counter proves the gate); the words for an API error's
+//! cause and a wall's wire word; the reset clock ([`countdown_to_reset`]); and
+//! [`Native`], the seam through which the engine reads a wall, an input stall,
+//! this process's harness and the wire's percent codec. The App's side
+//! (`app_presence.rs`) gathers each session's facts, hosts the engine's
+//! presence driver (`aterm_messages::presence::drive`) and paints the row. The
+//! row's pure tests are the engine's (`presence_tests.rs`); the tests here
+//! cover this host's sensing and its seam.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -37,11 +33,10 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
-// The engine's presence core under the names every call site has always used
-// (design ruling 348).
+// The engine's presence core under the names call sites use.
 pub(crate) use aterm_messages::presence::{
     ChipLevel, Hand, HoldFact, LeaseMark, Link, MailFacts, MailLast, StoryVerb,
-    TOLD_TEXT_MAX_BYTES, TurnFact, Words, fmt_dur, prompt_band_word, prompt_kind_words,
+    TOLD_TEXT_MAX_BYTES, TurnFact, WallAnswer, Words, fmt_dur, prompt_band_word, prompt_kind_words,
     sanitize_token, short_sid,
 };
 // …and the ones only the tests name.
@@ -62,7 +57,7 @@ pub(crate) type AgentReading = aterm_messages::presence::AgentReading<Native>;
 /// is the window state's own, `WindowState::presence_row`).
 pub(crate) type WindowView = aterm_messages::presence::View;
 
-/// THIS host's presence seam (`aterm_messages::presence::Host`): an
+/// This host's presence seam (`aterm_messages::presence::Host`): an
 /// uninhabited marker, because the orphan rule forbids implementing the
 /// engine's trait on `aterm_phase`'s types. A wall is `aterm_phase`'s
 /// [`aterm_phase::WallKind`], a stall the server's published
@@ -79,12 +74,11 @@ impl aterm_messages::presence::Host for Native {
         wall_word(kind)
     }
 
-    /// A wall the row has always called `limited` (a usage window, a model
-    /// bucket, spend, an API rate limit — [`aterm_phase::WallKind::reads_limited`])
-    /// keeps that word (design §1: `limited → 19:30 · 1d 22h`), an API error
-    /// the network caused says what went wrong ([`api_cause_words`]), and any
-    /// other wall is the state it leaves the session in (the menu bar's
-    /// `status_item::wall_words`).
+    /// A wall that reads `limited` (a usage window, a model bucket, spend, an
+    /// API rate limit: [`aterm_phase::WallKind::reads_limited`]) keeps that word
+    /// (`limited → 19:30 · 1d 22h`); an API error the network caused says what
+    /// went wrong ([`api_cause_words`]); any other wall is the state it leaves
+    /// the session in (`status_item::wall_words`).
     fn wall_band(kind: aterm_phase::WallKind) -> &'static str {
         if kind.reads_limited() {
             return "limited";
@@ -92,14 +86,17 @@ impl aterm_messages::presence::Host for Native {
         api_cause_words(kind).unwrap_or_else(|| crate::status_item::wall_words(kind.name()))
     }
 
-    /// An API error or an overload the harness retries on its own clock
-    /// (not a rate limit, which names its own reset).
+    /// An API error or overload the harness retries on its own clock, including
+    /// the API's own rate limit (a 429 `API Error`), whose wait is told to the
+    /// tab: the row says `limited → 14:05 · 5m00s` and speaks `limited, next try
+    /// 14:05`. A usage window (`UsageSession` and the like) names and keeps its
+    /// own reset, as does a screen that names a time of its own
+    /// (`with_retry_plan` lays a plan only where there is none).
     fn wall_retries(kind: aterm_phase::WallKind) -> bool {
-        !kind.reads_limited()
-            && matches!(
-                kind,
-                aterm_phase::WallKind::ApiError { .. } | aterm_phase::WallKind::Overloaded
-            )
+        matches!(
+            kind,
+            aterm_phase::WallKind::ApiError { .. } | aterm_phase::WallKind::Overloaded
+        )
     }
 
     fn stall_since(stall: &crate::input_stall::InputStallFact) -> aterm_messages::Instant {
@@ -127,26 +124,22 @@ impl aterm_messages::presence::Host for Native {
     }
 }
 
-/// A hold's reason as every human-facing surface prints and speaks it — the
-/// engine's `hold_reason_words` over the wire's decode: the band's hand slot,
+/// A hold's reason as every human-facing surface prints and speaks it (the
+/// engine's `hold_reason_words` over the wire's decode). The band's hand slot,
 /// its spoken sentence and the greyed menu row (`crate::menu::hold_row_reason`)
 /// all read from here, so they cannot disagree.
 pub(crate) fn hold_reason_words(reason: &str) -> String {
     aterm_messages::presence::hold_reason_words::<Native>(reason)
 }
 
-/// When a control client was last handed a session's screen GENERATION by a
+/// When a control client was last handed a session's screen generation by a
 /// read an `if-gen=` fence names (`status gen=`, `text --json`):
-/// [`crate::metrics::now_us`] plus one (so `0` stays "never"). Lives on
+/// [`crate::metrics::now_us`] plus one (`0` means never). Lives on
 /// [`crate::SessionCtx`]; the App's `Desk::looked_at` reads it, and a pending
-/// fold of the presence row waits its quiet past it (ruling 394, bounded by
-/// `FOLD_LOOK_CAP`). Why (2026-09-28 review of ruling 394): with the fold
-/// deferred, its re-grid could land between a driver's read and its fenced
-/// act — `meta` unset, a read, the fold's timer, the act refused
-/// `reason=changed` — where the immediate fold had landed before the read.
-/// Posts no wake: the loop recomputes the presence deadline every pass, and
-/// a tick that finds the fold not yet due re-arms at the later instant.
-/// Lock-free, one relaxed `fetch_max` per read.
+/// fold of the presence row waits its quiet past it (bounded by
+/// `FOLD_LOOK_CAP`), so the fold's re-grid cannot land between a driver's read
+/// and its fenced act. Posts no wake: the loop recomputes the presence
+/// deadline every pass. Lock-free, one relaxed `fetch_max` per read.
 #[derive(Debug, Default)]
 pub(crate) struct GenerationLook(std::sync::atomic::AtomicU64);
 
@@ -174,7 +167,7 @@ impl GenerationLook {
 /// The event-loop proxy the control and bridge threads post presence wakes
 /// through. Installed once at launch (`install_proxy`); a headless test App
 /// installs nothing and drives the model directly, so a post before install is
-/// a no-op rather than a lost invariant.
+/// a no-op.
 static PROXY: OnceLock<EventLoopProxy<Wake>> = OnceLock::new();
 
 /// Install the proxy the wakes ride. First install wins; later calls are ignored.
@@ -182,9 +175,9 @@ pub(crate) fn install_proxy(proxy: EventLoopProxy<Wake>) {
     let _ = PROXY.set(proxy);
 }
 
-/// A session's drive lease changed hands — a `turn` began or settled, a
-/// cooperative `lease` was acquired or released. `submitted` marks the moment a
-/// turn's submit keypress verifiably landed: the one edge the rim ripples on.
+/// A session's drive lease changed hands (a `turn` began or settled, a
+/// cooperative `lease` was acquired or released). `submitted` marks the moment
+/// a turn's submit keypress verifiably landed, the one edge the rim ripples on.
 pub(crate) fn post_lease_changed(session: &SessionId, submitted: bool) {
     #[cfg(test)]
     LEASE_WAKES.with(|w| w.borrow_mut().push((session.clone(), submitted)));
@@ -202,18 +195,17 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Every lease-changed wake posted ON THIS THREAD since the last take, in
+/// Every lease-changed wake posted on this thread since the last take, in
 /// order: `(session, submitted)`. A headless test App installs no proxy, so
-/// the wake itself goes nowhere; this is what a control verb run on the test's
-/// own thread asked the event loop to deliver. Thread-local for the same
-/// reason as [`classifier_calls`]: the suite runs tests in parallel.
+/// this records what a control verb run on the test's thread asked the event
+/// loop to deliver. Thread-local because tests run in parallel.
 #[cfg(test)]
 pub(crate) fn take_lease_wakes() -> Vec<(SessionId, bool)> {
     LEASE_WAKES.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
-/// A session's fabric endpoint changed — a delivery, a hold transition, a post
-/// landing, `inbox seen`, a link report. Posted beside every
+/// A session's fabric endpoint changed (a delivery, a hold transition, a post
+/// landing, `inbox seen`, a link report). Posted beside every
 /// `changed.notify_all()` in `fabric.rs`, so the band moves exactly when a
 /// parked `await inbox` would.
 pub(crate) fn post_fabric_changed(session: &SessionId) {
@@ -229,42 +221,34 @@ pub(crate) fn post_fabric_changed(session: &SessionId) {
 // ---------------------------------------------------------------------------
 
 /// How many screen rows the agent-phase classifier reads: the composer frame
-/// and the live zone above it fit in the last 40 rows of any screen's CONTENT
+/// and the live zone above it fit in the last 40 rows of any screen's content
 /// ([`live_zone`]), and the whole-screen fallback (no composer frame) reads
 /// the same rows a supervisor would.
 pub(crate) const CLASSIFY_ROWS: usize = 40;
 
-/// THE LIVE ZONE the agent verdict reads ([`agent_verdict`]) and the status
+/// The live zone the agent verdict reads ([`agent_verdict`]) and the status
 /// sweep's classifier gate hashes (`session_status`'s `agent_observe`): the
-/// last [`CLASSIFY_ROWS`] rows of the screen's content — up to its last
-/// non-blank row — and the blank rows under it
-/// ([`aterm_phase::live_zone_start`], the one cut: a supervisor whose tail
-/// read ends on a blank row cuts there too). Counted from the grid's last
-/// row, the cut missed whatever was drawn wholly above a blank foot: the
-/// live run of 2026-09-26 (Claude Code 2.1.283 in a fresh 149x62 pane whose
-/// shell prompt sat at the top) drew the folder-trust dialog on rows 5-20,
-/// the last 40 rows of the SCREEN were blank, and `status` published
-/// `agent=idle` for 3+ minutes while the hosted loop, which waits on that
-/// verdict at an idle point (`await agent`), slept; and Claude Code's inline
-/// renderer draws its REPL at the top of a pane taller than the cut, blank
-/// rows below it (the review of 2026-09-26, 150x50: `agent=unknown`, `await
-/// agent idle` timed out). The zone never shrinks: on a screen whose last row
-/// has content it is the last 40 rows, as before; it reaches up only by as
-/// many rows as the screen's foot is blank, so a reader is handed the same
-/// rows under the content it always was.
+/// last [`CLASSIFY_ROWS`] rows of the screen's content (up to its last
+/// non-blank row) plus the blank rows under it ([`aterm_phase::live_zone_start`],
+/// the same cut a supervisor's tail read makes). Counting from the content, not
+/// the grid, keeps a dialog or inline REPL drawn at the top of a tall pane
+/// (blank rows below) in the zone. The zone never shrinks below the last 40
+/// rows: it reaches up by as many rows as the foot is blank, and a run of
+/// [`aterm_phase::BLANK_GAP`] or more blank rows counts as one row, so the last
+/// thing said above a tall pane's empty middle stays in it. A screen drawn to
+/// its last row with no such gap has exactly its last 40 rows. `aterm ctl help
+/// status` says the same, and the supervisor's tail read asks
+/// [`aterm_phase::live_zone_reaches_above`] whether its rows are the whole zone.
 pub(crate) fn live_zone(rows: &[String]) -> &[String] {
     &rows[aterm_phase::live_zone_start(rows, CLASSIFY_ROWS)..]
 }
 
-/// The TERMINAL'S CURSOR as the verdict reads a screen: Claude Code's `idle`
-/// is its prompt box's only where that box holds the cursor
+/// The terminal's cursor as the verdict reads a screen: Claude Code's `idle` is
+/// read only from the prompt box that holds the cursor
 /// ([`aterm_phase::ScreenReader::read_at`], `aterm_phase::phase::
-/// prompt_box_holds`) — never a box an earlier run left on the screen. The
-/// inline renderer relaunched in the SAME tab keeps the previous run's box
-/// above the new launch line, and the server published `agent=idle` from it
-/// before the new REPL was drawn (the review of 2026-09-26: a draft typed on
-/// `await agent idle` lost 3 of 3 after the folder-trust dialog, 1 of 3
-/// without it); the cursor sits under the new launch line there (measured).
+/// prompt_box_holds`), never from a box an earlier run left on screen (the
+/// inline renderer relaunched in the same tab keeps the previous run's box
+/// above the new launch line, with the cursor below it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Cursor {
     /// Its row among the rows the verdict is handed (`None`: on none of
@@ -292,20 +276,17 @@ thread_local! {
     static CLASSIFIER_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many times the agent-phase classifier has run ON THIS THREAD — the
-/// count the classifier-gate test compares against screen changes.
-/// Thread-local because a headless test drives its App on its own thread
-/// and the suite runs tests in parallel.
+/// How many times the agent-phase classifier has run on this thread, which the
+/// classifier-gate test compares against screen changes. Thread-local because
+/// a headless test drives its App on its own thread and tests run in parallel.
 #[cfg(test)]
 pub(crate) fn classifier_calls() -> u64 {
     CLASSIFIER_CALLS.with(|c| c.get())
 }
-/// The tab's and the menu's words for an API error that never reached the
-/// API ([`aterm_phase::ApiCause::Unreachable`]). Not `offline`: most of that
-/// family — `Connection refused — a firewall or proxy may be blocking it`,
-/// `Request timed out`, `No response from API` — is no machine offline, and
-/// the words promise nothing the harness may not do (the outage of
-/// 2026-09-27).
+/// The tab's and menu's words for an API error that never reached the API
+/// ([`aterm_phase::ApiCause::Unreachable`]). Not `offline`: most of that family
+/// (`Connection refused`, `Request timed out`, `No response from API`) is no
+/// machine offline, and the words promise nothing about retries.
 pub(crate) const API_UNREACHABLE: &str = "can't reach the API";
 /// … a reply the connection cut off ([`aterm_phase::ApiCause::CutOff`]).
 pub(crate) const API_CUT_OFF: &str = "reply cut off";
@@ -313,12 +294,11 @@ pub(crate) const API_CUT_OFF: &str = "reply cut off";
 /// ([`aterm_phase::ApiCause::Config`]).
 pub(crate) const API_REFUSED: &str = "TLS/proxy refused";
 
-/// What an API error the NETWORK caused is called on the tab, in the menu and
-/// in the notification — the cause the vendor's own line names
-/// ([`aterm_phase::ApiCause`]), never a plan: nothing here knows what the
-/// session's supervisor will do, or when (its `WAITING` is its journal's).
-/// `None` for the server's own failure (a status, words the catalog does not
-/// name) and every other wall: its kind's name stands.
+/// What an API error the network caused is called on the tab, in the menu and
+/// in the notification: the cause the vendor's own line names
+/// ([`aterm_phase::ApiCause`]), never a plan (the supervisor's plan is its
+/// journal's). `None` for the server's own failure and every other wall: its
+/// kind's name stands.
 pub(crate) fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static str> {
     match kind {
         aterm_phase::WallKind::ApiError { cause, .. } => match cause {
@@ -331,27 +311,56 @@ pub(crate) fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static st
     }
 }
 
-/// THE LOOP'S NEXT TRY laid on an API wall's reading (the tab retry plan,
-/// 2026-09-29): a wall the harness retries ([`Native::wall_retries`]) that
-/// names no time of its own gets the loop's deadline — `until` for the
-/// countdown and, where the zone is known, the local `HH:MM` as its `reset`
-/// — so the row reads `can't reach the API → 14:05 · 3m`. Only a plan still
-/// AHEAD counts (a past one is a try already made), only a wall with neither
-/// `reset` nor `until` (a usage limit keeps its own), and nothing else about
-/// the reading moves: the wall's kind, its band word and `status agent=` are
-/// the screen's. `zone` is asked only when a plan is laid on.
+/// The loop's next try as the window keeps it for an API wall's reading: the
+/// try's unix second, and the local clock time it falls at (`14:05`), read by
+/// the harness worker that reported it, off the window's thread, with the
+/// zone's offset at the try ([`local_offset_at`]) so a DST or timezone change
+/// in a long-lived window does not shift it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetryPlan {
+    /// The try's unix second: the countdown is off it.
+    pub(crate) at_unix: i64,
+    /// The local `HH:MM` of the try; `None` where the zone cannot be read —
+    /// then the countdown is printed alone.
+    pub(crate) clock: Option<String>,
+}
+
+impl RetryPlan {
+    /// The plan for a try at `at_unix`, its clock read at that instant (spawns
+    /// a subprocess: worker threads only, never the window's).
+    pub(crate) fn at(at_unix: i64) -> Self {
+        Self::with_offset(at_unix, local_offset_at(at_unix))
+    }
+
+    /// The plan for a try at `at_unix` in a zone `offset` seconds from UTC.
+    pub(crate) fn with_offset(at_unix: i64, offset: Option<i64>) -> Self {
+        let clock = offset.map(|offset| {
+            let local = (at_unix + offset).rem_euclid(86_400);
+            format!("{:02}:{:02}", local / 3600, (local % 3600) / 60)
+        });
+        Self { at_unix, clock }
+    }
+}
+
+/// The loop's next try laid on an API wall's reading: a wall the harness
+/// retries ([`Native::wall_retries`]) that names no time of its own gets the
+/// loop's deadline (`until` for the countdown and, where the plan carries one,
+/// its local `HH:MM` as `reset`), so the row reads `can't reach the API → 14:05
+/// · 3m00s`. Only a plan still ahead counts (the words also drop a plan whose
+/// time has come, in `aterm_messages`' `words`), and only for a wall with
+/// neither `reset` nor `until`. The wall's kind, band word and `status agent=`
+/// stay the screen's.
 pub(crate) fn with_retry_plan(
     agent: Option<AgentReading>,
-    at_unix: Option<i64>,
+    plan: Option<&RetryPlan>,
     now_unix: i64,
     now: Instant,
-    zone: impl FnOnce() -> Option<i64>,
 ) -> Option<AgentReading> {
-    let Some(at) = at_unix else {
+    let Some(plan) = plan else {
         return agent;
     };
     let mut agent = agent?;
-    let ahead = at - now_unix;
+    let ahead = plan.at_unix - now_unix;
     let AgentPhase::Wall {
         kind,
         reset: None,
@@ -364,17 +373,13 @@ pub(crate) fn with_retry_plan(
         return Some(agent);
     }
     *until = now.checked_add(Duration::from_secs(ahead.unsigned_abs()));
-    let clock = zone().map(|offset| {
-        let local = (at + offset).rem_euclid(86_400);
-        format!("{:02}:{:02}", local / 3600, (local % 3600) / 60)
-    });
     if let AgentPhase::Wall { reset, .. } = &mut agent.phase {
-        *reset = clock;
+        reset.clone_from(&plan.clock);
     }
     Some(agent)
 }
 
-/// `wall:<kind>` for a wall kind — `status agent=`'s spelling, `wall:` and
+/// `wall:<kind>` for a wall kind: `status agent=`'s spelling, `wall:` and
 /// [`aterm_phase::WallKind::name`] (pinned by a test). Static because a
 /// published verdict word is.
 pub(crate) fn wall_word(kind: aterm_phase::WallKind) -> &'static str {
@@ -399,17 +404,15 @@ pub(crate) enum AgentVerdict {
     /// The foreground program is not an identified agent: `agent=-`, no band
     /// phase, no rim. A shell whose last line ends in `?` lands here.
     NotAgent,
-    /// An identified agent's reading. `by_frame` is true when only the
-    /// agent's own screen identified it — Claude Code's composer frame or one
-    /// of its boxes, Codex's composer or one of its boxes (the caller keeps
-    /// that identity, `program`, for the rest of the foreground job: a box
-    /// hides the composer, and Codex's composer holding a draft names
-    /// nothing). `subject` is the approval
-    /// box's command or path, folded to one clipped line — or, at an API
-    /// error the network caused, its cause in words ([`api_cause_words`]) —
-    /// for the host's own menu row and notification
-    /// ([`crate::status_item::escalation`]), never for the wire or the band;
-    /// `None` for every other phase.
+    /// An identified agent's reading. `by_frame` is true when only the agent's
+    /// own screen identified it (Claude Code's composer frame or a box, Codex's
+    /// composer or a box); the caller keeps that identity, `program`, for the
+    /// rest of the foreground job, since a box hides the composer and a Codex
+    /// draft names nothing. `subject` is the approval box's command or path,
+    /// folded to one clipped line, or at a network-caused API error its cause in
+    /// words ([`api_cause_words`]), for the host's menu row and notification
+    /// ([`crate::status_item::escalation`]), never the wire or the band; `None`
+    /// for every other phase.
     Agent {
         reading: AgentReading,
         by_frame: bool,
@@ -466,26 +469,23 @@ impl AgentVerdict {
     }
 }
 
-/// THE ONE ADAPTER between a session's screen and its published agent
-/// verdict. Per-vendor screen knowledge stays in `aterm_phase` — its
-/// per-program readers ([`aterm_phase::identify`]); this only decides WHICH
-/// reader to ask, and whether to ask at all: a session whose foreground
-/// program is an identified agent (`claude`, `codex`) gets that program's
-/// reader; one `known_agent` already (identified by its screen earlier in
-/// this foreground job) keeps that agent's reader; one whose program is a
-/// runtime an agent runs under ([`aterm_phase::may_host_agent`]) or cannot
-/// be known (no foreground group to name) is identified by its SCREEN
-/// (`identify(None, rows)`: Claude Code's composer frame or one of its boxes;
-/// Codex's composer — empty, or under its status row — or one of its boxes).
-/// A program still being RESOLVED (`program_pending`: a
-/// group, no name yet) identifies nothing until it is named — a shell's own
-/// group is re-named after every job, and a frame left on screen by `cat`
-/// must not flash an agent verdict in that gap. Anything else, and any screen
-/// the generic reader gets, is [`AgentVerdict::NotAgent`] — a shell never
-/// reads as a question, not even one that has just `cat`-ed a captured
-/// Claude screen.
+/// The one adapter between a session's screen and its published agent verdict.
+/// Per-vendor screen knowledge stays in `aterm_phase`
+/// ([`aterm_phase::identify`]); this decides which reader to ask, if any:
+/// - a foreground program that is an identified agent (`claude`, `codex`) gets
+///   its reader;
+/// - a `known_agent` (identified by its screen earlier in this foreground job)
+///   keeps that agent's reader;
+/// - a runtime an agent runs under ([`aterm_phase::may_host_agent`]), or no
+///   foreground group to name, is identified by its screen (`identify(None,
+///   rows)`);
+/// - a program still being resolved (`program_pending`: a group, no name yet)
+///   identifies nothing, so a frame `cat` left on screen cannot flash a verdict.
 ///
-/// `cursor` is the terminal's cursor on `rows`, the WHOLE screen ([`Cursor`]).
+/// Anything else is [`AgentVerdict::NotAgent`]: a shell never reads as a
+/// question, even after `cat`-ing a captured Claude screen.
+///
+/// `cursor` is the terminal's cursor on `rows`, the whole screen ([`Cursor`]).
 pub(crate) fn agent_verdict(
     program: Option<&str>,
     program_pending: bool,
@@ -495,9 +495,8 @@ pub(crate) fn agent_verdict(
     now: Instant,
 ) -> AgentVerdict {
     use aterm_phase::{Program, ScreenReader};
-    // The live zone: the last CLASSIFY_ROWS of the screen's content
-    // ([`live_zone`]); `whole` is read again for a box whose head the zone
-    // cuts.
+    // The live zone ([`live_zone`]); `whole` is read again for a box whose head
+    // the zone cuts.
     let whole = rows;
     let rows = live_zone(whole);
     // The one name table is aterm-phase's (`program_of`, `may_host_agent`).
@@ -526,11 +525,8 @@ pub(crate) fn agent_verdict(
     } else {
         return AgentVerdict::NotAgent;
     };
-    // A box the zone cut — its title above the zone of a taller screen — is
-    // read on the whole screen, as the supervisor's loop reads it
-    // (the E2E probe of 2026-09-25: a trust dialog at the top of a 45-row
-    // pane was published `agent_detail=other`, and the menu bar said "other
-    // approval").
+    // A box whose title the zone cut (a taller screen) is read on the whole
+    // screen, as the supervisor's loop reads it.
     let (rows, cursor) =
         if whole.len() > rows.len() && reader.prompt(rows).is_some_and(|p| p.head_off_screen) {
             (whole, cursor)
@@ -547,10 +543,9 @@ pub(crate) fn agent_verdict(
 }
 
 /// [`agent_verdict`] behind the screen reader's panic fence
-/// ([`crate::reader_guard`]) — what the sweep (`session_status`) publishes.
-/// A reader panic reads as [`unreadable_verdict`] (an identified agent's
-/// `unknown`, never a prompt) and is warned once per session per panic
-/// location, instead of taking the terminal and every session with it.
+/// ([`crate::reader_guard`]), which the sweep (`session_status`) publishes. A
+/// reader panic reads as [`unreadable_verdict`] (never a prompt) and is warned
+/// once per session per panic location.
 pub(crate) fn agent_verdict_guarded(
     session: u64,
     program: Option<&str>,
@@ -584,13 +579,11 @@ fn fenced_verdict(
     }
 }
 
-/// The verdict for a screen the reader could not read (it panicked): an
-/// agent identified WITHOUT the screen — by its program's name, or by the
-/// frame this foreground job already showed — is that agent at
-/// [`AgentPhase::Unknown`], the reading a reader with no evidence gets
-/// (nothing acts on it, nothing announces it); anything else is
-/// [`AgentVerdict::NotAgent`], since identifying it would need the screen.
-/// Never a prompt, a question or a wall.
+/// The verdict for a screen the reader could not read (it panicked): an agent
+/// identified without the screen (by its program's name, or the frame this
+/// foreground job already showed) is that agent at [`AgentPhase::Unknown`], the
+/// no-evidence reading nothing acts on; anything else is
+/// [`AgentVerdict::NotAgent`]. Never a prompt, a question or a wall.
 fn unreadable_verdict(
     program: Option<&str>,
     program_pending: bool,
@@ -615,22 +608,19 @@ fn unreadable_verdict(
     }
 }
 
-/// Classify one screen with one program's reader: the reading, and the
-/// box's command or path for the host's menu row ([`AgentVerdict::Agent`]).
-/// The ONLY caller of `aterm_phase`'s readers in this crate, so the test
-/// counter is total; `rows` is the [`live_zone`] (or the whole screen, for a
-/// box whose head it cuts), `cursor` the terminal's cursor on them. Callers
-/// go through [`agent_verdict`].
+/// Classify one screen with one program's reader: the reading, and the box's
+/// command or path for the host's menu row ([`AgentVerdict::Agent`]). The only
+/// caller of `aterm_phase`'s readers in this crate, so the test counter is
+/// total; `rows` is the [`live_zone`] (or the whole screen, for a box whose head
+/// it cuts), `cursor` the terminal's cursor on them. Callers go through
+/// [`agent_verdict`].
 ///
-/// A reading that is not [`aterm_phase::Reading::phase_authoritative`] — read
-/// with the cursor ([`aterm_phase::ScreenReader::read_at`]: Claude Code's
-/// `idle` only at the prompt box that holds it) — is
-/// [`AgentPhase::Unknown`], whatever its default phase. A wall
-/// ([`aterm_phase::Reading::wall`], which the reader leaves `None` under a
-/// box, and under a hard busy keeps only Claude Code's critical-memory
-/// banner) outranks the phase it ended on — `idle`, `question`, a background
-/// monitor's soft busy, and for that banner a running spinner: the worker
-/// will not move past it.
+/// A reading that is not [`aterm_phase::Reading::phase_authoritative`] (read
+/// with the cursor, [`aterm_phase::ScreenReader::read_at`]) is
+/// [`AgentPhase::Unknown`]. A wall ([`aterm_phase::Reading::wall`], which the
+/// reader leaves `None` under a box, and under a hard busy keeps only Claude
+/// Code's critical-memory banner) outranks the phase it ended on (`idle`,
+/// `question`, a soft busy, and for that banner a running spinner).
 pub(crate) fn classify(
     reader: &dyn aterm_phase::ScreenReader,
     rows: &[String],
@@ -677,9 +667,9 @@ pub(crate) fn classify(
                 }
             }
             aterm_phase::Phase::Question => AgentPhase::Question,
-            // `worker_phase` names a limit only where `wall` places one, so
-            // this arm is the belt to that brace: name the kind from the
-            // notice's own words, a usage window when the table has none.
+            // `worker_phase` names a limit only where `wall` places one, so this
+            // arm is a fallback: name the kind from the notice's words, a usage
+            // window when the table has none.
             aterm_phase::Phase::Limited { message, reset } => wall(
                 aterm_phase::classify_wall(&message).unwrap_or(aterm_phase::WallKind::UsageSession),
                 reset,
@@ -697,12 +687,11 @@ pub(crate) fn classify(
     )
 }
 
-/// The prompt's kind word, and — for a Bash approval — the read-only
-/// classifier's verdict on it (`bash:read-only`, `bash:not-read-only`). The
-/// command itself is never carried. `read-only` only when EVERY reading of
-/// the box's command rows ([`aterm_phase::PromptV2::readings`]) is read-only,
-/// and never for a box with no command rows. Advisory: the supervisor's own
-/// decider decides.
+/// The prompt's kind word and, for a Bash approval, the read-only classifier's
+/// verdict (`bash:read-only`, `bash:not-read-only`). The command itself is
+/// never carried. `read-only` only when every reading of the box's command rows
+/// ([`aterm_phase::PromptV2::readings`]) is read-only, never for a box with no
+/// command rows. Advisory: the supervisor's own decider decides.
 fn prompt_detail(p: &aterm_phase::PromptV2) -> String {
     let kind = sanitize_token(p.kind.name(), 24);
     if p.kind != aterm_phase::PromptKind::Bash || p.command.trim().is_empty() {
@@ -725,27 +714,41 @@ fn prompt_detail(p: &aterm_phase::PromptV2) -> String {
 // The reset clock: placing a limit notice's reset time on this machine's clock.
 // ---------------------------------------------------------------------------
 
-/// How long until `reset` falls, on THIS machine's clock — the figure the
-/// limited row counts down. The notice's words are read by the supervisor's
-/// own grammar ([`limit::parse_reset`], placed by [`limit::reset_at`]), so
-/// the band and the engine never read one notice two ways. `None` when the
-/// words cannot be read, when the notice names a zone that is not this
-/// machine's, or when the reset is already behind us: then the row prints
-/// the reset time and no figure.
+/// How long until `reset` falls on this machine's clock: the figure the limited
+/// row counts down. The notice's words are read by the supervisor's grammar
+/// ([`limit::parse_reset`], placed by [`limit::reset_in_zone`]), so the band and
+/// the engine never read one notice two ways. `None` when the words cannot be
+/// read, the notice names another zone, or the reset is past; the row then
+/// prints the reset time alone. The reset is placed with the offset that holds
+/// at it ([`local_offset_at_cached`]), so a daylight-saving change between now
+/// and the reset is honoured.
 pub(crate) fn countdown_to_reset(reset: &str) -> Option<Duration> {
-    countdown_at(
+    countdown_in(
         reset,
         limit::unix_now(),
-        local_offset_s()?,
+        &local_offset_at_cached,
         local_zone().as_deref(),
     )
 }
 
-/// [`countdown_to_reset`] with the clock, the offset and the local zone
-/// passed in — pure, so the rules are testable at any hour. A notice in
-/// another zone is no figure rather than one placed by a `date` spawned per
-/// read; with no zone named, or this machine's, it is placed at `offset`.
+/// [`countdown_in`] at one constant offset — pure, so the rules are testable
+/// at any hour.
+#[cfg(test)]
 fn countdown_at(reset: &str, now: i64, offset: i64, local_zone: Option<&str>) -> Option<Duration> {
+    countdown_in(reset, now, &|_| Some(offset), local_zone)
+}
+
+/// [`countdown_to_reset`] with the clock, the local zone's offset at an
+/// instant and the local zone passed in. A notice in another zone is no
+/// figure rather than one placed by a `date` spawned per read; with no zone
+/// named, or this machine's, it is placed in the local zone, each candidate
+/// day with the offset that holds on it ([`limit::reset_in_zone`]).
+fn countdown_in(
+    reset: &str,
+    now: i64,
+    offset_at: &dyn Fn(i64) -> Option<i64>,
+    local_zone: Option<&str>,
+) -> Option<Duration> {
     let spec = limit::parse_reset(reset)?;
     if let limit::ResetSpec::At {
         zone: Some(named), ..
@@ -754,7 +757,7 @@ fn countdown_at(reset: &str, now: i64, offset: i64, local_zone: Option<&str>) ->
     {
         return None;
     }
-    let at = limit::reset_at(&spec, now, offset, |_| None);
+    let at = limit::reset_in_zone(&spec, now, limit::SESSION_AHEAD_MAX, offset_at)?;
     u64::try_from(at - now)
         .ok()
         .filter(|&s| s > 0)
@@ -777,16 +780,16 @@ fn local_zone() -> Option<String> {
 }
 
 /// The local clock's offset from UTC in seconds, from `date +%z`, read once;
-/// `None` where it cannot be run — then no figure is ever printed. (Settings ▸
-/// Packages reads its clock per instant instead, [`local_offset_at`].)
+/// `None` where it cannot be run (then no figure is printed). Settings ▸
+/// Packages reads its clock per instant instead ([`local_offset_at`]).
 #[cfg(unix)]
 pub(crate) fn local_offset_s() -> Option<i64> {
     static OFFSET: OnceLock<Option<i64>> = OnceLock::new();
     *OFFSET.get_or_init(|| {
-        let out = std::process::Command::new("date")
+        let out = aterm_uds::spawnfd::command("date")
             .arg("+%z")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .output()
             .ok()?;
         if !out.status.success() {
@@ -801,13 +804,40 @@ pub(crate) fn local_offset_s() -> Option<i64> {
     None
 }
 
-/// The local zone's offset from UTC AT the instant `unix`, in seconds: the offset
-/// daylight saving gave that instant, not today's — [`limit::offset_at`] with no zone
-/// named, the workspace's one reader of an offset at an instant. A subprocess each
-/// call, so a WORKER's only (Settings ▸ Packages' clock,
-/// `packages_screen::LocalClock::read`); `None` where `date` cannot say.
+/// The local zone's offset from UTC at the instant `unix`, in seconds (the
+/// offset daylight saving gives that instant): [`limit::offset_at`] with no zone
+/// named. Spawns a subprocess per call, so workers only (Settings ▸ Packages'
+/// clock, `packages_screen::LocalClock::read`); `None` where `date` cannot say.
 pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
     limit::offset_at(None, unix)
+}
+
+/// [`local_offset_at`] for the UI thread: the offset read at the start of the
+/// quarter hour `unix` falls in (zones change offset on a quarter hour of UTC),
+/// memoized per quarter hour, so a countdown re-read on every classification
+/// spawns no `date` and still uses the offset that holds then. A bounded memo:
+/// the oldest quarter hours go.
+pub(crate) fn local_offset_at_cached(unix: i64) -> Option<i64> {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    const QUARTER: i64 = 15 * 60;
+    const KEPT: usize = 32;
+    static MEMO: Mutex<VecDeque<(i64, Option<i64>)>> = Mutex::new(VecDeque::new());
+    let memo = || {
+        MEMO.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let quarter = unix.div_euclid(QUARTER);
+    if let Some(&(_, offset)) = memo().iter().find(|(q, _)| *q == quarter) {
+        return offset;
+    }
+    let offset = local_offset_at(quarter.saturating_mul(QUARTER));
+    let mut memo = memo();
+    if memo.len() >= KEPT {
+        memo.pop_front();
+    }
+    memo.push_back((quarter, offset));
+    offset
 }
 
 #[cfg(test)]
@@ -818,14 +848,11 @@ mod tests {
         Instant::now()
     }
 
-    /// Ruling 313 (day eight, E1): the turn aterm's OWN harness typed to
-    /// relaunch an agent after a kill raised a teal rim and `◂
-    /// aterm-harness@<pid>` while it typed, then `◇ quiet since … · 1 turn`
-    /// standing until a key — FYI the restart record already told. aterm's
-    /// hand is not shown by the window's chrome and what happens under it is
-    /// not news; `status level=` keeps the hand. Controls: the same exchange
-    /// under a manager's hand is Driven and then a story, and a story from
-    /// before aterm's hand stays news, counted without aterm's turn.
+    /// A turn aterm's own harness typed (relaunching an agent after a kill)
+    /// shows no rim or chip while it types and leaves no story after:
+    /// `status level=` keeps the hand. Controls: the same exchange under a
+    /// manager's hand is Driven and then a story, and a story from before
+    /// aterm's hand stays news, counted without aterm's turn.
     #[test]
     fn aterms_own_hand_is_no_row_and_its_turn_is_no_story() {
         let now = t0();
@@ -927,13 +954,11 @@ mod tests {
         assert!(!w.since.iter().any(|c| c == "2 turns"), "{w:?}");
     }
 
-    /// The classifier is `aterm-phase`'s Claude reader, word for word — a
-    /// reading that is not evidence ([`aterm_phase::Reading::
-    /// phase_authoritative`]: Claude Code's idle with no composer drawn) is
-    /// `unknown` — and its count moves once per call (the gate test in
-    /// `session_status` compares it with screen changes). The screens are
-    /// judged by `aterm_phase` itself, so the mapping — not the composer
-    /// geometry — is what this pins.
+    /// The classifier is `aterm-phase`'s Claude reader, word for word; a reading
+    /// that is not evidence ([`aterm_phase::Reading::phase_authoritative`]:
+    /// Claude Code's idle with no composer drawn) is `unknown`, and the count
+    /// moves once per call. The screens are judged by `aterm_phase` itself, so
+    /// this pins the mapping, not the composer geometry.
     #[test]
     fn classify_is_aterm_phases_verdict_and_counts_once_per_call() {
         let before = classifier_calls();
@@ -995,12 +1020,11 @@ mod tests {
     }
 
     /// The published verdict behind the reader's panic fence: a panicking
-    /// stand-in for the reader does not unwind out of the sweep's call (the
-    /// window's thread lives), and degrades to the no-evidence reading — an
-    /// agent identified by its program name (or by the frame this job already
-    /// showed) is that agent at `unknown`, never a prompt; one that only its
-    /// screen could identify is no agent. Controls: the guarded verdict of a
-    /// real screen is the unguarded one, box and subject included.
+    /// stand-in reader does not unwind out of the sweep's call, and degrades to
+    /// the no-evidence reading (an agent identified by program name or earlier
+    /// frame is `unknown`, never a prompt; one only its screen could identify
+    /// is no agent). Control: the guarded verdict of a real screen equals the
+    /// unguarded one, box and subject included.
     #[test]
     fn a_reader_panic_degrades_the_verdict_to_unknown_and_the_thread_lives() {
         let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::BOX_RM);
@@ -1072,9 +1096,9 @@ mod tests {
         assert!(guarded.subject().is_some());
     }
 
-    /// `agent=wall:<kind>` is `wall:` and aterm-phase's own kind name, for
-    /// every kind; the band keeps `limited` for exactly the kinds
-    /// `worker_phase` has always read so.
+    /// `agent=wall:<kind>` is `wall:` and aterm-phase's own kind name, for every
+    /// kind; the band keeps `limited` for exactly the kinds `worker_phase` reads
+    /// so.
     #[test]
     fn a_wall_word_is_wall_and_aterm_phases_kind_name() {
         use aterm_phase::WallKind as K;
@@ -1121,12 +1145,10 @@ mod tests {
         assert_eq!(AgentPhase::Unknown.word(), "unknown");
     }
 
-    /// Lane A's fixtures, through the ONE adapter: each wall reads
-    /// `wall:<kind>` under `program=claude` — a 529 included (it read `idle`
-    /// before, and a supervisor trusting idle waited forever), and the real
-    /// Fable screen. NEGATIVE CONTROLS: a tool's output QUOTING `API Error:
-    /// 529` under a `⏺ Bash(…)` call stays `idle`; every wall screen under a
-    /// shell is not an agent.
+    /// Each wall fixture reads `wall:<kind>` under `program=claude` through the
+    /// one adapter, a 529 and a real Fable screen included. Negative controls: a
+    /// tool's output quoting `API Error: 529` under a `⏺ Bash(…)` call stays
+    /// `idle`; every wall screen under a shell is not an agent.
     #[test]
     fn a_wall_is_published_by_kind() {
         use aterm_phase::prompt::fixtures::{
@@ -1183,19 +1205,12 @@ mod tests {
         );
     }
 
-    /// THE SERVER PUBLISHES CLAUDE CODE IDLE ONLY AT ITS COMPOSER (the live
-    /// e2e of 2026-09-26, NEW-1: `agent=idle` went out 72-248 ms after the
-    /// harness pressed the folder-trust dialog, `await agent idle` returned,
-    /// and the first prompt sent then was lost or left unsent). The screens
-    /// Claude Code 2.1.283 showed between its launch and its REPL (measured
-    /// frame by frame: the shell's rows with the dialog erased, then the
-    /// alternate screen half drawn) publish `unknown` — an agent whose
-    /// screen is no evidence, never acted on as idle — and the REPL drawn
-    /// whole publishes `idle` (the control), in shell mode too (`!` typed
-    /// into the empty prompt box: its caret `!`, the REPL up and taking keys
-    /// — `idle`, as every build before this rule published it). The dialog
-    /// itself is still a prompt, and the same rows under a shell are no
-    /// agent.
+    /// Claude Code is published idle only at its composer: the screens between
+    /// launch and REPL (the shell's rows with the dialog erased, then the
+    /// alternate screen half drawn) publish `unknown`, and the whole REPL
+    /// publishes `idle` (the control), in shell mode too (`!` typed into the
+    /// empty prompt box). The dialog itself is still a prompt, and the same rows
+    /// under a shell are no agent.
     #[test]
     fn claude_code_is_published_idle_only_at_its_composer() {
         use aterm_phase::prompt::fixtures::{
@@ -1263,18 +1278,13 @@ mod tests {
         );
     }
 
-    /// CLAUDE CODE'S INLINE REPL IS PUBLISHED IDLE WHERE IT IS DRAWN (the
-    /// review of 2026-09-26): its inline renderer drew the REPL at the top of
-    /// a 150x50 pane, blank rows below it, and the server read the grid's
-    /// last 40 rows — the prompt box's bottom rule and footer, never its
-    /// caret — so `agent=` stayed `unknown` and `await agent idle` timed out
-    /// (measured on 2.1.283, 8 of 8 launches). The verdict reads the last 40
-    /// DRAWN rows ([`live_zone`]): the REPL is `idle` at 50 rows and in any
-    /// taller pane, and under `node` (identified by its frame, which the old
-    /// cut never showed it). The inline launch's other frames keep their
-    /// words: the dialog is `prompt trust`, the half-drawn REPL and the
-    /// shell's rows `unknown`; the same rows under a shell are no agent. The
-    /// fullscreen REPL, drawn to its last row, is `idle` as it was.
+    /// Claude Code's inline REPL is published idle where it is drawn (at the top
+    /// of a tall pane, blank rows below): the verdict reads the last 40 drawn
+    /// rows ([`live_zone`]), so the REPL is `idle` at 50 rows and in any taller
+    /// pane, and under `node` (identified by its frame). The inline launch's
+    /// other frames keep their words (the dialog `prompt trust`, the half-drawn
+    /// REPL and shell rows `unknown`); the same rows under a shell are no agent.
+    /// The fullscreen REPL, drawn to its last row, is `idle`.
     #[test]
     fn an_inline_repl_at_the_top_of_a_tall_pane_is_published_idle() {
         use aterm_phase::prompt::fixtures::{
@@ -1329,22 +1339,15 @@ mod tests {
         assert_eq!(v.word(), "idle", "the fullscreen REPL: {v:?}");
     }
 
-    /// CLAUDE CODE IS PUBLISHED IDLE AT THE PROMPT BOX THAT HOLDS THE CURSOR
-    /// (the review of 2026-09-26): its inline renderer relaunched in the SAME
-    /// tab leaves the previous run's prompt box on the main grid above the
-    /// new launch line, and the server — reading the box by its frame alone
-    /// — published `agent=idle` from it 187-352 ms before the new REPL was
-    /// drawn; a draft typed on `await agent idle` was lost 3 of 3 (RED: the
-    /// first assertion, the cursor not given). The sweep reads the verdict
-    /// with the terminal's cursor, measured under the new launch line there:
-    /// `unknown`, in the measured 50-row pane and padded to 80 rows. The
-    /// relaunch's other frames keep their words with their measured cursors:
-    /// the dialog `prompt trust`, the new REPL half drawn `unknown`, whole
-    /// `idle`. NEGATIVE CONTROLS: the whole new REPL with the cursor moved
-    /// one row under its box, or into the OLD box's rows, is not idle the
-    /// first way and is idle the second (a box holds its rows: the cursor is
-    /// what Claude Code keeps in the box that is running); the cursor on no
-    /// row read is not idle.
+    /// Claude Code is published idle at the prompt box that holds the cursor: a
+    /// relaunch in the same tab leaves the previous run's box above the new
+    /// launch line, and with the cursor under that line the verdict is
+    /// `unknown` (in a 50-row pane and padded to 80). The relaunch's other
+    /// frames keep their words with their cursors (the dialog `prompt trust`,
+    /// the half-drawn REPL `unknown`, the whole REPL `idle`). Negative controls:
+    /// the whole new REPL with the cursor one row under its box is not idle, and
+    /// with it in the old box's rows is idle (a box holds its rows); the cursor
+    /// on no row read is not idle.
     #[test]
     fn a_relaunched_inline_repl_is_published_idle_only_at_the_box_that_holds_the_cursor() {
         use aterm_phase::prompt::fixtures::{
@@ -1386,7 +1389,7 @@ mod tests {
                 assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
             }
         }
-        // NEGATIVE CONTROLS on the whole new REPL.
+        // Negative controls on the whole new REPL.
         let ready = screen(INLINE_RELAUNCH_REPL_READY);
         let (caret, _) = cursor(INLINE_RELAUNCH_REPL_READY).expect("measured");
         let bottom = (caret..ready.len())
@@ -1409,18 +1412,16 @@ mod tests {
         }
     }
 
-    /// Claude Code's critical-memory banner under a RUNNING spinner (the
-    /// 2026-09-24 incident: 36 minutes into a turn, 38.8 GiB resident, no
-    /// input read for 2h41m) publishes `wall:memory`, not `busy` — the one
-    /// wall aterm-phase keeps under a hard busy — with no detail and the
-    /// band word `memory`, never `limited`. NEGATIVE CONTROLS: the same
-    /// words in the composer draft alone read `busy`, and under a shell the
-    /// screen is no agent. The row is built from aterm-phase's anchor.
+    /// Claude Code's critical-memory banner under a running spinner publishes
+    /// `wall:memory`, not `busy` (the one wall aterm-phase keeps under a hard
+    /// busy), with no detail and the band word `memory`, never `limited`.
+    /// Negative controls: the same words in the composer draft alone read
+    /// `busy`, and under a shell the screen is no agent.
     #[test]
     fn the_memory_banner_publishes_wall_memory_under_a_busy_spinner() {
         use aterm_phase::prompt::fixtures::composer;
-        // The VENDOR's banner, word for word (its own remedy tail is Claude
-        // Code's text on the screen, never a remedy aterm prints).
+        // The vendor's banner, word for word (its remedy tail is Claude Code's
+        // text on the screen, never a remedy aterm prints).
         let banner = format!(
             "{} (140.4GB) \u{2014} restart and resume with claude --continue",
             aterm_phase::anchor_text("wall.memory"),
@@ -1462,9 +1463,9 @@ mod tests {
         );
     }
 
-    /// A reader with no evidence publishes `unknown`, never its default
-    /// `idle`: a Codex screen outside its choice box. NEGATIVE CONTROL: the
-    /// Codex trust gate itself is read, as a prompt with its subject.
+    /// A reader with no evidence publishes `unknown`, never its default `idle`:
+    /// a Codex screen outside its choice box. Negative control: the Codex trust
+    /// gate itself reads as a prompt with its subject.
     #[test]
     fn a_reading_without_evidence_is_unknown_not_idle() {
         use aterm_phase::prompt::fixtures::{CODEX_TRUST, screen};
@@ -1487,8 +1488,8 @@ mod tests {
         assert_eq!(gate.word(), "prompt");
     }
 
-    /// The box's subject rides the verdict, from the same reading: the
-    /// measured rm box names its command; a non-prompt names nothing.
+    /// The box's subject rides the verdict from the same reading: the rm box
+    /// names its command; a non-prompt names nothing.
     #[test]
     fn the_prompt_subject_comes_from_the_reading() {
         use aterm_phase::prompt::fixtures::{BOX_RM, END_529, screen};
@@ -1515,14 +1516,11 @@ mod tests {
         assert_eq!(wall.subject(), None);
     }
 
-    /// AN API ERROR SAYS WHAT WENT WRONG, NEVER A PLAN (the outage of
-    /// 2026-09-27): Claude Code 2.1.283's `⏺ API Error: Can't reach the API
-    /// server … (ENOTFOUND)` is `can't reach the API` on the tab and in the
-    /// menu row — not `offline` (a refused connection or a timeout is no
-    /// machine offline), and not `continuing when …`: nothing here knows
-    /// the supervisor's plan — a reply cut off is `reply cut off`, a
-    /// certificate or proxy refused `TLS/proxy refused`. The wire word stays
-    /// `wall:api-error` for every cause. NEGATIVE CONTROLS: the server's own
+    /// An API error says what went wrong, never a plan: `⏺ API Error: Can't
+    /// reach the API server … (ENOTFOUND)` is `can't reach the API` on the tab
+    /// and in the menu row; a reply cut off is `reply cut off`; a refused
+    /// certificate or proxy is `TLS/proxy refused`. The wire word stays
+    /// `wall:api-error` for every cause. Negative controls: the server's own
     /// failure (a 529, a 503) keeps its kind's word and names no subject.
     #[test]
     fn an_api_wall_says_its_cause_and_claims_no_plan() {
@@ -1603,15 +1601,15 @@ mod tests {
         );
     }
 
-    /// THE TAB RETRY PLAN (2026-09-29): the loop's next try is laid on an API
-    /// wall's reading — `until` for the countdown and, the zone known, the
-    /// local `HH:MM` as its `reset` — and the row PRINTS `→ 08:58 · 3m00s` and
-    /// SPEAKS `next try 08:58`, never `resets`. CONTROLS, each leaving the
-    /// reading exactly as it was: a plan in the past or now (a try already
-    /// made), none, a wall that names its own time (a usage limit, a reset
-    /// already read), a phase that is no wall, and no reading at all. An
-    /// overload takes it too; an unknown zone gives the countdown alone; and
-    /// the zone is asked only when a plan is laid on.
+    /// The loop's next try is laid on an API wall's reading (`until` for the
+    /// countdown and, with the clock known, the local `HH:MM` as `reset`): the
+    /// row prints `→ 08:58 · 3m00s` and speaks `next try 08:58`, never
+    /// `resets`. Controls, each leaving the reading unchanged: a plan in the
+    /// past or now, none, a wall that names its own time, a non-wall phase, and
+    /// no reading. An overload and a 429 rate limit take it too (band
+    /// `limited`, row `→ 14:05 · 5m00s`, sentence `next try`); an unknown zone
+    /// gives the countdown alone; and the clock is the plan's own, so the same
+    /// second in two offsets prints two clocks.
     #[test]
     fn a_retry_plan_is_laid_on_an_api_wall_and_nothing_else() {
         use aterm_phase::{ApiCause, WallKind};
@@ -1634,7 +1632,8 @@ mod tests {
             cause: ApiCause::Unreachable,
         };
         let lay = |agent: Option<AgentReading>, at: Option<i64>, zone: Option<i64>| {
-            with_retry_plan(agent, at, NOW_UNIX, now, || zone)
+            let plan = at.map(|at| RetryPlan::with_offset(at, zone));
+            with_retry_plan(agent, plan.as_ref(), NOW_UNIX, now)
         };
         // Laid on: 3 minutes ahead, the local clock at the try.
         let got = lay(wall(unreachable, None), Some(NOW_UNIX + 180), Some(PDT)).unwrap();
@@ -1645,12 +1644,46 @@ mod tests {
         assert_eq!(kind, unreachable, "the wall's kind is the screen's");
         assert_eq!(reset.as_deref(), Some("08:58"));
         assert_eq!(until, now.checked_add(Duration::from_secs(180)));
+        // The clock is the plan's: the same second an hour further east.
+        let got = lay(
+            wall(unreachable, None),
+            Some(NOW_UNIX + 180),
+            Some(PDT + 3600),
+        )
+        .unwrap();
+        let AgentPhase::Wall { reset, .. } = got.phase else {
+            panic!("still a wall");
+        };
+        assert_eq!(reset.as_deref(), Some("09:58"));
         // An overload takes it; an unknown zone gives the countdown alone.
         let got = lay(wall(WallKind::Overloaded, None), Some(NOW_UNIX + 60), None).unwrap();
         let AgentPhase::Wall { reset, until, .. } = got.phase else {
             panic!("still a wall");
         };
         assert_eq!((reset, until.is_some()), (None, true));
+        // The API's own rate limit: `limited` on the band, the loop retries
+        // it on its ladder, and so it takes the plan and says `next try`.
+        let rate = WallKind::ApiError {
+            code: Some(429),
+            retryable: true,
+            cause: ApiCause::Server,
+        };
+        assert!(rate.reads_limited(), "a 429 reads `limited`");
+        let got = lay(wall(rate, None), Some(NOW_UNIX + 300), Some(PDT)).unwrap();
+        let mut slot = Slot::new(now);
+        slot.agent = Some(got);
+        let said = words(&slot, now, 0);
+        assert_eq!(said.phase, "limited");
+        assert_eq!(
+            said.since,
+            vec!["\u{2192} 09:00".to_string(), "5m00s".to_string()],
+            "{said:?}"
+        );
+        assert!(
+            said.sentence.contains("next try 09:00"),
+            "{}",
+            said.sentence
+        );
         // CONTROLS: the reading is returned as it was.
         for (name, agent, at) in [
             ("past", wall(unreachable, None), Some(NOW_UNIX - 5)),
@@ -1659,6 +1692,11 @@ mod tests {
             (
                 "its own reset",
                 wall(unreachable, Some("7:30pm")),
+                Some(NOW_UNIX + 60),
+            ),
+            (
+                "a rate limit's own reset",
+                wall(rate, Some("7:30pm")),
                 Some(NOW_UNIX + 60),
             ),
             (
@@ -1678,28 +1716,6 @@ mod tests {
             assert_eq!(lay(agent.clone(), at, Some(PDT)), agent, "{name}");
         }
         assert_eq!(lay(None, Some(NOW_UNIX + 60), Some(PDT)), None);
-        // The zone is asked only when a plan is laid on.
-        let asked = std::cell::Cell::new(0);
-        let count = |zone| {
-            asked.set(asked.get() + 1);
-            zone
-        };
-        let _ = with_retry_plan(
-            wall(unreachable, None),
-            Some(NOW_UNIX - 1),
-            NOW_UNIX,
-            now,
-            || count(Some(PDT)),
-        );
-        assert_eq!(asked.get(), 0, "a past plan asks nothing");
-        let _ = with_retry_plan(
-            wall(unreachable, None),
-            Some(NOW_UNIX + 9),
-            NOW_UNIX,
-            now,
-            || count(Some(PDT)),
-        );
-        assert_eq!(asked.get(), 1);
 
         // What the row prints and speaks (the shared words engine).
         let mut slot = Slot::new(now);
@@ -1723,12 +1739,9 @@ mod tests {
         assert!(said.sentence.contains("resets 7:30pm"), "{}", said.sentence);
     }
 
-    /// A TALL PANE, A SHORT TRANSCRIPT (a real render of 2026-09-28: Claude
-    /// Code 2.1.284, 144x50, an API error on row 8 and the composer pinned on
-    /// rows 45-47): the status sweep's verdict was `idle` with no wall, the
-    /// error 41 rows above the last drawn row and cut by the zone. The
-    /// verdict reads the wall and its cause, with the cursor on the caret as
-    /// the sweep hands it.
+    /// A tall pane with a short transcript (an API error on row 8, the composer
+    /// pinned on rows 46-48 of 50): the verdict reads the wall and its cause,
+    /// with the cursor on the caret as the sweep hands it.
     #[test]
     fn an_api_error_far_above_the_composer_is_a_wall_in_the_verdict() {
         use aterm_phase::prompt::fixtures::{API_ERROR_TALL_PANE_MEASURED, screen};
@@ -1741,22 +1754,15 @@ mod tests {
         }
     }
 
-    /// THE FRESH PANE (the live run of 2026-09-26: Claude Code 2.1.283 in a
-    /// private headless aterm, a fresh 149x62 pane whose shell prompt sat at
-    /// the top). The folder-trust dialog was drawn on rows 5-20, wholly above
-    /// the last 40 rows of the screen, every one of them blank, and `status`
-    /// published `agent=idle` for 3+ minutes: the zone was the last 40 rows
-    /// of the SCREEN. It is the last 40 rows of the screen's CONTENT
-    /// ([`live_zone`]): the dialog is published a trust prompt — by the
-    /// program's name, and by its frame while the program is unnamed. The
-    /// same session's subagent Bash box with the rm breaker's note, drawn at
-    /// the top of the pane, likewise (its command the subject, clipped). NEGATIVE
-    /// CONTROLS: an idle Claude composer at the top of the same pane, blank
-    /// rows under it, stays idle; and a screen whose last row has content
-    /// keeps its last 40 rows as its zone, unchanged. Each screen is read with
-    /// the cursor where Claude Code parks it ([`Cursor`]): on the focused
-    /// option of a box (the measured row 17 of the dialog), on the caret row
-    /// of its prompt box.
+    /// A fresh tall pane whose shell prompt sat at the top: the folder-trust
+    /// dialog drawn on rows 5-20, with the last 40 screen rows blank, is
+    /// published a trust prompt (by the program's name, and by its frame while
+    /// the program is unnamed), because the zone is the last 40 rows of the
+    /// content ([`live_zone`]). A subagent Bash box drawn at the top likewise
+    /// (its command the subject, clipped). Negative controls: an idle composer
+    /// at the top of the same pane stays idle, and a screen whose last row has
+    /// content keeps its last 40 rows. Each screen is read with the cursor
+    /// where Claude Code parks it ([`Cursor`]).
     #[test]
     fn a_box_above_the_last_rows_of_a_mostly_blank_pane_is_classified() {
         use aterm_phase::prompt::fixtures::{self as f, composer, screen};
@@ -1827,12 +1833,11 @@ mod tests {
             assert_eq!(v.word(), "idle", "{program:?}");
         }
 
-        // The live capture's content ends on row 40: its zone is the last
-        // 40 rows of that content and the blank foot under it. A screen
-        // drawn to its last row: its last 40 rows, as it always was; an
-        // all-blank one reads whole. A long blank GAP counts as one row
-        // (`aterm_phase::live_zone_start`), so the dialog above a blank
-        // middle stays in the zone of a screen with content on its last row.
+        // The capture's content ends on row 40: its zone is the last 40 rows of
+        // that content plus the blank foot. A screen drawn to its last row: its
+        // last 40 rows; an all-blank one reads whole. A long blank gap counts as
+        // one row (`aterm_phase::live_zone_start`), so a dialog above a blank
+        // middle stays in the zone.
         assert_eq!(live_zone(&live), &live[41 - CLASSIFY_ROWS..]);
         let drawn: Vec<String> = (0..62).map(|i| format!("row {i}")).collect();
         assert_eq!(live_zone(&drawn), &drawn[62 - CLASSIFY_ROWS..]);
@@ -1848,15 +1853,13 @@ mod tests {
         assert_eq!(live_zone(&blank).len(), 62);
     }
 
-    /// The countdown is measured on THIS machine's clock, through the
-    /// supervisor's own reset grammar (`supervise::limit`, whose tests own
-    /// the words): a bare clock time two hours ahead counts down two hours;
-    /// one an hour ago has fallen (a session limit resets within five hours,
-    /// so it is today's, passed) and is no figure; a dated reset behind us is
-    /// no figure; the span and the auto-continue forms the band's old copy of
-    /// the grammar could not read count down too; a notice in another zone is
-    /// no figure, never a wrong one. Pure through [`countdown_at`] at a fixed
-    /// clock, then the live path once.
+    /// The countdown is measured on this machine's clock through the
+    /// supervisor's reset grammar (`supervise::limit`, whose tests own the
+    /// words): a bare clock time two hours ahead counts down two hours; one an
+    /// hour ago has fallen and is no figure; a dated reset behind us is no
+    /// figure; the span and auto-continue forms count down; a notice in another
+    /// zone is no figure. Pure through [`countdown_at`] at a fixed clock, then
+    /// the live path once.
     #[test]
     fn the_countdown_is_to_the_reset_on_this_clock() {
         // 2026-09-19 10:00:00 UTC, at -0700: 03:00 local on the 19th.
@@ -1881,7 +1884,12 @@ mod tests {
         assert_eq!(at("5am (Etc/UTC)"), None, "another zone");
         assert_eq!(at("soon"), None);
         // The live path, once: a bare time two hours from now on this clock.
-        if let Some(offset) = local_offset_s() {
+        // Not within two hours of a daylight-saving switch: the countdown places the
+        // time with the offset THEN, as it must, and this expectation is built with
+        // today's.
+        if let Some(offset) = local_offset_s()
+            && local_offset_at_cached(limit::unix_now() + 2 * 3600) == Some(offset)
+        {
             let local = limit::unix_now() + offset + 2 * 3600;
             let tod = local.rem_euclid(86_400);
             let text = format!("{}:{:02}", tod / 3600, (tod % 3600) / 60);
@@ -1895,15 +1903,10 @@ mod tests {
         assert_eq!(countdown_to_reset("soon"), None);
     }
 
-    // ───── the second adversarial reviews (honesty-cost, menu-a11y), 2026-09-19 ─────
-
-    /// menu-a11y D2: the SPOKEN hold sentence carried the pct-encoded wire
-    /// token (`held, main%20broken, …` — VoiceOver read "main percent twenty
-    /// broken") while the greyed menu row beside it said `main broken`. The
-    /// band, its sentence and the menu row all read the reason through
-    /// [`hold_reason_words`] now: decoded, then sanitized like every other
-    /// free-text value — a `%e2%80%ae` in a bridge-supplied reason cannot
-    /// reverse the row.
+    /// The band, its spoken sentence and the greyed menu row all read a hold
+    /// reason through [`hold_reason_words`]: decoded (never `main%20broken`),
+    /// then sanitized like any free text, so a `%e2%80%ae` in a bridge-supplied
+    /// reason cannot reverse the row.
     #[test]
     fn the_hold_reason_is_decoded_and_sanitized_on_every_surface() {
         let now = Instant::now();
@@ -1939,13 +1942,11 @@ mod tests {
         // beside that row in `menu.rs`.
     }
 
-    /// THIS host's stall seam: `Native`'s three accessors over the server's
-    /// real [`crate::input_stall::InputStallFact`]. The engine's own stall
-    /// tests run on its `TestStall`, so only this one proves that `since`
-    /// reads the fact's instant, `stopped` its `stopped` field (never the
-    /// word) and `survived` its restart record. Each case differs from the
-    /// others in exactly the field its accessor reads, so a crossed or
-    /// constant accessor turns one of them red.
+    /// This host's stall seam: `Native`'s three accessors over the server's real
+    /// [`crate::input_stall::InputStallFact`]: `since` reads the fact's instant,
+    /// `stopped` its `stopped` field (not the word) and `survived` its restart
+    /// record. Each case differs in exactly the field its accessor reads, so a
+    /// crossed or constant accessor fails one of them.
     #[test]
     fn the_native_stall_seam_reads_since_stopped_and_survived_off_the_fact() {
         use crate::input_stall::{InputStallFact, Restart};
@@ -1988,7 +1989,7 @@ mod tests {
             "{}",
             w.sentence
         );
-        // Stopped is the `stopped` FIELD: the word left at `Stalled`.
+        // Stopped is the `stopped` field: the word left at `Stalled`.
         let (level, chip, w) = read(InputStallFact {
             stopped: true,
             ..frozen.clone()
@@ -2053,12 +2054,10 @@ mod tests {
         }
     }
 
-    /// `agent_detail=bash:read-only` holds for EVERY reading of the command
-    /// rows ([`aterm_phase::PromptV2::readings`], the readings the
-    /// supervisor's decider classifies — review major; SUP-1/APR-5).
-    /// NEGATIVE CONTROL for the `│` case: the space-joined string the old
-    /// parser returned classifies read-only on its own — the verdict this used
-    /// to publish.
+    /// `agent_detail=bash:read-only` holds only when every reading of the
+    /// command rows ([`aterm_phase::PromptV2::readings`], what the supervisor's
+    /// decider classifies) is read-only. Negative control for the `│` case: the
+    /// space-joined string alone classifies read-only.
     #[test]
     fn a_bash_verdict_is_read_only_only_when_every_reading_is() {
         use aterm_agent::supervise::classify::classify_command;
@@ -2083,8 +2082,7 @@ mod tests {
         assert_eq!(detail_of(&bars).as_deref(), Some("bash:not-read-only"));
 
         // No `│`: one shell line that may wrap, its rows every command row. A
-        // write anywhere in them — the row shown as the command or the one
-        // the parser guesses is the description — is not read-only.
+        // write anywhere in them is not read-only.
         for block in [
             &["git status &&", "rm -rf build"][..],
             &["echo hi >", "out.txt"][..],
@@ -2109,18 +2107,15 @@ mod tests {
         assert_eq!(detail_of(&wrapped).as_deref(), Some(want));
     }
 
-    /// FRAME identification is for a program that can be an agent (review
-    /// major): a shell or `cat` showing a captured Claude screen — frame,
-    /// question and all — is not an agent, a frame identity does not survive
-    /// the program resolving to a shell, and a group still being named waits
-    /// for its name. NEGATIVE CONTROL: the same screen under `node`, or with
-    /// no foreground group to name, IS read as the question it shows.
-    /// A Codex started under `node` (an npm install) names no agent: its
-    /// screen does — its composer at idle ([`aterm_phase::identify`]) — and,
-    /// as Claude Code's frame does across its boxes, that identity is kept
-    /// for the job (`known_agent`): a draft standing in the composer, which
-    /// alone identifies nothing, is still read by Codex's reader. NEGATIVE
-    /// CONTROL: the draft screen with nothing known is no agent.
+    /// Frame identification is only for a program that can be an agent: a
+    /// shell or `cat` showing a captured Claude screen is not an agent, a frame
+    /// identity does not survive the program resolving to a shell, and a group
+    /// still being named waits for its name. Negative control: the same screen
+    /// under `node`, or with no foreground group, is read as the question it
+    /// shows. A Codex under `node` is identified by its composer at idle, and
+    /// that identity is kept for the job (`known_agent`), so a draft in the
+    /// composer is still read by Codex's reader. Negative control: the draft
+    /// screen with nothing known is no agent.
     #[test]
     fn a_node_run_codex_keeps_its_reader_across_its_job() {
         use aterm_phase::Program;
@@ -2199,5 +2194,61 @@ mod tests {
                 AgentVerdict::NotAgent => panic!("{program:?} is identified by its frame"),
             }
         }
+    }
+
+    /// The band's countdown places a reset with the offset that holds at the
+    /// reset, not one process-wide offset: a dated reset on the far side of a
+    /// daylight-saving change counts down to the real instant. (A zone with no
+    /// daylight saving has nothing to measure, and says so.)
+    #[cfg(unix)]
+    #[test]
+    fn r44_hb5_the_reset_countdown_places_a_reset_with_the_offset_that_holds_then() {
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        // Days since 1970-01-01 → (month 1..=12, day 1..=31) (H. Hinnant).
+        fn month_day(days: i64) -> (usize, i64) {
+            let z = days + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            (usize::try_from(m).unwrap(), d)
+        }
+        let Some(now_offset) = local_offset_s() else {
+            return;
+        };
+        let now = limit::unix_now();
+        let Some((probe, then_offset)) = [90i64, 120, 150, 180, 210, 240]
+            .into_iter()
+            .map(|days| now + days * 86_400)
+            .find_map(|t| {
+                local_offset_at(t)
+                    .filter(|o| *o != now_offset)
+                    .map(|o| (t, o))
+            })
+        else {
+            eprintln!("this machine's zone keeps one offset: nothing to measure");
+            return;
+        };
+        let (m, d) = month_day((probe + then_offset).div_euclid(86_400));
+        let reset = format!("{} {d} at 12pm", MONTHS[m - 1]);
+        let got = countdown_to_reset(&reset).expect("a figure");
+        let spec = limit::parse_reset(&reset).expect("the grammar reads it");
+        let now = limit::unix_now();
+        let at = limit::reset_in_zone(&spec, now, limit::SESSION_AHEAD_MAX, &|t| {
+            local_offset_at(t)
+        })
+        .expect("placed");
+        let want = u64::try_from(at - now).expect("ahead");
+        let off_by = got.as_secs().abs_diff(want);
+        assert!(
+            off_by <= 5,
+            "`{reset}` counted down {got:?}, the reset is {want} s away: {off_by} s off \
+             (offset now {now_offset}, then {then_offset})"
+        );
     }
 }

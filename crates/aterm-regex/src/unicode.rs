@@ -38,17 +38,14 @@
 //! desynchronise it, and the three hand-added edges cannot silently vanish.
 //!
 //! [`ND`], [`MARK`] and [`PC`] are the three general categories `std` withholds,
-//! enumerated code point by code point. `perl_classes_match_the_oracle` in
-//! `tests/differential.rs` re-checks `\d`, `\w` and `\s` against the `regex`
-//! dev-dependency across every code point.
+//! enumerated code point by code point. `perl_classes_are_pinned` in
+//! `tests/differential.rs` pins `\d`, `\s` and the non-alphabetic part of `\w`
+//! across every code point.
 //!
-//! One deliberate divergence is recorded there: `char::is_alphabetic` tracks the
+//! One deliberate divergence from `regex`: `char::is_alphabetic` tracks the
 //! *toolchain's* Unicode version, which is newer than the tables `regex`
 //! bundles, so `\w` here is a superset of `\w` there on the ~4.7k code points
-//! that gained `Alphabetic` in the interim. The differential test asserts
-//! exactly that shape — every disagreement is a code point `std` calls
-//! alphabetic and the oracle does not — so a real divergence could not hide
-//! inside it.
+//! that gained `Alphabetic` in the interim.
 
 /// Membership test for a sorted, disjoint, inclusive range table.
 fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
@@ -3633,8 +3630,8 @@ mod tests {
             }
         }
         // The three `C`-entry edges above, which no single-code-point mapping
-        // reaches. Without them `(?i)\u{390}` would not match `\u{1fd3}` and
-        // the oracle says it must — see `case_folding_matches_the_oracle`.
+        // reaches. Without them `(?i)\u{390}` would not match `\u{1fd3}`, as
+        // `regex` does — see `case_folding_is_pinned`.
         for &(a, b) in NON_DERIVABLE {
             join(&mut parent, a, b);
         }
@@ -3713,7 +3710,7 @@ mod tests {
     }
 
     /// Range folding must pull in the exotic members that live far outside the
-    /// range — `(?i)[a-z]` has to match KELVIN SIGN, as the oracle does.
+    /// range — `(?i)[a-z]` has to match KELVIN SIGN, as `regex` does.
     #[test]
     fn range_folding_reaches_outside_the_range() {
         let mut out = Vec::new();

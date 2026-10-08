@@ -3,6 +3,11 @@
 
 [package]
 name = "aterm-agent"
+# Integration tests are declared at the end of this file, not discovered: the
+# files are modules of the one `agent_suite` binary, and the two that count
+# process-wide allocations are their own. With autotests off a `tests/*.rs` file
+# listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,27 +23,39 @@ workspace = true
 [[bin]]
 name = "aterm-drive"
 path = "src/bin/aterm-drive.rs"
+# A shim over the library with no test of its own: its libtest harness ran 0
+# tests in every gate. Integration tests still get the built binary.
+test = false
 
 # The fleet-federation bridge: merge every live session's `subscribe events` into
 # one astream-subject-addressed stream, and dispatch commands back to the fleet.
 [[bin]]
 name = "aterm-fleet"
 path = "src/bin/aterm-fleet.rs"
+# As aterm-drive: no test of its own.
+test = false
 
 [features]
 # Compile this crate's source↔spec anchors into the LIBRARY, for a
 # downstream test binary that collects them via `inventory` (aterm-gui's
 # `spec_xref_closure` gate): `#[refines]` on the live upgrade's ladder (its
 # gate, its rung, the repaint-proof settle's look and the Codex daemon's pin,
-# machine `HarnessUpgradeLadder`) and its goal pause (the pause's step, its
-# owed resume and the daemon's turn, `HarnessUpgradeGoalPause`), on the
-# Claude Code footer's reader
+# machine `HarnessUpgradeLadder`), its goal pause (the pause's step, its
+# owed resume and the daemon's turn, `HarnessUpgradeGoalPause`) and its
+# progress (the reducer's steps, the watch's look and the view's mark,
+# `HarnessUpgradeProgress`), on the Claude Code footer's reader
 # (`ClaudeFooterModel`) and on the Codex rate-limit nudge's deciders
 # (`SupervisorCodexRateNudge`), each machine's other actions waived by name.
 # OFF by default: the shipped build carries no `aterm-spec` and no probe.
 # This crate's own test build expands the anchors through `cfg(test)`, and
 # its integration tests through the dev edge on itself below.
 spec-anchors = ["dep:aterm-spec"]
+# DEVELOPMENT SEAMS in an optimized build: this crate's `aterm_types::dev_seam!`
+# read (the live upgrade's settle, `ATERM_UPGRADE_QUIET_S`, which the live suite
+# shortens). A debug build compiles it anyway; the release cutter never enables
+# this (aterm's and aterm-gui's `dev-seams` forward here), so a shipped binary
+# settles the full `upgrade::QUIET_S`.
+dev-seams = []
 
 [dependencies]
 # Optional: pulled into the LIBRARY only by the off-by-default `spec-anchors`
@@ -63,6 +80,13 @@ aterm-ctl = { path = "../aterm-ctl" }
 # independently checksummed frames. `libc` is Unix-only at the call sites and
 # supplies O_NOFOLLOW/O_DIRECTORY for private state and WAL admission.
 aterm-digest = { workspace = true }
+# The workspace's one hex codec (digests, claim tokens, action hashes) and the
+# control wire's one percent escape (`pct`, every `status`/`history` field the
+# supervisor decodes). First-party, dependency-free.
+aterm-codec = { workspace = true }
+# The workspace's one FNV-1a/64 (the upgrade markers and still-prints, the bake
+# cache's file names, a dialog's answer key). First-party, dependency-free.
+aterm-hash = { workspace = true }
 libc = { workspace = true }
 # The control protocol's shared halves, so the supervisor speaks the wire the
 # server does instead of a copy of it: the verb table (`framing_of`, `spec`,
@@ -72,6 +96,9 @@ libc = { workspace = true }
 # or `send` carries. Plus the state/home directories and the RFC 3339 calendar.
 # Not a new edge in the BUILD graph: `aterm-ctl` above already pulls aterm-types.
 aterm-types = { workspace = true }
+# The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin), already in
+# the graph via aterm-types.
+aterm-time = { workspace = true }
 # The harness core reads two JSON shapes Claude Code writes (the statusLine
 # input and the transcript's usage rows) through the workspace's own parser.
 # A leaf: its one dependency is `serde`, already in the shipped graph.
@@ -91,6 +118,11 @@ aterm-grapheme = { workspace = true }
 # writes. No cycle: atpkg depends on no aterm-agent; aterm-cli and aterm-gui,
 # this crate's two binary consumers, already link it.
 atpkg = { workspace = true }
+# `aterm harness upgrade` reads another process's working directory and
+# executable in process (`process_cwd`, `process_path`: libproc on macOS,
+# procfs on Linux) instead of forking two `lsof`s per agent it inspects. Not a
+# new edge in the shipped graph — aterm-gui already links it.
+aterm-sysprobe = { workspace = true }
 # The ONE spelling of Claude Code's top-effort mode, `aterm_primer::CLAUDE_TOP_EFFORT_KEY`
 # (its settings key and the name `/effort` and the footer's effort results use): the
 # footer reads that name as `xhigh`. The publication baseline bans the word, joined,
@@ -98,11 +130,11 @@ atpkg = { workspace = true }
 # writes the key. Not a new edge in the shipped graph — atpkg above already depends on
 # it — and aterm-primer is a std-only leaf with no dependencies of its own.
 aterm-primer = { workspace = true }
-# The harness's master switch (`harness.enabled`) and `disk.apply` are read out
-# of aterm.toml with the SAME parser the GUI's Settings page seeds from, so the
-# switch cannot read OFF on the glass and ON here (`harness::cli::toml_bool`).
-# Not a new edge in the shipped graph — atpkg above already depends on it — and
-# its one dependency is `serde`.
+# aterm.toml's `[harness]` table (`supervise::SupervisorConfig::from_aterm_toml`)
+# and its `[disk]` knobs (`harness::cli::disk_config_read`) are read with the SAME
+# parser the GUI's Settings page seeds from, so a switch cannot read OFF on the
+# glass and ON here. Not a new edge in the shipped graph — atpkg above already
+# depends on it — and its one dependency is `serde`.
 aterm-toml = { workspace = true }
 # The live upgrade's relaunch line re-keys a shell spawned before the re-key
 # channel (`upgrade::with_rekey`): the text that sets the globals a script signs
@@ -121,7 +153,7 @@ aterm-shell-integration = { workspace = true }
 # (`#![cfg(unix)]`) and its one user here (`disk_target::fd`); elsewhere the
 # reclaim refuses. Declared for every target, it pulled aterm-dirfd into the
 # Windows cells' graph, whose test-target pass then compiled its Unix-only
-# differential oracle (`tests/oracle.rs`) for Windows — 135 errors per cell.
+# tests for Windows — 135 errors per cell.
 aterm-dirfd = { workspace = true }
 
 [dev-dependencies]
@@ -142,3 +174,26 @@ aterm-session = { workspace = true }
 # The E2E loopback-TLS remote-Turn test drives a real `dial_and_relay_pinned` bridge and a
 # channel-bound capability. Transport-only test deps; no cycle (aterm-net ⊄ aterm-agent).
 aterm-net = { workspace = true }
+# Test scratch directories removed on drop. First-party, zero dependencies.
+aterm-tempfile = { workspace = true, features = ["stand-in"] }
+# The upgrade tests' pseudo-terminals, both ends close-on-exec from birth
+# (`open_pty_pair`): an `openpty(3)` pair is inheritable, and the shell spawned
+# onto it kept a copy of its own master. Already in this test build through
+# aterm-session; no cycle (aterm-pty does not depend on aterm-agent).
+aterm-pty = { workspace = true }
+
+# ---- integration tests (autotests = false above) ----------------------------
+
+[[test]]
+name = "agent_suite"
+path = "tests/agent_suite.rs"
+
+# Alone: installs a #[global_allocator] and asserts process-wide byte counts.
+[[test]]
+name = "footer_window_allocations"
+path = "tests/footer_window_allocations.rs"
+
+# Alone: installs a #[global_allocator] and asserts process-wide allocation counts.
+[[test]]
+name = "transcript_allocations"
+path = "tests/transcript_allocations.rs"

@@ -127,20 +127,26 @@ else
     end
 end
 
+# A user's ATERM_MUX=0 (or off/no/none/false) turns the whole check off:
+# keep it, and say nothing.
+contains -- "$ATERM_MUX" 0 off no none false; and set __aterm_mux ""
+
 # THE IN-PLACE UPGRADE (2026-09-26). The guard below is exported, so a NON-empty
 # value normally proves this shell did not come straight from aterm (a pane — see
 # above). There is one other way to arrive here with it set: THIS VERY SHELL
 # sourcing the file again — the live agent upgrade's relaunch line sources a newer
 # build's loader into a shell spawned before loaders existed (`typed_rekey` in
 # aterm-shell-integration). That shell, and only that shell, already holds
-# `$__aterm_shell_nonce`: a plain global, never exported, so no pane or child
-# shell can have inherited it (`set -q` is right here: it is this script's own
-# variable, not an ATERM_* one). For it the guard is its own, and the load goes on
-# as an upgrade in place: everything below is idempotent, and what must run once
-# per shell (the package blocks, the prompt wrapper's copy of the user's prompt) is
-# skipped where it already ran.
+# `$__aterm_shell_nonce` AND the preexec handler its integration defined,
+# `__aterm_fish_preexec` (every build's since 0.61): a function, which no pane or
+# child shell inherits (`set -q` is right here: it is this script's own variable,
+# not an ATERM_* one). The nonce alone is no proof — the typed line assigns it in
+# a NESTED shell too (the zsh script says why). For the shell that holds both the
+# guard is its own, and the load goes on as an upgrade in place: everything below
+# is idempotent, and what must run once per shell (the package blocks, the prompt
+# wrapper's copy of the user's prompt) is skipped where it already ran.
 set -g __aterm_fresh_load 1
-if set -q __aterm_shell_nonce; and test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
+if set -q __aterm_shell_nonce; and functions -q __aterm_fish_preexec; and test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
     set -g __aterm_fresh_load 0
     set -gx ATERM_SHELL_INTEGRATION_INSTALLED ""
 end
@@ -251,8 +257,8 @@ end
 # exported into every child process.
 #
 # In an upgrade in place (see above) the environment holds no nonce any more — it
-# was scrubbed at this shell's first load — so the one the shell already signs
-# with is kept.
+# was scrubbed at this shell's first load — so the one the shell holds is kept: in
+# a typed upgrade, the key its line assigned just before sourcing this file.
 if set -q ATERM_SHELL_NONCE
     set -g __aterm_shell_nonce "$ATERM_SHELL_NONCE"
     set -e ATERM_SHELL_NONCE
@@ -349,11 +355,12 @@ if test "$__aterm_fresh_load" = 1; and test -d "$HOME/.aterm/shell.d"
     end
 end
 
-# THE BODY CHECK, first in every fish_prompt (the trampoline at the end of the
-# file): a newer body waits when the host has written the pointer. Two builtin
-# `test`s while nothing waits; the read, the removal (the one fork) and the source
-# happen only when a pointer waits. The revision moves only when the source
-# succeeded: a body that failed to load is still reported as the one before it.
+# THE BODY CHECK, first at every prompt (the prompt event and the trampoline at
+# the end of the file): a newer body waits when the host has written the
+# pointer. Two builtin `test`s while nothing waits; the read, the removal (the
+# one fork) and the source happen only when a pointer waits. The revision moves
+# only when the source succeeded: a body that failed to load is still reported
+# as the one before it.
 function __aterm_body_check
     test -n "$__aterm_body_pointer"; and test -f "$__aterm_body_pointer"; or return 0
     set -l addr ""
@@ -617,8 +624,17 @@ end
 
 # State tracking. KEPT across a live re-source: the body is re-sourced from the
 # prompt trampoline, and the prompt it draws still colours the last status.
+# `$__aterm_last_status` is the last command's `$status`, one value, as every
+# body reads it: an older body taking over draws its custom prompt with `test
+# $__aterm_last_status -ne 0`, which a list stops with a `test` error (measured).
+# `$__aterm_last_pipestatus` is its `$pipestatus`; the user's prompt is handed
+# both (see "THE USER'S PROMPT" below).
 if not set -q __aterm_last_status
     set -g __aterm_last_status 0
+end
+# How many prompts this shell has wrapped (see "THE USER'S PROMPT").
+if not set -q __aterm_prompt_gen
+    set -g __aterm_prompt_gen 0
 end
 
 # OSC escape sequences
@@ -689,7 +705,16 @@ if test -n "$__aterm_host_first_label"
 end
 
 # The re-key channel's check (the path is captured by the loader above).
+#
+# Inside a user's prompt it is the first thing a copy of the prompt wrapper from
+# before loaders runs — conda's `__fish_prompt_orig` or a venv's
+# `_old_fish_prompt` in a shell that took a loader by the typed upgrade — so it
+# keeps what that wrapper was handed, as a trampoline's first statement does:
+# the prompt the copy draws reads the status conda or the venv put back (`$status`
+# alone, `$pipestatus` of their own), not the command's (see "THE USER'S PROMPT").
 function __aterm_rekey_check
+    set -l st $status $pipestatus
+    __aterm_prompt_inner; and set -g __aterm_prompt_status $st
     test -n "$__aterm_rekey_path"; and test -f "$__aterm_rekey_path"; or return 0
     set -l key ""
     read -l key <"$__aterm_rekey_path" 2>/dev/null
@@ -736,13 +761,17 @@ function __aterm_report_cwd
     __aterm_osc "7;file://$__aterm_report_host$cwd"
 end
 
-# Mark prompt start (OSC 133;A)
+# Mark prompt start (OSC 133;A). Never from inside a user's prompt: a wrapper's
+# copy of an older build's prompt wrapper calls this too (see "THE USER'S
+# PROMPT").
 function __aterm_mark_prompt_start
+    __aterm_prompt_inner; and return 0
     __aterm_osc "133;A$__aterm_id_suffix_str"
 end
 
-# Mark command line start (OSC 133;B)
+# Mark command line start (OSC 133;B), the same.
 function __aterm_mark_command_start
+    __aterm_prompt_inner; and return 0
     __aterm_osc "133;B$__aterm_id_suffix_str"
 end
 
@@ -835,7 +864,7 @@ function __aterm_custom_prompt
 
     # Error-aware prompt char: separator color on success, error color on failure
     set -l prompt_color $sc
-    if test $__aterm_last_status -ne 0
+    if test "$__aterm_last_status[1]" -ne 0
         set prompt_color $ec
     end
 
@@ -899,13 +928,273 @@ function __aterm_custom_prompt
     end
 end
 
+# ─── THE USER'S PROMPT: handed what fish hands it, and kept wrapped (2026-10-01) ───
+#
+# The trampoline (end of file) draws the user's prompt between this body's 133;A
+# and 133;B. Two things went wrong there, both measured on fish 4.9.3:
+#
+#  1. The prompt never saw the command's `$status` / `$pipestatus`: the
+#     trampoline and this body ran a dozen commands before it, each replacing
+#     both. fish's default prompt never showed `[1]` after `false`, and tide's
+#     and pure's error colours never turned.
+#  2. A prompt config.fish defines (`starship init fish | source`, oh-my-posh's,
+#     a plain `function fish_prompt` there) replaced the trampoline for the
+#     shell's life — fish reads the vendor conf.d, and so this file, BEFORE
+#     config.fish — and with it every 133;A and 133;B. Only fish's own unsigned
+#     `133;A;click_events=1` / `133;B` reached the wire, and were dropped, so the
+#     engine kept no block at all while `status` read `integration=on`. The marks
+#     cannot come from somewhere else: the `fish_prompt` event fires before the
+#     prompt is drawn, but nothing fires after it, where 133;B goes.
+#
+# So:
+#  - Every trampoline captures what fish handed it, `$status $pipestatus`, as its
+#    first statement (`$__aterm_prompt_status`; a copy of the wrapper from before
+#    loaders keeps it in its first call, `__aterm_rekey_check`; a trampoline from
+#    an older loader captures nothing, and the command's stands in), and
+#    `__aterm_prompt_dispatch` puts both back with a pipeline of
+#    `__aterm_return`s — negated when `not` inverted the status, which leaves
+#    `$pipestatus` alone — in the same `eval` as the call of the prompt: the
+#    prompt's first statement reads exactly what it would have read unwrapped.
+#  - A prompt that is no trampoline is wrapped again — at the first prompt this
+#    body sees (after config.fish) and after every command: a copy of it becomes
+#    `__aterm_fish_prompt_<n>` and `fish_prompt` a trampoline that NAMES it
+#    (`$__aterm_prompt_fn`). The prompt fish had at load becomes
+#    `__aterm_fish_prompt_0`, and `__aterm_original_fish_prompt` — what every
+#    body draws, an older one too — `__aterm_prompt_dispatch`, which draws the
+#    prompt the calling trampoline named (none: the load's).
+#  - Before every command that prompt is given back (`__aterm_prompt_give_back`):
+#    while a command runs, `fish_prompt` is the user's own, so what reads or
+#    copies it — `funcsave fish_prompt`, `funced`, `fish_config prompt save`, a
+#    venv's activate.fish — gets their prompt, never a trampoline (which, saved,
+#    would be every later shell's prompt), and `funced` edits the file that
+#    defined it.
+#  - A wrapper that keeps a COPY of a trampoline and calls it — conda's
+#    `__fish_prompt_orig` and a config.fish wrapper that calls it only some of
+#    the time, both taken from the loader's before any prompt — reaches, through
+#    that copy, the prompt the copy named, never the wrapper again (which would
+#    recurse to fish's call stack limit), and that inner draw writes no mark: one
+#    133;A and one 133;B per prompt. A prompt that recurses anyway stops four
+#    deep, at the fallback prompt; the one an older build let `funcsave
+#    fish_prompt` save — the loader's trampoline, which recursed to the limit in
+#    every later shell (measured: 63 marks, 7 stack-limit errors, no prompt) —
+#    is replaced at load by fish's own default prompt (`__aterm_prompt_shim`).
+#  - No mark is written from inside a user's prompt, whoever asks: a copy of a
+#    build's prompt wrapper from before loaders writes its own, and a typed
+#    upgrade of a shell whose conda or venv kept one drew two of each, nested,
+#    at every prompt for the shell's life (measured). "Inside" is
+#    `__aterm_prompt_inner`: a draw `__aterm_prompt_dispatch` started and has not
+#    finished, which only its own frame says (see there).
+#  - The prompt is handed the trampoline's `$argv` too: fish 4.1's transient
+#    prompt draws it once more with `--final-rendering` (starship's
+#    `enable_transience`), and without it the full prompt was drawn again.
+
+# Returns its argument: a pipeline of these puts back a `$status` and a
+# `$pipestatus`.
+function __aterm_return
+    return $argv[1]
+end
+
+# The fallback minimal prompt.
+#
+# Was `echo -n (whoami)'@'(hostname)' '(prompt_pwd)' $ '` — four glued command
+# substitutions, so a single one of them printing nothing (a host with no
+# `hostname`, the commonest case) collapsed the cartesian product to zero
+# arguments and `echo -n` printed NOTHING AT ALL: no user, no host, no path, no
+# `$`. Measured on fish 4.2.1 — the entire fallback prompt vanished, leaving a
+# bare line between the 133;A and 133;B marks. Quoted interpolation of captured
+# locals instead.
+function __aterm_prompt_fallback
+    set -l user "$USER"
+    if test -z "$user"; and command -sq whoami
+        set user (whoami)
+    end
+    set -l cwd (prompt_pwd)
+    printf '%s@%s %s $ ' "$user" "$__aterm_report_host" "$cwd"
+end
+
+# Whether this runs inside a user's prompt being drawn: inside a call of
+# `__aterm_prompt_dispatch`, whose frame holds `$__aterm_prompt_drawing` (how
+# many draws deep) as a local. It is EXPORTED only because fish hands a
+# function the exported locals of the functions that called it, and nothing
+# else does: every function the user's prompt calls sees it (and the commands
+# it runs, a name none of them reads), and it is gone with the dispatch's frame
+# — also when a Ctrl-C cancels the draw half way, which a count kept in a
+# global outlived: it left the prompts after it unmarked, and four cancelled
+# draws in a row drew the fallback prompt once nothing reset it (both measured).
+# Nothing fish prints is read: the stack trace this once matched names each
+# frame in the user's language (`in der Funktion '…'`), and under a German fish
+# a conda prompt drew two 133;A and two 133;B at every prompt (measured). `-l`:
+# a global of that name (an environment's) is no draw of this shell's.
+function __aterm_prompt_inner
+    set -ql __aterm_prompt_drawing
+end
+
+# Draws the user's prompt the calling trampoline named, handed the status that
+# trampoline captured and its `$argv`. `__aterm_original_fish_prompt` once the
+# shim is in.
+function __aterm_prompt_dispatch
+    set -l fn __aterm_fish_prompt_0
+    if string match -qr '^__aterm_fish_prompt_[0-9]+$' -- "$__aterm_prompt_fn"
+        and functions -q $__aterm_prompt_fn
+        set fn $__aterm_prompt_fn
+    end
+    set -e __aterm_prompt_fn
+    set -l st $__aterm_prompt_status
+    set -q st[1]; or set st $__aterm_last_status $__aterm_last_pipestatus
+    set -l ps $st[2..-1]
+    set -q ps[1]; or set ps $st[1]
+    set -l run (string join ' | ' -- '__aterm_return '$ps)
+    if test "$st[1]" != "$ps[-1]"
+        set run "not $run"
+    end
+    # Integers only ever reach the `eval`.
+    string match -qr '^(not )?__aterm_return [0-9]+( \| __aterm_return [0-9]+)*$' -- "$run"
+    or set run true
+    set -l depth 0
+    __aterm_prompt_inner; and set depth $__aterm_prompt_drawing
+    if test "$depth" -ge 4; or not functions -q $fn
+        __aterm_prompt_fallback
+        return 0
+    end
+    # The prompt's lines, read as fish reads a prompt's, and written back as ONE
+    # piece: fish draws every piece written apart on a line of its own, and a
+    # prompt that writes through `string` (fish-async-prompt's `string collect`,
+    # tide's `string unescape`) is a piece apart from the marks around it — its
+    # command line was drawn on the line below it (measured).
+    set -lx __aterm_prompt_drawing (math $depth + 1)
+    set -l lines (eval "$run; $fn \$argv")
+    set -q lines[1]; and printf '%s' $lines[1]
+    set -q lines[2]; and printf '\n%s' $lines[2..-1]
+    return 0
+end
+
+# The prompt fish had at load becomes `__aterm_fish_prompt_0`, and
+# `__aterm_original_fish_prompt` the dispatch — once per shell. A load-time
+# prompt that is itself a trampoline (one saved with `funcsave fish_prompt`) is
+# replaced by fish's own default prompt where fish carries it.
+function __aterm_prompt_shim
+    functions --no-details __aterm_original_fish_prompt 2>/dev/null | string match -q -- '*__aterm_prompt_dispatch*'
+    and return 0
+    if functions -q __aterm_original_fish_prompt; and not functions -q __aterm_fish_prompt_0
+        functions -c __aterm_original_fish_prompt __aterm_fish_prompt_0
+    end
+    functions -e __aterm_original_fish_prompt
+    function __aterm_original_fish_prompt
+        __aterm_prompt_dispatch $argv
+    end
+    if functions --no-details __aterm_fish_prompt_0 2>/dev/null | string match -q -- '*__aterm_body_prompt*'
+        functions -e __aterm_fish_prompt_0
+        status get-file functions/fish_prompt.fish 2>/dev/null \
+            | string replace -r -- '^function fish_prompt\b' 'function __aterm_fish_prompt_0' | source
+    end
+    return 0
+end
+
+# Wraps a prompt that is no trampoline (see above): under the name of the last
+# one wrapped when it is that one, given back for a command and left as it was.
+function __aterm_prompt_wrap
+    functions -q fish_prompt; or return 0
+    functions --no-details fish_prompt | string match -q -- '*__aterm_body_prompt*'
+    and return 0
+    __aterm_prompt_shim
+    set -l fn __aterm_fish_prompt_$__aterm_prompt_gen
+    set -l now (functions --no-details fish_prompt)[2..-1]
+    set -l was (functions --no-details $fn 2>/dev/null)[2..-1]
+    if test "$__aterm_prompt_gen" = 0; or test "$now" != "$was"
+        set -g __aterm_prompt_gen (math $__aterm_prompt_gen + 1)
+        set fn __aterm_fish_prompt_$__aterm_prompt_gen
+        functions -e $fn
+        functions -c fish_prompt $fn; or return 0
+    end
+    functions -e fish_prompt
+    eval "function fish_prompt
+    set -g __aterm_prompt_status \$status \$pipestatus
+    set -g __aterm_prompt_fn $fn
+    __aterm_body_check
+    __aterm_body_prompt \$argv
+end"
+end
+function __aterm_prompt_wrap_first --on-event fish_prompt
+    functions -e __aterm_prompt_wrap_first
+    __aterm_prompt_wrap
+    __aterm_prompt_give_back_arm
+end
+# The prompt a trampoline in `fish_prompt` draws, printed — the one it names, or
+# for the loader's, the one fish had at load; false when `fish_prompt` is none.
+function __aterm_prompt_wrapped
+    set -l text (functions --no-details fish_prompt 2>/dev/null)
+    string match -q -- '*__aterm_body_prompt*' $text; or return 1
+    set -l fn (string replace -rf -- '^\s*set -g __aterm_prompt_fn (__aterm_fish_prompt_[0-9]+)\s*$' '$1' $text)
+    set -q fn[1]; or set fn __aterm_fish_prompt_0
+    functions -q $fn[1]; or return 1
+    printf '%s\n' $fn[1]
+end
+# Gives that prompt back as `fish_prompt` before a command (see above), copied
+# in a handler defined at a prompt — from no file. fish 4 records where a copy
+# was made (the file of the innermost function running that has one), and
+# `funced` reads a copy made in another file as a prompt with no file of its
+# own: the prompt given back from this file was edited as a dump, never in
+# config.fish or functions/fish_prompt.fish as fish without aterm edits it
+# (measured), and fish 4.0's funced edited this very file instead (fish 4.1.0's
+# changelog); `tide reload` sourced it.
+# Copied from nowhere, it names the user's file. So the handler is defined at a
+# prompt or after a command, never while a file is sourced (a newer body taking
+# over), which it would name, and once: a body sourced later leaves it be. It
+# gives the prompt back only while the body running is one that wraps it again
+# after the command, which each prompt and command of this body records (the
+# revision it runs): under a body from before this one, which never wraps it
+# again, fish's own default prompt lost its marks at the first command
+# (measured).
+function __aterm_prompt_give_back_arm
+    set -g __aterm_prompt_rewrap_rev "$__aterm_body_rev"
+    functions -q __aterm_prompt_give_back; and return 0
+    function __aterm_prompt_give_back --on-event fish_preexec
+        test "$__aterm_prompt_rewrap_rev" = "$__aterm_body_rev"; or return 0
+        functions -q __aterm_prompt_wrapped; or return 0
+        set -l fn (__aterm_prompt_wrapped); or return 0
+        functions -e fish_prompt
+        functions -c $fn fish_prompt
+    end
+end
+# The same from this file, for a command before that handler exists.
+function __aterm_prompt_unwrap
+    functions -q __aterm_prompt_give_back; and return 0
+    set -l fn (__aterm_prompt_wrapped); or return 0
+    functions -e fish_prompt
+    functions -c $fn fish_prompt
+end
+# A running shell that takes this body (the loader's trampoline is already
+# there) wraps it at once: the prompt about to be drawn is the first this body
+# sees. A fresh load has config.fish still to run, and leaves it to that event.
+if functions -q __aterm_fish_prompt_trampoline
+    __aterm_prompt_wrap
+end
+
 # The prompt the loader's fish_prompt trampoline draws (end of file).
 function __aterm_body_prompt
+    # Called by a copy of a trampoline while a user's prompt is drawn: that
+    # prompt's own, nothing else (see "THE USER'S PROMPT" above).
+    if __aterm_prompt_inner
+        __aterm_original_fish_prompt $argv
+        return 0
+    end
+    # This body draws the prompt, and gives it back for the command (see "THE
+    # USER'S PROMPT") — the first prompt after it took over too.
+    __aterm_prompt_give_back_arm
+
     # A waiting re-key first, so every mark this prompt emits carries it.
     __aterm_rekey_check
 
     # The managed dirs, live (see "LIVE" above): one probe, an assign only on change.
     __aterm_managed_path_live
+
+    # The shell's own cwd before every prompt start, as zsh and bash report it
+    # from their prompt hook. OSC 7 carries no nonce (a remote shell over ssh
+    # must be able to report a cwd), so a cwd a program — or a remote shell,
+    # after ssh exits — reported went into the next signed block and became the
+    # new-tab folder until the next `cd`. fish's own report rides the prompt
+    # event only from 4.3.
+    __aterm_report_cwd
 
     # The revision this prompt runs, then the prompt start.
     __aterm_mark_integration_rev
@@ -949,26 +1238,17 @@ function __aterm_body_prompt
     # empty value, handed it to __aterm_custom_prompt, and its `switch "$style"`
     # matched no case — so fish printed NO PROMPT AT ALL (an empty line between
     # the 133;A and 133;B marks), while the user's real prompt was skipped.
+    #
+    # The shim runs under either prompt: it alone makes the load's prompt
+    # `__aterm_fish_prompt_0`, the one given back for a command. Called only for
+    # the user's prompt, a style left none to give back, so `fish_prompt` stayed
+    # the loader's trampoline for the shell's life and `funcsave fish_prompt`
+    # wrote it over the user's prompt file (measured, fish 4.9.3).
+    __aterm_prompt_shim
     if test -n "$ATERM_PROMPT_STYLE"; and test "$ATERM_PROMPT_STYLE" != "none"
         __aterm_custom_prompt
-    else if functions -q __aterm_original_fish_prompt
-        __aterm_original_fish_prompt
     else
-        # Fallback minimal prompt.
-        #
-        # Was `echo -n (whoami)'@'(hostname)' '(prompt_pwd)' $ '` — four glued
-        # command substitutions, so a single one of them printing nothing (a
-        # host with no `hostname`, the commonest case) collapsed the cartesian
-        # product to zero arguments and `echo -n` printed NOTHING AT ALL: no
-        # user, no host, no path, no `$`. Measured on fish 4.2.1 — the entire
-        # fallback prompt vanished, leaving a bare line between the 133;A and
-        # 133;B marks. Quoted interpolation of captured locals instead.
-        set -l user "$USER"
-        if test -z "$user"; and command -sq whoami
-            set user (whoami)
-        end
-        set -l cwd (prompt_pwd)
-        printf '%s@%s %s $ ' "$user" "$__aterm_report_host" "$cwd"
+        __aterm_original_fish_prompt $argv
     end
 
     # Mark command line start (user will type here)
@@ -1031,6 +1311,9 @@ end
 
 # fish_preexec - runs before command execution
 function __aterm_fish_preexec --on-event fish_preexec
+    # The command runs with the user's own prompt (see "THE USER'S PROMPT").
+    __aterm_prompt_unwrap
+
     # The managed dirs, live — BEFORE this command resolves: a `claude` typed at a
     # prompt that was drawn before atpkg laid agents/ must already run the twin.
     __aterm_managed_path_live
@@ -1061,7 +1344,16 @@ end
 
 # fish_postexec - runs after command execution
 function __aterm_fish_postexec --on-event fish_postexec
-    set __aterm_last_status $status
+    # Both in ONE statement: any command replaces both.
+    set -l st $status $pipestatus
+    set -g __aterm_last_status $st[1]
+    set -g __aterm_last_pipestatus $st[2..-1]
+    # What a trampoline captured was the command before this one's.
+    set -e __aterm_prompt_status
+    # The prompt the command leaves — the one it was given, or a new one — is
+    # wrapped for the prompt to come (see "THE USER'S PROMPT").
+    __aterm_prompt_wrap
+    __aterm_prompt_give_back_arm
     # The command's end mark carries a key that arrived while it ran.
     __aterm_rekey_check
     __aterm_mark_exec_finish $__aterm_last_status
@@ -1116,14 +1408,40 @@ functions -c fish_prompt __aterm_original_fish_prompt 2>/dev/null
 # from the vendor conf.d BEFORE config.fish, so a prompt the user defines there
 # (a framework's: `starship init fish | source`) replaced our wrapper for that
 # shell's life; replacing it in turn would draw the prompt copied above, from
-# before config.fish ran, and the user's own would be gone.
+# before config.fish ran, and the user's own would be gone. The body wraps such
+# a prompt again, in a trampoline that names it (the body's "THE USER'S
+# PROMPT"), which is left alone too.
+#
+# The trampoline's first statement captures what fish handed it: every command
+# after it replaces `$status` and `$pipestatus`, and the user's prompt reads them.
 function __aterm_fish_prompt_trampoline
+    set -g __aterm_prompt_status $status $pipestatus
     __aterm_body_check
-    __aterm_body_prompt
+    __aterm_body_prompt $argv
 end
-if test "$__aterm_fresh_load" = 1; or functions fish_prompt | string match -q -- '*__aterm_*'
+set -l __aterm_prompt_text (functions --no-details fish_prompt 2>/dev/null)
+if test "$__aterm_fresh_load" = 1; or begin
+        string match -q -- '*__aterm_*' $__aterm_prompt_text
+        and not string match -q -- '*__aterm_prompt_fn*' $__aterm_prompt_text
+    end
     functions -e fish_prompt
     functions -c __aterm_fish_prompt_trampoline fish_prompt
+end
+
+# THE BODY CHECK ON THE PROMPT EVENT (review finding 2026-10-01). A prompt
+# config.fish defines (`starship init fish | source`, oh-my-posh's), read after
+# this file, replaces the trampoline above for that shell's life — and with it
+# the only call of the check and the only revision signed: such a shell left
+# every update's pointer unread and never said which body it ran. fish emits
+# `fish_prompt` before every prompt, whoever draws it, so the check rides that
+# event too (where the trampoline still draws, its own check then finds no
+# pointer waiting), and where the prompt is not the trampoline the revision is
+# signed here. The user's prompt is never touched, and fish keeps `$status`
+# across an event handler, so it still reads the command's.
+function __aterm_fish_prompt_event --on-event fish_prompt
+    __aterm_body_check
+    functions --no-details fish_prompt 2>/dev/null | string match -q -- '*__aterm_body_prompt*'
+    or __aterm_mark_integration_rev
 end
 
 # The key bindings, ONCE per shell: a fresh load only — the zsh script's twin

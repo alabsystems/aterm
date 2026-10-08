@@ -1,48 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `SupervisorNetworkWall` (aterm-spec
-//! `supervisor_network_wall_model`): the REAL turn-end decider
-//! (`decide_turn_end`, with the real `TurnEndState` it keeps) driven along
-//! EVERY reachable state of the model, so the committed answer to an API
-//! error the network caused — the outage of 2026-09-27's `API Error: Can't
-//! reach the API server … (ENOTFOUND)`, and a reply the connection cut off —
-//! is the model's, state for state.
+//! Tier-1 for `SupervisorNetworkWall` (aterm-spec
+//! `supervisor_network_wall_model`): the real turn-end decider
+//! (`decide_turn_end`, with its `TurnEndState`) driven along every reachable
+//! state of the model, so the answer to an API error the network caused (`API
+//! Error: Can't reach the API server … (ENOTFOUND)`, or a reply cut off) is the
+//! model's, state for state.
 //!
-//! Each model action is mirrored on the real side. The world (`NetFails`,
-//! `NetReturns`) is invisible to the decider; the host's measure is the
-//! reading's `reach` (`Unknown`, `Down`, `Up`); a wall appearing is the
-//! point `observe`d with the vendor's own retries as its busy work (3 min,
-//! short of the real `progress`); time at the wall is the real clock moved
-//! one minute per tick, with the real ladders scaled to the model's
-//! constants (`net_backoff` = `Rung1`, `Rung2` min, `down_hold` = `Hold`
-//! min); the model's `Act` is the real decider's own act, recorded with
-//! `acted`; the act meeting the wall again is the next point observed with
-//! the vendor's retries (the same episode) or with ten minutes of work (a
-//! new one, past `progress`); and `Taken` is an idle point with no wall
-//! after real work, which ends the track.
+//! The world (`NetFails`, `NetReturns`) is invisible to the decider; the
+//! host's measure is the reading's `reach`; a wall appearing is the point
+//! observed with the vendor's retries as busy work; time moves one minute per
+//! tick with the real ladders scaled to the model's constants (`net_backoff` =
+//! `Rung1`, `Rung2`, `down_hold` = `Hold`); `Act` is the decider's own act,
+//! recorded with `acted`; and `Taken` is an idle point with no wall after real
+//! work. The decider is asked at every state, as the loop asks at every due
+//! and every change of the host's measure (`reach_edge`).
 //!
-//! The walk asks the decider at EVERY state, as the loop does at every
-//! change that can move its answer: the due its last wait named (a tick)
-//! and each new run of the host's measure (the loop's `reach_edge`, which
-//! since the review of 2026-09-27 decides again on a measure lost or newly
-//! down, not only on an `Up`).
-//!
-//! At every state, the model's invariants hold, and the real verdict is
-//! checked against the model: at a wall that shows, the real decider TYPES
-//! exactly where `Act` is enabled — under the rule the model's branch
-//! names (`api-back@v1` for an unreachable API measured up, `api-cutoff@v1`
-//! for a reply cut off and not measured down, `api-retry@v1` otherwise) and
-//! in the words `wall_retry_text` gives for it, the vendor's line quoted —
-//! and otherwise WAITS until exactly the tick the model's `Act` would
-//! become enabled with nothing else moving; while the worker works or the
-//! act is in flight it does nothing. NEGATIVE CONTROLS: the `Buggy = 1`
-//! model (the day's supervisor: at once at every appearance, whatever the
-//! measure) disagrees with the real decider — among others at a measured
-//! outage's appearance, where it types and the real decider waits the hold
-//! — so a green walk is not vacuous; and so does `Carry = 1` (the hold's
-//! clock carried across an episode's appearances), at the outage's next
-//! appearance under a Down measure.
+//! At every state the invariants hold, and at a shown wall the decider types
+//! exactly where `Act` is enabled, under the model's rule (`api-back@v1`,
+//! `api-cutoff@v1`, `api-retry@v1`) and in `wall_retry_text`'s words, and
+//! otherwise waits until exactly the tick `Act` would become enabled.
+//! Negative controls: the `Buggy = 1` model (acting at once whatever the
+//! measure) and `Carry = 1` (the hold's clock carried across appearances)
+//! each disagree with the real decider somewhere.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -122,6 +103,7 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
             (true, _) => ENOTFOUND.to_string(),
         },
         reset_at: None,
+        jitter: Duration::ZERO,
         resumes_by_itself: false,
         composer: Composer::Empty,
         said_tail: None,
@@ -147,6 +129,7 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
         sandbox_fell: None,
         thread_model: None,
         upgrade_goal: false,
+        account: None,
     }
 }
 
@@ -221,7 +204,7 @@ fn verdict(a: &TurnEndAction, st: &State, now: Instant) -> Verdict {
             let r = reading(st, None, now);
             assert_eq!(
                 *text,
-                wall_retry_text(rule_id, cause_of(st), &r.wall_message),
+                wall_retry_text(rule_id, cause_of(st), &r.wall_message, r.program),
                 "the words at {st:?}"
             );
             Verdict::Act(rule_id)
@@ -349,10 +332,10 @@ fn tier1_the_real_decider_types_into_a_network_wall_exactly_where_the_model_allo
     }
 }
 
-/// NEGATIVE CONTROL: the day's supervisor (`Buggy = 1`, at once at every
-/// appearance whatever the measure) is NOT the real decider. It disagrees
-/// at a measured outage's appearance — it types, the real decider waits
-/// the hold — and the walk finds that without being told where to look.
+/// Negative control: the `Buggy = 1` model (acting at once at every appearance
+/// whatever the measure) is not the real decider: at a measured outage's
+/// appearance it types where the real decider waits the hold, and the walk
+/// finds that without being told where to look.
 #[test]
 fn the_buggy_model_disagrees_with_the_real_decider() {
     let m = supervisor_network_wall_model();

@@ -20,19 +20,27 @@
 //!   whose cargo lock is nevertheless its own — so all are real lanes that
 //!   genuinely overlap the main lane's compile.
 //!
-//! * An EXCLUSIVE stage runs with nothing else in flight. The deadline tests,
-//!   the measuring tests and the two smokes are judged by the clock: launchd
-//!   deadlines, paint takes, frames per second, input→present latency, sync
-//!   timeout-releases. A gate that
+//! * An EXCLUSIVE stage runs with nothing else in flight. The measuring tests
+//!   and the two smokes are judged by the clock: paint takes, frames per
+//!   second, input→present latency, sync timeout-releases. A gate that
 //!   decided "present starvation — frames=12 (< 15)" while a lint saturated the
 //!   other cores would be reporting the gate, not the build. Exclusivity is what
 //!   keeps a ported stage's decision identical to the sequential one.
 //!
-//! * An AFTER-LANES stage (2026-09-13; today only the test run) also waits for
-//!   every stage of the lanes it names — except stages behind an exclusive
-//!   barrier declared after it, which cannot overlap it anyway: that barrier
-//!   waits for it, and they wait for the barrier. Those are its AWAITED stages
-//!   ([`awaited`]).
+//! * An AFTER-LANES stage (2026-09-13; the test run) also waits for every
+//!   stage of the lanes it names, and an AFTER-STAGES stage (2026-10-03; the
+//!   MEASURE tier's release build on a host too small to overlap it,
+//!   [`crate::plan::measure_overlap`]; since 2026-10-04 the trust lane on a
+//!   host with no room beside the land tier's builds,
+//!   [`crate::plan::trust_overlap`]; since 2026-10-05 the doctests, which
+//!   await the test compile from a lane of their own,
+//!   [`crate::plan::Lane::Doctests`]) for every stage it names — except
+//!   stages behind an exclusive barrier declared after it, which cannot
+//!   overlap it anyway: that barrier waits for it, and they wait for the
+//!   barrier; and except, when reached through a lane, the compile-only rows
+//!   [`crate::plan::NOT_AWAITED`] declares (2026-09-29), whose products only
+//!   rows behind that barrier drive (a stage named in after-stages is always
+//!   awaited). Those are its AWAITED stages ([`awaited`]).
 //!
 //! Scheduling rule, in full: stage *i* may start when every earlier stage in its
 //! own lane has finished, no earlier exclusive stage is unfinished, every stage
@@ -40,16 +48,32 @@
 //! running.
 //!
 //! That rule cannot deadlock, given what [`check_after_lanes`] enforces: an
-//! awaited stage is never exclusive, never waits on lanes itself, and is never
-//! in the awaiting stage's own lane. Take the lowest-indexed unfinished stage
-//! *i*: every earlier stage is finished, so its lane predecessors are done and
-//! no earlier exclusive stage is pending; if it is exclusive, anything still
-//! running would have to be a LATER stage, which could not have started while
-//! an earlier exclusive stage was unfinished. If *i* is blocked at all, it is
-//! blocked on an unfinished awaited stage. Take the lowest such *j*: nothing
+//! awaited stage is never exclusive and never in the awaiting stage's own
+//! lane; if it waits itself, on lanes or stages (since 2026-10-04: the trust
+//! lane awaiting the release build that awaits the land tier's builds; since
+//! 2026-10-05 also the test run, which awaits the driver lane), every stage it
+//! awaits is declared before the awaiting stage, or is awaited by the awaiting
+//! stage too and waits on nothing; and every stage of its lane declared
+//! between the two waits on nothing. "Nothing" there discounts a wait on a
+//! stage declared before the awaiting stage (since 2026-10-06: the land
+//! tier's builds chained behind the test compile on a host short of memory,
+//! [`crate::plan::land_builds`]) — the argument below only looks at the
+//! lowest unfinished stage, before which everything has finished.
+//! Take the lowest-indexed unfinished stage *i*: every earlier stage
+//! is finished, so its lane predecessors are done and no earlier exclusive
+//! stage is pending; if it is exclusive, anything still running would have to
+//! be a LATER stage, which could not have started while an earlier exclusive
+//! stage was unfinished. If *i* is blocked at all, it is blocked on an
+//! unfinished awaited stage. Some unfinished awaited stage has all of ITS
+//! awaited stages finished: one that waits on nothing does, and one that waits
+//! waits only on stages *i* awaits that themselves wait on nothing — were one
+//! unfinished, it would be such a stage. Take the lowest such *j*: nothing
 //! exclusive lies between *i* and *j* (that is what "not behind a barrier"
-//! means), its lane predecessors after *i* would be lower awaited stages, and it
-//! awaits nothing — so *j* is running or startable. Progress is guaranteed.
+//! means), and its unfinished lane predecessors all lie after *i* and wait on
+//! nothing; the lowest of them, or *j* itself when there are none, is running
+//! or startable. Progress is guaranteed. (Awaiting a lane awaits every row of
+//! it, so the lane-predecessor clause bites only on after-stages and the
+//! NOT_AWAITED rows, which skip some.)
 //! (`no_starvation_and_no_deadlock` below model-checks that against the real
 //! plans.)
 
@@ -100,10 +124,14 @@ pub(crate) fn ready(
     !blocked && !(me.exclusive && running > 0) && awaited(specs, i).all(|j| done[j])
 }
 
-/// The stages `i` waits for through [`StageSpec::after_lanes`]: every stage in
-/// one of those lanes, unless an exclusive stage is declared after `i` and at
+/// The stages `i` waits for through [`StageSpec::after_lanes`] — every stage
+/// in one of those lanes — and through [`StageSpec::after_stages`] — every
+/// stage it names — unless an exclusive stage is declared after `i` and at
 /// or before it. Such a stage cannot overlap `i` — the barrier waits for `i`
 /// and the stage waits for the barrier — and waiting for it would deadlock.
+/// Nor a [`crate::plan::NOT_AWAITED`] row reached through a lane (a stage named
+/// in `after_stages` is always awaited): leaving one out removes a wait and
+/// adds none, so the no-deadlock argument above is untouched.
 pub fn awaited(specs: &[StageSpec], i: usize) -> impl Iterator<Item = usize> + '_ {
     let me = &specs[i];
     let barrier = specs
@@ -112,14 +140,24 @@ pub fn awaited(specs: &[StageSpec], i: usize) -> impl Iterator<Item = usize> + '
         .skip(i + 1)
         .find(|(_, s)| s.exclusive)
         .map_or(specs.len(), |(k, _)| k);
-    (0..barrier).filter(move |&j| j != i && me.after_lanes.contains(&specs[j].lane))
+    (0..barrier).filter(move |&j| {
+        j != i
+            && ((me.after_lanes.contains(&specs[j].lane) && specs[j].id.awaited())
+                || me.after_stages.contains(&specs[j].id))
+    })
 }
 
 /// What keeps the no-deadlock argument above true. An awaited stage must not be
-/// exclusive (it would wait for everything, the waiter included), must not wait
-/// on lanes itself (two waiters could wait for each other), and the waiter must
-/// not name its own lane or `Pure` (its own lane already orders it, and `Pure`
-/// is the absence of a resource).
+/// exclusive (it would wait for everything, the waiter included), may wait on
+/// lanes or stages only on ones declared before the waiter or ones the waiter
+/// awaits too that wait on nothing (so no two waiters can wait for each
+/// other), and must not be in the waiter's own lane; a stage of its lane
+/// declared between the two must wait on nothing (the awaited stage queues
+/// behind it, so a wait of its own would be a wait of the awaited stage's).
+/// A wait on a stage declared before the waiter counts as none: when the
+/// waiter is the lowest unfinished stage, that stage has finished. And the
+/// waiter must not name its own lane or `Pure` (its own lane already orders
+/// it, and `Pure` is the absence of a resource).
 ///
 /// # Errors
 /// Names the first stage that breaks one of those rules.
@@ -133,15 +171,53 @@ pub fn check_after_lanes(specs: &[StageSpec]) -> Result<(), String> {
         }
         for j in awaited(specs, i) {
             let s = &specs[j];
-            if s.exclusive || !s.after_lanes.is_empty() {
+            if s.lane == me.lane && me.lane != Lane::Pure {
                 return Err(format!(
-                    "{} awaits {}, which is exclusive or waits on lanes itself",
+                    "{} awaits {}, a stage of its own lane",
                     me.title, s.title
+                ));
+            }
+            if s.exclusive {
+                return Err(format!(
+                    "{} awaits {}, which is exclusive",
+                    me.title, s.title
+                ));
+            }
+            // One level of waits, through lanes or stages: what an awaited
+            // stage awaits is declared before its waiter, or its waiter
+            // awaits it too and it waits on nothing declared after the
+            // waiter. (Until 2026-10-05 an awaited stage could not wait on
+            // lanes at all; the trust lane now awaits the test run, which
+            // does. Until 2026-10-06 a stage declared before the waiter
+            // counted as a wait too; the land tier's builds now chain behind
+            // the test compile, `crate::plan::land_builds`.)
+            if let Some(k) = awaited(specs, j).find(|&k| {
+                k >= i && (!awaited(specs, i).any(|a| a == k) || !waits_before(specs, k, i))
+            }) {
+                return Err(format!(
+                    "{} awaits {}, which awaits {}, a stage that waits itself or that {} does not await",
+                    me.title, s.title, specs[k].title, me.title
+                ));
+            }
+            if s.lane != Lane::Pure
+                && let Some(k) =
+                    (i + 1..j).find(|&k| specs[k].lane == s.lane && !waits_before(specs, k, i))
+            {
+                return Err(format!(
+                    "{} awaits {}, which queues behind {}, a stage that waits itself",
+                    me.title, s.title, specs[k].title
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// Does stage `k` wait only on stages declared before stage `i`? Those have
+/// all finished by the time `i` is the lowest unfinished stage, so for the
+/// no-deadlock argument such a `k` waits on nothing.
+fn waits_before(specs: &[StageSpec], k: usize, i: usize) -> bool {
+    awaited(specs, k).all(|m| m < i)
 }
 
 /// Run every stage under the rule above, calling `on_report` in DECLARED order as
@@ -221,6 +297,9 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
 
+    /// A wait for something that must happen is a hang detector, never a latency budget.
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
     fn spec(id: StageId, title: &str, lane: Lane, exclusive: bool) -> StageSpec {
         StageSpec {
             id,
@@ -228,6 +307,7 @@ mod tests {
             lane,
             exclusive,
             after_lanes: Vec::new(),
+            after_stages: Vec::new(),
         }
     }
 
@@ -241,7 +321,10 @@ mod tests {
                 after_lanes: AWAITED_LANES.to_vec(),
                 ..spec(StageId::Test, "test", Lane::MainTarget, false)
             },
-            spec(StageId::Doctests, "doctests", Lane::MainTarget, false),
+            StageSpec {
+                after_stages: vec![StageId::TestCompile],
+                ..spec(StageId::Doctests, "doctests", Lane::Doctests, false)
+            },
             spec(StageId::Tippy, "tippy", Lane::TippyTarget, false),
             spec(StageId::Formatting, "fmt", Lane::XtaskTarget, false),
             spec(StageId::GrepGuards, "grep", Lane::Pure, false),
@@ -292,11 +375,12 @@ mod tests {
     }
 
     /// [`timed_run`] where each stage named in `meet` holds its slot until
-    /// every partner it is paired with there has STARTED, bounded at 10 s —
-    /// a rendezvous, not a window. The stages that must overlap then do on a
-    /// correct scheduler however late their threads are first scheduled; one
-    /// that serialised a pair never starts the second while the first holds
-    /// its slot, so the first times out, ends, and the pair reads disjoint.
+    /// every partner it is paired with there has STARTED, bounded by
+    /// [`HANG_DETECTOR`] — a rendezvous, not a window. The stages that must
+    /// overlap then do on a correct scheduler however late their threads are
+    /// first scheduled; one that serialised a pair never starts the second
+    /// while the first holds its slot, so the first times out, ends, and the
+    /// pair reads disjoint.
     /// A 30 ms sleep asked a freshly spawned thread to start within 30 ms of
     /// its partner, eight pairs over (the load-sensitive test audit of
     /// 2026-09-27).
@@ -317,7 +401,7 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                let deadline = start + Duration::from_secs(10);
+                let deadline = start + HANG_DETECTOR;
                 let mut g = entered.lock().expect("entered");
                 g.push(s.title.clone());
                 arrived.notify_all();
@@ -473,6 +557,29 @@ mod tests {
         }
     }
 
+    /// THE DOCTESTS RUN BESIDE THE TEST RUN, AFTER ITS COMPILE (2026-10-05):
+    /// they await the test compile and nothing else, so they start when it
+    /// ends and overlap the test run instead of queueing behind it; the test
+    /// run itself still waits for the driver lane's rows.
+    #[test]
+    fn the_doctests_run_beside_the_test_run_after_its_compile() {
+        let specs = plan_shape();
+        let times = met_run(&specs, &[("test", "doctests")]);
+        let at = |t: &str| {
+            let i = specs.iter().position(|s| s.title == t).expect("stage");
+            let (_, s, e) = times.iter().find(|(k, _, _)| *k == i).expect("timed");
+            (*s, *e)
+        };
+        assert!(at("compile").1 <= at("doctests").0, "after the compile");
+        assert!(
+            overlaps(at("test"), at("doctests")),
+            "the doctests must run beside the test run"
+        );
+        for driver in ["drivers", "atpkg"] {
+            assert!(at(driver).1 <= at("test").0, "{driver} before the test run");
+        }
+    }
+
     /// The test run never overlaps the driver lane: the stages it awaits finish
     /// before it starts, and the driver stages behind the smokes' barrier start
     /// after it ends.
@@ -558,7 +665,26 @@ mod tests {
                 crate::Scope::crate_only("aterm-grid"),
                 crate::Scope::changed("main", vec![], true),
             ] {
-                shapes.push(crate::plan::plan(&ctx(mode, scope)));
+                // The small host (the release build and the trust lane await
+                // named stages), the unread host (the same waits) and the big
+                // host (nothing waits on stages); and the 8 GiB host with
+                // 3.5 GiB wired, whose land-tier builds chain one behind
+                // another, and with 3 GiB wired, whose tippy awaits the test
+                // compile (`crate::plan::land_builds`).
+                const GIB: u64 = crate::disk::GIB;
+                for (ram, usable) in [
+                    (Some(8 * GIB), None),
+                    (None, None),
+                    (Some(128 * GIB), None),
+                    (Some(8 * GIB), Some(9 * GIB / 2)),
+                    (Some(8 * GIB), Some(5 * GIB)),
+                ] {
+                    shapes.push(crate::plan::plan(
+                        &ctx(mode, scope.clone())
+                            .with_host_memory(ram)
+                            .with_host_usable(usable),
+                    ));
+                }
             }
         }
         for specs in &shapes {
@@ -612,6 +738,13 @@ mod tests {
     /// — OR behind it. And over every interleaving the model reaches, a lane
     /// row starts only once the driver builds have FINISHED, never beside
     /// another stage of its lane, and never beside the test run.
+    ///
+    /// THE ONE EXCEPTION (2026-09-29): a [`crate::plan::NOT_AWAITED`] row, the
+    /// tail driver builds — a compile whose every product only rows behind the
+    /// barrier drive, so a test run beside it relinks nothing under anyone and
+    /// meets no daemon. It must be the lane's LAST row before the barrier (so
+    /// every row the test run does wait for has finished before it starts),
+    /// and it is the only lane row the test run may start or run beside.
     #[test]
     fn every_driver_lane_row_runs_behind_the_driver_builds_and_never_beside_the_test_run() {
         let ctx = |mode, scope| {
@@ -624,6 +757,7 @@ mod tests {
             )
         };
         let mut awaited_rows = 0;
+        let mut unawaited_rows = 0;
         for mode in [crate::Mode::Fast, crate::Mode::Measure, crate::Mode::Full] {
             for scope in [
                 crate::Scope::workspace(),
@@ -653,15 +787,29 @@ mod tests {
                     .position(|s| s.id == StageId::Test)
                     .expect("the test run");
                 assert!(test < barrier, "{what}");
-                for row in (builds + 1..barrier).filter(|&i| specs[i].lane == lane) {
+                let unawaited = |i: usize| !specs[i].id.awaited();
+                let lane_rows: Vec<usize> = (builds + 1..barrier)
+                    .filter(|&i| specs[i].lane == lane)
+                    .collect();
+                for (k, &row) in lane_rows.iter().enumerate() {
                     let title = &specs[row].title;
                     assert!(!specs[row].exclusive, "{what}: {title}");
                     assert!(specs[row].after_lanes.is_empty(), "{what}: {title}");
-                    assert!(
-                        awaited(&specs, test).any(|j| j == row),
-                        "{what}: the test run must wait for {title}"
-                    );
-                    awaited_rows += 1;
+                    if unawaited(row) {
+                        assert_eq!(
+                            k + 1,
+                            lane_rows.len(),
+                            "{what}: {title} is the lane's last row before the barrier"
+                        );
+                        assert!(!awaited(&specs, test).any(|j| j == row), "{what}: {title}");
+                        unawaited_rows += 1;
+                    } else {
+                        assert!(
+                            awaited(&specs, test).any(|j| j == row),
+                            "{what}: the test run must wait for {title}"
+                        );
+                        awaited_rows += 1;
+                    }
                 }
                 for order in 0..3 {
                     let mut seed = 0x9e37_79b9_u32;
@@ -689,12 +837,20 @@ mod tests {
                                     "{what}: {title} started beside a stage of its own lane"
                                 );
                                 assert!(
-                                    !running.contains(&test),
+                                    unawaited(i) || !running.contains(&test),
                                     "{what}: {title} started beside the test run"
                                 );
+                                if unawaited(i) {
+                                    assert!(
+                                        (0..i).all(|j| specs[j].lane != lane || done[j]),
+                                        "{what}: {title} started before a row the test run waits for"
+                                    );
+                                }
                             } else if i == test {
                                 assert!(
-                                    running.iter().all(|&j| specs[j].lane != lane),
+                                    running
+                                        .iter()
+                                        .all(|&j| specs[j].lane != lane || unawaited(j)),
                                     "{what}: the test run started beside a driver-lane row"
                                 );
                             }
@@ -704,8 +860,10 @@ mod tests {
             }
         }
         // Not vacuous: the atpkg pack in every contract run, and the sealed
-        // rung in `--full`'s, sit before the barrier.
+        // rung in `--full`'s, sit before the barrier; so do the tail driver
+        // builds, in every run that plans driver builds.
         assert!(awaited_rows >= 5, "{awaited_rows}");
+        assert!(unawaited_rows >= 10, "{unawaited_rows}");
     }
 
     #[test]
@@ -720,7 +878,9 @@ mod tests {
             spec(StageId::GuiSmoke, "early", Lane::DriverTarget, true),
         );
         assert!(check_after_lanes(&specs).is_err());
-        // …and so would one awaiting a stage that waits on lanes itself.
+        // …and so would one awaiting a stage that waits on lanes itself, here
+        // ones the waiter does not await (the test run awaits the driver
+        // lane, whose first row now waits on the xtask lane).
         let mut specs = plan_shape();
         let drivers = specs
             .iter()
@@ -728,10 +888,67 @@ mod tests {
             .expect("drivers");
         specs[drivers].after_lanes = vec![Lane::XtaskTarget];
         assert!(check_after_lanes(&specs).is_err());
+        // The same wait on the lane's LAST row before the barrier, so nothing
+        // awaited queues behind it: refused while the test run does not await
+        // the xtask rows, accepted once it awaits every one of them, none of
+        // which waits (2026-10-05: the trust lane awaiting the test run).
+        let mut specs = plan_shape();
+        specs[drivers + 1].after_lanes = vec![Lane::XtaskTarget];
+        assert!(check_after_lanes(&specs).is_err());
+        specs[1].after_stages = vec![StageId::Formatting, StageId::Forge];
+        check_after_lanes(&specs).expect("one level, inside the waiter's own");
+        model_check(&specs, |_| 0);
+        model_check(&specs, |r| r.len() - 1);
         // …or one naming its own lane.
         let mut specs = plan_shape();
         specs[1].after_lanes.push(Lane::MainTarget);
         assert!(check_after_lanes(&specs).is_err());
+        // …or one naming a later stage of its own lane: the two wait for
+        // each other (only the own-lane rule sees this — nothing lies between).
+        let mut specs = plan_shape();
+        let atpkg = drivers + 1;
+        assert_eq!(specs[atpkg].lane, specs[drivers].lane);
+        specs[drivers].after_stages = vec![specs[atpkg].id];
+        assert!(check_after_lanes(&specs).is_err());
+        // …or one awaiting a stage that names stages itself (the test run
+        // awaits the driver lane, whose first row now waits on fmt).
+        let mut specs = plan_shape();
+        specs[drivers].after_stages = vec![StageId::Formatting];
+        assert!(check_after_lanes(&specs).is_err());
+        // Accepted once the waiter awaits fmt too, fmt waits on nothing and
+        // no awaited stage queues behind the one that waits (the trust lane
+        // awaiting the release build and its land builds): here atpkg, the
+        // driver lane's last row before the barrier…
+        let mut specs = plan_shape();
+        specs[atpkg].after_stages = vec![StageId::Formatting];
+        assert!(check_after_lanes(&specs).is_err());
+        specs[1].after_stages = vec![StageId::Formatting];
+        check_after_lanes(&specs).expect("one level, inside the waiter's own");
+        model_check(&specs, |_| 0);
+        model_check(&specs, |r| r.len() - 1);
+        // …but not when fmt waits itself.
+        let fmt = specs.iter().position(|s| s.title == "fmt").expect("fmt");
+        specs[fmt].after_stages = vec![StageId::GrepGuards];
+        assert!(check_after_lanes(&specs).is_err());
+        // …or one awaiting a stage that queues behind a waiter it does not
+        // await. Each waits on a stage of the other's lane: 0 on 2, 2 behind
+        // 1 (its lane), 1 on 3, 3 behind 0 (its lane) — a cycle in which no
+        // stage is ever ready.
+        let cycle = vec![
+            StageSpec {
+                after_stages: vec![StageId::Forge],
+                ..spec(StageId::Formatting, "a", Lane::XtaskTarget, false)
+            },
+            StageSpec {
+                after_stages: vec![StageId::LibcOracle],
+                ..spec(StageId::Tippy, "b", Lane::TippyTarget, false)
+            },
+            spec(StageId::Forge, "c", Lane::TippyTarget, false),
+            spec(StageId::LibcOracle, "d", Lane::XtaskTarget, false),
+        ];
+        let none = vec![false; cycle.len()];
+        assert!((0..cycle.len()).all(|i| !ready(&cycle, &none, &none, 0, i)));
+        assert!(check_after_lanes(&cycle).is_err());
     }
 
     #[test]

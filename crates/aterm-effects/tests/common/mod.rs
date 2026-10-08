@@ -1,19 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared support for this crate's release-only perf gates
+//! Shared support for this crate's integration tests. `effects_suite` mounts it
+//! ONCE (its files reach it as `crate::common`); a binary of its own, such as
+//! `rainbow_kitty_v2_frame_cost`, declares `mod common;`. Each uses what it
+//! needs; an item some binary leaves unused carries `#[allow(dead_code)]`.
+//!
+//! **THE BUDGET-SCALE KNOB** of the release-only perf gates
 //! (`tests/cursor_bench.rs` and `tests/rainbow_kitty_v2_frame_cost.rs`): the
-//! ONE budget-scale knob both read, and its pure parse. Each consuming binary
-//! declares `mod common;` (the standard integration-test share: aterm-gpu
-//! and aterm-toml carry a `tests/common/mod.rs`, aterm-render and aterm-spec a
-//! `tests/common/` directory). The parse is pinned in exactly one binary,
-//! `cursor_bench`, which has no counting allocator;
-//! `rainbow_kitty_v2_frame_cost` counts every thread's allocations, so it
-//! keeps its one non-ignored test. `tests/rain_bench.rs` (the matrix-rain
-//! gates) keeps its own bars and does not read this knob.
+//! ONE knob both read, and its pure parse. The parse is pinned in exactly one
+//! binary, `cursor_bench`, which has no counting allocator;
+//! `rainbow_kitty_v2_frame_cost` installs a counting global allocator (tallied
+//! per thread) and does not repeat that pin.
+//!
+//! **THE RIBBON HOST'S PIECES**: the owner's rainbow-kitty config and a grid's
+//! geometry; the frame hold's samples as `app_render.rs` takes them from a
+//! real `Terminal` AFTER the last `process` (the content-scroll seam, the
+//! caret, the repaint blink, the caret row's probe and its neighbours, the
+//! rows the ribbon names), one free function each, so a host keeps its own
+//! order and fields and calls the pieces it samples; the plan-coverage census
+//! of a row; and the `ptyrec.py` recording parse the real-byte replays read.
+//!
+//! **THE REPLAY POOL** ([`par_map`]): a law that sweeps many independent
+//! replays runs them on a pool as wide as the threads the harness allots
+//! this binary, and judges them in order afterwards.
+
+use aterm_core::grid::Cursor;
+use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::rainbow_kitty::TypedClass;
+use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// THE BUDGET-SCALE KNOB
+// ---------------------------------------------------------------------------
 
 /// The knob's name — one name across both gates, so a host's scale is set
 /// once for every absolute wall-clock bound in the two binaries.
+#[allow(dead_code)]
 pub const BUDGET_SCALE_VAR: &str = "RK_FRAME_COST_BUDGET_SCALE";
 
 /// `RK_FRAME_COST_BUDGET_SCALE=x` (a positive float, default `1.0`) multiplies
@@ -29,6 +54,7 @@ pub const BUDGET_SCALE_VAR: &str = "RK_FRAME_COST_BUDGET_SCALE";
 /// and cap laws, not cursor_bench's quad caps and shares, not the
 /// fixture-emits checks: a red there is a finding about the engine, not host
 /// noise.
+#[allow(dead_code)]
 pub fn budget_scale() -> f64 {
     parse_budget_scale(std::env::var(BUDGET_SCALE_VAR).ok().as_deref())
 }
@@ -37,6 +63,7 @@ pub fn budget_scale() -> f64 {
 /// process environment: unset, empty, unparsable, non-finite and non-positive
 /// spellings all mean `1.0` — a typo widens nothing. The floor that keeps a
 /// tiny scale from asserting `p50 ≤ 0 µs` lives in [`scaled_budget_us`].
+#[allow(dead_code)]
 pub fn parse_budget_scale(raw: Option<&str>) -> f64 {
     raw.and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|s| s.is_finite() && *s > 0.0)
@@ -47,6 +74,357 @@ pub fn parse_budget_scale(raw: Option<&str>) -> f64 {
 /// rounded to the microsecond and floored at 1 µs — at `1.0` the reference
 /// number itself, exactly; and no scale, however small (`1e-9` rounds 400 µs
 /// to 0), turns a gate into `p50 ≤ 0 µs`.
+#[allow(dead_code)]
 pub fn scaled_budget_us(reference_us: u64, scale: f64) -> u64 {
     (reference_us as f64 * scale).round().max(1.0) as u64
+}
+
+// ---------------------------------------------------------------------------
+// THE RIBBON HOST: config and geometry
+// ---------------------------------------------------------------------------
+
+/// The owner's config as most takes ran it: rainbow kitty, tall body, dark,
+/// 240 ms, intensity 0.7. A take that ran another spells only what differs:
+/// `GlowConfig { intensity: 1.0, ..rainbow_cfg() }`.
+#[allow(dead_code)]
+pub fn rainbow_cfg() -> GlowConfig {
+    GlowConfig {
+        classic_mono: false,
+        ribbon_tall: true,
+        ribbon_flat: false,
+        enabled: true,
+        dark_theme: true,
+        theme_fg: 0x00C8_D3F5,
+        theme_bg: 0x001A_1B26,
+        style: GlowStyle::RainbowKitty,
+        color: 0x0050_FA7B,
+        accent: 0x007A_A2F7,
+        duration: Duration::from_millis(240),
+        length: 18,
+        intensity: 0.7,
+        audible: true,
+        radius: 0.6,
+        ring: true,
+        beam: false,
+        head_dx: 0.5,
+        pack: None,
+    }
+}
+
+/// A `rows × cols` grid of `cw × ch` px cells filling its window from the
+/// origin.
+#[allow(dead_code)]
+pub fn geom(rows: usize, cols: usize, cw: usize, ch: usize) -> Geom {
+    Geom {
+        cw,
+        ch,
+        rows,
+        cols,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: (cols * cw) as u16,
+        win_h: (rows * ch) as u16,
+        head: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE RIBBON HOST: the frame hold's samples
+// ---------------------------------------------------------------------------
+
+/// The host's content-scroll seam (`sync_cursor_effect_scroll`): the delta
+/// since the state the last frame saw (`seen`) — a translate or band moves
+/// the ribbon with the text and drops the row probe, an unexplained step
+/// curtains — then `seen` is this frame's state.
+#[allow(dead_code)]
+pub fn sync_scroll(
+    term: &Terminal,
+    glow: &mut CursorGlow,
+    seen: &mut Option<ContentScrollState>,
+    now: Instant,
+) {
+    let scroll = term.content_scroll_state();
+    match ContentScrollState::delta_since(*seen, scroll) {
+        ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged => {}
+        ContentScrollDelta::Translate(rows) => {
+            glow.note_scroll(rows);
+            glow.drop_row_probe();
+        }
+        ContentScrollDelta::Bands { first_seq, count } => {
+            for i in 0..u64::from(count) {
+                let m = scroll.band(first_seq + i);
+                glow.note_band_move(m.top, m.bottom, m.delta);
+            }
+            glow.drop_row_probe();
+        }
+        ContentScrollDelta::Invalidate => glow.curtain(now),
+    }
+    *seen = Some(scroll);
+}
+
+/// The caret, and the frame's cursor sample: `(row, col)` while it is
+/// drawn, `None` while hidden.
+#[allow(dead_code)]
+pub fn caret_sample(term: &Terminal) -> (Cursor, Option<(u16, u16)>) {
+    let c = term.cursor();
+    (c, term.cursor_visible().then_some((c.row, c.col)))
+}
+
+/// The repaint blink: the terminal's `repaint_blink_epoch` diffed against
+/// the last one seen — an advance is the hide-inside-DEC-2026 repaint
+/// bracket, noted at `now`. Returns whether it advanced.
+#[allow(dead_code)]
+pub fn note_blink(term: &Terminal, glow: &mut CursorGlow, seen: &mut u64, now: Instant) -> bool {
+    let epoch = term.repaint_blink_epoch();
+    if epoch == *seen {
+        return false;
+    }
+    *seen = epoch;
+    glow.note_repaint_blink(now);
+    true
+}
+
+/// The caret row's probe, read into `buf`: observed as the caret's row, and
+/// as a ribbon row (the caret row rides the probe the host already holds).
+#[allow(dead_code)]
+pub fn observe_caret_row(
+    term: &Terminal,
+    glow: &mut CursorGlow,
+    buf: &mut Vec<char>,
+    c: Cursor,
+    now: Instant,
+) {
+    term.row_cols_into(usize::from(c.row), buf);
+    glow.observe_row(c.row, c.col, buf, now);
+    glow.observe_ribbon_row(c.row, buf);
+}
+
+/// The caret row's neighbours on a `rows`-tall screen, read into `bufs`
+/// (`[above, below]`) and handed over — `None` past the screen's edge.
+#[allow(dead_code)]
+pub fn observe_neighbor_rows(
+    term: &Terminal,
+    glow: &mut CursorGlow,
+    bufs: &mut [Vec<char>; 2],
+    row: u16,
+    rows: usize,
+) {
+    let r = usize::from(row);
+    let [above, below] = bufs;
+    if r > 0 {
+        term.row_cols_into(r - 1, above);
+    }
+    if r + 1 < rows {
+        term.row_cols_into(r + 1, below);
+    }
+    glow.observe_neighbor_rows(
+        (r > 0).then_some(above.as_slice()),
+        (r + 1 < rows).then_some(below.as_slice()),
+    );
+}
+
+/// The ribbon's own rows: every row `CursorGlow::ribbon_rows` names into a
+/// [`WITNESS_ROWS`]-slot list, read into `buf` and observed.
+#[allow(dead_code)]
+pub fn observe_ribbon_rows(term: &Terminal, glow: &mut CursorGlow, buf: &mut Vec<char>) {
+    observe_ribbon_rows_where::<WITNESS_ROWS>(term, glow, buf, |_| true);
+}
+
+/// [`observe_ribbon_rows`] into an `N`-slot list, reading only the rows
+/// `keep` admits (a host that skips the caret row it already sampled, or
+/// drops the far rows).
+#[allow(dead_code)]
+pub fn observe_ribbon_rows_where<const N: usize>(
+    term: &Terminal,
+    glow: &mut CursorGlow,
+    buf: &mut Vec<char>,
+    keep: impl Fn(u16) -> bool,
+) {
+    let mut rows = [0u16; N];
+    let n = glow.ribbon_rows(&mut rows);
+    for &r in rows[..n].iter().filter(|&&r| keep(r)) {
+        term.row_cols_into(usize::from(r), buf);
+        glow.observe_ribbon_row(r, buf);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE RIBBON HOST: the plan's census
+// ---------------------------------------------------------------------------
+
+/// A cell counts as LIT at this planned coverage — the pixel census on glass
+/// calls a cell lit at 20% of the bed.
+#[allow(dead_code)]
+pub const LIT_COV: u8 = 20;
+
+/// Plan coverage per column of `row`.
+#[allow(dead_code)]
+pub fn coverage(glow: &CursorGlow, g: Geom, row: u16) -> Vec<u8> {
+    let mut cov = vec![0u8; g.cols];
+    let rib = glow.v2_ribbon().expect("rainbow kitty owns the frame");
+    for sg in rib.plan_segments() {
+        let r = ((sg.spine / g.ch as f32) - 0.5).floor();
+        let c = (sg.x / g.cw as f32).floor();
+        if r >= 0.0 && c >= 0.0 && r as usize == usize::from(row) && (c as usize) < g.cols {
+            let i = c as usize;
+            cov[i] = cov[i].max(sg.cov);
+        }
+    }
+    cov
+}
+
+/// Interior dark runs of a coverage lane, as `(first col, len)`: the unlit
+/// runs between its first and last [`LIT_COV`] column.
+#[allow(dead_code)]
+pub fn holes_of(cov: &[u8]) -> Vec<(usize, usize)> {
+    let lit: Vec<usize> = (0..cov.len()).filter(|&i| cov[i] >= LIT_COV).collect();
+    let mut holes = Vec::new();
+    if lit.len() < 2 {
+        return holes;
+    }
+    let mut start = None;
+    for (i, &v) in cov
+        .iter()
+        .enumerate()
+        .take(lit[lit.len() - 1] + 1)
+        .skip(lit[0])
+    {
+        if v >= LIT_COV {
+            if let Some(s) = start.take() {
+                holes.push((s, i - s));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    holes
+}
+
+// ---------------------------------------------------------------------------
+// THE RIBBON HOST: keys and recordings
+// ---------------------------------------------------------------------------
+
+/// The host's `typed_class_for` and `glyph_shifted && !spacebar`.
+#[allow(dead_code)]
+pub fn class_of(ch: char) -> (bool, TypedClass) {
+    match ch {
+        ' ' => (false, TypedClass::Space),
+        '!' => (true, TypedClass::Bang),
+        c if c.is_uppercase() => (true, TypedClass::Capital),
+        _ => (false, TypedClass::Glyph),
+    }
+}
+
+/// A printable one-byte key.
+#[allow(dead_code)]
+pub fn is_key(b: &[u8]) -> bool {
+    matches!(b, [c] if (0x20..0x7f).contains(c))
+}
+
+/// An arrow key, plain or with a modifier (`ESC [ … A|B|C|D`).
+#[allow(dead_code)]
+pub fn is_arrow(b: &[u8]) -> bool {
+    b.starts_with(b"\x1b[") && matches!(b.last(), Some(b'A' | b'B' | b'C' | b'D'))
+}
+
+/// One recorded event of a `ptyrec.py` take.
+#[allow(dead_code)]
+pub enum Rec {
+    /// Bytes the program wrote to the terminal.
+    Out(Vec<u8>),
+    /// Bytes the keyboard sent to the program.
+    In(Vec<u8>),
+}
+
+#[allow(dead_code)]
+pub fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// `(ms from the first line, event)` of a take whose lines read `<stamp>
+/// <O|I> <hex>`; `per_ms` stamps make a millisecond (`1_000_000` for
+/// `ptyrec.py`'s nanoseconds, `1_000` for microseconds).
+#[allow(dead_code)]
+pub fn recording(src: &str, per_ms: u64) -> Vec<(u64, Rec)> {
+    let mut t0 = None;
+    src.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut it = l.splitn(3, ' ');
+            let stamp: u64 = it.next().expect("stamp").parse().expect("stamp");
+            let kind = it.next().expect("kind");
+            let bytes = unhex(it.next().expect("bytes"));
+            let t0 = *t0.get_or_insert(stamp);
+            let ms = (stamp - t0) / per_ms;
+            match kind {
+                "O" => (ms, Rec::Out(bytes)),
+                "I" => (ms, Rec::In(bytes)),
+                k => panic!("bad kind {k}"),
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// THE REPLAY POOL
+// ---------------------------------------------------------------------------
+
+/// `f` over every item, on a pool as wide as the threads the harness allots
+/// this binary (`RUST_TEST_THREADS`, as libtest reads it, else the machine's
+/// parallelism), results in `items`' order. Each item is one independent
+/// replay — its own `Terminal`, engine and clock — so where it runs changes
+/// nothing it reads, and the caller judges the results in the order it
+/// always did. A panicking item does not stop the others; once all have
+/// run, the first panic in `items`' order is re-raised with its own
+/// payload, as the serial loop would have raised it.
+///
+/// WHY (2026-09-30, the merge gate's env: `RUST_TEST_THREADS=7`,
+/// `TRAIL_LAWS_FULL=1`): a law that swept its replays one after another was
+/// one thread's wall while the binary's other threads sat idle. Measured
+/// back to back, old and new binaries alternated: `moves_are_followed`
+/// 47.6–50.3 s → 12.3–12.5 s, `zsh_isearch_band` 25.9–26.2 s → 4.9–5.1 s,
+/// `walk_continuity_census` 21.9 s → 3.9–4.8 s,
+/// `busy_status_rows_keep_their_brand` 19.5–19.6 s → 7.4–7.5 s — the same
+/// instructions retired (±0.1 %), so the same work, spread.
+#[allow(dead_code)]
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let threads = std::env::var("RUST_TEST_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .min(items.len());
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<std::thread::Result<R>>>> =
+        items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let out = catch_unwind(AssertUnwindSafe(|| f(item)));
+                    *slots[i].lock().unwrap_or_else(|p| p.into_inner()) = Some(out);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            match slot
+                .into_inner()
+                .unwrap_or_else(|p| p.into_inner())
+                .expect("every item ran")
+            {
+                Ok(r) => r,
+                Err(payload) => resume_unwind(payload),
+            }
+        })
+        .collect()
 }

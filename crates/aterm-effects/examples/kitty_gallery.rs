@@ -1,21 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `kitty_gallery` — cat-art v4 authored-character contact sheets (design §6).
+//! `kitty_gallery`: cat-art v4 authored-character contact sheets (design §6).
 //!
-//! The v2/v3 procedural gallery is retired with the procedural cats. This tool
-//! bakes every roster glyph through the REAL v4 bake path
-//! ([`aterm_effects::cat_baker::bake_variant_with`] — the same fill resolver,
+//! Bakes every roster glyph through the real v4 bake path
+//! ([`aterm_effects::cat_baker::bake_variant_with`], the same fill resolver,
 //! catch-light patch strip and ramps `CatBaker::get_v4` uses) and composites
 //! labelled montages for human / visual-LLM QA against the reference sheets.
-//! Pages (each on a light AND a dark ground, so the dark-bg outline lift is
-//! judged):
+//! Each page is rendered on a light and a dark ground, so the dark-bg outline
+//! lift is judged:
 //!
 //!   * `heads_{light,dark}.png` — all 25 [`HEADS`] at the reference art height.
 //!   * `heads_small_{light,dark}.png` — the same 25 at 16 px and 26 px art
 //!     height side by side (the terminal-legibility check: eyes read small).
 //!   * `specials_accessories_{light,dark}.png` — the 8 authored specials, then
-//!     each of the 3 overlay accessories bare AND seated on a plain head.
+//!     each of the 3 overlay accessories bare and seated on a plain head.
 //!   * `coats_{light,dark}.png` — one recolorable silhouette (S100) swept
 //!     across the 16-stop `COAT_RAMP`, then across the reachable `EYE_RAMP`
 //!     iris stops (the genome recolor space on one glyph).
@@ -23,8 +22,8 @@
 //!     all 12 local-text hue families and the neutral context key.
 //!
 //! Glyph proportions come from the asset viewbox aspect (the const drawlists
-//! are normalized to a unit square; the viewbox carries the true aspect), so a
-//! wide stretch-cat is not squished to a head's box.
+//! are normalized to a unit square), so a wide stretch-cat is not squished to
+//! a head's box.
 //!
 //! ```text
 //! cargo run -q -p aterm-effects --example kitty_gallery -- [out_dir]

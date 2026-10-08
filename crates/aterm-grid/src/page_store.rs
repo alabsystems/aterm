@@ -2,9 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Page-backed allocator with memory pooling.
-//!
-//! See [`PageStore`] for pooling strategy and lazy zeroing optimization.
+//! Page-backed allocator with memory pooling and lazy zeroing; see [`PageStore`].
 
 use std::ptr::NonNull;
 
@@ -31,19 +29,15 @@ pub(crate) struct PoolStats {
 
 /// Page-backed allocator with memory pooling.
 ///
-/// ## Pooling Strategy
+/// ## Pooling
 ///
-/// - Pages that would be deallocated are instead added to a free list
-/// - New allocations first check the free list before allocating
-/// - Grid constructors can pre-allocate pages internally to avoid runtime allocations
-/// - The pool can grow unbounded; use `shrink_to_fit()` to release unused pages
+/// Released pages go to a free list that new allocations check first. The
+/// pool grows unbounded; `shrink_to_fit()` releases unused pages.
 ///
-/// ## Lazy Zeroing Optimization
+/// ## Lazy zeroing
 ///
-/// Pages are only zeroed up to the amount actually used (`next_offset`), not the
-/// full 64KB. This is tracked per-page using `page_used_bytes`. When a page is
-/// recycled, only the used portion is zeroed, reducing write overhead significantly
-/// for typical allocations that don't fill entire pages.
+/// `page_used_bytes` tracks how much of each 64KB page was used, and only that
+/// portion is zeroed when the page is recycled.
 #[derive(Debug, Default)]
 pub struct PageStore {
     /// Cell slices returned by removed rows, before `pages` for drop order.
@@ -81,10 +75,7 @@ impl PageStore {
         Self::default()
     }
 
-    /// Create a page store with pre-allocated pages.
-    ///
-    /// This eliminates allocation latency during normal operation by
-    /// pre-heating the free list with the specified number of pages.
+    /// Create a page store with the free list pre-filled with `pages` pages.
     #[must_use]
     pub(crate) fn with_capacity(page_count: usize) -> Self {
         let mut store = Self::new();
@@ -92,22 +83,8 @@ impl PageStore {
         store
     }
 
-    /// Pre-allocate pages into the free list.
-    ///
-    /// Call this during initialization to avoid allocation during hot paths.
-    /// Each page is 64KB, so `preheat(10)` allocates 640KB.
-    ///
-    /// Crate-internal in production builds. Exposed under `cfg(miri)` so the
-    /// memory-safety integration tests can exercise free-list reuse directly.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use aterm_grid::PageStore;
-    ///
-    /// let mut store = PageStore::new();
-    /// store.preheat(4);
-    /// ```
+    /// Pre-allocate pages into the free list (64KB each). Exposed under
+    /// `cfg(miri)` for the memory-safety tests.
     #[cfg(miri)]
     pub fn preheat(&mut self, page_count: usize) {
         self.preheat_impl(page_count);
@@ -164,9 +141,6 @@ impl PageStore {
     }
 
     /// Release all free pages back to the system.
-    ///
-    /// This reduces memory usage but may cause future allocations to be slower.
-    /// Call after operations that reduce grid size to reclaim freed page memory.
     pub(crate) fn shrink_to_fit(&mut self) {
         self.stats.pages_free = 0;
         self.free_pages.clear();
@@ -174,9 +148,6 @@ impl PageStore {
     }
 
     /// Reset the page store, moving all active pages to the free list.
-    ///
-    /// This is useful when clearing the terminal without deallocating memory.
-    /// All existing `PageSlice` references become invalid after this call.
     ///
     /// # Safety
     ///
@@ -206,19 +177,14 @@ impl PageStore {
         self.next_offset = 0;
     }
 
-    /// Allocate a fresh page from the pool.
-    ///
-    /// Returns a page from the free list if available, otherwise allocates new.
-    /// Uses lazy zeroing: only zeros the portion that was actually used.
+    /// Take a page from the free list (zeroing only its used portion) or
+    /// allocate a new one.
     fn alloc_page(&mut self) -> Box<Page> {
         if let Some((page, used_bytes)) = self.free_pages.pop() {
-            // Reuse from free list - only zero the used portion (lazy zeroing)
-            // This is a significant optimization: instead of writing 64KB,
-            // we only write the portion that was actually used.
+            // Zero only the used portion.
             if used_bytes > 0 {
-                // Zero only the used portion through UnsafeCell
-                // SAFETY: We have exclusive access to the page (it's from the free list)
-                // and no PageSlice references exist to this page's data.
+                // SAFETY: The page came from the free list, so we have exclusive
+                // access and no PageSlice references its data.
                 unsafe {
                     let data = &mut *page.data.get();
                     data[..used_bytes].fill(0);
@@ -250,10 +216,9 @@ impl PageStore {
 
     /// Return a removed row's unique allocation to this arena.
     ///
-    /// The pool is bounded by the arena's allocations, not by viewport height:
-    /// a height grow can reveal history instead of consuming a returned blank
-    /// row. Dropping handles at an arbitrary cap would strand their bump
-    /// allocations and let repeated shrink/reveal/scroll cycles grow forever.
+    /// The pool is bounded by the arena's allocations, not the viewport height:
+    /// dropping handles at a cap would strand their bump allocations and let
+    /// shrink/reveal/scroll cycles grow memory forever.
     ///
     /// # Safety
     ///
@@ -268,10 +233,8 @@ impl PageStore {
         self.recycled_cells.len()
     }
 
-    /// Allocate a typed slice within the page store.
-    ///
-    /// Crate-internal in production builds (#5573). Accessible externally under
-    /// `feature = "testing"` for downstream property tests and Kani scaffolding.
+    /// Allocate a typed slice within the page store. Exposed under
+    /// `feature = "testing"` for downstream property tests and Kani.
     #[cfg(any(test, kani, feature = "testing"))]
     #[allow(clippy::expect_used)]
     pub fn alloc_slice<T>(&mut self, len: u16) -> PageSlice<T> {

@@ -1,57 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A MOVE OVER A FADING BAND LEAVES NO HOLE IN THE LINE** (2026-09-22).
-//! The owner, on the shipped 0.89, rainbow kitty under a Claude Code
-//! composer: *"There is a rainbow trail gap in 0.89. I'm not sure what is
-//! causing it but it seems like some kind of back cursor movement bug."*
-//! The torn read (`torn_read_gaps.rs`) was most of it. These are the two
-//! back-cursor-movement holes the reproducers found beside it, both in the
-//! corridor `Ribbon::wake` lays behind a moving caret, and both opened only
-//! when the band under the move is already on its way out:
+//! A move over a fading band leaves no hole in the line.
 //!
-//! * **HOME / END OVER A FADING BAND** (the takeover arm). A Home inside the
-//!   band's swoosh laid [`WAKE_MAX_CELLS`] of new light at the landing,
-//!   covered the band's still-lit remnant by the origin, and left the
-//!   stretch the drain had already emptied between them dark: 3 to 65 cells
-//!   as the drain advanced, 31 at 1.5 s here. Once the band was gone
-//!   (Home at 2.2 s or 4 s), the End back re-owned the Home's island
-//!   (K4), laid the cap at its own landing, and skipped the 45 columns
-//!   between. Either way the next keys joined the wake cohort and held both
-//!   islands until the swoosh after the last key, about 1.7 s. The cap now
-//!   binds at the corridor's FAR EDGE: light the corridor keeps past it
-//!   moves that edge out, and the drained columns between are laid (v3
-//!   §2.10, K2).
-//! * **A WORD HOP AT THE END OF THE SWOOSH** (the hop arm). ⌥← ×2 (a scrub,
-//!   the band held), a pause, then ⌥→ landing in the last ~20 ms of the
-//!   band's fade: the scrub refused the move (the band was leaving) and the
-//!   hop left every corridor cell with ANY light alone, which was five of
-//!   six cells, all carrying an invisible residue. The retire one frame
-//!   later left them owned by nobody. The result was the owner's picture:
-//!   `IN` lit, `TO ` dark, `MAIN!!!!` held by the hand. Light whose band is
-//!   leaving is now covered by the hop from the level it has, as the jump
-//!   covers it. A visibility floor was measured and REFUTED as the fix: at
-//!   20/255 the same `TO ` hole opened at a pause of 1412–1420 ms instead
-//!   of 1481–1491, because the drain empties neighbouring columns ~3.7 ms
-//!   apart and any floor splits the corridor at some instant.
+//! Two back-cursor-movement cases, both in the corridor `Ribbon::wake` lays
+//! behind a moving caret while the band under the move is on its way out:
 //!
-//! The host seam, exactly as `scrub_gaps.rs` drives it: a real
+//! * Home / End over a fading band (the takeover arm). The cap binds at the
+//!   corridor's far edge: light the corridor keeps past it moves that edge
+//!   out, and the drained columns between are laid (v3 §2.10, K2).
+//! * A word hop at the end of the swoosh (the hop arm). ⌥← ×2 (a scrub),
+//!   a pause, then ⌥→ landing in the last ~20 ms of the band's fade. Light
+//!   whose band is leaving is covered by the hop from the level it has, as
+//!   the jump covers it. A visibility floor does not fix this: the drain
+//!   empties neighbouring columns a few ms apart, so any floor splits the
+//!   corridor at some instant.
+//!
+//! The host seam, as `scrub_gaps.rs` drives it: a real
 //! `aterm_core::terminal::Terminal` driven byte for byte, its rows sampled as
 //! `app_render.rs`'s frame hold samples them, fed to `CursorGlow`, ticked on a
-//! 16 ms frame train. The owner's own line is typed at 12 cps into an
-//! Ink-shaped composer (whole-line redraw inside a DECTCEM bracket, split so
-//! a present lands while the caret is hidden) and into a Claude-Code-shaped
-//! one (the composer bottom-pinned, a spinner row above it repainting every
-//! 100 ms on its own clock and inside every redraw). Every frame censuses the
-//! PLAN over the typed row, `#` at ≥ 20 coverage and `.` dark, and a HOLE is
-//! a dark run strictly between two lit cells of that row. The laws read here
-//! allow none, on any frame from the move to the end of the take.
+//! 16 ms frame train. A line is typed at 12 cps into an Ink-shaped composer
+//! (whole-line redraw inside a DECTCEM bracket, split so a present lands
+//! while the caret is hidden) and into a Claude-Code-shaped one (bottom-pinned,
+//! a spinner row above it repainting every 100 ms). Every frame censuses the
+//! plan over the typed row, `#` at ≥ 20 coverage and `.` dark; a hole is a
+//! dark run strictly between two lit cells of that row. No frame from the
+//! move to the end of the take may carry one.
 
+use crate::common::{
+    LIT_COV, caret_sample, coverage, holes_of, note_blink, observe_caret_row, observe_ribbon_rows,
+    rainbow_cfg,
+};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::ribbon::{Layer, WAKE_MAX_CELLS};
-use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
 const COLS: usize = 140;
@@ -69,12 +52,9 @@ const HOP_MS: u64 = 150;
 const FRAME_MS: u64 = 16;
 /// The split between a redraw's head (caret hidden) and its tail.
 const INK_SPLIT_MS: u64 = 30;
-/// A cell counts as LIT at this planned coverage (`ribscan2.py`'s census).
-const LIT_COV: u8 = 20;
 /// The spinner's cadence in the Claude-shaped composer.
 const SPINNER_MS: u64 = 100;
-/// The window the owner's `TO ` hole opened in: the first ⌥→ this long
-/// after the scrub's last hop lands inside the last ~20 ms of the band's
+/// Pauses that land the first ⌥→ inside the last ~20 ms of the band's
 /// 1.69 s swoosh (grace 0.90 s at 12 cps + 0.15 reach + 0.40 retract + 0.24
 /// fade), the replay frame 30 ms after the head.
 const FADE_END_PAUSES_MS: [u64; 6] = [1481, 1483, 1485, 1487, 1489, 1491];
@@ -127,45 +107,6 @@ enum WordKeys {
     Readline,
 }
 
-fn geom(c: Composer) -> Geom {
-    Geom {
-        cw: CW,
-        ch: CH,
-        rows: c.rows(),
-        cols: COLS,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (COLS * CW) as u16,
-        win_h: (c.rows() * CH) as u16,
-        head: 0,
-    }
-}
-
-/// The owner's config: rainbow kitty, tall body, intensity 0.70, dark.
-fn cfg() -> GlowConfig {
-    GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
-    }
-}
-
 /// One frame's census of the typed row.
 struct RowFrame {
     ms: u64,
@@ -212,8 +153,8 @@ impl Host {
         let mut h = Self {
             term,
             glow,
-            cfg: cfg(),
-            g: geom(composer),
+            cfg: rainbow_cfg(),
+            g: crate::common::geom(composer.rows(), COLS, CW, CH),
             t0: now,
             now,
             last_event: now,
@@ -254,25 +195,11 @@ impl Host {
 
     /// EXACTLY the frame hold, then the tick.
     fn frame(&mut self) {
-        let c = self.term.cursor();
-        let cur = self.term.cursor_visible().then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink_seen {
-            self.blink_seen = epoch;
-            self.glow.note_repaint_blink(self.now);
-        }
-        let alt = self.term.is_alternate_screen();
-        self.glow.note_context(alt);
-        self.term
-            .row_cols_into(usize::from(c.row), &mut self.row_buf);
-        self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            self.glow.observe_ribbon_row(r, &self.row_buf);
-        }
+        let (c, cur) = caret_sample(&self.term);
+        note_blink(&self.term, &mut self.glow, &mut self.blink_seen, self.now);
+        self.glow.note_context(self.term.is_alternate_screen());
+        observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+        observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
         self.record();
@@ -433,34 +360,10 @@ impl Host {
         let row = self.composer.row();
         let c0 = usize::from(self.composer.col0());
         let n = self.text.len().max(LINE.len() + TAIL.len());
-        let mut cov = [0u8; COLS];
-        let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-        for sg in rib.plan_segments() {
-            let r = ((sg.spine / CH as f32) - 0.5).floor();
-            let col = (sg.x / CW as f32).floor();
-            if r < 0.0 || col < 0.0 {
-                continue;
-            }
-            if r as usize == usize::from(row) && (col as usize) < COLS {
-                let c = col as usize;
-                cov[c] = cov[c].max(sg.cov);
-            }
-        }
+        let cov = coverage(&self.glow, self.g, row);
         let lit = |i: usize| cov[c0 + i] >= LIT_COV;
         let map: String = (0..n).map(|i| if lit(i) { '#' } else { '.' }).collect();
-        let mut holes = Vec::new();
-        if let (Some(first), Some(last)) = ((0..n).find(|&i| lit(i)), (0..n).rfind(|&i| lit(i))) {
-            let mut run = None;
-            for i in first..=last {
-                if lit(i) {
-                    if let Some(s) = run.take() {
-                        holes.push((s, i - s));
-                    }
-                } else if run.is_none() {
-                    run = Some(i);
-                }
-            }
-        }
+        let holes = holes_of(&cov[c0..c0 + n]);
         self.frames.push(RowFrame {
             ms: self.ms(),
             label: self.label.clone(),
@@ -519,8 +422,8 @@ impl Host {
     }
 }
 
-/// S6: the owner's line to `…INTO MAIN`, Home (a 108-cell meteor to column
-/// 0) `settle_ms` after the last key, End 300 ms later, then `!!!!`. Returns
+/// Types the line to `…INTO MAIN`, Home (a 108-cell meteor to column 0)
+/// `settle_ms` after the last key, End 300 ms later, then `!!!!`. Returns
 /// the host and the Home's first frame.
 fn home_end(composer: Composer, settle_ms: u64) -> (Host, usize) {
     let mut h = Host::new(composer, WordKeys::Inkish);
@@ -534,9 +437,9 @@ fn home_end(composer: Composer, settle_ms: u64) -> (Host, usize) {
     (h, home)
 }
 
-/// S3: the owner's line, ⌥← ×2 (a scrub), a pause of EXACTLY `pause_ms`,
-/// ⌥→ ×2 (then End if short of the end), then `!!!!`. Returns the host and
-/// the first ⌥→'s first frame.
+/// Types the line, ⌥← ×2 (a scrub), a pause of exactly `pause_ms`, ⌥→ ×2
+/// (then End if short of the end), then `!!!!`. Returns the host and the
+/// first ⌥→'s first frame.
 fn scrub_pause_hop(composer: Composer, words: WordKeys, pause_ms: u64) -> (Host, usize) {
     let mut h = Host::new(composer, words);
     h.type_str(LINE);
@@ -558,87 +461,82 @@ fn scrub_pause_hop(composer: Composer, words: WordKeys, pause_ms: u64) -> (Host,
     (h, hop)
 }
 
-/// The frames a LEAVING band's own head may still be sweeping the row in
-/// after a jump has landed beside the caret — the band's clock, not the
-/// corridor's. Measured at 11 on both composers at a 1.5 s settle; the bar
-/// is 16 (256 ms), well inside the band's own 0.64 s exit, so the claim is
-/// about a departure and not about a number. What those frames may hold is
-/// pinned far more tightly below: one corridor, one departing cell.
+/// Frames a leaving band's own head may still sweep the row after a jump
+/// lands beside the caret (the band's clock, not the corridor's); well
+/// inside the band's 0.64 s exit.
 const BAND_EXIT_FRAMES: usize = 16;
 
-/// **HOME AND END OVER A FADING BAND, THEN TYPING, LEAVE THE LINE WHOLE.**
-/// Home at 0.9 s (the band still in its grace: a scrub, the control), at
-/// 1.5 s (inside the swoosh: RED before, 31 dark cells from col 33, the
-/// drained stretch between the cap and the remnant, on 119 frames), at 2.2 s
-/// and at 4.0 s (the band gone: RED before, the End's 44 dark cells between
-/// the Home's island and its own, on 101 frames). On both composers, no
-/// frame from the Home to the end of the take carries a hole — except, for
-/// [`BAND_EXIT_FRAMES`] frames at the 1.5 s settle, the leaving band's OWN
-/// head.
+/// Home and End over a fading band, then typing, leave the line whole.
+/// Home at 0.9 s (the band in its grace: a scrub, the control), 1.5 s
+/// (inside the swoosh), 2.2 s and 4.0 s (the band gone). On both composers
+/// no frame from the Home to the end of the take carries a hole, except,
+/// for [`BAND_EXIT_FRAMES`] frames at the 1.5 s settle, the leaving band's
+/// own head.
 ///
-/// **A LEAVING BAND'S HEAD IS NOT A HOLE IN THE CORRIDOR** (2026-09-22, the
-/// review round; this take was written on 2026-09-22 to pin the S6 fix and
-/// is re-pinned here). At a 1.5 s settle the band's body has drained under
-/// the glass census bar and only its crisp retract edge still reads as ink,
-/// a single cell sweeping right at ~4 columns a frame. The first cut
-/// bridged the corridor out to that band's INVISIBLE residue, which is the
-/// whole-row paint the review measured and [`WAKE_MAX_CELLS`] forbids
-/// ("a phrase, not a line"). The corridor now stops where the light stops,
-/// so for the 64 ms its old head takes to sweep off the row the census sees
-/// the corridor and that one departing cell as two islands. That is the
-/// band finishing on its own clock, which is the abandoned-band law, not a
-/// hole a key left: it is gone within [`BAND_EXIT_FRAMES`], and from the End
-/// on — the jump back, and every key after it — the line carries no hole at
-/// all, which is what S6 was about.
+/// At a 1.5 s settle the band's body has drained under the census bar and
+/// only its retract edge still reads as ink, one cell sweeping right. The
+/// corridor stops where the light stops ([`WAKE_MAX_CELLS`]: a phrase, not
+/// a line), so while that head sweeps off the row the census sees two
+/// islands. That is the band finishing on its own clock, not a hole a key
+/// left; from the End on the line carries no hole at all.
 #[test]
 fn home_then_end_over_a_fading_band_then_typing_leaves_no_hole_in_the_line() {
-    let mut bad = Vec::new();
+    // Each take replays on its own host and clock: the takes run on the
+    // binary's threads (`par_map`) and their findings are joined in order.
+    let mut takes = Vec::new();
     for composer in [Composer::Ink, Composer::Claude] {
         for settle in [900u64, 1500, 2200, 4000] {
-            let (h, home) = home_end(composer, settle);
-            let jump = h.first_labelled("home").max(home);
-            let late = h.hole_frames_from(jump + BAND_EXIT_FRAMES);
-            if !late.is_empty() {
-                bad.push(format!(
-                    "{composer:?} settle={settle}: {} frame(s) with a hole more than \
-                     {BAND_EXIT_FRAMES} frames after the Home\n{}",
-                    late.len(),
-                    h.holes_from(jump + BAND_EXIT_FRAMES)
-                        .iter()
-                        .take(6)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ));
-            }
-            // What the early frames may carry is ONE leaving cell beyond the
-            // corridor, never a gap the corridor itself left: every hole in
-            // them has the corridor whole to its left.
-            for i in h.hole_frames_from(jump) {
-                let f = &h.frames[i];
-                let lit = f.map.chars().filter(|&c| c == '#').count();
-                let head = f.map.find('#').unwrap_or(0);
-                let run = f.map[head..].chars().take_while(|&c| c == '#').count();
-                if lit != run + 1 {
-                    bad.push(format!(
-                        "{composer:?} settle={settle}: frame {i} is not one corridor plus \
-                         one departing cell\n{}",
-                        h.holes_from(i).first().cloned().unwrap_or_default()
-                    ));
-                    break;
-                }
-            }
+            takes.push((composer, settle));
         }
     }
+    let bad: Vec<String> = crate::common::par_map(&takes, |&(composer, settle)| {
+        let mut bad = Vec::new();
+        let (h, home) = home_end(composer, settle);
+        let jump = h.first_labelled("home").max(home);
+        let late = h.hole_frames_from(jump + BAND_EXIT_FRAMES);
+        if !late.is_empty() {
+            bad.push(format!(
+                "{composer:?} settle={settle}: {} frame(s) with a hole more than \
+                 {BAND_EXIT_FRAMES} frames after the Home\n{}",
+                late.len(),
+                h.holes_from(jump + BAND_EXIT_FRAMES)
+                    .iter()
+                    .take(6)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        // The early frames may carry one leaving cell beyond the
+        // corridor, never a gap in the corridor: every hole has the
+        // corridor whole to its left.
+        for i in h.hole_frames_from(jump) {
+            let f = &h.frames[i];
+            let lit = f.map.chars().filter(|&c| c == '#').count();
+            let head = f.map.find('#').unwrap_or(0);
+            let run = f.map[head..].chars().take_while(|&c| c == '#').count();
+            if lit != run + 1 {
+                bad.push(format!(
+                    "{composer:?} settle={settle}: frame {i} is not one corridor plus \
+                     one departing cell\n{}",
+                    h.holes_from(i).first().cloned().unwrap_or_default()
+                ));
+                break;
+            }
+        }
+        bad
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     assert!(bad.is_empty(), "{}", bad.join("\n\n"));
 }
 
-/// **THE CAP BINDS AT THE FAR EDGE, AND ONLY THERE.** The End back over
-/// dark ground, 300 ms after a Home the band had already left, lays every
-/// column from its landing to the Home's island it re-owns: the whole
-/// 108-cell line, one interval, where it laid two islands of
-/// [`WAKE_MAX_CELLS`] with 45 columns unlaid between them before. And the
-/// Home itself, with nothing lit past the cap, still lays exactly the cap.
+/// The cap binds at the far edge, and only there. The End back over dark
+/// ground, 300 ms after a Home the band already left, lays every column
+/// from its landing to the Home's island it re-owns: the whole 108-cell
+/// line, one interval. The Home itself, with nothing lit past the cap,
+/// lays exactly the cap.
 #[test]
 fn the_end_back_over_dark_ground_lays_one_corridor_out_to_the_island_it_re_owns() {
     for composer in [Composer::Ink, Composer::Claude] {
@@ -664,60 +562,63 @@ fn the_end_back_over_dark_ground_lays_one_corridor_out_to_the_island_it_re_owns(
     }
 }
 
-/// **THE OWNER'S `TO ` HOLE: A WORD HOP AT THE END OF THE SWOOSH.** ⌥← ×2,
-/// then the first ⌥→ landing in the last ~20 ms of the band's fade (pause
-/// 1481–1491 ms), a second ⌥→, `!!!!`. RED before at every pause in the
-/// window: `IN` lit, `TO `/`O `/` ` dark, `MAIN!!!!` lit and held by the
-/// hand. Now the first hop's corridor carries an `Over` cell at every column
-/// of its span on its own replay frame, and no frame from the hop to the end
-/// of the take carries a hole: both composers, both word-key semantics.
+/// A word hop at the end of the swoosh: ⌥← ×2, then the first ⌥→ landing
+/// in the last ~20 ms of the band's fade, a second ⌥→, `!!!!`. The first
+/// hop's corridor carries an `Over` cell at every column of its span on
+/// its replay frame, and no frame from the hop to the end of the take
+/// carries a hole: both composers, both word-key semantics.
 #[test]
 fn a_word_hop_landing_in_the_last_twenty_ms_of_the_swoosh_lays_its_corridor_whole() {
-    let mut bad = Vec::new();
+    // Each take replays on its own host and clock: the takes run on the
+    // binary's threads (`par_map`) and their findings are joined in order.
+    let mut takes = Vec::new();
     for composer in [Composer::Ink, Composer::Claude] {
         for words in [WordKeys::Inkish, WordKeys::Readline] {
             for pause in FADE_END_PAUSES_MS {
-                let (h, hop) = scrub_pause_hop(composer, words, pause);
-                let first = h
-                    .moves
-                    .iter()
-                    .find(|m| m.1 < m.2)
-                    .expect("the first opt-right was traced");
-                if !first.3.is_empty() {
-                    bad.push(format!(
-                        "{composer:?} {words:?} pause={pause}: the hop {}->{} left corridor \
-                         columns {:?} with no Over cell on its replay frame {}",
-                        first.1, first.2, first.3, first.0
-                    ));
-                }
-                let holes = h.holes_from(hop);
-                if !holes.is_empty() {
-                    bad.push(format!(
-                        "{composer:?} {words:?} pause={pause}: {} frame(s) with a hole after the hop\n{}",
-                        holes.len(),
-                        holes.iter().take(4).cloned().collect::<Vec<_>>().join("\n")
-                    ));
-                }
+                takes.push((composer, words, pause));
             }
         }
     }
+    let bad: Vec<String> = crate::common::par_map(&takes, |&(composer, words, pause)| {
+        let mut bad = Vec::new();
+        let (h, hop) = scrub_pause_hop(composer, words, pause);
+        let first = h
+            .moves
+            .iter()
+            .find(|m| m.1 < m.2)
+            .expect("the first opt-right was traced");
+        if !first.3.is_empty() {
+            bad.push(format!(
+                "{composer:?} {words:?} pause={pause}: the hop {}->{} left corridor \
+                 columns {:?} with no Over cell on its replay frame {}",
+                first.1, first.2, first.3, first.0
+            ));
+        }
+        let holes = h.holes_from(hop);
+        if !holes.is_empty() {
+            bad.push(format!(
+                "{composer:?} {words:?} pause={pause}: {} frame(s) with a hole after the hop\n{}",
+                holes.len(),
+                holes.iter().take(4).cloned().collect::<Vec<_>>().join("\n")
+            ));
+        }
+        bad
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     assert!(bad.is_empty(), "{}", bad.join("\n\n"));
 }
 
-/// **THE SAME HOP OVER A BAND STILL RETRACTING.** The first ⌥→ at a pause
-/// of 1.0–1.2 s lands while the band's drain has not reached the corridor.
-/// Before, the hop laid nothing over it, and the second hop lit only its
-/// landing past the band's end: an isolated cell 2–6 columns right of the
-/// draining band for four frames. Now the hop covers the leaving band from
-/// its level, and no column of its span is left to the band's clock.
+/// The same hop over a band still retracting: the first ⌥→ at a pause of
+/// 1.0–1.2 s lands before the band's drain reaches the corridor. The hop
+/// covers the leaving band from its level, and no column of its span is
+/// left to the band's clock.
 ///
-/// What remains is the hop's own FLIGHT and is not held by anything: the
-/// second hop's cells are born 15 ms apart along its 60 ms flight (K3),
-/// the band's retract has already drawn its lit end in to col 106, and
-/// until col 107's corridor cell is born, the landing cell's left boundary
-/// vertex reads 107's full coverage. That is one dark column for two frames,
-/// measured. So the bar here is the reproducers' own: no hole outlives three
-/// frames.
+/// The second hop's cells are born 15 ms apart along its 60 ms flight (K3),
+/// so a landing cell's left vertex can read the next column's coverage
+/// before that column's corridor cell is born: one dark column for up to
+/// two frames. The bar is that no hole outlives three frames.
 #[test]
 fn a_word_hop_over_a_retracting_band_leaves_nothing_to_the_band_s_clock() {
     let mut bad = Vec::new();
@@ -745,10 +646,10 @@ fn a_word_hop_over_a_retracting_band_leaves_nothing_to_the_band_s_clock() {
     assert!(bad.is_empty(), "{}", bad.join("\n\n"));
 }
 
-/// **THE CONTROL: A HOP BESIDE A LIVE BAND LAYS NOTHING OVER IT.** The same
-/// scrub with a 300 ms pause: the band is in its grace, the ⌥→ is a scrub
-/// over it (nothing laid, no `Over` cell on the band), and the line stays
-/// whole. The hop's cover reaches only light that is leaving.
+/// The control: a hop beside a live band lays nothing over it. With a
+/// 300 ms pause the band is in its grace, the ⌥→ is a scrub over it (no
+/// `Over` cell on the band), and the line stays whole. The hop's cover
+/// reaches only light that is leaving.
 #[test]
 fn a_word_hop_over_a_live_band_is_a_scrub_and_lays_nothing() {
     for composer in [Composer::Ink, Composer::Claude] {

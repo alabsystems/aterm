@@ -3,9 +3,6 @@
 // Author: Andrew Yates
 
 //! Tests and test-only helpers for the grid style module.
-//!
-//! Test helpers extracted from style.rs (#2487).
-//! Tests extracted from style.rs (#1977).
 
 use super::*;
 use crate::PackedColors;
@@ -299,11 +296,8 @@ fn intern_extended_style() {
 
 #[test]
 fn all_style_attrs_roundtrip() {
-    // Non-underline attrs + a single underline style (UNDERLINE).
-    // Underline styles are mutually exclusive in CellFlags: DOTTED_UNDERLINE
-    // and DASHED_UNDERLINE are compound bit patterns (UNDERLINE|CURLY and
-    // DOUBLE|CURLY respectively), so combining all underline variants creates
-    // false matches. Test each underline variant independently below.
+    // Non-underline attrs plus UNDERLINE only: dotted and dashed are compound
+    // bit patterns, so each underline variant is tested separately below.
     let base_attrs = StyleAttrs::BOLD
         | StyleAttrs::DIM
         | StyleAttrs::ITALIC
@@ -375,13 +369,7 @@ fn superscript_and_subscript_roundtrip_between_cell_flags_and_style_attrs() {
     }
 }
 
-/// Verify StyleTable intern is O(1) with respect to table size.
-///
-/// The hash-based lookup should have constant time regardless of how many
-/// styles are already in the table. This verifies the claim at style.rs:681
-/// "lookup: FxHashMap for O(1) intern lookups".
-///
-/// Addresses claim verification in #1646.
+/// StyleTable intern cost is independent of table size (hash lookup).
 #[test]
 fn style_intern_constant_time() {
     fn measure_intern_ops(num_existing: usize, num_lookups: usize) -> usize {
@@ -443,10 +431,8 @@ fn style_intern_constant_time() {
     );
 }
 
-/// Verify StyleTable cap behavior at u16::MAX (#4548).
-///
-/// When the table reaches u16::MAX entries and no styles are reclaimable,
-/// `insert_new_style` returns `StyleId::DEFAULT`.
+/// At u16::MAX entries with nothing reclaimable, `insert_new_style` returns
+/// `StyleId::DEFAULT`.
 #[test]
 fn style_table_cap_at_u16_max() {
     let mut table = StyleTable::new();
@@ -484,13 +470,8 @@ fn style_table_cap_at_u16_max() {
     );
 }
 
-/// At saturation with dead styles, new inserts degrade to DEFAULT (#7446).
-///
-/// Previously, `insert_new_style` called `compact()` at saturation to reclaim
-/// dead style slots. However, `compact()` remaps style IDs and the remap was
-/// discarded — existing grid cells would reference old IDs now pointing to
-/// wrong styles. The fix disables compaction during insert; new styles degrade
-/// to DEFAULT while existing cell styles remain correct.
+/// At saturation with dead styles, new inserts degrade to DEFAULT: compaction
+/// during insert would remap IDs that grid cells still reference.
 #[test]
 fn style_table_saturation_with_dead_styles_degrades_to_default() {
     let mut table = StyleTable::new();
@@ -528,7 +509,7 @@ fn style_table_saturation_with_dead_styles_degrades_to_default() {
         "at saturation, new styles must degrade to DEFAULT even with dead slots (#7446)"
     );
 
-    // Table must NOT have been compacted — length unchanged.
+    // Table must not have been compacted — length unchanged.
     assert_eq!(
         table.len(),
         u16::MAX as usize,
@@ -536,11 +517,8 @@ fn style_table_saturation_with_dead_styles_degrades_to_default() {
     );
 }
 
-/// Existing style IDs remain valid after saturation fallback (#7446).
-///
-/// When the table is full and a new insert degrades to DEFAULT, all previously
-/// allocated style IDs must still resolve to their original styles. This is
-/// the core invariant that the compaction removal protects.
+/// After a saturation fallback, every previously allocated ID still resolves
+/// to its original style.
 #[test]
 fn style_table_saturation_preserves_existing_styles() {
     let mut table = StyleTable::new();

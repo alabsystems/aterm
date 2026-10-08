@@ -16,22 +16,23 @@
 //! [`Guard`] is therefore re-checked at every read and every write, which are
 //! the points at which terminal context could actually leave this process or a
 //! response could be admitted. The check is two atomic loads, so revocation on
-//! the UI thread stays wait-free. This is the same linearization point the
-//! retired client's `Transport` wrapper used, now expressed directly in the
-//! write loop instead of through a foreign trait.
+//! the UI thread stays wait-free.
 //!
 //! # Deadlines
 //!
-//! One deadline covers the whole request, matching the previous client's
-//! `timeout_global`. It is converted to a per-syscall socket timeout before
-//! each operation, so a peer that trickles bytes cannot extend the total.
+//! One deadline covers the whole request. It is converted to a per-syscall
+//! socket timeout before EVERY socket call, so a peer that trickles bytes cannot extend the total.
 //!
-//! "Each operation" includes the ones this module does not issue itself. The
-//! TLS handshake is driven by `rustls::ClientConnection::complete_io`, which
-//! LOOPS over `read_tls` internally and does not return between records; a
-//! timeout applied once before calling it would bound a single read while a
-//! dribbling peer reset the clock forever. [`HandshakeIo`] is what keeps the
-//! sentence above true there — see its own note.
+//! "Every socket call" includes the ones this module does not issue itself.
+//! rustls drives the socket in loops: the handshake's `complete_io` stays in
+//! `read_tls` until a flight is whole, and an established stream's `read`
+//! loops `complete_io` until a whole RECORD has arrived (16 KiB, which a peer
+//! can send a byte at a time). A timeout applied once before either loop bounds
+//! one of its reads while every dribbled byte restarts the clock, and the guard
+//! is never asked again until the loop ends. So the socket rustls holds is
+//! [`Bounded`], which re-checks the guard and re-derives the remaining budget
+//! before each call it makes — for the stream's whole life, not only its
+//! handshake.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -142,47 +143,55 @@ impl Connect for TcpConnector {
     }
 }
 
-/// The socket as `rustls`'s handshake driver sees it: the global deadline and
-/// the authority guard are re-checked before EVERY syscall it makes.
+/// A socket carrying the request's deadline and authority, re-checked before
+/// EVERY call made on it.
 ///
-/// `ClientConnection::complete_io` is a loop, not a step. While the connection
-/// is handshaking it stays inside `read_tls` until the flight it wants is whole
-/// (rustls 0.23 `ConnectionCommon::complete_io`), so a timeout set once before
-/// the call bounds each syscall to the budget that existed when the call began,
-/// and every dribbled byte restarts that clock — and control never comes back
-/// out for a guard re-check either. Pushing both checks down to the syscall is
-/// what actually makes the module's promise ("one deadline covers the whole
-/// request ... a peer that trickles bytes cannot extend the total") true across
-/// the handshake, which is the one stretch that runs before any body byte moves.
-struct HandshakeIo<'a> {
-    sock: &'a mut TcpStream,
-    guard: &'a Arc<dyn Guard>,
+/// Both arms of [`Stream`] own their socket through this, and for TLS it is
+/// the socket `rustls` itself reads and writes: `complete_io` and an
+/// established stream's `read` are loops, not steps, so a check made once
+/// before handing control to rustls bounds one of the many socket calls rustls
+/// then makes (see the module docs). Here the check sits in front of each of
+/// them, so the global deadline and a revocation hold inside those loops as
+/// they do between them.
+struct Bounded {
+    sock: TcpStream,
+    guard: Arc<dyn Guard>,
     deadline: Deadline,
 }
 
-impl HandshakeIo<'_> {
-    /// Re-check authority, then push the REMAINING budget down as this
-    /// syscall's timeout. Monotone by construction: the budget only shrinks, so
-    /// the handshake cannot outlive the deadline by more than one read.
-    fn admit(&mut self) -> io::Result<()> {
+impl Bounded {
+    /// The request may still proceed: authority holds and budget remains.
+    fn admit(&self) -> io::Result<Duration> {
         if !self.guard.is_authorized() {
             return Err(revoked_error());
         }
-        let budget = self.deadline.remaining_or_timeout()?;
-        self.sock.set_read_timeout(Some(budget))?;
-        self.sock.set_write_timeout(Some(budget))?;
-        Ok(())
+        self.deadline.remaining_or_timeout()
+    }
+
+    /// [`Self::admit`], then the REMAINING budget as the timeout of the one
+    /// socket direction the coming call uses. Monotone by construction: the
+    /// budget only shrinks, so no call can outlive the deadline by more than
+    /// itself.
+    fn admit_read(&self) -> io::Result<()> {
+        let budget = self.admit()?;
+        self.sock.set_read_timeout(Some(budget))
+    }
+
+    /// As [`Self::admit_read`], for a write.
+    fn admit_write(&self) -> io::Result<()> {
+        let budget = self.admit()?;
+        self.sock.set_write_timeout(Some(budget))
     }
 }
 
 /// Normalise a socket-timeout error into the deadline error.
 ///
 /// A blocking socket that hits `SO_RCVTIMEO` reports `WouldBlock` on Unix and
-/// `TimedOut` on Windows. The only timeout this socket ever carries during the
-/// handshake IS the remaining global budget, so either kind means the same
-/// thing and callers should not have to know the platform to see it. (It also
-/// matters inside `complete_io`, which treats `WouldBlock` as "come back later"
-/// rather than as a failure.)
+/// `TimedOut` on Windows. The only timeout this socket ever carries IS the
+/// remaining global budget, so either kind means the same thing and callers
+/// should not have to know the platform to see it. (It also matters inside
+/// `complete_io`, which treats `WouldBlock` as "come back later" rather than as
+/// a failure.)
 fn as_deadline_timeout(error: io::Error) -> io::Error {
     match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
@@ -192,21 +201,21 @@ fn as_deadline_timeout(error: io::Error) -> io::Error {
     }
 }
 
-impl Read for HandshakeIo<'_> {
+impl Read for Bounded {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.admit()?;
+        self.admit_read()?;
         self.sock.read(buf).map_err(as_deadline_timeout)
     }
 }
 
-impl Write for HandshakeIo<'_> {
+impl Write for Bounded {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.admit()?;
+        self.admit_write()?;
         self.sock.write(buf).map_err(as_deadline_timeout)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.admit()?;
+        self.admit_write()?;
         self.sock.flush().map_err(as_deadline_timeout)
     }
 }
@@ -214,29 +223,11 @@ impl Write for HandshakeIo<'_> {
 /// A TCP stream, optionally under TLS, carrying the deadline and the guard.
 pub struct Stream {
     inner: Inner,
-    guard: Arc<dyn Guard>,
-    deadline: Deadline,
 }
 
 enum Inner {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IoDirection {
-    Read,
-    Write,
-}
-
-fn timeout_directions(is_tls: bool, operation: IoDirection) -> (bool, bool) {
-    // A rustls read may need to write protocol records and a write may first
-    // need to read them, so TLS keeps both socket directions bounded. Plain TCP
-    // has no such cross-direction I/O and should pay only the relevant syscall.
-    (
-        is_tls || operation == IoDirection::Read,
-        is_tls || operation == IoDirection::Write,
-    )
+    Plain(Bounded),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, Bounded>>),
 }
 
 impl Stream {
@@ -244,9 +235,11 @@ impl Stream {
     #[must_use]
     pub fn plain(tcp: TcpStream, guard: Arc<dyn Guard>, deadline: Deadline) -> Self {
         Self {
-            inner: Inner::Plain(tcp),
-            guard,
-            deadline,
+            inner: Inner::Plain(Bounded {
+                sock: tcp,
+                guard,
+                deadline,
+            }),
         }
     }
 
@@ -271,60 +264,44 @@ impl Stream {
             .to_owned();
         let connection = rustls::ClientConnection::new(config, name)
             .map_err(|error| io::Error::other(format!("TLS setup failed: {error}")))?;
-        let mut stream = Self {
-            inner: Inner::Tls(Box::new(rustls::StreamOwned::new(connection, tcp))),
-            guard,
-            deadline,
-        };
-        // Drive the handshake now so a certificate failure surfaces here rather
-        // than as a confusing short write later.
-        //
-        // The socket goes in wrapped in `HandshakeIo`, NOT bare. Re-deriving the
-        // budget once per `complete_io` call (what this loop did before) still
-        // bounded nothing against a dribbling peer: while handshaking,
-        // `complete_io` loops on `read_tls` until the flight it is waiting for
-        // is whole, so every one of those reads carried the budget that existed
-        // when the call began, each dribbled byte restarted it, and control never
-        // came back to this loop to re-derive it. The wrapper re-derives the
-        // REMAINING budget and re-checks authority before every syscall, so the
-        // global deadline covers the handshake like it covers everything else,
-        // and revocation is seen DURING it rather than after.
-        let Self {
-            inner,
-            guard,
-            deadline,
-        } = &mut stream;
-        if let Inner::Tls(tls) = inner {
-            let rustls::StreamOwned { conn, sock } = &mut **tls;
-            let mut io = HandshakeIo {
-                sock,
+        let mut tls = Box::new(rustls::StreamOwned::new(
+            connection,
+            Bounded {
+                sock: tcp,
                 guard,
-                deadline: *deadline,
-            };
-            while conn.is_handshaking() {
-                let (read, wrote) = conn.complete_io(&mut io).map_err(|error| {
-                    // A revoked guard and a spent deadline both surface from
-                    // inside `complete_io` as plain io errors. Keep their kinds
-                    // — callers match on `PermissionDenied` to tell revocation
-                    // from a network fault — and wrap only real TLS failures.
-                    match error.kind() {
-                        io::ErrorKind::PermissionDenied | io::ErrorKind::TimedOut => error,
-                        _ => io::Error::other(format!("TLS handshake failed: {error}")),
-                    }
-                })?;
-                // NEITHER direction moving while still handshaking means the
-                // peer went away; surface it rather than spin on a dead socket.
-                // Testing only the write side would loop forever against a peer
-                // that accepts our flight and then stops talking.
-                if read == 0 && wrote == 0 && conn.is_handshaking() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "peer closed during TLS handshake",
-                    ));
+                deadline,
+            },
+        ));
+        // Drive the handshake now so a certificate failure surfaces here rather
+        // than as a confusing short write later. The socket rustls drives is
+        // `Bounded`, so the deadline and the guard hold for every syscall the
+        // handshake makes, however many `complete_io` loops over.
+        let rustls::StreamOwned { conn, sock } = &mut *tls;
+        while conn.is_handshaking() {
+            let (read, wrote) = conn.complete_io(sock).map_err(|error| {
+                // A revoked guard and a spent deadline both surface from
+                // inside `complete_io` as plain io errors. Keep their kinds
+                // — callers match on `PermissionDenied` to tell revocation
+                // from a network fault — and wrap only real TLS failures.
+                match error.kind() {
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::TimedOut => error,
+                    _ => io::Error::other(format!("TLS handshake failed: {error}")),
                 }
+            })?;
+            // NEITHER direction moving while still handshaking means the
+            // peer went away; surface it rather than spin on a dead socket.
+            // Testing only the write side would loop forever against a peer
+            // that accepts our flight and then stops talking.
+            if read == 0 && wrote == 0 && conn.is_handshaking() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer closed during TLS handshake",
+                ));
             }
         }
-        Ok(stream)
+        Ok(Self {
+            inner: Inner::Tls(tls),
+        })
     }
 
     /// Take the raw socket back out of a PLAINTEXT stream.
@@ -335,43 +312,29 @@ impl Stream {
     #[must_use]
     pub fn into_tcp(self) -> Option<TcpStream> {
         match self.inner {
-            Inner::Plain(tcp) => Some(tcp),
+            Inner::Plain(bounded) => Some(bounded.sock),
             Inner::Tls(_) => None,
         }
     }
 
-    /// Push the remaining deadline down only to socket directions this
-    /// operation can use. TLS may perform cross-direction I/O, unlike plain TCP.
-    fn apply_timeouts(&mut self, operation: IoDirection) -> io::Result<()> {
-        let budget = self.deadline.remaining_or_timeout()?;
-        let (tcp, is_tls) = match &self.inner {
-            Inner::Plain(tcp) => (tcp, false),
-            Inner::Tls(tls) => (&tls.sock, true),
-        };
-        let (set_read, set_write) = timeout_directions(is_tls, operation);
-        if set_read {
-            tcp.set_read_timeout(Some(budget))?;
+    /// The socket, whichever arm holds it.
+    fn socket(&self) -> &Bounded {
+        match &self.inner {
+            Inner::Plain(bounded) => bounded,
+            Inner::Tls(tls) => &tls.sock,
         }
-        if set_write {
-            tcp.set_write_timeout(Some(budget))?;
-        }
-        Ok(())
-    }
-
-    /// Guard + deadline check performed before every read and write.
-    fn admit(&mut self, operation: IoDirection) -> io::Result<()> {
-        if !self.guard.is_authorized() {
-            return Err(revoked_error());
-        }
-        self.apply_timeouts(operation)
     }
 }
 
+// The guard and the deadline are checked HERE as well as in front of every
+// socket call: rustls can answer a read from plaintext it already holds, and
+// accept a write into its buffer, without touching the socket at all, and a
+// revoked or expired request must do neither.
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.admit(IoDirection::Read)?;
+        self.socket().admit()?;
         match &mut self.inner {
-            Inner::Plain(tcp) => tcp.read(buf),
+            Inner::Plain(bounded) => bounded.read(buf),
             Inner::Tls(tls) => tls.read(buf),
         }
     }
@@ -380,18 +343,19 @@ impl Read for Stream {
 impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // THE linearization point: terminal context does not leave this process
-        // unless authority still holds right here.
-        self.admit(IoDirection::Write)?;
+        // unless authority still holds right here (and, under TLS, again before
+        // each socket write that carries it).
+        self.socket().admit()?;
         match &mut self.inner {
-            Inner::Plain(tcp) => tcp.write(buf),
+            Inner::Plain(bounded) => bounded.write(buf),
             Inner::Tls(tls) => tls.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.admit(IoDirection::Write)?;
+        self.socket().admit()?;
         match &mut self.inner {
-            Inner::Plain(tcp) => tcp.flush(),
+            Inner::Plain(bounded) => bounded.flush(),
             Inner::Tls(tls) => tls.flush(),
         }
     }
@@ -401,6 +365,9 @@ impl Write for Stream {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A wait for something that must happen is a hang detector, never a latency budget.
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
     #[derive(Debug)]
     struct Revocable(AtomicBool);
@@ -419,21 +386,13 @@ mod tests {
     }
 
     #[test]
-    fn timeout_direction_classification_keeps_tls_bidirectional() {
-        assert_eq!(timeout_directions(false, IoDirection::Read), (true, false));
-        assert_eq!(timeout_directions(false, IoDirection::Write), (false, true));
-        assert_eq!(timeout_directions(true, IoDirection::Read), (true, true));
-        assert_eq!(timeout_directions(true, IoDirection::Write), (true, true));
-    }
-
-    #[test]
     fn plaintext_io_sets_only_its_socket_timeout_direction() {
         let (read_client, mut read_server) = connected_pair();
         read_server.write_all(b"r").unwrap();
         let mut read_stream = Stream::plain(
             read_client,
             Arc::new(AlwaysAuthorized),
-            Deadline::after(Duration::from_secs(5)),
+            Deadline::after(HANG_DETECTOR),
         );
         let mut byte = [0_u8; 1];
         read_stream.read_exact(&mut byte).unwrap();
@@ -445,7 +404,7 @@ mod tests {
         let mut write_stream = Stream::plain(
             write_client,
             Arc::new(AlwaysAuthorized),
-            Deadline::after(Duration::from_secs(5)),
+            Deadline::after(HANG_DETECTOR),
         );
         write_stream.write_all(b"w").unwrap();
         write_stream.flush().unwrap();
@@ -468,7 +427,7 @@ mod tests {
         let mut stream = Stream::plain(
             client,
             Arc::clone(&guard) as Arc<dyn Guard>,
-            Deadline::after(Duration::from_secs(5)),
+            Deadline::after(HANG_DETECTOR),
         );
         assert!(stream.write(b"hello").is_ok());
 

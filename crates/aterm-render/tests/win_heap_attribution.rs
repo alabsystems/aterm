@@ -110,14 +110,10 @@ const MAX_SEAL_TRANSIENT_KB: i64 = 4 * 1024;
 ///    is the defect this gate was written with: `FallbackFace::from_path_bytes`
 ///    took a slice and copied it, so all nine Windows chain files were resident
 ///    twice while `build_fallback_chain`'s scoped workers ran.
-///
-/// Gated: no system font -> the test no-ops.
 #[test]
 fn the_font_seal_reads_each_file_once_and_keeps_one_copy() {
-    let Some(mut r) = Renderer::from_system(14.0, Theme::default()) else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = Renderer::from_system(14.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let ((), live_kb, peak_kb) = heapprof::measure(|| {
         r.seal_admitted_font_sources();
     });
@@ -161,12 +157,10 @@ fn full_font_stack_heap() {
     heapprof::mark("process start");
     heapprof::start();
 
-    let Some(mut r) = heapprof::bill("Renderer::from_system", || {
+    let mut r = heapprof::bill("Renderer::from_system", || {
         Renderer::from_system(14.0, Theme::default())
-    }) else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    })
+    .expect("no font: build with aterm-render's default embedded-font feature");
     heapprof::bill("seal_admitted_font_sources", || {
         r.seal_admitted_font_sources()
     });
@@ -205,7 +199,7 @@ fn full_font_stack_heap() {
     });
 
     // aterm-gui `tray_raster::resolve_ui_font_assets()` -> `parse_ui_font` x2.
-    // Verbatim: `std::fs::read` then `fontdue::Font::from_bytes`, and the
+    // Verbatim: `std::fs::read` then `Font::from_bytes`, and the
     // REGULAR's file bytes are retained by `variable_semibold_of` on Windows.
     let ui = heapprof::bill("chrome UI pair (SegUIVar + seguisb)", ui_font_pair);
 
@@ -254,14 +248,21 @@ fn full_font_stack_heap() {
 }
 
 /// `tray_raster::resolve_ui_font_assets`'s Windows arm, verbatim.
-fn ui_font_pair() -> Option<(std::sync::Arc<fontdue::Font>, std::sync::Arc<[u8]>)> {
+fn ui_font_pair() -> Option<(
+    std::sync::Arc<aterm_render::font::Font>,
+    std::sync::Arc<[u8]>,
+)> {
     let root = std::env::var_os("WINDIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
         .join("Fonts");
-    let parse = |p: std::path::PathBuf| -> Option<(fontdue::Font, Vec<u8>)> {
+    let parse = |p: std::path::PathBuf| -> Option<(aterm_render::font::Font, Vec<u8>)> {
         let bytes = std::fs::read(p).ok()?;
-        let font = fontdue::Font::from_bytes(&bytes[..], fontdue::FontSettings::default()).ok()?;
+        let font = aterm_render::font::Font::from_bytes(
+            &bytes[..],
+            aterm_render::font::FontSettings::default(),
+        )
+        .ok()?;
         Some((font, bytes))
     };
     let (regular, bytes) = parse(root.join("SegUIVar.ttf"))?;

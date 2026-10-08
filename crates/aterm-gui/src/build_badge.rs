@@ -7,10 +7,10 @@
 //! tab ▸ Window ▸ "Show build/version badge". It is NON-INTERACTIVE (paint only) — it never
 //! captures the mouse — so it
 //! lives in its OWN paint-only `badge_card` slot rather than the modal `settings_card`,
-//! and the composite picks the modal FIRST (`settings_card.or(badge_card)`): an About or
-//! palette overlay covers the badge while open, and it returns when that overlay
-//! closes. Built from the SAME [`DrawPrim`] chrome vocabulary as the About dialog (a
-//! rounded pill, hairline border, dim text) so it reads as native window chrome, not
+//! and the composite picks the modal FIRST (`settings_card.or(badge_card)`): any modal
+//! card — the palette, or a native route such as Settings and its `/about` page — covers
+//! the badge while open, and it returns when that card closes. Built
+//! from the SAME [`DrawPrim`] chrome vocabulary as the palette (a rounded pill, hairline border, dim text) so it reads as native window chrome, not
 //! terminal grid cells. ONE structured source ([`crate::build_info`]) drives it.
 
 use aterm_render::Theme;
@@ -22,14 +22,14 @@ use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
 
 /// The badge caption, e.g. `v0.59 · 1783203308` — the shared app/source display
 /// version plus the build number (a release's `RELEASES.ledger` claim; HEAD's
-/// committer epoch on a dev build — see `build_info::BUILD_NUMBER`). Compact by
+/// committer epoch on a dev build — see `build_info::build_number()`). Compact by
 /// design — a glanceable identity, not the full provenance (compiler flavor /
 /// commit / signature live in About).
 pub(crate) fn badge_text() -> String {
     format!(
         "v{} \u{00b7} {}",
         crate::build_info::version_display(),
-        crate::build_info::BUILD_NUMBER
+        crate::build_info::build_number()
     )
 }
 
@@ -44,7 +44,7 @@ pub(crate) fn fingerprint(enabled: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     crate::build_info::version_display().hash(&mut h);
-    crate::build_info::BUILD_NUMBER.hash(&mut h);
+    crate::build_info::build_number().hash(&mut h);
     h.finish() | 1
 }
 
@@ -137,7 +137,7 @@ mod tests {
             "has display version: {t}"
         );
         assert!(
-            t.contains(crate::build_info::BUILD_NUMBER),
+            t.contains(crate::build_info::build_number()),
             "has build: {t}"
         );
         assert!(!t.contains('+'), "no provenance suffix on the badge: {t}");

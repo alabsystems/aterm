@@ -1,51 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// THE GPU MEMORY FLOOR: what a terminal's GPU stack is allowed to hold when it
-// is drawing nothing but text.
+// GPU memory floor: what a terminal's GPU stack may hold while drawing only
+// text.
 //
-// Two independent eager allocations used to sit here, and both were invisible
-// to every other test in the tree because nothing had ever asked the renderer
-// how many bytes it was holding:
+//   1. Suballocator: `GpuContext::new` uses `terminal_memory_hints`, not
+//      `MemoryHints::Performance`, whose 128 MiB device + 64 MiB host block
+//      floors are reserved on first touch (system RAM on integrated adapters)
+//      for a few MB of actual allocations.
+//   2. Bloom target: the half-resolution texture is built only when a frame
+//      carries a live glow, not with every `Offscreen`.
 //
-//   1. The SUBALLOCATOR. `GpuContext::new` requested `MemoryHints::Performance`,
-//      which tells wgpu-hal to floor its block sizes at 128 MiB (device) + 64 MiB
-//      (host). gpu-allocator creates a driver heap of exactly that size the FIRST
-//      time each memory type is touched — during renderer construction — so a
-//      terminal that sub-allocates 2.94 MB reserved 192 MB. On an INTEGRATED
-//      adapter (this box: AMD Radeon 780M, DX12) every D3D12 heap is system RAM,
-//      so all of it landed in the process working set. Measured: 337.8 MB working
-//      set steady-state before, 97.8 MB after (see `terminal_memory_hints`).
-//
-//   2. The BLOOM TARGET. The half-resolution texture the comet halo is extracted
-//      into was built alongside the `Offscreen`, on every window, whether or not
-//      a glow ever lit — 2.05 MB at 1914x1071, 8.4 MB at 4180x2016, for a pass
-//      the shipped `cursor_trail = false` default never runs.
-//
-// Both are lifetime-only changes: the same resources, built when something asks
-// for them. This file is the standing gate that they stay that way.
-//
-// Gated: no GPU / no system font -> the test no-ops (returns). A backend with no
-// suballocator report (GLES/WebGL2 has none) skips the reservation arm only.
+// No GPU / no system font: no-op. A backend with no suballocator report
+// (GLES/WebGL2) skips the reservation arm only.
 
 use aterm_core::terminal::Terminal;
-use aterm_gpu::{GpuRenderer, WindowGpu};
+use aterm_gpu::WindowGpu;
 use aterm_render::{GlowQuad, Theme, premul_rgb};
+
+use crate::common;
 
 const MIB: u64 = 1024 * 1024;
 
-/// What the suballocator may reserve for a renderer that has not drawn a frame.
-///
-/// Measured on this box with the shipped hint: **24 MiB** (one 16 MiB device
-/// block + one 8 MiB host block), against 2.94 MB actually sub-allocated. Under
-/// the old `MemoryHints::Performance` it was **192 MiB** — so this bound is what
-/// catches a regression to it, with room for a backend whose first block lands
-/// differently.
+/// What the suballocator may reserve before the first frame. The shipped hint
+/// reserves about 24 MiB (one 16 MiB device block + one 8 MiB host block);
+/// `Performance` would reserve 192 MiB.
 const MAX_RESERVED_AT_CONSTRUCT: u64 = 64 * MIB;
 
-/// What it may reserve once a ~1080p frame has been rendered and read back —
-/// the largest single allocation a terminal makes (the full-surface offscreen)
-/// plus its readback staging. Measured: **32 MiB**. Under `Performance`: 256 MiB.
+/// What it may reserve after a ~1080p frame is rendered and read back (the
+/// full-surface offscreen plus readback staging): about 32 MiB with the
+/// shipped hint, 256 MiB under `Performance`.
 const MAX_RESERVED_AFTER_FRAME: u64 = 128 * MIB;
 
 fn mib(bytes: u64) -> f64 {
@@ -65,34 +49,16 @@ fn scene() -> aterm_render::RenderInput {
 /// The suballocator must not floor itself at a streaming engine's block sizes.
 #[test]
 fn suballocator_reserves_a_terminal_sized_floor() {
-    let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-        // THE FLIP: this file audits the WGPU-HAL suballocator floors — the
-        // WGPU ORACLE arm, asked for by name post-flip.
-        Ok(g) => {
-            #[cfg(target_os = "macos")]
-            let g = {
-                let mut g = g;
-                g.disarm_metal_for_oracle();
-                g
-            };
-            g
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
+    let Some(mut gpu) = common::wgpu_oracle_or_skip(18.0, Theme::default()) else {
+        return;
     };
     let (adapter, backend) = gpu.adapter();
     let Some((used, reserved, blocks)) = gpu.allocator_reserved() else {
-        // A SKIP-BY-RETURN REPORTS `ok`, so this arm has to prove it is the
-        // legitimate one. `allocator_reserved` answers `None` by COMPILE-TIME
-        // cfg — a build without `wgpu_arm` has no suballocator report surface at
-        // all (Metal's armed resources are shared-storage exact-size mints) — not
-        // by runtime discovery. So on a build that HAS the arm, a `None` here is
-        // the report itself regressing, and this gate would go on reporting `ok`
-        // while guarding nothing. That matters: this file is the standing gate
-        // against a MEASURED 192 MiB-of-driver-heap-for-24 MiB-of-resources
-        // regression, and a gate that cannot fail is not a gate.
+        // A skip-by-return reports `ok`, so it must be legitimate:
+        // `allocator_reserved` returns `None` only by compile-time cfg (no
+        // `wgpu_arm`; Metal's armed resources are exact-size mints). On a
+        // build with the arm, `None` means the report regressed and the gate
+        // would guard nothing.
         assert!(
             !cfg!(wgpu_arm) || backend.eq_ignore_ascii_case("metal"),
             "{backend} produced no suballocator report, and it is not the one \
@@ -157,26 +123,12 @@ fn suballocator_reserves_a_terminal_sized_floor() {
     );
 }
 
-/// The half-res bloom target is DEMAND-BUILT: absent until a frame carries a
-/// live glow, present on the frame that does, and actually used by it.
+/// The half-res bloom target is built on demand: absent until a frame carries
+/// a live glow, present and used on the frame that does.
 #[test]
 fn bloom_target_is_built_on_demand_not_with_the_offscreen() {
-    let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-        // THE FLIP: this file audits the WGPU-HAL suballocator floors — the
-        // WGPU ORACLE arm, asked for by name post-flip.
-        Ok(g) => {
-            #[cfg(target_os = "macos")]
-            let g = {
-                let mut g = g;
-                g.disarm_metal_for_oracle();
-                g
-            };
-            g
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
+    let Some(mut gpu) = common::wgpu_oracle_or_skip(18.0, Theme::default()) else {
+        return;
     };
     // The whole point is the SHIPPED configuration: bloom enabled, nothing
     // drawing through it.

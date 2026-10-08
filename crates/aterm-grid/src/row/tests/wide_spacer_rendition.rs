@@ -2,26 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 //
-// The wide-char continuation spacer inherits its lead's rendition.
-//
-// THE LAW: a rendition belongs to the CHARACTER, not to the column. A
-// double-width character is one character in two columns, so the spacer must
-// carry the lead's visual attributes and only its own role bit.
-//
-// MEASURED REASON (2026-09-16): spacers were built with `WIDE_CONTINUATION`
-// alone. Under SGR 7 the renderer swapped fg/bg for the lead and not for the
-// spacer, and since `lead.resolved_fg == spacer.resolved_bg` for EVERY colour
-// pair, the glyph's spilled right half was composited invisibly — `\033[7m[漢字]`
-// on a 9x17 cell gave 153 of 153 flat pixels per spacer, distinct=1, zero glyph
-// ink. Underline/strikethrough/overline rules gapped under each right half too.
+// The wide-char continuation spacer inherits its lead's rendition: a
+// double-width character is one character in two columns, so the spacer
+// carries the lead's visual attributes plus only its own role bit. Otherwise
+// SGR 7 paints the glyph's right half invisibly and underline, strikethrough
+// and overline gap under it.
 
 use super::super::*;
 use super::make_row;
 use crate::{CellFlags, PackedColor};
 
-/// Every visual attribute bit, so a future SGR addition that lands in bits 0-13
-/// is covered by construction rather than by a list someone has to remember to
-/// extend.
+/// Every visual attribute bit, so a future SGR bit in 0-13 is covered
+/// automatically.
 const EVERY_RENDITION: CellFlags = CellFlags::from_bits(CellFlags::SPACER_RENDITION_MASK);
 
 #[test]

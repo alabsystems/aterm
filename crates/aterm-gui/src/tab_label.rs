@@ -67,8 +67,8 @@ fn local_host_names() -> &'static (String, String) {
 }
 
 /// Read the host's own name without spawning anything on the platforms that can
-/// answer from the filesystem. `$HOSTNAME` is consulted first because a user who
-/// overrides it is describing the same machine the prompt will name.
+/// answer from the filesystem or an API. `$HOSTNAME` is consulted first because a
+/// user who overrides it is describing the same machine the prompt will name.
 fn resolve_hostname() -> Option<String> {
     if let Some(name) = std::env::var_os("HOSTNAME")
         && let Some(name) = name.to_str()
@@ -82,9 +82,53 @@ fn resolve_hostname() -> Option<String> {
     {
         return Some(name.trim().to_owned());
     }
-    let out = std::process::Command::new("hostname").output().ok()?;
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (!name.is_empty()).then_some(name)
+    #[cfg(windows)]
+    {
+        windows_host_name()
+    }
+    #[cfg(not(windows))]
+    {
+        let out = aterm_uds::spawnfd::command("hostname").output().ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+/// Windows: the DNS host name, as `hostname.exe` prints it
+/// (`GetComputerNameExW(ComputerNameDnsHostname)`), else `%COMPUTERNAME%` (the
+/// NetBIOS name: upper-cased, at most 15 characters, so a longer name would not
+/// match). NEVER a spawn here: `$HOSTNAME` is unset on Windows, so this ran
+/// `hostname.exe` once per window process — on the UI thread, at the first tab
+/// label — and the window, which has no console, opened a visible console window
+/// for it (measured 2026-09-30). Measured on that machine: `hostname` printed the
+/// name in its own case, `%COMPUTERNAME%` the same name upper-cased.
+#[cfg(windows)]
+fn windows_host_name() -> Option<String> {
+    /// `COMPUTER_NAME_FORMAT::ComputerNameDnsHostname` (sysinfoapi.h).
+    const COMPUTER_NAME_DNS_HOSTNAME: u32 = 1;
+    /// A DNS host label is at most 63 characters; this holds any name.
+    const CAPACITY: usize = 256;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetComputerNameExW(name_type: u32, buffer: *mut u16, size: *mut u32) -> i32;
+    }
+    let mut buf = [0u16; CAPACITY];
+    let mut len = CAPACITY as u32;
+    // SAFETY: `buf` is `len` writable UTF-16 units and outlives the call. On
+    // success the API writes the name and its NUL inside them and sets `len` to
+    // the name's length without the NUL; on failure nothing written is read.
+    let ok = unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, buf.as_mut_ptr(), &mut len) };
+    let dns = (ok != 0)
+        .then(|| buf.get(..len as usize).map(String::from_utf16_lossy))
+        .flatten()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    dns.or_else(|| {
+        std::env::var("COMPUTERNAME")
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+    })
 }
 
 /// The title with a `user@host:` prefix naming this machine removed.
@@ -343,5 +387,24 @@ mod tests {
         }
         // The two sheds compose: identity first, then the path shape.
         assert_eq!(informative("vim README.md"), "vim README.md");
+    }
+
+    /// Windows names this machine from the OS, with no `hostname.exe` child (the
+    /// window has no console, so that child was a console window on screen): a
+    /// one-label name, as `hostname` prints it, that a prompt naming this host
+    /// in any case matches.
+    #[cfg(windows)]
+    #[test]
+    fn windows_names_this_machine_without_a_child() {
+        let name = super::windows_host_name().expect("Windows names this machine");
+        assert!(
+            !name.is_empty() && !name.contains(char::is_whitespace),
+            "{name:?}"
+        );
+        let short = name
+            .split_once('.')
+            .map_or(name.as_str(), |(label, _)| label);
+        let prompt = format!("me@{}: ~", name.to_ascii_uppercase());
+        assert_eq!(without_identity_of(&prompt, &name, short), "~");
     }
 }

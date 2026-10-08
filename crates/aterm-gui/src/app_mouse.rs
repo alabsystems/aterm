@@ -134,9 +134,10 @@ enum HoverProbe {
 /// [`App::refresh_hover_for_frame_locked`] re-probes it, under the fill's own
 /// hold, before the caption is spliced.
 ///
-/// The VALUE keeps the OSC 8 destination itself (`Some` ⇔ the cell is linked)
-/// as the `Arc<str>` the engine already holds, so the caption splice reads it
-/// with no lock and no `String` copy per frame. [`crate::link_target::LinkHover`]
+/// The VALUE keeps the destination the caption discloses itself (`Some` ⇔ the
+/// band has one to name) as an `Arc<str>` — for an OSC 8 link the one the
+/// engine already holds — so the caption splice reads it with no lock and no
+/// `String` copy per frame. [`crate::link_target::LinkHover`]
 /// stays `Copy + PartialEq` (it is compared by value at the event boundary);
 /// this sibling record carries the string.
 #[derive(Clone, Debug)]
@@ -152,8 +153,9 @@ pub(crate) struct HoverMemo {
     under_pointer: bool,
     /// The engine fill this answer stands on — see [`HoverFrame`].
     frame: HoverFrame,
-    /// The hyperlink under the cell, when it carries one.
-    link: Option<std::sync::Arc<str>>,
+    /// The destination the caption discloses: the cell's hyperlink when it
+    /// carries one, else a FAINT plain-text URL run's (`crate::PlainUrl`).
+    disclosed: Option<std::sync::Arc<str>>,
     /// A plain-text URL run under the cell (probed only with the modifier held).
     plain_url: bool,
 }
@@ -222,7 +224,7 @@ impl HoverMemo {
         hover: &crate::link_target::LinkHover,
     ) -> Option<&std::sync::Arc<str>> {
         (self.session == hover.session && self.cell == hover.cell)
-            .then_some(self.link.as_ref())
+            .then_some(self.disclosed.as_ref())
             .flatten()
     }
 
@@ -245,37 +247,48 @@ impl HoverMemo {
 
 /// The grid arm's two probes for one hovered cell, against a terminal the
 /// caller already holds — the frame's own guard or the motion path's
-/// successful `try_lock`. Returns `(link, plain_url)`.
+/// successful `try_lock`. Returns `(disclosed, plain_url)`.
 ///
-/// The destination itself, as the `Arc<str>` the grid already holds: kept in
-/// the memo so the caption splice reads it with no lock and no copy per frame,
-/// and re-read only when the frame under the pointer changes. VIEWPORT-keyed,
-/// like the plain-text probe beside it: the pointer stands on the row the frame
-/// DREW, and a screen-keyed probe answers about a different line the moment the
-/// viewport is scrolled back.
+/// The hyperlink's destination itself, as the `Arc<str>` the grid already
+/// holds: kept in the memo so the caption splice reads it with no lock and no
+/// copy per frame, and re-read only when the frame under the pointer changes.
+/// VIEWPORT-keyed, like the plain-text probe beside it: the pointer stands on
+/// the row the frame DREW, and a screen-keyed probe answers about a different
+/// line the moment the viewport is scrolled back.
 ///
-/// The plain-text probe needs only the row's CHARACTERS (one char per column,
-/// viewport-keyed), never the whole colour/decoration resolution `render_row`
-/// performs; it runs only for the gesture that needs it, and only once per cell
-/// entered. It earns no caption: a detected URL IS its own visible text.
+/// The plain-text probe is the press's own reading — [`crate::plain_url_at`]
+/// over the viewport row `render_row` resolves, at the renderer's
+/// `min_contrast` — so the hand appears exactly where a click opens something.
+/// It needs the row's INKS, not just its characters: a concealed cell keeps
+/// its character, and a URL run must end where the ink does. It runs only for
+/// the gesture that needs it, and only once per cell entered. A detected URL
+/// is its own visible text, so it earns a caption only when part of it is
+/// painted FAINTLY — the one case where the text a glance reads may stop short
+/// of what the press opens.
 fn probe_hover_cell(
     t: &Terminal,
     row: u16,
     col: u16,
     cell_is_under_pointer: bool,
     mod_held: bool,
+    min_contrast: f32,
 ) -> (Option<std::sync::Arc<str>>, bool) {
     let link = if cell_is_under_pointer {
         t.hyperlink_at_visible(row, col)
     } else {
         None
     };
-    let plain_url = mod_held && cell_is_under_pointer && link.is_none() && {
-        let mut chars = Vec::new();
-        t.row_cols_into(usize::from(row), &mut chars);
-        crate::find_url_span(&chars, usize::from(col)).is_some()
-    };
-    (link, plain_url)
+    if link.is_some() || !mod_held || !cell_is_under_pointer {
+        return (link, false);
+    }
+    match plain_url_at(
+        &t.render_row(usize::from(row)),
+        usize::from(col),
+        min_contrast,
+    ) {
+        Some(plain) => (plain.faint.then(|| plain.url.into()), true),
+        None => (None, false),
+    }
 }
 
 /// Whether the "open link" modifier is held: Cmd (Super) on macOS — its native
@@ -393,6 +406,105 @@ thread_local! {
     static PANE_DRAG_APPLIED_AT: Cell<Option<(WindowId, Instant)>> = const { Cell::new(None) };
     /// Window with a coalesced (skipped) drag step awaiting the release flush.
     static PANE_DRAG_PENDING: Cell<Option<WindowId>> = const { Cell::new(None) };
+    /// The window cell the held divider FOLLOWS — the pointer's cell passed
+    /// through [`divider_drag_cell`]'s boundary hysteresis, seeded with the press
+    /// cell. Every applied step (the leading edge and the release flush alike)
+    /// maps THIS cell to the split ratio, never the raw pointer cell.
+    static PANE_DRAG_CELL: Cell<Option<(WindowId, (u16, u16))>> = const { Cell::new(None) };
+}
+
+/// Forget window `wid`'s divider-drag throttle and hysteresis state — for a
+/// path that drops the gesture WITHOUT a release (focus loss), so no stamp,
+/// coalesced step or held cell of the dropped drag outlives it.
+/// `begin_divider_drag` reseeds all three on the next press anyway; this keeps
+/// the thread-locals from naming a drag that no longer exists.
+pub(crate) fn forget_divider_drag(wid: WindowId) {
+    PANE_DRAG_APPLIED_AT.with(|c| {
+        if matches!(c.get(), Some((w, _)) if w == wid) {
+            c.set(None);
+        }
+    });
+    PANE_DRAG_PENDING.with(|c| {
+        if c.get() == Some(wid) {
+            c.set(None);
+        }
+    });
+    PANE_DRAG_CELL.with(|c| {
+        if matches!(c.get(), Some((w, _)) if w == wid) {
+            c.set(None);
+        }
+    });
+}
+
+/// How far, as a fraction `1/N` of the cell along the axis, the pointer must
+/// travel PAST a cell boundary before a held divider follows it into the next
+/// cell (and, symmetrically, back).
+///
+/// Why a divider drag needs it: the pointer is quantized to cells, so a hand
+/// that rests on a boundary — a grab-and-let-go on the divider, a wobble near
+/// a cell edge — crosses it and comes back a pixel or two later. Without a
+/// dead band each crossing re-grids BOTH sibling panes, N -> N±1 -> N within
+/// one gesture, and the second half lands inside the app's SIGWINCH window:
+/// a handler that reads the size after both halves sees its old size and
+/// never repaints, while an alt-screen shrink demoted a row it then shows
+/// stale (the Claude Code desync). The band is SPATIAL — a deliberate move
+/// crosses it and applies on the same event, so the drag gains no latency.
+const DIVIDER_DRAG_HYSTERESIS_DIV: usize = 4;
+
+/// One axis of the held divider's cell: `held` stays until the pointer (in
+/// cell `raw`, `off` device px into it, cells `cell` px long) is MORE than
+/// `cell / DIVIDER_DRAG_HYSTERESIS_DIV` px past `held`'s edge. Pure, so the
+/// dead band is testable without a window.
+fn divider_drag_axis(held: u16, raw: u16, off: u16, cell: usize) -> u16 {
+    if raw == held || cell == 0 {
+        return raw;
+    }
+    let off = usize::from(off).min(cell - 1);
+    // Device px of the pointer beyond `held`'s nearer edge, counting the pixel
+    // it sits on: 1 for the first pixel of the neighbouring cell either way.
+    let past = if raw > held {
+        usize::from(raw - held - 1) * cell + off + 1
+    } else {
+        usize::from(held - raw - 1) * cell + (cell - off)
+    };
+    if past > cell / DIVIDER_DRAG_HYSTERESIS_DIV {
+        raw
+    } else {
+        held
+    }
+}
+
+/// The window cell a held divider follows after a pointer move to `raw`
+/// (sub-cell offset `off`, cell size `cell` = `(w, h)` px), given the cell it
+/// followed so far — [`divider_drag_axis`] per axis.
+fn divider_drag_cell(
+    held: (u16, u16),
+    raw: (u16, u16),
+    off: crate::input::PixelOffset,
+    cell: (usize, usize),
+) -> (u16, u16) {
+    (
+        divider_drag_axis(held.0, raw.0, off.y, cell.1),
+        divider_drag_axis(held.1, raw.1, off.x, cell.0),
+    )
+}
+
+/// One axis of the sub-cell offset the divider's dead band reads, made to
+/// describe the CLAMPED cell `raw`: `g` is the pointer's grid pixel along the
+/// axis (insets stripped, unclamped) and `cell` the cell length. The raw cell
+/// comes from `pixel_to_term_cell`, which clamps to the grid, while `g % cell`
+/// does not — a pointer past the last row would carry an offset into a cell it
+/// is not in. Past the far edge the pointer is at least at the clamped cell's
+/// far pixel, and before the near edge at its first.
+fn divider_drag_off_axis(g: usize, raw: u16, cell: usize) -> u16 {
+    let cell = cell.max(1);
+    let at = g / cell;
+    let off = match at.cmp(&usize::from(raw)) {
+        std::cmp::Ordering::Greater => cell - 1,
+        std::cmp::Ordering::Less => 0,
+        std::cmp::Ordering::Equal => g % cell,
+    };
+    u16::try_from(off).unwrap_or(u16::MAX)
 }
 
 /// The window geometry EVERY pointer↔cell mapping needs, derived once.
@@ -482,17 +594,80 @@ pub(crate) enum PointerAction {
 }
 
 impl App {
-    /// Modal palette pointer boundary. It clears any hover/press retained by the native
-    /// app underneath, synchronizes the cursor to the palette row hover, and reports
-    /// whether the caller must swallow the gesture. This runs before native hit testing
-    /// for motion, buttons, and wheel input, preventing a visible palette from becoming an
-    /// invisible click-through layer over an editor or Settings control.
-    pub(crate) fn palette_claims_pointer(&mut self, wid: WindowId) -> bool {
-        if self
-            .windows
-            .get(&wid)
-            .is_none_or(|window| window.palette().is_none())
+    // ---- The overlay CARD plumbing (palette, session picker, connection map,
+    // connection card): one body each, parameterised only by what names the card.
+
+    /// Put `overlay` in `wid`'s one overlay slot (structural mutual exclusion)
+    /// and arm the pointer as every overlay card opens: the wheel residual is
+    /// dropped, `raise` brings the window forward, drags settle, the card
+    /// `claim`s the pointer and resolves the stationary cursor through
+    /// `motion`. `false` (nothing opens) when `wid` is gone.
+    pub(crate) fn install_overlay_card(
+        &mut self,
+        wid: WindowId,
+        overlay: crate::overlay::Overlay,
+        raise: bool,
+        claim: fn(&mut Self, WindowId) -> bool,
+        motion: fn(&mut Self, WindowId, f64, f64),
+    ) -> bool {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        ws.overlay = Some(overlay);
+        ws.scroll_residual = 0.0;
+        if let Some(w) = &ws.os_window {
+            if raise {
+                w.focus_window();
+            }
+            w.request_redraw();
+        }
+        self.settle_pointer_drags(wid);
+        let _ = claim(self, wid);
+        if let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
+            motion(self, wid, x, y);
+        }
+        self.overlay_a11y_update();
+        true
+    }
+
+    /// Close `wid`'s overlay card when `is_open` says the slot holds it (a
+    /// no-op otherwise), publish the now-empty accessibility tree, and
+    /// re-resolve the cursor against the revealed surface.
+    pub(crate) fn close_overlay_card(
+        &mut self,
+        wid: WindowId,
+        is_open: fn(&crate::WindowState) -> bool,
+    ) {
+        let mut closed = false;
+        if let Some(ws) = self.windows.get_mut(&wid)
+            && is_open(ws)
         {
+            ws.overlay = None;
+            ws.scroll_residual = 0.0;
+            if let Some(w) = &ws.os_window {
+                w.request_redraw();
+            }
+            closed = true;
+        }
+        self.overlay_a11y_update();
+        if closed && let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
+            self.on_cursor_moved(wid, x, y);
+        }
+    }
+
+    /// Modal pointer boundary of an overlay card. When `is_open` says the card is up on
+    /// `wid`, it clears any hover/press retained by the native app underneath, aligns the
+    /// cursor through `sync`, and reports that the caller must swallow the gesture. This
+    /// runs before native hit testing for motion, buttons, and wheel input, preventing a
+    /// visible card from becoming an invisible click-through layer over an editor or
+    /// Settings control.
+    pub(crate) fn overlay_card_claims_pointer(
+        &mut self,
+        wid: WindowId,
+        is_open: fn(&crate::WindowState) -> bool,
+        sync: fn(&mut Self, WindowId),
+    ) -> bool {
+        if self.windows.get(&wid).is_none_or(|ws| !is_open(ws)) {
             return false;
         }
 
@@ -515,63 +690,81 @@ impl App {
             self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
             self.request_redraw_all_windows();
         }
-        self.sync_palette_pointer_cursor(wid);
+        sync(self, wid);
         true
     }
 
-    /// Convert a window-space point into the palette's card-local geometry and return the
-    /// filtered row it hits. Terminal frames composite the card at
-    /// `(pad, pad_top + head)`;
-    /// native tabs composite it inside the scaled app texture below host tab chrome. These
-    /// are the exact two placement laws in `app_render`, reversed here before calling the
-    /// shared painter/hit rectangle.
-    fn palette_row_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
-        let window = self.windows.get(&wid)?;
-        let palette = window.palette()?;
+    /// A window-space point in the open card's local geometry, with the transform whose
+    /// `geom` the card's own hit test takes. Terminal frames composite the card at
+    /// `(pad, pad_top + head)`; native tabs composite it inside the scaled app texture
+    /// below host tab chrome. These are the exact two placement laws in `app_render`,
+    /// reversed here before calling the shared painter/hit rectangle.
+    pub(crate) fn overlay_card_point(
+        &self,
+        wid: WindowId,
+        x: f64,
+        y: f64,
+    ) -> Option<(crate::OverlayCoordinateTransform, f32, f32)> {
         let transform = self.overlay_coordinate_transform(wid)?;
         let (frame_x, frame_y) = self.window_to_frame(wid, x, y);
         let local_x = (frame_x - transform.origin_x) / f64::from(transform.scale);
         let local_y = (frame_y - transform.origin_y) / f64::from(transform.scale);
-        crate::palette::palette_row_hit(palette, &transform.geom, local_x as f32, local_y as f32)
+        Some((transform, local_x as f32, local_y as f32))
     }
 
-    /// Keep the OS cursor aligned with the palette's current row hover. The existing
-    /// `hover_pointer` bit is safe to reuse while the modal is open because the underlying
-    /// native/terminal hover authority has already been cleared at the boundary above.
+    /// Keep the OS cursor aligned with an overlay card's hover: the pointing hand over
+    /// one of its targets, the arrow elsewhere. The existing `hover_pointer` bit is safe
+    /// to reuse while the modal is open because the underlying native/terminal hover
+    /// authority has already been cleared at the boundary above.
+    pub(crate) fn set_overlay_card_cursor(&mut self, wid: WindowId, pointer: bool) {
+        let icon = if pointer {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Default
+        };
+        self.set_hover_cursor(wid, icon, pointer, false);
+    }
+
+    /// Repaint `wid`'s overlay card and republish its accessibility tree when `changed`.
+    pub(crate) fn redraw_overlay_card(&mut self, wid: WindowId, changed: bool) {
+        if !changed {
+            return;
+        }
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+            w.request_redraw();
+        }
+        self.overlay_a11y_update();
+    }
+
+    /// The palette's modal pointer boundary ([`Self::overlay_card_claims_pointer`]).
+    pub(crate) fn palette_claims_pointer(&mut self, wid: WindowId) -> bool {
+        self.overlay_card_claims_pointer(
+            wid,
+            |ws| ws.palette().is_some(),
+            Self::sync_palette_pointer_cursor,
+        )
+    }
+
+    /// The filtered palette row under a window-space point.
+    fn palette_row_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
+        let palette = self.windows.get(&wid)?.palette()?;
+        let (transform, x, y) = self.overlay_card_point(wid, x, y)?;
+        crate::palette::palette_row_hit(palette, &transform.geom, x, y)
+    }
+
+    /// Keep the OS cursor aligned with the palette's current row hover.
     pub(crate) fn sync_palette_pointer_cursor(&mut self, wid: WindowId) {
         let pointer = self
             .windows
             .get(&wid)
             .and_then(|window| window.palette())
             .is_some_and(crate::palette::PaletteState::pointer_over_row);
-        if let Some(window) = self.windows.get_mut(&wid)
-            && (window.hover_pointer != pointer || window.native_text_cursor)
-        {
-            window.hover_pointer = pointer;
-            window.native_text_cursor = false;
-            if let Some(os_window) = &window.os_window {
-                os_window.set_cursor(if pointer {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                });
-            }
-        }
+        self.set_overlay_card_cursor(wid, pointer);
     }
 
     fn repaint_palette_pointer(&mut self, wid: WindowId, changed: bool) {
         self.sync_palette_pointer_cursor(wid);
-        if !changed {
-            return;
-        }
-        if let Some(window) = self
-            .windows
-            .get(&wid)
-            .and_then(|window| window.os_window.as_ref())
-        {
-            window.request_redraw();
-        }
-        self.overlay_a11y_update();
+        self.redraw_overlay_card(wid, changed);
     }
 
     /// Hover-select the row under a pointer motion; outside points remain swallowed while
@@ -908,6 +1101,9 @@ impl App {
         // without a release (focus loss drops the gesture) may flush into it.
         PANE_DRAG_APPLIED_AT.with(|c| c.set(None));
         PANE_DRAG_PENDING.with(|c| c.set(None));
+        // The divider starts out following the press cell, so a pointer that
+        // never leaves its dead band never moves the split.
+        PANE_DRAG_CELL.with(|c| c.set(Some((wid, (wr, wc)))));
         true
     }
 
@@ -926,6 +1122,26 @@ impl App {
         let Some(hit) = ws.divider_drag.clone() else {
             return;
         };
+        // Boundary hysteresis FIRST: a move that stays inside the held cell's
+        // dead band is no step at all — nothing applied, nothing pending — so a
+        // wobble across a cell edge and back never re-grids the siblings.
+        let raw = ws.last_mouse_window_cell;
+        let off = ws.last_mouse_px_off;
+        let held = PANE_DRAG_CELL.with(|c| match c.get() {
+            Some((w, cell)) if w == wid => cell,
+            _ => raw,
+        });
+        let cell = divider_drag_cell(held, raw, off, self.pointer_geometry(wid).cell);
+        // …unless a throttle-coalesced step is still pending: the band holds the
+        // divider where it is GOING (`PANE_DRAG_CELL`), not where it was last
+        // applied, so a move that stays in the band after the window closes is
+        // exactly the out-of-window move that must flush it (below). Returning
+        // here would leave both panes' engines/PTYs a step behind until release.
+        let pending = PANE_DRAG_PENDING.with(|c| c.get()) == Some(wid);
+        if cell == held && !pending {
+            return;
+        }
+        PANE_DRAG_CELL.with(|c| c.set(Some((wid, cell))));
         let now = Instant::now();
         let gated = PANE_DRAG_APPLIED_AT.with(|c| {
             matches!(c.get(), Some((w, t)) if w == wid
@@ -950,7 +1166,13 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
-        let (wr, wc) = ws.last_mouse_window_cell;
+        // The cell the divider follows (hysteresis-filtered in `drag_divider`),
+        // never the raw pointer cell: the release flush must land where the
+        // divider was going, not re-cross a boundary the dead band absorbed.
+        let (wr, wc) = PANE_DRAG_CELL.with(|c| match c.get() {
+            Some((w, cell)) if w == wid => cell,
+            _ => ws.last_mouse_window_cell,
+        });
         let (applied, terminal_projection) = match hit {
             crate::DividerDrag::Terminal(hit) => {
                 let Some(tree) = self.active_tree(wid) else {
@@ -1025,6 +1247,7 @@ impl App {
             self.apply_divider_drag(wid, &hit);
         }
         PANE_DRAG_APPLIED_AT.with(|c| c.set(None));
+        PANE_DRAG_CELL.with(|c| c.set(None));
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.divider_drag = None;
             // Restore the default cursor (the hover state machine re-asserts the
@@ -1254,6 +1477,50 @@ impl App {
         }
     }
 
+    /// Sub-cell pixel offset of the pointer inside its cell, measured from the
+    /// real winit cursor (band-, pad- and strip-stripped) so a DEC 1016 (SGR-pixel)
+    /// report carries a GENUINE sub-cell coordinate, not a cell-origin one, and a
+    /// held divider can tell how far past a cell boundary the pointer is. The
+    /// chrome (strip + status bars) occupies the top rows, so subtract its pixel
+    /// height from `y` before taking the per-cell remainder (matches
+    /// `pixel_to_term_cell`). Ignored by every cell-coordinate encoding — see
+    /// [`crate::input::PixelOffset`].
+    fn pointer_subcell_px(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+    ) -> crate::input::PixelOffset {
+        let (cw, ch) = geom.cell;
+        let (gx, gy) = self.pointer_grid_px(wid, geom, x, y);
+        crate::input::PixelOffset {
+            x: (gx % cw.max(1)) as u16,
+            y: (gy % ch.max(1)) as u16,
+        }
+    }
+
+    /// The pointer's pixel inside the terminal grid, insets stripped (the pad on
+    /// both axes, the chrome headroom and strip on y — `pixel_to_term_cell`'s
+    /// exact insets) and NOT clamped to the grid: the shared base of
+    /// [`Self::pointer_subcell_px`] and the divider drag's clamped offset.
+    fn pointer_grid_px(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+    ) -> (usize, usize) {
+        let ch = geom.cell.1.max(1);
+        let (fx, fy) = self.window_to_frame_with(wid, geom, x, y);
+        let gx = (fx - geom.pad as f64).max(0.0) as usize;
+        let strip_px = usize::from(self.chrome_rows(wid)) * ch;
+        // The chrome headroom sits above the pad on the y-axis (x carries none),
+        // matching `pixel_to_term_cell`'s `pad_top + head` inset.
+        let gy = (fy - (geom.pad_top + geom.head) as f64).max(0.0) as usize;
+        (gx, gy.saturating_sub(strip_px))
+    }
+
     /// The [`HoverMapping`] window `wid`'s pointer→cell mapping runs under
     /// RIGHT NOW: the geometry and the focused pane rect derived afresh (the
     /// rect plans the split — no lock, same cost the full route pays in
@@ -1388,7 +1655,15 @@ impl App {
                 // each repaints, may open a window and logs a line. (The
                 // verb's `click` is Owner-only at the dispatch gate, as
                 // `notice` is: ruling 174's premise.)
-                if self.band_hit_at(wid, x, y).is_some() {
+                // Only a click that PRESSES something there (round 44): the
+                // presence row, an echo's or a padded row, and a question
+                // banner over the band spend nothing and are never refused —
+                // the fold law and the paste question's cancel still run.
+                if self.band_banner_at(wid, x, y).is_none()
+                    && self
+                        .band_hit_at(wid, x, y)
+                        .is_some_and(|target| self.band_press_acts(wid, target))
+                {
                     aterm_messages::wire::spend_press(&mut self.wire_gate, Instant::now())
                         .map_err(|line| line.strip_prefix("ERR ").unwrap_or(&line).to_string())?;
                 }
@@ -1591,31 +1866,40 @@ impl App {
         // band's hit test is asked at all: a press on a modal security question
         // is its FAIL-CLOSED answer (cancel — the parked text is dropped), never
         // a confirm, and never the capsule underneath it.
-        let paste_up = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid);
-        // The close/quit confirm (Windows) shares the paste banner's slot and
-        // floor (`splice_close_banner`); the two are never up together on one
-        // window, and the paste question keeps the band when both could be.
-        let close_up = self.close_banner.as_ref().is_some_and(|p| p.wid == wid);
-        if paste_up || close_up {
-            let floor = self.paste_banner_tray_floor_y(wid);
-            let (_, fy) = self.window_to_frame(wid, px, py);
-            let top = (self.win_pad_top(wid) + self.win_head(wid)) as f64;
-            if floor > 0 && fy >= top && fy < f64::from(floor) {
-                if paste_up {
-                    self.answer_paste_banner(false);
-                } else {
-                    // Nothing closes on a press that named no answer.
-                    self.answer_close_banner(false);
-                }
-                self.request_redraw_all_windows();
-                return true;
+        if let Some(paste_up) = self.band_banner_at(wid, px, py) {
+            if paste_up {
+                self.answer_paste_banner(false);
+            } else {
+                // Nothing closes on a press that named no answer.
+                self.answer_close_banner(false);
             }
+            self.request_redraw_all_windows();
+            return true;
         }
         let Some(target) = self.band_hit_at(wid, px, py) else {
             return false;
         };
         self.press_band(wid, target);
         true
+    }
+
+    /// Whether a question banner covers window pixel `(px, py)` where it
+    /// overwrites the band's rows — `Some(true)` the paste question,
+    /// `Some(false)` the close/quit confirm — so a press there is its answer
+    /// ([`Self::press_band_at`]), never the band's.
+    fn band_banner_at(&self, wid: WindowId, px: f64, py: f64) -> Option<bool> {
+        let paste_up = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid);
+        // The close/quit confirm (Windows) shares the paste banner's slot and
+        // floor (`splice_close_banner`); the two are never up together on one
+        // window, and the paste question keeps the band when both could be.
+        let close_up = self.close_banner.as_ref().is_some_and(|p| p.wid == wid);
+        if !(paste_up || close_up) {
+            return None;
+        }
+        let floor = self.paste_banner_tray_floor_y(wid);
+        let (_, fy) = self.window_to_frame(wid, px, py);
+        let top = (self.win_pad_top(wid) + self.win_head(wid)) as f64;
+        (floor > 0 && fy >= top && fy < f64::from(floor)).then_some(paste_up)
     }
 
     /// [`Self::strip_col_at`] against geometry the caller already derived.
@@ -1763,7 +2047,10 @@ impl App {
         // `PET_HIT_SLOP_PX`) and, on a hit, latches the stroke (note, never
         // act); the redraw consumes it on the ground: a purr-flavored hold, a
         // heart per queued pet, and contentment toward the real purr.
-        if ws.companion.press(Instant::now(), (fx as f32, fy as f32))
+        if ws
+            .fx
+            .companion_mut()
+            .press(Instant::now(), (fx as f32, fy as f32))
             != aterm_effects::host::PressOutcome::Pet
         {
             return false;
@@ -2003,14 +2290,21 @@ impl App {
             _ => None,
         };
         let on_new_tab = matches!(hit, Some(crate::tab_bar::TabHit::NewTab));
+        // …and a THIRD: the trailing version label (Windows), which is no tab
+        // either. Same hit, so at most one of the three is ever lit.
+        let on_version = matches!(hit, Some(crate::tab_bar::TabHit::Version { .. }));
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        if ws.strip_hover == hovered && ws.strip_hover_new_tab == on_new_tab {
+        if ws.strip_hover == hovered
+            && ws.strip_hover_new_tab == on_new_tab
+            && ws.strip_hover_version == on_version
+        {
             return;
         }
         ws.strip_hover = hovered;
         ws.strip_hover_new_tab = on_new_tab;
+        ws.strip_hover_version = on_version;
         if let Some(window) = &ws.os_window {
             window.request_redraw();
         }
@@ -2048,11 +2342,16 @@ impl App {
         ws.hover_grid_owned = false;
         // The band's lit chip is the same shape of stale claim as the strip's.
         let band_lit = ws.band_hover.take().is_some();
-        if ws.strip_hover.is_none() && !ws.strip_hover_new_tab && !band_lit {
+        if ws.strip_hover.is_none()
+            && !ws.strip_hover_new_tab
+            && !ws.strip_hover_version
+            && !band_lit
+        {
             return;
         }
         ws.strip_hover = None;
         ws.strip_hover_new_tab = false;
+        ws.strip_hover_version = false;
         if let Some(window) = &ws.os_window {
             window.request_redraw();
         }
@@ -2355,7 +2654,7 @@ impl App {
         if !ws.pointer_position_known || !ws.hover_grid_owned {
             return;
         }
-        let Some(session) = self.front_terminal(wid).map(|front| front.session) else {
+        let Some(session) = ws.front_terminal().map(|front| front.session) else {
             return;
         };
         if ws
@@ -2445,9 +2744,11 @@ impl App {
     }
 
     /// Resolve the hover state, writing the cursor and RETURNING the cell whose
-    /// hyperlink is to be disclosed (`None` from every arm where the grid is not
-    /// the thing under the pointer). `probe` is the frame's own terminal hold
-    /// when there is one (see [`Self::update_hover_cursor_with`]).
+    /// destination is to be disclosed: its OSC 8 hyperlink, or, with the link
+    /// modifier held, the faint plain-text URL under it (`crate::PlainUrl`).
+    /// `None` from every arm where the grid is not the thing under the pointer.
+    /// `probe` is the frame's own terminal hold when there is one (see
+    /// [`Self::update_hover_cursor_with`]).
     fn resolve_hover_cursor(
         &mut self,
         wid: WindowId,
@@ -2599,15 +2900,18 @@ impl App {
             return Resolved(None);
         };
         let frame = HoverMemo::frame_of(ws);
+        let min_contrast = self.render_knobs.minimum_contrast;
         let answered = ws.hover_memo.as_ref().is_some_and(|memo| {
             memo.answers(session, window_cell, mod_held, cell_is_under_pointer, frame)
         });
         if !answered {
-            let (link, plain_url) = match probe {
+            let (disclosed, plain_url) = match probe {
                 // THE FRAME'S OWN HOLD: the fill that made this question new
                 // was taken under it, and it is still held — read straight
                 // through it. Nothing to acquire, nothing to defer.
-                Some(t) => probe_hover_cell(t, row, col, cell_is_under_pointer, mod_held),
+                Some(t) => {
+                    probe_hover_cell(t, row, col, cell_is_under_pointer, mod_held, min_contrast)
+                }
                 None => {
                     // NON-BLOCKING: a busy mutex means the PTY reader is
                     // mid-slice, and a hover icon must never queue the UI
@@ -2618,7 +2922,7 @@ impl App {
                     let Some(t) = crate::term_try_lock(&term) else {
                         return HoverProbe::Deferred;
                     };
-                    probe_hover_cell(&t, row, col, cell_is_under_pointer, mod_held)
+                    probe_hover_cell(&t, row, col, cell_is_under_pointer, mod_held, min_contrast)
                 }
             };
             ws.hover_memo = Some(HoverMemo {
@@ -2628,15 +2932,14 @@ impl App {
                 mod_held,
                 under_pointer: cell_is_under_pointer,
                 frame,
-                link,
+                disclosed,
                 plain_url,
             });
         }
-        let (linked, plain_url) = ws
-            .hover_memo
-            .as_ref()
-            .map_or((false, false), |memo| (memo.link.is_some(), memo.plain_url));
-        if mod_held && (linked || plain_url) {
+        let (disclosed, plain_url) = ws.hover_memo.as_ref().map_or((false, false), |memo| {
+            (memo.disclosed.is_some(), memo.plain_url)
+        });
+        if mod_held && (disclosed || plain_url) {
             self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
         } else if tracking {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
@@ -2647,8 +2950,10 @@ impl App {
         // OSC 8 is the one link kind whose visible text and destination can be
         // unrelated, and the moment a person needs to know that is while they
         // are deciding whether the underlined word is worth a click — which is
-        // before their hand reaches the modifier, not after.
-        Resolved(linked.then_some(crate::link_target::LinkHover {
+        // before their hand reaches the modifier, not after. A faint plain URL
+        // is found only with the modifier down, which is the moment the hand
+        // offers its click: disclosed then, still before the press.
+        Resolved(disclosed.then_some(crate::link_target::LinkHover {
             cell: (row, col),
             window_row,
             session,
@@ -3037,8 +3342,16 @@ impl App {
                     hover_changed.push(target);
                 }
             }
-            let text_cursor = !over_pane_header && (editor_target.is_some() || text_field_hovered);
+            // The band above a native front (§3.4) is a hand where a press
+            // acts, as above a terminal: the native press path presses it
+            // (`press_band_at`), and its chip is already lit (round 44).
+            let band_acts = self
+                .band_hit_at(wid, x, y)
+                .is_some_and(|target| self.band_press_acts(wid, target));
+            let text_cursor =
+                !over_pane_header && !band_acts && (editor_target.is_some() || text_field_hovered);
             let pointer = over_pane_header
+                || band_acts
                 || (!text_field_hovered
                     && native_hover
                         .as_ref()
@@ -3104,6 +3417,22 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.divider_drag.is_some())
         {
+            // The divider's boundary hysteresis reads how far into its cell the
+            // pointer is, so the drag records the sub-cell offset too — the
+            // offset into the CLAMPED cell it reads, so a pointer past the grid's
+            // edge (or up in the chrome) is not read as partway into that cell.
+            let (gx, gy) = self.pointer_grid_px(wid, geom, x, y);
+            let (raw_r, raw_c) = self
+                .windows
+                .get(&wid)
+                .map_or((0, 0), |ws| ws.last_mouse_window_cell);
+            let px_off = crate::input::PixelOffset {
+                x: divider_drag_off_axis(gx, raw_c, geom.cell.0),
+                y: divider_drag_off_axis(gy, raw_r, geom.cell.1),
+            };
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.last_mouse_px_off = px_off;
+            }
             self.drag_divider(wid);
             return;
         }
@@ -3143,8 +3472,8 @@ impl App {
         // off the grid).
         if let Some(ws) = self.windows.get_mut(&wid)
             && pet_wake_wanted(
-                ws.companion.hit_rect().is_some(),
-                ws.companion.needs_frames(),
+                ws.fx.companion_mut().hit_rect().is_some(),
+                ws.fx.companion_mut().needs_frames(),
                 ws.pet_pointer_sampled_px,
                 (x, y),
                 geom.cell,
@@ -3170,35 +3499,15 @@ impl App {
         // the hovered cell, the left half stops before it. Remembered so a
         // shift-click press (which has no pixel position of its own) can
         // anchor by the half that was pressed. Subtract the `pad` inset first so
-        // the half-split lines up with the (padded) cell, matching `pixel_to_cell`.
-        let (cw, ch) = geom.cell;
-        let cw = cw.max(1);
-        let ch = ch.max(1);
-        // W1: strip the leading remainder bands first (window→frame), THEN the
-        // `pad` inset, so the half-split lines up with the on-glass (banded,
-        // padded) cell — matching `pixel_to_cell`.
-        let (fx, fy) = self.window_to_frame_with(wid, geom, x, y);
-        let gx = (fx - geom.pad as f64).max(0.0) as usize;
-        let side = if (gx % cw) * 2 >= cw {
+        // the half-split lines up with the (padded) cell, matching `pixel_to_cell`
+        // (W1: `pointer_subcell_px` strips the leading remainder bands first,
+        // THEN the `pad` inset, so the split matches the on-glass cell).
+        let cw = geom.cell.0.max(1);
+        let px_off = self.pointer_subcell_px(wid, geom, x, y);
+        let side = if usize::from(px_off.x) * 2 >= cw {
             SelectionSide::Right
         } else {
             SelectionSide::Left
-        };
-        // Sub-cell pixel offset of the pointer inside its cell, measured from the
-        // real winit cursor (band-, pad- and strip-stripped) so a DEC 1016 (SGR-pixel)
-        // report carries a GENUINE sub-cell coordinate, not a cell-origin one. The
-        // chrome (strip + status bars) occupies the top rows, so subtract its pixel
-        // height from `y` before taking the per-cell remainder (matches
-        // `pixel_to_term_cell`). Ignored by every cell-coordinate encoding — see
-        // [`crate::input::PixelOffset`].
-        let strip_px = usize::from(self.chrome_rows(wid)) * ch;
-        // The chrome headroom sits above the pad on the y-axis (x carries none),
-        // matching `pixel_to_term_cell`'s `pad_top + head` inset.
-        let gy = (fy - (geom.pad_top + geom.head) as f64).max(0.0) as usize;
-        let gy = gy.saturating_sub(strip_px);
-        let px_off = crate::input::PixelOffset {
-            x: (gx % cw) as u16,
-            y: (gy % ch) as u16,
         };
         // Phase 0.5: the cell-half (`side`) is GUI-derived (it needs the pixel x),
         // then handed to the seam as DATA. The seam runs the `self.selecting` local
@@ -3910,7 +4219,9 @@ impl App {
         term.hyperlink_at_visible(row, col)
             .map(|url| url.to_string())
             .or_else(|| {
-                plain_url_at(&term.render_row(row as usize), col as usize).map(|(u, _, _)| u)
+                let cells = term.render_row(row as usize);
+                plain_url_at(&cells, col as usize, self.render_knobs.minimum_contrast)
+                    .map(|plain| plain.url)
             })
     }
 
@@ -4151,15 +4462,8 @@ impl App {
                 .map_or((0.0, 0.0), |window| window.last_cursor_px);
             // A Claude Code light in a terminal pane of this mixed tab is a
             // light, not a focus click — the first press toggles it, as it
-            // does in a terminal-only tab (`crate::claude_lights`). Not under
-            // the Settings modal, which owns every press below.
-            if self.strip_col_at(wid, px, py).is_none()
-                && self
-                    .windows
-                    .get(&wid)
-                    .is_some_and(|ws| ws.settings().is_none())
-                && self.press_claude_light(wid)
-            {
+            // does in a terminal-only tab (`crate::claude_lights`).
+            if self.strip_col_at(wid, px, py).is_none() && self.press_claude_light(wid) {
                 return;
             }
             if self.strip_col_at(wid, px, py).is_none()
@@ -4524,9 +4828,10 @@ impl App {
                             ) => {
                                 let _ = self.open_tab_context_menu(wid, index, col, false);
                             }
-                            // The bare band (or the `+` / `↻`, which have no menu
-                            // of their own): on WINDOWS the caption's system menu — the
-                            // band IS caption there. Linux has no system menu to pop, so
+                            // The bare band (or the `+` / `↻` / the version label,
+                            // which have no menu of their own): on WINDOWS the
+                            // caption's system menu — the band IS caption there. Linux
+                            // has no system menu to pop, so
                             // the bare band keeps its wave-3 pure swallow (and this arm
                             // must not name the cfg(windows) platform_win module).
                             //
@@ -5282,14 +5587,19 @@ impl App {
             // Also at offset 0 when the reader aimed up while a rewrap held the
             // history away (ruling 238): typing is them coming back to the live
             // bottom, and the re-attach must not land them on the old aim.
-            if term.grid().display_offset() != 0 || term.grid().reader_aim_held() {
-                // A non-typing snap (⌘-V, a composing IME key): the press path
-                // records no class for it, so this records `SnapToLive` itself.
-                term.return_to_live();
-                true
-            } else {
-                false
-            }
+            let away = term.grid().display_offset() != 0 || term.grid().reader_aim_held();
+            // A non-typing snap (⌘-V, a composing IME key): the press path
+            // records no class for it, so this records `SnapToLive` itself when
+            // the view moved. ALWAYS called, the view already at live included:
+            // a paste at the prompt is the person acting on this session, and
+            // `return_to_live` counts that as a reader gesture
+            // (`Terminal::reader_gesture_count`) — which an update's history
+            // import reads to leave a session the person used where they put
+            // it (round seven of the update audit, finding 110: a visible
+            // paste at the live bottom counted nothing, and the import scrolled
+            // the view up under the half-pasted command).
+            term.return_to_live();
+            away
         };
         if scrolled && let Some(w) = &ws.os_window {
             w.request_redraw();
@@ -5356,11 +5666,22 @@ impl App {
 /// Cmd-click link open and the About dialog's site link; callers gate through
 /// `is_safe_url` FIRST (this helper trusts its input). Best-effort: a failed
 /// spawn (`xdg-open` absent, etc.) degrades to a silent no-op.
+///
+/// REAPED (2026-09-29): the opener is handed to `aterm_pty::reap_in_background`.
+/// It used to be spawned and its `Child` dropped, which neither waits nor
+/// kills — every Cmd-click left one `<defunct>` child of the window for the
+/// rest of its life (grep_guard B30).
 pub(crate) fn open_url_external(url: &str) {
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+    let opener = aterm_uds::spawnfd::command("/usr/bin/open")
+        .arg(url)
+        .spawn();
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    let opener = aterm_uds::spawnfd::command("xdg-open").arg(url).spawn();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Ok(child) = opener {
+        aterm_pty::reap_in_background(child);
+    }
     #[cfg(windows)]
     open_url_windows(url);
 }
@@ -5475,7 +5796,7 @@ fn bank_scroll_lines(residual: &mut f64, delta: f64) -> Option<(bool, i32)> {
 /// sample the pointer — the wake's EDGE, in one pure function.
 ///
 /// * `pet_visible` — a pet body was drawn last frame
-///   (`ws.companion.hit_rect().is_some()`); a petless window never pays.
+///   (`ws.fx.companion_mut().hit_rect().is_some()`); a petless window never pays.
 /// * `brain_running` — `CompanionOwner::needs_frames()` (the brain's own
 ///   answer, withheld while the resident is static): the brain already owns a
 ///   frame cadence (heat, pursuit, pounce, a fade…), and that lane samples the
@@ -5544,13 +5865,13 @@ mod pointer_license_tests {
             head: 0,
         };
         let cfg = app.glow_config();
-        app.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
-            Some((0, 0)),
-            Instant::now(),
-            &cfg,
-            geom,
-            &mut Vec::new(),
-        );
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .fx
+            .cursor_mut()
+            .glow
+            .tick(Some((0, 0)), Instant::now(), &cfg, geom, &mut Vec::new());
         (app, reader, geom)
     }
 
@@ -5587,7 +5908,7 @@ mod pointer_license_tests {
         let cfg = app.glow_config();
         let ws = app.windows.get_mut(&wid).unwrap();
         let mut out = Vec::new();
-        ws.cursor_fx.glow.tick(
+        ws.fx.cursor_mut().glow.tick(
             Some((cursor.row, cursor.col)),
             Instant::now(),
             &cfg,
@@ -5595,9 +5916,15 @@ mod pointer_license_tests {
             &mut out,
         );
         (
-            ws.cursor_fx.glow.spawns(),
-            ws.cursor_fx.glow.admission_log().last().unwrap().licence,
-            !out.is_empty() || !ws.cursor_fx.glow.under_quads().is_empty(),
+            ws.fx.cursor_mut().glow.spawns(),
+            ws.fx
+                .cursor_mut()
+                .glow
+                .admission_log()
+                .last()
+                .unwrap()
+                .licence,
+            !out.is_empty() || !ws.fx.cursor_mut().glow.under_quads().is_empty(),
         )
     }
 
@@ -5627,7 +5954,8 @@ mod pointer_license_tests {
                     assert!(model.fire("PressArmsLicense", &mut before));
                     assert!(
                         app.windows[&wid]
-                            .cursor_fx
+                            .fx
+                            .cursor()
                             .glow
                             .move_licensed(Instant::now())
                     );
@@ -5663,9 +5991,12 @@ mod pointer_license_tests {
                         assert!(bytes.starts_with(b"\x1b[<35;"), "{bytes:?}");
                     }
                     let ws = &app.windows[&wid];
-                    let live = ws.cursor_fx.glow.move_licensed(Instant::now());
+                    let live = ws.fx.cursor().glow.move_licensed(Instant::now());
                     assert_eq!(live, !reported, "{mode}/{controller}/{same_pixel}");
-                    assert_eq!(ws.cursor_fx.trail.move_licensed(Instant::now()), !reported);
+                    assert_eq!(
+                        ws.fx.cursor().trail.move_licensed(Instant::now()),
+                        !reported
+                    );
                     assert_eq!(
                         echo(&mut app, geom),
                         if reported {
@@ -5744,13 +6075,15 @@ mod pointer_license_tests {
             );
             assert!(
                 !app.windows[&wid]
-                    .cursor_fx
+                    .fx
+                    .cursor()
                     .glow
                     .move_licensed(Instant::now())
             );
             assert!(
                 !app.windows[&wid]
-                    .cursor_fx
+                    .fx
+                    .cursor()
                     .trail
                     .move_licensed(Instant::now())
             );
@@ -5764,6 +6097,304 @@ mod tests {
         PointerAction, WheelDir, bank_scroll_lines, press_selection_kind, press_starts_selection,
     };
     use aterm_core::selection::SelectionType;
+
+    /// A hand-rolled `format!("file://{}")` URI is MALFORMED on Windows (drive
+    /// letter + backslashes after the authority slot), so tests built on one
+    /// never ran there. Build the URI the way the shipping path does.
+    fn file_uri(path: &std::path::Path) -> String {
+        crate::native_document_host::path_to_file_uri(path).unwrap()
+    }
+
+    /// THE HAND, THE PRESS AND THE CAPTION READ ONE PLAIN URL, through the real
+    /// motion path with the open modifier down. A concealed tail (SGR 8) keeps
+    /// its characters in the grid, so a hover that read characters alone put
+    /// the hand over cells that look blank and a press there opened
+    /// `google.com.evil.example`; at every cell the hand now appears exactly
+    /// where a press opens something. A tail painted a shade off its background
+    /// (1.31:1) IS part of the URL, so the band names the whole destination
+    /// before the click; an ordinary URL is its own disclosure and takes no row,
+    /// and so does a 1.11:1 URL the configured `minimum_contrast` lifts to 4.5:1,
+    /// because the hover reads the ink at the floor the renderer paints with.
+    #[test]
+    fn the_hand_the_press_and_the_caption_agree_on_a_plain_url() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        crate::term_lock(&term).process(
+            b"Docs: https://google.com\x1b[8m.evil.example/login\x1b[28m (official)\r\n\
+              Docs: \x1b[48;2;17;19;24mhttps://google.com\x1b[38;2;40;43;50m.evil.example/login\x1b[0m\r\n\
+              Docs: https://example.com/path/to/page\r\n\
+              Docs: \x1b[38;2;33;34;44;48;2;40;42;54mhttps://example.com/path\x1b[0m\r\n",
+        );
+        app.on_modifiers_changed(wid, link_modifier());
+        let (cw, ch) = app.win_cell_size(wid);
+        let strip_px = f64::from(app.tab_strip_rows) * ch as f64;
+        let hand = |app: &mut crate::App, row: u16, col: u16| {
+            let x = app.win_pad(wid) as f64 + cw as f64 * (f64::from(col) + 0.5);
+            let y = (app.win_pad_top(wid) + app.win_head(wid)) as f64
+                + strip_px
+                + ch as f64 * (f64::from(row) + 0.5);
+            app.on_cursor_moved(wid, x, y);
+            assert_eq!(app.windows[&wid].last_mouse_cell, (row, col));
+            app.windows[&wid].hover_pointer
+        };
+        for row in 0..3 {
+            for col in 0..80 {
+                let offered = hand(&mut app, row, col);
+                assert_eq!(
+                    offered,
+                    app.link_under_pointer(wid).is_some(),
+                    "({row}, {col})"
+                );
+            }
+        }
+        let band = |app: &mut crate::App| {
+            assert!(
+                app.prepare_terminal_capture_grid_with_cursor_fx(
+                    wid,
+                    crate::app_render::ComposedCursorFxClock::Advance(std::time::Instant::now()),
+                )
+                .is_some()
+            );
+            app.splice_link_target(wid);
+            let rows = &app.windows[&wid].input_scratch.cells;
+            rows.last()
+                .expect("rows")
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+        };
+        assert!(hand(&mut app, 0, 20), "the visible URL takes the hand");
+        assert!(
+            !band(&mut app).contains("google.com"),
+            "and is its own disclosure"
+        );
+        assert!(!hand(&mut app, 0, 30), "a cell that looks blank never does");
+        let whole = "https://google.com.evil.example/login";
+        assert!(hand(&mut app, 1, 30), "a faint tail is still the URL's");
+        assert_eq!(app.link_under_pointer(wid).as_deref(), Some(whole));
+        let caption = band(&mut app);
+        assert!(
+            caption.contains(whole),
+            "the band names it first: {caption:?}"
+        );
+        // That band still claims the bottom row (only the strip splice clears
+        // the register), so a later one would land on top: ask the hover itself
+        // whether there is a destination to disclose.
+        assert!(hand(&mut app, 2, 20));
+        let disclosed = |app: &crate::App| app.windows[&wid].link_hover;
+        assert_eq!(disclosed(&app), None, "an ordinary URL takes no row");
+        app.render_knobs.minimum_contrast = 4.5;
+        assert!(hand(&mut app, 3, 20));
+        assert_eq!(
+            disclosed(&app),
+            None,
+            "a URL the configured floor lifts takes no row"
+        );
+    }
+
+    /// The held divider's boundary hysteresis, as a pure function: a pointer a
+    /// few pixels past a cell edge keeps the held cell; one more than a quarter
+    /// cell past it (either way, or several cells away) moves it on the same
+    /// event.
+    #[test]
+    fn divider_drag_axis_holds_inside_the_dead_band_and_follows_past_it() {
+        use super::divider_drag_axis as axis;
+        // 20 px cells: the band is 20 / 4 = 5 px either side of a boundary.
+        assert_eq!(axis(12, 12, 3, 20), 12, "same cell is the same cell");
+        assert_eq!(axis(12, 13, 0, 20), 12, "1 px into the next cell holds");
+        assert_eq!(axis(12, 13, 4, 20), 12, "5 px past holds");
+        assert_eq!(axis(12, 13, 5, 20), 13, "6 px past follows");
+        assert_eq!(
+            axis(12, 11, 19, 20),
+            12,
+            "1 px back into the previous cell holds"
+        );
+        assert_eq!(axis(12, 11, 15, 20), 12, "5 px back holds");
+        assert_eq!(axis(12, 11, 14, 20), 11, "6 px back follows");
+        assert_eq!(axis(12, 14, 0, 20), 14, "a whole cell past always follows");
+        assert_eq!(axis(12, 10, 19, 20), 10, "a whole cell back always follows");
+        assert_eq!(axis(12, 13, 0, 0), 13, "no geometry: no band");
+    }
+
+    /// THE WOBBLE (net-zero re-grid). A top/bottom split, the pointer pressed on
+    /// the divider, nudged across the cell boundary below by a pixel and brought
+    /// back, then released — a grab-and-let-go, or a hand resting on a cell edge.
+    /// Driven through the real pointer path (`on_cursor_moved`, `on_mouse_input`).
+    /// Before the dead band, the nudge was the drag's leading edge and re-gridded
+    /// BOTH panes at once (top R -> R+1, bottom S -> S-1) and the release flushed
+    /// the return (R+1 -> R, S-1 -> S): a net-zero run on both engines and both
+    /// PTYs, the shape that left an alt-screen app (Claude Code) desynced when
+    /// its SIGWINCH handler read an unchanged size. Now neither pane moves. The
+    /// second half proves the band costs a deliberate drag no latency: a move to
+    /// the next cell's centre applies on that very event.
+    #[test]
+    fn divider_wobble_across_a_cell_edge_never_regrids_the_siblings() {
+        use winit::event::{ElementState, MouseButton};
+
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let top = app.focused_session_id(wid).unwrap();
+        let bottom = app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Horizontal);
+        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+        let col = cols / 4;
+        let divider = (0..rows)
+            .find(|&r| {
+                app.active_tree(wid)
+                    .expect("terminal split tree")
+                    .divider_at(r, col, rows, cols)
+                    .is_some()
+            })
+            .expect("the split has a divider row");
+        let ch = app.pointer_geometry(wid).cell.1;
+        assert!(
+            ch / 4 >= 2,
+            "a cell tall enough for a 1 px nudge to sit in the band"
+        );
+        let engine_rows = |app: &crate::App| {
+            let rows = |sid| crate::term_lock(&app.pool.get(sid).unwrap().term).rows();
+            (rows(top), rows(bottom))
+        };
+        let before = engine_rows(&app);
+
+        let (x, y) = app.cell_centre_px(wid, divider, col).unwrap();
+        let (_, below) = app.cell_centre_px(wid, divider + 1, col).unwrap();
+        // 1 px into the next cell: the pixel row just past the boundary, + 1.
+        #[allow(clippy::cast_precision_loss, reason = "a cell height in px")]
+        let nudge = below - (ch / 2) as f64 + 1.0;
+        assert_eq!(
+            app.pixel_to_cell(wid, x, nudge).0,
+            divider + 1,
+            "the nudge really crosses into the next cell"
+        );
+
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        assert!(
+            app.windows[&wid].divider_drag.is_some(),
+            "press arms the drag"
+        );
+        let mut seen = vec![engine_rows(&app)];
+        app.on_cursor_moved(wid, x, nudge);
+        seen.push(engine_rows(&app));
+        app.on_cursor_moved(wid, x, y);
+        seen.push(engine_rows(&app));
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        seen.push(engine_rows(&app));
+        assert!(
+            app.windows[&wid].divider_drag.is_none(),
+            "release ends the drag"
+        );
+        assert!(
+            seen.iter().all(|&s| s == before),
+            "a wobble inside the dead band never re-grids either pane: \
+             before={before:?} seen={seen:?}"
+        );
+
+        // A deliberate one-row drag: the move to the next cell's centre is the
+        // fresh drag's leading edge and applies on that same event.
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        assert!(
+            app.windows[&wid].divider_drag.is_some(),
+            "press re-arms the drag"
+        );
+        app.on_cursor_moved(wid, x, below);
+        assert_eq!(
+            engine_rows(&app),
+            (before.0 + 1, before.1 - 1),
+            "a real one-row move applies at once — the band adds no latency"
+        );
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        assert_eq!(engine_rows(&app), (before.0 + 1, before.1 - 1));
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// The dead band must not strand a THROTTLE-COALESCED step. A fast drag
+    /// applies the move to the next row at its leading edge, and the move one
+    /// row further, inside [`crate::RESIZE_THROTTLE`], is left pending. Once the
+    /// window closes, a small move that stays inside that row's band is the
+    /// out-of-window move that flushes it — the band's early return used to
+    /// swallow it, leaving both panes' engines/PTYs a row behind the pointer
+    /// until release. The throttle stamp is set and backdated by hand, so the
+    /// test decides "inside" and "after" the window without sleeping.
+    #[test]
+    fn divider_drag_flushes_a_coalesced_step_on_a_move_inside_the_band() {
+        use winit::event::{ElementState, MouseButton};
+
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let top = app.focused_session_id(wid).unwrap();
+        let bottom = app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Horizontal);
+        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+        let col = cols / 4;
+        let divider = (0..rows)
+            .find(|&r| {
+                app.active_tree(wid)
+                    .expect("terminal split tree")
+                    .divider_at(r, col, rows, cols)
+                    .is_some()
+            })
+            .expect("the split has a divider row");
+        let engine_rows = |app: &crate::App| {
+            let rows = |sid| crate::term_lock(&app.pool.get(sid).unwrap().term).rows();
+            (rows(top), rows(bottom))
+        };
+        let before = engine_rows(&app);
+        let (x, y) = app.cell_centre_px(wid, divider, col).unwrap();
+        let (_, one) = app.cell_centre_px(wid, divider + 1, col).unwrap();
+        let (_, two) = app.cell_centre_px(wid, divider + 2, col).unwrap();
+
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_cursor_moved(wid, x, one);
+        assert_eq!(
+            engine_rows(&app),
+            (before.0 + 1, before.1 - 1),
+            "the first step is the leading edge"
+        );
+        // Inside the throttle window: the second step is coalesced.
+        super::PANE_DRAG_APPLIED_AT.with(|c| c.set(Some((wid, std::time::Instant::now()))));
+        app.on_cursor_moved(wid, x, two);
+        assert_eq!(
+            super::PANE_DRAG_PENDING.with(|c| c.get()),
+            Some(wid),
+            "the in-window step is pending, not applied"
+        );
+        assert_eq!(engine_rows(&app), (before.0 + 1, before.1 - 1));
+        // After the window: a 1 px move that stays inside the same row flushes it.
+        let past = std::time::Instant::now()
+            .checked_sub(crate::RESIZE_THROTTLE * 2)
+            .expect("a monotonic clock older than two throttle windows");
+        super::PANE_DRAG_APPLIED_AT.with(|c| c.set(Some((wid, past))));
+        app.on_cursor_moved(wid, x, two + 1.0);
+        assert_eq!(
+            engine_rows(&app),
+            (before.0 + 2, before.1 - 2),
+            "a move inside the band flushes the coalesced step"
+        );
+        assert_eq!(super::PANE_DRAG_PENDING.with(|c| c.get()), None);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        assert_eq!(engine_rows(&app), (before.0 + 2, before.1 - 2));
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// The divider band's sub-cell offset describes the CLAMPED cell: a pointer
+    /// past the grid's far edge sits at that cell's last pixel, one before its
+    /// near edge at its first, and one inside it at its real offset.
+    #[test]
+    fn divider_drag_offset_is_read_against_the_clamped_cell() {
+        use super::divider_drag_off_axis as off;
+        // 20 px cells, clamped to cell 9 (a 10-row grid).
+        assert_eq!(off(187, 9, 20), 7, "inside the cell: the real offset");
+        assert_eq!(off(203, 9, 20), 19, "past the last row: its far pixel");
+        assert_eq!(off(455, 9, 20), 19, "far past it: still its far pixel");
+        assert_eq!(off(3, 1, 20), 0, "before the cell: its first pixel");
+        assert_eq!(off(5, 0, 0), 0, "no geometry: no offset");
+        // And the band then reads it right: a pointer below the last row,
+        // with row 8 held, has crossed the whole of row 9 — it follows.
+        assert_eq!(super::divider_drag_axis(8, 9, off(203, 9, 20), 20), 9);
+    }
 
     fn pane_header_point(app: &crate::App, wid: crate::WindowId, index: usize) -> (f64, f64) {
         let plan = app.active_visible_leaf_plan(wid).expect("split plan");
@@ -6578,10 +7209,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pointer.txt");
         std::fs::write(&path, "alpha βeta\nsecond\n").unwrap();
-        // A hand-rolled `format!("file://{}")` URI is MALFORMED on Windows (drive
-        // letter + backslashes after the authority slot), so these tests never ran
-        // there. Build the URI the way the shipping path does.
-        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let uri = file_uri(&path);
         app.open_document_tab(AppKind::Editor, &uri).unwrap();
         let (_, editor_view) = app.active_native_view(wid).expect("Editor active");
         let compiled = presented_native_ui(&mut app, wid);
@@ -6765,6 +7393,111 @@ mod tests {
         );
     }
 
+    /// A live terminal overlay card resolves the pointer through `window_to_frame`
+    /// followed by `overlay_coordinate_transform`: the compositor's sub-cell
+    /// remainder band and the asymmetric `pad_top + head` origin must each be
+    /// removed EXACTLY ONCE. Pinned on the Palette with a nonzero remainder in both
+    /// axes (x only on Linux, whose frame top is pinned by policy) plus pad 12,
+    /// pad_top 4, head 3: each row's inner corners (half a pixel inside its hit
+    /// rect) resolve to that row and the four one-pixel exterior bands miss, so a
+    /// remainder or top origin that is stripped twice, or never, shifts the point
+    /// across an edge by at least one pixel and fails here.
+    #[test]
+    fn terminal_palette_pointer_strips_frame_remainder_and_top_origin_once() {
+        use crate::{App, WindowId};
+        use winit::dpi::PhysicalSize;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.backend.set_pad(12);
+        app.backend.set_pad_top(4);
+        app.backend.set_head(3);
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.metrics.pad = 12;
+            ws.metrics.pad_top = 4;
+            ws.input_scratch.cells = vec![Vec::new(); 24];
+        }
+        app.palette_enter();
+        assert_eq!(
+            (app.win_pad(wid), app.win_pad_top(wid), app.win_head(wid)),
+            (12, 4, 3),
+            "fixture geometry reaches the pointer seams"
+        );
+
+        let (cw, ch) = app.win_cell_size(wid);
+        let (rows, cols) = {
+            let ws = &app.windows[&wid];
+            (
+                usize::from(ws.rows) + usize::from(app.chrome_rows(wid)),
+                usize::from(ws.cols),
+            )
+        };
+        // A strict sub-cell remainder produces a nonzero leading frame band.
+        let rw = cw.saturating_sub(1).max(4);
+        let rh = ch.saturating_sub(1).max(4);
+        app.windows.get_mut(&wid).unwrap().win_px = Some(PhysicalSize::new(
+            (cols * cw + 24 + rw) as u32,
+            (rows * ch + 4 + 12 + 3 + rh) as u32,
+        ));
+        let (ox, oy) = app.frame_origin(wid);
+        assert!(ox > 0, "fixture needs the horizontal remainder band");
+        if cfg!(target_os = "linux") {
+            assert_eq!(oy, 0, "Linux pins the frame top");
+        } else {
+            assert!(oy > 0, "fixture needs the vertical remainder band");
+        }
+
+        let window = &app.windows[&wid];
+        let palette = window.palette().expect("open palette");
+        let geom = crate::settings::SettingsGeom {
+            cw: cw as f32,
+            ch: ch as f32,
+            font_px: app.win_font_px(wid),
+            cols,
+            panel_rows: window.overlay_rows(),
+        };
+        // A freshly opened palette is unscrolled and lists every command, so the
+        // first three painted slots are filtered rows 0..3.
+        let visible = 3;
+        // Card-local → window: the frame remainder, then the terminal overlay origin.
+        let to_window = |x: f32, y: f32| {
+            (
+                ox as f64 + 12.0 + f64::from(x),
+                oy as f64 + 4.0 + 3.0 + f64::from(y),
+            )
+        };
+        for slot in 0..visible {
+            let (rx, ry, rw, rh) =
+                crate::palette::palette_row_rect(palette, &geom, slot).expect("painted row");
+            let want = Some(slot);
+            for (cx, cy, what) in [
+                (rx + 0.5, ry + 0.5, "top-left corner"),
+                (rx + rw - 0.5, ry + rh - 0.5, "bottom-right corner"),
+                (rx + rw * 0.5, ry + rh * 0.5, "centre"),
+            ] {
+                let (x, y) = to_window(cx, cy);
+                assert_eq!(
+                    app.palette_row_at_pointer(wid, x, y),
+                    want,
+                    "slot {slot} {what}: origin stripped exactly once"
+                );
+            }
+            for (cx, cy, band) in [
+                (rx - 0.5, ry + rh * 0.5, "left"),
+                (rx + rw + 0.5, ry + rh * 0.5, "right"),
+                (rx + rw * 0.5, ry - 0.5, "top"),
+                (rx + rw * 0.5, ry + rh + 0.5, "bottom"),
+            ] {
+                let (x, y) = to_window(cx, cy);
+                assert_eq!(
+                    app.palette_row_at_pointer(wid, x, y),
+                    None,
+                    "slot {slot} {band} exterior band misses"
+                );
+            }
+        }
+    }
+
     #[test]
     fn click_below_terminal_palette_is_swallowed_without_starting_selection() {
         use crate::{App, WindowId};
@@ -6866,10 +7599,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pointer.md");
         std::fs::write(&path, "alpha\nβeta\n").unwrap();
-        // A hand-rolled `format!("file://{}")` URI is MALFORMED on Windows (drive
-        // letter + backslashes after the authority slot), so these tests never ran
-        // there. Build the URI the way the shipping path does.
-        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let uri = file_uri(&path);
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7030,10 +7760,7 @@ mod tests {
         let path = dir.join("pointer.md");
         let source = "# **Heading**\n\nBody [link](https://example.com).\n";
         std::fs::write(&path, source).unwrap();
-        // A hand-rolled `format!("file://{}")` URI is MALFORMED on Windows (drive
-        // letter + backslashes after the authority slot), so these tests never ran
-        // there. Build the URI the way the shipping path does.
-        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let uri = file_uri(&path);
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.open_document_tab(AppKind::Markdown, &uri).unwrap();
@@ -7324,23 +8051,20 @@ mod tests {
         );
     }
 
-    /// Classic wheel notches (±1 or ±3 lines per event) pass through whole and
-    /// leave no residual — behavior identical to the pre-banking code.
+    /// `bank_scroll_lines`: classic wheel notches (±1 or ±3 lines per event)
+    /// pass through whole and leave no residual; fractional LineDelta (Windows
+    /// precision touchpads emit many |y| << 1 events) banks until a whole line
+    /// accumulates instead of the old `.round().max(1)` forcing one full line
+    /// per micro-event; and a direction flip forfeits the banked remainder, so
+    /// reversing never has to pay off leftover motion from the old direction.
     #[test]
-    fn whole_wheel_notches_pass_through_unbanked() {
+    fn scroll_banking_passes_notches_banks_fractions_and_forfeits_on_reversal() {
         let mut r = 0.0;
         assert_eq!(bank_scroll_lines(&mut r, 1.0), Some((true, 1)));
         assert_eq!(r, 0.0);
         assert_eq!(bank_scroll_lines(&mut r, -3.0), Some((false, 3)));
         assert_eq!(r, 0.0);
-    }
 
-    /// Fractional LineDelta (Windows precision touchpads emit many |y| << 1
-    /// events) banks until a whole line accumulates instead of the old
-    /// `.round().max(1)` forcing one full line per micro-event.
-    #[test]
-    fn fractional_deltas_bank_until_a_whole_line() {
-        let mut r = 0.0;
         for _ in 0..4 {
             assert_eq!(
                 bank_scroll_lines(&mut r, 0.2),
@@ -7353,13 +8077,8 @@ mod tests {
         // Same going down.
         assert_eq!(bank_scroll_lines(&mut r, -0.6), None);
         assert_eq!(bank_scroll_lines(&mut r, -0.6), Some((false, 1)));
-    }
 
-    /// A direction flip forfeits the banked remainder, so reversing never has
-    /// to pay off leftover motion from the old direction first.
-    #[test]
-    fn direction_flip_forfeits_the_banked_remainder() {
-        let mut r = 0.0;
+        r = 0.0;
         assert_eq!(bank_scroll_lines(&mut r, 0.9), None);
         assert_eq!(
             bank_scroll_lines(&mut r, -0.5),
@@ -7734,28 +8453,6 @@ mod tests {
         }
         // Degenerate metrics never divide and never spin.
         assert!(pet_wake_wanted(true, false, seen, (101.0, 200.0), (0, 0)));
-
-        // The call site: the ONE pet request in the motion routing sits behind
-        // this gate and BELOW the cell walk (after the chrome/modal returns),
-        // never at the top of the ladder. Pinned on the source.
-        let src = include_str!("app_mouse.rs");
-        let route = src
-            .split("fn route_cursor_moved(")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    }\n").next())
-            .expect("route_cursor_moved body");
-        let gate = route
-            .find("pet_wake_wanted(")
-            .expect("the pet wake is gated");
-        let walk = route
-            .find("self.refresh_mouse_cell(wid, geom, x, y);\n        let (lr, lc)")
-            .expect("the grid cell walk");
-        assert!(walk < gate, "the gated wake sits below the cell walk");
-        assert_eq!(
-            route.matches("ws.companion.hit_rect().is_some()").count(),
-            1,
-            "exactly one pet-visibility read in the routing: the gated one"
-        );
     }
 
     /// PETTING (wave 1), the chrome-wins policy end to end: a left press
@@ -7792,7 +8489,8 @@ mod tests {
                 },
             );
             assert!(pet.on_glass, "fixture: the resident is drawn");
-            ws.companion
+            ws.fx
+                .companion_mut()
                 .hit_rect()
                 .expect("the drawn body is the hit target")
         };
@@ -7808,7 +8506,7 @@ mod tests {
         {
             let ws = app.windows.get(&wid).unwrap();
             assert_eq!(
-                ws.companion.brain().pending_pets(),
+                ws.fx.companion().brain().pending_pets(),
                 1,
                 "the press latched a pet (note, never act)"
             );
@@ -7825,7 +8523,7 @@ mod tests {
         {
             let ws = app.windows.get(&wid).unwrap();
             assert_eq!(
-                ws.companion.brain().pending_pets(),
+                ws.fx.companion().brain().pending_pets(),
                 1,
                 "no second pet off the body"
             );
@@ -7834,21 +8532,34 @@ mod tests {
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
     }
 
-    /// PETTING (wave 1): a cleared stash (pet not drawn) can never eat a
-    /// click — the guard for stale rects after a style switch or fade-out.
+    /// PETTING (wave 1) and DISMISSING ROBI: a cleared stash (pet or Robi not
+    /// drawn) can never eat a click — the guard for stale rects after a style
+    /// switch, a fade-out or the gate closing.
     #[test]
-    fn no_rect_no_pet_the_click_falls_through() {
+    fn no_rect_no_pet_or_robi_the_click_falls_through() {
         use crate::{App, WindowId};
         use winit::event::{ElementState, MouseButton as WinitMouseButton};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        assert_eq!(app.windows.get(&wid).unwrap().companion.hit_rect(), None);
+        assert_eq!(
+            app.windows.get(&wid).unwrap().fx.companion().hit_rect(),
+            None
+        );
+        assert_eq!(app.windows.get(&wid).unwrap().robi_hit_rect, None);
         app.on_cursor_moved(wid, 150.0, 130.0);
         app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
         let ws = app.windows.get(&wid).unwrap();
-        assert_eq!(ws.companion.brain().pending_pets(), 0, "nothing to pet");
+        assert_eq!(
+            ws.fx.companion().brain().pending_pets(),
+            0,
+            "nothing to pet"
+        );
         assert!(ws.selecting, "the press reached the selection layer");
+        assert!(
+            !app.has_live_message("Couldn't dismiss Robi"),
+            "and no dismissal was ever attempted"
+        );
     }
 
     /// DISMISSING ROBI, chrome-wins end to end: a left press inside the
@@ -7897,26 +8608,6 @@ mod tests {
             "a plain terminal press still selects"
         );
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-    }
-
-    /// DISMISSING ROBI: a cleared stash (Robi not drawn) can never eat a
-    /// click — the guard for stale rects after the gate closes.
-    #[test]
-    fn no_rect_no_robi_the_click_falls_through() {
-        use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert_eq!(app.windows.get(&wid).unwrap().robi_hit_rect, None);
-        app.on_cursor_moved(wid, 150.0, 130.0);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        let ws = app.windows.get(&wid).unwrap();
-        assert!(ws.selecting, "the press reached the selection layer");
-        assert!(
-            !app.has_live_message("Couldn't dismiss Robi"),
-            "and no dismissal was ever attempted"
-        );
     }
 
     /// DISMISSING ROBI, the latch's settlement law (`poll_robi_dismissal`):
@@ -8185,14 +8876,17 @@ mod tests {
         let pad = app.win_pad(wid) as f64;
         let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
         app.splice_tab_strip_with(wid, 1);
-        // A strip column PAST every segment: `hit_test` answers None there —
-        // the bare band, the caption's naked stretch.
+        // A strip column just past the `+`: `hit_test` answers None there —
+        // the bare band, the caption's naked stretch. Found BY KIND, not as
+        // "past the last segment": where the UI face is installed (any earlier
+        // test on this thread may have installed it) the strip's last segment
+        // is the version label, flush against the right edge.
         let bare = app.windows[&wid]
             .tab_segments
             .iter()
+            .find(|seg| seg.kind == crate::tab_bar::TabHit::NewTab)
             .map(|seg| seg.end_col)
-            .max()
-            .expect("the strip laid out segments")
+            .expect("the strip laid out its +")
             + 2;
         let bare_pt = (
             pad + f64::from(bare) * cw as f64 + cw as f64 * 0.5,
@@ -8269,6 +8963,15 @@ mod tests {
     /// the motion hook records the button (and clears it on leaving), the strip
     /// CACHE KEY carries the flag (or the repaint is a hit and the wash never
     /// reaches the rows), and the painted row actually moves.
+    ///
+    /// THE POINTER LEAVING THE WINDOW CLEARS BOTH STRIP HOVERS. `CursorMoved` is
+    /// the only thing that drives [`App::track_strip_hover`], so a pointer that
+    /// walks off the window simply stops reporting and whatever was lit at the
+    /// last motion INSIDE stays lit. Measured on glass (2026-08-25, windowed,
+    /// three tabs, font_px 13): the `+` kept its `hover_bg` wash while the pointer
+    /// sat 236 px outside the window's right edge. Both hover states are pinned
+    /// — a chip's (which reveals a `✕` on a tab nobody is pointing at) and the
+    /// `+`'s — plus the redraw that carries the clear to the rows.
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn hovering_the_new_tab_button_records_it_and_repaints_the_strip() {
@@ -8329,7 +9032,23 @@ mod tests {
             "the button takes the band's own hover material"
         );
 
-        // Leaving for a CHIP clears the button and lights the tab instead.
+        // Leaving the WINDOW clears the `+` wash, and the clear reaches the row.
+        app.on_cursor_left(wid);
+        assert!(
+            !app.windows[&wid].strip_hover_new_tab,
+            "leaving the window clears the `+` wash"
+        );
+        app.splice_tab_strip_with(wid, 1);
+        assert_eq!(
+            bg_of(&app, button_col),
+            resting,
+            "…and the clear reaches the painted row"
+        );
+
+        // Back on the `+`, then leaving for a CHIP clears the button and lights
+        // the tab instead.
+        app.on_cursor_moved(wid, p.0, p.1);
+        assert!(app.windows[&wid].strip_hover_new_tab, "re-entry relights");
         let q = point(chip.start_col + 1);
         app.on_cursor_moved(wid, q.0, q.1);
         assert!(
@@ -8343,19 +9062,33 @@ mod tests {
             resting,
             "…and the button is back to resting"
         );
+
+        // The CHIP lit, then the pointer leaves the window. The harness window
+        // has ONE tab and that tab is the SELECTED one, whose card and `✕` are
+        // the same painted either way ([`crate::tab_bar::strip_cell`]: hover
+        // never overrides the selection, and the chip-card band keeps the
+        // selected `✕` resident), so the chip's half is pinned at the STATE —
+        // which is what feeds the wash and the hover-only `✕` on every
+        // unselected chip.
+        app.on_cursor_left(wid);
+        assert_eq!(
+            app.windows[&wid].strip_hover, None,
+            "leaving the window clears the chip's wash and its `✕`"
+        );
     }
 
-    /// THE POINTER LEAVING THE WINDOW CLEARS THE STRIP'S HOVER. `CursorMoved` is
-    /// the only thing that drives [`App::track_strip_hover`], so a pointer that
-    /// walks off the window simply stops reporting and whatever was lit at the
-    /// last motion INSIDE stays lit. Measured on glass (2026-08-25, windowed,
-    /// three tabs, font_px 13): the `+` kept its `hover_bg` wash while the pointer
-    /// sat 236 px outside the window's right edge. Both hover states are pinned
-    /// here — a chip's (which reveals a `✕` on a tab nobody is pointing at) and
-    /// the `+`'s — plus the redraw that carries the clear to the rows.
+    /// A STRIP HOVER CHANGE REACHES THE GLASS ON ITS OWN. The hover test above
+    /// drives the splice by hand; a real frame reaches the splice only past the
+    /// settled-screen early-out, whose RepaintKey carries the strip as
+    /// `redraw_tab_strip_state`'s fingerprint. A hover moves no terminal cell, so
+    /// unless that fingerprint moves with it the frame `track_strip_hover`
+    /// requests is skipped and the wash waits for an unrelated present (measured
+    /// on Windows, 2026-10-01: with the cursor not blinking it never came). It
+    /// moves with each hover change, stands still for motion WITHIN a chip, and
+    /// a resting strip's value is exactly the one it had before anything was lit.
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
-    fn the_pointer_leaving_the_window_clears_both_strip_hovers() {
+    fn a_strip_hover_change_moves_the_repaint_key() {
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
         app.tab_strip_rows = 1;
@@ -8363,65 +9096,161 @@ mod tests {
         let pad = app.win_pad(wid) as f64;
         let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
         app.splice_tab_strip_with(wid, 1);
-        let seg = |want_plus: bool| {
+        let seg = |kind: crate::tab_bar::TabHit| {
             app.windows[&wid]
                 .tab_segments
                 .iter()
-                .find(|s| matches!(s.kind, crate::tab_bar::TabHit::NewTab) == want_plus)
+                .find(|s| s.kind == kind)
                 .copied()
-                .expect("the strip laid out both a chip and a +")
+                .expect("the strip laid out a chip and a +")
         };
-        let plus = seg(true);
-        let chip = seg(false);
+        let chip = seg(crate::tab_bar::TabHit::Select(0));
+        let plus = seg(crate::tab_bar::TabHit::NewTab);
         let point = |col: u16| {
             (
                 pad + f64::from(col) * cw as f64 + cw as f64 * 0.5,
                 top + ch as f64 * 0.5,
             )
         };
-        let button_col = plus.start_col + 1;
+        let rest = app.redraw_tab_strip_state(wid);
+        assert_ne!(rest, 0, "a live strip has a fingerprint");
+
+        let p = point(chip.start_col + 1);
+        app.on_cursor_moved(wid, p.0, p.1);
+        assert_eq!(app.windows[&wid].strip_hover, Some(0), "on the chip");
+        let on_chip = app.redraw_tab_strip_state(wid);
+        assert_ne!(on_chip, rest, "lighting a chip moves the repaint key");
+
+        let p = point(chip.start_col + 2);
+        app.on_cursor_moved(wid, p.0, p.1);
+        assert_eq!(
+            app.redraw_tab_strip_state(wid),
+            on_chip,
+            "motion within the chip repaints nothing"
+        );
+
+        let p = point(plus.start_col + 1);
+        app.on_cursor_moved(wid, p.0, p.1);
+        assert!(app.windows[&wid].strip_hover_new_tab, "on the `+`");
+        let on_plus = app.redraw_tab_strip_state(wid);
+        assert_ne!(
+            on_plus, on_chip,
+            "the light moving to the `+` moves the key"
+        );
+        assert_ne!(on_plus, rest);
+
+        app.on_cursor_left(wid);
+        assert_eq!(
+            app.redraw_tab_strip_state(wid),
+            rest,
+            "nothing lit: the resting strip's fingerprint, byte for byte"
+        );
+    }
+
+    /// THE VERSION LABEL'S HOVER, END TO END — the `+`'s three links, for the
+    /// strip's trailing version label (Windows): the motion hook records it
+    /// (and nothing else: no chip, no `+`), the strip CACHE KEY carries the flag
+    /// so the next splice repaints, the painted row takes the band's hover
+    /// material, leaving the window clears it, and moving to the `+` hands the
+    /// light over. The label is laid out only once the UI face is installed, so
+    /// this thread installs it first and clears it after.
+    #[cfg(windows)]
+    #[test]
+    fn hovering_the_version_label_records_it_and_repaints_the_strip() {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        assert!(
+            crate::tray_raster::strip_band_ui_ready(),
+            "Windows always has a UI face to measure the label in"
+        );
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+        app.splice_tab_strip_with(wid, 1);
+        let label = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find(|s| matches!(s.kind, crate::tab_bar::TabHit::Version { .. }))
+            .copied()
+            .expect("the strip lays the version label out once the UI face is in");
+        let plus = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find(|s| s.kind == crate::tab_bar::TabHit::NewTab)
+            .copied()
+            .expect("the strip offers the +");
+        let point = |col: u16| {
+            (
+                pad + f64::from(col) * cw as f64 + cw as f64 * 0.5,
+                top + ch as f64 * 0.5,
+            )
+        };
         let bg_of =
             |app: &crate::App, col: u16| app.windows[&wid].cached_strip_rows[0][col as usize].bg;
-        let resting_button = bg_of(&app, button_col);
-        let resting_chip = bg_of(&app, chip.start_col + 1);
+        let resting = bg_of(&app, label.start_col);
+        let resting_key = app.redraw_tab_strip_state(wid);
 
-        // The `+` lit, then the pointer leaves.
-        let p = point(button_col);
+        // (1) the motion hook records the label, and only the label…
+        let p = point(label.start_col + 3);
         app.on_cursor_moved(wid, p.0, p.1);
-        assert!(app.windows[&wid].strip_hover_new_tab);
+        assert!(
+            app.windows[&wid].strip_hover_version,
+            "the pointer is on the label"
+        );
+        assert!(!app.windows[&wid].strip_hover_new_tab, "…not on the `+`");
+        assert_eq!(app.windows[&wid].strip_hover, None, "…and on no chip");
+        // (1b) …and the RepaintKey's strip term moves, so the frame it asks for
+        // is not swallowed by the settled-screen early-out.
+        assert_ne!(
+            app.redraw_tab_strip_state(wid),
+            resting_key,
+            "the label's hover reaches the glass on its own"
+        );
+
+        // (2) …the cache key carries it, so the next splice REBUILDS…
+        // (3) …and the rebuilt row shows the band's hover material.
         app.splice_tab_strip_with(wid, 1);
-        assert_ne!(resting_button, bg_of(&app, button_col), "the `+` is lit");
+        let hot = bg_of(&app, label.start_col);
+        assert_ne!(resting, hot, "the repaint must reach the rows");
+        assert_eq!(
+            hot,
+            crate::tab_bar::strip_hover_bg_for_test(app.chrome_palette_theme()),
+            "the label takes the band's own hover material"
+        );
+
+        // Leaving the WINDOW clears it, and the clear reaches the row.
         app.on_cursor_left(wid);
         assert!(
-            !app.windows[&wid].strip_hover_new_tab,
-            "leaving the window clears the `+` wash"
+            !app.windows[&wid].strip_hover_version,
+            "leaving clears the label"
         );
         app.splice_tab_strip_with(wid, 1);
+        assert_eq!(bg_of(&app, label.start_col), resting);
         assert_eq!(
-            bg_of(&app, button_col),
-            resting_button,
-            "…and the clear reaches the painted row"
+            app.redraw_tab_strip_state(wid),
+            resting_key,
+            "…and the repaint key is the resting one again"
         );
 
-        // A CHIP lit, then the pointer leaves. The harness window has ONE tab and
-        // that tab is the SELECTED one, whose card and `✕` are the same painted
-        // either way ([`crate::tab_bar::strip_cell`]: hover never overrides the
-        // selection, and the chip-card band keeps the selected `✕` resident), so
-        // the chip's half is pinned at the STATE — which is what feeds the wash
-        // and the hover-only `✕` on every unselected chip.
-        let _ = resting_chip;
-        let q = point(chip.start_col + 1);
+        // Back on the label, then onto the `+`: the light moves to the button.
+        app.on_cursor_moved(wid, p.0, p.1);
+        assert!(app.windows[&wid].strip_hover_version, "re-entry relights");
+        let q = point(plus.start_col + 1);
         app.on_cursor_moved(wid, q.0, q.1);
-        assert_eq!(
-            app.windows[&wid].strip_hover,
-            Some(0),
-            "the chip is hovered"
+        assert!(
+            !app.windows[&wid].strip_hover_version,
+            "leaving the label clears it"
         );
-        app.on_cursor_left(wid);
+        assert!(app.windows[&wid].strip_hover_new_tab, "…and lights the `+`");
+        app.splice_tab_strip_with(wid, 1);
         assert_eq!(
-            app.windows[&wid].strip_hover, None,
-            "leaving the window clears the chip's wash and its `✕`"
+            bg_of(&app, label.start_col),
+            resting,
+            "the label is back to resting"
         );
+        crate::tray_raster::clear_ui_fonts_for_test();
     }
 
     /// I10/I11: the hover cursor resolves BY LOCATION. Over plain grid cells the
@@ -8588,9 +9417,7 @@ mod tests {
     }
 
     /// G17 — a wheel gesture and a button PRESS arm the reader's
-    /// interactive-input-pending hint (the stamp advances across the call);
-    /// a button RELEASE and hover motion do not (structurally: the routing
-    /// contains no arming call — see the source pin below).
+    /// interactive-input-pending hint (the stamp advances across the call).
     #[test]
     fn wheel_and_button_press_arm_the_interactive_input_hint() {
         let mut app = crate::App::headless_for_test();
@@ -8622,35 +9449,6 @@ mod tests {
         assert!(
             crate::metrics::input_pending(),
             "…and the window is live afterwards"
-        );
-    }
-
-    /// G17 — the arming sites are EXACTLY the wheel handler and the press arm
-    /// of the button handler; the hover routing (`route_cursor_moved` and its
-    /// callees in this file) never arms it. Pinned on the source because the
-    /// negative cannot be observed at runtime without racing every other test
-    /// that legitimately arms the process-wide hint.
-    #[test]
-    fn hover_motion_never_arms_the_interactive_input_hint() {
-        let src = include_str!("app_mouse.rs");
-        // Two production CALL sites (statement lines; the doc/comment mentions
-        // and this test's own text are not calls).
-        let calls = src
-            .lines()
-            .filter(|l| l.trim() == "crate::metrics::note_typing_hot();")
-            .count();
-        assert_eq!(
-            calls, 2,
-            "arming sites must be the wheel handler and the press arm only"
-        );
-        let route = src
-            .split("fn route_cursor_moved(")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    }\n").next())
-            .expect("route_cursor_moved body");
-        assert!(
-            !route.contains("note_typing_hot"),
-            "hover routing must not arm the interactive-input hint"
         );
     }
 
@@ -8713,8 +9511,8 @@ mod tests {
         assert_eq!(app.windows[&wid].last_mouse_cell, (5, 11));
 
         // A link-modifier edge is a new question (the plain-text URL probe runs,
-        // over the row's CHARACTERS — no `render_row`); motion inside the cell
-        // with it held is not.
+        // over the row `render_row` resolves); motion inside the cell with it
+        // held is not.
         let before = acq();
         app.on_modifiers_changed(wid, link_modifier());
         assert_eq!(acq() - before, 1, "the modifier edge re-asks once");
@@ -8779,19 +9577,6 @@ mod tests {
             (changed_fill, changed_splice),
             (unchanged_fill, unchanged_splice),
             "a changed frame re-probes the hovered cell under the frame's own hold"
-        );
-
-        // The resolver's grid arm renders no row on the pointer path — pinned on
-        // the source, because the cost is invisible to a runtime assertion.
-        let src = include_str!("app_mouse.rs");
-        let resolver = src
-            .split("fn resolve_hover_cursor(")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    }\n").next())
-            .expect("resolve_hover_cursor body");
-        assert!(
-            !resolver.contains("render_row("),
-            "the hover path must never render a row"
         );
     }
 
@@ -9018,11 +9803,13 @@ mod tests {
 
         let (mut app, wid, before) = app_with_three_chips();
         // Past the trailing `+`, short of the strip's right edge: genuinely bare.
+        // Found BY KIND: with the UI face installed the strip's last segment is
+        // the version label, not the `+`.
         let band = app.windows[&wid]
             .tab_segments
             .iter()
+            .find(|seg| seg.kind == crate::tab_bar::TabHit::NewTab)
             .map(|seg| seg.end_col)
-            .max()
             .expect("a laid-out strip");
         assert!(
             crate::tab_bar::hit_test(&app.windows[&wid].tab_segments, band).is_none(),
@@ -10262,27 +11049,6 @@ mod tests {
             Some(crate::native_settings::SettingsRoute::Messages)
         );
         assert_eq!(selected_message(&app, wid), Some(id.raw()));
-
-        // The overflow row: one link, Settings ▸ Messages at the top, nothing
-        // selected.
-        let mut app = crate::App::headless_for_test();
-        for i in 0..5 {
-            app.post_message(aterm_messages::Message::new(
-                aterm_messages::tags::CONFIG,
-                aterm_messages::Severity::Warn,
-                format!("w{i}"),
-            ));
-        }
-        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(4);
-        let ch = app.win_cell_size(wid).1 as f64;
-        assert!(app.press_band_at(wid, x, y + 2.0 * ch), "the overflow row");
-        assert_eq!(
-            settings_route(&app, wid),
-            Some(crate::native_settings::SettingsRoute::Messages)
-        );
-        assert_eq!(selected_message(&app, wid), None);
     }
 
     /// A PRESS ON THE PASTE QUESTION OVER THE BAND ANSWERS NO FIRST (design
@@ -10372,10 +11138,8 @@ mod tests {
         assert_eq!(settings_route(&app, wid), None);
         app.paste_banner = Some(question(wid));
         let ch = app.win_cell_size(wid).1 as f64;
-        let rows = app
-            .paste_banner
-            .as_ref()
-            .map_or(0, crate::paste_banner::PendingPaste::wanted_rows) as f64;
+        let cols = app.windows[&wid].cols as usize;
+        let rows = app.paste_banner.as_ref().map_or(0, |p| p.wanted_rows(cols)) as f64;
         assert!(
             !app.press_band_at(wid, x, y + rows * ch),
             "below the question, with no band: nobody's press"
@@ -10917,5 +11681,189 @@ mod tests {
             })
         );
         assert!(lit(&app, &link), "the body lights the row's one link");
+    }
+
+    // ---- round 44: the second adversarial hunt's host repros -------------
+
+    /// host-band-R44-HB-1 — the module doc and `paint::band_fp`: the lit chip
+    /// is the chip under the pointer, and a band of no committed row lights
+    /// nothing, by construction. A layout change under a still pointer — the
+    /// pass ends and the band folds to no row — must not leave the old
+    /// capsule's hover standing for the next row to paint lit.
+    #[test]
+    fn r44_hb1_the_band_hover_follows_a_layout_change_under_a_still_pointer() {
+        use crate::message_band::{BandHover, HoverTarget};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let id = app.post_message(toolchain_row());
+        let packages = band_row(&app, wid).capsules[0].clone();
+        let (x, y) = band_pixel(&app, wid)(packages.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            app.windows[&wid].band_hover,
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Capsule(aterm_messages::ActionIndex(0))
+            })
+        );
+        // The pass ends; the band folds to no row; the pointer stays put.
+        assert!(app.resolve_message(id, aterm_messages::Outcome::Ok));
+        let quiet = aterm_messages::SHRINK_QUIET.max(aterm_messages::animate::echo_span(
+            aterm_messages::EchoKind::Complete,
+            0,
+            true,
+        )) + std::time::Duration::from_millis(1);
+        app.settle_messages(std::time::Instant::now() + quiet);
+        assert_eq!(app.message_band_rows, 0, "the band folded");
+        let under = |app: &crate::App| {
+            app.band_hit_at(wid, x, y)
+                .and_then(|target| app.band_hover_for(wid, target))
+        };
+        assert_eq!(
+            under(&app),
+            None,
+            "nothing is under the pointer on the band"
+        );
+        assert_eq!(
+            app.windows[&wid].band_hover,
+            under(&app),
+            "a band of no row still lights the old capsule"
+        );
+    }
+
+    /// host-band-R44-HB-4 — §3.4 and `band_press_acts`: the pointer is a hand
+    /// over a capsule, "there and nowhere else on the band" — and a press there
+    /// acts over a native front too (`press_band_at` in the native press path).
+    /// With Settings ▸ Messages fronting the window (where a band press opens
+    /// it), a lit capsule's pointer is still the hand.
+    #[test]
+    fn r44_hb4_a_band_capsule_over_a_native_front_is_a_hand() {
+        use crate::message_band::{BandHover, HoverTarget};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(
+            app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Messages)
+        );
+        assert!(app.active_native_view(wid).is_some(), "a native front");
+        app.post_message(toolchain_row());
+        let packages = band_row(&app, wid).capsules[0].clone();
+        let (x, y) = band_pixel(&app, wid)(packages.col + 1);
+        let target = app.band_hit_at(wid, x, y).expect("the band");
+        assert!(app.band_press_acts(wid, target), "a press there acts");
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            app.windows[&wid].band_hover,
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Capsule(aterm_messages::ActionIndex(0))
+            }),
+            "the chip lights"
+        );
+        assert!(
+            app.windows[&wid].hover_pointer,
+            "a lit capsule a press acts on, under the arrow"
+        );
+    }
+
+    /// host-band-R44-HB-7 — ruling 373: "a click that lands on a band CAPSULE
+    /// spends one of notice act's presses". A click on a band row that presses
+    /// nothing (the row withdrawn, its row held for the shrink's quiet) spends
+    /// nothing — and is not refused when the budget is spent.
+    #[test]
+    fn r44_hb7_a_pointer_click_that_presses_nothing_on_the_band_spends_nothing() {
+        use aterm_messages::wire::spend_press;
+        let blank_row_click = |app: &mut crate::App| {
+            let wid = crate::WindowId(0);
+            let id = app.post_message(toolchain_row());
+            assert!(app.withdraw_message(id));
+            assert_eq!(app.message_band_rows, 1, "the shrink waits out its quiet");
+            let (x, y) = band_pixel(app, wid)(4);
+            let target = app.band_hit_at(wid, x, y).expect("still the band");
+            assert!(
+                !app.band_press_acts(wid, target),
+                "a press there does nothing"
+            );
+            assert!(
+                app.pointer_cmd(PointerAction::MoveChrome { up: 1, col: 4 })
+                    .is_ok()
+            );
+            app.pointer_cmd(PointerAction::Click)
+        };
+        // With the budget left: the click takes none of the ten.
+        let mut app = crate::App::headless_for_test();
+        assert!(blank_row_click(&mut app).is_ok());
+        let now = std::time::Instant::now();
+        for k in 0..10 {
+            assert!(
+                spend_press(&mut app.wire_gate, now).is_ok(),
+                "press {k}: the click that pressed nothing spent one"
+            );
+        }
+        // With the budget spent: the click is not refused.
+        let mut app = crate::App::headless_for_test();
+        for _ in 0..10 {
+            assert!(spend_press(&mut app.wire_gate, now).is_ok());
+        }
+        let clicked = blank_row_click(&mut app);
+        assert!(clicked.is_ok(), "{clicked:?}");
+    }
+
+    /// Round 44's review of HB-1 (ruling 417 (k)): a retire through the
+    /// host's own verbs (`withdraw_message`, and so a resolve, a dismissal, a
+    /// restate) changes the glass BEFORE the step's settle, whose
+    /// `glass_changed` compares the glass across the settle alone — so the
+    /// lit chip stood over the withdrawn row's echo, and the next row's
+    /// capsule at that index could inherit it, until the pointer moved.
+    #[test]
+    fn r44_review_a_withdrawn_rows_chip_goes_out_under_a_still_pointer() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let id = app.post_message(toolchain_row());
+        let packages = band_row(&app, wid).capsules[0].clone();
+        let (x, y) = band_pixel(&app, wid)(packages.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert!(app.windows[&wid].band_hover.is_some(), "the chip is lit");
+        assert!(app.withdraw_message(id));
+        let under = app
+            .band_hit_at(wid, x, y)
+            .and_then(|target| app.band_hover_for(wid, target));
+        assert_eq!(under, None, "nothing a press acts on is under the pointer");
+        assert_eq!(
+            app.windows[&wid].band_hover, under,
+            "the withdrawn row's chip stayed lit"
+        );
+    }
+
+    /// Round 44's review of HB-1 with HB-4 (ruling 417 (k), (n)): over a
+    /// native front the band's hand is the motion path's native branch's,
+    /// and `refresh_band_hover` re-resolved the cursor through
+    /// `update_hover_cursor`, which leaves a native front's cursor alone. A
+    /// capsule withdrawn under a still pointer put its chip out and left the
+    /// hand standing over a band row that presses nothing.
+    #[test]
+    fn r44_review_a_native_fronts_hand_leaves_with_its_capsule_under_a_still_pointer() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(
+            app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Messages)
+        );
+        assert!(app.active_native_view(wid).is_some(), "a native front");
+        let id = app.post_message(toolchain_row());
+        let packages = band_row(&app, wid).capsules[0].clone();
+        let (x, y) = band_pixel(&app, wid)(packages.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert!(app.windows[&wid].hover_pointer, "the hand over the capsule");
+        assert!(app.withdraw_message(id));
+        assert_eq!(app.message_band_rows, 1, "the shrink waits out its quiet");
+        let target = app.band_hit_at(wid, x, y).expect("still the band");
+        assert!(
+            !app.band_press_acts(wid, target),
+            "a press there does nothing now"
+        );
+        assert_eq!(app.windows[&wid].band_hover, None, "the chip went out");
+        assert!(
+            !app.windows[&wid].hover_pointer,
+            "the hand stood over a band row that presses nothing"
+        );
     }
 }

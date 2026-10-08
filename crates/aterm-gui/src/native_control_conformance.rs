@@ -17,6 +17,7 @@
 use aterm_spec::derive::{Model, native_control_routing_model};
 use aterm_spec::interp::{State, admits};
 
+use crate::conformance_support::assert_sole_transition as assert_transition;
 use crate::control::{
     NativeControlDecision, NativeControlPrincipal, NativeControlTarget, Scope,
     native_control_decision, session_route_decision,
@@ -109,23 +110,6 @@ impl RealRouting {
             ),
         );
         state
-    }
-}
-
-fn assert_transition(model: &Model, before: &State, after: &State, action: &'static str) {
-    assert_eq!(
-        model.successors(action, before).as_slice(),
-        std::slice::from_ref(after),
-        "real transition must conform specifically to {action}"
-    );
-    assert_eq!(admits(model, before, after), Some(action));
-    for invariant in &model.invariants {
-        assert!(
-            model.check_invariant(invariant.name, after),
-            "post-state violates {}::{}: {after:?}",
-            model.name,
-            invariant.name,
-        );
     }
 }
 

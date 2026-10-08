@@ -293,14 +293,11 @@ fn species_heads_do_not_alias_each_other_at_sprite_size() {
     }
 }
 
-/// The completeness gate — the reason this roster exists: EVERY species tag
-/// the builtin lexicon can attach to a word has authored art, and every
-/// authored head is reachable from at least one word. One set, two sources —
-/// plus the one cross-class seam: the `dog` head carries no species tag
-/// because dog words are [`aterm_lexicon::Class::Canine`] (the typed dog
-/// summon's class), which the Occurrence resolver pins to species `dog`. The
-/// seam is asserted, not exempted: the canine class must actually reach the
-/// head, or the head really is orphaned.
+/// Completeness: every species tag the builtin lexicon can attach to a word
+/// has authored art, and every authored head is reachable from a word. The
+/// `dog` head has no species tag because dog words are
+/// [`aterm_lexicon::Class::Canine`], which the Occurrence resolver pins to
+/// species `dog`; that path is asserted too.
 #[test]
 fn lexicon_species_and_authored_roster_are_the_same_set() {
     let authored: BTreeSet<String> = load_all().into_iter().map(|a| a.id).collect();

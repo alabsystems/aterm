@@ -438,7 +438,6 @@ fn find_prev_position_contract_symbolic() {
 
 // ========================================================================
 // Gap coverage: eviction, iterator completeness, iterator ordering
-// Part of #2875
 // ========================================================================
 
 /// Eviction bounds the cache: after indexing beyond max_cached_lines,

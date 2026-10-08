@@ -1,22 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! No-mint-reachability conformance (ATERM_DESIGN §5.4) — the Tier-1 partner of
-//! `aterm_spec::derive::mint_reachability_model`.
+//! No-mint-reachability conformance (`docs/ATERM_DESIGN.md` §5.4), the Tier-1
+//! partner of `aterm_spec::derive::mint_reachability_model`.
 //!
-//! The `ty` model proves the ABSTRACT property (an untrusted actor never reaches
-//! the `Top` mint — invariant `NoUntrustedTop`). This source-scan test binds that
-//! property to the REAL tree, mirroring the `aterm-core/tests/capability_ceremony.rs`
-//! idiom: rustc's feature/visibility rules already enforce the seal in isolated
-//! builds, but a refactor could silently regress it. This guards against exactly
-//! three regressions:
+//! The `ty` model proves the abstract property (an untrusted actor never
+//! reaches the `Top` mint, invariant `NoUntrustedTop`); this source scan binds
+//! it to the tree. It fails when:
 //!
-//! 1. dropping the seal attributes on `root_authority` (feature-cfg + `doc(hidden)`
-//!    + `unsafe`), which would make the mint nameable / discoverable again;
-//! 2. enabling `launcher-mint` in a NON-launcher PRODUCTION dependency table, which
-//!    would give that crate the mint at compile time;
-//! 3. reaching the mint from production (non-`#[cfg(test)]`) code outside the two
-//!    trusted launcher binaries.
+//! 1. the seal attributes on `root_authority` (feature cfg, `doc(hidden)`,
+//!    `unsafe`) are dropped;
+//! 2. a non-launcher production dependency table enables `launcher-mint`;
+//! 3. production (non-`#[cfg(test)]`) code outside the two trusted launchers
+//!    reaches the mint.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -137,7 +133,13 @@ fn no_production_code_outside_launchers_reaches_the_mint() {
             let text = fs::read_to_string(&file).expect("read src");
             // Once a file enters a `#[cfg(test)]` region, the rest is test-only code
             // (matches the real layout: every mint lives under `#[cfg(test)] mod tests`).
-            let mut in_test = false;
+            // A `<stem>_tests.rs` file IS such a module, declared `#[cfg(test)]
+            // #[path = …] mod tests;` in its parent (the shape aterm-pty's unix.rs
+            // tests moved to on 2026-10-06), so it is test-only from its first line,
+            // as grep_guard and aterm-census's is_test_file read it.
+            let mut in_test = file
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"));
             for (i, line) in text.lines().enumerate() {
                 let t = line.trim_start();
                 if t == "#[cfg(test)]" {

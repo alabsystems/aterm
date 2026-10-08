@@ -4,16 +4,15 @@
 //! The presence core proves itself without a host: a [`TestHost`] with a
 //! two-kind wall and a plain stall drives the level ranking, the fold law,
 //! the width law, the sanitizer, the painter and the idle view (design
-//! ruling 348), and — moved from the host in round 31 (ruling 353) — the
-//! row's words against the approved mock, elision, the severity table, the
+//! ruling 348), and the row's words against the approved mock, elision, the severity table, the
 //! story and its watermark, the tone, the durations and the ripple.
 
 use crate::ink::{BandInks, InkedCell};
 use crate::presence::{
     AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, Host, Level, Link, MailFacts,
-    MailLast, PresenceTones, RIPPLE, Rim, Slot, SlotKind, StopCause, Tone, TurnFact, View, Words,
-    fmt_dur, paint_row, prints_seconds, prompt_band_word, sanitize_token, short_sid, stall_words,
-    text_cols, words, words_step,
+    MailLast, PresenceTones, RIPPLE, Rim, Slot, SlotKind, StopCause, Tone, TurnFact, View,
+    WallAnswer, Words, fmt_dur, paint_row, prints_seconds, prompt_band_word, sanitize_token,
+    short_sid, stall_words, text_cols, words, words_step,
 };
 use crate::{Duration, Instant};
 
@@ -27,6 +26,9 @@ pub(crate) enum TestHost {}
 pub(crate) enum TestWall {
     Usage,
     Context,
+    /// An API error the harness retries on its own clock
+    /// ([`Host::wall_retries`]).
+    Api,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +46,7 @@ impl Host for TestHost {
         match kind {
             TestWall::Usage => "wall:usage",
             TestWall::Context => "wall:context",
+            TestWall::Api => "wall:api-error",
         }
     }
 
@@ -51,7 +54,12 @@ impl Host for TestHost {
         match kind {
             TestWall::Usage => "limited",
             TestWall::Context => "context full",
+            TestWall::Api => "can't reach the API",
         }
+    }
+
+    fn wall_retries(kind: TestWall) -> bool {
+        kind == TestWall::Api
     }
 
     fn stall_since(s: &TestStall) -> Instant {
@@ -604,9 +612,8 @@ fn a_clause_prints_seconds_only_on_a_digit_then_s() {
     assert_eq!(words_step(&row(&["2h05m", "12s"])), Duration::from_secs(1));
 }
 
-// ---- moved from the host (round 31, ruling 351 (2)) -------------------------
-// `aterm-gui/src/presence.rs`'s pure `Slot`/`words` tests, bodies verbatim
-// over this file's seam: the usage wall is `TestWall::Usage`, the input stall
+// ---- slot and words (ruling 351 (2)) ---------------------------------------
+// Over this file's seam: the usage wall is `TestWall::Usage`, the input stall
 // a `TestStall`, the slot and facts `TSlot`/`TFacts`.
 
 /// Display width in cells: every glyph the row uses is one cell wide.
@@ -1260,6 +1267,72 @@ fn free_text_is_sanitized_and_the_limit_message_never_appears() {
     );
 }
 
+/// A RETRY'S NEXT TRY LAPSES WITH ITS TIME (the review of 2026-09-29): the
+/// tab printed `can't reach the API → 09:04 · 2m00s` and, once 09:04 had come
+/// and gone, kept `→ 09:04` (the countdown filtered at zero, the arrow not)
+/// and spoke `next try 09:04` — for as long as nothing re-read the session:
+/// a loop parked behind a hold after ERR halted, a worker restarting, a
+/// machine that slept. The window's fold takes an agent reading only when its
+/// sequence is newer, and a plan that lapses by the clock moves nothing, so
+/// the words themselves must drop a next try whose time has come: the wall
+/// names its cause alone again ("it shows only while that wait is real").
+/// NEGATIVE CONTROLS: a wall that names a RESET (a usage window) keeps its
+/// `→ 19:30` and its `resets` after the countdown ends, as it always did,
+/// and a retry with time left prints both.
+#[test]
+fn a_retrys_next_try_lapses_with_its_time() {
+    let now = Instant::now();
+    let retry = |until: Option<Duration>| {
+        slot_of(
+            TFacts {
+                agent_seq: 1,
+                agent: agent(AgentPhase::Wall {
+                    kind: TestWall::Api,
+                    reset: Some("09:04".into()),
+                    until: until.map(|d| now + d),
+                }),
+                ..TFacts::default()
+            },
+            now,
+        )
+    };
+    let s = retry(Some(Duration::from_secs(120)));
+    let w = words(&s, now, 0);
+    assert_eq!(w.phase, "can't reach the API");
+    assert_eq!(w.since, ["\u{2192} 09:04", "2m00s"], "{w:?}");
+    assert!(w.sentence.contains("next try 09:04"), "{}", w.sentence);
+    // Half a minute before it: still ahead.
+    let w = words(&s, now + Duration::from_secs(90), 0);
+    assert_eq!(w.since, ["\u{2192} 09:04", "30s"], "{w:?}");
+    // The time has come, and long since: the cause alone.
+    for late in [120, 121, 3600] {
+        let w = words(&s, now + Duration::from_secs(late), 0);
+        assert_eq!(w.phase, "can't reach the API", "{late}");
+        assert!(w.since.is_empty(), "{late}: {w:?}");
+        assert!(
+            !w.sentence.contains("next try") && !w.sentence.contains("09:04"),
+            "{late}: {}",
+            w.sentence
+        );
+    }
+    // A reset the wall names itself, whose countdown ended, stays.
+    let usage = slot_of(
+        TFacts {
+            agent_seq: 1,
+            agent: agent(AgentPhase::Wall {
+                kind: TestWall::Usage,
+                reset: Some("19:30".into()),
+                until: Some(now + Duration::from_secs(120)),
+            }),
+            ..TFacts::default()
+        },
+        now,
+    );
+    let w = words(&usage, now + Duration::from_secs(3600), 0);
+    assert_eq!(w.since, ["\u{2192} 19:30"], "{w:?}");
+    assert!(w.sentence.contains("resets 19:30"), "{}", w.sentence);
+}
+
 #[test]
 fn durations_read_like_the_mock() {
     assert_eq!(fmt_dur(Duration::from_secs(12)), "12s");
@@ -1300,9 +1373,9 @@ fn window_view_fp_is_zero_when_quiet_and_the_ripple_steps_nine_times() {
 }
 
 /// ADV-6 (model): a stalled link with no date behind it (a bridge still
-/// dialing since it attached) has no age — the composer used to print
-/// `~ 0s` and speak "bridge stalled 0 seconds". The glyph alone now, and
-/// the sentence names no figure; a dated stall still prints its seconds.
+/// dialing since it attached) has no age, never `~ 0s` or "bridge stalled
+/// 0 seconds": the glyph alone, and the sentence names no figure; a dated stall still prints its
+/// seconds.
 #[test]
 fn adv6_a_stall_of_unknown_age_prints_no_figure() {
     let now = Instant::now();
@@ -1337,8 +1410,8 @@ fn adv6_a_stall_of_unknown_age_prints_no_figure() {
     );
 }
 
-/// ADV-7 (model): a hold the slot first sees at its mint used to be dated
-/// from the mint. Nothing in `Hold` says when it began, so the model
+/// ADV-7 (model): a hold the slot first sees at its mint is not dated from
+/// the mint. Nothing in `Hold` says when it began, so the model
 /// cannot know: the first absorb is the baseline, the hold is state with
 /// no figure, and when it lifts the story says `resumed N ago` without a
 /// length it never measured. A hold that BEGINS after the baseline is
@@ -1402,4 +1475,120 @@ fn adv7_a_hold_seen_at_first_sight_has_no_made_up_duration() {
         "{:?}",
         w.since
     );
+}
+
+/// A WALL THE HARNESS ANSWERS IS A RECORD, NOT A STOP: an alert nobody needs
+/// to act on does not persist. A shell-plus-wall tab reads `wall:*`, and a
+/// wall the supervisor will resume by itself stands at `Note`: no rim, no
+/// chip, no warn tone, the row still there with its reset and its countdown and
+/// the words saying the harness resumes it. NEGATIVE CONTROLS: nobody answering
+/// keeps the stop; a prompt, a question or a person's hand still outranks it.
+#[test]
+fn a_wall_the_harness_answers_is_a_note_and_a_wall_nobody_answers_is_a_stop() {
+    let now = Instant::now();
+    let wall = |answer: WallAnswer, reset: Option<&str>, left: Option<u64>| {
+        slot_of(
+            TFacts {
+                agent_seq: 1,
+                agent: agent(AgentPhase::Wall {
+                    kind: TestWall::Usage,
+                    reset: reset.map(str::to_string),
+                    until: left.map(|s| now + Duration::from_secs(s)),
+                }),
+                wall_answer: answer,
+                ..TFacts::default()
+            },
+            now,
+        )
+    };
+    // The harness resumes it: a note. The row is there, the chrome is not.
+    let handled = wall(WallAnswer::Harness, Some("4pm"), Some(13_260));
+    // The wall arriving is a story point (a dot on the chip until the human
+    // looks: "something happened while you were away", self-clearing); once
+    // it has been looked at, what stands is the note.
+    assert_eq!(handled.level(0), Level::Story);
+    let looked = handled.story_seq;
+    assert_eq!(handled.level(looked), Level::Note);
+    assert_eq!(handled.shown_level(looked), Level::Note);
+    assert_eq!(handled.level(looked).rim(), Rim::None);
+    assert_eq!(handled.chip(looked), ChipLevel::Off);
+    assert!(handled.level(looked).shows_row(), "the row is the record");
+    assert_eq!(handled.tone(now, looked), Tone::Info, "no warn tone");
+    assert!(
+        !handled.calm(),
+        "the row does not fold on a keystroke while the wall stands"
+    );
+    let w = words(&handled, now, looked);
+    assert_eq!(w.phase, "limited");
+    assert_eq!(
+        w.since,
+        ["\u{2192} 4pm", "3h41m"],
+        "the reset and the time to it, as before"
+    );
+    assert!(w.sentence.contains("resumes by itself"), "{}", w.sentence);
+    // Nobody answers it: the stop, as ever.
+    let unanswered = wall(WallAnswer::Nobody, Some("4pm"), Some(13_260));
+    assert_eq!(unanswered.level(looked), Level::Limited);
+    assert_eq!(unanswered.level(looked).rim(), Rim::Stop { hold: false });
+    assert_eq!(unanswered.chip(looked), ChipLevel::Stop(StopCause::Wall));
+    assert_eq!(unanswered.tone(now, looked), Tone::Warn);
+    assert!(
+        !words(&unanswered, now, looked)
+            .sentence
+            .contains("resumes by itself")
+    );
+    // A wall the harness resumes slowly and a person can lift sooner: still a
+    // note, with the ONE action in the row and in the sentence.
+    let asks = wall(WallAnswer::HarnessAsks("/model to switch"), None, None);
+    assert_eq!(asks.level(looked), Level::Note);
+    assert_eq!(asks.chip(looked), ChipLevel::Off);
+    let w = words(&asks, now, looked);
+    assert_eq!(w.since, ["\u{2192} /model to switch"]);
+    assert!(
+        w.sentence
+            .contains("resumes by itself, or sooner: /model to switch"),
+        "{}",
+        w.sentence
+    );
+    // CONTROL: a hold, a prompt and a person's keyboard still outrank the note.
+    let prompt = slot_of(
+        TFacts {
+            agent_seq: 1,
+            agent: agent(AgentPhase::Prompt { detail: None }),
+            wall_answer: WallAnswer::Harness,
+            ..TFacts::default()
+        },
+        now,
+    );
+    assert_eq!(prompt.level(looked), Level::Attention);
+    let driven_wall = slot_of(
+        TFacts {
+            agent_seq: 1,
+            agent: agent(AgentPhase::Wall {
+                kind: TestWall::Usage,
+                reset: None,
+                until: None,
+            }),
+            wall_answer: WallAnswer::Harness,
+            ..driven_facts()
+        },
+        now,
+    );
+    assert_eq!(driven_wall.level(looked), Level::Driven);
+    // The answer moving (a claim lapses) is a change the view must repaint.
+    let mut s = wall(WallAnswer::Harness, Some("4pm"), None);
+    let mut facts = TFacts {
+        agent_seq: 1,
+        agent: agent(AgentPhase::Wall {
+            kind: TestWall::Usage,
+            reset: Some("4pm".to_string()),
+            until: None,
+        }),
+        wall_answer: WallAnswer::Nobody,
+        ..TFacts::default()
+    };
+    assert!(s.absorb(facts.clone(), now), "the answer moved");
+    assert_eq!(s.level(looked), Level::Limited);
+    facts.agent_seq = 2;
+    assert!(!s.absorb(facts, now), "nothing moved");
 }

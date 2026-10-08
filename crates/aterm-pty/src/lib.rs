@@ -3,20 +3,18 @@
 
 //! The single PTY spawn + IO seam (ATERM_DESIGN WS-G).
 //!
-//! Every raw PTY primitive — Unix `forkpty`, `execve`, `read`, `write`,
-//! `ioctl(TIOCSWINSZ)`, and the two queue probes [`input_queue_len`]
-//! (`FIONREAD`: input the program has not read) and [`output_queue_len`]
-//! (`TIOCOUTQ`: output aterm has not read), macOS-only readings added
-//! 2026-09-24 when a frozen program's unread Enter was invisible to every
-//! driver, with [`flush_input_queue`] (`TCIFLUSH`, 2026-09-25) to drop that
-//! input before a restart hands it to the shell; Windows ConPTY (`CreatePseudoConsole` + anonymous pipes) — is
-//! contained HERE, in one auditable crate, so the frontend holds no unsafe PTY
-//! code and there is exactly one place where a child process is spawned. The master is returned as a raw `i32` because aterm's frontend
-//! shares it across the input, reader, and control-socket threads (the same
-//! sharing it already did); the unsafe is what moves, not the ownership model.
+//! Every raw PTY primitive — Unix `open_pty_pair_cloexec` + `fork` +
+//! `login_tty`, `execve`, `read`, `write`, `ioctl(TIOCSWINSZ)`, the queue
+//! probes [`input_queue_len`] (`FIONREAD`: input the program has not read) and
+//! [`output_queue_len`] (`TIOCOUTQ`: output aterm has not read), and
+//! [`flush_input_queue`] (`TCIFLUSH`); Windows ConPTY (`CreatePseudoConsole` +
+//! anonymous pipes) — lives in this one auditable crate, so the frontend holds
+//! no unsafe PTY code and there is exactly one place a child is spawned. The
+//! master is a raw `i32` because the frontend shares it across the input,
+//! reader and control-socket threads.
 //!
-//! Platform split (module split, no inline cfg): `src/unix.rs` is the shipping
-//! POSIX seam moved verbatim; `src/windows/` is the ConPTY backend. On Unix the
+//! Platform split (module split, no inline cfg): `src/unix.rs` is the POSIX
+//! seam; `src/windows/` is the ConPTY backend. On Unix the
 //! `i32` IS the PTY master fd; on Windows it is an opaque, always-`>= 0` key
 //! into a process-global session registry that owns the real HANDLEs. Every
 //! public signature is identical on both platforms; Windows adds only
@@ -30,7 +28,7 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 /// A successfully spawned shell: the PTY master fd plus the child's pid. The
-/// child is a session + process-group leader (`forkpty` -> `login_tty` ->
+/// child is a session + process-group leader (`fork` -> `login_tty` ->
 /// `setsid`), so `pid` doubles as the pgid: a `SIGHUP` to it (or `killpg`) tears
 /// the whole job tree down. Exposed so the frontend can HANG UP the child first
 /// — making the slave produce EOF so the reader's blocking `read(master)` returns
@@ -57,13 +55,12 @@ pub struct SpawnedShell {
 /// in aterm's own environment never leaks into the spawned shell, while explicitly
 /// injected vars (TERM, shell integration) are always preserved.
 ///
-/// Called by [`spawn_shell_with_pid`] in the PARENT (before `forkpty`), so it stays
+/// Called by [`spawn_shell_with_pid`] in the PARENT (before the `fork`), so it stays
 /// async-signal-safe (no child-side allocation). A non-UTF-8 key is classified by
 /// its lossy spelling, so a deny-listed PREFIX on one still denies it. Pure in
-/// its inputs so the wiring is unit-tested without mutating the process-global env
-/// (the same approach `classify_write_result` uses for `write_all`'s branch ladder).
-/// Shared verbatim by BOTH platform spawns (the Windows env-block builder applies
-/// its case-insensitive dedupe on top of this exact output). The deny check itself
+/// its inputs so it is unit-tested without mutating the process-global env.
+/// Shared by both platform spawns (the Windows env-block builder applies
+/// its case-insensitive dedupe on top of this output). The deny check itself
 /// is case-insensitive on Windows only — see
 /// [`aterm_types::domain::is_ai_env_key`], the one classifier.
 // Skip: the `impl Iterator` parameter is CALLER-CHOSEN code — `next` is an
@@ -78,11 +75,7 @@ fn build_child_env(
     // Explicit loops instead of `filter(..).collect()` / `iter_mut().find(..)`:
     // the closure bodies those adapters lower to are absent callees for the Trust
     // panic-freedom verifier, leaving the obligations at the closure sites
-    // unprovable. The loops below are the adapters' exact operational semantics —
-    // `filter` keeps each passing element in encounter order (the push loop),
-    // `find` yields the FIRST match and stops (the `break`), and the miss arm
-    // appends — so the output Vec is element-for-element identical to the former
-    // adapter pipeline on every input.
+    // unprovable. The loops keep encounter order and replace the FIRST match.
     let mut env_pairs: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
     for (k, v) in inherited {
         if !aterm_types::domain::is_ai_env_key(&k) {
@@ -181,19 +174,12 @@ impl TtySignals {
 /// WHICH process a session's shell pid named when the session took it — the
 /// identity every pid-addressed signal at teardown must re-verify first.
 ///
-/// THE DEFECT THIS CLOSES (robustness audit, 2026-09-26, backlog item 5): the
-/// GUI's `Session::drop` sent `killpg(pid, SIGHUP)` and, 250 ms later from the
-/// reaper, `killpg(pid, SIGKILL)` to whatever the shell's pid named at CLOSE
-/// time. For a shell this process spawned that is sound until the status path
-/// reaps it (it latches that). For a shell ADOPTED across a seamless update it
-/// was not: launchd is the parent, so nothing here ever reaps it, the pid is
-/// freed the moment it exits, and the only guard left was `reap`'s
-/// `getpgid(pid) == pid` — which every job-control group leader and every
-/// daemon passes. The trigger is an adopted shell that exits while the pane
-/// stays open (`--hold`, or a disowned job keeping the terminal open), the
-/// kernel reissuing its pid, then the tab closing: SIGHUP then SIGKILL to an
-/// unrelated process group — a build in another terminal, say. 4 of the 5
-/// live tabs in the owner's window that day were adopted.
+/// Why: a shell ADOPTED across a seamless update has launchd as its parent,
+/// so nothing here reaps it and its pid is freed the moment it exits. If the
+/// pane stays open (`--hold`, a disowned job) and the kernel reissues the pid,
+/// a teardown `killpg(pid, SIGHUP/SIGKILL)` would hit an unrelated process
+/// group; `getpgid(pid) == pid` does not tell them apart, since every
+/// job-control group leader passes it.
 ///
 /// So the session records the identity when it TAKES the shell, while it is
 /// provably the shell ([`record_spawned_shell`]: our own unreaped child;
@@ -255,7 +241,7 @@ impl ShellIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellHangup {
     /// The recorded shell was verified and its process group got `SIGHUP`
-    /// (the historical teardown, `docs/DESIGN-pty-keeper-2026-09-26.md` F3).
+    /// (`docs/DESIGN-pty-keeper-2026-09-26.md` F3).
     Shell(i32),
     /// The shell could not be verified; the terminal's own foreground process
     /// group (`tcgetpgrp(master)` — a group that is on this tty by definition)
@@ -291,17 +277,20 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+// Test-only: this test process forks outside `InheritStrip::prepare` (the
+// fork-safety probe's raw `fork`s, a `setsid` stand-in's `pre_exec`) while
+// sibling tests make libnotify calls on other threads — measured, a child lost
+// inside `fork()` in 4 of 160 loaded runs. So libnotify's once-gate is passed at
+// image load, before the harness starts a thread.
+#[cfg(all(test, target_os = "macos"))]
+aterm_uds::pass_libnotify_gate_at_load!();
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---- env-sanitization seam wiring (the deny-list is actually APPLIED) ----
-    //
-    // REGRESSION: the deny-list CLASSIFIER (`is_ai_env_var`) is unit-tested in
-    // aterm-types, but the PTY spawn seam never CALLED it — so AI-tool vars and the
-    // provisioning vars leaked into every child shell. This proves `build_child_env`
-    // (which `spawn_shell_with_pid` uses to build `envp`) drops the deny-listed keys
-    // while keeping ordinary vars, and that `env_add` still overrides.
+    // `build_child_env` (the spawn's `envp`) drops deny-listed keys, keeps
+    // ordinary vars, and lets `env_add` override.
     #[test]
     fn build_child_env_drops_denylisted_and_keeps_overrides() {
         use std::ffi::OsString;
@@ -352,12 +341,9 @@ mod tests {
         );
     }
 
-    /// A NON-UTF-8 key that carries a deny-listed PREFIX is still denied
-    /// (2026-09-27). `is_denied_env_key` let every non-UTF-8 key through on the
-    /// grounds that "every deny-listed name is ASCII" — true of the exact names,
-    /// but the prefixes match a key's leading bytes, so `ANTHROPIC_\xffX` kept
-    /// its `ANTHROPIC_` and reached the child shell. The last key is the control:
-    /// a non-UTF-8 key with no deny-listed prefix still passes.
+    /// A NON-UTF-8 key that carries a deny-listed PREFIX is still denied:
+    /// prefixes match a key's leading bytes, so `ANTHROPIC_\xffX` is denied.
+    /// The last key is the control: no deny-listed prefix, so it passes.
     #[cfg(unix)]
     #[test]
     fn a_non_utf8_key_with_a_denied_prefix_is_still_denied() {
@@ -375,7 +361,7 @@ mod tests {
         assert_eq!(keys, vec![b"PLAIN_\xffKEY".to_vec()]);
     }
 
-    /// THE IDENTITY SEAM (session identities, 2026-09-17). A session spawned
+    /// THE IDENTITY SEAM. A session spawned
     /// with `identity=<name>` gets each agent's home variable pointed into the
     /// identity dir through `env_add`, which this builder applies AFTER the
     /// deny pass. For every variable the identity table sets (the primer's

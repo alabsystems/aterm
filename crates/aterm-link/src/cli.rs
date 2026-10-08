@@ -3,7 +3,7 @@
 
 //! `aterm-link` — the fabric bridge's command line.
 //!
-//! A3 implements two of the subcommands §11.2 lists:
+//! The two bridge subcommands §11.2 lists (USAGE has the rest):
 //!
 //! ```text
 //! aterm-link serve --fleet <F> --broker <ep> [--tcp] [--key-file PATH]
@@ -13,19 +13,13 @@
 //!                  --cap-file <path>… [--attention]
 //! ```
 //!
-//! An unknown word is refused BY NAME rather than answered with the usage text:
-//! a typo that prints help reads as a request for help rather than as the
-//! mistake it was. Three names — `wake`, `pin` and `lash` — used to have an arm
-//! of their own saying they were "a later rung"; round 21 removed it, and they
-//! are now unknown subcommands like any other. Both answers are exit 2; what
-//! changed is that this file no longer promises a rung nobody is building.
+//! An unknown word is refused BY NAME (exit 2) rather than answered with the
+//! usage text: a typo that prints help reads as a request for help.
 //!
-//! The one exception is `hook`, removed in round 25: a hook entry that survived the
-//! removal still runs it on every prompt, and an exit 2 there is Claude Code's BLOCKING
-//! error, so it answers exit 0 with nothing on stdout and one line on stderr
-//! (`retired_hook`), and keeps answering that way permanently (decided 2026-09-25 under
-//! the owner's standing direction: a stale project-level hook entry must never block a
-//! prompt, and no cleanup pass can reach every project's settings file).
+//! The one exception is the retired `hook`: a surviving hook entry still runs
+//! it on every prompt, and exit 2 there is Claude Code's BLOCKING error, so it
+//! answers exit 0, nothing on stdout, one line on stderr ([`retired_hook`]) —
+//! permanently, since no cleanup can reach every project's settings file.
 //!
 //! ## `ls` PRINTS §7'S COLUMNS, AND SAYS WHICH OF THEM HAVE NO WRITER
 //!
@@ -40,28 +34,23 @@
 //!
 //! * `driving=` is in §4.2's presence body but
 //!   [`crate::bridge::Bridge::publish_session_presence`] does not publish it,
-//!   so every row shows `-` today. (`role=` and `detail=` HAVE a writer since
-//!   round 13 — the bridge's presence sampler, [`crate::presence`] — on a
-//!   bridge running with `presence = "meta"`, the default; a `minimal` bridge
-//!   and one that predates round 13 still show `-`.)
+//!   so every row shows `-`. (`role=` and `detail=` are written by
+//!   [`crate::presence`] on a `presence = "meta"` bridge, the default; a
+//!   `minimal` bridge shows `-`.)
 //! * `host=` and `fabric=` are published on the NODE's own presence row only
-//!   (`bridge.rs`'s `bring_presence_up`), deliberately: `fabric=` on a session
-//!   row was a constant nothing could falsify, and the bridge's own header says
-//!   why it was removed. A session row therefore shows `-` for both, and the
-//!   node row above it carries the real answer.
+//!   (`bridge.rs`'s `bring_presence_up`): `fabric=` on a session row was a
+//!   constant nothing could falsify. A session row shows `-` for both; the
+//!   node row above it carries the answer.
 //!
 //! SIX COLUMNS ARE ADDED to §7's set, at the end, because each has a real
 //! writer and a real reader: `gen=` (§6.6's `<content_seq>:<fp16>`, what a
 //! `gen=`-bound approval is minted against), `observer=` (§11.2's watching,
 //! non-hosting attachment — a row an operator must not read as a host),
-//! `epoch=` (the launch nonce a drive record is fenced on), and round 13's
-//! `phase=` (busy | idle | prompt | question | limited | survey — the
-//! server's `status agent=` verdict, relayed), `context=` (no longer written
-//! since 2026-09-23 — the server publishes no context figure — and printed
-//! for rows an older bridge wrote) and `title=` (the session's `meta set
-//! title` user title, else `-`; NEVER the terminal's title, which the program
-//! writes — [`crate::presence`]; 128 bytes). Dropping them to match §7
-//! exactly would lose the only face they have.
+//! `epoch=` (the launch nonce a drive record is fenced on), `phase=` (the
+//! server's `status agent=` verdict, relayed), `context=` (no longer written;
+//! printed for rows an older bridge wrote) and `title=` (the session's `meta
+//! set title` user title, else `-`; NEVER the terminal's title, which the
+//! program writes — [`crate::presence`]; 128 bytes).
 //!
 //! EVERY PRINTED FIELD IS UNTRUSTED. A presence body is written by whatever node
 //! holds `rw,p=<n>:/f/<F>/pub/<n>/>`, and `attention=` is free text a session
@@ -94,7 +83,7 @@ macro_rules! build_line {
 /// Its LAST LINE says whether this build carries the sealed transport
 /// (`build_line!`) — the one fact about a binary its flags cannot show, and
 /// the one `aterm fabric join` and `on --tcp` read off the binary they will
-/// write into a bridge command ([`crate::enable`]'s `binary_has_sealed`).
+/// write into a bridge command ([`crate::enable`]'s `binary_has_link`).
 const USAGE: &str = concat!(
     "\
 aterm-link — the aterm fabric bridge
@@ -110,9 +99,10 @@ aterm-link — the aterm fabric bridge
   aterm-link fabric ...  the same as `aterm fabric` (`fabric help` for its usage)
 
 `ls` defaults its flags from the rendezvous file `aterm fabric on` (or `join`) writes
-beside the instance control sockets (fabric.toml): --fleet, --broker, --cap-file and
---state — and --tcp --key-file with a defaulted --broker on a host that joined over the
-sealed wire. A flag given on the command line wins.
+beside the instance control sockets (fabric.toml): --fleet and --broker, and WITH a
+defaulted --broker only, the node's --cap-file and --state (a cap is minted for that one
+broker, so it is never presented to a --broker you named) and, on a host that joined
+over the sealed wire, --tcp --key-file. A flag given on the command line wins.
 
   --fleet <F>            the fleet name (the `/f/<F>/` subtree)
   --broker <ep>          the broker: a Unix socket path, or <host>:<port> with --tcp
@@ -158,11 +148,8 @@ pub const SEALED_BUILD_MARK: &str = "sealed TCP transport compiled in";
 
 /// The bridge's whole command line, as a LIBRARY entry.
 ///
-/// It lives here and not behind a `main` so the ONE `aterm` binary can carry
-/// it: this repository ships a single Mach-O with argv0 symlinks beside it
-/// (`expose = ["aterm"]`, `bundle = []`), so a second executable would simply
-/// never reach a user. `aterm link ...` and the `aterm-link` symlink both land
-/// here; `src/main.rs` is a shim for a direct `cargo run`.
+/// A library entry so the ONE `aterm` binary carries it: `aterm link ...` and
+/// the `aterm-link` symlink both land here; `src/main.rs` is a dev shim.
 #[must_use]
 pub fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
@@ -172,10 +159,8 @@ pub fn dispatch(args: &[String]) -> ExitCode {
         // every flag spelled out and a bridge that silently took a different
         // broker than its config names would be the report lying about itself.
         //
-        // NO RENDEZVOUS FILE AND NO FLAGS: say exactly what was checked, not
-        // "no fabric" — a hand-written `[fabric] command` or a bridge armed by
-        // `ctl fabric attach` writes no rendezvous file — and not the whole
-        // usage under it.
+        // No rendezvous file and no flags: say what was checked, not "no
+        // fabric" — a hand-written `[fabric] command` writes no rendezvous file.
         Some("ls") => {
             let given = |flag: &str| args[1..].iter().any(|a| a == flag);
             if !given("--fleet")
@@ -196,17 +181,12 @@ pub fn dispatch(args: &[String]) -> ExitCode {
         Some("fabric") => crate::fabric::main(&args[1..]),
         // THE RETIRED `hook` VERB: a silent no-op, never a refusal ([`retired_hook`]).
         Some("hook") => retired_hook(),
-        // Asked for: stdout, exit 0 — the same contract `aterm --help` and the
-        // `broker -h` / `mint -h` children keep. Before this the front door
-        // answered its own `--help` with exit 2 on stderr, disagreeing with
-        // every one of its children.
+        // Asked for: stdout, exit 0, like `aterm --help` and `broker -h`.
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        // Refused BY NAME, the rule this file's header states. An unknown word
-        // used to print the usage indistinguishably from `--help`, so a typo
-        // read as a request for help rather than as the mistake it was.
+        // Refused BY NAME (module doc).
         Some(other) => {
             eprintln!("aterm-link: unknown subcommand `{other}`");
             eprint!("{USAGE}");
@@ -225,24 +205,15 @@ pub const RETIRED_HOOK_LINE: &str =
      that runs it";
 
 /// `aterm link hook …`, any arguments: EXIT 0, NOTHING ON STDOUT, one stderr line
-/// ([`RETIRED_HOOK_LINE`]) — KEPT PERMANENTLY. Decided 2026-09-25 under the owner's
-/// standing direction: the tombstone is fifteen lines, and removing it would bring back
-/// the blocking-hook failure below for every project-level entry still out there.
+/// ([`RETIRED_HOOK_LINE`]) — kept permanently.
 ///
-/// Round 25 cut the vendor hooks (59c3bee59), and the agents pass takes the entries aterm
-/// wrote out of `~/.claude/settings.json` — but never out of a PROJECT's
-/// `.claude/settings.local.json`, nor on a host the pass has not reached yet, nor from a
-/// Claude Code already running (it reads its hooks at startup). Refused by name like any
-/// unknown word, a surviving `aterm link hook run user-prompt-submit …` entry exited 2,
-/// which Claude Code reads as a BLOCKING error: after an upgrade every prompt was blocked
-/// (round-25 review, 2026-09-23, measured on the real binary). So the verb is answered with
-/// nothing: exit 0 is "go on", and stdout stays empty because a `UserPromptSubmit` or
-/// `SessionStart` hook's stdout is added to the model's context. What the vendor writes on
-/// stdin — the event's JSON, a whole pasted prompt for `UserPromptSubmit` — is read to its
-/// end first, so its write never meets a closed pipe: Claude Code closes the pipe once the
-/// JSON is written, and no byte cap is kept, because a cap bounds no time and a prompt over
-/// it would meet exactly that closed pipe (round-25 follow-up review, 2026-09-23). Never
-/// read from a terminal: a person typing the verb gets the line at once.
+/// A hook entry aterm once wrote can survive in a project's
+/// `.claude/settings.local.json` or a running Claude Code, and exit 2 there is
+/// Claude Code's BLOCKING error. Exit 0 is "go on"; stdout stays empty because a
+/// `UserPromptSubmit` or `SessionStart` hook's stdout joins the model's context.
+/// Stdin (the event's JSON, possibly a whole pasted prompt) is drained first, with
+/// no byte cap, so the writer never meets a closed pipe. Never read from a
+/// terminal: a person typing the verb gets the line at once.
 fn retired_hook() -> ExitCode {
     use std::io::IsTerminal as _;
     let stdin = std::io::stdin();
@@ -254,10 +225,9 @@ fn retired_hook() -> ExitCode {
 }
 
 fn run(args: &[String], serve: bool) -> ExitCode {
-    // THE SEALED WIRE IN A BUILD WITHOUT IT is refused here, by name, for
-    // `serve` and `ls` alike, and before `parse` reads the key file: `serve`
-    // would otherwise redial a connect that can never succeed, silently, for
-    // ever. Not in `parse`, which `aterm fabric` also reads a sealed host's
+    // THE SEALED WIRE IN A BUILD WITHOUT IT is refused here, by name, before
+    // `parse` reads the key file: `serve` would otherwise redial for ever. Not
+    // in `parse`, which `aterm fabric` also reads a sealed host's
     // `[fabric] command` with.
     if let Some(refusal) = transport::sealed_flags_refusal(args) {
         eprintln!("aterm-link: --key-file: {refusal}");
@@ -272,26 +242,20 @@ fn run(args: &[String], serve: bool) -> ExitCode {
         }
     };
     if serve {
-        // `--attention` IS AN `ls` FILTER, and `serve` refuses it BY NAME rather
-        // than ignoring it: a flag that parsed and did nothing is the failure
-        // this crate refuses everywhere else (`--handshake`, and every unknown
-        // subcommand).
+        // `--attention` is an `ls` filter; `serve` refuses it by name rather
+        // than parsing it and doing nothing.
         if parsed.attention {
             eprintln!("aterm-link: --attention is an `ls` filter; `serve` has no roster");
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
         let mut cfg = parsed.cfg;
-        // THE ONE FLAG `serve` DOES DEFAULT FROM A FILE: `[fabric] presence`
-        // is a knob on what the bridge publishes, not on which broker it
-        // reaches, so reading it from aterm.toml cannot make the report lie
-        // about the bus — and it is where the design says the knob lives.
+        // `serve` defaults `[fabric] presence` and `[fabric] receipts` from
+        // aterm.toml: they are knobs on what the bridge publishes, not on which
+        // broker it reaches, so they cannot make the report lie about the bus.
         if !parsed.presence_given {
             cfg.presence = crate::fabric::presence_from_config();
         }
-        // AND `[fabric] receipts`, by the same argument: a knob on what the
-        // bridge publishes about its own sessions' decisions, not on which
-        // broker it reaches.
         if !parsed.receipts_given {
             cfg.receipts = crate::fabric::receipts_from_config();
         }
@@ -337,26 +301,13 @@ pub(crate) struct Parsed {
 /// ASCII, no whitespace, no escape sequence, one token per column.
 fn column(raw: &str) -> String {
     let mut safe = crate::pct::encode(&crate::pct::decode(raw));
-    // AND IT IS BOUNDED, by the SAME number the other two readers of a presence
-    // token use. `presence.rs`'s `token` caps what the bridge publishes at
-    // [`crate::glance::ATTENTION_CAP`] and `glance.rs` caps what it renders
-    // at the same constant; a roster that printed the token whole would be a
-    // third reader of one field with a bound of its own — which is the shape of
-    // defect this crate keeps re-finding. A row is written by another host and
-    // nothing on the bus obliges it to have used the bridge's own writer.
-    //
-    // The truncation is on an ESCAPE boundary, never inside a `%XX`, which is
-    // the rule `presence::token` already applies; the mark is `pct::encode("…")`,
-    // the same ellipsis `glance::truncate` appends, kept ASCII so the row is
-    // still one printable token per column.
+    // BOUNDED by the same [`crate::glance::ATTENTION_CAP`] the bridge's writer
+    // and `glance` use: a row from another host need not have gone through
+    // the bridge's writer. The cut is on an escape boundary, never inside a
+    // `%XX`, and the mark is the ASCII-encoded ellipsis `glance` appends.
     if safe.len() > crate::glance::ATTENTION_CAP {
-        // THE MARK IS INSIDE THE CAP: a reader sizing anything from
-        // `ATTENTION_CAP` must never be handed `cap + <the mark>`, which is the
-        // whole reason to have one number rather than one number and a bit.
-        safe.truncate(crate::glance::ATTENTION_CAP - ELLIPSIS.len());
-        while safe.ends_with('%') || (safe.len() >= 2 && safe.as_bytes()[safe.len() - 2] == b'%') {
-            safe.pop();
-        }
+        // The mark is inside the cap.
+        safe = crate::presence::clamp_pct(&safe, crate::glance::ATTENTION_CAP - ELLIPSIS.len());
         safe.push_str(ELLIPSIS);
     }
     if safe.is_empty() {
@@ -374,24 +325,12 @@ const ELLIPSIS: &str = "%E2%80%A6";
 /// is one bounded last-value walk and no filesystem scan, no `dial`, and no
 /// saved peer names.
 ///
-/// IT PAGES ON THE RESUME CURSOR, through the crate's one walk
-/// ([`transport::walk_last`]), and it did not always: it used to call
-/// `Client::last` — which drops the cursor before its caller can see it — and
-/// stop on an EMPTY PAGE, which the broker's own contract says is not the end of
-/// the answer. A short roster is indistinguishable from a small fleet, and
-/// `--attention` printing nothing is indistinguishable from nobody escalating,
-/// so a walk that could not FINISH is an error here and not an absence.
+/// It pages on the resume cursor through [`transport::walk_last`]; an empty
+/// page is not the end of the answer. A short roster is indistinguishable from
+/// a small fleet, so a walk that could not FINISH is an error, not an absence.
 ///
-/// THE ROW IS §7's, in §7's order, with §7's names — see the module header for
-/// which of its columns have no writer in this fabric yet (they print `-`) and
-/// for the three that are appended to it. `attention_only` is §9.3's
-/// `--attention`: the cross-host escalation view, which is the same one `Last`
-/// and a filter on the field the notifier fires on (§4.2, A10).
-///
-/// A row that carries no `attention=`, an empty one, or the `-` an absent field
-/// renders as, is not an escalation — the same three-way test
-/// `notify::Sel::Attention` makes, so the two faces of the same question cannot
-/// disagree.
+/// The row is §7's (module header). `attention_only` is §9.3's `--attention`:
+/// the same `Last` filtered on the field the notifier fires on (§4.2, A10).
 fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
     let (mut client, _closer) = transport::connect(&cfg.transport, &cfg.broker).map_err(|e| {
         std::io::Error::new(
@@ -399,11 +338,7 @@ fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
             format!("cannot connect to the broker at {}: {e}", cfg.broker),
         )
     })?;
-    for path in &cfg.cap_files {
-        for cap in crate::bridge::read_cap_file(path)? {
-            client.attach(&cap.grant, &cap.tag)?;
-        }
-    }
+    crate::fabric::attach_caps(&mut client, cfg)?;
     let filter = format!("/f/{}/pub/*/*/presence", cfg.fleet);
     transport::walk_last(&mut client, &filter, |(_, subject, raw)| {
         let (body, _) = crate::body::Body::decode(raw);
@@ -415,12 +350,8 @@ fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
     })
 }
 
-/// One roster line, and whether it is an ESCALATION.
-///
-/// Split out of [`roster`] so the column set §7 pins is checkable without a
-/// broker: the order and the names of the columns are the claim, and a claim
-/// this crate makes in a doc comment is the only evidence it has (aterm keeps no
-/// manifest).
+/// One roster line, and whether it is an ESCALATION. Split out of [`roster`]
+/// so §7's column set is testable without a broker.
 fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
     let segs: Vec<&str> = subject.split('/').collect();
     let node = column(segs.get(4).unwrap_or(&"-"));
@@ -458,8 +389,7 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
             .get("observer")
             .map_or_else(|| "0".to_string(), |v| column(v)),
         body.epoch.as_deref().map_or_else(|| "-".into(), column),
-        // ROUND 13'S THREE: the phase word, the context percentage and the
-        // title, written by a `meta`-mode bridge; `-` from any other.
+        // Written by a `meta`-mode bridge; `-` from any other.
         field("phase"),
         field("context"),
         field("title"),
@@ -488,9 +418,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         token: None,
         presence: crate::presence::Mode::Meta,
         // ON, matching `receipts_from_config`'s absent-key answer and what
-        // `aterm fabric on` writes — one default, whichever door you came
-        // through (round 21). This value only ever survives for a caller that
-        // builds a `Cfg` without going through the config fallback below.
+        // `aterm fabric on` writes.
         receipts: true,
     };
     let mut token_file: Option<String> = None;
@@ -508,16 +436,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
             "--broker" => cfg.broker = value()?,
             "--tcp" => tcp = true,
             "--key-file" => key_file = Some(value()?),
-            // REFUSED BY NAME, with the reason. astream builds both; §11.2 pins
-            // this crate's third-party set to what `cap` + `aead` already
-            // isolate, and each of these adds another vetted-but-new crypto
-            // dependency to it. A flag that parsed and silently fell back to the
-            // PSK would be worse than one that says it does not exist.
+            // REFUSED BY NAME: astream's forward-secret and identity transports
+            // would widen this crate's pinned dependency set (DESIGN-aterm-fabric.md
+            // §11.2), and silently falling back to the PSK would be worse.
             other @ ("--handshake" | "--identity" | "--identity-file" | "--host-key-file") => {
                 return Err(format!(
-                    "{other}: aterm-link speaks the sealed PSK wire only (--tcp --key-file); \
-                     astream's forward-secret and identity transports would widen this \
-                     crate's pinned dependency set (DESIGN-aterm-fabric.md §11.2)"
+                    "{other}: unsupported; the only TCP wire is the sealed PSK one (--tcp --key-file)"
                 ));
             }
             "--cap-file" => cfg.cap_files.push(value()?),
@@ -549,27 +473,11 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     if cfg.fleet.is_empty() || cfg.broker.is_empty() {
         return Err("--fleet and --broker are required".to_string());
     }
-    // A KEY WITHOUT `--tcp` IS A MISTAKE, NOT A DEFAULT. Quietly ignoring it
-    // would run the fleet's traffic over a plain socket while the operator
-    // believed it was sealed, and quietly turning `--tcp` on would try to
-    // connect to a socket path as a host:port. Both are refused.
-    cfg.transport = match (tcp, key_file) {
-        (false, None) => Transport::Unix,
-        (true, None) => {
-            eprintln!(
-                "aterm-link: --tcp without --key-file is plaintext — messages and presence \
-                 cross the network unencrypted; trusted networks only"
-            );
-            Transport::Tcp
-        }
-        (true, Some(path)) => Transport::Sealed(Box::new(
-            transport::read_key_file(&path)
-                .map_err(|e| format!("--key-file {}", transport::describe(&path, &e)))?,
-        )),
-        (false, Some(_)) => {
-            return Err("--key-file needs --tcp (the sealed wire is a TCP transport)".to_string());
-        }
-    };
+    cfg.transport = transport_from_flags(
+        tcp,
+        key_file,
+        "aterm-link: --tcp without --key-file is plaintext; trusted networks only",
+    )?;
     if !crate::subject::is_fleet(&cfg.fleet) {
         return Err(format!(
             "--fleet {} is not a subject segment ([a-z0-9-]{{1,32}})",
@@ -579,12 +487,14 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     if cfg.state_dir.is_empty() {
         cfg.state_dir = default_state_dir();
     }
+    // Read the way every control client reads an instance token
+    // (`aterm_ctl::read_control_token_file`): a symlink planted at the name is
+    // refused rather than followed, only a regular file is read, and no more
+    // than a token's bound of it.
     if let Some(path) = token_file {
         cfg.token = Some(
-            std::fs::read_to_string(&path)
-                .map_err(|e| format!("--token-file {path}: {e}"))?
-                .trim()
-                .to_string(),
+            aterm_ctl::read_control_token_file(std::path::Path::new(&path))
+                .map_err(|e| format!("--token-file {path}: {e}"))?,
         );
     }
     if cfg.sock.is_some() && cfg.token.is_none() {
@@ -600,6 +510,31 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         attention,
         presence_given,
         receipts_given,
+    })
+}
+
+/// The transport `--tcp` and `--key-file` name — shared by `serve` and `notify`. A
+/// KEY WITHOUT `--tcp` IS REFUSED: ignoring it would run unsealed while the operator
+/// believed otherwise, and implying `--tcp` would dial a socket path as a host:port.
+/// Plain `--tcp` prints `plaintext_warning` to stderr.
+pub(crate) fn transport_from_flags(
+    tcp: bool,
+    key_file: Option<String>,
+    plaintext_warning: &str,
+) -> Result<Transport, String> {
+    Ok(match (tcp, key_file) {
+        (false, None) => Transport::Unix,
+        (true, None) => {
+            eprintln!("{plaintext_warning}");
+            Transport::Tcp
+        }
+        (true, Some(path)) => Transport::Sealed(Box::new(
+            transport::read_key_file(&path)
+                .map_err(|e| format!("--key-file {}", transport::describe(&path, &e)))?,
+        )),
+        (false, Some(_)) => {
+            return Err("--key-file needs --tcp".to_string());
+        }
     })
 }
 
@@ -623,13 +558,6 @@ pub(crate) fn default_state_dir() -> String {
 
 /// `aterm link broker <socket> [log]` — run the bus this instance's bridge talks to.
 ///
-/// The fabric needs three things on a machine: a broker, a bridge, and aterm.
-/// Two of them now ride the one binary; without this the third was `asb`, a
-/// SEPARATE executable from the vendored `astream-broker` crate, and
-/// `bundle = []` means aterm ships exactly one Mach-O — so an operator had to
-/// build another repository's CLI by hand to turn on a feature the shipped
-/// binary otherwise supports end to end.
-///
 /// TWO LISTENERS — and the second host's broker serves both:
 ///
 /// * `<socket> [log]` — the LOCAL broker: a Unix socket created
@@ -639,7 +567,7 @@ pub(crate) fn default_state_dir() -> String {
 ///   `Broker::open_guarded`: every attach must carry a capability minted under
 ///   that secret, and every request is authorized against it.
 /// * `--tcp <host:port> --key-file <k> --secret-file <s> <log>` — the SECOND
-///   HOST's broker (round 16): astream's sealed record layer
+///   HOST's broker: astream's sealed record layer
 ///   (`serve_tcp_sealed`, XChaCha20-Poly1305 under the 64-hex pre-shared key)
 ///   and ALWAYS guarded. The guard is not optional on TCP, and that is the
 ///   point of it: the pre-shared key is ONE secret every host holds, so it
@@ -786,24 +714,15 @@ second `listening <socket>` line once that is bound too.
     let (endpoint, log) = match &tcp {
         None => {
             if key_file.is_some() {
-                return usage_error(
-                    "--key-file needs --tcp (the sealed wire is a TCP listener; a socket's \
-                     boundary is its directory)",
-                );
+                return usage_error("--key-file needs --tcp");
             }
             if allow_remote {
-                return usage_error("--allow-remote needs --tcp (a Unix socket is never remote)");
+                return usage_error("--allow-remote needs --tcp");
             }
             if unix.is_some() {
-                return usage_error(
-                    "--unix needs --tcp: without it the socket IS the listener (`broker \
-                     <socket> [log]`)",
-                );
+                return usage_error("--unix needs --tcp");
             }
-            // A surplus word is refused, never dropped: `broker d/b.sock d/b.log
-            // --guarded` used to run happily with `--guarded` vanished, which is
-            // exactly the "parses and does nothing" failure this file's header
-            // names.
+            // A surplus word is refused, never dropped.
             match words.as_slice() {
                 [sock] => ((*sock).to_string(), format!("{sock}.log")),
                 [sock, log] => ((*sock).to_string(), (*log).to_string()),
@@ -821,15 +740,11 @@ second `listening <socket>` line once that is bound too.
                 return usage_error("--tcp needs --key-file: the broker serves TCP only sealed");
             };
             if secret_file.is_none() {
-                return usage_error(
-                    "--tcp needs --secret-file: a TCP broker is always GUARDED — the \
-                     pre-shared key is one secret every host holds, so only the capability a \
-                     node attaches (minted under this secret) says which node may publish what",
-                );
+                return usage_error("--tcp needs --secret-file: a TCP broker is always guarded");
             }
             let log = match words.as_slice() {
                 [log] => (*log).to_string(),
-                [] => return usage_error("--tcp needs <log>: the durable record log's path"),
+                [] => return usage_error("--tcp needs <log>"),
                 [_, extra, ..] => {
                     return usage_error(&format!("unexpected argument `{extra}`"));
                 }
@@ -840,8 +755,7 @@ second `listening <socket>` line once that is bound too.
                 Ok(false) => {
                     eprintln!(
                         "aterm link broker: --tcp {bind}: not a loopback address, and every host \
-                         of the fleet holds the one key; add --allow-remote to serve it on the \
-                         network"
+                         of the fleet holds the one key; add --allow-remote"
                     );
                     return ExitCode::from(2);
                 }
@@ -871,10 +785,8 @@ second `listening <socket>` line once that is bound too.
         }
     };
     let guarded = secret.is_some();
-    // Whether THIS call is the one creating the log: `open` creates it, and a
-    // bind refused afterwards (`a broker is already listening on this socket`)
-    // used to leave an empty `b2.log` behind every typo'd retry — stray files
-    // that later read as real bus records.
+    // Whether THIS call creates the log, so a refused bind can remove the
+    // empty file it would otherwise leave behind.
     let log_created_here = !std::path::Path::new(&log).exists();
     let opened = match secret {
         Some(secret) => astream_broker::Broker::open_guarded(&log, secret),
@@ -918,30 +830,38 @@ second `listening <socket>` line once that is bound too.
             return refused(sock, e, broker);
         }
     };
-    // The line a supervisor waits for. `asb serve` prints the same word, so a
-    // launchd/systemd readiness probe written against either one works. On
-    // TCP it is the BOUND address, so a port-0 bind names the port it got.
+    // The readiness line a supervisor waits for (`asb serve`'s word). On TCP
+    // it is the BOUND address, so a port-0 bind names the port it got.
+    //
+    // WRITTEN, NEVER PRINTED: a supervisor may close the pipe after the first
+    // line, and `println!` on a closed stdout panics (Rust ignores SIGPIPE).
     let shown = handle.tcp_addr().map_or(endpoint, str::to_string);
-    println!("listening {shown}");
-    if let Some(sock) = unix.as_deref() {
-        println!("listening {sock}");
-    }
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    eprintln!(
-        "aterm link broker: {} on {shown}{}{}",
-        if tcp.is_some() {
-            "sealed TCP"
-        } else {
-            "unix socket"
-        },
-        unix.as_deref()
-            .map_or_else(String::new, |sock| format!(" and the unix socket {sock}")),
-        if guarded {
-            " — GUARDED: an attach must carry a capability minted under the secret file"
-        } else {
-            " — unguarded: no capability is checked on attach"
+    let transport = if tcp.is_some() {
+        "sealed TCP"
+    } else {
+        "unix socket"
+    };
+    let beside_note = unix
+        .as_deref()
+        .map_or_else(String::new, |sock| format!(" and the unix socket {sock}"));
+    let guard_note = if guarded {
+        " (guarded)"
+    } else {
+        " (unguarded)"
+    };
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "listening {shown}");
+        if let Some(sock) = unix.as_deref() {
+            let _ = writeln!(out, "listening {sock}");
         }
-    );
+        let _ = out.flush();
+        let _ = writeln!(
+            std::io::stderr(),
+            "aterm link broker: {transport} on {shown}{beside_note}{guard_note}"
+        );
+    }
     // The broker serves on its own threads; this one parks. `BrokerHandle` has
     // no `join` — `asb serve` parks exactly this way — and dropping the handle
     // would shut the broker down and unlink the socket.
@@ -959,8 +879,7 @@ fn read_secret(path: &str) -> Result<Vec<u8>, String> {
     let secret = std::fs::read(path).map_err(|e| format!("--secret-file {path}: {e}"))?;
     if secret.len() < crate::enable::SECRET_LEN {
         return Err(format!(
-            "--secret-file {path} holds {} bytes; a mint secret is at least {} (a short key \
-             guards nothing)",
+            "--secret-file {path} holds {} bytes; a mint secret is at least {}",
             secret.len(),
             crate::enable::SECRET_LEN
         ));
@@ -995,10 +914,7 @@ fn serve_sealed(
 
 /// `aterm link mint <grant> --secret-file <path>` — print one capability line.
 ///
-/// The third thing an operator needs and the one binary did not carry. A cap
-/// file is `<grant> <tag-hex>` lines, and `serve --cap-file` reads them; without
-/// a mint there was no way to produce one except `asb`, a separate executable
-/// from a repository aterm now vendors but does not ship.
+/// A cap file is `<grant> <tag-hex>` lines, and `serve --cap-file` reads them.
 ///
 /// The secret is read from a FILE and never an argument: an argv is world-
 /// readable in `ps` for the life of the call, and this one is the key that mints
@@ -1018,9 +934,7 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
     while i < args.len() {
         match args[i].as_str() {
             "--secret-file" => {
-                // Once. A repeated flag used to win last silently, so
-                // `--secret-file good --secret-file empty` minted with the empty
-                // key and exited 0.
+                // Once: a repeated flag never wins last.
                 if secret.is_some() {
                     eprintln!("aterm link mint: --secret-file given twice");
                     return ExitCode::from(2);
@@ -1058,17 +972,13 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
             return ExitCode::FAILURE;
         }
     };
-    // A SHORT SECRET IS REFUSED, not silently used. HMAC accepts a key of any
-    // length, so an empty or truncated file mints a capability that looks
-    // perfectly well-formed and seals nothing — the failure mode is a fleet that
-    // appears configured and is not. 32 bytes is what a mint secret is here (see
-    // tools/fabric-enable.sh, which writes exactly that from /dev/urandom).
-    const SECRET_MIN: usize = 32;
-    if key.len() < SECRET_MIN {
+    // A SHORT SECRET IS REFUSED: HMAC accepts any key length, so an empty
+    // or truncated file would mint a well-formed capability that seals nothing.
+    if key.len() < crate::enable::SECRET_LEN {
         eprintln!(
-            "aterm link mint: {secret_path} holds {} bytes; a mint secret is at least \
-             {SECRET_MIN} (a short key mints a capability that seals nothing)",
-            key.len()
+            "aterm link mint: {secret_path} holds {} bytes; a mint secret is at least {}",
+            key.len(),
+            crate::enable::SECRET_LEN
         );
         return ExitCode::FAILURE;
     }
@@ -1098,23 +1008,11 @@ mod tests {
         line.split(' ').map(str::to_string).collect()
     }
 
-    /// **`ls` PRINTS §7's ROW, AND `--attention` IS §9.3's VIEW.**
-    ///
-    /// §7 pins the columns and their order; §9.3 names `aterm-link ls
-    /// --attention` as the way a human finds an escalation on a headless box.
-    /// Before this, `roster` printed a set of its own (`<node> <owner> state=
-    /// inc= hold= holder= gen= observer= epoch=` — no `host`, `role`, `detail`,
-    /// `driving`, `fabric` or `attention` at all) and `parse` answered a bare
-    /// "unknown flag --attention", so the one face the design names for an
-    /// escalation refused to run and the fallback had no column to read.
-    ///
-    /// The columns with no writer are asserted to be PRESENT and `-`: that is
-    /// the honest rendering of "unknown", and it is what stops the next reader
-    /// from concluding the design's column set was silently abandoned.
+    /// **`ls` PRINTS §7's ROW, AND `--attention` IS §9.3's VIEW.** The columns
+    /// with no writer are asserted PRESENT and `-` ("unknown").
     #[test]
     fn ls_prints_section_7s_columns_and_attention_is_a_flag_not_an_error() {
-        // §9.3'S FLAG PARSES, on `ls`, and is refused by name on `serve` —
-        // `run` does that, so here we assert `parse` no longer rejects it.
+        // §9.3's flag parses (`run` refuses it on `serve`).
         let base = "--fleet f1 --broker /tmp/b.sock --state /tmp/s";
         assert!(!parse(&argv(base)).expect("ok").attention);
         assert!(
@@ -1166,11 +1064,7 @@ mod tests {
             line.contains(" attention=needs%20a%20key ") && line.contains(" gen=9:beef "),
             "{line}"
         );
-        // The columns this row's writer did not fill read `-`, which is
-        // "unknown" and not a promise — `driving=` and `fabric=` have no
-        // session-row writer at all; `role=`, `detail=`, `phase=`, `context=`
-        // and `title=` have one since round 13, and this body (an older or
-        // `minimal` bridge's) carries none of them.
+        // The columns this body (a `minimal` bridge's) did not fill read `-`.
         for absent in [
             "role=-",
             "detail=-",
@@ -1182,7 +1076,7 @@ mod tests {
         ] {
             assert!(line.contains(absent), "{absent} missing from: {line}");
         }
-        // A ROUND-13 ROW: the five are printed as written, in their columns.
+        // A `meta` row: the five are printed as written, in their columns.
         let (body, _) = crate::body::Body::decode(
             b"v=1 t=1 inc=4 state=live hold=0 holder=- attention=- role=worker \
               detail=claude phase=busy context=12%25 title=satcomp%20run",
@@ -1228,9 +1122,7 @@ mod tests {
             "one token per column, always: {line:?}"
         );
 
-        // AND EVERY COLUMN IS BOUNDED BY THE SAME NUMBER the bridge and glance
-        // use. A rogue node's presence row is not obliged to have gone through
-        // this crate's own writer, so `ls` cannot inherit its cap.
+        // Every column is bounded by the cap the bridge and glance use.
         let long = format!("v=1 t=1 attention={}", "é".repeat(400));
         let (line, _) = row(
             "/f/f1/pub/n-a/s-w/presence",
@@ -1252,5 +1144,30 @@ mod tests {
             crate::pct::decode(printed).ends_with('…'),
             "the cut landed inside a %XX escape: {printed}"
         );
+    }
+
+    /// `serve --token-file` reads the instance token the way every control
+    /// client reads one: a symlink planted at the named path is refused, never
+    /// followed to whatever file it names.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_token_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("atlk-tokfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, "feed1234\n").expect("a token-shaped file");
+        let planted = dir.join("a.sock.token");
+        std::os::unix::fs::symlink(&elsewhere, &planted).expect("plant");
+        let args = argv(&format!(
+            "--fleet f1 --broker /tmp/b.sock --state /tmp/s --sock /tmp/a.sock --token-file {}",
+            planted.display()
+        ));
+        let refused = parse(&args).map(|p| p.cfg.token);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("--token-file")),
+            "the symlink was followed: {refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

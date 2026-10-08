@@ -1,46 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The SHARED cursor-trail path substrate — the cell-sweep primitives every
-//! trail engine lays its wake with, extracted so continuity is solved ONCE and
-//! every style (fire, rainbow kitty, phaser, comet, …) inherits the same guarantees
-//! while keeping its own tuning (lifetimes, coverage curves, palettes).
+//! Shared cursor-trail path primitives: the cell sweeps every trail engine
+//! (fire, rainbow kitty, phaser, comet, ...) lays its wake with, so continuity
+//! is solved once while each style keeps its own tuning.
 //!
-//! ## The continuity contract
+//! ## Continuity contract
 //!
-//! Every primitive in this module returns a path whose consecutive cells are
-//! CHEBYSHEV-ADJACENT (no cell-to-cell step larger than 1 in either axis) —
-//! a trail laid along any of these paths can never show an interior hole. The
-//! property tests at the bottom pin this for every primitive across sweeps of
-//! geometries; new primitives added here must join them.
+//! Every primitive returns a path whose consecutive cells are
+//! Chebyshev-adjacent (no step larger than 1 in either axis), so a trail laid
+//! along it has no interior hole. The tests pin this for every primitive.
 //!
-//! ## Why trails get gaps (and what fixed the fire trail)
+//! ## Why trails get gaps
 //!
-//! Engines observe the cursor ONCE per rendered frame, so real movement
-//! arrives quantized: a fast typing burst, a key-repeat run, or a PTY that
-//! batches echoes can move the cursor several cells between observations, and
-//! ConPTY hides the cursor entirely during each echo repaint. The fire trail
-//! reads as gapless because it (a) sweeps the full vector of every observed
-//! move, (b) renders real jumps as one pixel-space streak along the true jump
-//! vector, and (c) bridges the OS hide window (see
-//! [`crate::cursor_trail::HIDE_BRIDGE_MS`]). These primitives make (a) — and
-//! the wrap/coalesce cases it misses — reusable:
+//! Engines observe the cursor once per frame, so fast typing, key-repeat or a
+//! batching PTY can move it several cells between observations, and ConPTY
+//! hides the cursor during each echo repaint. A gapless trail (a) sweeps the
+//! full vector of every observed move, (b) renders real jumps as one
+//! pixel-space streak, and (c) bridges the OS hide window
+//! ([`crate::cursor_trail::HIDE_BRIDGE_MS`]). These primitives cover (a) plus
+//! wrap/coalesce:
 //!
-//! * [`line_cells_tail`] — the canonical bounded Bresenham sweep (tail→head),
-//!   forward-byte-identical and O(limit) whatever the jump distance.
-//! * `row_sweep_cells` — a same-row typed-coalesce sweep: the cells a
-//!   batched echo skipped between two observations.
-//! * `wrap_fold_cells` — the typewriter fold: a typing wrap finishes the old
-//!   row and continues from the new row's start, never sweeping a diagonal
-//!   across cells the cursor didn't visit.
+//! * [`line_cells_tail`]: the bounded Bresenham sweep (tail->head), identical
+//!   to the forward walk and O(limit) whatever the jump distance.
+//! * `row_sweep_cells`: the same-row typed-coalesce sweep, the cells a batched
+//!   echo skipped between two observations.
+//! * `wrap_fold_cells`: the typewriter fold; a typing wrap finishes the old row
+//!   and continues from the new row's start instead of sweeping a diagonal.
 
 /// Walk the straight cell-line from `origin` toward `destination` and return
-/// (in `out`) the up-to-`limit` cells NEAREST the destination, ordered
-/// tail→head (oldest first, destination-adjacent last). `include_destination`
-/// controls whether the destination cell itself is laid (a live cursor usually
-/// draws there). The start index is solved directly on the FORWARD Bresenham
-/// lattice, so cost is O(limit), not O(distance), without changing the legacy
-/// forward walk's asymmetric tie choices on shallow diagonals.
+/// (in `out`) the up-to-`limit` cells nearest the destination, ordered
+/// tail->head. `include_destination` controls whether the destination cell
+/// itself is laid (a live cursor usually draws there). The start index is
+/// solved directly on the forward Bresenham lattice, so cost is O(limit), not
+/// O(distance), and the forward walk's asymmetric tie choices on shallow
+/// diagonals are preserved.
 pub fn line_cells_tail(
     out: &mut Vec<(i32, i32)>,
     origin: (i32, i32),
@@ -87,12 +81,11 @@ pub fn line_cells_tail(
     }
 }
 
-/// The SAME-ROW typed-coalesce sweep: the cells between two same-row
-/// observations of a typing cursor, EXCLUDING the origin (its spark was laid
-/// by the previous key) and INCLUDING the destination (the new head). Ordered
-/// tail→head. Appends to `out` (the fold primitive chains it). A batched echo
-/// that advanced the cursor `k` columns lays exactly the `k` cells a per-key
-/// observer would have lit — the fast-typing hole this closes.
+/// The same-row typed-coalesce sweep: the cells between two same-row
+/// observations of a typing cursor, excluding the origin (lit by the previous
+/// key) and including the destination (the new head), ordered tail->head and
+/// appended to `out`. A batched echo that advanced `k` columns lays exactly
+/// the `k` cells a per-key observer would have lit.
 #[cfg(test)]
 pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_col: i32) {
     if to_col > from_col {
@@ -102,22 +95,22 @@ pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_co
     }
 }
 
-/// The TYPEWRITER FOLD for a typing wrap: finish the old row from the origin
+/// The typewriter fold for a typing wrap: finish the old row from the origin
 /// to the right edge, then continue from the new row's left edge to the
-/// landing cell — the ribbon folds around the line end instead of either
-/// sweeping a diagonal across unvisited cells or leaving the rows disjoint.
-/// `prev` must be at/near the right edge and `cur` at/near the new row's start
-/// (the wrap SHAPE the caller already classified); `cols` is the grid width.
-/// Ordered tail→head, origin excluded, destination included.
+/// landing cell, instead of sweeping a diagonal across unvisited cells or
+/// leaving the rows disjoint. `prev` must be at/near the right edge and `cur`
+/// at/near the new row's start (the caller classified the wrap shape); `cols`
+/// is the grid width. Ordered tail->head, origin excluded, destination
+/// included.
 #[cfg(test)]
 pub fn wrap_fold_cells(out: &mut Vec<(i32, i32)>, prev: (i32, i32), cur: (i32, i32), cols: i32) {
     wrap_fold_cells_in_pane(out, prev, cur, 0, cols);
 }
 
 /// The [`wrap_fold_cells`] law in a pane whose first column is `col0` in the
-/// composed window grid. The old row finishes at `col0 + cols`; the new row
-/// begins at `col0`. Keeping the offset explicit prevents a right-hand split's
-/// physical margin from being mistaken for the whole window's margin.
+/// composed window grid: the old row finishes at `col0 + cols` and the new row
+/// begins at `col0`, so a right-hand split's margin is not mistaken for the
+/// window's.
 #[cfg(test)]
 pub fn wrap_fold_cells_in_pane(
     out: &mut Vec<(i32, i32)>,
@@ -135,9 +128,9 @@ pub fn wrap_fold_cells_in_pane(
 }
 
 /// Whether one observed move is the exact physical-margin fold shape for a
-/// pane: final pane column -> first pane column on the next row. This is only
-/// morphology; callers must independently require their normal fresh input
-/// license before minting any light.
+/// pane: final pane column -> first pane column on the next row. Morphology
+/// only; callers must still require their normal fresh input license before
+/// minting light.
 #[must_use]
 pub fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, cols: u16) -> bool {
     if cols == 0 {
@@ -152,9 +145,8 @@ pub fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, cols: 
 mod tests {
     use super::*;
 
-    /// Every consecutive pair of a laid path must be Chebyshev-adjacent — the
-    /// module's continuity contract. (The wrap fold is exempt at exactly its
-    /// fold seam, where the path wraps the row edge by design.)
+    /// Every consecutive pair of a laid path must be Chebyshev-adjacent, except
+    /// at the wrap fold's seam, where the path wraps the row edge by design.
     fn assert_adjacent(path: &[(i32, i32)], allow_fold_at: Option<usize>) {
         for (i, w) in path.windows(2).enumerate() {
             if allow_fold_at == Some(i) {
@@ -199,12 +191,10 @@ mod tests {
         }
     }
 
-    /// The bounded solver must be byte-identical to the historical FORWARD
-    /// Bresenham walk, including its direction-sensitive tie law. Reversing
-    /// Bresenham is not equivalent: `(0,0)→(1,2)` chooses `(0,1)`, while a
-    /// backward walk chooses `(1,1)`. Exhaust every small direction, limit and
-    /// destination policy so a visually shifted diagonal cannot hide behind a
-    /// handful of non-tie examples.
+    /// The bounded solver matches the forward Bresenham walk exactly,
+    /// including its direction-sensitive ties (reversed Bresenham differs:
+    /// `(0,0)->(1,2)` picks `(0,1)` forward but `(1,1)` backward). Exhausts
+    /// every small direction, limit and destination policy.
     #[test]
     fn bounded_tail_matches_forward_bresenham_exhaustively() {
         fn reference(origin: (i32, i32), destination: (i32, i32)) -> Vec<(i32, i32)> {

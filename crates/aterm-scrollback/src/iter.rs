@@ -44,50 +44,98 @@ impl Scrollback {
     // (each individually classified: guarded-index / decode class).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn read_segment(&self, idx: usize) -> SegmentResult {
-        let cold_count = self.cold.line_count();
-        let warm_count = self.warm.line_count();
-
-        if idx < cold_count {
-            self.cold.take_lines_from(idx).map_err(|e| {
-                // Skip the rest of the undecodable page, clamped into the
-                // cold range; `max(1)` guarantees forward progress even
-                // against a degenerate segment length.
-                let skip = self
-                    .cold
-                    .segment_len_at(idx)
-                    .min(cold_count.saturating_sub(idx))
-                    .max(1);
-                (e, skip)
-            })
-        } else if idx < cold_count.saturating_add(warm_count) {
-            let warm_idx = idx.saturating_sub(cold_count);
-            self.warm.take_lines_from(warm_idx).map_err(|e| {
-                let skip = self
-                    .warm
-                    .segment_len_at(warm_idx)
-                    .min(warm_count.saturating_sub(warm_idx))
-                    .max(1);
-                (e, skip)
-            })
-        } else {
-            let hot_idx = idx.saturating_sub(cold_count).saturating_sub(warm_count);
-            match self.hot.get(hot_idx) {
-                Some(line) => Ok(vec![line.clone()]),
-                // In-range index with no hot line: stale aggregate count —
-                // surface as end-of-data exactly like the old `Ok(None)`.
-                None => Ok(Vec::new()),
-            }
-        }
+        read_segment_tiers(&self.cold, &self.warm, &self.hot, idx)
     }
-}
 
-impl Scrollback {
     /// First logical index of the hot tier (`cold + warm` lines): the dense
     /// walk's switch from bulk segment decodes to borrowed hot lines.
     pub(crate) fn hot_start(&self) -> usize {
-        self.cold
-            .line_count()
-            .saturating_add(self.warm.line_count())
+        hot_start_tiers(&self.cold, &self.warm)
+    }
+}
+
+/// The cold-tier surface the streaming walk needs, shared by the in-memory
+/// [`ColdTier`](crate::ColdTier) and the disk-backed `DiskColdTier` so one
+/// [`read_segment_tiers`] serves both scrollback types.
+pub(crate) trait ColdSegments {
+    fn line_count(&self) -> usize;
+    fn take_lines_from(&self, idx: usize) -> Result<Vec<Line>, ScrollbackError>;
+    fn segment_len_at(&self, idx: usize) -> usize;
+}
+
+impl ColdSegments for crate::ColdTier {
+    fn line_count(&self) -> usize {
+        crate::ColdTier::line_count(self)
+    }
+    fn take_lines_from(&self, idx: usize) -> Result<Vec<Line>, ScrollbackError> {
+        crate::ColdTier::take_lines_from(self, idx)
+    }
+    fn segment_len_at(&self, idx: usize) -> usize {
+        crate::ColdTier::segment_len_at(self, idx)
+    }
+}
+
+#[cfg(feature = "disk-tier")]
+impl ColdSegments for crate::DiskColdTier {
+    fn line_count(&self) -> usize {
+        crate::DiskColdTier::line_count(self)
+    }
+    fn take_lines_from(&self, idx: usize) -> Result<Vec<Line>, ScrollbackError> {
+        crate::DiskColdTier::take_lines_from(self, idx)
+    }
+    fn segment_len_at(&self, idx: usize) -> usize {
+        crate::DiskColdTier::segment_len_at(self, idx)
+    }
+}
+
+/// First logical index of the hot tier: `cold + warm` lines.
+pub(crate) fn hot_start_tiers(cold: &impl ColdSegments, warm: &crate::WarmTier) -> usize {
+    cold.line_count().saturating_add(warm.line_count())
+}
+
+/// Bulk read for the streaming iterators over one cold/warm/hot tier stack:
+/// owned lines from `idx` through the end of its tier segment (cold page /
+/// warm block / one hot line), or the error plus the lines to skip.
+// Skip: the tier-dispatch driver — routes into the per-tier bulk reads
+// (each individually classified: guarded-index / decode class).
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn read_segment_tiers(
+    cold: &impl ColdSegments,
+    warm: &crate::WarmTier,
+    hot: &crate::HotTier,
+    idx: usize,
+) -> SegmentResult {
+    let cold_count = cold.line_count();
+    let warm_count = warm.line_count();
+
+    if idx < cold_count {
+        cold.take_lines_from(idx).map_err(|e| {
+            // Skip the rest of the undecodable page, clamped into the
+            // cold range; `max(1)` guarantees forward progress even
+            // against a degenerate segment length.
+            let skip = cold
+                .segment_len_at(idx)
+                .min(cold_count.saturating_sub(idx))
+                .max(1);
+            (e, skip)
+        })
+    } else if idx < cold_count.saturating_add(warm_count) {
+        let warm_idx = idx.saturating_sub(cold_count);
+        warm.take_lines_from(warm_idx).map_err(|e| {
+            let skip = warm
+                .segment_len_at(warm_idx)
+                .min(warm_count.saturating_sub(warm_idx))
+                .max(1);
+            (e, skip)
+        })
+    } else {
+        let hot_idx = idx.saturating_sub(cold_count).saturating_sub(warm_count);
+        match hot.get(hot_idx) {
+            Some(line) => Ok(vec![line.clone()]),
+            // In-range index with no hot line: stale aggregate count —
+            // surface as end-of-data exactly like the old `Ok(None)`.
+            None => Ok(Vec::new()),
+        }
     }
 }
 

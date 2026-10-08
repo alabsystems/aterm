@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PHOSPHOR rain FIELD — the pure `(seed, tick)` math (matrix-rain design §4).
+//! Phosphor rain field: the pure `(seed, tick)` math (matrix-rain design §4).
 //!
 //! Everything here is a total function of `(seed32, config-derived params,
-//! tick)` on **u32** lattice math (`rain_hash32` only — WGSL has no u64, and a
-//! split host/shader hash would make the field-conformance proof vacuous).
-//! No `Instant`, no allocation, no state beyond the caller-owned
-//! [`DensityRing`]: the engine in `mod.rs` is a thin driver over these
-//! functions, so the field is unit-testable (and shader-portable) on its own.
+//! tick)` on u32 lattice math (`rain_hash32` only: WGSL has no u64, and a split
+//! host/shader hash would make the field-conformance proof vacuous). No
+//! `Instant`, no allocation, no state beyond the caller-owned [`DensityRing`],
+//! so the field is unit-testable and shader-portable on its own.
 
 /// GPU-path quad budget (contract §4): the hard cap both backends size for.
 pub const MAX_RAIN_QUADS: usize = 2048;
@@ -112,19 +111,16 @@ pub struct ColParams {
     pub phi: u32,
 }
 
-/// Column parameters with the GEOMETRY-AWARE flash floor: `g` is extended at
-/// runtime so `c·p·tick_ms >= 1000` holds for the LIVE `rows` value — a
-/// config-space clamp cannot see an 8-row split pane, so per-cell re-ignition
-/// stays under 1 Hz structurally (WCAG 2.3.1).
+/// Column parameters with the geometry-aware flash floor: `g` is extended at
+/// runtime so `c·p·tick_ms >= 1000` holds for the live `rows` (a config-space
+/// clamp cannot see an 8-row split pane), keeping per-cell re-ignition under
+/// 1 Hz (WCAG 2.3.1).
 #[must_use]
 pub fn col_params(fp: &FieldParams, col: u32) -> ColParams {
-    // Floor at 3, not 1: the trail clamps below are `.clamp(3, rows)` and
-    // `Ord::clamp` panics when `min > max`, so a 1–2-row viewport (a tiny
-    // window, or a heavily-subdivided split pane) must derive its cycle from
-    // a 3-row VIRTUAL field. Drawing is bounded by the live geometry
-    // elsewhere (`head_row < rows` on-screen test against the REAL rows), so
-    // the only effect is a slightly longer off-screen cycle — never an
-    // out-of-range row and never a panic.
+    // Floor at 3: the trail clamps below are `.clamp(3, rows)`, which panics
+    // when `min > max`, so a 1–2-row viewport derives its cycle from a 3-row
+    // virtual field. Drawing is bounded by the real rows elsewhere, so the
+    // only effect is a slightly longer off-screen cycle.
     let rows = fp.rows.max(3);
     let h = rain_hash32(fp.seed32 ^ ((col << 1) | 1));
     // Step period 2..=5 from the hash, then the speed-knob shift (5 =
@@ -219,10 +215,10 @@ pub fn cycle_active(hk: u32, density_byte: u8) -> bool {
     ((hk >> 8) & 0xFF) < u32::from(density_byte)
 }
 
-/// Step-stable, TIME-based trail level (design §4 `[FIX — attack blocker]`):
-/// decay keys to elapsed ticks since the head passed (`tick_ign = (k·c + r)·p
-/// - phi`), so per stepping column only head/tail/`ceil(15/p)` bucket rows
-/// change per tick. Returns the level `0..=15`, or `None` when unlit.
+/// Step-stable, time-based trail level (design §4): decay keys to elapsed
+/// ticks since the head passed (`tick_ign = (k·c + r)·p - phi`), so per
+/// stepping column only head/tail/`ceil(15/p)` bucket rows change per tick.
+/// Returns the level `0..=15`, or `None` when unlit.
 #[must_use]
 pub fn trail_level(cp: &ColParams, eff_tick: u64, k: u64, row: u32) -> Option<u32> {
     let ign = ((k * u64::from(cp.c) + u64::from(row)) * u64::from(cp.p)) as i64 - i64::from(cp.phi);
@@ -259,12 +255,11 @@ pub fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u
     (g % GLYPH_COUNT, (g >> 8) & 1 == 1)
 }
 
-/// The frame-invariant glyph epoch `tick / mq` — `mq` is GLOBAL, so swaps are
+/// The frame-invariant glyph epoch `tick / mq`. `mq` is global, so swaps are
 /// synchronized screen-wide and iso-luminant. Hoisted once per frame.
 ///
-/// scope-waiver: a PURE function of its two arguments. "screen-wide" describes
-/// agreement between callers, and callers agree by computing the same value —
-/// a second caller cannot disagree, so no instance count can falsify this.
+/// scope-waiver: a pure function of its two arguments; callers agree by
+/// computing the same value, so no instance count can falsify this.
 #[must_use]
 pub fn glyph_epoch(tick: u64, mq: u32) -> u32 {
     (tick / u64::from(mq.max(1))) as u32
@@ -369,9 +364,8 @@ mod tests {
         assert_eq!(bits(0xF0, 4, 8), 0xF);
     }
 
-    /// FLASH FLOOR (design §4 `[FIX — attack major]`): for every clamped
-    /// config and the short-pane geometries that broke the config-space
-    /// clamp, `c·p·tick_ms >= 1000` — per-cell re-ignition stays under 1 Hz.
+    /// Flash floor (design §4): for every clamped config and short-pane
+    /// geometry, `c·p·tick_ms >= 1000`, so re-ignition stays under 1 Hz.
     #[test]
     fn flash_floor_holds_at_all_clamped_configs() {
         for rows in [5u32, 8, 50, 120] {
@@ -396,11 +390,9 @@ mod tests {
         }
     }
 
-    /// TINY VIEWPORTS (split-pane audit): a 1- or 2-row field must never
-    /// panic — `.clamp(3, rows)` requires the derivation `rows >= 3`, and a
-    /// heavily-subdivided split pane (or a 1-row window) legitimately emits
-    /// at `fp.rows < 3`. The virtual 3-row cycle keeps every invariant: the
-    /// trail pins to its 3-row floor, `p >= 2`, and the flash floor holds.
+    /// A 1- or 2-row field (tiny split pane or window) never panics: the
+    /// virtual 3-row cycle keeps the trail at its 3-row floor, `p >= 2`, and
+    /// the flash floor.
     #[test]
     fn tiny_viewports_never_panic_and_keep_invariants() {
         for rows in [1u32, 2, 3] {

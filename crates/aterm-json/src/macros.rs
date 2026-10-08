@@ -52,13 +52,9 @@ macro_rules! json_build {
 
     // ── anything else is a Rust expression ─────────────────────────────────
     //
-    // PANICS on a value that cannot serialize, which is what `serde_json`'s
-    // `json!` does (`.unwrap()`), and deliberately not what this used to do:
-    // `unwrap_or(Value::Null)` turned a map with a non-string key, or an
-    // integer too wide for the model, into a document that quietly carried
-    // `null` where the field should have been — in the LLM request-body builder
-    // and the control-payload builder. A loud failure at the call site is the
-    // only honest answer for a macro with no way to return one.
+    // PANICS on a value that cannot serialize, as `serde_json`'s `json!` does:
+    // the macro cannot return an error, and substituting `null` would ship a
+    // document missing a field.
     ($other:expr) => {
         $crate::to_value(&$other).expect("json! value must serialize")
     };

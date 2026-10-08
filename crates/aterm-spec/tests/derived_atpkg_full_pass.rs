@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+use crate::walk::walk;
 use aterm_spec::{derive::atpkg_full_pass_rule_model, interp, verify};
-
-fn walk(model: &aterm_spec::derive::Model, actions: &[&str]) -> interp::State {
-    let mut state = model.init_state();
-    for action in actions {
-        assert!(model.fire(action, &mut state), "{action}: {state:?}");
-    }
-    state
-}
 
 /// Tier-0: every invariant holds over the whole bounded space at `Buggy=0`, each has its
 /// own counterexample at `Buggy=1`, and the two defects are replayed step by step: the

@@ -1,33 +1,29 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE LIVE UPGRADE'S LADDER, BOUND TO THE CODE (the owner's decision of
-//! 2026-09-28: "Time ladder — prefer a natural pause; the longer it has been
-//! behind, the less it waits … It never types over a draft, a dialog or
-//! running work."). Three tests:
+//! The live upgrade's ladder, bound to the code: prefer a natural pause, wait
+//! less the longer the session has been behind, and never type over a draft, a
+//! dialog or running work. Three tests:
 //!
-//! * TIER-1: the derived `HarnessUpgradeLadder` machine against the REAL
+//! * Tier-1: the derived `HarnessUpgradeLadder` machine against the real
 //!   `upgrade::gate` (through `upgrade_codex::requested_step`, a daemon-mode
-//!   Codex client — the incident's), over every state the machine reaches.
-//!   Each model state becomes the screens, the person's stamps, the clock and
-//!   the daemon's threads and clients of real looks, and the facts are built
-//!   from them by the ONE ASSEMBLY the visit builds them by — `ladder_look`
-//!   (the rung, the person, the one reader's idle reading and the
-//!   repaint-proof settle: the same the Claude Code lane's `look` calls),
-//!   `codex_daemon_turn` (the daemon's turns: the kernel's naming of the own
-//!   conversation, the still run's placing of another session's root),
-//!   `screen_turn`
-//!   and `quiet_s` — never set by hand. Every `Buggy` member caught where the
-//!   real rule disagrees with it, and every `#[refines]` anchor entered;
-//! * the repaint-proof settle, looked at;
-//! * the 2026-09-28 INCIDENT, REPLAYED through the same assembly on its own
-//!   schedule: the pin overnight, nine hours of goal-mode turns in the
-//!   daemon, the owner's Esc and the `»` input line — and again with one more
-//!   thread on the daemon (the second review), and in the owner's measured
-//!   shape of that evening, one conversation and three subagents it spawned
-//!   under one TUI (the third review).
+//!   Codex client), over every reachable state. Each model state becomes the
+//!   screens, person's stamps, clock and daemon threads and clients of real
+//!   looks, and the facts are built by the visit's own assembly, never by hand:
+//!   `ladder_look` (the rung, the person, the reader's idle reading and the
+//!   repaint-proof settle, as the Claude Code lane's `look` calls),
+//!   `codex_daemon_turn` (the kernel naming the own conversation, the still
+//!   run placing another session's root), `screen_turn` and `quiet_s`. Every
+//!   `Buggy` member is caught where the real rule disagrees, and every
+//!   `#[refines]` anchor is entered.
+//! * The repaint-proof settle, looked at.
+//! * A recorded day replayed through the same assembly on its own schedule:
+//!   the pin overnight, nine hours of goal-mode turns in the daemon, the
+//!   owner's Esc and the `»` input line; again with one more thread on the
+//!   daemon; and in the shape of one conversation with three subagents under
+//!   one TUI.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use aterm_phase::codex::fixtures::{BOX_EXEC, GOAL_BUSY_0_158, GOAL_NEXT_TURN_0_158};
 use aterm_phase::prompt::fixtures::screen as fixture;
@@ -43,7 +39,7 @@ type State = BTreeMap<&'static str, i64>;
 /// `[harness] human_grace_s` at its default.
 const GRACE: u32 = 120;
 
-/// A look's clock: the incident's own day (2026-09-28 15:04:17Z).
+/// A look's clock on the recorded day (15:04:17Z).
 const NOW: u64 = 1_790_607_857;
 
 /// The tab's Codex, another tab's Codex on the same daemon, and the daemon.
@@ -59,33 +55,30 @@ const OTHERS: &str = "01a0dc3a-5c71-7143-bcee-58def0a15dfd";
 const OTHERS_SUB: &str = "01a0e8a1-0000-7000-8000-000000000002";
 const DETACHED: &str = "01a0dc3b-0000-7000-8000-000000000003";
 
-/// The status line a look reads (the incident's Codex: agent unknown).
+/// The status line a look reads (the recorded Codex: agent unknown).
 const STATUS: &str = "OK schema=1 agent=unknown agent_since_ms=5";
 
 fn v(s: &str) -> Version {
     Version::parse(s).expect("a version")
 }
 
+/// Every state `m` reaches from its `Init` under every successor of every
+/// action, sorted. The closure is the interpreter's own
+/// ([`aterm_spec::interp::reachable_states`]: each state once, over the same
+/// successors, keyed by its values in a hash table): this test's own BFS
+/// probed a `BTreeSet` of name-keyed maps twice per successor, 1.1 s of the
+/// test's 2.8 s single-threaded walk (measured 2026-10-05).
 fn reach(m: &Model) -> BTreeSet<State> {
-    let mut seen: BTreeSet<State> = BTreeSet::new();
-    let mut queue = VecDeque::from([m.init_state()]);
-    while let Some(s) = queue.pop_front() {
-        if !seen.insert(s.clone()) {
-            continue;
-        }
-        for a in &m.actions {
-            queue.extend(m.successors(a.name, &s));
-        }
-    }
-    seen
+    aterm_spec::interp::reachable_states(m)
+        .into_iter()
+        .collect()
 }
 
-/// The owner's tab as the incident showed it between two goal turns — the
-/// measured 0.158.0 frame a second after a turn's end row, whose screen reads
-/// ENDED while the goal's next turn already streams under it — the input
-/// line drawn with `mark`, the last message `words`, the goal's counter in
-/// the footer reading `minute`: what repaints between two looks while the
-/// words stand still.
+/// The recorded tab between two goal turns (a 0.158.0 frame a second after a
+/// turn's end row, which reads ended while the goal's next turn already
+/// streams), the input line drawn with `mark`, the last message `words`, the
+/// goal's footer counter reading `minute`: what repaints between two looks
+/// while the words stand still.
 fn tab_screen(mark: char, words: &str, minute: u32) -> Vec<String> {
     let mut rows = fixture(GOAL_NEXT_TURN_0_158);
     let last = rows
@@ -102,7 +95,7 @@ fn tab_screen(mark: char, words: &str, minute: u32) -> Vec<String> {
     rows
 }
 
-/// The same screen with NO GOAL in its footer: the footer's `Pursuing goal
+/// The same screen with no goal in its footer: the footer's `Pursuing goal
 /// (…)` cleared, the rest of the row kept.
 fn without_goal(mut rows: Vec<String>) -> Vec<String> {
     let footer = rows.len() - 2;
@@ -138,9 +131,9 @@ fn read(rows: Vec<String>, drafted: bool, seq: u64, human: HumanInput) -> Screen
     }
 }
 
-/// ONE READ OF THE DAEMON as the pass read it — on the managed build — by
-/// which threads it holds, which of them run a turn, and whether another
-/// Codex is attached (another tab's TUI).
+/// One read of the daemon (on the managed build): which threads it holds,
+/// which run a turn, and whether another Codex (another tab's TUI) is
+/// attached.
 #[derive(Clone, Copy, Debug, Default)]
 struct Daemon {
     /// This tab's conversation's root, running.
@@ -207,14 +200,12 @@ impl Daemon {
     }
 }
 
-/// ONE REAL LOOK of a daemon-mode Codex client at `t`: the facts its visit
-/// builds of the screen `scr` and the daemon `d`, by the visit's own
-/// assembly — [`quiet_s`] over the
-/// status and the screen's `seq`, [`ladder_look`], [`screen_turn`] (no
-/// rollout: a daemon-mode client's thread is its daemon's) and
-/// [`codex_daemon_turn`]. The composer's placeholder cell reads `dim` unless
-/// `drafted` (the `cell` verb the visit asks). With the look's ladder
-/// reading, whose `idle_read` is where the host steps at all.
+/// One real look of a daemon-mode Codex client at `t`: the facts its visit
+/// builds of screen `scr` and daemon `d` by the visit's own assembly
+/// ([`quiet_s`] over the status and the screen's `seq`, [`ladder_look`],
+/// [`screen_turn`] with no rollout, and [`codex_daemon_turn`]). The composer's
+/// placeholder cell reads `dim` unless `drafted`. Returns the look's ladder
+/// reading too, whose `idle_read` is where the host steps at all.
 fn look(
     st: &mut St,
     scr: &Screen,
@@ -222,14 +213,53 @@ fn look(
     d: Daemon,
     t: u64,
 ) -> (Facts, super::super::LadderLook) {
+    look_seen(st, scr, Seen::of(scr, drafted), d, t)
+}
+
+/// What a look reads off the screen alone — the visit's `screen_turn` (no
+/// rollout), `composer_is_empty` and `box_on_screen` — each a pure function
+/// of the rows, the cursor and whether the caret's placeholder reads dim.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    turn: &'static str,
+    busy: bool,
+    composer_empty: bool,
+    approval_box: bool,
+}
+
+impl Seen {
+    fn of(scr: &Screen, drafted: bool) -> Seen {
+        let (turn, busy) = screen_turn(&scr.rows, None);
+        Seen {
+            turn,
+            busy,
+            composer_empty: cx::composer_is_empty(&scr.rows, scr.cursor, !drafted),
+            approval_box: cx::box_on_screen(&scr.rows),
+        }
+    }
+}
+
+/// [`look`] with the screen's own readings `seen` ([`Seen::of`] of `scr`).
+fn look_seen(
+    st: &mut St,
+    scr: &Screen,
+    seen: Seen,
+    d: Daemon,
+    t: u64,
+) -> (Facts, super::super::LadderLook) {
     let quiet = quiet_s(Some(STATUS), st, scr.seq, t);
     let ladder = ladder_look(st, "codex", scr, TUI, GRACE, t);
-    let (turn, busy) = screen_turn(&scr.rows, None);
+    let Seen {
+        turn,
+        busy,
+        composer_empty,
+        approval_box,
+    } = seen;
     let f = Facts {
         status: turn.to_string(),
         status_age_s: quiet,
-        composer_empty: cx::composer_is_empty(&scr.rows, scr.cursor, !drafted),
-        approval_box: cx::box_on_screen(&scr.rows),
+        composer_empty,
+        approval_box,
         busy_footer: busy,
         quiet_s: quiet,
         attended: ladder.attended,
@@ -255,21 +285,21 @@ fn look(
 /// and the lane never places: a subagent of this tab's own conversation
 /// (the owner's shape of 2026-09-28), another session's subagent, or a root
 /// no tab shows with this TUI the daemon's only client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Hidden {
     OwnSub,
     OthersSub,
     Detached,
 }
 
-/// ONE DAEMON HISTORY a model state admits: whose turn a `work` 2 is
+/// One daemon history a model state admits: whose turn a `work` 2 is
 /// (`hidden`); whether the turn `work` stands for ran at the earlier look of
 /// the still run too (`work_earlier`: unseen — a goal's, or a hidden one);
 /// whether another session's root ran there (`other_earlier`); and whether
 /// another session is on the daemon at all, another Codex attached
 /// (`shared`: its root idle where the state runs none — so the kernel names
 /// no conversation).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct History {
     hidden: Hidden,
     work_earlier: bool,
@@ -277,19 +307,14 @@ struct History {
     shared: bool,
 }
 
-/// Every daemon history of `s` the bind looks at: the model's own (this
-/// tab's turn idle at the earlier look, another session's root running there
-/// as `other_seen` says, on the daemon where `other` or `other_seen` put
-/// one); where this tab's turn runs, the same with another session on the
-/// daemon, idle; for a turn the lane never places (`work` 2), each of its
-/// kinds — this tab's subagent (named by the kernel, or not: another session
-/// on the daemon), another session's subagent, a root no tab shows with no
-/// other Codex attached — running at BOTH looks of a still run of two, the
-/// third review's probe, where the rule that placed as it ran moved; and
-/// under a GOAL the worst the state admits — this tab's own goal turn and
-/// another session's running at both looks of the still run, and another
-/// session on the daemon so the kernel names nothing: the second review's
-/// probe, where the rule that placed through a goal moved.
+/// Every daemon history of `s` the bind looks at: the model's own (this tab's
+/// turn idle at the earlier look, another session's root running there as
+/// `other_seen` says); where this tab's turn runs, the same with another
+/// session idle on the daemon; for a turn the lane never places (`work` 2),
+/// each of its kinds running at both looks of a still run of two; and under a
+/// goal the worst the state admits: this tab's goal turn and another
+/// session's running at both looks, with another session on the daemon so the
+/// kernel names nothing.
 fn histories(s: &State) -> Vec<History> {
     let model = History {
         hidden: Hidden::OwnSub,
@@ -373,6 +398,8 @@ fn daemon_of(s: &State, h: History, earlier: bool) -> Daemon {
 /// same words (the footer's counter repainted between them and the `seq`
 /// moved unless `quiet`), the daemon as it was then; the last at NOW. The
 /// last look's facts and ladder reading.
+///
+/// `s` is a state's [`look_vars`]: a look reads nothing else of it.
 fn facts_of(s: &State, h: History) -> (Facts, super::super::LadderLook) {
     const BEHIND: [u64; 4] = [
         60,
@@ -380,25 +407,8 @@ fn facts_of(s: &State, h: History) -> (Facts, super::super::LadderLook) {
         upgrade::RUNG_KEYS_S,
         upgrade::RUNG_LAND_S,
     ];
-    let mark = if s["glyph"] == 1 { '»' } else { '›' };
     let drafted = s["draft"] == 1;
-    let rows = |minute: u32| {
-        let tab = if s["goal"] == 1 {
-            tab_screen(mark, "Done.", minute)
-        } else {
-            without_goal(tab_screen(mark, "Done.", minute))
-        };
-        if s["dialog"] == 1 {
-            fixture(BOX_EXEC)
-        } else if drafted {
-            let mut rows = tab;
-            let caret = aterm_phase::codex::composer(&rows).expect("the input line");
-            rows[caret] = format!("{mark} fix the footer");
-            rows
-        } else {
-            tab
-        }
-    };
+    let rows = |minute: u32| look_rows(s, minute);
     let human = match s["keys"] {
         0 => HumanInput::Ago(600_000),
         1 => HumanInput::Ago(60_000),
@@ -412,22 +422,173 @@ fn facts_of(s: &State, h: History) -> (Facts, super::super::LadderLook) {
     // quiet holds for `quiet` only where its `seq` never moved.
     let _ = quiet_s(Some(STATUS), &mut st, 7, NOW - 2 * QUIET_S);
     if s["seen"] == 2 {
-        let earlier = read(rows(50), drafted, 7, human);
-        let _ = look(
+        let (earlier, seen) = rows(50);
+        let earlier = read(earlier, drafted, 7, human);
+        let _ = look_seen(
             &mut st,
             &earlier,
-            drafted,
+            seen,
             daemon_of(s, h, true),
             NOW - QUIET_S,
         );
     }
-    let now = read(
-        rows(51),
-        drafted,
-        if s["quiet"] == 1 { 7 } else { 8 },
-        human,
-    );
-    look(&mut st, &now, drafted, daemon_of(s, h, false), NOW)
+    let (now, seen) = rows(51);
+    let now = read(now, drafted, if s["quiet"] == 1 { 7 } else { 8 }, human);
+    look_seen(&mut st, &now, seen, daemon_of(s, h, false), NOW)
+}
+
+/// The tab's rows a look of `s` reads at `minute` (the goal's footer
+/// counter): a box, a draft, or the goal's idle-looking frame with the input
+/// line drawn in the glyph `s` says, its footer's `Pursuing goal (…)` for
+/// `goal` alone.
+///
+/// BUILT ONCE PER PROCESS: the rows are a pure function of `s`'s `glyph`,
+/// `goal`, `dialog` and `draft` and of `minute` — fixtures and string edits,
+/// nothing else read — so its 32 screens are drawn once, each with its own
+/// assertions, and every look reads its own copy. Each of the walk's
+/// 23,808 distinct looks drew its two screens afresh from the fixtures: the
+/// test's CPU went 6.4 s to 5.4 s without it (measured 2026-10-05).
+///
+/// With each screen, what a look reads off it alone ([`Seen`]): a pure
+/// function of the rows and of `draft` (the cursor and the placeholder's dim
+/// both follow from them), so each of the 32 screens is read by the real
+/// `box_on_screen`, `screen_turn` and `composer_is_empty` once, and every look
+/// of it is handed that reading. Each look read the whole screen twice over
+/// (Codex's reader for the box, then again in `ladder_look`): 47% of the
+/// looks' samples went to the box and the screen's turn (measured 2026-10-06).
+fn look_rows(s: &State, minute: u32) -> (Vec<String>, Seen) {
+    type Key = (bool, bool, bool, bool, u32);
+    static DRAWN: std::sync::OnceLock<BTreeMap<Key, (Vec<String>, Seen)>> =
+        std::sync::OnceLock::new();
+    let drawn = DRAWN.get_or_init(|| {
+        let mut drawn = BTreeMap::new();
+        for glyph in [false, true] {
+            for goal in [false, true] {
+                for dialog in [false, true] {
+                    for drafted in [false, true] {
+                        for minute in [50, 51] {
+                            let mark = if glyph { '»' } else { '›' };
+                            let tab = if goal {
+                                tab_screen(mark, "Done.", minute)
+                            } else {
+                                without_goal(tab_screen(mark, "Done.", minute))
+                            };
+                            let rows = if dialog {
+                                fixture(BOX_EXEC)
+                            } else if drafted {
+                                let mut rows = tab;
+                                let caret =
+                                    aterm_phase::codex::composer(&rows).expect("the input line");
+                                rows[caret] = format!("{mark} fix the footer");
+                                rows
+                            } else {
+                                tab
+                            };
+                            let seen = Seen::of(
+                                &read(rows.clone(), drafted, 0, HumanInput::Never),
+                                drafted,
+                            );
+                            drawn.insert((glyph, goal, dialog, drafted, minute), (rows, seen));
+                        }
+                    }
+                }
+            }
+        }
+        drawn
+    });
+    drawn[&(
+        s["glyph"] == 1,
+        s["goal"] == 1,
+        s["dialog"] == 1,
+        s["draft"] == 1,
+        minute,
+    )]
+        .clone()
+}
+
+/// The variables of a model state [`facts_of`] builds its looks of — the
+/// screen, the person, the rung, the still run and the daemon ([`daemon_of`]);
+/// none of `behind`, `pinned`, `kept`, `scoped`, `reads`, `narrows`, or the
+/// `moved`/`missed`/`at_*`/`slipped` records.
+const LOOK_VARS: [&str; 11] = [
+    "rung",
+    "quiet",
+    "seen",
+    "keys",
+    "draft",
+    "dialog",
+    "glyph",
+    "goal",
+    "work",
+    "other",
+    "other_seen",
+];
+
+/// `s` as [`facts_of`] is handed it: its [`LOOK_VARS`] alone, so a look that
+/// read any other variable would panic rather than read one [`looks_of`]
+/// does not key on.
+fn look_vars(s: &State) -> State {
+    LOOK_VARS.iter().map(|&k| (k, s[k])).collect()
+}
+
+/// The facts and ladder reading of each distinct look ([`looks_of`]).
+/// Keyed by the look's variables, then its history: the walk finds a state's
+/// looks once and each history's among them.
+type Looks = BTreeMap<State, BTreeMap<History, (Facts, super::super::LadderLook)>>;
+
+/// [`facts_of`] for every distinct `(look_vars, history)` in `wanted`, the
+/// looks taken SIDE BY SIDE — one worker per core at most, each in an
+/// evidence window of its own — with every anchor those windows saw entered.
+///
+/// ONE LOOK PER DISTINCT INPUT: `facts_of` is a pure function of a state's
+/// `look_vars` and the history — a fresh `St`, the real assembly at fixed
+/// clocks, nothing global read — so a state that differs from another only
+/// in variables no look reads gets the same facts, and the walk takes them
+/// from here: every (state, history) is still asserted on, each over the
+/// facts its own looks build. Measured 2026-09-30: 55,680 (state, history)
+/// pairs over 23,808 distinct looks; the test alone went 23.4 s to 11.4 s on
+/// the distinct looks, and to 3.9 s with them side by side (one thread, it
+/// was the aterm-agent lib run's longest test: 28.7 s).
+fn looks_of(wanted: Vec<(State, History)>) -> (Looks, BTreeSet<&'static str>) {
+    use aterm_spec::xref;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(wanted.len().max(1));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    assert!(
+                        xref::reset_entered_anchors(),
+                        "a worker's evidence window opens"
+                    );
+                    let mut taken = Vec::new();
+                    while let Some((vars, h)) =
+                        wanted.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    {
+                        taken.push(((vars.clone(), *h), facts_of(vars, *h)));
+                    }
+                    (taken, xref::entered_anchor_ids())
+                })
+            })
+            .collect();
+        let mut looked = BTreeMap::new();
+        let mut entered = BTreeSet::new();
+        for handle in handles {
+            let (taken, seen) = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for ((vars, h), look) in taken {
+                looked
+                    .entry(vars)
+                    .or_insert_with(BTreeMap::new)
+                    .insert(h, look);
+            }
+            entered.extend(seen);
+        }
+        (looked, entered)
+    })
 }
 
 /// The real client step of a daemon-mode Codex over those facts: the host
@@ -477,41 +638,28 @@ fn real_pins(s: &State) -> bool {
     }) == DaemonStep::Update
 }
 
-/// TIER-1: the derived `HarnessUpgradeLadder` against the REAL rule, over
-/// EVERY state the committed machine reaches. The model's `Move` is enabled
-/// exactly where a look the host takes would type the `/exit` — the rung,
-/// the screen's quiet, the reader's run of looks, the person, the draft, the
-/// box, the mark, this tab's turn and another session's in the daemon each
-/// built from real looks by the visit's own assembly — and its `Pin` exactly
-/// where the real daemon rule pins a tab that is due; the rungs are the real
-/// `rung`'s; the daemon's turns are the ones `codex_daemon_turn` decides
-/// (this tab's own conversation named by the kernel where every thread of
-/// the daemon hangs from its root and it is the one client — a subagent's
-/// turn included; another session's running ROOT placed by the still run,
-/// another Codex attached — never under a goal; a turn the lane never
-/// places, holding it for as long as it runs); and the real facts project
-/// back onto the state they were built from
+/// Tier-1: the derived `HarnessUpgradeLadder` against the real rule, over every
+/// reachable state. The model's `Move` is enabled exactly where a look would
+/// type `/exit` (the rung, the screen's quiet, the reader's run of looks, the
+/// person, the draft, the box, the mark, this tab's turn and another session's
+/// in the daemon, each built from real looks by the visit's assembly), and its
+/// `Pin` exactly where the real daemon rule pins a due tab. The rungs are the
+/// real `rung`'s; the daemon's turns are the ones `codex_daemon_turn` decides
+/// (this tab's own conversation named by the kernel where every thread hangs
+/// from its root and it is the one client, subagent turns included; another
+/// session's running root placed by the still run with another Codex
+/// attached, never under a goal; a turn the lane never places holding it while
+/// it runs); and the real facts project back onto their state
 /// (`upgrade_drive::ladder_projection`). Each state is looked at under every
-/// daemon history it admits ([`histories`]) — among them, under a goal, this
-/// tab's own goal turn running unseen through both looks of the still run
-/// with another session on the daemon, and a subagent's turn (this tab's
-/// own, or another session's) or a root no tab shows running through both
-/// looks, where `Move` is not enabled and the real rule must wait. Every
-/// `#[refines]` anchor of the machine is ENTERED on the way (the evidence
-/// window).
+/// daemon history it admits ([`histories`]). Every `#[refines]` anchor is
+/// entered.
 ///
-/// NEGATIVE CONTROLS — each `Buggy` member caught ALONE in a state the
-/// machine reaches, where the real rule does otherwise: the owner's `--now`
-/// that waived the person (`NowWaivesThePerson`: the real word waits a
-/// keystroke within KEYS_GAP_S out), a move over a draft, a box or this
-/// tab's own turn in the daemon (the real one waits), the still run placing
-/// through a goal (`PlacedUnderAGoal`: the real one waits), the still run
-/// placing as it ran (`PlacedAsItRan`: the real one waits), the seq settle
-/// (`SeqSettle`: the real one moves where it waited), the grace that never
-/// narrows, the reader blind to `»` and every thread of the daemon holding
-/// the client (`OtherTurnHolds`: the real one moves where they, once
-/// decided, cannot), and the pin that let a current tab go (`PinDropsDue`:
-/// the real due question answers yes).
+/// Negative controls, each `Buggy` member caught alone in a reachable state:
+/// `NowWaivesThePerson` (the real `--now` waits out a keystroke within
+/// KEYS_GAP_S), a move over a draft, a box or this tab's own daemon turn,
+/// `PlacedUnderAGoal`, `PlacedAsItRan`, `SeqSettle` (the real one moves where
+/// it waited), the grace that never narrows, the reader blind to `»`,
+/// `OtherTurnHolds`, and `PinDropsDue`.
 #[test]
 fn the_real_ladder_is_the_derived_machine() {
     use aterm_spec::xref;
@@ -523,14 +671,22 @@ fn the_real_ladder_is_the_derived_machine() {
         "the machine has a space: {}",
         states.len()
     );
-    // NEGATIVE CONTROLS on the Buggy=1 machine, each mutant caught ALONE at
-    // a state the committed machine reaches, where it is enabled and the real
-    // rule does otherwise (a degraded lane: once it has decided, it refuses
-    // the move the real rule takes there).
+    // Negative controls on the Buggy=1 machine, each mutant caught alone at a
+    // reachable state where it is enabled and the real rule does otherwise.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut caught: BTreeSet<&str> = BTreeSet::new();
     let (mut moves, mut waits, mut placed, mut unseen, mut hidden) = (0, 0, 0, 0, 0);
     let mut kinds: BTreeSet<(&str, bool)> = BTreeSet::new();
+    // Every look the walk asks for, taken once and side by side ([`looks_of`]).
+    let (looked, looks_entered) = looks_of(
+        states
+            .iter()
+            .filter(|s| s["behind"] != 0)
+            .flat_map(|s| histories(s).into_iter().map(|h| (look_vars(s), h)))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    );
     for s in &states {
         assert_eq!(model.action_enabled("Pin", s), real_pins(s), "{s:?}");
         if s["behind"] == 0 {
@@ -541,10 +697,35 @@ fn the_real_ladder_is_the_derived_machine() {
             }
             continue;
         }
+        // What the machines say at `s` is the same for each of its
+        // histories: each guard read once per state, judged against every
+        // history's real rule below (each a pure read of `s`; the loop read
+        // them per history, 1.0 s of the walk's 2.8 s, measured 2026-10-05).
+        let moves_here = model.action_enabled("Move", s);
+        let enabled: BTreeSet<&str> = [
+            "MoveOverADraft",
+            "MoveOverABox",
+            "MoveMidTurn",
+            "PlacedUnderAGoal",
+            "PlacedAsItRan",
+            "NowWaivesThePerson",
+            "SeqSettle",
+        ]
+        .into_iter()
+        .filter(|mutant| buggy.action_enabled(mutant, s))
+        .collect();
+        let refused: BTreeSet<&str> = ["AttendedWithoutLadder", "BlindReader", "OtherTurnHolds"]
+            .into_iter()
+            .filter(|mutant| {
+                let mut decided = s.clone();
+                buggy.fire(mutant, &mut decided) && !buggy.action_enabled("Move", &decided)
+            })
+            .collect();
+        let looks = &looked[&look_vars(s)];
         for h in histories(s) {
-            let (f, ladder) = facts_of(s, h);
-            let real = real_moves(&f, ladder.idle_read, &Request::None);
-            assert_eq!(model.action_enabled("Move", s), real, "{s:?}\n{h:?}\n{f:?}");
+            let (f, ladder) = &looks[&h];
+            let real = real_moves(f, ladder.idle_read, &Request::None);
+            assert_eq!(moves_here, real, "{s:?}\n{h:?}\n{f:?}");
             if real {
                 moves += 1;
             } else {
@@ -558,12 +739,11 @@ fn the_real_ladder_is_the_derived_machine() {
             // is the one client.
             let named = !(h.shared || s["other"] == 1 || s["other_seen"] > 0)
                 && (s["work"] != 2 || h.hidden == Hidden::OwnSub);
-            // Where the host steps (the one reader's idle reading — a box on
-            // the screen is none, and ends the still run), the daemon's turns
-            // as the model says: a turn of this tab's own conversation holds
-            // it — named by the kernel, a goal where its footer shows one; a
-            // turn the lane never places holds it, named or not; another
-            // session's root only until placed — never under a goal.
+            // Where the host steps (the reader's idle reading; a box is none and
+            // ends the still run), the daemon's turns as the model says: a turn
+            // of this tab's own conversation holds it (a goal where its footer
+            // shows one); a turn the lane never places holds it; another
+            // session's root only until placed, never under a goal.
             if ladder.idle_read {
                 let want = match (s["work"] > 0, named) {
                     (true, true) if goal => DaemonTurn::Goal,
@@ -598,7 +778,7 @@ fn the_real_ladder_is_the_derived_machine() {
                 // One look is no run: the projection reads none, as the gate does.
                 want.insert("seen", if s["seen"] == 2 { 2 } else { 0 });
                 want.insert("work", i64::from(s["work"] > 0 || unplaced));
-                assert_eq!(ladder_projection(&f), want, "{s:?}\n{h:?}");
+                assert_eq!(ladder_projection(f), want, "{s:?}\n{h:?}");
             }
             for mutant in [
                 "MoveOverADraft",
@@ -607,28 +787,22 @@ fn the_real_ladder_is_the_derived_machine() {
                 "PlacedUnderAGoal",
                 "PlacedAsItRan",
             ] {
-                if buggy.action_enabled(mutant, s) && !real {
+                if enabled.contains(mutant) && !real {
                     caught.insert(mutant);
                 }
             }
-            if buggy.action_enabled("NowWaivesThePerson", s)
-                && !real_moves(&f, ladder.idle_read, &Request::Now)
+            if enabled.contains("NowWaivesThePerson")
+                && !real_moves(f, ladder.idle_read, &Request::Now)
             {
                 caught.insert("NowWaivesThePerson");
             }
-            if buggy.action_enabled("SeqSettle", s) && real {
+            if enabled.contains("SeqSettle") && real {
                 caught.insert("SeqSettle");
             }
             // The degraded lanes, once decided: refused where the real rule
             // moves.
-            for mutant in ["AttendedWithoutLadder", "BlindReader", "OtherTurnHolds"] {
-                let mut decided = s.clone();
-                if buggy.fire(mutant, &mut decided)
-                    && !buggy.action_enabled("Move", &decided)
-                    && real
-                {
-                    caught.insert(mutant);
-                }
+            if real {
+                caught.extend(refused.iter().copied());
             }
         }
     }
@@ -656,11 +830,12 @@ fn the_real_ladder_is_the_derived_machine() {
     ] {
         assert_eq!(upgrade::rung(behind), rung);
     }
+    let fired = aterm_spec::interp::fired_actions(&model);
     let every: BTreeSet<&str> = buggy
         .actions
         .iter()
         .map(|a| a.name)
-        .filter(|name| !aterm_spec::interp::fired_actions(&model).contains(name))
+        .filter(|name| !fired.contains(name))
         .collect();
     assert_eq!(caught, every, "every Buggy member caught by the real rule");
 
@@ -686,7 +861,11 @@ fn the_real_ladder_is_the_derived_machine() {
             ("Pin", "daemon_step"),
         ]
     );
-    let entered = xref::entered_anchor_ids();
+    // This thread's window, and the looks' own: the anchors a look enters
+    // (the still run's, the daemon's turns) are entered on the worker that
+    // took it.
+    let mut entered = xref::entered_anchor_ids();
+    entered.extend(looks_entered);
     for id in [
         "HarnessUpgradeLadder::Advance @ rung",
         "HarnessUpgradeLadder::Look @ still",
@@ -698,11 +877,11 @@ fn the_real_ladder_is_the_derived_machine() {
     }
 }
 
-/// THE REPAINT-PROOF SETTLE, looked at (`ladder_look`, `St::still`): two
-/// looks QUIET_S apart at the same last words stand QUIET_S however the
-/// screen repainted; new words, a look not idle, or a look past
-/// `IDLE_RUN_GAP_S` begin the run again. NEGATIVE CONTROL: the screen's own
-/// quiet (`quiet_s`, the verdict `unknown`) restarts at each repaint.
+/// The repaint-proof settle (`ladder_look`, `St::still`): two looks QUIET_S
+/// apart at the same last words stand QUIET_S however the screen repainted;
+/// new words, a look not idle, or a look past `IDLE_RUN_GAP_S` restart the run.
+/// Negative control: the screen's own quiet (`quiet_s`, verdict `unknown`)
+/// restarts at each repaint.
 #[test]
 fn the_still_run_counts_looks_at_the_same_words_and_not_repaints() {
     let mut st = St::default();
@@ -751,9 +930,9 @@ fn the_still_run_counts_looks_at_the_same_words_and_not_repaints() {
     );
 }
 
-/// One look of the incident's day: the tab's screen and its `seq`, whether
-/// this tab's thread runs a turn in the daemon, and the owner's last
-/// keystroke (unix s).
+/// One look of the recorded day: the tab's screen and its `seq`, whether this
+/// tab's thread runs a turn in the daemon, and the owner's last keystroke
+/// (unix s).
 struct DayLook {
     rows: Vec<String>,
     seq: u64,
@@ -769,11 +948,10 @@ impl DayLook {
     }
 }
 
-/// The incident's GOAL LOOKS, 06:09:22Z to 14:59:53Z, a look every 200 s:
-/// every fourth one mid-turn (the status row up), the rest idle-looking
-/// between goal turns — this tab's thread running its goal's next turn at
-/// every one — the words new every fourth look, the goal's counter
-/// repainting at each.
+/// The recorded goal looks, 06:09:22Z to 14:59:53Z, one every 200 s: every
+/// fourth mid-turn (the status row up), the rest idle-looking between goal
+/// turns with this tab's thread running the goal's next turn; the words new
+/// every fourth look, the goal's counter repainting at each.
 fn goal_looks() -> Vec<(u64, DayLook)> {
     (0..)
         .map(|i: u64| 1_790_575_762 + i * 200)
@@ -822,44 +1000,19 @@ fn paused_looks() -> Vec<(u64, DayLook)> {
         .collect()
 }
 
-/// THE 2026-09-28 INCIDENT, REPLAYED through the visit's own assembly on its
-/// own schedule (the journal of tab `s-0920…`, the rollout, the ledger). One
-/// Codex session on its daemon, one tab attached: the kernel names the
-/// thread as this tab's.
+/// A recorded day replayed through the visit's assembly on its own schedule,
+/// one Codex session on its daemon with one tab attached:
 ///
-/// * 20:39Z–05:12Z: Codex 0.157.1 CURRENT on its current, UNPINNED daemon —
-///   due for the PIN alone (main's rule, kept: that daemon's armed updater
-///   restarted it mid-turn at 06:05:45Z). Looked at for it once an hour
-///   (PIN_LOOK_S), each look `wait:pin:busy-thread` on the goal's thread,
-///   owning no turn end — where every idle point of the goal's turns looked
-///   before.
-/// * 05:21:08Z 0.158.0 installed (behind from then). 06:09Z–14:59Z: a
-///   goal-mode turn in the daemon at every look — the next one began within
-///   14 ms of each end — its screen idle-looking between the busy rows, the
-///   goal's counter repainting, the words changing turn by turn. The real
-///   rule types NOTHING through Settled, KeysOnly and Land: this tab's own
-///   thread runs its goal (`goal`, the wait the owner's "Pause the goal
-///   briefly" will lift), and `/exit` might stop the turn. A step that
-///   ignored the daemon's turn (`MoveMidTurn`, the report's proposed
-///   repaint-proof move of a daemon-mode client) would have ended the client
-///   at 06:12Z, mid-goal.
-/// * 15:01:13Z the owner's Esc pauses the goal; 15:02:39Z they send a
-///   message, answered by 15:04:04Z; the thread idles until 15:18:42Z; the
-///   input line is drawn `»` from 15:02Z. The real rule moves at the first
-///   look of that pause, 15:04:17Z (the journal's own idle event): the Land
-///   rung (9 h 43 m behind), the last keystroke 98 s old, the `»` line read
-///   by the one reader. The reader of the incident (`BlindReader`, `›`
-///   alone) never steps there — the owner quit and resumed Codex by hand at
-///   15:27Z; the grace that never narrows (`AttendedWithoutLadder`, 120 s)
-///   waits two more looks.
+/// * 20:39Z–05:12Z: an unpinned daemon, due for the pin alone, looked at
+///   hourly (`PIN_LOOK_S`), each look `wait:pin:busy-thread`.
+/// * 05:21Z a new Codex is installed; 06:09Z–14:59Z a goal-mode turn runs at
+///   every look. The real rule types nothing (`goal`); `MoveMidTurn` would end
+///   the client at 06:12Z, mid-goal.
+/// * 15:01Z the owner's Esc pauses the goal and the input line reads `»`. The
+///   real rule moves at the pause's first look, 15:04:17Z; `BlindReader` never
+///   steps there and `AttendedWithoutLadder` waits two more looks.
 ///
-/// So it lands at the first pause the goal gave, 7 h 43 m past the Land rung
-/// (07:21:08Z): no rung moves a client over its own running turn, and a goal
-/// that never pauses gives none until aterm may pause it (the owner's
-/// decision of 2026-09-28, not built here). The tab read
-/// `integration=degraded` with no blocks at 15:35Z: the typed `/exit` then
-/// names its thread from the KERNEL — the daemon's one thread, this TUI its
-/// one client (`kernel_thread`) — as this replay's daemon is.
+/// The typed `/exit` names its thread from the kernel (`kernel_thread`).
 #[test]
 fn the_incident_replayed_moves_at_the_first_pause_its_goal_gave() {
     const PENDING: u64 = 1_790_572_868; // 05:21:08Z
@@ -918,7 +1071,7 @@ fn the_incident_replayed_moves_at_the_first_pause_its_goal_gave() {
         };
         let (mut f, ladder) = look(st, &scr, false, d, t);
         let trusted = match lane {
-            // The reader of the incident knew `›` alone.
+            // A reader knowing `›` alone.
             Lane::BlindReader => {
                 ladder.idle_read
                     && aterm_phase::codex::composer(&l.rows)
@@ -957,9 +1110,9 @@ fn the_incident_replayed_moves_at_the_first_pause_its_goal_gave() {
         (None, waits)
     };
 
-    // THE REAL RULE: nothing through nine hours of the goal's turns, at every
-    // rung — the looks between turns wait `goal`, this tab's own goal named
-    // by the kernel; the `/exit` at the first look of the owner's pause.
+    // The real rule: nothing through nine hours of goal turns at every rung
+    // (looks between turns wait `goal`, named by the kernel); `/exit` at the
+    // first look of the owner's pause.
     let (moved, waits) = run(Lane::Real);
     assert_eq!(
         moved,
@@ -988,13 +1141,11 @@ fn the_incident_replayed_moves_at_the_first_pause_its_goal_gave() {
     );
 }
 
-/// THE RULE OF THE ROUND BEFORE THE THIRD REVIEW (2026-09-28), kept here as
-/// the replays' negative-control lane: the kernel named a client's thread
-/// only where its daemon held ONE writer lock and it was the one client —
-/// so a conversation with subagents was never named — and a running thread
-/// the still run placed (`elsewhere`) held nothing, whatever it was — a
-/// subagent, a root with no other Codex attached — unless a goal showed on
-/// this screen (`goal`).
+/// An earlier, weaker rule kept as the replays' negative-control lane: the
+/// kernel named a client's thread only where its daemon held one writer lock
+/// and it was the one client (so a conversation with subagents was never
+/// named), and a running thread the still run placed (`elsewhere`) held
+/// nothing unless a goal showed on this screen (`goal`).
 fn round_before(
     threads: &[cx::Loaded],
     clients: &[u32],
@@ -1046,23 +1197,18 @@ fn placed_by(
     placed
 }
 
-/// THE SECOND REVIEW'S PROBE (2026-09-28), REPLAYED: the incident's own goal
-/// looks — this tab's thread running its goal at every one of them — with
-/// ONE MORE thread on the daemon, idle: another tab's Codex session (two
-/// clients), or a thread no tab shows (this TUI the daemon's only client).
-/// The kernel names no conversation, so this tab's screen is all the lane
-/// has, and it reads the goal's own turns ENDED at the same last words for
+/// The recorded goal looks with one more idle thread on the daemon: another
+/// tab's Codex session (two clients), or a thread no tab shows (this TUI the
+/// only client). The kernel names no conversation, so the lane has only this
+/// tab's screen, which reads the goal's turns ended at the same words for
 /// 200 s at a time. The real rule places nothing under the goal its footer
-/// shows — nor, with this TUI the only client, anything at all: it types
-/// NOTHING through the nine hours — `daemon-busy` between the busy rows,
-/// never `goal` (the thread is not proven this tab's) — and moves at the
-/// first look of the owner's pause, as the one-thread replay does.
+/// shows, nor anything with this TUI the only client: it types nothing through
+/// the nine hours (`daemon-busy`, never `goal`, since the thread is not proven
+/// this tab's) and moves at the first look of the owner's pause.
 ///
-/// NEGATIVE CONTROLS, each ending the client MID-GOAL: `MoveMidTurn` (the
-/// daemon's turn ignored), and `PlacedUnderAGoal` — the rule of the rounds
-/// before, the still run placing through the goal ([`placed_by`] handed to
-/// [`round_before`] as though no goal showed), which the review's probe
-/// caught typing `/exit` at 06:12:42Z, the second goal look.
+/// Negative controls, each ending the client mid-goal: `MoveMidTurn`, and
+/// `PlacedUnderAGoal` ([`placed_by`] handed to [`round_before`] as though no
+/// goal showed), typing `/exit` at the second goal look.
 #[test]
 fn a_second_thread_on_the_daemon_never_lets_the_goal_be_ended() {
     const PENDING: u64 = 1_790_572_868; // 05:21:08Z
@@ -1151,27 +1297,21 @@ fn a_second_thread_on_the_daemon_never_lets_the_goal_be_ended() {
     }
 }
 
-/// THE THIRD REVIEW'S SHAPE (2026-09-28), REPLAYED: the owner's daemon as it
-/// was measured that evening, read-only — ONE conversation, the root this
-/// tab's one TUI resumed, and three subagents it spawned, their turns begun
-/// on their own after the spawn and drawn nowhere on the tab's screen, which
-/// stands idle at the same last words look after look. The looks: every
-/// 200 s from the Land rung on, a subagent running at each of the first
-/// eight (its turn a few minutes long, the next one's beginning as the last
-/// ends), the root idle — then, at the last two, every thread idle. With the
-/// goal footer (`goal`) or without it.
+/// One conversation (the root this tab's one TUI resumed) and three subagents
+/// it spawned, their turns drawn nowhere on the tab's screen, which stands idle
+/// at the same words. Looks every 200 s from the Land rung, a subagent running
+/// at each of the first eight, the root idle; at the last two every thread
+/// idle. With the goal footer (`goal`) or without it.
 ///
-/// THE REAL RULE: the kernel names the conversation — every thread hangs
-/// from the root, and this TUI is the one client — so a subagent's turn is
-/// the tab's own: it waits `daemon-turn` (`goal` under the footer) at every
-/// look a subagent runs, types nothing, and moves at the first look with
-/// every thread idle. NEGATIVE CONTROLS: the rule of the round before
-/// ([`round_before`] over [`placed_by`]) named nothing — four locks — and
-/// placed the running subagent after 20 s of the still screen: `/exit` at
-/// the second look, the subagent mid-turn (without the footer; under it, it
-/// waited `daemon-busy`, never `goal`). And the same looks with ANOTHER
-/// session on the daemon, another Codex attached (the kernel names nothing
-/// now): the real rule never places a subagent, `daemon-busy` until it ends.
+/// The real rule: the kernel names the conversation (every thread hangs from
+/// the root, this TUI the one client), so a subagent's turn is the tab's own:
+/// it waits `daemon-turn` (`goal` under the footer), types nothing, and moves
+/// at the first look with every thread idle. Negative controls: the weaker
+/// rule ([`round_before`] over [`placed_by`]) names nothing and places the
+/// running subagent after 20 s of still screen, typing `/exit` at the second
+/// look mid-turn. With another session on the daemon (the kernel names
+/// nothing), the real rule never places a subagent: `daemon-busy` until it
+/// ends.
 #[test]
 fn the_owners_shape_holds_while_a_subagent_of_its_own_conversation_runs() {
     const PENDING: u64 = 1_790_572_868; // 05:21:08Z
@@ -1249,6 +1389,6 @@ fn the_owners_shape_holds_while_a_subagent_of_its_own_conversation_runs() {
     }
 }
 
-// The goal pause's Tier-1 bind and its replay of the incident.
+// The goal pause's Tier-1 bind and its replay of the recorded day.
 #[path = "upgrade_goal_tests.rs"]
 mod goal;

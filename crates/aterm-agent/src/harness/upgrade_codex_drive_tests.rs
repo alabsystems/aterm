@@ -1,13 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE CODEX LANE'S DRIVER over scripted screens and a scripted kernel: a
+//! The Codex lane's driver over scripted screens and a scripted kernel: a
 //! stand-in aterm instance on a real socket (every request recorded, nothing
 //! typed anywhere) whose screen turns from Codex's idle composer into the
 //! shell with the TUI's exit hint when `/exit` is typed, and into the
 //! relaunched Codex when the relaunch line is; and a kernel whose TUI dies
-//! when `/exit` is typed and whose relaunch appears when its line is. Every
-//! screen and hint is the one measured on Codex 0.157.0/0.157.1 (2026-09-25).
+//! when `/exit` is typed and whose relaunch appears when its line is. Screens
+//! and hints are Codex 0.157.0/0.157.1's.
 
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::harness::upgrade::Request;
+use crate::supervise::ScratchDir;
 
 const TAB: &str = "s-c0dec0dec0dec0dec0de";
 const TOKEN: &str = "0badf00d0badf00d";
@@ -31,16 +32,12 @@ fn v(s: &str) -> Version {
     Version::parse(s).expect("version")
 }
 
-/// A fresh directory per CALL: two tests share a name (`Rig::new("daemon-busy")` and
-/// `daemon_home("daemon-busy")`), and the harness runs them on parallel threads of one
-/// process, so a per-name directory let one wipe the other's mid-pass.
-fn scratch(name: &str) -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("aterm-cxd-{name}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("scratch");
-    d
+/// A fresh directory per CALL, removed when it drops: two tests share a name
+/// (`Rig::new("daemon-busy")` and `daemon_home("daemon-busy")`), and the harness runs
+/// them on parallel threads of one process, so a per-name directory let one wipe the
+/// other's mid-pass.
+fn scratch(name: &str) -> ScratchDir {
+    ScratchDir::new("cxd", name)
 }
 
 /// One `text --json` body: `rows`, the cursor at `(row, col)`, `seq` and a
@@ -56,8 +53,8 @@ fn screen_json(rows: &[&str], cursor: (usize, usize), seq: u64) -> String {
     )
 }
 
-/// Codex 0.157's idle screen, measured: the card, the composer's dim
-/// placeholder with the cursor at column 2, the footer.
+/// Codex 0.157's idle screen: the card, the composer's dim placeholder with
+/// the cursor at column 2, the footer.
 fn codex_idle(seq: u64) -> String {
     screen_json(
         &[
@@ -77,9 +74,8 @@ fn codex_idle(seq: u64) -> String {
     )
 }
 
-/// [`codex_idle`] with a GOAL being pursued: the footer under the input line
-/// says `Pursuing goal (…)`, as the owner's 0.158.0 tab's did (measured
-/// 2026-09-28).
+/// [`codex_idle`] with a goal being pursued: the footer under the input line
+/// says `Pursuing goal (…)`, as Codex 0.158.0 draws it.
 fn codex_idle_goal(seq: u64) -> String {
     screen_json(
         &[
@@ -115,7 +111,7 @@ fn codex_draft(seq: u64) -> String {
     )
 }
 
-/// The shell after the TUI's exit: an OLDER exit's hint (another thread)
+/// The shell after the TUI's exit: an older exit's hint (another thread)
 /// above the command that ran this one, then this one's hint `hint`, then
 /// the prompt with the cursor after it.
 fn shell_after(hint: &[&str]) -> String {
@@ -167,26 +163,30 @@ struct World {
     /// Appended to the `status` reply as it is asked (a person's stamp, a
     /// hold): what changes while a test runs.
     status_extra: Arc<Mutex<String>>,
-    /// A `turn` types its text and does NOT submit it, answering this — a
-    /// missed guard's `skipped reason=guard`, or an Enter written and not
-    /// seen (`submitted=0 pressed=1`) — and the composer then shows that
-    /// text ([`World::left`]) until a fenced, guarded `ctrl+u` clears it.
+    /// A `turn` types its text and does not submit it, answering this (a
+    /// missed guard's `skipped reason=guard`, or an Enter written and not seen,
+    /// `submitted=0 pressed=1`), and the composer then shows that text
+    /// ([`World::left`]) until the test clears it; the lane never takes it
+    /// back.
     miss: Option<&'static str>,
     /// What the lane left typed in the composer, as the stand-in draws it.
     left: Arc<Mutex<Option<String>>>,
+    /// The screen the tab comes to show while a test runs — what a turn's end
+    /// leaves on it, a wall — in place of [`World::before`], once set.
+    shows: Arc<Mutex<Option<String>>>,
     /// The `lease acquire …` reply (a `lease release` is `OK lease released`
     /// after an acquire it granted).
     lease: &'static str,
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<String>>>,
-    /// A GOAL on the tab's Codex, as the stand-in draws it (`None`: the
+    /// A goal on the tab's Codex, as the stand-in draws it (`None`: the
     /// screens above, as they are): its footer and the relaunched Codex's
     /// `Resume paused goal?` box, moved by the goal's keys and commands.
     goal: Option<Arc<Mutex<GoalWorld>>>,
 }
 
-/// A Codex GOAL as the stand-in draws it ([`World::goal`]).
+/// A Codex goal as the stand-in draws it ([`World::goal`]).
 #[derive(Debug, Default)]
 pub(super) struct GoalWorld {
     /// The goal is paused (its footer `Goal paused (/goal resume)`), not
@@ -199,12 +199,12 @@ pub(super) struct GoalWorld {
     pub(super) boxed: bool,
     /// The person stamp its screens carry (`human_ms`), `None`: nobody.
     pub(super) human_ms: Option<u64>,
-    /// A goal turn's STATUS ROW stands over the composer (`• Working (0s •
+    /// A goal turn's status row stands over the composer (`• Working (0s •
     /// esc to interrupt)`), as it does for the whole of a turn's head.
     pub(super) working: bool,
-    /// How many screen reads after the relaunch show its STARTUP frame — the
-    /// composer, no footer, `Resuming session…` — before its paused goal's
-    /// box (measured: about 200 ms before it on 0.158.0).
+    /// How many screen reads after the relaunch show its startup frame (the
+    /// composer, no footer, `Resuming session…`) before its paused goal's box
+    /// (about 200 ms on 0.158.0).
     pub(super) startup: u32,
     /// What the goal was given, in order: `pause`, `resume` (typed), `enter`,
     /// `esc` (keys).
@@ -213,13 +213,16 @@ pub(super) struct GoalWorld {
 
 /// The tab's Codex with a goal on its footer, pursued or `paused`, at its
 /// idle-looking frame (a goal turn's first moments), the person stamp
-/// `human` — with a goal turn's status row over the composer where `working`
-/// (a turn at its head: `• Working (0s • esc to interrupt)`, as
-/// `codex-0.158.0-goal-busy-live.txt` draws it mid-turn).
+/// `human`; with a goal turn's status row over the composer where `working`
+/// (`• Working (0s • esc to interrupt)`, as
+/// `codex-0.158.0-goal-busy-live.txt` draws it mid-turn), and its composer
+/// holding `draft`, the cursor after it, where there is one (the lane's own
+/// words left there, [`World::left`]).
 pub(super) fn codex_goal_frame(
     paused: bool,
     working: bool,
     human: Option<u64>,
+    draft: Option<&str>,
     seq: u64,
 ) -> String {
     let goal = if paused {
@@ -236,6 +239,7 @@ pub(super) fn codex_goal_frame(
     } else {
         ""
     };
+    let composer = format!("› {}", draft.unwrap_or("Ask Codex to do anything"));
     let json = screen_json(
         &[
             "╭─────────────────────────────────────────────╮",
@@ -245,12 +249,12 @@ pub(super) fn codex_goal_frame(
             "",
             status,
             "",
-            "› Ask Codex to do anything",
+            &composer,
             "",
             &footer,
             "  ← for agents · ? for shortcuts",
         ],
-        (7, 2),
+        (7, draft.map_or(2, |d| 2 + d.chars().count())),
         seq,
     );
     match human {
@@ -272,10 +276,9 @@ pub(super) fn codex_goal_box(seq: u64) -> String {
     screen_json(&refs, (at, 0), seq)
 }
 
-/// The relaunched Codex's STARTUP frame, drawn before its paused goal's box
-/// (MEASURED 2026-09-28, 0.158.0, `codex resume <thread>` over a paused
-/// goal: `Resuming session…` over the composer, no footer, 0.298 s in; the
-/// box at 0.499 s).
+/// The relaunched Codex's startup frame, drawn before its paused goal's box
+/// (0.158.0, `codex resume <thread>` over a paused goal: `Resuming session…`
+/// over the composer, no footer, about 0.3 s in; the box at 0.5 s).
 fn codex_startup(seq: u64) -> String {
     screen_json(
         &[
@@ -345,7 +348,7 @@ fn instance(dir: &Path, w: World) -> String {
                     "sessions" => format!("OK 1\nlocal {TAB} 0 idle codex"),
                     // A goal on the tab's Codex: its footer, and the box the
                     // relaunched Codex opens on while the goal is paused.
-                    "text" if left.is_none() && goal.is_some() && (relaunched || !exited) => {
+                    "text" if goal.is_some() && (relaunched || !exited) => {
                         let (paused, boxed, human, working, startup) = goal.unwrap_or_default();
                         format!(
                             "OK {}",
@@ -358,6 +361,7 @@ fn instance(dir: &Path, w: World) -> String {
                                     paused,
                                     working,
                                     human,
+                                    left.as_deref(),
                                     if paused { 12 } else { 11 },
                                 )
                             }
@@ -371,6 +375,8 @@ fn instance(dir: &Path, w: World) -> String {
                             w.after_exit.clone()
                         } else if let Some(t) = &left {
                             codex_holding(t, 30)
+                        } else if let Some(shown) = w.shows.lock().ok().and_then(|s| s.clone()) {
+                            shown
                         } else {
                             w.before.clone()
                         }
@@ -402,21 +408,9 @@ fn instance(dir: &Path, w: World) -> String {
                         }
                     }
                     "lease" => w.lease.to_string(),
-                    // A fenced, guarded `ctrl+u`: the composer's line is
-                    // cleared, as Codex 0.157 clears it.
-                    "key"
-                        if line.contains("if-gen=")
-                            && line.contains("if=")
-                            && line.ends_with(" ctrl+u") =>
-                    {
-                        if let Ok(mut l) = w.left.lock() {
-                            *l = None;
-                        }
-                        "OK seq=31".to_string()
-                    }
                     "turn" if w.miss.is_some() => {
                         // What the host does on a missed guard: the text is
-                        // TYPED and its Enter not pressed.
+                        // typed and its Enter not pressed.
                         let text = line
                             .split_once(&format!(" {TURN_WAIT} "))
                             .map_or("", |(_, t)| t)
@@ -492,6 +486,12 @@ struct Script {
     background: Vec<String>,
     /// The session leaders under the TUI ([`CodexKernel::terminals`]).
     terminals: Vec<String>,
+    /// What runs under the TUI, named for the notice ([`CodexKernel::held`]).
+    held: Vec<upgrade::Held>,
+    /// The `TZ` each pid was started with ([`CodexKernel::tz`]; `None`
+    /// inside: none named): a pid not listed has an environment that cannot
+    /// be read.
+    tz: Vec<(u32, Option<String>)>,
 }
 
 impl Kernel for Script {
@@ -526,6 +526,13 @@ impl CodexKernel for Script {
         })
     }
 
+    fn tz(&self, pid: u32) -> Option<Option<String>> {
+        self.tz
+            .iter()
+            .find(|(p, _)| *p == pid)
+            .map(|(_, tz)| tz.clone())
+    }
+
     fn exe(&self, _: u32) -> Option<PathBuf> {
         None
     }
@@ -533,6 +540,8 @@ impl CodexKernel for Script {
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>> {
         Some(match (pid, &self.lock) {
             (TUI, Some(lock)) if !self.exited.load(Ordering::SeqCst) => vec![lock.clone()],
+            // The relaunch holds the thread again, as `holders_of` says.
+            (NEW, Some(lock)) if self.relaunched.load(Ordering::SeqCst) => vec![lock.clone()],
             _ => Vec::new(),
         })
     }
@@ -570,6 +579,10 @@ impl CodexKernel for Script {
         self.terminals.clone()
     }
 
+    fn held(&self, _: u32) -> Vec<upgrade::Held> {
+        self.held.clone()
+    }
+
     fn daemon_clients(&self, _: u32) -> Option<Vec<u32>> {
         Some(vec![TUI])
     }
@@ -586,7 +599,7 @@ impl CodexKernel for Script {
 /// One scripted rig: a home with the thread's rollout, a state directory, the
 /// stand-in instance, the kernel, and the TUI and target a sweep found.
 struct Rig {
-    dir: PathBuf,
+    dir: ScratchDir,
     opts: Opts,
     tui: Tui,
     target: Target,
@@ -597,6 +610,8 @@ struct Rig {
     left: Arc<Mutex<Option<String>>>,
     /// Appended to the tab's `status` reply ([`World::status_extra`]).
     status_extra: Arc<Mutex<String>>,
+    /// What the tab comes to show ([`World::shows`]).
+    shows: Arc<Mutex<Option<String>>>,
 }
 
 impl Rig {
@@ -625,6 +640,7 @@ impl Rig {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let left = Arc::new(Mutex::new(None));
         let status_extra = Arc::new(Mutex::new(String::new()));
+        let shows = Arc::new(Mutex::new(None));
         let hint = if embedded {
             vec![
                 "To continue this session, run:".to_string(),
@@ -652,6 +668,7 @@ impl Rig {
             status_extra: Arc::clone(&status_extra),
             miss: None,
             left: Arc::clone(&left),
+            shows: Arc::clone(&shows),
             lease: "ERR unscripted",
             exited: Arc::clone(&exited),
             relaunched: Arc::clone(&relaunched),
@@ -670,6 +687,9 @@ impl Rig {
             hand_back: false,
             background: false,
             aterm_state: None,
+            // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
+            ask: true,
+            several_logins: false,
         };
         let lock = embedded.then(|| {
             codex
@@ -704,11 +724,15 @@ impl Rig {
                 new_argv,
                 background: Vec::new(),
                 terminals: Vec::new(),
+                held: Vec::new(),
+                // The TUI names no `TZ`: the machine's own zone.
+                tz: vec![(TUI, None)],
             },
             asked,
             rollout,
             left,
             status_extra,
+            shows,
             opts,
             dir,
         }
@@ -799,22 +823,33 @@ fn daemon_at(running: Option<&str>, wait: &str) -> Option<DaemonView> {
 fn a_daemon_client_is_exited_by_a_typed_exit_and_resumed_on_the_managed_twin() {
     let rig = Rig::new("daemon-swap", T1, false, |_| {});
     rig.settle(10);
-    let r = rig.visit(daemon_current());
+    let k = InFlight(&rig.kernel, &rig.opts, Mutex::new(None));
+    let r = visit(&rig.opts, &rig.tui, &rig.target, daemon_current(), &k);
     assert_eq!(r.step, "done", "{r:?}\n{:#?}", rig.asked());
+    // The record in flight, the TUI gone and its exit not read yet, carries
+    // no line (a line planned with the placeholder thread would resume
+    // `00000000-…`).
+    let in_flight =
+        k.2.into_inner()
+            .expect("the record")
+            .expect("the relaunch looked for the shell's prompt");
+    assert!(matches!(in_flight.phase, Phase::Exiting { .. }));
+    assert_eq!(
+        in_flight.line, "",
+        "no line until the exit names the thread"
+    );
     assert_eq!(r.pid, NEW);
     let typed = rig.typed();
     assert_eq!(typed.len(), 2, "{typed:#?}");
     // `/exit`, fenced on the read that judged the composer empty and guarded
-    // on the composer's row — either of its marks (`›`, and 0.158.0's `»`,
-    // measured 2026-09-28: a guard spelled `›` alone is never pressed under
-    // the new input line).
+    // on the composer's row by either of its marks (`›`, and 0.158.0's `»`).
     assert!(
         typed[0].contains("if-gen=1.10 yield=0.2 submit=guarded:^[›»]\\s/exit\\s*$ ")
             && typed[0].ends_with(" /exit"),
         "{}",
         typed[0]
     );
-    // The relaunch: the managed twin, `resume` and the thread the TUI's OWN
+    // The relaunch: the managed twin, `resume` and the thread the TUI's own
     // hint named — never the older exit's still on the screen.
     let line = &typed[1];
     assert!(
@@ -825,7 +860,7 @@ fn a_daemon_client_is_exited_by_a_typed_exit_and_resumed_on_the_managed_twin() {
         !line.contains("01a0dc99"),
         "the older exit's thread: {line}"
     );
-    // NOTHING SIGNALS A CODEX PROCESS.
+    // Nothing signals a Codex process.
     assert!(!rig.asked().iter().any(|l| l.contains("signal")));
     let st = rig.state();
     assert_eq!(st.phase, Phase::Done);
@@ -839,14 +874,12 @@ fn a_daemon_client_is_exited_by_a_typed_exit_and_resumed_on_the_managed_twin() {
     );
 }
 
-/// ND1 FOR A CODEX (the review of the first cut: the Codex restart's
-/// `/exit`-to-relaunch bare shell took no hand, and the `aterm help` text
-/// said every restart did): the harness's HARD hand is taken before the
-/// `/exit`'s last look and kept — never let go — through the `/exit`, the
-/// bare shell and the relaunch line, both typed under it on its own
-/// connection, and given back once the relaunched TUI is carried on.
-/// NEGATIVE CONTROL: another driver's hold on the tab — the restart waits
-/// `held`, types nothing and gives nothing back.
+/// ND1 for a Codex: the harness's hard hand is taken before the `/exit`'s
+/// last look and kept through the `/exit`, the bare shell and the relaunch
+/// line, both typed under it on its own connection, and given back once the
+/// relaunched TUI is carried on. Negative control: another driver's hold on
+/// the tab makes the restart wait `held`, typing nothing and giving nothing
+/// back.
 #[test]
 fn a_codex_restart_holds_the_tab_from_its_last_look_to_the_relaunched_tui() {
     let held = "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1";
@@ -874,7 +907,7 @@ fn a_codex_restart_holds_the_tab_from_its_last_look_to_the_relaunched_tui() {
         asked[line..].iter().any(|l| l.contains(" lease release ")),
         "given back: {asked:#?}"
     );
-    // NEGATIVE CONTROL: another driver holds the tab.
+    // Negative control: another driver holds the tab.
     let rig = Rig::new("codex-hand-theirs", T1, false, |w| {
         w.lease = "ERR lease held holder=orchestrator expires_in_ms=5000";
     });
@@ -890,8 +923,8 @@ fn a_daemon_client_waits_for_its_daemon_and_for_every_quiet_gate() {
     // The daemon's own move goes first.
     let rig = Rig::new("daemon-first", T1, false, |_| {});
     rig.settle(10);
-    // ... and the client says what the daemon waits on (review of
-    // 2026-09-26: a bare `daemon-first` named nothing the owner could act on).
+    // ... and the client says what the daemon waits on, not a bare
+    // `daemon-first`.
     assert_eq!(
         rig.visit(daemon_at(Some("0.157.0"), "busy-thread")).step,
         "wait:daemon-first:busy-thread"
@@ -908,13 +941,11 @@ fn a_daemon_client_waits_for_its_daemon_and_for_every_quiet_gate() {
     assert!(rig.typed().is_empty());
     // No daemon at all and no lock held: nothing proves the mode.
     assert_eq!(rig.visit(None).step, "wait:no-daemon");
-    // Its daemon on the build, ITS OWN thread running a turn its screen does
+    // Its daemon on the build, its own thread running a turn its screen does
     // not show (the kernel names it: the daemon's one thread, this TUI its one
-    // client; a goal-mode Codex began its next turn within 14 ms of every
-    // end, its screen idle for seconds; 2026-09-28): its `/exit` might stop
-    // that turn (Codex 0.158.0's binary holds `Disconnected from this task.
-    // The current turn was stopped.`; which case prints it is unmeasured), so
-    // nothing is typed, at any rung.
+    // client; a goal-mode Codex begins its next turn within milliseconds of
+    // every end, its screen idle for seconds): its `/exit` might stop that
+    // turn, so nothing is typed, at any rung.
     let hidden = Some(DaemonView {
         running: Some(v("0.157.1")),
         wait: String::new(),
@@ -966,9 +997,9 @@ fn a_daemon_client_waits_for_its_daemon_and_for_every_quiet_gate() {
 
 #[test]
 fn a_tui_that_names_no_thread_is_never_relaunched_into_another() {
-    // NEGATIVE CONTROL: the TUI printed nothing as it left. The older exit's
+    // Negative control: the TUI printed nothing as it left. The older exit's
     // hint is still above the prompt, and read from the whole screen it would
-    // resume ANOTHER conversation.
+    // resume another conversation.
     let rig = Rig::new("no-hint", T1, false, |w| {
         w.after_exit = shell_after(&[]);
         w.block_out = Vec::new();
@@ -1050,6 +1081,95 @@ fn an_embedded_conversation_is_asked_first_and_moved_only_on_its_ready_answer() 
     );
 }
 
+/// THE CODEX TWINS OF THE TYPED ACTS (the presence flap of 2026-09-28): the
+/// notice and the continuation are typed under the harness's own hand — the
+/// wire is `lease acquire … hard`, the fence's `help turn`, its screen read,
+/// the `turn`, `lease release`, nothing of aterm's between the last read and
+/// the `turn` — so the window's presence layer reads aterm's own hand and
+/// raises no row. NEGATIVE CONTROL: a tab another driver holds is a wait
+/// (`wait:held`), nothing typed, nothing given back.
+#[test]
+fn the_codex_notice_and_the_continuation_are_typed_under_the_harnesss_hand() {
+    let held = "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1";
+    let rig = Rig::new("embedded-under-hand", T2, true, |w| w.lease = held);
+    rig.settle(10);
+    let r = rig.visit(None);
+    assert_eq!(r.step, "announced:1", "{r:?}\n{:#?}", rig.asked());
+    let asked = rig.asked();
+    let pos = |needle: &str| asked.iter().position(|l| l.contains(needle));
+    let acquire = pos(" lease acquire ").expect("the hand taken");
+    assert!(asked[acquire].ends_with(" hard"), "{}", asked[acquire]);
+    let notice = pos(cx::ANNOUNCE_HEAD).expect("the notice");
+    let release = pos(" lease release ").expect("the hand given back");
+    let help = asked[acquire..notice]
+        .iter()
+        .position(|l| l.contains("help") && l.contains("turn"))
+        .map(|i| i + acquire)
+        .expect("the fence probes `turn` before its read");
+    assert!(
+        acquire < help && help < notice && notice < release,
+        "{asked:#?}"
+    );
+    // Nothing of aterm's between the fence's last read and the turn: no
+    // request that is not a read of the screen or the composer's cell.
+    let read = asked[help + 1..notice]
+        .iter()
+        .rposition(|l| l.contains(" text") || l.contains(" screen"))
+        .map(|i| i + help + 1)
+        .expect("the fence's read");
+    assert!(
+        asked[read + 1..notice].iter().all(|l| l.contains(" cell ")),
+        "only the composer's dim cell between the last read and the turn: {:#?}",
+        &asked[read..=notice]
+    );
+    assert_eq!(release, notice + 1, "given back at once: {asked:#?}");
+    // The READY answer, then the move, then the continuation: one hand from
+    // the relaunch line to the carry-on, given back once at the end.
+    let st = rig.state();
+    let answer = format!(
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"Stopped.\n{}"}}]}}}}"#,
+        st.marker
+    );
+    let mut text = std::fs::read_to_string(&rig.rollout).expect("rollout");
+    text.push_str(&answer);
+    text.push('\n');
+    std::fs::write(&rig.rollout, text).expect("rollout");
+    age(&rig.rollout);
+    rig.settle_keeping(&rig.state());
+    let r = rig.visit(None);
+    assert_eq!(r.step, "continued", "{r:?}\n{:#?}", rig.asked());
+    let asked = rig.asked();
+    let last_turn = asked
+        .iter()
+        .rposition(|l| l.contains(" turn ") && l.contains("Upgraded"))
+        .expect("the continuation");
+    let taken = asked[..last_turn]
+        .iter()
+        .rposition(|l| l.contains(" lease acquire "))
+        .expect("a hand before the continuation");
+    assert!(
+        !asked[taken..last_turn]
+            .iter()
+            .any(|l| l.contains(" lease release ")),
+        "the continuation is typed under a hand still held: {asked:#?}"
+    );
+    assert!(
+        asked[last_turn..]
+            .iter()
+            .any(|l| l.contains(" lease release ")),
+        "and given back after it: {asked:#?}"
+    );
+    // NEGATIVE CONTROL: another driver holds the tab.
+    let rig = Rig::new("embedded-theirs", T2, true, |w| {
+        w.lease = "ERR lease held holder=orchestrator expires_in_ms=5000";
+    });
+    rig.settle(10);
+    let r = rig.visit(None);
+    assert_eq!(r.step, "wait:held", "{r:?}");
+    assert!(rig.typed().is_empty(), "{:#?}", rig.asked());
+    assert!(!rig.asked().iter().any(|l| l.contains(" lease release ")));
+}
+
 #[test]
 fn work_still_running_under_an_embedded_session_is_waited_for_ready_or_not() {
     let mut rig = Rig::new("embedded-bg", T2, true, |_| {});
@@ -1083,7 +1203,7 @@ fn the_owners_word_holds_or_hurries_a_codex_upgrade() {
     st.request_tab = TAB.into();
     save(&rig.opts, &key(TAB), &st);
     assert_eq!(rig.visit(daemon_current()).step, "wait:skipped");
-    // `--now` waives the settling window: a screen that JUST moved.
+    // `--now` waives the settling window: a screen that just moved.
     let now = Rig::new("owner-now", T1, false, |_| {});
     now.settle(9);
     let mut st = now.state();
@@ -1113,7 +1233,7 @@ fn only_a_tabs_foreground_codex_is_a_candidate() {
         (300, 30, "zsh".to_string()),
         (400, 40, "codex".to_string()),
     ];
-    // The host: the tab's foreground group's LEADER, when it is a codex.
+    // The host: the tab's foreground group's leader, when it is a codex.
     let tabs = vec![
         LiveTab {
             sid: "s-a".into(),
@@ -1146,7 +1266,7 @@ fn only_a_tabs_foreground_codex_is_a_candidate() {
             }),
         }]
     );
-    // Its environment naming ANOTHER tab vetoes the claim.
+    // Its environment naming another tab vetoes the claim.
     assert!(
         candidates(
             Some(&tabs),
@@ -1156,9 +1276,8 @@ fn only_a_tabs_foreground_codex_is_a_candidate() {
         )
         .is_empty()
     );
-    // A hand-run sweep: the environment's tab, and only a foreground leader
-    // — the suspended one (400, its group not the terminal's) is no
-    // candidate, and could never write over the foreground one's notice.
+    // A hand-run sweep: the environment's tab, and only a foreground leader;
+    // the suspended one (400, its group not the terminal's) is no candidate.
     let env = |pid: u32| match pid {
         100 | 400 => Some("s-a".to_string()),
         200 => Some("s-b".to_string()),
@@ -1189,15 +1308,14 @@ fn only_a_tabs_foreground_codex_is_a_candidate() {
 
 /// A fake `codex` for the daemon's verb: it lays the managed package into the
 /// daemon's releases, re-points `daemon.pid` at a new pid, disarms the
-/// vendor's updater, and answers as 0.157.1 does — recording its argv and
-/// its whole environment first.
+/// vendor's updater, and answers as 0.157.1 does, recording its argv and its
+/// whole environment first.
 fn fake_update_verb(dir: &Path, home: &Path, new_pid: u32) -> PathBuf {
     let exe = dir.join("store/codex/b/bin/codex");
     std::fs::create_dir_all(exe.parent().expect("bin")).expect("bin");
     let rel = home.join("packages/app-server-daemon/releases/local-abc");
     let script = format!(
-        "#!/bin/sh\n\
-         /usr/bin/env > '{dir}/verb.env'\n\
+        "/usr/bin/env > '{dir}/verb.env'\n\
          echo \"$@\" > '{dir}/verb.args'\n\
          /bin/mkdir -p '{rel}/bin'\n\
          : > '{rel}/bin/codex'\n\
@@ -1205,29 +1323,26 @@ fn fake_update_verb(dir: &Path, home: &Path, new_pid: u32) -> PathBuf {
          /bin/rm -f '{home}/packages/app-server-daemon/auto-update-version'\n\
          echo '{{\"pid\":{new_pid}}}' > '{home}/app-server-daemon/daemon.pid'\n\
          echo 'Replace installed daemon version 0.157.0 with CLI version 0.157.1.'\n\
-         echo '{{\"status\":\"updated\",\"installedVersion\":\"0.157.1\",\"runningVersion\":\"0.157.1\"}}'\n",
+         echo '{{\"status\":\"updated\",\"installedVersion\":\"0.157.1\",\"runningVersion\":\"0.157.1\"}}'",
         dir = dir.display(),
         rel = rel.display(),
         home = home.display(),
         pkg = PACKAGE.replace("0.157.0", "0.157.1"),
     );
-    std::fs::write(&exe, script).expect("verb");
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // A link of the one stand-in, its first exec no assessment of a new file.
+    super::super::tests::sh_script(&exe, &script);
     exe
 }
 
-/// THE VERB INHERITS NOTHING BUT ITS STDIO. A descriptor this process holds
-/// without close-on-exec — the stand-in for the Metal shader-cache files the
-/// GUI holds (measured 2026-09-27) — must not reach the vendor's verb, so it
-/// cannot reach the daemon the verb starts, which outlives the GUI (the
-/// product fd-hygiene sweep of 2026-09-27). The verb reports what it finds
-/// open before it answers: its stdout is the detector's positive control,
-/// and the answer being read proves the verb ran.
+/// The verb inherits nothing but its stdio: a descriptor this process holds
+/// without close-on-exec (a stand-in for the GUI's shader-cache files) must
+/// not reach the vendor's verb, so it cannot reach the daemon the verb
+/// starts, which outlives the GUI. The verb reports what it finds open before
+/// it answers: its stdout is the detector's positive control, and the answer
+/// being read proves the verb ran.
 #[test]
 fn the_daemon_update_verb_inherits_nothing_but_its_stdio() {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = scratch("verb-fds");
     let null = std::fs::File::open("/dev/null").expect("open /dev/null");
     // `F_DUPFD` clears close-on-exec on the copy; the floor keeps the number
@@ -1247,24 +1362,23 @@ fn the_daemon_update_verb_inherits_nothing_but_its_stdio() {
     );
     let exe = dir.join("codex");
     let report = dir.join("fds");
-    std::fs::write(
+    // A link of the one stand-in, its first exec no assessment of a new file
+    // (the body is read by the shell, and closed, before it runs).
+    super::super::tests::sh_script(
         &exe,
-        format!(
-            "#!/bin/sh\n\
-             r=''\n\
+        &format!(
+            "r=''\n\
              [ -e /dev/fd/1 ] && r='stdout '\n\
              [ -e /dev/fd/{raw} ] && r=\"${{r}}held \"\n\
              printf '%send' \"$r\" > '{report}'\n\
              echo '{{\"status\":\"updated\",\"installedVersion\":\"0.157.1\",\
-             \"runningVersion\":\"0.157.1\"}}'\n",
+             \"runningVersion\":\"0.157.1\"}}'",
             report = report.display(),
         ),
-    )
-    .expect("verb");
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
-    // A long ceiling: the verb exits at once, and a first exec of a fresh
-    // script can wait on the system's code assessment under load.
+    // A long ceiling: the verb exits at once, and a first exec can wait on
+    // the system's code assessment under load (the stand-in's, once a process).
     let answer = update_daemon(&exe, &[], Duration::from_secs(120));
     drop(held);
     assert_eq!(
@@ -1374,10 +1488,10 @@ impl CodexKernel for DaemonScript {
     }
 }
 
-/// A home whose daemon runs 0.157.0, unpinned, holding one thread — a
-/// conversation's root, its rollout opening on its `session_meta` — whose
+/// A home whose daemon runs 0.157.0, unpinned, holding one thread (a
+/// conversation's root, its rollout opening on its `session_meta`) whose
 /// rollout ends on `last`, written `age_s` ago.
-fn daemon_home(name: &str, last: &str, age_s: u64) -> (PathBuf, Opts, DaemonScript, Target) {
+fn daemon_home(name: &str, last: &str, age_s: u64) -> (ScratchDir, Opts, DaemonScript, Target) {
     let dir = scratch(name);
     let user = dir.join("user");
     let home = user.join(".codex");
@@ -1424,6 +1538,9 @@ fn daemon_home(name: &str, last: &str, age_s: u64) -> (PathBuf, Opts, DaemonScri
         hand_back: false,
         background: false,
         aterm_state: None,
+        // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
+        ask: true,
+        several_logins: false,
     };
     let script = DaemonScript {
         home: home.clone(),
@@ -1471,7 +1588,7 @@ fn the_daemon_is_moved_and_pinned_by_the_vendors_verb_with_its_own_environment()
             .join("packages/app-server-daemon/auto-update-version")
             .exists()
     );
-    // The verb ran with the RUNNING DAEMON's environment and nothing else —
+    // The verb ran with the running daemon's environment and nothing else,
     // never this process's (the window's, in production).
     let env = std::fs::read_to_string(dir.join("verb.env")).expect("env");
     assert!(env.contains("DAEMON_ENV=the-daemons-own"), "{env}");
@@ -1496,7 +1613,7 @@ fn the_daemon_is_moved_and_pinned_by_the_vendors_verb_with_its_own_environment()
 
 #[test]
 fn a_busy_or_settling_thread_holds_the_daemon_where_it_is() {
-    // NEGATIVE CONTROL: a thread whose turn runs — attached to no tab at all
+    // Negative control: a thread whose turn runs, attached to no tab at all
     // (no TUI here), so only the daemon's own lock reveals it.
     let (dir, opts, k, target) = daemon_home("daemon-busy", BUSY_LAST, 600);
     let home = k.home.clone();
@@ -1522,25 +1639,6 @@ fn a_busy_or_settling_thread_holds_the_daemon_where_it_is() {
     assert!(!dir2.join("verb.args").exists());
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
-}
-
-#[test]
-fn the_codex_lane_holds_no_signal_primitive() {
-    // Codex's TUI installs no signal handler: SIGTERM, SIGINT and SIGHUP end
-    // it with the tab left in the alternate screen, kitty keyboard, mouse
-    // reporting and bracketed paste (the research's pty run). The lane exits
-    // it by a typed `/exit` alone — pinned here, by the source.
-    for (name, text) in [
-        (
-            "upgrade_codex_drive.rs",
-            include_str!("upgrade_codex_drive.rs"),
-        ),
-        ("upgrade_codex.rs", include_str!("upgrade_codex.rs")),
-    ] {
-        for banned in ["libc::kill", "signal term", "SIGTERM)", "terminate("] {
-            assert!(!text.contains(banned), "{name} holds `{banned}`");
-        }
-    }
 }
 
 /// A kernel that answers only what [`tuis`] asks: each pid's argv and
@@ -1626,6 +1724,9 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
         hand_back: false,
         background: false,
         aterm_state: None,
+        // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
+        ask: true,
+        several_logins: false,
     };
     let tabs = [LiveTab {
         sid: TAB.to_string(),
@@ -1707,11 +1808,10 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
 
 #[test]
 fn a_codex_of_another_home_is_never_this_sweeps() {
-    // NEGATIVE CONTROL for a real hazard: a sweep discovers Codex by the
-    // machine's process table, so a TEST's sweep (a scratch home) found a real
-    // throwaway Codex on this machine, and its daemon, until the sweep was
-    // scoped to its own home. Only a TUI started with this sweep's `$HOME` is
-    // the owner's; another is said (a tab's) or passed by (a hand-run sweep's).
+    // Negative control: a sweep discovers Codex by the machine's process
+    // table, so it is scoped to its own home: only a TUI started with this
+    // sweep's `$HOME` is the owner's; another is said (a tab's) or passed by
+    // (a hand-run sweep's).
     let dir = scratch("homes");
     let root = dir.join("store/codex/b");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
@@ -1729,6 +1829,9 @@ fn a_codex_of_another_home_is_never_this_sweeps() {
         hand_back: false,
         background: false,
         aterm_state: None,
+        // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
+        ask: true,
+        several_logins: false,
     };
     let k = Found2 {
         exe: root.join("bin/codex"),
@@ -1760,9 +1863,8 @@ fn a_codex_of_another_home_is_never_this_sweeps() {
     assert_eq!(tuis.iter().map(|t| t.pid).collect::<Vec<_>>(), vec![1]);
     assert_eq!(tuis[0].version, v("0.157.0"));
     assert_eq!(tuis[0].home, canonical(&mine.join(".codex")));
-    // THE SAME RULE HOLDS THE OWNER'S VIEW: a hand-run `--status` never
-    // counts another home's Codex as a holder (the lab's throwaway TUI ran
-    // on this machine while this suite did).
+    // The same rule holds the owner's view: a hand-run `--status` never
+    // counts another home's Codex as a holder.
     let sessions: BTreeSet<String> = ["s-b".to_string()].into_iter().map(|t| key(&t)).collect();
     assert!(holders(&mine, &sessions, None).is_empty());
     assert_eq!(
@@ -1821,8 +1923,8 @@ fn a_relaunch_that_waited_keeps_the_thread_its_first_attempt_read() {
         "{}",
         typed[0]
     );
-    // NEGATIVE CONTROL: a DIFFERENT exit at that prompt since (another Codex
-    // run and quit there) names another thread — nothing is typed on it.
+    // Negative control: a different exit at that prompt since (another Codex
+    // run and quit there) names another thread; nothing is typed on it.
     let other = Rig::new("retry-other", T2, false, |_| {});
     other.kernel.exited.store(true, Ordering::SeqCst);
     let mut st = exiting(&other, T1);
@@ -1838,20 +1940,19 @@ fn a_relaunch_that_waited_keeps_the_thread_its_first_attempt_read() {
     assert!(other.typed().is_empty());
 }
 
-// ---------------------------------------------------------------- review of 2026-09-26
+// ---------------------------------------------------------------- daemon-mode tabs
 //
-// Each test below was first a reproduction of a review finding against the
-// shipped lane (the throwaway lab's live runs, and the review's own unit
-// repros); each now pins the fix, with a negative control beside it.
+// Each test below pins a behaviour of the daemon-mode lane, with a negative
+// control beside it.
 
-/// The daemon home of [`daemon_home`], serving one daemon-mode TUI — the
-/// stand-in tab of a [`Rig`], attached to the daemon — and `world` for that
+/// The daemon home of [`daemon_home`], serving one daemon-mode TUI (the
+/// stand-in tab of a [`Rig`], attached to the daemon) and `world` for that
 /// tab. The Rig goes with the returned tuple (its socket is the tab's).
 fn served(
     name: &str,
     last: &str,
     world: impl FnOnce(&mut World),
-) -> (Rig, PathBuf, Opts, DaemonScript, Target, Tui) {
+) -> (Rig, ScratchDir, Opts, DaemonScript, Target, Tui) {
     let (dir, mut opts, mut k, target) = daemon_home(name, last, 600);
     let rig = Rig::new(&format!("{name}-tab"), T1, false, world);
     opts.sock = rig.opts.sock.clone();
@@ -1897,19 +1998,19 @@ fn attended(w: &mut World) {
 }
 
 /// A person typed into the tab a second ago: within KEYS_GAP_S, which no rung
-/// and no word waives (the owner's decision of 2026-09-28).
+/// and no word waives.
 fn typing(w: &mut World) {
     w.before = codex_idle(10).replace(r#""human_ms":null"#, r#""human_ms":1000"#);
 }
 
 #[test]
 fn the_owners_skip_or_defer_on_a_codex_tab_holds_its_daemon_too() {
-    // The review, live: `--skip` on the tab, and 28 s later the daemon was
-    // restarted onto exactly the skipped build under it.
+    // A `--skip` or deferral on the tab holds its daemon too: never restarted
+    // onto the skipped build under it.
     for (request, held) in [
         (Request::Skip("0.157.1".into()), true),
         (Request::DeferUntil(now_s() + 3_600), true),
-        // A skip of ANOTHER build, and a deferral that ran out, hold nothing.
+        // A skip of another build, and a deferral that ran out, hold nothing.
         (Request::Skip("0.157.2".into()), false),
         (Request::DeferUntil(now_s() - 1), false),
     ] {
@@ -1943,9 +2044,9 @@ fn the_owners_skip_or_defer_on_a_codex_tab_holds_its_daemon_too() {
 
 #[test]
 fn a_codex_attached_to_the_daemon_that_the_sweep_does_not_list_holds_it() {
-    // The review's repro: the window's roster holds no Codex tab, and a Codex
-    // in another window (or a pane, or one whose build could not be read) is
-    // attached to the shared daemon. Nothing of its tab was asked.
+    // The window's roster holds no Codex tab, and a Codex in another window
+    // (or a pane, or one whose build could not be read) is attached to the
+    // shared daemon. Nothing of its tab was asked.
     let roster = [LiveTab {
         sid: "s-0ther0ther0ther0ther".into(),
         fgpgid: Some(77),
@@ -1972,13 +2073,13 @@ fn a_codex_attached_to_the_daemon_that_the_sweep_does_not_list_holds_it() {
     assert_eq!(run(Some(vec![TUI])), (daemon("wait:unseen-client"), false));
     // Unreadable is never "none attached".
     assert_eq!(run(None), (daemon("wait:clients-unreadable"), false));
-    // NEGATIVE CONTROL: a daemon nobody is attached to moves.
+    // Negative control: a daemon nobody is attached to moves.
     assert_eq!(run(Some(Vec::new())), (daemon("daemon-updated"), true));
 }
 
 #[test]
 fn the_owners_now_on_a_daemon_mode_tab_waives_its_own_attended_guard_at_the_daemon() {
-    // CONTROL: a person at the tab and no word — the daemon waits, and the
+    // Control: a person at the tab and no word — the daemon waits, and the
     // tab's client says what for.
     let (rig, dir, opts, k, target, tui) = served("att", IDLE_LAST, attended);
     owner_word(&opts, Request::None);
@@ -1996,10 +2097,9 @@ fn the_owners_now_on_a_daemon_mode_tab_waives_its_own_attended_guard_at_the_daem
     assert!(rig.typed().is_empty());
     drop(rig);
     let _ = std::fs::remove_dir_all(&dir);
-    // The owner's `--now` on that tab: the ladder's last rung, where a
-    // person holds it only by a keystroke within KEYS_GAP_S (the owner's
-    // decision of 2026-09-28). The daemon moves, and the client after it, in
-    // one sweep (the review: nothing moved).
+    // The owner's `--now` on that tab: the ladder's last rung, where a person
+    // holds it only by a keystroke within KEYS_GAP_S. The daemon moves, and
+    // the client after it, in one sweep.
     let (rig, dir, opts, k, target, tui) = served("now", IDLE_LAST, attended);
     owner_word(&opts, Request::Now);
     let (r, view) = daemon_pass(
@@ -2021,9 +2121,8 @@ fn the_owners_now_on_a_daemon_mode_tab_waives_its_own_attended_guard_at_the_daem
     assert_eq!(c.step, "done", "{:#?}", rig.asked());
     drop(rig);
     let _ = std::fs::remove_dir_all(&dir);
-    // NEGATIVE CONTROL: a keystroke a second ago holds even the owner's
-    // `--now` — at the daemon and at the client (until 2026-09-28 the word
-    // waived the person outright, and the daemon restarted under their hand).
+    // Negative control: a keystroke a second ago holds even the owner's
+    // `--now`, at the daemon and at the client.
     let (rig, dir, opts, k, target, tui) = served("now-typing", IDLE_LAST, typing);
     owner_word(&opts, Request::Now);
     let (r, _) = daemon_pass(
@@ -2044,8 +2143,8 @@ fn the_owners_now_on_a_daemon_mode_tab_waives_its_own_attended_guard_at_the_daem
 #[test]
 fn what_the_daemon_waits_on_reaches_its_clients_row_and_words() {
     // A detached thread's turn runs in the daemon (the rollout ends on
-    // `task_started`): the daemon waits `busy-thread`, and the tab's row now
-    // says so — it read a bare `daemon-first` for 7 h in the review.
+    // `task_started`): the daemon waits `busy-thread`, and the tab's row says
+    // so.
     let (rig, dir, opts, k, target, tui) = served("rows", BUSY_LAST, |_| {});
     owner_word(&opts, Request::None);
     let (r, view) = daemon_pass(
@@ -2075,8 +2174,8 @@ fn what_the_daemon_waits_on_reaches_its_clients_row_and_words() {
 
 #[test]
 fn a_background_terminal_under_the_daemon_holds_it_where_it_is() {
-    // The review, live: `1 background terminal running`, its thread idle
-    // (`task_complete`), and the update restarted the daemon and ended it.
+    // `1 background terminal running`, its thread idle (`task_complete`): an
+    // update would restart the daemon and end it.
     let (dir, opts, mut k, target) = daemon_home("term", IDLE_LAST, 600);
     k.terminals = vec!["sleep".into()];
     let home = k.home.clone();
@@ -2084,7 +2183,7 @@ fn a_background_terminal_under_the_daemon_holds_it_where_it_is() {
     assert_eq!(r.step, "wait:background-terminal");
     assert_eq!(view.wait, "background-terminal");
     assert!(!dir.join("verb.args").exists(), "the verb never ran");
-    // NEGATIVE CONTROL: once it ends, the daemon moves.
+    // Negative control: once it ends, the daemon moves.
     k.terminals.clear();
     let (r, _) = daemon_pass(&opts, &home, &target, &[], &k).expect("a daemon");
     assert_eq!(r.step, "daemon-updated");
@@ -2095,7 +2194,7 @@ fn a_background_terminal_under_the_daemon_holds_it_where_it_is() {
 fn a_served_tabs_status_line_backs_the_kernels_count_at_the_daemon() {
     // The kernel reads no session leader (the count is the proof, this the
     // backstop): the tab's own status line says a background terminal of its
-    // thread runs — in this daemon.
+    // thread runs in this daemon.
     let footer = |w: &mut World| {
         w.before = screen_json(
             &[
@@ -2147,9 +2246,9 @@ fn embedded_ready(name: &str, world: impl FnOnce(&mut World)) -> Rig {
 
 #[test]
 fn a_background_terminal_under_an_embedded_session_holds_its_exit_ready_or_not() {
-    // The review, live: `--no-daemon`, `sleep 7772` directly under the TUI
-    // (no shell between, so `background` never saw it); READY answered, and
-    // the `/exit` ended it.
+    // `--no-daemon`, `sleep 7772` directly under the TUI (no shell between, so
+    // `background` never sees it); READY answered, and the `/exit` would end
+    // it.
     let mut rig = embedded_ready("emb-term", |_| {});
     rig.kernel.terminals = vec!["sleep".into()];
     assert_eq!(rig.visit(None).step, "wait:background-terminal");
@@ -2172,18 +2271,16 @@ fn a_background_terminal_under_an_embedded_session_holds_its_exit_ready_or_not()
     });
     assert_eq!(footer.visit(None).step, "wait:background-terminal");
     assert_eq!(footer.typed().len(), 1);
-    // NEGATIVE CONTROL: nothing runs under it — it moves, and is carried on.
+    // Negative control: nothing runs under it; it moves, and is carried on.
     rig.kernel.terminals.clear();
     rig.settle_keeping(&rig.state());
     assert_eq!(rig.visit(None).step, "continued");
 }
 
-/// A TERMINAL THAT NEVER ENDS DOES NOT HOLD THE UPGRADE FOR GOOD (the Codex
-/// arm of the 2026-09-26 four-day tab): a READY answer outlived by a
-/// background terminal for a whole re-ask window is asked about again, and
-/// past the last ask the upgrade gives up — the Claude lane's one rule.
-/// Before, the embedded drive swapped the reducer's Terminate for a bare
-/// `wait:background-terminal` it never re-asked.
+/// A terminal that never ends does not hold the upgrade for good: a READY
+/// answer outlived by a background terminal for a whole re-ask window is
+/// asked about again, and past the last ask the upgrade gives up, the Claude
+/// lane's rule.
 #[test]
 fn a_background_terminal_that_outlives_the_answer_is_asked_again_then_given_up() {
     let mut rig = embedded_ready("emb-reask", |_| {});
@@ -2223,15 +2320,14 @@ fn a_background_terminal_that_outlives_the_answer_is_asked_again_then_given_up()
     );
 }
 
-/// NO STOP IS FOR GOOD IN THE CODEX LANE EITHER (the owner, 2026-09-27: "you
-/// should NEVER have upgrades stalled"). An embedded conversation's round
-/// gives up over a background terminal that outlives its READY; it RESTS —
-/// `wait:failed:unanswered`, looked at again, nothing typed — and once it has
-/// rested `RETRY_S` a new round starts (`rearmed:unanswered`, on the ledger,
-/// nothing typed at that look), whose first notice the next look types, with
-/// a READY marker of its own. NEGATIVE CONTROL: the owner's `--skip` of the
-/// build holds the rested round where it is, however long it rests, and says
-/// `wait:skipped` — the host's last word, as in the Claude lane — and a
+/// No stop is for good in the Codex lane either: an embedded conversation's
+/// round gives up over a background terminal that outlives its READY; it
+/// rests (`wait:failed:unanswered`, looked at again, nothing typed), and once
+/// it has rested `RETRY_S` a new round starts (`rearmed:unanswered`, on the
+/// ledger, nothing typed at that look), whose first notice the next look
+/// types, with a READY marker of its own. Negative control: the owner's
+/// `--skip` of the build holds the rested round however long it rests and
+/// says `wait:skipped` (the host's last word, as in the Claude lane), and a
 /// `--defer` not run out holds it too, looked at again (`wait:deferred`).
 #[test]
 fn a_codex_round_that_gave_up_rests_then_a_new_one_asks_again() {
@@ -2299,11 +2395,10 @@ fn a_codex_round_that_gave_up_rests_then_a_new_one_asks_again() {
 
 #[test]
 fn a_two_row_prompt_after_a_wiped_block_list_still_reads_the_tuis_own_hint() {
-    // The review, live: an inline Codex (`--no-alt-screen`), a `%~` / `%#`
-    // prompt, and a daemon update whose reconnect wiped the tab's blocks
-    // (measured: `{"blocks":[]}`): after `/exit` only the entering prompt is
-    // marked — two rows (`prompt:98, cmd:99`) — and the hint above its first
-    // row was read as none: exited, never relaunched.
+    // An inline Codex (`--no-alt-screen`), a `%~` / `%#` prompt, and a daemon
+    // update whose reconnect wiped the tab's blocks (`{"blocks":[]}`): after
+    // `/exit` only the entering prompt is marked, two rows (`prompt:98,
+    // cmd:99`), and the hint above its first row must still be read.
     let entering = r#"{"blocks":[{"id":1,"state":"entering","exit":null,"prompt":98,"cmd":99,"cmdcol":2,"out":null,"end":null,"cwd":"/w","cmdline":""}]}"#;
     let rig = Rig::new("two-row", T1, false, |w| {
         w.after_exit = screen_json(
@@ -2366,10 +2461,121 @@ fn keys(rig: &Rig) -> Vec<String> {
         .collect()
 }
 
+/// A Codex notice naming a long command is guarded on its closing word: the
+/// clause naming what runs goes before the closing sentence
+/// (`upgrade::with_running`, as Claude's does), so the notice ends `…ask
+/// again later.` whatever runs, the agent's command quoted whole, and its
+/// guarded Enter (the text's last word on the cursor's row) never waits on a
+/// long path that wraps inside itself. Here Codex's exec shell stays alive
+/// for a pipeline whose last word is a long log path: a lone command runs
+/// with no shell between (the unified exec), and a `tail` or `sleep` is no
+/// process the notice names. Negative control, on the host's own engine over
+/// the wrap model (`last_wrapped_row`): the clause at the notice's end has
+/// its guard miss the cursor's row at 80 columns.
 #[test]
-fn a_missed_guard_on_exit_is_said_and_the_exit_cleared_from_the_composer() {
-    // The review's repro: the guarded Enter missed, `/exit` sat in the
-    // composer, and every later visit read it as the person's draft.
+fn a_codex_notice_naming_a_long_command_is_guarded_on_its_closing_word() {
+    // 157 characters: under `HELD_COMMAND_CHARS`, quoted whole; the path
+    // alone is longer than an 80-column row.
+    let path = "/w/target/trust-scope/debug/build/aterm-grid-4f3c2a1b9d8e7f60/out/trust-verify-report.jsonl.log";
+    let held = vec![upgrade::Held {
+        pid: 81_234,
+        name: "zsh".to_string(),
+        age_s: 8_000,
+        command: format!("/bin/zsh -lc targo --unverified test -p aterm-grid 2>&1 | tee {path}"),
+    }];
+    let clause = upgrade::running_clause(&held);
+    let mut rig = Rig::new("notice-held", T2, true, |_| {});
+    rig.kernel.held = held;
+    rig.settle(10);
+    assert_eq!(rig.visit(None).step, "announced:1");
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "{typed:#?}");
+    assert!(
+        typed[0].contains(" submit=guarded:^[›»\\s]\\s.*later\\.\\s*$ "),
+        "{}",
+        typed[0]
+    );
+    let text = typed[0]
+        .split_once(&format!(" {TURN_WAIT} "))
+        .map(|(_, t)| t)
+        .expect("the notice");
+    assert!(
+        text.ends_with(&format!("{} {}", clause.trim_end(), upgrade::NOTICE_CLOSE)),
+        "{text}"
+    );
+    assert!(text.contains(path), "the agent's command quoted whole");
+    // Negative control: the clause at the end.
+    let notice = cx::prepare_prompt(&v("0.157.0"), &v("0.157.1"), &rig.state().marker);
+    let old = format!("{notice}{clause}");
+    let wrapped = |t: &str| super::super::tests::last_wrapped_row(&format!("› {t}"), 80);
+    let guard = |t: &str| aterm_observe::row_matcher(&guard_for(t)).expect("the host compiles it");
+    assert!(!guard(&old).matches(&wrapped(&old)), "{}", wrapped(&old));
+    assert!(guard(text).matches(&wrapped(text)), "{}", wrapped(text));
+}
+
+/// THE CODEX NOTICE STAYS A PASTE CODEX DRAWS AS TEXT (measured 2026-09-30
+/// on Codex 0.159.2: 1000 characters are drawn as they are, 1001 as
+/// `[Pasted Content 1001 chars]`, a placeholder the guarded Enter and
+/// `left_standing` never find, left in the person's composer as their
+/// draft). Eight shells under Codex, each an hour older than the next and
+/// each running a long loop: the notice as typed is within
+/// [`cx::PASTE_SHOWN_MAX`], still ends in the closing sentence, and still
+/// names the oldest. NEGATIVE CONTROL: the same held set through the
+/// unbounded clause (`upgrade::running_clause`) is past it.
+#[test]
+fn a_codex_notice_naming_many_long_commands_stays_under_the_paste_placeholder() {
+    let held: Vec<upgrade::Held> = (0..8u32)
+        .map(|i| upgrade::Held {
+            pid: 81_300 + i,
+            name: "zsh".to_string(),
+            age_s: 3_600 * u64::from(i + 1),
+            command: format!(
+                "/bin/zsh -lc while true; do targo --unverified test -p aterm-grid-{i} \
+                 --lib -- --test-threads 1 2>&1 | tee -a build/logs/run-{i}.log; sleep 60; done"
+            ),
+        })
+        .collect();
+    let oldest = 81_307;
+    let mut rig = Rig::new("notice-bounded", T2, true, |_| {});
+    rig.kernel.held = held.clone();
+    rig.settle(10);
+    assert_eq!(rig.visit(None).step, "announced:1");
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "{typed:#?}");
+    let text = typed[0]
+        .split_once(&format!(" {TURN_WAIT} "))
+        .map(|(_, t)| t)
+        .expect("the notice");
+    assert!(
+        text.chars().count() <= cx::PASTE_SHOWN_MAX,
+        "{} chars: {text}",
+        text.chars().count()
+    );
+    assert!(text.ends_with(upgrade::NOTICE_CLOSE), "{text}");
+    assert!(text.contains(&format!("pid {oldest} (zsh, 8h")), "{text}");
+    // NEGATIVE CONTROL: the whole clause, unbounded.
+    let notice = cx::prepare_prompt(&v("0.157.0"), &v("0.157.1"), &rig.state().marker);
+    let unbounded = upgrade::with_running(&notice, &upgrade::running_clause(&held));
+    assert!(
+        unbounded.chars().count() > cx::PASTE_SHOWN_MAX,
+        "{} chars",
+        unbounded.chars().count()
+    );
+}
+
+/// A MISSED GUARD ON `/exit` IS SAID AND LEFT STANDING (the review of
+/// 2026-09-26; the safety ruling of 2026-09-30): the guarded Enter missed
+/// and `/exit` sits in the composer. Said once (`left-typed:exit`) and
+/// recorded, so no look reads it as the person's draft — and NEVER TAKEN
+/// BACK: until 2026-09-30 a fenced `ctrl+u` cleared it, and neither of its
+/// screen fences saw a person's key the host had counted and Codex had not
+/// drawn, which went with it. No key is pressed; every later look waits on
+/// it, a person's hold (`wait:left-typed:unsent`) — the watch's dry run
+/// reads it alike, saving and ledgering nothing. NEGATIVE CONTROL: the
+/// person clears it — the record goes, and the act waits out its back-off,
+/// typed once.
+#[test]
+fn a_missed_guard_on_exit_is_said_and_left_standing() {
     let rig = Rig::new("gm-exit", T1, false, |w| {
         w.miss = Some("OK 0 turn skipped reason=guard submitted=0 seq=11 id=1");
     });
@@ -2378,37 +2584,39 @@ fn a_missed_guard_on_exit_is_said_and_the_exit_cleared_from_the_composer() {
     assert_eq!(r.step, "left-typed:exit");
     let st = rig.state();
     assert_eq!(st.phase, Phase::Pending, "nothing is in flight");
-    assert_eq!(st.left_typed, "", "cleared, so no record is owed");
-    assert!(
-        rig.left.lock().expect("left").is_none(),
-        "the composer is empty again"
-    );
+    assert_eq!(st.left_typed, CODEX_EXIT, "recorded: never read as a draft");
     assert_eq!(
-        rig.ledger_steps(),
-        vec!["left-typed:exit", "left-typed-cleared"]
+        rig.left.lock().expect("left").as_deref(),
+        Some(CODEX_EXIT),
+        "left standing"
     );
-    // One `ctrl+u`, fenced on the read that judged it and guarded on the
-    // composer's row reading exactly `/exit`.
-    let k = keys(&rig);
-    assert_eq!(k.len(), 1, "{k:#?}");
-    assert!(
-        k[0].contains("if-gen=1.30 ")
-            && k[0].contains("if=^›\\x20/exit\\s*$ ")
-            && k[0].ends_with(" ctrl+u"),
-        "{}",
-        k[0]
-    );
-    // The next visit neither reads a draft nor types the act again at once.
+    assert_eq!(rig.ledger_steps(), vec!["left-typed:exit"]);
+    assert!(keys(&rig).is_empty(), "nothing pressed: {:#?}", keys(&rig));
+    // The watch's dry run reads what a look reads, and keeps nothing.
+    let before = rig.state();
+    let dry = Opts {
+        dry_run: true,
+        ..rig.opts.clone()
+    };
+    let r = visit(&dry, &rig.tui, &rig.target, daemon_current(), &rig.kernel);
+    assert_eq!(r.step, "wait:left-typed:unsent");
+    assert_eq!(rig.state(), before, "the record as it was");
+    // A look: a person's hold, pressing nothing.
+    assert_eq!(rig.visit(daemon_current()).step, "wait:left-typed:unsent");
+    assert!(keys(&rig).is_empty(), "nothing pressed: {:#?}", keys(&rig));
+    assert_eq!(rig.ledger_steps(), vec!["left-typed:exit"]);
+    // Negative control: the person clears it.
+    *rig.left.lock().expect("left") = None;
     assert_eq!(rig.visit(daemon_current()).step, "wait:left-typed-backoff");
+    assert_eq!(rig.state().left_typed, "", "the record goes with the text");
     assert_eq!(rig.typed().len(), 1);
 }
 
 #[test]
-fn an_enter_that_did_not_submit_the_notice_is_said_and_cleared_too() {
-    // The embedded notice: the review found the miss said NOWHERE (no ledger
-    // row) and ~600 characters left as the person's "draft". Here the Enter
-    // was written and not seen (`submitted=0 pressed=1`), the notice still in
-    // the composer.
+fn an_enter_that_did_not_submit_the_notice_is_said_and_left_standing() {
+    // The embedded notice: the Enter was written and not seen (`submitted=0
+    // pressed=1`), the notice still in the composer: said, recorded, and
+    // never taken back.
     let rig = Rig::new("gm-notice", T2, true, |w| {
         w.miss = Some("OK 0 turn submitted=0 pressed=1 status=timeout seq=11 id=1");
     });
@@ -2416,12 +2624,18 @@ fn an_enter_that_did_not_submit_the_notice_is_said_and_cleared_too() {
     let r = rig.visit(None);
     assert_eq!(r.step, "left-typed:notice");
     assert_eq!(rig.state().phase, Phase::Pending, "never announced");
-    assert!(rig.left.lock().expect("left").is_none());
-    assert_eq!(
-        rig.ledger_steps(),
-        vec!["left-typed:notice", "left-typed-cleared"]
-    );
-    // NEGATIVE CONTROL: a person's text in the composer is never cleared.
+    let left = rig
+        .left
+        .lock()
+        .expect("left")
+        .clone()
+        .expect("left standing");
+    assert!(left.starts_with(cx::ANNOUNCE_HEAD), "{left}");
+    assert_eq!(rig.state().left_typed, left);
+    assert!(keys(&rig).is_empty(), "nothing pressed: {:#?}", keys(&rig));
+    assert_eq!(rig.ledger_steps(), vec!["left-typed:notice"]);
+    // Negative control: a person's text in the composer is theirs; the lane's
+    // record goes, and the look waits on their draft.
     let mine = Rig::new("gm-mine", T2, true, |_| {});
     mine.settle(10);
     if let Ok(mut l) = mine.left.lock() {
@@ -2447,45 +2661,67 @@ fn an_enter_that_did_not_submit_the_notice_is_said_and_cleared_too() {
     );
 }
 
-/// A DRY RUN PRESSES NOTHING, not even the clear of the lane's own left-typed
-/// text (design record 2026-09-28, "No upgrade stuck forever", §3.2 C4): the
-/// watch reads every record off any point through a dry-run visit, and this
-/// `ctrl+u` was the one key a dry run could still press — found by the watch's
-/// audit of every act behind `opts.dry_run`. The dry run says what it would do
-/// and leaves the composer, the record and the ledger as they were. NEGATIVE
-/// CONTROL: the same visit, not dry, clears it with the one fenced key.
+/// A CODEX STALE EXIT NAMES WHAT HELD ITS LINE, as Claude Code's does
+/// (`a_stale_exit_names_the_wait_that_held_its_line`): the relaunch line's
+/// wait in a person's words; none of the lane's other waits, and no wait,
+/// give the bare line. An end no look saw is only the `/exit` typed.
 #[test]
-fn a_dry_run_never_clears_the_lanes_left_typed_text() {
-    let rig = Rig::new("dry-left", T1, false, |_| {});
-    rig.settle(10);
-    if let Ok(mut l) = rig.left.lock() {
-        *l = Some("/exit".to_string());
-    }
-    let mut st = rig.state();
-    st.left_typed = "/exit".to_string();
-    save(&rig.opts, &key(TAB), &st);
-    let before = rig.state();
-    let dry = Opts {
-        dry_run: true,
-        ..rig.opts.clone()
+fn a_codex_stale_exit_names_the_wait_that_held_its_line() {
+    let rig = Rig::new("stale-words", T1, false, |_| {});
+    let now = now_s();
+    let st = St {
+        phase: Phase::Exiting { at_s: now - 400 },
+        exited_at: now - 390,
+        wait: "typing".into(),
+        ..exiting(&rig, T1)
     };
-    let r = visit(&dry, &rig.tui, &rig.target, daemon_current(), &rig.kernel);
-    assert_eq!(r.step, "would-clear:left-typed");
-    assert!(keys(&rig).is_empty(), "nothing pressed: {:#?}", keys(&rig));
-    assert_eq!(rig.left.lock().expect("left").as_deref(), Some("/exit"));
-    assert_eq!(rig.state(), before, "the record as it was");
-    assert!(rig.ledger_steps().is_empty(), "nothing ledgered");
-    // NEGATIVE CONTROL: not a dry run, the text is cleared.
-    let r = rig.visit(daemon_current());
-    assert_eq!(r.step, "left-typed-cleared");
-    assert_eq!(keys(&rig).len(), 1);
-    assert!(rig.left.lock().expect("left").is_none());
+    let line = |st: &St| expired(st, now, &rig.kernel);
+    assert_eq!(
+        line(&st),
+        Some((
+            "stale-exit",
+            "Codex ended over 5 minutes ago and was not relaunched: the prompt it returned to \
+             does not read as empty"
+                .to_string()
+        ))
+    );
+    for wait in ["", "daemon-turn"] {
+        let other = St {
+            wait: wait.into(),
+            ..st.clone()
+        };
+        assert_eq!(
+            line(&other).map(|(_, d)| d).as_deref(),
+            Some("Codex ended over 5 minutes ago and was not relaunched"),
+            "{wait:?}"
+        );
+    }
+    let unseen = St {
+        exited_at: 0,
+        wait: String::new(),
+        ..st.clone()
+    };
+    assert_eq!(
+        line(&unseen).map(|(_, d)| d).as_deref(),
+        Some("Codex was asked to end over 5 minutes ago and was not relaunched")
+    );
+    // The orphan pass stamps a first sighting now: the `/exit` is what is
+    // over the bound, never the end.
+    let just_seen = St {
+        exited_at: now,
+        wait: String::new(),
+        ..st
+    };
+    assert_eq!(
+        line(&just_seen).map(|(_, d)| d).as_deref(),
+        Some("Codex was asked to end over 5 minutes ago and was not relaunched")
+    );
 }
 
 #[test]
 fn an_exit_the_tui_outlived_is_never_waited_on_again() {
-    // The review's repro: an hour-old `/exit` the TUI outlived was waited on
-    // for 30 s under the sweep lock, every sweep, and never expired.
+    // An old `/exit` the TUI outlived is not waited on under the sweep lock at
+    // every sweep: it expires.
     let rig = Rig::new("outlived", T1, false, |_| {});
     let mut st = exiting(&rig, "");
     st.phase = Phase::Exiting {
@@ -2495,13 +2731,13 @@ fn an_exit_the_tui_outlived_is_never_waited_on_again() {
     let t0 = std::time::Instant::now();
     let r = rig.visit(daemon_current());
     assert_eq!(r.step, "failed:stale-exit");
-    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    assert!(t0.elapsed() < EXIT_WAIT, "{:?}", t0.elapsed());
     assert_eq!(rig.state().phase, Phase::Failed("stale-exit".into()));
     // Two minutes old: not waited on either, and a `/exit` left in its
-    // composer is cleared while it alone is there.
+    // composer stands, recorded — never taken back, nothing ledgered.
     let fresh = Rig::new("outlived-2m", T1, false, |_| {});
     if let Ok(mut l) = fresh.left.lock() {
-        *l = Some("/exit".to_string());
+        *l = Some(CODEX_EXIT.to_string());
     }
     let mut st = exiting(&fresh, "");
     st.phase = Phase::Exiting {
@@ -2510,16 +2746,32 @@ fn an_exit_the_tui_outlived_is_never_waited_on_again() {
     save(&fresh.opts, &key(TAB), &st);
     let t0 = std::time::Instant::now();
     assert_eq!(fresh.visit(daemon_current()).step, "wait:exit-not-taken");
-    assert!(t0.elapsed() < Duration::from_secs(10));
-    assert!(fresh.left.lock().expect("left").is_none());
-    assert!(matches!(fresh.state().phase, Phase::Exiting { .. }));
-    assert_eq!(fresh.ledger_steps(), vec!["left-typed-cleared"]);
+    assert!(t0.elapsed() < EXIT_WAIT);
+    assert_eq!(
+        fresh.left.lock().expect("left").as_deref(),
+        Some(CODEX_EXIT)
+    );
+    let st = fresh.state();
+    assert!(matches!(st.phase, Phase::Exiting { .. }));
+    assert_eq!(st.left_typed, CODEX_EXIT);
+    assert!(
+        fresh.ledger_steps().is_empty(),
+        "{:?}",
+        fresh.ledger_steps()
+    );
+    assert!(
+        keys(&fresh).is_empty(),
+        "nothing pressed: {:#?}",
+        keys(&fresh)
+    );
 }
 
-/// A kernel whose shell never takes its terminal back: a relaunch waits.
-struct NoPrompt<'a>(&'a Script);
+/// The scripted kernel, reading the tab's record the moment the relaunch
+/// first asks whether the shell has its terminal back: the TUI seen gone,
+/// its exit not read yet.
+struct InFlight<'a>(&'a Script, &'a Opts, Mutex<Option<St>>);
 
-impl Kernel for NoPrompt<'_> {
+impl Kernel for InFlight<'_> {
     fn job(&self, p: u32) -> Option<(Job, u32)> {
         self.0.job(p)
     }
@@ -2531,7 +2783,7 @@ impl Kernel for NoPrompt<'_> {
     }
 }
 
-impl CodexKernel for NoPrompt<'_> {
+impl CodexKernel for InFlight<'_> {
     fn alive(&self, p: u32) -> bool {
         self.0.alive(p)
     }
@@ -2547,8 +2799,13 @@ impl CodexKernel for NoPrompt<'_> {
     fn holders_of(&self, f: &Path) -> Option<Vec<u32>> {
         self.0.holders_of(f)
     }
-    fn shell_has_terminal(&self, _: u32) -> bool {
-        false
+    fn shell_has_terminal(&self, s: u32) -> bool {
+        if let Ok(mut seen) = self.2.lock()
+            && seen.is_none()
+        {
+            *seen = load(self.1, &key(TAB));
+        }
+        self.0.shell_has_terminal(s)
     }
     fn codex_children(&self, s: u32) -> Vec<(u32, Vec<String>)> {
         self.0.codex_children(s)
@@ -2571,27 +2828,6 @@ impl CodexKernel for NoPrompt<'_> {
 }
 
 #[test]
-fn a_daemon_clients_exit_in_flight_records_no_line_before_its_thread_is_read() {
-    // The review's repro: the state in flight carried a line planned with
-    // the placeholder thread, which an older build's orphan pass types
-    // verbatim — a resume of `00000000-…`.
-    let rig = Rig::new("no-line", T1, false, |_| {});
-    rig.settle(10);
-    let r = visit(
-        &rig.opts,
-        &rig.tui,
-        &rig.target,
-        daemon_current(),
-        &NoPrompt(&rig.kernel),
-    );
-    assert_eq!(r.step, "wait:shell-prompt");
-    let st = rig.state();
-    assert!(matches!(st.phase, Phase::Exiting { .. }));
-    assert_eq!(st.line, "", "no line until the exit names the thread");
-    assert!(st.exited_at != 0, "the TUI was seen gone");
-}
-
-#[test]
 fn a_current_codex_in_the_tab_ends_a_move_that_failed_after_its_exit() {
     let rig = Rig::new("resumed-by-hand", T1, false, |_| {});
     let mut st = exiting(&rig, T1);
@@ -2606,8 +2842,8 @@ fn a_current_codex_in_the_tab_ends_a_move_that_failed_after_its_exit() {
     let r = visit(&rig.opts, &tui, &rig.target, daemon_current(), &rig.kernel);
     assert_eq!(r.step, "current");
     assert!(load(&rig.opts, &key(TAB)).is_none(), "the record is over");
-    // NEGATIVE CONTROL: a failure before any exit (the TUI never went) is
-    // left alone here — the owner's view vets it against its holder.
+    // Negative control: a failure before any exit (the TUI never went) is
+    // left alone here; the owner's view vets it against its holder.
     st.exited_at = 0;
     save(&rig.opts, &key(TAB), &st);
     assert_eq!(
@@ -2632,7 +2868,7 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
     assert_eq!(r.step, "adopted", "{r:?}\n{:#?}", rig.asked());
     assert_eq!(r.pid, NEW);
     // The adopted TUI is on the record: its own exit is never read as the
-    // restart's (`relaunch::restarted`, the review of 2026-09-27).
+    // restart's (`relaunch::restarted`).
     assert_eq!(rig.state().resumed_pid, NEW);
     assert_eq!(
         rig.typed().len(),
@@ -2647,7 +2883,7 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
         "{:?}",
         rig.state().phase
     );
-    // A PERSON AT THE KEYS where the loop parks next: it stays owed, and
+    // A person at the keys where the loop parks next: it stays owed, and
     // nothing is typed over them.
     *rig.status_extra.lock().expect("status") = " human_ms=500".to_string();
     let carry = Opts {
@@ -2684,16 +2920,12 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
     assert!(!rig.asked().iter().any(|l| l.contains("signal")));
 }
 
-/// A RELAUNCHED CODEX THE RESTART FOUND IS YOURS ONCE IT IS GONE, ADOPTED OR
-/// NOT (the review of 2026-09-27). Only an adoption stamped the TUI on the
-/// record ([`St::resumed_pid`]), and two paths leave it up in the tab
-/// unstamped: an adopt whose [`ADOPT_WAIT`] ran out (`wait:resume`), and a
-/// carry-on that found a person at the keys (`wait:held`). A person's `/exit`
-/// of that TUI was then read as the restart's: every carry held the
-/// harness's hand on the tab for a TUI that was gone, until the record
-/// expired and the tab was badged as an agent the harness had ended. The
-/// TUI the relaunch brought up is on the record from the look that finds it,
-/// and once it is gone a Codex leaving the tab is that TUI — its own exit.
+/// A relaunched Codex the restart found is yours once it is gone, adopted or
+/// not: two paths leave it up in the tab without an adoption stamp (an adopt
+/// whose [`ADOPT_WAIT`] ran out, `wait:resume`, and a carry-on that found a
+/// person at the keys, `wait:held`). The TUI the relaunch brought up is on
+/// the record ([`St::resumed_pid`]) from the look that finds it, and once it
+/// is gone a Codex leaving the tab is that TUI's own exit, not the restart's.
 /// (`NEW` is the rig's: no process of the real kernel's, so gone to
 /// `relaunch::restarted`, which reads the real one.)
 #[test]
@@ -2710,7 +2942,9 @@ fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
         only_sid: Some(TAB.to_string()),
         ..rig.opts.clone()
     };
-    let restarted = || super::super::super::relaunch::restarted(&tab, true, None);
+    // Asked about the TUI that left: the one its `/exit` was typed into.
+    assert_eq!(rig.state().pid, TUI);
+    let restarted = || super::super::super::relaunch::restarted(&tab, true, Some(TUI));
     // The record an adopt whose ADOPT_WAIT ran out leaves: the new TUI found
     // and up, and never stamped as adopted.
     let mut st = rig.state();
@@ -2724,8 +2958,8 @@ fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
         !restarted(),
         "the relaunched TUI the restart found, gone: its own exit"
     );
-    // A PERSON AT THE KEYS where the carry-on looks: `wait:held`, the record
-    // still relaunched and unadopted — and that TUI, once gone, still its own.
+    // A person at the keys where the carry-on looks: `wait:held`, the record
+    // still relaunched and unadopted, and that TUI, once gone, still its own.
     *rig.status_extra.lock().expect("status") = " human_ms=500".to_string();
     let carry = Opts {
         hand_back: false,
@@ -2741,9 +2975,9 @@ fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
         "found, never adopted"
     );
     assert!(!restarted(), "the person's `/exit` is theirs");
-    // FOUND BY A VISIT: a relaunched TUI no earlier look recorded (the
+    // Found by a visit: a relaunched TUI no earlier look recorded (the
     // relaunch's own wait ran out before it came up) is on the record from
-    // the visit that finds it leading the tab — held at the keys as here, or
+    // the visit that finds it leading the tab, held at the keys as here, or
     // its adoption out of time.
     let mut st = rig.state();
     st.relaunched_pid = 0;
@@ -2762,17 +2996,58 @@ fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
         "found by the visit, never adopted"
     );
     assert!(!restarted(), "the person's `/exit` is theirs");
+    // A carry of the old TUI's exit made after it finds the restart LANDED:
+    // closed as the relaunch on exit closes it, no hand held on the tab for
+    // a TUI that is gone, and never `refused:no-restart-in-flight`, which the
+    // host says as a restart that cannot land (the review of 6c7df720f,
+    // 2026-10-02).
     assert_eq!(
-        super::super::super::relaunch::carry_restart(&tab, true, None).step,
-        "refused:no-restart-in-flight",
+        super::super::super::relaunch::carry_restart(&tab, true, Some(TUI)).step,
+        "landed",
         "no hand held on the tab for a TUI that is gone"
+    );
+    assert_eq!(
+        rig.state().phase,
+        Phase::Failed("exited-before-continuing".to_string())
+    );
+    // Gone by its own orderly exit before its continuation: the relaunched
+    // TUI's own exit closes the upgrade's record as one overtaken — never the
+    // upgrade's failure after ITS exit, "The upgrade ended it and aterm could
+    // not start it again" marked and notified for a day (round three of the
+    // joint audit of 2026-10-01).
+    use crate::harness::relaunch::{ExitCause, ExitRecord};
+    rig.kernel.relaunched.store(false, Ordering::SeqCst);
+    let gone = crate::harness::relaunch::Snapshot {
+        pid: NEW,
+        ..crashed_snap(&rig, Some(T2), true)
+    };
+    let r = after_exit(
+        &rig.opts,
+        &gone,
+        &ExitRecord::Removed,
+        false,
+        ExitCause::Exit,
+        &rig.kernel,
+    );
+    assert_eq!(r.step, "ended:graceful-exit", "{r:?}");
+    let st = rig.state();
+    assert!(
+        st.is_upgrade() && matches!(st.phase, Phase::Failed(_)),
+        "{st:?}"
+    );
+    let rows = super::super::rows(&rig.opts);
+    assert!(
+        rows.iter()
+            .all(|row| !row.failed_after_exit() && row.interrupt(now_s()).is_none()),
+        "no failure after its exit: exited_at={}",
+        st.exited_at
     );
 }
 
 #[test]
 fn a_daemon_reached_from_one_tabs_step_asks_every_codex_tab_it_serves() {
-    // The window's step is ONE tab's, taken at its idle point; the daemon it
-    // reaches serves every Codex tab of the window. Each of those is asked —
+    // The window's step is one tab's, taken at its idle point; the daemon it
+    // reaches serves every Codex tab of the window. Each of those is asked,
     // and none is a client the pass does not list.
     const OTHER: &str = "s-0ther0ther0ther0ther";
     const TUI2: u32 = 4_000_009;
@@ -2804,7 +3079,7 @@ fn a_daemon_reached_from_one_tabs_step_asks_every_codex_tab_it_serves() {
     // its own step at its own idle point.
     assert!(reports.iter().any(|r| r.tab == TAB), "{reports:#?}");
     assert!(!reports.iter().any(|r| r.tab == OTHER), "{reports:#?}");
-    // NEGATIVE CONTROL: the other tab's Codex attached and NOT listed — the
+    // Negative control: the other tab's Codex attached and not listed; the
     // daemon waits for a client it did not ask.
     let (reports, ran) = run(false);
     let daemon = reports
@@ -2815,17 +3090,14 @@ fn a_daemon_reached_from_one_tabs_step_asks_every_codex_tab_it_serves() {
     assert!(!ran);
 }
 
-/// A CODEX DAEMON BEHIND THE MANAGED CODEX, OR ON IT WITH THE VENDOR'S
-/// UPDATER ARMED, MAKES ITS TAB DUE — the second for the PIN alone, and at
-/// most once every PIN_LOOK_S (the review of 2026-09-28: this branch's first
-/// cut dropped the pin from `due`, and nothing in the window pinned a current
-/// daemon, whose armed updater had restarted the owner's daemon mid-turn at
-/// 06:05:45Z; main's rule, which the owner never dropped, is back). The look
-/// the pin takes is stamped by the daemon step when it does not pin (a goal
-/// keeps a thread running: `wait:pin:busy-thread`), so a goal that never
-/// pauses is asked about once an hour, not at every turn end — the sixteen
-/// journaled looks of that night. NEGATIVE CONTROLS: pinned on the managed
-/// build, ahead of it, or no daemon at all — nothing to move or pin.
+/// A Codex daemon behind the managed Codex, or on it with the vendor's
+/// updater armed, makes its tab due: the latter for the pin alone, and at
+/// most once every PIN_LOOK_S (an armed updater can restart the daemon
+/// mid-turn). The look the pin takes is stamped by the daemon step when it
+/// does not pin (a goal keeps a thread running: `wait:pin:busy-thread`), so
+/// a goal that never pauses is asked about once an hour, not at every turn
+/// end. Negative controls: pinned on the managed build, ahead of it, or no
+/// daemon at all: nothing to move or pin.
 #[test]
 fn a_codex_daemon_behind_or_on_the_vendors_updater_is_due_and_the_pin_alone_boundedly() {
     let (dir, opts, k, target) = daemon_home("due", IDLE_LAST, 600);
@@ -2896,7 +3168,7 @@ fn a_codex_daemon_behind_or_on_the_vendors_updater_is_due_and_the_pin_alone_boun
     assert!(!due_at(at + 60));
     assert!(!due_at(at + PIN_LOOK_S - 1));
     assert!(due_at(at + PIN_LOOK_S), "asked again an hour on");
-    // NEGATIVE CONTROL: the move of a daemon BEHIND is never bounded so.
+    // Negative control: the move of a daemon behind is never bounded so.
     let behind_target = Target {
         version: v("0.157.2"),
         ..busy_target.clone()
@@ -2932,8 +3204,8 @@ fn a_codex_daemon_behind_or_on_the_vendors_updater_is_due_and_the_pin_alone_boun
         "the stamp goes with the pin"
     );
     assert!(!daemon_due(&opts, &home, &target, &k, now));
-    // NEGATIVE CONTROLS: pinned on the managed build, ahead of it, or no
-    // daemon at all — nothing to move or pin.
+    // Negative controls: pinned on the managed build, ahead of it, or no
+    // daemon at all: nothing to move or pin.
     assert_eq!(
         daemon_owes(Some(v("0.157.1")), true, &target),
         Owes::Nothing
@@ -2953,9 +3225,9 @@ fn a_codex_daemon_behind_or_on_the_vendors_updater_is_due_and_the_pin_alone_boun
     let _ = std::fs::remove_dir_all(&busy_dir);
 }
 
-/// [`daemon_home`] whose daemon runs the MANAGED build (0.157.1, the rigs'
+/// [`daemon_home`] whose daemon runs the managed build (0.157.1, the rigs'
 /// target) with the vendor's updater still armed: what owes the pin alone.
-fn current_unpinned(name: &str, last: &str) -> (PathBuf, Opts, DaemonScript, Target) {
+fn current_unpinned(name: &str, last: &str) -> (ScratchDir, Opts, DaemonScript, Target) {
     let (dir, opts, k, target) = daemon_home(name, last, 600);
     let rel = k
         .home
@@ -2976,11 +3248,10 @@ fn upgrade_drive_owns_turn_ends(step: &str) -> bool {
 
 #[test]
 fn a_background_terminals_break_takes_the_notice_and_ends_nothing() {
-    // THE OWNER'S ANSWER OF 2026-09-26, the Codex branch: an embedded
-    // session whose finished turn left a background terminal (its status
-    // line under the turn's end, so its loop reads the turn running) is told
-    // of its upgrade at that break — the notice alone; its READY answer
-    // waits for an idle point, where the `/exit` still waits out the
+    // An embedded session whose finished turn left a background terminal (its
+    // status line under the turn's end, so its loop reads the turn running)
+    // is told of its upgrade at that break, the notice alone; its READY
+    // answer waits for an idle point, where the `/exit` still waits out the
     // terminal. A daemon-mode client, which gets no notice, types nothing
     // there.
     let with_terminal = |w: &mut World| {
@@ -3026,7 +3297,7 @@ fn a_background_terminals_break_takes_the_notice_and_ends_nothing() {
     rig.settle_keeping(&rig.state());
     assert_eq!(rig.visit(None).step, "wait:background-terminal");
     assert_eq!(rig.typed().len(), 1);
-    // NEGATIVE CONTROL: a daemon-mode client at the break types nothing.
+    // Negative control: a daemon-mode client at the break types nothing.
     let mut daemon = Rig::new("daemon-break", T1, false, with_terminal);
     daemon.opts.background = true;
     daemon.settle(9);
@@ -3037,11 +3308,9 @@ fn a_background_terminals_break_takes_the_notice_and_ends_nothing() {
 
 #[test]
 fn at_a_break_a_daemon_mode_client_waits_background_and_its_daemon_is_only_read() {
-    // Live, 2026-09-26 (the host-driven lab, scenario A): at a break the
-    // daemon pass is skipped, and a daemon-mode client whose daemon was never
-    // read recorded `wait:no-daemon` — a wait that named the wrong thing. The
-    // daemon is READ at a break (its build, from its files), never stepped:
-    // the client waits `background`, and the vendor's verb never runs.
+    // At a break the daemon pass is skipped, but the daemon is read (its
+    // build, from its files), never stepped: a daemon-mode client waits
+    // `background`, not `wait:no-daemon`, and the vendor's verb never runs.
     let (rig, dir, mut opts, k, target, tui) = served("break-read", IDLE_LAST, |_| {});
     opts.background = true;
     assert_eq!(daemon_build(&k.home, &k), Some((Some(v("0.157.0")), false)));
@@ -3072,8 +3341,7 @@ fn at_a_break_a_daemon_mode_client_waits_background_and_its_daemon_is_only_read(
     let r = visit(&opts, &tui, &target, Some(read), &rig.kernel);
     assert_eq!(r.step, "wait:background", "{r:?}");
     assert!(rig.typed().is_empty());
-    // NEGATIVE CONTROL: with no daemon read, the same client reads none —
-    // what the break recorded before the read.
+    // Negative control: with no daemon read, the same client reads none.
     let r = visit(&opts, &tui, &target, None, &rig.kernel);
     assert_eq!(r.step, "wait:no-daemon");
     drop(rig);
@@ -3082,11 +3350,10 @@ fn at_a_break_a_daemon_mode_client_waits_background_and_its_daemon_is_only_read(
 
 // ---------------------------------------------------------------- the ladder, driven
 //
-// The review of 2026-09-28: the Tier-1 bind reassembled the visit's facts by
-// hand. These drive the REAL visit across two looks — its own reads of the
-// screen, the status line, the person's stamp, the kernel and the daemon —
-// with the clock between the looks moved by rewinding the state the first
-// look saved (the still run, the screen's `seq`), as a later look finds it.
+// These drive the real visit across two looks (its own reads of the screen,
+// the status line, the person's stamp, the kernel and the daemon), with the
+// clock between the looks moved by rewinding the state the first look saved
+// (the still run, the screen's `seq`), as a later look finds it.
 
 /// A kernel that is the tab's ([`Script`]) for the TUI, its shell and its
 /// relaunch, and the daemon's ([`DaemonScript`]) for the daemon — the one a
@@ -3174,13 +3441,13 @@ impl CodexKernel for Both<'_> {
     }
 }
 
-/// [`served`] whose daemon already runs the managed build, PINNED: the
+/// [`served`] whose daemon already runs the managed build, pinned: the
 /// daemon step says `current`, and the client's own gate decides. The pass
 /// keeps its state where the rig's helpers read and write it.
 fn served_current(
     name: &str,
     world: impl FnOnce(&mut World),
-) -> (Rig, PathBuf, Opts, DaemonScript, Target, Tui) {
+) -> (Rig, ScratchDir, Opts, DaemonScript, Target, Tui) {
     let (rig, dir, mut opts, k, target, tui) = served(name, IDLE_LAST, world);
     // One state directory for the rig's helpers and the pass.
     opts.state.clone_from(&rig.opts.state);
@@ -3234,10 +3501,10 @@ fn now_ends(k: &DaemonScript, thread: &str, last: &str) {
 }
 
 /// The state a look saved, as a look [`upgrade::QUIET_S`] (20 s) later finds
-/// it: the still run begun 20 s earlier (and every thread its record found running with it),
-/// and the screen's `seq` changed since the last read when `repainted` — the
-/// screen's own quiet restarting, as a goal's counter or a footer's clock
-/// restarts it.
+/// it: the still run begun 20 s earlier (and every thread its record found
+/// running with it), and the screen's `seq` changed since the last read when
+/// `repainted` (the screen's own quiet restarting, as a goal's counter or a
+/// footer's clock restarts it).
 fn twenty_seconds_on(rig: &Rig, repainted: bool) {
     let mut st = rig.state();
     assert!(st.still_since != 0, "the first look began a still run");
@@ -3285,13 +3552,12 @@ fn behind(rig: &Rig, behind_s: u64, last_seq: u64, seq_since_s: u64) {
     );
 }
 
-/// THE LADDER, DRIVEN (the review of 2026-09-28): the real visit of a
-/// daemon-mode Codex, across two looks. A REPAINT AT SETTLED MOVES: the
-/// screen's own quiet restarted at each look (its `seq` moved, as a goal's
-/// counter moves it) while its words stood still 20 s — the Settled
-/// rung takes the reader's run of looks, and the second look types the
-/// `/exit`. NEGATIVE CONTROL: the same two looks at the Prefer rung wait
-/// `settling`, and type nothing.
+/// The ladder, driven: the real visit of a daemon-mode Codex across two
+/// looks. A repaint at Settled moves: the screen's own quiet restarted at each
+/// look (its `seq` moved) while its words stood still 20 s, so the Settled
+/// rung takes the reader's run of looks and the second look types the
+/// `/exit`. Negative control: the same two looks at the Prefer rung wait
+/// `settling` and type nothing.
 #[test]
 fn the_real_visit_moves_at_settled_on_a_repaint_and_waits_at_prefer() {
     for (behind_s, moves) in [(upgrade::RUNG_SETTLED_S + 60, true), (600, false)] {
@@ -3314,9 +3580,9 @@ fn the_real_visit_moves_at_settled_on_a_repaint_and_waits_at_prefer() {
     }
 }
 
-/// THE LADDER, DRIVEN: A PERSON NEAR THE TAB AT KEYSONLY MOVES — their input
-/// a minute old, within `human_grace_s`, not within KEYS_GAP_S. The first
-/// look, at Settled, waits for them (`attended`, said once as
+/// The ladder, driven: a person near the tab at KeysOnly moves (their input a
+/// minute old, within `human_grace_s`, not within KEYS_GAP_S). The first look,
+/// at Settled, waits for them (`attended`, said once as
 /// `held-back:attended`); the same person an hour behind no longer holds it,
 /// and the next look types the `/exit`.
 #[test]
@@ -3333,9 +3599,9 @@ fn the_real_visit_lets_a_person_near_the_tab_go_by_at_keys_only() {
     assert_eq!(r.step, "done", "{:#?}", rig.asked());
 }
 
-/// THE LADDER, DRIVEN: A KEYSTROKE WITHIN 20 S AT LAND WAITS — at the last
-/// rung, look after look, nothing typed. NEGATIVE CONTROL: the same rung
-/// with the person's input a minute old moves at the first look.
+/// The ladder, driven: a keystroke within 20 s at Land waits, look after
+/// look, nothing typed. Negative control: the same rung with the person's
+/// input a minute old moves at the first look.
 #[test]
 fn the_real_visit_waits_a_keystroke_out_at_land() {
     let rig = Rig::new("ladder-typing", T1, false, typing);
@@ -3348,22 +3614,18 @@ fn the_real_visit_waits_a_keystroke_out_at_land() {
     assert_eq!(rig.visit(daemon_current()).step, "done");
 }
 
-/// ANOTHER CODEX SESSION'S TURN HOLDS AN IDLE CLIENT ONLY UNTIL ITS SCREEN
-/// PLACES IT THERE (the review of 2026-09-28: every thread of the daemon held
-/// the client, so an idle tab waited on another tab's goal for as long as it
-/// ran, and after six hours was told to pause a goal it did not have). Two
-/// daemon-mode tabs on one daemon, this one idle at its placeholder, the
-/// other's conversation's ROOT running a turn: the kernel cannot say which
-/// conversation is this client's (two roots, two clients), so the first look
-/// waits `daemon-busy` — worded as a turn that may be this tab's own (a
-/// subagent of this conversation) or another Codex session's, neither
-/// presumed, never as a goal to pause here — and a look 20 s
-/// (`QUIET_S`) later, the other root still running, another Codex attached
-/// and this screen's words unchanged, places it in the other session and
-/// types the `/exit`. NEGATIVE CONTROLS: a thread that began
-/// running only at the second look is not placed (a goal's next turn streams
-/// nothing for its first moments); and with this tab's thread the daemon's
-/// only one, running, the kernel names it this tab's own — `daemon-turn`.
+/// Another Codex session's turn holds an idle client only until its screen
+/// places it there. Two daemon-mode tabs on one daemon, this one idle at its
+/// placeholder, the other's conversation's root running a turn: the kernel
+/// cannot say which conversation is this client's (two roots, two clients),
+/// so the first look waits `daemon-busy`, worded as a turn that may be this
+/// tab's own (a subagent) or another session's, never as a goal to pause
+/// here; a look 20 s (`QUIET_S`) later, the other root still running,
+/// another Codex attached and this screen's words unchanged, places it in the
+/// other session and types the `/exit`. Negative controls: a thread that
+/// began running only at the second look is not placed (a goal's next turn
+/// streams nothing at first); with this tab's thread the daemon's only one,
+/// running, the kernel names it this tab's own (`daemon-turn`).
 #[test]
 fn another_sessions_turn_holds_an_idle_client_only_until_its_screen_places_it() {
     const TUI2: u32 = 4_000_009;
@@ -3383,109 +3645,117 @@ fn another_sessions_turn_holds_an_idle_client_only_until_its_screen_places_it() 
         rig.settle(10);
         (rig, dir, opts, k, target, tui, view)
     };
-    let (rig, dir, opts, k, target, tui, view) = setup("two-threads", BUSY_LAST);
-    assert_eq!(
-        view.threads,
-        vec![
-            root_turn(T1, TurnState::Idle),
-            root_turn(T2, TurnState::Busy)
-        ]
-    );
-    let both = Both {
-        tab: &rig.kernel,
-        daemon: &k,
-    };
-    let r = visit(&opts, &tui, &target, Some(view.clone()), &both);
-    assert_eq!(r.step, "wait:daemon-busy", "{r:?}");
-    assert!(rig.typed().is_empty());
-    let row = super::super::rows(&opts)
-        .into_iter()
-        .find(|r| r.tab == TAB)
-        .expect("its row");
-    let words = row.waiting_line("2:15 PM");
-    assert!(
-        words.contains("a subagent of this conversation")
-            && words.contains("another Codex session's")
-            && !words.contains("most often"),
-        "{words}"
-    );
-    assert!(
-        !words.contains("goal") && !words.contains("pause"),
-        "{words}"
-    );
-    // 20 s on, the other thread still running: placed, and moved.
-    twenty_seconds_on(&rig, false);
-    let r = visit(&opts, &tui, &target, Some(view.clone()), &both);
-    assert_eq!(r.step, "done", "{r:?}\n{:#?}", rig.asked());
-    drop(rig);
-    let _ = std::fs::remove_dir_all(&dir);
-
-    // NEGATIVE CONTROL: the other thread idle at the first look (Settled,
-    // the screen repainting), running at the second — found running only
-    // then, it is not placed; still running 20 s later, it is.
-    let (rig, dir, opts, k, target, tui, idle_view) = setup("two-threads-late", IDLE_LAST);
-    behind(&rig, upgrade::RUNG_SETTLED_S + 60, 9, now_s());
-    let both = Both {
-        tab: &rig.kernel,
-        daemon: &k,
-    };
-    assert_eq!(
-        visit(&opts, &tui, &target, Some(idle_view.clone()), &both).step,
-        "wait:settling"
-    );
-    twenty_seconds_on(&rig, true);
-    let running = DaemonView {
-        threads: vec![
-            root_turn(T1, TurnState::Idle),
-            root_turn(T2, TurnState::Busy),
-        ],
-        ..idle_view
-    };
-    let r = visit(&opts, &tui, &target, Some(running.clone()), &both);
-    assert_eq!(r.step, "wait:daemon-busy", "{r:?}");
-    assert!(rig.typed().is_empty());
-    twenty_seconds_on(&rig, true);
-    let r = visit(&opts, &tui, &target, Some(running), &both);
-    assert_eq!(r.step, "done", "{r:?}");
-    drop(rig);
-    let _ = std::fs::remove_dir_all(&dir);
-
-    // NEGATIVE CONTROL: this tab's thread the daemon's only one, running.
-    let (rig, dir, opts, mut k, target, tui) = served_current("own-thread", |_| {});
-    now_ends(&k, T1, BUSY_LAST);
-    k.clients = Some(vec![TUI]);
-    let (_, view) = daemon_pass(
-        &opts,
-        &k.home.clone(),
-        &target,
-        std::slice::from_ref(&tui),
-        &k,
-    )
-    .expect("a daemon");
-    rig.settle(10);
-    let both = Both {
-        tab: &rig.kernel,
-        daemon: &k,
-    };
-    assert_eq!(
-        visit(&opts, &tui, &target, Some(view), &both).step,
-        "wait:daemon-turn"
-    );
-    assert!(rig.typed().is_empty());
-    drop(rig);
-    let _ = std::fs::remove_dir_all(&dir);
+    // Three cases of their own, two of them each waiting out a relaunch's
+    // fixed waits: side by side.
+    let setup = &setup;
+    super::super::tests::side_by_side(vec![
+        Box::new(move || {
+            let (rig, dir, opts, k, target, tui, view) = setup("two-threads", BUSY_LAST);
+            assert_eq!(
+                view.threads,
+                vec![
+                    root_turn(T1, TurnState::Idle),
+                    root_turn(T2, TurnState::Busy)
+                ]
+            );
+            let both = Both {
+                tab: &rig.kernel,
+                daemon: &k,
+            };
+            let r = visit(&opts, &tui, &target, Some(view.clone()), &both);
+            assert_eq!(r.step, "wait:daemon-busy", "{r:?}");
+            assert!(rig.typed().is_empty());
+            let row = super::super::rows(&opts)
+                .into_iter()
+                .find(|r| r.tab == TAB)
+                .expect("its row");
+            let words = row.waiting_line("2:15 PM");
+            assert!(
+                words.contains("a subagent of this conversation")
+                    && words.contains("another Codex session's")
+                    && !words.contains("most often"),
+                "{words}"
+            );
+            assert!(
+                !words.contains("goal") && !words.contains("pause"),
+                "{words}"
+            );
+            // 20 s on, the other thread still running: placed, and moved.
+            twenty_seconds_on(&rig, false);
+            let r = visit(&opts, &tui, &target, Some(view.clone()), &both);
+            assert_eq!(r.step, "done", "{r:?}\n{:#?}", rig.asked());
+            drop(rig);
+            let _ = std::fs::remove_dir_all(&dir);
+        }),
+        Box::new(move || {
+            // Negative control: the other thread idle at the first look (Settled,
+            // the screen repainting), running at the second: found running only
+            // then, it is not placed; still running 20 s later, it is.
+            let (rig, dir, opts, k, target, tui, idle_view) = setup("two-threads-late", IDLE_LAST);
+            behind(&rig, upgrade::RUNG_SETTLED_S + 60, 9, now_s());
+            let both = Both {
+                tab: &rig.kernel,
+                daemon: &k,
+            };
+            assert_eq!(
+                visit(&opts, &tui, &target, Some(idle_view.clone()), &both).step,
+                "wait:settling"
+            );
+            twenty_seconds_on(&rig, true);
+            let running = DaemonView {
+                threads: vec![
+                    root_turn(T1, TurnState::Idle),
+                    root_turn(T2, TurnState::Busy),
+                ],
+                ..idle_view
+            };
+            let r = visit(&opts, &tui, &target, Some(running.clone()), &both);
+            assert_eq!(r.step, "wait:daemon-busy", "{r:?}");
+            assert!(rig.typed().is_empty());
+            twenty_seconds_on(&rig, true);
+            let r = visit(&opts, &tui, &target, Some(running), &both);
+            assert_eq!(r.step, "done", "{r:?}");
+            drop(rig);
+            let _ = std::fs::remove_dir_all(&dir);
+        }),
+        Box::new(move || {
+            // Negative control: this tab's thread the daemon's only one, running.
+            let (rig, dir, opts, mut k, target, tui) = served_current("own-thread", |_| {});
+            now_ends(&k, T1, BUSY_LAST);
+            k.clients = Some(vec![TUI]);
+            let (_, view) = daemon_pass(
+                &opts,
+                &k.home.clone(),
+                &target,
+                std::slice::from_ref(&tui),
+                &k,
+            )
+            .expect("a daemon");
+            rig.settle(10);
+            let both = Both {
+                tab: &rig.kernel,
+                daemon: &k,
+            };
+            assert_eq!(
+                visit(&opts, &tui, &target, Some(view), &both).step,
+                "wait:daemon-turn"
+            );
+            assert!(rig.typed().is_empty());
+            drop(rig);
+            let _ = std::fs::remove_dir_all(&dir);
+        }),
+    ]);
 }
 
-/// A GOAL ON THIS SCREEN PLACES NOTHING (the second review of 2026-09-28):
-/// the same two daemon-mode tabs on one daemon as
+/// A goal on this screen places nothing: the same two daemon-mode tabs as
 /// [`another_sessions_turn_holds_an_idle_client_only_until_its_screen_places_it`],
-/// the other's thread running, but THIS tab's footer says `Pursuing goal
-/// (…)` — so this client's own goal turn may be running where its screen
-/// reads idle at the same words, and a thread that runs through the still
-/// run may be its own. Look after look, 20 s apart and more, the real visit
-/// waits `daemon-busy`, keeps no record of the run's threads, and types
-/// nothing. NEGATIVE CONTROL: the same looks with no goal in the footer
-/// place the other session's turn at the second look and move.
+/// the other's thread running, but this tab's footer says `Pursuing goal
+/// (…)`, so this client's own goal turn may be running where its screen reads
+/// idle, and a thread that runs through the still run may be its own. Look
+/// after look the real visit waits `daemon-busy`, keeps no record of the
+/// run's threads, and types nothing. Negative control: the same looks with no
+/// goal in the footer place the other session's turn at the second look and
+/// move.
 #[test]
 fn a_goal_on_this_screen_places_no_other_sessions_turn() {
     const TUI2: u32 = 4_000_009;
@@ -3571,23 +3841,16 @@ fn three_looks(
     steps
 }
 
-/// THE OWNER'S SHAPE (the third review of 2026-09-28, measured read-only on
-/// the owner's live Codex 0.158.0 daemon that evening): ONE conversation on
-/// the daemon — the root this tab's one TUI resumed and three subagents it
-/// spawned, each rollout opening on its `session_meta` — and this TUI the
-/// daemon's only client. The pass reads each thread's spawn tree; the kernel
-/// names the conversation; so a SUBAGENT'S turn is this tab's own: running
-/// while the root idles (their turns begin on their own after the spawn and
-/// never draw on the tab's screen), the real visit waits `daemon-turn` at
-/// every look 20 s apart — `goal` under a goal's footer — and types nothing;
-/// the root running while the subagents idle (a TUI showing a subagent's
-/// thread draws no root's turn), the same. The round before, counting locks,
-/// named nothing and placed the running subagent at the second look:
-/// `wait:daemon-busy`, then `/exit` (the review's probe). All idle, it
-/// moves — and where the tab's shell integration marks do not reach aterm
-/// (the owner's `integration=degraded`), the KERNEL names the conversation's
-/// ROOT, recorded before the `/exit` and resumed: until this review the four
-/// locks named nothing, and that tab waited `no-shell-integration`.
+/// One conversation on the daemon (the root this tab's TUI resumed and three
+/// subagents it spawned, each rollout opening on its `session_meta`), this
+/// TUI the daemon's only client. The pass reads each thread's spawn tree and
+/// the kernel names the conversation, so a subagent's turn is this tab's
+/// own: running while the root idles, the real visit waits `daemon-turn` at
+/// every look 20 s apart (`goal` under a goal's footer) and types nothing;
+/// the root running while the subagents idle, the same. All idle, it moves,
+/// and where the tab's shell integration marks do not reach aterm
+/// (`integration=degraded`) the kernel names the conversation's root,
+/// recorded before the `/exit` and resumed.
 #[test]
 fn the_tabs_own_subagents_hold_it_and_the_kernel_names_their_root() {
     let degraded = |w: &mut World| {
@@ -3595,102 +3858,110 @@ fn the_tabs_own_subagents_hold_it_and_the_kernel_names_their_root() {
         w.blocks1 = r#"{"blocks":[]}"#.to_string();
         w.blocks2 = r#"{"blocks":[]}"#.to_string();
     };
-    for (case, root_busy, sub_busy, goal, marks) in [
-        ("sub", false, true, false, true),
-        ("subg", false, true, true, true),
-        ("root", true, false, false, true),
-        ("idle", false, false, false, true),
-        ("nomk", false, false, false, false),
-    ] {
-        let world = move |w: &mut World| {
-            if goal {
-                w.before = codex_idle_goal(10);
-            }
-            if !marks {
-                degraded(w);
-            }
-        };
-        let (rig, dir, mut opts, mut k, target, tui) = served_current(&format!("os-{case}"), world);
-        opts.only_sid = Some(TAB.to_string());
-        if root_busy {
-            now_ends(&k, T1, BUSY_LAST);
-        }
-        for (s, busy) in [(S1, sub_busy), (S2, false), (S3, false)] {
-            subagent(&mut k, s, T1, T1, if busy { BUSY_LAST } else { IDLE_LAST });
-        }
-        k.clients = Some(vec![TUI]);
-        let (_, view) = daemon_pass(
-            &opts,
-            &k.home.clone(),
-            &target,
-            std::slice::from_ref(&tui),
-            &k,
+    // Five cases of their own, the moving ones each waiting out a relaunch's
+    // fixed waits: side by side.
+    super::super::tests::side_by_side(
+        [
+            ("sub", false, true, false, true),
+            ("subg", false, true, true, true),
+            ("root", true, false, false, true),
+            ("idle", false, false, false, true),
+            ("nomk", false, false, false, false),
+        ]
+        .into_iter()
+        .map(
+            |(case, root_busy, sub_busy, goal, marks)| -> Box<dyn FnOnce() + Send> {
+                Box::new(move || {
+                    let world = move |w: &mut World| {
+                        if goal {
+                            w.before = codex_idle_goal(10);
+                        }
+                        if !marks {
+                            degraded(w);
+                        }
+                    };
+                    let (rig, dir, mut opts, mut k, target, tui) =
+                        served_current(&format!("os-{case}"), world);
+                    opts.only_sid = Some(TAB.to_string());
+                    if root_busy {
+                        now_ends(&k, T1, BUSY_LAST);
+                    }
+                    for (s, busy) in [(S1, sub_busy), (S2, false), (S3, false)] {
+                        subagent(&mut k, s, T1, T1, if busy { BUSY_LAST } else { IDLE_LAST });
+                    }
+                    k.clients = Some(vec![TUI]);
+                    let (_, view) = daemon_pass(
+                        &opts,
+                        &k.home.clone(),
+                        &target,
+                        std::slice::from_ref(&tui),
+                        &k,
+                    )
+                    .expect("a daemon");
+                    assert_eq!(view.threads.len(), 4, "{case}");
+                    assert!(
+                        view.threads[1..]
+                            .iter()
+                            .all(|l| l.lineage == cx::Lineage::Spawned(T1.to_string())),
+                        "{case}: {:?}",
+                        view.threads
+                    );
+                    rig.settle(10);
+                    let both = Both {
+                        tab: &rig.kernel,
+                        daemon: &k,
+                    };
+                    let steps = three_looks(&rig, &opts, &tui, &target, &view, &both);
+                    if root_busy || sub_busy {
+                        let want = if goal {
+                            "wait:goal"
+                        } else {
+                            "wait:daemon-turn"
+                        };
+                        assert_eq!(steps, [want; 3], "{case}");
+                        assert!(rig.typed().is_empty(), "{case}: nothing typed");
+                        let row = super::super::rows(&opts)
+                            .into_iter()
+                            .find(|r| r.tab == TAB)
+                            .expect("its row");
+                        let words = row.waiting_line("2:15 PM");
+                        assert!(words.contains("this tab's Codex"), "{case}: {words}");
+                    } else {
+                        assert_eq!(steps, ["done"], "{case}: {:#?}", rig.asked());
+                        let typed = rig.typed();
+                        assert!(
+                            typed[1].contains(&format!("'resume' '{T1}'")),
+                            "{case}: the root resumed: {}",
+                            typed[1]
+                        );
+                        if !marks {
+                            let ledger = std::fs::read_to_string(super::super::ledger_path(&opts))
+                                .unwrap_or_default();
+                            assert!(
+                                ledger.contains(&format!("its thread {T1} named by the kernel")),
+                                "{ledger}"
+                            );
+                        }
+                    }
+                    drop(rig);
+                    let _ = std::fs::remove_dir_all(&dir);
+                })
+            },
         )
-        .expect("a daemon");
-        assert_eq!(view.threads.len(), 4, "{case}");
-        assert!(
-            view.threads[1..]
-                .iter()
-                .all(|l| l.lineage == cx::Lineage::Spawned(T1.to_string())),
-            "{case}: {:?}",
-            view.threads
-        );
-        rig.settle(10);
-        let both = Both {
-            tab: &rig.kernel,
-            daemon: &k,
-        };
-        let steps = three_looks(&rig, &opts, &tui, &target, &view, &both);
-        if root_busy || sub_busy {
-            let want = if goal {
-                "wait:goal"
-            } else {
-                "wait:daemon-turn"
-            };
-            assert_eq!(steps, [want; 3], "{case}");
-            assert!(rig.typed().is_empty(), "{case}: nothing typed");
-            let row = super::super::rows(&opts)
-                .into_iter()
-                .find(|r| r.tab == TAB)
-                .expect("its row");
-            let words = row.waiting_line("2:15 PM");
-            assert!(words.contains("this tab's Codex"), "{case}: {words}");
-        } else {
-            assert_eq!(steps, ["done"], "{case}: {:#?}", rig.asked());
-            let typed = rig.typed();
-            assert!(
-                typed[1].contains(&format!("'resume' '{T1}'")),
-                "{case}: the root resumed: {}",
-                typed[1]
-            );
-            if !marks {
-                let ledger =
-                    std::fs::read_to_string(super::super::ledger_path(&opts)).unwrap_or_default();
-                assert!(
-                    ledger.contains(&format!("its thread {T1} named by the kernel")),
-                    "{ledger}"
-                );
-            }
-        }
-        drop(rig);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+        .collect(),
+    );
 }
 
-/// AN IDLE CONVERSATION BEHIND A LINE LONGER THAN THE TAIL (the fourth review
-/// of 2026-09-28, measured read-only on the owner's live root rollout: a turn
-/// ended, then ONE 542,736-byte `item_completed` line — a command that
-/// finished after it — and settings rows for six hours). In the owner's shape
-/// (the root, three idle subagents, this TUI the daemon's only client) and on
-/// a daemon holding the one thread, the pass reads the root's turn back past
-/// that line: IDLE, and the tab moves at the first look, the root resumed.
-/// The round before read the 256 KiB tail alone, found no turn event, counted
-/// the idle root running and waited `daemon-turn` look after look with
-/// nothing to end it. Controls, each waiting `daemon-turn` with nothing
-/// typed: a turn STARTED before the same line (busy), a line whose output
-/// QUOTES a turn's end after a turn started (the words are text, never an
-/// event), and a turn's end further back than the reader looks
-/// ([`TURN_BACK_BYTES`]: Unknown, counted running — fail closed).
+/// An idle conversation behind a line longer than the tail: a turn ended,
+/// then one very large `item_completed` line (a command that finished after
+/// it) and settings rows. In the one-conversation shape and on a daemon
+/// holding the one thread, the pass reads the root's turn back past that
+/// line: idle, and the tab moves at the first look, the root resumed.
+/// Controls, each waiting `daemon-turn` with nothing typed: a turn started
+/// before the same line (busy), a line whose output quotes a turn's end after
+/// a turn started (text, never an event), and a turn's end further back than
+/// the reader looks ([`TURN_BACK_BYTES`]: Unknown, counted running, fail
+/// closed).
 #[test]
 fn an_idle_conversation_behind_a_line_longer_than_the_tail_moves() {
     const STARTED: &str = r#"{"timestamp":"2026-09-27T20:30:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t9"}}"#;
@@ -3711,6 +3982,9 @@ fn an_idle_conversation_behind_a_line_longer_than_the_tail_moves() {
     let busy = [ENDED, STARTED, big.as_str()];
     let quoted = [ENDED, STARTED, quoting.as_str()];
     let far = [STARTED, ENDED, beyond.as_str()];
+    // Five cases of their own, the moving ones each waiting out a relaunch's
+    // fixed waits: side by side.
+    let mut cases: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::new();
     for (case, subs, last, want) in [
         ("idle", true, idle, TurnState::Idle),
         ("alone", false, idle, TurnState::Idle),
@@ -3718,62 +3992,63 @@ fn an_idle_conversation_behind_a_line_longer_than_the_tail_moves() {
         ("quoted", true, quoted, TurnState::Busy),
         ("far", true, far, TurnState::Unknown),
     ] {
-        let (rig, dir, mut opts, mut k, target, tui) =
-            served_current(&format!("long-{case}"), |_| {});
-        opts.only_sid = Some(TAB.to_string());
-        now_ends(&k, T1, &last.join("\n"));
-        if subs {
-            for s in [S1, S2, S3] {
-                subagent(&mut k, s, T1, T1, IDLE_LAST);
+        cases.push(Box::new(move || {
+            let (rig, dir, mut opts, mut k, target, tui) =
+                served_current(&format!("long-{case}"), |_| {});
+            opts.only_sid = Some(TAB.to_string());
+            now_ends(&k, T1, &last.join("\n"));
+            if subs {
+                for s in [S1, S2, S3] {
+                    subagent(&mut k, s, T1, T1, IDLE_LAST);
+                }
             }
-        }
-        k.clients = Some(vec![TUI]);
-        let (_, view) = daemon_pass(
-            &opts,
-            &k.home.clone(),
-            &target,
-            std::slice::from_ref(&tui),
-            &k,
-        )
-        .expect("a daemon");
-        assert_eq!(view.threads[0].thread, T1, "{case}");
-        assert_eq!(view.threads[0].turn, want, "{case}");
-        rig.settle(10);
-        let both = Both {
-            tab: &rig.kernel,
-            daemon: &k,
-        };
-        let steps = three_looks(&rig, &opts, &tui, &target, &view, &both);
-        if want == TurnState::Idle {
-            assert_eq!(steps, ["done"], "{case}: {:#?}", rig.asked());
-            let typed = rig.typed();
-            assert!(
-                typed[1].contains(&format!("'resume' '{T1}'")),
-                "{case}: the root resumed: {}",
-                typed[1]
-            );
-        } else {
-            assert_eq!(steps, ["wait:daemon-turn"; 3], "{case}");
-            assert!(rig.typed().is_empty(), "{case}: nothing typed");
-        }
-        drop(rig);
-        let _ = std::fs::remove_dir_all(&dir);
+            k.clients = Some(vec![TUI]);
+            let (_, view) = daemon_pass(
+                &opts,
+                &k.home.clone(),
+                &target,
+                std::slice::from_ref(&tui),
+                &k,
+            )
+            .expect("a daemon");
+            assert_eq!(view.threads[0].thread, T1, "{case}");
+            assert_eq!(view.threads[0].turn, want, "{case}");
+            rig.settle(10);
+            let both = Both {
+                tab: &rig.kernel,
+                daemon: &k,
+            };
+            let steps = three_looks(&rig, &opts, &tui, &target, &view, &both);
+            if want == TurnState::Idle {
+                assert_eq!(steps, ["done"], "{case}: {:#?}", rig.asked());
+                let typed = rig.typed();
+                assert!(
+                    typed[1].contains(&format!("'resume' '{T1}'")),
+                    "{case}: the root resumed: {}",
+                    typed[1]
+                );
+            } else {
+                assert_eq!(steps, ["wait:daemon-turn"; 3], "{case}");
+                assert!(rig.typed().is_empty(), "{case}: nothing typed");
+            }
+            drop(rig);
+            let _ = std::fs::remove_dir_all(&dir);
+        }));
     }
+    super::super::tests::side_by_side(cases);
 }
 
-/// NEGATIVE CONTROLS FOR THE OWNER'S SHAPE — where the kernel names no
-/// conversation, what the lane can never place holds the tab for as long as
-/// it runs, look after look 20 s apart, and nothing is typed: TWO ROOTS AND
-/// TWO TUIs, with a running SUBAGENT of the other conversation (its root
-/// idle), or of this tab's own (another conversation idle beside it) — a
-/// subagent is never placed; and a second ROOT running with this TUI the
-/// daemon's ONLY client (a thread no tab shows — or this tab's own while its
-/// screen shows another thread): not provably another session's, so never
-/// placed either. Each waits `daemon-busy`, worded without presuming whose
-/// turn it is. The round before placed each at the second look and typed
-/// `/exit`. And with the marks gone, two roots name nothing: the `/exit`
-/// waits `no-shell-integration` even when every thread idles (the root of
-/// neither conversation is proven this TUI's).
+/// Negative controls for the one-conversation shape: where the kernel names
+/// no conversation, what the lane can never place holds the tab for as long
+/// as it runs, look after look, and nothing is typed: two roots and two TUIs
+/// with a running subagent of the other conversation (its root idle) or of
+/// this tab's own (another conversation idle beside it), since a subagent is
+/// never placed; and a second root running with this TUI the daemon's only
+/// client (a thread no tab shows, or this tab's own while its screen shows
+/// another thread), not provably another session's. Each waits
+/// `daemon-busy`, worded without presuming whose turn it is. With the marks
+/// gone, two roots name nothing: the `/exit` waits `no-shell-integration`
+/// even when every thread idles.
 #[test]
 fn what_the_lane_never_places_holds_the_tab_where_the_kernel_names_nothing() {
     const TUI2: u32 = 4_000_009;
@@ -3853,14 +4128,14 @@ fn what_the_lane_never_places_holds_the_tab_where_the_kernel_names_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A TURN BEGUN SINCE THE SWEEP READ THE DAEMON HOLDS THE `/exit` (the second
-/// review of 2026-09-28): the gate passed on the daemon as the pass read it —
-/// this tab's thread, the daemon's only one, idle — and between that read
-/// and the `/exit` the thread began a turn (a goal's next one begins within
-/// 14 ms of the last one's end). The `/exit`'s last look reads the daemon
-/// again, finds this tab's own thread running (the kernel names it), and
-/// waits `changed`, typing nothing; so does a daemon it can no longer read.
-/// NEGATIVE CONTROL: nothing begun since, and the same visit moves.
+/// A turn begun since the sweep read the daemon holds the `/exit`: the gate
+/// passed on the daemon as the pass read it (this tab's thread, the daemon's
+/// only one, idle), and between that read and the `/exit` the thread began a
+/// turn (a goal's next one begins within milliseconds of the last one's
+/// end). The `/exit`'s last look reads the daemon again, finds this tab's own
+/// thread running, and waits `changed`, typing nothing; so does a daemon it
+/// can no longer read. Negative control: nothing begun since, and the same
+/// visit moves.
 #[test]
 fn a_turn_begun_since_the_sweeps_read_holds_the_exit() {
     for case in ["idle", "began", "gone"] {
@@ -3898,16 +4173,16 @@ fn a_turn_begun_since_the_sweeps_read_holds_the_exit() {
     }
 }
 
-/// NO SHELL INTEGRATION, AND THE KERNEL NAMES THE THREAD (the owner's tab of
-/// 2026-09-28 read `integration=degraded` with no blocks, after an aterm
-/// update): the rows a daemon-mode client prints as it leaves cannot be told
-/// from the prompt after them, but its daemon holds ONE thread and this TUI
-/// is its ONE client — so that thread is this TUI's, recorded before the
-/// `/exit` (its ledger row says so) and resumed. NEGATIVE CONTROLS: a second
-/// thread on the daemon, or a second Codex attached to it — the `/exit`
-/// waits `no-shell-integration`, typing nothing, and the wait is a BLOCKER
-/// whose clock stands through the other waits a later look finds (a goal's
-/// `daemon-turn`), until a look finds the marks back.
+/// No shell integration, and the kernel names the thread
+/// (`integration=degraded`, no blocks): the rows a daemon-mode client prints
+/// as it leaves cannot be told from the prompt after them, but its daemon
+/// holds one thread and this TUI is its one client, so that thread is this
+/// TUI's, recorded before the `/exit` (its ledger row says so) and resumed.
+/// Negative controls: a second thread on the daemon, or a second Codex
+/// attached to it: the `/exit` waits `no-shell-integration`, typing nothing,
+/// and the wait is a blocker whose clock stands through the other waits a
+/// later look finds (a goal's `daemon-turn`), until a look finds the marks
+/// back.
 #[test]
 fn without_shell_integration_the_kernel_names_the_thread_or_the_exit_waits() {
     let no_marks = |w: &mut World| {
@@ -3915,44 +4190,11 @@ fn without_shell_integration_the_kernel_names_the_thread_or_the_exit_waits() {
         w.blocks1 = r#"{"blocks":[]}"#.to_string();
         w.blocks2 = r#"{"blocks":[]}"#.to_string();
     };
-    let (rig, dir, opts, k, target, tui) = served_current("kernel-thread", no_marks);
-    let (_, view) = daemon_pass(
-        &opts,
-        &k.home.clone(),
-        &target,
-        std::slice::from_ref(&tui),
-        &k,
-    )
-    .expect("a daemon");
-    rig.settle(10);
-    let both = Both {
-        tab: &rig.kernel,
-        daemon: &k,
-    };
-    let r = visit(&opts, &tui, &target, Some(view), &both);
-    assert_eq!(r.step, "done", "{r:?}\n{:#?}", rig.asked());
-    let typed = rig.typed();
-    assert!(
-        typed[1].contains(&format!("'resume' '{T1}'")),
-        "{}",
-        typed[1]
-    );
-    let ledger = std::fs::read_to_string(super::super::ledger_path(&opts)).unwrap_or_default();
-    assert!(ledger.contains("named by the kernel"), "{ledger}");
-    drop(rig);
-    let _ = std::fs::remove_dir_all(&dir);
-
-    for (name, second_thread, second_client) in [
-        ("kernel-two-threads", true, false),
-        ("kernel-two-clients", false, true),
-    ] {
-        let (rig, dir, opts, mut k, target, tui) = served_current(name, no_marks);
-        if second_thread {
-            another_session(&mut k, IDLE_LAST);
-        }
-        if second_client {
-            k.clients = Some(vec![TUI, 4_000_009]);
-        }
+    // Three cases of their own, each waiting out a relaunch's fixed waits:
+    // side by side.
+    let mut cases: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::new();
+    cases.push(Box::new(move || {
+        let (rig, dir, opts, k, target, tui) = served_current("kernel-thread", no_marks);
         let (_, view) = daemon_pass(
             &opts,
             &k.home.clone(),
@@ -3966,44 +4208,82 @@ fn without_shell_integration_the_kernel_names_the_thread_or_the_exit_waits() {
             tab: &rig.kernel,
             daemon: &k,
         };
-        let r = visit(&opts, &tui, &target, Some(view.clone()), &both);
-        assert_eq!(r.step, "wait:no-shell-integration", "{name}: {r:?}");
-        assert!(rig.typed().is_empty(), "{name}");
-        let st = rig.state();
-        assert_eq!(
-            (st.wait.as_str(), st.blocked.as_str()),
-            ("no-shell-integration", "no-shell-integration")
-        );
-        // Another wait meanwhile keeps the blocker's clock; past
-        // BLOCKED_AFTER_S the row is `blocked`.
-        let mut st = rig.state();
-        st.blocked_since -= super::super::upgrade_status::BLOCKED_AFTER_S;
-        st.wait = "daemon-turn".to_string();
-        st.wait_since = now_s();
-        save(&opts, &key(TAB), &st);
-        let row = super::super::rows(&opts)
-            .into_iter()
-            .find(|r| r.tab == TAB)
-            .expect("its row");
-        assert_eq!(
-            row.stall(now_s()).as_deref(),
-            Some("blocked:no-shell-integration"),
-            "{name}"
-        );
-        // The marks back: the next look clears it.
-        *rig.status_extra.lock().expect("status") = " integration=on".to_string();
         let r = visit(&opts, &tui, &target, Some(view), &both);
-        assert_eq!(r.step, "done", "{name}: {r:?}");
+        assert_eq!(r.step, "done", "{r:?}\n{:#?}", rig.asked());
+        let typed = rig.typed();
+        assert!(
+            typed[1].contains(&format!("'resume' '{T1}'")),
+            "{}",
+            typed[1]
+        );
+        let ledger = std::fs::read_to_string(super::super::ledger_path(&opts)).unwrap_or_default();
+        assert!(ledger.contains("named by the kernel"), "{ledger}");
         drop(rig);
         let _ = std::fs::remove_dir_all(&dir);
+    }));
+    for (name, second_thread, second_client) in [
+        ("kernel-two-threads", true, false),
+        ("kernel-two-clients", false, true),
+    ] {
+        cases.push(Box::new(move || {
+            let (rig, dir, opts, mut k, target, tui) = served_current(name, no_marks);
+            if second_thread {
+                another_session(&mut k, IDLE_LAST);
+            }
+            if second_client {
+                k.clients = Some(vec![TUI, 4_000_009]);
+            }
+            let (_, view) = daemon_pass(
+                &opts,
+                &k.home.clone(),
+                &target,
+                std::slice::from_ref(&tui),
+                &k,
+            )
+            .expect("a daemon");
+            rig.settle(10);
+            let both = Both {
+                tab: &rig.kernel,
+                daemon: &k,
+            };
+            let r = visit(&opts, &tui, &target, Some(view.clone()), &both);
+            assert_eq!(r.step, "wait:no-shell-integration", "{name}: {r:?}");
+            assert!(rig.typed().is_empty(), "{name}");
+            let st = rig.state();
+            assert_eq!(
+                (st.wait.as_str(), st.blocked.as_str()),
+                ("no-shell-integration", "no-shell-integration")
+            );
+            // Another wait meanwhile keeps the blocker's clock; past
+            // BLOCKED_AFTER_S the row is `blocked`.
+            let mut st = rig.state();
+            st.blocked_since -= super::super::upgrade_status::BLOCKED_AFTER_S;
+            st.wait = "daemon-turn".to_string();
+            st.wait_since = now_s();
+            save(&opts, &key(TAB), &st);
+            let row = super::super::rows(&opts)
+                .into_iter()
+                .find(|r| r.tab == TAB)
+                .expect("its row");
+            assert_eq!(
+                row.stall(now_s()).as_deref(),
+                Some("blocked:no-shell-integration"),
+                "{name}"
+            );
+            // The marks back: the next look clears it.
+            *rig.status_extra.lock().expect("status") = " integration=on".to_string();
+            let r = visit(&opts, &tui, &target, Some(view), &both);
+            assert_eq!(r.step, "done", "{name}: {r:?}");
+            drop(rig);
+            let _ = std::fs::remove_dir_all(&dir);
+        }));
     }
+    super::super::tests::side_by_side(cases);
 }
 
-/// A SCREEN NO READ RETURNS IS RECORDED (the review of 2026-09-28: the visit
-/// returned before any record, so `blocked:screen-unreadable` could never
-/// form): the wait and its blocker's clock are saved, and past
-/// BLOCKED_AFTER_S the row is `blocked:screen-unreadable`. A later look that
-/// reads the screen clears it.
+/// A screen no read returns is recorded: the wait and its blocker's clock are
+/// saved, and past BLOCKED_AFTER_S the row is `blocked:screen-unreadable`. A
+/// later look that reads the screen clears it.
 #[test]
 fn an_unreadable_screen_is_recorded_and_blocks_after_half_an_hour() {
     let rig = Rig::new("unreadable", T1, false, |w| {
@@ -4026,7 +4306,7 @@ fn an_unreadable_screen_is_recorded_and_blocks_after_half_an_hour() {
         row.stall(now_s()).as_deref(),
         Some("blocked:screen-unreadable")
     );
-    // NEGATIVE CONTROL: a readable screen at the next look ends it.
+    // Negative control: a readable screen at the next look ends it.
     let readable = Rig::new("unreadable-then-read", T1, false, |_| {});
     let mut st = rig.state();
     st.seq_since_s = now_s() - 60;
@@ -4036,20 +4316,22 @@ fn an_unreadable_screen_is_recorded_and_blocks_after_half_an_hour() {
     assert_eq!(readable.state().blocked, "", "cleared by a look that read");
 }
 
-// The goal pause through the lane's own driver (the owner's decision of
-// 2026-09-28).
+// The goal pause through the lane's own driver.
 #[path = "upgrade_goal_drive_tests.rs"]
 mod goal;
 
+// Codex's usage wall and the reset it names (design record C9's Codex half).
+#[path = "upgrade_codex_limit_tests.rs"]
+mod limit_wall;
+
 // ------------------------------------------------------ relaunch on exit
 //
-// The harness's Codex parity (2026-09-27): a Codex that crashed out of its tab
-// is relaunched on its thread, as a Claude Code is. Measured first on 0.157.1
-// in a private instance: a SIGKILLed TUI's command block reads `exit 137` and
-// prints no hint; a `/exit` reads `exit 0` and prints its hint; an embedded
-// TUI's `/exit` removes its thread's writer lock, and SIGKILL, SIGTERM, SIGINT
-// and SIGHUP all leave it (the last three measured 2026-09-27) — so the lock
-// is no word on the exit, and the shell's status alone decides.
+// A Codex that crashed out of its tab is relaunched on its thread, as a
+// Claude Code is. A SIGKILLed TUI's command block reads `exit 137` and prints
+// no hint; a `/exit` reads `exit 0` and prints its hint; an embedded TUI's
+// `/exit` removes its thread's writer lock, and SIGKILL, SIGTERM, SIGINT and
+// SIGHUP all leave it, so the lock is no word on the exit and the shell's
+// status alone decides.
 
 /// A Codex TUI that ran in the rig's tab, as the relaunch's snapshot read it
 /// while it ran: `thread` the one it held (`embedded`) or named.
@@ -4073,8 +4355,11 @@ fn crashed_snap(
             embedded,
             started_ms: 0,
             ambiguous: false,
+            // The command block that ran it ([`blocks_after`]'s `codex`).
+            block: Some(7),
         }),
         dialect: None,
+        login: None,
     }
 }
 
@@ -4088,158 +4373,293 @@ fn after_crash(w: &mut World, exit: i64) {
     w.blocks1 = b1;
 }
 
-/// A CRASHED embedded Codex (SIGKILL: `exit 137`, its thread's lock left
-/// behind) is relaunched on the thread it held — `<build> resume <thread>`,
-/// the build it ran with `[harness] upgrade` off — and, its new TUI holding
-/// the thread again, told WHY (the relaunch's carry-on, not the upgrade's).
-/// NEGATIVE CONTROLS: the same exit read as its own (`exit 0`, a `/exit`) or
+/// A restart whose resume line was never typed, overtaken by a Codex a
+/// person started by hand in its tab: that process's exit closes it as
+/// resumed elsewhere, never as aterm's relaunch quitting (Claude Code's rule
+/// too). NEGATIVE CONTROL: a record of the same phase relaunched closes as
+/// the relaunched Codex exiting.
+#[test]
+fn a_hand_resumed_codex_closes_a_restart_as_resumed_elsewhere() {
+    use crate::harness::relaunch::{ExitCause, ExitRecord};
+    for (phase, want) in [
+        (Phase::Exiting { at_s: now_s() }, "failed:resumed-elsewhere"),
+        (
+            Phase::Relaunched { at_s: now_s() },
+            "failed:exited-before-continuing",
+        ),
+    ] {
+        let rig = Rig::new("hand-resumed", T2, true, |w| after_crash(w, 0));
+        rig.kernel.exited.store(true, Ordering::SeqCst);
+        let st = St {
+            phase: phase.clone(),
+            pid: TUI + 1,
+            ..exiting(&rig, T2)
+        };
+        save(&rig.opts, &key(TAB), &st);
+        let snap = crashed_snap(&rig, Some(T2), true);
+        let r = after_exit(
+            &rig.opts,
+            &snap,
+            &ExitRecord::Removed,
+            false,
+            ExitCause::Exit,
+            &rig.kernel,
+        );
+        assert_eq!(r.step, "ended:graceful-exit", "{phase:?}");
+        assert!(
+            rig.ledger_steps().contains(&want.to_string()),
+            "{:#?}",
+            rig.ledger_steps()
+        );
+        assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
+    }
+}
+
+/// A crashed embedded Codex (SIGKILL: `exit 137`, its thread's lock left
+/// behind) is relaunched on the thread it held (`<build> resume <thread>`,
+/// the build it ran with `[harness] upgrade` off) and, its new TUI holding
+/// the thread again, told why (the relaunch's carry-on, not the upgrade's).
+/// Negative controls: the same exit read as its own (`exit 0`, a `/exit`) or
 /// someone's signal, and an exit no word came for, are left alone with
-/// nothing typed — unless the stall's remedy ended it (U1), or aterm itself
+/// nothing typed, unless the stall's remedy ended it (U1), or aterm itself
 /// ended while it ran and the next launch reopened its tab (its hangup read
 /// as its own orderly exit, which it was not).
 #[test]
 fn a_crashed_codex_is_relaunched_on_its_thread_and_told_why() {
     use crate::harness::relaunch::{ExitCause, ExitRecord};
-    let rig = Rig::new("exit-crash", T2, true, |w| after_crash(w, 137));
-    rig.kernel.exited.store(true, Ordering::SeqCst);
-    let snap = crashed_snap(&rig, Some(T2), true);
-    let r = after_exit(
-        &rig.opts,
-        &snap,
-        &ExitRecord::Crashed,
-        false,
-        ExitCause::Exit,
-        &rig.kernel,
-    );
-    assert_eq!(r.step, "continued", "{r:?}\n{:#?}", rig.asked());
-    let typed = rig.typed();
-    assert_eq!(typed.len(), 2, "{typed:#?}");
-    assert!(
-        typed[0].contains(&format!("{}' 'resume' '{T2}'", rig.target.exe.display())),
-        "the build it ran, on its thread: {}",
-        typed[0]
-    );
-    assert!(
-        typed[1].contains("[aterm harness] Relaunched: Codex exited without anyone asking"),
-        "the relaunch's carry-on: {}",
-        typed[1]
-    );
-    let st = rig.state();
-    assert_eq!((st.mode.as_str(), st.thread.as_str()), ("embedded", T2));
-    assert_eq!(st.cause, crate::harness::relaunch::CAUSE_EXIT);
-    assert!(!rig.asked().iter().any(|l| l.contains("signal")));
-
-    // NEGATIVE CONTROLS: its own exit, someone's signal, no word at all.
-    for (left, want) in [
-        (ExitRecord::Removed, "ended:graceful-exit"),
-        (ExitRecord::Unread, "ended:exit-unwitnessed"),
-    ] {
-        let rig = Rig::new("exit-left", T2, true, |w| after_crash(w, 0));
-        rig.kernel.exited.store(true, Ordering::SeqCst);
-        let snap = crashed_snap(&rig, Some(T2), true);
-        let r = after_exit(&rig.opts, &snap, &left, false, ExitCause::Exit, &rig.kernel);
-        assert_eq!(r.step, want);
-        assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
-    }
-    // …unless the stall's remedy ended it: relaunched, told so.
-    let rig = Rig::new("exit-stall", T2, true, |w| after_crash(w, 143));
-    rig.kernel.exited.store(true, Ordering::SeqCst);
-    let snap = crashed_snap(&rig, Some(T2), true);
-    let r = after_exit(
-        &rig.opts,
-        &snap,
-        &ExitRecord::Removed,
-        false,
-        ExitCause::Stall,
-        &rig.kernel,
-    );
-    assert_eq!(r.step, "continued", "{r:?}");
-    assert!(rig.typed()[1].contains("Relaunched: Codex stopped reading its input"));
-    // …or aterm's own end took its tab: relaunched in the reopened one, told
-    // so (the continuation is the relaunch's, never the upgrade's).
-    let rig = Rig::new("exit-host", T2, true, |w| after_crash(w, 129));
-    rig.kernel.exited.store(true, Ordering::SeqCst);
-    let snap = crashed_snap(&rig, Some(T2), true);
-    let r = after_exit(
-        &rig.opts,
-        &snap,
-        &ExitRecord::Unread,
-        false,
-        ExitCause::HostEnded,
-        &rig.kernel,
-    );
-    assert_eq!(r.step, "continued", "{r:?}");
-    assert!(
-        rig.typed()[1].contains("Relaunched: aterm ended while this session ran"),
-        "{:#?}",
-        rig.typed()
-    );
-    assert_eq!(rig.state().cause, crate::harness::relaunch::CAUSE_HOST);
-}
-
-/// A CODEX EXIT IS DECIDED ON ITS SHELL'S WORD ALONE (the review of
-/// 2026-09-27): an embedded TUI's thread lock left behind is no word —
-/// SIGTERM, SIGINT and SIGHUP leave it exactly as SIGKILL does (measured
-/// that day on 0.157.1) — so a look that comes before the shell drew its
-/// prompt says nothing, and the record waits for the status (`143`, a
-/// person's `kill`: theirs). NEGATIVE CONTROL: the status once it is there.
-#[test]
-fn a_codex_lock_left_behind_is_no_word_on_its_exit() {
-    let rig = Rig::new("exit-lock", T2, true, |w| {
-        after_crash(w, 143);
-        w.blocks2 = blocks_after(1).1;
-    });
-    rig.kernel.exited.store(true, Ordering::SeqCst);
-    let snap = crashed_snap(&rig, Some(T2), true);
-    let lock = rig
-        .tui
-        .home
-        .join("thread-writer-locks")
-        .join(format!("{T2}.lock"));
-    std::fs::write(&lock, "").expect("the lock left behind");
-    let look = look_at_exit(&rig.opts, &snap, &rig.kernel);
-    assert!(!look.running);
-    assert_eq!(look.crashed, None, "no word yet: {look:?}");
-    // NEGATIVE CONTROL: the shell's word, once drawn — someone's signal.
-    let rig = Rig::new("exit-lock-word", T2, true, |w| after_crash(w, 143));
-    rig.kernel.exited.store(true, Ordering::SeqCst);
-    let snap = crashed_snap(&rig, Some(T2), true);
-    std::fs::write(
-        rig.tui
-            .home
-            .join("thread-writer-locks")
-            .join(format!("{T2}.lock")),
-        "",
-    )
-    .expect("the lock left behind");
-    assert_eq!(
-        look_at_exit(&rig.opts, &snap, &rig.kernel).crashed,
-        Some(false)
-    );
+    // Six cases, each a rig of its own whose relaunches each wait out the
+    // shell's prompt (600 ms) and the new TUI's first idle: side by side
+    // (4.3 s one after another, measured 2026-10-05).
+    super::super::tests::side_by_side(vec![
+        Box::new(|| {
+            let rig = Rig::new("exit-crash", T2, true, |w| after_crash(w, 137));
+            rig.kernel.exited.store(true, Ordering::SeqCst);
+            let snap = crashed_snap(&rig, Some(T2), true);
+            let r = after_exit(
+                &rig.opts,
+                &snap,
+                &ExitRecord::Crashed,
+                false,
+                ExitCause::Exit,
+                &rig.kernel,
+            );
+            assert_eq!(r.step, "continued", "{r:?}\n{:#?}", rig.asked());
+            let typed = rig.typed();
+            assert_eq!(typed.len(), 2, "{typed:#?}");
+            assert!(
+                typed[0].contains(&format!("{}' 'resume' '{T2}'", rig.target.exe.display())),
+                "the build it ran, on its thread: {}",
+                typed[0]
+            );
+            assert!(
+                typed[1].contains("[aterm harness] Relaunched: Codex exited without anyone asking"),
+                "the relaunch's carry-on: {}",
+                typed[1]
+            );
+            let st = rig.state();
+            assert_eq!((st.mode.as_str(), st.thread.as_str()), ("embedded", T2));
+            assert_eq!(st.cause, crate::harness::relaunch::CAUSE_EXIT);
+            assert!(!rig.asked().iter().any(|l| l.contains("signal")));
+        }),
+        Box::new(|| {
+            // Negative controls: its own exit, someone's signal, no word at all.
+            for (left, want) in [
+                (ExitRecord::Removed, "ended:graceful-exit"),
+                (ExitRecord::Unread, "ended:exit-unwitnessed"),
+            ] {
+                let rig = Rig::new("exit-left", T2, true, |w| {
+                    after_crash(w, 0);
+                    // No word at the attempt either: the prompt is not back.
+                    if left == ExitRecord::Unread {
+                        w.blocks2 = blocks_after(1).1;
+                    }
+                });
+                rig.kernel.exited.store(true, Ordering::SeqCst);
+                let snap = crashed_snap(&rig, Some(T2), true);
+                let r = after_exit(&rig.opts, &snap, &left, false, ExitCause::Exit, &rig.kernel);
+                assert_eq!(r.step, want);
+                assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
+            }
+        }),
+        Box::new(|| {
+            // …unless the stall's remedy ended it: relaunched, told so.
+            let rig = Rig::new("exit-stall", T2, true, |w| after_crash(w, 143));
+            rig.kernel.exited.store(true, Ordering::SeqCst);
+            let snap = crashed_snap(&rig, Some(T2), true);
+            let r = after_exit(
+                &rig.opts,
+                &snap,
+                &ExitRecord::Removed,
+                false,
+                ExitCause::Stall,
+                &rig.kernel,
+            );
+            assert_eq!(r.step, "continued", "{r:?}");
+            assert!(rig.typed()[1].contains("Relaunched: Codex stopped reading its input"));
+        }),
+        Box::new(|| {
+            // …or aterm's own end took its tab: relaunched in the reopened one, told
+            // so (the continuation is the relaunch's, never the upgrade's).
+            let rig = Rig::new("exit-host", T2, true, |w| after_crash(w, 129));
+            rig.kernel.exited.store(true, Ordering::SeqCst);
+            let snap = crashed_snap(&rig, Some(T2), true);
+            let r = after_exit(
+                &rig.opts,
+                &snap,
+                &ExitRecord::Unread,
+                false,
+                ExitCause::HostEnded,
+                &rig.kernel,
+            );
+            assert_eq!(r.step, "continued", "{r:?}");
+            assert!(
+                rig.typed()[1].contains("Relaunched: aterm ended while this session ran"),
+                "{:#?}",
+                rig.typed()
+            );
+            assert_eq!(rig.state().cause, crate::harness::relaunch::CAUSE_HOST);
+        }),
+        Box::new(|| {
+            // The crash tried again once the TUI its relaunch brought up and handed
+            // back is gone before its continuation (the window's host, round two of
+            // the joint audit of 2026-10-01): closed and relaunched afresh — carried
+            // on, the try waited 90 s on a dead TUI, the harness's hand on the tab,
+            // until the record went stale. NEGATIVE CONTROL: while that TUI lives, a
+            // try finds it again and types nothing.
+            let mut rig = Rig::new("exit-landed-gone", T2, true, |w| after_crash(w, 137));
+            rig.opts.hand_back = true;
+            rig.kernel.exited.store(true, Ordering::SeqCst);
+            let snap = crashed_snap(&rig, Some(T2), true);
+            let again = |rig: &Rig| {
+                after_exit(
+                    &rig.opts,
+                    &snap,
+                    &ExitRecord::Crashed,
+                    false,
+                    ExitCause::Exit,
+                    &rig.kernel,
+                )
+            };
+            assert_eq!(again(&rig).step, "adopted");
+            let lines = rig.typed().len();
+            assert_eq!(
+                (again(&rig).step, rig.typed().len()),
+                ("adopted".to_string(), lines),
+                "found again"
+            );
+            rig.kernel.relaunched.store(false, Ordering::SeqCst);
+            assert_eq!(
+                (again(&rig).step, rig.typed().len()),
+                ("adopted".to_string(), lines + 1),
+                "relaunched afresh: {:#?}",
+                rig.ledger_steps()
+            );
+        }),
+        Box::new(|| {
+            // The same crash with its word read only at the first attempt (`Unread`
+            // at the exit: a park held the parser, or the prompt came back late —
+            // round three of the joint audit of 2026-10-01): the retry decides on
+            // what that attempt read, the record its relaunch filed naming this TUI.
+            // By then the tab's newest finished block is the relaunched TUI's own,
+            // and read again the crash was dropped `exit-unwitnessed`, nothing typed
+            // and nothing said.
+            let mut rig = Rig::new("exit-late-landed", T2, true, |w| after_crash(w, 137));
+            rig.opts.hand_back = true;
+            rig.kernel.exited.store(true, Ordering::SeqCst);
+            let late = |rig: &Rig| {
+                let snap = crashed_snap(rig, Some(T2), true);
+                after_exit(
+                    &rig.opts,
+                    &snap,
+                    &ExitRecord::Unread,
+                    false,
+                    ExitCause::Exit,
+                    &rig.kernel,
+                )
+                .step
+            };
+            assert_eq!(late(&rig), "adopted");
+            let mut retry = Rig::new("exit-late-retry", T2, true, |w| {
+                after_crash(w, 137);
+                w.blocks2 = blocks_after(1)
+                    .0
+                    .replace(r#""id":7"#, r#""id":9"#)
+                    .replace(r#""id":8"#, r#""id":10"#);
+            });
+            retry.opts.hand_back = true;
+            retry.kernel.exited.store(true, Ordering::SeqCst);
+            save(&retry.opts, &key(TAB), &rig.state());
+            assert_eq!(
+                (late(&retry), retry.typed().len()),
+                ("adopted".to_string(), 1),
+                "relaunched afresh: {:#?}",
+                retry.ledger_steps()
+            );
+        }),
+    ]);
 }
 
 /// TIER-1 of `HarnessCodexExitWitness` (aterm-spec
 /// `harness_codex_exit_witness_model`): EVERY look of the model — a crash
 /// (`exit 137`), its own `/exit` (`exit 0`, its thread lock removed) or
 /// someone's signal (`exit 143`, the lock left, as measured), with the
-/// shell's word drawn or not yet — replayed through the REAL
-/// `look_at_exit` and `exit_record` over a stand-in tab (the lock on disk
-/// as the model has it) and then the REAL `after_exit`: the look keeps
-/// what the model's does (a crash, no crash, or no word within its wait),
-/// and the attempt relaunches (`continued`) exactly where the model's
-/// `Decide` does. NEGATIVE CONTROLS: where the `Buggy = 1` model reads the
-/// lock (`LookAtLock` relaunches someone's signal) or reads silence as a
-/// graceful exit (`LookAsClaude` leaves a crash), the real look reads no
-/// word at all.
+/// shell's word drawn or not yet, or drawn and another command's block
+/// newest since — replayed through the REAL `look_at_exit` and
+/// `exit_record` over a stand-in tab (the lock on disk and the blocks drawn
+/// as the model has them): the look keeps what the model's does (a crash,
+/// no crash, or no word within its wait). And EVERY attempt — what the look
+/// kept, the tab as it stands then — through the REAL `after_exit`, which
+/// relaunches (`continued`) exactly where the model's `Decide` does: a word
+/// that came after the look is read then (round three of the joint audit
+/// of 2026-10-01), never another command's. NEGATIVE CONTROLS: where the
+/// `Buggy = 1` model reads the lock (`LookAtLock` relaunches someone's
+/// signal) or reads silence as a graceful exit (`LookAsClaude` leaves a
+/// crash), the real look reads no word at all; where it decides on the look
+/// alone (`DecideOnLook`, round three's loss) or on the newest block
+/// (`DecideOnNewest`), the real attempt decides otherwise.
 #[test]
 fn tier1_the_real_codex_exit_read_conforms_to_the_model() {
     use crate::harness::relaunch::{ExitCause, ExitRecord, exit_record};
     use std::collections::{BTreeSet, VecDeque};
     let m = aterm_spec::derive::harness_codex_exit_witness_model();
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    // The tab the model's state draws: the TUI's exit status, its word drawn
+    // or not, a later command's block newest (a failure), its lock.
+    let draw = |name: String, exit: i64, word: bool, later: bool, lock: bool| {
+        let status = match exit {
+            1 => 137,
+            2 => 0,
+            _ => 143,
+        };
+        let rig = Rig::new(&name, T2, true, |w| {
+            after_crash(w, status);
+            if !word {
+                w.blocks2 = blocks_after(1).1;
+            } else if later {
+                w.blocks2 = blocks_after(1)
+                    .0
+                    .replace(r#""id":7"#, r#""id":9"#)
+                    .replace(r#""id":8"#, r#""id":10"#)
+                    .replace(r#""exit":0"#, r#""exit":2"#)
+                    .replace(r#""cmdline":"codex""#, r#""cmdline":"make""#);
+            }
+        });
+        rig.kernel.exited.store(true, Ordering::SeqCst);
+        if lock {
+            let locks = rig.tui.home.join("thread-writer-locks");
+            std::fs::write(locks.join(format!("{T2}.lock")), "").expect("the lock on disk");
+        }
+        rig
+    };
+    let kept = |kept: i64| match kept {
+        1 => ExitRecord::Crashed,
+        2 => ExitRecord::Removed,
+        _ => ExitRecord::Unread,
+    };
     let mut seen = BTreeSet::new();
+    let mut attempted = BTreeSet::new();
     let mut queue = VecDeque::from([m.init_state()]);
-    let mut looks = 0;
+    let (mut looks, mut attempts, mut caught) = (0, 0, 0);
     while let Some(st) = queue.pop_front() {
         if !seen.insert(st.clone()) {
             continue;
@@ -4250,82 +4670,109 @@ fn tier1_the_real_codex_exit_read_conforms_to_the_model() {
                 queue.push_back(next);
             }
         }
-        if st["exit"] == 0 || st["seen"] == 1 {
+        if st["exit"] == 0 || st["decided"] > 0 {
             continue;
         }
-        looks += 1;
-        let look = if st["word"] == 1 { "Look" } else { "LookGone" };
-        let mut after = st.clone();
-        assert!(m.fire(look, &mut after), "{look} at {st:?}");
-        let status = match st["exit"] {
-            1 => 137,
-            2 => 0,
-            _ => 143,
-        };
-        let rig = Rig::new(&format!("witness-{looks}"), T2, true, |w| {
-            after_crash(w, status);
-            if st["word"] == 0 {
-                w.blocks2 = blocks_after(1).1;
+        if st["seen"] == 0 {
+            looks += 1;
+            let word = st["word"] == 1;
+            let later = st["later"] == 1;
+            let look = if word && !later { "Look" } else { "LookGone" };
+            let mut after = st.clone();
+            assert!(m.fire(look, &mut after), "{look} at {st:?}");
+            let rig = draw(
+                format!("witness-look-{looks}"),
+                st["exit"],
+                word,
+                later,
+                st["lock"] == 1,
+            );
+            let snap = crashed_snap(&rig, Some(T2), true);
+            let left = exit_record(
+                || Some(look_at_exit(&rig.opts, &snap, &rig.kernel)),
+                |_| true,
+            );
+            assert_eq!(left, kept(after["kept"]), "the look at {st:?}");
+            // Negative controls: the Buggy looks at the same point.
+            if !word {
+                let mut at_lock = st.clone();
+                assert!(buggy.fire("LookAtLock", &mut at_lock));
+                let mut as_claude = st.clone();
+                assert!(buggy.fire("LookAsClaude", &mut as_claude));
+                assert_ne!(at_lock["kept"], 3, "the lock read as a word");
+                assert_eq!(as_claude["kept"], 2, "silence read as a graceful exit");
+                assert_eq!(left, ExitRecord::Unread, "the real look reads no word");
             }
-        });
-        rig.kernel.exited.store(true, Ordering::SeqCst);
-        let snap = crashed_snap(&rig, Some(T2), true);
-        let lock = rig
-            .tui
-            .home
-            .join("thread-writer-locks")
-            .join(format!("{T2}.lock"));
-        if st["lock"] == 1 {
-            std::fs::write(&lock, "").expect("the lock on disk");
+            continue;
         }
-        let left = exit_record(
-            || Some(look_at_exit(&rig.opts, &snap, &rig.kernel)),
-            |_| true,
-        );
-        let want = match after["kept"] {
-            1 => ExitRecord::Crashed,
-            2 => ExitRecord::Removed,
-            _ => ExitRecord::Unread,
+        // An attempt on what the look kept: a word kept reads nothing of the
+        // tab, which stands as the look found it; none kept reads it as it
+        // stands now.
+        let (word, later) = if st["kept"] <= 2 {
+            (true, false)
+        } else {
+            (st["word"] == 1, st["later"] == 1)
         };
-        assert_eq!(left, want, "the look at {st:?}");
-        assert!(m.fire("Decide", &mut after));
-        let r = after_exit(&rig.opts, &snap, &left, false, ExitCause::Exit, &rig.kernel);
-        assert_eq!(
-            r.step == "continued",
-            after["decided"] == 1,
-            "the attempt at {after:?}: {r:?}"
+        if !attempted.insert((st["exit"], st["kept"], word, later)) {
+            continue;
+        }
+        attempts += 1;
+        let mut after = st.clone();
+        assert!(m.fire("Decide", &mut after), "Decide at {st:?}");
+        let rig = draw(
+            format!("witness-attempt-{attempts}"),
+            st["exit"],
+            word,
+            later,
+            st["lock"] == 1,
         );
-        // NEGATIVE CONTROLS: the Buggy looks at the same point.
-        if st["word"] == 0 {
-            let mut at_lock = st.clone();
-            assert!(buggy.fire("LookAtLock", &mut at_lock));
-            let mut as_claude = st.clone();
-            assert!(buggy.fire("LookAsClaude", &mut as_claude));
-            assert_ne!(at_lock["kept"], 3, "the lock read as a word");
-            assert_eq!(as_claude["kept"], 2, "silence read as a graceful exit");
-            assert_eq!(left, ExitRecord::Unread, "the real look reads no word");
+        let snap = crashed_snap(&rig, Some(T2), true);
+        let r = after_exit(
+            &rig.opts,
+            &snap,
+            &kept(st["kept"]),
+            false,
+            ExitCause::Exit,
+            &rig.kernel,
+        );
+        let relaunched = r.step == "continued";
+        assert_eq!(
+            relaunched,
+            after["decided"] == 1,
+            "the attempt at {st:?}: {r:?}"
+        );
+        // Negative controls: the Buggy attempts where they decide otherwise.
+        for mutant in ["DecideOnLook", "DecideOnNewest"] {
+            let mut wrong = st.clone();
+            if buggy.fire(mutant, &mut wrong) && wrong["decided"] != after["decided"] {
+                assert_ne!(relaunched, wrong["decided"] == 1, "{mutant} at {st:?}");
+                caught += 1;
+            }
         }
     }
-    // A crash, its own exit and someone's signal, each told and untold.
-    assert_eq!(looks, 6, "{seen:?}");
+    // A crash, its own exit and someone's signal, each told, untold, and
+    // told with another command run since.
+    assert_eq!(looks, 9, "{seen:?}");
+    // What the look kept, and — none kept — the tab at the attempt.
+    assert_eq!((attempts, caught), (12, 4), "{seen:?}");
 }
 
 /// The exit's word is the shell's: the finished block that ends where the
-/// entering prompt begins, its `exit` — none while the prompt is not back,
-/// none for an older block; and a crash is every status but the TUI's own
-/// `0` and someone's HUP/INT/TERM.
+/// entering prompt begins, its `exit` (none while the prompt is not back,
+/// none for an older block); a crash is every status but the TUI's own `0`
+/// and someone's HUP/INT/TERM.
 #[test]
 fn the_codex_exit_is_read_off_its_command_block() {
     let (b2, _) = blocks_after(1);
-    assert_eq!(parse_exit_status("OK", &b2), Some(0));
+    assert_eq!(parse_exit_status("OK", &b2, None), Some(0));
     let killed = b2.replace(r#""exit":0"#, r#""exit":137"#);
-    assert_eq!(parse_exit_status("OK", &killed), Some(137));
+    assert_eq!(parse_exit_status("OK", &killed, None), Some(137));
     // No entering prompt yet, an older block, an ERR: no word.
     let (_, entering_only) = blocks_after(1);
-    assert_eq!(parse_exit_status("OK", &entering_only), None);
+    assert_eq!(parse_exit_status("OK", &entering_only, None), None);
     let older = b2.replace(r#""end":4"#, r#""end":3"#);
-    assert_eq!(parse_exit_status("OK", &older), None);
-    assert_eq!(parse_exit_status("ERR no such session", ""), None);
+    assert_eq!(parse_exit_status("OK", &older, None), None);
+    assert_eq!(parse_exit_status("ERR no such session", "", None), None);
     for (exit, crashed) in [
         (0, false),
         (129, false),
@@ -4341,15 +4788,14 @@ fn the_codex_exit_is_read_off_its_command_block() {
     }
 }
 
-/// A DAEMON-MODE CLIENT that named no thread is resumed on the ONE thread its
+/// A daemon-mode client that named no thread is resumed on the one thread its
 /// daemon holds that was begun in its directory after it started (UUIDv7
-/// ids). NEGATIVE CONTROLS: one begun before it started, or elsewhere, is
-/// not it (nothing to resume: `Ok(None)`); two that fit are never guessed
-/// between; ANOTHER live client of the daemon in the same directory (the
-/// review of 2026-09-27: a second Codex tab in the repository that messaged
-/// first) makes the one thread that fits no answer — it may be that
-/// client's — and so does one whose directory cannot be read, or clients
-/// that cannot be listed; and with no daemon to read, nothing is told.
+/// ids). Negative controls: one begun before it started, or elsewhere, is not
+/// it (`Ok(None)`); two that fit are never guessed between; another live
+/// client of the daemon in the same directory makes the one thread that fits
+/// no answer (it may be that client's), as does one whose directory cannot be
+/// read, or clients that cannot be listed; with no daemon to read, nothing is
+/// told.
 #[test]
 fn a_daemon_clients_thread_is_the_one_its_daemon_began_for_it() {
     let (_dir, _opts, mut k, _target) = daemon_home("daemon-thread", IDLE_LAST, 60);
@@ -4374,7 +4820,7 @@ fn a_daemon_clients_thread_is_the_one_its_daemon_began_for_it() {
         daemon_thread(&home, "/w", born - 500, ME, &k),
         Ok(Some(T1.to_string()))
     );
-    // NEGATIVE CONTROLS: another client in the same directory, one whose
+    // Negative controls: another client in the same directory, one whose
     // directory is unreadable, clients that cannot be listed.
     k.cwds[1].1 = "/w".to_string();
     assert_eq!(
@@ -4392,7 +4838,7 @@ fn a_daemon_clients_thread_is_the_one_its_daemon_began_for_it() {
         Err("clients-unreadable")
     );
     k.clients = Some(vec![ME]);
-    // NEGATIVE CONTROLS: begun before the client started, or elsewhere.
+    // Negative controls: begun before the client started, or elsewhere.
     assert_eq!(daemon_thread(&home, "/w", born + 5_000, ME, &k), Ok(None));
     assert_eq!(
         daemon_thread(&home, "/elsewhere", born - 500, ME, &k),
@@ -4425,4 +4871,1055 @@ fn a_daemon_clients_thread_is_the_one_its_daemon_began_for_it() {
         daemon_thread(&home, "/w", born - 500, ME, &k),
         Err("no-daemon")
     );
+}
+
+// ---------------------------------------------------------------- the prune
+
+/// Opts for a prune over `dir`'s state, nothing live about it.
+fn prune_opts(dir: &Path) -> Opts {
+    Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: None,
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: false,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+    }
+}
+
+/// `st` filed as `opts`'s record `name`, last written `ago` seconds before now.
+fn filed_as(opts: &Opts, name: &str, st: &St, ago: u64) -> PathBuf {
+    save(opts, name, st);
+    let path = state_dir(opts).join(format!("{name}.json"));
+    let when = std::time::SystemTime::now() - Duration::from_secs(ago);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(when))
+        .expect("mtime");
+    path
+}
+
+/// A Codex record of `tab` in `phase` (with the owner's `request`), filed as
+/// `codex-<tab>.json` and last written `ago` seconds before now.
+fn filed(opts: &Opts, tab: &str, phase: Phase, request: Request, ago: u64) -> PathBuf {
+    let st = St {
+        agent: Agent::Codex,
+        tab: tab.to_string(),
+        phase,
+        request,
+        from: "0.157.0".to_string(),
+        to: "0.158.0".to_string(),
+        ..St::default()
+    };
+    filed_as(opts, &key(tab), &st, ago)
+}
+
+/// A rendezvous registry under `dir` naming `live` (`graph/<sid>`, the
+/// entries `aterm-gui`'s `proxy::write_graph_entry` writes).
+fn registry(dir: &Path, live: &[&str]) -> PathBuf {
+    let graph = dir.join("run").join("aterm").join("graph");
+    std::fs::create_dir_all(&graph).expect("graph");
+    for sid in live {
+        std::fs::write(graph.join(sid), "sock /x/aterm-1.sock\nnonce 00\npid 1\n").expect("entry");
+    }
+    graph
+}
+
+/// A record's projection onto `HarnessUpgradeStateCollection`, from what the
+/// test set up (never from the code under test): its tab alive or proven
+/// gone, its round's stage, whether its week has passed. `aged` stays at its
+/// initial 0: `Prune`'s guard never reads it.
+fn collection_state(
+    model: &aterm_spec::derive::Model,
+    tab_lives: bool,
+    phase: &Phase,
+    request: &Request,
+    week_old: bool,
+) -> aterm_spec::interp::State {
+    let mut s = model.init_state();
+    let stage = match phase {
+        Phase::Exiting { .. } | Phase::Relaunched { .. } => 1,
+        Phase::Done | Phase::Failed(_) => 2,
+        Phase::Pending if *request == Request::None => 2,
+        _ => 0,
+    };
+    s.insert("tab", i64::from(tab_lives));
+    s.insert("stage", stage);
+    s.insert("old", i64::from(week_old));
+    s.insert("kept", 1);
+    s
+}
+
+/// One pass's decision on one record held to `Prune`'s guard, both ways: a
+/// removal the model does not allow breaks safety, and a record the model
+/// lets go that a pass with a clean reading kept breaks the prune's weak
+/// fairness (every such pass takes it). After a removal every invariant
+/// holds.
+fn collection_conforms(
+    model: &aterm_spec::derive::Model,
+    before: &aterm_spec::interp::State,
+    removed: bool,
+) -> Result<(), String> {
+    let enabled = model.action_enabled("Prune", before);
+    if removed != enabled {
+        return Err(format!(
+            "the real prune {} a record the model {}: {before:?}",
+            if removed { "removed" } else { "kept" },
+            if enabled { "lets go" } else { "keeps" }
+        ));
+    }
+    if removed {
+        let mut after = before.clone();
+        assert!(model.fire("Prune", &mut after));
+        for inv in &model.invariants {
+            if !model.check_invariant(inv.name, &after) {
+                return Err(format!(
+                    "`{}` broken after the removal: {after:?}",
+                    inv.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tier-1: the real `prune`, reading the real registry over records on disk,
+/// bound to the derived `HarnessUpgradeStateCollection`. A closed tab's
+/// settled record goes once it has sat a week (done, failed, or pending with
+/// no word of the owner's), and nothing else does. Negative controls: a live
+/// tab's record (the host's own, and another window's that only the registry
+/// names) and a restart in flight survive, however old; the model's
+/// `PruneLiveTab` member would take the live one; and the Claude-only
+/// `prune_states` is caught keeping a record the model lets go.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
+    const HERE: &str = "s-0a0a0a0a0a0a"; // the host's own live tab
+    const THERE: &str = "s-0b0b0b0b0b0b"; // another window's: the registry alone names it
+    let old = super::super::STATE_KEEP_S + 3_600;
+    let model = aterm_spec::derive::harness_upgrade_state_collection_model();
+    let dir = scratch("codex-prune");
+    let opts = prune_opts(&dir);
+    let graph = registry(&dir, &[HERE, THERE]);
+    let known_live = vec![HERE.to_string()];
+
+    // (tab, its tab lives, phase, the owner's word, sat a week, removed?)
+    let skip = || Request::Skip("0.158.0".to_string());
+    let failed = |why: &str| Phase::Failed(why.to_string());
+    let none = || Request::None;
+    #[rustfmt::skip]
+    let cases: Vec<(&str, bool, Phase, Request, bool, bool)> = vec![
+        ("s-dead00000001", false, Phase::Done,                         none(), true,  true),
+        ("s-dead00000002", false, failed("unanswered"),                none(), true,  true),
+        ("s-dead00000003", false, Phase::Pending,                      none(), true,  true),
+        (HERE,             true,  Phase::Done,                         none(), true,  false),
+        (THERE,            true,  failed("no-resume"),                 none(), true,  false),
+        ("s-dead00000004", false, Phase::Exiting { at_s: 5 },          none(), true,  false),
+        ("s-dead00000005", false, Phase::Relaunched { at_s: 5 },       none(), true,  false),
+        ("s-dead00000006", false, Phase::Announced { at_s: 5, asks: 1 }, none(), true, false),
+        ("s-dead00000007", false, Phase::Pending,                      skip(), true,  false),
+        ("s-dead00000008", false, Phase::Done,                         none(), false, false),
+    ];
+    let paths: Vec<PathBuf> = cases
+        .iter()
+        .map(|(tab, _, phase, request, week_old, _)| {
+            let ago = if *week_old { old } else { 0 };
+            filed(&opts, tab, phase.clone(), request.clone(), ago)
+        })
+        .collect();
+    // Beside them, outside the model's projection and never the Codex
+    // prune's: a Claude record filed under a Codex name, a Codex record whose
+    // name and tab disagree, a Claude conversation's record, and a file that
+    // is no record.
+    let done = |agent: Agent, tab: &str| St {
+        agent,
+        tab: tab.to_string(),
+        phase: Phase::Done,
+        ..St::default()
+    };
+    let strangers = [
+        filed_as(
+            &opts,
+            &key("s-dead00000009"),
+            &done(Agent::Claude, "s-dead00000009"),
+            old,
+        ),
+        filed_as(
+            &opts,
+            &key("s-dead0000000a"),
+            &done(Agent::Codex, "s-dead0000000b"),
+            old,
+        ),
+        filed_as(
+            &opts,
+            "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            &done(Agent::Claude, ""),
+            old,
+        ),
+    ];
+    let models = state_dir(&opts).join("models.json");
+    std::fs::write(&models, "{}").expect("models");
+    let now = now_s();
+
+    // Nothing proves a tab gone, so nothing goes: a pass that knows no live
+    // tab, a registry missing a tab the pass knows is live (another runtime
+    // directory), no registry at all, a dry run, and a break of the agent's
+    // background work, whatever they read.
+    let unvouched = ["s-0c0c0c0c0c0c".to_string()];
+    prune(&opts, now, registry_life(Some(&graph), &[]));
+    prune(&opts, now, registry_life(Some(&graph), &unvouched));
+    prune(&opts, now, registry_life(None, &known_live));
+    for quiet in [
+        Opts {
+            dry_run: true,
+            ..prune_opts(&dir)
+        },
+        Opts {
+            background: true,
+            ..prune_opts(&dir)
+        },
+    ] {
+        prune(&quiet, now, registry_life(Some(&graph), &known_live));
+    }
+    assert!(
+        paths.iter().chain(&strangers).all(|p| p.exists()) && models.exists(),
+        "nothing proven gone, nothing gone"
+    );
+    let life = registry_life(Some(&graph), &known_live);
+    assert_eq!(life(HERE), TabLife::Live, "the pass saw it live");
+    assert_eq!(life(THERE), TabLife::Live, "the registry names it");
+    assert_eq!(life("s-dead00000001"), TabLife::Gone);
+    for odd in ["s-../../etc", "s-", "t-0a0a", "s-dead/0a0a"] {
+        assert_eq!(life(odd), TabLife::Unknown, "{odd} is no tab id");
+    }
+    assert_eq!(
+        registry_life(Some(&graph), &unvouched)("s-dead00000001"),
+        TabLife::Unknown,
+        "a registry that misses a live tab vouches for nothing"
+    );
+
+    // The Claude-only prune keeps a closed tab's settled week-old Codex
+    // record, which the model lets go.
+    super::super::prune_states(&opts, &[], now);
+    let dead_done = collection_state(&model, false, &Phase::Done, &Request::None, true);
+    assert!(paths[0].exists(), "the Claude lane passes Codex records by");
+    assert!(
+        collection_conforms(&model, &dead_done, !paths[0].exists()).is_err(),
+        "the bind catches the lane that kept it for ever"
+    );
+    // (It took the settled Claude records: those are its own.)
+    assert!(!strangers[0].exists() && !strangers[2].exists());
+    // So the Claude record under a Codex name the Codex pass must pass by is
+    // filed again here, after the Claude lane took the first: settled, a week
+    // old, its tab proven gone, everything but a Codex record.
+    let claude_under_codex = filed_as(
+        &opts,
+        &key("s-dead0000000c"),
+        &done(Agent::Claude, "s-dead0000000c"),
+        old,
+    );
+
+    // The pass.
+    let befores: Vec<_> = cases
+        .iter()
+        .map(|(_, lives, phase, request, week_old, _)| {
+            collection_state(&model, *lives, phase, request, *week_old)
+        })
+        .collect();
+    prune(&opts, now, registry_life(Some(&graph), &known_live));
+    for ((case, before), path) in cases.iter().zip(&befores).zip(&paths) {
+        let removed = !path.exists();
+        assert_eq!(
+            removed, case.5,
+            "{} {:?}: removed={removed}",
+            case.0, case.2
+        );
+        collection_conforms(&model, before, removed)
+            .unwrap_or_else(|why| panic!("{} {:?}: {why}", case.0, case.2));
+    }
+    assert!(
+        strangers[1].exists(),
+        "a record whose name and tab disagree"
+    );
+    assert!(
+        claude_under_codex.exists(),
+        "a Claude record is never the Codex prune's, whatever its name"
+    );
+    assert!(
+        models.exists(),
+        "a file that is no record is not the prune's"
+    );
+
+    // Negative controls: the live tabs' records and the restarts in flight
+    // survive, and the model's `PruneLiveTab` member would take a live one.
+    assert!(
+        paths[3].exists() && paths[4].exists(),
+        "live tabs' records stay"
+    );
+    assert!(
+        paths[5].exists() && paths[6].exists(),
+        "restarts in flight stay"
+    );
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    assert!(buggy.action_enabled("PruneLiveTab", &befores[3]));
+    assert!(!model.action_enabled("Prune", &befores[3]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A registry speaks only for its own state root: the prune reads the
+/// rendezvous registry only when it and the state root are both the person's
+/// defaults or both private. A private runtime directory over the default
+/// state root (a private instance with the person's `$HOME` and no state root
+/// of its own) reads none of the person's tabs and would call each one gone.
+#[test]
+fn a_registry_vouches_only_for_a_state_root_of_its_own_kind() {
+    for (private_registry, private_state, vouches) in [
+        (false, false, true),
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        assert_eq!(
+            registry_vouches_for_state(private_registry, private_state),
+            vouches,
+            "registry private = {private_registry}, state private = {private_state}"
+        );
+    }
+}
+
+// ------------------------------------------------------------ the usage wall
+
+/// A real Codex screen at a usage wall (`aterm_phase::codex::fixtures`,
+/// 0.159.2) as the stand-in serves it: its rows, the cursor at the composer's
+/// caret, column 2, where 0.159.2 draws the placeholder.
+fn measured_screen(text: &str, seq: u64) -> String {
+    served_screen(&aterm_phase::prompt::fixtures::screen(text), seq)
+}
+
+/// `rows` as the stand-in serves a Codex screen: the cursor at the composer's
+/// caret, column 2.
+fn served_screen(rows: &[String], seq: u64) -> String {
+    let caret = aterm_phase::codex::composer(rows).expect("the screen's composer");
+    let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+    screen_json(&refs, (caret, 2), seq)
+}
+
+/// The rows of a usage wall's block on a screen: from its `■` to the blank
+/// row under it.
+fn wall_block(rows: &[String], what: &str) -> std::ops::Range<usize> {
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with('■'))
+        .unwrap_or_else(|| panic!("{what}: a wall block"));
+    let end = (at..rows.len())
+        .find(|&i| rows[i].trim().is_empty())
+        .unwrap_or_else(|| panic!("{what}: a blank row under the wall block"));
+    at..end
+}
+
+/// `rows` with the wall's block dropped and nothing else touched: the same
+/// screen once the wall is gone, which is what every negative control below
+/// is made of.
+fn block_gone(rows: &[String], what: &str) -> Vec<String> {
+    let mut gone = rows.to_vec();
+    gone.drain(wall_block(rows, what));
+    gone
+}
+
+/// [`measured_screen`] of the wall screen `text` with its block gone.
+fn measured_screen_block_gone(text: &str, what: &str, seq: u64) -> String {
+    let rows = aterm_phase::prompt::fixtures::screen(text);
+    served_screen(&block_gone(&rows, what), seq)
+}
+
+/// The three panes the wall is fixtured mid-turn in, its row wrapped after
+/// `purchase more`, after `or try again`, and not at all.
+const WALL_MID_TURN: [(&str, &str); 3] = [
+    (
+        aterm_phase::codex::fixtures::WALL_MID_TURN_100X30_0_159,
+        "100 columns",
+    ),
+    (
+        aterm_phase::codex::fixtures::WALL_MID_TURN_0_159,
+        "120 columns",
+    ),
+    (
+        aterm_phase::codex::fixtures::WALL_MID_TURN_160X50_0_159,
+        "160 columns",
+    ),
+];
+
+/// The two wall screens once the live upgrade's notice was typed as a turn:
+/// the turn's own end, and `codex resume` redrawing it.
+const WALL_AT_THE_NOTICE: [(&str, &str); 2] = [
+    (
+        aterm_phase::codex::fixtures::WALL_AFTER_NOTICE_0_159,
+        "after the notice's turn",
+    ),
+    (
+        aterm_phase::codex::fixtures::WALL_RESUMED_0_159,
+        "redrawn by codex resume",
+    ),
+];
+
+/// The round's READY marker.
+const READY: &str = "ATERM-UPGRADE-READY-0badf00d";
+
+/// The turn `user` typed ended on the usage wall, as 0.159.2 writes it to the
+/// rollout (ids dropped): the turn starts, the message is its user's, and it
+/// completes carrying the wall's error.
+fn walled_rollout(rig: &Rig, user: &str) {
+    let user = aterm_json::to_string(&aterm_json::Value::from(user)).expect("text");
+    let mut text = std::fs::read_to_string(&rig.rollout).expect("rollout");
+    for line in [
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"2"}}"#.to_string(),
+        format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":{user}}}]}}}}"#
+        ),
+        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"2","last_agent_message":null,"error":{"message":"You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.","codex_error_info":"usage_limit_exceeded"}}}"#.to_string(),
+    ] {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    std::fs::write(&rig.rollout, text).expect("rollout");
+    age(&rig.rollout);
+}
+
+/// The notice the round types, as the rollout of a conversation it met the
+/// wall in holds it.
+fn notice_text() -> String {
+    cx::prepare_prompt(&v("0.157.0"), &v("0.157.1"), READY)
+}
+
+/// A round announced `ago_s` seconds back, on its `asks`-th notice.
+fn announced_ago(rig: &Rig, ago_s: u64, asks: u32) -> St {
+    St {
+        phase: Phase::Announced {
+            at_s: now_s() - ago_s,
+            asks,
+        },
+        marker: READY.into(),
+        ..rig.state()
+    }
+}
+
+/// What the limit fact ([`upgrade::limited`]) says of one wall screen, and of
+/// its controls: the wall screen `text` reads limited and reads no login
+/// wall; the same screen with its block gone does not read limited; and the
+/// same screen with the block naming a wall that is no limit (a full context,
+/// a busy model) does not either, though the same reader reads it as a wall.
+fn assert_the_wall_reads_limited_and_only_it_does(text: &str, what: &str) {
+    let rows = aterm_phase::prompt::fixtures::screen(text);
+    assert!(upgrade::limited(Agent::Codex, &rows), "{what}");
+    assert!(!upgrade::login_wall(Agent::Codex, &rows), "{what}");
+    let gone = block_gone(&rows, what);
+    assert!(!upgrade::limited(Agent::Codex, &gone), "{what}: block gone");
+    for other in [
+        "■ Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+        "■ Selected model is at capacity. Please try a different model.",
+    ] {
+        let mut swapped = rows.clone();
+        swapped.splice(wall_block(&rows, what), [other.to_string()]);
+        assert!(
+            aterm_phase::codex::wall(&swapped).is_some(),
+            "{what}: the reader still reads a wall: {other}"
+        );
+        assert!(!upgrade::limited(Agent::Codex, &swapped), "{what}: {other}");
+    }
+}
+
+/// The usage wall of a real Codex is the limit fact ([`upgrade::limited`],
+/// which [`Facts::limited`] is read from): 0.159.2's `■ You’ve hit your usage
+/// limit …` block as the last thing on the screen (after a turn that ran a
+/// command, after a notice typed as a turn, redrawn by `codex resume`) in
+/// every pane. Negative controls: the fresh idle screen; each wall screen
+/// with its block gone; and each wall screen with the block naming a wall
+/// that is no limit (a full context, a busy model), which the same reader
+/// reads as a wall and the limit fact does not. All six screens come from a
+/// loopback 429 and wear the wording that names no reset; the other wording
+/// is [`the_usage_wall_of_an_earlier_codex_reads_limited_with_and_without_a_reset`].
+#[test]
+fn the_usage_wall_of_a_real_codex_reads_limited_on_every_screen_it_was_measured_on() {
+    use aterm_phase::codex::fixtures as fx;
+    for (text, what) in WALL_MID_TURN.iter().chain(WALL_AT_THE_NOTICE.iter()) {
+        assert_the_wall_reads_limited_and_only_it_does(text, what);
+    }
+    let idle = aterm_phase::prompt::fixtures::screen(fx::IDLE_0_159);
+    assert!(!upgrade::limited(Agent::Codex, &idle), "the idle control");
+}
+
+/// The usage wall reads limited whether or not it names a reset, on two
+/// earlier screens: 0.157.1's real `HIT_LIMIT_NO_RESET` (a loopback 429: `try
+/// again later`), and 0.156.1's `HIT_LIMIT`, hand-built from the binary's
+/// strings (the Pro plan's text, `try again at Sep 25th, 2026 3:05 PM.`,
+/// wrapped to column 0), since no real reset-bearing wall was captured. The
+/// visit-level tests run on the 0.159.2 panes alone; the gate they pin is
+/// this fact, so it must not depend on the reset. The same controls as the
+/// 0.159.2 test.
+#[test]
+fn the_usage_wall_of_an_earlier_codex_reads_limited_with_and_without_a_reset() {
+    use aterm_phase::codex::fixtures as fx;
+    for (text, what, reset) in [
+        (
+            fx::HIT_LIMIT_NO_RESET,
+            "0.157.1, measured, no reset named",
+            false,
+        ),
+        (fx::HIT_LIMIT, "0.156.1, hand-built, a reset named", true),
+    ] {
+        assert_the_wall_reads_limited_and_only_it_does(text, what);
+        let rows = aterm_phase::prompt::fixtures::screen(text);
+        let wall = aterm_phase::codex::wall(&rows).expect(what);
+        assert_eq!(wall.reset.is_some(), reset, "{what}: {wall:?}");
+    }
+}
+
+/// A round whose notice was typed as a turn that the wall ended, the rollout
+/// carrying that walled turn and the tab showing `screen`: what the sweep's
+/// own earlier ticks leave, its screen quiet for a minute.
+fn walled_notice_round(name: &str, screen: String) -> Rig {
+    let rig = Rig::new(name, T2, true, |w| w.before = screen);
+    walled_rollout(&rig, &notice_text());
+    rig.settle(10);
+    rig
+}
+
+/// An embedded conversation announced whose READY was answered, and settled,
+/// hours ago, the tab coming to show `screen` at the next look.
+fn ready_hours_ago_showing(name: &str, screen: String) -> Rig {
+    let rig = embedded_ready(name, |_| {});
+    rig.settle_keeping(&St {
+        ready_since: now_s() - 3 * upgrade::REASK_S,
+        ..rig.state()
+    });
+    *rig.shows.lock().expect("shows") = Some(screen);
+    rig
+}
+
+/// A quiet Codex (`upgrade_ask` off: nothing asked, the `/exit` alone is the
+/// move) showing `screen`, the rollout carrying a walled turn.
+fn quiet_showing(name: &str, screen: String) -> Rig {
+    let mut quiet = Rig::new(name, T2, true, |w| w.before = screen);
+    quiet.opts.ask = false;
+    walled_rollout(&quiet, &notice_text());
+    quiet.settle(10);
+    quiet
+}
+
+/// A Codex at its usage wall is never asked or re-asked, and its clocks hold:
+/// what Codex takes typed at the wall is a turn that fails and stays in
+/// history, so a notice per re-ask window would all arrive together, unread,
+/// when the limit resets. The screen ([`Facts::limited`]) keeps them out: a
+/// pending round in every pane types nothing; a round announced hours ago,
+/// on each of its [`upgrade::MAX_ASKS`] asks, waits `limited` (no re-ask, no
+/// give-up, no key), and its re-ask window is restarted at every look, so
+/// the agent gets the whole of it once a turn gets past the wall. The
+/// screen's word has no end here: the `■` block stays the last block until a
+/// turn goes through (a person's, or the supervise loop's continue at the
+/// reset). These screens name no reset and this is the ask flow, so nothing
+/// lifts the wait; the one bound is the quiet upgrade's grace, which lifts a
+/// wall that names its reset an hour after it (class C9 of
+/// `docs/DESIGN-upgrade-never-stuck-2026-09-28.md`; pinned in
+/// `upgrade_codex_limit_tests.rs`). Negative controls: the same rounds on the
+/// wall's own screens with the block gone (the block the only difference)
+/// type the notice, ask again on each ask and give up on the last; and a
+/// fresh screen with no wall.
+#[test]
+fn a_codex_at_its_usage_wall_is_never_asked_or_re_asked_and_its_clocks_hold() {
+    for (text, what) in WALL_MID_TURN {
+        let rig = Rig::new("wall-pending", T2, true, |w| {
+            w.before = measured_screen(text, 10);
+        });
+        walled_rollout(&rig, "TOOLTHEN429 please");
+        rig.settle(10);
+        let r = rig.visit(None);
+        assert_eq!(r.step, "wait:limited", "{what}: {r:?}");
+        assert_eq!(rig.state().phase, Phase::Pending, "{what}");
+        assert!(rig.typed().is_empty(), "{what}: {:?}", rig.typed());
+        assert!(keys(&rig).is_empty(), "{what}: {:?}", keys(&rig));
+        // Control: this pane, this rollout, the block gone.
+        let gone = Rig::new("wall-pending-gone", T2, true, |w| {
+            w.before = measured_screen_block_gone(text, what, 10);
+        });
+        walled_rollout(&gone, "TOOLTHEN429 please");
+        gone.settle(10);
+        let r = gone.visit(None);
+        assert_eq!(r.step, "announced:1", "{what}: block gone: {r:?}");
+        assert_eq!(gone.typed().len(), 1, "{what}: block gone: the notice");
+    }
+    for (text, what) in WALL_AT_THE_NOTICE {
+        let rig = walled_notice_round("wall-announced", measured_screen(text, 10));
+        for asks in 1..=upgrade::MAX_ASKS {
+            rig.settle_keeping(&announced_ago(&rig, 3 * upgrade::REASK_S, asks));
+            let r = rig.visit(None);
+            assert_eq!(r.step, "wait:limited", "{what}: asks {asks}: {r:?}");
+            assert!(rig.typed().is_empty(), "{what}: {:?}", rig.typed());
+            assert!(keys(&rig).is_empty(), "{what}: {:?}", keys(&rig));
+            match rig.state().phase {
+                Phase::Announced { at_s, asks: kept } => {
+                    assert_eq!(kept, asks, "{what}: no ask spent");
+                    assert!(
+                        now_s().saturating_sub(at_s) < 5,
+                        "{what}: the window restarted at this look, not {}s ago",
+                        now_s().saturating_sub(at_s)
+                    );
+                }
+                p => panic!("{what}: asks {asks}: {p:?}"),
+            }
+        }
+        // Control: this screen, this rollout, the block gone — every ask
+        // spent, in order, and the last one given up on.
+        let gone = walled_notice_round(
+            "wall-announced-gone",
+            measured_screen_block_gone(text, what, 10),
+        );
+        for asks in 1..=upgrade::MAX_ASKS {
+            gone.settle_keeping(&announced_ago(&gone, 3 * upgrade::REASK_S, asks));
+            let r = gone.visit(None);
+            if asks < upgrade::MAX_ASKS {
+                assert_eq!(
+                    r.step,
+                    format!("announced:{}", asks + 1),
+                    "{what}: block gone: asks {asks}: {r:?}"
+                );
+                assert_eq!(
+                    gone.typed().len(),
+                    asks as usize,
+                    "{what}: block gone: asks {asks}: one notice per ask"
+                );
+            } else {
+                assert_eq!(r.step, "gave-up", "{what}: block gone: asks {asks}: {r:?}");
+                assert_eq!(
+                    gone.typed().len(),
+                    (upgrade::MAX_ASKS - 1) as usize,
+                    "{what}: block gone: the last ask given up on, not repeated"
+                );
+            }
+        }
+    }
+    // Controls: a screen with no wall, the same rounds.
+    let clear = Rig::new("wall-clear", T2, true, |_| {});
+    clear.settle(10);
+    assert_eq!(clear.visit(None).step, "announced:1");
+    assert_eq!(clear.typed().len(), 1, "the pending round types its notice");
+    clear.settle_keeping(&announced_ago(&clear, upgrade::REASK_S + 5, 1));
+    assert_eq!(clear.visit(None).step, "announced:2");
+    assert_eq!(clear.typed().len(), 2, "the window run out: asked again");
+    clear.settle_keeping(&announced_ago(
+        &clear,
+        upgrade::REASK_S + 5,
+        upgrade::MAX_ASKS,
+    ));
+    assert_eq!(clear.visit(None).step, "gave-up");
+    assert_eq!(
+        clear.typed().len(),
+        2,
+        "the last ask given up on, not repeated"
+    );
+}
+
+/// A Codex at its usage wall is never exited, asked or not: the restart would
+/// drop the vendor's own wait and resume into the wall, so the gate every
+/// restart passes ([`upgrade::gate_restart`], the reducer's `quiet_step`)
+/// waits `limited` first, before READY, the ladder's settle or the owner's
+/// notice. Asked (`upgrade_ask`): a notice typed, its READY answered and
+/// settled, the wall on the screen: no `/exit`, no relaunch, and the READY's
+/// clock restarted at the look. Quiet (the default): the same wall types
+/// nothing at all. This also keeps [`carry_on`] off a wall in practice: a
+/// relaunched Codex replays a wall only where one came up between the last
+/// look and the `/exit`. Negative controls: each lane on the wall's own
+/// screen with the block gone (the block the only difference) moves, the
+/// asked one to `continued`, the quiet one to its `/exit`, as does each on a
+/// fresh screen with no wall.
+#[test]
+fn a_codex_at_its_usage_wall_is_not_exited_whether_it_was_asked_or_not() {
+    // Ten rigs of their own, the moving ones each waiting out a relaunch's
+    // fixed waits (the shell's prompt, the new TUI's first idle): side by
+    // side (3.7 s one after another, measured 2026-10-05).
+    let mut cases: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+    for (text, what) in WALL_AT_THE_NOTICE {
+        // Asked: the notice went out on a clear screen and was answered, hours
+        // ago; the wall is what the tab shows at the next look.
+        cases.push(Box::new(move || {
+            let rig = ready_hours_ago_showing("wall-ready", measured_screen(text, 10));
+            let r = rig.visit(None);
+            assert_eq!(r.step, "wait:limited", "{what}: {r:?}");
+            assert_eq!(rig.typed().len(), 1, "{what}: the notice, no `/exit`");
+            assert!(!rig.asked().iter().any(|l| l.contains("signal")), "{what}");
+            assert!(
+                now_s().saturating_sub(rig.state().ready_since) < 5,
+                "{what}: the READY's clock restarted at this look: {}",
+                rig.state().ready_since
+            );
+        }));
+        // Quiet: nothing asked, the exit alone is the move.
+        cases.push(Box::new(move || {
+            let quiet = quiet_showing("wall-quiet", measured_screen(text, 10));
+            let r = quiet.visit(None);
+            assert_eq!(r.step, "wait:limited", "{what}: {r:?}");
+            assert!(quiet.typed().is_empty(), "{what}: {:?}", quiet.typed());
+            assert!(keys(&quiet).is_empty(), "{what}: {:?}", keys(&quiet));
+        }));
+        // Controls: the same two lanes, the block gone.
+        cases.push(Box::new(move || {
+            let gone = ready_hours_ago_showing(
+                "wall-ready-gone",
+                measured_screen_block_gone(text, what, 10),
+            );
+            let r = gone.visit(None);
+            assert_eq!(r.step, "continued", "{what}: block gone: {r:?}");
+            assert_eq!(
+                gone.typed().len(),
+                4,
+                "{what}: block gone: notice, /exit, relaunch, continuation: {:?}",
+                gone.typed()
+            );
+        }));
+        cases.push(Box::new(move || {
+            let quiet = quiet_showing(
+                "wall-quiet-gone",
+                measured_screen_block_gone(text, what, 10),
+            );
+            quiet.visit(None);
+            assert!(
+                quiet.typed().iter().any(|l| l.ends_with(" /exit")),
+                "{what}: block gone: the quiet lane's `/exit`: {:?}",
+                quiet.typed()
+            );
+        }));
+    }
+    // Controls: the same two lanes with no wall on the screen.
+    cases.push(Box::new(|| {
+        let clear = embedded_ready("wall-ready-clear", |_| {});
+        assert_eq!(clear.visit(None).step, "continued");
+    }));
+    cases.push(Box::new(|| {
+        let mut quiet = Rig::new("wall-quiet-clear", T2, true, |_| {});
+        quiet.opts.ask = false;
+        quiet.settle(10);
+        quiet.visit(None);
+        assert!(
+            quiet.typed().iter().any(|l| l.ends_with(" /exit")),
+            "the quiet lane's `/exit`: {:?}",
+            quiet.typed()
+        );
+    }));
+    super::super::tests::side_by_side(cases);
+}
+
+/// A CRASHED CODEX IS RELAUNCHED ON ITS OWN PROGRAM WHILE THE OWNER'S WORD
+/// HOLDS THE MANAGED BUILD (round eight, #24, the Codex half): a `Skip` of
+/// that build, or a `Not today` standing, kept the visit off it but not the
+/// relaunch on exit, which moved the crashed Codex straight onto it.
+/// NEGATIVE CONTROLS: no word, a deferral run out, a skip of another build
+/// and `--now` move it; `[harness] upgrade = false` and an older managed
+/// build never do.
+#[test]
+fn a_crashed_codex_is_relaunched_off_the_build_its_owner_holds() {
+    let now = 1_790_000_000_u64;
+    let target = |v: &str| Target {
+        twin: PathBuf::from("/p/agents/codex"),
+        exe: PathBuf::from("/p/store/codex/1/bin/codex"),
+        version: Version::parse(v).expect("version"),
+    };
+    let running = Version::parse("0.158.0").expect("running");
+    let onto = |upgrade: bool, hold: Option<upgrade::Request>| {
+        relaunch_onto(
+            Some(target("0.159.2")),
+            upgrade,
+            Some(&running),
+            hold.as_ref(),
+            now,
+        )
+        .map(|t| t.version.to_string())
+    };
+    let moved = Some("0.159.2".to_string());
+    assert_eq!(
+        onto(true, Some(upgrade::Request::Skip("0.159.2".into()))),
+        None
+    );
+    assert_eq!(
+        onto(true, Some(upgrade::Request::DeferUntil(now + 60))),
+        None
+    );
+    // NEGATIVE CONTROLS.
+    assert_eq!(onto(true, None), moved);
+    assert_eq!(
+        onto(true, Some(upgrade::Request::DeferUntil(now - 1))),
+        moved
+    );
+    assert_eq!(
+        onto(true, Some(upgrade::Request::Skip("0.159.1".into()))),
+        moved
+    );
+    assert_eq!(onto(true, Some(upgrade::Request::Now)), moved);
+    assert_eq!(onto(false, None), None, "the switch off");
+    assert!(
+        relaunch_onto(Some(target("0.157.0")), true, Some(&running), None, now).is_none(),
+        "never onto an older build"
+    );
+}
+
+/// A CRASHED CODEX RELAUNCHED OFF THE BUILD ITS OWNER HOLDS IS STILL HELD AT
+/// THE RELAUNCHED TUI'S NEXT VISIT (round eight, #24, end to end): the crash
+/// relaunched the TUI on its own program while the owner's Skip held the
+/// managed build, and the relaunch's record kept the hold and the move clock
+/// — but it still named the TUI that crashed, so the relaunched TUI's first
+/// visit read it as another TUI's ([`own_prior`]) and minted a round with no
+/// word and its clock at zero: under the quiet flow, a move onto the very
+/// build the owner had skipped, one launch late. The relaunch now hands its
+/// record to the TUI it brought up ([`found`]): its visit says
+/// `wait:skipped`, and the session is as far behind as before the crash.
+/// NEGATIVE CONTROLS: a crash relaunched on its own program with no word —
+/// the next visit moves the TUI, its age kept: past the waiting record's
+/// look (`would-exit`), where a round minted afresh still shows its record
+/// first. And A WORD GIVEN TO ANOTHER TUI (#24's review): the owner skipped
+/// the build for a Codex the person has since quit, and the TUI they started
+/// after it crashed before its first visit re-minted the record. The crash
+/// read that record unfiltered, kept its word and its clock, and [`found`]
+/// stamped them onto the relaunched TUI, held `wait:skipped` by a word
+/// nobody gave it. Now the record is read only as the crashed TUI's (its pid
+/// and kernel start, as [`own_prior`] and [`owner_word_on`] read it): the
+/// relaunch keeps neither, and its next visit moves it.
+#[test]
+fn a_crashed_codex_relaunched_off_a_held_build_is_still_held_at_its_next_visit() {
+    use crate::harness::relaunch::{ExitCause, ExitRecord};
+    for (word_given, own, name) in [
+        (true, true, "crash-held"),
+        (false, true, "crash-unheld"),
+        (true, false, "crash-other-tui"),
+    ] {
+        let held = word_given && own;
+        let mut rig = Rig::new(name, T2, true, |w| after_crash(w, 137));
+        rig.opts.ask = false;
+        rig.settle(10);
+        let behind = now_s() - 7_200;
+        let snap = crashed_snap(&rig, Some(T2), true);
+        let word = word_given.then(|| Request::Skip(rig.target.version.to_string()));
+        rig.settle_keeping(&St {
+            request: word.clone().unwrap_or_default(),
+            request_tab: if word_given {
+                TAB.to_string()
+            } else {
+                String::new()
+            },
+            request_at: if word_given { now_s() - 600 } else { 0 },
+            pending_since: behind,
+            // The TUI the record is about: the one that crashed, or one the
+            // person quit before starting it.
+            notice_pid: if own { snap.pid } else { snap.pid + 7 },
+            notice_start: snap.start.clone(),
+            ..rig.state()
+        });
+        rig.kernel.exited.store(true, Ordering::SeqCst);
+        // Relaunched on its own program either way: the switch off (which
+        // build the hold keeps it off is `relaunch_onto`'s, pinned above,
+        // and the machine's managed Codex is no test's).
+        let r = after_exit(
+            &rig.opts,
+            &snap,
+            &ExitRecord::Crashed,
+            false,
+            ExitCause::Exit,
+            &rig.kernel,
+        );
+        assert_eq!(r.to, "0.157.0(same)", "{name}: {r:?}");
+        assert_eq!(r.step, "continued", "{name}: {r:?}\n{:#?}", rig.asked());
+        let st = rig.state();
+        assert_eq!(st.source, SAME_PROGRAM, "{name}");
+        assert_eq!(st.resumed_pid, NEW, "{name}");
+        assert_eq!(st.notice_pid, NEW, "{name}: the relaunched TUI's record");
+        if !own {
+            assert_eq!(st.request, Request::None, "{name}: another TUI's word");
+            assert_ne!(st.behind_since(), behind, "{name}: another TUI's clock");
+        }
+        let relaunched = Tui {
+            pid: NEW,
+            argv: rig.kernel.new_argv.clone(),
+            ..rig.tui.clone()
+        };
+        if held {
+            let r = visit(&rig.opts, &relaunched, &rig.target, None, &rig.kernel);
+            assert_eq!(r.step, "wait:skipped", "{name}: {r:?}");
+            let st = rig.state();
+            assert_eq!(st.request_for(TAB), word.clone().expect("the word"));
+            assert_eq!(st.behind_since(), behind, "{name}: the move clock");
+            assert_eq!(st.notice_pid, NEW, "{name}");
+        } else {
+            let dry = Opts {
+                dry_run: true,
+                ..rig.opts.clone()
+            };
+            let r = visit(&dry, &relaunched, &rig.target, None, &rig.kernel);
+            // Its age kept, past the settle; another TUI's clock not kept,
+            // its round at the first rung, settling — and neither held.
+            let want = if own { "would-exit" } else { "wait:settling" };
+            assert_eq!(r.step, want, "{name}: {r:?}");
+        }
+    }
+}
+
+/// A QUIET CODEX MOVE AFTER A ROUND THAT GAVE UP IS CARRIED ON ACROSS A NEWER
+/// BUILD (round eight, #23, the retarget): the quiet flow gave up a round an
+/// older build announced, and a newer managed Codex landed during its rest.
+/// The retarget of the stopped round ([`St::retarget`]'s stopped arm) built
+/// a fresh round with neither the notice's stamp ([`St::noticed_at`]) nor
+/// the give-up ([`St::last_stop`]), so the TUI told to wind down was ended
+/// with `/exit` and resumed with nothing typed (`done:resumed`). Both are
+/// now carried: its move types the continuation — after a stamped notice,
+/// and after a give-up an older build recorded with no stamp. NEGATIVE
+/// CONTROL: a round that stopped for another reason with no notice ever
+/// typed is resumed with nothing typed after.
+#[test]
+fn a_quiet_codex_move_after_a_given_up_round_a_newer_build_retargets_types_its_continuation() {
+    for (why, noticed, name) in [
+        (upgrade::GAVE_UP, true, "rt-noticed"),
+        (upgrade::GAVE_UP, false, "rt-unstamped"),
+        ("signal-refused", false, "rt-unasked"),
+    ] {
+        let mut rig = Rig::new(name, T2, true, |_| {});
+        rig.opts.ask = false;
+        rig.settle(10);
+        // The stopped round moved to 0.157.1, resting; 0.157.2 landed since.
+        rig.settle_keeping(&St {
+            phase: Phase::Failed(why.to_string()),
+            failed_at: now_s(),
+            streak_why: why.to_string(),
+            stop_streak: 1,
+            noticed_at: if noticed { now_s() - 7_200 } else { 0 },
+            ..rig.state()
+        });
+        rig.target.version = v("0.157.2");
+        // The retarget's look: a new round, its screen not settled yet.
+        assert_eq!(rig.visit(None).step, "wait:settling", "{name}");
+        assert_eq!(rig.state().phase, Phase::Pending, "{name}");
+        rig.settle_keeping(&rig.state());
+        let r = rig.visit(None);
+        let typed = rig.typed();
+        assert!(
+            typed.iter().any(|l| l.ends_with(" /exit")),
+            "{name}: the quiet `/exit`: {r:?} {typed:?}"
+        );
+        let carried = typed.iter().any(|l| l.contains("Upgraded:"));
+        if why == upgrade::GAVE_UP {
+            assert_eq!(r.step, "continued", "{name}: {r:?} {typed:?}");
+            assert!(carried, "{name}: {typed:?}");
+        } else {
+            assert_ne!(r.step, "continued", "{name}: {r:?}");
+            assert!(!carried, "{name}: {typed:?}");
+        }
+    }
+}
+
+/// A QUIET CODEX MOVE AFTER A ROUND THAT GAVE UP ON ITS NOTICES IS CARRIED ON
+/// (round eight, #23, the Codex half): the quiet flow gives up a round an
+/// older aterm (or `upgrade_ask`) announced once the agent's own work held it
+/// past the notice's window, and re-arms it after the rest — a pending round
+/// whose agent was asked to wind down and was never told to go on: this lane
+/// types no release line. Its quiet `/exit` was followed by nothing
+/// (`done:resumed`). Now that move types the continuation — and so does one
+/// whose notice the owner's hold ended, or `--now` re-armed after a give-up
+/// (the notice's stamp, [`St::noticed_at`], with no stop recorded).
+/// NEGATIVE CONTROL: a pending round nothing was asked of is resumed with
+/// nothing typed after.
+#[test]
+fn a_quiet_codex_move_after_a_given_up_round_types_its_continuation() {
+    for (asked, name) in [
+        (Some(true), "quiet-after-giveup"),
+        (Some(false), "quiet-after-a-notice"),
+        (None, "quiet-unasked"),
+    ] {
+        let mut rig = Rig::new(name, T2, true, |_| {});
+        rig.opts.ask = false;
+        rig.settle(10);
+        match asked {
+            Some(true) => rig.settle_keeping(&St {
+                last_stop: upgrade::GAVE_UP.to_string(),
+                ..rig.state()
+            }),
+            Some(false) => rig.settle_keeping(&St {
+                noticed_at: now_s() - 7_200,
+                ..rig.state()
+            }),
+            None => {}
+        }
+        assert_eq!(rig.state().phase, Phase::Pending, "{name}");
+        let r = rig.visit(None);
+        let typed = rig.typed();
+        assert!(
+            typed.iter().any(|l| l.ends_with(" /exit")),
+            "{name}: the quiet `/exit`: {typed:?}"
+        );
+        let carried = typed.iter().any(|l| l.contains("Upgraded:"));
+        if asked.is_some() {
+            assert_eq!(r.step, "continued", "{name}: {r:?} {typed:?}");
+            assert!(carried, "{name}: {typed:?}");
+        } else {
+            assert_ne!(r.step, "continued", "{name}: {r:?}");
+            assert!(!carried, "{name}: {typed:?}");
+        }
+    }
+}
+
+/// A RELAUNCHED CODEX THAT REPLAYS THE WALL IS CARRIED ON ONCE, NEVER STACKED:
+/// [`carry_on`] is not gated on the usage wall, on purpose (its doc says
+/// why), so the restart that comes back onto a replayed wall types its one
+/// continuation there — a turn that fails and stays in history — and the
+/// record is done: the next looks, however many, type and press nothing, and
+/// the restart's earlier lines (the notice, the `/exit`, the relaunch) are the
+/// same as anywhere. This pins the fact that decision rests on, `one line per
+/// restart`. NEGATIVE CONTROL: the same restart onto a screen with no wall —
+/// the same four lines, one of them the continuation, the same record, the
+/// same quiet after it.
+#[test]
+fn a_relaunched_codex_that_replays_the_wall_is_carried_on_once_and_never_stacked() {
+    let replayed = measured_screen(aterm_phase::codex::fixtures::WALL_RESUMED_0_159, 20);
+    for (after_relaunch, what) in [
+        (replayed, "onto a replayed wall"),
+        (codex_idle(20), "clear"),
+    ] {
+        let rig = embedded_ready("wall-replayed", |w| w.after_relaunch = after_relaunch);
+        let r = rig.visit(None);
+        assert_eq!(r.step, "continued", "{what}: {r:?}\n{:#?}", rig.asked());
+        let typed = rig.typed();
+        assert_eq!(
+            typed.len(),
+            4,
+            "{what}: notice, /exit, relaunch, one continuation: {typed:#?}"
+        );
+        assert_eq!(
+            typed
+                .iter()
+                .filter(|l| l.contains("[aterm harness] Upgraded"))
+                .count(),
+            1,
+            "{what}: {typed:#?}"
+        );
+        assert_eq!(rig.state().phase, Phase::Done, "{what}: nothing left owed");
+        assert_eq!(
+            rig.ledger_steps(),
+            vec!["announced:1", "exit-typed", "relaunched", "continued"],
+            "{what}"
+        );
+        // Never stacked: later looks type and press nothing more.
+        let pressed = keys(&rig);
+        for look in 1..=3 {
+            let r = rig.visit(None);
+            assert_eq!(
+                rig.typed().len(),
+                4,
+                "{what}: look {look} ({}) typed again: {:#?}",
+                r.step,
+                rig.typed()
+            );
+            assert_eq!(keys(&rig), pressed, "{what}: look {look} ({})", r.step);
+            assert_eq!(rig.state().phase, Phase::Done, "{what}: look {look}");
+        }
+    }
 }

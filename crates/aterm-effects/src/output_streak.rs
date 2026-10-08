@@ -1,49 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PRISM WAKE — the terminal answers PROGRAM OUTPUT with a comet, softly, in the
-//! theme's own colours (owner: *"add some kind of small sound effect and rainbow
-//! streak when in terminal there is output"*, then the ruling that outranks it:
-//! *"it should't be overwhelming but I want some per-theme effect and soft
-//! sound"*).
-//!
-//! Design record: `docs/DESIGN-output-streak-2026-08-30.md`.
+//! Prism wake: the terminal answers program output with a soft comet in the
+//! theme's own colours, plus a soft sound. Design:
+//! `docs/DESIGN-output-streak-2026-08-30.md`.
 //!
 //! ## The rule
 //!
 //! > Output earns light the way typing earns momentum: metered,
 //! > echo-discounted, and always decaying to zero. A burst gets one comet and
-//! > one soft note. A flood gets one silent ribbon. **No configuration animates
-//! > forever.**
+//! > one soft note. A flood gets one silent ribbon. No configuration animates
+//! > forever.
 //!
-//! The corollary, and it is the whole ceiling ruling: every governor below is an
-//! ENGINE-SIDE CLAMP, not host policy. An embedder, a config typo, or a future
-//! theme cannot make this loud, fast, or flashy, because the limits live in this
-//! state machine the same way the WCAG posture already lives in the crate
-//! contract (see the [crate] docs).
+//! Every governor below is an engine-side clamp, not host policy: an embedder,
+//! a config typo or a theme cannot make this loud, fast or flashy (see the
+//! [crate] docs on WCAG).
 //!
-//! ## The licence — what counts as "output"
+//! ## The licence: what counts as output
 //!
 //! The host feeds [`OutputStreak::note_output`] a content-generation counter and
-//! the freshly damaged row spans it read at the deco-rescan seam. Four gates,
-//! all here rather than at the call site, decide whether that mints light:
+//! the freshly damaged row spans it read at the deco-rescan seam. Four gates
+//! decide whether that mints light:
 //!
-//! * **First observation BASELINES.** A cold engine (or one explicitly rebased
-//!   for a session or tab switch) records the counter and mints nothing,
-//!   so attaching to a busy session never fires a burst of comets for history.
-//! * **ECHO DISCOUNT.** A delta within [`ECHO_DISCOUNT_MS`] of conclusively
-//!   accepted editor input, or one arriving while the host reports `input_hot`,
-//!   is the user's own typing coming back and mints NOTHING. `input_hot` covers
-//!   the active/spilled interval; the accepted-input receipt covers its short
-//!   post-write echo shadow. A submitted turn boundary clears that shadow so a
-//!   fast command response remains authored output.
-//! * **EMPTY DAMAGE MINTS NOTHING.** The host passes only spans that still carry
-//!   ink. `\x1b[2K` over an already-blank line advances the content counter, and
-//!   without this clause an idle TUI redrawing its own chrome would shimmer
-//!   forever.
-//! * **Output never feeds the TYPING metric.** Output momentum is a separate
-//!   instance of the one [`TypingMomentum`] law; output must not read as
-//!   typing-earned drama anywhere else in the family.
+//! * First observation baselines: a cold engine (or one rebased for a session or
+//!   tab switch) records the counter and mints nothing, so attaching to a busy
+//!   session never fires comets for history.
+//! * Echo discount: a delta within [`ECHO_DISCOUNT_MS`] of accepted editor input,
+//!   or while the host reports `input_hot`, is the user's own typing and mints
+//!   nothing. `input_hot` covers the active/spilled interval, the accepted-input
+//!   receipt its post-write echo shadow; a submitted turn boundary clears the
+//!   shadow so a fast command response still counts.
+//! * Empty damage mints nothing: the host passes only spans still carrying ink,
+//!   so an idle TUI redrawing blank chrome (`\x1b[2K` over a blank line) never
+//!   shimmers.
+//! * Output never feeds the typing metric: output momentum is a separate
+//!   instance of the [`TypingMomentum`] rule.
 //!
 //! Hosts with a whole-frame token use [`OutputStreak::note_output_cells`], which
 //! derives fresh damage from retained glyph snapshots. A token change elsewhere
@@ -52,81 +43,60 @@
 //!
 //! ## Why it cannot overwhelm
 //!
-//! Six stacked structural governors — the ceiling ruling, made arithmetic:
+//! Six stacked governors:
 //!
-//! 1. **[`TypingMomentum`], reused verbatim.** Rate-normalized accrual means a
-//!    firehose cannot accumulate more drama than a trickle; its `low_crossing`
-//!    gives the episode edges analytically, at any frame rate.
-//! 2. **[`SPAWN_MIN_GAP_MS`] — the ignition floor.** At 700 ms this is ≤1.43
-//!    ignitions/second, and it is this engine's OWN floor over its OWN clock —
-//!    per pane, because the engine is per pane. It is NOT a draw on the
-//!    word-nova's `FlashLimiterWindow`: nothing in this file reserves against
-//!    that limiter, and the host makes no reservation on the engine's behalf.
-//!    (This header used to say the floor sat "inside the ≤2/s budget the
-//!    word-nova limiter keeps for the same window", which invoked a budget
-//!    nothing here spends from; which budget IS window-wide, and why this floor
-//!    is not, is on [`OutputStreak`].) Every edge that puts light on a cell or
-//!    takes it off spends from this floor — a comet spawn and a flood-ribbon
-//!    re-home (`OutputStreak::refresh_ribbon` shares `last_spawn`) — so there is
-//!    ONE ignition clock per engine, not one per emitter. And because a sound
-//!    cue is recorded only on a spawn edge, the same clamp bounds eye and ear
-//!    together.
-//! 3. **[`MAX_COMETS`] + per-row dedup.** A row already carrying a comet cannot
-//!    respawn until it retires.
-//! 4. **Flood coalescing.** Past [`SATURATED`] momentum, per-row spawning STOPS
-//!    and the engine degrades to a single constant-cost ribbon: `cat bigfile` is
-//!    one ribbon, one pip, then quiet.
-//! 5. **Amplitude clamps.** [`ALPHA_DEFAULT`] with [`ALPHA_CLAMP`] as the hard
-//!    ceiling, halved again on light grounds, so text is never harder to read
-//!    than with the effect off.
-//! 6. **The episode sound law.** One [`StreakSound::Shimmer`] on the quiet→active
-//!    crossing, then MUTE until momentum drains through [`EPISODE_LOW`], which
-//!    re-arms the voice and fires one [`StreakSound::Settle`]. A build log yields
-//!    one pip and one exhale, total.
+//! 1. [`TypingMomentum`], reused verbatim: rate-normalized accrual means a
+//!    firehose accumulates no more drama than a trickle, and `low_crossing`
+//!    gives episode edges analytically at any frame rate.
+//! 2. [`SPAWN_MIN_GAP_MS`], the ignition floor: ≤1.43 ignitions/second on this
+//!    engine's own clock, per pane. It does not draw on the word-nova's
+//!    `FlashLimiterWindow` (see [`OutputStreak`]). Every edge that puts light on
+//!    a cell or takes it off spends from it, a comet spawn and a flood-ribbon
+//!    re-home alike (`OutputStreak::refresh_ribbon` shares `last_spawn`), so
+//!    there is one ignition clock per engine. Sound cues ride spawn edges only,
+//!    so the same clamp bounds eye and ear.
+//! 3. [`MAX_COMETS`] and per-row dedup: a row carrying a comet cannot respawn
+//!    until it retires.
+//! 4. Flood coalescing: past [`SATURATED`] momentum, per-row spawning stops and
+//!    a single constant-cost ribbon remains (`cat bigfile` is one ribbon, one
+//!    pip, then quiet).
+//! 5. Amplitude clamps: [`ALPHA_DEFAULT`] with [`ALPHA_CLAMP`] as the ceiling,
+//!    halved on light grounds, so text is never harder to read than with the
+//!    effect off.
+//! 6. The episode sound rule: one [`StreakSound::Shimmer`] on the quiet→active
+//!    crossing, then mute until momentum drains through [`EPISODE_LOW`], which
+//!    re-arms the voice with one [`StreakSound::Settle`].
 //!
-//! Decay is guaranteed from three directions: the momentum τ, the ribbon's
+//! Decay is guaranteed three ways: the momentum τ, the ribbon's
 //! [`RIBBON_LINGER_MS`], and the mandatory idle drain
-//! ([`StreakConfig::idle_secs`], clamped by the host to a finite band).
+//! ([`StreakConfig::idle_secs`], host-clamped to a finite band).
 //!
-//! ## What the floor buys, and what it does not
+//! ## What the floor buys
 //!
-//! WCAG 2.3.1 is breached only when AMPLITUDE and RATE and AREA hold together,
-//! and this effect's conformance rests on the RATE arm: the threshold is
-//! measured at a point on the retina, a cell belongs to exactly one pane, and a
-//! comet's envelope is monotone over any one cell (one rise as the head arrives,
-//! one fall as the tail passes — never a train), so the per-cell flash rate is a
-//! function of governor 2's floor alone, and N panes do not multiply it. That
-//! is what makes a PER-PANE floor safe without any window-wide budget behind
-//! it. N panes DO multiply the flashing AREA, and the amplitude arm depends on
-//! the ground a comet is composited over — neither arm supplies the margin the
-//! earlier prose implied. The measurements behind that sentence are in
-//! `docs/DESIGN-output-streak-2026-08-30.md` §7 and are deliberately not
-//! restated here: a figure belongs beside the harness that pins it.
+//! WCAG 2.3.1 is breached only when amplitude, rate and area hold together;
+//! conformance here rests on the rate arm. The threshold is measured at a
+//! retinal point, a cell belongs to one pane, and a comet's envelope is monotone
+//! over any cell (one rise, one fall), so the per-cell flash rate depends only
+//! on governor 2's floor, and N panes do not multiply it. They do multiply the
+//! flashing area, and the amplitude arm depends on the ground; the measurements
+//! are in the design doc §7.
 //!
 //! ## Contract
 //!
-//! Clockless (every entry point takes an injected `now`), overlay-only (output is
-//! premultiplied [`GlowQuad`]s destined for the grid-anchored `nova_add` channel
-//! — the grid is never touched), and empty-is-off: disabled, reduced-motion, or
-//! settled ticks reset the state machine, emit no quads, record no cue, and
-//! return fingerprint `0`.
+//! Clockless (every entry point takes an injected `now`), overlay-only
+//! (premultiplied [`GlowQuad`]s for the grid-anchored `nova_add` channel), and
+//! empty-is-off: disabled, reduced-motion or settled ticks reset the machine,
+//! emit no quads, record no cue and return fingerprint `0`.
 //!
 //! ## Its share of the channel
 //!
-//! The host APPENDS this engine's quads to `nova_add` AFTER the word-decoration
-//! pass has spent its own [`crate::nova::MAX_NOVA_QUADS`] budget (app_render.rs
-//! `compose_output_streak` / the single-pane PRISM WAKE block), so the streak
-//! share is neither funded by that budget nor counted by it — 1536 is a funding
-//! ceiling on the DECORATION producers, not a total for the channel. This
-//! engine's own bound is one ribbon row of ≤ `cols` cells plus at most
-//! `MAX_COMETS` comet heads of ≤ `TAIL_MAX` + 2 cells each (a comet lights
-//! its head and tail, never the whole row), so `cols + 64` at the config corner
-//! — PER PANE, since the engines are per pane and nothing sums them. Four
-//! 200-column panes of build output measure ~823 quads on top of the decoration
-//! share. That overrun is deliberate and inert: the consumer walks the whole
-//! slice (no cap, no fixed buffer, no assert) and the host's channel is a
-//! resident scratch that grows once. Pinned in
-//! `tests/nova_channel_budget.rs`.
+//! The host appends these quads to `nova_add` after the word-decoration pass has
+//! spent its [`crate::nova::MAX_NOVA_QUADS`] budget, so the streak is neither
+//! funded nor counted by it. This engine's bound is one ribbon row of ≤ `cols`
+//! cells plus at most `MAX_COMETS` heads of ≤ `TAIL_MAX` + 2 cells, i.e.
+//! `cols + 64` per pane; four 200-column panes of build output add ~823 quads.
+//! The consumer walks the whole slice and the host's channel scratch grows once.
+//! Pinned in `tests/nova_channel_budget.rs`.
 
 use aterm_render::{GlowQuad, premul_rgb};
 use aterm_time::Instant;
@@ -144,36 +114,27 @@ use crate::typing_momentum::TypingMomentum;
 /// output-activity consumers cannot disagree about what "your own typing" is.
 pub const ECHO_DISCOUNT_MS: u64 = 250;
 
-/// THE ENGINE'S ONE IGNITION FLOOR. 700 ms between any two edges that put light
-/// on a cell or take it off — a comet spawn, and a flood-ribbon re-home
-/// (`OutputStreak::refresh_ribbon` shares `last_spawn`) — so ≤1.43
-/// ignitions/second per engine; and because a sound cue is recorded only on a
-/// spawn edge, this one clamp limits the eye and the ear together (the
-/// one-event law).
+/// The engine's one ignition floor: 700 ms between any two edges that put light
+/// on a cell or take it off (a comet spawn, or a flood-ribbon re-home, which
+/// shares `last_spawn`), so ≤1.43 ignitions/second per engine; cues ride spawn
+/// edges, so this also limits the sound.
 ///
-/// IT IS THIS ENGINE'S OWN FLOOR, NOT A DRAW ON ANOTHER BUDGET. Nothing here
-/// reserves against the word-nova's `FlashLimiterWindow`, and the host does not
-/// reserve on this engine's behalf; the older wording ("inside the ≤2/s rolling
-/// WCAG ignition budget") named a budget this engine has never spent from. The
-/// floor is per pane because the engine is per pane, and that is safe because
-/// WCAG 2.3.1's rate arm is measured per cell and a cell belongs to exactly one
-/// pane (module docs, [`OutputStreak`]). The test
-/// `the_engine_makes_no_flash_limiter_reservation_so_its_docs_may_say_so`
-/// keeps the first sentence of this paragraph a check rather than a claim.
+/// This engine's own floor, not a draw on another budget: nothing here reserves
+/// against the word-nova's `FlashLimiterWindow`, and the host does not reserve
+/// on its behalf. Per pane is safe because WCAG 2.3.1's rate arm is measured per
+/// cell and a cell belongs to one pane (see [`OutputStreak`]).
+/// `the_engine_makes_no_flash_limiter_reservation_so_its_docs_may_say_so` checks
+/// the no-reservation claim.
 pub const SPAWN_MIN_GAP_MS: u64 = 700;
 
-/// The voice's own floor, on top of the episode law: even across episode
-/// boundaries two pips can never fall closer than this. A denied fire does NOT
-/// re-arm — it is simply not heard.
+/// The voice's own floor on top of the episode rule: two pips never fall closer
+/// than this. A denied fire does not re-arm; it is simply not heard.
 pub const SOUND_MIN_GAP_MS: u64 = 1_500;
 
-/// Comet sweep duration band. The floor is above the 350 ms WCAG twinkle floor
-/// with room to spare, and the whole envelope is MONOTONE — `shape = (1 − u)²`
-/// lights a cell as the head reaches it and thins as the tail leaves it, scaled
-/// by a `life` that only decays. So ONE comet over one cell is one rise and one
-/// fall: a single luminance pair, never a train. That is what makes the per-cell
-/// flash RATE a function of [`SPAWN_MIN_GAP_MS`] alone, which is the arm the
-/// effect's WCAG 2.3.1 conformance rests on (module docs).
+/// Comet sweep duration band. The floor is well above the 350 ms WCAG twinkle
+/// floor, and the envelope is monotone (`shape = (1 − u)²` scaled by a `life`
+/// that only decays), so one comet over a cell is one rise and one fall. That
+/// makes the per-cell flash rate a function of [`SPAWN_MIN_GAP_MS`] alone.
 pub const COMET_MS_MIN: u32 = 420;
 /// Upper end of the sweep band (see [`COMET_MS_MIN`]).
 pub const COMET_MS_MAX: u32 = 900;
@@ -183,9 +144,8 @@ pub const TAIL_MIN: u16 = 4;
 /// Upper end of the tail band (see [`TAIL_MIN`]).
 pub const TAIL_MAX: u16 = 14;
 
-/// Peak coverage on a dark ground at full intensity — the SHIPPING amplitude.
-/// Deliberately a third under [`ALPHA_CLAMP`]: the clamp is the ceiling a config
-/// may reach for, this is what the effect actually looks like.
+/// Peak coverage on a dark ground at full intensity, the shipping amplitude: a
+/// third under [`ALPHA_CLAMP`], the ceiling a config may reach for.
 pub const ALPHA_DEFAULT: f32 = 0.10;
 
 /// The hard amplitude ceiling. No configuration, theme derivation, or embedder
@@ -204,22 +164,17 @@ pub const EPISODE_LOW: f32 = 0.10;
 /// How long the ribbon lingers after the last licensed output before retiring.
 pub const RIBBON_LINGER_MS: u64 = 600;
 
-/// Hue span across one comet, in spectrum turns. Compressed on purpose: a fifth
-/// of the arc reads as an IRIDESCENT SHEEN, where a full turn reads as a rainbow
-/// bar laid over the user's text.
+/// Hue span across one comet, in spectrum turns: a fifth of the arc reads as an
+/// iridescent sheen; a full turn would be a rainbow bar over the user's text.
 pub const HUE_SPAN: f32 = 0.22;
 
-/// Ribbon hue drift, turns/second — a drift rather than a cycle.
-///
-/// It is not luminance-flat, and the old "three orders under the 3.2 Hz
-/// photosensitivity invariant" overstated the margin: 0.25 turns/s is about one
-/// order under 3.2 Hz, not three, and the spectrum's relative luminance rises
-/// and falls more than once across a turn, so the cell under a drifting ribbon
-/// sees a slow luminance rhythm of a fraction of a hertz — not a thousandth of
-/// one. What bounds the ribbon's contribution to any cell's flash RATE is not
-/// this constant but the ignition floor: a re-home is an edge and spends from
-/// [`SPAWN_MIN_GAP_MS`] (`OutputStreak::refresh_ribbon`), while the drift only
-/// recolours light already there.
+/// Ribbon hue drift, turns per second: a drift, not a cycle. It is not
+/// luminance-flat (spectrum luminance rises and falls more than once per turn),
+/// so a cell under the ribbon sees a slow luminance rhythm of a fraction of a
+/// hertz. The ribbon's contribution to flash rate is bounded by the ignition
+/// floor instead: a re-home is an edge and spends from [`SPAWN_MIN_GAP_MS`]
+/// (`OutputStreak::refresh_ribbon`); the drift only recolours light already
+/// there.
 pub const RIBBON_DRIFT: f32 = 0.25;
 
 /// The most comets that may be resident at once (the host clamps its own
@@ -240,10 +195,8 @@ pub enum StreakSound {
 }
 
 impl StreakSound {
-    /// The one shipping synth gesture for this visual edge.
-    ///
-    /// Kept beside the source enum so native, composed, and formal-conformance
-    /// hosts cannot silently assign different voices to the same streak cue.
+    /// The synth gesture for this visual edge, kept beside the source enum so
+    /// native, composed and conformance hosts assign the same voice.
     #[must_use]
     pub const fn output_gesture(self) -> OutputGesture {
         match self {
@@ -269,9 +222,8 @@ pub struct StreakCue {
 /// engine state, exactly like the cursor emitters' configs.
 #[derive(Clone, Copy, Debug)]
 pub struct StreakConfig {
-    /// Master on/off. Default ON at the config layer (owner ruling 2026-08-31);
-    /// `false` here is fully inert, byte-identical to a build without the
-    /// effect.
+    /// Master on/off (on by default at the config layer). `false` is fully
+    /// inert, byte-identical to a build without the effect (owner, 2026-08-31).
     pub enabled: bool,
     /// Amplitude `0..=1` — the reduced-motion / load-shed scale the host folds
     /// in. `0` ⇒ fully inert, reset not dimmed.
@@ -284,10 +236,9 @@ pub struct StreakConfig {
     /// retires. The host clamps the band; a non-finite or non-positive value is
     /// treated as "drain immediately" rather than "animate forever".
     pub idle_secs: f32,
-    /// Whether the resolved theme background is dark. Selects the POLARITY:
-    /// additive spectrum light on dark grounds, a tinted shadow-shimmer on
-    /// light ones (additive light cannot darken a pale ground, so on a light
-    /// theme it would simply not exist).
+    /// Whether the resolved theme background is dark. Selects polarity: additive
+    /// spectrum light on dark grounds, a tinted shadow shimmer on light ones
+    /// (additive light cannot darken a pale ground).
     pub dark_theme: bool,
     /// The resolved theme background `0x00RRGGBB` — the pole the light-theme
     /// shimmer is mixed toward.
@@ -295,10 +246,9 @@ pub struct StreakConfig {
     /// The resolved theme foreground `0x00RRGGBB` — the legibility grounding mix
     /// on light themes.
     pub theme_fg: u32,
-    /// The theme's cursor colour (foreground is the host's documented fallback):
-    /// its nearest spectrum stop seeds where on the arc a comet's head ENTERS,
-    /// which is the whole per-theme character axis. Pure position selection on
-    /// THE ONE SPECTRUM — never a second ramp.
+    /// The theme's cursor colour (foreground is the host's fallback): its nearest
+    /// spectrum stop seeds where on the arc a comet's head enters, the per-theme
+    /// character. Pure position selection on the one spectrum.
     pub theme_cursor: u32,
     /// Whether the pip may be recorded at all (the host's own sound ladder —
     /// focus, master switch, volume — still applies on top).
@@ -403,46 +353,30 @@ impl ObservedGlyph {
     }
 }
 
-/// PRISM WAKE's state machine. ONE PER PANE — see the module docs for the law.
+/// The prism wake state machine, one per pane.
 ///
-/// Not one per window, and the difference is the design rather than a detail:
-/// `crates/aterm-gui/src/lib.rs` holds `output_streak_panes: BTreeMap<(u64,
-/// usize), OutputStreak>` keyed by `(session id, visible pane slot)`, and says
-/// why at the field — "a split shows several live terminal views at once and
-/// each carries its own arrival clock, so one engine per window would blend
-/// their streams into nonsense (and let a chatty pane spend the quiet pane's
-/// spawn budget)". The slot keeps two visible views of one session independent.
-/// The sibling
-/// `output_streak: Option<Box<OutputStreak>>` beside it is the SINGLE-PANE
-/// present, not a second scope.
+/// The window's pipeline holds `streak_panes: BTreeMap<(u64, usize),
+/// OutputStreak>` keyed by `(session id, visible pane slot)`: each visible
+/// terminal view has its own arrival clock, so one engine per window would
+/// blend streams and let a chatty pane spend a quiet pane's spawn budget. The
+/// slot keeps two views of one session independent. The sibling
+/// `streak: Option<Box<OutputStreak>>` is the single-pane present.
 ///
-/// THE WINDOW-WIDE BUDGET IN THIS FAMILY IS SOMEBODY ELSE'S, AND THIS ENGINE
-/// DOES NOT SPEND FROM IT. The ≤2/s WCAG rolling ignition allowance belongs to
-/// the word-nova's `FlashLimiterWindow` — a registered, machine-checked
-/// window-scope claim (`aterm_census::scope_census`, id `flash-limiter`) whose
-/// scope is window-wide because a retina sees every pane at once. PRISM WAKE
-/// never reserves against it: there is no `FlashLimiter` call in this file, and
-/// the host makes none on this engine's behalf. Saying "one per window" HERE
-/// would claim that budget's scope for a per-pane state machine, which is the
-/// exact confusion OB-17 exists to catch — and the module header used to make
-/// the mirror-image mistake, citing that window-wide budget as the thing
-/// [`SPAWN_MIN_GAP_MS`] fits inside.
-///
-/// What makes the per-pane shape SAFE is not a shared budget but the shape of
-/// the threshold: WCAG 2.3.1's rate arm is measured at a point on the retina,
-/// and a cell belongs to exactly one pane, so N engines do not multiply any
-/// cell's flash count. They DO multiply the flashing AREA, an arm these docs
-/// claim no margin on (module docs).
+/// The window-wide ≤2/s WCAG ignition allowance belongs to the word-nova's
+/// `FlashLimiterWindow` (the machine-checked `flash-limiter` scope claim in
+/// `aterm_census::scope_census`). This engine never reserves against it; its
+/// per-pane shape is safe because WCAG 2.3.1's rate arm is measured per cell
+/// and a cell belongs to one pane. N engines do multiply the flashing area,
+/// on which these docs claim no margin.
 #[derive(Default)]
 pub struct OutputStreak {
     /// The output metric — [`TypingMomentum`]'s law, a separate instance, fed
     /// only by licensed output.
     momentum: TypingMomentum,
-    /// Last ARRIVAL TOKEN seen; `None` ⇒ not yet baselined. Any CHANGE is an
-    /// arrival — deliberately not "any increase". A monotone content counter
-    /// and a content hash both satisfy that, which is what lets the composed
-    /// hosts (whose snapshots carry only a synthetic, always-advancing frame
-    /// seq) share this law with the hosts that have a real content clock.
+    /// Last arrival token seen; `None` means not yet baselined. Any change is an
+    /// arrival (not "any increase"), so both a monotone content counter and a
+    /// content hash work, letting composed hosts (with a synthetic
+    /// always-advancing frame seq) share this rule.
     last_token: Option<u64>,
     /// Exact prior visible glyphs for the cell-observation API. A changed
     /// global token says some row changed, not that the parked caret's row
@@ -504,10 +438,9 @@ impl OutputStreak {
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, idle_secs: f32) -> Option<Instant> {
         if !self.drawing {
-            // Even with nothing on glass, a live episode still owes both its
-            // mandatory idle retirement and its analytic Settle crossing. The
-            // earlier transition owns the wake; after an idle tick consumes
-            // `last_output`, only the still-pending Settle remains.
+            // With nothing on glass, a live episode still owes its idle
+            // retirement and its analytic Settle crossing; the earlier wakes.
+            // After an idle tick consumes `last_output`, only Settle remains.
             return [
                 self.pending_idle_deadline(idle_secs),
                 self.pending_settle_deadline(),
@@ -553,14 +486,11 @@ impl OutputStreak {
         };
     }
 
-    /// FORGET THE ARRIVAL TOKEN, keeping everything else. The next observation
-    /// then BASELINES instead of minting — the session/tab-switch seam.
-    ///
-    /// Under the token law any change is an arrival, so a host that re-points
-    /// one engine at a different terminal would otherwise answer the swap
-    /// itself with a comet. Hosts that key an engine per session get this
-    /// structurally (a different session is a different engine) and never need
-    /// to call it; the single-engine window path does.
+    /// Forget the arrival token, keeping everything else, so the next
+    /// observation baselines instead of minting: the session/tab-switch seam.
+    /// Any change is an arrival, so re-pointing one engine at a different
+    /// terminal would otherwise answer the swap with a comet. Hosts keying an
+    /// engine per session never need this; the single-engine window path does.
     pub fn rebase(&mut self) {
         self.last_token = None;
         self.observed_rows.clear();
@@ -583,14 +513,12 @@ impl OutputStreak {
         }
     }
 
-    /// One frame-time output observation: the terminal's content-generation
-    /// counter, the freshly damaged INK-BEARING row spans (the host filters
-    /// blank damage — see "empty damage mints nothing" in the module docs), and
-    /// whether the host currently has input in flight.
+    /// One frame-time output observation: the content-generation counter, the
+    /// freshly damaged ink-bearing row spans (the host filters blank damage),
+    /// and whether the host has input in flight.
     ///
-    /// Returns `true` when the observation was LICENSED (it credited momentum
-    /// and armed a spawn) — the tests' non-vacuity handle, and a cheap way for a
-    /// host to assert its own licence facts.
+    /// Returns `true` when the observation was licensed (it credited momentum
+    /// and armed a spawn).
     pub fn note_output(
         &mut self,
         token: u64,
@@ -598,12 +526,9 @@ impl OutputStreak {
         now: Instant,
         input_hot: bool,
     ) -> bool {
-        // FIRST OBSERVATION BASELINES — a fresh engine (or one that just
-        // rebased across a session or tab switch) records what it sees and
-        // mints nothing, so attaching to a busy session never answers history
-        // with a burst. After that, any CHANGE is an arrival and an unchanged
-        // token is no arrival at all: a screen being repainted byte-identically
-        // has produced no output, however busy the byte stream looks.
+        // First observation baselines: a fresh or rebased engine records what it
+        // sees and mints nothing. After that any change is an arrival, and an
+        // unchanged token (a byte-identical repaint) is none.
         let Some(prev) = self.last_token else {
             self.last_token = Some(token);
             return false;
@@ -612,11 +537,11 @@ impl OutputStreak {
         if token == prev {
             return false;
         }
-        // EMPTY DAMAGE MINTS NOTHING.
+        // Empty damage mints nothing.
         let Some(&(row, left, right)) = spans.last() else {
             return false;
         };
-        // ECHO DISCOUNT — the user's own typing coming back.
+        // Echo discount: the user's own typing coming back.
         if input_hot || self.within_echo_window(now) {
             return false;
         }
@@ -626,28 +551,23 @@ impl OutputStreak {
         true
     }
 
-    /// [`Self::note_output`] with THE ANCHOR derived from a frame's cells — the
-    /// one authority every host shares, because four different render paths
-    /// (the single-pane present, the composed present, and both capture
-    /// splices) need the identical answer and a fifth copy of this reasoning is
-    /// a fifth chance to get it subtly different.
+    /// [`Self::note_output`] with the anchor derived from a frame's cells, the one
+    /// implementation shared by every render path (single-pane present, composed
+    /// present, both capture splices).
     ///
-    /// The freshly written row is the cursor's OWN while it is mid-line, and
-    /// the row above it otherwise: program output ends its lines with a
-    /// newline, which parks the cursor at column 0 of a row with no ink in it
-    /// yet, so anchoring naively on the live cursor would licence nothing for
-    /// the overwhelming majority of real output. The span is the rightmost
-    /// contiguous run of gained or replaced ink, including wide continuations,
-    /// since the previous observation. Unchanged gaps never join two sparse
-    /// changes into one ribbon. A timer changing elsewhere cannot decorate
-    /// an unchanged composer. Erasure alone and a row moved intact from an
-    /// old position are not new output.
-    /// `viewport` is the host's actual `(rows, cols)`, not the lengths of the
-    /// sparse row vectors. A dimension change establishes a fresh baseline and
-    /// retires old pending/resident geometry, even if the content token is
-    /// unchanged. Stable dimensions and token skip the entire glyph walk.
+    /// The freshly written row is the cursor's own while it is mid-line and the
+    /// row above otherwise: output lines end with a newline, parking the cursor
+    /// at column 0 of an empty row. The span is the rightmost contiguous run of
+    /// gained or replaced ink (wide continuations included) since the previous
+    /// observation; unchanged gaps never join sparse changes, so a timer changing
+    /// elsewhere cannot decorate an unchanged composer. Erasure alone, and a row
+    /// moved intact from an old position, are not new output.
     ///
-    /// Returns whether the observation was LICENSED (see [`Self::note_output`]).
+    /// `viewport` is the host's actual `(rows, cols)`, not the sparse row
+    /// lengths. A dimension change baselines afresh and retires old geometry even
+    /// if the token is unchanged; stable dimensions and token skip the walk.
+    ///
+    /// Returns whether the observation was licensed (see [`Self::note_output`]).
     pub fn note_output_cells(
         &mut self,
         cells: &[Vec<aterm_core::terminal::RenderCell>],
@@ -777,8 +697,8 @@ impl OutputStreak {
         cfg: &StreakConfig,
         out: &mut Vec<GlowQuad>,
     ) -> StreakFrame {
-        // FULLY INERT: off, reduced to zero amplitude, or degenerate geometry.
-        // A reset, not a dimming — the pin-not-ease rule for reduced motion.
+        // Fully inert: off, zero amplitude, or degenerate geometry. A reset, not
+        // a dimming (reduced motion pins rather than eases).
         if !cfg.enabled
             || cfg.intensity <= 0.0
             || geom.cw == 0
@@ -797,7 +717,7 @@ impl OutputStreak {
             .clamp(0.0, MAX_DT_S);
         self.last_tick = Some(now);
 
-        // MANDATORY IDLE DRAIN — no configuration animates forever.
+        // Mandatory idle drain: no configuration animates forever.
         if self.idle_drained(now, cfg) {
             let cue = self.close_episode_cue(now, cfg);
             self.comets = Default::default();
@@ -849,7 +769,7 @@ impl OutputStreak {
             return None;
         }
 
-        // GOVERNOR 4 — FLOOD COALESCING. Past saturation nothing new spawns; the
+        // Governor 4, flood coalescing: past saturation nothing new spawns; the
         // single ribbon carries the activity at constant cost, mutely.
         if m >= SATURATED {
             self.refresh_ribbon(now, pending, cfg, geom);
@@ -899,9 +819,9 @@ impl OutputStreak {
         self.comets.iter().take(cap).position(Option::is_none)
     }
 
-    /// GOVERNOR 6, opening half: one pip on the quiet→active crossing, then
-    /// mute. Honours the voice's own [`SOUND_MIN_GAP_MS`] floor; a denied fire
-    /// is simply not heard and does not re-arm.
+    /// Governor 6, opening half: one pip on the quiet→active crossing, then
+    /// mute. Honours [`SOUND_MIN_GAP_MS`]; a denied fire is not heard and does
+    /// not re-arm.
     fn open_episode_cue(
         &mut self,
         now: Instant,
@@ -948,11 +868,10 @@ impl OutputStreak {
         })
     }
 
-    /// PER-THEME CHARACTER, axis 2: the theme's cursor colour snapped to its
-    /// nearest named spectrum stop decides where on the arc this comet's head
-    /// ENTERS — Nord enters through the blue window, Gruvbox through amber,
-    /// Dracula through violet. Pure position selection on THE ONE SPECTRUM; the
-    /// per-comet genome only jitters within a stop's neighbourhood.
+    /// Per-theme character: the theme's cursor colour snapped to its nearest
+    /// named spectrum stop decides where on the arc the comet's head enters
+    /// (Nord through blue, Gruvbox through amber, Dracula through violet). The
+    /// per-comet genome only jitters within that stop's neighbourhood.
     fn hue_for(&self, pending: Pending, cfg: &StreakConfig) -> f32 {
         let named = nearest_spectrum_stop_by_hue(cfg.theme_cursor);
         let anchor = spectrum_stop_position(named);
@@ -964,52 +883,32 @@ impl OutputStreak {
         (anchor + jitter).clamp(0.0, 1.0)
     }
 
-    /// Refresh (or open) the flood ribbon on the newest output row.
-    /// Refresh — or open, or MOVE — the flood ribbon, spending an ignition to
-    /// move it, because moving it is one.
+    /// Refresh, open or move the flood ribbon on the newest output row, spending
+    /// an ignition to move it.
     ///
-    /// MOVING THE RIBBON IS AN EDGE ON TWO ROWS AT ONCE: it takes light off
-    /// every cell of the row it leaves and puts light on every cell of the row
-    /// it arrives at, inside one frame. That is an ignition by the same
-    /// definition GOVERNOR 2 applies to a comet, and until 2026-09-01 it was
-    /// exempt from GOVERNOR 2's floor — this ran on EVERY licensed observation.
+    /// Moving the ribbon takes light off every cell of one row and puts it on
+    /// another within a frame, so it is an ignition by governor 2's definition.
+    /// The host samples the anchor row from the live cursor each frame, so a
+    /// program whose cursor alternates between two rows (a two-line progress
+    /// display, a multi-line spinner, a flood sampled mid-line and after the
+    /// newline) would otherwise re-home the ribbon at the frame rate (about 100
+    /// times a second at 120 Hz; with the floor, 1.25).
+    /// [`Self::a_two_row_alternation_cannot_strobe_the_ribbon`] pins it.
     ///
-    /// The host samples the anchor row from the LIVE CURSOR once a frame
-    /// (`note_output_cells`: the cursor's own row mid-line, the row above it at
-    /// column 0), so a program whose cursor sits on two rows in turn — a
-    /// two-line progress display, a multi-line spinner, or a scrolling flood
-    /// sampled sometimes mid-line and sometimes just after the newline — handed
-    /// this engine alternating rows at the frame rate, and the ribbon answered
-    /// every one of them. MEASURED on the mechanism, 8 s of a two-row
-    /// alternation at 120 Hz: **811 re-homes, 101.4 per second**. With this
-    /// floor: 10, i.e. 1.25 per second.
-    /// [`Self::a_two_row_alternation_cannot_strobe_the_ribbon`] pins it and is
-    /// RED without the floor.
+    /// Sharing `last_spawn` with the comet floor means a cell cannot get a comet
+    /// edge and a ribbon edge within one [`SPAWN_MIN_GAP_MS`]. The continuous
+    /// terms (the linger clock `since_output_s` and the hue drift in
+    /// [`Self::advance_ribbon`]) refresh on every observation; they only recolour.
     ///
-    /// SHARING `last_spawn` WITH THE COMET FLOOR IS THE POINT, not an economy.
-    /// One clock means a cell cannot be handed a comet edge and a ribbon edge
-    /// inside the same [`SPAWN_MIN_GAP_MS`], so the per-cell edge rate is bounded
-    /// by the one floor rather than by the sum of two independent ones.
-    ///
-    /// THE CONTINUOUS TERMS ARE NOT EDGES and still refresh on every
-    /// observation: the linger clock (`since_output_s`), and the hue drift that
-    /// rides it in [`Self::advance_ribbon`]. Neither puts light on a cell nor
-    /// takes it off; they only recolour light already there.
-    ///
-    /// WHAT IT COSTS, VISIBLY, so nobody meets it as a surprise: the ribbon can
-    /// now LAG the newest output row by up to [`SPAWN_MIN_GAP_MS`]. On the flood
-    /// this exists for — `cat bigfile`, a build log scrolling at the bottom of
-    /// the screen — the anchor row does not move and nothing changes. On a flood
-    /// still FILLING a fresh screen it steps down at the ignition rate instead
-    /// of following every line. That is the right way round: the ribbon is a
-    /// constant-cost wash saying "output is pouring", not a cursor.
+    /// Cost: the ribbon can lag the newest output row by up to
+    /// [`SPAWN_MIN_GAP_MS`]. On a flood scrolling at the bottom of the screen the
+    /// anchor row does not move; on a flood filling a fresh screen the ribbon
+    /// steps down at the ignition rate. It is a wash, not a cursor.
     fn refresh_ribbon(&mut self, now: Instant, pending: Pending, cfg: &StreakConfig, geom: Geom) {
-        // CLIP FIRST, so the unchanged-geometry test below compares the span
-        // this call would STORE against the span already stored. Comparing an
-        // unclipped `pending` against a clipped `Ribbon` reports a change on
-        // every frame of any flood whose span runs past the last column, and the
-        // ribbon would then re-home at the ignition floor forever — a slower
-        // strobe rather than no strobe.
+        // Clip first, so the unchanged-geometry test compares the span this call
+        // would store with the stored one; comparing an unclipped span would
+        // report a change every frame for a flood past the last column and
+        // re-home at the ignition floor forever.
         let Some((from_col, to_col)) = clipped_span(pending, geom.cols) else {
             return;
         };
@@ -1078,13 +977,11 @@ impl OutputStreak {
             // so a comet has no flash rate to bound.
             let life = 1.0 - c.progress;
             let head = c.from_col as f32 + (c.to_col - c.from_col) as f32 * c.progress;
-            // The entire comet, including its tail, belongs to licensed ink.
-            // A one-cell rewrite must not sweep the nine unchanged cells to
-            // its left just because the configured tail is nine cells long.
+            // The whole comet, tail included, belongs to licensed ink: a one-cell
+            // rewrite must not sweep nine unchanged cells to its left.
             let tail_start = (head - f32::from(c.tail)).max(c.from_col as f32);
-            // `row_sweep_cells(from - 1, to)` is exactly this inclusive
-            // same-row range. Emit it directly: no temporary Vec, no resident
-            // scratch to clear, and the hot tick keeps its no-allocation law.
+            // `row_sweep_cells(from - 1, to)` is this inclusive same-row range;
+            // emitted directly, keeping the tick allocation-free.
             for col in tail_start.floor() as i32..=head.round() as i32 {
                 let u = ((head - col as f32) / f32::from(c.tail).max(1.0)).clamp(0.0, 1.0);
                 // Bright head, fading tail; squared so the tail thins fast and
@@ -1107,10 +1004,9 @@ impl OutputStreak {
         }
 
         if let Some(r) = self.ribbon {
-            // The ribbon is a FLAT, constant-cost texture: no head, no sweep,
-            // one steady low-amplitude wash whose hue drifts at `RIBBON_DRIFT`
-            // (a fraction of a hertz in luminance — see its doc; the re-home,
-            // not the drift, is the edge the ignition floor charges).
+            // The ribbon is a flat, constant-cost wash: no head or sweep, low
+            // amplitude, hue drifting at `RIBBON_DRIFT` (the re-home, not the
+            // drift, is the edge the ignition floor charges).
             let fade =
                 1.0 - (r.since_output_s / (RIBBON_LINGER_MS as f32 / 1000.0)).clamp(0.0, 1.0) * 0.5;
             for col in r.from_col..=r.to_col {
@@ -1150,9 +1046,8 @@ impl OutputStreak {
             return;
         }
         let peak = (ALPHA_DEFAULT * cfg.intensity.clamp(0.0, 1.0)).min(ALPHA_CLAMP);
-        // GOVERNOR 5 / axis 1: on a light ground the same light is halved AND
-        // flipped to a tinted shadow — additive light can only brighten, so on a
-        // pale theme the additive form would simply not exist.
+        // Governor 5: on a light ground the light is halved and flipped to a
+        // tinted shadow, since additive light cannot darken a pale ground.
         let amp = if cfg.dark_theme { peak } else { peak * 0.5 };
         let a = (amp * shape.clamp(0.0, 1.0) * 255.0).round() as u8;
         if a == 0 {
@@ -1166,9 +1061,8 @@ impl OutputStreak {
         if cfg.dark_theme {
             push_grid_quad(out, geom, x, y, w, h, premul_rgb(base, a), 0);
         } else {
-            // SHADOW-SHIMMER: the spectrum hue pulled toward the near-black pole
-            // and grounded toward the theme's own ink for legibility, composited
-            // source-over so it can actually darken.
+            // Shadow shimmer: the spectrum hue pulled toward black and toward the
+            // theme's ink for legibility, composited source-over so it darkens.
             let shade = lerp_rgb(lerp_rgb(base, 0x0000_0000, 0.55), cfg.theme_fg, 0.25);
             push_grid_quad(out, geom, x, y, w, h, premul_rgb(shade, a), a);
         }
@@ -1324,8 +1218,8 @@ mod tests {
         (cues, peak)
     }
 
-    /// FIRST OBSERVATION BASELINES: attaching to a session that already has a
-    /// counter mints nothing, so a fresh window never bursts for history.
+    /// First observation baselines: attaching to a session with a counter mints
+    /// nothing.
     #[test]
     fn first_observation_baselines_and_mints_nothing() {
         let t0 = Instant::now();
@@ -1340,10 +1234,9 @@ mod tests {
         );
     }
 
-    /// THE TOKEN LAW: an UNCHANGED token is no arrival — a screen repainted
-    /// byte-identically has produced no output however busy its byte stream is
-    /// — and an explicit [`OutputStreak::rebase`] (the session/tab-switch seam)
-    /// makes the next observation baseline instead of answering the swap.
+    /// An unchanged token is no arrival (a byte-identical repaint produced no
+    /// output), and [`OutputStreak::rebase`] makes the next observation baseline
+    /// instead of answering the swap.
     #[test]
     fn an_unchanged_token_is_no_arrival_and_rebase_baselines() {
         let t0 = Instant::now();
@@ -1553,8 +1446,8 @@ mod tests {
         );
     }
 
-    /// THE ECHO DISCOUNT: accepted editor input — by post-write receipt OR by
-    /// the host's active/spill `input_hot` flag — mints nothing.
+    /// Echo discount: accepted editor input (post-write receipt or the host's
+    /// `input_hot` flag) mints nothing.
     #[test]
     fn echo_discount_mints_nothing_including_paste() {
         let t0 = Instant::now();
@@ -1593,9 +1486,8 @@ mod tests {
         );
     }
 
-    /// EMPTY DAMAGE MINTS NOTHING: a content-counter step carrying no
-    /// ink-bearing span (the `\x1b[2K`-over-blank case) licences nothing, so an
-    /// idle TUI redrawing its chrome never shimmers.
+    /// Empty damage mints nothing: a counter step with no ink-bearing span (the
+    /// `\x1b[2K`-over-blank case) licenses nothing.
     #[test]
     fn empty_damage_mints_nothing() {
         let t0 = Instant::now();
@@ -1608,7 +1500,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// REDUCED MOTION IS EXACT ZERO, NOT EASED: amplitude 0 resets the machine,
+    /// Reduced motion is exact zero, not eased: amplitude 0 resets the machine,
     /// emits no quads, records no cue, and reports fingerprint 0.
     #[test]
     fn reduced_motion_emits_nothing() {
@@ -1633,8 +1525,7 @@ mod tests {
         assert!(!e.is_active(), "and the host may disarm the lane");
     }
 
-    /// OFF IS BYTE-IDENTICAL OFF: a disabled engine is inert no matter what it
-    /// is fed.
+    /// Off is byte-identical off: a disabled engine is inert whatever it is fed.
     #[test]
     fn disabled_is_inert() {
         let t0 = Instant::now();
@@ -1652,25 +1543,11 @@ mod tests {
         }
     }
 
-    /// A RIBBON RE-HOME IS AN IGNITION, and GOVERNOR 2's floor covers it.
-    ///
-    /// THE SHAPE THAT PRODUCED THE REGRESSION: the host samples the anchor row
-    /// from the live cursor once a frame, so a program whose cursor sits on two
-    /// rows in turn — a two-line progress display, a multi-line spinner, a
-    /// scrolling flood sampled sometimes mid-line and sometimes just after the
-    /// newline — hands this engine alternating rows at the frame rate.
-    /// `refresh_ribbon` used to answer every one by MOVING the ribbon, which
-    /// takes light off a whole row and puts it on another inside one frame.
-    ///
-    /// MEASURED on the mechanism at 120 Hz over 8 s, with the floor removed and
-    /// nothing else changed: **811 re-homes, 101.38 per second**. With it: 10,
-    /// i.e. 1.25 per second — [`SPAWN_MIN_GAP_MS`] doing for the ribbon exactly
-    /// what it already did for a comet.
-    ///
-    /// The bound is asserted against the FLOOR, not against the number I
-    /// happened to measure: a test that pins 11 fails when someone retunes
-    /// `SPAWN_MIN_GAP_MS` for an unrelated reason, and teaches them to update
-    /// the number rather than to think.
+    /// A ribbon re-home is an ignition, covered by governor 2's floor. A cursor
+    /// alternating between two rows every frame hands the engine alternating
+    /// anchor rows; the floor keeps re-homes to about 1.25 per second at 120 Hz
+    /// (about 100 without it). The bound is asserted against
+    /// [`SPAWN_MIN_GAP_MS`], not a measured count.
     #[test]
     fn a_two_row_alternation_cannot_strobe_the_ribbon() {
         let t0 = Instant::now();
@@ -1678,9 +1555,8 @@ mod tests {
         let cfg = cfg_on();
         let g = geom();
 
-        // 120 Hz for 8 s, the cursor alternating between two rows every frame,
-        // driven hard enough to stay past SATURATED so the ribbon is the only
-        // thing on glass (GOVERNOR 4).
+        // 120 Hz for 8 s, the cursor alternating rows every frame, past
+        // SATURATED so the ribbon is the only thing on glass (governor 4).
         let steps = 960u64;
         let hz = 120u64;
         let mut homes = 0u32;
@@ -1745,8 +1621,8 @@ mod tests {
         );
     }
 
-    /// THE SPAWN FLOOR bounds ignitions to the WCAG budget, and because a cue
-    /// rides only a spawn edge it bounds the ear with the same clamp.
+    /// The spawn floor bounds ignitions to the WCAG budget, and since a cue rides
+    /// only a spawn edge it bounds the sound too.
     #[test]
     fn the_spawn_gap_clamps_eye_and_ear_together() {
         let t0 = Instant::now();
@@ -1771,9 +1647,8 @@ mod tests {
         );
     }
 
-    /// THE EPISODE LAW: sustained-but-sparse output (the test-runner case) does
-    /// not drip one pip per spawn — it speaks once, then stays mute until the
-    /// metric drains, and closes with a single exhale.
+    /// The episode rule: sustained sparse output (a test runner) speaks once,
+    /// stays mute until the metric drains, and closes with one exhale.
     #[test]
     fn an_episode_is_one_pip_and_one_exhale() {
         let t0 = Instant::now();
@@ -1815,8 +1690,8 @@ mod tests {
         assert_eq!(exhales, 1, "one exhale closes it: {exhales}");
     }
 
-    /// IDLE-TO-ZERO: after the drain the engine reports inactive, owes no
-    /// deadline, and draws nothing — the host parks to a pure wait.
+    /// Idle to zero: after the drain the engine is inactive, owes no deadline,
+    /// and draws nothing.
     #[test]
     fn idle_settles_to_fingerprint_zero_and_no_deadline() {
         let t0 = Instant::now();
@@ -1943,8 +1818,8 @@ mod tests {
         assert!(e.idle_drained(last, &cfg));
     }
 
-    /// CLOCKLESS DETERMINISM: the same seed and the same injected `(now, input)`
-    /// script replay byte-identical quads and fingerprints.
+    /// Clockless determinism: the same seed and `(now, input)` script replay
+    /// byte-identical quads and fingerprints.
     #[test]
     fn identical_scripts_replay_identical_light() {
         let t0 = Instant::now();
@@ -1970,9 +1845,8 @@ mod tests {
         assert!(!a_quads.is_empty(), "NON-VACUITY: the script drew light");
     }
 
-    /// A DIFFERENT SEED IS A DIFFERENT COMET: the per-window variation actually
-    /// varies (the twin that keeps the determinism test above from passing
-    /// vacuously).
+    /// A different seed is a different comet (the per-window variation varies),
+    /// so the determinism test above is not vacuous.
     #[test]
     fn a_different_seed_draws_differently() {
         let t0 = Instant::now();
@@ -1992,9 +1866,8 @@ mod tests {
         assert_ne!(play(1), play(2));
     }
 
-    /// AMPLITUDE IS CLAMPED: no configuration — including one that asks for far
-    /// more than the ceiling — can put more than [`ALPHA_CLAMP`] of light on a
-    /// cell, and a light theme is halved again.
+    /// Amplitude is clamped: no configuration can put more than [`ALPHA_CLAMP`]
+    /// of light on a cell, and a light theme is halved again.
     #[test]
     fn no_configuration_can_exceed_the_amplitude_ceiling() {
         let t0 = Instant::now();
@@ -2026,10 +1899,8 @@ mod tests {
         }
     }
 
-    /// THE POLARITY FLIP: a light theme emits SOURCE-OVER shadow, a dark theme
-    /// emits ADDITIVE light — the fix for "additive light cannot darken a pale
-    /// ground", which would otherwise make the effect invisible on Solarized
-    /// Light.
+    /// Polarity: a light theme emits source-over shadow, a dark theme additive
+    /// light (additive light would be invisible on Solarized Light).
     #[test]
     fn light_themes_get_shadow_not_invisible_additive_light() {
         let t0 = Instant::now();
@@ -2063,8 +1934,8 @@ mod tests {
         );
     }
 
-    /// PER-THEME CHARACTER IS REAL: two themes whose cursor colours sit in
-    /// different spectrum windows enter the arc at different places.
+    /// Per-theme character: themes whose cursor colours sit in different spectrum
+    /// windows enter the arc at different places.
     #[test]
     fn different_themes_enter_the_spectrum_at_different_places() {
         let nord = StreakConfig {
@@ -2089,8 +1960,8 @@ mod tests {
         );
     }
 
-    /// THE SWEEP IS GAPLESS: every comet frame's cells form one contiguous run
-    /// on one row — the continuity contract inherited from `trail_sweep`.
+    /// The sweep is gapless: every comet frame's cells form one contiguous run on
+    /// one row.
     #[test]
     fn a_comet_paints_one_contiguous_run() {
         let t0 = Instant::now();
@@ -2112,48 +1983,5 @@ mod tests {
                 assert_eq!(pair[1] - pair[0], 1, "the sweep must be gapless: {xs:?}");
             }
         }
-    }
-
-    /// The docs on [`SPAWN_MIN_GAP_MS`] and [`OutputStreak`] say this engine
-    /// never reserves against the word-nova's flash limiter — that its 700 ms
-    /// floor is its OWN clock, not a draw on the window-wide budget. Prose is
-    /// not a check (the lesson `aterm_census::scope_census` OB-17 encodes), so
-    /// this pins the sentence to the source: the non-test half of this file has
-    /// no CODE line naming the limiter or its reservation entry points. Doc and
-    /// comment lines may name it — that is the DISCLAIMER the census's
-    /// `covers_prose_in` entry exists to keep — so they are skipped. Whoever
-    /// adds a real reservation here must rewrite those docs, and this test is
-    /// what tells them.
-    #[test]
-    fn the_engine_makes_no_flash_limiter_reservation_so_its_docs_may_say_so() {
-        let src = include_str!("output_streak.rs");
-        let (engine, _tests) = src
-            .split_once("#[cfg(test)]")
-            .expect("this file has exactly one test-module marker");
-        // Assembled at runtime so the needles never appear as code text in the
-        // scanned half — the test module sits after the split anyway, but a
-        // future move of this test must not make it match itself.
-        let needles: Vec<String> = [
-            ("Flash", "Limiter"),
-            ("Ignition", "Reservation"),
-            ("grant_", "ignition"),
-            ("grant_pane_", "ignition"),
-        ]
-        .iter()
-        .map(|(a, b)| format!("{a}{b}"))
-        .collect();
-        let offending: Vec<(usize, &str)> = engine
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim_start().starts_with("//"))
-            .filter(|(_, line)| needles.iter().any(|n| line.contains(n.as_str())))
-            .map(|(i, line)| (i + 1, line))
-            .collect();
-        assert!(
-            offending.is_empty(),
-            "output_streak.rs now names the word-nova's flash limiter in CODE: {offending:?}. \
-             If the engine has started reserving against it, rewrite the docs on \
-             SPAWN_MIN_GAP_MS, OutputStreak and the module header, which say it does not."
-        );
     }
 }

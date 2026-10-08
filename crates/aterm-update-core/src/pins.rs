@@ -59,7 +59,7 @@
 //! A delegation tier buys revocation ONLY if the root is genuinely elsewhere. A master
 //! that is ON PAPER is: it is present on no computer, it is touched only to mint or
 //! revoke a machine key, and a thief who takes a laptop gets a machine key that the
-//! master can revoke without them. See `docs/SIGNING-KEY-DESIGN.md`.
+//! master can revoke without them. See `docs/RELEASE-KEYS.md`.
 //!
 //! # Rotation
 //!
@@ -239,14 +239,10 @@ pub const fn roster_tier_armed() -> bool {
 ///
 /// 4. **Set the value below** to your 10-character Team ID (it is public — it
 ///    already appears in the `subject.OU` of every Developer-ID signature you
-///    ship). This step was taken on 2026-08-15, and taking it DELETED the tripwire
-///    assertion this checklist used to send the operator to remove
-///    (`the_shipped_anchor_is_unset_so_the_tier_is_inert`, in
-///    `crates/aterm-release/tests/it/apple_tier.rs`) — the instruction outlived the test it
-///    named, which is now defined nowhere in the tree. Its replacement,
-///    `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`, asserts the
-///    ARMED value directly, so a fork re-arming this anchor updates that assertion rather
-///    than deleting one. One reviewed diff.
+///    ship). Taken 2026-08-15;
+///    `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert` (in
+///    `crates/aterm-release/tests/it/apple_tier.rs`) asserts the ARMED value, so a fork
+///    re-arming this anchor updates that assertion. One reviewed diff.
 ///
 /// 5. **Cut a rehearsal first.** `--rehearse` and `--dry-run` deliberately sign
 ///    and notarize for real, so the rehearsal is a true proof that the whole path
@@ -279,9 +275,10 @@ pub const APPLE_TEAM_ID: &str = "A66A9P66Z7";
 /// (event 3077, "did not meet the Enterprise signing level requirements")
 /// whenever that changes — measured on 2026-09-15 on an installed
 /// `aterm-gui.exe` that had run the day before. Only a publicly trusted chain
-/// clears that policy: Azure Trusted Signing (the lane Microsoft recommends for
-/// exactly this) or a CA-issued code-signing certificate. A self-signed
-/// certificate, however widely trusted locally, does not, so it is not a lane.
+/// clears that policy: Azure Artifact Signing, formerly Trusted Signing (the
+/// lane Microsoft recommends for exactly this), or a CA-issued code-signing
+/// certificate. A self-signed certificate, however widely trusted locally, does
+/// not, so it is not a lane.
 ///
 /// # ACTIVATION CHECKLIST — turning Tier WINDOWS on
 ///

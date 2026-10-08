@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TOML 1.0.0 conformance, checked BOTH ways against the oracle: what the spec
-//! says must parse, and — the half that matters for a config parser — what the
-//! spec says must be REJECTED.
+//! TOML 1.0.0 conformance, checked both ways: what the spec says must parse,
+//! and — the half that matters for a config parser — what the spec says must
+//! be REJECTED.
 //!
 //! A parser that accepts a duplicate key, or lets a second `[table]` header
 //! silently reopen the first, makes the file an operator reads and the file the
@@ -24,26 +24,21 @@
 //! valid:    210 pass / 6 fail        invalid: 492 pass / 0 fail
 //! ```
 //!
-//! All six are TOML 1.1 DRAFTS, and `toml` 0.8.23 and `toml_edit` 0.22.27 both
-//! reject the same six — parity with the crates being replaced, not a gap:
+//! All six are TOML 1.1 DRAFTS:
 //! `datetime/no-seconds`, `inline-table/newline`, `inline-table/newline-comment`
 //! and `key/empty-05` (newlines inside inline tables), `string/escape-esc`
 //! (`\e`) and `string/hex-escape` (`\x`). Those are the omissions `lib.rs`
 //! names. `valid/spec-1.0.0/table-9`, `valid/utf8-bom-01` and
-//! `valid/utf8-bom-02` pass AND round-trip byte for byte, which the oracle does
-//! not manage for the BOM pair; `invalid/control/comment-del` is refused.
+//! `valid/utf8-bom-02` pass AND round-trip byte for byte;
+//! `invalid/control/comment-del` is refused.
 //!
 //! The suite is NOT a dev-dependency: `toml-test-data` carries 4.4 MB of assets
 //! and drags `include_dir` behind it, and dropping 509 deliberately-invalid
-//! `.toml` files into the tree would break the repository-corpus tests in
-//! `differential.rs` and `roundtrip.rs`, which walk every `.toml` in the repo.
+//! `.toml` files into the tree would break the repository-corpus test in
+//! `roundtrip.rs`, which walks every `.toml` in the repo.
 //! The cases it caught are transcribed below instead.
 
-mod common;
-
-use common::values_agree;
-
-/// Both implementations must accept these, and agree on what they mean.
+/// These must be accepted.
 const VALID: &[&str] = &[
     // Keys: bare, quoted, dotted, and the awkward spellings of each.
     "key = 1\nbare_key = 2\nbare-key = 3\n1234 = 4\n",
@@ -258,17 +253,11 @@ const INVALID: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn everything_the_spec_allows_parses_and_agrees_with_the_oracle() {
+fn everything_the_spec_allows_parses() {
     for source in VALID {
-        let ours: aterm_toml::Value = match aterm_toml::from_str(source) {
-            Ok(v) => v,
-            Err(e) => panic!("we rejected valid TOML {source:?}: {e}"),
-        };
-        let theirs: toml::Value = match toml::from_str(source) {
-            Ok(v) => v,
-            Err(e) => panic!("the oracle rejected {source:?}: {e}"),
-        };
-        values_agree(&ours, &theirs).unwrap_or_else(|why| panic!("{source:?}: {why}"));
+        if let Err(e) = aterm_toml::from_str::<aterm_toml::Value>(source) {
+            panic!("we rejected valid TOML {source:?}: {e}");
+        }
 
         // And the document half reproduces the source exactly.
         let document: aterm_toml::edit::DocumentMut = source
@@ -283,26 +272,17 @@ fn everything_the_spec_allows_parses_and_agrees_with_the_oracle() {
 }
 
 #[test]
-fn everything_the_spec_forbids_is_refused_by_both() {
+fn everything_the_spec_forbids_is_refused() {
     let mut ours_accepted = Vec::new();
-    let mut oracle_accepted = Vec::new();
     for (source, rule) in INVALID {
         if aterm_toml::from_str::<aterm_toml::Value>(source).is_ok() {
             ours_accepted.push(format!("  {rule}: {source:?}"));
-        }
-        if toml::from_str::<toml::Value>(source).is_ok() {
-            oracle_accepted.push(format!("  {rule}: {source:?}"));
         }
     }
     assert!(
         ours_accepted.is_empty(),
         "we accepted invalid TOML:\n{}",
         ours_accepted.join("\n")
-    );
-    assert!(
-        oracle_accepted.is_empty(),
-        "the oracle accepted these, so the rule as written is wrong:\n{}",
-        oracle_accepted.join("\n")
     );
 }
 
@@ -378,12 +358,6 @@ fn multiline_strings_handle_delimiter_runs() {
             Some(expected),
             "{source:?}"
         );
-        let theirs: toml::Value =
-            toml::from_str(source).unwrap_or_else(|e| panic!("oracle: {source:?}: {e}"));
-        assert_eq!(
-            theirs.get("s").and_then(toml::Value::as_str),
-            Some(expected)
-        );
     }
     assert!(
         aterm_toml::from_str::<aterm_toml::Value>("s = \"\"\"a\"\"\"\"\"\"\n").is_err(),
@@ -391,13 +365,9 @@ fn multiline_strings_handle_delimiter_runs() {
     );
 }
 
-/// The one deliberate divergence from the oracle, pinned so it cannot drift
-/// into being accidental.
-///
 /// TOML does not say what an implementation should do with a finite literal
-/// that overflows binary64. `toml` 0.8.23 refuses `1e400` and accepts `-1e400`
-/// as negative infinity — an asymmetry that would let `timeout = -1e400` slip
-/// into a config while the positive typo is caught. This crate refuses both.
+/// that overflows binary64. This crate refuses both signs, so `timeout =
+/// -1e400` cannot slip into a config as negative infinity.
 #[test]
 fn overflowing_float_literals_are_refused_in_both_signs() {
     for source in [
@@ -418,127 +388,96 @@ fn overflowing_float_literals_are_refused_in_both_signs() {
         value.get("x").and_then(aterm_toml::Value::as_float),
         Some(0.0)
     );
-    assert_eq!(
-        toml::from_str::<toml::Value>("x = 1e-400\n")
-            .expect("oracle agrees")
-            .get("x")
-            .and_then(toml::Value::as_float),
-        Some(0.0)
-    );
-
-    // The evidence for the asymmetry, so a future reader does not have to
-    // re-derive it: the oracle really does accept the negative one.
-    assert!(toml::from_str::<toml::Value>("x = 1e400\n").is_err());
-    assert!(toml::from_str::<toml::Value>("x = -1e400\n").is_ok());
 }
 
 // ---------------------------------------------------------------------------
 // How an error PRINTS, and where it points
 // ---------------------------------------------------------------------------
 
-/// The rendered diagnostic is byte-identical to the oracle's.
+/// The rendered diagnostic carries the source line.
 ///
 /// This is not cosmetic. `native_config_language::analyze` puts
 /// `error.to_string()` — whitespace-flattened — into the config editor's status
 /// bar, so the SOURCE LINE inside the annotated snippet is the part that tells
-/// the operator `font_px` is the key at fault. An error that named only a line
-/// and column would pass every type check and make the editor useless, which is
-/// exactly what happened the first time this crate was wired in.
+/// the operator `font_px` is the key at fault.
 #[test]
-fn a_schema_error_renders_exactly_what_toml_renders() {
+fn a_schema_error_renders_the_offending_line() {
     #[derive(Debug, serde::Deserialize)]
     #[allow(dead_code)]
     struct Config {
         font_px: f64,
     }
 
-    for source in [
-        "font_px = \"huge\"\n",
-        "font_px = \"not-a-number\"\n",
-        "font_px = true\n",
-        "# a comment first\nfont_px = [1]\n",
+    for (source, rendered, span) in [
+        (
+            "font_px = \"huge\"\n",
+            "TOML parse error at line 1, column 11\n  |\n1 | font_px = \"huge\"\n  |           ^^^^^^\ninvalid type: string \"huge\", expected f64\n",
+            10..16,
+        ),
+        (
+            "font_px = true\n",
+            "TOML parse error at line 1, column 11\n  |\n1 | font_px = true\n  |           ^^^^\ninvalid type: boolean `true`, expected f64\n",
+            10..14,
+        ),
+        (
+            "# a comment first\nfont_px = [1]\n",
+            "TOML parse error at line 2, column 11\n  |\n2 | font_px = [1]\n  |           ^^^\ninvalid type: sequence, expected f64\n",
+            28..31,
+        ),
     ] {
         let ours = aterm_toml::from_str::<Config>(source).expect_err("refused");
-        let theirs = toml::from_str::<Config>(source).expect_err("the oracle refuses too");
         assert_eq!(
             ours.to_string(),
-            theirs.to_string(),
-            "the rendered diagnostic differs for {source:?}"
+            rendered,
+            "the rendered diagnostic for {source:?}"
         );
-        assert_eq!(
-            ours.span(),
-            theirs.span(),
-            "the span differs for {source:?}"
-        );
+        assert_eq!(ours.span(), Some(span), "the span for {source:?}");
     }
 }
 
 /// END OF INPUT IS ON THE LAST AUTHORED LINE, and its span is EMPTY.
 ///
-/// Both halves are the oracle's convention and both are load-bearing:
+/// Both halves are load-bearing:
 /// `native_config_language::parser_diagnostic_range` turns an empty span at or
 /// past the end of input into a caret on the last authored byte, so a caret the
 /// operator can see. A span covering the whole unterminated construct is not
 /// empty, misses that path, and underlines the opening bracket instead —
 /// measured, and the reason this test exists.
 #[test]
-fn end_of_input_errors_point_where_the_oracle_points() {
-    for source in [
-        "x = [ ",
-        "x = [1, 2\n",
-        "# Manual\nfont_px = [ \n",
-        "x = [\n\n",
+fn end_of_input_errors_point_at_the_last_authored_line() {
+    for (source, position) in [
+        ("x = [ ", "TOML parse error at line 1, column 7"),
+        ("x = [1, 2\n", "TOML parse error at line 1, column 11"),
+        (
+            "# Manual\nfont_px = [ \n",
+            "TOML parse error at line 2, column 14",
+        ),
+        ("x = [\n\n", "TOML parse error at line 2, column 2"),
     ] {
         let ours = source
             .parse::<aterm_toml::edit::DocumentMut>()
             .expect_err("refused");
-        let theirs = source
-            .parse::<toml_edit::DocumentMut>()
-            .expect_err("the oracle refuses too");
-        assert_eq!(ours.span(), theirs.span(), "span differs for {source:?}");
         let span = ours.span().expect("a refusal carries a span");
         assert!(span.is_empty(), "{source:?} must report an EMPTY span");
         assert_eq!(span.start, source.len(), "and it must be at end of input");
         // The rendered position, which is what the editor's "Ln 2, Col 13"
-        // comes from: the LAST AUTHORED line, not the blank one after it.
-        let ours_first = ours.to_string();
-        let theirs_first = theirs.to_string();
-        let position = |text: &str| {
-            text.lines()
-                .next()
-                .expect("the first line carries the position")
-                .to_owned()
-        };
+        // comes from.
         assert_eq!(
-            position(&ours_first),
-            position(&theirs_first),
-            "line/column differ for {source:?}"
+            ours.to_string().lines().next(),
+            Some(position),
+            "line/column for {source:?}"
         );
     }
 }
 
-/// A DELIBERATE DIVERGENCE, pinned so it cannot rot into an unnoticed one.
-///
-/// Our spans underline the offending TOKEN; the oracle's mark the single byte
-/// where its parser combinator gave up. Measured over the [`INVALID`] corpus,
-/// the two agree on 13 of 55 and differ on the rest — `int = 010` is ours
-/// `6..9` (the literal) against the oracle's `7..8` (the byte after the zero).
-/// Ours is the more useful underline and nothing in this tree depends on the
-/// other convention: the ONE place that did — an empty end-of-input span — is
-/// matched exactly, above.
-///
-/// What IS required of every span is asserted here for all 55: in range, and
-/// pointing at a byte boundary of the source.
+/// Our spans underline the offending TOKEN (`int = 010` is `6..9`, the
+/// literal). Every span is in range and lands on a character boundary.
 #[test]
-fn token_spans_are_wider_than_the_oracles_and_that_is_deliberate() {
-    let mut agree = 0usize;
+fn token_spans_underline_the_token() {
     for (source, why) in INVALID {
         let ours = source
             .parse::<aterm_toml::edit::DocumentMut>()
             .expect_err(why);
-        let theirs = source
-            .parse::<toml_edit::DocumentMut>()
-            .expect_err("the oracle refuses it too");
         let span = ours.span().expect("every refusal carries a span");
         assert!(
             span.end <= source.len() && span.start <= span.end,
@@ -548,21 +487,9 @@ fn token_spans_are_wider_than_the_oracles_and_that_is_deliberate() {
             source.is_char_boundary(span.start) && source.is_char_boundary(span.end),
             "{why}: span {span:?} splits a character in {source:?}"
         );
-        if ours.span() == theirs.span() {
-            agree += 1;
-        }
     }
-    assert_eq!(
-        agree, 13,
-        "the span conventions moved — re-read the note above before re-pinning"
-    );
-    // The named example, so the note above is checkable rather than folklore.
     let ours = "int = 010\n"
         .parse::<aterm_toml::edit::DocumentMut>()
         .expect_err("a leading zero is refused");
-    let theirs = "int = 010\n"
-        .parse::<toml_edit::DocumentMut>()
-        .expect_err("the oracle refuses it too");
     assert_eq!(ours.span(), Some(6..9), "ours underlines the literal");
-    assert_eq!(theirs.span(), Some(7..8), "the oracle marks one byte");
 }

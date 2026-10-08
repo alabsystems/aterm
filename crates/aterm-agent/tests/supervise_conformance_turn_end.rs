@@ -1,85 +1,51 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `SupervisorTurnEnd` (aterm-spec `supervisor_turn_end_model`):
-//! the REAL turn-end decider (`decide_turn_end`, with the real
-//! `TurnEndState` it keeps) driven along EVERY reachable state of the model
-//! — fully automatic (no cap, the owner's default) and under a cap the owner
-//! wrote.
+//! Tier-1 for `SupervisorTurnEnd` (aterm-spec `supervisor_turn_end_model`): the
+//! real turn-end decider (`decide_turn_end`, with its `TurnEndState`) driven
+//! along every reachable state of the model, fully automatic (no cap, the
+//! default) and under a cap.
 //!
-//! Each model action is mirrored on the real side — a box or a wall on the
-//! screen is the reading the decider is handed, a person at the keyboard is
-//! the reading's `person` (a keystroke inside the grace), a draft left is
-//! the composer holding text (with that keystroke's grace), a wall's wait
-//! running out is the clock moved by the real retry ladder, a back-off
-//! running out is the clock moved by EXACTLY the real ladder's wait for the
-//! streak (so the growth — 2, 4, 8 … min — is the real one), a turn's yield
-//! is the next point `observe`d with that much busy work, an hour passing is
-//! the clock moved past the cap's window, and the model's `Continue`/`Retry`
-//! and `SubmitDraft` are the real decider's own act, recorded with `acted`
-//! — and at every state the real verdict is checked against the model: it
-//! types a continuation exactly where `Continue` is enabled, a retry exactly
-//! where `Retry` is, submits a draft exactly where `SubmitDraft` is, waits
-//! where a wall's wait, a person or a back-off holds it, and escalates only
-//! where the owner's cap is spent — and, at an act's point that showed no
-//! busy read (`pending` 3), waits for its deadline and then acts or waits,
-//! never nothing (the latch lane B2's review found: at every free point the
-//! real verdict is something). The walk runs twice: once with that point a
-//! reply that ended unseen, once with the act's `❯` row left unanswered —
-//! an act the worker never took, judged at the same deadline as the same
-//! short yield (escalated as "not taken" until 2026-09-24). Each state's verdict is
-//! the loop's: the point folded in again with no work (`observe`), then
-//! decided — as `turn_end_now` does at a deadline. The model's invariants
-//! are checked at every state. NEGATIVE CONTROLS: at the state with a box
-//! up — and with a person at the keyboard — and everything else free, the
-//! real decider types nothing while the `Buggy = 1` model would; and the
-//! `Buggy` model escalates a worker that "reports done", which the real
-//! decider never does — so a green walk is not vacuous.
+//! Each model action is mirrored on the real side: a box or wall is the
+//! reading handed to the decider, a person is a keystroke inside the grace, a
+//! draft is composer text, waits run out by moving the clock through the real
+//! retry and back-off ladders, and `Continue`/`Retry`/`SubmitDraft` are the
+//! decider's own acts, recorded with `acted`. At every state the real verdict
+//! types a continuation, a retry or a draft submit exactly where the model
+//! enables it, waits where a wall, person or back-off holds, escalates only
+//! where the cap is spent, and at an act's point with no busy read waits for
+//! its deadline and then acts or waits, never nothing. The walk runs with that
+//! point a reply that ended unseen and with the act's `❯` row unanswered.
 //!
-//! THE TASK (D1 of the live E2E of 2026-09-26): the walk WRITES the
-//! conversation's record as it goes — a person's prompt and its answer for
-//! `HumanWork`; for `HarnessTurn` the harness's own marked turn and a
-//! `keep going` of the supervisor's own (unmarked, known from its loop's
-//! ledger), each answered — and the reading's `taskless` is the REAL
-//! `harness::upgrade::transcript_tasked` over it and that ledger, checked
-//! against the model's `tasked` at every state: the harness's own turns
-//! never make a task, and at a state with none the real decider does
-//! nothing at all.
+//! The task: the walk writes the conversation's record as it goes, and the
+//! reading's `taskless` is the real `harness::upgrade::transcript_tasked`,
+//! checked against the model's `tasked`: the harness's own turns never make a
+//! task, and with none the decider does nothing. A `HarnessTurn` (the host's
+//! typed turn, `TurnEndState::host_typed`) answered short never moves the
+//! streak; a `HarnessTurnLong` ends it.
 //!
-//! THE HARNESS'S TURNS ARE NO SHORT TURNS OF THE WORKER'S (N1 of the live
-//! E2E of 2026-09-26): a `HarnessTurn` is the turn the session's host typed
-//! (`TurnEndState::host_typed`), answered short, in a session with a task
-//! or without; the real streak and its wait are checked against the model's
-//! at every state after it — unmoved — and the decider continues at once
-//! where the worker's own work earned no back-off. A `HarnessTurnLong` is
-//! the same turn answered with real work (a carry-on's answer is the
-//! worker's own work, resumed): the real streak ends with the model's, and
-//! a back-off the worker's short turn had started is over. NEGATIVE
-//! CONTROLS: the same short answer read as someone else's turn (the host's
-//! turn not registered, the regression) backs a free point off where the
-//! model continues, and the `Buggy` model that counts it so is caught by
-//! `NeverBackOffForTheHarness`; the `Buggy` model whose long answer leaves
-//! the streak standing is caught by `NeverBackOffAfterRealWork`.
+//! Every walk runs over what the turn ends on: a report (`continue@v1`'s `keep
+//! going`) and a choice asked in prose (`answer@v1`'s `answer_text`, and the
+//! `prose-long-term@v1`/`prose-short-term@v1` texts per question priority):
+//! the harness answers and goes on (owner, 2026-09-25).
 //!
-//! Every walk runs twice more over what the turn ends on: a report (`Stage
-//! done.`), whose `Continue` is `continue@v1`'s `keep going`, and a CHOICE
-//! asked in prose (`Should I rewrite the parser or patch the lexer?`), whose
-//! `Continue` is `answer@v1`'s `answer_text` (the owner directive of
-//! 2026-09-25: the harness answers and goes on): the same model, so an
-//! answered choice is exactly a continuation — the same switch, cap, back-off
-//! and walls — and nothing else. Each walk requires its own rule on every
-//! `Continue` it sees.
+//! Negative controls: with a box up or a person present the real decider types
+//! nothing where the `Buggy = 1` model would; the `Buggy` model escalates a
+//! worker that reports done; a host turn not registered backs off where the
+//! model continues (`NeverBackOffForTheHarness`); and a long answer that
+//! leaves the streak standing is caught by `NeverBackOffAfterRealWork`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::upgrade::transcript_tasked;
-use aterm_agent::supervise::SupervisorConfig;
+use aterm_agent::supervise::approvals::Typed;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
     Composer, RULE_ANSWER, RULE_API_RETRY, RULE_CONTINUE, TurnEndAction, TurnEndReading,
     TurnEndState, TurnEndTiming, decide_turn_end,
 };
+use aterm_agent::supervise::{QuestionPriority, SupervisorConfig};
 use aterm_phase::WallKind;
 use aterm_spec::derive::{Model, supervisor_turn_end_model};
 
@@ -106,15 +72,28 @@ const CHOICE: &str = "Should I rewrite the parser or patch the lexer?";
 thread_local! {
     /// What this walk's turns end on ([`REPORT`], [`CHOICE`]).
     static SAID: std::cell::Cell<&'static str> = const { std::cell::Cell::new(REPORT) };
+    /// The question priority this walk's policy answers a choice by.
+    static PRIORITY: std::cell::Cell<QuestionPriority> =
+        const { std::cell::Cell::new(QuestionPriority::Recommended) };
 }
 
 /// The rule a `Continue` of the walk under way types: `continue@v1` after a
-/// report, `answer@v1` after a choice.
+/// report, after a choice the priority's answer — `answer@v1` under
+/// `recommended`, else `prose-<word>@v1`.
 fn continue_rule() -> &'static str {
     if SAID.with(std::cell::Cell::get) == CHOICE {
-        RULE_ANSWER
+        PRIORITY.with(std::cell::Cell::get).prose_rule_id()
     } else {
         RULE_CONTINUE
+    }
+}
+
+/// The owner's policy for the walk under way: the defaults, answering a
+/// choice by the walk's priority word.
+fn policy() -> SupervisorConfig {
+    SupervisorConfig {
+        question_priority: PRIORITY.with(std::cell::Cell::get),
+        ..SupervisorConfig::default()
     }
 }
 
@@ -123,13 +102,16 @@ fn continue_rule() -> &'static str {
 /// conversation's record holds them.
 const PERSON: &str = r#"{"type":"user","message":{"role":"user","content":"Stage the parser."}}"#;
 const HARNESS: &str = r#"{"type":"user","message":{"role":"user","content":"[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.283."}}"#;
-const SUPERVISOR: &str = r#"{"type":"user","message":{"role":"user","content":"keep going"}}"#;
+const SUPERVISOR: &str = r#"{"type":"user","timestamp":"1970-01-01T00:00:01.000Z","message":{"role":"user","content":"keep going"}}"#;
 const ANSWER: &str = r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"ok"}]}}"#;
 
-/// What the session's supervisor typed, as its ledger records it
-/// (`supervise::approvals::typed_texts`).
-fn ours() -> Vec<String> {
-    vec![SupervisorConfig::default().continue_text]
+/// What the session's supervisor typed, and when, as its ledger records it
+/// (`supervise::approvals::typed_texts`): [`SUPERVISOR`] as it was recorded.
+fn ours() -> Vec<Typed> {
+    vec![Typed {
+        at_ms: 1_000,
+        text: SupervisorConfig::default().continue_text,
+    }]
 }
 
 /// The screen the model state stands for; `unanswered`: the act's `❯` row
@@ -161,6 +143,7 @@ fn reading(
             String::new()
         },
         reset_at: None,
+        jitter: Duration::ZERO,
         resumes_by_itself: false,
         composer: if st["draft"] == 1 && st["box_up"] == 0 {
             Composer::Typed
@@ -187,6 +170,7 @@ fn reading(
         sandbox_fell: None,
         thread_model: None,
         upgrade_goal: false,
+        account: None,
     }
 }
 
@@ -346,7 +330,7 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
         }
         "Continue" | "Retry" | "SubmitDraft" => {
             let r = seen(before, None);
-            let cfg = SupervisorConfig::default();
+            let cfg = policy();
             let a = decide_turn_end(&real.st, &r, &cfg, real.now);
             real.st.acted(&a, &r, real.now);
         }
@@ -454,12 +438,21 @@ fn walk(
 #[test]
 fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     let m = supervisor_turn_end_model();
-    for said in [REPORT, CHOICE] {
+    assert_eq!(QuestionPriority::Recommended.prose_rule_id(), RULE_ANSWER);
+    for (said, priority) in [
+        (REPORT, QuestionPriority::Recommended),
+        (CHOICE, QuestionPriority::Recommended),
+        // A choice under every text word: the policy texts ride the same
+        // switch, cap, back-off and walls as `answer_text`.
+        (CHOICE, QuestionPriority::LongTerm),
+        (CHOICE, QuestionPriority::ShortTerm),
+    ] {
         SAID.with(|s| s.set(said));
-        // FULLY AUTOMATIC: no cap, and nothing is ever escalated — with an
-        // unseen reply, and with an act never taken.
+        PRIORITY.with(|p| p.set(priority));
+        // Fully automatic: no cap, and nothing is ever escalated, with an
+        // unseen reply and with an act never taken.
         for variant in [false, true] {
-            let (states, acts) = walk(&m, &SupervisorConfig::default(), variant);
+            let (states, acts) = walk(&m, &policy(), variant);
             // 184 before any turn of the harness's (160 with a task), and
             // after each of its two the same 184 again — a short answer
             // moves nothing but their count, a long one only what any turn
@@ -479,7 +472,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         let capped = aterm_spec::interp::with_consts(&m, &[("Budget", 2)]);
         let cfg = SupervisorConfig {
             continue_per_hour: u32::try_from(cnst(&capped, "Budget")).unwrap(),
-            ..SupervisorConfig::default()
+            ..policy()
         };
         let (_, acts) = walk(&capped, &cfg, false);
         assert!(
@@ -488,8 +481,9 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         );
     }
     SAID.with(|s| s.set(REPORT));
+    PRIORITY.with(|p| p.set(QuestionPriority::Recommended));
 
-    // NEGATIVE CONTROLS: a box up, or a person at the keyboard, with
+    // Negative controls: a box up, or a person at the keyboard, with
     // nothing else in the way — the real decider types nothing, the Buggy
     // model would; and the Buggy model escalates "reports done".
     let base = Instant::now() + Duration::from_secs(3600);
@@ -526,7 +520,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     assert!(!m.action_enabled("Escalate", &done));
     assert!(buggy.action_enabled("Escalate", &done));
 
-    // D1: after the harness's own turn — its record the harness's alone —
+    // After the harness's own turn — its record the harness's alone —
     // the real decider does nothing, however long the point stands, while
     // the Buggy model (a reader that takes the harness's turn for a task)
     // types into it and is caught.
@@ -535,7 +529,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         !transcript_tasked(&record, &ours()),
         "the harness's own turns are no task"
     );
-    // NEGATIVE CONTROL: without the loop's ledger, its `keep going` reads as
+    // Negative control: without the loop's ledger, its `keep going` reads as
     // someone's — the ledger is what keeps the walk's record taskless.
     assert!(transcript_tasked(&record, &[]));
     let mut after = m.init_state();
@@ -566,7 +560,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     // N1: after the worker's real work, the upgrade's two turns — its
     // notice's READY and its carry-on's reply, each short — leave the point
     // free: the model continues, and so does the real decider, the host's
-    // turns registered as typed. NEGATIVE CONTROL: the same answers read as
+    // turns registered as typed. Negative control: the same answers read as
     // someone else's turns back the point off, and the Buggy model that
     // counts them so is caught.
     let mut st = asked(m.init_state());

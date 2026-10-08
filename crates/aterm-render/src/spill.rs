@@ -126,7 +126,7 @@ impl SpillGeom {
     /// clip and NOT fully contained in the grid box. Mirrors the renderer's
     /// clipping so a grid-interior emission is invisible to the spill
     /// fingerprint (typing-only frames must not advance the revision).
-    fn rect_touches_band(&self, x: usize, y: usize, w: usize, h: usize) -> bool {
+    fn rect_touches_band(&self, (x, y, w, h): Rect) -> bool {
         let xe = (x + w).min(self.frame_w);
         let ye = (y + h).min(self.frame_h);
         if x >= xe || y >= ye {
@@ -238,15 +238,68 @@ pub struct SpillBand {
     cover: Vec<u8>,
     // The previous frame's band-clipped emissions — the content fingerprint
     // that keeps the revision still on typing-only/settled frames.
-    prev_glow_under: Vec<GlowQuad>,
-    prev_fire: Vec<FirePatch>,
-    prev_glow: Vec<GlowQuad>,
-    prev_halo: Vec<RainHalo>,
-    // Scratch for the current frame's clip (swapped into prev_* on a raster).
-    cur_glow_under: Vec<GlowQuad>,
-    cur_fire: Vec<FirePatch>,
-    cur_glow: Vec<GlowQuad>,
-    cur_halo: Vec<RainHalo>,
+    prev: BandStreams,
+    // Scratch for the current frame's clip (swapped into `prev` on a raster).
+    cur: BandStreams,
+}
+
+/// One frame's band-clipped emissions, per window-absolute stream.
+#[derive(Default, PartialEq)]
+struct BandStreams {
+    glow_under: Vec<GlowQuad>,
+    fire: Vec<FirePatch>,
+    glow: Vec<GlowQuad>,
+    halo: Vec<RainHalo>,
+}
+
+impl BandStreams {
+    fn is_empty(&self) -> bool {
+        self.glow_under.is_empty()
+            && self.fire.is_empty()
+            && self.glow.is_empty()
+            && self.halo.is_empty()
+    }
+}
+
+/// A frame-space rect as `(x, y, w, h)` device px.
+type Rect = (usize, usize, usize, usize);
+
+/// The grid row and frame-space rect every window-absolute emission carries.
+trait Emission: Copy {
+    fn row(&self) -> usize;
+    fn rect(&self) -> Rect;
+}
+
+macro_rules! impl_emission {
+    ($($t:ty),*) => {$(
+        impl Emission for $t {
+            fn row(&self) -> usize {
+                self.row as usize
+            }
+            fn rect(&self) -> Rect {
+                (self.x as usize, self.y as usize, self.w as usize, self.h as usize)
+            }
+        }
+    )*};
+}
+impl_emission!(GlowQuad, FirePatch, RainHalo);
+
+/// Band-clip one emission stream into `dst` (allocation-reusing), mirroring the
+/// renderer's `row >= rows` skip so the fingerprint matches what the frame
+/// actually drew.
+fn clip_stream<T: Emission>(
+    dst: &mut Vec<T>,
+    src: &[T],
+    rows: usize,
+    geom: SpillGeom,
+    keep: impl Fn(&T) -> bool,
+) {
+    dst.clear();
+    dst.extend(
+        src.iter()
+            .filter(|q| q.row() < rows && keep(q) && geom.rect_touches_band(q.rect()))
+            .copied(),
+    );
 }
 
 impl SpillBand {
@@ -302,10 +355,10 @@ impl SpillBand {
         if geom.pad == 0 && geom.head == 0 {
             self.rects.clear();
             if self.geom != geom {
-                if self.has_prev_content() {
+                if !self.prev.is_empty() {
                     self.rev = self.rev.wrapping_add(1);
                 }
-                self.clear_content();
+                self.prev = BandStreams::default();
                 self.rgba = Vec::new();
                 self.color = Vec::new();
                 self.cover = Vec::new();
@@ -321,86 +374,23 @@ impl SpillBand {
         };
         let base_bg = renderer.frame_bg(input) & 0x00FF_FFFF;
 
-        // Band-clip the four window-absolute emission streams (mirroring the
-        // renderer's `row >= rows` skip so the fingerprint matches what the
-        // frame actually drew). Grid-interior emissions vanish here — the
-        // typing-only stability guarantee.
-        self.cur_glow_under.clear();
-        self.cur_glow_under.extend(
-            input
-                .glow_under
-                .iter()
-                .filter(|q| {
-                    (q.row as usize) < input.rows
-                        && geom.rect_touches_band(
-                            q.x as usize,
-                            q.y as usize,
-                            q.w as usize,
-                            q.h as usize,
-                        )
-                })
-                .copied(),
-        );
-        self.cur_fire.clear();
-        self.cur_fire.extend(
-            input
-                .fire_patch
-                .iter()
-                .filter(|q| {
-                    (q.row as usize) < input.rows
-                        && geom.rect_touches_band(
-                            q.x as usize,
-                            q.y as usize,
-                            q.w as usize,
-                            q.h as usize,
-                        )
-                })
-                .copied(),
-        );
-        self.cur_glow.clear();
-        self.cur_glow.extend(
-            input
-                .cursor_glow_add
-                .iter()
-                .filter(|q| {
-                    (q.row as usize) < input.rows
-                        && geom.rect_touches_band(
-                            q.x as usize,
-                            q.y as usize,
-                            q.w as usize,
-                            q.h as usize,
-                        )
-                })
-                .copied(),
-        );
+        // Band-clip the four window-absolute emission streams. Grid-interior
+        // emissions vanish here — the typing-only stability guarantee.
+        let (rows, cur) = (input.rows, &mut self.cur);
+        clip_stream(&mut cur.glow_under, &input.glow_under, rows, geom, |_| true);
+        clip_stream(&mut cur.fire, &input.fire_patch, rows, geom, |_| true);
+        clip_stream(&mut cur.glow, &input.cursor_glow_add, rows, geom, |_| true);
         // Excluded veils are dropped AT THE CLIP, so the veil policy is part
         // of the stream fingerprint: a flip with veils present re-rasters, a
         // flip without them is a no-op.
         let include_veils = !self.veils_excluded;
-        self.cur_halo.clear();
-        self.cur_halo.extend(
-            input
-                .glow_halo
-                .iter()
-                .filter(|q| {
-                    (q.row as usize) < input.rows
-                        && (include_veils || q.mode == HaloMode::Add)
-                        && geom.rect_touches_band(
-                            q.x as usize,
-                            q.y as usize,
-                            q.w as usize,
-                            q.h as usize,
-                        )
-                })
-                .copied(),
-        );
+        clip_stream(&mut cur.halo, &input.glow_halo, rows, geom, |q| {
+            include_veils || q.mode == HaloMode::Add
+        });
 
         let geom_changed = geom != self.geom;
         let bg_changed = base_bg != self.base_bg;
-        let streams_changed = self.cur_glow_under != self.prev_glow_under
-            || self.cur_fire != self.prev_fire
-            || self.cur_glow != self.prev_glow
-            || self.cur_halo != self.prev_halo;
+        let streams_changed = self.cur != self.prev;
         if !(geom_changed || bg_changed || streams_changed) {
             // Typing-only / settled / idle frame: rev, rects and bytes all still.
             self.rects.clear();
@@ -420,47 +410,17 @@ impl SpillBand {
         self.geom = geom;
         self.base_bg = base_bg;
 
-        if !self.has_prev_content() && !self.has_cur_content() {
+        if self.prev.is_empty() && self.cur.is_empty() {
             // A bg/geometry change under an all-transparent band: no visible
             // bytes changed, so the revision (the host's blit signal) holds.
             self.rects.clear();
-            self.adopt_cur();
-            return;
+        } else {
+            self.emit_dirty_rects(geom_changed || bg_changed);
+            self.rasterize();
+            self.rev = self.rev.wrapping_add(1);
         }
-
-        self.emit_dirty_rects(geom_changed || bg_changed);
-        self.rasterize();
-        self.adopt_cur();
-        self.rev = self.rev.wrapping_add(1);
-    }
-
-    fn has_prev_content(&self) -> bool {
-        !(self.prev_glow_under.is_empty()
-            && self.prev_fire.is_empty()
-            && self.prev_glow.is_empty()
-            && self.prev_halo.is_empty())
-    }
-
-    fn has_cur_content(&self) -> bool {
-        !(self.cur_glow_under.is_empty()
-            && self.cur_fire.is_empty()
-            && self.cur_glow.is_empty()
-            && self.cur_halo.is_empty())
-    }
-
-    fn clear_content(&mut self) {
-        self.prev_glow_under.clear();
-        self.prev_fire.clear();
-        self.prev_glow.clear();
-        self.prev_halo.clear();
-    }
-
-    /// Swap the just-clipped streams into the fingerprint (allocation-reusing).
-    fn adopt_cur(&mut self) {
-        std::mem::swap(&mut self.prev_glow_under, &mut self.cur_glow_under);
-        std::mem::swap(&mut self.prev_fire, &mut self.cur_fire);
-        std::mem::swap(&mut self.prev_glow, &mut self.cur_glow);
-        std::mem::swap(&mut self.prev_halo, &mut self.cur_halo);
+        // Swap the just-clipped streams into the fingerprint (allocation-reusing).
+        std::mem::swap(&mut self.prev, &mut self.cur);
     }
 
     /// Pack this update's dirty rects: the full band on a geometry/bg/policy
@@ -487,7 +447,7 @@ impl SpillBand {
         }
         // Frame-clipped bbox over every prev∪cur band emission rect.
         let mut bb: Option<(usize, usize, usize, usize)> = None;
-        let mut grow = |x: usize, y: usize, w: usize, h: usize| {
+        let mut grow = |(x, y, w, h): Rect| {
             let xe = (x + w).min(geom.frame_w);
             let ye = (y + h).min(geom.frame_h);
             if x >= xe || y >= ye {
@@ -498,17 +458,17 @@ impl SpillBand {
                 Some((bx, by, bxe, bye)) => (bx.min(x), by.min(y), bxe.max(xe), bye.max(ye)),
             });
         };
-        for q in self.prev_glow_under.iter().chain(&self.cur_glow_under) {
-            grow(q.x as usize, q.y as usize, q.w as usize, q.h as usize);
+        for q in self.prev.glow_under.iter().chain(&self.cur.glow_under) {
+            grow(q.rect());
         }
-        for q in self.prev_fire.iter().chain(&self.cur_fire) {
-            grow(q.x as usize, q.y as usize, q.w as usize, q.h as usize);
+        for q in self.prev.fire.iter().chain(&self.cur.fire) {
+            grow(q.rect());
         }
-        for q in self.prev_glow.iter().chain(&self.cur_glow) {
-            grow(q.x as usize, q.y as usize, q.w as usize, q.h as usize);
+        for q in self.prev.glow.iter().chain(&self.cur.glow) {
+            grow(q.rect());
         }
-        for q in self.prev_halo.iter().chain(&self.cur_halo) {
-            grow(q.x as usize, q.y as usize, q.w as usize, q.h as usize);
+        for q in self.prev.halo.iter().chain(&self.cur.halo) {
+            grow(q.rect());
         }
         let Some((bx, by, bxe, bye)) = bb else {
             return;
@@ -541,10 +501,10 @@ impl SpillBand {
             }
             let color = &mut self.color[off..off + n];
             let cover = &mut self.cover[off..off + n];
-            replay_flat_add(color, cover, s, &self.cur_glow_under);
-            replay_fire(color, cover, s, pad, &self.cur_fire);
-            replay_flat_add(color, cover, s, &self.cur_glow);
-            replay_halo(color, cover, s, &self.cur_halo);
+            replay_flat_add(color, cover, s, &self.cur.glow_under);
+            replay_fire(color, cover, s, pad, &self.cur.fire);
+            replay_flat_add(color, cover, s, &self.cur.glow);
+            replay_halo(color, cover, s, &self.cur.halo);
             off += n;
         }
         for ((c, a), out) in self
@@ -560,13 +520,7 @@ impl SpillBand {
 
 /// Strip-clip a frame-space emission rect; `None` when it misses the strip.
 #[inline]
-fn clip_to_strip(
-    s: StripRect,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-) -> Option<(usize, usize, usize, usize)> {
+fn clip_to_strip(s: StripRect, (x, y, w, h): Rect) -> Option<(usize, usize, usize, usize)> {
     let x0 = x.max(s.x);
     let y0 = y.max(s.y);
     let xe = (x + w).min(s.x + s.w);
@@ -579,65 +533,36 @@ fn clip_to_strip(
 /// `GlowQuad::alpha == 0` and premultiplied source-over otherwise (the
 /// rainbow bed is the live Over emitter) — restricted to one strip. Pure
 /// per-pixel functions of absolute coords, so the strip clip is
-/// byte-identical to the frame's own rasterization. The Over branch used to
-/// be missing here — an alpha-blind `add_sat` replay of the bed's Over quads
-/// — so a tall ribbon poking into the head band exported a seam-discontinuous
-/// sliver on light themes (2026-09-01 audit).
+/// byte-identical to the frame's own rasterization; without the Over branch a
+/// ribbon poking into the head band exports a seam-discontinuous sliver.
 ///
-/// A GRADIENT quad ([`GlowQuad::color2`], 2026-09-21) takes the frame's
-/// gradient branch: per column, colour and opacity are
-/// [`crate::glow_lerp`]'d between the quad's edges and composited
-/// source-over (which is `add_sat` wherever the opacity is 0). The column
+/// Every quad takes the frame's gradient law ([`GlowQuad::color2`]): per
+/// column, colour and opacity are [`crate::glow_lerp`]'d between the quad's
+/// edges and composited source-over. A FLAT quad is the
+/// lerp's bit-exact identity and source-over at opacity 0 is `add_sat` byte
+/// for byte, so this one loop replays both of the frame's branches. The column
 /// index is read against the quad's UNCLIPPED left edge, as the frame reads
-/// it, never the strip-clipped one. Until 2026-09-22 this replay read
-/// `color`/`alpha` alone: a ribbon slab poking into the head band exported
-/// its LEFT colour flat across the whole sliver, a flat-red strip over a
-/// red→blue ramp in the grid (the review measured 792 mismatching pixels).
+/// it, never the strip-clipped one; reading `color`/`alpha` alone would
+/// export a ramp's left colour flat across the sliver.
 fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[GlowQuad]) {
     for q in quads {
-        let Some((x0, y0, xe, ye)) =
-            clip_to_strip(s, q.x as usize, q.y as usize, q.w as usize, q.h as usize)
-        else {
+        let Some((x0, y0, xe, ye)) = clip_to_strip(s, q.rect()) else {
             continue;
         };
-        if !q.is_flat() {
-            let (a0, a1) = (u32::from(q.alpha), u32::from(q.alpha2));
-            let qw = u32::from(q.w);
-            for x in x0..xe {
-                // `x − q.x < q.w ≤ u16::MAX`, so the cast is exact.
-                let i = (x - q.x as usize) as u32;
-                let a = crate::glow_lerp(a0, a1, i, qw) as u8;
-                let c = crate::glow_lerp_rgb(q.color, q.color2, i, qw);
-                let ap = if a == 0 {
-                    max_channel(c)
-                } else {
-                    a.max(max_channel(c))
-                };
-                for y in y0..ye {
-                    let k = (y - s.y) * s.w + (x - s.x);
-                    color[k] = crate::over_premul(color[k], c, a);
-                    cover[k] = cover_union(cover[k], ap);
-                }
-            }
-            continue;
-        }
-        // The Over case occludes by its own opacity as well as its light —
-        // the solver's `a0` must reflect the paint's real coverage.
-        let ap = if q.alpha == 0 {
-            max_channel(q.color)
-        } else {
-            q.alpha.max(max_channel(q.color))
-        };
-        for y in y0..ye {
-            let row = (y - s.y) * s.w;
-            for x in x0..xe {
-                let i = row + (x - s.x);
-                color[i] = if q.alpha == 0 {
-                    add_sat(color[i], q.color)
-                } else {
-                    crate::over_premul(color[i], q.color, q.alpha)
-                };
-                cover[i] = cover_union(cover[i], ap);
+        let (a0, a1) = (u32::from(q.alpha), u32::from(q.alpha2));
+        let qw = u32::from(q.w);
+        for x in x0..xe {
+            // `x − q.x < q.w ≤ u16::MAX`, so the cast is exact.
+            let i = (x - q.x as usize) as u32;
+            let a = crate::glow_lerp(a0, a1, i, qw) as u8;
+            let c = crate::glow_lerp_rgb(q.color, q.color2, i, qw);
+            // The Over case occludes by its own opacity as well as its light —
+            // the solver's `a0` must reflect the paint's real coverage.
+            let ap = a.max(max_channel(c));
+            for y in y0..ye {
+                let k = (y - s.y) * s.w + (x - s.x);
+                color[k] = crate::over_premul(color[k], c, a);
+                cover[k] = cover_union(cover[k], ap);
             }
         }
     }
@@ -651,9 +576,7 @@ fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[G
 fn replay_halo(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[RainHalo]) {
     for mode in [HaloMode::Add, HaloMode::Over] {
         for q in quads.iter().filter(|q| q.mode == mode) {
-            let Some((x0, y0, xe, ye)) =
-                clip_to_strip(s, q.x as usize, q.y as usize, q.w as usize, q.h as usize)
-            else {
+            let Some((x0, y0, xe, ye)) = clip_to_strip(s, q.rect()) else {
                 continue;
             };
             let (cx, cy) = (q.cx as i32, q.cy as i32);
@@ -703,9 +626,7 @@ fn replay_halo(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[RainH
 fn replay_fire(color: &mut [u32], cover: &mut [u8], s: StripRect, pad: usize, quads: &[FirePatch]) {
     for mode in [FireMode::Add, FireMode::Over] {
         for q in quads.iter().filter(|q| q.mode == mode) {
-            let Some((x0, y0, xe, ye)) =
-                clip_to_strip(s, q.x as usize, q.y as usize, q.w as usize, q.h as usize)
-            else {
+            let Some((x0, y0, xe, ye)) = clip_to_strip(s, q.rect()) else {
                 continue;
             };
             let fp = fire_field::FireFieldParams {
@@ -868,9 +789,7 @@ mod tests {
             selection: 0x00B0_C4DE,
         };
         for theme in [dark, light] {
-            let Some(mut r) = Renderer::from_system(16.0, theme) else {
-                return; // no usable system font in this environment
-            };
+            let mut r = Renderer::from_system(16.0, theme).expect(crate::NO_FONT);
             r.set_pad(10);
             r.set_pad_top(3);
             r.set_head(24);
@@ -914,12 +833,12 @@ mod tests {
                     // SOURCE-OVER paint (the rainbow bed's blend) straddling
                     // grid_top: the replay must take draw_flat_add's Over
                     // branch, not an alpha-blind add — the seam-continuity
-                    // law this suite pins (2026-09-01 audit).
+                    // law this suite pins.
                     alpha: 0x16,
                     color2: 0x0009_1216,
                     alpha2: 0x16,
                 },
-                // GRADIENT quads (2026-09-22): the replay must ramp the
+                // GRADIENT quads: the replay must ramp the
                 // colour per column from the quad's UNCLIPPED left edge, as
                 // `draw_flat_add`'s gradient branch does — an additive ramp
                 // wholly in the head band, and a source-over ramp that
@@ -1045,9 +964,7 @@ mod tests {
     #[test]
     fn asymmetric_top_pad_invalidates_spill_geometry_at_constant_frame_size() {
         let theme = Theme::default();
-        let Some(mut r) = Renderer::from_system(16.0, theme) else {
-            return;
-        };
+        let mut r = Renderer::from_system(16.0, theme).expect(crate::NO_FONT);
         const PAD: usize = 10;
         const HEAD: usize = 17;
         const TOP_A: usize = 3;
@@ -1110,9 +1027,7 @@ mod tests {
     /// vanishing each tick it exactly once with in-band rects.
     #[test]
     fn rev_advances_only_on_band_content_change() {
-        let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-            return;
-        };
+        let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
         r.set_pad(8);
         r.set_head(20);
         let mut term = Terminal::new(6, 20);
@@ -1207,9 +1122,7 @@ mod tests {
     /// re-derives the allocation and its length.
     #[test]
     fn spill_ptr_stays_stable_across_content_re_rasters() {
-        let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-            return;
-        };
+        let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
         r.set_pad(8);
         r.set_head(20);
         let mut term = Terminal::new(6, 20);
@@ -1261,9 +1174,7 @@ mod tests {
     /// never moves, no rects — and chrome→0 clears with exactly one tick.
     #[test]
     fn zero_chrome_is_identity_and_transitions_clear() {
-        let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-            return;
-        };
+        let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
         let mut term = Terminal::new(6, 20);
         let mut input = term.cell_frame(6, 20);
         input.cursor_glow_add = vec![GlowQuad {
@@ -1309,9 +1220,7 @@ mod tests {
     /// clipped-stream fingerprint.
     #[test]
     fn include_veils_policy_gates_over_halos() {
-        let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-            return;
-        };
+        let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
         r.set_pad(8);
         r.set_head(20);
         let mut term = Terminal::new(6, 20);

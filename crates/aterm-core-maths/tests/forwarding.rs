@@ -3,25 +3,18 @@
 
 //! Every [`CoreFloat`] method, called once on `f32` and once on `f64`.
 //!
-//! Two jobs, and the first is the one that could not be done by reading:
-//!
-//! 1. **Recursion.** Each body in `src/lib.rs` is written `<$t>::name(self)`,
-//!    which resolves to the inherent `std` method — but the same body written
-//!    `self.name()` would compile just as cleanly and call `CoreFloat::name`
-//!    forever. Calling all 38 methods on both types turns any such body into a
-//!    stack overflow here rather than a hang in a shipped binary.
-//! 2. **The exactly-specified subset is exact.** `floor`, `ceil`, `round`,
-//!    `trunc`, `fract`, `abs`, `copysign`, `sqrt` and `mul_add` have ONE
-//!    correct answer per input under IEEE 754, so `std` and the `libm` this
-//!    crate replaces must agree bit for bit. Those are pinned as exact
-//!    equalities below. The transcendentals are not: they are checked against a
-//!    tolerance, because pinning a bit pattern for `sin` would encode one
-//!    platform's libm into a test that runs on three.
+//! 1. Recursion: a body written `self.name()` instead of `<$t>::name(self)`
+//!    would call `CoreFloat::name` forever; calling all 38 methods turns that
+//!    into a stack overflow here.
+//! 2. The exactly specified subset (`floor`, `ceil`, `round`, `trunc`,
+//!    `fract`, `abs`, `copysign`, `sqrt`, `mul_add`) has one correct answer
+//!    per input, so it is pinned with exact equalities. Transcendentals are
+//!    checked against a tolerance, since libm results vary by platform.
 
 use core_maths::CoreFloat;
 
 /// Half an ulp of nothing — a tolerance loose enough for any conforming libm
-/// and tight enough that a wrong FUNCTION (rather than a wrong last bit) fails.
+/// and tight enough that a wrong function (rather than a wrong last bit) fails.
 const EPS32: f32 = 1e-5;
 const EPS64: f64 = 1e-12;
 
@@ -42,9 +35,7 @@ fn f32_rounding_and_sign_are_bit_exact() {
     assert_eq!(CoreFloat::floor(-3.7_f32), -4.0);
     assert_eq!(CoreFloat::ceil(3.01_f32), 4.0);
     assert_eq!(CoreFloat::ceil(-3.01_f32), -3.0);
-    // Halfway cases round AWAY FROM ZERO — the clause that separates `round`
-    // from `rint`, and the only CoreFloat method rustybuzz would call if its
-    // `std` feature were ever off.
+    // Halfway cases round away from zero (unlike `rint`).
     assert_eq!(CoreFloat::round(3.5_f32), 4.0);
     assert_eq!(CoreFloat::round(4.5_f32), 5.0);
     assert_eq!(CoreFloat::round(-3.5_f32), -4.0);

@@ -41,7 +41,7 @@ pub fn to_string<T: Serialize + ?Sized>(value: &T) -> Result<String> {
         Item::Table(table) => {
             let document = DocumentMut {
                 root: Item::Table(table),
-                trailing: String::new().into(),
+                ..DocumentMut::default()
             };
             Ok(document.to_string())
         }
@@ -52,7 +52,7 @@ pub fn to_string<T: Serialize + ?Sized>(value: &T) -> Result<String> {
             }
             let document = DocumentMut {
                 root: Item::Table(table),
-                trailing: String::new().into(),
+                ..DocumentMut::default()
             };
             Ok(document.to_string())
         }

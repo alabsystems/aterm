@@ -18,6 +18,7 @@ use aterm_spec::derive::{Model, control_connection_admission_model};
 use aterm_spec::interp::{State, admits};
 use aterm_uds::CtlStream;
 
+use crate::conformance_support::assert_transition;
 use crate::control::BoundedDispatch;
 
 #[derive(Clone, Copy, Default)]
@@ -39,22 +40,6 @@ fn project(model: &Model, dispatch: &BoundedDispatch<CtlStream>, facts: Facts) -
     state.insert("rejected", facts.rejected);
     state.insert("completed", facts.completed);
     state
-}
-
-fn assert_transition(model: &Model, before: &State, after: &State, action: &'static str) {
-    assert_eq!(
-        admits(model, before, after),
-        Some(action),
-        "shipping transition must be admitted specifically as {action}"
-    );
-    for invariant in &model.invariants {
-        assert!(
-            model.check_invariant(invariant.name, after),
-            "post-state violates {}::{}: {after:?}",
-            model.name,
-            invariant.name,
-        );
-    }
 }
 
 fn admit(

@@ -6,20 +6,29 @@
 //!
 //! A replaced executable (`crate::linux`) gets [`crate::LINUX_TRIAL_LAUNCHES`]
 //! starts to prove itself healthy; the start after that restores the previous one
-//! and refuses the new build for good. Until 2026-09-28 only a WINDOW counted or
-//! confirmed a start, so a copy used only from the terminal installed one update,
-//! never confirmed it, and stopped updating for good. Terminal sessions now count
-//! and confirm too, and sessions start in BURSTS: a terminal that restores six
+//! and refuses the new build for good. Terminal sessions count and confirm as well
+//! as windows (a copy used only from the terminal opens none), and sessions start in
+//! BURSTS: a terminal that restores six
 //! tabs, each running `aterm`, starts six copies inside a second, and every one of
 //! them is counted before the first has printed a prompt and confirmed. Counting
 //! alone would roll a healthy build back at the fourth, and a rolled-back build
 //! never installs again.
 //!
 //! So a start over the budget rolls back only when the start before it is no
-//! longer YOUNG: [`START_SETTLES_SECS`] old or more, long enough for any start to
-//! have confirmed itself (a session confirms at its shell's first output, or after
-//! [`crate::LINUX_SESSION_HEALTHY_AFTER`] at the latest; a window after its first
-//! frame).
+//! longer YOUNG: [`START_SETTLES_SECS`] old or more, long enough for a healthy start
+//! to have confirmed itself (a session at its shell's first output, a window after
+//! its first frame) — most, not all: a session whose shell prints nothing for that
+//! long (an rc file waiting on a cold NFS or automount home, several heavy ones
+//! starting together) has not, and staying up silent never confirms it.
+//!
+//! AND A SILENT SESSION BUYS ONE MORE WINDOW, ONCE.
+//! A start within the budget that is still alive, its shell still silent, at half
+//! the window ([`crate::LINUX_SESSION_SILENT_DEFER`]) moves the trial's stamp to that
+//! moment, once, if the stamp is still its own (`linux::defer_session_verdict`). The
+//! next start over the budget — a tab opened before the first prompt — is then young
+//! for another window instead of rolling a slow-starting healthy build back for
+//! good. It confirms nothing: a build that hangs before its shell speaks is rolled
+//! back one window later, by a start at least [`START_SETTLES_SECS`] after the move.
 //!
 //! AND THE WAIT IS BOUNDED ([`start_stamp`]). "The start before it" is the last
 //! start WITHIN the budget: a start past the budget leaves the stamp where it was.
@@ -32,23 +41,37 @@
 //! [`START_SETTLES_SECS`] after the budget's last one, however fast the restarts
 //! come: the rule moves the verdict by at most that much, and never drops it.
 //!
+//! AND THE CLOCK THAT JUDGES YOUTH DOES NOT STEP ([`judged_now`]). Each start is counted by
+//! its own process, so "the start before it" was stamped by another one, and the wall clock
+//! both read can step between them: a board with no battery-backed clock boots hours behind
+//! until NTP sets it, a dual-boot machine whose clock keeps local time boots hours ahead. A
+//! step landing inside a burst would make the burst's next start read its predecessor as
+//! long settled (or stamped in the future), and roll the healthy build back for good before
+//! its first prompt. So each stamp also carries the system's monotonic clock, which every
+//! process of one boot shares and nothing steps ([`Steady`]), and the age between two
+//! stamps of one boot is read on it; across a boot, or where no such clock was read (a
+//! record an older build saved), the wall clock judges as it always did.
+//!
 //! AND EACH LANE PROVES ITS OWN ([`Lanes`]). A terminal session's prompt confirms
 //! the trial for update checks and applies, never for a window: a trial only a
 //! session confirmed still counts its window starts until a window confirms it.
 //! Otherwise `aterm` typed into a terminal to look into a window that crashes at
-//! start would keep that build for good (the round-four review). And the window
-//! lane's budget is spent by window starts alone: a session's confirmation starts
-//! the count afresh, and is never refused (round six).
+//! start would keep that build for good. And the window lane's budget is spent by
+//! window starts alone: a session's confirmation starts the count afresh, and is
+//! never refused.
 //!
 //! Compiled on every target so these rules, their derived models and the binds
 //! between them run on the macOS gate too; the transaction code in `crate::linux`
 //! is the only shipping caller.
 
-/// How long after a start it may still confirm itself: twice the longest a
-/// session waits before confirming ([`crate::LINUX_SESSION_HEALTHY_AFTER`]), so a
-/// start whose confirmation waits on the update lock or on hashing the executable
-/// is still inside it.
-pub(crate) const START_SETTLES_SECS: i64 = 2 * crate::LINUX_SESSION_HEALTHY_AFTER.as_secs() as i64;
+/// How long after a start it may still confirm itself: 20 s. A session confirms at
+/// its shell's first output, which a shell prints in milliseconds; a window after its
+/// first frame. The rest is room for a confirmation that waits on the update lock or on
+/// hashing the executable, and for a slow rc file. Staying up silent never confirms a
+/// session; a silent one alive at half of this moves its
+/// stamp once (`linux::defer_session_verdict`, the module docs), and is not waited for
+/// past that.
+pub(crate) const START_SETTLES_SECS: i64 = 20;
 
 /// Whether the start stamped at `previous_start_unix` may still confirm itself at
 /// `now_unix`. `0` is "no start stamped": a record an older build wrote carries no
@@ -56,10 +79,24 @@ pub(crate) const START_SETTLES_SECS: i64 = 2 * crate::LINUX_SESSION_HEALTHY_AFTE
 /// shipping caller first restamps a trial past its budget whose stamp an older
 /// build's save dropped, [`stamp_lost`]). A stamp in
 /// the future (the clock stepped back) is not young either, so a wrong clock can
-/// delay no verdict.
+/// delay no verdict. The shipping caller passes `now_unix` as the stamp's own clock
+/// reads it ([`judged_now`]), so a step of the wall clock between two starts of one
+/// boot is no age at all.
 pub(crate) fn start_is_young(previous_start_unix: i64, now_unix: i64) -> bool {
     previous_start_unix > 0
         && (0..START_SETTLES_SECS).contains(&now_unix.saturating_sub(previous_start_unix))
+}
+
+/// Whether a silent session's deferral moves the trial's stamp, still the one its
+/// start left at `own_unix`, to now — `now_unix` on that stamp's own clock
+/// ([`judged_now`]): only LATER, and only while the stamp is still young
+/// ([`start_is_young`]). A stamp already settled is a verdict due: a start past the
+/// budget now rolls back, and a deferral that landed late (a long wait on the update
+/// lock) must not make it young again. So the move defers the verdict by less than
+/// one window, once per stamp of the budget (the caller moves only a stamp that is
+/// still its own, which the move makes it no longer), and never confirms.
+pub(crate) fn defer_moves(own_unix: i64, now_unix: i64) -> bool {
+    now_unix > own_unix && start_is_young(own_unix, now_unix)
 }
 
 /// Whether the start just counted — `starts` includes it — rolls the trial back.
@@ -76,11 +113,62 @@ pub(crate) fn start_rolls_back(starts: u32, previous_start_unix: i64, now_unix: 
 /// for as long as they kept coming (see the module docs). The budget's starts each
 /// keep their full window, which is what a burst of healthy session starts needs;
 /// the starts after them share the last one's.
-pub(crate) fn start_stamp(starts: u32, previous_start_unix: i64, now_unix: i64) -> i64 {
+pub(crate) fn start_stamp<T>(starts: u32, previous_start: T, now: T) -> T {
     if starts <= crate::LINUX_TRIAL_LAUNCHES {
-        now_unix
+        now
     } else {
-        previous_start_unix
+        previous_start
+    }
+}
+
+/// When a start was counted, as the record keeps it and the next start reads it
+/// ([`judged_now`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StartClock {
+    /// Wall-clock Unix seconds; `0` for no start stamped. Comparable across boots, and
+    /// the stamp an older build keeps, but it steps.
+    pub(crate) unix: i64,
+    /// The same moment on a clock no step moves, where the system has one to read.
+    pub(crate) steady: Option<Steady>,
+}
+
+impl From<i64> for StartClock {
+    /// A wall-clock reading alone: what an older build's record holds, and what a
+    /// system with no steady clock to read gives.
+    fn from(unix: i64) -> Self {
+        Self { unix, steady: None }
+    }
+}
+
+/// Whole seconds on the system's monotonic clock (Linux `CLOCK_MONOTONIC`: one count
+/// for every process of a boot, never stepped, stopped while the machine sleeps, so an
+/// age on it is time a start could have spent confirming itself), with the clock they
+/// count on: the boot, and the time namespace, which may offset it. Two readings are
+/// compared only when that names the same clock.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Steady {
+    /// The boot (`/proc/sys/kernel/random/boot_id`) and time namespace the count is on.
+    pub(crate) clock: String,
+    /// Seconds on it.
+    pub(crate) secs: i64,
+}
+
+/// `now` as the wall clock that stamped `previous` reads it: the stamp's wall time plus
+/// the steady clock's age since it, when both were read on the same steady clock, and
+/// `now`'s wall time otherwise (no start stamped, a stamp from another boot, or one of
+/// them read no steady clock, as a record an older build saved does).
+///
+/// So two starts of one boot are judged by how long really passed between them: a step
+/// of the wall clock between a burst's third start and its fourth, by an hour forward
+/// or a second back, no longer reads as a predecessor long settled or stamped in the
+/// future ([`start_is_young`]), and a crash loop still ages on the steady clock however
+/// the wall clock moves.
+pub(crate) fn judged_now(previous: &StartClock, now: &StartClock) -> i64 {
+    match (&previous.steady, &now.steady) {
+        (Some(then), Some(steady)) if previous.unix > 0 && then.clock == steady.clock => previous
+            .unix
+            .saturating_add(steady.secs.saturating_sub(then.secs)),
+        _ => now.unix,
     }
 }
 
@@ -90,15 +178,15 @@ pub(crate) fn start_stamp(starts: u32, previous_start_unix: i64, now_unix: i64) 
 /// 0.98 rewrites the whole record in its own shape, without `last_start_unix` — and
 /// it can land in the middle of a burst of session starts, where the plain reading of
 /// "no stamp" ([`start_is_young`]: the budget alone) rolled back, and refused for good,
-/// a healthy build before its first prompt (round six).
+/// a healthy build before its first prompt.
 ///
-/// Such a start — one of the first [`LOST_STAMP_SPARES`] past the budget — stamps its
-/// own time and does not roll back; the next start past the budget is judged against
-/// that stamp as usual. So one lost stamp costs a crash loop one start and at most one
-/// settle window more; a stamp lost before EVERY start (a running 0.98 saving over each
-/// one, below) costs it at most [`LOST_STAMP_SPARES`] starts, and the next rolls back.
-/// The verdict is never dropped: the start that restamps is a start of a trial past its
-/// budget, whose stamp then stays put ([`start_stamp`]). A record an older build wrote with no stamp WITHIN the
+/// Such a start — one of the first [`LOST_STAMP_SPARES`] past the budget — stamps its own
+/// time and does not roll back; the next start past the budget is judged against that stamp
+/// as usual. So one lost stamp costs a crash loop one start and at most one settle window
+/// more; a stamp lost before EVERY start (a running 0.98 saving over each one, below) costs
+/// it at most [`LOST_STAMP_SPARES`] starts, and the next rolls back. The verdict is never
+/// dropped: the start that restamps is a start of a trial past its budget, whose stamp then
+/// stays put ([`start_stamp`]). A record an older build wrote with no stamp WITHIN the
 /// budget needs no such care: those starts stamp as they always do.
 ///
 /// AND ONLY [`LOST_STAMP_SPARES`] STARTS PAST THE BUDGET ARE SPARED. The 0.98 that
@@ -149,7 +237,7 @@ pub(crate) enum Lane {
 /// Where a trial's two lanes stand: the trial record's `healthy` and
 /// `window_proven`.
 ///
-/// WHY A SESSION DOES NOT VOUCH FOR A WINDOW (the round-four review). Once a
+/// WHY A SESSION DOES NOT VOUCH FOR A WINDOW. Once a
 /// trial was confirmed its window starts stopped counting, so when a session
 /// could confirm the whole file, `aterm` typed into a terminal to look into a
 /// window that crashes at start (a GPU or Wayland regression) confirmed that
@@ -158,13 +246,12 @@ pub(crate) enum Lane {
 /// starts go on counting, and roll the install back past the budget, until a
 /// WINDOW confirms ([`Self::window_proven`]).
 ///
-/// AND A SESSION IS NEVER REFUSED (round six). Round four also made a window
-/// start that had not confirmed refuse every session's confirmation, while those
-/// sessions' starts still counted against the one shared budget. One window start
-/// that never reached a first frame — `aterm` run with no terminal on a box with
-/// no display, a window killed at logout — then let three healthy terminal
-/// sessions roll the build back and refuse it for good. A session's confirmation
-/// now always confirms the session lane, and the count starts again at zero, so
+/// AND A SESSION IS NEVER REFUSED. Were an unconfirmed window start to refuse every
+/// session's confirmation while those sessions' starts still counted against one
+/// shared budget, one window start that never reached a first frame — `aterm` run
+/// with no terminal on a box with no display, a window killed at logout — would let
+/// three healthy terminal sessions roll the build back for good. A session's
+/// confirmation always confirms the session lane, and the count starts again at zero, so
 /// the window lane's budget is spent by window starts alone.
 ///
 /// AND AN OLDER BUILD MAY REWRITE THE RECORD. A running 0.98 saves the whole
@@ -172,7 +259,7 @@ pub(crate) enum Lane {
 /// that its missing value is the careful one: a trial whose `window_proven` was
 /// dropped counts its window starts again, and a window that works confirms it
 /// again ([`confirm`] starts the count afresh, so that recount never nears the
-/// budget). Round four's `window_owed` read "the window lane owes nothing" when
+/// budget). The retired `window_owed` read "the window lane owes nothing" when
 /// absent, so one such save kept, for good, a build whose window crashes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Lanes {
@@ -232,7 +319,7 @@ pub(crate) fn confirm(lane: Lane, lanes: Lanes) -> LaneConfirm {
 /// installed before it. Taking the installed build there dropped its window
 /// verdict: a build whose window had crashed became the build a failing successor
 /// rolled back TO, so a window regression that carried into the next release left
-/// a window that still crashed and the successor refused for good (round six).
+/// a window that still crashed and the successor refused for good.
 /// A build no window has tried — a copy used only from the terminal — is still its
 /// successor's rollback target: nothing says its window is broken, and a copy that
 /// never opens a window must not roll back further with every release.
@@ -251,8 +338,8 @@ mod tests {
     /// its window passing with no confirmation (that start crashed, or hung);
     /// `lost` records a rollback taken over a start that could still have
     /// confirmed — the false rollback of a healthy build this rule exists to
-    /// prevent. `Buggy = 1` drops the young test from `RollBack`, which is exactly
-    /// the rule before 2026-09-28 (`starts > budget`, nothing else).
+    /// prevent. `Buggy = 1` drops the young test from `RollBack` (`starts >
+    /// budget`, nothing else).
     ///
     /// Untimed, so it cannot see how LONG the verdict waits; that is
     /// [`deferral_model`]'s job.
@@ -303,7 +390,7 @@ mod tests {
     }
 
     /// The machine proves no rollback is ever taken over a start that could still
-    /// confirm, and the pre-2026-09-28 rule (`Buggy = 1`) is caught taking one.
+    /// confirm, and the count-only rule (`Buggy = 1`) is caught taking one.
     /// Then the Tier-1 bind: for every count up to past the model's space and every
     /// age of the previous start that matters (none, this second, the last young
     /// second, the first settled one, long ago, and a stamp from the future), the
@@ -343,12 +430,104 @@ mod tests {
             }
         }
         assert_eq!(both, [true, true], "the grid reaches both verdicts");
-        // Negative control: the pre-2026-09-28 rule rolls the fourth start of a
+        // Negative control: the count-only rule rolls the fourth start of a
         // burst back, with the third still able to confirm; the model refuses that
         // step.
         let burst = projection(crate::LINUX_TRIAL_LAUNCHES, true);
         assert!(!model.action_enabled("RollBack", &burst));
         assert!(!start_rolls_back(crate::LINUX_TRIAL_LAUNCHES + 1, now, now));
+    }
+
+    /// A WALL-CLOCK STEP BETWEEN TWO STARTS OF ONE BOOT MOVES NO VERDICT. The model's
+    /// `young` is a fact about real time: the stamped start may still confirm itself.
+    /// Tier-1 bind: for every count, every real age that matters (this second, the last
+    /// young one, the first settled one, an hour) and every step of the wall clock between
+    /// the two starts (an hour either way, a second back, none), the shipping decision on
+    /// [`judged_now`] is the model's `RollBack` guard at the REAL age, and a start it keeps
+    /// is one `Count` admits.
+    ///
+    /// Negative control: the rule before this, which judged the raw wall clock, rolls
+    /// back the fourth start of a burst an hour's step landed in, with the third still
+    /// able to confirm; the model refuses that step.
+    #[test]
+    fn a_wall_clock_step_between_two_starts_of_one_boot_moves_no_verdict() {
+        let model = start_model();
+        let steady = |clock: &str, secs: i64| {
+            Some(Steady {
+                clock: clock.to_string(),
+                secs,
+            })
+        };
+        let wall = 1_000_000;
+        let previous = StartClock {
+            unix: wall,
+            steady: steady("boot-a time:[1]", 400),
+        };
+        let mut both = [false, false];
+        for starts_before in 0..=crate::LINUX_TRIAL_LAUNCHES + 2 {
+            for age in [0, START_SETTLES_SECS - 1, START_SETTLES_SECS, 3_600] {
+                for step in [-3_600, -1, 0, 3_600] {
+                    let now = StartClock {
+                        unix: wall + age + step,
+                        steady: steady("boot-a time:[1]", 400 + age),
+                    };
+                    let judged = judged_now(&previous, &now);
+                    assert_eq!(judged, wall + age, "age {age}, step {step}");
+                    let shipping = start_rolls_back(starts_before + 1, previous.unix, judged);
+                    let state = projection(starts_before, age < START_SETTLES_SECS);
+                    assert_eq!(
+                        model.action_enabled("RollBack", &state),
+                        shipping,
+                        "RollBack: {starts_before} before, {age} s on, wall stepped {step} s"
+                    );
+                    assert_eq!(
+                        model.action_enabled("Count", &state),
+                        !shipping,
+                        "Count: {starts_before} before, {age} s on, wall stepped {step} s"
+                    );
+                    both[usize::from(shipping)] = true;
+                }
+            }
+        }
+        assert_eq!(both, [true, true], "the grid reaches both verdicts");
+        let budget = crate::LINUX_TRIAL_LAUNCHES;
+        assert!(!model.action_enabled("RollBack", &projection(budget, true)));
+        assert!(
+            start_rolls_back(budget + 1, wall, wall + 3_600),
+            "the raw wall clock read the stepped burst as settled"
+        );
+        // Where no steady clock spans both starts, the wall clock judges as it did:
+        // another boot, another time namespace, a side that read none, no stamp.
+        let later = wall + 3_600;
+        for (then, now) in [
+            (previous.steady.clone(), steady("boot-b time:[1]", 401)),
+            (previous.steady.clone(), steady("boot-a time:[2]", 401)),
+            (previous.steady.clone(), None),
+            (None, steady("boot-a time:[1]", 401)),
+        ] {
+            let then = StartClock {
+                unix: wall,
+                steady: then,
+            };
+            let now = StartClock {
+                unix: later,
+                steady: now,
+            };
+            assert_eq!(judged_now(&then, &now), later, "{then:?} -> {now:?}");
+        }
+        let unstamped = StartClock {
+            unix: 0,
+            steady: steady("boot-a time:[1]", 400),
+        };
+        let now = StartClock {
+            unix: later,
+            steady: steady("boot-a time:[1]", 401),
+        };
+        assert_eq!(judged_now(&unstamped, &now), later, "no start stamped");
+        assert!(!start_is_young(
+            unstamped.unix,
+            judged_now(&unstamped, &now)
+        ));
     }
 
     /// Six starts inside one second — a terminal restoring six tabs — keep a build
@@ -394,16 +573,26 @@ mod tests {
 
     /// How long the verdict waits, as a machine with a clock. `age` is the ticks
     /// since the stamp (capped at the window `W`), `wait` the ticks since the
-    /// first start kept past the budget (capped just past `W`), and `late`
-    /// records a start kept past the budget `W` or more ticks after the first
+    /// first start kept past the budget (capped just past `W` + 1), and `late`
+    /// records a start kept past the budget more than `W` ticks after the first
     /// one — the verdict deferred past its bound. `Buggy = 1` restamps at every
-    /// start, which is exactly the rule before this change: a restarter faster
-    /// than the window then keeps every start young, and the machine is caught
-    /// keeping one late.
+    /// start: a restarter
+    /// faster than the window then keeps every start young, and the machine is
+    /// caught keeping one late.
+    ///
+    /// `Defer` is a silent session's one move of the stamp to now ([`defer_moves`]): only
+    /// later than the stamp and while it is still young (`age` one tick: the
+    /// session moves it half a window after its start), and only once per stamp
+    /// of the budget — `owned` is "the stamp is still the one a start of the
+    /// budget left", which each such start's `Count` gives back and the move
+    /// takes. So the bound is one window and less than one more, `W` ticks here.
+    /// `Once = 0` drops the `owned` latch (a session that could move the stamp as
+    /// often as it stays silent) and is caught keeping a start late.
     fn deferral_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             LinuxTrialDeferralBounded {
                 const Buggy = 0;
+                const Once = 1;
                 const Max = 3;
                 const W = 2;
                 var starts = 0;
@@ -412,9 +601,12 @@ mod tests {
                 var wait = 0;
                 var rolled = 0;
                 var late = 0;
-                action Tick when (rolled == 0 && (age <= W - 1 || (over == 1 && wait <= W))) {
+                var owned = 0;
+                action Tick when (
+                    rolled == 0 && (age <= W - 1 || (over == 1 && wait <= W + 1))
+                ) {
                     age = if age <= W - 1 { age + 1 } else { age };
-                    wait = if (over == 1 && wait <= W) { wait + 1 } else { wait };
+                    wait = if (over == 1 && wait <= W + 1) { wait + 1 } else { wait };
                 }
                 action Count when (
                     rolled == 0 && starts <= Max + 2 && (starts <= Max - 1 || age <= W - 1)
@@ -422,7 +614,14 @@ mod tests {
                     starts = starts + 1;
                     age = if (starts <= Max - 1 || Buggy == 1) { 0 } else { age };
                     over = if starts > Max - 1 { 1 } else { over };
-                    late = if (starts > Max - 1 && wait > W - 1) { 1 } else { late };
+                    late = if (starts > Max - 1 && wait > W) { 1 } else { late };
+                    owned = if starts <= Max - 1 { 1 } else { owned };
+                }
+                action Defer when (
+                    rolled == 0 && (owned == 1 || Once == 0) && age > 0 && age <= W - 1
+                ) {
+                    age = 0;
+                    owned = 0;
                 }
                 action RollBack when (rolled == 0 && starts > Max - 1 && age > W - 1) {
                     starts = starts + 1;
@@ -433,14 +632,16 @@ mod tests {
         }
     }
 
-    /// THE VERDICT WAITS AT MOST ONE SETTLE WINDOW PAST THE BUDGET, however fast
-    /// the starts come. The machine proves it, and the rule before this change
-    /// (`Buggy = 1`: every start restamps) is caught deferring past it. Then the
-    /// Tier-1 bind: for every count up to past the model's space and every stamp
-    /// age the model can hold (this tick, one tick, the window, no stamp at all),
-    /// the shipping [`start_rolls_back`] decides what the model's `RollBack` guard
-    /// does, and the shipping [`start_stamp`] leaves the stamp exactly as old as
-    /// the model's `Count` leaves `age`.
+    /// THE VERDICT WAITS AT MOST ONE SETTLE WINDOW AND LESS THAN ONE MORE PAST THE BUDGET,
+    /// however fast the starts come; the second only for a silent session still up half a
+    /// window after its start. The machine proves it, and the restamping rule (`Buggy = 1`:
+    /// every start restamps) is caught deferring past it. Then the Tier-1 bind: for every
+    /// count up to past the model's space and every stamp age the model can hold (this
+    /// tick, one tick, the window, no stamp at all), the shipping [`start_rolls_back`]
+    /// decides what the model's `RollBack` guard does, and the shipping [`start_stamp`]
+    /// leaves the stamp exactly as old as the model's `Count` leaves `age`; and the
+    /// shipping [`defer_moves`], with the stamp still the session's own, decides what
+    /// `Defer` does.
     #[test]
     fn the_verdict_waits_at_most_one_window_past_the_budget() {
         let model = deferral_model();
@@ -463,6 +664,7 @@ mod tests {
                         ("wait", 0),
                         ("rolled", 0),
                         ("late", 0),
+                        ("owned", 0),
                     ]);
                     let rolls = start_rolls_back(starts_before + 1, previous, now);
                     assert_eq!(
@@ -490,6 +692,56 @@ mod tests {
             }
         }
         assert_eq!(both, [true, true], "the grid reaches both verdicts");
+        // The silent session's move is the model's `Defer`, at every age the model
+        // holds, the stamp still its own or not; and the move leaves the stamp as
+        // old as `Defer` leaves `age`.
+        let mut moved = [false, false];
+        for age in 0..=2_i64 {
+            for owned in [false, true] {
+                let state = BTreeMap::from([
+                    ("starts", i64::from(budget)),
+                    ("age", age),
+                    ("over", 0),
+                    ("wait", 0),
+                    ("rolled", 0),
+                    ("late", 0),
+                    ("owned", i64::from(owned)),
+                ]);
+                let own = now - age * TICK_SECS;
+                let shipping = owned && defer_moves(own, now);
+                assert_eq!(
+                    model.action_enabled("Defer", &state),
+                    shipping,
+                    "Defer: stamp {age} tick(s) old, owned {owned}"
+                );
+                if shipping {
+                    let mut next = state.clone();
+                    assert!(model.fire("Defer", &mut next));
+                    assert_eq!(next["age"], 0, "the move stamps now");
+                    assert_eq!(next["owned"], 0, "once: the stamp is no longer its own");
+                }
+                moved[usize::from(shipping)] = true;
+            }
+        }
+        assert_eq!(moved, [true, true], "the grid reaches both answers");
+        // Negative controls: a move that is not later, or of a settled stamp.
+        assert!(!defer_moves(now, now), "no move to the same moment");
+        assert!(
+            !defer_moves(now - START_SETTLES_SECS, now),
+            "nor of a settled stamp"
+        );
+        // The `owned` latch is load-bearing: without it the verdict is kept late.
+        assert!(
+            aterm_spec::interp::bmc(&aterm_spec::interp::with_consts(&model, &[("Once", 0)]))
+                .is_err(),
+            "a session that moves the stamp as often as it stays silent defers for good"
+        );
+        // And the session waits half a window before it moves it.
+        assert_eq!(
+            i64::try_from(crate::LINUX_SESSION_SILENT_DEFER.as_secs()).unwrap(),
+            TICK_SECS,
+            "the silent session moves its stamp one tick (half a window) after its start"
+        );
     }
 
     /// A RESTARTER FASTER THAN THE SETTLE WINDOW STILL GETS ITS VERDICT: a build
@@ -527,7 +779,7 @@ mod tests {
         assert_eq!(run(0, 6), None);
     }
 
-    /// A LOST STAMP DELAYS NO VERDICT FOR GOOD, AND ROLLS NO BURST BACK (round six).
+    /// A LOST STAMP DELAYS NO VERDICT FOR GOOD, AND ROLLS NO BURST BACK.
     /// The start count as `crate::linux` runs it — [`stamp_lost`] first, then
     /// [`start_rolls_back`] and [`start_stamp`] — with an older build's save
     /// dropping the stamp after the budget's last start. A burst the save landed in
@@ -680,10 +932,9 @@ mod tests {
     /// applies go on), `proven` a window confirmed it, `crashed` a window start
     /// counted with no window's confirmation since. A session's start moves no
     /// lane (it counts while nothing has confirmed), so it is not an action here.
-    /// `WindowVerdictKept` is the round-four review's finding as an invariant: a
-    /// window start that never confirmed is never left behind a trial whose window
-    /// starts no longer count. `Buggy = 1` is the rule before that review: a
-    /// session's prompt confirmed the whole file, window included.
+    /// `WindowVerdictKept`: a window start that never confirmed is never left
+    /// behind a trial whose window starts no longer count. `Buggy = 1` lets a
+    /// session's prompt confirm the whole file, window included.
     fn lane_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             LinuxTrialLanes {
@@ -718,7 +969,7 @@ mod tests {
 
     /// A SESSION NEVER VOUCHES FOR A WINDOW. The machine proves a window start
     /// that has not confirmed is never stranded behind a trial whose window
-    /// starts stopped counting, and the rule before the round-four review
+    /// starts stopped counting, and the whole-file rule
     /// (`Buggy = 1`) is caught stranding one. Then the Tier-1 bind: in every one
     /// of the eight states, the shipping [`start_counts`] and [`confirm`] decide
     /// exactly what the model's guards do and leave exactly the lanes its actions
@@ -862,7 +1113,7 @@ mod tests {
     }
 
     /// A WINDOW THAT CRASHES AT START IS ROLLED BACK, EVEN WHEN A TERMINAL IS
-    /// USED TO LOOK INTO IT (the round-four review). Two windows of the new build
+    /// USED TO LOOK INTO IT. Two windows of the new build
     /// crash before their first frame; the person types `aterm` in a terminal to
     /// see why, and its shell prompts. That session confirms the session lane and
     /// the window lane goes on counting, from zero: its fourth crashing start
@@ -951,7 +1202,7 @@ mod tests {
     }
 
     /// ONE WINDOW THAT NEVER REACHED A FIRST FRAME DOES NOT LET HEALTHY SESSIONS
-    /// ROLL THE BUILD BACK (round six). `aterm` run with no terminal on a box with
+    /// ROLL THE BUILD BACK. `aterm` run with no terminal on a box with
     /// no display, or a window killed at logout before it drew, is one window
     /// start that never confirms. Then the person works in the terminal, as the
     /// update's own words tell them to: each session prompts. The first session

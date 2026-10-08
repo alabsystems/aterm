@@ -2,13 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Width-sweep topology tests (feel audit, fixwave5): a rapid width sweep that
-//! returns to the original column count must restore the ORIGINAL wrap
-//! topology — the same physical rows in the viewport, the same history rows,
-//! the prompt anchored directly under its content. Before the fix, a logical
-//! line whose wrapped rows straddled the history/viewport boundary mid-sweep
-//! stayed permanently split at that boundary, and the viewport was padded with
-//! blank rows below a mid-window prompt.
+//! Width-sweep topology tests: a rapid width sweep that returns to the original
+//! column count restores the original wrap topology (same viewport and history
+//! rows, prompt directly under its content).
 
 use super::super::super::*;
 
@@ -33,7 +29,7 @@ fn physical_snapshot(grid: &Grid) -> Vec<(String, bool)> {
     out
 }
 
-/// Join the snapshot into logical lines across ALL boundaries (history and
+/// Join the snapshot into logical lines across all boundaries (history and
 /// viewport alike): a wrapped row continues the previous physical row.
 fn logical_lines(snapshot: &[(String, bool)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -60,21 +56,71 @@ fn feed(grid: &mut Grid) {
     grid.carriage_return();
 }
 
-/// Build the audit shape: filler history, one long wrapped logical line at the
-/// bottom of the viewport, then a prompt row under it. Returns the long line.
+/// Filler history, one long wrapped logical line at the bottom of the viewport,
+/// then a prompt row. Returns the long line.
 fn build_audit_grid(grid: &mut Grid) -> String {
     // Distinct filler lines, most scrolling into history.
     for i in 0..8u16 {
         type_line(grid, &format!("filler-{i}"));
         feed(grid);
     }
-    // One long logical line: wraps across several viewport rows at 30 cols.
-    // Tail mirrors the audit's '...8UtaKZtFqk' searched suffix.
+    // One long logical line wrapping across several viewport rows at 30 cols.
     let long: String = format!("{}8UtaKZtFqk", "x".repeat(60));
     type_line(grid, &long);
     feed(grid);
     type_line(grid, "$ ");
     long
+}
+
+/// The audit's rapid width sweep, ending where it began.
+const SWEEP: [u16; 6] = [24, 16, 9, 13, 21, 30];
+
+/// Run [`SWEEP`] through the synchronous resize, checking invariants each step.
+fn sweep(grid: &mut Grid) {
+    for w in SWEEP {
+        grid.resize(6, w);
+        grid.assert_invariants();
+    }
+}
+
+/// A 6×30 grid over TIERED scrollback (the GUI's configuration).
+fn tiered_grid() -> Grid {
+    let scrollback = Scrollback::new(1000, 10_000, 10_000_000);
+    Grid::with_tiered_scrollback(6, 30, 32, scrollback)
+}
+
+/// The GUI's width step: detach the tiered store, rewrap "off-thread" (here
+/// inline via `reflow()`), re-attach, check invariants.
+fn offloaded_resize(grid: &mut Grid, w: u16) {
+    match grid.resize_offloading_scrollback(6, w) {
+        Some(job) => grid.reattach_reflowed_scrollback(job.reflow()),
+        None => unreachable!("tiered store must detach on a width change"),
+    }
+    grid.assert_invariants();
+}
+
+/// Build the audit shape in `grid`, [`sweep`] it, and require the exact
+/// pre-sweep physical topology back.
+fn assert_sweep_restores_wrap_topology(mut grid: Grid) {
+    let long = build_audit_grid(&mut grid);
+
+    let before = physical_snapshot(&grid);
+    assert!(
+        logical_lines(&before).iter().any(|l| l == &long),
+        "sanity: the long line is one logical line before the sweep"
+    );
+
+    sweep(&mut grid);
+
+    let after = physical_snapshot(&grid);
+    assert!(
+        logical_lines(&after).iter().any(|l| l == &long),
+        "logical line must survive the sweep intact: {after:#?}"
+    );
+    assert_eq!(
+        after, before,
+        "returning to the original width must restore the exact wrap topology"
+    );
 }
 
 /// THE AUDIT SWEEP: rapid width shrink then return to the original width.
@@ -84,67 +130,18 @@ fn build_audit_grid(grid: &mut Grid) -> String {
 /// band between the content and the prompt.
 #[test]
 fn width_sweep_round_trip_restores_wrap_topology_ring() {
-    let mut grid = Grid::with_scrollback(6, 30, 1000);
-    let long = build_audit_grid(&mut grid);
-
-    let before = physical_snapshot(&grid);
-    assert!(
-        logical_lines(&before).iter().any(|l| l == &long),
-        "sanity: the long line is one logical line before the sweep"
-    );
-
-    // Rapid sweep through several widths, ending where it began.
-    for w in [24u16, 16, 9, 13, 21, 30] {
-        grid.resize(6, w);
-        grid.assert_invariants();
-    }
-
-    let after = physical_snapshot(&grid);
-    assert!(
-        logical_lines(&after).iter().any(|l| l == &long),
-        "logical line must survive the sweep intact: {after:#?}"
-    );
-    assert_eq!(
-        after, before,
-        "returning to the original width must restore the exact wrap topology"
-    );
+    assert_sweep_restores_wrap_topology(Grid::with_scrollback(6, 30, 1000));
 }
 
 /// Same sweep against TIERED scrollback (the GUI's configuration).
 #[test]
 fn width_sweep_round_trip_restores_wrap_topology_tiered() {
-    let scrollback = Scrollback::new(1000, 10_000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(6, 30, 32, scrollback);
-    let long = build_audit_grid(&mut grid);
-
-    let before = physical_snapshot(&grid);
-    assert!(
-        logical_lines(&before).iter().any(|l| l == &long),
-        "sanity: the long line is one logical line before the sweep"
-    );
-
-    for w in [24u16, 16, 9, 13, 21, 30] {
-        grid.resize(6, w);
-        grid.assert_invariants();
-    }
-
-    let after = physical_snapshot(&grid);
-    assert!(
-        logical_lines(&after).iter().any(|l| l == &long),
-        "logical line must survive the sweep intact: {after:#?}"
-    );
-    assert_eq!(
-        after, before,
-        "returning to the original width must restore the exact wrap topology"
-    );
+    assert_sweep_restores_wrap_topology(tiered_grid());
 }
 
-/// Mid-line SPACES survive the sweep. A space that lands at a chunk boundary
-/// becomes a TRAILING blank cell of a continued row — outside `row.len()` —
-/// and every len-trimmed merge/materialize seam used to drop it, eroding one
-/// space per boundary per step ("foxjumpsover the lazydog" on the live
-/// audit repro). The merge path and the Row→Line seams now carry a continued
-/// row at its full width.
+/// Mid-line spaces survive the sweep: a space at a chunk boundary is a
+/// trailing blank of a continued row (outside `row.len()`), so merges and
+/// Row→Line seams carry continued rows at full width.
 #[test]
 fn width_sweep_preserves_spaces_at_chunk_boundaries() {
     let mut grid = Grid::with_scrollback(6, 30, 1000);
@@ -153,10 +150,7 @@ fn width_sweep_preserves_spaces_at_chunk_boundaries() {
     feed(&mut grid);
     type_line(&mut grid, "$ ");
 
-    for w in [24u16, 16, 9, 13, 21, 30] {
-        grid.resize(6, w);
-        grid.assert_invariants();
-    }
+    sweep(&mut grid);
 
     let joined: String = logical_lines(&physical_snapshot(&grid)).join("\n");
     assert!(
@@ -165,25 +159,18 @@ fn width_sweep_preserves_spaces_at_chunk_boundaries() {
     );
 }
 
-/// The GUI's actual resize path: every step detaches the tiered store, runs
-/// the rewrap "off-thread" (here: inline via `reflow()`), and re-attaches.
-/// The deficit fill runs at re-attach (`pending_fill_target`), so the settled
-/// state must restore the exact pre-sweep topology just like the synchronous
-/// path does.
+/// The GUI's resize path: each step detaches the tiered store, rewraps (inline
+/// here) and re-attaches, with the deficit fill at re-attach. The settled state
+/// restores the pre-sweep topology.
 #[test]
 fn width_sweep_round_trip_restores_wrap_topology_offloaded() {
-    let scrollback = Scrollback::new(1000, 10_000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(6, 30, 32, scrollback);
+    let mut grid = tiered_grid();
     let long = build_audit_grid(&mut grid);
 
     let before = physical_snapshot(&grid);
 
-    for w in [24u16, 16, 9, 13, 21, 30] {
-        match grid.resize_offloading_scrollback(6, w) {
-            Some(job) => grid.reattach_reflowed_scrollback(job.reflow()),
-            None => unreachable!("tiered store must detach on a width change"),
-        }
-        grid.assert_invariants();
+    for w in SWEEP {
+        offloaded_resize(&mut grid, w);
     }
 
     let after = physical_snapshot(&grid);
@@ -197,10 +184,8 @@ fn width_sweep_round_trip_restores_wrap_topology_offloaded() {
     );
 }
 
-/// Snapshot with the trailing blank rows stripped: the settled CONTENT
-/// sequence, seam-agnostic (a row reads the same whether it sits in history
-/// or the viewport) — what a scrolled-back resize must preserve even when the
-/// deficit fill legitimately defers.
+/// The settled content sequence without trailing blank rows, independent of
+/// the history/viewport seam.
 fn settled_content(grid: &Grid) -> Vec<(String, bool)> {
     let mut snap = physical_snapshot(grid);
     while snap.last().is_some_and(|(t, w)| t.is_empty() && !w) {
@@ -209,36 +194,25 @@ fn settled_content(grid: &Grid) -> Vec<(String, bool)> {
     snap
 }
 
-/// The offloaded width step with a SCROLLED-BACK reader (fixwave5 review,
-/// bug 1, belt side): the belt lift runs BEFORE `resize()` zeroes
-/// `display_offset`, so it must read CONTENT rows (`row_at_screen`). Before
-/// the fix the offset-mapped `row()` probes returned the scrolled view (or
-/// `None` once the ring history was already lifted into the job), the belt
-/// never lifted, and the boundary-straddling logical line rewrapped as TWO
-/// independent documents — a wrap topology diverging from the never-scrolled
-/// resize of the identical grid.
+/// Offloaded width step with a scrolled-back reader: the belt lift reads
+/// content rows (`row_at_screen`), so the boundary-straddling line rewraps as
+/// one, matching the never-scrolled resize.
 #[test]
 fn offloaded_resize_while_scrolled_back_matches_unscrolled_topology() {
     let build = || {
-        let scrollback = Scrollback::new(1000, 10_000, 10_000_000);
-        let mut grid = Grid::with_tiered_scrollback(6, 30, 32, scrollback);
+        let mut grid = tiered_grid();
         build_audit_grid(&mut grid);
         grid
     };
 
-    // Two steps: the deep shrink pushes the long line's head into history so
-    // its tail is the viewport's leading continuation belt at the second
-    // step — the state the belt lift exists for.
+    // The deep shrink pushes the long line's head into history, so its tail is
+    // the viewport's leading continuation belt at the second step.
     let steps = [9u16, 26];
 
     // Reference: the identical grid resized while at the live bottom.
     let mut reference = build();
     for w in steps {
-        match reference.resize_offloading_scrollback(6, w) {
-            Some(job) => reference.reattach_reflowed_scrollback(job.reflow()),
-            None => unreachable!("tiered store must detach on a width change"),
-        }
-        reference.assert_invariants();
+        offloaded_resize(&mut reference, w);
     }
 
     // Same grid, same steps — but the reader is scrolled back into history.
@@ -246,11 +220,7 @@ fn offloaded_resize_while_scrolled_back_matches_unscrolled_topology() {
     grid.scroll_display(3);
     assert!(grid.display_offset() > 0, "sanity: reader is scrolled back");
     for w in steps {
-        match grid.resize_offloading_scrollback(6, w) {
-            Some(job) => grid.reattach_reflowed_scrollback(job.reflow()),
-            None => unreachable!("tiered store must detach on a width change"),
-        }
-        grid.assert_invariants();
+        offloaded_resize(&mut grid, w);
     }
     grid.scroll_to_bottom();
 
@@ -262,16 +232,12 @@ fn offloaded_resize_while_scrolled_back_matches_unscrolled_topology() {
     );
 }
 
-/// The fill-target side of the same defect (fixwave5 review, bug 1): the
-/// trailing-blank count captured at detach must be counted over CONTENT rows.
-/// Before the fix a scrolled-back reader's offset shifted the probe window,
-/// undercounting a GENUINE erased band below the cursor — and the re-attach
-/// deficit fill then "restored" the missing blanks by resurrecting history
-/// rows under the erase.
+/// The trailing-blank count captured at detach is counted over content rows,
+/// so a scrolled-back reader does not undercount a genuine erased band (which
+/// the re-attach fill would refill with history).
 #[test]
 fn offloaded_resize_while_scrolled_back_keeps_erased_band_blank() {
-    let scrollback = Scrollback::new(1000, 10_000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(6, 30, 32, scrollback);
+    let mut grid = tiered_grid();
     for i in 0..9u16 {
         type_line(&mut grid, &format!("filler-{i}"));
         feed(&mut grid);
@@ -284,11 +250,7 @@ fn offloaded_resize_while_scrolled_back_keeps_erased_band_blank() {
 
     // The reader scrolls back, then the width changes offloaded.
     grid.scroll_display(2);
-    match grid.resize_offloading_scrollback(6, 40) {
-        Some(job) => grid.reattach_reflowed_scrollback(job.reflow()),
-        None => unreachable!("tiered store must detach on a width change"),
-    }
-    grid.assert_invariants();
+    offloaded_resize(&mut grid, 40);
     grid.scroll_to_bottom();
 
     // The erased band is genuine: no history may be pulled back under it.
@@ -307,16 +269,11 @@ fn offloaded_resize_while_scrolled_back_keeps_erased_band_blank() {
     }
 }
 
-/// A screen-clearing erase DURING the offloaded reflow window (fixwave5
-/// review, bug 2): ED 2 + cursor home mid-flight makes the blank screen
-/// GENUINE, so the deficit fill armed at detach (`pending_fill_target`) must
-/// be invalidated — before the fix only ED 3/replacement/abort cleared it,
-/// and the re-attach fill resurrected pre-clear history onto the cleared
-/// screen.
+/// ED 2 + cursor home during the offloaded reflow window invalidates the
+/// deficit fill armed at detach, so no pre-clear history returns.
 #[test]
 fn clear_mid_flight_does_not_resurrect_history_offloaded() {
-    let scrollback = Scrollback::new(1000, 10_000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(6, 30, 32, scrollback);
+    let mut grid = tiered_grid();
     build_audit_grid(&mut grid);
 
     // Open the reflow window on a width change (arms the fill target).
@@ -325,7 +282,7 @@ fn clear_mid_flight_does_not_resurrect_history_offloaded() {
         .expect("tiered store must detach on a width change");
 
     // Mid-flight: the program clears the screen and homes the cursor
-    // (`clear`'s ED 2 + CUP) — NOT an ED 3, so history itself survives.
+    // (`clear`'s ED 2 + CUP) — not an ED 3, so history itself survives.
     grid.erase_screen();
     grid.move_cursor_to(0, 0);
 
@@ -348,17 +305,13 @@ fn clear_mid_flight_does_not_resurrect_history_offloaded() {
     );
 }
 
-/// An early-wrapped wide char (fixwave5 review, bug 3): a CJK/emoji glyph
-/// that cannot start at the last column wraps EARLY, leaving that cell
-/// unwritten. The grow merge must join the halves WITHOUT padding the hole —
-/// before the fix the merge pad materialized it as a phantom space right
-/// before the wide char.
+/// An early-wrapped wide char leaves its last-column cell unwritten; the grow
+/// merge joins the halves without padding that hole.
 #[test]
 fn early_wrap_pad_preserves_real_trailing_spaces() {
     use crate::{CellFlags, StyleId};
-    // The re-review's deterministic repro: REAL trailing spaces sit before the
-    // early-wrap hole. The hole is exactly ONE cell; the spaces are content
-    // and must survive the merge.
+    // Real trailing spaces sit before the one-cell early-wrap hole; the spaces
+    // are content and survive the merge.
     let mut grid = Grid::new(5, 10);
     type_line(&mut grid, "ABCDEF   "); // cols 0..=8: text + three real spaces
     grid.write_wide_char_wrap_with_style_id('世', StyleId::default(), CellFlags::empty());
@@ -420,10 +373,8 @@ fn grow_merges_early_wrapped_wide_char_without_phantom_space() {
     );
 }
 
-/// The same early-wrap hole across the HISTORY boundary (fixwave5 review,
-/// bug 3, Row→Line seams): when the early-wrapped head sits in ring history
-/// and its wide-char tail is the viewport's top row, the full-width
-/// materialization must skip the unwritten cell too.
+/// The same early-wrap hole across the history boundary: full-width
+/// materialization of the ring head skips the unwritten cell.
 #[test]
 fn early_wrapped_wide_char_survives_sweep_across_history_boundary() {
     use crate::{CellFlags, StyleId};
@@ -442,9 +393,7 @@ fn early_wrapped_wide_char_survives_sweep_across_history_boundary() {
 
     grid.resize(3, 20);
     grid.assert_invariants();
-    // Assert at the GROWN width, where the hole would sit mid-line: a shrink
-    // would re-split before the wide char and hide a phantom as a trimmed
-    // trailing space.
+    // Assert at the grown width, where a phantom would sit mid-line.
     let joined = logical_lines(&physical_snapshot(&grid)).join("\n");
     assert!(
         joined.contains("ABCDEFGHI世"),
@@ -461,10 +410,8 @@ fn early_wrapped_wide_char_survives_sweep_across_history_boundary() {
     );
 }
 
-/// The stranded-prompt anchor: after a shrink that overflows the viewport and
-/// a grow back, the prompt must sit directly below its content — the viewport
-/// must not hold a band of blank rows between content and prompt, and the
-/// bottom of the viewport must stay anchored to the newest content.
+/// After a shrink that overflows the viewport and a grow back, the prompt sits
+/// directly below its content with the viewport bottom-anchored.
 #[test]
 fn width_sweep_keeps_prompt_anchored_to_content() {
     let mut grid = Grid::with_scrollback(6, 30, 1000);
@@ -475,7 +422,7 @@ fn width_sweep_keeps_prompt_anchored_to_content() {
         .find(|&r| !grid.row(r).unwrap().is_empty())
         .expect("prompt row exists");
 
-    for w in [24u16, 16, 9, 13, 21, 30] {
+    for w in SWEEP {
         grid.resize(6, w);
     }
 

@@ -2,18 +2,13 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for write_ascii_run_styled — the fast path for styled ASCII output.
-//!
-//! Covers content correctness, color/flag application, cursor position,
-//! wrapping behavior, empty input, and consistency with write_char_wrap.
-//!
-//! Part of strategic verification phase, #5445 epic.
+//! Tests for write_ascii_run_styled, the fast path for styled ASCII output:
+//! content, colours and flags, cursor position, wrapping, empty input, and
+//! consistency with write_char_wrap.
 
 use super::*;
 
-// ========================================================================
 // write_ascii_run_styled content and styling correctness
-// ========================================================================
 
 #[test]
 fn write_ascii_run_styled_content_matches_write_char() {

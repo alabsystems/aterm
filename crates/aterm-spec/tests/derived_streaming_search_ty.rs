@@ -7,8 +7,7 @@
 //! of `aterm-search::streaming::StreamingSearch`. It SUPERSEDES the hand-written
 //! `StreamingSearch.tla` the module docs referenced — a spec that was never
 //! committed, so there is nothing to quarantine; the derived model is the spec of
-//! record (if the missing hand `.tla` ever surfaces it goes to
-//! `aterm-spec-models/specs/legacy/` per the Kernel/FdLifecycle convention).
+//! record.
 //!
 //! This file:
 //!   1. **Tier-0 prove-AND-catch** (tiered, VERIFY-1): the interpreter proves all
@@ -74,7 +73,7 @@ fn derived_streaming_search_holds_with_wrap_disabled() {
     // ARMED: partial-order reduction does not preserve coverage, and the `ty`
     // this machine discovers has an UNSOUND one — see `arm_whole_space_check`.
     aterm_spec::verify::arm_whole_space_check(&mut cmd);
-    let out = cmd.output().expect("run ty check");
+    let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty check");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

@@ -3,9 +3,12 @@
 
 //! The question dialog as Claude Code 2.1.282 draws it (module header of
 //! `question.rs`): every live capture of 2026-09-25 read as its form, the
-//! hand-built shapes the critique of that day named (R5–R13), and the
+//! hand-built shapes a review named, and the
 //! negative controls that keep a quoted, cut or unsound dialog from ever
-//! being read whole — or read idle.
+//! being read whole — or read idle. Then 2.1.283 with a policy text typed
+//! into its free-text row: the measured text read back exactly, the
+//! contract's texts wrapped as 2.1.283 wraps them read whole at 80 and 200
+//! columns, and a wrap at any other column never read whole.
 
 use super::*;
 use crate::phase::{Phase, worker_phase};
@@ -50,7 +53,7 @@ fn why(d: &QuestionDialog) -> &'static str {
     }
 }
 
-/// F1: the incident's screen (S6-01, the live replica of the owner's
+/// The incident's screen (S6-01, the live replica of the owner's
 /// 2026-09-25 screen) reads whole — where the walk up from the footer had
 /// stopped at the rule over `4. Chat about this`, a three-row box with no
 /// question and no option (kind `other` on 0.93.0).
@@ -154,7 +157,7 @@ struct Live<'a> {
     unanswered: bool,
 }
 
-/// F1: the table over every live capture of 2026-09-25 — its form, its
+/// The table over every live capture of 2026-09-25 — its form, its
 /// focus, its options' `(Recommended)` and checkboxes, its free-text row,
 /// its tabs — each read whole, prompt phase, authoritative, every role
 /// `Other`.
@@ -465,7 +468,7 @@ fn every_live_question_capture_reads_as_its_form() {
     }
 }
 
-/// F1: a bare question at column 0 (S6-02) is inside the box, not a shell's
+/// A bare question at column 0 (S6-02) is inside the box, not a shell's
 /// line that ends it; the chat row's `❯` at column 0 is the dialog's focus,
 /// not the user's row (it read authoritative idle: the walk stopped there).
 /// NEGATIVE CONTROL: the same rows with Claude's composer under the footer
@@ -496,7 +499,7 @@ fn the_question_zone_is_not_a_shell_line_nor_the_option_cursor_the_users_row() {
     }
 }
 
-/// F1: the Submit (review) tab, which draws no footer, is the question
+/// The Submit (review) tab, which draws no footer, is the question
 /// dialog — it read authoritative idle (S6-05, S3-17). NEGATIVE CONTROLS:
 /// without `Review your answers` it is a question with its head off the
 /// screen, form unknown — escalated, never idle, never the review; the same
@@ -554,7 +557,7 @@ fn the_review_tab_is_a_question() {
     }
 }
 
-/// F1 and R8: the preview form's options are read left of the pane (`┌` at
+/// The preview form's options are read left of the pane (`┌` at
 /// column 34), their labels wrapping inside the option column, a trailing
 /// ` ✔` the selection tick; the chat row has no number and the form is
 /// chosen by arrows and Enter (a digit only moves the focus, measured).
@@ -590,7 +593,7 @@ fn the_preview_form_reads_its_options_left_of_the_pane() {
         .and_then(|p| p.question_dialog)
         .expect("still the question");
     assert_eq!(why(&d), NOTES_OPEN);
-    // R8: a label wrapped inside the option column.
+    // A label wrapped inside the option column.
     let (_, _, d) = read(QUESTION_PREVIEW_LONG_LABEL);
     let o = options_of_preview(&d);
     assert_eq!(
@@ -600,7 +603,7 @@ fn the_preview_form_reads_its_options_left_of_the_pane() {
     assert_eq!(o[0].recommended, Recommended::Label);
     assert_eq!(o[0].label_rows.len(), 2);
     assert_eq!(o[1].label, "Tabs");
-    // R8: a revisited tab's tick is the selection, not part of the label.
+    // A revisited tab's tick is the selection, not part of the label.
     let (_, _, d) = read(QUESTION_PREVIEW_REVISITED);
     let o = options_of_preview(&d);
     assert_eq!(o[0].label, "Sidebar (Recommended)");
@@ -618,7 +621,7 @@ fn options_of_preview(d: &QuestionDialog) -> &[QuestionOption] {
     }
 }
 
-/// F1 and R13: multi-select reads each checkbox, the free-text row (which
+/// Multi-select reads each checkbox, the free-text row (which
 /// checks itself when typed into) and the button row by position; ONE
 /// multi-select question draws the `✔ Submit` chip, and its button reads
 /// `Submit`.
@@ -660,7 +663,7 @@ fn multiselect_reads_checkboxes_the_free_text_and_the_button() {
     );
     let (_, _, d) = read(QUESTION_MULTISELECT_NEXT);
     assert_eq!(d.focus(), QuestionFocus::Button);
-    // R13: a lone multi-select question.
+    // A lone multi-select question.
     let (r, p, d) = read(QUESTION_MULTISELECT_ALONE);
     assert!(d.submit_tab);
     assert_eq!(d.tabs.len(), 1);
@@ -675,7 +678,7 @@ fn multiselect_reads_checkboxes_the_free_text_and_the_button() {
     );
 }
 
-/// F1: the free-text row is read by its POSITION: a person's `2` in it is
+/// The free-text row is read by its POSITION: a person's `2` in it is
 /// no pristine placeholder, whether the focus is on it or moved away; the
 /// pristine row with the focus on it reads as focused.
 #[test]
@@ -700,7 +703,7 @@ fn the_free_text_row_is_read_by_its_position() {
     assert_eq!(options(&d).len(), 3);
 }
 
-/// F1: `(Recommended)` is read from the LABEL only: the 80-column capture's
+/// `(Recommended)` is read from the LABEL only: the 80-column capture's
 /// wrapped label is [`Recommended::Wrapped`] (its row ran to the edge), the
 /// 180-column one [`Recommended::Label`]. NEGATIVE CONTROLS: a description
 /// row that ends ` (Recommended)` under a label that fits its row by far is
@@ -744,7 +747,7 @@ fn recommended_is_read_from_the_label_only() {
     assert!(possibly_wrap(&"x".repeat(79), "meter", 80));
 }
 
-/// F1: a question whose head the pane cut — its tab bar, its question or
+/// A question whose head the pane cut — its tab bar, its question or
 /// its first options off the rows read — is a question with its head off
 /// the screen, form unknown, never idle; so is a review tab cut the same
 /// way. A cut at the top rule leaves the whole dialog on the rows read, and
@@ -811,7 +814,7 @@ fn a_cut_question_is_head_off_screen_never_idle() {
     assert!(!parse_prompt_v2(&r[rule..]).expect("whole").head_off_screen);
 }
 
-/// F1: the hand-built column-one dialogs (a shape 2.1.282 does not draw)
+/// The hand-built column-one dialogs (a shape 2.1.282 does not draw)
 /// are still questions — prompt phase — but not read whole, so nothing
 /// answers them.
 #[test]
@@ -836,7 +839,7 @@ fn a_column_one_question_is_still_a_question_not_read_whole() {
     assert_eq!(p.with_role(Role::Once), None);
 }
 
-/// F1: the owner's TRANSCRIPTION of the incident screen (`›` for the
+/// The owner's TRANSCRIPTION of the incident screen (`›` for the
 /// cursor, `□` chips, `✓ Submit`, a leading space on the tab row) is a
 /// question — its footer says so — read not whole: the `›` row is no
 /// option, so nothing answers it.
@@ -865,7 +868,7 @@ fn the_transcribed_incident_is_escalated_not_answered() {
     assert!(matches!(d.form, QuestionForm::Unknown { .. }));
 }
 
-/// R5 as MEASURED (the live E2E of 2026-09-25, 2.1.282): with `draft` typed
+/// AS MEASURED (the live E2E of 2026-09-25, 2.1.282): with `draft` typed
 /// into the composer while the turn ran, the dialog was drawn in place of
 /// the composer anyway — the draft hidden under it, no withheld notice —
 /// and it reads whole, as any live dialog does; once answered, the draft is
@@ -903,7 +906,7 @@ fn a_dialog_drawn_over_a_draft_reads_whole_and_the_draft_is_left() {
     assert_ne!(worker_phase(&after), Phase::Prompt);
 }
 
-/// R5: Claude Code WITHHOLDS the dialog while the composer holds a draft and
+/// Claude Code WITHHOLDS the dialog while the composer holds a draft and
 /// draws a dim notice instead — it read idle, a silent stall. It is a
 /// question, form unknown, prompt phase. NEGATIVE CONTROLS: the notice's
 /// words in the worker's message, the notice over the transcript's later
@@ -949,7 +952,7 @@ fn a_question_withheld_behind_a_draft_is_a_question_never_idle() {
     assert_ne!(worker_phase(&bare), Phase::Prompt);
 }
 
-/// R6: what the dialog's host draws under it — the AFK countdown row, one
+/// What the dialog's host draws under it — the AFK countdown row, one
 /// right-aligned plugin notice, the REPL's `… waiting while this panel is
 /// open` row — keeps the dialog read whole (they had made it unknown, a
 /// stall); the AFK row is read as `auto_continue`. NEGATIVE CONTROL: any
@@ -990,7 +993,7 @@ fn the_rows_under_a_dialog_keep_it_read_whole() {
     }
 }
 
-/// R7: a question footer whose rows are none of the shapes read, over
+/// A question footer whose rows are none of the shapes read, over
 /// which the old walk finds no box, is still a question when it is LIVE —
 /// read with its head off the screen, form unknown, never idle. NEGATIVE
 /// CONTROL: the owner's screen QUOTED in a message with the composer under
@@ -1038,7 +1041,7 @@ fn a_live_question_footer_is_never_no_box_and_a_quoted_one_is() {
     assert_eq!(parse_prompt_v2(&flat), None);
 }
 
-/// R9 and R11: a scrolled option list (`↓`/`↑` in the pointer column), a
+/// A scrolled option list (`↓`/`↑` in the pointer column), a
 /// gap in the numbering, a chat row that is not `N+2`, and no row carrying
 /// the focus are each unknown — never read whole — and still a question.
 #[test]
@@ -1089,7 +1092,7 @@ fn an_unsound_option_list_is_never_read_whole() {
 }
 
 /// The tab bar's grammar: one chip at column 1, or `←` … `✔ Submit` … `→`
-/// at column 0 (R13: ONE multi-select question draws the latter).
+/// at column 0 (ONE multi-select question draws the latter).
 #[test]
 fn the_tab_bar_is_read_by_its_chips() {
     let names = |row: &str| {
@@ -1151,6 +1154,630 @@ fn the_dialogs_accessors_name_its_rows() {
     assert_eq!(unknown.question(), None);
     assert_eq!(unknown.guard_row(), None);
     assert_eq!(unknown.focus(), QuestionFocus::None);
+}
+
+// ---- 2.1.283: a policy text typed into the free-text row --------------------
+
+/// The contract's §4 rewording, the texts the harness types (commas,
+/// semicolons, hyphens and `then` taken out so a multi-select answer is not
+/// delivered CSV-quoted). `aterm-agent`'s `policy/question.rs` owns the
+/// constants; these copies pin the READER's side of them — that each, wrapped
+/// as 2.1.283 wraps the field, is read back whole — before that code lands.
+const REWORDED_LONG_TERM: &str = "Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)";
+const REWORDED_SHORT_TERM: &str = "Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)";
+
+/// The captures whose free-text row holds a measured policy text, with it —
+/// the focused field (c1-04, c4-04, c8-02, c3-05, c4-09) and the field the
+/// focus left for the button (c3-06, c4-10).
+const TYPED_2_1_283: [(&str, &str, &str); 7] = [
+    (
+        "c1-04",
+        QUESTION_283_TYPED_LONG_TERM,
+        MEASURED_LONG_TERM_2_1_283,
+    ),
+    (
+        "c4-04",
+        QUESTION_283_TABS_FIRST_TYPED_LONG_TERM,
+        MEASURED_LONG_TERM_2_1_283,
+    ),
+    (
+        "c8-02",
+        QUESTION_283_TYPED_SHORT_TERM,
+        MEASURED_SHORT_TERM_2_1_283,
+    ),
+    (
+        "c3-05",
+        QUESTION_283_MULTISELECT_TYPED_LONG_TERM,
+        MEASURED_LONG_TERM_2_1_283,
+    ),
+    (
+        "c4-09",
+        QUESTION_283_TABS_SECOND_TYPED_LONG_TERM,
+        MEASURED_LONG_TERM_2_1_283,
+    ),
+    (
+        "c3-06",
+        QUESTION_283_MULTISELECT_TYPED_BUTTON,
+        MEASURED_LONG_TERM_2_1_283,
+    ),
+    (
+        "c4-10",
+        QUESTION_283_TABS_SECOND_TYPED_BUTTON,
+        MEASURED_LONG_TERM_2_1_283,
+    ),
+];
+
+/// The rows the free-text row's text is drawn on: from its numbered row to
+/// the multi-select button or the divider.
+fn field_rows(d: &QuestionDialog) -> std::ops::Range<usize> {
+    match &d.form {
+        QuestionForm::Single {
+            free_text, chat, ..
+        } => free_text.row..chat.row - 1,
+        QuestionForm::Multi {
+            free_text, button, ..
+        } => free_text.row..button.row,
+        other => panic!("no free-text row: {other:?}"),
+    }
+}
+
+/// One 2.1.283 capture's expected reading.
+struct Live283 {
+    name: &'static str,
+    text: &'static str,
+    /// `single`, `multi`, `preview`, `review`, or the `why` of an unknown.
+    form: &'static str,
+    focus: QuestionFocus,
+    answered: &'static [bool],
+    /// The free-text row's (text, pristine, checked), where the form has one.
+    free: Option<(&'static str, bool, Option<bool>)>,
+}
+
+/// 2.1.283 (c1…c11): every committed capture of the dialog reads as its
+/// form — single, multi, preview, review, or unknown where it must be —
+/// always a question, its head on the screen, prompt phase, authoritative.
+/// The options are the model's and never ticked: the text is the answer.
+#[test]
+fn every_2_1_283_question_capture_reads_as_its_form() {
+    use QuestionFocus as F;
+    const Y: bool = true;
+    const N: bool = false;
+    const DOT: &str = "Type something.";
+    const BARE: &str = "Type something";
+    const LONG: &str = MEASURED_LONG_TERM_2_1_283;
+    fn live(
+        name: &'static str,
+        text: &'static str,
+        form: &'static str,
+        focus: QuestionFocus,
+        answered: &'static [bool],
+        free: Option<(&'static str, bool, Option<bool>)>,
+    ) -> Live283 {
+        Live283 {
+            name,
+            text,
+            form,
+            focus,
+            answered,
+            free,
+        }
+    }
+    let table = [
+        live(
+            "c1-03",
+            QUESTION_283_FREE_TEXT_FOCUSED,
+            "single",
+            F::FreeText,
+            &[N],
+            Some((DOT, Y, None)),
+        ),
+        live(
+            "c1-04",
+            QUESTION_283_TYPED_LONG_TERM,
+            "single",
+            F::FreeText,
+            &[N],
+            Some((LONG, N, None)),
+        ),
+        live(
+            "c8-02",
+            QUESTION_283_TYPED_SHORT_TERM,
+            "single",
+            F::FreeText,
+            &[N],
+            Some((MEASURED_SHORT_TERM_2_1_283, N, None)),
+        ),
+        live(
+            "c2-04",
+            QUESTION_283_TYPED_PERSON,
+            "single",
+            F::FreeText,
+            &[N],
+            Some(("go with blue", N, None)),
+        ),
+        live(
+            "c3-04",
+            QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED,
+            "multi",
+            F::FreeText,
+            &[N],
+            Some((BARE, Y, Some(N))),
+        ),
+        live(
+            "c3-05",
+            QUESTION_283_MULTISELECT_TYPED_LONG_TERM,
+            "multi",
+            F::FreeText,
+            &[Y],
+            Some((LONG, N, Some(Y))),
+        ),
+        live(
+            "c3-06",
+            QUESTION_283_MULTISELECT_TYPED_BUTTON,
+            "multi",
+            F::Button,
+            &[Y],
+            Some((LONG, N, Some(Y))),
+        ),
+        live(
+            "c3-07",
+            QUESTION_283_MULTISELECT_REVIEW,
+            "review",
+            F::ReviewSubmit,
+            &[Y],
+            None,
+        ),
+        live(
+            "c3b-03",
+            QUESTION_283_MULTISELECT_TYPED_PERSON,
+            "multi",
+            F::FreeText,
+            &[Y],
+            Some(("go with olives", N, Some(Y))),
+        ),
+        // Typed into, the multi-select row ticks itself (c3-05 … c4-10,
+        // c3b-03); Enter in it UNTICKS it, the text left (c3c-03): the
+        // hazard that forbids an Enter there. A single-select row has none.
+        live(
+            "c3c-03",
+            QUESTION_283_MULTISELECT_UNTICKED,
+            "multi",
+            F::FreeText,
+            &[N],
+            Some(("go with olives", N, Some(N))),
+        ),
+        live(
+            "c4-01",
+            QUESTION_283_TABS_FIRST,
+            "single",
+            F::Option(1),
+            &[N, N],
+            Some((DOT, Y, None)),
+        ),
+        live(
+            "c4-02",
+            QUESTION_283_TABS_FIRST_DOWN,
+            "single",
+            F::Option(2),
+            &[N, N],
+            Some((DOT, Y, None)),
+        ),
+        live(
+            "c4-03",
+            QUESTION_283_TABS_FIRST_FREE_TEXT_FOCUSED,
+            "single",
+            F::FreeText,
+            &[N, N],
+            Some((DOT, Y, None)),
+        ),
+        live(
+            "c4-04",
+            QUESTION_283_TABS_FIRST_TYPED_LONG_TERM,
+            "single",
+            F::FreeText,
+            &[N, N],
+            Some((LONG, N, None)),
+        ),
+        live(
+            "c4-05",
+            QUESTION_283_TABS_SECOND,
+            "multi",
+            F::Option(1),
+            &[Y, N],
+            Some((BARE, Y, Some(N))),
+        ),
+        live(
+            "c4-06",
+            QUESTION_283_TABS_SECOND_DOWN,
+            "multi",
+            F::Option(2),
+            &[Y, N],
+            Some((BARE, Y, Some(N))),
+        ),
+        live(
+            "c4-07",
+            QUESTION_283_TABS_SECOND_DOWN_TWICE,
+            "multi",
+            F::Option(3),
+            &[Y, N],
+            Some((BARE, Y, Some(N))),
+        ),
+        live(
+            "c4-08",
+            QUESTION_283_TABS_SECOND_FREE_TEXT_FOCUSED,
+            "multi",
+            F::FreeText,
+            &[Y, N],
+            Some((BARE, Y, Some(N))),
+        ),
+        live(
+            "c4-09",
+            QUESTION_283_TABS_SECOND_TYPED_LONG_TERM,
+            "multi",
+            F::FreeText,
+            &[Y, Y],
+            Some((LONG, N, Some(Y))),
+        ),
+        live(
+            "c4-10",
+            QUESTION_283_TABS_SECOND_TYPED_BUTTON,
+            "multi",
+            F::Button,
+            &[Y, Y],
+            Some((LONG, N, Some(Y))),
+        ),
+        live(
+            "c4-11",
+            QUESTION_283_TABS_REVIEW,
+            "review",
+            F::ReviewSubmit,
+            &[Y, Y],
+            None,
+        ),
+        live(
+            "c11-01",
+            QUESTION_283_PREVIEW,
+            "preview",
+            F::Option(1),
+            &[N],
+            None,
+        ),
+        live(
+            "c5-03",
+            QUESTION_283_PREVIEW_CHAT_FOCUSED,
+            FOCUS,
+            F::None,
+            &[N],
+            None,
+        ),
+        live(
+            "c5-06",
+            QUESTION_283_PREVIEW_NOTES_OPEN,
+            NOTES_OPEN,
+            F::None,
+            &[N],
+            None,
+        ),
+    ];
+    assert_eq!(table.len(), 24, "every committed 2.1.283 dialog capture");
+    for want in &table {
+        let name = want.name;
+        let prov = provenance(want.text).expect("provenance");
+        assert!(
+            prov.starts_with("claude-code 2.1.283 · MEASURED") && prov.contains(name),
+            "{name}: {prov}"
+        );
+        let (r, p, d) = read(want.text);
+        assert_eq!(p.kind, PromptKind::Question, "{name}");
+        assert!(!p.head_off_screen, "{name}");
+        assert_eq!(d.width, 120, "{name}");
+        let form = match &d.form {
+            QuestionForm::Single { .. } => "single",
+            QuestionForm::Multi { .. } => "multi",
+            QuestionForm::Preview { .. } => "preview",
+            QuestionForm::Review { .. } => "review",
+            QuestionForm::Unknown { why } => why,
+        };
+        assert_eq!(form, want.form, "{name}");
+        assert_eq!(d.focus(), want.focus, "{name}");
+        let answered: Vec<bool> = d.tabs.iter().map(|t| t.answered).collect();
+        assert_eq!(answered, want.answered, "{name}");
+        assert_eq!(
+            d.submit_tab,
+            want.answered.len() > 1 || form == "multi" || form == "review",
+            "{name}"
+        );
+        let free = match &d.form {
+            QuestionForm::Single { free_text, .. } | QuestionForm::Multi { free_text, .. } => {
+                Some((
+                    free_text.text.as_str(),
+                    free_text.pristine,
+                    free_text.checked,
+                ))
+            }
+            _ => None,
+        };
+        assert_eq!(free, want.free, "{name}");
+        match &d.form {
+            QuestionForm::Single { options, .. } => {
+                let o: Vec<(&str, Recommended)> = options
+                    .iter()
+                    .map(|o| (o.label.as_str(), o.recommended))
+                    .collect();
+                assert_eq!(
+                    o,
+                    [
+                        ("Red (Recommended)", Recommended::Label),
+                        ("Blue", Recommended::No)
+                    ],
+                    "{name}"
+                );
+            }
+            QuestionForm::Multi { options, .. } => {
+                let o: Vec<(&str, Option<bool>)> = options
+                    .iter()
+                    .map(|o| (o.label.as_str(), o.checked))
+                    .collect();
+                assert_eq!(
+                    o,
+                    [
+                        ("Cheese (Recommended)", Some(N)),
+                        ("Olives", Some(N)),
+                        ("Basil", Some(N))
+                    ],
+                    "{name}: no option is ever ticked"
+                );
+            }
+            // c3-07, c4-11: the button's Enter drew the review, every
+            // question answered, the key guarded on `1. Submit answers`.
+            QuestionForm::Review {
+                unanswered,
+                submit,
+                cancel,
+            } => {
+                assert!(!unanswered, "{name}");
+                assert_eq!(r[submit.row].trim(), "❯ 1. Submit answers", "{name}");
+                assert_eq!(cancel.row, submit.row + 1, "{name}");
+                assert_eq!(d.guard_row(), Some(submit.row), "{name}");
+                assert_eq!(p.span.1, cancel.row, "{name}");
+            }
+            _ => {}
+        }
+        let reading = crate::reader::read(Some("claude"), &r, None);
+        assert_eq!(reading.phase, Phase::Prompt, "{name}");
+        assert!(reading.phase_authoritative, "{name}");
+    }
+}
+
+/// 2.1.283: the policy text typed into the free-text row — three rows at
+/// the label column, the dialog grown upward by two — is read back as the
+/// rows joined with one space, EXACTLY the text typed: the read-back the
+/// harness compares before any Enter. On a single-select tab that is the
+/// very string Claude received (the sessions' `answers` maps, c1, c4 and
+/// c8); a multi-select tab delivered this comma-bearing wording CSV-quoted
+/// (c3, c4: `"\"Decide yourself: …\""`), the reason the contract rewords
+/// it. The multi-select field REFLOWS when the focus leaves it for the
+/// button (c3-05 → c3-06, c4-09 → c4-10: its rows end one cell further
+/// out) and still reads the same text.
+#[test]
+fn the_typed_policy_text_reads_back_exactly_as_typed() {
+    for (name, text, measured) in TYPED_2_1_283 {
+        let (r, _, d) = read(text);
+        assert_eq!(free_row(&d).text, measured, "{name}");
+        let rows = field_rows(&d);
+        assert_eq!(rows.len(), 3, "{name}: the field grew to three rows");
+        let col = if matches!(d.form, QuestionForm::Multi { .. }) {
+            9
+        } else {
+            5
+        };
+        for (i, row) in r[rows].iter().enumerate().skip(1) {
+            assert_eq!(leading_spaces(row), col, "{name}: the field's row {i}");
+        }
+    }
+    for (typed, button) in [
+        (
+            QUESTION_283_MULTISELECT_TYPED_LONG_TERM,
+            QUESTION_283_MULTISELECT_TYPED_BUTTON,
+        ),
+        (
+            QUESTION_283_TABS_SECOND_TYPED_LONG_TERM,
+            QUESTION_283_TABS_SECOND_TYPED_BUTTON,
+        ),
+    ] {
+        let (a, _, da) = read(typed);
+        let (b, _, db) = read(button);
+        let (ra, rb) = (field_rows(&da), field_rows(&db));
+        assert_ne!(a[ra.start + 1], b[rb.start + 1], "the field reflowed");
+        assert_eq!(free_row(&da).text, free_row(&db).text);
+        assert!(da.same_question(&db));
+        assert_eq!(
+            (da.focus(), db.focus()),
+            (QuestionFocus::FreeText, QuestionFocus::Button)
+        );
+    }
+    // NEGATIVE CONTROL: a person's words there are theirs, not the text.
+    for text in [
+        QUESTION_283_TYPED_PERSON,
+        QUESTION_283_MULTISELECT_TYPED_PERSON,
+    ] {
+        let (_, _, d) = read(text);
+        let f = free_row(&d);
+        assert!(!f.pristine);
+        assert_ne!(f.text, MEASURED_LONG_TERM_2_1_283);
+        assert_eq!(field_rows(&d).len(), 1);
+    }
+}
+
+/// 2.1.283: the preview form reads whole on its first screen (c11-01); two
+/// `down`s past its last option draw `❯` on the chat row AND leave it on
+/// option 2 (c5-03), and `n` opens the notes (c5-06: `Notes: Add notes on
+/// this design…`, what they hold drawn nowhere else) — each unknown: still
+/// a question, prompt phase, never answered.
+#[test]
+fn the_2_1_283_preview_is_unknown_on_its_chat_row_and_with_its_notes_open() {
+    let (_, _, d) = read(QUESTION_283_PREVIEW);
+    let QuestionForm::Preview {
+        options, pane_col, ..
+    } = &d.form
+    else {
+        panic!("{:?}", d.form)
+    };
+    assert_eq!(*pane_col, 34);
+    assert_eq!(options[0].label, "Stacked (Recommended)");
+    for (text, want, drawn) in [
+        (
+            QUESTION_283_PREVIEW_CHAT_FOCUSED,
+            FOCUS,
+            "❯ Chat about this",
+        ),
+        (
+            QUESTION_283_PREVIEW_NOTES_OPEN,
+            NOTES_OPEN,
+            "Notes: Add notes on this design…",
+        ),
+    ] {
+        let (r, p, d) = read(text);
+        assert!(r.iter().any(|x| x.trim() == drawn), "{want}");
+        assert_eq!(why(&d), want);
+        assert_eq!(p.kind, PromptKind::Question);
+        assert!(!p.head_off_screen);
+        assert_eq!(worker_phase(&r), Phase::Prompt);
+    }
+    let (r, p, _) = read(QUESTION_283_PREVIEW_CHAT_FOCUSED);
+    let focused: Vec<&str> = r[p.span.0..=p.span.1]
+        .iter()
+        .filter(|x| x.starts_with('❯'))
+        .map(|x| x.trim_end())
+        .collect();
+    assert_eq!(focused.len(), 2);
+    assert!(focused[0].starts_with("❯ 2. Side by side  "));
+    assert_eq!(focused[1], "❯ Chat about this");
+}
+
+/// The synthetic wrap ([`rewrap_free_text`]) is the MEASURED one: fed each
+/// capture's own text at its own 120 columns it redraws the capture's
+/// dialog row for row — the focused field wrapping at cell 119 (c8-02's
+/// `you` would fit at 120), the unfocused one at 120 (c3-06's `(Answered`
+/// runs to it) — so the wraps below are the shape 2.1.283 draws.
+#[test]
+fn rewrap_free_text_redraws_every_measured_wrap() {
+    for (name, text, measured) in TYPED_2_1_283 {
+        let r = screen(text);
+        let top = r
+            .iter()
+            .rposition(|x| x.starts_with('←') || x.starts_with(" ☐") || x.starts_with(" ☒"))
+            .expect("the tab bar")
+            - 1;
+        assert_eq!(rewrap_free_text(text, measured, 120), r[top..], "{name}");
+    }
+}
+
+/// The contract's texts (§4), typed into each 2.1.283 select tab — single
+/// and multi-select, alone and one of two, focused and left for the button
+/// — and wrapped as 2.1.283 wraps them, read back whole and exactly at 80
+/// and 200 columns, and at every width between the narrowest the tab's
+/// other rows fit in and 220: never cut, never joined with a doubled or
+/// missing space, never read as the placeholder. The two-question tabs
+/// with text in the field draw an 84-cell footer (`Enter to select ·
+/// Tab/Arrow keys to navigate · ctrl+g to edit in Vim · Esc to cancel`), so
+/// their narrowest is 84: how 2.1.283 draws that footer in 80 columns is
+/// not measured (the live check at 80x24 is the contract's L7).
+#[test]
+fn the_reworded_policy_texts_read_whole_at_80_and_200_columns() {
+    let check = |capture: &str, text: &str, width: usize| {
+        let (_, _, measured) = read(capture);
+        let r = rewrap_free_text(capture, text, width);
+        let p = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{width}: no box"));
+        assert_eq!(p.kind, PromptKind::Question, "{width}");
+        assert!(!p.head_off_screen, "{width}");
+        let d = p.question_dialog.expect("the dialog");
+        assert_eq!(d.width, width);
+        assert_eq!(
+            std::mem::discriminant(&d.form),
+            std::mem::discriminant(&measured.form),
+            "{width}: {:?}",
+            d.form
+        );
+        let f = free_row(&d);
+        assert_eq!(f.text, text, "{width}");
+        assert!(!f.pristine, "{width}");
+        assert_eq!(f.checked, free_row(&measured).checked, "{width}");
+        assert_eq!(d.focus(), measured.focus(), "{width}");
+        assert!(d.same_question(&measured), "{width}");
+        assert_eq!(worker_phase(&r), Phase::Prompt, "{width}");
+        field_rows(&d).len()
+    };
+    for (capture, narrowest) in [
+        (QUESTION_283_TYPED_LONG_TERM, 80),
+        (QUESTION_283_TYPED_SHORT_TERM, 80),
+        (QUESTION_283_MULTISELECT_TYPED_LONG_TERM, 80),
+        (QUESTION_283_MULTISELECT_TYPED_BUTTON, 80),
+        (QUESTION_283_TABS_FIRST_TYPED_LONG_TERM, 84),
+        (QUESTION_283_TABS_SECOND_TYPED_LONG_TERM, 84),
+        (QUESTION_283_TABS_SECOND_TYPED_BUTTON, 84),
+    ] {
+        // The narrowest width the tab's other rows fit in, as captured.
+        let (r, p, d) = read(capture);
+        let field = field_rows(&d);
+        let widest = (p.span.0..r.len())
+            .filter(|i| !field.contains(i) && !is_rule(&r[*i]))
+            .map(|i| r[i].chars().count())
+            .max()
+            .expect("rows");
+        assert_eq!(widest.max(80), narrowest);
+        for text in [REWORDED_LONG_TERM, REWORDED_SHORT_TERM] {
+            let at_narrowest = check(capture, text, narrowest);
+            let at_200 = check(capture, text, 200);
+            assert!(
+                at_narrowest >= 4 && at_200 == 2,
+                "{at_narrowest} rows at {narrowest}, {at_200} at 200: wrapped at both"
+            );
+            for width in narrowest..=220 {
+                check(capture, text, width);
+            }
+        }
+    }
+}
+
+/// NEGATIVE CONTROL: a free-text row whose wrapped rows are not at its
+/// label column — one cell either side, or a multi-select row's at the
+/// single-select column 5 — is a question never read whole (unknown,
+/// prompt phase): a vendor that moved the wrap stalls the harness, it never
+/// reads the text short.
+#[test]
+fn a_free_text_row_wrapped_at_another_column_is_never_read_whole() {
+    for (capture, cols) in [
+        (QUESTION_283_TYPED_LONG_TERM, &[4, 6][..]),
+        (QUESTION_283_TYPED_SHORT_TERM, &[4, 6]),
+        (QUESTION_283_MULTISELECT_TYPED_LONG_TERM, &[5, 8, 10]),
+        (QUESTION_283_MULTISELECT_TYPED_BUTTON, &[5, 8, 10]),
+    ] {
+        for text in [REWORDED_LONG_TERM, REWORDED_SHORT_TERM] {
+            let r = rewrap_free_text(capture, text, 80);
+            let d = parse_prompt_v2(&r)
+                .and_then(|p| p.question_dialog)
+                .expect("read whole where it is drawn");
+            let rows = field_rows(&d);
+            assert_eq!(free_row(&d).text, text);
+            for k in rows.start + 1..rows.end {
+                for &col in cols {
+                    let mut moved = r.clone();
+                    moved[k] = format!("{}{}", " ".repeat(col), r[k].trim_start());
+                    let p = parse_prompt_v2(&moved)
+                        .unwrap_or_else(|| panic!("row {k} at {col}: no box"));
+                    assert_eq!(p.kind, PromptKind::Question, "row {k} at {col}");
+                    let d = p.question_dialog.expect("the dialog");
+                    assert!(
+                        matches!(d.form, QuestionForm::Unknown { .. }),
+                        "row {k} at {col}: {:?}",
+                        d.form
+                    );
+                    assert_eq!(worker_phase(&moved), Phase::Prompt, "row {k} at {col}");
+                }
+            }
+        }
+    }
 }
 
 /// The dialog as 2.1.281 drew it (live captures of 2026-09-24, before the

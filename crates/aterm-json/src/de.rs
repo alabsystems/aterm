@@ -1,22 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The parser and its `serde::Deserializer`.
-//!
-//! RFC 8259 with the same three practical rules `serde_json` applies, because
-//! every one of them is load-bearing for a program that reads untrusted JSON:
-//!
-//! * **trailing data is an error.** `from_str` parses ONE value and then
-//!   requires end-of-input, so `{"a":1} {"b":2}` is a failure rather than the
-//!   first object.
-//! * **nesting is bounded** ([`RECURSION_LIMIT`]). A hostile document of ten
-//!   thousand `[` is an error, not a stack overflow — and the recursion here is
-//!   the deserializer's own, so the bound has to be enforced by counting rather
-//!   than hoped for.
-//! * **duplicate keys are last-wins**, matching `serde_json` and what
-//!   `#[derive(Deserialize)]` does with them. (This is the OPPOSITE of
-//!   `aterm-toml`, which rejects them — a config file an operator edits and a
-//!   wire format a server emits are different problems.)
+//! The parser and its `serde::Deserializer`: RFC 8259 under the rules the
+//! crate docs list (one value then end-of-input, bounded nesting, last-wins
+//! duplicate keys).
 
 use std::borrow::Cow;
 
@@ -121,10 +108,7 @@ impl<'de> Deserializer<'de> {
 
     fn enter(&mut self) -> Result<()> {
         self.depth = self.depth.saturating_add(1);
-        // The 128th container is already too deep — `serde_json` starts a
-        // budget of `RECURSION_LIMIT` and refuses the descent that would spend
-        // the last unit, so 127 nested arrays parse and 128 do not. The
-        // differential oracle pinned this boundary; it was off by one.
+        // As `serde_json`: 127 nested containers parse, 128 do not.
         if self.depth >= RECURSION_LIMIT {
             return Err(self.err("recursion limit exceeded"));
         }
@@ -421,12 +405,7 @@ impl<'de> Deserializer<'de> {
     /// Hand a parsed number to `visitor`.
     ///
     /// `-0` goes to the visitor as the FLOAT negative zero in every context,
-    /// typed or not. That is what `serde_json` does and it is not an accident
-    /// of its untyped path: its typed integer entry points call the SAME
-    /// `parse_number`, which turns `-0` into `F64(-0.0)` on both paths, so
-    /// `from_str::<u64>("-0")` is an error there. It used to be `Ok(0)` here —
-    /// an acceptance-set widening on the reader that parses the GitHub Releases
-    /// discovery reply.
+    /// typed or not, as in `serde_json`: `from_str::<u64>("-0")` is an error.
     fn visit_number<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
         let parsed = self.parse_number()?;
         Self::dispatch(parsed.value, visitor)
@@ -467,13 +446,9 @@ impl<'de> Deserializer<'de> {
         }
     }
 
-    /// The 128-bit entry points, which are the only ones that can carry an
-    /// integer the `u64`/`i64` classification cannot hold.
-    ///
-    /// Without this, `deserialize_u128` went through the same `f64` widening as
-    /// every other integer, so `u128::MAX` — which this crate SERIALIZES
-    /// exactly — read back as an error, and `to_value` of it silently became a
-    /// rounded float. `serde_json` round-trips both exactly.
+    /// The 128-bit entry points: the only ones that can carry an integer the
+    /// `u64`/`i64` classification would widen to `f64`, so `u128::MAX`
+    /// round-trips exactly, as in `serde_json`.
     fn deserialize_wide<V: Visitor<'de>>(&mut self, visitor: V, signed: bool) -> Result<V::Value> {
         if !matches!(self.peek_value()?, b'-' | b'0'..=b'9') {
             return serde::de::Deserializer::deserialize_any(&mut *self, visitor);
@@ -699,7 +674,6 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
                 self.enter()?;
                 self.bump();
                 let out = visitor.visit_enum(EnumAccess { de: self })?;
-                self.skip_ws();
                 self.expect(b'}', "`}` after the enum variant")?;
                 self.leave();
                 Ok(out)
@@ -919,8 +893,5 @@ pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T
 /// # Errors
 /// As [`from_slice`].
 pub fn from_str<'de, T: serde::Deserialize<'de>>(input: &'de str) -> Result<T> {
-    let mut de = Deserializer::from_slice(input.as_bytes());
-    let value = T::deserialize(&mut de)?;
-    de.end()?;
-    Ok(value)
+    from_slice(input.as_bytes())
 }

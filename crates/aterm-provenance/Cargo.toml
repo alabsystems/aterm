@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Trusted data-flow provenance framework for aterm: Origin lattice + Provenance<T, O> wrapper (Phase 0, issue #8000)"
+description = "Type-level taint for aterm's parser: the sealed Pty origin and the Provenance<T, O> wrapper"
 
 [dev-dependencies]
 # None — tests use only std

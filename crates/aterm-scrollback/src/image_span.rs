@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use aterm_types::ImageData;
+use aterm_types::{ImageData, KittyPlacementTag};
 
 /// Inline-image span within a line.
 ///
@@ -45,8 +45,10 @@ use aterm_types::ImageData;
 /// │ image_row: u16 (2 bytes) - Footprint row these cells paint      │
 /// │ first_cell_col: u16 (2 bytes) - Footprint column of start_col   │
 /// │ image: Arc<ImageData> (8 bytes) - SHARED payload                │
+/// │ kitty: Option<KittyPlacementTag> (12 bytes) - Kitty placement   │
 /// └─────────────────────────────────────────────────────────────────┘
-/// Total: 16 bytes per span, plus a refcount bump on the shared payload
+/// Total: 32 bytes per span (with padding), plus a refcount bump on the
+/// shared payload
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageSpan {
@@ -63,6 +65,10 @@ pub struct ImageSpan {
     pub first_cell_col: u16,
     /// The shared placement payload.
     pub image: Arc<ImageData>,
+    /// The Kitty placement these cells showed, `None` for any other image. It
+    /// orders the image layers of a cell that returns from history as they
+    /// were stacked.
+    pub kitty: Option<KittyPlacementTag>,
 }
 
 impl ImageSpan {
@@ -82,6 +88,7 @@ impl ImageSpan {
             image_row,
             first_cell_col,
             image,
+            kitty: None,
         }
     }
 

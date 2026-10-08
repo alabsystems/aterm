@@ -19,6 +19,9 @@
 //! * THE HOLDER SCAN: a window whose master is also held by a surviving
 //!   process is SIGKILLed; nothing is offered while that process lives, and
 //!   the master is offered once it is gone.
+//! * AN OFFER THAT BECOMES NO SESSION: the next window RELEASEs what it could
+//!   not place through its link, on the connection the offer was made to, and
+//!   quits: the keeper closes its copy and the shell is hung up.
 //! * THE CRASH MARKER (§5.4 row 3's cross-check): a window that holds a real
 //!   locked marker, names it at HELLO, and quits through its exit path —
 //!   `exit(0)`, the marker unlinked — WITHOUT a BYE has its shell hung up, as
@@ -52,10 +55,11 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use aterm_keeper::client::KeeperClient;
+use aterm_keeper::client::{KeeperClient, KeeperLink, LinkOp};
 use aterm_keeper::identity::Identity;
 use aterm_keeper::server::{Relauncher, ServeConfig, Server};
 use aterm_keeper::wire::{Birth, Frame, MarkerRef, MasterHeader};
+use aterm_spec::wait::{MUST_HAPPEN, within};
 use aterm_uds::exitwatch::ExitWatch;
 
 const ROLE: &str = "ATERM_KEEPER_TEST_ROLE";
@@ -67,27 +71,17 @@ const DROP: &str = "ATERM_KEEPER_TEST_DROP_CUSTODY";
 const TALK: &str = "ATERM_KEEPER_TEST_TALK";
 /// The directory a marked window arms its crash marker in.
 const LOGS: &str = "ATERM_KEEPER_TEST_LOGS";
-const HANG: Duration = Duration::from_secs(60);
+const HANG: Duration = MUST_HAPPEN;
 
 unsafe extern "C" {
-    fn posix_openpt(flags: i32) -> i32;
-    fn grantpt(fd: i32) -> i32;
-    fn unlockpt(fd: i32) -> i32;
-    fn ptsname(fd: i32) -> *const core::ffi::c_char;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn setsid() -> i32;
     fn ioctl(fd: i32, req: u64, ...) -> i32;
-    fn dup2(a: i32, b: i32) -> i32;
-    fn open(path: *const core::ffi::c_char, flags: i32, ...) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
-    fn flock(fd: i32, op: i32) -> i32;
 }
 
-const O_RDWR: i32 = 2;
-const O_NOCTTY: i32 = 0x20000;
-const F_SETFD: i32 = 2;
 const F_DUPFD: i32 = 0;
-const FD_CLOEXEC: i32 = 1;
+const F_SETFD: i32 = 2;
 const TIOCSCTTY: u64 = 0x2000_7461;
 
 /// Which role this process plays, when re-run by a test.
@@ -140,11 +134,10 @@ fn stepped_keeper_role() -> ! {
         if parked {
             std::fs::remove_file(note("pause")).expect("take the pause");
             std::fs::write(note("paused"), b"paused").expect("say parked");
-            let started = Instant::now();
-            while !note("resume").exists() {
-                assert!(started.elapsed() < HANG * 5, "never resumed");
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            let resumed = within(HANG * 5, Duration::from_millis(5), || {
+                note("resume").exists().then_some(())
+            });
+            assert!(resumed.is_some(), "never resumed");
             std::fs::remove_file(note("resume")).expect("take the resume");
         }
         if server.step(20).is_err() {
@@ -156,45 +149,35 @@ fn stepped_keeper_role() -> ! {
     }
 }
 
-/// A real PTY: the master (close-on-exec), and a `sleep` session leader whose
-/// controlling terminal is the slave.
+/// A real PTY: the master, and a `sleep` session leader whose controlling
+/// terminal is the slave. The pair is aterm-pty's `open_pty_pair`: both ends
+/// close-on-exec from the open, not set after it (a sibling test that forks in
+/// between would otherwise inherit one), and a `/dev/ptmx` open that lost
+/// XNU's race for a pty minor to another process's (`EREDRIVEOPEN`, -6) is
+/// redriven rather than failed.
 fn pty_with_leader() -> (OwnedFd, Child) {
-    // SAFETY: plain libc calls on a descriptor this function owns.
-    let master = unsafe { posix_openpt(O_RDWR | O_NOCTTY) };
-    assert!(master >= 0, "posix_openpt");
-    // SAFETY: as above.
-    unsafe {
-        assert_eq!(grantpt(master), 0);
-        assert_eq!(unlockpt(master), 0);
-        fcntl(master, F_SETFD, FD_CLOEXEC);
-    }
-    // SAFETY: ptsname returns a static buffer naming the slave; copied at once.
-    let slave = unsafe { std::ffi::CStr::from_ptr(ptsname(master)) }.to_owned();
-    // SAFETY: a fresh descriptor this function owns.
-    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    // SAFETY: two fresh descriptors this function alone owns.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let stdio = || Stdio::from(slave.try_clone().expect("dup the slave"));
     let mut cmd = Command::new("/bin/sleep");
-    cmd.arg("600");
-    // SAFETY: only async-signal-safe calls between fork and exec.
+    cmd.arg("600")
+        .stdin(stdio())
+        .stdout(stdio())
+        .stderr(stdio());
+    // SAFETY: only async-signal-safe calls between fork and exec, on the
+    // child's own stdin, which is the slave by then.
     unsafe {
         use std::os::unix::process::CommandExt as _;
-        cmd.pre_exec(move || {
-            if setsid() < 0 {
+        cmd.pre_exec(|| {
+            if setsid() < 0 || ioctl(0, TIOCSCTTY, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let fd = open(slave.as_ptr(), O_RDWR);
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if ioctl(fd, TIOCSCTTY, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            dup2(fd, 0);
-            dup2(fd, 1);
-            dup2(fd, 2);
             Ok(())
         });
     }
     let leader = cmd.spawn().expect("the session leader");
+    drop(slave);
     (master, leader)
 }
 
@@ -238,7 +221,11 @@ fn window_role(holder: bool) -> ! {
         // A non-close-on-exec duplicate at a high number, inherited by a
         // `sleep` that holds it for as long as it lives. The floor sits under
         // 256, macOS's default soft `RLIMIT_NOFILE`: `F_DUPFD` at or above
-        // the soft limit fails `EINVAL`.
+        // the soft limit fails `EINVAL`. The `sleep` is started by
+        // `spawnfd::transparent`, which hands its child every descriptor
+        // without close-on-exec on every std (a std `Command` child gets fds
+        // 0-2 alone under Trust's SP-1); its stdio is this role's, `/dev/null`
+        // (`Scratch::spawn`).
         // SAFETY: F_DUPFD on a descriptor we own; the result is inherited.
         let raw = unsafe { fcntl(master.as_raw_fd(), F_DUPFD, 200) };
         assert!(
@@ -246,9 +233,8 @@ fn window_role(holder: bool) -> ! {
             "F_DUPFD at 200: {}",
             std::io::Error::last_os_error()
         );
-        let held = Command::new("/bin/sleep")
+        let held = aterm_uds::spawnfd::transparent("/bin/sleep")
             .arg("600")
-            .stdin(Stdio::null())
             .spawn()
             .expect("holder");
         // SAFETY: our own duplicate; the child has its copy.
@@ -295,12 +281,12 @@ fn marked_window_role(named: bool) -> ! {
         .mode(0o600)
         .open(&pending)
         .expect("the marker");
-    // SAFETY: a descriptor this role owns; LOCK_EX|LOCK_NB never waits.
-    assert_eq!(
-        unsafe { flock(file.as_raw_fd(), 2 | 4) },
-        0,
-        "the owner lock"
-    );
+    // `flock(LOCK_EX|LOCK_NB)`, as `create_locked` takes it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the owner lock, held for the role process's life: its exit releases it"
+    )]
+    file.try_lock().expect("the owner lock");
     std::fs::rename(&pending, &marker).expect("the marker in place");
     let (master, leader) = pty_with_leader();
     let rdev = rdev_of(&master);
@@ -376,6 +362,116 @@ fn next_window_role(bye: bool, adopt: bool) -> ! {
     std::process::exit(0)
 }
 
+/// A recovering window that could not place what it was offered: HELLO, drop
+/// every offered master, start its link on the boot connection, RELEASE each
+/// offer through the link (`aterm-gui`'s `keeper_link::Claim`, dropped
+/// undischarged), say BYE and exit 0 (a quit).
+fn unplaced_window_role() -> ! {
+    let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
+    let client = KeeperClient::connect(&socket, &Identity::same_uid(), HANG).expect("connect");
+    let offers = client.hello_app("test").expect("hello");
+    let rdevs: Vec<u64> = offers.iter().map(|o| o.header.rdev).collect();
+    drop(offers);
+    let link = KeeperLink::start_on(socket, Identity::same_uid(), "test".into(), Some(client))
+        .expect("link");
+    for rdev in &rdevs {
+        assert!(link.enqueue(LinkOp::Release { rdev: *rdev }), "queued");
+    }
+    assert!(link.send_and_wait(LinkOp::Bye, HANG), "the BYE is written");
+    report(&format!("released={}", rdevs.len()));
+    std::process::exit(0)
+}
+
+/// An update's OUTGOING window whose successor never takes part in the keeper
+/// (its `[keeper] enabled = false`, or a build before the keeper): open a PTY
+/// with a leader and REGISTER it; start the successor — this binary again, as
+/// `quiet-successor`, holding a duplicate of the master as an adopted session
+/// does — and name it in a PENDING; report; on "go", end as the Commit does:
+/// `exit(0)`, no BYE.
+fn outgoing_window_role() -> ! {
+    let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
+    let talk = std::env::var(TALK).expect("talk");
+    let (master, leader) = pty_with_leader();
+    let rdev = rdev_of(&master);
+    let birth = born(leader.id());
+    let client = KeeperClient::connect(&socket, &Identity::same_uid(), HANG).expect("connect");
+    assert!(client.hello_app("test").expect("hello").is_empty());
+    let dup = master.try_clone().expect("dup for the keeper");
+    client
+        .register(
+            &dup,
+            MasterHeader {
+                rdev,
+                shell_pid: leader.id(),
+                shell_birth: birth,
+                local_id: 1,
+            },
+            b"sid=s-test".to_vec(),
+        )
+        .expect("register");
+    drop(dup);
+    // The successor's duplicate: not close-on-exec, at a number under the
+    // default soft `RLIMIT_NOFILE` (as `window_role`'s holder).
+    // SAFETY: F_DUPFD on a descriptor we own; the result is inherited.
+    let raw = unsafe { fcntl(master.as_raw_fd(), F_DUPFD, 200) };
+    assert!(
+        raw >= 200,
+        "F_DUPFD at 200: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut cmd = Command::new(std::env::current_exe().expect("test binary"));
+    cmd.args(std::env::args().skip(1))
+        .env(ROLE, "quiet-successor")
+        .env(TALK, format!("{talk}-succ"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // The hook clears the duplicate's close-on-exec flag in the child, so the
+    // successor holds it on every std. A `pre_exec` hook sends any std down
+    // its fork path, where Trust's SP-1 std MARKS every descriptor above
+    // stdio close-on-exec (it closes none) and then runs the hooks; the
+    // std before SP-1 marks nothing, and the clear changes nothing there.
+    // SAFETY: one async-signal-safe `fcntl` between fork and exec, on a
+    // descriptor the child holds from the fork.
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        cmd.pre_exec(move || {
+            if fcntl(raw, F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let successor = cmd.spawn().expect("the successor");
+    // SAFETY: our own duplicate; the successor has its copy.
+    drop(unsafe { OwnedFd::from_raw_fd(raw) });
+    client
+        .send(
+            &Frame::Pending {
+                pid: successor.id(),
+            },
+            None,
+        )
+        .expect("pending");
+    report(&format!(
+        "leader={} rdev={rdev} successor={}",
+        leader.id(),
+        successor.id()
+    ));
+    std::mem::forget(leader);
+    std::mem::forget(successor);
+    await_go();
+    drop(master);
+    std::process::exit(0)
+}
+
+/// The successor of [`outgoing_window_role`]: it never dials the keeper; on
+/// "go" it quits, `exit(0)`.
+fn quiet_successor_role() -> ! {
+    await_go();
+    std::process::exit(0)
+}
+
 /// A role's one-line report to the test.
 fn report(line: &str) {
     let talk = PathBuf::from(std::env::var(TALK).expect("talk"));
@@ -395,14 +491,10 @@ fn note(what: &str) {
 /// before).
 fn await_go() -> String {
     let go = PathBuf::from(std::env::var(TALK).expect("talk")).with_extension("go");
-    let started = Instant::now();
-    loop {
-        if let Ok(what) = std::fs::read_to_string(&go) {
-            return what;
-        }
-        assert!(started.elapsed() < HANG * 5, "never told to go");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    within(HANG * 5, Duration::from_millis(5), || {
+        std::fs::read_to_string(&go).ok()
+    })
+    .expect("never told to go")
 }
 
 fn dispatch_role() {
@@ -423,6 +515,9 @@ fn dispatch_role() {
         }
         Some("marked-window") => marked_window_role(true),
         Some("unmarked-window") => marked_window_role(false),
+        Some("unplaced-window") => unplaced_window_role(),
+        Some("outgoing-window") => outgoing_window_role(),
+        Some("quiet-successor") => quiet_successor_role(),
         _ => {}
     }
 }
@@ -450,7 +545,17 @@ impl Drop for Scratch {
                 sigkill(*p);
             }
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // A relaunch the keeper fired (`echo relaunch >> <dir>/relaunches`,
+        // [`keeper_config`]) is no child of this test, and its line can land
+        // while the tree is being removed — the directory then refuses to go
+        // as not empty, and stayed behind (measured 2026-09-30). One line per
+        // relaunch: remove until the directory is gone.
+        for _ in 0..4 {
+            match std::fs::remove_dir_all(&self.dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                _ => break,
+            }
+        }
     }
 }
 
@@ -471,7 +576,7 @@ impl Scratch {
     fn mark(&self) -> PathBuf {
         self.dir.join("relaunches")
     }
-    /// Re-run this test binary as `role`, stdin and stdout piped.
+    /// Re-run this test binary as `role`, its stdio `/dev/null`.
     fn spawn(&mut self, test: &str, role: &str, extra: &[(&str, &str)]) -> usize {
         let mut cmd = Command::new(std::env::current_exe().expect("test binary"));
         cmd.arg(test)
@@ -495,29 +600,38 @@ impl Scratch {
     /// A child's report, once it has made one (a hang detector bounds it).
     fn line(&mut self, kid: usize, prefix: &str) -> String {
         let out = self.dir.join(format!("kid-{kid}.out"));
-        let started = Instant::now();
-        loop {
+        let text = within(HANG, Duration::from_millis(5), || {
             if let Ok(text) = std::fs::read_to_string(&out) {
-                let line = text.trim().to_string();
-                assert!(
-                    line.starts_with(prefix),
-                    "{prefix:?} expected, got {line:?}"
-                );
-                return line;
+                return Some(text);
             }
             if let Ok(Some(status)) = self.kids[kid].try_wait() {
-                panic!("the child ended ({status}) before reporting {prefix:?}");
+                // A role may report and exit between the read above and this
+                // look (`unplaced-window` does both at once). Its report is
+                // published before its exit, so it is there now if ever.
+                return Some(std::fs::read_to_string(&out).unwrap_or_else(|_| {
+                    panic!("the child ended ({status}) before reporting {prefix:?}")
+                }));
             }
-            assert!(started.elapsed() < HANG, "no report {prefix:?}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+            None
+        })
+        .unwrap_or_else(|| panic!("no report {prefix:?}"));
+        let line = text.trim().to_string();
+        assert!(
+            line.starts_with(prefix),
+            "{prefix:?} expected, got {line:?}"
+        );
+        line
     }
     /// Tell the role `kid` to go on; `what` is what it is told (published
     /// whole, by a rename).
     fn say(&mut self, kid: usize, what: &str) {
-        let tmp = self.dir.join(format!("kid-{kid}.say"));
+        self.tell(&format!("kid-{kid}"), what);
+    }
+    /// [`Self::say`] to the role whose talk file is `<dir>/<talk>`.
+    fn tell(&self, talk: &str, what: &str) {
+        let tmp = self.dir.join(format!("{talk}.say"));
         std::fs::write(&tmp, what).expect("say");
-        std::fs::rename(&tmp, self.dir.join(format!("kid-{kid}.go"))).expect("go");
+        std::fs::rename(&tmp, self.dir.join(format!("{talk}.go"))).expect("go");
     }
     /// Park the stepped keeper `kid` between two of its turns: returns once it
     /// has finished its turn and runs none until [`Self::resume`].
@@ -536,14 +650,16 @@ impl Scratch {
     }
     fn await_note(&mut self, kid: usize, what: &str) {
         let note = self.dir.join(format!("kid-{kid}.{what}"));
-        let started = Instant::now();
-        while !note.exists() {
+        let seen = within(HANG, Duration::from_millis(5), || {
+            if note.exists() {
+                return Some(());
+            }
             if let Ok(Some(status)) = self.kids[kid].try_wait() {
                 panic!("role {kid} ended ({status}) before it {what}");
             }
-            assert!(started.elapsed() < HANG, "role {kid} never {what}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+            None
+        });
+        assert!(seen.is_some(), "role {kid} never {what}");
         std::fs::remove_file(&note).expect("take the note");
     }
     fn keeper(&mut self, test: &str, drop_custody: bool) -> usize {
@@ -559,15 +675,12 @@ impl Scratch {
     }
     /// Poll the keeper's status until `pred` holds (a hang detector bounds it).
     fn await_status(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
-        let started = Instant::now();
-        loop {
-            let s = self.status();
-            if pred(&s) {
-                return s;
-            }
-            assert!(started.elapsed() < HANG, "never {what}:\n{s}");
-            std::thread::yield_now();
-        }
+        let mut last = String::new();
+        let hit = within(HANG, Duration::ZERO, || {
+            last = self.status();
+            pred(&last).then(|| last.clone())
+        });
+        hit.unwrap_or_else(|| panic!("never {what}:\n{last}"))
     }
 }
 
@@ -580,14 +693,8 @@ fn field(line: &str, key: &str) -> u64 {
 
 /// Wait for a watched process's kernel status (a hang detector bounds it).
 fn await_exit(watch: &ExitWatch) -> i32 {
-    let started = Instant::now();
-    loop {
-        if let Some(s) = watch.exit_status() {
-            return s;
-        }
-        assert!(started.elapsed() < HANG, "pid {} never exited", watch.pid());
-        std::thread::yield_now();
-    }
+    within(HANG, Duration::ZERO, || watch.exit_status())
+        .unwrap_or_else(|| panic!("pid {} never exited", watch.pid()))
 }
 
 fn relaunch_lines(s: &Scratch) -> usize {
@@ -626,11 +733,10 @@ fn a_killed_window_s_shell_lives_and_is_offered_once() {
     assert_eq!(leader_watch.exit_status(), None, "the leader lives:\n{st}");
     assert!(aterm_uds::process::pid_alive(leader));
     // One relaunch, by the test command, before any window answered.
-    let started = Instant::now();
-    while relaunch_lines(&s) < 1 {
-        assert!(started.elapsed() < HANG, "the keeper never relaunched");
-        std::thread::yield_now();
-    }
+    let relaunched = within(HANG, Duration::ZERO, || {
+        (relaunch_lines(&s) >= 1).then_some(())
+    });
+    assert!(relaunched.is_some(), "the keeper never relaunched");
 
     // The next window is offered exactly that master, and the keeper keeps its copy.
     let next = s.spawn(T_CRASH, "next-window", &[]);
@@ -746,6 +852,89 @@ fn a_master_another_process_holds_is_never_offered() {
     s.say(next, "go");
     let _ = s.kids[next].wait();
     assert_eq!(await_exit(&leader_watch), 1, "and the quit hung it up");
+}
+
+const T_UNPLACED: &str = "an_offer_the_window_could_not_place_is_released_through_its_link";
+
+/// AN OFFER THAT BECOMES NO SESSION IS RELEASED: a killed window's shell is
+/// offered to the next window, which cannot place it (its restore window
+/// failed to open, its spawn failed) and RELEASEs it through its link — the
+/// worker running on the connection the offer was made to — then quits. The
+/// keeper closes its copy and the shell is hung up: nothing is left for the
+/// next launch to bring back. (The link dropped a RELEASE for a master it had
+/// not registered itself, so the offer went back to Orphaned at that quit and
+/// its shell ran on unseen until the next launch was offered it.)
+#[test]
+fn an_offer_the_window_could_not_place_is_released_through_its_link() {
+    dispatch_role();
+    let mut s = Scratch::new("unplaced");
+    s.keeper(T_UNPLACED, false);
+    let w = s.spawn(T_UNPLACED, "window", &[]);
+    let reg = s.line(w, "leader=");
+    let leader = field(&reg, "leader") as u32;
+    s.pids.push(leader);
+    let leader_watch = ExitWatch::watch(leader).expect("watch the leader");
+    s.await_status("registered", |t| t.contains("claimed=1"));
+    sigkill(s.kids[w].id());
+    let _ = s.kids[w].wait();
+    s.await_status("orphaned", |t| t.contains("orphaned=1"));
+    let r = s.spawn(T_UNPLACED, "unplaced-window", &[]);
+    assert_eq!(s.line(r, "released="), "released=1");
+    let ended = s.kids[r].wait().expect("its status");
+    assert!(ended.success(), "it quit: {ended}");
+    let st = s.await_status("its end read", |t| t.contains("windows=0"));
+    assert!(
+        st.contains("masters=0") && st.contains("custody_copies=0"),
+        "the keeper closed its copy:\n{st}"
+    );
+    assert_eq!(
+        await_exit(&leader_watch),
+        1,
+        "the shell was hung up (SIGHUP)"
+    );
+}
+
+const T_QUIET: &str = "a_successor_that_never_registered_hangs_its_shells_up_when_it_quits";
+
+/// AN UPDATE TO A SUCCESSOR THAT TAKES NO PART (its keeper off, or a build
+/// before the keeper): the outgoing window names it in a PENDING and ends as
+/// the Commit does, so the keeper HOLDS the master for it; the successor never
+/// registers, and quits with `exit(0)`. §5.4 row 3 judges that end — a process
+/// that never spoke to the keeper, ended cleanly — as a quit: the keeper
+/// closes its copy and the shell is hung up, as with no keeper at all. (It
+/// once orphaned every such shell after the quit, alive and unseen, for the
+/// next launch to bring back as "stopped unexpectedly".)
+#[test]
+fn a_successor_that_never_registered_hangs_its_shells_up_when_it_quits() {
+    dispatch_role();
+    let mut s = Scratch::new("quiet");
+    s.keeper(T_QUIET, false);
+    let o = s.spawn(T_QUIET, "outgoing-window", &[]);
+    let reg = s.line(o, "leader=");
+    let (leader, successor) = (
+        field(&reg, "leader") as u32,
+        field(&reg, "successor") as u32,
+    );
+    s.pids.push(leader);
+    s.pids.push(successor);
+    let leader_watch = ExitWatch::watch(leader).expect("watch the leader");
+    let successor_watch = ExitWatch::watch(successor).expect("watch the successor");
+    s.say(o, "go");
+    let ended = s.kids[o].wait().expect("its status");
+    assert!(ended.success(), "the outgoing window exited 0: {ended}");
+    s.await_status("held for the successor", |t| t.contains("held=1"));
+    s.tell(&format!("kid-{o}-succ"), "go");
+    assert_eq!(await_exit(&successor_watch), 0, "the successor quit");
+    let st = s.await_status("the hold judged", |t| t.contains("held=0"));
+    assert!(
+        st.contains("masters=0") && st.contains("custody_copies=0"),
+        "the keeper closed its copy:\n{st}"
+    );
+    assert_eq!(
+        await_exit(&leader_watch),
+        1,
+        "the shell was hung up (SIGHUP)"
+    );
 }
 
 const T_LOST_BYE: &str = "a_quit_whose_bye_was_lost_hangs_its_shell_up";

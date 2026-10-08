@@ -1,0 +1,11 @@
+# claude-code 2.1.287 · HAND-BUILT 2026-10-02 from the owner's window-supervisor ledger of 2026-09-27 (drive/s-4f99e1043500f1704afa.jsonl, five `escalated` rows, box_seq 41654 42280 508 1016 509): the three option labels in order, the box's first row (the fullscreen panel's `▔` rule, 131 columns, carrying the `You've used 96% of your weekly limit` toast on the first escalation and bare on the other four) and the reading `the box's title row is not on the screen` are the ledger's words; the frame is read from the 2.1.287 source, not measured: under the fullscreen renderer the dialog sits in the bottom panel under its `▔` rule (`Va` with `char:"\u2594"`, a toast drawn into the rule by `hc()`), and the Dialog `he` wraps its content in `Po`, which under `Xa()` draws NO rule of its own and pads three columns (`paddingX:RD`, as the MEASURED model-switch box), so the title three columns in, a gap of one row, the numbered Select with the vendor's `❯` on the first row, a marginTop-1 input guide; the transcript row above is assembled · the usage-limit options dialog in the fullscreen panel
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ You've used 96% of your weekly limit · resets Oct 2 at 5am (America/Los_Angeles) ▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Wait here, then continue automatically at Oct 2 at 5am
+     3. Switch to usage credits
+
+   Enter to confirm · Esc to cancel

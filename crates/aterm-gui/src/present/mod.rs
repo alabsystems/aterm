@@ -48,7 +48,7 @@
 //!
 //! `aterm-gpu` documents the downgrade to the CPU renderer as the fail-soft arm
 //! for GPU device loss and for surfaces that will not create
-//! (`crates/aterm-gpu/src/lib.rs:168`, `:240`). Every error here therefore
+//! (`aterm_gpu::surface_attach_fallback`). Every error here therefore
 //! travels as a typed failure the caller turns into a DROPPED frame plus a
 //! re-arm — never a panic, and never a silently-skipped commit that would leave
 //! a user whose GPU has already failed looking at a black window.

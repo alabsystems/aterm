@@ -18,9 +18,9 @@ use super::super::{HorizontalMargins, PageStore, Row, ScrollRegion};
 use super::GridCursorState;
 
 /// Ring cap meaning "unlimited retention" (`set_scrollback_line_limit(None)`
-/// on a ring-only grid). Deliberately NOT `usize::MAX`: `scroll_up` computes
-/// ring capacity as `visible_rows + max_scrollback`, and `visible_rows` is
-/// clamped to `MAX_GRID_ROWS`, so this headroom keeps that sum overflow-free.
+/// on a ring-only grid). Not `usize::MAX`: `scroll_up` computes ring capacity
+/// as `visible_rows + max_scrollback`, and `visible_rows` is clamped to
+/// `MAX_GRID_ROWS`, so this headroom keeps that sum overflow-free.
 pub(crate) const UNLIMITED_RING_SCROLLBACK: usize = usize::MAX - crate::MAX_GRID_ROWS as usize;
 
 /// Effective tiered-scrollback settings captured while its store is detached
@@ -43,24 +43,23 @@ pub(crate) struct PendingScrollbackSettings {
     pub(crate) memory_budget_changed: bool,
 }
 
-/// Where the READER asked the viewport to go while the history was away for an
-/// off-thread reflow, past what the attached rows could show (design ruling 238
-/// of the unified-messages design). See `Grid::note_detached_reader_motion`.
+/// Where the reader asked the viewport to go, past what the attached rows
+/// could show, while the history was away for an off-thread reflow. See
+/// `Grid::note_detached_reader_motion`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DetachedReaderAim {
-    /// `rows` above the live bottom — more than the attached history holds —
-    /// as of `absolute_row_counter == at_counter`. Lines that scroll into
-    /// history afterwards push the aim up with them (the SCR-1 repin's rule),
-    /// so it grows by the counter's rise before it is applied.
+    /// `rows` above the live bottom (more than the attached history holds) as
+    /// of `absolute_row_counter == at_counter`. Lines scrolling into history
+    /// afterwards push the aim up with them, so it grows by the counter's rise
+    /// before it is applied.
     Above { rows: usize, at_counter: u64 },
     /// `rows` below the top of the whole history (a `Top` gesture, then any
     /// motion from there).
     FromTop { rows: usize },
     /// Exactly `rows` above the live bottom (as of `at_counter`, grown the same
-    /// way): where the reader came back to INSIDE the attached rows after
-    /// aiming past them — `rows == 0` for the End press, a keystroke's snap,
-    /// or scrolling all the way back down. Having aimed, the reader has said
-    /// where they are, so the restore no longer speaks for them.
+    /// way): where the reader came back to inside the attached rows after
+    /// aiming past them (`rows == 0` for End, a keystroke's snap, or scrolling
+    /// all the way down). The restore rule does not apply to them.
     At { rows: usize, at_counter: u64 },
 }
 
@@ -105,117 +104,102 @@ pub struct GridStorage {
     /// arrived while the worker owned it. `None` outside a detach window.
     pub(crate) pending_scrollback_settings: Option<PendingScrollbackSettings>,
     /// The viewport's trailing-blank-row count captured when a width-reflow
-    /// resize DETACHED the tiered store (see `resize_offloading_scrollback`).
-    /// The synchronous resize cannot bottom-anchor the viewport while the
-    /// history is out with the worker, so the deficit fill
-    /// (`fill_viewport_deficit_from_history`) runs at re-attach against this
-    /// target instead. `None` outside a detach window; consumed by the first
-    /// width-matched re-attach, cleared by erase/replacement/abort.
+    /// resize detached the tiered store (see `resize_offloading_scrollback`).
+    /// The synchronous resize cannot bottom-anchor while the history is with
+    /// the worker, so the deficit fill (`fill_viewport_deficit_from_history`)
+    /// runs at re-attach against this target. `None` outside a detach window;
+    /// consumed by the first width-matched re-attach, cleared by
+    /// erase/replacement/abort.
     pub(crate) pending_fill_target: Option<usize>,
-    /// THE READER'S AIM WHILE THE HISTORY IS AWAY (design ruling 238). `None`
-    /// while every gesture inside a detach window fits the attached rows —
-    /// then the re-attach's restore rule stands untouched. `Some` once the
-    /// reader asks for more than is attached (a scroll up over a history that
-    /// is out with the worker), so the re-attach can land them where they
-    /// asked. Recorded only by the reader-facing primitives (`scroll_display`,
-    /// `scroll_to_top`, `scroll_to_bottom`); cleared at every detach,
-    /// re-attach and abort.
+    /// The reader's aim while the history is away. `None` while every gesture
+    /// in a detach window fits the attached rows (the re-attach's restore rule
+    /// stands); `Some` once the reader asks for more than is attached, so the
+    /// re-attach can land them there. Recorded only by the reader-facing
+    /// primitives (`scroll_display`, `scroll_to_top`, `scroll_to_bottom`);
+    /// cleared at every detach, re-attach and abort.
     pub(crate) detached_reader_aim: Option<DetachedReaderAim>,
-    /// THRU-5: true when an off-thread compression worker is attached to this
-    /// session (set once at session setup). While true, the reader-thread ingest
-    /// path does NOT drain the lazy buffer inline on `should_drain` — it lets the
-    /// worker drain it in bounded batches via [`Grid::drain_lazy_bounded`], so the
-    /// LZ4/zstd promotion spike stays off the PTY-drain critical path. Once the
-    /// backlog exceeds the flood staging cap (`Grid::flood_overflow`: the
-    /// worker fell behind) the reader DROPS its oldest staged lines rather than
-    /// promote inline, so memory stays bounded — rows the configured limit
-    /// would evict anyway go silently, and any other loss is counted and
-    /// marked in place (`flood_truncated_lines`, the lazy buffer's flood cut).
+    /// True when an off-thread compression worker is attached (set once at
+    /// session setup). The reader-thread ingest path then does not drain the
+    /// lazy buffer inline on `should_drain`; the worker drains it in bounded
+    /// batches via [`Grid::drain_lazy_bounded`], keeping LZ4/zstd promotion off
+    /// the PTY reader. Past the flood staging cap (`Grid::flood_overflow`) the
+    /// reader drops its oldest staged lines instead of promoting, so memory
+    /// stays bounded: rows the limit would evict go silently, any other loss
+    /// is counted and marked (`flood_truncated_lines`, the flood cut).
     pub(crate) compress_offload_active: bool,
-    /// Monotonic count of STAGED history lines dropped by flood backpressure
-    /// (the lazy-buffer staging cap while a compress worker is behind, and the
-    /// detached-reflow-window cap) that the configured limit would have kept —
-    /// real retention loss. Surfaced two ways: this counter (out of band, for
-    /// `metrics`/`lines`), which adds each cut's peak, and ONE dim marker row
-    /// IN the history at each cut, naming the lines missing there now
+    /// Monotonic count of staged history lines dropped by flood backpressure
+    /// (the staging cap while a compress worker is behind, and the
+    /// detached-reflow-window cap) that the configured limit would have kept.
+    /// Surfaced out of band here (for `metrics`/`lines`, adding each cut's
+    /// peak) and in band as one dim marker row per cut
     /// (`scroll_convert::FloodCut`). Ordinary retention eviction and
-    /// user-requested limit shrinks are NOT counted.
+    /// user-requested limit shrinks are not counted.
     pub(crate) flood_truncated_lines: u64,
-    /// Ring-byte watermark budget (audit E10a): an approximate byte budget the
-    /// host sets so ring-only "unlimited" retention still reports memory
-    /// pressure ([`Grid::ring_watermark_level`]). `None` (default) = no
-    /// watermark, level reads Green.
+    /// Ring-byte watermark budget: an approximate byte budget the host sets so
+    /// ring-only "unlimited" retention still reports memory pressure
+    /// ([`Grid::ring_watermark_level`]). `None` (default) = no watermark,
+    /// level reads Green.
     pub(crate) ring_byte_watermark: Option<usize>,
     /// Monotonic generation bumped whenever off-screen scrollback is erased
     /// (ED3 / full reset). Captured when the store is detached for reflow and
     /// re-checked on re-attach: if it advanced, the reflowed (pre-erase) store is
     /// dropped rather than resurrecting history the user explicitly cleared.
     pub(crate) scrollback_clear_gen: u64,
-    /// Monotonic generation bumped whenever rows are RENUMBERED in the
-    /// absolute-row space with no
-    /// [`AbsoluteRowUpdate`](crate::AbsoluteRowUpdate) emitted — i.e. whenever
-    /// an absolute row number starts naming DIFFERENT text without `base_y()`
-    /// arithmetic or the protected-footer revision moving. Four paths raise it:
+    /// Monotonic generation bumped whenever rows are renumbered in the
+    /// absolute-row space with no [`AbsoluteRowUpdate`](crate::AbsoluteRowUpdate)
+    /// emitted, i.e. an absolute row number starts naming different text
+    /// without `base_y()` arithmetic or the protected-footer revision moving:
     ///
-    /// * ANY width reflow (`Grid::resize_with_reflow_mode`). A rewrap re-splits
-    ///   the same logical lines across a different number of rows, so the text
-    ///   a given absolute key names slides — on the LIVE screen as much as in
-    ///   history, which is why this bump is unconditional on the width change
-    ///   rather than gated on a splice having happened;
-    /// * the Kitty CSI +T unscroll (`unscroll_from_scrollback`), which removes
-    ///   the NEWEST scrollback lines;
+    /// * any width reflow (`Grid::resize_with_reflow_mode`): the rewrap
+    ///   re-splits the same lines across a different number of rows, live
+    ///   screen included, so the bump is unconditional on a width change;
+    /// * the Kitty CSI +T unscroll (`unscroll_from_scrollback`), removing the
+    ///   newest scrollback lines;
     /// * the width rewrap's scrollback restore (`scrollback_reflow.rs`) and the
     ///   deficit pullback (`reflow_pullback.rs`), which move the retained-line
     ///   total under a still-standing `absolute_row_counter`. Subsumed by the
     ///   width bump above during a resize, and kept because the OFFLOADED
     ///   re-attach reaches both outside one;
-    /// * a ROWS-ONLY resize that adds or removes rows at the BOTTOM — the
-    ///   grow's blank append and the shrink's trailing-blank trim
-    ///   (`Grid::note_bottom_end_renumbered`) — under the native resize policy;
-    ///   the ConPTY policy moves the counter with those rows and renumbers
-    ///   nothing. Rows moved ACROSS the
+    /// * the resize undo handing a PUSHED row back to the bottom of a grid that
+    ///   keeps no history (`Grid::note_bottom_end_renumbered`), the exact inverse
+    ///   of the shrink whose eviction took it. A rows-only grow's blank append
+    ///   and shrink's trailing-blank trim move the counter with their rows under
+    ///   both resize policies and renumber nothing; rows moved ACROSS the
     ///   live/history boundary (reveal, top-demote) leave the total unchanged
-    ///   and are pure relabels that do NOT bump this.
+    ///   and are pure relabels. Neither bumps this.
+    /// * a width rewrap that leaves the counter below the retained rows
+    ///   (`Grid::cover_retained_rows` raises it), which renumbers the write map
+    ///   onto the read map.
     ///
-    /// The last three share one shape: the retained-line total moves while
-    /// `absolute_row_counter` does not, so `oldest_absolute_row()` (`counter −
-    /// visible − scrollback`) slides and carries every retained row's
-    /// `oldest + i` key with it, while `base_y()` and the footer revision stay
-    /// put. The width reflow is the one that also moves LIVE rows.
+    /// The last three move the retained-line total under a fixed
+    /// `absolute_row_counter`, so `oldest_absolute_row()` slides and carries
+    /// every retained row's `oldest + i` key with it.
     ///
-    /// Ordinary retention eviction
-    /// drops the OLDEST lines and preserves every survivor's absolute key, so
-    /// it deliberately does NOT bump this. Consumers that incrementally
-    /// maintain absolute-row-keyed caches over history (the terminal's cached
-    /// search index) treat any advance as "history renumbered: rebuild" —
-    /// closing the one retained-window mutation that is invisible to the
-    /// `(content_gen, absolute_row_revision, geometry)` key set.
+    /// Ordinary retention eviction drops the oldest lines and keeps every
+    /// survivor's key, so it does not bump this. Consumers maintaining
+    /// absolute-row-keyed caches over history (the terminal's search index)
+    /// rebuild on any advance; nothing in the `(content_gen,
+    /// absolute_row_revision, geometry)` key set shows this change.
     pub(crate) history_renumber_epoch: u64,
-    /// Monotonic count of rows-grow REVEALS that handed history lines back to
-    /// the live screen (`Grid::resize`, via `adjust_row_count`), 2026-09-26.
+    /// Monotonic count of rows-grow reveals that handed history lines back to
+    /// the live screen (`Grid::resize`, via `adjust_row_count`).
     ///
-    /// A reveal is a pure relabel — every line keeps its absolute key, which
-    /// is why `history_renumber_epoch` rightly does not move — but a revealed
-    /// line is LIVE again: it can be rewritten on screen and pushed back into
-    /// history under the SAME key with other text. So a reader that read
-    /// history by absolute row before a reveal cannot trust those rows after
-    /// one, whatever the retained-line total says: the self-update's history
-    /// export fences on this (`HistoryFence::reveal_gen`). Measured before it
-    /// existed: grow 5 rows, rewrite the revealed rows, 20 lines of output —
-    /// the export's fence still held while rows 31 to 35 named `NEW1..NEW5`
-    /// where the export had read `old31..old35`.
+    /// A reveal is a pure relabel (keys unchanged, so
+    /// `history_renumber_epoch` does not move), but a revealed line is live
+    /// again: it can be rewritten and pushed back into history under the same
+    /// key with other text. So history read by absolute row before a reveal
+    /// cannot be trusted after one; the self-update's history export fences on
+    /// this (`HistoryFence::reveal_gen`).
     pub(crate) history_reveal_gen: u64,
     /// Preserved extras for ring buffer scrollback rows.
     ///
     /// When rows scroll from the visible area into ring buffer scrollback,
     /// their extras (hyperlinks, complex chars, combining marks, RGB colors)
     /// are extracted from `CellExtras` before the extras are discarded.
-    /// Indexed by ring buffer scrollback position:
-    /// front = oldest (same order as ring buffer).
+    /// Indexed by ring buffer scrollback position, oldest first.
     ///
-    /// Uses `Option<Box<>>` to avoid 120 bytes of empty Vec headers per
-    /// plain-text row. `None` = no overflow data (common case, 8 bytes).
-    /// `Some(Box<..>)` = has overflow data (rare, heap-allocated).
+    /// `Option<Box<>>` avoids 120 bytes of empty Vec headers per plain-text
+    /// row: `None` = no overflow data (common, 8 bytes).
     pub ring_extras: VecDeque<Option<Box<ScrolledRowExtras>>>,
     /// The alt-screen resize undo: what the last rows-only shrink(s) of a grid
     /// that keeps no history took off the screen, for a grow back with nothing
@@ -228,76 +212,61 @@ pub struct GridStorage {
     /// Absolute row counter (monotonically increasing).
     /// Used for creating absolute pins that survive scrollback eviction.
     pub absolute_row_counter: u64,
-    /// Monotonic content-generation counter (P1.0).
+    /// Monotonic content-generation counter.
     ///
-    /// Bumped exactly once per CONTENT mutation — every cell/line/scrollback
-    /// change that marks damage also bumps this, because the bump is FUSED into
-    /// the `mark_content_*` wrappers below (the same total-coverage trick
-    /// `damage_epoch` gets from the damage-mark funnel). It does NOT bump on a
-    /// pure VIEWPORT change (`scroll_display` / `apply_display_offset_damage`),
-    /// so a cached search index or a peer session can detect content change in
-    /// O(1) without invalidating on a mere scroll.
+    /// Bumped once per content mutation: every cell/line/scrollback change that
+    /// marks damage bumps it, because the bump is fused into the
+    /// `mark_content_*` wrappers below. Not bumped on a pure viewport change
+    /// (`scroll_display` / `apply_display_offset_damage`), so a cached search
+    /// index or a peer session detects content change in O(1) without
+    /// invalidating on a scroll.
     ///
-    /// Initialized NONZERO (`1`) so a reader can use `0` as a "never observed"
-    /// sentinel. WRITE-ONLY except for [`Grid::content_gen`]: no render or parse
-    /// path reads it, so it cannot alter any rendered output.
+    /// Starts at `1`, so `0` is a "never observed" sentinel. Read only by
+    /// [`Grid::content_gen`]; no render or parse path reads it.
     pub content_gen: u64,
-    /// Monotonic generation bumped exactly once each time the READER DESCENDS the
-    /// viewport to the live bottom — `display_offset` going from non-zero to zero
-    /// through a reader-facing scroll primitive, and through nothing else.
+    /// Monotonic generation bumped once each time the reader brings the
+    /// viewport down to the live bottom: `display_offset` going from non-zero
+    /// to zero through a reader-facing scroll primitive, and nothing else.
     ///
-    /// It exists because [`crate::grid::scrollback_offload`]'s audit-#7 exception
-    /// asks a question `display_offset` cannot answer. That exception honors a reader
-    /// who followed streaming output down to the live bottom during a reflow window,
-    /// instead of restoring their pre-resize depth — so it must tell that End apart
-    /// from the detach's own clamp, from a retention clamp, from a rows-only resize
-    /// re-anchoring the viewport and from SCR-1's per-batch pin dance. Every one of
-    /// those writes the same `0` to the same field, so no reading of the VALUE — at
-    /// the detach, at the re-attach, or as a high-water mark in between — can
-    /// separate them. A generation can, because it records PROVENANCE: sampled at
-    /// detach and compared at re-attach, an advance means the reader's own hand.
+    /// [`crate::grid::scrollback_offload`]'s re-attach must tell a reader's End
+    /// during a reflow window apart from the detach's own clamp, a retention
+    /// clamp, a rows-only resize re-anchoring the viewport, and the per-batch
+    /// pin/repin around output. All of those write the same `0`, so no reading
+    /// of the value can separate them; a generation sampled at detach and
+    /// compared at re-attach records provenance instead.
     ///
-    /// The bump condition is the audit's own sentence made literal — "the reader
-    /// DESCENDED to 0" — so it is `before != 0 && after == 0` inside the four
-    /// reader-facing primitives in [`crate::grid::scroll`] (`scroll_display`,
-    /// `scroll_to_top`, `scroll_to_bottom`, `scroll_to_absolute_row`). Two readings
-    /// follow from that and both are deliberate: an End at a viewport already pinned
-    /// to the live bottom moves nothing and records nothing (a gesture that moved
-    /// nothing is not evidence of a choice), and a reader who scrolls UP and stops
-    /// records nothing either (they did not choose the bottom; the machine did if
-    /// anything later puts them there).
+    /// The bump is `before != 0 && after == 0` inside the four reader-facing
+    /// primitives in [`crate::grid::scroll`] (`scroll_display`,
+    /// `scroll_to_top`, `scroll_to_bottom`, `scroll_to_absolute_row`). So an
+    /// End at a viewport already at the bottom records nothing, and a reader
+    /// who scrolls up and stops records nothing.
     ///
-    /// Deliberately NOT bumped by machine motion, each of which has its own
-    /// non-bumping entry point: `reset_display_offset_with_damage` (the row-arithmetic
-    /// precondition IL/DL/ED/unscroll/`scroll_up` force),
-    /// `pin_viewport_to_live_for_output_batch` + `repin_display_offset` (SCR-1's
-    /// force-to-live-then-repin around a batch of output),
-    /// `scroll_to_absolute_row_internal` (a rows-only resize re-anchoring the
-    /// viewport), `clamp_display_offset`, the reflow clamp and the erase resets.
+    /// Machine motion never bumps it, via its own entry points:
+    /// `reset_display_offset_with_damage` (the row-arithmetic precondition of
+    /// IL/DL/ED/unscroll/`scroll_up`),
+    /// `pin_viewport_to_live_for_output_batch` + `repin_display_offset`,
+    /// `scroll_to_absolute_row` from the rows-only resize re-anchor (it
+    /// cannot reach the live bottom there, since `Grid::resize` zeroes
+    /// `display_offset` first; see its doc),
+    /// `clamp_display_offset`, the reflow clamp and the erase resets.
     ///
-    /// Like `content_gen`, WRITE-ONLY outside its one consumer: no render or parse
-    /// path reads it, so it can never alter rendered output.
+    /// Read only by that consumer; no render or parse path reads it.
     pub(crate) reader_live_bottom_gen: u64,
-    /// Monotonic AUTOWRAP serial — the emulator wrap fact (kitty-motion §4.1).
+    /// Monotonic autowrap serial: the emulator's wrap fact.
     ///
-    /// Bumped exactly once each time `advance_autowrap_line` runs, which is
-    /// the ONE funnel every autowrap line advance resolves through (deferred
-    /// wraps via `resolve_pending_wrap`, plus the bulk/split write paths that
-    /// advance mid-run). A host that diffs this against a last-seen value
-    /// learns "the terminal wrapped since my last read" as a fact instead of
-    /// a caret-delta heuristic — the only signal that separates a scrolled
-    /// bottom-row wrap from `Home` pressed at the last column.
+    /// Bumped once each time `advance_autowrap_line` runs, the one funnel
+    /// every autowrap line advance goes through (deferred wraps via
+    /// `resolve_pending_wrap`, plus the bulk/split write paths that advance
+    /// mid-run). A host diffing it against a last-seen value learns that the
+    /// terminal wrapped, which distinguishes a scrolled bottom-row wrap from
+    /// `Home` pressed at the last column.
     ///
-    /// TRANSIENT OBSERVABILITY, not persisted state — a deliberate law:
-    /// checkpoint/restore does NOT capture it (`GridCursorRepr` round-trips
-    /// `pending_wrap`, never this), and main/alt buffer swaps do NOT migrate
-    /// it (`handler_dec` copies `pending_wrap` onto the incoming grid; each
-    /// grid keeps its own serial). A restored session or a buffer switch may
-    /// therefore hand the host at most one spurious changed/unchanged read,
-    /// and the host diff — a per-window `(session, last-serial)` baseline
-    /// that reports only "changed since MY last read of the SAME session" —
-    /// tolerates exactly that. Like `content_gen`, no render or parse path
-    /// reads it, so it can never alter rendered output or replay parity.
+    /// Transient, not persisted: checkpoint/restore does not capture it
+    /// (`GridCursorRepr` round-trips `pending_wrap` only), and main/alt swaps
+    /// do not migrate it (each grid keeps its own serial). A restored session
+    /// or buffer switch may give the host at most one spurious read, which a
+    /// per-window `(session, last-serial)` baseline tolerates. No render or
+    /// parse path reads it.
     pub wrap_serial: u64,
     /// Fast-path flag: set when any row uses DECDWL/DECDHL (double-width/height).
     /// When false, `effective_cols_for_row` skips the ring-buffer lookup
@@ -381,15 +350,12 @@ impl GridStorage {
     }
 
     // -------------------------------------------------------------------------
-    // Content-mutation damage wrappers (P1.0)
+    // Content-mutation damage wrappers
     //
-    // Each does the EXISTING `damage.mark_*` call AND bumps `content_gen`. The
-    // bump is FUSED here so any CONTENT mutation that correctly marks damage also
-    // advances `content_gen` — it cannot be forgotten on a future mutation path,
-    // inheriting the same total coverage the damage funnel already has. VIEWPORT
-    // -only marks (`apply_display_offset_damage`) deliberately do NOT route here:
-    // a viewport scroll changes what is shown, not the content, so a cached
-    // search index / peer session must NOT invalidate.
+    // Each does the `damage.mark_*` call and bumps `content_gen`, so any content
+    // mutation that marks damage also advances `content_gen`. Viewport-only
+    // marks (`apply_display_offset_damage`) do not route here: a viewport
+    // scroll changes what is shown, not the content.
     //
     // Plain `+= 1` (not `wrapping_add`): a debug build panics rather than
     // silently wrapping a generation token.
@@ -596,11 +562,10 @@ impl GridStorage {
         self.rows.get(idx)
     }
 
-    /// The row at `visible_row` display-mapped through the ring WITHOUT the
-    /// viewport bound — the one-past-the-viewport read the M1b incoming-row
-    /// apron needs (`visible_row == visible_rows`). `None` beyond the ring
-    /// (tiered history), exactly where [`row`](Self::row) answers `None` for an
-    /// in-viewport index.
+    /// The row at `visible_row` mapped through the ring without the viewport
+    /// bound: the one-past-the-viewport read the incoming-row apron needs
+    /// (`visible_row == visible_rows`). `None` beyond the ring (tiered
+    /// history), exactly where [`row`](Self::row) answers `None`.
     pub(crate) fn row_past_viewport(&self, visible_row: u16) -> Option<&Row> {
         if self.rows.is_empty() {
             return None;
@@ -609,11 +574,10 @@ impl GridStorage {
         self.rows.get(idx)
     }
 
-    /// The live on-screen row at `screen_row`, IGNORING `display_offset` (as if
+    /// The live on-screen row at `screen_row`, ignoring `display_offset` (as if
     /// the viewport were at the bottom). Absolute-frame readers (block text
-    /// extraction) use this so the current scroll position cannot shift which
-    /// physical row they read. Equivalent to `row_index`'s `display_offset == 0`
-    /// fast path.
+    /// extraction) use this so the scroll position cannot shift which row they
+    /// read. Equivalent to `row_index`'s `display_offset == 0` fast path.
     pub(crate) fn row_at_screen(&self, screen_row: u16) -> Option<&Row> {
         if screen_row >= self.visible_rows || self.rows.is_empty() {
             return None;
@@ -646,36 +610,26 @@ impl GridStorage {
             return None;
         }
         let idx = self.row_index(visible_row)?;
-        // EARNED get_unchecked (PCP A1): `row_index` returns `(ring_head + base) %
-        // self.rows.len()` (both its display_offset fast and slow paths end in `% len`),
-        // so `idx < self.rows.len()` — the A1 bounds theorem `(ring_head + base) % len <
-        // len` for all `len != 0`, DISCHARGED on `ay`
-        // (crates/aterm-spec-models/proofs/ay/a1_row_index/row_index_in_bounds.smt2 →
-        // unsat; both Some-returning paths share this `% len` postcondition). The `len !=
-        // 0` side condition is enforced by Rust's DETERMINISTIC modulo-by-zero PANIC (a
-        // checked trap, never UB) inside `row_index` — a `Some` is unreachable when `len
-        // == 0`, in release too — NOT by the elidable `is_empty` debug_assert there. And
-        // `self.rows` is neither pushed/popped nor resized anywhere in this `&mut self`
-        // method between this computation and the two uses below (the single-borrow
-        // lexical lemma — verified by inspection; the only `self.rows` mutators are in
-        // OTHER methods). This is the engine's single most-executed lookup (every bulk
-        // write); the conversion removes the redundant slice bounds check the modulo
-        // already makes impossible to fail.
+        // `get_unchecked` below is sound: `row_index` returns
+        // `(ring_head + base) % self.rows.len()` on both paths, so
+        // `idx < self.rows.len()` (proved in
+        // crates/aterm-spec-models/proofs/ay/a1_row_index/row_index_in_bounds.smt2).
+        // `len != 0` holds because modulo by zero panics inside `row_index`, and
+        // `self.rows` is not resized between here and the two uses below. This is
+        // the most-executed lookup (every bulk write), so the redundant bounds
+        // check is removed.
         //
-        // The arithmetic bound `x % len < len` is TOTAL — never violable post-modulo — so
-        // the `debug_assert`s are really a TRIPWIRE for the LEXICAL lemma: if a future
-        // edit inserts a `self.rows` length-mutation into this span, the now-stale `idx`
-        // reddens the suite (the conformance + bulk-write tests drive this path across
-        // many ring-head / offset states). One assert at the index site and one
-        // immediately before the `&mut` use bracket the full lexical span.
+        // The debug_asserts bracket that span as a tripwire: an edit that
+        // resizes `self.rows` in between would make `idx` stale and fail the
+        // tests that drive this path.
         debug_assert!(
             idx < self.rows.len(),
             "A1 violated: row_index returned out-of-bounds idx {idx} (len {})",
             self.rows.len()
         );
         let cols = self.cols.max(1);
-        // Fast path: skip line_size check when no double-width rows exist.
-        // This is the common case — DECDWL/DECDHL are rare (VT100 era).
+        // Fast path: skip the line_size check when no double-width rows exist
+        // (DECDWL/DECDHL are rare).
         let effective_cols = if self.any_double_width {
             let is_double = {
                 // SAFETY: idx < self.rows.len() (A1, asserted above); len unchanged.
@@ -752,7 +706,6 @@ impl GridStorage {
     ///
     /// Phase 1 clears all flags: O(rows * cols) bitwise ops, zero hash probes.
     /// Phase 2 sets flags for actual entries: O(E) row-index lookups.
-    /// Replaces the previous O(rows * cols) hash-probe approach (#5859).
     pub(crate) fn sync_all_extras_flags(&mut self) {
         // Phase 1: clear all HAS_EXTRAS flags.
         for row in &mut self.rows {
@@ -843,18 +796,15 @@ impl GridStorage {
     /// Apply new viewport dimensions and clamp cursor-owned state to fit.
     pub(crate) fn resize_viewport_state(&mut self, new_rows: u16, new_cols: u16) {
         if new_cols != self.cols {
-            // Only grow tab_stops, never shrink. This preserves custom tab stops
-            // set beyond the current width during a shrink+grow cycle, matching
-            // xterm behavior. Tab operations already bounds-check via max_col
-            // (clamped to cols-1), so a larger array is safe. (#7479)
+            // Only grow tab_stops, never shrink, preserving custom stops beyond
+            // the current width across a shrink+grow (as xterm does). Tab ops
+            // bounds-check via max_col, so a larger array is safe.
             if usize::from(new_cols) > self.tab_stops.len() {
                 let old_len = self.tab_stops.len();
                 self.tab_stops.resize(usize::from(new_cols), false);
-                // ...unless TBC 3 erased every stop and nothing has reset them
-                // since. Seeding the every-8 default into the columns a WIDEN
-                // adds resurrected stops the application had explicitly cleared
-                // — "clear all" has to keep meaning all, at a width the grid did
-                // not have when it was asked.
+                // Unless TBC 3 erased every stop and nothing has reset them
+                // since: seeding every-8 defaults into widened columns would
+                // resurrect stops the application cleared.
                 if !self.tab_defaults_suppressed {
                     for col in old_len..self.tab_stops.len() {
                         self.tab_stops[col] = col > 0 && col % 8 == 0;
@@ -1139,19 +1089,44 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    /// Every visible row's first cell, top to bottom: the snapshot a no-op
+    /// shift must leave unchanged.
+    fn first_cells(g: &Grid) -> Vec<Option<char>> {
+        (0..g.storage.visible_rows)
+            .map(|r| {
+                g.storage
+                    .row(r)
+                    .and_then(|row| row.get(0).map(|c| c.char()))
+            })
+            .collect()
+    }
+
+    /// A distinct letter at column 0 of every visible row, so a shift that
+    /// moved ANY row would show up in [`first_cells`].
+    fn label_rows(g: &mut Grid) {
+        for (r, ch) in (0..g.storage.visible_rows).zip('A'..) {
+            g.set_cursor(r, 0);
+            g.write_char(ch);
+        }
+    }
+
     #[test]
     fn shift_rows_up_n_exceeds_range_is_noop() {
         let mut g = make_storage(5, 10);
-        // top + n > bottom should be a no-op
+        label_rows(&mut g);
+        let before = first_cells(&g);
+        // top + n > bottom: nothing moves.
         g.storage.shift_visible_rows_up(0, 2, 5);
-        // Just verify no panic
+        assert_eq!(first_cells(&g), before);
     }
 
     #[test]
     fn shift_rows_down_n_exceeds_range_is_noop() {
         let mut g = make_storage(5, 10);
+        label_rows(&mut g);
+        let before = first_cells(&g);
         g.storage.shift_visible_rows_down(0, 2, 5);
-        // Just verify no panic
+        assert_eq!(first_cells(&g), before);
     }
 
     /// Every ring row's slice identity — `(cell pointer, cells length, page id)`,
@@ -1331,7 +1306,7 @@ mod tests {
         let mut g = make_storage(24, 80);
         let len_before = g.storage.tab_stops.len();
         g.storage.resize_viewport_state(24, 40);
-        // Tab stops should NOT shrink (xterm behavior, #7479)
+        // Tab stops should NOT shrink (xterm behavior)
         assert_eq!(g.storage.tab_stops.len(), len_before);
     }
 
@@ -1365,7 +1340,7 @@ mod tests {
         let sb = aterm_scrollback::Scrollback::new(100, 1000, 1_000_000);
         g.storage.attach_scrollback(sb);
         // The raw writer takes the store SHARE; the getter reports the ONE
-        // unified total = share + ring cap (audit E1), so the pair composes
+        // unified total = share + ring cap, so the pair composes
         // to the same arithmetic `Grid::set_scrollback_line_limit` applies.
         g.storage.set_store_line_limit(Some(500));
         assert_eq!(

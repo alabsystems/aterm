@@ -20,13 +20,15 @@
 use aterm_core::terminal::{RenderCell, Terminal};
 use aterm_render::{Frame, Renderer, Theme, rgb_to_u32};
 
-fn renderer() -> Option<Renderer> {
-    Renderer::from_system(18.0, Theme::default()).map(|mut r| {
-        // Deterministic pixels: block on the lazy fallback parses so a parse
-        // landing between two renders can't recolour a "must not change" frame.
-        r.debug_block_on_lazy_fallbacks();
-        r
-    })
+fn renderer() -> Renderer {
+    Renderer::from_system(18.0, Theme::default())
+        .map(|mut r| {
+            // Deterministic pixels: block on the lazy fallback parses so a parse
+            // landing between two renders can't recolour a "must not change" frame.
+            r.debug_block_on_lazy_fallbacks();
+            r
+        })
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// The pixels of one cell's TOP row — where `overline_rect` anchors its band.
@@ -66,10 +68,7 @@ fn paint_seam(cells: &mut [Vec<RenderCell>], color: [u8; 3]) {
 /// band the channel exists to colour, and no other pixel on the row.
 #[test]
 fn an_overline_takes_its_channel_and_leaves_the_rest_of_the_cell_alone() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (1usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -113,10 +112,7 @@ fn an_overline_takes_its_channel_and_leaves_the_rest_of_the_cell_alone() {
 /// so it must keep the glyph's ink while the two channels around it move.
 #[test]
 fn the_three_decoration_bands_take_three_independent_inks() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (1usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -163,10 +159,7 @@ fn the_three_decoration_bands_take_three_independent_inks() {
 /// drags a brighter dash of the rule along with it.
 #[test]
 fn a_seam_holds_one_tone_across_a_row_of_two_different_inks() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (1usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -199,10 +192,7 @@ fn a_seam_holds_one_tone_across_a_row_of_two_different_inks() {
 /// must render exactly what a frame that never heard of the channel renders.
 #[test]
 fn an_unset_overline_colour_renders_the_cells_own_foreground() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (1usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);

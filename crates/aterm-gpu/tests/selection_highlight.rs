@@ -13,8 +13,7 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, SelectionClip, Theme};
 
-mod common;
-use common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
+use crate::common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
 
 fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u32> {
     let mut out = Vec::with_capacity(cw * ch);
@@ -111,8 +110,8 @@ fn selection_highlight_gpu_matches_cpu() {
 fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
     let theme = Theme::default();
     let px = 18.0;
-    // The kit's pair is FONT-SETTLED (`common::font_settled`): a chain still
-    // parsing between the two arms would read as a parity failure.
+    // The kit's pair is font-settled (`common::font_settled`), so a chain still
+    // parsing cannot read as a parity failure.
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
@@ -142,6 +141,7 @@ fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
         rows: 1,
         z_index: aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD - 1,
         band_lift_px: 0,
+        cell_offset_px: (0, 0),
         scaling: aterm_core::grid::extra::ImageScaling::Fit,
         source_rect: None,
     });
@@ -200,8 +200,8 @@ fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
 fn multiline_selection_clip_matches_cpu_and_never_tints_sibling_cells() {
     let theme = Theme::default();
     let px = 18.0;
-    // The kit's pair is FONT-SETTLED (`common::font_settled`): a chain still
-    // parsing between the two arms would read as a parity failure.
+    // The kit's pair is font-settled (`common::font_settled`), so a chain still
+    // parsing cannot read as a parity failure.
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
@@ -254,10 +254,9 @@ fn multiline_selection_clip_matches_cpu_and_never_tints_sibling_cells() {
 
 #[test]
 fn inactive_selection_bg_gpu_matches_cpu() {
-    // When the pane is UNFOCUSED, selected cells must paint with the (derived or
-    // explicit) INACTIVE selection bg instead of the active `Theme::selection`, on
-    // BOTH the CPU and GPU paths, byte-equal within the parity tolerance. Mirrors
-    // `selection_highlight_gpu_matches_cpu`, but toggling the focus flag.
+    // An unfocused pane paints selected cells with the (derived or explicit)
+    // inactive selection bg instead of `Theme::selection`, on both paths,
+    // equal within the parity tolerance.
     let theme = Theme::default();
     let px = 18.0;
 
@@ -368,11 +367,10 @@ fn selection_fg_override_gpu_matches_cpu() {
     let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
     let mut input = term.cell_frame(rows, cols);
-    // This first phase intentionally exercises the renderer-owned host
-    // override. A terminal snapshot with no live selection foreground now
-    // carries COLOR_DYNAMIC, which correctly requests automatic contrast and
-    // suppresses stale host state; COLOR_UNSET is the explicit delegation
-    // sentinel for raw/non-terminal producers.
+    // This phase exercises the renderer-owned host override. A terminal
+    // snapshot with no live selection foreground carries COLOR_DYNAMIC
+    // (automatic contrast, suppressing host state); COLOR_UNSET delegates to
+    // the host for raw producers.
     input.selection_fg = aterm_core::render::COLOR_UNSET;
     let cpu_frame = cpu.render_input(&input);
     let gpu_frame = gpu.render_input(&mut win, &input, None);

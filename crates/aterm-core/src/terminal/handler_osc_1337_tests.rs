@@ -4,10 +4,9 @@
 
 //! Tests for the OSC 1337 `File=` inline-image handler.
 //!
-//! These exercise PARSING + PLACEMENT only — the engine never decodes pixels
-//! (that is the renderer's job), so the payload here is arbitrary bytes with a
-//! PNG magic prefix. Footprint sizing uses cell-unit dimensions (`width=N`) so
-//! the placement is deterministic without any real image.
+//! Parsing and placement only: the engine stores an iTerm2 image undecoded, so
+//! the payload is arbitrary bytes with a PNG magic prefix, and cell-unit sizes
+//! (`width=N`) make placement deterministic.
 
 use super::super::Terminal;
 
@@ -58,10 +57,8 @@ fn file_with_cell_dimensions_covers_exact_footprint() {
     assert_eq!(image.image.rows, 3);
 }
 
-/// `preserveAspectRatio=0` is iTerm2's "stretch to fill, ignore the inherent
-/// ratio": the placement must CARRY that request to the renderer, or an
-/// explicit stretch draws exactly like the default fit. The default (and an
-/// explicit `=1`) stays FIT.
+/// `preserveAspectRatio=0` (stretch to fill) is carried to the renderer; the
+/// default and an explicit `=1` stay fit.
 #[test]
 fn preserve_aspect_ratio_zero_carries_stretch_and_the_default_fits() {
     use aterm_grid::ImageScaling;
@@ -101,7 +98,7 @@ fn tile_coordinates_increase_across_the_footprint() {
     let image = extra.image().expect("image ref");
     assert_eq!(image.cell_row, 1);
     assert_eq!(image.cell_col, 2);
-    // All tiles share the SAME underlying payload (one Arc).
+    // All tiles share the same underlying payload (one Arc).
     let a = grid.cell_extra(0, 0).unwrap().image().unwrap();
     let b = grid.cell_extra(1, 2).unwrap().image().unwrap();
     assert!(std::sync::Arc::ptr_eq(&a.image, &b.image));
@@ -109,7 +106,7 @@ fn tile_coordinates_increase_across_the_footprint() {
 
 #[test]
 fn malformed_or_non_inline_draws_nothing() {
-    // Each row was its own test: none of these may place an image, or panic.
+    // None of these may place an image, or panic.
     let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
     let rows: [(&str, Vec<u8>); 6] = [
         // inline=0 means "download to disk": no on-screen effect.
@@ -206,14 +203,9 @@ fn whitespace_in_payload_is_tolerated() {
 }
 
 #[test]
-fn large_inline_image_payload_survives_old_64k_cap() {
-    // Regression for the OSC capacity bump: before raising the parser's
-    // MAX_OSC_DATA from 64 KiB to 8 MiB, the base64 payload of any non-trivial
-    // inline image was truncated at the parser, so the handler decoded garbage
-    // (or nothing) and the real image never reached the grid.
-    //
-    // Here we send a ~512 KiB image whose base64 is ~683 KiB — over 10x the old
-    // 64 KiB cap — and assert the handler decodes the FULL payload intact.
+fn large_inline_image_payload_decodes_intact() {
+    // A ~512 KiB image (~683 KiB of base64) decodes intact: the parser's OSC
+    // cap (MAX_OSC_DATA) is large enough for real inline images.
     let mut term = Terminal::new(10, 20);
 
     // Deterministic, non-trivial body so a truncated decode could not coincide.
@@ -222,21 +214,12 @@ fn large_inline_image_payload_survives_old_64k_cap() {
         .collect();
     let payload = [PNG_MAGIC, &body[..]].concat();
 
-    // base64 of ~512 KiB is ~683 KiB, far above the old 64 KiB parser cap.
-    let b64 = aterm_codec::base64::encode(&payload).expect("encode");
-    assert!(
-        b64.len() > 64 * 1024,
-        "test must exceed the old 64 KiB cap (b64 len = {})",
-        b64.len()
-    );
-
     term.process(&osc_1337_file("inline=1;width=4;height=3", &payload));
 
     // The image must have been placed (4×3 footprint).
     assert_eq!(image_cell_count(&term), 12, "large image must be placed");
 
-    // Crucially, the stored bytes must equal the ORIGINAL payload exactly —
-    // proving the parser delivered the whole base64 body without truncation.
+    // The stored bytes equal the payload: the whole base64 body arrived.
     let grid = term.grid();
     let image = grid
         .cell_extra(0, 0)
@@ -272,19 +255,18 @@ fn single_arg_body_places_via_borrowed_payload() {
 }
 
 #[test]
-fn semicolon_after_payload_start_is_rejected_like_before() {
-    // A ';' AFTER the first ':' is malformed (base64 has no ';'): the rejoin
+fn semicolon_after_payload_start_is_rejected() {
+    // A ';' after the first ':' is malformed (base64 has no ';'): the rejoin
     // fallback reconstructs the body and the decode fails — nothing drawn.
     let mut term = Terminal::new(10, 20);
     term.process(b"\x1b]1337;File=inline=1;width=2;height=2:QUJD;RUY=\x1b\\");
     assert_eq!(image_cell_count(&term), 0);
 }
 
-/// An image far taller than the screen must end in EXACTLY the state text flow
-/// produces — the middle-band stamp skip in `place_image` is an internal
-/// optimization only. On a 10-row grid a 40-row footprint scrolls 31 times, so
-/// visible row `r` (0..=8) holds footprint row `r + 31`, row 9 is the fresh
-/// blank line, and the cursor rests at (9, 0).
+/// An image far taller than the screen ends in the same state text flow
+/// produces (the middle-band stamp skip in `place_image` is an optimization
+/// only). On a 10-row grid a 40-row footprint scrolls 31 times: visible row
+/// `r` (0..=8) holds footprint row `r + 31`, row 9 is blank, cursor at (9, 0).
 #[test]
 fn tall_image_final_state_matches_text_flow() {
     let mut term = Terminal::new(10, 20);
@@ -306,11 +288,8 @@ fn tall_image_final_state_matches_text_flow() {
     assert_eq!(term.grid().cursor_col(), 0);
 }
 
-/// With a DECSTBM scroll region, footprint rows stamped while the cursor is
-/// still descending ABOVE the region are never scrolled or overwritten — they
-/// must survive even for a footprint tall enough to trigger the middle-band
-/// stamp skip (regression: a naive `rows - 2*grid_rows` skip start would drop
-/// them).
+/// With a DECSTBM region, footprint rows stamped above the region survive,
+/// even for a footprint tall enough to trigger the middle-band stamp skip.
 #[test]
 fn tall_image_above_scroll_region_keeps_leading_rows() {
     let mut term = Terminal::new(10, 20);
@@ -368,11 +347,67 @@ fn does_not_panic_on_truncated_sequences() {
     }
 }
 
-/// A DECGRA-only sixel (`" Pan;Pad;Ph;Pv` with no trailing data byte) defers the
-/// raster allocation to `unhook`, bypassing the DCS stream/pixel budget. A
-/// 2100x2100 declared raster composes to 2100*2100*4 ≈ 17.6 MB of RGBA — over the
-/// 16 MiB `MAX_IMAGE_BYTES` cap — so `place_sixel_image` must reject it and stamp
-/// NO cells. Before the cap guard it allocated the buffer and placed the image.
+/// A one-pixel PNG: the signature and an IHDR naming 1x1 (the engine reads no
+/// further).
+fn one_pixel_png() -> Vec<u8> {
+    let mut png = PNG_MAGIC.to_vec();
+    png.extend_from_slice(&13u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&1u32.to_be_bytes());
+    png.extend_from_slice(&1u32.to_be_bytes());
+    png
+}
+
+/// A footprint is never taller than the screen or the tallest raster that
+/// decodes (4096 px), whichever is more, because the renderers decode a
+/// placement into one buffer of the footprint's pixel size: `height=4096`
+/// (cells) on a one-pixel PNG would ask each draw for 800 x 81,920 px, 262 MB, at
+/// this grid. A request within those bounds keeps its height.
+#[test]
+fn a_footprint_is_no_taller_than_the_screen_or_the_decodable_height() {
+    let cell_h = 20;
+    // 4096 px is 205 rows of 20 px, more than the screen's 24.
+    let tallest = 4096_u16.div_ceil(cell_h);
+    for (args, want) in [
+        ("width=80;height=4096", tallest),
+        ("width=80;height=300", tallest),
+        ("width=80;height=100", 100),
+        ("width=80;height=5000px", tallest),
+        // Height from the width and the picture's aspect: 800 px of a square.
+        ("width=80", 40),
+        ("width=4096", tallest),
+    ] {
+        let mut term = Terminal::new(24, 80);
+        term.set_cell_pixel_size(10, cell_h);
+        term.process(&osc_1337_file(
+            &format!("inline=1;{args}"),
+            &one_pixel_png(),
+        ));
+        let image = term
+            .grid()
+            .cell_extra(0, 0)
+            .and_then(|e| e.image().cloned())
+            .expect("placed");
+        assert_eq!(image.image.rows, want, "{args}");
+    }
+    // The screen itself is always allowed: a grid taller than 4096 px.
+    let mut term = Terminal::new(300, 80);
+    term.set_cell_pixel_size(10, cell_h);
+    term.process(&osc_1337_file(
+        "inline=1;width=80;height=4096",
+        &one_pixel_png(),
+    ));
+    let image = term
+        .grid()
+        .cell_extra(0, 0)
+        .and_then(|e| e.image().cloned());
+    assert_eq!(image.map(|i| i.image.rows), Some(300));
+}
+
+/// A DECGRA-only sixel defers the raster allocation to `unhook`, bypassing the
+/// DCS stream budget. A declared 2100x2100 raster is ~17.6 MB of RGBA, over the
+/// 16 MiB `MAX_IMAGE_BYTES` cap, so `place_sixel_image` rejects it and stamps
+/// no cells.
 #[cfg(feature = "sixel")]
 #[test]
 fn decgra_only_sixel_over_image_cap_is_rejected() {
@@ -384,4 +419,88 @@ fn decgra_only_sixel_over_image_cap_is_rejected() {
         0,
         "a DECGRA-only sixel exceeding MAX_IMAGE_BYTES must place no cells"
     );
+}
+
+/// The payload bytes of the distinct images the visible screen shows, every
+/// layer of every cell counted once per image.
+#[cfg(feature = "sixel")]
+fn live_image_bytes(term: &Terminal) -> usize {
+    let grid = term.grid();
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = 0;
+    for r in 0..grid.rows() {
+        for c in 0..grid.cols() {
+            for layer in grid.cell_extra(r, c).map_or(&[][..], |e| e.images()) {
+                if seen.insert(std::sync::Arc::as_ptr(&layer.image)) {
+                    bytes += layer.image.payload_bytes();
+                }
+            }
+        }
+    }
+    bytes
+}
+
+/// The images a screen shows are bounded as a whole, whatever each costs to
+/// send. A sixel declaring a 4096x20 raster (`"1;1;4096;20`, no pixel data)
+/// takes the rest of its row, so placing one a column further right each time
+/// leaves every one of them a cell, and its whole 320 KiB raster, on screen:
+/// 1,840 of them, 65 KB of output, would hold 603 MB without a screen budget.
+#[cfg(feature = "sixel")]
+#[test]
+fn a_screen_of_sixels_keeps_its_images_within_the_live_budget() {
+    let mut term = Terminal::new(24, 80);
+    term.set_cell_pixel_size(10, 20);
+    let raster = 4096 * 20 * 4;
+    // DECSDM: each sixel is drawn at the cursor, which stays put. The last row
+    // is left alone: a placement there scrolls the screen.
+    term.process(b"\x1b[?80h");
+    for row in 1..=23u16 {
+        for col in 1..=80u16 {
+            term.process(format!("\x1b[{row};{col}H\x1bPq\"1;1;4096;20\x1b\\").as_bytes());
+            let live = live_image_bytes(&term);
+            assert!(
+                live <= super::MAX_LIVE_IMAGE_BYTES + raster,
+                "at row {row}, column {col} the screen holds {live} bytes of images"
+            );
+        }
+    }
+    let newest = term.grid().cell_extra(22, 79).and_then(|e| e.image());
+    assert!(
+        newest.is_some_and(|image| image.image.bytes.len() == raster),
+        "the image just placed is never the one taken off"
+    );
+}
+
+/// Each screen's images are bounded, however a program moves between them. A
+/// count sees only the active grid, so one charge shared by both screens would
+/// be reset by a sixel on the near-empty alternate screen (mode 47 keeps both
+/// buffers), and the parked main screen never counted again: hopping over after
+/// every placement, it would hold all 1,840 rasters, 603 MB.
+#[cfg(feature = "sixel")]
+#[test]
+fn each_screen_keeps_its_images_within_the_live_budget() {
+    let mut term = Terminal::new(24, 80);
+    term.set_cell_pixel_size(10, 20);
+    let raster = 4096 * 20 * 4;
+    let bound = super::MAX_LIVE_IMAGE_BYTES + raster;
+    term.process(b"\x1b[?80h");
+    for row in 1..=23u16 {
+        for col in 1..=80u16 {
+            term.process(format!("\x1b[{row};{col}H\x1bPq\"1;1;4096;20\x1b\\").as_bytes());
+            let main = live_image_bytes(&term);
+            assert!(
+                main <= bound,
+                "at row {row}, column {col} the main screen holds {main} bytes of images"
+            );
+            // Over to the alternate screen for one sixel, always on its first
+            // row, and back.
+            term.process(b"\x1b[?47h\x1b[1;1H\x1bPq\"1;1;4096;20\x1b\\");
+            let alternate = live_image_bytes(&term);
+            assert!(
+                alternate <= bound,
+                "the alternate screen holds {alternate} bytes of images"
+            );
+            term.process(b"\x1b[?47l");
+        }
+    }
 }

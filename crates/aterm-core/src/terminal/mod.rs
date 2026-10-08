@@ -22,6 +22,7 @@ mod builder;
 mod callback_setters;
 mod callbacks;
 mod checkpoint;
+mod checkpoint_output;
 #[cfg(feature = "serde")]
 mod checkpoint_parser;
 mod checkpoint_state;
@@ -55,9 +56,12 @@ pub(crate) mod hyperlink_auth;
 /// Inline-image survival across a width-changing reflow (see its module docs).
 mod image_reflow;
 mod keyboard_mode;
-/// Kitty graphics protocol (APC `G`) command parser (KITTY-CORE foundation).
+/// Kitty placements relative to a virtual placement, placed each frame where
+/// its placeholders show.
+mod kitty_floating;
+/// Kitty graphics protocol (APC `G`) command parser.
 pub mod kitty_graphics;
-/// Kitty graphics Unicode placeholder (U+10EEEE) diacritic decoding (M3).
+/// Kitty graphics Unicode placeholder (U+10EEEE) diacritic decoding.
 mod kitty_placeholder;
 mod mode_mirror;
 #[cfg(test)]
@@ -71,16 +75,18 @@ mod policy_bridge;
 mod policy_gates;
 mod processing;
 mod render_cells;
+pub mod repaint_nudge;
 mod reset;
 mod resize_journal;
 mod response_capability;
 mod response_rate_limiter;
 mod selection;
+mod serialize_ansi;
 mod shell;
 pub(crate) mod shell_integration_auth;
 mod window_auth;
 
-// Phase 1+2: Universal block model, process detection, and AtermApi.
+// Block model, process detection, and the shell-facing API.
 mod shell_api;
 
 pub mod scrollback_shared_budget;
@@ -94,15 +100,9 @@ mod terminal_modes_conformance;
 mod transient_state;
 mod types;
 
-// TRUST_NATIVE_TLA Phase 2: the source↔spec cross-reference closure gate was
-// RELOCATED out of aterm-core (it lived at `src/terminal/spec_xref_gate.rs` in Phase
-// 0) into aterm-gui's TEST build (`#[cfg(test)] mod spec_xref_gate` in
-// `aterm-gui/src/main.rs`). Reason: the Phase-2 ISOLATION anchors live in
-// aterm-sandbox/pty/gpu/core, and `inventory` only collects from crates LINKED into
-// the gate's test binary; aterm-gui links them all (with each crate's `spec-anchors`
-// feature on), so it is the one binary that sees EVERY machine's anchors —
-// `terminal_modes` (still emitted by aterm-core's anchors, now visible downstream via
-// its `spec-anchors` feature) PLUS the six ISOLATION machines.
+// The source-to-spec cross-reference gate lives in aterm-gui's test build: it is
+// the one binary that links every crate's `spec-anchors`, including this crate's
+// `terminal_modes` anchors.
 
 pub use callbacks::{ColorChangeOp, ColorTarget};
 use callbacks::{
@@ -125,17 +125,21 @@ pub use alt_archive::{
     AltArchiveImport, AltArchiveQuery, AltArchiveRead, alt_archive_row_charge,
 };
 pub use aterm_parser::{CarryRefusal, ParserCarry};
+pub use aterm_types::XtermKeyboardState;
 pub(crate) use aterm_types::charset::CharacterSetState;
 pub use aterm_types::{ColorPalette, Rgb};
 pub use aterm_types::{KittyKeyboardFlags, KittyKeyboardState};
+pub use aterm_types::{WindowOperation, WindowResponse};
 pub use blocks_api::BlockText;
 pub use buffer_api::HistoryShed;
 pub use builder::{TIERED_RING_CAP_DEFAULT, TerminalBuilder};
-pub use callbacks::{SshConductorCallbackEvent, TmuxCallbackEvent};
 #[cfg(feature = "serde")]
 pub use checkpoint::CheckpointMeta;
 pub use checkpoint::{
     GridCursorRepr, ShellIntegrationNonce, ShellIntegrationPosture, StyleRepr, TerminalCheckpoint,
+};
+pub use checkpoint_output::{
+    HyperlinkRepr, OutputStateRepr, SavedModeRepr, SgrPushRepr, Vt52AddressRepr,
 };
 #[cfg(feature = "serde")]
 pub use checkpoint_parser::ParserRepr;
@@ -143,123 +147,73 @@ pub use checkpoint_state::{
     ColorRepr, ColorSlotRepr, ColorStackEntryRepr, OutputBlockRepr, PaletteOverrideRepr, ShellRepr,
     ShellSpanRepr, TitleRepr,
 };
+pub use clipboard_auth::ClipboardAccess;
 pub use custody::CustodyTransition;
 pub use foreground_handback::{ForegroundHandback, evidence as program_evidence};
 pub use mode_mirror::ModeMirror;
-// The injected-clock seam, re-exported so an out-of-crate replay/lash harness
-// can feed a FIXED ClockReading and get bit-deterministic state regardless of
-// real wall-clock pacing (the determinism a faithful replay relies on).
 pub use observe::{
     RowMatch, RowRange, Satisfaction, SurfaceSource, WatchId, WatcherSet, WatcherSpec,
     first_matching_row,
 };
-pub use processing::ClockReading;
+// `ClockReading`: the injected-clock seam, so an out-of-crate replay harness can
+// feed a fixed clock and get bit-deterministic state.
+pub use processing::{ClockReading, KittyAnimationStep};
+pub use render_cells::{RenderCell, Script, UnderlineStyle};
+pub use resize_journal::{RESIZE_JOURNAL_CAP, ResizeReport};
+pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
 pub use shell::{Annotation, BlockState, CommandMark, OutputBlock, ShellState, TerminalMark};
+pub use state::{
+    CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove, Terminal,
+};
 pub(crate) use types::SavedCursorState;
 pub use types::{
     ClipboardOperation, ClipboardSelection, CurrentStyle, CursorStyle,
     Iterm2ShellIntegrationVersion, MouseEncoding, MouseMode, TerminalModes, TerminalSize,
 };
-// Terminal-internal: not re-exported to crate level
-pub use aterm_types::XtermKeyboardState;
-pub use aterm_types::{WindowOperation, WindowResponse};
-pub use clipboard_auth::ClipboardAccess;
-pub use render_cells::{RenderCell, UnderlineStyle};
-pub use resize_journal::{RESIZE_JOURNAL_CAP, ResizeReport};
-pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
-pub use state::{
-    CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove, Terminal,
-};
 use types::{SgrPushMask, SgrStackEntry, TaskbarProgress};
 
 use crate::grid::Cursor;
 
-// Type alias for user_vars HashMap.
 pub(crate) type UserVarsMap = std::collections::HashMap<String, String>;
 
-// Pending notification map.
 pub(crate) type PendingNotificationsMap = std::collections::HashMap<String, types::Notification>;
 
-/// Maximum **decoded** clipboard bytes for an OSC 52 query response (Pd = "?").
+/// Maximum decoded clipboard bytes for an OSC 52 query response (Pd = "?").
 ///
-/// This caps the size of **raw/decoded** data that aterm-core will accept from
-/// the clipboard callback before base64 encoding and emitting as an OSC 52
-/// response. Responses exceeding this limit are silently dropped to avoid
-/// excessive memory use and accidental large exfil.
-///
-/// # Wire size note
-///
-/// The actual emitted response is larger due to:
-/// - Base64 encoding (~33% expansion: 3 input bytes → 4 output bytes)
-/// - OSC framing overhead (~12 bytes for `ESC ] 52 ; Pc ; ... BEL`)
-///
-/// A 64KB decoded payload becomes ~85KB on the wire. If wire-size constraints
-/// are critical, hosts should apply their own caps before returning data from
-/// the clipboard callback.
-///
-/// # Rationale
-///
-/// 64 KiB is a deliberately tight, clipboard-specific cap: a clipboard query
-/// response should never be large, and a tight bound limits accidental large
-/// exfil. This is independent of the parser's `MAX_OSC_DATA` input limit (which
-/// is generous — 8 MiB — to carry OSC 1337 inline images); clipboard data does
-/// not need that headroom, so it keeps its own smaller cap.
+/// Larger clipboard data from the callback is dropped rather than answered. The
+/// wire response is about a third larger (base64 plus OSC framing). This cap is
+/// deliberately tighter than the parser's 8 MiB `MAX_OSC_DATA` input limit, to
+/// limit accidental exfiltration.
 pub(crate) const MAX_OSC52_QUERY_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Maximum bytes allowed in the terminal response buffer.
-///
-/// Responses from query sequences (for example DSR/DA/DECRQSS/OSC queries) are
-/// buffered until the host drains them via `take_response()`. This cap prevents
-/// unbounded memory growth when a single input batch generates excessive
-/// responses before the host has a chance to read.
+/// Maximum bytes in the terminal response buffer (DSR/DA/DECRQSS/OSC replies
+/// waiting for `take_response()`).
 pub(crate) const MAX_RESPONSE_BUFFER_SIZE: usize = 1024 * 1024;
 
-/// Maximum title/icon-name length in bytes for OSC 0/1/2 and the public
-/// `set_title` API. Matches OSC 777's cap in
-/// `handler_osc_notify.rs`. The parser's OSC buffer allows up to 65534
-/// bytes, but real terminal titles are short strings.
+/// Maximum title/icon-name length in bytes for OSC 0/1/2 and `set_title`
+/// (same cap as OSC 777).
 const MAX_TITLE_BYTES: usize = 1024;
 
-/// Maximum hyperlink URL length in bytes for OSC 8 sequences.
-///
-/// URLs exceeding this limit are silently ignored (consistent with other
-/// terminals). 8 KiB is generous for any realistic URL while preventing
-/// memory abuse from malicious sequences. Part of #7172.
+/// Maximum OSC 8 hyperlink URL length in bytes; longer URLs are ignored.
 const MAX_HYPERLINK_URL_BYTES: usize = 8192;
 
-/// Maximum current-working-directory path length in bytes for OSC 7 and the
-/// OSC 633 `P` Cwd property.
+/// Maximum working-directory path length in bytes for OSC 7 and OSC 633 `P` Cwd.
 ///
-/// The OSC parser admits up to `MAX_OSC_DATA` (8 MiB) of payload, and the cwd
-/// path it carries is otherwise length-unbounded: OSC 7's percent-decoded path
-/// and OSC 633-P's `Cwd` value flow into the count-capped (but not byte-capped)
-/// `osc_events` queue and the shell mark/block working-directory fields, where
-/// a callback-based host can retain them indefinitely. Paths longer than this
-/// are rejected (left unchanged / not queued). 4 KiB matches the conventional
-/// `PATH_MAX`, which is generous for any real directory.
+/// Longer paths are rejected: they would otherwise be retained in the
+/// `osc_events` queue and the count-capped but not byte-capped shell
+/// mark/block fields. 4 KiB matches the conventional `PATH_MAX`.
 pub(crate) const MAX_CWD_PATH_BYTES: usize = 4096;
 
-/// Maximum command-line / semantic-text length in bytes for the OSC 633 `E`
-/// (VS Code explicit command) and `F`/`G`/`H` (progress) payloads.
+/// Maximum command-line text length in bytes for OSC 633 `E` and `F`/`G`/`H`
+/// payloads.
 ///
-/// Same hazard as [`MAX_CWD_PATH_BYTES`] (#7172): the OSC parser admits up to
-/// `MAX_OSC_DATA` (8 MiB), and the `E` command text is RETAINED in the count-capped
-/// (but not byte-capped) shell mark/block `commandline` fields, where a host can
-/// hold it indefinitely — so an unbounded `E` can pin megabytes per retained entry.
-/// Command lines are legitimately longer than a path (long pipelines), so this cap
-/// is more generous than `MAX_CWD_PATH_BYTES` while still bounding abuse. Bounding
-/// the escaped input also bounds the unescape work (unescape only shrinks).
+/// The `E` text is retained in shell mark/block `commandline` fields, which are
+/// count-capped but not byte-capped. Bounding the escaped input also bounds the
+/// unescape work.
 pub(crate) const MAX_COMMANDLINE_BYTES: usize = 64 * 1024;
 
-// ----------------------------------------------------------------------------
-// Type-safe conversion helpers
-// ----------------------------------------------------------------------------
-
-/// Convert u16 SGR parameter to u8 color index.
-/// SGR color parameters are in 0-255 range; values >255 saturate to 255.
+/// An SGR color parameter as a palette index; values above 255 saturate.
 #[inline]
 pub(crate) fn sgr_color_u8(val: u16) -> u8 {
     val.try_into().unwrap_or(u8::MAX)
 }
-
-// Terminal struct, Debug impl, and root state accessors live in state.rs.

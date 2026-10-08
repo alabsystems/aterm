@@ -43,6 +43,13 @@ assets/bundled/`, each face beside its own notice, held to the same
 - JetBrains Mono 2.304 (Regular, Bold, Italic, Bold Italic), The JetBrains
   Mono Project Authors: SIL Open Font License 1.1 in
   `crates/aterm-render/assets/bundled/JetBrainsMono-*.LICENSE.txt`.
+- Cascadia Mono PL 2407.24 (Regular, Bold, Italic, Bold Italic; the static
+  release of github.com/microsoft/cascadia-code, unmodified), Copyright (c)
+  2019 - Present, Microsoft Corporation, with Reserved Font Name Cascadia
+  Code: SIL Open Font License 1.1 in
+  `crates/aterm-render/assets/bundled/CascadiaMonoPL-*.LICENSE.txt`.
+  Compiled into Windows builds only. Cascadia Code is a trademark of the
+  Microsoft group of companies.
 - Noto Sans Symbols 2 2.008, The Noto Project Authors: SIL Open Font License
   1.1 in `crates/aterm-render/assets/bundled/NotoSansSymbols2-Regular.LICENSE.txt`.
 - Noto Sans Math 3.000, Google LLC: SIL Open Font License 1.1 in

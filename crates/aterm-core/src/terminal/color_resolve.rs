@@ -16,16 +16,16 @@ use crate::grid::{Cell, CellExtra, CellFlags, PackedColors};
 use aterm_types::{ColorPalette, DIM_FACTOR, Rgb};
 use std::sync::OnceLock;
 
-/// Host-configurable STYLE-attribute policy for color resolution (W5).
+/// Host-configurable style-attribute policy for color resolution.
 ///
 /// * `bold_is_bright` — whether SGR 1 promotes indexed colors 0–7 to their
 ///   bright 8–15 siblings (the classic xterm behavior). Defaults to `true`
 ///   (the historical unconditional promotion); config `bold_is_bright = false`
 ///   keeps bold a pure weight change.
 /// * `faint_opacity` — how much of the foreground SGR 2 (dim/faint) retains,
-///   `0.0..=1.0`. The fg is blended TOWARD THE CELL BACKGROUND in linear
+///   `0.0..=1.0`. The fg is blended toward the CELL background in linear
 ///   light by this fraction (see [`dim_toward_bg`]), so faint text recedes on
-///   BOTH dark and light themes. Defaults to [`DIM_FACTOR`] (0.5).
+///   both dark and light themes. Defaults to [`DIM_FACTOR`] (0.5).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StyleResolveOpts {
     /// SGR 1 promotes indexed 0–7 to bright 8–15 (default `true`).
@@ -46,15 +46,7 @@ impl Default for StyleResolveOpts {
 /// Resolve the foreground RGB color for a cell, applying all style attributes.
 ///
 /// Applies in order: raw lookup -> bold-to-bright -> dim -> inverse -> hidden.
-///
-/// # Arguments
-///
-/// * `cell` - The cell to resolve colors for
-/// * `extra` - Extended cell data (needed for RGB color lookup)
-/// * `palette` - The color palette for indexed color resolution
-/// * `default_fg` - Default foreground color (from terminal settings)
-/// * `default_bg` - Default background color (from terminal settings)
-/// * `reverse_video` - Terminal-level DECSCNM mode (DECSET mode 5)
+/// `extra` carries the RGB colors; `reverse_video` is DECSCNM (DECSET 5).
 #[must_use]
 #[cfg(test)]
 pub fn resolve_fg_color(
@@ -177,8 +169,8 @@ fn resolve_both(
         }
     }
 
-    // 3. Dim (SGR 2): blend fg toward the cell BACKGROUND in linear light.
-    // (The old "multiply toward black" made faint text DARKER — i.e. HEAVIER —
+    // 3. Dim (SGR 2): blend fg toward the cell background in linear light.
+    // (The old "multiply toward black" made faint text darker — i.e. heavier —
     // on light themes, the inversion of the attribute. Blending toward bg is
     // theme-independent: it always recedes toward the surface it sits on.)
     // Applied before the inverse swap, like the old multiply.
@@ -269,7 +261,7 @@ impl TransferTables {
         let mut thresholds = [0.0; 255];
         for q in 1..=255u16 {
             // Invert the half-byte rounding boundary for a close starting point,
-            // then walk the neighboring f32 values until we have the FIRST value
+            // then walk the neighboring f32 values until we have the first value
             // accepted by the exact legacy function. Usually this takes one probe.
             let encoded_boundary = (f32::from(q) - 0.5) / 255.0;
             let mut bits = encoded_unit_to_linear(encoded_boundary).to_bits();
@@ -339,7 +331,7 @@ fn linear_to_srgb_with(tables: &TransferTables, l: f32) -> u8 {
     q as u8
 }
 
-/// SGR 2 (dim/faint): blend `fg` TOWARD `bg` by `1 - opacity`, in LINEAR light.
+/// SGR 2 (dim/faint): blend `fg` toward `bg` by `1 - opacity`, in linear light.
 ///
 /// `opacity` is the fraction of the foreground retained (clamped to `0..=1`):
 /// `1.0` returns `fg` unchanged, `0.0` lands on `bg` (invisible). The blend is
@@ -350,7 +342,7 @@ fn linear_to_srgb_with(tables: &TransferTables, l: f32) -> u8 {
 /// # Invariant (proven)
 ///
 /// `contrast(dim_toward_bg(fg, bg, t), bg) <= contrast(fg, bg)` for every
-/// `fg`/`bg` pair and `t ∈ [0,1]` — dim REDUCES contrast on BOTH polarities
+/// `fg`/`bg` pair and `t ∈ [0,1]` — dim reduces contrast on both polarities
 /// (dark-on-light and light-on-dark), unlike the old gamma-space multiply
 /// toward black, which made faint text HIGHER-contrast (darker/heavier) on
 /// light backgrounds. Exhaustively machine-checked over all grayscale pairs
@@ -363,7 +355,7 @@ pub fn dim_toward_bg(fg: Rgb, bg: Rgb, opacity: f32) -> Rgb {
     } else {
         DIM_FACTOR
     };
-    // Resolve the OnceLock ONCE per cell, not once per channel/transfer.
+    // Resolve the OnceLock once per cell, not once per channel/transfer.
     let tables = transfer_tables();
     let mix = |f: u8, b: u8| -> u8 {
         let lf = tables.to_linear[usize::from(f)];
@@ -410,25 +402,21 @@ fn raw_resolve(
     (fg, bg)
 }
 
-/// W5(e) PROOF — the dim contrast law, machine-checked (L0, always-on).
+/// The dim contrast law, machine-checked (L0, always on).
 ///
 /// Invariant: `contrast(dim_toward_bg(fg, bg, t), bg) <= contrast(fg, bg)`
-/// for all `fg`,`bg` and `t ∈ [0,1]` — SGR 2 REDUCES WCAG contrast on BOTH
-/// polarities. In real arithmetic this is exact: the linear-light blend makes
-/// relative luminance itself the lerp `L(dim) = L(bg) + t·(L(fg) − L(bg))`,
-/// so `|L(dim) − L(bg)| = t·|L(fg) − L(bg)| ≤ |L(fg) − L(bg)|` and the WCAG
-/// ratio (monotone in that distance) can only shrink. u8 quantization adds a
-/// bounded perturbation, checked here empirically:
+/// for all `fg`, `bg` and `t ∈ [0,1]`: SGR 2 reduces WCAG contrast on both
+/// polarities. In real arithmetic it is exact, since the linear-light blend
+/// makes relative luminance the lerp `L(dim) = L(bg) + t·(L(fg) − L(bg))`. u8
+/// quantization adds a bounded perturbation, checked here:
 ///
-/// * GRAYSCALE (single-channel, all directions agree): EXACT over the full
-///   exhaustive 256×256×|t| domain — zero tolerance.
-/// * RGB (channels may move in opposing directions): EXACT for every pair
-///   with `contrast(fg,bg) >= 1.05`, and within `+0.005` (one u8 step of
-///   luminance) for near-iso-luminant pairs, over a dense 8³-per-color
-///   lattice. (Measured worst excess: 4.9e-3, only below contrast 1.05.)
+/// * grayscale: exact over the exhaustive 256×256×|t| domain, zero tolerance;
+/// * RGB (channels may move in opposing directions): exact for pairs with
+///   `contrast(fg,bg) >= 1.05`, within `+0.005` (one u8 step of luminance)
+///   for near-iso-luminant pairs, over a dense 8³-per-color lattice.
 ///
-/// The pre-fix behavior (gamma-space multiply toward black) is kept as the
-/// NEGATIVE CONTROL: it *raises* contrast for dark-on-light text.
+/// A gamma-space multiply toward black is the negative control: it raises
+/// contrast for dark-on-light text.
 #[cfg(test)]
 mod dim_contrast_law {
     use super::{dim_toward_bg, srgb_to_linear};
@@ -445,7 +433,7 @@ mod dim_contrast_law {
 
     const OPACITIES: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
 
-    /// Grayscale: EXHAUSTIVE over all 256×256 pairs × 5 opacities, exact.
+    /// Grayscale: exhaustive over all 256×256 pairs × 5 opacities, exact.
     #[test]
     fn dim_never_increases_contrast_grayscale_exhaustive() {
         let mut reduced = 0u32; // non-vacuity: strict reductions must occur
@@ -500,7 +488,7 @@ mod dim_contrast_law {
                         );
                     }
                 }
-                // Track that BOTH polarities are genuinely exercised.
+                // Track that both polarities are genuinely exercised.
                 if luminance(fg) < luminance(bg) && c0 > 4.0 {
                     dark_on_light_checked = true;
                 }
@@ -515,9 +503,9 @@ mod dim_contrast_law {
         );
     }
 
-    /// NEGATIVE CONTROL: the pre-fix gamma-space multiply toward black RAISES
-    /// contrast for dark text on a light background (the audited polarity bug),
-    /// so the law above genuinely distinguishes the fix from the bug.
+    /// Negative control: a gamma-space multiply toward black raises contrast
+    /// for dark text on a light background, so the law above distinguishes the
+    /// linear-light blend from it.
     #[test]
     fn old_gamma_multiply_violates_the_law() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -626,7 +614,7 @@ mod tests {
         let cell = cell_with_indexed_fg(1, CellFlags::DIM);
         let pal = palette();
         let fg = resolve_fg_color(&cell, None, &pal, DEFAULT_FG, DEFAULT_BG, false);
-        // W5(e): dim is the linear-light blend toward the cell bg (the default
+        // dim is the linear-light blend toward the cell bg (the default
         // bg here), at the default faint opacity.
         assert_eq!(fg, dim_toward_bg(pal.get(1), DEFAULT_BG, DIM_FACTOR));
         // On the black default bg the blend still darkens red text.
@@ -649,7 +637,7 @@ mod tests {
             DIM_FACTOR,
         );
         assert_eq!(fg, expected);
-        // Halving in LINEAR light lands brighter than the old gamma-space
+        // Halving in linear light lands brighter than the old gamma-space
         // multiply (100, 50, 25) — pin the polarity fix's actual output.
         assert!(
             fg.r > 100,
@@ -657,9 +645,8 @@ mod tests {
         );
     }
 
-    /// W5(e) THE POLARITY FIX: on a LIGHT background, dim must make text
-    /// LIGHTER (recede toward bg), not darker/heavier. The old gamma multiply
-    /// toward black did the opposite — this is its regression test.
+    /// On a light background, dim makes text lighter (receding toward bg), not
+    /// darker, unlike a gamma-space multiply toward black.
     #[test]
     fn test_dim_recedes_on_light_theme() {
         let (cell, extra) = cell_with_rgb_fg(40, 40, 40, CellFlags::DIM);
@@ -669,7 +656,7 @@ mod tests {
             g: 240,
             b: 240,
         };
-        // The cell sets no bg, so the light DEFAULT bg is what it sits on —
+        // The cell sets no bg, so the light default bg is what it sits on —
         // and therefore the blend target.
         let fg = resolve_fg_color(&cell, Some(&extra), &pal, DEFAULT_FG, light_bg, false);
         assert!(
@@ -725,9 +712,8 @@ mod tests {
         assert_eq!(fg, expected);
     }
 
-    /// W5(f): `bold_is_bright = false` keeps SGR 1 a pure weight change — the
-    /// indexed 0–7 fg is NOT promoted to its bright sibling. The default policy
-    /// (true) stays byte-identical to the historical unconditional promotion.
+    /// `bold_is_bright = false` keeps SGR 1 a pure weight change: indexed 0–7
+    /// fg is not promoted to its bright sibling. The default (true) promotes.
     #[test]
     fn test_bold_is_bright_off_keeps_base_color() {
         let cell = cell_with_indexed_fg(3, CellFlags::BOLD);

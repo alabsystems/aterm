@@ -3,29 +3,19 @@
 
 //! **aterm-regex** — aterm's regular expressions, first-party.
 //!
-//! This crate exists to retire the `regex` crate from aterm's shipped graph. That
-//! dependency cost four packages and 158,471 lines of third-party source
-//! (`regex`, `regex-automata`, `regex-syntax`, `aho-corasick`) to provide
-//! `Regex::new`, a size-limited builder, `find`, `find_iter`, `is_match` and one
-//! error type at six call sites — `aterm-observe`, `aterm-selection`'s rules, and
-//! four files of `aterm-search` — plus a seventh in `aterm-core`'s test-support
-//! triggers, which is a dev-dependency and never shipped. Owner rule: a package
-//! used this narrowly is a package we can debug and maintain ourselves.
+//! Replaces the `regex` crate (four packages, 158,471 lines of third-party
+//! source) at the call sites in `aterm-observe`, `aterm-selection` and
+//! `aterm-search`, plus `aterm-core`'s test-support triggers. Owner rule: a
+//! package used this narrowly is one we maintain ourselves.
 //!
 //! ## What it is
 //!
 //! Parse → NFA → **Pike VM**: the pattern becomes a Thompson automaton and the
-//! search advances the whole set of live states one code point at a time. Match
-//! time is linear in the length of the haystack, always — `(a|a)*b` against ten
-//! thousand `a`s is a few milliseconds here and a hang in a backtracking engine.
-//!
-//! That is not a reduced substitute for what `regex` did. `regex` is also a
-//! finite-automaton engine with the same linear guarantee, has no backreferences
-//! and no look-around, and matches leftmost-first; so does this. The syntax floor
-//! is set by the patterns aterm already ships in
-//! `aterm-selection`'s `builtin_patterns` — URLs, IPv4/IPv6, email, UUID, git
-//! hashes, quoted strings, Windows and unix paths — and every one of them is a
-//! test here, checked against the `regex` crate as a differential oracle.
+//! search advances the whole set of live states one code point at a time, so
+//! match time is linear in the haystack — `(a|a)*b` against ten thousand `a`s
+//! is milliseconds, not a backtracking hang. Like `regex`, it has no
+//! backreferences or look-around and matches leftmost-first. Every pattern in
+//! `aterm-selection`'s `builtin_patterns` is a test here.
 //!
 //! ```
 //! use aterm_regex::Regex;
@@ -39,64 +29,40 @@
 //!
 //! ## Bounds, because patterns here are user input
 //!
-//! Selection rules, the `await match <re>` verb and the search options all take
-//! their pattern from a human or an agent, so the engine is bounded on both
-//! axes. [`RegexBuilder::size_limit`] caps the compiled program in bytes and is
-//! re-checked on every instruction emitted, so `(a{200}){200}` — thirteen bytes
-//! of pattern, forty thousand instructions of automaton — fails fast instead of
-//! allocating. Nesting is capped at 250 levels, so `((((…))))` returns an error
-//! rather than overflowing the stack.
+//! Selection rules, `await match <re>` and the search options take patterns
+//! from a human or an agent. Nesting is capped at 250 levels, so `((((…))))`
+//! errors instead of overflowing the stack.
 //!
-//! The Pike VM's guarantee is worth stating precisely, because the loose version
-//! of it — "linear time, therefore nothing can hang it" — is false, and this
-//! crate shipped that loose version in writing until the numbers below were
-//! measured. A search is linear **in the length of the haystack**: there is no
-//! input that makes it exponential, which is the failure mode a backtracking
-//! engine has and this one cannot. But the *constant* of that linearity is the
-//! compiled program size, because the simulation advances every live thread at
-//! every position. A scan costs `O(|haystack| × program)`, both factors are
-//! chosen by whoever supplies the pattern and the content, and linear in one
-//! factor is not a bound on the product.
+//! "Linear time" does not mean nothing can hang it. A scan costs
+//! `O(|haystack| × program)`, and the caller chooses both factors. Measured on
+//! the m21 box in release at a 1 MiB `size_limit` (~16k instructions):
 //!
-//! Measured on the m21 box in release, through the shipped bounded builder at a
-//! 1 MiB `size_limit` — which admits roughly 16k instructions — against `regex`
-//! as the oracle:
-//!
-//! | pattern | bytes | one 4,096-column row | a 3 MB haystack | oracle |
+//! | pattern | bytes | one 4,096-column row | a 3 MB haystack | `regex` |
 //! |---|---|---|---|---|
 //! | `(?:x?){2000}z` | 13 | 42.7 ms | 30.25 s | 6.8 µs / 40 µs |
 //! | `(?:x\|x\|x\|x\|x\|x\|x\|x){400}z` | 25 | 60.3 ms | 50.09 s | 855 µs / 1.01 ms |
 //!
-//! Thirteen bytes of pattern, inside every length gate in the tree, for a
-//! 750,000x slowdown on the second column — reachable from a selection rule, an
-//! `await match <re>` argument or the search box, which is to say from user
-//! input. (Re-measured while fixing it, same box, same builder: 37.7 ms /
-//! 28.66 s and 55.5 ms / 50.16 s — the same numbers to within the noise of a
-//! loaded machine.)
+//! Two bounds cover the two factors:
 //!
-//! Two bounds answer that, and they answer different halves of it.
-//! [`RegexBuilder::size_limit`] bounds the *program*; the call sites pass
-//! 128 KiB rather than the 10 MiB default, which refuses both patterns above
-//! outright and caps the admitted ones at ~2,048 instructions.
-//! [`RegexBuilder::step_limit`] bounds the *scan*: it charges every position
-//! visited, every prefilter byte skipped, every epsilon instruction entered and
-//! every thread stepped against one budget, so it is the `|haystack| × program`
-//! product itself that is capped rather than one of its factors. Exhausting it
-//! ends the search with [`StepLimitExceeded`] — a distinct outcome, never a
-//! quiet "no match", because a wrong answer is worse than a refusal.
-//! `tests/bounds.rs` pins the compile half; the step-budget half is pinned in
-//! this crate's own test modules.
+//! * [`RegexBuilder::size_limit`] bounds the *program*, re-checked on every
+//!   instruction emitted, so `(a{200}){200}` fails fast instead of allocating.
+//!   The call sites pass 128 KiB (~2,048 instructions) rather than the 10 MiB
+//!   default, which refuses both patterns above.
+//! * [`RegexBuilder::step_limit`] bounds the *scan*: positions visited,
+//!   prefilter bytes skipped, epsilon instructions entered and threads stepped
+//!   all draw on one budget, so the product itself is capped. Exhausting it
+//!   yields [`StepLimitExceeded`], never a quiet "no match": a wrong answer
+//!   is worse than a refusal.
+//!
+//! `tests/bounds.rs` pins the compile half; `step_budget_tests` below pins the
+//! scan half.
 //!
 //! ## What it costs, measured
 //!
-//! `regex` is faster at *matching* and this crate is faster at *compiling*, and
-//! both differences are structural rather than incidental. `regex` builds a lazy
-//! DFA and drives it behind SIMD literal prefilters, so a warm scan is close to
-//! `memchr`; a Pike VM walks a state set. The trade runs the other way at
-//! compile time, where a DFA-backed engine has far more to build.
-//!
-//! Measured on the m21 box, release, min of three alternated runs, scanning
-//! 20,000 terminal-style rows (~3 MB) with `find_iter`:
+//! `regex` drives a lazy DFA behind SIMD prefilters, so it scans faster; this
+//! crate compiles faster, because it has no DFA to build. m21 box, release,
+//! min of three alternated runs, `find_iter` over 20,000 terminal-style rows
+//! (~3 MB):
 //!
 //! | pattern | here | `regex` |
 //! |---|---|---|
@@ -109,97 +75,39 @@
 //! | one compile of the IPv4 rule | 3.2 µs | 150 µs |
 //! | one compile of a literal | 0.37 µs | 1.5 µs |
 //!
-//! So: five to twenty times slower per full-scrollback scan, forty-odd times
-//! faster per compile. That second number is not a consolation prize — `aterm-search`
-//! recompiles the pattern on **every keystroke**, and selection compiles eleven
-//! rules at startup. The scan side is bounded work in bounded slices
-//! (`BudgetedSearch` feeds rows in budgeted batches), and 30 ms is the worst
-//! case over an entire 20k-row scrollback, not per frame.
+//! Five to twenty times slower per full scan, forty-odd times faster per
+//! compile — and `aterm-search` recompiles on every keystroke while selection
+//! compiles eleven rules at startup. Scans run in budgeted batches
+//! (`BudgetedSearch`), so 30 ms is a whole-scrollback worst case, not per frame.
 //!
-//! The gap that mattered most is already closed. A first-code-point prefilter
-//! rejects a position with one array lookup per byte, and it survives a leading
-//! assertion — `\bcommit` and `^ERROR` are what a terminal actually searches for,
-//! and arming those took the never-matches case from 21.6 ms to 1.0 ms.
+//! The scan-side fast paths, each measured over the shipped 100,000-row
+//! scrollback against the same binary with the path forced off:
 //!
-//! Surviving a leading assertion is right for `\bcommit` and was wrong for
-//! `^ERROR`: the prefilter would hunt down every `E` in the scrollback so the
-//! simulation could fail `\A` on each one. A start-anchored program can only
-//! match at offset 0, so [`compile`](compile) now proves that fact once
-//! ([`Program::start_anchored`]) and the search stops rather than walks.
-//! `benches/anchored_scan.rs` measures it over the shipped 100,000-row default,
-//! paired and slot-alternated against the same binary with the fact forced off:
+//! * **First-code-point prefilter**: rejects a position with one array lookup
+//!   per byte and survives a leading assertion (`\bcommit`, `^ERROR`).
+//! * **Start anchoring** ([`Program::start_anchored`]): a program that can only
+//!   match at offset 0 stops instead of letting the prefilter hunt every `E`.
+//!   `(?i)^ERROR` 7.42 → 2.10 ms, `(?i)^\d+` 10.10 → 1.45 ms; the unanchored
+//!   controls (`(?i)ERROR`, `(?im)^ERROR`, `\bcommit`) stay inside a 3.1%
+//!   noise floor.
+//! * **ASCII class bitmap**: a dense `u128` per class answers membership below
+//!   U+0080 with a shift, instead of a binary search; `(?i)ERROR` compiles to
+//!   five classes. 16.90 → 13.76 ms.
+//! * **Second-code-point prefilter** ([`Prefilter`](compile::Prefilter)): armed
+//!   when every path provably consumes a first code point, and tested before
+//!   the decode, since an ASCII lead byte is its whole code point. Cost tracks
+//!   the lead byte's frequency (`(?i)QUARK` 3.6 ms vs `(?i)ERROR` 13.2 ms on a
+//!   one-byte filter); with two bytes `(?i)ERROR` 12.87 → 8.39 ms, `\bcommit`
+//!   5.90 → 4.66 ms.
 //!
-//! | pattern | anchor fact off | on |
-//! |---|---|---|
-//! | `(?i)^ERROR` — the find bar's default | 7.42 ms | **2.10 ms** |
-//! | `(?i)^\d+` | 10.10 ms | **1.45 ms** |
-//! | `^\[` (a pattern that *does* match) | 2.82 ms | **1.19 ms** |
-//! | `(?i)ERROR` — control | 16.99 ms | 16.64 ms |
-//! | `(?im)^ERROR` — control, `StartLine` anchors nothing | 7.80 ms | 7.59 ms |
-//! | `\bcommit` — control | 5.53 ms | 5.71 ms |
+//! Together: the find bar's default `(?i)ERROR` went from 16.90 ms to 7.79 ms
+//! per keystroke over 100,000 rows.
 //!
-//! The three controls sit inside a 3.1% identical-binary noise floor, which is
-//! the point: the fast path must take the anchored patterns and nothing else.
-//!
-//! The other half of the gap is the CLASS path, and it is the case-insensitive
-//! search — the find bar's default — that pays it. `(?i)ERROR` compiles to five
-//! `Inst::Class` where the case-sensitive form compiles to five `Inst::Char`,
-//! so the default search asks a lookup structure built for the whole of Unicode
-//! about one ASCII byte, five times per candidate position. `Program`
-//! now carries a dense `u128` per class covering U+0000..U+007F, built at the
-//! moment the classes are frozen, and below U+0080 a membership test is a shift
-//! and a test against sixteen bytes rather than a reach through two `Vec`
-//! headers and a binary search:
-//!
-//! | pattern | binary search | ASCII bitmap |
-//! |---|---|---|
-//! | `(?i)ERROR` — the find bar's default | 16.90 ms | **13.76 ms** |
-//!
-//! Measured the same way; that lane's identical-binary control is 0.1% over
-//! eleven rounds. The other lanes do not move outside their own noise, which
-//! for `\bcommit` is ±15% on a loaded box and for `(?i)^\d+` is ±1.2% — a
-//! reminder that the floor is per-arm and quoting one number for the suite
-//! would be quoting the wrong one.
-//!
-//! What remained after that was not the simulation but the PREFILTER'S HIT
-//! RATE, and the bench states the cost model as a measurement rather than an
-//! argument: `(?i)QUARK` and `(?i)ERROR` are the same shape and length over the
-//! same corpus and differ only in how common their lead byte is — 3.6 ms
-//! against 13.2 ms. That gap is what a one-byte filter spends entering the
-//! simulation at positions that die on their SECOND character.
-//!
-//! So [`Prefilter`](compile::Prefilter) now carries a second marking, for the
-//! code point after the first, armed only when every path provably consumes
-//! one. `(?i)ERROR` stops meaning "every `e` in the scrollback" and starts
-//! meaning "every `e` followed by an `r`":
-//!
-//! | pattern | one byte | two bytes |
-//! |---|---|---|
-//! | `(?i)ERROR` | 12.87 ms | **8.39 ms** |
-//! | `\bcommit` | 5.90 ms | **4.66 ms** |
-//! | `(?im)^ERROR` | 7.23 ms | **5.96 ms** |
-//! | `(?i)^ERROR` | 1.836 ms | 1.835 ms |
-//!
-//! The last row is the anchored fast path getting there first, as it should.
-//! Per-lane controls were 0.0-1.8%.
-//!
-//! One more, from the same measurement: the second-byte test now runs BEFORE
-//! the decode rather than after it. Everything else in the skip loop needs the
-//! decoded code point — the viability walk compares whole `char`s — but an
-//! ASCII lead byte IS its whole code point, so the next one starts at `pos + 1`
-//! and can be tested with an array lookup. Doing it second meant paying a
-//! decode on every marked byte in order to reject nearly all of them:
-//! `(?i)ERROR` -5.0%, `(?im)^ERROR` -5.1%, `\bcommit` -1.9%, `(?i)QUARK`
-//! -1.8%, against per-lane controls of 0.0-0.3%.
-//!
-//! Taken together, the find bar's default over the shipped 100,000-row
-//! scrollback has gone from 16.90 ms per keystroke to 7.79 ms.
-//!
-//! ## Divergences from the `regex` crate, stated plainly
+//! ## Divergences from the `regex` crate
 //!
 //! Every one of these is a *refusal* — an [`Error`] naming the construct — never
-//! a quiet reinterpretation. `tests/differential.rs` proves agreement on
-//! everything else.
+//! a quiet reinterpretation. `tests/differential.rs` pins everything else, as
+//! recorded when it agreed with `regex`.
 //!
 //! * `\p{…}` / `\pL` Unicode property classes are not supported.
 //! * Character-class set operations (`[a&&b]`, `[a--b]`, `[a~~b]`) and the
@@ -209,32 +117,23 @@
 //!   code point.
 //! * `(?R)` CRLF mode is not supported.
 //! * `\w`, and therefore `\b`, follow the *toolchain's* Unicode version through
-//!   `char::is_alphabetic`, which is newer than the tables `regex` bundles. The
-//!   two agree except on code points that gained the `Alphabetic` property in
-//!   between; the differential test asserts every disagreement has exactly that
-//!   shape. Measured against the locked oracle, `^\w$` disagrees on 4,662 code
-//!   points, all in one direction — this engine is a strict superset, and `\d`,
-//!   `\s`, `\D`, `\S` and `\W` agree exactly.
+//!   `char::is_alphabetic`, which is newer than the tables `regex` bundles.
+//!   `^\w$` disagreed with `regex` on 4,662 code points, all in one direction
+//!   (this engine is a strict superset); `\d`, `\s`, `\D`, `\S` and `\W` agree
+//!   exactly. Two consequences:
 //!
-//!   Two consequences that follow from it and are easy to miss:
+//!   1. **It reaches a shipped selection rule.** `git_hash` is
+//!      `\b[0-9a-fA-F]{7,40}\b`; on `"deadbeef\u{088F}"` `regex` selects
+//!      `deadbeef` and this engine selects nothing, because U+088F is
+//!      `Alphabetic` to the current toolchain. `url`, `email` and `semver` are
+//!      unaffected.
+//!   2. **The answer tracks the compiler.** Two builds on different toolchains
+//!      can select differently. For reproducibility, bake `Alphabetic` into a
+//!      range table beside `ND`/`MARK`/`PC`, checked against `std` by a sibling
+//!      of `fold_table_matches_std`.
 //!
-//!   1. **It reaches `\b`, and therefore a shipped selection rule.** Word
-//!      boundaries are defined from `\w`, so they fall in different places next
-//!      to those 4,662 code points. Concretely, `aterm-selection`'s `git_hash`
-//!      rule is `\b[0-9a-fA-F]{7,40}\b`, and on `"deadbeef\u{088F}"` the oracle
-//!      selects `deadbeef` while this engine selects nothing: U+088F is
-//!      `Alphabetic` to the current toolchain, so there is no boundary after the
-//!      `f`. The `url`, `email` and `semver` rules are unaffected.
-//!   2. **The answer tracks the compiler, not this crate.** The `Alphabetic`
-//!      term is read from `std` at compile time rather than frozen here, so two
-//!      builds of the same aterm source on different toolchains can select
-//!      differently. If build-to-build reproducibility is ever wanted over
-//!      currency, the fix is to bake `Alphabetic` into a fourth range table
-//!      beside `ND`/`MARK`/`PC`, pinned to a stated Unicode version and checked
-//!      against `std` by a sibling of `fold_table_matches_std`.
-//!
-//! Nothing in the aterm tree uses any of the first four, and the built-in
-//! patterns are the proof: they are all here, all passing.
+//! Nothing in the aterm tree uses any of the first four; the built-in patterns
+//! all pass.
 
 #![forbid(unsafe_code)]
 
@@ -254,11 +153,6 @@ use pikevm::Cache;
 /// Default ceiling on a compiled program, in bytes. Matches the `regex` crate's
 /// default so a call site that does not set one behaves the same.
 const DEFAULT_SIZE_LIMIT: usize = 10 * (1 << 20);
-
-/// Default lazy-DFA cache ceiling, in bytes. See
-/// [`RegexBuilder::dfa_size_limit`], which explains why this engine has no DFA
-/// for it to bound.
-const DEFAULT_DFA_SIZE_LIMIT: usize = 2 * (1 << 20);
 
 /// Default ceiling on the work one search may do, in units of
 /// `positions × live threads`. See [`RegexBuilder::step_limit`] for what a unit
@@ -300,8 +194,7 @@ impl std::fmt::Display for Error {
 /// would turn a refusal into a wrong answer, which is the worse of the two
 /// failures — a watcher that never latches or a search that quietly loses rows
 /// is a bug you cannot see. The fallible entry points
-/// ([`Regex::try_is_match`], [`Regex::try_find`], `Matches::step_limit_exceeded`)
-/// hand this back so a call site can decide; the infallible ones fail closed
+/// ([`Regex::try_is_match`], [`Regex::try_find`]) hand this back so a call site can decide; the infallible ones fail closed
 /// and record it on the [`Regex`] for [`Regex::step_limit_exceeded`] to read.
 ///
 /// This is not an [`Error`]: `Error` is what a *pattern* can be wrong about and
@@ -322,8 +215,7 @@ impl std::fmt::Display for StepLimitExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "regex search exceeded its step budget of {} work units before it \
-             could decide; the pattern is too expensive to run over this input",
+            "regex search exceeded its step budget of {} units",
             self.limit
         )
     }
@@ -386,7 +278,8 @@ impl Regex {
     /// decide. Nothing about the haystack is implied by that: the pattern may
     /// or may not match it.
     pub fn try_is_match(&self, text: &str) -> Result<bool, StepLimitExceeded> {
-        Ok(self.search(text, 0, true)?.is_some())
+        let mut budget = self.step_limit;
+        Ok(self.search(text, 0, true, &mut budget)?.is_some())
     }
 
     /// The leftmost-first match in `text`, if any.
@@ -406,8 +299,9 @@ impl Regex {
     /// decide. No partial span is returned: a truncated search has not
     /// established which match is leftmost-first.
     pub fn try_find<'t>(&self, text: &'t str) -> Result<Option<Match<'t>>, StepLimitExceeded> {
+        let mut budget = self.step_limit;
         Ok(self
-            .search(text, 0, false)?
+            .search(text, 0, false, &mut budget)?
             .map(|(start, end)| Match { text, start, end }))
     }
 
@@ -440,11 +334,14 @@ impl Regex {
     /// matches ending at the same offset in a row. Call sites that do not want
     /// empty matches filter them — `aterm-search` does exactly that.
     ///
-    /// **Fails closed**: if a search along the way exhausts the
-    /// [step budget](RegexBuilder::step_limit) the iterator ends there, and
-    /// `Matches::step_limit_exceeded` says so. A caller that treats the
-    /// yielded matches as the complete set without asking is reading a
-    /// truncated list.
+    /// The whole iteration is held to ONE [step budget](RegexBuilder::step_limit),
+    /// shared by the search it runs per match — see there for why a budget per
+    /// search bounds nothing.
+    ///
+    /// **Fails closed**: if the iteration exhausts that budget the iterator
+    /// ends there, and the sticky [`Regex::step_limit_exceeded`] records it. A caller that
+    /// treats the yielded matches as the complete set without asking is
+    /// reading a truncated list.
     #[must_use]
     pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
         Matches {
@@ -452,11 +349,13 @@ impl Regex {
             text,
             last_end: 0,
             last_match: None,
+            budget: self.step_limit,
             cut_short: false,
         }
     }
 
-    /// The leftmost-first match starting at or after byte offset `start`.
+    /// The leftmost-first match starting at or after byte offset `start`,
+    /// charged against `budget` and leaving it holding what remains.
     ///
     /// Assertions still see the whole haystack: `^` matches at offset 0 of
     /// `text`, not at `start`.
@@ -465,17 +364,17 @@ impl Regex {
         text: &str,
         start: usize,
         earliest: bool,
+        budget: &mut u64,
     ) -> Result<Option<(usize, usize)>, StepLimitExceeded> {
         thread_local! {
             /// Per-thread scratch for the simulation, so a scan over ten
             /// thousand rows allocates once rather than ten thousand times.
             static CACHE: RefCell<Cache> = RefCell::new(Cache::new());
         }
-        let limit = self.step_limit;
         let outcome = CACHE
             .try_with(|cell| {
                 cell.try_borrow_mut().ok().map(|mut cache| {
-                    pikevm::search(&self.prog, &mut cache, text, start, earliest, limit)
+                    pikevm::search(&self.prog, &mut cache, text, start, earliest, budget)
                 })
             })
             .ok()
@@ -484,14 +383,14 @@ impl Regex {
             // impossible (a search inside a `Drop` during thread teardown), and
             // a fresh cache is always correct — only slower.
             .unwrap_or_else(|| {
-                pikevm::search(&self.prog, &mut Cache::new(), text, start, earliest, limit)
+                pikevm::search(&self.prog, &mut Cache::new(), text, start, earliest, budget)
             });
         if outcome.is_err() {
             // Recorded here, in the one place every entry point funnels
             // through, so no caller can lose the fact by taking a shortcut.
             self.cut_short.store(true, Ordering::Relaxed);
         }
-        outcome
+        outcome.map_err(|_| StepLimitExceeded::new(self.step_limit))
     }
 }
 
@@ -572,6 +471,9 @@ pub struct Matches<'r, 't> {
     text: &'t str,
     last_end: usize,
     last_match: Option<usize>,
+    /// What is left of the ONE step budget the whole iteration shares. See
+    /// [`RegexBuilder::step_limit`] for why it is not one budget per search.
+    budget: u64,
     cut_short: bool,
 }
 
@@ -597,7 +499,10 @@ impl<'t> Iterator for Matches<'_, 't> {
             if self.last_end > self.text.len() {
                 return None;
             }
-            let (start, end) = match self.re.search(self.text, self.last_end, false) {
+            let searched = self
+                .re
+                .search(self.text, self.last_end, false, &mut self.budget);
+            let (start, end) = match searched {
                 Ok(found) => found?,
                 Err(_) => {
                     // Fail closed and stay closed: fuse the iterator so a
@@ -659,7 +564,6 @@ impl std::error::Error for Error {}
 pub struct RegexBuilder {
     pattern: String,
     size_limit: usize,
-    dfa_size_limit: usize,
     step_limit: u64,
     flags: Flags,
 }
@@ -671,7 +575,6 @@ impl RegexBuilder {
         Self {
             pattern: pattern.to_string(),
             size_limit: DEFAULT_SIZE_LIMIT,
-            dfa_size_limit: DEFAULT_DFA_SIZE_LIMIT,
             step_limit: DEFAULT_STEP_LIMIT,
             flags: Flags::default(),
         }
@@ -695,22 +598,14 @@ impl RegexBuilder {
     /// **This engine has no DFA.** A Pike VM simulates the NFA directly, which
     /// is what buys the linear-time guarantee, and it holds no cache that could
     /// grow: per-search memory is already bounded by
-    /// [`size_limit`](Self::size_limit) alone. The setting is accepted and
-    /// recorded — [`get_dfa_size_limit`](Self::get_dfa_size_limit) reads it
-    /// back — for source compatibility with the call sites that pass it, and it
-    /// is what a lazy DFA would be bounded by if one were ever added. It is
+    /// [`size_limit`](Self::size_limit) alone. The setting is accepted for
+    /// source compatibility with the call sites that pass it, and it is what a
+    /// lazy DFA would be bounded by if one were ever added. It is
     /// deliberately *not* silently repurposed as a second cap on the program:
     /// that would reject patterns the caller expected to compile.
     #[must_use]
-    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
-        self.dfa_size_limit = bytes;
+    pub fn dfa_size_limit(self, _bytes: usize) -> Self {
         self
-    }
-
-    /// Read back the value passed to [`dfa_size_limit`](Self::dfa_size_limit).
-    #[must_use]
-    pub fn get_dfa_size_limit(&self) -> usize {
-        self.dfa_size_limit
     }
 
     /// Ceiling on the work **one search** may do, in units of
@@ -730,10 +625,17 @@ impl RegexBuilder {
     /// which entry points fail closed.
     ///
     /// The budget is spent per call, not per `Regex`: every
-    /// [`find`](Regex::find), [`is_match`](Regex::is_match) and each step of a
-    /// [`find_iter`](Regex::find_iter) starts from a full one. Scanning a
-    /// thousand rows therefore costs at most a thousand budgets, which is what
-    /// makes the ceiling a per-row cost the caller can reason about.
+    /// [`find`](Regex::find), [`is_match`](Regex::is_match) and
+    /// [`find_iter`](Regex::find_iter) starts from a full one — and a
+    /// `find_iter` is ONE call, however many matches it yields. Its searches,
+    /// one per match, share the budget, because leftmost-first iteration can
+    /// re-walk the rest of the haystack in every one of them: `\w+=|\w` over a
+    /// run of `n` word characters has its one-character match in hand at once,
+    /// but must walk the higher-priority `\w+=` thread to the end of the run
+    /// before it may report it, `n` times — `n²/2` positions, with no single
+    /// search over `n`. Scanning a thousand rows therefore costs at most a
+    /// thousand budgets whatever the rows hold, which is what makes the
+    /// ceiling a per-row cost the caller can reason about.
     ///
     /// ## Choosing the default: 2^26 = 67,108,864 units
     ///
@@ -751,12 +653,12 @@ impl RegexBuilder {
     ///   all needs **~16.7M** units to cross one 4,096-column row
     ///   (`(?:x?){1020}z`, 19.3 ms). A pattern that compiles must be able to
     ///   run, so the default clears that with 4x to spare.
-    /// * Every built-in `aterm-selection` rule is *four orders of magnitude*
-    ///   below it. Over a full-width row of exactly the text each rule exists
-    ///   to find, and again over 3 MB of it, the most expensive single search
-    ///   any of them performs is **~3,100** units (the IPv6 rule); git hashes
-    ///   cost ~260, emails ~325, URLs ~590. Nothing aterm ships can notice this
-    ///   budget exists.
+    /// * Every built-in `aterm-selection` rule is over *two orders of
+    ///   magnitude* below it. Finding every match in a full-width row of
+    ///   exactly the text each rule exists to find — the whole `find_iter`,
+    ///   which is what one budget pays for — costs at most **~252,000** units
+    ///   (the IPv6 rule); git hashes cost ~19,000, emails ~45,000, file paths
+    ///   ~48,000, URLs ~34,000. Nothing aterm ships can notice this budget exists.
     ///
     /// What the default deliberately does *not* do is make one expensive row
     /// cheap: `(?:x?){2000}z` compiled under a 1 MiB ceiling costs 32.8M units
@@ -764,7 +666,8 @@ impl RegexBuilder {
     /// refusing the same pattern's 3 MB scan. Call sites that take their
     /// pattern *and* their content from outside pass something tighter —
     /// `aterm-observe` and `aterm-search` pass 2^22, about 4.8 ms per row,
-    /// which still clears the most expensive built-in rule by 1,000x.
+    /// which still clears every match of the most expensive built-in rule in a
+    /// full row by 16x.
     #[must_use]
     pub fn step_limit(mut self, steps: u64) -> Self {
         self.step_limit = steps;
@@ -820,7 +723,6 @@ pub fn escape(pattern: &str) -> String {
 #[cfg(test)]
 mod step_budget_tests {
     use super::*;
-    use std::time::Instant;
 
     /// The gate quoted in the bug report: the builder the untrusted-pattern
     /// call sites used when `(?:x?){2000}z` was measured at 42.7 ms per row and
@@ -848,32 +750,6 @@ mod step_budget_tests {
     }
     fn scrollback() -> String {
         "x".repeat(3 * 1024 * 1024)
-    }
-
-    /// Timed runs a budget row may take before it is judged.
-    const TIMING_ATTEMPTS: usize = 3;
-
-    /// The wall time of `scan`, the cheapest of up to [`TIMING_ATTEMPTS`]
-    /// runs, re-run only while the cheapest so far is at or over `bound`
-    /// (the load-sensitive test audit of 2026-09-27). The rows below bound a
-    /// FIXED number of Pike VM steps, and a single wall-clock sample charged
-    /// every moment a loaded gate held the thread off-core to those steps.
-    /// The thread CPU clock that fixes this elsewhere is out of reach here —
-    /// the crate forbids `unsafe` and has no dependencies — so the minimum
-    /// does the shedding: a stall has to strike every attempt to fail a row,
-    /// while a step that really got costlier inflates every attempt and still
-    /// fails it. A quiet run costs one attempt, as before.
-    fn cheapest_run(bound: std::time::Duration, mut scan: impl FnMut()) -> std::time::Duration {
-        let mut cheapest = std::time::Duration::MAX;
-        for _ in 0..TIMING_ATTEMPTS {
-            let started = Instant::now();
-            scan();
-            cheapest = cheapest.min(started.elapsed());
-            if cheapest < bound {
-                break;
-            }
-        }
-        cheapest
     }
 
     /// Does a whole `find_iter` over `haystack` finish inside `limit` units?
@@ -912,7 +788,7 @@ mod step_budget_tests {
     /// **The defect, at the budget the untrusted-pattern call sites pass.**
     /// Both amplifiers, through the exact gate they were measured on, over both
     /// haystacks — the 42.7 ms row and the 30.25 s scrollback — and every one
-    /// of the four now stops immediately and *says* it stopped.
+    /// of the four stops immediately and *says* it stopped.
     #[test]
     fn the_amplifiers_terminate_promptly_instead_of_hanging() {
         let row = row();
@@ -924,18 +800,10 @@ mod step_budget_tests {
                 .build()
                 .expect("the amplifiers compile under a 1 MiB ceiling — that is the problem");
             for (what, haystack) in [("row", &row), ("3 MB scrollback", &scrollback)] {
-                let bound = std::time::Duration::from_secs(2);
-                let elapsed = cheapest_run(bound, || {
-                    assert_eq!(
-                        re.try_is_match(haystack),
-                        Err(StepLimitExceeded::new(CALL_SITE_STEP_LIMIT)),
-                        "{pattern:?} on the {what} must report exhaustion"
-                    );
-                });
-                assert!(
-                    elapsed < bound,
-                    "{pattern:?} on the {what} took {elapsed:?} at best of \
-                     {TIMING_ATTEMPTS}; the budget is not bounding the scan"
+                assert_eq!(
+                    re.try_is_match(haystack),
+                    Err(StepLimitExceeded::new(CALL_SITE_STEP_LIMIT)),
+                    "{pattern:?} on the {what} must report exhaustion"
                 );
                 assert!(!re.is_match(haystack), "the infallible form fails closed");
             }
@@ -950,25 +818,15 @@ mod step_budget_tests {
     ///
     /// This is the honest boundary of the default, and the reason the call
     /// sites pass something tighter rather than inheriting it.
-    ///
-    /// The haystack is built once, outside the timed runs: 3 MB of
-    /// allocation and fill is not the scan the budget bounds.
     #[test]
     fn the_default_budget_stops_the_runaway_scan() {
         let scrollback = scrollback();
         for pattern in AMPLIFIERS {
             let re = one_mib_gate(pattern);
-            let bound = std::time::Duration::from_secs(5);
-            let elapsed = cheapest_run(bound, || {
-                assert_eq!(
-                    re.try_is_match(&scrollback),
-                    Err(StepLimitExceeded::new(DEFAULT_STEP_LIMIT)),
-                    "{pattern:?} over 3 MB took 30.25 s before the budget existed"
-                );
-            });
-            assert!(
-                elapsed < bound,
-                "{pattern:?} over 3 MB took {elapsed:?} at best of {TIMING_ATTEMPTS}"
+            assert_eq!(
+                re.try_is_match(&scrollback),
+                Err(StepLimitExceeded::new(DEFAULT_STEP_LIMIT)),
+                "{pattern:?} over 3 MB took 30.25 s before the budget existed"
             );
         }
     }
@@ -1022,10 +880,14 @@ mod step_budget_tests {
     #[test]
     fn find_iter_reports_truncation_and_fuses() {
         // Cheap prefix, then a run that costs more than the budget allows.
+        // The whole iteration shares the budget, so it has to cover all three
+        // cheap matches: each start thread walks the amplifier's ~4,000
+        // epsilon instructions, some 16,000 units per match. The run after
+        // them costs ~16M.
         let haystack = format!("ab ab ab {}", "x".repeat(4096));
         let re = RegexBuilder::new("ab|(?:x?){2000}z")
             .size_limit(1 << 20)
-            .step_limit(50_000)
+            .step_limit(200_000)
             .build()
             .expect("compiles");
         let mut it = re.find_iter(&haystack);
@@ -1039,33 +901,124 @@ mod step_budget_tests {
             it.step_limit_exceeded(),
             "and the truncation is on the record"
         );
-        let started = Instant::now();
         for _ in 0..1_000 {
             assert!(it.next().is_none(), "a truncated iterator is fused");
         }
-        assert!(
-            started.elapsed().as_millis() < 500,
-            "polling a fused iterator is free"
-        );
         assert!(
             re.step_limit_exceeded(),
             "the regex carries the fact for infallible callers"
         );
     }
 
+    /// A `find_iter` is ONE scan of its haystack and is held to ONE budget, not
+    /// one per match.
+    ///
+    /// Leftmost-first iteration can re-walk the haystack once per match: in
+    /// `\w+=|\w` over a run of `n` word characters with no `=`, every search
+    /// has its one-character `\w` match in hand after a single step, but the
+    /// higher-priority `\w+=` thread is still alive and must be walked to the
+    /// end of the run before that match may be reported. The `k`th search
+    /// walks `n - k` positions, so the iteration walks `n²/2` positions while no
+    /// single search walks more than `n`. A budget per search is then no bound
+    /// on the iteration at all — measured at the call sites' 2^22, release, one
+    /// 4,096-column row took 115 ms (24x the 4.8 ms per row the call sites
+    /// document) and a 16,384-column one 1.6 s, and neither reported anything.
+    ///
+    /// The counts make it exact without a clock: one search over the row fits
+    /// the budget many times over, the iteration's `n` searches do not.
+    #[test]
+    fn a_find_iter_is_held_to_one_budget_not_one_per_match() {
+        let row = row();
+        let n = row.len();
+        let re = RegexBuilder::new(r"\w+=|\w")
+            .size_limit(128 * 1024)
+            .step_limit(CALL_SITE_STEP_LIMIT)
+            .build()
+            .expect("compiles");
+
+        // One search walks the whole row, and is cheap.
+        let one_search = budget_needed_for_one_search(r"\w+=|\w", &row);
+        assert!(
+            one_search.saturating_mul(16) < CALL_SITE_STEP_LIMIT,
+            "one search over the row needs {one_search} units; the budget is {CALL_SITE_STEP_LIMIT}"
+        );
+        assert_eq!(
+            re.try_find(&row).map(|m| m.map(|m| m.range())),
+            Ok(Some(0..1))
+        );
+
+        // The iteration runs `n` such searches over a shrinking suffix: about
+        // `n / 2` searches' worth of walking, which no per-row budget covers.
+        let mut it = re.find_iter(&row);
+        let found = it.by_ref().count();
+        assert!(
+            it.step_limit_exceeded(),
+            "{found} of {n} matches yielded and no exhaustion reported: the \
+             iteration walked ~{} units against a budget of {CALL_SITE_STEP_LIMIT}",
+            u64::try_from(n / 2)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(one_search)
+        );
+        assert!(found < n, "a truncated iteration yields a prefix");
+        assert!(
+            re.step_limit_exceeded(),
+            "and records it for infallible callers"
+        );
+
+        // A linear iteration over the same row with the same budget is
+        // untouched: `\w` yields every one of its `n` matches.
+        let linear = RegexBuilder::new(r"\w")
+            .size_limit(128 * 1024)
+            .step_limit(CALL_SITE_STEP_LIMIT)
+            .build()
+            .expect("compiles");
+        let mut it = linear.find_iter(&row);
+        assert_eq!(it.by_ref().count(), n);
+        assert!(!it.step_limit_exceeded());
+    }
+
+    /// The smallest budget one `try_find` over `haystack` needs, to within 2%.
+    fn budget_needed_for_one_search(pattern: &str, haystack: &str) -> u64 {
+        let fits = |limit: u64| {
+            RegexBuilder::new(pattern)
+                .step_limit(limit)
+                .build()
+                .expect("compiles")
+                .try_find(haystack)
+                .is_ok()
+        };
+        let mut hi = 1u64;
+        while !fits(hi) {
+            hi = hi
+                .checked_mul(2)
+                .expect("a search this expensive is the bug");
+        }
+        let mut lo = hi / 2;
+        while lo / 64 + 1 < hi - lo {
+            let mid = lo + (hi - lo) / 2;
+            if fits(mid) { hi = mid } else { lo = mid }
+        }
+        hi
+    }
+
     /// The default budget is chosen to be invisible to everything aterm runs.
     /// This is the evidence for the number in [`RegexBuilder::step_limit`]'s
     /// docs: every built-in selection rule, over a full-width row of the text
-    /// it is designed to match and over a 3 MB scrollback of it, needs a tiny
-    /// fraction of the default.
+    /// it is designed to match and over a 1 MB scrollback of it, needs a tiny
+    /// fraction of the default — measured for the whole `find_iter`, which is
+    /// what one budget pays for.
     #[test]
     fn every_builtin_selection_rule_stays_far_inside_the_default() {
         // `aterm-selection`'s builtin_patterns.rs, verbatim, each paired with a
         // row of the content it exists to find (the expensive case for a rule
         // is text that keeps its threads alive, not text it rejects at once).
-        let rules: [(&str, &str); 8] = [
+        let rules: [(&str, &str); 11] = [
             (
-                r"(?:/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+|\.{1,2}/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+|[A-Za-z]:[/\\](?:[a-zA-Z0-9._-]+[/\\])*[a-zA-Z0-9._-]+)",
+                r#"(?i)(?:https?|ftp|file)://[^\s<>\[\](){}'"`,;|\\^]+[^\s<>\[\](){}'"`,;|\\^.!?:]"#,
+                "see https://example.com/path/to/page?q=1&r=2 and ftp://host/file ",
+            ),
+            (
+                r"(?:~|\.{1,2}|[a-zA-Z0-9._-]+)?(?:/[a-zA-Z0-9._-]+)+/?|[A-Za-z]:[/\\](?:[a-zA-Z0-9._-]+[/\\])*[a-zA-Z0-9._-]+",
                 "/usr/local/share/aterm/crates/aterm-regex/src/pikevm.rs ",
             ),
             (
@@ -1085,12 +1038,20 @@ mod step_budget_tests {
                 "commit 66390b5c8f2a1b3c4d5e6f7a8b9c0d1e2f3a4b5c landed ",
             ),
             (
+                r#""(?:[^"\\]|\\.)*""#,
+                "echo \"a quoted \\\"string\\\" here\" | cat ",
+            ),
+            (
                 r"'(?:[^'\\]|\\.)*'",
                 "echo 'a quoted \\'string\\' here' | cat ",
             ),
             (
                 r"`(?:[^`\\]|\\.)*`",
                 "run `git log --oneline` and `cargo test` ",
+            ),
+            (
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                "id 123e4567-e89b-12d3-a456-426614174000 done ",
             ),
             (
                 r"v?\d+\.\d+\.\d+(?:-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*)?(?:\+[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*)?",
@@ -1104,12 +1065,12 @@ mod step_budget_tests {
             // threads alive, not text it rejects at the first code point.
             let row: String = sample.repeat(4096 / sample.len() + 1);
             let per_row = budget_needed(pattern, &row);
-            println!("{per_row:>12} units/search  {pattern}");
+            println!("{per_row:>12} units/row  {pattern}");
             assert!(
-                per_row <= 4_096,
-                "{pattern:?} needs {per_row} units for one search over a full row; the docs \
-                 claim every built-in rule is four orders of magnitude under the default \
-                 budget of {DEFAULT_STEP_LIMIT}"
+                per_row <= CALL_SITE_STEP_LIMIT / 8,
+                "{pattern:?} needs {per_row} units to find every match in a full row; the \
+                 docs claim every built-in rule is far inside even the call sites' budget of \
+                 {CALL_SITE_STEP_LIMIT}, let alone the default of {DEFAULT_STEP_LIMIT}"
             );
             // And under the default the rule simply works, over a full row and
             // over a 1 MB scrollback of the same, with nothing cut off.

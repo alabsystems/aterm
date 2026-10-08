@@ -7,8 +7,6 @@
 //! Proves the fundamental bloom filter invariant: no false negatives.
 //! After `insert(s)`, `might_contain(s)` MUST return `true`.
 //! Also proves bit-index bounds safety and capacity invariants.
-//!
-//! Part of #2679.
 
 use super::*;
 

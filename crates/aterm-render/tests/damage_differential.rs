@@ -38,15 +38,17 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{DamageOutcome, Frame, Renderer, Theme, WindowCpu};
 
-fn renderer() -> Option<Renderer> {
-    Renderer::from_system(18.0, Theme::default()).map(|mut r| {
-        // Deterministic differential: block on the lazy fallback parses so the
-        // warm-cache renderer and every fresh oracle rasterize the CJK step
-        // identically (no provisional `.notdef` race; the global intern makes
-        // every block after the first instant).
-        r.debug_block_on_lazy_fallbacks();
-        r
-    })
+fn renderer() -> Renderer {
+    Renderer::from_system(18.0, Theme::default())
+        .map(|mut r| {
+            // Deterministic differential: block on the lazy fallback parses so the
+            // warm-cache renderer and every fresh oracle rasterize the CJK step
+            // identically (no provisional `.notdef` race; the global intern makes
+            // every block after the first instant).
+            r.debug_block_on_lazy_fallbacks();
+            r
+        })
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// The WARM ARM's persistent state: the renderer PLUS its per-window damage
@@ -65,15 +67,15 @@ struct DamageRig {
     scroll_frames: usize,
 }
 
-fn rig() -> Option<DamageRig> {
-    renderer().map(|r| DamageRig {
-        r,
+fn rig() -> DamageRig {
+    DamageRig {
+        r: renderer(),
         wc: WindowCpu::new(),
         full_frames: 0,
         gate_frames: 0,
         rows_frames: 0,
         scroll_frames: 0,
-    })
+    }
 }
 
 /// The renderer-owned state a frame is drawn with. Both the persistent and the
@@ -136,7 +138,7 @@ fn assert_identical(
         DamageOutcome::Scroll { .. } => damaged.scroll_frames += 1,
     }
 
-    let mut fresh = renderer().expect("font available (checked by caller)");
+    let mut fresh = renderer();
     fresh.set_cursor_blink_phase(st.blink_phase);
     fresh.set_cursor_style_override(st.cursor_override);
     let full: Frame = fresh.render_input(&input);
@@ -176,10 +178,7 @@ fn assert_identical(
 /// system font is present, matching the other renderer tests' SKIP convention.
 #[test]
 fn damage_path_is_byte_identical_to_full_repaint() {
-    let Some(mut dmg) = rig() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut dmg = rig();
 
     let (rows, cols) = (6usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -362,10 +361,7 @@ fn damage_path_is_byte_identical_to_full_repaint() {
 /// This is the dominant interactive case the optimization targets.
 #[test]
 fn warm_single_cell_typing_is_identical() {
-    let Some(mut dmg) = rig() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut dmg = rig();
     let (rows, cols) = (4usize, 40usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     let st = RState::default();

@@ -10,24 +10,11 @@
 //! lifecycles a person meets are walked by name. Tier-1 is
 //! `crates/aterm-keeper/src/conformance_custody.rs`.
 
+use crate::walk::{only, walk};
 use aterm_spec::derive::{
-    Model, keeper_death_judgement_model, keeper_relaunch_brake_model, pty_keeper_custody_model,
+    keeper_death_judgement_model, keeper_relaunch_brake_model, pty_keeper_custody_model,
 };
 use aterm_spec::{interp, verify};
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
-
-fn walk(m: &Model, actions: &[&str]) -> interp::State {
-    let mut state = m.init_state();
-    for action in actions {
-        assert!(m.fire(action, &mut state), "{action}: {state:?}");
-    }
-    state
-}
 
 fn registered(name: &str) -> bool {
     aterm_spec::xref::model_registry()
@@ -54,6 +41,7 @@ fn pty_keeper_custody_proves_and_catches() {
         "Rollback",
         "SuccessorFailStops",
         "SuccessorCrashes",
+        "SuccessorCrashesFirst",
         "Relaunch",
         "OfferA",
         "OfferB",

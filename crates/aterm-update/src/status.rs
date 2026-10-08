@@ -203,7 +203,7 @@ pub(crate) fn latest_tag(
 /// [`latest_tag`], which answers only the build that recorded it: the head-in-flight
 /// count is machine-wide (`check_receipt`), so the predicate it counts must give
 /// every build the same answer, or one build's checks start the ladder that
-/// another's reset (the review of 2026-09-25, F7).
+/// another's reset.
 pub(crate) fn authorized_tag(staging: &Staging, source: &crate::Source) -> Option<String> {
     read_latest(staging)
         .filter(|latest| latest.source.eq_ignore_ascii_case(&source_slug(source)))
@@ -256,13 +256,10 @@ fn clear_delivery() {
 
 /// A scratch path no other in-flight writer of this record can be holding.
 ///
-/// The rename is what makes the write atomic; picking the SOURCE file is what has to
-/// be exclusive, and a per-pid name only got that half right. It separates processes,
-/// but [`record`] is called from several lanes inside one process — the background
-/// check, the apply path and the control socket — so two threads could land on the
-/// same `status.toml.<pid>.tmp`: the loser's `write` truncates and rewrites the file
-/// the winner is about to rename, and the winner publishes the loser's (or a spliced)
-/// bytes. The counter closes that, so each writer renames exactly what it wrote (F18).
+/// The rename makes the write atomic; the SOURCE file must also be exclusive. A pid
+/// separates processes, but [`record`] runs on several lanes inside one process (the
+/// background check, the apply path, the control socket), so the counter makes each
+/// writer rename exactly what it wrote.
 fn temp_path(staging: &Staging) -> PathBuf {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -273,18 +270,15 @@ fn temp_path(staging: &Staging) -> PathBuf {
 
 /// A note a check wants carried onto EVERY status record it writes after a
 /// notable event — a revocation retiring a staged build — because `status.toml` is
-/// a single overwritten line and the check goes on to record its terminal outcome
-/// moments later, which used to erase the one sentence that explained where the
-/// stage went (2026-08-19 round-2 audit). Set by the event, cleared at the start of
-/// the next check.
+/// a single overwritten line and the check's terminal outcome, recorded moments
+/// later, would otherwise erase the sentence that explains where the stage went. Set
+/// by the event, cleared at the start of the next check.
 #[cfg(not(test))]
 static CHECK_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 // Under test the note is per THREAD: the harness runs tests concurrently on its own
 // threads, and a test that retires a revoked stage (which sets the note) otherwise
-// leaks "held: staged … signed by machine …" onto another test's status line —
-// measured 2026-09-29 as an intermittent failure of
-// `a_stage_that_already_covers_the_candidate_records_the_staged_decision`.
+// leaks its note onto another test's status line.
 #[cfg(test)]
 thread_local! {
     static CHECK_NOTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -372,11 +366,8 @@ pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
     if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &staging.status).is_ok() {
         return;
     }
-    // BOTH arms have to reclaim. Under the old per-pid name a leaked scratch was
-    // overwritten by the next `record`, so a failed rename cost one stale file forever-at-
-    // most; a per-writer name has no such self-healing, and every rename failure (a
-    // `status.toml` replaced by a directory, a permissions fault on `Updates/`) would
-    // strand a distinct `status.toml.<pid>.<seq>.tmp` that nothing sweeps.
+    // BOTH arms reclaim: a per-writer scratch name is never reused, so a failed
+    // write or rename would strand a `status.toml.<pid>.<seq>.tmp` nothing sweeps.
     let _ = std::fs::remove_file(&tmp);
 }
 
@@ -483,6 +474,7 @@ mod tests {
             changelog: None,
             machine_id: None,
             roster_seq: None,
+            roster_confirmed_at: Some(crate::install::now_rfc3339()),
         };
         std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
 
@@ -687,6 +679,7 @@ mod tests {
             changelog: None,
             machine_id: None,
             roster_seq: None,
+            roster_confirmed_at: Some(crate::install::now_rfc3339()),
         };
         let contents = staging.staged_app.join("Contents");
         std::fs::create_dir_all(&contents).unwrap();
@@ -805,6 +798,6 @@ mod tests {
         std::fs::remove_file(&staging.ready).unwrap();
         assert!(cache_decision_matches_model(&staging, 1, &source));
         clear_check_note();
-        let _ = std::fs::remove_dir_all(staging.root);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 }

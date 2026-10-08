@@ -25,36 +25,31 @@
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{
     ColumnGlyph, Frame, LigatureMode, Renderer, Scale, TextShapingConfig, Theme, clip_span,
-    cursor_cutout_cols, cursor_rects, glyph_quad,
+    cursor_cutout_cols, for_each_cursor_rect, glyph_quad,
 };
 
 const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
 const BG: u32 = 0x0011_1318; // Theme::default().bg
 
-// Layout-independent ligature font discovery (same as tests/ligatures.rs):
-// $ATERM_LIGATURE_TEST_FONT if set, else the committed JetBrains Mono fixture.
-// None -> SKIP.
-fn ligature_test_font() -> Option<Vec<u8>> {
+// The ligature test font (same as tests/ligatures.rs): $ATERM_LIGATURE_TEST_FONT
+// if set and readable, else the committed JetBrains Mono fixture (compiled in).
+fn ligature_test_font() -> Vec<u8> {
     if let Ok(path) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         && let Ok(bytes) = std::fs::read(&path)
     {
-        return Some(bytes);
+        return bytes;
     }
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/jetbrains-mono.ttf"
-    );
-    std::fs::read(FIXTURE).ok()
+    include_bytes!("fixtures/jetbrains-mono.ttf").to_vec()
 }
 
-fn renderer() -> Option<Renderer> {
-    let bytes = ligature_test_font()?;
-    let mut r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).ok()?;
+fn renderer() -> Renderer {
+    let mut r = Renderer::from_bytes(&ligature_test_font(), 18.0, Theme::default())
+        .expect("the ligature test font parses");
     r.set_text_shaping(TextShapingConfig {
         ligature_mode: LigatureMode::Enabled,
         ..Default::default()
     });
-    Some(r)
+    r
 }
 
 const ROWS: usize = 1;
@@ -63,8 +58,8 @@ const COLS: usize = 12;
 // plain cell, a wide CJK lead + continuation (cols 5-6) and trailing blanks.
 const TEXT: &[u8] = "a=>b \u{65E5}x".as_bytes(); // 日 = U+65E5 (wide)
 
-/// Render TEXT with the cursor placed at `col` under DECSCUSR `style_code`
-/// (2=block, 4=underline, 6=bar), or hidden entirely when `col` is None.
+/// Render TEXT with a steady-block cursor at `col` (callers reshape it through
+/// the renderer override), or hidden entirely when `col` is None.
 fn frame_with_cursor(r: &mut Renderer, col: Option<usize>) -> Frame {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"\x1b[2 q"); // steady block (override below can reshape)
@@ -82,7 +77,7 @@ fn frame_with_cursor(r: &mut Renderer, col: Option<usize>) -> Frame {
 }
 
 /// The exact pixel rects the cursor paints for `style` at `col` — the SAME
-/// geometry the renderer uses: `cursor_rects` over the (block-widened on a
+/// geometry the renderer uses: `for_each_cursor_rect` over the (block-widened on a
 /// wide lead) cursor width. `wide_lead` mirrors `draw_cursor`'s probe.
 fn cursor_rect_union(
     style: CursorStyle,
@@ -93,7 +88,9 @@ fn cursor_rect_union(
 ) -> Vec<[usize; 4]> {
     let is_block = matches!(style, CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock);
     let cur_w = if is_block && wide_lead { 2 * cw } else { cw };
-    cursor_rects(style, col * cw, 0, cur_w, ch)
+    let mut rects = Vec::new();
+    for_each_cursor_rect(style, col * cw, 0, cur_w, ch, |rect| rects.push(rect));
+    rects
 }
 
 fn in_rects(rects: &[[usize; 4]], x: usize, y: usize) -> bool {
@@ -111,7 +108,7 @@ fn in_rects(rects: &[[usize; 4]], x: usize, y: usize) -> bool {
 /// pixels inside its rect (the cursor is really drawn).
 ///
 /// `Bolt` is in the sweep and is the reason the word "every" is safe to write.
-/// It is the only style whose `cursor_rects` arm emits ONE strip PER PIXEL ROW
+/// It is the only style whose `for_each_cursor_rect` arm emits ONE strip PER PIXEL ROW
 /// with a per-row-varying x and width; every other arm emits 1 or 4
 /// axis-aligned rects. It also arrives via `set_cursor_style_override` rather
 /// than a DECSCUSR parameter, so it is invisible to anyone enumerating escape
@@ -120,12 +117,7 @@ fn in_rects(rects: &[[usize; 4]], x: usize, y: usize) -> bool {
 /// steady shape must be added here by hand.
 #[test]
 fn cursor_touches_only_its_rect_all_columns_and_styles() {
-    let Some(mut r) = renderer() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let hidden = frame_with_cursor(&mut r, None);
     let styles = [
@@ -183,12 +175,7 @@ fn cursor_touches_only_its_rect_all_columns_and_styles() {
 /// ink), which this pin catches.
 #[test]
 fn block_on_ligature_tail_leaves_lead_cell_identical() {
-    let Some(mut r) = renderer() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let hidden = frame_with_cursor(&mut r, None);
     let cursor_on_gt = frame_with_cursor(&mut r, Some(2)); // '>' cell of '=>'
@@ -224,12 +211,7 @@ fn block_on_ligature_tail_leaves_lead_cell_identical() {
 /// recoloured ink, and (from the sweep invariant) the '>' cell is untouched.
 #[test]
 fn block_on_ligature_lead_recolors_covering_slice() {
-    let Some(mut r) = renderer() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let hidden = frame_with_cursor(&mut r, None);
     let f = frame_with_cursor(&mut r, Some(1)); // '=' cell of '=>'
@@ -264,12 +246,7 @@ fn block_on_ligature_lead_recolors_covering_slice() {
 /// ideograph's right half (bg-on-bg in the continuation cell, no cursor there).
 #[test]
 fn block_on_wide_lead_inverts_both_cells() {
-    let Some(mut r) = renderer() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let hidden = frame_with_cursor(&mut r, None);
     let f = frame_with_cursor(&mut r, Some(5)); // 日 lead cell

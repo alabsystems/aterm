@@ -29,7 +29,8 @@
 //! falls back, in order:
 //!
 //! 1. the embedded atpkg path, if it exists and is executable;
-//! 2. `command -v atpkg` (the `~/.local/bin` alias / shell hook);
+//! 2. the first `atpkg` an absolute `PATH` entry names (the `~/.local/bin` alias / shell
+//!    hook), never a relative or empty entry's;
 //! 3. a static honest message — and exit 127.
 //!
 //! The per-launch seed-pass reconcile REWRITES stubs whose bytes changed, refreshing
@@ -119,9 +120,9 @@ pub const DEFAULT_SET_STUB_NAMES: &[(&str, &str)] = &[
 /// was retired). What is theirs alone, each enforced where it lives:
 ///
 /// * their shims are ALSO laid under `<prefix>/agents/`, the one managed directory
-///   that goes FIRST on `PATH` ([`crate::activate::lay_agent_shims`]), so the managed
+///   that goes FIRST on `PATH` ([`crate::activate::reconcile_agents`]), so the managed
 ///   copy is what `claude`/`codex` run — the rule-1 exception recorded in
-///   docs/design/DESIGN-which-copy-runs;
+///   docs/DESIGN-which-copy-runs-2026-08-27.md;
 /// * a pass that leaves them at the index pin says so on stdout
 ///   (`crate::cli::MANAGED_CURRENT_MARKER`).
 ///
@@ -171,9 +172,7 @@ pub const STUB_UNREACHABLE_MSG: &str =
 
 /// Single-quote `s` for safe embedding in a `/bin/sh` script (the POSIX `'\''`
 /// escape). [`crate::store::shim_allowed`] does not forbid shell metacharacters, so
-/// the stub body must never let a crafted name break out of its quotes. (A local
-/// twin of the platform backend's private helper — same rule, one screen away from
-/// its use.)
+/// the stub body must never let a crafted name break out of its quotes.
 pub(crate) fn sh_single_quote(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
@@ -187,7 +186,7 @@ pub(crate) fn sh_single_quote(s: &str) -> String {
     out
 }
 
-/// The inverse of [`sh_single_quote`] (and of the platform backend's twin, the same rule):
+/// The inverse of [`sh_single_quote`]:
 /// the text a word made of `'…'` runs and `\'` escapes stands for, or `None` for any other
 /// spelling — a value this crate did not quote is never guessed at.
 fn sh_single_unquote(word: &str) -> Option<String> {
@@ -281,9 +280,17 @@ fn stub_content_sh(tool: &ToolName, atpkg: &Path) -> String {
     // `claude -p 'x'` typed during the install must reach it whole.
     s.push_str("\nif [ -x \"$ATPKG\" ]; then\n  exec \"$ATPKG\" __pending ");
     s.push_str(&name);
-    s.push_str(" \"$@\"\nfi\nif command -v atpkg >/dev/null 2>&1; then\n  exec atpkg __pending ");
-    s.push_str(&name);
-    s.push_str(" \"$@\"\nfi\nprintf '%s\\n' ");
+    s.push_str(" \"$@\"\nfi\n");
+    // The first atpkg an ABSOLUTE PATH entry names, by the reroute stub's own walk: the
+    // shell's `command -v atpkg` honoured a relative or empty entry, so with no live
+    // embedded atpkg the stub ran the current directory's `./atpkg` (2026-10-01 review).
+    s.push_str(&crate::reroute::sh_path_walk(
+        "",
+        "atpkg",
+        &format!("__pending {name} "),
+        &[],
+    ));
+    s.push_str("printf '%s\\n' ");
     s.push_str(&sh_single_quote(STUB_UNREACHABLE_MSG));
     s.push_str(" 1>&2\nexit 127\n");
     s
@@ -811,13 +818,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-stub-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-stub-{label}-"))
     }
 
     fn tool(name: &str) -> ToolName {
@@ -913,7 +915,7 @@ mod tests {
         assert!(body.starts_with("#!/bin/sh\n"));
         assert!(body.contains(STUB_MARKER));
         let atpkg_pos = body.find("[ -x \"$ATPKG\" ]").unwrap();
-        let command_v = body.find("command -v atpkg").unwrap();
+        let command_v = body.find("exec \"$__d/atpkg\" __pending").unwrap();
         // The message embeds sh-quoted (its apostrophe becomes '\''), so probe a
         // quote-free distinctive slice of it.
         let static_msg = body.find("package manager is not reachable").unwrap();
@@ -1117,8 +1119,7 @@ mod tests {
     /// squats its own bin dir.
     #[test]
     fn rem_marker_recognition_round_trips() {
-        let dir = std::env::temp_dir().join(format!("atpkg-stub-rem-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::dir("atpkg-stub-rem-");
         let path = dir.join("trust.cmd");
         std::fs::write(
             &path,
@@ -1330,7 +1331,8 @@ mod tests {
     }
 
     /// The fallback chain END-TO-END, run through a real `/bin/sh`: a live embedded
-    /// atpkg wins; a dangling embedded path falls back to `command -v atpkg`; with
+    /// atpkg wins; a dangling embedded path falls back to the first absolute-entry atpkg on
+    /// PATH (never a relative or empty entry's); with
     /// neither reachable the static honest message lands on stderr with exit 127.
     #[cfg(unix)]
     #[test]
@@ -1392,6 +1394,24 @@ mod tests {
         );
         assert_eq!(out.status.code(), Some(127));
         assert!(String::from_utf8_lossy(&out.stderr).contains(STUB_UNREACHABLE_MSG));
+        // ... and never an atpkg a RELATIVE or EMPTY PATH entry names (2026-10-01 review):
+        // run from the directory holding one, `.` and a stray `:` both mean it, and the
+        // stub still answers 3.
+        let script = l.prefix.join("stub-under-test");
+        std::fs::write(&script, stub_content(&t, None)).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for path_env in ["/nonexistent:.", "/nonexistent:"] {
+            let out = std::process::Command::new(&script)
+                .current_dir(&path_dir)
+                .env("PATH", path_env)
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{path_env:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(STUB_UNREACHABLE_MSG),
+                "{path_env:?}: {out:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1600,8 +1620,11 @@ mod tests {
                 Some(PathBuf::from(path)),
                 "{twin}"
             );
-            let reroute = crate::reroute::stub_body_sh("cargo", Path::new(path), Path::new("/r"));
-            assert_eq!(sh_named_atpkg(&reroute, "ATPKG"), Some(PathBuf::from(path)));
+            for strict in [false, true] {
+                let reroute =
+                    crate::reroute::stub_body_sh("cargo", Path::new(path), Path::new("/r"), strict);
+                assert_eq!(sh_named_atpkg(&reroute, "ATPKG"), Some(PathBuf::from(path)));
+            }
         }
         let cmd = stub_content_cmd(&t, Path::new(r"C:\Program Files\aterm\atpkg.exe"));
         assert_eq!(
@@ -1772,20 +1795,14 @@ mod tests {
         if std::env::var_os(LAY_AS_COPY_ENV).is_some() {
             return;
         }
-        let root = std::env::temp_dir().join(format!("atpkg-lay-as-copy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
         // Removed however the test ends — a failed run leaves no copies of this binary
         // (tens of MB each) behind in the temp dir.
-        struct RemoveOnDrop(std::path::PathBuf);
-        impl Drop for RemoveOnDrop {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _cleanup = RemoveOnDrop(root.clone());
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("atpkg-lay-as-copy-")
+            .tempdir()
+            .unwrap();
         // Canonical, as the lay spells an atpkg path: `current_exe` resolved.
-        let root = std::fs::canonicalize(&root).unwrap();
+        let root = std::fs::canonicalize(scratch.path()).unwrap();
         let l = Layout {
             prefix: root.join("prefix"),
         };

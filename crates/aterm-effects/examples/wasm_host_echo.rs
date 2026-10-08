@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TEMPORARY DIAGNOSTIC (2026-09-13, WASM host analyst) — the alab.systems
-//! /terminal page, headless: boot.js's key seam + alab-sh's line discipline +
-//! aterm-wasm's render loop, driven against the REAL `EffectsPipeline`, so the
-//! Rainbow Kitty v2 bed (`RenderInput::glow_under`) can be read per column
-//! after every frame. Reproduces what the page does on keydown, Backspace,
-//! Enter, arrows and Ctrl-A, and prints where the ribbon lands.
+//! Diagnostic: the alab.systems /terminal page, headless. Reproduces boot.js's
+//! key seam, alab-sh's line discipline and aterm-wasm's render loop against the
+//! real `EffectsPipeline`, and prints the Rainbow Kitty v2 bed
+//! (`RenderInput::glow_under`) per column after each frame for keydown,
+//! Backspace, Enter, arrows and Ctrl-A.
 //!
-//! The page's seam, verbatim from /assets/term/boot.js `userInput`:
-//!   - a printable: `sh.write(bytes)` (echo buffered), THEN
-//!     `term.note_typed_char(ch)`, THEN `flushShell()` → `process_str(echo)`.
+//! The page's seam (/assets/term/boot.js `userInput`):
+//!   - a printable: `sh.write(bytes)` (echo buffered), then
+//!     `term.note_typed_char(ch)`, then `flushShell()` → `process_str(echo)`.
 //!   - any other key (Backspace/Enter/arrows/^A/^K/^U): `term.note_keystroke()`
-//!     (TEXT-BLIND), `sh.write(bytes)`, `process_str(echo)`. No erase seam.
+//!     (text-blind), `sh.write(bytes)`, `process_str(echo)`. No erase seam.
 //!   - a rAF frame: `advance_effects(dt)`, `render()` → `effects.apply`.
 //!
-//! alab-sh's echoes, verbatim from /assets/term/alab-sh.js:
+//! alab-sh's echoes (/assets/term/alab-sh.js):
 //!   - insert:    ch + (tail ? tail + CSI n D : "")
 //!   - backspace: "\b" + CSI K + (tail ? tail + CSI n D : "")
 //!   - moveTo:    CSI d C | CSI d D
@@ -440,10 +439,9 @@ impl Page {
                 slits.join(" | ")
             );
         }
-        // BAND-HEIGHT NOTCHES and SPINE-LUMA DIPS per px column: a "dark slit"
-        // that is not an uncovered column shows up as a px column whose
-        // covered height is below both neighbours', or whose spine colour is
-        // much darker than both neighbours'.
+        // Band-height notches and spine-luma dips per px column: a dark slit
+        // that is not an uncovered column shows as a px column whose covered
+        // height, or spine colour, is well below both neighbours'.
         if let (Some(f), Some(l)) = (first, last) {
             let x0 = f * CW();
             let x1 = (l + 1) * CW();

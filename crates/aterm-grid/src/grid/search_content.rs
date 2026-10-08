@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! `SearchContent` adapter for `Grid`.
-//!
-//! Moved from aterm-core as part of the grid ownership transfer (#6554).
-//! The orphan rule requires this impl to live in the same crate as `Grid`.
+//! `SearchContent` adapter for `Grid` (here because of the orphan rule).
 
 use super::Grid;
 use aterm_types::SearchContent;

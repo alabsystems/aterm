@@ -161,10 +161,8 @@ impl ExtendedStyle {
         }
     }
 
-    /// Convert back to PackedColors.
-    ///
-    /// Note: For RGB colors, the actual RGB values are stored separately.
-    /// This method only sets the color mode indicators.
+    /// Convert back to PackedColors (only the colour modes for RGB; the values
+    /// are stored separately).
     #[must_use]
     pub fn to_packed_colors(self) -> PackedColors {
         let mut colors = PackedColors::DEFAULT;
@@ -194,14 +192,8 @@ impl ExtendedStyle {
 }
 
 impl StyleTable {
-    /// Intern a style, returning its ID.
-    ///
-    /// If the style already exists, increments its reference count and returns
-    /// the existing ID. Otherwise, creates a new style entry.
-    ///
-    /// # Performance
-    ///
-    /// O(1) average case (hash lookup).
+    /// Intern a style, returning its ID: an existing style gains a reference,
+    /// a new one gets an entry. O(1) average (hash lookup).
     pub fn intern(&mut self, style: Style) -> StyleId {
         count_style_intern_op();
 

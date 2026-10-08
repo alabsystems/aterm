@@ -21,63 +21,50 @@ const RESULT_HOLD: f32 = 1.20;
 const REACTION_TTL: f32 = 2.0;
 const CLEARANCE: f32 = 0.10;
 const CONTACT_MARGIN: f32 = 0.45;
+/// The most cells of one frame's typing [`typed_run`] discounts from contact.
+const TYPED_RUN_MAX: usize = 4;
 const PERCH_REACH: f32 = 24.0;
 /// The caret is home. Located output may direct the gaze, but must not park
 /// the resident across the pane. Rows cost twice a column in this bound.
 const HOME_REACH: f32 = 6.0;
 
-/// How long the resident holds still for an UNPAINTED caret before the
-/// ordinary ladder takes over again.
-///
-/// A DECTCEM hide means "I am repainting", and a repaint is milliseconds — the
-/// fake-Claude fixture brackets one per frame at ~6/s, and a synchronized
-/// output bracket is shorter still. So a quarter second is many repaints' worth
-/// of patience and still nothing a person would call a pause.
-///
-/// It is a BOUND rather than a latch because the old hold had none: the cat sat
-/// frozen for as long as the program kept its cursor hidden — measured at
-/// 20.04 s and 20.15 s on v0.88.0, which is a `cargo build`, a `git clone`, a
-/// pager or an LLM reply, not a repaint. Past this bound the caret is still
-/// known (the host feeds it hidden or not), so the pet simply follows it.
+/// How long the resident holds still for an unpainted caret before the
+/// ordinary ladder takes over again. A DECTCEM hide means "I am repainting",
+/// which takes milliseconds, so a quarter second is many repaints' worth of
+/// patience. Past it the caret is still known (the host feeds it hidden or
+/// not), so the pet follows it rather than sitting through a long build or
+/// pager with its cursor hidden.
 const HIDDEN_HOLD_MAX: f32 = 0.25;
 
-/// How long a SPENT interest — a content perch with no live event left to
-/// react to — may hold the resident before the pet is handed back its own
-/// life. The perch is a visit, not a tenancy: without this the console layer
-/// answers `console_frames() == Some(false)` and `console_deadline() == None`
-/// forever, which is a pet with no future at all — it can never breathe,
-/// blink, settle, sleep, or notice that the caret has walked away.
+/// How long a spent interest (a content perch with no live event left) may
+/// hold the resident before the pet gets its own life back. Without it the
+/// console layer would answer `console_frames() == Some(false)` and
+/// `console_deadline() == None` forever, and the pet could never breathe,
+/// blink, settle, sleep or notice the caret leaving.
 const PERCH_DWELL: f32 = 3.0;
 
-/// THE VISIBILITY HOLD's dwell, in BOTH directions.
-///
-/// v0.81.0 made the pet's presence a per-frame boolean function of screen
-/// content. Measured on glass over one 1.67 s typing burst, the cat's alpha
-/// ran 1.00, 0.00, 0.17, 0.29, 0.57, 0.43, 0.37, 0.29, 0.67, 0.45, 0.67,
-/// 0.51, 0.00 — six direction reversals in 950 ms, a half-period of ~158 ms.
-/// A hold shorter than that half-period does not remove the strobe, it only
-/// slows it; this is 1.6x longer. It is also the budget the pet has to WALK
-/// out of the way before it has to fade instead, which is why it is not
-/// longer still.
+/// The visibility hold's dwell, in both directions. Per-frame presence from
+/// screen content can reverse every ~158 ms during typing; a shorter hold
+/// only slows that strobe, so this is 1.6x longer. It is also the budget the
+/// pet has to walk out of the way before it must fade instead.
 const VETO_DWELL: f32 = 0.25;
-/// A HARD CUT is what the owner saw. When an obstruction is real and
-/// sustained the pet yields over a RAMP instead — a fifth of a second, which
-/// reads as the cat stepping aside and is short enough that it is not
-/// painting over the user's text for half a second first. The ramp back IN
-/// is normally the pet's own 0.30 s arrival fade, because a body hidden long
-/// enough to be reseated returns at a NEW station (see
-/// `reseat_unshown_console_body`), and a station change retires the verdict
-/// this envelope was holding.
+/// When an obstruction is real and sustained the pet yields over a ramp, not a
+/// hard cut: a fifth of a second reads as the cat stepping aside without
+/// painting over the user's text for long. The ramp back in is normally the
+/// pet's own 0.30 s arrival fade, because a body hidden long enough to be
+/// reseated returns at a new station (`reseat_unshown_console_body`), which
+/// retires the held verdict.
 const VETO_FADE: f32 = 0.20;
-/// Blindness is not a licence to stay forever. "I cannot see there" keeps the
-/// previous verdict — that is the entire point of the three-valued answer —
-/// but an unbroken run of unknowns this long (a surface that never regains
-/// coherence) finally counts as obstruction, so a retired world can never
-/// strand an opaque pet on glass.
-///
-/// This counts only unknowns about a body THAT IS BEING EMITTED. A frame with
-/// no body at all goes to [`VisibilityHold::idle`] and never reaches here.
+/// An unbroken run of unknown verdicts this long (a surface that never
+/// regains coherence) counts as obstruction, so a retired world cannot strand
+/// an opaque pet on glass. Counts only unknowns about a body being emitted; a
+/// frame with no body goes to [`VisibilityHold::idle`].
 const VETO_BLIND: f32 = 0.50;
+/// Coming back IN FRONT of the glyphs waits this long with the drawn body
+/// clear of ink. [`VETO_DWELL`]'s reasoning — longer than a keystroke's
+/// half-period, so a body crossing the last typed glyph on every key cannot
+/// strobe — and its value, so the two perception holds cannot drift apart.
+const Z_DWELL: f32 = VETO_DWELL;
 
 /// What the resident does about a body beside a live caret — see
 /// [`PetBrain::caret_seat`].
@@ -92,18 +79,18 @@ enum CaretSeat {
     Yield,
 }
 
-/// The pet's presence as a HELD STATE rather than a per-frame boolean.
+/// The pet's presence as a held state rather than a per-frame boolean.
 ///
-/// Fed the three-valued clearance verdict for the emitted sprite rectangle,
-/// it answers with a 0..=1 cover factor. Two properties do the work:
+/// Fed the three-valued clearance verdict for the emitted sprite rectangle, it
+/// answers a 0..=1 cover factor:
 ///
 ///  * an `Unknown` verdict neither flips the state nor resets a run in
-///    progress — it is not evidence, so it cannot blank the pet;
+///    progress;
 ///  * contrary evidence must persist for [`VETO_DWELL`] before the held
-///    verdict changes, and the cover then RAMPS over [`VETO_FADE`].
+///    verdict changes, and the cover then ramps over [`VETO_FADE`].
 ///
-/// A single obstructed frame therefore cannot blank the pet, and a single
-/// clear frame cannot snap it back on.
+/// So a single obstructed frame cannot blank the pet, and a single clear
+/// frame cannot snap it back.
 #[derive(Clone, Copy, Debug)]
 struct VisibilityHold {
     /// The held verdict: may the pet be on glass at all?
@@ -116,16 +103,11 @@ struct VisibilityHold {
     cover: f32,
     /// The instant the ramp last advanced; `None` before the first frame.
     at: Option<Instant>,
-    /// Was the hidden state entered BY FIAT — a selection, or a placement
-    /// search that came back empty — rather than by perception?
-    ///
-    /// Those two paths yield AT ONCE by design, and the dwell exists to
-    /// discount perception WOBBLE, which neither of them is. So neither may
-    /// they be charged the dwell on the way back: a selection that ends is
-    /// the user's act ending, and a placement search that succeeds has
-    /// SEARCHED, not guessed. Without this the pet stayed dark for 0.25 s
-    /// after a selection was cleared, which the cursor-home suite catches
-    /// (`full_selection_still_protects_the_console_and_explains_the_hidden_body`).
+    /// Whether the hidden state was entered by fiat (a selection, or a
+    /// placement search that came back empty) rather than by perception. Those
+    /// yield at once, and are not charged the dwell on the way back either,
+    /// since the dwell discounts perception wobble. Pinned by
+    /// `full_selection_still_protects_the_console_and_explains_the_hidden_body`.
     by_fiat: bool,
 }
 
@@ -150,10 +132,8 @@ impl VisibilityHold {
     /// `None` unobservable.
     fn update(&mut self, now: Instant, verdict: Option<bool>) -> f32 {
         let dt = self.advance(now);
-        // A YIELD BY FIAT IS NOT PAID FOR TWICE. `hide_now`'s two callers cut
-        // at once on purpose; the first verdict that says the ground is free
-        // again therefore restores at once too, rather than spending a dwell
-        // meant for perception wobble on the end of a user's selection.
+        // A yield by fiat restores at once on the first clear verdict rather
+        // than spending a dwell meant for perception wobble.
         if self.by_fiat {
             if verdict != Some(true) {
                 return self.cover;
@@ -191,18 +171,11 @@ impl VisibilityHold {
         self.ramp(dt)
     }
 
-    /// NOTHING WAS DRAWN AT ALL, which is not the same `None` as "I cannot
-    /// see there" and must not be spent as one.
-    ///
-    /// The emitter produces no body of its own accord all the time: an
-    /// arrival fade that has not started, a resident that has finished its
-    /// own 0.30 s retirement, a capture with no caret. There is no rectangle
-    /// for the map to be blind ABOUT, so this advances the ramp and touches
-    /// no run — in particular it may not feed [`VETO_BLIND`], which exists
-    /// for the opposite case (a body IS being emitted and the map cannot
-    /// certify the ground under it). Conflating the two latched `shown =
-    /// false` on a pet that had merely faded out, and then charged it a
-    /// [`VETO_DWELL`] it never owed when it came back.
+    /// Nothing was drawn at all, which is a different `None` from "I cannot
+    /// see there". The emitter often produces no body (an arrival fade not yet
+    /// started, a finished retirement, no caret); with no rectangle there is
+    /// nothing to be blind about, so this advances the ramp without touching
+    /// any run, and in particular never feeds [`VETO_BLIND`].
     fn idle(&mut self, now: Instant) -> f32 {
         let dt = self.advance(now);
         self.ramp(dt)
@@ -251,6 +224,45 @@ impl VisibilityHold {
     }
 }
 
+/// The emitted Z-ORDER (`PetFrame::under_ink`) as a HELD STATE.
+///
+/// Recomputed per frame it flipped at the keystroke rate — 50 flips over
+/// one 80 ms/key pangram — and every flip swaps the cat between beneath and
+/// above the glyphs, the ribbon light, the caret halo and the sparkles.
+/// The two directions are not symmetric, on purpose: going UNDER is
+/// immediate, because a body is never painted in front of the user's text;
+/// coming back OVER needs the body clear of ink for [`Z_DWELL`]. A frame
+/// that draws nothing releases the hold — a flip is only visible between
+/// two drawn frames, so the next drawn one reads the ground afresh.
+#[derive(Clone, Copy, Debug, Default)]
+struct ZHold {
+    under: bool,
+    /// Start of the current unbroken run of clear frames spent `under`.
+    clear_since: Option<Instant>,
+}
+
+impl ZHold {
+    /// Advance one DRAWN frame; `ink` is real ink under the drawn body.
+    fn update(&mut self, now: Instant, ink: bool) -> bool {
+        if ink {
+            self.under = true;
+            self.clear_since = None;
+        } else if self.under {
+            let since = *self.clear_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= Duration::from_secs_f32(Z_DWELL) {
+                *self = Self::default();
+            }
+        }
+        self.under
+    }
+
+    /// When the clear run under way lands, so a quiet pet still surfaces.
+    fn deadline(&self) -> Option<Instant> {
+        self.clear_since
+            .map(|since| since + Duration::from_secs_f32(Z_DWELL))
+    }
+}
+
 /// Fold the hold's cover into an emitted opacity byte. Floored at 1 while
 /// any cover remains, for the reason the arrival ramp is floored: hosts gate
 /// "is the pet on glass" on `alpha > 0`, and rounding a faint-but-present
@@ -271,9 +283,8 @@ pub enum PetInputKind {
     Navigate,
     Submit,
     Paste,
-    /// A kill chord that moves the caret (`^U`, `^W`): the line's content
-    /// going. Reaches the cursor engines as a kill (2026-09-13); the pet reads
-    /// it as an edit like a delete.
+    /// A kill chord that moves the caret (`^U`, `^W`): reaches the cursor
+    /// engines as a kill; the pet reads it as an edit like a delete.
     Kill,
     /// A kill chord that leaves the caret where it is (`^K`).
     KillForward,
@@ -373,10 +384,12 @@ pub(super) struct ConsoleLife {
     result_at: Option<(Instant, bool)>,
     pose: Option<PetGlyphId>,
     still: bool,
-    /// Seconds the caret has been continuously unpainted (see the hold in
-    /// [`PetBrain::tick_console_resident`] and [`HIDDEN_HOLD_MAX`]). Zeroed by
+    /// Seconds the caret has been continuously unpainted (see
+    /// [`PetBrain::hold_unpainted_caret`] and [`HIDDEN_HOLD_MAX`]). Zeroed by
     /// any frame that paints one, so a repainting console never accumulates.
     hidden_hold: f32,
+    /// The last tick read an unpainted caret as the painted home.
+    caret_held: bool,
     tick_stamp: Option<PetWorldStamp>,
     repair_until: Option<Instant>,
     repair_target: Option<(f32, f32)>,
@@ -389,22 +402,26 @@ pub(super) struct ConsoleLife {
     completion_seq: u64,
     failure_quiet_until: Option<Instant>,
     last_body: Option<PetRect>,
+    /// The brain's own `(col, row)` when [`Self::last_body`] was drawn: what
+    /// the no-caret hold re-seats from. The drawn rect is not a seat — it
+    /// carries the pose's lift and the row-0 pixel clamp.
+    last_seat: Option<(f32, f32)>,
     /// THE ONE EXPLICIT FACT the reseat needs: did the last emission actually
     /// put pixels on glass? This used to be inferred from `last_body` being
     /// `None`, which the visibility veto ALSO wrote — so a vetoed frame read
     /// as "never drawn", teleported the pet and restarted its fade from zero.
     on_glass: bool,
     hold: VisibilityHold,
+    z: ZHold,
     /// Last real visible caret on this coherent coordinate surface. This is
     /// placement memory only; it never enters the keyboard/motion sensor.
     cursor_home: Option<(u16, u16)>,
     contact_changed: bool,
     observed_seq: u64,
     progress_seq: u64,
-    /// When the SETTLED spent perch was taken. `Some` only while the content
-    /// perch owns the resident with nothing live to attend; the dwell it
-    /// starts is offered by [`PetBrain::console_deadline`] so the wake that
-    /// releases it actually happens.
+    /// When the settled spent perch was taken; `Some` only while the content
+    /// perch owns the resident with nothing live to attend. Its dwell end is
+    /// offered by [`PetBrain::console_deadline`].
     perched_since: Option<Instant>,
 }
 
@@ -454,15 +471,12 @@ impl PetBrain {
             at: now,
             target: self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c))),
         });
-        // THE KITTY COMMAND'S ONE RE-STAMP. A latched trick waits out the
-        // user's OWN typing — text, a delete, the submit — and this note is
-        // exactly one per admitted press, so it is the only signal that
-        // means "the hand is still busy". The move sensor must never do
-        // this: program output moves the caret too, and a build log
-        // re-stamping the latch would hold it, the frame lane and the
-        // console resident's perch for the whole absolute cap. Navigation, a
-        // paste and the kill chords re-stamp nothing: the listener has
-        // already poisoned or reset the line they touch.
+        // The kitty command's one re-stamp: a latched trick waits out the
+        // user's own typing, and this note is exactly one per admitted press.
+        // The move sensor must not re-stamp (program output moves the caret
+        // too, and a build log would hold the latch for its whole cap).
+        // Navigation, paste and kill chords re-stamp nothing: the listener has
+        // already poisoned or reset the line.
         if matches!(
             kind,
             PetInputKind::Text | PetInputKind::Delete | PetInputKind::Submit
@@ -527,20 +541,12 @@ impl PetBrain {
         self.observe_console_with_exclusions(input, facts, pane, &[]);
     }
 
-    /// Cells the LAST world observation classified — the pet's per-frame walk
-    /// size, in cells.
+    /// Cells the last world observation classified: the pet's per-frame walk
+    /// size (min(rows,64) × min(cols,256), on every presented frame), exposed
+    /// so a running product can report the cost.
     ///
-    /// Published because the walk is the resident pet's whole per-frame cost
-    /// (min(rows,64) x min(cols,256), unconditional on every presented frame)
-    /// and until now the count existed only inside `PetWorld`, read by two
-    /// in-crate tests. That left the cost measurable by a bench and by an A/B
-    /// of two live instances, but NOT from inside a running product — which is
-    /// precisely how the 2026-09-24 audit ended with the pet's ~0.39 ms split
-    /// unresolved by 4x between `observe` and everything else.
-    ///
-    /// Zero when the pet has never made a coherent observation, and zero after
-    /// a refused one: [`PetWorld::retire`] clears the count, so this reports
-    /// the cells of an observation that actually stood, never a stale total.
+    /// Zero before any coherent observation and after a refused one
+    /// ([`PetWorld::retire`] clears the count).
     #[must_use]
     pub fn observed_cells(&self) -> usize {
         self.console
@@ -556,10 +562,10 @@ impl PetBrain {
         pane: PetPane,
         exclusions: &[PetRect],
     ) {
-        // The hidden-cursor resident holds its last drawn body. Keep that
-        // body's cells inside the bounded observation window too; centering
-        // a large pane instead made an unchanged, blank home look unknown.
-        // A new surface/history/geometry cannot inherit the old body's hint.
+        // The hidden-cursor resident holds its last drawn body, so keep that
+        // body's cells inside the observation window (centering a large pane
+        // would make an unchanged blank home look unknown). A new
+        // surface/history/geometry cannot inherit the old body's hint.
         let held_center = self
             .console
             .cursor_home
@@ -581,7 +587,11 @@ impl PetBrain {
         let prior_stamp = world.stamp();
         let prior_selection = world.selection_target();
         let prior_progress = world.progress();
-        let old_ink = self.console.last_body.and_then(|r| local_ink(world, r));
+        let typed = typed_run(input, pane, self.last_caret);
+        let old_ink = self
+            .console
+            .last_body
+            .and_then(|r| local_ink(world, r, typed));
         world.observe_with_exclusions_near(input, facts, pane, exclusions, held_center);
         if world.stamp().is_some()
             && (prior_stamp != world.stamp()
@@ -590,7 +600,6 @@ impl PetBrain {
         {
             self.console.observed_seq = self.console.observed_seq.wrapping_add(1).max(1);
         }
-        let new_ink = self.console.last_body.and_then(|r| local_ink(world, r));
         let fixed_view = prior_stamp.zip(world.stamp()).is_some_and(|(a, b)| {
             a.surface == b.surface
                 && a.top_absolute_row == b.top_absolute_row
@@ -600,6 +609,10 @@ impl PetBrain {
         if fixed_view {
             // Multiple coherent reads may precede one tick. A duplicate
             // observation cannot erase new local ink already observed.
+            let new_ink = self
+                .console
+                .last_body
+                .and_then(|r| local_ink(world, r, typed));
             self.console.contact_changed |= old_ink
                 .zip(new_ink)
                 .is_some_and(|(a, b)| a.iter().zip(b).any(|(old, new)| new & !old != 0));
@@ -628,12 +641,9 @@ impl PetBrain {
     /// `None` retains the span fallback; it never licenses an unobserved gap.
     pub(super) fn observed_ink_overlaps(&self, col: f32, row: f32, width: f32) -> Option<bool> {
         let (a, b) = (col + INK_PAD, col + width - INK_PAD);
-        // A first/last glyph span is a hull, not solid ink. Coding consoles
-        // animate sparse particles around a stationary composer: treating the
-        // spaces between them as glyphs sent the pet across the pane whenever
-        // a distant particle moved. The console already sampled exact glyph
-        // occupancy; use it for a completely observed footprint. No rescan,
-        // allocation, or guessed blanks outside that bounded map.
+        // A first/last glyph span is a hull, not solid ink: coding consoles
+        // animate sparse particles around a stationary composer. Use the
+        // console's exact glyph occupancy for a completely observed footprint.
         if self.console.presentable
             && let Some(world) = self.console.world.as_ref()
             && row.is_finite()
@@ -674,6 +684,7 @@ impl PetBrain {
             // Custody changed hands. A frozen ramp and a stale verdict from
             // the previous custodian are not evidence about this one.
             self.console.hold = VisibilityHold::default();
+            self.console.z = ZHold::default();
         }
         self.console.presentable = presentable;
     }
@@ -688,36 +699,52 @@ impl PetBrain {
 
     /// Natural, pixel-rounded sprite coverage in fractional grid cells.
     fn console_body(&self, sense: PetSense) -> PetRect {
-        let ch = f32::from(sense.cell_h.max(1));
-        let cw = f32::from(sense.cell_w.max(1));
-        let h = (ART_ROWS * ch).round().clamp(1.0, f32::from(u16::MAX));
-        let w = (h * ART_ASPECT).round().clamp(1.0, f32::from(u16::MAX));
-        // Match the neutral-scale body_px projection, including the origin
-        // and feet. Fractional flight landings can straddle a protected cell
-        // before rounding even though the actual displayed body clears it.
-        let x = (self.col * cw)
-            .round()
-            .clamp(0.0, (f32::from(sense.cols) * cw - w).max(0.0));
-        let y = (((self.row + 1.0) * ch).round() - h)
-            .clamp(0.0, (f32::from(sense.rows) * ch - h).max(0.0));
-        PetRect::new(y / ch, x / cw, h / ch, w / cw)
+        still_body_rect(
+            (self.col, self.row),
+            (sense.cell_w, sense.cell_h),
+            (sense.cols, sense.rows),
+        )
     }
 
-    /// An EXAMINED obstruction under the pet's natural body. `clear` would
-    /// answer the same `false` for "outside the coverage window", and this
-    /// predicate authorizes a teleport — so it takes the three-valued answer
-    /// and acts only on a certified `Some(false)`.
+    /// THE RE-SIGHTING GHOST'S ADMISSION ON ITS OWN GLASS, judged at the
+    /// boundary ([`PetBrain::resight_coordinate_space`]) — before the retire
+    /// drops the old surface's map, so the map is the observation the body
+    /// was drawn against on the frame the user saw. The ghost is the body
+    /// standing still at its seat (no lift, no squash), at the last tick's
+    /// cell metrics and grid; it is admitted only where that map certifies
+    /// nothing protected under it — no selection, image, overlay or unseen
+    /// cell — exactly the live body's own verdict
+    /// (`under_text_clearance_past_caret`). An incoherent map, or none,
+    /// admits nothing.
+    pub(super) fn console_still_body_clear(&self) -> bool {
+        self.console_still_rect_clear(self.col, self.row)
+    }
+
+    /// [`Self::console_still_body_clear`]'s verdict for a still body standing
+    /// at `(col, row)` of the same map: a crossfade ghost still fading there
+    /// at the boundary (`Carried::own_clear`).
+    pub(super) fn console_still_rect_clear(&self, col: f32, row: f32) -> bool {
+        let Some(world) = self.console.world.as_ref().filter(|w| w.stamp().is_some()) else {
+            return false;
+        };
+        let rect = still_body_rect(
+            (col, row),
+            (self.last_cell_w, self.last_cell_h),
+            self.last_grid,
+        );
+        world.under_text_clearance_past_caret(rect, 0.0) == Some(true)
+    }
+
+    /// An examined obstruction under the pet's natural body. `clear` would
+    /// also answer `false` for "outside the coverage window", and this
+    /// predicate authorizes a teleport, so it acts only on a certified
+    /// `Some(false)`.
     ///
-    /// THE CARET IS NOT AN OBSTRUCTION TO ITS OWN ESCORT, which is why this
-    /// reads past it. The strict reading counts the caret's 3x3 keep-off
-    /// ring as protected, and [`STATION_LEAD`] seats the escort one cell
-    /// past the caret — inside that ring by construction. With this
-    /// predicate in the eviction disjunct (`kitty_pet.rs`, beside the
-    /// v0.76 `ink_overlaps` test) the strict reading evicted a settled cat
-    /// for sitting exactly where the escort law puts it, and every escort
-    /// station restored above would have been given straight back. Glyphs
-    /// are still `ink_overlaps`'s to judge; selections, images and
-    /// uncertified geometry are still this one's.
+    /// The caret is not an obstruction to its own escort: [`STATION_LEAD`]
+    /// seats the escort one cell past the caret, inside its 3x3 keep-off ring,
+    /// so reading the ring as protected would evict a cat sitting exactly
+    /// where the escort rule puts it. Glyphs are `ink_overlaps`'s to judge;
+    /// selections, images and uncertified geometry are this one's.
     pub(super) fn console_obstructed(&self, sense: PetSense) -> bool {
         self.console.presentable
             && self.console.world.as_ref().is_some_and(|world| {
@@ -727,11 +754,9 @@ impl PetBrain {
     }
 
     pub(super) fn reseat_unshown_console_body(&mut self, sense: PetSense, width: f32) {
-        // NOTHING WAS ON GLASS last emission. A first appearance or a fully
-        // faded-out resident may therefore start its finite fade at a current
-        // safe station; a body the user can still SEE must use locomotion.
-        // This used to key on `last_body.is_some()`, which the visibility
-        // veto cleared on every vetoed frame — so a visible pet teleported.
+        // Nothing was on glass last emission, so a first appearance or a
+        // fully faded resident may start its fade at a current safe station;
+        // a body the user can still see must use locomotion.
         if self.console.on_glass
             || self.console.resident
             || self.flight.is_some()
@@ -746,14 +771,10 @@ impl PetBrain {
                 self.row = row;
                 self.alpha = 0.0;
                 self.last_caret = None;
-                // A HELD VERDICT IS A FACT ABOUT A PLACE. This body just
-                // moved to a different one, chosen because it is safe, so
-                // the accumulated "obstructed" evidence belongs to the
-                // station it left. Retiring it here is also what keeps the
-                // recovery to ONE fade: without it the pet paid this
-                // envelope's dwell and ramp a second time on top of its own
-                // 0.30 s arrival, and stayed invisible for half a second
-                // after it had already stepped somewhere clear.
+                // A held verdict is a fact about a place, and this body just
+                // moved to a safe one, so retire the accumulated evidence. This
+                // also keeps recovery to one fade instead of this envelope's
+                // dwell and ramp on top of the 0.30 s arrival.
                 self.console.hold = VisibilityHold::default();
             }
         }
@@ -764,9 +785,7 @@ impl PetBrain {
     pub(super) fn begin_console_tick(&mut self, sense: PetSense, width: f32) {
         let contact_changed = core::mem::take(&mut self.console.contact_changed);
         // Taken, not read: only the spent-perch arm below re-establishes it,
-        // so every other verdict — a key, a selection, output, a result, a
-        // surface change, an incoherent read — restarts the dwell by simply
-        // not claiming it.
+        // so every other verdict restarts the dwell.
         let perched_since = self.console.perched_since.take();
         // A body still gliding to its station has not settled yet, so the
         // dwell measures SETTLED time and a long trip cannot eat it.
@@ -815,9 +834,12 @@ impl PetBrain {
             self.console.contact_at = None;
             self.console.consumed = self.console.seq;
             self.console.last_body = None;
+            self.console.last_seat = None;
             return;
         }
-        if let Some(caret) = sense.caret {
+        // Only a PAINTED caret is a home: an unpainted one is a program's
+        // repaint, and its cell may be the program's write position.
+        if let Some(caret) = sense.caret.filter(|_| sense.caret_drawn) {
             self.console.cursor_home = Some(caret);
         }
 
@@ -845,13 +867,11 @@ impl PetBrain {
             self.pending_vigil_pounce = false;
             self.vigil_cheer = None;
             self.quiet = 0.0;
-            // A COMMANDED SEAT stands down with the quiet clock it was
-            // written on, and a "heard you" beat the hand typed over owes
-            // its verb no longer (work outranks a trick) — a key that does
-            // not move the caret is still the hand going back to work. The
-            // trick LATCH is deliberately not cleared here: the word's own
-            // Enter is a fresh input, and the verb is owed to the prompt
-            // that follows it.
+            // A commanded seat stands down on its quiet clock, and a "heard
+            // you" beat the hand typed over owes its verb no longer: a key that
+            // does not move the caret is still the hand going back to work.
+            // The trick latch is kept: the word's own Enter is a fresh input,
+            // and the verb is owed to the prompt that follows.
             self.clear_trick_settle();
             self.drop_trick_go();
             // Intent is enough for attention even if the caret stays still.
@@ -941,12 +961,10 @@ impl PetBrain {
                 self.console.resident = true;
                 self.console.still = true;
             }
-            // The clearance margin is real contact geometry. Never brace on
-            // input alone or on a duplicate frame of the same displayed ink.
-            // ADVANCING INK, and the caret's blank ring is not ink. Read
-            // strictly, a cat seated at the caret's shoulder is never
-            // `roomy`, so `contact_armed` can never re-arm and the whole
-            // brace fires once per surface and then never again.
+            // The clearance margin is real contact geometry: never brace on
+            // input alone or a duplicate frame of the same ink. Read past the
+            // caret's blank ring, or a cat at the caret's shoulder is never
+            // `roomy` and `contact_armed` never re-arms.
             let safe = world.clear_past_caret(body, CLEARANCE);
             let roomy = world.clear_past_caret(body, CONTACT_MARGIN);
             if roomy
@@ -987,18 +1005,14 @@ impl PetBrain {
             return;
         }
 
-        // Eligible direct affection outranks program watching. The ordinary
-        // petting owner consumes the contact and its finite hold unchanged.
+        // Eligible direct affection outranks program watching; the petting
+        // owner consumes the contact and its finite hold unchanged.
         //
-        // A TYPED KITTY COMMAND IS THE SAME KIND OF ADDRESS, for as long as
-        // it has the cat's attention or its body ([`PetBrain::trick_engaged`]):
-        // the latch, its opening beat, a one-shot still playing, a commanded
-        // seat still held. Keyed on the latch alone, a running command
-        // reseated the cat as `Sit` one tick after `sleep` was performed —
-        // the nap lasted a frame — and cut a roll to its first pose. Every
-        // term is finite or interruptible by its own law, and none of them
-        // is in `console_frames`: a resident that owns the tick (a held
-        // selection, a hidden caret) still parks exactly as it did.
+        // A typed kitty command is the same kind of address while it has the
+        // cat's attention or body ([`PetBrain::trick_engaged`]): the latch, its
+        // opening beat, a one-shot still playing, a commanded seat still held.
+        // Each term is finite or interruptible, and none is in
+        // `console_frames`, so a resident that owns the tick still parks.
         if self.pending_pet > 0 || self.pet_hold_t > 0.0 || self.trick_engaged() {
             self.console.resident = false;
             self.console.trip = None;
@@ -1117,20 +1131,13 @@ impl PetBrain {
                     .copied()
             })
         }) {
-            // One existing content anchor may survive a completed command.
-            // No timer grants another excursion around the same old screen.
+            // One existing content anchor may survive a completed command; no
+            // timer grants another excursion around the same screen.
             //
-            // THE PERCH IS A VISIT, NOT A TENANCY. This interest has no live
-            // event behind it — the command is over, the anchor merely still
-            // resolves — so it is the one resident state nothing can ever
-            // end. Held forever it made the pet a decal: the resident branch
-            // pins pose, scale, lift and motes every frame, `console_frames`
-            // answers `Some(false)` and `console_deadline` answered `None`,
-            // so the brain owned NO FUTURE — no frame train and no wake
-            // instant — and could not breathe, blink, settle, sleep or
-            // notice the caret walking away. [`PERCH_DWELL`] bounds the
-            // visit; `console_deadline` offers its end, so the wake that
-            // releases it is real, and the pet goes back to its own life.
+            // The perch is a visit, not a tenancy: with no live event behind
+            // it, held forever it would pin pose, scale, lift and motes with no
+            // frame train and no wake. [`PERCH_DWELL`] bounds the visit and
+            // `console_deadline` offers its end.
             if sense
                 .now
                 .saturating_duration_since(settled_since)
@@ -1160,7 +1167,6 @@ impl PetBrain {
             self.console.progress_at = None;
             self.console.progress_key = None;
         }
-        let _ = width;
     }
 
     fn choose_console_perch(
@@ -1192,26 +1198,13 @@ impl PetBrain {
                     let dy = (stamp.top_absolute_row - old.top_absolute_row) as f32;
                     target.row -= dy;
                     body.row -= dy;
-                    // THE CONTENT MAY CARRY THE BODY ONLY WHILE THE BODY STAYS
-                    // ON THE GLASS. `dy` is a whole inter-tick scroll — a fast
-                    // log licenses most of a screen between two ticks — and
-                    // this subtraction had no floor, so the pet's row went
-                    // NEGATIVE and `emit`'s `self.row.clamp(0.0, max_row)`
-                    // wrote that back into brain state as exactly 0.0. That is
-                    // a draw clamp answering where the animal stands, and the
-                    // answer it gives is the top row, which is where the owner
-                    // kept finding the cat (2026-09-19). The row is also the
-                    // one coordinate nothing else restores: `leaving_view` was
-                    // judged on `target.row`, never on the body, and only ever
-                    // abandoned the anchor.
-                    //
-                    // So a scroll that would carry the body off the top does
-                    // not move it at all. The pet keeps the seat it can be
-                    // seen in, the perch it was holding is given up (the
-                    // anchor has genuinely left the view), and the caret's
-                    // escort re-stations it — which is the documented intent
-                    // here: output scrolls its own anchor, it cannot carry the
-                    // resident away from input.
+                    // The content may carry the body only while it stays on
+                    // glass. `dy` is a whole inter-tick scroll, and without a
+                    // floor the row would go negative and be clamped to the top
+                    // row by `emit`. So a scroll that would carry the body off
+                    // the top does not move it: the pet keeps its visible seat,
+                    // gives up the perch (the anchor left the view), and the
+                    // caret's escort re-stations it.
                     let scrolled_off_top = self.row - dy < 0.0;
                     if !scrolled_off_top {
                         self.row -= dy;
@@ -1239,8 +1232,8 @@ impl PetBrain {
         }
         // Output directs attention; the caret remains home, and home is the
         // escort's stand ([`Self::console_seat`]). A certified resident is
-        // retained even on ordinary ink, avoiding a fresh search for every
-        // identical frame of a busy console.
+        // kept even on ordinary ink, avoiding a fresh search per identical
+        // frame.
         let next = self.console_seat(world, body, home);
         self.console.anchor = Some(subject);
         self.console.target = next;
@@ -1265,6 +1258,58 @@ impl PetBrain {
         self.console.resident_handoff
     }
 
+    /// THE REPAINT HOLD. A DECTCEM hide means "I am repainting", so for up to
+    /// [`HIDDEN_HOLD_MAX`] an unpainted caret is read as the last caret this
+    /// surface PAINTED ([`ConsoleLife::cursor_home`], while the observation
+    /// still vouches for it), as painted. The brain then sees a caret that has
+    /// not moved, and every arm runs as on a painted frame: no chase, no move
+    /// event, a flight lands where it was going, a sleeper sleeps. Past the
+    /// bound the unpainted caret passes through and is followed, starting as
+    /// a re-sighting: the pet did not see where it went, so the chase takes
+    /// it quietly from the pet's own feet, as it would a caret that
+    /// reappeared.
+    ///
+    /// The hold used to pin the resident's body instead, and a same-tick
+    /// escort resign handed the hidden caret straight to the ordinary ladder:
+    /// the pet chased the program's write position, stored it as its last
+    /// caret so the caret's return read as a line change, loafed a sleeper
+    /// awake, and was re-seated from its drawn rect with a flight's lift and
+    /// the row-0 clamp baked into its feet.
+    pub(super) fn hold_unpainted_caret(&mut self, sense: PetSense, dt: f32) -> PetSense {
+        if sense.caret_drawn && sense.caret.is_some() {
+            self.console.hidden_hold = 0.0;
+            self.console.caret_held = false;
+            return sense;
+        }
+        self.console.hidden_hold += dt.max(0.0);
+        let vouched = || {
+            let now = self.console.world.as_ref().and_then(|w| w.stamp());
+            now.zip(self.console.tick_stamp)
+                .is_some_and(|(now, prior)| now.preserves_cursor_home(prior))
+        };
+        match self.console.cursor_home {
+            Some(home)
+                if sense.caret.is_some()
+                    && self.console.presentable
+                    && self.console.hidden_hold <= HIDDEN_HOLD_MAX
+                    && vouched() =>
+            {
+                self.console.caret_held = true;
+                PetSense {
+                    caret: Some(home),
+                    caret_drawn: true,
+                    ..sense
+                }
+            }
+            _ => {
+                if core::mem::take(&mut self.console.caret_held) && sense.caret.is_some() {
+                    self.last_caret = None;
+                }
+                sense
+            }
+        }
+    }
+
     /// New interests use the resident's position, distance-driven gait and
     /// authored poses. This is one branch of PetBrain::tick, not a host driver.
     pub(super) fn tick_console_resident(
@@ -1273,91 +1318,62 @@ impl PetBrain {
         width: f32,
         dt: f32,
     ) -> Option<PetFrame> {
-        // Coding consoles hide the logical cursor while repainting. Preserve
-        // the resident's last real home without inventing a caret for the move
-        // sensor. Admission happens AFTER begin_console_tick has handled real
-        // selection, input, and OSC command facts: hidden pixels do not erase
-        // attention ownership or lose a completion. The body is re-seated from
-        // the rect that was DRAWN, which holds the visible feet across the
-        // scroll compensation in `choose_console_perch` — output scrolls its
-        // own anchor and may not carry the resident away with it
-        // (`hidden_cursor_home_stays_put_while_real_output_scrolls`).
-        //
-        // WHAT CHANGED, 2026-09-19 — THE HOLD IS BOUNDED WHEN THERE IS
-        // SOMETHING BETTER TO DO. This arm used to fire on `sense.caret
-        // .is_none()` alone, and the host set that for a merely HIDDEN cursor
-        // (`app_render.rs`, the `cur` note). A hide is how a program says "I
-        // am repainting", and a repaint is milliseconds — but nothing bounded
-        // the hold, so the pet held its seat for as long as the program kept
-        // its cursor dark. MEASURED on the shipped v0.88.0 with `aterm ctl
-        // trail status`, driving a DECTCEM-hiding TUI: the pet sat at row 0.0
-        // for 20.04 s while the caret was on row 44, and at row 23.4 for
-        // 20.15 s in the same fixture started mid-screen — it holds wherever
-        // it stands, and "the top of the screen" is simply where it most often
-        // was standing (a fresh prompt, a `clear`, a console whose input row is
-        // near the top). When the cursor came back it crossed 28.4 cells in
-        // ONE frame. That is the owner's report of 2026-09-19: *"not correctly
-        // following the cursor reliably … getting shoved away as like a glitch
-        // … sometimes getting trapped at the top of the screen"*. Every
-        // progress bar, spinner, pager, editor and LLM console hides the
-        // cursor while it works.
-        //
-        // WHICH REFUSAL IS IT is the whole fix. The host now says separately
+        // A CARET THE PET CANNOT TAKE AT ITS WORD. The host says separately
         // whether a caret EXISTS and whether it is PAINTED ([`PetSense::caret`]
-        // / [`PetSense::caret_drawn`]):
+        // / [`PetSense::caret_drawn`]) since 2026-09-19, when a pet fed `None`
+        // for a hidden cursor sat 20.04 s at row 0 while a DECTCEM-hiding TUI
+        // worked on row 44, then crossed 28.4 cells in one frame (the owner's
+        // *"trapped at the top of the screen"*). Two cases reach here:
         //
-        //  * caret ABSENT — the viewport is scrolled into history, or the
-        //    song's law is withholding it. There is no better place to send a
-        //    cat than the one it is standing in, so that hold keeps its old
-        //    unbounded patience.
-        //  * caret PRESENT but unpainted — a repaint. Hold for
-        //    [`HIDDEN_HOLD_MAX`], which is many repaints' worth, and then let
-        //    the ordinary ladder follow the caret it can see perfectly well.
-        let unpainted = !sense.caret_drawn || sense.caret.is_none();
-        if unpainted {
-            self.console.hidden_hold += dt.max(0.0);
-        } else {
-            self.console.hidden_hold = 0.0;
-        }
-        if self.console.presentable
-            && unpainted
-            && (sense.caret.is_none() || self.console.hidden_hold <= HIDDEN_HOLD_MAX)
+        //  * caret ABSENT — the viewport is scrolled into history. There is
+        //    no better place for the cat than where it stands, so the
+        //    resident holds it there, unbounded, without inventing a caret for
+        //    the move sensor. It is re-seated at the brain's own seat from the
+        //    last drawn frame: `choose_console_perch`'s scroll compensation may
+        //    have moved it this tick, and output may not carry the resident
+        //    away from input (`hidden_cursor_home_stays_put_while_real_output_scrolls`).
+        //    A flight in the air is left to the no-caret arm, which eases its
+        //    lift down as it fades: re-seating it from the drawn rect used to
+        //    freeze the cat mid-air, its lift baked into its feet.
+        //  * caret PRESENT but unpainted past [`HIDDEN_HOLD_MAX`] (inside the
+        //    bound [`Self::hold_unpainted_caret`] already read it as the
+        //    painted home) — a build or a pager, not a repaint.
+        //
+        // Admission happens AFTER begin_console_tick has handled real
+        // selection, input, and OSC command facts: a hold does not erase
+        // attention ownership or lose a completion.
+        let holding = self.console.presentable
+            && sense.caret.is_none()
             && self.console.cursor_home.is_some()
             && self.alpha > 0.0
-        {
-            if let Some(held) = self.console.last_body {
-                self.col = held.col;
-                self.row = held.foot_row();
+            && !self.console_legacy_motion_pending();
+        if holding {
+            if let Some((col, row)) = self.console.last_seat {
+                self.col = col;
+                self.row = row;
             }
-            self.flight = None;
-            self.bound2 = None;
-            self.land_t = 0.0;
-            self.retired_flight_lift = None;
-            self.deferred_hidden_landing = None;
             self.console.resident = true;
             self.console.target = Some(self.console_body(sense));
             self.console.trip = None;
             if self.console.attention == PetAttention::Rest {
                 self.console.reason = "cursor-hidden-home";
-                self.console.pose = Some(PetGlyphId::PetLoaf);
+                // A parked resident loafs; a sleeping one sleeps on.
+                if self.action != PetAction::Sleep {
+                    self.console.pose = Some(PetGlyphId::PetLoaf);
+                }
             }
             self.console.still = true;
+            // The caret that comes back is a new sighting, as for the
+            // no-caret arm this one stands in for.
             self.last_caret = None;
-        } else if unpainted && sense.caret.is_some() && self.console.presentable {
+        } else if !sense.caret_drawn && sense.caret.is_some() && self.console.presentable {
             // THE HOLD OUTLASTED THE REPAINT IT WAS FOR, and the caret is in
             // plain sight of the brain even though the emulator is not drawing
-            // it. Bounding the hold above is not enough on its own: residency
-            // survives it, and a resident sits at `console.target`, which is
-            // the seat the hold last pinned. Nothing else resigns it while the
-            // cursor stays dark, so the cat kept the stale seat for the whole
-            // of a build (measured: 20.04 s).
-            //
-            // So hand the body back to the caret's own escort. `resident` is
-            // the console layer's claim on the pet, and this is the one
-            // condition under which it should not have one: there IS a caret,
-            // it is simply unpainted, and the ordinary ladder knows exactly
-            // where it is. A frame that paints the caret again re-establishes
-            // residency through the usual door.
+            // it. Residency would survive the bound on its own, and a resident
+            // sits at `console.target`, so hand the body back to the caret's
+            // own escort, which follows it (measured before this: the cat kept
+            // a stale seat for the whole of a 20 s build). A frame that paints
+            // the caret again re-establishes residency through the usual door.
             self.console.resident = false;
             self.console.target = None;
             self.console.trip = None;
@@ -1374,24 +1390,19 @@ impl PetBrain {
         }
         self.console.resident_handoff = false;
         // A resident branch has already yielded affection to protected
-        // reading or another selected interest. Retire its suppressed latch
-        // even when no safe footprint exists; it cannot keep a hidden pet
-        // polling, or replay when the selection is released.
+        // reading or another interest; retire its suppressed latch even with
+        // no safe footprint, so it cannot keep a hidden pet polling or replay
+        // when the selection is released.
         self.pet_hold_t = 0.0;
         self.pending_pet = 0;
         self.pet_at = None;
-        // THE KITTY COMMAND goes the same way, whole — a held selection or a
-        // hidden caret must not replay a stale verb, or resume a commanded
-        // seat, minutes later when it lets go. ONE EXCEPTION, and only for
-        // the latch: while a REPAIR is live. Fixing a typo is still typing
-        // the word — `sot`, two backspaces, `it`, Space fires with the
-        // repair's hold still standing, and that hold seats a resident (this
-        // one) on a body that may stand. It is [`EDIT_HOLD`] from the last
-        // key, well inside the latch's own TTL, with its end already offered
-        // by `console_deadline`; dropping the latch under it would make the
-        // commonest recovery gesture a silent non-answer. Keyed on the
-        // repair's own clock, not on the attention it was dealt — advancing
-        // ink re-labels a repair as `Contact` for its first beats.
+        // The kitty command goes the same way, so a held selection or hidden
+        // caret cannot replay a stale verb later. Exception, for the latch
+        // only: while a repair is live. Fixing a typo is still typing the word
+        // (`sot`, two backspaces, `it`, Space fires with the repair's hold
+        // standing), and the hold ([`EDIT_HOLD`] from the last key) is well
+        // inside the latch's TTL. Keyed on the repair's own clock, since
+        // advancing ink labels a repair as `Contact` at first.
         let repairing = self.console.repair_until.is_some_and(|end| sense.now < end);
         let latched = self.pending_trick.filter(|_| repairing);
         self.drop_tricks();
@@ -1399,30 +1410,20 @@ impl PetBrain {
         let body = self.console_body(sense);
         let world = self.console.world.as_ref()?;
         let home = self.console_caret_home(sense, width);
-        // THE ESCORT DELIVERS, THE RESIDENT HOLDS. Beside a live caret the
-        // seat is decided from the escort's stand EVERY FRAME, never carried
-        // over from a target chosen while the body was somewhere else: a
-        // perch picked by a strict search while the escort was still walking
-        // the cat home used to outrank the body's own arrival, so the escort
-        // landed the cat at its station and this arm then tripped it to the
-        // old target two cells further out — the standoff, paid on every
-        // command. And a body that is NOT yet at the stand is not this arm's
-        // to move: "a moved caret has first claim on a visible resident" —
-        // the cursor follower carries it home, with its own pace, its
-        // row-hop path, its lead decay and its wall hysteresis, and it
-        // arrives at the very rect this arm calls home. A body off glass or
-        // under reduced motion is placed directly, as it always was.
+        // The escort delivers, the resident holds. Beside a live caret the seat
+        // is decided from the escort's stand every frame, never carried over
+        // from a target chosen while the body was elsewhere. A body not yet at
+        // the stand is the cursor follower's to move (its pace, row-hop path,
+        // lead decay and wall hysteresis) to the rect this arm calls home. A
+        // body off glass or under reduced motion is placed directly.
         //
-        // A REPAIR AND A RESULT HOLD THEIR LOCAL SUBJECT. Those two arms
-        // claim the body WHERE IT IS on purpose — the inspection of a
-        // two-cell backspace and the flourish at a command's exit are
-        // performances in place, not trips — and `begin_console_tick` only
-        // admits them on a body that may stand. They keep the old bound:
-        // within [`HOME_REACH`] of the stand, else the caret has first claim.
+        // A repair or a result holds its local subject: those arms claim the
+        // body where it is (an inspection, an exit flourish), admitted only on
+        // a body that may stand, within [`HOME_REACH`] of the stand, else the
+        // caret has first claim.
         //
-        // With the caret HIDDEN (or no home at all) there is no stand to
-        // agree with and nothing to resign to — the escort would only fade
-        // the pet out — so the admitted body is held where it stands.
+        // With the caret hidden (or no home) there is no stand, so the
+        // admitted body is held where it stands.
         let claimed = matches!(
             self.console.attention,
             PetAttention::Editing | PetAttention::Result
@@ -1469,9 +1470,9 @@ impl PetBrain {
             self.last_caret = sense.caret;
             return Some(self.emit(sense, width));
         };
-        // A certificate for the current displayed body means stay here.
-        // Converting that pixel rectangle back to fractional feet would
-        // otherwise move a settled resident on its next idle observation.
+        // A certificate for the current displayed body means stay here;
+        // converting the pixel rect back to fractional feet would move a
+        // settled resident.
         let destination = if target == body {
             (self.col, self.row)
         } else {
@@ -1500,17 +1501,8 @@ impl PetBrain {
         self.watch_heat = 0.0;
         self.stream = false;
         self.motes = [None; PET_MOTES_MAX];
-        // THE DEPARTURE LANE IS NOT THIS ARM'S TO EMPTY. `self.departures =
-        // [None; ..]` stood here from the day the resident was written —
-        // before a look swap was a crossfade — and it deleted the departing
-        // ghost's BIRTH RECORD on the first resident-owned tick after a swap
-        // landed, while the arriving body on the same tick was emitted at
-        // its ARRIVE_FLOOR. Measured on glass (0.83.0 + the crossfade fix;
-        // the Claude-Code-shaped streamer, a swap landing between its
-        // repaints while `protected-displacement` held the body): one
-        // presented frame at 36 % with NO ghost, then the 0.25 s ramp — the
-        // blink, with the freeze already gone. A crossfade has one law for
-        // both of its halves; `finish_console_frame` applies it.
+        // The departure lane is not emptied here: a look-swap crossfade has
+        // one rule for both halves, applied in `finish_console_frame`.
         self.land_t = 0.0;
         self.retired_flight_lift = None;
         self.deferred_hidden_landing = None;
@@ -1535,11 +1527,9 @@ impl PetBrain {
                 if Self::console_may_stand(world, body, CLEARANCE) {
                     self.console.target = Some(body);
                 } else {
-                    // The caret or selection just claimed the old cells.
-                    // Keep presence intact: the final footprint resolver
-                    // displaces the body to nearby protected-free ground.
-                    // Zeroing the envelope here used to insert a blink before
-                    // that resolver could act.
+                    // The caret or selection just claimed the old cells. Keep
+                    // presence intact: the final footprint resolver displaces
+                    // the body to nearby protected-free ground.
                     self.console.target = Some(target);
                     self.console.reason = "protected-displacement";
                 }
@@ -1597,11 +1587,13 @@ impl PetBrain {
         } else {
             self.console.trip = None;
         }
-        self.set_action_keep(if self.console.moving {
-            PetAction::Walk
-        } else {
-            PetAction::Sit
-        });
+        if !(holding && self.action == PetAction::Sleep) {
+            self.set_action_keep(if self.console.moving {
+                PetAction::Walk
+            } else {
+                PetAction::Sit
+            });
+        }
         if !self.console.moving {
             self.speed = 0.0;
             if let Some((r, c)) = self.console.gaze {
@@ -1629,81 +1621,46 @@ impl PetBrain {
         Some(self.emit(sense, width))
     }
 
-    /// MAY THE PET BE WHERE IT NOW IS? Every console arm that asks this of
-    /// the pet's CURRENT body asks it through here, and the answer never
-    /// counts the caret's own keep-off ring.
+    /// Whether the pet may be where it now is. Every console arm asking this
+    /// of the current body asks through here, and the caret's own keep-off
+    /// ring never counts: [`STATION_LEAD`] seats the escort inside it.
     ///
-    /// [`STATION_LEAD`] seats the escort one cell past the caret, inside
-    /// that 3x3 ring by construction — that is the shipped escort law and
-    /// what the pet looked like at v0.76.0. Read strictly, every one of
-    /// these arms answers "no" for the escort's own station and reaches for
-    /// a perch clear of the ring: the resident trips to a target two cells
-    /// out and owes frames forever, placement relocates a walking cat, the
-    /// repair inspection never engages. That is a bound on the reading
-    /// returned as a fact about the place.
-    ///
-    /// CHOOSING a new station is the opposite question and keeps the strict
+    /// Choosing a new station is the opposite question and keeps the strict
     /// reading (`home_perch`, `nearest_under_text_perch`, the rounding
-    /// re-check in [`Self::place_console_body_at_home`]), so the pet can
-    /// still never be PARKED on the cursor.
+    /// re-check in [`Self::place_console_body_at_home`]), so the pet is never
+    /// parked on the cursor.
     fn console_may_stand(world: &PetWorld, rect: PetRect, margin: f32) -> bool {
         world.under_text_clearance_past_caret(rect, margin) == Some(true)
     }
 
-    /// MUST THIS BODY MOVE? THE SAME READING, ASKED THE OTHER WAY ROUND.
+    /// Whether this body must move: the same reading asked the other way.
     ///
-    /// [`Self::console_may_stand`] is the question CHOOSING a station asks,
-    /// and being fail-closed is right for it: an unknown place is not a
-    /// place to park a cat. This asks about a body that ALREADY EXISTS
-    /// somewhere, and fail-closed is the wrong default there. `None` from
-    /// the three-valued reading means the rectangle left the observed
-    /// coverage window — a window centred on the caret that SLIDES AS THE
-    /// USER TYPES — so a walking cat leaves it constantly, and a placement
-    /// pass that counted that as obstruction would recall the cat
-    /// constantly. That is a bound on this map returned as a fact about the
-    /// terminal, the same defect class the visibility hold was fixed for.
-    ///
-    /// Only a POSITIVE observation of a protected surface moves a body that
-    /// is already standing somewhere.
+    /// [`Self::console_may_stand`] is fail-closed, right for choosing a
+    /// station. For a body that already exists, `None` usually means it left
+    /// the caret-centred coverage window, which slides as the user types, so
+    /// only a positive observation of a protected surface moves it.
     fn console_must_yield(world: &PetWorld, rect: PetRect) -> bool {
         world.under_text_clearance_past_caret(rect, 0.0) == Some(false)
     }
 
-    /// THE ESCORT'S OWN STATION, CORRECTED ONLY WHERE THE LADDER IS BLIND.
+    /// The escort's own station, corrected only where the ladder is blind.
     ///
-    /// This layer used to REPLACE the baseline station: it took the caret's
-    /// desired column, ran it through the resident's home rule — which added
-    /// a two-cell `HOME_BREATHING_ROOM` — and answered with a `home_perch`
-    /// search around THAT, discarding the ladder's answer. Every station the
-    /// escort chose was therefore two cells further from the caret than the
-    /// shipped escort law puts it, on every frame, for the pet's whole life.
-    /// That constant displacement is what "it no longer sits with me" was.
-    /// (The resident's home has since been made the escort's stand too —
-    /// [`Self::console_caret_home`] — so the breathing room is gone.)
-    ///
-    /// The layer's real contribution is narrower, and it is kept: the ink
-    /// ladder knows about GLYPHS and nothing else, so it can seat the escort
+    /// The ink ladder knows glyphs and nothing else, so it can seat the escort
     /// on a selection, an image, or a row with no certified cell-to-pixel
-    /// projection — places the pet must not stand. So this answers `Some`
-    /// for exactly those, and `None` everywhere else, which hands the caret
-    /// its escort back.
+    /// projection. This answers `Some` for exactly those and `None` otherwise,
+    /// leaving the caret its escort.
     ///
-    /// Three things are deliberately NOT a reason to move the escort:
+    /// Not reasons to move the escort:
     ///
-    ///  * THE CARET'S OWN KEEP-OFF RING. The pet is the caret's escort and
-    ///    [`STATION_LEAD`] seats it one cell past the caret, inside that
-    ///    ring by construction. Treating the ring as an obstruction is how
-    ///    the standoff was paid twice over.
-    ///  * ORDINARY INK. A resident may stand behind text — that is a
-    ///    Z-ORDER fact (`frame.under_ink`), settled in 259649fe2, and the
-    ///    ladder already owns the glyph rules the escort actually follows.
-    ///  * AN UNKNOWN. `None` from the three-valued reading is a bound on
-    ///    this map, never a claim about the terminal.
+    ///  * the caret's own keep-off ring ([`STATION_LEAD`] seats the pet inside
+    ///    it);
+    ///  * ordinary ink (standing behind text is a z-order fact,
+    ///    `frame.under_ink`);
+    ///  * an unknown (`None` is a bound on this map, not a claim about the
+    ///    terminal).
     ///
-    /// And the correction searches with [`PetWorld::nearest_under_text_perch`],
-    /// not `home_perch`: the escort must take the CLOSEST place it may
-    /// stand, never travel to distant blank sky to avoid ink it is allowed
-    /// to stand behind.
+    /// The correction searches with [`PetWorld::nearest_under_text_perch`], not
+    /// `home_perch`: the escort takes the closest place it may stand.
     pub(super) fn console_station(
         &self,
         desired: (f32, f32),
@@ -1719,22 +1676,16 @@ impl PetBrain {
         if world.under_text_clearance_past_caret(body, CLEARANCE) != Some(false) {
             return None;
         }
-        // NO PERCH IN REACH IS NOT AN OPINION. This used to answer
-        // `(self.col, self.row)` — "stay exactly where you are" — which is a
-        // BOUND ON WHAT THIS LAYER KNOWS returned as a fact about where the
-        // pet belongs, and it retired the caret escort outright: every
-        // baseline station (`station_safe`'s ink ladder, the reduced-motion
-        // pin) was replaced by the pet's own current position, so the pet
-        // stopped following the caret at all. `None` is the honest answer,
-        // and both callers already have the baseline to fall back to.
+        // No perch in reach is `None`, not "stay where you are": both callers
+        // fall back to the baseline station, so the pet keeps following the
+        // caret.
         let next = world.nearest_under_text_perch(body, CLEARANCE, HOME_REACH)?;
         Some((next.col, next.foot_row()))
     }
 
-    /// The body rect the escort's own station puts the pet in — the station
-    /// exactly as the ladder chose it, with nothing added. The resident's
-    /// caret home ([`Self::console_caret_home`]) is built from it as well,
-    /// so escort and resident agree on the seat by construction.
+    /// The body rect the escort's own station puts the pet in, unchanged. The
+    /// resident's caret home ([`Self::console_caret_home`]) is built from it,
+    /// so escort and resident agree on the seat.
     fn console_stand_rect(desired: (f32, f32), rows: u16, width: f32) -> PetRect {
         PetRect::new(
             (desired.1 + 1.0 - ART_ROWS).clamp(
@@ -1747,32 +1698,14 @@ impl PetBrain {
         )
     }
 
-    /// THE RESIDENT'S HOME IS THE ESCORT'S STAND — ONE DISTANCE FROM THE
-    /// CARET, NOT TWO.
+    /// The resident's home is the escort's stand: one distance from the caret.
+    /// (`tests/pet_resident_standoff.rs` pins that they agree.)
     ///
-    /// This used to build its own rect: the caret's column plus
-    /// [`STATION_LEAD`] plus a `HOME_BREATHING_ROOM` of two more cells
-    /// ("leave room for a newly typed character and the follower's
-    /// acceleration"), with the wall side chosen around that buffer. So the
-    /// escort seated the cat at `caret + 1` and the resident — the SAME cat,
-    /// the moment a command block was executing — at `caret + 3`. Measured
-    /// on `pet_position_authority`'s streaming fixture with the block left
-    /// executing (`tests/pet_resident_standoff.rs`): the escort settled at
-    /// a gap of 1.30 cells past the caret on the caret's row; the resident
-    /// at 3.00–3.10, and a row below it wherever the row above carried ink.
-    /// The breathing room bought nothing the escort needed:
-    /// the escort has stood inside the caret's keep-off ring since v0.76.0,
-    /// and the visibility HOLD, not a standoff, is what keeps a fresh glyph
-    /// from blinking the pet out. v0.76.0 had no resident path at all, so
-    /// the escort's distance is the only precedent.
-    ///
-    /// So this answers with the escort's own law, as `station_safe` gives
-    /// it to the chase: the lead-free [`PetBrain::station`] — a hand that
-    /// has PARKED has no typing rhythm to lead, and the chase's keep-ahead
-    /// lead and wall hysteresis are its own sensors, not read here — with
-    /// the far stand of a controller lease folded in, run through the ink
-    /// ladder, and corrected by [`Self::console_station`] exactly where the
-    /// escort's stand would be corrected.
+    /// Uses the escort's rule as `station_safe` gives it to the chase: the
+    /// lead-free [`PetBrain::station`] (a parked hand has no rhythm to lead)
+    /// with a controller lease's far stand folded in, run through the ink
+    /// ladder, and corrected by [`Self::console_station`] where the escort's
+    /// stand would be.
     fn console_caret_home(&self, sense: PetSense, width: f32) -> Option<PetRect> {
         let (r, c) = sense.caret.or(self.console.cursor_home)?;
         let want = Self::station_with(c, sense.cols, width, self.standoff());
@@ -1783,36 +1716,24 @@ impl PetBrain {
         Some(Self::console_stand_rect(stand, sense.rows, width))
     }
 
-    /// WHAT THE RESIDENT DOES ABOUT A BODY BESIDE A LIVE CARET whose home
-    /// is `stand` ([`Self::console_caret_home`] — the escort's own stand).
-    /// Three answers, in order:
+    /// What the resident does about a body beside a live caret whose home is
+    /// `stand` ([`Self::console_caret_home`]). In order:
     ///
-    ///  * [`CaretSeat::Hold`] — A BODY THE ESCORT HAS DELIVERED STAYS. It
-    ///    is at rest (the chase's own stillness, `speed` under the
-    ///    `needs_frames` floor), within the chase's own [`ARRIVED`]
-    ///    tolerance of the stand on the stand's row, and it may stand
-    ///    there. The chase eases in and stops short of its station
-    ///    (measured: 0.30 cells past it); a resident that "corrected" that
-    ///    residue would slide a settled cat a few pixels every time a
-    ///    command started, which is the two-writer fight in miniature.
-    ///  * [`CaretSeat::Escort`] — ANYWHERE ELSE IS THE ESCORT'S TO CLOSE.
-    ///    The stand is read the way the escort reads it: only a POSITIVE
-    ///    observation of a protected surface refuses it
-    ///    ([`Self::console_must_yield`]). The caret's own keep-off ring is
-    ///    not one — the escort lives inside it by construction — and
-    ///    ordinary ink is a z-order fact, not an obstruction. The strict
-    ///    `home_perch` search this used to run could never answer with the
-    ///    stand, because the stand is inside the ring, so the nearest
-    ///    strictly clear seat it found was always at least a cell further
-    ///    out — a second standoff hiding behind the first. And this arm
-    ///    does not walk the body there itself: the escort's chase already
-    ///    does, to the same rect, so a second mover at a second pace is
-    ///    exactly what `pet_position_authority` refuses.
-    ///  * [`CaretSeat::Yield`] — A PROTECTED STAND. `console_caret_home` has
-    ///    already applied the escort's own correction
-    ///    ([`Self::console_station`]), so this is "no perch in reach": the
+    ///  * [`CaretSeat::Hold`]: a body the escort has delivered stays. It is at
+    ///    rest (`speed` under the `needs_frames` floor), within the chase's
+    ///    [`ARRIVED`] tolerance of the stand on its row, and may stand there.
+    ///    Correcting the chase's small arrival residue would slide a settled
+    ///    cat every time a command started.
+    ///  * [`CaretSeat::Escort`]: anywhere else is the escort's to close. Only
+    ///    a positive observation of a protected surface refuses the stand
+    ///    ([`Self::console_must_yield`]); the keep-off ring and ordinary ink do
+    ///    not. This arm does not walk the body itself: the chase already does,
+    ///    to the same rect, and a second mover is what
+    ///    `pet_position_authority` refuses.
+    ///  * [`CaretSeat::Yield`]: a protected stand. `console_caret_home` already
+    ///    applied the escort's correction ([`Self::console_station`]), so the
     ///    caller asks [`PetWorld::nearest_under_text_perch`] once more and
-    ///    yields honestly on `None`.
+    ///    yields on `None`.
     fn caret_seat(&self, world: &PetWorld, body: PetRect, stand: PetRect) -> CaretSeat {
         if self.speed.abs() <= 0.01
             && Self::at_console_stand(body, stand)
@@ -1826,13 +1747,12 @@ impl PetBrain {
         }
     }
 
-    /// The seat as a TARGET RECT for the arms that only record one
-    /// (`begin_console_tick`'s selection reading, [`Self::choose_console_perch`]):
-    /// the same three answers as [`Self::caret_seat`], written down, and
-    /// the old bounded local search where there is no caret home to agree
-    /// with. [`Self::tick_console_resident`] makes the live decision from
-    /// `caret_seat` itself; this value is advisory (scroll compensation and
-    /// the step-aside shift read it).
+    /// The seat as a target rect for the arms that only record one
+    /// (`begin_console_tick`'s selection reading,
+    /// [`Self::choose_console_perch`]): the same three answers as
+    /// [`Self::caret_seat`], with the bounded local search where there is no
+    /// caret home. Advisory: [`Self::tick_console_resident`] decides from
+    /// `caret_seat` (scroll compensation and the step-aside shift read this).
     fn console_seat(
         &self,
         world: &PetWorld,
@@ -1850,11 +1770,10 @@ impl PetBrain {
         }
     }
 
-    /// Is `body` where the escort would consider itself arrived at `stand`:
-    /// within the chase's own [`ARRIVED`] tolerance in columns, and on the
-    /// stand's row — a quarter row covers `body_px`'s pixel rounding of the
-    /// top edge at any cell height of four pixels or more, and nothing else;
-    /// a body between two rows is mid-hop and not arrived.
+    /// Whether `body` is arrived at `stand` as the escort judges it: within
+    /// [`ARRIVED`] in columns, and on the stand's row (a quarter row covers
+    /// `body_px`'s rounding at cell heights of 4 px or more; a body between
+    /// rows is mid-hop).
     fn at_console_stand(body: PetRect, stand: PetRect) -> bool {
         (body.col - stand.col).abs() <= ARRIVED && (body.row - stand.row).abs() < 0.25
     }
@@ -1868,83 +1787,44 @@ impl PetBrain {
         })
     }
 
-    /// PROTECTED CELLS constrain every emitted body, including a pose hold
-    /// or a flight: a body standing on a selection, an image or a row with
-    /// no certified projection steps aside with one bounded LOCAL
-    /// placement, preserving the full body and its alpha. Ordinary ink
-    /// permits residency; only a protected surface yields.
+    /// Protected cells constrain every emitted body, including a pose hold or
+    /// a flight: a body on a selection, an image or a row with no certified
+    /// projection steps aside with one bounded local placement, keeping the
+    /// full body and its alpha. Ordinary ink permits residency.
     ///
-    /// The caret's home is deliberately NOT a constraint here — see the
-    /// guard below. When the step-aside does happen the existing motion
-    /// coordinates are translated with it, or the next tick's lerp would
-    /// restore the body to the protected spot it was just moved off.
+    /// The caret's home is not a constraint here (see below). When a step
+    /// aside happens the motion coordinates are translated with it, or the
+    /// next tick's lerp would restore the body to the protected spot.
     fn place_console_body_at_home(&mut self, frame: &mut PetFrame, sense: PetSense) {
         if self.console.clipped || frame.alpha == 0 {
             return;
         }
-        let rect_of = |frame: PetFrame| {
-            frame
-                .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-                .map(|(x0, x1, y0, y1)| {
-                    PetRect::new(
-                        y0 as f32 / f32::from(sense.cell_h.max(1)),
-                        x0 as f32 / f32::from(sense.cell_w.max(1)),
-                        (y1 - y0) as f32 / f32::from(sense.cell_h.max(1)),
-                        (x1 - x0) as f32 / f32::from(sense.cell_w.max(1)),
-                    )
-                })
-        };
         let Some(world) = self.console.world.as_ref() else {
             return;
         };
-        let Some(rect) = rect_of(*frame) else { return };
-        // THE CONSOLE LAYER IS NOT A SECOND OPINION ABOUT POSITION.
-        //
-        // This guard used to read `near_console_home(rect, home) &&
-        // console_may_stand(world, rect, 0.0)`, and its `home` was the
-        // caret's own console home. So a body further than [`HOME_REACH`]
-        // from the caret was TELEPORTED to it: in one frame, over whatever
-        // the escort or a live flight was doing, on every emitted frame.
-        //
-        // Two writers then owned the same body with different targets and
-        // neither read the other. The escort closes distance at a walking
-        // pace — that pace IS the animal — and this closed the same
-        // distance instantly, so the escort walked the body back out and
-        // this yanked it home again, about eleven times a second for as
-        // long as a command printed into a screen that was not yet full.
-        // That is the owner's "it keeps jumping out and then looping back",
-        // and it is why every measured snap-back landed at exactly
-        // `caret + STATION_LEAD + HOME_BREATHING_ROOM` (the resident's old
-        // two-cell standoff): the pull was this function's destination, not
-        // anywhere the escort ever chose.
-        //
-        // DISTANCE FROM THE CARET IS THE ESCORT'S BUSINESS and it is
-        // already covered twice over: the escort's chase follows the caret
-        // under the shipped speed law, and the resident's own handoff in
-        // [`Self::tick_console_resident`] resigns residency when the body
-        // is no longer near home rather than fighting for it. What is left
-        // here is the one correction the escort genuinely cannot make,
-        // because the ink ladder knows about GLYPHS and nothing else: a
-        // body standing on a selection, an image, or a row with no
+        let Some(rect) = body_rect(frame, sense) else {
+            return;
+        };
+        // The console layer is not a second opinion about position. Distance
+        // from the caret is the escort's business (its chase at the shipped
+        // speed, and the resident handoff in [`Self::tick_console_resident`]).
+        // Pulling a far body home here would make two writers with different
+        // paces fight over it. What remains is the one correction the escort
+        // cannot make: a body on a selection, an image, or a row with no
         // certified cell-to-pixel projection.
         if !Self::console_must_yield(world, rect) {
             return;
         }
-        // AND IT STEPS ASIDE — it does not go home. The shortest move off
-        // the protected surface is the whole of what this layer owes.
-        // Searching from the caret's home instead would re-import the
-        // teleport under another name (and, until the resident's home was
-        // made the escort's stand, carried a two-cell standoff with it — the
-        // same two cells the escort restoration took off the station).
+        // It steps aside, not home: the shortest move off the protected
+        // surface is all this layer owes.
         let Some(safe) = world.nearest_under_text_perch(rect, CLEARANCE, HOME_REACH) else {
             self.console.clipped = true;
             self.console.reason = "protected-home-unavailable";
             return;
         };
-        // Invert body_px's pixel projection instead of adding a delta to a
-        // possibly viewport-clamped source. After a line wrap the raw flight
-        // can be beyond the right edge: shifting its CLAMPED box left by dx
-        // would leave the raw body several cells short of the certified spot.
+        // Invert body_px's projection rather than adding a delta to a possibly
+        // viewport-clamped source: after a wrap the raw flight can be past the
+        // right edge.
         let cw = f32::from(sense.cell_w.max(1));
         let ch = f32::from(sense.cell_h.max(1));
         let natural_h = (ART_ROWS * ch).round();
@@ -1956,7 +1836,7 @@ impl PetBrain {
             row: ((safe.row * ch).round() + dest_h + (frame.lift * ch).round()) / ch - 1.0,
             ..*frame
         };
-        if rect_of(shifted).is_none_or(|r| !world.under_text_clear(r, 0.0)) {
+        if body_rect(&shifted, sense).is_none_or(|r| !world.under_text_clear(r, 0.0)) {
             self.console.clipped = true;
             self.console.reason = "protected-home-rounding";
             return;
@@ -1970,9 +1850,11 @@ impl PetBrain {
         // A STILL GHOST IS THIS BODY A FRAME AGO — the fading half of an
         // in-place crossfade — so it steps aside with the body, or the swap
         // frame splits one cat into two a perch apart. A running ghost is
-        // its own motion and keeps its door.
+        // its own motion and keeps its door, and a re-sighting ghost is not
+        // this body at all: it is the replaced surface's body, standing where
+        // the user saw it (on its own glass, in another pane's cells).
         for (record, drawn) in self.departures.iter_mut().zip(frame.departures.iter_mut()) {
-            if let Some(record) = record.as_mut().filter(|d| d.still) {
+            if let Some(record) = record.as_mut().filter(|d| d.still && !d.resight) {
                 record.from_col += dx;
                 record.edge += dx;
                 record.row += dy;
@@ -2013,26 +1895,12 @@ impl PetBrain {
             return;
         }
         if let Some(pose) = self.console.pose {
-            // The contact is a pose over the existing displacement. Flights
-            // keep their own silhouette unless this is the console's trip.
-            //
-            // A SETTLED CAT'S OWN ANIMATION IS ITS OWN. `|| self.action
-            // .settled()` used to stand here, and `settled()` is
-            // Sleep|Sit|Loaf|Purr|Groom|Perk|Stand — so one keystroke, which
-            // sets `console.pose = Some(PetStandEar)` and leaves `resident`
-            // FALSE, pinned a sitting, loafing, grooming or sleeping cat
-            // into a single stand-ear silhouette with `scale = 1` and
-            // `purr = 0` for the whole of INPUT_HOLD, while its own action
-            // still said Loaf. Measured on a Sit: one pose for 36 frames,
-            // against a tail-flicking cat with the layer off. That is the
-            // pet losing its own life the moment you type, and it is exactly
-            // the state where this layer has the LEAST to say — the cat is
-            // doing nothing that needs correcting.
-            //
-            // Contact stays: advancing ink running into the body is a real
-            // located event with a 0.40 s hold, not a standing claim on the
-            // silhouette, and it is one of the features this restoration
-            // keeps.
+            // The contact is a pose over the existing displacement; flights
+            // keep their own silhouette unless this is the console's trip. A
+            // settled cat's own animation (sit, loaf, groom, sleep) is left
+            // alone while typing: the layer has nothing to correct there.
+            // Contact (advancing ink running into the body, a 0.40 s hold)
+            // still applies.
             if !self.console_legacy_motion_pending()
                 && self.action != PetAction::Land
                 && (self.console.resident || self.console.attention == PetAttention::Contact)
@@ -2049,110 +1917,112 @@ impl PetBrain {
                 frame.lift = self.console.lift;
             }
             frame.motes = [None; PET_MOTES_MAX];
-            // NOT `frame.departures`: the departing ghost is the other half
-            // of a crossfade whose live half this frame is about to draw,
-            // and it is judged below, by the body's law, together with it.
+            // Not `frame.departures`: the departing ghost is the other half of
+            // a crossfade and is judged below with the body.
         }
         self.place_console_body_at_home(frame, sense);
         let Some(world) = self.console.world.as_ref() else {
+            // A host that feeds no world cannot judge a re-sighting ghost's
+            // new ground (`Departure::resight`), so it never draws one.
+            for (slot, live) in frame.departures.iter_mut().zip(&self.departures) {
+                if live.is_some_and(|d| d.resight) {
+                    *slot = None;
+                }
+            }
             return;
         };
         if world.stamp().is_none() {
             // NO CERTIFIED MAP AT ALL — not "I cannot see this rectangle" but
-            // "I cannot see anything". The pet is drawn only over pixels this
-            // observation certified, so an incoherent surface draws nothing.
-            // That is the shipped rule and it stays: reflow, a mid-scroll
-            // fractional offset and a stale snapshot all land here, and none
-            // of them can vouch for the position the pet is standing in.
-            //
-            // It deliberately does NOT reach the visibility hold below. A
-            // surface that went momentarily incoherent is not evidence of
-            // INK, and must not spend the dwell that keeps a real
-            // obstruction honest — nor may it clear `on_glass`, which would
-            // hand the next tick's reseat a teleport it has not earned.
-            frame.alpha = 0;
-            frame.lane_alpha = 0;
+            // "I cannot see anything": a stale snapshot, a resize frame whose
+            // cells and facts straddle two grids. Nothing new is licensed
+            // here — the tick froze the body where it stood, and no station,
+            // perch or ghost is judged against a map that does not exist.
             frame.motes = [None; PET_MOTES_MAX];
-            frame.departures = [None; PET_DEPARTURES_MAX];
-            self.console.clipped = true;
             self.console.attention = PetAttention::Yielding;
             self.console.reason = "incoherent-surface";
+            if self.console.on_glass && frame.alpha > 0 {
+                // A BODY ALREADY ON GLASS IS HELD, not cut (2026-10-01). It
+                // stands exactly where the last certified frame judged it,
+                // and "I cannot see" is the visibility hold's own unknown: it
+                // keeps the verdict that body already had, and only an
+                // unbroken blind run of [`VETO_BLIND`] counts as obstruction
+                // and fades it over [`VETO_FADE`]. Cutting to alpha zero here
+                // — the shipped rule until then — blinked the resident for
+                // one frame on every incoherent read: a resize frame, a
+                // snapshot a present reused. The z-order is held for the
+                // same reason: a body under the glyphs stays under them.
+                let cover = self.console.hold.update(sense.now, None);
+                frame.alpha = cover_alpha(frame.alpha, cover);
+                frame.lane_alpha = cover_alpha(frame.lane_alpha, cover);
+                frame.under_ink |= self.console.z.under;
+                // A re-sighting ghost stands on glass this blind map would
+                // have to judge (`Departure::resight`): it goes.
+                for (slot, live) in frame.departures.iter_mut().zip(&self.departures) {
+                    if live.is_some_and(|d| d.resight) {
+                        *slot = None;
+                    }
+                }
+                if frame.alpha == 0 {
+                    frame.departures = [None; PET_DEPARTURES_MAX];
+                }
+                self.console.on_glass = frame.alpha > 0;
+                return;
+            }
+            // NOTHING WAS ON GLASS: the pet is drawn only over pixels an
+            // observation certified, so a first appearance on an incoherent
+            // surface draws nothing.
+            //
+            // This bypasses the visibility hold: momentary incoherence is not
+            // evidence of ink, must not spend the dwell, and must not clear
+            // `on_glass` (which would grant the next reseat a teleport).
+            frame.alpha = 0;
+            frame.lane_alpha = 0;
+            frame.departures = [None; PET_DEPARTURES_MAX];
+            self.console.clipped = true;
+            self.console.z = ZHold::default();
             return;
         }
-        let body = frame
-            .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-            .map(|(x0, x1, y0, y1)| {
-                let cw = f32::from(sense.cell_w.max(1));
-                let ch = f32::from(sense.cell_h.max(1));
-                PetRect::new(
-                    y0 as f32 / ch,
-                    x0 as f32 / cw,
-                    (y1 - y0) as f32 / ch,
-                    (x1 - x0) as f32 / cw,
-                )
-            });
-        // THE BODY IS STILL EXACTLY WHERE IT IS, whatever the veto decides.
-        // v0.81.0 cleared this on a vetoed frame; the next tick's
-        // `reseat_unshown_console_body` then read the absence as "the
-        // previous emission contained no body", TELEPORTED the pet to a new
-        // station and set `alpha = 0`, restarting the 0.30 s fade. The veto
-        // and the reseat retriggering each other is the self-sustaining
-        // blink the owner reported. `on_glass`, set below, is the separate
-        // and explicit fact the reseat actually wanted.
+        let body = body_rect(frame, sense);
+        // The body is still where it is, whatever the veto decides; clearing it
+        // would make the next reseat teleport the pet and restart its fade.
+        // `on_glass`, set below, is the separate fact the reseat reads.
         if let Some(rect) = body {
             self.console.last_body = Some(rect);
+            self.console.last_seat = Some((self.col, self.row));
         }
-        // SELECTED TEXT SUBORDINATES THE PET AT ONCE, and is deliberately
-        // NOT held: a selection is a user act, not a per-frame perception
-        // wobble, and the whole point of selecting text is to read or copy
-        // it right now. The union of the examined selected cells is a
-        // conservative box — over-yielding here is the safe direction, and
-        // selections do not change at the keystroke rate, so it cannot
-        // strobe. (Shipped rule, carried by the resident-handoff and
-        // landing-wake conformance suites, kept exactly.)
+        // Selected text subordinates the pet at once, without the hold: a
+        // selection is a user act, not perception wobble. The union of selected
+        // cells is a conservative box (over-yielding is safe), and selections
+        // change too slowly to strobe.
         let selected = body
             .zip(world.selection_rect())
             .is_some_and(|(b, s)| b.overlaps(s));
         if self.console.clipped || selected {
-            // PLACEMENT ALREADY SEARCHED THE WHOLE REACH this tick and found
-            // nowhere safe to stand — a dense screen. That is a SEARCHED
-            // result, not a bound on perception, and the shipped rule (the
-            // derived resident-handoff model carries it) is that it yields
-            // at once. The envelope is moved to where the glass already is
-            // rather than left to fight it.
+            // Placement searched the whole reach this tick and found nowhere to
+            // stand (a dense screen): a searched result, so it yields at once,
+            // moving the envelope to where the glass already is.
             frame.alpha = 0;
             frame.lane_alpha = 0;
             self.console.hold.hide_now(sense.now);
+            self.console.z = ZHold::default();
             self.console.clipped = true;
             if !self.console.reason.starts_with("protected-") {
                 self.console.reason = "protected-footprint";
             }
         } else {
-            // THE VISIBILITY VERDICT, THREE-VALUED. `None` means "I cannot
-            // see there" — a body outside the caret-centred coverage window,
-            // which SLIDES AS THE USER TYPES, or no body to certify at all —
-            // and it is NOT evidence of ink. The hold spends it as such: an
-            // unknown keeps whatever verdict was already held.
+            // The visibility verdict is three-valued: `None` ("cannot see
+            // there", e.g. outside the caret-centred coverage window) is not
+            // evidence of ink, and the hold keeps the previous verdict on it.
             //
-            // `under_text_clearance_past_caret`, and each half of that name
-            // is one of the two sides this reconciliation had to keep:
+            // `under_text_clearance_past_caret`:
             //
-            //  * UNDER TEXT — ordinary ink in front of the body is a Z-ORDER
-            //    fact, not an identity one, so it can no longer switch a
-            //    resident off. `frame.under_ink` below is what the renderer
-            //    does with it instead.
-            //  * PAST CARET — PLACEMENT keeps the caret protected so the pet
-            //    never comes to REST on the cursor, but a pet merely walking
-            //    PAST the caret must not be deleted for the two frames it
-            //    overlaps that one cell. The pet is the caret's ESCORT, and
-            //    with the pet now HOMED on the caret (HOME_REACH) that ring
-            //    is exactly where it lives.
+            //  * under text: ordinary ink in front of the body is a z-order
+            //    fact (`frame.under_ink` below), not a reason to hide;
+            //  * past caret: placement keeps the caret protected so the pet
+            //    never rests on it, but a pet walking past it must not vanish
+            //    for the frames it overlaps. The escort lives in that ring.
             //
-            // A frame with NO BODY goes to `idle`, not to `update`: the
-            // emitter is drawing nothing of its own accord (an arrival fade
-            // that has not started, no caret, a finished retirement), which
-            // is neither evidence about the place the pet stands nor
-            // blindness about it — there is no rectangle to be blind about.
+            // A frame with no body goes to `idle`, not `update`.
             let verdict = body.map(|rect| world.under_text_clearance_past_caret(rect, 0.0));
             let cover = match verdict {
                 Some(verdict) => self.console.hold.update(sense.now, verdict),
@@ -2167,33 +2037,33 @@ impl PetBrain {
                 if !self.console.reason.starts_with("protected-") {
                     self.console.reason = "protected-footprint";
                 }
-                // THE FOOTPRINT IS REFUSED ONLY ONCE THE YIELD HAS COMPLETED.
-                // While the ramp is still running the pet is genuinely on
-                // glass and still owes frames, so `clipped` — which
-                // `console_frames` reads as "nothing further to draw" — must
-                // not be latched until the cover has actually reached zero.
+                // The footprint is refused only once the yield has completed:
+                // while the ramp runs the pet is on glass and owes frames, so
+                // `clipped` waits for the cover to reach zero.
                 self.console.clipped |= frame.alpha == 0;
             }
             // ORDINARY TERMINAL INK IS IN FRONT OF THE FULL BODY. A busy
             // prompt must not switch a resident off or shrink it — it
-            // changes the z-order and nothing else. The strict (two-valued)
-            // reading is the right one to ask here: an unobserved rectangle
-            // answers `false` and draws under the text, which is the safe
-            // direction for a layering decision.
-            if body.is_some_and(|rect| !world.clear(rect, 0.0)) {
-                frame.under_ink = true;
+            // changes the z-order and nothing else, and that z-order is
+            // HELD (`ZHold`). Only real INK is asked about, never the
+            // caret's keep-off ring: an unobserved rectangle still answers
+            // inked and draws under the text, the safe direction for a
+            // layering decision.
+            match body.filter(|_| frame.alpha > 0) {
+                Some(rect) => {
+                    let ink = world.ink_clearance(rect, 0.0) != Some(true);
+                    frame.under_ink |= self.console.z.update(sense.now, ink);
+                }
+                None => self.console.z = ZHold::default(),
             }
         }
         if frame.alpha == 0 {
             frame.motes = [None; PET_MOTES_MAX];
             frame.departures = [None; PET_DEPARTURES_MAX];
         }
-        // `clipped` is set by the two branches above, which are the only ones
-        // that REFUSE a footprint. It is deliberately NOT set here: a frame
-        // can be transparent because the pet is still FADING IN — its own
-        // 0.30 s arrival ramp, or a first capture — and latching the refusal
-        // on that turned the very next frame, with a certified-clear verdict
-        // under it, into a permanent blank.
+        // `clipped` is set only by the two refusing branches above, not here:
+        // a transparent frame may just be fading in, and latching a refusal
+        // then would blank the next, clear frame.
         self.console.on_glass = frame.alpha > 0;
         // The whole emitted sprite, including motes and departing bodies,
         // is subordinate to selected text and the current occupancy map.
@@ -2212,53 +2082,64 @@ impl PetBrain {
                 *mote = None;
             }
         }
-        // ONE CROSSFADE, ONE VISIBILITY LAW. The emitter draws a departing
-        // ghost at `d.alpha × lane_alpha / 255`, and `lane_alpha` above
-        // already carries this frame's cover: whatever the verdict lets the
-        // BODY show, the ghost shows the same factor times its own
-        // departure ramp, and the two ramp down TOGETHER — a body at alpha
-        // 0 (an incoherent surface, a searched-and-refused footprint, a
-        // selection under it) took every ghost with it above. What is left
-        // to decide here is the ghost's OWN rectangle, and it gets the body's
-        // rule there too:
+        // One crossfade, one visibility rule. The emitter draws a departing
+        // ghost at `d.alpha × lane_alpha / 255`, and `lane_alpha` carries this
+        // frame's cover, so body and ghost ramp together (a body at alpha 0
+        // took every ghost with it above). The ghost's own rectangle gets the
+        // body's rule:
         //
-        //  * SELECTED TEXT subordinates it AT ONCE — the body's `selected`
-        //    arm, a user act and not a perception, so it cannot strobe;
-        //  * nothing else culls a ghost BY ITSELF. This used to delete the
-        //    ghost on any `Some(false)` under it (an image, uncertified
-        //    geometry — and, before the crossfade fix, ordinary ink), an
-        //    obstruction the BODY is granted VETO_DWELL and a VETO_FADE ramp
-        //    for. Two halves of one crossfade under two laws is a one-sided
-        //    hide, and on glass it is the arriver alone at 6 %: a blink.
+        //  * selected text subordinates it at once;
+        //  * nothing else culls a ghost by itself (an obstruction gets the
+        //    body's dwell and ramp).
         //
         // A ghost with no on-grid rectangle at all is dropped: there is
         // nothing to draw.
+        //
+        // THE RE-SIGHTING GHOST is the one exception, because it is the one
+        // ghost whose rectangle the body never stood on in THIS world: it is
+        // the old surface's body fading on glass a new screen now owns
+        // (`Departure::resight`). It is kept only where this map certifies
+        // nothing protected — no selection, image, overlay or unseen cell —
+        // and it goes under whatever ink the new screen has there, so the
+        // text in front of it stays legible. Over anything else it is
+        // dropped, and the arriver fades in alone, as a fresh sighting does.
+        //
+        // A GHOST ON ITS OWN GLASS (`Departure::own_glass`) is not on this
+        // map at all: it stands in the pane the focus left, in that pane's
+        // cells, and this world is the new pane's. Its own surface admitted it
+        // at the boundary (`PetBrain::displace_resight`), and it stays
+        // beneath that pane's ink, which nobody observes after it.
         let base = *frame;
         let selection = world.selection_rect();
-        for departure in &mut frame.departures {
-            if departure.is_some_and(|d| {
-                // Copying the frame before setting the ghost fields also avoids
-                // a stock-rustc MIR ICE for PetFrame's const-sized arrays on
-                // foreign targets (Linux ARM and Windows).
-                let mut ghost = base;
-                ghost.alpha = d.alpha;
-                ghost.col = d.col;
-                ghost.row = d.row;
-                ghost.lift = 0.0;
-                ghost.scale_x = 1.0;
-                ghost.scale_y = 1.0;
-                ghost
-                    .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-                    .is_none_or(|(x0, x1, y0, y1)| {
-                        let rect = PetRect::new(
-                            y0 as f32 / f32::from(sense.cell_h.max(1)),
-                            x0 as f32 / f32::from(sense.cell_w.max(1)),
-                            (y1 - y0) as f32 / f32::from(sense.cell_h.max(1)),
-                            (x1 - x0) as f32 / f32::from(sense.cell_w.max(1)),
-                        );
-                        selection.is_some_and(|s| rect.overlaps(s))
-                    })
-            }) {
+        for (departure, live) in frame.departures.iter_mut().zip(&self.departures) {
+            let Some(d) = departure.as_mut() else {
+                continue;
+            };
+            if live.is_some_and(|l| l.own_glass) {
+                d.under_ink = true;
+                continue;
+            }
+            // Copying the frame before setting the ghost fields also avoids
+            // a stock-rustc MIR ICE for PetFrame's const-sized arrays on
+            // foreign targets (Linux ARM and Windows).
+            let mut ghost = base;
+            ghost.alpha = d.alpha;
+            ghost.col = d.col;
+            ghost.row = d.row;
+            ghost.lift = 0.0;
+            ghost.scale_x = 1.0;
+            ghost.scale_y = 1.0;
+            let keep = match body_rect(&ghost, sense) {
+                None => false,
+                Some(rect) if selection.is_some_and(|s| rect.overlaps(s)) => false,
+                Some(rect) if live.is_some_and(|l| l.resight) => {
+                    let admitted = world.under_text_clearance_past_caret(rect, 0.0) == Some(true);
+                    d.under_ink = world.ink_clearance(rect, 0.0) != Some(true);
+                    admitted
+                }
+                Some(_) => true,
+            };
+            if !keep {
                 *departure = None;
             }
         }
@@ -2268,20 +2149,14 @@ impl PetBrain {
         if !self.console.presentable || self.console_legacy_motion_pending() {
             return None;
         }
-        // A visibility hold in transit is a FADE ON GLASS and a dwell still
-        // counting: it owes frames whatever else the pet is doing, or the
-        // ramp stalls until some unrelated repaint happens to tick it.
+        // A visibility hold in transit is a fade on glass and a counting dwell:
+        // it owes frames, or the ramp stalls until an unrelated repaint.
         if !self.console.hold.settled() {
             return Some(true);
         }
-        // SO IS A LOOK SWAP IN TRANSIT: the incoming body's arrival ramp
-        // and the departing ghost's fade are finite envelopes ON GLASS, and
-        // this layer answers the frame-train question FIRST for a resident
-        // (`needs_frames` returns whatever it says here before it ever
-        // reaches the departure and arrival terms below it). A resident
-        // that had nothing else to animate answered `Some(false)` over a
-        // half-drawn crossfade, and the swap stalled wherever the last
-        // unrelated repaint left it.
+        // So is a look swap in transit (the incoming arrival ramp and the
+        // departing ghost's fade). This layer answers the frame-train question
+        // first for a resident, so it must count them here or the swap stalls.
         if self.arrive_t > 0.0 || self.departures.iter().any(Option::is_some) {
             return Some(true);
         }
@@ -2321,10 +2196,8 @@ impl PetBrain {
             .console
             .progress_at
             .map(|at| at + Duration::from_millis(350));
-        // THE SPENT PERCH'S OWN EDGE. Without this the resident that has
-        // nothing left to react to offers nothing at all, and the release
-        // below can never be reached — the dwell would be a timer nothing
-        // ticks. Finite by construction: one dwell per perch.
+        // The spent perch's own edge; without it the dwell would be a timer
+        // nothing ticks. One dwell per perch.
         let perch = self
             .console
             .perched_since
@@ -2336,6 +2209,9 @@ impl PetBrain {
             result,
             progress,
             perch,
+            // A pet held under the glyphs surfaces when its clear run lands,
+            // even if nothing else on screen asks for a frame by then.
+            self.console.z.deadline(),
             self.console.repair_until,
             self.console.failure_quiet_until,
         ]
@@ -2364,10 +2240,73 @@ impl PetBrain {
     }
 }
 
+/// A body standing still at `(col, row)` — no lift, no squash — in
+/// fractional grid cells: the neutral-scale `PetFrame::body_px` projection,
+/// including the origin, the feet and the grid clamp. Fractional flight
+/// landings can straddle a protected cell before rounding even though the
+/// actual displayed body clears it.
+fn still_body_rect(seat: (f32, f32), cell: (u16, u16), grid: (u16, u16)) -> PetRect {
+    let cw = f32::from(cell.0.max(1));
+    let ch = f32::from(cell.1.max(1));
+    let h = (ART_ROWS * ch).round().clamp(1.0, f32::from(u16::MAX));
+    let w = (h * ART_ASPECT).round().clamp(1.0, f32::from(u16::MAX));
+    let x = (seat.0 * cw)
+        .round()
+        .clamp(0.0, (f32::from(grid.0) * cw - w).max(0.0));
+    let y = (((seat.1 + 1.0) * ch).round() - h).clamp(0.0, (f32::from(grid.1) * ch - h).max(0.0));
+    PetRect::new(y / ch, x / cw, h / ch, w / cw)
+}
+
+/// The frame's body in cell units: [`PetFrame::body_px`]'s pixel box divided
+/// back through the cell size.
+fn body_rect(frame: &PetFrame, sense: PetSense) -> Option<PetRect> {
+    frame
+        .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+        .map(|(x0, x1, y0, y1)| {
+            let cw = f32::from(sense.cell_w.max(1));
+            let ch = f32::from(sense.cell_h.max(1));
+            PetRect::new(
+                y0 as f32 / ch,
+                x0 as f32 / cw,
+                (y1 - y0) as f32 / ch,
+                (x1 - x0) as f32 / cw,
+            )
+        })
+}
+
+/// The caret's OWN writing this frame, pane-local `(row, first, end)`: the
+/// cells between the last ticked caret and the visible one on its row (the
+/// cell just behind the caret when the caret changed rows or went unseen),
+/// at most [`TYPED_RUN_MAX`]. A glyph typed there is the escort's next step,
+/// not ink arriving at the cat: counted as contact it braced the escort on
+/// the first key of every burst, the brace sliding sideways under the chase.
+/// Ink anywhere else — a completion, output, text the caret did not write —
+/// still touches.
+fn typed_run(
+    input: &aterm_core::render::RenderInput,
+    pane: PetPane,
+    last: Option<(u16, u16)>,
+) -> Option<(usize, usize, usize)> {
+    if !input.cursor_visible || input.display_offset != 0 {
+        return None;
+    }
+    let row = input.cursor_row.checked_sub(pane.row)?;
+    let col = input.cursor_col.checked_sub(pane.col)?;
+    let first = last
+        .filter(|&(r, c)| usize::from(r) == row && usize::from(c) < col)
+        .map_or(col.saturating_sub(1), |(_, c)| usize::from(c));
+    Some((row, first.max(col.saturating_sub(TYPED_RUN_MAX)), col))
+}
+
 /// Compare occupied ink at the SAME body rectangle before/after observation.
 /// Moving a cat or a caret toward old ink cannot manufacture contact. This
 /// tiny independent mask includes at most 16×32 cells; overflow is no claim.
-fn local_ink(world: &PetWorld, body: PetRect) -> Option<[u64; 8]> {
+/// Cells of the caret's own `typed` run ([`typed_run`]) read as blank.
+fn local_ink(
+    world: &PetWorld,
+    body: PetRect,
+    typed: Option<(usize, usize, usize)>,
+) -> Option<[u64; 8]> {
     world.stamp()?;
     let r0 = (body.row - CONTACT_MARGIN).floor().max(0.0) as usize;
     let c0 = (body.col - CONTACT_MARGIN).floor().max(0.0) as usize;
@@ -2381,11 +2320,14 @@ fn local_ink(world: &PetWorld, body: PetRect) -> Option<[u64; 8]> {
         for c in c0..c1 {
             match world.ink_at(r, c) {
                 None => return None,
-                Some(true) => {
+                Some(true)
+                    if !typed
+                        .is_some_and(|(row, first, end)| r == row && (first..end).contains(&c)) =>
+                {
                     let i = (r - r0) * 32 + c - c0;
                     bits[i / 64] |= 1 << (i % 64);
                 }
-                Some(false) => {}
+                Some(_) => {}
             }
         }
     }
@@ -2533,30 +2475,69 @@ mod tests {
         assert!(s.pet.next_change_deadline(s.now).is_none());
     }
 
+    /// THE INCOHERENT FRAME HOLDS, AND ONLY HOLDS (2026-10-01). A stale
+    /// snapshot — the cells read before the terminal changed — certifies
+    /// nothing, so it licenses nothing: no move toward the caret it reports,
+    /// no legacy placement, no first appearance. But a body ALREADY on glass
+    /// is the visibility hold's unknown, not its obstruction: it stays where
+    /// the last certified frame judged it, at its opacity, until an unbroken
+    /// blind run of `VETO_BLIND` counts as obstruction and fades it over
+    /// `VETO_FADE`. The shipped rule cut it to alpha zero on the first
+    /// incoherent frame — the one-frame blink of a resize frame or a reused
+    /// snapshot. CONTROLS: the hold ends (an unbroken blind run fades the
+    /// body out), and a pet that was not on glass still draws nothing.
     #[test]
     fn an_incoherent_observation_never_falls_back_to_uncertified_legacy_placement() {
+        let incoherent = |s: &mut Scene, ms: u64| {
+            let input = s.term.cell_frame(20, 80);
+            s.term.process(b"changed");
+            let facts = PetWorldFacts::read(&s.term, 17);
+            s.pet.observe_console(&input, &facts, PetPane::full(&input));
+            s.now += Duration::from_millis(ms);
+            s.pet.tick(PetSense {
+                caret_drawn: true,
+                now: s.now,
+                caret: Some((5, 23)),
+                wrapped: false,
+                rows: 20,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+            })
+        };
         let mut s = Scene::new();
-        let input = s.term.cell_frame(20, 80);
-        s.term.process(b"changed");
-        let facts = PetWorldFacts::read(&s.term, 17);
-        s.pet.observe_console(&input, &facts, PetPane::full(&input));
-        s.now += Duration::from_millis(16);
-        let f = s.pet.tick(PetSense {
-            caret_drawn: true,
-            now: s.now,
-            caret: Some((5, 23)),
-            wrapped: false,
-            rows: 20,
-            cols: 80,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-        });
-        assert_eq!(f.alpha, 0);
-        assert_eq!(f.lane_alpha, 0);
+        let before = s.frame(0.016);
+        assert_eq!(before.alpha, 255, "fixture: the resident is on glass");
+        let f = incoherent(&mut s, 16);
         assert_eq!(s.pet.console_reason(), "incoherent-surface");
+        assert_eq!(
+            (f.alpha, f.lane_alpha),
+            (before.alpha, before.lane_alpha),
+            "the body on glass is held, not cut"
+        );
+        assert_eq!(
+            (f.col, f.row),
+            (before.col, before.row),
+            "…exactly where the last certified frame judged it"
+        );
+        // The grace is bounded: blindness that never ends is obstruction.
+        let mut last = f;
+        for _ in 0..80 {
+            last = incoherent(&mut s, 16);
+        }
+        assert_eq!(last.alpha, 0, "an unbroken blind run fades the body out");
+        assert_eq!((last.col, last.row), (before.col, before.row));
+
+        // A pet that was not on glass is never MATERIALIZED by an
+        // uncertified map — the original law, unchanged.
+        let mut cold = Scene::new();
+        cold.pet.console.on_glass = false;
+        let f = incoherent(&mut cold, 16);
+        assert_eq!((f.alpha, f.lane_alpha), (0, 0));
+        assert_eq!(cold.pet.console_reason(), "incoherent-surface");
     }
 
     #[test]
@@ -2597,13 +2578,10 @@ mod tests {
         assert_ne!(s.pet.console_attention(), PetAttention::Result);
     }
 
-    /// THE FROZEN DECAL. A content perch taken after a command finished has
-    /// no live event left to react to, yet `console_frames()` answers
-    /// `Some(false)` and `console_deadline()` answers `None`: the resident is
-    /// left with NO FUTURE AT ALL — no frame train, and no wake instant
-    /// either — so it can never breathe, blink, settle or sleep, and it can
-    /// never notice that the caret has walked away. A pet that cannot be
-    /// ticked again is a decal.
+    /// A content perch taken after a command finished must not leave the
+    /// resident with no future (`console_frames()` `Some(false)` and
+    /// `console_deadline()` `None`): it must still breathe, blink, settle,
+    /// sleep and notice the caret leaving.
     #[test]
     fn a_spent_content_perch_hands_the_pet_back_its_own_life() {
         let mut s = Scene::new();
@@ -2618,12 +2596,9 @@ mod tests {
             PetAttention::Exploring,
             "fixture: the surviving anchor is the content perch"
         );
-        // Let the pet ARRIVE, then hold the screen perfectly still. It walks
-        // there on its own feet — the console layer no longer teleports a
-        // body to a perch, so the arrival costs real frames — and the dwell
-        // deliberately measures SETTLED time, so it cannot start until the
-        // walk and its trip are over. Waiting on the pet itself keeps this
-        // budget honest whatever the gait costs.
+        // Let the pet arrive (it walks there, costing real frames), then hold
+        // the screen still; the dwell measures settled time, so wait on the pet
+        // itself.
         for _ in 0..240 {
             s.frame(0.016);
             if !s.pet.console.moving && !s.pet.needs_frames() {
@@ -2634,14 +2609,9 @@ mod tests {
             s.pet.needs_frames() || s.pet.next_change_deadline(s.now).is_some(),
             "a resident with nothing left to react to must still own a future"
         );
-        // …and that future is its own life: the perch is spent, so the pet
-        // goes back to escorting the caret and running the idle ladder.
-        //
-        // The budget is DERIVED from the bound it is testing. Written out as
-        // `3 * 62` frames it was 2.976 s — SHORT of [`PERCH_DWELL`] — and
-        // passed only on slack donated by a console layer that teleported
-        // the body to its perch instead of letting the pet walk there. A
-        // test for a 3.0 s bound has to run past 3.0 s on its own.
+        // That future is its own life: the perch is spent, so the pet goes back
+        // to escorting the caret and the idle ladder. The budget is derived
+        // from [`PERCH_DWELL`] so the test runs past the bound on its own.
         for _ in 0..((PERCH_DWELL / 0.016).ceil() as usize + 2) {
             s.frame(0.016);
         }
@@ -2656,20 +2626,13 @@ mod tests {
         );
     }
 
-    /// THE ESCORT. When no perch is in reach the console layer knows nothing
-    /// about where the pet belongs — that is not the same as "stay exactly
-    /// where you are", which is what it used to answer, and which stops the
-    /// pet following the caret at all.
+    /// The escort: when no perch is in reach, `console_station` answers `None`
+    /// rather than "stay where you are", so the pet keeps following the caret.
     ///
-    /// THE FIXTURE IS DOUBLE-WIDTH LINES, not dense ink, and the change is
-    /// part of this reconciliation. A screen packed with `X` used to offer
-    /// nowhere to stand; a resident may now stand UNDER ordinary ink
-    /// (`under_text_clear`), so dense text is no longer a screen with no
-    /// perch on it. DECDWL is: a non-single-width line has no certified
-    /// cell-to-pixel projection, so every cell is `Protected` and the
-    /// under-text reading refuses it too. The subject of the test is
-    /// unchanged — what `console_station` answers when the search genuinely
-    /// comes back empty.
+    /// The fixture uses double-width lines: a resident may stand under
+    /// ordinary ink, but a DECDWL line has no certified cell-to-pixel
+    /// projection, so every cell is `Protected` and the search comes back
+    /// empty.
     #[test]
     fn no_perch_in_reach_is_not_an_opinion_about_where_the_pet_belongs() {
         let mut s = Scene::new();
@@ -2872,12 +2835,9 @@ mod tests {
             assert!(!model.check_invariant("UnknownClearsHome", &leaked));
         }
     }
-    /// MEASURED ON GLASS (0.83.0, cascade_typing take, frames 366-397): a
-    /// look swap that landed while a command's output owned the resident
-    /// left the incoming cat at 27 % for 660 ms — fifteen presented frames
-    /// with `pet_reason=protected-displacement` — and it ramped only once
-    /// the prompt returned. The arrival clock was decayed after the console
-    /// arms' early return, so a resident-owned tick never advanced it.
+    /// A look swap that lands while a command's output owns the resident must
+    /// still ramp the incoming cat in, not leave it at partial opacity until
+    /// the prompt returns: resident-owned ticks advance the arrival clock.
     #[test]
     fn a_look_swaps_arrival_ramp_runs_while_the_console_resident_owns_the_tick() {
         let mut s = Scene::new();
@@ -2924,12 +2884,9 @@ mod tests {
         );
     }
 
-    /// MEASURED ON GLASS (0.83.0, onto take, frames 256-268): the cat stood
-    /// on the wrapped command line it had just run; a look swap landed and
-    /// the departing ghost — the SAME body one frame earlier — was culled
-    /// under the strict `clear`, so the presented frame carried only the
-    /// arriver at 29 % and no ghost. The ghost keeps the body's law: ink
-    /// does not cull it, a protected surface still does.
+    /// A look swap on a cat standing on text: the departing ghost (the same
+    /// body a frame earlier) keeps the body's rule, so ink does not cull it
+    /// while a protected surface still does.
     #[test]
     fn a_departing_ghost_over_ordinary_ink_survives_and_over_a_selection_does_not() {
         let mut s = Scene::new();
@@ -2949,6 +2906,9 @@ mod tests {
             facing_left: false,
             stride0: 0.0,
             pose0: PetGlyphId::PetSit,
+            resight: false,
+            own_glass: false,
+            peak: 1.0,
         };
         s.pet.departures[0] = Some(ghost(&s));
         let f = s.frame(0.016);
@@ -2957,10 +2917,8 @@ mod tests {
             f.departures[0].is_some(),
             "ordinary ink under the ghost is a z-order fact, not a cull"
         );
-        // A selection over the same cells: the BODY steps aside (the console
-        // layer's nearest perch) and its still ghost — the same cat a frame
-        // ago — steps aside WITH it, one cat and one move, so neither stands
-        // on the selection and neither is hidden without the other.
+        // A selection over the same cells: the body steps aside and its still
+        // ghost steps aside with it, one cat and one move.
         s.term.text_selection_mut().start_selection(
             4,
             20,
@@ -2984,10 +2942,9 @@ mod tests {
             f.col,
             f.row
         );
-        // A RUNNING ghost has its own door and does not follow the body:
-        // over the selection it is culled at once, as the body's own
-        // `selected` arm would hide the body — the same rule at its own
-        // rectangle, and the only cull a ghost is ever dealt alone.
+        // A running ghost has its own door and does not follow the body: over
+        // the selection it is culled at once, the only cull a ghost is dealt
+        // alone.
         s.pet.departures[0] = Some(Departure {
             still: false,
             edge: 0.0,
@@ -3001,6 +2958,58 @@ mod tests {
             f.departures[0].is_none(),
             "a selection under a running ghost culls it at once, as it culls the body"
         );
+    }
+
+    /// THE GHOST ON ITS OWN GLASS IS ADMITTED BY ITS OWN WORLD, AT THE
+    /// BOUNDARY (`PetBrain::displace_resight`): a split-pane focus switch
+    /// spends the old body in the pane the focus left only where that pane's
+    /// last observation — the one the body was drawn against — certified
+    /// nothing protected under it. Spent, it stands at the old body's cell
+    /// beneath that pane's text while the arriver comes up at its own
+    /// station. CONTROL: a selection under the body in that observation
+    /// refuses it, and the arriver fades in alone.
+    #[test]
+    fn a_ghost_on_its_own_glass_needs_its_own_worlds_admission() {
+        let switch = |select: bool| {
+            let mut s = Scene::new();
+            s.pet.worn = Some((1, 1));
+            let before = s.frame(0.016);
+            assert_eq!(before.alpha, 255, "fixture: on glass");
+            if select {
+                s.term.text_selection_mut().start_selection(
+                    4,
+                    20,
+                    SelectionSide::Left,
+                    SelectionType::Simple,
+                );
+                s.term
+                    .text_selection_mut()
+                    .update_selection(5, 30, SelectionSide::Right);
+                let input = s.term.cell_frame(20, 80);
+                let facts = PetWorldFacts::read(&s.term, 17);
+                s.pet.observe_console(&input, &facts, PetPane::full(&input));
+            }
+            s.pet.resight_coordinate_space();
+            s.pet.displace_resight();
+            let kept = s.pet.has_own_glass_ghost();
+            // The new pane's caret, elsewhere: the arriver's station.
+            s.term.process(b"\x1b[15;40H");
+            (kept, before, s.frame(0.016))
+        };
+        let (kept, before, f) = switch(false);
+        assert!(kept, "clear ground admits the ghost");
+        let d = f.departures[0].expect("the ghost is spent on its own glass");
+        assert!(d.own_glass && d.under_ink, "{d:?}");
+        assert_eq!(
+            (d.col, d.row),
+            (before.col, before.row),
+            "it stands at the old body's cell, whatever the new world holds there"
+        );
+        assert!(f.alpha > 0, "beside the arriver");
+
+        let (kept, _, f) = switch(true);
+        assert!(!kept, "control: a selection under the body refuses it");
+        assert!(f.departures.iter().all(Option::is_none));
     }
 
     /// MEASURED ON GLASS (0.83.0 with the crossfade fix, the Claude-Code-
@@ -3048,8 +3057,8 @@ mod tests {
             "the swap spawned its ghost"
         );
         let pre = u32::from(landing.lane_alpha);
-        // THE CLAUDE-CODE SHAPE: the caret hides for the repaint and the
-        // resident holds the body where it stands, owning every tick.
+        // The Claude Code shape: the caret hides for the repaint and the
+        // resident holds the body, owning every tick.
         s.term.process(b"\x1b[?25l");
         let mut ticks = 0u32;
         let mut resident_ticks = 0u32;
@@ -3095,13 +3104,10 @@ mod tests {
         );
     }
 
-    /// The ghost's OWN rectangle gets the body's rule and nothing stricter:
-    /// a selection culls it at once (the body's `selected` arm), and NOTHING
-    /// ELSE culls it by itself. Here the ghost stands on a double-width line
-    /// — protected ground, `Some(false)`, not a selection — while the live
-    /// body stands clear three rows up: the old reading deleted the ghost on
-    /// the spot; it now runs its own ramp to the end, present on every frame
-    /// the body is.
+    /// The ghost's own rectangle gets the body's rule and nothing stricter: a
+    /// selection culls it at once and nothing else culls it alone. Here the
+    /// ghost stands on a double-width line (protected, not a selection) while
+    /// the body is clear three rows up; the ghost runs its ramp to the end.
     #[test]
     fn a_departing_ghost_over_a_protected_line_fades_with_the_body_instead_of_vanishing() {
         let mut s = Scene::new();
@@ -3120,6 +3126,9 @@ mod tests {
             facing_left: false,
             stride0: 0.0,
             pose0: PetGlyphId::PetSit,
+            resight: false,
+            own_glass: false,
+            peak: 1.0,
         };
         s.pet.departures[0] = Some(ghost);
         let f = s.frame(0.016);
@@ -3172,13 +3181,12 @@ mod tests {
         );
     }
 
-    // ── the typed kitty commands, WITH an observed world ─────────────────
+    // ── the typed kitty commands, with an observed world ─────────────────
     //
-    // The brain's own trick tests run with no console world, where
+    // The brain's own trick tests run with no console world, so
     // `begin_console_tick` returns before it can wipe a latch or seat a
-    // resident — so every interaction below is invisible to them. These
-    // drive the real terminal, the real input notes and the real OSC 133
-    // block states.
+    // resident. These drive the real terminal, input notes and OSC 133 block
+    // states.
 
     impl Scene {
         /// Type `text` the way the host does: one input note per key, then
@@ -3218,11 +3226,9 @@ mod tests {
         }
     }
 
-    /// TREAT FROLICS ON GLASS. Routed through `pending_cheer` it never did:
-    /// the console layer wipes that latch on every tick the last key is
-    /// younger than [`INPUT_HOLD`], the cheer needs two ticks, and a settle
-    /// gate inside the hold meant the very next tick erased it. Performed
-    /// directly, past the hold, it plays — motes and all, in its own poses.
+    /// Treat frolics on glass: performed directly, past [`INPUT_HOLD`] (the
+    /// console layer wipes `pending_cheer` on every tick inside the hold), it
+    /// plays with its motes and poses.
     #[test]
     fn a_typed_treat_frolics_with_the_console_layer_watching() {
         let mut s = Scene::new();
@@ -3266,21 +3272,18 @@ mod tests {
         );
     }
 
-    /// A COMMANDED SLEEP SURVIVES A RUNNING COMMAND. The resident that a
-    /// `C..D` block seats owns the tick and forces `Sit`; keyed on the latch
-    /// alone, the affection arm handed the cat back to it one tick after the
-    /// verb was performed and the nap lasted a frame. The level
-    /// (`trick_settle`) is what the arm reads now.
+    /// A commanded sleep survives a running command: the `C..D` block's
+    /// resident forces `Sit`, so the affection arm reads the level
+    /// (`trick_settle`), not the latch, and the nap lasts.
     #[test]
     fn a_commanded_sleep_survives_an_executing_block() {
         let mut s = Scene::new();
         s.executing();
         s.pet.note_trick(s.now, Trick::Sleep, true);
-        // The latch is deliberately NOT a term of `console_frames`: a parked
-        // resident answers the cadence question first, and the handoff
-        // model's quiet-resident laws stay untouched. The host asks for the
-        // frame that reads the latch (the petting precedent) — and that one
-        // tick is what takes the cat off the resident and arms the lane.
+        // The latch is not a term of `console_frames` (a parked resident
+        // answers the cadence question first). The host asks for the frame that
+        // reads the latch, and that tick takes the cat off the resident and
+        // arms the lane.
         assert!(
             !s.pet.needs_frames(),
             "a parked resident still answers first"
@@ -3346,9 +3349,8 @@ mod tests {
         );
     }
 
-    /// A HELD SELECTION DROPS THE LATCH (surface protection outranks
-    /// everything): nothing plays over a selection, and nothing replays when
-    /// it is released minutes later.
+    /// A held selection drops the latch: nothing plays over a selection, and
+    /// nothing replays when it is released.
     #[test]
     fn a_held_selection_drops_a_trick_and_never_replays_it() {
         let mut s = Scene::new();
@@ -3389,12 +3391,9 @@ mod tests {
         );
     }
 
-    /// PROGRAM OUTPUT NEVER RE-STAMPS THE LATCH. `sleep 1 && make`: the
-    /// trick fires, then a build streams for ten seconds with nobody typing.
-    /// Every printed line is a caret move, so the settle gate never opens —
-    /// and the latch must not ride those moves to its twenty-second cap,
-    /// evicting the running command's parked resident (and holding the lane)
-    /// the whole way. Gone by [`TRICK_TTL`]; the resident has its perch back.
+    /// Program output never re-stamps the latch: with `sleep 1 && make` a
+    /// streaming build moves the caret on every line, but the latch expires by
+    /// [`TRICK_TTL`] and the running command's resident gets its perch back.
     #[test]
     fn streamed_output_lets_a_trick_expire_and_the_resident_takes_its_perch_back() {
         let mut s = Scene::new();
@@ -3405,9 +3404,8 @@ mod tests {
         let mut rolled = false;
         for step in 0..625u32 {
             if step % 6 == 0 {
-                // Lines of two lengths: at the bottom row the pane scrolls
-                // instead of the caret stepping down, and only the column
-                // still says that something was printed.
+                // Two line lengths: at the bottom row the pane scrolls instead
+                // of the caret stepping down, and only the column changes.
                 s.term.process(if step % 12 == 0 {
                     b"\r\ncompiling another crate".as_slice()
                 } else {
@@ -3433,10 +3431,9 @@ mod tests {
         assert_eq!(s.pet.console_attention(), PetAttention::Output);
     }
 
-    /// FIXING A TYPO IS STILL TYPING THE WORD. `sot`, two backspaces, `it`,
-    /// Space: the fire lands with the repair's hold still standing — a
-    /// RESIDENT, whose clear list drops every other suppressed latch. The
-    /// trick latch rides it out and plays when the hold lapses.
+    /// Fixing a typo is still typing the word: `sot`, two backspaces, `it`,
+    /// Space fires with the repair's resident hold standing; the trick latch
+    /// rides it out and plays when the hold lapses.
     #[test]
     fn a_trick_typed_through_a_repair_is_still_performed() {
         let mut s = Scene::new();
@@ -3461,10 +3458,9 @@ mod tests {
         );
     }
 
-    /// …AND SO IS A SEAT. The same repair, asking for `sit`: the latch rides
-    /// the repair's resident out, the cat looks up when the hand has stopped
-    /// — and then HOLDS the look-up seat it was asked for, with the console
-    /// layer watching: no resident reseats it, no typing pose overrides it.
+    /// The same repair asking for `sit`: the latch rides the repair out, the
+    /// cat looks up when the hand stops, then holds the seat it was asked for
+    /// with no resident reseating it and no typing pose overriding it.
     #[test]
     fn a_seat_typed_through_a_repair_is_taken_and_held() {
         let mut s = Scene::new();
@@ -3492,11 +3488,9 @@ mod tests {
         assert_eq!(s.pet.trick_settle, Some(Trick::Sit), "and still is");
     }
 
-    /// THE FRESH-INPUT CLEAR AND THE TRICK. A key wipes the verdict latches
-    /// (a cheer, a sulk) and stands a COMMANDED SEAT down — a key is the
-    /// hand going back to work even when it moves no caret — but it never
-    /// takes an owed trick: the word's own Enter is a fresh input, and the
-    /// verb is owed to the prompt that follows it.
+    /// A key wipes the verdict latches (cheer, sulk) and stands a commanded
+    /// seat down, but never takes an owed trick: the word's own Enter is a
+    /// fresh input, and the verb is owed to the following prompt.
     #[test]
     fn fresh_input_stands_a_commanded_seat_down_but_keeps_an_owed_latch() {
         let mut s = Scene::new();
@@ -3534,9 +3528,8 @@ mod tests {
         );
     }
 
-    /// THE EXIT-127 FORGIVENESS reaches the console layer too: no failed
-    /// result pose, no failure hush — where an ordinary fast failure gets
-    /// both.
+    /// Exit-127 forgiveness reaches the console layer: no failed result pose
+    /// and no failure hush, where an ordinary fast failure gets both.
     #[test]
     fn a_forgiven_pet_only_submit_leaves_no_failed_result_on_the_console() {
         let failed_result = |pet_talk: bool| -> (bool, bool) {
@@ -3566,14 +3559,10 @@ mod tests {
         assert!(hushed, "control: an ordinary fast failure is hushed");
     }
 
-    /// ENTER INSIDE THE HEARD-YOU BEAT, in the key handler's own order: the
-    /// input note and the listener's confirmation FIRST, the echo and the
-    /// tick after. `roll`, a thinking pause, the cat looks up — and Enter
-    /// lands a tenth of a second into the look. Absorbed as "already
-    /// answered", the confirmation was lost and the Enter then took the
-    /// beat's verb with it: heard, confirmed, never performed. A look is
-    /// not an answer: the confirmation latches and plays at the new prompt,
-    /// once.
+    /// Enter inside the heard-you beat, in the key handler's order (input note
+    /// and confirmation first, then echo and tick): `roll`, a pause, the cat
+    /// looks up, and Enter lands a tenth of a second in. A look is not an
+    /// answer, so the confirmation latches and plays once at the new prompt.
     #[test]
     fn an_enter_inside_the_heard_you_beat_still_gets_its_trick() {
         let rolling = |f: &PetFrame| {

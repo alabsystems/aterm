@@ -3,11 +3,10 @@
 
 //! ucs-detect style validation tests for grapheme width calculations.
 //!
-//! These tests validate that aterm-grapheme's Unicode width calculations match
-//! expected terminal behavior, using test vectors inspired by the jquast/ucs-detect
-//! project methodology.
+//! Checks aterm-grapheme's Unicode widths against expected terminal behaviour
+//! using test vectors modelled on jquast/ucs-detect.
 //!
-//! ## Test Categories (from ucs-detect)
+//! ## Test categories (from ucs-detect)
 //!
 //! - **WIDE**: East Asian width characters (CJK ideographs, fullwidth forms)
 //! - **ZERO**: Zero-width combining characters and marks
@@ -19,8 +18,6 @@
 //! - <https://github.com/jquast/ucs-detect>
 //! - Unicode TR11: East Asian Width
 //! - Unicode TR51: Emoji
-//!
-//! Part of #245: Integrate ucs-detect methodology for Unicode width validation
 
 #[cfg(test)]
 mod tests {
@@ -537,7 +534,7 @@ mod tests {
     }
 
     // =========================================================================
-    // CJK EXTENSION G/H/I TESTS (SIP/TIP, #7775)
+    // CJK EXTENSION G/H/I TESTS (SIP/TIP)
     // =========================================================================
 
     /// CJK Unified Ideographs Extensions G (U+30000-U+3134A) and H

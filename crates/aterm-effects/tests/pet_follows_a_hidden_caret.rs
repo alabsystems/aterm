@@ -1,36 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PET FOLLOWS THE CARET IT CANNOT SEE.
+//! The pet follows the caret it cannot see (owner report, 2026-09-19).
 //!
-//! Owner report, 2026-09-19, against the shipped v0.88.0: *"the cursorkitty is
-//! not correctly following the cursor reliably. it is getting shoved away as
-//! like a glitch sometimes, and sometimes it's getting trapped at the top of
-//! the screen."*
-//!
-//! MEASURED on that build with `aterm ctl trail status`, driving a fixture that
-//! hides the cursor with DECTCEM while it repaints — the choreography every
-//! progress bar, spinner, pager, editor and LLM console uses: with the caret
-//! parked on row 44 the pet sat at **row 0.0 for 20.04 s**, and in the same
-//! fixture started mid-screen it sat at **row 23.4 for 20.15 s**. It holds
-//! wherever it stands, for as long as the hide lasts, and "the top of the
-//! screen" is simply where it was most often standing — a fresh prompt, a
-//! `clear`, a console whose input row is near the top. When the cursor came
-//! back it crossed **28.4 cells in one frame**.
-//!
-//! The cause was one conflation in the host: `cursor_visible && display_offset
-//! == 0` decided whether there was a caret AT ALL, so "I am not painting it"
-//! arrived at the brain as "it is not there" — a bound returned as a fact. The
-//! two facts travel separately now (`PetSense::caret` /
-//! `PetSense::caret_drawn`), and the console's hidden-caret hold is bounded
+//! Programs that hide the cursor with DECTCEM while repainting (progress bars,
+//! spinners, pagers, editors, LLM consoles) still have a caret. The host sends
+//! the caret cell and its visibility separately (`PetSense::caret` /
+//! `PetSense::caret_drawn`), so the console's hidden-caret hold is bounded
 //! when the caret is merely unpainted and unbounded only when it is genuinely
-//! absent (scrollback), where there is nothing better to do.
+//! absent (scrollback). Otherwise the pet would freeze wherever it stood for
+//! the whole hide and then cross many cells in one frame.
 //!
-//! The other two laws here are the same family — a bound answering a question
-//! about where the animal is — found by the same audit and measured in code:
-//! the console's scroll compensation must not carry the body off the top of the
-//! glass, and a flight born this tick must not be advanced by this tick's
-//! clock.
+//! Two related laws: the console's scroll compensation must not carry the body
+//! off the top of the glass, and a flight born this tick must not be advanced
+//! by this tick's clock.
 
 use std::time::{Duration, Instant};
 
@@ -60,8 +43,8 @@ impl Scene {
         }
     }
 
-    /// One frame. The caret's CELL is fed whatever DECTCEM says, exactly as the
-    /// host does since 2026-09-19; `caret_drawn` carries the visibility.
+    /// One frame. The caret's cell is fed whatever DECTCEM says, as the host
+    /// does; `caret_drawn` carries the visibility.
     fn tick(&mut self, millis: u64) -> PetFrame {
         self.now += Duration::from_millis(millis);
         let input = self.term.cell_frame(usize::from(ROWS), usize::from(COLS));
@@ -94,9 +77,8 @@ impl Scene {
     }
 }
 
-/// THE REPORT, as a law. A caret that moves while the cursor is hidden is
-/// still a caret, and the pet is expected to arrive at it — not to sit where it
-/// was standing when the hide began, for as long as the program keeps working.
+/// A caret that moves while the cursor is hidden is still a caret, and the pet
+/// arrives at it rather than sitting where the hide began.
 #[test]
 fn a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden() {
     let mut s = Scene::new();
@@ -134,17 +116,11 @@ fn a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden() {
     );
 }
 
-/// THE ARM THE OWNER'S REPORT WAS ACTUALLY ABOUT — the tennis watch.
-///
-/// A console that repaints a row (`\r` or `ESC[row;1H`, erase, write, back to
-/// the caret column) reverses the caret's direction once per repaint. Three
-/// reversals is a frolic, a second frolic inside `TENNIS_AFTER` latches the
-/// watch, and the watch's `PetAction::Sit if self.tennis` arm returns BEFORE
-/// every door — the row-hop included — for as long as repaints keep refreshing
-/// it. The cat could not travel at all, and nothing asked where the rally was.
-///
-/// Measured on v0.88.0: 20.03 s frozen with the caret 44 rows away. After the
-/// fix the same fixture crosses in 1.38 s and holds a median gap of 0.5 rows.
+/// The tennis watch. A console repainting a row (`\r` or `ESC[row;1H`, erase,
+/// write, back to the caret column) reverses the caret's direction once per
+/// repaint; three reversals is a frolic, and a second frolic inside
+/// `TENNIS_AFTER` latches the watch. The watch must not stop the cat
+/// travelling to a caret rows away: it crosses and then holds a small gap.
 #[test]
 fn a_repainting_console_does_not_freeze_the_pet_away_from_the_caret() {
     let mut s = Scene::new();

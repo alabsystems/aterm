@@ -2,41 +2,37 @@
 // Copyright 2026 Andrew Yates
 
 //! [`read`] over fixture Claude Code directories and snapshots written the way
-//! 2.1.284 writes them (its `oMn`/`tMn`/`nMn`; the person's part measured
-//! 2026-09-28 from `zsh -f` 5.9 and bash 3.2.57 against a fake rc, by
-//! printing only). Never the owner's files.
+//! 2.1.284 writes them (its `oMn`/`tMn`/`nMn`; the person's part from `zsh -f`
+//! 5.9 and bash 3.2.57 against a fake rc). Never the owner's files.
 
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A scratch directory, removed on drop.
-struct Scratch(PathBuf);
+struct Scratch(aterm_tempfile::TempDir);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-shell-startup-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("home")).expect("scratch home");
-        std::fs::create_dir_all(dir.join("project")).expect("scratch project");
-        std::fs::create_dir_all(dir.join("claude/shell-snapshots")).expect("scratch snapshots");
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-shell-startup-{tag}-"))
+            .tempdir()
+            .expect("scratch dir");
+        std::fs::create_dir_all(dir.path().join("home")).expect("scratch home");
+        std::fs::create_dir_all(dir.path().join("project")).expect("scratch project");
+        std::fs::create_dir_all(dir.path().join("claude/shell-snapshots"))
+            .expect("scratch snapshots");
         Self(dir)
     }
 
     fn claude(&self) -> PathBuf {
-        self.0.join("claude")
+        self.0.path().join("claude")
     }
 
     fn home(&self) -> PathBuf {
-        self.0.join("home")
+        self.0.path().join("home")
     }
 
     fn project(&self) -> PathBuf {
-        self.0.join("project")
+        self.0.path().join("project")
     }
 
     /// Write `text` as a snapshot of `kind` (`zsh`/`bash`) named by `ms`.
@@ -64,12 +60,6 @@ impl Scratch {
     }
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Claude Code's own part of a snapshot: the `rg` fallback, its
 /// `find`/`grep` shadows (ant-native builds) and `pkill` shadow, and `PATH`.
 const CLAUDE_TAIL: &str = "# Check for rg availability
@@ -91,8 +81,8 @@ export PATH='/usr/bin:/bin'
 ";
 
 /// A zsh snapshot: the person's `functions`, the options a login `zsh -c`
-/// lists with an empty rc (`nohashdirs`, `login`, measured) plus `options`,
-/// the default aliases plus `aliases`, then Claude Code's part.
+/// lists with an empty rc (`nohashdirs`, `login`) plus `options`, the default
+/// aliases plus `aliases`, then Claude Code's part.
 fn zsh_snapshot(functions: &str, options: &str, aliases: &str) -> String {
     format!(
         "# Snapshot file
@@ -110,9 +100,9 @@ alias -- which-command=whence
 }
 
 /// A bash 3.2 snapshot: `shopt -p` as a login `bash -c` prints it with an
-/// empty rc (measured), each of `shopts` (`name`, on) replacing its row, the
-/// person's `functions`, the `set -o` rows the snapshot's `grep "on"` keeps,
-/// plus `sets`, then the aliases and Claude Code's part.
+/// empty rc, each of `shopts` (`name`, on) replacing its row, the person's
+/// `functions`, the `set -o` rows the snapshot's `grep "on"` keeps, plus
+/// `sets`, then the aliases and Claude Code's part.
 fn bash_snapshot(shopts: &[(&str, bool)], functions: &str, sets: &str, aliases: &str) -> String {
     let mut out = String::from(
         "# Snapshot file\n# Unset all aliases to avoid conflicts with functions\nunalias -a \
@@ -166,9 +156,8 @@ fn a_default_zsh_snapshot_fails_no_line_and_its_aliases_fail_the_lines_naming_th
     );
 }
 
-/// THE AUDIT'S RESIDUAL (§5): `setopt globsubst` in the snapshot globs a
-/// plain `$N`'s value; every option the models do not assume fails every
-/// line, the reason naming it.
+/// `setopt globsubst` in the snapshot globs a plain `$N`'s value; every option
+/// the models do not assume fails every line, the reason naming it.
 #[test]
 fn an_option_the_models_do_not_assume_fails_every_line_naming_it() {
     for opt in [
@@ -348,7 +337,7 @@ fn what_runs_before_every_command_besides_the_snapshot_is_read() {
         assert!(why.contains(".zshenv"), "{text}: {why}");
     }
     // `$ZDOTDIR`'s, not `$HOME`'s, when it is set.
-    let zdot = s.0.join("zdot");
+    let zdot = s.0.path().join("zdot");
     std::fs::create_dir_all(&zdot).expect("zdotdir");
     std::fs::write(zdot.join(".zshenv"), "setopt globsubst\n").expect("zshenv");
     std::fs::write(&zshenv, "").expect("zshenv");
@@ -410,12 +399,10 @@ fn a_word_is_named_only_whole() {
     }
 }
 
-/// Hooks a `zsh -c` never runs (measured 2026-09-28, zsh 5.9 `-f -c` with
-/// each defined and `PERIOD=1`, then `eval "print hi; cd /tmp; print
-/// there"`: only `chpwd` and `zshexit` printed): `precmd`, `preexec`,
-/// `periodic` and `zshaddhistory` run only around an interactive prompt or
-/// history, so a person's `precmd() { vcs_info }` fails only the lines that
-/// name it.
+/// Hooks a `zsh -c` never runs (`precmd`, `preexec`, `periodic`,
+/// `zshaddhistory` run only around an interactive prompt or history; only
+/// `chpwd` and `zshexit` fire), so a person's `precmd() { vcs_info }` fails
+/// only the lines that name it.
 #[test]
 fn a_prompt_or_history_hook_is_an_ordinary_function() {
     let s = Scratch::new("prompt-hooks");
@@ -439,11 +426,10 @@ fn a_prompt_or_history_hook_is_an_ordinary_function() {
     }
 }
 
-/// zsh finds a function by the word AFTER quote removal (measured
-/// 2026-09-28, zsh 5.9, `rm(){ print FN-rm "$@"; }`: `r\m`, `r""m`,
-/// `$'\x72m'`, `r\<newline>m`, `eval "r\\m d"` and `eval "\$'\\x72m' e"` all
-/// printed `FN-rm`), and the line models remove the quotes too, so a quoted
-/// spelling of a function's name is that function.
+/// zsh finds a function by the word after quote removal (`r\m`, `r""m`,
+/// `$'\x72m'`, `r\<newline>m` and `eval "r\\m d"` all run a function `rm`),
+/// and the line models remove the quotes too, so a quoted spelling of a
+/// function's name is that function.
 #[test]
 fn a_function_is_named_by_any_quoting_of_its_name() {
     let s = Scratch::new("quoted-fn");
@@ -479,13 +465,12 @@ fn a_function_is_named_by_any_quoting_of_its_name() {
     }
 }
 
-/// A plain alias is expanded only in command position — a line's first
-/// word, one after `;`, `&&`, `|`, `(`, `{`, a backtick or a newline, after
+/// A plain alias is expanded only in command position (a line's first word,
+/// one after `;`, `&&`, `|`, `(`, `{`, a backtick or a newline, after
 /// `if`/`then`/`do`/`!`/`time`/…, an assignment or a redirection, or after an
-/// alias whose value ends in a blank (measured 2026-09-28, zsh 5.9 and bash
-/// 3.2.57) — and 2.1.284's snapshot demotes a global alias to a plain one.
-/// So oh-my-zsh's `alias 1='cd -1'` … `9` and `alias -- -='cd -'`
-/// (`lib/directories.zsh`) fail `5` and `x && 1`, not `tail -n 5`.
+/// alias whose value ends in a blank), and 2.1.284's snapshot demotes a global
+/// alias to a plain one. So oh-my-zsh's `alias 1='cd -1'` … `9` and `alias --
+/// -='cd -'` fail `5` and `x && 1`, not `tail -n 5`.
 #[test]
 fn an_alias_fails_only_a_line_that_may_run_it() {
     let s = Scratch::new("omz-aliases");

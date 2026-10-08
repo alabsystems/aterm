@@ -16,11 +16,7 @@
 //! writer stamps one (the package pass end, `….000000000Z`; Claude Code's
 //! transcript stamps, `….796Z`). Neither reads a zone offset: `…+05:30` names a
 //! DIFFERENT instant than its digits, and reading it as UTC moves a deadline
-//! the wrong way by up to 14 h. Five near-identical private copies (update
-//! ledger, health streaks, machine roster, package stamps, the atpkg index
-//! gate) were folded into these two on 2026-09-25, and the harness's
-//! transcript-stamp reader (which took `…+05:30` as UTC) on 2026-09-26. The
-//! one reader with a different grammar is the supervisor ledger's
+//! the wrong way by up to 14 h. The one reader with a different grammar is the supervisor ledger's
 //! (`aterm-agent`'s `supervise/ledger.rs`): it reads local times and zone
 //! offsets ON PURPOSE, applying them, over this module's calendar.
 

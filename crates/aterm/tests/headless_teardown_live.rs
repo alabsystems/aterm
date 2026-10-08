@@ -16,25 +16,26 @@
 //!   names SIGTERM).
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private socket, every automatic lane
-//! off (`support/launch_isolation.rs`), `--no-reroute`, `SHELL=/bin/sh`. An
-//! instance that cannot start FAILS the test (`support/headless_boot.rs`
-//! `await_ready`); SKIP only on a scratch, log or spawn refusal.
+//! off (`support/launch_isolation.rs`), `--no-reroute`, `SHELL=/bin/sh`, and a
+//! LIFELINE (`launch_isolation::lifeline`): a runner killed mid-test takes its
+//! instance with it, which the `Drop` below cannot do. An instance that cannot
+//! start FAILS the test (`support/headless_boot.rs` `await_ready`); SKIP only on
+//! a scratch, log or spawn refusal.
 
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
-
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
+use crate::{headless_boot, launch_isolation};
 
 use headless_boot::{POLL_GAP, SOCKET_POLLS};
 
 struct Instance {
     child: Child,
+    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed
+    /// by the kernel if this test process dies first.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     tmp: PathBuf,
 }
 
@@ -57,8 +58,9 @@ fn scratch_root(tag: &str) -> Option<PathBuf> {
     headless_boot::scratch_root(&format!("atht{tag}"))
 }
 
-/// One isolated headless launch, its log at `info`, not yet spawned.
-fn headless(tmp: &Path) -> Command {
+/// One isolated headless launch, its log at `info`, not yet spawned, and the
+/// lifeline it is armed with — held as long as the instance should run.
+fn headless(tmp: &Path) -> (Command, aterm_uds::lifeline::Lifeline) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
@@ -69,7 +71,8 @@ fn headless(tmp: &Path) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    cmd
+    let lifeline = launch_isolation::lifeline(&mut cmd, tmp);
+    (cmd, lifeline)
 }
 
 /// Boot one headless instance with `state` as its `$ATERM_STATE_HOME` when
@@ -89,7 +92,7 @@ fn boot(tag: &str, state: Option<&str>) -> Option<Instance> {
             return None;
         }
     };
-    let mut cmd = headless(&tmp);
+    let (mut cmd, lifeline) = headless(&tmp);
     cmd.stdout(out).stderr(err);
     if let Some(state) = state {
         cmd.env("ATERM_STATE_HOME", tmp.join(state));
@@ -102,7 +105,11 @@ fn boot(tag: &str, state: Option<&str>) -> Option<Instance> {
             return None;
         }
     };
-    let mut inst = Instance { child, tmp };
+    let mut inst = Instance {
+        child,
+        _lifeline: lifeline,
+        tmp,
+    };
     let sock = inst.sock();
     headless_boot::await_ready(&mut inst, |i| &mut i.child, &sock, &log, |_| true).then_some(inst)
 }
@@ -117,10 +124,11 @@ fn home_log(tmp: &Path) -> PathBuf {
     }
 }
 
-/// The logger opens its file at startup, before the socket binds; allow it a
-/// moment anyway so a slow machine does not read a race as a defect.
+/// The logger opens its file at startup, before the socket binds; allow it the
+/// boot's hang detector anyway so a slow machine does not read a race as a
+/// defect.
 fn appears(path: &Path) -> bool {
-    for _ in 0..50 {
+    for _ in 0..SOCKET_POLLS {
         if path.exists() {
             return true;
         }
@@ -201,7 +209,7 @@ fn a_refused_state_root_is_said_not_silent() {
         eprintln!("SKIP: no scratch base with a short enough socket path");
         return;
     };
-    let mut cmd = headless(&tmp);
+    let (mut cmd, lifeline) = headless(&tmp);
     cmd.env("ATERM_STATE_HOME", "relative-state")
         .stderr(Stdio::piped());
     let Ok(child) = cmd.spawn() else {
@@ -209,7 +217,11 @@ fn a_refused_state_root_is_said_not_silent() {
         let _ = std::fs::remove_dir_all(&tmp);
         return;
     };
-    let mut inst = Instance { child, tmp };
+    let mut inst = Instance {
+        child,
+        _lifeline: lifeline,
+        tmp,
+    };
     // The words come first thing in startup; the bound socket is well after.
     for _ in 0..SOCKET_POLLS {
         if headless_boot::is_socket_or_symlink(&inst.sock())

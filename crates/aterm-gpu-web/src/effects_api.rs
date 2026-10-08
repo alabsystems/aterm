@@ -2,11 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The host-facing effects API on [`AtermGpuTerminal`]: cursor aurora / comet
-//! trail + sparkle words, driven by the shared [`aterm_effects`] pipeline (the
-//! SAME state machines the native app runs — no forked art). Mirrors
-//! aterm-wasm's `effects_api` so the GPU and CPU bindings expose ONE contract;
-//! both feed the same `RenderInput` overlay channels, whose CPU==GPU pixel
-//! parity the aterm-gpu suite gates.
+//! trail and sparkle words, driven by the shared [`aterm_effects`] pipeline
+//! (the same state machines the native app runs). Mirrors aterm-wasm's
+//! `effects_api`; both feed the same `RenderInput` overlay channels, whose
+//! CPU==GPU parity the aterm-gpu suite gates.
 //!
 //! ## Animation-drive contract
 //!
@@ -25,30 +24,18 @@
 //! requestAnimationFrame(frame);
 //! ```
 //!
-//! Every effect self-terminates to a stable fingerprint (steady ink gradient /
-//! settled cat / nova ember), so `is_effects_active()` returns `false` and the
-//! host drops to 0% idle. Defaults are all OFF: without any `set_*` call the
-//! render output stays byte-identical to the pre-effects binding.
+//! Every effect settles to a stable fingerprint, so `is_effects_active()`
+//! returns `false` and the host goes idle. All effects default off, leaving
+//! the render output unchanged.
 //!
-//! ## WF-1 frame-gate bumps (mirrored from the CPU twin)
+//! ## Frame-gate bumps
 //!
-//! Every CONFIG/ignition mutator below opens with
-//! `self.note_host_visual_change()`. That bump belongs to aterm-wasm's
-//! settled-frame gate: a config change can light up pixels on the NEXT render
-//! while `is_active()` still reads false at gate time, because decorations and
-//! comets ignite inside `apply` — which a gated frame never runs. `advance_effects`
-//! deliberately does NOT bump (hosts pump it every rAF tick, which would
-//! reopen the gate every frame and delete the optimization); its soundness
-//! rests on `is_active()` plus these mutators.
-//!
-//! THIS crate has no frame gate yet — every `render` presents, and aterm-gpu's
-//! dirty-row diff is keyed off the whole `RenderInput` (overlay channels
-//! included) — so the bumps are inert here today. They are carried, and
-//! `AtermGpuTerminal::note_host_visual_change` is a REAL counter rather than
-//! a stub, so this module stays the byte-for-byte mirror the parity guard
-//! requires AND the effects surface is already correct the day this twin gets
-//! its own gate. A stub would look wired and drop every bump — the exact
-//! stale-frame class the gate exists to prevent.
+//! Every config/ignition mutator opens with `self.note_host_visual_change()`:
+//! a config change can light pixels on the next render while `is_active()`
+//! still reads false at gate time, because decorations and comets ignite
+//! inside `apply`, which a gated frame never runs. `advance_effects` does not
+//! bump (hosts call it every rAF tick); its soundness rests on `is_active()`
+//! plus these mutators.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -94,33 +81,26 @@ impl AtermGpuTerminal {
     }
 
     /// Register one keystroke for the cursor-comet ignition: sustained fast
-    /// calls heat the typing cadence so the next `render` ignites the trail,
-    /// sparse/slow calls keep it gentle. The cadence reads the effects clock,
-    /// so the host must `advance_effects` between keystrokes for it to reflect
-    /// real time. Call this from the SAME JS keydown handler that feeds
-    /// `encode_key`; without it the comet stays dormant on web hosts. It also
-    /// freezes literal-rain sampling while a draft is unsent; on submit call
-    /// `note_matrix_rain_signal(10, 4)` after this method.
+    /// calls heat the typing cadence so the next `render` ignites the trail.
+    /// The cadence reads the effects clock, so `advance_effects` must run
+    /// between keystrokes. Call from the keydown handler that feeds
+    /// `encode_key`. Also freezes literal-rain sampling while a draft is
+    /// unsent; on submit call `note_matrix_rain_signal(10, 4)` after this.
     pub fn note_keystroke(&mut self) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
         self.effects.note_keystroke();
     }
 
-    /// [`Self::note_keystroke`] upgraded with the typed CHARACTER: the exact
-    /// input-time content witness the movement-admission gate requires before
-    /// glow/trail styles may follow the cursor (movement without one is
-    /// program output and stays dark — the native app's provenance law). Call
-    /// from the SAME JS handler that dispatched this key's bytes to the
-    /// transport — after dispatch, BEFORE the echo is fed to [`Self::process`]
-    /// — and only between renders (the witness is checked against the last
-    /// rendered frame and fails closed on any staleness, so a mistimed call
-    /// costs cosmetics, never correctness). Returns whether movement
-    /// provenance armed; on decline the text-blind keystroke semantics
-    /// (cadence heat, rain freeze, candidate cancellation) still apply.
-    /// The character is SPELLED to the rainbow engine (2026-09-13): a Space
-    /// rests the synth and deals no star, a capital or `!` earns its hero
-    /// star, exactly as the native seam prices them.
+    /// [`Self::note_keystroke`] with the typed character: the input-time
+    /// witness the movement-admission gate requires before glow/trail styles
+    /// may follow the cursor (unwitnessed movement is program output and stays
+    /// dark). Call after dispatching the key's bytes and before the echo is fed
+    /// to [`Self::process`], between renders; a stale witness fails closed.
+    /// Returns whether movement provenance armed; otherwise the text-blind
+    /// keystroke semantics still apply. The rainbow engine prices the
+    /// character: a Space rests and deals no star, a capital or `!` earns a
+    /// hero star.
     pub fn note_typed_char(&mut self, ch: char) -> bool {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -130,29 +110,21 @@ impl AtermGpuTerminal {
 
     /// Report one accepted input intent: `text`, `delete`, `navigate`,
     /// `submit`, `paste`, `kill` (`^U`/`^W`: the caret moves) or
-    /// `kill-forward` (`^K`). Call AFTER transport admission, once for an
-    /// entire committed IME run or paste, never for composition preview,
-    /// formatting, or PTY output. Empty or sanitizer-empty input needs no note.
+    /// `kill-forward` (`^K`). Call after transport admission, once per
+    /// committed IME run or paste, never for composition preview, formatting
+    /// or PTY output. Empty input needs no note.
     ///
-    /// Since 2026-09-13 the kind reaches the CURSOR ENGINES too, with the
-    /// native app's laws: `delete` is the erase (the rainbow ribbon retracts
-    /// the erased cell and the sky throws its stars), `navigate` licenses
-    /// the hop it precedes without a typed credit, `submit` is the Enter
-    /// key (inert until its flight is observed), a kill drains the line.
-    /// Call it for every NON-TEXT key INSTEAD of [`Self::note_keystroke`]:
-    /// a Backspace reported as a text-blind keystroke is replayed as a typed
-    /// glyph — it advanced the ribbon's momentum, banked a press credit and
-    /// re-laid the very cell it erased, which nothing then retracted (the
-    /// ribbon left under blank cells right of the text). A page that keeps
-    /// calling `note_keystroke` keeps that old behaviour, byte for byte.
+    /// The kind reaches the cursor engines with the native app's rules:
+    /// `delete` is the erase (the ribbon retracts the erased cell),
+    /// `navigate` licenses the hop it precedes, `submit` is Enter, a kill
+    /// drains the line. Use this for every non-text key instead of
+    /// [`Self::note_keystroke`], which would replay a Backspace as a typed
+    /// glyph.
     ///
-    /// For a scalar already reported through [`Self::note_typed_char`], do
-    /// not also call this method. For an IME bundle use this once instead of
-    /// calling `note_typed_char` per character. `text` and `paste` supply pet
-    /// attention only — no cursor-motion credit, no evidence of changed
-    /// text. Do NOT also call [`Self::note_keystroke`] for a key reported
-    /// here: the erase and kill kinds carry their own cadence.
-    /// Returns `false` for an unknown kind without scheduling a frame.
+    /// Do not also call this for a scalar reported via
+    /// [`Self::note_typed_char`]; for an IME bundle call this once instead.
+    /// `text` and `paste` only supply pet attention. Returns `false` for an
+    /// unknown kind without scheduling a frame.
     pub fn note_console_input(&mut self, kind: &str) -> bool {
         let Some(kind) = aterm_effects::kitty_pet::PetInputKind::parse(kind) else {
             return false;
@@ -163,14 +135,13 @@ impl AtermGpuTerminal {
         true
     }
 
-    /// Configure the LUMEN cursor aurora (additive light in the cursor's
-    /// wake). Mirrors the native knobs + clamps: `style` ∈
-    /// `lumen|phaser|rainbow kitty|sparkle|fire|laser|beam|water|comet` (unknown →
-    /// lumen; `rainbow` = the rainbow kitty banded ribbon);
-    /// `color`/`accent` omitted derive from the theme cursor (accent = color
-    /// brightened 1.5×) exactly like the native app; `duration_ms` clamps
-    /// 30..=2000, `length` (cells) 1..=512, `intensity` 0..=1 (0 = off),
-    /// `radius` (bloom crown, cells) 0..=2, `ring` = landing-ring ping.
+    /// Configure the lumen cursor aurora (additive light in the cursor's
+    /// wake), with the native knobs and clamps: `style` ∈
+    /// `lumen|phaser|rainbow kitty|sparkle|fire|laser|beam|water|comet`
+    /// (unknown → lumen); `color`/`accent` omitted derive from the theme
+    /// cursor (accent = color × 1.5); `duration_ms` 30..=2000, `length`
+    /// (cells) 1..=512, `intensity` 0..=1 (0 = off), `radius` (bloom crown,
+    /// cells) 0..=2, `ring` = landing-ring ping.
     #[allow(clippy::too_many_arguments)]
     pub fn set_cursor_glow(
         &mut self,
@@ -200,10 +171,10 @@ impl AtermGpuTerminal {
         );
     }
 
-    /// Configure the legacy opaque comet trail (the native `cursor_trail_style
-    /// = "comet"` look). `color` omitted = the theme cursor; `duration_ms`
-    /// clamps 30..=2000, `length` 1..=512. Exactly one of trail/glow is on in
-    /// the native app (chosen by style); the embedder decides here.
+    /// Configure the opaque comet trail (native `cursor_trail_style =
+    /// "comet"`). `color` omitted = theme cursor; `duration_ms` 30..=2000,
+    /// `length` 1..=512. The native app enables one of trail/glow by style;
+    /// the embedder decides here.
     pub fn set_cursor_trail(
         &mut self,
         enabled: bool,
@@ -222,9 +193,9 @@ impl AtermGpuTerminal {
         );
     }
 
-    /// Enable PHOSPHOR matrix rain. With output material opted in, the shared
-    /// pipeline samples supported literal codepoints outside the current
-    /// cursor/composer protection band and emits only into empty default-bg cells.
+    /// Enable phosphor matrix rain. With output material opted in, the
+    /// pipeline samples supported literal codepoints outside the cursor/
+    /// composer protection band and emits only into empty default-bg cells.
     pub fn set_matrix_rain_enabled(&mut self, on: bool) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -237,10 +208,10 @@ impl AtermGpuTerminal {
         self.effects.matrix_rain_enabled()
     }
 
-    /// Configure PHOSPHOR using the native bounds. `hue` is
+    /// Configure phosphor with the native bounds. `hue` is
     /// `matrix|theme|custom`; `hue_color` is used only for `custom`.
-    /// `output_material` opts into supported literal screen codepoints; hosts
-    /// that cannot protect their current composer can leave it false.
+    /// `output_material` opts into literal screen codepoints; hosts that
+    /// cannot protect their composer can leave it false.
     #[allow(clippy::too_many_arguments)]
     pub fn set_matrix_rain(
         &mut self,
@@ -283,9 +254,8 @@ impl AtermGpuTerminal {
         );
     }
 
-    /// Accessibility motion gate for PHOSPHOR — an ALIAS of
-    /// [`Self::set_reduced_motion`] (one host fact, every effect): it pins
-    /// the pet and statics sparkle words too.
+    /// Alias of [`Self::set_reduced_motion`]: also pins the pet and statics
+    /// sparkle words.
     pub fn set_matrix_rain_reduced_motion(&mut self, on: bool) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -317,27 +287,18 @@ impl AtermGpuTerminal {
         self.effects.note_matrix_rain_signal(code, weight);
     }
 
-    /// Configure PRISM WAKE — the output streak. Program OUTPUT (not typing) is
-    /// answered with a short spectrum comet on the row that just took ink,
-    /// metered so a burst gets one comet and a flood degrades to a single
-    /// constant-cost ribbon. `intensity` 0..=1 (0 is a RESET, not a dim),
-    /// `tail` (cells) 4..=14, `max_streaks` 1..=4, `idle_secs` 2..=120, `seed`
-    /// fixes the per-comet genome so a host that pins it replays identical
-    /// frames. Every band is re-clamped inside the engine: the ceiling is
-    /// STRUCTURAL, so no argument an embedder can reach makes this loud, fast,
-    /// or flashy.
+    /// Configure prism wake, the output streak: program output (not typing)
+    /// gets a short spectrum comet on the row that took ink, metered so a
+    /// burst gets one comet and a flood one constant-cost ribbon. `intensity`
+    /// 0..=1 (0 resets), `tail` (cells) 4..=14, `max_streaks` 1..=4,
+    /// `idle_secs` 2..=120; a pinned `seed` replays identical frames. The
+    /// engine re-clamps every band, so no argument makes it loud or flashy.
     ///
-    /// Constructed OFF, like every effect on this binding — until this runs
-    /// with `enabled = true` the pipeline holds no streak state at all and the
-    /// render output stays byte-identical to a build without the effect.
-    /// Toggling back off DROPS the engine while keeping the knobs, so
-    /// re-enabling restores this same configuration (the rain off/on posture).
+    /// Off until called with `enabled = true`; toggling off drops the engine
+    /// but keeps the knobs, so re-enabling restores this configuration.
     ///
-    /// `sound` is carried for contract parity with the native host and is
-    /// VISUALS-ONLY here: the web has no audio host, so the shared pipeline
-    /// drops the episode cue at the point it is produced rather than queueing
-    /// it forever against a listener that will never exist. Passing `true`
-    /// records the intent and changes nothing you can hear.
+    /// `sound` is accepted for parity with the native host but has no effect:
+    /// the web has no audio host, so the pipeline drops the cue.
     #[allow(clippy::too_many_arguments)]
     pub fn set_output_streak(
         &mut self,
@@ -362,26 +323,17 @@ impl AtermGpuTerminal {
         );
     }
 
-    /// Fold the resolved theme into PRISM WAKE. `dark_theme` is the one fact
-    /// the colour triple cannot supply on its own: it picks the POLARITY —
-    /// additive spectrum light on a dark ground, a tinted shadow-shimmer on a
-    /// light one, because additive light cannot darken pale paper and would
-    /// simply not exist there. The bg/fg/cursor colours are read from THIS
-    /// binding's own [`Self::set_theme`] state rather than re-passed by the
-    /// host, exactly as [`Self::set_matrix_rain`] sources its ramp, so the
-    /// streak can never disagree with the grid about what the theme is.
+    /// Fold the resolved theme into prism wake. `dark_theme` picks the
+    /// polarity: additive light on a dark ground, a tinted shadow-shimmer on a
+    /// light one. Colours come from this binding's [`Self::set_theme`] state,
+    /// so the streak always agrees with the grid.
     ///
-    /// Call it per frame. The fold deliberately does NOT reset the engine, so
-    /// an OSC 11/12 recolour re-tints the comets already in flight instead of
-    /// killing them; a host that calls this once at boot and later runs
-    /// `set_theme` keeps flying the old palette.
+    /// Call per frame. It does not reset the engine, so an OSC 11/12 recolour
+    /// re-tints comets in flight; a host calling it only at boot keeps the old
+    /// palette.
     pub fn set_output_streak_theme(&mut self, dark_theme: bool) {
-        // NO WF-1 twin bump — the one CONFIG mutator in this mirror that must
-        // abstain, because its documented contract is a PER-FRAME call and a
-        // bump would reopen aterm-wasm's settled-frame gate every frame. The
-        // omission is carried here verbatim for the same reason the inert bumps
-        // above are: this twin is the byte-for-byte mirror, and the day it
-        // grows its own gate the surface is already correct.
+        // No frame-gate bump: this is called every frame, and a bump would
+        // reopen the gate every frame.
         self.effects.set_output_streak_theme(
             dark_theme,
             self.theme_bg,
@@ -390,39 +342,32 @@ impl AtermGpuTerminal {
         );
     }
 
-    /// Accessibility motion gate for PRISM WAKE. On, amplitude is pinned to
-    /// zero, which the engine treats as a full RESET rather than a dim: no
-    /// quads, no cue, fingerprint 0 — so `is_effects_active` settles and the
-    /// host's rAF loop parks instead of spinning on an invisible effect.
-    /// Turning it back OFF restores FULL amplitude, so a host running a custom
-    /// `intensity` must re-apply [`Self::set_output_streak`] afterwards.
+    /// Accessibility motion gate for prism wake. On pins amplitude to zero,
+    /// which resets the engine (no quads, no cue), so `is_effects_active`
+    /// settles. Off restores full amplitude; a host using a custom
+    /// `intensity` must re-apply [`Self::set_output_streak`].
     pub fn set_output_streak_reduced_motion(&mut self, on: bool) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
         self.effects.set_output_streak_reduced_motion(on);
     }
 
-    /// Stamp one keystroke against PRISM WAKE's ECHO DISCOUNT: output arriving
-    /// within the discount window of a stamp is the user's own echo coming back
-    /// and mints NOTHING. Deliberately not folded into [`Self::note_keystroke`]
-    /// — the streak keeps its own stamp — so call BOTH from the same JS keydown
-    /// handler. On web this is effectively required rather than a refinement:
-    /// the embedder pipeline reports `input_hot = false`, so the stamp is the
-    /// only echo defence a browser host has, and a binding that skips it will
-    /// answer the user's own typing with comets.
+    /// Stamp one keystroke for prism wake's echo discount: output within the
+    /// window after a stamp is the user's echo and mints nothing. Separate from
+    /// [`Self::note_keystroke`], so call both from the keydown handler. On the
+    /// web this is the only echo defence (`input_hot` is false), so skipping
+    /// it answers typing with comets.
     pub fn note_output_streak_keystroke(&mut self) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
         self.effects.note_output_streak_keystroke();
     }
 
-    /// MASTER sparkle-words switch (native `[sparkle_words] enabled` +
-    /// `toggle_sparkle_words` panic-off). Enabling compiles the multilingual
-    /// lexicon once and starts scanning the visible grid; disabling drops all
-    /// occurrence state and restores byte-identical output next render.
-    /// Defaults (until other setters run) mirror the native launch config:
-    /// every class on (profanity nova / feline cat / canine / emphasis ink),
-    /// animated ink on.
+    /// Master sparkle-words switch (native `[sparkle_words] enabled`).
+    /// Enabling compiles the lexicon once and scans the visible grid;
+    /// disabling drops all occurrence state and restores plain output next
+    /// render. Defaults match the native config: every class on, animated ink
+    /// on.
     pub fn set_sparkle_words_enabled(&mut self, on: bool) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -437,12 +382,8 @@ impl AtermGpuTerminal {
 
     /// Per-class gates (native `[sparkle_words.<class>] enabled`): profanity
     /// (supernova/sparkle), feline (peeking cat/paw), emphasis (ink-only;
-    /// effective only while ink is enabled).
-    ///
-    /// The third argument was the orca class's gate. The class was deleted on
-    /// 2026-09-27 (it had been suspended, so the gate already did nothing);
-    /// the argument is accepted and ignored so an embedder's existing
-    /// four-argument call keeps `emphasis` in the fourth position.
+    /// effective only while ink is enabled). The third argument is accepted
+    /// and ignored so `emphasis` stays in the fourth position.
     pub fn set_sparkle_classes(
         &mut self,
         profanity: bool,
@@ -456,10 +397,10 @@ impl AtermGpuTerminal {
             .set_sparkle_classes(profanity, feline, emphasis);
     }
 
-    /// Animated-ink knobs (native `[sparkle_words.ink]`): the glyph-ink
-    /// gradient + specular sweep on matched words. `strength` clamps 0..=1;
-    /// `sweep_ms` clamps 350..=6000 (floor 600 while `loop_` — the WCAG flash
-    /// margin, structural); `loop_` re-sweeps while the word stays visible.
+    /// Animated-ink knobs (native `[sparkle_words.ink]`): glyph-ink gradient +
+    /// specular sweep on matched words. `strength` 0..=1; `sweep_ms`
+    /// 350..=6000 (floor 600 while `loop_`, a WCAG flash margin); `loop_`
+    /// re-sweeps while the word stays visible.
     pub fn set_sparkle_ink(&mut self, enabled: bool, strength: f32, sweep_ms: u32, loop_: bool) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -467,11 +408,9 @@ impl AtermGpuTerminal {
             .set_sparkle_ink(enabled, strength, sweep_ms, loop_);
     }
 
-    /// Force the static, non-animating path (no twinkle/jitter/sweep; novas
-    /// collapse to a static glint) — the accessibility `reduced_motion`
-    /// override. The engine's flash-limiter floors apply regardless. An
-    /// ALIAS of [`Self::set_reduced_motion`] (one host fact, every effect):
-    /// it pins the pet and freezes PHOSPHOR too.
+    /// Force the static path (no twinkle/jitter/sweep; novas become a static
+    /// glint). Flash-limiter floors apply regardless. Alias of
+    /// [`Self::set_reduced_motion`]: also pins the pet and freezes phosphor.
     pub fn set_sparkle_reduced_motion(&mut self, on: bool) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -479,8 +418,7 @@ impl AtermGpuTerminal {
     }
 
     /// Alt-screen suppression (native `[sparkle_words] suppress_in_alt_screen`,
-    /// default off): when on, full-screen apps render undecorated — the v1
-    /// launch behavior. Off, the alternate screen sparkles like the main one.
+    /// default off): when on, full-screen apps render undecorated.
     pub fn set_sparkle_alt_screen_suppression(&mut self, on: bool) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -506,14 +444,12 @@ impl AtermGpuTerminal {
     }
 
     /// Profanity knobs (native `[sparkle_words.profanity]`): `style` =
-    /// "rainbow" (the v3 animated rainbow ink, the default) | "nova" (the v2
-    /// classic nova) | "sparkle" (the exact v1 twinkle). Clamps are the
-    /// native flash-safety floors and are not bypassable: `density` 1..=12
-    /// sparks, `anim_ms` 350..=10000, `jitter` 0..=6 px, `intensity` 0..=1.
-    /// `magic` = rare Quasar/Singularity novas. `supernova_chance` (0..=100,
-    /// 0 disables) = the FUCK SUPER NOVA escalation chance under
-    /// `style = "rainbow"`. The window-wide ignition limiter (≤2 ignitions
-    /// per rolling second) is always on.
+    /// "rainbow" (animated rainbow ink, default) | "nova" | "sparkle". Clamps
+    /// are the native flash-safety floors: `density` 1..=12 sparks, `anim_ms`
+    /// 350..=10000, `jitter` 0..=6 px, `intensity` 0..=1. `magic` = rare
+    /// Quasar/Singularity novas. `supernova_chance` (0..=100, 0 disables) is
+    /// the super-nova escalation chance under `style = "rainbow"`. The
+    /// window-wide ignition limiter (≤2 per rolling second) is always on.
     #[allow(clippy::too_many_arguments)]
     pub fn set_sparkle_profanity(
         &mut self,
@@ -538,32 +474,30 @@ impl AtermGpuTerminal {
         );
     }
 
-    /// Custom word-effect specs (native `[[sparkle_words.custom]]`): pass the
-    /// SAME TOML fragment the native config carries — per-word `ink` /
-    /// `burst` / `graphic` axes. Custom words are auto-appended to the
-    /// emphasis class (CJK surfaces included), override class defaults, and
-    /// bypass per-class enable gates. Malformed TOML fails open to no
-    /// customs; pass `undefined` to clear.
+    /// Custom word-effect specs (native `[[sparkle_words.custom]]`): the same
+    /// TOML fragment the native config carries (per-word `ink` / `burst` /
+    /// `graphic`). Custom words join the emphasis class, override class
+    /// defaults and bypass class gates. Malformed TOML yields no customs;
+    /// `undefined` clears.
     pub fn set_sparkle_custom_specs(&mut self, toml: Option<String>) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
         self.effects.set_sparkle_custom_specs(toml);
     }
 
-    /// Arm (or clear) a **Trail Pack** — user-generated cursor trails as data.
-    /// Pass the pack's TOML source (`trail_pack::compile_trail_pack_toml`);
-    /// `undefined` clears any live pack. On a compile ERROR the prior pack is
-    /// LEFT INTACT and the joined diagnostics are RETURNED (never silently
-    /// dropped); `Ok` returns `undefined`.
+    /// Arm or clear a Trail Pack (user-defined cursor trails as data) from its
+    /// TOML source (`trail_pack::compile_trail_pack_toml`); `undefined` clears.
+    /// On a compile error the prior pack stays and the joined diagnostics are
+    /// returned; success returns `undefined`.
     pub fn set_cursor_trail_pack(&mut self, toml: Option<String>) -> Option<String> {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
         self.effects.set_cursor_trail_pack(toml)
     }
 
-    /// Comma-separated languages whose AMBIGUOUS homograph lexicon entries
-    /// un-gate (native `languages`, default `"en"`; non-ambiguous forms load
-    /// regardless; `"all"` un-gates everything). Rebuilds the lexicon.
+    /// Comma-separated languages whose ambiguous homograph entries are enabled
+    /// (native `languages`, default `"en"`; `"all"` enables everything).
+    /// Rebuilds the lexicon.
     pub fn set_sparkle_languages(&mut self, languages_csv: &str) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -575,10 +509,9 @@ impl AtermGpuTerminal {
         self.effects.set_sparkle_languages(&langs);
     }
 
-    /// User lexicon-override TOML merged over the builtin (the native
-    /// `lexicon` file / `extra_words` channel — the same `[[entry]]` schema).
-    /// Pass `undefined` to clear. A malformed override falls back to the
-    /// builtin lexicon (the native fail-open posture).
+    /// User lexicon-override TOML merged over the builtin (native `lexicon` /
+    /// `extra_words`, same `[[entry]]` schema). `undefined` clears; malformed
+    /// input falls back to the builtin.
     pub fn set_sparkle_lexicon_override(&mut self, toml: Option<String>) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -599,38 +532,30 @@ impl AtermGpuTerminal {
         self.effects.set_sparkle_deny(&words);
     }
 
-    /// Lexicon build diagnostics (v3 §6), newline-joined — one warning per
-    /// line for every user/custom surface that can never scan as written
-    /// (single-char CJK without the `cjk_single_char` opt-in, mixed-script /
-    /// multi-word) or collides across classes; the same warnings the native
-    /// resolver logs. Empty string while sparkle words are off or the lexicon
-    /// is clean. Filtered by the current knobs: a "requires cjk_single_char =
-    /// true" warning disappears once `set_sparkle_feline` enables the opt-in.
+    /// Lexicon build diagnostics, newline-joined: one warning per user/custom
+    /// surface that can never scan as written (single-char CJK without
+    /// `cjk_single_char`, mixed-script, multi-word) or collides across
+    /// classes. Empty while sparkle words are off or the lexicon is clean.
+    /// Filtered by the current knobs.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
     pub fn sparkle_lexicon_warnings(&self) -> String {
         self.effects.sparkle_lexicon_warnings().join("\n")
     }
 
-    // ---- The resident pet (design 2026-08-30, Phase 1) -------------------
+    // ---- The resident pet ------------------------------------------------
     //
-    // The rainbow kitty pet's brain, art and driver all live in the engine
-    // (`aterm_effects::companion::CompanionOwner`, driven by the shared
-    // pipeline); these exports are the JS host's door to it. Every one of
-    // them is O(1) — a field write, a value-shadowed compare, or a rect test
-    // — so the wasm-process census (OB-10) sees no unbounded reach behind a
-    // synchronous entry point. Defaults are OFF: a host that never calls
-    // `set_cursor_pet` renders byte-identically to the pre-pet binding.
+    // The pet's brain, art and driver live in the engine
+    // (`aterm_effects::companion::CompanionOwner`); these exports are the JS
+    // host's door to it. Each is O(1) (a field write, shadowed compare or rect
+    // test). Off by default.
 
     /// Enable the resident pet beside the caret, dressed by `seed`
-    /// (`KittyLook::for_launch` — the coat and iris a page load is born
-    /// with). The seed is MINTED BY THE HOST (`crypto.getRandomValues` over
-    /// a `BigUint64Array`; it crosses as a JS BigInt like `set_matrix_rain`'s
-    /// seed) because the engine is clockless and dieless: same seed + same
-    /// bytes + same `dt` stream ⇒ the same cat, pixel for pixel. The pet
-    /// draws only while the cursor glow is on with a style that names it
-    /// (`rainbow kitty`, `kitty`, `kitty pet`, `dog pet`, …); `false`
-    /// retires it outright and the next render is byte-identical to a
-    /// binding that never enabled it. The seed is read on enable only.
+    /// (`KittyLook::for_launch`). The host mints the seed
+    /// (`crypto.getRandomValues`, crossing as a BigInt) because the engine is
+    /// clockless and dieless: same seed, bytes and `dt` stream give the same
+    /// cat. The pet draws only while the cursor glow uses a style naming it
+    /// (`rainbow kitty`, `kitty`, `kitty pet`, `dog pet`, …). `false` retires
+    /// it. The seed is read on enable only.
     pub fn set_cursor_pet(&mut self, enabled: bool, seed: u64) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -644,22 +569,18 @@ impl AtermGpuTerminal {
         self.effects.cursor_pet_enabled()
     }
 
-    /// The alpha the last `render` put the pet on glass with: `0` = nothing
-    /// drawn (off, retired, unfocused, in history, or faded out), up to `255`
-    /// for a fully present cat. The observability twin of the hit target —
-    /// a page can tell "no cat" from "cat asleep" without reading pixels.
+    /// The alpha the last `render` drew the pet with: `0` = nothing drawn
+    /// (off, retired, unfocused, in history, or faded), up to `255`. Lets a
+    /// page tell "no cat" from "cat asleep" without reading pixels.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
     pub fn cursor_pet_alpha(&self) -> u8 {
         self.effects.cursor_pet_alpha()
     }
 
-    /// The pointer's position in FRAME px (the canvas's own device pixels,
-    /// chrome and message band included — the pixels the page already has;
-    /// the pipeline reads them against the grid where the frame draws it).
-    /// The pet watches a moving pointer and pounces on a fast one; feed every
-    /// `mousemove`. Value-shadowed: a sample equal to the last one changes
-    /// nothing and costs no render, so an idle hover cannot delete the frame
-    /// gate. A non-finite coordinate is dropped.
+    /// The pointer position in frame px (canvas device pixels, chrome and
+    /// message band included). The pet watches a moving pointer and pounces
+    /// on a fast one; feed every `mousemove`. Value-shadowed, so an idle hover
+    /// costs no render. Non-finite coordinates are dropped.
     pub fn note_pointer_px(&mut self, x: f32, y: f32) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         if self.effects.note_pointer_px(x, y) {
@@ -667,9 +588,8 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// The pointer left the surface (`mouseleave`): the pet stops watching
-    /// and settles. Value-shadowed like `note_pointer_px` — a second leave
-    /// changes nothing and costs no render.
+    /// The pointer left the surface (`mouseleave`): the pet stops watching and
+    /// settles. Value-shadowed.
     pub fn note_pointer_leave(&mut self) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         if self.effects.note_pointer_leave() {
@@ -677,15 +597,11 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// A left press at FRAME px `(x, y)` (the canvas's device pixels, chrome
-    /// and message band included). Returns the engine's verdict as a
-    /// small integer: `0` = pass (nothing of the engine's was under the
-    /// pointer — start your selection as usual), `1` = the pet was petted
-    /// and the press is CONSUMED (chrome wins: do not start a selection, do
-    /// not encode a mouse report). Higher codes are reserved for later
-    /// companions. Ask this BEFORE `selection_start`, exactly like the
-    /// native app asks its chrome first. The body is padded by a 4 px slop
-    /// so a near miss still strokes the cat.
+    /// A left press at frame px `(x, y)` (chrome and message band included).
+    /// Returns `0` = pass (start your selection as usual) or `1` = the pet
+    /// was petted and the press is consumed (no selection, no mouse report).
+    /// Higher codes are reserved. Ask before `selection_start`. The body hit
+    /// rect has 4 px of slop.
     pub fn pet_press_px(&mut self, x: f32, y: f32) -> u8 {
         let outcome = self.effects.press_px(x, y);
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
@@ -695,17 +611,12 @@ impl AtermGpuTerminal {
         outcome as u8
     }
 
-    /// The accessibility motion preference for EVERY effect at once (the
-    /// page's `prefers-reduced-motion: reduce`): the cursor's light is off
-    /// (the aurora, the block bodies, the momentum glow and the comet, as a
-    /// window's Reduce Motion turns them off), the pet is drawn but pinned
-    /// at its station (no arc, no gait), sparkle words take the static path
-    /// and PHOSPHOR freezes. The per-engine spellings
-    /// `set_sparkle_reduced_motion` and `set_matrix_rain_reduced_motion` are
-    /// ALIASES of this setter — one host fact, every effect, whichever name
-    /// the page calls — NOT narrower knobs: calling either pins the pet too.
-    /// A stable preference only, never a load term: the engine's own load
-    /// shed is a separate post-tick alpha envelope.
+    /// Reduced motion for every effect (`prefers-reduced-motion: reduce`):
+    /// cursor light off (aurora, block bodies, momentum glow, comet), pet
+    /// drawn but pinned at its station, sparkle words static, phosphor
+    /// frozen. `set_sparkle_reduced_motion` and
+    /// `set_matrix_rain_reduced_motion` are aliases. A stable preference, not
+    /// a load term (load shedding is a separate alpha envelope).
     pub fn set_reduced_motion(&mut self, on: bool) {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();

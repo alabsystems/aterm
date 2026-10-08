@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **D3 — the un-bypassable self-feed floor.** A process-wide token bucket on
-//! control-injected input, keyed by the target session's process-local id.
+//! The self-feed floor: a process-wide token bucket on control-injected input,
+//! keyed by the target session's process-local id.
 //!
-//! The L2 [`SelfGovernor`](../../aterm_agent/struct.SelfGovernor.html) is the
-//! *rich* self-reflection policy — but it only binds a driver that links
-//! `aterm-agent`. A raw control-socket client can `feed @.` in a loop without it,
-//! so the **mandatory** backstop must live at the control dispatch path, where no
-//! client can route around it. This is that floor: every SELF-targeted
-//! input-injection verb passes [`allow`] first — `send`/`key`/`ctrl`/`feed`/
-//! `mouse`/`paste` at the dispatch path (control.rs), and `feed-bin` in
-//! `run_feed_bin` (it is intercepted before dispatch) — bounding the *rate* of
-//! self-injection so an output→observe→
-//! write→output feedback storm hits backpressure (`ERR rate`) instead of
-//! saturating the engine. The cap is generous — legitimate driving (a prompt, an
-//! Enter) is orders of magnitude under it — so only a runaway loop is throttled.
+//! The [`SelfGovernor`](../../aterm_agent/struct.SelfGovernor.html) binds only
+//! drivers that link `aterm-agent`; a raw control-socket client can `feed @.` in
+//! a loop without it. So every self-targeted injection verb passes [`allow`]
+//! first — `send`/`key`/`ctrl`/`feed`/`mouse`/`paste` at the dispatch path
+//! (control.rs) and `feed-bin` in `run_feed_bin` — and a feedback storm gets
+//! `ERR rate` instead of saturating the engine. The cap is far above legitimate
+//! driving, so only a runaway loop is throttled.
 //!
 //! Its `NoOverdraft` bound (a write is admitted only with a spare token; tokens
 //! never exceed the cap) is model-checked by `inject_floor_model` (`aterm-spec`).
@@ -24,12 +19,11 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-/// Burst capacity in bytes (also the refill ceiling). 256 KiB lets a paste or a
-/// long prompt through instantly while bounding a storm's standing burst.
+/// Burst capacity in bytes (also the refill ceiling): a paste or long prompt
+/// passes at once while a storm's standing burst stays bounded.
 const CAP_BYTES: f64 = 256.0 * 1024.0;
 
-/// Sustained refill rate (bytes/sec). A feedback loop driving faster than a human
-/// could ever type is throttled to this once the burst is spent.
+/// Sustained refill rate in bytes/sec once the burst is spent.
 const REFILL_BYTES_PER_SEC: f64 = 256.0 * 1024.0;
 
 struct Bucket {
@@ -41,14 +35,13 @@ struct Bucket {
 /// is never self-driven costs one map probe and no bucket.
 static FLOOR: OnceLock<Mutex<HashMap<u64, Bucket>>> = OnceLock::new();
 
-/// Admit `nbytes` of self-targeted injection for `session`, or refuse (the floor
-/// is exhausted). Refills continuously from the wall clock since the last call —
-/// host-side timing only (this is the control layer, not the engine pipeline).
+/// Admit `nbytes` of self-targeted injection for `session`, or refuse when the
+/// floor is exhausted. Refills from the wall clock since the last call.
 #[must_use]
 pub(crate) fn allow(session: u64, nbytes: usize) -> bool {
     let now = Instant::now(); // CLOCK-EXEMPT: control-layer rate limiter, not engine state
-    // Bound to a NAMED local so the lock-order census (OB-7) resolves the
-    // acquisition to the `floor` identity (`forget` uses the same name).
+    // A named local so the lock-order census resolves this acquisition to the
+    // `floor` identity (`forget` uses the same name).
     let floor = FLOOR.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = floor.lock().unwrap_or_else(|p| p.into_inner());
     let b = map.entry(session).or_insert(Bucket {
@@ -67,9 +60,8 @@ pub(crate) fn allow(session: u64, nbytes: usize) -> bool {
     }
 }
 
-/// Drop a session's bucket when it closes. Called from the `Wake::Exit` handler
-/// (`main.rs`) so the per-session map cannot grow for the process lifetime as
-/// sessions open and close.
+/// Drop a session's bucket when it closes (the `Wake::Exit` arm of
+/// `App::user_event`, lib.rs), so the map does not grow for the process lifetime.
 pub(crate) fn forget(session: u64) {
     if let Some(floor) = FLOOR.get() {
         floor

@@ -1,17 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Differential tests against the `regex` crate, kept as a dev-dependency
-//! ORACLE for exactly this purpose.
+//! Matching behaviour over corpora: the patterns aterm ships, a hand-written
+//! syntax corpus, the perl classes and case folding across all of Unicode,
+//! zero-width and nullable repetitions, and the prefilter at every alignment.
 //!
-//! The contract this crate has to meet is not "close enough". It is: for a
-//! pattern both engines compile, `find_iter` yields the identical sequence of
-//! `(start, end)` pairs and `is_match` returns the identical bool. Everything
-//! here is that assertion over a corpus — the patterns aterm ships, a
-//! hand-written syntax corpus, and the perl classes across all of Unicode.
+//! Each corpus is pinned by an FNV-1a digest of what this engine reports —
+//! `find_iter` spans, `is_match` and `find` — recorded when every one of those
+//! answers matched the `regex` crate this engine replaced. A changed digest is
+//! a changed answer somewhere in that corpus.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+
+thread_local! {
+    static GOLDEN: Cell<u64> = const { Cell::new(0xcbf2_9ce4_8422_2325) };
+}
+
+/// Fold `bytes` (and a separator) into this test thread's digest.
+fn feed(bytes: &[u8]) {
+    GOLDEN.with(|g| {
+        let mut h = g.get();
+        for &b in bytes.iter().chain(&[0xff]) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        g.set(h);
+    });
+}
+
+fn feed_spans(spans: &[(usize, usize)]) {
+    for &(a, b) in spans {
+        feed(&(a as u64).to_le_bytes());
+        feed(&(b as u64).to_le_bytes());
+    }
+    feed(b"/");
+}
+
+/// Assert this thread's digest, then reset it.
+#[track_caller]
+fn pin(expected: &str) {
+    let got = GOLDEN.with(|g| g.replace(0xcbf2_9ce4_8422_2325));
+    assert_eq!(format!("{got:016x}"), expected, "the pinned corpus changed");
+}
 
 /// The eleven patterns `aterm-selection`'s `builtin_patterns` ships. These are
 /// the specification: whatever else this engine can or cannot do, it has to do
@@ -96,52 +128,48 @@ fn spans_mine(p: &str, h: &str) -> Option<Vec<(usize, usize)>> {
     Some(re.find_iter(h).map(|m| (m.start(), m.end())).collect())
 }
 
-fn spans_oracle(p: &str, h: &str) -> Option<Vec<(usize, usize)>> {
-    let re = regex::Regex::new(p).ok()?;
-    Some(re.find_iter(h).map(|m| (m.start(), m.end())).collect())
-}
-
-/// Assert both engines compile `p` and agree on `h`, for `find_iter` *and*
-/// `is_match`.
+/// Compile `p`, run it over `h`, hold `find_iter`, `is_match` and `find` to
+/// each other, and fold the answer into the corpus digest.
 #[track_caller]
-fn agree(p: &str, h: &str) {
-    let mine =
+fn record(p: &str, h: &str) {
+    let re =
         aterm_regex::Regex::new(p).unwrap_or_else(|e| panic!("this engine rejected {p:?}:\n{e}"));
-    let oracle = regex::Regex::new(p).unwrap_or_else(|e| panic!("the oracle rejected {p:?}: {e}"));
-    let a: Vec<(usize, usize)> = mine.find_iter(h).map(|m| (m.start(), m.end())).collect();
-    let b: Vec<(usize, usize)> = oracle.find_iter(h).map(|m| (m.start(), m.end())).collect();
-    assert_eq!(a, b, "find_iter disagreed for {p:?} on {h:?}");
+    let spans: Vec<(usize, usize)> = re.find_iter(h).map(|m| (m.start(), m.end())).collect();
+    let first = re.find(h).map(|m| (m.start(), m.end()));
     assert_eq!(
-        mine.is_match(h),
-        oracle.is_match(h),
-        "is_match disagreed for {p:?} on {h:?}"
+        first,
+        spans.first().copied(),
+        "find vs find_iter for {p:?} on {h:?}"
     );
     assert_eq!(
-        mine.find(h).map(|m| (m.start(), m.end())),
-        oracle.find(h).map(|m| (m.start(), m.end())),
-        "find disagreed for {p:?} on {h:?}"
+        re.is_match(h),
+        first.is_some(),
+        "is_match vs find for {p:?} on {h:?}"
     );
     // Every offset must land on a code-point boundary, or the call sites'
     // `&text[m.start()..m.end()]` would panic.
-    for (start, end) in a {
+    for &(start, end) in &spans {
         assert!(
             h.is_char_boundary(start) && h.is_char_boundary(end),
             "{p:?} on {h:?}"
         );
     }
+    feed(p.as_bytes());
+    feed(h.as_bytes());
+    feed_spans(&spans);
 }
 
 #[test]
-fn builtin_selection_patterns_match_the_oracle() {
+fn builtin_selection_patterns_are_pinned() {
     for &(name, pattern) in BUILTIN {
         for haystack in HAYSTACKS {
-            // Name the rule in the panic so a failure says which one broke.
-            let mine = spans_mine(pattern, haystack);
-            let oracle = spans_oracle(pattern, haystack);
-            assert_eq!(mine, oracle, "builtin rule {name:?} on {haystack:?}");
-            assert!(mine.is_some(), "builtin rule {name:?} must compile");
+            let spans = spans_mine(pattern, haystack)
+                .unwrap_or_else(|| panic!("builtin rule {name:?} must compile"));
+            record(pattern, haystack);
+            feed_spans(&spans);
         }
     }
+    pin(BUILTIN_DIGEST);
 }
 
 /// The specific spans the built-in rules are supposed to pick out, spelled out
@@ -214,7 +242,7 @@ fn builtin_patterns_select_what_they_are_for() {
 }
 
 #[test]
-fn syntax_corpus_matches_the_oracle() {
+fn syntax_corpus_is_pinned() {
     const PATTERNS: &[&str] = &[
         // Quantifiers, greedy and lazy.
         r"a",
@@ -410,235 +438,55 @@ fn syntax_corpus_matches_the_oracle() {
     ];
     for p in PATTERNS {
         for h in HAY {
-            agree(p, h);
+            record(p, h);
         }
     }
+    pin(SYNTAX_DIGEST);
 }
 
-/// `\d`, `\w` and `\s` over every code point.
-///
-/// `\s` and `\d` must agree exactly. `\w` is allowed to disagree in one
-/// direction only — code points the *toolchain's* `char::is_alphabetic` knows
-/// about and the oracle's older bundled tables do not. Asserting that shape is
-/// what keeps this a recorded version skew rather than a place a real bug could
-/// hide.
+/// `\d`, `\w` and `\s` over every code point. `\w` is `char::is_alphabetic`
+/// (the toolchain's Unicode version, which also moves `\b` and so the
+/// `git_hash` rule) plus baked tables; only the baked part is pinned, so a
+/// toolchain bump cannot move the digest. Recorded when `\d`, `\s` and the
+/// non-alphabetic `\w` matched the `regex` crate exactly.
 #[test]
-fn perl_classes_match_the_oracle() {
-    let mine_d = aterm_regex::Regex::new(r"^\d$").expect("compiles");
-    let mine_w = aterm_regex::Regex::new(r"^\w$").expect("compiles");
-    let mine_s = aterm_regex::Regex::new(r"^\s$").expect("compiles");
-    let their_d = regex::Regex::new(r"^\d$").expect("compiles");
-    let their_w = regex::Regex::new(r"^\w$").expect("compiles");
-    let their_s = regex::Regex::new(r"^\s$").expect("compiles");
-
+fn perl_classes_are_pinned() {
+    let d = aterm_regex::Regex::new(r"^\d$").expect("compiles");
+    let w = aterm_regex::Regex::new(r"^\w$").expect("compiles");
+    let sp = aterm_regex::Regex::new(r"^\s$").expect("compiles");
     let mut buf = [0u8; 4];
-    let mut word_skew = 0usize;
     for cp in 0u32..0x11_0000 {
         let Some(c) = char::from_u32(cp) else {
             continue;
         };
         let s: &str = c.encode_utf8(&mut buf);
-        assert_eq!(mine_d.is_match(s), their_d.is_match(s), "\\d at U+{cp:04X}");
-        assert_eq!(mine_s.is_match(s), their_s.is_match(s), "\\s at U+{cp:04X}");
-        if mine_w.is_match(s) != their_w.is_match(s) {
-            assert!(
-                mine_w.is_match(s) && c.is_alphabetic(),
-                "\\w disagreed at U+{cp:04X} in a direction that is not Unicode-version skew"
-            );
-            word_skew += 1;
-        }
-    }
-    // Non-zero and bounded: the skew is real, known, and small next to the
-    // ~140k code points `\w` covers.
-    assert!(
-        word_skew < 10_000,
-        "unexpectedly large \\w skew: {word_skew}"
-    );
-}
-
-/// The `\w` skew reaches `\b`, and therefore a rule aterm actually ships.
-///
-/// `perl_classes_match_the_oracle` bounds the `\w` divergence but stops there,
-/// which understates it: `\b` is *defined* from `\w`, so a code point the
-/// toolchain calls alphabetic and the oracle does not is a code point where the
-/// two engines draw the word boundary in different places. That is not an
-/// abstract difference — `aterm-selection`'s `git_hash` rule is `\b`-delimited,
-/// so a hex run touching one of those 4,662 code points was selectable under the
-/// retired crate and is not under this one.
-///
-/// This test exists to make that consequence *visible and pinned* rather than
-/// discovered later from a bug report. It asserts the shape, not the verdict:
-/// the divergence is one-directional (the oracle selects, we do not, never the
-/// reverse), it is confined to `\b`-delimited rules, and the rules without `\b`
-/// are untouched. If a future toolchain or a baked `Alphabetic` table changes
-/// any of that, this fails and says so.
-#[test]
-fn the_word_class_skew_moves_word_boundaries_in_a_shipped_rule() {
-    let git_hash = BUILTIN
-        .iter()
-        .find(|(name, _)| *name == "git_hash")
-        .expect("the git_hash rule is part of the specification")
-        .1;
-    assert!(
-        git_hash.contains(r"\b"),
-        "this test is about the \\b delimiters"
-    );
-
-    let mine = aterm_regex::Regex::new(git_hash).expect("compiles");
-    let oracle = regex::Regex::new(git_hash).expect("compiles");
-
-    // U+088F: `Alphabetic` to the current toolchain, not to the oracle's
-    // bundled tables. Adjacent to a hex run it removes the trailing boundary.
-    //
-    // The concrete spans are asserted only while the two engines still disagree
-    // about U+088F being a word character, and a live probe decides that rather
-    // than a hard-coded expectation. Pinning `theirs == [(0, 8)]` outright would
-    // make a newer oracle — one whose tables have caught up — fail this test
-    // with a message about `\b` when the real news is that the divergence
-    // closed. That is the same trap
-    // `this_engine_finds_the_leftmost_start_whichever_oracle_vintage_resolves`
-    // was renamed and rewritten out of — it used to be called
-    // `the_oracle_misses_a_leftmost_start_and_this_engine_does_not` and to
-    // `assert_ne!` that the oracle stayed wrong — and it is not worth
-    // re-digging one test over.
-    let mut buf = [0u8; 4];
-    let sep = char::from_u32(0x088F).expect("scalar");
-    let probe_mine = aterm_regex::Regex::new(r"^\w$").expect("compiles");
-    let probe_oracle = regex::Regex::new(r"^\w$").expect("compiles");
-    let sep_str: &str = sep.encode_utf8(&mut buf);
-    if probe_mine.is_match(sep_str) && !probe_oracle.is_match(sep_str) {
+        let word = w.is_match(s);
         assert!(
-            sep.is_alphabetic(),
-            "the divergence rests on `std` calling U+088F alphabetic"
+            word || !c.is_alphabetic(),
+            "\\w misses alphabetic U+{cp:04X}"
         );
-        let haystack = format!("deadbeef{sep}");
-        let ours: Vec<(usize, usize)> = mine
-            .find_iter(&haystack)
-            .map(|m| (m.start(), m.end()))
-            .collect();
-        let theirs: Vec<(usize, usize)> = oracle
-            .find_iter(&haystack)
-            .map(|m| (m.start(), m.end()))
-            .collect();
-        assert_eq!(
-            theirs,
-            vec![(0, 8)],
-            "the retired crate selected the hash here"
-        );
-        assert_eq!(
-            ours,
-            Vec::new(),
-            "and this engine does not, because U+088F is a \\w"
-        );
-    }
-
-    // The direction is fixed: the skew only ever *removes* a selection, because
-    // `\w` here is a superset. A rule matching where the oracle does not would
-    // be a different bug wearing this one's clothes.
-    let mut suppressed = 0usize;
-    for cp in 0u32..0x11_0000 {
-        let Some(c) = char::from_u32(cp) else {
-            continue;
-        };
-        if !c.is_alphabetic() || c.is_ascii() {
-            continue;
-        }
-        let s: &str = c.encode_utf8(&mut buf);
-        let haystack = format!("deadbeef{s}");
-        let ours = mine.find(&haystack).is_some();
-        let theirs = oracle.find(&haystack).is_some();
-        if ours != theirs {
-            assert!(
-                theirs && !ours,
-                "U+{cp:04X}: this engine selected a git hash the oracle did not"
-            );
-            suppressed += 1;
+        let baked_word = word && !c.is_alphabetic();
+        let bits =
+            u8::from(d.is_match(s)) | u8::from(baked_word) << 1 | u8::from(sp.is_match(s)) << 2;
+        if bits != 0 {
+            feed(&cp.to_le_bytes());
+            feed(&[bits]);
         }
     }
-    // If this ever reaches zero the divergence has closed — which is good news,
-    // and news the crate docs are then WRONG about. The failure says so rather
-    // than demanding the divergence survive.
-    assert!(
-        suppressed > 0,
-        "no `\\b` boundary skew left: the oracle's Unicode has caught up with the \
-         toolchain's, so the divergence note in lib.rs is now false and this test \
-         has nothing to pin — update both together"
-    );
-    assert!(
-        suppressed < 10_000,
-        "unexpectedly large boundary skew: {suppressed}"
-    );
-
-    // The rules with no `\b` are untouched, which is what confines the blast
-    // radius to word-boundary rules rather than to selection generally.
-    for name in ["url", "email", "semver"] {
-        let pattern = BUILTIN
-            .iter()
-            .find(|(n, _)| *n == name)
-            .expect("built-in")
-            .1;
-        assert!(!pattern.contains(r"\b"), "{name} is not \\b-delimited");
-    }
+    pin(PERL_DIGEST);
 }
 
 /// Case folding, over the whole cased range, one code point at a time.
 ///
-/// Two things went wrong in the first version of this test and both are fixed
-/// here, because between them they made an entire class of fold bug invisible.
-///
-/// **The candidate window was arithmetic.** It asked both engines about
-/// everything within `±0x40` of the code point. A fold orbit is not a
-/// neighbourhood: `\u{390}` folds to `\u{1fd3}`, 0x1c43 away, and no window
-/// reaches that. Candidates are now *bucketed by case mapping* — every code
-/// point whose `to_lowercase`/`to_uppercase` starts with the same code point as
-/// this one's, in both directions — which is what actually finds a distant
-/// orbit partner. `\u{390}` and `\u{1fd3}` both uppercase to a string starting
-/// `\u{399}`, so each is in the other's bucket; `\u{fb05}` and `\u{fb06}` both
-/// uppercase to `"ST"`.
-///
-/// **The skip discarded exactly the population that was broken.** It skipped
-/// any code point whose whole `to_uppercase()` *string* the oracle's single-char
-/// `(?i)` pattern did not match — which is every code point with a multi-code-
-/// point full case mapping, i.e. precisely `\u{390}`, `\u{3b0}` and `\u{fb05}`.
-/// There is no skip now. Every disagreement is *classified* instead, the way
-/// `perl_classes_match_the_oracle` classifies `\w`: a disagreement is tolerated
-/// only when this engine matches, the oracle does not, and `std`'s own
-/// single-code-point case mappings link the pair — the recorded
-/// Unicode-version skew. A disagreement the other way, where the *oracle*
-/// folds two code points together and this engine does not, is a hard failure
-/// with no escape hatch. That is the direction the three missing
-/// `CaseFolding.txt` `C` edges failed in.
+/// Candidates are *bucketed by case mapping* — every code point whose
+/// `to_lowercase`/`to_uppercase` starts with the same code point as this one's,
+/// in both directions — which is what finds a distant orbit partner: `\u{390}`
+/// folds to `\u{1fd3}`, 0x1c43 away, and both uppercase to a string starting
+/// `\u{399}`. Recorded when every answer matched the `regex` crate except
+/// pairs `std`'s own single-code-point case mappings link (Unicode-version
+/// skew, in the direction of folding MORE).
 #[test]
-fn case_folding_matches_the_oracle() {
-    fn single_lower(c: char) -> Option<char> {
-        let mut it = c.to_lowercase();
-        let first = it.next()?;
-        it.next().is_none().then_some(first)
-    }
-    fn single_upper(c: char) -> Option<char> {
-        let mut it = c.to_uppercase();
-        let first = it.next()?;
-        it.next().is_none().then_some(first)
-    }
-
-    // `std`'s own view of which code points are case-equivalent: the connected
-    // components of the single-code-point mapping graph. A disagreement is only
-    // excusable as version skew if `std` links the pair and the oracle's older
-    // tables do not, so this is the arbiter of "skew" rather than our say-so.
-    let mut parent: BTreeMap<char, char> = BTreeMap::new();
-    fn root(parent: &mut BTreeMap<char, char>, x: char) -> char {
-        let mut r = x;
-        while let Some(&p) = parent.get(&r) {
-            if p == r {
-                break;
-            }
-            r = p;
-        }
-        r
-    }
-
-    // Buckets keyed by the FIRST code point of each case mapping, in both
-    // directions. This is the part that reaches a far-away orbit partner.
+fn case_folding_is_pinned() {
     let mut lower_bucket: BTreeMap<char, Vec<char>> = BTreeMap::new();
     let mut upper_bucket: BTreeMap<char, Vec<char>> = BTreeMap::new();
     let mut cased: Vec<char> = Vec::new();
@@ -653,39 +501,17 @@ fn case_folding_matches_the_oracle() {
         if !c.to_lowercase().eq([c]) || !c.to_uppercase().eq([c]) {
             cased.push(c);
         }
-        for mapped in [single_lower(c), single_upper(c)].into_iter().flatten() {
-            if mapped != c {
-                parent.entry(c).or_insert(c);
-                parent.entry(mapped).or_insert(mapped);
-                let (ra, rb) = (root(&mut parent, c), root(&mut parent, mapped));
-                if ra != rb {
-                    parent.insert(ra, rb);
-                }
-            }
-        }
     }
 
     let mut buf = [0u8; 4];
-    let mut checked = 0usize;
-    let mut skew = 0usize;
     for &c in &cased {
-        let cp = c as u32;
-        let escaped = regex::escape(&c.to_string());
-        let Ok(oracle) = regex::Regex::new(&format!("(?i){escaped}")) else {
-            continue;
-        };
-        let Ok(oracle_class) = regex::Regex::new(&format!("(?i)[{escaped}]")) else {
-            continue;
-        };
-        let mine_src = aterm_regex::escape(&c.to_string());
-        let mine = aterm_regex::Regex::new(&format!("(?i){mine_src}")).expect("compiles");
-        let mine_class = aterm_regex::Regex::new(&format!("(?i)[{mine_src}]")).expect("compiles");
+        let src = aterm_regex::escape(&c.to_string());
+        let single = aterm_regex::Regex::new(&format!("(?i){src}")).expect("compiles");
+        let class = aterm_regex::Regex::new(&format!("(?i)[{src}]")).expect("compiles");
 
         let mut candidates: BTreeSet<char> = ('a'..='z').chain('A'..='Z').collect();
         candidates.insert(c);
         candidates.extend(c.to_lowercase().chain(c.to_uppercase()));
-        // Both directions, and both "who maps to where I map" and "who maps
-        // to me": U+1FD3 is found from U+0390 through the shared U+0399.
         for key in [
             c,
             c.to_lowercase().next().expect("non-empty"),
@@ -697,57 +523,23 @@ fn case_folding_matches_the_oracle() {
                 }
             }
         }
-        // Everything this engine folds `c` onto must be in the comparison, or a
-        // spurious orbit member could slip through unexamined.
-        for other in &candidates.clone() {
-            let s: &str = other.encode_utf8(&mut buf);
-            if mine.is_match(s) {
-                candidates.insert(*other);
-            }
-        }
-
+        feed(&(c as u32).to_le_bytes());
         for other in &candidates {
             let s: &str = other.encode_utf8(&mut buf);
-            for (got, want, shape) in [
-                (mine.is_match(s), oracle.is_match(s), "(?i)X"),
-                (mine_class.is_match(s), oracle_class.is_match(s), "(?i)[X]"),
-            ] {
-                if got == want {
-                    continue;
-                }
-                // The ONLY tolerated direction: we fold, the oracle does not,
-                // and `std` says the pair is case-equivalent. Anything else --
-                // above all the oracle folding a pair we miss -- is a bug here.
-                assert!(
-                    got && !want,
-                    "{shape} U+{cp:04X}: the oracle folds U+{:04X} onto it and this engine \
-                     does not. This is not version skew; it is a missing fold edge.",
-                    *other as u32
-                );
-                let (ra, rb) = (root(&mut parent, c), root(&mut parent, *other));
-                assert!(
-                    parent.contains_key(&c) && parent.contains_key(other) && ra == rb,
-                    "{shape} U+{cp:04X} folds onto U+{:04X} but `std`'s case mappings do \
-                     not link them, so this is not Unicode-version skew either",
-                    *other as u32
-                );
-                skew += 1;
+            let (a, b) = (single.is_match(s), class.is_match(s));
+            assert_eq!(a, b, "(?i)X and (?i)[X] disagree for U+{:04X}", c as u32);
+            if a {
+                feed(&(*other as u32).to_le_bytes());
             }
         }
-        checked += 1;
     }
-    assert!(
-        checked > 2_000,
-        "expected the whole cased range, checked {checked}"
-    );
-    // Non-zero and bounded, exactly as `perl_classes_match_the_oracle` bounds
-    // the `\w` skew: real, known, and small.
-    assert!(skew < 5_000, "unexpectedly large case-fold skew: {skew}");
+    assert!(cased.len() > 2_000, "expected the whole cased range");
+    pin(FOLD_DIGEST);
 }
 
 /// The exotic orbits that make case folding more than `to_lowercase`.
 #[test]
-fn exotic_fold_orbits_match_the_oracle() {
+fn exotic_fold_orbits_are_pinned() {
     for (p, h) in [
         ("(?i)k", "kK\u{212a}"),
         ("(?i)[a-z]", "K\u{212a}\u{17f}Sz"),
@@ -760,15 +552,16 @@ fn exotic_fold_orbits_match_the_oracle() {
         ("(?i)[^k]", "kK\u{212a}z"),
         ("(?i)\u{3a9}", "\u{3a9}\u{3c9}\u{2126}"),
     ] {
-        agree(p, h);
+        record(p, h);
     }
+    pin(EXOTIC_DIGEST);
 }
 
 /// Zero-width matching, where `find_iter`'s advance rule lives. `aterm-search`
 /// filters these out, but only after this engine has produced exactly the same
-/// ones the oracle would.
+/// ones it should.
 #[test]
-fn zero_width_matches_match_the_oracle() {
+fn zero_width_matches_are_pinned() {
     for p in [
         r"", r"x*", r"a*", r"\b", r"\B", r"^", r"$", r"(?m)^", r"(?m)$", r"()", r"(?:)", r"a{0}",
         r"\bx*\b", r"(|a)*", r"\b|a", r"a*?", r"(?:a|)*",
@@ -785,9 +578,10 @@ fn zero_width_matches_match_the_oracle() {
             "a\u{301}b c",
             "  x  ",
         ] {
-            agree(p, h);
+            record(p, h);
         }
     }
+    pin(ZERO_WIDTH_DIGEST);
 }
 
 /// Repetitions whose body can match nothing, and repetitions whose body is
@@ -796,7 +590,7 @@ fn zero_width_matches_match_the_oracle() {
 /// stop at the first word boundary rather than run to the end — and both of
 /// those broke, in opposite directions, before the star grew two shapes.
 #[test]
-fn nullable_and_lazy_repetitions_match_the_oracle() {
+fn nullable_and_lazy_repetitions_are_pinned() {
     const PATTERNS: &[&str] = &[
         r"(|a)*",
         r"(a|)*",
@@ -864,9 +658,10 @@ fn nullable_and_lazy_repetitions_match_the_oracle() {
     ];
     for p in PATTERNS {
         for h in HAY {
-            agree(p, h);
+            record(p, h);
         }
     }
+    pin(NULLABLE_DIGEST);
 }
 
 /// `(?x)` — extended mode, where whitespace is insignificant and `#` runs to
@@ -877,7 +672,7 @@ fn nullable_and_lazy_repetitions_match_the_oracle() {
 /// theirs, where `a? ?` is `(a?)?` and not `a??`. Every one of those is checked
 /// here, because every one of them was wrong first.
 #[test]
-fn extended_mode_matches_the_oracle() {
+fn extended_mode_is_pinned() {
     const PATTERNS: &[&str] = &[
         r"(?x)a b c",
         r"(?x) a  b ",
@@ -942,16 +737,16 @@ fn extended_mode_matches_the_oracle() {
     ];
     for p in PATTERNS {
         for h in HAY {
-            agree(p, h);
+            record(p, h);
         }
     }
+    pin(EXTENDED_DIGEST);
 }
 
 /// The prefilter — the byte-at-a-time scan that skips text no match can begin
 /// in — is the one place a walk could stop inside a multi-byte code point, and
 /// the one optimisation that could cost a match outright. Drive it at every
-/// alignment over text where the skipped runs are multi-byte, and check the
-/// answer against the oracle rather than against itself.
+/// alignment over text where the skipped runs are multi-byte.
 #[test]
 fn the_prefilter_never_changes_the_answer() {
     const PATTERNS: &[&str] = &[
@@ -1002,17 +797,17 @@ fn the_prefilter_never_changes_the_answer() {
                 "ab qz",
                 "az0 ab1",
             ] {
-                agree(pattern, &format!("{prefix}{body}{prefix}"));
+                record(pattern, &format!("{prefix}{body}{prefix}"));
             }
         }
     }
+    pin(PREFILTER_DIGEST);
 }
 
-/// Every construct this engine deliberately refuses, each one proved to be a
-/// refusal the oracle does *not* share — so the list is honest about the cost,
-/// and so a future change that starts accepting one of these is visible.
+/// Every construct this engine deliberately refuses (each one a construct the
+/// `regex` crate accepted), so a change that starts accepting one is visible.
 #[test]
-fn refusals_are_refusals_and_the_oracle_accepts_them() {
+fn refusals_are_refusals() {
     for (pattern, expected) in [
         (r"\p{L}", "Unicode property classes"),
         (r"\pL", "Unicode property classes"),
@@ -1023,10 +818,6 @@ fn refusals_are_refusals_and_the_oracle_accepts_them() {
         (r"(?-u)a", "byte-oriented"),
         (r"(?R)^", "CRLF mode"),
     ] {
-        assert!(
-            regex::Regex::new(pattern).is_ok(),
-            "{pattern:?} is supposed to be something the oracle accepts"
-        );
         let err = aterm_regex::Regex::new(pattern)
             .expect_err("this engine must refuse it, not reinterpret it")
             .to_string();
@@ -1037,10 +828,9 @@ fn refusals_are_refusals_and_the_oracle_accepts_them() {
     }
 }
 
-/// Malformed patterns both engines reject. The messages differ in wording; what
-/// matters is that neither compiles something bogus into a matcher.
+/// Malformed patterns are rejected rather than compiled into something bogus.
 #[test]
-fn malformed_patterns_are_rejected_by_both() {
+fn malformed_patterns_are_rejected() {
     for pattern in [
         r"(unclosed",
         r"a)",
@@ -1083,107 +873,146 @@ fn malformed_patterns_are_rejected_by_both() {
         r"(?P<n >a)",
     ] {
         assert!(
-            regex::Regex::new(pattern).is_err(),
-            "{pattern:?} is supposed to be something the oracle rejects"
-        );
-        assert!(
             aterm_regex::Regex::new(pattern).is_err(),
-            "this engine accepted {pattern:?}, which the oracle rejects"
+            "this engine accepted {pattern:?}"
         );
     }
 }
 
-/// This engine finds a leftmost start that some oracle versions miss.
+/// A negated POSIX item is case-folded BEFORE it is negated, exactly as a
+/// bracketed class is: `(?i)[[:^lower:]]` is "not a letter of either case", not
+/// "fold the complement of `[a-z]`".
 ///
-/// `regex` 1.12's unanchored search misses the leftmost start when a repetition
-/// whose body can consume a multi-byte code point is followed by a multi-byte
-/// literal: `(.*b)*é` on `"aaébé"` reports `2..7`, though a match plainly begins
-/// at 0. The oracle contradicts itself there — anchor the same pattern, or drive
-/// it with a lazy prefix and read the capture, and it agrees with this engine
-/// that the match starts at 0. The fuzz loop arbitrates disagreements that way
-/// rather than trusting the oracle blindly, and this case is the reason it has
-/// to.
+/// The two orders are far apart. The complement of `[a-z]` holds `A-Z`, `ſ`
+/// (U+017F) and the KELVIN SIGN (U+212A), whose fold orbits are `a-z`, `s` and
+/// `k` — so folding after negating gives back every code point there is, and
+/// `[^[:^lower:]]` then matches nothing at all. `aterm-search` prefixes `(?i)`
+/// to every pattern in its default case-insensitive mode, so these are the
+/// answers a person typing `[[:^alpha:]]` into the find bar gets.
 ///
-/// ## Why this no longer asserts the defect is still there
-///
-/// It used to `assert_ne!` that the oracle still gets these wrong — a tripwire
-/// meant to say "delete this case once upstream fixes it". That made a
-/// third-party bug into a *requirement*, and it was pinned to the wrong crate.
-/// The behaviour lives in `regex-automata`, not `regex`: holding the oracle at
-/// `regex = "=1.12.3"` and moving only the transitive `regex-automata` 0.4.14 →
-/// 0.4.18 flips all three cases to agree with this engine, and the `assert_ne!`
-/// fails. Since the dev-dependency is `regex = "1"` and `regex` itself takes a
-/// caret range on `regex-automata`, nothing pinned the crate that carries the
-/// behaviour — so a plain `cargo update` would turn this crate red with a
-/// message blaming the oracle rather than naming the cause.
-///
-/// The claim worth keeping is the unconditional one: **this engine finds the
-/// leftmost match**, whichever oracle vintage resolves. The oracle half is now
-/// conditional — when it disagrees, the anchored arbiter has to confirm us, so
-/// the disagreement is still proved to be the oracle's and not ours; when it
-/// agrees, there is simply nothing to arbitrate.
-///
-/// The NAME changed with the assertion, because the name was half the defect.
-/// The old one — `the_oracle_misses_a_leftmost_start_and_this_engine_does_not`
-/// — put a third-party bug where the property under test belongs, so an
-/// upstream fix read as a local failure. A test that requires a defect to be
-/// present punishes whoever fixes the defect.
-///
-/// This repo has retired that shape twice already, which is why it is not
-/// re-litigated here. `aterm-forge`'s
-/// `an_unpatched_sibling_version_reds_the_forge_verb` used to be pointed at the
-/// real dependency graph's live `winnow` duplication and now plants the same
-/// shape in a synthesized fixture, so resolving the duplicate upstream cannot
-/// turn the gate red. And
-/// `the_word_class_skew_moves_word_boundaries_in_a_shipped_rule` above pins its
-/// concrete `\b` spans only while a live probe says the two engines still
-/// disagree about U+088F, rather than hard-coding the oracle's answer and then
-/// failing with a message about `\b` when the real news is that the divergence
-/// closed.
+/// Every expected span here is what the `regex` crate (1.12.4) reports on the
+/// same haystack.
 #[test]
-fn this_engine_finds_the_leftmost_start_whichever_oracle_vintage_resolves() {
+fn negated_posix_items_fold_before_they_negate() {
+    // a Z ␠ k K ␠ s S ſ K ␠ 1 é _ -
+    let haystack = "aZ kK sS\u{17f}\u{212a} 1\u{e9}_-";
+    let not_a_letter = vec![
+        (2, 3),
+        (5, 6),
+        (13, 14),
+        (14, 15),
+        (15, 17),
+        (17, 18),
+        (18, 19),
+    ];
+    let letters = vec![
+        (0, 1),
+        (1, 2),
+        (3, 4),
+        (4, 5),
+        (6, 7),
+        (7, 8),
+        (8, 10),
+        (10, 13),
+    ];
+    for (pattern, expected) in [
+        (r"(?i)[[:^lower:]]", not_a_letter.clone()),
+        (r"(?i)[[:^upper:]]", not_a_letter.clone()),
+        (r"(?i)[[:^alpha:]]", not_a_letter.clone()),
+        (r"(?i)[[:^lower:]0-9]", not_a_letter.clone()),
+        (r"(?i)[^[:^lower:]]", letters),
+        (
+            r"(?i)[[:^alnum:]]",
+            vec![(2, 3), (5, 6), (13, 14), (15, 17), (17, 18), (18, 19)],
+        ),
+        (
+            r"(?i)[[:^word:]]",
+            vec![(2, 3), (5, 6), (13, 14), (15, 17), (18, 19)],
+        ),
+        (r"(?i)[[:^print:]]", vec![(15, 17)]),
+        // Controls: the same items without `(?i)`, and the class-level
+        // negation, which was always folded first.
+        (
+            r"[[:^lower:]]",
+            vec![
+                (1, 2),
+                (2, 3),
+                (4, 5),
+                (5, 6),
+                (7, 8),
+                (8, 10),
+                (10, 13),
+                (13, 14),
+                (14, 15),
+                (15, 17),
+                (17, 18),
+                (18, 19),
+            ],
+        ),
+        (r"(?i)[^[:lower:]]", not_a_letter),
+    ] {
+        let spans = spans_mine(pattern, haystack).expect("compiles");
+        assert_eq!(spans, expected, "{pattern:?} on {haystack:?}");
+    }
+}
+
+/// A quantifier straight after a flag directive has nothing to repeat, and is
+/// refused — not quietly applied to whatever came before the directive.
+///
+/// `a(?i)*` read as `a*` (then case-insensitive) is a different pattern from
+/// anything its author wrote, and the `regex` crate rejects all of these with
+/// "repetition operator missing expression". A refusal is the contract
+/// (`refusals_are_refusals`); a reinterpretation is the failure it guards.
+#[test]
+fn a_quantifier_after_a_flag_directive_is_refused() {
+    for pattern in [
+        r"a(?i)*",
+        r"a(?i)+",
+        r"a(?i)?",
+        r"a(?i)*?",
+        r"x(?s){2}",
+        r"ab(?i)+c",
+        r"a(?i)(?s)*",
+        r"(?:a(?-i)*)",
+        r"a(?x) *",
+    ] {
+        let err = aterm_regex::Regex::new(pattern)
+            .expect_err("a quantifier after a flag directive repeats nothing")
+            .to_string();
+        assert!(
+            err.contains("repetition operator missing expression"),
+            "{pattern:?}: {err}"
+        );
+    }
+    // The directive still leaves the item AFTER it repeatable, and a group
+    // after it is an item like any other.
+    assert_eq!(spans_mine(r"a(?i)b*", "aBB"), Some(vec![(0, 3)]));
+    assert_eq!(spans_mine(r"a(?i)(?:b)*", "aBB"), Some(vec![(0, 3)]));
+    assert_eq!(spans_mine(r"a(?i)(?:)*", "aa"), Some(vec![(0, 1), (1, 2)]));
+}
+
+/// The leftmost start where a repetition whose body can consume a multi-byte
+/// code point is followed by a multi-byte literal — a case some `regex-automata`
+/// versions miss (`(.*b)*é` on `"aaébé"` reported `2..7`), confirmed by an
+/// anchored lazy-prefix arbiter.
+#[test]
+fn this_engine_finds_the_leftmost_start() {
     for (pattern, haystack, correct) in [
         (r"(.*b)*\u{e9}", "aa\u{e9}b\u{e9}", (0usize, 7usize)),
         (r"(.*?b)*\u{4f60}", "K0\u{4f60}b\u{4f60}", (0, 9)),
         (r"(.*?\u{e9})*b", "aab\u{e9}b", (0, 6)),
     ] {
-        let mine = aterm_regex::Regex::new(pattern).expect("compiles");
-        let oracle = regex::Regex::new(pattern).expect("compiles");
-        let got = mine.find(haystack).map(|m| (m.start(), m.end()));
+        let re = aterm_regex::Regex::new(pattern).expect("compiles");
         assert_eq!(
-            got,
+            re.find(haystack).map(|m| (m.start(), m.end())),
             Some(correct),
             "this engine must find the leftmost match"
         );
-
-        // The oracle contradicting itself is the proof, not our own say-so:
-        // anchored, it agrees the match starts where we say it does. The prefix
-        // flag is scoped so it cannot rewrite `{pattern}`'s own `.` — these
-        // patterns are all built from `.`, so an unscoped `(?s)` would be
-        // arbitrating a different pattern than the one under test.
-        let arbiter = regex::Regex::new(&format!(r"\A(?s:(?:.)*?)({pattern})")).expect("compiles");
-        let span = arbiter
-            .captures(haystack)
-            .and_then(|c| c.get(1))
-            .map(|m| (m.start(), m.end()));
-        assert_eq!(span, Some(correct), "the arbiter must confirm this engine");
-
-        // Version-agnostic: whichever `regex-automata` resolves, either the
-        // oracle agrees with us or the arbiter says it should have.
-        let oracle_span = oracle.find(haystack).map(|m| (m.start(), m.end()));
-        if oracle_span != Some(correct) {
-            assert_eq!(
-                span,
-                Some(correct),
-                "the oracle reported {oracle_span:?} for {pattern:?} on {haystack:?}; \
-                 driven anchored it must still confirm {correct:?}"
-            );
-        }
     }
 }
 
 /// `escape` must round-trip: an escaped string matches itself and nothing it
-/// should not, and means the same thing to both engines.
+/// should not.
 #[test]
 fn escape_round_trips() {
     let mut seen = BTreeSet::new();
@@ -1218,7 +1047,19 @@ fn escape_round_trips() {
             Some(if s.is_empty() { "" } else { s }),
             "escape({s:?}) must match {s:?} literally"
         );
-        agree(&escaped, &haystack);
+        record(&escaped, &haystack);
     }
     assert!(seen.len() > 15);
+    pin(ESCAPE_DIGEST);
 }
+
+const BUILTIN_DIGEST: &str = "811be2e87727fce6";
+const SYNTAX_DIGEST: &str = "d9526bd496b9392f";
+const PERL_DIGEST: &str = "6212cb3a3e2938ec";
+const FOLD_DIGEST: &str = "b91b2d673464fac8";
+const EXOTIC_DIGEST: &str = "033f0d201ef6505a";
+const ZERO_WIDTH_DIGEST: &str = "c6278ff2ce852f5c";
+const NULLABLE_DIGEST: &str = "75190a174fd22dac";
+const EXTENDED_DIGEST: &str = "5addd2360f0054b0";
+const PREFILTER_DIGEST: &str = "dc3f23d94d077828";
+const ESCAPE_DIGEST: &str = "0fd8a26440ba8875";

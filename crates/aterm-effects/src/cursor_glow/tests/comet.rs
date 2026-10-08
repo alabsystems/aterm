@@ -5,20 +5,6 @@
 
 use super::*;
 
-// `the_supernova_rolls_only_for_a_real_leap` STOOD HERE. It pinned the
-// three properties that made a random escalation safe: never below the
-// distance floor, never under reduced motion, and an observed rate that
-// tracked the declared 1-in-6 chance. Its subject is deleted (step 5) and
-// the properties are now unrepresentable rather than checked — there is
-// no roll, so there is no floor to fall through and no rate to honour.
-
-// `a_supernova_landing_throws_a_rainbow_glitter_shell` STOOD HERE, pinning
-// that a nova landing threw all 28 grains, that they left in every
-// direction, and that an ordinary landing grew none. The shell is deleted
-// with the tier that owned it (step 5). What the landing must still do —
-// mark the arrival with one expanding spectral stroke — is pinned by
-// `every_landing_rings_a_rainbow_past_its_own_debris` below.
-
 /// `comet` and `beam` each graduated to their own variant; `lumen` stays
 /// the plain Lumen tracer (raw-string routing in the GUI resolver untouched).
 #[test]
@@ -69,9 +55,9 @@ fn comet_tail_freezes_white_toward_the_head() {
     assert!(bright(head) < 3 * 255, "head stays below pure white");
 }
 
-/// A comet move sheds debris grains; the plain Lumen tracer sheds none.
-/// Grains HANG (near-zero gravity) and drift BEHIND the motion — on a
-/// rightward jump every grain's x-velocity points back along the tail.
+/// A comet move sheds debris grains; the plain Lumen tracer sheds none. Grains
+/// hang (near-zero gravity) and drift behind the motion: on a rightward jump
+/// every grain's x-velocity points back along the tail.
 #[test]
 fn comet_sheds_hanging_debris_behind_the_motion() {
     let g = geom();
@@ -130,12 +116,9 @@ fn chrome_geom() -> Geom {
     }
 }
 
-/// The live-cursor bridge vertex is WINDOW-ABSOLUTE like every other
-/// comet sample (the `center` closure): with real chrome the bridge must
-/// attach at `origin_x + (col + head_dx)·cw`. The audited regression
-/// rebuilt the bridge x grid-relative, which at this origin fails the
-/// ±1.5-cell adjacency gate outright — the beam silently detaches from
-/// the cursor for every beam style in every real window.
+/// The live-cursor bridge vertex is window-absolute like every other comet
+/// sample: with real chrome it attaches at `origin_x + (col + head_dx)·cw`. A
+/// grid-relative x fails the ±1.5-cell adjacency gate and detaches the beam.
 #[test]
 fn comet_bridge_attaches_window_absolute() {
     let g = chrome_geom();
@@ -160,10 +143,9 @@ fn comet_bridge_attaches_window_absolute() {
         .map(|q| i32::from(q.x) + i32::from(q.w))
         .max()
         .unwrap();
-    // Window-absolute attach: 56 + (14 + 0.9)·8 = 175.2 px. The head
-    // SAMPLE (cell 13's centre) reaches only 56 + 13.5·8 = 164, so a
-    // reach ≥ 172 proves the bridge segment exists AND lands at head_dx;
-    // the grid-relative x (119.2) sat 44.8 px off and emitted nothing.
+    // Window-absolute attach: 56 + (14 + 0.9)·8 = 175.2 px. The head sample
+    // (cell 13's centre) reaches only 56 + 13.5·8 = 164, so a reach ≥ 172
+    // proves the bridge segment exists and lands at head_dx.
     assert!(
         reach >= 172,
         "bridge reaches the window-absolute head_dx attach point: {reach}"
@@ -174,17 +156,14 @@ fn comet_bridge_attaches_window_absolute() {
     );
 }
 
-/// Comet debris is born WINDOW-ABSOLUTE: jump grains sit ON the true leap
-/// vector — never on a phantom vector starting `origin` px up-left — and
-/// typing debris drifts BEHIND the one-cell motion with jitter-only vy.
-/// The audited grid-relative fx/fy skewed the drift by (origin_x,
-/// origin_y) on every spawn, so in a real window the shed dust always
-/// streamed toward the window's top-left instead of trailing the motion.
+/// Comet debris is born window-absolute: jump grains sit on the true leap
+/// vector, and typing debris drifts behind the one-cell motion with
+/// jitter-only vy (not toward the window's top-left).
 #[test]
 fn comet_debris_born_window_absolute_with_chrome_origin() {
     let g = chrome_geom();
     let c = cfg(GlowStyle::Comet, true);
-    // A leap: grains strewn along the WINDOW-ABSOLUTE vector.
+    // A leap: grains strewn along the window-absolute vector.
     let mut glow = CursorGlow::default();
     let t = Instant::now();
     let mut out = Vec::new();
@@ -209,10 +188,8 @@ fn comet_debris_born_window_absolute_with_chrome_origin() {
             p.y0
         );
     }
-    // Typing: the drift vector is the true one-cell motion — leftward
-    // along the row, vy pure dispersion jitter (±0.175·cell). The origin
-    // skew instead pointed it up-left and made the stationary ml≈0
-    // dispersion branch unreachable.
+    // Typing: the drift vector is the true one-cell motion, leftward along
+    // the row, vy pure dispersion jitter (±0.175·cell).
     let mut glow = CursorGlow::default();
     let mut t = Instant::now();
     glow.tick(Some((2, 10)), t, &c, g, &mut out);
@@ -233,10 +210,8 @@ fn comet_debris_born_window_absolute_with_chrome_origin() {
     }
 }
 
-/// Beam stardust jump births are WINDOW-ABSOLUTE: every mote lies inside
-/// the ±0.4-cell sleeve of the true leap vector. The grid-relative
-/// departure point put early motes above/left of the effects box (silently
-/// clipped by push_rect) and the rest on cells the rod never crossed.
+/// Beam stardust jump births are window-absolute: every mote lies inside the
+/// ±0.4-cell sleeve of the true leap vector.
 #[test]
 fn beam_stardust_strewn_along_window_absolute_leap() {
     let g = chrome_geom();
@@ -278,17 +253,6 @@ fn beam_stardust_strewn_along_window_absolute_leap() {
         );
     }
 }
-
-// `the_glide_shooting_star_head_is_dealt_like_the_rest` STOOD HERE and is
-// deleted (step 13). It governed the POPULATION SHAPE of the fast-glide
-// star's white twinkle HEAD — one plus or one mote per star, dealt against
-// the family's star kit so a fast sweep could not lay a row of full-size
-// crosses. That head belonged to a mark that no longer exists: a glide
-// draws the ZOOM streak now, whose leading light is the meteor NUCLEUS
-// (`RAINBOW_METEOR_NUCLEUS_*`), a different mark with its own pins. Deleting
-// a proof about a deleted subject is not the same as dropping a claim — the
-// claim it made about the star kit's deal is still held, for the marks that
-// still deal, by `stardust_is_the_body_the_plus_is_the_accent`.
 
 /// The comet's emitted light (beam + coma crown + twinkling glitter) honours
 /// the shared quad invariants and decays to exactly empty.

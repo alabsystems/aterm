@@ -4,9 +4,7 @@
 //! WHO MAKES aterm — the origin every user-facing surface prints under its title
 //! (`aterm --help`, `aterm --version`, the manual's front page and agent brief,
 //! `atpkg help`, Settings ▸ About), so a person who meets the program cold knows
-//! where it comes from. Owner's ruling, 2026-09-14: "I want alab.systems printed
-//! somewhere in the about string and help text so that people know where this
-//! comes from — and by Andrew Yates." ONE definition, so no surface can drift.
+//! where it comes from. ONE definition, so no surface can drift.
 
 /// The author.
 pub const AUTHOR: &str = "Andrew Yates";

@@ -8,8 +8,8 @@
 //! substrate" thesis applied to a terminal: **the screen is a pure function of
 //! the ordered output-byte log.** A session is recorded as an ordered list of
 //! output records (the bytes a PTY emitted — exactly the `BYTES` frames an
-//! aterm `subscribe` stream carries). We feed that log into the SHIPPING engine
-//! via the injected-clock seam ([`Terminal::process_at`] + a FIXED
+//! aterm `subscribe` stream carries). We feed that log into the shipping engine
+//! via the injected-clock seam ([`Terminal::process_at`] + a fixed
 //! [`ClockReading`]) so the result cannot depend on real wall-clock pacing.
 //!
 //! Two things are proven, both bit-exact:
@@ -21,14 +21,14 @@
 //!    records[0..N] alone — nothing else leaks in. This is also the correctness
 //!    of a *lashed* viewer: a viewer engine fed the host's output log mirrors it.
 //!
-//! 2. **Coalescing-independence.** The same bytes split at ANY boundaries —
+//! 2. **Coalescing-independence.** The same bytes split at any boundaries —
 //!    one shot, per original record, per single byte, or mid-escape-sequence —
 //!    fold to the identical final state. A lash relay may re-chunk the host's
 //!    output (coalesce or fragment `BYTES` frames) and the mirror is unchanged.
 //!
 //! A pinned FNV-1a hash of the final rendered text demonstrates drift detection
 //! (machine-independent: text only), and a negative control (drop one record)
-//! MUST diverge, so the determinism assertions are non-vacuous.
+//! must diverge, so the determinism assertions are non-vacuous.
 
 use aterm_core::terminal::{ClockReading, Terminal};
 
@@ -101,7 +101,7 @@ fn replay_from_zero_mirrors_live_at_every_offset() {
         live_states.push(live.checkpoint());
     }
 
-    // For every offset N, a FRESH replay engine fed records[0..N] must reproduce
+    // For every offset N, a fresh replay engine fed records[0..N] must reproduce
     // the live host's state at N — exactly. The state at N is a pure function of
     // the first N records and nothing else.
     for n in 1..=SESSION.len() {

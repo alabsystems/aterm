@@ -38,9 +38,7 @@ use aterm_spec::derive::{Expr, Model, trail_audio_reopen_ladder_model, trail_sou
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify;
 
-#[path = "common/conjunct_audit.rs"]
-mod conjunct_audit;
-use conjunct_audit::audit_guard_conjuncts;
+use crate::conjunct_audit::audit_guard_conjuncts;
 
 fn fire(m: &Model, action: &str, s: &State) -> State {
     let next = m.successors(action, s);

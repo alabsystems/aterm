@@ -5,10 +5,9 @@
 
 use super::*;
 
-/// PHASER: the band spans the last THREE letters as one continuous bar at
-/// a typing rhythm, and NEVER parks — a key typed after a thinking pause
-/// is a new burst with a short base life, not a multi-second chained one
-/// (live review: "it stays back at the last time I typed").
+/// Phaser: the band spans the last three letters as one continuous bar at a
+/// typing rhythm and never parks: a key typed after a thinking pause is a new
+/// burst with a short base life.
 #[test]
 fn phaser_band_spans_three_letters_and_never_parks() {
     let g = geom();
@@ -54,11 +53,10 @@ fn phaser_band_spans_three_letters_and_never_parks() {
     );
 }
 
-/// ECHO-RUN LAW: a coalesced typing echo (2-3 cells forward on one row,
-/// backed by an admitted typed candidate mid-rhythm) is CONTINUED TYPING — every
-/// swept cell gets its own typing spark in its own successive laid hue, no
-/// flare slams, no landing ring. (Classified as a jump, it laid long-lived
-/// jump sparks between short typing sparks — the audited picket-fence burst.)
+/// Echo-run law: a coalesced typing echo (2-3 cells forward on one row, backed
+/// by an admitted typed candidate mid-rhythm) is continued typing: every swept
+/// cell gets its own typing spark in successive hues, with no flare slam or
+/// landing ring.
 #[test]
 fn coalesced_echo_advance_is_typing_and_lays_every_cell() {
     let g = geom();
@@ -107,11 +105,10 @@ fn coalesced_echo_advance_is_typing_and_lays_every_cell() {
     assert!(glow.ring.is_none(), "no landing ring on a coalesced echo");
 }
 
-/// ECHO-RUN REACH: the coalesced-echo law extends to the SHARED typed-bridge
-/// reach (8 cells, `HIDE_BRIDGE_TYPED_MAX_DIST`), not a private cap of 3. A
-/// 4-8 cell typed advance in one observed frame (key-repeat across a frame
-/// slip, SSH echo batching) must not fall through to `re_anchor`, which lays
-/// ONLY the landing cell — a multi-cell dark notch splitting the band.
+/// Echo-run reach: the coalesced-echo law extends to the shared typed-bridge
+/// reach (8 cells, `HIDE_BRIDGE_TYPED_MAX_DIST`). A 4-8 cell typed advance in
+/// one frame (key-repeat across a frame slip, SSH echo batching) must not fall
+/// to `re_anchor`, which lays only the landing cell.
 #[test]
 fn wide_coalesced_echo_still_sweeps_every_cell() {
     let g = geom();
@@ -146,12 +143,9 @@ fn wide_coalesced_echo_still_sweeps_every_cell() {
     );
 }
 
-/// WRAP-RUN LAW: a coalesced wrap echo mid-burst (last columns → the next
-/// row's first columns) lays typing sparks on the pre-wrap tail AND the
-/// landed post-wrap glyph cells — the band follows the typing through the
-/// fold instead of stranding the old row lit and the fresh glyphs bare —
-/// and fires no landing ring (the audited hollow-rectangle glitch at the
-/// break).
+/// Wrap-run law: a coalesced wrap echo mid-burst (last columns → the next
+/// row's first columns) lays typing sparks on the pre-wrap tail and the landed
+/// post-wrap cells, and fires no landing ring.
 #[test]
 fn wrap_echo_continues_the_band_across_the_fold() {
     let g = geom(); // cols: 40
@@ -206,9 +200,9 @@ fn wrap_echo_continues_the_band_across_the_fold() {
     );
 }
 
-/// VERTICAL-NAV LAW: Up/Down timestamps are classifier signals, not causal
-/// evidence. Repeated one-row child relocations therefore stay dark in every
-/// direction and cannot build heat or a wake.
+/// Vertical-nav law: Up/Down timestamps are classifier signals, not causal
+/// evidence, so repeated one-row child relocations stay dark in every
+/// direction and build no heat or wake.
 #[test]
 fn vertical_navigation_timestamps_stay_dark() {
     let g = geom();
@@ -235,10 +229,9 @@ fn vertical_navigation_timestamps_stay_dark() {
     assert!(glow.flare < 0.05, "nav scrubbing never slams the flare");
 }
 
-/// FADE-AS-ONE, phaser edition: the first key of a burst takes the long
-/// lone-key base life, but once the burst follows, the origin cell is
-/// retro-clamped to the chained cadence — it can no longer outlive the
-/// whole band as a parked opaque box (the audited stuck origin quad).
+/// Fade as one: the first key of a burst takes the long lone-key base life,
+/// but once the burst follows, the origin cell is retro-clamped to the chained
+/// cadence and cannot outlive the band.
 #[test]
 fn phaser_burst_origin_cannot_outlive_the_band() {
     let g = geom();
@@ -273,10 +266,9 @@ fn phaser_burst_origin_cannot_outlive_the_band() {
     );
 }
 
-/// LIGHT-THEME LAW (beam family): additive light cannot brighten a white
-/// ground and over fresh glyphs it lifts their ink toward the background —
-/// so on `dark_theme: false` the comet/band renders as source-over VEIL
-/// halos and emits NO additive beam quads; dark themes are untouched.
+/// Light-theme law (beam family): additive light cannot brighten a white
+/// ground, so on `dark_theme: false` the comet/band renders as source-over
+/// veil halos with no additive beam quads; dark themes are untouched.
 #[test]
 fn light_theme_band_is_veils_not_additive() {
     let g = geom();

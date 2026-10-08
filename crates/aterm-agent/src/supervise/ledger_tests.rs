@@ -68,17 +68,6 @@ const MANAGER: &str = "s-mgr";
 
 /// The three turns the manager typed, as `history` prints them.
 fn history() -> CtlReply {
-    let pct = |s: &str| -> String {
-        s.bytes()
-            .map(|b| {
-                if b.is_ascii_graphic() && b != b'%' {
-                    char::from(b).to_string()
-                } else {
-                    format!("%{b:02X}")
-                }
-            })
-            .collect()
-    };
     let mut out = String::new();
     for (id, started, dur, status, text) in [
         (
@@ -95,7 +84,7 @@ fn history() -> CtlReply {
             "turn {id} submitted=1 status={status} started_ms={started} dur_ms={dur} seq=9 \
              hash=0000000000000000 arch=7730:{} text={}\n",
             100 + id,
-            pct(text)
+            aterm_codec::pct::encode(text)
         ));
     }
     ok(&out)
@@ -466,10 +455,10 @@ fn the_md_form_is_tables() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// The HTML form is ONE file: no URL it would fetch, a policy that forbids
-/// one, every tag closed, and everything a worker said escaped — into the
-/// page as text and into the embedded data as `\u` escapes, so neither a
-/// `</script>` in a transcript nor a tag in a command can close one.
+/// The HTML form is one file: no URL it would fetch, a policy that forbids
+/// one, every tag closed, and everything a worker said escaped (as text in the
+/// page and as `\u` escapes in the embedded data), so neither a `</script>`
+/// in a transcript nor a tag in a command can close one.
 #[test]
 fn the_html_form_is_one_self_contained_page() {
     let (dir, path) = journal_file("html", &journal_lines());
@@ -635,22 +624,10 @@ fn without_a_clock_the_times_are_marked_and_no_latency_is_claimed() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// **WITHOUT A CLOCK, NO WORKING TIME IS CLAIMED.**
-///
-/// `turn.t` is a PROCESS-clock stamp placed on an epoch; unanchored that epoch
-/// is the fallback (the newest turn read taken as now) while a journal
-/// record's `t` is the wall clock the watcher wrote. Before the fix
-/// `turn.stopped` was set from the journal unconditionally and `working_ms +=
-/// stopped - t` subtracted the two, so ONE render said both:
-///
-/// ```text
-///   worker busy       9.5s in the turn verbs (sum of dur_ms) · 50s working over 2 turn(s) …
-///   manager latency   - (the clock could not be placed)
-///  ~00:28:30   worker   turn 1 reply: 3 rows        working 40s
-/// ```
-///
-/// while the help, the CHANGELOG and the skill all say what cannot be placed
-/// is marked `~` and claims no latency.
+/// Without a clock, no working time is claimed: an unanchored `turn.t` is a
+/// process-clock stamp on a fallback epoch, while a journal record's `t` is
+/// wall-clock time, so their difference is not a duration. What cannot be
+/// placed is marked `~` and claims no latency or working span.
 #[test]
 fn without_a_clock_no_working_time_is_claimed() {
     let (dir, path) = journal_file("clockless-spans", &journal_lines());
@@ -682,17 +659,9 @@ fn without_a_clock_no_working_time_is_claimed() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// **A `--journal` THAT COULD NOT BE READ IS NOT A JOURNAL OF ZERO EVENTS.**
-///
-/// `journaled` was `opts.journal.is_some()` — the file was GIVEN, not read —
-/// so an unreadable path printed the watcher's whole lane as measured zeroes
-/// two lines under the `✗ journal` that said it could not be opened:
-///
-/// ```text
-///   ✗ journal    unreadable: /nonexistent-dir/journal.jsonl: No such file or directory (os error 2)
-///   manager latency   - (no EVENT idle/question in the journal)
-///   approvals         0 / dismissals 0 / reconnects 0 / reports 0 complete · 0 incomplete
-/// ```
+/// A `--journal` that could not be read is not a journal of zero events: the
+/// watcher's lane is not printed as measured zeroes under the `✗ journal`
+/// line that says it could not be opened.
 #[test]
 fn an_unreadable_journal_is_not_counted_as_zero() {
     let mut host = whole_host();
@@ -723,7 +692,7 @@ fn an_unreadable_journal_is_not_counted_as_zero() {
         "{text}"
     );
 
-    // With NO journal asked for, the older wording still stands.
+    // With no journal asked for, the plain wording stands.
     let mut host = whole_host();
     let l = read(&mut host, &opts(None), &mut anchors);
     assert!(!l.journaled && !l.journal_unreadable);
@@ -1041,7 +1010,7 @@ fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
         text.contains("turn 1 reply: 4 rows (turn 2's too: its ❯ row was not found)"),
         "{text}"
     );
-    // And when NO later turn's row is found, every one after it is named.
+    // And when no later turn's row is found, every one after it is named.
     let mut host = whole_host();
     let archived = rows(&[
         "⏺ Older words.",

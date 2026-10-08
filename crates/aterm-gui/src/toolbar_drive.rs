@@ -1,65 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TOOLBAR DRIVER: `toolbar.rs`'s four declared classes and 268 ported
-//! binding sites, entered through AppKit's own dispatch on a real `NSWindow`,
+//! The toolbar driver: `toolbar.rs`'s four declared classes and its AppKit
+//! binding sites, entered through AppKit's own dispatch on a real `NSWindow`
 //! and read back as pixels, wakes and registered encodings.
 //!
-//! # The defect this exists to close
-//!
-//! `examples/objc_live_class_audit.rs` drives FIVE targets, all of them
-//! `vendor/winit`'s. `toolbar.rs` is the largest ported file in the tree —
-//! 4,800 lines, four declared classes, and after W7 every AppKit binding call
-//! in it — and NOTHING IN THE TREE DROVE IT. Its classes were checked by
-//! `#[cfg(test)] mod objc_tests`, whose central case is thirty-two rows of
-//! registered encoding against a LITERAL WRITTEN IN THE SAME FILE. That is the
-//! circularity D1 named, and W7's own control proved it is not theoretical: a
-//! plant that registered `controlTextDidChange:` as `v@:B` **and edited the
-//! table to agree** left `the_runtime_reports_every_encoding_the_table_says`
-//! GREEN.
-//!
-//! It is also the exact shape D1 was raised for one file over. W3 ported
-//! `window_delegate.rs` and CI read nothing; the answer was a driver. W7 ported
-//! `toolbar.rs`'s bindings and CI still read nothing about the strip AppKit is
-//! actually holding; this is that driver.
+//! `toolbar.rs`'s `objc_tests` check registered encodings against a table in
+//! the same file, so a wrong encoding with a matching table edit passes there.
+//! This driver reads the classes off the live objects AppKit holds instead.
 //!
 //! # What it refuses to do
 //!
 //! * It never calls `toolbar::native_strip_container`. It finds the strip the
-//!   way AppKit finds it — `-[NSWindow toolbar]` -> `-items` -> item 0 ->
-//!   `-view` — so the thing under test is what the toolbar delegate actually
-//!   handed AppKit, not what this crate believes it handed over.
-//! * It never sends through `crate::appkit`. Every message below goes through
-//!   this module's OWN typed casts ([`macos`]'s `s_*` family), so a wrong
-//!   prototype in the helper layer cannot agree with itself. The port and its
-//!   instrument disagree independently or not at all.
-//! * It never asserts a pixel hash against a stored golden. Hashes are
-//!   MACHINE-SPECIFIC (backing scale, system font, accent tint), so a stored
-//!   one would be a flake generator. What it asserts is RELATIONAL — every
-//!   state draws, and states that must differ do differ — and what it PRINTS is
-//!   the whole 26-row matrix, which is the A/B oracle: run this binary at two
-//!   commits on one machine and diff the transcripts.
+//!   way AppKit does (`-[NSWindow toolbar]` -> `-items` -> item 0 -> `-view`),
+//!   so the thing under test is what the toolbar delegate handed AppKit.
+//! * It never sends through `crate::appkit`. Every message goes through this
+//!   module's own typed casts ([`macos`]'s `s_*` family), so a wrong prototype
+//!   in the helper layer cannot agree with itself.
+//! * It never asserts a pixel hash against a stored golden: hashes depend on
+//!   backing scale, system font and accent tint. It asserts relations (every
+//!   state draws; states that must differ do) and prints the whole state
+//!   matrix, so running it at two commits on one machine and diffing the
+//!   transcripts is the A/B oracle. The strip's ink columns catch layout
+//!   defects no encoding check sees (e.g. `NSTextAlignmentCenter` is 1 on
+//!   arm64, not 2).
 //!
-//! That last point is how W7 shipped: 26 states, four runs per arm, every hash
-//! equal between the branch and `origin/main`. It is also how W7 found the one
-//! defect its 4,344 passing tests could not — `NSTextAlignmentCenter` is 1 on
-//! arm64, not 2, and the only instrument that could see it was the strip's own
-//! ink columns.
-//!
-//! # The exit contract, which `aterm_verify::stages::OBJC_DRIVES` reads
+//! # Exit contract (read by `aterm_verify::stages::OBJC_DRIVES`)
 //!
 //! | code | meaning |
 //! |---|---|
 //! | 0 | every check passed |
 //! | 1 | at least one finding; the transcript names each |
-//! | 2 | NOT RUN — no event loop, no window, or no toolbar was installed. NEVER a pass. |
-//! | 3 | the drive HUNG (a modal tracking loop never returned) and the watchdog killed it |
+//! | 2 | not run: no event loop, no window, or no toolbar was installed. Never a pass. |
+//! | 3 | the drive hung (a modal tracking loop never returned) and the watchdog killed it |
 //!
-//! `3` is its own code and not a panic because the failure it names is
-//! specific: this driver enters `-mouseDown:` IMPs directly, and a context menu
-//! that actually popped would run `-[NSMenu popUpContextMenu:…]`'s modal
-//! tracking loop and never come back. A hang read as a timeout somewhere up the
-//! ladder is a stage that decided nothing while looking busy.
+//! `3` has its own code because this driver enters `-mouseDown:` IMPs directly,
+//! and a context menu that really popped would run
+//! `-[NSMenu popUpContextMenu:…]`'s modal tracking loop and never return.
 
 /// Every check passed.
 #[cfg(target_os = "macos")]
@@ -74,12 +51,11 @@ pub(crate) const NOT_RUN: i32 = 2;
 #[cfg(target_os = "macos")]
 pub(crate) const HUNG: i32 = 3;
 
-/// Drive the real tab strip and answer the exit code above.
+/// Drive the real tab strip and return the exit code above.
 ///
-/// Called from `examples/objc_toolbar_drive.rs`, which owns `fn main` — the
-/// body lives here because `mod toolbar`, `Wake` and `WindowId` are all
-/// library-private, exactly as `run_redraw_conformance` lives here for the
-/// same reason.
+/// Called from `examples/objc_toolbar_drive.rs`, which owns `fn main`; the body
+/// lives here because `mod toolbar`, `Wake` and `WindowId` are library-private
+/// (as with `run_redraw_conformance`).
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn run_toolbar_drive() -> i32 {
@@ -110,41 +86,32 @@ mod macos {
 
     // ---------------------------------------------------------------- sends
     //
-    // DELIBERATELY NOT `crate::appkit`. That module is the helper layer W7
-    // routed all 268 sites through; an instrument that used it would be
-    // evidence about the layer agreeing with itself. Every prototype below is
-    // written out here, and each was checked against clang's own
-    // `@encode`-derived signature for its selector.
+    // Not `crate::appkit`: an instrument using the helper layer would only show
+    // that layer agreeing with itself. Every prototype below is written out
+    // here and checked against clang's `@encode`-derived signature.
 
-    /// `+[NSMenu popUpContextMenu:withEvent:forView:]` — the strip's ONE pop
-    /// site (toolbar.rs), as the class method it is: `(cls, _cmd, menu, event,
+    /// `+[NSMenu popUpContextMenu:withEvent:forView:]`, the strip's one pop site
+    /// (toolbar.rs), as the class method it is: `(cls, _cmd, menu, event,
     /// view)`, void.
     type PopUpContextMenu = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id);
 
     /// The site that replaces it for the life of the drive process.
     ///
-    /// NO MENU EVER TRACKS IN THIS PROCESS. The module header promised that
-    /// by entering the strip's IMPs directly, on the premise that
-    /// A synthesized ctrl-left or right mouse may route into the titlebar's
-    /// view tree. The old premise that it did not was recorded as
-    /// measured, with no macOS version. On one x86_64 Mac running macOS 13.7.8
-    /// (measured 2026-09-08; OS version and arch were not separated) it routes
-    /// both: the real `rightMouseDown:` ran, `popUpContextMenu:` opened a real
-    /// menu, its synchronous tracking loop did not return, and the watchdog
-    /// fired — exit 3, at the same line, every run. The pop site is therefore
-    /// replaced before stage 5 with a stub that RECORDS the pop (count and
-    /// item count) and returns; the stage's checks read the strip's own
-    /// `TabContextMenuOpening` wake and this record, and the tracking loop
-    /// that no drive can survive is never entered, on any macOS.
+    /// No menu ever tracks in this process. A synthesized ctrl-left or right
+    /// mouse may route into the titlebar's view tree on some macOS versions,
+    /// where `popUpContextMenu:` opens a real menu whose synchronous tracking
+    /// loop never returns. So the pop site is replaced before stage 5 with a
+    /// stub that records the pop (count and item count) and returns; the stage
+    /// reads the strip's `TabContextMenuOpening` wake and this record.
     static POP_UP_CONTEXT_MENU: aterm_objc::swizzle::SwizzleSite<PopUpContextMenu> =
         aterm_objc::swizzle::SwizzleSite::new();
     /// Pops the stub swallowed, and the item count of the last one.
     static MENUS_SWALLOWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static LAST_MENU_ITEMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// The stub. Entered by the runtime exactly as the class method it
-    /// replaces; nothing here can unwind (two atomic stores and one
-    /// `-numberOfItems` send on a live menu).
+    /// The stub, entered by the runtime as the class method it replaces.
+    /// Nothing here can unwind (two atomic stores and one `-numberOfItems` send
+    /// on a live menu).
     unsafe extern "C-unwind" fn swallow_pop_up(
         _cls: Id,
         _cmd: Sel,
@@ -153,10 +120,9 @@ mod macos {
         _view: Id,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for the
-        // duration of this call); `-numberOfItems` is `-(NSInteger)` on it,
-        // sent as exactly that. A nil menu (and a negative answer, which no
-        // menu gives) is recorded as zero items.
+        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for this
+        // call); `-numberOfItems` is `-(NSInteger)`, sent as that. A nil menu
+        // (or a negative answer) is recorded as zero items.
         let items = if menu.is_null() {
             0
         } else {
@@ -287,9 +253,9 @@ mod macos {
         }
     }
 
-    /// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:]`
-    /// — measured `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88`, which is why
-    /// `pressure` is `f32` and the two counters are `NSInteger`.
+    /// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:]`,
+    /// encoded `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88`: `pressure` is
+    /// `f32` and the two counters are `NSInteger`.
     unsafe fn mouse_event(
         kind: usize,
         loc: CGPoint,
@@ -329,10 +295,10 @@ mod macos {
         }
     }
 
-    /// `+[NSEvent keyEventWithType:…]` — measured
+    /// `+[NSEvent keyEventWithType:…]`, encoded
     /// `@96@0:8Q16{CGPoint=dd}24Q40d48q56@64@72@80B88S92`.
     unsafe fn key_event(kind: usize, win: isize, chars: Id, code: u16) -> Id {
-        // SAFETY: as [`mouse_event`], against the measured signature above.
+        // SAFETY: as [`mouse_event`], against the signature above.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -392,32 +358,18 @@ mod macos {
             .into_owned()
     }
 
-    /// Intern a class or protocol name that is only known as a `&str`.
+    /// Intern a class or protocol name known only as a `&str`.
     ///
-    /// [`aterm_objc::protocol`] takes `&'static CStr` because every ordinary
-    /// call site writes a `c"…"` literal; the names in stage 10 come out of
-    /// `class_protocols`, which is the case that is not ordinary. One small
-    /// leak per name, bounded by four superclass chains in a process that
-    /// drives one window and exits — the same bridge
-    /// `objc_live_class_audit.rs` uses, for the same reason.
+    /// [`aterm_objc::protocol`] takes `&'static CStr`; the names in stage 10
+    /// come from `class_protocols`. One small leak per name, bounded by four
+    /// superclass chains in a process that drives one window and exits (as
+    /// `objc_live_class_audit.rs` does).
     fn cstr_named(name: &str) -> &'static CStr {
         Box::leak(
             std::ffi::CString::new(name)
                 .expect("a runtime-supplied name has no interior NUL")
                 .into_boxed_c_str(),
         )
-    }
-
-    /// FNV-1a over the captured bitmap. Not cryptographic and not meant to be:
-    /// what it has to do is change when any pixel changes and be stable across
-    /// runs of the same build on the same machine.
-    fn fnv(bytes: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in bytes {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h
     }
 
     /// Round to a sixteenth of a point, so a layout figure is printable without
@@ -582,8 +534,7 @@ mod macos {
     }
 
     /// The findings ledger. `check` prints every question it asked, passing or
-    /// failing, because the transcript is half the deliverable: the A/B between
-    /// two commits is a diff of it.
+    /// failing: the transcript is what an A/B between two commits diffs.
     struct Ctx {
         findings: Vec<String>,
     }
@@ -601,12 +552,10 @@ mod macos {
     /// The strip container, reached the way AppKit reaches it: window ->
     /// toolbar -> items -> item 0 -> view.
     ///
-    /// NEVER `toolbar::native_strip_container`. Going through AppKit is what
-    /// makes this evidence about what the toolbar delegate HANDED OVER: if
+    /// Never `toolbar::native_strip_container`: if
     /// `toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:` were
     /// mis-registered, or the delegate stopped claiming `NSToolbarDelegate`,
-    /// this returns nil and every stage below it fails — which is precisely
-    /// what the accessor could not tell you.
+    /// this returns nil and every later stage fails.
     unsafe fn strip_of(ns_window: Id) -> Id {
         // SAFETY: `ns_window` is a live `NSWindow`; every send is a read-only
         // accessor at the prototype its helper declares.
@@ -659,13 +608,9 @@ mod macos {
             .find(|v| name_of(*v).contains("ChromeButton"))
     }
 
-    /// Capture `view` through AppKit's own `-cacheDisplayInRect:` pair and
-    /// return `(w, h, bytes)`.
-    ///
-    /// This is the instrument, and it is AppKit's: the bitmap holds what
-    /// `drawRect:` actually put down, so a port that registered every encoding
-    /// correctly and drew the wrong thing is still caught. It is what caught
-    /// `NSTextAlignmentCenter`.
+    /// Capture `view` through AppKit's `-cacheDisplayInRect:` pair and return
+    /// `(w, h, bytes)`: what `drawRect:` actually put down, so a port that
+    /// registered every encoding correctly and drew the wrong thing is caught.
     unsafe fn capture(view: Id) -> Option<(usize, usize, Vec<u8>)> {
         // SAFETY: `view` is a live `NSView` on the main thread; the two sends
         // are the documented caching pair and the rep's accessors are
@@ -699,9 +644,8 @@ mod macos {
     }
 
     /// Per-column ink profile: how many non-transparent samples each x column
-    /// holds. This LOCALISES a pixel difference to a column band, which is the
-    /// form in which the alignment defect was legible — a hash says "different",
-    /// a span list says "the label moved 60 points right".
+    /// holds. It localises a pixel difference to a column band (e.g. "the label
+    /// moved 60 points right").
     fn ink_columns(w: usize, h: usize, px: &[u8]) -> Vec<u32> {
         let spp = px.len().checked_div(w * h).unwrap_or(4).max(1);
         let mut cols = vec![0u32; w];
@@ -749,12 +693,9 @@ mod macos {
 
     // --------------------------------------------------- the registered rows
 
-    /// Every protocol reachable from `seed`, following protocol INHERITANCE.
-    ///
-    /// A protocol list is a DAG: `NSTextFieldDelegate` inherits
-    /// `NSControlTextEditingDelegate`, which is where two of the three rename
-    /// rows are actually declared. Reading only the claimed names would miss
-    /// every declaration one level up.
+    /// Every protocol reachable from `seed`, following protocol inheritance
+    /// (`NSTextFieldDelegate` inherits `NSControlTextEditingDelegate`, where two
+    /// of the three rename rows are declared).
     fn expand_protocols(into: &mut Vec<String>, seed: impl IntoIterator<Item = String>) {
         for name in seed {
             let mut stack = vec![name];
@@ -768,11 +709,9 @@ mod macos {
         }
     }
 
-    /// The protocols a protocol itself inherits.
-    ///
-    /// `protocol_copyProtocolList` has no `aterm-objc` wrapper because no
-    /// SHIPPING call site needs one — the crate grows for the port, not for
-    /// the instrument — so the prototype is declared where it is read.
+    /// The protocols a protocol itself inherits. `protocol_copyProtocolList` has
+    /// no `aterm-objc` wrapper (no shipping call site needs one), so the
+    /// prototype is declared here.
     fn protocol_parents(proto: aterm_objc::ProtocolPtr) -> Vec<String> {
         unsafe extern "C" {
             fn protocol_copyProtocolList(
@@ -805,15 +744,13 @@ mod macos {
         names
     }
 
-    /// Where a row's SHAPE is written down by something other than this tree,
-    /// and what that authority says.
+    /// Where a row's shape is written down outside this tree, and what that
+    /// authority says.
     ///
-    /// Two sources, asked in order: every protocol the class claims (expanded
-    /// through inheritance), then the superclass chain, which is where an
-    /// OVERRIDE's original lives. `None` means nothing outside this tree
-    /// declares the selector — every such row is a first-party action
-    /// (`closeTab:`, `tabMenuAction:`) and is PRINTED rather than silently
-    /// dropped.
+    /// Asked in order: every protocol the class claims (expanded through
+    /// inheritance), then the superclass chain, where an override's original
+    /// lives. `None` means nothing outside this tree declares the selector (a
+    /// first-party action such as `closeTab:`); such rows are printed.
     unsafe fn authority_for(cls: ClassPtr, s: Sel) -> Option<(String, String)> {
         // SAFETY: `cls` is a live class object.
         let mut protos: Vec<String> = Vec::new();
@@ -844,14 +781,12 @@ mod macos {
     struct Declared {
         /// The instance this class was read from, and how it was found.
         found_by: &'static str,
-        /// The name `declare_class!` registered — the only thing written down,
-        /// and only so `objc_getClass` can be asked whether the live object's
-        /// class IS that class.
+        /// The name `declare_class!` registered, used only to ask
+        /// `objc_getClass` whether the live object's class is that class.
         name: &'static CStr,
         cls: ClassPtr,
-        /// A protocol the class must CONFORM to, if its rows come from one.
-        /// This is plant two's tooth: an encoding check cannot see a class that
-        /// silently stopped saying what it is.
+        /// A protocol the class must conform to, if its rows come from one; an
+        /// encoding check cannot see a class that stopped claiming it.
         conforms: Option<&'static CStr>,
     }
 
@@ -884,9 +819,8 @@ mod macos {
         println!("      superclass {}", sup.to_string_lossy());
         if let Some(p) = d.conforms {
             let proto = protocol(p);
-            // Registered by the HOST's AppKit, not supplied by aterm: a
-            // name-only stand-in would make the conformance below true of
-            // nothing AppKit knows.
+            // Registered by the host's AppKit, not supplied by aterm, so the
+            // conformance below is about something AppKit knows.
             let hosts =
                 !proto.is_null() && !aterm_objc::protocols_registered_by_aterm().contains(&p);
             cx.check(hosts, format!("{p:?} is registered by this host's AppKit"));
@@ -950,12 +884,9 @@ mod macos {
                   nothing"
     )]
     pub(crate) fn run() -> i32 {
-        // THE WATCHDOG, and it is not belt-and-braces. This driver enters
-        // `-mouseDown:`/`-rightMouseDown:` IMPs directly; a context menu that
-        // actually popped would run `-[NSMenu popUpContextMenu:…]`'s modal
-        // tracking loop and never return. A hang that reached the ladder as a
-        // generic timeout is a stage that decided nothing while looking busy,
-        // so it gets its own code.
+        // The watchdog: this driver enters `-mouseDown:`/`-rightMouseDown:`
+        // IMPs directly, and a context menu that popped would run a modal
+        // tracking loop that never returns. A hang gets its own exit code.
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(180));
             crate::logging::stderr_line!(
@@ -964,10 +895,10 @@ mod macos {
             std::process::exit(HUNG);
         });
 
-        // The quiet builder starts inactive. Stages 3 and 4 dispatch to the
-        // hit view/window without stealing a foreground app's focus. Stage 5
-        // activates for its AppKit-routing and later keyboard checks: on Darwin
-        // 27 an inactive app's NSApp click is consumed as an activation click.
+        // The quiet builder starts inactive. Stages 3 and 4 dispatch to the hit
+        // view/window without stealing focus. Stage 5 activates for its
+        // AppKit-routing and keyboard checks: an inactive app's NSApp click is
+        // consumed as an activation click.
         let mut el = match crate::quiet_driver_event_loop_builder::<Wake>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -1042,9 +973,9 @@ mod macos {
             format!("toolbar item 0 has a view: {}", name_of(strip)),
         );
         if strip.is_null() {
-            // Nothing below can mean anything, and an empty toolbar is exactly
-            // what a delegate that stopped claiming `NSToolbarDelegate` leaves
-            // behind — a FINDING, not a could-not-run.
+            // Nothing below means anything, and an empty toolbar is what a
+            // delegate that stopped claiming `NSToolbarDelegate` leaves: a
+            // finding, not a could-not-run.
             println!("objc-toolbar-drive: 1 FINDING(S)");
             return FINDING;
         }
@@ -1097,7 +1028,10 @@ mod macos {
         if let Some((w, h, px)) = unsafe { capture(strip) } {
             let cols = ink_columns(w, h, &px);
             let inked = cols.iter().filter(|c| **c > 0).count();
-            println!("  --  {w}x{h} hash={:016x} ink_cols={inked}", fnv(&px));
+            println!(
+                "  --  {w}x{h} hash={:016x} ink_cols={inked}",
+                aterm_hash::fnv1a_64(&px)
+            );
             println!("  --  ink spans: {}", show_spans(&cols));
             cx.check(inked > 40, format!("the strip drew ink in {inked} columns"));
         } else {
@@ -1109,13 +1043,11 @@ mod macos {
         // SAFETY: `+sharedApplication` on a linked class; later keyboard
         // events still enter through NSApp's event dispatch.
         let app = unsafe { s_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
-        // ACTIVE AND KEY FIRST, as stage 5 does for its own probe. The drive launches
-        // under the quiet posture (Accessory, no activation) so a gate run never takes
-        // the front; this stage audits tab selection BY CLICK, which needs the key
-        // window. MEASURED 2026-09-23 on macOS 27 (m3): with the window not key, the
-        // click hit-tests to the chip's label (`NSTextField`, no first mouse) and AppKit
-        // spends it on key-window selection — no SelectTab for any chip — where the
-        // 2026-09-21 measurement on macOS 13.7 saw the same output either way.
+        // Active and key first, as stage 5 does. The drive launches under the
+        // quiet posture (Accessory, no activation); this stage audits tab
+        // selection by click, which needs the key window: otherwise the click
+        // hit-tests to the chip's label (`NSTextField`, no first mouse) and
+        // AppKit spends it on key-window selection.
         // SAFETY: the live NSApp and the live window this drive built.
         unsafe {
             s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
@@ -1206,8 +1138,8 @@ mod macos {
 
         // ---------------------------------------------------------- stage 5
         println!("\n-- stage 5: the context menu, two ways in");
-        // The pop site goes first — see `POP_UP_CONTEXT_MENU`. A class method
-        // is an instance method of the METACLASS, so the row is claimed there;
+        // The pop site goes first (see `POP_UP_CONTEXT_MENU`). A class method is
+        // an instance method of the metaclass, so the row is claimed there;
         // `install` refuses unless the registered encoding is the stub's.
         // SAFETY: `NSMenu` is a live, immortal class object; `class_of` on it
         // answers its metaclass.
@@ -1244,9 +1176,8 @@ mod macos {
             println!("      {l}");
         }
         // NSApp's real event routing needs the application active and this
-        // window key on Darwin 27: otherwise the first click is consumed as
-        // an activation click and no chip receives it. Keep that activation
-        // here, after the quiet view/window checks in stages 3 and 4.
+        // window key; otherwise the first click is consumed as an activation
+        // click. Activated here, after the quiet checks in stages 3 and 4.
         // SAFETY: the live NSApp and the drive's own window.
         unsafe {
             s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
@@ -1288,12 +1219,10 @@ mod macos {
             );
         }
         // The block below enters the strip's menu, through AppKit's routing
-        // and straight at the IMPs, so it runs only over the stub. Over the
-        // REAL pop site any of those entries can start the tracking loop the
-        // watchdog exists for, and the drive would end HUNG (exit 3) instead of
-        // failing with the reason recorded above. Its free observations (the
-        // control click, the hit map) are skipped with it; that FAIL already
-        // decides the drive.
+        // and straight at the IMPs, so it runs only over the stub; over the
+        // real pop site it could hang in the tracking loop (exit 3) instead of
+        // failing with the recorded reason. Its other observations (the control
+        // click, the hit map) are skipped with it.
         if pop_site_replaced {
             // SAFETY: live views, NSApp and NSWindow throughout this block; every
             // synthesized event is +0 autoreleased.
@@ -1321,10 +1250,9 @@ mod macos {
                     s_bool(ns_window, sel!(isMainWindow))
                 );
 
-                // THE CONTROL: a plain click through the same NSApp routing
-                // as the context clicks must select before those observations
-                // count. The pop site is stubbed, so whichever context route
-                // this host takes cannot enter a modal tracking loop.
+                // The control: a plain click through the same NSApp routing as
+                // the context clicks must select before those observations count.
+                // The pop site is stubbed, so no route enters a tracking loop.
                 d.wakes.clear();
                 s_v_id(
                     app,
@@ -1381,11 +1309,10 @@ mod macos {
                     name_of(s_id_point(frame_view, sel!(hitTest:), wp))
                 );
 
-                // STRAIGHT INTO THE REGISTERED IMP, which is what AppKit calls once
-                // its routing has picked the view. Nothing is queued to dismiss the
-                // menu: the pop lands in the stub, so there is no tracking loop to
-                // end, and an ESC posted anyway would reach the key window as a
-                // stray Escape keyDown, on every macOS.
+                // Straight into the registered IMP, which AppKit calls once its
+                // routing has picked the view. Nothing is queued to dismiss the
+                // menu: the pop lands in the stub, and a posted ESC would reach
+                // the key window as a stray Escape keyDown.
                 for (label, recv, s, ev) in [
                     (
                         "chip rightMouseDown:",
@@ -1415,9 +1342,8 @@ mod macos {
                     );
                 }
 
-                // WHERE a click lands, across the chip. Free (no pumping), and it
-                // is the layout evidence a chip-geometry regression shows up in
-                // first: the label owns the middle, the chip owns the edges.
+                // Where a click lands across the chip (no pumping needed): the
+                // label owns the middle, the chip owns the edges.
                 let bb = s_rect(cs[1], sel!(bounds));
                 let map: Vec<String> = (0..20)
                     .map(|k| {
@@ -1436,8 +1362,8 @@ mod macos {
                     .collect();
                 println!("  --  hit map across chip1: {}", map.join(" "));
 
-                // AND THE LABEL, which is what a user's pointer is actually over:
-                // `NSTextField` is not a chip, so both menu routes have to survive
+                // And the label, which the user's pointer is actually over:
+                // `NSTextField` is not a chip, so both menu routes must survive
                 // the responder walk from the label up to the chip.
                 let label = subviews(cs[1])
                     .into_iter()
@@ -1514,10 +1440,9 @@ mod macos {
                 "the \"+\" button is live before and after".to_owned(),
             );
         }
-        // The chips follow the edge too. `reflow_window_tabs` is what the app runs
-        // in the resize's own turn; before it existed a narrowed window kept the
-        // wide layout, the last chip under the "+", until an unrelated title or
-        // chrome refresh rebuilt the strip.
+        // The chips follow the edge too: `reflow_window_tabs` runs in the
+        // resize's own turn, so a narrowed window does not keep the wide layout
+        // with the last chip under the "+".
         toolbar::reflow_window_tabs(&handle);
         pump(&mut d, &mut el, 100);
         // SAFETY: `strip` is live; `chips` walks its subviews.
@@ -1578,26 +1503,21 @@ mod macos {
         // SAFETY: `strip` is live.
         if let Some((w, h, px)) = unsafe { capture(strip) } {
             let cols = ink_columns(w, h, &px);
-            println!("  --  narrow {w}x{h} hash={:016x}", fnv(&px));
+            println!(
+                "  --  narrow {w}x{h} hash={:016x}",
+                aterm_hash::fnv1a_64(&px)
+            );
             println!("  --  ink spans: {}", show_spans(&cols));
         }
 
         // ---------------------------------------------------------- stage 7
         //
-        // THE RENAME EDITOR, AND IT IS WHERE D1 LIVES. Two of
-        // `TabRenameTarget`'s three rows are why the D1 finding exists at all:
-        // `control:textView:doCommandBySelector:` takes a `SEL` and returns a
-        // `BOOL`, and its one-byte-vs-eight-byte failure mode is SILENT on
-        // arm64. Nothing in the tree calls that row except a real Escape typed
-        // into a real field editor, and nothing calls its commit twin except a
-        // real Return, so this stage types both.
-        //
-        // It found a defect on its first run, and the defect had nothing to do
-        // with encodings: `-selectText:` ended the editing session
-        // `-makeFirstResponder:` had just begun, `controlTextDidEndEditing:`
-        // fired from inside `begin_tab_rename` on a relay already attached, and
-        // the resulting `done` latch left BOTH exits dead for the rest of the
-        // editor's life. See the comment at that attach in `toolbar.rs`.
+        // The rename editor. `control:textView:doCommandBySelector:` takes a
+        // `SEL` and returns a `BOOL`, whose one-byte-vs-eight-byte failure mode
+        // is silent on arm64. Only a real Escape typed into a real field editor
+        // reaches that row, and only a real Return reaches its commit twin, so
+        // this stage types both. Opening the editor must not end the editing
+        // session (see the relay attach in `toolbar.rs`).
         println!("\n-- stage 7: the inline rename editor, typed through AppKit's field editor");
         cx.check(
             toolbar::can_present_tab_rename(&handle),
@@ -1610,10 +1530,8 @@ mod macos {
             "begin_tab_rename".to_owned(),
         );
         pump(&mut d, &mut el, 200);
-        // THE SPURIOUS-OUTCOME CHECK, and it is the one this stage was written
-        // blind to. Opening an editor decides nothing, so it must post nothing:
-        // a commit here is a rename the user never asked for AND a latch that
-        // kills every later exit.
+        // Opening an editor decides nothing, so it must post nothing: a commit
+        // here is an unrequested rename and a latch that kills every later exit.
         cx.check(
             d.wakes.is_empty(),
             format!("opening the editor posted no outcome; saw {:?}", d.wakes),
@@ -1633,9 +1551,8 @@ mod macos {
             ),
         );
         // The field editor's delegate is the NSTextField control, whose own
-        // delegate is the declared `ATermTabRenameTarget`. Walking to it here
-        // is the only moment that object is LIVE, which is why stage 10 reads
-        // it now.
+        // delegate is the declared `ATermTabRenameTarget`; this is the only
+        // moment that object is live, so stage 10 reads it now.
         // SAFETY: `fr` is a live responder while the editor is up; both
         // `-delegate` sends are read-only accessors.
         unsafe {
@@ -1681,9 +1598,9 @@ mod macos {
             toolbar::rename_editor_edit(&handle, crate::platform::RenameEditorEdit::SelectAll),
             "rename_editor_edit(SelectAll) found a field editor".to_owned(),
         );
-        // ESCAPE — `control:textView:doCommandBySelector:` with
-        // `cancelOperation:`. THE D1 ROW, entered by a real key event through
-        // AppKit's own key-binding machinery.
+        // Escape: `control:textView:doCommandBySelector:` with
+        // `cancelOperation:`, entered by a real key event through AppKit's
+        // key-binding machinery.
         d.wakes.clear();
         // SAFETY: live NSApp, +0 autoreleased events.
         unsafe {
@@ -1709,9 +1626,9 @@ mod macos {
         );
         toolbar::end_tab_rename(&handle);
         pump(&mut d, &mut el, 150);
-        // RETURN — the commit exit, which is `controlTextDidEndEditing:` and
-        // NOT the selector row: `abortEditing` suppresses that notification, so
-        // the two outcomes leave by two different rows and both need driving.
+        // Return: the commit exit, `controlTextDidEndEditing:`, not the selector
+        // row (`abortEditing` suppresses that notification), so both need
+        // driving.
         d.wakes.clear();
         cx.check(
             toolbar::begin_tab_rename(&handle, m3.ids[1], 77, "vim", "name"),
@@ -1743,9 +1660,8 @@ mod macos {
                 d.wakes
             ),
         );
-        // Tearing the field down is `App`'s job on that wake, not the strip's,
-        // so the field is still up here — `end_tab_rename` is what removes it,
-        // and THAT is what this checks.
+        // Tearing the field down is `App`'s job on that wake; `end_tab_rename`
+        // removes it, and that is what this checks.
         toolbar::end_tab_rename(&handle);
         pump(&mut d, &mut el, 150);
         // SAFETY: `ns_window` is live.
@@ -1760,13 +1676,9 @@ mod macos {
 
         // ---------------------------------------------------------- stage 8
         //
-        // THE OWNERSHIP LEDGER. Every rebuild runs inside an
-        // `autoreleasepool`, because that is what the shipped app does — AppKit
-        // drains one per event-loop iteration — and a driver without one
-        // measures its own missing pool: the same 200 rebuilds unpooled take
-        // the strip's retain count 152 -> 5755 IDENTICALLY on this branch and
-        // on origin/main, which is a statement about this file, not about the
-        // port.
+        // The ownership ledger. Every rebuild runs inside an `autoreleasepool`,
+        // as the shipped app does (AppKit drains one per event-loop iteration);
+        // without one the driver would measure its own missing pool.
         println!("\n-- stage 8: the ownership ledger over 200 pooled strip rebuilds");
         let m4 = model(4);
         apply(&handle, &m3);
@@ -1829,18 +1741,11 @@ mod macos {
 
         // ---------------------------------------------------------- stage 9
         //
-        // THE STATE MATRIX. Stage 2 captured ONE model; every other branch of
-        // the drawing code — icon kinds, status marks, connection roles, dark
-        // mode, the accent tint, hover, press — is invisible to it. Each row
-        // applies a state, lets AppKit draw it, and prints the hash.
-        //
-        // The hashes are NOT asserted against a golden: they depend on the
-        // backing scale, the system font and the user's accent colour, so a
-        // stored one would be a flake generator. They are printed, and the
-        // A/B is a diff of two transcripts on one machine — which is how this
-        // port shipped (26 states, four runs per arm, every hash equal to
-        // origin/main). What IS asserted is relational and machine-independent:
-        // every row draws, and rows that must differ do differ.
+        // The state matrix: icon kinds, status marks, connection roles, dark
+        // mode, the accent tint, hover and press. Each row applies a state, lets
+        // AppKit draw it, and prints the hash. Hashes are printed, not asserted
+        // (they are machine-specific); what is asserted is relational: every
+        // row draws, and rows that must differ do differ.
         println!("\n-- stage 9: the drawing state matrix");
         // SAFETY: `ns_window` is live.
         unsafe {
@@ -1874,7 +1779,7 @@ mod macos {
             // SAFETY: `s` is a live view or nil, which `capture` rejects.
             match unsafe { capture(s) } {
                 Some((w, hgt, px)) => {
-                    let h = fnv(&px);
+                    let h = aterm_hash::fnv1a_64(&px);
                     println!("  {name:<34} {w}x{hgt} {h:016x}");
                     matrix.push((name.to_owned(), Some(h)));
                 }
@@ -1944,7 +1849,7 @@ mod macos {
             row(name, &mut d, &mut el, &mut matrix);
         }
         toolbar::set_active_tab_color(&handle, None);
-        // HOVER AND PRESS, driven into the registered IMPs a tracking area and
+        // Hover and press, driven into the registered IMPs a tracking area and
         // a mouse would enter.
         // SAFETY: `ns_window` is live.
         let strip_now = unsafe { strip_of(ns_window) };
@@ -2033,9 +1938,8 @@ mod macos {
             );
         }
 
-        // The relational teeth. Absolute hashes are machine-specific; these are
-        // not, and they are what a branch that silently stopped drawing a state
-        // fails.
+        // Relational checks: absolute hashes are machine-specific, these are
+        // not, and a branch that stopped drawing a state fails them.
         cx.check(
             matrix.len() == 27,
             format!("27 states were captured (got {})", matrix.len()),
@@ -2079,15 +1983,11 @@ mod macos {
 
         // --------------------------------------------------------- stage 10
         //
-        // THE FOUR DECLARED CLASSES, READ OFF LIVE OBJECTS. `toolbar.rs`'s
-        // `objc_tests` checks thirty-two encodings against a literal IN THE
-        // SAME FILE — the circularity D1 named, and W7's own control proved it
-        // is not theoretical: a plant that registered `controlTextDidChange:`
-        // as `v@:B` AND edited the table to agree left that test GREEN. Here
-        // every class is reached through the object AppKit is holding, every
-        // row comes out of `class_copyMethodList`, and every encoding is
-        // compared against what a protocol the class claims or an ancestor
-        // class says — never against a string this tree wrote.
+        // The four declared classes, read off live objects: every class is
+        // reached through the object AppKit holds, every row comes from
+        // `class_copyMethodList`, and every encoding is compared against a
+        // protocol the class claims or an ancestor class, never a string this
+        // tree wrote.
         println!("\n-- stage 10: the four declared classes, off the live objects");
         // SAFETY: `ns_window` is live; the toolbar's delegate is the declared
         // `ATermToolbarDelegate` while the toolbar exists.

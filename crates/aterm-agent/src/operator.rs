@@ -3,18 +3,16 @@
 
 //! Durable state machine for an embedded fleet operator.
 //!
-//! The queue deliberately keeps the authority-bearing transition and its WAL
-//! write under one mutex. Every mutating operation validates its compare-and-set
-//! precondition, appends and synchronizes one checksummed record, and only then
-//! changes memory. A failed or uncertain write poisons the live handle; reopening
-//! replays the durable answer instead of guessing whether an operation landed.
+//! The queue keeps the authority-bearing transition and its WAL write under one
+//! mutex. Every mutating operation validates its compare-and-set precondition,
+//! appends and syncs one checksummed record, and only then changes memory. A
+//! failed or uncertain write poisons the live handle; reopening replays the
+//! durable answer instead of guessing whether an operation landed.
 //!
-//! Invalid/stale claim attempts are deliberately not one-record-per-request audit
-//! events: the authenticated requester controls that input, so such a WAL would be
-//! an unbounded durable-storage amplification primitive. The durable event state
-//! and successful reclaim/CAS transition remain authoritative; a bounded external
-//! security log may record rejected requests. Adding an in-WAL rejection audit
-//! requires a separately specified, coalesced quota and is intentionally deferred.
+//! Invalid or stale claim attempts are not WAL audit events: the authenticated
+//! requester controls that input, so one record per request would amplify
+//! durable storage without bound. A bounded external security log may record
+//! rejected requests.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -119,9 +117,7 @@ impl ClaimToken {
     }
 
     fn from_wal(value: String) -> Result<Self, String> {
-        if value.len() != CLAIM_TOKEN_HEX_LEN
-            || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
-        {
+        if !aterm_codec::hex::is_hex(&value, CLAIM_TOKEN_HEX_LEN) {
             return Err("claim token is not the canonical 32-byte lowercase-hex shape".into());
         }
         if value.as_bytes().iter().any(u8::is_ascii_uppercase) {
@@ -710,9 +706,8 @@ impl From<io::Error> for OperatorError {
     }
 }
 
-/// Locate aterm's durable per-user state root — the ONE rule
-/// ([`aterm_types::dirs::state_dir`]) the journal and the session identities use
-/// too. The returned directory is the aterm root itself; callers append
+/// Locate aterm's durable per-user state root ([`aterm_types::dirs::state_dir`],
+/// shared with the journal and session identities). Callers append
 /// `operator/<fleet-id>`.
 pub fn default_state_root() -> Result<PathBuf, OperatorError> {
     aterm_types::dirs::state_dir().ok_or_else(|| {
@@ -726,14 +721,10 @@ pub fn default_state_root() -> Result<PathBuf, OperatorError> {
 
 /// Resolve and create the private directory for one fleet.
 ///
-/// SCOPE DISCIPLINE: the operator owns `<root>/operator/**` and nothing above
-/// it. `<root>` is aterm's SHARED per-user state root — the recovery journal,
-/// and anything else this app keeps per user, live there too. An opt-in
-/// subsystem does not get to rewrite the mode of, or veto its own startup on,
-/// state it merely shares: this creates the root when it is missing and
-/// otherwise touches nothing about it beyond "it is a directory". That is the
-/// pre-existing precedent in `native_document_journal`, which `create_dir_all`s
-/// the shared root and hardens only its own `drafts/` subdirectory.
+/// The operator owns `<root>/operator/**` and nothing above it. `<root>` is
+/// aterm's shared per-user state root (the recovery journal lives there too),
+/// so this only creates it when missing and requires it to be a directory,
+/// never changing its mode, as `native_document_journal` does.
 pub fn fleet_state_dir(fleet_id: &str) -> Result<PathBuf, OperatorError> {
     fleet_state_dir_in(&default_state_root()?, fleet_id)
 }
@@ -744,23 +735,20 @@ pub fn fleet_state_dir_in(root: &Path, fleet_id: &str) -> Result<PathBuf, Operat
     validate_fleet_id(fleet_id)?;
     ensure_shared_root(root)?;
     let operator_root = root.join("operator");
-    // The anchor of this creation is the shared root, so it is NOT policed for
-    // link-likeness; `operator/` and below are ours and are policed in full.
+    // The shared root is not policed for link-likeness; `operator/` and below
+    // are ours and are policed in full.
     ensure_private_dir_below_shared_root(&operator_root)?;
     let path = operator_root.join(fleet_id);
     ensure_private_dir(&path)?;
     Ok(path)
 }
 
-/// Admit aterm's shared state root without taking ownership of it.
-///
-/// Deliberately weaker than [`ensure_private_dir`]: no `chmod`, no uid/mode
-/// verification, and `metadata` FOLLOWS a link, because a user who points their
-/// aterm state root at another volume has not thereby created an operator
-/// security boundary — the operator's own directory, one level down, is opened
-/// `O_NOFOLLOW` and mode-verified, and that is where every token, claim, and WAL
-/// byte lives. Creating a missing root uses the process umask, exactly as the
-/// recovery journal already does.
+/// Admit aterm's shared state root without taking ownership of it: no `chmod`,
+/// no uid/mode check, and `metadata` follows a link (a user pointing the state
+/// root at another volume creates no operator security boundary). The
+/// operator's own directory below it is opened `O_NOFOLLOW` and mode-verified,
+/// and holds every token, claim and WAL byte. A missing root is created with
+/// the process umask, as the recovery journal does.
 fn ensure_shared_root(root: &Path) -> Result<(), OperatorError> {
     if !root.is_absolute() {
         return Err(OperatorError::InvalidInput(format!(
@@ -870,13 +858,12 @@ impl TickSource for InstantSource {
 
 /// Process-local authority clock.
 ///
-/// The underlying `Instant` cannot move backwards when the civil clock is
-/// corrected. The atomic high-water mark also makes that property explicit for
-/// injected/test sources: a faulty rollback can delay neither an expiry nor a
-/// previously observed forward jump. Rust deliberately does not promise whether
-/// `Instant` includes time spent suspended on every target, so a process that is
-/// asleep may grant extra real-world visibility time. Restart/takeover is safe:
-/// the durable epoch transition revokes every claim from the previous process.
+/// `Instant` cannot move backwards when the civil clock is corrected, and the
+/// atomic high-water mark makes that explicit for injected sources: a rollback
+/// can delay neither an expiry nor a previously observed forward jump. Whether
+/// `Instant` counts suspended time varies by target, so a sleeping process may
+/// grant extra visibility time. Restart/takeover is safe: the durable epoch
+/// transition revokes every claim from the previous process.
 struct AuthorityClock {
     source: Arc<dyn TickSource>,
     high_water_ms: AtomicU64,
@@ -934,9 +921,9 @@ fn harden_new_directory(path: &Path) -> Result<(), OperatorError> {
     Ok(())
 }
 
-/// Whether the closest EXISTING ancestor of a path we are creating is ours to
-/// police. It is not, when that ancestor is aterm's shared state root: see
-/// [`fleet_state_dir`].
+/// Whether the closest existing ancestor of a path being created is ours to
+/// police; it is not when it is aterm's shared state root (see
+/// [`fleet_state_dir`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AnchorPolicy {
     /// The anchor is inside the operator's own subtree: reject a link-like one.
@@ -947,14 +934,10 @@ enum AnchorPolicy {
 }
 
 /// Create missing descendants one component at a time. The closest existing
-/// caller-selected ancestor is admitted only if it is a real directory (see
-/// [`AnchorPolicy`]); every descendant is then created and rechecked without
-/// following a final symlink.
-///
-/// We intentionally do not reject symlinks above that existing anchor: macOS
-/// exposes `/var` and `/tmp` as system aliases. Rejecting every lexical ancestor
-/// makes ordinary `temp_dir` and state paths unusable without adding security at
-/// the user-controlled boundary.
+/// ancestor is admitted only if it is a real directory (see [`AnchorPolicy`]);
+/// every descendant is created and rechecked without following a final
+/// symlink. Symlinks above that anchor are allowed: macOS exposes `/var` and
+/// `/tmp` as system aliases.
 fn prepare_directory_tree(path: &Path, policy: AnchorPolicy) -> Result<(), OperatorError> {
     if !path.is_absolute() {
         return Err(OperatorError::InvalidInput(format!(
@@ -1012,96 +995,55 @@ fn prepare_directory_tree(path: &Path, policy: AnchorPolicy) -> Result<(), Opera
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), OperatorError> {
-    File::open(path)?.sync_all()?;
+    crate::durable::sync_all(&File::open(path)?)?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> Result<(), OperatorError> {
-    // `std` has no portable way to open a Windows directory for
-    // `FlushFileBuffers`. Checkpoints therefore use create-new final names (no
-    // replace-over-existing dependency), while file contents themselves are
-    // synchronized. Directory-entry durability remains platform/filesystem
-    // dependent and is not presented as an ACL or flush guarantee.
+    // `std` cannot open a Windows directory for `FlushFileBuffers`, so
+    // checkpoints use create-new final names (no replace-over-existing) and
+    // sync file contents; directory-entry durability is left to the platform.
     Ok(())
 }
 
-#[cfg(unix)]
 fn ensure_private_dir_with_anchor(path: &Path, policy: AnchorPolicy) -> Result<(), OperatorError> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
     prepare_directory_tree(path, policy)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    let metadata = fs::symlink_metadata(path)?;
-    // SAFETY: getuid takes no arguments and cannot invalidate memory.
-    let our_uid = unsafe { libc::getuid() };
-    if !metadata.file_type().is_dir()
-        || metadata.uid() != our_uid
-        || metadata.mode() & 0o777 != 0o700
+    #[cfg(unix)]
     {
-        return Err(OperatorError::Io(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{} must be a real uid-{our_uid} directory with mode 0700",
-                path.display()
-            ),
-        )));
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let metadata = fs::symlink_metadata(path)?;
+        // SAFETY: getuid takes no arguments and cannot invalidate memory.
+        let our_uid = unsafe { libc::getuid() };
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != our_uid
+            || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(OperatorError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be a real uid-{our_uid} directory with mode 0700",
+                    path.display()
+                ),
+            )));
+        }
     }
-    sync_directory(path)?;
-    if let Some(parent) = path.parent() {
-        // Best-effort: every component this call CREATED already had its parent
-        // synchronized in `prepare_directory_tree`, so the only thing left here
-        // is a re-flush of a directory that may not be ours (the shared state
-        // root) on a filesystem that may not flush directories at all. A
-        // subsystem must not fail to start over a redundant fsync.
-        let _ = sync_directory(parent);
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn ensure_private_dir_with_anchor(path: &Path, policy: AnchorPolicy) -> Result<(), OperatorError> {
-    use std::os::windows::fs::MetadataExt as _;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-
-    prepare_directory_tree(path, policy)?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    #[cfg(not(unix))]
     {
-        return Err(OperatorError::Io(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} is not a real directory", path.display()),
-        )));
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_dir() || metadata_is_link_like(&metadata) {
+            return Err(OperatorError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not a real directory", path.display()),
+            )));
+        }
     }
     sync_directory(path)?;
     if let Some(parent) = path.parent() {
-        // Best-effort: every component this call CREATED already had its parent
-        // synchronized in `prepare_directory_tree`, so the only thing left here
-        // is a re-flush of a directory that may not be ours (the shared state
-        // root) on a filesystem that may not flush directories at all. A
-        // subsystem must not fail to start over a redundant fsync.
-        let _ = sync_directory(parent);
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn ensure_private_dir_with_anchor(path: &Path, policy: AnchorPolicy) -> Result<(), OperatorError> {
-    prepare_directory_tree(path, policy)?;
-    if !fs::symlink_metadata(path)?.file_type().is_dir() {
-        return Err(OperatorError::Io(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} is not a real directory", path.display()),
-        )));
-    }
-    sync_directory(path)?;
-    if let Some(parent) = path.parent() {
-        // Best-effort: every component this call CREATED already had its parent
-        // synchronized in `prepare_directory_tree`, so the only thing left here
-        // is a re-flush of a directory that may not be ours (the shared state
-        // root) on a filesystem that may not flush directories at all. A
-        // subsystem must not fail to start over a redundant fsync.
+        // Best-effort: every created component already had its parent synced in
+        // `prepare_directory_tree`; this re-flush may target the shared root on
+        // a filesystem that cannot flush directories, and must not fail startup.
         let _ = sync_directory(parent);
     }
     Ok(())
@@ -1189,7 +1131,7 @@ fn open_private_regular_file(path: &Path) -> Result<File, OperatorError> {
         )));
     }
     if !existed {
-        file.sync_all()?;
+        crate::durable::sync_all(&file)?;
         if let Some(parent) = path.parent() {
             sync_directory(parent)?;
         }
@@ -1251,7 +1193,7 @@ fn ensure_fault_marker(
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
     file.write_all(&fault_marker_bytes(reason))?;
-    file.sync_all()?;
+    crate::durable::sync_all(&file)?;
     sync_directory(directory)?;
     Ok(reason)
 }
@@ -1282,7 +1224,12 @@ struct ProcessLock {
 impl ProcessLock {
     fn acquire(path: &Path) -> Result<Self, OperatorError> {
         let file = open_private_regular_file(path)?;
-        match file.try_lock() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        let taken = file.try_lock();
+        match taken {
             Ok(()) => Ok(Self { file }),
             Err(fs::TryLockError::WouldBlock) => {
                 Err(OperatorError::LockContended(path.to_path_buf()))
@@ -1294,30 +1241,9 @@ impl ProcessLock {
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
-        // Release the lock itself; do not settle for closing a descriptor that
-        // names it. The lock lives on the open file description, and any child
-        // forked anywhere in this process while it was held owns a duplicate of
-        // that description until it reaches `exec` — a window a loaded machine
-        // stretches into milliseconds, and aterm forks for every session it
-        // spawns. Closing alone inside that window leaves the lock standing in a
-        // process that never opened the queue, so the next opener — this process
-        // reopening the directory cold, or the next process to try — is refused
-        // as `LockContended` by a holder no diagnostic can name. Unlocking is the
-        // release no fork window can outlive: it makes "the last handle dropped"
-        // mean "the next opener may have it".
-        //
-        // It reaches exactly the paths that RUN DESTRUCTORS, which is not all of
-        // them. A process that leaves through `libc::_exit` runs none: the
-        // seamless handoff's point of no return (`commit_and_exit` in
-        // crates/aterm-gui/src/seamless.rs) is such an exit, so a successor
-        // taking leadership after handoff still meets whatever the predecessor's
-        // fork window left standing. Closing that gap means unlocking BEFORE the
-        // exit, which no `Drop` can do for it.
-        //
-        // The workspace's other advisory-lock guards release the same way:
-        // `atpkg::lock::StoreLock` and its `Flock` since 2026-09-23, and
-        // `aterm_update_core::FileLock` — with `atpkg-keys`' roster claim, which
-        // holds one — since 2026-09-24.
+        // Unlock explicitly: the lock lives on the open file description, which
+        // a forked child keeps until `exec`, and paths that `_exit` run no
+        // destructors.
         let _ = self.file.unlock();
     }
 }
@@ -1369,6 +1295,15 @@ enum StoredStatus {
 impl StoredStatus {
     fn unresolved(&self) -> bool {
         !matches!(self, Self::Resolved { .. } | Self::ResolvedUnclaimed { .. })
+    }
+
+    /// Queued, delivered, or carrying an action intent: work a revocation
+    /// must settle. In-doubt is unresolved but no longer active.
+    fn active(&self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Delivered { .. } | Self::ActionInFlight { .. }
+        )
     }
 
     fn snapshot(&self) -> EventStatus {
@@ -1486,6 +1421,24 @@ impl StoredFleetGate {
 }
 
 impl StoredEvent {
+    /// A newly observed event: queued, never redelivered, not escalated.
+    fn fresh(
+        id: EventId,
+        sid: String,
+        generation: EventGeneration,
+        condition: AttentionCondition,
+    ) -> Self {
+        Self {
+            id,
+            sid,
+            generation,
+            condition,
+            redelivery_count: 0,
+            escalated: false,
+            status: StoredStatus::Queued,
+        }
+    }
+
     fn snapshot(&self) -> EventSnapshot {
         EventSnapshot {
             id: self.id,
@@ -1536,6 +1489,77 @@ impl QueueState {
             .count()
     }
 
+    fn require_healthy(&self) -> Result<(), String> {
+        self.fleet_gate
+            .require_healthy()
+            .map_err(|error| error.to_string())
+    }
+
+    fn event(&self, event_id: &EventId) -> Result<&StoredEvent, String> {
+        self.events
+            .get(event_id)
+            .ok_or_else(|| format!("event {} does not exist", event_id.get()))
+    }
+
+    fn event_mut(&mut self, event_id: &EventId) -> Result<&mut StoredEvent, String> {
+        self.events
+            .get_mut(event_id)
+            .ok_or_else(|| format!("event {} does not exist", event_id.get()))
+    }
+
+    /// The `Delivered` event `token` claimed in this epoch, with its claim
+    /// epoch, when `valid(claim_epoch, expires_at_ms)` holds too; otherwise
+    /// the refusal, `cas` naming the compare-and-set that failed.
+    fn delivered_mut(
+        &mut self,
+        event_id: &EventId,
+        token: &ClaimToken,
+        cas: &str,
+        valid: impl FnOnce(u64, u64) -> bool,
+    ) -> Result<(&mut StoredEvent, u64), String> {
+        let durable_epoch = self.durable_epoch;
+        let event = self.event_mut(event_id)?;
+        let StoredStatus::Delivered {
+            token: current,
+            claim_epoch,
+            expires_at_ms,
+            ..
+        } = &event.status
+        else {
+            return Err(format!("event {} is not delivered", event_id.get()));
+        };
+        let claim_epoch = *claim_epoch;
+        if !tokens_equal(current, token)
+            || claim_epoch != durable_epoch
+            || !valid(claim_epoch, *expires_at_ms)
+        {
+            return Err(format!("event {} {cas}", event_id.get()));
+        }
+        Ok((event, claim_epoch))
+    }
+
+    /// The fresh event `event` becomes under the next identifier.
+    fn next_fresh_event(&self, event: NewEvent) -> StoredEvent {
+        StoredEvent::fresh(
+            EventId(self.next_event_id),
+            event.sid,
+            event.generation,
+            event.condition,
+        )
+    }
+
+    fn manage(&mut self, sid: &str) -> Result<(), String> {
+        if self.managed.len() >= MAX_MANAGED_SIDS {
+            return Err(format!(
+                "managed-session count reached hard bound {MAX_MANAGED_SIDS}"
+            ));
+        }
+        if !self.managed.insert(sid.to_string()) {
+            return Err(format!("sid {sid:?} is already managed"));
+        }
+        Ok(())
+    }
+
     fn add_ready(&mut self, sid: &str, event_id: EventId) -> Result<(), String> {
         if !self.managed.contains(sid) {
             return Err(format!(
@@ -1574,9 +1598,15 @@ impl QueueState {
         {
             return Err("new event has a non-initial lifecycle".into());
         }
+        self.insert_fresh(event, "enqueue")
+    }
+
+    /// Index a vetted fresh event under the next identifier and make it ready;
+    /// `label` names the record in a duplicate-identity refusal.
+    fn insert_fresh(&mut self, event: &StoredEvent, label: &str) -> Result<(), String> {
         let key = (event.sid.clone(), event.generation);
         if self.generations.contains_key(&key) || self.events.contains_key(&event.id) {
-            return Err("enqueue duplicates an event identity".into());
+            return Err(format!("{label} duplicates an event identity"));
         }
         self.next_event_id = self
             .next_event_id
@@ -1639,11 +1669,10 @@ impl QueueState {
 
     /// Apply a durable leadership epoch transition.
     ///
-    /// This transition is intentionally part of `Epoch` replay rather than an
-    /// in-memory recovery projection. A new leader atomically revokes every old
-    /// delivered claim and turns every unmatched old action intent into InDoubt.
-    /// Consequently a later reconciliation record replays from exactly the same
-    /// predecessor state that the live process observed.
+    /// Part of `Epoch` replay, not an in-memory recovery projection: a new
+    /// leader atomically revokes every old delivered claim and turns every
+    /// unmatched old action intent into InDoubt, so a later reconciliation
+    /// record replays from the state the live process observed.
     fn advance_epoch(&mut self, epoch: u64, redelivery_cap: u32) -> Result<(), String> {
         if epoch == 0 || epoch <= self.durable_epoch {
             return Err(format!(
@@ -1670,47 +1699,24 @@ impl QueueState {
             })
             .collect();
         for event_id in stale {
-            let (sid, status, escalated, redelivery_count) = {
-                let event = self
-                    .events
-                    .get(&event_id)
-                    .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
-                (
-                    event.sid.clone(),
-                    event.status.clone(),
-                    event.escalated,
-                    event.redelivery_count,
-                )
-            };
-            match status {
+            let event = self.event_mut(&event_id)?;
+            event.status = match &event.status {
                 StoredStatus::Delivered {
                     token,
                     claimed_at_ms,
                     ..
-                } if escalated => {
-                    let event = self
-                        .events
-                        .get_mut(&event_id)
-                        .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
-                    event.status = StoredStatus::InDoubt {
-                        token: Some(token),
-                        reason: "escalation delivery lost during leader takeover".into(),
-                        at_ms: claimed_at_ms,
-                    };
-                }
+                } if event.escalated => StoredStatus::InDoubt {
+                    token: Some(token.clone()),
+                    reason: "escalation delivery lost during leader takeover".into(),
+                    at_ms: *claimed_at_ms,
+                },
                 StoredStatus::Delivered { .. } => {
-                    let next_count = redelivery_count.saturating_add(1);
-                    let event = self
-                        .events
-                        .get_mut(&event_id)
-                        .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
-                    event.redelivery_count = next_count;
-                    if next_count >= redelivery_cap {
+                    event.redelivery_count = event.redelivery_count.saturating_add(1);
+                    if event.redelivery_count >= redelivery_cap {
                         event.escalated = true;
                         event.condition = AttentionCondition::Escalation;
                     }
-                    event.status = StoredStatus::Queued;
-                    self.add_ready(&sid, event_id)?;
+                    StoredStatus::Queued
                 }
                 StoredStatus::ActionInFlight {
                     token,
@@ -1718,20 +1724,56 @@ impl QueueState {
                     action_hash,
                     intent_at_ms,
                     ..
-                } => {
-                    let event = self
-                        .events
-                        .get_mut(&event_id)
-                        .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
-                    event.status = StoredStatus::InDoubt {
-                        token: Some(token),
-                        reason: format!(
-                            "recovered unmatched action intent class={action_class} hash={action_hash}"
-                        ),
-                        at_ms: intent_at_ms,
-                    };
-                }
+                } => StoredStatus::InDoubt {
+                    token: Some(token.clone()),
+                    reason: format!(
+                        "recovered unmatched action intent class={action_class} hash={action_hash}"
+                    ),
+                    at_ms: *intent_at_ms,
+                },
                 _ => return Err("stale-claim scan selected an incompatible event".into()),
+            };
+            if matches!(event.status, StoredStatus::Queued) {
+                let sid = event.sid.clone();
+                self.add_ready(&sid, event_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Revoke, in identifier order, every active event `select` picks: a queued
+    /// or delivered one resolves `Paused` with no claimant (`paused` says why),
+    /// and an action intent in flight goes token-scoped in-doubt (`in_doubt`).
+    fn revoke_active(
+        &mut self,
+        select: impl Fn(&StoredEvent) -> bool,
+        at_ms: u64,
+        paused: &str,
+        in_doubt: &str,
+    ) -> Result<(), String> {
+        let revoked: Vec<EventId> = self
+            .events
+            .iter()
+            .filter_map(|(id, event)| (event.status.active() && select(event)).then_some(*id))
+            .collect();
+        for event_id in revoked {
+            let event = self.event_mut(&event_id)?;
+            let queued = matches!(event.status, StoredStatus::Queued);
+            event.status = match &event.status {
+                StoredStatus::ActionInFlight { token, .. } => StoredStatus::InDoubt {
+                    token: Some(token.clone()),
+                    reason: in_doubt.into(),
+                    at_ms,
+                },
+                _ => StoredStatus::ResolvedUnclaimed {
+                    resolution: Resolution::Paused,
+                    resolved_at_ms: at_ms,
+                    reason: paused.into(),
+                },
+            };
+            if queued {
+                let sid = event.sid.clone();
+                self.remove_ready(&sid, event_id)?;
             }
         }
         Ok(())
@@ -1752,57 +1794,15 @@ impl QueueState {
     }
 
     fn begin_fault_clear(&mut self, at_ms: u64) -> Result<(), String> {
-        let StoredFleetGate::Faulted(fault) = self.fleet_gate.clone() else {
+        let StoredFleetGate::Faulted(fault) = self.fleet_gate else {
             return Err("fleet is not in the faulted state".into());
         };
-        let active = self
-            .events
-            .iter()
-            .filter_map(|(id, event)| {
-                matches!(
-                    event.status,
-                    StoredStatus::Queued
-                        | StoredStatus::Delivered { .. }
-                        | StoredStatus::ActionInFlight { .. }
-                )
-                .then_some(*id)
-            })
-            .collect::<Vec<_>>();
-        for event_id in active {
-            let (sid, status) = {
-                let event = self
-                    .events
-                    .get(&event_id)
-                    .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
-                (event.sid.clone(), event.status.clone())
-            };
-            if matches!(status, StoredStatus::Queued) {
-                self.remove_ready(&sid, event_id)?;
-            }
-            let event = self
-                .events
-                .get_mut(&event_id)
-                .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
-            event.status = match status {
-                StoredStatus::Queued | StoredStatus::Delivered { .. } => {
-                    StoredStatus::ResolvedUnclaimed {
-                        resolution: Resolution::Paused,
-                        resolved_at_ms: at_ms,
-                        reason: "fleet fault clear revoked pre-baseline work".into(),
-                    }
-                }
-                StoredStatus::ActionInFlight { token, .. } => StoredStatus::InDoubt {
-                    token: Some(token),
-                    reason: "fleet fault clear found an action intent in flight".into(),
-                    at_ms,
-                },
-                StoredStatus::Resolved { .. }
-                | StoredStatus::ResolvedUnclaimed { .. }
-                | StoredStatus::InDoubt { .. } => {
-                    return Err("fault clear selected a terminal event".into());
-                }
-            };
-        }
+        self.revoke_active(
+            |_| true,
+            at_ms,
+            "fleet fault clear revoked pre-baseline work",
+            "fleet fault clear found an action intent in flight",
+        )?;
         if !self.ready_by_sid.is_empty() || !self.fair_sids.is_empty() {
             return Err("fault clear left a nonempty ready queue".into());
         }
@@ -1835,17 +1835,7 @@ impl QueueState {
         if !self.managed.contains(&event.sid) {
             return Err(format!("baseline sid {:?} is unmanaged", event.sid));
         }
-        let key = (event.sid.clone(), event.generation);
-        if self.generations.contains_key(&key) || self.events.contains_key(&event.id) {
-            return Err("fault-clear baseline duplicates an event identity".into());
-        }
-        self.next_event_id = self
-            .next_event_id
-            .checked_add(1)
-            .ok_or_else(|| "event id space exhausted".to_string())?;
-        self.generations.insert(key, event.id);
-        self.events.insert(event.id, event.clone());
-        self.add_ready(&event.sid, event.id)?;
+        self.insert_fresh(event, "fault-clear baseline")?;
         let StoredFleetGate::RebaselineRequired { pending_sids, .. } = &mut self.fleet_gate else {
             return Err("fleet baseline gate changed during one transition".into());
         };
@@ -1905,14 +1895,7 @@ impl QueueState {
                 if !pending_sids.is_subset(&self.managed) {
                     return Err("fault-clear baseline roster exceeds managed allowlist".into());
                 }
-                for event in self.events.values().filter(|event| {
-                    matches!(
-                        event.status,
-                        StoredStatus::Queued
-                            | StoredStatus::Delivered { .. }
-                            | StoredStatus::ActionInFlight { .. }
-                    )
-                }) {
+                for event in self.events.values().filter(|event| event.status.active()) {
                     if !matches!(event.status, StoredStatus::Queued)
                         || event.condition != AttentionCondition::Changed
                         || pending_sids.contains(&event.sid)
@@ -1941,12 +1924,8 @@ impl QueueState {
             if event.id != *id {
                 return Err(format!("event-map key {} differs from payload", id.get()));
             }
-            if matches!(
-                event.status,
-                StoredStatus::Queued
-                    | StoredStatus::Delivered { .. }
-                    | StoredStatus::ActionInFlight { .. }
-            ) && self.generations.get(&(event.sid.clone(), event.generation)) != Some(id)
+            if event.status.active()
+                && self.generations.get(&(event.sid.clone(), event.generation)) != Some(id)
             {
                 return Err(format!(
                     "unresolved event {} is absent from generation index",
@@ -1959,13 +1938,7 @@ impl QueueState {
             {
                 return Err(format!("event {} has malformed escalation state", id.get()));
             }
-            if matches!(
-                event.status,
-                StoredStatus::Queued
-                    | StoredStatus::Delivered { .. }
-                    | StoredStatus::ActionInFlight { .. }
-            ) && !self.managed.contains(&event.sid)
-            {
+            if event.status.active() && !self.managed.contains(&event.sid) {
                 return Err(format!("active event {} has unmanaged sid", id.get()));
             }
             match &event.status {
@@ -2180,66 +2153,19 @@ impl WalRecord {
                 state.advance_epoch(*epoch, *redelivery_cap)?;
             }
             Self::Manage { sid } => {
-                state
-                    .fleet_gate
-                    .require_healthy()
-                    .map_err(|error| error.to_string())?;
-                if state.managed.len() >= MAX_MANAGED_SIDS {
-                    return Err(format!(
-                        "managed-session count reached hard bound {MAX_MANAGED_SIDS}"
-                    ));
-                }
-                if !state.managed.insert(sid.clone()) {
-                    return Err(format!("sid {sid:?} is already managed"));
-                }
+                state.require_healthy()?;
+                state.manage(sid)?;
             }
             Self::Unmanage { sid, at_ms } => {
                 if !state.managed.remove(sid) {
                     return Err(format!("sid {sid:?} is not managed"));
                 }
-                let affected: Vec<EventId> = state
-                    .events
-                    .iter()
-                    .filter_map(|(id, event)| {
-                        (event.sid == *sid
-                            && matches!(
-                                event.status,
-                                StoredStatus::Queued
-                                    | StoredStatus::Delivered { .. }
-                                    | StoredStatus::ActionInFlight { .. }
-                            ))
-                        .then_some(*id)
-                    })
-                    .collect();
-                for event_id in affected {
-                    let queued = matches!(
-                        state.events.get(&event_id).map(|event| &event.status),
-                        Some(StoredStatus::Queued)
-                    );
-                    if queued {
-                        state.remove_ready(sid, event_id)?;
-                    }
-                    let event = state
-                        .events
-                        .get_mut(&event_id)
-                        .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
-                    event.status = match &event.status {
-                        StoredStatus::Queued | StoredStatus::Delivered { .. } => {
-                            StoredStatus::ResolvedUnclaimed {
-                                resolution: Resolution::Paused,
-                                resolved_at_ms: *at_ms,
-                                reason: "session removed from managed allowlist before actuation"
-                                    .into(),
-                            }
-                        }
-                        StoredStatus::ActionInFlight { token, .. } => StoredStatus::InDoubt {
-                            token: Some(token.clone()),
-                            reason: "session removed with an action in flight".into(),
-                            at_ms: *at_ms,
-                        },
-                        _ => return Err("unmanage selected a terminal event".into()),
-                    };
-                }
+                state.revoke_active(
+                    |event| event.sid == *sid,
+                    *at_ms,
+                    "session removed from managed allowlist before actuation",
+                    "session removed with an action in flight",
+                )?;
                 // Retire exact-generation idempotency keys at the management
                 // boundary. Historical events remain available for bounded
                 // audit/idempotent acknowledgement, but re-managing the same
@@ -2254,24 +2180,15 @@ impl WalRecord {
                 }
             }
             Self::Enqueue { event } => {
-                state
-                    .fleet_gate
-                    .require_healthy()
-                    .map_err(|error| error.to_string())?;
+                state.require_healthy()?;
                 state.apply_initial_event(event)?;
             }
             Self::Coalesce {
                 event_id,
                 condition,
             } => {
-                state
-                    .fleet_gate
-                    .require_healthy()
-                    .map_err(|error| error.to_string())?;
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
+                state.require_healthy()?;
+                let event = state.event_mut(event_id)?;
                 if !matches!(event.status, StoredStatus::Queued) {
                     return Err(format!("event {} is not coalescible", event_id.get()));
                 }
@@ -2289,44 +2206,22 @@ impl WalRecord {
                 claim_epoch,
                 condition,
             } => {
-                state
-                    .fleet_gate
-                    .require_healthy()
-                    .map_err(|error| error.to_string())?;
-                let event = state
-                    .events
-                    .get(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
-                let StoredStatus::Delivered {
-                    token: current,
-                    claim_epoch: current_epoch,
-                    ..
-                } = &event.status
-                else {
-                    return Err(format!("event {} is not delivered", event_id.get()));
-                };
-                if !tokens_equal(current, token)
-                    || *current_epoch != *claim_epoch
-                    || *claim_epoch != state.durable_epoch
-                {
-                    return Err(format!(
-                        "event {} delivered-invalidation CAS is stale",
-                        event_id.get()
-                    ));
-                }
+                state.require_healthy()?;
+                let (event, _) = state.delivered_mut(
+                    event_id,
+                    token,
+                    "delivered-invalidation CAS is stale",
+                    |current_epoch, _| current_epoch == *claim_epoch,
+                )?;
                 if *condition <= event.condition {
                     return Err(format!(
                         "event {} delivered invalidation is regressive or a no-op",
                         event_id.get()
                     ));
                 }
-                let sid = event.sid.clone();
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
                 event.condition = *condition;
                 event.status = StoredStatus::Queued;
+                let sid = event.sid.clone();
                 state.add_ready(&sid, *event_id)?;
             }
             Self::Claim {
@@ -2336,10 +2231,7 @@ impl WalRecord {
                 claimed_at_ms,
                 expires_at_ms,
             } => {
-                state
-                    .fleet_gate
-                    .require_healthy()
-                    .map_err(|error| error.to_string())?;
+                state.require_healthy()?;
                 if *claim_epoch != state.durable_epoch {
                     return Err(format!(
                         "claim epoch {claim_epoch} does not equal durable epoch {}",
@@ -2349,19 +2241,11 @@ impl WalRecord {
                 if *expires_at_ms <= *claimed_at_ms {
                     return Err("claim expiry does not follow claim time".into());
                 }
-                let event = state
-                    .events
-                    .get(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
-                if !matches!(event.status, StoredStatus::Queued) {
+                if !matches!(state.event(event_id)?.status, StoredStatus::Queued) {
                     return Err(format!("event {} is not queued", event_id.get()));
                 }
                 state.claim_ready(*event_id)?;
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
-                event.status = StoredStatus::Delivered {
+                state.event_mut(event_id)?.status = StoredStatus::Delivered {
                     token: token.clone(),
                     claim_epoch: *claim_epoch,
                     claimed_at_ms: *claimed_at_ms,
@@ -2375,10 +2259,8 @@ impl WalRecord {
                 expires_at_ms,
                 cumulative_extension_ms,
             } => {
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
+                let durable_epoch = state.durable_epoch;
+                let event = state.event_mut(event_id)?;
                 let StoredStatus::Delivered {
                     token: current,
                     claim_epoch,
@@ -2390,7 +2272,7 @@ impl WalRecord {
                     return Err(format!("event {} is not delivered", event_id.get()));
                 };
                 if !tokens_equal(current, token)
-                    || *claim_epoch != state.durable_epoch
+                    || *claim_epoch != durable_epoch
                     || *expires_at_ms <= *current_expiry
                     || *cumulative_extension_ms <= *current_extension
                     || expires_at_ms - *current_expiry
@@ -2408,55 +2290,32 @@ impl WalRecord {
                 redelivery_count,
                 became_escalated,
             } => {
-                let event = state
-                    .events
-                    .get(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
-                let StoredStatus::Delivered {
-                    token: current,
-                    claim_epoch,
-                    expires_at_ms,
-                    ..
-                } = &event.status
-                else {
-                    return Err(format!("event {} is not delivered", event_id.get()));
-                };
-                if !tokens_equal(current, token)
-                    || *claim_epoch != state.durable_epoch
-                    || *at_ms < *expires_at_ms
-                {
-                    return Err(format!("event {} expiry CAS is invalid", event_id.get()));
-                }
-                let sid = event.sid.clone();
-                let already_escalated = event.escalated;
-                let old_count = event.redelivery_count;
-                if already_escalated {
-                    if *redelivery_count != old_count || !*became_escalated {
+                let (event, _) = state.delivered_mut(
+                    event_id,
+                    token,
+                    "expiry CAS is invalid",
+                    |_, expires_at_ms| *at_ms >= expires_at_ms,
+                )?;
+                if event.escalated {
+                    if *redelivery_count != event.redelivery_count || !*became_escalated {
                         return Err("escalated expiry record has invalid counters".into());
                     }
-                    let event = state
-                        .events
-                        .get_mut(event_id)
-                        .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
                     event.status = StoredStatus::InDoubt {
                         token: Some(token.clone()),
                         reason: "escalation delivery expired".into(),
                         at_ms: *at_ms,
                     };
                 } else {
-                    if *redelivery_count != old_count.saturating_add(1) {
+                    if *redelivery_count != event.redelivery_count.saturating_add(1) {
                         return Err("expiry did not increment redelivery count once".into());
                     }
-                    let event = state
-                        .events
-                        .get_mut(event_id)
-                        .ok_or_else(|| format!("event {} vanished", event_id.get()))?;
                     event.redelivery_count = *redelivery_count;
                     if *became_escalated {
                         event.escalated = true;
                         event.condition = AttentionCondition::Escalation;
                     }
                     event.status = StoredStatus::Queued;
+                    let sid = event.sid.clone();
                     state.add_ready(&sid, *event_id)?;
                 }
             }
@@ -2466,31 +2325,15 @@ impl WalRecord {
                 resolution,
                 resolved_at_ms,
             } => {
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
-                let StoredStatus::Delivered {
-                    token: current,
-                    claim_epoch,
-                    expires_at_ms,
-                    ..
-                } = &event.status
-                else {
-                    return Err(format!("event {} is not delivered", event_id.get()));
-                };
-                if !tokens_equal(current, token)
-                    || *claim_epoch != state.durable_epoch
-                    || *resolved_at_ms >= *expires_at_ms
-                {
-                    return Err(format!(
-                        "event {} resolution CAS is invalid",
-                        event_id.get()
-                    ));
-                }
+                let (event, claim_epoch) = state.delivered_mut(
+                    event_id,
+                    token,
+                    "resolution CAS is invalid",
+                    |_, expires_at_ms| *resolved_at_ms < expires_at_ms,
+                )?;
                 event.status = StoredStatus::Resolved {
                     token: token.clone(),
-                    claim_epoch: *claim_epoch,
+                    claim_epoch,
                     resolution: *resolution,
                     resolved_at_ms: *resolved_at_ms,
                     action: None,
@@ -2503,10 +2346,8 @@ impl WalRecord {
                 reason,
                 at_ms,
             } => {
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
+                let durable_epoch = state.durable_epoch;
+                let event = state.event_mut(event_id)?;
                 let StoredStatus::Resolved {
                     token: current,
                     claim_epoch,
@@ -2515,7 +2356,7 @@ impl WalRecord {
                 else {
                     return Err(format!("event {} is not resolved", event_id.get()));
                 };
-                if !tokens_equal(current, token) || *claim_epoch != state.durable_epoch {
+                if !tokens_equal(current, token) || *claim_epoch != durable_epoch {
                     return Err(format!("event {} conflict token is stale", event_id.get()));
                 }
                 event.status = StoredStatus::InDoubt {
@@ -2531,35 +2372,16 @@ impl WalRecord {
                 action_hash,
                 intent_at_ms,
             } => {
-                state
-                    .fleet_gate
-                    .require_healthy()
-                    .map_err(|error| error.to_string())?;
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
-                let StoredStatus::Delivered {
-                    token: current,
-                    claim_epoch,
-                    expires_at_ms,
-                    ..
-                } = &event.status
-                else {
-                    return Err(format!("event {} is not delivered", event_id.get()));
-                };
-                if !tokens_equal(current, token)
-                    || *claim_epoch != state.durable_epoch
-                    || *intent_at_ms >= *expires_at_ms
-                {
-                    return Err(format!(
-                        "event {} action-intent CAS is invalid",
-                        event_id.get()
-                    ));
-                }
+                state.require_healthy()?;
+                let (event, claim_epoch) = state.delivered_mut(
+                    event_id,
+                    token,
+                    "action-intent CAS is invalid",
+                    |_, expires_at_ms| *intent_at_ms < expires_at_ms,
+                )?;
                 event.status = StoredStatus::ActionInFlight {
                     token: token.clone(),
-                    claim_epoch: *claim_epoch,
+                    claim_epoch,
                     action_class: action_class.clone(),
                     action_hash: action_hash.clone(),
                     intent_at_ms: *intent_at_ms,
@@ -2573,10 +2395,8 @@ impl WalRecord {
                 resolution,
                 resolved_at_ms,
             } => {
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
+                let durable_epoch = state.durable_epoch;
+                let event = state.event_mut(event_id)?;
                 let StoredStatus::ActionInFlight {
                     token: current,
                     claim_epoch,
@@ -2588,7 +2408,7 @@ impl WalRecord {
                     return Err(format!("event {} has no action intent", event_id.get()));
                 };
                 if !tokens_equal(current, token)
-                    || *claim_epoch != state.durable_epoch
+                    || *claim_epoch != durable_epoch
                     || current_hash != action_hash
                 {
                     return Err(format!(
@@ -2616,10 +2436,8 @@ impl WalRecord {
                 reason,
                 at_ms,
             } => {
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
+                let durable_epoch = state.durable_epoch;
+                let event = state.event_mut(event_id)?;
                 let StoredStatus::ActionInFlight {
                     token: current,
                     claim_epoch,
@@ -2628,7 +2446,7 @@ impl WalRecord {
                 else {
                     return Err(format!("event {} has no action intent", event_id.get()));
                 };
-                if !tokens_equal(current, token) || *claim_epoch != state.durable_epoch {
+                if !tokens_equal(current, token) || *claim_epoch != durable_epoch {
                     return Err(format!("event {} action token is stale", event_id.get()));
                 }
                 event.status = StoredStatus::InDoubt {
@@ -2645,10 +2463,7 @@ impl WalRecord {
                 resolved_at_ms,
             } => {
                 let claim_epoch = state.durable_epoch;
-                let event = state
-                    .events
-                    .get_mut(event_id)
-                    .ok_or_else(|| format!("event {} does not exist", event_id.get()))?;
+                let event = state.event_mut(event_id)?;
                 let StoredStatus::InDoubt {
                     token: Some(current),
                     ..
@@ -2679,21 +2494,11 @@ impl WalRecord {
             Self::Rebaseline { event } => state.apply_rebaseline(event)?,
             Self::CompleteFaultClear { at_ms: _ } => state.complete_fault_clear()?,
             Self::ManageWithBaseline { event } => {
-                state
-                    .fleet_gate
-                    .require_healthy()
-                    .map_err(|error| error.to_string())?;
+                state.require_healthy()?;
                 if !event.condition.is_safe_manage_baseline() {
                     return Err("manage baseline condition is not an initial safe condition".into());
                 }
-                if state.managed.len() >= MAX_MANAGED_SIDS {
-                    return Err(format!(
-                        "managed-session count reached hard bound {MAX_MANAGED_SIDS}"
-                    ));
-                }
-                if !state.managed.insert(event.sid.clone()) {
-                    return Err(format!("sid {:?} is already managed", event.sid));
-                }
+                state.manage(&event.sid)?;
                 state.apply_initial_event(event)?;
             }
         }
@@ -2702,15 +2507,7 @@ impl WalRecord {
 }
 
 fn tokens_equal(left: &ClaimToken, right: &ClaimToken) -> bool {
-    left.0
-        .as_bytes()
-        .iter()
-        .zip(right.0.as_bytes())
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-        && left.0.len() == right.0.len()
+    aterm_digest::ct_eq(left.0.as_bytes(), right.0.as_bytes())
 }
 
 fn validate_action_class(value: &str) -> Result<(), OperatorError> {
@@ -2724,10 +2521,7 @@ fn validate_action_class(value: &str) -> Result<(), OperatorError> {
 }
 
 fn validate_action_hash(value: &str) -> Result<(), OperatorError> {
-    if value.len() != ACTION_HASH_HEX_LEN
-        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || value.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
+    if !aterm_codec::hex::is_lower(value, ACTION_HASH_HEX_LEN) {
         return Err(OperatorError::InvalidInput(
             "action hash must be a lowercase 32-byte SHA-256 hex digest".into(),
         ));
@@ -2770,6 +2564,22 @@ impl Encoder {
         self.byte(u8::from(generation.alternate_screen));
         self.u64(generation.content_seq);
         self.bytes.extend_from_slice(&generation.fingerprint);
+    }
+
+    fn fault(&mut self, fault: FleetFault) {
+        self.byte(fault.reason.to_tag());
+        self.u64(fault.fault_epoch);
+        self.u64(fault.latched_at_ms);
+    }
+
+    /// A fresh event's identity: all an `Enqueue`, `Rebaseline` or
+    /// `ManageWithBaseline` record carries, and how a checkpoint row opens.
+    fn event_body(&mut self, event: &StoredEvent) -> Result<(), OperatorError> {
+        self.u64(event.id.get());
+        self.string(&event.sid)?;
+        self.generation(event.generation);
+        self.byte(event.condition.to_tag());
+        Ok(())
     }
 }
 
@@ -2865,6 +2675,38 @@ impl<'a> Decoder<'a> {
         })
     }
 
+    fn sid(&mut self) -> Result<String, String> {
+        let sid = self.string(MAX_SID_BYTES, false, "sid")?;
+        validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
+        Ok(sid)
+    }
+
+    /// A bounded free-text reason or note, validated as evidence text.
+    fn reason(&mut self, label: &str) -> Result<String, String> {
+        let reason = self.string(MAX_REASON_BYTES, false, label)?;
+        validate_evidence(label, &reason, MAX_REASON_BYTES, false)
+            .map_err(|error| error.to_string())?;
+        Ok(reason)
+    }
+
+    fn fault(&mut self) -> Result<FleetFault, String> {
+        Ok(FleetFault {
+            reason: FleetFaultReason::from_tag(self.byte()?)?,
+            fault_epoch: self.u64()?,
+            latched_at_ms: self.u64()?,
+        })
+    }
+
+    /// The fresh event [`Encoder::event_body`] wrote.
+    fn fresh_event(&mut self) -> Result<StoredEvent, String> {
+        let id = self.event_id()?;
+        let sid = self.string(MAX_SID_BYTES, false, "sid")?;
+        let generation = self.generation()?;
+        let condition = AttentionCondition::from_tag(self.byte()?)?;
+        validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
+        Ok(StoredEvent::fresh(id, sid, generation, condition))
+    }
+
     fn finish(self) -> Result<(), String> {
         if self.cursor == self.bytes.len() {
             Ok(())
@@ -2892,12 +2734,9 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, OperatorError> {
             encoder.string(sid)?;
             encoder.u64(*at_ms);
         }
-        WalRecord::Enqueue { event } => {
-            encoder.u64(event.id.get());
-            encoder.string(&event.sid)?;
-            encoder.generation(event.generation);
-            encoder.byte(event.condition.to_tag());
-        }
+        WalRecord::Enqueue { event }
+        | WalRecord::Rebaseline { event }
+        | WalRecord::ManageWithBaseline { event } => encoder.event_body(event)?,
         WalRecord::Coalesce {
             event_id,
             condition,
@@ -3027,25 +2866,9 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, OperatorError> {
             encoder.u64(*claim_epoch);
             encoder.byte(condition.to_tag());
         }
-        WalRecord::LatchFleetFault { fault } => {
-            encoder.byte(fault.reason.to_tag());
-            encoder.u64(fault.fault_epoch);
-            encoder.u64(fault.latched_at_ms);
-        }
+        WalRecord::LatchFleetFault { fault } => encoder.fault(*fault),
         WalRecord::BeginFaultClear { at_ms } | WalRecord::CompleteFaultClear { at_ms } => {
             encoder.u64(*at_ms)
-        }
-        WalRecord::Rebaseline { event } => {
-            encoder.u64(event.id.get());
-            encoder.string(&event.sid)?;
-            encoder.generation(event.generation);
-            encoder.byte(event.condition.to_tag());
-        }
-        WalRecord::ManageWithBaseline { event } => {
-            encoder.u64(event.id.get());
-            encoder.string(&event.sid)?;
-            encoder.generation(event.generation);
-            encoder.byte(event.condition.to_tag());
         }
     }
     if encoder.bytes.len() > MAX_WAL_PAYLOAD_BYTES {
@@ -3063,37 +2886,16 @@ fn decode_record(kind: u16, payload: &[u8]) -> Result<WalRecord, String> {
             epoch: decoder.u64()?,
             redelivery_cap: decoder.u32()?,
         },
-        2 => {
-            let sid = decoder.string(MAX_SID_BYTES, false, "sid")?;
-            validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
-            WalRecord::Manage { sid }
-        }
-        3 => {
-            let sid = decoder.string(MAX_SID_BYTES, false, "sid")?;
-            validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
-            WalRecord::Unmanage {
-                sid,
-                at_ms: decoder.u64()?,
-            }
-        }
-        4 => {
-            let id = decoder.event_id()?;
-            let sid = decoder.string(MAX_SID_BYTES, false, "sid")?;
-            let generation = decoder.generation()?;
-            let condition = AttentionCondition::from_tag(decoder.byte()?)?;
-            validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
-            WalRecord::Enqueue {
-                event: StoredEvent {
-                    id,
-                    sid,
-                    generation,
-                    condition,
-                    redelivery_count: 0,
-                    escalated: false,
-                    status: StoredStatus::Queued,
-                },
-            }
-        }
+        2 => WalRecord::Manage {
+            sid: decoder.sid()?,
+        },
+        3 => WalRecord::Unmanage {
+            sid: decoder.sid()?,
+            at_ms: decoder.u64()?,
+        },
+        4 => WalRecord::Enqueue {
+            event: decoder.fresh_event()?,
+        },
         5 => {
             let event_id = decoder.event_id()?;
             let condition = AttentionCondition::from_tag(decoder.byte()?)?;
@@ -3128,19 +2930,12 @@ fn decode_record(kind: u16, payload: &[u8]) -> Result<WalRecord, String> {
             resolution: Resolution::from_tag(decoder.byte()?)?,
             resolved_at_ms: decoder.u64()?,
         },
-        10 => {
-            let event_id = decoder.event_id()?;
-            let token = decoder.token()?;
-            let reason = decoder.string(MAX_REASON_BYTES, false, "in-doubt reason")?;
-            validate_evidence("in-doubt reason", &reason, MAX_REASON_BYTES, false)
-                .map_err(|error| error.to_string())?;
-            WalRecord::Conflict {
-                event_id,
-                token,
-                reason,
-                at_ms: decoder.u64()?,
-            }
-        }
+        10 => WalRecord::Conflict {
+            event_id: decoder.event_id()?,
+            token: decoder.token()?,
+            reason: decoder.reason("in-doubt reason")?,
+            at_ms: decoder.u64()?,
+        },
         11 => {
             let event_id = decoder.event_id()?;
             let token = decoder.token()?;
@@ -3173,95 +2968,40 @@ fn decode_record(kind: u16, payload: &[u8]) -> Result<WalRecord, String> {
                 resolved_at_ms: decoder.u64()?,
             }
         }
-        13 => {
-            let event_id = decoder.event_id()?;
-            let token = decoder.token()?;
-            let reason = decoder.string(MAX_REASON_BYTES, false, "in-doubt reason")?;
-            validate_evidence("in-doubt reason", &reason, MAX_REASON_BYTES, false)
-                .map_err(|error| error.to_string())?;
-            WalRecord::MarkActionInDoubt {
-                event_id,
-                token,
-                reason,
-                at_ms: decoder.u64()?,
-            }
-        }
-        14 => {
-            let event_id = decoder.event_id()?;
-            let token = decoder.token()?;
-            let resolution = Resolution::from_tag(decoder.byte()?)?;
-            let note = decoder.string(MAX_REASON_BYTES, false, "human reconciliation note")?;
-            validate_evidence("human reconciliation note", &note, MAX_REASON_BYTES, false)
-                .map_err(|error| error.to_string())?;
-            WalRecord::ReconcileInDoubt {
-                event_id,
-                token,
-                resolution,
-                note,
-                resolved_at_ms: decoder.u64()?,
-            }
-        }
-        15 => {
-            let event_id = decoder.event_id()?;
-            let token = decoder.token()?;
-            let claim_epoch = decoder.u64()?;
-            let condition = AttentionCondition::from_tag(decoder.byte()?)?;
-            WalRecord::InvalidateDelivered {
-                event_id,
-                token,
-                claim_epoch,
-                condition,
-            }
-        }
+        13 => WalRecord::MarkActionInDoubt {
+            event_id: decoder.event_id()?,
+            token: decoder.token()?,
+            reason: decoder.reason("in-doubt reason")?,
+            at_ms: decoder.u64()?,
+        },
+        14 => WalRecord::ReconcileInDoubt {
+            event_id: decoder.event_id()?,
+            token: decoder.token()?,
+            resolution: Resolution::from_tag(decoder.byte()?)?,
+            note: decoder.reason("human reconciliation note")?,
+            resolved_at_ms: decoder.u64()?,
+        },
+        15 => WalRecord::InvalidateDelivered {
+            event_id: decoder.event_id()?,
+            token: decoder.token()?,
+            claim_epoch: decoder.u64()?,
+            condition: AttentionCondition::from_tag(decoder.byte()?)?,
+        },
         16 => WalRecord::LatchFleetFault {
-            fault: FleetFault {
-                reason: FleetFaultReason::from_tag(decoder.byte()?)?,
-                fault_epoch: decoder.u64()?,
-                latched_at_ms: decoder.u64()?,
-            },
+            fault: decoder.fault()?,
         },
         17 => WalRecord::BeginFaultClear {
             at_ms: decoder.u64()?,
         },
-        18 => {
-            let id = decoder.event_id()?;
-            let sid = decoder.string(MAX_SID_BYTES, false, "sid")?;
-            let generation = decoder.generation()?;
-            let condition = AttentionCondition::from_tag(decoder.byte()?)?;
-            validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
-            WalRecord::Rebaseline {
-                event: StoredEvent {
-                    id,
-                    sid,
-                    generation,
-                    condition,
-                    redelivery_count: 0,
-                    escalated: false,
-                    status: StoredStatus::Queued,
-                },
-            }
-        }
+        18 => WalRecord::Rebaseline {
+            event: decoder.fresh_event()?,
+        },
         19 => WalRecord::CompleteFaultClear {
             at_ms: decoder.u64()?,
         },
-        20 => {
-            let id = decoder.event_id()?;
-            let sid = decoder.string(MAX_SID_BYTES, false, "sid")?;
-            let generation = decoder.generation()?;
-            let condition = AttentionCondition::from_tag(decoder.byte()?)?;
-            validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
-            WalRecord::ManageWithBaseline {
-                event: StoredEvent {
-                    id,
-                    sid,
-                    generation,
-                    condition,
-                    redelivery_count: 0,
-                    escalated: false,
-                    status: StoredStatus::Queued,
-                },
-            }
-        }
+        20 => WalRecord::ManageWithBaseline {
+            event: decoder.fresh_event()?,
+        },
         _ => return Err(format!("unknown WAL record kind {kind}")),
     };
     decoder.finish()?;
@@ -3399,14 +3139,10 @@ fn decode_checkpoint_status(decoder: &mut Decoder<'_>) -> Result<StoredStatus, S
             } else {
                 None
             };
-            let reconciliation_note = if decoder.boolean()? {
-                let note = decoder.string(MAX_REASON_BYTES, false, "reconciliation note")?;
-                validate_evidence("reconciliation note", &note, MAX_REASON_BYTES, false)
-                    .map_err(|error| error.to_string())?;
-                Some(note)
-            } else {
-                None
-            };
+            let reconciliation_note = decoder
+                .boolean()?
+                .then(|| decoder.reason("reconciliation note"))
+                .transpose()?;
             Ok(StoredStatus::Resolved {
                 token,
                 claim_epoch,
@@ -3416,45 +3152,18 @@ fn decode_checkpoint_status(decoder: &mut Decoder<'_>) -> Result<StoredStatus, S
                 reconciliation_note,
             })
         }
-        4 => {
-            let resolution = Resolution::from_tag(decoder.byte()?)?;
-            let resolved_at_ms = decoder.u64()?;
-            let reason = decoder.string(MAX_REASON_BYTES, false, "resolution reason")?;
-            validate_evidence("resolution reason", &reason, MAX_REASON_BYTES, false)
-                .map_err(|error| error.to_string())?;
-            Ok(StoredStatus::ResolvedUnclaimed {
-                resolution,
-                resolved_at_ms,
-                reason,
-            })
-        }
-        5 => {
-            let token = decoder.boolean()?.then(|| decoder.token()).transpose()?;
-            let reason = decoder.string(MAX_REASON_BYTES, false, "in-doubt reason")?;
-            validate_evidence("in-doubt reason", &reason, MAX_REASON_BYTES, false)
-                .map_err(|error| error.to_string())?;
-            Ok(StoredStatus::InDoubt {
-                token,
-                reason,
-                at_ms: decoder.u64()?,
-            })
-        }
+        4 => Ok(StoredStatus::ResolvedUnclaimed {
+            resolution: Resolution::from_tag(decoder.byte()?)?,
+            resolved_at_ms: decoder.u64()?,
+            reason: decoder.reason("resolution reason")?,
+        }),
+        5 => Ok(StoredStatus::InDoubt {
+            token: decoder.boolean()?.then(|| decoder.token()).transpose()?,
+            reason: decoder.reason("in-doubt reason")?,
+            at_ms: decoder.u64()?,
+        }),
         tag => Err(format!("unknown checkpoint status tag {tag}")),
     }
-}
-
-fn encode_checkpoint_fault(encoder: &mut Encoder, fault: FleetFault) {
-    encoder.byte(fault.reason.to_tag());
-    encoder.u64(fault.fault_epoch);
-    encoder.u64(fault.latched_at_ms);
-}
-
-fn decode_checkpoint_fault(decoder: &mut Decoder<'_>) -> Result<FleetFault, String> {
-    Ok(FleetFault {
-        reason: FleetFaultReason::from_tag(decoder.byte()?)?,
-        fault_epoch: decoder.u64()?,
-        latched_at_ms: decoder.u64()?,
-    })
 }
 
 fn encode_checkpoint_fleet_gate(
@@ -3465,14 +3174,14 @@ fn encode_checkpoint_fleet_gate(
         StoredFleetGate::Healthy => encoder.byte(0),
         StoredFleetGate::Faulted(fault) => {
             encoder.byte(1);
-            encode_checkpoint_fault(encoder, *fault);
+            encoder.fault(*fault);
         }
         StoredFleetGate::RebaselineRequired {
             fault,
             pending_sids,
         } => {
             encoder.byte(2);
-            encode_checkpoint_fault(encoder, *fault);
+            encoder.fault(*fault);
             encoder.u32(u32::try_from(pending_sids.len()).map_err(|_| {
                 OperatorError::InvariantViolation(
                     "fault-clear pending-session count does not fit u32".into(),
@@ -3492,9 +3201,9 @@ fn decode_checkpoint_fleet_gate(
 ) -> Result<StoredFleetGate, String> {
     match decoder.byte()? {
         0 => Ok(StoredFleetGate::Healthy),
-        1 => Ok(StoredFleetGate::Faulted(decode_checkpoint_fault(decoder)?)),
+        1 => Ok(StoredFleetGate::Faulted(decoder.fault()?)),
         2 => {
-            let fault = decode_checkpoint_fault(decoder)?;
+            let fault = decoder.fault()?;
             let pending_count = usize::try_from(decoder.u32()?)
                 .map_err(|_| "fault-clear pending-session count does not fit usize".to_string())?;
             if pending_count > MAX_MANAGED_SIDS || pending_count > managed.len() {
@@ -3538,10 +3247,7 @@ fn encode_checkpoint_payload(state: &QueueState) -> Result<Vec<u8>, OperatorErro
         OperatorError::InvariantViolation("checkpoint event count does not fit u32".into())
     })?);
     for event in state.events.values() {
-        encoder.u64(event.id.get());
-        encoder.string(&event.sid)?;
-        encoder.generation(event.generation);
-        encoder.byte(event.condition.to_tag());
+        encoder.event_body(event)?;
         encoder.u32(event.redelivery_count);
         encoder.byte(u8::from(event.escalated));
         encode_checkpoint_status(&mut encoder, &event.status)?;
@@ -3588,8 +3294,7 @@ fn decode_checkpoint_payload(
     }
     let mut managed = BTreeSet::new();
     for _ in 0..managed_count {
-        let sid = decoder.string(MAX_SID_BYTES, false, "sid")?;
-        validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
+        let sid = decoder.sid()?;
         if !managed.insert(sid) {
             return Err("checkpoint repeats a managed sid".into());
         }
@@ -3609,8 +3314,7 @@ fn decode_checkpoint_payload(
     let mut generations = BTreeMap::new();
     for _ in 0..event_count {
         let id = decoder.event_id()?;
-        let sid = decoder.string(MAX_SID_BYTES, false, "sid")?;
-        validate_text("sid", &sid, MAX_SID_BYTES, false).map_err(|error| error.to_string())?;
+        let sid = decoder.sid()?;
         let generation = decoder.generation()?;
         let condition = AttentionCondition::from_tag(decoder.byte()?)?;
         let redelivery_count = decoder.u32()?;
@@ -3706,16 +3410,7 @@ fn encode_checkpoint(state: &QueueState) -> Result<Vec<u8>, OperatorError> {
     header[8..16].copy_from_slice(&payload_len.to_le_bytes());
     header[16..24].copy_from_slice(&state.next_record_sequence.to_le_bytes());
     header[24..32].copy_from_slice(&state.durable_epoch.to_le_bytes());
-    let mut digest = Sha256::new();
-    digest.update(header);
-    digest.update(&payload);
-    let checksum = digest.finalize();
-    let mut bytes =
-        Vec::with_capacity(CHECKPOINT_HEADER_LEN + payload.len() + CHECKPOINT_CHECKSUM_LEN);
-    bytes.extend_from_slice(&header);
-    bytes.extend_from_slice(&payload);
-    bytes.extend_from_slice(&checksum);
-    Ok(bytes)
+    Ok(seal(&header, &payload))
 }
 
 fn corrupt_checkpoint(path: &Path, reason: impl Into<String>) -> OperatorError {
@@ -3878,15 +3573,7 @@ fn encode_frame(
     header[12..16].copy_from_slice(&0_u32.to_le_bytes());
     header[16..24].copy_from_slice(&sequence.to_le_bytes());
     header[24..32].copy_from_slice(&record.header_epoch(current_epoch).to_le_bytes());
-    let mut digest = Sha256::new();
-    digest.update(header);
-    digest.update(&payload);
-    let checksum = digest.finalize();
-    let mut frame = Vec::with_capacity(WAL_FRAME_OVERHEAD + payload.len());
-    frame.extend_from_slice(&header);
-    frame.extend_from_slice(&payload);
-    frame.extend_from_slice(&checksum);
-    Ok(frame)
+    Ok(seal(&header, &payload))
 }
 
 fn decode_header(header: &[u8; WAL_HEADER_LEN], offset: u64) -> Result<WalHeader, OperatorError> {
@@ -3984,19 +3671,40 @@ fn partial_header_plausible(bytes: &[u8], expected_sequence: u64) -> bool {
     true
 }
 
-fn checksum_matches(header: &[u8], payload: &[u8], actual: &[u8]) -> bool {
+/// SHA-256 over a sealed unit's header and payload: the checksum that closes
+/// every WAL frame and checkpoint.
+fn seal_checksum(header: &[u8], payload: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(header);
     digest.update(payload);
-    let expected = digest.finalize();
-    expected
-        .iter()
-        .zip(actual)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-        && actual.len() == WAL_CHECKSUM_LEN
+    digest.finalize()
+}
+
+/// `header`, `payload`, then their checksum: the one on-disk shape of a WAL
+/// frame and of a checkpoint.
+fn seal(header: &[u8], payload: &[u8]) -> Vec<u8> {
+    let checksum = seal_checksum(header, payload);
+    let mut sealed = Vec::with_capacity(header.len() + payload.len() + checksum.len());
+    sealed.extend_from_slice(header);
+    sealed.extend_from_slice(payload);
+    sealed.extend_from_slice(&checksum);
+    sealed
+}
+
+fn checksum_matches(header: &[u8], payload: &[u8], actual: &[u8]) -> bool {
+    aterm_digest::ct_eq(&seal_checksum(header, payload), actual)
+}
+
+/// Apply `record` as the next WAL record: its transition, the record-sequence
+/// cursor, then every whole-state invariant. The live commit and replay both
+/// take exactly this step, so a durable frame reopens to the state it made.
+fn replay_step(state: &mut QueueState, record: &WalRecord) -> Result<(), String> {
+    record.apply(state)?;
+    state.next_record_sequence = state
+        .next_record_sequence
+        .checked_add(1)
+        .ok_or_else(|| "record sequence exhausted".to_string())?;
+    state.validate()
 }
 
 fn recover_wal(
@@ -4124,18 +3832,7 @@ fn recover_wal(
                     ),
                 });
             }
-            record
-                .apply(&mut state)
-                .map_err(|reason| OperatorError::CorruptWal { offset, reason })?;
-            state.next_record_sequence =
-                state.next_record_sequence.checked_add(1).ok_or_else(|| {
-                    OperatorError::CorruptWal {
-                        offset,
-                        reason: "record sequence exhausted".into(),
-                    }
-                })?;
-            state
-                .validate()
+            replay_step(&mut state, &record)
                 .map_err(|reason| OperatorError::CorruptWal { offset, reason })?;
         }
         offset = offset
@@ -4156,7 +3853,7 @@ fn recover_wal(
 
     if repaired {
         file.set_len(offset)?;
-        file.sync_all()?;
+        crate::durable::sync_all(file)?;
     }
     file.seek(SeekFrom::Start(offset))?;
     state
@@ -4240,7 +3937,7 @@ fn compact_live(live: &mut LiveState) -> Result<(), OperatorError> {
     remove_pending_checkpoint(&pending_path)?;
     let mut pending = create_private_new_file(&pending_path)?;
     pending.write_all(&bytes)?;
-    pending.sync_all()?;
+    crate::durable::sync_all(&pending)?;
 
     let final_path = live.directory.join(format!(
         "{CHECKPOINT_PREFIX}{}",
@@ -4258,7 +3955,7 @@ fn compact_live(live: &mut LiveState) -> Result<(), OperatorError> {
     // The checkpoint is now authoritative. If a crash happens before or during
     // truncation, recovery verifies and skips any covered WAL prefix by sequence.
     live.wal.set_len(0)?;
-    live.wal.sync_all()?;
+    crate::durable::sync_all(&live.wal)?;
     live.wal.seek(SeekFrom::Start(0))?;
     live.wal_len = 0;
     live.state = projected;
@@ -4283,14 +3980,7 @@ fn commit_record(
         return Err(OperatorError::WalPoisoned);
     }
     let mut next = live.state.clone();
-    record
-        .apply(&mut next)
-        .map_err(OperatorError::InvariantViolation)?;
-    next.next_record_sequence = next
-        .next_record_sequence
-        .checked_add(1)
-        .ok_or_else(|| OperatorError::InvariantViolation("record sequence exhausted".into()))?;
-    next.validate().map_err(OperatorError::InvariantViolation)?;
+    replay_step(&mut next, record).map_err(OperatorError::InvariantViolation)?;
     let frame = encode_frame(
         record,
         live.state.next_record_sequence,
@@ -4325,14 +4015,7 @@ fn commit_record(
         // using the pre-compaction clone here would resurrect pruned history in
         // memory and make live state diverge from reopen.
         next = live.state.clone();
-        record
-            .apply(&mut next)
-            .map_err(OperatorError::InvariantViolation)?;
-        next.next_record_sequence = next
-            .next_record_sequence
-            .checked_add(1)
-            .ok_or_else(|| OperatorError::InvariantViolation("record sequence exhausted".into()))?;
-        next.validate().map_err(OperatorError::InvariantViolation)?;
+        replay_step(&mut next, record).map_err(OperatorError::InvariantViolation)?;
         new_len = frame_len;
     }
     if new_len > config.max_wal_bytes {
@@ -4343,7 +4026,7 @@ fn commit_record(
     let write_result = (|| -> io::Result<()> {
         live.wal.seek(SeekFrom::Start(live.wal_len))?;
         live.wal.write_all(&frame)?;
-        live.wal.sync_data()?;
+        crate::durable::sync_data(&live.wal)?;
         Ok(())
     })();
     if let Err(error) = write_result {
@@ -4377,16 +4060,13 @@ impl DurableQueue {
         run_epoch: u64,
         config: QueueConfig,
     ) -> Result<Self, OperatorError> {
-        Self::open_with_report(directory, run_epoch, config).map(|(queue, _)| queue)
-    }
-
-    /// Open a queue and return the recovery facts observed before the new epoch.
-    pub fn open_with_report(
-        directory: impl AsRef<Path>,
-        run_epoch: u64,
-        config: QueueConfig,
-    ) -> Result<(Self, RecoveryReport), OperatorError> {
-        Self::open_internal(directory.as_ref(), Some(run_epoch), config)
+        Self::open_internal(
+            directory.as_ref(),
+            Some(run_epoch),
+            config,
+            Arc::new(AuthorityClock::process_local()),
+        )
+        .map(|(queue, _)| queue)
     }
 
     /// Open a queue while atomically choosing the next durable run epoch.
@@ -4394,23 +4074,15 @@ impl DurableQueue {
         directory: impl AsRef<Path>,
         config: QueueConfig,
     ) -> Result<(Self, RecoveryReport), OperatorError> {
-        Self::open_internal(directory.as_ref(), None, config)
-    }
-
-    fn open_internal(
-        directory: &Path,
-        requested_epoch: Option<u64>,
-        config: QueueConfig,
-    ) -> Result<(Self, RecoveryReport), OperatorError> {
-        Self::open_internal_with_clock(
-            directory,
-            requested_epoch,
+        Self::open_internal(
+            directory.as_ref(),
+            None,
             config,
             Arc::new(AuthorityClock::process_local()),
         )
     }
 
-    fn open_internal_with_clock(
+    fn open_internal(
         directory: &Path,
         requested_epoch: Option<u64>,
         config: QueueConfig,
@@ -4518,13 +4190,11 @@ impl DurableQueue {
         self.shared.recovery
     }
 
-    /// Synchronously write and sync the independent fail-closed marker without
-    /// acquiring the queue's live-state mutex.
-    ///
-    /// This is the shutdown/last-resort path for a worker that may itself be
-    /// wedged while holding that mutex. It may block on filesystem I/O, but it
-    /// never waits for `LiveState`; the next open converts the marker into the
-    /// ordinary durable fleet-fault transition before returning a usable handle.
+    /// Write and sync the independent fail-closed marker without acquiring the
+    /// queue's live-state mutex: the last-resort path for a worker that may be
+    /// wedged holding it. It may block on filesystem I/O but never waits for
+    /// `LiveState`; the next open converts the marker into the durable
+    /// fleet-fault transition before returning a usable handle.
     pub fn latch_fault_marker_without_live(
         &self,
         reason: FleetFaultReason,
@@ -4552,13 +4222,10 @@ impl DurableQueue {
         })
     }
 
-    /// Atomically and without parking validate the exact durable action intent
-    /// used by the host's final egress gate.
-    ///
-    /// The host additionally holds its actuator gate across this check and the
-    /// bounded sink write, serializing host fault/unmanage operations with the
-    /// actual terminal mutation. Queue contention is a safe `Busy` refusal;
-    /// this method never waits behind observer WAL I/O.
+    /// Validate, without parking, the exact durable action intent used by the
+    /// host's final egress gate. The host holds its actuator gate across this
+    /// check and the bounded sink write; queue contention is a safe `Busy`
+    /// refusal, never a wait behind observer WAL I/O.
     pub fn try_validate_action_permit(
         &self,
         event_id: EventId,
@@ -4745,16 +4412,8 @@ impl DurableQueue {
                 capacity: self.shared.config.capacity,
             });
         }
-        let id = EventId(live.state.next_event_id);
-        let stored = StoredEvent {
-            id,
-            sid: event.sid,
-            generation: event.generation,
-            condition: event.condition,
-            redelivery_count: 0,
-            escalated: false,
-            status: StoredStatus::Queued,
-        };
+        let stored = live.state.next_fresh_event(event);
+        let id = stored.id;
         commit_record(
             &mut live,
             &self.shared.config,
@@ -4812,13 +4471,10 @@ impl DurableQueue {
         Ok(())
     }
 
-    /// Persistently admit one session together with its first exact safe
-    /// baseline as one WAL transition.
-    ///
-    /// `Ok(None)` means the SID was already managed and no new baseline was
-    /// written. On every successful new admission, the authorization and its
-    /// exact generation either both replay or neither does; an ambiguous WAL
-    /// outcome poisons the handle rather than attempting a compensating unmanage.
+    /// Persistently admit one session with its first exact safe baseline as one
+    /// WAL transition. `Ok(None)` means the SID was already managed. The
+    /// authorization and its generation replay together or not at all; an
+    /// ambiguous WAL outcome poisons the handle rather than compensating.
     pub fn manage_with_baseline(&self, event: NewEvent) -> Result<Option<EventId>, OperatorError> {
         event.validate()?;
         if !event.condition.is_safe_manage_baseline() {
@@ -4842,16 +4498,8 @@ impl DurableQueue {
                 capacity: self.shared.config.capacity,
             });
         }
-        let id = EventId(live.state.next_event_id);
-        let stored = StoredEvent {
-            id,
-            sid: event.sid,
-            generation: event.generation,
-            condition: event.condition,
-            redelivery_count: 0,
-            escalated: false,
-            status: StoredStatus::Queued,
-        };
+        let stored = live.state.next_fresh_event(event);
+        let id = stored.id;
         commit_record(
             &mut live,
             &self.shared.config,
@@ -4980,16 +4628,8 @@ impl DurableQueue {
                 capacity: self.shared.config.capacity,
             });
         }
-        let id = EventId(live.state.next_event_id);
-        let stored = StoredEvent {
-            id,
-            sid: event.sid,
-            generation: event.generation,
-            condition: event.condition,
-            redelivery_count: 0,
-            escalated: false,
-            status: StoredStatus::Queued,
-        };
+        let stored = live.state.next_fresh_event(event);
+        let id = stored.id;
         commit_record(
             &mut live,
             &self.shared.config,
@@ -5345,14 +4985,11 @@ impl DurableQueue {
         }
     }
 
-    /// Human-only reconciliation of a token-scoped in-doubt event.
-    ///
-    /// This is deliberately separate from [`Self::ack`] and the autonomous
-    /// actuator transaction. A human may choose any terminal resolution after
-    /// inspecting external evidence; choosing [`Resolution::Acted`] records the
-    /// human's assertion that the ambiguous submission did occur. It never
-    /// authorizes the operator to replay that action. `note` is mandatory and is
-    /// persisted with the resolution as audit evidence.
+    /// Human-only reconciliation of a token-scoped in-doubt event, separate from
+    /// [`Self::ack`] and the autonomous actuator. A human may choose any terminal
+    /// resolution after inspecting external evidence; [`Resolution::Acted`]
+    /// records their assertion that the submission occurred and never authorizes
+    /// a replay. `note` is mandatory and persisted as audit evidence.
     pub fn reconcile_in_doubt(
         &self,
         event_id: EventId,
@@ -5544,11 +5181,6 @@ impl DurableQueue {
             StoredStatus::Delivered { .. } => Err(OperatorError::ActionMismatch(event_id)),
             StoredStatus::Queued => Err(OperatorError::StaleClaim(event_id)),
         }
-    }
-
-    /// Snapshot one event by durable identifier.
-    pub fn status(&self, event_id: EventId) -> Result<EventSnapshot, OperatorError> {
-        self.snapshot(event_id)
     }
 
     /// Snapshot one event by durable identifier.
@@ -5771,15 +5403,7 @@ mod tests {
         header[8..16].copy_from_slice(&payload_len.to_le_bytes());
         header[16..24].copy_from_slice(&state.next_record_sequence.to_le_bytes());
         header[24..32].copy_from_slice(&state.durable_epoch.to_le_bytes());
-        let mut digest = Sha256::new();
-        digest.update(header);
-        digest.update(&payload);
-        let checksum = digest.finalize();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&header);
-        bytes.extend_from_slice(&payload);
-        bytes.extend_from_slice(&checksum);
-        bytes
+        seal(&header, &payload)
     }
 
     #[test]
@@ -5788,8 +5412,7 @@ mod tests {
         let ticks = Arc::new(ManualTicks::new(100));
         let clock = Arc::new(AuthorityClock::injected(ticks.clone()));
         let (queue, _) =
-            DurableQueue::open_internal_with_clock(&directory.0, Some(1), fast_config(), clock)
-                .unwrap();
+            DurableQueue::open_internal(&directory.0, Some(1), fast_config(), clock).unwrap();
         queue.manage_sid("a").unwrap();
         let id = enqueued_id(
             queue
@@ -5912,7 +5535,7 @@ mod tests {
         // and skipped, not applied twice.
         fs::write(directory.0.join(WAL_FILE_NAME), old_wal).unwrap();
         let reopened = DurableQueue::open(&directory.0, 2, config.clone()).unwrap();
-        assert_eq!(reopened.status(id).unwrap().id, id);
+        assert_eq!(reopened.snapshot(id).unwrap().id, id);
         drop(reopened);
 
         // A pre-publish temporary is never authoritative and may be abandoned.
@@ -5922,7 +5545,7 @@ mod tests {
         )
         .unwrap();
         let reopened = DurableQueue::open(&directory.0, 3, config.clone()).unwrap();
-        assert_eq!(reopened.status(id).unwrap().id, id);
+        assert_eq!(reopened.snapshot(id).unwrap().id, id);
         drop(reopened);
 
         let partial_final = directory
@@ -6096,11 +5719,11 @@ mod tests {
             vec!["a".to_string(), "b".to_string()]
         );
         assert!(matches!(
-            queue.status(action_id).unwrap().status,
+            queue.snapshot(action_id).unwrap().status,
             EventStatus::InDoubt { .. }
         ));
         assert!(matches!(
-            queue.status(delivered_id).unwrap().status,
+            queue.snapshot(delivered_id).unwrap().status,
             EventStatus::ResolvedUnclaimed {
                 resolution: Resolution::Paused,
                 ..
@@ -6257,21 +5880,9 @@ mod tests {
         ));
     }
 
-    /// The marker is written while another thread HOLDS the live-state mutex,
-    /// and the lock is let go only after the writer reports: a writer that
-    /// finishes at all proves it never waited on that mutex, and the pass
-    /// ends at that completion, not on a clock.
-    ///
-    /// THE BOUND IS A HANG DETECTOR, NOT A LATENCY CLAIM (2026-09-25). The
-    /// write is a create, a truncating write and two `sync_all`s (file, then
-    /// directory), which on macOS are `F_FULLFSYNC` drive-cache flushes. The
-    /// same call measured 2.9-5.2 s on a contended disk in aterm-gui's
-    /// shutdown-timeout test (72cbf0601), and here it also runs beside this
-    /// module's durable-queue tests flushing their WALs in parallel, so the
-    /// old 2 s bound could fail a correct product. No observable tells a
-    /// writer parked on the mutex from one parked in the flush, so the bound
-    /// can only name the deadlock a regression makes; 60 s names it as surely
-    /// as 2 s did, and a pass never waits for it.
+    /// The marker write completes while another thread holds the live-state
+    /// mutex. The 60 s bound is a hang detector (the write includes
+    /// durability flushes), not a latency claim.
     #[test]
     fn operator_fault_marker_bypasses_held_live_mutex() {
         let directory = TestDir::new("fault-marker-with-held-live");
@@ -6469,14 +6080,6 @@ mod tests {
     }
 
     #[test]
-    fn operator_defaults_pin_delivery_policy() {
-        assert_eq!(DEFAULT_VISIBILITY_TIMEOUT, Duration::from_secs(120));
-        assert_eq!(DEFAULT_MAX_CUMULATIVE_EXTENSION, Duration::from_secs(600));
-        assert_eq!(DEFAULT_REDELIVERY_CAP, 3);
-        assert_eq!(QueueConfig::default().capacity, 1024);
-    }
-
-    #[test]
     fn operator_manage_with_baseline_is_atomic_across_failure_and_reopen() {
         let failed = TestDir::new("manage-baseline-definite-failure");
         let mut capacity_one = fast_config();
@@ -6558,7 +6161,7 @@ mod tests {
 
         let reopened = DurableQueue::open(&ambiguous.0, 2, fast_config()).unwrap();
         assert!(reopened.is_managed("b").unwrap());
-        let baseline = reopened.status(event_id).unwrap();
+        let baseline = reopened.snapshot(event_id).unwrap();
         assert_eq!(baseline.sid, "b");
         assert_eq!(baseline.condition, AttentionCondition::Changed);
         assert!(matches!(baseline.status, EventStatus::Queued));
@@ -6583,7 +6186,7 @@ mod tests {
             .ack_at(approval_id, &approval.token, Resolution::NoAction, 11)
             .unwrap();
         assert_eq!(
-            queue.status(approval_id).unwrap().condition,
+            queue.snapshot(approval_id).unwrap().condition,
             AttentionCondition::ApprovalRequired
         );
 
@@ -6598,7 +6201,7 @@ mod tests {
             .ack_at(exit_id, &exited.token, Resolution::NoAction, 13)
             .unwrap();
         assert_eq!(
-            queue.status(exit_id).unwrap().condition,
+            queue.snapshot(exit_id).unwrap().condition,
             AttentionCondition::SessionExited
         );
 
@@ -6631,7 +6234,7 @@ mod tests {
         let claim = queue.claim_at(10).unwrap().unwrap();
         assert!(queue.unmanage_sid_at("sid-a", 11).unwrap());
         assert!(matches!(
-            queue.status(id).unwrap().status,
+            queue.snapshot(id).unwrap().status,
             EventStatus::ResolvedUnclaimed {
                 resolution: Resolution::Paused,
                 ..
@@ -6646,7 +6249,7 @@ mod tests {
         let reopened = DurableQueue::open(&directory.0, 2, fast_config()).unwrap();
         assert!(!reopened.is_managed("sid-a").unwrap());
         assert!(matches!(
-            reopened.status(id).unwrap().status,
+            reopened.snapshot(id).unwrap().status,
             EventStatus::ResolvedUnclaimed {
                 resolution: Resolution::Paused,
                 ..
@@ -6685,7 +6288,7 @@ mod tests {
             }
         );
         assert_eq!(
-            queue.status(first).unwrap().condition,
+            queue.snapshot(first).unwrap().condition,
             AttentionCondition::ApprovalRequired
         );
         let second = enqueued_id(
@@ -6735,7 +6338,7 @@ mod tests {
                 strengthened: true,
             }
         );
-        let invalidated = queue.status(id).unwrap();
+        let invalidated = queue.snapshot(id).unwrap();
         assert_eq!(invalidated.condition, AttentionCondition::ApprovalRequired);
         assert!(matches!(invalidated.status, EventStatus::Queued));
         assert!(matches!(
@@ -6765,7 +6368,7 @@ mod tests {
                 ))
                 .unwrap(),
         );
-        assert_eq!(queue.status(id).unwrap().generation, generation);
+        assert_eq!(queue.snapshot(id).unwrap().generation, generation);
         let wal = fs::read(directory.0.join(WAL_FILE_NAME)).unwrap();
         assert!(
             !wal.windows(canary.len())
@@ -6890,7 +6493,7 @@ mod tests {
             Err(OperatorError::ResolutionConflict(found)) if found == id
         ));
         assert!(matches!(
-            queue.status(id).unwrap().status,
+            queue.snapshot(id).unwrap().status,
             EventStatus::InDoubt { .. }
         ));
     }
@@ -6915,7 +6518,7 @@ mod tests {
             assert_eq!(outcomes.len(), 1);
             assert_eq!(outcomes[0].escalated, delivery == 2);
         }
-        let snapshot = queue.status(id).unwrap();
+        let snapshot = queue.snapshot(id).unwrap();
         assert_eq!(snapshot.redelivery_count, 3);
         assert!(snapshot.escalated);
         assert_eq!(snapshot.condition, AttentionCondition::Escalation);
@@ -6923,7 +6526,7 @@ mod tests {
         let escalation = queue.claim_at(30).unwrap().unwrap();
         assert!(queue.reclaim_expired_at(40).unwrap()[0].escalated);
         assert!(matches!(
-            queue.status(id).unwrap().status,
+            queue.snapshot(id).unwrap().status,
             EventStatus::InDoubt { token: Some(token), .. } if token == escalation.token
         ));
     }
@@ -6976,7 +6579,7 @@ mod tests {
         drop(queue);
         let reopened = DurableQueue::open(&completed_dir.0, 2, fast_config()).unwrap();
         assert!(matches!(
-            reopened.status(id).unwrap().status,
+            reopened.snapshot(id).unwrap().status,
             EventStatus::Resolved { .. }
         ));
         drop(reopened);
@@ -6996,7 +6599,7 @@ mod tests {
         drop(orphan);
         let recovered = DurableQueue::open(&orphan_dir.0, 2, fast_config()).unwrap();
         assert!(matches!(
-            recovered.status(orphan_id).unwrap().status,
+            recovered.snapshot(orphan_id).unwrap().status,
             EventStatus::InDoubt { .. }
         ));
         assert!(recovered.claim_at(1_000).unwrap().is_none());
@@ -7034,7 +6637,7 @@ mod tests {
             AckOutcome::Resolved
         );
         assert!(matches!(
-            recovered.status(orphan_id).unwrap().status,
+            recovered.snapshot(orphan_id).unwrap().status,
             EventStatus::Resolved {
                 resolution: Resolution::Acted,
                 reconciliation_note: Some(ref note),
@@ -7059,7 +6662,7 @@ mod tests {
         // reconciliation must not make the next open report a corrupt WAL.
         let reconciled = DurableQueue::open(&orphan_dir.0, 3, fast_config()).unwrap();
         assert!(matches!(
-            reconciled.status(orphan_id).unwrap().status,
+            reconciled.snapshot(orphan_id).unwrap().status,
             EventStatus::Resolved {
                 resolution: Resolution::Acted,
                 reconciliation_note: Some(ref note),
@@ -7091,7 +6694,7 @@ mod tests {
         drop(first);
 
         let second = DurableQueue::open(&directory.0, 2, config.clone()).unwrap();
-        let after_one = second.status(id).unwrap();
+        let after_one = second.snapshot(id).unwrap();
         assert_eq!(after_one.redelivery_count, 1);
         assert!(!after_one.escalated);
         assert!(matches!(after_one.status, EventStatus::Queued));
@@ -7107,7 +6710,7 @@ mod tests {
         drop(second);
 
         let third = DurableQueue::open(&directory.0, 3, config.clone()).unwrap();
-        let at_cap = third.status(id).unwrap();
+        let at_cap = third.snapshot(id).unwrap();
         assert_eq!(at_cap.redelivery_count, 2);
         assert!(at_cap.escalated);
         assert_eq!(at_cap.condition, AttentionCondition::Escalation);
@@ -7121,7 +6724,7 @@ mod tests {
 
         let fourth = DurableQueue::open(&directory.0, 4, config).unwrap();
         assert!(matches!(
-            fourth.status(id).unwrap().status,
+            fourth.snapshot(id).unwrap().status,
             EventStatus::InDoubt { token: Some(ref token), .. }
                 if token == &escalation.token
         ));
@@ -7156,7 +6759,7 @@ mod tests {
             Err(OperatorError::StaleClaim(found)) if found == id
         ));
         assert!(matches!(
-            second.status(id).unwrap().status,
+            second.snapshot(id).unwrap().status,
             EventStatus::Resolved {
                 resolution: Resolution::NoAction,
                 ..
@@ -7179,7 +6782,7 @@ mod tests {
             );
             assert!(queue.unmanage_sid_at("a", u64::from(value)).unwrap());
             assert!(matches!(
-                queue.status(id).unwrap().status,
+                queue.snapshot(id).unwrap().status,
                 EventStatus::ResolvedUnclaimed {
                     resolution: Resolution::Paused,
                     ..
@@ -7206,7 +6809,10 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .poisoned = true;
 
-        assert!(matches!(queue.status(id), Err(OperatorError::WalPoisoned)));
+        assert!(matches!(
+            queue.snapshot(id),
+            Err(OperatorError::WalPoisoned)
+        ));
         assert!(matches!(
             queue.is_managed("a"),
             Err(OperatorError::WalPoisoned)
@@ -7243,10 +6849,9 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
 
-        let (reopened, report) =
-            DurableQueue::open_with_report(&directory.0, 2, fast_config()).unwrap();
-        assert!(report.repaired_partial_final_frame);
-        assert_eq!(reopened.status(id).unwrap().id, id);
+        let reopened = DurableQueue::open(&directory.0, 2, fast_config()).unwrap();
+        assert!(reopened.recovery_report().repaired_partial_final_frame);
+        assert_eq!(reopened.snapshot(id).unwrap().id, id);
         assert!(fs::metadata(&wal_path).unwrap().len() > good_len);
         drop(reopened);
 
@@ -7281,14 +6886,10 @@ mod tests {
         assert_eq!(next.durable_epoch().unwrap(), 6);
     }
 
-    /// A descriptor duplicate is what every `fork` hands out: a child spawned
-    /// anywhere in this process while the queue was open carries a copy of the
-    /// lock's open file description until it reaches `exec`, and the OS lock
-    /// lives on that description rather than on either descriptor. `try_clone`
-    /// is that duplicate exactly. Dropping the last queue handle must therefore
-    /// end the lock, not merely close one name for it — otherwise the next opener
-    /// of the same directory is refused by a holder that never opened it, which is
-    /// how a shell spawn in one thread breaks an unrelated reopen in another.
+    /// `try_clone` duplicates the descriptor as `fork` does: the OS lock lives on
+    /// the open file description, so dropping the last queue handle must end the
+    /// lock, not just close one name for it, or a spawned child would block an
+    /// unrelated reopen.
     #[test]
     fn a_dropped_queue_releases_its_lock_against_an_inherited_descriptor() {
         let directory = TestDir::new("lock-fork-window");
@@ -7356,10 +6957,9 @@ mod tests {
         fs::remove_file(link).unwrap();
     }
 
-    /// REGRESSION: the operator must own `<root>/operator/**` and nothing above
-    /// it. aterm's shared per-user state root also holds the recovery journal;
-    /// an opt-in subsystem that silently rewrote its mode would be changing the
-    /// permissions of state belonging to users who never enabled it.
+    /// The operator owns `<root>/operator/**` and nothing above it: it must not
+    /// change the mode of the shared per-user state root, which also holds the
+    /// recovery journal.
     #[cfg(unix)]
     #[test]
     fn operator_state_scope_stops_at_its_own_subtree() {
@@ -7403,17 +7003,16 @@ mod tests {
                 .is_symlink()
         );
 
-        // ... but the operator's OWN components are still policed in full.
+        // ... but the operator's own components are still policed in full.
         let hostile = home.0.join("hostile");
         fs::create_dir_all(&hostile).unwrap();
         std::os::unix::fs::symlink(&elsewhere.0, hostile.join("operator")).unwrap();
         assert!(fleet_state_dir_in(&hostile, "profile-default").is_err());
     }
 
-    /// REGRESSION: a state root this process cannot write reports a plain
-    /// error. It must never panic, and it must not leave a trace on the shared
-    /// root. The embedded host turns this error into standby, never a fleet
-    /// fault (`crates/aterm-gui/src/operator_host.rs`).
+    /// A state root this process cannot write reports a plain error, never a
+    /// panic, and leaves no trace on the shared root. The embedded host turns it
+    /// into standby, not a fleet fault (`crates/aterm-gui/src/operator_host.rs`).
     #[cfg(unix)]
     #[test]
     fn operator_state_dir_on_an_unusable_root_errors_without_touching_it() {
@@ -7520,13 +7119,13 @@ mod tests {
                 "{refused:?}"
             );
             assert!(matches!(
-                run.queue.status(run.id).unwrap().status,
+                run.queue.snapshot(run.id).unwrap().status,
                 EventStatus::ActionInFlight { .. }
             ));
             drop(run.queue);
             let reopened = DurableQueue::open(&run.directory.0, 2, fast_config()).unwrap();
             assert!(matches!(
-                reopened.status(run.id).unwrap().status,
+                reopened.snapshot(run.id).unwrap().status,
                 EventStatus::InDoubt { .. }
             ));
         }
@@ -7562,13 +7161,13 @@ mod tests {
                 "{refused:?}"
             );
             assert!(matches!(
-                run.queue.status(run.id).unwrap().status,
+                run.queue.snapshot(run.id).unwrap().status,
                 EventStatus::Resolved { .. }
             ));
             drop(run.queue);
             let reopened = DurableQueue::open(&run.directory.0, 2, fast_config()).unwrap();
             assert!(matches!(
-                reopened.status(run.id).unwrap().status,
+                reopened.snapshot(run.id).unwrap().status,
                 EventStatus::Resolved {
                     resolution: Resolution::Acted,
                     ..
@@ -7614,7 +7213,7 @@ mod tests {
             drop(run.queue);
             let reopened = DurableQueue::open(&run.directory.0, 2, fast_config()).unwrap();
             assert!(matches!(
-                reopened.status(run.id).unwrap().status,
+                reopened.snapshot(run.id).unwrap().status,
                 EventStatus::Resolved {
                     resolution: Resolution::Acted,
                     ..
@@ -7640,7 +7239,7 @@ mod tests {
                     if pending_sids.is_empty()
             ));
             assert!(matches!(
-                run.queue.status(run.id).unwrap().status,
+                run.queue.snapshot(run.id).unwrap().status,
                 EventStatus::InDoubt { .. }
             ));
             let marker = run.directory.0.join(FAULT_MARKER_NAME);

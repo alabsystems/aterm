@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the reviewer's proofs of the band's MOTION on the host side
-//! (design §10.8–§10.12, review 2026-09-24) — the idle law, a hidden window,
-//! the frame cadence, what one animation frame costs the host, the still
-//! looks, the capture's determinism, the `appstatus` face and the Settings ▸
-//! Messages page. Each test drives a headless `App` through the same seams
-//! the loop uses (`band_motion_deadline` is what `about_to_wait` folds under
-//! `DeadlineOwner::MessageBandMotion`, `band_motion_due` is the timer wake's
-//! redraw list, `prepare_band_motion` is the first thing a redraw does).
+//! Test-only: host-side tests of the message band's motion: the idle rule, a
+//! hidden window, the frame cadence, the host cost of one animation frame, the
+//! still looks, capture determinism, the `appstatus` face and the Settings ▸
+//! Messages page. Each test drives a headless `App` through the loop's seams:
+//! `band_motion_deadline` (folded by `about_to_wait` under
+//! `DeadlineOwner::MessageBandMotion`), `band_motion_due` (the timer wake's
+//! redraw list) and `prepare_band_motion` (the first step of a redraw).
 
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,7 @@ use crate::{App, WindowId, term_lock};
 
 const WID: WindowId = WindowId(0);
 
-/// A headless App whose first window is ON SCREEN (the test seam for a real,
+/// A headless App whose first window is on screen (the test seam for a real,
 /// unoccluded OS window) and focused, with every motion gate open.
 fn on_screen_app() -> App {
     let mut app = App::headless_for_test();
@@ -88,13 +87,12 @@ fn pty_dims(app: &App) -> (u16, u16) {
     (term.rows(), term.cols())
 }
 
-// ---- (1) THE IDLE LAW -----------------------------------------------------
+// ---- (1) The idle rule -----------------------------------------------------
 
-/// FL-1 AT THE HOST: an App with nothing on the glass arms no state wake and
-/// no motion wake, lists no window as due, prepares a zero motion term and
-/// folds a zero band term into the RepaintKey — and a RECORD (`Hold::LogOnly`)
-/// changes none of that, nor does a live row once it has folded and its echo
-/// has ended. On screen and focused throughout: the window that WOULD move.
+/// An App with nothing on the glass arms no state or motion wake, lists no
+/// window as due, prepares a zero motion term and folds a zero band term into
+/// the RepaintKey. A record (`Hold::LogOnly`) changes none of that, nor does a
+/// live row once it has folded and its echo ended. On screen and focused.
 #[test]
 fn an_idle_app_arms_nothing_and_a_record_or_a_folded_row_leaves_it_idle() {
     let mut app = on_screen_app();
@@ -142,13 +140,12 @@ fn an_idle_app_arms_nothing_and_a_record_or_a_folded_row_leaves_it_idle() {
     idle(&mut app, "after the row folded");
 }
 
-// ---- (2) A HIDDEN WINDOW ----------------------------------------------------
+// ---- (2) A hidden window ----------------------------------------------------
 
-/// OCCLUDED (minimized, fully covered — what `WindowEvent::Occluded` reports)
-/// and HEADLESS windows schedule NO animation frame and no text tick, and are
-/// never listed due — even with a prepared frame from before they hid; an
-/// UNFOCUSED window on screen keeps only the text ticks (never a frame-rate
-/// wake). Folded over a 20 s window of the loop, not one instant.
+/// Occluded (minimized or fully covered, per `WindowEvent::Occluded`) and
+/// headless windows schedule no animation frame or text tick and are never
+/// listed due, even with a frame prepared before they hid; an unfocused window
+/// on screen keeps only the text ticks. Folded over 20 s of the loop.
 #[test]
 fn a_hidden_window_schedules_no_animation_frames() {
     let mut app = on_screen_app();
@@ -208,10 +205,9 @@ fn a_hidden_window_schedules_no_animation_frames() {
 }
 
 /// A determinate bar's next glint/glide frame searches future cell surfaces.
-/// The event sweep and the park may ask again dozens of times in the SAME
-/// frame during PTY traffic; those reads must share one search, yet a new
-/// reading, width, visual look or visibility edge must keep the first real
-/// transition reachable.
+/// Repeated asks within one frame (event sweep and park during PTY traffic)
+/// share one search, while a new reading, width, look or visibility edge keeps
+/// the first real transition reachable.
 #[test]
 fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     let mut app = on_screen_app();
@@ -325,12 +321,12 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     );
 }
 
-// ---- (3) THE CADENCE AND THE COST OF ONE FRAME -----------------------------
+// ---- (3) The cadence and the cost of one frame -----------------------------
 
-/// THE CAP: whatever wakes the loop — here a wake every 7 ms for 3 s, as a
-/// PTY stream or pointer traffic would — the band is DUE at most once per
-/// 33 ms grid step, each prepared frame sits on the grid strictly after the
-/// last, and the motion deadline is always on the grid and in the future.
+/// The cap: with a wake every 7 ms for 3 s (as PTY or pointer traffic would
+/// cause), the band is due at most once per 33 ms grid step, each prepared
+/// frame sits on the grid strictly after the last, and the motion deadline is
+/// always on the grid and in the future.
 #[test]
 fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
     let mut app = on_screen_app();
@@ -356,12 +352,9 @@ fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
         }
         t += Duration::from_millis(7);
     }
-    // A prepared frame sits on the grid step AT OR BEFORE the wake that
+    // A prepared frame sits on the grid step at or before the wake that
     // prepared it, so the first can land up to one step before `t0`: the
-    // frames span `[first, t0 + 3 s)`, and that span holds at most one per
-    // step. (A fixed `3000 / 33 + 1` assumed the first frame at `t0`; with the
-    // grid anchored at the row's birth, a loaded run that read `t0` late saw 92
-    // honest frames against that cap of 91.)
+    // frames span `[first, t0 + 3 s)`, at most one per step.
     let first = *frames.first().expect("the band animates");
     let span = (t0 + Duration::from_secs(3)).saturating_duration_since(first);
     let cap = (span.as_millis() / ANIM_FRAME.as_millis()) as usize + 1;
@@ -377,17 +370,13 @@ fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
     );
 }
 
-/// ONE ANIMATION FRAME COSTS THE BAND ROW AND NOTHING ELSE: across two frame
-/// instants the composed input differs in the band row only, so the
-/// renderer's row diff (`compute_dirty_rows`, the damage both presents use)
-/// repaints exactly that row — the damage a cursor blink costs (its one row);
-/// the LAYOUT is reused (a poisoned cached presentation survives
-/// `prepare_band_motion`: the width law did not run); a frame changes the
-/// row's CHARACTERS only in the glyph cell and the time slots — everything
-/// else it moves is the full-row meter's surface under them (rulings 138,
-/// 140: one paint per frame, every word floored against the tone under it,
-/// so there is no time-free paint to reuse); and no frame re-grids or
-/// resizes the PTY.
+/// One animation frame costs the band row and nothing else: across two frame
+/// instants the composed input differs only in the band row, so the renderer's
+/// row diff (`compute_dirty_rows`) repaints exactly that row, the same damage
+/// as a cursor blink. The layout is reused (a poisoned cached presentation
+/// survives `prepare_band_motion`), a frame changes the row's characters only
+/// in the glyph cell and the time slots (the rest is the meter surface under
+/// them), and no frame re-grids or resizes the PTY.
 #[test]
 fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
     let mut app = on_screen_app();
@@ -475,15 +464,14 @@ fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
     assert_eq!(pty_dims(&app), dims, "…nor resizes the PTY");
 }
 
-// ---- (4) THE STILL LOOKS ------------------------------------------------------
+// ---- (4) The still looks ------------------------------------------------------
 
-/// SERIOUS MODE, REDUCE MOTION, `motion = "reduced"` AND THE LOAD-SHED LATCH:
-/// each draws the still form — its meter does not change with time — and
-/// arms no frame-rate deadline, for work with no fraction (the comet's row)
-/// and for a determinate download alike: the only wakes are TEXT ticks at
-/// most once a second (the download's ETA slot shows its elapsed clock
-/// while the estimate is hidden, review round 3, 2026-09-24; the comet's
-/// row has no words before 10 s, so it arms nothing here).
+/// Serious mode, reduce motion, `motion = "reduced"` and the load-shed latch
+/// each draw the still form (a meter that does not change with time) and arm
+/// no frame-rate deadline, for fractionless work (the comet row) and a
+/// determinate download alike. The only wakes are text ticks at most once a
+/// second (the download's ETA slot shows its elapsed clock while the estimate
+/// is hidden; the comet row has no words before 10 s, so it arms nothing).
 #[test]
 fn every_still_gate_draws_static_frames_and_arms_no_frame_deadline() {
     type Gate = fn(&mut App, bool);
@@ -551,13 +539,12 @@ fn every_still_gate_draws_static_frames_and_arms_no_frame_deadline() {
     }
 }
 
-// ---- (6) CAPTURES ---------------------------------------------------------------
+// ---- (6) Captures ---------------------------------------------------------------
 
-/// A PRODUCTION CAPTURE IS STILL AND A PURE FUNCTION OF ITS INSTANT: a
-/// headless window (no OS window — what `aterm --headless` and a capture of
-/// it run) prepares the still form in its own look, the same instant twice
-/// gives the same frame, and instants a few seconds apart give the same
-/// meter until the first elapsed word arrives.
+/// A production capture is still and a pure function of its instant: a
+/// headless window prepares the still form in its own look, the same instant
+/// twice gives the same frame, and instants seconds apart give the same meter
+/// until the first elapsed word arrives.
 #[test]
 fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
     let mut app = App::headless_for_test();
@@ -578,14 +565,12 @@ fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
         a,
         "the still form does not move with time"
     );
-    // …but its WORDS are the capture's instant's (design ruling 202): a
-    // capture after another reads its own elapsed clock, never the last
-    // painted one (the live run's `1:59` at 120 s was the request time, not
-    // the capture's; re-measured 2026-09-24: every capture read its instant).
+    // …but its words are the capture instant's: each capture reads its own
+    // elapsed clock, never the last painted one.
     let text = |cells: &[aterm_core::terminal::RenderCell]| -> String {
         cells.iter().map(|c| c.ch).collect()
     };
-    // The elapsed words, labelled (`for 20 s`, ruling 241).
+    // The elapsed words, labelled (`for 20 s`).
     let clock = |row: &str| -> u64 {
         let words: Vec<&str> = row.split_whitespace().collect();
         let at = words
@@ -608,7 +593,7 @@ fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
     );
 }
 
-// ---- (7) THE FACES THAT MUST NOT MOVE ---------------------------------------
+// ---- (7) The faces that must not move ---------------------------------------
 
 /// `appstatus` carries no motion: a live row's `phase=live` line is the same
 /// bytes 30 s apart (no elapsed, no ETA, no frame state leaks into it), and
@@ -630,9 +615,9 @@ fn appstatus_carries_no_motion_words() {
     assert_eq!(read(&app, now + Duration::from_secs(30)), first);
 }
 
-/// THE PAGE STILL LISTS THE RECORDS: a `Hold::LogOnly` message never reaches
-/// the glass, arms nothing, and is on Settings ▸ Messages' projection as
-/// `recorded`, worded "recorded, never on the band", newest first.
+/// The page still lists records: a `Hold::LogOnly` message never reaches the
+/// glass, arms nothing, and appears on Settings ▸ Messages as `recorded`,
+/// worded "recorded, never on the band", newest first.
 #[test]
 fn the_messages_page_lists_log_only_records() {
     let mut app = on_screen_app();

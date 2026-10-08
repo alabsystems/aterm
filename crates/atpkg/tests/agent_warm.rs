@@ -23,6 +23,9 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+
+use aterm_spec::wait::{MUST_HAPPEN, within};
 
 /// AI variables that must not reach the warm, set on the verb's own environment: a parent
 /// Claude session's markers (a session exports the first four — measured in one,
@@ -47,10 +50,11 @@ const UNSET: &[&str] = &[
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
+    "DISABLE_TELEMETRY",
 ];
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     prefix: PathBuf,
     record: PathBuf,
@@ -58,17 +62,18 @@ struct Fixture {
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-agent-warm-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-agent-warm-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let home = home.canonicalize().unwrap();
         // The account has run claude before: there are caches to refresh.
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         let prefix = atpkg::store::default_prefix(&home);
         let fx = Self {
-            record: root.join("record"),
+            record: root.path().join("record"),
             root,
             home,
             prefix,
@@ -95,7 +100,8 @@ impl Fixture {
         std::fs::write(
             &exe,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{r}.args'\nenv > '{r}.env'\npwd > '{r}.pwd'\n\
+                "#!/bin/sh\nif [ \"${{1-}}\" = --fixture-ready ]; then echo fixture-ready; exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > '{r}.args'\nenv > '{r}.env'\npwd > '{r}.pwd'\n\
                  if [ -t 0 ]; then echo tty; else echo notty; fi > '{r}.stdin'\n\
                  echo out; echo err >&2\nexit {code}\n"
             ),
@@ -124,19 +130,62 @@ impl Fixture {
             Some(&build),
             "fixture: the build is active"
         );
+        // Establish that each fresh executable can enter before the real warm starts
+        // its unchanged 30 s product deadline. Prepare the stand-in first, then its real
+        // shim, so two macOS first-exec assessments do not share one setup hang detector.
+        // The readiness branch records nothing: never-runs cases still detect a warm.
+        for ready_exe in [exe, layout.shim(&tool)] {
+            let mut ready = Command::new(&ready_exe)
+                .arg("--fixture-ready")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start the fixture readiness check");
+            let ended = within(MUST_HAPPEN, Duration::from_millis(10), || {
+                ready.try_wait().expect("observe fixture readiness")
+            });
+            if ended.is_none() {
+                let _ = ready.kill();
+                let _ = ready.wait();
+                panic!(
+                    "fixture {} did not become ready within {MUST_HAPPEN:?}",
+                    ready_exe.display()
+                );
+            }
+            let out = ready.wait_with_output().unwrap();
+            assert!(out.status.success(), "fixture readiness: {out:?}");
+            assert_eq!(out.stdout, b"fixture-ready\n", "fixture readiness: {out:?}");
+            assert!(out.stderr.is_empty(), "fixture readiness: {out:?}");
+        }
+        for kind in ["args", "env", "pwd", "stdin"] {
+            assert!(self.recorded(kind).is_none(), "setup recorded {kind}");
+        }
+        assert!(self.warm_lines().is_empty(), "setup logged a warm");
     }
 
     /// `atpkg __warm <operands…>`, confined to this fixture, with a parent Claude
-    /// session's variables and `extra` in its environment.
+    /// session's variables and `extra` in its environment — an environment born in the
+    /// person's shell (the rc hook's `ATPKG_BIN` set), as a typed pass's is.
     fn warm_with(&self, operands: &[&str], extra: &[(&str, &str)]) -> Output {
+        self.command(operands, extra)
+            .output()
+            .expect("run the dev atpkg")
+    }
+
+    /// [`Fixture::warm_with`]'s command, not yet run.
+    fn command(&self, operands: &[&str], extra: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.arg(atpkg::warm::HIDDEN_VERB)
             .args(operands)
             .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("ATPKG_BIN", self.prefix.join("bin"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env_remove("ATERM_STATE_HOME")
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
+            // A zsh the warm asks reads its rc under `$ZDOTDIR`, never this HOME's.
+            .env_remove("ZDOTDIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -146,7 +195,7 @@ impl Fixture {
         for (k, v) in SESSION_VARS.iter().chain(SENTINELS).chain(extra) {
             cmd.env(k, v);
         }
-        cmd.output().expect("run the dev atpkg")
+        cmd
     }
 
     fn warm(&self, operands: &[&str]) -> Output {
@@ -172,7 +221,7 @@ impl Fixture {
             None,
             aterm_types::dirs::StatePlatform {
                 home: Some(self.home.clone()),
-                xdg_state_home: Some(self.root.join("state")),
+                xdg_state_home: Some(self.root.path().join("state")),
                 local_app_data: None,
             },
         )
@@ -187,12 +236,6 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
 /// Exit 0 with not one byte on either pipe.
 fn silent_success(out: &Output, label: &str) {
     assert!(out.status.success(), "{label}: {out:?}");
@@ -203,8 +246,11 @@ fn silent_success(out: &Output, label: &str) {
 #[test]
 fn the_warm_runs_the_bin_shim_silently_with_the_table_argv_and_no_session_variables() {
     let fx = Fixture::new("runs");
-    fx.install_claude(2_001_280, 0);
-    let out = fx.warm_build(2_001_280);
+    let build = atpkg::vendor_direct::Version::parse("2.1.280")
+        .unwrap()
+        .build_id();
+    fx.install_claude(build, 0);
+    let out = fx.warm_build(build);
     silent_success(&out, "a warm");
     let spec = atpkg::vendor_direct::spec("claude").unwrap();
     let args: Vec<String> = fx
@@ -237,7 +283,11 @@ fn the_warm_runs_the_bin_shim_silently_with_the_table_argv_and_no_session_variab
     let lines = fx.warm_lines();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].get("program"), Some("claude"));
-    assert_eq!(lines[0].get("build"), Some("2001280"));
+    assert_eq!(
+        lines[0].get("build"),
+        Some("2.1.280"),
+        "the version, as updates name it"
+    );
     assert_eq!(lines[0].get("outcome"), Some("exit=0"));
     assert!(lines[0].get("ms").is_some());
 }
@@ -284,11 +334,16 @@ fn a_stale_build_or_a_malformed_request_runs_nothing() {
 
 /// The user's own config home reaches the warm (it is where the caches the warm refreshes
 /// live), and is where the warm looks for claude's state.
+///
+/// AND KEPT ONLY IN THE PERSON'S SHELL RC, warmed from the window (no `ATPKG_BIN`; review
+/// of the 2026-10-02 fix): the config home and a variable the program honours itself
+/// (`DISABLE_TELEMETRY`, the reason [`atpkg::warm`] leaves it out of its opt-outs) reach
+/// the program from their login shell, as they reach their next `claude`.
 #[test]
 fn the_users_own_config_home_reaches_the_warm() {
     let fx = Fixture::new("config-home");
     fx.install_claude(2_001_280, 0);
-    let config = fx.root.join("claude-config");
+    let config = fx.root.path().join("claude-config");
     std::fs::create_dir_all(&config).unwrap();
     let config = config.to_str().unwrap();
     silent_success(
@@ -301,11 +356,37 @@ fn the_users_own_config_home_reaches_the_warm() {
             .any(|v| v == format!("CLAUDE_CONFIG_DIR={config}")),
         "{env}"
     );
+    std::fs::remove_file(format!("{}.env", fx.record.display())).unwrap();
+    std::fs::write(
+        fx.home.join(".bash_profile"),
+        format!("export CLAUDE_CONFIG_DIR='{config}' DISABLE_TELEMETRY=1\n"),
+    )
+    .unwrap();
+    let prefix = fx.prefix.to_str().unwrap().to_string();
+    let out = fx
+        .command(&["claude", &prefix, "2001280"], &[("SHELL", "/bin/bash")])
+        .env_remove("ATPKG_BIN")
+        .output()
+        .expect("run the dev atpkg");
+    silent_success(&out, "kept in the rc, warmed from the window");
+    let env = fx.recorded("env").expect("the program ran");
+    for want in [
+        format!("CLAUDE_CONFIG_DIR={config}"),
+        String::from("DISABLE_TELEMETRY=1"),
+    ] {
+        assert!(env.lines().any(|v| v == want), "{want}: {env}");
+    }
 }
 
 /// The user's opt-out of claude's non-essential traffic, and an account that never ran
 /// claude (a default-set install nobody launched): nothing runs, silently, and the warm's
 /// line says why.
+///
+/// AND THE OPT-OUT KEPT IN THE PERSON'S SHELL RC (audit 2026-10-02): most builds land from
+/// the window's head watch, and a window started from the Dock carries launchd's
+/// environment — no `ATPKG_BIN`, nothing the person's rc exports — so the warm read no
+/// opt-out there and ran claude anyway. It now reads the person's login shell, the way
+/// their next `claude` gets its environment.
 #[test]
 fn an_opted_out_or_never_run_claude_is_not_run() {
     let fx = Fixture::new("declined");
@@ -318,7 +399,7 @@ fn an_opted_out_or_never_run_claude_is_not_run() {
         "opted out",
     );
     assert!(fx.recorded("args").is_none(), "opted out: nothing ran");
-    let config = fx.root.join("never-ran");
+    let config = fx.root.path().join("never-ran");
     silent_success(
         &fx.warm_build_with(
             2_001_280,
@@ -327,10 +408,81 @@ fn an_opted_out_or_never_run_claude_is_not_run() {
         "never ran",
     );
     assert!(fx.recorded("args").is_none(), "never ran: nothing ran");
+    std::fs::write(
+        fx.home.join(".bash_profile"),
+        "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n",
+    )
+    .unwrap();
+    let prefix = fx.prefix.to_str().unwrap().to_string();
+    let out = fx
+        .command(&["claude", &prefix, "2001280"], &[("SHELL", "/bin/bash")])
+        .env_remove("ATPKG_BIN")
+        .output()
+        .expect("run the dev atpkg");
+    silent_success(&out, "opted out in the rc, warmed from the window");
+    assert!(
+        fx.recorded("args").is_none(),
+        "opted out in the rc: nothing ran"
+    );
+    // AND AN RC THE WARM COULD NOT READ (audit round 2, 2026-10-02): unread is not unset.
+    // Each shape gives the person's own terminal the opt-out (tmux and the exec'd shell
+    // inherit the export, ksh reads `.profile`) and the warm's probe no environment of
+    // theirs: an rc that auto-starts tmux, which refuses with no terminal (exit 1); one that
+    // greets and execs another shell, which reads the empty stdin and exits 0 having
+    // printed only the greeting; a `$SHELL` the warm does not ask; no `$SHELL` at all.
+    // Before, claude ran in every one (`exit=0`). An opt-out already in hand says so.
+    let tmux = fx.root.path().join("tmux");
+    std::fs::write(
+        &tmux,
+        "#!/bin/sh\necho 'open terminal failed: not a terminal' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opt_out = "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n";
+    std::fs::write(fx.home.join(".profile"), opt_out).unwrap();
+    let in_hand = [("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")];
+    for (label, shell, rc_tail, extra) in [
+        (
+            "tmux",
+            Some("/bin/bash"),
+            format!("exec '{}'\n", tmux.display()),
+            &[][..],
+        ),
+        (
+            "another shell",
+            Some("/bin/bash"),
+            String::from("echo \"Welcome, user=$USER\"\nexec /bin/sh\n"),
+            &[],
+        ),
+        ("ksh", Some("/bin/ksh"), String::new(), &[]),
+        ("no $SHELL", None, String::new(), &[]),
+        ("in hand", Some("/bin/ksh"), String::new(), &in_hand),
+    ] {
+        std::fs::write(fx.home.join(".bash_profile"), format!("{opt_out}{rc_tail}")).unwrap();
+        let mut command = fx.command(&["claude", &prefix, "2001280"], extra);
+        command.env_remove("ATPKG_BIN").env_remove("SHELL");
+        if let Some(shell) = shell {
+            command.env("SHELL", shell);
+        }
+        silent_success(&command.output().expect("run the dev atpkg"), label);
+        assert!(fx.recorded("args").is_none(), "{label}: nothing ran");
+    }
     let outcomes: Vec<String> = fx
         .warm_lines()
         .iter()
         .map(|l| l.get("outcome").unwrap().to_string())
         .collect();
-    assert_eq!(outcomes, ["opted-out", "never-run"]);
+    assert_eq!(
+        outcomes,
+        [
+            "opted-out",
+            "never-run",
+            "opted-out",
+            "setup-unread",
+            "setup-unread",
+            "setup-unread",
+            "setup-unread",
+            "opted-out"
+        ]
+    );
 }

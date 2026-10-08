@@ -29,8 +29,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::process::Command;
 
 /// Where vendored machine-local shared libraries are copied, relative to the
 /// stage root. Kept distinct from any real `lib/` content the toolchain ships.
@@ -528,7 +526,7 @@ pub fn magic4(path: &Path) -> Option<[u8; 4]> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(tool: &str, args: &[&str], file: &Path) -> Result<std::process::Output, String> {
-    Command::new(tool)
+    aterm_uds::spawnfd::command(tool)
         .args(args)
         .arg(file)
         .output()
@@ -545,6 +543,11 @@ pub mod macho {
 
     #[cfg(target_os = "macos")]
     pub struct MachoBackend;
+
+    /// How long one `codesign --force --sign` may run before the relocate is
+    /// refused ([`MachoBackend`]'s `resign`): a hang detector, never a budget.
+    #[cfg(target_os = "macos")]
+    const RESIGN_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Mach-O magic (thin arm64/x86_64 little-endian + universal).
     pub fn is_macho_magic(m: &[u8; 4]) -> bool {
@@ -678,16 +681,29 @@ pub mod macho {
             Ok(())
         }
         fn resign(&self, path: &Path, sign_id: Option<&str>) -> Result<(), String> {
-            let mut c = Command::new("/usr/bin/codesign");
+            let mut c = aterm_uds::spawnfd::command("/usr/bin/codesign");
             c.arg("--force");
             match sign_id {
                 Some(id) => c.args(["--timestamp", "--sign", id]),
                 None => c.args(["--sign", "-"]), // ad-hoc: arm64 needs a valid sig to exec
             };
-            let out = c
-                .arg(path)
-                .output()
-                .map_err(|e| format!("spawn codesign: {e}"))?;
+            // A hang detector, not a budget: signing one object takes well under
+            // a second (a timestamped one adds a round-trip to Apple). A codesign
+            // that macOS's code-signing service (trustd) never answers is killed,
+            // and the object stays unsigned, so the tree is never tarred.
+            let out = aterm_uds::deadline::output_until(
+                c.arg(path),
+                std::time::Instant::now() + RESIGN_HANG,
+            )
+            .map_err(|e| match e {
+                aterm_uds::deadline::RunError::TimedOut => format!(
+                    "codesign did not finish in {} s (macOS's code-signing service (trustd) \
+                     may not be answering); {} was not re-signed, relocate refused",
+                    RESIGN_HANG.as_secs(),
+                    path.display()
+                ),
+                other => format!("codesign {}: {other}", path.display()),
+            })?;
             if out.status.success() {
                 Ok(())
             } else {
@@ -1030,9 +1046,7 @@ mod tests {
     #[test]
     fn a_hard_link_group_is_relocated_once_and_stays_one_file() {
         use std::os::unix::fs::MetadataExt;
-        let stage =
-            std::env::temp_dir().join(format!("atpkg-reloc-hardlink-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&stage);
+        let stage = crate::testdir::dir("atpkg-reloc-hardlink-");
         std::fs::create_dir_all(stage.join("bin")).unwrap();
         std::fs::create_dir_all(stage.join("lib/rustlib/t/lib")).unwrap();
         std::fs::write(stage.join("bin/rustc"), b"OBJ compiler").unwrap();

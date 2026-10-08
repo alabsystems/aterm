@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! LAZY-INIT REENTRANCY CENSUS — the L0-DEADLOCK class in its REENTRANCY
-//! sense, as a fail-closed, build-blocking obligation (OB-19..OB-21).
+//! Lazy-init reentrancy census (OB-19..OB-21): the L0 deadlock class in its
+//! reentrancy sense, as a fail-closed, build-blocking obligation.
 //!
-//! THE BUG THIS GUARDS (shipped in v0.65.0 and v0.66.0; fixed by 9811b83c):
+//! The shape it guards against:
 //!
 //! ```text
 //! pub(crate) fn debug_seamless_reexec_armed() -> bool {
@@ -18,66 +18,33 @@
 //! }
 //! ```
 //!
-//! `Once::call` marks the cell RUNNING before it invokes the initializer, so
-//! the nested call found its own `Once` already claimed and PARKED THE CALLING
-//! THREAD — permanently, with no timeout and no way out. The site is reached
-//! from `apply_staged_update_now` on the winit MAIN THREAD, so the first
-//! automatic update apply froze the whole terminal: window up, caret alive,
-//! nothing responding. A hang report from the field (2026-08-30, 0.65.0,
-//! unresponsive 3588 s before sampling) shows the main thread stopped inside
-//! `std::sync::Once::call` → `wait` → `_dispatch_semaphore_wait_slow`, with
-//! `Once::call`'s frame appearing TWICE — the closure arm above the wait arm.
+//! `Once::call` marks the cell running before invoking the initializer, so the
+//! nested call parks the thread on its own `Once` forever. Reached from the
+//! winit main thread, that freezes the whole terminal. It is not a lock-order
+//! cycle (OB-7), not an unbounded sink (OB-1..OB-6), and clippy has no lint for
+//! it. This census derives every lazy cell in `crates/*/src` and which fns
+//! block on each, and fails the build if an initializer can reach a blocking
+//! touch of its own cell, directly or around a cycle.
 //!
-//! Nothing in the build caught it. It is not a lock-ORDER cycle, so OB-7 is
-//! silent (a `Once` is not in the lock graph); it is not an unbounded sink, so
-//! OB-1..OB-6 are silent; `clippy` has no lint for it; and the unit test that
-//! DOES pin it can only pin it by HANGING, which is a stopped suite rather
-//! than a red one. This census is the standing CLASS guard: it derives every
-//! lazy cell in `crates/*/src`, derives which functions BLOCKINGLY touch each
-//! one, and fails the build if any initializer can reach a blocking touch of
-//! the cell it is itself initializing — directly, or around a cycle.
+//! Consumers: the `aterm-census` bin (`targo --unverified run -p aterm-census
+//! -- --lazy-init`) and `tools/freeze-safety-gate/build.rs`.
 //!
-//! ONE implementation, TWO consumers (so the verb and the gate cannot diverge):
+//! Obligations (`[OB-n]` tags in the diagnostics; none has a waiver):
 //!
-//!   * the `aterm-census` bin (`targo --unverified run -p aterm-census --
-//!     --lazy-init`, src/main.rs) — the standalone runner.
-//!   * `tools/freeze-safety-gate/build.rs` — the same `cargo build` that runs
-//!     the temporal proof gate and the other four censuses; any violation
-//!     fails the compile.
+//! * OB-19 self-reentrancy: no initializer reaches a blocking touch of its own
+//!   cell (always a deadlock).
+//! * OB-20 mutual reentrancy: the lazy-init graph (`S -> T` when `S`'s
+//!   initializer can reach a blocking touch of `T`) is acyclic.
+//! * OB-21 liveness: an anti-vacuity floor. It fires only when the tree-wide
+//!   count of cells, initializers or blocking touches reaches zero, so it does
+//!   not catch a single site hidden behind a wrapper type; per-site coverage
+//!   rests on the vocabulary and join rules.
 //!
-//! The obligations (each fail-closed; `[OB-n]` tags appear in the diagnostics):
-//!
-//! * OB-19 SELF-REENTRANCY. No lazy initializer may reach a BLOCKING touch of
-//!   the very cell it is initializing. This is a self-loop in the lazy-init
-//!   graph and it is ALWAYS a deadlock — the thread waits on itself. There is
-//!   NO waiver channel, ever.
-//! * OB-20 MUTUAL REENTRANCY. The lazy-init graph — an edge `S -> T` whenever
-//!   `S`'s initializer can reach a blocking touch of `T` — must be ACYCLIC.
-//!   A cycle of length ≥ 2 is the same deadlock reached the long way round on
-//!   one thread, and an ordering hazard on two. Also no waiver channel.
-//! * OB-21 CENSUS LIVENESS — an ANTI-VACUITY floor, and nothing more. If the
-//!   derivation finds no cells, no initializers or no blocking touches at all,
-//!   the construct has been renamed wholesale (a wrapper type, a macro) and
-//!   this census is blind rather than clean, so the build fails until the
-//!   walker is re-audited — the same posture OB-4 takes for the offload
-//!   boundary.
-//!
-//!   BE CLEAR ABOUT WHAT IT DOES NOT DO, because this comment used to overclaim
-//!   it and the adversarial audit called that out: OB-21 fires only when a
-//!   count reaches ZERO TREE-WIDE. With 137 cells standing it can never fire,
-//!   so it is not an incremental backstop. ONE site refactored behind a wrapper
-//!   type is invisible to it, and the census will report "the walk sees the
-//!   idiom" while missing that site. Coverage of individual sites rests on the
-//!   vocabulary and the join rules below, not on OB-21.
-//!
-//! WHAT COUNTS AS A BLOCKING TOUCH. Only the operations that can PARK:
-//! `get_or_init` / `get_or_try_init` on a `OnceLock`/`OnceCell`, `call_once` /
-//! `call_once_force` on a `Once`, and ANY use of a `LazyLock`/`Lazy` cell
-//! (every use derefs, and the first deref runs the initializer). `OnceLock::get`,
-//! `::set`, `::get_mut` and `Once::is_completed` are NOT blocking touches and
-//! are deliberately ignored — re-entering through `get()` is the SUPPORTED
-//! escape from this hazard, and flagging it would push authors away from the
-//! fix.
+//! Blocking touches are the operations that can park: `get_or_init` /
+//! `get_or_try_init` on `OnceLock`/`OnceCell`, `call_once` / `call_once_force`
+//! on `Once`, and any use of a `LazyLock`/`Lazy` cell. `OnceLock::get`, `::set`,
+//! `::get_mut` and `Once::is_completed` are ignored: re-entering through
+//! `get()` is the supported escape.
 
 use crate::CensusOutcome;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -132,18 +99,16 @@ pub const LAZY_INIT_PRECISION_NOTE: &str =
         supported escape from this hazard, not an instance of it.
 ";
 
-// ---------------------------------------------------------------------------
-// Vocabulary
-// ---------------------------------------------------------------------------
+// Vocabulary.
 
-/// Type tokens that mark a `static` as a lazily-initialised cell whose EVERY
+/// Type tokens that mark a `static` as a lazily-initialised cell whose every
 /// use derefs it — so every mention is a blocking touch.
 const DEREF_LAZY_TYPES: &[&str] = &["LazyLock", "Lazy<", "SyncLazy"];
 
 /// Type tokens whose blocking surface is exactly [`BLOCKING_METHODS`].
 const METHOD_LAZY_TYPES: &[&str] = &["OnceLock", "OnceCell", "SyncOnceCell", "Once"];
 
-/// The methods that can PARK the calling thread inside a lazy cell: each one
+/// The methods that can park the calling thread inside a lazy cell: each one
 /// claims the cell and then runs (or waits for) the initializer.
 const BLOCKING_METHODS: &[&str] = &[
     "get_or_init",
@@ -157,28 +122,18 @@ const BLOCKING_METHODS: &[&str] = &[
 /// `static` declaration, is that cell's initializer.
 const LAZY_CTORS: &[&str] = &["LazyLock::new", "Lazy::new", "SyncLazy::new"];
 
-/// How far the walk follows SAME-FILE callees out of an initializer.
-///
-/// Four hops covers "the initializer calls a local helper that calls a local
-/// helper that asks the accessor again" — the deepest shape this hazard has
-/// taken here — while keeping the derived graph sparse. See the reach
-/// paragraph of [`LAZY_INIT_PRECISION_NOTE`] for why it is not unbounded.
+/// How far the walk follows same-file callees out of an initializer: enough for
+/// helper-calls-helper-calls-accessor while keeping the graph sparse (see
+/// [`LAZY_INIT_PRECISION_NOTE`]).
 const MAX_LOCAL_DEPTH: usize = 4;
 
-/// A callee name carried by MORE than this many definitions across the scan
-/// set is too merged to mean anything (`new`, `default`, `len`, `lock`, …), so
-/// the walk does not follow it.
-///
-/// Without this the census reports `TABLES.get_or_init(TransferTables::new)` as
-/// self-reentrant, because the ONE merged `new` node calls everything that any
-/// `new` in the workspace calls. Skipping over-merged names is the same
-/// report-what-is-legible choice the other censuses make when a name cannot be
-/// resolved, and it is stated in the precision note rather than hidden.
+/// A callee name with more than this many definitions across the scan set
+/// (`new`, `default`, `len`, …) is too merged to follow; otherwise the merged
+/// `new` node would make `TABLES.get_or_init(TransferTables::new)` look
+/// self-reentrant. Stated in the precision note.
 const AMBIGUOUS_DEFS: usize = 3;
 
-// ---------------------------------------------------------------------------
-// Derived facts
-// ---------------------------------------------------------------------------
+// Derived facts.
 
 /// A lazily-initialised cell found at its `static` declaration.
 #[derive(Debug, Clone)]
@@ -191,16 +146,16 @@ struct Cell {
     span: String,
     /// `true` for `LazyLock`/`Lazy` (every use derefs = every use blocks).
     deref_lazy: bool,
-    /// `true` when the cell is a STRUCT FIELD rather than a `static`.
+    /// `true` when the cell is a struct field rather than a `static`.
     field: bool,
 }
 
-/// One place a cell is touched in a way that can PARK the calling thread.
+/// One place a cell is touched in a way that can park the calling thread.
 #[derive(Debug, Clone)]
 struct Touch {
     cell: String,
     /// The enclosing fn, if the touch is inside one. A touch at item scope
-    /// cannot be REACHED by a call, so it never becomes a graph edge.
+    /// cannot be reached by a call, so it never becomes a graph edge.
     in_fn: Option<String>,
     span: String,
     /// How it blocks — `get_or_init` / `deref` — for the diagnostic.
@@ -215,7 +170,7 @@ struct Initializer {
     /// Repo-relative file the initializer is written in (the same-file walk).
     file: String,
     /// Every `<ident>(` called directly in the initializer's text, plus an
-    /// UNQUALIFIED function path passed instead of a closure.
+    /// unqualified function path passed instead of a closure.
     callees: BTreeSet<String>,
     /// Cells this initializer blockingly touches in its own text (depth 0).
     direct_touches: BTreeSet<String>,
@@ -230,9 +185,7 @@ struct Edge {
     path: String,
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+// Entry point.
 
 /// Run the lazy-init reentrancy census over an aterm checkout at `root`.
 #[must_use]
@@ -368,9 +321,7 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Derivation
-// ---------------------------------------------------------------------------
+// Derivation.
 
 /// Everything the walk derived from one tree.
 struct Derived {
@@ -409,14 +360,10 @@ fn scan_files(root: &Path) -> Vec<PathBuf> {
         let _ = crate::collect_rs_files(&dir, &mut files);
     }
     files.retain(|p| !crate::is_test_file(p));
-    // THE CENSUS DOES NOT POLICE ITS OWN FIXTURES — the same self-exclusion
-    // `scope_census::SELF_EXCLUDED_DIR` takes, for the same reason. This lane's
-    // red fixtures embed whole Rust programs in raw strings at column 0,
-    // including their `}` lines, and those are indistinguishable from real
-    // declarations to a lexical walker. (They also end this file's own
-    // `#[cfg(test)]` mask early, since a raw string CAN forge a line that is
-    // exactly `}` at indent 0 — the one way the indent rule below is weaker
-    // than it looks, and it is confined to files that quote Rust.)
+    // Skip this census's own sources, like `scope_census::SELF_EXCLUDED_DIR`:
+    // the red fixtures embed whole Rust programs in raw strings at column 0,
+    // which a lexical walker cannot tell from real declarations (and which can
+    // end the file's `#[cfg(test)]` mask early).
     files.retain(|p| {
         !p.to_string_lossy()
             .replace('\\', "/")
@@ -430,8 +377,7 @@ fn scan_files(root: &Path) -> Vec<PathBuf> {
 const SELF_EXCLUDED_DIR: &str = "crates/aterm-census/src";
 
 /// Read each source once, as written. Masking happens in
-/// [`derive_from_sources`], so the synthetic-source seam the red fixtures drive
-/// goes through the SAME masking the real tree does.
+/// [`derive_from_sources`], so synthetic fixtures go through the same masking.
 fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for path in files {
@@ -455,24 +401,21 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
     // suite, which is loud, not a terminal, which is silent.
     let sources: Vec<(String, String)> = raw_sources
         .iter()
-        .map(|(rel, raw)| (rel.clone(), mask_unshipped(raw)))
+        .map(|(rel, raw)| (rel.clone(), crate::lock_order::mask_cfg_test_items(raw)))
         .collect();
     let sources = &sources[..];
     let mut cells: Vec<Cell> = Vec::new();
     let mut defs: BTreeMap<String, usize> = BTreeMap::new();
     let mut local: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
 
-    // PASS 1: every cell in the tree, and the per-file call graph. Cells must
-    // all be known before touches are collected, because a deref-lazy cell is
-    // touched by files that may be read before its declaration.
+    // Pass 1: every cell and the per-file call graph. All cells must be known
+    // before touches are collected, since a deref-lazy cell may be touched in a
+    // file read before its declaration.
     for (rel, text) in sources {
-        // Attribute every call to the fn whose body the line sits in, using
-        // THIS module's segmentation rather than `parse_source_fns` — the
-        // shared one has no body-less-declaration guard, and an `extern "C"`
-        // block's `fn foo(..) -> T;` there silently absorbs the next real fn's
-        // body into its own callee set. That is not a hypothetical: it is what
-        // produced the phantom `IOServiceMatching -> connection` edge in
-        // keymap.rs the first time this census ran.
+        // Attribute calls with this module's segmentation, not
+        // `parse_source_fns`, which lacks the body-less-declaration guard: an
+        // `extern "C"` block's `fn foo(..) -> T;` would absorb the next fn's
+        // body.
         let lines: Vec<&str> = text.lines().collect();
         let enclosing = enclosing_fns(&lines);
         let per_file = local.entry(rel.clone()).or_default();
@@ -524,44 +467,8 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
     }
 }
 
-/// Blank `#[cfg(test)]` / `#[cfg(kani)]` items — the SHARED masker, which this
-/// lane's adversarial audit is the reason to trust.
-///
-/// This was a private COPY, and the comment in its place said why:
-/// `lock_order::mask_gated_items` found the end of a gated item by counting `{`
-/// and `}` INCLUDING braces inside string and char literals, so one `"}"`,
-/// `'{'` or `format!("{{")` desynchronised the depth and every remaining line
-/// of the file was blanked — 19 553 of `crates/aterm-gui/src/lib.rs`'s 39 833,
-/// and everything after line 3 046 of `seamless.rs`'s 5 813, the very subsystem
-/// the v0.65.0 freeze lived in. The copy ended a body at rustfmt's `<indent>}`
-/// instead, and the note recorded that fixing the SHARED masker was the right
-/// repair, deferred only because un-blinding the other censuses had to be
-/// adjudicated by their owners rather than arrive as a side effect of this
-/// lane's work.
-///
-/// That adjudication happened (2026-08-30) and the repair now lives in
-/// `mask_gated_items` itself — with two rules the copy never had. An item can
-/// end at a COMMA at the gate's own indent (an enum variant, a struct field, a
-/// match arm): the copy ran such an item on to the next `<indent>}`, which at
-/// `crates/aterm-gui/src/lib.rs:2570` means 830 lines of shipped `enum`
-/// swallowed. And the walk that looks for the body's opening brace masks
-/// literals first: without that, `debug_assert!(` … `"exceeds count({})"` … `)`
-/// at `crates/aterm-scrollback/src/cold_tier.rs:612` is cut in half at its own
-/// format string. Keeping the copy would have kept both of those bugs in this
-/// lane alone, so the copy is gone: ONE masker, one place to fix it, and this
-/// lane's fixtures still drive it through [`derive_from_sources`].
-///
-/// The caveat the copy's comment named is unchanged and now documented at the
-/// shared masker too: a raw string CAN forge a line that is exactly `<indent>}`
-/// and end a body early. It costs at most a false positive (masking is
-/// subtractive), it only happens in files that quote whole Rust programs, and
-/// this lane already excludes its own — see [`SELF_EXCLUDED_DIR`].
-fn mask_unshipped(text: &str) -> String {
-    crate::lock_order::mask_gated_items(text, &["#[cfg(test)]", "#[cfg(kani)]"])
-}
-
 /// `static [mut] NAME: …<lazy type>… = …;` declarations, wherever they sit —
-/// item scope OR inside a fn body (the shipped bug's cell was fn-local).
+/// item scope or inside a fn body.
 fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
     for (i, line) in text.lines().enumerate() {
         let code = crate::strip_line_comment(line);
@@ -577,11 +484,9 @@ fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
             continue;
         }
         if let Some(existing) = out.iter_mut().find(|c| c.name == name) {
-            // Same-named cells merge into ONE node — the documented
-            // over-approximation. Merge toward the WIDER hazard: if either
-            // spelling derefs, the merged node derefs, or an earlier
-            // `OnceLock` named `CACHE` would silently erase a later
-            // `LazyLock CACHE`'s mention rule.
+            // Same-named cells merge into one node (the documented
+            // over-approximation), toward the wider hazard: if either spelling
+            // derefs, the merged node derefs.
             existing.deref_lazy |= deref_lazy;
             // A `static` won this merge, so the node is no longer field-shaped.
             existing.field = false;
@@ -604,20 +509,10 @@ fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
     collect_field_cells(text, rel, out);
 }
 
-/// Cells that are a STRUCT FIELD rather than a `static`.
-///
-/// The first cut of this census only knew `static NAME: OnceLock<..>`, and a
-/// `OnceLock` field re-entered from its own initializer —
-/// `*self.cache.get_or_init(|| self.armed())` — sailed through GREEN. That is
-/// not a contrived shape: it is the ordinary way to memoise something per
-/// session, and it parks exactly as hard as the shipped `static` did. Measured
-/// on this tree when the gap was found: one field cell
-/// (`operator_host.rs:434 marker_queue`), zero blocking touches on it — so the
-/// hazard was latent, not live, which is the moment to close it.
-///
-/// Everything downstream needs no change: a touch is found by the identifier
-/// before the blocking method, and for `self.cache.get_or_init(..)` that
-/// identifier is already `cache`.
+/// Cells that are a struct field rather than a `static`, e.g.
+/// `*self.cache.get_or_init(|| self.armed())`, which parks just like a
+/// `static`. Touches are found by the identifier before the blocking method,
+/// which for `self.cache.get_or_init(..)` is `cache`.
 fn collect_field_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
     for (i, line) in text.lines().enumerate() {
         let code = crate::strip_line_comment(line);
@@ -637,14 +532,10 @@ fn collect_field_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
             name,
             kind,
             span: format!("{rel}:{}", i + 1),
-            // A FIELD cell is tracked through its blocking METHODS only, never
-            // through bare mentions. A `static LazyLock` earns the mention rule
-            // because its name is globally unique and every use derefs it; a
-            // field name like `cache` or `state` is neither, and treating every
-            // occurrence of it as a touch would manufacture edges — and this
-            // obligation has no waiver channel, so a false RED is expensive.
-            // Consequence, recorded in the precision note: a `LazyLock` FIELD
-            // re-entered by a bare deref is not caught.
+            // Field cells are tracked through blocking methods only, never bare
+            // mentions: names like `cache` are not unique and would manufacture
+            // edges. So a `LazyLock` field re-entered by a bare deref is not
+            // caught (recorded in the precision note).
             deref_lazy: false,
             field: true,
         });
@@ -678,7 +569,7 @@ fn field_cell_name(code: &str) -> Option<String> {
         return None;
     }
     let ty = ty.trim();
-    // A borrowed cell is someone else's, passed in — the OWNER declares it.
+    // A borrowed cell is someone else's, passed in; its owner declares it.
     if ty.starts_with('&') {
         return None;
     }
@@ -692,11 +583,8 @@ fn field_cell_name(code: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// The identifier a `[pub[(..)]] static [mut] NAME…` line declares.
-///
-/// The visibility prefix is stripped first. Without that, `pub(crate) static
-/// CELL: OnceLock<..>` was not recognised as a cell AT ALL — the census simply
-/// did not see it, and a self-recursive initializer on it passed GREEN.
+/// The identifier a `[pub[(..)]] static [mut] NAME…` line declares; the
+/// visibility prefix is stripped first.
 fn static_name(code: &str) -> Option<String> {
     let t = code.trim_start();
     let t = if let Some(rest) = t.strip_prefix("pub(") {
@@ -716,12 +604,9 @@ fn static_name(code: &str) -> Option<String> {
 /// The `static` declaration starting at `line_idx`, up to and including its
 /// terminating `;` (bounded, so a parse slip cannot run away).
 fn declaration_text(text: &str, line_idx: usize) -> String {
-    // The terminator is a `;` at BRACKET DEPTH 0. Stopping at the first `;`
-    // anywhere truncated every declaration whose TYPE contains one —
-    // `static LUT: LazyLock<[f32; 256]> =` ends its first line inside the
-    // array length — so the wrapped `LazyLock::new(..)` on the next line was
-    // never found and the cell entered the graph with NO initializer at all.
-    // Measured when this was found: 6 of the 10 shipping deref-lazy cells.
+    // The terminator is a `;` at bracket depth 0: a type like
+    // `LazyLock<[f32; 256]>` contains one, and the initializer follows on the
+    // next line.
     let mut out = String::new();
     let mut depth = 0i32;
     for line in text.lines().skip(line_idx).take(40) {
@@ -746,20 +631,13 @@ fn declaration_text(text: &str, line_idx: usize) -> String {
 
 /// Blocking touches and initializers in one file.
 ///
-/// THE SCAN IS OVER THE WHOLE FILE, NOT LINE BY LINE, and that is a correctness
-/// requirement rather than a refactor. Rust is not line-oriented and rustfmt
-/// wraps at 100 columns, so the incident's own shape — with identifiers only
-/// slightly longer than the ones that shipped — formats as
+/// The scan is over the whole file, not line by line: rustfmt can put the
+/// receiver and the blocking method on different lines, e.g.
 ///
 /// ```text
 ///     *ARMED_SEAMLESS_REEXEC_FLAG
 ///         .get_or_init(|| debug_seamless_reexec_armed())
 /// ```
-///
-/// where the receiver and the blocking method are on DIFFERENT LINES. The first
-/// cut of this census matched `.get_or_init(` within a single line and took the
-/// identifier immediately before it, so that shape — the real bug, merely
-/// reformatted — passed GREEN. `cargo fmt` could turn a RED tree green.
 fn collect_touches_and_inits(
     text: &str,
     rel: &str,
@@ -863,12 +741,8 @@ fn line_start_index(joined: &str) -> Vec<usize> {
     out
 }
 
-/// Find the next `.<method>(` after `from`, tolerating a TURBOFISH between the
-/// name and the parenthesis: `CELL.get_or_init::<_>(|| ..)` is ordinary Rust and
-/// its `F` is inferrable, so nothing stops an author writing it. Matching the
-/// literal `.get_or_init(` missed it entirely — the touch AND its initializer
-/// both vanished, and a self-recursive cell spelled that way passed the gate
-/// GREEN. Found by `codex review`, not by the adversarial sweep.
+/// Find the next `.<method>(` after `from`, tolerating a turbofish between the
+/// name and the parenthesis (`CELL.get_or_init::<_>(|| ..)`).
 ///
 /// Returns `(dot_index, open_paren_index)`.
 fn find_method_call(hay: &str, method: &str, from: usize) -> Option<(usize, usize)> {
@@ -957,9 +831,8 @@ const fn is_ident_byte(b: u8) -> bool {
 }
 
 /// For every line, the fn whose body it sits in (rustfmt's
-/// closing-brace-at-fn-indent invariant, the same segmentation the main-loop
-/// census uses). Nested fns and closures resolve to the OUTERMOST fn, which is
-/// the entry point a caller can actually reach.
+/// closing-brace-at-fn-indent invariant, as in the main-loop census). Nested
+/// fns and closures resolve to the outermost fn.
 fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
     let mut out = vec![None; lines.len()];
     let mut i = 0usize;
@@ -968,12 +841,9 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
             i += 1;
             continue;
         };
-        // A fn DECLARATION has no body: `unsafe extern "C" { fn f(..) -> T; }`
-        // and trait-method signatures both end in `;` before any `{`. Treating
-        // one as an opening body makes the close-brace scan swallow everything
-        // down to the next same-indent `}` — which is how `fn IOServiceMatching`
-        // in keymap.rs came out as the enclosing fn of a `get_or_init` 20 lines
-        // later, i.e. a phantom self-reentrancy finding. Observed, not feared.
+        // A fn declaration has no body (`extern "C" { fn f(..) -> T; }`, trait
+        // signatures); treating one as a body would swallow lines down to the
+        // next same-indent `}` and invent callers.
         if is_bodyless_declaration(lines, i) {
             i += 1;
             continue;
@@ -1001,23 +871,17 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
     out
 }
 
-/// Whether the fn definition starting at `at` is a body-less DECLARATION: its
+/// Whether the fn definition starting at `at` is a body-less declaration: its
 /// signature reaches a `;` before it ever reaches a `{`.
 fn is_bodyless_declaration(lines: &[&str], at: usize) -> bool {
-    // DEPTH MATTERS. `fn table() -> [f32; 256] {` has a `;` before its `{`, and
-    // reading that as "declaration, no body" made the census skip the whole
-    // function — every call in it vanished from the graph, and a cell it
-    // re-entered went GREEN. Only a `;` at bracket depth 0 ends a signature.
+    // Only a `;` at bracket depth 0 ends a signature: `fn table() -> [f32; 256] {`
+    // has one inside its return type.
     let mut depth = 0i32;
     for line in lines.iter().skip(at).take(24) {
         for b in crate::strip_line_comment(line).bytes() {
             match b {
-                // ONLY `()` and `[]`. Counting `<`/`>` as brackets looks right
-                // and is wrong: the `>` of the return arrow `->` decrements on
-                // every signature, so `fn t() -> [f32; 256] {` arrived at its
-                // array's `;` already at depth -1 and was still read as a
-                // body-less declaration. `[]` is what carries an array length,
-                // which is the only `;` a signature realistically holds.
+                // Only `()` and `[]`: counting `<`/`>` would let the `>` of
+                // `->` decrement on every signature.
                 b'(' | b'[' => depth += 1,
                 b')' | b']' => depth -= 1,
                 b'{' if depth <= 0 => return false,
@@ -1029,9 +893,8 @@ fn is_bodyless_declaration(lines: &[&str], at: usize) -> bool {
     false
 }
 
-/// The text between the `(` at byte offset `at` and its matching `)`, capped at
-/// 40 000 bytes (a bound, not a semantic limit — no real initializer is longer).
-/// Returned as lines, which is what the callee scan wants.
+/// The text between the `(` at byte offset `at` and its matching `)`, as lines,
+/// capped at 40 000 bytes.
 fn balanced(joined: &str, at: usize) -> Vec<String> {
     let bytes = joined.as_bytes();
     let mut depth = 0i32;
@@ -1051,12 +914,8 @@ fn balanced(joined: &str, at: usize) -> Vec<String> {
     joined[at..end].lines().map(str::to_string).collect()
 }
 
-/// Every `<ident>(` in the initializer, plus an UNQUALIFIED function path
-/// passed instead of a closure (`CELL.get_or_init(build_it)`).
-///
-/// A QUALIFIED path (`CELL.get_or_init(TransferTables::new)`) is deliberately
-/// not followed: its last segment is a merged super-node (`new`) that carries
-/// no information about the function actually referenced.
+/// Every `<ident>(` in the initializer, plus a function path passed instead of
+/// a closure (`CELL.get_or_init(build_it)`).
 fn initializer_callees(body: &[String]) -> BTreeSet<String> {
     let mut out = crate::callee_names(body);
     let joined = body.join(" ");
@@ -1066,13 +925,9 @@ fn initializer_callees(body: &[String]) -> BTreeSet<String> {
         .trim_end_matches(')')
         .trim();
     if !inner.contains('|') && !inner.contains('(') && !inner.is_empty() {
-        // A QUALIFIED path's last segment is followed too, and the ambiguity
-        // filter in `reachable` is what makes that safe: `Type::new` resolves
-        // to the merged `new` super-node (246 definitions here) and is dropped
-        // there, while `Type::with_builtin_rules` names exactly one function
-        // and is worth following. Refusing every qualified path — the first
-        // cut — meant `CELL.get_or_init(Type::assoc_fn)` produced an
-        // initializer with NO outgoing edges at all.
+        // A qualified path's last segment is followed too; the ambiguity filter
+        // in `reachable` drops merged names like `new`, while a unique name
+        // such as `Type::with_builtin_rules` is worth following.
         let last = inner.rsplit("::").next().unwrap_or(inner);
         let ident: String = last
             .chars()
@@ -1085,7 +940,7 @@ fn initializer_callees(body: &[String]) -> BTreeSet<String> {
     out
 }
 
-/// Cells this initializer text touches BLOCKINGLY in its own body (depth 0).
+/// Cells this initializer text touches blockingly in its own body (depth 0).
 fn direct_touches(body: &[String], cells: &[Cell]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in body {
@@ -1109,9 +964,7 @@ fn direct_touches(body: &[String], cells: &[Cell]) -> BTreeSet<String> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// The lazy-init graph
-// ---------------------------------------------------------------------------
+// The lazy-init graph.
 
 /// `S -> T` whenever `S`'s initializer can reach a blocking touch of `T`.
 fn derive_edges(d: &Derived) -> Vec<Edge> {
@@ -1157,10 +1010,9 @@ fn derive_edges(d: &Derived) -> Vec<Edge> {
 }
 
 /// Fn names reachable from `init`, mapped to the caller each was first reached
-/// from. The DIRECT callees are taken as written (a call out of the initializer
-/// names a real function); everything deeper is followed only within
-/// `init.file`, and never through an over-merged name. See the reach paragraph
-/// of [`LAZY_INIT_PRECISION_NOTE`].
+/// from. Direct callees are taken as written; deeper calls are followed only
+/// within `init.file` and never through an over-merged name (see
+/// [`LAZY_INIT_PRECISION_NOTE`]).
 fn reachable(d: &Derived, init: &Initializer) -> BTreeMap<String, Option<String>> {
     let empty = BTreeMap::new();
     let local = d.local.get(&init.file).unwrap_or(&empty);
@@ -1210,12 +1062,9 @@ fn render_path(reach: &BTreeMap<String, Option<String>>, target: &str) -> String
 
 /// Split the graph's cycles into self-loops (OB-19) and mutual cycles (OB-20).
 ///
-/// Mutual cycles are reported as STRONGLY CONNECTED COMPONENTS, not enumerated
-/// elementary cycles. Enumerating every elementary cycle of an over-approximated
-/// graph is exponential — the first draft of this walker was OOM-killed doing
-/// exactly that, which would have made the freeze gate itself the hang it
-/// exists to prevent. An SCC is linear, and it is the right unit of repair
-/// anyway: every cell in one component can reach every other.
+/// Mutual cycles are reported as strongly connected components: enumerating
+/// elementary cycles is exponential on an over-approximated graph, while SCCs
+/// are linear and are the unit of repair.
 fn find_cycles(edges: &[Edge]) -> (Vec<Edge>, Vec<Vec<Edge>>) {
     let mut self_loops: Vec<Edge> = Vec::new();
     let mut nodes: BTreeSet<&str> = BTreeSet::new();
@@ -1287,7 +1136,7 @@ fn find_cycles(edges: &[Edge]) -> (Vec<Edge>, Vec<Vec<Edge>>) {
         }
     }
 
-    // Render each component as the edges INSIDE it, sorted for determinism.
+    // Render each component as the edges inside it, sorted for determinism.
     let mut out: Vec<Vec<Edge>> = Vec::new();
     for component in components {
         let members: BTreeSet<&str> = component.iter().map(|i| order[*i]).collect();
@@ -1309,9 +1158,8 @@ fn find_cycles(edges: &[Edge]) -> (Vec<Edge>, Vec<Vec<Edge>>) {
     (self_loops, out)
 }
 
-/// Drive the census over synthetic `(path, source)` pairs — the seam the red
-/// fixtures use, so a demonstration exercises the SAME derivation and the SAME
-/// verdict logic the build gate runs, not a lookalike.
+/// Drive the census over synthetic `(path, source)` pairs, through the same
+/// derivation and verdict logic as the build gate.
 #[cfg(test)]
 fn run_synth_sources(sources: &[(String, String)]) -> CensusOutcome {
     let derived = derive_from_sources(sources);
@@ -1321,22 +1169,13 @@ fn run_synth_sources(sources: &[(String, String)]) -> CensusOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("crates/aterm-census lives two levels under the aterm root")
-            .to_path_buf()
-    }
+    use crate::scan_set::test_fixtures::repo_root;
 
     fn src(path: &str, body: &str) -> (String, String) {
         (path.to_string(), body.to_string())
     }
 
-    /// GREEN must not be vacuous: the walk has to actually SEE the idiom on
-    /// this tree, or OB-21 is the only thing standing between a renamed
-    /// construct and a silently blind gate.
+    /// Green is not vacuous: the walk sees the idiom on this tree.
     #[test]
     fn the_real_tree_derivation_is_not_empty() {
         let files = scan_files(&repo_root());
@@ -1354,15 +1193,13 @@ mod tests {
         assert!(!derived.inits.is_empty() && !derived.touches.is_empty());
     }
 
-    /// The v0.65.0 / v0.66.0 source of `debug_seamless_reexec_armed`, verbatim
-    /// from `crates/aterm-gui/src/app_update_screen.rs:51` at tag v0.65.0 —
-    /// fn-local `OnceLock`, multi-statement closure, the self-call first — plus
-    /// the main-thread caller that reached it on every apply.
+    /// The self-reentrant `debug_seamless_reexec_armed` shape (fn-local
+    /// `OnceLock`, multi-statement closure, self-call first) plus its
+    /// main-thread caller.
     ///
-    /// Hoisted OUT of the fixture body on purpose: `xtask`'s non-vacuity
-    /// checker bounds a registered fixture at the first `\n    }` after its
-    /// `fn` line, and this snippet's own `    })` would truncate the body
-    /// before the assertions, making a real red fixture read as no fixture.
+    /// Hoisted out of the fixture body because `xtask`'s non-vacuity checker
+    /// bounds a fixture at the first `\n    }` after its `fn` line, and this
+    /// snippet's own `    })` would truncate it.
     const V065_SHIPPED_SHAPE: &str = r#"
 pub(crate) fn debug_seamless_reexec_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1381,8 +1218,8 @@ pub(crate) fn apply_staged_update_now() -> bool {
 }
 "#;
 
-    /// THE RED FIXTURE (non-vacuity): the EXACT shape that shipped in v0.65.0
-    /// and v0.66.0 and froze the terminal on its first automatic update apply.
+    /// Non-vacuity fixture: the self-reentrant fn-local `OnceLock` shape must
+    /// go red.
     #[test]
     fn the_v065_self_recursive_once_lock_is_red_with_its_path() {
         let sources = vec![src(
@@ -1417,8 +1254,7 @@ pub(crate) fn apply_staged_update_now() -> bool {
         );
     }
 
-    /// …and the SHIPPED REPAIR is green. Same file, same cell, the initializer
-    /// reading the environment instead of itself.
+    /// The repair (the initializer reads the environment, not itself) is green.
     #[test]
     fn the_shipped_repair_of_that_site_is_green() {
         let sources = vec![src(
@@ -1472,9 +1308,7 @@ fn beta() -> bool {
         );
     }
 
-    /// The SUPPORTED escape is not a finding: `get()` cannot park, so an
-    /// initializer that peeks at its own cell through it is fine. Flagging
-    /// this would push authors away from the repair the census recommends.
+    /// Peeking at the own cell through `get()` cannot park and is not a finding.
     #[test]
     fn a_non_blocking_get_back_edge_is_not_a_finding() {
         let sources = vec![src(
@@ -1493,7 +1327,7 @@ fn armed() -> bool {
         assert!(out.ok, "a `get()` peek must stay GREEN:\n{}", out.log);
     }
 
-    /// A `LazyLock` has no accessor method to look for — EVERY use derefs it,
+    /// A `LazyLock` has no accessor method to look for — every use derefs it,
     /// so the reader that mentions it is the trigger.
     #[test]
     fn a_deref_lazy_cell_reentered_through_a_reader_is_red() {
@@ -1537,11 +1371,8 @@ fn seed() -> Vec<u8> {
         );
     }
 
-    /// PRECISION REGRESSION, observed on the real tree the first time this
-    /// census ran: `unsafe extern "C" { fn f(..) -> T; }` declares a fn with no
-    /// body. Segmenting it as if it had one let it absorb the NEXT function's
-    /// body, and `keymap.rs`'s `connection()` — which does own a `OnceLock` —
-    /// came out as a phantom self-reentrancy. A declaration must own no lines.
+    /// A body-less `extern "C"` declaration owns no lines, so it cannot absorb
+    /// the next function's body and invent a self-reentrancy.
     #[test]
     fn an_extern_declaration_does_not_absorb_the_next_fn_body() {
         let sources = vec![src(
@@ -1574,10 +1405,8 @@ fn open_port(dict: *mut u8) -> Option<u32> {
         );
     }
 
-    /// A QUALIFIED constructor reference (`CELL.get_or_init(Type::new)`) must
-    /// not be followed: its last segment is the merged `new` super-node, and
-    /// following it reported `TABLES` in aterm-core as self-reentrant on the
-    /// first run of this census. Real shape, kept as a fixture.
+    /// A qualified constructor reference (`CELL.get_or_init(Type::new)`) is not
+    /// followed through the merged `new` node.
     #[test]
     fn a_qualified_ctor_reference_is_not_followed() {
         let sources = vec![
@@ -1611,9 +1440,8 @@ fn transfer_tables_reader() -> u8 {
         );
     }
 
-    /// An UNQUALIFIED fn reference passed instead of a closure IS the
-    /// initializer, and must be followed — otherwise the commonest terse
-    /// spelling of this hazard is invisible.
+    /// An unqualified fn reference passed instead of a closure is the
+    /// initializer and is followed.
     #[test]
     fn an_unqualified_fn_reference_initializer_is_followed() {
         let sources = vec![src(
@@ -1670,7 +1498,7 @@ fn live() -> bool {
     }
 
     /// A `Once` is a cell too: `ONCE.call_once(|| ..)` parks exactly the same
-    /// way, and the shipped surface has 15 of them.
+    /// way.
     #[test]
     fn a_self_recursive_once_call_once_is_red() {
         let sources = vec![src(
@@ -1693,11 +1521,7 @@ fn init_crypto() {
         );
     }
 
-    /// REGRESSION: the first cut of this census only knew `static` cells, so a
-    /// `OnceLock` STRUCT FIELD re-entered from its own initializer passed
-    /// GREEN. That is not a contrived shape — it is the ordinary way to
-    /// memoise per session — and it parks exactly as hard as the shipped
-    /// `static` did. Found by attacking this census rather than by reading it.
+    /// A `OnceLock` struct field re-entered from its own initializer is red.
     #[test]
     fn a_self_recursive_oncelock_field_is_red() {
         let sources = vec![src(
@@ -1732,9 +1556,7 @@ impl Session {
         );
     }
 
-    /// …and an ordinary field cell whose initializer does NOT re-enter is
-    /// GREEN. 49 of this tree's 136 cells are fields; a census that reddened
-    /// them would be deleted within the hour.
+    /// A field cell whose initializer does not re-enter is green.
     #[test]
     fn an_ordinary_oncelock_field_is_green() {
         let sources = vec![src(
@@ -1760,9 +1582,8 @@ impl Session {
         );
     }
 
-    /// A BORROWED cell is someone else's — the owner declares it, and treating
-    /// a `&OnceLock<T>` parameter as a declaration would register the same cell
-    /// once per function that takes one.
+    /// A borrowed `&OnceLock<T>` parameter is not a declaration; the owner
+    /// declares the cell.
     #[test]
     fn a_borrowed_cell_parameter_is_not_a_declaration() {
         assert!(field_cell_name("    cache: std::sync::OnceLock<bool>,").is_some());
@@ -1773,12 +1594,8 @@ impl Session {
         assert!(field_cell_name("    name: String,").is_none());
     }
 
-    /// THE WORST ONE THE ADVERSARIAL AUDIT FOUND, and the reason this walker
-    /// scans the whole file instead of line by line: rustfmt wraps at 100
-    /// columns, so the incident's own shape with identifiers only slightly
-    /// longer than the ones that shipped puts the receiver and the blocking
-    /// method on DIFFERENT LINES. The line-oriented first cut passed it GREEN
-    /// — meaning `cargo fmt` could turn a red tree green.
+    /// The receiver and the blocking method on different lines (as rustfmt
+    /// wraps long identifiers) is still red.
     #[test]
     fn a_receiver_the_formatter_wrapped_onto_its_own_line_is_still_red() {
         let sources = vec![src(
@@ -1805,10 +1622,7 @@ pub fn debug_seamless_reexec_armed() -> bool {
         );
     }
 
-    /// A visibility prefix is not a disguise. `pub(crate) static CELL:
-    /// OnceLock<..>` was not recognised as a cell AT ALL — `static_name`
-    /// stripped only a bare `static `, so the census did not merely miss the
-    /// cycle, it never saw the cell.
+    /// `pub(crate) static CELL: OnceLock<..>` is recognised as a cell.
     #[test]
     fn a_pub_static_cell_is_still_a_cell() {
         for vis in ["pub ", "pub(crate) ", "pub(super) ", ""] {
@@ -1833,12 +1647,8 @@ pub fn armed() -> bool {{
         }
     }
 
-    /// An array length in a return type is not the end of a signature.
-    /// `fn table() -> [f32; 256] {` reached its `;` and was read as a body-less
-    /// declaration, which deleted the whole function from the call graph — so
-    /// a cell it re-entered went GREEN. (The first fix for this counted `<`
-    /// and `>` as brackets too, which is worse: the `>` of `->` fires on every
-    /// signature in the workspace.)
+    /// An array length in a return type (`fn table() -> [f32; 256] {`) does not
+    /// end the signature, so the function stays in the call graph.
     #[test]
     fn an_array_length_in_a_signature_does_not_delete_the_function() {
         let sources = vec![src(
@@ -1869,8 +1679,7 @@ fn build() -> [f32; 256] {
         );
     }
 
-    /// A real body-less declaration still owns no lines — the array fix must
-    /// not have re-broken the `extern "C"` case the other regression pins.
+    /// A real body-less declaration still owns no lines.
     #[test]
     fn the_depth_rule_still_treats_a_real_declaration_as_bodyless() {
         let lines = vec![
@@ -1891,12 +1700,8 @@ fn build() -> [f32; 256] {
         );
     }
 
-    /// A `;` inside a static's TYPE is not the end of its declaration.
-    /// `declaration_text` stopped at the first `;` anywhere, so
-    /// `static LUT: LazyLock<[f32; 256]> =` ended on its own first line and the
-    /// wrapped `LazyLock::new(..)` beneath it was never found — the cell
-    /// entered the graph with NO initializer, which cannot cycle. Six of the
-    /// ten shipping deref-lazy cells were in exactly that state.
+    /// A `;` inside a static's type (`LazyLock<[f32; 256]>`) does not end its
+    /// declaration, so the wrapped initializer is found.
     #[test]
     fn a_wrapped_ctor_after_a_semicolon_in_the_type_is_still_found() {
         let sources = vec![src(
@@ -1923,11 +1728,8 @@ fn build() -> [f32; 256] {
         );
     }
 
-    /// TURBOFISH. `CELL.get_or_init::<_>(|| ..)` is ordinary Rust — the closure
-    /// type is inferrable, so nothing stops an author writing it — and matching
-    /// the literal `.get_or_init(` missed the touch AND its initializer, so a
-    /// self-recursive cell spelled that way passed the mandatory gate GREEN.
-    /// Found by `codex review`, not by the six-adversary sweep.
+    /// A turbofish (`CELL.get_or_init::<_>(|| ..)`) is still a touch with an
+    /// initializer.
     #[test]
     fn a_turbofished_blocking_call_is_still_a_touch() {
         let sources = vec![src(
@@ -1953,9 +1755,8 @@ pub fn armed() -> bool {
         );
     }
 
-    /// …and the name must still END at the method: `get_or_init_with` is its own
-    /// entry in the vocabulary and must not be matched as `get_or_init` with a
-    /// stray suffix, or the initializer span would start at the wrong paren.
+    /// The name must end at the method: `get_or_init_with` is its own
+    /// vocabulary entry, not `get_or_init` with a suffix.
     #[test]
     fn a_longer_method_name_is_not_matched_as_a_shorter_one() {
         let hay = "CELL.get_or_init_with(|| 1)";

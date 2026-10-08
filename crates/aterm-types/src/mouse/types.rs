@@ -116,10 +116,7 @@ impl MouseButton {
 /// space genuinely keeps growing — xterm already reserves buttons 10/11) a wheel
 /// has exactly two axes and two senses on each, and every consumer wants an
 /// EXHAUSTIVE match so a fifth variant would be a compile error rather than a
-/// silently-dropped gesture. That is the bug this type exists to kill: the
-/// direction used to be a bare `dir_up: bool`, which cannot represent the
-/// horizontal axis at all, so a tilt-wheel notch and a two-finger horizontal
-/// trackpad swipe were dropped before they could ever be encoded.
+/// silently-dropped gesture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WheelDir {
     /// Wheel up / content scrolled toward older lines (xterm button 4).

@@ -2,14 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Display-offset damage computation.
-//!
-//! Derives which rows need redrawing when the terminal's display offset
-//! (scroll position into history) changes. All four scroll functions that
-//! modify `display_offset` delegate here instead of carrying bespoke
-//! row-marking loops.
-//!
-//! See #6072 and `designs/2026-03-13-6072-display-offset-damage-deduplication.md`.
+//! Display-offset damage: which rows need redrawing when the scroll position
+//! into history changes. Every function that modifies `display_offset`
+//! delegates here.
 
 use super::Damage;
 
@@ -31,14 +26,10 @@ pub(crate) enum DisplayOffsetDamage {
     },
 }
 
-/// Compute damage for an arbitrary display-offset transition.
-///
-/// Given old and new display offsets plus visible row count, returns which
-/// rows need redrawing.
-///
-/// - Scrolling up (new > old) → top rows are new content from scrollback.
-/// - Scrolling down (new < old) → bottom rows are newly exposed live content.
-/// - Delta ≥ visible rows → full damage.
+/// Damage for a display-offset transition over `visible_rows`:
+/// - scrolling up (new > old): top rows are new content from scrollback;
+/// - scrolling down (new < old): bottom rows are newly exposed live content;
+/// - delta ≥ visible rows: full damage.
 #[must_use]
 pub(crate) fn compute_display_offset_damage(
     old_offset: usize,
@@ -70,10 +61,7 @@ pub(crate) fn compute_display_offset_damage(
 }
 
 impl Damage {
-    /// Apply display-offset damage to this damage tracker.
-    ///
-    /// Convenience method that maps [`DisplayOffsetDamage`] to the
-    /// appropriate `mark_*` calls.
+    /// Apply a [`DisplayOffsetDamage`] through the matching `mark_*` calls.
     pub(crate) fn apply_display_offset_damage(&mut self, damage: DisplayOffsetDamage) {
         match damage {
             DisplayOffsetDamage::None => {}

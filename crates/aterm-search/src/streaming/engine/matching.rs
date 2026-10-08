@@ -57,10 +57,7 @@ fn resolve_columns(
         Some(lm) => (lm.map_to_original(abs_pos), lm.map_to_original(match_end)),
         None => (abs_pos, match_end),
     };
-    (
-        col_map.byte_to_column(start_byte),
-        col_map.byte_to_column(end_byte),
-    )
+    col_map.span(start_byte, end_byte)
 }
 
 /// Production literal search: find all substring matches via `str::find`.

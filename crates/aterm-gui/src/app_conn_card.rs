@@ -1,23 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `App` glue for the connection confirm/configure card ([`crate::conn_card`],
-//! design §3.3 + §2.5): open (the tab menu's Configure…, the session picker's
-//! choice, and — via [`App::open_confirm_card`] — the drag stage's drop),
-//! drive (arrows/Tab move focus, Left/Right cycle, pointer on the chips), and
-//! settle: **Enter confirms, Esc cancels, nothing mints before Confirm.**
+//! `App` glue for the connection confirm/configure card ([`crate::conn_card`]):
+//! open (the tab menu's Configure…, the session picker, and the drag stage's
+//! drop via [`App::open_confirm_card`]), drive (arrows/Tab move focus,
+//! Left/Right cycle, pointer on the chips), and settle: Enter confirms, Esc
+//! cancels, nothing mints before Confirm.
 //!
-//! Modelled on `app_tab_menu.rs` throughout: the state lives in the single
-//! modal [`crate::overlay::Overlay`] slot, so the key gate structurally sits
-//! BEFORE every keybinding/`[key_sequences]`/PTY path (winit side) and the
-//! engine-neutral `App::input` gate swallows controller bytes identically —
-//! Enter/Esc can never leak into T's PTY (§3.3). Confirm executes the card's
-//! pure [`crate::conn_card::ConnCardPlan`] through the ONE declarative
-//! [`crate::connections::connect_in`] seam (set semantics, §2.5) and pokes the
-//! §2.4 freshness funnel; confirming here is also a §1.4#8 first-use surface
-//! (same once-per-config latch as the spawn presets, so never double-noticed).
-
-use winit::window::CursorIcon;
+//! Like the session picker (`app_session_picker.rs`) and the palette, the
+//! state lives in the single modal
+//! [`crate::overlay::Overlay`] slot, so the key gate sits before every
+//! keybinding, `[key_sequences]` and PTY path, and the engine-neutral
+//! `App::input` gate swallows controller bytes the same way: Enter/Esc never
+//! reach T's PTY. Confirm runs the card's pure
+//! [`crate::conn_card::ConnCardPlan`] through the declarative
+//! [`crate::connections::connect_in`] seam (set semantics), refreshes the
+//! connection surfaces, and shows the first-use notice (the spawn presets'
+//! once-per-config latch).
 
 use aterm_session::SessionId;
 
@@ -41,9 +40,9 @@ impl App {
         })
     }
 
-    /// The strip column of the tab chip hosting session `sid` in `wid` — the
-    /// card's anchor (T's chip for a drop, §3.3). Band-left when the session
-    /// has no chip there (overflow / other-window peer).
+    /// The strip column of the tab chip hosting session `sid` in `wid`, the
+    /// card's anchor (T's chip for a drop). Band-left when the session has no
+    /// chip there (overflow, other-window peer).
     fn conn_anchor_col(&self, wid: WindowId, sid: &SessionId) -> u16 {
         let local = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
@@ -67,12 +66,10 @@ impl App {
     }
 
     /// Open the shared confirm/configure card for `src` ⇄ `dst` in `window`
-    /// (design §3.3 + §2.5 — ONE component; the drag stage calls this with
-    /// origin `"drag"`, the menu/picker paths with `"menu"`). `prefill = None`
-    /// derives the existing pair state from the LIVE edge tables (the §2.5
-    /// configure prefill); `Some` lets the caller carry an already-derived
-    /// snapshot. Self-drop refused (§3.3); `false` when either endpoint is
-    /// unregistered. Nothing mints here — only Confirm acts.
+    /// (origin `"drag"` from the drag stage, `"menu"` from the menu and picker).
+    /// `prefill = None` derives the pair's state from the live edge tables;
+    /// `Some` carries an already-derived snapshot. A self-pair is refused;
+    /// `false` when either endpoint is unregistered. Nothing mints here.
     pub(crate) fn open_confirm_card(
         &mut self,
         window: WindowId,
@@ -82,7 +79,7 @@ impl App {
         origin: &'static str,
     ) -> bool {
         if src == dst {
-            // §3.3: self-drop refused before any UI state moves.
+            // Self-drop refused before any UI state moves.
             aterm_log::info!("connection card refused: self-connection");
             return false;
         }
@@ -112,58 +109,30 @@ impl App {
             anchor_col,
             usize::from(self.chrome_rows(window)),
         );
-        let Some(ws) = self.windows.get_mut(&window) else {
-            return false;
-        };
-        // §3.3: the popover is hosted on T's window — focus it first for the
-        // drag path so Enter lands in the card, not wherever focus was.
-        if origin == "drag"
-            && let Some(w) = &ws.os_window
-        {
-            w.focus_window();
-        }
-        // Structural mutual exclusion: the one overlay slot.
-        ws.overlay = Some(crate::overlay::Overlay::ConnCard(state));
-        ws.scroll_residual = 0.0;
-        if let Some(w) = &ws.os_window {
-            w.request_redraw();
-        }
-        self.settle_pointer_drags(window);
-        let _ = self.conn_card_claims_pointer(window);
-        if let Some((x, y)) = self.windows.get(&window).map(|ws| ws.last_cursor_px) {
-            self.conn_card_pointer_motion(window, x, y);
-        }
-        self.overlay_a11y_update();
-        true
+        // The popover is hosted on T's window; the drag path raises it so Enter
+        // lands in the card, not wherever focus was.
+        self.install_overlay_card(
+            window,
+            crate::overlay::Overlay::ConnCard(state),
+            origin == "drag",
+            Self::conn_card_claims_pointer,
+            Self::conn_card_pointer_motion,
+        )
     }
 
-    /// Close the card on `wid` WITHOUT acting — the Esc path. Nothing was
-    /// minted before Confirm, so cancel has no state to undo.
+    /// Close the card on `wid` without acting (Esc). Nothing was minted before
+    /// Confirm, so there is nothing to undo.
     pub(crate) fn conn_card_exit(&mut self, wid: WindowId) {
-        let mut closed = false;
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.conn_card().is_some()
-        {
-            ws.overlay = None;
-            ws.scroll_residual = 0.0;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-            closed = true;
-        }
-        self.overlay_a11y_update();
-        if closed && let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
-            self.on_cursor_moved(wid, x, y);
-        }
+        self.close_overlay_card(wid, |ws| ws.conn_card().is_some());
     }
 
-    /// Confirm the card on `wid` (Enter / the Confirm button): close, then
-    /// execute its pure plan through the declarative seams — `connect_in` per
-    /// selected direction (set semantics, idempotent on an unchanged half),
-    /// `disconnect_kind_in` per deselected-but-existing direction. Endpoints
-    /// are re-resolved by sid NOW; one that died while the card was open makes
-    /// its half a logged no-op. Ends with the §2.4 freshness poke and the
-    /// §1.4#8 first-use notice (shared latch — never double-noticed).
+    /// Confirm the card on `wid` (Enter or the Confirm button): close, then run
+    /// its plan through the declarative seams: `connect_in` per selected
+    /// direction (set semantics, idempotent on an unchanged half) and
+    /// `disconnect_kind_in` per deselected existing direction. Endpoints are
+    /// re-resolved by sid now; one that died while the card was open makes its
+    /// half a logged no-op. Ends with the surface refresh and the first-use
+    /// notice.
     pub(crate) fn conn_card_confirm(&mut self, wid: WindowId) {
         let Some((plan, origin, src, dst)) = self
             .windows
@@ -174,13 +143,9 @@ impl App {
             return;
         };
         self.conn_card_exit(wid);
-        let dst_ctx = |app: &App, sid: &SessionId| {
-            let g = app.store.read().unwrap_or_else(|p| p.into_inner());
-            g.by_sid(sid).map(|h| h.ctx.clone())
-        };
         let mut minted = false;
         for (from, to, kind) in &plan.connects {
-            match dst_ctx(self, to) {
+            match self.registered_ctx(to) {
                 Some(ctx) => {
                     minted |= crate::connections::connect_in(
                         &self.connections,
@@ -199,84 +164,72 @@ impl App {
             }
         }
         for (from, to) in &plan.disconnects {
-            match dst_ctx(self, to) {
-                Some(ctx) => {
-                    let _ = crate::connections::disconnect_kind_in(
-                        &self.connections,
-                        from,
-                        to,
-                        &ctx.edges,
-                        None,
-                        origin,
-                    );
-                }
-                None => aterm_log::info!(
+            if !self.disconnect_direction(from, to, origin) {
+                aterm_log::info!(
                     "connection card: peer {} vanished before confirm; half skipped",
                     to.as_str()
-                ),
+                );
             }
         }
-        // §1.4#8: confirming from this card is a first-use surface. The latch
-        // is the SAME config-lifetime marker the spawn presets use, so exactly
-        // one surface ever notices (no double-noticing).
+        // Confirming here is a first-use surface, sharing the spawn presets'
+        // config-lifetime latch so only one surface ever notices.
         if minted
             && crate::connections::first_use_notice_should_show(crate::app_config::config_path())
         {
             let src_drives = plan.connects.iter().any(|(f, _, _)| *f == src);
             let dst_drives = plan.connects.iter().any(|(f, _, _)| *f == dst);
-            // A disclosure the tab's own mark and menu already show: a RECORD
-            // (R22, the owner's attention rule), never a row.
+            // The tab's own mark and menu already show this, so it is a record,
+            // never a row.
             self.record_message(crate::message_reporters::session_connection_created(
                 &crate::connections::first_use_connect_notice_text(src_drives, dst_drives),
             ));
         }
-        // The §2.4 freshness poke: marks + menus + tooltips recompose now (the
-        // revision was bumped inside the seams above).
+        // Recompose marks, menus and tooltips now (the seams above bumped the
+        // revision).
         self.refresh_connection_surfaces();
     }
 
-    /// Dissolve BOTH directions of `a` ⇄ `b` (the menu Disconnect row and the
-    /// picker's Disconnect intent share this): recorded halves pair-precisely
-    /// by held token, unrecorded wire-grant rows via the op-filtered sweep.
-    /// Rows TOWARD an unregistered endpoint died with its table, so only the
-    /// registered halves exist to dissolve. Ends with the §2.4 poke —
-    /// unconditionally, so a nothing-to-revoke race still recomposes to truth.
+    /// Dissolve both directions of `a` ⇄ `b` (the menu's Disconnect row and the
+    /// picker's Disconnect intent): recorded halves by held token, unrecorded
+    /// wire-grant rows via the op-filtered sweep. Rows toward an unregistered
+    /// endpoint died with its table. Always ends with the surface refresh, so a
+    /// nothing-to-revoke race still recomposes to truth.
     pub(crate) fn disconnect_pair(&mut self, a: &SessionId, b: &SessionId, origin: &str) {
-        let ctx_of = |app: &App, sid: &SessionId| {
-            let g = app.store.read().unwrap_or_else(|p| p.into_inner());
-            g.by_sid(sid).map(|h| h.ctx.clone())
-        };
-        // a → b half: rows live in b's table.
-        if let Some(ctx) = ctx_of(self, b) {
-            let _ = crate::connections::disconnect_kind_in(
-                &self.connections,
-                a,
-                b,
-                &ctx.edges,
-                None,
-                origin,
-            );
-        }
-        // b → a half: rows live in a's table.
-        if let Some(ctx) = ctx_of(self, a) {
-            let _ = crate::connections::disconnect_kind_in(
-                &self.connections,
-                b,
-                a,
-                &ctx.edges,
-                None,
-                origin,
-            );
-        }
+        let _ = self.disconnect_direction(a, b, origin);
+        let _ = self.disconnect_direction(b, a, origin);
         self.refresh_connection_surfaces();
     }
 
-    fn conn_card_repaint(&mut self, wid: WindowId) {
-        self.sync_conn_card_pointer_cursor(wid);
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
-        }
-        self.overlay_a11y_update();
+    /// The live context of a registered session; `None` once it left the
+    /// registry (its edge table went with it).
+    fn registered_ctx(&self, sid: &SessionId) -> Option<std::sync::Arc<crate::SessionCtx>> {
+        let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+        g.by_sid(sid).map(|h| h.ctx.clone())
+    }
+
+    /// Dissolve exactly the `src → dst` direction: recorded halves by held
+    /// token, unrecorded wire-grant rows via the sweep
+    /// ([`crate::connections::disconnect_kind_in`]). Rows live in the
+    /// destination's table; a dst gone from the registry returns `false`. The
+    /// caller owns the surface refresh.
+    pub(crate) fn disconnect_direction(
+        &self,
+        src: &SessionId,
+        dst: &SessionId,
+        origin: &str,
+    ) -> bool {
+        let Some(ctx) = self.registered_ctx(dst) else {
+            return false;
+        };
+        let _ = crate::connections::disconnect_kind_in(
+            &self.connections,
+            src,
+            dst,
+            &ctx.edges,
+            None,
+            origin,
+        );
+        true
     }
 
     /// Move the focused control row (Up/Down/Tab).
@@ -284,7 +237,7 @@ impl App {
         if let Some(c) = self.windows.get_mut(&wid).and_then(|ws| ws.conn_card_mut()) {
             c.move_focus();
         }
-        self.conn_card_repaint(wid);
+        self.repaint_conn_card_pointer(wid, true);
     }
 
     /// Cycle the focused control's value (Left/Right).
@@ -292,13 +245,12 @@ impl App {
         if let Some(c) = self.windows.get_mut(&wid).and_then(|ws| ws.conn_card_mut()) {
             c.cycle_value(delta);
         }
-        self.conn_card_repaint(wid);
+        self.repaint_conn_card_pointer(wid, true);
     }
 
-    /// While the card is open on `wid`, drive it from the keyboard and SWALLOW
-    /// every key (the modal-overlay gate contract — §3.3: Enter/Esc never
-    /// reach the PTY): Enter confirms, Esc cancels, Up/Down/Tab move the
-    /// focus, Left/Right cycle the focused control; everything else is eaten.
+    /// While the card is open on `wid`, drive it from the keyboard and swallow
+    /// every key so Enter/Esc never reach the PTY: Enter confirms, Esc cancels,
+    /// Up/Down/Tab move focus, Left/Right cycle the focused control.
     pub(crate) fn on_key_conn_card_mode(
         &mut self,
         wid: WindowId,
@@ -326,9 +278,9 @@ impl App {
         true
     }
 
-    /// The ENGINE-NEUTRAL twin of [`Self::on_key_conn_card_mode`] — reached by
-    /// controller `key` verbs. The caller still swallows the event from the
-    /// PTY (the `App::input` overlay gate).
+    /// Engine-neutral twin of [`Self::on_key_conn_card_mode`] for controller
+    /// `key` verbs. The caller still swallows the event from the PTY (the
+    /// `App::input` overlay gate).
     pub(crate) fn conn_card_input_event(&mut self, wid: WindowId, ev: &crate::input::InputEvent) {
         use aterm_types::keyboard::{Key as TKey, KeyEventType, NamedKey as TNamed};
         if self
@@ -339,14 +291,11 @@ impl App {
         {
             return;
         }
-        // THE KEYPAD IS ITS MAIN-BLOCK TWIN ON AN OVERLAY, as it is on a native
-        // page and in the seam's press classifier. This card reads the key for
-        // what it MEANS, and `keymap::build_key_input` hands it the keypad
-        // identity (`Numpad5`, `NumpadEnd`) so the PTY encoders can tell KP_5
-        // from 5 — which the arms below have no case for: a keypad digit
-        // reached no arm at all, where a main-row one dismisses the card.
-        // `InputEvent::keypad_folded` is the one fold, shared with the native
-        // pages, and a controller's `key kp5` takes the same road.
+        // Keypad keys act as their main-block twins, as on native pages and in
+        // the seam's press classifier: `keymap::build_key_input` keeps the
+        // keypad identity (`Numpad5`, `NumpadEnd`) for the PTY encoders, which
+        // the arms below would otherwise miss. `InputEvent::keypad_folded` is the
+        // shared fold; a controller's `key kp5` takes the same road.
         let folded = ev.keypad_folded();
         let ev = folded.as_ref().unwrap_or(ev);
         if let crate::input::InputEvent::Key {
@@ -373,43 +322,22 @@ impl App {
 
     /// Modal pointer boundary: whether the open card owns the gesture on
     /// `wid`, clearing native hover/press retained underneath (never a
-    /// click-through layer). Mirrors [`Self::tab_menu_claims_pointer`].
+    /// click-through layer). Shares [`Self::overlay_card_claims_pointer`] with
+    /// the other modal cards.
     pub(crate) fn conn_card_claims_pointer(&mut self, wid: WindowId) -> bool {
-        if self
-            .windows
-            .get(&wid)
-            .is_none_or(|ws| ws.conn_card().is_none())
-        {
-            return false;
-        }
-        let mut changed = None;
-        if let Some((_, view)) = self.active_native_view(wid)
-            && let Some(state) = self.native_runtime.view_state_mut(view)
-        {
-            let common = state.common_mut();
-            let hovered = common.hovered.take().is_some();
-            let pressed = common.pressed.take().is_some();
-            if hovered || pressed {
-                changed = Some(view);
-            }
-        }
-        if let Some(view) = changed {
-            self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
-            self.request_redraw_all_windows();
-        }
-        self.sync_conn_card_pointer_cursor(wid);
-        true
+        self.overlay_card_claims_pointer(
+            wid,
+            |ws| ws.conn_card().is_some(),
+            Self::sync_conn_card_pointer_cursor,
+        )
     }
 
     /// The hit target under a window-space point, through the same zoom-aware
     /// transform the card was composited with.
     fn conn_card_hit_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<ConnCardHit> {
         let card = self.windows.get(&wid)?.conn_card()?;
-        let transform = self.overlay_coordinate_transform(wid)?;
-        let (frame_x, frame_y) = self.window_to_frame(wid, x, y);
-        let local_x = (frame_x - transform.origin_x) / f64::from(transform.scale);
-        let local_y = (frame_y - transform.origin_y) / f64::from(transform.scale);
-        crate::conn_card::conn_card_hit(card, &transform.geom, local_x as f32, local_y as f32)
+        let (transform, x, y) = self.overlay_card_point(wid, x, y)?;
+        crate::conn_card::conn_card_hit(card, &transform.geom, x, y)
     }
 
     /// Keep the OS cursor aligned with the card's chip hover.
@@ -419,30 +347,12 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.conn_card())
             .is_some_and(ConnCardState::pointer_over_target);
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && (ws.hover_pointer != pointer || ws.native_text_cursor)
-        {
-            ws.hover_pointer = pointer;
-            ws.native_text_cursor = false;
-            if let Some(w) = &ws.os_window {
-                w.set_cursor(if pointer {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                });
-            }
-        }
+        self.set_overlay_card_cursor(wid, pointer);
     }
 
     fn repaint_conn_card_pointer(&mut self, wid: WindowId, changed: bool) {
         self.sync_conn_card_pointer_cursor(wid);
-        if !changed {
-            return;
-        }
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
-        }
-        self.overlay_a11y_update();
+        self.redraw_overlay_card(wid, changed);
     }
 
     /// Hover the chip under a pointer motion; outside points stay swallowed.
@@ -466,9 +376,9 @@ impl App {
         self.repaint_conn_card_pointer(wid, changed);
     }
 
-    /// Settle a left release: same-target press+release activates — chips move
-    /// the selection in place; Confirm/Cancel settle through the SAME seams as
-    /// Enter/Esc.
+    /// Settle a left release: a same-target press and release activates. Chips
+    /// move the selection in place; Confirm/Cancel settle through the same seams
+    /// as Enter/Esc.
     pub(crate) fn conn_card_pointer_release(&mut self, wid: WindowId, x: f64, y: f64) {
         let hit = self.conn_card_hit_at_pointer(wid, x, y);
         let (mut changed, activated) = self
@@ -539,8 +449,8 @@ mod tests {
         (app, wid, a, b)
     }
 
-    /// Opening seeds the §3.3 DECIDED default (S→T, both) and a self-pair is
-    /// refused before any UI state moves.
+    /// Opening seeds the default (S→T, both) and a self-pair is refused before
+    /// any UI state moves.
     #[test]
     fn open_seeds_the_default_and_refuses_self() {
         let (mut app, wid, a, b) = app_with_pair();
@@ -556,10 +466,9 @@ mod tests {
         );
     }
 
-    /// THE §3.3 CATCH, end to end on the engine-neutral seam: with the card
-    /// open, Enter is swallowed from the PTY (the overlay gate records the
-    /// consumed press) and CONFIRMS — the edges exist afterward; Esc on a
-    /// fresh card is swallowed too and mints NOTHING.
+    /// On the engine-neutral seam with the card open, Enter is swallowed from
+    /// the PTY and confirms (the edges exist afterward); Esc on a fresh card is
+    /// swallowed too and mints nothing.
     #[test]
     fn enter_confirms_and_esc_never_mints_and_keys_never_reach_the_pty() {
         use aterm_types::keyboard::NamedKey;
@@ -607,10 +516,9 @@ mod tests {
         assert!(all_permitted);
     }
 
-    /// Confirm applies the EDITED kind (the state-machine contract): cycling
-    /// direction/kind then Enter calls the connect seam with exactly that
-    /// selection — here T→S push, so rows land in S's (the destination's)
-    /// table and none in T's.
+    /// Confirm applies the edited kind: cycling direction/kind then Enter
+    /// connects exactly that selection (T→S push, so rows land in S's table,
+    /// the destination's, and none in T's).
     #[test]
     fn confirm_applies_the_edited_direction_and_kind() {
         use aterm_types::keyboard::NamedKey;
@@ -640,9 +548,9 @@ mod tests {
         assert!(g.by_sid(&b).unwrap().ctx.edges.lock().unwrap().is_empty());
     }
 
-    /// The CONFIGURE path (§2.5): the card prefills from the existing pair,
-    /// an edit re-kinds atomically through set semantics, and deselecting the
-    /// direction disconnects — the sheet's final state IS the pair's state.
+    /// Configure path: the card prefills from the existing pair, an edit
+    /// re-kinds atomically through set semantics, and deselecting the direction
+    /// disconnects.
     #[test]
     fn configure_prefills_and_set_semantics_rekinds_and_disconnects() {
         use aterm_types::keyboard::NamedKey;

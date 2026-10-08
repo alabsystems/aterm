@@ -192,17 +192,9 @@ pub(crate) fn read_bounded_regular_utf8_follow_final_links(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn fixture(label: &str) -> std::path::PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "atpkg-metadata-{label}-{}-{serial}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn fixture(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-metadata-{label}-"))
     }
 
     #[test]
@@ -216,7 +208,7 @@ mod tests {
         let error = read_bounded_regular(&over, 8).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("8-byte"), "{error}");
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -227,7 +219,7 @@ mod tests {
         file.set_len(16 * 1024 * 1024).unwrap();
         let error = read_bounded_regular(&path, 1024).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]
@@ -250,7 +242,7 @@ mod tests {
         std::fs::write(&target, b"status").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(read_bounded_regular(&link, 64).is_err());
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]
@@ -275,6 +267,6 @@ mod tests {
                 .unwrap()
                 .contains("second")
         );
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

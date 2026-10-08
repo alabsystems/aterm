@@ -16,7 +16,8 @@ default = []
 [dependencies]
 
 [dev-dependencies]
-proptest = { workspace = true }
+# The generated-input tests' one generator (`aterm_spec::rng::XorShift`).
+aterm-spec = { workspace = true }
 
 [lints]
 workspace = true

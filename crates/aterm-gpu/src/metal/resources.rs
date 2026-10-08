@@ -1,51 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RESOURCE MINT — Metal-side resource creation behind a device handle
-//! that stamps every texture with its LOSS DOMAIN.
+//! Metal resource creation behind a device handle that stamps every texture
+//! with its loss domain.
 //!
-//! # Why this exists (the W1 judge's two-latch residual)
+//! [`super::encoder::EncodeSession`] owns the render queue and binds a
+//! `LossLatch`, and `Frame::present` cross-checks the session's latch against
+//! the swapchain's. Without more, a caller with a second latch and session
+//! could render a texture on one session and present on the other. So
+//! textures are created here, through a [`MetalResourceDevice`] carrying the
+//! `Arc<LossLatch>`, and each [`SealedTexture`] is stamped with it. The
+//! encoder's write verbs (`render_pass`, copies) and `Frame::present` check
+//! the stamp by `Arc::ptr_eq`, so a cross-domain texture is refused before
+//! any FFI.
 //!
-//! W1 sealed the one-latch arrangement: [`super::encoder::EncodeSession`] owns
-//! the process's render queue, `EncodeSession::new` binds the latch and
-//! refuses a latch already bound, and `Frame::present` cross-checks the
-//! session's latch against the swapchain's. The judged residual
-//! (`docs/measured/metal-port-map-2026-08-31.md` §6): a caller who constructs
-//! a SECOND `LossLatch` and a second `EncodeSession` could still render a
-//! frame's texture on session 2 and present on session 1, because NOTHING tied
-//! a render target to a session. Every runtime check stayed green while the
-//! present fired for work committed on a queue the present never ordered
-//! against.
+//! Views from [`SealedTexture::alias_view`] inherit the parent's stamp (the
+//! Unorm/sRGB alias pair is one texture, so one loss domain).
 //!
-//! The structural seal (W3, map §5): textures are created HERE, through a
-//! [`MetalResourceDevice`] that carries the `Arc<LossLatch>` naming the loss
-//! domain, and the mint stamps each [`SealedTexture`] with that latch. The
-//! encoder's write verbs (`render_pass`, the copies) and `Frame::present`
-//! cross-check the stamp by `Arc::ptr_eq` — so a latch-2 texture crossing a
-//! latch-1 session is a NAMED refusal at the earliest API crossing, and the
-//! two-latch cross-wired present has no remaining shape: every path that
-//! writes the drawable is stamped-checked before any FFI.
-//!
-//! Views mint through [`SealedTexture::alias_view`] and INHERIT the parent's
-//! stamp — the Unorm/sRGB alias pair (the FORMAT LAW) is one texture in two
-//! types, so it is one loss domain by construction.
-//!
-//! Deliberately NOT sealed: buffers and samplers ([`MetalResourceDevice::
-//! buffer`]/[`MetalResourceDevice::sampler`] hand out plain [`Obj`]s). They
-//! are never presented and never render-encoded as targets; binding one
-//! cross-session is an ordering question for W4's encode port, not the
-//! present-integrity hazard this mint closes.
+//! Buffers and samplers ([`MetalResourceDevice::buffer`] /
+//! [`MetalResourceDevice::sampler`]) are plain [`Obj`]s: they are never
+//! presented or used as render targets.
 
 use std::sync::Arc;
 
 use super::ffi::{self, Device, MtlRegion, Obj, PixelFormat, SamplerDesc};
 use super::loss::LossLatch;
 
-/// The session/device handle Metal-side resource creation goes through — the
-/// mint. Holds the device (retained) and the loss-domain latch it stamps into
-/// every texture. Any number of mints may share one latch (they are stamps,
-/// not queues); the ONE-queue exclusivity lives on
-/// [`super::encoder::EncodeSession`], which binds the latch.
+/// The handle Metal resource creation goes through. Holds the retained device
+/// and the loss-domain latch it stamps into every texture. Mints may share a
+/// latch; queue exclusivity lives on [`super::encoder::EncodeSession`].
 #[derive(Debug)]
 pub(crate) struct MetalResourceDevice {
     dev: Device,
@@ -107,33 +90,24 @@ impl MetalResourceDevice {
     }
 }
 
-// THREADING: unlike the queue/encoder/layer types (thread-pinned raw-pointer
-// holders, per the metal module convention), RESOURCES are the class Apple
-// documents as thread-safe — `MTLBuffer`/`MTLTexture`/`MTLSamplerState`
-// conform to `MTLResource`, may be used from multiple threads, and
-// objc_retain/objc_release are themselves thread-safe. wgpu-hal's Metal
-// backend rests its own `Send + Sync` resource types on the same contract,
-// and the pre-W3 renderer moved these very textures/buffers across threads as
-// wgpu objects. The device layer's routed structs (`VertexBuffer`,
-// `ResidentAtlas`, `TrayOverlay`) live inside `GpuRenderer`, which crosses a
-// thread at gui startup — so the sealed resource types declare exactly the
-// Send/Sync the objects they wrap are documented to have, and nothing more
-// (the ENCODING of work into them stays on the session's thread, checked by
-// the stamp).
+// Threading: Metal resources (`MTLBuffer`/`MTLTexture`/`MTLSamplerState`,
+// all `MTLResource`) are documented thread-safe, as are objc_retain/release;
+// wgpu-hal relies on the same contract. The device layer's `VertexBuffer`,
+// `ResidentAtlas` and `TrayOverlay` live in `GpuRenderer`, which crosses a
+// thread at gui startup, so the sealed types declare exactly that Send/Sync.
+// Encoding into them stays on the session's thread, checked by the stamp.
 
 // SAFETY: `MTLTexture` is an `MTLResource` (thread-safe per Metal's threading
-// model); `Arc<LossLatch>` is Send+Sync (atomics + OnceLock). See the
-// THREADING note above.
+// model); `Arc<LossLatch>` is Send+Sync. See the threading note above.
 unsafe impl Send for SealedTexture {}
 // SAFETY: as for `Send` — the wrapped object is documented thread-safe and
 // this type adds only the immutable stamp.
 unsafe impl Sync for SealedTexture {}
 
 /// A shared-storage `MTLBuffer` minted by [`MetalResourceDevice::buffer`],
-/// wrapped so the device layer's buffer enum can carry it across threads
-/// (see the THREADING note): the buffer OBJECT is thread-safe; coherent
-/// access to its CONTENTS is the writer's documented wait-before-rewrite
-/// discipline, unchanged from the raw `Obj` form.
+/// wrapped so it can cross threads (see the threading note). The object is
+/// thread-safe; coherent access to its contents relies on the writer waiting
+/// before rewriting.
 #[derive(Debug)]
 pub(crate) struct SharedBuffer(Obj);
 
@@ -161,15 +135,12 @@ impl SharedBuffer {
 }
 
 /// A Metal texture (or a format-alias view of one) carrying the
-/// `Arc<LossLatch>` of the loss domain it was minted in. The stamp is what the
-/// encoder's write verbs and `Frame::present` cross-check, which is what makes
-/// "render on session 2, present on session 1" a named refusal instead of a
-/// green-across-every-check misorder.
+/// `Arc<LossLatch>` of the loss domain it was minted in, which the encoder's
+/// write verbs and `Frame::present` cross-check.
 ///
-/// No public constructor outside this module tree: production mints through
-/// [`MetalResourceDevice`], the swapchain stamps its drawable with its own
-/// latch, and views inherit. A texture with a forged stamp is therefore not
-/// expressible without editing the metal module itself.
+/// Constructed only inside the metal module: via [`MetalResourceDevice`], the
+/// swapchain's drawable stamp, or view inheritance, so a forged stamp is not
+/// expressible.
 #[derive(Debug)]
 pub(crate) struct SealedTexture {
     obj: Obj,
@@ -177,16 +148,14 @@ pub(crate) struct SealedTexture {
 }
 
 impl SealedTexture {
-    /// Stamp an already-created texture object into `latch`'s domain — the
-    /// swapchain's drawable path (the drawable is vended by CoreAnimation,
-    /// not minted here, but its loss domain IS the swapchain's).
+    /// Stamp an existing texture into `latch`'s domain: the swapchain's
+    /// drawable, vended by CoreAnimation but in the swapchain's loss domain.
     pub(super) fn from_parts(obj: Obj, latch: Arc<LossLatch>) -> Self {
         Self { obj, latch }
     }
 
-    /// The raw texture, for read-only FFI (binding as a fragment texture,
-    /// property getters). The write verbs take `&SealedTexture` and check the
-    /// stamp; handing this `Obj` to them is not possible by type.
+    /// The raw texture for read-only FFI (binding, property getters). Write
+    /// verbs take `&SealedTexture` and check the stamp.
     pub(crate) const fn obj(&self) -> &Obj {
         &self.obj
     }
@@ -196,11 +165,10 @@ impl SealedTexture {
         &self.latch
     }
 
-    /// A second +1 handle to the SAME texture, carrying the SAME loss-domain
-    /// stamp — not a copy and not a re-mint, so it cannot launder a texture
-    /// into another domain ([`Obj::clone_retained`]). The armed renderer's
-    /// per-frame rig assembly clones the resident offscreen/atlas handles
-    /// with this instead of borrowing (the rig owns its resolution set).
+    /// A second +1 handle to the same texture with the same stamp
+    /// ([`Obj::clone_retained`]), so it cannot move a texture into another
+    /// domain. The armed renderer's per-frame rig clones resident handles
+    /// with this.
     pub(crate) fn clone_handle(&self) -> Self {
         Self {
             obj: self.obj.clone_retained(),
@@ -217,9 +185,8 @@ impl SealedTexture {
         })
     }
 
-    /// Upload CPU bytes into level 0 — [`ffi::texture_upload`] on the sealed
-    /// object (uploads are CPU-synchronous `replaceRegion:`, no queue, so no
-    /// stamp check is needed or possible here).
+    /// Upload CPU bytes into level 0 via [`ffi::texture_upload`]. Uploads are
+    /// CPU-synchronous `replaceRegion:` with no queue, so no stamp check.
     ///
     /// # Safety
     /// As [`ffi::texture_upload`]: the texture's storage is not `Private`, its

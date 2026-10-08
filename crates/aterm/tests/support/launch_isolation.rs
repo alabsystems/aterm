@@ -85,6 +85,29 @@ pub fn control_listening(sock: impl AsRef<Path>) -> bool {
     std::os::unix::net::UnixStream::connect(sock).is_ok()
 }
 
+/// A fresh private root for one launch, [`prepare`]d, and removed when the
+/// returned guard drops — the caller holds it until the launch has exited.
+/// Named `<label>-<unique>`, under `/tmp` on unix rather than `$TMPDIR`: a
+/// root holds a control socket (`run/aterm/aterm.sock`, [`control_sock`]), and a
+/// unix-socket path must fit in 104 bytes, which macOS's per-user temp dir (49
+/// of them) plus a unique name can exceed.
+///
+/// # Panics
+/// The root could not be created or prepared: a broken fixture.
+#[allow(dead_code)]
+pub fn scratch_root(label: &str) -> aterm_tempfile::TempDir {
+    #[cfg(unix)]
+    let base = std::path::PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let base = std::env::temp_dir();
+    let root = aterm_tempfile::Builder::new()
+        .prefix(&format!("{label}-"))
+        .tempdir_in(base)
+        .expect("create a private root");
+    prepare(root.path()).expect("prepare a private root");
+    root
+}
+
 pub fn prepare(root: &Path) -> std::io::Result<()> {
     for relative in [
         "",
@@ -115,6 +138,13 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
 }
 
 pub fn apply(cmd: &mut Command, root: &Path) {
+    // The aterm under test is a fresh build whose first exec can wait out the
+    // system's code-policy check for over a minute: run that file once,
+    // unclocked, before the caller's clock starts (`aterm_spec::wait::first_exec`).
+    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    if Path::new(cmd.get_program()) == aterm {
+        aterm_spec::wait::first_exec(aterm, &["--help"]);
+    }
     // Remove both inherited context and explicit command overrides before
     // assigning this fixture's authority. Callers may then add the one setting
     // they are testing (for example the containment mode or @self session id).

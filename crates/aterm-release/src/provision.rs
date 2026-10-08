@@ -182,7 +182,7 @@ pub fn run_provision(
         // what generation the fleet is on, and minting from a stale local pair while a
         // peer has already published the next generation forks the lineage — two
         // master-signed documents at one number, each de-authorizing the other's
-        // successors (2026-08-19 round-3 audit). Only a clean 404 (no roster published
+        // successors. Only a clean 404 (no roster published
         // yet) lets a mint proceed from the local pair alone.
         let channel_unreadable = match &fetched {
             Err(e) if !e.starts_with(NO_CHANNEL_ROSTER) => Some(e.clone()),
@@ -286,19 +286,15 @@ pub fn run_provision(
                 identity_path.display(),
             )));
         }
-        // The verb's cheapest decisive proof, run BEFORE its two irreversible ones. A
-        // machine that may never publish again — a revoked id, a roster that has lapsed —
-        // used to walk the whole verb first: prompted to spend one of the team's five
-        // permanent Developer ID slots, stored a notary credential, wrote a profile
-        // carrying its signing key, and only then learned at `authority` that an id never
-        // returns. Nothing is repeated by this: the freshly minted case still binds below,
-        // and this attribution is the one printed there.
+        // The verb's cheapest decisive proof, run BEFORE its two irreversible ones. A machine that
+        // may never publish again — a revoked id, a roster that has lapsed — must learn it before
+        // it spends a permanent Developer ID slot, stores a notary credential or writes a profile.
+        // Nothing is repeated by this: the freshly minted case still binds below, and this
+        // attribution is the one printed there.
         //
-        // Over the pair phase 1 chose, not a fresh read of dist/: they are the same
-        // document — the chosen one was written there moments ago, or was already there —
-        // but `--check` declines that write, so re-reading judged a pair this run did not
-        // pick, and on a swept checkout it died inside the cut's own reader talking about
-        // a `machine_roster` profile key the operator never touched.
+        // Over the pair phase 1 chose, not a fresh read of dist/: `--check` declines that
+        // write, so a re-read would judge a pair this run did not pick (or none at all,
+        // on a swept checkout).
         attributed = Some(authorize(chosen.bytes.clone(), &chosen.sig, derived)?);
         true
     } else {
@@ -351,10 +347,8 @@ pub fn run_provision(
         "Apple certificate",
         "this machine's own Developer ID identity",
     );
-    // The SHA-1 the profile pins comes back BESIDE the check, not out of it. It used to be
-    // formatted into an English sentence and then scraped back out with a 40-hex regex over
-    // the printed line — and on a machine with two certificates that regex pinned whichever
-    // appeared first in the prose, while the sentence claimed the profile disambiguated.
+    // The SHA-1 the profile pins comes back BESIDE the check, never scraped out of its
+    // prose (which, with two certificates, names more than one).
     let (apple_check, apple_sha1) = apple_identity_check(id, !check_only, cert_dir);
     record(crate::apple::APPLE_LABEL, apple_check, &mut checks);
 
@@ -382,19 +376,12 @@ pub fn run_provision(
     let blocking = blockers(&checks);
     let host_cannot_cut = checks.iter().any(|(_, c)| matches!(c, Check::Skip(_)));
 
-    // RETIRED 2026-08-26: the `SEED` audit band (`dist/toolchain-seed` validation
-    // and its READY-TO-CUT gate). aterm ships ONE lean self-provisioning
-    // download, so a cut needs no staged seed and the audit has none to report.
-
     // ---- 3. mint LAST -------------------------------------------------------------
     // A roster id is irreversible, so it is never consumed on a machine the audit just
     // proved cannot build or publish.
     //
-    // A deferred mint prints NOTHING. It used to say "DEFERRED — minting '<id>' would
-    // consume an irreversible roster id; fix the N item(s) above and re-run. Nothing was
-    // written", four lines above a terminal error saying: fix N, re-run, nothing written.
-    // The mint's absence is exactly what that error means, and the error is the line the
-    // shell shows and the exit code carries.
+    // A deferred mint prints NOTHING: the terminal error below already says fix, re-run,
+    // nothing written, and it is the line the shell shows and the exit code carries.
     let report = if already || check_only || blocking > 0 {
         None
     } else if let Some(why) = channel_unreadable.as_ref() {
@@ -455,14 +442,10 @@ pub fn run_provision(
             },
             None => profile_check(&home, id, apple_sha1.as_deref(), derived_pubkey.as_deref()),
         };
-        // RECORDED, not printed here. `profile` and `authority` are results of phase 5,
-        // and they used to print AFTER the mint's own closing report — which ends with a
-        // `=== NEXT ===` list — so they read as further next steps. `roster kept at
-        // ~/.aterm/roster/...` landing directly under "copy dist/aterm-machines.toml to
-        // every publishing machine" reads as a third instruction naming a DIFFERENT
-        // roster path, and an operator following NEXT literally copies the wrong file.
-        // Nothing was flushing out of order; the order was the bug. They belong in the
-        // DONE band, which is emitted once, below, at the end.
+        // RECORDED, not printed here: `profile` and `authority` are results, and printed
+        // after the mint's `=== NEXT ===` list they read as further steps (one names a
+        // different roster path than NEXT does). They belong in the DONE band, emitted
+        // once, below, at the end.
         checks.push(("profile", check));
     }
     let (fails, waiting) = tally(&checks);
@@ -653,10 +636,8 @@ pub(crate) fn report_next_after_cut(r: &atpkg_keys::provision::Report) -> Vec<St
 
 /// The product's spelling of the release verbs in every remedy this audit prints.
 ///
-/// 2026-09-18: a Mac provisioned by `aterm pkg install trust` has no `cargo` on PATH
-/// (`command -v cargo` → nothing), so a copyable `cargo ship …` line was a command that
-/// did not exist on the machine the audit had just called READY TO CUT. `.cargo/config.toml`
-/// sets `-Ztrust-verify=off` workspace-wide, so targo needs its explicit lane flag.
+/// A Mac provisioned by `aterm pkg install trust` has no `cargo` on PATH, so the line is
+/// `targo`; targo refuses an implicit lane, so it names its explicit `--unverified` one.
 pub(crate) const SHIP: &str = crate::publish::SHIP_COMMAND;
 
 /// The one line an operator copies off a READY TO CUT transcript. It RUNS as printed:
@@ -688,13 +669,10 @@ fn band(name: &str) {
 ///
 /// # Why it is unconditional
 ///
-/// `=== DONE ===` / `=== NEXT ===` used to exist only on the once-per-machine mint run —
-/// emitted from inside `atpkg-keys`, on its own 10-column gutter, in the middle of a run
-/// that then kept printing for another 140 lines. The run an operator actually REPEATS —
-/// a re-check before a release, or `--check` — ended with seven unheaded lines in which
-/// `authority`, the single line proving this machine may sign, was indistinguishable from
-/// the seventh chore in a list. The shape that answers "is this machine still good?" was
-/// present only on the run that needs it least.
+/// The run an operator actually REPEATS — a re-check before a release, or `--check` —
+/// needs the shape that answers "is this machine still good?" as much as the
+/// once-per-machine mint run does: without it `authority`, the single line proving this
+/// machine may sign, reads as one more chore in a list.
 ///
 /// # Why the mint's report is re-rendered here rather than passed through
 ///
@@ -743,15 +721,10 @@ fn close(c: Closing<'_>) -> Result<()> {
         next.extend(report_next_before_cut(r));
     }
     let profile_path = Path::new(c.home).join(".aterm/release-credentials.toml");
-    // `c.fails + c.waiting == 0` is the whole point: this list used to print
-    // `… ship cut --dry-run …` on a run whose own verdict, four lines later, was
-    // `NOT DONE`. An operator who copies the last runnable command on the screen — which
-    // is what a stressed operator does — was handed the one command the machine was not
-    // yet allowed to run.
+    // `c.fails + c.waiting == 0` is the whole point: an operator copies the last runnable
+    // command on the screen, so a `NOT DONE` run must not offer `… ship cut --dry-run …`.
     if c.key_exists && !c.host_cannot_cut && c.fails + c.waiting == 0 {
-        // The command as printed RUNS. It used to spell the profile `<profile>` even
-        // though the audit had printed its real path two lines up, so the one thing the
-        // operator came here to copy had to be assembled by hand.
+        // The command as printed RUNS: it names the real profile path.
         next.push(cut_dry_run_next(&profile_path));
     }
     if let Some(r) = c.report {
@@ -851,14 +824,10 @@ fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<atpkg_keys::provisi
     let pre = prov::preflight(prov::Verb::Join, id, &paths).map_err(Error::new)?;
     let phrase = prompt_master_with_retries()?;
     let seed = phrase.seed();
-    // The fingerprint is printed HERE and nowhere else. It used to be printed on the way
-    // in, as `master fingerprint: <fp>  (compare with the paper)` — a manual comparison
-    // the tool then performs itself two statements later (this verb only ever runs
-    // `Verb::Join`, never `Setup`, so the operator's eye is never the only check), and a
-    // value `render_report` reprints on its own `anchor  phrase verified against the
-    // committed master (<fp>)` line. The one moment a human needs to read it is this one,
-    // which is also where `verify_master`'s own text — "compare the fingerprint printed
-    // above against the one on your paper" — was pointing at a line that had scrolled by.
+    // The fingerprint is printed HERE and nowhere else: the tool compares it itself
+    // (this verb only runs `Verb::Join`), and `render_report` reprints it. The one moment
+    // a human needs it is a refusal, whose text says "compare the fingerprint printed
+    // above against the one on your paper".
     prov::verify_master(&pre, &seed).map_err(|e| {
         // Above the refusal, because the refusal's own words are "compare the fingerprint
         // printed above against the one on your paper".
@@ -885,9 +854,8 @@ fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<atpkg_keys::provisi
 ///
 /// # The prompt
 ///
-/// It used to start at column 0, breaking the two-space grid every other line of the run
-/// uses, with no blank line above it. `prompt_master_attempt` writes the string verbatim,
-/// so putting it through [`crate::publish::grid_block`] is a one-string change here.
+/// On the run's two-space grid: `prompt_master_attempt` writes the string verbatim, so it
+/// goes through [`crate::publish::grid_block`] here.
 ///
 /// "hyphens" is in the forgiveness list because `parse_master` strips them (it strips
 /// whitespace and `b'-'`), and its own doc says the rule exists "because the owner
@@ -1482,20 +1450,18 @@ fn verifiers_check(bin: &Path) -> Check {
 fn path_persist_fix(dir: &Path) -> String {
     format!(
         "echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc && exec zsh\n\
-         it has to persist: a plain `cargo test`'s doctest lane resolves \
-         `trustdoc` from PATH, in whatever shell it runs in",
+         it has to persist: a cargo run whose toolchain carries no trustdoc \
+         resolves it from PATH, in whatever shell it runs in",
         d = dir.display()
     )
 }
 
-/// The doc-tool FARM LINK. `.cargo/config.toml` names the workspace's doc driver
-/// by BARE NAME (`[build] rustdoc = "trustdoc"`, resolved from PATH), so a plain
-/// `cargo test` on this machine runs its doctest lane only where `trustdoc`
-/// resolves — the verify gate binds `RUSTDOC` to the stage2's copy when the
-/// stage2 carries one (and diagnoses when nothing exists anywhere), but a
-/// direct cargo invocation has only PATH, and without the link it dies at exec
-/// with a raw OS error that names no remedy. The convention that config
-/// comment describes — `~/.local/bin/trustdoc` symlinked at the live stage2 —
+/// The doc-tool FARM LINK. targo resolves an unset doc driver to the `trustdoc`
+/// beside itself, then PATH; the farm link covers a direct cargo run whose
+/// toolchain carries no trustdoc, which without it dies at exec with a raw OS
+/// error that names no remedy. The verify gate binds `RUSTDOC` to the stage2's
+/// copy when the stage2 carries one (and diagnoses when nothing exists anywhere). The convention —
+/// `~/.local/bin/trustdoc` symlinked at the live stage2 —
 /// is a provisioned artifact, audited like the rustup link. UNLIKE that link the
 /// whole remedy is one mechanical symlink, so a full run REPAIRS it in place: a
 /// missing entry or a DANGLING symlink (a swept stage2, say) is linked to the
@@ -1554,8 +1520,8 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
     );
     if check_only {
         return Check::Fail {
-            what: "no `trustdoc` resolves on PATH — a plain `cargo test`'s doctest lane \
-                   dies at exec"
+            what: "no `trustdoc` resolves on PATH — a cargo run whose toolchain carries \
+                   no trustdoc dies at exec"
                 .into(),
             fix,
         };
@@ -1668,12 +1634,7 @@ fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
 /// test`, the cut's own build — is the stage2's `targo` beside its `trustc`, and this
 /// row proves both ANSWER: each runs `--version` from the resolved bin dir. No rustup:
 /// a Mac provisioned the product's way (`aterm pkg install trust`) has no rustup and no
-/// `cargo`/`rustc` on PATH, and until 2026-09-18 this row ran `rustup … which cargo`
-/// and reported exactly that correctly provisioned machine as a GAP (measured:
-/// `command -v cargo rustc rustup` → nothing; `aterm pkg which targo` → the store's
-/// build 9192). The informational rustup row that sat beside it (suggesting a
-/// `rustup toolchain link trust` so a stock `cargo` typed here would reach Trust)
-/// was removed 2026-09-28: the host lane is `targo`, never a rustup `cargo`.
+/// `cargo`/`rustc` on PATH. The host lane is `targo`, never a rustup `cargo`.
 #[cfg(unix)]
 fn front_door_check(bin: &Path) -> Check {
     front_door_verdict(bin, |tool| {
@@ -1761,11 +1722,8 @@ fn x86_slice_check() -> Check {
                     .into(),
             },
         },
-        // The WHOLE fault, and the shared remedy text. The probe no longer carries a
-        // hand-indented `fix:`/`or:` block of its own, so nothing has to be truncated to
-        // keep this line on the grid — and truncating it used to throw away the rustup
-        // branch's real explanation (that this is a choice about what to ship, not a
-        // broken setup) on exactly the machine that needed it.
+        // The WHOLE fault, untruncated, and the shared remedy text: the explanation (a
+        // choice about what to ship, not a broken setup) is what this machine needs.
         Err(e) => Check::Fail {
             what: e.to_string(),
             fix: gates::X86_SLICE_REMEDIES.to_string(),
@@ -1803,17 +1761,14 @@ fn apple_clt_check() -> Check {
 
 /// This machine's own Developer ID identity, ACQUIRED rather than copied: [`crate::apple`]
 /// mints the keypair and CSR here and imports the certificate Apple issues against them.
-/// A private key never crosses a machine boundary — the `.p12` transfer this check used to
-/// prescribe is exactly what the rest of the design exists to prevent.
+/// A private key never crosses a machine boundary — no `.p12` transfer.
 ///
 /// Apple allows no unattended path (see [`crate::apple`] for the three that were measured
 /// and refused), so the acquisition waits for the operator's one browser errand rather
 /// than making them re-run the command.
 ///
 /// Returns the identity the credentials profile should pin beside the audit line, because
-/// that is where it came from. It used to be recovered by regex from the printed sentence,
-/// which meant the pin was decided by "whichever SHA-1 appeared first in some prose" — and
-/// the prose it was scraped out of also contains a filesystem path.
+/// that is where it came from — never scraped out of the printed sentence.
 #[cfg(unix)]
 fn apple_identity_check(
     id: &str,
@@ -1917,8 +1872,7 @@ fn authorize(bytes: Vec<u8>, sig: &[u8], pubkey: &str) -> Result<roster::Attribu
 
 /// One numbered phase header, and the only place the plan is stated. `provision` can sit
 /// waiting for a browser errand for minutes, and a process that says where it is is a
-/// process nobody has to guess about — `[3/5]` carries both the position and the length,
-/// which is why the list that used to precede these was pure repetition.
+/// process nobody has to guess about — `[3/5]` carries both the position and the length.
 #[cfg(unix)]
 fn phase(n: usize, name: &str, what: &str) {
     println!();
@@ -1996,15 +1950,8 @@ fn notary_check() -> Check {
 /// the conventional location and holds what it finds to the CUT'S OWN admission rules.
 ///
 /// Validated by calling `sign::ReleaseCredentials::load` — literally the call the cut
-/// makes — instead of re-scanning for a couple of key names. The two-key scan this
-/// replaced proved only that `notary_profile` and `signing_identity_sha1` parsed, while
-/// `load` additionally hard-requires `signing_key` (sign.rs: "the one key of record"),
-/// demands the file be owner-owned with no group/other access (`check_credentials_perms`,
-/// because it holds a private key), and refuses a profile naming two notary credentials.
-/// So a hand-written or restored profile could pass this audit — READY TO CUT, every item
-/// green — and be refused by `targo --unverified ship cut` on its first line. An audit that admits what
-/// the cut rejects is the exact false green this verb exists to abolish, so there is now
-/// one validator, not two.
+/// makes (`signing_key` required, owner-only permissions, one notary credential) — so the
+/// audit can never pass a profile the cut refuses on its first line.
 #[cfg(unix)]
 fn profile_check(
     home: &str,
@@ -2105,8 +2052,8 @@ fn profile_check(
     match (creds.signing_identity_sha1(), apple_sha1) {
         // The pin names a different certificate than the one this run happened to prove
         // first. With more than one valid Developer ID identity installed that is NOT yet a
-        // gap — `security find-identity` orders them unstably (measured 2026-08-18: two
-        // certificates, alternate runs blessed each), and the cut accepts any valid pinned
+        // gap — `security find-identity` orders them unstably (MEASURED: two certificates,
+        // alternate runs blessed each), and the cut accepts any valid pinned
         // identity that can sign (`select_devid_identity`). So prove the PINNED one; only a
         // pin that names nothing valid, or a certificate that cannot sign unattended (a
         // renewal, a profile carried over from a re-certified machine), is the failure the
@@ -2236,7 +2183,7 @@ pub(crate) fn devid_identities(listing: &str, team_id: &str) -> Vec<String> {
         .filter(|l| l.contains("Developer ID Application:") && l.contains(&team_tag))
         .filter_map(|l| {
             l.split_whitespace()
-                .find(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit()))
+                .find(|t| aterm_codec::hex::is_hex(t, 40))
         })
         .map(str::to_string)
         .collect()
@@ -2557,7 +2504,7 @@ mod tests {
     }
 
     /// `Todo` is "your certificate request is at Apple", not a fault, and the summary is
-    /// the one line an operator reads as a verdict. It used to call both FAILED.
+    /// the one line an operator reads as a verdict, so it never calls both FAILED.
     #[test]
     fn waiting_on_apple_is_counted_apart_from_a_fault() {
         let fail = || Check::Fail {
@@ -2661,14 +2608,13 @@ mod tests {
     }
 
     /// The front door is `targo` + `trustc` answering `--version` from the resolved
-    /// bin — a machine with no rustup passes it (measured 2026-09-18 on a Trust-only
-    /// Mac, where the old `rustup … which cargo` probe reported a GAP), a missing or
+    /// bin — a machine with no rustup passes it, a missing or
     /// mute tool fails it with `aterm pkg install trust` as the first remedy and no
     /// rustup in the fix at all.
     #[test]
     fn the_copyable_remedies_spell_the_products_verb_never_cargo() {
-        // 2026-09-18: on a Trust-only Mac `command -v cargo` → nothing; a remedy that
-        // starts with `cargo ` is command-not-found on the machine that printed it.
+        // On a Trust-only Mac `command -v cargo` → nothing; a remedy that starts with `cargo ` is
+        // command-not-found on the machine that printed it.
         assert!(SHIP.starts_with("targo --unverified ship"), "{SHIP}");
         let next = cut_dry_run_next(Path::new("/tmp/x/release.toml"));
         assert_eq!(
@@ -2901,8 +2847,8 @@ mod tests {
         std::fs::write(&dist, &seven).unwrap();
         drop(lock);
 
-        // The state that used to be permanent: both halves present, from two different
-        // generations, verifying as nothing.
+        // A torn pair: both halves present, from two different generations, verifying
+        // as nothing.
         let torn = machines::RosterDocument::read(&dist).expect("both halves are present");
         assert_eq!(torn.bytes, seven);
         assert_eq!(torn.signature, six_sig);

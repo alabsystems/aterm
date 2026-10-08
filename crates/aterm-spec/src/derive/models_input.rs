@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The unread-input gate on socket-driven input — the rule that a driver's key
-//! is never queued behind input the program has left unread.
+//! is never queued behind input a program the watch has established is not
+//! reading has left unread, and that nothing else is refused.
 //!
 //! 2026-09-24: a Claude Code grown past 38 GiB stopped reading its terminal.
 //! The owner's Enter sat unread in the slave's input queue for hours, and a
@@ -17,29 +18,54 @@ use super::Model;
 
 /// A raw-mode program's input queue (at most `Cap` unread writes, each with
 /// an age), the two writers that feed it — the human's window keyboard,
-/// never gated, and a socket driver, gated — and the reader's states:
-/// reading or frozen, stopped or running, raw or canonical.
+/// never gated, and a socket driver, gated — the reader's states (reading or
+/// frozen, stopped or running, raw or canonical), and the input WATCH that
+/// publishes a stall.
 ///
-/// The gate is aterm-session's `input_backlog::refuses`, restated: a driver
-/// key is admitted when the queue is empty, or when the job is running and
-/// either the slave is canonical (only complete lines are counted there, and
-/// a complete line a shell has not asked for is ordinary type-ahead) or the
-/// oldest unread write is younger than `Refuse` ticks. A stopped job refuses
-/// at any age. `behind_stale` latches when a driver key lands behind input
-/// that is stale by that same rule, and `NoDriverKeyBehindStaleInput` says it
-/// never does.
+/// AGES ARE BANDS, not ticks: `a1` is the oldest unread write's band — `0`
+/// younger than `WARN_AFTER` (1 s), `1` from there to `STALL_AFTER` (10 s),
+/// `2` past it — and a `Tick` moves it to the next band. `a2` is the second
+/// write's band; the queue is FIFO, so consuming one promotes the second's.
 ///
-/// One `Tick` is 500 ms of the oldest byte's wait, so `Refuse = 2` is
-/// `REFUSE_AFTER` (1 s) and `a1` projects `min(wait_ms / 500, AgeMax)`.
-/// `a1` and `a2` are the ages of the first and second unread writes; the
-/// queue is FIFO, so consuming one promotes the second's age. `Buggy = 1`
-/// admits every driver key the queue has room for — the screen-only fence
-/// the incident ran under, which could not see the queue at all.
+/// THE WATCH publishes (`Publish`) only a program that is not reading, whose
+/// raw input has aged into the stall band — its evidence, in aterm-session's
+/// `classify`: spinning and silent, or asleep, past thresholds the machine's
+/// load stretches. `reading == 0` is that evidence. It withdraws the stall
+/// (`Withdraw`) once the queue is read, turns canonical, or holds only input
+/// younger than the stall.
+///
+/// THE GATE is aterm-session's `input_backlog::gate`, restated (owner
+/// direction, 2026-09-29: caps are warnings, and nothing blocks that does not
+/// have to). A driver key is REFUSED only when the queue is not empty and
+/// the job is stopped, or a stall is published and the raw oldest write is
+/// still in the stall band. Every other key is written; one written behind
+/// raw input in the warn band or older carries the warning (`warned`).
+///
+/// Three latches, one per way the gate has been, or could be, wrong:
+///
+/// * `behind_stalled` — a driver key landed behind input of a stopped job or
+///   of a program published as not reading: the 2026-09-24 incident, where a
+///   screen-fenced key queued behind a frozen Claude Code's Enter and was
+///   read hours later (`NoDriverKeyBehindStalledInput`);
+/// * `refused_live` — a driver key was refused with neither a stop nor a
+///   published stall: the 1 s static cap the owner overruled on 2026-09-29,
+///   which blocked every driver of a healthy program on a loaded machine
+///   (`NoRefusalWithoutAnEstablishedStall`);
+/// * `healthy_published` — the watch published a program that was reading
+///   (merely slow): a stall judged on age alone
+///   (`NoReadingProgramPublished`).
+///
+/// `Buggy = 1` is all three defects at once — the screen-only fence admits
+/// every key, the refusal fires on the static warn age, and the watch
+/// publishes on age alone — and each invariant, isolated, is falsified by
+/// its own.
 ///
 /// Tier-1 (`aterm-session/tests/conformance_input_unread.rs`) drives a real
 /// pty whose raw slave never reads, projects the sink's reading onto
-/// `raw`/`q`/`a1` at every step, checks the shipped `refuses` against
-/// `DriverKey`'s guard, and replays the incident as the negative control.
+/// `raw`/`q`/`a1` at every step and the model's `published` onto the gate's
+/// argument, checks the shipped `gate` against `DriverKey`/`DriverRefused`
+/// and the warning, and `classify`'s entry against `Publish`, and replays
+/// the incident and the static cap as negative controls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn input_unread_gate_model() -> Model {
@@ -47,15 +73,20 @@ pub fn input_unread_gate_model() -> Model {
         InputUnreadGate {
             const Buggy = 0;
             const Cap = 2;
-            const Refuse = 2;
-            const AgeMax = 3;
+            const Warn = 1;
+            const Stall = 2;
+            const AgeMax = 2;
             var raw = 1;
             var reading = 1;
             var stopped = 0;
             var q = 0;
             var a1 = 0;
             var a2 = 0;
-            var behind_stale = 0;
+            var published = 0;
+            var warned = 0;
+            var behind_stalled = 0;
+            var refused_live = 0;
+            var healthy_published = 0;
 
             action HumanKey when (q <= Cap - 1) {
                 a1 = if q == 0 { 0 } else { a1 };
@@ -63,16 +94,43 @@ pub fn input_unread_gate_model() -> Model {
                 q = q + 1;
             }
             action DriverKey when (q <= Cap - 1
-                && (Buggy == 1 || q == 0 || (stopped == 0 && (raw == 0 || a1 <= Refuse - 1))))
+                && (Buggy == 1
+                    || q == 0
+                    || (stopped == 0 && (published == 0 || raw == 0 || a1 <= Stall - 1))))
             {
-                behind_stale = if q > 0 && (stopped == 1 || (raw == 1 && Refuse <= a1)) {
+                behind_stalled = if q > 0
+                    && (stopped == 1 || (published == 1 && raw == 1 && Stall <= a1))
+                {
                     1
                 } else {
-                    behind_stale
+                    behind_stalled
                 };
+                warned = if q > 0 && raw == 1 && Warn <= a1 { 1 } else { 0 };
                 a1 = if q == 0 { 0 } else { a1 };
                 a2 = if q == 1 { 0 } else { a2 };
                 q = q + 1;
+            }
+            action DriverRefused when (q > 0
+                && (stopped == 1
+                    || (published == 1 && raw == 1 && Stall <= a1)
+                    || (Buggy == 1 && raw == 1 && Warn <= a1)))
+            {
+                refused_live = if stopped == 0
+                    && (published == 0 || raw == 0 || a1 <= Stall - 1)
+                {
+                    1
+                } else {
+                    refused_live
+                };
+            }
+            action Publish when (published == 0 && stopped == 0 && raw == 1 && q > 0
+                && Stall <= a1 && (reading == 0 || Buggy == 1))
+            {
+                healthy_published = if reading == 1 { 1 } else { healthy_published };
+                published = 1;
+            }
+            action Withdraw when (published == 1 && (q == 0 || raw == 0 || a1 <= Stall - 1)) {
+                published = 0;
             }
             action Consume when (reading == 1 && stopped == 0 && q > 0) {
                 a1 = if q == 2 { a2 } else { 0 };
@@ -99,7 +157,9 @@ pub fn input_unread_gate_model() -> Model {
                 raw = if raw == 1 { 0 } else { 1 };
             }
 
-            invariant NoDriverKeyBehindStaleInput: behind_stale == 0;
+            invariant NoDriverKeyBehindStalledInput: behind_stalled == 0;
+            invariant NoRefusalWithoutAnEstablishedStall: refused_live == 0;
+            invariant NoReadingProgramPublished: healthy_published == 0;
         }
     }
 }

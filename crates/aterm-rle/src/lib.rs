@@ -121,19 +121,9 @@ impl<T: Default> Default for Run<T> {
 ///
 /// # Why no prefix-sum index
 ///
-/// This type used to carry a second `Vec<u32>` of run start offsets so that
-/// [`get`](Self::get) / [`set`](Self::set) / [`set_range`](Self::set_range) /
-/// [`Index`] could binary-search it. That index cost one extra allocation on
-/// every constructed `Rle` — paid by the scrollback materialization path for
-/// EVERY line it builds, including the all-default lines whose `Rle` is
-/// discarded unread — and 24 of the struct's 56 bytes. It bought nothing: the
-/// four random-access readers are the only readers of the index, and no
-/// production caller reaches them (scrollback's `Line::get_attr` deliberately
-/// walks the `runs` slice instead). [`with_value`](Self::with_value) already
-/// left the index empty and never resynced it, so those `Rle`s permanently ran
-/// on the linear path with no observable consequence — the tell that the index
-/// was decoration. Runs per scrollback line are 1-6, so a linear walk is also
-/// the faster shape at the sizes that exist.
+/// Lookups walk `runs` linearly. A cached start-offset index would cost an
+/// allocation per constructed `Rle` (scrollback builds one per line), and
+/// lines hold 1-6 runs, where the walk is also faster.
 ///
 /// # Type Parameters
 ///
@@ -217,14 +207,10 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     fn checked_run_length_sum(lhs: u32, rhs: u32) -> u32 {
         // Run-length sums never exceed `u32::MAX`: every entry point clamps
         // or rejects against `remaining_capacity`, and every internal sum is
-        // bounded by the maintained `total_length == sum(run.length)`
-        // invariant (machine-checked by tests/fuzz_rle.rs). Under that
-        // invariant `saturating_add` is behavior-identical to the previous
-        // `checked_add(..).expect(..)` invariant panic on every reachable
-        // input — the saturation, like the panic before it, cannot fire. The
-        // strict verifier refutes any reachable panic on the symbolic
-        // arguments it sees here (it cannot carry the callers' invariant),
-        // so the guard is spelled as the provable no-op saturation.
+        // bounded by the `total_length == sum(run.length)` invariant (checked
+        // by tests/fuzz_rle.rs), so the saturation cannot fire. It is spelled
+        // as saturation, not a panic, because the verifier cannot carry the
+        // callers' invariant and would refute a reachable panic here.
         lhs.saturating_add(rhs)
     }
 
@@ -327,10 +313,8 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         self.total_length = Self::checked_run_length_sum(self.total_length, count);
     }
 
-    /// Get the value at a specific index (safe alternative to `Index`).
-    ///
-    /// This is the non-panicking alternative to the `Index` trait implementation.
-    /// Returns `None` if index is out of bounds instead of panicking.
+    /// Get the value at `index`, or `None` if out of bounds (the
+    /// non-panicking form of `Index`).
     #[must_use]
     pub fn get(&self, index: u32) -> Option<T> {
         if index >= self.total_length {
@@ -352,20 +336,14 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
             return false;
         };
 
-        let run = &self.runs[run_idx];
-        if run.value == value {
-            // Value already matches
+        if self.runs[run_idx].value == value {
             return true;
         }
-
-        // Need to split the run
         self.split_and_set(run_idx, offset_in_run, value);
         true
     }
 
-    /// Set a range of values to the same attribute.
-    ///
-    /// This is the most efficient way to update multiple cells.
+    /// Set `start..end` (clamped to the length) to `value`.
     pub fn set_range(&mut self, start: u32, end: u32, value: T) {
         if start >= end || start >= self.total_length {
             return;
@@ -483,11 +461,8 @@ impl<T: Copy + PartialEq + Default> Index<u32> for Rle<T> {
     type Output = T;
 
     fn index(&self, index: u32) -> &Self::Output {
-        // Index trait contract: panic on out-of-bounds is standard behavior.
-        // An out-of-range `index` maps to `runs.len()`, which the slice bounds
-        // check below rejects with the canonical "index out of bounds" panic —
-        // same panic-on-OOB contract, expressed as the standard runtime bounds
-        // check instead of an explicit `expect` the modular verifier cannot
+        // An out-of-range `index` maps to `runs.len()`, so the slice bounds
+        // check panics; an explicit `expect` is one the verifier cannot
         // discharge.
         let (run_idx, _) = self.find_run(index).unwrap_or((self.runs.len(), 0));
         &self.runs[run_idx].value

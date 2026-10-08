@@ -1,42 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `vendor/astream`, the astream GIT SUBMODULE. This is a separate, named
-//! `[OB-1]` provenance obligation, not an exemption for directories outside
-//! the patch table.
+//! `vendor/astream`, the astream git submodule: a separate, named `[OB-1]`
+//! provenance obligation, not an exemption for directories outside the patch
+//! table.
 //!
 //! # The pin is the gitlink
 //!
-//! Until 2026-09-24 this directory was a hand-synced copy of four astream
-//! crates, pinned file by file in a review record whose own digest, and the
-//! upstream revision it named, were compiled in here. It is now a submodule of
-//! `github.com/alabsystems/astream` (`vendor/README-astream.md`), and the one
-//! pin is the GITLINK: the commit this repository's index records at
-//! `vendor/astream`. Nothing below hardcodes an astream revision or a file
-//! digest. A bump is a change to the gitlink, reviewed in astream as the range
-//! it moves over. What this module proves is that the tree really builds the
-//! commit the gitlink names:
+//! `vendor/astream` is a submodule of `github.com/alabsystems/astream`
+//! (`vendor/README-astream.md`). The one pin is the gitlink the index records;
+//! nothing here hardcodes a revision or digest, and a bump is reviewed in
+//! astream. This module proves the tree builds the commit the gitlink names:
 //!
 //! 1. `.gitmodules` declares path `vendor/astream` with astream's URL;
-//! 2. the index records `vendor/astream` as ONE gitlink (mode 160000) and
+//! 2. the index records `vendor/astream` as one gitlink (mode 160000) and
 //!    tracks nothing beneath it;
 //! 3. the submodule is initialised and checked out at exactly the gitlink
 //!    commit, with no tracked modification (untracked or ignored build output
 //!    such as `target/` is not a modification);
 //! 4. cargo resolves `astream-{aead,broker,cap,wire}` exactly once each, from
 //!    `vendor/astream/crates/<name>/Cargo.toml`, as path packages (a null
-//!    `source`) licensed Apache-2.0, and NOT as aterm workspace members;
+//!    `source`) licensed Apache-2.0, and not as aterm workspace members;
 //! 5. the root manifest's `[workspace] exclude` covers `vendor/astream`;
 //! 6. `crates/aterm-link` still reaches astream-broker and astream-cap there;
-//! 7. the pin did not move BACKWARD: relative to the merge-base with
-//!    `origin/main`, a bump goes forward or nowhere (see [`PinMotion`]).
+//! 7. the pin did not move backward relative to the merge-base with
+//!    `origin/main` (see [`PinMotion`]).
 //!
-//! The gitlink is read from the INDEX rather than from `HEAD`'s tree. The
-//! index is what the next commit records, so a staged bump is judged as the
-//! commit it is about to become; on a committed tree the two are the same.
-//! Obligation 7 compares against `HEAD`'s merge-base with `origin/main`, so
-//! mid-merge (`MERGE_HEAD` set, merge commit not yet made) it is blind to the
-//! merge's own result and judges the merge commit once it exists.
+//! The gitlink is read from the index, so a staged bump is judged as the commit
+//! it will become. Obligation 7 compares against `HEAD`'s merge-base with
+//! `origin/main`, so mid-merge it judges the merge commit once it exists.
 //!
 //! # What it does not prove
 //!
@@ -78,8 +70,8 @@ const CONSUMER: &str = "crates/aterm-link/Cargo.toml";
 /// aterm-link's direct path dependencies into the submodule.
 const CONSUMER_DEPS: [&str; 2] = ["astream-broker", "astream-cap"];
 /// The variables that point git at a repository. A hook exports them for the
-/// SUPERPROJECT, so they are cleared before asking git anything inside the
-/// submodule, which is what git's own submodule code does too.
+/// superproject, so they are cleared before asking git inside the submodule
+/// (as git's own submodule code does).
 const REPO_ENV: [&str; 6] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -118,17 +110,15 @@ enum Checkout {
         head: String,
         /// `git status --porcelain -z --untracked-files=no` entries: staged or
         /// unstaged changes to tracked files. Untracked and ignored files are
-        /// deliberately absent.
+        /// excluded.
         modified: Vec<String>,
     },
 }
 
-/// Where this tree's pin stands against the pin `origin/main` had at the
-/// merge-base. A bump moves FORWARD in astream's history; the way it goes
-/// backward by accident is a checkout whose submodule the pull did not
-/// advance, where `git commit -a` or `git add -A` (or a merge resolved from
-/// that checkout) records the OLD gitlink. Seen 2026-09-29: main's pin went
-/// back from astream `73e837b` to its ancestor `5021230` after being bumped.
+/// Where this tree's pin stands against `origin/main`'s pin at the merge-base.
+/// A bump moves forward; it goes backward by accident when a checkout whose
+/// submodule was not advanced records the old gitlink (`git commit -a`,
+/// `git add -A`, or a merge resolved there).
 ///
 /// A provable regression fails, and so does a pin that cannot be a bump
 /// because the base's pin was never fetched ([`PinMotion::BaseNotFetched`]);
@@ -149,10 +139,9 @@ enum PinMotion {
         base: String,
         declared: Option<String>,
     },
-    /// The base's pin is not in the submodule's object store. This pin IS
-    /// (the checkout is at it), and a descendant of the base would carry the
-    /// base with it, so it is no bump from it: a stale checkout that never
-    /// fetched what main moved on to, which is where the incident began.
+    /// The base's pin is not in the submodule's object store while this pin
+    /// is, so this cannot descend from it: a stale checkout that never fetched
+    /// what main moved on to.
     BaseNotFetched { base: String },
     /// Could not be decided, with the reason.
     Undecided(String),
@@ -282,9 +271,8 @@ fn checkout(root: &Path) -> Checkout {
     if !dir.is_dir() {
         return Checkout::Uninitialised("the directory does not exist".into());
     }
-    // An uninitialised submodule is an empty directory, and git run inside it
-    // silently answers for the SUPERPROJECT; its HEAD would then be read as
-    // the submodule's. The top level must be this directory itself.
+    // An uninitialised submodule is an empty directory, and git inside it
+    // answers for the superproject, so the top level must be this directory.
     let top = match git(&dir, &["rev-parse", "--show-toplevel"], true) {
         Ok(out) => String::from_utf8_lossy(&out).trim().to_owned(),
         Err(e) => return Checkout::Uninitialised(e),
@@ -447,11 +435,11 @@ fn exclude(root: &Path) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
-/// The FULL resolution, not `--no-deps`: that lists workspace members only,
-/// and the astream crates are excluded from this workspace by design, so it
-/// could never see them. `--all-features` because `astream-aead` is reachable
-/// only through aterm-link's off-by-default `sealed` feature. Still `--locked
-/// --offline`: this reads the lock that ships and fetches nothing.
+/// The full resolution, not `--no-deps` (which lists members only; the astream
+/// crates are excluded from the workspace). `--all-features` because
+/// `astream-aead` is reachable only through aterm-link's off-by-default
+/// `sealed` feature. `--locked --offline`: reads the shipped lock, fetches
+/// nothing.
 fn metadata(root: &Path) -> Result<Value, String> {
     // `$CARGO` (the driver running forge), else Trust's `targo` — never a stock
     // `cargo`. `metadata` takes no lane flag.
@@ -792,20 +780,12 @@ fn consumer_reaches_submodule(root: &Path, metadata: &Value) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("crates/aterm-forge sits two levels under the workspace root")
-            .canonicalize()
-            .unwrap()
-    }
+    use crate::test_support::repo_root;
 
     /// The real tree's facts, which every mutation below starts from, and
     /// which must themselves validate or the mutations prove nothing.
     fn real() -> (PathBuf, Facts) {
-        let root = repo_root();
+        let root = repo_root().canonicalize().unwrap();
         let facts = capture(&root).unwrap();
         assert!(
             validate(&root, &facts).is_ok(),
@@ -842,7 +822,7 @@ mod tests {
 
     #[test]
     fn the_real_submodule_is_the_pinned_commit_and_cargo_resolves_it() {
-        let root = repo_root();
+        let root = repo_root().canonicalize().unwrap();
         let pin = review(&root)
             .unwrap_or_else(|why| panic!("{why}"))
             .expect("this checkout has vendor/astream");
@@ -1088,18 +1068,22 @@ mod tests {
     /// A throwaway superproject whose `vendor/astream` is a real repository,
     /// so `pin_motion` runs the git it runs in production.
     struct Fixture {
-        root: PathBuf,
+        root: aterm_tempfile::TempDir,
     }
 
     impl Fixture {
         fn new(tag: &str) -> Fixture {
-            let root =
-                std::env::temp_dir().join(format!("aterm-forge-pin-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join(SUBMODULE)).unwrap();
+            let root = aterm_tempfile::Builder::new()
+                .prefix(&format!("aterm-forge-pin-{tag}-"))
+                .tempdir()
+                .unwrap();
+            std::fs::create_dir_all(root.path().join(SUBMODULE)).unwrap();
             let f = Fixture { root };
-            f.run(&f.root, &["init", "-q", "-b", "main"]);
-            f.run(&f.root.join(SUBMODULE), &["init", "-q", "-b", "main"]);
+            f.run(f.root.path(), &["init", "-q", "-b", "main"]);
+            f.run(
+                &f.root.path().join(SUBMODULE),
+                &["init", "-q", "-b", "main"],
+            );
             f
         }
 
@@ -1133,7 +1117,7 @@ mod tests {
 
         /// A commit in the SUBMODULE on top of `parent` (or the current HEAD).
         fn astream_commit(&self, parent: Option<&str>, msg: &str) -> String {
-            let sub = self.root.join(SUBMODULE);
+            let sub = self.root.path().join(SUBMODULE);
             if let Some(p) = parent {
                 self.run(&sub, &["checkout", "-q", "--detach", p]);
             }
@@ -1144,15 +1128,15 @@ mod tests {
         /// A commit in the SUPERPROJECT that records `pin` at the gitlink.
         fn commit_pin(&self, parent: Option<&str>, pin: &str, msg: &str) -> String {
             if let Some(p) = parent {
-                self.run(&self.root, &["checkout", "-q", "--detach", p]);
+                self.run(self.root.path(), &["checkout", "-q", "--detach", p]);
             }
             let cacheinfo = format!("160000,{pin},{SUBMODULE}");
             self.run(
-                &self.root,
+                self.root.path(),
                 &["update-index", "--add", "--cacheinfo", &cacheinfo],
             );
-            self.run(&self.root, &["commit", "-q", "-m", msg]);
-            self.run(&self.root, &["rev-parse", "HEAD"])
+            self.run(self.root.path(), &["commit", "-q", "-m", msg]);
+            self.run(self.root.path(), &["rev-parse", "HEAD"])
         }
 
         fn motion(&self) -> PinMotion {
@@ -1165,13 +1149,7 @@ mod tests {
                     "{var} is exported: unset it, or this test reads a real repository"
                 );
             }
-            pin_motion(&self.root, &index(&self.root).unwrap())
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            pin_motion(self.root.path(), &index(self.root.path()).unwrap())
         }
     }
 
@@ -1190,7 +1168,10 @@ mod tests {
             PinMotion::Unchanged,
             "no {BASE_REF} to judge by"
         );
-        f.run(&f.root, &["update-ref", "refs/remotes/origin/main", &base]);
+        f.run(
+            f.root.path(),
+            &["update-ref", "refs/remotes/origin/main", &base],
+        );
 
         // The gitlink is the base's own.
         assert_eq!(f.motion(), PinMotion::Unchanged);
@@ -1199,7 +1180,7 @@ mod tests {
         f.commit_pin(Some(&base), &c3, "bump to c3");
         assert_eq!(f.motion(), PinMotion::Forward);
 
-        // THE INCIDENT: a stale checkout commits the old gitlink back.
+        // A stale checkout commits the old gitlink back.
         f.commit_pin(Some(&base), &c1, "an unrelated fix that drags the pin back");
         assert_eq!(
             f.motion(),
@@ -1223,7 +1204,7 @@ mod tests {
         // …and it still counts once more commits sit on top of it, which is how
         // a rollback lands (aterm changes for the older astream follow it).
         f.run(
-            &f.root,
+            f.root.path(),
             &["commit", "-q", "--allow-empty", "-m", "adapt aterm-link"],
         );
         assert_eq!(
@@ -1265,7 +1246,10 @@ mod tests {
         // main moved on to a commit this checkout's submodule never fetched.
         let unfetched = "a".repeat(40);
         let base = f.commit_pin(None, &unfetched, "main: pinned to a commit not held here");
-        f.run(&f.root, &["update-ref", "refs/remotes/origin/main", &base]);
+        f.run(
+            f.root.path(),
+            &["update-ref", "refs/remotes/origin/main", &base],
+        );
         f.commit_pin(
             Some(&base),
             &c1,
@@ -1283,11 +1267,17 @@ mod tests {
         let f = Fixture::new("nobase");
         let c1 = f.astream_commit(None, "c1");
         // The base commit tracks something else and has no vendor/astream at all.
-        std::fs::write(f.root.join("README"), "x").unwrap();
-        f.run(&f.root, &["add", "README"]);
-        f.run(&f.root, &["commit", "-q", "-m", "base: no submodule yet"]);
-        let base = f.run(&f.root, &["rev-parse", "HEAD"]);
-        f.run(&f.root, &["update-ref", "refs/remotes/origin/main", &base]);
+        std::fs::write(f.root.path().join("README"), "x").unwrap();
+        f.run(f.root.path(), &["add", "README"]);
+        f.run(
+            f.root.path(),
+            &["commit", "-q", "-m", "base: no submodule yet"],
+        );
+        let base = f.run(f.root.path(), &["rev-parse", "HEAD"]);
+        f.run(
+            f.root.path(),
+            &["update-ref", "refs/remotes/origin/main", &base],
+        );
         f.commit_pin(Some(&base), &c1, "add the submodule");
         assert_eq!(f.motion(), PinMotion::Unchanged);
     }
@@ -1299,7 +1289,7 @@ mod tests {
         let c2 = f.astream_commit(None, "c2");
         let base = f.commit_pin(None, &c2, "the pin is c2");
         // The remote-tracking ref is absent, and a LOCAL branch spells its name.
-        f.run(&f.root, &["branch", "origin/main", &base]);
+        f.run(f.root.path(), &["branch", "origin/main", &base]);
         f.commit_pin(Some(&base), &c1, "goes back to c1");
         assert_eq!(f.motion(), PinMotion::Unchanged);
     }

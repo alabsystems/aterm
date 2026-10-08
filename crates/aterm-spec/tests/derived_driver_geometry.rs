@@ -14,22 +14,9 @@
 //! the real `turn` and `lease` verbs on a real pty against the real presence
 //! projection — is `aterm-gui/src/driver_geometry_conformance.rs`.
 
-use aterm_spec::derive::{Model, driver_geometry_liveness, driver_geometry_model};
+use crate::walk::{only, walk};
+use aterm_spec::derive::{driver_geometry_liveness, driver_geometry_model};
 use aterm_spec::{interp, verify};
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
-
-fn run(model: &Model, schedule: &[&str]) -> std::collections::BTreeMap<&'static str, i64> {
-    let mut state = model.init_state();
-    for action in schedule {
-        assert!(model.fire(action, &mut state), "{action}: {state:?}");
-    }
-    state
-}
 
 #[test]
 fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
@@ -71,7 +58,7 @@ fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
 
     // The fence keeps its guarantee: the program's own output between the
     // read and the paste refuses it — and is never counted against the hand.
-    let moved = run(&model, &["Read", "Output", "Take", "Fence", "Drop"]);
+    let moved = walk(&model, &["Read", "Output", "Take", "Fence", "Drop"]);
     assert_eq!(
         (moved["refused"], moved["refused_own"]),
         (1, 0),
@@ -80,18 +67,18 @@ fn a_drivers_own_lease_never_moves_the_screen_its_fence_judged() {
 
     // So does a re-grid another fact (mail) caused BEFORE the lease: the
     // screen the driver judged moved, and it reads again.
-    let mail = run(&model, &["Read", "Note", "Regrid", "Take", "Fence"]);
+    let mail = walk(&model, &["Read", "Note", "Regrid", "Take", "Fence"]);
     assert_eq!((mail["refused"], mail["refused_own"]), (1, 0), "{mail:?}");
 
     // A cooperative lease held and let go re-grids nothing while held.
-    let lease = run(&model, &["Take", "Drop"]);
+    let lease = walk(&model, &["Take", "Drop"]);
     assert_eq!((lease["gen"], lease["rows"]), (0, 0), "{lease:?}");
 
     // THE INCIDENT (`RegridUnderTheHand`): the row is committed on the lease,
     // the program repaints, and the fence the driver judged a moment earlier
     // reads "changed" — 121 visits of 121.
     let incident = verify::buggy_baseline_with(&model, "RegridUnderTheHand");
-    let refused = run(&incident, &["Read", "Take", "RegridUnderTheHand", "Fence"]);
+    let refused = walk(&incident, &["Read", "Take", "RegridUnderTheHand", "Fence"]);
     assert_eq!(refused["refused_own"], 1, "{refused:?}");
     let mut state = incident.init_state();
     for action in ["Read", "Take", "RegridUnderTheHand", "Fence"] {
@@ -140,10 +127,10 @@ fn a_lease_that_moved_between_the_sense_and_the_commit_raises_no_row() {
     assert_eq!((state["rows"], state["gen"]), (0, 0), "{state:?}");
     // A turn's settle is still not held: words sensed after its input ended,
     // committed while it settles, are born, as `Regrid` births them.
-    let settled = run(&model, &["Take", "EndInput", "Sense", "Commit", "Release"]);
+    let settled = walk(&model, &["Take", "EndInput", "Sense", "Commit", "Release"]);
     assert_eq!((settled["rows"], settled["ghost"]), (1, 0), "{settled:?}");
     // …and a row the hand did not raise (mail) is born once the hand goes.
-    let mail = run(
+    let mail = walk(
         &model,
         &["Take", "Note", "Sense", "Drop", "Sense", "Commit"],
     );
@@ -160,7 +147,7 @@ fn a_lease_that_moved_between_the_sense_and_the_commit_raises_no_row() {
         ),
     ] {
         let race = verify::buggy_baseline_with(&model, mutant);
-        let mut flap = run(&race, schedule);
+        let mut flap = walk(&race, schedule);
         assert!(race.fire(mutant, &mut flap), "{mutant}: {flap:?}");
         assert_eq!((flap["rows"], flap["ghost"]), (1, 1), "{mutant}: {flap:?}");
         assert!(!race.check_invariant("NoBirthForAGoneHand", &flap));
@@ -181,7 +168,7 @@ fn a_lease_that_moved_between_the_sense_and_the_commit_raises_no_row() {
     // The first repair did close the `lease release` race: only the turn's
     // schedule sees it.
     let first_fix = verify::buggy_baseline_with(&model, "CommitTypingOnly");
-    let state = run(&first_fix, &["Take", "Sense", "Drop"]);
+    let state = walk(&first_fix, &["Take", "Sense", "Drop"]);
     assert!(!first_fix.fire("CommitTypingOnly", &mut state.clone()));
     assert!(verify::uncaught_invariants(&model).is_empty());
 }
@@ -204,7 +191,7 @@ fn a_row_a_moved_lease_holds_catches_up_once_the_wake_is_handled() {
     // wake, and the held row never catches up: no `Sense` is owed, and the
     // words formed under the lease never commit.
     let silent = verify::buggy_baseline_with(&model, "DropNoWake");
-    let stuck = run(&silent, &["Take", "Note", "Sense", "DropNoWake"]);
+    let stuck = walk(&silent, &["Take", "Note", "Sense", "DropNoWake"]);
     assert_eq!((stuck["rows"], stuck["other"], stuck["woke"]), (0, 1, 0));
     assert!(!silent.fire("Sense", &mut stuck.clone()));
     assert!(!silent.fire("Commit", &mut stuck.clone()));
@@ -228,7 +215,7 @@ fn a_row_a_moved_lease_holds_catches_up_once_the_wake_is_handled() {
 fn a_row_a_peers_unseen_lease_held_is_caught_up_by_the_timer() {
     let model = driver_geometry_model();
     let live = driver_geometry_liveness();
-    let stranded = run(
+    let stranded = walk(
         &model,
         &[
             "PeerTake",
@@ -263,7 +250,7 @@ fn a_row_a_peers_unseen_lease_held_is_caught_up_by_the_timer() {
     assert_eq!((caught["rows"], caught["ghost"]), (1, 0), "{caught:?}");
     assert!(live.goal_holds(&model, &caught));
     // The peer's hold stands while its lease does: no catch under it.
-    let held = run(&model, &["PeerTake", "Note", "Sense", "Turned"]);
+    let held = walk(&model, &["PeerTake", "Note", "Sense", "Turned"]);
     assert!(!model.fire("Catch", &mut held.clone()), "{held:?}");
     assert!(!model.fire("Commit", &mut held.clone()), "{held:?}");
 }

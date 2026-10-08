@@ -569,14 +569,11 @@ fn evict_destroys_a_selection_whose_whole_interval_fell_off(ev: &mut StepEvidenc
     );
 }
 
-#[test]
-fn real_selection_custody_conforms() {
-    let _ = run_conformance();
-}
-
-/// The `SelectionCustody` Tier-1 body, factored out so the `spec_xref_gate` can RUN
-/// it: the gate's "SelectionCustody is actively bound" claim then means the real
-/// engine and GUI seams were driven and checked, not merely that anchors exist.
+/// The `SelectionCustody` Tier-1 body, RUN by `spec_xref_gate`'s `spec_xref_closure`
+/// and by nothing else: the gate's "SelectionCustody is actively bound" claim then
+/// means the real engine and GUI seams were driven and checked, not merely that
+/// anchors exist. (A standalone test wrapper ran this same body a second time per
+/// gate run; it is gone.)
 pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
     // EXECUTION EVIDENCE. Every step below drives its shipping seam inside a

@@ -2,18 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Engine retained-heap CEILING (M2 MEM-BUDGET) — a deterministic regression gate.
+//! Engine retained-heap ceiling, a deterministic gate.
 //!
-//! This is the self-contained, dependency-free half of the memory story (the
-//! aterm-vs-alacritty COMPARISON lives in `aterm-bench/tests/memory.rs`). It pins
-//! the engine's retained heap for a 24x80 grid under a committed ceiling so a real
-//! regression — accidental per-cell boxing, scrollback bloat, a leak on the process
-//! path — fails the build. The number is deterministic: the grid is pre-allocated,
+//! It pins the engine's retained heap for a 24x80 grid under a committed ceiling so a
+//! real regression — accidental per-cell boxing, scrollback bloat, a leak on the
+//! process path — fails the build. The number is deterministic: the grid is pre-allocated,
 //! cells are inline, so a full screen of SGR text retains ZERO additional heap.
 //!
-//! An integration test is its own crate, so the counting global allocator here does
-//! NOT affect any other test or bench. The merge contract's workspace test stage runs it.
-//! Run directly: `cargo test -p aterm-core --test mem_budget -- --nocapture`.
+//! The counting global allocator applies only to this test crate.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -51,7 +47,7 @@ fn retained<T>(f: impl FnOnce() -> T) -> (i64, T) {
 }
 
 /// 24 full rows of mixed ASCII + SGR — fills the visible screen without scrolling
-/// far past it, so the measurement is dominated by the GRID, not scrollback config.
+/// far past it, so the measurement is dominated by the grid, not scrollback config.
 fn screen_fill() -> Vec<u8> {
     let mut v = Vec::new();
     for r in 0..24 {
@@ -65,9 +61,8 @@ fn screen_fill() -> Vec<u8> {
     v
 }
 
-/// Observed 2026-06: 74_020 bytes, and a full screen of SGR text retains ZERO
-/// additional heap (`filled == fresh`). Ceiling = observed × ~1.33 so minor
-/// legitimate churn does not flap while a 33%+ blowup is caught.
+/// A full screen of SGR text retains no additional heap (`filled == fresh`);
+/// the ceiling leaves about a third of headroom over the fresh terminal.
 const MEM_BUDGET_24X80_BYTES: i64 = 96 * 1024;
 
 #[test]

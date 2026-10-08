@@ -1,51 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OTHER CONSUMER of [`crate::pipeline_table`]: real
-//! `MTLRenderPipelineState` objects, built from the SAME rows `renderer.rs`
-//! builds its `wgpu` pipelines from.
+//! Builds `MTLRenderPipelineState`s from [`crate::pipeline_table`], the same
+//! rows `renderer.rs` builds its wgpu pipelines from.
 //!
-//! # What this buys, and why the tests it replaces could not
+//! [`metal_blend`], [`metal_write_mask`], [`metal_format`] and
+//! [`metal_vertex_descriptor`] are total mappings off the neutral enums, so a
+//! factor added on the wgpu side fails to compile here.
+//! [`tests::every_table_row_builds_a_metal_pipeline`] builds every row on the
+//! real MSL functions with the renderer's own state.
 //!
-//! `metal/mod.rs` used to carry four hand-written pipeline tests, each
-//! re-spelling one pipeline's blend factors, write mask and attachment format
-//! in Metal terms. A judge proved they had drifted, in mutually inconsistent
-//! ways:
+//! # REPLACE
 //!
-//! | test | what it built | what `renderer.rs` builds |
-//! |---|---|---|
-//! | `fire_pipeline_builds_…` | `(One, One, One, One)`, `Bgra8Unorm` | `(One, One, One, One)`, RGB-only, **`Rgba8Unorm`** |
-//! | `hdr_glow_pipeline_builds_…` | alpha `(Zero, One)` | alpha **`(One, One)`** — `alpha: add` |
-//! | `bg_pipeline_builds_…` | `Bgra8Unorm` | **`Rgba8UnormSrgb`** |
-//! | `glyph_pipeline_builds_…` | `Bgra8UnormSrgb` | **`Rgba8UnormSrgb`** |
+//! `renderer.rs` spells the bg and blit pipelines `wgpu::BlendState::REPLACE`
+//! (`(One, Zero)` on both halves). Metal expresses the same state as blending
+//! disabled, so [`metal_blend`] maps a REPLACE row to `None`, decided by
+//! [`crate::pipeline_table::Blend::is_replace`], not by name.
 //!
-//! Every one of those is a hand-copied constant, and the EDR test only passed
-//! its alpha substitution because `fs_hdr_glow` happens to emit `0.0` there.
-//! The doc comments claimed the tests validated "the blend state" and "the EDR
-//! arm"; what they actually validated was that Metal accepts *a* pipeline.
-//!
-//! So the four are gone and [`tests::every_table_row_builds_a_metal_pipeline`]
-//! stands in their place: it builds ALL EIGHTEEN rows, on the real MSL
-//! functions, with the renderer's own state. There is no longer a Metal-side
-//! spelling of a blend factor or a write mask to drift — [`metal_blend`],
-//! [`metal_write_mask`], [`metal_format`] and [`metal_vertex_descriptor`] are
-//! total mappings off the neutral enums, so a factor added on the `wgpu` side
-//! fails to compile here rather than passing silently.
-//!
-//! # The one deliberate non-identity: REPLACE
-//!
-//! `renderer.rs` spells the bg and blit pipelines `wgpu::BlendState::REPLACE`,
-//! which is `(One, Zero)` on both halves — arithmetically "no blending". Metal
-//! expresses the identical fixed-function state as blending DISABLED, so
-//! [`metal_blend`] maps a REPLACE row to `None` deliberately, gated on
-//! [`crate::pipeline_table::Blend::is_replace`] rather than on a name.
-//!
-//! # Not wired to a renderer
-//!
-//! Like the rest of this module, nothing outside it calls this yet:
-//! `GpuRenderer` is still `wgpu` on every cell. What lands here is the piece
-//! the port needs to be *correct* before it is *used* — the state, declared
-//! once and consumed by both backends.
+//! The armed macOS renderer mints its pipeline states through [`build`].
 
 use super::ffi::{
     self, BlendFactor, BlendOperation, BlendState, ColorWriteMask, Device, Library, Obj,
@@ -70,18 +42,13 @@ const fn metal_factor(f: Factor) -> BlendFactor {
     }
 }
 
-/// The complete Metal blend state [`RenderPipelineDescriptor::set_color_attachment`]
-/// takes, or `None` for a pipeline that does not blend.
+/// The Metal blend state for
+/// [`RenderPipelineDescriptor::set_color_attachment`], or `None` for no
+/// blending: a row with `blend: None` or a row whose blend is REPLACE
+/// ([`Blend::is_replace`]).
 ///
-/// `None` covers BOTH of the table's ways of saying "no blending": a row with
-/// `blend: None` (the shimmer's REPLACE-by-omission) and a row whose blend IS
-/// fixed-function REPLACE (`(One, Zero)` on both halves — the bg and the blit).
-/// The second is the deliberate non-identity described in this module's header;
-/// it is decided by [`Blend::is_replace`], never by a pipeline's name.
-///
-/// Operations are mapped and set explicitly even though today's only operation
-/// is `Add`. Adding a table operation therefore fails this exhaustive mapping
-/// until Metal gains the corresponding constant and setter coverage.
+/// Operations are mapped explicitly (today only `Add`), so a new operation
+/// fails this exhaustive mapping until Metal supports it.
 pub(crate) fn metal_blend(blend: Option<Blend>) -> Option<BlendState> {
     let b = blend?;
     if b.is_replace() {
@@ -123,22 +90,14 @@ const fn metal_attr_format(f: AttrFormat) -> VertexFormat {
     }
 }
 
-/// The colour-attachment format for a row's [`TargetRole`].
+/// The colour-attachment format for a row's [`TargetRole`]. The offscreen pair
+/// is `format_plan`'s native choice (`Rgba8Unorm` with an `Rgba8UnormSrgb`
+/// alias view), view-compatible in Metal as in wgpu. `present` is the live
+/// swapchain format (`Bgra8Unorm` or `Rgba8Unorm` from `pick_surface_format`).
 ///
-/// The offscreen pair is `format_plan`'s native choice — `Rgba8Unorm` with an
-/// `Rgba8UnormSrgb` alias view — restated here in `MTLPixelFormat` terms; the
-/// two are a view-compatible pair in Metal exactly as they are in `wgpu`, which
-/// is what makes THE FORMAT LAW port rather than approximate (see
-/// [`super::shaders`]). `present` is the live swapchain format, which
-/// `renderer.rs::pick_surface_format` picks as `Bgra8Unorm` where it can and
-/// `Rgba8Unorm` otherwise — so a sweep must try BOTH.
-///
-/// This match is still hand-written — a `wgpu` type may not cross into this
-/// module, so it cannot call `TargetFormats::resolve` — but it is no longer
-/// UNGUARDED: `format_plan::tests::the_metal_format_axis_equals_the_wgpu_resolve_for_every_role`
-/// computes both sides for every role x present format and asserts equality by
-/// name, because format is the axis a judge made wrong on all three offscreen
-/// roles at once with every pipeline still building.
+/// Hand-written because no wgpu type may enter this module;
+/// `format_plan::tests::the_metal_format_axis_equals_the_wgpu_resolve_for_every_role`
+/// checks it against the wgpu resolve for every role and present format.
 pub(crate) fn metal_format(role: TargetRole, present: PixelFormat) -> PixelFormat {
     match role {
         TargetRole::OffscreenSrgb => PixelFormat::Rgba8UnormSrgb,
@@ -149,17 +108,12 @@ pub(crate) fn metal_format(role: TargetRole, present: PixelFormat) -> PixelForma
 }
 
 /// The `MTLVertexDescriptor` for a row's instance stream, or `None` for a
-/// `[[vertex_id]]`-only pass (which is `buffers: &[]` on the `wgpu` side).
+/// `[[vertex_id]]`-only pass. Attributes and stride come from the table's
+/// [`crate::pipeline_table::VertexLayoutSpec`].
 ///
-/// Every attribute's index, format and offset, and the buffer's stride, come
-/// off the table's [`crate::pipeline_table::VertexLayoutSpec`] — the same
-/// declaration `renderer.rs` derives its `wgpu::VertexAttribute` arrays from.
-///
-/// The stream lives at [`ffi::INSTANCE_STREAM_SLOT`], NEVER at 0: every MSL
-/// vertex function that takes this descriptor's `[[stage_in]]` also declares
-/// its uniform block at `[[buffer(0)]]`, and the two share one buffer argument
-/// table. This function used to say `0` and produced pipelines that BUILT and
-/// then drew nothing — see the slot constant's doc for the measured proof.
+/// The stream lives at [`ffi::INSTANCE_STREAM_SLOT`], never 0: vertex functions
+/// taking `[[stage_in]]` declare uniforms at `[[buffer(0)]]` in the same
+/// argument table.
 pub(crate) fn metal_vertex_descriptor(layout: VertexLayout) -> Option<VertexDescriptor> {
     let spec = layout.spec()?;
     let vd = VertexDescriptor::new()?;
@@ -175,16 +129,10 @@ pub(crate) fn metal_vertex_descriptor(layout: VertexLayout) -> Option<VertexDesc
     Some(vd)
 }
 
-/// The `MTLPrimitiveType` for a row's [`Topology`] — the DRAW-state half of
-/// the row's pipeline state.
-///
-/// In `wgpu`, topology is PIPELINE state (`PrimitiveState::topology`); in
-/// Metal it is an argument to `drawPrimitives:` — so a Metal consumer that
-/// only builds pipelines drops it on the floor with nothing to notice. That
-/// was this module until now: [`build`] consumed every table field EXCEPT
-/// `spec.topology`. This mapping is what a [`ffi::DrawCall`] takes its
-/// `primitive` from, and the tray is the row that dies without it: its
-/// 4-vertex quad drawn as a `TriangleList` is one triangle and half the card.
+/// The `MTLPrimitiveType` for a row's [`Topology`]. Topology is pipeline state
+/// in wgpu but a `drawPrimitives:` argument in Metal; [`ffi::DrawCall`] takes
+/// its `primitive` from here. The tray's 4-vertex strip drawn as a list would
+/// cover half the card.
 #[cfg(test)]
 pub(crate) const fn metal_primitive_type(t: Topology) -> ffi::PrimitiveType {
     match t {
@@ -233,9 +181,8 @@ pub(crate) fn compile_library(device: &Device, library: ShaderLibrary) -> Result
     device.new_library_with_options(super::shaders::source(library), &opts)
 }
 
-/// [`compile_library`] for the library one row names. Six libraries serve
-/// eighteen rows, so a sweep compiles per LIBRARY and holds the map rather than
-/// calling this eighteen times.
+/// [`compile_library`] for the library one row names. Sweeps compile per
+/// library and share the result.
 #[cfg(test)]
 pub(crate) fn compile(device: &Device, spec: &PipelineSpec) -> Result<Library, String> {
     compile_library(device, spec.library)
@@ -244,31 +191,13 @@ pub(crate) fn compile(device: &Device, spec: &PipelineSpec) -> Result<Library, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metal::test_support::device;
     use crate::pipeline_table::{ALL_PIPELINES, Pipeline};
     use std::collections::HashMap;
 
-    /// Every test here needs a GPU; a machine without one SKIPs loudly.
-    fn device() -> Option<Device> {
-        let d = Device::preferred();
-        if d.is_none() {
-            crate::stderr_line!("SKIP: no Metal device on this machine");
-        }
-        d
-    }
-
-    /// THE PIPELINE-STATE GUARD, GPU half: every one of the eighteen rows in
-    /// THE PIPELINE TABLE builds a real `MTLRenderPipelineState` — the SAME
-    /// rows `renderer.rs` builds its `wgpu` pipelines from, with the renderer's
-    /// own entry points, blend factors, write masks, attachment formats,
-    /// vertex layouts and strides.
-    ///
-    /// This is what the four hand-written pipeline tests it replaces could not
-    /// be: they each re-spelled one pipeline's state, all four had drifted from
-    /// `renderer.rs`, and they had drifted DIFFERENTLY (see this module's
-    /// header). Nothing is re-spelled here.
-    ///
-    /// Both swapchain formats `pick_surface_format` can choose are exercised,
-    /// because a `TargetRole::Present` row is built once per live format.
+    /// Every table row builds a real `MTLRenderPipelineState` with the
+    /// renderer's own entry points, blend, write mask, formats and vertex
+    /// layouts, for both swapchain formats `pick_surface_format` can choose.
     #[test]
     fn every_table_row_builds_a_metal_pipeline() {
         let Some(dev) = device() else { return };
@@ -296,22 +225,13 @@ mod tests {
         }
     }
 
-    /// THE INSTANCE-STREAM SLOT INVARIANT, held against the SHADER TEXT.
+    /// No MSL source binds `[[buffer(n)]]` at [`ffi::INSTANCE_STREAM_SLOT`]:
+    /// stage-in attributes and constant buffers share one argument table, so a
+    /// binding there would collide with the stream.
     ///
-    /// [`ffi::INSTANCE_STREAM_SLOT`] is only a deconfliction while nothing in
-    /// the MSL binds at it: `[[stage_in]]` attributes and `constant` buffers
-    /// share one vertex-stage argument table, so a `[[buffer(30)]]` in any
-    /// render source would recreate the exact collision the slot exists to
-    /// end — the one where `Pipeline::Bg` built cleanly and drew 0 texels.
-    /// Every `[[buffer(n)]]` in the six libraries and the state probe must
-    /// therefore be a SMALL uniform index, and never the stream's.
-    ///
-    /// The scan is deliberately coarse — it does not parse stages, so it also
-    /// sweeps fragment bindings, which live in a separate table and cannot
-    /// collide. That is a stricter check, not a wrong one: no aterm shader has
-    /// any business near index 30 in either table. `parity_kernel.metal` is
-    /// excluded because compute kernels use the compute argument table, where
-    /// `buffer(0..3)` are the dispatch's data buffers.
+    /// The scan does not parse stages, so it also checks fragment bindings
+    /// (stricter, not wrong). `parity_kernel.metal` is excluded: compute kernels
+    /// use the compute argument table.
     #[test]
     fn no_msl_buffer_binding_collides_with_the_instance_stream_slot() {
         use crate::metal::shaders;
@@ -356,21 +276,15 @@ mod tests {
             "only {found} `buffer(n)` bindings found across seven sources — the \
              declaration style changed and this guard stopped seeing them"
         );
-        // The slot applies wgpu-hal's count-down-from-the-top PRINCIPLE at
-        // Metal's true 31-entry table top. wgpu-hal's own literal slot is 15
-        // (it caps max_vertex_buffers at 16 — adapter.rs:784, lib.rs:326); a
-        // judge caught an earlier comment here claiming 30 was wgpu-hal's
-        // number. The pin is the CONTRACT with the MSL scan above, nothing
-        // more: change one, change both.
+        // Count down from the top of Metal's 31-entry table (wgpu-hal's
+        // principle; its own slot is 15). This pin is the contract with the MSL
+        // scan above: change one, change both.
         assert_eq!(ffi::INSTANCE_STREAM_SLOT, 30);
     }
 
-    /// The `MTLVertexDescriptor.h` value for one [`AttrFormat`] — the tests'
-    /// OWN spelling, deliberately independent of [`metal_attr_format`] so
-    /// neither test below validates the mapping with itself. (The first cut of
-    /// the descriptor test computed its expected formats through
-    /// `metal_attr_format` and stayed green under the exact `UChar4` mutation
-    /// it existed to catch.)
+    /// The `MTLVertexDescriptor.h` value for one [`AttrFormat`], spelled here
+    /// independently of [`metal_attr_format`] so the tests do not check the
+    /// mapping against itself.
     const fn pinned_vertex_format(f: AttrFormat) -> (usize, &'static str) {
         match f {
             AttrFormat::Uint8x4 => (3, "MTLVertexFormatUChar4"),
@@ -381,15 +295,10 @@ mod tests {
         }
     }
 
-    /// THE VERTEX-FORMAT CONSTANTS, pinned against `MTLVertexDescriptor.h`.
-    ///
-    /// The trap this exists for is one enum row over: `UChar4 == 3` and
-    /// `UChar4Normalized == 9` both build, and the first turns every packed
-    /// `Unorm8x4` colour from 0..1 into 0..255. A transposed
-    /// `metal_attr_format` arm fails here by value, and the GPU half of the
-    /// same guard is `metal::tests::the_bg_row_draws_its_instance_stream_at_
-    /// the_deconflicted_slot`, whose mid-range colours saturate under the
-    /// non-normalized misdeclaration.
+    /// Vertex-format constants pinned against `MTLVertexDescriptor.h`.
+    /// `UChar4 == 3` and `UChar4Normalized == 9` both build, but the first turns
+    /// `Unorm8x4` colours from 0..1 into 0..255. The GPU half is
+    /// `metal::tests::the_bg_row_draws_its_instance_stream_at_the_deconflicted_slot`.
     #[test]
     fn every_attr_format_maps_to_the_pinned_metal_constant() {
         let all = [
@@ -409,21 +318,10 @@ mod tests {
         }
     }
 
-    /// THE VERTEX DESCRIPTOR, READ BACK — every table layout, attribute by
-    /// attribute, against the spec it claims to restate.
-    ///
-    /// `metal_vertex_descriptor` was UNVERIFIED: wrong format mappings,
-    /// doubled strides and zeroed offsets all stayed green, because the only
-    /// Metal path with a behavioural test was the blit, whose row is
-    /// `VertexLayout::None`. This reads the built `MTLVertexDescriptor` back
-    /// through separate getter selectors and holds every field to the table:
-    /// format (raw, so a wrong constant cannot launder itself through the
-    /// enum), offset, buffer index, stride, per-instance stepping — and that
-    /// slot 0 stays EMPTY, which is the other half of the P1 collision fix.
-    ///
-    /// Needs no GPU: `MTLVertexDescriptor` is a plain descriptor class.
-    /// The DRAWN half of the same verification is the bg-row readback test in
-    /// `metal::tests`.
+    /// Every table layout's `MTLVertexDescriptor`, read back through separate
+    /// getters and checked field by field against the spec: raw format, offset,
+    /// buffer index, stride, per-instance stepping, and slot 0 left empty. No
+    /// GPU needed; the drawn half is the bg-row readback test in `metal::tests`.
     #[test]
     fn the_vertex_descriptor_restates_every_table_layout_at_the_stream_slot() {
         const STEP_PER_INSTANCE: usize = 2;
@@ -491,14 +389,10 @@ mod tests {
         assert_eq!(verified, 14, "expected 14 instanced rows");
     }
 
-    /// TOPOLOGY, CONSUMED. Pinned against `MTLRenderCommandEncoder.h`
-    /// (`MTLPrimitiveTypeTriangle == 3`, `MTLPrimitiveTypeTriangleStrip == 4`
-    /// — `Point == 0` and the line pair sit below, so a transposed constant
-    /// still encodes), and the table's one strip row named so losing it — or
-    /// growing a second one without a drawn test — is a visible diff. The
-    /// BEHAVIOURAL half is `metal::tests::the_tray_strip_covers_the_whole_
-    /// card`, where the same 4 vertices drawn as a list are one triangle and
-    /// half the card.
+    /// Topology constants pinned against `MTLRenderCommandEncoder.h`
+    /// (`Triangle == 3`, `TriangleStrip == 4`), with the table's one strip row
+    /// named. The drawn half is
+    /// `metal::tests::the_tray_strip_covers_the_whole_card`.
     #[test]
     fn every_table_topology_maps_to_the_pinned_primitive_type() {
         assert_eq!(
@@ -519,10 +413,8 @@ mod tests {
         assert_eq!(strips, ["tray"], "the strip rows are exactly the tray");
     }
 
-    /// The five factors the table declares must be five DISTINCT
-    /// `MTLBlendFactor` values. A transposed pair here would swap two
-    /// pipelines' blend equations while every pipeline still built — the
-    /// failure mode a build sweep alone cannot see.
+    /// The table's blend factors map to distinct `MTLBlendFactor` values; a
+    /// transposed pair would swap blend equations while still building.
     #[test]
     fn every_table_factor_maps_to_a_distinct_metal_constant() {
         let all = [
@@ -542,10 +434,8 @@ mod tests {
             );
             seen.push(raw);
         }
-        // Pinned against `MTLBlendFactor` in Metal.framework's headers: the
-        // SCREEN destination factor is `OneMinusSourceColor == 3`, which sits
-        // BETWEEN `One == 1` and `SourceAlpha == 4` — a range where an
-        // off-by-one guess lands on `SourceColor == 2` and still builds.
+        // Pinned against the headers: the screen factor `OneMinusSourceColor`
+        // is 3, between `One == 1` and `SourceAlpha == 4`.
         assert_eq!(metal_factor(Factor::Zero) as usize, 0);
         assert_eq!(metal_factor(Factor::One) as usize, 1);
         assert_eq!(metal_factor(Factor::OneMinusSrc) as usize, 3);
@@ -578,17 +468,11 @@ mod tests {
         assert_eq!(off, vec!["bg", "shimmer", "blit"]);
     }
 
-    /// The NINE RGB-only rows, named. Metal's default write mask is ALL and so
-    /// is `wgpu`'s, so a row that lost its `WriteMask::Color` is silent on both
-    /// backends until a translucent window goes opaque — this is the assertion
-    /// that makes it loud.
-    ///
-    /// Nine ROWS, eight `renderer.rs` CALL SITES: `build_glow_boost_pipeline`
-    /// is one site that builds both crowns, and both are RGB-only. The shimmer
-    /// LEFT this set on 2026-09-01: its refraction displaces the whole rgba
-    /// sample now, so its row writes ALL — an RGB-only shimmer paired the
-    /// displaced rgb with the undisplaced pixel's alpha on translucent
-    /// presents.
+    /// The RGB-only rows, named: both backends default to all channels, so a
+    /// row that lost `WriteMask::Color` would otherwise be silent until a
+    /// translucent window goes opaque. Both crowns (one call site) are
+    /// RGB-only; the shimmer writes all channels because it displaces the whole
+    /// rgba sample.
     #[test]
     fn nine_rows_are_rgb_only_and_they_are_these() {
         let rgb_only: Vec<&str> = ALL_PIPELINES

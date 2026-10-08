@@ -9,6 +9,7 @@ use aterm_buffer::Seq;
 use aterm_spec::derive::{Model, native_draft_journal_model};
 use aterm_spec::interp::{State, admits};
 
+use crate::conformance_support::assert_transition;
 use crate::document_store::{DocumentId, DocumentStore, TextEdit};
 use crate::native_document_io::{
     AtomicSaveProof, AtomicSaveResult, JournalAppendProof, JournalAppendResult, JournalGeneration,
@@ -71,22 +72,6 @@ fn projection(
     );
     state.insert("wrong_image_accepted", 0);
     state
-}
-
-fn assert_transition(model: &Model, before: &State, after: &State, action: &'static str) {
-    assert_eq!(
-        admits(model, before, after),
-        Some(action),
-        "shipping transition must be admitted specifically as {action}"
-    );
-    for invariant in &model.invariants {
-        assert!(
-            model.check_invariant(invariant.name, after),
-            "post-state violates {}::{}: {after:?}",
-            model.name,
-            invariant.name,
-        );
-    }
 }
 
 fn append(store: &mut DocumentStore, document: DocumentId, text: &str) {

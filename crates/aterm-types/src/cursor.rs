@@ -9,11 +9,6 @@
 /// Terminal-domain representation: 6 DECSCUSR variants (3 shapes x blink/steady)
 /// plus `Hidden` (cursor invisible, DECTCEM off) and `HollowBlock` (outline-only
 /// block, common in unfocused windows and vi normal mode).
-///
-/// Intentionally distinct from `gpu::pipeline::CursorStyle` which collapses
-/// to 3 shape-only variants for GPU rendering, and `gpu::ffi::AtermCursorStyle`
-/// which provides a C-ABI-safe equivalent. See `gpu::renderer::terminal_cursor_style_to_gpu`
-/// for the conversion bridge.
 #[non_exhaustive]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

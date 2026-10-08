@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Session identities, phase 1 (separation): a session can carry its own AGENT
-//! identity, set at spawn.
+//! Session identities: a session can carry its own agent identity, set at spawn.
 //!
-//! ONE CONCEPT. `identity` is a spawn-time, immutable session property (like
-//! `frozen_path`, unlike the `meta set` fields a driver rewrites). It names a
-//! directory `<state>/identities/<name>/` — [`aterm_types::dirs::identities_dir`]
-//! — and every agent aterm knows ([`aterm_primer::agent_homes`], the primer's
-//! roster read through its `var` column) gets its home variable pointed at
-//! its own conventional subdirectory there: `CLAUDE_CONFIG_DIR=<idir>/.claude`,
-//! `CODEX_HOME=<idir>/.codex`. The subdirs carry the agents' OWN names so the
-//! primer works unchanged: `ensure` runs [`aterm_primer::auto_prime`] over the
-//! identity dir (detection-only, so the 0700 subdirs aterm just made are what
-//! it detects) — a worker under `identity=worker` has the aterm skills and the
-//! manual pointer, and its OWN login.
+//! `identity` is a spawn-time, immutable session property (like `frozen_path`,
+//! unlike the `meta set` fields). It names a directory `<state>/identities/<name>/`
+//! ([`aterm_types::dirs::identities_dir`]), and every agent aterm knows
+//! ([`aterm_primer::agent_homes`]) gets its home variable pointed at its own
+//! conventional subdirectory there: `CLAUDE_CONFIG_DIR=<idir>/.claude`,
+//! `CODEX_HOME=<idir>/.codex`. Because the subdirs carry the agents' own names,
+//! [`ensure`] primes the identity dir unchanged, so a worker under
+//! `identity=worker` has the aterm skills, the manual pointer, and its own login.
 //!
-//! aterm never opens a login. It knows nothing of what the agent keeps in the
-//! dir beyond the directory names it made; `agents=<prog>:present|absent`
-//! (the `identities` verb) is a `read_dir` name listing, bytes never opened.
-//! The macOS keychain is the one login channel outside the dir: aterm never
-//! reads, names or deletes a keychain item it did not create.
+//! aterm never opens a login: `agents=<prog>:present|absent` (the `identities`
+//! verb) is a `read_dir` name listing. The macOS keychain is the one login
+//! channel outside the dir; aterm never reads, names or deletes a keychain item
+//! it did not create.
 //!
 //! MEASURED 2026-09-27 (the isolation half; Claude Code 2.1.283, an isolated
 //! dev-seams instance on the owner's Mac with the real `HOME`): a tab from
@@ -29,34 +24,24 @@
 //! logged in as the owner. It wrote only under `<idir>/.claude`, and the login
 //! keychain still held one `Claude Code-credentials` item. The other half — a
 //! login completed under an identity leaves the default session's account alone —
-//! needs the owner to complete that login (`docs/AGENT-EXPERIENCE-2026-08-26.md`
-//! §7.3).
+//! is READ from the vendor code (Claude Code 2.1.285 and 2.1.286, 2026-09-30):
+//! its keychain read, write and delete all name the service
+//! `Claude Code-credentials`, plus `-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>`
+//! whenever that variable is set, with account `$USER` — so an identity's login
+//! is a different item from the default tab's, which carries no
+//! `CLAUDE_CONFIG_DIR`. Version-dependent: re-read when the claude pin moves
+//! (`docs/AGENT-EXPERIENCE-2026-08-26.md` §7.3).
 //!
-//! THE SEAM. [`env`] rides `spawn_session`'s `env_add`, which
-//! `aterm_pty::build_child_env` applies AFTER the deny pass — so the parent's
-//! `CLAUDE_CONFIG_DIR` is dropped and the identity's survives, with no change
-//! to the deny tables and no `is_ai_env_var` pin (an inherited key is REPLACED
-//! by `env_add`'s value either way; the aterm-pty test
-//! `build_child_env_replaces_the_parents_agent_home_with_the_identitys` pins
-//! that per variable). An adopted shell (seamless update) gets nothing: it
-//! keeps its env; only the label rides the handoff record.
+//! `spawn identity=<name>` is the only create path ([`ensure`] with
+//! `create = true`, Owner-only). The spawn seam and a cold restore pass
+//! `create = false`: a missing identity falls back to a default shell with one
+//! stderr line ([`restorable`]). A downgrade to a build without the field keeps
+//! the shell's env and drops the label (`sessions` says `identity=-`).
 //!
-//! WHO CREATES. `spawn identity=<name>` is the ONLY create path
-//! ([`ensure`] with `create = true`, from the wire verb — Owner-only). The
-//! spawn seam itself and a cold restore of a leaf naming an identity pass
-//! `create = false`: a missing identity there falls back to a default shell
-//! with one stderr line ([`restorable`]), never a silently recreated one.
-//! A downgrade to a build without the field keeps the shell's env and drops
-//! the label — `sessions` says `identity=-` for a shell still logged in as
-//! `worker` — the `frozen_path`-style degradation, documented and accepted.
-//!
-//! NAMES fold to lowercase at parse ([`parse_name`]): the default-case-
-//! insensitive APFS would make `Worker` and `worker` one directory with two
-//! labels, two `identities` rows and a `forget` that removes the other's tree.
-//! Grammar after folding: `[a-z0-9][a-z0-9._-]{0,63}`; `-` alone is refused —
-//! it is the wire's absent mark (`identity=-` opts an aimed spawn out of
-//! inheriting) — and so is `forget`, the `identities` verb's sub-form word:
-//! an identity so named could be created but never described or removed.
+//! Names fold to lowercase at parse ([`parse_name`]), since case-insensitive
+//! APFS would make `Worker` and `worker` one directory with two labels. Grammar
+//! after folding: `[a-z0-9][a-z0-9._-]{0,63}`; `-` (the wire's absent mark) and
+//! `forget` (the `identities` verb's sub-form word) are refused.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -64,13 +49,11 @@ use std::path::{Path, PathBuf};
 /// The longest name: a directory name, and one that fits an `ls` row.
 pub(crate) const NAME_MAX: usize = 64;
 
-/// Parse (and FOLD) a spawn-time identity name. `Worker` and `worker` are one
-/// identity; the folded spelling is the directory name. Refused: an empty
-/// name, `-` (the absent mark), `forget` (the verb's sub-form word — the one
-/// name `identities` could never describe or remove), a first character
-/// outside `[a-z0-9]`, any character outside `[a-z0-9._-]`, and anything
-/// past [`NAME_MAX`] bytes — so a name can never be `..`, a path, or a shell
-/// word.
+/// Parse and fold a spawn-time identity name; the folded spelling is the
+/// directory name. Refused: an empty name, `-` (the absent mark), `forget` (the
+/// verb's sub-form word), a first character outside `[a-z0-9]`, any character
+/// outside `[a-z0-9._-]`, and anything past [`NAME_MAX`] bytes, so a name is
+/// never `..`, a path, or a shell word.
 pub(crate) fn parse_name(raw: &str) -> Result<String, String> {
     let name = raw.to_ascii_lowercase();
     if name.is_empty() {
@@ -112,18 +95,13 @@ pub(crate) fn dir_for(name: &str) -> Option<PathBuf> {
     aterm_types::dirs::identities_dir().map(|root| root.join(name))
 }
 
-/// Resolve `name` to its identity directory. With `create`, provision it —
-/// `<identities>/<name>/` and each agent subdir, 0700, owned by us (a foreign
-/// owner is REFUSED, fail-closed: [`aterm_types::fs_restricted::ensure_private_dir`]),
-/// prime it — idempotently: a second call over the same
-/// name is the same directory, verified again, and nothing rewritten that is
-/// current. Without `create`, an identity is what the `identities` verb calls
-/// one ([`identity_dir`]: a REAL directory, never a symlink — measured
-/// 2026-09-17 (review): `is_dir` followed a symlink the verb refused, so a
-/// restore re-injected env pointing outside the identities tree at a name
-/// `identities` could neither list nor forget); anything else is `NotFound`
-/// and nothing is touched. The name is parsed (and folded) here, so every
-/// caller gets the grammar for free.
+/// Resolve `name` (parsed and folded here) to its identity directory. With
+/// `create`, provision `<identities>/<name>/` and each agent subdir at 0700,
+/// owned by us (a foreign owner is refused:
+/// [`aterm_types::fs_restricted::ensure_private_dir`]), and prime it,
+/// idempotently. Without `create`, only what the `identities` verb calls an
+/// identity counts ([`identity_dir`]: a real directory, never a symlink);
+/// anything else is `NotFound` and nothing is touched.
 pub(crate) fn ensure(name: &str, create: bool) -> io::Result<PathBuf> {
     let root = aterm_types::dirs::identities_dir().ok_or_else(|| {
         io::Error::new(
@@ -148,12 +126,10 @@ pub(crate) fn ensure_in(root: &Path, name: &str, create: bool) -> io::Result<Pat
     for row in aterm_primer::agent_homes() {
         aterm_types::fs_restricted::ensure_private_dir(&dir.join(row.sub))?;
     }
-    // The primer over the identity dir: the subdirs above are what it detects,
-    // so exactly the agents of the table get their context file and skills —
-    // fail-soft per agent, exactly as it is for `$HOME`. The IDENTITY entry
-    // point, not `auto_prime`: that one follows the human's `$XDG_CONFIG_HOME`
-    // for the `.config/` row, and measured 2026-09-17 (review) wrote aterm's
-    // OpenCode files into the HUMAN's tree while provisioning an identity.
+    // Prime the identity dir: exactly the agents whose subdirs exist get their
+    // context file and skills, fail-soft per agent. `auto_prime_identity`, not
+    // `auto_prime`, which follows the human's `$XDG_CONFIG_HOME` for the
+    // `.config/` row and would write into the human's tree.
     let pass = aterm_primer::auto_prime_identity(&dir);
     for (agent, err) in pass.errors() {
         aterm_log::warn!("identity {name}: primer: {agent}: {err}");
@@ -163,17 +139,16 @@ pub(crate) fn ensure_in(root: &Path, name: &str, create: bool) -> io::Result<Pat
 
 /// The env additions for a session under the identity at `dir`: one pair per
 /// table row, `<VAR>=<dir>/<sub>`. Applied by `build_child_env` after the deny
-/// pass, so these are the ONLY agent-home variables the child sees.
+/// pass, so these are the only agent-home variables the child sees.
 pub(crate) fn env(dir: &Path) -> Vec<(String, String)> {
     aterm_primer::agent_homes()
         .map(|row| (row.var.to_string(), dir.join(row.sub).display().to_string()))
         .collect()
 }
 
-/// The RESTORE rule: a cold restore of a leaf naming `name` re-injects the
-/// identity's env only when the identity still exists — `create = false`. A
-/// forgotten (or foreign-rooted) identity falls back to a default shell, with
-/// one stderr line saying so; restore never creates an identity.
+/// The restore rule: a cold restore of a leaf naming `name` re-injects the
+/// identity's env only when the identity still exists (`create = false`);
+/// otherwise a default shell, with one stderr line. Restore never creates.
 pub(crate) fn restorable(name: &str) -> Option<String> {
     match ensure(name, false) {
         Ok(_) => Some(name.to_string()),
@@ -187,12 +162,9 @@ pub(crate) fn restorable(name: &str) -> Option<String> {
     }
 }
 
-/// [`restorable`] without the stderr line: the identity a restore leaf naming
-/// `name` would re-inject, or `None` when it no longer exists. For the SECOND
-/// read of the same leaf on a cold restore — the graft's check that the
-/// window's bootstrap shell wears what the pane names
-/// (`App::restore_terminal_leaf`), after `main_entry` already read it (and
-/// said so) to spawn that bootstrap.
+/// [`restorable`] without the stderr line, for the second read of the same leaf
+/// on a cold restore (`App::restore_terminal_leaf` checking that the bootstrap
+/// shell wears what the pane names, after `main_entry` already reported it).
 pub(crate) fn existing(name: &str) -> Option<String> {
     ensure(name, false).ok().map(|_| name.to_string())
 }
@@ -200,16 +172,12 @@ pub(crate) fn existing(name: &str) -> Option<String> {
 /// The `identities` verb's usage line — the whole grammar in one row.
 const IDENTITIES_USAGE: &str = "ERR usage: identities [<name>|forget <name> [confirm=<name>]]\n";
 
-/// `identities [<name>|forget <name> [confirm=<name>]]` -> the ON-DISK roster
-/// of agent identities: what `spawn identity=` created under
-/// [`aterm_types::dirs::identities_dir`], which live sessions carry each, and
-/// which agents have files there. Owner-only like `sessions` (whose
-/// `identity=` column it explains) and Lines-framed from the table — a listing
-/// reply is `OK <n>` + exactly n lines (the client streams exactly that many)
-/// or one `ERR` line — except `forget`, whose replies are all ONE status line
-/// (`control_verbs::framing_of` flips that sub-form to `Status`, as it does
-/// `inbox seen`): the live try of 2026-09-17 measured aterm-ctl refusing
-/// `OK removed=… left=keychain` as a malformed row count under Lines.
+/// `identities [<name>|forget <name> [confirm=<name>]]` -> the on-disk roster of
+/// agent identities under [`aterm_types::dirs::identities_dir`], which live
+/// sessions carry each, and which agents have files there. Owner-only like
+/// `sessions`. Lines-framed (`OK <n>` + n lines, or one `ERR` line), except
+/// `forget`, whose replies are one status line (`control_verbs::framing_of`
+/// flips that sub-form to `Status`).
 ///
 /// | form | reply |
 /// |---|---|
@@ -221,25 +189,15 @@ const IDENTITIES_USAGE: &str = "ERR usage: identities [<name>|forget <name> [con
 /// | unknown name | `ERR no such identity <name>` |
 /// | anything else | `ERR usage: identities [<name>\|forget <name> [confirm=<name>]]` |
 ///
-/// `present` is a `read_dir` NAME listing of the agent's subdirectory — at
-/// least one entry — and nothing is ever opened: aterm knows no login, it
-/// knows a directory it made is not empty (so a primed identity reads
-/// `present` for every agent of the table; `absent` is a missing or emptied
-/// subdirectory). `forget` removes the tree, and the credentials the agents
-/// keep as files go with it; a login an agent keeps in the macOS keychain does
-/// NOT — `left=keychain` says so every time, and the help says: sign out in
-/// the agent first (`/logout`); aterm never reads, names or deletes a keychain
-/// item it did not create. The live count is the registry's: a shell adopted
-/// from a build without the label carries none and is not counted —
-/// `sessions=0` beside a shell still logged in as that identity is the
-/// documented degradation, and the help says to close it first. The in-use
-/// check and the removal are two steps, not one: a `spawn identity=` racing
-/// the removal recreates the directory, which is the create path doing its
-/// job, never a session without its env. Names are parsed (folded) here, so
-/// `Worker` is `worker`; a name the grammar refuses is usage — it cannot
-/// exist, and it is never joined to a path. Only REAL directories are
-/// identities: a symlink or a file in the root is neither listed, described
-/// nor removed.
+/// `present` means the agent's subdirectory has at least one entry (a name
+/// listing; nothing is opened). `forget` removes the tree and the agents'
+/// file credentials with it; a keychain login stays (`left=keychain`, always),
+/// so sign out in the agent first. The live count is the registry's: a shell
+/// adopted from a build without the label is not counted. The in-use check and
+/// the removal are two steps; a racing `spawn identity=` just recreates the
+/// directory. A name the grammar refuses is usage and is never joined to a
+/// path. Only real directories are identities; a symlink or file in the root
+/// is ignored.
 pub(crate) fn cmd_identities(store: &crate::session_store::Store, rest: &str) -> String {
     // The live users, from the registry snapshot: `(identity, sid)` in local-id
     // order. Cloned out under a short read guard, never held across the
@@ -277,9 +235,8 @@ pub(crate) fn identities_reply(root: &Path, live: &[(String, String)], rest: &st
     }
 }
 
-/// The directory `name` (already folded) names under `root`, when it IS an
-/// identity: a real directory, never a symlink — the verb lists, describes and
-/// removes only directories aterm made.
+/// The directory `name` (already folded) names under `root`, when it is an
+/// identity: a real directory, never a symlink.
 fn identity_dir(root: &Path, name: &str) -> Option<PathBuf> {
     let dir = root.join(name);
     std::fs::symlink_metadata(&dir)
@@ -296,9 +253,8 @@ pub(crate) fn roster() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every identity under `root`, by name: the entries whose name IS its own
-/// folded spelling and which are real directories. Anything else in the root
-/// is not an identity and is not listed. A missing root is an empty roster.
+/// Every identity under `root`, by name: entries whose name is its own folded
+/// spelling and which are real directories. A missing root is an empty roster.
 fn list_names(root: &Path) -> io::Result<Vec<String>> {
     let rd = match std::fs::read_dir(root) {
         Ok(rd) => rd,
@@ -327,7 +283,7 @@ fn presence_word(present: bool) -> &'static str {
 }
 
 /// The agents' files under `dir`, per table row: `present` iff the agent's
-/// subdirectory has at least one entry — a NAME listing; nothing is opened.
+/// subdirectory has at least one entry (a name listing; nothing is opened).
 fn agent_presence(dir: &Path) -> Vec<(aterm_primer::AgentHome, bool)> {
     aterm_primer::agent_homes()
         .map(|row| {
@@ -444,10 +400,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "aterm-identity-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -466,22 +419,20 @@ mod tests {
         ] {
             assert!(parse_name(bad).is_err(), "{bad:?} must be refused");
         }
-        // The verb's own word (review, 2026-09-17): `spawn identity=forget`
-        // was creatable, and `identities forget` is usage — an identity no
-        // verb could describe or remove. Folded first, so `FORGET` is it too.
+        // The verb's own word: `spawn identity=forget` would create an identity
+        // no verb could describe or remove. Folded first, so `FORGET` too.
         for word in ["forget", "FORGET", "Forget"] {
             assert!(parse_name(word).is_err(), "{word:?} must be refused");
         }
         assert!(parse_name("forget2").is_ok() && parse_name("forgetful").is_ok());
         assert!(parse_name(&"a".repeat(NAME_MAX + 1)).is_err());
-        // The two spellings are ONE identity: same folded name, same dir.
+        // The two spellings are one identity: same folded name, same dir.
         assert_eq!(parse_name("Worker"), parse_name("wOrKeR"));
     }
 
-    /// `ensure(create = true)`: the dir and every agent subdir exist at 0700,
-    /// the primer's files are in place for every measured agent, a second call
-    /// is the same dir, two names are two dirs, and `create = false` finds
-    /// what exists and refuses what does not — touching nothing.
+    /// `ensure(create = true)`: the dir and every agent subdir exist at 0700 and
+    /// are primed; a second call is the same dir; two names are two dirs; and
+    /// `create = false` finds what exists and refuses what does not.
     #[test]
     fn ensure_creates_0700_dirs_once_primes_them_and_never_creates_on_restore() {
         let root = scratch("ensure").join("identities");
@@ -539,8 +490,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
-    /// The env seam: one pair per table row, each pointing INTO the identity
-    /// dir at the agent's own subdir — nothing else.
+    /// The env seam: one pair per table row, each pointing into the identity
+    /// dir at the agent's own subdir.
     #[test]
     fn env_points_every_table_var_into_the_identity_dir() {
         let dir = PathBuf::from("/state/identities/worker");
@@ -558,10 +509,8 @@ mod tests {
         assert_eq!(env.len(), aterm_primer::agent_homes().count());
     }
 
-    /// The public `ensure` resolves through the state root (here the
-    /// development build's `ATERM_STATE_HOME` seam, what a test isolates with) —
-    /// the identities root is `<state>/identities`, and a name is a directory
-    /// right below it.
+    /// The public `ensure` resolves through the state root (the dev build's
+    /// `ATERM_STATE_HOME` seam): the identities root is `<state>/identities`.
     #[test]
     fn ensure_resolves_the_identities_root_through_the_state_home() {
         let state = scratch("state");
@@ -587,10 +536,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// The verb's LIST: every real directory in the root whose name is its own
-    /// folded spelling, by name, with the live count from the registry pairs
-    /// and `present`/`absent` per agent by a NON-EMPTY subdirectory. A file, a
-    /// symlink and a mis-spelt directory in the root are not identities and
+    /// The list: every real directory in the root whose name is its own folded
+    /// spelling, by name, with the live count and `present`/`absent` per agent
+    /// by a non-empty subdirectory. A file, a symlink and a mis-spelt directory
     /// are not listed.
     #[test]
     fn identities_lists_names_live_counts_and_presence_by_non_empty_subdir() {
@@ -623,10 +571,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// ONE identity: `OK <1+agents>` — the row, then one line per agent naming
-    /// its variable and home. `present` is a name listing: the sentinel file
-    /// is mode 0000, so any attempt to open it would have failed the test, and
-    /// the name folds (`SEALED` is `sealed`). An unknown name is named back.
+    /// One identity: `OK <1+agents>`, the row then one line per agent. `present`
+    /// is a name listing (the sentinel file is mode 0000, so opening it would
+    /// fail the test), and the name folds. An unknown name is named back.
     #[test]
     fn identities_one_names_each_agents_var_and_home_and_never_opens_a_file() {
         let root = scratch("verb-one");
@@ -666,10 +613,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// FORGET: no confirm word (or the wrong one) is the confirm line and
-    /// nothing is touched; a live user is `ERR identity in use` naming the
-    /// sids and nothing is touched; then the tree goes and the reply says what
-    /// aterm left behind — `left=keychain`, every time.
+    /// Forget: no or wrong confirm word gives the confirm line; a live user gives
+    /// `ERR identity in use` naming the sids; both touch nothing. Then the tree
+    /// goes and the reply says `left=keychain`.
     #[test]
     fn identities_forget_needs_the_confirm_word_refuses_a_live_user_then_removes_the_tree() {
         let root = scratch("verb-forget");
@@ -715,8 +661,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Junk is usage, never a guess — and a name the grammar refuses is usage
-    /// too, so `..` and a path are never joined to the root.
+    /// Junk is usage, and so is a name the grammar refuses, so `..` and a path
+    /// are never joined to the root.
     #[test]
     fn identities_junk_and_ungrammatical_names_are_usage() {
         let root = scratch("verb-usage");
@@ -744,13 +690,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// REVIEW (separation lens, 2026-09-17): provisioning an identity must
-    /// write under the identity dir and nowhere else. With the human's
-    /// `$XDG_CONFIG_HOME` set and holding an `opencode` directory, `ensure`
-    /// went through `auto_prime`, which follows that redirection for the
-    /// `.config/` row: it detected the HUMAN's OpenCode and wrote aterm's
-    /// `AGENTS.md` and command file into it. Measured red before the fix:
-    /// `["command", "AGENTS.md"]` in the human's tree.
+    /// Provisioning an identity writes under the identity dir only, even when
+    /// the human's `$XDG_CONFIG_HOME` holds an `opencode` directory.
     #[test]
     fn ensure_never_writes_into_the_humans_xdg_config_home() {
         let scratch = scratch("xdg");
@@ -780,14 +721,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// REVIEW (separation lens, 2026-09-17): restore and the verb agree on
-    /// what an identity is. `identities link` and `identities forget link`
-    /// refuse a symlink in the root (`ERR no such identity`), but
-    /// `ensure(create = false)` followed it — so a restore leaf naming `link`
-    /// re-injected `CLAUDE_CONFIG_DIR=<root>/link/.claude`, pointing outside
-    /// the identities tree, under a name the verb could neither list nor
-    /// forget. Now both read the same [`identity_dir`]: a real directory.
-    /// Unix only: the fixture is a symlink.
+    /// Restore and the verb agree on what an identity is: a symlink in the root
+    /// is not one to either (both read [`identity_dir`]), so a restore never
+    /// re-injects env pointing outside the identities tree. Unix only: the
+    /// fixture is a symlink.
     #[cfg(unix)]
     #[test]
     fn restore_and_the_verb_agree_on_what_an_identity_is() {

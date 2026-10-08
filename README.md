@@ -35,8 +35,6 @@
 
 ## Install
 
-The recommended install is one line:
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
 ```
@@ -49,22 +47,21 @@ On macOS the script downloads the newest app release from github.com (no
 credential, no API request), checks its SHA-256 against the release manifest,
 verifies the app's Developer ID signature and notarization, puts `aterm.app` in
 `/Applications` (or `~/Applications`), and links the `aterm` command and its man
-pages under `~/.local`. `--no-toolchain` excludes the toolset, `--no-path` skips
-the installer's own PATH block, `--dry-run` prints the whole plan — elected
-release, asset, every destination, every edit — and writes nothing, and
-`--uninstall` reverses everything it installed. The toolset adds its own marked
+pages under `~/.local`. Flags: `--dry-run` prints the whole plan and writes
+nothing; `--uninstall` reverses everything it installed; `--no-path` skips the
+installer's own PATH block; `--no-toolchain` excludes the toolset and writes
+`[packages] auto_install = false` into `aterm.toml` (never over a value already
+there), so the app's first launch leaves it alone too — a machine that already
+runs the toolset keeps updating it, but gains a new default-set member only from
+`aterm pkg install --default-set` (`aterm help pkg`). The toolset adds a marked
 block to an existing `~/.zshrc`, `~/.bashrc`, `~/.bash_profile` or fish config;
-delete it and it stays deleted (`aterm pkg repair` puts it back). The toolset
-exclusion persists: `--no-toolchain` writes `[packages] auto_install = false`
-into `aterm.toml` (never over a value already there), so the app's first launch
-leaves the toolset alone too, and a machine that already runs the toolset keeps
-updating it but gets a new default-set member only when `aterm pkg install
---default-set` is run (`aterm help pkg`).
+delete it and it stays deleted (`aterm pkg repair` puts it back).
 
 aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
-and Intel), from the
-public release channel at
+and Intel), from
 [github.com/alabsystems/aterm/releases](https://github.com/alabsystems/aterm/releases).
+The Trust compiler, its verifier backends and `clean` are published for Apple
+silicon only, so on an Intel Mac the first-launch toolchain installs without them.
 The channel carries two kinds of cut: **app releases** ship the containers
 below plus the signed `aterm-appcast.toml` manifest, and **source releases**
 carry only a signed source manifest — the installer and the in-app updater elect
@@ -131,78 +128,39 @@ toolchain's name — install one or the other, not both.
 
 ### Staying current
 
-Installed macOS copies keep themselves current: the app checks the release channel in
-the background, verifies the new build, and swaps it in at a quiet moment —
-every window, tab, split, and live shell survives, and if the handoff cannot
-complete the update lands at the next launch. Settings ▸ Software Update shows
-what is staged plus the release notes; `aterm ctl update status` says the same
-on the command line, and `aterm update` (status, check) works with no window
-open. Settings ▸ Software Update ("Check for updates
-automatically", `[update] enabled = false` in `aterm.toml`) stops the background
-checks — Check for Updates and `aterm update check` still check when asked;
-`[update] auto_apply = false` stages the build and leaves
-applying it to you (Software Update, `aterm ctl update apply`, or the next
-launch).
-
-Enrolled Linux copies check while an ordinary window or interactive session is
-running, normally every thirty minutes with shared retry backoff. By default
-they replace only the on-disk executable; open windows and PTYs keep running
-their existing binary. The next start of the new build that comes up healthy (a
-window, `--headless`, or an interactive session) confirms it; a build whose window
-fails still rolls back. Update checks and applies wait until the new build is
-confirmed or rolls back; when the previous copy can't come back, three failed
-starts end the wait instead. `[update] auto_apply = false` leaves a verified
-stage for explicit `aterm update apply`. `aterm update status` and Settings
-distinguish a Linux stage, an installed trial and a failed check; Linux does not
-pretend to use the macOS live-session handoff. `[update] enabled = false` disables
-background checks from the next launch; explicit checks and applies remain
-available. Locally built installations require explicit
-`aterm update enable`; that trusts the local baseline, not unsigned future
-updates. Updates arrive only from a signed Linux release.
-
-On Windows there is no updater yet and no published build: nothing checks,
-stages or applies one. To update a copy you built, pull and rebuild it as in
-[Build from source](#build-from-source).
+Installed copies update themselves: the app checks the channel in the background,
+verifies the new build and swaps it in at a quiet moment — on macOS every window, tab and
+live shell survives the handoff. Settings ▸ Software Update and `aterm update status`
+show what is staged. `[update] enabled = false` stops background checks;
+`[update] auto_apply = false` stages but leaves applying to you. Windows has no updater
+and no published build; building there needs the Trust toolchain for Windows, which is
+not published yet (see [Build from source](#build-from-source)).
 
 ### Build from source
 
-This repository is a snapshot of the private development line, cut with each
-release, and pins the same Trust toolchain (`rust-toolchain.toml`). Install
-aterm as above and atpkg installs Trust (`aterm pkg install trust` does it by
-hand). On macOS with the Xcode Command Line Tools installed:
+This repository is a snapshot of the development line and pins the Trust toolchain
+(`rust-toolchain.toml`); install aterm and atpkg installs Trust (`aterm pkg install
+trust`). atpkg ships Trust for Apple-silicon macOS only, so that is where this snapshot
+builds today. With the Xcode Command Line Tools:
 
 ```sh
-git clone https://github.com/alabsystems/aterm.git
-cd aterm
+git clone https://github.com/alabsystems/aterm.git && cd aterm
 targo --unverified build --locked -p aterm
 ./target/debug/aterm --window
 ```
 
-`./target/debug/aterm --version` should agree with `[workspace.package]
-version` in the root `Cargo.toml`. Build from the workspace — aterm's crates are
-not on crates.io, so there is nothing to `cargo install`. atpkg ships Trust for
-Apple-silicon macOS today; Linux and Windows build from source too, with Trust
-built from [source](https://github.com/alabsystems/trust). A source build is a
-real aterm,
-not a byte-identical signed release, and is not automatically enrolled for
-replacement. Linux release availability and enrollment are described above.
-
-The name has neighbours, so aim carefully: the crates.io package named `aterm`,
-the `aterm` in MacPorts and old `brew install aterm` guides (an X11 terminal
-from 2007), and the aterm.ai and aterm.io domains are all unrelated projects.
-This aterm is [ALab](https://alab.systems)'s terminal — the code lives here, and
-the releases live on this repository's
-[Releases](https://github.com/alabsystems/aterm/releases) page.
+The crates are not on crates.io. A source build is a real aterm, not the signed release,
+and is not enrolled for updates. (The crates.io `aterm`, the X11 `aterm` in MacPorts and
+the aterm.ai/aterm.io domains are unrelated projects.)
 
 ## Why aterm?
 
-Most terminals are excellent human interfaces. aterm keeps that familiar PTY and
-adds a second, authenticated surface that software can understand: text, styled
-cells, pixels, events, sessions, input, synchronization, and live metrics. That
-makes the terminal a shared workbench — a person types normally while an agent
-observes structured state, drives a turn, waits for a real transition, or
-captures the rendered result, and shells, TUIs, REPLs, editors, and agent CLIs
-still see an ordinary terminal.
+Most terminals are excellent human interfaces. aterm keeps the familiar PTY and adds a
+second, authenticated surface software can understand — text, styled cells, pixels,
+events, sessions, input, synchronization and live metrics — so a person types normally
+while an agent observes structured state, drives a turn, waits for a real transition or
+captures the rendered result. Shells, TUIs, editors and agent CLIs still see an ordinary
+terminal.
 
 ```mermaid
 flowchart LR
@@ -211,358 +169,182 @@ flowchart LR
     A <-->|ordinary PTY bytes| P[Shells · TUIs · agent CLIs]
     A -->|dispatch installed packages| T[Compilers · solvers · verifiers]
     A --> E[aterm engine]
-    O[Your project] -->|Rust · C · WASM embed| E
+    O[Your project] -->|Rust · WASM embed| E
 ```
 
-**And it is fun.** The window looks alive, and the cursor has a companion with
-opinions about your typing. ALab, the group behind aterm, also ships its
-compilers, solvers, and verification tools through it — one `aterm pkg install`
-away.
-
-| Battery | What aterm adds | Important boundary |
+| Battery | What aterm adds | Boundary |
 | --- | --- | --- |
-| **Observe** | Plain text, lossless styled cells, cursor, modes, shell command blocks, session status, a lifecycle timeline, and full-history search | Window and headless modes only |
-| **Drive** | Text, keys, paste, mouse, focus, resize, selection, clipboard, tabs, menu actions, and native Settings | Signals are a separate operation, never faked keystrokes |
-| **Coordinate** | Event-driven `await`, `ready`, `wait`, whole-turn settlement, and cooperative drive leases | `turn` waits for the screen to settle, not for the process to exit; `wait` needs OSC 133 marks |
-| **Stream** | `screen`, `cursor`, `cells`, `bytes`, `events`, `mail`, and `sessions` subscriptions, plus fleet-wide NDJSON | Gaps are marked, never hidden |
-| **Capture** | PNG frames, full-window artifacts with native chrome (macOS), bounded asciicast history, opt-in temporal replay, and GPU swapchain-tap video | Records what aterm rendered, not what the display showed |
-| **Measure** | Live render, frame, input, and application-present-return counters with percentiles and startup phases | Software-side counters; GPU completion and the display are outside |
-| **Extend** | Themes, typography, wallpaper, Trail Packs, Toy Packs, keybindings, and the Rust/C/WASM engine source | Path dependencies only — no crates.io, no API stability yet |
-| **Delight** | The rainbow kitty pet, per-program cats, Robi the helper robot, a shelf of cursor trails, Sparkle Words, Matrix rain, and a typing-sound synth | Synth audio is macOS-only; decorative effects are opt-in on Windows; some halos need the GPU |
+| **Observe** | Plain text, lossless styled cells, cursor, modes, command blocks, session status, a lifecycle timeline, full-history search | Window and headless modes only |
+| **Drive** | Text, keys, paste, mouse, focus, resize, selection, clipboard, tabs, menu actions, Settings | Signals are a separate operation, never faked keystrokes |
+| **Coordinate** | Event-driven `await`, `ready`, `wait`, whole-turn settlement, drive leases | `turn` waits for the screen to settle; `wait` needs OSC 133 marks |
+| **Stream** | `screen`, `cursor`, `cells`, `bytes`, `events`, `mail`, `sessions` subscriptions, fleet-wide NDJSON | Gaps are marked, never hidden |
+| **Capture** | PNG frames, full-window shots with native chrome (macOS), asciicast history, opt-in temporal replay, GPU video | What aterm rendered, not what the display showed |
+| **Measure** | Render, frame, input and present counters with percentiles and startup phases | Software-side counters |
+| **Extend** | Themes, typography, wallpaper, Trail Packs, Toy Packs, keybindings, the engine source | Path dependencies only; no API stability yet |
+| **Delight** | The rainbow kitty pet, per-program cats, Robi, cursor trails, Sparkle Words, Matrix rain, a typing-sound synth | Synth audio is macOS-only |
 
-### One binary, distinct modes
+### One binary
 
-aterm ships as one executable. Invocation chooses the surface:
-
-| Invocation | Result | External control socket |
+| Invocation | Result | Control socket |
 | --- | --- | --- |
 | `aterm` in a TTY | Transparent PTY session | No |
-| `aterm` with no TTY on stdin (a Finder launch) | Terminal window | Yes, by default |
-| `aterm --window` | Terminal window, explicitly | Yes, by default |
-| `aterm --headless` | Terminal engine without a window | Yes, by default |
+| `aterm` with no TTY (a Finder launch), or `--window` | Terminal window | Yes |
+| `aterm --headless` | The engine without a window | Yes |
 | `aterm --session` | Force the PTY session in a pipe or CI | No |
 
-The same binary answers the front-door verbs — `ctl`, `conn`, `pkg`, `fleet`,
-`drive`, `fabric`, `link`, `update`, `agents`, `harness`, `new-tab`, `new-window`,
-`split-pane` — plus `aterm help`, the diagnostic words (`doctor`, `show-config`,
-`explain-config`, `list-themes`, …), and managed-tool dispatch. Compatibility
-names such as `aterm-ctl`, `atpkg`, `aterm-fleet`, and `aterm-drive` are symlinks
-onto that binary, not separate products, and the app bundle ships them beside it.
-
-The plain TTY session deliberately serves no socket — use window or headless mode
-when another process needs to observe or drive a session. Those modes enable
-control by default, disable it explicitly with `--no-control-sock`, and fail
-closed if a secure socket cannot be created.
+The same binary answers `ctl`, `conn`, `pkg`, `fleet`, `drive`, `link`, `fabric`,
+`update`, `agents`, `harness`, `keeper`, `new-tab`, `new-window`, `split-pane`, `ship`
+(source checkouts), `help`, the diagnostic words
+(`doctor`, `show-config`, `list-themes`, …) and managed-tool dispatch. `aterm-ctl`,
+`atpkg`, `aterm-fleet` and `aterm-drive` are symlinks onto it. Control is on by default
+in window and headless modes (`--no-control-sock` turns it off) and fails closed if a
+secure socket cannot be created.
 
 ## Made for humans and agents
 
-aterm does not make an agent impersonate a person by scraping pixels and hoping
-the timing works. Agents speak a local control protocol outside the PTY byte
-stream; the text and keys they send enter through the same input path a person's
-keystrokes do, and the person's keyboard never routes through the agent — so a
-human can type at any time, even mid-turn.
+Agents speak a local control protocol outside the PTY byte stream; what they send enters
+through the same input path as a person's keystrokes, and the person's keyboard never
+routes through the agent, so a human can type at any time, even mid-turn.
 
-Coding agents learn that aterm exists without anyone running anything: each
-time an aterm window opens a session, it detects the coding agents on the
-machine — Claude Code, Codex CLI, Gemini CLI, and OpenCode — and keeps a short
-primer current in each one's global context file (`~/.claude/CLAUDE.md`,
-`~/.codex/AGENTS.md`, …).
-The aterm brief in that primer only activates when the agent finds itself inside
-aterm (its Rust note and peer-messaging note gate on the toolchain and the fabric
-instead). Claude Code also gets four bundled skills — `drive-aterm`,
-`supervise-agent`, `rust-in-aterm` and `aterm-fabric` — and the other agents get
-`aterm-fabric` as a command. An agent launched inside an aterm window or headless
-instance then knows to detect it (`TERM_PROGRAM=aterm` /
-`ATERM_CHILD=1`), to run `aterm help` — which there prints the agent operating
-brief with the caller's own session ID already filled in — and to list the
-windows and sessions and read a peer's `status` before typing into it.
+Each time a window opens a session, aterm keeps a short primer current in the global
+context file of every coding agent it finds — Claude Code, Codex CLI, Gemini CLI,
+OpenCode (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …). Claude Code also gets four
+bundled skills — `drive-aterm`, `supervise-agent`, `rust-in-aterm` and `aterm-fabric` —
+and the other agents get `aterm-fabric` as a command. The brief activates only inside
+aterm (`TERM_PROGRAM=aterm`, `ATERM_CHILD=1`; its Rust and peer-messaging notes gate on
+the toolchain and the fabric), where `aterm help` prints the agent brief with the
+caller's session ID filled in. Rules of your own go outside its markers. `aterm agents`
+shows status, `aterm agents remove` uninstalls, `agents_auto_prime = false` stops it.
 
-```sh
-aterm agents install          # the same pass on demand; name an agent to force it
-```
-
-`aterm agents` shows status, `aterm agents remove` uninstalls,
-`agents_auto_prime = false` in `aterm.toml` stops the automatic pass, and
-`aterm help agents` explains the mechanism.
-
-Two facts agent builders ask about first:
-
-- **Env hygiene is unconditional.** Every shell aterm spawns has `CLAUDE*`,
-  `ANTHROPIC_*`, `COPILOT_*`, `CODEX_*`, `CURSOR_*`, `AI_*`, and `_DEVTOOL_*`
-  stripped, along with aterm's own session identity (re-issued fresh to each
-  child), so an outer agent's context never leaks into an inner session.
+- **Env hygiene is unconditional.** Every spawned shell has `CLAUDE*`, `ANTHROPIC_*`,
+  `COPILOT_*`, `CODEX_*`, `CURSOR_*`, `AI_*` and `_DEVTOOL_*` stripped, and a window's
+  shell gets a fresh session identity.
 - **There is no MCP server, by design.** The integration surfaces are the CLI
-  (`aterm ctl`, `aterm conn`, `aterm drive`, `aterm fleet`) and the Rust library
-  API.
-
-Beyond the batteries listed under [Why aterm?](#why-aterm), the control-enabled
-window and headless modes provide:
-
-- **Session state without reading the screen:** a per-session `status`
-  (idle / running / quiet / exited, with confidence), a `timeline` of lifecycle
-  events, and user-settable `meta` such as a typed `role` and a needs-human
-  `attention` flag.
-- **A session fabric:** stable session IDs, exact `@sid` routing across every
-  same-user instance, `@self` for your own session, a hard per-session lease
-  during a `turn` and a cooperative `lease` for raw drivers, multi-session
-  subscriptions, and `aterm fleet events` / `aterm fleet exec` to federate a
-  fleet over one descriptor. `aterm conn` goes further and wires one session to
-  pull another's screen and push keystrokes into it as standing wiring, so a
-  supervisor session supervises any interactive tool, unmodified.
+  (`aterm ctl`, `conn`, `drive`, `fleet`) and the Rust library API.
+- **A session fabric**: stable IDs, `@sid` routing across every same-user instance,
+  `@self`, per-session `status` and `timeline`, settable `meta` (`role`, `attention`),
+  turn leases, multi-session subscriptions, `aterm fleet events` / `aterm fleet exec`
+  over one descriptor, and `aterm conn` to wire one session to watch and type into
+  another.
 
 ### CLI tour
 
-Open a window — with your shell, or running one command:
-
 ```sh
-aterm --window
-aterm --window -e htop        # -d <dir>, --hold, --shell pwsh also exist
-```
-
-From another shell, inspect and drive its active session:
-
-```sh
+aterm --window -e htop          # a window running one command (-d <dir>, --hold, --shell)
 aterm ctl text                  # plain visible rows
 aterm ctl screen                # lossless styled-grid JSON
 aterm ctl status                # phase, outcome, and confidence for this session
 aterm ctl image frame.png       # the rendered frame as PNG; the reply names where it was saved
 aterm ctl window shot.png       # the whole window with its native chrome (macOS), saved the same way
 aterm ctl turn 'git status'     # type, submit, settle, and return the screen
-aterm ctl wait                  # block until the running command completes (OSC 133)
+aterm ctl wait [<ms>]           # block until the running command completes (OSC 133)
 aterm ctl metrics               # live render and latency counters
-aterm ctl help text             # one verb's full entry; bare `help` is the short catalog, `--full` all of it
-```
+aterm ctl help text             # one verb's entry; bare `help` is the catalog
 
-A verb with no session address targets the active tab. From inside an aterm
-session, `@self` is your own pane; for automation, pick a session by ID or mint
-one:
-
-```sh
-aterm ctl windows                              # one row per window: which sessions sit on its active tab
-aterm ctl ls                                   # every session of every live instance, with window=, detail= (what it runs), identity= (whose agent login) and path= (frozen|live)
-#   wfocus=1 marks aterm's most recently focused window (a minimize or the app deactivating does not clear it)
-#   path=frozen names a tab whose shell predates the self-healing sessions: `claude`/`codex` there run the foreign copies until `. ~/.aterm/shell.d/00-atpkg.zsh` is typed in it
-sid=$(aterm ctl spawn window=1 | cut -d' ' -f2)   # a fresh tab in window 1, immediately addressable — not raised
-#   (an unknown id is refused by name; a --headless instance owns logical window 0, the one `ls` and `windows` show)
+aterm ctl ls                                   # every session of every live instance
+sid=$(aterm ctl spawn window=1 | cut -d' ' -f2)
 aterm ctl "@$sid" turn 'make test'
 aterm ctl "@$sid" await match 'result:'        # block until a regex appears (one token)
-aterm ctl "@$sid" await gone esc.to.interrupt   # block until NO row matches (an agent's busy footer leaving = its turn is over); one token — the wire never quotes
+aterm ctl "@$sid" await agent idle,prompt,question,wall   # a coding-agent peer: block until the server's verdict says its turn is over, a box waits, or a wall stops it (latched)
 aterm ctl subscribe "@$sid" events,cursor      # targets follow the verb here; add screen,cells,bytes as needed
 aterm ctl "@$sid" close
 ```
 
-`turn` types, submits, verifies the submit landed, settles, and returns the
-screen plus a deterministic hash. `await` waits on one predicate — `idle <ms>`,
-`seq [<n>]`, `match <re>`, `gone <re>` (no visible row matches: the inverse of
-`match`, for a turn whose end is a busy footer leaving), `block`, `agent <word>`,
-`inbox since=<id>`, `momentum <floor>` or `consent` — with an optional
-`timeout=<ms>`; `await seq` is level-triggered, so `await seq <n> timeout=0` is
-a cheap one-shot "did anything change?" check, and any timeout exits with code
-124 so a script can tell "not yet" from "failed".
-
-Socket discovery is automatic for ordinary local use: `--sock`, `--pid`, then
-the instance hosting your own terminal, then the per-user socket that always
-points at the newest instance. (A private instance binds its own path with
-`aterm --headless --control-sock <path>`; no environment variable selects a
-socket.) `aterm ctl help`
-prints the short verb catalog from a running instance, `aterm ctl help <verb>`
-one verb's full entry, and `aterm help introspection` the full catalog
-anywhere. All of them are generated from the one typed verb table the server
-answers from, so they cannot drift.
+`await` takes one predicate (`idle <ms>`, `seq [<n>]`, `match <re>`, `gone <re>`,
+`block`, `agent <word>`, `inbox since=<id>`, …) and an optional `timeout=<ms>`;
+`await seq <n> timeout=0` is a cheap "did anything change?", and a timeout exits 124.
+Without `--sock`/`--pid` a call drives the instance hosting your terminal, else the
+newest instance; a private instance binds its own path with `--control-sock`. Every help
+listing is generated from the one verb table the server answers from.
 
 ## Fun is a feature
 
-The default cursor is the **rainbow kitty pet**: a full-body cat that walks,
-runs, and pounces along your line, trailing a banded rainbow ribbon (with a
-music-box typing sound on macOS). It cheers a green build, sulks at a failed
-one, and chases your mouse. Slowly stroke across its body to earn a chin lift,
-slow blink and purr, or click it for affection. Keep petting and its tail and
-body join in. A new kitty is generated every time aterm starts, and
-any program that holds the foreground for more than a few seconds earns its own
-cat — Claude Code, Codex, and everything else you run gets a look of its own.
-View ▸ Favourite This Kitty pins the one you like.
+The default cursor is the **rainbow kitty pet**: a full-body cat that walks, runs and
+pounces along your line on a banded rainbow ribbon, with a music-box typing sound on
+macOS. It cheers a green build, sulks at a failed one, chases your mouse, and purrs when
+stroked. Every launch generates a new kitty, and any program that holds the foreground
+earns its own cat; View ▸ Favourite This Kitty pins one.
 
 <p align="center">
   <img src="assets/aterm-rainbow-kitty.png" width="880" alt="Close-up from a real aterm frame: the rainbow kitty and its ribbon under a typed command">
 </p>
 
-The pet answers to `rainbow kitty pet`, `rainbow kitty`, and bare `kitty` — all
-three are the same animal; the original flying head has its own name now,
-`rainbow kitty flying` (the historical `nyan` aliases still select it). The rest
-of the shelf: `rainbow dog pet`, the ribbon geometries `rainbow kitty underline`
-and `rainbow kitty tall`, the A/B control `rainbow kitty flat` (the body before
-the comet and its vivid rail), then `phaser`, `comet`, `lumen`, `sparkle`, `fire`,
-`laser`, `water`, `beam`, `classic`, `classic mono`, and `off` — or load a Trail Pack, a TOML cursor trail
-composed from the built-in beam, crown, particle, and ramp primitives, no restart
-needed. `classic` is the v0.28 trail restored: a thin four-layer comet under a
-soft square bloom, and the long diagonal comet on a screen-crossing jump that
-the modern engine's shape gates no longer draw. It is a faithful restoration —
-its frames are byte-identical to the ones the v0.28 build emits — and it is
-offered as an option, never a default. `classic mono` is that same engine
-wearing v0.28's other face: one hue instead of the rolling spectrum, taken from
-the theme's cursor colour, so it follows `cursor_trail_color` and live OSC 12. Every trail has a signature typing sound on macOS, and
-Settings ▸ Cursor & Motion ▸ Sound ▸ Typing sound picks any instrument — music
-box, droplet, typewriter, marimba, felt — regardless of the trail on screen, or
-leaves it on Follow the trail.
+- **Trails**: `rainbow kitty pet` (also `kitty`), `rainbow kitty flying`, `rainbow dog
+  pet`, `phaser`, `comet`, `lumen`, `sparkle`, `fire`, `laser`, `water`, `beam`,
+  `classic`, `off` — or a TOML Trail Pack. Settings ▸ Cursor &
+  Motion picks the typing sound.
+- **Robi**, a tip-sharing helper robot (`robi = true`).
+- **Sparkle Words** give typed words animated ink; TOML Toy Packs add your own. Purely visual: copied text and logs read exact bytes.
+- **Matrix rain** in empty cells (View ▸ Matrix Rain, `aterm ctl rain toggle`).
 
-The rest of the roster:
-
-- **Robi**, a tip-sharing helper robot, walks your typed row, does jumping jacks
-  while showing tips, and swings across the tab bar. Off by default — invite him
-  with `robi = true` in `aterm.toml` (or the Settings toggle). Once invited, type
-  `robi` and he hustles over with a fresh tip; click him to retire him again.
-- **Sparkle Words** give typed words animated ink. Profanity gets rainbow ink
-  with a bonk (and sometimes escalates to a nova); hundreds of animal words —
-  in English, Chinese, Japanese, Korean, and more — show their animal on the
-  word; `kitty` summons a cat, and `dog`, once you have typed enough, summons a
-  dog. Toy Packs add your own word effects from TOML. Everything is purely
-  visual: copied text, logs, and recordings read exact bytes.
-- **Matrix rain** falls only in empty cells under the text, follows what the
-  session is doing, and toggles per session from View ▸ Matrix Rain or
-  `aterm ctl rain toggle`. Off by default.
-- **Sing-along:** hold a key on the rainbow trail and the cat goes full chorus —
-  maximal ribbon flow, a dancing singing face, rising notes, and an original
-  chiptune riff that crossfades away when you stop. Every key sings its own
-  verse; switch keys and the song modulates onto the new one.
-
-Fun remains controllable. `motion = auto|full|reduced` follows the OS Reduce
-Motion setting and, under reduced motion, stops every governed animation
-outright. `serious_mode` (View ▸ Serious Mode) mutes every effect sound and hides
-every decorative effect in one switch without changing the terminal's functional
-behavior, and each trail, sound, and toy has its own switch. The ambient sound
-bed is opt-in and off by default, and on Windows the decorative effects are
-opt-in as a whole (`cursor_trail = true`).
+`motion = reduced` (or the OS Reduce Motion setting) stops governed animation;
+`serious_mode` mutes every effect sound and hides every decorative effect in one switch.
+On Windows decorative effects are opt-in.
 
 ## A real terminal underneath
 
-The engine handles modern shell and TUI workloads: Unicode grapheme clusters,
-emoji sequences, wide and combining characters, bidi visual reordering, the
-kitty keyboard protocol, OSC 8 hyperlinks (Cmd-click on macOS, Ctrl-click
-elsewhere; hovering discloses the destination before you can open it), OSC 133
-shell marks (injected automatically for zsh, bash, fish, and PowerShell), styled
-underlines, 24-bit colour, synchronized output, bracketed paste, OSC 52
-clipboard writes, and inline graphics — sixel, iTerm2 images, and the core kitty
-graphics paths.
+Unicode grapheme clusters, wide and combining characters, bidi, the kitty keyboard
+protocol, OSC 8 hyperlinks, OSC 133 shell marks (injected for zsh, bash, fish and
+PowerShell), styled underlines, 24-bit colour, synchronized output, bracketed paste,
+OSC 52, and sixel, iTerm2 and kitty graphics. Scrollback is tiered (RAM, LZ4, zstd;
+100,000 lines by default); predictive local echo paints ahead of a slow shell; box
+drawing and Powerline glyphs are generated from cell geometry; an idle event loop parks.
 
-Scrollback is a tiered store (hot RAM, warm LZ4, cold zstd) that defaults to
-100,000 lines under a byte budget. Predictive local echo (mosh-style) paints
-typed glyphs ahead of a slow shell's echo — ssh, a loaded box — and stays out of
-alt-screen and password contexts. Box drawing, blocks, braille, and Powerline
-separators are generated from cell geometry so adjacent shapes meet cleanly.
-When nothing is animating and no deadline is pending, the event loop parks.
-
-The window renders on the GPU — aterm's own Metal backend on macOS, wgpu over
-Vulkan on Linux and DX12 on Windows — with the CPU rasterizer as automatic
-fallback or explicit `--cpu` choice; a parity suite renders the same frames both
-ways and holds them to a small channel tolerance. On macOS the titlebar is the
-tab strip, the menu bar is a real menu bar, and a `❯` status item in the system
-menu bar gives an operator glance across sessions and instances.
-
-Tabs, split panes, and multiple windows live in one process; tabs carry busy and
-attention badges (a failed command flags its tab), the focused pane is marked in
-the split divider, and the workspace is restored across quit and relaunch. Cmd-,
-opens native Settings as a tab (Manual, Appearance, Wallpaper, Text & Fonts, Cursor &
-Motion, Cursor Kitty, Window, Tab Color, Keyboard & Input, Terminal, Security,
-Software Update, Packages, Messages, About); Markdown files and a native Editor
-open as tabs too. Cmd-F searches screen and scrollback with regex, Shift-Cmd-P
-opens the command palette, and the built-in chords are rebindable through
-`[keybindings]` (`aterm --window --list-actions` prints the set). Twelve colour
-themes are built in (`aterm list-themes`), `theme = "dark:…,light:…"` follows the
-OS appearance, and `~/.config/aterm/themes/*.conf` adds your own. Typography
-covers ligatures, OpenType features, variable-font weight, ordered fallback fonts,
-and bundled display faces.
-
-A Linux build publishes the AccessKit tree, so a screen reader reads the grid and
-Settings. macOS releases and Windows builds ship without one; build it with
-`targo --unverified build --locked -p aterm --features aterm-gui/a11y-accesskit` (or, on
-macOS, `aterm-gui/a11y-appkit`, aterm's own VoiceOver publisher).
+Rendering is aterm's own Metal backend on macOS and wgpu elsewhere, with the CPU
+rasterizer as fallback or `--cpu`, held to the same frames by a parity suite. Tabs,
+splits and windows share one process and are restored across relaunch; Settings
+(Cmd-,), Markdown files and an editor open as tabs; Cmd-F searches scrollback by regex;
+Shift-Cmd-P is the command palette; chords are rebindable under `[keybindings]`. Twelve
+themes are built in, `theme = "dark:…,light:…"` follows the OS, and
+`~/.config/aterm/themes/*.conf` adds your own. Linux builds publish an AccessKit tree for
+screen readers.
 
 ## The ALab toolchain
 
-aterm is the front door to ALab's self-owned verification toolchain: the `trust`
-compiler (a Rust compiler that verifies what it compiles), the `ay` solver, the
-`ty` specification checker, the `clean` theorem prover, and the `ny` and `nn`
-neural-network tools. The same binary owns package management and dispatch, so
-`aterm ay` means the same tool on every machine:
+aterm is the front door to ALab's verification toolchain — the `trust` compiler (a Rust
+compiler that verifies what it compiles), the `ay` solver, the `ty` specification
+checker, the `clean` theorem prover, and the `ny`/`nn` neural-network tools:
 
 ```sh
-aterm pkg install ay        # from the signed public index
-aterm pkg install trust     # the compiler bundle: trustc, targo, tippy, …
+aterm pkg install trust     # trustc, targo, tippy, …
+aterm pkg install ay
 aterm ay --help
-aterm trustc --help
 aterm pkg list
 ```
 
-`aterm <tool>` resolves against the managed store — never `$PATH` — so aterm's
-own verbs cannot be shadowed. On `$PATH` itself the managed tools come last, so
-a `ty` or `clean` you already had (Homebrew core has formulae with those names)
-keeps winning — `alab-<tool>` (`alab-ty`, `alab-clean`, …) always names ALab's
-copy, and `aterm pkg which <tool>` says which one runs. Inside an aterm tab a
-few names run stubs first: `cargo`, `rustc` and `tlc` name ALab's counterpart,
-then run yours; `clippy`, `rustfmt`, `rustdoc` and `lean` run `tippy`,
-`trustfmt`, `trustdoc` and `clean`; `z3` refuses unless run by its path; and
-`claude` and `codex` run the managed Claude Code and Codex CLI the toolset
-installs. `aterm --no-reroute` restores every name but `claude` and `codex`
-(`aterm help reroute`). Settings ▸ Packages ▸ Install ALab Tools Now (or `aterm
-pkg install --default-set`) fetches the whole set at once, and the windowed app
-keeps installed packages current on a six-hour loop.
-
-Packages ride the same trust chain as the app updater (see
-[Security model](#security-model)): every download is verified before it is
-parsed, the tree hash of the extracted files must match the signed manifest, and
-installs swap in atomically with rollback. `aterm help` lists the tools.
+`aterm <tool>` resolves against the managed store, never `$PATH`. On `$PATH` the managed
+tools come last, `alab-<tool>` always names ALab's copy, and `aterm pkg which <tool>`
+says which one runs. Inside an aterm tab `cargo`, `rustc` and friends are rerouted to
+their Trust counterparts (`aterm help reroute`; `--no-reroute` restores them). Packages
+ride the updater's trust chain: verified before parsing, tree-hashed against the signed
+manifest, swapped in atomically with rollback.
 
 ## Use aterm in your own project
 
-### 1. Control a running terminal
+**Control a running terminal.** Every result in the [CLI tour](#cli-tour) has a protocol
+equivalent; from Rust, `aterm-agent` wraps it as `CtlClient`, `RelayClient` and `Turn`.
 
-Use the authenticated local protocol when your program should share a real PTY
-session with a person: every result in the [CLI tour](#cli-tour) has a
-protocol-level equivalent, and `aterm ctl screen` returns full per-cell JSON
-(glyph, colours, attributes) when text is not enough. It is the right boundary
-for an agent orchestrator, test harness, development environment, or tool that
-needs observation and control without owning the terminal engine. From Rust, the
-`aterm-agent` crate wraps the same protocol as `CtlClient`, `RelayClient`, and
-`Turn`.
-
-### 2. Embed the engine
-
-Use the engine surfaces when your application owns the terminal grid and
-renderer. Point your workspace at the checked-out source:
+**Embed the engine** when your application owns the grid and renderer:
 
 ```toml
 [dependencies]
 aterm-core = { path = "../aterm/crates/aterm-core" }
 ```
 
-The Rust shape is intentionally small:
-
 ```rust
 use aterm_core::terminal::TerminalBuilder;
 
-let mut terminal = TerminalBuilder::new()
-    .size(24, 80) // rows, columns
-    .build();
-
+let mut terminal = TerminalBuilder::new().size(24, 80).build();
 terminal.process(b"\x1b[32mhello from aterm\x1b[0m");
-let visible = terminal.visible_content(); // the plain-text projection
-assert!(visible.contains("hello from aterm"));
+assert!(terminal.visible_content().contains("hello from aterm"));
 ```
 
-Beyond Rust: `aterm-ffi` builds a static or dynamic library with a small
-panic-safe C ABI (`crates/aterm-core/include/aterm.h`), and three WebAssembly
-crates target `wasm32-unknown-unknown` — `aterm-wasm` (engine plus CPU
-rasterizer into a canvas), `aterm-gpu-web` (engine plus wgpu over WebGL2), and
-`aterm-effects-web` (the Matrix-rain overlay for an external terminal grid).
+Beyond Rust: two WebAssembly crates target `wasm32-unknown-unknown` —
+`aterm-wasm` (engine plus CPU rasterizer into a canvas) and `aterm-gpu-web`
+(engine plus wgpu over WebGL2).
 [Orca ALab Edition](https://github.com/alabsystems/orca-alab) is the reference
-integration: it uses aterm for terminal state, parsing, search, selection,
-scrollback, and the CPU/GPU WebAssembly renderers, and its
-[`orca-terminal` adapter](https://github.com/alabsystems/orca-alab/tree/main/rust/crates/orca-terminal)
-is a concrete example.
-
-Embedding the engine does not include the native window, the control socket, or
-the macOS sound palette. The workspace crates are public but pre-1.0; expect API
-changes between releases.
+integration. Embedding excludes the native window, the control socket and the sound
+palette. The crates are pre-1.0.
 
 ## Security model
 
@@ -619,8 +401,9 @@ Containment is a launch-time choice: `--containment <mode>` with modes `master`,
 `user` (default), `safety`, and `containment`. `--sandbox` is shorthand for the
 last and wraps the shell in the macOS sandbox: no network, writes only under
 the temp directories (`$TMPDIR`, `/private/tmp`) and `/dev` plus the shell's
-history file, and no reads or writes of credential stores or private data
-directories, failing closed if the wrapper is missing. The working directory
+history file, no reads or writes of credential stores or private data
+directories, and no debugger attach (no task port but a process's own),
+failing closed if the wrapper is missing. The working directory
 and `$HOME` are read-only there, so a contained tool that builds a project
 builds a copy under `$TMPDIR`. Linux and Windows have no OS sandbox, so there `--sandbox`
 refuses to start and names the gap rather than run a shell unconfined. `safety`
@@ -649,54 +432,36 @@ subsystem state back onto the models so the specs stay tied to shipping code; a
 model with no such tie only proves something about itself, and the repository
 labels those.
 
-Shipped bugs get promoted into that discipline rather than just patched. The
-auto-update crash-loop — a quarantine memo the updater wrote and then ignored,
-so a build that had just failed was re-applied on the next check — was fixed,
-then hardened, and is now stated as one contract binding the writer to the
-reader, checked by the exhaustive interpreter and independently by `ty`, bound
-to the real constructors and the real reader by a conformance test, and guarded
-by replaying the original defect as a negative control that the model must
-catch.
+Shipped bugs get promoted into that discipline rather than just patched: the
+updater's quarantine memo is one contract binding its writer to its reader,
+checked by the interpreter and by `ty`, bound to the real code by a conformance
+test, with the original crash-loop replayed as a negative control.
 
 The development line — and the Apple-silicon slice of every release — is compiled
 by the Trust toolchain (`trustc`/`targo`), but in-compilation verification is not
 yet enabled workspace-wide, so "compiled by a verifying compiler" is not
 "verified": that campaign ratchets crate by crate. The public snapshot pins the
 same Trust toolchain and carries the embedded exhaustive checker, the conformance,
-property, and fuzz tests, the CPU/GPU parity suites, and the differential oracle
-against `alacritty_terminal` (the `ay` bundles stay internal). These prove or
-test named, bounded contracts — not the whole emulator, renderer, or OS.
+property and fuzz tests and the CPU/GPU parity suites (the `ay` bundles stay
+internal). These prove or test named, bounded contracts — not the whole emulator,
+renderer, or OS.
 The development line gates every merge on a local verification run (there is
 no hosted CI), and the release cutter re-runs the temporal-safety checks before
 it claims a build number. Those gate scripts live in the development line, not
 in this snapshot; [CONTRIBUTING.md](CONTRIBUTING.md) says what you can run here.
 
-aterm makes no aggregate performance claim. The reproducible cross-engine
-measurements are engine-only and in-process — throughput via
-`targo --unverified bench -p aterm-bench --bench comparative` and retained heap via
-`targo --unverified test -p aterm-bench --test memory`, aterm vs `alacritty_terminal`, no
-rendering or GPU. No on-glass head-to-head has yet been run on a shipped build
-under a protocol fit to publish, so none is quoted. `aterm ctl metrics` exists so
-you can measure render and latency on the workload that matters to you.
+aterm makes no aggregate performance claim: no head-to-head has been run on a
+shipped build under a protocol fit to publish. `aterm ctl metrics` measures render
+and input latency on the workload that matters to you.
 
 ## Help and configuration
 
-The executable carries its current command reference:
-
 ```sh
-aterm --help                 # the daily-driver session
-aterm --window --help        # window options, keys, and the main config keys by group
-aterm help                   # the manual — or, inside a session, the agent brief
+aterm help                   # the manual (in an aterm window's tab: the agent brief)
+aterm --window --help        # window options, keys, config keys
 aterm help introspection     # the control-verb catalog, offline
-aterm ctl --help             # the client: socket resolution, exit codes, payloads
 aterm doctor
-aterm --window --diagnose    # compiler, renderer, features, advertised capabilities
-aterm --window --show-config
-aterm --window --write-config
 aterm --window --validate-config
-aterm --window --list-keybinds
-aterm list-themes
-aterm list-kitty-commands    # the words the cursor cat obeys when typed (aterm help kitty)
 ```
 
 Configuration is loaded from `$XDG_CONFIG_HOME/aterm/aterm.toml`, falling back to
@@ -708,14 +473,17 @@ meaning. The window watches the configuration and applies supported
 changes without a restart, and Settings ▸ Manual opens the file in the native
 editor.
 
-By default the windowed app goes online for at most two things — the app update
-check (eligible macOS or enrolled Linux installs) and the toolchain package
-update pass (GitHub, plus downloads.claude.ai and releases.openai.com for Claude
-Code and Codex CLI) — and contains no telemetry. Descriptive tab titles use a
-local summarizer unless you opt into a remote provider. Ordinary interactive
-terminal sessions also run the eligible update/package checks. Noninteractive
-helpers and introspection harnesses do not start those background checks;
-explicit network commands still perform their requested work.
+aterm contains no telemetry. By default it goes online for two things only: the
+app update check (eligible macOS or enrolled Linux installs) and the toolchain
+package update pass (GitHub, plus downloads.claude.ai and releases.openai.com for
+Claude Code and Codex CLI). When that pass installs a new Claude Code or Codex CLI
+you have used before, aterm runs it once in the background so it refreshes your
+account's model list. `[packages] enabled = false` stops the pass and that run
+(a build you install by hand still gets the run). The window and ordinary
+interactive sessions run these checks; noninteractive helpers and introspection
+harnesses do not, though explicit network commands still do their work.
+Descriptive tab titles use a local summarizer unless you opt into a remote
+provider.
 
 On macOS aterm also changes two settings by default: it turns Universal Control
 off for this Mac, and renames cargo `target` folders under your home to
@@ -727,18 +495,10 @@ Control back on.
 
 ## Community and license
 
-Focused fixes and well-scoped improvements are welcome — it is a best-effort
-project. See [CONTRIBUTING.md](CONTRIBUTING.md) for the build and review boundary
-and [SECURITY.md](SECURITY.md) for private vulnerability reporting. Release notes
-live on the [Releases](https://github.com/alabsystems/aterm/releases) page and
-inside the app under Settings ▸ Software Update.
+Focused fixes are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+[PUBLICATION.md](PUBLICATION.md) describes this snapshot's boundary and
+[VERSIONING.md](VERSIONING.md) the one `MAJOR.MINOR.0` version.
 
-[PUBLICATION.md](PUBLICATION.md) describes the snapshot boundary between this
-repository and the private development line, and [VERSIONING.md](VERSIONING.md)
-the one `MAJOR.MINOR.0` version that names the app, the tag, the DMG, and the
-snapshot.
-
-Unless a file says otherwise, aterm is licensed under the
-[Apache License 2.0](LICENSE). MIT-licensed project components use
-[LICENSE-MIT](LICENSE-MIT), and bundled or derived third-party material retains
-its own terms. See [NOTICE](NOTICE) for the distribution inventory.
+Unless a file says otherwise, aterm is licensed under the [Apache License 2.0](LICENSE).
+MIT-licensed components use [LICENSE-MIT](LICENSE-MIT); third-party material keeps its
+own terms ([NOTICE](NOTICE)).

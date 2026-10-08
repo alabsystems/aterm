@@ -21,9 +21,10 @@ pub enum InstallPosture {
     /// A normal install. The bundle can be replaced in place, so self-update
     /// works and the shell shims can be written beside it.
     Installed,
-    /// Running straight out of a mounted disk image (`/Volumes/…`) — the user
+    /// Running from a mounted volume (`/Volumes/…`) — usually the user
     /// double-clicked `aterm.app` inside the DMG window instead of dragging it
-    /// to Applications. The volume is read-only and disappears on eject.
+    /// to Applications, but an install on a second drive lands here too: the
+    /// path alone cannot tell them apart, and the updater replaces neither.
     MountedImage,
     /// Gatekeeper is running this copy from a randomized, read-only path (App
     /// Translocation), which is what happens to a quarantined app launched
@@ -42,7 +43,7 @@ impl InstallPosture {
     pub fn summary(self) -> &'static str {
         match self {
             Self::Installed => "aterm is installed and can keep itself up to date",
-            Self::MountedImage => "aterm is running from the disk image, not from Applications",
+            Self::MountedImage => "aterm is running from a mounted volume, not from Applications",
             Self::Translocated => {
                 "macOS is running aterm from a temporary read-only copy, because it was opened \
                  without being moved first"

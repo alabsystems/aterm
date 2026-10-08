@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Integration test: verify fail-closed behavior when init_mode() is never called.
+//! Integration test: fail-closed behavior when init_mode() is never called.
 //!
-//! This test runs in its own binary (integration test), so the global OnceLock
-//! has NOT been initialized. All gates should default to Containment mode
+//! Each test runs in a fresh process (`crate::in_fresh_process`), so the global
+//! OnceLock has NOT been initialized. All gates should default to Containment mode
 //! (maximally restrictive).
 
 use aterm_containment::{
@@ -14,19 +14,31 @@ use aterm_containment::{
 
 #[test]
 fn mode_or_containment_defaults_to_containment_when_uninit() {
-    // init_mode() has NOT been called in this binary.
-    assert_eq!(aterm_containment::try_current_mode(), None);
+    crate::in_fresh_process(
+        module_path!(),
+        "mode_or_containment_defaults_to_containment_when_uninit",
+        || {
+            // init_mode() has NOT been called in this fresh process.
+            assert_eq!(aterm_containment::try_current_mode(), None);
 
-    let mode = aterm_containment::mode_or_containment();
-    assert_eq!(mode, ContainmentMode::Containment);
+            let mode = aterm_containment::mode_or_containment();
+            assert_eq!(mode, ContainmentMode::Containment);
+        },
+    );
 }
 
 #[test]
 fn uninitialized_mode_gets_most_restrictive_capabilities() {
-    let mode = aterm_containment::mode_or_containment();
-    let caps = ContainmentPolicy::capabilities(mode);
+    crate::in_fresh_process(
+        module_path!(),
+        "uninitialized_mode_gets_most_restrictive_capabilities",
+        || {
+            let mode = aterm_containment::mode_or_containment();
+            let caps = ContainmentPolicy::capabilities(mode);
 
-    assert_eq!(caps.network, NetworkCapability::None);
-    assert_eq!(caps.fs, FsCapability::TmpOnly);
-    assert_eq!(caps.process, ProcessCapability::NoFork);
+            assert_eq!(caps.network, NetworkCapability::None);
+            assert_eq!(caps.fs, FsCapability::TmpOnly);
+            assert_eq!(caps.process, ProcessCapability::NoFork);
+        },
+    );
 }

@@ -1,30 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **aterm-net** — layer L3 of the RFC "The Reactive Surface": carrying the
-//! control protocol (read + drive + `await`) over a NETWORK boundary so one
-//! aterm can drive another on a different host, byte-identically to local.
+//! **aterm-net** — layer L3 of the RFC "The Reactive Surface": the control
+//! protocol (read + drive + `await`) over a network boundary, so one aterm
+//! drives another on a different host exactly as it would locally.
 //!
-//! ## Why this needs no astream to *drive* a remote aterm
+//! Predicates run on the **authoritative** surface (the host that owns the
+//! engine), never on a remote fold, so driving a remote aterm is relaying the
+//! control protocol: no astream fold is on the critical path.
 //!
-//! The design review's key correction: predicate evaluation runs on the
-//! **authoritative aterm surface** (the host that owns the engine), never on a
-//! subset-diverging remote fold. So "drive a remote aterm" is just **relaying the
-//! control protocol over a network transport** — the remote host runs the
-//! watchers; the driver sends `await idle`/`send`/`key` and reads back. No
-//! astream fold is on the critical path.
-//!
-//! ## Status: built, tested, and wired into the listener (opt-in)
-//!
-//! Every piece below is built and tested (unit + end-to-end over real
-//! loopback-TLS). The LISTENER side is wired into `aterm-gui`'s control server via
-//! `net_listen` — **secure-default-OFF**: it binds only when an operator sets
-//! aterm.toml's `[net] listen`/`cert`/`key`, and only in a top-level aterm (a
-//! nested one never binds a second surface). The DRIVER side ([`dial_and_relay_pinned`](drive::dial_and_relay_pinned))
-//! ships as the `dial <name>` control verb (`aterm_gui::control::try_net_dial` ->
-//! `net_connections::dial_relay` -> `dial_and_relay_pinned`), and `aterm_agent::RelayClient`
-//! drives a `Turn` over that relay end-to-end (see aterm-agent's
-//! `remote_turn_loopback_tls` test). The pieces:
+//! The listener is `aterm-gui`'s `net_listen`, off by default: it binds only
+//! when aterm.toml sets `[net] listen`/`cert`/`key`, and only in a top-level
+//! aterm. The driver is the `dial <name>` control verb
+//! ([`dial_and_relay_pinned`](drive::dial_and_relay_pinned)), over which
+//! `aterm_agent::RelayClient` drives a `Turn`. The pieces:
 //!
 //! 1. [`tls`] — the TLS 1.3 transport ([`tls::relay`] owns both halves: TLS has no
 //!    `UnixStream::try_clone`), and [`drive`] composes both ends of the network
@@ -44,10 +33,9 @@
 
 use std::io::{self, Read, Write};
 
-// HMAC-SHA256 (first-party, `aterm-digest`): the channel-binding MAC. The edge
-// token is the key.
+use aterm_codec::hex;
 use aterm_digest::HmacSha256;
-use aterm_session::{EdgeToken, hex_nibble};
+use aterm_session::EdgeToken;
 
 /// TLS 1.3 transport (rustls) with the RFC 5705 keying-material exporter that
 /// binds the capability to the channel.
@@ -60,13 +48,10 @@ pub mod tls;
 pub mod drive;
 
 /// The channel-bound presented secret: `HMAC-SHA256(edge_token, channel_exporter)`.
-/// The edge token is the HMAC KEY (the unforgeable secret) and the channel
-/// exporter (TLS RFC 5705 keying material — see [`TlsTransport`]) is the message,
-/// so the output is a MAC that depends on BOTH and cannot be produced without the
-/// token. Binding it to the connection's exporter means a value captured on one
-/// channel is rejected on any other — the network replacement for the same-uid
-/// peer check, and (over a real TLS exporter) it resists even an active MITM who
-/// terminates one TLS leg, because that attacker holds a different exporter.
+/// The token is the key and the exporter (RFC 5705 keying material, see
+/// [`TlsTransport`]) the message, so the tag cannot be produced without the token
+/// and a tag captured on one channel is rejected on any other — including by an
+/// active MITM terminating one TLS leg, who holds a different exporter.
 #[must_use]
 pub fn channel_bind(token: &EdgeToken, exporter: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(token.as_bytes())
@@ -76,10 +61,8 @@ pub fn channel_bind(token: &EdgeToken, exporter: &[u8]) -> [u8; 32] {
 }
 
 /// Verify a `presented` secret against `token` on the CURRENT channel's
-/// `exporter`, in **constant time**. Recomputes the HMAC and compares with
-/// [`HmacSha256::verify_slice`] (constant-time tag compare), so a token bound to a
-/// different channel (a captured replay) fails — its `presented` was computed over
-/// a different exporter — and the comparison leaks no timing.
+/// `exporter`, in constant time ([`HmacSha256::verify_slice`]). A tag bound to a
+/// different channel (a captured replay) fails.
 #[must_use]
 pub fn verify_presented(token: &EdgeToken, exporter: &[u8], presented: &[u8]) -> bool {
     let Ok(mut mac) = HmacSha256::new_from_slice(token.as_bytes()) else {
@@ -111,16 +94,9 @@ pub struct Granted {
 /// peer cannot make us buffer unboundedly before the capability is even checked.
 const MAX_AUTH_LINE: usize = 4096;
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // unwrap: a hex digit (0..=15) is always representable.
-        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
-        s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap());
-    }
-    s
-}
-
+/// [`hex::decode_vec`] bounded by [`MAX_AUTH_LINE`]. The loop stays here rather
+/// than calling it: it is written for the Trust verifier, and a cross-crate call
+/// would take its proved obligations out of this crate's ratchet floor.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let b = s.as_bytes();
     let len = b.len();
@@ -144,8 +120,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         // `& 0x0f` is an identity on a hex-digit value (0..=15); it restates
         // the bound locally, and the shift/or composition of two nibbles
         // cannot overflow a byte.
-        let hi = hex_nibble(b[i])? & 0x0f;
-        let lo = hex_nibble(b[i + 1])? & 0x0f;
+        let hi = hex::nibble(b[i])? & 0x0f;
+        let lo = hex::nibble(b[i + 1])? & 0x0f;
         out.push((hi << 4) | lo);
         i += 2;
     }
@@ -211,7 +187,8 @@ fn is_wire_token(s: &str) -> bool {
 ///
 /// # Errors
 /// If `src`/`op` are not wire tokens, on I/O failure, or if the listener denies
-/// the capability (`Err` with the listener's reason).
+/// the capability: a `PermissionDenied` error carrying [`TokenRefused`]
+/// ([`is_token_refused`] tells it apart).
 pub fn present_capability<S: Read + Write>(
     stream: &mut S,
     exporter: &[u8],
@@ -223,17 +200,49 @@ pub fn present_capability<S: Read + Write>(
         return Err(io::Error::other("src/op must not contain whitespace"));
     }
     let tag = channel_bind(token, exporter);
-    let line = format!("AUTH {src} {op} {}\n", hex_encode(&tag));
+    let line = format!("AUTH {src} {op} {}\n", hex::encode_lower(&tag));
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
-    let verdict = read_line(stream, MAX_AUTH_LINE)?;
+    // The dialer has SENT its capability line; an end of stream here is the
+    // listener hanging up instead of answering it.
+    let verdict = read_line(stream, MAX_AUTH_LINE).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the remote hung up without answering the drive token",
+            )
+        } else {
+            e
+        }
+    })?;
     if verdict == "OK" {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "capability denied by the listener: {verdict}"
-        )))
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            TokenRefused,
+        ))
     }
+}
+
+/// The listener answered the dialer's capability with anything but `OK`. An aterm
+/// listener grants every dialer that asks to `drive`, so this means the drive
+/// token did not verify: the dialer holds a stale or wrong one.
+#[derive(Debug)]
+pub struct TokenRefused;
+
+impl std::fmt::Display for TokenRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the remote refused the drive token")
+    }
+}
+
+impl std::error::Error for TokenRefused {}
+
+/// Whether `e` is [`present_capability`]'s refusal ([`TokenRefused`]).
+#[must_use]
+pub fn is_token_refused(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<TokenRefused>())
 }
 
 /// Listener side: read and verify the dialer's presentation over `stream`,
@@ -252,24 +261,24 @@ where
     S: Read + Write,
     F: FnOnce(&str, &str) -> Option<EdgeToken>,
 {
-    let deny = |stream: &mut S, why: &str| -> io::Result<Granted> {
+    let deny = |stream: &mut S, why: &'static str| -> io::Result<Granted> {
         let _ = stream.write_all(b"DENIED\n");
         let _ = stream.flush();
-        Err(io::Error::other(format!("capability rejected: {why}")))
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, why))
     };
     let line = read_line(stream, MAX_AUTH_LINE)?;
     let Some((src, op, tag)) = parse_auth(&line) else {
-        return deny(stream, "malformed AUTH line");
+        return deny(stream, "malformed capability line");
     };
     let Some(token) = lookup(&src, &op) else {
-        return deny(stream, "no capability for that (src, op)");
+        return deny(stream, "no capability for the requested op");
     };
     if verify_presented(&token, exporter, &tag) {
         stream.write_all(b"OK\n")?;
         stream.flush()?;
         Ok(Granted { src, op })
     } else {
-        deny(stream, "channel-binding verification failed")
+        deny(stream, "wrong drive token")
     }
 }
 
@@ -282,7 +291,7 @@ where
 /// [`dial_and_relay_pinned`](drive::dial_and_relay_pinned) BEFORE any relay, against
 /// the live nonce the remote's `sessions bridge` roster reports for `sid` (or, with
 /// no `sid`, for any session carrying the pinned nonce). A pinned session the remote
-/// does not report FAILS CLOSED (refuses to dial) rather than relay unverified — an
+/// does not report FAILS CLOSED (nothing is relayed) rather than relay unverified — an
 /// operator-requested guard is never silently skipped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteEndpoint {
@@ -403,6 +412,35 @@ mod tests {
             Some(token),
         );
         assert!(c.is_err() && s.is_err(), "wrong-token forgery denied");
+        // Each end says what happened in its own words: the dialer that its token
+        // was refused (a typed error its caller words with the remedy), the
+        // listener that the token was wrong — no echoed `DENIED` verdict.
+        let dialer = c.unwrap_err();
+        assert!(is_token_refused(&dialer), "{dialer}");
+        assert_eq!(dialer.to_string(), "the remote refused the drive token");
+        assert_eq!(s.unwrap_err().to_string(), "wrong drive token");
+    }
+
+    /// A listener that hangs up after the capability line, answering neither `OK`
+    /// nor `DENIED`: the dialer says so, not "closed before the capability line"
+    /// (it had already sent that line).
+    #[test]
+    fn a_listener_that_hangs_up_unanswered_is_named_as_such() {
+        let (mut c, s) = CtlStream::pair().unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut s = s;
+            let _ = read_line(&mut s, MAX_AUTH_LINE);
+            drop(s);
+        });
+        let err = present_capability(&mut c, b"x", "driver-1", "drive", &EdgeToken::generate())
+            .unwrap_err();
+        srv.join().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(!is_token_refused(&err));
+        assert_eq!(
+            err.to_string(),
+            "the remote hung up without answering the drive token"
+        );
     }
 
     #[test]

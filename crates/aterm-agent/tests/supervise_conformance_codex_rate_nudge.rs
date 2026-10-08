@@ -1,81 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `SupervisorCodexRateNudge` (aterm-spec
-//! `supervisor_codex_rate_nudge_model`): the REAL approval decider
-//! (`decide_screen` on the rate-limit nudge and the `/model` picker), the
-//! REAL turn-end decider (`decide_turn_end`, with the real `TurnEndState` it
-//! keeps) and the REAL goal stop (`TurnEndState::goal_stop`, what the loop's
-//! busy read asks before its Esc — `turn_end_loop`'s `stop_codex_turn`,
-//! itself driven over a scripted busy screen in the crate's
-//! `turn_end_loop_tests`) driven along EVERY reachable state of the model, so
-//! the committed answer to Codex's `Approaching rate limits` — switch only
-//! near the limit, stop Codex's goal while switched, save the work once on
-//! the cheaper model, put the thread back on its own model, hold until the
-//! window resets — is the model's, state for state.
+//! Tier-1 for `SupervisorCodexRateNudge` (aterm-spec
+//! `supervisor_codex_rate_nudge_model`): the real approval decider
+//! (`decide_screen` on the rate-limit nudge and the `/model` picker), the real
+//! turn-end decider (`decide_turn_end` with its `TurnEndState`) and the real
+//! goal stop (`TurnEndState::goal_stop`) driven along every reachable state of
+//! the model. The answer to Codex's `Approaching rate limits` (switch only near
+//! the limit, stop the goal while switched, save the work once on the cheaper
+//! model, restore the thread's own model, hold until the window resets) is the
+//! model's, state for state.
 //!
-//! The projection: `model` is the footer's first field (`GPT-6-Astra ultra`,
-//! or the nudge's `GPT-6-Luna medium`); `goal` and `paused` its right side
-//! (`Pursuing goal (…)`, `Goal paused (/goal resume)`); `near` Codex's own
-//! usage reading (99% of the weekly window, or 1%); `sandbox` the fall the
-//! loop reads off the rollouts; `shown` the nudge box (the HAND-BUILT
-//! fixture on the measured list geometry); `turn` a busy reading, its end an
-//! idle point with the turn's work; `person` a person's keystroke in the
-//! turn (`human_ms`, the moment their turn began on the walk's clock) — at
-//! a busy read, the LOOP'S evidence of it: the real `RunningTurn` the loop
-//! keeps, driven along the walk as the loop drives it (its span begun at
-//! the turn's first busy read, closed at every point, and at the nudge's
-//! box — the box marks the end of the turn it covered — its keystrokes
-//! floored at the switch's opening), read at the loop's first busy read of
-//! the turn and again [`TURN`] into it, past the grace; never the model's
-//! bit; `cov` a person's hand in the turn whose end the box covered (their
-//! keystroke then, on the walk's clock); `ph` the real switch's phase (none,
-//! owed, winding, restore then hold, holding, restore then free); `stops`
-//! the real switch's stops; `over` the save's own turn run past the real
-//! `WIND_DOWN_BOUND` on the walk's clock (its span the loop's). Every other
-//! turn runs [`TURN`] on the walk's clock.
+//! The projection: `model` is the footer's first field; `goal` and `paused`
+//! its right side; `near` Codex's usage reading; `sandbox` the fall read off
+//! the rollouts; `shown` the nudge box (a hand-built fixture); `turn` a busy
+//! reading; `person` a person's keystroke as the loop's real `RunningTurn`
+//! sees it (never the model's bit); `cov` a person's hand in the turn the box
+//! covered; `ph` and `stops` the real switch's phase and stops; `over` the
+//! save's own turn run past `WIND_DOWN_BOUND`. Every other turn runs [`TURN`].
 //!
-//! Each model action is mirrored on the real side: a turn's end is the point
-//! `observe`d (behind the box when the nudge shows it, observed once the box
-//! is answered); `PressSwitch` is the real `open_switch` of the switch the
-//! press made; `StopGoal` is the real goal stop's Esc on the running turn
-//! (its interrupted point observed) or the real decider's `/goal pause` at a
-//! free point; `StopWindDown` is the real goal stop's one Esc on the save's
-//! own turn past its bound, its interrupted point observed (the marker
-//! judged there); `Tell` the real stop's note; the turn-end policy's actions are
-//! the real decider's own acts, recorded with `acted`; `Restore` is the real
-//! `/model`, the approval decider's picks through the MEASURED 0.158.0
-//! picker boxes, and the point showing the thread's own model again.
-//!
-//! At every state the invariants hold, the real switch's phase is the
-//! model's, and: at the nudge, the real approval decider presses `Switch to
-//! gpt-6-luna` exactly where `PressSwitch` is enabled, `Keep current model`
-//! exactly where `PressKeep` is, and never the never-show-again; at a busy
-//! read, the real goal stop sends its Esc exactly where `StopGoal` or
-//! `StopWindDown` is enabled, tells exactly where `Tell` is, and stops
-//! nothing else (the wind-down's own turn within its bound, a person's, a
-//! switch a person took over); at a free
-//! point, the real turn-end decider types the wind-down, `/model`, `/goal
-//! pause`, the resume or a continuation exactly where `TypeWindDown`,
-//! `Restore`, `StopGoal`, `Resume` or `Continue` is enabled, tells a person
-//! exactly where `Tell` is, and otherwise types nothing. A HOST RESTART at
-//! every open phase — the loop's ledger rows written, read back with
-//! `open_wind_down` and seeded into a fresh state — decides the same and
-//! tells the same (the notes said ride the rows), and so does one taken
-//! WHILE the wind-down's or the goal's turn runs, judged at the point that
-//! ends it, and one taken between the harness's Esc and the interrupted
-//! point it makes (`esc=`), in every phase. NEGATIVE CONTROLS: every `Buggy
-//! = 1` branch is enabled somewhere the real deciders answer OTHERWISE (a
-//! keep where it switches, a stop where it lets the goal run on, no stop
-//! where it stops a person's turn, no continuation where it types one, a
-//! restore where it holds, a remembered switch where it forgets, an Esc
-//! where a person's hand in the covered turn would spare the goal turn, an
-//! Esc where the save's own turn would run on past its bound);
-//! the grace-only reading of a person (round 2's defect) stops a person's
-//! turn the model protects; round 3's reading — its span carried across
-//! the nudge's box, no floor at the switch's opening, the grace latched —
-//! spares a goal turn the model stops; and a restart that reads nothing
-//! back types `keep going` where the model allows none.
+//! At every state the real deciders press, stop, type and tell exactly where
+//! the model's corresponding actions are enabled, and a host restart at every
+//! open phase (ledger rows read back with `open_wind_down`), mid-turn and
+//! between an Esc and its interrupted point decides the same. Negative
+//! controls: every `Buggy = 1` branch is enabled somewhere the real deciders
+//! answer otherwise; the grace-only and carried-span readings of a person
+//! ([`Hand`]) disagree with the model; and a restart that reads nothing back
+//! types `keep going` where the model allows none.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -177,6 +128,7 @@ fn reading(
         wall: None,
         wall_message: String::new(),
         reset_at: None,
+        jitter: Duration::ZERO,
         resumes_by_itself: false,
         composer: if st["shown"] == 1 {
             Composer::Absent
@@ -202,6 +154,7 @@ fn reading(
         sandbox_fell: (st["sandbox"] == 1).then(|| "workspace-write".to_string()),
         thread_model: None,
         upgrade_goal: false,
+        account: None,
     }
 }
 
@@ -219,16 +172,16 @@ struct Real {
     strict: bool,
     /// The turn running now as the LOOP keeps it (`Session::running`).
     hand: RunningTurn,
-    /// Round 3's reading of the same turn — the regression — kept beside it.
+    /// The carried-span reading of the same turn, a negative control.
     round3: Round3,
     /// When a person last typed (`status human_ms=`), on the walk's clock.
     typed: Option<Instant>,
 }
 
-/// ROUND 3'S READING of a person at a busy read, the re-review's
-/// regression: the span taken only at a point — never at the nudge's box —
-/// no floor at the switch's opening, and a keystroke within the grace
-/// latched for the whole turn.
+/// The carried-span reading of a person at a busy read (a negative control):
+/// the span taken only at a point, never at the nudge's box, no floor at the
+/// switch's opening, and a keystroke within the grace latched for the whole
+/// turn.
 #[derive(Clone, Copy, Default)]
 struct Round3 {
     since: Option<Instant>,
@@ -261,7 +214,7 @@ impl Real {
     }
 
     /// The loop's point at `self.now`: the turn's work, as the loop's span
-    /// measures it — and round 3's span closed with it.
+    /// measures it, with the carried span closed with it.
     fn point(&mut self) -> Option<Duration> {
         self.round3.point();
         self.hand.point(self.now)
@@ -337,9 +290,9 @@ enum Hand {
     /// The loop's own: the real `RunningTurn`, floored at the switch's
     /// opening (`turn_end_loop`'s `person_in_this_turn`).
     Loop,
-    /// Round 2's defect: the grace alone.
+    /// A person read from the grace alone.
     GraceOnly,
-    /// Round 3's regression ([`Round3`]).
+    /// The carried-span reading ([`Round3`]).
     Round3,
 }
 
@@ -520,7 +473,7 @@ fn restarted(real: &Real, st: &State) -> TurnEndState {
     fresh
 }
 
-/// A HOST RESTART at the free point `st`: the switch's row as the loop
+/// A host restart at the free point `st`: the switch's row as the loop
 /// writes it, read back by a loop that starts after it and seeded into a
 /// fresh state, decides the point as the live state does.
 fn restarted_decides_the_same(real: &Real, st: &State, live: &TurnEndAction, tells: bool) {
@@ -545,12 +498,10 @@ fn restarted_decides_the_same(real: &Real, st: &State, live: &TurnEndAction, tel
     );
 }
 
-/// A HOST RESTART WHILE A TURN RUNS (the review of 2026-09-28: the loop
-/// restarted during the wind-down's own turn took the harness's save for a
-/// person's message, dropped the hold and typed `keep going` at 95%): the
-/// switch read back mid-turn, then the point that ends the turn (`r`)
-/// judged by both the live state and the restarted one — the same phase,
-/// the same next act.
+/// A host restart while a turn runs: the switch read back mid-turn (the save's
+/// own turn must not be taken for a person's message), then the point that
+/// ends the turn (`r`) judged by both the live state and the restarted one:
+/// the same phase, the same next act.
 fn restart_mid_turn(real: &Real, before: &State, after: &State, r: &TurnEndReading) {
     let mut fresh = restarted(real, before);
     let mut live = real.st.clone();
@@ -790,7 +741,7 @@ struct Found {
     disagree: Vec<State>,
     /// Busy reads of a person's turn the grace-only reading would stop.
     grace_only_stops: usize,
-    /// Busy reads of a goal turn the model stops that round 3's reading
+    /// Busy reads of a goal turn the model stops that the carried-span reading
     /// ([`Round3`]) would spare.
     round3_spares: usize,
 }
@@ -912,15 +863,15 @@ fn walk(m: &Model, strict: bool) -> Found {
             if m.action_enabled("StopPersonsTurn", &st) && got == "none" {
                 found.buggy_refused.insert("StopPersonsTurn");
             }
-            // Round 2's defect, the grace alone read as a person's hand: it
-            // stops a person's turn the model protects.
+            // The grace alone read as a person's hand stops a person's turn
+            // the model protects.
             if st["person"] == 1
                 && !m.action_enabled("StopGoal", &st)
                 && stop_word_as(&real, &st, Hand::GraceOnly) == "StopGoal"
             {
                 found.grace_only_stops += 1;
             }
-            // Round 3's regression: it spares a goal turn the model stops.
+            // The carried-span reading spares a goal turn the model stops.
             if m.action_enabled("StopGoal", &st) && stop_word_as(&real, &st, Hand::Round3) == "none"
             {
                 found.round3_spares += 1;
@@ -1096,15 +1047,10 @@ fn tier1_the_real_deciders_switch_stop_save_restore_and_hold_exactly_where_the_m
     }
 }
 
-/// NEGATIVE CONTROLS. Every `Buggy = 1` branch — the day's defects — is
-/// enabled at some reachable state where the real deciders ANSWER OTHERWISE
-/// (the switch at 1% is a keep, the goal left to run on is stopped, `keep
-/// going` during the switch is the wind-down or nothing, the save into a
-/// sandbox is nothing, the hold on the cheaper model is `/model`, a restart
-/// that forgets decides otherwise than one that remembers, …): a green walk
-/// is not vacuous. And a restart that reads NOTHING back — the incident's
-/// press was ledgered as a row no reader saw — types `keep going` into the
-/// owed wind-down, where the committed model allows no continuation.
+/// Negative controls: every `Buggy = 1` branch is enabled at some reachable
+/// state where the real deciders answer otherwise, so a green walk is not
+/// vacuous. A restart that reads nothing back types `keep going` into the owed
+/// wind-down, where the model allows no continuation.
 #[test]
 fn the_buggy_branches_and_a_forgetful_restart_are_not_the_real_deciders() {
     let m = supervisor_codex_rate_nudge_model();
@@ -1117,8 +1063,8 @@ fn the_buggy_branches_and_a_forgetful_restart_are_not_the_real_deciders() {
             found.buggy_refused
         );
     }
-    // The grace-only person (round 2's defect) and round 3's regression
-    // are caught by the walk.
+    // The grace-only and carried-span readings of a person are caught by the
+    // walk.
     let strict = walk(&m, false);
     assert!(
         strict.grace_only_stops > 0,

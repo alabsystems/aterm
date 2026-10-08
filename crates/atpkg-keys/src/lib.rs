@@ -10,20 +10,16 @@
 //! signature contract whose verifier is `atpkg::sig`.
 //!
 //! The atpkg client is **verify-only** (`ring` with `default-features = false`, no RNG/
-//! alloc). The owner, by contrast, must *generate* the offline root + rotatable release
-//! keys and *sign* `index.toml` / `pkg-*.toml` over their **exact raw bytes**. That needs
-//! the full `ring` crate, so it lives in this **separate, owner-only** tool — never shipped
-//! to clients, so the client's minimal crypto surface is unaffected.
+//! alloc). The owner must *generate* the paper master and the per-machine keys (`setup` /
+//! `join`) and *sign* `index.toml` / `pkg-*.toml` with the machine key over their **exact
+//! raw bytes**. That needs the full `ring` crate, so it lives in this owner-only tool,
+//! never shipped to clients.
 //!
-//! The unit signed is the exact asset bytes (no canonicalization — same discipline the
-//! verifier enforces), so a detached signature here is byte-for-byte what the client
-//! verifier checks: `atpkg::sig::TrustedRoster::authorize_bytes` (and
-//! `atpkg::sig::TrustedIndex::verify_pkg`, the wrapper that calls it), which delegate to
-//! `aterm_update_core::roster` — the same verifier the app updater runs. There is
-//! exactly one; the single-root `verify_index`/`verify_index_with` pair this line
-//! used to name was retired with the package-specific root, as the note on
-//! `produces_signatures_the_client_verifier_accepts` below records. A test signs a
-//! manifest and verifies it with that **actual client verifier**, pinning the contract.
+//! The unit signed is the exact asset bytes (no canonicalization), so a detached signature
+//! here is byte-for-byte what the client checks: `atpkg::sig::TrustedRoster::authorize_bytes`
+//! (and `TrustedIndex::verify_pkg`, which calls it), delegating to
+//! `aterm_update_core::roster` — the same verifier the app updater runs. A test verifies
+//! this tool's output with that actual verifier, pinning the contract.
 //!
 //! # The paper master and the machine roster
 //!
@@ -34,13 +30,12 @@
 //! the three edits the master authorizes (add a machine, revoke a machine, start a fresh
 //! roster) as pure functions over the shared `aterm_update_core::roster::Roster` type the
 //! updater client parses, so producer and client cannot disagree about what a valid
-//! roster is. See `docs/SIGNING-KEY-DESIGN.md` for the decision and `docs/RELEASE-KEYS.md`
-//! for the runbook.
+//! roster is. See `docs/RELEASE-KEYS.md` for the decision and the runbook.
 //!
 //! # Provisioning: the human's only step is writing the phrase on paper
 //!
-//! [`provision`] is the engine behind the two verbs that removed every hand-transcription
-//! from arming the release channel — `atpkg-keys setup` on the first machine and
+//! [`provision`] is the engine behind the two verbs that arm the release channel with no
+//! hand-transcription — `atpkg-keys setup` on the first machine and
 //! `atpkg-keys join` on every later one. It derives the master's public identity, mints
 //! the machine keypair, edits the roster and, through [`pins_edit`], WRITES the two public
 //! keys into `aterm_update_core::pins` itself, so no one ever copies 44 base64 characters
@@ -52,15 +47,17 @@ pub mod master;
 pub mod pins_edit;
 pub mod provision;
 pub mod roster_ops;
+/// Unit-test scratch directories, removed when the test ends however it ends.
+#[cfg(test)]
+mod testdir;
 
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 /// Generate a fresh Ed25519 keypair: returns `(pkcs8 private-key bytes, base64 raw
 /// 32-byte public key)`. The pkcs8 bytes are the **secret** — write them `0600` and keep
-/// them offline (the root key especially). The base64 public key is what goes into
-/// the committed paper-master anchor, or a roster-named machine key. (The retired
-/// two-tier world verified under `PINNED_PKG_ROOTKEY` / `[keys].release_key_pubkey`.)
+/// them offline. The base64 public key is what goes into the committed paper-master
+/// anchor, or a roster-named machine key.
 pub fn generate() -> Result<(Vec<u8>, String), String> {
     let rng = SystemRandom::new();
     let pkcs8 =
@@ -226,12 +223,9 @@ mod tests {
     // THE contract: a signature produced here is accepted by the actual client verifier
     // over the exact bytes, and a 1-byte tamper is rejected.
     //
-    // The verifier is `aterm_update_core::roster` — the SAME one atpkg's index chain runs
-    // (`atpkg::sig::TrustedRoster::authorize_bytes` delegates to it) and the same one the
-    // app updater runs. It used to be `atpkg::sig::verify_index_with`, a single-key check
-    // against a package-specific root; that root is retired, and there is exactly one
-    // verifier left to prove this tool's output against. The FULL owner→client chain,
-    // through `atpkg::flow::install` and a real archive, is `tests/owner_to_client.rs`.
+    // The verifier is `aterm_update_core::roster` — the one atpkg's index chain and the
+    // app updater both run. The full owner→client chain, through `atpkg::flow::install`
+    // and a real archive, is `tests/owner_to_client.rs`.
     #[test]
     fn produces_signatures_the_client_verifier_accepts() {
         use aterm_update_core::roster::{Machine, Roster, RosterReject};

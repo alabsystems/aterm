@@ -3,282 +3,123 @@
 
 //! aterm's first-party Objective-C runtime layer.
 //!
-//! # Why this crate exists
-//!
-//! `aterm-gpu/src/metal/ffi.rs` was the first module in the tree to talk to the
-//! Objective-C runtime directly, and it established the conventions this crate
-//! promotes: `objc_msgSend` declared once and cast per selector, one owning
-//! wrapper that is the only caller of `objc_release`, explicit autorelease
-//! pools, and selectors resolved from checked C-string literals. It is also
-//! `pub(crate)` inside a PRIVATE `mod metal` (`aterm-gpu/src/lib.rs:62`), so
-//! nothing outside `aterm-gpu` can use a line of it. The tree's demonstrated
-//! answer to that has been to hand-roll again — `CfOwned` is duplicated
-//! byte-for-byte between `aterm-gui/src/net_connections/keychain.rs:219` and
-//! `aterm-http/src/verifier/apple.rs:193`.
-//!
-//! This crate is the shared version, plus the four things `metal/ffi.rs`
-//! deliberately never needed and the `objc2` + `block2` cluster is being paid
-//! for:
+//! Typed message sends ([`msg`], one exact prototype per selector), ownership
+//! ([`Obj`], [`Retained`]), scoped autorelease pools, and:
 //!
 //! 1. **[Runtime class creation](declare)** — `objc_allocateClassPair`,
 //!    `class_addMethod`, `class_addIvar`, `class_addProtocol`,
-//!    `objc_registerClassPair`. Zero uses of any of these existed anywhere in
-//!    the workspace before this crate; they are what objc2's `declare_class!`
-//!    does, and aterm-gui has seven such sites defining 33 methods.
-//! 2. **[The block ABI](block)** — `_NSConcreteStackBlock`, for aterm-gui's
-//!    three `RcBlock` sites, plus [`BlockPtr`] for the `"@?"` encoding a block
-//!    needs when it crosses a boundary this crate DECLARES.
-//! 3. **[Weak references](weak)** — `objc_initWeak`, `objc_loadWeak`,
-//!    `objc_storeWeak`, `objc_destroyWeak`, `objc_copyWeak`. Zero uses of any
-//!    of these existed in the workspace before W9, for the same reason as
-//!    class creation: Metal owns its objects in a TREE and never has a cycle to
-//!    break, while AppKit is a graph — `vendor/winit`'s `view.rs:169` holds a
-//!    weak reference to the window that (transitively) retains it, and that one
-//!    field is what makes `view.rs` the largest remaining port. A weak
-//!    reference is the only handle in this crate whose STORAGE LOCATION is
-//!    load-bearing rather than its value, which is why it is a capability and
-//!    not a wrapper; see [`weak`] for what Rust's `memcpy`-move does to one.
-//! 4. **[Cached selectors](sel_cache)** — `metal/ffi.rs` calls
-//!    `sel_registerName` on every send, on per-frame paths.
-//! 5. **[Method swizzling](swizzle)** — `method_setImplementation`, for the one
-//!    place in the tree that PATCHES a framework class instead of declaring
-//!    one: `vendor/winit`'s `app.rs` replaces `-[NSApplication sendEvent:]`'s
-//!    IMP. `class_addMethod` cannot substitute — [`ClassBuilder::add_method`]
-//!    asserts on the `NO` an existing row returns, and an existing row is the
-//!    PREMISE of a swizzle. It is also the only capability here whose effect
-//!    NO ENCODING CHECK CAN SEE, which is why [`swizzle`] opens by saying what
-//!    a guard on it can and cannot prove.
+//!    `objc_registerClassPair`, driven by [`declare_class!`].
+//! 2. **[The block ABI](block)** — stack and heap blocks ([`RcBlock`]), plus
+//!    [`BlockPtr`] for the `"@?"` encoding of a block in a declared method.
+//! 3. **[Weak references](weak)** — `objc_initWeak` and friends. A weak
+//!    reference's storage location, not its value, is what the runtime tracks,
+//!    so it is a pinned capability rather than a movable wrapper.
+//! 4. **[Cached selectors](sel_cache)** — one `sel_registerName` per call site.
+//! 5. **[Method swizzling](swizzle)** — `method_setImplementation`, for patching
+//!    an existing framework method (`-[NSApplication sendEvent:]`), which
+//!    `class_addMethod` cannot do. No encoding check can see its effect.
 //! 6. **[A thread-affinity container](main_thread_bound)** —
-//!    [`MainThreadBound<T>`][MainThreadBound], for `vendor/winit`'s
-//!    `window.rs`, whose `Window` must be `Send + Sync` while the two
-//!    [`Retained`]s it owns are unconditionally `!Send`. This crate had the
-//!    [`MainThread`] witness and [`run_on_main`], which are exactly the two
-//!    pieces such a container is built from, and nothing that put them
-//!    together.
-//! 7. **[The run-loop wake timer](wake_timer)** — the one `CFRunLoopTimer`
-//!    in the tree, `vendor/winit`'s event-loop waker. Its repeat interval is a
-//!    year, not the 0.1 µs winit shipped, because CoreFoundation walks a late
-//!    repeating timer forward one interval at a time with the run-loop lock
-//!    held: the 2026-09-26 freeze was that walk, after a 26.6 h stop.
+//!    [`MainThreadBound<T>`][MainThreadBound], built from the [`MainThread`]
+//!    witness and [`run_on_main`].
+//! 7. **[The run-loop wake timer](wake_timer)** — the event-loop waker. Its
+//!    repeat interval is a year because CoreFoundation walks a late repeating
+//!    timer forward one interval at a time with the run-loop lock held.
 //!
-//! # Zero third-party dependencies
-//!
-//! By construction. The crate exists to REMOVE 255,335 lines of third-party
-//! code from the mac-arm cell; adding a dependency to it would be
-//! self-defeating. Everything here is std over `libobjc` and `Foundation`,
-//! both already loaded in every aterm process.
+//! The crate has no third-party dependencies: everything is std over `libobjc`
+//! and `Foundation`, both loaded in every aterm process.
 //!
 //! # Safety conventions
 //!
-//! The first two are `metal/ffi.rs`'s, unchanged. The rest are this crate's,
-//! and the last three exist because an adversarial read of the first wave found
-//! them missing:
-//!
-//! * One declaration of `objc_msgSend` cannot serve every selector. There is no
-//!   single prototype that is right for all of them, and on AAPCS64 a send
-//!   declared variadic passes its arguments somewhere else entirely from the
-//!   non-variadic IMP that receives them. Every send therefore casts [`msg`] to
-//!   the EXACT prototype of the selector; a wrong prototype corrupts registers
-//!   silently, so a typed cast per selector is the only sound form.
+//! * No single `objc_msgSend` prototype is right for every selector, and on
+//!   AAPCS64 a variadic declaration passes arguments elsewhere than the
+//!   non-variadic IMP reads them. Every send casts [`msg`] to the exact
+//!   prototype of the selector; a wrong one corrupts registers silently.
 //! * `new*`/`alloc`/`copy*` results are +1 and land in [`Obj`] or
 //!   [`Retained`], the only places `objc_release` is called.
-//! * A method that RETURNS an object and is not named `new*`/`alloc`/`copy*`
-//!   owes its caller +0, which means [`autorelease`] — see [`Obj::autorelease`]
-//!   and [`Retained::autorelease`]. Returning the +1 leaks one object per call;
-//!   returning a borrowed pointer whose owner is about to drop returns a
-//!   dangling one. There is no third option and the runtime enforces neither.
-//! * Autoreleased returns are BORROWED and never released here; they live until
-//!   the enclosing [`autoreleasepool`] scope ends, which is the CALLER's
-//!   obligation — including on drop, because a dealloc path autoreleases into
-//!   whatever frame the drop happens in.
-//! * Every `unsafe` block names the runtime invariant it relies on, and a
-//!   SAFETY comment that turns out to be false is a defect of the same rank as
-//!   the bug it hides — worse, because it also tells the next reader not to
-//!   look. Three were found by an adversarial read of W1 (the pool nesting
-//!   claim, and `bool` as `BOOL` twice); re-reading the rest with the same
-//!   suspicion found three more (what [`msg`]'s `size_of` assertion actually
-//!   proves, when an ivar slot is guaranteed written, and which receivers a
-//!   trampoline can be handed); a THIRD pass found four more, all of them about
-//!   the word "aligned" or the word "always" — [`IvarSlot`]'s three alignment
-//!   preconditions, which the SAFE `ivars()` accessor could not establish, and
-//!   the claim that "in this crate a MUTABLE raw void pointer in a method
-//!   position always means `id`", which the KVO `context:` argument refutes at
-//!   every live site. All ten are corrected IN PLACE, each keeping a note of
-//!   what it used to claim, because a silent correction teaches nothing.
-//! * A GUARD ARMED AT THE WRONG SPELLING IS NOT A GUARD. Two of the second
-//!   pass's fixes were green for a whole pass against shapes that occur nowhere
-//!   in the code being ported: `Sel`'s newtype was armed with `*const c_void`
-//!   where the SDK, `objc2-foundation` and vendored winit all write
-//!   `*mut c_void`, and `HAS_UNALIGNED_FIELDS` was armed with a packed struct
-//!   where the rule it states also has to answer for a WRAPPER around one. Both
-//!   armings were moved to the live spelling.
+//! * A declared method that returns an object and is not named
+//!   `new*`/`alloc`/`copy*` owes its caller +0, i.e. [`autorelease`] (see
+//!   [`Obj::autorelease`], [`Retained::autorelease`]). Returning +1 leaks;
+//!   returning a borrowed pointer whose owner is about to drop dangles.
+//! * Autoreleased returns are borrowed and never released here; they live until
+//!   the enclosing [`autoreleasepool`] scope ends, which is the caller's
+//!   obligation — including on drop, since dealloc paths autorelease into the
+//!   current frame.
+//! * Every `unsafe` block names the runtime invariant it relies on. A false
+//!   SAFETY comment is a defect of the same rank as the bug it hides.
+//! * A guard must be armed with the spelling the ported code actually uses
+//!   (e.g. `*mut c_void`, a wrapper around a packed struct), not a convenient
+//!   stand-in.
 //!
-//! # Where this improves on `metal/ffi.rs`, and why
+//! # Design points
 //!
-//! * **A written initialised flag on the ivars** ([`IvarSlot`]) — `metal/ffi.rs`
-//!   had no ivars at all, but the naive port of objc2's design would
-//!   `drop_in_place` all-zero bytes if `dealloc` ran before the ivars were
-//!   stored. The flag costs one byte per instance and makes that window sound.
-//!   It is checked on READ in release builds too, not only in `dealloc`: the
-//!   class is registered under a public name, so Objective-C code can mint an
-//!   instance this crate never initialised, and the branch is free beside the
-//!   `catch_unwind` every message already pays.
-//! * **Exposed-provenance ivar access** — reaching an ivar means deriving a
-//!   pointer at an offset from the instance base, which the instance's own
-//!   (zero-sized) Rust type does not cover. This crate derives it through
-//!   [`std::ptr::with_exposed_provenance`] from an address the runtime handed
-//!   across FFI, rather than by `offset`-ing a reference out of its own
-//!   allocation.
-//! * **Panic guards on every trampoline, and exception CONTAINMENT inside
-//!   them** — unwinding out of an Objective-C frame is undefined behaviour.
-//!   `metal/ffi.rs` never defines a method, so it never had the problem; every
-//!   method this crate declares aborts on a Rust panic, with its name. An
-//!   `NSException` raised inside the method is a different thing and gets a
-//!   different answer: it is caught by the `@try` wrapper in [`exception`]
-//!   after every Rust `Drop` on the unwound frames has run, reported once with
-//!   the selector, the exception's name, reason and call stack, counted, and
-//!   the method answers its inert zero. `-dealloc` and any method declared
-//!   `@abort_on_exception` keep the abort. The order — `catch_unwind` outside,
-//!   `@try` inside — and the cost (+1.0 ns per declared call, nothing on a
-//!   send) were measured before the design was decided.
-//! * **Cached selectors** — see [`sel_cache`].
-//! * **The indirect-return entry point is chosen by the TYPE SYSTEM.**
-//!   `metal/ffi.rs` binds `objc_msgSend` alone and argues the case from the
-//!   aarch64 ABI, but is gated `target_os = "macos"`, and aterm ships an
-//!   `x86_64-apple-darwin` compat slice inside its universal binary. There a
-//!   struct return larger than 16 bytes must go through `objc_msgSend_stret`,
-//!   whose hidden result pointer occupies `RDI` — the register plain
-//!   `objc_msgSend` reads `self` from — so every argument shifts and the send
-//!   silently reads the wrong registers. `aterm-gui` already performs five
-//!   `NSRect` (32-byte) sends. [`msg`] reads the return type off the prototype
-//!   through [`MsgFn`] and picks the entry point in a `const` block, so no call
-//!   site is asked to remember the rule. See [`returns_indirectly`].
-//! * **`BOOL` is a type, not `bool`** — see [`Bool`], and the measurement in
-//!   [`encode`].
-//! * **Every pointer-shaped runtime type is its OWN type, so it can carry its
-//!   own encoding.** `Id`, `ClassPtr`, `ProtocolPtr` and `Sel` were all aliases
-//!   of `*mut c_void` / `*const c_void`, so two `Encode` impls had to serve four
-//!   meanings and each impl picked one. `Sel` was newtyped first, which fixed
-//!   `const void *`; the `*mut` side stayed broken and mapped an opaque `void *`
-//!   — KVO's `context:`, spelled `*mut c_void` in the SDK, in
-//!   `objc2-foundation`'s binding and in vendored winit — to `"@"`, an OBJECT.
-//!   `Class` had the same problem in the other direction: `@encode(Class)` is
-//!   `"#"`. All four are `#[repr(transparent)]` newtypes now and each carries
-//!   the letter clang emits, measured on this box.
-//! * **An autorelease pool is a SCOPE** — see [`autoreleasepool`]. The RAII
-//!   token form let safe code pop out of order, which is a use-after-free.
+//! * **Ivars carry a written-initialised flag** ([`IvarSlot`]), so a `dealloc`
+//!   before the ivars are stored never drops zeroed bytes. It is checked on
+//!   read in release builds too: the class is registered under a public name,
+//!   so Objective-C code can mint an instance this crate never initialised.
+//! * **Ivar pointers use exposed provenance** — derived through
+//!   [`std::ptr::with_exposed_provenance`] from the address the runtime handed
+//!   across FFI, not by offsetting a reference to the zero-sized Rust type.
+//! * **Every trampoline has a panic guard and exception containment.**
+//!   Unwinding out of an Objective-C frame is undefined behaviour, so a Rust
+//!   panic aborts with the method's name. An `NSException` raised inside the
+//!   method is caught by the `@try` wrapper in [`exception`] after every Rust
+//!   `Drop` on the unwound frames has run, reported once, counted, and the
+//!   method returns its inert zero. `-dealloc` and methods declared
+//!   `@abort_on_exception` abort instead. Order: `catch_unwind` outside,
+//!   `@try` inside.
+//! * **The indirect-return entry point is chosen by the type system.** On
+//!   `x86_64-apple-darwin` (the compat slice of the universal binary) a struct
+//!   return over 16 bytes must use `objc_msgSend_stret`, whose hidden result
+//!   pointer occupies `RDI`, shifting every argument. [`msg`] reads the return
+//!   type off the prototype through [`MsgFn`] and picks the entry point in a
+//!   `const` block. See [`returns_indirectly`].
+//! * **`BOOL` is a type, not `bool`** — see [`Bool`] and [`encode`].
+//! * **Every pointer-shaped runtime type is its own `#[repr(transparent)]`
+//!   type** (`Id`, `ClassPtr`, `ProtocolPtr`, `Sel`), so each carries the
+//!   encoding clang emits (`"@"`, `"#"`, …) and an opaque `void *` such as
+//!   KVO's `context:` is not mistaken for an object.
+//! * **An autorelease pool is a scope** — see [`autoreleasepool`]; an RAII
+//!   token would let safe code pop out of order.
 //!
-//! # Named soundness questions, unsettled
+//! # Open soundness questions
 //!
-//! * **Ivar provenance.** The exposed-provenance derivation above is the best
-//!   available form, but Rust has no model in which a zero-sized marker type at
-//!   an object's base address *legitimately* addresses bytes beyond itself.
-//!   objc2 has the same shape and the same question. Miri cannot adjudicate it
-//!   because it cannot run the Objective-C runtime at all.
-//! * **Message sends ARE unwind-capable in the other direction — and must
-//!   be.** An Objective-C exception raised inside a send unwinds through the
-//!   Rust frame as a foreign exception. `metal/ffi.rs` declares its own
-//!   `objc_msgSend` as `extern "C"` and states this becomes an abort; this
-//!   crate's entry points are `extern "C-unwind"` and [`MsgFn`] refuses the
-//!   `"C"` spelling, because a `nounwind` callee on the path a raise takes was
-//!   MEASURED to skip that frame's `Drop`s or abort with `failed to initiate
-//!   panic`. What catches the raise is [`exception`], at the trampoline. What
-//!   was open, in two places (the first still is): `aterm-gpu`'s private
-//!   `metal/ffi.rs` sends keep the `"C"` spelling, so a Metal raise inside a
-//!   frame of that crate skips that frame's destructors on its way to the
-//!   containment above it; and every send that was made through an `objc2`
-//!   binding or `msg_send!` in the vendored winit macOS backend and in
-//!   `aterm-gui` was `"C"` too —
-//!   `objc-sys 0.3.5` spells `objc_msgSend` `extern "C"` unless its
-//!   `unstable-c-unwind` feature is on, and that feature enables
-//!   `#![feature(c_unwind)]`, a nightly gate the release's x86_64 compat
-//!   slice (built on upstream stable) refuses with E0554. MEASURED against
-//!   this tree: a raise through such a send is still contained above, but the
-//!   frame that made it skips its own `Drop`s. That second place is CLOSED:
-//!   the W12 + W13 merge (2026-09-05) took the last such send out of both,
-//!   neither manifest declares an `objc2`-family dependency any more, so such
-//!   a send cannot compile there, and `tests/objc2_exit_condition.rs` refuses
-//!   a re-added dependency row. (The line-count ceiling that tracked the port
-//!   down to zero was retired with it.) Third-party BLOCKS are gone from every
-//!   raise path: `block2`'s `nounwind` invoke was measured to abort the
-//!   process on a raise beneath it even with a containment outside, and its
-//!   three sites are [`RcBlock`] now.
+//! * **Ivar provenance.** Rust has no model in which a zero-sized marker at an
+//!   object's base address legitimately addresses bytes beyond itself. objc2
+//!   has the same shape; Miri cannot run the Objective-C runtime.
+//! * **Sends are unwind-capable, and must be.** An Objective-C exception raised
+//!   inside a send unwinds through the Rust frame as a foreign exception. This
+//!   crate's entry points are `extern "C-unwind"` and [`MsgFn`] refuses `"C"`,
+//!   because a `nounwind` frame on the raise path skips its `Drop`s or aborts
+//!   with `failed to initiate panic`. [`exception`] catches the raise at the
+//!   trampoline. `aterm-gpu`'s private `metal/ffi.rs` still declares its sends
+//!   `"C"`, so a Metal raise skips that frame's destructors on its way to the
+//!   containment. `tests/objc2_exit_condition.rs` refuses a re-added
+//!   objc2-family dependency.
 //! * **`S3` — `dealloc` runs on whatever thread performs the last release.**
-//!   [`ClassBuilder::register`] hands the object to the Objective-C runtime,
-//!   and nothing in that runtime promises the final `release` comes from the
-//!   thread that created the instance: an `-autorelease` inside a framework
-//!   worker, a `performSelectorOnMainThread:` that outlives its sender, or a
-//!   `NSNotificationCenter` posting from a background queue can all be the last
-//!   holder. The generated `-dealloc` then runs the ivar type's Rust
-//!   destructor there, with NO `Send` bound anywhere in the path. objc2 0.5 has
-//!   exactly this hole — it is why 0.6 introduced `MainThreadOnly` — and every
-//!   declared class in this tree is main-thread AppKit state whose ivars are
-//!   `Cell`/`RefCell`/[`Retained`], so the hole is real and currently
-//!   unexercised. STILL UNCLOSED at the RELEASE end IN GENERAL, which is where
-//!   it was named: nothing can make a framework release an object on the thread
-//!   that made it.
-//!
-//!   NARROWED, by W12, and the narrowing is measured rather than argued. For a
-//!   value held in a [`MainThreadBound`] the release end IS closed: that
-//!   container's `Drop` reschedules through [`run_on_main`], so the
-//!   [`Retained`] is released — and any resulting `-dealloc` and Rust ivar
-//!   destructor run — on the main thread, wherever the container itself
-//!   happened to die. `tests/main_thread_bound_drive.rs` measures both sides
-//!   against a `NaiveBound<T>` that carries the identical `unsafe impl<T> Send`
-//!   with an ordinary drop: the naive one runs a declared class's ivar
-//!   destructor on a spawned thread through 100% safe code, and the compiler
-//!   cannot tell the two types apart. This is a narrowing and not a closure —
-//!   an object AppKit holds elsewhere is still released wherever AppKit
-//!   releases it.
-//!
-//!   Its BIRTH end is closed, and it had quietly opened. objc2 0.5 gave every
-//!   class in this port `mutability::MainThreadOnly`, which made `alloc`
-//!   reachable only through a `MainThreadMarker`; this crate's first
-//!   [`declare_class!`] dropped the parameter, reasoning that [`Retained`] is
-//!   `!Send` so it had one useful value. That reasoning is about where an
-//!   instance may TRAVEL. A judge built the counterexample about where one may
-//!   be BORN: a declared class registered, instantiated and deallocated on a
-//!   `std::thread::spawn`ed thread, no witness, NOT ONE `unsafe` token at the
-//!   call site, no diagnostic — the ivar destructor running on a foreign thread
-//!   through the front door rather than through a framework's release. W3 was
-//!   about to multiply that by five, including `NSView` and `NSWindow`
-//!   subclasses. [`MainThread`] is the parameter restored: `alloc_init` and
-//!   `alloc_ivars` take one, `new()` asks `+[NSThread isMainThread]` exactly as
-//!   objc2's marker does, and the escape hatch is `unsafe`. Class REGISTRATION
-//!   is deliberately still ungated — see [`MainThread`] for why.
-//! * **`S4` — nothing `malloc` allocates can out-align 16 bytes. CLOSED, by
-//!   refusal, on BOTH of its paths.** `_Block_copy` allocates with `malloc`,
-//!   which guarantees 16-byte alignment; a closure needing more would land
-//!   misaligned in the heap block. There is no ABI knob to ask for more, so
-//!   each [`RcBlock`] constructor carries a `const` assertion that rejects such
-//!   a closure at compile time rather than producing a misaligned one at run
-//!   time.
-//!
-//!   That was recorded as CLOSED while its exact twin stood open one module
-//!   over. `class_createInstance` — what `+alloc` calls — uses the same
-//!   allocator, `class_addIvar` can align the ivar's OFFSET but not the
-//!   instance BASE, and so a `type Ivars = T` with `align_of::<T>() > 16` lands
-//!   misaligned in some fraction of instances: MEASURED through `ivar_getOffset`
-//!   on raw `+alloc` addresses, 9/4096 at `align(64)` and 19/4096 at
-//!   `align(32)`, with 0/4096 at 16. It was reachable with NOT ONE `unsafe`
-//!   token at the call site (`declare_class!{ type Ivars = Align64 }` then
-//!   `X::alloc_init(v)`), aborted in debug at `IvarSlot::init`'s `ptr::write`
-//!   alignment precondition and again on the `dealloc` path, and in release
-//!   compiles the check out and lets LLVM propagate the alignment it was
-//!   promised. [`ClassBuilder::add_rust_ivar`] and [`declare_class!`] now carry
-//!   the same `const` assertion the block constructors do — which is also what
-//!   makes [`IvarSlot`]'s three "aligned" preconditions dischargeable, since
-//!   its `get` is reached from the SAFE `ivars()` accessor.
-//! * **`x86_64` is proved by CODEGEN, not by execution.** Every claim this
-//!   crate makes about `x86_64-apple-darwin` — `@encode(BOOL) == "c"`, the
-//!   `objc_msgSend_stret` threshold at 16 bytes, and the SECOND `_stret` rule
-//!   that has no threshold at all (a struct with a misaligned field goes
-//!   indirect at any size, measured down to three bytes) — was measured by
-//!   compiling the equivalent Objective-C with `clang -arch x86_64 -S` and
-//!   reading which symbol the call lands on, because the development box cannot
-//!   execute that slice. The Rust side's `x86_64` arms are type-checked by a
-//!   cross `cargo check --target x86_64-apple-darwin`, never run. The aarch64
-//!   half of each pair IS execution-proved, by the tests here.
+//!   The generated `-dealloc` runs the ivars' Rust destructor there with no
+//!   `Send` bound in the path, and every declared class holds main-thread
+//!   state (`Cell`/`RefCell`/[`Retained`]). Nothing can make a framework
+//!   release an object on its creating thread, so this stays open in general.
+//!   A value held in a [`MainThreadBound`] is released on the main thread: its
+//!   `Drop` reschedules through [`run_on_main`]
+//!   (`tests/main_thread_bound_drive.rs` contrasts it with a naive
+//!   `unsafe impl Send` wrapper). The birth end is closed: `alloc_init` and
+//!   `alloc_ivars` take a [`MainThread`] witness, so a declared class cannot
+//!   be instantiated off the main thread without `unsafe`. Class registration
+//!   is deliberately ungated — see [`MainThread`].
+//! * **`S4` — `malloc` cannot out-align 16 bytes. Closed by refusal.**
+//!   `_Block_copy` and `class_createInstance` both allocate with `malloc`, and
+//!   `class_addIvar` aligns an ivar's offset but not the instance base. Each
+//!   [`RcBlock`] constructor, [`ClassBuilder::add_rust_ivar`] and
+//!   [`declare_class!`] carry a `const` assertion rejecting alignment above
+//!   16, which is also what makes [`IvarSlot`]'s alignment preconditions
+//!   dischargeable from the safe `ivars()` accessor.
+//! * **`x86_64` is checked by codegen, not execution.** `@encode(BOOL) ==
+//!   "c"`, the 16-byte `objc_msgSend_stret` threshold, and the second `_stret`
+//!   rule (a struct with a misaligned field goes indirect at any size) come
+//!   from reading `clang -arch x86_64 -S` output; the Rust `x86_64` arms are
+//!   only type-checked by a cross `check`. The aarch64 half of each is
+//!   execution-tested here.
 
 #![cfg(target_os = "macos")]
 
@@ -319,9 +160,6 @@ pub use swizzle::{Imp, MethodFn, Swizzle, SwizzleError, SwizzleSite, owning_clas
 pub use wake_timer::{WakeArm, WakePlan, WakeTarget, WakeTimer};
 pub use weak::{WeakObj, WeakSlot};
 
-/// The uncached selector lookup, under its full name.
-///
-/// [`sel!`] is what call sites should use; this is exported for the rare case
-/// where the name is not known at compile time, and for tests that compare the
-/// two forms.
+/// The uncached selector lookup. Call sites use [`sel!`]; this serves names not
+/// known at compile time and tests comparing the two forms.
 pub use runtime::sel as sel_uncached;

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding for SING-ALONG activation thresholds.
+//! Tier-1 binding for sing-along activation thresholds.
 //!
 //! The derived models exhaust the bounded detector/count spaces. These tests
-//! drive the genuine shipping state machines with injected clocks, project the
+//! drive the shipping state machines with injected clocks, project the
 //! post-state at every abstract boundary, and validate representative traces in
 //! both the embedded interpreter and external `ty` when it is installed.
 
@@ -120,9 +120,9 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
         let post = sing_projection(&detector, at, i);
 
         if i == 8 {
-            // Exact historical mutant: SING-ALONG armed on the eighth press.
-            // The transition exists only under Buggy=1, and its post-state
-            // demonstrably violates the healthy threshold invariant.
+            // Mutant: sing-along armed on the eighth press. The transition
+            // exists only under Buggy=1, and its post-state violates the
+            // healthy threshold invariant.
             let early = BTreeMap::from([
                 ("phase", 1),
                 ("count", 8),
@@ -323,7 +323,7 @@ fn real_cursor_cat_singing_bypass_still_requires_sixteen_travel_events() {
         let post = cat_projection(true, i, &cat);
 
         if i == 10 {
-            // Exact v0.56 mutant: the cat appears at the old ten-key floor.
+            // Mutant: the cat appears at a ten-key floor.
             let early = BTreeMap::from([("singing", 1), ("run", 10), ("active", 1)]);
             assert!(!model.check_invariant("NoCatBeforeSixteen", &early));
             let (healthy_ok, _) = verify::validate_transition_tiered(

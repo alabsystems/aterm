@@ -98,17 +98,12 @@ fn reflow_grow_preserves_cursor_position() {
     // Resize to 12 columns
     grid.resize(5, 12);
 
-    // After unwrap, "ABCDEFGHIJ" is on row 0
-    // Position row 1 col 2 was at logical offset 7 (5 from row 0 + 2)
-    // After unwrap to 12 cols, it should be row 0 col 7
+    // Row 1 col 2 was logical offset 7; unwrapped to 12 cols it is row 0 col 7.
     assert_eq!(grid.cursor_row(), 0);
     assert_eq!(grid.cursor_col(), 7);
 }
 
-/// Test cursor at exact chunk boundary during reflow (#1784).
-///
-/// When cursor is at the exact end of a row that will become a chunk boundary,
-/// verify it ends up correctly positioned after reflow.
+/// A cursor exactly at a chunk boundary is positioned correctly after reflow.
 #[test]
 fn reflow_cursor_at_chunk_boundary() {
     let mut grid = Grid::new(5, 10);
@@ -117,32 +112,24 @@ fn reflow_cursor_at_chunk_boundary() {
         grid.write_char(c);
     }
 
-    // Position cursor at col 5 (on 'F') - this is the exact boundary
-    // when we shrink to 5 columns
-    // Note: set_cursor clamps to valid range, so we use col 5 which is valid
+    // Col 5 ('F') is the exact boundary once shrunk to 5 columns.
     grid.set_cursor(0, 5);
 
-    // Shrink to 5 columns
-    // "ABCDE" on row 0 (ends at logical offset 5)
-    // "FGHIJ" on row 1 (ends at logical offset 10)
-    // Cursor at logical offset 5 is exactly at the chunk boundary
+    // At 5 columns: "ABCDE" (offsets 0-4), "FGHIJ" (5-9); the cursor at
+    // offset 5 is on the boundary.
     grid.resize(5, 5);
 
     // Verify content
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
     assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
 
-    // Cursor was at col 5 (on 'F'), which is logical offset 5
-    // After reflow to 5 cols: this is the exact boundary between chunks
-    // Should end up at row 1, col 0 (start of second chunk)
+    // Offset 5 starts the second chunk: row 1, col 0.
     assert_eq!(grid.cursor_row(), 1);
     assert_eq!(grid.cursor_col(), 0);
 }
 
-/// Test cursor at exact end of wrapped line during reflow.
-///
-/// When a line is wrapped and cursor is at the last valid position of the
-/// first segment, verify it ends up correctly positioned after unwrap.
+/// A cursor at the last position of a wrapped line's first segment is
+/// positioned correctly after unwrap.
 #[test]
 fn reflow_cursor_at_wrapped_line_end() {
     // Start with 5-column grid
@@ -215,8 +202,7 @@ fn reflow_without_reflow_flag() {
 
 #[test]
 fn resize_with_reflow_noop_and_grow_preserve_logical_rows_after_scroll() {
-    // Regression for #2184: no-op/grow resize must not reset ring_head unless
-    // rows were linearized.
+    // A no-op or grow resize keeps ring_head unless rows were linearized.
     let mut grid = Grid::with_scrollback(4, 8, 0);
     for row in 0..4 {
         grid.set_cursor(row, 0);
@@ -252,8 +238,8 @@ fn resize_with_reflow_noop_and_grow_preserve_logical_rows_after_scroll() {
 
 #[test]
 fn resize_with_reflow_grow_preserves_nonempty_bottom_row_after_scroll() {
-    // Regression for #2184 follow-up: grow must append new rows after all
-    // existing logical rows, even when ring_head != 0.
+    // A grow appends new rows after all existing logical rows, even when
+    // ring_head != 0.
     let mut grid = Grid::with_scrollback(4, 8, 0);
     for row in 0..4 {
         grid.set_cursor(row, 0);

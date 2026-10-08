@@ -1,0 +1,10 @@
+# claude-code 2.1.283 · HAND-BUILT 2026-09-28 from the 2.1.283 binary's `G6t()`: the auto-continue that went `stale` (the Mac slept past the reset by over 30 min) leaves the session wall's row and adds the banner `⚠ Your usage limit has reset · press enter to continue` — the reset is PAST, the banner is no limit · a passed wall
+⏺ Suites are running; I'll report the number when it lands.
+  ⎿  You've hit your session limit · resets 3pm (America/Los_Angeles)
+
+✻ Cooked for 3m 2s · done 2:24 PM
+                                                                                       ⚠ Your usage limit has reset · press enter to continue
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

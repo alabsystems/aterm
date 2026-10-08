@@ -13,12 +13,11 @@
 //! being read and the roster signature being produced. Everything below is in service of
 //! that sentence, and a test asserts the mint path writes no bytes derived from it.
 //!
-//! # The encoding is the owner's choice: 52 base32 characters (ruling 2026-08-15)
+//! # The encoding: 52 base32 characters (owner's ruling)
 //!
 //! Thirty-two bytes, written as 52 characters of lowercase Crockford base32 — `0-9` and
-//! `a-z` minus `i l o u`, the characters hands confuse. Hex was the first spelling; the
-//! owner ruled 64 characters too long to write, and base32 is the shortest spelling that
-//! stays lowercase alphanumeric. Shown in groups of four. The reader strips spaces and
+//! `a-z` minus `i l o u`, the characters hands confuse; the shortest spelling that stays
+//! lowercase alphanumeric. Shown in groups of four. The reader strips spaces and
 //! hyphens, folds case, and maps `o→0`, `i→1`, `l→1`, so the classic misreads parse as
 //! what they resemble instead of failing. The final character carries four padding bits
 //! the reader masks off — the IDENTITY (checked by fingerprint) is canonical, not the
@@ -42,9 +41,7 @@
 //!    there must never be one. The only flags this tool takes are non-secret. A future
 //!    "convenience" flag here would be a security regression, and this sentence exists
 //!    because that is precisely how such a flag gets added.
-//! 2. **environment** — `ps -E`. No environment variable is read for the master. Note the
-//!    habit being deliberately broken: the retired design read `ATERM_UPDATE_PUBKEY` and
-//!    friends from the environment.
+//! 2. **environment** — `ps -E`. No environment variable is read for the master.
 //! 3. **shell history** — falls out of (1). Nothing secret is ever typed on a command
 //!    line, so nothing secret can land in history.
 //! 4. **terminal scrollback** — ECHO is off while reading, and the termios state is
@@ -86,22 +83,17 @@
 //! 10. **the clipboard** — if the owner PASTES the phrase instead of typing it, it sits in
 //!     the pasteboard afterwards. Nothing inside this tool can prevent that; the docs say
 //!     so and recommend typing.
-//! 12. **the terminal emulator's own persistence** — the phrase is shown on a terminal,
-//!     and some terminals (aterm's seamless-update grid snapshots, iTerm2 session
-//!     restore) write their grid to DISK. The ceremony docs therefore say: run
-//!     `setup`/`join` in a terminal that does not persist its contents (macOS
-//!     Terminal.app with session restore off is fine; aterm is NOT, while a seamless
-//!     update can snapshot the grid), and clear scrollback after. This tool cannot
-//!     close a vector that lives in whatever renders it.
-//! 11. **stdout redirection — the OUTPUT side of vector 5, and the one this inventory
-//!     originally missed.** Reading was scrupulous (`/dev/tty`, `isatty`, refuse otherwise)
-//!     while the single deliberate WRITE went to fd 1, so `setup > log`, `| tee`, `| less`
-//!     or any wrapper that captures stdout put the 64 hex characters into a file forever —
-//!     and a wrapper that captured and discarded them destroyed the master instead, while
-//!     the tool reported success. Both are closed the same way: the phrase is written to
-//!     the [`Tty`] handle, which is `/dev/tty` proved with `isatty`, and a run with no
-//!     terminal is REFUSED before a master is generated. A redirect can no longer capture
-//!     it and a discarded stream can no longer swallow it.
+//! 11. **stdout redirection** — the output side of vector 5. On fd 1, `setup > log`,
+//!     `| tee` or any capturing wrapper would put the phrase in a file, and one that
+//!     discards it would destroy the master while the tool reported success. The phrase
+//!     is written to the [`Tty`] handle (`/dev/tty`, proved with `isatty`), and a run
+//!     with no terminal is REFUSED before a master is generated.
+//! 12. **the terminal emulator's own persistence** — some terminals (aterm's
+//!     seamless-update grid snapshots, iTerm2 session restore) write their grid to DISK.
+//!     The ceremony docs therefore say: run `setup`/`join` in a terminal that does not
+//!     persist its contents (macOS Terminal.app with session restore off is fine; aterm
+//!     is NOT, while a seamless update can snapshot the grid), and clear scrollback after.
+//!     This tool cannot close a vector that lives in whatever renders it.
 
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -427,7 +419,7 @@ pub fn generate_master() -> Result<MasterPhrase, String> {
     let mut nbits: u32 = 0;
     let mut out = 0usize;
     // `for b in raw` would move a COPY of the whole seed into `array::IntoIter`'s
-    // backing storage, which nothing scrubs (found by external audit 2026-08-15);
+    // backing storage, which nothing scrubs;
     // iterate by reference so the only seed copy is `raw`, which is scrubbed below.
     for &b in &raw {
         acc = (acc << 8) | u32::from(b);
@@ -533,19 +525,10 @@ const PROMPT_CAP: usize = 256;
 /// THE TERMINAL, opened explicitly — the only place a master is ever read from and the
 /// only place one is ever written to.
 ///
-/// # Why an owned handle rather than "print it and hope"
-///
-/// The reading side always did this: `/dev/tty` is opened by name and `isatty`-checked, so
-/// `join < phrase.txt` fails loudly instead of quietly taking the master out of a file
-/// (leak vector 5). The WRITING side did not, and that asymmetry was a hole in both
-/// directions (leak vector 11): a redirect captured the phrase into a file that outlives
-/// the terminal, and a discarded stream swallowed it while the tool reported success —
-/// which is worse, because the anchor it had just armed then named a master nobody held.
-///
 /// `/dev/tty` is the process's CONTROLLING TERMINAL, resolved by the kernel. It is not fd
-/// 1, so no shell redirection can point it at a file, and a process with no controlling
-/// terminal cannot open it at all. That is the property both directions want, so both
-/// directions now go through this one handle.
+/// 0 or 1, so no shell redirection can point it at a file (leak vectors 5 and 11), and a
+/// process with no controlling terminal cannot open it at all. Reading and writing both go
+/// through this one handle.
 pub struct Tty {
     file: std::fs::File,
     fd: std::os::unix::io::RawFd,
@@ -598,9 +581,8 @@ impl Tty {
     /// * It goes to the TERMINAL, so a redirect cannot capture it and a discarded stream
     ///   cannot swallow it (leak vector 11).
     /// * It is assembled in a fixed array that is `mlock`ed and volatile-scrubbed,
-    ///   never a `String` — the CLI's old `push_str` + `push('\n')` grew the allocation
-    ///   and freed the original with the phrase still in it, which is exactly the
-    ///   reallocation leak vector 9 exists to forbid.
+    ///   never a `String`, whose growth would free a copy of the phrase unscrubbed
+    ///   (leak vector 9).
     ///
     /// The phrase is written in GROUPS OF FOUR — thirteen blocks the hand can copy
     /// without losing its place. The parser strips the spaces, so the grouping costs the

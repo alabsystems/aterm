@@ -226,7 +226,12 @@ fn lay(prefix: &Path, stem: &str, who: &str, wait: Duration) -> Result<(File, Pa
         open(&gate_path, false).map_err(|e| format!("{}: {e}", gate_path.display()))?;
     let deadline = Instant::now() + wait;
     loop {
-        match gate.try_lock_shared() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the gate, SHARED: let go by unlock() once the lease is laid"
+        )]
+        let taken = gate.try_lock_shared();
+        match taken {
             Ok(()) => break,
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(POLL);
@@ -247,6 +252,11 @@ fn lay(prefix: &Path, stem: &str, who: &str, wait: Duration) -> Result<(File, Pa
     let path = dir.join(format!("{stem}@{tag}.lease"));
     let laid = (|| -> std::io::Result<File> {
         let mut file: std::fs::File = open(&taking, true)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the laid lease's lock goes to a Lease, whose Drop releases by LOCK_UN; \
+                      a failed laying lets go by unlock() below"
+        )]
         file.try_lock().map_err(|e| match e {
             std::fs::TryLockError::Error(e) => e,
             std::fs::TryLockError::WouldBlock => std::io::Error::new(
@@ -256,8 +266,15 @@ fn lay(prefix: &Path, stem: &str, who: &str, wait: Duration) -> Result<(File, Pa
         })?;
         let mut line = who_line(who);
         line.push('\n');
-        file.write_all(line.as_bytes())?;
-        std::fs::rename(&taking, &path)?;
+        let laid = file
+            .write_all(line.as_bytes())
+            .and_then(|()| std::fs::rename(&taking, &path));
+        if let Err(e) = laid {
+            // Let go by LOCK_UN before the close, not by the close alone (the
+            // flock release rule); the caller unlinks the `.taking` name.
+            let _ = file.unlock();
+            return Err(e);
+        }
         Ok(file)
     })();
     let _ = gate.unlock();
@@ -335,10 +352,12 @@ mod tests {
         );
         // Another open of it cannot lock it: this is what atpkg reads as a live holder.
         let other: std::fs::File = File::open(&file).unwrap();
-        assert!(matches!(
-            other.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a probe that is refused: it never holds the lock"
+        )]
+        let refused = other.try_lock();
+        assert!(matches!(refused, Err(std::fs::TryLockError::WouldBlock)));
         assert!(
             Taken::Held(lease)
                 .header_line()
@@ -362,6 +381,10 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(p.join(DIR)).unwrap();
         let gate: std::fs::File = File::create(p.join(DIR).join("rustup-trust.gate")).unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's stand-in reclaimer: it lets go of the gate by unlock() below"
+        )]
         gate.try_lock().unwrap();
         let taken = take(&p, &bin, "x", Duration::from_millis(250));
         let Taken::Failed(why) = &taken else {

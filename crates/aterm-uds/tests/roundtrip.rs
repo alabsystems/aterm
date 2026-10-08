@@ -3,13 +3,10 @@
 
 //! Cross-platform behavioral tests for the portable control-socket stream.
 //!
-//! These run on BOTH platforms: on Unix they exercise the std aliases (a
-//! regression guard that the portable surface never drifts from std); on
-//! Windows they are the LOAD-BEARING proof that afunix.sys semantics hold —
-//! in particular that `shutdown` unblocks a blocked cross-thread read (relay
-//! teardown depends on it) and that a stale/absent socket reads as
-//! `ConnectionRefused`/`NotFound` (the `decide_bind` unlink-on-restart
-//! contract depends on it).
+//! On Unix they check the std aliases; on Windows they check that afunix.sys
+//! semantics hold, in particular that `shutdown` unblocks a blocked
+//! cross-thread read (relay teardown) and that a stale or absent socket reads
+//! as `ConnectionRefused`/`NotFound` (unlink-on-restart in `decide_bind`).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -18,7 +15,7 @@ use std::time::{Duration, Instant};
 use aterm_uds::{CtlListener, CtlStream, latest, process, rand};
 
 /// A fresh per-test directory under the OS temp dir (tests run in parallel in
-/// one process, so the name carries the pid AND the test tag).
+/// one process, so the name carries the pid and the test tag).
 fn test_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("aterm-uds-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -26,10 +23,9 @@ fn test_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// The control channel's on-the-wire handshake over a real bound socket:
-/// `AUTH <hex>` is consumed silently on success (the first reply a client
-/// reads answers its first VERB), a bad token yields exactly `ERR auth\n` —
-/// mirroring `control_auth`'s `run_auth_preamble` shape.
+/// The control channel's handshake over a real bound socket: `AUTH <hex>` is
+/// consumed silently on success (the first reply answers the first verb), and
+/// a bad token yields exactly `ERR auth\n`.
 #[test]
 fn roundtrip_auth_handshake_over_a_bound_socket() {
     let dir = test_dir("roundtrip");
@@ -106,10 +102,10 @@ fn pump(r: &mut CtlStream, w: &mut CtlStream) {
     }
 }
 
-/// The proxy.rs `relay_bidirectional` shape: BOTH directions pumped
-/// concurrently over CLONES of the two streams; when either direction ends,
-/// that pump shuts BOTH sockets down both ways, which must unblock the OTHER
-/// pump's parked read so everything joins.
+/// The proxy's `relay_bidirectional` shape: both directions pumped
+/// concurrently over clones of the two streams; when either direction ends,
+/// its pump shuts both sockets down, which must unblock the other pump's
+/// parked read so everything joins.
 #[test]
 fn clone_bidirectional_relay() {
     let (app, relay_client) = CtlStream::pair().expect("client pair");
@@ -157,20 +153,15 @@ fn clone_bidirectional_relay() {
         .expect("child->client pump joins after teardown");
 }
 
-/// THE relay-teardown load-bearing property: `shutdown(Both)` on a CLONE must
-/// unblock a read parked on another thread within a bounded window, returning
-/// EOF or an error — never hanging.
+/// `shutdown(Both)` on a clone unblocks a read parked on another thread,
+/// returning EOF or an error, never hanging (relay teardown relies on it).
 #[test]
 fn shutdown_unblocks_blocked_read() {
     let (a, _b) = CtlStream::pair().expect("pair");
     let clone = a.try_clone().expect("clone");
     let (tx, rx) = std::sync::mpsc::channel();
-    // The sleep alone used to be the ONLY thing ordering "reader is parked" before
-    // "shutdown fires". On a loaded box the thread may not be scheduled inside
-    // 100ms, the shutdown lands FIRST, and the read then returns EOF for a reason
-    // that has nothing to do with unblocking a parked read — the property under
-    // test never runs and the test passes anyway. Publish entry, then keep the
-    // sleep as slack for the gap between the flag and the actual park.
+    // Publish entry so the shutdown cannot land before the reader starts; the
+    // sleep covers the gap between the flag and the actual park.
     let entering = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_entering = entering.clone();
     let reader = std::thread::spawn(move || {
@@ -188,7 +179,7 @@ fn shutdown_unblocks_blocked_read() {
     let res = rx
         .recv_timeout(Duration::from_secs(60))
         .expect("shutdown must unblock the parked read within the deadline");
-    // An `Err` also unblocks the relay loop — acceptable; EOF must be clean.
+    // An `Err` also unblocks the relay loop; EOF must be clean.
     if let Ok(n) = res {
         assert_eq!(n, 0, "post-shutdown read is EOF");
     }
@@ -196,8 +187,7 @@ fn shutdown_unblocks_blocked_read() {
 }
 
 /// A read timeout expires as `WouldBlock`/`TimedOut` (what the tls relay's
-/// poll loop accepts), within a sane tolerance, and a timed stream still
-/// delivers data that IS available.
+/// poll loop accepts), and a timed stream still delivers available data.
 #[test]
 fn read_timeout_returns_would_block() {
     let (a, b) = CtlStream::pair().expect("pair");
@@ -234,10 +224,9 @@ fn read_timeout_returns_would_block() {
     );
 }
 
-/// The `decide_bind` contract: a socket FILE with no listener (a crashed
-/// instance's leftover) must read as stale — `ConnectionRefused`/`NotFound` —
-/// and an absent path must read as `NotFound`. Anything else would make the
-/// server refuse to rebind after every crash.
+/// A socket file with no listener (a crashed instance's leftover) reads as
+/// stale (`ConnectionRefused`/`NotFound`) and an absent path as `NotFound`, so
+/// the server can rebind after a crash.
 #[test]
 fn stale_socket_reads_not_live() {
     let dir = test_dir("stale");
@@ -245,10 +234,10 @@ fn stale_socket_reads_not_live() {
 
     let listener = CtlListener::bind(&path).expect("bind");
     CtlStream::connect(&path).expect("live listener accepts a connect");
-    drop(listener); // the file REMAINS; nobody listens -> stale
+    drop(listener); // the file remains; nobody listens -> stale
 
     // Socket teardown can be asynchronous: poll (bounded) until the stale
-    // verdict lands; never reaching it is the real regression.
+    // verdict lands.
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut stale = false;
     while Instant::now() < deadline {
@@ -284,8 +273,8 @@ fn stale_socket_reads_not_live() {
 }
 
 /// `std::fs::remove_file` deletes the socket file (on Windows an afunix
-/// REPARSE POINT — DeleteFileW removes it without following), so the
-/// `remove_file` + rebind flow works unchanged on both platforms.
+/// reparse point, which DeleteFileW removes without following), so
+/// `remove_file` + rebind works on both platforms.
 #[test]
 fn remove_file_deletes_socket_reparse_point() {
     let dir = test_dir("unlink");
@@ -309,9 +298,8 @@ fn remove_file_deletes_socket_reparse_point() {
 }
 
 /// The `latest` alias publishes atomically and repoints (symlink on Unix,
-/// pointer file on Windows — one portable surface), leaving no temp residue;
-/// the client-side `resolve` follows it on Windows and is the identity on
-/// Unix (where the kernel resolves the symlink during connect).
+/// pointer file on Windows), leaving no temp residue; `resolve` follows it on
+/// Windows and is the identity on Unix.
 #[test]
 fn latest_pointer_publishes_atomically_and_repoints() {
     let dir = test_dir("latest");
@@ -351,9 +339,8 @@ fn latest_pointer_publishes_atomically_and_repoints() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// On Windows a planted alias with junk / path-escaping contents must NOT
-/// resolve (contents are validated against the `aterm-<pid>.sock` shape);
-/// the client then just dials the given path and fails cleanly.
+/// On Windows a planted alias with junk or path-escaping contents does not
+/// resolve; the client then dials the given path and fails cleanly.
 #[cfg(windows)]
 #[test]
 fn latest_pointer_rejects_junk_and_escaping_contents() {
@@ -382,8 +369,8 @@ fn latest_pointer_rejects_junk_and_escaping_contents() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An unencodable socket path (over sun_path's 107 usable bytes) fails with a
-/// clean `InvalidInput` on both platforms — never a garbled bind.
+/// An unencodable socket path (over sun_path's 107 usable bytes) fails with
+/// `InvalidInput` on both platforms, never a garbled bind.
 #[test]
 fn sun_path_too_long_errors_cleanly() {
     let long = std::env::temp_dir().join(format!("{}.sock", "x".repeat(200)));
@@ -397,8 +384,8 @@ fn sun_path_too_long_errors_cleanly() {
     );
 }
 
-/// Pid liveness: we are alive; a reaped child and pid 0 are dead. This is the
-/// predicate the stale-instance sweep keys on.
+/// Pid liveness, the predicate the stale-instance sweep keys on: we are alive;
+/// a reaped child and pid 0 are dead.
 #[test]
 fn pid_alive_self_true_reaped_child_false() {
     assert!(process::pid_alive(std::process::id()), "self is alive");

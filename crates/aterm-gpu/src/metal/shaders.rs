@@ -1,100 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The MSL twins of aterm's six WGSL shaders. The entry-point roster is NOT
-//! kept here — it is derived from [`crate::pipeline_table`], which is what
-//! `renderer.rs` builds its `wgpu` pipelines from; see `libraries` for the
-//! drift that cost.
+//! The MSL twins of aterm's WGSL shaders. The entry-point roster is derived
+//! from [`crate::pipeline_table`] (see `libraries`).
 //!
-//! # Why these are files and the WGSL was not
+//! The WGSL lives in `const &str` literals in `renderer.rs`; the MSL lives in
+//! `crates/aterm-gpu/shaders/*.metal`, pulled in with `include_str!`, so the
+//! compile test, editors and `xcrun metal` can read it.
 //!
-//! The WGSL lives in six `const &str` literals in `renderer.rs` (lines 272,
-//! 759, 926, 1016, 1071, 1146) — there is not one `.wgsl` file in the tree.
-//! The MSL is kept in `crates/aterm-gpu/shaders/*.metal` and pulled in with
-//! `include_str!` instead, because a `.metal` file is what the headless
-//! compile test, an editor, and `xcrun metal` (where it exists) can all read.
+//! # Colour spaces
 //!
-//! # THE FORMAT LAW — the thing a port silently gets wrong
+//! `renderer.rs::pick_surface_format` chooses a non-sRGB surface format, never
+//! an `*_sRGB` one:
 //!
-//! `renderer.rs::pick_surface_format` (7811-7826) deliberately chooses a
-//! **non-sRGB** surface format (`Bgra8Unorm`, else `Rgba8Unorm`, else any
-//! non-sRGB non-`Rgba16Float` format) and NEVER an `*_sRGB` one. That is not an
-//! oversight to be "fixed" during the port:
+//! * Base OVER/REPLACE passes render into an sRGB view of the offscreen; the
+//!   fragments emit linear light (`s2l`) and the view re-encodes on store, so
+//!   blending composites in linear light like the CPU `blend`.
+//! * Additive passes (`fs_glow`, `fs_rain_glow`, `fs_fire_add`, `fs_deco_add`)
+//!   bind the Unorm view of the same texture and emit raw values, so One/One
+//!   is byte-exact with the CPU `add_sat`.
+//! * The blit writes already-encoded bytes; an sRGB swapchain would encode
+//!   twice.
 //!
-//! * The base OVER/REPLACE passes render into an **sRGB-typed VIEW** of the
-//!   offscreen texture. The fragment shaders emit **linear light** (`s2l`), the
-//!   view re-encodes on store, and so fixed-function blending composites in
-//!   linear light — which is what makes the GPU match the CPU `blend`.
-//! * The ADDITIVE passes (`fs_glow`, `fs_rain_glow`, `fs_fire_add`,
-//!   `fs_deco_add`) bind the **Unorm** view of the SAME texture and emit RAW,
-//!   un-decoded values, so the One/One add is byte-exact against the CPU
-//!   `add_sat`.
-//! * The final blit then writes already-sRGB-encoded bytes to the swapchain. If
-//!   the swapchain were sRGB-typed it would encode a SECOND time and the whole
-//!   frame would wash out.
-//!
-//! Metal expresses the same pairing with
-//! `newTextureViewWithPixelFormat:` over a texture created with
-//! `TEXTURE_USAGE_PIXEL_FORMAT_VIEW`:
-//! `Bgra8Unorm` <-> `Bgra8UnormSrgb` are a view-compatible pair, so the trick
-//! ports exactly rather than needing an approximation.
-//!
-//! The four formats the renderer asks for — `Bgra8Unorm`, `Rgba8Unorm`,
-//! `R8Unorm` (the glyph atlas) and `Rgba16Float` (the HDR/EDR path) — are all
-//! declared in [`super::ffi::PixelFormat`] and all exercised by
-//! [`super::tests`].
+//! Metal expresses the pairing with `newTextureViewWithPixelFormat:` on
+//! Unorm/sRGB view-compatible formats. The formats used (`Bgra8Unorm`,
+//! `Rgba8Unorm`, `R8Unorm`, `Rgba16Float`) are declared in
+//! [`super::ffi::PixelFormat`] and exercised by [`super::tests`].
 
-//! # THE PORT TABLE
+//! # WGSL to MSL mapping
 //!
-//! WGSL lines are the literal bodies in `renderer.rs` (the `r#"` open/close
-//! lines excluded); MSL lines are the `.metal` files beside this module.
+//! Structural differences: `@location` params become `[[attribute(n)]]` +
+//! `[[stage_in]]` structs; `@interpolate(flat)` becomes `[[flat]]`;
+//! `bitcast<i32>` becomes `as_type<int>`; `textureLoad` becomes `read`;
+//! `textureSampleLevel(.., 0.0)` becomes `sample(.., level(0.0))`; uniforms,
+//! textures and samplers become function arguments. In `cell.metal` the rain
+//! weight and fire shading tails are shared `static inline` helpers so the
+//! parity kernel calls the same code as the fragments. Integer math is
+//! otherwise op for op. `parity_kernel.metal` is verification-only.
 //!
-//! | shader   | WGSL | MSL | what changed |
-//! |----------|-----:|----:|--------------|
-//! | `cell`     | 484 | 506 | Attribute structs replace `@location` params (`[[attribute(n)]]` + `[[stage_in]]`); `@interpolate(flat)` -> `[[flat]]`; `bitcast<i32>` -> `as_type<int>`; the rain weight and both fire shading tails factored into shared `static inline` helpers so the parity kernel calls the SAME code the fragments do. All integer math otherwise op-for-op. |
-//! | `blit`     | 153 | 121 | `textureLoad(t, vec2<i32>(p), 0)` -> `t.read(uint2(p), 0)` (both truncate toward zero, and `p` is bounds-checked non-negative first); `select` kept as-is; the long W1/M3/M5/H1 rationale comments condensed, no logic touched. |
-//! | `hdr_glow` |  87 |  91 | Uniform becomes a `constant HdrU&` argument on both stages; `select(lo, hi, c > 0.04045)` maps 1:1 (MSL `select(a,b,cond)` is `cond ? b : a`, the same argument order as WGSL); §L5's `white_part` helper and `smoothstep(0.35, 0.60, ..)` boost curve map argument-for-argument. |
-//! | `tray`     |  39 |  41 | Uniform/texture/sampler become function arguments; 4-vertex triangle-strip corner table unchanged. |
-//! | `bloom`    |  62 |  67 | Identical apart from the argument-binding form; the 5x5 loop, `exp` weights and normalization are unchanged, and §L5's white/chroma radius split is the same two samples per tap on both. |
-//! | `shimmer`  |  87 |  87 | `array<vec4<f32>,16>` -> `float4 heat[16]` (same 16-byte stride, so the Rust struct is unchanged); `textureSampleLevel(..., 0.0)` -> `sample(..., level(0.0))`; `heat_at` takes the uniform by reference since MSL has no module-scope uniform. |
+//! Every construct maps exactly:
 //!
-//! Totals: 912 WGSL -> 913 MSL (plus a 62-line verification-only
-//! `parity_kernel.metal` that is never part of a shipping pipeline).
-//!
-//! # Constructs with NO direct MSL equivalent
-//!
-//! There are none in this shader set — every WGSL construct aterm uses mapped
-//! 1:1, and nothing was approximated. The four that needed care, and why each
-//! is exact rather than close:
-//!
-//! * **Arithmetic right shift on negative integers.** `fire_core` evaluates
-//!   `(body0 - 128) * edge >> 8` where the left operand can be negative. WGSL
-//!   defines `i32 >>` as sign-replicating; MSL pins the same for signed types
-//!   (this is NOT the C++ implementation-defined case). The fire differential
-//!   in `super::tests` is what proves it empirically.
-//! * **Wrapping `u32` arithmetic.** `fire_hash`'s splitmix multiplies rely on
-//!   wraparound; both languages define unsigned overflow as wrapping.
-//! * **Flat interpolation of integers.** WGSL needs an explicit
-//!   `@interpolate(flat)`; MSL *requires* integers in a `stage_in` struct to be
-//!   `[[flat]]`. The provoking-vertex rule never enters into it because every
-//!   flat value here is per-INSTANCE and therefore identical across the quad's
-//!   vertices.
-//! * **Uniform buffer layout.** WGSL uniforms use std140; MSL `constant`
-//!   buffers use natural C layout. For all four uniform blocks here every
-//!   member is <= 16 bytes and naturally aligned, and both layouts agree
-//!   member-for-member — so the existing Rust structs are byte-identical and
-//!   UNCHANGED. `BlitUniform` (112 bytes) and `ShimmerU`'s `float4[16]` are the
-//!   two worth re-checking if a field is ever added.
+//! * Arithmetic right shift of negative integers (`fire_core`'s
+//!   `(body0 - 128) * edge >> 8`): sign-replicating in both WGSL and MSL for
+//!   signed types; the fire differential in `super::tests` confirms it.
+//! * Wrapping `u32` arithmetic (`fire_hash`): defined in both.
+//! * Flat integer interpolation: MSL requires `[[flat]]`; every flat value is
+//!   per instance, so the provoking vertex does not matter.
+//! * Uniform layout: std140 in WGSL, natural C layout in MSL. Every member here
+//!   is at most 16 bytes and naturally aligned, so they agree; recheck
+//!   `BlitUniform` (112 bytes) and `ShimmerU`'s `float4[16]` when adding
+//!   fields.
 
 use crate::pipeline_table::ShaderLibrary;
 
-/// The cell shader: backgrounds, the LUMEN aurora, the PHOSPHOR rain halo, the
-/// EMBERFORGE fire field, glyphs, decorations and sprites. The WGSL twin is
-/// `renderer.rs::SHADER`.
+/// The cell shader: backgrounds, aurora, rain halo, fire field, glyphs,
+/// decorations and sprites. WGSL twin: `renderer.rs::SHADER`.
 pub(crate) const CELL: &str = include_str!("../../shaders/cell.metal");
-/// The offscreen -> swapchain blit, including the W1 remainder bands, the
-/// bell-flash invert, the drop-target overlay and the M3 EDR encode. WGSL twin:
-/// `renderer.rs::BLIT_SHADER`.
+/// The offscreen-to-swapchain blit, with remainder bands, bell invert, drop
+/// overlay and HDR encode. WGSL twin: `renderer.rs::BLIT_SHADER`.
 pub(crate) const BLIT: &str = include_str!("../../shaders/blit.metal");
 /// The swapchain-side aurora crown, HDR and SDR arms. WGSL twin:
 /// `renderer.rs::HDR_GLOW_SHADER`.
@@ -107,12 +70,8 @@ pub(crate) const BLOOM: &str = include_str!("../../shaders/bloom.metal");
 /// `renderer.rs::SHIMMER_SHADER`.
 pub(crate) const SHIMMER: &str = include_str!("../../shaders/shimmer.metal");
 
-/// The MSL source for one [`ShaderLibrary`].
-///
-/// The `.metal` file is the ONLY thing this function decides; WHICH entry
-/// points that file must export comes off THE PIPELINE TABLE
-/// (`crate::pipeline_table::entry_points`), not from a roster maintained
-/// beside it.
+/// The MSL source for one [`ShaderLibrary`]. Which entry points it must export
+/// comes from `crate::pipeline_table::entry_points`.
 pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
     match library {
         ShaderLibrary::Cell => CELL,
@@ -124,24 +83,10 @@ pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
     }
 }
 
-/// Every `(library, source, entry points)` triple, DERIVED FROM THE PIPELINE
-/// TABLE — so one test can prove the whole shader set compiles and every entry
-/// point `renderer.rs` actually asks for resolves.
-///
-/// # Why this is derived and not a list
-///
-/// It used to be a hand-written `LIBRARIES` const, and that is exactly how the
-/// `vs_fs` drift survived. `renderer.rs` requested `entry_point: Some("vs_fs")`
-/// twice (the bloom composite and the shimmer); the MSL renamed those functions
-/// `vs_fs_bloom` / `vs_fs_shimmer`; and the roster listed the NEW names. The
-/// compile test then walked the roster and passed — it was SELF-CONSISTENT WITH
-/// THE RENAME and structurally could not catch it, because nothing in the loop
-/// ever mentioned what `renderer.rs` asks for.
-///
-/// Deriving the roster from the table closes that by construction: the table is
-/// what `renderer.rs` builds its pipelines from, so "the entry points the
-/// renderer asks for" and "the entry points the MSL must export" are now the
-/// same list read twice.
+/// Every `(library, source, entry points)` triple, derived from the pipeline
+/// table, so one test proves every library compiles and every entry point the
+/// renderer requests resolves. Derived rather than listed so the roster cannot
+/// agree with a rename the renderer does not know about.
 #[cfg(test)]
 pub(crate) fn libraries() -> Vec<(ShaderLibrary, &'static str, Vec<&'static str>)> {
     ShaderLibrary::ALL
@@ -150,18 +95,14 @@ pub(crate) fn libraries() -> Vec<(ShaderLibrary, &'static str, Vec<&'static str>
         .collect()
 }
 
-/// The verification-only PIPELINE AND ENCODER STATE probes: a fullscreen
-/// triangle, a constant-colour fragment and a sampling fragment, which together
-/// let [`super::tests`] prove on the GPU that the colour write mask, the scissor
-/// rect, the viewport and the sampler filters in [`super::ffi`] are honoured
-/// rather than merely spelled. Never compiled into a shipping pipeline — see
-/// the file's own header.
+/// Verification-only state probes (fullscreen triangle, constant-colour and
+/// sampling fragments) that let [`super::tests`] prove the write mask,
+/// scissor, viewport and sampler filters in [`super::ffi`] are honoured.
 #[cfg(test)]
 pub(crate) const STATE_PROBE: &str = include_str!("../../shaders/state_probe.metal");
 
-/// The verification-only compute kernels, CONCATENATED onto [`CELL`] by the
-/// parity test so the math under test is literally the shipped math. Never
-/// compiled into a shipping pipeline — see the file's own header.
+/// Verification-only compute kernels, concatenated onto [`CELL`] by the parity
+/// test so the math under test is the shipped math.
 #[cfg(test)]
 pub(crate) const PARITY_KERNEL: &str = include_str!("../../shaders/parity_kernel.metal");
 
@@ -171,13 +112,9 @@ pub(crate) fn cell_with_parity_kernels() -> String {
     format!("{CELL}\n{PARITY_KERNEL}")
 }
 
-/// Every `vertex`/`fragment` function `src` DEFINES, in source order.
-///
-/// A deliberately narrow scan, and it can afford to be: every entry point in
-/// these files is declared at column zero as `vertex <ret> <name>(` or
-/// `fragment <ret> <name>(`, and the two verification-only sources
-/// ([`STATE_PROBE`], [`PARITY_KERNEL`]) are not part of any library. Anything
-/// clever here would be a parser nobody asked for.
+/// Every `vertex`/`fragment` function `src` defines, in source order. A narrow
+/// scan: every entry point is declared at column zero as `vertex <ret> <name>(`
+/// or `fragment <ret> <name>(`.
 #[cfg(test)]
 pub(crate) fn defined_entry_points(src: &str) -> Vec<&str> {
     src.lines()
@@ -192,9 +129,9 @@ pub(crate) fn defined_entry_points(src: &str) -> Vec<&str> {
         .collect()
 }
 
-/// What one MSL entry point DECLARES in its parameter list, with the 1-based
-/// line each declaration sits on — the scanned half of THE BINDING MAP whose
-/// tabled half is [`crate::pipeline_table::BindSpec`].
+/// What one MSL entry point declares in its parameter list, with the 1-based
+/// line of each declaration; the scanned side of
+/// [`crate::pipeline_table::BindSpec`].
 #[derive(Debug)]
 #[cfg(test)]
 pub(crate) struct DeclaredBindings {
@@ -211,13 +148,9 @@ pub(crate) struct DeclaredBindings {
     pub(crate) samplers: Vec<(u32, usize)>,
 }
 
-/// Scan `src` for the entry point named `entry` and read the binding
-/// attributes off its parameter list, or `None` when no such entry point is
-/// defined. The same narrow declaration shape as [`defined_entry_points`]
-/// (column-zero `vertex`/`fragment`, name before the paren), then a plain
-/// paren-balance walk to the end of the parameter list — `[[...]]` attributes
-/// appear nowhere else in these sources, and anything cleverer would be a
-/// parser nobody asked for.
+/// Read the binding attributes off `entry`'s parameter list in `src`, or `None`
+/// if not defined. Same declaration shape as [`defined_entry_points`], then a
+/// paren-balanced walk to the end of the parameters.
 #[cfg(test)]
 pub(crate) fn entry_point_bindings(src: &str, entry: &str) -> Option<DeclaredBindings> {
     // Byte offset of the declaration line's start.
@@ -285,27 +218,9 @@ pub(crate) fn entry_point_bindings(src: &str, entry: &str) -> Option<DeclaredBin
 mod tests {
     use super::*;
 
-    /// THE ENTRY-POINT ROSTER GUARD.
-    ///
-    /// For every library: the set of entry points the MSL DEFINES must be
-    /// exactly the set THE PIPELINE TABLE asks for. Both directions are
-    /// checked, and both had a live defect:
-    ///
-    /// * **MSL missing what the renderer asks for.** `renderer.rs` requested
-    ///   `entry_point: Some("vs_fs")` twice; `bloom.metal` and `shimmer.metal`
-    ///   defined `vs_fs_bloom` / `vs_fs_shimmer` instead, and the roster listed
-    ///   the renamed pair — so the compile test agreed with the rename and
-    ///   could not see the drift. Resolved by renaming the MSL back to the
-    ///   WGSL's own name, because the port's contract is that the two are
-    ///   twins.
-    /// * **MSL defining what nobody asks for.** `fs_sdr_glow` looked dead to a
-    ///   grep for `entry_point: Some("…")`, because `renderer.rs` requests it
-    ///   INDIRECTLY — `build_glow_boost_pipeline` took the name as an argument.
-    ///   It is now `Pipeline::SdrGlow`'s `fs` and this test sees it, so the
-    ///   question a grep answered wrongly is answered structurally.
-    ///
-    /// This needs no GPU: it is a text scan against the table, so it runs on
-    /// every machine that compiles the crate.
+    /// For every library, the entry points the MSL defines equal exactly the set
+    /// the pipeline table requests, in both directions: nothing requested is
+    /// missing, and nothing defined is unrequested. A text scan; no GPU needed.
     #[test]
     fn the_msl_defines_exactly_the_entry_points_the_table_asks_for() {
         for (lib, src, mut want) in libraries() {
@@ -327,26 +242,14 @@ mod tests {
         }
     }
 
-    /// THE BINDING-MAP GUARD, both directions.
+    /// For every table row, the `[[buffer(n)]]` / `[[texture(n)]]` /
+    /// `[[sampler(n)]]` slots its MSL entry points declare equal the row's
+    /// [`BindSpec`] per stage. An untabled declaration fails naming its
+    /// file:line; a tabled but undeclared slot names the entry point's.
     ///
-    /// For every table row: the `[[buffer(n)]]` / `[[texture(n)]]` /
-    /// `[[sampler(n)]]` slots its MSL entry points DECLARE must be exactly the
-    /// slots the row's [`BindSpec`] TABLES, per stage. A declared-but-untabled
-    /// binding fails naming the declaration's file:line; a tabled-but-
-    /// undeclared binding fails naming the entry point's file:line. This is
-    /// the guard that retires the map's "per-row binding map MISSING from the
-    /// table" row (§2): the map was prose in `blit.rs`'s header and
-    /// `draw_and_read`'s doc, and prose cannot go red.
-    ///
-    /// Also pinned here, because the parameter list is where they show:
-    /// * a vertex stage may declare textures/samplers NEVER (no row uses
-    ///   them, and one appearing means the table needs a new column, not a
-    ///   silent pass);
-    /// * `[[stage_in]]` presence must equal `vertex != VertexLayout::None`
-    ///   (the instance stream rides the vertex descriptor at
-    ///   `INSTANCE_STREAM_SLOT`, so a vertex uniform tabled AT that slot is
-    ///   also refused);
-    /// * text scan only — no GPU, so it runs wherever the crate compiles.
+    /// Also: vertex stages declare no textures or samplers, and `[[stage_in]]`
+    /// is present iff `vertex != VertexLayout::None` (a vertex uniform at
+    /// `INSTANCE_STREAM_SLOT` is refused). Text scan only.
     #[test]
     fn the_msl_bindings_are_exactly_the_tables_bind_column() {
         use crate::pipeline_table::{ALL_PIPELINES, VertexLayout};
@@ -459,9 +362,8 @@ mod tests {
             scanned_any.2 += fs.textures.len();
             scanned_any.3 += fs.samplers.len();
         }
-        // POSITIVE CONTROL: a scan that stopped seeing attributes would agree
-        // with an empty table forever. The sweep above must have actually read
-        // stage_ins, buffers, textures and samplers somewhere.
+        // Positive control: the sweep must have read stage_ins, buffers,
+        // textures and samplers somewhere.
         assert!(
             scanned_any.0 > 0 && scanned_any.1 > 0 && scanned_any.2 > 0 && scanned_any.3 > 0,
             "the binding scan found {scanned_any:?} (stage_in/buffers/textures/\
@@ -469,13 +371,9 @@ mod tests {
         );
     }
 
-    /// THE SCAN'S OWN BOUNDARY, pinned so it cannot rot silently. The binding
-    /// scan compares SETS per kind, which a judge proved blind to a same-kind
-    /// slot SWAP — the write-mask lesson's shape — by constructing a synthetic
-    /// two-texture row. No shipping row can exercise that blindness today, and
-    /// THIS test is what keeps "today" honest: the moment any row tables two
-    /// bindings of one kind, this fails and the failure message says what the
-    /// scan must grow before the row may land.
+    /// The binding scan compares sets per kind, so it cannot see a same-kind
+    /// slot swap. No row has two bindings of one kind today; this fails the
+    /// moment one does, saying what the scan must learn first.
     #[test]
     fn no_row_tables_two_bindings_of_one_kind_until_the_scan_learns_pairing() {
         for p in crate::pipeline_table::ALL_PIPELINES {
@@ -487,12 +385,10 @@ mod tests {
             ] {
                 assert!(
                     slots.len() <= 1,
-                    "row `{}` tables {} {kind} slots. The MSL binding scan \
-                     compares SETS per kind and is PROVABLY BLIND to a \
-                     same-kind slot swap (judged, by construction, \
-                     2026-08-31). Before a multi-binding row lands, teach the \
-                     scan slot->meaning pairing (order or names), arm it with \
-                     a transposed pair, and then delete this pin.",
+                    "row `{}` tables {} {kind} slots; the MSL binding scan \
+                     compares sets per kind and cannot see a same-kind slot \
+                     swap. Teach it slot->meaning pairing (order or names), arm it with a \
+                     transposed pair, then delete this pin.",
                     p.name(),
                     slots.len()
                 );

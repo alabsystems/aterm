@@ -6,27 +6,13 @@
 
 use alloc::boxed::Box;
 
-/// The Hashtable trait used by the compression to store hashed bytes to their position.
-/// `val` can be maximum the size of the input in bytes.
-///
-/// `pos` can have a maximum value of u16::MAX or 65535
-/// If the hashtable is smaller it needs to reduce the pos to its space, e.g. by right
-/// shifting.
-///
-/// Duplication dictionary size.
-///
-/// Every four bytes is assigned an entry. When this number is lower, fewer entries exists, and
-/// thus collisions are more likely, hurting the compression ratio.
-///
-/// hashes and right shifts to a maximum value of 16bit, 65535
-/// The right shift is done in order to not exceed, the hashtables capacity
+/// Hashes 4 bytes to 16 bits, so a table smaller than 2^16 entries indexes it by right shift.
 #[inline]
 fn hash(sequence: u32) -> u32 {
     (sequence.wrapping_mul(2654435761_u32)) >> 16
 }
 
-/// hashes and right shifts to a maximum value of 16bit, 65535
-/// The right shift is done in order to not exceed, the hashtables capacity
+/// Hashes the low 5 bytes of `sequence` to 16 bits.
 #[cfg(target_pointer_width = "64")]
 #[inline]
 fn hash5(sequence: usize) -> u32 {
@@ -38,6 +24,7 @@ fn hash5(sequence: usize) -> u32 {
     (((sequence << 24).wrapping_mul(primebytes)) >> 48) as u32
 }
 
+/// Maps a 16-bit hash to the last input position that produced it.
 pub trait HashTable {
     fn get_at(&self, pos: usize) -> usize;
     fn put_at(&mut self, pos: usize, val: usize);
@@ -64,49 +51,30 @@ pub struct HashTable4KU16 {
 impl HashTable4KU16 {
     #[inline]
     pub fn new() -> Self {
-        // This generates more efficient assembly in contrast to Box::new(slice), because of an
-        // optimized call alloc_zeroed, vs. alloc + memset
-        // try_into is optimized away
-        //
-        // Allocate the boxed ARRAY directly. The `vec![0; N].into_boxed_slice()
-        // .try_into::<Box<[T; N]>>()` form the upstream used for codegen relies
-        // on the slice->array `try_into`, whose absent std body the native
-        // verifier cannot prove panic-free (fatal absent-callee). `Box::new`
-        // of a zeroed array is the SAME zeroed table (this was already the
-        // fallback arm), verifiable, and the compiler heap-zero-inits it.
+        // Boxed array directly, not upstream's `vec![..].into_boxed_slice()
+        // .try_into()`: that `try_into` is a std absent callee the verifier
+        // cannot prove panic-free.
         let dict = alloc::boxed::Box::new([0; HASHTABLE_SIZE_4K]);
         Self { dict }
     }
 }
 impl HashTable for HashTable4KU16 {
     #[inline]
-    // Skip: same audited Box-deref assert class as `put_at` below (the
-    // sep-lane alignment/null obligations on `self.dict`'s deref cannot see
-    // the constructor's infallible boxed-array allocation across the fn
-    // boundary). Non-null and align-2 by construction; droppable with
-    // `put_at`'s when cross-fn box facts land.
+    // Skip: the Box-deref null/alignment row, as `put_at` below.
     #[cfg_attr(trust_verify, trust::skip)]
     fn get_at(&self, hash: usize) -> usize {
-        // `hash` is < 2^16 by construction (`hash`/`hash5` right-shift to 16
-        // bits), so `hash >> 4 < 4096` on every real call; that invariant is
-        // invisible across the trait boundary. `% HASHTABLE_SIZE_4K` (a
-        // power of two — compiles to a mask) is identical when it holds.
+        // `hash < 2^16`, so `hash >> 4 < 4096`; the `%` (a mask) states that
+        // across the trait boundary.
         self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] as usize
     }
     #[inline]
-    // Skip: the one open is the MIR Box-deref null/alignment runtime assert on
-    // `self.dict`. The allocator-anchored discharge (`box_alloc_facts_for_addr`)
-    // cannot cross the fn boundary to the constructor, and trusting the Box
-    // TYPE LABEL is a documented false-prove vector (a transmute can forge it) —
-    // so the row is honestly undischargeable intra-fn today. Audited: every
-    // `dict` is built by this crate's own infallible boxed-array constructors
-    // (direct boxed-array alloc, 1047ada0) — non-null and align-2 by
-    // construction; no transmute exists in this crate. A hoisted-reborrow
-    // respelling was measured NET-NEGATIVE (adds a Misaligned assert row) and
-    // reverted per the ratchet discipline. Verify-only. Re-measured
-    // 2026-09-27 on seal 321aaeda7 with this skip removed: the row is still
-    // unknown. Needed from $HOME/trust, in a promoted seal: cross-fn Box
-    // allocation facts or validity-invariant modeling; then drop this.
+    // Skip: the MIR Box-deref null/alignment assert on `self.dict` needs
+    // allocation facts from the constructor, which the verifier cannot carry
+    // across functions (still unknown on seal 321aaeda7); trusting the Box
+    // type instead would let a transmute forge the facts. `dict` is non-null
+    // and aligned by construction; this crate has no transmute. A
+    // hoisted-reborrow respelling measured net-negative (it adds a Misaligned
+    // row). Drop the skip once the verifier has cross-function Box facts.
     #[cfg_attr(trust_verify, trust::skip)]
     fn put_at(&mut self, hash: usize, val: usize) {
         // Same `%` mask idiom as `get_at` above (identical on all real calls).
@@ -125,8 +93,7 @@ pub struct HashTable4K {
 impl HashTable4K {
     #[inline]
     pub fn new() -> Self {
-        // Direct boxed-array allocation; see `HashTable4KU16::new` (avoids the
-        // absent-callee slice->array `try_into`).
+        // See `HashTable4KU16::new`.
         let dict = alloc::boxed::Box::new([0; HASHTABLE_SIZE_4K]);
         Self { dict }
     }

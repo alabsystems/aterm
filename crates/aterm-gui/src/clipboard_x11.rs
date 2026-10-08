@@ -1,26 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A self-contained X11 clipboard (CLIPBOARD + PRIMARY) over the pure-Rust x11rb
-//! connection — NO external helper binary (`xclip`/`xsel`/`wl-copy`) and NO new
-//! external crate (x11rb is already in the build as a winit transitive dependency).
-//! On macOS the GUI talks to NSPasteboard in-process; this is the Linux/X11 twin so
-//! copy + paste actually WORK as a daily driver (the old code hard-coded
-//! `/usr/bin/pbcopy`, which does not exist on Linux, so every copy silently failed).
+//! A self-contained X11 clipboard (CLIPBOARD + PRIMARY) over the pure-Rust
+//! x11rb connection, with no helper binary (`xclip`/`xsel`) and no extra crate
+//! (x11rb is already a winit dependency). The Linux/X11 counterpart of the
+//! in-process NSPasteboard path on macOS.
 //!
-//! X11 has no "set the clipboard and forget" primitive: the copying client must OWN
-//! the selection and keep answering `SelectionRequest` conversions for as long as
-//! the data should stay pasteable. So one background thread owns a single X
-//! connection plus an unmapped 1×1 window, takes selection ownership on
-//! [`set`](X11Clipboard::set), and serves conversions from its event loop. A
-//! [`get`](X11Clipboard::get) returns our own stored text when we still own the
-//! selection (the common "copy here, paste here" case) or asks the current owner via
-//! `ConvertSelection` and waits briefly for the reply.
+//! X11 has no "set and forget" clipboard: the copying client must own the
+//! selection and answer `SelectionRequest` conversions for as long as the data
+//! should stay pasteable. One background thread owns an X connection and an
+//! unmapped 1×1 window, takes selection ownership on
+//! [`set`](X11Clipboard::set) and serves conversions from its event loop.
+//! [`get`](X11Clipboard::get) returns our stored text when we still own the
+//! selection, or asks the current owner via `ConvertSelection` and waits
+//! briefly for the reply.
 //!
-//! Scope: UTF-8 text, single-shot transfers (no INCR — a multi-megabyte clipboard
-//! payload is not served/read; ordinary terminal copy/paste is far below the X
-//! max-request size). Wayland-only sessions (no `$DISPLAY`) get a `None` from
-//! [`X11Clipboard::get_handle`] and the caller degrades gracefully.
+//! Scope: UTF-8 text. Serving is single-shot (no INCR), which covers ordinary
+//! terminal copies; pasting also accepts INCR transfers. Without `$DISPLAY`
+//! (pure Wayland) [`X11Clipboard::get_handle`] returns `None` and the caller
+//! degrades gracefully.
 
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Mutex, OnceLock};
@@ -67,9 +65,8 @@ struct Atoms {
     text_plain: Atom,
     /// The property on our own window that `ConvertSelection` deposits a paste into.
     recv: Atom,
-    /// The `INCR` atom: when a selection owner answers a large paste with a property
-    /// of THIS type, the data arrives in chunks via `PropertyNotify` instead of one
-    /// shot (the ICCCM INCR protocol). Interned so `read_paste` can detect it.
+    /// The `INCR` atom: an owner answering a large paste with a property of
+    /// this type streams the data in chunks via `PropertyNotify` (ICCCM INCR).
     incr: Atom,
 }
 
@@ -124,12 +121,10 @@ impl X11Clipboard {
 
     /// Connect as [`connect`](Self::connect), but intern `clipboard_name` for the
     /// CLIPBOARD-role selection and, when `primary_override` is `Some`, that name
-    /// for the PRIMARY-role selection instead of the real predefined `PRIMARY`.
-    /// Production uses `b"CLIPBOARD"` / `None`. Tests pass private, per-process
-    /// selection names so that an ambient clipboard manager on the real display
-    /// (e.g. GNOME's) never competes for the atoms under test — the wire protocol
-    /// exercised (`SetSelectionOwner`/`ConvertSelection`/`SelectionRequest`/
-    /// `SelectionNotify`) is identical; only the selection atom differs.
+    /// for the PRIMARY-role selection. Production passes `b"CLIPBOARD"` / `None`;
+    /// tests pass private per-process names so a clipboard manager on the real
+    /// display never competes for the atoms under test. The wire protocol is
+    /// identical.
     fn connect_with_selections(
         clipboard_name: &[u8],
         primary_override: Option<&[u8]>,
@@ -223,11 +218,9 @@ impl X11Clipboard {
     /// Read the current contents of `sel` as text, or `None` if empty / unavailable.
     /// Fast-pathed to our own stored text when we own the selection.
     ///
-    /// ICCCM target fallback: prefer `UTF8_STRING`, but a legacy owner (old
-    /// Motif/Tk, a non-UTF-8 xterm) may export only `TEXT`/`STRING`. Try them in
-    /// order — but ONLY advance to the next target on a fast NONE reply
-    /// (`Unsupported`); a `Timeout` means the owner is unresponsive, so we stop
-    /// immediately and never exceed the single ~1 s block callers already expect.
+    /// ICCCM target fallback: prefer `UTF8_STRING`, then `TEXT`/`STRING` for
+    /// legacy owners. Only a fast NONE reply (`Unsupported`) advances to the next
+    /// target; a `Timeout` stops, so callers never block more than ~1 s.
     pub(crate) fn get(&self, sel: Sel) -> Option<String> {
         let atom = self.sel_atom(sel);
         if let Some(t) = self.get_owned(sel) {
@@ -247,10 +240,9 @@ impl X11Clipboard {
         None
     }
 
-    /// The non-blocking fast-path of [`get`](Self::get): return the text we STORED
-    /// when we own `sel`, or `None` — never a `ConvertSelection` round-trip. Safe to
-    /// call on the UI thread; a foreign owner (no stored slot) yields `None` here and
-    /// must go through the blocking [`get`](Self::get) off-thread.
+    /// The non-blocking fast path of [`get`](Self::get): the text we stored when
+    /// we own `sel`, or `None`, never a `ConvertSelection` round-trip. Safe on the
+    /// UI thread; a foreign owner needs the blocking [`get`](Self::get) off-thread.
     pub(crate) fn get_owned(&self, sel: Sel) -> Option<String> {
         let atom = self.sel_atom(sel);
         self.inner
@@ -352,7 +344,7 @@ fn serve_request(inner: &Inner, req: &SelectionRequestEvent) {
                 .is_ok();
         } else if req.target == a.text {
             // TEXT is polymorphic (owner picks the encoding); we answer UTF-8 and
-            // LABEL the property UTF8_STRING so the requestor decodes it correctly.
+            // label the property UTF8_STRING so the requestor decodes it correctly.
             ok = inner
                 .conn
                 .change_property8(
@@ -364,9 +356,8 @@ fn serve_request(inner: &Inner, req: &SelectionRequestEvent) {
                 )
                 .is_ok();
         } else if req.target == Atom::from(AtomEnum::STRING) {
-            // ICCCM: STRING is ISO-8859-1 (Latin-1), NOT UTF-8. Transcode; a
-            // char outside Latin-1 becomes '?' rather than mojibake. (UTF8_STRING
-            // above is the lossless path every modern consumer prefers.)
+            // ICCCM: STRING is ISO-8859-1 (Latin-1), not UTF-8. Characters
+            // outside Latin-1 become '?'.
             let latin1: Vec<u8> = text
                 .chars()
                 .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
@@ -419,10 +410,9 @@ fn serve_request(inner: &Inner, req: &SelectionRequestEvent) {
     let _ = inner.conn.flush();
 }
 
-/// Read (and delete) the paste text the owner deposited on our `recv` property.
-/// Handles BOTH single-shot transfers and the ICCCM INCR protocol for large
-/// selections (multi-megabyte pastes from a browser/editor). `None` for an empty
-/// value or a failed/aborted transfer.
+/// Read (and delete) the paste text the owner deposited on our `recv` property,
+/// single-shot or via ICCCM INCR. `None` for an empty value or a failed or
+/// aborted transfer.
 fn read_paste(inner: &Inner, property: Atom) -> Option<String> {
     let reply = inner
         .conn
@@ -430,20 +420,18 @@ fn read_paste(inner: &Inner, property: Atom) -> Option<String> {
         .ok()?
         .reply()
         .ok()?;
-    // Large selection: the owner replied with a property of type INCR (whose value
-    // is a size HINT, not the data). Deleting it (the `delete=true` above) signals
-    // the owner to begin streaming; the real data arrives as PropertyNotify chunks.
+    // Large selection: an INCR-typed property holds a size hint, not the data.
+    // Deleting it (`delete=true` above) tells the owner to start streaming
+    // chunks via PropertyNotify.
     if reply.type_ == inner.atoms.incr {
         return read_incr(inner, property);
     }
     if reply.value.is_empty() {
         return None;
     }
-    // Decode by the property's ACTUAL type, per ICCCM: STRING is ISO-8859-1
-    // (Latin-1), UTF8_STRING / text/plain;charset=utf-8 are UTF-8. A legacy owner
-    // that answered our TEXT/STRING fallback with a STRING property must be decoded
-    // as Latin-1, or "café" would arrive as "cafÃ©". Latin-1 → Unicode is the
-    // identity on 0..=0xFF, so `b as char` is the exact transcode.
+    // Decode by the property's actual type, per ICCCM: STRING is Latin-1,
+    // UTF8_STRING and text/plain;charset=utf-8 are UTF-8. Latin-1 → Unicode is
+    // the identity on 0..=0xFF, so `b as char` is exact.
     if reply.type_ == Atom::from(AtomEnum::STRING) {
         Some(reply.value.iter().map(|&b| b as char).collect())
     } else {
@@ -451,21 +439,17 @@ fn read_paste(inner: &Inner, property: Atom) -> Option<String> {
     }
 }
 
-/// Drive one ICCCM INCR transfer: after our `delete=true` GetProperty kicked it
-/// off, the owner appends each chunk to `property` and fires `PropertyNotify`
-/// (state = NewValue); we read+delete each chunk to ack it, until a ZERO-length
-/// chunk marks the end. Runs on the serve thread, so it dispatches the few other
-/// events that can arrive meanwhile (a SelectionRequest for a selection WE own, a
-/// SelectionClear) rather than dropping them. Bounded by a deadline and a size cap
-/// so a slow/hostile owner can neither hang the thread nor exhaust memory.
+/// Drive one ICCCM INCR transfer: the owner appends each chunk to `property`
+/// and fires `PropertyNotify` (NewValue); we read and delete each chunk to ack
+/// it until a zero-length chunk ends the transfer. Runs on the serve thread, so
+/// it also dispatches SelectionRequest/SelectionClear events meanwhile. Bounded
+/// by a deadline and a size cap against slow or hostile owners.
 fn read_incr(inner: &Inner, property: Atom) -> Option<String> {
     const MAX_BYTES: usize = 64 * 1024 * 1024;
-    // Bounded just under the caller's 1000 ms `get` timeout: the serve thread sends
-    // the result back through that channel, so finishing earlier lets even a failed
-    // transfer report cleanly. Local INCR transfers (the realistic case) complete in
-    // well under this. The UI thread never waits on it: every GUI caller of a
-    // foreign-owner read runs on a paste worker (`paste_clipboard_into`,
-    // `paste_primary_into`, `search_paste_in`) that posts a `Wake` when done.
+    // Just under the caller's 1000 ms `get` timeout, so even a failed transfer
+    // reports back through the channel in time. The UI thread never waits on
+    // this: foreign-owner reads run on paste workers (`paste_clipboard_into`,
+    // `paste_primary_into`, `search_paste_in`) that post a `Wake` when done.
     let deadline = Instant::now() + Duration::from_millis(900);
     let mut buf: Vec<u8> = Vec::new();
     while Instant::now() < deadline {
@@ -497,7 +481,7 @@ fn read_incr(inner: &Inner, property: Atom) -> Option<String> {
                 }
                 buf.extend_from_slice(&chunk.value);
             }
-            // Stay responsive to our OWN selection during the transfer.
+            // Stay responsive to our own selection during the transfer.
             Event::SelectionRequest(req) => serve_request(inner, &req),
             Event::SelectionClear(clear) => {
                 if let Some(slot) = inner.slot(clear.selection) {
@@ -514,21 +498,16 @@ fn read_incr(inner: &Inner, property: Atom) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// End-to-end CROSS-CLIENT round-trip: two independent `X11Clipboard` handles
-    /// (each its own X connection + owner window) — `a` copies, then `b` pastes by
-    /// asking the server for the CLIPBOARD selection, which exercises the FULL X
-    /// `SetSelectionOwner` → `ConvertSelection` → `SelectionRequest`/`SelectionNotify`
-    /// protocol exactly as a real second app (a browser, another terminal) would.
-    /// Proves copy in aterm is pasteable elsewhere on this X11 box. Skipped (not
-    /// failed) when there is no X display to connect to.
+    /// Cross-client round trip: two independent `X11Clipboard` handles (each its
+    /// own connection and owner window); `a` copies and `b` pastes through the
+    /// full `SetSelectionOwner` → `ConvertSelection` → `SelectionRequest` /
+    /// `SelectionNotify` protocol, as another app would. Skipped without an X
+    /// display.
     #[test]
     fn cross_client_clipboard_round_trip() {
-        // Private, per-process selection names: a real clipboard manager on the
-        // display watches CLIPBOARD/PRIMARY and would race us for ownership,
-        // making this non-hermetic. Names no manager knows about isolate the test
-        // while exercising the identical selection protocol. Both handles share
-        // the same names so `b` can read what `a` owns; the pid keeps a stale
-        // owner from an earlier run of this test from colliding.
+        // Private per-process selection names keep a real clipboard manager from
+        // racing us for CLIPBOARD/PRIMARY; the protocol is identical. Both handles
+        // share the names so `b` reads what `a` owns.
         let clip_name = format!("ATERM_TEST_CLIPBOARD_{}", std::process::id());
         let prim_name = format!("ATERM_TEST_PRIMARY_{}", std::process::id());
         let connect = || {

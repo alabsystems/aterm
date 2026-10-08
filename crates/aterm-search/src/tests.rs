@@ -570,8 +570,6 @@ fn search_single_multibyte_char_repeated() {
 }
 
 /// Verify `index_scrollback_lines` batch method indexes all lines.
-///
-/// Previously a full coverage gap — no test, no Kani proof.
 #[test]
 fn terminal_search_index_scrollback_lines_batch() {
     let mut search = TerminalSearch::new();
@@ -588,8 +586,6 @@ fn terminal_search_index_scrollback_lines_batch() {
 }
 
 /// Verify `index_visible_content` indexes at correct base offset.
-///
-/// Previously a full coverage gap — no test, no Kani proof.
 #[test]
 fn terminal_search_index_visible_content() {
     let mut search = TerminalSearch::new();
@@ -1103,10 +1099,8 @@ fn regex_search_preserves_nonzero_matches_alongside_zero_length() {
     }
 }
 
-/// Performance proof: `search_before_line` returns candidates in strictly
-/// descending line order. This validates that the O(n) `.reverse()` on the
-/// already-sorted bitmap range output produces the correct reverse ordering
-/// (previously used O(n log n) `.sort_unstable_by(descending)` redundantly).
+/// `search_before_line` returns candidates in strictly descending line order
+/// (the O(n) `.reverse()` of the sorted bitmap range).
 #[test]
 fn search_before_line_descending_order_at_scale() {
     let mut index = SearchIndex::new();
@@ -1259,9 +1253,9 @@ fn case_insensitive_overlapping_matches() {
     assert_eq!(matches.len(), 4, "should find 4 overlapping matches");
 }
 
-/// A repeated first-byte prefix used to make the candidate-at-every-byte scanner
-/// verifier quadratic. Three-byte-and-longer literals now use `str::find`'s
-/// linear-time search over one reusable folded buffer instead.
+/// A repeated first-byte prefix must not make case-insensitive verification
+/// quadratic: literals of three bytes or more use a linear-time search over
+/// one reusable folded buffer.
 #[test]
 fn case_insensitive_repeated_prefix_uses_linear_matcher_path() {
     let mut index = SearchIndex::new();
@@ -1498,8 +1492,7 @@ fn terminal_search_option_navigation_is_ordered_and_case_insensitive() {
 /// Regex pattern exceeding `MAX_REGEX_PATTERN_LEN` is rejected before compilation.
 ///
 /// Prevents ReDoS via compilation by bounding pattern length at the index
-/// layer, matching the streaming engine's existing `max_pattern_len` guard.
-/// Part of #7203.
+/// layer, matching the streaming engine's `max_pattern_len` guard.
 #[test]
 fn regex_pattern_too_long_rejected() {
     let mut index = SearchIndex::new();
@@ -1984,7 +1977,7 @@ fn case_insensitive_search_uses_trigram_index() {
 }
 
 // Regression for the lowercased-trigram fast path: gating the lowered pass
-// behind `needs_lower` must keep insert/remove/rebuild symmetric. An
+// behind `lower_need` must keep insert/remove/rebuild symmetric. An
 // all-lowercase line skips the lowered pass entirely, while a mixed-case line
 // runs it; overwriting one with the other (which drives `remove_trigrams` on
 // the old text) must not leak or double-delete shared trigrams.

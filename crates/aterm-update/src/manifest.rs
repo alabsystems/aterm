@@ -15,16 +15,13 @@ use serde::{Deserialize, Serialize};
 /// best-effort directory sync — the shape `aterm_update_core::sentinel` already
 /// uses for the boot sentinel.
 ///
-/// WHY THESE TWO FILES NEED IT (2026-08-19 round-4 audit). The sentinel is the
-/// commit marker for a swap and is `F_FULLFSYNC`'d; `trial.toml` (the trialed
-/// artifact's identity) and `installed-receipt.toml` (the proof the installed
-/// bundle is the artifact a ticket authorized) were written with a plain
-/// `write` + `rename`. APFS commits the rename in a metadata transaction that a
-/// later fsync can force, while the file's DATA pages stay dirty for up to ~30 s —
-/// so a KERNEL panic or power loss in the trial window could leave the sentinel
-/// armed beside a ZERO-LENGTH trial marker. (A userspace panic cannot: `write` and
-/// `rename` are complete syscalls and the page cache is coherent for every later
-/// reader. The dangerous window is the one the hardware can interrupt.) Every launch then counts, fails
+/// WHY THESE TWO FILES NEED IT. The sentinel is the commit marker for a swap and is
+/// `F_FULLFSYNC`'d; `trial.toml` (the trialed artifact's identity) and
+/// `installed-receipt.toml` (the proof the installed bundle is the artifact a ticket
+/// authorized) must be as durable. With a plain `write` + `rename`, APFS can commit
+/// the rename while the file's DATA pages stay dirty for up to ~30 s, so a KERNEL
+/// panic or power loss in the trial window could leave the sentinel armed beside a
+/// ZERO-LENGTH trial marker. Every launch then counts, fails
 /// `ensure_current_trial_receipt` (no identity to prove), and on the third one the
 /// updater takes the "budget exhausted AND the rollback is unprovable" branch:
 /// it DISARMS instead of reverting, so a crash-looping build stays installed with
@@ -41,7 +38,7 @@ pub(crate) fn write_durable(path: &Path, text: &str, what: &str) -> Result<(), S
     let write = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(text.as_bytes())?;
-        match file.sync_all() {
+        match crate::durable::sync_all(&file) {
             Ok(()) => Ok(()),
             Err(e)
                 if matches!(
@@ -62,7 +59,7 @@ pub(crate) fn write_durable(path: &Path, text: &str, what: &str) -> Result<(), S
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("commit {what}: {error}"));
     }
-    let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+    let _ = crate::durable::sync_dir(parent);
     Ok(())
 }
 
@@ -88,7 +85,7 @@ pub struct Manifest {
     /// (== the bundle's sealed `CFBundleVersion`). The downgrade gate.
     pub build_number: u64,
     /// Full git commit hash of the source the release was built from.
-    /// Every ship-tool manifest carries it; clients used to drop it at parse.
+    /// Every ship-tool manifest carries it.
     /// Binds the build number to an exact source commit, so a staged (and later
     /// running) build is checkable against the repo. Absent ⇒ None (a hand-written
     /// or pre-field manifest).
@@ -207,8 +204,8 @@ pub struct Ready {
     /// durable revocation set ([`Floor::withdraws`]): the check that observes the
     /// revocation retires the stage, the publisher refuses it, and the apply lane's
     /// gate 4c refuses it at the next launch — once a check on this Mac has seen the
-    /// revoking roster. A revocation no check has observed yet is out of reach of a
-    /// lane that holds no roster (see gate 4c).
+    /// revoking roster. A revocation no check has observed yet is what
+    /// [`Self::roster_confirmed_at`] bounds.
     ///
     /// Absent ⇒ None: a marker written before these fields existed, or a release with
     /// no attribution at all (every pre-roster cut). `None` means UNKNOWN, never
@@ -218,7 +215,64 @@ pub struct Ready {
     /// See [`Self::machine_id`].
     #[serde(default)]
     pub roster_seq: Option<u64>,
+    /// RFC3339 UTC of the last time a check CONFIRMED this stage's authorization
+    /// against a freshly fetched machine roster: the check that staged it, then
+    /// every check that admits a roster and finds the stage still admitted by the
+    /// floor ([`crate::install::confirm_roster_authorization`]).
+    ///
+    /// THE TIME THE ROSTER WAS READ, NOT THE TIME OF THE WRITE. Each check stamps the
+    /// instant it began fetching the roster it judged by: the window is a bound on how long
+    /// ago a roster was last read, and a stage the check publishes after a slow download
+    /// (up to hours on a bad link) would otherwise add the whole download to it. A
+    /// revocation published after that read is one this stage was never judged against.
+    ///
+    /// WHY. A revocation reaches this Mac only through a check,
+    /// and the boot swap runs before any check can: a stage signed at 22:00 by a
+    /// machine revoked at 23:00 was swapped in by the next morning's launch, with the
+    /// revocation unread. So no lane swaps a stage confirmed longer than
+    /// [`ROSTER_FRESHNESS_SECS`] ago ([`Self::roster_authorization_stale`]): the swap
+    /// waits (a passing refusal) for the check that runs right after launch, which
+    /// re-reads the roster ([`Self::needs_roster_reconfirmation`]) and confirms the
+    /// stage or retires it. The residual is a revocation published inside that
+    /// window, which the swap cannot see without a network wait at launch.
+    ///
+    /// MIXED VERSIONS: additive and skipped while empty, so an older build reads and
+    /// swaps the marker exactly as before. A marker an older build staged has none,
+    /// and this build's lanes wait for one check to confirm it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_confirmed_at: Option<String>,
 }
+
+/// How long a stage's roster confirmation ([`Ready::roster_confirmed_at`]) stays good
+/// for a swap: a day. Inside it, a revocation published after the last confirming
+/// check is the residual (docs/RELEASE-KEYS.md); past it, the swap waits for a check.
+pub(crate) const ROSTER_FRESHNESS_SECS: u64 = 24 * 60 * 60;
+
+/// How old a confirmation may grow before the check re-reads the channel head's
+/// roster even though the head has not moved: an hour.
+///
+/// WHY AN HOUR, NOT HALF THE WINDOW. The window counts
+/// from the last confirmation, and a client confirms only while it runs, so the
+/// stamp a quit leaves behind is the one the next launch is judged by. Re-read at
+/// twelve hours, a session shorter than that never refreshed it: a stage confirmed
+/// at 08:00, the app quit at 19:00 and opened at 08:30 the next day met the wait
+/// (24.5 h), and where the boot swap is the install path (`auto_apply` off, an
+/// in-session lane held by editor work or latched, a headless instance) every
+/// weekend deferred it a day more. Re-read hourly, the stamp at a quit is at most
+/// this plus one check interval old, so only a gap of nearly a day (the app closed,
+/// a laptop asleep or offline) makes a launch wait. The cost is a few small GETs an
+/// hour, and only while a newer stage is waiting.
+pub(crate) const ROSTER_RECONFIRM_AFTER_SECS: u64 = 60 * 60;
+
+/// How far ahead of this Mac's clock a confirmation may sit and still count: a clock
+/// stepped back by more (an NTP correction, a hand-set date) leaves the age
+/// unknowable, which reads as stale — the next check stamps it again.
+const ROSTER_CONFIRMATION_SKEW_SECS: u64 = 60;
+
+/// The words every stale-confirmation refusal carries, so the check that confirms
+/// the stage can withdraw the refusal it answers from the ledger, and the window's
+/// apply lane can tell the wait from a failure (`crate::is_roster_confirmation_wait`).
+pub(crate) use crate::ROSTER_UNCONFIRMED_KEY;
 
 impl Ready {
     /// Read + parse the marker, or `None` if absent/unparseable. (Non-UTF-8 IS an
@@ -238,14 +292,11 @@ impl Ready {
     /// markers carry a full 40-hex source commit and 64-hex artifact digest.
     pub(crate) fn has_canonical_identity(&self) -> bool {
         self.build_number != 0
-            && self.commit.as_deref().is_some_and(|commit| {
-                let commit = commit.trim();
-                commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-            && {
-                let digest = self.dmg_sha256.trim();
-                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            }
+            && self
+                .commit
+                .as_deref()
+                .is_some_and(|commit| aterm_codec::hex::is_hex(commit.trim(), 40))
+            && aterm_codec::hex::is_hex(self.dmg_sha256.trim(), 64)
     }
 
     /// Whether this marker names a genuinely published local stage. A parseable
@@ -258,7 +309,7 @@ impl Ready {
     /// remains the apply-time authority; this local read is an early stale/corrupt
     /// rejection that does not spawn a helper process on status/check paths.
     ///
-    /// AND THE FLOOR STILL ADMITS IT (round seven, H1 findings 55 and 33): a build
+    /// AND THE FLOOR STILL ADMITS IT: a build
     /// the operator has since yanked, or one signed by a machine a roster has since
     /// revoked ([`Floor::withdraws`]), is no update either. The floor moves on
     /// OBSERVATION, before anything retires the stage, and every surface that read
@@ -283,7 +334,7 @@ impl Ready {
         {
             return false;
         }
-        // A QUARANTINED ARTIFACT IS NEVER AN UPDATE (round six, finding 15): a
+        // A QUARANTINED ARTIFACT IS NEVER AN UPDATE: a
         // stager that decided before a crash-loop revert — or an older build's,
         // which never asks — can publish it after the revert, and every reader
         // (the check's coverage, status, the apply gate, which retires it) must
@@ -304,6 +355,65 @@ impl Ready {
     /// not the floor still admits it.
     pub(crate) fn read_published_bundle(staging: &crate::paths::Staging) -> Option<Self> {
         Self::read(&staging.ready).filter(|ready| ready.is_published_bundle(staging))
+    }
+
+    /// Seconds since [`Self::roster_confirmed_at`] at `now`, or `None` when there is
+    /// no confirmation this clock can date: none recorded (an older build's marker),
+    /// a stamp that is not this module's RFC3339 shape, or one more than
+    /// [`ROSTER_CONFIRMATION_SKEW_SECS`] ahead of `now`.
+    pub(crate) fn roster_confirmation_age(&self, now: u64) -> Option<u64> {
+        let stamp = self.roster_confirmed_at.as_deref()?;
+        let confirmed = u64::try_from(aterm_types::rfc3339::parse_utc(stamp)?).ok()?;
+        if confirmed > now.saturating_add(ROSTER_CONFIRMATION_SKEW_SECS) {
+            return None;
+        }
+        Some(now.saturating_sub(confirmed))
+    }
+
+    /// Why no lane may swap this stage in at `now` — its roster authorization was
+    /// last confirmed [`ROSTER_FRESHNESS_SECS`] or more ago, or never on this Mac —
+    /// or `None` when it may. A PASSING refusal: a fact about how long ago a check
+    /// ran, never a verdict on the build, so nothing is retired, memoized or backed
+    /// off, and the check that confirms the stage ends it.
+    ///
+    /// `armed` is whether this build holds a roster tier at all
+    /// (`aterm_update_core::pins::roster_tier_armed`): with no paper master pinned
+    /// there is no roster to confirm against, and the gate is not asked.
+    pub(crate) fn roster_authorization_stale(&self, now: u64, armed: bool) -> Option<String> {
+        if !armed {
+            return None;
+        }
+        let build = self.build_number;
+        let since = match self.roster_confirmation_age(now) {
+            Some(age) if age < ROSTER_FRESHNESS_SECS => return None,
+            Some(_) => format!(
+                "since {}",
+                self.roster_confirmed_at.as_deref().unwrap_or("?")
+            ),
+            None if self.roster_confirmed_at.is_some() => {
+                format!(
+                    "since {} (a time ahead of this Mac's clock)",
+                    self.roster_confirmed_at.as_deref().unwrap_or("?")
+                )
+            }
+            None => "on this Mac".to_string(),
+        };
+        Some(crate::verify::mark_passing(format!(
+            "staged build {build} has not been {ROSTER_UNCONFIRMED_KEY} {since}, so a \
+             revocation of its signer could have been missed; it installs once the next \
+             update check confirms it"
+        )))
+    }
+
+    /// Whether a check should re-read the channel head's machine roster for this
+    /// stage even though the head has not moved: its confirmation is
+    /// [`ROSTER_RECONFIRM_AFTER_SECS`] old or more, or missing, on a build with a
+    /// roster tier. The steady state otherwise reads nothing but the pointer.
+    pub(crate) fn needs_roster_reconfirmation(&self, now: u64, armed: bool) -> bool {
+        armed
+            && self
+                .roster_confirmation_age(now)
+                .is_none_or(|age| age >= ROSTER_RECONFIRM_AFTER_SECS)
     }
 }
 
@@ -366,10 +476,8 @@ impl InstalledReceipt {
         let git_commit = git_commit.trim();
         let dmg_sha256 = dmg_sha256.trim();
         (build_number != 0
-            && git_commit.len() == 40
-            && git_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-            && dmg_sha256.len() == 64
-            && dmg_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            && aterm_codec::hex::is_hex(git_commit, 40)
+            && aterm_codec::hex::is_hex(dmg_sha256, 64))
         .then(|| Self {
             build_number,
             git_commit: git_commit.to_ascii_lowercase(),
@@ -435,7 +543,7 @@ impl InstalledReceipt {
 ///   refuses to stage a "latest available" that is below this (an attacker who
 ///   re-points the newest release at an older genuine build can't roll a client back).
 ///
-/// ONE THING LOWERS THEM: A REVOCATION (round seven, H1 findings 2 and 10). Both
+/// ONE THING LOWERS THEM: A REVOCATION. Both
 /// numbers come from manifests signed by a rostered MACHINE, and the roster exists for
 /// the day one of those machines is stolen. A thief who published a release with
 /// `build_number = min_build = 9_999_999_999` raised both floors on every client that
@@ -541,6 +649,44 @@ impl Floor {
             .unwrap_or_default()
     }
 
+    /// [`Self::read`] for the writer, which REPLACES what it reads: a present floor
+    /// this read could not get through (`EMFILE` on a large desk, `EIO`, a mode this
+    /// uid cannot open) is an error, never the all-zero default — starting from
+    /// defaults there would write `roster_seq`, `min_build` and the revocation set
+    /// away on a moment's failure. Only an absent file, or one that is not a floor at
+    /// all (the same answer on every read, so refusing would freeze the ratchet for
+    /// good), starts from the default, as [`Self::read`] does.
+    fn read_for_replace(path: &Path) -> Result<Self, String> {
+        let text = crate::read_ledger_text_checked(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        Ok(text
+            .and_then(|t| aterm_toml::from_str(&t).ok())
+            .unwrap_or_default())
+    }
+
+    /// [`Self::read`] for a GATE that admits a build — the publish, the swap's 4b/4c,
+    /// the pre-park refusals, the check's judging floor.
+    /// A present floor this read could not get through withdraws nothing it holds, so
+    /// reading it as the all-zero default would let a yanked build, or a revoked
+    /// machine's, through on that one read. It is a PASSING refusal instead
+    /// ([`crate::PASSING_REFUSAL_KEY`]): a fact about the moment, never a verdict on
+    /// the build, and the next attempt reads the floor again. An absent or non-floor
+    /// file still reads as the default, exactly as [`Self::read_for_replace`] keeps it.
+    ///
+    /// The words carry the remedy: a floor that STAYS unreadable —
+    /// root-owned after a `sudo` run, a broken ACL, a failing disk — refuses every
+    /// gate and every check, and `commit_observation` can never rewrite it, so the
+    /// check books it and the persistent notice repeats these words.
+    pub(crate) fn read_for_gate(path: &Path) -> Result<Self, String> {
+        Self::read_for_replace(path).map_err(|error| {
+            crate::verify::mark_passing(format!(
+                "aterm can't read its update records ({error}), so no update installs until \
+                 it can — if this lasts, make that file readable again (it should be yours) \
+                 or remove it"
+            ))
+        })
+    }
+
     /// Whether `machine` has been revoked by a roster this client admitted. An unnamed
     /// machine is never matched: "I cannot tell who signed this" is not evidence of
     /// withdrawal.
@@ -588,17 +734,14 @@ impl Floor {
     /// UNATTRIBUTED: nothing recorded here is lowered by a revocation. The check lane,
     /// which knows the signing machine, goes through [`Self::observe_and_write`].
     ///
-    /// Best-effort, but no longer SILENT. Every step here used to discard its error,
-    /// so a full disk, a read-only remount, or a floor file this uid cannot replace
-    /// froze `min_build`, `high_water` and `roster_seq` at their recorded values
-    /// indefinitely — a replayed pre-revocation roster generation and an operator-
-    /// yanked build are then re-accepted every single cycle — while `update status`
-    /// went on describing a perfectly healthy machine, so the one party who could fix
-    /// the disk was never told. `atpkg`'s sibling ratchet (`atpkg::sig`,
-    /// `Floor::write` / `read_floor`) makes exactly this call in the other direction
-    /// and documents why: report the failure, then carry on under the old value,
-    /// because refusing outright would let anyone who can wedge the file wedge the
-    /// updater. Same shape here.
+    /// Best-effort, but never SILENT: a full disk, a read-only remount, or a floor file
+    /// this uid cannot replace freezes `min_build`, `high_water` and `roster_seq`,
+    /// re-accepting a replayed roster or a yanked build every cycle, so the failure must
+    /// reach the party who can fix the disk. `atpkg`'s sibling ratchet (`atpkg::sig`,
+    /// `Floor::write` / `read_floor`) makes exactly this call in the other direction and
+    /// documents why: report the failure, then carry on under the old value, because
+    /// refusing outright would let anyone who can wedge the file wedge the updater. Same
+    /// shape here.
     #[cfg(test)]
     pub fn bump_and_write(
         path: &Path,
@@ -701,15 +844,15 @@ impl Floor {
     fn commit_observation(path: &Path, observation: &FloorObservation<'_>) -> Result<(), String> {
         let lock_path = path.with_extension("toml.lock");
         // `_lock`, never `_`: the guard must live until this function returns, since
-        // it covers the whole read/max/write transaction. BOUNDED (plan P2-1): the
-        // checker thread ratchets here after a stage, and a holder stopped mid-write
-        // parked it for good; a timeout is the bump's ordinary, reported failure.
+        // it covers the whole read/max/write transaction. BOUNDED: the checker
+        // thread ratchets here after a stage, and a holder stopped mid-write would
+        // park it for good; a timeout is the bump's ordinary, reported failure.
         let _lock = aterm_update_core::FileLock::acquire_within(
             &lock_path,
             crate::install::BACKGROUND_LOCK_WAIT,
         )
         .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
-        let cur = Self::read(path).canonical();
+        let cur = Self::read_for_replace(path)?.canonical();
         let next = Self::after(cur.clone(), observation);
         if next == cur {
             return Ok(());
@@ -738,17 +881,12 @@ impl Floor {
 ///
 /// # Why there is a retry budget and not a permanent memo
 ///
-/// This memo used to be permanent for a given `(build, sha256)`: once recorded,
-/// the only escapes were a NEWER build or a re-publish under a different digest.
-/// That is right for a genuinely corrupt artifact and WRONG for everything else,
-/// because staging fails for plenty of transient reasons that say nothing about
-/// the bytes — a full disk, a `codesign`/`spctl` invocation that lost a race with
-/// Gatekeeper's cache, a DMG mount refused under memory pressure, a machine put
-/// to sleep mid-extract. One such blip permanently pinned that machine to its
-/// current build with no user-visible cause and no recovery short of deleting
-/// updater state by hand.
+/// A permanent memo is right for a genuinely corrupt artifact and WRONG for
+/// everything else: staging fails for transient reasons that say nothing about the
+/// bytes — a full disk, a `codesign`/`spctl` race with Gatekeeper's cache, a DMG
+/// mount refused under memory pressure, a machine put to sleep mid-extract.
 ///
-/// So the memo now carries an attempt count and a `retry_after` deadline, and it
+/// So the memo carries an attempt count and a `retry_after` deadline, and it
 /// SUPPRESSES rather than FORBIDS: the same candidate is retried on a widening
 /// schedule ([`RETRY_BACKOFF_SECS`], capped at its last entry) instead of never.
 /// A corrupt artifact therefore costs one download per backoff period rather than
@@ -756,7 +894,7 @@ impl Floor {
 /// heals on its own.
 ///
 /// The crash-loop TRIAL marker (`Updates/trial.toml`) is a different use of this
-/// same type and deliberately keeps the old permanent semantics: poisoning an
+/// same type and deliberately keeps permanent semantics: poisoning an
 /// artifact that crashed on boot must be deterministic, so those paths call
 /// [`FailedMark::record`]/[`FailedMark::matches`] and never consult the deadline.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -782,26 +920,29 @@ pub struct FailedMark {
     /// MACHINE, and the only honest escapes are a newer build or a re-publish
     /// under a different digest, both of which change the memo's key.
     ///
-    /// It is a FIELD rather than a `retry_after` sentinel because the two states
-    /// are genuinely different and were previously conflated: the crash-loop path
-    /// wrote `retry_after = 0` meaning "forever", while [`Self::suppresses`] reads
-    /// `retry_after = 0` as "the deadline has passed, retry now" — which is also
-    /// exactly what a pre-budget legacy marker means. The poison was therefore
-    /// written and then ignored, and the crash-looping build was re-downloaded and
-    /// re-applied on the very next check. Absent ⇒ `false`, so a legacy marker
-    /// keeps its (safe) retryable reading.
+    /// It is a FIELD rather than a `retry_after` sentinel because
+    /// [`Self::suppresses`] reads `retry_after = 0` as "the deadline has passed,
+    /// retry now" — which is also what a pre-budget legacy marker means. Absent ⇒
+    /// `false`, so a legacy marker keeps its (safe) retryable reading.
     #[serde(default)]
     pub quarantined: bool,
     /// TRIAL markers only: the install root (`…/aterm.app`) the armed trial belongs
     /// to. The sentinel and this marker are per USER, while a build can sit at
     /// several paths at once (`~/Applications/aterm.app` beside
     /// `/Applications/aterm.app`, a duplicate copy of a release): a same-build
-    /// process launched from a DIFFERENT bundle used to count launches against, or
-    /// disarm, a trial it did not own — three sibling launches could revert and
-    /// poison a build that never crashed. Absent in markers written before this
+    /// process launched from a DIFFERENT bundle must not count launches against, or
+    /// disarm, a trial it does not own. Absent in markers written before this
     /// field existed ⇒ unbound (the historical behaviour, for one trial's lifetime).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_root: Option<String>,
+    /// The LATEST failure booked here was a MOMENT — staging could not FINISH (a helper
+    /// past its deadline, a lock a sibling held, a full disk), which says nothing
+    /// about the bytes — rather than a verdict on them. It picks the schedule the
+    /// deadline was set from ([`MOMENT_BACKOFF_SECS`]) and the words a backed-off
+    /// check says. Absent ⇒ `false`: an older build's memo is a verdict, and an older
+    /// reader ignores the field and reads the deadline alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moment: bool,
 }
 
 /// The widening retry schedule for a candidate that failed to stage, in seconds:
@@ -813,16 +954,48 @@ pub struct FailedMark {
 /// download a day, against the unbounded "never retry" this replaced.
 pub const RETRY_BACKOFF_SECS: [u64; 4] = [15 * 60, 60 * 60, 4 * 60 * 60, 24 * 60 * 60];
 
+/// The retry schedule for a candidate whose staging could not FINISH — a MOMENT, by the
+/// `n`-th consecutive failure of the artifact: nothing for the first, so the next check
+/// tries again (one moment is no reason to wait), then 15 min, 1 h, and 4 h for as long as
+/// the moment keeps coming back.
+///
+/// WHY A MOMENT IS THROTTLED AT ALL. Without it a staging step that times out EVERY time —
+/// a network that black-holes Gatekeeper, an `hdiutil attach` that always runs long —
+/// re-downloads the whole container (about 775 MB) at every check of every aterm process,
+/// about every 40 minutes, for as long as it lasted. The memo is shared by every aterm on
+/// the Mac, so this bounds the machine, not one process.
+///
+/// WHY NOT A VERDICT'S DAY. A moment is expected to pass — a disk gets freed, a
+/// network changes — and the cap is how long the SCHEDULE may wait after it has:
+/// four hours, at most six downloads a day while it lasts. A person need not wait
+/// at all: a check they ask for passes a moment's memo (`github::stage_backoff`),
+/// while a verdict's and a quarantine still hold against it.
+pub const MOMENT_BACKOFF_SECS: [u64; 4] = [0, 15 * 60, 60 * 60, 4 * 60 * 60];
+
 impl FailedMark {
     /// Read the memo, or `None` if absent/unparseable.
     /// A marker that parses to ALL DEFAULTS is not a marker: every field carries
     /// `#[serde(default)]`, so a zero-length file — a rename committed over data
     /// extents a kernel panic never wrote — deserialized into `build_number: 0` and
     /// answered "not this artifact" instead of failing closed, which would let a
-    /// just-quarantined build be re-downloaded and re-applied (2026-08-19 round-4
-    /// skeptics). Treated as ABSENT.
+    /// just-quarantined build be re-downloaded and re-applied. Treated as ABSENT.
     pub fn read(path: &Path) -> Option<Self> {
-        let parsed: Self = aterm_toml::from_str(&crate::read_ledger_text(path)?).ok()?;
+        Self::parse(&crate::read_ledger_text(path)?)
+    }
+
+    /// [`Self::read`] for a writer that REPLACES or removes what it reads: a present
+    /// memo this read could not get through (`EMFILE`, `EIO`, a mode this uid cannot
+    /// open) is an error, never "no memo" — this file may hold the only record of a
+    /// quarantine, and a writer that starts from nothing there writes it away on a
+    /// moment's failure. As [`Floor::read_for_replace`] keeps the floor.
+    fn read_for_replace(path: &Path) -> Result<Option<Self>, String> {
+        let text = crate::read_ledger_text_checked(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        Ok(text.and_then(|text| Self::parse(&text)))
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let parsed: Self = aterm_toml::from_str(text).ok()?;
         (parsed.build_number != 0 || !parsed.sha256.is_empty()).then_some(parsed)
     }
 
@@ -908,6 +1081,14 @@ impl FailedMark {
         RETRY_BACKOFF_SECS[idx]
     }
 
+    /// The backoff for the `n`-th consecutive failure (1-based) when it is a MOMENT,
+    /// saturating at the last entry of [`MOMENT_BACKOFF_SECS`].
+    #[must_use]
+    pub fn moment_backoff_secs(attempts: u32) -> u64 {
+        let idx = (attempts.max(1) as usize - 1).min(MOMENT_BACKOFF_SECS.len() - 1);
+        MOMENT_BACKOFF_SECS[idx]
+    }
+
     /// Record `(build_number, sha256)` as the IN-FLIGHT trial artifact, discarding the
     /// persistence error. TEST-ONLY: production arms the trial through
     /// [`Self::record_required`], because a trial marker that failed to persist must abort
@@ -917,8 +1098,7 @@ impl FailedMark {
     /// up after a swap can tell WHICH artifact it is trialing, and its readers use
     /// [`Self::matches`], never the deadline. The download/stage memo wants
     /// [`Self::record_stage_failure`]; the crash-loop verdict wants
-    /// [`Self::record_quarantine`] — which is what the one production caller this
-    /// convenience used to have was changed to, leaving it to the fixtures.
+    /// [`Self::record_quarantine`].
     #[cfg(test)]
     pub fn record(path: &Path, build_number: u64, sha256: &str) {
         let _ = Self::record_required(path, build_number, sha256, None);
@@ -928,19 +1108,13 @@ impl FailedMark {
     /// health `MAX_BOOT_ATTEMPTS` times, and was reverted. [`Self::suppresses`] then
     /// skips it forever — until the channel offers a different build or a re-publish
     /// under a different digest, either of which changes the key and so no longer
-    /// matches.
+    /// matches. (A zero `retry_after` cannot express this: `suppresses` reads it as
+    /// "already elapsed".)
     ///
-    /// This exists because [`Self::record`] could not express it. That path wrote
-    /// `retry_after = 0` intending "never retry", but `suppresses` reads a zero
-    /// deadline as "already elapsed" — so the memo was written and then ignored, and
-    /// the very next check re-downloaded and re-applied the build that had just
-    /// crash-looped, straight back into the crash/revert loop the poison existed to
-    /// break.
     /// DURABLE, like the trial identity it supersedes: this memo is the only thing
     /// standing between a build that just crash-looped and the next check
     /// re-downloading and re-applying it, and every other record that could
-    /// re-derive the verdict (trial, rollback, stage) is deleted moments later
-    /// (2026-08-19 round-4 skeptics).
+    /// re-derive the verdict (trial, rollback, stage) is deleted moments later.
     pub fn record_quarantine(path: &Path, build_number: u64, sha256: &str) {
         let m = Self::quarantine_mark(build_number, sha256);
         let Ok(text) = aterm_toml::to_string(&m) else {
@@ -982,6 +1156,7 @@ impl FailedMark {
             retry_after: 0,
             quarantined: true,
             install_root: None,
+            moment: false,
         }
     }
 
@@ -993,22 +1168,59 @@ impl FailedMark {
     /// `now` is unix seconds, threaded in rather than read here so the widening
     /// schedule is testable.
     pub fn record_stage_failure(path: &Path, build_number: u64, sha256: &str, now: u64) {
-        let prior = Self::read(path).unwrap_or_default();
-        let m = prior.stage_failure_mark(build_number, sha256, now);
+        Self::record_timed(path, build_number, sha256, now, false);
+    }
+
+    /// Record a staging MOMENT of `(build_number, sha256)` — a step that could not
+    /// finish, no verdict on the bytes — on the gentler schedule
+    /// ([`MOMENT_BACKOFF_SECS`]: the first one costs nothing), and answer the memo
+    /// written. Same persistence as [`Self::record_stage_failure`].
+    pub fn record_stage_moment(path: &Path, build_number: u64, sha256: &str, now: u64) -> Self {
+        Self::record_timed(path, build_number, sha256, now, true)
+    }
+
+    /// The one persisting body of both timed memos.
+    fn record_timed(path: &Path, build_number: u64, sha256: &str, now: u64, moment: bool) -> Self {
+        let prior = match Self::read_for_replace(path) {
+            Ok(prior) => prior.unwrap_or_default(),
+            Err(error) => {
+                // What this read could not see may be a quarantine: keep the file.
+                crate::warn(&format!(
+                    "did not write the backoff memo of build {build_number} over a memo this \
+                     could not read: {error}"
+                ));
+                return Self::default().stage_failure_mark(build_number, sha256, now, moment);
+            }
+        };
+        let m = prior.stage_failure_mark(build_number, sha256, now, moment);
+        // A TIMED MEMO NEVER ERASES A QUARANTINE: this file
+        // may hold the only record of one — an older build's revert wrote it alone
+        // ([`artifact_quarantined`]) — and a moment is the frequent, endlessly
+        // repeating event, so the crash-looping build it withdraws would be
+        // downloaded again. It moves to the quarantine ledger beside this file first
+        // (which no stage event touches); if that cannot be written, this memo is not.
+        if prior.is_quarantine() {
+            let ledger = path.with_file_name("quarantine.toml");
+            if let Err(error) = Quarantine::record(&ledger, prior.build_number, &prior.sha256) {
+                crate::warn(&format!(
+                    "kept the quarantine of build {} in place of a backoff memo: {error}",
+                    prior.build_number
+                ));
+                return m;
+            }
+        }
         let Ok(text) = aterm_toml::to_string(&m) else {
-            return;
+            return m;
         };
         // NOT durable, deliberately: losing a backoff memo costs one redundant
-        // download, never correctness. (Round 4 put the durable write HERE by a
-        // mis-anchored edit and left the quarantine — the record that actually has
-        // to survive a power loss — on the plain path, while the release note said
-        // otherwise. All four round-5 reviewers blocked on it.)
+        // download, never correctness.
         let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         } else {
             let _ = std::fs::remove_file(&tmp);
         }
+        m
     }
 
     /// The in-memory backoff memo [`Self::record_stage_failure`] persists,
@@ -1024,6 +1236,13 @@ impl FailedMark {
     /// persisting wrapper so the round trip is expressible over in-memory
     /// values; the persisted half rides the same regression tests as
     /// [`Self::quarantine_mark`].
+    ///
+    /// `moment` picks the schedule the deadline is set from — a verdict's
+    /// ([`RETRY_BACKOFF_SECS`]) or a moment's ([`MOMENT_BACKOFF_SECS`])
+    /// — and nothing else: both are the same TIMED memo, whose
+    /// contract with the reader is the one above, so the machine's
+    /// `RecordStageFailure` binds them both. A first moment's deadline is `now`
+    /// itself: it suppresses at no later probe.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -1033,17 +1252,29 @@ impl FailedMark {
         )
     )]
     #[must_use]
-    pub(crate) fn stage_failure_mark(&self, build_number: u64, sha256: &str, now: u64) -> Self {
+    pub(crate) fn stage_failure_mark(
+        &self,
+        build_number: u64,
+        sha256: &str,
+        now: u64,
+        moment: bool,
+    ) -> Self {
         let attempts = self.next_attempt(build_number, sha256);
+        let backoff = if moment {
+            Self::moment_backoff_secs(attempts)
+        } else {
+            Self::backoff_secs(attempts)
+        };
         FailedMark {
             build_number,
             sha256: sha256.to_ascii_lowercase(),
             attempts,
-            retry_after: now.saturating_add(Self::backoff_secs(attempts)),
+            retry_after: now.saturating_add(backoff),
             // A timed backoff, never a quarantine: this failure is about fetching or
             // staging the artifact, not about the artifact having proved itself bad.
             quarantined: false,
             install_root: None,
+            moment,
         }
     }
 
@@ -1064,6 +1295,7 @@ impl FailedMark {
             retry_after: 0,
             quarantined: false,
             install_root: install_root.map(|root| root.to_string_lossy().into_owned()),
+            moment: false,
         };
         let text = aterm_toml::to_string(&m)
             .map_err(|error| format!("serialize artifact marker: {error}"))?;
@@ -1078,18 +1310,20 @@ impl FailedMark {
     /// Clear the download/stage BACKOFF memo once a stage succeeds — and only that:
     /// a quarantine verdict in the same file (another artifact's, or one an older
     /// build wrote there alone) stays, because a success of one build says nothing
-    /// about a build that crash-looped (round six, finding 32).
+    /// about a build that crash-looped.
     pub fn clear_backoff(path: &Path) {
-        if Self::read(path).is_some_and(|mark| mark.is_quarantine()) {
-            return;
+        match Self::read_for_replace(path) {
+            Ok(Some(mark)) if mark.is_quarantine() => {}
+            Ok(_) => Self::clear(path),
+            // A memo this read could not get through may be a quarantine: it stays too.
+            Err(_) => {}
         }
-        Self::clear(path);
     }
 }
 
-/// THE CRASH-LOOP QUARANTINE, IN A LEDGER OF ITS OWN (`quarantine.toml`, round six,
-/// findings 15 and 32): every artifact that was swapped in, failed boot health
-/// `MAX_BOOT_ATTEMPTS` times and was reverted on this machine, as `build:sha256`.
+/// THE CRASH-LOOP QUARANTINE, IN A LEDGER OF ITS OWN (`quarantine.toml`): every artifact
+/// that was swapped in, failed boot health `MAX_BOOT_ATTEMPTS` times and was reverted on
+/// this machine, as `build:sha256`.
 ///
 /// WHY NOT [`FailedMark`] ALONE. The permanent verdict and the timed download
 /// backoff shared one record that holds ONE artifact: the next stage failure of any
@@ -1129,6 +1363,17 @@ impl Quarantine {
             .unwrap_or_default()
     }
 
+    /// [`Self::read`] for [`Self::record`], which REPLACES what it reads: a present
+    /// ledger this read could not get through is an error, never the empty ledger
+    /// that would write every verdict it holds away (as [`Floor::read_for_replace`]).
+    fn read_for_replace(path: &Path) -> Result<Self, String> {
+        let text = crate::read_ledger_text_checked(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        Ok(text
+            .and_then(|text| aterm_toml::from_str(&text).ok())
+            .unwrap_or_default())
+    }
+
     /// Whether `(build_number, sha256)` is quarantined here.
     #[must_use]
     pub fn holds(&self, build_number: u64, sha256: &str) -> bool {
@@ -1147,7 +1392,7 @@ impl Quarantine {
     /// is the only thing standing between a build that just crash-looped and the
     /// next check re-applying it.
     pub fn record(path: &Path, build_number: u64, sha256: &str) -> Result<(), String> {
-        let mut ledger = Self::read(path);
+        let mut ledger = Self::read_for_replace(path)?;
         if ledger.holds(build_number, sha256) {
             return Ok(());
         }
@@ -1238,6 +1483,67 @@ pub fn failed_mark_suppression_projection(
 mod tests {
     use super::*;
 
+    /// A TIMED MEMO NEVER ERASES A QUARANTINE: a
+    /// quarantine `failed.toml` alone held — an older build's revert — survives any
+    /// number of moments and stage failures of another artifact, carried into the
+    /// quarantine ledger, and the throttle still records its memo. NEGATIVE CONTROL:
+    /// over a plain backoff memo, nothing is carried.
+    #[test]
+    fn a_timed_memo_never_erases_a_quarantine() {
+        let staging = crate::paths::Staging::scratch("timed-keeps-quarantine");
+        let (x, y) = ("aa".repeat(32), "bb".repeat(32));
+        let failed = staging.failed();
+        FailedMark::record_quarantine(&failed, 7, &x);
+        assert!(
+            !Quarantine::read(&staging.quarantine()).holds(7, &x),
+            "PRECONDITION"
+        );
+        for at in 0..5 {
+            FailedMark::record_stage_moment(&failed, 8, &y, 1_000 + at);
+        }
+        FailedMark::record_stage_failure(&failed, 8, &y, 2_000);
+        assert!(artifact_quarantined(&staging, 7, &x), "still withdrawn");
+        assert!(
+            FailedMark::read(&failed).is_some_and(|m| m.matches(8, &y)),
+            "the new artifact's memo is recorded"
+        );
+
+        let fresh = crate::paths::Staging::scratch("timed-plain");
+        FailedMark::record_stage_failure(&fresh.failed(), 7, &x, 1_000);
+        FailedMark::record_stage_moment(&fresh.failed(), 8, &y, 2_000);
+        assert!(!artifact_quarantined(&fresh, 7, &x));
+    }
+
+    /// A READ THAT FAILS IS NOT AN ABSENT RECORD: with `failed.toml` holding build 7's
+    /// quarantine and the ledger build 9's, a mode this uid cannot open on either file
+    /// (the cheap stand-in for `EMFILE`/`EIO`) makes every writer keep it — neither a
+    /// timed memo, nor the ledger rewrite that carries 7 over, nor a clear writes a
+    /// verdict away the read never saw.
+    #[test]
+    fn a_record_the_writer_could_not_read_survives() {
+        use std::os::unix::fs::PermissionsExt;
+        let staging = crate::paths::Staging::scratch("unreadable-keeps-quarantine");
+        let (x, y, z) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        FailedMark::record_quarantine(&staging.failed(), 7, &x);
+        Quarantine::record(&staging.quarantine(), 9, &z).unwrap();
+        let mode = |path: &Path, bits| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits))
+        };
+        for locked in [staging.failed(), staging.quarantine()] {
+            mode(&locked, 0o000).unwrap();
+            if std::fs::File::open(&locked).is_ok() {
+                return; // root reads through any mode: nothing to stand in with
+            }
+            FailedMark::record_stage_moment(&staging.failed(), 8, &y, 1_000);
+            FailedMark::record_stage_failure(&staging.failed(), 8, &y, 2_000);
+            FailedMark::clear_backoff(&staging.failed());
+            let _ = mode(&locked, 0o600);
+            let at = locked.display();
+            assert!(artifact_quarantined(&staging, 7, &x), "{at}");
+            assert!(artifact_quarantined(&staging, 9, &z), "{at}");
+        }
+    }
+
     /// A zero-length marker — a rename committed over data extents a kernel panic
     /// never wrote — must read as ABSENT, not as an all-defaults memo that answers
     /// "not this artifact" and lets a just-quarantined build be re-applied.
@@ -1258,8 +1564,6 @@ mod tests {
         assert_eq!(read.build_number, 42);
         assert!(read.quarantined, "and keeps its verdict");
         // …and it went through the DURABLE writer, which leaves no temp behind.
-        // (Round 4 wired that call into the stage-backoff memo instead — a
-        // mis-anchored edit that all four round-5 reviewers caught.)
         let strays: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -1387,7 +1691,7 @@ mod tests {
     /// also exactly what the pre-budget legacy marker above means. The two states were
     /// indistinguishable, so the poison was written and then ignored, and the build that
     /// had just crash-looped was re-downloaded and re-applied on the next check.
-    /// A QUARANTINE OUTLIVES EVERY LATER STAGE EVENT (round six, finding 32). The
+    /// A QUARANTINE OUTLIVES EVERY LATER STAGE EVENT. The
     /// verdict and the timed backoff shared ONE record holding ONE artifact, so the
     /// next stage failure of any other build replaced it — and once that build was
     /// withdrawn and the channel named the quarantined build again, it was
@@ -1495,9 +1799,11 @@ mod tests {
     /// `V.suppresses(build, sha, now)` holds for EVERY `now` (all four
     /// timeline classes, including `u64::MAX`). Contract 2: after
     /// [`FailedMark::stage_failure_mark`] produces `V` with deadline `D`,
-    /// `V.suppresses(build, sha, now)` holds IFF `now < D`. The persisted half
-    /// of the round trip is covered by the torn-write/read-back regression
-    /// tests above.
+    /// `V.suppresses(build, sha, now)` holds IFF `now < D` — on BOTH schedules
+    /// that writer sets a deadline from: a verdict's, and a moment's,
+    /// whose first deadline is the booking's own `now` and whose
+    /// second is interior again. The persisted half of the round trip is
+    /// covered by the torn-write/read-back regression tests above.
     #[test]
     fn failed_mark_suppression_exhaustively_refines_the_model() {
         use std::collections::BTreeSet;
@@ -1535,15 +1841,29 @@ mod tests {
 
         // Writer 2: a first stage failure at NOW0 — deadline NOW0 + rung 1.
         const NOW0: u64 = 1_000;
-        let backoff = FailedMark::default().stage_failure_mark(BUILD, &sha, NOW0);
-        let deadline = NOW0 + RETRY_BACKOFF_SECS[0];
-        assert_eq!(backoff.retry_after, deadline);
+        let backoff = FailedMark::default().stage_failure_mark(BUILD, &sha, NOW0, false);
+        assert_eq!(backoff.retry_after, NOW0 + RETRY_BACKOFF_SECS[0]);
         assert_eq!(backoff.attempts, 1);
-        assert!(!backoff.quarantined);
+        assert!(!backoff.quarantined && !backoff.moment);
+        // The same writer on the MOMENT schedule: a first moment is due at once
+        // (deadline = its own now), the second waits rung 2.
+        let first_moment = FailedMark::default().stage_failure_mark(BUILD, &sha, NOW0, true);
+        assert_eq!(first_moment.retry_after, NOW0 + MOMENT_BACKOFF_SECS[0]);
+        assert_eq!(first_moment.retry_after, NOW0, "one moment costs nothing");
+        let second_moment = first_moment.stage_failure_mark(BUILD, &sha, NOW0, true);
+        assert_eq!(second_moment.retry_after, NOW0 + MOMENT_BACKOFF_SECS[1]);
+        assert_eq!(second_moment.attempts, 2);
+        assert!(second_moment.moment && !second_moment.quarantined);
 
         let mut projected_inputs = BTreeSet::new();
         let mut calls = 0usize;
-        for (mark, quarantine_writer) in [(&quarantine, true), (&backoff, false)] {
+        for (mark, quarantine_writer) in [
+            (&quarantine, true),
+            (&backoff, false),
+            (&first_moment, false),
+            (&second_moment, false),
+        ] {
+            let deadline = mark.retry_after;
             // One probe per timeline class; `timeline_class` is asserted below
             // to hit all four so the sweep cannot silently narrow.
             let probes = if quarantine_writer {
@@ -1626,7 +1946,7 @@ mod tests {
         }
 
         assert_eq!(
-            calls, 24,
+            calls, 48,
             "the concrete decision lattice must stay exhaustive"
         );
         assert_eq!(
@@ -1654,6 +1974,7 @@ mod tests {
             retry_after: 0,
             quarantined: false,
             install_root: None,
+            moment: false,
         };
         let suppressed = legacy_poison.suppresses(42, &"ab".repeat(32), 0);
         assert!(
@@ -1950,6 +2271,7 @@ changelog = '''
             changelog: Some("### Fixes\n- a thing".into()),
             machine_id: Some("m3".into()),
             roster_seq: Some(2),
+            roster_confirmed_at: Some(crate::install::now_rfc3339()),
         };
         let parsed: Ready = aterm_toml::from_str(&r.to_toml().unwrap()).unwrap();
         assert_eq!(parsed.build_number, 9);
@@ -1983,6 +2305,7 @@ changelog = '''
             changelog: None,
             machine_id: None,
             roster_seq: None,
+            roster_confirmed_at: Some(crate::install::now_rfc3339()),
         };
         std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
         assert!(
@@ -2100,8 +2423,12 @@ changelog = '''
 
     #[test]
     fn floor_ratchets_monotonically_and_reads_default() {
-        let p = std::env::temp_dir().join(format!("aterm-floor-{}.toml", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        // A dir of its own: the write leaves a `.lock` beside the file.
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-floor-")
+            .tempdir()
+            .unwrap();
+        let p = dir.path().join("floor.toml");
         // Absent ⇒ all-zero default (permissive).
         assert_eq!(Floor::read(&p).min_build, 0);
         assert_eq!(Floor::read(&p).high_water, 0);
@@ -2122,10 +2449,9 @@ changelog = '''
         assert_eq!((f.min_build, f.high_water), (9, 12));
         Floor::bump_and_write(&p, 0, 0, 7);
         assert_eq!(Floor::read(&p).roster_seq, 7);
-        let _ = std::fs::remove_file(&p);
     }
 
-    /// EVERY MIXED-VERSION PAIRING READS THE FLOOR AS BEFORE (round seven, H1). A
+    /// EVERY MIXED-VERSION PAIRING READS THE FLOOR AS BEFORE. A
     /// build that predates provenance reads a file this build wrote exactly as it
     /// reads its own; and a number this build finds with no provenance — the file an
     /// older build rewrote, dropping the fields it does not know — is unattributed:
@@ -2231,7 +2557,7 @@ changelog = '''
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // A DIRECTORY where the floor file belongs: the temp write succeeds and the
-        // rename over it cannot, which is exactly the arm that used to leak.
+        // rename over it cannot.
         let path = root.join("floor.toml");
         std::fs::create_dir(&path).unwrap();
         let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
@@ -2246,8 +2572,7 @@ changelog = '''
             !tmp.exists(),
             "the temp file must never outlive a failed commit"
         );
-        // Nor may ANY temp spelling: each failing cycle used to drop one more into the
-        // 0700 Updates root that nothing ever collects.
+        // Nor may ANY temp spelling: nothing collects strays in the 0700 Updates root.
         let leaked: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(Result::ok)
@@ -2269,6 +2594,57 @@ changelog = '''
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A FLOOR THE WRITE COULD NOT READ IS NEVER REPLACED. Folding an open/read
+    /// failure into "no floor" would let one `EMFILE` or `EIO` on a high-water bump
+    /// write `{high_water}` over the file — losing the replay floor, the yank floor and the
+    /// durable revocation set until the channel head moved. A mode this uid cannot
+    /// open stands in for the transient failure: the advance is refused and reported,
+    /// and the record on disk is the one it was. NEGATIVE CONTROL: the same
+    /// observation on a readable copy raises high-water and keeps the rest.
+    #[test]
+    fn a_floor_the_write_could_not_read_is_never_replaced_with_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-floor-unreadable-")
+            .tempdir()
+            .unwrap();
+        let recorded = "min_build = 500\nhigh_water = 600\nroster_seq = 10\n\
+                        revoked_machines = [\"m11\"]\n";
+        let observation = FloorObservation {
+            high_water: 700,
+            machine: Some("m3"),
+            ..FloorObservation::default()
+        };
+        let keeps_the_record = |floor: &Floor| {
+            floor.roster_seq == 10 && floor.min_build == 500 && floor.revokes(Some("m11"))
+        };
+
+        let path = dir.path().join("floor.toml");
+        std::fs::write(&path, recorded).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let outcome = Floor::observe_reporting(&path, &observation);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let floor = Floor::read(&path);
+        assert!(
+            keeps_the_record(&floor),
+            "an unreadable floor was replaced with defaults: {floor:?}"
+        );
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|e| e.contains("high_water 700")),
+            "the refused advance must be reported, naming what was not raised: {outcome:?}"
+        );
+
+        let ok_path = dir.path().join("ok.toml");
+        std::fs::write(&ok_path, recorded).unwrap();
+        assert_eq!(Floor::observe_reporting(&ok_path, &observation), Ok(()));
+        let floor = Floor::read(&ok_path);
+        assert!(keeps_the_record(&floor), "{floor:?}");
+        assert_eq!(floor.high_water, 700);
+    }
+
     #[test]
     fn failed_mark_matches_on_build_and_hash_only() {
         let p = std::env::temp_dir().join(format!("aterm-failed-{}.toml", std::process::id()));
@@ -2284,5 +2660,149 @@ changelog = '''
         );
         FailedMark::clear(&p);
         assert!(FailedMark::read(&p).is_none());
+    }
+
+    /// A stage marker at `confirmed` (unix seconds; `None` writes no confirmation).
+    fn confirmed_ready(confirmed: Option<u64>) -> Ready {
+        Ready {
+            build_number: 20,
+            version: "0.0.20".into(),
+            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            dmg_sha256: "ab".repeat(32),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: None,
+            machine_id: Some("m11".into()),
+            roster_seq: Some(9),
+            roster_confirmed_at: confirmed.map(aterm_types::rfc3339::format_rfc3339),
+        }
+    }
+
+    /// THE ROSTER CONFIRMATION'S AGE. A stage confirmed against
+    /// a freshly fetched roster less than a day ago may be swapped in; one confirmed
+    /// a day ago or more, never confirmed on this Mac, stamped in a shape this
+    /// module does not write, or stamped ahead of the clock waits — as a PASSING
+    /// refusal that names the roster and when it was last read. A build with no
+    /// roster tier is never held. The check re-reads an unchanged head's roster
+    /// once a confirmation is an hour old, so the stamp a quit leaves behind is
+    /// never more than about an hour old: only a gap of nearly a day in checks
+    /// makes a launch wait.
+    #[test]
+    fn a_stage_is_swapped_only_inside_a_day_of_its_roster_confirmation() {
+        let now = 1_790_000_000;
+        let day = ROSTER_FRESHNESS_SECS;
+        for (confirmed, stale) in [
+            (Some(now), false),
+            (Some(now - 3_600), false),
+            (Some(now - day + 1), false),
+            (Some(now + ROSTER_CONFIRMATION_SKEW_SECS), false),
+            (Some(now - day), true),
+            (Some(now - day - 3_600), true),
+            (Some(now + ROSTER_CONFIRMATION_SKEW_SECS + 1), true),
+            (None, true),
+        ] {
+            let ready = confirmed_ready(confirmed);
+            let refusal = ready.roster_authorization_stale(now, true);
+            assert_eq!(refusal.is_some(), stale, "{confirmed:?}: {refusal:?}");
+            if let Some(refusal) = refusal {
+                assert!(crate::is_passing_refusal(&refusal), "{refusal}");
+                assert!(
+                    crate::is_roster_confirmation_wait(&refusal),
+                    "the window's lane files it as the wait, not a failure: {refusal}"
+                );
+                assert!(
+                    refusal.contains(ROSTER_UNCONFIRMED_KEY) && refusal.contains("20"),
+                    "{refusal}"
+                );
+                if let Some(stamp) = ready.roster_confirmed_at.as_deref() {
+                    assert!(refusal.contains(stamp), "names when: {refusal}");
+                }
+            }
+            // No roster tier, no roster to confirm against: never held.
+            assert_eq!(ready.roster_authorization_stale(now, false), None);
+        }
+        let mut malformed = confirmed_ready(Some(now));
+        malformed.roster_confirmed_at = Some("2026-10-02 09:00:00".into());
+        assert!(malformed.roster_authorization_stale(now, true).is_some());
+        // CONTROLS: another passing moment is not the wait, and nor are the wait's
+        // words without the passing mark.
+        assert!(!crate::is_roster_confirmation_wait(
+            &crate::verify::mark_passing("could not take the apply lock within 10s".to_string())
+        ));
+        assert!(!crate::is_roster_confirmation_wait(ROSTER_UNCONFIRMED_KEY));
+
+        // The check's re-read: due from an hour on, or with no stamp.
+        let reread = ROSTER_RECONFIRM_AFTER_SECS;
+        assert!(!confirmed_ready(Some(now - reread + 1)).needs_roster_reconfirmation(now, true));
+        assert!(confirmed_ready(Some(now - reread)).needs_roster_reconfirmation(now, true));
+        assert!(confirmed_ready(None).needs_roster_reconfirmation(now, true));
+        assert!(!confirmed_ready(None).needs_roster_reconfirmation(now, false));
+        // The oldest stamp a running client leaves at a quit: one re-read's age plus
+        // the check that is due to read it (jittered). The evening's quit (19:00, the
+        // stamp at most this old) and the next morning's launch (08:30) are 13.5 h
+        // apart: inside the day, so the launch swaps.
+        let oldest_at_quit =
+            reread + crate::cadence::INTERVAL_SECS * (100 + crate::cadence::JITTER_PCT) / 100;
+        assert!(
+            oldest_at_quit <= 2 * 60 * 60,
+            "a running client's stamp is about an hour old at most: {oldest_at_quit} s"
+        );
+        let quit = now - 13 * 3_600 - 1_800;
+        assert_eq!(
+            confirmed_ready(Some(quit - oldest_at_quit)).roster_authorization_stale(now, true),
+            None,
+            "an overnight quit does not make the morning's launch wait"
+        );
+        assert!(
+            confirmed_ready(Some(now - day - 1))
+                .roster_authorization_stale(now, true)
+                .is_some(),
+            "a day with no check does"
+        );
+    }
+
+    /// MIXED VERSIONS (law L3): the confirmation is one additive key. v0.98.0's
+    /// marker (this shape, with no `deny_unknown_fields`) reads a marker that carries
+    /// it, and this build reads v0.98.0's marker as unconfirmed — which its lanes
+    /// answer by waiting for one check, never by refusing the build.
+    #[test]
+    fn the_roster_confirmation_is_one_additive_key_both_ways() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct ReadyV098 {
+            build_number: u64,
+            version: String,
+            #[serde(default)]
+            commit: Option<String>,
+            dmg_sha256: String,
+            team_id: String,
+            staged_at: String,
+            #[serde(default)]
+            changelog: Option<String>,
+            #[serde(default)]
+            machine_id: Option<String>,
+            #[serde(default)]
+            roster_seq: Option<u64>,
+        }
+        let confirmed = confirmed_ready(Some(1_790_000_000));
+        let text = confirmed.to_toml().unwrap();
+        assert!(text.contains("roster_confirmed_at"), "{text}");
+        let old: ReadyV098 = aterm_toml::from_str(&text).expect("v0.98.0 reads the new marker");
+        assert_eq!((old.build_number, old.roster_seq), (20, Some(9)));
+
+        let unconfirmed = confirmed_ready(None);
+        let text = unconfirmed.to_toml().unwrap();
+        assert!(
+            !text.contains("roster_confirmed_at"),
+            "skipped while empty: {text}"
+        );
+        let back: Ready = aterm_toml::from_str(&text).unwrap();
+        assert_eq!(back.roster_confirmed_at, None);
+        assert_eq!(
+            aterm_toml::from_str::<Ready>(&confirmed.to_toml().unwrap())
+                .unwrap()
+                .roster_confirmed_at,
+            confirmed.roster_confirmed_at
+        );
     }
 }

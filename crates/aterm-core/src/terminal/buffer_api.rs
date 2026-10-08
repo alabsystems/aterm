@@ -2,31 +2,27 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Buffer and scrollback API for [`Terminal`](super::Terminal).
-//!
-//! Scrollback buffer access, memory management, viewport scrolling,
-//! response buffer operations, and paste formatting.
-//! Extracted from `mod.rs` as part of #5524.
+//! Buffer and scrollback API for [`Terminal`](super::Terminal): scrollback
+//! access, memory management, viewport scrolling, the response buffer and
+//! paste formatting.
 
 use super::Terminal;
 
 /// Maximum paste size in bytes (16 MiB). Pastes exceeding this are truncated
-/// at a char boundary to prevent unbounded memory allocation (#7379).
+/// at a char boundary to prevent unbounded memory allocation.
 const MAX_PASTE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum UTF-8 prefix inspected synchronously by the GUI's cursor-gesture
 /// admission probe. Formatting still consumes the full bounded paste off the
 /// event thread; admission is deliberately conservative beyond this prefix.
 const PASTE_GESTURE_PROBE_BYTES: usize = 4 * 1024;
 /// Maximum UTF-8 body the delivered-insert pricer ([`Terminal::paste_insert_cells`])
-/// walks synchronously. A single-line body longer than this is wider than
-/// any row and wraps — its echo is never the same-row hop the insert licence
-/// describes — so it is reported as an unknown width instead of scanned.
+/// walks. A single-line body longer than this is wider than any row and wraps,
+/// so it is reported as an unknown width.
 const PASTE_INSERT_PRICE_BYTES: usize = PASTE_GESTURE_PROBE_BYTES;
 
-/// Return the prefix the paste formatter is permitted to inspect, ending on a
-/// UTF-8 boundary.  Keep the payload probe and formatter on this one boundary
-/// so text surviving only beyond the 16 MiB cap cannot arm an input gesture
-/// that no emitted byte can represent.
+/// The prefix the paste formatter may inspect, ending on a UTF-8 boundary. The
+/// payload probe and the formatter share it, so text beyond the 16 MiB cap
+/// cannot arm an input gesture no emitted byte represents.
 #[inline]
 fn bounded_paste_text(text: &str) -> &str {
     if text.len() <= MAX_PASTE_BYTES {
@@ -46,26 +42,24 @@ fn paste_char_allowed(c: char) -> bool {
     !(c.is_control() && c != '\t' && c != '\n' && c != '\r')
 }
 
-/// Whether one sanitizer-surviving character can advance/reposition a terminal
-/// cursor. Zero-width combining marks, variation selectors and joiners may
-/// legitimately egress as text, but cannot own a landing by themselves.
+/// Whether one sanitizer-surviving character can advance or reposition the
+/// cursor. Zero-width marks, variation selectors and joiners cannot land a
+/// cursor on their own.
 #[inline]
 fn paste_char_can_move(c: char) -> bool {
     paste_char_allowed(c) && (matches!(c, '\t' | '\n' | '\r') || aterm_grapheme::char_width(c) > 0)
 }
 
 impl Terminal {
-    /// Whether a paste contains at least one authored character that survives
-    /// the formatter's control-character sanitizer in a small bounded prefix.
+    /// Whether a paste contains an authored character that survives the
+    /// formatter's control-character sanitizer, within a bounded prefix.
     ///
-    /// This deliberately ignores bracketed-paste wrapper bytes: an empty pair
-    /// of wrappers carries protocol framing but cannot author a cursor landing,
-    /// so it must not license a cursor-trail gesture. The scan allocates
-    /// nothing, stops at the first ordinary character (the typical path), and
-    /// examines at most [`PASTE_GESTURE_PROBE_BYTES`] bytes so an adversarial
-    /// 16 MiB control-only clipboard cannot stall the UI thread. A payload
-    /// hidden behind a larger control-only prefix still egresses normally but
-    /// conservatively receives no trail licence.
+    /// Bracketed-paste wrapper bytes are ignored: framing alone cannot land a
+    /// cursor, so it must not license a cursor-trail gesture. The scan
+    /// allocates nothing, stops at the first ordinary character and examines at
+    /// most [`PASTE_GESTURE_PROBE_BYTES`], so a 16 MiB control-only clipboard
+    /// cannot stall the UI thread (a payload behind a longer control-only
+    /// prefix still pastes, just without a trail licence).
     #[must_use]
     pub fn paste_has_payload(text: &str) -> bool {
         let text = bounded_paste_text(text);
@@ -76,21 +70,16 @@ impl Terminal {
         text[..end].chars().any(paste_char_can_move)
     }
 
-    /// THE DELIVERED INSERT'S WIDTH (2026-09-10): how many cells a paste of
-    /// `text` advances the caret on its own row, priced from the SAME
-    /// sanitized body [`Self::format_paste_framed`] puts on the wire (the
-    /// control-character sanitizer, then the grapheme display width under
-    /// the terminal's ambiguous-width mode — the pricing a committed IME run
-    /// already gets in the GUI).
+    /// How many cells a paste of `text` advances the caret on its own row,
+    /// priced from the same sanitized body [`Self::format_paste_framed`] sends
+    /// (control-character sanitizer, then grapheme display width under the
+    /// terminal's ambiguous-width mode).
     ///
-    /// `Some(cells)` for a single-line body; `None` when the width is
-    /// UNKNOWABLE from the text alone — a TAB (the shell's tab stops), a
-    /// line break (the landing row), or a body longer than
-    /// [`PASTE_INSERT_PRICE_BYTES`] (it wraps, or an app collapses it into a
-    /// placeholder) — the host then licenses an unknown-width insert bounded
-    /// by the cursor engine's gesture cap. The scan is bounded by that byte
-    /// count BEFORE any character is looked at, so an adversarial 16 MiB
-    /// clipboard costs the UI thread one length compare.
+    /// `Some(cells)` for a single-line body; `None` when the width is unknowable
+    /// from the text: a TAB, a line break, or a body longer than
+    /// [`PASTE_INSERT_PRICE_BYTES`]. The host then licenses an unknown-width
+    /// insert bounded by the cursor engine's gesture cap. The length is checked
+    /// before any character is scanned.
     #[must_use]
     pub fn paste_insert_cells(text: &str, ambiguous_width_double: bool) -> Option<u16> {
         use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
@@ -108,9 +97,8 @@ impl Terminal {
                 body.push(c);
             }
         }
-        // A base-less run of combining marks / selectors / joiners advances
-        // nothing, even where the grapheme classifier groups them into an
-        // emoji-shaped cluster (the GUI's committed-text rule).
+        // A base-less run of combining marks, selectors or joiners advances
+        // nothing, even if grouped into an emoji-shaped cluster.
         if aterm_grapheme::str_width(&body) == 0 {
             return Some(0);
         }
@@ -136,22 +124,14 @@ impl Terminal {
         self.grid.scrollback()
     }
 
-    /// The tiered store that holds this terminal's HISTORY, whichever grid
-    /// slot it currently sits in — the twin of [`Self::main_grid`] for the
-    /// scrollback store.
+    /// The tiered store holding this terminal's history, whichever grid slot it
+    /// sits in: the scrollback twin of [`Self::main_grid`].
     ///
-    /// [`Self::scrollback`] reads the ACTIVE grid. That is the right answer
-    /// for a viewport, and the wrong one for anything that accounts for or
-    /// reclaims history: entering the alternate screen (`CSI ?1049h`,
-    /// `handler_dec.rs` `enter_alternate_screen_raw`) swaps a fresh
-    /// scrollback-0 alt grid into the active slot and parks the primary grid
-    /// — and with it the only tiered store — in `alt_grid`. On 2026-09-26 the
-    /// audit found every memory-pressure line the owner's live window (pids
-    /// 6874 and 79405) ever logged saying "trimmed scrollback across 0
-    /// session(s)" (53 of 53) while 3 of its 4 tabs ran Claude Code on the
-    /// alternate screen: the shed read this store through
-    /// [`Self::scrollback`], found `None`, and skipped the tab. Read the
-    /// history through this accessor instead.
+    /// [`Self::scrollback`] reads the active grid, which is right for a viewport
+    /// but wrong for accounting or reclaiming history: while the alternate
+    /// screen is up the primary grid and its tiered store are parked in
+    /// `alt_grid`. Memory-pressure shedding must read history through this
+    /// accessor.
     #[must_use]
     pub fn history_scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
         self.main_grid().scrollback()
@@ -169,19 +149,14 @@ impl Terminal {
     }
 
     /// Evict the history store down to `keep(budget)` bytes, then restore its
-    /// own `budget` so the tab can keep growing history — the
-    /// evict-hard-then-restore idiom of the GUI's memory-pressure shed and
-    /// aggregate-cap lane, which both route through here (2026-09-26).
+    /// own `budget` so the tab can keep growing history. Used by the GUI's
+    /// memory-pressure shed and aggregate-cap lane.
     ///
-    /// It acts on the store that HOLDS the history, including while the
-    /// alternate screen is up (see [`Self::history_scrollback`] for the
-    /// incident), and it reports what it measured before and after rather
-    /// than asserting that a store's existence meant bytes were freed —
-    /// those lanes used to count "sessions with a store" as "trimmed".
-    /// Enforcement errors from the budget setter are not surfaced: the hot
-    /// tier can refuse to evict the rows it is actively serving, and the
-    /// measured [`HistoryShed::freed`] is the honest account of what was
-    /// given back either way.
+    /// Acts on the store that holds the history, including while the alternate
+    /// screen is up (see [`Self::history_scrollback`]), and reports the bytes
+    /// measured before and after. Budget-setter errors are not surfaced: the hot
+    /// tier may refuse to evict rows it is serving, and
+    /// [`HistoryShed::freed`] reports what was actually given back.
     ///
     /// Returns `None` (and changes nothing) when no tiered store is attached.
     pub fn shed_history_scrollback(
@@ -191,9 +166,8 @@ impl Terminal {
         let store = self.history_grid_mut().scrollback_mut()?;
         let budget = store.memory_budget();
         let before = store.budgeted_memory_used();
-        // `set_memory_budget` applies to BOTH grid slots, so it reaches the
-        // parked primary while the alt screen is up; the alt grid itself has
-        // no tiered store, so the call is a no-op there.
+        // `set_memory_budget` applies to both grid slots, reaching the parked
+        // primary while alt is up; the alt grid has no tiered store.
         let _ = self.set_memory_budget(keep(budget));
         let _ = self.set_memory_budget(budget);
         let after = self.history_scrollback().map_or(
@@ -203,11 +177,8 @@ impl Terminal {
         Some(HistoryShed { before, after })
     }
 
-    /// Drain deferred scrollback rows into attached tiered storage for all grids.
-    ///
-    /// The grid keeps recently scrolled rows in a lazy buffer for write-path
-    /// efficiency. Diagnostics such as memory pressure need those rows promoted
-    /// first so their byte accounting and watermarks reflect the full history.
+    /// Drain deferred scrollback rows into attached tiered storage for all
+    /// grids, so byte accounting and watermarks reflect the full history.
     pub fn sync_scrollback_buffers(&mut self) {
         let _ = self.grid.scrollback_mut();
         if let Some(ref mut alt) = self.alt_grid {
@@ -241,23 +212,19 @@ impl Terminal {
 
     /// Set the retained scrollback line limit (`None` = unlimited).
     ///
-    /// Applied to the PRIMARY-content grid — the active grid, or the saved
-    /// primary while the alt screen is up — because scrollback belongs to
-    /// primary content: the alt buffer has none by xterm spec (its ring cap
-    /// is 0 and must stay 0). The limit is ONE TOTAL retention count (audit
-    /// E1): on tiered grids it caps ring + staged + store together (the store
-    /// takes the remainder after the ring's share); ring-only grids re-cap
-    /// the ring itself, evicting the oldest lines on shrink (see
+    /// Applied to the primary-content grid (the active grid, or the saved
+    /// primary while the alt screen is up): the alt buffer has no scrollback
+    /// and its ring cap stays 0. The limit is one total retention count: on
+    /// tiered grids it caps ring + staged + store together; ring-only grids
+    /// re-cap the ring, evicting the oldest lines on shrink (see
     /// [`Grid::set_scrollback_line_limit`]).
     ///
     /// [`Grid::set_scrollback_line_limit`]: crate::grid::Grid::set_scrollback_line_limit
     ///
-    /// SELECTION CUSTODY — `SelectionCustody`'s `Evict`. Shrinking the limit drops the
-    /// oldest retained lines with NO content scroll and NO damage band, so nothing else
-    /// re-floors the selection: this is the entry point `adjust_for_scroll` cannot serve
-    /// (`Terminal::post_process` carries the same action for the batch-epilogue re-floor).
-    /// The spec law is that partial eviction CLAMPS the head and RECORDS the loss, and only
-    /// a selection whose whole interval fell off the back is destroyed — driven for real in
+    /// This is `SelectionCustody`'s `Evict`: shrinking drops the oldest lines
+    /// with no content scroll and no damage band, so the selection is re-floored
+    /// here. Partial eviction clamps the head and records the loss; only a
+    /// selection whose whole interval fell off is destroyed. Driven by
     /// `aterm_gui::selection_custody_conformance`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
@@ -277,19 +244,14 @@ impl Terminal {
             grid.set_scrollback_line_limit(limit);
             grid.clamp_display_offset();
         }
-        // Keep the ACTIVE grid's offset valid too (it IS the primary when the
+        // Keep the active grid's offset valid too (it is the primary when the
         // alt screen is down; a no-op re-clamp otherwise).
         self.grid.clamp_display_offset();
-        // SELECTION CUSTODY Phase 4: shrinking the limit EVICTS the oldest lines with
-        // no scroll and no damage band, so nothing else re-floors the selection —
-        // this is the entry point `adjust_for_scroll` cannot serve.
-        //
-        // Only off the alt screen. While alt is up the eviction above hit
-        // `self.alt_grid`, which holds the SAVED PRIMARY, whereas `text_selection`
-        // addresses `self.grid` — the alt buffer. Those are unrelated coordinate
-        // spaces: re-flooring here would clamp the live selection against a floor that
-        // does not describe its grid. The saved primary's own selection is re-floored
-        // when it is restored.
+        // Shrinking evicts the oldest lines with no scroll or damage band, so
+        // re-floor the selection here. Only off the alt screen: there the
+        // eviction hit the saved primary in `alt_grid`, while `text_selection`
+        // addresses the alt buffer; the primary's selection is re-floored when
+        // it is restored.
         if !self.modes.alternate_screen {
             let live_top_abs = self
                 .grid
@@ -309,10 +271,9 @@ impl Terminal {
     }
 
     /// Highest scrollback watermark pressure across the main and alternate
-    /// grids — the tiered stores' budget watermarks, plus the advisory RING
-    /// byte watermark (audit E10a) when one is configured via
-    /// `set_ring_byte_watermark`, so a
-    /// ring-only "unlimited" terminal still reports memory pressure.
+    /// grids: the tiered stores' budget watermarks plus the advisory ring byte
+    /// watermark (`set_ring_byte_watermark`), so a ring-only unlimited terminal
+    /// still reports pressure.
     #[must_use]
     pub fn scrollback_pressure_level(&self) -> crate::scrollback::WatermarkLevel {
         let mut level = self.grid.scrollback().map_or(
@@ -328,26 +289,25 @@ impl Terminal {
         level
     }
 
-    /// Set the advisory RING byte watermark budget on the primary-content
-    /// grid (audit E10a): with no tiered store and no line limit, retention
-    /// is otherwise unbounded and silent — a configured budget makes
+    /// Set the advisory ring byte watermark on the primary-content grid: with
+    /// no tiered store and no line limit, it makes
     /// [`scrollback_pressure_level`](Self::scrollback_pressure_level) report
-    /// Yellow/Red as ring memory approaches it. Advisory only (no eviction).
-    /// `None` (default) disables it.
+    /// Yellow/Red as ring memory approaches it. Advisory only (no eviction);
+    /// `None` disables it.
     #[cfg(test)]
     pub fn set_ring_byte_watermark(&mut self, budget: Option<usize>) {
         self.grid.set_ring_byte_watermark(budget);
     }
 
-    /// Monotonic count of history lines LOST to non-user-requested truncation
+    /// Monotonic count of history lines lost to non-user-requested truncation
     /// across the main and alternate grids: flood-backpressure staged-line
-    /// drops, detached-reflow-window cap drops, and memory-pressure store
-    /// evictions. The OUT-OF-BAND truncation signal, for hosts to surface in
-    /// their own chrome (`metrics`, `lines`). The grid's flood drops are ALSO
-    /// marked in band — one dim `— aterm dropped N lines here …` row stands at
-    /// each cut, naming the lines missing there that the configured limit
-    /// would still hold — so a reader scrolling past the hole is told about it
-    /// too; see [`Grid::truncated_lines`](aterm_grid::Grid::truncated_lines).
+    /// drops, detached-reflow-window cap drops and memory-pressure store
+    /// evictions. Hosts surface it (`metrics`, `lines`). Flood drops are also
+    /// marked in band with a dim `— aterm dropped N lines here …` row at each
+    /// cut; see [`Grid::truncated_lines`](aterm_grid::Grid::truncated_lines).
+    /// It also counts the lines of a quarantined (undecodable) store block,
+    /// which stay in the scrollback line count as blank rows when older
+    /// history sits before them, so the two can overlap.
     #[must_use]
     pub fn scrollback_truncated_lines(&self) -> u64 {
         let mut total = self.grid.truncated_lines();
@@ -357,20 +317,15 @@ impl Terminal {
         total
     }
 
-    /// Monotonic count of history rows that crossed the IMAGE RETENTION
-    /// HORIZON across the main and alternate grids: rows that kept their text
-    /// and lost their inline picture when the tiered store compressed them.
-    /// Counted separately from
-    /// [`scrollback_truncated_lines`](Self::scrollback_truncated_lines)
-    /// because no LINE was lost — the same out-of-band discipline (audit E10a),
-    /// a different quantity.
+    /// Monotonic count of history rows that crossed the image retention horizon
+    /// across the main and alternate grids: rows that kept their text but lost
+    /// their inline picture when the tiered store compressed them. Separate from
+    /// [`scrollback_truncated_lines`](Self::scrollback_truncated_lines) because
+    /// no line was lost.
     ///
-    /// An inline image is retained for exactly as long as its line is held
-    /// uncompressed. Past that boundary the row is the empty row it always was
-    /// underneath the picture, so a footprint ages out of history one row at a
-    /// time from its top — the same direction as the history above it. Hosts
-    /// poll this to say so in their own chrome; nothing is ever written into
-    /// the user's content to mark it.
+    /// An inline image is kept only while its lines are held uncompressed, so a
+    /// footprint ages out one row at a time from its top. Hosts poll this; the
+    /// user's content is never marked.
     #[must_use]
     pub fn scrollback_image_rows_dropped(&self) -> u64 {
         let mut total = self.grid.image_rows_dropped_by_compression();
@@ -380,36 +335,26 @@ impl Terminal {
         total
     }
 
-    /// Clear all scrollback history (main and alt grids).
+    /// Clear all scrollback history (main and alt grids): the ring buffer and
+    /// every tier of the tiered store. Visible rows are kept; the text selection
+    /// is cleared, since its anchors would dangle.
     ///
-    /// Resets both the ring buffer scrollback (`total_lines`, `ring_head`)
-    /// and all tiers (hot, warm, cold) of the tiered scrollback.
-    /// Preserves live visible rows. Clears any active text selection
-    /// since scrollback-anchored selection coordinates become dangling.
-    ///
-    /// SELECTION CUSTODY — this performs the same destruction as
-    /// `SelectionCustody`'s `WholesaleInvalidate`, but it is deliberately NOT the
-    /// anchor for it. Nothing inside the engine calls this: it is a host-facing API,
-    /// and the three producers the model actually names (ED 3, RIS, a Kitty unscroll)
-    /// all reach the selection through `post_process`'s `SelectionDamage::All` arm
-    /// instead. Anchoring here would bind the action to a seam no VT path can drive,
-    /// which reads like coverage and proves nothing. The anchor lives on
-    /// [`Terminal::post_process`]; Tier-1 drives it there with real ED 3 bytes.
+    /// This destroys like `SelectionCustody`'s `WholesaleInvalidate` but is not
+    /// its anchor: it is host-facing, and the VT producers (ED 3, RIS, Kitty
+    /// unscroll) reach the selection through `post_process`'s
+    /// `SelectionDamage::All` arm, where the anchor lives
+    /// ([`Terminal::post_process`]).
     pub fn clear_scrollback(&mut self) {
         self.grid.erase_scrollback();
         if let Some(ref mut alt) = self.alt_grid {
             alt.erase_scrollback();
         }
         self.text_selection.clear();
-        // `erase_scrollback` above ran on BOTH grids, so the parked selection's
-        // anchors dangle in exactly the same way. The parked grid's own `All` damage
-        // would also reach the drain on the exit batch, but a selection that is
-        // already known to be dangling should not stay alive until then, and a later
-        // narrowing of that damage must not silently resurrect it.
+        // `erase_scrollback` ran on both grids, so the parked selection dangles
+        // too; clear it now rather than waiting for the exit batch's damage.
         self.parked_text_selection.clear();
-        // Clear shell integration marks and marks state that contain absolute
-        // row numbers — these become dangling references after scrollback is
-        // erased (#7667).
+        // Shell integration marks hold absolute row numbers that dangle once
+        // scrollback is erased.
         self.shell.command_marks.clear();
         self.shell.output_blocks.clear();
         self.shell.current_block = None;
@@ -420,25 +365,19 @@ impl Terminal {
 
     /// Scroll display by delta lines.
     ///
-    /// PRESS CUSTODY: this is one of the three entry points that can RAISE
-    /// `display_offset`, so it samples the offset around the move and records
-    /// [`crate::terminal::CustodyTransition::UserScroll`] on a rise and `SnapToLive`
-    /// / `UserScrollTowardLive` on a fall (`Terminal::note_scroll_custody`).
-    /// Recording here rather than at the GUI seams is what makes the
-    /// wheel — which reaches this function directly from `input_wheel`'s instant arm
-    /// and from its glide tick, and used to record nothing at all — impossible to
-    /// bypass.
+    /// Press custody: one of the entry points that can raise `display_offset`,
+    /// so it records [`crate::terminal::CustodyTransition::UserScroll`] on a
+    /// rise and `SnapToLive` / `UserScrollTowardLive` on a fall
+    /// (`Terminal::note_scroll_custody`). Recording here covers every caller,
+    /// including the wheel's instant and glide paths.
     pub fn scroll_display(&mut self, delta: i32) {
         let before = self.grid.display_offset();
         self.grid.scroll_display(delta);
         self.note_scroll_custody(before);
     }
 
-    /// Scroll to top of scrollback.
-    ///
-    /// PRESS CUSTODY: records `UserScroll` on a rise — see [`Self::scroll_display`].
-    /// A terminal already at the top of its history records nothing, because nothing
-    /// moved.
+    /// Scroll to top of scrollback. Records `UserScroll` on a rise (see
+    /// [`Self::scroll_display`]); nothing when already at the top.
     pub fn scroll_to_top(&mut self) {
         let before = self.grid.display_offset();
         self.grid.scroll_to_top();
@@ -447,22 +386,18 @@ impl Terminal {
 
     /// Scroll to bottom (live content).
     ///
-    /// PRESS CUSTODY: deliberately NOT a recording site. `apply_press_custody`'s
-    /// typing snap runs through here and records its own `TypingPress`, which a
-    /// `SnapToLive` must not overwrite. A NON-typing return to live — End /
-    /// `ScrollToBottom`, the ⌘-V and IME snaps — is [`Self::return_to_live`].
+    /// Not a custody recording site: the typing snap runs through here and
+    /// records its own `TypingPress`. A non-typing return to live (End,
+    /// `ScrollToBottom`, the paste and IME snaps) is [`Self::return_to_live`].
     pub fn scroll_to_bottom(&mut self) {
         self.grid.scroll_to_bottom();
     }
 
-    /// Scroll to bottom as a USER gesture that is not typing — End /
-    /// `ScrollToBottom`, the ⌘-V and IME snaps, the find bar's restore to a live
-    /// view — recording [`crate::terminal::CustodyTransition::SnapToLive`] when the
-    /// view actually moved. The highlight is left alone.
-    ///
-    /// One already at live records nothing, but it is still the person saying
-    /// where they want to be, so it counts as a reader gesture
-    /// ([`Self::reader_gesture_count`]).
+    /// Scroll to bottom as a non-typing user gesture (End, `ScrollToBottom`,
+    /// the paste and IME snaps, the find bar's restore), recording
+    /// [`crate::terminal::CustodyTransition::SnapToLive`] when the view moved.
+    /// The highlight is left alone. Already at live it records nothing but
+    /// still counts as a reader gesture ([`Self::reader_gesture_count`]).
     pub fn return_to_live(&mut self) {
         let before = self.grid.display_offset();
         self.grid.scroll_to_bottom();
@@ -472,31 +407,19 @@ impl Terminal {
         self.note_scroll_custody(before);
     }
 
-    /// Scroll the viewport so `target_abs_row` (an absolute row number, e.g. a
-    /// command mark's `prompt_start_row`) sits at the top visible line, clamped
-    /// to the retained history — the primitive behind prompt-to-prompt navigation.
-    ///
-    /// PRESS CUSTODY: records `UserScroll` on a rise and `SnapToLive` /
-    /// `UserScrollTowardLive` on a fall (a search hit below the current view, the
-    /// find bar's ⎋ restore landing lower than the current position) — see
-    /// [`Self::scroll_display`].
+    /// Scroll the viewport so `target_abs_row` (an absolute row, e.g. a command
+    /// mark's `prompt_start_row`) sits at the top line, clamped to retained
+    /// history: the primitive behind prompt-to-prompt navigation. Records
+    /// custody like [`Self::scroll_display`].
     pub fn scroll_to_absolute_row(&mut self, target_abs_row: u64) {
         let before = self.grid.display_offset();
         self.grid.scroll_to_absolute_row(target_abs_row);
         self.note_scroll_custody(before);
     }
 
-    /// Take pending response data.
-    ///
-    /// Returns any data accumulated in the response buffer (from DSR/DA
-    /// responses) and clears the buffer. The returned data should be
-    /// written to the PTY.
-    ///
-    /// Uses `clone()+clear()` instead of `mem::take()` to preserve the
-    /// internal buffer's heap allocation. Subsequent `process()` calls
-    /// reuse the existing capacity instead of re-allocating (#4073).
-    ///
-    /// Returns `None` if the response buffer is empty.
+    /// Take pending response data (DSR/DA replies) for the PTY and clear the
+    /// buffer; `None` if empty. Clones and clears rather than `mem::take` so the
+    /// buffer keeps its allocation.
     #[must_use]
     pub fn take_response(&mut self) -> Option<Vec<u8>> {
         if self.transient.response_buffer.is_empty() {
@@ -508,7 +431,7 @@ impl Terminal {
         }
     }
 
-    /// Expose response buffer capacity for test assertions (#4544).
+    /// Expose response buffer capacity for test assertions.
     #[cfg(test)]
     #[must_use]
     pub fn response_buffer_capacity(&self) -> usize {
@@ -540,13 +463,9 @@ impl Terminal {
 
     /// Format text for pasting into the terminal.
     ///
-    /// Strips terminal control bytes that can inject commands, converts line
-    /// breaks to carriage returns for PTY input, and when bracketed paste mode
-    /// is enabled wraps the body with the bracketed paste markers
-    /// (`\x1b[200~` prefix and `\x1b[201~` suffix).
-    ///
-    /// This is useful for host applications that need to send paste data
-    /// to the PTY in the correct format based on the terminal's current mode.
+    /// Strips control bytes that could inject commands, converts line breaks to
+    /// carriage returns, and with bracketed paste mode on wraps the body in
+    /// `\x1b[200~` / `\x1b[201~`.
     ///
     /// # Example
     ///
@@ -570,21 +489,15 @@ impl Terminal {
         self.format_paste_framed(text, self.modes.bracketed_paste)
     }
 
-    /// [`Self::format_paste`] with the bracketed-paste decision supplied rather
-    /// than read from the live mode.
+    /// [`Self::format_paste`] with the bracketed-paste decision supplied by the
+    /// caller rather than read from the live mode; the body is identical either
+    /// way.
     ///
-    /// The sanitize + LF→CR body is IDENTICAL either way; only whether the guards
-    /// wrap it is chosen by the caller. This exists because a paste is framed when
-    /// its bytes are produced, which for a queued paste is strictly LATER than the
-    /// moment a person was asked about it — and a program on the other end of the
-    /// PTY may flip DEC 2004 in between. A host that showed someone a question
-    /// about a paste (aterm's multi-line paste confirmation) must be able to frame
-    /// the answer by the mode the QUESTION was asked under, or the guard and the
-    /// wire can disagree about the same paste in either direction.
-    ///
-    /// Passing `self.modes().bracketed_paste` reproduces [`Self::format_paste`]
-    /// exactly, which is how the no-promise callers (the control `paste` verbs)
-    /// keep their "framed by the mode at write time" contract.
+    /// A queued paste is framed later than the moment a person was asked about
+    /// it, and the program may flip DEC 2004 in between; a host that asked (the
+    /// multi-line paste confirmation) frames by the mode the question was asked
+    /// under. Passing `self.modes().bracketed_paste` reproduces
+    /// [`Self::format_paste`].
     ///
     /// # Example
     ///
@@ -599,19 +512,15 @@ impl Terminal {
     /// ```
     #[must_use]
     pub fn format_paste_framed(&self, text: &str, bracketed: bool) -> Vec<u8> {
-        // Truncate at char boundary to prevent unbounded allocation (#7379).
+        // Truncate at char boundary to prevent unbounded allocation.
         let text = bounded_paste_text(text);
 
         if bracketed {
-            // Strip every non-printable control char except TAB and the line breaks
-            // (\n/\r, normalized to CR just below). This covers ESC (which could inject
-            // \x1b[201~ to end the bracket region early), the C1 controls 0x80-0x9F
-            // (0x9B C1 CSI can also terminate it: \x9B201~), DEL, and the C0 signals
-            // (ETX/Ctrl-C, EOT, SUB, …) a hostile clipboard could otherwise smuggle in.
+            // Strip every non-printable control except TAB and line breaks: ESC
+            // (could inject \x1b[201~ to end the bracket early), C1 0x80-0x9F
+            // (\x9B201~ too), DEL, and C0 signals (ETX, EOT, SUB, …).
             let sanitized: String = text.chars().filter(|&c| paste_char_allowed(c)).collect();
-            // Convert newlines to CR: terminals expect CR for line breaks in
-            // pasted text; LF alone moves the cursor down without returning
-            // to column 0 (#7773).
+            // Line breaks become CR, as typed Enter would send.
             let sanitized = sanitized.replace("\r\n", "\r").replace('\n', "\r");
             let mut result = Vec::with_capacity(sanitized.len() + 12);
             result.extend_from_slice(b"\x1b[200~");
@@ -619,14 +528,11 @@ impl Terminal {
             result.extend_from_slice(b"\x1b[201~");
             result
         } else {
-            // Same sanitization OUTSIDE bracketed paste: strip every non-printable
-            // control except TAB and the line breaks. Beyond ESC and the C1 controls
-            // (0x9B CSI / 0x9D OSC / 0x90 DCS can inject commands with 8-bit controls
-            // enabled, #7411), this also drops the C0 signal bytes (0x03 SIGINT, 0x04
-            // EOF, 0x1a SUSP, …) a hostile clipboard could deliver to a non-bracketed
-            // reader (REPL / `read` / cooked-mode app) to hijack the rest of the paste.
+            // The same sanitization outside bracketed paste: C1 controls can
+            // inject commands with 8-bit controls enabled, and C0 signals (0x03,
+            // 0x04, 0x1a, …) could hijack a non-bracketed reader mid-paste.
             let cleaned: String = text.chars().filter(|&c| paste_char_allowed(c)).collect();
-            // Convert newlines to CR (#7773).
+            // Convert newlines to CR.
             cleaned
                 .replace("\r\n", "\r")
                 .replace('\n', "\r")
@@ -645,10 +551,9 @@ mod tests {
         }
     }
 
-    /// A ring-only terminal (`Terminal::new` — the wasm engines' shape) must
-    /// honor `set_scrollback_line_limit` as its RETENTION bound: shrinking
-    /// evicts the oldest lines immediately, growing lets history keep
-    /// accumulating past the construction-time ring cap.
+    /// A ring-only terminal (`Terminal::new`, as the wasm engines use) honors
+    /// `set_scrollback_line_limit` as its retention bound: shrinking evicts the
+    /// oldest lines, growing lets history accumulate past the initial ring cap.
     #[test]
     fn ring_only_scrollback_limit_governs_retention() {
         let mut t = Terminal::new(5, 20);
@@ -685,8 +590,8 @@ mod tests {
         );
     }
 
-    /// The limit reaches the SAVED PRIMARY while the alt screen is up, and the
-    /// alt buffer itself never grows scrollback (xterm spec: alt has none).
+    /// The limit reaches the saved primary while the alt screen is up, and the
+    /// alt buffer never grows scrollback.
     #[test]
     fn scrollback_limit_targets_primary_content_never_the_alt_buffer() {
         let mut t = Terminal::new(5, 20);
@@ -713,9 +618,9 @@ mod tests {
         assert_eq!(t.scrollback_line_limit(), Some(50));
     }
 
-    /// E10a: the advisory ring byte watermark folds into the ONE pressure
-    /// query, and the out-of-band truncation counter aggregates grid + store
-    /// loss — with nothing counted for user-requested limits.
+    /// The advisory ring byte watermark folds into the pressure query, and the
+    /// truncation counter aggregates grid and store loss, counting nothing for
+    /// user-requested limits.
     #[test]
     fn ring_watermark_and_truncation_counter_are_out_of_band() {
         use crate::scrollback::WatermarkLevel;
@@ -729,7 +634,7 @@ mod tests {
         assert_eq!(t.scrollback_truncated_lines(), 0);
 
         // Configure a budget the ring already exceeds: pressure surfaces
-        // through the SAME query hosts already poll.
+        // through the same query hosts already poll.
         t.set_ring_byte_watermark(Some(1));
         assert_eq!(
             t.scrollback_pressure_level(),
@@ -748,10 +653,8 @@ mod tests {
         );
     }
 
-    /// The whole point of the bracket guard: a paste planted with ESC[201~
-    /// must not terminate the region early and have its tail run as
-    /// keystrokes. ESC is stripped, so the only ESC[201~ on the wire is the
-    /// final guard and the planted "[201~" is inert text.
+    /// A paste carrying ESC[201~ cannot end the bracket early: ESC is stripped,
+    /// so the only ESC[201~ on the wire is the final guard.
     #[test]
     fn bracketed_paste_blocks_embedded_escape_terminator() {
         let mut term = Terminal::new(24, 80);
@@ -778,26 +681,23 @@ mod tests {
         assert_eq!(term.format_paste("a\x1b[31mb\u{009D}c"), b"a[31mbc");
     }
 
-    /// A supplied framing OVERRIDES the live mode in both directions, and only
-    /// the guards move: the sanitize + LF→CR body is the same text either way.
-    /// This is what lets a host frame a queued paste by the mode its user was
-    /// asked about rather than by whatever the program has set by the time the
-    /// bytes are written.
+    /// A supplied framing overrides the live mode in both directions, and only
+    /// the guards move: the body is the same either way.
     #[test]
     fn a_supplied_framing_decides_the_guards_and_nothing_else() {
         let mut term = Terminal::new(24, 80);
-        // 2004 OFF, framed bracketed anyway.
+        // 2004 off, framed bracketed anyway.
         assert_eq!(
             term.format_paste_framed("a\x1b[31mb\nc", true),
             b"\x1b[200~a[31mb\rc\x1b[201~"
         );
         term.process(b"\x1b[?2004h");
-        // 2004 ON, framed unbracketed anyway — same body, no guards.
+        // 2004 on, framed unbracketed anyway — same body, no guards.
         assert_eq!(
             term.format_paste_framed("a\x1b[31mb\nc", false),
             b"a[31mb\rc"
         );
-        // Passing the live mode IS `format_paste`, which is how a caller with no
+        // Passing the live mode is `format_paste`, which is how a caller with no
         // captured answer keeps the write-time contract.
         assert_eq!(
             term.format_paste_framed("a\x1b[31mb\nc", term.modes().bracketed_paste),
@@ -834,10 +734,8 @@ mod tests {
         );
     }
 
-    /// A hostile clipboard must not deliver C0 SIGNAL bytes (Ctrl-C 0x03, EOF 0x04,
-    /// SUSP 0x1a, DEL 0x7f, …) to a NON-bracketed reader (a REPL / `read` / cooked-mode
-    /// app), where they could interrupt/suspend a program mid-paste and let the shell
-    /// run the rest as typed input. They are stripped; TAB and line breaks survive.
+    /// C0 signal bytes (0x03, 0x04, 0x1a, DEL, …) are stripped from a
+    /// non-bracketed paste; TAB and line breaks survive.
     #[test]
     fn unbracketed_paste_strips_c0_signal_bytes() {
         let term = Terminal::new(24, 80);
@@ -846,7 +744,7 @@ mod tests {
         assert_eq!(term.format_paste("a\tb\n"), b"a\tb\r");
     }
 
-    /// Line breaks become CR for PTY input, in both modes (#7773).
+    /// Line breaks become CR for PTY input, in both modes.
     #[test]
     fn paste_converts_line_breaks_to_cr() {
         let mut term = Terminal::new(24, 80);
@@ -865,11 +763,9 @@ mod tests {
         assert!(!term.drain_bell(), "flag is cleared after draining");
     }
 
-    /// OSC 7 queues the REAL parsed cwd as an app-event AND updates the
-    /// terminal's working directory (proving it reads real state, not a stub).
-    /// A named URI host is preserved in the event's `//host/path` form (a UNC
-    /// cwd must reach the embedder), while the terminal's own cwd keeps the
-    /// plain local path.
+    /// OSC 7 queues the parsed cwd as an app-event and updates the terminal's
+    /// working directory. A named URI host is kept in the event's `//host/path`
+    /// form, while the terminal's own cwd is the plain local path.
     #[test]
     fn osc_7_queues_real_cwd_path() {
         let mut term = Terminal::new(24, 80);
@@ -889,7 +785,7 @@ mod tests {
         assert_eq!(term.take_osc_event(), Some((7, "/var/tmp".to_string())));
     }
 
-    /// OSC 133 marks queue compact REAL payloads (A carries the cursor
+    /// OSC 133 marks queue compact real payloads (A carries the cursor
     /// row/col; D carries the parsed exit code).
     #[test]
     fn osc_133_marks_queue_real_payloads() {
@@ -907,7 +803,7 @@ mod tests {
         assert_eq!(codes[3].1, "D;exit=42", "D carries the real exit code");
     }
 
-    /// OSC 52 set queues the REAL decoded clipboard string (base64 "aGk=" → "hi").
+    /// OSC 52 set queues the real decoded clipboard string (base64 "aGk=" → "hi").
     #[test]
     fn osc_52_set_queues_decoded_clipboard() {
         let mut term = Terminal::new(24, 80);
@@ -915,6 +811,30 @@ mod tests {
         term.authorize_clipboard_access(crate::terminal::ClipboardAccess::Write);
         term.process(b"\x1b]52;c;aGk=\x07");
         assert_eq!(term.take_osc_event(), Some((52, "hi".to_string())));
+    }
+
+    /// A flood of large OSC 52 sets is held to the queue's byte budget, not
+    /// 1024 x 64 KiB, and a late poll still sees the newest sets in order —
+    /// the native hosts never drain this queue, so the bound is all there is.
+    #[test]
+    fn osc_52_flood_is_held_to_the_event_byte_budget() {
+        use super::super::transient_state::OscEventQueue;
+        let mut term = Terminal::new(24, 80);
+        term.authorize_clipboard_access(crate::terminal::ClipboardAccess::Write);
+        let payload = |i: u8| char::from(b'a' + i % 26).to_string().repeat(60_000);
+        for i in 0..40 {
+            let encoded = aterm_codec::base64::encode(payload(i).as_bytes()).expect("encodes");
+            term.process(format!("\x1b]52;c;{encoded}\x07").as_bytes());
+        }
+        assert!(term.transient.osc_events.bytes() <= OscEventQueue::MAX_BYTES);
+
+        let kept: Vec<_> = std::iter::from_fn(|| term.take_osc_event()).collect();
+        let newest = 40 - kept.len();
+        assert_eq!(kept.len(), OscEventQueue::MAX_BYTES / 60_000);
+        for (offset, (code, text)) in kept.iter().enumerate() {
+            assert_eq!(*code, 52);
+            assert!(*text == payload(u8::try_from(newest + offset).unwrap()));
+        }
     }
 
     /// DEC mode 2031 (color-scheme update notifications) flips the real getter.
@@ -931,7 +851,7 @@ mod tests {
         );
     }
 
-    /// CUP positions the cursor; the grid exposes the REAL display-relative col/row.
+    /// CUP positions the cursor; the grid exposes the real display-relative col/row.
     #[test]
     fn cursor_position_reads_real_grid_state() {
         let mut term = Terminal::new(24, 80);
@@ -941,7 +861,7 @@ mod tests {
         assert_eq!(term.grid().cursor().col, 9);
     }
 
-    /// cell_grapheme returns the REAL written character (base + combining mark).
+    /// cell_grapheme returns the real written character (base + combining mark).
     #[test]
     fn cell_grapheme_reads_real_cell() {
         let mut term = Terminal::new(24, 80);
@@ -952,10 +872,9 @@ mod tests {
         assert_eq!(term.cell_grapheme(999, 0), None);
     }
 
-    /// THE DELIVERED INSERT'S WIDTH (2026-09-10): priced from the sanitized
-    /// single-line body exactly as the wire carries it; unknowable (`None`)
-    /// for a TAB, a line break or a body past the probe; zero for a
-    /// base-less run of marks; control characters stripped before pricing.
+    /// Insert width is priced from the sanitized single-line body as sent;
+    /// `None` for a TAB, a line break or a body past the probe; zero for a
+    /// base-less run of marks; controls stripped before pricing.
     #[test]
     fn paste_insert_cells_prices_the_sanitized_single_line_body() {
         let path = "/Users//example/Desktop/Screenshot\\ 2026-09-10\\ at\\ 14.02.11.png ";
@@ -1010,13 +929,10 @@ mod tests {
         );
     }
 
-    /// THE ECHO ANCHOR COUNTS THE PENDING-WRAP COLUMN (2026-09-12): a glyph
-    /// printed at the last column with DECAWM on leaves the DEC cursor ON
-    /// that column (the wrap deferred), and the anchor reports one past it
-    /// — the END of the print run, so the cursor-effect host can see the
-    /// hand's row advance by a cell that produced no cursor move. A cursor
-    /// address clears it; a TUI-model print (text, then an explicit CUP)
-    /// reports the cursor column as before.
+    /// The echo anchor counts the pending-wrap column: a glyph printed at the
+    /// last column with DECAWM on leaves the cursor on that column, and the
+    /// anchor reports one past it (the end of the print run). A cursor address
+    /// clears it; text followed by an explicit CUP reports the cursor column.
     #[test]
     fn print_anchor_counts_the_pending_wrap_column() {
         let mut t = Terminal::new(4, 10);
@@ -1039,9 +955,8 @@ mod tests {
         t.process(b"a");
         assert_eq!(t.print_anchor().map(|(r, c, _)| (r, c)), Some((1, 1)));
         assert_eq!((t.cursor().row, t.cursor().col), (1, 1));
-        // The TUI model: text to the last column, then an explicit CUP to
-        // the next row — the anchor reports the print's own end, and the
-        // cursor address moves the cursor without touching it.
+        // Text to the last column, then a CUP to the next row: the anchor keeps
+        // the print's end and the CUP moves only the cursor.
         t.process(b"\x1b[3;1H");
         t.process(b"abcdefghij");
         assert_eq!(t.print_anchor().map(|(r, c, _)| (r, c)), Some((2, 10)));
@@ -1058,11 +973,10 @@ mod tests {
         );
     }
 
-    /// THE ANCHOR'S GLYPH IS THE RUN'S LAST CELL (2026-09-23): the cell just
-    /// left of the echo anchor, read live, in `row_cols_into`'s per-column
-    /// convention — the witness that tells a key's echo (`…c`) from zsh's
-    /// i-search minibuffer, whose `<glyph>_` run ends on its fake cursor and
-    /// whose caret climbs back onto the match row.
+    /// The anchor's glyph is the run's last cell: the cell left of the echo
+    /// anchor, read live in `row_cols_into`'s per-column convention. It tells a
+    /// key's echo from zsh's i-search minibuffer, whose run ends on its fake
+    /// cursor.
     #[test]
     fn print_anchor_glyph_is_the_run_s_last_cell() {
         let mut t = Terminal::new(6, 10);
@@ -1090,7 +1004,7 @@ mod tests {
         // Erased after the print: the grid's truth now, a blank.
         t.process(b"\x1b[5;1Hxy\x1b[2K");
         assert_eq!(t.print_anchor_glyph(), Some(' '));
-        // Scrolled back: the anchor is an ACTIVE-grid coordinate, and so is
+        // Scrolled back: the anchor is an active-grid coordinate, and so is
         // its glyph — never the history row the viewport shows there.
         t.process(b"\x1b[6;1H");
         for i in 0..12 {

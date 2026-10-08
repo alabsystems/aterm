@@ -38,8 +38,8 @@
 /// Deliberately strict: non-empty, not `.`/`..`, and only `[A-Za-z0-9._-]` — so no
 /// `/` (an extra path segment), no `?`/`#` (a query or fragment), no `%` (an escape
 /// that could decode into any of those), and no whitespace or control byte. A refusal
-/// costs the caller at most a fallback (see [`release_download_url`]); an acceptance of
-/// any of the above would point the URL somewhere else entirely. Lifted verbatim from
+/// ends that fetch (see [`release_download_url`]); an acceptance of any of the above
+/// would point the URL somewhere else entirely. Lifted verbatim from
 /// atpkg's slug check so both clients refuse the same strings.
 #[must_use]
 pub fn path_segment_safe(segment: &str) -> bool {

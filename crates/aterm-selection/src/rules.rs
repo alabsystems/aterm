@@ -7,8 +7,6 @@
 //! Provides regex-based rules for context-aware text selection.
 
 pub(crate) use super::builtin_patterns::BuiltinRules;
-use aterm_grapheme::char_width;
-use aterm_grapheme::split_graphemes;
 use aterm_regex::Regex;
 #[cfg(test)]
 use std::cmp::Ordering;
@@ -162,9 +160,9 @@ pub struct SelectionMatch {
 impl SelectionMatch {
     /// Create a new selection match.
     ///
-    /// # Panics (debug builds)
+    /// # Panics
     ///
-    /// Panics if `end < start` (invalid range).
+    /// Panics if `end < start`.
     pub(crate) fn new(
         text: impl Into<String>,
         start: usize,
@@ -229,7 +227,7 @@ pub struct SmartSelection {
     rules: Vec<SelectionRule>,
     /// Optional host-configured word-SEPARATOR set (xterm.js `wordSeparators`
     /// semantics), consulted only by the basic word walk. `None` (the default)
-    /// keeps the class-based logic (alphanumeric + `_`) byte-for-byte.
+    /// keeps the class-based logic (alphanumeric + `_`).
     word_separators: Option<String>,
 }
 
@@ -264,7 +262,7 @@ impl SmartSelection {
     /// Rules are maintained in priority order (highest first).
     pub(crate) fn add_rule(&mut self, rule: SelectionRule) {
         self.rules.push(rule);
-        // Highest priority first (clippy::unnecessary_sort_by — Reverse key).
+        // Highest priority first.
         self.rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
     }
 
@@ -327,7 +325,6 @@ impl SmartSelection {
     #[cfg(test)]
     #[must_use]
     pub fn find_at_column(&self, text: &str, column: usize) -> Option<SelectionMatch> {
-        // Convert column to byte position
         let byte_pos = column_to_byte_pos(text, column);
         self.find_at(text, byte_pos)
     }
@@ -371,15 +368,13 @@ impl SmartSelection {
     /// Override the characters that BREAK a word for the basic (non-rule)
     /// double-click word walk — xterm.js `wordSeparators` semantics: with a
     /// set configured, a word is a maximal run of NON-separator characters
-    /// (zero-width combining marks still extend the run onto their base;
-    /// zero-width format controls still break). `None` restores the default
-    /// class-based logic (alphanumeric + `_`) exactly.
+    /// (a mark still belongs to the character it hangs off, and an invisible
+    /// format control still breaks: [`aterm_grapheme::words`]). `None`
+    /// restores the default class-based logic (alphanumeric + `_`).
     ///
     /// Smart-selection RULES (url/file_path/email/…) still take precedence in
     /// [`word_boundaries_at`](Self::word_boundaries_at); the separators only
-    /// shape the fallback word (disable rules via
-    /// `set_rule_enabled` if pure separator
-    /// behaviour is wanted).
+    /// shape the fallback word.
     pub fn set_word_separators(&mut self, separators: Option<&str>) {
         self.word_separators = separators.map(str::to_owned);
     }
@@ -411,24 +406,28 @@ impl SmartSelection {
 
     /// Get word boundaries at a column (display-width) position.
     ///
-    /// Converts column→byte on input, calls `word_boundaries_at`, then
-    /// converts the byte-offset result back to column offsets. This is
-    /// the correct entry point for terminal UI code that works in column
-    /// coordinates (#5685).
+    /// The entry point for UI code in grid columns: converts column→byte, calls
+    /// `word_boundaries_at`, and converts the result back to columns.
+    ///
+    /// A column at or past the end of the text names an empty cell: `None`.
     #[must_use]
     pub fn word_boundaries_at_column(&self, text: &str, column: usize) -> Option<(usize, usize)> {
         let byte_pos = column_to_byte_pos(text, column);
+        if byte_pos >= text.len() {
+            return None;
+        }
         let (start_byte, end_byte) = self.word_boundaries_at(text, byte_pos)?;
-        Some((
-            byte_pos_to_column(text, start_byte),
-            byte_pos_to_column(text, end_byte),
-        ))
+        Some(byte_span_to_columns(text, start_byte, end_byte))
     }
 
     /// Get basic word boundaries (fallback when no rule matches).
     ///
-    /// Treats sequences of alphanumeric characters and underscores as words.
-    /// Unicode combining marks are treated as word continuations.
+    /// Treats sequences of alphanumeric characters and underscores as words,
+    /// with what belongs to them: their marks, a prepended mark, and a format
+    /// control that spells the word (a ZWNJ or ZWJ, the Mongolian vowel
+    /// separator, an Egyptian hieroglyph joiner). Any other invisible character
+    /// separates two words. This is [`aterm_grapheme::words`], the rule the
+    /// find field's and the editor's word motions follow too.
     /// Handles Unicode text: CJK, accented Latin, Cyrillic, etc.
     ///
     /// Test-only pin of the DEFAULT (no-separator) classifier; production goes
@@ -444,7 +443,7 @@ impl SmartSelection {
     /// optional word-SEPARATOR set: `Some(seps)` switches the char classifier
     /// to xterm.js `wordSeparators` semantics (see
     /// [`set_word_separators`](Self::set_word_separators)); `None` is the
-    /// default class-based walk, byte-for-byte.
+    /// default class-based walk.
     #[must_use]
     fn basic_word_boundaries_with(
         seps: Option<&str>,
@@ -461,124 +460,69 @@ impl SmartSelection {
         // Snap to nearest char boundary at or before pos
         let snap = (0..=pos).rev().find(|&i| text.is_char_boundary(i))?;
 
-        // Check if the character at the snapped position is a word character
-        let ch = text[snap..].chars().next()?;
-        if !continues_word(seps, ch) {
-            return None;
-        }
-
-        // Walk backwards from snap to find start of word
-        let start = text[..snap]
-            .char_indices()
-            .rev()
-            .take_while(|&(_, c)| continues_word(seps, c))
-            .last()
-            .map_or(snap, |(i, _)| i);
-
-        // Walk forwards from snap to find end of word
-        let end = text[snap..]
-            .char_indices()
-            .skip(1) // skip the char at snap
-            .find(|&(_, c)| !continues_word(seps, c))
-            .map_or(text.len(), |(i, _)| snap + i);
-
-        // Treat combining marks as continuations, not standalone words.
-        if !text[start..end].chars().any(|c| anchors_word(seps, c)) {
-            return None;
-        }
-
-        Some((start, end))
+        // The word the snapped character belongs to, if any, read from the last
+        // word break before it.
+        let is_word = |c: char| is_word_char(seps, c);
+        let from = aterm_grapheme::word_break_before(text, snap, is_word);
+        let word = aterm_grapheme::words(text.get(from..)?, is_word)
+            .map(|word| from.saturating_add(word.start)..from.saturating_add(word.end))
+            .find(|word| word.end > snap)?;
+        (word.start <= snap).then_some((word.start, word.end))
     }
 }
 
-/// Whether `ch` EXTENDS the word run under the active classifier: the
-/// configured separator set (a word is any run of non-separators — xterm.js
-/// `wordSeparators`), or the default class-based logic. Combining marks always
-/// extend (they belong to their base grapheme even if listed as separators);
-/// zero-width format controls always break (invisible characters must not
-/// weld two words together).
+/// Whether `ch`, standing on its own, is a word character under the active
+/// classifier: the configured separator set (a word is any run of
+/// non-separators — xterm.js `wordSeparators`), or the default class
+/// ([`aterm_grapheme::is_word_char`]: alphanumeric + `_`). Which invisible and
+/// attached characters join it is [`aterm_grapheme::words`]'s to say.
 #[inline]
-fn continues_word(seps: Option<&str>, ch: char) -> bool {
+fn is_word_char(seps: Option<&str>, ch: char) -> bool {
     match seps {
-        Some(s) => is_combining_mark(ch) || (!s.contains(ch) && !is_zero_width_word_breaker(ch)),
-        None => is_word_continuation_char(ch),
+        Some(s) => !s.contains(ch),
+        None => aterm_grapheme::is_word_char(ch),
     }
 }
 
-/// Whether `ch` can ANCHOR a word (a run of pure combining marks is not a
-/// word): the non-mark continuation chars under either classifier.
-#[inline]
-fn anchors_word(seps: Option<&str>, ch: char) -> bool {
-    match seps {
-        Some(_) => continues_word(seps, ch) && !is_combining_mark(ch),
-        None => is_word_core_char(ch),
-    }
-}
-
-#[inline]
-fn is_word_core_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
-}
-
-#[inline]
-fn is_word_continuation_char(ch: char) -> bool {
-    is_word_core_char(ch) || is_combining_mark(ch)
-}
-
-#[inline]
-fn is_combining_mark(ch: char) -> bool {
-    char_width(ch) == 0 && !is_zero_width_word_breaker(ch)
-}
-
-#[inline]
-fn is_zero_width_word_breaker(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-    )
-}
-
-/// Convert a column (display-width) position to a byte position.
+/// Convert a GRID column to the byte position of the grapheme drawn there.
+///
+/// Columns are the grid's (see [`aterm_grapheme::grid_graphemes`]), not
+/// display width: the grid advances per CHARACTER outside emoji, so a
+/// cluster's display width is the wrong charge for an Indic conjunct and
+/// double-click landed on the wrong cells. A column inside a multi-cell
+/// grapheme names its start; past the text, `text.len()`.
 pub(crate) fn column_to_byte_pos(text: &str, column: usize) -> usize {
-    let mut current_col = 0;
-
-    for grapheme in split_graphemes(text) {
-        // Column points at this grapheme's first cell.
-        if current_col >= column {
-            return grapheme.byte_offset;
-        }
-
-        // GRID cells (see `aterm_grapheme::grapheme_grid_columns`): the grid
-        // advances per CHARACTER outside emoji, so a cluster's display width is
-        // the wrong charge for an Indic conjunct and double-click landed on the
-        // wrong cells.
-        current_col += aterm_grapheme::grapheme_grid_columns(grapheme.text);
-
-        // Column points inside a multi-cell grapheme; return its start.
-        if current_col > column {
-            return grapheme.byte_offset;
+    for g in aterm_grapheme::grid_graphemes(text) {
+        if column < g.end_col {
+            return g.byte_offset;
         }
     }
-
     text.len()
 }
 
-/// Convert a byte position to a column (display-width) position.
-pub(crate) fn byte_pos_to_column(text: &str, byte_pos: usize) -> usize {
-    let mut current_col = 0;
-
-    for grapheme in split_graphemes(text) {
-        if grapheme.byte_offset >= byte_pos {
+/// The grid columns `start..end` (exclusive) that bytes `start_byte..end_byte`
+/// are drawn in.
+///
+/// A grapheme the grid folds into the cell before it (the `ය` of Sinhala
+/// `ක්‍ය`) starts in that cell, so a word that starts with one still covers
+/// the cell its first letter is drawn in.
+pub(crate) fn byte_span_to_columns(
+    text: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> (usize, usize) {
+    let mut start = None;
+    let mut end = 0;
+    for g in aterm_grapheme::grid_graphemes(text) {
+        if g.byte_offset >= end_byte {
             break;
         }
-        current_col += aterm_grapheme::grapheme_grid_columns(grapheme.text);
+        if start.is_none() && g.byte_offset >= start_byte {
+            start = Some(g.start_col);
+        }
+        end = g.end_col;
     }
-
-    current_col
+    (start.unwrap_or(end), end)
 }
 
 #[cfg(test)]

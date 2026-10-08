@@ -16,9 +16,10 @@
 //! * the Claude Code footer (`crate::claude_footer`: `composer_bottom` +
 //!   `footer::mode_row`, and `footer::launch_card` while a process's model
 //!   or effort is unnamed — every frame on the main thread);
-//! * the Claude Code lights (`crate::claude_lights`: `lights::read_screen` +
-//!   `composer_draft` every frame, and a toggle's `composer_draft` +
-//!   `upgrade::composer_is_empty` — the main thread).
+//! * the Claude Code lights (`crate::claude_lights`: `lights::read_screen`
+//!   every frame and at a toggle — the main thread), which the footer reads
+//!   too, with `upgrade::composer_is_empty`, every frame while a live
+//!   upgrade's note stands for the pane.
 //!
 //! The
 //! reader is pure functions over the screen's rows, and a screen is whatever
@@ -36,9 +37,11 @@
 //!   (their contract: a miss there is a keystroke into a box — the operator
 //!   is refused, as over a box), and the announcing sites announce NOTHING
 //!   (no "waiting for human approval" off a screen nobody could read);
-//! * the footer paints no row (the vendor's own row stays), and the lights
-//!   keep what they last showed, take no toggle step, and refuse a toggle
-//!   (`NotShown`) — no keystroke leaves off an unread screen.
+//! * the footer paints no row (the vendor's own row stays) — a panic in the
+//!   upgrade note's composer read drops only the note, the facts still
+//!   paint — and the lights keep what they last showed, take no toggle step,
+//!   and refuse a toggle (`NotShown`) — no keystroke leaves off an unread
+//!   screen.
 //!
 //! The release profile unwinds (`Cargo.toml` `[profile.release]`), so the
 //! catch holds in the shipped binary. The panic hook (`logging.rs`, and the
@@ -132,7 +135,7 @@ pub(crate) fn guarded<T>(read: impl FnOnce() -> T) -> Result<T, ReaderPanic> {
 /// value, or — on a panic, warned once per `session` per location
 /// ([`warn_once`], `what` naming the caller) — `None`.
 pub(crate) fn read_or_none<T>(
-    session: &str,
+    session: impl std::fmt::Display,
     what: &str,
     rows: &[String],
     read: impl FnOnce() -> T,
@@ -140,7 +143,7 @@ pub(crate) fn read_or_none<T>(
     match guarded(read) {
         Ok(value) => Some(value),
         Err(panic) => {
-            warn_once(session, what, &panic, rows);
+            warn_once(&session.to_string(), what, &panic, rows);
             None
         }
     }

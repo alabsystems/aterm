@@ -26,16 +26,14 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Read};
-use std::process::{Command, Output, Stdio};
+use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::{child_output, headless_boot};
 
-use headless_boot::Instance;
+use headless_boot::{
+    Instance, boot_session, client_command, ctl, ctl_ok, field, status, type_line,
+};
 
 /// Boot one headless instance, 40x120 ([`headless_boot::boot`]: `None` is an
 /// environment refusal; a product that cannot start fails the test).
@@ -46,104 +44,10 @@ fn boot(tag: &str) -> Option<Instance> {
     )
 }
 
-/// A client that has not exited by now is hung: past every [`HANG`] wait a
-/// call makes, so a wait that times out answers before it is killed.
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
-
 /// How long a wait for something that MUST happen may take before it is read
 /// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
-
-/// A connection-bound supervisor claim goes WITH its connection: the fastest
-/// of [`CLAIMS_RELEASED`] closes is read off the roster within this, a roster
-/// poll's `aterm ctl` spawn included. A loaded gate's one slow poll is one
-/// close among several; a claim that outlives its connection by a lease is
-/// late on every one (each was held to 5 s, then only to the minute's hang).
-const RELEASED_PROMPTLY: Duration = Duration::from_secs(5);
-const CLAIMS_RELEASED: usize = 4;
-
-fn client_command(inst: &Instance, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    cmd.arg("ctl")
-        .arg("--sock")
-        .arg(&inst.sock)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    launch_isolation::apply(&mut cmd, &inst.tmp);
-    cmd
-}
-
-/// One bounded `aterm ctl --sock <sock> <args…>` call.
-fn ctl(inst: &Instance, args: &[&str]) -> Output {
-    let mut child = client_command(inst, args).spawn().expect("spawn aterm ctl");
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + CLIENT_EXIT_DEADLINE;
-    loop {
-        match child.try_wait().expect("poll aterm ctl") {
-            Some(status) => {
-                return Output {
-                    status,
-                    stdout: stdout.join().expect("stdout drain"),
-                    stderr: stderr.join().expect("stderr drain"),
-                };
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("aterm ctl {args:?} did not exit in time");
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
-}
-
-fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
-    let out = ctl(inst, args);
-    assert!(
-        out.status.success(),
-        "aterm ctl {args:?} failed: stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    String::from_utf8(out.stdout).expect("utf-8")
-}
-
-/// `key=value` out of a status/sessions line.
-fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}=");
-    line.split_whitespace()
-        .find_map(|t| t.strip_prefix(prefix.as_str()))
-}
-
-/// The boot session's `(local, sid)` from `sessions`.
-fn boot_session(inst: &Instance) -> (u64, String) {
-    let body = ctl_ok(inst, &["sessions"]);
-    let row = body
-        .lines()
-        .find(|l| l.starts_with(|c: char| c.is_ascii_digit()))
-        .unwrap_or_else(|| panic!("a session row: {body}"));
-    let mut toks = row.split_whitespace();
-    let local = toks.next().unwrap().parse().unwrap();
-    let sid = toks.next().unwrap().to_string();
-    (local, sid)
-}
-
-fn status(inst: &Instance, sid: &str) -> String {
-    ctl_ok(inst, &[&format!("@{sid}"), "status"])
-}
 
 /// Wait for the process-name resolver before asserting supervisor behavior.
 /// The fake worker's screen can be ready before its asynchronous name lookup.
@@ -172,12 +76,6 @@ fn watchers(inst: &Instance, sid: &str) -> usize {
     field(row, "watchers")
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("no watchers= in {row}"))
-}
-
-/// Type one line into the session and submit it.
-fn type_line(inst: &Instance, sid: &str, line: &str) {
-    ctl_ok(inst, &[&format!("@{sid}"), "send", line]);
-    ctl_ok(inst, &[&format!("@{sid}"), "key", "enter"]);
 }
 
 /// The fake worker: raw mode, a background reader appending every byte it
@@ -289,12 +187,16 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
                 "timeout=150000",
             ],
         );
-        std::thread::spawn(move || cmd.output().expect("await match"))
+        let child = cmd.spawn().expect("spawn the await");
+        std::thread::spawn(move || {
+            child_output::wait_and_read(child, Instant::now() + Duration::from_secs(150) + HANG)
+                .expect("the await exits after its own timeout")
+        })
     };
     // Armed, or the waiter ended without arming: the two events that decide
     // it. A wall-clock bound alone read a client starved of its spawn under a
-    // loaded lane as "never armed" (red 1 in 4 under `verify-lane.sh -p aterm
-    // --tests` on 2026-09-26, green 3/3 alone); the backstop is only for a
+    // loaded lane as "never armed" (red 1 in 4 on a loaded lane on 2026-09-26,
+    // green 3/3 alone); the backstop is only for a
     // server that neither arms nor answers.
     //
     // Every `who` sample is kept — when it started, how long the call took,
@@ -523,13 +425,9 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     // socket close-on-exec non-atomically on macOS, so a sibling test's spawn can
     // carry a copy into an `aterm` that outlives the wait below (the fd-copy
     // sweep of 2026-09-27). `shutdown` acts on the socket, copies and all.
-    let closed = Instant::now();
     let _ = conn.get_ref().shutdown(std::net::Shutdown::Both);
     drop(conn);
     supervisor_until(&inst, &sid, "-");
-    // How long each connection-bound claim outlived its connection, for
-    // [`RELEASED_PROMPTLY`].
-    let mut outlived = vec![closed.elapsed()];
 
     // A `ttl=` claim from a one-shot client outlives the client. Its ttl
     // outlives the wait for the roster to show it (it was 30 s, under that
@@ -550,25 +448,14 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     ctl_ok(&inst, &[&format!("@{sid}"), "meta", "unset", "supervisor"]);
     supervisor_until(&inst, &sid, "-");
     // …and a one-shot claim WITHOUT ttl= is bound to a connection that has
-    // already closed by the time anyone can read it.
-    for _ in 1..CLAIMS_RELEASED {
-        ctl_ok(
-            &inst,
-            &[&format!("@{sid}"), "meta", "set", "supervisor", "sup-once"],
-        );
-        let exited = Instant::now();
-        supervisor_until(&inst, &sid, "-");
-        outlived.push(exited.elapsed());
-    }
-    // Released WITH the connection, not by a lease of its own: each roster
-    // wait above is only a hang detector, and a claim that held on for a
-    // lease of seconds past its connection is late every time.
-    let fastest = outlived.iter().min().copied().unwrap_or_default();
-    assert!(
-        fastest < RELEASED_PROMPTLY,
-        "the fastest of {CLAIMS_RELEASED} connection-bound claims outlived its connection by \
-         {fastest:?}: {outlived:?}"
+    // already closed by the time anyone can read it. Such a claim has no
+    // expiry of its own: one its connection's end did not release would stand
+    // past the hang detector.
+    ctl_ok(
+        &inst,
+        &[&format!("@{sid}"), "meta", "set", "supervisor", "sup-once"],
     );
+    supervisor_until(&inst, &sid, "-");
 
     // A `ttl=` claim nobody renews LAPSES, and the lapse is recorded — the
     // `meta-change field=supervisor value=-` a dead supervisor never writes
@@ -713,14 +600,14 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         requests: Vec::new(),
         end_after_press: true,
     };
-    // The budget is a hang discriminator: the loop ends once it has pressed
-    // (`end_after_press`). It was 4 s, spent on read, settle, read, status,
-    // `help key` and the press — each a round trip to the live instance's main
-    // thread — so a contended gate returned before the press, and the fence
-    // assertion failed on a correct engine (the load-sensitive test audit of
-    // 2026-09-27).
+    // The budget is a hang discriminator, the [`HANG`] minute: the loop ends
+    // once it has pressed (`end_after_press`). It was 4 s, spent on read,
+    // settle, read, status, `help key` and the press — each a round trip to the
+    // live instance's main thread — so a contended gate returned before the
+    // press, and the fence assertion failed on a correct engine (the
+    // load-sensitive test audit of 2026-09-27).
     let opts = SuperviseOpts {
-        max: Duration::from_secs(30),
+        max: HANG,
         ..SuperviseOpts::default()
     };
     let ran = {

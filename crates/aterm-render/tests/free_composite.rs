@@ -36,8 +36,9 @@ use aterm_core::render::{
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, WindowCpu, premul_rgb, rgb_to_u32};
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// A deterministic patterned RGBA atlas, tall enough for a rect spanning
@@ -126,10 +127,7 @@ fn legacy_slices(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2], ch: usize) ->
 /// phase runner).
 #[test]
 fn free_multirow_rect_matches_legacy_perrow_slices_on_both_paths() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (_, ch) = rend.cell_size();
     let (rows, cols) = (6usize, 12usize);
     // Glyph-free terminal: the sliced-vs-free comparison is sprite-only (the
@@ -216,10 +214,7 @@ fn free_multirow_rect_matches_legacy_perrow_slices_on_both_paths() {
 /// band-edge strip reset, the CPU twin of the GPU edge scissor).
 #[test]
 fn free_no_ghosting_cached_equals_fresh_including_off_grid_pad_spill() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     rend.set_pad(6);
     let (_, ch) = rend.cell_size();
     let (rows, cols) = (6usize, 12usize);
@@ -276,10 +271,7 @@ fn free_no_ghosting_cached_equals_fresh_including_off_grid_pad_spill() {
 /// translucent sprite over itself and over the glyphs above it.)
 #[test]
 fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (_, ch) = rend.cell_size();
     let (rows, cols) = (6usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -333,10 +325,7 @@ fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
 /// `FreeOver` slot: after the wdeco streams, immediately before the cursor).
 #[test]
 fn free_z_under_text_over_legacy_and_over_text() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (3usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);

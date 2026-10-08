@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Deterministic operation counters for complexity assertions.
+//! Deterministic operation counters for complexity assertions, in place of
+//! wall-clock timing. Enabled under `cfg(test)` or the `testing` feature so
+//! downstream crate tests can instrument grid operations.
 //!
-//! These counters replace wall-clock timing for complexity assertions in tests.
-//! Behind `#[cfg(any(test, feature = "testing"))]` so downstream crate tests
-//! (aterm-core) can instrument grid operations via the `testing` feature.
-//!
-//! NOTE: Use full path `std::cell::Cell` to avoid conflict with grid `Cell` type.
+//! Use the full path `std::cell::Cell`; `Cell` here is the grid cell type.
 
 // Counter for CellExtras shift operations (entries iterated per shift call).
 thread_local! {
@@ -40,21 +38,16 @@ thread_local! {
     static REFLOW_CELL_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// Counter for scrollback lines that took the RFL-4a rewrap PASSTHROUGH
-// (clone-through of width-invariant single-row logical lines) instead of the
-// full decompose+rebuild path. Reach is asserted in BOTH directions: a mixed
-// corpus must drive it above zero (the fast path really fires) and a
-// wrap-changing corpus must leave it at zero (the gate never over-fires).
+// Scrollback lines taken by the rewrap passthrough (clone of width-invariant
+// single-row logical lines) instead of decompose+rebuild. Asserted both ways:
+// a mixed corpus drives it above zero, a wrap-changing corpus leaves it at 0.
 thread_local! {
     static REFLOW_PASSTHROUGH_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// Counter for off-screen scrollback lines rewrapped SYNCHRONOUSLY inside a
-// `Grid::resize` width change (the L0-hang budget: this must stay bounded by the
-// viewport, NOT by session history — see `tests/reflow/cost_bound.rs` and the
-// bounded-cost obligation. A non-zero count on a deep-history resize is the
-// signature of the whole-Mac freeze: the reflow ran on the caller's thread, under
-// its lock, in O(history)).
+// Off-screen scrollback lines rewrapped synchronously inside a `Grid::resize`
+// width change. Must stay bounded by the viewport, not session history
+// (`tests/reflow/cost_bound.rs`).
 thread_local! {
     static SCROLLBACK_REFLOW_SYNC_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -74,12 +67,9 @@ pub(crate) fn take_extras_shift_ops() -> usize {
     })
 }
 
-// Counter for hyperlink-limit COLD-PATH walks (entries iterated per walk).
-//
-// The guard in `CellExtras::enforce_hyperlink_limit` is supposed to keep this
-// at zero unless the hyperlink population is genuinely over budget; a
-// non-zero-per-call count is the signature of the guard testing the wrong
-// quantity (total extras entries instead of hyperlink-bearing ones).
+// Entries iterated by hyperlink-limit cold-path walks. The guard in
+// `CellExtras::enforce_hyperlink_limit` keeps this at zero unless the
+// hyperlink population is really over budget.
 thread_local! {
     static HYPERLINK_WALK_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -126,12 +116,8 @@ pub(crate) fn count_row_to_line_cell() {
 
 /// Take (read and reset) the row-to-line operation count.
 ///
-/// `pub` under the `testing` feature (unlike its siblings, which are
-/// `cfg(test)`-only) because a DOWNSTREAM crate's tests need it: `Line`
-/// construction from a ring row is what a scrollback COPY pays per selected
-/// line, and the pin that each selected row is resolved exactly ONCE
-/// (aterm-core `selection.rs`, SCR-4) can only be written where
-/// `selection_to_string` lives. Exactly the use the module header describes.
+/// `pub` under `testing` because aterm-core's selection tests pin that each
+/// selected ring row is converted to a `Line` exactly once.
 #[cfg(any(test, feature = "testing"))]
 pub fn take_row_to_line_ops() -> usize {
     ROW_TO_LINE_OPS.with(|c| {
@@ -197,19 +183,9 @@ pub(crate) fn take_reflow_passthrough_lines() -> usize {
     })
 }
 
-// Counter for ring rows a ROWS-ONLY resize evacuates out of the grid ring (the
-// second half of the resize bounded-cost obligation — see
-// `tests/reflow/rows_only_cost_bound.rs`).
-//
-// `SCROLLBACK_REFLOW_SYNC_LINES` above instruments the WIDTH reflow only, so a
-// rows-only resize incremented nothing and the gate reported 0 — which reads as
-// proof of O(viewport) when it actually means "not instrumented". It was not:
-// `adjust_row_count` compared the FULL ring length against the new VISIBLE row
-// target, so every rows-only resize (window-height drag, pane split/close,
-// divider drag, find-bar toggle) migrated the entire ring — ~9,999 rows at the
-// GUI's 10,000-line ring — into the tiered store synchronously under the
-// caller's lock. This counter closes that hole: it must stay bounded by the
-// HEIGHT DELTA, never by history.
+// Ring rows a rows-only resize evacuates out of the grid ring
+// (`tests/reflow/rows_only_cost_bound.rs`). Must stay bounded by the height
+// delta, never by history.
 thread_local! {
     static ROWS_ONLY_RESIZE_MIGRATED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -246,13 +222,10 @@ pub(crate) fn take_scrollback_reflow_sync_lines() -> usize {
     })
 }
 
-// Counter for RING-tier history rows materialized DIRECTLY from their stored
-// `Row` + `ScrolledRowExtras` (SCR-2's fast path) instead of through the
-// Row -> Line -> cells round trip. Reach is asserted in BOTH directions by the
-// parity test: a realistic corpus must drive it above zero (the fast path
-// really fires, so the parity assertions are not vacuous), and a read that
-// lands in the warm/cold tiers must leave it at zero (it never over-fires onto
-// a tier whose bytes it cannot see).
+// Ring-tier history rows materialized directly from their stored `Row` +
+// `ScrolledRowExtras` instead of the Row -> Line -> cells round trip. The
+// parity test asserts it both ways: above zero on a realistic corpus, zero for
+// reads that land in the warm/cold tiers.
 thread_local! {
     static RING_FAST_MATERIALIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -264,15 +237,9 @@ pub(crate) fn count_ring_fast_materialize() {
 
 /// Take (read and reset) the ring fast-materialize count.
 ///
-/// `pub` under the `testing` feature (unlike its `cfg(test)`-only siblings)
-/// because the parity test that needs it lives DOWNSTREAM, in aterm-core: only
-/// there can a corpus of OSC 8 / SGR 58 / emoji / CJK be fed through the real
-/// parser into real scrollback, which is the only way to prove the fast path
-/// agrees with the round trip on the data that actually reaches it.
-///
-/// Gated on the FEATURE alone, not `any(test, feature)`: without the feature
-/// this module is `pub(crate)`, so a `pub fn` no aterm-grid test calls would
-/// read as dead code.
+/// Feature-gated `pub` for aterm-core's parity test, which feeds real parsed
+/// scrollback. Gated on the feature alone: without it the module is
+/// `pub(crate)` and this would be dead code.
 #[cfg(feature = "testing")]
 pub fn take_ring_fast_materialize() -> usize {
     RING_FAST_MATERIALIZE.with(|c| {
@@ -282,18 +249,10 @@ pub fn take_ring_fast_materialize() -> usize {
     })
 }
 
-// Counter for HISTORY ROWS MATERIALIZED from the 3-tier store to answer a
-// scrolled-back viewport read (`Grid::materialized_history_row`) — the SCR-1
-// number, and the one this campaign moved from 24 per repaint to 0.
-//
-// WHAT IS COUNTED, PRECISELY, AND WHY THE DISTINCTION IS THE WHOLE POINT: the
-// MISSES. A memo HIT does not increment, and in debug builds a hit still runs a
-// full re-materialize (the stale-row net in `viewport_row_cache`'s module docs)
-// — so a counter placed one level down, inside
-// `materialize_scrollback_row_full`, would count that net and report 24 in
-// exactly the build a test runs in. It would look like the fix had never
-// landed. This counter sits at the two sites that do REAL work for the frame:
-// the memo miss, and the unkeyable read-through.
+// History rows materialized from the 3-tier store for a scrolled-back viewport
+// read (`Grid::materialized_history_row`). Counts only real work (memo misses
+// and unkeyable read-throughs), not memo hits, which in debug builds still
+// re-materialize as a stale-row check.
 thread_local! {
     static VIEWPORT_ROW_MATERIALIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -304,15 +263,36 @@ pub(crate) fn count_viewport_row_materialize() {
 }
 
 /// Take (read and reset) the scrolled-back history-row materialize count.
-///
-/// `pub` under the `testing` feature (like its `take_ring_fast_materialize`
-/// sibling, and for the same reason): the claim is about a FRAME, and only a
-/// downstream aterm-core test can drive `Terminal::cell_frame_into` over real
-/// parsed scrollback — which is the only thing that makes "materializations per
-/// frame" a measurement of the product rather than of a fixture.
+/// Feature-gated `pub` so aterm-core can count materializations per frame of
+/// `Terminal::cell_frame_into` over real scrollback.
 #[cfg(feature = "testing")]
 pub fn take_viewport_row_materialize() -> usize {
     VIEWPORT_ROW_MATERIALIZE.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}
+
+// Counter for the cells a resize's RGB harvest
+// (`Grid::migrate_rgb_ring_to_extras`) examined for ring-stored truecolor. The
+// early-out contract is a COUNT, not a clock: a screen that has written no
+// truecolor since the last resize has no RGB ring and the harvest must visit no
+// cell (`tests/reflow/rgb_across_resize.rs`).
+thread_local! {
+    static RGB_HARVEST_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the RGB-harvest counter by `n` cells examined.
+#[cfg(test)]
+pub(crate) fn count_rgb_harvest_cells(n: usize) {
+    RGB_HARVEST_CELLS.with(|c| c.set(c.get() + n));
+}
+
+/// Take (read and reset) the RGB-harvest cell count.
+#[cfg(test)]
+pub(crate) fn take_rgb_harvest_cells() -> usize {
+    RGB_HARVEST_CELLS.with(|c| {
         let v = c.get();
         c.set(0);
         v

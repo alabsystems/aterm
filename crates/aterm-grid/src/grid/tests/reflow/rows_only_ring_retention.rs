@@ -2,17 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rows-only resize retention on RING-ONLY grids (the wasm engines' shape).
+//! Rows-only resize retention on ring-only grids (the wasm engines' shape).
 //!
-//! A rows-only resize must never shed ring history: the ring IS retention
-//! when no tiered store is attached. Identity law: the resulting logical
-//! buffer — history sequence, viewport content, absolute-row numbering —
-//! matches what the SAME writes + resize produce on a tiered grid (whose
-//! migration path has always preserved retention). Pre-fix,
-//! `adjust_row_count` trimmed the ring to the viewport, destroying ALL
-//! history and renumbering the survivors on every height-only change (orc:
-//! search "staleness" after a height-only resize — history matches vanished
-//! and surviving lines reported shifted absolute rows).
+//! Without a tiered store the ring is the retention, so a rows-only resize
+//! never sheds ring history. Identity law: history sequence, viewport content
+//! and absolute-row numbering match what the same writes and resize produce on
+//! a tiered grid.
 
 use super::super::super::*;
 use aterm_scrollback::Scrollback;
@@ -83,13 +78,9 @@ fn rows_only_shrink_preserves_ring_history_and_matches_tiered() {
         "identity law: same history sequence, viewport, and absolute numbering"
     );
 
-    // Spot-pin the shape so the identity cannot drift silently: the shrink
-    // anchors at the CURSOR (audit-2 item 1) — the top 5 viewport rows are
-    // demoted as the newest history, a pure relabel, so the full reading
-    // order stays exactly the write order (N0..N29 then the cursor's blank
-    // row) and the cursor's line stays visible. The old pin archived the
-    // BOTTOM rows — including the cursor's blank row as manufactured blank
-    // history — and hid N29 from view.
+    // The shrink anchors at the cursor: the top 5 viewport rows become the
+    // newest history, so reading order stays the write order (N0..N29, then the
+    // cursor's blank row) and the cursor's line stays visible.
     let (history, viewport, oldest_abs) = logical_buffer(&ring);
     assert_eq!(history.len(), 26);
     assert_eq!(history[0], "N0");
@@ -131,13 +122,10 @@ fn rows_only_grow_reveals_history_and_matches_tiered() {
     assert_eq!(oldest_abs, 0);
 }
 
-/// The cursor FOLLOWS its content through a rows-grow reveal: revealed
-/// history re-labels the newest ring lines as the top of the viewport, so
-/// every pre-resize viewport row — the cursor's included — sits `revealed`
-/// rows further down afterwards. Pre-fix the cursor kept its old viewport
-/// row, pointing `revealed` rows ABOVE its line; an inline TUI's
-/// post-SIGWINCH repaint (and CPR answers) then anchored wrong, painting
-/// into the revealed band. Pinned on BOTH grid shapes via the identity law.
+/// The cursor follows its content through a rows-grow reveal: every pre-resize
+/// viewport row, the cursor's included, sits `revealed` rows further down, so
+/// a TUI's post-SIGWINCH repaint and CPR answers anchor correctly. Pinned on
+/// both grid shapes via the identity law.
 #[test]
 fn rows_only_grow_cursor_follows_its_content_line() {
     for tiered in [false, true] {
@@ -178,7 +166,7 @@ fn rows_only_grow_cursor_follows_its_content_line() {
     }
 }
 
-/// A shrink whose demoted rows overflow the retention cap evicts ONLY past
+/// A shrink whose demoted rows overflow the retention cap evicts only past
 /// the cap (oldest-first), exactly like scroll_up's at-capacity reuse.
 #[test]
 fn rows_only_shrink_at_cap_evicts_only_beyond_the_limit() {
@@ -199,9 +187,8 @@ fn rows_only_shrink_at_cap_evicts_only_beyond_the_limit() {
     );
 }
 
-/// The alt-screen configuration (ring cap 0) keeps its no-scrollback
-/// invariant through a rows-only shrink: demoted rows are evicted by the
-/// zero cap, matching the pre-fix discard behavior.
+/// The alt-screen configuration (ring cap 0) keeps no scrollback through a
+/// rows-only shrink: demoted rows are evicted by the zero cap.
 #[test]
 fn rows_only_shrink_with_zero_cap_still_retains_nothing() {
     let mut grid = Grid::with_scrollback(5, 20, 0);
@@ -218,16 +205,14 @@ fn rows_only_shrink_with_zero_cap_still_retains_nothing() {
     assert_eq!(grid.rows(), 3);
 }
 
-/// Ring history extras survive a rows-only resize in place: the ring is not
-/// rebuilt, so a hyperlink that already lived in history must still resolve
-/// afterwards (the tiered path clears `ring_extras` because it rebuilds; the
-/// ring-only path keeps the rows AND their side table).
+/// Ring history extras survive a rows-only resize: the ring-only path keeps the
+/// rows and their side table.
 #[test]
 fn rows_only_resize_keeps_ring_history_extras() {
     use std::sync::Arc;
 
     let mut grid = Grid::with_scrollback(3, 20, 10_000);
-    // "Hello" with a hyperlink on row 0 (the #7783 extras pattern), then
+    // "Hello" with a hyperlink on row 0, then
     // enough lines to push it into ring history.
     let url: Arc<str> = Arc::from("https://example.com/rows-only");
     for c in "Hello".chars() {

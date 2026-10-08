@@ -2,31 +2,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Property tests for unsafe grid access paths.
-//!
-//! Migrated from aterm-core as part of #6556 Batch 3.
+//! Unsafe grid access paths, checked over generated inputs (fixed-seed
+//! xorshift, so a failure reproduces).
 
 use aterm_grid::{Cell, Grid, PageStore, Row};
-use proptest::prelude::*;
-use proptest::test_runner::Config as ProptestConfig;
+use aterm_spec::rng::XorShift;
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        failure_persistence: None,
-        .. ProptestConfig::default()
-    })]
+/// A `u16` in `lo..hi`.
+fn range(rng: &mut XorShift, lo: u16, hi: u16) -> u16 {
+    u16::try_from(rng.range(usize::from(lo), usize::from(hi))).expect("below hi")
+}
 
-    /// In-bounds unchecked reads must match safe reads for all columns.
-    #[test]
-    fn row_get_unchecked_matches_safe_access(
-        cols in 1u16..200,
-        writes in prop::collection::vec((0u16..300, prop::char::range(' ', '~')), 0..200),
-    ) {
+/// An ASCII character in `lo..=hi`.
+fn char_in(rng: &mut XorShift, lo: char, hi: char) -> char {
+    char::from(range(rng, lo as u16, hi as u16 + 1) as u8)
+}
+
+/// In-bounds unchecked reads must match safe reads for all columns.
+#[test]
+fn row_get_unchecked_matches_safe_access() {
+    let mut rng = XorShift::new(0x0A11_0C0D);
+    for _ in 0..256 {
+        let cols = range(&mut rng, 1, 200);
         let mut pages = PageStore::new();
         // SAFETY: Test-local `pages` outlives `row` for the full scope.
         let mut row = unsafe { Row::new(cols, &mut pages) };
 
-        for (col, ch) in writes {
+        for _ in 0..range(&mut rng, 0, 200) {
+            let (col, ch) = (range(&mut rng, 0, 300), char_in(&mut rng, ' ', '~'));
             if col < cols {
                 row.write_char(col, ch);
             }
@@ -36,32 +39,22 @@ proptest! {
             let safe = row.get(col).expect("col from 0..cols must be in-bounds");
             // SAFETY: `col` is drawn from `0..cols`.
             let unchecked = unsafe { row.get_unchecked(col) };
-            prop_assert_eq!(
-                unchecked.char(),
-                safe.char(),
-                "char mismatch at col {} (cols={})",
-                col,
-                cols
-            );
-            prop_assert_eq!(
-                unchecked.flags(),
-                safe.flags(),
-                "flags mismatch at col {} (cols={})",
-                col,
-                cols
-            );
+            assert_eq!(unchecked.char(), safe.char(), "col {col} (cols={cols})");
+            assert_eq!(unchecked.flags(), safe.flags(), "col {col} (cols={cols})");
         }
 
-        prop_assert!(row.get(cols).is_none(), "safe get must reject col == cols");
+        assert!(row.get(cols).is_none(), "safe get must reject col == cols");
     }
+}
 
-    /// In-bounds unchecked mutable access must update only the targeted cell.
-    #[test]
-    fn row_get_unchecked_mut_updates_only_target_cell(
-        cols in 1u16..160,
-        target in 0u16..300,
-        replacement in prop::char::range('!', '~'),
-    ) {
+/// In-bounds unchecked mutable access must update only the targeted cell.
+#[test]
+fn row_get_unchecked_mut_updates_only_target_cell() {
+    let mut rng = XorShift::new(0x007A_26E7);
+    for _ in 0..256 {
+        let cols = range(&mut rng, 1, 160);
+        let target = range(&mut rng, 0, 300) % cols;
+        let replacement = char_in(&mut rng, '!', '~');
         let mut pages = PageStore::new();
         // SAFETY: Test-local `pages` outlives `row` for the full scope.
         let mut row = unsafe { Row::new(cols, &mut pages) };
@@ -72,51 +65,40 @@ proptest! {
         }
 
         let before: Vec<char> = (0..cols)
-            .map(|col| row.get(col).expect("row initialized across all cols").char())
+            .map(|col| {
+                row.get(col)
+                    .expect("row initialized across all cols")
+                    .char()
+            })
             .collect();
 
-        let target = target % cols;
         // SAFETY: modulo ensures `target < cols`.
         unsafe { *row.get_unchecked_mut(target) = Cell::new(replacement) };
 
         for col in 0..cols {
-            let actual = row
-                .get(col)
-                .expect("all tested columns remain in-bounds")
-                .char();
+            let actual = row.get(col).expect("in bounds").char();
             if col == target {
-                prop_assert_eq!(
-                    actual,
-                    replacement,
-                    "target col {} should be updated",
-                    col
-                );
+                assert_eq!(actual, replacement, "target col {col} should be updated");
             } else {
-                prop_assert_eq!(
-                    actual,
-                    before[usize::from(col)],
-                    "non-target col {} changed unexpectedly",
-                    col
-                );
+                assert_eq!(actual, before[usize::from(col)], "col {col} changed");
             }
         }
     }
+}
 
-    /// Distinct grid rows must not alias each other under random writes.
-    #[test]
-    fn grid_row_storage_does_not_alias_across_rows(
-        rows in 2u16..40,
-        cols in 4u16..120,
-        source_row in 0u16..40,
-        mutate_row in 0u16..40,
-        writes in prop::collection::vec((0u16..200, prop::char::range('A', 'Z')), 1..200),
-    ) {
-        let mut grid = Grid::new(rows, cols);
-        let source_row = source_row % rows;
-        let mut mutate_row = mutate_row % rows;
+/// Distinct grid rows must not alias each other under random writes.
+#[test]
+fn grid_row_storage_does_not_alias_across_rows() {
+    let mut rng = XorShift::new(0x0A11_A5ED);
+    for _ in 0..256 {
+        let rows = range(&mut rng, 2, 40);
+        let cols = range(&mut rng, 4, 120);
+        let source_row = range(&mut rng, 0, 40) % rows;
+        let mut mutate_row = range(&mut rng, 0, 40) % rows;
         if source_row == mutate_row {
             mutate_row = (mutate_row + 1) % rows;
         }
+        let mut grid = Grid::new(rows, cols);
 
         {
             let source = grid
@@ -128,44 +110,30 @@ proptest! {
             }
         }
 
-        let baseline: Vec<char> = (0..cols)
-            .map(|col| {
-                grid.row(source_row)
-                    .expect("source row should still exist")
-                    .get(col)
-                    .expect("source col should be in bounds")
-                    .char()
-            })
-            .collect();
+        let row_chars = |grid: &Grid, r: u16| -> Vec<char> {
+            let row = grid.row(r).expect("row in bounds");
+            (0..cols)
+                .map(|col| row.get(col).expect("col in bounds").char())
+                .collect()
+        };
+        let baseline = row_chars(&grid, source_row);
 
         {
             let row = grid
                 .row_mut(mutate_row)
                 .expect("mutate row index must be in bounds");
-            for (col, ch) in writes {
+            for _ in 0..range(&mut rng, 1, 200) {
+                let (col, ch) = (range(&mut rng, 0, 200), char_in(&mut rng, 'A', 'Z'));
                 if col < cols {
                     row.write_char(col, ch);
                 }
             }
         }
 
-        let source = grid
-            .row(source_row)
-            .expect("source row should remain available");
-        for col in 0..cols {
-            let actual = source
-                .get(col)
-                .expect("source col should remain in bounds")
-                .char();
-            let expected = baseline[usize::from(col)];
-            prop_assert_eq!(
-                actual,
-                expected,
-                "source row {} changed at col {} after mutating row {}",
-                source_row,
-                col,
-                mutate_row
-            );
-        }
+        assert_eq!(
+            row_chars(&grid, source_row),
+            baseline,
+            "source row {source_row} changed after mutating row {mutate_row}"
+        );
     }
 }

@@ -29,12 +29,8 @@
 //!
 //! Every team id is `TEAMIDXXXX` / `OTHERTEAM1`, every certificate hash is a
 //! repeated hex digit, and every name is `Placeholder Org`. `pins::APPLE_TEAM_ID`
-//! is ARMED in this tree and this file asserts its value directly; the note that used to
-//! stand here said the opposite and pointed at a tripwire the arming commit deleted. That
-//! correction then left a dangling pointer of its own, which this fixes: the test it named,
-//! `the_shipped_anchor_is_unset_so_the_tier_is_inert`, is defined NOWHERE in the tree. The
-//! live assertion is
-//! `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`, which pins both
+//! is ARMED in this tree;
+//! `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert` pins both
 //! halves — the real anchor is active, and an empty anchor still resolves inert.
 
 use crate::{dmg, ledger, publish, sign};
@@ -297,8 +293,8 @@ fn the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert() {
 fn an_empty_anchor_resolves_to_the_inactive_tier_without_touching_a_keychain() {
     // No credentials, no certificate, no notarytool profile — and no error.
     // Anything else would break every FORK's cut, and every cut this tree made before
-    // 2026-08-15. WRONG BEFORE: "every cut that ships today" — `pins::APPLE_TEAM_ID` is
-    // armed, so a cut from this tree resolves the ACTIVE tier.
+    // 2026-08-15. `pins::APPLE_TEAM_ID` is armed, so a cut from this tree resolves the
+    // ACTIVE tier.
     let tier = sign::resolve_apple_tier("", None).expect("an unpinned build must resolve");
     assert!(
         tier.identity().is_none(),
@@ -590,9 +586,9 @@ fn a_cut_without_a_profile_is_told_to_pass_one_and_a_profile_without_notary_is_n
 
 #[test]
 fn a_profile_with_no_apple_stanza_yields_no_auth() {
-    // A FORK's case: Tier APPLE off, profile carries only the signing key. WRONG BEFORE:
-    // "the shipped case" — the anchor is armed, so a cut from this tree needs a real
-    // notarytool credential named in the profile.
+    // A FORK's case: Tier APPLE off, profile carries only the signing key. The anchor is
+    // armed, so a cut from this tree needs a real notarytool credential named in the
+    // profile.
     assert!(
         sign::credentials_notary_auth("signing_key = \"AA==\"\n")
             .expect("no Apple stanza is legal")
@@ -933,9 +929,7 @@ fn the_packaging_lane_builds_exactly_one_dmg_and_one_zip() {
 fn the_inactive_build_packages_exactly_as_it_always_did() {
     // The other half of the same call site: with an EMPTY anchor — a fork's, and this
     // tree's own before 2026-08-15 — the hooks must add NOTHING. No Apple tool, no
-    // re-hash, and the manifest keeps the digest `dmg::create` minted. WRONG BEFORE:
-    // this called that anchor "the shipped anchor" and the result "what ships today";
-    // the shipped anchor has been ARMED since 2026-08-15.
+    // re-hash, and the manifest keeps the digest `dmg::create` minted.
     let log = log();
     let out = publish::notarize_and_package(
         &app(),
@@ -1082,8 +1076,7 @@ fn the_self_check_asks_nothing_of_apple_for_a_cut_that_claims_no_team() {
     // The other direction of the same gate — inverting it (`if !team.is_empty()`
     // → `if true`) would judge an ad-hoc cut (a fork's, or one of this tree's from before
     // 2026-08-15) by rules it cannot satisfy and fail every release it makes. The hard
-    // codesign gate still runs; nothing else does. WRONG BEFORE: "the shipped ad-hoc cut"
-    // and "the shipped tier claims nothing" — the shipped tier is ARMED.
+    // codesign gate still runs; nothing else does.
     let log = log();
     let note = publish::selfcheck_signing("", &app(), &dmg(), &FakeTools::healthy(&log))
         .expect("a cut that claims no team passes without asking Apple anything");
@@ -1223,6 +1216,4 @@ fn a_resume_that_will_rebuild_must_still_prove_it_can_notarize() {
 // The shipped anchor's effect on a resume is asserted inside
 // `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`, deliberately:
 // that keeps every assertion about the real anchor in ONE test, which is what pins.rs's
-// activation checklist points at. WRONG BEFORE: this named
-// `the_shipped_anchor_is_unset_so_the_tier_is_inert` — the pre-arming tripwire, deleted on
-// 2026-08-15 and defined nowhere in the tree since.
+// activation checklist points at.

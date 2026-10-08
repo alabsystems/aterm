@@ -429,26 +429,9 @@ mod tests {
 
     #[test]
     fn relative_listener_witness_restores_directory_across_transport() {
-        const CHILD: &str = "ATERM_TEST_RELATIVE_SOCKET_DIRECTORY";
-        if std::env::var_os(CHILD).is_none() {
-            // Cwd is process-wide; the normal parallel test runner never changes
-            // it. This single-test child owns every file and listener below.
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "control_socket_identity::tests::relative_listener_witness_restores_directory_across_transport",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "relative socket child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        // Cwd is process-wide; the normal parallel test runner never changes
+        // it. This single-test child owns every file and listener below.
+        if !crate::test_alone::alone() {
             return;
         }
         let original = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
@@ -465,6 +448,7 @@ mod tests {
         let listener = CtlListener::bind(&plan.sock_path).unwrap();
         let identity = SocketIdentity::capture(&plan, &listener, &token).unwrap();
         assert_eq!(identity.directory.as_ref(), Some(&original_dir));
+        // std's Command on purpose: never spawned; the shipped `bind_command_identity` takes std's.
         let mut command = Command::new("unused-test-command");
         bind_command_identity(&mut command, Some(&identity));
         let wire = command
@@ -525,6 +509,7 @@ mod tests {
         let decoded = SocketIdentity::decode(&wire).unwrap();
         assert!(decoded == identity);
         assert!(decoded.matches_current(&plan));
+        // std's Command on purpose: never spawned; the shipped `bind_command_identity` takes std's.
         let mut command = Command::new("unused-test-command");
         command.env(ENV_IDENTITY, "inherited-authority");
         bind_command_identity(&mut command, None);
@@ -586,6 +571,45 @@ mod tests {
         assert!(SocketIdentity::capture(&plan, &listener, &token).is_none());
         std::fs::remove_file(&plan.token_path).unwrap();
         assert!(!identity.matches_current(&plan));
+    }
+
+    /// A WITNESS THE PARENT'S OWN REBIND MOVED IS FILED A MOMENT (round eight
+    /// of the update audit, finding 69). The successor carries the witness
+    /// sampled when the attempt began; the parent's self-healing listener
+    /// rebind moves the socket's inode under it while it is held, so its
+    /// fixed-socket check refuses the intake. That is the parent's endpoint,
+    /// not the new build's bytes: a parent that declared it reads 75 files
+    /// the exit Transient, and an older one is sent the `74` it always read.
+    ///
+    /// RED before the fix: the successor exited 74, which the parent files
+    /// Structural, and two such races converged a healthy build.
+    #[test]
+    fn a_witness_the_parents_rebind_moved_is_filed_a_moment() {
+        use crate::app_native::PhysicalFailureShape as Shape;
+        let (_dir, plan, listener, token) = fixture();
+        let identity = SocketIdentity::capture(&plan, &listener, &token).unwrap();
+        assert!(
+            identity.matches_current(&plan),
+            "PRECONDITION: the witness holds"
+        );
+        let mut published = crate::control_listener::socket_file_id(&plan.sock_path);
+        let _fresh = crate::control_listener::rebind_socket(&plan.sock_path, &mut published)
+            .expect("the rebind");
+        assert!(
+            !identity.matches_current(&plan),
+            "the carried witness no longer matches: the successor refuses"
+        );
+        let filed = |parent_reads_passing| {
+            Shape::of_child_death(crate::ChildDeathEvidence::Exited {
+                code: crate::seamless::endpoint_refusal_exit(parent_reads_passing),
+            })
+        };
+        assert_eq!(filed(true), Shape::Transient, "a moment, retried");
+        assert_eq!(
+            crate::seamless::endpoint_refusal_exit(false),
+            74,
+            "an older parent is sent what it always was"
+        );
     }
 
     #[test]

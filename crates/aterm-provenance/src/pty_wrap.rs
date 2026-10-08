@@ -17,13 +17,13 @@
 //! with `PhantomData<fn() -> O>` is a compile-time-only marker; it contributes
 //! no runtime state to reinterpret.
 //!
-//! The crate-level `forbid(unsafe_code)` is relaxed narrowly for this module
+//! The crate-level `deny(unsafe_code)` is relaxed narrowly for this module
 //! via `#![allow(unsafe_code)]` at the file top; the rest of the crate
-//! continues to forbid unsafe.
+//! denies unsafe.
 //!
 //! # Kani coverage
 //!
-//! The harness `pty_wrap_ref_identity_slice` in `proofs/kani/provenance/`
+//! The harness `pty_wrap_ref_identity_slice` (the `kani_proofs` module below)
 //! asserts that for any `&[u8]` the wrapped reference has the same address,
 //! length, and byte contents as the input reference (bit-identical).
 

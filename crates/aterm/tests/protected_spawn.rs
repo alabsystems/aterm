@@ -20,8 +20,7 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::launch_isolation;
 
 /// How long the CLI gets to run the scripted shell session and exit. GENEROUS —
 /// a healthy run finishes in well under a second even on a loaded CI box — because
@@ -40,16 +39,14 @@ const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 /// lanes off (`launch_isolation::CONFIG_OFF` — settings, since the environment vetoes
 /// are gone), and `--no-reroute`, so nothing is laid for the upstream Rust names.
 /// `/bin/sh` is the shell on unix, and piped stdio still routes to the SESSION.
-fn session_command(test: &str) -> Command {
-    let root = std::env::temp_dir().join(format!(
-        "aterm-protected-spawn-{test}-{}",
-        std::process::id()
-    ));
-    launch_isolation::prepare(&root).expect("prepare private session state");
+/// The roots go when the returned guard drops: the caller holds it until the
+/// session has exited.
+fn session_command(test: &str) -> (Command, aterm_tempfile::TempDir) {
+    let root = launch_isolation::scratch_root(&format!("aterm-protected-spawn-{test}"));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    launch_isolation::apply(&mut cmd, &root);
+    launch_isolation::apply(&mut cmd, root.path());
     cmd.args(["--session", launch_isolation::NO_REROUTE]);
-    cmd
+    (cmd, root)
 }
 
 /// Bounded replacement for `Child::wait_with_output`, shared by every test in
@@ -128,7 +125,8 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
 #[test]
 fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
     // No containment flag: the default User mode — no sandbox, fast.
-    let mut child = session_command("protected")
+    let (mut cmd, _root) = session_command("protected");
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -172,7 +170,7 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
 #[test]
 fn a_session_builds_no_vt_model_and_the_old_seam_arms_nothing() {
     let run = |model: Option<&str>| -> String {
-        let mut cmd = session_command("model");
+        let (mut cmd, _root) = session_command("model");
         cmd.arg("--verbose") // the epilogue is the observable
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -203,14 +201,15 @@ fn a_session_builds_no_vt_model_and_the_old_seam_arms_nothing() {
 }
 
 /// `--containment containment` wraps the spawn in `sandbox-exec` (deny
-/// network, writes outside the temp roots, and credential/private-data
-/// reads). A basic shell command must STILL run
+/// network, other processes' task ports, writes outside the temp roots, and
+/// credential/private-data reads). A basic shell command must STILL run
 /// under the sandbox — the OS confinement must not break normal shell operation.
 /// macOS-only (Seatbelt `sandbox-exec` is the actuated path).
 #[cfg(target_os = "macos")]
 #[test]
 fn cli_runs_under_the_os_sandbox_in_containment_mode() {
-    let mut child = session_command("containment")
+    let (mut cmd, _root) = session_command("containment");
+    let mut child = cmd
         .args(["--containment", "containment"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -247,7 +246,8 @@ fn cli_runs_under_the_os_sandbox_in_containment_mode() {
 #[cfg(unix)]
 #[test]
 fn malformed_containment_mode_fails_closed_not_open() {
-    let mut child = session_command("malformed")
+    let (mut cmd, _root) = session_command("malformed");
+    let mut child = cmd
         .args(["--containment", "definitely-not-a-real-mode"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -309,7 +309,8 @@ fn malformed_containment_mode_fails_closed_not_open() {
 #[cfg(windows)]
 #[test]
 fn cli_runs_a_command_through_the_conpty_seam_and_exits_with_the_shells_status() {
-    let mut child = session_command("protected-win")
+    let (mut cmd, _root) = session_command("protected-win");
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

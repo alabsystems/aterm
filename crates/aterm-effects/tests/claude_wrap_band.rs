@@ -1,108 +1,73 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A WORD CARRIED DOWN BY A SOFT-WRAPPED CARET KEEPS ITS BAND, AND ONLY
-//! ITS BAND** (2026-09-23 — the owner's screenshot, Claude Code's composer:
-//! `› the other aterm window had this prompt appear asking for permission.
-//! however, your aterm claude code harness should have` filling row 1 and
-//! `  already been runnignin █[Image #1] in the` on row 2, the words typed
-//! INTO the line at the fold. The band under `already…` starts under the
-//! `l`, on a fresh red walk; the `a` at column 2 is dark; a detached stub
-//! sits in the blank indent at columns 0–1).
+//! A word carried down by a soft-wrapped caret keeps its band, and only its
+//! band: in Claude Code's composer, words typed into a line at the fold must be
+//! lit from their first letter on the continuation row, with nothing in the
+//! blank indent.
 //!
-//! Every take here is REAL Claude Code (v2.1.280, the fullscreen composer on
-//! the alternate screen) recorded under `docs/design/repro/ptyrec.py` inside a
-//! headless aterm 0.91.0 at 40×120 (7×14 px cells), driven through the
-//! keyboard seam with `aterm ctl key`; nothing was ever submitted. The line
-//! is typed, the caret is walked back (Left, or Alt+Left/Alt+Right word
-//! hops), and ` already been runnignin` is typed at 8–12 cps:
+//! Every take is real Claude Code (v2.1.280, fullscreen composer on the
+//! alternate screen) recorded with `docs/design/repro/ptyrec.py` in a headless
+//! aterm at 40×120 (7×14 px cells), keys via `aterm ctl key`, nothing submitted.
+//! The line is typed, the caret walked back (Left, or Alt+Left/Alt+Right word
+//! hops), and ` already been runnignin` typed at 8–12 cps:
 //!
-//! * `row1-end` — THE OWNER'S SHAPE. The caret after `have`, the last word of
-//!   row 1. The Space moves the caret to column 117, the last text column.
-//!   The `a` is written AT (36,117) and the caret ALONE soft-wraps to the
-//!   continuation row's indent: `ESC[H CR ESC[117C ESC[36B a … ESC[38;3H`,
-//!   caret (37,2). The `l` erases the `a` from row 1 and writes `al` from
-//!   the indent: `ESC[117C ESC[36B ESC[K CR ESC[2C ESC[1B al [image #1]…
-//!   ESC[38;5H`, caret (37,4). The partial word sat at the end of row 1 for
-//!   one key, then the whole word went down.
-//! * `row1-end-six` — the same with nine columns of room: `alread` is typed
-//!   on row 1, its `d` soft-wraps the caret to (37,2), and the `y` moves the
-//!   whole word to (37,2..8), caret (37,9).
-//! * `hops`, `hops-fast` — `row1-end` reached the owner's way: Alt+Left word
-//!   hops to the start of row 1, Alt+Right word hops back to `have` (250 ms
-//!   and 140 ms apart; the fast take types at once, while the hops' wake
-//!   still stands on row 1).
-//! * `eol-caret` — the caret before `[image`, which stood at the END of row 1
-//!   (caret (36,112)): the first key erases row 1 from 112 and writes
-//!   `a[image #1]` from (37,2), caret (37,3) — a one-row-down typed move whose
-//!   landing row holds the key's glyph. A separate root cause: the seam held
-//!   that move as a background footer park and swallowed the whole insert
-//!   (row 2 live `[]` throughout, every mode); it is judged at once now
+//! * `row1-end`, the main shape: the caret after `have`, row 1's last word. The
+//!   Space moves the caret to column 117, the last text column. The `a` is
+//!   written at (36,117) and the caret alone soft-wraps to the continuation
+//!   indent: `ESC[H CR ESC[117C ESC[36B a … ESC[38;3H`, caret (37,2). The `l`
+//!   erases the `a` from row 1 and writes `al` from the indent: `ESC[117C
+//!   ESC[36B ESC[K CR ESC[2C ESC[1B al [image #1]… ESC[38;5H`, caret (37,4).
+//! * `row1-end-six`: nine columns of room; `alread` is typed on row 1, its `d`
+//!   soft-wraps the caret to (37,2), and `y` moves the whole word to
+//!   (37,2..8), caret (37,9).
+//! * `hops`, `hops-fast`: `row1-end` reached by Alt+Left hops to the start of
+//!   row 1 and Alt+Right hops back to `have` (250 and 140 ms apart; the fast
+//!   take types while the hops' wake still stands).
+//! * `eol-caret`: the caret before `[image` at the end of row 1 (36,112); the
+//!   first key erases row 1 from 112 and writes `a[image #1]` from (37,2),
+//!   caret (37,3): a one-row-down typed move judged at once
 //!   (`CursorGlow::key_pushed_text_down`).
-//! * `row2-start` (control) — the caret before `[image`, which already stood
-//!   at the start of row 2: an in-place insert from (37,2), no row change.
-//! * `end` (control) — typing at the end of the text; the box grows a row
-//!   on the Space after `[image` (the 2.1.278 box-growth shape
-//!   `composer_box_growth_wrap.rs` models) and `#1]` lands on row 2.
+//! * `row2-start` (control): the caret before `[image` at the start of row 2;
+//!   an in-place insert, no row change.
+//! * `end` (control): typing at the end of the text; the box grows a row on the
+//!   Space after `[image` (the shape `composer_box_growth_wrap.rs` models).
 //!
-//! **THE MECHANISM.** The engine modelled a composer wrap only as the text
-//! moving WITH the caret: the 2.1.278 end-of-text wrap puts the wrap key's
-//! glyph at `landing − 1` on the new row. For the soft-wrapped caret that
-//! cell is the blank indent. The wrap key's move (36,117)→(37,2) matched
-//! the coalesced fold: the seam swept `(37,1)`, the key's `Typed` replay laid
-//! the same cell, and its one credit was spent there — THE STUB — while its
-//! real glyph at (36,117) got nothing. The next key's hop (37,2)→(37,4) is two
-//! cells for one press, so the press budget refused it (`no-credits` on the
-//! trail ring), and the ribbon's re-wrap relay measured the word from the
-//! last typed Space without the wrap key's own glyph: `(37,2)` never got a
-//! cell — THE GAP, with the band starting under `l`.
+//! The mechanism: a composer wrap where the text moves with the caret puts the
+//! wrap key's glyph at `landing − 1` on the new row, but for a soft-wrapped
+//! caret that cell is the blank indent and the glyph is at the origin. The
+//! seam reads the probes (`CursorGlow::soft_wrapped_caret`: the landing row
+//! blank up to the landing, the origin cell blank in the last probe and a glyph
+//! now) and lays the key's one cell at the origin. The ribbon keeps the word
+//! the key ends (`Ribbon::settle_carry`) and, when the next key's echo advances
+//! past it, relays its lit cells from row 1 to the indent on their walk, with
+//! the reflowing key's glyph. A typeahead key's `Typed` replayed at the frame's
+//! caret is held at the landing (`Engine::replay_events`) and laid by the
+//! reflow.
 //!
-//! Now the seam reads the probes (`CursorGlow::soft_wrapped_caret`: the
-//! landing row blank up to the landing, the origin cell blank in the last
-//! probe and a glyph now) and lays the key's one cell at the origin; the
-//! ribbon keeps the word the key ends (`Ribbon::settle_carry`) and, when the
-//! next key's echo advances past it, relays its lit cells from row 1 to the
-//! indent on the walk they had, with the reflowing key's own glyph.
-//!
-//! The replay is `codex_particle_replay.rs`'s: one real `Terminal`, sampled
-//! as `app_render.rs`'s LOCK A samples it (content scroll, repaint blink,
-//! the caret's row probe with its trust class and neighbours, the print
-//! anchor, every ribbon row), `CursorGlow` ticked on an 8 ms train that holds
-//! while a `?2026` bracket is open, with the hints the app stamps for each
-//! key (`note_typed_expected` per printable byte; an arrow clears the typed
-//! bank and stamps `note_motion`). Each owner-shape take is replayed under
-//! every [`Present`] mode — the key's echo in the frame that sees its press,
-//! a frame between the two (the key's `Typed` HELD, its cell from the seam's
-//! sweep alone), the wrap key after a pause (judged a typed RE-ANCHOR, not
-//! a coalesced fold), and the first and the third again with TYPEAHEAD
-//! across the wrap (the next key pressed before the wrap key's echo, so one
-//! frame holds both keys and the wrap); the controls under the first two
-//! (`row2-start` has no wrap key to pause before). The census reads the
-//! ribbon's own CELLS per column of the two text rows: a one-cell hole
-//! between two cells is feathered over by the plan's coverage, so only the
-//! cells show it.
-//!
-//! Measured before the fix: `row1-end` laid a stub at (37,1) from 15813 ms
-//! for 497 frames and left (37,2) dark from 16097 ms (live `[1,3,4,…]`); with
-//! a frame between press and echo (37,2) AND (37,3) stayed dark; after the
-//! pause the re-anchor's landing sweep laid the same stub; `six` left (37,2)
-//! dark under a relay of `[3,9)`. `hops` and `hops-fast` read as `row1-end`.
-//! Measured before the typeahead hold (fix/trail-land review): with the
-//! next key pressed before the wrap key's echo, `row1-end`, `row1-end-six`,
-//! `hops` and `hops-fast` each laid the stub again under both typeahead
-//! modes — that key's `Typed`, replayed at the frame's caret, laid
-//! `landing − 1`, the blank indent (`Engine::replay_events` now holds it at
-//! the landing, and the reflow lays it).
+//! The replay is `codex_particle_replay.rs`'s: one real `Terminal`, sampled as
+//! `app_render.rs`'s lock A does (content scroll, repaint blink, the caret row
+//! probe with its trust class and neighbours, the print anchor, every ribbon
+//! row), `CursorGlow` ticked on an 8 ms train that holds while a `?2026` bracket
+//! is open, with the app's hints per key (`note_typed_expected` per printable
+//! byte; an arrow clears the typed bank and stamps `note_motion`). Each main
+//! take runs under every [`Present`] mode; the controls under the first two.
+//! The census reads the ribbon's own cells per column of the two text rows (the
+//! plan's coverage feathers over a one-cell hole).
 //!
 //! Diagnostics: `targo --unverified test -p aterm-effects --test
-//! claude_wrap_band census -- --ignored --nocapture` prints every take's
+//! effects_suite claude_wrap_band::census -- --ignored --nocapture` prints every take's
 //! verdict; `CLAUDE_WRAP_ONLY=<take>` narrows it, `CLAUDE_WRAP_DUMP=1` prints
 //! the two rows frame by frame, and `CLAUDE_WRAP_RING=<ms>:<ms>` prints every
 //! admission verdict and every ribbon cell in that window.
 
+use crate::common::{
+    LIT_COV, Rec, caret_sample, coverage, is_arrow, is_key, note_blink, observe_neighbor_rows,
+    observe_ribbon_rows_where, rainbow_cfg, recording, sync_scroll,
+};
 use aterm_core::render::GlowQuad;
-use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, ProbeTrust};
+use aterm_core::terminal::{ContentScrollState, Terminal};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, ProbeTrust};
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::ribbon::{FLOW_TOTAL_S, RETRACT_FADE_S};
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
@@ -122,8 +87,6 @@ const ROW2: u16 = 37;
 const INDENT: u16 = 2;
 /// The frame train.
 const FRAME_MS: u64 = 8;
-/// A column is LIT at this planned coverage (the glass census's 20/255).
-const LIT_COV: u8 = 20;
 /// `app_render.rs`'s `BLINK_RECENT_MAX`.
 const BLINK_RECENT: Duration = Duration::from_secs(1);
 /// [`Present::PauseBeforeWrap`]'s pause: past the seam's typing rhythm
@@ -169,25 +132,21 @@ const FIXTURES: [(&str, &str); 7] = [
 /// How the host presents a key relative to its echo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Present {
-    /// The echo lands before the next frame (Claude Code echoes 1–3 ms after
-    /// the key): the key's `Typed` is replayed in the frame that observes
-    /// its move.
+    /// The echo lands before the next frame (Claude Code echoes 1–3 ms after the
+    /// key): the key's `Typed` is replayed in the frame that observes its move.
     EchoInFrame,
-    /// A frame between each key's press and its echo, as a 120 Hz window
-    /// renders whenever one falls between the two: the key's `Typed` is
-    /// HELD on the press frame and its cell comes from the seam's sweep.
+    /// A frame between each key's press and its echo, as a 120 Hz window renders
+    /// when one falls between: the key's `Typed` is held on the press frame and
+    /// its cell comes from the seam's sweep.
     FrameBeforeEcho,
-    /// [`Present::EchoInFrame`] with the hand pausing a second before the
-    /// key that soft-wraps the caret — the first key after arriving at the
-    /// fold. Past the typing rhythm the move is not a coalesced fold; the
-    /// seam judges it a typed RE-ANCHOR, whose landing sweep is the other
-    /// path that laid the stub.
+    /// [`Present::EchoInFrame`] with a one-second pause before the key that
+    /// soft-wraps the caret. Past the typing rhythm the move is judged a typed
+    /// re-anchor, whose landing sweep must not lay the indent either.
     PauseBeforeWrap,
-    /// [`Present::EchoInFrame`] with TYPEAHEAD across the wrap: the key
-    /// after the wrap key is pressed a millisecond after it, before its
-    /// echo (a lagging composer, a fast hand), so one frame holds both
-    /// keys' `Typed` and the soft wrap's `Move`. The second key has no echo
-    /// yet — the reflow that carries the word down is its echo.
+    /// [`Present::EchoInFrame`] with typeahead across the wrap: the next key is
+    /// pressed a millisecond after the wrap key, before its echo, so one frame
+    /// holds both keys' `Typed` and the soft wrap's `Move`. The reflow that
+    /// carries the word down is the second key's echo.
     TypeaheadAcrossWrap,
     /// [`Present::PauseBeforeWrap`] with the same typeahead: the wrap judged
     /// a typed re-anchor.
@@ -220,75 +179,17 @@ fn fixture(name: &str) -> &'static str {
         .expect("a fixture")
 }
 
-enum Rec {
-    Out(Vec<u8>),
-    In(Vec<u8>),
-}
-
-fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex"))
-        .collect()
-}
-
-/// `(ms from the first line, event)`; `ptyrec.py` stamps nanoseconds.
-fn recording(src: &str) -> Vec<(u64, Rec)> {
-    let mut t0 = None;
-    src.lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            let mut it = l.splitn(3, ' ');
-            let ns: u64 = it.next().expect("stamp").parse().expect("stamp");
-            let kind = it.next().expect("kind");
-            let bytes = unhex(it.next().expect("bytes"));
-            let t0 = *t0.get_or_insert(ns);
-            let ms = (ns - t0) / 1_000_000;
-            match kind {
-                "O" => (ms, Rec::Out(bytes)),
-                "I" => (ms, Rec::In(bytes)),
-                k => panic!("bad kind {k}"),
-            }
-        })
-        .collect()
-}
-
 /// The owner's config: rainbow kitty, tall body, default intensity, dark.
 fn cfg() -> GlowConfig {
     GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
         duration: Duration::from_millis(260),
-        length: 18,
         intensity: 1.0,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
+        ..rainbow_cfg()
     }
 }
 
 fn geom() -> Geom {
-    Geom {
-        cw: CW,
-        ch: CH,
-        rows: ROWS,
-        cols: COLS,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (COLS * CW) as u16,
-        win_h: (ROWS * CH) as u16,
-        head: 0,
-    }
+    crate::common::geom(ROWS, COLS, CW, CH)
 }
 
 /// The host's `typed_class_for` and its shiftedness.
@@ -299,14 +200,6 @@ fn class_of(ch: char) -> (bool, TypedClass) {
         c if c.is_uppercase() => (true, TypedClass::Capital),
         c => ("~!@#$%^&*()_+{}|:\"<>?".contains(c), TypedClass::Glyph),
     }
-}
-
-fn is_key(b: &[u8]) -> bool {
-    matches!(b, [c] if (0x20..0x7f).contains(c))
-}
-
-fn is_arrow(b: &[u8]) -> bool {
-    b.starts_with(b"\x1b[") && matches!(b.last(), Some(b'A' | b'B' | b'C' | b'D'))
 }
 
 /// Claude Code's kitty-keyboard Ctrl+C: the take's exit.
@@ -348,8 +241,8 @@ struct Host {
     now: Instant,
     out: Vec<GlowQuad>,
     row_buf: Vec<char>,
-    above: Vec<char>,
-    below: Vec<char>,
+    /// The caret row's neighbours, `[above, below]`.
+    nbrs: [Vec<char>; 2],
     blink: u64,
     last_blink: Option<Instant>,
     scroll: Option<ContentScrollState>,
@@ -374,8 +267,7 @@ impl Host {
             now,
             out: Vec::new(),
             row_buf: Vec::new(),
-            above: Vec::new(),
-            below: Vec::new(),
+            nbrs: [Vec::new(), Vec::new()],
             blink: 0,
             last_blink: None,
             scroll: None,
@@ -418,35 +310,14 @@ impl Host {
         );
     }
 
-    /// The host's own order: the content-scroll sync, the blink edge, the
-    /// context, the caret's row probe (trust and neighbours), the print
-    /// anchor, every ribbon row, then the tick.
+    /// The host's order: content-scroll sync, the blink edge, the context, the
+    /// caret row probe (trust and neighbours), the print anchor, every ribbon
+    /// row, then the tick.
     fn frame(&mut self) {
-        let scroll = self.term.content_scroll_state();
-        match ContentScrollState::delta_since(self.scroll, scroll) {
-            ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged => {}
-            ContentScrollDelta::Translate(rows) => {
-                self.glow.note_scroll(rows);
-                self.glow.drop_row_probe();
-            }
-            ContentScrollDelta::Bands { first_seq, count } => {
-                for i in 0..u64::from(count) {
-                    let m = scroll.band(first_seq + i);
-                    self.glow.note_band_move(m.top, m.bottom, m.delta);
-                }
-                self.glow.drop_row_probe();
-            }
-            ContentScrollDelta::Invalidate => self.glow.curtain(self.now),
-        }
-        self.scroll = Some(scroll);
-        let c = self.term.cursor();
-        let visible = self.term.cursor_visible();
-        let cur = visible.then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink {
-            self.blink = epoch;
+        sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
+        let (c, cur) = caret_sample(&self.term);
+        if note_blink(&self.term, &mut self.glow, &mut self.blink, self.now) {
             self.last_blink = Some(self.now);
-            self.glow.note_repaint_blink(self.now);
         }
         let alt = self.term.is_alternate_screen();
         self.glow.note_context(alt);
@@ -458,53 +329,28 @@ impl Host {
         } else {
             ProbeTrust::ContentOnly
         };
-        let r = usize::from(c.row);
-        self.term.row_cols_into(r, &mut self.row_buf);
+        self.term
+            .row_cols_into(usize::from(c.row), &mut self.row_buf);
         self.glow
             .observe_row_with_trust(c.row, c.col, &self.row_buf, self.now, trust);
-        if r > 0 {
-            self.term.row_cols_into(r - 1, &mut self.above);
-        }
-        if r + 1 < ROWS {
-            self.term.row_cols_into(r + 1, &mut self.below);
-        }
-        self.glow.observe_neighbor_rows(
-            (r > 0).then_some(self.above.as_slice()),
-            (r + 1 < ROWS).then_some(self.below.as_slice()),
-        );
+        observe_neighbor_rows(&self.term, &mut self.glow, &mut self.nbrs, c.row, ROWS);
         self.glow.observe_print_anchor(self.term.print_anchor());
         self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &rr in &rows[..n] {
-            if rr == c.row {
-                continue;
-            }
-            self.term.row_cols_into(usize::from(rr), &mut self.row_buf);
-            self.glow.observe_ribbon_row(rr, &self.row_buf);
-        }
+        observe_ribbon_rows_where::<WITNESS_ROWS>(
+            &self.term,
+            &mut self.glow,
+            &mut self.row_buf,
+            |r| r != c.row,
+        );
         self.glow
             .tick(cur, self.now, &self.cfg, geom(), &mut self.out);
-        self.record((c.row, c.col, visible));
+        self.record((c.row, c.col, cur.is_some()));
         self.debug();
     }
 
     fn record(&mut self, caret: (u16, u16, bool)) {
         let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-        let mut cov = [vec![0u8; COLS], vec![0u8; COLS]];
-        for sg in rib.plan_segments() {
-            let r = ((sg.spine / CH as f32) - 0.5).floor();
-            let c = (sg.x / CW as f32).floor();
-            if r < 0.0 || c < 0.0 || (c as usize) >= COLS {
-                continue;
-            }
-            for (i, row) in [ROW1, ROW2].into_iter().enumerate() {
-                if r as usize == usize::from(row) {
-                    let k = c as usize;
-                    cov[i][k] = cov[i][k].max(sg.cov);
-                }
-            }
-        }
+        let cov = [ROW1, ROW2].map(|row| coverage(&self.glow, geom(), row));
         let cols_of = |row: u16, live_only: bool| {
             let mut v: Vec<u16> = rib
                 .cells()
@@ -556,10 +402,10 @@ impl Host {
         }
     }
 
-    /// The hint the app stamps for what the keyboard sent: a printable byte
-    /// is a typed key (`note_typed_expected`, the host's single-cell arm), an
-    /// arrow is navigation (the typed bank cleared, then `note_motion`), a
-    /// Backspace erases one glyph. Terminal replies stamp nothing.
+    /// The app's hint for what the keyboard sent: a printable byte is a typed key
+    /// (`note_typed_expected`, single-cell), an arrow is navigation (typed bank
+    /// cleared, then `note_motion`), Backspace erases one glyph. Terminal
+    /// replies stamp nothing.
     fn hint(&mut self, bytes: &[u8]) {
         match bytes {
             [b] if (0x20..0x7f).contains(b) => {
@@ -570,7 +416,7 @@ impl Host {
             }
             [0x7f] => self.glow.note_backspace_erasing(self.now, Some(1)),
             b if is_arrow(b) => {
-                self.glow.clear_typed(self.now);
+                self.glow.clear_typed_keeping_hand(self.now);
                 self.glow.note_motion(self.now);
             }
             _ => {}
@@ -626,8 +472,8 @@ impl Take {
     }
 }
 
-/// The insert's WRAP KEY: the key whose echo first carries the caret from
-/// row 1 to row 2 — measured on the bytes alone, a terminal with no host.
+/// The insert's wrap key: the key whose echo first carries the caret from row 1
+/// to row 2, measured on the bytes alone.
 fn wrap_key_ms(rec: &[(u64, Rec)], from_ms: u64) -> Option<u64> {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     let mut key = None;
@@ -653,7 +499,7 @@ fn wrap_key_ms(rec: &[(u64, Rec)], from_ms: u64) -> Option<u64> {
 }
 
 fn replay(name: &'static str, present: Present) -> Take {
-    let mut rec = recording(fixture(name));
+    let mut rec = recording(fixture(name), 1_000_000);
     let exit = rec
         .iter()
         .find(|(_, e)| matches!(e, Rec::In(b) if b.as_slice() == CTRL_C))
@@ -671,9 +517,8 @@ fn replay(name: &'static str, present: Present) -> Take {
         if present.typeahead() {
             // The key after the wrap key, pressed a millisecond after it and
             // before its echo: everything after the wrap key is delayed two
-            // (the echo lands 1–3 ms after its key, often inside the same
-            // millisecond), and the next key moved in between — on its own
-            // clock, as a real press is.
+            // (the echo lands 1–3 ms after its key) and the next key moved in
+            // between on its own clock.
             let wk = rec
                 .iter()
                 .position(|(ms, e)| *ms == wrap && matches!(e, Rec::In(b) if is_key(b)))
@@ -749,9 +594,9 @@ struct Verdict {
     /// Frames where a column of typed text left of the caret on the wrapped
     /// row has no live cell: `(ms, caret col, missing columns)`.
     gaps: Vec<(u64, u16, Vec<u16>)>,
-    /// Frames from the landing to the last key with a live cell on the
-    /// wrapped row AT or right of the caret, over the text the reflow moved
-    /// down with the word: `(ms, caret col, columns)`.
+    /// Frames from the landing to the last key with a live cell on the wrapped
+    /// row at or right of the caret, over text the reflow moved down with the
+    /// word: `(ms, caret col, columns)`.
     ahead: Vec<(u64, u16, Vec<u16>)>,
     /// Row-1 cells and lit columns still there long after the last key.
     stranded: Vec<(u64, Vec<u16>, Vec<usize>)>,
@@ -775,9 +620,9 @@ impl Verdict {
             if !stub.is_empty() {
                 v.stub.push((f.ms, stub));
             }
-            // The wrapped row holds the inserted text once the composer's
-            // first row is row 1 and the caret stands on row 2 past the
-            // indent's first column.
+            // The wrapped row holds the inserted text once the composer's first
+            // row is row 1 and the caret is on row 2 past the indent's first
+            // column.
             if v.landed_ms.is_none()
                 && f.text[0].starts_with('❯')
                 && f.caret.0 == ROW2
@@ -795,9 +640,9 @@ impl Verdict {
                 if !missing.is_empty() {
                     v.gaps.push((f.ms, f.caret.1, missing));
                 }
-                // A cell past the one after row 1's text is over the blank
-                // the word left: its light should have gone with it. The
-                // typed Space's own cell, right after the text, stays.
+                // A cell past the one after row 1's text is over the blank the
+                // word left; the typed Space's own cell right after the text
+                // stays.
                 let end = u16::try_from(f.text[0].chars().count()).unwrap_or(u16::MAX);
                 let past: Vec<u16> = f.live[0].iter().copied().filter(|&c| c > end).collect();
                 let fade_ms = (RETRACT_FADE_S * 1000.0) as u64 + FRAME_MS;
@@ -861,33 +706,29 @@ impl Verdict {
             // Precondition: the take reached the shape at all.
             Some("the insert never reached the wrapped row")
         } else if !self.stub.is_empty() {
-            // (1) NOTHING ON THE INDENT: Claude Code's continuation row
-            // writes from column 2; columns 0-1 hold no glyph anyone typed.
+            // (1) Nothing on the indent: the continuation row writes from
+            // column 2; columns 0-1 hold no typed glyph.
             Some("a band cell stands in the wrapped row's indent")
         } else if !self.gaps.is_empty() {
-            // (2) EVERY TYPED GLYPH OF THE WORD THAT CAME DOWN IS LIT, ITS
-            // FIRST LETTER INCLUDED: from the frame the word landed on row 2
-            // (the relay lands on the reflowing key's own echo, that same
-            // frame) to the last key, every column from the indent to the
-            // caret owns a live cell.
+            // (2) Every typed glyph of the word that came down is lit, its
+            // first letter included: from the frame the word landed on row 2
+            // to the last key, every column from the indent to the caret owns
+            // a live cell.
             Some("typed text on the wrapped row has no band under it")
         } else if !self.ahead.is_empty() {
-            // (3) ONLY WHAT WAS TYPED: the `[image #1] in the` the reflow
-            // moved down with the word, right of the caret, is the app's
-            // text and stays dark.
+            // (3) Only what was typed: the `[image #1] in the` moved down with
+            // the word, right of the caret, is the app's text and stays dark.
             Some("a band cell stands at or right of the caret")
         } else if !self.stranded.is_empty() {
-            // (4) NOTHING STRANDED ON THE ROW THE WORD LEFT: long after the
-            // last key (the fold flow is gone by FLOW_TOTAL_S) row 1 owns no
-            // cell and no lit column.
+            // (4) Nothing stranded on the row the word left: long after the last
+            // key (the fold flow is gone by FLOW_TOTAL_S) row 1 owns no cell and
+            // no lit column.
             Some("band left stranded on row 1")
         } else if !self.tail.is_empty() {
-            // (5) THE WORD'S OLD LIGHT LEAVES ROW 1 WITH IT: from a retract
-            // fade after the landing to the last key, no LIVE row-1 cell
-            // stands past the cell after row 1's text. (4) cannot see this:
-            // by its window the fold flow has taken every row-1 cell, a
-            // stranded one included. Cells, not coverage: the typed Space's
-            // live cell right after the text lights the column past it.
+            // (5) The word's old light leaves row 1 with it: from a retract fade
+            // after the landing to the last key, no live row-1 cell stands past
+            // the cell after row 1's text. Cells, not coverage: the typed
+            // Space's cell right after the text lights the column past it.
             Some("the moved word's old light stayed on row 1's blank tail")
         } else {
             None
@@ -896,24 +737,45 @@ impl Verdict {
 }
 
 /// Assert the laws on one take under each of `modes`, naming every mode
-/// that broke one.
+/// that broke one. Each mode replays on its own host and clock, so the modes
+/// run on the binary's threads (`par_map`) and are judged in order after.
 fn assert_laws(name: &'static str, modes: &[Present]) {
-    let failures: Vec<String> = modes
+    assert_laws_of(&[name], modes);
+}
+
+/// [`assert_laws`] on each of `names` in turn, every take under every mode
+/// replayed on one pool first, so the takes of a later name need not wait
+/// for an earlier one's. Each replay is caught in its pool thread, so a
+/// later name's panic waits for the earlier names' judgement, and a name's
+/// first panic in mode order is raised before its verdicts, as when each
+/// name had its own pool.
+fn assert_laws_of(names: &[&'static str], modes: &[Present]) {
+    let takes: Vec<(&'static str, Present)> = names
         .iter()
-        .filter_map(|&present| {
+        .flat_map(|&name| modes.iter().map(move |&present| (name, present)))
+        .collect();
+    let mut verdicts = crate::common::par_map(&takes, |&(name, present)| {
+        std::panic::catch_unwind(|| {
             let t = replay(name, present);
             let v = Verdict::of(&t);
             v.broken()
                 .map(|law| format!("{name} {present:?}: {law}\n{}", v.report(&t)))
         })
-        .collect();
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    })
+    .into_iter();
+    for _ in names {
+        let failures: Vec<String> = verdicts
+            .by_ref()
+            .take(modes.len())
+            .filter_map(|verdict| verdict.unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 }
 
-/// **THE OWNER'S SHAPE.** The caret after the last word of row 1, two
-/// columns from its end; ` already` typed: the `a` is written at the end of
-/// row 1 while the caret soft-wraps to the continuation row's indent, and
-/// the `l` carries `al` down to column 2.
+/// The main shape: the caret after row 1's last word, two columns from its end;
+/// ` already` typed: the `a` is written at the end of row 1 while the caret
+/// soft-wraps to the indent, and the `l` carries `al` down to column 2.
 #[test]
 fn a_partial_word_carried_down_by_the_next_key_keeps_its_first_letter_and_no_indent_stub() {
     assert_laws("row1-end", &Present::ALL);
@@ -940,25 +802,25 @@ fn the_reflowed_word_after_fast_word_hops_keeps_its_first_letter() {
     assert_laws("hops-fast", &Present::ALL);
 }
 
-/// CONTROLS: an insert that begins at the continuation row's indent (no
-/// word changes row, no caret soft-wraps), and typing at the end of the
-/// text while `#1]` wraps with the box's growth.
+/// Controls: an insert beginning at the continuation row's indent (no word
+/// changes row, no caret soft-wraps), and typing at the end of the text while
+/// `#1]` wraps with the box's growth.
 #[test]
 fn controls_an_insert_on_the_wrapped_row_and_an_end_of_text_wrap() {
-    let modes = [Present::EchoInFrame, Present::FrameBeforeEcho];
-    assert_laws("row2-start", &modes);
-    assert_laws("end", &modes);
+    // Both takes' four replays run on one pool (2026-10-05: 3.5 s alone, two
+    // pools one after the other); each take is still judged in turn.
+    assert_laws_of(
+        &["row2-start", "end"],
+        &[Present::EchoInFrame, Present::FrameBeforeEcho],
+    );
 }
 
-/// The caret before `[image`, which stood at the end of row 1: the first key
-/// erases row 1 from the caret, writes `a[image #1]` at the continuation
-/// row's indent and moves the caret down to column 3. No caret soft-wraps
-/// here; the text moved with it. The seam used to hold that move as a
-/// background footer park (row 1's prefix untouched, a key in flight) and
-/// swallow every later move for the park's patience — the whole insert dark,
-/// live on 0.91.0 too. The key's own glyph left of the landing and row 1's
-/// erased tail now judge it at once (`CursorGlow::key_pushed_text_down`;
-/// `wrap_code_reflow.rs` pins the footer's custody beside it).
+/// The caret before `[image` at the end of row 1: the first key erases row 1
+/// from the caret, writes `a[image #1]` at the indent and moves the caret down
+/// to column 3; no caret soft-wraps, the text moved with it. The key's glyph
+/// left of the landing and row 1's erased tail judge the move at once
+/// (`CursorGlow::key_pushed_text_down`) instead of a footer park
+/// (`wrap_code_reflow.rs` pins the footer's custody beside it).
 #[test]
 fn an_insert_whose_first_key_carries_the_caret_down_is_lit() {
     assert_laws("eol-caret", &Present::ALL);
@@ -968,7 +830,7 @@ fn an_insert_whose_first_key_carries_the_caret_down_is_lit() {
 /// a frame before it, printed (see the module doc for the variables that
 /// narrow and deepen it).
 #[test]
-#[ignore = "diagnostic; run with --ignored --nocapture"]
+#[ignore = "diagnostic; run with --test effects_suite -- claude_wrap_band:: --ignored --nocapture"]
 fn census() {
     let only = std::env::var("CLAUDE_WRAP_ONLY").ok();
     for (name, _) in FIXTURES {

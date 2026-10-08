@@ -2,19 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Window operations handler for the terminal.
-//!
-//! This module contains handlers for XTWINOPS (window manipulation) sequences:
-//! - Window state: iconify/de-iconify, raise/lower
-//! - Window geometry: move, resize (pixels and cells)
-//! - Maximize/fullscreen operations
-//! - State queries: window state, position, size
-//! - Title stack: push/pop window and icon titles
-//!
-//! Most operations invoke a platform callback; some (text area size,
-//! title reports) can be answered directly from terminal state.
-//!
-//! Extracted from handler.rs as part of large files refactor.
+//! XTWINOPS (window manipulation) handlers: iconify/raise/lower, move and
+//! resize, maximize/fullscreen, state and size queries, and the title stack.
+//! Most operations go through the platform callback; text-area size and title
+//! reports are answered from terminal state.
 
 use std::sync::Arc;
 
@@ -35,40 +26,25 @@ fn title_stack_targets(params: &[u16]) -> (bool, bool) {
 }
 
 impl TerminalHandler<'_> {
-    /// Handle XTWINOPS - xterm window manipulation and queries.
+    /// Handle XTWINOPS (`CSI Ps ; Ps ; Ps t`).
     ///
-    /// CSI Ps ; Ps ; Ps t
+    /// Manipulation goes through the platform callback; title push/pop and
+    /// some reports are handled in-core.
     ///
-    /// This handles window manipulation and query operations.
-    /// For manipulation operations, the platform callback is invoked.
-    /// For some operations (title push/pop, text area reports), the terminal
-    /// handles them directly without requiring a callback.
-    ///
-    /// # Capability gates (CF-003 + CF-008)
-    ///
-    /// The window-operations mint authority is consulted once per XTWINOPS
-    /// dispatch against the host's `allow_window_ops` policy bit. When the
-    /// host has authorized window ops, a [`WindowOpsCapability`] is minted
-    /// and threaded down to the handlers that call
-    /// [`TerminalHandler::invoke_window_callback`]; when the host has
-    /// not, the mint returns `None`, no capability exists, and the
-    /// callback-invoking paths are structurally unreachable.
-    ///
-    /// The `response_cap: &ResponseCapability` is threaded separately to
-    /// gate the `send_response` calls made by the report subcommands.
-    ///
-    /// Title-stack sub-operations (CSI 22t / 23t) do not invoke the
-    /// window callback and therefore do not require a capability; they
-    /// run regardless of the policy bit.
+    /// The window-operations mint authority is consulted once per dispatch
+    /// against the host's `allow_window_ops`. When authorized, a
+    /// [`WindowOpsCapability`] is minted and passed to the handlers that call
+    /// [`TerminalHandler::invoke_window_callback`]; otherwise no capability
+    /// exists and those paths are unreachable. `response_cap` separately gates
+    /// the report subcommands' `send_response` calls. Title-stack operations
+    /// (CSI 22t / 23t) need no capability.
     ///
     /// See [`super::window_auth`] and [`super::response_capability`].
     pub(super) fn handle_xtwinops(&mut self, response_cap: &ResponseCapability, params: &[u16]) {
         let ps = params.first().copied().unwrap_or(0);
         let mint_authority = WindowMintAuthority::new();
-        // Engine-consulting variant (#7994): when a policy is installed,
-        // a matching rule (Execute | !Execute) wins over the legacy
-        // `allow_window_ops` bool. On fallthrough the bool is authoritative
-        // (design §6.3 Release N backward-compat).
+        // With a policy installed, a matching rule wins over the
+        // `allow_window_ops` bool; otherwise the bool decides.
         let window_cap = mint_authority
             .try_mint_with_engine(self.policy.xtwinops_gate(ps), self.modes.allow_window_ops);
 
@@ -81,17 +57,11 @@ impl TerminalHandler<'_> {
                 }
             }
             None => {
-                // No capability minted — host has not authorized window ops.
-                //
-                // Silently drop manipulation (1–10), geometry/position/size
-                // queries (11–19), and title reports (20–21). These all
-                // either change window state on the host side or leak
-                // information back to the PTY response buffer for
-                // client fingerprinting (#7454, #7643, #7876).
-                //
-                // Only title stack push/pop (22–23) fall through — they
-                // mutate the internal title stack without touching the
-                // window callback or emitting any PTY response.
+                // No capability: drop manipulation (1-10), geometry/position/size
+                // queries (11-19) and title reports (20-21), which change host
+                // window state or leak information for fingerprinting. Only the
+                // title stack (22-23) proceeds: it touches neither the callback
+                // nor the PTY.
                 if let 1..=21 = ps {
                     return;
                 }
@@ -100,40 +70,27 @@ impl TerminalHandler<'_> {
         self.handle_window_title_stack(ps, params);
     }
 
-    /// Minimum window size in pixels for resize operations (#7139).
-    ///
-    /// Prevents remote servers from resizing the window to unusably small
-    /// dimensions (e.g., 1x1 pixel).
+    /// Minimum window size in pixels for resize operations, so a remote program
+    /// cannot shrink the window to something unusable.
     const MIN_RESIZE_PIXELS: u16 = 200;
 
-    /// Minimum window size in cells for resize operations (#7139).
+    /// Minimum window size in cells for resize operations.
     const MIN_RESIZE_CELLS: u16 = 10;
 
-    /// Dispatch XTWINOPS state/geometry subcommands (1–10).
-    ///
-    /// Reached only when the [`WindowOpsCapability`] has been minted,
-    /// i.e. `allow_window_ops = true`. The capability is threaded to
-    /// every `invoke_window_callback` call so the compiler enforces
-    /// the authorization gate at each call site; a future subcommand
-    /// that forgets to request a capability will not compile.
+    /// Dispatch XTWINOPS state/geometry subcommands (1-10). Reached only with a
+    /// minted [`WindowOpsCapability`], which every `invoke_window_callback`
+    /// call requires, so a new subcommand cannot skip the authorization.
     fn handle_window_state_or_geometry(
         &mut self,
         ps: u16,
         params: &[u16],
         cap: &WindowOpsCapability,
     ) -> bool {
-        // Security: CSI t subcommands 1-2 (iconify/de-iconify), 3 (move),
-        // 4 (resize pixels), 8 (resize cells), 9 (maximize), and 10 (fullscreen)
-        // allow remote servers to manipulate the window. Deny move and clamp
-        // resize to safe minimums (#7139).
-        //
-        // The `allow_window_ops = false` deny branch lives in
-        // `handle_xtwinops`: when the capability is not minted, we do not
-        // reach this function at all (for subcommands 1–19) or this function
-        // is entered only for the fall-through path (20+), which this match
-        // does not claim.
+        // Subcommands 1-2 (iconify/de-iconify), 3 (move), 4 (resize pixels),
+        // 8 (resize cells), 9 (maximize) and 10 (fullscreen) let a remote program
+        // manipulate the window: move is denied and resizes are clamped to safe
+        // minimums. The unauthorized case never reaches this function.
         match ps {
-            // Window state manipulation — allowed when window_ops enabled
             1 => {
                 self.invoke_window_callback(WindowOperation::DeIconify, cap);
             }
@@ -141,13 +98,11 @@ impl TerminalHandler<'_> {
                 self.invoke_window_callback(WindowOperation::Iconify, cap);
             }
 
-            // Window move — DENIED (#7139): remote move can push window off-screen
-            3 => {
-                // Silently ignore move requests from remote servers.
-                // A malicious server could move the window off-screen to hide it.
-            }
+            // Move is ignored: a remote program could push the window
+            // off-screen to hide it.
+            3 => {}
 
-            // Window resize (pixels) — clamp to safe minimum (#7139)
+            // Window resize (pixels) — clamp to safe minimum
             4 => {
                 let height = params
                     .get(1)
@@ -174,7 +129,7 @@ impl TerminalHandler<'_> {
                 self.invoke_window_callback(WindowOperation::RefreshWindow, cap);
             }
 
-            // Window resize (cells) — clamp to safe minimum (#7139)
+            // Window resize (cells) — clamp to safe minimum
             8 => {
                 let rows = params
                     .get(1)
@@ -189,18 +144,15 @@ impl TerminalHandler<'_> {
                 self.invoke_window_callback(WindowOperation::ResizeWindowCells { rows, cols }, cap);
             }
 
-            // Maximize/fullscreen (9-10) — allowed when window_ops enabled
             9 => {
                 let sub = params.get(1).copied().unwrap_or(0);
-                let op = Self::maximize_operation(sub);
-                if let Some(op) = op {
+                if let Some(op) = Self::maximize_operation(sub) {
                     self.invoke_window_callback(op, cap);
                 }
             }
             10 => {
                 let sub = params.get(1).copied().unwrap_or(0);
-                let op = Self::fullscreen_operation(sub);
-                if let Some(op) = op {
+                if let Some(op) = Self::fullscreen_operation(sub) {
                     self.invoke_window_callback(op, cap);
                 }
             }
@@ -209,42 +161,24 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Dispatch XTWINOPS report subcommands (11–21).
+    /// Dispatch XTWINOPS report subcommands (11-21). Reached only with a minted
+    /// [`WindowOpsCapability`]; `response_cap` gates the replies.
     ///
-    /// Reached only when the [`WindowOpsCapability`] has been minted.
-    /// `response_cap` gates `send_response` for the report paths.
+    /// A report needs a synchronous value. The GUI's window callback declines
+    /// every report (its window ops post an async wake, which cannot carry a
+    /// reply), so a report is answered only from state the engine holds:
     ///
-    /// # Who can actually answer
-    ///
-    /// A report needs a SYNCHRONOUS value. The window callback is the host's
-    /// only seam into this dispatch, and in this project's GUI it declines
-    /// every report by design — the host answers window ops by posting an async
-    /// wake, and a wake cannot carry a reply back into the parser frame it came
-    /// from. So in practice a report is answered only if the ENGINE can answer
-    /// it from state it truly holds:
-    ///
-    /// - `18 t` (text area in cells): the grid. Exact.
+    /// - `18 t` (text area in cells): the grid.
     /// - `14 t` (text area in pixels) and `16 t` (cell size in pixels): the grid
-    ///   and the cell box the host reported through
-    ///   [`super::Terminal::set_cell_pixel_size`]. Exact once reported, SILENT
-    ///   before — see [`Self::report_cell_size_pixels`].
-    /// - `20 t` / `21 t` (icon label, window title): the engine's own title
-    ///   state.
+    ///   and the cell box the host reported via
+    ///   [`super::Terminal::set_cell_pixel_size`]; silent until reported (see
+    ///   [`Self::report_cell_size_pixels`]).
+    /// - `20 t` / `21 t` (icon label, window title): the engine's title state.
     ///
-    /// The rest have no in-core truth and therefore stay silent — an honest
-    /// non-answer, not an oversight:
-    ///
-    /// - `11 t` window state (iconified?) — a window-manager fact.
-    /// - `13 t` window / text-area POSITION — a window-manager fact.
-    /// - `14 ; 2 t` whole-window pixels — text area plus interior padding plus
-    ///   whatever the WM drew around it; the engine knows none of the three.
-    /// - `15 t` screen size in pixels, `19 t` screen size in cells — properties
-    ///   of the DISPLAY, which the engine has never been told about.
-    ///
-    /// Fabricating any of those (a plausible-looking 0,0 origin, the engine's
-    /// 8x16 placeholder cell) would be strictly worse than silence: an
-    /// application can retry or fall back when a query goes unanswered, but it
-    /// cannot tell a confident wrong number from a right one.
+    /// The rest have no in-core truth and stay silent: `11 t` window state,
+    /// `13 t` position, `14 ; 2 t` whole-window pixels (padding and decoration
+    /// unknown), `15 t` / `19 t` screen size. An unanswered query lets an app
+    /// fall back; a fabricated number cannot be told from a real one.
     fn handle_window_reports(
         &mut self,
         response_cap: &ResponseCapability,
@@ -253,7 +187,6 @@ impl TerminalHandler<'_> {
         cap: &WindowOpsCapability,
     ) -> bool {
         match ps {
-            // Report operations (11-21)
             11 => self.report_window_state(response_cap, cap),
             13 => {
                 self.report_window_position(response_cap, params.get(1).copied().unwrap_or(0), cap);
@@ -342,15 +275,10 @@ impl TerminalHandler<'_> {
     }
 
     /// CSI 14 t (text area, pixels) and CSI 14 ; 2 t (whole window, pixels).
-    ///
-    /// The host gets first refusal. When it declines — which is the norm, see
-    /// [`Self::handle_window_reports`] — the TEXT AREA arm answers in-core:
-    /// the text area is by definition `rows x cols` of the host's reported cell
-    /// box, so the product is a measurement, not a guess.
-    ///
-    /// The `; 2` arm has no such identity (window = text area + interior
-    /// padding + window-manager decoration, none of which the engine holds) and
-    /// stays silent rather than pass the text area off as the window.
+    /// The host answers first; when it declines (the norm), the text-area arm
+    /// answers `rows x cols` of the host-reported cell box. The `; 2` arm has no
+    /// in-core answer (window padding and decoration are unknown) and stays
+    /// silent.
     fn report_window_size_pixels(
         &mut self,
         response_cap: &ResponseCapability,
@@ -374,10 +302,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// The text area in pixels as `(height, width)`: the host's answer when it
-    /// gives one, else the in-core product of the grid and the host-reported
-    /// cell box, else `None`. The one source for CSI 14 t and XTSMGRAPHICS's
-    /// sixel-geometry read, so both ride the same window-ops capability.
+    /// The text area in pixels as `(height, width)`: the host's answer if any,
+    /// else the grid times the host-reported cell box, else `None`. Shared by
+    /// CSI 14 t and XTSMGRAPHICS's sixel geometry, both under the window-ops
+    /// capability.
     pub(super) fn text_area_pixels(&mut self, cap: &WindowOpsCapability) -> Option<(u32, u32)> {
         match self.invoke_window_callback(WindowOperation::ReportTextAreaSizePixels, cap) {
             Some(WindowResponse::SizePixels { height, width }) => {
@@ -387,11 +315,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// The text area in pixels, or `None` while no host has reported a cell box.
-    ///
-    /// `u32` because a `u16` grid times a `u16` cell does not fit `u16`; the
-    /// product of two `u16`s always fits `u32`, so the saturation below is a
-    /// formality that keeps the arithmetic obligation-free.
+    /// The text area in pixels, or `None` while no host has reported a cell
+    /// box. `u32` because a `u16` grid times a `u16` cell does not fit `u16`.
     fn text_area_size_pixels(&self) -> Option<(u32, u32)> {
         let (cell_w, cell_h) = self.iterm2.host_cell_px()?;
         Some((
@@ -414,19 +339,12 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// CSI 16 t — the size of one character cell in pixels.
+    /// CSI 16 t: the size of one character cell in pixels, which image-capable
+    /// TUIs use to size pictures in rows; answered from the cell box the host
+    /// reported via [`super::Terminal::set_cell_pixel_size`].
     ///
-    /// This is the report image-capable TUIs lean on: aterm ships sixel, and a
-    /// program that wants its picture to occupy a known number of rows has to
-    /// ask how tall a row is. Answering it in-core is the whole point of the
-    /// host reporting metrics through
-    /// [`super::Terminal::set_cell_pixel_size`].
-    ///
-    /// SILENT while nothing has reported. The engine carries an 8x16
-    /// placeholder for inline-image footprint arithmetic — which must produce
-    /// some cell count either way — but a placeholder is not a measurement, and
-    /// handing it to an application that asked a direct question would send it
-    /// off to render at a font size that exists nowhere.
+    /// Silent while nothing has been reported: the engine's 8x16 placeholder
+    /// (used for inline-image footprints) is not a measurement.
     fn report_cell_size_pixels(
         &mut self,
         response_cap: &ResponseCapability,
@@ -444,7 +362,6 @@ impl TerminalHandler<'_> {
     }
 
     fn report_text_area_size_cells(&mut self, response_cap: &ResponseCapability) {
-        // This can be answered directly from grid state.
         let rows = self.grid.rows();
         let cols = self.grid.cols();
         let response = format!("\x1b[8;{rows};{cols}t");
@@ -493,25 +410,11 @@ impl TerminalHandler<'_> {
 
     /// Invoke the window callback if set, returning the response if any.
     ///
-    /// # Capability gate (CF-008)
-    ///
-    /// The `_cap: &WindowOpsCapability` argument is a zero-sized compile-
-    /// time proof that the caller has already discharged the
-    /// `allow_window_ops` policy check by minting a capability through
-    /// [`super::window_auth::WindowMintAuthority::try_mint_with_engine`]. Because the
-    /// capability type's constructor is `pub(super)` and its seal field
-    /// is private, no PTY-origin byte and no external crate can produce
-    /// a capability — so reaching this function structurally implies
-    /// the host authorized window operations at the dispatch frame.
-    ///
-    /// The capability is consumed by reference (not ownership) so a
-    /// single capability can gate multiple invocations within one
-    /// XTWINOPS dispatch (e.g. maximize + report round-trip) without
-    /// re-minting.
-    ///
-    /// The underscore prefix silences the unused-variable lint: the
-    /// capability has no runtime behavior — its only contribution is
-    /// the type signature itself.
+    /// `_cap` is a zero-sized proof that the caller minted a capability via
+    /// [`super::window_auth::WindowMintAuthority::try_mint_with_engine`]; its
+    /// constructor is `pub(super)` and its seal private, so reaching this
+    /// function implies the host authorized window operations. Taken by
+    /// reference so one capability covers several calls in one dispatch.
     pub(super) fn invoke_window_callback(
         &mut self,
         op: WindowOperation,
@@ -524,16 +427,12 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Push current title(s) onto the title stack.
-    ///
-    /// Uses `Arc<str>` cloning which is just a refcount increment - no allocation.
+    /// Push current title(s) onto the title stack (`Arc<str>` clones, no
+    /// allocation).
     fn push_title(&mut self, icon: bool, window: bool) {
         if self.title.stack.len() >= TITLE_STACK_MAX_DEPTH {
-            // Stack is full, don't push more (prevents memory exhaustion)
             return;
         }
-        // Store the titles to push. Arc::clone is just a refcount increment,
-        // so this shares the same allocation as the current title/icon_name.
         let icon_title: Arc<str> = if icon {
             Arc::clone(&self.title.icon)
         } else {
@@ -547,9 +446,8 @@ impl TerminalHandler<'_> {
         self.title.stack.push((icon_title, window_title));
     }
 
-    /// Pop title(s) from the title stack and restore them.
-    ///
-    /// Re-caps at [`super::MAX_TITLE_BYTES`] for defense-in-depth.
+    /// Pop title(s) from the title stack and restore them, re-capped at
+    /// [`super::MAX_TITLE_BYTES`].
     fn pop_title(&mut self, icon: bool, window: bool) {
         if let Some((icon_title, window_title)) = self.title.stack.pop() {
             if icon && !icon_title.is_empty() {
@@ -567,9 +465,8 @@ impl TerminalHandler<'_> {
                 } else {
                     window_title
                 };
-                // Bump the title-change epoch only on a real value change (mirrors
-                // set_title / the OSC 0/2 handler) so a host polling `title_epoch()`
-                // sees the pop restore the tab title rather than showing a stale one.
+                // Bump the title epoch only on a real change (as set_title does),
+                // so hosts polling `title_epoch()` see the restored title.
                 if *self.title.window != *capped {
                     self.title
                         .epoch
@@ -580,10 +477,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Filter a title string for safe reporting.
-    ///
-    /// Removes escape sequences and control characters to prevent
-    /// title spoofing/injection attacks.
+    /// Filter a title for reporting: strip escape sequences and control
+    /// characters against title injection.
     fn filter_title_for_report(title: &str) -> String {
         title.chars().filter(|c| !c.is_control()).collect()
     }
@@ -591,41 +486,24 @@ impl TerminalHandler<'_> {
 
 #[cfg(test)]
 mod tests {
-    //! Regression tests for the `allow_window_ops` deny match in
-    //! `handle_window_state_or_geometry`.
-    //!
-    //! These tests exercise the pure terminal handler without a PTY — they
-    //! feed CSI sequences directly to `Terminal::process` and inspect
-    //! `take_response()` for leaked PTY replies.
+    //! Tests for the `allow_window_ops` gate in XTWINOPS, feeding CSI sequences
+    //! to `Terminal::process` and inspecting `take_response()`.
 
     use crate::terminal::Terminal;
     use aterm_policy::engine::PolicyEngine;
-    use aterm_policy::{
-        Defaults, OriginTag, Policy, Profile, Response, Rule, SCHEMA_VERSION, profiles,
-    };
+    use aterm_policy::{OriginTag, Policy, Response, profiles};
 
     fn window_policy(sequence: &str, response: Response) -> Policy {
-        Policy {
-            schema_version: SCHEMA_VERSION,
-            profile: Profile::Standard,
-            defaults: Defaults {
-                unmatched: Response::Drop,
-                shell_integration_require_nonce: false,
-            },
-            rules: vec![Rule {
-                sequence: sequence.to_owned(),
-                origin_min: OriginTag::Pty,
-                response,
-                rate_limit: None,
-                prompt_id: None,
-            }],
-            rate_limits: vec![],
-        }
+        crate::terminal::policy_bridge::one_rule_policy(
+            sequence,
+            response,
+            OriginTag::Pty,
+            Response::Drop,
+        )
     }
 
-    /// CSI 21 t (report window title) MUST NOT emit any PTY response when
-    /// `allow_window_ops=false`. Regression: CSI 20/21 previously fell through
-    /// the deny match and leaked the title to untrusted PTY output (#7876).
+    /// CSI 21 t (report window title) emits no response when
+    /// `allow_window_ops=false`.
     #[test]
     fn csi_21t_title_report_suppressed_when_window_ops_disabled() {
         let mut term = Terminal::new(24, 80);
@@ -637,12 +515,12 @@ mod tests {
 
         assert!(
             term.take_response().is_none(),
-            "CSI 21 t must not leak the window title when allow_window_ops is false (#7876)"
+            "CSI 21 t must not leak the window title when allow_window_ops is false"
         );
     }
 
-    /// CSI 20 t (report icon label) MUST NOT emit any PTY response when
-    /// `allow_window_ops=false`. Regression from #7876.
+    /// CSI 20 t (report icon label) emits no response when
+    /// `allow_window_ops=false`.
     #[test]
     fn csi_20t_icon_label_report_suppressed_when_window_ops_disabled() {
         let mut term = Terminal::new(24, 80);
@@ -653,13 +531,11 @@ mod tests {
 
         assert!(
             term.take_response().is_none(),
-            "CSI 20 t must not leak the icon label when allow_window_ops is false (#7876)"
+            "CSI 20 t must not leak the icon label when allow_window_ops is false"
         );
     }
 
-    /// Positive case: CSI 21 t DOES emit a response when
-    /// `allow_window_ops=true`. Guards against over-broad denial that would
-    /// also break title reporting for hosts that opt into window ops.
+    /// CSI 21 t does respond when `allow_window_ops=true`.
     #[test]
     fn csi_21t_title_report_allowed_when_window_ops_enabled() {
         let mut term = Terminal::new(24, 80);
@@ -683,10 +559,8 @@ mod tests {
         );
     }
 
-    /// CSI 22 t (title stack push) MUST still be processed when
-    /// `allow_window_ops=false` — it only mutates the internal stack and does
-    /// not emit any PTY response. This guards against an over-broad fix to
-    /// #7876 that would also block the title stack.
+    /// CSI 22 t (title stack push) is still processed when
+    /// `allow_window_ops=false`: it only mutates the internal stack.
     #[test]
     fn csi_22t_title_push_allowed_when_window_ops_disabled() {
         let mut term = Terminal::new(24, 80);
@@ -710,10 +584,8 @@ mod tests {
         );
     }
 
-    /// CSI 23 t (title stack pop) restoring a DIFFERENT window title MUST bump
-    /// `title_epoch()`, mirroring set_title / OSC 0/2 — otherwise a host polling
-    /// the epoch keeps showing the stale tab title after the pop. Regression:
-    /// pop_title's window branch restored the value without bumping the epoch.
+    /// CSI 23 t (title stack pop) restoring a different window title bumps
+    /// `title_epoch()`, as set_title and OSC 0/2 do.
     #[test]
     fn csi_23t_title_pop_bumps_epoch_on_window_change() {
         let mut term = Terminal::new(24, 80);
@@ -780,16 +652,11 @@ mod tests {
     }
 
     // =====================================================================
-    // XTWINOPS PIXEL REPORTS
+    // XTWINOPS pixel reports
     //
-    // 14t/16t are what a sixel or image-capable TUI asks before it decides
-    // how big to draw. Both used to be structurally unanswerable: the
-    // handlers replied only through `invoke_window_callback`, the GUI host
-    // declines every report (its window ops ride an async wake, which cannot
-    // carry a synchronous reply), and unlike 20t/21t neither had an in-core
-    // fallback. `allow_window_ops = true` changed nothing — the query simply
-    // went into the void. They now answer from the grid and the host's
-    // reported cell box, and stay silent when that box does not exist.
+    // 14t/16t are what image-capable TUIs ask before sizing a picture. The GUI
+    // host declines every callback report, so these answer from the grid and
+    // the host's reported cell box, and stay silent without one.
     // =====================================================================
 
     /// A window with `allow_window_ops` alone — no window callback, exactly
@@ -820,7 +687,7 @@ mod tests {
         );
     }
 
-    /// CSI 14 t reports the TEXT AREA in pixels: the grid times the cell box.
+    /// CSI 14 t reports the text area in pixels: the grid times the cell box.
     #[test]
     fn csi_14t_reports_the_text_area_in_pixels() {
         let mut term = windowed_term(24, 80);
@@ -835,7 +702,7 @@ mod tests {
         );
     }
 
-    /// The text area tracks the GRID, not the size at construction — a report
+    /// The text area tracks the grid, not the size at construction — a report
     /// after a resize describes the terminal the application is looking at.
     #[test]
     fn csi_14t_follows_the_grid_across_a_resize() {
@@ -851,16 +718,13 @@ mod tests {
         );
     }
 
-    /// NO FABRICATION. The engine carries an 8x16 placeholder cell for
-    /// inline-image footprint arithmetic. It is not a measurement, so a
-    /// terminal no host has measured answers NOTHING — never `CSI 6 ; 16 ; 8 t`,
-    /// which would send an image-capable TUI off to render at a font size that
-    /// exists nowhere.
+    /// No fabrication: a terminal no host has measured answers nothing, never
+    /// the 8x16 placeholder (`CSI 6 ; 16 ; 8 t`).
     #[test]
     fn the_pixel_reports_stay_silent_when_no_host_has_measured_a_cell() {
         for query in [b"\x1b[14t".as_slice(), b"\x1b[16t".as_slice()] {
             let mut term = windowed_term(24, 80);
-            // Deliberately NOT calling set_cell_pixel_size.
+            // Deliberately not calling set_cell_pixel_size.
             term.process(query);
             assert_eq!(
                 response_string(&mut term),
@@ -868,7 +732,7 @@ mod tests {
                 "{query:?} must not pass the 8x16 placeholder off as a measurement"
             );
         }
-        // Negative control: the same queries DO answer once a host measures,
+        // Negative control: the same queries do answer once a host measures,
         // so the silence above is the missing metric and not a dead path.
         let mut term = windowed_term(24, 80);
         term.set_cell_pixel_size(8, 16);
@@ -886,12 +750,10 @@ mod tests {
         assert_eq!(response_string(&mut term), None);
     }
 
-    /// The reports the engine genuinely cannot answer stay silent even with a
-    /// measured cell box and window ops fully authorized. Each is a fact about
-    /// the window manager or the display, not about the terminal:
-    /// `14 ; 2 t` whole-window pixels (text area + padding + decoration),
-    /// `15 t` screen pixels, `19 t` screen cells, `11 t` iconified state,
-    /// `13 t` window position.
+    /// Reports the engine cannot answer stay silent even with a measured cell
+    /// box and window ops authorized: `14 ; 2 t` whole-window pixels, `15 t`
+    /// screen pixels, `19 t` screen cells, `11 t` iconified state, `13 t`
+    /// window position.
     #[test]
     fn reports_with_no_in_core_truth_stay_silent_rather_than_guess() {
         for query in [
@@ -913,8 +775,8 @@ mod tests {
         }
     }
 
-    /// The new fallbacks live INSIDE the capability gate: an unauthorized host
-    /// still leaks no font metrics to the PTY (#7454, #7643, #7876).
+    /// The in-core fallbacks live inside the capability gate: an unauthorized host
+    /// still leaks no font metrics to the PTY.
     #[test]
     fn the_pixel_reports_are_still_gated_by_allow_window_ops() {
         for query in [b"\x1b[14t".as_slice(), b"\x1b[16t".as_slice()] {
@@ -930,7 +792,7 @@ mod tests {
         }
     }
 
-    /// A host that CAN answer synchronously still wins: the callback's value is
+    /// A host that can answer synchronously still wins: the callback's value is
     /// used verbatim and the in-core fallback never runs.
     #[test]
     fn a_host_that_answers_a_pixel_report_overrides_the_in_core_fallback() {

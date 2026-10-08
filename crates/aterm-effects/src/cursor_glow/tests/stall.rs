@@ -5,13 +5,9 @@
 
 use super::*;
 
-/// THE SCREENSHOT: thirty keys at 85 ms into a stall, the row echoing
-/// 400 ms after the last key as ONE 30-cell hop. Licensed as ONE sweep,
-/// every cell lit, no `no-credits`, nothing for the ledger to bridge.
-///
-/// RED on 81dea89c8: `declined no-credits origin=27,5 target=27,35` —
-/// the presses older than the 2 s credit life were invisible at the
-/// echo (22 of 30 credits, 88 < 90), thirty dark cells.
+/// Thirty keys at 85 ms into a stall, the row echoing 400 ms after the last
+/// key as one 30-cell hop: licensed as one sweep, every cell lit, no
+/// `no-credits`, nothing for the ledger to bridge.
 #[test]
 fn thirty_keys_typed_into_a_stall_are_laid_as_one_sweep_when_the_row_echoes() {
     let g = wide_geom();
@@ -48,11 +44,7 @@ fn thirty_keys_typed_into_a_stall_are_laid_as_one_sweep_when_the_row_echoes() {
     );
 }
 
-/// Fifty keys into a five-second stall: over the old 32-cell cap and
-/// far past the old 2 s life. One sweep, 5..55, nothing refused.
-///
-/// RED on 81dea89c8: the hop is over `RAINBOW_TYPED_SWEEP_MAX` (32) and
-/// falls to a re-anchor — the landing alone is lit.
+/// Fifty keys into a five-second stall: one sweep, 5..55, nothing refused.
 #[test]
 fn a_fifty_key_batch_after_a_five_second_stall_is_one_sweep() {
     let g = wide_geom();
@@ -76,15 +68,11 @@ fn a_fifty_key_batch_after_a_five_second_stall_is_one_sweep() {
     );
 }
 
-/// A batch whose LAST key is three seconds old when the row echoes (the
-/// matrix's hold-N12-D3): licensed, and LIT in the echoing frame and the
-/// frame after — the sweep's cells are born no earlier than one stamp
-/// window before the echo, so they are not born three seconds into a
-/// cohort that has already faded (the matrix's `held_lit_late`).
-///
-/// RED on 81dea89c8 twice over: `no-fresh-hint` at the gate; and with
-/// the gate alone fixed, cells born at the oldest press's clock into a
-/// cohort idle 3 s are retired on the very tick that laid them.
+/// A batch whose last key is three seconds old when the row echoes (the
+/// matrix's hold-N12-D3): licensed, and lit in the echoing frame and the
+/// frame after; the sweep's cells are born no earlier than one stamp window
+/// before the echo, not into a cohort that has already faded
+/// (`held_lit_late`).
 #[test]
 fn a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame() {
     let g = wide_geom();
@@ -123,15 +111,10 @@ fn a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame() {
     );
 }
 
-/// ONE key stalled three seconds (S9, the stalled LAST key followed by a
-/// pause): its own +1 echo is licensed by the press in flight
-/// (`licence=inflight`), its cell is lit on the echoing frame and one
-/// beat later, and the press is spent — so the next key, echoed on
-/// time, has nothing left to bridge.
-///
-/// RED on c45b13300: `no-fresh-hint` at the seam (the in-flight arm
-/// needed two presses), the cell a dark notch for the whole pause and
-/// relit only by the next key's ledger bridge.
+/// One key stalled three seconds (S9): its own +1 echo is licensed by the
+/// press in flight (`licence=inflight`), its cell is lit on the echoing frame
+/// and one beat later, and the press is spent, so the next key echoed on time
+/// has nothing to bridge.
 #[test]
 fn one_key_stalled_three_seconds_lights_its_own_cell_on_the_late_echo() {
     let g = wide_geom();
@@ -205,11 +188,10 @@ fn one_key_stalled_three_seconds_lights_its_own_cell_on_the_late_echo() {
     );
 }
 
-/// THE ANTI-STRAY BOUND of the one-press echo: a press the app swallowed
-/// (a modal's key, vim's `x`) followed by a program's +1 on the same row
-/// buys AT MOST its own one cell, once — the credit is spent on
-/// admission, so the next keyless +1 finds an empty pool and is refused;
-/// and a press an unexplained edge forgot buys nothing at all.
+/// Anti-stray bound of the one-press echo: a swallowed press (a modal's key,
+/// vim's `x`) followed by a program's +1 on the same row buys at most its own
+/// one cell, once (the credit is spent on admission); a press an unexplained
+/// edge forgot buys nothing.
 #[test]
 fn a_swallowed_press_buys_at_most_its_own_one_cell_and_only_once() {
     let g = wide_geom();
@@ -242,7 +224,7 @@ fn a_swallowed_press_buys_at_most_its_own_one_cell_and_only_once() {
         v2_cols(&glow, 3)
     );
 
-    // THE FORGET CONTROL: press, keyless backward hop, then +1 — refused.
+    // The forget control: press, keyless backward hop, then +1 is refused.
     let mut forgot = CursorGlow::default();
     forgot.tick(Some((3, 8)), t0, &c, g, &mut out);
     forgot.note_typed(t0 + Duration::from_millis(10));
@@ -269,10 +251,9 @@ fn a_swallowed_press_buys_at_most_its_own_one_cell_and_only_once() {
     assert!(v2_cols(&forgot, 3).is_empty(), "{:?}", v2_cols(&forgot, 3));
 }
 
-/// ONE stalled press against a hop WIDER than one cell is still refused
-/// (the multi-cell floor: vim's `w` on a stale stamp) — and the credit
-/// is KEPT, not forgotten: it is the delivered insert receipt's and the
-/// next key's ledger bridge.
+/// One stalled press against a hop wider than one cell is refused (vim's `w`
+/// on a stale stamp), and the credit is kept for the delivered insert receipt
+/// and the next key's ledger bridge.
 #[test]
 fn a_single_stalled_press_wider_than_one_cell_is_still_refused_and_kept() {
     let g = wide_geom();
@@ -299,11 +280,10 @@ fn a_single_stalled_press_wider_than_one_cell_is_still_refused_and_kept() {
     assert!(v2_cols(&glow, 3).is_empty());
 }
 
-/// A HIDDEN-CARET TUI's single stalled key (Claude Code's bracket) is
-/// admitted by the same one-press rule on the anchored lane: the
-/// established echo row's end advancing by one with one press in
-/// flight and no stamp fresh is that press's own echo. A row no licensed
-/// anchored echo has established stays silent, as today.
+/// A hidden-caret TUI's single stalled key (Claude Code's bracket) is admitted
+/// by the same one-press rule on the anchored lane: the established echo row's
+/// end advancing by one with one press in flight and no fresh stamp is that
+/// press's echo. A row no licensed anchored echo has established stays silent.
 #[test]
 fn a_hidden_caret_single_key_stall_relights_on_its_own_anchored_echo() {
     let g = wide_geom();

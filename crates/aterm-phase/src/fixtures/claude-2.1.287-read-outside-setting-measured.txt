@@ -1,0 +1,30 @@
+# claude-code 2.1.287 · MEASURED 2026-10-02, `aterm ctl text` of a private headless aterm (120x50) running the real Claude Code in auto mode (tools/real-claude-lab, a stub API answering with a Read of /etc/hosts) · the first outside-read dialog: `Yes, and keep allowing any reads …` (sets hasSeenAutoModeOutsideReadPrompt), `No, and block reads … from now on` (writes permissions.blockReadsOutsideWorkingDirectories to the user settings), `No, and ask again next time`, `Yes, but ask again next time` · socket dir renamed at.XXXX
+ ▐▛███▛█   Claude Code v2.1.287
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.XXXX/proj
+
+
+❯ readout please
+
+  Reading 1 file… (ctrl+o to expand)
+  ⎿  /etc/hosts
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Read outside the working directories
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Read(/etc/hosts)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Auto mode and the sandbox read outside the working directories without asking. Yes or No answers for this read; the
+ rest is for later reads. Block: the file tools refuse reads outside the working directories in every project.
+ Sandboxed commands are not changed on this machine (the sandbox is off, its filesystem rules are relaxed, a managed
+ read-path lock is on, or the working directory name has glob characters). To undo, remove
+ permissions.blockReadsOutsideWorkingDirectories from your user settings; file tools follow next session, sandboxed
+ commands at once.
+
+ Allow this read outside the working directories?
+ ❯ 1. Yes, and keep allowing any reads outside the working directories
+   2. No, and block reads outside the working directories from now on
+   3. No, and ask again next time
+   4. Yes, but ask again next time
+
+ Esc to cancel · Tab to amend

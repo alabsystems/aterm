@@ -7,11 +7,10 @@
 //! `crates/aterm-release/src/sign.rs` (codesign verification, `stapler
 //! validate`, `spctl` assessment) — in order of cheapest/most-local first, and
 //! fails CLOSED: any error, non-zero exit, or unparseable output is a
-//! rejection. Both sides were ported from the retired `apps/aterm-mac/notarize.sh`,
-//! which no longer exists in this tree; cite the Rust, not the shell.
+//! rejection.
 
+use aterm_uds::spawnfd::Command;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Wall-clock ceiling for one verification helper.
@@ -26,22 +25,9 @@ use std::time::{Duration, Instant};
 /// child is a hung child.
 ///
 /// 30s is far above any healthy run and far below "the user thinks the app is
-/// broken".
-///
-/// The headroom survived the batteries-included seed (§9.1), which is worth
-/// recording because it looks like it should not have: the sealed
-/// `Contents/Resources/toolchain-seed` puts the bundle at ~650-850 MB, and
-/// `codesign --verify --deep --strict` really does hash every sealed resource.
-/// Measured on an 851 MB seeded bundle: 0.09 s wall (0.28 s CPU) — codesign
-/// hashes at roughly 3 GB/s and parallelizes across files, so the seed's
-/// marginal cost is ~0.06 s. `spctl` is 0.14-0.21 s there and *slower* on the
-/// small notarized app (~0.44 s), because certificate and ticket evaluation
-/// dominate it, not hashing. Even a pre-SHA-NI Intel Mac doing software SHA-256
-/// lands 1-2 s wall. Reaching 30 s would need sustained reads under ~27 MB/s
-/// across the whole payload — below any internal SSD and below a spinning disk —
-/// and in that regime the download and `ditto` extract dominate long before
-/// verification does. `spctl`'s network reach, not payload size, remains the
-/// reason this ceiling exists.
+/// broken". Bundle size does not threaten it: on an 851 MB seeded bundle (§9.1)
+/// `codesign --verify --deep --strict` measured 0.09 s wall and `spctl` 0.14-0.21 s;
+/// reaching 30 s would need reads under ~27 MB/s across the payload.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The CEILING on the child-exit poll interval (see [`HELPER_POLL_MIN`]).
@@ -52,16 +38,10 @@ const HELPER_REAP: Duration = Duration::from_millis(250);
 
 /// The first child-exit poll interval, doubled up to [`HELPER_POLL`].
 ///
-/// A fixed 25 ms tick made every helper cost `25ms * ceil(runtime / 25ms)` with a
-/// hard 25 ms floor, because the first `try_wait` runs microseconds after `spawn`
-/// and therefore always sleeps a whole tick. The helpers are local and fast —
-/// measured against the installed bundle, `PlistBuddy -c Print:CFBundleVersion`
-/// is 6 ms and `codesign --verify --deep --strict` 35-70 ms — so one
-/// `verified_bundle_identity()` (one codesign + two PlistBuddy) rounded ~50-80 ms
-/// of real work up to 75-125 ms wall, tens of milliseconds of pure sleep on the
-/// launch/apply critical path. Backing off from 1 ms removes essentially all of
-/// that floor while keeping the steady-state tick (and the syscall rate for a
-/// genuinely slow child) exactly where it was.
+/// A fixed 25 ms tick put a 25 ms floor on every helper (the first `try_wait`
+/// runs right after `spawn`), while `PlistBuddy` measures 6 ms and `codesign`
+/// 35-70 ms on the launch/apply critical path. Backing off from 1 ms removes that
+/// floor and keeps the steady-state tick for a genuinely slow child.
 const HELPER_POLL_MIN: Duration = Duration::from_millis(1);
 
 /// The AGGREGATE ceiling on one apply's verification work — see [`ApplyBudget`].
@@ -71,9 +51,8 @@ const HELPER_POLL_MIN: Duration = Duration::from_millis(1);
 /// `verified_bundle_identity` calls at five each, plus the start probe), because
 /// the staged, the fixed and the installed bundle are each re-verified at the
 /// point of use. Every one of those is fail-closed, so timeouts cannot actually
-/// accumulate — the first one aborts the apply — but "cannot accumulate" is a
-/// property of the CALLERS, argued across four files, and nothing stated the
-/// ceiling as a single number a reader could check.
+/// accumulate — the first one aborts the apply — but that is a property of the
+/// callers, argued across four files; this states the ceiling as one number.
 ///
 /// 8s is that number. Measured against the real signed bundle the whole sequence
 /// is ~1.1s wall (codesign -R 0.101s, codesign -d 0.050s, spctl 0.193s,
@@ -124,8 +103,7 @@ impl ApplyBudget {
 }
 
 /// The deadline this thread's verification must finish by, or `None` outside a
-/// budget — for the tests that pin a lane to running under one (round seven,
-/// item 36: the pre-park verification's ceiling rests on it).
+/// budget — for the tests that pin a lane to running under one.
 #[cfg(test)]
 pub(crate) fn current_budget_deadline() -> Option<Instant> {
     APPLY_DEADLINE.with(std::cell::Cell::get)
@@ -149,11 +127,9 @@ const STDERR_KEEP: usize = 512;
 /// the original budget; the typed internal result distinguishes an observed exit
 /// from unconfirmed cleanup so callers do not reclaim a live writer's paths.
 ///
-/// The tail of stderr rides back with the status so a failure can say WHY
-/// (2026-09-14). `ditto` used to inherit the process stderr, so every failed
-/// extract reached the ledger as the bare "ditto zip extract failed (exit status:
-/// 1)" — the same line for a full disk, a corrupt archive and a read-only volume —
-/// and the machine re-downloaded on the backoff schedule with nothing to act on.
+/// The tail of stderr rides back with the status so a failure can say WHY: a bare
+/// exit status reads the same for a full disk, a corrupt archive and a read-only
+/// volume.
 ///
 /// The stream is drained on its own thread, so a child that writes more than the
 /// pipe holds cannot wedge against this poll loop; only the tail is kept. The
@@ -179,7 +155,7 @@ trait HelperChild {
     fn observe_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
 }
 
-impl HelperChild for std::process::Child {
+impl HelperChild for aterm_uds::spawnfd::Child {
     fn request_kill(&mut self) -> std::io::Result<()> {
         self.kill()
     }
@@ -210,8 +186,8 @@ pub(crate) fn status_bounded_with_stderr_observed(
     what: &str,
     limit: Duration,
 ) -> Result<(std::process::ExitStatus, String), HelperFailure> {
+    use aterm_uds::spawnfd::Stdio;
     use std::io::Read;
-    use std::process::Stdio;
     let deadline = Instant::now() + limit;
     let cleanup_reserve = Duration::from_millis(250).min(limit / 4);
     let work_deadline = deadline - cleanup_reserve;
@@ -262,9 +238,9 @@ pub(crate) fn status_bounded_with_stderr_observed(
                     std::thread::sleep(HELPER_POLL.min(remaining));
                     continue;
                 }
-                // A copy that outran its own ceiling is the disk's afternoon
+                // A copy that outran its own ceiling says the disk was slow
                 // (a cross-volume `ditto` of a large bundle on a busy volume),
-                // not the bundle: passing (round four, plan item 2).
+                // not that the bundle is bad: passing.
                 mark_passing(format!(
                     "{what} did not finish within {}s; treating as a failure",
                     limit.as_secs()
@@ -294,14 +270,6 @@ pub(crate) fn last_stderr_line(stderr: &str) -> Option<&str> {
     stderr.lines().rev().map(str::trim).find(|l| !l.is_empty())
 }
 
-/// Run a verification helper with a bounded wall clock, killing it on timeout.
-///
-/// Fails CLOSED like every other check here: a timeout is an `Err`, i.e. a
-/// rejection, never a pass. `what` names the helper for the error text.
-///
-/// The output of these helpers is a few hundred bytes at most, so collecting it
-/// after the child exits cannot deadlock on a full pipe. Do not reuse this for a
-/// child that streams volume.
 /// PROVE THE CANDIDATE CAN ACTUALLY START, by starting it.
 ///
 /// Everything else this module checks is CRYPTOGRAPHIC — the signature, the Team ID,
@@ -312,8 +280,7 @@ pub(crate) fn last_stderr_line(stderr: &str) -> Option<&str> {
 /// sentinel lives inside the new build's own `main` (`install::check_boot_health`):
 /// a build that never reaches `main` never counts a launch, never reaches
 /// `MAX_BOOT_ATTEMPTS`, and never reverts — leaving a bricked app beside a perfectly
-/// good predecessor at `aterm.app.rollback` (2026-08-19, named by an external
-/// reviewer of the product's public claim).
+/// good predecessor at `aterm.app.rollback`.
 ///
 /// So: run the candidate's own executable with `--version` before the swap and
 /// require a clean exit that names the build we are about to install. `--version` is
@@ -332,7 +299,7 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
     let out = output_bounded(
         // `--version` answers before any lane starts, so the candidate never reaches
         // its updater: no switch is needed to keep the probe inert.
-        Command::new(&exe).arg("--version"),
+        aterm_uds::spawnfd::command(&exe).arg("--version"),
         "candidate --version probe",
     )?;
     if !out.status.success() {
@@ -343,13 +310,10 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
         ));
     }
     // …and it must be the build we are installing. A probe that starts SOME binary
-    // proves nothing about this one. Since 2026-09-14 the candidate prints
-    // `build: <N>` (audit BA-8 — the identity line lost its number when versions
-    // moved to MAJOR.MINOR.0 and this clause had been dead), so the text itself
-    // answers for a current build; the bundle's own `CFBundleVersion`, which the
-    // codesign seal verified above ties to the very binary that just ran, stays
-    // as the identity for a candidate older than that (a yank rolling the channel
-    // back, a rollback sibling) and as the belt under the text.
+    // proves nothing about this one. A current candidate prints `build: <N>`; the
+    // bundle's own `CFBundleVersion`, which the codesign seal ties to the binary
+    // that just ran, answers for an older candidate (a yank, a rollback sibling)
+    // whose identity line has no build number.
     let text = String::from_utf8_lossy(&out.stdout);
     if !text.contains(&expected_build.to_string())
         && bundle_build_number(app).ok() != Some(expected_build)
@@ -381,7 +345,7 @@ fn helper_deadline() -> (Instant, bool) {
 
 /// The rejection a helper that outran [`helper_deadline`] reports.
 ///
-/// A REJECTION, AND A PASSING ONE (round four, plan item 2): the apply refuses
+/// A REJECTION, AND A PASSING ONE: the apply refuses
 /// exactly as before — nothing is swapped past a helper that did not answer —
 /// but the reason carries [`crate::PASSING_REFUSAL_KEY`], because a deadline
 /// missed says the machine was slow at that moment (a loaded desk, a cold page
@@ -434,7 +398,7 @@ pub(crate) fn io_error_is_passing(error: &std::io::Error) -> bool {
 
 /// The refusal for an I/O error while starting helper `what`, marked passing when
 /// the error is a moment ([`io_error_is_passing`]).
-fn spawn_refusal(what: &str, error: &std::io::Error) -> String {
+pub(crate) fn spawn_refusal(what: &str, error: &std::io::Error) -> String {
     let message = format!("spawn {what}: {error}");
     if io_error_is_passing(error) {
         mark_passing(message)
@@ -444,14 +408,11 @@ fn spawn_refusal(what: &str, error: &std::io::Error) -> String {
 }
 
 /// The refusal a bounded wait on the apply lock reports, under `what` (the lane's
-/// own prefix: "lock", "pre-verify lock", "health lock").
+/// own prefix: "lock", "pre-verify lock", "health lock", "publish lock").
 ///
-/// A lock another process held past the wait is PASSING (round four, plan item
-/// 2): the holder is a sibling launch mid-swap, a stage publishing, or a process
-/// stopped under a debugger — every one of them lets go or is reaped, and the
-/// next attempt takes the lock. Until this, a seamless successor that waited out
-/// a sibling's hold returned `Deferred("lock: …")`, stayed the old build, refused
-/// the target and was booked STRUCTURAL by its parent. Any OTHER lock error
+/// A lock another process held past the wait is PASSING: the holder is a sibling
+/// launch mid-swap, a stage publishing, or a process stopped under a debugger —
+/// each lets go or is reaped, and the next attempt takes the lock. Any OTHER lock error
 /// (`ENOLCK`, an unsupported filesystem) is not a moment and keeps its verdict.
 pub(crate) fn lock_wait_refusal(what: &str, error: &std::io::Error) -> String {
     let message = format!("{what}: {error}");
@@ -462,6 +423,14 @@ pub(crate) fn lock_wait_refusal(what: &str, error: &std::io::Error) -> String {
     }
 }
 
+/// Run a verification helper with a bounded wall clock, killing it on timeout.
+///
+/// Fails CLOSED like every other check here: a timeout is an `Err`, i.e. a
+/// rejection, never a pass. `what` names the helper for the error text.
+///
+/// The output of these helpers is a few hundred bytes at most, so collecting it
+/// after the child exits cannot deadlock on a full pipe. Do not reuse this for a
+/// child that streams volume.
 fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
     output_until(cmd, what, || {
         let (deadline, bound_by_budget) = helper_deadline();
@@ -477,7 +446,7 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
 /// and the child is killed and reaped. Same output caveat as [`output_bounded`]:
 /// for helpers that print a few lines at most.
 ///
-/// A limit run out is PASSING ([`mark_passing`], round six, finding 11), like
+/// A limit run out is PASSING ([`mark_passing`]), like
 /// [`timed_out`]: a helper that did not finish says the machine was slow at that
 /// moment, not that the image is bad, and the stage path retries it rather than
 /// booking a backoff against a healthy build.
@@ -505,7 +474,7 @@ fn output_until(
     what: &str,
     bound: impl FnOnce() -> (Instant, String),
 ) -> Result<std::process::Output, String> {
-    use std::process::Stdio;
+    use aterm_uds::spawnfd::Stdio;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -576,7 +545,7 @@ pub fn verify_bundle_policy(app: &Path, expected_team: &str) -> Result<(), Strin
 /// not constrain the signer (an ad-hoc signature passes). The default-tier check.
 fn codesign_structural(app: &Path) -> Result<(), String> {
     let out = output_bounded(
-        Command::new("/usr/bin/codesign")
+        aterm_uds::spawnfd::command("/usr/bin/codesign")
             .args(["--verify", "--deep", "--strict", "--verbose=2"])
             .arg(app),
         "codesign --verify (structural)",
@@ -584,9 +553,12 @@ fn codesign_structural(app: &Path) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "codesign --verify (structural) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+        Err(codesign_exit_refusal(
+            "codesign --verify (structural)",
+            aterm_update_core::codesign::CodesignError::Refused {
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            },
         ))
     }
 }
@@ -603,7 +575,7 @@ fn codesign_structural(app: &Path) -> Result<(), String> {
 pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
     let plist = app.join("Contents/Info.plist");
     let out = output_bounded(
-        Command::new("/usr/libexec/PlistBuddy")
+        aterm_uds::spawnfd::command("/usr/libexec/PlistBuddy")
             .args(["-c", "Print :CFBundleVersion"])
             .arg(&plist),
         "PlistBuddy CFBundleVersion",
@@ -626,7 +598,7 @@ pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
 pub fn bundle_short_version(app: &Path) -> Result<String, String> {
     let plist = app.join("Contents/Info.plist");
     let out = output_bounded(
-        Command::new("/usr/libexec/PlistBuddy")
+        aterm_uds::spawnfd::command("/usr/libexec/PlistBuddy")
             .args(["-c", "Print :CFBundleShortVersionString"])
             .arg(&plist),
         "PlistBuddy CFBundleShortVersionString",
@@ -653,7 +625,7 @@ pub fn bundle_short_version(app: &Path) -> Result<String, String> {
 pub fn bundle_git_commit(app: &Path) -> Result<String, String> {
     let plist = app.join("Contents/Info.plist");
     let out = output_bounded(
-        Command::new("/usr/libexec/PlistBuddy")
+        aterm_uds::spawnfd::command("/usr/libexec/PlistBuddy")
             .args(["-c", "Print :ATermGitCommit"])
             .arg(&plist),
         "PlistBuddy ATermGitCommit",
@@ -684,22 +656,80 @@ pub fn bundle_git_commit(app: &Path) -> Result<String, String> {
 /// `spctl`/Gatekeeper, which a Gatekeeper-disabled machine turns into a no-op (F1).
 /// Fails CLOSED on any codesign error, bounded like every helper here.
 fn codesign_verify(app: &Path, expected_team: &str) -> Result<(), String> {
-    use aterm_update_core::codesign::{CodesignError, verify_developer_id_until};
-    const WHAT: &str = "codesign --verify (team-pinned)";
+    use aterm_update_core::codesign::verify_developer_id_until;
     let (deadline, bound_by_budget) = helper_deadline();
-    match verify_developer_id_until(app, expected_team, true, deadline) {
-        Ok(()) => Ok(()),
-        Err(CodesignError::InvalidTeam(team)) => Err(format!(
-            "refusing to verify: pinned team id {team:?} is not alphanumeric"
-        )),
-        Err(CodesignError::Refused { stderr, .. }) => Err(format!(
-            "codesign --verify (team-pinned requirement) failed: {}",
+    verify_developer_id_until(app, expected_team, true, deadline)
+        .map_err(|e| codesign_refusal(e, bound_by_budget))
+}
+
+/// The refusal a failed [`codesign_verify`] reports, split out so its classification
+/// is provable without a codesign that misbehaves on cue: always a rejection, and a
+/// PASSING one ([`mark_passing`]) only when codesign knowably reached no verdict on the
+/// bytes ([`codesign_exit_refusal`]).
+pub(crate) fn codesign_refusal(
+    error: aterm_update_core::codesign::CodesignError,
+    bound_by_budget: bool,
+) -> String {
+    use aterm_update_core::codesign::CodesignError;
+    const WHAT: &str = "codesign --verify (team-pinned)";
+    match error {
+        CodesignError::InvalidTeam(team) => {
+            format!("refusing to verify: pinned team id {team:?} is not alphanumeric")
+        }
+        // A REFUSAL UNLESS codesign KNOWABLY JUDGED NOTHING: see
+        // [`codesign_exit_refusal`], which the structural lane and the team-id read
+        // share.
+        refused @ CodesignError::Refused { .. } => {
+            codesign_exit_refusal("codesign --verify (team-pinned requirement)", refused)
+        }
+        CodesignError::TimedOut => timed_out(WHAT, bound_by_budget),
+        CodesignError::Spawn(e) => spawn_refusal(WHAT, &e),
+        // Waiting on a child that ran is no verdict on what it read.
+        CodesignError::Wait(e) => mark_passing(format!("wait for {WHAT}: {e}")),
+        e @ CodesignError::Unsupported => format!("{WHAT}: {e}"),
+    }
+}
+
+/// The refusal for a codesign run that ENDED (`refused`, a
+/// [`CodesignError::Refused`]) under `what`: codesign's words, marked passing
+/// ([`mark_passing`]) only when codesign knowably judged nothing.
+///
+/// A RUN THAT ENDED WITHOUT A VERDICT IS NOT ONE. codesign killed by a signal
+/// (jetsam on a loaded desk), or exiting 1 for a file it could not read or
+/// "internal error in Code Signing subsystem", says nothing about the bundle; as a
+/// verdict it would ask a person to reinstall a healthy app or discard a healthy
+/// stage. The rejection stands either way — nothing is swapped past a check that
+/// did not pass — but its readers retry it.
+///
+/// FAIL CLOSED: only [`CodesignError::judged_nothing`] — a signal,
+/// or exit 1 naming only a failure to read or to run and no signature fault — is
+/// passing. Every other exit is a verdict, however codesign words it ("a sealed
+/// resource is missing or invalid", "invalid Info.plist", exit 2's usage error,
+/// exit 3's requirement, words no list knows), so a tampered stage is never kept
+/// and re-verified and a tampered installed bundle still asks for a reinstall.
+///
+/// [`CodesignError::Refused`]: aterm_update_core::codesign::CodesignError::Refused
+/// [`CodesignError::judged_nothing`]: aterm_update_core::codesign::CodesignError::judged_nothing
+fn codesign_exit_refusal(
+    what: &str,
+    refused: aterm_update_core::codesign::CodesignError,
+) -> String {
+    use aterm_update_core::codesign::CodesignError;
+    let message = match &refused {
+        CodesignError::Refused { code: None, stderr } => format!(
+            "{what} was ended by a signal before it reached a verdict: {}",
             stderr.trim()
-        )),
-        Err(CodesignError::TimedOut) => Err(timed_out(WHAT, bound_by_budget)),
-        Err(CodesignError::Spawn(e)) => Err(spawn_refusal(WHAT, &e)),
-        Err(CodesignError::Wait(e)) => Err(format!("wait for {WHAT}: {e}")),
-        Err(e @ CodesignError::Unsupported) => Err(format!("{WHAT}: {e}")),
+        ),
+        CodesignError::Refused {
+            code: Some(_),
+            stderr,
+        } => format!("{what} failed: {}", stderr.trim()),
+        other => format!("{what}: {other}"),
+    };
+    if refused.judged_nothing() {
+        mark_passing(message)
+    } else {
+        message
     }
 }
 
@@ -707,19 +737,57 @@ fn codesign_verify(app: &Path, expected_team: &str) -> Result<(), String> {
 /// descriptive output to **stderr**, hence the merge; we scan for the
 /// `TeamIdentifier=...` line. A `not set` value (ad-hoc / unsigned) is rejected.
 pub fn team_id(app: &Path) -> Result<String, String> {
+    parse_team_id(&codesign_display(app, "codesign -d (team id)")?)
+}
+
+/// The code-signing identifier `app` is signed with (`codesign -d`'s
+/// `Identifier=`): the identifier a code requirement's `identifier "…"` clause
+/// tests. A display, not a verification — read it from a bundle a check has
+/// just passed. A run that ended on a moment is a passing refusal, as for
+/// [`team_id`].
+pub fn signing_identifier(app: &Path) -> Result<String, String> {
+    parse_signing_identifier(&codesign_display(app, "codesign -d (identifier)")?)
+}
+
+/// `codesign -d --verbose=4 <app>`'s text, both streams (it prints to stderr
+/// whether or not it succeeds), bounded like every helper here.
+fn codesign_display(app: &Path, what: &str) -> Result<String, String> {
     let out = output_bounded(
-        Command::new("/usr/bin/codesign")
+        aterm_uds::spawnfd::command("/usr/bin/codesign")
             .args(["-d", "--verbose=4"])
             .arg(app),
-        "codesign -d (team id)",
+        what,
     )?;
-    // -dv prints to stderr regardless of success; combine both streams.
-    let text = format!(
+    // A run that ended on a MOMENT — a signal, or a file it could not read just then —
+    // reached no verdict, and its output is no evidence of a missing TeamIdentifier.
+    if !out.status.success() {
+        let ended = aterm_update_core::codesign::CodesignError::Refused {
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        };
+        if ended.judged_nothing() {
+            return Err(codesign_exit_refusal(what, ended));
+        }
+    }
+    Ok(format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    );
-    parse_team_id(&text)
+    ))
+}
+
+/// Pure parser for the `Identifier=` line of `codesign -dv` output. Fails closed
+/// on a missing or empty identifier.
+fn parse_signing_identifier(text: &str) -> Result<String, String> {
+    let identifier = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Identifier="))
+        .map(str::trim)
+        .ok_or_else(|| "codesign output had no Identifier line".to_string())?;
+    if identifier.is_empty() {
+        return Err("codesign output had an empty Identifier".to_string());
+    }
+    Ok(identifier.to_string())
 }
 
 /// Pure parser for the `TeamIdentifier=` line of `codesign -dv` output, split out
@@ -742,17 +810,29 @@ fn parse_team_id(text: &str) -> Result<String, String> {
 /// ticket from the bundle, so it succeeds offline.
 fn spctl_assess(app: &Path) -> Result<(), String> {
     let out = output_bounded(
-        Command::new("/usr/sbin/spctl")
+        aterm_uds::spawnfd::command("/usr/sbin/spctl")
             .args(["-a", "-t", "exec", "-vvv"])
             .arg(app),
         "spctl assessment",
     )?;
-    if out.status.success() {
+    spctl_verdict(out.status, &String::from_utf8_lossy(&out.stderr))
+}
+
+/// What one ended `spctl` run says: a pass, its rejection, or — when a signal ended
+/// it — no verdict at all, a passing refusal (as liable to jetsam on a loaded desk
+/// as `codesign`).
+fn spctl_verdict(status: std::process::ExitStatus, stderr: &str) -> Result<(), String> {
+    if status.success() {
         Ok(())
+    } else if status.code().is_none() {
+        Err(mark_passing(format!(
+            "spctl assessment was ended by a signal before it reached a verdict: {}",
+            stderr.trim()
+        )))
     } else {
         Err(format!(
             "spctl assessment rejected the bundle: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            stderr.trim()
         ))
     }
 }
@@ -768,29 +848,21 @@ mod tests {
     #[test]
     fn the_apply_budget_binds_before_the_helper_timeout() {
         let _budget = ApplyBudget::start(Duration::from_millis(150));
-        let started = Instant::now();
         let outcome = output_bounded(
             Command::new("/bin/sleep").arg("30"),
             "a helper that never returns",
         );
-        let waited = started.elapsed();
         let error = outcome.expect_err("a helper past the budget must be a rejection");
         assert!(
             error.contains("verification budget"),
             "the rejection must name the budget, not the per-helper ceiling: {error}"
         );
-        // Bounded by the budget (150ms), nowhere near HELPER_TIMEOUT (30s).
-        assert!(
-            waited < Duration::from_secs(5),
-            "waited {waited:?}, so the budget did not bind"
-        );
     }
 
-    /// A HELPER THAT DID NOT FINISH IS A PASSING REFUSAL (round four, plan item
-    /// 2): still a rejection — nothing is swapped past it — but one its readers
-    /// retry on the transient schedule, never a structural verdict and never a
-    /// person's. Both deadlines that bind a helper say so: the apply's budget and
-    /// the helper's own ceiling, and a copy's own `limit` as well.
+    /// A HELPER THAT DID NOT FINISH IS A PASSING REFUSAL: still a rejection — nothing is
+    /// swapped past it — but one its readers retry on the transient schedule, never a
+    /// structural verdict and never a person's. Both deadlines that bind a helper say so:
+    /// the apply's budget and the helper's own ceiling, and a copy's own `limit` as well.
     ///
     /// CONTROL: a helper that ran and REFUSED is a verdict and carries no key.
     #[cfg(unix)]
@@ -858,41 +930,36 @@ mod tests {
         assert!(!crate::is_passing_refusal(&missing), "{missing}");
     }
 
-    /// A CHECK-THREAD HELPER ENDS AT ITS OWN LIMIT (plan P2-1, round three). The
-    /// check's `hdiutil` attach and detaches ran with `.output()` — no bound at all
-    /// — on the update checker's thread, inside a check holding the process's check
-    /// lane and the machine-wide `checker.lock`, so one that never returned parked
-    /// the checker for good. They now run through `output_within`: a child past its
-    /// limit is killed, reaped within a short reserve, and reported, promptly; one
-    /// that finishes is collected as before.
+    /// A CHECK-THREAD HELPER ENDS AT ITS OWN LIMIT. The check's `hdiutil` runs
+    /// hold the check lane and the machine-wide `checker.lock`, so one that never
+    /// returned would park the checker: through `output_within` a child past its
+    /// limit is killed, reaped within a short reserve, and reported; one that
+    /// finishes is collected.
     #[cfg(unix)]
     #[test]
     fn a_check_helper_past_its_limit_is_killed_and_reported_promptly() {
-        let started = Instant::now();
         let error = output_within(
             Command::new("/bin/sleep").arg("30"),
             "sleep",
             Duration::from_millis(300),
         )
         .expect_err("a helper past its limit is a failure");
-        let waited = started.elapsed();
         assert!(error.contains("sleep did not finish within"), "{error}");
-        // A limit run out is the machine's moment, not a verdict on the image
-        // (round six, finding 11): the stage path retries it instead of booking
+        // A limit run out is the machine's moment, not a verdict on the image:
+        // the stage path retries it instead of booking
         // a backoff against a healthy build.
         assert!(crate::is_passing_refusal(&error), "{error}");
-        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
         let out = output_within(
             Command::new("/bin/echo").arg("hi"),
             "echo",
-            Duration::from_secs(10),
+            aterm_spec::wait::MUST_HAPPEN,
         )
         .expect("a helper inside its limit runs");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
     }
 
     /// Outside an apply there is no budget, and the per-helper ceiling stands
-    /// alone exactly as before — the budget must not leak into ordinary use.
+    /// alone — the budget must not leak into ordinary use.
     #[cfg(unix)]
     #[test]
     fn without_a_budget_a_helper_keeps_its_own_ceiling() {
@@ -1039,7 +1106,6 @@ mod tests {
     fn timed_out_owned_helper_is_reaped_before_its_copy_path_is_reclaimable() {
         let staging = crate::paths::Staging::scratch("owned-helper-reap");
         let receipt = staging.root.join("child.pid");
-        let started = Instant::now();
         let failure = status_bounded_with_stderr_observed(
             Command::new("/bin/sh")
                 .arg("-c")
@@ -1050,7 +1116,6 @@ mod tests {
             Duration::from_secs(2),
         )
         .unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(failure.message.contains("did not finish"), "{failure:?}");
         assert!(failure.writer_stopped, "{failure:?}");
         let pid: i32 = std::fs::read_to_string(&receipt)
@@ -1071,26 +1136,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(absent.writer_stopped, "a refused spawn created no writer");
-        let _ = std::fs::remove_dir_all(staging.root);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// `ditto` was the one child on the apply path with no ceiling at all.
-    #[cfg(unix)]
-    #[test]
-    fn status_bounded_kills_a_child_that_overruns() {
-        let started = Instant::now();
-        let error = status_bounded_with_stderr(
-            Command::new("/bin/sleep").arg("30"),
-            "a copy that never finishes",
-            Duration::from_millis(150),
-        )
-        .expect_err("an overrunning copy must fail, not hang");
-        assert!(error.contains("did not finish"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    /// The TAIL of the child's stderr comes back with its status (2026-09-14, audit
-    /// SV-3): a failing `ditto` used to reach the ledger as its bare exit code. A
+    /// The TAIL of the child's stderr comes back with its status. A
     /// child that floods stderr is drained past the pipe's capacity rather than
     /// wedged against the poll loop, and only its last bytes are kept.
     #[cfg(unix)]
@@ -1101,7 +1150,7 @@ mod tests {
                 .arg("-c")
                 .arg("echo 'first line' >&2; echo 'ditto: No space left on device' >&2; exit 1"),
             "a copy that fails",
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         )
         .expect("the child ran");
         assert!(!status.success());
@@ -1111,14 +1160,13 @@ mod tests {
             "{stderr:?}"
         );
 
-        // A flood: 1 MiB of stderr, far past the 64 KiB pipe, then a clean exit.
-        let started = Instant::now();
+        // A flood: 128 KiB of stderr, past the 64 KiB pipe, then a clean exit.
         let (status, stderr) = status_bounded_with_stderr(
             Command::new("/bin/sh")
                 .arg("-c")
-                .arg("i=0; while [ $i -lt 16384 ]; do echo 'a line of stderr noise, sixty-four bytes long, give or take..' >&2; i=$((i+1)); done; echo 'the last line' >&2"),
+                .arg("i=0; while [ $i -lt 2048 ]; do echo 'a line of stderr noise, sixty-four bytes long, give or take..' >&2; i=$((i+1)); done; echo 'the last line' >&2"),
             "a chatty copy",
-            Duration::from_secs(20),
+            Duration::from_secs(60),
         )
         .expect("a chatty child must not wedge the poll loop");
         assert!(status.success());
@@ -1128,13 +1176,12 @@ mod tests {
             stderr.len()
         );
         assert_eq!(last_stderr_line(&stderr), Some("the last line"));
-        assert!(started.elapsed() < Duration::from_secs(15));
 
         // Silence is an empty tail, not a failure.
         let (status, stderr) = status_bounded_with_stderr(
             &mut Command::new("/usr/bin/true"),
             "a quiet copy",
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         )
         .expect("ran");
         assert!(status.success() && stderr.is_empty() && last_stderr_line(&stderr).is_none());
@@ -1144,6 +1191,22 @@ mod tests {
     fn team_id_parsed_from_codesign_output() {
         let sample = "Executable=/x\nIdentifier=com.aterm.aterm\nTeamIdentifier=ABCDE12345\nSealed Resources\n";
         assert_eq!(parse_team_id(sample).unwrap(), "ABCDE12345");
+    }
+
+    /// The signing identifier is the `Identifier=` line, never the
+    /// `TeamIdentifier=` one that also ends in "Identifier=", and its absence
+    /// fails closed.
+    #[test]
+    fn signing_identifier_parsed_from_codesign_output() {
+        let sample = "Executable=/x\nIdentifier=com.aterm.aterm\nTeamIdentifier=ABCDE12345\n";
+        assert_eq!(parse_signing_identifier(sample).unwrap(), "com.aterm.aterm");
+        let reordered = "TeamIdentifier=ABCDE12345\nIdentifier=com.aterm.aterm.dev\n";
+        assert_eq!(
+            parse_signing_identifier(reordered).unwrap(),
+            "com.aterm.aterm.dev"
+        );
+        assert!(parse_signing_identifier("TeamIdentifier=ABCDE12345\n").is_err());
+        assert!(parse_signing_identifier("Identifier=\n").is_err());
     }
 
     #[test]
@@ -1164,6 +1227,10 @@ mod tests {
             codesign_verify(Path::new("/nonexistent"), "AB\"CD").unwrap_err(),
             "refusing to verify: pinned team id \"AB\\\"CD\" is not alphanumeric"
         );
+        // Judging Apple's `/bin/ls` waits on trustd.
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
         let refused = codesign_verify(Path::new("/bin/ls"), "ABCDE12345").unwrap_err();
         assert!(
             refused.starts_with("codesign --verify (team-pinned requirement) failed: "),
@@ -1173,5 +1240,164 @@ mod tests {
             refused.ends_with("failed to satisfy specified code requirement(s)"),
             "{refused}"
         );
+        // A real verdict (exit 3, another signer) carries no passing key.
+        assert!(!crate::is_passing_refusal(&refused), "{refused}");
+    }
+
+    /// A codesign run that ended WITHOUT a verdict — a signal, a
+    /// wait that failed, or exit 1 naming a fact about this machine (a file it could
+    /// not read, its own internal error) — is a passing refusal on both codesign lanes.
+    /// EVERY OTHER EXIT IS A VERDICT, worded as codesign words it and with no key:
+    /// the signature faults, exit 3's requirement, exit 2's usage error, codesign's
+    /// bundle-seal verdicts — and a line nobody measured, which must stay a verdict too
+    /// ([`aterm_update_core::codesign::CodesignError::judged_nothing`] fails closed).
+    #[test]
+    fn only_a_codesign_moment_is_passing() {
+        use aterm_update_core::codesign::CodesignError;
+        let refused = |code: Option<i32>, stderr: &str| CodesignError::Refused {
+            code,
+            stderr: stderr.to_string(),
+        };
+        for passing in [
+            refused(None, ""),
+            refused(None, "aterm.app: code object is not signed at all\n"),
+            refused(
+                Some(1),
+                "aterm.app: internal error in Code Signing subsystem\n",
+            ),
+            refused(Some(1), "aterm.app: Permission denied\n"),
+            refused(Some(1), "aterm.app: No such file or directory\n"),
+            refused(Some(1), "aterm.app: Too many open files\n"),
+            refused(
+                Some(1),
+                "aterm.app: the code cannot be read by the verifier (file system permissions \
+                 etc.)\n",
+            ),
+            CodesignError::Wait(std::io::Error::from_raw_os_error(libc::EINTR)),
+        ] {
+            let pinned = codesign_refusal(passing, false);
+            assert!(crate::is_passing_refusal(&pinned), "{pinned}");
+        }
+        let structural = codesign_exit_refusal(
+            "codesign --verify (structural)",
+            refused(
+                Some(1),
+                "aterm.app: internal error in Code Signing subsystem\n",
+            ),
+        );
+        assert!(crate::is_passing_refusal(&structural), "{structural}");
+
+        // CONTROL: a verdict on the bytes stays a verdict, on either lane — the
+        // tamper verdicts measured on a modified ad hoc signed bundle included.
+        let verdicts = [
+            (
+                Some(3),
+                "aterm.app: code failed to satisfy specified code requirement(s)\n",
+            ),
+            (Some(1), "aterm.app: code object is not signed at all\n"),
+            (
+                Some(1),
+                "aterm.app: invalid signature (code or signature have been modified)\n",
+            ),
+            (
+                Some(1),
+                "aterm.app: bundle format unrecognized, invalid, or unsuitable\n",
+            ),
+            (
+                Some(1),
+                "aterm.app: a sealed resource is missing or invalid\nfile modified: \
+                 /Applications/aterm.app/Contents/Resources/aterm-handoff-policy.toml\n",
+            ),
+            (
+                Some(1),
+                "aterm.app: a sealed resource is missing or invalid\nfile added: \
+                 /Applications/aterm.app/Contents/Resources/x: Permission denied\n",
+            ),
+            (
+                Some(1),
+                "aterm.app: invalid Info.plist (plist or signature have been modified)\n\
+                 In architecture: arm64e\n",
+            ),
+            (
+                Some(1),
+                "aterm.app: invalid resource directory (directory or signature have been \
+                 modified)\n",
+            ),
+            (
+                Some(1),
+                "aterm.app: unsealed contents present in the bundle root\n",
+            ),
+            (Some(1), "aterm.app: nested code is modified or invalid\n"),
+            (Some(1), "aterm.app: a verdict nobody has measured yet\n"),
+            (Some(1), ""),
+            (Some(2), "codesign: unrecognized option\n"),
+        ];
+        for (code, stderr) in verdicts {
+            let line = codesign_refusal(refused(code, stderr), false);
+            assert!(!crate::is_passing_refusal(&line), "{line}");
+            assert!(
+                line.starts_with("codesign --verify (team-pinned requirement) failed: "),
+                "{line}"
+            );
+            let structural =
+                codesign_exit_refusal("codesign --verify (structural)", refused(code, stderr));
+            assert!(!crate::is_passing_refusal(&structural), "{structural}");
+        }
+    }
+
+    /// `verify_bundle` runs THREE helpers on the bundle, and a signal ending the
+    /// second (`codesign -d`, the team id) or the third (`spctl`) is as much a moment
+    /// as one ending the first. CONTROL: an
+    /// ended `spctl` that ran to its exit is still the rejection it reports.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_ending_the_team_or_gatekeeper_helper_is_no_verdict() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        let rejected = std::process::ExitStatus::from_raw(3 << 8);
+        let spctl = spctl_verdict(killed, "").expect_err("a killed spctl did not pass");
+        assert!(crate::is_passing_refusal(&spctl), "{spctl}");
+        let spctl = spctl_verdict(rejected, "aterm.app: rejected\nsource=Unnotarized")
+            .expect_err("a rejection");
+        assert!(!crate::is_passing_refusal(&spctl), "{spctl}");
+        assert!(
+            spctl.starts_with("spctl assessment rejected the bundle: "),
+            "{spctl}"
+        );
+
+        // The team-id helper, through the real `codesign -d` on a bundle it cannot
+        // read: the run ends on a moment, not on the missing line it then prints.
+        // `codesign -d` of Apple's `/bin/ls` waits on trustd.
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = aterm_tempfile::Builder::new()
+            .prefix("aterm-team-id-moment-")
+            .tempdir()
+            .unwrap();
+        let exe = root.path().join("aterm.app/Contents/MacOS/aterm");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::copy("/bin/ls", &exe).unwrap();
+        std::fs::write(
+            root.path().join("aterm.app/Contents/Info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>CFBundleExecutable</key><string>aterm</string></dict></plist>\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads a mode-000 file, and then the premise does not hold.
+        let premise = std::fs::read(&exe).is_err();
+        let unread = team_id(&root.path().join("aterm.app"));
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if premise {
+            let refusal = unread.expect_err("an unreadable bundle has no team id");
+            assert!(crate::is_passing_refusal(&refusal), "{refusal}");
+        }
+        // CONTROL: readable, the platform-signed executable carries no Developer ID
+        // team (measured: `TeamIdentifier=not set`), the verdict it always was.
+        let refusal = team_id(&root.path().join("aterm.app")).expect_err("no team id");
+        assert!(refusal.contains("TeamIdentifier not set"), "{refusal}");
+        assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
     }
 }

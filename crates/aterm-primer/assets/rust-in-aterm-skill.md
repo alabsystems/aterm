@@ -6,28 +6,24 @@ description: Use whenever you are about to build, check, test, lint, format or r
 
 # Rust in aterm: the default is the Trust toolchain
 
-aterm installs the ALab **verified** Rust toolchain beside stock Rust. On this
-machine, **use it by default** — the owner's instruction, verbatim: *"USE TRUST
-TOOLCHAIN NOT RUST! this needs to be very strongly encouraged by the aterm system
-itself."* Stock `cargo`/`rustc` is not blocked; it is the exception: if you run it,
-say in your reply that you did and why.
+aterm installs the ALab **verified** Rust toolchain beside stock Rust, and on this
+machine it is **the default**. Stock `cargo`/`rustc` is not blocked and still runs; a
+reply that used it says so, and why.
 
-That holds **in every repository, including one whose `rust-toolchain.toml` pins a
-stock channel** (owner ruling, 2026-09-23, after an orchestrating agent wrote
-`cargo +1.97.1` and "clippy/fmt" into ~45 subagent prompts for two such repos).
-Never write `cargo`, `cargo +<channel>`, clippy or rustfmt into a command or a
-prompt for another agent: the spellings are the right column below.
+The default holds **in every repository, including one whose `rust-toolchain.toml`
+pins a stock channel**. The spellings to write — in a command, and in a prompt for
+another agent — are the right column below; `cargo`, `cargo +<channel>`, clippy or
+rustfmt there send that agent to stock Rust.
 
 ## A stock pin moves only rustup's proxies
 
 A `rust-toolchain.toml` saying `channel = "1.97.1"` is read by **rustup**, so it
 moves rustup's proxies — `cargo`, `rustc`, `rustfmt`, `cargo-clippy` — and nothing
-else. `targo`, `tippy`, `trustfmt` and `trustdoc` are not rustup proxies. Measured
-2026-09-23/24 in a crate pinning 1.97.1 (store build 9192): `targo --unverified check
--v` ran the store's `trustc`, `targo tippy -v` its `tippy-driver`, `targo fmt --
---version` answered `trustfmt`, `targo --unverified doc -v` ran `trustdoc`. What DOES
-move targo off trustc is an explicit `RUSTC` or `build.rustc`; `aterm help rust`
-checks both for the directory you are in (its `targo here` row). So in a stock-pinned
+else. `targo`, `tippy`, `trustfmt` and `trustdoc` are not rustup proxies: in a crate
+pinning 1.97.1, `targo` still runs the store's `trustc`, `tippy-driver`, `trustfmt`
+and `trustdoc`. What DOES move targo off trustc is an explicit `RUSTC` or
+`build.rustc`; `aterm help rust` checks both for the directory you are in (its
+`targo here` row). So in a stock-pinned
 repo you build, lint and format exactly as anywhere else: `targo --unverified <cmd>` /
 `targo trust <cmd>`, `targo tippy`, `targo fmt`.
 
@@ -46,12 +42,10 @@ The right column is the tool's name — use it in your replies too (`tippy`, not
 "clippy"); the stock name is for a run that really used stock Rust, said with why.
 
 They live in `$ATPKG_BIN` and are on PATH in every shell. That is the copy
-`aterm pkg update` keeps current, and it is the one to use: it keeps working
-even when rustup's `trust` link is stale. Do **not** resolve `targo` through
-`rustup which` — that entry is not guaranteed to be the managed store (`aterm
-pkg doctor` warns in so many words when it is not), it has been found pointing
-into a live build tree that was being emptied, and when it is missing the
-command yields no path at all. Ask the tool, then ask the directory:
+`aterm pkg update` keeps current, and it keeps working even when rustup's `trust`
+link is stale. `rustup which` is a weaker way to find `targo`: that entry may not be
+the managed store (`aterm pkg doctor` warns when it is not), may point into a live
+build tree, and yields no path when missing. Ask the tool, then ask the directory:
 
 ```sh
 targo --unverified --version     # a real targo answers; a cargo-in-disguise rejects the flag
@@ -70,8 +64,8 @@ targo --unverified <cmd> …   # UNVERIFIED: proof pipeline off; warns that the 
                              # claim, and `-q` does not silence that
 ```
 
-The refusal you get from a bare `targo build` is that rule, not a broken tool.
-Do not fall back to stock `cargo` because of it — add the lane.
+The refusal you get from a bare `targo build` is that rule, not a broken tool:
+adding the lane is the whole fix, and stock `cargo` is not needed for it.
 
 Which verbs take a lane is not uniform, so measure rather than assume: `build`,
 `check` and `test` REFUSE a bare call; `run`, `doc`, `bench`, `rustc`, `rustdoc` and
@@ -101,7 +95,7 @@ the Trust spelling when it runs stock Rust, exit 0 when it does not. `--` joins 
 words with spaces, so a command with quotes goes on stdin instead:
 `aterm pkg lane - <<'EOF'`, the command, `EOF`.
 
-## Before the first build in a project: measure, do not guess
+## Before the first build in a project: `aterm help rust` measures it
 
 ```sh
 aterm help rust      # which toolchain this directory gets, and why — measured now
@@ -125,26 +119,31 @@ build with targo.
 
 * `error: 'rustc' is not installed for the custom toolchain 'trust'` — a
   **stale rustup link**, not a blocked machine. `targo`, `trustc`, `tippy` in
-  `$ATPKG_BIN` keep working. Run `aterm pkg doctor` (names the seam), then
-  `aterm pkg repair`. **Never** rebuild a toolchain from source to answer it.
+  `$ATPKG_BIN` keep working. `aterm pkg repair` fixes it; a toolchain rebuild
+  from source is not needed for it.
 * `targo check refuses to create an implicitly unverified artifact` — you
   omitted the lane. Add `trust` or `--unverified`.
 * `[host] rustflags cannot set -Ztrust_verify during a verified Targo
   invocation` — the repo's `.cargo/config.toml` carries a stock-cargo scoping
   posture that `targo trust` refuses by design. Targo scopes per unit itself;
   that config belongs on a measurement command line, not in the file.
+* `Host Rust cannot supply -Ztrust_verify: project configuration supplies
+  requirements, not activation, …` — a `.cargo/config.toml` carries
+  `-Ztrust-verify=off`, which a targo from Trust main refuses in any table.
+  Move the off-switch onto the command line of the build that needs it
+  (`targo --unverified` applies it itself).
 * A verification run that ends in `transport:missing-json` / `0 proved` /
   `verification did not run` after an `error:` line about a **world-writable
   directory** — you pointed `CARGO_TARGET_DIR` or `--out-dir` under `/tmp`.
   Use a directory under `$HOME`. Read the `error:` lines above the summary.
 
-## Never
+## Things that bite
 
-* Never build in a checkout another session is working in — `git worktree
-  add` your own; it gets its own `target/`.
-* Never assign `RUSTFLAGS` in a Trust-pinned repo (it replaces the repo's
-  policy wholesale); never pass an explicit `--target` (it strips the config
-  from host units).
-* Never report the machine as blocked before `aterm pkg doctor`.
+* A checkout another session is working in shares its `target/` and working
+  tree with you; `git worktree add` gives you your own, with its own `target/`.
+* `RUSTFLAGS` in a Trust-pinned repo replaces the repo's policy flags wholesale,
+  and an explicit `--target` strips the config from host units.
+* `aterm pkg doctor` says whether the machine is actually blocked, and names the
+  fix when it is.
 
-Ask the compiler, never a document: `trustc -Vv`, `targo --unverified --version`.
+The compiler answers for itself: `trustc -Vv`, `targo --unverified --version`.

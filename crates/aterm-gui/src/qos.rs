@@ -70,7 +70,8 @@ pub(crate) enum Role {
     /// reaper leaks the very processes whose CPU use degrades the machine. They
     /// take [`Role::Background`]. (Pinned by experience — putting the managed
     /// runtime's reapers here made their 500 ms kill-and-reap assertions fail
-    /// under load.)
+    /// under load; so did the artifact-reply quarantine reaper, whose guards
+    /// hold capture capacity, by 60 s, 2026-09-30.)
     Housekeeping,
 }
 
@@ -89,13 +90,21 @@ const fn qos_class(role: Role) -> libc::qos_class_t {
 ///
 /// Setting a thread's own QoS is the supported spelling (`_self_np`); it cannot
 /// fail in a way worth branching on, so the result is discarded.
+///
+/// Every fork the thread makes afterwards runs at the default class or above
+/// (`fork_at_default`, macOS), installed here BEFORE the class is set, so no
+/// thread is ever demoted while a fork from it could run at the demoted class.
 #[inline]
 pub(crate) fn set_self(role: Role) {
     #[cfg(target_os = "macos")]
-    // SAFETY: sets this thread's own QoS class. Takes no pointers and mutates
-    // no shared state, so there is nothing for another thread to observe.
-    unsafe {
-        libc::pthread_set_qos_class_self_np(qos_class(role), 0);
+    {
+        fork_at_default::install();
+        // SAFETY: sets this thread's own QoS class. Takes no pointers and
+        // mutates no shared state, so there is nothing for another thread to
+        // observe.
+        unsafe {
+            libc::pthread_set_qos_class_self_np(qos_class(role), 0);
+        }
     }
     #[cfg(all(
         target_os = "linux",
@@ -112,6 +121,106 @@ pub(crate) fn set_self(role: Role) {
         )
     )))]
     let _ = role;
+}
+
+// ---------------------------------------------------------------------------
+// A FORK FROM A DEMOTED THREAD RUNS AT THE DEFAULT CLASS.
+//
+// A fork-path spawn — any `Command` with a `pre_exec`, a raw `fork()`, a
+// `forkpty` — makes a child that holds a copy of every descriptor aterm has
+// open (each tab's pty master, the control listener, locks, pipe ends) from its
+// copy inside `fork(2)` until the child's exec closes them. `fork(2)` runs on the
+// FORKING thread: aterm's address space is copied there, and the child cannot
+// run before that copy is done. So that window is paid at the forking thread's
+// class, and a `Background` thread paid it at UTILITY. The title worker starting the managed
+// Ollama daemon (`setsid` and `InheritStrip` in a `pre_exec`) is that fork
+// today; every other fork-path spawn found runs on an undeclared or a raised
+// thread (the update handoff worker, the shell spawns, the CLI's own verbs), and
+// the guard below holds for whichever demoted thread forks next.
+//
+// MEASURED 2026-10-01 at load 128-140 on 18 cores (6 P, 12 E): from the
+// instant `fork` is called to the child's last `pre_exec` step, `/usr/bin/true`
+// from a parent of 2 GB in 6000 resident mappings (the live window had 6643),
+// n=300 per row, the rows interleaved, in ms:
+//
+//   forking thread                   p50     p90     p99     max
+//   DEFAULT                          7.2     11.9    20      32
+//   UTILITY                          26      133     309     431
+//   UTILITY, lifted by this guard    7.3     11.2    26      50
+//
+// The child's own thread is NOT the slow party: it starts with no class at all
+// (base priority 31) whichever class forked it — measured, and read back by the
+// kernel as `THREAD_QOS_UNSPECIFIED` in its `pre_exec`. The address-space copy,
+// on the forking thread, is what a demoted class starves.
+//
+// THE GUARD IS `pthread_atfork`, so no spawn site can forget it: libSystem runs
+// the prepare handler on the forking thread before `fork(2)` and the parent
+// handler after it returns, for every fork in the process — std's `Command`
+// fork path, aterm-pty's raw `fork`, any library's — and for no `posix_spawn`
+// (aterm-pty measured 1 call per fork, 0 per spawn), which copies nothing of
+// aterm's and so needs no lift. A thread below the default is lifted to the
+// default; the parent handler puts its class and relative priority back as soon
+// as `fork(2)` returns, and it waits for the child's exec at its own class. A
+// thread at or above the default, or one opted out of QoS, is left exactly as
+// it is: the guard never lowers anything.
+//
+// Installed by `set_self` BEFORE it sets a class — the one way this crate
+// demotes a thread. The managed daemon's background band is untouched: its
+// parent sets it after the exec ([`demote_process_tree`]), not the fork.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+mod fork_at_default {
+    use libc::qos_class_t::{QOS_CLASS_BACKGROUND, QOS_CLASS_DEFAULT, QOS_CLASS_UTILITY};
+    use std::cell::Cell;
+
+    unsafe extern "C" {
+        fn pthread_atfork(
+            prepare: Option<extern "C" fn()>,
+            parent: Option<extern "C" fn()>,
+            child: Option<extern "C" fn()>,
+        ) -> libc::c_int;
+    }
+
+    thread_local! {
+        /// The class and relative priority [`lift`] raised this thread from, for
+        /// the fork in flight on it; `None` when it raised nothing.
+        static LIFTED_FROM: Cell<Option<(libc::qos_class_t, libc::c_int)>> =
+            const { Cell::new(None) };
+    }
+
+    /// Bracket every fork in the process with [`lift`] and [`restore`]. Once.
+    pub(super) fn install() {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            // SAFETY: registers two `extern "C"` functions that live as long as
+            // the process; neither unwinds (they cannot panic).
+            unsafe { pthread_atfork(Some(lift), Some(restore), None) };
+        });
+    }
+
+    /// The prepare handler: on the forking thread, before `fork(2)`.
+    extern "C" fn lift() {
+        let lifted = super::requested_class_of_self().and_then(|(class, relative)| {
+            let from = [QOS_CLASS_UTILITY, QOS_CLASS_BACKGROUND]
+                .into_iter()
+                .find(|below| *below as libc::c_uint == class)?;
+            // SAFETY: sets this thread's own class; no pointers, no shared state.
+            let rc = unsafe { libc::pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, 0) };
+            (rc == 0).then_some((from, relative))
+        });
+        // Written on every fork, `None` included: the child copies this slot,
+        // and a child that forks again must not "restore" its parent's class.
+        LIFTED_FROM.set(lifted);
+    }
+
+    /// The parent handler: on the forking thread, once `fork(2)` has returned.
+    extern "C" fn restore() {
+        if let Some((class, relative)) = LIFTED_FROM.take() {
+            // SAFETY: as in `lift`; `class` and `relative` are the pair this
+            // thread had requested, read back off it before the fork.
+            unsafe { libc::pthread_set_qos_class_self_np(class, relative) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,12 +473,12 @@ const fn child_clamp(role: Role) -> Option<&'static str> {
 /// into. Measured: under `taskpolicy -c utility` a child and its own child both
 /// read pri 20, against 31 spawned bare.
 ///
-/// A SPAWN ATTRIBUTE, NOT A `pre_exec`. A `pre_exec` closure forces a real `fork()`
-/// that copies aterm's page tables (see `configure_dedicated_process_group`); the
-/// wrapper keeps the `posix_spawn` fast path. `taskpolicy` replaces itself with the
-/// program (`POSIX_SPAWN_SETEXEC`), so `Child::id` is the program's own pid and its
-/// parent is aterm: pid-keyed tailers, group kills and `SPAWNER_PID_ENV` checks see
-/// exactly what they saw before.
+/// A WRAPPER, NOT A HOOK OF OURS. `taskpolicy` replaces itself with the program
+/// (`POSIX_SPAWN_SETEXEC`), so `Child::id` is the program's own pid and its parent
+/// is aterm: pid-keyed tailers, group kills and `SPAWNER_PID_ENV` checks see exactly
+/// what they saw before. (The `Command` comes from `aterm_uds::spawnfd::command`, so
+/// neither `taskpolicy` nor the program inherits a descriptor of aterm's above stdio,
+/// and on Darwin the spawn is one `posix_spawn`: no fork of the window.)
 ///
 /// Wrapped only when both ends are real: `taskpolicy` exists and `program` is an
 /// absolute path to an executable file. A missing program under `taskpolicy` is an
@@ -378,10 +487,22 @@ const fn child_clamp(role: Role) -> Option<&'static str> {
 ///
 /// NOT FOR a child whose pid is attested the moment `spawn` returns: until
 /// `taskpolicy` execs the program, that pid is still running taskpolicy's image.
-/// The managed Ollama daemon demotes itself with [`demote_forked_child`] instead.
+/// The managed Ollama daemon is demoted by its parent with [`demote_process_tree`]
+/// instead.
 /// NOT FOR a child that launches an aterm either: the clamp is inherited, and
 /// docs/RELEASING.md measured an aterm under UTILITY starving its paint probe.
-pub(crate) fn command(role: Role, program: impl AsRef<std::path::Path>) -> std::process::Command {
+///
+/// NO CONSOLE WINDOW ON WINDOWS. Both arms build through
+/// [`aterm_uds::spawnfd::command`]: the window has no console, and every console
+/// child it started bare — each `atpkg.exe` pass, a Settings ▸ Packages verb, the
+/// daily `machine apply` — got a VISIBLE console window for its whole life
+/// (measured 2026-09-30: 9–18 s per pass, at every launch and update). It gets a
+/// windowless console now, which atpkg's own children (curl, `cmd /C mklink`)
+/// share.
+pub(crate) fn command(
+    role: Role,
+    program: impl AsRef<std::path::Path>,
+) -> aterm_uds::spawnfd::Command {
     command_with(role, program.as_ref(), std::path::Path::new(TASKPOLICY))
 }
 
@@ -391,18 +512,18 @@ fn command_with(
     role: Role,
     program: &std::path::Path,
     taskpolicy: &std::path::Path,
-) -> std::process::Command {
+) -> aterm_uds::spawnfd::Command {
     match child_clamp(role) {
         Some(clamp)
             if program.is_absolute()
                 && is_executable_file(program)
                 && is_executable_file(taskpolicy) =>
         {
-            let mut wrapped = std::process::Command::new(taskpolicy);
+            let mut wrapped = aterm_uds::spawnfd::command(taskpolicy);
             wrapped.arg("-c").arg(clamp).arg(program);
             wrapped
         }
-        _ => std::process::Command::new(program),
+        _ => aterm_uds::spawnfd::command(program),
     }
 }
 
@@ -420,36 +541,87 @@ fn is_executable_file(path: &std::path::Path) -> bool {
     }
 }
 
-/// `sys/resource.h`: `setpriority`'s "which" for the whole calling process, and the
-/// value that puts it in the Darwin background band. Not in `aterm-libc`.
+/// `sys/resource.h`: `setpriority`'s "which" for a whole process, and the value
+/// that puts it in the Darwin background band. Not in `aterm-libc`.
 #[cfg(target_os = "macos")]
 const PRIO_DARWIN_PROCESS: libc::c_int = 4;
 #[cfg(target_os = "macos")]
 const PRIO_DARWIN_BG: libc::c_int = 0x1000;
 
-/// Put the CALLING PROCESS in the Darwin background band. For a `pre_exec`
-/// closure whose child cannot take [`command`]'s wrapper.
+/// The most processes one [`demote_process_tree`] visits: the daemon it serves
+/// has a handful at most, and a tree forking faster than the walk must not
+/// keep the caller in it.
+#[cfg(target_os = "macos")]
+const DEMOTE_TREE_MAX: usize = 256;
+
+/// Put a child that is ALREADY RUNNING its own image — and every descendant it
+/// has started — in the Darwin background band, from its parent. For a child
+/// that cannot take [`command`]'s wrapper because its pid is attested the moment
+/// `spawn` returns: the managed Ollama daemon.
 ///
-/// This is what `taskpolicy -b` does: `setpriority(PRIO_DARWIN_PROCESS, 0,
-/// PRIO_DARWIN_BG)`. It survives `execve` and reaches every descendant (measured:
-/// the exec'd child and its own child read pri 4, against 31 bare). It is harsher
-/// than the UTILITY clamp [`command`] gives a `Background` child — the lowest CPU
-/// band, with disk I/O and newly opened sockets throttled — but it is the only
-/// process-wide demotion that can run between fork and exec: the utility clamp
-/// exists only as a spawn attribute, and `taskpolicy -p` cannot apply one to a
-/// running pid.
+/// This is what `taskpolicy -b` does to itself, `setpriority(PRIO_DARWIN_PROCESS,
+/// pid, PRIO_DARWIN_BG)`, aimed at another process of this user. Measured: the
+/// target reads pri 4 against 31 bare, and a child it starts afterwards inherits
+/// pri 4. It is harsher than the UTILITY clamp [`command`] gives a `Background`
+/// child — the lowest CPU band, with disk I/O and newly opened sockets throttled —
+/// but the utility clamp exists only as a spawn attribute, and `taskpolicy -p`
+/// cannot apply one to a running pid.
 ///
-/// Async-signal-safe: one syscall, no allocation. Its result is ignored, because a
-/// scheduling hint must never be the reason a child fails to start. A no-op off
-/// macOS.
-#[inline]
-#[cfg(all(unix, any(target_os = "macos", test)))]
-pub(crate) fn demote_forked_child() {
-    #[cfg(target_os = "macos")]
-    // SAFETY: `setpriority` on the calling process takes no pointers and is a
-    // plain syscall, safe between fork and exec.
-    unsafe {
-        libc::setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG);
+/// AFTER EXEC, NEVER BETWEEN FORK AND EXEC (2026-09-30). The daemon used to demote
+/// itself in a `pre_exec`. A forked child holds a copy of every descriptor aterm
+/// has open — each tab's pty master, the control listener, locks, pipe ends —
+/// until its exec closes them, and in the background band on a loaded host that
+/// exec barely runs. Measured 2026-09-30 at load ~129 on 18 cores, fork to exec
+/// of `/usr/bin/true` from a 2 GB parent: p50 30 ms, p90 116 ms, max 1.1 s for
+/// a child that demoted itself first, against p50 3.5 ms, p90 8 ms, max 27 ms
+/// bare — and over 10 s at load ~150, long enough to hold a dead run's
+/// crash-journal lock and a retired control listener open. Std's `spawn` returns
+/// only once the child has exec'd (the EOF of its CLOEXEC error pipe), so a
+/// child demoted after it holds nothing of aterm's.
+///
+/// THE TREE, because that child runs a moment at the inherited band first: at
+/// load ~120, 5 bare children in 200 reached `main` before their parent's
+/// demotion landed, up to 170 ms later — time enough for a daemon to start
+/// something. So each process is demoted BEFORE its children are listed: a
+/// child it forks after the listing inherits the band, and one it forked before
+/// is in the listing. Only a descendant whose parent has already exited —
+/// re-parented away from the tree — escapes.
+///
+/// NOT FOR A CHILD THAT EXECS AGAIN AT ONCE. An exec copies the band into the
+/// new image as it starts and then drops the old one, so a demotion that lands
+/// between the two is lost with the old image. `spawn`'s own exec has finished
+/// that by the time it returns (0 lost in 750 demotions of `/bin/sleep` and
+/// `/bin/bash`), but macOS's `/bin/sh` is a launcher that execs `/bin/bash`
+/// straight away, and 12 in 250 demotions of it were lost. The daemon is
+/// Ollama's own image, attested as such the moment `spawn` returns. The same
+/// race can leave a descendant the sweep demotes mid-exec at the inherited
+/// band; only one started before the root's demotion is ever swept.
+///
+/// The caller must still own `pid` unreaped, so the pid names the child it
+/// spawned. Results are ignored: a scheduling hint must never be the reason a
+/// child fails. macOS only, like the daemon it serves.
+#[cfg(target_os = "macos")]
+pub(crate) fn demote_process_tree(pid: u32) {
+    let Ok(root) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    let mut pending = vec![root];
+    let mut visited = 0;
+    while let Some(pid) = pending.pop() {
+        if visited == DEMOTE_TREE_MAX {
+            break;
+        }
+        visited += 1;
+        let Ok(who) = libc::id_t::try_from(pid) else {
+            continue;
+        };
+        // SAFETY: `setpriority` on a pid takes no pointers; at worst it
+        // answers ESRCH for a process that has gone.
+        unsafe {
+            libc::setpriority(PRIO_DARWIN_PROCESS, who, PRIO_DARWIN_BG);
+        }
+        // Listed only now, after `pid` is in the band (see above).
+        pending.extend(crate::quit_safety::child_pids(pid).unwrap_or_default());
     }
 }
 
@@ -462,23 +634,43 @@ pub(crate) fn demote_forked_child() {
 // both of them claims about code. The class is a property of a RUNNING THREAD,
 // and it is the only thing the scheduler reads.
 //
-// Neither symbol is in `libc`: that crate is GENERATED from a pinned reference
-// and asserted item-for-item by its oracle ("Regenerate rather than edit"), so
-// declaring them there would be a hand edit of generated code. Both are
-// ordinary libSystem exports (`<sys/qos.h>`, `<pthread/qos.h>`), declared here
-// the way this module already declares `PRIO_DARWIN_PROCESS`/`PRIO_DARWIN_BG`.
+// None of these symbols is in `libc`: that crate is GENERATED from a pinned
+// reference and asserted item-for-item by its oracle ("Regenerate rather than
+// edit"), so declaring them there would be a hand edit of generated code. All
+// are ordinary libSystem exports (`<sys/qos.h>`, `<pthread/qos.h>`,
+// `<pthread.h>`), declared here the way this module already declares
+// `PRIO_DARWIN_PROCESS`/`PRIO_DARWIN_BG`.
 //
 // Declared returning `c_uint`, NOT `libc::qos_class_t`: a `repr(u32)` enum
 // return carrying a value outside its six discriminants would be undefined
 // behaviour, so a class read back is compared as a number.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn qos_class_self() -> libc::c_uint;
+    /// Spelled as `main_thread_probe` declares it: one symbol, one signature.
+    fn pthread_self() -> *mut std::ffi::c_void;
     fn pthread_get_qos_class_np(
         thread: libc::pthread_t,
         class: *mut libc::c_uint,
         relative_priority: *mut libc::c_int,
     ) -> libc::c_int;
+}
+
+#[cfg(all(test, target_os = "macos"))]
+unsafe extern "C" {
+    fn qos_class_self() -> libc::c_uint;
+}
+
+/// The class and relative priority the CALLING thread has REQUESTED — its own
+/// word, which no override another thread pushes onto it changes — or `None` if
+/// the platform declined to answer.
+#[cfg(target_os = "macos")]
+fn requested_class_of_self() -> Option<(libc::c_uint, libc::c_int)> {
+    let mut class: libc::c_uint = 0;
+    let mut relative: libc::c_int = 0;
+    // SAFETY: both out-parameters are live, correctly typed locals, and
+    // `pthread_self` names the calling thread, alive across the call.
+    let rc = unsafe { pthread_get_qos_class_np(pthread_self().addr(), &mut class, &mut relative) };
+    (rc == 0).then_some((class, relative))
 }
 
 /// The class the CALLING thread is actually running at.
@@ -514,6 +706,97 @@ pub(crate) fn class_for(role: Role) -> u32 {
 /// MEASURED, not assumed: see `tests::a_role_reaches_only_the_thread_that_declares_it`.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) const UNDECLARED_CLASS: u32 = libc::qos_class_t::QOS_CLASS_DEFAULT as u32;
+
+// ---------------------------------------------------------------------------
+// READING A PROCESS'S BAND BACK.
+//
+// The band a process runs in is the BASE PRIORITY of its threads, which is
+// what `ps -o pri` shows: 31 at the band a process inherits, 4 in the Darwin
+// background band. NOT the task record's `pti_priority`: a process that
+// inherited the background band at fork keeps `pti_priority` 31 while its
+// threads run at base 4 (measured 2026-09-30 on Darwin 25.6, for the 2 s after
+// the fork), so only a process demoted by pid shows the band there.
+//
+// `struct proc_threadinfo` and its two `proc_pidinfo` flavors are in
+// `<sys/proc_info.h>` but not in `aterm-libc` (generated; see above): 112
+// bytes, `pth_priority` at offset 40, `PROC_PIDTHREADINFO` 5 and
+// `PROC_PIDLISTTHREADS` 6, all measured against the SDK on this Mac.
+#[cfg(all(test, target_os = "macos"))]
+#[repr(C)]
+struct ProcThreadInfo {
+    _user_and_system_time: [u64; 2],
+    _usage_policy_state_flags_sleep_curpri: [i32; 6],
+    priority: i32,
+    _max_priority: i32,
+    _name: [u8; 64],
+}
+
+#[cfg(all(test, target_os = "macos"))]
+const _: () = assert!(size_of::<ProcThreadInfo>() == 112);
+
+/// The base priority of a thread in the Darwin background band.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) const BACKGROUND_BAND_PRIORITY: i32 = 4;
+
+/// SIGKILLs the process group a test started, on every way out of the test,
+/// a panic included. Drop it before reaping the leader, so the group id still
+/// names that group. Takes everything only when nothing in the group forks
+/// once demoted: a starved fork can finish after the kill has walked the group.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) struct KillGroupOnDrop(pub(crate) libc::pid_t);
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: signals only the process group this test started.
+        unsafe { libc::kill(-self.0, libc::SIGKILL) };
+    }
+}
+
+/// The base priority of `pid`'s first thread — its main thread, and its only
+/// one for the shells and stand-ins the tests start — or `None` when libproc
+/// cannot answer. Async-signal-safe (two `proc_pidinfo` calls into stack
+/// records), so a `pre_exec` probe may call it.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn base_priority_of(pid: libc::pid_t) -> Option<i32> {
+    const PROC_PIDTHREADINFO: libc::c_int = 5;
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    const HANDLE: libc::c_int = size_of::<u64>() as libc::c_int;
+    const INFO: libc::c_int = size_of::<ProcThreadInfo>() as libc::c_int;
+    let mut thread: u64 = 0;
+    // SAFETY: `thread` is one writable `u64` slot, and libproc writes at most
+    // `HANDLE` bytes of thread handles into it.
+    let listed = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDLISTTHREADS,
+            0,
+            (&raw mut thread).cast(),
+            HANDLE,
+        )
+    };
+    if listed != HANDLE {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<ProcThreadInfo>::uninit();
+    // SAFETY: `info` is `INFO` writable bytes laid out as the
+    // `proc_threadinfo` this flavor fills (pinned to 112 bytes above).
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDTHREADINFO,
+            thread,
+            info.as_mut_ptr().cast(),
+            INFO,
+        )
+    };
+    if read != INFO {
+        return None;
+    }
+    // SAFETY: the exact-size read initialized the whole record, and every
+    // field is a plain integer, valid for any bit pattern.
+    Some(unsafe { info.assume_init() }.priority)
+}
 
 #[cfg(test)]
 mod tests {
@@ -577,382 +860,85 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // THE CENSUS
-    // -----------------------------------------------------------------------
+    /// The class a fork from the CALLING thread ran at, as the forked child
+    /// reads it in its last step before the exec: its copy of this thread's QoS
+    /// word, which `fork(2)` took when it copied the address space — the copy
+    /// the forking thread's class paces ([`fork_at_default`]). Not the child's
+    /// base priority: the kernel starts a forked thread with no class whichever
+    /// class forked it, so that reads the same with or without the guard.
+    #[cfg(target_os = "macos")]
+    fn class_a_fork_ran_at() -> u32 {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
 
-    /// Workers that declare NO role, each with the reason. Two kinds only:
-    ///
-    /// * a worker on a platform where [`set_self`] is a no-op, where declaring
-    ///   one would be a comment with a syscall's shape; and
-    /// * a worker the 2026-08-29 audit's P2 role-by-role pass has not reached.
-    ///
-    /// The second kind is the OPEN half of that P2, countable here instead of
-    /// guessed at: each of those runs in the band the compilers and the program
-    /// you are typing into share. This is not a licence to add another — a new
-    /// worker gets a role, and appending to this list instead is a decision to
-    /// argue for in review, in the entry.
-    const UNDECLARED_WORKERS: &[(&str, &str)] = &[
-        (
-            "aterm-agent-prime",
-            "unclassified: primes the agent roster when due",
-        ),
-        (
-            "aterm-artifact-cleanup",
-            "unclassified: the artifact cleanup scheduler",
-        ),
-        (
-            "aterm-config-runtime",
-            "unclassified: the runtime config service's entry worker",
-        ),
-        (
-            "aterm-claimant-census",
-            "unclassified: lists the bundles claiming this app's identifier",
-        ),
-        (
-            "aterm-claimant-retire",
-            "unclassified: moves conflicting copies of the app to the Trash on the owner's press",
-        ),
-        (
-            "aterm-consent-probe",
-            "unclassified: probes macOS full-disk-access consent",
-        ),
-        (
-            "aterm-document-admit",
-            "unclassified: admits an opened document",
-        ),
-        (
-            "aterm-fabric-launch",
-            "unclassified: arms the fabric launcher",
-        ),
-        (
-            "aterm-fleet-scan",
-            "unclassified: scans the fleet on request",
-        ),
-        (
-            "aterm-handoff-commit",
-            "unclassified: signals update-handoff readiness",
-        ),
-        (
-            "aterm-handoff-parent-watch",
-            "unclassified: watches the seamless handoff's parent",
-        ),
-        (
-            "aterm-jumplist",
-            "Windows only (`jumplist_win::install`); `set_self` is a no-op there",
-        ),
-        (
-            "aterm-macos-access-answer",
-            "unclassified: records and clears the macOS access marker",
-        ),
-        (
-            "aterm-macos-access-card",
-            "unclassified: posts the macOS access card's facts",
-        ),
-        (
-            "aterm-native-config",
-            "unclassified: the native config queue's worker",
-        ),
-        (
-            "aterm-native-document",
-            "unclassified: the native document queue's worker",
-        ),
-        (
-            "aterm-operator-observer",
-            "unclassified: the operator host's observer",
-        ),
-        (
-            "aterm-reroute-lay",
-            "unclassified: lays the session reroute at startup",
-        ),
-        (
-            "aterm-update-handoff",
-            "unclassified: drives the Unix update handoff",
-        ),
-        (
-            "aterm-update-preverify",
-            "DELIBERATELY the inherited DEFAULT — the reason is written at its spawn \
-             site in app_native.rs: it publishes into a mutex the UI thread takes, so \
-             the floor rule forbids demoting it, and nothing waits on it, so promoting \
-             it would be wrong too",
-        ),
-        (
-            "aterm-watchdog",
-            "unclassified: the freeze watchdog's beat monitor",
-        ),
-        (
-            "aterm-x11-clipboard",
-            "X11 only; unclassified (on Linux `set_self` only shortens the \
-             slice of the keystroke-path roles)",
-        ),
-        (
-            "aterm-x11-paste",
-            "X11 only; unclassified (on Linux `set_self` only shortens the \
-             slice of the keystroke-path roles)",
-        ),
-        (
-            "aterm-x11-primary-paste",
-            "X11 only; unclassified (on Linux `set_self` only shortens the \
-             slice of the keystroke-path roles)",
-        ),
-    ];
+        let (mut probe, probe_end) = std::io::pipe().unwrap();
+        // std's Command on purpose: the probe IS a `pre_exec` in a forked child.
+        let mut command = std::process::Command::new("/usr/bin/true");
+        // SAFETY: the probe loads this thread's QoS word (a thread-specific
+        // slot) and makes one 4-byte `write`; it allocates nothing and takes
+        // no lock. The closure owns the write end.
+        unsafe {
+            command.pre_exec(move || {
+                let class = qos_class_self();
+                let _ = libc::write(
+                    probe_end.as_raw_fd(),
+                    (&raw const class).cast(),
+                    size_of::<libc::c_uint>(),
+                );
+                Ok(())
+            });
+        }
+        let status = command.status().unwrap();
+        assert!(status.success(), "{status}");
+        // The probe wrote before the exec, and `status` returned after it: the
+        // bytes are in the pipe, and no EOF is needed to read them.
+        let mut class = [0; 4];
+        probe
+            .read_exact(&mut class)
+            .expect("the pre_exec probe wrote nothing before the exec");
+        u32::from_ne_bytes(class)
+    }
 
-    /// EVERY NAMED WORKER IN THIS CRATE IS ROLE-DECLARED OR INVENTORIED — the
-    /// standing thread-QoS census the 2026-08-29 audit's P2 asked for
-    /// ("platform thread-QoS inspection"), as a test rather than a verb.
-    ///
-    /// The other QoS tests here each pin ONE lane by name — the package lane,
-    /// the reflow pool, the control plane — so a worker nobody thought to name
-    /// is invisible to all of them. That is the exact shape of the incident this
-    /// module ports: 41 named threads, 2 declaring a class. This test enumerates
-    /// instead, and has no list of lanes to keep up to date.
-    ///
-    /// A role counts only where it REACHES the worker, so the scan resolves the
-    /// BODY rather than reading near the name:
-    ///
-    /// * an inline closure declares inside itself, before the next named spawn
-    ///   (so one worker's declaration can never cover its neighbour's);
-    /// * `.spawn(some_fn)` declares at that function's entry — resolved only
-    ///   when the crate holds exactly one definition of the name, so an
-    ///   ambiguous one is reported rather than guessed (the reflow pool's two
-    ///   spawn sites are this shape);
-    /// * a body handed to a spawn SEAM declares in every closure passed to that
-    ///   seam. This is the reply writer, and it is the shape that motivated the
-    ///   whole test: its `Role::Interactive` is one line inside the closure
-    ///   `spawn_reply_writer` hands `spawn_reply_writer_thread`, and moving that
-    ///   body to a bare `std::thread::spawn` would compile, pass, and drop the
-    ///   class of the thread holding the mutex a keystroke write spins on.
-    ///
-    /// Line comments are blanked before the scan, so a comment that NAMES
-    /// `set_self` — `aterm-update-preverify`'s spawn site says exactly why it
-    /// declares none — can never read as a declaration.
+    /// A FORK FROM A DEMOTED THREAD RUNS AT THE DEFAULT CLASS, and the thread
+    /// has its own class back once `spawn` returns. Until its exec the forked
+    /// child holds every descriptor aterm has open, and that window is paid at
+    /// the forking thread's class: from a UTILITY thread p50 26 ms / max 431 ms
+    /// at load ~130, against 7 ms / 32 ms from a DEFAULT one
+    /// ([`fork_at_default`]). Read off the fork itself, not timed. A thread at
+    /// or above the default forks at its own class — the guard never lowers —
+    /// which is also what shows the probe reads the forking thread's class
+    /// rather than a constant. Negative control: without the guard a
+    /// `Background` thread forks at UTILITY (0x11).
+    #[cfg(target_os = "macos")]
     #[test]
-    fn every_named_worker_declares_a_role_or_is_inventoried() {
-        let sources = crate_sources();
-        // Built at runtime so this file's own source never carries the token it
-        // scans for.
-        let marker = String::from(".name") + "(\"aterm-";
-        let mut sites = 0usize;
-        let mut undeclared: Vec<String> = Vec::new();
-        let mut listed_seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for (file, source) in &sources {
-            let mut from = 0usize;
-            while let Some(hit) = source[from..].find(&marker) {
-                let site = from + hit;
-                from = site + marker.len();
-                let Some(quote) = source[from..].find('"') else {
-                    continue;
-                };
-                let name = format!("aterm-{}", &source[from..from + quote]);
-                sites += 1;
-                if declares_a_role(&sources, source, site) {
-                    continue;
-                }
-                match UNDECLARED_WORKERS
-                    .iter()
-                    .find(|(listed, _)| *listed == name)
-                {
-                    Some((listed, _)) => {
-                        listed_seen.insert(*listed);
-                    }
-                    None => {
-                        let line = source[..site].matches('\n').count() + 1;
-                        undeclared.push(format!("{file}:{line} {name}"));
-                    }
-                }
-            }
+    fn a_fork_runs_at_the_default_class_or_above_and_the_role_comes_back() {
+        for role in [
+            Role::Interactive,
+            Role::Responsive,
+            Role::Background,
+            Role::Housekeeping,
+        ] {
+            let (at_fork, after) = std::thread::spawn(move || {
+                set_self(role);
+                (class_a_fork_ran_at(), class_of_self())
+            })
+            .join()
+            .expect("the forking thread");
+            let declared = class_for(role);
+            assert_eq!(
+                at_fork,
+                declared.max(UNDECLARED_CLASS),
+                "a {role:?} thread (0x{declared:x}) forked at 0x{at_fork:x}: a copy of \
+                 aterm holding every descriptor it has open waited out its exec at a \
+                 demoted class"
+            );
+            assert_eq!(
+                after, declared,
+                "a {role:?} thread came back from its fork at 0x{after:x}, not its own \
+                 class"
+            );
         }
-        assert!(
-            sites >= 50,
-            "the scan found only {sites} named workers, so it has stopped seeing them"
-        );
-        assert!(
-            undeclared.is_empty(),
-            "these workers declare no scheduling role, so they run in the band the \
-             compilers and the program being typed into share — give each one a \
-             `crate::qos::set_self(…)` as the first statement INSIDE its closure, or \
-             list it in UNDECLARED_WORKERS with the reason:\n  {}",
-            undeclared.join("\n  ")
-        );
-        let stale: Vec<&str> = UNDECLARED_WORKERS
-            .iter()
-            .map(|(name, _)| *name)
-            .filter(|name| !listed_seen.contains(name))
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "UNDECLARED_WORKERS lists workers that no longer exist, or that now declare \
-             a role; drop them so the list stays the true inventory: {stale:?}"
-        );
-    }
-
-    /// Every `.rs` file under this crate's `src/`, with line comments blanked to
-    /// spaces: byte offsets — and so the line numbers reported — stay true.
-    fn crate_sources() -> Vec<(String, String)> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut out = Vec::new();
-        let mut stack = vec![root.clone()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).expect("read src/") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    let rel = path
-                        .strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .into_owned();
-                    let text = std::fs::read_to_string(&path).expect("read source");
-                    out.push((rel, blank_line_comments(&text)));
-                }
-            }
-        }
-        out.sort();
-        out
-    }
-
-    /// `//` to end of line becomes spaces, outside a string literal.
-    fn blank_line_comments(source: &str) -> String {
-        let mut out = String::with_capacity(source.len());
-        for line in source.split('\n') {
-            let bytes = line.as_bytes();
-            let mut quotes = 0usize;
-            let mut cut = None;
-            let mut i = 0usize;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'"' => quotes += 1,
-                    b'/' if quotes.is_multiple_of(2) && bytes.get(i + 1) == Some(&b'/') => {
-                        cut = Some(i);
-                        break;
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-            match cut {
-                Some(at) => {
-                    out.push_str(&line[..at]);
-                    for _ in at..line.len() {
-                        out.push(' ');
-                    }
-                }
-                None => out.push_str(line),
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    /// A byte window of `source` from `from`, clipped back to a char boundary.
-    fn window(source: &str, from: usize, len: usize) -> &str {
-        let mut end = from.saturating_add(len).min(source.len());
-        while end > from && !source.is_char_boundary(end) {
-            end -= 1;
-        }
-        source.get(from..end).unwrap_or("")
-    }
-
-    /// Does the worker named at `site` declare a role where that role REACHES
-    /// its thread? The three body shapes are described on the census test.
-    fn declares_a_role(sources: &[(String, String)], source: &str, site: usize) -> bool {
-        const DECL: &str = "qos::set_self";
-        let marker = String::from(".name") + "(\"aterm-";
-        let Some(offset) = window(source, site, 800).find(".spawn(") else {
-            return false;
-        };
-        let body = site + offset + ".spawn(".len();
-        let trimmed = window(source, body, 200).trim_start();
-        if trimmed.starts_with('|') || trimmed.starts_with("move |") {
-            let mut inline = window(source, body, 2000);
-            if let Some(next) = inline.find(&marker) {
-                inline = &inline[..next];
-            }
-            return inline.contains(DECL);
-        }
-        let path: String = trimmed
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
-            .collect();
-        if let Some(target) = path.rsplit("::").next().filter(|t| !t.is_empty()) {
-            let needle = format!("fn {target}");
-            let mut heads: Vec<&str> = Vec::new();
-            for (_, other) in sources {
-                for (at, _) in other.match_indices(&needle) {
-                    let tail = window(other, at + needle.len(), 1);
-                    if tail != "(" && tail != "<" {
-                        continue;
-                    }
-                    // A DEFINITION, not a mention: `fn` opens its line, behind
-                    // nothing but a visibility or a qualifier. The tests in this
-                    // very file quote such a signature inside a string literal.
-                    let line = other[..at].rfind('\n').map_or(0, |nl| nl + 1);
-                    let opens = other[line..at].split_whitespace().all(|word| {
-                        matches!(
-                            word,
-                            "pub" | "pub(crate)" | "pub(super)" | "async" | "const" | "unsafe"
-                        )
-                    });
-                    if opens {
-                        heads.push(window(other, at, 900));
-                    }
-                }
-            }
-            if heads.len() == 1 && heads[0].contains(DECL) {
-                return true;
-            }
-        }
-        // A body handed to a SEAM: every closure passed to the enclosing
-        // function declares, and there is at least one caller to pass one.
-        let Some(seam) = enclosing_fn(source, site) else {
-            return false;
-        };
-        let call = format!("{seam}(");
-        let (mut calls, mut declared) = (0usize, 0usize);
-        for (_, other) in sources {
-            for (at, _) in other.match_indices(&call) {
-                let before = &other[..at];
-                if before
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                {
-                    continue;
-                }
-                if before.trim_end().ends_with("fn") {
-                    continue; // the seam's own definition
-                }
-                calls += 1;
-                if window(other, at + call.len(), 800).contains(DECL) {
-                    declared += 1;
-                }
-            }
-        }
-        calls > 0 && calls == declared
-    }
-
-    /// The name of the function enclosing `site`.
-    fn enclosing_fn(source: &str, site: usize) -> Option<String> {
-        let head = &source[..site];
-        let mut name = None;
-        for (at, _) in head.match_indices("fn ") {
-            if head[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_')
-            {
-                continue;
-            }
-            let found: String = head[at + 3..]
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if !found.is_empty() {
-                name = Some(found);
-            }
-        }
-        name
     }
 
     /// The ORDER is the contract: cosmetic work must never outrank the work a
@@ -973,7 +959,7 @@ mod tests {
         );
         assert!(
             rank(Role::Background) > rank(Role::Housekeeping),
-            "useful background work must outrank the artifact-quarantine sweep"
+            "useful background work must outrank an opportunistic disk sweep"
         );
     }
 
@@ -1128,7 +1114,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn argv(command: &std::process::Command) -> Vec<String> {
+    fn argv(command: &aterm_uds::spawnfd::Command) -> Vec<String> {
         std::iter::once(command.get_program())
             .chain(command.get_args())
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1206,6 +1192,55 @@ mod tests {
         assert!(
             pri <= 20,
             "a Background child ran at pri {pri}, not utility (20)"
+        );
+    }
+
+    /// THE SWEEP. A child demoted from its parent runs a moment at the band it
+    /// inherited first, and whatever it starts in that moment does not inherit
+    /// the demotion. [`demote_process_tree`] takes those too. Deterministic: the
+    /// root here is a shell started bare, and its descendant demonstrably exists
+    /// (it has printed its pid) before the root is demoted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tree_demoted_from_its_root_takes_what_it_already_started() {
+        use std::io::BufRead as _;
+
+        // The root runs the descendant in the foreground and waits on it; the
+        // descendant names itself once it runs its own image, then blocks
+        // reading the stdin pipe this test holds. From then on neither forks
+        // nor execs: no demotion can land in an exec, no starved fork can
+        // escape the group kill, and the pipe's EOF ends both even without it.
+        let mut root = aterm_uds::spawnfd::command("/bin/bash")
+            .args(["-c", "/bin/bash -c 'echo $$; read -r _'; :"])
+            .process_group(0)
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .unwrap();
+        let group = KillGroupOnDrop(libc::pid_t::try_from(root.id()).unwrap());
+        let mut line = String::new();
+        std::io::BufReader::new(root.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant: libc::pid_t = line.trim().parse().unwrap();
+        let before = base_priority_of(descendant);
+
+        demote_process_tree(root.id());
+        let after = (base_priority_of(group.0), base_priority_of(descendant));
+
+        drop(group);
+        let _ = root.wait();
+        let band = Some(BACKGROUND_BAND_PRIORITY);
+        assert!(
+            before.is_some() && before != band,
+            "the descendant must start outside the background band ({before:?}), or \
+             this proves nothing"
+        );
+        assert_eq!(after.0, band, "the root was not demoted");
+        assert_eq!(
+            after.1, band,
+            "a descendant started before its root's demotion stayed at {before:?}"
         );
     }
 

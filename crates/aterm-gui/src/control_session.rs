@@ -19,7 +19,7 @@ use crate::Wake;
 use crate::app_introspect::SessionWindowRow;
 use crate::input::InputEvent;
 use crate::session_edge_audit::{self, EdgeAction};
-use crate::session_store::{ExitActor, SessionHandle, Store};
+use crate::session_store::{ExitActor, SessionHandle, SessionState, Store};
 use crate::session_timeline::{
     MetaEdit, MetaField, MetaWriteError, QUESTIONS_USAGE, apply_meta_value, write_session_meta,
 };
@@ -317,6 +317,7 @@ pub(crate) fn sessions_lines(
     rows: Result<&[SessionWindowRow], &str>,
     frozen_path: impl Fn(u64) -> bool,
 ) -> String {
+    use std::fmt::Write as _;
     let mut out = format!("OK {}\n", snapshot.len());
     for h in snapshot {
         let parent = h
@@ -345,17 +346,12 @@ pub(crate) fn sessions_lines(
                 (
                     p.window
                         .map_or_else(|| "none".to_string(), |w| w.to_string()),
-                    u8::from(p.active_tab).to_string(),
-                    u8::from(p.window_focused).to_string(),
+                    if p.active_tab { "1" } else { "0" },
+                    if p.window_focused { "1" } else { "0" },
                     p.detail,
                 )
             }
-            Err(_) => (
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-                session_detail(h),
-            ),
+            Err(_) => ("-".to_string(), "-", "-", session_detail(h)),
         };
         let detail = detail
             .as_deref()
@@ -383,27 +379,25 @@ pub(crate) fn sessions_lines(
         };
         // `human_ms=<ms|->`: how long since a PERSON last had a hand on the
         // session through a window — the same atomic `status` reads.
-        let human = format!(
-            "human_ms={}",
-            h.ctx.human_input.wire(crate::metrics::now_us())
-        );
+        let human = h.ctx.human_input.wire(crate::metrics::now_us());
         // Then the typed `role=`, `attention=` and `user_title=` (the escalated
         // set and the operator a fleet glance needs, in the roster itself rather
         // than one `@sid meta` hop per session) and `supervisor=<holder|->`, the
         // live supervisor claim, so a fleet read shows which agent tabs something
         // is answering for — all from the one meta read above.
-        out.push_str(&format!(
+        let _ = writeln!(
+            out,
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
              wfocus={wfocus} detail={detail} identity={identity} path={path} {agent} \
-             {human} role={role} attention={attention} user_title={user_title} \
-             supervisor={supervisor} {owner}\n",
+             human_ms={human} role={role} attention={attention} user_title={user_title} \
+             supervisor={supervisor} {owner}",
             h.local_id,
             h.sid.as_str(),
             parent,
             h.state.as_str(),
             title,
             nonce = h.nonce.to_hex(),
-        ));
+        );
     }
     out
 }
@@ -914,6 +908,29 @@ fn fire_idle_unless_parked(t: &mut Terminal, now: std::time::Instant, parked: bo
     }
 }
 
+/// The exit check every parked verb shares: whether `session` was in the
+/// registry is read HERE, at arm, and the returned probe answers "has it
+/// ended?" against the store it is handed. A session that WAS registered but is
+/// later GONE (deregistered during teardown) is dead — the `Wake::Exit` notify
+/// can race the deregistration, so the woken thread may see `None`. Treating
+/// "was registered, now None" as exited closes that race; a headless unit term
+/// (never registered) stays Alive on `None`.
+fn exit_probe(store: &Store, session: u64) -> impl Fn(&Store) -> bool {
+    let was_registered = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_local(session)
+        .is_some();
+    move |store: &Store| -> bool {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        match g.by_local(session).map(|h| h.state) {
+            Some(SessionState::Exited) => true,
+            None => was_registered,
+            _ => false,
+        }
+    }
+}
+
 pub(crate) fn cmd_ready(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -926,7 +943,6 @@ pub(crate) fn cmd_ready(
 
     use aterm_core::terminal::{BlockState, WatcherSpec};
 
-    use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
     // Accept a bare `<ms>` (original) or `timeout=<ms>` (k=v, aligning with the
@@ -951,19 +967,7 @@ pub(crate) fn cmd_ready(
     // the registry — e.g. a headless unit term) is treated as Alive — UNLESS the
     // session was registered at arm and is now gone (deregistered on teardown),
     // which is a dead session the `Wake::Exit` notify woke us for (see `gone`).
-    let was_registered = store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .by_local(session)
-        .is_some();
-    let gone = |store: &Store| -> bool {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        match g.by_local(session).map(|h| h.state) {
-            Some(SessionState::Exited) => true,
-            None => was_registered,
-            _ => false,
-        }
-    };
+    let gone = exit_probe(store, session);
 
     // Arm one idle watcher up front; the engine auto-resets its deadline on output.
     let idle_id = term_lock(term).watch(WatcherSpec::IdleFor { dur: SETTLE }, now0);
@@ -1035,7 +1039,7 @@ pub(crate) fn cmd_ready(
 /// | block | inbox since=<id> [kinds=<k,...>]> [timeout <ms>]` — block until the
 /// Observation Kernel (L0) latches the predicate, then return `OK <kind> <seq>`;
 /// `OK timeout` if the overall deadline elapses; `ERR exited` if the session dies.
-/// (`await consent [timeout=<ms>]` is dispatched to `control_privacy` before this
+/// (`await consent [kind=debugger] [timeout=<ms>]` is dispatched to `control_privacy` before this
 /// handler is reached; the usage line names it so the alternation stays complete.)
 ///
 /// `gone` is the inverse of `match` — it latches when NO visible row (in range)
@@ -1083,32 +1087,30 @@ pub(crate) fn cmd_await(
 
     use aterm_core::terminal::{RowRange, WatcherSpec};
 
-    use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
     const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|\
                          gone <re> [rows <a> <b>]|block|inbox since=<id> [kinds=<k,...>]|\
                          agent <word>[,<word>...]> \
-                         [timeout <ms>] | await consent [timeout=<ms>] | await momentum <floor 0..=1> [timeout <ms>]\n";
+                         [timeout <ms>] | await consent [kind=debugger] [timeout=<ms>] | await momentum <floor 0..=1> [timeout <ms>]\n";
 
     // Split off an optional `timeout <ms>` anywhere in the args; the rest is the
     // predicate + its arguments.
-    let toks: Vec<&str> = rest.split_whitespace().collect();
+    let mut toks = rest.split_whitespace();
     let mut timeout_ms = 30_000u64;
     let mut args: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < toks.len() {
+    while let Some(tok) = toks.next() {
         // Accept BOTH `timeout <ms>` (the original await grammar) and `timeout=<ms>`
         // (the k=v form turn/turns/subscribe use) so the wait family reads uniformly.
-        if let Some(v) = toks[i].strip_prefix("timeout=") {
+        // A bare trailing `timeout` is an argument like any other word.
+        if let Some(v) = tok.strip_prefix("timeout=") {
             timeout_ms = v.parse().unwrap_or(30_000);
-            i += 1;
-        } else if toks[i] == "timeout" && i + 1 < toks.len() {
-            timeout_ms = toks[i + 1].parse().unwrap_or(30_000);
-            i += 2;
+        } else if tok == "timeout"
+            && let Some(v) = toks.next()
+        {
+            timeout_ms = v.parse().unwrap_or(30_000);
         } else {
-            args.push(toks[i]);
-            i += 1;
+            args.push(tok);
         }
     }
     let timeout_ms = timeout_ms.min(600_000);
@@ -1229,24 +1231,8 @@ pub(crate) fn cmd_await(
     // overall timeout is the ultimate backstop — so no re-query is needed.
     let sub = SubscriberSet::register(subscribers, &[session]);
 
-    // Whether the session was in the registry at arm. A session that WAS
-    // registered but is later GONE (deregistered during teardown) is dead — and
-    // the `Wake::Exit` notify can race the deregistration, so the woken thread may
-    // see `None`. Treating "was registered, now None" as exited closes that race;
-    // a headless unit term (never registered) stays Alive on `None` as before.
-    let was_registered = store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .by_local(session)
-        .is_some();
-    let exited = |store: &Store| -> bool {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        match g.by_local(session).map(|h| h.state) {
-            Some(SessionState::Exited) => true,
-            None => was_registered,
-            _ => false,
-        }
-    };
+    // Whether the session was in the registry at arm ([`exit_probe`]).
+    let exited = exit_probe(store, session);
 
     loop {
         if exited(store) {
@@ -1265,14 +1251,17 @@ pub(crate) fn cmd_await(
             // Fire any elapsed idle deadline (host-injected `now`) — held
             // while the session's reader is parked for an update.
             fire_idle_unless_parked(&mut t, now, parked);
-            (t.watch_poll(id), t.watch_next_deadline())
+            let sat = t.watch_poll(id);
+            // Every return below disarms: do it under this same guard.
+            if sat.is_some() || now >= overall {
+                t.watch_disarm(id);
+            }
+            (sat, t.watch_next_deadline())
         };
         if let Some(s) = sat {
-            term_lock(term).watch_disarm(id);
             return format!("OK {kind} {}\n", s.seq);
         }
         if now >= overall {
-            term_lock(term).watch_disarm(id);
             return "OK timeout\n".to_string();
         }
         // Park until a REAL event wakes us — event-driven, no re-poll: an
@@ -1309,7 +1298,8 @@ const AGENT_WORDS: [&str; 7] = [
 /// its timeout rather than being refused: a newer reader may name one this
 /// build does not. `limited`, the verdict word before the walls were named,
 /// is `ERR usage` like any unknown word: its deprecated alias meant the limit
-/// walls MINUS an API 429, which is neither what `level=limited` (any wall)
+/// walls MINUS an API 429, which is neither what `level=limited` (any wall
+/// nobody answers)
 /// nor the band's `limited` (the limit walls with a 429) means — `wall` or
 /// `wall:<kind>` says which.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1371,16 +1361,11 @@ fn await_agent(
 ) -> String {
     use std::time::{Duration, Instant};
 
-    use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
     let overall = Instant::now() + Duration::from_millis(timeout_ms);
     let sub = SubscriberSet::register(subscribers, &[session]);
-    let was_registered = store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .by_local(session)
-        .is_some();
+    let exited = exit_probe(store, session);
     loop {
         let (word, rev) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -1389,15 +1374,7 @@ fn await_agent(
         if words.iter().any(|w| w.matches(word)) {
             return format!("OK agent {word} rev={rev}\n");
         }
-        let gone = {
-            let g = store.read().unwrap_or_else(|p| p.into_inner());
-            match g.by_local(session).map(|h| h.state) {
-                Some(SessionState::Exited) => true,
-                None => was_registered,
-                _ => false,
-            }
-        };
-        if gone {
+        if exited(store) {
             return "ERR exited\n".to_string();
         }
         if crate::control::caller_hung_up() {
@@ -1476,15 +1453,25 @@ pub(crate) fn turn_ids_for_handoff() -> u64 {
 /// attempt's handoff manifest carried: the successor would mint it again, so
 /// the Commit stands down (and the next attempt carries a fresh count). A
 /// `ceiling` of 0 — an attempt whose manifest was never written — is none.
+///
+/// Nor is a ceiling at the top of what a manifest carries
+/// (`handoff_carry::MAX_TURN_ID`, round eight of the update audit, finding
+/// 715): the successor continues from there whatever this process minted
+/// ([`raise_turn_ids`] holds the count to it), so standing down protects no
+/// id — and since the next attempt's ceiling is the top again, it would
+/// refuse every later Commit, an update that never lands. A count gets there
+/// only from a carried count no aterm minted; the successor says so
+/// (`seamless::take_incoming`).
 #[cfg(any(unix, test))]
 pub(crate) fn turn_ids_past_handoff_ceiling(ceiling: u64) -> bool {
     past_ceiling(turn_ids_minted(), ceiling)
 }
 
-/// [`turn_ids_past_handoff_ceiling`]'s rule: `ceiling` 0 is none.
+/// [`turn_ids_past_handoff_ceiling`]'s rule: `ceiling` 0 is none, and so is
+/// one at the top of the manifest's range.
 #[cfg(any(unix, test))]
 const fn past_ceiling(minted: u64, ceiling: u64) -> bool {
-    ceiling > 0 && minted > ceiling
+    ceiling > 0 && ceiling < crate::handoff_carry::MAX_TURN_ID && minted > ceiling
 }
 
 /// Input delivery for [`cmd_turn`], resolved by the dispatch site so the ONE
@@ -1588,6 +1575,15 @@ impl TurnIo<'static> {
 /// with room for the reply; past that a turn is a document, not a sentence.
 pub(crate) const TYPED_CAP: usize = 240;
 
+/// The most graphemes `turn typed=1 cap=<n>` may ask to have pressed one key at a
+/// time. The default cap is a bound on TIME (240 keys at the default cadence);
+/// a caller that types faster and needs its whole text pressed, not pasted,
+/// asks for the room with `cap=`. Why anyone would: an agent that reads a long
+/// paste as PASTED (Claude Code wraps one in `<pasted_content>` and treats its
+/// instructions as not its person's) reads the same text pressed as its person's
+/// own. 4096 keys at the 2 ms a harness notice uses is ~8 s, inside `timeout=`.
+pub(crate) const TYPED_CAP_MAX: usize = 4096;
+
 /// The default inter-key interval of `turn typed=1`, in milliseconds. A
 /// jitter-free 70 ms IOI (~14 cps, held exactly) is the typed turn's ONE
 /// honest signature: no hand holds a cadence to the millisecond, and the seam
@@ -1685,14 +1681,301 @@ pub(crate) fn typed_key_events(text: &str) -> Vec<InputEvent> {
     text.graphemes().filter_map(typed_key_event).collect()
 }
 
-/// Split `text` at the [`TYPED_CAP`]th grapheme: `(typed prefix, pasted
-/// remainder)`. The remainder is empty for a text inside the cap.
-pub(crate) fn split_typed_cap(text: &str) -> (&str, &str) {
+/// Split `text` at the `cap`th grapheme ([`TYPED_CAP`] unless the turn said
+/// `cap=`): `(typed prefix, pasted remainder)`. The remainder is empty for a
+/// text inside the cap.
+pub(crate) fn split_typed_cap(text: &str, cap: usize) -> (&str, &str) {
     use aterm_grapheme::GraphemeClusters;
-    match text.grapheme_indices().nth(TYPED_CAP) {
+    match text.grapheme_indices().nth(cap) {
         Some((at, _)) => text.split_at(at),
         None => (text, ""),
     }
+}
+
+/// WHAT A FENCED TYPED TURN IS HELD TO BETWEEN ITS KEYS (review of
+/// 2026-09-30, finding 12): `if-gen=`/`if-rows=` are checked once, before the
+/// first key, and a `typed=1` text then takes a key per grapheme — about two
+/// seconds for the live upgrade's notice. The fence's own values cannot be
+/// asked again between the keys: the turn's own echo moves the generation
+/// and the rows it lands in at every key. What they are there for can be:
+///
+/// * `person`: the session's person count
+///   ([`crate::human_input::HumanInputStamp::seq`]), read under the fence's
+///   own lock hold. A person's key counts and a controller's never does —
+///   this turn's own keys included — so a moved count is a person at the
+///   keyboard, whose keys would be mixed into the text and submitted with it.
+/// * `epoch`: the screen's invalidation epoch ([`crate::control::ScreenGen`]),
+///   moved by every screen switch and RIS and never by an echo. A moved one
+///   is another screen than the one the caller judged.
+/// * `frame`: THE CARET ANCHOR (the review of 2026-09-30, item D), armed by
+///   an `if-rows=` fence whose rows ARE an input frame ([`Frame::of`]) —
+///   any other rows leave the hold to the person and the epoch, as for any
+///   app, so `turn typed=1 if-rows=` stays the app-agnostic verb its help
+///   describes (the review of the build). A box that mounts between two keys
+///   on the same screen — a
+///   workflow subagent's permission box at the break the notice is typed
+///   at, a resumed turn's first tool call — moves neither count above, and
+///   took the notice's digits as its answers (`2` = No, `1` = Yes on an
+///   `rm -rf`). The rows a typed turn is fenced on are the input FRAME it
+///   types into, and the typing is held to that frame ([`Frame::holds`]):
+///   a miss stops it as `changed`. A frame the program has not finished
+///   drawing (DEC 2026, [`Terminal::sync_frame_unfinished`]) is TORN — its
+///   cursor is the program's write position, not its caret — and is not
+///   judged: the key waits for it ([`TypingHold::held`]). A DIGIT, the
+///   selector of every numbered box, also waits until the program has READ
+///   every key before it (the kernel's own count, [`keys_unread`]) and the
+///   caret has moved since the key before it went out, on a finished frame.
+///
+/// What it does not see, said. Keys already on their way when a box mounts,
+/// before the box's first finished frame reaches the grid: about one render
+/// of them (Claude Code echoes 13-17 ms after a key, 7-8 keys at the
+/// notice's `cadence=2`), which the box takes. A digit is pressed only once
+/// the program has read every key before it, so what stays open for a digit
+/// is the program's own gap between reading a key and drawing the box it
+/// raises (the caret check alone, until 2026-10-01, was satisfied by an
+/// OLDER key's echo while later keys sat unread; a tty that cannot count
+/// its unread input keeps that check alone). A card drawn ABOVE an intact
+/// composer (the session survey) leaves the frame whole and is not a change
+/// — and need not be one, below. And a turn fenced by `if-gen=` alone — the
+/// driver's fallback when it found no frame, or the host takes no
+/// `if-rows=` — is held to the person and the epoch only: the host is
+/// app-agnostic, and without a frame it cannot tell a box's drawing from the
+/// turn's own echo.
+///
+/// A ONE-KEY CARD OVER THE COMPOSER TAKES NO KEY OF A TYPED TEXT (measured
+/// 2026-10-01 from Claude Code 2.1.286's bundle, the same code in 2.1.285,
+/// and live). The session survey (`1: Bad … 0: Dismiss`) and every one-key
+/// card — the other rating cards, the transcript ask, the drafts card, the
+/// hotkeys above the prompt — reads no key of its own: one hook (`Dm` in
+/// 2.1.286) reads the COMPOSER'S VALUE, and answers only while that value is
+/// exactly one of the card's keys (a digit; `y`/`n`/`d` on the transcript
+/// ask), changed since the card mounted and left alone 400 ms (or Enter
+/// pressed on it), past the card's first 600 ms. A rating card also leaves
+/// the screen at any other value, and one a person was shown is closed for
+/// good, as `abandoned`: nothing answered. A typed text's first key is its
+/// whole value only until the next key, so a text answers a card only if it
+/// OPENS with the card's key and its second key is held back 400 ms. The
+/// notice and the release open with `[aterm harness]`, and nothing is typed
+/// into a draft. Live, the card forced by `CLAUDE_FORCE_DISPLAY_SURVEY=1` on
+/// a private instance: `draft` then `2` left `❯ draft2` and no card; `[`
+/// alone took the card off, the notice's shape after it at `cadence=2` stood
+/// whole, digits and all, and the card stayed closed once the composer was
+/// cleared; `0x` 100 ms apart left `❯ 0x`; and a lone `0`, the control, was
+/// taken — the composer emptied, the card gone. What a notice's first key
+/// WOULD do is close an open card unanswered, as a person's first key does —
+/// so the card is the person's, and the driver never types a notice or a
+/// release while one is open (`wait:survey`, the upgrade's look).
+struct TypingHold {
+    epoch: u64,
+    person: u64,
+    frame: Option<Frame>,
+}
+
+/// The input frame an `if-rows=` fence names, as the fence found it: the
+/// text of its first row (the top rule), of its last (the bottom rule), and
+/// the first grapheme of the row after the first (the caret, Claude Code's
+/// `❯` — the frame `aterm_phase::phase::composer_rules` reads and the
+/// driver's fence is built on, the cursor on the caret row). False stops it
+/// can make, each a cut whose words stand and whose owner is told (the
+/// safety ruling of 2026-09-30): the program retitling its top rule
+/// mid-text (an effort or mode tag), a text grown past the pane's height
+/// that pushes the top rule off the visible rows, a frame left torn until
+/// the deadline.
+struct Frame {
+    top: String,
+    bottom: String,
+    caret: String,
+}
+
+impl Frame {
+    /// The frame the fence's rows are, read under the fence's own lock hold —
+    /// ARMED whether or not the cursor sits between them now: a fence checked
+    /// during a repaint found the program's write position there, not its
+    /// caret, and a hold armed only on a bracketing cursor would drop out
+    /// silently for the whole text. Judged by the rows alone, which are the
+    /// rows the caller judged (they hashed to its fence): a rule
+    /// ([`aterm_phase::phase::is_rule`]) over a row opening with a caret, down
+    /// to a rule. `None` for any other rows — a shell prompt's row, a single
+    /// line — whose turn a frame would stop at its first key.
+    fn of(terminal: &Terminal, fence: aterm_types::control_verbs::RowsFence) -> Option<Self> {
+        use aterm_grapheme::GraphemeClusters;
+        let row = |r: usize| crate::control::visible_row(terminal, r);
+        let (top, bottom) = (row(fence.first), row(fence.last));
+        let caret = row(fence.first.saturating_add(1))
+            .graphemes()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        (fence.first.saturating_add(1) < fence.last
+            && aterm_phase::phase::is_rule(&top)
+            && aterm_phase::phase::is_rule(&bottom)
+            && !caret.trim().is_empty())
+        .then_some(Self { top, bottom, caret })
+    }
+
+    /// Whether the cursor on `row` is still in the frame: the row under it is
+    /// the bottom rule (typing only appends, so the caret sits on the text's
+    /// last row), and the nearest row at or above it that is the top rule
+    /// sits over a row opening with the caret. The frame is free to move and
+    /// to grow — rows above it come and go, the text wraps, a full screen
+    /// scrolls it up — and so is every row outside it (a ticking timer, the
+    /// footer rewriting itself at the first key). Every measured box misses:
+    /// its title sits under its top border (` Bash command`, ` ☐ Colors`), so
+    /// a border that is the composer's own all-`─` rule, the cursor inside
+    /// and the bottom border right under it, is caught by the caret. A frame
+    /// with no caret never holds.
+    fn holds(&self, terminal: &Terminal, row: usize) -> bool {
+        let text = |r: usize| crate::control::visible_row(terminal, r);
+        let under = row.saturating_add(1);
+        !self.caret.is_empty()
+            && under < usize::from(terminal.rows())
+            && text(under) == self.bottom
+            && (0..=row)
+                .rev()
+                .find(|&r| text(r) == self.top)
+                .is_some_and(|top| text(top.saturating_add(1)).starts_with(self.caret.as_str()))
+    }
+}
+
+/// One look at a [`TypingHold`], under one hold of the terminal lock.
+enum Look {
+    /// Go on: the cursor as it stood.
+    Held(aterm_core::grid::Cursor),
+    /// Not judged yet: the program's frame is torn, or a digit's previous
+    /// key has not moved the caret.
+    Wait,
+    /// Stop the typing, and the verdict's reason.
+    Stop(&'static str),
+}
+
+impl TypingHold {
+    /// The hold as the fence found the screen (the caller holds its lock),
+    /// with the frame `if-rows=` names ([`Frame::of`]).
+    fn of(
+        terminal: &Terminal,
+        ctx: &SessionCtx,
+        rows: Option<aterm_types::control_verbs::RowsFence>,
+    ) -> Self {
+        Self {
+            epoch: crate::control::screen_gen(terminal).epoch,
+            person: ctx.human_input.seq(),
+            frame: rows.and_then(|fence| Frame::of(terminal, fence)),
+        }
+    }
+
+    /// One look: a person's hand (`person`, asked first — the more useful
+    /// word) or another screen (`changed`) stops the typing; then, with a
+    /// frame, a torn one waits, a finished one the cursor has left stops it
+    /// (`changed`), and a digit's caret not yet moved off `sent_from` (the
+    /// cursor the key before it went out from) waits.
+    fn look(
+        &self,
+        terminal: &Terminal,
+        ctx: &SessionCtx,
+        sent_from: Option<aterm_core::grid::Cursor>,
+    ) -> Look {
+        if ctx.human_input.seq() != self.person {
+            return Look::Stop("person");
+        }
+        if crate::control::screen_gen(terminal).epoch != self.epoch {
+            return Look::Stop("changed");
+        }
+        let cursor = terminal.cursor();
+        let Some(frame) = &self.frame else {
+            return Look::Held(cursor);
+        };
+        if terminal.sync_frame_unfinished() {
+            Look::Wait
+        } else if !frame.holds(terminal, usize::from(cursor.row)) {
+            Look::Stop("changed")
+        } else if (sent_from.is_some() && keys_unread(ctx)) || sent_from == Some(cursor) {
+            // The key before it is still unread by the program, or it has
+            // not yet moved the caret off where it went out from.
+            Look::Wait
+        } else {
+            Look::Held(cursor)
+        }
+    }
+
+    /// The hold judged before a key, the remainder's paste or the Enter: the
+    /// cursor it held at and whether it waited first, or why the typing
+    /// stops. A [`Look::Wait`] sleeps one `tick` OUTSIDE the lock and looks
+    /// again, bounded by the turn's deadline (`deadline`) — never a key
+    /// pressed on a frame nobody could judge.
+    fn held(
+        &self,
+        term: &Arc<Mutex<Terminal>>,
+        ctx: &SessionCtx,
+        sent_from: Option<aterm_core::grid::Cursor>,
+        tick: std::time::Duration,
+        deadline: std::time::Instant,
+    ) -> Result<(aterm_core::grid::Cursor, bool), &'static str> {
+        let mut waited = false;
+        loop {
+            let look = self.look(&term_lock(term), ctx, sent_from);
+            match look {
+                Look::Held(cursor) => return Ok((cursor, waited)),
+                Look::Stop(why) => return Err(why),
+                Look::Wait => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Err("deadline");
+                    }
+                    waited = true;
+                    std::thread::sleep(tick.min(deadline - now));
+                }
+            }
+        }
+    }
+}
+
+/// THE READ WITNESS (2026-10-01): whether the program has yet to READ keys
+/// already written to it — bytes in the slave's input queue or still in the
+/// sink's spill ([`aterm_session::sink::SinkWriter::input_backlog`], the
+/// kernel's own count; a spill whose lock was busy counts as unread). Before
+/// a DIGIT the typing waits for none: a key the program has read went where
+/// the screen it judged was, and only the program's own gap between reading
+/// a key and drawing the box it raises stays open. The caret-moved check
+/// alone was satisfied by an OLDER key's echo while later keys sat unread —
+/// keys a box mounting then would take, a digit answering it. A tty that
+/// cannot say (`None`) keeps the caret check alone: never weaker than it was.
+fn keys_unread(ctx: &SessionCtx) -> bool {
+    ctx.sink
+        .input_backlog()
+        .is_some_and(|b| b.queued != 0 || b.spilled != Some(0))
+}
+
+/// Whether a typed turn's key is an ASCII DIGIT — the selector key of every
+/// numbered box (`1. Yes`, `2. No`), which [`TypingHold::held`] presses only
+/// after the key before it has moved the caret. Unshifted: `!` rides the `1`
+/// key under SHIFT ([`typed_key_event`]) and is not one.
+fn is_digit_key(ev: &InputEvent) -> bool {
+    matches!(
+        ev,
+        InputEvent::Key {
+            key: aterm_types::keyboard::Key::Character(c),
+            mods,
+            ..
+        } if c.is_ascii_digit() && mods.is_empty()
+    )
+}
+
+/// A typed turn stopped part-way ([`TypingHold::held`], or its deadline):
+/// NOTHING pressed after it, the Enter included, and the keys already typed
+/// said — `typed=<k> pasted=<p>` — so the driver knows part of its text sits
+/// where it was typed. The verb's Lines framing, zero rows, like every skip.
+fn typed_cut(
+    term: &Arc<Mutex<Terminal>>,
+    why: &str,
+    typed: usize,
+    pasted: usize,
+    id: u64,
+) -> String {
+    let seq = term_lock(term).content_seq();
+    format!(
+        "OK 0 turn skipped reason={why} typed={typed} pasted={pasted} submitted=0 seq={seq} \
+         id={id}\n"
+    )
 }
 
 /// How a park on one watcher ended. Shared by the `turn` phases and the
@@ -1914,7 +2197,6 @@ pub(crate) fn cmd_await_momentum(
 ) -> String {
     use std::time::{Duration, Instant};
 
-    use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
     const USAGE: &str = "ERR usage: await momentum <floor 0..=1> [timeout <ms>]\n";
@@ -1946,19 +2228,8 @@ pub(crate) fn cmd_await_momentum(
     };
     let until = Instant::now() + Duration::from_millis(timeout_ms.min(600_000));
     let sub = SubscriberSet::register(subscribers, &[session]);
-    let was_registered = store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .by_local(session)
-        .is_some();
-    let exited = || -> bool {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        match g.by_local(session).map(|h| h.state) {
-            Some(SessionState::Exited) => true,
-            None => was_registered,
-            _ => false,
-        }
-    };
+    let probe = exit_probe(store, session);
+    let exited = || probe(store);
     match park_until_momentum_below(term, &exited, &sub, read, floor, until) {
         MomentumWait::Below(v) => format!("OK momentum {v:.2}\n"),
         MomentumWait::Deadline(_) => "OK timeout\n".to_string(),
@@ -1969,7 +2240,7 @@ pub(crate) fn cmd_await_momentum(
 }
 
 /// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>]
-/// [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>]
+/// [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>]
 /// [yield=<floor>] <text>` — one complete HUMAN
 /// TURN against the target session: type `<text>`, submit it with a real keypress,
 /// block until the app's response settles, and return the settled screen —
@@ -2070,8 +2341,17 @@ pub(crate) fn cmd_await_momentum(
 /// stardust, and its only signature is TIME — a jitter-free cadence no hand
 /// produces. The seam is told nothing else ([`typed_key_events`] builds the
 /// tuple a keyboard builds; `input.rs`'s indistinguishability invariant is
-/// untouched). The typed prefix is capped at [`TYPED_CAP`] graphemes and the
-/// remainder is ONE paste, voiced as one up-strum by the paste seam.
+/// untouched). The typed prefix is capped at [`TYPED_CAP`] graphemes (`cap=<n>`,
+/// up to [`TYPED_CAP_MAX`], raises it) and the remainder is ONE paste, voiced as
+/// one up-strum by the paste seam. A typed text is never submitted in part
+/// (review of 2026-09-30, findings 12 and 15): a head whose schedule would
+/// end past the deadline is not begun, one the deadline overtakes stops
+/// there, and a FENCED one (`if-gen=`/`if-rows=`) stops at a person's key or
+/// a screen switch counted between its keys, and an `if-rows=` one at the
+/// cursor leaving the frame those rows are ([`TypingHold`]) — each pressing
+/// nothing more, Enter included, and answering `OK 0 turn skipped
+/// reason=<deadline|person|changed> typed=<k> pasted=<p> submitted=0
+/// seq=<n> id=<n>`, the keys already typed left where they landed.
 /// `yield=<floor>` parks BEFORE typing until the target's typing momentum has
 /// exhaled to `floor` ([`park_until_momentum_below`]: analytic, one timer per
 /// reading, no polling); the human's own typing is never blocked — the agent
@@ -2195,10 +2475,9 @@ pub(crate) fn cmd_turn_guarded(
 
     use aterm_core::terminal::{BlockState, WatcherSpec};
 
-    use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
-    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [yield=<floor>] [if-gen=<epoch>.<seq>] <text>\n";
+    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] <text>\n";
     /// Echo-settle window: the paste burst has been ingested and painted.
     const ECHO_SETTLE: Duration = Duration::from_millis(150);
     /// Echo phase cap — a busy app (spinner mid-turn) may never go echo-quiet;
@@ -2239,11 +2518,16 @@ pub(crate) fn cmd_turn_guarded(
     // target's typing momentum has exhaled to the floor.
     let mut typed = false;
     let mut cadence_ms = TYPED_CADENCE_MS;
+    let mut typed_cap = TYPED_CAP;
     let mut yield_floor: Option<f32> = None;
     // `if-gen=<epoch>.<seq>`: type only while the screen is still the
     // generation the caller judged — checked after the yield, immediately
     // before the paste. None => no precondition.
     let mut if_gen: Option<crate::control::ScreenGen> = None;
+    // `if-rows=<first>-<last>:<hex16>`: the NARROW fence — type only while
+    // those rows still hash to the value (a spinner or a timer elsewhere may
+    // move). Checked with `if-gen=`, under the same lock hold.
+    let mut if_rows: Option<aterm_types::control_verbs::RowsFence> = None;
     let mut text = rest.trim_start();
     loop {
         let (tok, tail) = match text.split_once(char::is_whitespace) {
@@ -2314,12 +2598,20 @@ pub(crate) fn cmd_turn_guarded(
                 Ok(ms) => cadence_ms = ms.clamp(1, 2_000),
                 Err(_) => return USAGE.to_string(),
             },
+            "cap" => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => typed_cap = n.min(TYPED_CAP_MAX),
+                _ => return USAGE.to_string(),
+            },
             "yield" => match v.parse::<f32>() {
                 Ok(f) if f.is_finite() && (0.0..=1.0).contains(&f) => yield_floor = Some(f),
                 _ => return USAGE.to_string(),
             },
             "if-gen" => match crate::control::ScreenGen::parse(v) {
                 Some(generation) => if_gen = Some(generation),
+                None => return USAGE.to_string(),
+            },
+            "if-rows" => match aterm_types::control_verbs::RowsFence::parse(v) {
+                Some(fence) => if_rows = Some(fence),
                 None => return USAGE.to_string(),
             },
             _ => break, // not an option: the message itself starts with `word=…`
@@ -2483,19 +2775,7 @@ pub(crate) fn cmd_turn_guarded(
 
     // Exit detection, identical to `await` (including the deregistration race:
     // "was registered, now gone" is exited).
-    let was_registered = store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .by_local(session)
-        .is_some();
-    let exited = |store: &Store| -> bool {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        match g.by_local(session).map(|h| h.state) {
-            Some(SessionState::Exited) => true,
-            None => was_registered,
-            _ => false,
-        }
-    };
+    let exited = exit_probe(store, session);
 
     // One subscriber for the whole turn: output/exit notifies wake every phase.
     let sub = SubscriberSet::register(subscribers, &[session]);
@@ -2536,8 +2816,11 @@ pub(crate) fn cmd_turn_guarded(
             MomentumWait::Unreadable(e) => return format!("ERR yield: {e}\n"),
         }
         // The dispatch asked the unread-input gate when this turn ARRIVED; the
-        // yield can outlast `REFUSE_AFTER` (τ = 2 s), so a byte young then is
-        // stale now. Asked again before the first byte (2026-09-24, S4 review).
+        // yield (τ = 2 s) can outlast the moment the watch publishes the
+        // program as stalled, so a turn let in then is refused now. Asked
+        // again before the first byte (2026-09-24, S4 review); a slow read is
+        // only a warning, and the dispatch's warning is the one the verdict
+        // carries.
         if let Some(refusal) = crate::input_stall::refusal(ctx, "turn", "", false) {
             return refusal;
         }
@@ -2553,14 +2836,29 @@ pub(crate) fn cmd_turn_guarded(
     // be: the seam routes through the event loop or the source-blind sink),
     // so what is left is the seam's hand-off — not the caller's whole
     // read-judge-type round trip, which is what the fence closes. ──
-    if let Some(generation) = if_gen {
+    //
+    // `if-rows=` is the same check over the rows it names only (the owner's
+    // ruling of 2026-09-29, design record C7b): a screen that repaints
+    // itself — a spinner, a ticking timer — moved `if-gen=` at every look
+    // and a notice was never typed; the rows the text lands in are what
+    // matter. Both, when given, are read under ONE lock hold — and so is
+    // what a typed turn is then held to between its keys ([`TypingHold`]),
+    // the frame `if-rows=` names included.
+    let mut hold: Option<TypingHold> = None;
+    if if_gen.is_some() || if_rows.is_some() {
         let terminal = term_lock(term);
-        if crate::control::screen_gen(&terminal) != generation {
+        let moved = if_gen
+            .is_some_and(|generation| crate::control::screen_gen(&terminal) != generation)
+            || if_rows.is_some_and(|fence| {
+                crate::control::rows_hash(&terminal, fence.first, fence.last) != Some(fence.hash)
+            });
+        if moved {
             let seq = terminal.content_seq();
             return format!(
                 "OK 0 turn skipped reason=changed submitted=0 seq={seq} id={turn_id}\n"
             );
         }
+        hold = typed.then(|| TypingHold::of(&terminal, ctx, if_rows));
     }
 
     // ── phase 1: type. Paste semantics by default; the seam strips control
@@ -2569,39 +2867,87 @@ pub(crate) fn cmd_turn_guarded(
     // remainder as one paste. ──
     let mut typed_keys = 0usize;
     let mut pasted_graphemes = 0usize;
+    let cadence = Duration::from_millis(cadence_ms);
+    // From the first byte that lands to the verified submit the turn is
+    // committed: a caller that hangs up then does not stop the rest of its
+    // keys or its Enter at the main-thread gate (round eight of the update
+    // audit, U51), as it does not end the parks between them
+    // ([`OnHangup::Finish`]). Before the first byte nothing is half-applied,
+    // and a gone caller's first hop is refused as any other is.
+    let mut committed: Option<crate::control::CommittedInput> = None;
     if !text.is_empty() {
         if typed {
             use aterm_grapheme::GraphemeClusters;
-            let (head, remainder) = split_typed_cap(text);
-            let cadence = Duration::from_millis(cadence_ms);
-            let type0 = Instant::now();
-            for (i, ev) in typed_key_events(head).into_iter().enumerate() {
+            let (head, remainder) = split_typed_cap(text, typed_cap);
+            let keys = typed_key_events(head);
+            let mut type0 = Instant::now();
+            // ALL OR NOTHING AGAINST THE DEADLINE (review of 2026-09-30,
+            // finding 15): a head whose schedule ends past the deadline is
+            // not begun — a yield that spent the budget types nothing, as a
+            // yield timeout does.
+            let last_due =
+                type0 + cadence * u32::try_from(keys.len().saturating_sub(1)).unwrap_or(u32::MAX);
+            if !keys.is_empty() && last_due >= deadline {
+                return typed_cut(term, "deadline", 0, 0, turn_id);
+            }
+            // The cursor the previous key went out from: a digit waits until
+            // the caret has moved off it ([`TypingHold::held`]).
+            let mut sent_from = None;
+            for (i, ev) in keys.into_iter().enumerate() {
                 let due = type0 + cadence * i as u32;
                 let now = Instant::now();
                 if due > now {
                     std::thread::sleep(due - now);
                 }
                 // The deadline bounds the typing too: a turn does not keep
-                // pressing keys into a session after its own budget is spent.
+                // pressing keys into a session after its own budget is spent
+                // — and a text cut short there is never submitted: its Enter
+                // would send the part typed as the whole.
                 if Instant::now() >= deadline {
-                    break;
+                    return typed_cut(term, "deadline", typed_keys, 0, turn_id);
                 }
                 if exited(store) {
                     return "ERR exited\n".to_string();
                 }
+                if let Some(h) = &hold {
+                    let digit = is_digit_key(&ev);
+                    match h.held(term, ctx, sent_from.filter(|_| digit), cadence, deadline) {
+                        // A key that waited ANCHORS THE SCHEDULE ON ITSELF:
+                        // the next is one cadence after it, never a burst
+                        // catching up on the time spent (a torn frame has
+                        // been held ~280 ms, 140 keys at `cadence=2`).
+                        Ok((cursor, waited)) => {
+                            if waited {
+                                type0 += Instant::now().saturating_duration_since(due);
+                            }
+                            sent_from = Some(cursor);
+                        }
+                        Err(why) => return typed_cut(term, why, typed_keys, 0, turn_id),
+                    }
+                }
                 if !(io.key)(ev) {
                     return "ERR key delivery failed\n".to_string();
                 }
+                committed.get_or_insert_with(crate::control::CommittedInput::enter);
                 typed_keys += 1;
             }
             if !remainder.is_empty() {
+                if let Some(Err(why)) = hold
+                    .as_ref()
+                    .map(|h| h.held(term, ctx, None, cadence, deadline))
+                {
+                    return typed_cut(term, why, typed_keys, 0, turn_id);
+                }
                 pasted_graphemes = remainder.graphemes().count();
                 if !(io.paste)(remainder) {
                     return "ERR paste delivery failed\n".to_string();
                 }
+                committed.get_or_insert_with(crate::control::CommittedInput::enter);
             }
         } else if !(io.paste)(text) {
             return "ERR paste delivery failed\n".to_string();
+        } else {
+            committed = Some(crate::control::CommittedInput::enter());
         }
         // Echo settle: the editor ingested + painted the burst. Cap the phase so
         // an app that is ALREADY animating (mid-turn spinner) cannot stall us.
@@ -2613,6 +2959,15 @@ pub(crate) fn cmd_turn_guarded(
             // A committed park never ends on a hangup (`OnHangup::Finish`):
             // the turn goes on to its submit either way.
             Phase::Latched | Phase::Deadline | Phase::HungUp => {}
+        }
+        // The last gap of a held typing: a person's key during the echo
+        // settle would be submitted with the text by the Enter below, and a
+        // box drawn there would take it.
+        if let Some(Err(why)) = hold
+            .as_ref()
+            .map(|h| h.held(term, ctx, None, cadence, deadline))
+        {
+            return typed_cut(term, why, typed_keys, pasted_graphemes, turn_id);
         }
     }
 
@@ -2771,6 +3126,10 @@ pub(crate) fn cmd_turn_guarded(
         }
     }
 
+    // The input is over, submitted or not: from here a gone caller's hop is
+    // refused again, as the settle below gives its lane back.
+    drop(committed);
+
     // The submit VERIFIABLY landed: the one edge the presence rim ripples on
     // (round 19). Posted once, here, after the verdict — never on the press.
     if submitted {
@@ -2883,7 +3242,7 @@ pub(crate) fn cmd_turn_guarded(
     // the inline `dur_ms=`/`hash=` an AI diffs by (the catalog + INTROSPECTION.md
     // promise them) are the SAME values `history` later reports for this id.
     let dur_ms = now0.elapsed().as_millis() as u64;
-    let screen_hash = crate::turn_ledger::fnv1a_64(screen.as_bytes());
+    let screen_hash = aterm_hash::fnv1a_64(screen.as_bytes());
     // `record` keeps the ids rising in landing order: a turn a `lease release
     // force` preempted, finishing after the one that took its slot, is
     // re-numbered, and its verdict prints the id it was recorded under.
@@ -2965,9 +3324,9 @@ pub(crate) fn cmd_turn_guarded(
 /// previous process ([`crate::turn_ledger::TurnRecord::carried`]: its
 /// `started_ms` and `seq` are that process's). A ledger an update could not
 /// carry whole adds ` unheld_below=<id>` to the header (after the count)
-/// when that floor is above the `since=` anchor and above the oldest record
-/// the ledger holds: records of turn ids below it may be gone rather than
-/// absent.
+/// when that floor is above the `since=` anchor, until `LEDGER_CAP` turns at
+/// or past it have landed (the lost ones would have aged out by then):
+/// records of turn ids below it may be gone rather than absent.
 pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
     let mut n = 0usize;
     let mut since: Option<u64> = None;
@@ -2999,9 +3358,9 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
     // empty or short reply is not "no turn landed". Only when the floor is
     // above the anchor — a `since=` past it lost nothing — and after the
     // count, where every reader of the header already allows fields. Only
-    // while the floor lies inside the window this ledger answers for
-    // (`TurnLedger::live_floor`): once the records under it are evicted, it
-    // is stale noise a supervisor's every `drive ledger` would repeat.
+    // until the turns it lost would have aged out of a ledger carried whole
+    // (`TurnLedger::live_floor`): from then on it is stale noise a
+    // supervisor's every `drive ledger` would repeat.
     if let Some(floor) = ledger
         .live_floor()
         .filter(|&floor| since.is_none_or(|anchor| anchor.saturating_add(1) < floor))
@@ -3046,11 +3405,13 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 ///   OUTRANKS the OSC title in tab labels. `role operator` designates the
 ///   fleet operator to the menu-bar status item; a non-empty `attention` is
 ///   the typed needs-human escalation it badges and lists. `questions` is a
-///   CLOSED set, not text: `ask|recommended` (case folded, stored
-///   lowercase) — how the in-window supervisor treats this session's Claude
-///   Code question dialog, over `[harness] answer_questions` (`ask` hands it
-///   to a person, `recommended` answers it with its recommended option); any
-///   other value is `ERR usage: meta set questions …`
+///   CLOSED set, not text: `ask|recommended|long-term|short-term` (case
+///   folded, stored lowercase) — how the in-window supervisor treats this
+///   session's Claude Code question dialog, over `[harness] answer_questions`
+///   and `question_priority` (`ask` hands it to a person, `recommended`
+///   answers it with its recommended option, `long-term` / `short-term` by
+///   the worker's own choice under that policy); any other value is `ERR
+///   usage: meta set questions …`
 ///   ([`QUESTIONS_USAGE`]). Writing it is Owner-only
 ///   ([`meta_questions_denied`], answered before this handler).
 /// * `meta unset <field>` — clear a field (labels fall back down the chain;
@@ -4363,6 +4724,30 @@ mod tests {
         assert!(super::past_ceiling(carried + 1, carried));
         assert!(!super::past_ceiling(u64::MAX, 0), "no manifest, no ceiling");
     }
+
+    /// Round eight, finding 715: a count held at the top of what a manifest
+    /// carries (`raise_turn_ids` from a carried count at `MAX_TURN_ID`) mints
+    /// its next id past it, and every later attempt's ceiling is the top again
+    /// (`turn_ids_for_handoff`'s clamp). Read as "minted past the ceiling",
+    /// that stood every Commit down for good. Pure arithmetic: the
+    /// process-wide count is never moved.
+    #[test]
+    fn a_count_at_the_manifest_limit_never_wedges_the_commit() {
+        let max = crate::handoff_carry::MAX_TURN_ID;
+        // The state after `raise_turn_ids(MAX_TURN_ID)` and one `turn`.
+        let minted = max + 1;
+        let ceiling = minted.saturating_add(TURN_ID_RESERVE).min(max);
+        assert_eq!(ceiling, max, "the ceiling is held to the top");
+        assert!(!super::past_ceiling(minted, ceiling));
+        assert!(!super::past_ceiling(minted + TURN_ID_RESERVE, ceiling));
+        // Below the top the reserve still holds every Commit to it.
+        let below = max - TURN_ID_RESERVE - 1;
+        assert!(!super::past_ceiling(below, below + TURN_ID_RESERVE));
+        assert!(
+            super::past_ceiling(below + TURN_ID_RESERVE + 1, below + TURN_ID_RESERVE),
+            "negative control: past a ceiling below the top still stands down"
+        );
+    }
     use super::*;
     use aterm_session::{EdgeTable, LaunchNonce};
 
@@ -4651,7 +5036,6 @@ mod tests {
                 crate::turn_ledger::TurnLedger::default(),
             )),
             meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
-            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
@@ -5382,7 +5766,6 @@ mod tests {
                 crate::turn_ledger::TurnLedger::default(),
             )),
             meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
-            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
@@ -6087,6 +6470,68 @@ mod update_anchor_tests {
     }
 }
 
+/// ROUND EIGHT OF THE UPDATE AUDIT, U23: the raw `grant` verb mints a fresh row
+/// for every call, an identical `(src, dst, op)` included, and names any
+/// string as its source. The handoff carries each triple once — never a
+/// repeat, which every successor folds into one set of ops anyway. A triple the
+/// successor cannot re-mint (a source that is not one of its sessions, a
+/// self-loop) still rides, once (U23's review): its drop in the successor
+/// (`App::remint_carried_connections`) is the `session_edge` audit that puts
+/// its dissolution on record, after the Commit that dissolves it.
+#[cfg(test)]
+mod connection_carry_tests {
+    use super::{Scope, cmd_grant};
+    use crate::session_store::{SessionHandoff, SessionStore, test_handle};
+
+    /// RED before the fix: 1,000 + 1,000 + 2 + 1 rows, every one written.
+    #[test]
+    fn the_carry_holds_each_triple_once() {
+        let controller = test_handle(1);
+        let target = test_handle(2);
+        let (src, dst) = (controller.sid.clone(), target.sid.clone());
+        for _ in 0..1_000 {
+            // A controller that grants on every attach.
+            assert!(
+                cmd_grant(&target.ctx, Scope::Owner, &format!("{src} read-screen"))
+                    .starts_with("OK ")
+            );
+            // A source that is no session of this store.
+            assert!(
+                cmd_grant(&target.ctx, Scope::Owner, "s-controller read-screen").starts_with("OK ")
+            );
+        }
+        for op in ["signal", "write-input"] {
+            assert!(
+                cmd_grant(&target.ctx, Scope::Owner, &format!("{src} {op}")).starts_with("OK ")
+            );
+        }
+        // A self-loop, which nothing mints but `grant` does not refuse.
+        assert!(cmd_grant(&target.ctx, Scope::Owner, &format!("{dst} signal")).starts_with("OK "));
+        let mut store = SessionStore::default();
+        store.register(controller);
+        store.register(target);
+
+        let carried = SessionHandoff::from_store(&store).connections;
+        let triples = carried
+            .iter()
+            .map(|row| (row.src.as_str(), row.dst.as_str(), row.op.as_str()))
+            .collect::<Vec<_>>();
+        let mut expected = vec![
+            (src.as_str(), dst.as_str(), "read-screen"),
+            (src.as_str(), dst.as_str(), "signal"),
+            (src.as_str(), dst.as_str(), "write-input"),
+            // Each once, for the successor to drop and audit.
+            ("s-controller", dst.as_str(), "read-screen"),
+            (dst.as_str(), dst.as_str(), "signal"),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            triples, expected,
+            "each distinct triple, once, in `(src, dst, op)` order"
+        );
+    }
+}
+
 /// ROUND SEVEN OF THE UPDATE AUDIT, FINDINGS 62 AND 63: while a session's PTY
 /// reader is parked for an update (`SessionCtx::update_parked`), nothing on
 /// this side consumes its output, so the silence is not the program's: an idle
@@ -6125,13 +6570,46 @@ mod update_park_wait_tests {
             "OK timeout\n"
         );
         // Unparked mid-wait: the idle window is measured from the resume, in
-        // full — never from before the park.
+        // full — never from before the park. "Mid-wait" is a FACT, not 300 ms
+        // of sleep: nothing is printed, so only a parked look restarts the
+        // await's idle deadline, and once that deadline has moved a whole
+        // window past the first one seen, the await held its window open
+        // across a park longer than the window. Then the reader resumes; the
+        // deadline its last parked look set is the earliest it may latch.
+        //
+        // The resume and the deadline it is judged by are taken under ONE
+        // hold of the terminal lock — the lock every look of the await takes
+        // to restart or expire its idle clock — and only while that deadline
+        // is still AHEAD: so `held` is what the last parked look set, and it
+        // lies after the resume. A resumer descheduled between reading a
+        // deadline and resuming can no longer hand back one already past,
+        // which let an await that latches AT the resume pass.
+        const IDLE: Duration = Duration::from_millis(200);
         let resumer = {
             let ctx = handle.ctx.clone();
+            let term = handle.term.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                ctx.update_parked.store(false, Ordering::Release);
-                Instant::now()
+                let first = aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the await arms its idle window",
+                    || term.lock().unwrap().watch_next_deadline(),
+                );
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the await holds its idle window across the park",
+                    || {
+                        let t = term.lock().unwrap();
+                        match t.watch_next_deadline() {
+                            // Disarmed: the await answered while parked.
+                            None => Some(None),
+                            Some(at) if at >= first + IDLE && at > Instant::now() => {
+                                ctx.update_parked.store(false, Ordering::Release);
+                                Some(Some(at))
+                            }
+                            Some(_) => None,
+                        }
+                    },
+                )
             })
         };
         let reply = cmd_await(
@@ -6139,25 +6617,28 @@ mod update_park_wait_tests {
             &store,
             0,
             &handle.ctx,
-            "idle 200 timeout=60000",
+            &format!("idle {} timeout=60000", IDLE.as_millis()),
             &registry,
         );
         let latched = Instant::now();
-        let resumed = resumer.join().unwrap();
+        let held = resumer.join().unwrap().unwrap_or_else(|| {
+            panic!("the await answered {reply:?} while parked, never holding its window open")
+        });
         assert!(reply.starts_with("OK idle "), "{reply}");
         assert!(
-            latched >= resumed + Duration::from_millis(150),
-            "a whole window after the resume, not {:?}",
-            latched.saturating_duration_since(resumed)
+            latched >= held,
+            "a whole window after the last parked look: latched {:?} before it",
+            held.saturating_duration_since(latched)
         );
-        // NEGATIVE CONTROL: unparked, the same wait latches on true quiet.
+        // NEGATIVE CONTROL: unparked, the same wait latches on true quiet —
+        // at its 60 ms window; the timeout is only the hang detector.
         assert!(
             cmd_await(
                 &handle.term,
                 &store,
                 0,
                 &handle.ctx,
-                "idle 60 timeout=2000",
+                "idle 60 timeout=60000",
                 &registry
             )
             .starts_with("OK idle ")
@@ -6169,9 +6650,15 @@ mod update_park_wait_tests {
     /// presses it was allowed. FAILS WITHOUT THE FIX: three presses, one per
     /// submit window. NEGATIVE CONTROL: unparked, a swallowed press is pressed
     /// again, as before.
+    ///
+    /// The deadline is the subject only parked, where the first press's
+    /// window stays open to it. Unparked, the turn ends at its third
+    /// unanswered window, so its timeout is a hang detector: a bound that
+    /// three 150 ms windows had to fit cut a correct run to two presses
+    /// whenever the test thread stalled.
     #[test]
     fn a_turn_across_an_update_park_presses_submit_once() {
-        let run = |parked: bool| -> usize {
+        let run = |parked: bool, timeout_ms: u64| -> usize {
             let handle = test_handle(0);
             let store = new_store();
             let registry = crate::subscribe::new_registry();
@@ -6186,7 +6673,7 @@ mod update_park_wait_tests {
                 &handle.term,
                 &store,
                 0,
-                "idle=50 timeout=1200 submit_window=150 presses=3 hello",
+                &format!("idle=50 timeout={timeout_ms} submit_window=150 presses=3 hello"),
                 &registry,
                 &handle.ctx,
                 &TurnIo {
@@ -6197,7 +6684,11 @@ mod update_park_wait_tests {
             );
             presses.load(Ordering::SeqCst)
         };
-        assert_eq!(run(true), 1, "one Enter into a parked session");
-        assert_eq!(run(false), 3, "a swallowed press is re-pressed unparked");
+        assert_eq!(run(true, 1200), 1, "one Enter into a parked session");
+        assert_eq!(
+            run(false, aterm_spec::wait::MUST_HAPPEN.as_millis() as u64),
+            3,
+            "a swallowed press is re-pressed unparked"
+        );
     }
 }

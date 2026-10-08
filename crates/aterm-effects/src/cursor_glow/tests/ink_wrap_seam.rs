@@ -1,41 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE INK WRAP SEAM TRACE** — the owner: "the rainbow cursor streak
-//! doesn't follow the new line down in claude code and codex".
+//! Ink wrap seam trace: a trailing rainbow streak follows Claude Code's and
+//! Codex's composer onto a new line.
 //!
-//! A headless replay of Claude Code's (Ink's) composer WRAP at the seam,
-//! modelled on `a_line_still_being_typed_has_no_dark_cell_inside_its_live_span`:
-//! keys at 70 ms, each echo observed 9 ms after its key, ticks at 60 Hz, the
-//! caret typed from Ink's inset column 2 out to column 78 on the composer's
-//! bottom row. The wrap key then makes Ink re-wrap its box: the last word
-//! (`pers`) moves down to the next visual row and the box grows one row.
-//! Three observed shapes of that one frame are replayed:
+//! A headless replay of Ink's composer wrap at the seam, modelled on
+//! `a_line_still_being_typed_has_no_dark_cell_inside_its_live_span`: keys at
+//! 70 ms, each echo observed 9 ms later, ticks at 60 Hz, the caret typed from
+//! Ink's inset column 2 to column 78 on the composer's bottom row. The wrap key
+//! makes Ink re-wrap: the last word (`pers`) moves down a row and the box grows
+//! one row. Shapes replayed:
 //!
-//! * `ScrolledOneMove` — the measured Claude Code shape on the main screen
-//!   with the box at the screen's bottom (`classify_move`'s "BOX-GROWTH
-//!   wrap": the box grows a row UP, the screen scrolls one line in the same
-//!   repaint, the caret's terminal row stays constant). The host sees a
-//!   `note_scroll(1)` and then the caret at `(row, 6)` — after
-//!   `translate_scroll_state` the move is `(row−1, 78) → (row, 6)`.
-//! * `ScrolledTwoMove` — the same, observed as Ink's two-move rewrite
-//!   (`RAINBOW-KITTY-V2.md`'s "end → col 2, then col 2 → end + 1"): the
-//!   caret first at the inset column `(row, 2)`, one tick later at `(row, 6)`.
-//! * `BoxGrowsUpNoScroll` — the box not at the screen's bottom (or the alt
-//!   screen): no scroll, the caret's terminal row constant, the old text
-//!   moved UP a row by the app's rewrite without the host being told —
-//!   the move is the same-row `(row, 78) → (row, 6)`.
+//! * `ScrolledOneMove`: Claude Code's shape with the box at the screen's
+//!   bottom (`classify_move`'s box-growth wrap): the box grows a row up, the
+//!   screen scrolls one line in the same repaint, the caret's terminal row is
+//!   constant. The host sees `note_scroll(1)` then the caret at `(row, 6)`, so
+//!   after `translate_scroll_state` the move is `(row−1, 78) → (row, 6)`.
+//! * `ScrolledTwoMove`: the same, observed as Ink's two-move rewrite (caret
+//!   first at the inset `(row, 2)`, one tick later at `(row, 6)`).
+//! * `BoxGrowsUpNoScroll`: the box not at the bottom (or the alt screen): no
+//!   scroll, the old text moved up a row without the host being told, so the
+//!   move is the same-row `(row, 78) → (row, 6)`.
 //!
-//! Every frame prints the v2 cells per row (`v2_cols`) from just before the
-//! wrap to 3 s after it, and the seam's ring rows (with their `licence=`)
-//! around the wrap. The assertions state what SHOULD hold (the owner's
-//! expectation, the task's brief): the band SPANS the wrap — a second on,
-//! with the hand typing below, the row it wrapped off still carries the
-//! light its glyphs were typed with (2026-09-15); that light is gone within
-//! ~2 s although the hand keeps typing on the new row; nothing stays lit on
-//! the old row past its last glyph — the cells the re-wrap MOVED leave with
-//! their text; and the new row's cells are contiguous from Ink's inset
-//! column while it is being typed.
+//! Each frame prints the v2 cells per row (`v2_cols`) from just before the
+//! wrap to 3 s after, and the seam's ring rows (with `licence=`). Asserted:
+//! the band spans the wrap (a second later the row wrapped off still carries
+//! its typed light); that light is gone within ~2 s while typing continues on
+//! the new row; nothing stays lit on the old row past its last glyph (moved
+//! cells leave with their text); and the new row's cells are contiguous from
+//! the inset column while typed.
 
 use super::*;
 use std::collections::BTreeSet;
@@ -156,8 +149,8 @@ fn replay(shape: WrapShape) -> Replay {
     let mut ring_snap: Vec<String> = Vec::new();
 
     // The old row after the wrap: on the scrolled shapes the old text moved
-    // up with the scroll; on the no-scroll shape the app moved it up and
-    // the host was not told, so the old light stays on ROW.
+    // up with the scroll; on the no-scroll shape the host was not told, so the
+    // old light stays on ROW.
     let old_row = match shape {
         WrapShape::BoxGrowsUpNoScroll => ROW,
         _ => ROW - 1,
@@ -315,15 +308,10 @@ fn replay(shape: WrapShape) -> Replay {
                             ));
                         }
                     }
-                    // (0) **THE BAND SPANS THE WRAP** (2026-09-15, the
-                    // owner: *"awkward transitions when going to a new line
-                    // still with the rainbow"* — his screenshot with the
-                    // first row bare and the second coloured). A second
-                    // after the wrap, with the hand typing on the new row,
-                    // the row it wrapped off STILL CARRIES the light it was
-                    // typed with: wrapping is one input continuing, and the
-                    // glyphs on that row have not moved. Under the shipped
-                    // abandon that row was empty inside 0.7 s.
+                    // (0) The band spans the wrap: a second later, with typing
+                    // on the new row, the row wrapped off still carries its
+                    // light (wrapping continues one input; those glyphs did
+                    // not move) (owner, 2026-09-15).
                     if (Duration::from_millis(1000)..Duration::from_millis(1200)).contains(&since)
                         && old.is_empty()
                         && law_hits[3] < 4
@@ -334,10 +322,8 @@ fn replay(shape: WrapShape) -> Replay {
                             since.as_secs_f32()
                         ));
                     }
-                    // (1) the old row's light is gone within ~2 s of the
-                    // wrap — the hand left the row and no key on the new one
-                    // renews it. Measured 2026-09-15: lit to +1.7 s, its own
-                    // swoosh; under the shipped abandon, +0.7 s.
+                    // (1) The old row's light is gone within ~2 s of the wrap
+                    // (its own swoosh); no key on the new row renews it.
                     if since >= Duration::from_millis(2000) && !old.is_empty() && law_hits[0] < 4 {
                         law_hits[0] += 1;
                         violations.push(format!(

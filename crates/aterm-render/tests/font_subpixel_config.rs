@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! LINUX SUBPIXEL stage 1: the `font_subpixel` config key's renderer seam
-//! ([`Renderer::set_font_subpixel`]) — the one way to change the subpixel mode
-//! (the construction-time `ATERM_FONT_SUBPIXEL` read was deleted 2026-09-24),
+//! ([`Renderer::set_font_subpixel`]) — the one way to change the subpixel mode,
 //! mirroring the `font_hinting_config` suite.
 //!
 //! Laws under test, on the Linux subpixel seam:

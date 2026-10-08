@@ -2,22 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 conformance + L0 lattice proofs for M4 (ligature slicing): the shaping
-//! GATE stays conservative when the Cascadia N:1 branch is added, and the raster
-//! SLICING that the N:1 path rests on partitions a wide ligature glyph into
-//! per-cell tiles that reassemble byte-exactly and recolour locally.
+//! Tier-1 conformance for M4 (ligature slicing): the shaping GATE stays
+//! conservative when the Cascadia N:1 branch is added. The tile arithmetic the
+//! N:1 path rests on is the L0 lattice `extract_cell_slice_reassembles_wide_raster`
+//! (in `ligature_shaping.rs`; ty has no multiplication, the M4 rounding/scaling
+//! waiver).
 //!
-//! These bind the SHIPPING pure functions
-//! ([`aterm_render::ligature_shaping::classify_shape`],
-//! [`aterm_render::ligature_shaping::slice_tile_bands`],
-//! [`aterm_render::ligature_shaping::extract_tile`]) to the M4 PROVE bullets:
+//! These bind the SHIPPING pure function
+//! [`aterm_render::ligature_shaping::classify_shape`] to M4 PROVE bullet 3:
 //!
-//! 1. **Slicing partition** — concatenating the per-cell tiles reproduces the
-//!    original wide raster byte-exactly (disjoint + complete), over an odd/even
-//!    size lattice. ty has no multiplication, so this arithmetic law is an L0
-//!    lattice test, not a ty model (the M4 rounding/scaling waiver).
-//! 2. **Per-tile recolour locality** — recolouring tile `k` changes no bytes
-//!    outside cell `k`'s columns.
 //! 3. **Conservative gate** — `classify_shape` admits EXACTLY the two
 //!    grid-mappable forms (1:1, or N:1 with `N>=2` behind the flag) and rejects
 //!    everything else; with the flag off it is byte-identical to the legacy
@@ -26,208 +19,7 @@
 //!    Tier-1 bind to the `LigatureGate` derived ty model: the model's own
 //!    `Classify` rule judges every real verdict.
 
-use aterm_render::ligature_shaping::{
-    ShapeVerdict, TileBand, classify_shape, extract_tile, slice_tile_bands,
-};
-
-// ---------------------------------------------------------------------------
-// PROVE (1): slicing partition — disjoint + complete + byte-exact reassembly.
-// ---------------------------------------------------------------------------
-
-/// A wide coverage raster `w × h` with a DISTINCT byte per pixel (mod 256) so a
-/// dropped, duplicated, or transposed column is detectable in the reassembly.
-fn synth_raster(w: usize, h: usize) -> Vec<u8> {
-    (0..w * h).map(|i| (i % 251 + 1) as u8).collect()
-}
-
-/// The band set is a partition of `[0, raster_w)`: it starts at 0, ends at
-/// `raster_w`, is contiguous (each band meets the next), every band is non-empty,
-/// and the widths sum to `raster_w`. Every interior band is exactly `cell_w` wide;
-/// only the final band may be narrower (the remainder).
-#[test]
-fn slice_partition_is_disjoint_and_complete() {
-    let mut saw_remainder = false; // non-vacuity: the narrow-final-band branch fires
-    let mut saw_multi = false; // non-vacuity: multi-cell rasters are exercised
-    for raster_w in 0..=40usize {
-        for cell_w in 1..=12usize {
-            let bands = slice_tile_bands(raster_w, cell_w);
-            if raster_w == 0 {
-                assert!(bands.is_empty(), "empty raster => no bands");
-                continue;
-            }
-            // Starts at 0, ends at raster_w.
-            assert_eq!(bands.first().unwrap().x0, 0, "first band starts at 0");
-            assert_eq!(
-                bands.last().unwrap().x1,
-                raster_w,
-                "last band ends at raster_w"
-            );
-            let mut total = 0usize;
-            for (i, b) in bands.iter().enumerate() {
-                assert!(b.x1 > b.x0, "every band is non-empty");
-                assert_eq!(b.width(), b.x1 - b.x0);
-                if i + 1 < bands.len() {
-                    // Contiguous: band i meets band i+1 (disjoint + no gap).
-                    assert_eq!(b.x1, bands[i + 1].x0, "bands are contiguous");
-                    // Interior bands are exactly one cell wide.
-                    assert_eq!(b.width(), cell_w, "interior band is cell_w wide");
-                }
-                total += b.width();
-            }
-            assert_eq!(total, raster_w, "band widths tile the raster exactly");
-            if bands.len() >= 2 {
-                saw_multi = true;
-            }
-            if bands.last().unwrap().width() < cell_w {
-                saw_remainder = true;
-            }
-        }
-    }
-    assert!(saw_multi, "non-vacuity: multi-band partitions exercised");
-    assert!(
-        saw_remainder,
-        "non-vacuity: the remainder branch is reachable"
-    );
-}
-
-/// PROVE (1), the byte-level statement: extracting every band and laying each tile
-/// back at its band offset reproduces the ORIGINAL wide raster byte-for-byte, over
-/// an odd/even width × height × cell_w lattice. A negative control shows the
-/// partition matters: a BUGGY slicer that gives the final band a full `cell_w`
-/// (ignoring the remainder) fails to reassemble.
-#[test]
-fn slice_tiles_reassemble_byte_exactly() {
-    let mut reassembled_a_remainder = false;
-    for raster_w in 1..=33usize {
-        for height in 1..=5usize {
-            for cell_w in 1..=11usize {
-                let raster = synth_raster(raster_w, height);
-                let bands = slice_tile_bands(raster_w, cell_w);
-                // Reassemble: copy each extracted tile back at its column offset.
-                let mut rebuilt = vec![0u8; raster_w * height];
-                for b in &bands {
-                    let tile = extract_tile(&raster, raster_w, height, *b);
-                    assert_eq!(tile.len(), b.width() * height, "tile is width*height");
-                    let tw = b.width();
-                    for row in 0..height {
-                        let dst = row * raster_w + b.x0;
-                        let src = row * tw;
-                        rebuilt[dst..dst + tw].copy_from_slice(&tile[src..src + tw]);
-                    }
-                    if tw < cell_w {
-                        reassembled_a_remainder = true;
-                    }
-                }
-                assert_eq!(
-                    rebuilt, raster,
-                    "concatenated tiles must reproduce the raster (w={raster_w}, h={height}, cw={cell_w})"
-                );
-            }
-        }
-    }
-    assert!(
-        reassembled_a_remainder,
-        "non-vacuity: a narrower-than-cell_w final tile was reassembled"
-    );
-
-    // NEGATIVE CONTROL — reproduce the pre-slicing defect. A slicer that assumes
-    // every band is a full cell_w (dropping the remainder) reads past the raster
-    // for a non-multiple width; our `extract_tile` bounds-checks and returns empty,
-    // so a full-cell_w final band CANNOT reassemble — proving the remainder-aware
-    // partition is load-bearing.
-    let raster_w = 25usize;
-    let height = 3usize;
-    let raster = synth_raster(raster_w, height);
-    // Buggy band: force the final band to a full cell_w (x1 past raster_w=25).
-    let buggy_final = TileBand { x0: 20, x1: 30 };
-    let last = extract_tile(&raster, raster_w, height, buggy_final);
-    assert!(
-        last.is_empty(),
-        "an out-of-bounds full-cell final band must not slice (defect caught)"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// PROVE (2): per-tile recolour locality.
-// ---------------------------------------------------------------------------
-
-/// Blend one coverage byte over a destination pixel (premultiplied-free, matches
-/// the renderer's `blend` shape closely enough for a locality proof: cov==0 leaves
-/// the dest untouched, cov>0 writes the fg-tinted value).
-fn blend(bg: u32, fg: u32, cov: u8) -> u32 {
-    if cov == 0 {
-        return bg;
-    }
-    // A monotone, cov-dependent mix; the exact formula is irrelevant to LOCALITY,
-    // only that cov==0 is a no-op and cov>0 mutates.
-    let a = u32::from(cov);
-    let mix = |b: u32, f: u32| ((b * (255 - a) + f * a) / 255) & 0xff;
-    let r = mix((bg >> 16) & 0xff, (fg >> 16) & 0xff);
-    let g = mix((bg >> 8) & 0xff, (fg >> 8) & 0xff);
-    let bl = mix(bg & 0xff, fg & 0xff);
-    (r << 16) | (g << 8) | bl
-}
-
-/// Recolouring tile `k` (blitting its coverage at band `k`'s columns in a new fg)
-/// changes NO destination pixel outside band `k`'s column span — every other cell's
-/// ink survives. This is the block-cursor / per-cell-fg locality M4 delivers:
-/// recolour one cell of a merged ligature without dissolving the run.
-#[test]
-fn per_tile_recolor_is_local() {
-    const BG: u32 = 0x0011_1318;
-    const FG: u32 = 0x00FF_A000; // the "recolour" (e.g. cursor/selection/syntax fg)
-    let mut touched_outside = false; // must stay false
-    let mut recoloured_something = false; // non-vacuity: some pixel actually changed
-    for raster_w in 1..=24usize {
-        for height in 1..=4usize {
-            for cell_w in 1..=9usize {
-                let raster = synth_raster(raster_w, height);
-                let bands = slice_tile_bands(raster_w, cell_w);
-                for (k, band) in bands.iter().enumerate() {
-                    // Fresh dest painted with the base ink of the WHOLE raster.
-                    let base: Vec<u32> =
-                        raster.iter().map(|&c| blend(BG, 0x00C8_C8C8, c)).collect();
-                    let mut dest = base.clone();
-                    // Recolour ONLY tile k: blit its coverage at band k in FG.
-                    let tw = band.width();
-                    let tile = extract_tile(&raster, raster_w, height, *band);
-                    for row in 0..height {
-                        for col in 0..tw {
-                            let cov = tile[row * tw + col];
-                            let idx = row * raster_w + band.x0 + col;
-                            let before = dest[idx];
-                            dest[idx] = blend(BG, FG, cov);
-                            if dest[idx] != before {
-                                recoloured_something = true;
-                            }
-                        }
-                    }
-                    // Locality: every pixel OUTSIDE band k's columns is unchanged.
-                    for row in 0..height {
-                        for x in 0..raster_w {
-                            let inside = x >= band.x0 && x < band.x1;
-                            if !inside {
-                                let idx = row * raster_w + x;
-                                if dest[idx] != base[idx] {
-                                    touched_outside = true;
-                                }
-                            }
-                        }
-                    }
-                    let _ = k;
-                }
-            }
-        }
-    }
-    assert!(
-        !touched_outside,
-        "recolouring tile k must not touch any other cell"
-    );
-    assert!(
-        recoloured_something,
-        "non-vacuity: a recolour actually changed pixels"
-    );
-}
+use aterm_render::ligature_shaping::{ShapeVerdict, classify_shape};
 
 // ---------------------------------------------------------------------------
 // PROVE (3): conservative gate — Tier-1 binding of the shipping classifier.

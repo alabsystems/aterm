@@ -501,22 +501,43 @@ pub(crate) const EDIT_HARNESS_APPROVE: &str = "harness.approve";
 /// [`NESTED_LEAVES`] beside the approval level, so it is a Settings row, a
 /// Search hit and a Manual key at once.
 ///
-/// ON: a Claude Code question dialog (AskUserQuestion) is answered with its
-/// recommended option — option 1 when none is marked; every recommended
-/// option of a multi-select; the review tab submitted — by Enter on the
-/// focused row once a person has been quiet (`answer-recommended@v1`),
-/// never its free-text row, its chat row or Cancel, and a question a person
-/// has begun answering is theirs; and a question or choice the worker asks
-/// in prose gets `[harness] answer_text` (`answer@v1`). OFF — a limit —
-/// every question goes to the menu bar. Independent of
-/// [`EDIT_HARNESS_APPROVE`] both ways: a question is no permission. The row
-/// seeds from the SUPERVISOR's resolved bit ([`Config::harness`]), so a
-/// refused value reads OFF here exactly as the reader limits it.
+/// WHETHER, never how: ON, a Claude Code question dialog (AskUserQuestion)
+/// is ANSWERED, as [`EDIT_HARNESS_QUESTION_PRIORITY`] (the row beside it)
+/// says. Under its default, `recommended`, that is the dialog's recommended
+/// option — option 1 when none is marked; every recommended option of a
+/// multi-select; the review tab submitted — by Enter on the focused row once
+/// a person has been quiet (`answer-recommended@v1`), never its free-text
+/// row, its chat row or Cancel, and a question or choice the worker asks in
+/// prose gets `[harness] answer_text` (`answer@v1`); under `long-term` /
+/// `short-term` no option is chosen and the policy's text is written into
+/// the free-text row instead (and typed in place of `answer_text`). Either
+/// way a question a person has begun answering is theirs. OFF — a limit —
+/// every question goes to the menu bar, whatever the priority says.
+/// Independent of [`EDIT_HARNESS_APPROVE`] both ways: a question is no
+/// permission. The row seeds from the SUPERVISOR's resolved bit
+/// ([`Config::harness`]), so a refused value reads OFF here exactly as the
+/// reader limits it.
 pub(crate) const EDIT_HARNESS_ANSWER_QUESTIONS: &str = "harness.answer_questions";
+/// `[harness] question_priority` — HOW the supervisor answers a question
+/// dialog while [`EDIT_HARNESS_ANSWER_QUESTIONS`] is on (2026-09-25). An Enum,
+/// default `recommended`, registered through [`NESTED_LEAVES`] beside it, so
+/// it is a Settings row, a Search hit and a Manual key at once.
+///
+/// `recommended`: the dialog's recommended option, as above. `long-term` /
+/// `short-term`: the supervisor chooses no option — it writes that policy's
+/// fixed text into the question's free-text row and submits it, so the
+/// worker decides by the policy and says which it chose (a preview tab, or
+/// one the text would not fit, gets its recommended option). Never WHETHER:
+/// with the answer switch off every question goes to the menu bar whatever
+/// this row says. A session's own `aterm ctl @<sid> meta set questions …`
+/// word decides over it. A refused value turns the answer switch off (the
+/// reader's fail-closed, [`Config::harness`]), and this row then seeds
+/// nothing.
+pub(crate) const EDIT_HARNESS_QUESTION_PRIORITY: &str = "harness.question_priority";
 
 /// `[machine] universal_control` — `"off"` (default) disables macOS Universal Control
 /// for this host whenever the `[machine]` settings are applied (`aterm pkg machine apply`,
-/// run as the window opens and by a terminal session once a day, and a pass after an
+/// run once a day at the first window or terminal session, and by a pass after an
 /// edit); `"leave"` never touches it. Applied by the CO-LOCATED atpkg, which reads the same
 /// table; the Security page shows the measured state beside the switch.
 pub(crate) const EDIT_MACHINE_UNIVERSAL_CONTROL: &str = "machine.universal_control";
@@ -759,7 +780,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     },
     NestedLeaf {
         key: "update.auto_apply",
-        label: "Update: apply immediately",
+        label: "Update: install updates automatically",
         kind: EditKind::Bool,
     },
     // [reroute] — the upstream-Rust signpost line (atpkg reads it).
@@ -785,13 +806,23 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
             options: &["all", "safe", "none"],
         },
     },
-    // The question answer (owner, 2026-09-25): ON answers a question dialog
-    // with its recommended option, and one asked in prose with
-    // `answer_text`; OFF (a limit) hands every question over.
+    // The question answer (owner, 2026-09-25): ON answers a question dialog,
+    // and one asked in prose, as the priority row below says; OFF (a limit)
+    // hands every question over. WHETHER only: the label names no way of
+    // answering, which is the priority's.
     NestedLeaf {
         key: EDIT_HARNESS_ANSWER_QUESTIONS,
-        label: "Answer questions with the recommended option",
+        label: "Answer questions",
         kind: EditKind::Bool,
+    },
+    // HOW a question is answered (2026-09-25): its recommended option, or the
+    // worker's own choice under the long-term or short-term policy.
+    NestedLeaf {
+        key: EDIT_HARNESS_QUESTION_PRIORITY,
+        label: "Question priority",
+        kind: EditKind::Enum {
+            options: &aterm_agent::supervise::QuestionPriority::WORDS,
+        },
     },
     // [sparkle_words] — master + top-level scalars.
     NestedLeaf {
@@ -1101,6 +1132,21 @@ pub(crate) fn nested_leaf(key: &str) -> Option<&'static NestedLeaf> {
 #[cfg(test)]
 pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
+        "claude_footer",
+        "the Claude Code footer's Σ switch ([claude_footer] usage, owner 2026-09-30), on by \
+         default and read live. The footer answers a live Claude Code session, which the \
+         Settings preview cannot show; the Manual completes and explains the key",
+    ),
+    (
+        "render",
+        "the repaint nudge's mode ([render] repaint_nudge = on|log|off), read once at launch. A \
+         repair for one program (Claude Code) after a resize left its tab drawn one row off, \
+         on by default since a real-Claude run measured it (`log` only writes what it would do \
+         to aterm.log, `off` does nothing). The key is read once at launch, so a change \
+         applies next launch and a Settings toggle would have to say so; the Manual \
+         completes and explains the key and `aterm help config` documents it",
+    ),
+    (
         "keeper",
         "the PTY keeper's opt-in ([keeper] enabled, P3 of docs/DESIGN-pty-keeper-2026-09-26.md), \
          read once at launch: while it is opt-in and needs `aterm keeper start` beside it, a \
@@ -1110,10 +1156,11 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
         "privacy",
         "the macOS consent posture ([privacy] enabled/check/notice/warmup/observer/…). It has \
-         its OWN purpose-built surface — the \"macOS file access\" block on Settings > Security, \
-         which renders the live probe state, the System Settings route, the warm-up gesture and \
-         the denied-state repair together. Registering the raw keys here would create a second, \
-         competing surface for the same facts, and two of them cannot be scalar rows at all: \
+         its OWN purpose-built surface — the \"macOS access\" block on Settings > Security, \
+         which renders the live probe states (Full Disk Access and debugger access), the System \
+         Settings route, the warm-up gesture and the denied-state repair together. Registering \
+         the raw keys here would create a second, competing surface for the same facts, and two \
+         of them cannot be scalar rows at all: \
          `protected_roots` and `warmup_folders` are lists (the same no-lossy-encoding rationale \
          as keybindings). `auto_accept` is RESERVED and refused on purpose — an editable toggle \
          would advertise a capability aterm deliberately does not have (it emits a \
@@ -1915,6 +1962,8 @@ impl std::error::Error for PrefsEditError {}
 ///     on the replaced value node and are copied across ([`adopt_inline_decor`]);
 ///     a new key is appended.
 ///   * `None` — REMOVE `key` (revert to its built-in default). Absent already ⇒ no-op.
+///     Its line goes with its same-line comment; the comment lines written ABOVE it
+///     stay where they were ([`aterm_toml::edit::DocumentMut::remove_path`]).
 ///
 /// DOTTED KEYS (`"table.key"`, e.g. `matrix_rain.enabled`, or deeper like
 /// `sparkle_words.profanity.enabled`): the edit walks the table chain to the
@@ -1949,7 +1998,9 @@ pub(crate) fn apply_prefs_edits(
         if key.contains('.') {
             let parts: Vec<&str> = key.split('.').collect();
             match value {
-                None => remove_nested_key(&mut doc, &parts),
+                None => {
+                    doc.remove_path(&parts);
+                }
                 Some(raw) => {
                     let item = typed_item(key, raw)?;
                     set_nested_key(&mut doc, &parts, item)?;
@@ -1962,7 +2013,7 @@ pub(crate) fn apply_prefs_edits(
             for (retired, current) in RETIRED_PACKAGES_SPELLINGS {
                 if current == key {
                     let retired: Vec<&str> = retired.split('.').collect();
-                    remove_nested_key(&mut doc, &retired);
+                    doc.remove_path(&retired);
                 }
             }
             continue;
@@ -2061,28 +2112,6 @@ fn set_nested_key(
     adopt_inline_decor(table.get(leaf), &mut item);
     table.insert(leaf, item);
     Ok(())
-}
-
-/// REMOVE a nested leaf at dotted path `parts` (revert to its built-in
-/// default). Any missing/non-table step along the way means the leaf is not
-/// set ⇒ a clean no-op, mirroring the top-level remove. The PARENT tables are
-/// left in place even when emptied — deleting `[net]` outright would also take
-/// its comments, and an empty table parses to the same defaults.
-fn remove_nested_key(doc: &mut aterm_toml::edit::DocumentMut, parts: &[&str]) {
-    let (leaf, tables) = parts.split_last().expect("dotted key has segments");
-    let mut cur: &mut aterm_toml::edit::Item = doc.as_item_mut();
-    for part in tables {
-        let Some(table) = cur.as_table_like_mut() else {
-            return;
-        };
-        let Some(next) = table.get_mut(part) else {
-            return;
-        };
-        cur = next;
-    }
-    if let Some(table) = cur.as_table_like_mut() {
-        table.remove(leaf);
-    }
 }
 
 /// The WRITABLE domain of an [`EditKind::Integer`] key. This is normally the exact
@@ -2485,9 +2514,9 @@ fn configured_str(field: Option<&str>) -> Option<String> {
 /// as the top-level rows: a Bool seeds its RESOLVED state (checkbox convention,
 /// empty placeholder), everything else seeds the CONFIGURED raw value only with
 /// the effective default rendered in the placeholder. Defaults here mirror the
-/// consuming resolvers (`sparkle_deco_config` / `matrix_rain_config` /
+/// consuming resolvers (`sparkle_deco_config` / `Config::matrix_rain_params` /
 /// `update_auto_apply` / `net_listen`); the conformance test
-/// `nested_leaves_all_have_rows_with_seed_conventions` forces an arm for every
+/// `nested_leaves_have_agreeing_rows_and_serde_round_trip` forces an arm for every
 /// registered leaf, so a new leaf cannot silently fall to the blank fallback.
 fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) {
     let sw = cfg.sparkle_words.as_ref();
@@ -2539,6 +2568,18 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
             (
                 (level != "all").then(|| level.to_string()),
                 "all".to_string(),
+            )
+        }
+        // The word the supervisor reads, the default its placeholder (a
+        // seed is a written override): a refused word is read as the
+        // default, and answers no question at all — its answer switch says
+        // so (OFF).
+        EDIT_HARNESS_QUESTION_PRIORITY => {
+            let word = cfg.harness_question_priority();
+            (
+                (word != aterm_agent::supervise::QuestionPriority::Recommended)
+                    .then(|| word.word().to_string()),
+                "recommended (default)".to_string(),
             )
         }
         "sparkle_words.enabled" => boolean(sw.and_then(|s| s.enabled), true),
@@ -3101,7 +3142,7 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
             "Opacity requires macOS GPU rendering; other renderers stay solid. Text over translucent backgrounds uses at least 4.5:1 contrast."
         }
         "Paste safety" => {
-            "Asks before pasting more than one line into a program that does not use bracketed paste."
+            "Asks before pasting text with a line break into a program that does not use bracketed paste."
         }
         "Motion" => "Automatic also reduces motion under heavy load; turn that off in Manual.",
         "Keyboard" => {
@@ -3148,7 +3189,7 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         // Every other caveat (silent with
         // the trail off, with the window unfocused, under Serious Mode, or on a
         // platform without audio) already has a per-row disclosure
-        // (`native_settings::settings_effect_note`), and this string is
+        // (`native_settings::setting_effect_projection`), and this string is
         // budgeted: a long footnote can consume a whole 320 pt page at 2× text
         // and leave no room for a control
         // (`advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts`).
@@ -3183,7 +3224,7 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         // off switch used to turn the first launch into (R20) is retired — nothing posts
         // it. Off, nothing installs that nobody asked for (`PackagesConfig::auto_install`).
         "ALab Tools" => {
-            "Automatic updates keeps the installed ALab tools up to date in the background and applies at once — off stops it, on starts it again; typed aterm pkg commands work either way. Install ALab tools lets aterm download them (several GB) and add new tools later; it applies at the next package check, and off installs nothing you did not ask for. Announce upstream cargo/rustc prints one line before a rerouted Rust tool runs."
+            "Automatic updates keeps ALab tools, Claude Code and Codex up to date and takes effect at once; Check & Update Now and aterm pkg work either way. Install ALab tools lets aterm download them (several GB) at the next package check, and new ones as they join; off installs nothing you did not ask for. Announce upstream cargo/rustc prints one line before a rerouted Rust tool runs."
         }
         "Smart Titles" => {
             "Activity shows only when a tab has no Description. Built-in and aterm-managed \
@@ -3191,13 +3232,13 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
              terminal text only with your consent, and filtering cannot catch every secret."
         }
         "Permissions" => {
-            "Off by default. Programs request access; Secure Keyboard Entry stops \
-             snooping. Notifications: macOS and Windows."
+            "Off by default; off refuses the program. Secure Keyboard Entry hides keys \
+             from other apps. Program notifications: macOS and Windows."
         }
         // Short on purpose (the "This Mac" note above says why).
         "Notifications" => {
-            "Off, aterm's own alerts stay in the message band, the menu bar and Messages; \
-             the operator's only in aterm fleet status and next."
+            "Off, aterm's alerts stay in the window, the menu bar and Messages; \
+             agent-operator alerts are only counted in aterm fleet status."
         }
         "Window padding" => {
             "Top padding cannot exceed all-edge padding; constrained values show their effective size."
@@ -3241,13 +3282,15 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
         // re-rendered without the prelude so the NEXT launch is plain.
         EDIT_HARNESS_ENABLED => Some(HARNESS_TIMING),
         // Live the same way (2026-09-24), with no launcher half.
-        // So is the question answer (2026-09-25).
-        EDIT_HARNESS_APPROVE | EDIT_HARNESS_ANSWER_QUESTIONS => Some(HARNESS_APPROVE_TIMING),
+        // So is the question answer (2026-09-25), and how it answers.
+        EDIT_HARNESS_APPROVE | EDIT_HARNESS_ANSWER_QUESTIONS | EDIT_HARNESS_QUESTION_PRIORITY => {
+            Some(HARNESS_APPROVE_TIMING)
+        }
         EDIT_HDR_GLOW => Some("Disabling applies now; enabling may require a new window"),
         EDIT_RESTORE_SESSION => Some("Applies when closing or next launch"),
         EDIT_REROUTE_ANNOUNCE => Some("Applies to the next rerouted command"),
         EDIT_PACKAGES_AUTO_INSTALL | "packages.account" | "packages.exclude" | "packages.links" => {
-            Some("Applies on the next package operation")
+            Some("Applies at the next package check")
         }
         EDIT_MACHINE_UNIVERSAL_CONTROL | EDIT_MACHINE_SPOTLIGHT_NOINDEX => {
             Some("Applies on the next package pass, or Apply now")
@@ -3256,7 +3299,7 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
             "A development build only: applies on the next manual or automatic update \
              check; a shipped build reads its compiled channel",
         ),
-        "update.auto_apply" => Some("Applies on the next update transition"),
+        "update.auto_apply" => Some("Applies now, including a downloaded update"),
         EDIT_MATRIX_RAIN_ENABLED => {
             Some("Applies live unless this session has a View menu override")
         }
@@ -3286,6 +3329,7 @@ pub(crate) fn application_has_live_effect(key: &str) -> bool {
             | EDIT_HARNESS_ENABLED
             | EDIT_HARNESS_APPROVE
             | EDIT_HARNESS_ANSWER_QUESTIONS
+            | EDIT_HARNESS_QUESTION_PRIORITY
     ) || application_timing(key).is_none()
 }
 
@@ -3465,7 +3509,7 @@ pub(crate) fn range_of(key: &str) -> Option<Range> {
         "sparkle_words.profanity.intensity" | "sparkle_words.feline.intensity" => r(0.0, 1.0, 0.05),
         "sparkle_words.ink.strength" => r(0.0, 1.0, 0.05),
         "sparkle_words.ink.sweep_ms" => r(350.0, 6000.0, 50.0),
-        // Nested matrix-rain numerics — `matrix_rain_config`'s clamp domains.
+        // Nested matrix-rain numerics — `Config::matrix_rain_params`'s clamp domains.
         "matrix_rain.fps" => r(12.0, 60.0, 1.0),
         "matrix_rain.density" => r(1.0, 12.0, 1.0),
         "matrix_rain.speed" | "matrix_rain.trail" => r(1.0, 10.0, 1.0),
@@ -4057,6 +4101,23 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "choose",
             "auto answer",
         ],
+        // HOW a question is answered: the word "priority", the two policy
+        // words, and what a person reaches for to have the worker decide.
+        EDIT_HARNESS_QUESTION_PRIORITY => &[
+            "harness",
+            "claude",
+            "question",
+            "questions",
+            "priority",
+            "question priority",
+            "long-term",
+            "short-term",
+            "long term",
+            "short term",
+            "askuserquestion",
+            "recommended",
+            "decide",
+        ],
         // The one word most people will search for here is the vendor's — so
         // the wrapper's switch answers to "claude" as well as to "harness",
         // and to the two words an operator reaches for when they want it to
@@ -4453,9 +4514,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            // ONE popup row over the whole style list (design graft #1) — while its
-            // menu is open the preview card's demo lane plays the HIGHLIGHTED look,
-            // so browsing the menu live-demos each effect before anything commits.
+            // ONE popup row over the whole style list (design graft #1).
             label: "Cursor trail",
             key: EDIT_CURSOR_TRAIL_STYLE,
             kind: EditKind::Enum {
@@ -4671,7 +4730,15 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.cursor_trail_bloom_radius.map(|v| v.to_string()),
             placeholder: match cfg.cursor_trail_bloom_radius {
                 Some(v) => v.to_string(),
-                None => "2.2 (default)".to_string(),
+                // The style's own default (Trail Packs are never the kitty,
+                // so built-in resolution against an empty catalog is exact).
+                None => format!(
+                    "{} (default)",
+                    Config::bloom_radius_style_default(crate::app_config::resolve_trail_style(
+                        cfg.cursor_trail_style_raw(),
+                        &crate::app_config::TrailPackCatalog::default(),
+                    ))
+                ),
             },
         },
         EditField {
@@ -4881,7 +4948,10 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.tab_strip_rows.map(|n| n.to_string()),
             placeholder: cfg
                 .tab_strip_rows
-                .map_or_else(|| "default".to_string(), |n| n.to_string()),
+                .map_or_else(
+                    || format!("{} (default)", crate::app_config::DEFAULT_TAB_STRIP_ROWS),
+                    |n| n.to_string(),
+                ),
         },
         EditField {
             label: "Generate live Activity",
@@ -5407,7 +5477,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
         });
     }
     // Security opt-ins (all fail-closed: default OFF). One Bool per key, sourced from
-    // SECURITY_BOOL_KEYS so `edit_kind` agrees. `allow_value` reads the matching field.
+    // SECURITY_BOOL_KEYS so `edit_kind` agrees.
     for &key in SECURITY_BOOL_KEYS {
         let on = match key {
             EDIT_ALLOW_OSC52_QUERY => cfg.allow_osc52_query,
@@ -6418,30 +6488,6 @@ mod edit_tests {
         assert!(c.matrix_rain_enabled());
     }
 
-    /// Dotted edits are NON-DESTRUCTIVE inside the table: comments, unrelated
-    /// sibling keys (in `[matrix_rain]` AND at top level) and formatting all
-    /// survive an update; only the addressed child changes.
-    #[test]
-    fn dotted_update_preserves_comments_and_unrelated_keys() {
-        let existing = "# my config\nfont_px = 13.0\n\n[matrix_rain]\n# keep the fps comment\nfps = 24 # inline note\nenabled = false\n";
-        let out = apply_prefs_edits(existing, &[(super::EDIT_MATRIX_RAIN_ENABLED, set("true"))])
-            .expect("dotted update");
-        assert!(out.contains("# my config"), "top comment survives");
-        assert!(out.contains("font_px = 13.0"), "unrelated top key survives");
-        assert!(
-            out.contains("# keep the fps comment"),
-            "table comment survives"
-        );
-        assert!(
-            out.contains("fps = 24 # inline note"),
-            "sibling + its inline note survive"
-        );
-        assert!(out.contains("enabled = true"), "the child updated in place");
-        let c: Config = aterm_toml::from_str(&out).unwrap();
-        assert!(c.matrix_rain_enabled());
-        assert_eq!(c.matrix_rain.as_ref().unwrap().fps, Some(24));
-    }
-
     /// Blank = revert: removing the dotted child deletes only that key while
     /// siblings remain — and an EMPTIED table is deliberately RETAINED (its
     /// header may carry the user's comments, and an empty table parses to the
@@ -6460,11 +6506,10 @@ mod edit_tests {
         let lone = "font_px = 13.0\n[matrix_rain]\n# mine\nenabled = true\n";
         let out = apply_prefs_edits(lone, &[(super::EDIT_MATRIX_RAIN_ENABLED, None)])
             .expect("dotted remove of the last child");
-        assert!(
-            out.contains("[matrix_rain]"),
-            "an emptied table is retained (comments live on its header): {out:?}"
+        assert_eq!(
+            out, "font_px = 13.0\n[matrix_rain]\n# mine\n",
+            "an emptied table is retained, with the comment above its last key"
         );
-        assert!(out.contains("font_px = 13.0"));
         let cfg: crate::app_config::Config = aterm_toml::from_str(&out).expect("round-trip");
         assert!(
             !cfg.matrix_rain_enabled(),
@@ -6925,7 +6970,14 @@ mod edit_tests {
             .into_iter()
             .find(|f| f.key == key)
             .expect("the row exists on an unconfigured install");
-        assert_eq!(row.label, "Answer questions with the recommended option");
+        // WHETHER only: HOW is the priority row's, so the switch names no
+        // way of answering (under `long-term` no option is pressed at all).
+        assert_eq!(row.label, "Answer questions");
+        assert!(
+            !row.label.to_lowercase().contains("recommended"),
+            "{}",
+            row.label
+        );
         assert_eq!(row.seed.as_deref(), Some("true"), "absent means ON");
         assert_eq!(
             super::application_timing(key),
@@ -6966,6 +7018,117 @@ mod edit_tests {
         let unread =
             Config::parse("[harness]\nanswer_questions = \"sometimes\"\n").expect("parses");
         assert!(unread.harness.policy.answer_questions, "no setting: ON");
+    }
+
+    /// THE QUESTION-PRIORITY ROW (2026-09-25): `[harness] question_priority`
+    /// is an Enum Settings row in the Harness section beside the question
+    /// answer — its options the supervisor's own words, in their order —
+    /// `recommended` by default (the placeholder; nothing seeded while the
+    /// key is absent), live like it, and found by "priority", "long-term" and
+    /// "question". Writing a word stores it (case normalised) and the policy
+    /// reads it, the question answer left on; a word outside the three is
+    /// refused at Save; clearing it answers with the recommended option again.
+    /// NEGATIVE CONTROL: a refused value in the file seeds nothing, and the
+    /// answer switch reads OFF.
+    #[test]
+    fn the_question_priority_row_round_trips_through_set_and_unset() {
+        use aterm_agent::supervise::QuestionPriority;
+        let key = super::EDIT_HARNESS_QUESTION_PRIORITY;
+        assert_eq!(
+            key, "harness.question_priority",
+            "the FILE spelling is the key"
+        );
+        assert_eq!(
+            super::edit_kind(key),
+            EditKind::Enum {
+                options: &["recommended", "long-term", "short-term"]
+            }
+        );
+        assert_eq!(super::section_of(key), super::Section::Harness);
+        assert_eq!(super::group_of(key).0, "Harness");
+        for word in [
+            "question",
+            "priority",
+            "question priority",
+            "long-term",
+            "short-term",
+        ] {
+            assert!(keywords_of(key).contains(&word), "{word}");
+        }
+        assert_eq!(super::environment_precedence(key), None, "no env override");
+        assert_eq!(
+            super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
+            1,
+            "one registration, one home"
+        );
+        let row = editable_fields(&Config::default())
+            .into_iter()
+            .find(|f| f.key == key)
+            .expect("the row exists on an unconfigured install");
+        assert_eq!(row.label, "Question priority");
+        assert_eq!(
+            row.seed, None,
+            "absent: the default, shown as the placeholder"
+        );
+        assert_eq!(row.placeholder, "recommended (default)");
+        assert_eq!(
+            super::application_timing(key),
+            Some(super::HARNESS_APPROVE_TIMING)
+        );
+        assert!(super::application_has_live_effect(key));
+
+        for (typed, want) in [
+            ("long-term", QuestionPriority::LongTerm),
+            ("Short-Term", QuestionPriority::ShortTerm),
+        ] {
+            let written = apply_prefs_edits("[harness]\nenabled = true\n", &[(key, set(typed))])
+                .expect("the nested writer edits [harness]");
+            assert!(
+                written.contains(&format!("question_priority = \"{}\"", want.word())),
+                "{written}"
+            );
+            let on = Config::parse(&written).expect("re-parses as Config");
+            assert!(
+                on.harness_notices().is_empty(),
+                "{:?}",
+                on.harness_notices()
+            );
+            let policy = &on.harness.policy;
+            assert_eq!(policy.question_priority, want);
+            assert!(policy.answer_questions, "HOW, never WHETHER");
+            assert_eq!(
+                editable_fields(&on)
+                    .into_iter()
+                    .find(|f| f.key == key)
+                    .and_then(|f| f.seed),
+                Some(want.word().to_string())
+            );
+            let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
+            let back = Config::parse(&cleared).expect("re-parses as Config");
+            assert_eq!(
+                back.harness.policy.question_priority,
+                QuestionPriority::Recommended,
+                "{cleared}"
+            );
+        }
+        assert!(
+            apply_prefs_edits("", &[(key, set("long_term"))]).is_err(),
+            "a word outside the three is refused at Save"
+        );
+
+        let refused = Config::parse("[harness]\nquestion_priority = \"sometimes\"\n").unwrap();
+        assert!(
+            refused.harness.policy.answer_questions,
+            "a refused word changes nothing"
+        );
+        assert_eq!(
+            editable_fields(&refused)
+                .into_iter()
+                .find(|f| f.key == key)
+                .and_then(|f| f.seed),
+            None,
+            "a refused priority seeds nothing"
+        );
     }
 
     /// The `[packages]` switches (2026-09-23: TWO, Automatic updates and the one install
@@ -7149,46 +7312,76 @@ mod edit_tests {
         ));
     }
 
-    /// Setting a NEW key on an empty file writes it typed correctly and re-parses
-    /// through `Config` (a Save → reload round-trip).
-    #[test]
-    fn set_new_key_on_empty_file() {
-        let out = apply_prefs_edits("", &[(EDIT_FONT_PX, set("15.5"))]).unwrap();
-        assert!(out.contains("font_px"), "wrote the key: {out:?}");
-        // Floats are typed as TOML floats, not strings, so serde reads f32.
-        let c: Config = aterm_toml::from_str(&out).expect("round-trips");
-        assert_eq!(c.font_px, Some(15.5));
-    }
-
-    /// UPDATING an existing key changes only its value, leaving its line in place.
-    #[test]
-    fn update_existing_key() {
-        let existing = "font_px = 12.0\ntheme = \"Dracula\"\n";
-        let out = apply_prefs_edits(existing, &[(EDIT_FONT_PX, set("18.0"))]).unwrap();
-        let c: Config = aterm_toml::from_str(&out).unwrap();
-        assert_eq!(c.font_px, Some(18.0));
-        // The unrelated key is untouched.
-        assert_eq!(c.theme.as_deref(), Some("Dracula"));
-    }
-
-    /// A `None` (blank/cleared) edit REMOVES the key — reverting it to its default —
-    /// rather than writing an empty string.
-    #[test]
-    fn blank_removes_key() {
-        let existing = "font_px = 12.0\ntheme = \"Dracula\"\n";
-        let out = apply_prefs_edits(existing, &[(EDIT_FONT_PX, None)]).unwrap();
-        assert!(!out.contains("font_px"), "key removed: {out:?}");
-        let c: Config = aterm_toml::from_str(&out).unwrap();
-        assert_eq!(c.font_px, None);
-        // Removing the cleared key does NOT touch the sibling.
-        assert_eq!(c.theme.as_deref(), Some("Dracula"));
-    }
-
     /// Removing an ALREADY-absent key is a clean no-op, not an error.
     #[test]
     fn remove_absent_key_is_noop() {
         let out = apply_prefs_edits("theme = \"Dracula\"\n", &[(EDIT_FONT_PX, None)]).unwrap();
         assert_eq!(out, "theme = \"Dracula\"\n");
+    }
+
+    /// A removal takes the key's own line, its same-line comment included, and
+    /// nothing else: the comment and blank lines written ABOVE it are the
+    /// person's, and stay where they were — above the next line, or below a
+    /// table's last remaining line.
+    #[test]
+    fn removing_a_key_keeps_the_comment_lines_above_it() {
+        for (existing, key, expected) in [
+            (
+                "# keep me\nfont_px = 14.0  # cozy\nfont_family = \"Menlo\"\n",
+                EDIT_FONT_PX,
+                "# keep me\nfont_family = \"Menlo\"\n",
+            ),
+            (
+                "[matrix_rain]\n# mine\nenabled = true\nfps = 24\n",
+                super::EDIT_MATRIX_RAIN_ENABLED,
+                "[matrix_rain]\n# mine\nfps = 24\n",
+            ),
+            // The same key as a dotted line among the top-level ones.
+            (
+                "# rain\nmatrix_rain.enabled = true\nfont_px = 13.0\n",
+                super::EDIT_MATRIX_RAIN_ENABLED,
+                "# rain\nfont_px = 13.0\n",
+            ),
+            (
+                "font_px = 13.0\n# alt themes\ntheme = \"X\"\n\n[update]\nenabled = false\n",
+                EDIT_THEME,
+                "font_px = 13.0\n# alt themes\n\n[update]\nenabled = false\n",
+            ),
+        ] {
+            let out = apply_prefs_edits(existing, &[(key, None)]).expect("remove");
+            assert_eq!(out, expected, "removing {key} from {existing:?}");
+            aterm_toml::from_str::<Config>(&out).expect("the result still parses");
+        }
+    }
+
+    /// Settings ▸ Reset and then Undo, through the service that drives both: the
+    /// comment lines above the reset key survive the reset AND the undo, which
+    /// writes the key back as a new line.
+    #[test]
+    fn reset_then_undo_keeps_the_comment_lines_above_the_key() {
+        use crate::native_config_service::{ConfigPatchResult, VersionedConfigService};
+        let comments = "# ---- My fonts ----\n# keep these in sync with my editor\n";
+        let mut service = VersionedConfigService::new(format!(
+            "{comments}font_px = 14.0\nfont_family = \"Menlo\"\n"
+        ))
+        .unwrap();
+        let base = service.snapshot().revision;
+        let ConfigPatchResult::Applied { snapshot, undo } =
+            service.reset_all(base, [EDIT_FONT_PX.to_string()])
+        else {
+            panic!("the reset should commit");
+        };
+        assert_eq!(
+            *snapshot.text,
+            format!("{comments}font_family = \"Menlo\"\n")
+        );
+        let ConfigPatchResult::Applied { snapshot, .. } = service.undo(undo) else {
+            panic!("the undo should commit");
+        };
+        assert_eq!(
+            *snapshot.text,
+            format!("{comments}font_family = \"Menlo\"\nfont_px = 14.0\n")
+        );
     }
 
     /// COMMENTS and unrelated keys survive an edit — the whole point of the
@@ -7589,17 +7782,6 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(c.cursor_trail_style.as_deref(), Some("fire"));
     }
 
-    /// An out-of-domain `Enum` value is REJECTED (`BadValue`) so a typo'd style can never
-    /// be saved (and silently fall back to lumen at reload).
-    #[test]
-    fn bad_enum_value_is_rejected() {
-        let err = apply_prefs_edits("", &[(EDIT_CURSOR_TRAIL_STYLE, set("rainbwo"))]).unwrap_err();
-        match err {
-            PrefsEditError::BadValue { key, .. } => assert_eq!(key, EDIT_CURSOR_TRAIL_STYLE),
-            other => panic!("expected BadValue, got {other:?}"),
-        }
-    }
-
     /// A `pack:<id>` selection (a loaded Trail Pack, offered by the dynamic picker)
     /// saves VERBATIM through the `cursor_trail_style` Enum row — it is not a
     /// canonical built-in, but the engine resolves/fail-closes it at load. An empty
@@ -7877,7 +8059,7 @@ listen = \"127.0.0.1:7777\" # local only
         ] {
             assert_eq!(
                 super::application_timing(key),
-                Some("Applies on the next package operation"),
+                Some("Applies at the next package check"),
                 "{key}"
             );
         }
@@ -7894,7 +8076,7 @@ listen = \"127.0.0.1:7777\" # local only
         );
         assert_eq!(
             super::application_timing("update.auto_apply"),
-            Some("Applies on the next update transition")
+            Some("Applies now, including a downloaded update")
         );
         assert_eq!(
             super::application_timing(super::EDIT_AMBIGUOUS_WIDTH),
@@ -7933,76 +8115,6 @@ listen = \"127.0.0.1:7777\" # local only
                 super::application_has_live_effect(key),
                 "{key} applies live"
             );
-        }
-    }
-
-    #[test]
-    fn audited_advanced_labels_defaults_and_consequence_notes_are_plain_and_exact() {
-        let fields = editable_fields(&Config::default());
-        let field = |key: &str| {
-            fields
-                .iter()
-                .find(|field| field.key == key)
-                .unwrap_or_else(|| panic!("missing field {key}"))
-        };
-        assert_eq!(field(super::EDIT_BIDI).label, "Bidirectional text");
-        assert_eq!(
-            field(super::EDIT_AMBIGUOUS_WIDTH).label,
-            "Ambiguous-character width"
-        );
-        assert_eq!(field(super::EDIT_FONT_WEIGHT).label, "Variable font weight");
-        let search = field(super::EDIT_SEARCH_HISTORY_LINES);
-        assert_eq!(search.label, "Searchable scrollback lines");
-        assert_eq!(
-            search.placeholder,
-            format!("{} (default)", aterm_core::search::DEFAULT_MAX_CACHED_LINES)
-        );
-
-        let keyboard = super::group_footnote("Keyboard").unwrap();
-        assert!(keyboard.contains("slow connection"));
-        assert!(keyboard.contains("password prompt"));
-        assert!(keyboard.contains("Always, set in Manual"));
-        let paste = super::group_footnote("Paste safety").unwrap();
-        assert!(paste.contains("more than one line"));
-        assert!(paste.contains("does not use bracketed paste"));
-        let scrollback = super::group_footnote("Scrollback").unwrap();
-        assert!(scrollback.contains("keeps every line"));
-        assert!(scrollback.contains("Find searches the newest Searchable scrollback lines"));
-        assert!(scrollback.contains("set it to 0 to search only the screen"));
-        let semantics = super::group_footnote("Text direction & width").unwrap();
-        assert!(semantics.contains("reorders right-to-left text"));
-        assert!(semantics.contains("one or two cells"));
-        assert!(semantics.contains("not existing cells"));
-        let rendering = super::group_footnote("Rendering").unwrap();
-        assert!(rendering.contains("needs a variable font"));
-        assert!(rendering.contains("other fonts ignore it"));
-        assert_eq!(
-            field(super::EDIT_ALLOW_PALETTE_RECONFIGURE).label,
-            "Allow programs to set indexed colors (OSC 4/21)"
-        );
-        // The two switches and the reroute row, each by its own label and timing — never
-        // the retired `seed_install` / "Maintenance" / "Auto-install" model (2026-09-23).
-        let packages = super::group_footnote("ALab Tools").unwrap();
-        assert!(packages.contains("Automatic updates keeps the installed ALab tools"));
-        assert!(packages.contains("applies at once"));
-        assert!(
-            !packages.contains("next launch"),
-            "the switch is live (Phase 4): {packages}"
-        );
-        assert!(packages.contains("Install ALab tools"));
-        assert!(packages.contains("applies at the next package check"));
-        assert!(packages.contains("Announce upstream cargo/rustc"));
-        // …nor the lanes Phase 5 and R20's retirement took away: a full install's own
-        // copy, and an offer at first launch (2026-09-24 post-push review).
-        for retired in [
-            "seed_install",
-            "Maintenance",
-            "Auto-install",
-            "auto-update",
-            "own copy",
-            "offer",
-        ] {
-            assert!(!packages.contains(retired), "{retired}: {packages}");
         }
     }
 

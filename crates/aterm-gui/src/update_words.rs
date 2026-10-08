@@ -55,6 +55,8 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aterm_messages::exceptions::{Entry, Family};
+use aterm_messages::need::{Ask, Reason, Resurface, StandingWhy, Then, Why};
 use aterm_messages::{
     Amount, DETAIL_LINE_CAP, Glyph, HOLD_STAGED_MANUAL, Hold, Intent, Message, Meter,
     PROGRESS_GRACE, Restatement, STALE_HANDOFF, STALE_UPDATE, Severity, Unit, tags,
@@ -70,6 +72,12 @@ pub(crate) const KEY_PROGRESS: &str = "update.progress";
 /// An apply-lane outcome's key (R37) — never [`KEY_PROGRESS`]: both rows
 /// stay live, side by side.
 pub(crate) const KEY_OUTCOME: &str = "update.outcome";
+/// The key of the row that says a person's unsaved work holds the automatic
+/// lane ([`waits_for_you`], round eight of the update audit, lead U38): a
+/// standing row's identity, apart from [`KEY_OUTCOME`] so the once-read quiet
+/// it earns (`aterm_messages::need::STANDING_QUIET`) is about this wait alone,
+/// never a transient outcome's fold.
+pub(crate) const KEY_WAITS_FOR_YOU: &str = "update.waits-for-you";
 /// The check-health warning's FAMILY key (R38): the key every health warning
 /// wore before design ruling 311, and so the one a row carried from an older
 /// build still wears. Today each warning wears its kind's own key
@@ -83,7 +91,7 @@ pub(crate) const KEY_HEALTH: &str = "update.health";
 /// raised under its old words still heals by the proof that answers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HealthKind {
-    /// A verified build will not start (the updater's `apply` class, its overdue
+    /// A verified build keeps failing to install (the updater's `apply` class, its overdue
     /// notice, the automatic lane's convergence).
     Install,
     /// Downloads fail or will not verify (`pipeline`, `stage`).
@@ -109,6 +117,27 @@ pub(crate) enum HealthKind {
 }
 
 impl HealthKind {
+    /// Every kind, in the order the page lists them.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Install,
+        Self::Download,
+        Self::Check,
+        Self::Stalled,
+        Self::LockHeld,
+    ];
+
+    /// The kind's word in the digest's key (`update.review.<slug>`), never the
+    /// record's (`update.health.<slug>`): an entry and a record never share a key.
+    pub(crate) const fn slug(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Download => "download",
+            Self::Check => "check",
+            Self::Stalled => "stalled",
+            Self::LockHeld => "lock-held",
+        }
+    }
+
     /// The kind an updater class names (`aterm_update::HealthNotify`'s classes).
     pub(crate) fn of_class(class: &str) -> Self {
         match class {
@@ -158,15 +187,7 @@ impl HealthKind {
 
     /// The kind whose row key is `key` ([`Self::key`]); `None` for any other.
     pub(crate) fn of_key(key: &str) -> Option<Self> {
-        [
-            Self::Install,
-            Self::Download,
-            Self::Check,
-            Self::Stalled,
-            Self::LockHeld,
-        ]
-        .into_iter()
-        .find(|kind| kind.key() == key)
+        Self::ALL.into_iter().find(|kind| kind.key() == key)
     }
 }
 
@@ -229,6 +250,11 @@ pub(crate) enum ApplyPosture {
     /// failure. `lapses`: the schedule carries a retry deadline and re-arms by
     /// itself; otherwise it has converged and only a person moves it.
     ManualOnlyLatched { lapses: bool },
+    /// The stood-down build is the installed ACTIVATION and its boot trial has
+    /// no launch to spare (`App::latched_activation_trial_spent`): its next
+    /// start, a press included, is the one the trial reverts on. No press is
+    /// offered; a newer release replaces it by itself.
+    TrialSpent,
     /// The in-session handoff cannot run in this process — `why` names the
     /// reason ([`HandoffUnavailable`]: a control socket this process does not own,
     /// `--headless`, no event loop), read from the SAME predicate the apply
@@ -283,8 +309,7 @@ pub(crate) const INSTALL_FROM_MENU: &str = if cfg!(target_os = "macos") {
 };
 
 /// The flow row's phase words, point first and at most 40 characters each —
-/// what is happening now, in the order it happens
-/// (`every_flow_detail_is_short_and_point_first`). They ride behind
+/// what is happening now, in the order it happens. They ride behind
 /// `Details ›` and in the log; the title already says the phase. Never "build
 /// N", "verified", "staging" or "in place" (2026-09-23 audit: internal words).
 pub(crate) const DOWNLOADING: &str = "downloading";
@@ -309,6 +334,45 @@ pub(crate) const FINISHING: &str = "almost done \u{2014} what you type is kept";
 /// (audit 2026-09-24: five phrasings of one promise), with ` later` or ` in
 /// 6 h` after it where a time is known.
 pub(crate) const TRIES_AGAIN: &str = "tries again by itself";
+/// The one way out of a stood-down activation whose boot trial is spent
+/// ([`ApplyPosture::TrialSpent`]): a press would start the build the trial
+/// reverts on, so the menu is never named.
+pub(crate) const NEWER_RELEASE_REPLACES: &str = "a newer release replaces it by itself";
+
+/// Start a sentence: `checked 3 min ago` → `Checked 3 min ago`.
+#[must_use]
+pub(crate) fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// How a staged build is named to a person: `aterm vX`, or `build N` where
+/// its version string is the running build's own — the Version menu's row
+/// ([`crate::menu::staged_apply_label`]) and the on-hold sentence
+/// ([`trial_spent_refusal`]).
+#[must_use]
+pub(crate) fn staged_build_name(build: u64, version: &str) -> String {
+    if version == crate::build_info::version_display() {
+        format!("build {build}")
+    } else {
+        format!("aterm v{version}")
+    }
+}
+
+/// A build ON HOLD ([`ApplyPosture::TrialSpent`]), named `what`
+/// ([`staged_build_name`]), in one sentence, the staged record's words
+/// ([`staged_detail`]) after the state: what a refused press says (Settings'
+/// button, a control `update apply`; nothing launches) and the automatic
+/// lane's hold (`update status`'s `apply_refusal=`).
+#[must_use]
+pub(crate) fn trial_spent_refusal(what: &str) -> String {
+    format!(
+        "{what} is on hold: {}",
+        staged_detail(ApplyPosture::TrialSpent)
+    )
+}
 /// A download that failed: the next check retries it.
 pub(crate) const DOWNLOAD_FAILED: &str = TRIES_AGAIN;
 
@@ -375,9 +439,16 @@ fn flow(title: String, phase: &str, meter: Meter, hold: Hold) -> Message {
 /// The READY row's title, where a press or closed terminals install the build
 /// rather than the lane: "aterm vX is ready". The press affordance is the
 /// `Install now` CAPSULE ([`apply_capsule_for`]), so the words are the same
-/// under every posture.
+/// under every posture but one: a build whose next start its boot trial rolls
+/// back is not ready ([`staged_on_hold_title`]).
 pub(crate) fn staged_title(version: &str) -> String {
     format!("{} is ready", aterm_v(version))
+}
+
+/// The staged record's title for [`ApplyPosture::TrialSpent`]: the build is on
+/// disk but no start of it may be offered, so it is on hold, not ready.
+pub(crate) fn staged_on_hold_title(version: &str) -> String {
+    format!("{} is on hold", aterm_v(version))
 }
 
 /// The `Install now` capsule ONLY where a press is the way the build installs
@@ -394,7 +465,8 @@ pub(crate) fn apply_capsule_for(posture: Option<ApplyPosture>, build: u64) -> Op
         Some(
             ApplyPosture::HandoffDisabled { .. }
             | ApplyPosture::Automatic
-            | ApplyPosture::ManualOnlyLatched { lapses: true },
+            | ApplyPosture::ManualOnlyLatched { lapses: true }
+            | ApplyPosture::TrialSpent,
         ) => None,
         _ => Some(Intent::ApplyUpdate { build }),
     }
@@ -422,6 +494,9 @@ pub(crate) fn staged_detail(posture: ApplyPosture) -> String {
         }
         ApplyPosture::ManualOnlyLatched { lapses: false } => {
             "automatic install didn't work".to_string()
+        }
+        ApplyPosture::TrialSpent => {
+            format!("starting it would roll it back \u{2014} {NEWER_RELEASE_REPLACES}")
         }
         // The load-bearing clause comes first: the width law cuts the detail
         // from the right when the window is narrow. Nothing installs while a
@@ -469,6 +544,9 @@ pub(crate) fn staged_detail_lines(posture: Option<ApplyPosture>) -> Vec<String> 
 ///   ready`, Info with `⇣` (ruling 303), how it installs behind `Details ›`, the
 ///   `Install now` capsule, held [`HOLD_STAGED_MANUAL`] — raised once per
 ///   build and posture by the host (ruling 119);
+/// * a build whose next start its boot trial rolls back
+///   ([`ApplyPosture::TrialSpent`]) is an Info RECORD, `aterm vX is on hold`
+///   with `ℹ`: nothing lands it but a newer release, which its sentence says;
 /// * anything else — the automatic lane that lands it within a minute, a
 ///   stand-down that retries later, the handoff off — is a RECORD with the
 ///   posture's sentence verbatim: it lands by itself (or once the terminals
@@ -478,6 +556,13 @@ pub(crate) fn staged_detail_lines(posture: Option<ApplyPosture>) -> Vec<String> 
 /// The App re-states the words once the lane has actually armed or stood
 /// down for this build ([`restate_apply_posture`]).
 pub(crate) fn staged(version: &str, build: u64, posture: Option<ApplyPosture>) -> Message {
+    if posture == Some(ApplyPosture::TrialSpent) {
+        return row(Severity::Info, staged_on_hold_title(version))
+            .glyph(glyph(NOTED))
+            .lines(staged_detail_lines(posture))
+            .hold(Hold::LogOnly)
+            .key(KEY_PROGRESS);
+    }
     let title = staged_title(version);
     match apply_capsule_for(posture, build) {
         Some(install) => row(Severity::Info, title)
@@ -582,6 +667,7 @@ pub(crate) fn progress(
         P::Staged { version, build } => staged(version, *build, posture),
         P::Failed { detail } => download_failed(flow_version, detail),
         P::Deferred { detail } => download_postponed(detail),
+        P::Withheld { detail } => download_withheld(flow_version, detail),
     }
 }
 
@@ -609,6 +695,24 @@ pub(crate) fn download_failed(flow_version: &str, detail: &str) -> Message {
 /// sentence ("Update download postponed").
 pub(crate) fn download_postponed(detail: &str) -> Message {
     row(Severity::Info, "Update download postponed")
+        .glyph(glyph(NOTED))
+        .sentence(detail)
+        .hold(Hold::LogOnly)
+}
+
+/// A download the updater WITHHELD (round eight of the update audit, #72): the
+/// release was withdrawn — its signer revoked, or yanked — or quarantined on this
+/// machine while it downloaded. Nothing failed and nothing is retried: the next
+/// check refuses it before any download. No row; a RECORD with the updater's
+/// `held: …` sentence, never "Couldn't download … tries again by itself".
+pub(crate) fn download_withheld(flow_version: &str, detail: &str) -> Message {
+    let v = v(flow_version);
+    let title = if v.trim().is_empty() {
+        "Update not installed".to_string()
+    } else {
+        format!("Not installing aterm v{v}")
+    };
+    row(Severity::Info, title)
         .glyph(glyph(NOTED))
         .sentence(detail)
         .hold(Hold::LogOnly)
@@ -727,30 +831,64 @@ pub(crate) fn scrollback_lost(lines: u64, tabs: usize) -> Message {
 /// `withheld` of them because the successor's signed handoff policy asked
 /// for no scrollback (`carry = "visible"` or `"repaint"`, which the outgoing
 /// build follows by carrying NONE — no lines in the screen carry, no
-/// sidecar). Said by WHY, because the words true of one cause are false of
-/// the other (round 3 of the update-robustness work, 2026-09-27): the
-/// failure row's "everything on screen and the newest lines came across" was
-/// posted for a policy's withholding too, when no newest line had crossed
-/// and, under `repaint`, no screen had either.
+/// sidecar), `held` of them in held panes BY DESIGN (round eight of the update
+/// audit, finding 39: their scrollback crosses beside their screen, except on
+/// a hop that carries a held pane's screen alone, to a build older than the
+/// one that parked), and `held_failed` of them in held panes whose carry
+/// FAILED (the review of that fix: the producer says which, and these are a
+/// failure — but no newest line of a held pane ever crosses, its screen
+/// carrying none, so the failure row's comfort is false of them). Said by
+/// WHY, because the words true of one cause are false of another (round 3 of
+/// the update-robustness work, 2026-09-27): the failure row's "everything on
+/// screen and the newest lines came across" was posted for a policy's
+/// withholding too, when no newest line had crossed and, under `repaint`, no
+/// screen had either.
 ///
-/// * none withheld: the failure row, [`scrollback_lost`], unchanged;
+/// * none withheld or in a held pane: the failure row, [`scrollback_lost`],
+///   unchanged;
 /// * all withheld: [`scrollback_withheld`], the new version's request;
-/// * both (no producer writes that today; a successor reads what it is
-///   given): the failure's title, both counts, and a sentence that claims
-///   nothing about what crossed.
-pub(crate) fn scrollback_left_behind(lines: u64, tabs: usize, withheld: u64) -> Message {
-    if withheld == 0 {
+/// * otherwise: one count line per cause, a title that calls it a failure
+///   only when some of it was (a held pane's failed carry is), and a sentence
+///   that claims nothing about what crossed.
+pub(crate) fn scrollback_left_behind(
+    lines: u64,
+    tabs: usize,
+    withheld: u64,
+    held: u64,
+    held_failed: u64,
+) -> Message {
+    if withheld == 0 && held == 0 && held_failed == 0 {
         return scrollback_lost(lines, tabs);
     }
-    if withheld >= lines {
+    if held == 0 && held_failed == 0 && withheld >= lines {
         return scrollback_withheld(lines, tabs);
     }
-    row(Severity::Warn, "Couldn't carry all scrollback")
+    let title = if held_failed == 0 && withheld.saturating_add(held) >= lines {
+        "Update left scrollback behind"
+    } else {
+        "Couldn't carry all scrollback"
+    };
+    let mut message = row(Severity::Warn, title)
         .glyph(glyph(NEEDS_YOU))
-        .line(scrollback_lost_words(lines, tabs))
-        .line(format!(
+        .line(scrollback_lost_words(lines, tabs));
+    if withheld > 0 {
+        message = message.line(format!(
             "{withheld} of them because the new version asked this update to carry no scrollback"
-        ))
+        ));
+    }
+    if held > 0 {
+        message = message.line(format!(
+            "{held} of them in panes kept open after their command ended, whose screen alone \
+             crossed"
+        ));
+    }
+    if held_failed > 0 {
+        message = message.line(format!(
+            "{held_failed} of them in panes kept open after their command ended, which this \
+             update failed to carry"
+        ));
+    }
+    message
         .sentence("`aterm ctl status` in a tab says history_lost= for it")
         .hold(Hold::Default)
         .key(KEY_SCROLLBACK)
@@ -791,6 +929,57 @@ pub(crate) const KEY_SETTINGS_DRAFTS: &str = "update.settings-drafts";
 pub(crate) const PANE_NOT_CARRIED: &str =
     "Nothing was running in this pane when aterm updated, so there was no session to carry.";
 
+/// D5 — A DESK THE UPDATE FOLDED TO FIT (round eight of the update audit,
+/// #505). An update's layout holds at most 64 windows of 256 tabs; the
+/// outgoing build folds a desk past that into what fits
+/// (`restore::RestoreManifest::fold_into_caps`) rather than leave any shell
+/// out, and the successor says so ONCE, here: which windows and tabs it put
+/// where. A calm RECORD on glass — nothing was lost, every tab and shell came
+/// across, nothing is asked of the person — never a warning. `None` when the
+/// layout folded nothing.
+pub(crate) fn layout_folded(fold: &crate::restore::LayoutFold) -> Option<Message> {
+    if !fold.folded() {
+        return None;
+    }
+    let tabs_line = format!(
+        "a window holds at most {} tabs: the tabs past that are in the next window with room",
+        crate::restore::MAX_TABS_PER_WINDOW
+    );
+    let message = if fold.windows > 0 {
+        let title = match fold.windows {
+            1 => "1 window was merged into tabs during the update".to_string(),
+            n => format!("{n} windows were merged into tabs during the update"),
+        };
+        let mut message = row(Severity::Info, title).line(format!(
+            "an update brings back at most {} windows: the tabs of the rest are in the last one",
+            crate::restore::MAX_WINDOWS
+        ));
+        if fold.tabs > 0 {
+            message = message.line(match fold.tabs {
+                1 => "1 tab moved to another window too".to_string(),
+                n => format!("{n} tabs moved to another window too"),
+            });
+            message = message.line(tabs_line);
+        }
+        message
+    } else {
+        let title = match fold.tabs {
+            1 => "1 tab was moved to another window during the update".to_string(),
+            n => format!("{n} tabs were moved to another window during the update"),
+        };
+        row(Severity::Info, title).line(tabs_line)
+    };
+    Some(
+        message
+            .glyph(glyph(NOTED))
+            .hold(Hold::Default)
+            .key(KEY_LAYOUT_FOLDED),
+    )
+}
+
+/// The supersede key of the folded-desk record: one per update.
+pub(crate) const KEY_LAYOUT_FOLDED: &str = "update.layout-folded";
+
 /// How many lost drafts the row spells out, each on its own line. Far above
 /// what a real update loses (only a Settings row the new build no longer has
 /// loses its draft); the rest are counted.
@@ -800,12 +989,16 @@ const SETTINGS_DRAFTS_SHOWN: usize = 16;
 /// build could not reopen some of it: a Settings row it no longer edits as
 /// text, a Settings tab it could not reopen, or a carry it could not read.
 /// Said as a FAILURE on glass, each lost field on its own line WITH the text
-/// the person typed, so it can be typed again — the text exists nowhere else
-/// now, and a loss is never only a log line. `unreadable` drafts had no text
-/// this build could read; they are counted.
+/// the person typed, so it can be typed again, and a loss is never only a log
+/// line. A line holds at most a band line of it, without its newlines, and only
+/// [`SETTINGS_DRAFTS_SHOWN`] drafts get one, so the whole text of every draft is
+/// saved apart (round eight of the update audit, lead U61) and `saved_in` names
+/// that file. `unreadable` drafts had no text this build could read; they are
+/// counted.
 pub(crate) fn settings_drafts_not_reopened(
     lost: &[crate::restore::SettingsDraftRestore],
     unreadable: usize,
+    saved_in: Option<&std::path::Path>,
 ) -> Message {
     let count = lost.len().saturating_add(unreadable);
     let title = if count == 1 {
@@ -829,6 +1022,12 @@ pub(crate) fn settings_drafts_not_reopened(
         0 => {}
         1 => m = m.line("1 draft could not be read"),
         n => m = m.line(format!("{n} drafts could not be read")),
+    }
+    if let Some(saved) = saved_in {
+        m = m.line(format!(
+            "the full text is saved in {}",
+            sanitize_for_tty(&saved.display().to_string(), DETAIL_LINE_CAP)
+        ));
     }
     m.sentence(
         "the update carried this unsaved text but this version could not put it back; type it \
@@ -941,11 +1140,105 @@ pub(crate) fn switch_started(target: Option<&str>, running: &str) -> Message {
         .hold(Hold::LogOnly)
 }
 
+/// THE COLD LANE WENT ON WITHOUT ITS QUIT LAYOUT (round eight of the update
+/// audit, U48): the data folder refused it for a reason no retry changes
+/// (`cause`), so the new version opens without the document and Settings tabs
+/// that were open — nothing unsaved, which the lane refuses to leave behind. A
+/// record, written before the switch, so the Messages page of the new version
+/// says why. No capsule: Software Update can neither bring the tabs back nor
+/// say more, and no apply outcome's key, as it is none.
+#[cfg(any(unix, test))]
+pub(crate) fn cold_lane_tabs_not_kept(cause: &str) -> Message {
+    row(Severity::Warn, "Open tabs not kept for the update")
+        .glyph(Severity::Warn.default_glyph())
+        .sentence(format!(
+            "aterm could not save which document and Settings tabs were open ({cause}), so the \
+             new version starts without them; no unsaved work was open"
+        ))
+        .hold(Hold::LogOnly)
+}
+
+/// A busy terminal, in the one spelling every busy stand-down takes.
+#[cfg(any(unix, test))]
+const BUSY: &str = "the terminal was busy";
+
+/// A stopped switch's reason in a person's words, as `(a substring of the
+/// reason, the words)`, keyed on the producers' own literals in
+/// `app_update_handoff.rs` and `native_update_auto_intent.rs`: the park
+/// gate's waits (a hold-cap stand-down names the last one it waited on, so
+/// they come first), the stand-downs and misses of both lanes, and the fork
+/// lane's activity refusals. A miss is read by its own reason, never by the
+/// every-rung stand-down that wraps it: that wrapper also carries a storage
+/// reservation that failed, which is no busy terminal. FIRST MATCH WINS.
+#[cfg(any(unix, test))]
+const STAND_DOWN_CAUSES: &[(&str, &str)] = &[
+    (
+        "a video recording is running",
+        "a video recording was running",
+    ),
+    (
+        "command has exited but its pane is still open",
+        "a tab's command had ended with its pane still open",
+    ),
+    (
+        "folder-access warm-up",
+        "a folder-access warm-up was still running",
+    ),
+    (
+        "a restore reopened are still being relaunched",
+        "the agents a restore reopened were still starting",
+    ),
+    ("inside the typing gap", "you were typing"),
+    (
+        "every terminal session closed",
+        "every tab closed while the new version started",
+    ),
+    (
+        "session closed during automatic reader park",
+        "a tab's command ended as the install began",
+    ),
+    (
+        "handoff policy is being read",
+        "the new version was still being checked",
+    ),
+    (
+        "pre-park verification is being read",
+        "the new version was still being checked",
+    ),
+    ("quiet epoch", BUSY),
+    ("output is still streaming", BUSY),
+    ("output waiting that its reader has not taken", BUSY),
+    ("input or PTY output arrived", BUSY),
+    ("handoff park deadline", BUSY),
+    ("capture exceeded", BUSY),
+    ("stayed busy", BUSY),
+    ("parked mid-sequence", BUSY),
+    ("activity revoked", BUSY),
+    ("ended ActivityRevoked", BUSY),
+    ("did not park within", BUSY),
+    ("proof deadline passed before the grant", BUSY),
+    ("within the hold cap", "the terminal never went quiet"),
+];
+
+/// What a stopped switch's `why` comes down to for a person: a stand-down's
+/// cause ([`STAND_DOWN_CAUSES`]), else a failure the apply lane can name
+/// ([`crate::update_apply_trouble::named_clause`]); `None` for anything
+/// else, whose account stays in aterm.log.
+#[cfg(any(unix, test))]
+fn stopped_cause(why: &str) -> Option<&'static str> {
+    STAND_DOWN_CAUSES
+        .iter()
+        .find(|(key, _)| why.contains(key))
+        .map(|(_, words)| *words)
+        .or_else(|| crate::update_apply_trouble::named_clause(why))
+}
+
 /// THE SWITCH THAT DID NOT HAPPEN, on record: an attempt [`switch_started`]
 /// wrote down ended with this process still running — refused, failed, or
 /// stood down by itself to try again (`routine`) — so the record never
 /// leaves an "Installing" that was not. `why` is the attempt's own account,
-/// whole, in every arm.
+/// said in a person's words ([`stopped_cause`]); the raw account is
+/// aterm.log's.
 #[cfg(any(unix, test))]
 pub(crate) fn switch_stopped(
     target: Option<&str>,
@@ -953,29 +1246,37 @@ pub(crate) fn switch_stopped(
     routine: bool,
     why: &str,
 ) -> Message {
-    let running = aterm_v(running);
-    let (title, detail) = match (target, routine) {
-        // THE STAND-DOWN'S OWN REASON (round six, finding 43): a routine
-        // stand-down is a busy machine, a hold spent on a video take or a
-        // hung-up pane, or every session closing as often as it is typing —
-        // "you were typing" blamed the person for all of them and dropped
-        // the reason the attempt carried.
-        (Some(version), true) => (
-            format!("Waiting to install {}", aterm_v(version)),
-            format!("{running} kept running: {why}; it {TRIES_AGAIN}"),
-        ),
-        (Some(version), false) => (
-            format!("Couldn't install {}", aterm_v(version)),
-            format!("{running} kept running: {why}"),
-        ),
-        (None, true) => (
-            "Waiting to reload aterm".to_string(),
-            format!("aterm kept running: {why}; it {TRIES_AGAIN}"),
-        ),
-        (None, false) => (
-            "Couldn't reload aterm".to_string(),
-            format!("aterm kept running: {why}"),
-        ),
+    let running = target.map_or_else(|| "aterm".to_string(), |_| aterm_v(running));
+    // THE STAND-DOWN'S OWN REASON (round six, finding 43): a routine
+    // stand-down is a busy machine, a hold spent on a video take or a
+    // hung-up pane, or every session closing as often as it is typing —
+    // "you were typing" blamed the person for all of them and dropped the
+    // reason the attempt carried. Spliced in its producers' words it then read
+    // "the park missed its budget on every rung (…); … the ladder retries; it
+    // tries again by itself" (audit 2026-09-29).
+    // A desk past a cap says which cap and by how much, in the refusal's own
+    // words, on a person's press as on the lane's retry ([`past_cap_cause`]).
+    // A cap refuses every try until something closes, so its retry says so,
+    // as `capture_refused_waiting` does.
+    let past_cap = past_cap_cause(why);
+    let kept = match past_cap.or_else(|| stopped_cause(why)) {
+        Some(cause) => format!("{running} kept running: {cause}"),
+        None => format!("{running} kept running"),
+    };
+    let detail = if routine {
+        let tail = if past_cap.is_some() {
+            "tries again when you close some"
+        } else {
+            TRIES_AGAIN
+        };
+        format!("{kept}; it {tail}")
+    } else {
+        kept
+    };
+    let title = match (target, routine) {
+        (_, true) => waiting_to_install(Some(target)),
+        (Some(version), false) => format!("Couldn't install {}", aterm_v(version)),
+        (None, false) => "Couldn't reload aterm".to_string(),
     };
     row(
         if routine {
@@ -988,6 +1289,95 @@ pub(crate) fn switch_stopped(
     .glyph(glyph(if routine { NOTED } else { NEEDS_YOU }))
     .sentence(detail)
     .hold(Hold::LogOnly)
+}
+
+/// The title of a switch the lane will make again by itself: the version it
+/// waits to install (`Some(Some(_))`), a reload of this build (`Some(None)`),
+/// or no switch on record (`None`).
+#[cfg(any(unix, test))]
+pub(crate) fn waiting_to_install(switch: Option<Option<&str>>) -> String {
+    match switch {
+        Some(Some(version)) => format!("Waiting to install {}", aterm_v(version)),
+        Some(None) => "Waiting to reload aterm".to_string(),
+        None => "Update waiting".to_string(),
+    }
+}
+
+/// `said`, then — after ` · ` — the apply failure `reason` in a person's words
+/// when the apply lane can name it ([`crate::update_apply_trouble::named_clause`]),
+/// never the ledger's own text ("overlap handoff failed safely: handoff proof
+/// ended ChildDied"), which stays in aterm.log.
+pub(crate) fn with_named_cause(said: &str, reason: &str) -> String {
+    match crate::update_apply_trouble::named_clause(reason) {
+        Some(cause) => format!("{said} \u{b7} {cause}"),
+        None => said.to_string(),
+    }
+}
+
+/// What `CaptureRefusal`'s Display puts ahead of a refusal of the open tabs
+/// together; the refusal's own words follow it.
+#[cfg(any(unix, test))]
+const CAPTURE_REFUSED: &str = "the park's capture refused: ";
+
+/// What a capture refusal past a cap no update carries says is past it and
+/// where (`restore::RestoreManifest::why_not_whole`), without the refusal's
+/// prefix; `None` for any other account.
+#[cfg(any(unix, test))]
+fn past_cap_cause(why: &str) -> Option<&str> {
+    why.contains(crate::restore::UPDATE_CAP_KEY).then(|| {
+        why.split_once(CAPTURE_REFUSED)
+            .map_or(why, |(_, cause)| cause)
+    })
+}
+
+/// Whether a capture refusal names ONE tab (`CaptureRefusal`'s "the park's
+/// capture refused session N: …") rather than the open tabs together — their
+/// layout, or their records over what one handover carries, which no single
+/// tab changing is owed to (audit 2026-09-29).
+#[cfg(any(unix, test))]
+fn capture_refusal_names_a_tab(message: &str) -> bool {
+    message.contains("refused session")
+}
+
+/// The record of a capture refusal the lane retries by itself, once the tabs
+/// change, scoped by [`capture_refusal_names_a_tab`] — and, for the open tabs'
+/// records over what one handover carries, in the Version menu's words for
+/// that cause ([`crate::update_apply_trouble::named_clause`]): closing tabs is
+/// what lets it through.
+///
+/// `spacing_left` is how long the lane holds the next try however the tabs
+/// change (`App::capture_refusal_spacing_left`). A refusal that came back
+/// waits 10, then 30 minutes (`app_native::capture_refusal_spacing`), and the
+/// record says so (round eight of the update audit, U43 review): told only
+/// "tries again when you close some", a person who closes tabs saw nothing
+/// happen for half an hour. Within one probe it says nothing more: the lane
+/// looks again that soon anyway.
+#[cfg(any(unix, test))]
+pub(crate) fn capture_refused_waiting(message: &str, spacing_left: Duration) -> String {
+    // A CAP no update carries past says what is past it and where, as the
+    // refusal words it (`restore::RestoreManifest::why_not_whole`): closing
+    // some is what lets it through.
+    let past_cap;
+    let said = if let Some(cause) = past_cap_cause(message) {
+        past_cap = format!("{cause} \u{b7} tries again when you close some");
+        past_cap.as_str()
+    } else if capture_refusal_names_a_tab(message) {
+        "one tab couldn't move to the new version \u{b7} tries again when that tab changes"
+    } else if crate::update_apply_trouble::named_clause(message)
+        == Some(crate::update_apply_trouble::TABS_OVER_HANDOVER)
+    {
+        "too many tabs were open to move to the new version at once \u{b7} tries again when \
+         you close some"
+    } else {
+        "the open tabs couldn't move to the new version \u{b7} tries again when the tabs change"
+    };
+    if spacing_left <= crate::app_native::CAPTURE_REFUSAL_PROBE {
+        return said.to_string();
+    }
+    match spacing_left.as_secs().div_ceil(60) {
+        1 => format!("{said}, in a minute at the soonest"),
+        minutes => format!("{said}, in {minutes} minutes at the soonest"),
+    }
 }
 
 /// R37 — an apply-lane OUTCOME the lane answers BY ITSELF, on record (ruling
@@ -1059,12 +1449,16 @@ pub(crate) fn needs_install_because(
 }
 
 /// The few words a failure's own message comes down to, where they change
-/// what the person does (design ruling 246): `disk full`, `no permission`,
-/// `read-only disk`; `None` for anything else, whose account stays behind
-/// `Details ›` and in the log.
+/// what the person does (design ruling 246): `folder not writable` (the install
+/// location's refusal, `aterm_update::INSTALL_LOCATION_REFUSAL_KEY` — round
+/// eight, finding 14: the probe's own error is not in it, so the row named no
+/// cause at all), `disk full`, `no permission`, `read-only disk`; `None` for
+/// anything else, whose account stays behind `Details ›` and in the log.
 pub(crate) fn short_cause(message: &str) -> Option<&'static str> {
     let m = message.to_ascii_lowercase();
-    if m.contains("no space left") || m.contains("enospc") || m.contains("disk full") {
+    if aterm_update::is_install_location_refusal(&m) {
+        Some("folder not writable")
+    } else if m.contains("no space left") || m.contains("enospc") || m.contains("disk full") {
         Some("disk full")
     } else if m.contains("read-only file system") || m.contains("erofs") {
         Some("read-only disk")
@@ -1098,18 +1492,51 @@ pub(crate) fn failed(title: &str, detail: &str, actionable: bool) -> Message {
     }
 }
 
+/// THE AUTOMATIC LANE HELD BY A PERSON'S UNSAVED WORK (round eight of the update
+/// audit, lead U38): `blocker`, the one thing the person does, painted as
+/// [`failed`]'s actionable row paints it. The one wait the lane cannot outlast,
+/// and the overdue notice is off while it holds (`App::update_lands_by_itself`),
+/// so the row STANDS rather than folding after a warning's 45 s: until the work
+/// is saved and the next attempt answers otherwise (withdrawn), until the update
+/// lands (withdrawn by the landing), or until the person reads it — the one
+/// notice of a wait with no deadline (L5). Raised where the lane retries by
+/// itself; a press that nothing retries keeps [`failed`]'s transient row.
+pub(crate) fn waits_for_you(blocker: &str) -> Message {
+    row(
+        Severity::Warn,
+        sanitize_for_tty(crate::app_update_screen::UPDATE_WAITS_FOR_YOU, 80),
+    )
+    .glyph(glyph(NEEDS_YOU))
+    .sentence(blocker)
+    .now(Ask::standing(
+        StandingWhy::OnlyYou(Reason::new(
+            "the update cannot carry unsaved work, and only you can keep it",
+        )),
+        // One action (`Step::fault`), named by the work that holds the update.
+        Then::step(match blocker {
+            crate::App::UNSAVED_SETTINGS_BLOCKS_APPLY => "Save the unsaved text in Settings",
+            crate::App::UNSAVED_EDITOR_AND_SETTINGS_BLOCK_APPLY => {
+                "Save the work in the open editor and in Settings"
+            }
+            _ => "Save the work in the open editor",
+        }),
+    ))
+    .key(KEY_WAITS_FOR_YOU)
+}
+
 /// R38 — THE CHECK-HEALTH WARNING. The updater's ledger says one half of the
 /// lane is PERSISTENTLY failing, and the title says which in plain words
 /// ("Couldn't install updates" / "download" / "check for",
 /// `aterm_update::health_failing_title`). The excerpt is since when ("since
-/// Sep 14"); the updater's whole sentence — the count, the cause, the command
-/// — is the further detail behind `Details ›` (the backticked command
-/// survives the width law), and `Software Update` is the capsule. Held the
+/// Sep 14"); the updater's whole sentence — the count and the cause — is the
+/// further detail behind `Details ›`, and `Software Update` is the capsule. Held the
 /// warning's 45 s, anchored at first glass — ONCE PER CLASS PER LAUNCH (the
-/// updater announces a class once; a count change is a log line): a ⚠
-/// standing for weeks with nothing to press is the blather the attention rule
-/// moves to the log (design ruling 59). After it folds, the record, the
-/// Settings headline and the OS banner carry it.
+/// updater announces a class once; a count change is a log line): a transient
+/// the door allows, never a standing row (design ruling 59). After it folds the
+/// RECORD (`update.health.<kind>`), the Settings headline carry it; what the
+/// failure earns after a day of the same kind is [`update_health_entry`], one
+/// dismissable line of the digest under its own key, and the OS banner is
+/// owed to one cause only (`App::post_update_health_banner`).
 ///
 /// Keyed by its `kind` (design ruling 311), never by its words: the heal and
 /// the latch read the key ([`HealthKind::of_row`]).
@@ -1123,6 +1550,106 @@ pub(crate) fn health_warning(kind: HealthKind, title: &str, body: &str) -> Messa
         .action(software_update())
         .hold(Hold::Default)
         .key(kind.key())
+}
+
+/// How long a failing kind goes on before it is worth a line of the digest:
+/// the engine's named horizon ([`aterm_messages::need::Horizon::UPDATES_FAILING`],
+/// 24 h since the streak began).
+pub(crate) const HEALTH_ENTRY_AFTER: Duration =
+    aterm_messages::need::Horizon::UPDATES_FAILING.duration();
+
+/// How much of [`HEALTH_ENTRY_AFTER`] is left for a failure whose sentence dates
+/// its streak (`body`, [`aterm_update::health_notice_since`]) at `now_unix`: the
+/// ledger's own start, so a process that starts on day six of a failing lane
+/// says it at once, and a restart never begins the day again. A warning a
+/// parent older than the sentence's carry handed over is its excerpt alone
+/// (`since Sep 14`), read by [`health_excerpt_since`]. A sentence with no
+/// readable start (the watchdogs' own) counts from now.
+pub(crate) fn health_entry_delay(body: &str, now_unix: i64) -> Duration {
+    let since = aterm_update::health_notice_since(body)
+        .and_then(aterm_types::rfc3339::parse_utc)
+        .or_else(|| health_excerpt_since(body, now_unix));
+    let elapsed = since.map_or(0, |since| now_unix.saturating_sub(since).max(0));
+    HEALTH_ENTRY_AFTER.saturating_sub(Duration::from_secs(u64::try_from(elapsed).unwrap_or(0)))
+}
+
+/// The start a carried warning's excerpt dates (`since Sep 14`, [`health_since`]'s
+/// words) at `now_unix`: the END of that UTC day, in the latest year whose day has
+/// begun by now — never earlier than the streak began, so the digest's day is not
+/// cut short. `None` for any other line.
+fn health_excerpt_since(line: &str, now_unix: i64) -> Option<i64> {
+    let (month, day) = line.strip_prefix("since ")?.split_once(' ')?;
+    let month = MONTHS.iter().position(|m| *m == month)? + 1;
+    let day: u32 = day.parse().ok()?;
+    let now = aterm_types::rfc3339::format_rfc3339(u64::try_from(now_unix).ok()?);
+    let year: i64 = now.get(..4)?.parse().ok()?;
+    [year, year - 1].into_iter().find_map(|year| {
+        let end =
+            aterm_types::rfc3339::parse_utc(&format!("{year:04}-{month:02}-{day:02}T23:59:59Z"))?;
+        (end - 86_399 <= now_unix).then_some(end)
+    })
+}
+
+/// THE DIGEST'S LINE for a kind of update failure that has gone on for a day
+/// ([`HEALTH_ENTRY_AFTER`]): under the key `update.review.<kind>`, never the
+/// record's `update.health.<kind>`. It says what is wrong, why it is the
+/// owner's and not aterm's, and the one place to go. Warn (updates that never
+/// arrive are the one silent decay worth ranking first), and quiet for a week
+/// once dismissed.
+pub(crate) fn update_health_entry(kind: HealthKind, body: &str) -> Entry {
+    let (what, why, then) = match kind {
+        HealthKind::Install => (
+            "Updates are not installing",
+            "a downloaded, verified update hasn\u{2019}t installed on this Mac",
+            "Open Software Update and read the cause",
+        ),
+        HealthKind::Download => (
+            "Updates are not downloading",
+            "updates will not download or verify here, and aterm cannot change why",
+            "Open Software Update and read the cause",
+        ),
+        HealthKind::Check => (
+            "Update checks keep failing",
+            "the newest release cannot be read or trusted from this Mac",
+            "Open Software Update and read the cause",
+        ),
+        HealthKind::Stalled => (
+            "The update check stopped",
+            "the update check stopped answering and is not coming back on its own",
+            "Open Software Update and check by hand",
+        ),
+        HealthKind::LockHeld => (
+            CHECKER_LOCK_HELD_TITLE,
+            "it has held the update lock for a day (aterm.log names its pid when the lock \
+             records one); this aterm checks without it",
+            "Quit that aterm",
+        ),
+    };
+    let then = match kind {
+        HealthKind::LockHeld => Then::step(then),
+        _ => Then::press(
+            aterm_messages::need::Mover::open_settings(
+                crate::native_settings::SettingsRoute::SoftwareUpdate.path(),
+            ),
+            then,
+        ),
+    };
+    let mut entry = Entry::new(
+        Family::Update,
+        "",
+        kind.slug(),
+        what,
+        Why::OnlyYou(Reason::new(why)),
+        then,
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT);
+    if let Some(since) = health_since(body) {
+        entry = entry.more(format!("failing since {since}"));
+    }
+    entry
+        .more(sanitize_for_tty(body, 200))
+        .log_line(format!("update-health: {} for over a day", kind.slug()))
 }
 
 /// The title of the warning the window's watchdog raises when the update check
@@ -1140,6 +1667,12 @@ pub(crate) fn health_warning(kind: HealthKind, title: &str, body: &str) -> Messa
 /// Its kind is [`HealthKind::Stalled`] (design ruling 311): the words are no
 /// identity, and they say it the way the page's other rows do.
 pub(crate) const CHECKER_STALLED_TITLE: &str = "Update check stopped";
+
+/// The title of the warning the watchdog raises when ANOTHER aterm holds the
+/// machine's update check without making progress
+/// ([`checker_lock_held_body`]). Not [`CHECKER_STALLED_TITLE`]: this aterm's own
+/// check did not stop — it checks without waiting for the sibling.
+pub(crate) const CHECKER_LOCK_HELD_TITLE: &str = "Another aterm's update check is stuck";
 
 /// Every title the watchdog's warning has worn, today's first: a row an older
 /// build carried under the family key is read back to its kind by these
@@ -1183,15 +1716,12 @@ pub(crate) fn checker_stalled_body(
         }
         (false, _) => "aterm could not start a fresh one",
     };
-    format!(
-        "the update check stopped answering {minutes} min ago while {doing}; {then}. Run \
-         `aterm ctl update status` for details."
-    )
+    format!("the update check stopped answering {minutes} min ago while {doing}; {then}.")
 }
 
 /// A SIBLING HOLDS THE MACHINE'S UPDATE CHECK (round four of the 2026-09 update
 /// robustness work, plan item 14): the body of the warning the window's watchdog
-/// raises under [`CHECKER_STALLED_TITLE`] when this process's check loop has
+/// raises under [`CHECKER_LOCK_HELD_TITLE`] when this process's check loop has
 /// found `checker.lock` held past its bound `cycles` times in a row by a holder
 /// that showed no progress (`aterm_update::checker_watch::CHECKER_UNGATED_AFTER`
 /// or more). A holder still checking — a long download included — rewrites the
@@ -1209,7 +1739,7 @@ pub(crate) fn checker_lock_held_body(cycles: u64) -> String {
     format!(
         "another aterm has held the update check's lock through the last {cycles} checks \
          without finishing — it may be stopped or hung. This aterm checks for updates \
-         without waiting for it. Run `aterm ctl update status` for details."
+         without waiting for it."
     )
 }
 
@@ -1226,16 +1756,31 @@ pub(crate) fn health_recovered(said_title: &str, said_line0: &str) -> Message {
         .hold(Hold::LogOnly)
 }
 
-/// The OS notification's body for the same warning: when it started and where
-/// the rest is. The updater's whole sentence — the count, a raw timestamp, the
-/// cause and a command — is the log's and Software Update's, never a banner's.
-/// "aterm Settings", never a bare "Settings ▸ Software Update", which is also
-/// where macOS keeps its own updates.
+/// The OS notification's body for the same warning: when it started, what the
+/// person does about it (the banner opens only when a person must act) and
+/// where the rest is. The updater's whole sentence — the count, a raw
+/// timestamp, the cause and a command — is the log's and Software Update's,
+/// never a banner's. "aterm Settings", never a bare "Settings ▸ Software
+/// Update", which is also where macOS keeps its own updates.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn health_notification_body(body: &str) -> String {
+pub(crate) fn health_notification_body(
+    body: &str,
+    remedy: crate::update_apply_trouble::PersonRemedy,
+) -> String {
+    let todo = remedy.row_tail();
     match health_since(body) {
-        Some(since) => format!("Since {since}. Details: aterm Settings \u{25b8} Software Update."),
-        None => "Details: aterm Settings \u{25b8} Software Update.".to_string(),
+        Some(since) => {
+            format!("Since {since}: {todo}. Details: aterm Settings \u{25b8} Software Update.")
+        }
+        None => {
+            let mut chars = todo.chars();
+            let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+            format!(
+                "{}{}. Details: aterm Settings \u{25b8} Software Update.",
+                first.unwrap_or_default(),
+                chars.as_str()
+            )
+        }
     }
 }
 
@@ -1254,12 +1799,14 @@ pub(crate) fn health_notification_title(title: &str) -> String {
     format!("aterm \u{00b7} {lowered}")
 }
 
+/// The month words of [`health_since`] and its reader, [`health_excerpt_since`].
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 /// "Sep 14": the day the updater's sentence dates the failure from
 /// ([`aterm_update::health_notice_since`]), or `None` without a readable one.
 pub(crate) fn health_since(body: &str) -> Option<String> {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     let stamp = aterm_update::health_notice_since(body)?;
     let month: usize = stamp.get(5..7)?.parse().ok()?;
     let day: u32 = stamp.get(8..10)?.parse().ok()?;
@@ -1269,7 +1816,7 @@ pub(crate) fn health_since(body: &str) -> Option<String> {
 /// The supersede key of a dev build's standing (gap #30): the newest standing a
 /// process read replaces the last.
 pub(crate) const KEY_DEV_BUILD: &str = "update.dev-build";
-/// The key of a dev build's shared-writes row ([`dev_build_writes`]) — never
+/// The key of a dev build's shared-writes row ([`dev_build_entry`]) — never
 /// [`KEY_DEV_BUILD`]: what this copy writes is its own fact, said at launch, and no
 /// reading of the channel may supersede it.
 pub(crate) const KEY_DEV_BUILD_WRITES: &str = "update.dev-build-writes";
@@ -1318,23 +1865,31 @@ pub struct DevSharedWrites {
 /// A DEV BUILD THAT WRITES THE RELEASE'S SETUP (gap #30): a dev-marked copy whose
 /// bundle is named `aterm.app` runs the writers of shared user state only the release
 /// runs unattended ([`dev_shared_writes`]). That is a failure only the person can
-/// undo: a Standing ROW, saying what it writes (the painted excerpt) and what puts it
-/// back. The loss — the release's setup — is the title, as the failure grammar names
-/// one. It is this copy's own fact, read from its bundle and its switches when the
-/// window starts, so it is said whatever the channel answers — offline, or with
+/// undo, but not one that needs them NOW: it was a Standing ROW with no button (a
+/// persistent row the owner could do nothing about at that moment), and under the
+/// owner's rule (2026-09-28) it is an ENTRY of the digest — "To look at" — saying
+/// what it writes and the one thing that puts it back, quiet for a month once
+/// dismissed. The loss — the release's setup — is the title, as the failure grammar
+/// names one. It is this copy's own fact, read from its bundle and its switches when
+/// the window starts, so it is said whatever the channel answers — offline, or with
 /// automatic checks off — and never waits on [`dev_build`]'s reading.
-pub(crate) fn dev_build_writes(writes: DevSharedWrites) -> Message {
+pub(crate) fn dev_build_entry(writes: DevSharedWrites) -> Entry {
     let DevSharedWrites { what, repair } = writes;
-    row(Severity::Warn, "Release setup lost to dev build")
-        .glyph(glyph(NEEDS_YOU))
-        .line(format!("it writes {what}"))
-        .line("this dev build's bundle is named aterm.app, which only the release may be")
-        .sentence(format!(
-            "rebuild it with tools/dev-app.sh, which installs it as aterm (dev).app, and remove \
-             this copy, then run {repair} from the release"
-        ))
-        .hold(Hold::Standing)
-        .key(KEY_DEV_BUILD_WRITES)
+    Entry::new(
+        Family::Update,
+        "dev-build",
+        "writes",
+        "Release setup lost to dev build",
+        Why::OnlyYou(Reason::new(format!("this dev build overwrote {what}"))),
+        Then::step(format!("run {repair} from the release")),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::CHOICE)
+    .more("this dev build's bundle is named aterm.app, which only the release may be")
+    .more(
+        "rebuild it with tools/dev-app.sh, which installs it as aterm (dev).app, and remove \
+         this copy",
+    )
 }
 
 /// A DEV BUILD'S STANDING AGAINST THE CHANNEL (gap #30, 2026-09-26). The updater
@@ -1352,7 +1907,7 @@ pub(crate) fn dev_build_writes(writes: DevSharedWrites) -> Message {
 /// * AT or NEWER THAN the newest release — nothing: the watch's log line keeps it.
 ///
 /// What a dev build WRITES of the release's shared setup is not the channel's to say:
-/// [`dev_build_writes`] is its own row, said at launch whatever the channel answers.
+/// [`dev_build_entry`] is its own row, said at launch whatever the channel answers.
 pub(crate) fn dev_build(lag: &aterm_update::dev_channel::DevLag) -> Option<Message> {
     let standing = lag.words();
     if !lag.is_behind() {
@@ -1388,6 +1943,71 @@ mod tests {
 
     fn busy(msg: &Message) -> bool {
         msg.meter.as_ref().is_some_and(|m| m.busy)
+    }
+
+    /// D5's record (round eight of the update audit, #505): a calm record on
+    /// glass, by what was folded — windows merged into tabs, tabs moved to
+    /// another window, both — singular and plural, and nothing at all for a
+    /// layout that folded nothing.
+    #[test]
+    fn a_folded_desk_is_said_as_a_calm_record() {
+        use crate::restore::LayoutFold;
+        assert!(layout_folded(&LayoutFold::default()).is_none());
+        assert!(
+            layout_folded(&LayoutFold {
+                front: vec![7],
+                ..LayoutFold::default()
+            })
+            .is_none(),
+            "a front list alone moved nothing"
+        );
+        let said = |windows, tabs| {
+            let m = layout_folded(&LayoutFold {
+                windows,
+                tabs,
+                front: vec![0],
+            })
+            .expect("something folded");
+            assert_eq!(m.severity, Severity::Info, "a record, never a warning");
+            assert_eq!(m.glyph, glyph(NOTED));
+            assert_eq!(m.hold, Hold::Default, "on glass");
+            assert_eq!(m.key.as_deref(), Some(KEY_LAYOUT_FOLDED));
+            (m.title.clone(), m.detail.clone())
+        };
+        assert_eq!(
+            said(6, 0),
+            (
+                "6 windows were merged into tabs during the update".to_string(),
+                vec![
+                    "an update brings back at most 64 windows: the tabs of the rest are in the \
+                     last one"
+                        .to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            said(1, 0).0,
+            "1 window was merged into tabs during the update"
+        );
+        assert_eq!(
+            said(0, 44),
+            (
+                "44 tabs were moved to another window during the update".to_string(),
+                vec![
+                    "a window holds at most 256 tabs: the tabs past that are in the next \
+                     window with room"
+                        .to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            said(0, 1).0,
+            "1 tab was moved to another window during the update"
+        );
+        let (title, detail) = said(2, 4);
+        assert_eq!(title, "2 windows were merged into tabs during the update");
+        assert_eq!(detail[1], "4 tabs moved to another window too");
+        assert_eq!(detail.len(), 3);
     }
 
     /// Everything a dev build named aterm.app writes with both switches on.
@@ -1478,37 +2098,43 @@ mod tests {
         }
     }
 
-    /// A DEV BUILD NAMED aterm.app, which runs the release's unattended writers, is a
-    /// Standing FAILURE row of its own — keyed apart from the standing, so no reading
+    /// A DEV BUILD NAMED aterm.app, which runs the release's unattended writers, is
+    /// an ENTRY of the digest of its own — keyed apart from the standing, so no reading
     /// of the channel supersedes it — saying what it writes and the release's verb that
-    /// puts EACH thing back: `aterm pkg repair` never touches the agent primer, so a
-    /// row that names the primer names `aterm agents install` (measured: the one row
-    /// seen live said "it writes the agent primer").
+    /// puts EACH thing back: `aterm pkg repair` never touches the agent primer, so an
+    /// entry that names the primer names `aterm agents install` (measured: the one row
+    /// seen live said "it writes the agent primer"). It was a Standing row with no
+    /// button; a persistent row the owner can do nothing about NOW is the alert the
+    /// rule forbids.
     #[test]
     fn a_dev_build_that_writes_the_release_setup_says_what_and_what_puts_it_back() {
-        use crate::message_reporters::{Attention, attention};
-        let row = dev_build_writes(ALL_WRITES);
-        assert_eq!(row.severity, Severity::Warn);
-        assert_eq!(row.hold, Hold::Standing);
-        assert_eq!(row.key.as_deref(), Some(KEY_DEV_BUILD_WRITES));
+        let entry = dev_build_entry(ALL_WRITES);
+        let msg = entry.message().expect("the words pass the rule");
+        assert_eq!(msg.severity, Severity::Warn);
+        assert_eq!(msg.hold, Hold::LogOnly, "an entry is never a band row");
+        assert_eq!(entry.key(), "update.review.dev-build.writes");
         assert_ne!(
-            row.key.as_deref(),
+            msg.key.as_deref(),
             Some(KEY_DEV_BUILD),
             "the channel never supersedes it"
         );
-        assert_eq!(attention(&row), Ok(Attention::Failure));
+        assert_ne!(
+            msg.key.as_deref(),
+            Some(KEY_DEV_BUILD_WRITES),
+            "an exception never shares a key with a row or a record"
+        );
         assert!(
-            row.title.contains("lost"),
+            msg.title.contains("lost"),
             "the loss is named: {}",
-            row.title
+            msg.title
         );
-        assert_eq!(aterm_messages::text::glass_title_fault(&row.title), None);
-        assert_eq!(
-            row.detail[0],
-            format!("it writes {}", ALL_WRITES.what),
-            "it says what it writes"
+        assert_eq!(aterm_messages::text::glass_title_fault(&msg.title), None);
+        assert!(
+            msg.detail[0].contains(ALL_WRITES.what),
+            "it says what it writes: {:?}",
+            msg.detail
         );
-        let said = row.detail.join(" ");
+        let said = msg.detail.join(" ");
         assert!(said.contains("`aterm pkg repair`"), "{said}");
         assert!(said.contains("`aterm agents install`"), "{said}");
         assert!(said.contains("tools/dev-app.sh"), "{said}");
@@ -1537,8 +2163,11 @@ mod tests {
                 assert_eq!(dev_shared_writes(true, packages, prime), None);
             }
         }
-        let only_primer = dev_build_writes(primer);
-        assert_eq!(only_primer.detail[0], "it writes the agent primer");
+        let only_primer = dev_build_entry(primer).message().expect("the words pass");
+        assert_eq!(
+            only_primer.detail[0],
+            "this dev build overwrote the agent primer"
+        );
         let said = only_primer.detail.join(" ");
         assert!(said.contains("`aterm agents install`"), "{said}");
         assert!(
@@ -1559,6 +2188,7 @@ mod tests {
             },
             P::ManualOnlyLatched { lapses: true },
             P::ManualOnlyLatched { lapses: false },
+            P::TrialSpent,
         ];
         postures.extend(HandoffUnavailable::ALL.map(|why| P::HandoffDisabled { why, veto: None }));
         for why in HandoffUnavailable::ALL {
@@ -1693,6 +2323,7 @@ mod tests {
             staged("0.48.0", 7, Some(ApplyPosture::Automatic)),
             staged("0.48.0", 7, Some(ApplyPosture::ManualByConfig)),
             download_postponed("later"),
+            download_withheld("0.48.0", "held: build 7 is quarantined"),
             download_failed("0.48.0", "zip sha256 mismatch"),
             installing("0.48.0"),
             finishing("0.48.0"),
@@ -1713,11 +2344,15 @@ mod tests {
             scrollback_lost(12_345, 3),
             scrollback_lost(1, 1),
             scrollback_withheld(12_345, 3),
-            scrollback_left_behind(12_345, 3, 10_000),
-            settings_drafts_not_reopened(&[draft("font_family", "Menlo")], 0),
-            settings_drafts_not_reopened(&[], 2),
+            scrollback_left_behind(12_345, 3, 10_000, 0, 0),
+            scrollback_left_behind(12_345, 3, 0, 345, 0),
+            scrollback_left_behind(12_345, 3, 0, 0, 345),
+            settings_drafts_not_reopened(&[draft("font_family", "Menlo")], 0, None),
+            settings_drafts_not_reopened(&[], 2, None),
             dev_build(&dev_behind()).expect("a record"),
-            dev_build_writes(ALL_WRITES),
+            dev_build_entry(ALL_WRITES)
+                .message()
+                .expect("the words pass"),
         ];
         for m in &rows {
             assert_eq!(m.tag, tags::UPDATE, "{}", m.title);
@@ -1739,6 +2374,30 @@ mod tests {
         for ch in [FLOW_GLYPH, NEEDS_YOU, MOVING_IN, NOTED, READY] {
             assert!(Glyph::new(ch).is_some(), "{ch:?} is in the closed set");
         }
+    }
+
+    /// A build whose next start its boot trial rolls back is not READY: its
+    /// record is Info with `ℹ`, `aterm vX is on hold`, and its sentence names
+    /// the newer release — never `✓ … is ready` beside the stranded warning.
+    #[test]
+    fn a_spent_trial_is_recorded_on_hold_not_ready() {
+        let m = staged("0.95.0", 11, Some(ApplyPosture::TrialSpent));
+        assert_eq!(m.title, "aterm v0.95.0 is on hold");
+        assert_eq!(m.severity, Severity::Info);
+        assert_eq!(m.glyph.ch(), NOTED);
+        assert_eq!(m.hold, Hold::LogOnly);
+        assert!(m.actions.is_empty(), "no press");
+        assert!(
+            m.detail
+                .iter()
+                .any(|line| line.contains(NEWER_RELEASE_REPLACES)),
+            "{:?}",
+            m.detail
+        );
+        // The lane's own record is still the ready build.
+        let ready = staged("0.95.0", 11, Some(ApplyPosture::Automatic));
+        assert_eq!(ready.title, staged_title("0.95.0"));
+        assert_eq!(ready.glyph.ch(), READY);
     }
 
     /// ONE UPDATE, ONE ROW, A TITLE PER PHASE (ruling 143): every phase from
@@ -1850,6 +2509,25 @@ mod tests {
             m.detail,
             vec!["the network is metered; checking again in 10 min"]
         );
+        // A withheld release is a record too, and never says it failed or retries
+        // (round eight #72).
+        let m = progress(
+            &P::Withheld {
+                detail: "held: build 7 was signed by machine m11, which the machine roster \
+                         has revoked"
+                    .into(),
+            },
+            None,
+            "0.48.0",
+        );
+        assert_eq!(m.title, "Not installing aterm v0.48.0");
+        assert_eq!(m.hold, Hold::LogOnly);
+        assert_eq!(m.key, None);
+        assert!(
+            !m.detail.iter().any(|d| d.contains("again")),
+            "{:?}",
+            m.detail
+        );
         // No version to name: the re-exec QA seam.
         assert_eq!(flow_title("Installing", ""), "Installing update");
         assert_eq!(Severity::Warn.default_hold(), HOLD_WARN);
@@ -1891,6 +2569,7 @@ mod tests {
             ),
             progress(&P::Failed { detail: "x".into() }, None, "0.91.0"),
             progress(&P::Deferred { detail: "x".into() }, None, "0.91.0"),
+            progress(&P::Withheld { detail: "x".into() }, None, "0.91.0"),
             installing("0.91.0"),
             installing(""),
             finishing("0.91.0"),
@@ -1924,19 +2603,27 @@ mod tests {
                 crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
                 true,
             ),
+            waits_for_you(crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY),
+            waits_for_you(crate::App::UNSAVED_SETTINGS_BLOCKS_APPLY),
+            waits_for_you(crate::App::UNSAVED_EDITOR_AND_SETTINGS_BLOCK_APPLY),
             health_recovered("Couldn't install updates", "since Sep 14"),
             staged("0.91.0", 7, None),
             scrollback_lost(12_345, 3),
             scrollback_withheld(12_345, 3),
-            scrollback_left_behind(12_345, 3, 10_000),
-            settings_drafts_not_reopened(&[draft("font_family", "Menlo")], 1),
+            scrollback_left_behind(12_345, 3, 10_000, 0, 0),
+            scrollback_left_behind(12_345, 3, 0, 345, 0),
+            scrollback_left_behind(12_345, 3, 0, 0, 345),
+            settings_drafts_not_reopened(&[draft("font_family", "Menlo")], 1, None),
         ];
         for lag in every_dev_standing() {
             all.extend(dev_build(&lag));
         }
         for packages in [false, true] {
             for prime in [false, true] {
-                all.extend(dev_shared_writes(false, packages, prime).map(dev_build_writes));
+                all.extend(
+                    dev_shared_writes(false, packages, prime)
+                        .map(|w| dev_build_entry(w).message().expect("the words pass")),
+                );
             }
         }
         for posture in every_posture() {
@@ -2016,7 +2703,14 @@ mod tests {
                 assert!(!m.excerpt, "the capsule is the press");
                 assert!(!busy(&m), "a ready row waits; it does not move");
             } else {
-                assert_eq!(m.title, "aterm v0.67.0 is ready", "{posture:?}");
+                // A spent boot trial is on hold, not ready: no start of it may
+                // be offered.
+                let title = if posture == P::TrialSpent {
+                    "aterm v0.67.0 is on hold"
+                } else {
+                    "aterm v0.67.0 is ready"
+                };
+                assert_eq!(m.title, title, "{posture:?}");
                 assert_eq!(m.hold, Hold::LogOnly, "{posture:?}: nothing to press");
                 assert!(m.meter.is_none());
             }
@@ -2244,12 +2938,12 @@ mod tests {
         let comfort = "the newest lines came across";
         let asked = "the new version asked this update to carry no scrollback";
 
-        let failed = scrollback_left_behind(12_345, 3, 0);
+        let failed = scrollback_left_behind(12_345, 3, 0, 0, 0);
         assert_eq!(failed, scrollback_lost(12_345, 3), "a failure is unchanged");
         assert!(text(&failed).contains(comfort), "{}", text(&failed));
         assert!(!text(&failed).contains(asked), "{}", text(&failed));
 
-        let withheld = scrollback_left_behind(12_345, 3, 12_345);
+        let withheld = scrollback_left_behind(12_345, 3, 12_345, 0, 0);
         assert_eq!(withheld, scrollback_withheld(12_345, 3));
         assert_eq!(withheld.title, "Update left scrollback behind");
         assert_eq!(
@@ -2263,7 +2957,7 @@ mod tests {
             text(&withheld)
         );
 
-        let mixed = scrollback_left_behind(12_345, 3, 10_000);
+        let mixed = scrollback_left_behind(12_345, 3, 10_000, 0, 0);
         assert_eq!(mixed.title, "Couldn't carry all scrollback");
         assert_eq!(mixed.detail[0], "12345 older lines stayed behind in 3 tabs");
         assert!(
@@ -2273,7 +2967,91 @@ mod tests {
         );
         assert!(!text(&mixed).contains("came across"), "{}", text(&mixed));
 
-        for m in [&failed, &withheld, &mixed] {
+        // A HELD PANE'S SCROLLBACK (round eight of the update audit, finding
+        // 39) left behind BY DESIGN — the hop carried its screen alone — is
+        // never said as a failure, and never as the new version's request.
+        let held = scrollback_left_behind(500, 1, 0, 500, 0);
+        assert_eq!(held.title, "Update left scrollback behind");
+        assert_eq!(held.detail[0], "500 older lines stayed behind in 1 tab");
+        // The count says why: the hop carried their screen alone.
+        assert_eq!(
+            held.detail[1],
+            "500 of them in panes kept open after their command ended, whose screen alone \
+             crossed",
+        );
+        assert!(
+            !text(&held).contains("came across") && !text(&held).contains(asked),
+            "{}",
+            text(&held)
+        );
+        let held_and_failed = scrollback_left_behind(12_345, 3, 0, 500, 0);
+        assert_eq!(held_and_failed.title, "Couldn't carry all scrollback");
+        assert!(
+            !text(&held_and_failed).contains("came across"),
+            "{}",
+            text(&held_and_failed)
+        );
+
+        // A HELD PANE WHOSE CARRY FAILED (the review of finding 39's fix: it
+        // was said as a held pane's by design) is a FAILURE — the failure's
+        // title, and a line naming the panes and the failure — but never with
+        // the failure row's "the newest lines came across": a held screen
+        // carries no line of its scrollback. Alone, and beside a handed tab's
+        // failure.
+        let held_carry_failed = scrollback_left_behind(500, 1, 0, 0, 500);
+        assert_eq!(held_carry_failed.title, "Couldn't carry all scrollback");
+        assert_eq!(
+            held_carry_failed.detail[0],
+            "500 older lines stayed behind in 1 tab"
+        );
+        assert!(
+            held_carry_failed.detail[1].starts_with(
+                "500 of them in panes kept open after their command ended, which this update \
+                 failed to carry"
+            ),
+            "{:?}",
+            held_carry_failed.detail
+        );
+        assert!(
+            !text(&held_carry_failed).contains("came across")
+                && !text(&held_carry_failed).contains("on screen")
+                && !text(&held_carry_failed).contains(asked),
+            "{}",
+            text(&held_carry_failed)
+        );
+        let held_failed_beside_a_tab = scrollback_left_behind(12_345, 3, 0, 0, 500);
+        assert_eq!(
+            held_failed_beside_a_tab.title,
+            "Couldn't carry all scrollback"
+        );
+        assert!(
+            !text(&held_failed_beside_a_tab).contains("came across"),
+            "{}",
+            text(&held_failed_beside_a_tab)
+        );
+        let by_design_and_failed = scrollback_left_behind(800, 2, 0, 300, 500);
+        assert_eq!(
+            by_design_and_failed.title, "Couldn't carry all scrollback",
+            "a failure among held panes is a failure"
+        );
+        assert!(
+            by_design_and_failed.detail[1].starts_with("300 of them in panes kept open")
+                && by_design_and_failed.detail[2].starts_with("500 of them in panes kept open")
+                && by_design_and_failed.detail[2].ends_with("which this update failed to carry"),
+            "one line per cause: {:?}",
+            by_design_and_failed.detail
+        );
+
+        for m in [
+            &failed,
+            &withheld,
+            &mixed,
+            &held,
+            &held_and_failed,
+            &held_carry_failed,
+            &held_failed_beside_a_tab,
+            &by_design_and_failed,
+        ] {
             assert_eq!(m.severity, Severity::Warn, "{}", m.title);
             assert_eq!(m.hold, Hold::Default, "a loss is on glass: {}", m.title);
             assert_eq!(m.key.as_deref(), Some(KEY_SCROLLBACK), "{}", m.title);
@@ -2294,7 +3072,7 @@ mod tests {
     /// opens Settings, and never asks for a restart.
     #[test]
     fn a_settings_draft_the_update_could_not_reopen_is_said_with_its_text() {
-        let m = settings_drafts_not_reopened(&[draft("font_family", "Menlo Nerd")], 0);
+        let m = settings_drafts_not_reopened(&[draft("font_family", "Menlo Nerd")], 0, None);
         assert_eq!(m.title, "Couldn't reopen a Settings draft");
         assert_eq!(m.severity, Severity::Warn);
         assert_eq!(
@@ -2319,7 +3097,7 @@ mod tests {
             "{words}"
         );
 
-        let unread = settings_drafts_not_reopened(&[draft("a", "1")], 2);
+        let unread = settings_drafts_not_reopened(&[draft("a", "1")], 2, None);
         assert_eq!(unread.title, "Couldn't reopen 3 Settings drafts");
         assert!(
             unread
@@ -2332,81 +3110,13 @@ mod tests {
         let many = (0..20)
             .map(|index| draft(&format!("k{index}"), "v"))
             .collect::<Vec<_>>();
-        let capped = settings_drafts_not_reopened(&many, 0);
+        let capped = settings_drafts_not_reopened(&many, 0, None);
         assert_eq!(capped.title, "Couldn't reopen 20 Settings drafts");
         assert!(
             capped.detail.iter().any(|line| line == "and 4 more"),
             "{:?}",
             capped.detail
         );
-    }
-
-    /// Every flow detail is short and point first: at most 40 characters, so
-    /// the phase is read at a glance and survives any ordinary width.
-    #[test]
-    fn every_flow_detail_is_short_and_point_first() {
-        use ApplyPosture as P;
-        let mut details: Vec<String> = [
-            DOWNLOADING,
-            CHECKING,
-            INSTALLS_BY_ITSELF,
-            INSTALLING,
-            FINISHING,
-            DOWNLOAD_FAILED,
-        ]
-        .map(str::to_string)
-        .to_vec();
-        details.push(staged_detail(P::Automatic));
-        for d in details {
-            assert!(
-                d.chars().count() <= 40,
-                "{d:?} is {} chars",
-                d.chars().count()
-            );
-            assert!(!d.is_empty());
-        }
-    }
-
-    /// NO "LOCK", "BLOCKED", "ANOTHER ATERM", "PAUSE" OR "QUEUED" ON THE GLASS
-    /// (owner rulings 2026-09-14 and 2026-09-18): every sentence the update
-    /// lane composes for a flow, ready, installing or finishing row, under
-    /// every posture, names what stays true and nothing that reads as a fault
-    /// or a stall.
-    #[test]
-    fn the_update_lanes_sentences_carry_no_fault_or_stall_words() {
-        let banned = [
-            "lock",
-            "blocked",
-            "another aterm",
-            "pause",
-            "queued",
-            "freeze",
-        ];
-        let mut sentences: Vec<String> = every_posture()
-            .iter()
-            .flat_map(|posture| {
-                let m = staged("0.88.0", 7, Some(*posture));
-                let mut words = vec![m.title];
-                words.extend(m.detail);
-                words
-            })
-            .collect();
-        sentences.push(staged_detail_unknown());
-        sentences.extend([DOWNLOADING, CHECKING, DOWNLOAD_FAILED].map(str::to_string));
-        for m in [
-            installing("0.88.0"),
-            finishing("0.88.0"),
-            landed("0.88.0", 7, 0, None),
-        ] {
-            sentences.push(m.title);
-            sentences.extend(m.detail);
-        }
-        for sentence in sentences {
-            let words = sentence.to_lowercase();
-            for word in banned {
-                assert!(!words.contains(word), "{word:?} in {sentence:?}");
-            }
-        }
     }
 
     /// THE SWITCH AND THE LANDING (rulings 141, 143): installing and
@@ -2508,18 +3218,87 @@ mod tests {
             switch_started(None, "0.78.0").title,
             "Reloading aterm in place"
         );
-        let waiting = switch_stopped(Some("0.79.0"), "0.78.0", true, "the machine is busy");
+        // The launched lane's stand-down after every rung missed, word for word
+        // (`park_miss_disposition`): said as what it means for a person.
+        let busy = "the park missed its budget on every rung (a PTY reader missed the 20 ms \
+                    handoff park deadline); the machine is busy, the candidate is not in \
+                    question, and the ladder retries";
+        let waiting = switch_stopped(Some("0.79.0"), "0.78.0", true, busy);
         assert_eq!(waiting.title, "Waiting to install aterm v0.79.0");
         assert_eq!(
             waiting.detail.join(" "),
-            "aterm v0.78.0 kept running: the machine is busy; it tries again by itself"
+            "aterm v0.78.0 kept running: the terminal was busy; it tries again by itself"
         );
         assert_eq!(waiting.severity, Severity::Info);
-        let not = switch_stopped(Some("0.79.0"), "0.78.0", false, "the proof timed out");
+        // A reason nobody can name is left to aterm.log, never spliced.
+        assert_eq!(
+            switch_stopped(Some("0.79.0"), "0.78.0", true, "x")
+                .detail
+                .join(" "),
+            "aterm v0.78.0 kept running; it tries again by itself"
+        );
+        // Every rung missed on a storage reservation: not a busy terminal, so no
+        // cause, as the fork lane's record of the same miss says.
+        let storage = "the park missed its budget on every rung (visible checkpoint set could \
+                       not reserve bounded storage; update handoff stayed in place); the \
+                       machine is busy, the candidate is not in question, and the ladder \
+                       retries";
+        for why in [
+            storage,
+            "visible checkpoint set could not reserve bounded storage; update handoff stayed \
+             in place",
+        ] {
+            assert_eq!(
+                switch_stopped(Some("0.79.0"), "0.78.0", true, why)
+                    .detail
+                    .join(" "),
+                "aterm v0.78.0 kept running; it tries again by itself",
+                "{why}"
+            );
+        }
+        let not = switch_stopped(
+            Some("0.79.0"),
+            "0.78.0",
+            false,
+            "handoff proof ended TimedOut",
+        );
         assert_eq!(not.title, "Couldn't install aterm v0.79.0", "ruling 309");
         assert_eq!(
             not.detail.join(" "),
-            "aterm v0.78.0 kept running: the proof timed out"
+            "aterm v0.78.0 kept running: the new version did not finish starting in time"
+        );
+        assert_eq!(
+            switch_stopped(None, "0.78.0", false, "x").detail.join(" "),
+            "aterm kept running"
+        );
+        // A press refused past a cap says which cap and where, as the lane's
+        // retry record does.
+        assert_eq!(
+            switch_stopped(
+                Some("0.79.0"),
+                "0.78.0",
+                false,
+                "overlap handoff failed safely: the park's capture refused: tab 1 of window 1 \
+                 has 300 panes, more than the 256 in one tab an update can carry",
+            )
+            .detail
+            .join(" "),
+            "aterm v0.78.0 kept running: tab 1 of window 1 has 300 panes, more than the 256 in \
+             one tab an update can carry"
+        );
+        // Its retry waits for something to close, not for time.
+        assert_eq!(
+            switch_stopped(
+                Some("0.79.0"),
+                "0.78.0",
+                true,
+                "overlap handoff failed safely: the park's capture refused: tab 1 of window 1 \
+                 has 300 panes, more than the 256 in one tab an update can carry",
+            )
+            .detail
+            .join(" "),
+            "aterm v0.78.0 kept running: tab 1 of window 1 has 300 panes, more than the 256 in \
+             one tab an update can carry; it tries again when you close some"
         );
         assert_eq!(not.severity, Severity::Warn);
         assert_eq!(
@@ -2535,7 +3314,16 @@ mod tests {
                 .chain(m.detail.clone())
                 .collect::<Vec<_>>()
                 .join(" ");
-            for jargon in ["switch", "carried", "on its own", "build "] {
+            for jargon in [
+                "switch",
+                "carried",
+                "on its own",
+                "build ",
+                "park",
+                "rung",
+                "ladder",
+                "candidate",
+            ] {
                 assert!(!words.contains(jargon), "{jargon:?} in {words:?}");
             }
         }
@@ -2552,6 +3340,241 @@ mod tests {
         ] {
             assert_eq!(span_words(Duration::from_secs(secs)), words);
         }
+    }
+
+    /// A STOPPED SWITCH SAYS ITS REASON IN A PERSON'S WORDS (audit 2026-09-29):
+    /// every stand-down reason the lanes write, copied from its producer, reads
+    /// as what it means — never "park", "rung", "PTY", "successor" or a second
+    /// promise to retry beside the record's own.
+    #[test]
+    fn every_stand_down_reason_is_said_in_a_persons_words() {
+        for (why, said) in [
+            (
+                "the terminal never offered a moment to pause in within the hold cap (120 s \
+                 after the successor dialled; the park was last held back because a video \
+                 recording is running)",
+                "a video recording was running",
+            ),
+            (
+                "the terminal never offered a moment to pause in within the hold cap (120 s \
+                 after the successor dialled; the park was last held back because a session's \
+                 command has exited but its pane is still open)",
+                "a tab's command had ended with its pane still open",
+            ),
+            (
+                "the terminal never offered a moment to pause in within the hold cap (120 s \
+                 after the successor dialled; the park was last held back because a keystroke \
+                 landed in an aterm window inside the typing gap)",
+                "you were typing",
+            ),
+            (
+                "the terminal never offered a moment to pause in within the hold cap (120 s \
+                 after the successor dialled; the park was last held back because a session \
+                 has output waiting that its reader has not taken)",
+                "the terminal was busy",
+            ),
+            (
+                "the terminal never offered a moment to pause in within the hold cap (120 s \
+                 after the successor dialled)",
+                "the terminal never went quiet",
+            ),
+            (
+                "every terminal session closed while the successor booted",
+                "every tab closed while the new version started",
+            ),
+            (
+                "build 9's handoff policy is being read before the fork lane parks; the \
+                 attempt after it ends parks under it",
+                "the new version was still being checked",
+            ),
+            (
+                "build 9's pre-park verification is being read before the cold lane \
+                 relaunches; the attempt after it ends relaunches under it",
+                "the new version was still being checked",
+            ),
+            (
+                "input or PTY output arrived before automatic reader park",
+                "the terminal was busy",
+            ),
+            (
+                "terminal activity has not reached the automatic-update quiet epoch",
+                "the terminal was busy",
+            ),
+            (
+                "a PTY reader missed the 20 ms handoff park deadline",
+                "the terminal was busy",
+            ),
+            (
+                "handoff proof capture exceeded the 20 ms deadline",
+                "the terminal was busy",
+            ),
+            (
+                "a PTY session closed during automatic reader park",
+                "a tab's command ended as the install began",
+            ),
+            (
+                "structural activity revoked the handoff while the successor held the claim",
+                "the terminal was busy",
+            ),
+            (
+                "a video recording is running",
+                "a video recording was running",
+            ),
+        ] {
+            let words = switch_stopped(Some("0.79.0"), "0.78.0", true, why)
+                .detail
+                .join(" ");
+            assert_eq!(
+                words,
+                format!("aterm v0.78.0 kept running: {said}; it tries again by itself"),
+                "{why}"
+            );
+        }
+    }
+
+    /// A failed install's record says the ledger's reason in a person's words,
+    /// or nothing past its own words (audit 2026-09-29: "another download has
+    /// replaced it · overlap handoff failed safely: handoff proof ended
+    /// ChildDied").
+    #[test]
+    fn a_failed_install_record_never_splices_the_ledgers_text() {
+        assert_eq!(
+            with_named_cause(
+                "another download replaced it",
+                "overlap handoff failed safely: handoff proof ended ChildDied"
+            ),
+            "another download replaced it \u{b7} the new version did not finish starting"
+        );
+        assert_eq!(
+            with_named_cause(
+                "the next check downloads it again",
+                "updater apply preflight became stale"
+            ),
+            "the next check downloads it again"
+        );
+    }
+
+    /// The cold lane's lost tabs are a record with no Software Update capsule,
+    /// which could not bring them back, and no apply outcome's key.
+    #[test]
+    fn tabs_not_kept_offers_no_action_that_cannot_help() {
+        let msg = cold_lane_tabs_not_kept("open restore lock: Permission denied (os error 13)");
+        assert_eq!(msg.title, "Open tabs not kept for the update");
+        assert_eq!(msg.severity, Severity::Warn);
+        assert!(msg.actions.is_empty(), "{:?}", msg.actions);
+        assert_ne!(msg.key.as_deref(), Some(KEY_OUTCOME));
+    }
+
+    /// A capture refusal names one tab only when its message names one; the
+    /// layout and the records over one handover's limit are the open tabs'.
+    #[test]
+    fn a_capture_refusal_record_names_the_tabs_it_is_about() {
+        assert!(
+            capture_refused_waiting(
+                "overlap handoff failed safely: the park's capture refused session 3: visible \
+                 checkpoint set could not be committed canonically: too many sessions",
+                Duration::ZERO,
+            )
+            .starts_with("one tab couldn't move")
+        );
+        let layout = capture_refused_waiting(
+            "overlap handoff failed safely: the park's capture refused: handoff layout could not \
+             be committed canonically",
+            Duration::ZERO,
+        );
+        assert!(
+            layout.starts_with("the open tabs couldn't move"),
+            "{layout}"
+        );
+        let over_cap = capture_refused_waiting(OVER_CAP_MESSAGE, Duration::ZERO);
+        assert_eq!(
+            over_cap.split(" \u{b7} ").next(),
+            crate::update_apply_trouble::named_clause(OVER_CAP_MESSAGE),
+            "the cause in the Version menu's words: {over_cap}"
+        );
+        assert!(
+            over_cap.ends_with("tries again when you close some"),
+            "{over_cap}"
+        );
+        assert!(
+            layout.ends_with("tries again when the tabs change"),
+            "{layout}"
+        );
+        for said in [layout, over_cap] {
+            assert!(!said.contains("that tab"), "{said}");
+        }
+        // A desk past a cap no update carries names what is past it and where,
+        // on both lanes (with and without the launched lane's prefix).
+        for message in [
+            "overlap handoff failed safely: the park's capture refused: 16500 tabs are open, more \
+             than the 16384 (64 windows of 256) an update can carry",
+            "the park's capture refused: 16500 tabs are open, more than the 16384 (64 windows of \
+             256) an update can carry",
+        ] {
+            assert_eq!(
+                capture_refused_waiting(message, Duration::ZERO),
+                "16500 tabs are open, more than the 16384 (64 windows of 256) an update can carry \
+                 \u{b7} tries again when you close some"
+            );
+        }
+    }
+
+    const OVER_CAP_MESSAGE: &str = "overlap handoff failed safely: could not write the \
+                                    authenticated handoff manifest (the open tabs' records are \
+                                    over the 4194304-byte limit one handover carries)";
+
+    /// A REFUSAL THAT CAME BACK SAYS WHEN THE NEXT TRY IS (round eight of the
+    /// update audit, U43 review). The second refusal of an update holds the
+    /// next try 10 minutes and the third 30 however the tabs change
+    /// (`app_native::capture_refusal_spacing`); a record saying only "tries
+    /// again when you close some" left a person who closed tabs as told
+    /// watching nothing happen. The first, released at the next probe, says
+    /// nothing more, as before.
+    #[test]
+    fn a_refusal_that_came_back_says_when_the_next_try_is() {
+        use crate::app_native::{CAPTURE_REFUSAL_PROBE, capture_refusal_spacing};
+        // What is left of a spacing a moment after the refusal was recorded.
+        let left = |refusals| capture_refusal_spacing(refusals) - Duration::from_millis(3);
+        let first = capture_refused_waiting(OVER_CAP_MESSAGE, left(1));
+        assert!(
+            first.ends_with("tries again when you close some"),
+            "{first}"
+        );
+        assert!(!first.contains("soonest"), "{first}");
+        assert_eq!(
+            capture_refused_waiting(OVER_CAP_MESSAGE, left(2)),
+            "too many tabs were open to move to the new version at once \u{b7} tries again \
+             when you close some, in 10 minutes at the soonest"
+        );
+        assert_eq!(
+            capture_refused_waiting(OVER_CAP_MESSAGE, left(3)),
+            "too many tabs were open to move to the new version at once \u{b7} tries again \
+             when you close some, in 30 minutes at the soonest"
+        );
+        let one_tab = capture_refused_waiting(
+            "overlap handoff failed safely: the park's capture refused session 3: visible \
+             checkpoint set could not be committed canonically: too many sessions",
+            left(2),
+        );
+        assert!(
+            one_tab.ends_with("tries again when that tab changes, in 10 minutes at the soonest"),
+            "{one_tab}"
+        );
+        // A minute and a half left reads as two; a minute's worth, singular.
+        let near = capture_refused_waiting(OVER_CAP_MESSAGE, Duration::from_secs(90));
+        assert!(near.ends_with(", in 2 minutes at the soonest"), "{near}");
+        let one = capture_refused_waiting(
+            OVER_CAP_MESSAGE,
+            CAPTURE_REFUSAL_PROBE + Duration::from_secs(1),
+        );
+        assert!(one.ends_with(", in a minute at the soonest"), "{one}");
+        // The cause still leads, in the Version menu's words.
+        assert_eq!(
+            capture_refused_waiting(OVER_CAP_MESSAGE, left(3))
+                .split(" \u{b7} ")
+                .next(),
+            crate::update_apply_trouble::named_clause(OVER_CAP_MESSAGE)
+        );
     }
 
     /// THE LANDING'S CLOCKS: the download instant crosses the handoff on the
@@ -2646,13 +3669,13 @@ mod tests {
     }
 
     /// A PERSISTENT FAILURE IS READ ONCE PER CLASS: the title names the broken
-    /// half, the excerpt since when, the whole sentence behind Details (its
-    /// command intact), the Software Update capsule, the warning's hold —
+    /// half, the excerpt since when, the whole sentence behind Details, the
+    /// Software Update capsule, the warning's hold —
     /// never Standing (design ruling 59).
     #[test]
     fn the_health_warning_names_the_half_and_since_when() {
         let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: release manifests \
-                    exist but cannot be downloaded. Run `aterm ctl update status` for details.";
+                    exist but cannot be downloaded.";
         for class in ["apply", "pipeline", "stage", "manifest"] {
             let m = health_warning(
                 HealthKind::of_class(class),
@@ -2664,7 +3687,7 @@ mod tests {
             assert!(
                 m.detail[1..]
                     .join(" ")
-                    .contains("Run `aterm ctl update status` for details."),
+                    .contains("release manifests exist but cannot be downloaded."),
                 "{:?}",
                 m.detail
             );
@@ -2681,14 +3704,23 @@ mod tests {
             "no date here",
         );
         assert_eq!(undated.detail, vec!["no date here"]);
-        assert_eq!(
-            health_notification_body(body),
-            "Since Sep 14. Details: aterm Settings \u{25b8} Software Update."
-        );
-        assert_eq!(
-            health_notification_body("no date"),
-            "Details: aterm Settings \u{25b8} Software Update."
-        );
+        {
+            use crate::update_apply_trouble::PersonRemedy;
+            assert_eq!(
+                health_notification_body(body, PersonRemedy::InstallSignedRelease),
+                "Since Sep 14: install the signed release. \
+                 Details: aterm Settings \u{25b8} Software Update."
+            );
+            assert_eq!(
+                health_notification_body(body, PersonRemedy::MoveOrAskAdmin),
+                "Since Sep 14: move aterm or ask an admin. \
+                 Details: aterm Settings \u{25b8} Software Update."
+            );
+            assert_eq!(
+                health_notification_body("no date", PersonRemedy::InstallSignedRelease),
+                "Install the signed release. Details: aterm Settings \u{25b8} Software Update."
+            );
+        }
         // The banner's title names aterm: a bare "Couldn't install updates"
         // reads as macOS's own updater.
         assert_eq!(
@@ -2774,7 +3806,7 @@ mod tests {
         surfaces.push(("staged row (no posture)", staged_detail_unknown()));
         surfaces.push((
             "Version menu row",
-            crate::menu::staged_apply_label("\u{2191}", 7, "9.9.9", None),
+            crate::menu::staged_apply_label("\u{2191}", 7, "9.9.9", None, false),
         ));
         surfaces.push((
             "Version menu row (same version)",
@@ -2783,9 +3815,14 @@ mod tests {
                 7,
                 crate::build_info::version_display(),
                 None,
+                false,
             ),
         ));
-        for retry in [ApplyRetry::Scheduled, ApplyRetry::ManualOnly] {
+        for retry in [
+            ApplyRetry::Scheduled,
+            ApplyRetry::ManualOnly,
+            ApplyRetry::NewerRelease,
+        ] {
             let trouble = ApplyTrouble::new(
                 2,
                 "overlap handoff failed safely: handoff proof ended ChildDied",
@@ -2798,9 +3835,24 @@ mod tests {
             surfaces.push(("trouble micro", trouble.micro()));
             surfaces.push((
                 "Version menu row (troubled)",
-                crate::menu::staged_apply_label("\u{2191}", 7, "9.9.9", Some(&trouble)),
+                crate::menu::staged_apply_label(
+                    "\u{2191}",
+                    7,
+                    "9.9.9",
+                    Some(&trouble),
+                    retry == ApplyRetry::NewerRelease,
+                ),
             ));
         }
+        surfaces.push((
+            "Version menu row (on hold, no record)",
+            crate::menu::staged_apply_label("\u{2191}", 7, "9.9.9", None, true),
+        ));
+        surfaces.push(("on-hold refusal", trial_spent_refusal("aterm v9.9.9")));
+        surfaces.push((
+            "on-hold refusal (same version)",
+            trial_spent_refusal(&staged_build_name(7, crate::build_info::version_display())),
+        ));
         let facts = AdmissionFacts {
             staged_verified: true,
             seamless_capable: false,
@@ -2828,6 +3880,8 @@ mod tests {
         }
         for blocker in [
             crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+            crate::App::UNSAVED_SETTINGS_BLOCKS_APPLY,
+            crate::App::UNSAVED_EDITOR_AND_SETTINGS_BLOCK_APPLY,
             crate::App::RESTORE_IN_FLIGHT_BLOCKS_APPLY,
             crate::App::INSTALLED_ACTIVATES_IN_PLACE,
         ] {
@@ -2872,9 +3926,12 @@ mod tests {
             landed("", 7, 0, None),
             download_failed("9.9.9", "x"),
             download_postponed("busy"),
+            download_withheld("9.9.9", "x"),
+            download_withheld("", "x"),
             switch_started(Some("9.9.9"), "9.9.8"),
             switch_started(None, "9.9.8"),
             health_recovered("Couldn't install updates", "since Sep 14"),
+            cold_lane_tabs_not_kept("open restore lock: Permission denied (os error 13)"),
         ]
         .into_iter()
         .chain([true, false].into_iter().flat_map(|routine| {

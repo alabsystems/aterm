@@ -5,22 +5,17 @@
 //!
 //! # Why `cargo tree` and not `cargo metadata`
 //!
-//! MEASURED on this checkout: `cargo metadata --filter-platform
-//! aarch64-apple-darwin` reports 271 packages for the `aterm` root against
-//! `cargo tree -p aterm`'s 212 — a 28% over-count, because `cargo metadata`
-//! resolves the WHOLE workspace (67 members) with features unified across all
-//! of them and then filters only by target, never by reachability from one
-//! root. A survey built on it would bill `aterm` for packages that only
-//! `aterm-bench` or `xtask` pull in. `cargo tree` walks the actual resolve from
-//! a single `-p` root, which is the question this program asks.
+//! `cargo metadata --filter-platform` resolves the whole workspace with
+//! features unified across members and filters by target, not reachability, so
+//! it would bill `aterm` for packages only other members pull in. `cargo tree
+//! -p aterm` walks the actual resolve from one root.
 //!
-//! `--no-dedupe` is mandatory: without it cargo elides repeated subtrees behind
-//! a ` (*)` marker, and the elided edges are exactly the shared dependencies
-//! that make a dominator differ from a subtree. The parser still recognises
-//! ` (*)` so that a hand-run command pasted into a fixture does not explode.
+//! `--no-dedupe` is mandatory: cargo otherwise elides repeated subtrees behind
+//! ` (*)`, and those shared edges are what make a dominator differ from a
+//! subtree. The parser still accepts ` (*)` for pasted fixtures.
 //!
 //! Resolution needs no toolchain and no network: every cell is measured
-//! offline, including the two triples this host cannot build for.
+//! offline, including triples this host cannot build for.
 
 use crate::model::{Cell, Graph, PkgId};
 use std::collections::BTreeMap;
@@ -29,80 +24,30 @@ use std::process::Command;
 
 /// The eight measurement cells, in report order.
 ///
-/// # THE SIX SHIPPED TRIPLES ARE ALL HERE, and until 2026-09-18 three were not
+/// # Every shipped triple is a cell
 ///
-/// `atpkg::manifest::TARGETS` is the roster of triples this project publishes
-/// an `[[artifact]]` row for, and `atpkg`'s client reports one of those six for
-/// itself. Three of them — `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`
-/// and `aarch64-pc-windows-msvc` — were in NO cell, and `xtask gate cells` is
-/// the only lane in this repository that compiles aterm for a triple the box in
-/// front of you is not. So a break visible only on one of those three reached no
-/// gate on any box: the matrix said `GREEN — all 5 cells type-check` over a list
-/// that never mentioned them, which is the same silence that let `aterm-gui`,
-/// `atpkg` and `aterm-verify` ship un-compilable for Windows for four days
-/// (crates/xtask/src/gate.rs, `gate_cells_foreign`). `crates/atpkg/tests/
-/// shipped_triples_have_a_compile_cell.rs` is the standing law that keeps the
-/// two lists in step; it costs no compiler and fails by name.
+/// `atpkg::manifest::TARGETS` lists the triples this project publishes
+/// artifacts for; each has a cell, including the second architecture of each
+/// OS, where a cfg break otherwise hides. `crates/atpkg/tests/
+/// shipped_triples_have_a_compile_cell.rs` keeps the two lists in step.
 ///
-/// The three that arrived late are the SECOND architecture of each shipped
-/// operating system, which is exactly where a cfg break hides: the first arch
-/// is compiled by somebody's daily build, and the second is compiled by this
-/// matrix or by nothing.
+/// # Order is append-only
 ///
-/// # ORDER IS APPEND-ONLY
+/// `measured::CELLS` rows are read by position (`loc.rs`'s tests index cells by
+/// number), so new cells go on the end.
 ///
-/// `measured::CELLS` rows are read by this vector's positions — `loc.rs`'s
-/// tests index cells 0 to 4 by number and check each row's cell name — so a
-/// cell inserted in the middle re-points them. New cells go on the END, and the report reads
-/// in the order cells joined the matrix rather than in OS order.
+/// # Every cell is rooted at something aterm ships
 ///
-/// # Every cell is rooted at something aterm actually SHIPS
+/// The six native cells are rooted at the binary package `aterm`. `aterm` is
+/// never compiled for `wasm32`, so the wasm cells are rooted at the two shipped
+/// browser modules, each compiled by name in `xtask gate cells-foreign` and
+/// `tools/wasm-bench/run.sh`:
 ///
-/// The six native cells are rooted at the binary package `aterm`, because on
-/// those targets the question is "what does the terminal ship" and the terminal
-/// is one binary.
+/// * `aterm-wasm`: the CPU/`putImageData` path (`aterm-render` rasterizer);
+/// * `aterm-gpu-web`: the GPU path (`aterm-gpu` over `wgpu` -> WebGL2/WebGPU).
 ///
-/// THERE IS NO SUCH BINARY ON `wasm32`, and pretending there was is the bug this
-/// matrix carried until 2026-08-30. `aterm` is a `[[bin]]` (`crates/aterm/Cargo.toml`)
-/// and nothing ever compiles it for `wasm32-unknown-unknown`; `cargo tree` will
-/// still RESOLVE it for that triple, and so a cell rooted there reported a
-/// configuration that is never built. It was wrong in BOTH directions, measured:
-///
-/// * it counted what the browser never loads — `zstd` (via `aterm-scrollback`,
-///   a C library that cannot target wasm32 and is default-features'd OUT of both
-///   web crates), plus `winit`, `rustls` and the whole updater;
-/// * and it MISSED `console_error_panic_hook`, which both shipped modules
-///   declare under `[target.'cfg(target_arch = "wasm32")'.dependencies]` and the
-///   `aterm` root does not reach at all.
-///
-/// # Why TWO wasm cells and not one
-///
-/// aterm ships two separate `.wasm` artifacts into the Electron renderer, and
-/// both are compiled by name in the two lanes that compile wasm at all —
-/// `xtask gate cells-foreign` (these two cells) and `tools/wasm-bench/run.sh`
-/// (`-p aterm-wasm -p aterm-gpu-web`):
-///
-/// * `aterm-wasm` — the CPU/`putImageData` path (`aterm-render` rasterizer);
-/// * `aterm-gpu-web` — the GPU path (`aterm-gpu` over `wgpu` -> WebGL2/WebGPU).
-///
-/// They are not the same download and they are not the same surface: measured on
-/// this checkout the CPU module is 27 third-party packages / 255,826 lines and
-/// the GPU module is 64 / 984,913, a 3.85x difference that is `wgpu` and its
-/// subtree almost exactly. One cell cannot report both honestly — rooted at the
-/// GPU module it bills the CPU path for a renderer it does not contain, and
-/// rooted at the CPU module it hides the biggest third-party dependency aterm
-/// has left. So there are two rows, and the ratchet bounds each.
-///
-/// # The third web crate is covered, and it is checked rather than assumed
-///
-/// `aterm-effects-web` (the PHOSPHOR-rain overlay adapter, and the third entry in
-/// [`aterm_census::wasm_census::WASM_ROOT_CRATES`]) has no cell. It does not need
-/// one: MEASURED, its `wasm32` closure is a strict subset of `aterm-wasm`'s —
-/// the two graphs differ by exactly one node, `aterm-effects-web` itself — so
-/// every third-party package it ships is already inside the `wasm-cpu` row. That
-/// containment is enforced by `loc::tests::the_wasm_cells_cover_every_shipped_web_crate`,
-/// not left to this comment: the day it gains a dependency of its own, that test
-/// fails and names it.
+/// They are different downloads with very different surfaces (`wgpu` and its
+/// subtree), so each has its own row and ratchet.
 pub fn default_cells() -> Vec<Cell> {
     vec![
         Cell {
@@ -134,17 +79,13 @@ pub fn default_cells() -> Vec<Cell> {
             triple: "wasm32-unknown-unknown".to_string(),
             package: "aterm-gpu-web".to_string(),
         },
-        // THE SECOND ARCHITECTURE OF EACH SHIPPED OS, added 2026-09-18 so that
-        // the six triples the index can name are the six a compiler reads.
-        // Each is rooted at `aterm` like its sibling, and each is FOREIGN to
-        // every box in this fleet — no `FLEET_HOST_TRIPLES` entry — so all
-        // three join `xtask gate cells-foreign`, which the merge contract runs, and
-        // their verdicts do not depend on who is asking.
+        // The second architecture of each shipped OS, rooted at `aterm`. None
+        // is a fleet host triple, so all three run in `xtask gate
+        // cells-foreign`.
         //
         // The Intel-Mac slice of the universal release binary
         // (`aterm-release`'s buildplan.rs builds it under `RUSTUP_TOOLCHAIN=
-        // stable`); the one triple of the six whose artifacts ship inside
-        // another cell's `.dmg` rather than on their own.
+        // stable`); its artifacts ship inside the mac-arm `.dmg`.
         Cell {
             name: "mac-x64".to_string(),
             triple: "x86_64-apple-darwin".to_string(),
@@ -157,9 +98,8 @@ pub fn default_cells() -> Vec<Cell> {
             triple: "aarch64-unknown-linux-gnu".to_string(),
             package: "aterm".to_string(),
         },
-        // ARM Windows: the triple apps/aterm-win/build.ps1 selects for itself
-        // when it detects an ARM64 host, and the one whose ABI cell
-        // crates/aterm-libc did not carry until 2026-09-16.
+        // ARM Windows: the triple apps/aterm-win/build.ps1 selects on an ARM64
+        // host.
         Cell {
             name: "win-arm".to_string(),
             triple: "aarch64-pc-windows-msvc".to_string(),
@@ -168,10 +108,8 @@ pub fn default_cells() -> Vec<Cell> {
     ]
 }
 
-/// Map `--cell NAME` arguments onto cells. No names at all means every cell —
-/// the default a gate wants, because a surface that only shrinks on one target
-/// has not shrunk. Requested order is preserved and repeats collapse, so
-/// `--cell linux --cell linux` measures Linux once.
+/// Map `--cell NAME` arguments onto cells. No names means every cell. Requested
+/// order is preserved and repeats collapse.
 pub fn select(cells: &[Cell], names: &[String]) -> Result<Vec<Cell>, String> {
     if names.is_empty() {
         return Ok(cells.to_vec());
@@ -202,8 +140,8 @@ pub fn select(cells: &[Cell], names: &[String]) -> Result<Vec<Cell>, String> {
 }
 
 /// One parsed `cargo tree --prefix depth` line. Exposed because the parser is
-/// the part most likely to drift when cargo changes its output, and a drift
-/// that silently drops edges would silently shrink every dominator.
+/// the part most likely to drift with cargo's output, and dropped edges would
+/// silently shrink every dominator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeLine {
     pub depth: usize,
@@ -301,13 +239,12 @@ fn parenthesised<'a>(tail: &'a str, whole: &str) -> Result<(&'a str, &'a str), S
     ))
 }
 
-/// Rebuild the graph from depth-prefixed output. A node at depth `d` attaches
-/// to the most recent node at depth `d - 1`; that is the whole trick, and it is
-/// why `--prefix depth` is used instead of the box-drawing default (whose
-/// indentation is ambiguous once a package name contains the same glyphs).
+/// Rebuild the graph from depth-prefixed output: a node at depth `d` attaches
+/// to the most recent node at depth `d - 1`. `--prefix depth` avoids the
+/// ambiguous box-drawing indentation.
 ///
-/// Returns the graph plus the directories cargo printed, which are the only
-/// authority on where a path package actually lives.
+/// Returns the graph plus the directories cargo printed, the authority on
+/// where a path package lives.
 pub fn parse_tree(text: &str) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
     let mut graph = Graph::default();
     let mut paths: BTreeMap<PkgId, PathBuf> = BTreeMap::new();
@@ -365,10 +302,8 @@ pub fn parse_tree(text: &str) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), Strin
 
 /// Resolve one cell: the graph plus every package directory cargo disclosed.
 ///
-/// `--locked --offline` first, because a survey that quietly re-resolves is
-/// measuring a graph the repository does not ship. If that fails, ONE retry
-/// without `--offline` is allowed and is written into `log` — a note nobody can
-/// miss, since the number it produced may not be reproducible offline.
+/// Runs `--locked --offline` first. On failure, one retry without `--offline`
+/// is allowed and noted in `log`, since that number may not reproduce offline.
 pub fn graph_and_paths(
     root: &Path,
     cell: &Cell,
@@ -405,9 +340,8 @@ pub fn graph_and_paths(
     parse_tree(&text)
 }
 
-/// Test convenience: just the graph. Any retry note goes to stderr, because a
-/// `Result<Graph, _>` has nowhere else to put it — the product calls
-/// [`graph_and_paths`], which captures the note into its report.
+/// Test convenience: just the graph. Any retry note goes to stderr; the
+/// product calls [`graph_and_paths`], which captures it.
 #[cfg(test)]
 pub fn graph(root: &Path, cell: &Cell) -> Result<Graph, String> {
     let mut log = String::new();
@@ -418,29 +352,59 @@ pub fn graph(root: &Path, cell: &Cell) -> Result<Graph, String> {
     Ok(out?.0)
 }
 
-/// Absolutise the workspace root ONCE, before it is used twice.
+/// Test-only: the real workspace's resolution of `cell`, run at most once per
+/// test process.
 ///
-/// THE MEASURED DEFECT THIS EXISTS TO PREVENT: [`run_tree`] both sets the child
-/// `current_dir` to the root AND passes `--manifest-path <root>/Cargo.toml`.
-/// With a RELATIVE root those two COMPOSE — cargo resolves the manifest against
-/// the cwd it was just given — so `--root ..` from `crates/` sent cargo looking
-/// for `/Users/…/Cargo.toml` one level above the workspace and every cell died
-/// with "manifest path `../Cargo.toml` does not exist". Worse than the failure
-/// was the diagnosis: the retry path reported it as an incomplete registry
-/// cache and told the operator to run `cargo fetch`, which cannot help.
+/// The answer depends only on the committed lock and manifests, and repeated
+/// `cargo tree` runs serialise on cargo's package-cache lock. Keyed by the
+/// whole [`Cell`]; tests about root spelling or fixture trees call [`graph`] /
+/// [`graph_and_paths`] directly. Failures are cached too.
+#[cfg(test)]
+pub(crate) fn real_workspace_graph_and_paths(
+    cell: &Cell,
+) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Resolved = Result<(Graph, BTreeMap<PkgId, PathBuf>), String>;
+    type Slots = BTreeMap<(String, String, String), Arc<OnceLock<Resolved>>>;
+    static SLOTS: OnceLock<Mutex<Slots>> = OnceLock::new();
+    let slot = SLOTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((cell.name.clone(), cell.triple.clone(), cell.package.clone()))
+        .or_default()
+        .clone();
+    slot.get_or_init(|| {
+        let mut log = String::new();
+        let out = graph_and_paths(&real_workspace_root(), cell, &mut log);
+        if !log.is_empty() {
+            eprint!("{log}");
+        }
+        out
+    })
+    .clone()
+}
+
+/// Test-only: the workspace this crate sits in (`crates/aterm-forge/../..`).
+#[cfg(test)]
+pub(crate) fn real_workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/aterm-forge sits two levels under the workspace root")
+        .to_path_buf()
+}
+
+/// Absolutise the workspace root once, before it is used twice.
 ///
-/// Canonicalising HERE fixes it for every caller at once, rather than once per
-/// verb — `check` had already grown its own private workaround.
+/// [`run_tree`] sets the child's `current_dir` to the root and passes
+/// `--manifest-path <root>/Cargo.toml`; a relative root would resolve twice
+/// and point outside the workspace.
 ///
-/// ON WINDOWS THE CANONICAL SPELLING IS THEN UN-VERBATIMED, and that is a
-/// measured defect too (2026-09-14, the first `cargo forge` run on a Windows
-/// host): `canonicalize` there answers `\\?\C:\Users\…`, cargo accepted that
-/// as `--manifest-path`, and then refused every cell with "cannot update the
-/// lock file `\\?\C:\…\Cargo.lock` because `--locked` was passed" — a lock
-/// that was byte-for-byte current. The retry path diagnosed it as a stale
-/// registry cache and told the operator to run `cargo fetch`, which again
-/// could not help. `crates/aterm-update/src/which_copy.rs` records the same
-/// property of Windows `canonicalize` for the same reason.
+/// On Windows the canonical `\\?\C:\…` form is then un-verbatimed: cargo
+/// accepts it as `--manifest-path` but then refuses `--locked` against the
+/// lock file (`crates/aterm-update/src/which_copy.rs` handles the same
+/// property).
 fn abs_root(root: &Path) -> Result<PathBuf, String> {
     let abs = root.canonicalize().map_err(|e| {
         format!(
@@ -451,10 +415,9 @@ fn abs_root(root: &Path) -> Result<PathBuf, String> {
     Ok(strip_verbatim_prefix(abs))
 }
 
-/// `\\?\C:\x` -> `C:\x`. Only the verbatim-DISK form is rewritten: a verbatim
-/// UNC path has no shorter spelling every tool accepts, and every other prefix
-/// is left exactly as `canonicalize` produced it. A no-op off Windows, where
-/// no path carries a prefix component at all.
+/// `\\?\C:\x` -> `C:\x`. Only the verbatim-disk form is rewritten: verbatim UNC
+/// has no shorter universally accepted spelling, and other prefixes are left
+/// as is. A no-op off Windows.
 pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     use std::path::{Component, Prefix};
     let verbatim_disk = matches!(
@@ -469,9 +432,8 @@ pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 }
 
 fn run_tree(root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
-    // `CARGO` is set by targo itself, so a nested invocation uses the very
-    // toolchain that launched forge; unset, it is Trust's `targo` (`tree` takes
-    // no lane flag), never a stock `cargo`.
+    // `CARGO` is set by targo, so a nested invocation uses the launching
+    // toolchain; unset, it is Trust's `targo` (`tree` takes no lane flag).
     let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
     let mut cmd = Command::new(exe);
     cmd.arg("tree")
@@ -515,14 +477,7 @@ fn first_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    pub(crate) fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("crates/aterm-forge sits two levels under the workspace root")
-            .to_path_buf()
-    }
+    use crate::test_support::repo_root;
 
     /// The verbatim-disk spelling Windows `canonicalize` answers is the one
     /// cargo refuses under `--locked`; everything else passes through untouched.
@@ -576,11 +531,8 @@ mod tests {
                 "win-arm",
             ]
         );
-        // THE ROOTS ARE THE POINT. The six native cells measure the one
-        // binary; the two wasm cells measure the two cdylib modules the
-        // browser actually loads, because `aterm` is a `[[bin]]` that is never
-        // compiled for wasm32 and a cell rooted there measured a configuration
-        // nothing builds.
+        // Native cells measure the one binary; the wasm cells measure the two
+        // modules the browser loads.
         assert_eq!(
             cells.iter().map(|c| c.package.as_str()).collect::<Vec<_>>(),
             [
@@ -598,13 +550,9 @@ mod tests {
         assert_eq!(cells[0].triple, "aarch64-apple-darwin");
         assert_eq!(cells[3].triple, "wasm32-unknown-unknown");
         assert_eq!(cells[4].triple, "wasm32-unknown-unknown");
-        // EVERY TRIPLE atpkg PUBLISHES AN ARTIFACT ROW FOR IS A CELL. The
-        // authority is `atpkg::manifest::TARGETS`, which this crate does not
-        // depend on — the law with teeth is
-        // crates/atpkg/tests/shipped_triples_have_a_compile_cell.rs, which reads
-        // that constant and this function's source — and this is its local echo,
-        // so a cell deleted here fails in this crate too and not only two crates
-        // away.
+        // Every triple atpkg publishes is a cell. The authoritative check is
+        // crates/atpkg/tests/shipped_triples_have_a_compile_cell.rs; this is
+        // its local echo.
         let triples: Vec<&str> = cells.iter().map(|c| c.triple.as_str()).collect();
         for shipped in [
             "aarch64-apple-darwin",
@@ -775,16 +723,14 @@ mod tests {
         assert!(parse_tree("1alpha v1.0.0\n").is_err());
     }
 
-    /// REGRESSION: a relative root used to be resolved TWICE — once as the
-    /// child's `current_dir` and again inside `--manifest-path <root>/…` — so
-    /// `crates/aterm-forge/../..` looked one level ABOVE the workspace and
-    /// every cell failed with "manifest path does not exist", misreported as a
-    /// stale registry cache. The root is canonicalised once now, so a relative
-    /// spelling resolves the identical graph as the absolute one.
+    /// A relative root resolves the identical graph as the absolute one.
     #[test]
     fn a_relative_root_resolves_the_same_graph_as_an_absolute_one() {
         let cell = &default_cells()[3]; // wasm-cpu — the smallest cell.
-        let absolute = graph(&repo_root(), cell).expect("absolute root must resolve");
+        // The absolute side is the shared real-workspace resolution; the relative side
+        // below is the one under test and always resolves afresh.
+        let (absolute, _) =
+            real_workspace_graph_and_paths(cell).expect("absolute root must resolve");
         let relative = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
         assert!(relative.is_relative() || relative.components().count() > 3);
         let via_relative = graph(&relative, cell).expect("a relative root must resolve too");

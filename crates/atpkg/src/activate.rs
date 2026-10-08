@@ -7,13 +7,13 @@
 //! Activation is **not** the app updater's in-session handoff (that is aterm-gui/
 //! aterm-update's `.app` path). A CLI program's active build is selected by a symlink:
 //! `store/<program>/current` points at the chosen `store/<program>/<build>/`, and one
-//! `bin/<tool>` symlink per exposed binary points into it. Each flip is an **atomic replace** — write a sibling
-//! temp symlink, then `rename(2)` it over the target — so a reader never sees a missing or
-//! half-written link, and a concurrent run (under `apply.lock`) cannot observe a torn
+//! `bin/<tool>` symlink per exposed binary points into it. Each flip is an **atomic replace** —
+//! write a sibling temp symlink, then `rename(2)` it over the target — so a reader never sees a
+//! missing or half-written link, and a concurrent run (under `apply.lock`) cannot observe a torn
 //! state. Every shim name is gated through [`crate::store::shim_allowed`]: a tool named
 //! `sudo`/`ssh`/`git`/… is refused a shim and reported, never silently installed.
 //!
-//! # The `alab-<tool>` alias (owner decision 2026-08-27)
+//! # The `alab-<tool>` alias
 //!
 //! ALab's bare tool names collide with other software — Homebrew's p11-kit installs a
 //! certificate tool at `/opt/homebrew/bin/trust`, Homebrew core owns the formula names
@@ -117,12 +117,9 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
 /// never name a different program than the build; a `build_dir` that is not a store build
 /// dir is refused (`InvalidInput`) rather than activated with no witness.
 ///
-/// **One link.** A second, `channels/<channel>/current`, used to be flipped beside it: one
-/// symlink per channel NAME, which every program shares (`[packages].channel`, default
-/// `stable`), so it held only the last activation — useless as a per-program witness, and
-/// read by nothing but a GC migration path and `uninstall`'s sweep of it. It was deleted
-/// end to end on 2026-09-25; a prefix that still carries the directory has it swept by
-/// [`crate::gc::sweep_retired_channel_links`].
+/// **One link.** The retired `channels/<channel>/current` was one link per channel NAME,
+/// shared by every program, so it witnessed only the last activation; a prefix that still
+/// carries it has it swept by [`crate::gc::sweep_retired_channel_links`].
 pub fn activate_build(layout: &Layout, build_dir: &Path) -> io::Result<()> {
     let Some((program, _)) = crate::ops::store_build_of(&layout.prefix, build_dir) else {
         return Err(io::Error::new(
@@ -156,8 +153,7 @@ pub fn install_shims(
 /// [`install_shims`] whose shims export `env` before they exec (design S7) — what a
 /// verb that re-lays an INSTALLED build passes its sidecar to
 /// ([`crate::shim_env::read_sidecar`]), so a re-lay never strips what the signed manifest
-/// declared (a `repair` that laid `claude` plain turned Claude Code's own updater back
-/// on, 2026-09-23).
+/// declared (a `claude` laid plain would turn Claude Code's own updater back on).
 pub fn install_shims_env(
     layout: &Layout,
     build_dir: &Path,
@@ -259,7 +255,7 @@ pub(crate) fn install_tools_env(
     }
     files.iter().try_for_each(crate::lay::write_in_process)?;
     prune_stale_shims(layout, build_dir, tools, aliases);
-    // The front-of-PATH twin of an agent program's shim (owner decision 2026-09-10),
+    // The front-of-PATH twin of an agent program's shim,
     // laid from the `bin/` shim just written so the two can never disagree.
     reconcile_agents(layout);
     Ok(())
@@ -270,10 +266,11 @@ pub(crate) fn install_tools_env(
 /// lay — or refresh — the twin `agents/<tool>` with the SAME target and the SAME exported
 /// environment (read off the `bin/` shim as laid, never re-derived, for the reason
 /// [`reconcile_aliases`] gives) plus the self-update block ([`crate::selfupdate`]),
-/// then sweep everything else out of `agents/` ([`sweep_agents_dir`]). Idempotent: a
-/// twin that already resolves where the primary does with the same env and the bytes the
-/// twin renderer lays ([`twin_is_rendered`]) is left alone, so the six-hourly tick
-/// rewrites nothing.
+/// then sweep everything else out of `agents/` ([`sweep_agents_dir`]). The primary itself
+/// gets the same block (outside an aterm session `bin/<program>` is the managed name). Idempotent:
+/// a twin that already resolves where the primary does with the same env and the bytes the twin
+/// renderer lays ([`twin_is_rendered`]) is left alone, and so is a primary already carrying the
+/// block, so the six-hourly tick rewrites nothing.
 ///
 /// Called at the end of every shim-laying pass — [`install_tools_env`] (hence every
 /// install and `repair`), flow's undo, linkmode's link/unlink, and ONCE at the end of
@@ -283,14 +280,13 @@ pub(crate) fn install_tools_env(
 ///
 /// ONCE PER PASS, NEVER ONCE PER PROGRAM. Nothing here is a function of any one program:
 /// it walks [`crate::stub::AGENT_PROGRAMS`] and sweeps `agents/` whatever the caller was
-/// reconciling. It used to hang off the end of [`reconcile_aliases`], which the pass runs
-/// for EVERY active program, so a twelve-program machine paid twelve whole agents
-/// reconciles per six-hourly tick (audit 2026-09-15).
+/// reconciling, so it must not hang off [`reconcile_aliases`], which the pass runs for
+/// EVERY active program.
 ///
 /// BEST-EFFORT, like [`sweep_agents_dir`]: a twin that cannot be laid — `agents/`
 /// uncreatable, the link refused — is reported on stderr and the pass goes on, because
 /// this runs inside EVERY program's install and an `ay` or `trust` install must not fail
-/// over a directory only `claude` and `codex` use (review 2026-09-10). The `bin/` shim
+/// over a directory only `claude` and `codex` use. The `bin/` shim
 /// is already laid by then; the twin is retried on the next pass.
 ///
 /// The keep-predicate is [`sweep_agents_dir`]'s: the primary must resolve into an AGENT
@@ -311,22 +307,25 @@ pub fn reconcile_agents(layout: &Layout) {
         let env = platform::shim_env_of(&primary);
         let twin = layout.agent_shim(&tool);
         // THE TWIN'S PRELUDE, rendered here, the one place the twin is laid
-        // ([`platform::twin_prelude`]): the self-update block (2026-09-19,
-        // [`crate::selfupdate`]) — `case "$1" in update|upgrade|install)` on the program's
-        // rostered verbs, so a `claude update` typed on the managed name is answered by
-        // `atpkg __selfupdate` and never by the vendor's own updater, which installs a copy
-        // this name never runs. No landing prelude since Phase 2 (2026-09-22,
-        // [`crate::landing`]): a twin that still carries one compares unequal below and is
-        // re-laid once.
+        // ([`platform::twin_prelude`]): the self-update block ([`crate::selfupdate`]) —
+        // `case "$1" in update|upgrade|install)` on the program's rostered verbs, so a
+        // `claude update` typed on the managed name is answered by `atpkg __selfupdate` and
+        // never by the vendor's own updater, which installs a copy this name never runs. A twin
+        // that still carries the retired landing prelude ([`crate::landing`]) compares unequal
+        // below and is re-laid once.
         //
         // WHICH atpkg it hands over to is [`crate::stub::Embedder`]'s call over the one the
-        // standing twin names (2026-09-25, D1): the co-located `atpkg` of the process running
-        // this pass only when it is there and lasts at least as long as that one — a pass run
-        // from a dev build or a scratch copy re-points no twin at a path that is not there,
-        // nor at a `target/` build while the installed app's atpkg stands.
-        let standing = crate::metadata_io::read_bounded_regular_utf8(&twin, 64 * 1024)
-            .ok()
-            .and_then(|body| crate::stub::sh_named_atpkg(&body, "__atpkg"));
+        // standing twin names — or, with no twin standing, the one `bin/`
+        // names: the co-located `atpkg` of the process running this pass only when it is
+        // there and lasts at least as long as that one — a pass run from a dev build or a
+        // scratch copy re-points no twin at a path that is not there, nor at a `target/`
+        // build while the installed app's atpkg stands.
+        let named = |shim: &Path| {
+            crate::metadata_io::read_bounded_regular_utf8(shim, 64 * 1024)
+                .ok()
+                .and_then(|body| crate::stub::sh_named_atpkg(&body, "__atpkg"))
+        };
+        let standing = named(&twin).or_else(|| named(&primary));
         let atpkg = crate::stub::Embedder::this_process().embed(standing.as_deref());
         let prelude = platform::twin_prelude(
             name,
@@ -334,6 +333,28 @@ pub fn reconcile_agents(layout: &Layout) {
             atpkg.as_deref(),
             crate::selfupdate::verbs_of(name),
         );
+        // THE `bin/` SHIM ANSWERS THE SAME VERBS. Outside an aterm session
+        // the rc hook takes `agents/` off PATH and APPENDS `bin/` (`crate::hooks`), so in
+        // Terminal, iTerm, an editor's terminal or over ssh — wherever the person keeps no
+        // copy of their own — `claude` IS `bin/claude`, and a `claude update` typed there ran
+        // the vendor's updater on the managed copy: measured on 2.1.287/2.1.288 it set
+        // `installMethod` to `native` in `~/.claude.json` and fetched the vendor's latest for a
+        // native install under `~/.local`, the copy this block exists never to install. So
+        // `bin/` carries the twin's block too, laid here over a primary that resolves into an
+        // agent program's store (checked above) and only when its bytes are not already the
+        // render — the two files are then byte for byte the same. The verb's forward `exec`s
+        // `bin/` again; the block's re-entry guard ([`crate::selfupdate::REENTRY_VAR`]) lets
+        // that through to the store build. Its own target and environment, read off it above,
+        // so nothing a reader keys on moves; Windows renders no block and nothing is laid.
+        if !prelude.is_empty()
+            && !twin_is_rendered(&primary, &target, &env, &prelude)
+            && let Err(e) = platform::install_twin_to_env(&primary, &target, &env, &prelude)
+        {
+            eprintln!(
+                "atpkg: {name}: bin/{name} lacks the self-update block ({e}); runs the store \
+                 build; retried next pass"
+            );
+        }
         // Left alone only when it resolves where the primary does, exports the same
         // environment, and its BYTES are what the renderer lays now ([`twin_is_rendered`]):
         // a twin that forwards and exports right but renders differently — laid before
@@ -351,8 +372,8 @@ pub fn reconcile_agents(layout: &Layout) {
             .and_then(|()| platform::install_twin_to_env(&twin, &target, &env, &prelude));
         if let Err(e) = laid {
             eprintln!(
-                "atpkg: {name}: the agents/ twin {} was not laid ({e}) — bin/{name} is in \
-                 place; retried next pass",
+                "atpkg: {name}: agents/ twin {} not laid ({e}); bin/{name} is in place; \
+                 retried next pass",
                 twin.display()
             );
         }
@@ -368,10 +389,9 @@ fn twin_is_rendered(
     env: &crate::shim_env::ShimEnv,
     prelude: &str,
 ) -> bool {
-    // On every platform: a Windows twin laid from 2026-09-17 to 2026-09-22 carries the
-    // landing prelude, and today's `.cmd` twin is the plain framed shim, so it is re-laid
-    // once. Safe while it runs: every `.cmd` starts with the frame
-    // (`platform::CMD_FRAME_HEAD`) and ends its batch on the line that runs the program,
+    // On every platform: an older Windows twin carries the landing prelude, and today's `.cmd` twin
+    // is the plain framed shim, so it is re-laid once. Safe while it runs: every `.cmd` starts with
+    // the frame (`platform::CMD_FRAME_HEAD`) and ends its batch on the line that runs the program,
     // so `cmd.exe`'s byte-offset resume never re-reads the new file. Unverified on Windows.
     platform::twin_executable_to_env(shim, target, env, prelude).is_ok_and(|want| {
         crate::metadata_io::read_bounded_regular(shim, platform::MAX_SHIM_BYTES)
@@ -430,7 +450,7 @@ pub fn sweep_agents_dir(layout: &Layout) {
                             .is_some_and(|(p, _)| crate::stub::is_agent_program(&p))
                             && platform::resolve_shim(&layout.shim(&tool)).is_some_and(|b| b == t)
                     })
-                        // An agent program's PENDING stub stands here too (2026-09-15),
+                        // An agent program's PENDING stub stands here too,
                         // until its build arrives and the twin replaces it.
                         || (crate::stub::is_pending_stub(&entry.path())
                             && !installed.contains_key(tool.as_str())))
@@ -565,11 +585,10 @@ pub(crate) fn shim_env_drift(
 /// WHY THE PASS NEEDS IT. An up-to-date program is never laid again: the index lane's
 /// `UpToDate` and the vendor lane's `KeepReason::UpToDate` both return before any shim is
 /// rendered. So a `claude` shim laid PLAIN over a build whose sidecar declares
-/// `DISABLE_AUTOUPDATER=1` — every `repair` before 2026-09-23 laid it so — stayed plain
-/// until the program's next build landed (for a held `claude`, forever), and
-/// [`reconcile_agents`] mirrored it onto the front-of-PATH twin: Claude Code's own updater
-/// back on under the managed name, pass after pass, with nothing said (audit
-/// 2026-09-23). The exec roots got [`crate::compat::reconcile`] for the same reason.
+/// `DISABLE_AUTOUPDATER=1` would stay plain until the program's next build landed (for a
+/// held `claude`, forever), and [`reconcile_agents`] would mirror it onto the
+/// front-of-PATH twin: Claude Code's own updater back on under the managed name. The exec
+/// roots got [`crate::compat::reconcile`] for the same reason.
 ///
 /// The target is the primary's own, as spelled on disk — never a re-derived path, for the
 /// reason [`reconcile_aliases`] gives — and the render goes through the one shim renderer,
@@ -596,8 +615,8 @@ pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]
                     said.push(drift.declared.spelled());
                 }
                 Err(e) => eprintln!(
-                    "atpkg: {} does not export {}, which its build declares, and could not be \
-                     re-rendered ({e}) — retried next pass",
+                    "atpkg: {} lacks its build's {} export; re-render failed ({e}); \
+                     retried next pass",
                     shim.display(),
                     drift.declared.spelled()
                 ),
@@ -618,8 +637,8 @@ pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]
             }
         }
         Err(e) => eprintln!(
-            "atpkg: {} shim(s) that do not export what their build declares were not re-laid \
-             ({e}) — retried next pass",
+            "atpkg: {} shim(s) lacking their build's exports not re-laid ({e}); retried next \
+             pass",
             paths.len()
         ),
     }
@@ -750,7 +769,7 @@ pub(crate) fn undo_activation(layout: &Layout, build_dir: &Path) {
 /// A tombstone is still a shim, so it must never shadow a sensitive name either — which is now
 /// a property of the argument type rather than a repeated `shim_allowed` call: a tool named
 /// `sudo`/`git`/… has no [`ToolName`], never had a live shim to disable, and cannot be named
-/// here at all. (This is why the function no longer returns "refused".)
+/// here at all.
 ///
 /// A later successful `atpkg update` re-runs [`install_shims`], whose `atomic_symlink` replaces
 /// this regular-file tombstone with a fresh symlink, so the disable clears itself on recovery.
@@ -797,10 +816,8 @@ mod tests {
     /// system shape (a brew-owned `/usr/local` does not) and accepts a `mkdir` wins.
     #[cfg(unix)]
     /// A skip here must be provably legitimate: callers skip by returning, which libtest
-    /// reports as `ok`, so a fixture that quietly stops working deletes their coverage
-    /// without failing anything. Only root can create in a root-owned parent, so an
-    /// ordinary user's `None` is a fact about the machine; from root it is a regression,
-    /// which [`system_fixture_is_available_when_this_process_could_build_one`] asserts.
+    /// reports as `ok`. Only root can create in a root-owned parent, so an ordinary
+    /// user's `None` is a fact about the machine.
     fn system_prefix_fixture(label: &str) -> Option<Layout> {
         for parent in ["/opt", "/usr/local", "/var/lib", "/usr/lib"] {
             let prefix =
@@ -828,13 +845,8 @@ mod tests {
         None
     }
 
-    fn temp_prefix(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-act-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Layout { prefix: p }
+    fn temp_prefix(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-act-{label}-"))
     }
 
     fn tool(name: &str) -> ToolName {
@@ -1345,33 +1357,13 @@ mod tests {
     ///
     /// Skips when this run cannot build an all-root-owned chain (see
     /// [`system_prefix_fixture`]); the `$HOME` shape is covered above.
-    /// The fixture's `None` is only credible from a process that could not have built the
-    /// shape. Root could have, so from root a `None` is the fixture quietly regressing while
-    /// every test that guards on it goes on reporting `ok`.
-    #[cfg(unix)]
-    #[test]
-    fn system_fixture_is_available_when_this_process_could_build_one() {
-        // SAFETY: `geteuid` reads this process's own effective uid and cannot fail.
-        let root = unsafe { libc::geteuid() } == 0;
-        if !root {
-            return;
-        }
-        let layout = system_prefix_fixture("mode-probe").expect(
-            "running as root, so a root-owned system-shaped prefix is buildable — \
-             a `None` here means the fixture has stopped working and every test \
-             that guards on it is silently asserting nothing",
-        );
-        let _ = std::fs::remove_dir_all(&layout.prefix);
-    }
-
     #[cfg(unix)]
     #[test]
     fn a_system_shaped_prefix_publishes_bin_traversable() {
         let Some(layout) = system_prefix_fixture("mode-sys") else {
-            // Not root: the shape is genuinely unbuildable here, and
-            // `system_fixture_is_available_when_this_process_could_build_one` keeps that
-            // excuse honest. Say so — this is the only assertion that tells the two prefix
-            // shapes apart, so a silent `ok` would misreport it as covered.
+            // Not root: the shape is genuinely unbuildable here. Say so — this is the
+            // only assertion that tells the two prefix shapes apart, so a silent `ok`
+            // would misreport it as covered.
             eprintln!(
                 "SKIP: a_system_shaped_prefix_publishes_bin_traversable \
                  needs a root-owned system prefix (run as root to gate it)"
@@ -1400,8 +1392,8 @@ mod tests {
     /// `undo_activation` unwinds exactly the DOOMED build's footprint and nothing wider:
     /// the doomed build's witness link and shim both go, a bystander program activated
     /// afterwards keeps both. Without the
-    /// undo, the sysroot resolve-check discard (`flow::install_program`) left both `current` links and
-    /// the written shims dangling into a deleted tree.
+    /// undo, the sysroot resolve-check discard (`flow::install_program`) left both `current` links
+    /// and the written shims dangling into a deleted tree.
     #[test]
     fn undo_activation_unwinds_only_the_doomed_build() {
         let layout = temp_prefix("undo");
@@ -1664,7 +1656,6 @@ mod tests {
         }
         // A symlink an older atpkg left reads as not rendered, the rendered file as rendered.
         let target = platform::resolve_shim(&layout.shim(&claude)).unwrap();
-        assert!(shim_is_rendered(&layout.shim(&claude), &target, &env));
         let link = layout.prefix.join("old-symlink-shim");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(!shim_is_rendered(&link, &target, &env));
@@ -1673,6 +1664,7 @@ mod tests {
         for (p, want) in [&alias, &twin].iter().zip(&rendered) {
             assert_eq!(&std::fs::read(p).unwrap(), want, "{} re-laid", p.display());
         }
+        assert!(shim_is_rendered(&alias, &target, &env));
         let stamp = |p: &Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
         let before = (stamp(&alias), stamp(&twin));
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1687,7 +1679,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE AGENTS TWIN (owner decision 2026-09-10): installing an agent program lays
+    /// THE AGENTS TWIN: installing an agent program lays
     /// `agents/<tool>` beside `bin/<tool>` — same target, same exported env — and nothing
     /// else ever lands in `agents/`: an ALab tool gets no twin, a hand-dropped file and a
     /// foreign name are swept, the twin follows its primary across an update, a
@@ -1797,15 +1789,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE TWIN CARRIES THE SELF-UPDATE BLOCK AND NO LANDING PRELUDE (Phase 2,
-    /// 2026-09-22, `crate::landing`; from 2026-09-16 this test pinned the landing prelude
-    /// in the twin): the `case "$1"` on the rostered verbs and the hand-over to `atpkg
-    /// __selfupdate` with the prefix operand, ahead of the exports; no `[ -f <marker> ]`,
-    /// no `__landing`; `bin/` carries neither. Every reader keyed on the target still
-    /// resolves the twin to the STORE target; the twin is laid once and a second reconcile
-    /// writes nothing; and the twins older clients laid — the primary's bytes (before any
-    /// block), the landing-only twin (2026-09-16 to 2026-09-18) and the block-then-landing
-    /// twin (2026-09-19 to 2026-09-22) — are each re-laid to today's once. A marker left
+    /// THE TWIN CARRIES THE SELF-UPDATE BLOCK AND NO LANDING PRELUDE: the `case "$1"` on the
+    /// rostered verbs and the hand-over to `atpkg __selfupdate` with the prefix operand, ahead of
+    /// the exports; no `[ -f <marker> ]`, no `__landing`; `bin/` carries the same block and no
+    /// landing prelude either (outside aterm `bin/claude` IS the managed name). Every reader keyed
+    /// on the target still resolves the twin to the STORE target; the twin is laid once and a
+    /// second reconcile writes nothing; and the twins older clients laid — the primary's
+    /// bytes (before any block), the landing-only twin and the block-then-landing twin —
+    /// are each re-laid to today's once. A marker left
     /// standing changes nothing: the twin runs the store build.
     #[cfg(unix)]
     #[test]
@@ -1850,9 +1841,9 @@ mod tests {
             !twin_body.contains("command -v atpkg") && !twin_body.contains("exec atpkg "),
             "no PATH fallback (review, 2026-09-16): {twin_body}"
         );
-        assert!(
-            !primary_body.contains("__selfupdate") && !primary_body.contains("case \"$1\""),
-            "bin/ carries no block: {primary_body}"
+        assert_eq!(
+            primary_body, twin_body,
+            "bin/ carries the twin's block: outside aterm it is the managed name"
         );
         // The block sits AHEAD of the exports, and the real exec is the last line.
         let block_at = twin_body.find("case \"$1\"").unwrap();
@@ -1890,8 +1881,8 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&twin).unwrap(), twin_body);
         // The twins older clients laid, each re-laid to today's on the next reconcile:
-        // the primary's bytes (before any block); the LANDING-ONLY twin (2026-09-16 to
-        // 2026-09-18); the BLOCK-THEN-LANDING twin (2026-09-19 to 2026-09-22).
+        // the primary's bytes (before any block); the LANDING-ONLY twin; the
+        // BLOCK-THEN-LANDING twin.
         let atpkg = crate::stub::co_located_atpkg_path();
         let landing = platform::sh_landing_prelude("claude", &layout.prefix, &marker, &atpkg);
         let mut block_then_landing = platform::sh_selfupdate_prelude(
@@ -1902,7 +1893,10 @@ mod tests {
         );
         block_then_landing.push_str(&landing);
         for (what, older) in [
-            ("before any block", primary_body.clone()),
+            (
+                "before any block",
+                platform::sh_shim_content_twin(&c1.join("bin/claude"), &env, None, ""),
+            ),
             (
                 "landing-only",
                 platform::sh_shim_content_twin(&c1.join("bin/claude"), &env, None, &landing),
@@ -1961,16 +1955,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE PRELUDE NEVER STRANDS THE TOOL (review, 2026-09-16), run through a real
-    /// `/bin/sh`: the self-update block (2026-09-19, `crate::selfupdate`) hands `update`
+    /// THE PRELUDE NEVER STRANDS THE TOOL, run through a real `/bin/sh`: the self-update
+    /// block (`crate::selfupdate`) hands `update`
     /// and `install latest --force` as the FIRST argument to the embedded atpkg as
     /// `__selfupdate claude <prefix> -- <args verbatim>`; `--probe`, `-p update` and
     /// `--debug install` run the store build untouched (the first token only — a prompt
     /// and a debug filter are not verbs); with the embedded atpkg gone, `update` runs the
     /// store build with nothing printed and exit 0 — an OLDER `atpkg` on `PATH` that would
     /// answer `unknown verb` exit 2 is never consulted. AND A STANDING LANDING MARKER
-    /// CHANGES NOTHING (Phase 2, 2026-09-22; until then a non-verb under a marker went to
-    /// `__landing`): today's twin runs the store build; only a twin an older client laid
+    /// CHANGES NOTHING: today's twin runs the store build; only a twin an older client laid
     /// with the landing prelude still hands a non-verb to `__landing`, which now `exec`s
     /// `bin/<program>` at once (`cli::cmd_landing`).
     #[cfg(unix)]
@@ -2111,7 +2104,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The twin is BEST-EFFORT and agent-store-only (review 2026-09-10): with `agents/`
+    /// The twin is BEST-EFFORT and agent-store-only: with `agents/`
     /// unmakeable (a file squats on its name) an `ay` install — and a `claude` install —
     /// still succeeds, `bin/` is laid, and nothing in `agents/` is claimed; and a
     /// `bin/claude` that resolves into a NON-agent store tree earns no twin, which is the
@@ -2168,12 +2161,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE AGENTS RECONCILE IS THE PASS'S, NOT EVERY PROGRAM'S (audit 2026-09-15).
-    /// [`reconcile_aliases`] runs once per ACTIVE PROGRAM and [`reconcile_agents`] answers
-    /// for none of them in particular, so hanging the second off the end of the first made
-    /// a P-program machine do the whole agents reconcile P times per pass. The alias
-    /// reconcile now leaves `agents/` alone; the pass calls [`reconcile_agents`] once after
-    /// its loop.
+    /// THE AGENTS RECONCILE IS THE PASS'S, NOT EVERY PROGRAM'S. [`reconcile_aliases`] runs
+    /// once per ACTIVE PROGRAM, so it leaves `agents/` alone; the pass calls
+    /// [`reconcile_agents`] once after its loop.
     #[cfg(unix)]
     #[test]
     fn the_alias_reconcile_leaves_the_agents_twin_to_the_once_per_pass_reconcile() {
@@ -2451,7 +2441,7 @@ mod tests {
     }
 
     /// The Windows `.cmd` alias, as content: the resume-proof frame every `.cmd` starts
-    /// with (2026-09-18), then the shim named for the ALIAS forwarding to the PRIMARY's
+    /// with, then the shim named for the ALIAS forwarding to the PRIMARY's
     /// `.exe`, ending its batch on that line — pure, so it is pinned from every build
     /// host.
     #[test]

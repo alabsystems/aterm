@@ -2,9 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Edge-case verification for `advance_grapheme_unit` (#5951 Prover verification).
-//!
-//! Migrated from aterm-core as part of #6556 Batch 2.
+//! Edge cases for `advance_grapheme_unit`.
 
 use super::super::*;
 
@@ -69,10 +67,8 @@ fn advance_grapheme_unit_single_ascii() {
     assert_eq!(byte_idx, 1, "should advance exactly 1 byte for ASCII");
 }
 
-/// Effective width replays the live writer's VS16 widening: `❤` (U+2764,
-/// text-presentation default, width 1) + VS16 must come back WIDE — the two
-/// columns `widen_previous_cell_for_vs16` gave the live cell — so scrolled-back
-/// rows do not shift the text after the heart by one column.
+/// Effective width replays the live writer's VS16 widening: `❤` + VS16 comes
+/// back wide, so text after the heart does not shift.
 #[test]
 fn advance_grapheme_unit_wide_vs16_widens_narrow_emoji() {
     use crate::grid::scroll_materialize::advance_grapheme_unit_wide;
@@ -93,9 +89,8 @@ fn advance_grapheme_unit_wide_vs16_widens_narrow_emoji() {
     assert!(!wide, "VS16 must not widen a non-emoji-capable base");
 }
 
-/// Effective width replays the live writer's VS15 narrowing: `⌚` (U+231A,
-/// emoji-presentation default, width 2) + VS15 must come back NARROW — matching
-/// `narrow_previous_cell_for_vs15` — and a bare `⌚` stays wide.
+/// Effective width replays VS15 narrowing: `⌚` + VS15 comes back narrow, and a
+/// bare `⌚` stays wide.
 #[test]
 fn advance_grapheme_unit_wide_vs15_narrows_wide_emoji() {
     use crate::grid::scroll_materialize::advance_grapheme_unit_wide;
@@ -115,15 +110,14 @@ fn advance_grapheme_unit_wide_vs15_narrows_wide_emoji() {
     assert!(wide, "a bare watch keeps its default 2-cell width");
 }
 
-/// The skin-tone fold gates on the EFFECTIVE width, mirroring the live
-/// `try_combine_skin_tone_modifier` (which requires the previous CELL to be
-/// wide): a text-presentation `☝🏽` stays SPLIT (the live modifier fell through
-/// to its own wide cell), while the VS16-widened `☝️🏽` folds into one unit.
+/// The skin-tone fold gates on effective width, as the live
+/// `try_combine_skin_tone_modifier` does: text-presentation `☝🏽` stays split,
+/// VS16-widened `☝️🏽` folds into one unit.
 #[test]
 fn advance_grapheme_unit_wide_skin_tone_fold_gates_on_effective_width() {
     use crate::grid::scroll_materialize::advance_grapheme_unit_wide;
 
-    // Narrow base (no VS16): the modifier must START A NEW UNIT.
+    // Narrow base (no VS16): the modifier starts a new unit.
     let text = "\u{261D}\u{1F3FD}Z";
     let mut byte_idx = 0;
     let u = advance_grapheme_unit_wide(text, &mut byte_idx);
@@ -167,10 +161,9 @@ fn advance_grapheme_unit_zwj_emoji_sequence() {
     assert_eq!(byte_idx, text.len());
 }
 
-/// A pathological endless ZWJ chain (as a crafted checkpoint / injected scrollback
-/// `Line` can hold) must NOT be consumed into one unbounded grapheme unit: the
-/// byte ceiling bounds `unit_str` so it cannot be allocated whole into a single
-/// `complex_char` cell (memory-amplification DoS). The excess forms later units.
+/// An endless ZWJ chain (from a crafted checkpoint or scrollback `Line`) is not
+/// consumed into one unit: a byte ceiling bounds `unit_str`, and the excess
+/// forms later units.
 #[test]
 fn advance_grapheme_unit_bounds_pathological_zwj_chain() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
@@ -234,11 +227,9 @@ fn materialize_consecutive_combining_marks() {
     assert_eq!(row.cells[1].char(), 'X', "col 1 should be 'X'");
 }
 
-/// A wide char that cannot fit at the last column must STOP materialization, not
-/// leave `col` stuck while the loop scans the rest of a (possibly injected,
-/// over-long) line — an O(line length) spin under the lock. With cols=1 the leading
-/// wide emoji cannot fit; without the col-progress break the following 'X' would be
-/// placed at col 0 (and an oversized all-wide line would be scanned in full).
+/// A wide char that cannot fit at the last column stops materialization rather
+/// than scanning the rest of the line with `col` stuck: with cols=1 the leading
+/// wide emoji does not fit and the following 'X' is not placed.
 #[test]
 fn materialize_stops_when_wide_char_cannot_fit_at_last_column() {
     use crate::grid::scroll_materialize::materialize_from_line;

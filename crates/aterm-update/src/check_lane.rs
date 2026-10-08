@@ -293,6 +293,6 @@ mod tests {
             "interval=0 dedup must stop without another wait"
         );
         assert!(lane.try_lock().is_some());
-        let _ = std::fs::remove_dir_all(staging.root);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 }

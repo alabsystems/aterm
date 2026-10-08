@@ -25,9 +25,6 @@
 //! fail every TLS connection on an ordinary machine. The two entry points are
 //! kept apart rather than the strict one being relaxed, because the strictness
 //! is the documented contract for an operator's bundle.
-//!
-//! Base64 comes from `aterm-codec`, already first-party and already in the
-//! shipped graph; `ureq` used its own `ureq::tls::PemItem` for this.
 
 /// Why a PEM bundle could not be decoded.
 #[derive(Debug)]

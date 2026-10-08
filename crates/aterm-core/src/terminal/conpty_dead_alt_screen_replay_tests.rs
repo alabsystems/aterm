@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! A full-screen app killed under Windows ConPTY, replayed from the reads the
-//! `cast` tap recorded on 2026-09-27 (the fixtures' headers say how). The
-//! scaled streams in `handler_dec.rs` (`conhost_left_alt_screen_tests`) pin
-//! each rule; these pin the whole measured session, byte for byte, and with it
-//! what the terminal side can and cannot do about conhost's own screen state
-//! (`TerminalHandler::leave_orphaned_alternate_screen` has the account).
+//! A full-screen app killed under Windows ConPTY, replayed from reads recorded
+//! by the `cast` tap (the fixtures' headers say how). The scaled streams in
+//! `handler_dec.rs` (`conhost_left_alt_screen_tests`) pin each rule; these pin
+//! the whole session byte for byte, and what the terminal can and cannot do
+//! about conhost's own screen state (see
+//! `TerminalHandler::leave_orphaned_alternate_screen`).
 use crate::terminal::Terminal;
 
 /// 40 history rows, `less`, `Stop-Process` on it, two commands, a second
@@ -16,7 +16,7 @@ const KILLED_THEN_SECOND_PAGER: &str =
     include_str!("testdata/conpty_killed_pager_then_second_pager.reads");
 
 /// The same, with one command right after the kill that writes `ESC[?1049l`
-/// to the console: a console CLIENT leaving the dead app's buffer.
+/// to the console: a console client leaving the dead app's buffer.
 const KILLED_THEN_CONSOLE_RESYNC: &str =
     include_str!("testdata/conpty_killed_pager_console_resync.reads");
 
@@ -145,12 +145,10 @@ fn the_next_pager_after_a_kill_shows_the_consoles_frozen_screen_and_loses_no_row
     for want in TYPED_AFTER_THE_KILL {
         assert_eq!(count(&all, want), 1, "{want:?}: {all:?}");
     }
-    // conhost's `?1049h` replaced the buffer the rows above were printed on,
-    // and its `?1049l` went back to the primary buffer it froze when the killed
-    // pager entered: its repaint is the screen from before the kill, with the
-    // prompt on the row that pager's `?1049h` saved. The terminal cannot keep
-    // conhost from drawing it, so the screen is conhost's and the rows it lost
-    // are in the scrollback just above.
+    // conhost's `?1049l` returns to the primary buffer it froze when the killed
+    // pager entered, so its repaint is the pre-kill screen with the prompt on
+    // the row that `?1049h` saved. The terminal cannot stop that repaint; the
+    // rows it lost are in the scrollback just above.
     let rows = screen(&term);
     for (row, n) in (20..=40).enumerate() {
         assert_eq!(rows[row], history(n));

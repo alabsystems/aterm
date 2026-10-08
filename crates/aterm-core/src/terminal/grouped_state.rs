@@ -1,11 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Grouped sub-state structs for [`Terminal`](super::Terminal).
-//!
-//! Each struct bundles related fields that are passed together to
+//! Grouped sub-state structs for [`Terminal`](super::Terminal), each bundling
+//! fields passed together to
 //! [`TerminalHandler`](super::handler::TerminalHandler) during processing.
-//! Extracted from `terminal/mod.rs` to reduce file size (#1977).
 
 mod protocol;
 
@@ -18,9 +16,8 @@ use aterm_types::{ColorPalette, Rgb};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-// Re-exports for TerminalHandler struct field types (#2157).
-// These let handler.rs import via `super::` instead of reaching directly into
-// external crate modules, reducing handler.rs fan-out from 11 to 5.
+// Re-exports for TerminalHandler field types, so handler.rs imports via
+// `super::` rather than reaching into external crates.
 #[cfg(feature = "sixel")]
 pub(super) use protocol::SixelState;
 pub(super) use protocol::{DcsState, DcsType};
@@ -51,12 +48,9 @@ impl MarksState {
     }
 }
 
-/// A snapshot of all color state saved by OSC 30001 (XTPUSHCOLORS).
-///
-/// Per the Kitty color stack protocol, push/pop must save and restore
-/// the full set of dynamic colors — not just the 256-color palette.
-/// This bundles palette, default foreground/background, cursor color,
-/// and both selection colors into a single stack entry.
+/// A snapshot of all color state saved by OSC 30001 (XTPUSHCOLORS). Per the
+/// Kitty color stack protocol, push/pop covers every dynamic color: palette,
+/// default fg/bg, cursor and both selection colors.
 #[derive(Debug, Clone)]
 pub(super) struct ColorStackEntry {
     /// The 256-color palette snapshot.
@@ -73,16 +67,11 @@ pub(super) struct ColorStackEntry {
     pub(super) selection_foreground: Option<Rgb>,
 }
 
-/// Grouped state for terminal color management.
-///
-/// Bundles the 256-color palette, default foreground/background colors,
-/// cursor color, selection foreground/background, and the color stack used by
-/// Kitty's OSC 30001/30101 push/pop protocol. Accessed from OSC handlers
-/// (handler_osc.rs), SGR resolution (handler_sgr.rs), config API, and
-/// the public colors API.
+/// Grouped color state: the 256-color palette, default fg/bg, cursor color,
+/// selection fg/bg, and the Kitty OSC 30001/30101 color stack.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "the three frame_*_authoritative flags are INDEPENDENT per-channel authority bits (fg, bg, cursor can each be host- or OSC-owned in any combination), so they are not a state machine an enum could model; bold_is_bright is an unrelated rendering flag"
+    reason = "independent per-channel authority bits (fg, bg, cursor) plus an unrelated rendering flag, not a state machine"
 )]
 pub(super) struct ColorState {
     /// Maps 256 indexed colors to RGB values (OSC 4).
@@ -93,70 +82,51 @@ pub(super) struct ColorState {
     pub(super) default_foreground: Rgb,
     /// Default background color (OSC 11, reset via OSC 111).
     pub(super) default_background: Rgb,
-    /// Theme-configured foreground color, set by `apply_config`.
-    ///
-    /// OSC 110 resets `default_foreground` to this value (not the hardcoded
-    /// constant). Updated whenever the host applies a new theme (#7443).
+    /// Theme-configured foreground color, set by `apply_config`; OSC 110
+    /// resets `default_foreground` to it.
     pub(super) configured_foreground: Rgb,
     /// Whether a host setter/config or an OSC mutation made the foreground
-    /// authoritative for render snapshots. A pristine `Terminal::new` retains
-    /// the historical renderer-theme fallback until one of those boundaries.
+    /// authoritative for render snapshots. A fresh `Terminal::new` leaves it
+    /// false, so the renderer's theme applies.
     pub(super) frame_foreground_authoritative: bool,
-    /// Theme-configured background color, set by `apply_config`.
-    ///
-    /// OSC 111 resets `default_background` to this value (not the hardcoded
-    /// constant). Updated whenever the host applies a new theme (#7443).
+    /// Theme-configured background color, set by `apply_config`; OSC 111
+    /// resets `default_background` to it.
     pub(super) configured_background: Rgb,
     /// Whether a host setter/config or an OSC mutation made the background
     /// authoritative for render snapshots.
     pub(super) frame_background_authoritative: bool,
-    /// Theme-configured palette, set by `apply_config` when the theme
-    /// provides `custom_palette`.
-    ///
-    /// OSC 104 (reset indexed colors) resets to this palette instead of
-    /// hardcoded xterm defaults, matching the OSC 110/111 pattern for
-    /// foreground/background. `None` means no theme palette was configured,
-    /// so resets fall back to xterm defaults.
+    /// Theme-configured palette, set by `apply_config` when the theme provides
+    /// `custom_palette`. OSC 104 resets to it; `None` resets to xterm defaults.
     pub(super) configured_palette: Option<ColorPalette>,
-    /// Theme-configured cursor color, set by `apply_config`.
-    ///
-    /// OSC 112 and RIS restore this value. `None` means the configured
-    /// fallback is the live default foreground.
+    /// Theme-configured cursor color, set by `apply_config`, restored by OSC
+    /// 112 and RIS. `None` falls back to the live default foreground.
     pub(super) configured_cursor: Option<Rgb>,
     /// Whether a host setter/config or an OSC mutation made the cursor policy
-    /// authoritative for render snapshots. This is distinct from
-    /// `cursor_color.is_some()`: OSC 21 `cursor=` deliberately selects an
-    /// authoritative dynamic foreground fallback.
+    /// authoritative for render snapshots. Distinct from
+    /// `cursor_color.is_some()`: OSC 21 `cursor=` selects an authoritative
+    /// dynamic foreground fallback.
     pub(super) frame_cursor_authoritative: bool,
     /// Cursor color (OSC 12, reset via OSC 112). None = use foreground.
     pub(super) cursor_color: Option<Rgb>,
-    /// Host-configured selection background.
-    ///
-    /// OSC 117 and RIS restore this value, preserving the same reset-to-theme
-    /// contract as the configured foreground/background/cursor colors.
+    /// Host-configured selection background, restored by OSC 117 and RIS.
     pub(super) configured_selection_background: Option<Rgb>,
     /// Selection background color (OSC 21). None = renderer default.
     pub(super) selection_background: Option<Rgb>,
-    /// Host-configured selection foreground.
-    ///
-    /// OSC 119 and RIS restore this value, mirroring the configured selection
-    /// background. `None` delegates selected-text contrast to the renderer.
+    /// Host-configured selection foreground, restored by OSC 119 and RIS.
+    /// `None` leaves selected-text contrast to the renderer.
     pub(super) configured_selection_foreground: Option<Rgb>,
     /// Selection foreground color (OSC 19). None = renderer default.
     pub(super) selection_foreground: Option<Rgb>,
-    /// Host style policy (W5f): SGR 1 promotes indexed 0–7 to bright 8–15.
+    /// Host style policy: SGR 1 promotes indexed 0–7 to bright 8–15.
     /// Config-level (like `configured_*`), so `reset()` leaves it alone.
     pub(super) bold_is_bright: bool,
-    /// Host style policy (W5e): fraction of fg retained by SGR 2, blended
+    /// Host style policy: fraction of fg retained by SGR 2, blended
     /// toward the cell bg in linear light. Config-level; survives `reset()`.
     pub(super) faint_opacity: f32,
     /// Callback for dynamic color changes (OSC 10/11/12, OSC 110/111/112).
     pub(super) change_callback: Option<super::callbacks::ColorChangeCallback>,
-    /// Callback for dynamic color queries (OSC 10/11/12 with `?`).
-    ///
-    /// When set, called before responding to color queries. If the callback
-    /// returns `Some(Rgb)`, that color is used in the response instead of
-    /// the palette color. Returns `None` to use the palette color.
+    /// Callback for dynamic color queries (OSC 10/11/12 with `?`). A
+    /// `Some(Rgb)` result replaces the palette color in the response.
     pub(super) query_callback: Option<super::callbacks::ColorQueryCallback>,
 }
 
@@ -186,13 +156,10 @@ impl ColorState {
         }
     }
 
-    /// Reset all color state to defaults (RIS / Terminal::reset).
-    ///
-    /// Restores palette, dynamic colors, cursor color, and color stack
-    /// to their theme-configured values (not hardcoded constants).
-    /// Preserves callbacks (they are transport-level registrations,
-    /// not terminal state) and configured defaults (they are
-    /// theme-level settings, not terminal state).
+    /// Reset all color state to the theme-configured values (RIS /
+    /// Terminal::reset): palette, dynamic colors, cursor color and color stack.
+    /// Callbacks and configured defaults are kept (they are not terminal
+    /// state).
     pub(super) fn reset(&mut self) {
         if let Some(ref configured) = self.configured_palette {
             self.palette = configured.clone();
@@ -200,10 +167,9 @@ impl ColorState {
             self.palette.reset();
         }
         self.stack.clear();
-        // OSC 110/111 (and RIS/DECSTR) reset to the CONFIGURED default, never to a
-        // transient state: a reverse-video swap (SGR 7 / DECSCNM) is applied at
-        // RENDER time in color_resolve, so it neither survives nor is captured by this
-        // reset — standard xterm semantics (reset-to-configured, not reset-to-current).
+        // Reset to the configured default, never a transient state: reverse
+        // video (SGR 7 / DECSCNM) is applied at render time in color_resolve, so
+        // it is neither captured nor preserved here (xterm semantics).
         self.default_foreground = self.configured_foreground;
         self.default_background = self.configured_background;
         self.cursor_color = self.configured_cursor;
@@ -212,10 +178,8 @@ impl ColorState {
     }
 }
 
-/// Tracks the last accepted OSC 133 shell integration marker (A/B/C/D).
-///
-/// Used to enforce the valid A→B→C→D state machine transition order.
-/// Out-of-order markers are silently ignored, matching Terminal behavior (#7668).
+/// The last accepted OSC 133 shell integration marker (A/B/C/D), enforcing
+/// the A→B→C→D order; out-of-order markers are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ShellIntegrationPhase {
     /// No marker has been accepted yet (initial state, or after reset).
@@ -238,10 +202,9 @@ pub(super) enum ShellIntegrationPhase {
 pub(super) struct ShellIntegrationState {
     /// Shell integration state machine (OSC 133).
     pub(super) state: ShellState,
-    /// Current phase in the A→B→C→D state machine.
-    ///
-    /// Enforces valid transitions: only `None`/`CommandFinished` → A,
-    /// A → B, B → C, C → D. Out-of-order markers are silently ignored (#7668).
+    /// Current phase in the A→B→C→D state machine: only `None`/
+    /// `CommandFinished` → A, A → B, B → C, C → D; out-of-order markers are
+    /// ignored.
     pub(super) phase: ShellIntegrationPhase,
     /// Current command mark being built (OSC 133).
     pub(super) current_mark: Option<CommandMark>,
@@ -253,25 +216,20 @@ pub(super) struct ShellIntegrationState {
     pub(super) current_block: Option<OutputBlock>,
     /// Next block ID to assign.
     pub(super) next_block_id: u64,
-    /// Monotonic count of COMPLETED commands (OSC 133;D observed). Strictly
-    /// increases per completion — the unambiguous "did a new command finish"
-    /// probe (two completions in one millisecond share an end timestamp but
-    /// never a seq). Preserved across `reset()` like `next_block_id`, so a
-    /// reset can never replay an old value to observers.
+    /// Monotonic count of completed commands (OSC 133;D). Unlike end
+    /// timestamps it never repeats, so it answers "did a new command finish".
+    /// Preserved across `reset()` like `next_block_id`.
     pub(super) completed_seq: u64,
-    /// Session counter: number of times a block's command/output read found the
-    /// block's rows already EVICTED from scrollback (DL-1 observability). Uses a
-    /// `Cell` so the `&self` `block_output`/`block_command` accessors can record
-    /// an eviction without taking `&mut self`.
+    /// Number of block command/output reads that found the block's rows
+    /// already evicted from scrollback. A `Cell` so the `&self` accessors can
+    /// count.
     pub(super) eviction_reads: std::cell::Cell<u64>,
-    /// Which integration BODY the shell runs (the LOADER / BODY split,
-    /// 2026-09-26): the 16 lowercase hex digits of the script folder its body
-    /// came from, as the body signs it before every prompt
+    /// Which integration body the shell runs: the 16 lowercase hex digits of
+    /// its script folder, as the body signs before every prompt
     /// (`633;P;AtermIntegration=<rev>;id=<nonce>`). Recorded only from a mark
-    /// that passed the nonce gate, so a program's output cannot claim one;
-    /// `None` until the first. Kept across `reset()`: a RIS clears the screen,
-    /// not the shell's script. Carried across a seamless update by the carry
-    /// projections, like the nonce (`TerminalCheckpoint::shell_integration_rev`).
+    /// that passed the nonce gate; `None` until the first. Kept across
+    /// `reset()` (RIS does not change the shell's script) and carried across a
+    /// seamless update like the nonce (`TerminalCheckpoint::shell_integration_rev`).
     pub(super) integration_rev: Option<[u8; 16]>,
 }
 
@@ -299,16 +257,14 @@ impl ShellIntegrationState {
         self.command_marks.clear();
         self.output_blocks.clear();
         self.current_block = None;
-        // next_block_id is NOT reset so block IDs stay unique across resets
+        // next_block_id is not reset so block IDs stay unique across resets
     }
 }
 
-/// Grouped cursor save/restore state for DECSC/DECRC and mode 1049 screen switches.
-///
-/// Bundles the per-buffer cursor save slots — one per screen, exactly like
-/// xterm's `screen->sc[whichBuf]`. DECSC/DECRC, SCOSC/SCORC, mode 1048, and
-/// mode 1049 all share these slots (xterm CursorSave/CursorRestore), so a
-/// 1049 round trip leaves the slot saved for a later bare DECRC.
+/// Grouped cursor save/restore state: one save slot per screen, like xterm's
+/// `screen->sc[whichBuf]`. DECSC/DECRC, SCOSC/SCORC, mode 1048 and mode 1049
+/// share these slots, so a 1049 round trip leaves the slot saved for a later
+/// bare DECRC.
 pub(super) struct CursorSaveState {
     /// Saved cursor state for main screen (xterm sc[0]).
     pub(super) main: Option<SavedCursorState>,
@@ -330,26 +286,20 @@ impl CursorSaveState {
     }
 }
 
-/// Grouped title/icon state.
-///
-/// Bundles window title (OSC 0/2), icon name (OSC 0/1), the title-change
-/// epoch, and title stack state for XTWINOPS push/pop operations.
+/// Window title (OSC 0/2), icon name (OSC 0/1), the title-change epoch and
+/// the XTWINOPS title stack.
 pub(super) struct TitleState {
     /// Window title (OSC 0 or OSC 2).
     pub(super) window: Arc<str>,
     /// Icon name (OSC 0 or OSC 1).
     pub(super) icon: Arc<str>,
-    /// Title stack for CSI 22/23 t push/pop operations.
-    ///
-    /// Stores (icon_name, window_title) pairs. Capped at `TITLE_STACK_MAX_DEPTH`
-    /// to prevent unbounded memory growth from malicious sequences.
+    /// Title stack for CSI 22/23 t: (icon_name, window_title) pairs, capped at
+    /// `TITLE_STACK_MAX_DEPTH`.
     pub(super) stack: Vec<(Arc<str>, Arc<str>)>,
-    /// Monotonic counter bumped each time a tab-LABEL value actually changes
-    /// (not on no-op re-sets): the window title, or the shell-reported cwd
-    /// (OSC 7 / OSC 633 `P;Cwd=` — shown by the GUI when no title is set).
-    /// Lets the host UI (e.g. the GUI tab strip) detect a tab's title/cwd
-    /// drift with a lock-free `Relaxed` atomic load instead of grabbing a
-    /// terminal lock per output burst. See
+    /// Monotonic counter bumped each time a tab-label value changes (not on
+    /// no-op re-sets): the window title, or the shell-reported cwd (OSC 7 / OSC
+    /// 633 `P;Cwd=`) shown when no title is set. Hosts read it with a
+    /// lock-free `Relaxed` load. See
     /// [`Terminal::title_epoch`](super::Terminal::title_epoch).
     pub(super) epoch: std::sync::atomic::AtomicU64,
 }
@@ -367,9 +317,8 @@ impl TitleState {
     /// Reset title data (xterm clears titles on RIS). Hosts see the clear
     /// through [`Terminal::title_epoch`](super::Terminal::title_epoch).
     pub(super) fn reset(&mut self) {
-        // Clearing a non-empty window title is a real title change; bump the
-        // change epoch so a host UI observing a background tab sees the RIS
-        // clear via a lock-free `title_epoch()` load (no bump if already empty).
+        // Clearing a non-empty window title is a real title change: bump the
+        // epoch so hosts see the RIS clear.
         if !self.window.is_empty() {
             self.epoch
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -380,10 +329,8 @@ impl TitleState {
     }
 }
 
-/// Grouped notification callback and accumulation state.
-///
-/// Bundles simple notifications (OSC 9), advanced/kitty notifications (OSC 99),
-/// and the pending notification map for multi-part accumulation.
+/// Notification callbacks (OSC 9, OSC 99/777) and the OSC 99 multi-part
+/// accumulation map.
 pub(super) struct NotificationState {
     /// Simple desktop notification callback (OSC 9).
     pub(super) callback: Option<NotificationCallback>,
@@ -393,14 +340,9 @@ pub(super) struct NotificationState {
     pub(super) pending: PendingNotificationsMap,
 }
 
-// NOTE: the OSC 9/99/777 notification rate-limiter (`check_rate_limit`,
-// `MAX_NOTIFICATIONS_PER_WINDOW`, `NOTIFICATION_WINDOW`, #7138) was deleted
-// here. The OSC 9/99/777 handlers (`handler_osc_notify.rs`) are gated by the
-// host's `modes.allow_notifications` authorization; the multi-part pending
-// map is bounded by `MAX_PENDING_NOTIFICATIONS`, so an unauthorized or flood
-// path cannot reach a callback or grow unbounded. A per-window callback-rate
-// limiter could be reintroduced if a host needs it; see git history for the
-// original implementation.
+// OSC 9/99/777 notifications are gated by `modes.allow_notifications`, and the
+// multi-part pending map is bounded by `MAX_PENDING_NOTIFICATIONS`; there is no
+// separate callback-rate limiter.
 
 impl NotificationState {
     pub(super) fn new() -> Self {
@@ -417,9 +359,7 @@ impl NotificationState {
     }
 }
 
-/// Grouped clipboard callback and copy-capture state.
-///
-/// Bundles OSC 52 clipboard callback with Terminal OSC 1337 CopyToClipboard state.
+/// The OSC 52 clipboard callback.
 pub(super) struct ClipboardState {
     /// Clipboard callback for OSC 52 operations.
     pub(super) callback: Option<ClipboardCallback>,
@@ -438,43 +378,33 @@ impl ClipboardState {
 pub(super) struct Iterm2State {
     /// User variables (OSC 1337 SetUserVar).
     pub(super) user_vars: UserVarsMap,
-    /// Insertion order of `user_vars` keys, for deterministic oldest-first
-    /// eviction when the map is at capacity. `UserVarsMap` is a `HashMap` whose
-    /// iteration order is non-deterministic, so eviction cannot rely on it; this
-    /// queue records first-insertion order (re-inserting an existing key does
-    /// not change its position). See `set_user_var` in `shell_api.rs`.
+    /// First-insertion order of `user_vars` keys, for deterministic
+    /// oldest-first eviction at capacity (`HashMap` iteration order is not
+    /// deterministic). Re-inserting a key keeps its position. See
+    /// `set_user_var` in `shell_api.rs`.
     pub(super) user_vars_order: std::collections::VecDeque<String>,
-    /// Cursor line highlight state (OSC 1337 HighlightCursorLine).
-    ///
-    /// `None` means no command has been received yet.
+    /// Cursor line highlight state (OSC 1337 HighlightCursorLine); `None`
+    /// until a command is received.
     pub(super) highlight_cursor_line: Option<bool>,
     /// Last reported shell integration version (OSC 1337 ShellIntegrationVersion).
     pub(super) shell_integration_version: Option<super::types::Iterm2ShellIntegrationVersion>,
     /// Current remote host (OSC 1337 RemoteHost).
     pub(super) remote_host: Option<super::types::RemoteHost>,
-    /// Cell pixel size `(width, height)` used to convert pixel/auto image
-    /// dimensions (OSC 1337 `File=`) into a CELL footprint. The frontend sets it
-    /// from its real font metrics via [`Terminal::set_cell_pixel_size`]; the
-    /// default ([`DEFAULT_CELL_PX`]) keeps the engine self-contained for headless
-    /// tests. Cell-unit dimensions (`width=10`) never consult this.
+    /// Cell pixel size `(width, height)` for converting pixel/auto image
+    /// dimensions (OSC 1337 `File=`) into a cell footprint. Set from the
+    /// frontend's font metrics via [`Terminal::set_cell_pixel_size`];
+    /// [`DEFAULT_CELL_PX`] otherwise. Cell-unit dimensions ignore it.
     pub(super) cell_px: (u16, u16),
-    /// Whether `cell_px` is a MEASUREMENT (a host called
-    /// [`Terminal::set_cell_pixel_size`]) rather than [`DEFAULT_CELL_PX`].
-    ///
-    /// The placeholder is a fine convenience for footprint arithmetic, which
-    /// has to produce *some* cell count either way. It is NOT an acceptable
-    /// answer to a question — an XTWINOPS pixel report (CSI 14 t / 16 t) that
-    /// hands back 8x16 tells a sixel or image-capable TUI to lay its output out
-    /// on a font that does not exist. Those reports consult
-    /// [`Terminal::host_cell_pixel_size`] instead and stay SILENT while this is
-    /// false, which is the honest answer for a headless engine or a session
-    /// whose renderer has not finished building.
+    /// Whether `cell_px` was measured by a host
+    /// ([`Terminal::set_cell_pixel_size`]) rather than [`DEFAULT_CELL_PX`]. The
+    /// placeholder is fine for footprint arithmetic but not as an answer: the
+    /// XTWINOPS pixel reports (CSI 14 t / 16 t) read
+    /// [`Terminal::host_cell_pixel_size`] and stay silent while this is false.
     pub(super) cell_px_from_host: bool,
 }
 
-/// Default cell pixel size used for inline-image footprint math before the
-/// frontend reports real metrics. A typical 80×24 terminal at common DPI; only
-/// affects pixel/auto-sized images, never cell-unit (`width=N`) ones.
+/// Default cell pixel size for inline-image footprint math before the frontend
+/// reports real metrics; affects only pixel/auto-sized images.
 pub(super) const DEFAULT_CELL_PX: (u16, u16) = (8, 16);
 
 impl Iterm2State {
@@ -490,18 +420,15 @@ impl Iterm2State {
         }
     }
 
-    /// The cell box a HOST measured, or `None` for the placeholder.
-    ///
-    /// The single predicate behind [`Terminal::host_cell_pixel_size`] and the
-    /// XTWINOPS pixel reports, so "is this a measurement?" is answered in one
-    /// place. A zero axis counts as unreported: no font has a zero-wide cell,
-    /// and reporting one tells the application to divide by zero.
+    /// The cell box a host measured, or `None` for the placeholder: the one
+    /// predicate behind [`Terminal::host_cell_pixel_size`] and the XTWINOPS
+    /// pixel reports. A zero axis counts as unreported.
     pub(super) fn host_cell_px(&self) -> Option<(u16, u16)> {
         let (w, h) = self.cell_px;
         (self.cell_px_from_host && w > 0 && h > 0).then_some((w, h))
     }
 
-    /// Reset data fields while preserving callbacks.
+    /// Reset the program-set fields; the host's cell size survives.
     pub(super) fn reset(&mut self) {
         self.remote_host = None;
         self.highlight_cursor_line = None;
@@ -511,16 +438,13 @@ impl Iterm2State {
     }
 }
 
-/// Grouped BiDi (bidirectional text) state.
-///
-/// Holds the BiDi configuration only — the resolver and render cache live
-/// behind the permanently compiled-out `aterm-bidi` integration.
+/// Grouped BiDi (bidirectional text) state: the configuration and, with
+/// feature `bidi`, the reorder scratch.
 pub(super) struct BiDiGroupState {
     /// BiDi configuration (mode, direction, alternate screen, etc.).
     pub(super) config: crate::config::BiDiConfig,
     /// Reusable per-row scratch buffers for the render-time visual reorder
-    /// (feature `bidi`). Held here so their capacity persists across the
-    /// `apply_bidi_reorder` row loop AND across frames.
+    /// (feature `bidi`), kept so their capacity persists across rows and frames.
     #[cfg(feature = "bidi")]
     pub(super) scratch: BidiScratch,
 }
@@ -535,11 +459,9 @@ impl BiDiGroupState {
     }
 }
 
-/// Reusable per-row scratch for BiDi visual reordering (feature `bidi`).
-///
-/// The hot `Terminal::apply_bidi_reorder` loop clears + refills these each RTL
-/// row instead of allocating fresh `Vec`s, so a stable terminal size reorders
-/// without per-row/per-frame allocation. Output stays byte-identical.
+/// Reusable per-row scratch for BiDi visual reordering (feature `bidi`):
+/// `Terminal::apply_bidi_reorder` clears and refills these for each RTL row
+/// instead of allocating.
 #[cfg(feature = "bidi")]
 pub(super) struct BidiScratch {
     /// Per-cell BiDi classes for the current row (computed once per row).
@@ -552,9 +474,8 @@ pub(super) struct BidiScratch {
     pub(super) row_tmp: Vec<crate::terminal::RenderCell>,
     /// Per-cell paired-bracket properties for the current row (UAX #9 N0).
     pub(super) brackets: Vec<aterm_bidi::Bracket>,
-    /// The UAX #9 working memory threaded into
-    /// [`aterm_bidi::reorder_cells_with_classes_into`], so the per-row resolution
-    /// reuses it instead of heap-allocating per RTL row per frame.
+    /// UAX #9 working memory for
+    /// [`aterm_bidi::reorder_cells_with_classes_into`], reused across rows.
     pub(super) bidi: aterm_bidi::Scratch,
     /// The resulting visual→logical CELL permutation.
     pub(super) cell_order: Vec<usize>,

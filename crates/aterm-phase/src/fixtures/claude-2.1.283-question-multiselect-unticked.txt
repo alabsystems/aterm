@@ -1,0 +1,45 @@
+# claude-code 2.1.283 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm (origin/main 63323e4a4, 120x44) · CASE 3c: key enter while the typed multi-select free-text row has the focus · capture c3c-03
+
+
+⏺ The user answered: "Which toppings do you want?"=""Decide yourself: choose the option that best serves long-term
+  correctness and total value, even at the cost of short-term deliverables. Say which you chose and why in one line,
+  then continue without asking again. (Answered by the aterm harness by policy; the user was not asked)."". Read the
+  answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually
+  say.
+
+✻ Baked for 4s · done 8:51 PM
+
+❯ Use the AskUserQuestion tool again exactly once with ONE question: question "Which toppings do you want?", header
+  "Toppings", multiSelect true, options "Cheese (Recommended)" (description "Melted mozzarella"), "Olives" (description
+  "Green olives") and "Basil" (description "Fresh basil leaves"). After I answer, reply with the exact tool result
+  text you received, verbatim, and nothing else.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which toppings do you want? → go with olives
+
+⏺ The user answered: "Which toppings do you want?"="go with olives". Read the answers carefully — they may request
+  clarification, changes, or that you not proceed — and follow what they actually say.
+
+✻ Cogitated for 3s · done 8:52 PM
+
+❯ Use the AskUserQuestion tool again exactly once with ONE question: question "Which toppings do you want?", header
+  "Toppings", multiSelect true, options "Cheese (Recommended)" (description "Melted mozzarella"), "Olives" (description
+  "Green olives") and "Basil" (description "Fresh basil leaves"). After I answer, reply with the exact tool result
+  text you received, verbatim, and nothing else.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Toppings  ✔ Submit  →
+
+Which toppings do you want?
+
+  1. [ ] Cheese (Recommended)
+         Melted mozzarella
+  2. [ ] Olives
+         Green olives
+  3. [ ] Basil
+         Fresh basil leaves
+❯ 4. [ ] go with olives
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel

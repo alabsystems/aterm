@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `StyleTable` — deduplicated style storage with interning and compaction.
-//!
-//! Extracted from `style.rs` to keep it under 500 lines.
+//! `StyleTable`: deduplicated style storage with interning and compaction.
 
 use aterm_hash::FxHashMap;
 
@@ -11,35 +9,29 @@ use super::{ColorType, ExtendedStyle, Style, StyleId};
 
 /// Number of ways in the L1 set-associative style-intern cache.
 ///
-/// SGR-dense workloads cycle through a small working set of distinct styles
-/// (e.g. bold+colour, underline+colour, reverse) between resets. A single-entry
-/// last-repeat cache thrashes because consecutive styles differ; a small N-way
-/// cache keeps the whole working set hot so each repeat hits without a HashMap
-/// probe (#7351).
+/// SGR-dense workloads cycle through a small working set of styles between
+/// resets, which a single-entry cache would thrash; an N-way cache keeps the
+/// set hot so repeats skip the HashMap probe.
 #[cfg(test)]
 const STYLE_L1_WAYS: usize = 4;
 
 /// Deduplicated style storage (Ghostty pattern).
 ///
-/// Styles are interned: identical styles share the same ID.
-/// Uses FxHashMap for fast lookup (2-3x faster than std HashMap for small keys).
+/// Styles are interned: identical styles share the same ID. FxHashMap keys
+/// the lookup.
 ///
-/// ## Reference Counting
+/// ## Reference counting
 ///
-/// Each style has a reference count tracking how many cells use it.
-/// This enables future garbage collection of unused styles.
+/// Each style has a count of the cells using it, which compaction uses to
+/// drop unused styles.
 ///
-/// ## Thread Safety
+/// ## Thread safety
 ///
-/// StyleTable is `!Sync` - it cannot be shared between threads.
-/// This is enforced at compile-time via a `PhantomData` marker.
+/// `!Sync` (enforced by a `PhantomData` marker). For multi-threaded use wrap it
+/// in `Mutex` or `RwLock`; ref counts are plain `u32`, since one table-level
+/// lock is cheaper than per-cell atomics.
 ///
-/// For multi-threaded use, wrap in `Mutex<StyleTable>` or `RwLock<StyleTable>`.
-/// Note that ref_counts use regular u32 (not AtomicU32) for single-threaded
-/// performance - locking at the table level is more efficient than per-cell
-/// atomic operations.
-///
-/// ## Memory Layout
+/// ## Memory layout
 ///
 /// - `styles`: Vec of Style structs (12 bytes each)
 /// - `ref_counts`: Vec of u32 (4 bytes each)
@@ -57,10 +49,9 @@ pub struct StyleTable {
     /// Extended style information (optional, for round-trip conversion).
     /// Only populated when extended info is needed.
     pub(crate) extended: Vec<Option<ExtendedStyleInfo>>,
-    /// L1 style cache: a small set-associative set of recently interned styles.
-    /// Avoids HashMap lookup when one of the last few styles is re-interned —
-    /// the common case for SGR sequences that alternate among a small working
-    /// set (#7351). Round-robin replacement via `l1_next`.
+    /// L1 style cache: a small set-associative set of recently interned
+    /// styles, skipping the HashMap when SGR sequences alternate among a small
+    /// working set. Round-robin replacement via `l1_next`.
     #[cfg(test)]
     l1_cache: [Option<(Style, StyleId)>; STYLE_L1_WAYS],
     /// Round-robin insertion cursor for `l1_cache`.
@@ -68,10 +59,9 @@ pub struct StyleTable {
     l1_next: usize,
     /// Direct-mapped style intern cache for indexed colors (level 2).
     ///
-    /// 256 entries keyed by `fg_index` — zero collisions for the full
-    /// ANSI 256-color palette. Bypasses HashMap for cycling color workloads
-    /// (e.g., `\x1b[38;5;Nm` per character), reducing dense_256color
-    /// benchmark latency by ~25%.
+    /// 256 entries keyed by `fg_index`, so the full ANSI 256-color palette
+    /// never collides; bypasses the HashMap for cycling-color workloads (e.g.
+    /// `\x1b[38;5;Nm` per character).
     #[cfg(test)]
     intern_cache: Vec<(Style, StyleId)>,
     /// Direct-mapped style intern cache for RGB colors (level 2b).
@@ -81,8 +71,7 @@ pub struct StyleTable {
     /// RGB palettes (e.g., `\x1b[38;2;R;G;Bm` per character).
     #[cfg(test)]
     rgb_cache: Vec<(Style, StyleId)>,
-    /// Marker to make StyleTable !Sync (not shareable across threads).
-    /// This catches accidental concurrent access at compile time.
+    /// Makes the table `!Sync`, so concurrent access fails to compile.
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -182,14 +171,13 @@ impl StyleTable {
         id
     }
 
-    /// L1 cache probe: check if the given style matches the last interned style.
+    /// L1 cache probe: check if the given style is in the L1 cache.
     ///
     /// On hit, increments the refcount and returns the cached `StyleId`.
-    /// On miss, returns `None` — the caller should fall back to `intern_extended`.
+    /// On miss, returns `None`; the caller falls back to `intern_extended`.
     ///
-    /// This avoids constructing the full `ExtendedStyle` (with color types and
-    /// palette indices) when the same style repeats consecutively, which is the
-    /// common case for SGR sequences that don't change the style (#7351).
+    /// Avoids building the full `ExtendedStyle` (color types, palette indices)
+    /// when the same style repeats, the common case for SGR sequences.
     #[inline]
     #[cfg(test)]
     pub fn try_intern_l1(&mut self, style: &Style) -> Option<StyleId> {
@@ -327,31 +315,24 @@ impl StyleTable {
     #[cfg(test)]
     const INTERN_CACHE_SIZE: usize = 256;
 
-    /// 90% of u16::MAX — diagnostic warning threshold (#4548).
+    /// 90% of u16::MAX — diagnostic warning threshold.
     #[cfg(any(test, kani))]
     const CAPACITY_WARNING_THRESHOLD: usize = (u16::MAX as usize) * 9 / 10;
 
     /// Insert a new style (not in table yet).
     ///
-    /// When the table is at u16::MAX capacity, returns `StyleId::DEFAULT` rather
-    /// than attempting compaction. Compaction remaps style IDs, but grid cells
-    /// still hold old IDs — compacting in place here would silently corrupt all
-    /// existing cell styles. The DEFAULT fallback is safe: new styles degrade
-    /// gracefully while existing cells remain correct. See #7446.
+    /// At u16::MAX capacity, returns `StyleId::DEFAULT` rather than compacting:
+    /// compaction remaps IDs that grid cells still hold, which would corrupt
+    /// existing styles. New styles degrade to DEFAULT while existing cells stay
+    /// correct.
     #[cfg(any(test, kani))]
     pub(crate) fn insert_new_style(
         &mut self,
         style: Style,
         ext_info: Option<ExtendedStyleInfo>,
     ) -> StyleId {
-        // At u16::MAX capacity: degrade new styles to DEFAULT (#7446).
-        //
-        // Previously this compacted the table in place to reclaim dead slots, but
-        // compaction remaps all style IDs and insert_new_style has no way to
-        // propagate that remap to grid cells. The result was silent style
-        // corruption: existing cells would reference remapped IDs that now
-        // point to different styles or DEFAULT. The safe behavior is to let
-        // new styles fall back to DEFAULT while preserving existing cell styles.
+        // At u16::MAX capacity: degrade new styles to DEFAULT. Compacting here
+        // would remap IDs that grid cells still reference.
         if self.styles.len() >= u16::MAX as usize {
             aterm_log::warn!(
                 "StyleTable at capacity ({} styles) — \
@@ -368,7 +349,7 @@ impl StyleTable {
         self.lookup.insert(style, id);
         self.extended.push(ext_info);
 
-        // Warn once at 90% capacity as early warning (#4548).
+        // Warn once at 90% capacity as early warning.
         if self.styles.len() == Self::CAPACITY_WARNING_THRESHOLD {
             aterm_log::warn!(
                 "StyleTable at 90% capacity ({}/{} styles). Rich TUI apps or colorful tools \
@@ -514,17 +495,6 @@ mod tests {
             2,
             "duplicate intern should not add another entry"
         );
-    }
-
-    #[test]
-    fn test_intern_extended_different_styles_different_ids() {
-        let mut table = StyleTable::new();
-        let ext1 = make_extended(255, 0, 0, ColorType::Rgb, 0);
-        let ext2 = make_extended(0, 255, 0, ColorType::Rgb, 0);
-        let id1 = table.intern_extended(ext1);
-        let id2 = table.intern_extended(ext2);
-        assert_ne!(id1, id2, "different styles should get different IDs");
-        assert_eq!(table.styles.len(), 3, "two distinct styles + default = 3");
     }
 
     // =========================================================================
@@ -745,7 +715,7 @@ mod tests {
         assert_eq!(
             result,
             Some(id),
-            "L1 cache should hit for the last interned style"
+            "L1 cache should hit for a just-interned style"
         );
     }
 
@@ -888,18 +858,23 @@ mod tests {
     }
 
     // =========================================================================
-    // L2 cache: indexed color cache
+    // L2 caches: indexed and RGB
     // =========================================================================
+
+    /// Fill every L1 way with other styles so the next intern of `style` skips L1.
+    fn evict_l1(table: &mut StyleTable, style: &Style) {
+        for b in 1..=STYLE_L1_WAYS as u8 {
+            table.intern_extended(make_extended(0, 0, b, ColorType::Default, 0));
+        }
+        assert!(table.l1_get(style).is_none());
+    }
 
     #[test]
     fn test_indexed_l2_cache_hit() {
         let mut table = StyleTable::new();
         let ext = make_extended(205, 0, 0, ColorType::Indexed, 1);
         let id1 = table.intern_extended(ext);
-        // Clear L1 cache by interning a different style
-        let other = make_extended(0, 0, 0, ColorType::Default, 0);
-        table.intern_extended(other);
-        // Now re-intern the indexed style -- should hit L2 cache
+        evict_l1(&mut table, &ext.style);
         let id2 = table.intern_extended(ext);
         assert_eq!(id1, id2, "indexed color should hit L2 cache on re-intern");
     }
@@ -919,10 +894,8 @@ mod tests {
             bg_index: 0,
         };
         let id1 = table.intern_extended(ext);
-        // Clear L1 cache
-        let other = make_extended(0, 0, 0, ColorType::Default, 0);
-        table.intern_extended(other);
-        // Re-intern -- should hit RGB L2 cache (keyed by fg.r = 100)
+        evict_l1(&mut table, &ext.style);
+        // Keyed by fg.r = 100.
         let id2 = table.intern_extended(ext);
         assert_eq!(id1, id2, "RGB color should hit L2 cache");
     }

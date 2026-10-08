@@ -1367,7 +1367,7 @@ pub(crate) enum TabIconKind {
 }
 
 impl TabIconKind {
-    /// Stable semantic name used by chrome inspection and assistive help.
+    /// Stable semantic name used by chrome inspection (`toolbar-tabs icons=`).
     #[must_use]
     pub(crate) const fn semantic_name(self) -> &'static str {
         match self {
@@ -1375,6 +1375,17 @@ impl TabIconKind {
             Self::Markdown => "markdown",
             Self::Editor => "editor",
             Self::Recovery => "recovery",
+        }
+    }
+
+    /// The app's name in words, for hover help.
+    #[must_use]
+    pub(crate) const fn display_name(self) -> &'static str {
+        match self {
+            Self::Settings => "Settings",
+            Self::Markdown => "Markdown viewer",
+            Self::Editor => "Editor",
+            Self::Recovery => "Recovery",
         }
     }
 }

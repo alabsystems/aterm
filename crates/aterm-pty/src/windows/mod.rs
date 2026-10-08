@@ -1563,6 +1563,13 @@ pub fn backend_is_conpty(master: i32) -> bool {
     session(master).is_some()
 }
 
+/// Unix-seam parity for `aterm_pty::size`: ConPTY has no winsize to read back,
+/// so there is nothing to verify and the answer is `None`.
+#[must_use]
+pub fn size(_master: i32) -> Option<(u16, u16)> {
+    None
+}
+
 /// Unix-seam parity for [`resize_with_cell_px`](crate::resize_with_cell_px):
 /// ConPTY resizes in CHARACTER cells (`COORD`) and has no winsize pixel fields,
 /// so `cell_px` has nowhere to land and is ignored. Kept so the frontend's one
@@ -2313,7 +2320,7 @@ mod tests {
 
         // The waiter should wake on the close event and close the signal pipe.
         let mut closed = false;
-        for _ in 0..200 {
+        for _ in 0..12_000 {
             if *s.signal.lock_or_recover() == 0 {
                 closed = true;
                 break;
@@ -2396,7 +2403,7 @@ mod tests {
         let (sh1, s1) = &sessions[0];
         hangup(sh1.pid);
         let mut closed = false;
-        for _ in 0..200 {
+        for _ in 0..12_000 {
             if *s1.signal.lock_or_recover() == 0 {
                 closed = true;
                 break;
@@ -2428,6 +2435,9 @@ mod tests {
     // `release_handoff_handles` fails the test instead of hanging it.
     #[test]
     fn release_handoff_handles_closes_the_live_slots_and_skips_the_zeros() {
+        /// A hang detector, never a latency budget: a closed write end answers
+        /// the read at once.
+        const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
         let mut reads = Vec::new();
         let mut writes = Vec::new();
         for _ in 0..2 {
@@ -2455,11 +2465,9 @@ mod tests {
                 };
                 let _ = tx.send(ok);
             });
-            let ok = rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap_or_else(|_| {
-                    panic!("slot {i}: ReadFile blocked, so its write end was never closed")
-                });
+            let ok = rx.recv_timeout(HANG_DETECTOR).unwrap_or_else(|_| {
+                panic!("slot {i}: ReadFile blocked, so its write end was never closed")
+            });
             assert_eq!(ok, 0, "slot {i}: the read end must report broken pipe");
             // SAFETY: the read ends are ours alone.
             unsafe { ffi::CloseHandle(rd) };

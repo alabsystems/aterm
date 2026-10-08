@@ -1,87 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PRESS CUSTODY — the RECORD of which custody transition last fired.
+//! Press custody: the record of which custody transition last fired.
 //!
-//! Custody is about two things the user owns: the reading position (the grid's
-//! `display_offset`) and the highlight (`TextSelection`). A dozen different events can
-//! move one or both of them, and until this module existed the engine kept no trace
-//! of WHICH one did. That had two costs.
+//! Custody covers the two things the user owns: the reading position (the
+//! grid's `display_offset`) and the highlight (`TextSelection`). Many events can
+//! move either, and the record names which one did, so the `custody` control
+//! verb can answer "why did my selection disappear?". Several events (an
+//! auto-repeat tick, a bare modifier, a key release) leave identical state, so
+//! the record carries the discriminator rather than inferring it from the state
+//! change; conformance can then check that "a repeat is inert".
 //!
-//! The user-facing cost is the whole reason this design exists: "my selection
-//! disappeared and I do not know why". Offset and selection are observable after the
-//! fact; the DECISION that moved them is not. `custody` on the control socket answers
-//! it directly — the last transition, by name, beside the state it left behind.
+//! Cost: `Option<CustodyTransition>` fields on [`Terminal`], one byte each in
+//! existing padding. Recording is a store and a compare at sites that already
+//! hold the terminal mutably; the key-release arm of the input seam and the
+//! hidden-session repeat path take the lock for it and say so at the call site.
 //!
-//! The verification cost is that several of those events are indistinguishable in
-//! every observable variable. An auto-repeat tick, a bare modifier and a key release
-//! all leave offset, ownership and the selection exactly as they found them, and all
-//! three arrive at `apply_press_custody` as the single value `disturbs == false`. A
-//! bool is a two-way channel for a four-way fact, so a conformance that had to INFER
-//! the event from the state change could never tell the three apart, and an invariant
-//! about "a repeat is inert" would be satisfied by construction rather than checked.
-//! The record carries the discriminator instead of inferring it.
+//! `last_custody` is the last event, which conformance needs. The most frequent
+//! writer is [`CustodyTransition::OutputAtLive`] (every prompt, `cat`, `tail -f`),
+//! so `last_custody_change` latches only transitions that took something (the
+//! offset moved or a live highlight died). The `custody` verb prints both
+//! (`last=` and `changed=`).
 //!
-//! COST. Two `Option<CustodyTransition>` fields on [`Terminal`] — a fieldless enum, so
-//! each record is ONE BYTE and both land in existing struct padding. Recording is a
-//! store plus one compare, with no allocation and no clock read, and every recording
-//! site already holds the terminal mutably (they are all mid-mutation), so the record
-//! adds no lock traffic of its own on the press path, the mouse path or the output
-//! path. Two sites DID have to start taking a lock they previously skipped — the key
-//! RELEASE arm of the input seam and the hidden-session repeat path — and both say so
-//! at the call site.
-//!
-//! WHY TWO. `last_custody` is the LAST event, full stop, and the Tier-1 conformance
-//! needs exactly that: it arms the slot and requires the very next seam to fill it.
-//! A human asking "why did my selection disappear?" needs something else. The most
-//! frequent writer by orders of magnitude is [`CustodyTransition::OutputAtLive`] — a
-//! shell prompt, a `cat`, a `tail -f` — and every one of those is a no-op that took
-//! nothing, so a single slot answers a `custody` typed one second after the fact with
-//! the last line of shell output rather than with the event being asked about.
-//! `last_custody_change` is the same byte latched only when the event really TOOK
-//! something: the offset moved, or a live highlight died. The `custody` verb prints
-//! both (`last=` and `changed=`), so the raw sequence stays visible and the question
-//! the record exists for has an answer that survives the next prompt.
-//!
-//! WHAT A RECORD IS NOT. It is not a self-reported "this press disturbed something"
-//! flag. `PressCustody`'s invariants are stated over the OBSERVABLE state (offset,
-//! owner, selection) against a shadow of the pre-action values; the recorded name
-//! only says WHICH action to hold the step to. An implementation that moved the
-//! viewport on a repeat and still recorded [`CustodyTransition::RepeatPress`] fails
-//! `RepeatPressIsInert` — recording the name it wanted does not help it.
+//! A record is not a self-reported "this disturbed something" flag.
+//! `PressCustody`'s invariants are stated over the observable state (offset,
+//! owner, selection) against the pre-action values; the name only selects the
+//! action to check. A repeat that moved the viewport still fails
+//! `RepeatPressIsInert` whatever it records.
 
 use super::state::Terminal;
 
-/// Which custody transition last fired — one variant per `PressCustody` action.
+/// Which custody transition last fired: one variant per `PressCustody` action.
 ///
-/// The three inert press classes are separate variants even though they are
-/// state-identical, because they are separate FACTS: a release, an auto-repeat tick
-/// of a hold in progress, and a bare modifier are three different reasons for the
-/// viewport to have stayed put, and a regression in one of them is invisible if they
-/// share a name.
+/// The three inert press classes (release, auto-repeat, bare modifier) are
+/// separate variants although state-identical, so a regression in one is
+/// visible.
 ///
-/// PRIORITY. The press bits OVERLAP — `is_modifier_or_lock_key` matches on the KEY
-/// alone with no event-type term, so a Shift key-up sets "release" and "inert
-/// modifier" at once, and a held Shift's auto-repeat sets "repeat" and "inert
-/// modifier" at once. The model's variants are disjoint, so the press seam resolves
-/// them in the fixed order Release > Repeat > Inert > Typing (see
-/// `aterm_gui::app_input::PressKind`). Any other order re-labels the same physical
-/// event without changing whether it disturbs — a trace corruption a passing model
-/// check would never catch.
+/// The press bits overlap (`is_modifier_or_lock_key` looks only at the key, so
+/// a Shift key-up is both release and inert modifier), and the press seam
+/// resolves them in the fixed order Release > Repeat > Inert > Typing (see
+/// `aterm_gui::app_input::PressKind`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum CustodyTransition {
-    /// The user moved the viewport back into history (a wheel notch, PgUp, the
-    /// `scroll` verb, or a selection drag past the grid edge). Only a move that
-    /// RAISES the offset is this transition; a move back down is
-    /// [`Self::UserScrollTowardLive`] or [`Self::SnapToLive`].
+    /// The user moved the viewport back into history (wheel, PgUp, the `scroll`
+    /// verb, a selection drag past the grid edge). Only a move that raises the
+    /// offset; a move down is [`Self::UserScrollTowardLive`] or
+    /// [`Self::SnapToLive`].
     UserScroll,
-    /// The user moved the viewport back DOWN toward live without reaching it (a
+    /// The user moved the viewport back down toward live without reaching it (a
     /// wheel notch or PgDn that stops short of the tail). The highlight stays.
     UserScrollTowardLive,
-    /// The user brought the viewport back to LIVE without typing: End /
-    /// `ScrollToBottom`, a downward scroll that lands at the tail, the ⌘-V and IME
-    /// snaps, the find bar's restore to a live view. Ownership goes to the
-    /// tail-follower; the highlight stays.
+    /// The user brought the viewport back to live without typing: End,
+    /// `ScrollToBottom`, a downward scroll landing at the tail, the paste and IME
+    /// snaps, the find bar's restore. Ownership goes to the tail-follower; the
+    /// highlight stays.
     SnapToLive,
     /// A user gesture that leaves a selection behind — the press that starts a drag,
     /// and the release that completes one.
@@ -89,70 +61,56 @@ pub enum CustodyTransition {
     /// A user gesture that deliberately deselects: a press and release inside one
     /// cell. Always allowed; it is the user's own highlight.
     UserClear,
-    /// The ONE handover: a byte-producing press means "take me back to the prompt",
+    /// The one handover: a byte-producing press means "take me back to the prompt",
     /// so the viewport snaps to live and the selection goes.
     TypingPress,
-    /// An auto-repeat tick of a hold whose press already took custody. Inert —
-    /// re-running the snap at the ~30 Hz repeat rate is what destroyed scrolls and
-    /// selections made mid-hold.
+    /// An auto-repeat tick of a hold whose press already took custody. Inert:
+    /// re-snapping at the repeat rate would destroy scrolls and selections made
+    /// mid-hold.
     RepeatPress,
-    /// A bare modifier or lock key (Shift/Control/Alt/Super/Caps…). Inert — this is
-    /// the first half of Cmd-C, and clearing the selection here is what made Cmd-C
-    /// copy nothing.
+    /// A bare modifier or lock key (Shift/Control/Alt/Super/Caps…). Inert: it is
+    /// the first half of Cmd-C, which must not clear the selection.
     InertPress,
-    /// A key RELEASE report (Kitty `REPORT_EVENT_TYPES`). Inert — a key-up is not
+    /// A key release report (Kitty `REPORT_EVENT_TYPES`). Inert — a key-up is not
     /// typing.
     ReleaseEvent,
     /// Program output arrived while the tail-follower owned the viewport. The view
     /// stays at live because it already was; the content advances underneath it.
     OutputAtLive,
-    /// Program output arrived while the USER owned the viewport. The re-pin rides
-    /// the arriving lines so the same content stays under the eye — the offset
-    /// RISES, and ownership stays with the user.
+    /// Program output arrived while the user owned the viewport. The re-pin rides
+    /// the arriving lines so the same content stays in view: the offset rises
+    /// and ownership stays with the user.
     OutputWhileReading,
-    /// Program output REPLACED the rows the selection was sitting on. The highlight
-    /// dies (a highlight left over replaced text makes a copy return something the
-    /// user never selected) — but the reading position is still not output's to
-    /// take: the re-pin rides the arriving lines.
+    /// Program output replaced the rows the selection sat on. The highlight dies
+    /// (a copy would return text the user never selected), but the reading
+    /// position stays: the re-pin rides the arriving lines.
     OutputDamagesTheSelectedRows,
-    /// [`Self::OutputDamagesTheSelectedRows`] with the view NOT moving under a
-    /// reader: the batch advanced no rows (an in-place rewrite — `\r` plus EL over
-    /// the selected row, a DECERA, a status line repainting itself) or its re-pin
-    /// saturated at the history floor.
+    /// [`Self::OutputDamagesTheSelectedRows`] without the view moving under a
+    /// reader: no rows advanced (an in-place rewrite such as `\r` plus EL, a
+    /// DECERA, a repainting status line) or the re-pin saturated at the history
+    /// floor.
     OutputDamagesTheSelectedRowsInPlace,
-    /// ED 3 / `clear_scrollback` / RIS: the coordinate space the offset and the
-    /// selection anchors were stated in is gone, so the viewport goes back to the
-    /// tail-follower and the selection cannot outlive the rows it named.
+    /// ED 3 / `clear_scrollback` / RIS: the coordinate space of the offset and
+    /// the selection anchors is gone, so the viewport returns to the
+    /// tail-follower and the selection dies.
     OutputInvalidatesTheCoordinateSpace,
-    /// Output took a live highlight for a reason that is NOT damage overlap. Its own
-    /// `PressCustody` action under the damaging take's tag (6) and law: the
-    /// highlight may go, the reading position may not — the re-pin rides the
-    /// arriving lines. (It was outside the model until 2026-09-25, with a `-1` tag.)
-    ///
-    /// `post_process` has five ways to reach this: a malformed or saturated splice
-    /// projection, a splice mixed with another scroll in one batch (the historical
-    /// fail-closed arm), an alt-screen exit mid-batch, the `left_alt` upper-bound
-    /// re-check, and a whole-interval eviction at the history floor.
-    ///
-    /// This variant exists because those five are precisely the flagship complaint —
-    /// a selection vanishing with no key press to blame — and the record used to
-    /// answer them by EMPTYING itself, which prints `last=none`: indistinguishable
-    /// from a terminal that has never done anything, and it destroyed whatever true
-    /// record was standing on the way out. "Output took it, for a reason I cannot
-    /// name" is a real answer, and it rules out the keyboard.
+    /// Output took a live highlight for a reason other than damage overlap: a
+    /// malformed or saturated splice projection, a splice mixed with another
+    /// scroll, an alt-screen exit mid-batch, the `left_alt` upper-bound re-check,
+    /// or a whole-interval eviction at the history floor. Same `PressCustody` tag
+    /// (6) and law as the damaging take: the highlight may go, the reading
+    /// position may not. Recording it (instead of nothing) tells the user that
+    /// output, not the keyboard, took the selection.
     OutputTookTheSelectionUnattributed,
-    /// [`Self::OutputTookTheSelectionUnattributed`] with the view NOT moving under
-    /// a reader (no row arrived, or the re-pin saturated — a whole-interval
-    /// eviction at the history floor is the common shape).
+    /// [`Self::OutputTookTheSelectionUnattributed`] without the view moving under
+    /// a reader (no row arrived, or the re-pin saturated).
     OutputTookTheSelectionUnattributedInPlace,
 }
 
 impl CustodyTransition {
-    /// The `PressCustody` action this transition IS, by the model's own spelling.
-    ///
-    /// Used by the Tier-1 conformance to name the action it validates the observed
-    /// step against, so the ACTION NAME comes from the engine's own classification
-    /// rather than from the harness's expectation.
+    /// The `PressCustody` action this transition is, by the model's spelling.
+    /// Conformance takes the action name from here, the engine's own
+    /// classification.
     #[must_use]
     pub fn action(self) -> &'static str {
         match self {
@@ -179,14 +137,11 @@ impl CustodyTransition {
 
     /// The model's `last_event` tag: 0 a user gesture, 1 typing, 2 auto-repeat,
     /// 3 a bare modifier, 4 a release, 5 output that missed the selected rows,
-    /// 6 output that TOOK the highlight (replaced the selected rows, or failed
-    /// closed on it), 7 output that invalidated the coordinate space, 8 a user
-    /// gesture back toward live that is not typing.
+    /// 6 output that took the highlight, 7 output that invalidated the
+    /// coordinate space, 8 a non-typing gesture back toward live.
     ///
-    /// Note that the tag is deliberately NOT injective: the three user gestures all
-    /// tag 0, both undamaged-output kinds tag 5, the four taking kinds tag 6 and
-    /// both downward gestures tag 8, exactly as the model declares. The VARIANT is
-    /// the discriminator; the tag is the model's projection of it.
+    /// Not injective, as in the model: the variant is the discriminator, the tag
+    /// its projection.
     #[must_use]
     pub fn last_event(self) -> i64 {
         match self {
@@ -205,31 +160,23 @@ impl CustodyTransition {
         }
     }
 
-    /// Whether this transition, at every site that records it, has already TAKEN
-    /// something from the user — the latch condition for `last_custody_change`.
+    /// Whether this transition, at every site that records it, has already
+    /// taken something from the user: the latch condition for
+    /// `last_custody_change`.
     ///
-    /// True by the recording condition, not by hope. [`Self::UserScroll`] is recorded
-    /// only on a RISE and the two downward gestures only on a FALL,
-    /// [`Self::OutputWhileReading`] only when the re-pin really moved
-    /// the offset, and the two destroying output kinds only when a highlight died.
-    /// The four press classes are false because three of them are inert by law and the
-    /// fourth ([`Self::TypingPress`]) may land on an already-live, unselected viewport
-    /// and take nothing — `apply_press_custody` promotes it explicitly on the presses
-    /// that really did snap or clear. [`Self::OutputAtLive`] is false because it is an
-    /// identity transition: it is the record's most frequent writer and never its most
-    /// interesting one.
+    /// True by the recording condition: [`Self::UserScroll`] is recorded only on
+    /// a rise and the downward gestures only on a fall,
+    /// [`Self::OutputWhileReading`] only when the re-pin moved the offset, and
+    /// the destroying output kinds only when a highlight died. The press classes
+    /// are false (three are inert; [`Self::TypingPress`] may take nothing, and
+    /// `apply_press_custody` promotes it explicitly when it does).
+    /// [`Self::OutputAtLive`] is an identity transition.
     ///
-    /// The output rows are DEFAULTS only: [`Terminal::note_output_custody`] does not
-    /// go through them, because it can see the pre-batch offset, the post-re-pin
-    /// offset and the selection on both sides of the batch and therefore computes the
-    /// exact answer ([`Terminal::note_custody_at`]). An ED 3 typed at a live,
-    /// unselected prompt takes nothing, and the exact form says so.
+    /// The output rows are defaults only: [`Terminal::note_output_custody`]
+    /// computes the exact answer ([`Terminal::note_custody_at`]).
     ///
-    /// STATED IMPRECISION: [`Self::UserClear`] latches even for a deselecting click
-    /// made when nothing was selected. It is still the last gesture in which the user
-    /// expressed an intent about the highlight, and the alternative — threading a
-    /// pre-state bool through the gesture seam — buys a distinction no one asking
-    /// "why did my selection disappear?" can act on.
+    /// [`Self::UserClear`] latches even for a deselecting click with nothing
+    /// selected; it is still a gesture expressing intent about the highlight.
     #[must_use]
     pub fn always_takes_custody(self) -> bool {
         match self {
@@ -252,10 +199,9 @@ impl CustodyTransition {
         }
     }
 
-    /// Is this a gesture of the person reading the session — typing, a paste,
-    /// a scroll, a selection, a return to live — rather than output, a bare
-    /// modifier or a key release, none of which says where they want to be?
-    /// What [`Terminal::reader_gesture_count`] counts.
+    /// Whether this is a gesture of the person reading the session (typing,
+    /// paste, scroll, selection, return to live) rather than output, a bare
+    /// modifier or a key release. Counted by [`Terminal::reader_gesture_count`].
     #[must_use]
     pub fn is_reader_gesture(self) -> bool {
         match self {
@@ -278,14 +224,10 @@ impl CustodyTransition {
         }
     }
 
-    /// Did this transition destroy a live highlight WITHOUT the user asking?
-    ///
-    /// The `custody` verb exists to answer "why did my selection disappear?", and the
-    /// honest answer is never "you deselected it" — the user knows that. These are the
-    /// four that take a highlight the user did not release: output that replaced the
-    /// selected rows, output that destroyed the coordinate space, output that took it
-    /// for a reason the damage lattice could not attribute, and typing, which takes it
-    /// as a documented side effect people still find surprising.
+    /// Whether this transition destroyed a live highlight without the user
+    /// asking: output that replaced the selected rows, output that destroyed the
+    /// coordinate space, output that took it for an unattributed reason, and
+    /// typing (a documented but surprising side effect).
     #[must_use]
     pub fn takes_a_selection_the_user_did_not_release(self) -> bool {
         matches!(
@@ -300,20 +242,17 @@ impl CustodyTransition {
     }
 }
 
-/// How this output batch's `SelectionDamage` landed on the live selection — the
-/// classification `post_process` can make and nothing else in the output path can.
+/// How this output batch's `SelectionDamage` landed on the live selection, as
+/// classified in `post_process`.
 ///
-/// Split from the bool `SelectionDamage::clears_selection` returns because that bool
-/// CONFLATES the two destroying kinds: it short-circuits `All` to `true` without ever
-/// calling the overlap predicate, so a recorder keyed off it alone would report
-/// [`CustodyTransition::OutputDamagesTheSelectedRows`] for every ED 3 / RIS and the
-/// invalidation transition would never appear in any trace.
+/// `SelectionDamage::clears_selection` short-circuits `All` to `true`, so the
+/// bool alone cannot tell a band hit from an ED 3 / RIS, and the invalidation
+/// transition would never be recorded.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum OutputDamage {
-    /// No damage was recorded, or the batch recorded bands that MISSED the selection.
-    /// Both leave the highlight alone, so they are one class here; `Missed` is kept
-    /// separate only so the "a band was recorded and missed" case is distinguishable
-    /// from "no band was recorded at all" by a future diagnostic.
+    /// No damage was recorded, or recorded bands missed the selection; both
+    /// leave the highlight alone. `Missed` distinguishes the second for
+    /// diagnostics.
     #[default]
     None,
     /// Bands were recorded and none of them intersected the selection.
@@ -325,18 +264,13 @@ pub(crate) enum OutputDamage {
 }
 
 impl Terminal {
-    /// Record which custody transition just fired, and whether it actually TOOK
-    /// something. One byte stored, one byte conditionally latched.
+    /// Record which custody transition just fired, and whether it took
+    /// something.
     ///
-    /// Called from the site that MADE the decision, while it still holds the facts
-    /// that separate the variants — never inferred later from the state change,
-    /// because several variants leave identical state (see the module header).
-    ///
-    /// `took` is the site's own observation that custody moved: the offset changed,
-    /// or a live highlight died. It is a separate argument rather than a re-read of
-    /// the terminal because the deciding site is the only place both sides of the
-    /// change are in hand — by the time anyone else looks, the "before" is gone,
-    /// which is the same reason the record exists at all.
+    /// Called from the site that made the decision, while it still has the
+    /// facts that separate the variants (several leave identical state). `took`
+    /// is that site's observation that the offset changed or a live highlight
+    /// died; only it has both sides of the change.
     #[inline]
     pub(crate) fn note_custody_at(&mut self, transition: CustodyTransition, took: bool) {
         self.last_custody = Some(transition);
@@ -346,131 +280,91 @@ impl Terminal {
         if took {
             self.last_custody_change = Some(transition);
         }
-        // …and the one the verb is JUSTIFIED by, latched separately because
-        // `last_custody_change` cannot answer it. That latch means "the last thing
-        // that moved custody", so an ordinary left-click — a `UserClear`, which really
-        // does move custody — overwrites it, and "why did my highlight vanish?" then
-        // answers "you cleared it": true of the click, useless about the loss, and the
-        // evidence is gone. A deliberate release is a cause the user already knows;
-        // only an INVOLUNTARY taker is worth preserving across later activity.
+        // Also latch involuntary takers separately: `last_custody_change` is
+        // overwritten by an ordinary click (`UserClear`), which would bury the
+        // explanation of a lost highlight.
         if transition.takes_a_selection_the_user_did_not_release() {
             self.last_selection_taker = Some(transition);
         }
     }
 
-    /// [`Self::note_custody_at`] for the sites whose recording CONDITION already
+    /// [`Self::note_custody_at`] for the sites whose recording condition already
     /// decides the answer — see [`CustodyTransition::always_takes_custody`].
     #[inline]
     pub fn note_custody(&mut self, transition: CustodyTransition) {
         self.note_custody_at(transition, transition.always_takes_custody());
     }
 
-    /// Latch `last_custody_change` ONLY, leaving the raw last-event record alone.
-    ///
-    /// For a site that records BEFORE it acts and only afterwards learns whether it
-    /// took anything — `apply_press_custody`, which must stamp the press class while
-    /// it still has it and can only then discover whether the viewport was scrolled
-    /// back or a highlight was alive. Deliberately not [`Self::note_custody_at`]: that
-    /// would re-store `last_custody`, and a promotion is not a second event. (It also
-    /// keeps a MUTANT honest — a press class that started disturbing must fail on the
-    /// transition it really is, not be laundered into whichever name the promotion
-    /// carried.)
+    /// Latch `last_custody_change` only, leaving the last-event record alone. For
+    /// `apply_press_custody`, which stamps the press class before acting and only
+    /// then learns whether it took anything; a promotion is not a second event,
+    /// and a press class that started disturbing still fails as the transition
+    /// it is.
     #[inline]
     pub fn note_custody_took(&mut self, transition: CustodyTransition) {
         self.last_custody_change = Some(transition);
     }
 
     /// How many reader gestures ([`CustodyTransition::is_reader_gesture`]) this
-    /// session has recorded since it was created, plus every return to live
-    /// that found the view already there ([`Self::return_to_live`]). Only its
-    /// CHANGE means anything: a caller samples it, and a later sample that
-    /// differs says the person acted on the session in between.
+    /// session has recorded, plus returns to live that found the view already
+    /// there ([`Self::return_to_live`]). Only changes are meaningful: a later
+    /// sample that differs means the person acted on the session in between.
     #[must_use]
     #[inline]
     pub fn reader_gesture_count(&self) -> u64 {
         self.reader_gestures
     }
 
-    /// The last recorded custody transition, or `None` if nothing has moved custody
-    /// since this terminal was created.
-    ///
-    /// Non-consuming: this is the read the `custody` control verb makes, and asking
-    /// twice must give the same answer.
+    /// The last recorded custody transition, or `None` if nothing has moved
+    /// custody since creation. Non-consuming (the `custody` verb's read).
     #[must_use]
     #[inline]
     pub fn last_custody_transition(&self) -> Option<CustodyTransition> {
         self.last_custody
     }
 
-    /// The last recorded transition that actually TOOK the reading position or the
-    /// highlight — the `changed=` half of the `custody` verb.
-    ///
-    /// Survives the ordinary output that overwrites [`Self::last_custody_transition`]
-    /// thousands of times a second, which is what makes the verb usable by a human
-    /// rather than only by a harness reading back inside the same step.
+    /// The last recorded transition that took the reading position or the
+    /// highlight: the `changed=` half of the `custody` verb. Survives the
+    /// ordinary output that overwrites [`Self::last_custody_transition`].
     #[must_use]
     #[inline]
     pub fn last_custody_change(&self) -> Option<CustodyTransition> {
         self.last_custody_change
     }
 
-    /// The last transition that took a live highlight the user did NOT release.
-    ///
-    /// Survives later activity on purpose — clicking, scrolling or typing after the
-    /// loss must not erase the explanation of it. Non-consuming, like its siblings.
+    /// The last transition that took a live highlight the user did not release.
+    /// Survives later activity so the explanation is not erased. Non-consuming.
     #[must_use]
     #[inline]
     pub fn last_selection_taker(&self) -> Option<CustodyTransition> {
         self.last_selection_taker
     }
 
-    /// PRESS CUSTODY — the viewport half of the record: the user moved the reading
-    /// position.
+    /// The viewport half of the record: the user moved the reading position.
     ///
-    /// `before` is the `display_offset` sampled immediately before the move, inside
-    /// the same `&mut self` borrow that performs it. A RISE is
-    /// [`CustodyTransition::UserScroll`] (moving AWAY from live). A FALL is a user
-    /// gesture back toward live that is not typing — `ScrollIntent::Down`, a
-    /// negative `By(n)`, a wheel notch down, the downward half of a selection
-    /// autoscroll, a search jump below the view — and is
-    /// [`CustodyTransition::SnapToLive`] when it lands at the tail, else
-    /// [`CustodyTransition::UserScrollTowardLive`]. No move, no record.
+    /// `before` is `display_offset` sampled just before the move, inside the same
+    /// borrow. A rise is [`CustodyTransition::UserScroll`]. A fall is a
+    /// non-typing gesture toward live (scroll down, wheel down, selection
+    /// autoscroll down, a search jump below the view): [`CustodyTransition::SnapToLive`]
+    /// when it lands at the tail, else [`CustodyTransition::UserScrollTowardLive`].
+    /// No move, no record.
     ///
-    /// WHY IT LIVES HERE AND NOT IN THE GUI. It used to be `app_input::
-    /// note_scroll_custody`, called from two of the roughly eight seams that raise
-    /// the offset — and the WHEEL, the dominant gesture and the first one this
-    /// transition's own doc names, was not among them. `input_wheel`'s instant arm,
-    /// its glide tick, `settle_scroll_motion_at_target`, `control::apply_scroll_intent`,
-    /// the cross-session `mouse` wheel fallback and the search jump all reached
-    /// [`Terminal::scroll_display`] / [`Terminal::scroll_to_absolute_row`] directly,
-    /// so after a wheel notch the `custody` verb reported whatever press came before
-    /// it beside a reading position that press had not moved. Recording in the three
-    /// `Terminal` primitives that can raise the offset is bypass-proof by
-    /// construction: there is no route to a higher `display_offset` that does not
-    /// pass through one of them.
+    /// Recorded in the `Terminal` primitives that can raise the offset
+    /// ([`Terminal::scroll_display`], [`Terminal::scroll_to_absolute_row`],
+    /// [`Terminal::scroll_to_top`]), so every input path is covered. Only the raw
+    /// `Terminal::grid_mut().scroll_display(..)` bypasses it, used by test
+    /// fixtures and bench support, not by shipping input paths.
     ///
     /// One handle still reaches past it: `Terminal::grid_mut().scroll_display(..)`,
     /// the raw grid. Every caller of that form in the workspace is a test fixture or a
-    /// bench harness (`aterm-gui::bench_support`, `aterm-bench`'s scroll-scrub
-    /// example, and unit tests in `content.rs` / `state.rs` / `search_index.rs`); no
+    /// bench harness (`aterm-bench`'s scroll-scrub example, and unit tests in `content.rs` / `state.rs` / `search_index.rs`); no
     /// shipping input path uses it, and a fixture that sets up an offset without
     /// claiming a user gesture is the honest use of it. Said out loud rather than
     /// left as an implied "no route exists".
     ///
-    /// It is also clean with respect to the two documented NON-actions.
-    /// [`Terminal::scroll_to_bottom`] does not call this, so it never records — which
-    /// is what keeps `apply_press_custody`'s snap from filing a `SnapToLive` over its
-    /// own `TypingPress` (the non-typing snaps go through
-    /// [`Terminal::return_to_live`], which does). And the SCR-1 output re-pin goes
-    /// through `Grid::repin_display_offset`, a grid-level entry point this method
-    /// cannot see, so output that rides the arriving lines can never be misfiled as a
-    /// user gesture.
-    ///
-    /// GRANULARITY, stated rather than hidden: the model moves the offset by exactly
-    /// one, while a real notch moves `wheel_viewport_lines` rows and a real PgUp moves
-    /// a whole page. The record says "the user took the viewport", not how far; Tier-1
-    /// drives the one-row forms so the projection is the identity and no saturation is
-    /// involved, and drives a real wheel notch for the RECORD alone.
+    /// The model moves the offset by one while real gestures move rows or
+    /// pages; the record says the user took the viewport, not how far.
+    /// Conformance drives one-row forms, and a real wheel notch for the record.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -509,86 +403,47 @@ impl Terminal {
         }
     }
 
-    /// Take the last recorded custody transition, leaving `None` behind.
-    ///
-    /// The Tier-1 conformance uses this and not [`Self::last_custody_transition`]:
-    /// clearing before a step and requiring `Some(_)` after it proves the step's site
-    /// actually RECORDED, instead of the harness reading a stale tag left by an
-    /// earlier step that happens to carry the name it expected.
+    /// Take the last recorded custody transition, leaving `None`. Conformance
+    /// clears before a step and requires `Some(_)` after it, proving the step's
+    /// site recorded rather than reading a stale tag.
     #[inline]
     #[cfg(any(test, feature = "spec-anchors"))]
     pub fn take_custody_transition(&mut self) -> Option<CustodyTransition> {
         self.last_custody.take()
     }
 
-    /// The output half of the record — the EMIT point of the three-site protocol
-    /// `process_at` runs, and the one moment at which the pre-batch reading position,
-    /// the damage verdict and the FINAL post-re-pin offset are all simultaneously
-    /// true.
+    /// The output half of the record: the emit point of `process_at`'s
+    /// three-site protocol, where the pre-batch reading position, the damage
+    /// verdict and the final post-re-pin offset are all known.
     ///
-    /// The three sites and why it takes three:
-    ///
-    /// 1. The SCR-1 prologue latches `pinned_offset` — the pre-batch `display_offset`
-    ///    — because the very next statement forces it to 0 for the duration of the
-    ///    batch. That value is the ONLY thing in the process that separates
+    /// 1. The prologue latches `pinned_offset`, the pre-batch `display_offset`,
+    ///    before forcing it to 0; only it separates
     ///    [`CustodyTransition::OutputAtLive`] from
-    ///    [`CustodyTransition::OutputWhileReading`], and by `post_process` it is
-    ///    already gone.
-    /// 2. `post_process` classifies the damage into an [`OutputDamage`], which is the
-    ///    only thing that separates a batch that merely scrolled from one that
-    ///    replaced the selected rows or destroyed the coordinate space. It cannot
-    ///    emit: the SCR-1 re-pin has not run yet, so the offset it can read is 0 for
-    ///    every batch.
-    /// 3. THIS, after the re-pin, where the final offset is readable — and it IS
-    ///    read (`self.grid.display_offset()` below), not merely available. The
-    ///    pre-batch offset alone cannot tell `OutputWhileReading` from a re-pin that
-    ///    saturated: a user parked at the top of a FULL scrollback takes a line of
-    ///    output, the new row evicts the oldest, `scrollback_lines()` is unchanged,
-    ///    the re-pin target `pinned_offset + 1` clamps straight back to
-    ///    `pinned_offset`, and the offset does not rise at all. The model's
-    ///    `OutputWhileReading` MANDATES the rise, so recording one there would be a
-    ///    step the spec rejects — for an ordinary `tail -f` against a full history.
+    ///    [`CustodyTransition::OutputWhileReading`].
+    /// 2. `post_process` classifies the damage into an [`OutputDamage`]; it
+    ///    cannot emit, since the re-pin has not run.
+    /// 3. This, after the re-pin, reads the final offset. A re-pin can saturate
+    ///    (a reader at the top of a full scrollback: the new row evicts the
+    ///    oldest and the offset does not rise), and `OutputWhileReading` requires
+    ///    the rise.
     ///
-    /// `lines_added` is what separates "output arrived" from "nothing happened": a
-    /// batch of cursor moves or an OSC query advances no rows and matches no model
-    /// action, so it records nothing rather than fabricating an `OutputAtLive` step.
-    /// Damage is exempt from that test — ED 3 advances no rows and is still very much
-    /// an event.
+    /// `lines_added` separates output from nothing: a batch of cursor moves or an
+    /// OSC query advances no rows and records nothing. Damage is exempt (ED 3
+    /// advances no rows).
     ///
-    /// `selection_before` catches the batches that destroyed a selection for a reason
-    /// that is NOT damage overlap. `post_process` has five of them — a malformed or
-    /// saturated splice projection, a splice mixed with another scroll in one batch
-    /// (the historical fail-closed arm), an alt-screen exit mid-batch, the `left_alt`
-    /// upper-bound re-check, and a whole-interval eviction at the history floor. Such
-    /// a batch records [`CustodyTransition::OutputTookTheSelectionUnattributed`] (or
-    /// its in-place twin), a model action under the damaging take's tag and law.
+    /// `selection_before` catches batches that destroyed a selection for a
+    /// reason other than damage overlap (see
+    /// [`CustodyTransition::OutputTookTheSelectionUnattributed`]); they record
+    /// that variant or its in-place twin rather than clearing the record.
     ///
-    /// It USED to empty the record instead, and that was the wrong half of a correct
-    /// argument. Not MISLABELLING it was right — answering "why did my selection
-    /// disappear?" with the name of an innocent event is worse than saying nothing.
-    /// But `= None` does not say "not by anything I can name"; it says `last=none`,
-    /// which is what a terminal that has never done anything says, and it threw away
-    /// whatever true record was standing. These five paths are exactly the flagship
-    /// complaint — a highlight gone with no key press to blame — so they are the last
-    /// place to destroy evidence. The named variant rules out the keyboard, which is
-    /// what the argument wanted in the first place.
+    /// Damage at live (a status line repainting under a highlight) records
+    /// `OutputDamagesTheSelectedRows`; the model's action rides the arriving
+    /// lines only when the user owns the viewport, so both ownerships are
+    /// covered.
     ///
-    /// AT LIVE. A batch that damages the selection while the view is at LIVE — a
-    /// status line or progress bar repainting the rows a highlight sits on — is the
-    /// commonest real instance of `OutputDamagesTheSelectedRows` and is recorded under
-    /// that name unconditionally. The model admits it: the action is guarded
-    /// `selection == 1 && offset <= MaxOffset - 1` and rides the arriving lines only
-    /// when the user owns the viewport (`offset = if owner == 1 { offset + 1 } else
-    /// { 0 }`), so both ownerships are in the machine and Tier-1 drives both.
-    ///
-    /// IN PLACE. A taking batch (damage, or a fail-closed arm) under a READER whose
-    /// view did not rise — no row arrived (an in-place rewrite: `\r` plus EL, a
-    /// DECERA, a status line repainting itself), or the re-pin saturated at the
-    /// history floor — is recorded under the `…InPlace` twin, whose model action
-    /// leaves the offset where it was. (Until 2026-09-25 that shape had no action and
-    /// was listed as a KNOWN GAP.) An undamaged batch that did not rise still records
-    /// nothing, because it took nothing and its only other name (`OutputAtLive`)
-    /// would claim the view is at live.
+    /// A taking batch under a reader whose view did not rise (no row arrived, or
+    /// the re-pin saturated) records the `…InPlace` twin, which leaves the offset
+    /// where it was. An undamaged batch that did not rise records nothing.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -652,44 +507,37 @@ impl Terminal {
         lines_added: u64,
         selection_before: bool,
     ) {
-        // The offset site 3 exists to see. `note_output_custody` is called only on a
-        // batch that did NOT switch screens, so this is the same grid `pinned_offset`
-        // was read from and the pair is a statement about one coordinate space.
+        // Called only on a batch that did not switch screens, so this is the grid
+        // `pinned_offset` was read from.
         let after = self.grid.display_offset();
         let selection_now = self.text_selection.has_selection();
-        // A READER whose view did not rise: the taking kinds record their in-place
+        // A reader whose view did not rise: the taking kinds record their in-place
         // twin, whose model action leaves the offset where it was.
         let in_place = pinned_offset > 0 && after <= pinned_offset;
         let transition = match damage {
-            // The VARIANT, not the bool: `clears_selection` answers `true` for `All`
-            // without consulting the overlap predicate, so keying off the bool would
-            // report a band hit for every ED 3 and this transition would never fire.
+            // Key off the variant: `clears_selection` answers `true` for `All`
+            // without the overlap test.
             OutputDamage::All => CustodyTransition::OutputInvalidatesTheCoordinateSpace,
             OutputDamage::Hit if in_place => CustodyTransition::OutputDamagesTheSelectedRowsInPlace,
             OutputDamage::Hit => CustodyTransition::OutputDamagesTheSelectedRows,
             OutputDamage::None | OutputDamage::Missed => {
                 if selection_before && !selection_now {
-                    // Destroyed, but not by damage — never `None`, which erases a
-                    // true prior record and reads as "this terminal has never done
-                    // anything".
+                    // Destroyed, but not by damage: record it rather than erase a
+                    // true prior record.
                     if in_place {
                         CustodyTransition::OutputTookTheSelectionUnattributedInPlace
                     } else {
                         CustodyTransition::OutputTookTheSelectionUnattributed
                     }
                 } else if lines_added == 0 {
-                    // No row entered scrollback: a batch of cursor moves or an OSC
-                    // query. No model action describes it either, and it took nothing,
-                    // so the previous record still stands.
+                    // No row entered scrollback (cursor moves, an OSC query): no
+                    // model action, nothing taken, the previous record stands.
                     return;
                 } else if pinned_offset > 0 {
                     if after <= pinned_offset {
-                        // The re-pin SATURATED at the history floor: the arriving line
-                        // evicted the oldest, so the same content is no longer
-                        // reachable and the offset did not move. `OutputWhileReading`
-                        // mandates the rise and `OutputAtLive` would claim the view is
-                        // at live, so neither is true. Record nothing — it took
-                        // nothing, and the previous record still stands.
+                        // The re-pin saturated at the history floor: the offset did
+                        // not move, so neither `OutputWhileReading` (needs a rise)
+                        // nor `OutputAtLive` (claims live) is true. Record nothing.
                         return;
                     }
                     CustodyTransition::OutputWhileReading
@@ -698,21 +546,15 @@ impl Terminal {
                 }
             }
         };
-        // The EXACT `took`, not the per-variant default: this is the one recorder
-        // that can see the offset on both sides of the event and the selection on
-        // both sides of the batch. An ED 3 at a live, unselected prompt and a
-        // one-line `tail` at live both took nothing, and both say so.
+        // The exact `took`: this recorder sees the offset and the selection on
+        // both sides of the batch, so an ED 3 at a live, unselected prompt
+        // correctly reports nothing taken.
         let took = after != pinned_offset || (selection_before && !selection_now);
         self.note_custody_at(transition, took);
     }
 }
 
-/// The cost claim, ASSERTED rather than asserted-in-prose.
-///
-/// The record is justified as a few `Option<CustodyTransition>` slots costing almost
-/// nothing beside a `Terminal`. That was a sentence with nothing holding it, so a
-/// future variant — or a field added beside these — could quietly turn "a few bytes"
-/// into something worth arguing about while the sentence still read the same.
+/// The record's size: a few `Option<CustodyTransition>` slots, asserted.
 #[cfg(test)]
 mod cost {
     use super::CustodyTransition;

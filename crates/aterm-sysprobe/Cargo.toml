@@ -23,5 +23,9 @@ aterm-messages = { workspace = true }
 libc = { workspace = true }
 aterm-objc = { workspace = true }
 
+[dev-dependencies]
+# The Linux fixture tree's private copy, removed on drop.
+aterm-tempfile = { workspace = true }
+
 [lints]
 workspace = true

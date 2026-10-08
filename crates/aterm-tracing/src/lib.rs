@@ -79,9 +79,7 @@
 //! * **`use tracing::warn;` followed only by `warn!(…)` does NOT warn.** The
 //!   import is still what *resolves* the macro name; name resolution happens
 //!   before expansion, so the `use` is marked used and `unused_imports` stays
-//!   quiet. `tests/consumer_forms.rs` pins this with a file-level
-//!   `#![deny(unused_imports)]` over verbatim copies of the consumers' import
-//!   lines — if that ever stopped being true, the test would stop compiling.
+//!   quiet.
 //! * **`let scale = compute(); info!("…{}", scale);` DOES warn** —
 //!   `unused_variables`, because after expansion nothing mentions `scale`. This
 //!   is the divergence, and it has exactly two other shapes: a method called
@@ -160,16 +158,6 @@
 //!
 //! assert_eq!(Span::none(), Span::default());
 //! ```
-//!
-//! # Proof of surface
-//!
-//! zbus, tiny-xlib and the winit Linux backends cannot be compiled on macOS, so
-//! "it builds" is not available as evidence for most of the surface. What is
-//! available is `tests/consumer_forms.rs`: every invocation form in the four
-//! consumer trees, copied verbatim with a comment naming its file and line.
-//! Compiling that test *is* the proof that this surface accepts what the real
-//! consumers write, and it also asserts at runtime that an argument which would
-//! panic or bump a counter does neither.
 
 #![no_std]
 // `no_std` unconditionally, and not behind the `std` feature. Measured with
@@ -194,8 +182,7 @@ use core::task::{Context, Poll};
 /// There is no `#[tracing::instrument]` anywhere in the four consumer trees.
 /// The re-export still lives at the crate root because that is where upstream
 /// `tracing` puts `tracing_attributes::instrument`, so the fully qualified path
-/// keeps working for a future consumer. Since no consumer form pins it,
-/// `consumer_forms.rs` pins that spelling in a test of its own.
+/// keeps working for a future consumer.
 #[cfg(feature = "attributes")]
 pub use tracing_attributes::instrument;
 

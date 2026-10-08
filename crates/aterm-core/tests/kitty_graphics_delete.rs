@@ -1,25 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Kitty graphics `a=d` delete semantics against the real engine.
-//!
-//! The spec invariants, each of which the delete arm once violated
+//! Kitty graphics `a=d` delete semantics against the real engine
 //! (`handler_actions.rs` `delete_kitty_placements`):
 //!
-//!   * a LOWERCASE selector deletes PLACEMENTS and KEEPS the transmitted
-//!     data — the id stays placeable, which preview cyclers (yazi, icat)
-//!     rely on; UPPERCASE also frees the data of every image it named or
-//!     cleared that has no placement left on screen;
-//!   * a selector addresses SPECIFIC placements — by image id (optionally one
-//!     placement id), image number, id range, cell, cell + z-index, column,
-//!     row or z-index — and is never license to clear the whole store, nor to
-//!     erase an image another protocol drew.
+//!   * a lowercase selector deletes placements and keeps the transmitted data,
+//!     so the id stays placeable (preview cyclers such as yazi and icat rely on
+//!     it); uppercase also frees the data of every image it named or cleared
+//!     that has no placement left on screen;
+//!   * a selector addresses specific placements (by image id and optional
+//!     placement id, image number, id range, cell, cell + z-index, column, row
+//!     or z-index); it never clears the whole store or erases another
+//!     protocol's image.
 //!
-//! Placements are observed through `Terminal::images_row` — the same per-cell
-//! image-extras surface the renderer reads, so "cleared" here is exactly
-//! "erased on the next repaint". Whether the STORE still holds an image is
-//! observed through a Unicode placeholder (`placeable`), which draws straight
-//! from the store and moves nothing: no put, no cursor policy, no scroll.
+//! Placements are observed through `Terminal::images_row`, the surface the
+//! renderer reads. Whether the store still holds an image is observed through
+//! a Unicode placeholder (`placeable`), which reads the store and moves nothing.
 
 use aterm_core::terminal::Terminal;
 
@@ -156,7 +152,7 @@ fn delete_by_id_uppercase_frees_that_data_and_no_other() {
     assert!(placeable(&mut term, 2), "image 2's data untouched");
 }
 
-/// `d=i` with a `p=` deletes ONE placement of the image; without it, every
+/// `d=i` with a `p=` deletes one placement of the image; without it, every
 /// placement of the image goes (the control).
 #[test]
 fn delete_by_id_and_placement_id_removes_only_that_placement() {
@@ -183,7 +179,7 @@ fn delete_by_id_and_placement_id_removes_only_that_placement() {
     );
 }
 
-/// A put that names an existing `(i, p)` MOVES that placement; unnamed puts
+/// A put that names an existing `(i, p)` moves that placement; unnamed puts
 /// each add a placement (the control).
 #[test]
 fn put_with_an_existing_placement_id_moves_it() {
@@ -390,10 +386,8 @@ fn kitty_delete_never_erases_another_protocols_image() {
     );
 }
 
-/// A selector missing its image or its coordinates — or naming a cell no
-/// screen has, up to the largest `u32` — addresses nothing: all delete NOTHING
-/// (recoverable), and none panics, where the old engine answered every
-/// unknown selector by destroying the store.
+/// A selector missing its image or coordinates, or naming a cell no screen
+/// has (up to `u32::MAX`), deletes nothing and does not panic.
 #[test]
 fn unaddressed_selectors_delete_nothing() {
     for selector in [

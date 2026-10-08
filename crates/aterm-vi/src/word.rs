@@ -357,8 +357,6 @@ mod tests {
         assert_eq!(result.line, 0);
     }
 
-    // ---- Whitespace word motions (W / B / E / gE) ----
-
     // ---- Scrollback content traversal (one-motion line cache) ----
 
     /// `b` from inside the visible region must walk back across the line
@@ -380,12 +378,8 @@ mod tests {
         );
     }
 
-    /// CJK RUNS ARE WORDS (2026-07-24). A double-width character stores a
-    /// literal `' '` in its continuation cell, and `' '` is both a
-    /// `DEFAULT_SEPARATORS` member and whitespace for WORD motions — so before
-    /// this fix `日本語` read as `日 · 本 · 語` and every motion stepped ONE
-    /// GLYPH. Alacritty, which these motions are ported from, skips the spacer
-    /// explicitly; aterm did not.
+    /// A CJK run is one word: the `' '` stored in each continuation cell
+    /// must not split it (see `LineCache::word_char_at`).
     #[test]
     fn cjk_runs_are_crossed_as_one_word() {
         // Columns:  0=日 1=cont 2=本 3=cont 4=語 5=cont 6=' ' 7=n 8=e 9=x 10=t
@@ -399,7 +393,7 @@ mod tests {
             "w stepped inside the CJK run instead of crossing it"
         );
 
-        // `W` (whitespace-delimited) must agree — same root cause, same fix.
+        // `W` (whitespace-delimited) must agree.
         let after_w = whitespace_word_right(&grid, ViPoint::new(0, 0));
         assert_eq!(
             after_w,
@@ -416,8 +410,7 @@ mod tests {
         );
     }
 
-    /// The fix must not merge across a REAL space. A space that is genuinely a
-    /// space — not a continuation spacer — still separates.
+    /// A real space (not a continuation spacer) still separates.
     #[test]
     fn a_real_space_between_cjk_runs_still_separates() {
         // 日本 | space | 語 — the middle space is real, not a continuation.

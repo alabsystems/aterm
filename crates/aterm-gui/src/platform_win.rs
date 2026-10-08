@@ -2287,7 +2287,7 @@ impl AppRt for AppRtWindows {
     /// this macOS `terminate:` seam also covers there, arrives as a SENT
     /// `WM_QUERYENDSESSION` that no winit event carries — on Windows it is
     /// handled by the end-session wndproc chain installed per window at attach
-    /// (see `install_end_session_guard`), which persists the session rather than
+    /// (see `install_window_subclass`), which persists the session rather than
     /// prompting: blocking a machine shutdown on a dialog is hostile, and with
     /// the layout saved there is nothing left to warn about.
     fn install_quit_confirm(&self) {}

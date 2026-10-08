@@ -41,12 +41,15 @@
 //! variation coords, so the outline that gets grid-fitted is the INSTANTIATED
 //! one — `HintingInstance::new` takes the normalized location, and skrifa's
 //! hinted draw reads size + location back off the instance. That matters on
-//! Windows specifically: the default face there
-//! (`C:\Windows\Fonts\CascadiaMono.ttf`) is a variable font with no separate
-//! Bold file, so BOTH the regular cut and the `wght`≈700 cut the real-bold
-//! path (W9) draws are instances, and a hinter pinned to `LocationRef::default()`
-//! would silently reset the configured weight. Linux passes an empty coord
-//! slice, which normalizes to the same default location it always used.
+//! Windows for a VARIABLE primary, such as the system's own
+//! `C:\Windows\Fonts\CascadiaMono.ttf` that `font_family = "Cascadia Mono"`
+//! names: it has no separate Bold file, so BOTH the regular cut and the
+//! `wght`≈700 cut the real-bold path (W9) draws are instances, and a hinter
+//! pinned to `LocationRef::default()` would silently reset the configured
+//! weight. (The unconfigured Windows default is the bundled STATIC Cascadia
+//! Mono PL, whose real Bold / Italic files take slot 0 like any static face.)
+//! Linux passes an empty coord slice, which normalizes to the same default
+//! location it always used.
 //!
 //! Gated to `cfg(any(all(unix, not(target_os = "macos")), windows))` at the
 //! module declaration AND in Cargo.toml (target-gated dependency): macOS keeps
@@ -514,7 +517,8 @@ mod tests {
         let gid = unicode_gid(dejavu(), 0, 'l').unwrap();
         let (w, h, _, _, _, cov) = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
         let hinted_rows = rows_with_peak(&cov, w, h, 240);
-        let fd = fontdue::Font::from_bytes(dejavu(), fontdue::FontSettings::default()).unwrap();
+        let fd =
+            crate::font::Font::from_bytes(dejavu(), crate::font::FontSettings::default()).unwrap();
         let (m, b) = fd.rasterize('l', 12.0);
         let fontdue_rows = rows_with_peak(&b, m.width, m.height, 240);
         assert!(
@@ -534,7 +538,8 @@ mod tests {
     #[test]
     fn advance_stays_linear() {
         let hint = full_instance(12.0);
-        let fd = fontdue::Font::from_bytes(dejavu(), fontdue::FontSettings::default()).unwrap();
+        let fd =
+            crate::font::Font::from_bytes(dejavu(), crate::font::FontSettings::default()).unwrap();
         for ch in ['M', 'i', 'W', '0'] {
             let gid = unicode_gid(dejavu(), 0, ch).unwrap();
             let (.., adv, _) = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
@@ -796,12 +801,13 @@ mod tests {
         );
     }
 
-    /// A VARIABLE system face — Windows' platform default (Cascadia Mono) or
-    /// any other `%WINDIR%\Fonts` face with a `wght` axis. Panics rather than
-    /// skipping: a test that silently returns when its fixture is missing
-    /// passes forever and proves nothing, and the embedded DejaVu (no `fvar`)
-    /// cannot stand in — every location on it normalizes to empty, which is
-    /// exactly the vacuity this guards against.
+    /// A VARIABLE system face — Windows 11's own Cascadia Mono (what
+    /// `font_family = "Cascadia Mono"` names) or any other `%WINDIR%\Fonts`
+    /// face with a `wght` axis. Panics rather than skipping: a test that
+    /// silently returns when its fixture is missing passes forever and proves
+    /// nothing, and the embedded DejaVu (no `fvar`) cannot stand in — every
+    /// location on it normalizes to empty, which is exactly the vacuity this
+    /// guards against.
     #[cfg(windows)]
     fn variable_system_face() -> (String, Vec<u8>) {
         let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());

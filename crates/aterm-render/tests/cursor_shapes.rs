@@ -12,13 +12,14 @@
 //   - blink phase off (Blinking* styles only) and DECTCEM-hidden: no cursor.
 
 use aterm_core::terminal::{CursorStyle, Terminal};
-use aterm_render::{Frame, Renderer, Theme, cursor_rects, for_each_cursor_rect};
+use aterm_render::{Frame, Renderer, Theme, for_each_cursor_rect};
 
 const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
 const FG: u32 = 0x00D0_D0D0; // Theme::default().fg
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// All (x, y) positions whose pixel is exactly the cursor colour.
@@ -34,6 +35,14 @@ fn cursor_positions(f: &Frame) -> Vec<(usize, usize)> {
     out
 }
 
+/// The rects a `style` cursor paints in a `cw`x`ch` cell at the origin, in
+/// paint order.
+fn cursor_rects(style: CursorStyle, cw: usize, ch: usize) -> Vec<[usize; 4]> {
+    let mut rects = Vec::new();
+    for_each_cursor_rect(style, 0, 0, cw, ch, |rect| rects.push(rect));
+    rects
+}
+
 /// A blank 2x4 terminal (cursor at (0,0)) with the given bytes processed.
 fn term_with(bytes: &[u8]) -> Terminal {
     let mut t = Terminal::new(2, 4);
@@ -43,9 +52,9 @@ fn term_with(bytes: &[u8]) -> Terminal {
 
 #[test]
 fn cursor_rect_visitor_preserves_order_and_degenerate_geometry() {
-    // Literal geometry pins the visitor independently of the collecting API.
-    // In particular, retain zero-area strips and overlapping tiny hollow edges:
-    // the painters, not this shared generator, own their clipping/blending.
+    // Literal geometry pins the visitor. In particular, retain zero-area strips
+    // and overlapping tiny hollow edges: the painters, not this shared
+    // generator, own their clipping/blending.
     let check = |style, w, h, expected: &[[usize; 4]]| {
         let mut actual = [[0; 4]; 128];
         let mut len = 0;
@@ -54,7 +63,6 @@ fn cursor_rect_visitor_preserves_order_and_degenerate_geometry() {
             len += 1;
         });
         assert_eq!(&actual[..len], expected, "{style:?}, {w}x{h}");
-        assert_eq!(cursor_rects(style, 7, 11, w, h), expected);
     };
     for style in [CursorStyle::BlinkingBlock, CursorStyle::SteadyBlock] {
         check(style, 13, 32, &[[7, 11, 13, 32]]);
@@ -100,10 +108,7 @@ fn cursor_rect_visitor_preserves_order_and_degenerate_geometry() {
 
 #[test]
 fn steady_block_fills_whole_cursor_cell() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let mut term = term_with(b"\x1b[2 q"); // DECSCUSR 2 = steady block
     let f = r.render_input(&term.cell_frame(2, 4));
@@ -122,10 +127,7 @@ fn steady_block_fills_whole_cursor_cell() {
 
 #[test]
 fn underline_cursor_fills_only_bottom_strip() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let mut term = term_with(b"\x1b[4 q"); // DECSCUSR 4 = steady underline
     let f = r.render_input(&term.cell_frame(2, 4));
@@ -144,10 +146,7 @@ fn underline_cursor_fills_only_bottom_strip() {
 
 #[test]
 fn bar_cursor_fills_only_left_strip() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let mut term = term_with(b"\x1b[6 q"); // DECSCUSR 6 = steady bar
     let f = r.render_input(&term.cell_frame(2, 4));
@@ -166,17 +165,14 @@ fn bar_cursor_fills_only_left_strip() {
 
 #[test]
 fn fill_override_recolors_a_steady_bar_without_theme_flash() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     const OVERRIDE: u32 = 0x00FE_017F;
     let (cw, ch) = r.cell_size();
     let mut term = term_with(b"\x1b[6 q"); // DECSCUSR 6 = steady bar
     let mut input = term.cell_frame(2, 4);
     input.cursor_fill_override = Some(OVERRIDE);
     let frame = r.render_input(&input);
-    let rects = cursor_rects(CursorStyle::SteadyBar, 0, 0, cw, ch);
+    let rects = cursor_rects(CursorStyle::SteadyBar, cw, ch);
     let area: usize = rects.iter().map(|&[_, _, w, h]| w * h).sum();
     assert_eq!(
         frame
@@ -206,10 +202,7 @@ fn fill_override_recolors_a_steady_bar_without_theme_flash() {
 
 #[test]
 fn hollow_block_draws_outline_but_not_center() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     // HollowBlock is not a DECSCUSR parameter: the windowed frontend forces it
     // for unfocused windows via the renderer's style override.
@@ -251,10 +244,7 @@ fn hollow_block_draws_outline_but_not_center() {
 
 #[test]
 fn composed_effect_shape_preserves_decscusr_and_backend_override_stays_highest() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let mut term = term_with(b"\x1b[4 q"); // terminal owns steady underline
     let mut input = term.cell_frame(2, 4);
@@ -264,7 +254,7 @@ fn composed_effect_shape_preserves_decscusr_and_backend_override_stays_highest()
     // terminal's DECSCUSR style.
     input.cursor_effect_style_override = Some(CursorStyle::Bolt);
     let effect = r.render_input(&input);
-    let bolt_area: usize = cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch)
+    let bolt_area: usize = cursor_rects(CursorStyle::Bolt, cw, ch)
         .iter()
         .map(|&[_, _, w, h]| w * h)
         .sum();
@@ -295,10 +285,7 @@ fn composed_effect_shape_preserves_decscusr_and_backend_override_stays_highest()
 
 #[test]
 fn blink_phase_off_suppresses_blinking_styles_only() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
 
     // Default style is BlinkingBlock: the off phase draws no cursor at all.
@@ -345,10 +332,7 @@ fn blink_phase_off_suppresses_blinking_styles_only() {
 
 #[test]
 fn hidden_cursor_draws_nothing() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     // DECTCEM off (CSI ?25l) hides the cursor entirely.
     let mut term = term_with(b"\x1b[?25l");
     let f = r.render_input(&term.cell_frame(2, 4));
@@ -367,10 +351,7 @@ fn hidden_cursor_draws_nothing() {
 
 #[test]
 fn underline_and_bar_keep_glyph_in_normal_colors() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let strip = (ch / 8).max(2);
     // Put the cursor back ON the 'a' it just typed, with an underline cursor:
@@ -405,10 +386,7 @@ fn underline_and_bar_keep_glyph_in_normal_colors() {
 
 #[test]
 fn bolt_cursor_paints_the_lightning_silhouette() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     // Bolt is not a DECSCUSR parameter: the frontend forces it via the style
     // override while the laser trail is active on a block cursor.
@@ -417,7 +395,7 @@ fn bolt_cursor_paints_the_lightning_silhouette() {
     let f = r.render_input(&term.cell_frame(2, 4));
 
     // The shared geometry: one 1px-tall strip per pixel row, all inside the cell.
-    let rects = cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch);
+    let rects = cursor_rects(CursorStyle::Bolt, cw, ch);
     assert_eq!(rects.len(), ch, "bolt: one strip per pixel row");
     for (y, &[x, ry, w, h]) in rects.iter().enumerate() {
         assert_eq!((ry, h), (y, 1), "bolt: strip {y} must be its own row");
@@ -464,10 +442,7 @@ fn bolt_cursor_paints_the_lightning_silhouette() {
 
 #[test]
 fn bolt_cursor_honours_the_fill_override_and_keeps_the_glyph() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     const LASER: u32 = 0x00FF_E01A;
     r.set_cursor_style_override(Some(CursorStyle::Bolt));
@@ -477,7 +452,7 @@ fn bolt_cursor_honours_the_fill_override_and_keeps_the_glyph() {
     let mut input = term.cell_frame(2, 4);
     input.cursor_fill_override = Some(LASER);
     let f = r.render_input(&input);
-    let rects = cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch);
+    let rects = cursor_rects(CursorStyle::Bolt, cw, ch);
     let area: usize = rects.iter().map(|&[_, _, w, h]| w * h).sum();
     let laser_px = f.pixels.iter().filter(|&&p| p == LASER).count();
     assert_eq!(

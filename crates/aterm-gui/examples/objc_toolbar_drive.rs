@@ -1,23 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `objc_toolbar_drive` — `toolbar.rs`'s four declared classes and 268 ported
-//! binding sites, driven on a real `NSWindow`.
+//! `objc_toolbar_drive` — drives `toolbar.rs`'s declared classes and binding
+//! sites on a real `NSWindow`.
 //!
-//! AN EXAMPLE AND NOT A `#[test]`, for the same reason its two siblings are:
-//! libtest runs every test body on a spawned thread, `pthread_main_np()`
-//! answers 0 there, and `EventLoop` construction panics — so only a target
-//! owning `fn main` can create the window whose toolbar this drives.
-//!
-//! THIN, for the same reason `src/bin/aterm-redraw-conformance.rs` is: `mod
-//! toolbar`, `Wake` and `WindowId` are all library-private, so the body lives
-//! in `aterm_gui::toolbar_drive` and this file supplies only the main thread
-//! and the exit code. The contract those codes carry (`0` pass / `1` finding /
-//! `2` NOT RUN / `3` hung) is stated there and read through this driver's
-//! row in `aterm_verify::stages::OBJC_DRIVES`.
+//! An example rather than a `#[test]`: libtest runs tests off the main thread,
+//! where `EventLoop` construction panics. The body lives in
+//! `aterm_gui::toolbar_drive` (the types it needs are library-private); this
+//! file supplies the main thread and the exit code (`0` pass, `1` finding,
+//! `2` not run, `3` hung; see `aterm_verify::stages::OBJC_DRIVES`).
 
-/// The drive could not execute here. NOT a pass — see the module docs in
-/// `aterm_gui::toolbar_drive`.
+/// The drive could not execute here; not a pass.
 #[cfg(not(target_os = "macos"))]
 const NOT_RUN: u8 = 2;
 

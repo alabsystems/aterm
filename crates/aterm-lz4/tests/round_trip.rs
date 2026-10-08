@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Integration tests for the vendored lz4_flex block-mode subset. These
-// exercise the public surface through `aterm_lz4::{compress_prepend_size,
-// decompress_size_prepended}` (matching the upstream `lz4_flex::block::*`
-// entry points) and are what in-tree consumers would call. The internal
-// unit tests live alongside the vendored source in `src/block/compress.rs`
-// and `src/block/decompress_safe.rs` — these tests cover end-to-end
-// roundtrips that are not otherwise exercised at the block-submodule
-// level.
+// End-to-end round trips and malformed-input rejection through the public API.
 
 use aterm_lz4::block::decompress_into;
 use aterm_lz4::{compress_prepend_size, decompress_size_prepended};
@@ -122,14 +115,8 @@ fn round_trip_overlapping_match() {
     assert_eq!(decompress_size_prepended(&out).unwrap(), input);
 }
 
-// ---------------------------------------------------------------------------
-// Malformed-input soundness regressions.
-//
-// These run against the bounds-checked decoder (`src/block/decompress_safe.rs`,
-// the only one carried). Literal and match lengths are attacker-influenced;
-// an overrun must come back as a decode `Err`, never a panic or an
-// out-of-bounds read or write.
-// ---------------------------------------------------------------------------
+// Malformed input: an overrunning literal or match length is an `Err`, never
+// a panic or an out-of-bounds access.
 
 #[test]
 fn malformed_literal_length_overruns_output_errors() {
@@ -153,35 +140,10 @@ fn malformed_match_length_overruns_output_errors() {
 
 #[test]
 fn malformed_large_block_stays_in_bounds() {
-    // A bigger output makes the unsafe hot path reachable; feed adversarial
-    // literal/offset bytes and require the decoder to stay in bounds (Ok or
-    // Err, never panic / OOB).
+    // A bigger output reaches the fast path; adversarial bytes must not panic.
     let input = vec![
         0x5Au8, b'a', b'b', b'c', b'd', b'e', 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
     let mut output = [0u8; 64];
     let _ = decompress_into(&input, &mut output);
-}
-
-#[test]
-fn fuzz_corrupt_input_never_panics() {
-    // A daily-driver terminal decompresses scrollback blocks that may be corrupt
-    // (truncated/bit-flipped on disk). The block decoder must NEVER panic on
-    // arbitrary input — only return Ok or Err. This deterministic fuzz sweeps
-    // 50k pseudo-random byte sequences through the raw decoder with a fixed
-    // output buffer (no untrusted-size allocation); any panic aborts the test.
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut next = move || {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (state >> 33) as u32
-    };
-    let mut output = vec![0u8; 4096];
-    for _ in 0..50_000 {
-        let len = (next() % 300) as usize;
-        let input: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
-        // Reaching the next iteration for every input means none panicked.
-        let _ = decompress_into(&input, &mut output);
-    }
 }

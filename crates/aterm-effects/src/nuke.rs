@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NUKE CLOUD — the rarest tier of the f-bomb detonation ladder (owner,
-//! 2026-07-24: "3 degrees of f-bomb detonations … and one of the f-bombs should
-//! be a nuke-cloud").
+//! The nuke cloud: the rarest tier of the f-bomb detonation ladder
+//! (owner, 2026-07-24).
 //!
-//! Three STATIC baked tiles (cap / stem / base surge) animated purely by
-//! dest-rect transform, alpha and tint — exactly the kitty cursor's pose trick,
-//! where `aw/ah` stay the natural source size and the renderer NEAREST-scales a
-//! fixed tile. The tiles are cache-stable per `(part, w, h)`, so an animating
-//! cloud NEVER rebakes and never spends the shared two-bakes-per-frame budget
-//! after warmup. Three atlas slots out of thirty-two.
+//! Three static baked tiles (cap / stem / base surge) animated only by
+//! dest-rect transform, alpha and tint, like the kitty cursor's pose: `aw/ah`
+//! stay the natural source size and the renderer nearest-scales a fixed tile.
+//! Tiles are cache-stable per `(part, w, h)`, so an animating cloud never
+//! rebakes after warmup. It uses three of the thirty-two atlas slots.
 //!
-//! Authoring lane is the proven one: const [`PathCmd`] drawlists in the 0..1
-//! frame → [`fill_path`] at WHITE → a per-sprite tint. That keeps the art a
-//! pure function of `(part, w, h)` and the animation a pure function of
-//! `t_ms`, which is what the CPU/GPU parity suite depends on: no clock, no RNG,
-//! no per-frame allocation.
+//! Art is const [`PathCmd`] drawlists in the 0..1 frame, filled with
+//! [`fill_path`] in white and tinted per sprite. The art is a pure function of
+//! `(part, w, h)` and the animation a pure function of `t_ms` (no clock, no
+//! RNG, no per-frame allocation), which the CPU/GPU parity suite relies on.
 
 use aterm_scene::{PathCmd, PathTransform, Tile, fill_path};
 
@@ -37,8 +34,8 @@ pub enum NukePart {
 pub const FLASH_END_MS: u64 = 260;
 /// The stem finishes climbing here…
 pub const STEM_RISE_END_MS: u64 = 1100;
-/// …and the cap starts blooming slightly BEFORE it does, so the two overlap and
-/// the head reads as being pushed up by the column rather than appearing on it.
+/// …and the cap starts blooming slightly before it does, so the head reads as
+/// pushed up by the column rather than appearing on it.
 pub const CAP_BLOOM_START_MS: u64 = 900;
 pub const CAP_BLOOM_END_MS: u64 = 1900;
 pub const SKIRT_START_MS: u64 = 1300;
@@ -46,10 +43,9 @@ pub const SKIRT_END_MS: u64 = 2400;
 /// Total visible window.
 pub const NUKE_TOTAL_MS: u64 = 3600;
 
-/// Peak ink alpha of the baked art. The cloud floats OVER live text, so the
-/// ART carries the legibility budget — the same reasoning as the over-ink
-/// coverage cap in `cursor_glow`: a detonation may be spectacular, but the line
-/// underneath it still has to be readable a moment later.
+/// Peak ink alpha of the baked art. The cloud floats over live text, so the
+/// art caps its own coverage (as `cursor_glow` caps over-ink coverage) to
+/// keep the line underneath readable.
 const NUKE_A: f32 = 0.86;
 
 /// The billowing cap, authored in the 0..1 glyph frame (y down). Lobes are
@@ -65,8 +61,7 @@ const NUKE_CAP_DOME: [PathCmd; 7] = [
     PathCmd::Close,
 ];
 
-/// The torus roll UNDER the cap — the read that makes it a mushroom and not
-/// just a cloud.
+/// The torus roll under the cap, which makes it read as a mushroom.
 const NUKE_CAP_CURL: [PathCmd; 5] = [
     PathCmd::Move(0.14, 0.66),
     PathCmd::Cubic(0.28, 0.92, 0.72, 0.92, 0.86, 0.66),
@@ -93,8 +88,8 @@ const NUKE_SKIRT: [PathCmd; 4] = [
     PathCmd::Close,
 ];
 
-/// Salt for the nuke tiles' host-id space — its own family, scrambled away from
-/// every other baked-sprite id by the splitmix finalizer.
+/// Salt for the nuke tiles' host-id space, scrambled away from every other
+/// baked-sprite id by the splitmix finalizer.
 const NUKE_HOST_SALT: u64 = 0xB0FF_1E5E_D0D0_CA57;
 
 /// Cache key for one baked part at one size.
@@ -113,11 +108,10 @@ pub fn nuke_host_id(part: NukePart, w: u16, h: u16) -> u64 {
 
 /// Natural tile size for a cell.
 ///
-/// Width rides `cell_w` (the cloud is measured in COLUMNS) but is CLAMPED to
-/// the baker's slot bounds — `4 * cell_h` wide, `2 * cell_h` tall — because
-/// `CatBaker::host_tile` rejects anything larger. On a very wide cell the
-/// column-derived width would exceed that, so the clamp is load-bearing, not
-/// defensive.
+/// Width follows `cell_w` (the cloud is measured in columns) but is clamped
+/// to the baker's slot bounds (`4 * cell_h` wide, `2 * cell_h` tall), since
+/// `CatBaker::host_tile` rejects anything larger; on a wide cell the
+/// column-derived width would exceed them.
 #[must_use]
 pub fn nuke_nat_size(part: NukePart, cell_w: u16, cell_h: u16) -> (u16, u16) {
     let (cw, ch) = (f32::from(cell_w.max(1)), f32::from(cell_h.max(1)));
@@ -131,10 +125,10 @@ pub fn nuke_nat_size(part: NukePart, cell_w: u16, cell_h: u16) -> (u16, u16) {
     (w, h)
 }
 
-/// Bake one cloud part at its natural `w x h`, WHITE (tinted per sprite).
+/// Bake one cloud part at its natural `w x h`, in white (tinted per sprite).
 ///
-/// Deterministic: const drawlists through the fixed scanline filler, so one
-/// tile per `(part, w, h)` and byte-identical across bakes.
+/// Deterministic: const drawlists through the fixed scanline filler, so tiles
+/// are byte-identical across bakes of the same `(part, w, h)`.
 #[must_use]
 pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
     let mut tile = Tile::new(u32::from(w), u32::from(h));
@@ -147,9 +141,8 @@ pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
     match part {
         NukePart::Cap => {
             fill_path(&mut tile, &[&NUKE_CAP_DOME], white, NUKE_A, fit);
-            // Underside torus at a clearly lower alpha than the dome: the one
-            // tonal band that gives the dust-phase head its volume (UX
-            // re-review nit, 2026-08-07).
+            // Underside torus at a lower alpha than the dome: the tonal band
+            // that gives the dust-phase head its volume.
             fill_path(&mut tile, &[&NUKE_CAP_CURL], white, NUKE_A * 0.66, fit);
             tile.disc(
                 0.26 * wf,
@@ -172,14 +165,13 @@ pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
                 white,
                 NUKE_A * 0.90,
             );
-            // Crown highlights: brighter-alpha lobes along the top so the
-            // tint shades the head instead of filling it flat (a single-tint
-            // sprite can only shade through alpha — UX review, 2026-08-07:
-            // "one step from brown smudge").
+            // Crown highlights: brighter-alpha lobes along the top so the tint
+            // shades the head instead of filling it flat (a single-tint sprite
+            // can only shade through alpha).
             tile.disc(0.40 * wf, 0.12 * hf, (0.11 * hf).max(1.0), white, 1.0);
             tile.disc(0.62 * wf, 0.14 * hf, (0.09 * hf).max(1.0), white, 1.0);
-            // Edge speckle: eroded dust flecks just outside the silhouette's
-            // shoulders — fixed offsets, deterministic like everything baked.
+            // Edge speckle: dust flecks just outside the shoulders, at fixed
+            // offsets.
             for &(sx, sy, sr, sa) in &[
                 (0.035f32, 0.44f32, 0.045f32, 0.38f32),
                 (0.075, 0.28, 0.035, 0.30),
@@ -207,12 +199,10 @@ pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
                 white,
                 NUKE_A * 0.70,
             );
-            // CHARRED, not swallowed (UX review nit 7, 2026-08-08): the
-            // column's base ramps translucent over its bottom ~30% so the
-            // word it stands on ghosts through dimmed — reading as scorched
-            // under the blast — and re-saturates untouched when the cloud
-            // ends. A straight per-pixel alpha ramp after the fills; the
-            // tile stays a pure function of `(part, w, h)`.
+            // The column's bottom ~30% ramps translucent so the word it stands
+            // on ghosts through dimmed (scorched, not covered) and returns
+            // untouched when the cloud ends. A per-pixel alpha ramp after the
+            // fills; the tile stays a pure function of `(part, w, h)`.
             let ramp_top = (0.70 * hf) as u32;
             let span = (u32::from(h).saturating_sub(ramp_top)).max(1) as f32;
             let px = tile.pixels_mut();
@@ -247,14 +237,12 @@ const CAP_DUST: u32 = 0x008F_7668;
 const STEM_HOT: u32 = 0x00FF_C070;
 const STEM_DUST: u32 = 0x00B0_8D74;
 const SKIRT_TONE: u32 = 0x00C8_B49C;
-/// The molten heart under the cap — the fire the dust hasn't swallowed yet.
+/// The molten heart under the cap.
 const CORE_HOT: u32 = 0x00FF_E9B0;
 
-/// Heat → dust. The whole cloud cools on ONE clock so the cap and the stem can
-/// never disagree about how old the blast is. Cooling starts only once the
-/// bloom is well underway (owner, 2026-08-07 "the mushroom cloud isn't good
-/// enough": the old 900 ms onset had the cap ~60% dust the moment it appeared
-/// — the hero moment rendered washed-out tan instead of fire-lit).
+/// Heat -> dust. The whole cloud cools on one clock so cap and stem agree on
+/// the blast's age. Cooling starts only once the bloom is well underway, so
+/// the cap first appears fire-lit rather than dust-tan (owner, 2026-08-07).
 fn cool(t_ms: u64) -> f32 {
     aterm_scene::smoothstep((t_ms.saturating_sub(1500) as f32 / 1600.0).clamp(0.0, 1.0))
 }
@@ -295,9 +283,9 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
             let q = ((t_ms - CAP_BLOOM_START_MS) as f32
                 / (CAP_BLOOM_END_MS - CAP_BLOOM_START_MS) as f32)
                 .clamp(0.0, 1.0);
-            // Bloom with a ~6% overshoot near q = 0.75, then a slow spread —
-            // the head keeps growing after it stops rising, which is what makes
-            // it read as billowing rather than inflating.
+            // Bloom with a ~6% overshoot near q = 0.75, then a slow spread: the
+            // head keeps growing after it stops rising, so it reads as
+            // billowing rather than inflating.
             let bloom = (1.0 - (1.0 - q) * (1.0 - q) * (1.0 - q))
                 + 0.06 * (core::f32::consts::PI * q).sin();
             let tail = (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 / 1700.0).clamp(0.0, 1.0);
@@ -305,11 +293,9 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
             Some(NukeDraw {
                 sx: (0.45 + 0.75 * bloom) * spread,
                 sy: (0.50 + 0.62 * bloom) * (1.0 + 0.15 * (spread - 1.0)),
-                // The cap rides the TOP of the column from the moment it
-                // blooms (UX review, 2026-08-07: anchored at the baseline it
-                // swallowed the stem and read as a ground blob, not a
-                // mushroom) — up ~a row above the stem at bloom, then the
-                // whole head keeps climbing through the dust tail.
+                // The cap rides the top of the column from bloom (anchored at
+                // the baseline it would swallow the stem): about a row above
+                // the stem at bloom, then climbing through the dust tail.
                 dy_cells: -(0.90 + 0.60 * q) - 0.70 * tail,
                 alpha: (q * 4.0).min(1.0) * fade(SKIRT_END_MS, NUKE_TOTAL_MS - SKIRT_END_MS),
                 tint: aterm_scene::mix_rgb(CAP_HOT, CAP_DUST, c),
@@ -332,13 +318,11 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
     }
 }
 
-/// The MOLTEN CORE pass — the same baked cap tile drawn a second time, smaller
-/// and hotter, hugging the underside of the head where the torus rolls. One
-/// tint per sprite is the lane's rule, so hue contrast inside the cloud takes
-/// a second sprite, not a second tile: same `(part, w, h)` cache slot, zero
-/// extra bake budget. It dies while the dust cap is still spreading — fire
-/// first, dust after — which is what makes the head read as burning from
-/// inside instead of flat-tinted.
+/// The molten core pass: the same baked cap tile drawn again, smaller and
+/// hotter, under the head where the torus rolls. One tint per sprite means hue
+/// contrast inside the cloud takes a second sprite, not a second tile (same
+/// cache slot, no extra bake budget). It dies while the dust cap is still
+/// spreading, so the head reads as burning from inside.
 #[must_use]
 pub fn nuke_core_draw(t_ms: u64) -> Option<NukeDraw> {
     const CORE_END_MS: u64 = 2_900;
@@ -357,9 +341,8 @@ pub fn nuke_core_draw(t_ms: u64) -> Option<NukeDraw> {
         sy: cap.sy * 0.52,
         dy_cells: cap.dy_cells,
         alpha: (q * 4.0).min(1.0) * die * 0.92,
-        // Warm cream toward orange — never the near-white FLASH_CORE (UX
-        // review, 2026-08-07: at small cell sizes a white core is
-        // indistinguishable from the block cursor on the same line).
+        // Warm cream toward orange, never the near-white `FLASH_CORE`: at small
+        // cell sizes a white core is indistinguishable from the block cursor.
         tint: aterm_scene::mix_rgb(CORE_HOT, CAP_HOT, 0.35 + 0.45 * q),
     })
 }
@@ -370,9 +353,8 @@ mod tests {
 
     const PARTS: [NukePart; 3] = [NukePart::Cap, NukePart::Stem, NukePart::Skirt];
 
-    /// The art is a PURE function of `(part, w, h)` — the property the parity
-    /// suite depends on, and the reason the cloud can be baked once and then
-    /// animated by transform alone.
+    /// The art is a pure function of `(part, w, h)`, which lets the cloud be
+    /// baked once and animated by transform alone.
     #[test]
     fn baking_is_deterministic() {
         for part in PARTS {
@@ -387,10 +369,8 @@ mod tests {
         }
     }
 
-    /// `CatBaker::host_tile` rejects a tile wider than `4 * cell_h` or taller
-    /// than `2 * cell_h`. The cloud is measured in COLUMNS, so on a wide cell
-    /// the natural width would breach that — the clamp has to hold for every
-    /// plausible cell geometry, not just the owner's.
+    /// The natural tile stays within `CatBaker::host_tile`'s bounds
+    /// (`4 * cell_h` by `2 * cell_h`) for every plausible cell geometry.
     #[test]
     fn natural_sizes_stay_inside_the_baker_slot() {
         for (cw, ch) in [(7u16, 14u16), (14, 32), (8, 16), (30, 20), (40, 12)] {
@@ -406,7 +386,7 @@ mod tests {
     }
 
     /// Each part is on screen for exactly its own window, and the whole cloud
-    /// is gone by `NUKE_TOTAL_MS` — nothing may outlive the detonation.
+    /// is gone by `NUKE_TOTAL_MS`.
     #[test]
     fn parts_live_only_in_their_phase() {
         assert!(
@@ -425,10 +405,8 @@ mod tests {
             nuke_draw(CAP_BLOOM_START_MS, NukePart::Cap).is_some(),
             "the cap must bloom at its edge"
         );
-        // The cap starts BEFORE the stem finishes: the head is pushed up by the
-        // column, it does not appear on a finished one. Both are constants, so
-        // this is checked at build time — a retune that inverts them never
-        // compiles.
+        // The cap starts before the stem finishes (the head is pushed up by the
+        // column); checked at build time.
         const {
             assert!(CAP_BLOOM_START_MS < STEM_RISE_END_MS);
         }
@@ -439,7 +417,7 @@ mod tests {
             );
         }
         // The molten core lives strictly inside the cap's window and dies
-        // while the dust is still spreading — fire first, dust after.
+        // while the dust is still spreading.
         assert!(nuke_core_draw(CAP_BLOOM_START_MS - 1).is_none());
         assert!(nuke_core_draw(CAP_BLOOM_START_MS).is_some());
         assert!(
@@ -466,9 +444,8 @@ mod tests {
         }
     }
 
-    /// The cloud COOLS: its tint must actually change from hot to dust, and
-    /// every part must stay finite and inside its alpha range for every frame
-    /// of the whole window (a NaN here would be an invisible or a stuck sprite).
+    /// The tint changes from hot to dust, and every part stays finite and
+    /// within its alpha range for every frame of the window.
     #[test]
     fn the_whole_window_is_finite_and_cools() {
         let hot = nuke_draw(CAP_BLOOM_START_MS, NukePart::Cap).expect("cap at bloom");

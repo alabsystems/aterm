@@ -58,8 +58,8 @@ fn caps(intents: &[Intent]) -> Vec<CapsuleSpec> {
 
 /// §1.8: "a restate or supersede clears the carried flag". A carried HELD
 /// row restated by the successor before the handoff commit must still fold on
-/// its own hold — it used to overstay its 45 s hold and leave as `Stale` after
-/// 125 s. (That its hold is armed at all is `center`'s
+/// its own 45 s hold, never overstay it and leave as `Stale` after 125 s.
+/// (That its hold is armed at all is `center`'s
 /// `a_carried_held_row_restated_before_commit_still_folds`.)
 #[test]
 fn a_carried_held_row_restated_before_commit_leaves_on_time_and_as_folded() {
@@ -135,9 +135,10 @@ fn a_queued_carried_held_row_is_not_folded_as_read_after_commit() {
 
 /// §1.4: "Ask and Standing rows are never evicted by a post"; the glass is
 /// STABLE ORDER — "a row on glass keeps its position while it lives". A
-/// flood of queued Warn posts past MAX_LIVE evicts the OLDEST lowest-severity
-/// held row — which is the row at the TOP of the glass, under the pointer —
-/// while 61 never-painted queued rows survive.
+/// flood of queued Warn posts past MAX_LIVE evicts queued held rows, never
+/// the held row at the TOP of the glass, under the pointer. Ruling 412 (a)
+/// extends it to queued `Live` rows
+/// (`center::tests::a_flood_takes_every_queued_row_before_one_on_glass`).
 #[test]
 fn a_flood_past_max_live_does_not_evict_a_row_on_glass() {
     let now = t0();
@@ -174,11 +175,9 @@ fn a_flood_past_max_live_does_not_evict_a_row_on_glass() {
     );
 }
 
-/// THE METER IS THE ROW (ruling 55, 2026-09-23). It used to be sacrificed
-/// after the excerpt, and this test caught it coming BACK at a capsule
-/// long→short transition. It is no longer sacrificed at all: at every width
-/// from 200 cols down to 8 a metered row's meter is `(0, cols, fill)` — it
-/// can neither leave nor come back.
+/// THE METER IS THE ROW (ruling 55): at every width from 200 cols down to 8
+/// a metered row's meter is `(0, cols, fill)`, so it can neither leave nor
+/// come back at a capsule long→short transition.
 #[test]
 fn the_meter_spans_the_row_at_every_width() {
     let spec = RowSpec {
@@ -260,7 +259,7 @@ fn a_live_row_keeps_its_log_record() {
     let mut c = fresh(now);
     let standing = c
         .post(
-            Message::new(tags::RENDER, Severity::Warn, "GPU lost").hold(Hold::Standing),
+            Message::new(tags::RENDER, Severity::Warn, "GPU lost").hold(Hold::STANDING),
             stamp(1),
             now,
         )
@@ -281,9 +280,9 @@ fn a_live_row_keeps_its_log_record() {
     );
 }
 
-/// Codec identity: a message with ONE empty detail line used to encode to
-/// `detail=` and decode to no lines at all. An empty line is dropped at
-/// ingress now (the builder, `normalized`, `restate`), so the live row, its
+/// Codec identity: an empty detail line is dropped at ingress (the builder,
+/// `normalized`, `restate`), so a message posted with ONE empty detail line
+/// never encodes to `detail=` and decodes to no lines: the live row, its
 /// Posted line and the decoded record all agree.
 #[test]
 fn a_single_empty_detail_line_round_trips() {
@@ -468,7 +467,7 @@ fn a_carried_ask_row_keeps_its_own_hold_after_the_commit() {
                 .action(Intent::NotNow {
                     decision: Decision::FileAccess,
                 })
-                .hold(Hold::Ask { for_: HOLD_ASK }),
+                .hold(Hold::asking(HOLD_ASK)),
             stamp(1),
             now,
         )
@@ -482,7 +481,7 @@ fn a_carried_ask_row_keeps_its_own_hold_after_the_commit() {
     let row = child.live(id).unwrap();
     assert_eq!(
         row.msg.hold,
-        Hold::Ask { for_: HOLD_ASK },
+        Hold::asking(HOLD_ASK),
         "the hold word is kept"
     );
     assert_eq!(
@@ -510,4 +509,127 @@ fn a_duplicate_post_keeps_the_live_severity() {
     assert_eq!(again.outcome, crate::center::PostOutcome::Duplicate);
     assert_eq!(c.live(a.id).unwrap().msg.severity, Severity::Info);
     assert_eq!(c.live(a.id).unwrap().repeats, 2);
+}
+
+/// A carried row its parent ended after the capture ends in the successor even
+/// when ANOTHER WRITER of the shared `messages.log` posted under the same
+/// number first. Each aterm mints ids from its own counter (ruling 270), so the
+/// file loads that writer's record under the number and the parent's under a
+/// fresh id; read by the number alone, the row's record would be the other
+/// writer's and the ended row would come back live.
+#[test]
+fn a_carried_row_the_parent_ended_ends_though_another_writer_took_its_number() {
+    let now = t0();
+    let mut parent = fresh(now);
+    let resolved = parent
+        .post(
+            Message::new(tags::CONFIG, Severity::Warn, "resolved there").key("resolved there"),
+            stamp(10),
+            now,
+        )
+        .id;
+    parent.commit_rows(now, 1);
+    let carry = parent.carried();
+    assert!(parent.resolve(resolved, crate::Outcome::Ok, now + secs(1)));
+    let mut other = fresh(now);
+    let theirs = other.post(info("another aterm's note"), stamp(5), now).id;
+    assert_eq!(
+        theirs, resolved,
+        "PRECONDITION: both minted the same number"
+    );
+    // The shared file: the other writer's line first, then the parent's.
+    let mut lines = other.drain_new_for_persist();
+    lines.extend(parent.drain_new_for_persist());
+    let mut disk = MessageLog::empty();
+    disk.replay_all(lines);
+    assert_ne!(
+        disk.get(resolved).map(|rec| rec.stamp),
+        Some(stamp(10)),
+        "PRECONDITION: the parent's record moved off its number"
+    );
+
+    let later = now + secs(5);
+    let mut child = fresh(later);
+    child.seed_carried(&carry, stamp(5_000), later);
+    child.merge_reloaded_log(&disk);
+    let ended = child.end_carried_rows_the_parent_ended(&disk, later);
+    assert_eq!(
+        ended
+            .iter()
+            .map(|(msg, how)| (msg.title.as_str(), how.clone()))
+            .collect::<Vec<_>>(),
+        vec![("resolved there", Retired::Resolved(crate::Outcome::Ok))],
+        "the parent's ending is found under the fresh id"
+    );
+    assert!(child.live(resolved).is_none());
+}
+
+/// Round eight of the update audit, lead U62: a CARRIED row its parent ended
+/// after the park's capture — its reporter's resolve, a person's press — ends in
+/// the successor at Commit, taking the file's ending WITHOUT a second line of its
+/// own; a row whose hold merely ran out on the parent's glass, a row the
+/// successor restated since the seed, and one nobody ended stay live.
+#[test]
+fn a_carried_row_the_parent_ended_after_the_capture_ends_in_the_successor() {
+    let now = t0();
+    let mut parent = fresh(now);
+    let warn = |title: &str| Message::new(tags::CONFIG, Severity::Warn, title).key(title);
+    let resolved = parent.post(warn("resolved there"), stamp(1), now).id;
+    let folded = parent.post(warn("folded there"), stamp(2), now).id;
+    let restated = parent.post(warn("restated here"), stamp(3), now).id;
+    let open = parent
+        .post(warn("open").hold(Hold::For(secs(110))), stamp(4), now)
+        .id;
+    parent.commit_rows(now, 5);
+    let carry = parent.carried();
+    assert_eq!(carry.live.len(), 4, "PRECONDITION: all four cross");
+    // The parent runs on after the capture.
+    assert!(parent.resolve(resolved, crate::Outcome::Ok, now + secs(1)));
+    assert!(parent.withdraw(restated, now + secs(1)));
+    let _ = parent.settle(now + HOLD_WARN + secs(1), true);
+    assert!(
+        parent.live(folded).is_none() && parent.live(open).is_some(),
+        "PRECONDITION: one hold ran out on the parent's glass"
+    );
+    let disk = parent.log().clone();
+
+    let later = now + secs(5);
+    let mut child = fresh(later);
+    child.seed_carried(&carry, stamp(5_000), later);
+    child.restate(
+        restated,
+        Restatement {
+            title: Some("restated by the successor".into()),
+            ..Restatement::default()
+        },
+        later,
+    );
+    child.merge_reloaded_log(&disk);
+    let pending_before = child.log().pending_len();
+    let ended = child.end_carried_rows_the_parent_ended(&disk, later);
+    assert_eq!(
+        ended
+            .iter()
+            .map(|(msg, how)| (msg.title.as_str(), how.clone()))
+            .collect::<Vec<_>>(),
+        vec![("resolved there", Retired::Resolved(crate::Outcome::Ok))],
+        "each ended row comes back with the parent's ending"
+    );
+    assert!(child.live(resolved).is_none());
+    assert!(matches!(
+        child.log().get(resolved).and_then(|rec| rec.retired()),
+        Some(Retired::Resolved(_))
+    ));
+    assert_eq!(
+        child.log().pending_len(),
+        pending_before,
+        "the parent's line is in the file: no second one"
+    );
+    for (id, why) in [
+        (folded, "a fold is about the parent's glass"),
+        (restated, "a restated row is the successor's"),
+        (open, "nobody ended it"),
+    ] {
+        assert!(child.live(id).is_some(), "{why}");
+    }
 }

@@ -36,11 +36,9 @@
 //!
 //! ## Performance
 //!
-//! Target: 400+ MB/s (vs Terminal's ~60 MB/s)
-//!
 //! Key techniques:
 //! - Compile-time transition table
-//! - Explicit SIMD intrinsics (AVX2/NEON) for escape scanning with scalar fallback
+//! - SIMD escape scanning (AVX2 intrinsics, auto-vectorized NEON) with scalar fallback
 //! - Zero allocation during parse
 //!
 //! ## Complexity Proof (O(n))
@@ -66,10 +64,7 @@
 //! 4. **Bounds enforcement**: All buffer operations check capacity before
 //!    insertion, preventing unbounded growth. See Kani proof `params_bounded`.
 //!
-//! The benchmarks live in the `aterm-bench` crate (`cargo bench -p aterm-bench
-//! --bench comparative` for the cjk/mixed engine numbers, and the
-//! `pathological_harness` example for the `wide_unicode` floor) and verify that
-//! throughput holds across input sizes and workload classes.
+//! Throughput floors live in the `aterm-bench` harnesses (`xtask perf`).
 
 #![deny(missing_docs, clippy::all, clippy::pedantic)]
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
@@ -118,14 +113,6 @@ mod csi;
 mod dispatch;
 mod invariants;
 mod simd;
-// No production caller since the speculative CSI parameter pre-parse was
-// removed from `parse_csi_general` (it measured as a net loss on every shape
-// that reached it — see the doc comment there). The module is kept compiled
-// under `cfg(test)` only, for its exhaustive SIMD-vs-scalar differential and
-// fuzz tests, which remain the documentation of what a bulk CSI parameter
-// parser has to agree with should anyone attempt one again.
-#[cfg(test)]
-mod simd_csi;
 mod state;
 /// State transition table.
 pub mod table;
@@ -133,7 +120,7 @@ mod utf8;
 mod utf8_simd;
 
 pub use action::{Action, ActionSink, NullSink};
-pub use carry::{CarryRefusal, OSC_CARRY_CAP, ParserCarry, UTF8_TAIL_MAX};
+pub use carry::{CarryRefusal, HOOKED_STRING_CARRY, OSC_CARRY_CAP, ParserCarry, UTF8_TAIL_MAX};
 // `BatchActionSink` powers the test-only batch dispatch path; it is gated out
 // of release builds along with `advance_batch`/`process_byte_batch`.
 #[cfg(test)]
@@ -245,7 +232,7 @@ pub(crate) const MAX_OSC_PARAMS: usize = 16;
 ///     fn dcs_unhook(&mut self, _canceled: bool) {}
 ///     fn apc_start(&mut self) {}
 ///     fn apc_put(&mut self, _byte: u8) {}
-///     fn apc_end(&mut self) {}
+///     fn apc_end(&mut self, _canceled: bool) {}
 /// }
 ///
 /// let mut parser = Parser::new();
@@ -263,10 +250,11 @@ pub struct Parser {
     pub(crate) intermediates: ArrayVec<u8, MAX_INTERMEDIATES>,
     pub(crate) osc_data: Vec<u8>,
     /// The OSC string being collected is DISCARDED at its terminator instead
-    /// of dispatched. Set only by [`Parser::restore_carry`] for an OSC whose
-    /// head was over [`OSC_CARRY_CAP`] when a seamless update carried it: the
+    /// of dispatched. Set by [`Parser::restore_carry`] for an OSC whose head
+    /// was over [`OSC_CARRY_CAP`] when a seamless update carried it (the
     /// successor never saw the head, so dispatching the tail alone would act
-    /// on a truncated payload (a clipped clipboard write, a broken image).
+    /// on a truncated payload: a clipped clipboard write, a broken image),
+    /// and by the CAN or SUB that cancels the string, as it ends it.
     /// Cleared by every OSC exit (`dispatch_osc`) and by [`Parser::reset`].
     pub(crate) osc_discard: bool,
     pub(crate) current_param: u32,
@@ -280,6 +268,11 @@ pub struct Parser {
     pub(crate) utf8_len: u8,
     /// Expected total bytes for current UTF-8 sequence
     pub(crate) utf8_expected: u8,
+    /// The head of a split UTF-8 character that a DCS or APC string's payload
+    /// ends in (`DcsPassthrough`, `DcsIgnore`, `SosPmApcString`; nothing in
+    /// every other state). With C1 controls off a `0x9C` that continues it is
+    /// the character's byte, not the 8-bit ST.
+    pub(crate) string_utf8: utf8::Utf8Prefix,
     /// Bitmask tracking which params were preceded by a colon (subparameter separator).
     /// Bit i is set if param\[i\] is a subparameter of param\[i-1\].
     /// Used for SGR 4:x underline style subparameters.
@@ -325,6 +318,7 @@ impl Parser {
             utf8_buffer: [0; 4],
             utf8_len: 0,
             utf8_expected: 0,
+            string_utf8: utf8::Utf8Prefix::NONE,
             subparam_mask: 0,
             last_was_colon: false,
             c1_controls_enabled: false,
@@ -350,6 +344,7 @@ impl Parser {
             utf8_buffer: [0; 4],
             utf8_len: 0,
             utf8_expected: 0,
+            string_utf8: utf8::Utf8Prefix::NONE,
             subparam_mask: 0,
             last_was_colon: false,
             c1_controls_enabled: false,
@@ -382,6 +377,7 @@ impl Parser {
         self.apc_active = false;
         self.utf8_len = 0;
         self.utf8_expected = 0;
+        self.string_utf8 = utf8::Utf8Prefix::NONE;
         self.subparam_mask = 0;
         self.last_was_colon = false;
     }

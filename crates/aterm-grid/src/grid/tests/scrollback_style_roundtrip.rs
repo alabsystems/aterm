@@ -2,18 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! StyleId color preservation in scrollback round-trips (#5890).
-//!
-//! Verifies that cells using StyleId (indirect color via StyleTable) and
-//! RGB overflow cells both preserve their colors through the scrollback
-//! extraction → line conversion pipeline.
+//! StyleId (via StyleTable) and RGB-overflow cells keep their colours through
+//! scrollback extraction and line conversion.
 
 use crate::{Cell, CellFlags, Color, Grid, PackedColor, Style, StyleAttrs, StyleId};
 
-/// Regression test for #5890: StyleId cells must preserve their actual colors
-/// through the scrollback extraction + line conversion round-trip.
-/// Before fix: StyleId cells returned placeholder black (0,0,0) from the
-/// deprecated fg()/bg() accessors, corrupting scrollback colors.
+/// StyleId cells keep their actual colours through the scrollback round trip.
 #[test]
 fn style_id_cells_preserve_colors_in_scrollback_roundtrip() {
     let mut grid = Grid::new(3, 10);
@@ -77,7 +71,7 @@ fn style_id_cells_preserve_colors_in_scrollback_roundtrip() {
         attr_s.bg,
     );
 
-    // Verify the indexed cell still works correctly (no regression)
+    // The indexed cell still converts correctly.
     let attr_i = line.get_attr(1);
     let expected_indexed_fg = PackedColor::indexed(2).0;
     assert_eq!(
@@ -87,8 +81,8 @@ fn style_id_cells_preserve_colors_in_scrollback_roundtrip() {
     );
 }
 
-/// Regression test for #5890: StyleId cells with missing style table entry
-/// (e.g., after compaction) should fall back to terminal defaults, not black.
+/// StyleId cells with a missing style table entry (e.g. after compaction) fall
+/// back to terminal defaults, not black.
 #[test]
 fn style_id_cells_missing_style_fallback_to_defaults() {
     let mut grid = Grid::new(3, 10);
@@ -126,8 +120,8 @@ fn style_id_cells_missing_style_fallback_to_defaults() {
     );
 }
 
-/// Regression test for #5771: RGB-marked cells with missing extras in scrollback
-/// conversion must use terminal defaults, not the black placeholder (0x01_000000).
+/// RGB-marked cells with missing extras fall back to terminal defaults, not the
+/// black placeholder (0x01_000000).
 #[test]
 fn row_to_line_rgb_missing_extras_returns_default_colors() {
     use crate::grid::scroll_convert::ScrolledRowExtras;

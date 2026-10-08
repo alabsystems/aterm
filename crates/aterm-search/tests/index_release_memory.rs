@@ -8,7 +8,7 @@
 // a cleared idle document still pins its peak footprint. `release()` must return
 // that capacity to the allocator. "Logical clears insufficient" is not provable
 // by asserting emptiness — it needs a REAL net-heap measurement, so this test
-// installs a counting global allocator (the tests/memory.rs / search_harness
+// installs a counting global allocator (the mem_budget / search_harness
 // pattern) and asserts the live-byte delta, not a logical line count.
 //
 // ONE test function on purpose: the counting allocator is a single global
@@ -16,16 +16,18 @@
 // reading. All scenarios run sequentially here.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use aterm_search::{BudgetedSearch, SearchIndex, TerminalSearch};
 
 static NET: AtomicI64 = AtomicI64::new(0);
+static ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
 struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         NET.fetch_add(l.size() as i64, Ordering::Relaxed);
+        ALLOCATED.fetch_add(l.size() as u64, Ordering::Relaxed);
         unsafe { System.alloc(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
@@ -175,7 +177,13 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
         }
         let retained = net() - base;
         assert!(search.is_complete());
-        assert!(search.results().matches.is_empty());
+        assert!(
+            search
+                .results()
+                .expect("an affordable query is never refused")
+                .matches
+                .is_empty()
+        );
         assert!(
             retained < SCRATCH_ALLOWANCE,
             "completed scan retained {retained} bytes beyond matcher scratch: \
@@ -245,5 +253,48 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
     eprintln!(
         "search_cache_bounds: unchanged_refresh_growth={refresh_growth} \
          capped_32_rows={capped_bytes} uncapped_million_row_reservation={full_bytes} bytes"
+    );
+
+    // -------- (7) a full history's front eviction does not decode survivors -
+    // One shared trigram isolates posting maintenance while the real index
+    // drops and appends rows. Count GROSS allocation, since the former decode
+    // scratch was freed immediately and was invisible to net-heap readings.
+    const HISTORY_ROWS: usize = 10_000;
+    const ADVANCES: usize = 256;
+    let mut moving = SearchIndex::with_capacity_and_max(HISTORY_ROWS, HISTORY_ROWS);
+    for row in 0..HISTORY_ROWS {
+        moving.index_line(row, "aaa");
+    }
+    let before_allocated = ALLOCATED.load(Ordering::Relaxed);
+    let before_live = net();
+    for step in 0..ADVANCES {
+        moving.drop_history_below(step + 1);
+        moving.index_line(step + HISTORY_ROWS, "aaa");
+    }
+    let eviction_allocated = ALLOCATED.load(Ordering::Relaxed) - before_allocated;
+    let eviction_growth = net() - before_live;
+    assert!(
+        eviction_allocated < 256 * 1024,
+        "{ADVANCES} one-row history evictions allocated {eviction_allocated} bytes"
+    );
+    assert!(eviction_growth < 64 * 1024);
+    assert_eq!(moving.search_with_positions("aaa").len(), HISTORY_ROWS);
+    assert!(!moving.results_may_be_incomplete());
+
+    // Real historical-allocation control: even ONE posting's old to_vec()
+    // allocated all retained u32 IDs each time. This omits re-encoding and
+    // text costs, so it is a conservative measurement of the removed traffic.
+    let before_old = ALLOCATED.load(Ordering::Relaxed);
+    for step in 0..ADVANCES as u32 {
+        let decoded: Vec<u32> = (step..step + HISTORY_ROWS as u32).collect();
+        std::hint::black_box(decoded);
+    }
+    let old_decode_allocated = ALLOCATED.load(Ordering::Relaxed) - before_old;
+    assert_eq!(old_decode_allocated, (ADVANCES * HISTORY_ROWS * 4) as u64);
+    assert!(old_decode_allocated > eviction_allocated * 20);
+    eprintln!(
+        "history_eviction_allocation: rows={HISTORY_ROWS} steps={ADVANCES} \
+         allocated={eviction_allocated} live_growth={eviction_growth} \
+         historical_decode_only={old_decode_allocated} bytes"
     );
 }

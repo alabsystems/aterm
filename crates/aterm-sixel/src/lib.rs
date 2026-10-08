@@ -7,7 +7,8 @@
 //! Parses the `DCS Ps q <sixel-data> ST` body that VT300-class terminals use to
 //! paint raster graphics, and produces a packed-RGBA [`SixelImage`] that the
 //! terminal engine routes into its existing inline-image placement/blit path
-//! (the same one OSC 1337 `File=` uses). The engine carries no image codec, so
+//! (the same one OSC 1337 `File=` uses). The engine stores inline images
+//! undecoded (it decodes a PNG only to compose Kitty animation frames), so
 //! this crate is the ONLY place sixel pixels are materialized; it has no
 //! dependencies and is pure `std`.
 //!

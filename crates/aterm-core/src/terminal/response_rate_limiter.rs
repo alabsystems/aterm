@@ -2,39 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Token-bucket rate limiter for PTY response sequences (Part of #7874).
+//! Token-bucket rate limiter for PTY response sequences.
 //!
 //! # Threat model
 //!
-//! A malicious PTY peer can spam query sequences (DSR, DA, DECRQSS, color
-//! queries, XTGETTCAP, title reports, etc.) to force the terminal engine to
-//! generate response bytes. The existing [`MAX_RESPONSE_BUFFER_SIZE`] cap
-//! (1 MiB, see `terminal/mod.rs`) prevents unbounded memory growth but does
-//! nothing about the *rate* of response generation: a host draining the
-//! buffer in a tight loop still pays CPU and wire-bandwidth cost for every
-//! response the engine is forced to emit.
-//!
-//! [`ResponseRateLimiter`] gates `send_response` with a token bucket so the
-//! engine can silently drop excess responses once a configurable rate is
-//! exceeded. This matches the existing buffer-full behavior — sequences
-//! that cannot be delivered are simply not emitted.
+//! A malicious PTY peer can spam queries (DSR, DA, DECRQSS, color queries,
+//! XTGETTCAP, title reports) to force response bytes. The 1 MiB
+//! [`MAX_RESPONSE_BUFFER_SIZE`] bounds memory but not rate: a host draining in
+//! a tight loop still pays CPU and bandwidth for every reply.
+//! [`ResponseRateLimiter`] gates `send_response` with a token bucket and drops
+//! the excess, as a full buffer does.
 //!
 //! # Tuning
 //!
-//! Defaults:
-//! - Refill rate: [`DEFAULT_REFILL_BYTES_PER_SEC`] = 100 KiB/s
-//! - Burst capacity: [`DEFAULT_BURST_BYTES`] = 64 KiB
-//!
-//! Rationale: normal terminals emit at most a few hundred bytes/s of
-//! responses during shell startup (DA/DA2/XTVERSION/DECRQSS probes).
-//! The defaults are ~500x above that ceiling, so they never trip for
-//! legitimate traffic while still capping abusive peers to a tiny
-//! fraction of the 1 MiB buffer's worst case rate.
+//! Shell startup emits at most a few hundred bytes/s of replies; the
+//! defaults ([`DEFAULT_REFILL_BYTES_PER_SEC`], [`DEFAULT_BURST_BYTES`]) sit
+//! far above that, so legitimate traffic never trips them.
 //!
 //! [`MAX_RESPONSE_BUFFER_SIZE`]: super::MAX_RESPONSE_BUFFER_SIZE
 
-// aterm_time::Instant: std::time on native (byte-identical), JS clock on wasm32 where
-// Instant::now() panics. Must match the engine's other Instant seams (bell, transient).
+// aterm_time::Instant: std on native, the JS clock on wasm32 (where std's
+// Instant::now() panics); the engine's other Instant seams use it too.
 use aterm_time::Instant;
 use std::time::Duration;
 
@@ -43,20 +31,14 @@ use std::time::Duration;
 /// while still reducing amplification relative to the 1 MiB buffer cap.
 pub(crate) const DEFAULT_REFILL_BYTES_PER_SEC: u64 = 100 * 1024;
 
-/// Default burst capacity in bytes. Absorbs legitimate startup bursts
-/// (DECRQSS batteries, multiple DA/DA2/XTVERSION queries, OSC palette probes)
-/// with room to spare — and, unlike the 64 KiB it used to be, it can actually
-/// carry the largest response this terminal says it will send.
+/// Default burst capacity in bytes. Absorbs startup bursts (DECRQSS batteries,
+/// DA/DA2/XTVERSION queries, OSC palette probes) and carries the largest
+/// response the terminal will send.
 ///
-/// IT IS SIZED ON THE WIRE, NOT ON THE PAYLOAD. A clipboard query answers with
-/// base64, which expands 3 bytes to 4, so the
-/// [`MAX_OSC52_QUERY_RESPONSE_BYTES`] the handler admits becomes ~1.34x that on
-/// the wire — the handler's own doc says so ("a 64KB decoded payload becomes
-/// ~85KB on the wire"). At 64 KiB of capacity every clipboard between 49,145
-/// and 65,536 bytes was admitted by the handler and then dropped here without a
-/// byte being sent, because `try_consume` refuses anything larger than capacity
-/// outright. Silence, for content the terminal had already decided it was
-/// allowed to answer with.
+/// Sized on the wire, not the payload: an OSC 52 query answers in base64, so
+/// the [`MAX_OSC52_QUERY_RESPONSE_BYTES`] the handler admits is about 1.34x
+/// larger on the wire, and `try_consume` refuses anything above capacity
+/// outright.
 ///
 /// [`MAX_OSC52_QUERY_RESPONSE_BYTES`]: super::MAX_OSC52_QUERY_RESPONSE_BYTES
 pub(crate) const DEFAULT_BURST_BYTES: u64 = 96 * 1024;
@@ -81,19 +63,11 @@ impl TimeSource for SystemTime {
 
 /// Token-bucket rate limiter for PTY response bytes.
 ///
-/// Each call to [`try_consume`][Self::try_consume] attempts to deduct
-/// `n` tokens; on success the response is allowed, otherwise it is
-/// silently dropped. Tokens refill at `refill_bytes_per_sec` and the
-/// bucket is capped at `capacity_bytes`.
-///
-/// Responses larger than `capacity_bytes` are always dropped. That is purely
-/// defensive ONLY while the capacity can hold the largest legitimate response:
-/// the [`MAX_OSC52_QUERY_RESPONSE_BYTES`] cap is on the DECODED clipboard, and
-/// base64 makes the wire form ~1.34x larger, so the capacity is sized on the
-/// encoded size (see [`DEFAULT_BURST_BYTES`]). It used to be sized on the
-/// decoded one, which turned a 50 KiB clipboard into silence.
-///
-/// [`MAX_OSC52_QUERY_RESPONSE_BYTES`]: super::MAX_OSC52_QUERY_RESPONSE_BYTES
+/// [`try_consume`][Self::try_consume] deducts `n` tokens; on success the
+/// response is allowed, otherwise it is silently dropped. Tokens refill at
+/// `refill_bytes_per_sec` up to `capacity_bytes`. Responses larger than the
+/// capacity are always dropped, so the capacity is sized on the largest
+/// encoded response (see [`DEFAULT_BURST_BYTES`]).
 #[derive(Debug, Clone)]
 pub(crate) struct ResponseRateLimiter {
     /// Current token count. Saturates at `capacity_bytes` after refill.
@@ -102,9 +76,8 @@ pub(crate) struct ResponseRateLimiter {
     capacity_bytes: u64,
     /// Token refill rate in bytes per second.
     refill_bytes_per_sec: u64,
-    /// Last refill instant. `None` means "uninitialized — seed on next call"
-    /// so the first `try_consume` after construction always succeeds at
-    /// full capacity without a time lookup during construction.
+    /// Last refill instant; `None` until the first `try_consume` seeds it,
+    /// so construction reads no clock.
     last_refill: Option<Instant>,
 }
 

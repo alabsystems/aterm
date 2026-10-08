@@ -6,13 +6,7 @@
 //!
 //! [`crate::tls`] records WHY server certificates are checked against the
 //! operating system's trust store and never against a root set compiled into
-//! the aterm binary; that argument is unchanged and this module is its
-//! implementation. What changed is only WHO makes the call: aterm now speaks to
-//! each platform itself instead of routing through `rustls-platform-verifier`
-//! (4 packages / 19,534 lines on mac-arm; 10 packages / 29,722 lines across the
-//! four measured cells). The trust DECISION is identical — the same
-//! Security.framework evaluation, the same `crypt32` chain policy, the same
-//! webpki-over-`/etc/ssl/certs` — because it is the same OS making it.
+//! the aterm binary; this module is its implementation.
 //!
 //! # What each platform runs
 //!
@@ -23,13 +17,9 @@
 //! | Linux, BSD | the distro's on-disk CA store, verified by `rustls`'s own webpki (`unix`) | **none** |
 //! | wasm32, Android, anything else | nothing — construction fails ([`unsupported`]) | n/a |
 //!
-//! Every one of those rows describes what `rustls-platform-verifier` did too,
-//! with one deliberate exception (macOS forbids network fetching during
-//! verification; see [`apple`]) and one deliberate correction: its wasm32 arm
-//! quietly fell back to a BUNDLED root set (`webpki-root-certs`), which
-//! contradicts the trust model [`crate::tls`] documents. Nothing ships for
-//! wasm32, so that was a paper divergence rather than a live one, but the
-//! replacement closes it by failing closed instead.
+//! These match `rustls-platform-verifier` except that macOS forbids network
+//! fetching during verification (see [`apple`]) and the remaining targets fail
+//! closed instead of falling back to a BUNDLED root set.
 //!
 //! # Fail closed, and the shapes that enforce it
 //!
@@ -45,22 +35,24 @@
 //!   `SecTrustEvaluateWithError`, `dwError == 0` from the Windows SSL policy, an
 //!   `Ok` from `WebPkiServerVerifier`.
 //! * An FFI call that fails, a certificate the OS will not parse, a hostname
-//!   that will not encode, an empty root store: all `Err`.
+//!   that will not encode, an empty root store: all `Err`. So is a platform
+//!   that never answers: macOS's evaluation runs under a deadline
+//!   ([`apple`], `aterm_uds::deadline`) and a `trustd` that does not reply is a refusal
+//!   [`is_service_unanswered`] names, never a hang and never an acceptance.
 //! * Nothing derived from the peer's chain is ever `unwrap`ped, `expect`ed, or
 //!   indexed. It is attacker-controlled input.
 //!
 //! # The anchor seam, and why it is not in your binary
 //!
 //! Testing the ACCEPT path offline needs a chain the machine trusts, which needs
-//! a way to add an anchor. `rustls-platform-verifier` exposes that as a public
-//! `new_with_extra_roots`. Here it is [`PlatformVerifier::new_with_extra_roots`],
-//! which is `#[cfg(test)]`: it does not exist in a shipped build, so no caller
+//! a way to add an anchor: [`PlatformVerifier::new_with_extra_roots`], which is
+//! `#[cfg(test)]`: it does not exist in a shipped build, so no caller
 //! can reach it and no configuration can turn it on. The seam that lets a caller
 //! add trust anchors is the same primitive an attacker wants, and the only thing
-//! that needs it is the oracle in [`tests`].
+//! that needs it is [`tests`].
 //!
 //! [`crate::tls::client_config`] therefore always builds this verifier with an
-//! empty anchor set; `platform_verifier_config_carries_no_extra_anchors` in
+//! empty anchor set; `the_shipped_constructor_trusts_no_fixture_anchor` in
 //! [`tests`] asserts exactly that.
 
 use std::fmt;
@@ -120,7 +112,7 @@ use unsupported as imp;
 // Three of the arms report the same condition through three unrelated
 // vocabularies (an Apple `OSStatus`, a Windows `dwError`, a webpki
 // `CertificateError`). These constructors are the one place that translation
-// lands, so a caller — and the differential oracle — sees one set of outcomes.
+// lands, so a caller sees one set of outcomes.
 //
 // What is deliberately NOT translated: anything finer than these. macOS returns
 // `errSecCertificateExpired` for a NOT-YET-VALID certificate as well as an
@@ -145,8 +137,8 @@ impl std::error::Error for PlatformRejection {}
 /// authentication (or, on Apple, is absent where Apple requires it).
 ///
 /// The `Display` text matches `rustls-platform-verifier`'s `EkuError`
-/// deliberately: it is how [`tests`] recognises this outcome on BOTH sides of
-/// the differential without either crate exposing the type.
+/// deliberately: it is how [`tests`] recognises this outcome without the type
+/// being exposed.
 #[derive(Debug)]
 struct EkuError;
 
@@ -192,6 +184,55 @@ fn eku_rejected() -> rustls::Error {
     )))
 }
 
+/// The OS trust service did not answer within the evaluation deadline, or an
+/// earlier evaluation has been waiting on it past the suspect age, so the
+/// chain was REFUSED without a verdict. Not a judgement of the certificate —
+/// the platform never gave one — and not a pass: fail closed.
+///
+/// A distinct type, so a caller that wants to tell a person "the Mac's
+/// certificate service is stuck" apart from "this certificate is bad" asks
+/// [`is_service_unanswered`] instead of matching on prose.
+#[cfg(target_vendor = "apple")]
+#[derive(Debug)]
+struct ServiceUnanswered;
+
+#[cfg(target_vendor = "apple")]
+impl fmt::Display for ServiceUnanswered {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "macOS's certificate service (trustd) is not answering; TLS connections are refused \
+             until it answers",
+        )
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl std::error::Error for ServiceUnanswered {}
+
+/// See [`ServiceUnanswered`]. `rustls::Error::Other`, not `InvalidCertificate`:
+/// nothing is known to be wrong with the certificate, and rustls would print
+/// the latter as "invalid peer certificate".
+#[cfg(target_vendor = "apple")]
+fn service_unanswered() -> rustls::Error {
+    rustls::Error::Other(rustls::OtherError(Arc::new(ServiceUnanswered)))
+}
+
+/// Whether `error` is the platform verifier refusing a connection because the
+/// OS trust service did not answer in time (macOS's `trustd`), rather than a
+/// verdict on the certificate. Always `false` where there is no such service.
+#[must_use]
+pub fn is_service_unanswered(error: &rustls::Error) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        matches!(error, rustls::Error::Other(other) if other.0.is::<ServiceUnanswered>())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// A rejection the platform explained in its own words.
 fn invalid_certificate(reason: impl Into<String>) -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
@@ -229,9 +270,8 @@ impl PlatformVerifier {
     /// TEST ONLY: the platform's trust anchors PLUS `extra_roots`.
     ///
     /// `#[cfg(test)]` on purpose — see this module's header. Extra anchors ADD
-    /// to the system set rather than replacing it, matching the incumbent's
-    /// semantics so the two implementations agree on chains that a real system
-    /// root would have validated. An operator-facing REPLACE-the-roots override
+    /// to the system set rather than replacing it, so chains a real system root
+    /// validates still validate. An operator-facing REPLACE-the-roots override
     /// already exists and is a different thing: [`crate::Trust::Roots`].
     #[cfg(test)]
     fn new_with_extra_roots(
@@ -327,5 +367,7 @@ impl ServerCertVerifier for PlatformVerifier {
     }
 }
 
+#[cfg(test)]
+mod test_platform;
 #[cfg(test)]
 mod tests;

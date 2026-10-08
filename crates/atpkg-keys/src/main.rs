@@ -13,15 +13,12 @@
 //!
 //! `pubkey` and `sign` operate on the machine key `setup`/`join` minted
 //! (`~/.aterm/machine.key`); the detached signature is exactly what the verify-only client
-//! (`atpkg::sig`) checks. `verify-signed` is the check for a signed file that is not an
-//! atpkg document, an ALab release's `SHA256SUMS`: the roster must verify under the master
-//! and be live, and a live machine of it must have signed the file's exact bytes. It runs
-//! the client's own roster code, and `tools/atpkg-auto-alab.sh` runs it before it builds
-//! anything.
-//! There is deliberately NO standalone key generator any more: every signing identity is
-//! a machine key born in provisioning, so a key that exists is a key the roster can
-//! account for. (`keygen` was that generator; it made keys the roster had never heard
-//! of, which is exactly the kind of stray authority this tool exists to end.)
+//! (`atpkg::sig`) checks. `verify-signed` checks a signed file that is not an atpkg
+//! document (an ALab release's `SHA256SUMS`) with the client's own roster code;
+//! `tools/atpkg-auto-alab.sh` runs it before it builds anything.
+//!
+//! There is deliberately no standalone key generator: every signing identity is a machine
+//! key born in provisioning, so every key that exists is one the roster accounts for.
 //!
 //! ## Arming the channel — the two verbs the owner actually runs
 //!
@@ -58,14 +55,8 @@
 //!   atpkg-keys master-check                 type the phrase back; print the fingerprint again
 //!   atpkg-keys machine-revoke --id <id> [--roster <p>]
 //!
-//! That is the WHOLE surface: provision with `setup`/`join`, revoke with
-//! `machine-revoke`, check a transcription with `master-check`, and let the publish
-//! scripts drive `pubkey`/`sign`/`verify-signed`. The one-per-act rule is deliberate — this tool used to
-//! carry a second generator (`master-new`), a second minting path (`machine-mint`) and a
-//! bare roster checker (`roster-verify`), each a way to do half a provisioning by hand
-//! and get the other half wrong. All three are deleted, not hidden: `setup`/`join` are
-//! the halves welded together, and `atpkg verify-index` already proves a roster as part
-//! of proving the thing the roster exists for.
+//! That is the whole surface, one verb per act: no verb does half a provisioning by hand.
+//! `atpkg verify-index` proves a roster as part of proving what the roster exists for.
 //!
 //! **The master is never an argument.** It is read only from `/dev/tty`, with echo off —
 //! never from argv (world-readable via `ps`), never from an environment variable, never
@@ -101,12 +92,9 @@ fn main() {
 }
 
 /// The most arguments any verb takes, counting flags and their values. Bounded so the
-/// argument pull stays a fixed number of `next()` calls: `collect()` on an arbitrary-length
-/// iterator is an unbounded allocation Trust cannot bound (`count-not-derivable`).
-/// (`std::env::args` itself is a hardened compat_observable boundary either way; see the
-/// artifact notes in [`atpkg_keys::fsio`].) The widest verbs are `setup` and `join`,
-/// which take the five [`PROVISION_FLAGS`] — ten tokens — so this leaves room and
-/// [`vet_args`] refuses anything past it rather than silently dropping it.
+/// argument pull is a fixed number of `next()` calls: `collect()` on an arbitrary-length
+/// iterator is an allocation Trust cannot bound (`count-not-derivable`). The widest verbs,
+/// `setup` and `join`, take eight tokens; `main` refuses anything past this bound.
 #[cfg(unix)]
 const MAX_ARGS: usize = 14;
 
@@ -135,11 +123,9 @@ fn flag<'a>(argv: &'a Argv, name: &str) -> Option<&'a str> {
 /// Flag names that would carry the master, refused by name with a warning rather than
 /// ignored.
 ///
-/// None of these exists and none may ever exist (`master.rs`, leak vector 1). They are
-/// listed HERE because an operator working from a stale note, or guessing, will type one —
-/// and the old parser accepted the tokens, ignored them, and prompted anyway. That is the
-/// worst possible response: the run succeeds, so nothing tells the operator that their
-/// master is now in `ps` output, in their shell history, and must be treated as burned.
+/// None of these exists and none may ever exist (`master.rs`, leak vector 1). An operator
+/// guessing will type one; accepting it and prompting anyway would leave them unaware that
+/// the phrase is now in `ps` output and shell history and must be treated as burned.
 #[cfg(unix)]
 const MASTER_FLAGS: &[&str] = &[
     "master",
@@ -151,19 +137,12 @@ const MASTER_FLAGS: &[&str] = &[
     "secret",
 ];
 
-/// REFUSE EVERY ARGUMENT SHAPE THIS CLI DOES NOT ACTUALLY READ.
+/// Refuse every argument shape this CLI does not actually read.
 ///
-/// # Why an unknown flag has to be an error here specifically
-///
-/// [`flag`] recognises only `--name value`. Everything else — `--name=value`, a misspelling,
-/// a flag belonging to another verb — used to be skipped in silence, and the value the
-/// operator supplied was replaced by a DEFAULT they never saw. For this tool those defaults
-/// are: the `pins.rs` discovered by walking up from the current directory, `dist/` relative
-/// to the current directory, and `$HOME/.aterm/machine.key`. So `setup --pins=/path/to/other`
-/// armed a trust anchor in whichever checkout the operator happened to be standing in,
-/// reporting success, and `join --roster=<the real roster>` extended a different file
-/// entirely. Editing the wrong copy of `pins.rs` is the failure this whole component exists
-/// to prevent; being handed the right path and ignoring it is the worst way to do it.
+/// [`flag`] recognises only `--name value`. Anything else skipped in silence would have
+/// its value replaced by a default the operator never saw — the `pins.rs` discovered from
+/// the current directory, `dist/`, `$HOME/.aterm/machine.key` — so `setup --pins=<other>`
+/// would arm whichever checkout the operator stood in.
 ///
 /// `allowed` lists the flags the verb reads; `max_positional` bounds its bare arguments.
 #[cfg(unix)]
@@ -207,13 +186,10 @@ fn vet_args(
             return Err(concat(&[
                 "'",
                 tok,
-                "' does not exist and never will. The master phrase is read from /dev/tty \
-                 and from nowhere else — never argv (world-readable via `ps`), never an \
-                 environment variable, never stdin, never a file. IF YOU JUST TYPED YOUR \
-                 REAL PHRASE ON THIS COMMAND LINE, TREAT THAT MASTER AS COMPROMISED: it is \
-                 in your shell history and was visible to every process on this machine \
-                 while the command ran. Destroy the paper and generate a new master on a \
-                 tree whose anchor is not yet armed.",
+                "' does not exist: the master phrase is read only from /dev/tty. If you \
+                 typed your real phrase on this command line, TREAT THAT MASTER AS \
+                 COMPROMISED (it is in shell history and was visible via `ps`): destroy \
+                 the paper and generate a new master on a tree whose anchor is not armed.",
             ]));
         }
         if !allowed.contains(&name) {
@@ -238,8 +214,7 @@ fn vet_args(
                     tok,
                     "' was given '",
                     v,
-                    "' as its value, which is another flag. Refusing to treat a flag as a \
-                     path or an id.",
+                    "' as its value, which is another flag",
                 ]));
             }
             Some(_) => {}
@@ -283,14 +258,6 @@ fn main() -> ExitCode {
     // discarded" must be an error and not a shrug.
     let overflowed = it.next().is_some();
 
-    /// The flags each verb reads, and how many bare arguments it takes. Written out per
-    /// verb rather than pooled, so a flag added to one verb cannot be silently accepted by
-    /// another that ignores it.
-    #[cfg(unix)]
-    fn vetted(verb: &str, argv: &Argv, allowed: &[&str], positionals: usize) -> Result<(), String> {
-        vet_args(verb, argv, allowed, positionals)
-    }
-
     let r = if overflowed {
         Err(concat(&[
             "too many arguments — `atpkg-keys` reads at most ",
@@ -298,11 +265,14 @@ fn main() -> ExitCode {
             " after the verb",
         ]))
     } else {
+        // The flags each verb reads, and how many bare arguments it takes. Written out per
+        // verb rather than pooled, so a flag added to one verb cannot be silently accepted
+        // by another that ignores it.
         match verb.as_deref() {
             Some("pubkey") => {
-                vetted("pubkey", &argv, &[], 1).and_then(|()| pubkey(positional(&argv, 0)))
+                vet_args("pubkey", &argv, &[], 1).and_then(|()| pubkey(positional(&argv, 0)))
             }
-            Some("sign") => vetted("sign", &argv, &[], 3).and_then(|()| {
+            Some("sign") => vet_args("sign", &argv, &[], 3).and_then(|()| {
                 sign(
                     positional(&argv, 0),
                     positional(&argv, 1),
@@ -310,16 +280,16 @@ fn main() -> ExitCode {
                 )
             }),
             Some("master-check") => {
-                vetted("master-check", &argv, &[], 0).and_then(|()| master_check())
+                vet_args("master-check", &argv, &[], 0).and_then(|()| master_check())
             }
             Some("verify-signed") => {
-                vetted("verify-signed", &argv, &[], 5).and_then(|()| verify_signed(&argv))
+                vet_args("verify-signed", &argv, &[], 5).and_then(|()| verify_signed(&argv))
             }
-            Some("setup") => vetted("setup", &argv, PROVISION_FLAGS, 0)
+            Some("setup") => vet_args("setup", &argv, PROVISION_FLAGS, 0)
                 .and_then(|()| provision(atpkg_keys::provision::Verb::Setup, &argv)),
-            Some("join") => vetted("join", &argv, PROVISION_FLAGS, 0)
+            Some("join") => vet_args("join", &argv, PROVISION_FLAGS, 0)
                 .and_then(|()| provision(atpkg_keys::provision::Verb::Join, &argv)),
-            Some("machine-revoke") => vetted("machine-revoke", &argv, &["id", "roster"], 0)
+            Some("machine-revoke") => vet_args("machine-revoke", &argv, &["id", "roster"], 0)
                 .and_then(|()| machine_revoke(&argv)),
             Some(other) => Err(concat(&[
                 "unknown verb '",
@@ -442,11 +412,9 @@ fn sign(key: Option<&str>, msg: Option<&str>, sig_out: Option<&str>) -> Result<(
         None => concat(&[msg, ".sig"]),
     };
     write_bytes(&path, &sig).map_err(|e| concat(&["write ", &path, ": ", &e.to_string()]))?;
-    // `~`-collapse before printing: `sign` runs inside publish pipelines whose
-    // transcripts can end up beside public releases, and an absolute path names the
-    // account on this machine. The signature path is not a secret; the home layout
-    // is nobody's business. (This was the one remaining absolute-path print — the
-    // producer_to_client suite asserts there is no other.)
+    // `~`-collapse before printing: publish transcripts can end up beside public
+    // releases, and an absolute path names this machine's account. The
+    // producer_to_client suite asserts no output carries one.
     let shown = match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && path.starts_with(&home) => {
             concat(&["~", &path[home.len()..]])
@@ -472,25 +440,17 @@ fn sign(key: Option<&str>, msg: Option<&str>, sig_out: Option<&str>) -> Result<(
 // down. See `master.rs` for the leak-vector inventory this implements.
 // ---------------------------------------------------------------------------
 
-/// Where the roster and its master signature live by default — the release staging dir,
-/// so a cut picks them up as assets alongside the appcast. Defined once, in the library,
-/// so `setup`/`join` and the publish scripts cannot drift about where a roster lives.
 #[cfg(unix)]
-use atpkg_keys::provision::{DEFAULT_ROSTER, MACHINE_KEY_REL, MACHINE_PUB_REL};
-
-/// `$HOME/<rel>`, or an error naming what was missing.
-#[cfg(unix)]
-use atpkg_keys::provision::home_path;
+use atpkg_keys::provision::{DEFAULT_ROSTER, MACHINE_KEY_REL, MACHINE_PUB_REL, home_path};
 
 /// Current unix seconds. Fails rather than guessing: every timestamp this tool writes is
 /// load-bearing (`valid_until` decides whether clients accept the roster at all), so a
 /// broken clock must stop the mint, not produce a window nobody chose.
 #[cfg(unix)]
 fn now_unix() -> Result<u64, String> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .map_err(|_| "the system clock is before the unix epoch; refusing to stamp a roster".into())
+    aterm_time::unix_secs().ok_or_else(|| {
+        "the system clock is before the unix epoch; refusing to stamp a roster".into()
+    })
 }
 
 /// Print the master's public identity: the fingerprint the owner eyeballs against paper,
@@ -508,20 +468,16 @@ const PHRASE_HEADING: &str = "atpkg-keys: MASTER PHRASE — write it on paper, t
      places. Shown once. Stored nowhere. Unrecoverable.";
 
 /// The rule that isolates the two lines the paper must carry from everything else on the
-/// screen. The 2026-08-14 ceremony failure was an operator who never realized the phrase
-/// was the deliverable: it was one unmarked line, and a report buried it.
+/// screen, so the phrase cannot read as one unmarked line in a report.
 #[cfg(unix)]
 const PHRASE_RULE: &str = "----------------------------------------------------------------";
 
 /// SHOW THE PHRASE — on the terminal, and only on the terminal.
 ///
 /// Every line of this exchange goes to the same `/dev/tty` handle: the heading, the 52
-/// characters, and the fingerprint that pairs with them on the paper. Splitting them across
-/// stdout and stderr is how the phrase used to end up in `setup.log` while the warning went
-/// to the screen — and how a `> /dev/null` could swallow the master entirely while the tool
-/// reported success. `write_phrase` checks its flush, so a caller that is about to arm a
-/// trust anchor on the strength of "the owner has seen this" is relying on a claim that was
-/// actually tested.
+/// characters, and the fingerprint that pairs with them on the paper. On stdout a
+/// redirect could capture the phrase or `> /dev/null` swallow it while the tool reported
+/// success. `write_phrase` checks its flush, so "the owner has seen this" is tested.
 #[cfg(unix)]
 fn show_phrase(
     tty: &mut atpkg_keys::master::Tty,
@@ -543,11 +499,10 @@ fn show_phrase(
 
 /// THE TRANSCRIPTION GATE — nothing is armed until the phrase comes back FROM THE PAPER.
 ///
-/// Added after the 2026-08-14 ceremony failure: the phrase was shown, never copied, and
-/// scrolled away — a master nobody transcribed armed a tier nobody could ever extend or
-/// revoke. `setup` therefore no longer trusts "the owner has seen this"; it requires "the
-/// owner's paper re-derives this". A mismatch re-shows the phrase and asks again — the
-/// paper is fixable exactly as long as this loop is alive. Abort (Ctrl-C/EOF) arms nothing.
+/// A shown-but-never-copied master would arm a tier nobody can extend or revoke, so
+/// `setup` requires the owner's paper to re-derive the master. A mismatch re-shows the
+/// phrase and asks again — the paper is fixable exactly as long as this loop is alive.
+/// Abort (Ctrl-C/EOF) arms nothing.
 #[cfg(unix)]
 fn confirm_transcription(
     tty: &mut atpkg_keys::master::Tty,
@@ -643,16 +598,10 @@ const SETUP_PAPER_ARMS_NOTHING: &str = "atpkg-keys: THE PHRASE ABOVE ARMS NOTHIN
 /// 3. **Show the phrase**, and check the flush.
 /// 4. **Arm the anchor.**
 ///
-/// Steps 3 and 4 are the pair that used to be the other way round, on the argument that an
-/// anchor naming a master nobody holds is unrecoverable while a phrase that arms nothing is
-/// merely wasteful. That argument was correct and its premise was not: "printed" meant
-/// `write_all` to fd 1, which succeeds just as happily into `/dev/null` as onto a screen,
-/// so `setup > log` armed the anchor and then destroyed the master while reporting success.
-/// With the phrase going to `/dev/tty` — which cannot be redirected, which must exist, and
-/// whose flush is checked — delivery is something this code can actually establish, so the
-/// order is now the one whose failure mode is recoverable: paper first, anchor second, and
-/// a failure between them says DESTROY THE PAPER ([`SETUP_PAPER_ARMS_NOTHING`]) rather than
-/// leaving the operator with a phrase that arms nothing and no way to know it.
+/// Paper first, anchor second: an anchor naming a master nobody holds is unrecoverable,
+/// while a phrase that arms nothing is merely wasteful. This order is sound only because
+/// delivery is established — `/dev/tty` cannot be redirected and its flush is checked. A
+/// failure between the two says DESTROY THE PAPER ([`SETUP_PAPER_ARMS_NOTHING`]).
 ///
 /// For `join` there is no such tension: the master already exists on paper. The phrase is
 /// read, PROVED twice — against the committed anchor and against the existing roster the
@@ -661,9 +610,9 @@ const SETUP_PAPER_ARMS_NOTHING: &str = "atpkg-keys: THE PHRASE ABOVE ARMS NOTHIN
 /// # The phrase reaches this function from `/dev/tty`, and leaves through it too
 ///
 /// There is no `--master` flag and there must never be one; `master.rs` holds the full
-/// leak-vector inventory, and [`vet_args`] now refuses the whole family of spellings by
-/// name rather than ignoring them. `atpkg-keys join < phrase.txt` fails loudly in
-/// `prompt_for_master`, which opens `/dev/tty` explicitly rather than reading fd 0, and
+/// leak-vector inventory, and [`vet_args`] refuses the whole family of spellings by name.
+/// `atpkg-keys join < phrase.txt` fails loudly in `prompt_for_master`, which opens
+/// `/dev/tty` explicitly rather than reading fd 0, and
 /// `atpkg-keys setup > log` fails just as loudly rather than writing the master into `log`.
 #[cfg(unix)]
 fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), String> {
@@ -676,10 +625,8 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
         .ok_or_else(|| concat(&["usage: atpkg-keys ", verb.name(), " --id <machine-id>"]))?;
     let now = now_unix()?;
     let paths = prov::Paths {
-        // Discovered, not configured: the operator's job is to type one phrase, and a
-        // `--pins` path typed wrong is another transcription risk in a different costume.
-        // (An UNREAD `--pins` is worse still, which is why `--pins=x` is now refused rather
-        // than falling through to this discovery.)
+        // Discovered, not configured: a `--pins` path typed wrong is another
+        // transcription risk.
         pins: match flag(argv, "pins") {
             Some(p) => p.to_string(),
             None => prov::discover_pins_path()?,
@@ -687,7 +634,7 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
         // Explicit names another tree; discovery names THIS one — the distinction the
         // compiled-anchor refusal in `preflight` turns on. An explicit path that
         // CANONICALIZES to the discovered tree's own anchor is discovery wearing a
-        // flag (or a symlink to it) and gets no bypass — external audit 2026-08-15.
+        // flag (or a symlink to it) and gets no bypass.
         pins_explicit: match flag(argv, "pins") {
             None => false,
             Some(p) => match (
@@ -793,14 +740,6 @@ fn load_roster(
     )
 }
 
-/// A stable, printable name for a rejection (see
-/// [`atpkg_keys::provision::reject_name`], where the mapping lives so the CLI and the
-/// provisioning engine cannot describe the same refusal two different ways).
-#[cfg(unix)]
-fn reject_name(r: &aterm_update_core::roster::RosterReject) -> String {
-    atpkg_keys::provision::reject_name(r)
-}
-
 /// Emit the roster and its detached master signature. The bytes are signed BEFORE either
 /// file is written, and [`atpkg_keys::provision::publish_roster_locked`] commits a
 /// durable redo directory before either canonical file moves — so the crash window
@@ -817,7 +756,7 @@ fn publish_roster(
     let text = roster.to_toml().map_err(|e| {
         concat(&[
             "refusing to emit an invalid roster (",
-            &reject_name(&e),
+            &atpkg_keys::provision::reject_name(&e),
             ")",
         ])
     })?;
@@ -851,9 +790,8 @@ fn show_roster(r: &aterm_update_core::roster::Roster) {
 
 /// `machine-revoke --id <id>` — withdraw a machine's authority.
 ///
-/// This is the operation the retired one-key design could not perform, and the reason the
-/// tier is worth its cost: a thief holds a MACHINE key, which signs artifacts. Only the
-/// paper master signs rosters, so only the owner can deny.
+/// A thief holds a MACHINE key, which signs artifacts. Only the paper master signs
+/// rosters, so only the owner can deny.
 ///
 /// It can be run from ANY surviving machine — the master is the authority, not the
 /// hardware. What it does NOT do is un-install: revocation stops future acceptance, and

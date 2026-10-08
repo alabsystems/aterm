@@ -191,9 +191,8 @@ fn row_write_wide_char_with_style_id_preserves_flags() {
     assert!(cell0.uses_style_id());
 }
 
-// ── Round 15: #7522 len class on the StyleId write paths ─────────────────
-// These mirror write_char_packed / write_wide_char_packed exactly: a wide-orphan
-// clear at the tail must tighten len rather than leave it stale-high.
+// The StyleId write paths tighten len on a tail wide-orphan clear, like
+// write_char_packed / write_wide_char_packed.
 
 /// write_char_with_style_id: single-width write over a WIDE head at the tail must
 /// tighten len when the cleared continuation was the row's last content.

@@ -770,13 +770,18 @@ impl EditorWorkspace {
                 };
                 self.execute(store, view, command)
             }
-            Minibuffer::Search { query, .. } => {
-                Ok(vec![EditorEffect::Status(if query.is_empty() {
-                    "Search cancelled: empty query".to_string()
+            // The selected match is the result; an empty status clears the
+            // `I-search:` line rather than echoing the query back.
+            Minibuffer::Search { query, .. } => Ok(vec![EditorEffect::Status(
+                if query.is_empty() {
+                    "Search cancelled"
+                } else if view.primary_selection().range().is_empty() {
+                    "Not found"
                 } else {
-                    format!("Search accepted: {query}")
-                })])
-            }
+                    ""
+                }
+                .to_string(),
+            )]),
             Minibuffer::Buffer { query } => Ok(vec![EditorEffect::SwitchBuffer { query }]),
             Minibuffer::GotoLine { query, origin } => {
                 let Ok(line) = query.trim().parse::<usize>() else {
@@ -797,7 +802,12 @@ impl EditorWorkspace {
                 view.primary = 0;
                 view.viewport_anchor = target;
                 view.mark_active = false;
-                Ok(vec![EditorEffect::Status(format!("Line {line}"))])
+                let landed = snapshot.text[..target].matches('\n').count() + 1;
+                Ok(vec![EditorEffect::Status(if landed < line {
+                    format!("Line {landed} (last line)")
+                } else {
+                    format!("Line {line}")
+                })])
             }
             Minibuffer::Inactive => Ok(vec![EditorEffect::Bell]),
         }
@@ -953,9 +963,15 @@ impl EditorWorkspace {
                 Ok(Vec::new())
             }
             KeyResolution::Unbound => {
+                let keys = view
+                    .chord_prefix
+                    .iter()
+                    .map(KeyChord::display)
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 view.chord_prefix.clear();
                 view.prefix_hud = None;
-                Ok(vec![EditorEffect::Bell])
+                Ok(vec![EditorEffect::Status(format!("{keys} is not bound"))])
             }
         }
     }
@@ -1086,11 +1102,7 @@ impl EditorWorkspace {
                     let at = if command == EditorCommand::MoveWordBackward {
                         previous_word_boundary(&snapshot.text, selection.head, count)
                     } else {
-                        let mut at = selection.head;
-                        for _ in 0..count {
-                            at = next_word_boundary(&snapshot.text, at);
-                        }
-                        at
+                        next_word_boundary(&snapshot.text, selection.head, count)
                     };
                     selection.move_head(at, preserve_anchor);
                 }
@@ -1158,7 +1170,7 @@ impl EditorWorkspace {
                     });
                 }
                 if edits.is_empty() {
-                    return Ok(vec![EditorEffect::Bell]);
+                    return Ok(vec![EditorEffect::Status("No region selected".to_string())]);
                 }
                 self.push_kill(killed);
                 self.apply_recorded(store, view, normalize_edits(edits)?)?;
@@ -1201,12 +1213,12 @@ impl EditorWorkspace {
             }
             EditorCommand::YankPop => {
                 let Some(previous) = self.last_yank.clone() else {
-                    return Ok(vec![EditorEffect::Bell]);
+                    return Ok(vec![EditorEffect::Status(YANK_POP_NEEDS_YANK.to_string())]);
                 };
                 let snapshot = snapshot_for_view(store, view)?;
                 if previous.document != view.document || previous.seq != snapshot.seq {
                     self.last_yank = None;
-                    return Ok(vec![EditorEffect::Bell]);
+                    return Ok(vec![EditorEffect::Status(YANK_POP_STALE.to_string())]);
                 }
                 let next_index = (previous.ring_index + 1) % self.kill_ring.len().max(1);
                 let replacement = self
@@ -1576,27 +1588,55 @@ fn next_boundary(text: &str, position: usize) -> usize {
     position.saturating_add(text[position..].graphemes().next().map_or(0, str::len))
 }
 
-fn editor_word_character(character: char) -> bool {
-    character.is_alphanumeric() || character == '_'
+/// The words of `text` from byte `from` on (0, or a place no word spans), each
+/// widened to the grapheme clusters it touches so the caret never lands inside one.
+///
+/// The words are [`aterm_grapheme::words`] of alphanumerics plus `_`: the rule a
+/// double-click and the find field follow, so M-f and M-b stop where they do. A
+/// ZWJ or ZWNJ joins the cluster before it, so a word that ends at one it does not
+/// share with the next word (`foo`, ZWJ, `bar`) ends after it.
+fn editor_words(text: &str, from: usize) -> impl Iterator<Item = Range<usize>> + '_ {
+    let tail = text.get(from..).unwrap_or_default();
+    let mut clusters = tail
+        .grapheme_indices()
+        .map(|(at, cluster)| at..at.saturating_add(cluster.len()))
+        .peekable();
+    aterm_grapheme::words(tail, aterm_grapheme::is_word_char).map(move |word| {
+        while clusters
+            .next_if(|cluster| cluster.end <= word.start)
+            .is_some()
+        {}
+        let start = clusters
+            .peek()
+            .map_or(word.start, |cluster| cluster.start.min(word.start));
+        while clusters.next_if(|cluster| cluster.end < word.end).is_some() {}
+        let end = clusters
+            .peek()
+            .map_or(word.end, |cluster| cluster.end.max(word.end));
+        #[cfg(test)]
+        EDITOR_WORDS_READ.with(|n| n.set(n.get().saturating_add(1)));
+        from.saturating_add(start)..from.saturating_add(end)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: how many words [`editor_words`] has read on this thread.
+    static EDITOR_WORDS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn previous_word_boundary(text: &str, position: usize, count: usize) -> usize {
     let position = clamp_to_char_boundary(text, position.min(text.len()));
     let count = count.clamp(1, 10_000);
     let mut recent_starts = VecDeque::with_capacity(count);
-    let mut in_word = false;
-    for (byte, grapheme) in text.grapheme_indices() {
-        if byte.saturating_add(grapheme.len()) > position {
+    for word in editor_words(text, 0) {
+        if word.start >= position {
             break;
         }
-        let is_word = grapheme.chars().next().is_some_and(editor_word_character);
-        if is_word && !in_word {
-            if recent_starts.len() == count {
-                recent_starts.pop_front();
-            }
-            recent_starts.push_back(byte);
+        if recent_starts.len() == count {
+            recent_starts.pop_front();
         }
-        in_word = is_word;
+        recent_starts.push_back(word.start);
     }
     if recent_starts.len() == count {
         recent_starts.front().copied().unwrap_or(0)
@@ -1605,25 +1645,16 @@ fn previous_word_boundary(text: &str, position: usize, count: usize) -> usize {
     }
 }
 
-fn next_word_boundary(text: &str, position: usize) -> usize {
-    let mut at = clamp_to_char_boundary(text, position.min(text.len()));
-    while at < text.len() {
-        let next = next_boundary(text, at);
-        let character = text[at..next].chars().next().unwrap_or(' ');
-        if editor_word_character(character) {
-            break;
-        }
-        at = next;
-    }
-    while at < text.len() {
-        let next = next_boundary(text, at);
-        let character = text[at..next].chars().next().unwrap_or(' ');
-        if !editor_word_character(character) {
-            break;
-        }
-        at = next;
-    }
-    at
+/// The end of the `count`-th word that ends after `position` (or the end of the
+/// text), read in one pass from the last word break before the caret, so M-f costs
+/// the distance it moves, whatever its count.
+fn next_word_boundary(text: &str, position: usize, count: usize) -> usize {
+    let position = clamp_to_char_boundary(text, position.min(text.len()));
+    let from = aterm_grapheme::word_break_before(text, position, aterm_grapheme::is_word_char);
+    editor_words(text, from)
+        .filter(|word| word.end > position)
+        .nth(count.clamp(1, 10_000).saturating_sub(1))
+        .map_or(text.len(), |word| word.end)
 }
 
 fn line_start(text: &str, position: usize) -> usize {
@@ -1713,6 +1744,10 @@ fn line_number(text: &str, position: usize) -> usize {
         .filter(|byte| **byte == b'\n')
         .count()
 }
+
+/// M-y replaces the text the previous C-y inserted, so it needs one first.
+const YANK_POP_NEEDS_YANK: &str = "Yank first (C-y), then M-y";
+const YANK_POP_STALE: &str = "The buffer changed since C-y; yank again, then M-y";
 
 fn byte_of_line(text: &str, line: usize) -> usize {
     if line == 0 {
@@ -2734,6 +2769,36 @@ mod tests {
     }
 
     #[test]
+    fn unbound_keys_and_idle_bound_commands_say_their_own_reason() {
+        let (mut store, mut workspace, mut view, _) = editor("abc");
+        workspace
+            .handle_chord(&mut store, &mut view, KeyChord::parse("C-x").unwrap())
+            .unwrap();
+        let effects = workspace
+            .handle_chord(&mut store, &mut view, KeyChord::parse("z").unwrap())
+            .unwrap();
+        assert_eq!(
+            effects,
+            [EditorEffect::Status("C-x z is not bound".to_string())]
+        );
+        // C-w IS bound: with no region it must not claim the key is unbound.
+        let effects = workspace
+            .handle_chord(&mut store, &mut view, KeyChord::parse("C-w").unwrap())
+            .unwrap();
+        assert_eq!(
+            effects,
+            [EditorEffect::Status("No region selected".to_string())]
+        );
+        let effects = workspace
+            .handle_chord(&mut store, &mut view, KeyChord::parse("M-y").unwrap())
+            .unwrap();
+        assert_eq!(
+            effects,
+            [EditorEffect::Status(YANK_POP_NEEDS_YANK.to_string())]
+        );
+    }
+
+    #[test]
     fn vertical_motion_preserves_a_bounded_text_column() {
         let (mut store, mut workspace, mut view, _) = editor("alpha\nβ\ngamma");
         view.selections = vec![Selection::caret(4)];
@@ -3367,6 +3432,21 @@ mod tests {
         assert!(
             matches!(effects.as_slice(), [EditorEffect::Status(message)] if message == "Line 2")
         );
+        // Past the end the caret lands on the last line, and the status says so.
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::GotoLine)
+            .unwrap();
+        workspace
+            .insert_minibuffer_text(&store, &mut view, "999")
+            .unwrap();
+        let effects = workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+        let text = store.snapshot(document).unwrap().text;
+        assert_eq!(view.primary_selection(), &Selection::caret(text.len()));
+        let last = text.matches('\n').count() + 1;
+        assert_eq!(
+            effects,
+            [EditorEffect::Status(format!("Line {last} (last line)"))]
+        );
 
         let effects = workspace
             .execute(&mut store, &mut view, EditorCommand::RevertBuffer)
@@ -3379,6 +3459,111 @@ mod tests {
                 reachable: vec!["g  goto-line".to_string()],
             }
         );
+    }
+
+    /// The words M-f then M-b find in `text`, as byte ranges.
+    fn motion_words(text: &str) -> Vec<(usize, usize)> {
+        let mut words = Vec::new();
+        let mut at = 0;
+        loop {
+            let end = next_word_boundary(text, at, 1);
+            let start = previous_word_boundary(text, end, 1);
+            if end == at || start < at {
+                return words;
+            }
+            words.push((start, end));
+            at = end;
+        }
+    }
+
+    /// The words a double-click selects in `text`, widened to the grapheme
+    /// clusters they touch: the editor's caret never lands inside a cluster.
+    fn clicked_words(text: &str) -> Vec<(usize, usize)> {
+        let smart = aterm_core::selection::SmartSelection::new();
+        let mut bounds: Vec<usize> = text.grapheme_indices().map(|(at, _)| at).collect();
+        bounds.push(text.len());
+        let mut words: Vec<(usize, usize)> = text
+            .char_indices()
+            .filter_map(|(at, _)| smart.word_boundaries_at(text, at))
+            .map(|(start, end)| {
+                let floor = bounds.iter().rev().find(|&&b| b <= start).copied();
+                let ceil = bounds.iter().find(|&&b| b >= end).copied();
+                (floor.unwrap_or(0), ceil.unwrap_or(text.len()))
+            })
+            .collect();
+        words.dedup();
+        words
+    }
+
+    /// M-f / M-b find the words a double-click selects. They used to call a word
+    /// any run of grapheme clusters that START with a letter, so a cluster led by
+    /// a prepended number sign (`۝١`) was no word, and a ZWJ or ZWNJ, which joins
+    /// the cluster before it, welded `foo` and `bar` into one word where a
+    /// double-click (and the find field) see two: an invisible character must not
+    /// weld two words together. A joiner that spells a word (Persian, Sinhala,
+    /// Bengali) still belongs to it.
+    #[test]
+    fn word_motion_finds_the_words_a_double_click_selects() {
+        for word in [
+            "\u{06DD}\u{0661}\u{0662}\u{0663}", // ۝١٢٣
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}", // می‌خواهم
+            "\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}", // ශ්‍රී
+            "\u{09B0}\u{200D}\u{09CD}\u{09AF}\u{09BE}\u{09AC}", // র‍্যাব
+            "\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947}", // नमस्ते
+            "\u{182C}\u{1820}\u{1837}\u{180E}\u{1820}", // ᠬᠠᠷ᠎ᠠ
+        ] {
+            let text = format!("x {word} y");
+            let end = 2 + word.len();
+            assert_eq!(
+                motion_words(&text),
+                [(0, 1), (2, end), (end + 1, end + 2)],
+                "{word:?}"
+            );
+            assert_eq!(motion_words(&text), clicked_words(&text), "{word:?}");
+        }
+        for (text, words) in [
+            ("foo\u{200D}bar", [(0, 6), (6, 9)]),
+            ("foo\u{200C}bar", [(0, 6), (6, 9)]),
+            ("abc\u{202E}def", [(0, 3), (6, 9)]),
+            ("a\u{2060}b", [(0, 1), (4, 5)]),
+            ("x\u{200E}y", [(0, 1), (4, 5)]),
+            ("ab\u{180E}cd", [(0, 2), (5, 7)]),
+        ] {
+            assert_eq!(motion_words(text), words, "{text:?}");
+            assert_eq!(motion_words(text), clicked_words(text), "{text:?}");
+        }
+    }
+
+    /// M-f with a count reads the line once, from the last word break before the
+    /// caret: its cost is the distance it moves, pinned here by the words it reads.
+    /// It used to run one motion per count, each reading from the last whitespace
+    /// before the caret, so C-u 1000 M-f on a line with no whitespace read half a
+    /// million words, and every plain M-f read the line up to the caret.
+    #[test]
+    fn forward_word_applies_a_count_in_one_pass_from_the_last_break() {
+        let text = "ab.".repeat(64 * 1024);
+        let (mut store, mut workspace, mut view, _) = editor(&text);
+        view.selections = vec![Selection::caret(0)];
+        view.prefix_argument = Some(1000);
+        EDITOR_WORDS_READ.with(|n| n.set(0));
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::MoveWordForward)
+            .unwrap();
+        assert_eq!(view.primary_selection().head, 1000 * 3 - 1);
+        let read = EDITOR_WORDS_READ.with(std::cell::Cell::get);
+        assert!(read <= 1001, "C-u 1000 M-f read {read} words");
+
+        // A thousand plain M-f deep in the line, each reading a word or two.
+        view.selections = vec![Selection::caret(30_000 * 3)];
+        EDITOR_WORDS_READ.with(|n| n.set(0));
+        for _ in 0..1000 {
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::MoveWordForward)
+                .unwrap();
+        }
+        assert_eq!(view.primary_selection().head, 31_000 * 3 - 1);
+        let read = EDITOR_WORDS_READ.with(std::cell::Cell::get);
+        assert!(read <= 2 * 1000, "1000 M-f read {read} words");
     }
 
     #[test]

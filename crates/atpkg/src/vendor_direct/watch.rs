@@ -7,13 +7,13 @@
 //! installed. The head is only a hint: the `update <program>` pass it triggers re-verifies
 //! everything.
 //!
-//! Two hosts run it (gap #28, 2026-09-26): the window's package thread, which rides its own
+//! Two hosts run it: the window's package thread, which rides its own
 //! parks ([`HeadWatch::slice`]), and — on a Mac with no window open — one terminal
 //! session, through the host-agnostic [`Runner`] ([`run_host`]). The store's rendezvous
 //! ([`host`]) keeps the two kinds from ever watching at once.
 
 use std::ffi::OsStr;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
@@ -588,10 +588,10 @@ impl HeadWatch {
     /// Move the workers' completion notices off the channel, keeping only those whose head
     /// is still pending; whether any arrived. A notice can outlive its head: a worker sends
     /// it just before it finishes, so a harvest that read the channel first and saw the
-    /// thread finished after joined the head without it (measured 2026-09-26: 32 of 3,000
-    /// rounds whose two GETs failed at once, as they do offline). Kept, that stale notice
-    /// skipped every later park's wait, and a host with nothing in flight — a session's
-    /// runner following its pass, or a window between due heads — spun a core.
+    /// thread finished after joined the head without it (32 of 3,000 offline rounds, whose
+    /// two GETs fail at once). Kept, that stale notice would skip every later park's wait,
+    /// and a host with nothing in flight — a session's runner following its pass, or a
+    /// window between due heads — would spin a core.
     fn take_notices(&mut self) -> bool {
         let mut arrived = false;
         while let Ok(index) = self.completed_rx.try_recv() {
@@ -1090,30 +1090,9 @@ fn open_shared(layout: &Layout, spec: &VendorSpec) -> SharedFile {
     let path = layout
         .prefix
         .join(format!("vendor-head-{}.watch", spec.program));
-    let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let Ok(file) = options.open(path) else {
+    let Some(file) = crate::index_probe::open_private(&path, true) else {
         return SharedFile::Unavailable;
     };
-    let Ok(metadata) = file.metadata() else {
-        return SharedFile::Unavailable;
-    };
-    if !metadata.file_type().is_file() || crate::platform::is_reparse(&metadata) {
-        return SharedFile::Unavailable;
-    }
     match crate::lock::Flock::try_lock(file) {
         Ok(file) => SharedFile::Held(file),
         Err(std::fs::TryLockError::WouldBlock) => SharedFile::Busy,
@@ -1337,7 +1316,7 @@ mod tests {
     /// release — is a hang detector of a minute, never a latency budget
     /// (AGENTS.md). A simulated GET the test holds waits twice this for its
     /// release, so it never gives up inside one.
-    const HANG: Duration = Duration::from_secs(60);
+    pub(super) const HANG: Duration = Duration::from_secs(60);
 
     /// A park of two minutes, woken at 100 ms, returns inside [`HANG`]: the
     /// wake and the slice running out are told apart whatever the load.
@@ -1364,11 +1343,8 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000 + secs)
     }
 
-    pub(super) fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-watch-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        Layout { prefix: p }
+    pub(super) fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-watch-{label}-"))
     }
 
     /// A window with no vendor head to ask must defer its held-move look while
@@ -1557,46 +1533,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A STALE COMPLETION NEVER CUTS A PARK SHORT (review, 2026-09-26). A worker sends its
-    /// notice just before its thread finishes, so a harvest can join the head by its
-    /// finished thread and leave the notice behind. Offline, both GETs of a round fail at
-    /// once and the race is common (32 in 3,000 rounds, measured before the fix); the
-    /// notice left over made every later park return at once — three 200 ms parks in
-    /// under a microsecond — so a host with nothing in flight spun. Here: the offline
-    /// rounds, then the state they leave pinned directly (a notice for a head no longer
-    /// pending).
+    /// A STALE COMPLETION NEVER CUTS A PARK SHORT. A worker sends its notice just before its
+    /// thread finishes, so a harvest can join the head by its finished thread and leave the
+    /// notice behind ([`HeadWatch::take_notices`]). That race leaves exactly one state, set
+    /// here directly: a notice for a head no longer pending.
     #[test]
     fn a_stale_completion_never_cuts_a_park_short() {
-        let l = layout("stale-notice");
-        install(&l, "claude", "2.1.280");
-        install(&l, "codex", "0.156.0");
-        let get: Arc<ConcurrentVendorGetFn<'static>> =
-            Arc::new(|_, _, _, _| Err(VendorFetchError::Unreachable(String::from("offline"))));
         let mut watch = HeadWatch::new(&[]);
-        for round in 0..3000u64 {
-            let now = at(round * 3600);
-            let _ = watch.check_pending(&l, now, &get);
-            assert!(watch.has_pending(), "round {round} asked both heads");
-            while watch.has_pending() {
-                watch.park_for_hint(Duration::from_millis(100));
-                let _ = watch.check_pending(&l, now, &get);
-            }
-            watch.park_for_hint(Duration::ZERO);
-            assert_eq!(
-                watch.ready_notices,
-                Vec::<usize>::new(),
-                "round {round} left a stale notice"
-            );
-        }
-        // The state pinned: a notice for a head no longer pending is dropped, so the next
-        // park's wait is not skipped (it waits exactly while `ready_notices` is empty).
+        // The notice is dropped, so the next park's wait is not skipped (it waits exactly
+        // while `ready_notices` is empty).
         watch.completed_tx.send(0).unwrap();
         watch.park_for_hint(Duration::ZERO);
         assert!(
             watch.ready_notices.is_empty(),
             "the stale notice was dropped"
         );
-        let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
     #[test]
@@ -1679,9 +1630,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A single installed vendor used to run its GET inline. A blocked host
-    /// then held the package lane for the hint's whole 15-second network bound,
-    /// so a bump or full-pass deadline arriving meanwhile could not be read.
+    /// A single installed vendor's GET runs off the package lane: a blocked host must not
+    /// hold it for the hint's 15-second network bound, past a bump or full-pass deadline.
     #[test]
     fn one_blocked_vendor_is_owned_without_blocking_the_package_lane() {
         let l = layout("one-blocked-head");

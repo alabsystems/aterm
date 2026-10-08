@@ -213,19 +213,8 @@ mod tests {
 
     const T: &str = "aarch64-apple-darwin";
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!(
-            "atpkg-vendor-digests-{label}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-vendor-digests-{label}-"))
     }
 
     fn v(text: &str) -> Version {

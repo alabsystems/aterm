@@ -1,59 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// A LIVE `GpuRenderer::set_text_shaping()` flip must reach GPU pixels AND keep
-// CPU==GPU parity. `ligature_parity.rs` builds the renderers fresh and only flips
-// the CPU side, so nothing exercised the new GPU config passthrough
-// (`GpuRenderer::set_text_shaping` -> `invalidate_atlas`) on a live renderer. These
-// tests drive the same renderer through a config change and re-render.
+// A live `GpuRenderer::set_text_shaping()` flip reaches GPU pixels and keeps
+// CPU==GPU parity: the same renderer is driven through a config change
+// (`set_text_shaping` -> `invalidate_atlas`) and re-rendered.
 //
-// Gated: no GPU / font -> skip cleanly.
+// No GPU: skip.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, TextShapingConfig, Theme};
 use aterm_types::text_shaping::{FontFeature, FontFeatureSet};
 
-mod common;
-use common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
+use crate::common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
 
-// Layout-independent ligature font discovery (mirrors ligature_parity.rs): the
-// bundled JetBrains Mono ligates `=>` and carries a `zero` (slashed-zero) feature.
-// The dedicated $ATERM_LIGATURE_TEST_FONT overrides it. The path is handed to both
-// renderers as their FAMILY (`backends_with_font`), so nothing here writes the
-// environment. Returns (path, is_fixture): is_fixture is true iff discovery fell
-// through to the bundled fixture, whose `zero` feature the tests may rely on.
-fn ligature_test_font() -> Option<(std::path::PathBuf, bool)> {
+// The ligature test font (as in ligature_parity.rs): the committed JetBrains
+// Mono fixture ligates `=>` and has a `zero` (slashed-zero) feature;
+// $ATERM_LIGATURE_TEST_FONT overrides it. The path is handed to both renderers
+// as their family (`backends_with_font`). Returns (path, is_fixture), where
+// is_fixture means the fixture's `zero` feature can be relied on.
+fn ligature_test_font() -> (std::path::PathBuf, bool) {
     if let Some(p) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         .ok()
         .map(std::path::PathBuf::from)
         .filter(|p| p.exists())
     {
-        return Some((p, false));
+        return (p, false);
     }
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
     );
     let p = std::path::PathBuf::from(FIXTURE);
-    p.exists().then_some((p, true))
+    assert!(p.exists(), "{FIXTURE}: missing (a committed fixture)");
+    (p, true)
 }
 
-/// A live ligature on->off flip via `set_text_shaping` reaches GPU pixels and keeps
-/// CPU==GPU. This is the same `set_text_shaping` entrypoint the GUI config wiring
-/// calls, exercised on a LIVE GpuRenderer (atlas already resident from the first
-/// frame) — the path the prior tests never covered.
+/// A live ligature on->off flip via `set_text_shaping` (the entry point the
+/// GUI config wiring calls) on a renderer with a resident atlas reaches GPU
+/// pixels and keeps CPU==GPU.
 #[test]
 fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
     let theme = Theme::default();
     let px = 18.0;
 
     // Builds BOTH renderers on the ligature font (see ligature_test_font).
-    let Some((font, _)) = ligature_test_font() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let (font, _) = ligature_test_font();
 
     let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
@@ -104,11 +95,9 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
     );
 }
 
-/// A live `font_features` flip (`zero` = slashed zero) reaches GPU pixels and keeps
-/// CPU==GPU. This proves the headline `font_features` knob is not a no-op on the GPU
-/// backend. Non-vacuity is enforced for the bundled JetBrains Mono fixture; if a
-/// host points $ATERM_LIGATURE_TEST_FONT at a font WITHOUT a `zero` feature it
-/// SKIPs (logged) rather than failing, so the suite stays portable.
+/// A live `font_features` flip (`zero` = slashed zero) reaches GPU pixels and
+/// keeps CPU==GPU. Non-vacuity is enforced for the bundled fixture; a font
+/// from $ATERM_LIGATURE_TEST_FONT without `zero` skips (logged).
 #[test]
 fn live_font_feature_flip_reaches_gpu_pixels() {
     let theme = Theme::default();
@@ -116,10 +105,7 @@ fn live_font_feature_flip_reaches_gpu_pixels() {
 
     // is_fixture: whether the bundled fixture (with its `zero` feature) is in use
     // (see ligature_test_font).
-    let Some((font, is_fixture)) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font");
-        return;
-    };
+    let (font, is_fixture) = ligature_test_font();
 
     let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;

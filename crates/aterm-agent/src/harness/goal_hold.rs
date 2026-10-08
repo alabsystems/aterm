@@ -1,32 +1,22 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE ONE RECORD OF A CODEX GOAL ATERM PAUSED (the owner's decision of
-//! 2026-09-28, answered to "A Codex in goal mode starts its next turn about
-//! 10 ms after the last one ends, so it never gives aterm a pause to upgrade
-//! in. How should aterm upgrade such a tab?": "Pause the goal briefly
-//! (Recommended) — once the upgrade is due, aterm types `/goal pause` (or
-//! presses Esc the instant a new goal turn starts, before it has done
-//! anything), moves Codex onto the new build, then types `/goal resume`. The
-//! goal carries on where it was; no running tool call is ever cut off.").
+//! The one record of a Codex goal aterm paused, per tab (owner, 2026-09-28).
 //!
-//! Two of aterm's lanes pause a Codex goal: the LIVE UPGRADE, for the move
-//! ([`super::upgrade_codex::goal_step`]), and the supervisor's SAVE-THEN-WAIT
-//! SWITCH (`supervise::policy::turn_end`), while Codex runs on a cheaper
-//! model. ONE FILE per tab says which of them holds that tab's goal paused,
-//! and what it still owes: `<aterm state>/drive/<sid>.goal-hold.json`, beside
-//! the tab's loop's ledger — the one place both reach (the upgrade by its
-//! `Opts::aterm_state`, the loop by its ledger's path, [`path_beside`]). An
-//! owner CLAIMS it before its key goes ([`claim`]: refused while the other
-//! owner's hold is open), and every edge of its hold is written there BEFORE
-//! the key that makes it: a host that restarts between the pause and the
-//! resume reads what it owes and resumes the goal ONCE — never twice (a
-//! resume already typed is `Resuming`, verified on the footer before it is
-//! ever typed again), and never not at all. The switch's own ledger rows stay
-//! its durable record (`approvals::open_wind_down`); its claim here is kept in
-//! step with them by its loop, which is how the upgrade learns the goal is
-//! the switch's ([`sync_switch`]), and how the switch learns it is the
-//! upgrade's ([`held_by_upgrade`]).
+//! A Codex in goal mode starts its next turn milliseconds after the last ends,
+//! so aterm pauses the goal (`/goal pause`, or Esc at a new turn's head),
+//! does its work, then types `/goal resume`. Two lanes pause a goal: the live
+//! upgrade, for the move ([`super::upgrade_codex::goal_step`]), and the
+//! supervisor's save-then-wait switch (`supervise::policy::turn_end`). One
+//! file per tab, `<aterm state>/drive/<sid>.goal-hold.json` beside the loop's
+//! ledger ([`path_beside`]), says which holds the goal and what it still owes.
+//!
+//! An owner claims it before its key goes ([`claim`], refused while the other
+//! owner's hold is open), and every edge of the hold is written before the key
+//! that makes it, so a host restarted between pause and resume resumes the
+//! goal exactly once (`Resuming` is verified on the footer before it is typed
+//! again). The switch's claim is kept in step with its ledger rows
+//! ([`sync_switch`], [`held_by_upgrade`]).
 //!
 //! Nothing here reads a screen or types a key: the lanes decide, and this is
 //! their shared memory.
@@ -67,13 +57,11 @@ impl Owner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum How {
     /// `/goal pause` typed: Codex takes it while a turn runs, and it stops
-    /// the goal's NEXT turn, never the running one (the upgrade's evidence,
-    /// `upgrade_codex` module header, "THE GOAL PAUSE").
+    /// the goal's next turn, never the running one.
     Typed,
-    /// Esc, at a goal turn's HEAD — its rollout holds nothing of the turn's
-    /// own work yet — which interrupts that turn and pauses the goal in the
-    /// same instant (measured 2026-09-28 in the owner's rollout: the Esc of
-    /// 15:01:13Z wrote `turn_aborted` and `thread_goal_updated … paused`).
+    /// Esc at a goal turn's head (its rollout holds none of the turn's work
+    /// yet), which interrupts that turn and pauses the goal in the same
+    /// instant.
     Esc,
 }
 
@@ -137,7 +125,7 @@ impl Stage {
     }
 }
 
-/// ONE TAB'S HOLD of its Codex goal (module header).
+/// One tab's hold of its Codex goal (module header).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hold {
     /// Whose it is.
@@ -149,7 +137,7 @@ pub struct Hold {
     /// The Codex TUI the pause went into; `0` where the owner did not name
     /// one (the switch's claim).
     pub pid: u32,
-    /// When the pause was FIRST made (unix seconds).
+    /// When the pause was first made (unix seconds).
     pub at: u64,
     /// When the latest way of pausing was tried ([`Hold::how`]): the typed
     /// pause, then the Esc.
@@ -327,9 +315,9 @@ pub fn write(path: &Path, hold: &Hold) -> std::io::Result<()> {
     super::upgrade_models::write_atomic(path, &hold.to_json())
 }
 
-/// CLAIM the goal for `hold`'s owner, before its key goes: written unless an
-/// OPEN hold of the OTHER owner stands there (`Err(that owner)`) — the one
-/// rule that keeps the two lanes from both holding a goal.
+/// Claim the goal for `hold`'s owner, before its key goes: written unless an
+/// open hold of the other owner stands there (`Err(that owner)`), the one rule
+/// that keeps the two lanes from both holding a goal.
 ///
 /// # Errors
 /// The other owner's hold is open (`Ok(Err(owner))`), or the record could not
@@ -351,17 +339,11 @@ pub fn held_by_upgrade(path: &Path) -> bool {
 }
 
 /// Whether the paused-goal box on the tab whose record is at `path` is the
-/// UPGRADE'S TO ANSWER — the one box the loop's approval policy presses for
-/// it (`goal-resume@v1`): the upgrade's hold still owes the goal its resume,
-/// it RELAUNCHED a Codex for the move ([`Hold::relaunched`]), that Codex
-/// still leads its terminal (`leads`: alive, and its group its terminal's
-/// foreground — the kernel's word), and its box was not left to a person at
-/// the keys (`upgrade_codex::BOX_THEIRS`). Every other box — the one a
-/// person's own `codex resume` draws in the tab (another Codex), the box of a
-/// Codex restarted by hand over aterm's relaunch, a box a person was left —
-/// is theirs (the review of 2026-09-28: armed by the hold alone, the policy
-/// pressed `Resume goal` on any paused-goal box in the tab, a goal aterm
-/// never paused included).
+/// upgrade's to answer (the one box `goal-resume@v1` presses for it): the
+/// upgrade's hold still owes the resume, it relaunched a Codex for the move
+/// ([`Hold::relaunched`]), that Codex still leads its terminal (`leads`), and
+/// the box was not left to a person (`upgrade_codex::BOX_THEIRS`). Every
+/// other paused-goal box in the tab is a person's.
 #[must_use]
 pub fn box_is_upgrades(path: &Path, leads: impl Fn(u32) -> bool) -> bool {
     read(path).is_some_and(|h| {
@@ -373,13 +355,11 @@ pub fn box_is_upgrades(path: &Path, leads: impl Fn(u32) -> bool) -> bool {
     })
 }
 
-/// THE SWITCH'S CLAIM KEPT IN STEP with its own state, at `now`: `paused` —
-/// the switch paused the goal and owes it its resume at the reset
-/// (`WindDown::goal_paused`) — writes its hold where none is open (the
-/// upgrade's open hold is left as it stands, and `false` says the switch does
-/// not hold the goal); not `paused` ends an open hold of the switch's
-/// ([`Stage::Released`], `switch`). What it wrote, or `None` where it wrote
-/// nothing (nothing changed, or the upgrade holds the goal).
+/// The switch's claim kept in step with its own state, at `now`: `paused` (the
+/// switch owes the goal its resume at the reset, `WindDown::goal_paused`)
+/// writes its hold where none is open (an open upgrade hold is left as it
+/// stands); not `paused` ends an open hold of the switch's
+/// ([`Stage::Released`], `switch`). Returns what it wrote, or `None`.
 pub fn sync_switch(path: &Path, paused: bool, how: How, now: u64) -> Option<Hold> {
     let open = read(path).filter(Hold::owes);
     let hold = match (paused, open) {
@@ -405,20 +385,13 @@ pub fn sync_switch(path: &Path, paused: bool, how: How, now: u64) -> Option<Hold
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("aterm-goal-hold-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("scratch");
-        d
-    }
-
     /// The record reads back whole, and sits beside the tab's loop ledger —
     /// the one file the loop's path and the upgrade's root both name.
-    /// NEGATIVE CONTROL: a file that is no hold (an upgrade state's shape)
+    /// Negative control: a file that is no hold (an upgrade state's shape)
     /// reads as none.
     #[test]
     fn a_hold_reads_back_whole_beside_the_loops_ledger() {
-        let root = scratch("whole");
+        let root = crate::supervise::ScratchDir::new("goal-hold", "whole");
         let at = path(&root, "s-0123");
         assert_eq!(at, root.join("drive").join("s-0123.goal-hold.json"));
         assert_eq!(
@@ -436,17 +409,16 @@ mod tests {
         assert_eq!(read(&at), Some(h));
         std::fs::write(&at, r#"{"phase":"pending","from":"0.157.1"}"#).expect("other");
         assert_eq!(read(&at), None);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// ONE OWNER AT A TIME: the upgrade's claim stands while the switch's
-    /// hold is open, and the switch's while the upgrade's is — each refused
+    /// One owner at a time: the upgrade's claim stands while the switch's
+    /// hold is open, and the switch's while the upgrade's is, each refused
     /// with the other's name; an ended hold is no obstacle. The switch's sync
-    /// leaves the upgrade's open hold as it stands. NEGATIVE CONTROL: the
+    /// leaves the upgrade's open hold as it stands. Negative control: the
     /// same owner claims over its own open hold (a new way tried).
     #[test]
     fn one_owner_holds_a_goal_at_a_time() {
-        let root = scratch("owner");
+        let root = crate::supervise::ScratchDir::new("goal-hold", "owner");
         let at = path(&root, "s-9");
         let up = Hold::pausing(Owner::Upgrade, How::Typed, 7, "0.158.0", 100);
         assert_eq!(claim(&at, &up).expect("io"), Ok(()));
@@ -489,20 +461,16 @@ mod tests {
             "nothing new"
         );
         assert_eq!(claim(&at, &upgrade).expect("io"), Ok(()));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// THE BOX IS THE UPGRADE'S only while its hold owes the resume, names
+    /// The box is the upgrade's only while its hold owes the resume, names
     /// the Codex it relaunched, that Codex still leads its terminal, and the
-    /// box was not left to a person (the review of 2026-09-28: the loop's
-    /// `goal-resume@v1` was armed by the hold alone). NEGATIVE CONTROLS, each
-    /// alone: no relaunch yet (a person's own `codex resume` before it),
-    /// the relaunch no longer leading (a Codex the person restarted by hand
-    /// in its place), the box left to a person (`BOX_THEIRS`), the hold no
-    /// longer owed, the hold the switch's.
+    /// box was not left to a person. Negative controls, each alone: no
+    /// relaunch yet, the relaunch no longer leading, the box left to a person
+    /// (`BOX_THEIRS`), the hold no longer owed, the hold the switch's.
     #[test]
     fn the_box_is_the_upgrades_only_on_its_own_relaunch() {
-        let root = scratch("box");
+        let root = crate::supervise::ScratchDir::new("goal-hold", "box");
         let at = path(&root, "s-7");
         let leads = |pid: u32| pid == 5151;
         let paused = Hold {
@@ -543,6 +511,5 @@ mod tests {
         )
         .expect("write");
         assert!(!box_is_upgrades(&at, leads), "the switch's");
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

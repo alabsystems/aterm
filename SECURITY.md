@@ -5,13 +5,11 @@
 
 ## Supported release
 
-Security maintenance is best-effort and applies to the newest `vX.Y.0` release
-on the public channel — the macOS application published on this repository's
-[Releases](https://github.com/alabsystems/aterm/releases) page, and the source
-snapshot published at that release's version. (The page's "Latest" badge can be
-held by a non-application release, such as a toolchain package index; the
-newest `vX.Y.0` tag is the one that matters.) Earlier releases are superseded
-rather than maintained.
+Security maintenance is best-effort and applies to the release marked Latest on
+this repository's [Releases](https://github.com/alabsystems/aterm/releases)
+page: the newest macOS application, and the source snapshot at its version. A
+newer `vX.Y.0` prerelease with no application is source only. Earlier releases
+are superseded rather than maintained.
 
 Installed copies update themselves from that channel, so a running macOS
 install converges on the supported version on its own. An install that has
@@ -62,8 +60,8 @@ Examples of issues that should be reported privately include:
   roster, its deny-list, and the forward-only build rule are described in
   [README ▸ Security model](README.md#security-model));
 - escapes from the sandbox profile that `--sandbox` applies to session
-  processes on macOS (network, write confinement, credential and private-data
-  directories), a `containment` session starting on a platform with no OS
+  processes on macOS (network, other processes' task ports, write confinement,
+  credential and private-data directories), a `containment` session starting on a platform with no OS
   sandbox (it must refuse), or a containment gate on any platform failing to
   enforce what it announces at startup;
 - capture-path escapes or unintended disclosure of terminal contents; and

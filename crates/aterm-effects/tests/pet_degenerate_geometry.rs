@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A DEGENERATE SENSE NEVER PUTS THE PET NOWHERE** (2026-09-15).
+//! A degenerate sense never puts the pet nowhere.
 //!
-//! The pet's body is fractional cells carried in `f32`, and the brain does 115
-//! divisions, roots and trig against numbers the host supplies — against only
-//! ten finiteness guards. A zero cell metric or a zero-sized grid is not
-//! hypothetical: it is what a host holds between a resize and the next surface
-//! attach, and a NaN there would draw the cat nowhere or at a garbage position,
-//! which is exactly the shape a person reports as the cat "flashing".
-//!
-//! This walks the legal-but-degenerate corners and asserts the body stays
-//! finite and on the grid whenever it is drawn at all. It passes today; it is
-//! here so it keeps passing.
+//! The pet's body is fractional cells in `f32`, and the brain does many
+//! divisions, roots and trig operations on host-supplied numbers. A zero cell
+//! metric or zero-sized grid is what a host holds between a resize and the next
+//! surface attach; a NaN there would draw the cat nowhere or at a garbage
+//! position. This walks the legal-but-degenerate corners and asserts the body
+//! stays finite and on the grid whenever it is drawn.
 use aterm_effects::kitty_pet::{PetBrain, PetSense};
 use std::time::{Duration, Instant};
 

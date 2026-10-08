@@ -8,8 +8,5 @@ license.workspace = true
 repository.workspace = true
 description = "aterm shared deterministic colour, easing, vector, and tile-raster primitives"
 
-[dev-dependencies]
-proptest.workspace = true
-
 [lints]
 workspace = true

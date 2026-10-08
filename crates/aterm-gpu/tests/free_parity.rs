@@ -1,36 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// FREE-floating sprite layer, Phase 2 (FREE_OVERLAY_LAYER_DESIGN.md §5.1/§5.2/
-// §5.5): CPU==GPU parity now that BOTH backends consume `free_sprites`. The
-// free layer is the cat NEAREST-1:1 regime through the same src-over pipeline,
-// so its effect-only delta is pinned at the cat bar — target <= 1, hard <= 2
-// (float UV normalization can round a boundary texel one ULP on the GPU; the
-// CPU stamp is integer-exact). Covered:
-//   * effect-only parity for multi-row free rects over blank bg and over text:
-//     opaque texels, partial-alpha texels, a sprite-level alpha multiplier,
-//     `flip_x`, tint, and the `FreeZ::OverText` slot (§5.1/§5.6);
-//   * damaged-path cross-band equality (§5.2): a moved multi-row rect vs the
-//     legacy per-row slices of the same art — byte-exact on the CPU, <= 2 on
-//     the GPU (the full-path GPU twin lives in free_sprite_gpu.rs);
-//   * damaged-path no-ghosting + the dirty gate on BOTH backends (§5.5):
-//     cached == fresh per backend after a move; settled ⇒ GPU `gate_hits`.
+// Free-floating sprite layer (FREE_OVERLAY_LAYER_DESIGN.md §5): CPU==GPU parity
+// for `free_sprites`. The layer uses the cat's nearest 1:1 regime through the
+// same source-over pipeline, so the effect-only delta is held to the cat bar
+// (target <= 1, hard <= 2; float UV normalization can round a boundary texel on
+// the GPU). Covered:
+//   * effect-only parity for multi-row rects over blank bg and over text:
+//     opaque and partial-alpha texels, sprite alpha, `flip_x`, tint, and the
+//     `FreeZ::OverText` slot;
+//   * damaged-path equality of a moved multi-row rect with per-row slices of
+//     the same art (byte-exact on the CPU, <= 2 on the GPU);
+//   * damaged-path no-ghosting and the dirty gate on both backends.
 //
-// Gated: no GPU or no font -> the test no-ops (returns), like the other parity gates.
+// Skips without a GPU or font.
 
+use crate::common;
 use std::sync::Arc;
 
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::Terminal;
 use aterm_render::{SceneAtlas, SpriteQuad, Theme, WindowCpu};
 
-mod common;
-use common::{backends, bb, gg, max_channel_delta, rr};
+use crate::common::{backends, bb, gg, max_channel_delta, rr};
 
-/// A deterministic patterned RGBA atlas: per-texel distinct colours, OPAQUE top
-/// half (multi-row opaque rects), mixed alpha bottom half (real src-over).
-/// Power-of-two dims keep the GPU's normalized-UV NEAREST math exact at texel
-/// centres.
+/// A deterministic RGBA atlas: distinct per-texel colours, opaque top half,
+/// mixed-alpha bottom half. Power-of-two dims keep nearest UV math exact at
+/// texel centres.
 fn free_atlas(version: u64) -> SceneAtlas {
     let (w, h) = (64u32, 128u32);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -78,13 +74,10 @@ fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2], alpha: u8) -> Fre
     }
 }
 
-/// THE free-layer parity pin (§5.1). The base frame is procedural full-block
-/// glyphs + background — byte-exact CPU==GPU (delta 0) — so the measured delta
-/// on the sprite frame is the FREE layer's alone (effect-only). Sprites cover:
-/// a MULTI-ROW rect over blank bg (opaque texels), a multi-row rect over the
-/// block TEXT, partial-alpha texels, a sprite-level alpha multiplier + flip_x,
-/// a tinted rect, and an OverText rect over the text (§5.6's GPU/CPU slot
-/// consistency; the OverText-vs-additive z-order is pinned separately by
+/// Free-layer parity over a delta-0 base (procedural blocks and background), so
+/// the measured delta is the free layer's: multi-row rects over blank bg and
+/// text, partial alpha, sprite alpha with `flip_x`, a tinted rect, and an
+/// OverText rect (the OverText z-order is pinned by
 /// `free_over_text_covers_wdeco_and_additive_light_both_backends`).
 #[test]
 fn free_effect_only_parity_pinned_over_bg_and_text() {
@@ -171,14 +164,10 @@ fn free_effect_only_parity_pinned_over_bg_and_text() {
     );
 }
 
-/// §5.6 OVER-TEXT z-order pin, BOTH backends: over-text means over EVERYTHING
-/// except the cursor. An OPAQUE OverText sprite covers a glyph, a wdeco `Over`
-/// stamp, AND additive glow + nova light: on the CPU the covered cells are
-/// byte-pure sprite colour (the stamp lands after `draw_decorations` and the
-/// additive post-passes, right before `draw_cursor`); on the GPU (`FreeOver`
-/// after the wdeco streams, before the cursor) the same cells match within the
-/// cat bar (<= 2, float UV rounding only). The UnderText slot is pinned by the
-/// other §5.6 cases and by free_composite.rs (unchanged).
+/// OverText z-order on both backends: over everything except the cursor. An
+/// opaque OverText sprite covers a glyph, a wdeco `Over` stamp and additive
+/// glow and nova light; the CPU cells are pure sprite colour and the GPU cells
+/// match within the cat bar (<= 2).
 #[test]
 fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
     use aterm_core::render::{DecoBlend, DecoGlyph, GlowQuad, WordDecoration};
@@ -186,10 +175,8 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
     let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    // The GPU-only comet BLOOM halo re-adds the aurora light over the WHOLE
-    // readback (deliberately above every stream, cursor included) — disable it
-    // so this pin measures the shared FreeOver slot, like nova_parity does.
-    // Ditto the heat shimmer (same parity class, wall-clock at present).
+    // Bloom and shimmer are GPU-only layers over the whole readback; off so
+    // this measures the shared FreeOver slot.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -288,11 +275,9 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
     );
 }
 
-/// §5.2 on the DAMAGED path, both backends: prime the caches with the rect at
-/// bands 1..=3, move it to 2..=4, and compare the cached repaint against the
-/// SAME move expressed as legacy per-row `cat_quads` slices — byte-exact on
-/// the CPU, <= 2 on the GPU. (The full-path CPU twin is in aterm-render's
-/// free_composite.rs.)
+/// Damaged path on both backends: prime with the rect at bands 1..=3, move it
+/// to 2..=4, and compare the cached repaint with the same move as per-row
+/// `cat_quads` slices (byte-exact on the CPU, <= 2 on the GPU).
 #[test]
 fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
     let theme = Theme::default();
@@ -383,25 +368,20 @@ fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
     );
 }
 
-/// §5.5 damaged/cached-path no-ghosting + the dirty gate, on BOTH backends:
-/// frame A primes the caches with a multi-row rect at bands 1..=3; frame B
-/// moves it down one band (GPU gate must MISS; both cached repaints must equal
-/// a fresh full render byte-for-byte — the row-union marked every vacated +
-/// occupied band, so Phase A re-cleared them); frame C repeats B (settled:
-/// equal sprites, same atlas version) and must take the GPU dirty gate.
+/// Damaged-path no-ghosting and the dirty gate on both backends: frame A primes
+/// with a rect at bands 1..=3; frame B moves it down one band (GPU gate misses;
+/// both cached repaints equal a fresh full render); frame C repeats B and takes
+/// the GPU dirty gate.
 #[test]
 fn damaged_path_free_no_ghosting_and_settled_gate_hit_both_backends() {
     let theme = Theme::default();
     let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    let mut win_cpu = WindowCpu::new();
-    let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (6usize, 12usize);
-    // Glyph-free terminal (all background), like the cat twin: a glyph AA
-    // overhang across a band boundary is a pre-existing damaged-vs-full note
-    // unrelated to the free layer.
+    // Glyph-free terminal, so glyph AA overhang across band edges does not
+    // enter the comparison.
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     let atlas = Arc::new(free_atlas(3));
@@ -414,66 +394,67 @@ fn damaged_path_free_no_ghosting_and_settled_gate_hit_both_backends() {
     };
     let in_a = make((ch + ch / 2) as i32); // bands 1..=3
     let in_b = make((2 * ch + ch / 2) as i32); // bands 2..=4
-
-    let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
-    let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
-
-    let misses_before = gpu.gate_misses();
-    let cpu_b_cached = cpu
-        .render_input_cached(&mut win_cpu, &in_b)
-        .pixels()
-        .to_vec();
-    let gpu_b_cached = gpu
-        .render_input_cached(&mut win_gpu, &in_b)
-        .pixels()
-        .to_vec();
-    assert!(
-        gpu.gate_misses() > misses_before,
-        "a moved multi-row free rect must MISS the GPU dirty gate (real re-render)"
-    );
-
-    // Fresh ground truths (throwaway caches / a fresh GPU renderer).
-    let cpu_b_fresh = cpu.render_input(&in_b).pixels;
-    assert_eq!(
-        cpu_b_cached, cpu_b_fresh,
-        "CPU damaged path must repaint the moved multi-row free rect with no ghosting"
-    );
-    let mut gpu2 = common::independent_gpu(18.0, theme);
-    let mut win2 = aterm_gpu::WindowGpu::new();
-    let gpu_b_fresh = gpu2.render_input(&mut win2, &in_b, None).pixels;
-    assert_eq!(
-        gpu_b_cached, gpu_b_fresh,
-        "GPU dirty-row path must repaint the moved multi-row free rect with no ghosting"
-    );
-
-    // Settled: byte-equal sprites + same atlas version ⇒ the GPU gate HITS.
-    let in_c = make((2 * ch + ch / 2) as i32);
-    let hits_before = gpu.gate_hits();
-    let _ = gpu.render_input_cached(&mut win_gpu, &in_c);
-    assert!(
-        gpu.gate_hits() > hits_before,
-        "a settled free sprite (equal sprites, same atlas version) must take the dirty gate"
+    let in_c = make((2 * ch + ch / 2) as i32); // settled: B again
+    common::assert_moved_then_settled(
+        (&mut cpu, &mut gpu),
+        (18.0, theme),
+        [&in_a, &in_b, &in_c],
+        "multi-row free rect",
+        "free sprite (equal sprites, same atlas version)",
     );
 }
 
-/// A SETTLED translucent multi-row sprite straddled by the dirty BOUNDING BAND
-/// on the SCISSORED present path: the sprite sits on rows 3..=6, and every
-/// damaged frame edits text on rows 2 and 10 only — so the GPU's scissor band
-/// (rows 2..=10) covers the sprite's Load-preserved rows while the free stream
-/// is rebuilt unconditionally. The dirty set must cover every band row the
-/// sprite overlaps (the scissor-band fill in `compute_dirty_rows`), else the
-/// translucent texels re-blend over their own cached pixels and the AA edges
-/// accumulate darker every frame. N damaged frames, each asserted BYTE-STABLE
-/// against a fresh full render on the GPU (and on the CPU damaged path, whose
-/// per-band stamp clipping is the twin invariant).
+/// The settled-overlay scissor-band pin the three tests below share:
+/// `make(term, 0)` primes the CPU damage cache and the GPU present-path
+/// offscreen, then each of four damaged frames `make(term, 1..=4)` must take the
+/// GPU's SCISSORED path and repaint BYTE-STABLE against a fresh full render on
+/// BOTH backends. `cpu_why` / `gpu_why` finish each backend's failure message.
+fn assert_damaged_frames_byte_stable(
+    (cpu, gpu): (&mut aterm_render::Renderer, &mut aterm_gpu::GpuRenderer),
+    theme: Theme,
+    mut term: Terminal,
+    make: impl Fn(&mut Terminal, usize) -> aterm_render::RenderInput,
+    cpu_why: &str,
+    gpu_why: &str,
+) {
+    let mut win_cpu = WindowCpu::new();
+    let mut win_gpu = aterm_gpu::WindowGpu::new();
+    let in_0 = make(&mut term, 0);
+    let _ = cpu.render_input_cached(&mut win_cpu, &in_0);
+    let _ = gpu.present_input_readback(&mut win_gpu, &in_0);
+    for n in 1..=4usize {
+        let input = make(&mut term, n);
+        let scissors_before = gpu.scissor_taken();
+        let cpu_cached = cpu
+            .render_input_cached(&mut win_cpu, &input)
+            .pixels()
+            .to_vec();
+        let gpu_scissored = gpu.present_input_readback(&mut win_gpu, &input).pixels;
+        assert!(
+            gpu.scissor_taken() > scissors_before,
+            "frame {n}: the two-row text edit must take the SCISSORED path \
+             (else this pin is vacuous)"
+        );
+        let cpu_fresh = cpu.render_input(&input).pixels;
+        assert_eq!(cpu_cached, cpu_fresh, "frame {n}: {cpu_why}");
+        let mut gpu2 = common::independent_gpu(18.0, theme);
+        let mut win2 = aterm_gpu::WindowGpu::new();
+        let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
+        assert_eq!(gpu_scissored, gpu_fresh, "frame {n}: {gpu_why}");
+    }
+}
+
+/// A settled translucent sprite (rows 3..=6) under a scissor band from edits on
+/// rows 2 and 10: the dirty set must cover every band row the sprite overlaps
+/// (the band fill in `compute_dirty_rows`), or translucent texels re-blend over
+/// their cached pixels and darken each frame. N damaged frames, each byte-stable
+/// against a fresh full render on the GPU and the CPU damaged path.
 #[test]
 fn settled_translucent_sprite_inside_dirty_band_stays_byte_stable() {
     let theme = Theme::default();
     let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    let mut win_cpu = WindowCpu::new();
-    let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (12usize, 20usize);
     // Glyph-free rows under the sprite (the free layer's own invariant); the
@@ -502,58 +483,30 @@ fn settled_translucent_sprite_inside_dirty_band_stays_byte_stable() {
 
     // Prime the CPU damage cache and the GPU present-path offscreen, then N
     // damaged frames with the sprite SETTLED (equal sprites, same version).
-    let in_0 = make(&mut term, 0);
-    let _ = cpu.render_input_cached(&mut win_cpu, &in_0);
-    let _ = gpu.present_input_readback(&mut win_gpu, &in_0);
-    for n in 1..=4usize {
-        let input = make(&mut term, n);
-        let scissors_before = gpu.scissor_taken();
-        let cpu_cached = cpu
-            .render_input_cached(&mut win_cpu, &input)
-            .pixels()
-            .to_vec();
-        let gpu_scissored = gpu.present_input_readback(&mut win_gpu, &input).pixels;
-        assert!(
-            gpu.scissor_taken() > scissors_before,
-            "frame {n}: the two-row text edit must take the SCISSORED path \
-             (else this pin is vacuous)"
-        );
-        let cpu_fresh = cpu.render_input(&input).pixels;
-        assert_eq!(
-            cpu_cached, cpu_fresh,
-            "frame {n}: CPU cached repaint must be byte-stable (no re-blend of \
-             the settled translucent sprite)"
-        );
-        let mut gpu2 = common::independent_gpu(18.0, theme);
-        let mut win2 = aterm_gpu::WindowGpu::new();
-        let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
-        assert_eq!(
-            gpu_scissored, gpu_fresh,
-            "frame {n}: GPU scissored repaint must be byte-stable — a settled \
-             sprite row inside the dirty bounding band must be fully rebuilt, \
-             not Load-preserved under an unconditional sprite redraw"
-        );
-    }
+    assert_damaged_frames_byte_stable(
+        (&mut cpu, &mut gpu),
+        theme,
+        term,
+        make,
+        "CPU cached repaint must be byte-stable (no re-blend of \
+         the settled translucent sprite)",
+        "GPU scissored repaint must be byte-stable — a settled \
+         sprite row inside the dirty bounding band must be fully rebuilt, \
+         not Load-preserved under an unconditional sprite redraw",
+    );
 }
 
-/// The OVER-TEXT twin of the settled-translucent scissor-band pin above: a
-/// SETTLED translucent multi-row `FreeZ::OverText` sprite (rows 3..=6, static
-/// text underneath it) with per-frame dirt straddling it on rows 2 and 10.
-/// The CPU damaged path stamps OverText sprites as the LAST post-pass clipped
-/// to the dirty bands; the GPU `FreeOver` stream is rebuilt unconditionally
-/// and clipped by the scissor — on both, every band row the sprite overlaps
-/// inside the dirty bounding band must be fully rebuilt (the scissor-band
-/// fill is z-agnostic), else the translucent texels re-blend over their own
-/// cached pixels. N damaged frames, each byte-stable against a fresh full
-/// render per backend.
+/// OverText twin of the test above: a settled translucent OverText sprite
+/// (rows 3..=6) with dirt on rows 2 and 10. The CPU stamps OverText last,
+/// clipped to dirty bands; the GPU `FreeOver` stream is clipped by the scissor.
+/// Both must rebuild every overlapped band row. N frames, byte-stable per
+/// backend.
 #[test]
 fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
     let theme = Theme::default();
     let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    let mut win_cpu = WindowCpu::new();
-    let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (12usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -563,8 +516,7 @@ fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
     term.process(b"\x1b[5;3Hcovered text");
     let atlas = Arc::new(free_atlas(9));
 
-    // Translucent texels (atlas bottom half) + a sprite-level alpha, in the
-    // OVER-TEXT slot. Rows 3..=6: y in [3ch + ch/4, 6ch + 3ch/4).
+    // Translucent texels and sprite alpha in the OverText slot, rows 3..=6.
     let sprite = FreeSprite {
         z: FreeZ::OverText,
         ..free_1to1(
@@ -584,50 +536,23 @@ fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
         input
     };
 
-    let in_0 = make(&mut term, 0);
-    let _ = cpu.render_input_cached(&mut win_cpu, &in_0);
-    let _ = gpu.present_input_readback(&mut win_gpu, &in_0);
-    for n in 1..=4usize {
-        let input = make(&mut term, n);
-        let scissors_before = gpu.scissor_taken();
-        let cpu_cached = cpu
-            .render_input_cached(&mut win_cpu, &input)
-            .pixels()
-            .to_vec();
-        let gpu_scissored = gpu.present_input_readback(&mut win_gpu, &input).pixels;
-        assert!(
-            gpu.scissor_taken() > scissors_before,
-            "frame {n}: the two-row text edit must take the SCISSORED path \
-             (else this pin is vacuous)"
-        );
-        let cpu_fresh = cpu.render_input(&input).pixels;
-        assert_eq!(
-            cpu_cached, cpu_fresh,
-            "frame {n}: CPU damaged path must be byte-stable for a settled \
-             translucent OverText sprite inside the dirty bounding band"
-        );
-        let mut gpu2 = common::independent_gpu(18.0, theme);
-        let mut win2 = aterm_gpu::WindowGpu::new();
-        let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
-        assert_eq!(
-            gpu_scissored, gpu_fresh,
-            "frame {n}: GPU scissored path must be byte-stable — a settled \
-             OverText sprite row inside the dirty bounding band must be fully \
-             rebuilt, not Load-preserved under the unconditional FreeOver redraw"
-        );
-    }
+    assert_damaged_frames_byte_stable(
+        (&mut cpu, &mut gpu),
+        theme,
+        term,
+        make,
+        "CPU damaged path must be byte-stable for a settled \
+         translucent OverText sprite inside the dirty bounding band",
+        "GPU scissored path must be byte-stable — a settled \
+         OverText sprite row inside the dirty bounding band must be fully \
+         rebuilt, not Load-preserved under the unconditional FreeOver redraw",
+    );
 }
 
-/// Settled-deco dy-SPILL scissor-band pin, BOTH backends: a SETTLED lifted
-/// `Add` sparkle (the v2 nova-ember regime, `dy = -cell_h/3`) on row 5, with
-/// per-frame dirt on its OWN row and on row 2 (so the GPU's scissor band
-/// [1..=5] covers the spill-neighbour row 4). The deco streams are row-gated
-/// on the deco's OWN row, so both backends re-stamp the settled deco every
-/// damaged frame — pre-fix its upward spill re-Added onto row 4's
-/// NOT-rebuilt pixels (CPU: never re-cleared; GPU: Load-preserved inside the
-/// scissor), accumulating brighter each frame. `compute_dirty_rows` must drag
-/// the spill neighbour into the dirty set. N damaged frames, byte-stable
-/// against a fresh full render per backend.
+/// A settled lifted `Add` sparkle (`dy = -cell_h/3`) on row 5 with dirt on its
+/// own row and row 2: both backends re-stamp it each damaged frame, so
+/// `compute_dirty_rows` must include the spill row 4 or the spill re-adds onto
+/// preserved pixels and brightens. N frames, byte-stable per backend.
 #[test]
 fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
     use aterm_core::render::{DecoBlend, DecoGlyph, WordDecoration};
@@ -635,8 +560,6 @@ fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
     let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    let mut win_cpu = WindowCpu::new();
-    let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (8usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -665,45 +588,21 @@ fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
         input
     };
 
-    let in_0 = make(&mut term, 0);
-    let _ = cpu.render_input_cached(&mut win_cpu, &in_0);
-    let _ = gpu.present_input_readback(&mut win_gpu, &in_0);
-    for n in 1..=4usize {
-        let input = make(&mut term, n);
-        let scissors_before = gpu.scissor_taken();
-        let cpu_cached = cpu
-            .render_input_cached(&mut win_cpu, &input)
-            .pixels()
-            .to_vec();
-        let gpu_scissored = gpu.present_input_readback(&mut win_gpu, &input).pixels;
-        assert!(
-            gpu.scissor_taken() > scissors_before,
-            "frame {n}: the two-row text edit must take the SCISSORED path \
-             (else this pin is vacuous)"
-        );
-        let cpu_fresh = cpu.render_input(&input).pixels;
-        assert_eq!(
-            cpu_cached, cpu_fresh,
-            "frame {n}: CPU damaged path must be byte-stable — the settled \
-             lifted Add deco's dy spill must land on a rebuilt neighbour row"
-        );
-        let mut gpu2 = common::independent_gpu(18.0, theme);
-        let mut win2 = aterm_gpu::WindowGpu::new();
-        let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
-        assert_eq!(
-            gpu_scissored, gpu_fresh,
-            "frame {n}: GPU scissored path must be byte-stable — the spill \
-             neighbour row inside the scissor band must be rebuilt, not \
-             Load-preserved under the row-gated wdeco re-stamp"
-        );
-    }
+    assert_damaged_frames_byte_stable(
+        (&mut cpu, &mut gpu),
+        theme,
+        term,
+        make,
+        "CPU damaged path must be byte-stable — the settled \
+         lifted Add deco's dy spill must land on a rebuilt neighbour row",
+        "GPU scissored path must be byte-stable — the spill \
+         neighbour row inside the scissor band must be rebuilt, not \
+         Load-preserved under the row-gated wdeco re-stamp",
+    );
 }
 
-/// The same scissor-band invariant for the LEGACY settled sprites (cat_quads —
-/// the defect predates the free layer): a settled translucent cat quad on row 4
-/// with per-frame dirt on rows 2 and 8 must stay byte-stable on the GPU's
-/// scissored present path across damaged frames (its band row is inside the
-/// scissor band, and the cat stream is built unconditionally).
+/// The same invariant for settled `cat_quads`: a translucent cat quad on row 4
+/// with dirt on rows 2 and 8 stays byte-stable on the scissored GPU path.
 #[test]
 fn settled_translucent_cat_quad_inside_dirty_band_stays_byte_stable() {
     let theme = Theme::default();
@@ -760,28 +659,14 @@ fn settled_translucent_cat_quad_inside_dirty_band_stays_byte_stable() {
     }
 }
 
-/// THE SCALED free sprite samples the SAME TEXEL on both backends.
+/// A scaled free sprite samples the same texel on both backends.
 ///
-/// v1 free sprites were specified as the cat's NEAREST-1:1 regime, and every
-/// pin above builds `aw == w` sprites — so nothing covered the SCALED arm that
-/// the shipped cursor pet actually takes: `word_decorations`' pet emitter sets
-/// `w: dest_w, aw: nat_w` with `dest_w = round(nat_w · pose.scale_x)`, and the
-/// pose scale is a DRAW-TIME transform against a fixed-size bake (the breath,
-/// the waking stretch, the sit fold), so `aw != w` on most animated frames.
-///
-/// The CPU stamp resolves the source index in exact integers
-/// (`floor(((2·d + 1)·aw) / (2·w))`, mirrored as `aw − 1 − s` under `flip_x`);
-/// the GPU hands the sampler a float uv window. Those agree everywhere except
-/// where a dest pixel's centre lands EXACTLY on a texel boundary — which is
-/// every column of an even integer downscale, and one column in
-/// `2·w / gcd(aw, 2·w)` otherwise. Measured on this fixture BEFORE
-/// `uv_tie_bias`: 150 % → 719 of 3600 sprite pixels differed at a worst
-/// channel delta of 253; 50 % flipped → all 400 differed; 1:1 → 0, which is
-/// exactly why the 1:1 pins never saw it.
-///
-/// The sweep covers both signs of scale, the tie-free ratios (80 %, 120 %,
-/// 200 %) and the tie-dense ones (50 %, 90 %, 150 %), each with and without
-/// `flip_x` — the two directions the bias must be signed for.
+/// The cursor pet draws with `aw != w` (pose scale against a fixed bake). The
+/// CPU picks the source index in integers (`floor(((2·d + 1)·aw) / (2·w))`,
+/// mirrored under `flip_x`); the GPU floors a float uv. They differ at exact
+/// texel-boundary ties, which `uv_tie_bias` resolves. The sweep covers
+/// tie-free ratios (80 %, 120 %, 200 %) and tie-dense ones (50 %, 90 %, 150 %),
+/// each with and without `flip_x`.
 #[test]
 fn free_scaled_sprite_samples_the_same_texel_as_the_cpu() {
     let theme = Theme::default();

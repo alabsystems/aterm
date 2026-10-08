@@ -65,10 +65,11 @@ fn abstract_prefix(model: &Model, count: usize) -> aterm_spec::interp::State {
 #[test]
 fn every_production_done_subset_matches_exact_prefix_model() {
     let model = release_journal_prefix_model();
-    let root =
-        std::env::temp_dir().join(format!("aterm-journal-prefix-tier1-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("cut-state.toml");
+    let root = aterm_tempfile::Builder::new()
+        .prefix("aterm-journal-prefix-tier1-")
+        .tempdir()
+        .unwrap();
+    let path = root.path().join("cut-state.toml");
     let mut admitted_masks = Vec::new();
 
     for mask in 0_usize..(1_usize << publish::STEPS.len()) {

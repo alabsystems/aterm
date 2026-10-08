@@ -1,44 +1,23 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Robustness fuzz for the SAFE LZ4 block decoder's DECODE LOGIC.
+// Decode-logic robustness: given a plausibly-sized output budget, a corrupt
+// or truncated body returns `Ok`/`Err`, never panics or reads out of bounds.
 //
-// Layering note (important — this test was previously wrong about it):
-// `aterm_lz4::block::decompress_size_prepended` is a LOW-LEVEL API whose 4-byte
-// little-endian size prefix is *trusted by contract* — it is the value written
-// by `compress_prepend_size`, and the decoder eagerly allocates a buffer of that
-// declared size (`vec![0; declared]`). Feeding it an unbounded random prefix
-// therefore asks it to allocate up to ~4 GiB per call: that is the documented
-// cost of the trusted-size contract, NOT a decoder bug. (An earlier version of
-// this test fed unbounded prefixes here and "found" that non-bug by hanging for
-// hours on multi-gigabyte allocations.)
-//
-// The genuine untrusted-input attack surface — cold-tier scrollback blocks read
-// back from a possibly-corrupt or hostile file — goes through
-// `aterm_scrollback`'s bounded wrapper, which rejects an oversized or
-// bomb-ratio declared size *before* allocating (see aterm-scrollback/src/lz4.rs,
-// `MAX_DECOMPRESSED_SIZE` / `MAX_COMPRESSION_RATIO`); that surface is fuzzed in
-// aterm-scrollback's own tests.
-//
-// What THIS test pins is the decoder's DECODE-LOGIC robustness: given a
-// plausibly-sized output budget (as every real caller supplies), a corrupt or
-// truncated compressed body must only ever return `Ok`/`Err` — never panic, and
-// never read out of bounds — because a panic in the decode path is a
-// denial-of-service for a daily-driver terminal.
+// `decompress_size_prepended` trusts its 4-byte size prefix and allocates
+// that much up front, so an unbounded random prefix tests allocation (up to
+// 4 GiB per call), not decoding. Untrusted scrollback goes through
+// aterm-scrollback's bounded wrapper (`MAX_DECOMPRESSED_SIZE`,
+// `MAX_COMPRESSION_RATIO`), fuzzed there.
 
 use aterm_lz4::block::{decompress, decompress_into, decompress_size_prepended};
 
-/// Largest declared output size this fuzz will ask the low-level decoder to
-/// budget for. Bounded so the test exercises decode logic, not the trusted-size
-/// contract's eager allocation. 256 KiB is far above any token shape these
-/// inputs produce yet trivially cheap to allocate.
+/// Largest declared output size: far above what these inputs decode to, cheap
+/// to allocate.
 const MAX_DECLARED_SIZE: u32 = 256 * 1024;
 
-/// Deterministic LCG fuzz: arbitrary corrupt bodies driven through every safe
-/// decode entry point with a BOUNDED output budget. The size-prepended path's
-/// 4-byte length prefix is masked into a sane range (mirroring what the bounded
-/// scrollback wrapper guarantees before this code is ever reached). Any panic
-/// aborts the test.
+/// Deterministic LCG fuzz of every decode entry point with a bounded output
+/// budget.
 #[test]
 fn fuzz_safe_decode_never_panics() {
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -54,10 +33,7 @@ fn fuzz_safe_decode_never_panics() {
         let body_len = (next() % 96) as usize;
         let body: Vec<u8> = (0..body_len).map(|_| (next() & 0xFF) as u8).collect();
 
-        // 1) size-prepended path: build a [declared_size_le][corrupt body] frame
-        //    with the declared size bounded to a sane budget (the trusted-size
-        //    contract means an unbounded prefix is an allocation request, not a
-        //    decode test). This fuzzes prefix parsing + decode on a corrupt body.
+        // 1) size-prepended path: [bounded declared size LE][corrupt body].
         let declared = next() % MAX_DECLARED_SIZE;
         let mut framed = Vec::with_capacity(4 + body.len());
         framed.extend_from_slice(&declared.to_le_bytes());
@@ -74,12 +50,9 @@ fn fuzz_safe_decode_never_panics() {
     }
 }
 
-/// Biased fuzz toward VALID-looking LZ4 token shapes (a literal-length token, a
-/// few literals, then a back-reference offset) so the decoder is driven deep into
-/// the match-copy path where an out-of-bounds offset or over-long match length
-/// must be REJECTED (`Err`), never panic or read out of bounds. Uses the
-/// fixed-output-buffer entry point, whose budget is the scratch slice — already
-/// bounded, so no trusted-size contract is in play here.
+/// Fuzz biased to valid-looking sequences (token, literals, offset) so the
+/// match-copy path sees wild offsets and over-long matches and must return
+/// `Err`.
 #[test]
 fn fuzz_decode_match_copy_shapes_never_panic() {
     let mut state: u64 = 0xD1B5_4A32_D192_ED03;
@@ -108,11 +81,7 @@ fn fuzz_decode_match_copy_shapes_never_panic() {
     }
 }
 
-/// The trusted-size contract is the LOW-LEVEL API's documented behavior, but a
-/// *bounded* declared size must still decode correctly: a round-trip through
-/// `compress_prepend_size` / `decompress_size_prepended` returns the original
-/// bytes. This pins that the bounding done above does not mask a real decode
-/// regression on well-formed frames.
+/// Well-formed size-prepended frames round-trip losslessly.
 #[test]
 fn size_prepended_round_trip_is_lossless() {
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;

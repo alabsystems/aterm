@@ -4,14 +4,11 @@
 //! Keeping Rust build output out of Spotlight's index (§9, storage hygiene) — the
 //! MEASURING half of the pair whose other half is [`crate::freespace`].
 //!
-//! On 2026-09-01 01:54 WindowServer's main thread blocked 40 s in a synchronous TCC
-//! preflight (`com.apple.tcc.preflight.kTCCServiceListenEvent`) waiting on tccd; tccd was
-//! TH_UNINT on an APFS volume rwlock contended by 18 rustc processes, syspolicyd
-//! (Gatekeeper, 86% CPU, background QoS + IO tier 2) and `mds` grinding 2.0 TB of Rust
-//! build output across 127 target dirs. The watchdog killed WindowServer and the GUI
-//! session died. Spotlight indexing of build output is ONE OF THE TWO amplifiers that made
-//! a busy build fatal. This module removes that one, per-directory, and NEVER by disabling
-//! Spotlight globally.
+//! WindowServer's main thread can block in a synchronous TCC preflight on tccd, which
+//! waits on an APFS volume rwlock contended by rustc, syspolicyd and `mds` indexing build
+//! output; measured once at 40 s over 2.0 TB across 127 target dirs, and the watchdog
+//! killed the GUI session. Spotlight indexing of build output is one of the two
+//! amplifiers. This module removes it per directory, NEVER by disabling Spotlight globally.
 //!
 //! # The mechanism, and why nothing here trusts it
 //!
@@ -25,10 +22,7 @@
 //!   whole subtree (re-measured 2026-09-02) — which is what makes [`scan`]'s pruning of
 //!   dot-directories a CORRECTNESS argument and not merely an optimization.
 //! * a `.metadata_never_index` marker file in a subdirectory is **INERT**. It is the answer
-//!   given in most blog posts and it silently does nothing. An earlier attempt in this same
-//!   investigation planted 189 of them and reported success, because its "verification" ran
-//!   `mdfind` against directories that were empty or dot-hidden for unrelated reasons.
-//!   Nothing here writes one.
+//!   given in most blog posts and it silently does nothing. Nothing here writes one.
 //! * a dot in the MIDDLE of a name (`d_.subdot`) has no effect.
 //!
 //! PROVENANCE: `.noindex` is verified-on-this-machine, NOT a documented Apple API. A search
@@ -57,14 +51,12 @@
 //! where it was. Both halves would then agree — measured, confident, and wrong — that a
 //! tree Spotlight is actively indexing is excluded (measured 2026-09-02).
 //!
-//! # Git checkouts: the symlink, never the config (2026-09-10)
+//! # Git checkouts: the symlink, never the config
 //!
 //! Re-pointing cargo by writing `[build] target-dir` into `.cargo/config.toml` is right
-//! for a repo nobody versions and WRONG for a git checkout: the aterm repo's
-//! `.cargo/config.toml` is TRACKED (every worktree's with it) and the release cutter
-//! (`crates/aterm-release/src/gates.rs::clean_tree`, `git status --porcelain`) refuses a
-//! dirty tree — so the first pass after landing would have broken every cut, and an
-//! untracked `.cargo/config.toml` in any other checkout is the same `??` row. In a git
+//! for a repo nobody versions and WRONG for a git checkout: a tracked `.cargo/config.toml`
+//! edited, or an untracked one added, dirties `git status --porcelain`, which the release
+//! cutter (`crates/aterm-release/src/gates.rs::clean_tree`) refuses. In a git
 //! checkout ([`is_git_checkout`]: a `.git` at the repo root, or `git rev-parse` succeeding
 //! for a crate nested inside one) [`apply_one`] therefore renames `target ->
 //! target.noindex`, leaves a RELATIVE symlink `target -> target.noindex` where the
@@ -75,25 +67,36 @@
 //! (per clone, outside the working tree, shared by its worktrees) unless git already
 //! ignores it, and the LINK is either caught by the same `.gitignore` entry that caught
 //! the directory or, when that entry is directory-only (`target/`, `/target-tippy/`,
-//! `**/target/` — the shape 20 of the 26 planned dirs on m21 carry, and the aterm
-//! checkout's own `/target-tippy/` until its .gitignore moved to a slashless
-//! `/target-*` on 2026-09-13), which matches a directory and NOT the symlink that
-//! replaces it, excluded the same way: the directory is probed with `git check-ignore`
-//! BEFORE the rename, and a link that git no longer ignores where the directory was gets
-//! its own `.git/info/exclude` line, read back through git. Status is exactly what it
-//! was. A repo that did not ignore the directory at all gets the same link and one line
-//! saying the link shows as untracked, exactly as the directory did.
+//! `**/target/`, the common shape), which matches a directory and NOT the symlink that
+//! replaces it, excluded the same way. What decides is what `git status` SHOWS for the
+//! directory, asked BEFORE the rename — not `git check-ignore` on it, which a
+//! contents-only entry (`target/*`, `/target/**`) never matches although status hides the
+//! directory all the same: when status showed nothing, a link git does not
+//! ignore where the directory was gets its own `.git/info/exclude` line, read back through
+//! git. Status is exactly what it was. A repo that did not ignore the directory at all
+//! gets the same link and one line saying the link shows as untracked, exactly as the
+//! directory did. A directory git TRACKS a file under is left alone: a link in its place
+//! reads as that file deleted, which no exclude line hides. A link laid under the older
+//! `git check-ignore` rule is repaired by the walk by what git says now
+//! ([`repair_shown_link`]): the link gets its exclude line where status would hide the
+//! directory, and the tree is moved back where git tracks a file under it.
 //!
-//! THE CUTTER ACCEPTS EXACTLY THIS LINK AND NO OTHER (2026-09-12). The release build runs
-//! under `<repo>/target` and guards that root against redirection (a git-ignored link
-//! there would aim residue GC and the artifact paths anywhere); v0.83.0's cut stopped on
-//! the link this pass leaves, and the operator had to undo the migration by hand.
-//! `crates/aterm-release/src/buildplan.rs::resolve_release_target_root` now accepts
+//! THE CUTTER ACCEPTS EXACTLY THIS LINK AND NO OTHER. The release build runs under
+//! `<repo>/target` and guards that root against redirection (a git-ignored link there
+//! would aim residue GC and the artifact paths anywhere).
+//! `crates/aterm-release/src/buildplan.rs::resolve_release_target_root` accepts
 //! `target -> target.noindex` when the referent is that exact name, the twin is a real
 //! directory in the same parent on the same filesystem, and it passes the plain root's
 //! ownership and mode checks — then derives every path from the twin. Change the SHAPE
 //! this function lays (an absolute link, a different suffix, a hop) and the cutter
 //! refuses again.
+//!
+//! WHAT THE PASS RENAMED IS RECORDED BY IDENTITY, NEVER READ OFF A NAME.
+//! Each rename is written to the [`Ledger`] — device and inode — before it is made, and
+//! every later decision about a `.noindex` directory asks it: finishing a migration a kill
+//! interrupted, deleting the stale tree `cargo clean` strands behind the link it removes,
+//! making again the directory a `rm -rf target/` deleted through the link. A `.noindex`
+//! directory born under that name is not the pass's, and is left alone.
 //!
 //! Measured on macOS 26.6.2 (25G83) on 2026-09-10 with a scratch tree under `$HOME`
 //! (`repo/target/debug/<token>.txt`, `mdimport`ed, then polled with `mdfind -onlyin`):
@@ -127,19 +130,10 @@ pub const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f0688680
 
 /// How deep `doctor`'s ambient scan of `$HOME` goes.
 ///
-/// FIVE, RAISED FROM THREE ON 2026-09-15, BECAUSE THREE MISSED THE REPOS THIS TOOL IS FOR.
-/// Three reaches `~/<repo>/target` and `~/src/<repo>/target` — but a cargo WORKSPACE keeps
-/// its members one level further down, and a member that is its own crate has its own
-/// `target/` the moment anything is built inside it. Measured on the developer's own
-/// machine, which is the case this feature exists to serve: at three the scan found 1
-/// exposed target dir (1.1 GiB) and every surface said "nothing to apply"; at five it
-/// found 5 (1.5 GiB), the four it had been blind to being `~/aterm/crates/<member>/target`
-/// and `~/aterm/tools/<tool>/target`. A scan that reports `scan=complete` while 400 MiB of
-/// build output stays in the index is the failure this whole module exists to prevent —
-/// the shallow walk was not a smaller promise, it was a false one.
-///
-/// Six found nothing six could see that five could not, on a tree with 29 861 directories
-/// in the first six levels, so five is where the return went to zero here. Deeper than
+/// Three reaches `~/<repo>/target` and `~/src/<repo>/target`, but a cargo WORKSPACE keeps
+/// its members one level further down, each with its own `target/` once built inside it
+/// (`~/aterm/crates/<member>/target`). Measured on a developer home: three found 1 of 5
+/// exposed target dirs; six found nothing five could not, over 29 861 directories. Deeper than
 /// that is still the deliberate `aterm pkg noindex scan <root>`, which the doctor line
 /// names, and the walk stays bounded by [`Budget::DOCTOR`] either way: the cost of being
 /// wrong about the depth is a report that says "at least", not a pass that hangs.
@@ -153,13 +147,10 @@ pub const VERB_DEPTH: usize = 6;
 /// and are large; `node_modules` is the other cheap prune. (`.Trash` is already covered by
 /// the dot rule; it is listed because the reader should not have to derive that.)
 ///
-/// THE macOS-PROTECTED FOLDERS ARE PRUNED TOO (2026-09-10). `Documents`, `Desktop`,
-/// `Downloads`, `Pictures`, `Movies` and `Music` are the folders macOS guards with a
-/// per-folder consent dialog, and it attributes that dialog to the terminal — so the
-/// automatic pass at the end of every seed/update walked `$HOME` three levels deep and
-/// raised, in aterm's own name, exactly the prompts the consent design exists to
-/// consolidate. No cargo `target/` the automatic pass should touch lives in any of them;
-/// a user who keeps one there names it to the verb, which is deliberate and may prompt.
+/// THE macOS-PROTECTED FOLDERS ARE PRUNED TOO. `Documents`, `Desktop`, `Downloads`,
+/// `Pictures`, `Movies` and `Music` are guarded by a per-folder consent dialog macOS
+/// attributes to the terminal, so an automatic walk into them raises prompts in aterm's
+/// name. A user who keeps a `target/` there names it to the verb, which may prompt.
 pub const SKIP_DIRS: &[&str] = &[
     "Library",
     "Applications",
@@ -246,9 +237,8 @@ pub enum Evidence {
     /// `<dir>/CACHEDIR.TAG` opens with [`CACHEDIR_TAG_SIGNATURE`].
     CachedirTag,
     /// `<dir>/.rustc_info.json` is a regular file AND `debug/` or `release/` is a dir.
-    /// This arm exists because it is MEASURED: `/Users//example/aterm/target` on 2026-09-02
-    /// had `.rustc_info.json` and `debug/` and NO `CACHEDIR.TAG`, so a tag-only rule would
-    /// have missed the very tree that motivated the feature.
+    /// Measured: a real `target/` can carry `.rustc_info.json` and `debug/` and NO
+    /// `CACHEDIR.TAG`, which a tag-only rule would miss.
     RustcInfo,
     /// Both `<dir>/debug` and `<dir>/release` are directories.
     DebugAndRelease,
@@ -291,16 +281,11 @@ pub fn target_evidence(dir: &Path) -> Option<Evidence> {
 
 /// Whether `<dir>/<profile>` is laid out the way CARGO lays a profile out.
 ///
-/// THE ARM THAT NEEDED THIS (2026-09-15). `debug` + `release` alone is not evidence of
-/// cargo: `cmake -B build/debug` and `-B build/release` is the ordinary two-config
-/// out-of-source convention, and on a case-insensitive volume — the macOS default —
-/// `build/Debug` and `build/Release` from CMake's or Xcode's multi-config generators
-/// answer `is_dir("debug")` too. A `build/` tree like that beside a `Cargo.toml` was
-/// recognized as cargo output and renamed by the AUTOMATIC pass; in a non-git crate the
-/// pass then wrote `[build] target-dir = "build.noindex"` and aimed cargo into the
-/// foreign tree, orphaning the real cache. Recognition is fail-closed by design, and
-/// this restores that: the two weakest signals now need a directory cargo itself
-/// creates inside the profile.
+/// `debug` + `release` alone is not evidence of cargo: `cmake -B build/debug` and
+/// `-B build/release` is the ordinary two-config convention, and on a case-insensitive
+/// volume — the macOS default — CMake's or Xcode's `build/Debug` and `build/Release`
+/// answer `is_dir("debug")` too. Renaming such a tree would aim cargo at a foreign one, so
+/// the two weakest signals need a directory cargo itself creates inside the profile.
 ///
 /// `.fingerprint` and `deps` are cargo's, in every profile it has ever written;
 /// `.cargo-lock` is the build lock that lives beside them. None of the three is
@@ -368,13 +353,9 @@ impl Budget {
     /// `doctor`'s ambient discovery ceiling: 60 000 directories, 3 s. Directory reads
     /// only — no file stats — so this covers a large home in practice.
     ///
-    /// RAISED WITH [`DOCTOR_DEPTH`] ON 2026-09-15 (was 20 000 / 1.5 s). Two more levels is
-    /// more directories: the developer's home holds 12 989 of them in the first five
-    /// levels once the dot-directories and [`SKIP_DIRS`] are pruned, and a full walk
-    /// measured 1.0–1.5 s warm — i.e. the old wall was exactly where this machine sat, so
-    /// the scan would have started reporting "at least" on the very tree it was deepened
-    /// for. Both ceilings are what keeps a pathological home from turning the first
-    /// statement of a pass into a stall; neither is a target to run up to.
+    /// Sized for [`DOCTOR_DEPTH`]: a developer home held 12 989 directories in the first
+    /// five levels after pruning, walked in 1.0–1.5 s warm. Both ceilings keep a
+    /// pathological home from stalling a pass; neither is a target to run up to.
     pub const DOCTOR: Self = Self {
         max_entries: 60_000,
         max_wall: Duration::from_secs(3),
@@ -420,6 +401,11 @@ impl Target {
 pub struct Scan {
     /// Every target dir found, sorted by path — a stable report order, not `read_dir`'s.
     pub targets: Vec<Target>,
+    /// Every symlink `X -> X.noindex` the walk passed — the exact link [`apply_one`] lays in
+    /// a git checkout — read, never followed, sorted by path. The pass finds the links it
+    /// laid among these by identity, wherever a checkout has been moved
+    /// ([`settle_links`]).
+    pub links: Vec<PathBuf>,
     /// `false` when a budget ran out, so the caller must say "at least" and never
     /// "there are none".
     pub complete: bool,
@@ -444,10 +430,12 @@ impl Scan {
 /// Rules, each load-bearing: directories only — no file stats, that is [`size_of`]'s job,
 /// and readdir's `d_type` is what screens an entry here, so a home full of source files
 /// costs no stat; no-follow throughout, so a symlink is never followed and never counted
-/// twice; a recognized target dir is RECORDED and not descended into (its contents are
-/// millions of files and none of them is another target dir); dot-directories are pruned,
-/// which is sound because their whole subtree is already excluded (measured 2026-09-02);
-/// [`SKIP_DIRS`] pruned; anything unreadable skipped in silence.
+/// twice — what a symlink gets is one `readlink`, and the exact link the pass lays is
+/// recorded ([`Scan::links`]); a recognized target dir is RECORDED and not descended into
+/// (its contents are millions of files and none of them is another target dir);
+/// dot-directories are pruned, which is sound because their whole subtree is already
+/// excluded (measured 2026-09-02); [`SKIP_DIRS`] pruned; anything unreadable skipped in
+/// silence.
 ///
 /// `root` itself is tested first, so `aterm pkg noindex scan ~/aterm/target` answers about
 /// the directory the user named rather than about its children.
@@ -457,19 +445,16 @@ impl Scan {
 pub fn scan(root: &Path, max_depth: usize, budget: &Budget) -> Scan {
     let mut out = Scan {
         targets: Vec::new(),
+        links: Vec::new(),
         complete: true,
     };
     if !SUPPORTED {
         return out;
     }
-    // A ROOT THAT IS NOT A READABLE DIRECTORY IS NOT AN EMPTY TREE. Without this, a typo
-    // (`~/srcc` for a `~/src` holding 40 exposed target dirs) walks nothing: `read_dir`
-    // fails, the loop drains, and the function returns `targets: []` with `complete: true`
-    // — the flag whose whole job is to license the caller to say "there are none". The CLI
-    // then prints "no cargo target directories under …" at exit 0: a confident false clean
-    // over a path that was never read, the same shape as the 189 inert markers this module
-    // exists to prevent. `metadata` (following, not `symlink_metadata`) because a symlinked
-    // root is a directory the user deliberately named.
+    // A ROOT THAT IS NOT A READABLE DIRECTORY IS NOT AN EMPTY TREE: a typo (`~/srcc`)
+    // must not come back `complete: true`, the flag that licenses "there are none".
+    // `metadata` (following, not `symlink_metadata`) because a symlinked root is a
+    // directory the user deliberately named.
     if !std::fs::metadata(root).is_ok_and(|m| m.is_dir()) {
         out.complete = false;
         return out;
@@ -495,21 +480,24 @@ pub fn scan(root: &Path, max_depth: usize, budget: &Budget) -> Scan {
                 break;
             }
             // `file_type` is readdir's own `d_type` here, so screening costs NO syscall
-            // per entry. A stat per entry cost one for every FILE too — a home whose
-            // depth-1..3 holds tens of thousands of source files paid tens of thousands
-            // of them to throw each one away one line later, on every seed, on every
-            // 6-hourly update pass and on every install, and only the 1.5 s wall clock
-            // ever stopped them (files never counted against `max_entries`, which counts
-            // directories). Under the contended APFS rwlock this module was written for,
-            // that is how the walk ran out of clock and came back incomplete (audit
-            // 2026-09-16). It is no-follow exactly like the stat it replaces: a symlink to
+            // per entry — a stat per source file runs the walk out of clock under the
+            // contended APFS rwlock this module exists for. It is no-follow: a symlink to
             // a directory is a symlink HERE, so `root/loop -> root` is skipped rather than
             // walked forever, and a filesystem that answers `DT_UNKNOWN` still gets its
             // no-follow stat inside `std`. An entry whose type cannot be learned at all is
-            // skipped, as an unreadable one always was.
+            // skipped.
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
+            // A symlink is READ, once, never followed: the link the pass lays is how it finds
+            // its migrations again after a checkout moves (`Scan::links`).
+            if kind.is_symlink() {
+                let path = entry.path();
+                if destination(&path).is_some_and(|twin| links_to(&path, &twin)) {
+                    out.links.push(path);
+                }
+                continue;
+            }
             if !kind.is_dir() {
                 continue;
             }
@@ -533,6 +521,7 @@ pub fn scan(root: &Path, max_depth: usize, budget: &Budget) -> Scan {
         }
     }
     out.targets.sort_by(|a, b| a.path.cmp(&b.path));
+    out.links.sort();
     out
 }
 
@@ -668,7 +657,9 @@ pub enum MigrateError {
     /// renaming a directory that is not build output is the one way this utility could cost
     /// someone work.
     NotATarget(PathBuf),
-    /// The destination already exists. NEVER clobbered, never merged, never deleted.
+    /// The destination already exists. NEVER clobbered, never merged, never deleted here
+    /// ([`apply_one`] deletes one only when its [`Ledger`] proves it a stale tree of the
+    /// pass's own, a cleaned checkout's).
     DestinationExists(PathBuf),
     /// `dir` is a SYMLINK. `rename(2)` would move the link and leave the build output
     /// exactly where it is — indexed — while every surface reported success.
@@ -743,10 +734,8 @@ pub fn migrate(dir: &Path, dry_run: bool) -> Result<Migration, MigrateError> {
     //
     // `target_evidence` reads THROUGH a link (`Path::is_dir` follows), so `repo/target ->
     // /Volumes/fast/realtarget` passes every recognition test — and then `fs::rename`
-    // renames THE LINK. Confirmed 2026-09-02: afterwards `target.noindex -> /…/realtarget`,
-    // the build output had not moved and was still indexed, and the CLI printed "migrated
-    // … nothing was copied and nothing was deleted". The user believes the 2 TB amplifier
-    // is gone. One `symlink_metadata` (which does NOT follow) buys the honest refusal.
+    // renames THE LINK, leaving the build output indexed where it lives. One
+    // `symlink_metadata` (which does NOT follow) buys the honest refusal.
     if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(MigrateError::Symlink {
             named: dir.to_path_buf(),
@@ -757,8 +746,7 @@ pub fn migrate(dir: &Path, dry_run: bool) -> Result<Migration, MigrateError> {
     // `~/build.noindex`, or through a symlinked ancestor, must answer `AlreadyExcluded`
     // exactly as the absolute spelling does — a `.noindex` (or dot-hidden) ancestor already
     // excludes the whole subtree (measured 2026-09-02), so renaming below it changes
-    // nothing. Falls back to the name as given when the path cannot be resolved, which is
-    // the pre-existing behaviour.
+    // nothing. Falls back to the name as given when the path cannot be resolved.
     let real = std::fs::canonicalize(dir);
     let claim = real.as_deref().unwrap_or(dir);
     if exclusion_of(claim) != Exclusion::Exposed {
@@ -806,8 +794,9 @@ pub enum ConfigNote {
     /// name>` stands where the directory was, so cargo's pointer is unchanged; `exclude`
     /// says what keeps `git status` clean about the new name, and `link_exclude` what
     /// keeps it clean about the link: [`ExcludeNote::AlreadyIgnored`] when the entry that
-    /// ignored the directory matches the link too, [`ExcludeNote::Added`] when that entry
-    /// was directory-only (`target/`) and the link got its own `.git/info/exclude` line,
+    /// ignored the directory matches the link too, [`ExcludeNote::Added`] when `git status`
+    /// hid the directory but no entry matches the link (a directory-only `target/`, a
+    /// contents-only `target/*`) and the link got its own `.git/info/exclude` line,
     /// [`ExcludeNote::NotIgnored`] when the link shows as untracked — as the directory did
     /// in a repo that never ignored it, or because excluding it failed.
     Linked {
@@ -831,8 +820,8 @@ pub enum ExcludeNote {
     /// outside the working tree, shared by the clone's worktrees.
     Added(PathBuf),
     /// Nothing written, and why (git could not be run, the path could not be related to
-    /// the toplevel, the write failed, or — for the link — the directory was never
-    /// ignored either): `git status` shows the path until the user excludes it.
+    /// the toplevel, the write failed, or — for the link — `git status` showed the
+    /// directory too): `git status` shows the path until the user excludes it.
     NotIgnored(String),
 }
 
@@ -852,32 +841,47 @@ pub enum Pointer {
 /// One directory's outcome under [`apply_one`] / [`apply_under`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
-    /// Renamed, and cargo (re-)pointed as `config` says.
+    /// Renamed, and cargo (re-)pointed as `config` says. `discarded`: a STALE tree stood at
+    /// `to` — one this pass renamed earlier ([`Ledger`]) whose link was removed (`cargo
+    /// clean` removes the link, not the directory), after which a build laid a new `from` —
+    /// and it was deleted first, finishing the clean.
     Migrated {
         from: PathBuf,
         to: PathBuf,
         config: ConfigNote,
+        discarded: bool,
     },
-    /// Dry run: the rename that would happen, and how cargo would stay pointed.
+    /// Dry run: the rename that would happen, and how cargo would stay pointed. `discards`:
+    /// the stale tree at `to` would be deleted first ([`Applied::Migrated`]'s `discarded`).
     Planned {
         from: PathBuf,
         to: PathBuf,
         pointer: Pointer,
+        discards: bool,
     },
+    /// A link this pass laid ([`Ledger`]) stood over NOTHING — `rm -rf target/` follows the
+    /// link and deletes the directory, and every build through the dangling link then fails
+    /// ("Not a directory") — so the directory `to` was made again, empty: builds go through
+    /// the link into the hidden name, as before the clean.
+    Restored { link: PathBuf, to: PathBuf },
+    /// A link this pass laid ([`Ledger`]) that `git status` SHOWED — a tree a pass migrated
+    /// before it asked what status shows for the directory — made to read as the directory
+    /// did ([`repair_shown_link`]).
+    Repaired { link: PathBuf, repair: Repair },
     /// Already `.noindex` (or dot-hidden): nothing to do — a SUCCESS for a loop.
     AlreadyExcluded(PathBuf),
-    /// Left alone, with the one reason: a build holds the cargo lock, no repo beside it
-    /// (under `--all`), a symlink, a destination in the way. NOTHING WENT WRONG — these
+    /// Left alone, with the one reason: a build or a process uses the tree ([`in_use`]),
+    /// git tracks a file under it, no repo beside it (under `--all`), a symlink, a
+    /// destination in the way. NOTHING WENT WRONG — these
     /// are the pass declining to touch a directory, and most of them resolve themselves
     /// on a later pass.
     Skipped { path: PathBuf, reason: String },
     /// TRIED AND DID NOT WORK: a rename that failed, a config this could not point, a
     /// link that could not be laid.
     ///
-    /// Separate from [`Applied::Skipped`] since 2026-09-15 because the caller reports
-    /// them differently: a refusal is ordinary and silent, a failure is the
-    /// `machine settings failed —` line the window keys on. Folding the two meant a
-    /// Spotlight half that failed every pass was reported to the user as a success.
+    /// Separate from [`Applied::Skipped`] because the caller reports them differently: a
+    /// refusal is ordinary and silent, a failure is the `machine settings failed —` line
+    /// the window keys on.
     Failed { path: PathBuf, reason: String },
 }
 
@@ -888,6 +892,7 @@ impl Applied {
     pub fn path(&self) -> &Path {
         match self {
             Applied::Migrated { from, .. } | Applied::Planned { from, .. } => from,
+            Applied::Restored { link, .. } | Applied::Repaired { link, .. } => link,
             Applied::AlreadyExcluded(path)
             | Applied::Skipped { path, .. }
             | Applied::Failed { path, .. } => path,
@@ -901,11 +906,19 @@ impl Applied {
         matches!(self, Applied::Migrated { .. })
     }
 
-    /// Whether a running build held this directory, so it was left for a later apply —
-    /// one the caller must not record as finished, or no pass retries it.
+    /// Whether a running build held this directory — cargo's lock, or a process using the
+    /// tree ([`in_use`]) — so it was left for a later apply: one the caller must not record
+    /// as finished, or no pass retries it.
     #[must_use]
     pub fn held_by_build(&self) -> bool {
         matches!(self, Applied::Skipped { reason, .. } if reason.starts_with(HELD_BY_BUILD))
+    }
+
+    /// Whether the walk left this directory because no Cargo.toml stands beside it — one
+    /// only `aterm pkg noindex apply <dir>`, by name, migrates.
+    #[must_use]
+    pub fn free_standing(&self) -> bool {
+        matches!(self, Applied::Skipped { reason, .. } if reason.starts_with(NOT_BESIDE_CARGO_TOML))
     }
 
     /// The reason this attempt FAILED, if it did — what a caller turns into the
@@ -919,8 +932,24 @@ impl Applied {
     }
 }
 
+/// What [`repair_shown_link`] did about a link `git status` showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Repair {
+    /// Status would hide the directory and no ignore entry matches the link: the link's own
+    /// line went into this exclude file — the line [`link_in_place`] writes today.
+    Excluded(PathBuf),
+    /// Git tracks a file under the directory, which reads as deleted while a link stands in
+    /// its place, and no exclude line hides a tracked file: the migration was undone — the
+    /// tree `from` moved back under the link's name, the link gone ([`move_back`]). Spotlight
+    /// indexes it again, as it does every directory the pass leaves for that reason.
+    MovedBack { from: PathBuf, why: String },
+}
+
 /// How a live build's skip reason starts ([`Applied::held_by_build`]).
 pub(crate) const HELD_BY_BUILD: &str = "a build holds ";
+
+/// How a free-standing dir's skip reason starts ([`Applied::free_standing`]).
+const NOT_BESIDE_CARGO_TOML: &str = "not beside a Cargo.toml";
 
 /// How many subdirectories [`build_in_progress`] looks into per level. Cargo's layout
 /// has a handful (`debug`, `release`, one dir per `--target` triple, and under each of
@@ -928,14 +957,13 @@ pub(crate) const HELD_BY_BUILD: &str = "a build holds ";
 /// probe on a directory that is not cargo's at all.
 const MAX_LOCK_PROBE_ENTRIES: usize = 64;
 
-/// The directory a build in `dir` holds locked, if one is running: cargo takes an
-/// exclusive `flock(2)` on `<target>/<profile>/.cargo-lock` for the whole build (and on
-/// `<target>/.cargo-lock` for some ops) — and a `--target <triple>` build one level
-/// deeper, on `<target>/<triple>/<profile>/.cargo-lock`, which is why the probe reaches
-/// two levels down (bounded by [`MAX_LOCK_PROBE_ENTRIES`] per level; noted in review
-/// 2026-09-10). A lock we cannot take non-blockingly is a live build; renaming its tree
-/// from under it would strand every path the compiler holds. Probed, never held: the lock
-/// is released again immediately. Non-Unix: `None`.
+/// The directory a build in `dir` holds locked, if one is running: cargo takes an exclusive
+/// `flock(2)` on `<target>/<profile>/.cargo-lock` for the whole build (and on
+/// `<target>/.cargo-lock` for some ops) — and a `--target <triple>` build one level deeper, on
+/// `<target>/<triple>/<profile>/.cargo-lock`, which is why the probe reaches two levels down
+/// (bounded by [`MAX_LOCK_PROBE_ENTRIES`] per level). A lock we cannot take non-blockingly is a
+/// live build; renaming its tree from under it would strand every path the compiler holds. Probed,
+/// never held: the lock is released again immediately. Non-Unix: `None`.
 #[must_use]
 pub fn build_in_progress(dir: &Path) -> Option<PathBuf> {
     fn subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -966,9 +994,9 @@ pub fn build_in_progress(dir: &Path) -> Option<PathBuf> {
 /// process that spawns a child duplicates every descriptor into it for the window
 /// between the fork and the exec that closes the `CLOEXEC` copies — so a lock the
 /// holder has just closed stays held until the child of ANY thread in that process
-/// has exec'd. Measured 2026-09-12 on the unit test that holds a lock in-process
-/// beside 30 sibling tests that spawn `git`: under a full gate's load, 2 of 13 runs
-/// saw a lock still held one call after its owner dropped it. The window is
+/// has exec'd. Measured on a unit test holding a lock beside 30 sibling tests that spawn
+/// `git`: under a full gate's load, 2 of 13 runs saw a lock still held one call after its
+/// owner dropped it. The window is
 /// milliseconds; the patience is a hundred, polled every ten, and the LAST reading
 /// is the verdict — a build that takes the lock mid-window is still caught, a copy
 /// that closes mid-window is not mistaken for one.
@@ -988,9 +1016,17 @@ fn lock_is_held(lock: &Path) -> bool {
     let deadline = std::time::Instant::now() + LOCK_PROBE_PATIENCE;
     loop {
         // SAFETY: flock on a valid open descriptor; LOCK_NB makes it return at once.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a probe: a lock it takes is let go by LOCK_UN below, before its close"
+        )]
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
             // SAFETY: releasing the lock this probe just took on the same descriptor.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the release: LOCK_UN before the close"
+            )]
             let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
             return false;
         }
@@ -1056,10 +1092,26 @@ pub enum ConfigEdit {
 /// appended (`[build]\ntarget-dir = "…"`); a `[build]` table with no `target-dir` ⇒ the
 /// key goes on the line after the header; an existing `target-dir` ⇒ rewritten when it
 /// named the old directory ([`names_dir`]: the bare name or `./name` — never a value
-/// that points out of the repository), left alone otherwise. The result is re-parsed as TOML before it is returned, so a
-/// file this cannot edit safely is never written.
+/// that points out of the repository), left alone otherwise.
+///
+/// WHAT THE FILE SAYS IS READ BY A TOML READER, never off the raw line: a raw read of `target-dir =
+/// "target" # local` keeps the comment in the value. The editor below only finds the line to
+/// replace; the reader decides what the value IS (a non-string value, or a file that does not
+/// parse, is refused), and the result must read back as `value` before it is returned, so a
+/// spelling the line editor does not understand is refused rather than written.
 #[must_use]
 pub fn point_cargo_config(text: &str, old_name: &str, old_path: &Path, value: &str) -> ConfigEdit {
+    let Ok(doc) = aterm_toml::from_str::<aterm_toml::Value>(text) else {
+        return ConfigEdit::Unparseable(text.to_string());
+    };
+    let rewrite = match doc.get("build").and_then(|build| build.get("target-dir")) {
+        None => false,
+        Some(current) => match current.as_str() {
+            Some(current) if names_dir(current, old_name, old_path) => true,
+            Some(current) => return ConfigEdit::PointsElsewhere(current.to_string()),
+            None => return ConfigEdit::Unparseable(text.to_string()),
+        },
+    };
     let key_line = format!(
         "target-dir = \"{}\"",
         value.replace('\\', "\\\\").replace('"', "\\\"")
@@ -1068,7 +1120,6 @@ pub fn point_cargo_config(text: &str, old_name: &str, old_path: &Path, value: &s
     let mut in_build = false;
     let mut seen_build = false;
     let mut rewrote = false;
-    let mut existing_elsewhere: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
@@ -1079,30 +1130,21 @@ pub fn point_cargo_config(text: &str, old_name: &str, old_path: &Path, value: &s
             out.push(line.to_string());
             continue;
         }
-        if in_build
+        if rewrite
+            && in_build
             && let Some(rest) = trimmed.strip_prefix("target-dir")
             && rest.trim_start().starts_with('=')
         {
-            let current = rest
-                .trim_start()
-                .trim_start_matches('=')
-                .trim()
-                .trim_matches(|c| c == '"' || c == '\'');
-            if names_dir(current, old_name, old_path) {
-                out.push(key_line.clone());
-                rewrote = true;
-            } else {
-                existing_elsewhere = Some(current.to_string());
-                out.push(line.to_string());
-            }
+            out.push(key_line.clone());
+            rewrote = true;
             continue;
         }
         out.push(line.to_string());
     }
-    if let Some(elsewhere) = existing_elsewhere
-        && !rewrote
-    {
-        return ConfigEdit::PointsElsewhere(elsewhere);
+    // The key the reader found and the editor did not (`build.target-dir = …` at the top,
+    // a quoted key): never a second key beside it.
+    if rewrite && !rewrote {
+        return ConfigEdit::Unparseable(text.to_string());
     }
     let mut result = if rewrote {
         out.join("\n")
@@ -1134,7 +1176,13 @@ pub fn point_cargo_config(text: &str, old_name: &str, old_path: &Path, value: &s
     if !result.ends_with('\n') {
         result.push('\n');
     }
-    if aterm_toml::from_str::<aterm_toml::Value>(&result).is_err() {
+    let reads_back = aterm_toml::from_str::<aterm_toml::Value>(&result).is_ok_and(|doc| {
+        doc.get("build")
+            .and_then(|build| build.get("target-dir"))
+            .and_then(aterm_toml::Value::as_str)
+            == Some(value)
+    });
+    if !reads_back {
         return ConfigEdit::Unparseable(result);
     }
     if rewrote {
@@ -1145,9 +1193,8 @@ pub fn point_cargo_config(text: &str, old_name: &str, old_path: &Path, value: &s
 }
 
 /// Whether a line is the `[build]` table header, read by what it names: a trailing
-/// `# comment` and whitespace inside the brackets are TOML, not another table. Byte
-/// equality with `[build]` missed `[build] # faster links`, appended a second `[build]`,
-/// and the edit was refused as unparseable (2026-09-12, audit K11).
+/// `# comment` and whitespace inside the brackets are TOML, not another table
+/// (`[build] # faster links` is the build table).
 fn is_build_header(line: &str) -> bool {
     let line = line.trim();
     let mut quote: Option<char> = None;
@@ -1179,13 +1226,12 @@ fn is_build_header(line: &str) -> bool {
 /// Whether a `target-dir` value names the directory called `old_name` IN THIS REPO: the
 /// bare name, or `./name`, with any trailing slash.
 ///
-/// NOT "any path whose last component is it" (2026-09-15). That rule matched
-/// `../target`, `/Volumes/fast/target` and `~/builds/target` — values that deliberately
-/// point cargo somewhere ELSE, often at a faster disk or a shared cache — and rewriting
-/// one to the in-repo `target.noindex` silently moved the user's builds back into the
-/// repository. A value with a parent component or a root is a different directory by
-/// construction, and the caller's `PointsElsewhere` arm is exactly right for it: cargo
-/// never used the directory being migrated, so nothing needs re-pointing.
+/// NOT "any path whose last component is it": `../target`, `/Volumes/fast/target` and
+/// `~/builds/target` deliberately point cargo somewhere ELSE (a faster disk, a shared cache), and
+/// rewriting one would move the user's builds back into the repository. A value with a parent
+/// component or a root is a different directory by construction, and the caller's `PointsElsewhere`
+/// arm is exactly right for it: cargo never used the directory being migrated, so nothing needs
+/// re-pointing.
 ///
 /// An ABSOLUTE value is compared to the migrated directory itself, so `<repo>/target`
 /// (a spelling this module has measured in a real file) is still rewritten while
@@ -1215,13 +1261,55 @@ enum RepoConfig {
     Leave(String),
 }
 
+/// How far a `.cargo/config.toml` edit may reach through a link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigReach {
+    /// A directory the user NAMED: through any link, so a config shared across checkouts
+    /// (dotfiles-managed) is edited where it lives.
+    Anywhere,
+    /// The unattended walk: only a file that resolves inside the repository. A tree it
+    /// merely FOUND chose where its links point, and a committed
+    /// `.cargo/config.toml -> ../../../.cargo/config.toml` (or a `.cargo` linked to
+    /// `~/.cargo`) must not have the six-hourly pass add `target-dir` to the user's global
+    /// config.
+    InsideRepo,
+}
+
 /// Decide the `[build] target-dir` edit for the migration `from -> to` in `repo`'s
 /// `.cargo/config.toml`, touching nothing. `Err` is a config that cannot be pointed —
-/// the caller must not rename: until 2026-09-12 this ran AFTER the rename, and a
-/// refusal left cargo aimed at a `target/` that was gone, orphaned the renamed tree,
-/// and wedged every later pass on "already exists" (audit K11).
-fn plan_repo_config(repo: &Path, from: &Path, to: &Path) -> Result<RepoConfig, String> {
+/// the caller must not rename, or a refusal would leave cargo aimed at a `target/` that is
+/// gone and the renamed tree orphaned. `reach` says whether a
+/// file outside the repository may be written ([`ConfigReach`]).
+fn plan_repo_config(
+    repo: &Path,
+    from: &Path,
+    to: &Path,
+    reach: ConfigReach,
+) -> Result<RepoConfig, String> {
     let config = repo.join(".cargo").join("config.toml");
+    if reach == ConfigReach::InsideRepo {
+        // Where the write LANDS: the file the links resolve to, else the `.cargo/` it would
+        // be created in (a linked directory reaches out as surely as a linked file), else
+        // the repository itself (`.cargo/` is created there).
+        let root = std::fs::canonicalize(repo)
+            .map_err(|e| format!("{}: unresolvable ({e})", repo.display()))?;
+        let lands = [Some(config.as_path()), config.parent()]
+            .into_iter()
+            .flatten()
+            .find_map(|p| std::fs::canonicalize(p).ok())
+            .unwrap_or_else(|| root.clone());
+        if !lands.starts_with(&root) {
+            // The one remedy is the safe one: naming the directory would reach
+            // `ConfigReach::Anywhere` and write through the link (for `.cargo ->
+            // ~/.cargo`, into every build's config), so it is not offered.
+            return Err(format!(
+                "{} resolves outside the repository, to {}; point cargo at {} yourself",
+                config.display(),
+                lands.display(),
+                to.display()
+            ));
+        }
+    }
     // Cargo reads a legacy `.cargo/config` in preference to `config.toml`, so an edit to
     // the latter would not move the build — unless the one is a link to the other.
     let legacy = repo.join(".cargo").join("config");
@@ -1294,10 +1382,10 @@ fn write_repo_config(repo: &Path, plan: RepoConfig) -> Result<ConfigNote, String
     if let Err(e) = std::fs::create_dir_all(repo.join(".cargo")) {
         return Err(format!("{}: {e}", repo.join(".cargo").display()));
     }
-    // Write to the FILE the config names, never over a link: a symlinked config.toml
-    // (shared across checkouts, dotfiles-managed) renamed over became a detached regular
-    // copy, and later edits to the shared file stopped reaching this repo (2026-09-12,
-    // the audit K12 class). A link that no longer resolves is refused, not replaced.
+    // Write to the FILE the config names, never over a link: a symlinked config.toml (shared across
+    // checkouts, dotfiles-managed) renamed over became a detached regular copy, and later edits to
+    // the shared file stopped reaching this repo. A link that no longer resolves is refused, not
+    // replaced.
     let real = match std::fs::symlink_metadata(&config) {
         Ok(m) if m.file_type().is_symlink() => match std::fs::canonicalize(&config) {
             Ok(real) => real,
@@ -1310,11 +1398,13 @@ fn write_repo_config(repo: &Path, plan: RepoConfig) -> Result<ConfigNote, String
     };
     // Atomic: temp + rename, so a crash mid-write cannot leave cargo a half config. The
     // temp sits beside the REAL file (same filesystem, so the rename replaces it and not
-    // the link), and an existing file's mode carries over.
+    // the link), and an existing file's mode carries over. The temp is born `0600`
+    // ([`crate::platform::create_private_new`]) and its name carries the pid, so two
+    // checkouts sharing one linked config cannot collide.
     let tmp = real_dir.join(format!(".config.toml.atpkg-{}.tmp", std::process::id()));
     let mode = std::fs::metadata(&real).ok().map(|m| m.permissions());
     let _ = std::fs::remove_file(&tmp);
-    let written = create_config_temp(&tmp)
+    let written = crate::platform::create_private_new(&tmp)
         .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
         .and_then(|()| match mode {
             Some(perms) => std::fs::set_permissions(&tmp, perms),
@@ -1335,31 +1425,8 @@ fn write_repo_config(repo: &Path, plan: RepoConfig) -> Result<ConfigNote, String
     })
 }
 
-/// Create the cargo config rewrite's temp: exclusively, and born `0600`. It holds the
-/// WHOLE config before the real file's mode is applied, so a umask-default temp left a
-/// `0600` `config.toml` readable by other users until that chmod (2026-09-12, review of
-/// the audit follow-ups; `hooks::create_rc_temp` closed the same window for rc files).
-/// The name carries the pid, so two checkouts sharing one linked config cannot collide.
-#[cfg(unix)]
-fn create_config_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(tmp)
-}
-
-#[cfg(not(unix))]
-fn create_config_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)
-}
-
-/// A config.toml this pass CREATES gets the ordinary `0644` a plain write used to leave
-/// under the usual umask, not the temp's private `0600`.
+/// A config.toml this pass CREATES gets the ordinary `0644`, not the temp's private
+/// `0600`.
 #[cfg(unix)]
 fn new_config_permissions(tmp: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1374,11 +1441,19 @@ fn new_config_permissions(_tmp: &Path) -> std::io::Result<()> {
 /// One bounded `git -C <repo> <args>` (the doctor's 5 s probe clock; stderr dropped).
 /// `None` when git could not be spawned or did not finish — every caller reads that as
 /// "not known", never as "not a checkout" on its own.
+///
+/// With the repo's fsmonitor OFF: every probe here reads the index, and in a checkout
+/// configured with `core.fsmonitor` (globally, or in its own config) any read that finds no
+/// daemon running STARTS git's builtin one — a watcher that outlives the probe, one per
+/// checkout. A read-only `--dry-run` left `git fsmonitor--daemon` watching a checkout it
+/// only looked at (measured 2026-10-02, git 2.50), and the census runs that same dry run.
+/// The answers are the same without it; the daemon only makes them faster.
 fn git(repo: &Path, args: &[&str]) -> Option<std::process::Output> {
     crate::doctor::output_bounded(
-        std::process::Command::new("git")
+        aterm_uds::spawnfd::command("git")
             .arg("-C")
             .arg(repo)
+            .args(["-c", "core.fsmonitor=false"])
             .args(args),
     )
 }
@@ -1403,7 +1478,7 @@ fn git_path(repo: &Path, args: &[&str]) -> Option<PathBuf> {
 /// FILE a linked worktree carries) answers without spawning anything; otherwise
 /// `git rev-parse --show-toplevel` decides, so a crate nested inside a checkout counts
 /// too. False when git cannot run and there is no `.git` — the config edit is then the
-/// fallback, which is the pre-2026-09-10 behaviour.
+/// fallback.
 #[must_use]
 pub fn is_git_checkout(repo: &Path) -> bool {
     std::fs::symlink_metadata(repo.join(".git")).is_ok()
@@ -1431,6 +1506,252 @@ fn git_ignores(repo: &Path, path: &Path) -> Option<bool> {
         Some(0) => Some(true),
         Some(1) => Some(false),
         _ => None,
+    }
+}
+
+/// WHAT `git status` SHOWS FOR THE DIRECTORY `dir`, asked while it still is one — the
+/// answer the link standing in its place must give too ([`link_in_place`]). `Ok(true)`:
+/// status shows nothing for it, because git ignores it or every entry under it. That is
+/// NOT `check-ignore` on the directory: a contents-only pattern (`target/*`, `/target/**`)
+/// never matches the directory, git hides an untracked directory holding only ignored
+/// entries all the same, and the link — which no such pattern matches — turned a clean
+/// tree into `?? target` (measured 2026-10-02). `Ok(false)`: status shows it, as untracked.
+///
+/// `Err` is why nothing may be renamed. A file git TRACKS under it reads as deleted once a
+/// link stands there (` D target/.gitkeep`, measured), and no exclude line hides a tracked
+/// file. And a question git could not answer is not read as either answer.
+fn git_hides(repo: &Path, dir: &Path) -> Result<bool, String> {
+    let shown = dir.to_string_lossy();
+    let unanswered = || {
+        "git could not be asked what `git status` shows for it — nothing was renamed".to_string()
+    };
+    let tracked = git(
+        repo,
+        &[
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--",
+            &shown,
+        ],
+    )
+    .filter(|o| o.status.success())
+    .ok_or_else(unanswered)?;
+    if let Some(file) = tracked.stdout.split(|b| *b == 0).find(|f| !f.is_empty()) {
+        return Err(format!(
+            "git tracks {} under it, which would read as deleted with a link in its place — \
+             nothing was renamed",
+            String::from_utf8_lossy(file)
+        ));
+    }
+    Ok(git_status_rows(repo, dir)
+        .ok_or_else(unanswered)?
+        .is_empty())
+}
+
+/// What `git status` shows for `path`, one porcelain row (`XY path`) each — empty when it
+/// shows nothing. `--untracked-files=normal` over the user's `status.showUntrackedFiles`: the
+/// question is what the ignore rules hide, and a link is untracked exactly as the directory
+/// it replaced is. `None`: git could not be asked.
+fn git_status_rows(repo: &Path, path: &Path) -> Option<Vec<String>> {
+    let shown = path.to_string_lossy();
+    let out = git(
+        repo,
+        &[
+            "--literal-pathspecs",
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=normal",
+            "--",
+            &shown,
+        ],
+    )
+    .filter(|o| o.status.success())?;
+    Some(
+        out.stdout
+            .split(|b| *b == 0)
+            .filter(|row| !row.is_empty())
+            .map(|row| String::from_utf8_lossy(row).into_owned())
+            .collect(),
+    )
+}
+
+/// How many entries [`git_would_hide`] lays in its stand-in before it stops and answers
+/// `None`. A cargo build directory holds a dozen at its top, and the two answers that matter
+/// most are given there: a contents-only entry (`target/*`) ignores every one, and a
+/// directory nothing ignores shows `CACHEDIR.TAG`.
+#[cfg(unix)]
+const MAX_STAND_IN_ENTRIES: usize = 256;
+
+/// WHAT `git status` WOULD SHOW FOR A DIRECTORY AT `link` HOLDING WHAT `twin` HOLDS — the
+/// question [`git_hides`] asks before a rename, asked again of a tree a pass migrated before
+/// it asked it. That pass asked `git check-ignore` about the directory, and its
+/// ledger line holds the same word for a directory a contents-only entry (`target/*`,
+/// `/target/**`) hid — whose link reads `?? target` — and for one no entry touches, whose
+/// link shows exactly as the directory did. Only the first should have had the link's own
+/// exclude line, and the line alone cannot tell them apart; git can.
+///
+/// Git will not look past a symlink ("pathspec 'target/x' is beyond a symbolic link",
+/// measured, whatever the spelling), so it is asked about a STAND-IN: a scratch work tree in
+/// the temp dir holding a copy of each `.gitignore` from the toplevel down to `link`'s
+/// parent, and at `link`'s place a real directory with one empty file or directory per entry
+/// of `twin` (a `.gitignore` among them copied), read against the clone's own git dir — so
+/// the rules are the repository's own: its `.gitignore`s, `info/exclude`, `core.excludesFile`,
+/// its case folding. `git check-ignore` answers for the directory, then for its entries a
+/// level at a time, the way `git status --untracked-files=normal` walks an untracked
+/// directory: it shows the directory once an entry it does not ignore is a file or a nested
+/// repository, and goes into a directory it does not ignore. `Some(true)`: status would hide
+/// it BECAUSE A RULE DID — the directory or an entry in it was ignored, and nothing it holds
+/// shows. A tree with nothing in it for a rule to judge (emptied through the link, or the
+/// empty directory [`settle_links`] makes again under a dangling one) is hidden by status
+/// whatever the rules say, so it tells this nothing about them: `Some(false)`, the answer
+/// that writes nothing, until a build fills it — an exclude line read off an empty tree hid
+/// the link of a directory nothing ignores for good (measured 2026-10-02). `None`: git could
+/// not be asked, or the walk reached [`MAX_STAND_IN_ENTRIES`] — never read as either answer.
+#[cfg(unix)]
+fn git_would_hide(repo: &Path, link: &Path, twin: &Path) -> Option<bool> {
+    let top = std::fs::canonicalize(git_path(repo, &["--show-toplevel"])?).ok()?;
+    let git_dir = git_path(repo, &["--absolute-git-dir"])?;
+    let real_link = std::fs::canonicalize(link.parent()?)
+        .ok()?
+        .join(link.file_name()?);
+    let rel = real_link.strip_prefix(&top).ok()?.to_path_buf();
+    let stand_in = StandIn::new()?;
+    let root = stand_in.0.as_path();
+    // The `.gitignore` of each level from the toplevel down to the link's parent.
+    let mut level = PathBuf::new();
+    copy_gitignore(&top, root)?;
+    for part in rel.parent()?.components() {
+        level.push(part);
+        std::fs::create_dir(root.join(&level)).ok()?;
+        copy_gitignore(&top.join(&level), &root.join(&level))?;
+    }
+    std::fs::create_dir(root.join(&rel)).ok()?;
+    if check_ignored(&git_dir, root, std::slice::from_ref(&rel))?.contains(&rel) {
+        return Some(true);
+    }
+    let mut budget = MAX_STAND_IN_ENTRIES;
+    // Whether a rule ignored anything the tree holds.
+    let mut ruled = false;
+    let mut dirs = vec![(twin.to_path_buf(), rel)];
+    while !dirs.is_empty() {
+        let mut entries = Vec::new();
+        for (real, at) in &dirs {
+            // Before the entries: their stubs are opened without truncating, so the copy
+            // stands under its own stub.
+            copy_gitignore(real, &root.join(at))?;
+            for entry in std::fs::read_dir(real).ok()? {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                if name == ".git" {
+                    return Some(false);
+                }
+                budget = budget.checked_sub(1)?;
+                let is_dir = entry.file_type().ok()?.is_dir();
+                let stub = root.join(at).join(&name);
+                if is_dir {
+                    std::fs::create_dir(&stub).ok()?;
+                } else {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&stub)
+                        .ok()?;
+                }
+                entries.push((at.join(&name), is_dir, entry.path()));
+            }
+        }
+        if entries.is_empty() {
+            break;
+        }
+        let asked: Vec<PathBuf> = entries.iter().map(|(at, ..)| at.clone()).collect();
+        let ignored = check_ignored(&git_dir, root, &asked)?;
+        dirs.clear();
+        for (at, is_dir, real) in entries {
+            if ignored.contains(&at) {
+                ruled = true;
+                continue;
+            }
+            if !is_dir {
+                return Some(false);
+            }
+            dirs.push((real, at));
+        }
+    }
+    Some(ruled)
+}
+
+/// Copy `from/.gitignore` to `to/.gitignore` when it is a regular file — git reads no
+/// symlinked one in a work tree. `None` when the copy failed.
+#[cfg(unix)]
+fn copy_gitignore(from: &Path, to: &Path) -> Option<()> {
+    let source = from.join(".gitignore");
+    if std::fs::symlink_metadata(&source).is_ok_and(|m| m.is_file()) {
+        std::fs::copy(&source, to.join(".gitignore")).ok()?;
+    }
+    Some(())
+}
+
+/// Which of `paths` (relative to the stand-in work tree `root`) git ignores, by the rules of
+/// the clone whose git dir is `git_dir`: `git check-ignore`, which prints each ignored path on
+/// a line of its own — quoted when a name needs it, which then matches none of `paths` and
+/// reads as not ignored, the answer that writes nothing.
+#[cfg(unix)]
+fn check_ignored(
+    git_dir: &Path,
+    root: &Path,
+    paths: &[PathBuf],
+) -> Option<std::collections::HashSet<PathBuf>> {
+    let git_dir = format!("--git-dir={}", git_dir.display());
+    let work_tree = format!("--work-tree={}", root.display());
+    let shown: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let mut args = vec![
+        git_dir.as_str(),
+        work_tree.as_str(),
+        "-c",
+        "core.quotePath=false",
+        "check-ignore",
+        "--",
+    ];
+    args.extend(shown.iter().map(String::as_str));
+    let out = git(root, &args)?;
+    matches!(out.status.code(), Some(0 | 1)).then(|| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(PathBuf::from)
+            .collect()
+    })
+}
+
+/// [`git_would_hide`]'s scratch work tree, in the temp dir and never inside a repository;
+/// removed on drop.
+#[cfg(unix)]
+struct StandIn(PathBuf);
+
+#[cfg(unix)]
+impl StandIn {
+    fn new() -> Option<Self> {
+        let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "atpkg-noindex-stand-in-{:x}-{nanos:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).ok()?;
+        Some(Self(path))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -1499,17 +1820,11 @@ fn exclude_in_git(repo: &Path, path: &Path, comment: &str) -> ExcludeNote {
     {
         return ExcludeNote::NotIgnored(format!("{}: {e}", parent.display()));
     }
-    // APPEND — never a read-modify-write. This was `std::fs::write(&exclude, whole_text)`,
-    // which opens `O_TRUNC`: a write that failed partway (the full disk this whole feature
-    // exists for) or a kill between that truncate and the write left the user's OWN exclude
-    // lines — local scratch dirs, `.env.local` — erased or cut short, and the pass that did
-    // it runs unattended every six hours and reports the loss as nothing louder than "git
-    // does not ignore the new name". `append(true)` cannot lose a byte that is already in
-    // the file; the worst a failed write leaves is a partial trailing line of OURS. It also
-    // suits a file this module does not own: `O_APPEND` writes do not interleave, so two
-    // passes over two worktrees sharing this one exclude file cannot drop each other's
-    // line — which a temp+rename of the whole text (`write_repo_config`'s shape, right for
-    // the `.cargo/config.toml` this module rewrites wholesale) would.
+    // APPEND — never a read-modify-write: an `O_TRUNC` write cut short (a full disk, a
+    // kill) would erase the user's OWN exclude lines. `append(true)` cannot lose a byte
+    // already in the file; the worst a failed write leaves is a partial trailing line of
+    // OURS. And `O_APPEND` writes do not interleave, so two passes over worktrees sharing
+    // this exclude file cannot drop each other's line, which a temp+rename would.
     let written = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -1532,31 +1847,37 @@ fn exclude_in_git(repo: &Path, path: &Path, comment: &str) -> ExcludeNote {
 #[cfg(unix)]
 const EXCLUDE_NEW_NAME: &str =
     "# atpkg noindex: the cargo target dir migrated out of Spotlight's index";
-/// The exclude-file comment over the link's line — written only when the entry that
-/// ignored the directory is directory-only and so stops matching at the link.
+/// The exclude-file comment over the link's line — written only when `git status` hid the
+/// directory and no ignore entry matches the link: a directory-only entry (`target/`)
+/// stops matching at the link, and a contents-only one (`target/*`) never matched the
+/// directory at all.
 #[cfg(unix)]
-const EXCLUDE_LINK: &str = "# atpkg noindex: the symlink standing where the directory was — the \
-                            ignore entry that matched the directory is directory-only";
+const EXCLUDE_LINK: &str = "# atpkg noindex: the symlink standing where the directory was — git \
+                            status hid the directory, and no ignore entry matches the link";
 
 /// The git-checkout pointer: a RELATIVE symlink `from -> <file name of to>` (same
 /// parent, so a moved checkout keeps working), then the exclude lines: the new name's,
-/// and the link's own when `dir_ignored` (git's answer about the DIRECTORY, probed
-/// before the rename) was true but the link is not — a directory-only pattern
-/// (`target/`) matches the directory and not the symlink that replaces it, and without
-/// this line the pass would turn an ignored directory into a `?? target` row. A link
-/// that cannot be laid rolls the rename back — a renamed tree with no pointer would
-/// break the next build silently — and reports why.
+/// and the link's own when `dir_hidden` (what `git status` showed for the DIRECTORY,
+/// probed before the rename — [`git_hides`]) was nothing but the link is not ignored — a
+/// directory-only pattern (`target/`) matches the directory and not the symlink that
+/// replaces it, a contents-only one (`target/*`) hid the directory without matching
+/// either, and without this line the pass would turn a clean tree into a `?? target`
+/// row. A link that cannot be laid rolls the rename back — a renamed tree with no pointer
+/// would break the next build silently — and reports why. The link a killed pass already
+/// laid is kept and only its exclude lines are finished ([`settle_migrated`]).
 #[cfg(unix)]
 fn link_in_place(
     repo: &Path,
     from: &Path,
     to: &Path,
-    dir_ignored: Option<bool>,
+    dir_hidden: Option<bool>,
 ) -> Result<ConfigNote, String> {
     let Some(name) = to.file_name() else {
         return Err(format!("{} has no file name", to.display()));
     };
-    if let Err(e) = std::os::unix::fs::symlink(name, from) {
+    if !links_to(from, to)
+        && let Err(e) = std::os::unix::fs::symlink(name, from)
+    {
         return Err(format!(
             "the symlink {} -> {} could not be laid ({e})",
             from.display(),
@@ -1564,26 +1885,27 @@ fn link_in_place(
         ));
     }
     let exclude = exclude_in_git(repo, to, EXCLUDE_NEW_NAME);
+    // Git's answer about the LINK itself, now that it stands where the directory was.
     let link_exclude = match git_ignores(repo, from) {
         // The entry that ignored the directory matches the link too. An unanswerable
         // git reads as ignored here because the alternative is a warning about a state
         // nothing measured.
         Some(true) | None => ExcludeNote::AlreadyIgnored,
-        Some(false) => match dir_ignored {
+        Some(false) => match dir_hidden {
             Some(true) => match exclude_in_git(repo, from, EXCLUDE_LINK) {
                 ExcludeNote::NotIgnored(why) => ExcludeNote::NotIgnored(format!(
-                    "the directory was ignored by a directory-only pattern the link does not \
-                     match, and excluding the link failed — {why}; git status shows it until it \
-                     is excluded"
+                    "git status hid the directory, no ignore entry matches the link, and \
+                     excluding the link failed — {why}; git status shows it until it is excluded"
                 )),
                 note => note,
             },
             Some(false) => ExcludeNote::NotIgnored(
                 "the link shows as untracked, as the directory did".to_string(),
             ),
+            // Only a ledger line from before the pass asked first ([`git_hides`]).
             None => ExcludeNote::NotIgnored(
-                "the link shows as untracked (whether git ignored the directory could not be \
-                 asked before the rename)"
+                "the link shows as untracked (whether git hid the directory was not asked \
+                 before the rename)"
                     .to_string(),
             ),
         },
@@ -1600,7 +1922,7 @@ fn link_in_place(
     _repo: &Path,
     from: &Path,
     to: &Path,
-    _dir_ignored: Option<bool>,
+    _dir_hidden: Option<bool>,
 ) -> Result<ConfigNote, String> {
     Err(format!(
         "a symlink {} -> {} is not laid on this platform",
@@ -1609,21 +1931,410 @@ fn link_in_place(
     ))
 }
 
-/// Apply the remedy to ONE target dir: refuse a live build, [`migrate`] it, and keep
-/// its repo's cargo pointed at the new name — a symlink in a git checkout, the config
-/// edit elsewhere ([`pointer_for`]). `require_repo` (the `--all` walk) skips a
+// ---------------------------------------------------------------------------------------
+// The ledger — what the pass renamed, by identity
+// ---------------------------------------------------------------------------------------
+
+/// The ledger's file name, under the package prefix ([`Ledger::of`]).
+pub const LEDGER_FILE: &str = "noindex.ledger";
+
+/// The ledger's first line, written when the file is created.
+const LEDGER_HEADER: &str = "# atpkg noindex ledger v1 — the build directories the Spotlight pass \
+                             renamed, by device:inode; the last line for a directory wins";
+
+/// The name a stale tree is renamed to before it is deleted ([`apply_one`]): DOT-hidden, so
+/// Spotlight drops the whole subtree the moment it moves (measured 2026-09-02, module doc),
+/// and placed INSIDE the directory being migrated, so git sees it exactly as it sees that
+/// directory. A kill mid-delete leaves it there, hidden, for [`sweep_killed_litter`].
+const DISCARD_PREFIX: &str = ".atpkg-noindex-discard-";
+
+/// WHAT THE PASS RENAMED, RECORDED BY IDENTITY — NEVER INFERRED FROM A NAME.
+///
+/// A `target.noindex` with no `target` beside it is two different things: the leftover of
+/// a pass killed between its rename and its link, and a directory BORN under that name —
+/// the gate's own `target-gate.noindex`, the `CARGO_TARGET_DIR` the `migrate` verb's hint
+/// suggests. A repair reading the NAME would lay links beside directories no pass
+/// migrated. So the pass
+/// writes down what it does, keyed by the renamed directory's device and inode — which a
+/// `rename(2)` inside one parent keeps — and every later decision about a `.noindex`
+/// directory asks this first:
+///
+/// * `renaming` is written BEFORE the rename, with git's answer about the directory. A
+///   directory carrying it was renamed by a pass that may not have laid its pointer, so the
+///   next pass finishes it with that answer, exactly as the uninterrupted pass would have
+///   ([`settle_migrated`]).
+/// * `done` is written once the pointer stands, with the link's own identity in a git
+///   checkout. A link gone afterwards was removed by its owner — `cargo clean` and `rm -rf
+///   target` remove the LINK, not the directory — and is not laid again: the stale tree
+///   waits, and once a build lays a plain directory there the stale tree is deleted and
+///   the new one migrated ([`apply_one`]), so the clean finishes instead of every later
+///   pass failing on "already exists". A link still standing over nothing (`rm -rf
+///   target/` follows it) has its directory made again ([`settle_links`]) — found by
+///   the link's identity, so in a checkout moved since too. A link `git status` SHOWS is
+///   settled as the pass would settle the directory today ([`repair_shown_link`]).
+/// * `undoing` is written before a migration is undone — the tree moved back under its
+///   first name, the link gone, because git tracks a file under it — and `undone` once it
+///   is ([`move_back`]); a pass killed between the two finishes it ([`settle_migrated`]).
+/// * A `.noindex` directory it has no line for is not the pass's, and is left exactly as
+///   it is — except the one shape the pass alone lays, its exact link `X -> X.noindex`
+///   beside it in a git checkout, which a pass from before this ledger left: that is
+///   recorded `done` (adopted) the first time it is seen, so a checkout migrated before
+///   the ledger existed is cleaned like any other.
+///
+/// Append-only lines in one file under the package prefix, outside every repository; a
+/// missing file is an empty ledger. A rename that could not be recorded is not made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ledger {
+    /// `None`: no prefix to keep it in ([`Ledger::unkept`]).
+    path: Option<PathBuf>,
+}
+
+/// A file's identity: the device and inode `lstat` reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Id {
+    dev: u64,
+    ino: u64,
+}
+
+/// How far a recorded migration got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Written before the rename: the pointer may never have been laid.
+    Renaming,
+    /// The pointer stands, or there was none to lay.
+    Done,
+    /// Written before a migration is undone ([`move_back`]): the link may be gone and the
+    /// tree not yet back under its first name.
+    Undoing,
+    /// The tree stands under its first name again and no link is the pass's: a directory
+    /// this line names is no longer a migration of the pass's.
+    Undone,
+}
+
+/// One ledger line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Record {
+    stage: Stage,
+    /// The renamed directory.
+    dir: Id,
+    /// The link laid where it was, in a git checkout ([`Stage::Done`] and
+    /// [`Stage::Undoing`] only).
+    link: Option<Id>,
+    /// Whether `git status` showed nothing for the directory before the rename
+    /// ([`git_hides`], [`link_in_place`]). Written `ignored`/`not-ignored`, the words of the
+    /// lines from before contents-only patterns were asked about, which still read.
+    dir_hidden: Option<bool>,
+    /// The directory's `.noindex` path when it was written (its first name again, on an
+    /// `undone` line): for a reader, and for [`settle_links`] to look for the link beside
+    /// it where the walk does not go. A checkout moved since leaves it behind; identity is
+    /// what decides.
+    at: PathBuf,
+}
+
+impl Record {
+    fn line(&self) -> String {
+        let id = |i: Id| format!("{}:{}", i.dev, i.ino);
+        format!(
+            "{}\t{}\t{}\t{}\t{}",
+            match self.stage {
+                Stage::Renaming => "renaming",
+                Stage::Done => "done",
+                Stage::Undoing => "undoing",
+                Stage::Undone => "undone",
+            },
+            id(self.dir),
+            self.link.map_or_else(|| "-".to_string(), id),
+            match self.dir_hidden {
+                Some(true) => "ignored",
+                Some(false) => "not-ignored",
+                None => "unknown",
+            },
+            self.at.display().to_string().replace(['\n', '\t'], " "),
+        )
+    }
+
+    fn parse(line: &str) -> Option<Self> {
+        let id = |s: &str| {
+            let (dev, ino) = s.split_once(':')?;
+            Some(Id {
+                dev: dev.parse().ok()?,
+                ino: ino.parse().ok()?,
+            })
+        };
+        let mut field = line.splitn(5, '\t');
+        let stage = match field.next()? {
+            "renaming" => Stage::Renaming,
+            "done" => Stage::Done,
+            "undoing" => Stage::Undoing,
+            "undone" => Stage::Undone,
+            _ => return None,
+        };
+        let dir = id(field.next()?)?;
+        let link = match field.next()? {
+            "-" => None,
+            s => Some(id(s)?),
+        };
+        let dir_hidden = match field.next()? {
+            "ignored" => Some(true),
+            "not-ignored" => Some(false),
+            "unknown" => None,
+            _ => return None,
+        };
+        let at = PathBuf::from(field.next()?);
+        Some(Self {
+            stage,
+            dir,
+            link,
+            dir_hidden,
+            at,
+        })
+    }
+}
+
+impl Ledger {
+    /// The ledger kept in `path`.
+    #[must_use]
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: Some(path.into()),
+        }
+    }
+
+    /// The ledger under a package prefix: `<prefix>/noindex.ledger`.
+    #[must_use]
+    pub fn of(layout: &crate::store::Layout) -> Self {
+        Self::at(layout.prefix.join(LEDGER_FILE))
+    }
+
+    /// No ledger at all (no prefix to keep one in): it knows nothing, and a pass handed it
+    /// renames nothing, because a rename it cannot record is one it does not make.
+    #[must_use]
+    pub const fn unkept() -> Self {
+        Self { path: None }
+    }
+
+    /// Every record, oldest first. A missing or unreadable file is an empty ledger, and a
+    /// line this cannot read is skipped — read LOSSILY, so one torn line (a short write on
+    /// a full disk, cut inside the header's dash or a path's accented letter) costs that
+    /// line and never the file (read strictly as UTF-8, one stray byte would empty it).
+    fn records(&self) -> Vec<Record> {
+        self.path
+            .as_deref()
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .filter_map(Record::parse)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The latest record of the directory whose identity is `dir`.
+    fn find(&self, dir: Id) -> Option<Record> {
+        self.records().into_iter().rev().find(|r| r.dir == dir)
+    }
+
+    /// Append `record`: one `O_APPEND` write, so two passes cannot lose each other's line.
+    /// It starts a line of its own: after a torn last line (no newline) it would otherwise
+    /// be glued onto that line and read as nothing.
+    fn note(&self, record: &Record) -> std::io::Result<()> {
+        use std::io::{Read as _, Seek as _};
+        let Some(path) = self.path.as_deref() else {
+            return Err(std::io::Error::other("no package prefix to keep it in"));
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(path)?;
+        let mut text = String::new();
+        let len = file.metadata()?.len();
+        if len == 0 {
+            text.push_str(LEDGER_HEADER);
+            text.push('\n');
+        } else {
+            let mut last = [0u8; 1];
+            file.seek(std::io::SeekFrom::Start(len - 1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                text.push('\n');
+            }
+        }
+        text.push_str(&record.line());
+        text.push('\n');
+        std::io::Write::write_all(&mut file, text.as_bytes())
+    }
+
+    /// Where it is kept, for a sentence.
+    fn shown(&self) -> String {
+        self.path.as_deref().map_or_else(
+            || "the migration ledger (no package prefix)".to_string(),
+            |p| p.display().to_string(),
+        )
+    }
+}
+
+/// `path`'s own identity (`lstat`: a link's, never its referent's).
+#[cfg(unix)]
+fn identity(path: &Path) -> Option<Id> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).ok().map(|m| Id {
+        dev: m.dev(),
+        ino: m.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn identity(_path: &Path) -> Option<Id> {
+    None
+}
+
+/// Whether `link` is the exact link the pass lays for `dir`: a symlink whose text is
+/// `dir`'s file name.
+fn links_to(link: &Path, dir: &Path) -> bool {
+    std::fs::read_link(link).is_ok_and(|text| Some(text.as_os_str()) == dir.file_name())
+}
+
+/// Whether `twin`, standing in the way of migrating `dir`, is a STALE tree of the pass's
+/// own: the [`Ledger`] knows it, and in a git checkout ([`Pointer::Symlink`]) the plain
+/// name is cargo's only pointer — so with a real directory there now, nothing points cargo
+/// at `twin` any more. That is a cleaned checkout (`cargo clean` removed the link, a build
+/// laid `dir`), or a pass killed before its link and a build since. A tree the pass moved
+/// back ([`Stage::Undone`]) is no longer its migration, whatever its name now.
+fn stale_twin(repo: Option<&Path>, twin: &Path, ledger: &Ledger) -> bool {
+    std::fs::symlink_metadata(twin).is_ok_and(|m| m.is_dir())
+        && identity(twin)
+            .and_then(|id| ledger.find(id))
+            .is_some_and(|r| r.stage != Stage::Undone)
+        && pointer_for(repo) == Pointer::Symlink
+}
+
+/// WHETHER `dir` IS IN USE — the ONE question [`apply_one`] asks before it renames a build
+/// tree or deletes a stale one — as the reason it is left for a later pass
+/// ([`Applied::held_by_build`]), `None` when nothing holds it: a build holding cargo's lock
+/// ([`build_in_progress`]), or a process with its working directory, its executable or an
+/// open file under it ([`aterm_uds::holders::scan_path_users`]), or processes that could
+/// not be listed. The lock alone never proved a tree unused: cargo lets it go before it
+/// runs the test binaries (`aterm_agent::harness::disk_target`), and a config-pointed tree
+/// renamed under `cargo test` loses its next binary — "could not execute process … No such
+/// file or directory", exit 101 (measured). The
+/// process scan narrows that hazard to the instant between two test binaries, when cargo
+/// itself holds nothing under the tree and no process is there to be seen. A process whose
+/// paths cannot be read (the platform's own agents) does not hold it back: none runs from
+/// a cargo build tree.
+fn in_use(dir: &Path) -> Option<String> {
+    if let Some(lock) = build_in_progress(dir) {
+        return Some(format!(
+            "{HELD_BY_BUILD}{} — retried next pass",
+            lock.display()
+        ));
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let held = |why: String| {
+            Some(format!(
+                "{HELD_BY_BUILD}{} ({why}) — retried next pass",
+                dir.display()
+            ))
+        };
+        let real = match std::fs::canonicalize(dir) {
+            Ok(real) => real,
+            Err(e) => {
+                return held(format!(
+                    "as far as can be told: it could not be resolved ({e})"
+                ));
+            }
+        };
+        match aterm_uds::holders::scan_path_users(&[real], &[std::process::id()]) {
+            Ok(scan) => scan.users.first().and_then(|u| {
+                held(format!(
+                    "process {} uses {} (its {})",
+                    u.pid,
+                    u.path.display(),
+                    match u.how {
+                        "cwd" => "working directory",
+                        "exe" => "executable",
+                        _ => "open file",
+                    }
+                ))
+            }),
+            Err(e) => held(format!(
+                "as far as can be told: the running processes could not be listed ({e})"
+            )),
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}
+
+/// [`apply_one`]'s first write, before its rename: the ledger's `renaming` line for `dir`,
+/// bound for `to`, with git's answer about it. `Err` is why nothing may be renamed.
+fn note_renaming(
+    ledger: &Ledger,
+    dir: &Path,
+    to: &Path,
+    dir_hidden: Option<bool>,
+) -> Result<Record, String> {
+    let id = identity(dir)
+        .ok_or_else(|| "its identity could not be read — nothing was renamed".to_string())?;
+    let record = Record {
+        stage: Stage::Renaming,
+        dir: id,
+        link: None,
+        dir_hidden,
+        at: to.to_path_buf(),
+    };
+    ledger.note(&record).map_err(|e| {
+        format!(
+            "the migration could not be recorded in {} ({e}) — nothing was renamed",
+            ledger.shown()
+        )
+    })?;
+    Ok(record)
+}
+
+/// A directory a person NAMED relative to where they stand, as an absolute path: its
+/// parent resolved (a `..`, a symlinked working directory), its own name kept as given, so
+/// a link there is still refused AS a link ([`migrate`]). Relative, it was wrong twice
+/// (measured 2026-10-02): git reads a path after `git -C <repo>` against the repository,
+/// not against where it was typed, so a directory named from outside its checkout got no
+/// answer and no exclude lines, and a clean `target/`-ignoring tree was left reading
+/// `?? target` and `?? target.noindex/`; and the [`Ledger`] kept the relative name, which
+/// no walk's root holds, so the link `rm -rf target/` left dangling after `aterm pkg
+/// noindex apply target` was never answered ([`settle_links`]). `None` when the parent
+/// cannot be resolved: the name is then used as given.
+fn named_absolute(dir: &Path) -> Option<PathBuf> {
+    let name = dir.file_name()?;
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Some(std::fs::canonicalize(parent).ok()?.join(name))
+}
+
+/// Apply the remedy to ONE target dir: refuse a tree in use ([`in_use`]) or one git
+/// tracks a file under ([`git_hides`]), [`migrate`] it, and keep its repo's cargo pointed
+/// at the new name — a symlink in a git checkout, the config edit elsewhere
+/// ([`pointer_for`]). `require_repo` (the `--all` walk) skips a
 /// free-standing target dir — renaming one whose pointer is an env var this cannot see
 /// would break the next build silently; a directory the user NAMED is migrated anyway,
 /// with the hint the standalone verb prints. Idempotent: an already-excluded directory
-/// is `AlreadyExcluded`, never an error.
+/// is `AlreadyExcluded`, never an error. Every rename is recorded in `ledger` first
+/// ([`Ledger`]); one that cannot be recorded is not made. A relative `dir` is resolved
+/// first ([`named_absolute`]).
 #[must_use]
-pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
+pub fn apply_one(dir: &Path, ledger: &Ledger, require_repo: bool, dry_run: bool) -> Applied {
     if !SUPPORTED {
         return Applied::Skipped {
             path: dir.to_path_buf(),
             reason: "not applicable — Spotlight is a macOS index".to_string(),
         };
     }
+    let named = dir.is_relative().then(|| named_absolute(dir)).flatten();
+    let dir = named.as_deref().unwrap_or(dir);
     // Sweep a killed `verify`'s leftovers ([`sweep_killed_litter`]) BEFORE any of the early
     // returns below. This verb runs at the end of every app pass, which makes it — not a
     // second `verify` the user may never type — the thing that actually reaches the repo
@@ -1652,17 +2363,22 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
     if require_repo && repo.is_none() {
         return Applied::Skipped {
             path: dir.to_path_buf(),
-            reason: "not beside a Cargo.toml — its pointer is an env var this cannot re-point; \
-                     `aterm pkg noindex apply <dir>` migrates it by name"
-                .to_string(),
+            reason: format!(
+                "{NOT_BESIDE_CARGO_TOML} — its pointer is an env var this cannot re-point; \
+                 `aterm pkg noindex apply <dir>` migrates it by name"
+            ),
         };
     }
     // What `migrate` would say, asked first — and it is the answer whatever else this pass
     // measures. A directory it refuses, or calls already excluded, cannot become a migration
-    // because a lock frees or an ignore rule moves, while both probes below cost real work on
-    // every pass. Answers that can change with time still come after: `require_repo` above,
-    // and the migration itself below.
-    let planned = match migrate(dir, true) {
+    // because a lock frees or an ignore rule moves, while the probes below — git, then who
+    // uses the tree — cost real work on every pass. Answers that can change with time still
+    // come after: `require_repo` above, and the migration itself below.
+    //
+    // The one refusal that is the pass's own to lift is a STALE tree in the way
+    // ([`stale_twin`]): a cleaned checkout. The tree goes, then the migration runs as usual.
+    let mut stale = false;
+    let (from, to) = match migrate(dir, true) {
         Ok(Migration::Planned { from, to }) => (from, to),
         Ok(Migration::AlreadyExcluded(p)) => return Applied::AlreadyExcluded(p),
         Ok(Migration::NotApplicable) => {
@@ -1675,6 +2391,12 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
         // Answered like `Planned` rather than asserted, so a future change to `migrate` costs
         // this pass its plan, never its correctness.
         Ok(Migration::Migrated { from, to }) => (from, to),
+        Err(MigrateError::DestinationExists(twin))
+            if stale_twin(repo.as_deref(), &twin, ledger) =>
+        {
+            stale = true;
+            (dir.to_path_buf(), twin)
+        }
         Err(e) => {
             return Applied::Failed {
                 path: dir.to_path_buf(),
@@ -1682,26 +2404,35 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
             };
         }
     };
-    if let Some(lock) = build_in_progress(dir) {
-        return Applied::Skipped {
-            path: dir.to_path_buf(),
-            reason: format!("{HELD_BY_BUILD}{} — retried next pass", lock.display()),
-        };
-    }
     let pointer = pointer_for(repo.as_deref());
-    // Git's answer about the DIRECTORY, taken while it still is one: a directory-only
-    // ignore pattern (`target/`) stops matching once a symlink stands there, and the
-    // link then needs its own exclude line (`link_in_place`).
-    let dir_ignored = match (&repo, &pointer) {
-        (Some(repo), Pointer::Symlink) if !dry_run => git_ignores(repo, dir),
+    // The walk writes only inside the tree it found; a directory the user named may reach
+    // a config it links to anywhere ([`ConfigReach`]).
+    let reach = if require_repo {
+        ConfigReach::InsideRepo
+    } else {
+        ConfigReach::Anywhere
+    };
+    // What `git status` shows for the DIRECTORY, asked while it still is one ([`git_hides`]):
+    // when it shows nothing, the link standing there must show nothing either, and gets its
+    // own exclude line when no ignore entry matches it ([`link_in_place`]). A directory git
+    // tracks a file under is refused here, the dry run included.
+    let dir_hidden = match (&repo, &pointer) {
+        (Some(repo), Pointer::Symlink) => match git_hides(repo, dir) {
+            Ok(hidden) => Some(hidden),
+            Err(reason) => {
+                return Applied::Skipped {
+                    path: dir.to_path_buf(),
+                    reason,
+                };
+            }
+        },
         _ => None,
     };
     // The config edit is decided BEFORE the rename, so a tree whose cargo cannot be
     // re-pointed is never moved (`plan_repo_config`).
     let mut config_plan = None;
     if let (Some(repo), Pointer::Config(_)) = (&repo, &pointer) {
-        let (from, to) = (&planned.0, &planned.1);
-        match plan_repo_config(repo, from, to) {
+        match plan_repo_config(repo, &from, &to, reach) {
             Ok(plan) => config_plan = Some(plan),
             Err(why) => {
                 return Applied::Failed {
@@ -1711,65 +2442,107 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
             }
         }
     }
-    match migrate(dir, dry_run) {
-        Ok(Migration::Migrated { from, to }) => {
-            let config = match (&repo, &pointer) {
-                (Some(repo), Pointer::Symlink) => {
-                    match link_in_place(repo, &from, &to, dir_ignored) {
-                        Ok(note) => note,
-                        Err(why) => {
-                            return match std::fs::rename(&to, &from) {
-                                Ok(()) => Applied::Failed {
-                                    path: dir.to_path_buf(),
-                                    reason: format!("{why} — the rename was rolled back"),
-                                },
-                                Err(e) => Applied::Migrated {
-                                    from,
-                                    to,
-                                    config: ConfigNote::Untouched(format!(
-                                        "{why}, and rolling the rename back failed ({e}) — lay the \
-                                     link or point cargo at the new name yourself"
-                                    )),
-                                },
-                            };
-                        }
-                    }
-                }
-                (Some(repo), _) => {
-                    let written = match config_plan {
-                        Some(plan) => Ok(plan),
-                        None => plan_repo_config(repo, &from, &to),
-                    }
-                    .and_then(|plan| write_repo_config(repo, plan));
-                    match written {
-                        Ok(note) => note,
-                        Err(why) => {
-                            // A renamed tree cargo is not pointed at breaks the next build
-                            // silently: roll back, as the symlink arm does.
-                            return match std::fs::rename(&to, &from) {
-                                Ok(()) => Applied::Failed {
-                                    path: dir.to_path_buf(),
-                                    reason: format!("{why} — the rename was rolled back"),
-                                },
-                                Err(e) => Applied::Migrated {
-                                    from,
-                                    to,
-                                    config: ConfigNote::Untouched(format!(
-                                        "{why}, and rolling the rename back failed ({e}) — point \
-                                         cargo at the new name yourself"
-                                    )),
-                                },
-                            };
-                        }
-                    }
-                }
-                (None, _) => ConfigNote::Untouched(
-                    "no Cargo.toml beside it — point cargo at the new name yourself".to_string(),
+    // Last, whether anything uses the tree — or the stale one this would delete — right
+    // now ([`in_use`]): the one refusal a later pass lifts, asked the same in a dry run.
+    if let Some(reason) = in_use(dir).or_else(|| stale.then(|| in_use(&to)).flatten()) {
+        return Applied::Skipped {
+            path: dir.to_path_buf(),
+            reason,
+        };
+    }
+    if dry_run {
+        return Applied::Planned {
+            from,
+            to,
+            pointer,
+            discards: stale,
+        };
+    }
+    // THE RECORD COMES FIRST: a kill after the rename must leave a tree the next pass can
+    // tell from one born `.noindex` ([`Ledger`]).
+    let mut record = match note_renaming(ledger, dir, &to, dir_hidden) {
+        Ok(record) => record,
+        Err(reason) => {
+            return Applied::Failed {
+                path: dir.to_path_buf(),
+                reason,
+            };
+        }
+    };
+    // The stale tree moves INSIDE `dir` under a dot-name before anything else: one rename,
+    // after which nothing indexes it, git sees it as it sees `dir`, and the name it held is
+    // free. It is deleted once `dir` has migrated (it travels with it).
+    let litter = if stale {
+        let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
+        let name = format!("{DISCARD_PREFIX}{nanos:x}{:x}", std::process::id());
+        if let Err(e) = std::fs::rename(&to, dir.join(&name)) {
+            return Applied::Failed {
+                path: dir.to_path_buf(),
+                reason: format!(
+                    "{} is the stale build output a removed link left, and moving it aside \
+                     failed ({e}) — nothing was renamed",
+                    to.display()
                 ),
             };
-            Applied::Migrated { from, to, config }
         }
-        Ok(Migration::Planned { from, to }) => Applied::Planned { from, to, pointer },
+        Some(name)
+    } else {
+        None
+    };
+    let outcome = match migrate(dir, false) {
+        Ok(Migration::Migrated { from, to }) => {
+            let pointed = match (&repo, &pointer) {
+                (Some(repo), Pointer::Symlink) => link_in_place(repo, &from, &to, dir_hidden)
+                    .inspect(|_| record.link = identity(&from))
+                    .map_err(|why| (why, "lay the link or point cargo at the new name yourself")),
+                (Some(repo), _) => match config_plan {
+                    Some(plan) => Ok(plan),
+                    None => plan_repo_config(repo, &from, &to, reach),
+                }
+                .and_then(|plan| write_repo_config(repo, plan))
+                .map_err(|why| (why, "point cargo at the new name yourself")),
+                (None, _) => Ok(ConfigNote::Untouched(
+                    "no Cargo.toml beside it — point cargo at the new name yourself".to_string(),
+                )),
+            };
+            match pointed {
+                Ok(config) => {
+                    // The pointer stands. A failed write here leaves `renaming`, which the
+                    // next pass reads as an unfinished migration and finishes, idempotently.
+                    record.stage = Stage::Done;
+                    let _ = ledger.note(&record);
+                    Applied::Migrated {
+                        from,
+                        to,
+                        config,
+                        discarded: stale,
+                    }
+                }
+                // A renamed tree cargo is not pointed at breaks the next build silently:
+                // roll the rename back.
+                Err((why, remedy)) => match std::fs::rename(&to, &from) {
+                    Ok(()) => Applied::Failed {
+                        path: dir.to_path_buf(),
+                        reason: format!("{why} — the rename was rolled back"),
+                    },
+                    Err(e) => Applied::Migrated {
+                        from,
+                        to,
+                        config: ConfigNote::Untouched(format!(
+                            "{why}, and rolling the rename back failed ({e}) — {remedy}"
+                        )),
+                        discarded: stale,
+                    },
+                },
+            }
+        }
+        // Unreachable by construction: a dry run returned above.
+        Ok(Migration::Planned { from, to }) => Applied::Planned {
+            from,
+            to,
+            pointer,
+            discards: stale,
+        },
         Ok(Migration::AlreadyExcluded(p)) => Applied::AlreadyExcluded(p),
         Ok(Migration::NotApplicable) => Applied::Skipped {
             path: dir.to_path_buf(),
@@ -1779,7 +2552,19 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
             path: dir.to_path_buf(),
             reason: e.to_string(),
         },
+    };
+    // Wherever the migrated directory stands now — renamed, or rolled back.
+    if let Some(litter) = litter
+        && let Some(path) = [to.as_path(), dir]
+            .iter()
+            .map(|home| home.join(&litter))
+            .find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+    {
+        // Best effort: what a kill or an error leaves is hidden where it is, and
+        // [`sweep_killed_litter`] finishes it.
+        let _ = std::fs::remove_dir_all(path);
     }
+    outcome
 }
 
 /// The doctor's scan, then [`apply_one`] over every EXPOSED target dir it found, repos
@@ -1790,9 +2575,10 @@ pub fn apply_under(
     root: &Path,
     max_depth: usize,
     budget: &Budget,
+    ledger: &Ledger,
     dry_run: bool,
 ) -> (Vec<Applied>, bool) {
-    let (outcomes, found) = apply_under_scan(root, max_depth, budget, dry_run);
+    let (outcomes, found) = apply_under_scan(root, max_depth, budget, ledger, dry_run);
     (outcomes, found.complete)
 }
 
@@ -1803,12 +2589,13 @@ pub fn apply_under_scan(
     root: &Path,
     max_depth: usize,
     budget: &Budget,
+    ledger: &Ledger,
     dry_run: bool,
 ) -> (Vec<Applied>, Scan) {
     let found = scan(root, max_depth, budget);
     let mut outcomes: Vec<Applied> = found
         .exposed()
-        .map(|t| apply_one(&t.path, true, dry_run))
+        .map(|t| apply_one(&t.path, ledger, true, dry_run))
         .collect();
     // A migration is two steps, and something can stop the process between them.
     outcomes.extend(
@@ -1816,14 +2603,16 @@ pub fn apply_under_scan(
             .targets
             .iter()
             .filter(|t| t.exclusion != Exclusion::Exposed)
-            .filter_map(|t| relink_migrated(&t.path, dry_run)),
+            .filter_map(|t| settle_migrated(&t.path, ledger, dry_run)),
     );
+    outcomes.extend(settle_links(root, &found.links, ledger, dry_run));
     outcomes.sort_by(|a, b| a.path().cmp(b.path()));
     (outcomes, found)
 }
 
-/// Finish the HALF-DONE migration this directory is the leftover of: re-lay the
-/// `target -> target.noindex` link in a git checkout, and write the `.cargo/config.toml`
+/// Finish the HALF-DONE migration this `.noindex` directory is the leftover of — when the
+/// [`Ledger`] says it is one: re-lay the `target -> target.noindex` link in a git checkout
+/// (with the exclude lines git's recorded answer calls for), write the `.cargo/config.toml`
 /// pointer in a config-pointed tree ([`repair_config_migration`]).
 ///
 /// THE WINDOW. [`apply_one`] renames and then links, and it rolls the rename back on
@@ -1835,53 +2624,118 @@ pub fn apply_under_scan(
 /// and refused forever after ("a name in the way"). So the steady state of one
 /// ill-timed signal is the exact failure this module exists to prevent, permanently.
 ///
-/// The LINK repair is the narrowest one that fixes it: only a `.noindex` directory, only
-/// in a repository whose pointer IS the symlink ([`Pointer::Symlink`] — a
-/// `.cargo/config.toml` tree needs no link and must not grow one), and only when the name
-/// beside it is ABSENT. A `target` that exists — as a link, a directory, anything — is not
-/// this case and is left alone.
+/// ONLY A RENAME THE LEDGER HOLDS AS UNFINISHED is repaired, and only when the name beside
+/// it is ABSENT (or is already the pass's own link, the kill having landed between the link
+/// and its exclude lines). A `.noindex` directory with no ledger line was not renamed by
+/// the pass — born under that name, or renamed by the `migrate` verb, which deliberately
+/// leaves no link — and is left exactly as it is; one recorded `done` whose link is gone
+/// had it removed by its owner (`cargo clean`), and is not re-linked: the clean stands.
+/// The one write for a `.noindex` directory the ledger does not know is the adoption of a
+/// pre-ledger migration ([`Ledger`]). Each `.noindex` directory visited is swept of the
+/// stale tree a killed delete left in it ([`sweep_killed_litter`]).
 ///
-/// A config-pointed tree is repaired by its POINTER instead — the half the interrupted pass
-/// never wrote, and no link ([`repair_config_migration`]).
-fn relink_migrated(dir: &Path, dry_run: bool) -> Option<Applied> {
+/// The other unfinished step is a MOVE BACK ([`move_back`]) a kill stopped between its
+/// unlink and its rename: one whose latest line is `undoing`, with nothing under its first
+/// name but the link it began with, is finished — the in-use rule asked again.
+fn settle_migrated(dir: &Path, ledger: &Ledger, dry_run: bool) -> Option<Applied> {
     if !SUPPORTED || exclusion_of(dir) != Exclusion::NoindexSuffix {
         return None;
     }
     let name = dir.file_name()?.to_str()?;
     let original = dir.with_file_name(name.strip_suffix(NOINDEX_SUFFIX)?);
-    if !dir.is_dir() || std::fs::symlink_metadata(&original).is_ok() {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
         return None;
     }
+    let id = identity(dir)?;
     let repo = repo_of(dir)?;
+    if !dry_run {
+        sweep_killed_litter(dir, Timing::DEFAULT.litter_cutoff());
+    }
+    let linked = links_to(&original, dir);
+    let dir_hidden = match ledger.find(id) {
+        Some(Record {
+            stage: Stage::Renaming,
+            dir_hidden,
+            ..
+        }) => dir_hidden,
+        // A move back a kill interrupted ([`move_back`]): finished, when nothing stands
+        // under the first name but the link it began with.
+        Some(
+            record @ Record {
+                stage: Stage::Undoing,
+                ..
+            },
+        ) => {
+            let first_name_free = std::fs::symlink_metadata(&original).is_err()
+                || (linked && identity(&original) == record.link);
+            return first_name_free.then(|| {
+                move_back(
+                    &original,
+                    dir,
+                    &record,
+                    ledger,
+                    "an earlier pass began moving it back and did not finish",
+                    dry_run,
+                )
+            });
+        }
+        Some(_) => return None,
+        None => {
+            if linked && !dry_run && pointer_for(Some(&repo)) == Pointer::Symlink {
+                let _ = ledger.note(&Record {
+                    stage: Stage::Done,
+                    dir: id,
+                    link: identity(&original),
+                    dir_hidden: None,
+                    at: dir.to_path_buf(),
+                });
+            }
+            return None;
+        }
+    };
+    let absent = std::fs::symlink_metadata(&original).is_err();
+    // A real directory there is a build since the kill: [`apply_one`]'s stale tree.
+    if !absent && !linked {
+        return None;
+    }
     let config = match pointer_for(Some(&repo)) {
-        // A git checkout: the link is cargo's pointer, so re-laying it is the repair.
+        // A git checkout: the link is cargo's pointer, so laying it is the repair.
         Pointer::Symlink => None,
         // Not under git: cargo's pointer is a config, and finishing the migration means
         // writing it rather than laying a link.
-        Pointer::Config(config) => Some(config),
-        // Unreachable by construction: `repo_of` above answered `Some`, so a `Cargo.toml`
-        // is beside this directory and `pointer_for` never says `None`. Answered rather than
-        // asserted, so a future change there costs a report, never correctness.
-        Pointer::None => return None,
+        Pointer::Config(config) if absent => Some(config),
+        // A link beside a config-pointed tree, or (unreachable: `repo_of` answered) no
+        // repo at all: nothing of the pass's to finish.
+        Pointer::Config(_) | Pointer::None => return None,
     };
     if let Some(config) = config {
-        return repair_config_migration(&repo, &original, dir, &config, dry_run);
+        return repair_config_migration(&repo, &original, dir, &config, id, ledger, dry_run);
     }
     if dry_run {
         return Some(Applied::Skipped {
             path: original,
             reason: format!(
-                "the link to {} is missing — a pass would lay it again",
+                "a migration to {} was interrupted before its link stood — a pass would lay it",
                 dir.display()
             ),
         });
     }
-    match link_in_place(&repo, &original, dir, None) {
-        Ok(config) => Some(Applied::Migrated {
-            from: original,
-            to: dir.to_path_buf(),
-            config,
-        }),
+    match link_in_place(&repo, &original, dir, dir_hidden) {
+        Ok(config) => {
+            let _ = ledger.note(&Record {
+                stage: Stage::Done,
+                dir: id,
+                link: identity(&original),
+                dir_hidden,
+                at: dir.to_path_buf(),
+            });
+            Some(Applied::Migrated {
+                from: original,
+                to: dir.to_path_buf(),
+                config,
+                discarded: false,
+            })
+        }
         Err(why) => Some(Applied::Failed {
             path: original,
             reason: format!(
@@ -1892,13 +2746,360 @@ fn relink_migrated(dir: &Path, dry_run: bool) -> Option<Applied> {
     }
 }
 
-/// Finish the half-done migration in a CONFIG-POINTED tree, which [`relink_migrated`]'s
-/// link cannot repair — such a tree must not grow a link
-/// (`the_relink_repair_touches_nothing_else`). What the interrupted pass was about to
-/// write is `[build] target-dir` in `.cargo/config.toml`, so this writes exactly that,
-/// through the same [`plan_repo_config`] / [`write_repo_config`] an uninterrupted
+/// Settle every link the pass laid. One that now stands over NOTHING has its directory made
+/// again: `rm -rf target/` — the trailing slash a shell's completion adds to a link —
+/// follows the link and deletes `target.noindex`, leaving `target -> target.noindex`
+/// dangling, and every build through it then fails (measured 2026-10-02: "failed to create
+/// directory `…/target` … Not a directory"). The [`Ledger`] holds the link's own identity,
+/// so only a link the pass laid is answered — with an empty directory under the name it
+/// points at, which cargo fills as before (a real pass only). One `git status` SHOWS is
+/// settled as the pass would settle the directory today ([`repair_shown_link`]).
+///
+/// THE LINK IS FOUND BY ITS IDENTITY, WHEREVER IT STANDS NOW. The candidates are the links
+/// the walk passed (`walked`, [`Scan::links`]) and, for the places it does not go, the link
+/// beside each record's path under `root` — as the walk spells it, or as its resolved path
+/// does (a directory a person named is recorded through its resolved parent,
+/// [`named_absolute`]: `/private/var` where the walk says `/var`); each is reported in the
+/// walk's spelling, and answered only when its identity is a link the ledger recorded.
+/// Looked up by the record's path alone, a checkout `mv`ed since — same identities, a path
+/// the ledger never saw — kept its dangling link for good, while a `cp -R` copy, adopted
+/// at its new path, was restored (measured 2026-10-02). The restored directory's line
+/// carries the path it was made at, so the ledger follows the move.
+fn settle_links(root: &Path, walked: &[PathBuf], ledger: &Ledger, dry_run: bool) -> Vec<Applied> {
+    if !SUPPORTED {
+        return Vec::new();
+    }
+    let resolved_root = std::fs::canonicalize(root).ok();
+    // Each directory's latest line, by its identity.
+    let mut latest: std::collections::HashMap<Id, Record> = std::collections::HashMap::new();
+    // Each link the pass laid, by identity: the latest record carrying it.
+    let mut laid: std::collections::HashMap<Id, Record> = std::collections::HashMap::new();
+    let mut candidates = walked.to_vec();
+    for record in ledger.records().into_iter().rev() {
+        // The latest line of each directory; a link only a `done` or `undoing` line carries.
+        if latest.contains_key(&record.dir) {
+            continue;
+        }
+        latest.insert(record.dir, record.clone());
+        let Some(link_id) = record.link else {
+            continue;
+        };
+        let rest = record.at.strip_prefix(root).ok().or_else(|| {
+            resolved_root
+                .as_deref()
+                .and_then(|r| record.at.strip_prefix(r).ok())
+        });
+        // Only where the walk itself goes ([`scan`]): a record under a folder it prunes — a
+        // dot-directory, or a [`SKIP_DIRS`] name, the macOS-protected folders among them — is
+        // a directory a person migrated by name, and an unattended pass that so much as
+        // `lstat`s inside `~/Documents` raises, in aterm's name, the consent prompt the prune
+        // exists to keep away.
+        if let Some(rest) = rest
+            && !rest.components().any(|c| {
+                let name = c.as_os_str().to_string_lossy();
+                name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref())
+            })
+        {
+            let at = root.join(rest);
+            if let Some(link) = at
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(NOINDEX_SUFFIX))
+                .map(|n| at.with_file_name(n))
+            {
+                candidates.push(link);
+            }
+        }
+        laid.entry(link_id).or_insert(record);
+    }
+    candidates.sort();
+    candidates.dedup();
+    let mut out = Vec::new();
+    for link in candidates {
+        let Some(link_id) = identity(&link) else {
+            continue;
+        };
+        let Some(at) = destination(&link) else {
+            continue;
+        };
+        if !links_to(&link, &at) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&at) {
+            if meta.is_dir() {
+                let record = identity(&at).and_then(|id| latest.get(&id));
+                out.extend(repair_shown_link(
+                    &link, &at, link_id, record, ledger, dry_run,
+                ));
+            }
+            continue;
+        }
+        let Some(record) = laid.get(&link_id).filter(|_| !dry_run) else {
+            continue;
+        };
+        match std::fs::create_dir(&at) {
+            Ok(()) => {
+                if let Some(dir) = identity(&at) {
+                    let _ = ledger.note(&Record {
+                        dir,
+                        at: at.clone(),
+                        ..record.clone()
+                    });
+                }
+                out.push(Applied::Restored { link, to: at });
+            }
+            Err(e) => out.push(Applied::Failed {
+                reason: format!(
+                    "the build directory it points at is gone, and making {} again failed \
+                     ({e}) — every build through the link fails until it exists",
+                    at.display()
+                ),
+                path: link,
+            }),
+        }
+    }
+    out
+}
+
+/// A LINK THE PASS LAID THAT `git status` SHOWS, settled the way [`apply_one`] settles the
+/// directory today. An older migration asked `git check-ignore` about the directory instead
+/// of what status shows for it ([`git_hides`]), and two shapes came out wrong under a
+/// ledger word that is the same as for a directory no ignore entry touches:
+///
+/// * a contents-only entry (`target/*`, `/target/**`) hid the directory and matches no
+///   link, so the link reads `?? target`. When git says status WOULD hide a directory there
+///   holding what the tree holds ([`git_would_hide`]), the link gets its own line in the
+///   clone's `.git/info/exclude` — the line, file and comment [`link_in_place`] writes
+///   today, and the least a repair can change. When status would show that directory too,
+///   the link shows exactly as the directory did, which is what a migration leaves today:
+///   it is left alone, in silence.
+/// * git TRACKS a file under the directory, which reads as deleted while a link stands in
+///   its place (` D target/.gitkeep`), and no exclude line hides a tracked file: the
+///   migration today's pass refuses is undone ([`move_back`]).
+///
+/// Only the pass's own link is changed: the identity a `done` line carries for the tree it
+/// points at (`record`, that tree's latest line). A tree the ledger does not know, or one
+/// whose latest line is not `done` ([`settle_migrated`] finishes `renaming` and `undoing`),
+/// is not answered; a link that is not the one the pass laid is reported and left. A dry run
+/// says what a pass would do and writes nothing.
+#[cfg(unix)]
+fn repair_shown_link(
+    link: &Path,
+    twin: &Path,
+    link_id: Id,
+    record: Option<&Record>,
+    ledger: &Ledger,
+    dry_run: bool,
+) -> Option<Applied> {
+    let record = record.filter(|r| r.stage == Stage::Done)?;
+    let repo = repo_of(link)?;
+    let rows = git_status_rows(&repo, link)?;
+    if rows.is_empty() {
+        return None;
+    }
+    let skipped = |reason: String| {
+        Some(Applied::Skipped {
+            path: link.to_path_buf(),
+            reason,
+        })
+    };
+    if record.link != Some(link_id) {
+        return skipped(format!(
+            "git status shows `{}`, and this is not the link the pass laid for {} — nothing \
+             was changed",
+            rows.join("`, `"),
+            twin.display()
+        ));
+    }
+    if let Some(row) = rows.iter().find(|row| !row.starts_with("?? ")) {
+        // What no link can stand in for is a file git tracks UNDER the directory, the
+        // migration's own refusal ([`git_hides`]): a row whose path is under the link's.
+        // A row about the link itself (`A  target`: someone staged it) is theirs.
+        let prefix = git(&repo, &["rev-parse", "--show-prefix"]).filter(|o| o.status.success())?;
+        let under = format!(
+            "{}{}/",
+            String::from_utf8_lossy(&prefix.stdout).trim_end_matches('\n'),
+            link.file_name()?.to_string_lossy()
+        );
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.get(3..).is_some_and(|path| path.starts_with(&under)))
+        else {
+            return skipped(format!(
+                "git status shows `{row}` for the link itself, and git tracks no file under \
+                 it — nothing was changed"
+            ));
+        };
+        let why = format!(
+            "git status showed `{row}`: git tracks a file under it, which reads as deleted \
+             while a link stands in its place"
+        );
+        return Some(move_back(link, twin, record, ledger, &why, dry_run));
+    }
+    match git_would_hide(&repo, link, twin) {
+        // Status would show the directory too: the link shows as the directory did.
+        Some(false) => None,
+        None => skipped(
+            "git status shows the link, and what it would show for the directory could not be \
+             learned (git could not be asked, or the tree is too large to stand in for) — \
+             nothing was changed"
+                .to_string(),
+        ),
+        Some(true) if dry_run => skipped(
+            "git status shows the link and would hide the directory — a pass would exclude the \
+             link"
+                .to_string(),
+        ),
+        Some(true) => match exclude_in_git(&repo, link, EXCLUDE_LINK) {
+            ExcludeNote::Added(file) => Some(Applied::Repaired {
+                link: link.to_path_buf(),
+                repair: Repair::Excluded(file),
+            }),
+            ExcludeNote::AlreadyIgnored => None,
+            ExcludeNote::NotIgnored(why) => Some(Applied::Failed {
+                path: link.to_path_buf(),
+                reason: format!(
+                    "git status shows the link and would hide the directory, and excluding the \
+                     link failed — {why}; git status shows it until it is excluded"
+                ),
+            }),
+        },
+    }
+}
+
+#[cfg(not(unix))]
+fn repair_shown_link(
+    _link: &Path,
+    _twin: &Path,
+    _link_id: Id,
+    _record: Option<&Record>,
+    _ledger: &Ledger,
+    _dry_run: bool,
+) -> Option<Applied> {
+    None
+}
+
+/// UNDO A MIGRATION GIT CANNOT READ AS THE DIRECTORY ([`repair_shown_link`]): move `twin`
+/// back under its first name `link`, the pass's link there removed. It is the migration's
+/// own step backwards — one `rename(2)` inside one parent, so no byte moves — and it asks
+/// what the migration asks first: nothing may use the tree ([`in_use`], the one rule; a held
+/// tree is retried next pass). The ledger has it before it starts (`undoing`, with the
+/// link's identity) and once it is done (`undone`), so a pass killed between the unlink and
+/// the rename is finished by the next ([`settle_migrated`]). A rename that fails lays the
+/// link again, so builds keep reaching the tree, and the next pass tries again. `why` says
+/// what made it necessary.
+fn move_back(
+    link: &Path,
+    twin: &Path,
+    record: &Record,
+    ledger: &Ledger,
+    why: &str,
+    dry_run: bool,
+) -> Applied {
+    let path = link.to_path_buf();
+    if let Some(reason) = in_use(twin) {
+        return Applied::Skipped { path, reason };
+    }
+    if dry_run {
+        return Applied::Skipped {
+            path,
+            reason: format!(
+                "{why} — a pass would move {} back to {}",
+                twin.display(),
+                link.display()
+            ),
+        };
+    }
+    let undoing = |link: Option<Id>| Record {
+        stage: Stage::Undoing,
+        link,
+        at: twin.to_path_buf(),
+        ..record.clone()
+    };
+    if record.stage != Stage::Undoing
+        && let Err(e) = ledger.note(&undoing(record.link))
+    {
+        return Applied::Failed {
+            path,
+            reason: format!(
+                "{why}, and moving it back could not be recorded in {} ({e}) — nothing was moved",
+                ledger.shown()
+            ),
+        };
+    }
+    if links_to(link, twin)
+        && let Err(e) = std::fs::remove_file(link)
+    {
+        return Applied::Failed {
+            path,
+            reason: format!(
+                "{why}, and removing the link to move {} back failed ({e}) — nothing was moved",
+                twin.display()
+            ),
+        };
+    }
+    if let Err(e) = std::fs::rename(twin, link) {
+        let relaid = twin
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("no file name"))
+            .and_then(|name| lay_link(name, link));
+        let reason = match relaid {
+            Ok(()) => {
+                let _ = ledger.note(&undoing(identity(link)));
+                format!(
+                    "{why}, and moving {} back failed ({e}) — the link was laid again, and the \
+                     next pass moves it back",
+                    twin.display()
+                )
+            }
+            Err(again) => format!(
+                "{why}, and moving {} back failed ({e}), and laying the link again failed \
+                 ({again}) — the next pass moves it back; until then a build through {} fails",
+                twin.display(),
+                link.display()
+            ),
+        };
+        return Applied::Failed { path, reason };
+    }
+    let _ = ledger.note(&Record {
+        stage: Stage::Undone,
+        dir: record.dir,
+        link: None,
+        dir_hidden: record.dir_hidden,
+        at: path.clone(),
+    });
+    Applied::Repaired {
+        link: path,
+        repair: Repair::MovedBack {
+            from: twin.to_path_buf(),
+            why: why.to_string(),
+        },
+    }
+}
+
+/// Lay the pass's relative link `at -> name`.
+fn lay_link(name: &std::ffi::OsStr, at: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(name, at)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, at);
+        Err(std::io::Error::other(
+            "a symlink is not laid on this platform",
+        ))
+    }
+}
+
+/// Finish the half-done migration in a CONFIG-POINTED tree, which [`settle_migrated`]'s
+/// link cannot repair — such a tree must not grow a link. What the interrupted pass was
+/// about to write is `[build] target-dir` in `.cargo/config.toml`, so this writes exactly
+/// that, through the same [`plan_repo_config`] / [`write_repo_config`] an uninterrupted
 /// migration uses, and reports the same [`Applied::Migrated`] row: nothing downstream
-/// learns a new shape, and the rename it completes already happened.
+/// learns a new shape, and the rename it completes already happened. Reached only for a
+/// rename `ledger` holds as unfinished (`id` is the directory's), which it marks `done`
+/// once nothing is left to write.
 ///
 /// NARROW, so a healthy or foreign tree is never touched: only a plan that WRITES a
 /// pointer into a file holding none is the wedge. Everything else is somebody's decision —
@@ -1911,14 +3112,33 @@ fn repair_config_migration(
     original: &Path,
     dir: &Path,
     config: &Path,
+    id: Id,
+    ledger: &Ledger,
     dry_run: bool,
 ) -> Option<Applied> {
+    let done = |ledger: &Ledger| {
+        let _ = ledger.note(&Record {
+            stage: Stage::Done,
+            dir: id,
+            link: None,
+            dir_hidden: None,
+            at: dir.to_path_buf(),
+        });
+    };
     // Only a `Write` plan is a half-done migration at all: `Leave` is a tree cargo is
     // already pointed somewhere for, and `Err` one whose config cannot be edited safely.
     // Both are left in the silence the reporting-only pass left them in.
-    let plan = match plan_repo_config(repo, original, dir) {
+    // Reached only from the walk ([`apply_under_scan`]), so only inside the repository.
+    let plan = match plan_repo_config(repo, original, dir, ConfigReach::InsideRepo) {
         Ok(plan @ RepoConfig::Write { .. }) => plan,
-        _ => return None,
+        // Pointed already: nothing left to finish.
+        Ok(RepoConfig::Leave(_)) => {
+            if !dry_run {
+                done(ledger);
+            }
+            return None;
+        }
+        Err(_) => return None,
     };
     // A `target-dir` already in the file is a pointer the user set, and writing over it
     // would re-aim their build — that shape is named, never finished.
@@ -1945,11 +3165,15 @@ fn repair_config_migration(
     match write_repo_config(repo, plan) {
         // The rename happened before the kill and this pass did the missing half, so the
         // row is the one an uninterrupted migration reports.
-        Ok(note) => Some(Applied::Migrated {
-            from: original.to_path_buf(),
-            to: dir.to_path_buf(),
-            config: note,
-        }),
+        Ok(note) => {
+            done(ledger);
+            Some(Applied::Migrated {
+                from: original.to_path_buf(),
+                to: dir.to_path_buf(),
+                config: note,
+                discarded: false,
+            })
+        }
         Err(why) => Some(Applied::Failed {
             path: original.to_path_buf(),
             reason: format!(
@@ -2129,54 +3353,44 @@ impl std::fmt::Display for Verdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Excluded => f.write_str(
-                "excluded — a probe planted here stayed out of the index while a control \
-                 planted after it appeared; nothing to do",
+                "excluded — a probe stayed out of the index while a later control appeared",
             ),
-            Self::Indexed => f.write_str(
-                "INDEXED — Spotlight is walking this tree; run `aterm pkg noindex migrate \
-                 <dir>` to rename it to the .noindex form",
-            ),
+            Self::Indexed => f.write_str("INDEXED — Spotlight is walking this tree"),
             Self::Unknown(Unmeasured::ControlNeverIndexed { waited_secs }) => write!(
                 f,
-                "unknown — the control file was still not indexed after {waited_secs}s, so a \
-                 miss here proves nothing; re-run on a less busy machine"
+                "unknown — the control was not indexed within {waited_secs}s; re-run when the \
+                 machine is less busy"
             ),
             Self::Unknown(Unmeasured::IndexingDisabled(p)) => write!(
                 f,
-                "unknown — Spotlight indexing is off for the volume holding {}, so there is \
-                 nothing to measure against; nothing needs migrating there",
+                "unknown — Spotlight indexing is off for the volume holding {}; nothing needs \
+                 migrating there",
                 p.display()
             ),
             Self::Unknown(Unmeasured::IndexReadOnly(p)) => write!(
                 f,
-                "unknown — the Spotlight index of the volume holding {} is read-only (mds \
-                 holds it so while the volume is low on space), so nothing new could be \
-                 indexed to measure against; indexing resumes when the hold lifts — free \
-                 space, then re-run `aterm pkg noindex verify`; migrating meanwhile is safe",
+                "unknown — the Spotlight index of the volume holding {} is read-only (low on \
+                 space); free space, then re-run `aterm pkg noindex verify`; migrating \
+                 meanwhile is safe",
                 p.display()
             ),
             Self::Unknown(Unmeasured::ScopeExcluded(p)) => write!(
                 f,
-                "unknown — the parent {} is itself excluded by name (a `.noindex` or \
-                 dot-hidden ancestor), so an `mdfind` scoped there answers from a live scan \
-                 and not from the index; everything below it is already excluded and \
-                 nothing there needs migrating",
+                "unknown — the parent {} is already excluded by name (a `.noindex` or \
+                 dot-hidden ancestor); nothing below it needs migrating",
                 p.display()
             ),
             Self::Unknown(Unmeasured::NoParent(p)) => write!(
                 f,
-                "unknown — {} has no parent to plant a same-volume control in; name a \
-                 directory, not a volume root",
+                "unknown — {} has no parent for a control; name a directory, not a volume \
+                 root",
                 p.display()
             ),
             Self::Unknown(Unmeasured::Io(e)) => write!(
                 f,
-                "unknown — the probe could not be run ({e}); check the directory is writable \
-                 and re-run"
+                "unknown — the probe could not be run ({e}); check the directory is writable"
             ),
-            Self::NotApplicable => f.write_str(
-                "not applicable — there is no Spotlight index on this platform to hide from",
-            ),
+            Self::NotApplicable => f.write_str("not applicable — no Spotlight on this platform"),
         }
     }
 }
@@ -2341,9 +3555,7 @@ pub fn verify(dir: &Path, timing: &Timing) -> Verdict {
     if exclusion_of(scope) != Exclusion::Exposed {
         return Verdict::Unknown(Unmeasured::ScopeExcluded(scope.to_path_buf()));
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
+    let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
     let token = probe_token(nanos, std::process::id());
     let control_name = control_file_name(&token);
     let mut control_dir_name = String::from("atpkg-control-");
@@ -2456,7 +3668,8 @@ impl Drop for Cleanup {
 }
 
 /// Remove what a KILLED [`verify`] left in `dir`: its `atpkgnoindexprobe…` probe file, and
-/// the `atpkg-control-atpkgnoindexprobe…` directory it plants beside a candidate. Only
+/// the `atpkg-control-atpkgnoindexprobe…` directory it plants beside a candidate — and the
+/// `.atpkg-noindex-discard-…` tree a killed [`apply_one`] had not finished deleting. Only
 /// entries at least `min_age` old, only names this module itself generates, and never
 /// anything reached by following a link out of `dir`. Returns how many were removed.
 ///
@@ -2484,8 +3697,10 @@ fn sweep_killed_litter(dir: &Path, min_age: Duration) -> usize {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // The control DIRECTORY must carry BOTH prefixes. `atpkg-control-` alone is not a
-        // claim this module can make about someone else's directory.
+        // claim this module can make about someone else's directory. The third name is a
+        // stale tree whose delete a kill cut short ([`apply_one`]).
         let ours = name.starts_with(PROBE_PREFIX)
+            || name.starts_with(DISCARD_PREFIX)
             || name
                 .strip_prefix(CONTROL_DIR_PREFIX)
                 .is_some_and(|rest| rest.starts_with(PROBE_PREFIX));
@@ -2559,22 +3774,28 @@ mod tests {
     fn release(file: &std::fs::File) {
         use std::os::unix::io::AsRawFd as _;
         // SAFETY: LOCK_UN on a valid descriptor this test owns.
-        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the release: LOCK_UN before the descriptor closes"
+        )]
+        let released = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        assert_eq!(released, 0);
     }
 
-    /// A synthetic root under `temp_dir()`. Module tag + per-test label + PID, so parallel
-    /// tests and concurrent runs cannot collide. Nothing here reads the environment or the
-    /// user's real home, and no test below queries Spotlight: on macOS `temp_dir()` is
-    /// `/private/var/folders/…/T/`, which is typically not indexed at all, so an index query
-    /// there would be meaningless AND flaky. The race logic is tested through [`decide`].
-    fn scratch(label: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-noindex-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        root
+    /// A synthetic root under `temp_dir()`, removed when the test ends. Module tag +
+    /// per-test label + a unique suffix, so parallel tests and concurrent runs cannot
+    /// collide. Nothing here reads the environment or the user's real home, and no test
+    /// below queries Spotlight: on macOS `temp_dir()` is `/private/var/folders/…/T/`, which
+    /// is typically not indexed at all, so an index query there would be meaningless AND
+    /// flaky. The race logic is tested through [`decide`].
+    fn scratch(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-noindex-{label}-"))
+    }
+
+    /// The ledger a test's passes keep: a dot-file at its scratch root, which no walk
+    /// reads and no fixture repository holds.
+    fn test_ledger(root: &Path) -> Ledger {
+        Ledger::at(root.join(".noindex.ledger"))
     }
 
     /// A directory carrying cargo's real cache-dir tag.
@@ -2679,6 +3900,38 @@ mod tests {
             ),
             ConfigEdit::PointsElsewhere("/Volumes/fast/t".to_string())
         );
+        // THE VALUE IS WHAT A TOML READER READS (2026-10-02). A trailing comment is not part
+        // of it: the line's text with its quotes trimmed read `target" # local`, named no
+        // directory, and the pass renamed `target` under a config still sending cargo
+        // there. Commented, the old directory is still named and rewritten; a commented
+        // elsewhere is still elsewhere; a value that is not a string is refused.
+        assert_eq!(
+            point_cargo_config(
+                "[build]\ntarget-dir = \"target\" # local\n",
+                "target",
+                Path::new("/Users//x/repo/target"),
+                "target.noindex"
+            ),
+            ConfigEdit::Rewritten("[build]\ntarget-dir = \"target.noindex\"\n".to_string())
+        );
+        assert_eq!(
+            point_cargo_config(
+                "[build]\ntarget-dir = '/Volumes/fast/t' # fast disk\n",
+                "target",
+                Path::new("/Users//x/repo/target"),
+                "target.noindex"
+            ),
+            ConfigEdit::PointsElsewhere("/Volumes/fast/t".to_string())
+        );
+        assert!(matches!(
+            point_cargo_config(
+                "[build]\ntarget-dir = 7\n",
+                "target",
+                Path::new("/Users//x/repo/target"),
+                "target.noindex"
+            ),
+            ConfigEdit::Unparseable(_)
+        ));
         // A target-dir key OUTSIDE [build] is not cargo's and is ignored.
         let ConfigEdit::Written(t) = point_cargo_config(
             "[other]\ntarget-dir = \"z\"\n",
@@ -2758,7 +4011,7 @@ mod tests {
         if !SUPPORTED {
             let root = scratch("apply-na");
             assert!(matches!(
-                apply_one(&root, false, false),
+                apply_one(&root, &test_ledger(&root), false, false),
                 Applied::Skipped { .. }
             ));
             return;
@@ -2773,8 +4026,13 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join("aterm"), "build output").unwrap();
         // Dry run first: nothing moves, the plan names the config.
-        match apply_one(&target, true, true) {
-            Applied::Planned { from, to, pointer } => {
+        match apply_one(&target, &test_ledger(&root), true, true) {
+            Applied::Planned {
+                from,
+                to,
+                pointer,
+                discards: false,
+            } => {
                 assert_eq!(from, target);
                 assert_eq!(to, repo.join("target.noindex"));
                 assert_eq!(pointer, Pointer::Config(repo.join(".cargo/config.toml")));
@@ -2783,8 +4041,14 @@ mod tests {
         }
         assert!(target.is_dir() && !repo.join("target.noindex").exists());
         // The real thing.
-        let out = apply_one(&target, true, false);
-        let Applied::Migrated { from, to, config } = out else {
+        let out = apply_one(&target, &test_ledger(&root), true, false);
+        let Applied::Migrated {
+            from,
+            to,
+            config,
+            discarded: false,
+        } = out
+        else {
             panic!("{out:?}");
         };
         assert!(out_is(&from, &target) && to == repo.join("target.noindex"));
@@ -2802,7 +4066,7 @@ mod tests {
         );
         // Idempotent: the new name is already excluded; the config is not rewritten.
         assert_eq!(
-            apply_one(&to, true, false),
+            apply_one(&to, &test_ledger(&root), true, false),
             Applied::AlreadyExcluded(to.clone())
         );
         assert_eq!(
@@ -2813,11 +4077,11 @@ mod tests {
         let free = root.join("free-target");
         tagged_target(&free);
         assert!(matches!(
-            apply_one(&free, true, false),
+            apply_one(&free, &test_ledger(&root), true, false),
             Applied::Skipped { ref reason, .. } if reason.contains("not beside a Cargo.toml")
         ));
         assert!(free.is_dir());
-        let out = apply_one(&free, false, false);
+        let out = apply_one(&free, &test_ledger(&root), false, false);
         assert!(
             matches!(out, Applied::Migrated { ref config, .. } if matches!(config, ConfigNote::Untouched(_))),
             "{out:?}"
@@ -2846,7 +4110,8 @@ mod tests {
         std::os::unix::fs::symlink("../../shared/config.toml", &link).unwrap();
         let (from, to) = (repo.join("target"), repo.join("target.noindex"));
 
-        let plan = plan_repo_config(&repo, &from, &to).expect("a linked config plans");
+        let plan = plan_repo_config(&repo, &from, &to, ConfigReach::Anywhere)
+            .expect("a linked config plans");
         let note = write_repo_config(&repo, plan).expect("and writes");
         assert!(matches!(note, ConfigNote::Written(_)), "{note:?}");
         assert!(
@@ -2883,6 +4148,7 @@ mod tests {
             &dangling,
             &dangling.join("target"),
             &dangling.join("target.noindex"),
+            ConfigReach::Anywhere,
         );
         assert!(refused.is_err(), "a dangling config link is refused");
         assert!(
@@ -2891,6 +4157,67 @@ mod tests {
                 .file_type()
                 .is_symlink()
                 && !root.join("not-checked-out.toml").exists()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // THE WALK WRITES ONLY INSIDE THE TREE IT FOUND (2026-10-01 security review). A tree the
+    // automatic pass merely found chose where its links point: a committed
+    // `.cargo/config.toml` linked out of the repository, or a `.cargo/` linked out, is
+    // refused before anything is renamed and the file it names is left as it was; a link
+    // that stays inside the repository is still written through. A directory the user
+    // NAMED reaches the linked file wherever it is (the test above).
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_never_writes_a_config_outside_the_repository() {
+        if !SUPPORTED {
+            return;
+        }
+        let root = scratch("config-escape");
+        let global = root.join("home/.cargo");
+        std::fs::create_dir_all(&global).unwrap();
+        let global_config = global.join("config.toml");
+        let before = "[alias]\nb = \"build\"\n";
+        let tree = |name: &str| {
+            let repo = root.join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+            tagged_target(&repo.join("target"));
+            repo
+        };
+        let file_out = tree("file-out");
+        std::fs::create_dir_all(file_out.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../home/.cargo/config.toml",
+            file_out.join(".cargo/config.toml"),
+        )
+        .unwrap();
+        let dir_out = tree("dir-out");
+        std::os::unix::fs::symlink("../home/.cargo", dir_out.join(".cargo")).unwrap();
+        for repo in [&file_out, &dir_out] {
+            std::fs::write(&global_config, before).unwrap();
+            let out = apply_one(&repo.join("target"), &test_ledger(&root), true, false);
+            assert!(
+                matches!(&out, Applied::Failed { reason, .. }
+                    if reason.contains("outside the repository") && reason.contains("nothing was renamed")),
+                "{out:?}"
+            );
+            assert!(repo.join("target").is_dir() && !repo.join("target.noindex").exists());
+            assert_eq!(std::fs::read_to_string(&global_config).unwrap(), before);
+        }
+        // Negative control: a link that stays inside the repository is written through.
+        let inside = tree("inside");
+        std::fs::create_dir_all(inside.join("cfg")).unwrap();
+        std::fs::write(inside.join("cfg/config.toml"), before).unwrap();
+        std::fs::create_dir_all(inside.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink("../cfg/config.toml", inside.join(".cargo/config.toml"))
+            .unwrap();
+        let out = apply_one(&inside.join("target"), &test_ledger(&root), true, false);
+        assert!(out.migrated(), "{out:?}");
+        assert!(
+            std::fs::read_to_string(inside.join("cfg/config.toml"))
+                .unwrap()
+                .contains("target-dir = \"target.noindex\""),
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2920,7 +4247,7 @@ mod tests {
         let cfg = "build.jobs = 8\n";
         std::fs::write(repo.join(".cargo/config.toml"), cfg).unwrap();
         for dry_run in [false, false, true] {
-            let out = apply_one(&target, true, dry_run);
+            let out = apply_one(&target, &test_ledger(&root), true, dry_run);
             assert!(
                 matches!(out, Applied::Failed { ref reason, .. }
                     if reason.contains("valid TOML") && !reason.contains("already exists")),
@@ -2938,7 +4265,7 @@ mod tests {
         // would not move the build.
         std::fs::remove_file(repo.join(".cargo/config.toml")).unwrap();
         std::fs::write(repo.join(".cargo/config"), "[build]\njobs = 1\n").unwrap();
-        let out = apply_one(&target, true, false);
+        let out = apply_one(&target, &test_ledger(&root), true, false);
         assert!(
             matches!(out, Applied::Failed { ref reason, .. } if reason.contains(".cargo/config")),
             "{out:?}"
@@ -2954,7 +4281,7 @@ mod tests {
             std::fs::set_permissions(&cargo_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
             // Root writes through 0500; the case only means something when it cannot.
             if std::fs::write(cargo_dir.join("probe"), "").is_err() {
-                let out = apply_one(&target, true, false);
+                let out = apply_one(&target, &test_ledger(&root), true, false);
                 assert!(
                     matches!(out, Applied::Failed { ref reason, .. } if reason.contains("rolled back")),
                     "{out:?}"
@@ -2971,26 +4298,14 @@ mod tests {
         a == b
     }
 
-    // A build holding cargo's lock refuses the migration — probed with a real
-    // `flock(2)` on `<target>/debug/.cargo-lock`, released, then the migration goes.
     #[cfg(unix)]
     #[test]
-    fn config_temp_is_never_created_wider_than_0600() {
+    fn a_config_this_pass_creates_gets_the_ordinary_mode() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = scratch("config-temp");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".config.toml.atpkg-1.tmp");
-        let f = create_config_temp(&path).unwrap();
-        assert_eq!(
-            f.metadata().unwrap().permissions().mode() & 0o777,
-            0o600,
-            "the temp must be private from the instant it exists"
-        );
-        drop(f);
-        assert!(
-            create_config_temp(&path).is_err(),
-            "exclusive: an existing temp is never opened and truncated"
-        );
+        drop(crate::platform::create_private_new(&path).unwrap());
         new_config_permissions(&path).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -3000,6 +4315,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A build holding cargo's lock refuses the migration — probed with a real
+    // `flock(2)` on `<target>/debug/.cargo-lock`, released, then the migration goes.
     #[cfg(unix)]
     #[test]
     fn a_live_cargo_lock_refuses_the_migration_until_released() {
@@ -3023,10 +4340,15 @@ mod tests {
             .open(&lock_path)
             .unwrap();
         // SAFETY: flock on an open descriptor owned by this test.
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's stand-in build holds cargo's lock and lets go by `release`"
+        )]
+        let taken = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(taken, 0);
         assert_eq!(build_in_progress(&target), Some(lock_path.clone()));
         if SUPPORTED {
-            let out = apply_one(&target, true, false);
+            let out = apply_one(&target, &test_ledger(&root), true, false);
             assert!(
                 matches!(out, Applied::Skipped { ref reason, .. } if reason.contains("a build holds")),
                 "{out:?}"
@@ -3043,12 +4365,32 @@ mod tests {
         assert_eq!(build_in_progress(&target), None);
         let held = std::fs::OpenOptions::new().write(true).open(&deep).unwrap();
         // SAFETY: flock on an open descriptor owned by this test.
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's stand-in build holds cargo's lock and lets go by `release`"
+        )]
+        let taken = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(taken, 0);
         assert_eq!(build_in_progress(&target), Some(deep.clone()));
         release(&held);
         assert_eq!(build_in_progress(&target), None);
         if SUPPORTED {
-            assert!(apply_one(&target, true, false).migrated());
+            // Cargo holds no lock while tests run, and this config-pointed tree leaves
+            // nothing at its old path: a process still using the tree holds it all the
+            // same, in the dry run as in the real one.
+            let mut user = std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .current_dir(target.join("debug"))
+                .spawn()
+                .unwrap();
+            let planned = apply_one(&target, &test_ledger(&root), true, true);
+            let out = apply_one(&target, &test_ledger(&root), true, false);
+            let _ = user.kill();
+            let _ = user.wait();
+            assert!(out.held_by_build(), "{out:?}");
+            assert_eq!(planned, out, "the dry run refuses identically");
+            assert!(target.is_dir(), "nothing moved under a running test");
+            assert!(apply_one(&target, &test_ledger(&root), true, false).migrated());
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3082,16 +4424,22 @@ mod tests {
             .open(&lock_path)
             .unwrap();
         // SAFETY: flock on an open descriptor owned by this test.
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's stand-in build holds cargo's lock and lets go by `release`"
+        )]
+        let taken = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(taken, 0);
         assert_eq!(build_in_progress(&target), Some(lock_path.clone()));
 
-        let out = apply_one(&target, true, false);
+        let out = apply_one(&target, &test_ledger(&root), true, false);
 
         assert!(
             matches!(out, Applied::Failed { ref reason, .. } if reason.contains("already exists")),
             "the standing refusal is the answer, not the lock that happens to be held: {out:?}"
         );
         assert!(target.is_dir(), "and nothing moved");
+        release(&held);
         drop(held);
 
         // The idempotent case answers at once for the same reason: a tree an earlier pass
@@ -3109,12 +4457,18 @@ mod tests {
             .open(&lock2)
             .unwrap();
         // SAFETY: flock on an open descriptor owned by this test.
-        assert_eq!(unsafe { libc::flock(held2.as_raw_fd(), libc::LOCK_EX) }, 0);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's stand-in build holds cargo's lock and lets go by `release`"
+        )]
+        let taken = unsafe { libc::flock(held2.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(taken, 0);
         assert_eq!(
-            apply_one(&hidden, true, false),
+            apply_one(&hidden, &test_ledger(&root), true, false),
             Applied::AlreadyExcluded(hidden.clone()),
             "an already-excluded tree is a success, not a lock report"
         );
+        release(&held2);
         drop(held2);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3169,7 +4523,8 @@ mod tests {
     /// .gitignore carried before its slashless `/target-*`, and 20 of the 26 planned
     /// dirs on m21). Those match the directory and NOT the symlink, so without the
     /// link's own exclude line the pass turned an ignored directory into a `?? target`
-    /// row that `clean_tree` would refuse.
+    /// row that `clean_tree` would refuse. Last, a directory git TRACKS a file under, which
+    /// no link can stand in for without that file reading as deleted: it is left alone.
     #[cfg(unix)]
     #[test]
     fn a_git_checkout_gets_a_symlink_and_stays_clean_never_a_config_edit() {
@@ -3198,9 +4553,25 @@ mod tests {
         assert!(is_git_checkout(&repo));
         assert_eq!(pointer_for(Some(&repo)), Pointer::Symlink);
 
-        // Dry run: the plan names the symlink, and nothing moves or is written.
-        match apply_one(&target, true, true) {
-            Applied::Planned { from, to, pointer } => {
+        // Dry run: the plan names the symlink, and nothing moves or is written — no
+        // watcher either, in a checkout configured for git's fsmonitor, whose daemon any
+        // index read that finds none running starts.
+        assert!(git_fixture(&repo, &["config", "core.fsmonitor", "true"]));
+        let planned = apply_one(&target, &test_ledger(&root), true, true);
+        let watching = git_fixture(&repo, &["fsmonitor--daemon", "status"]);
+        let _ = git_fixture(&repo, &["fsmonitor--daemon", "stop"]);
+        assert!(git_fixture(&repo, &["config", "--unset", "core.fsmonitor"]));
+        assert!(
+            !watching,
+            "the dry run left git's fsmonitor daemon watching"
+        );
+        match planned {
+            Applied::Planned {
+                from,
+                to,
+                pointer,
+                discards: false,
+            } => {
                 assert_eq!(from, target);
                 assert_eq!(to, repo.join("target.noindex"));
                 assert_eq!(pointer, Pointer::Symlink);
@@ -3211,11 +4582,12 @@ mod tests {
         assert_eq!(git_status(&repo), "");
 
         // The real thing.
-        let out = apply_one(&target, true, false);
+        let out = apply_one(&target, &test_ledger(&root), true, false);
         let Applied::Migrated {
             from,
             to,
             config: note,
+            discarded: false,
         } = out
         else {
             panic!("{out:?}");
@@ -3275,12 +4647,12 @@ mod tests {
         // Idempotent from either spelling; the exclude file is not appended to again.
         let exclude_once = std::fs::read_to_string(&exclude_file).unwrap();
         assert_eq!(
-            apply_one(&target, true, false),
+            apply_one(&target, &test_ledger(&root), true, false),
             Applied::AlreadyExcluded(target.clone()),
             "the link a previous pass left is a success, not a symlink refusal"
         );
         assert_eq!(
-            apply_one(&to, true, false),
+            apply_one(&to, &test_ledger(&root), true, false),
             Applied::AlreadyExcluded(to.clone())
         );
         assert_eq!(
@@ -3310,7 +4682,7 @@ mod tests {
         );
         tagged_target(&wt.join("target"));
         assert_eq!(git_status(&wt), "");
-        let out = apply_one(&wt.join("target"), true, false);
+        let out = apply_one(&wt.join("target"), &test_ledger(&root), true, false);
         assert!(
             matches!(
                 &out,
@@ -3347,7 +4719,7 @@ mod tests {
         tagged_target(&nested.join("target"));
         assert!(!nested.join(".git").exists());
         assert!(is_git_checkout(&nested));
-        let out = apply_one(&nested.join("target"), true, false);
+        let out = apply_one(&nested.join("target"), &test_ledger(&root), true, false);
         assert!(
             matches!(
                 &out,
@@ -3387,7 +4759,7 @@ mod tests {
         assert!(git_fixture(&bare, &["commit", "-q", "-m", "fixture"]));
         tagged_target(&bare.join("target"));
         assert_eq!(git_status(&bare), "?? target/\n", "untracked before");
-        let out = apply_one(&bare.join("target"), true, false);
+        let out = apply_one(&bare.join("target"), &test_ledger(&root), true, false);
         assert!(
             matches!(
                 &out,
@@ -3444,7 +4816,7 @@ mod tests {
             (&s_target, "target.noindex"),
             (&s_tippy, "target-tippy.noindex"),
         ] {
-            let out = apply_one(dir, true, false);
+            let out = apply_one(dir, &test_ledger(&root), true, false);
             let Applied::Migrated {
                 config:
                     ConfigNote::Linked {
@@ -3498,11 +4870,11 @@ mod tests {
         // Idempotent: the links a previous pass left are a success, and nothing is
         // appended again.
         assert_eq!(
-            apply_one(&s_target, true, false),
+            apply_one(&s_target, &test_ledger(&root), true, false),
             Applied::AlreadyExcluded(s_target.clone())
         );
         assert_eq!(
-            apply_one(&s_tippy, true, false),
+            apply_one(&s_tippy, &test_ledger(&root), true, false),
             Applied::AlreadyExcluded(s_tippy.clone())
         );
         assert_eq!(
@@ -3515,6 +4887,35 @@ mod tests {
             "",
             "still clean after the second apply"
         );
+
+        // A checkout that TRACKS a file under the directory: no exclude line hides a
+        // tracked file, and a link standing in the directory's place reads as that file
+        // deleted (` D target/.gitkeep`, measured). It stays a directory, and the dry run
+        // refuses it identically.
+        let kept = root.join("kept");
+        std::fs::create_dir_all(&kept).unwrap();
+        assert!(git_fixture(
+            &kept,
+            &["init", "-q", "--template=", "-b", "main"]
+        ));
+        std::fs::write(kept.join("Cargo.toml"), "[package]\nname = \"k\"\n").unwrap();
+        std::fs::write(kept.join(".gitignore"), "target/\n").unwrap();
+        let k_target = kept.join("target");
+        tagged_target(&k_target);
+        std::fs::write(k_target.join(".gitkeep"), b"").unwrap();
+        assert!(git_fixture(&kept, &["add", "."]));
+        assert!(git_fixture(&kept, &["add", "-f", "target/.gitkeep"]));
+        assert!(git_fixture(&kept, &["commit", "-q", "-m", "fixture"]));
+        assert_eq!(git_status(&kept), "");
+        let planned = apply_one(&k_target, &test_ledger(&root), true, true);
+        let out = apply_one(&k_target, &test_ledger(&root), true, false);
+        assert!(
+            matches!(&out, Applied::Skipped { reason, .. } if reason.contains("target/.gitkeep")),
+            "{out:?}"
+        );
+        assert_eq!(planned, out, "the dry run refuses identically");
+        assert!(std::fs::symlink_metadata(&k_target).unwrap().is_dir());
+        assert_eq!(git_status(&kept), "", "no ` D target/.gitkeep` row");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3614,7 +5015,13 @@ mod tests {
         }
         tagged_target(&root.join("free-target"));
         tagged_target(&root.join("c/target.noindex"));
-        let (outcomes, complete) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        let (outcomes, complete) = apply_under(
+            &root,
+            DOCTOR_DEPTH,
+            &Budget::VERB,
+            &test_ledger(&root),
+            false,
+        );
         assert!(complete);
         let migrated = outcomes.iter().filter(|o| o.migrated()).count();
         assert_eq!(migrated, 2, "{outcomes:?}");
@@ -3626,7 +5033,13 @@ mod tests {
             |o| matches!(o, Applied::Skipped { path, .. } if path == &root.join("free-target"))
         ));
         // Second pass: nothing exposed but the free one; zero migrated.
-        let (outcomes, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        let (outcomes, _) = apply_under(
+            &root,
+            DOCTOR_DEPTH,
+            &Budget::VERB,
+            &test_ledger(&root),
+            false,
+        );
         assert_eq!(outcomes.iter().filter(|o| o.migrated()).count(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3785,19 +5198,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cargo_hint_names_both_mechanisms_and_the_gitignore_trap() {
-        let text = cargo_hint(Path::new("/a/b/target.noindex")).join("\n");
-        assert!(text.contains("CARGO_TARGET_DIR"), "{text}");
-        assert!(text.contains("target-dir"), "{text}");
-        assert!(text.contains("[build]"), "{text}");
-        assert!(
-            text.contains("`target/`") && text.contains("`target.noindex/`"),
-            "an existing gitignore line does not match the new name, and the first surprise \
-             otherwise is a repo full of untracked objects: {text}"
-        );
-    }
-
     // --- FILESYSTEM (temp root, no Spotlight) ------------------------------------------
 
     #[test]
@@ -3948,7 +5348,7 @@ mod tests {
         // Declined: free-standing (no Cargo.toml beside it) under the automatic pass.
         let free = root.join("free/target");
         tagged_target(&free);
-        let declined = apply_one(&free, true, false);
+        let declined = apply_one(&free, &test_ledger(&root), true, false);
         assert!(matches!(declined, Applied::Skipped { .. }), "{declined:?}");
         assert!(declined.failure().is_none());
 
@@ -3959,7 +5359,7 @@ mod tests {
         std::fs::write(repo.join(".cargo/config.toml"), b"build.jobs = 8\n").unwrap();
         let target = repo.join("target");
         tagged_target(&target);
-        let failed = apply_one(&target, true, false);
+        let failed = apply_one(&target, &test_ledger(&root), true, false);
         let (path, reason) = failed.failure().expect("a failure reports itself");
         assert_eq!(path, target);
         assert!(reason.contains("valid TOML"), "{reason}");
@@ -3967,119 +5367,483 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The shapes a cargo build directory's ignore entry takes — bare, anchored,
+    /// directory-only, both, the slashless glob the aterm checkout carries, and the two
+    /// contents-only forms, which never match the directory and hide it all the same (git
+    /// hides an untracked directory that holds only ignored entries) — each a committed,
+    /// clean git checkout holding its build directory (`target`, or `target-lint` for the
+    /// glob). What each pass leaves is judged against these.
+    #[cfg(target_os = "macos")]
+    const IGNORE_FORMS: [(&str, &str); 7] = [
+        ("target\n", "target"),
+        ("/target\n", "target"),
+        ("target/\n", "target"),
+        ("/target/\n", "target"),
+        ("/target-*\n", "target-lint"),
+        ("target/*\n", "target"),
+        ("/target/**\n", "target"),
+    ];
+
+    /// One checkout per [`IGNORE_FORMS`] row under `root`, its build directory tagged, and
+    /// each with `git status` read: `(repo, build dir, status)`. `None` when git cannot run.
+    #[cfg(target_os = "macos")]
+    fn ignore_form_checkouts(root: &Path) -> Option<Vec<(PathBuf, PathBuf, String)>> {
+        let mut out = Vec::new();
+        for (i, (ignore, name)) in IGNORE_FORMS.iter().enumerate() {
+            let repo = root.join(format!("form{i}"));
+            std::fs::create_dir_all(&repo).unwrap();
+            if !git_fixture(&repo, &["init", "-q", "--template=", "-b", "main"]) {
+                return None;
+            }
+            std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+            std::fs::write(repo.join(".gitignore"), ignore).unwrap();
+            assert!(git_fixture(&repo, &["add", "."]));
+            assert!(git_fixture(&repo, &["commit", "-q", "-m", "fixture"]));
+            let dir = repo.join(name);
+            tagged_target(&dir);
+            let status = git_status(&repo);
+            out.push((repo, dir, status));
+        }
+        Some(out)
+    }
+
+    /// What a pass killed right after its rename leaves: [`apply_one`]'s own `renaming`
+    /// line, with git's answer about the directory, then the rename — and nothing else.
+    #[cfg(target_os = "macos")]
+    fn killed_after_rename(dir: &Path, ledger: &Ledger) {
+        let repo = repo_of(dir).unwrap();
+        let dir_hidden = (pointer_for(Some(&repo)) == Pointer::Symlink)
+            .then(|| git_hides(&repo, dir).ok())
+            .flatten();
+        note_renaming(ledger, dir, &destination(dir).unwrap(), dir_hidden).unwrap();
+        assert!(matches!(
+            migrate(dir, false),
+            Ok(Migration::Migrated { .. })
+        ));
+    }
+
     /// A SIGNAL BETWEEN THE RENAME AND THE LINK LEAVES A REPAIRABLE TREE, AND THE NEXT
-    /// PASS REPAIRS IT. `apply_one` rolls the rename back on every error it can see, but
-    /// a `kill` — which is what the window's *Apply now* does when its deadline expires —
-    /// is not an error it can see. Without the repair the steady state is permanent: the
-    /// next scan reads `target.noindex` as hidden and moves on, cargo recreates a real
-    /// `target`, and that one is indexed and refused forever ("a name in the way").
+    /// PASS REPAIRS IT — BY WHAT THE PASS RECORDED, NEVER BY THE NAME. `apply_one` rolls
+    /// the rename back on every error it can see, but a `kill` — which is what the window's
+    /// *Apply now* does when its deadline expires — is not one. The repair lays the link
+    /// with git's answer about the directory, taken before the rename, so a directory-only
+    /// ignore entry (`target/`, `/target/`) gets the link's own exclude line exactly as an
+    /// uninterrupted migration does, and the tree reads as it did before the pass. A
+    /// `.noindex` directory BORN under that name (the gate's `target-gate.noindex`) is no
+    /// migration at all: the repair read the name, laid `target-gate -> target-gate.noindex`
+    /// (three times on the owner's machine) and turned clean trees into `?? target`. It is
+    /// left exactly as it is. A second pass changes nothing, the ledger included. The
+    /// ledger these kills wrote into opens with a TORN line — what a short write on a full
+    /// disk leaves, cut inside the header's dash — which costs that line alone.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_half_finished_migration_is_relinked_by_the_next_pass() {
         let root = scratch("relink");
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::write(repo.join("Cargo.toml"), b"[package]\nname='x'\n").unwrap();
-        // The state a kill between the two steps leaves: the renamed dir, no link.
-        tagged_target(&repo.join("target.noindex"));
-        assert!(std::fs::symlink_metadata(repo.join("target")).is_err());
+        let ledger = test_ledger(&root);
+        let Some(checkouts) = ignore_form_checkouts(&root) else {
+            eprintln!("git is not runnable here; the fixture is skipped");
+            return;
+        };
+        std::fs::write(
+            ledger.path.as_deref().unwrap(),
+            b"# atpkg noindex ledger v1 \xe2",
+        )
+        .unwrap();
+        let mut original = Vec::new();
+        for (repo, dir, _) in &checkouts {
+            tagged_target(&repo.join("target-born.noindex"));
+            original.push(git_status(repo));
+            killed_after_rename(dir, &ledger);
+        }
 
-        let (outcomes, complete) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        let (outcomes, complete) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, &ledger, false);
         assert!(complete);
+        for ((repo, dir, _), original) in checkouts.iter().zip(&original) {
+            assert_eq!(
+                std::fs::read_link(dir).unwrap(),
+                Path::new(&format!(
+                    "{}.noindex",
+                    dir.file_name().unwrap().to_string_lossy()
+                )),
+                "relative, and to the sibling: {outcomes:?}"
+            );
+            assert_eq!(
+                &git_status(repo),
+                original,
+                "the tree reads as it did before the migration began: {outcomes:?}"
+            );
+            assert!(
+                std::fs::symlink_metadata(repo.join("target-born")).is_err(),
+                "a link was laid beside a directory no pass migrated: {outcomes:?}"
+            );
+        }
         assert_eq!(
             outcomes.iter().filter(|o| o.migrated()).count(),
-            1,
-            "the repair counts as a migration this pass: {outcomes:?}"
+            IGNORE_FORMS.len(),
+            "each repair counts as a migration this pass, and nothing else does: {outcomes:?}"
         );
-        let link = repo.join("target");
-        let meta = std::fs::symlink_metadata(&link).expect("the link is laid again");
-        assert!(meta.file_type().is_symlink(), "{meta:?}");
-        assert_eq!(
-            std::fs::read_link(&link).unwrap(),
-            Path::new("target.noindex"),
-            "relative, and to the sibling"
+        assert!(
+            outcomes.iter().all(|o| o.failure().is_none()),
+            "{outcomes:?}"
         );
 
-        // Idempotent: a second pass finds the link present and does nothing.
-        let (again, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        // Idempotent: a second pass finds every link present and writes nothing.
+        let ledger_once = std::fs::read(ledger.path.as_deref().unwrap()).unwrap();
+        let (again, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, &ledger, false);
+        assert!(again.is_empty(), "{again:?}");
         assert_eq!(
-            again.iter().filter(|o| o.migrated()).count(),
-            0,
-            "{again:?}"
+            std::fs::read(ledger.path.as_deref().unwrap()).unwrap(),
+            ledger_once
         );
-        let _ = std::fs::remove_dir_all(&root);
+        for ((repo, _, _), original) in checkouts.iter().zip(&original) {
+            assert_eq!(&git_status(repo), original);
+        }
     }
 
-    /// The repair is NARROW, and it is the RIGHT repair for each tree. A `.noindex` dir
-    /// whose sibling exists is not this case at all; a tree that is not a git checkout
-    /// points cargo by config, so it is finished by writing that pointer and must still
-    /// never grow a link.
+    /// A CLEANED CHECKOUT IS MIGRATED AGAIN, NEVER LEFT FAILING. `cargo clean` (and `rm -rf
+    /// target`) on `target -> target.noindex` removes the LINK — measured: "Removed 1 file,
+    /// 14B total" — and the build output stays. The pass does not lay the link again (the
+    /// clean stands), and once a build lays a fresh `target/`, it deletes the stale tree
+    /// and migrates the new one, where it used to fail "already exists" on every pass from
+    /// then on. `rm -rf target/` — the slash a shell's completion adds — follows the link
+    /// instead and deletes the directory, leaving a dangling link through which every build
+    /// fails ("Not a directory", measured); the pass makes the directory again — for a
+    /// directory a person migrated by name too, and in a checkout moved since. After every
+    /// step `git status` reads as it did before the first migration, in every ignore form,
+    /// and a pass with nothing to do changes nothing.
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_relink_repair_touches_nothing_else() {
-        let root = scratch("relink-narrow");
-        // (a) a non-git tree: the config pointer's job, not a link's.
-        let plain = root.join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        std::fs::write(plain.join("Cargo.toml"), b"[package]\nname='x'\n").unwrap();
-        tagged_target(&plain.join("target.noindex"));
-        // (b) a git checkout that already has its link.
-        let linked = root.join("linked");
-        std::fs::create_dir_all(linked.join(".git")).unwrap();
-        std::fs::write(linked.join("Cargo.toml"), b"[package]\nname='y'\n").unwrap();
-        tagged_target(&linked.join("target.noindex"));
-        std::os::unix::fs::symlink("target.noindex", linked.join("target")).unwrap();
+    fn a_cleaned_checkout_is_migrated_again_never_left_failing() {
+        let root = scratch("cleaned");
+        let ledger = test_ledger(&root);
+        let Some(checkouts) = ignore_form_checkouts(&root) else {
+            eprintln!("git is not runnable here; the fixture is skipped");
+            return;
+        };
+        let pass = || apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, &ledger, false).0;
+        let clean = |what: &str, outcomes: &[Applied]| {
+            for (repo, _, status) in &checkouts {
+                assert_eq!(&git_status(repo), status, "after {what}: {outcomes:?}");
+            }
+            assert!(
+                outcomes.iter().all(|o| o.failure().is_none()),
+                "after {what}: {outcomes:?}"
+            );
+        };
+        let twin = |dir: &Path| destination(dir).unwrap();
 
-        let (outcomes, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
-        // (a) is repaired, and (b) is whole already — so exactly one repair, and it is (a).
-        let migrated: Vec<&Applied> = outcomes.iter().filter(|o| o.migrated()).collect();
-        assert_eq!(
-            migrated.len(),
-            1,
-            "only (a) has a repair to make: {outcomes:?}"
+        // The directory-only form is migrated first by NAME, as a person types it at a
+        // prompt — relative to where they stand (`aterm pkg noindex apply <dir>`) — and
+        // every step after treats it exactly as it treats the pass's own.
+        let (_, by_name, _) = &checkouts[2];
+        let here = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let mut named: PathBuf = here.components().skip(1).map(|_| "..").collect();
+        named.push(
+            std::fs::canonicalize(by_name)
+                .unwrap()
+                .strip_prefix("/")
+                .unwrap(),
         );
-        assert_eq!(migrated[0].path(), plain.join("target"), "{outcomes:?}");
-        // THE RULING: (a) is repaired by its POINTER. A link is what a git checkout gets,
-        // and a config-pointed tree must never grow one.
+        let out = apply_one(&named, &ledger, false, false);
+        assert!(out.migrated(), "{out:?}");
+        let first = pass();
+        clean("the first migration", &first);
+        assert_eq!(
+            first.iter().filter(|o| o.migrated()).count(),
+            IGNORE_FORMS.len() - 1,
+            "{first:?}"
+        );
+
+        // What `rm -rf target/` does: the directory goes, the link stays.
+        for (_, dir, _) in &checkouts {
+            std::fs::remove_dir_all(twin(dir)).unwrap();
+        }
+        let restored = pass();
+        clean("the restore", &restored);
+        for (_, dir, _) in &checkouts {
+            let row = restored.iter().find(|o| o.path() == dir.as_path());
+            assert!(matches!(row, Some(Applied::Restored { .. })), "{row:?}");
+            assert!(
+                std::fs::metadata(dir).is_ok_and(|m| m.is_dir()),
+                "{restored:?}"
+            );
+        }
+
+        for (_, dir, _) in &checkouts {
+            std::fs::write(twin(dir).join("old-artifact"), b"stale").unwrap();
+            // What `cargo clean` does to the link.
+            std::fs::remove_file(dir).unwrap();
+        }
+
+        // Before the next build: the clean stands — no link is laid again.
+        let cleaned = pass();
+        clean("the clean", &cleaned);
+        assert!(cleaned.is_empty(), "{cleaned:?}");
+        for (_, dir, _) in &checkouts {
+            assert!(std::fs::symlink_metadata(dir).is_err(), "{cleaned:?}");
+        }
+
+        // The next build lays a fresh, indexed directory beside the stale tree.
+        for (_, dir, _) in &checkouts {
+            tagged_target(dir);
+            std::fs::write(dir.join("new-artifact"), b"fresh").unwrap();
+        }
+        let rebuilt = pass();
+        clean("the rebuild", &rebuilt);
+        for (_, dir, _) in &checkouts {
+            let row = rebuilt.iter().find(|o| o.path() == dir.as_path());
+            assert!(
+                matches!(
+                    row,
+                    Some(Applied::Migrated {
+                        discarded: true,
+                        ..
+                    })
+                ),
+                "{row:?}"
+            );
+            assert_eq!(std::fs::read(dir.join("new-artifact")).unwrap(), b"fresh");
+            assert!(
+                !twin(dir).join("old-artifact").exists(),
+                "the stale tree survived"
+            );
+            let left: Vec<_> = std::fs::read_dir(twin(dir))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .filter(|n| n.to_string_lossy().starts_with(DISCARD_PREFIX))
+                .collect();
+            assert!(left.is_empty(), "the stale tree's litter: {left:?}");
+        }
+
+        let ledger_once = std::fs::read(ledger.path.as_deref().unwrap()).unwrap();
+        let last = pass();
+        clean("a pass with nothing to do", &last);
+        assert!(last.is_empty(), "{last:?}");
+        assert_eq!(
+            std::fs::read(ledger.path.as_deref().unwrap()).unwrap(),
+            ledger_once
+        );
+
+        // A checkout RENAMED since (`mv`: the same identities at a new path), then `rm -rf
+        // target/` in it before any pass has seen it there: the pass finds the link the
+        // walk passed by its identity, and the build directory is made again exactly as
+        // in a checkout that never moved.
+        let (repo, dir, status) = &checkouts[0];
+        let moved = repo.with_file_name("moved");
+        std::fs::rename(repo, &moved).unwrap();
+        let moved_dir = moved.join(dir.file_name().unwrap());
+        std::fs::remove_dir_all(twin(&moved_dir)).unwrap();
+        let restored = pass();
         assert!(
-            std::fs::symlink_metadata(plain.join("target")).is_err(),
-            "a config-pointed tree grew a link it does not want"
-        );
-        assert_eq!(
-            std::fs::read_to_string(plain.join(".cargo/config.toml")).unwrap(),
-            "[build]\ntarget-dir = \"target.noindex\"\n",
-            "the interrupted migration's pointer was not written: {outcomes:?}"
-        );
-        assert_eq!(
-            std::fs::read_link(linked.join("target")).unwrap(),
-            Path::new("target.noindex"),
-            "(b)'s link moved"
+            matches!(
+                restored.as_slice(),
+                [Applied::Restored { link, .. }] if *link == moved_dir
+            ),
+            "{restored:?}"
         );
         assert!(
-            !linked.join(".cargo").exists(),
-            "(b) grew a config it does not want"
+            std::fs::metadata(&moved_dir).is_ok_and(|m| m.is_dir()),
+            "the moved checkout's link still dangles: {restored:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(&git_status(&moved), status);
+    }
+
+    /// What a migration from before 2026-10-02 did to `dir`: [`apply_one`]'s own steps, with
+    /// `git check-ignore`'s answer about the directory where [`git_hides`] is asked now, and
+    /// no refusal of a directory git tracks a file under.
+    #[cfg(target_os = "macos")]
+    fn migrated_by_the_old_rule(dir: &Path, ledger: &Ledger) {
+        let repo = repo_of(dir).unwrap();
+        let asked = git_ignores(&repo, dir);
+        let to = destination(dir).unwrap();
+        let mut record = note_renaming(ledger, dir, &to, asked).unwrap();
+        assert!(matches!(
+            migrate(dir, false),
+            Ok(Migration::Migrated { .. })
+        ));
+        link_in_place(&repo, dir, &to, asked).unwrap();
+        record.link = identity(dir);
+        record.stage = Stage::Done;
+        ledger.note(&record).unwrap();
+    }
+
+    /// A TREE THE OLD RULE MIGRATED READS AS IT DID, ONCE THE PASS REPAIRS IT. Until
+    /// 2026-10-02 a migration asked `git check-ignore` about the directory, not what `git
+    /// status` shows for it, and two shapes came out wrong — the owner's machine read `??
+    /// target` three times: under a contents-only entry (`target/*`, `/target/**`) the link
+    /// reads `?? target`, and over a file git tracks it reads ` D target/.gitkeep`. Their
+    /// ledger lines say the same as a directory nothing ignores. The pass asks git again: the
+    /// link gets its own exclude line where status would hide the directory, and the tree
+    /// is moved back where git tracks a file under it — never while a build holds it, and
+    /// finished when a kill stopped it halfway. A link to a directory no entry ignores shows
+    /// as that directory did, and is left alone. A pass with nothing to do changes nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tree_the_old_rule_migrated_reads_as_it_did_once_repaired() {
+        use std::os::unix::io::AsRawFd as _;
+        let root = scratch("old-rule");
+        let ledger = test_ledger(&root);
+        let Some(forms) = ignore_form_checkouts(&root) else {
+            eprintln!("git is not runnable here; the fixture is skipped");
+            return;
+        };
+        // Two checkouts that TRACK a file under target/, and the negative control: one whose
+        // target/ no entry ignores.
+        let checkout = |name: &str, ignore: &str, keep: bool| {
+            let repo = root.join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            assert!(git_fixture(
+                &repo,
+                &["init", "-q", "--template=", "-b", "main"]
+            ));
+            std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"k\"\n").unwrap();
+            std::fs::write(repo.join(".gitignore"), ignore).unwrap();
+            assert!(git_fixture(&repo, &["add", "."]));
+            let dir = repo.join("target");
+            tagged_target(&dir);
+            std::fs::create_dir_all(dir.join("debug")).unwrap();
+            if keep {
+                std::fs::write(dir.join(".gitkeep"), b"").unwrap();
+                assert!(git_fixture(&repo, &["add", "-f", "target/.gitkeep"]));
+            }
+            assert!(git_fixture(&repo, &["commit", "-q", "-m", "fixture"]));
+            let status = git_status(&repo);
+            (repo, dir, status)
+        };
+        let kept = checkout("kept", "target/\n", true);
+        let killed = checkout("killed", "", true);
+        let control = checkout("control", "", false);
+        // A link someone STAGED over the old rule's `?? target` (`git add -A`): the row is
+        // the link's own, git tracks no file under it, and it is theirs to keep or unstage.
+        let staged = checkout("staged", "target/*\n", false);
+        let fixed: Vec<_> = forms.iter().chain([&kept, &killed]).collect();
+        for (_, dir, _) in fixed.iter().copied().chain([&control, &staged]) {
+            migrated_by_the_old_rule(dir, &ledger);
+        }
+        assert!(git_fixture(&staged.0, &["add", "target"]));
+        let staged_rows = git_status(&staged.0);
+        assert_eq!(staged_rows, "A  target\n");
+        for (repo, _, _) in &forms[5..] {
+            assert_eq!(git_status(repo), "?? target\n", "the old rule's row");
+        }
+        assert!(git_status(&kept.0).contains(" D target/.gitkeep\n"));
+        let left = git_status(&control.0);
+        assert_eq!(left, "?? target\n", "the link shows as the directory did");
+
+        // A pass killed while moving `killed` back: its `undoing` line, the link gone.
+        let twin = destination(&killed.1).unwrap();
+        let record = ledger.find(identity(&twin).unwrap()).unwrap();
+        ledger
+            .note(&Record {
+                stage: Stage::Undoing,
+                ..record
+            })
+            .unwrap();
+        std::fs::remove_file(&killed.1).unwrap();
+
+        // A build holds `kept`'s tree through the first pass: it is not moved.
+        let lock = destination(&kept.1).unwrap().join("debug/.cargo-lock");
+        std::fs::write(&lock, "").unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        // SAFETY: flock on an open descriptor owned by this test.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's stand-in build holds cargo's lock and lets go by `release`"
+        )]
+        let taken = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(taken, 0);
+        let pass = || apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, &ledger, false).0;
+        let busy = pass();
+        release(&held);
+        let row = busy.iter().find(|o| o.path() == kept.1);
+        assert!(row.is_some_and(Applied::held_by_build), "{busy:?}");
+        assert!(
+            std::fs::symlink_metadata(&kept.1)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a tree a build holds was moved: {busy:?}"
+        );
+        let then = pass();
+
+        for (repo, _, status) in &fixed {
+            assert_eq!(&git_status(repo), status, "{busy:?}\n{then:?}");
+        }
+        for (_, dir, _) in [&kept, &killed] {
+            assert!(dir.join(".gitkeep").is_file(), "{busy:?}\n{then:?}");
+        }
+        let repaired = |rows: &[Applied]| {
+            rows.iter()
+                .filter(|o| matches!(o, Applied::Repaired { .. }))
+                .count()
+        };
+        assert_eq!(
+            repaired(&busy) + repaired(&then),
+            4,
+            "the two contents-only forms and the two tracked trees: {busy:?}\n{then:?}"
+        );
+        assert!(
+            busy.iter()
+                .chain(&then)
+                .all(|o| o.failure().is_none() && o.path() != control.1),
+            "{busy:?}\n{then:?}"
+        );
+        assert_eq!(git_status(&control.0), left);
+        assert_eq!(git_status(&staged.0), staged_rows, "{busy:?}\n{then:?}");
+        assert!(
+            std::fs::symlink_metadata(&staged.1)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // The control's tree emptied through its link (`rm -rf target/*`, or the empty
+        // directory the pass makes again under a link `rm -rf target/` left dangling): with
+        // nothing in it for a rule to judge, the link is still left as it shows.
+        let emptied = destination(&control.1).unwrap();
+        for entry in std::fs::read_dir(&emptied).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        let ledger_once = std::fs::read(ledger.path.as_deref().unwrap()).unwrap();
+        let last = pass();
+        assert!(
+            last.iter().all(|o| matches!(o, Applied::Skipped { .. })),
+            "only the moved-back trees, refused as today's pass refuses them: {last:?}"
+        );
+        assert_eq!(
+            std::fs::read(ledger.path.as_deref().unwrap()).unwrap(),
+            ledger_once
+        );
+        for (repo, _, status) in &fixed {
+            assert_eq!(&git_status(repo), status);
+        }
+        assert_eq!(git_status(&control.0), left);
     }
 
     /// A HALF-MIGRATED CONFIG-POINTED REPO IS FINISHED BY PASS 1. The kill that
     /// `a_half_finished_migration_is_relinked_by_the_next_pass` repairs in a git checkout
     /// lands here as a renamed directory nothing points cargo at, and the repair is the
     /// pointer the interrupted pass was about to write — never a link, which such a tree
-    /// must not grow (`the_relink_repair_touches_nothing_else`). Every shape that is NOT
-    /// that wedge is left exactly as it was: already pointed, pointed at another disk, a
-    /// git checkout, not yet migrated, and a `target-dir` the user set (named, not
-    /// overwritten).
+    /// must not grow. Every shape that is NOT that wedge is left exactly as it was: already
+    /// pointed, pointed at another disk, a git checkout, not yet migrated, a `target-dir`
+    /// the user set (named, not overwritten), and a `.noindex` directory no pass renamed.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_half_migrated_config_repo_is_finished_by_the_pass() {
         let root = scratch("wedged-config");
+        let ledger = test_ledger(&root);
         // (a) The wedge: renamed, and the config was never written.
         let wedged = root.join("wedged");
         std::fs::create_dir_all(&wedged).unwrap();
         std::fs::write(wedged.join("Cargo.toml"), b"[package]\nname='x'\n").unwrap();
-        tagged_target(&wedged.join("target.noindex"));
+        tagged_target(&wedged.join("target"));
+        killed_after_rename(&wedged.join("target"), &ledger);
         // (b) Healthy, already migrated: the config names the migrated directory, and
         // there is no `target` beside it because a config-pointed tree never grows one.
         let pointed = root.join("pointed");
@@ -4124,9 +5888,16 @@ mod tests {
             b"[build]\ntarget-dir = \"target\"\n",
         )
         .unwrap();
-        tagged_target(&owned.join("target.noindex"));
+        tagged_target(&owned.join("target"));
+        killed_after_rename(&owned.join("target"), &ledger);
+        // (g) A `.noindex` directory BORN under that name, beside no config: no pass renamed
+        // it, so there is nothing to finish, whatever its name says.
+        let born = root.join("born");
+        std::fs::create_dir_all(&born).unwrap();
+        std::fs::write(born.join("Cargo.toml"), b"[package]\nname='t'\n").unwrap();
+        tagged_target(&born.join("target.noindex"));
 
-        let (outcomes, complete) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        let (outcomes, complete) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, &ledger, false);
         assert!(complete);
 
         // (a) IS REPAIRED, and it reports the row an uninterrupted migration reports.
@@ -4142,6 +5913,7 @@ mod tests {
                 from: wedged.join("target"),
                 to: wedged.join("target.noindex"),
                 config: ConfigNote::Written(wedged.join(".cargo/config.toml")),
+                discarded: false,
             },
             "{outcomes:?}"
         );
@@ -4158,7 +5930,7 @@ mod tests {
         assert!(wedged.join("target.noindex").is_dir(), "the orphan moved");
 
         // Idempotent: the second pass reads it as already pointed and does nothing.
-        let (again, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        let (again, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, &ledger, false);
         assert_eq!(
             again
                 .iter()
@@ -4190,7 +5962,7 @@ mod tests {
             "a target-dir the user set was overwritten"
         );
 
-        // (b), (c) and (e) are untouched and unreported.
+        // (b), (c), (e) and (g) are untouched and unreported.
         assert_eq!(
             std::fs::read_to_string(pointed.join(".cargo/config.toml")).unwrap(),
             "[build]\ntarget-dir = \"target.noindex\"\n",
@@ -4214,7 +5986,11 @@ mod tests {
             std::fs::symlink_metadata(elsewhere.join("target")).is_err(),
             "the tree pointed at another disk grew a link"
         );
-        for tree in [&pointed, &git, &elsewhere] {
+        assert!(
+            !born.join(".cargo").exists(),
+            "a config was written for a directory no pass renamed"
+        );
+        for tree in [&pointed, &git, &elsewhere, &born] {
             assert_eq!(
                 outcomes
                     .iter()
@@ -4239,8 +6015,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The read-only refinement's sentence names the hold, says what lifts it, and says
-    /// migrating meanwhile is safe — never the switch's "nothing needs migrating there".
+    /// An unindexed volume is refined by its state: indexing switched off and a read-only
+    /// index are different reasons, and an indexed or unreadable state refines nothing.
     #[test]
     fn the_unindexed_refinement_maps_each_volume_state() {
         use crate::platform::IndexState;
@@ -4257,28 +6033,10 @@ mod tests {
         assert_eq!(refine_unindexed(None, scope), None);
     }
 
-    #[test]
-    fn the_read_only_index_sentence_says_free_space_and_re_run() {
-        let v = Verdict::Unknown(Unmeasured::IndexReadOnly(PathBuf::from("/Users//x")));
-        let s = v.to_string();
-        assert!(s.starts_with("unknown — "), "{s}");
-        assert!(s.contains("read-only") && s.contains("low on space"), "{s}");
-        assert!(
-            s.contains("free space") && s.contains("noindex verify"),
-            "{s}"
-        );
-        assert!(s.contains("migrating meanwhile is safe"), "{s}");
-        assert!(!s.contains("nothing needs migrating"), "{s}");
-        let off = Verdict::Unknown(Unmeasured::IndexingDisabled(PathBuf::from("/Users//x")));
-        assert!(off.to_string().contains("nothing needs migrating there"));
-    }
-
     /// THE DEPTH IS A PROMISE, NOT A TUNING KNOB. The automatic pass walks exactly
     /// [`DOCTOR_DEPTH`] levels, so that constant decides which real repositories the
     /// feature works for — and a cargo workspace puts its members two levels below the
-    /// checkout, which is where this scan was blind until 2026-09-15 (the developer's own
-    /// machine had four such target dirs, 400 MiB, while every surface said "nothing to
-    /// apply"). This pins the shapes that must be reachable AUTOMATICALLY, with the
+    /// checkout. This pins the shapes that must be reachable AUTOMATICALLY, with the
     /// automatic budget, so a future narrowing of the depth fails here instead of in a
     /// user's index.
     #[cfg(target_os = "macos")]
@@ -4710,7 +6468,7 @@ mod tests {
         backdate(&probe, older_than_any_run);
 
         assert!(matches!(
-            apply_one(&link, true, true),
+            apply_one(&link, &test_ledger(&root), true, true),
             Applied::AlreadyExcluded(_)
         ));
         assert!(
@@ -4719,7 +6477,7 @@ mod tests {
         );
 
         assert!(matches!(
-            apply_one(&link, true, false),
+            apply_one(&link, &test_ledger(&root), true, false),
             Applied::AlreadyExcluded(_)
         ));
         assert!(
@@ -5051,8 +6809,7 @@ mod tests {
         if !SUPPORTED {
             return;
         }
-        let tmp = std::env::temp_dir().join(format!("aterm-noindex-skip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = crate::testdir::dir("aterm-noindex-skip-");
         for name in [
             "Documents",
             "Desktop",
@@ -5098,6 +6855,31 @@ mod tests {
         // Named directly, the same folder IS walked — the user asked.
         let named = scan(&tmp.join("Documents"), 4, &Budget::VERB);
         assert!(!named.targets.is_empty(), "a named root is deliberate");
+        // The pass's own repair keeps to the same prune ([`settle_links`]): the link
+        // the pass laid for a directory a person migrated by name under `Documents`, left
+        // over nothing by `rm -rf target/`, is not the unattended pass's to `lstat` or remake.
+        #[cfg(unix)]
+        {
+            let link = tmp.join("Documents").join("proj").join("target");
+            let twin = link.with_file_name("target.noindex");
+            std::fs::remove_dir_all(&link).unwrap();
+            std::os::unix::fs::symlink("target.noindex", &link).unwrap();
+            let ledger = Ledger::at(tmp.join(".noindex.ledger"));
+            ledger
+                .note(&Record {
+                    stage: Stage::Done,
+                    dir: Id { dev: 0, ino: 0 },
+                    link: identity(&link),
+                    dir_hidden: None,
+                    at: twin.clone(),
+                })
+                .unwrap();
+            let (outcomes, _) = apply_under(&tmp, 4, &Budget::VERB, &ledger, false);
+            assert!(
+                std::fs::symlink_metadata(&twin).is_err(),
+                "the automatic pass made a directory inside Documents: {outcomes:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

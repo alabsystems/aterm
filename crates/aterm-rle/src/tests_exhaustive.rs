@@ -55,7 +55,7 @@ fn rle_from_iter_empty() {
     assert_eq!(rle.run_count(), 0);
 }
 
-/// set_range with start > end is a no-op (guard at line 282).
+/// set_range with start > end is a no-op.
 #[test]
 fn rle_set_range_start_greater_than_end() {
     let mut rle = Rle::from_iter([1u8, 2, 3]);
@@ -73,7 +73,7 @@ fn rle_set_range_on_empty() {
     assert!(rle.is_empty());
 }
 
-/// with_value(_, 0) returns empty RLE (early return at line 129).
+/// with_value(_, 0) returns empty RLE.
 #[test]
 fn rle_with_value_zero_length() {
     let rle = Rle::with_value(42u8, 0);

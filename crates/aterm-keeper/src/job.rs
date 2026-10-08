@@ -14,13 +14,11 @@
 //! derived from the executable's path, so they can never collide with the
 //! installed keeper (decision 6).
 //!
-//! [`submit`] is called by `aterm keeper start` (P3, by hand, with this
-//! build's own label or a test one); the window never starts a keeper itself
-//! until P4.
+//! [`submit`] is called by `aterm keeper start` (with this build's own label
+//! or a test one); the window never starts a keeper itself.
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The installed app's keeper label (decision 1).
 pub const INSTALLED_LABEL: &str = "com.aterm.aterm.keeper";
@@ -53,7 +51,7 @@ pub fn place_for(exe: &Path) -> KeeperPlace {
             installed: true,
         };
     }
-    let hash = fnv64(exe.as_os_str().as_encoded_bytes());
+    let hash = aterm_hash::fnv1a_64(exe.as_os_str().as_encoded_bytes());
     let short = format!("{:08x}", (hash >> 32) as u32 ^ hash as u32);
     KeeperPlace {
         label: format!("{DEV_LABEL_PREFIX}.{short}"),
@@ -70,15 +68,6 @@ pub fn own_place() -> KeeperPlace {
         .and_then(|p| p.canonicalize().ok())
         .unwrap_or_default();
     place_for(&exe)
-}
-
-fn fnv64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 /// The per-uid private directory the keeper's socket lives in: `$TMPDIR/aterm`
@@ -187,7 +176,7 @@ pub enum JobState {
 /// `launchctl` failing to run at all.
 #[cfg(unix)]
 pub fn state(label: &str) -> io::Result<JobState> {
-    let out = Command::new("/bin/launchctl")
+    let out = aterm_uds::spawnfd::command("/bin/launchctl")
         .arg("print")
         .arg(format!("{}/{label}", gui_domain()))
         .output()?;
@@ -203,7 +192,9 @@ pub fn state(label: &str) -> io::Result<JobState> {
 }
 
 fn run_launchctl(argv: &[String]) -> io::Result<()> {
-    let out = Command::new("/bin/launchctl").args(argv).output()?;
+    let out = aterm_uds::spawnfd::command("/bin/launchctl")
+        .args(argv)
+        .output()?;
     if out.status.success() {
         Ok(())
     } else {
@@ -341,7 +332,19 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         remove(&label).expect("remove");
-        assert_eq!(state(&label).expect("launchctl"), JobState::Absent, "gone");
+        // launchd drops the job asynchronously too: it stays loaded until its
+        // process has answered the SIGTERM (measured 2026-09-29 at load ~100:
+        // `Loaded { pid }` read straight after `remove`). A minute is a hang
+        // detector.
+        let started = std::time::Instant::now();
+        loop {
+            let now = state(&label).expect("launchctl");
+            if now == JobState::Absent {
+                break;
+            }
+            assert!(started.elapsed().as_secs() < 60, "never gone: {now:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         std::mem::forget(guard);
         // The job's process ends with the job (launchd's SIGTERM).
         let started = std::time::Instant::now();

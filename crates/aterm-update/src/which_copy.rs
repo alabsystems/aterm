@@ -1,49 +1,44 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which copy of aterm ITSELF is running — story S12 of
+//! Which copy of aterm itself is running — story S12 of
 //! `docs/DESIGN-which-copy-runs-2026-08-27.md`.
 //!
-//! `aterm.app` has the same three sources every provisioned program has: a DMG
-//! drag-install, the Homebrew cask (`auto_updates true`: brew never upgrades it), or
-//! `tools/install.sh`. The updater updates the RUNNING bundle's location only; a
-//! second copy elsewhere (`~/Applications`, a Caskroom
-//! leftover) is not its owner and is left alone (`install::trial_owned_by`). So
-//! `aterm --version` and Settings ▸ About name the path of the running copy and, when
-//! another `aterm.app` sits in one of the usual places, say so in ONE sentence — the
-//! same words on both surfaces, spelled here and nowhere else:
+//! The updater replaces only the RUNNING bundle; another `aterm.app` elsewhere
+//! (`~/Applications`, a Caskroom leftover) is left alone (`install::trial_owned_by`).
+//! `aterm --version` and Settings ▸ About name the running copy and any other copy
+//! in the usual places, in the words spelled here and nowhere else:
 //!
 //! ```text
 //! running: /Applications/aterm.app
 //! another copy: /Users//ana/Applications/aterm.app (0.60.0) — the updater leaves it alone
 //! ```
 //!
-//! Reuse, not reimplementation: the running bundle is [`crate::bundle::layout_of`]
-//! (the shape) and [`crate::bundle::resolve_from`] + the dev mark (whether the
-//! updater owns it); "is that candidate the same install?" is the updater's own
-//! [`crate::install::same_install_root`] — the duplicate-copy identity its trial
-//! ownership rule uses — and the other copy's version is
-//! [`crate::manifest::xml_plist_string`] over the bounded `read_ledger_text` reader.
-//! Nothing here spawns a helper: a version read is one small file.
+//! Identity is the updater's own [`crate::install::same_install_root`]; versions are
+//! read with the bounded `read_ledger_text` reader. Nothing here spawns a helper.
 
 use std::path::{Path, PathBuf};
 
-/// WHY a running copy is inert, not merely THAT it is. [`Running::InertApp`]
-/// deliberately collapses three situations the updater treats identically — a
-/// dev-marked build, a launch from a mounted disk image, and an App-Translocated
-/// launch — because the updater's answer to all three is the same: do not touch
-/// it. A person's is not. Two of the three are a mistake they can undo in one
-/// drag, and the third is not a fault at all.
-///
-/// The presentation value is portable so all-host message builders can render
-/// these facts. Only the macOS probe classifies a real bundle; exposing the
-/// enum does not infer an install posture for another platform.
+/// WHY a running copy is inert: [`Running::InertApp`] collapses a dev-marked build,
+/// a mounted-image launch and an App-Translocated launch, which the updater treats
+/// alike but a person does not: two are a mistake one drag undoes, and the third
+/// is no fault at all. Portable so every host can render it; only the
+/// macOS probe classifies a real bundle.
 pub use crate::install_posture::InstallPosture;
 
-/// The real macOS path classification remains platform-specific, shared with
-/// the updater's bundle admission rather than independently reimplemented.
+/// The macOS classification, shared with the updater's bundle admission.
 #[cfg(target_os = "macos")]
 pub use crate::bundle::posture_from;
+
+/// The RUNNING copy's [`InstallPosture`], from its resolved executable path (the
+/// same shim resolution as [`crate::bundle::resolve_layout`]); `None` when that path
+/// cannot be read.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn running_posture() -> Option<InstallPosture> {
+    let exe = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+    Some(posture_from(&exe))
+}
 
 /// What the running copy IS — decides whether the other-copy clause ("the updater
 /// leaves it alone") may be made at all.
@@ -143,12 +138,10 @@ fn observe_from(exe: &Path) -> WhichCopy {
     survey(exe, &usual_app_locations())
 }
 
-/// What kind of copy THIS process runs from — [`observe`]'s `kind` alone, without
-/// probing the usual places for other copies: one canonicalize and, for a bundle,
-/// one bounded `Info.plist` read. For a caller that must decide at launch whether
-/// it is the installed app (the crash marker's owner — `aterm-gui`'s
-/// `crash_signal::Arming`), where [`observe`]'s directory probes are work nobody
-/// asked for. [`Running::Binary`] when the executable path is unknown.
+/// [`observe`]'s `kind` alone, without probing for other copies: one canonicalize
+/// and, for a bundle, one bounded `Info.plist` read. For a launch-time caller
+/// (`aterm-gui`'s `crash_signal::Arming`). [`Running::Binary`] when the executable
+/// path is unknown.
 #[must_use]
 pub fn running_kind() -> Running {
     let Ok(exe) = std::env::current_exe() else {

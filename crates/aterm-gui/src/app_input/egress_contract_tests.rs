@@ -21,6 +21,11 @@ use super::paste_order;
 use crate::input::{Delivery, Egress, InputEvent, InputOutcome, PasteFraming, Source};
 use crate::{App, WindowId};
 use aterm_session::sink::{BulkMeter, BulkState, SinkWriter};
+// How long every test here waits for what MUST happen — the accepted bytes,
+// the drained spill, the retyped key, a paste reaching `Writing`, a sever
+// releasing its writer, a reply read back: a hang detector, never a latency
+// budget.
+use aterm_spec::wait::MUST_HAPPEN;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -42,13 +47,33 @@ fn fill(fd: i32) -> usize {
     filled
 }
 
+/// Write 4097-byte frames into `sink`'s spill until its cap refuses one, each
+/// accepted whole; returns the accepted frames, in order. Upper case: nothing
+/// accepted may look like a key a test refuses (`k`).
+fn fill_spill(sink: &SinkWriter) -> Vec<Vec<u8>> {
+    let mut accepted: Vec<Vec<u8>> = Vec::new();
+    for i in 0usize.. {
+        let frame = vec![b'A' + (i % 26) as u8; 4097];
+        match sink.write_frame_interactive_with_receipt(&frame) {
+            Ok(receipt) => {
+                assert_eq!(receipt.accepted(), frame.len());
+                accepted.push(frame);
+            }
+            Err(error) => {
+                assert!(error.is_refused(), "only the cap refuses: {error}");
+                break;
+            }
+        }
+        assert!(i < 1024, "the cap never refused");
+    }
+    accepted
+}
+
 /// A sink over one end of a socketpair in the production master's shape
 /// (`O_NONBLOCK`, declared), filled solid: a program that stopped reading.
 fn wedged_socket() -> (Arc<SinkWriter>, UnixStream, usize) {
     let (reader, writer) = UnixStream::pair().expect("socketpair");
-    reader
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("timeout");
+    reader.set_read_timeout(Some(MUST_HAPPEN)).expect("timeout");
     writer.set_nonblocking(true).expect("nonblocking master");
     let filled = fill(writer.as_raw_fd());
     let owned: std::os::fd::OwnedFd = writer.into();
@@ -57,22 +82,9 @@ fn wedged_socket() -> (Arc<SinkWriter>, UnixStream, usize) {
     (sink, reader, filled)
 }
 
-/// How long every test here waits for what MUST happen — the accepted bytes,
-/// the drained spill, the retyped key, a paste reaching `Writing`, a sever
-/// releasing its writer, a reply read back: a hang detector, never a latency
-/// budget.
-const MUST_HAPPEN: Duration = Duration::from_secs(60);
-
 /// Poll `done` until it holds or `limit` passes.
 fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + limit;
-    while Instant::now() < deadline {
-        if done() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    done()
+    aterm_spec::wait::within(limit, Duration::from_millis(2), || done().then_some(())).is_some()
 }
 
 /// THE PARK WITNESS for the never-parks tests: a thread that reads the
@@ -155,12 +167,22 @@ fn read_until(fd: i32, want: usize) -> Vec<u8> {
     got
 }
 
-/// Close a fixture's pipe. The sink over `pipe[1]` BORROWS the fd, so call
-/// this only once that sink's ordered writer has nothing admitted
-/// (`ordered_egress_count() == 0`): a queued job keeps the sink — and its
-/// serializer's registry entry, keyed by this fd number — alive after the
-/// close, and the next `pipe()` may be handed the number.
-fn close_pipe(pipe: [i32; 2]) {
+/// Close a fixture's pipe, taking the test's last handle on its sink. The
+/// sink over `pipe[1]` BORROWS the fd, and every job its ordered writer
+/// admitted holds a clone that keeps its serializer registered, live, under
+/// this fd number; closed under such a job, the number can go to the next
+/// fixture's `pipe()`, whose jobs then reach this serializer. A reader can see a
+/// queued report's bytes before the writer thread drops its job, and
+/// `ordered_egress_count() == 0` comes a few instructions early
+/// (`Reservation::drop` retires the count before its `sink` clone drops), so
+/// this waits until `sink` is the last clone. Drop the app first: its session
+/// holds one.
+fn close_pipe(sink: Arc<SinkWriter>, pipe: [i32; 2]) {
+    assert!(
+        wait_until(MUST_HAPPEN, || Arc::strong_count(&sink) == 1),
+        "the ordered writer released every job holding the sink"
+    );
+    drop(sink);
     unsafe {
         libc::close(pipe[0]);
         libc::close(pipe[1]);
@@ -187,22 +209,7 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     let filled = fill(pipe[1]);
     // Earlier input filled the spill to its cap (the program has not read
     // any of it).
-    let mut accepted: Vec<Vec<u8>> = Vec::new();
-    for i in 0usize.. {
-        // Upper case: nothing accepted may look like the refused `k`.
-        let frame = vec![b'A' + (i % 26) as u8; 4097];
-        match sink.write_frame_interactive_with_receipt(&frame) {
-            Ok(receipt) => {
-                assert_eq!(receipt.accepted(), frame.len());
-                accepted.push(frame);
-            }
-            Err(error) => {
-                assert!(error.is_refused(), "only the cap refuses: {error}");
-                break;
-            }
-        }
-        assert!(i < 1024, "the cap never refused");
-    }
+    let accepted = fill_spill(&sink);
 
     let done = Arc::new(AtomicBool::new(false));
     let watchdog = park_witness(pipe[0], Arc::clone(&done));
@@ -278,8 +285,7 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     }));
     assert_eq!(z, b"z");
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// REPEATED MAXIMUM PASTES PLATEAU, AND TEARDOWN UNBLOCKS EVERY WAITER. Into
@@ -295,7 +301,7 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
 /// still parked.
 #[test]
 fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
-    let (app, _app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
+    let (app, app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
     let (sink, _reader, _filled) = wedged_socket();
     let paste = || {
         InputEvent::Paste(
@@ -349,7 +355,7 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
         "every admitted byte came back"
     );
     drop(app);
-    close_pipe(pipe);
+    close_pipe(app_sink, pipe);
 }
 
 /// TERMINAL REPLIES STAY WHOLLY OUTSIDE A PASTE'S ENVELOPE, before and
@@ -361,7 +367,7 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
 /// paste and the key through the real ordered writer.
 #[test]
 fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
-    let (app, _app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
+    let (app, app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
     let (reader, writer) = UnixStream::pair().expect("socketpair");
     // Every read below is of bytes that must arrive: a hang detector.
     reader.set_read_timeout(Some(MUST_HAPPEN)).expect("timeout");
@@ -433,7 +439,7 @@ fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
         "the reply writer ends with its lane and sink"
     );
     drop(app);
-    close_pipe(pipe);
+    close_pipe(app_sink, pipe);
 }
 
 /// THE WINDOWS ARM, ON UNIX: ConPTY has no non-blocking write, so there every
@@ -494,8 +500,7 @@ fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
     );
     drop(mirror);
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// A KEY THAT WAITED BEHIND A PASTE ARMS THE ECHO CLOCK AT ITS OWN WRITE
@@ -542,8 +547,7 @@ fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
     );
     drop(pin);
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// CLOSING THE TAB IS THE TEARDOWN: `Session::drop` severs the session's
@@ -595,8 +599,7 @@ fn closing_the_session_releases_its_parked_writer_and_queued_input() {
     );
     assert_eq!(paste_order::admitted_for_test(&sink), (0, 0));
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// A REPLY FLOOD PLATEAUS TOO. A program that floods queries it never reads
@@ -715,8 +718,7 @@ fn the_conpty_route_sends_every_report_through_the_ordered_writer() {
     );
     drop(mirror);
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// A REPORT WAITS BEHIND WHAT WAS QUEUED BEFORE IT (2026-09-26), as a key
@@ -783,8 +785,7 @@ fn a_mouse_report_waits_behind_the_pastes_queued_before_it() {
     );
     assert_eq!(&tail[a.len() + b.len()..], report, "the click last");
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// Set `app` up so its next [`App::recompute_focus_reports`] sends `ESC[I` to
@@ -857,8 +858,7 @@ fn a_tab_switch_focus_report_waits_behind_the_pastes_queued_before_it() {
     );
     assert_eq!(&tail[a.len() + b.len()..], report, "the report last");
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// THE WINDOWS ARM OF A TAB SWITCH'S FOCUS REPORT, ON UNIX: on ConPTY the
@@ -896,8 +896,7 @@ fn a_tab_switch_focus_report_takes_the_conpty_route() {
     );
     drop(hold);
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// A MOTION FLOOD BEHIND A PASTE NEVER REFUSES A KEY (2026-09-26 review).
@@ -990,8 +989,7 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     );
     drop(mirror);
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }
 
 /// A SINK'S ADMISSION IS ITS OWN, NEVER AN FD-NUMBER TWIN'S (2026-09-27).
@@ -1055,8 +1053,7 @@ fn a_sinks_admission_never_reads_an_fd_number_twins_serializer() {
     assert_eq!(paste_order::admitted_for_test(&owner), (0, 0));
     drop(twin);
     drop(app);
-    drop(owner);
-    close_pipe(pipe);
+    close_pipe(owner, pipe);
 }
 
 /// AN OS APPEARANCE CHANGE NEVER PARKS THE UI THREAD (2026-09-26 review).
@@ -1081,21 +1078,7 @@ fn an_os_appearance_change_into_a_stalled_program_never_parks_the_ui_thread() {
         let mirror = app.front_terminal_mirror(WindowId(0)).expect("terminal");
         crate::term_lock(&mirror.term).process(b"\x1b[?2031h");
     }
-    let mut accepted: Vec<Vec<u8>> = Vec::new();
-    for i in 0usize.. {
-        let frame = vec![b'A' + (i % 26) as u8; 4097];
-        match sink.write_frame_interactive_with_receipt(&frame) {
-            Ok(receipt) => {
-                assert_eq!(receipt.accepted(), frame.len());
-                accepted.push(frame);
-            }
-            Err(error) => {
-                assert!(error.is_refused(), "only the cap refuses: {error}");
-                break;
-            }
-        }
-        assert!(i < 1024, "the cap never refused");
-    }
+    let accepted = fill_spill(&sink);
 
     let done = Arc::new(AtomicBool::new(false));
     let watchdog = park_witness(pipe[0], Arc::clone(&done));
@@ -1118,6 +1101,5 @@ fn an_os_appearance_change_into_a_stalled_program_never_parks_the_ui_thread() {
         at += frame.len();
     }
     drop(app);
-    drop(sink);
-    close_pipe(pipe);
+    close_pipe(sink, pipe);
 }

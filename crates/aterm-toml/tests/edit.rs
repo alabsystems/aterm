@@ -5,11 +5,9 @@
 //!
 //! Two consumers define that surface: the Preferences window's non-destructive
 //! save (`prefs::apply_prefs_edits`), and the config editor's diagnostics
-//! (`native_config_language`, which walks the tree and underlines spans). Each
-//! operation below is checked against `toml_edit` doing the same thing, so the
-//! swap is behaviour-preserving and not merely compiling.
+//! (`native_config_language`, which walks the tree and underlines spans).
 
-use aterm_toml::edit::{DocumentMut, Item, Key, Table, Value};
+use aterm_toml::edit::{DocumentMut, Item, Key, Table, TableLike, Value};
 
 const CONFIG: &str = "\
 # aterm configuration
@@ -29,8 +27,21 @@ keys = \"ctrl+c\"
 #[test]
 fn a_non_destructive_edit_keeps_every_other_byte() {
     let ours = edit_ours(CONFIG);
-    let theirs = edit_theirs(CONFIG);
-    assert_eq!(ours, theirs, "our edit differs from toml_edit's");
+    assert_eq!(
+        ours,
+        "\
+# aterm configuration
+font_px = 18.0  # cozy
+
+# networking
+[net]
+listen = \"0.0.0.0:9999\"  # local only
+timeout_ms = 500
+
+[[keybind]]
+keys = \"ctrl+c\"
+"
+    );
 
     assert!(
         ours.contains("# aterm configuration"),
@@ -134,75 +145,107 @@ fn set_nested_ours(doc: &mut DocumentMut, path: &[&str], mut item: Item) {
     table.insert(leaf, item);
 }
 
-fn edit_theirs(source: &str) -> String {
-    let mut doc: toml_edit::DocumentMut = source.parse().expect("parse");
+/// A removed line takes its own text, same-line comment included, and nothing
+/// else: the comment and blank lines written above it stay where they were.
+/// `rain.on` lives in the `rain` table but prints among the root's lines;
+/// `port` is `[net]`'s last line, and its comment stays under `[net]` although
+/// the same edit adds a table that prints right after it.
+#[test]
+fn a_removed_line_keeps_the_comment_lines_above_it() {
+    let mut doc: DocumentMut = "\
+# rain
+rain.on = true  # bright
+font_px = 12.0
 
-    let mut item = toml_edit::Item::Value(toml_edit::Value::from(18.0));
-    adopt_theirs(doc.get("font_px"), &mut item);
-    doc["font_px"] = item;
+[net]
+listen = \"x\"
+# old port
+port = 1
 
-    doc.remove("blink");
-
-    set_nested_theirs(
+[ui]
+a = 1
+"
+    .parse()
+    .expect("parse");
+    assert!(doc.remove_path(&["rain", "on"]).is_some());
+    assert!(doc.remove_path(&["net", "port"]).is_some());
+    set_nested_ours(
         &mut doc,
-        &["net", "listen"],
-        toml_edit::Item::Value(toml_edit::Value::from("0.0.0.0:9999")),
+        &["net", "extra", "k"],
+        Item::Value(Value::from(1i64)),
     );
-    set_nested_theirs(
-        &mut doc,
-        &["net", "timeout_ms"],
-        toml_edit::Item::Value(toml_edit::Value::from(500i64)),
-    );
+    assert_eq!(
+        doc.to_string(),
+        "\
+# rain
+font_px = 12.0
 
-    doc.to_string()
+[net]
+listen = \"x\"
+# old port
+
+[net.extra]
+k = 1
+
+[ui]
+a = 1
+"
+    );
 }
 
-fn adopt_theirs(old: Option<&toml_edit::Item>, new: &mut toml_edit::Item) {
-    let Some(old) = old.and_then(toml_edit::Item::as_value) else {
-        return;
-    };
-    let Some(new) = new.as_value_mut() else {
-        return;
-    };
-    let decor = old.decor().clone();
-    if let Some(prefix) = decor.prefix() {
-        new.decor_mut().set_prefix(prefix.clone());
+/// A leading byte-order mark is the file's, so it stays first whatever an edit
+/// removes or adds. The edits are Settings' Reset then Undo, which reads the
+/// reset file back before writing the key again, and the retired
+/// `packages.auto_update` spelling giving way to `packages.enabled`. Carried
+/// on the first line's text, the mark followed that text below the key the
+/// edit added, where it does not parse, or went with the first line itself.
+#[test]
+fn a_byte_order_mark_stays_first() {
+    fn print(doc: &DocumentMut) -> String {
+        let text = doc.to_string();
+        aterm_toml::from_str::<aterm_toml::Value>(&text).expect("it still parses");
+        text
     }
-    if let Some(suffix) = decor.suffix() {
-        new.decor_mut().set_suffix(suffix.clone());
-    }
-}
+    let mut doc: DocumentMut = "\u{feff}font_px = 14.0\nx = 1\n".parse().expect("parse");
+    assert!(doc.remove("font_px").is_some());
+    assert_eq!(print(&doc), "\u{feff}x = 1\n");
 
-fn set_nested_theirs(doc: &mut toml_edit::DocumentMut, path: &[&str], mut item: toml_edit::Item) {
-    let (leaf, tables) = path.split_last().expect("a path has segments");
-    let mut cur: &mut toml_edit::Item = doc.as_item_mut();
-    for part in tables {
-        let table = cur.as_table_like_mut().expect("a table on the way down");
-        if table.get(part).is_none_or(toml_edit::Item::is_none) {
-            let mut fresh = toml_edit::Table::new();
-            fresh.set_implicit(true);
-            table.insert(part, toml_edit::Item::Table(fresh));
-        }
-        cur = table.get_mut(part).expect("just ensured present");
-    }
-    let table = cur
-        .as_table_like_mut()
-        .expect("the leaf's parent is a table");
-    adopt_theirs(table.get(leaf), &mut item);
-    table.insert(leaf, item);
+    let mut doc: DocumentMut =
+        "\u{feff}# my aterm settings\nfont_px = 14.0\n\n[update]\nenabled = false\n"
+            .parse()
+            .expect("parse");
+    assert!(doc.remove("font_px").is_some());
+    let reset = print(&doc);
+    assert_eq!(
+        reset,
+        "\u{feff}# my aterm settings\n\n[update]\nenabled = false\n"
+    );
+    let mut doc: DocumentMut = reset.parse().expect("parse");
+    doc["font_px"] = Item::Value(Value::from(14.0));
+    assert_eq!(
+        print(&doc),
+        "\u{feff}font_px = 14.0\n# my aterm settings\n\n[update]\nenabled = false\n"
+    );
+
+    let mut doc: DocumentMut = "\u{feff}# pkgs\npackages.auto_update = false\n[update]\n"
+        .parse()
+        .expect("parse");
+    set_nested_ours(
+        &mut doc,
+        &["packages", "enabled"],
+        Item::Value(Value::from(true)),
+    );
+    assert!(doc.remove_path(&["packages", "auto_update"]).is_some());
+    assert_eq!(
+        print(&doc),
+        "\u{feff}packages.enabled = true\n# pkgs\n[update]\n"
+    );
 }
 
 /// The diagnostics surface: a dotted lookup, and a span that points at the
 /// authored token.
 ///
-/// This is the one place the replacement is strictly MORE capable than the
-/// crate it replaces, and the difference is measured here rather than claimed.
-/// `str::parse::<toml_edit::DocumentMut>()` parses into an immutable document
-/// and then despans it on the way to the mutable one, so EVERY `Item::span()`
-/// on a `toml_edit::DocumentMut` is `None` — which is why
-/// `native_config_language` carries a hand-rolled `source_value_range` that
-/// re-finds tokens in the source text. This crate keeps spans on the mutable
-/// document, so that fallback stops being load-bearing.
+/// Spans survive on the mutable document.
 #[test]
 fn a_dotted_lookup_finds_the_value_and_keeps_its_span() {
     let doc: DocumentMut = CONFIG.parse().expect("parse");
@@ -216,15 +259,6 @@ fn a_dotted_lookup_finds_the_value_and_keeps_its_span() {
     assert_eq!(&CONFIG[font.span().expect("span")], "12.0");
     let table = doc.get("net").and_then(Item::as_table).expect("[net]");
     assert_eq!(&CONFIG[table.span().expect("a header has a span")], "[net]");
-
-    // The same walk over the oracle finds the same VALUE and no span at all.
-    let theirs: toml_edit::DocumentMut = CONFIG.parse().expect("parse");
-    let their_item = dotted_item_theirs(&theirs, "net.listen").expect("the oracle finds it too");
-    assert_eq!(their_item.as_str(), item.as_str(), "the values must agree");
-    assert!(
-        their_item.span().is_none(),
-        "toml_edit 0.22 despans DocumentMut; if that changed, revisit this note"
-    );
 
     assert_eq!(
         dotted_item(&doc, "font_px").and_then(Item::as_float),
@@ -246,43 +280,25 @@ fn dotted_item<'a>(doc: &'a DocumentMut, key: &str) -> Option<&'a Item> {
     Some(item)
 }
 
-fn dotted_item_theirs<'a>(
-    doc: &'a toml_edit::DocumentMut,
-    key: &str,
-) -> Option<&'a toml_edit::Item> {
-    let mut item = doc.as_item();
-    for segment in toml_edit::Key::parse(key).ok()? {
-        item = item.as_table_like()?.get(segment.get())?;
-    }
-    Some(item)
-}
-
 /// `Key::parse` is a parser, not a `split('.')`: a dot inside a quoted segment
 /// is part of the name.
 #[test]
-fn key_parsing_and_canonical_spelling_match_the_oracle() {
-    for expression in [
-        "a",
-        "a.b.c",
-        " a . b ",
-        "\"quoted key\"",
-        "site.\"google.com\"",
-        "'literal.key'.tail",
-        "1234",
+fn key_parsing_and_canonical_spelling() {
+    for (expression, segments) in [
+        ("a", &["a"][..]),
+        ("a.b.c", &["a", "b", "c"]),
+        (" a . b ", &["a", "b"]),
+        ("\"quoted key\"", &["quoted key"]),
+        ("site.\"google.com\"", &["site", "google.com"]),
+        ("'literal.key'.tail", &["literal.key", "tail"]),
+        ("1234", &["1234"]),
     ] {
         let ours = Key::parse(expression).unwrap_or_else(|e| panic!("{expression:?}: {e}"));
-        let theirs = toml_edit::Key::parse(expression)
-            .unwrap_or_else(|e| panic!("oracle {expression:?}: {e}"));
         let ours: Vec<&str> = ours.iter().map(Key::get).collect();
-        let theirs: Vec<&str> = theirs.iter().map(toml_edit::Key::get).collect();
-        assert_eq!(ours, theirs, "{expression:?}");
+        assert_eq!(ours, segments, "{expression:?}");
     }
     for bad in ["a.", ".a", "a..b", "a b", "", "a.'unterminated"] {
         assert!(Key::parse(bad).is_err(), "{bad:?} is not a key expression");
-        assert!(
-            toml_edit::Key::parse(bad).is_err(),
-            "the oracle accepts {bad:?}"
-        );
     }
 
     // The canonical escaped spelling, used to build config key paths.
@@ -293,14 +309,13 @@ fn key_parsing_and_canonical_spelling_match_the_oracle() {
         ("", "\"\""),
     ] {
         assert_eq!(Key::new(raw).to_string(), spelled);
-        assert_eq!(toml_edit::Key::new(raw).to_string(), spelled);
     }
 }
 
 /// The tree-walking surface: every arm of `Item`, both table spellings, and the
 /// type names diagnostics print.
 #[test]
-fn the_walking_surface_reports_what_the_oracle_reports() {
+fn the_walking_surface() {
     let source = "\
 scalar = 1
 arr = [\"a\", \"b\"]
@@ -377,20 +392,6 @@ k = 2
         3
     );
 
-    // Type names, as printed in diagnostics.
-    let theirs: toml_edit::DocumentMut = source.parse().expect("parse");
-    for key in ["scalar", "arr", "inline", "explicit", "aot"] {
-        let ours = doc.get(key).expect("present");
-        let their = theirs.get(key).expect("present");
-        let same_kind = match (ours, their) {
-            (Item::Value(a), toml_edit::Item::Value(b)) => a.type_name() == b.type_name(),
-            (Item::Table(_), toml_edit::Item::Table(_)) => true,
-            (Item::ArrayOfTables(_), toml_edit::Item::ArrayOfTables(_)) => true,
-            _ => false,
-        };
-        assert!(same_kind, "{key}: kinds disagree");
-    }
-
     // Top-level iteration order is the authored order.
     let keys: Vec<&str> = doc.iter().map(|(k, _)| k).collect();
     assert_eq!(
@@ -450,15 +451,11 @@ fn a_document_built_by_hand_prints_legal_toml() {
 
 /// `Value::from_str` — the surface `native_settings` counts a list with.
 ///
-/// Its contract is STRICT, and that was measured rather than assumed: the
-/// oracle refuses ` 1 `, `1\n`, `# c\n1` and `1 # c`. A value is the whole
-/// input or the input is not a value. Both implementations are asserted here,
-/// so the day the oracle changes its mind this test says so instead of
-/// silently blessing a divergence.
+/// Its contract is STRICT: a value is the whole input or the input is not a
+/// value (` 1 `, `1\n`, `# c\n1` and `1 # c` are all refused).
 #[test]
-fn a_standalone_value_parses_exactly_as_toml_edit_parses_it() {
-    const CASES: &[&str] = &[
-        // Accepted by both.
+fn a_standalone_value_is_the_whole_input() {
+    const ACCEPTED: &[&str] = &[
         "1",
         "-0",
         "1.5",
@@ -476,66 +473,40 @@ fn a_standalone_value_parses_exactly_as_toml_edit_parses_it() {
         "1979-05-27",
         "1979-05-27T07:32:00Z",
         "07:32:00",
-        // Refused by both — trivia is not part of a value.
-        " 1 ",
-        "1\n",
-        "\n1",
-        "# c\n1",
-        "1 # c",
-        "1 # c\n",
-        "\t[1]\t",
-        "[1]\n\n",
-        "",
-        "  ",
-        // Refused by both — not one value.
-        "1 2",
-        "a = 1",
-        "1\nx = 2",
-        "[1,",
-        "{ a = 1",
+    ];
+    const REFUSED: &[&str] = &[
+        // Trivia is not part of a value.
+        " 1 ", "1\n", "\n1", "# c\n1", "1 # c", "1 # c\n", "\t[1]\t", "[1]\n\n", "", "  ",
+        // Not one value.
+        "1 2", "a = 1", "1\nx = 2", "[1,", "{ a = 1",
     ];
 
-    for case in CASES {
-        let ours = case.parse::<Value>();
-        let theirs = case.parse::<toml_edit::Value>();
+    for case in ACCEPTED {
+        let ours = case
+            .parse::<Value>()
+            .unwrap_or_else(|e| panic!("{case:?}: {e}"));
         assert_eq!(
-            ours.is_ok(),
-            theirs.is_ok(),
-            "verdict differs on {case:?}: ours={:?} toml_edit={:?}",
-            ours.as_ref()
-                .map(ToString::to_string)
-                .map_err(ToString::to_string),
-            theirs
-                .as_ref()
-                .map(ToString::to_string)
-                .map_err(ToString::to_string),
+            ours.to_string(),
+            *case,
+            "a standalone value must print back byte-for-byte: {case:?}"
         );
-        if let (Ok(ours), Ok(theirs)) = (&ours, &theirs) {
-            assert_eq!(
-                ours.to_string(),
-                theirs.to_string(),
-                "rendering differs on {case:?}"
-            );
-            assert_eq!(
-                ours.to_string(),
-                *case,
-                "a standalone value must print back byte-for-byte: {case:?}"
-            );
-        }
-        if let Err(e) = &ours {
-            let span = e.span().expect("a refusal carries a span");
-            assert!(
-                span.start <= case.len() && span.end <= case.len(),
-                "span {span:?} is outside {case:?}"
-            );
-        }
+    }
+    for case in REFUSED {
+        let e = case
+            .parse::<Value>()
+            .expect_err(&format!("{case:?} is not a value"));
+        let span = e.span().expect("a refusal carries a span");
+        assert!(
+            span.start <= case.len() && span.end <= case.len(),
+            "span {span:?} is outside {case:?}"
+        );
     }
 }
 
 /// `Item::is_*` — the predicates `native_config_language` types a setting with.
-/// Every kind, against the oracle, in both polarities.
+/// Every kind, in both polarities.
 #[test]
-fn item_kind_predicates_agree_with_toml_edit() {
+fn item_kind_predicates() {
     const SOURCE: &str = "\
 s = \"x\"
 i = 1
@@ -552,16 +523,24 @@ k = 1
 k = 1
 ";
     let ours: DocumentMut = SOURCE.parse().expect("parse");
-    let theirs: toml_edit::DocumentMut = SOURCE.parse().expect("oracle parses");
 
-    // NOT "absent": indexing a key that is not there is the one place these
-    // two disagree, and deliberately. `toml_edit` panics; `Item::None` is this
-    // crate's vacant state, so `doc["absent"]` yields a place to write. That is
-    // asserted below rather than smuggled past the comparison.
-    for key in ["s", "i", "f", "b", "d", "arr", "inline", "table", "aot"] {
+    // Columns: none, value, str, integer, float, bool, datetime, array, table,
+    // table_like, array_of_tables.
+    const F: bool = false;
+    const T: bool = true;
+    for (key, expected) in [
+        ("s", [F, T, T, F, F, F, F, F, F, F, F]),
+        ("i", [F, T, F, T, F, F, F, F, F, F, F]),
+        ("f", [F, T, F, F, T, F, F, F, F, F, F]),
+        ("b", [F, T, F, F, F, T, F, F, F, F, F]),
+        ("d", [F, T, F, F, F, F, T, F, F, F, F]),
+        ("arr", [F, T, F, F, F, F, F, T, F, F, F]),
+        ("inline", [F, T, F, F, F, F, F, F, F, T, F]),
+        ("table", [F, F, F, F, F, F, F, F, T, T, F]),
+        ("aot", [F, F, F, F, F, F, F, F, F, F, T]),
+    ] {
         let a = &ours[key];
-        let b = &theirs[key];
-        let ours_kinds = [
+        let kinds = [
             a.is_none(),
             a.is_value(),
             a.is_str(),
@@ -574,35 +553,188 @@ k = 1
             a.is_table_like(),
             a.is_array_of_tables(),
         ];
-        let their_kinds = [
-            b.is_none(),
-            b.is_value(),
-            b.is_str(),
-            b.is_integer(),
-            b.is_float(),
-            b.is_bool(),
-            b.is_datetime(),
-            b.is_array(),
-            b.is_table(),
-            b.is_table_like(),
-            b.is_array_of_tables(),
-        ];
-        assert_eq!(
-            ours_kinds, their_kinds,
-            "the kind predicates disagree for `{key}`"
-        );
+        assert_eq!(kinds, expected, "the kind predicates for `{key}`");
     }
 
-    // The divergence, pinned in both directions so it cannot drift unnoticed.
+    // Indexing a missing key yields the vacant entry, a place to write.
     let vacant = &ours["absent"];
     assert!(vacant.is_none(), "a missing key is the vacant entry");
     assert!(!vacant.is_value() && !vacant.is_str() && !vacant.is_table_like());
-    assert!(
-        std::panic::catch_unwind(|| {
-            let theirs: toml_edit::DocumentMut = SOURCE.parse().expect("oracle parses");
-            let _ = theirs["absent"].is_none();
-        })
-        .is_err(),
-        "toml_edit is expected to panic here — if it stopped, this divergence is gone"
+}
+
+/// A file saved without a final newline (VS Code's default) ends on a line
+/// whose terminator is missing, so a line added after it must start a line of
+/// its own: glued on, `a = 1` + `b` printed `a = 1b = 2`, which does not parse,
+/// and `a = 1 # note` + `b` printed `a = 1 # noteb = 2`, which parses with `b`
+/// inside the comment.
+///
+/// Each case prints back unedited byte-for-byte, keeps every source byte
+/// through the edit, parses back, and has both the old key and the new one.
+#[test]
+fn a_key_added_after_an_unterminated_final_line_starts_its_own_line() {
+    // (source, path of the new key, path of a key the source already had)
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        ("a = 1", &["b"], &["a"]),
+        ("a = 1 # note", &["b"], &["a"]),
+        ("theme = \"dark\" # my fav", &["cursor_blink"], &["theme"]),
+        ("[t]\nx = 1 # c", &["t", "y"], &["t", "x"]),
+        (
+            "[net]\nlisten = \"x\"",
+            &["net", "timeout_ms"],
+            &["net", "listen"],
+        ),
+        ("a = 1\r\nb = 2", &["c"], &["b"]),
+        ("[t]", &["t", "x"], &[]),
+        ("[t] # c", &["t", "x"], &[]),
+    ];
+    for &(source, new, old) in cases {
+        let mut doc: DocumentMut = source.parse().expect("parse");
+        assert_eq!(
+            doc.to_string(),
+            source,
+            "unedited, the document is the source"
+        );
+        set_nested_ours(&mut doc, new, Item::Value(Value::from(7i64)));
+        let printed = doc.to_string();
+        assert!(
+            printed.starts_with(source),
+            "the source's bytes changed: {source:?} printed {printed:?}"
+        );
+
+        let value: aterm_toml::Value = aterm_toml::from_str(&printed)
+            .unwrap_or_else(|e| panic!("{source:?} printed {printed:?}, which is not TOML: {e}"));
+        let lookup = |path: &[&str]| path.iter().try_fold(&value, |at, part| at.get(*part));
+        assert_eq!(
+            lookup(new).and_then(aterm_toml::Value::as_integer),
+            Some(7),
+            "{source:?} printed {printed:?}: the new key is lost"
+        );
+        assert!(
+            lookup(old).is_some(),
+            "{source:?} printed {printed:?}: the old key is lost"
+        );
+    }
+}
+
+/// A new TABLE, or a new element of an array of tables, after an unterminated
+/// final line gets its header on a line of its own too — also when the
+/// header's decor asks for no blank line before it (prefix `""`), which left
+/// nothing between the old line and the `[`.
+#[test]
+fn a_table_added_after_an_unterminated_final_line_starts_its_own_line() {
+    for source in ["a = 1", "a = 1 # note", "[s]\nx = 1", "[[k]]\nx = 1 # c"] {
+        for compact in [false, true] {
+            let mut doc: DocumentMut = source.parse().expect("parse");
+            let mut table = Table::new();
+            table.insert("y", Item::Value(Value::from(2i64)));
+            if compact {
+                TableLike::decor_mut(&mut table).set_prefix("");
+            }
+            match doc.as_table_mut().get_mut("k") {
+                Some(Item::ArrayOfTables(aot)) => aot.push(table),
+                _ => doc["t"] = Item::Table(table),
+            }
+            let printed = doc.to_string();
+            assert!(
+                printed.starts_with(source),
+                "{source:?} printed {printed:?}"
+            );
+
+            let value: aterm_toml::Value = aterm_toml::from_str(&printed)
+                .unwrap_or_else(|e| panic!("{source:?} printed {printed:?}: {e}"));
+            let added = match value.get("k") {
+                Some(k) => {
+                    assert_eq!(k[0]["x"].as_integer(), Some(1), "{printed:?}");
+                    k.get(1)
+                }
+                None => value.get("t"),
+            };
+            assert_eq!(
+                added
+                    .and_then(|t| t.get("y"))
+                    .and_then(aterm_toml::Value::as_integer),
+                Some(2),
+                "{source:?} printed {printed:?}"
+            );
+        }
+    }
+}
+
+/// A nested write THROUGH an inline table lands in it.
+///
+/// The walk vivifies a missing intermediate as a `[header]` `Table`; inserted
+/// into `sparkle_words = { … }` as-is, the encoder (which prints only values
+/// inside braces) dropped it and the leaf beneath it, and the save wrote back
+/// the file it read. An inline table converts what it is given to its own
+/// spelling.
+#[test]
+fn a_nested_write_through_an_inline_table_lands_in_it() {
+    let source = "# sparkles\nsparkle_words = { lexicon = \"my.txt\" } # keep\nfont_px = 12\n";
+    let mut doc: DocumentMut = source.parse().expect("parse");
+    set_nested_ours(
+        &mut doc,
+        &["sparkle_words", "profanity", "enabled"],
+        Item::Value(Value::from(false)),
+    );
+    let printed = doc.to_string();
+    assert_ne!(printed, source, "the write was dropped");
+    for untouched in [
+        "# sparkles\nsparkle_words = { lexicon = \"my.txt\" ",
+        "} # keep\nfont_px = 12\n",
+    ] {
+        assert!(
+            printed.contains(untouched),
+            "{untouched:?} changed: {printed:?}"
+        );
+    }
+
+    let value: aterm_toml::Value =
+        aterm_toml::from_str(&printed).unwrap_or_else(|e| panic!("{printed:?} is not TOML: {e}"));
+    let words = value.get("sparkle_words").expect("sparkle_words");
+    assert_eq!(
+        words.get("lexicon").and_then(aterm_toml::Value::as_str),
+        Some("my.txt")
+    );
+    assert_eq!(
+        words
+            .get("profanity")
+            .and_then(|p| p.get("enabled"))
+            .and_then(aterm_toml::Value::as_bool),
+        Some(false),
+        "the leaf is missing from {printed:?}"
+    );
+    assert_eq!(
+        value.get("font_px").and_then(aterm_toml::Value::as_integer),
+        Some(12)
+    );
+
+    // An array of tables given to an inline table becomes an array of inline
+    // tables, and nested tables convert all the way down.
+    let mut doc: DocumentMut = source.parse().expect("parse");
+    let words = doc
+        .as_table_mut()
+        .get_mut("sparkle_words")
+        .and_then(Item::as_table_like_mut)
+        .expect("an inline table");
+    let mut inner = Table::new();
+    inner.insert("n", Item::Value(Value::from(3i64)));
+    let mut element = Table::new();
+    element.insert("inner", Item::Table(inner));
+    let mut aot = aterm_toml::edit::ArrayOfTables::new();
+    aot.push(element);
+    words.insert("packs", Item::ArrayOfTables(aot));
+    let printed = doc.to_string();
+    let value: aterm_toml::Value =
+        aterm_toml::from_str(&printed).unwrap_or_else(|e| panic!("{printed:?} is not TOML: {e}"));
+    assert_eq!(
+        value
+            .get("sparkle_words")
+            .and_then(|w| w.get("packs"))
+            .and_then(|p| p.get(0))
+            .and_then(|e| e.get("inner"))
+            .and_then(|i| i.get("n"))
+            .and_then(aterm_toml::Value::as_integer),
+        Some(3),
+        "the array of tables is missing from {printed:?}"
     );
 }

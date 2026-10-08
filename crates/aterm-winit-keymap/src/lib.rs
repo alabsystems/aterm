@@ -20,8 +20,7 @@
 //! CoreGraphics, CoreVideo, CoreFoundation, Foundation and libobjc. A separate
 //! crate is the enforceable form of the same intent: `aterm-types` no longer
 //! mentions winit at all, so nothing can unify an edge that does not exist.
-//! See `crates/aterm-winit-keymap/Cargo.toml` and the measurement in
-//! `crates/aterm-bench/benches/startup_exec.rs`.
+//! See `crates/aterm-winit-keymap/Cargo.toml`.
 
 use winit::keyboard::{Key as WinitKey, KeyCode, KeyLocation, NamedKey as WinitNamed, PhysicalKey};
 
@@ -594,11 +593,7 @@ mod tests {
     /// CoreVideo, CoreFoundation, Foundation and libobjc — 7 framework load
     /// commands dyld maps and initialises before the first instruction of
     /// `main`, on a route that cannot call a symbol in any of them. Measured on
-    /// this tree with the same binary built both ways: 2.49 -> 1.15 ms per exec
-    /// (`crates/aterm-bench/benches/startup_exec.rs`).
-    ///
-    /// The BENCH's Mach-O reach guard catches the same regression from the other
-    /// end, but only when someone runs it. This catches it in `cargo test`.
+    /// this tree with the same binary built both ways: 2.49 -> 1.15 ms per exec.
     #[test]
     fn aterm_types_names_no_platform_dependency() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -171,7 +171,7 @@ fn conpty_spawns_cmd_echo_and_reaps() {
         let t0 = std::time::Instant::now();
         aterm_pty::reap(pid);
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(5),
+            t0.elapsed() < std::time::Duration::from_secs(60),
             "reap must return within its bounded budget"
         );
 

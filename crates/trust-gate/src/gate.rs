@@ -4,10 +4,14 @@
 //! The gate's decision, free of process state so it can be unit-tested. Compiled
 //! into `build.rs` (via `#[path]`) and, under `cfg(test)` only, into the library.
 
-/// The one-line installer from README.md: installs aterm AND the Trust
-/// toolchain, and links rustup's `trust` toolchain at the managed store.
+/// The one-line installer from README.md: installs aterm and, on Apple-silicon
+/// macOS, the Trust toolchain, linking rustup's `trust` toolchain at the store.
 pub const INSTALL_URL: &str =
     "https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh";
+
+/// The one host triple atpkg ships the Trust toolchain for
+/// (tools/atpkg-programs.spec: the `rustc` coherence group is aarch64-only).
+pub const TRUST_HOST: &str = "aarch64-apple-darwin";
 
 /// `true` when this `rustc -vV` output is a Trust compiler's.
 ///
@@ -18,40 +22,13 @@ pub const INSTALL_URL: &str =
 /// `trust:` line. Weaker markers rejected on purpose: the release string
 /// (`1.99.0-dev` is what every upstream nightly says too), the commit hash
 /// (changes with every store build), and `--print cfg`'s `trust_verify`
-/// (disappears under the very `-Ztrust-verify=off` this workspace applies).
+/// (disappears under the very `-Ztrust-verify=off` this workspace's build lane
+/// applies).
 /// Anchored at line start so a commit message or a `mistrust:` key cannot pass.
 pub fn is_trust_compiler(verbose_version: &str) -> bool {
     verbose_version
         .lines()
         .any(|line| line.starts_with("trust:"))
-}
-
-/// Does this TREE pin the Trust toolchain? The gate enforces the pin the tree
-/// actually carries. Both sanctioned trees — the dev workspace and, since
-/// 2026-09-29, the PUBLIC SNAPSHOT — pin `channel = "trust"` (the 2026-08-30
-/// standing directive, enforce). The stand-down for an explicit non-trust pin
-/// was made for the public snapshot while its export swapped in a stock pin
-/// (until 2026-09-29), when enforcing the trust marker there made it
-/// unbuildable by its own stock gate. Fail-closed: a
-/// missing or unreadable pin file, or one with no channel line, ENFORCES —
-/// only an explicit non-trust channel stands the gate down, and changing that
-/// is a committed-file edit, never an environment variable.
-pub fn tree_pins_trust(rust_toolchain_toml: Option<&str>) -> bool {
-    let Some(text) = rust_toolchain_toml else {
-        return true; // no pin to read: enforce
-    };
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some(rest) = line.strip_prefix("channel") else {
-            continue;
-        };
-        let Some(value) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"');
-        return value == "trust";
-    }
-    true // a pin file with no channel line: enforce
 }
 
 /// The refusal to print (then exit 1), or `None` when the build may proceed.
@@ -65,42 +42,57 @@ pub fn tree_pins_trust(rust_toolchain_toml: Option<&str>) -> bool {
 /// upstream compiler is never a lane, so it is exactly the case to refuse.
 /// `verbose_version` is `rustc -vV`'s stdout, or a parenthesised note when it
 /// could not run — which is refused too: a compiler we could not see is not a
-/// Trust compiler we saw. `aterm_on_path` picks the state-aware remedy.
+/// Trust compiler we saw. `aterm_on_path` picks the state-aware remedy; without
+/// aterm on a host Trust is not packaged for (atpkg's `rustc` group is
+/// aarch64-darwin only) the installer would not help, and the refusal says so.
+/// With aterm there, a locally linked seal (`aterm pkg link trust`) can serve.
+/// `rustup_toolchain` is `RUSTUP_TOOLCHAIN` as the build script sees it:
+/// rustup's proxy sets it for cargo and every build script (measured: `cargo
+/// +stable` gives `stable-aarch64-apple-darwin`), while `RUSTC` is then a bare
+/// `rustc` that names no toolchain. Unset means a cargo that is not rustup's,
+/// `trust` means rustup's link, anything else an override.
 pub fn refusal(
     host: &str,
     target: &str,
     rustc: &str,
     verbose_version: &str,
     aterm_on_path: bool,
-    rust_toolchain_toml: Option<&str>,
+    rustup_toolchain: Option<&str>,
 ) -> Option<String> {
-    if host != target || is_trust_compiler(verbose_version) || !tree_pins_trust(rust_toolchain_toml)
-    {
+    if host != target || is_trust_compiler(verbose_version) {
         return None;
     }
     let reported = verbose_version.lines().next().unwrap_or("(nothing)").trim();
-    let fix = if aterm_on_path {
-        "fix:  aterm pkg doctor\n      \
-         (aterm is on PATH — doctor audits and re-links the toolchain; then build\n      \
-         through rustup's cargo, ~/.cargo/bin/cargo, which honours the pin)"
-            .to_string()
-    } else {
+    let toolchain = rustup_toolchain.filter(|name| !name.is_empty());
+    let cause = match toolchain {
+        Some("trust") => "rustup's `trust` toolchain is not a Trust compiler".to_string(),
+        Some(name) => format!(
+            "a rustup override (`RUSTUP_TOOLCHAIN`, `cargo +{name}` or `rustup override`) picked \
+             `{name}` over the pin"
+        ),
+        None => "this cargo is not rustup's and ignores the pin".to_string(),
+    };
+    let fix = if !aterm_on_path && host != TRUST_HOST {
         format!(
-            "fix:  install aterm — it installs the Trust toolchain and links it for rustup:\n      \
+            "fix:  none on this machine: Trust is packaged for Apple-silicon macOS only \
+             ({TRUST_HOST}), this is {host}. Build on an Apple-silicon Mac."
+        )
+    } else if !aterm_on_path {
+        format!(
+            "fix:  install aterm (it installs the Trust toolchain):\n      \
              curl -fsSL {INSTALL_URL} | bash"
         )
+    } else if toolchain == Some("trust") {
+        "fix:  aterm pkg repair   (re-points rustup's `trust` at the store)".to_string()
+    } else {
+        "fix:  targo --unverified build   (Trust's cargo)".to_string()
     };
     Some(format!(
         "error: aterm compiles ONLY with the Trust toolchain, and this build is not using it.\n\
          \n  \
          compiler  {rustc}\n  \
          reports   {reported}\n  \
-         missing   the `trust: <version>` line a Trust rustc prints in `rustc -vV`\n\
-         \n  \
-         rust-toolchain.toml pins `channel = \"trust\"`: a rustup toolchain atpkg maintains as a\n  \
-         symlink, ~/.rustup/toolchains/trust -> <prefix>/rustup/trust. This build reached\n  \
-         an upstream compiler instead — a `RUSTUP_TOOLCHAIN` / `cargo +stable` override, a cargo\n  \
-         that is not rustup's (Homebrew's ignores the pin), or a missing/dangling `trust` link.\n\
+         cause     {cause}\n\
          \n  \
          {fix}\n"
     ))

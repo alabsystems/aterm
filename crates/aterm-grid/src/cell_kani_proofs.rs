@@ -3,8 +3,6 @@
 // Author: Andrew Yates
 
 //! Kani proofs for the grid cell module.
-//!
-//! Extracted from cell.rs (#1977).
 
 use super::*;
 
@@ -69,12 +67,8 @@ fn cell_complex_flag() {
     );
 }
 
-/// set_char() with any BMP char on a complex cell produces a valid state:
-/// stores the codepoint directly and clears the COMPLEX flag.
-///
-/// Note: set_char() has a debug_assert that rejects non-BMP characters
-/// (callers should use set_overflow_index() instead). This proof covers
-/// the BMP contract only. Re: #5788.
+/// set_char() with any BMP char on a complex cell stores the codepoint and
+/// clears COMPLEX. (Non-BMP is a debug_assert; callers use set_overflow_index().)
 #[kani::proof]
 fn set_char_clears_complex_and_stores_bmp() {
     let codepoint: u16 = kani::any();
@@ -104,9 +98,8 @@ fn set_char_clears_complex_and_stores_bmp() {
     }
 }
 
-/// Cell::new() with any valid Unicode codepoint produces a valid state:
-/// BMP characters stored directly, non-BMP stored as U+FFFD.
-/// (Cell::new does NOT debug_assert on non-BMP, unlike set_char.)
+/// Cell::new() with any codepoint stores BMP characters directly and non-BMP
+/// as U+FFFD (no debug_assert, unlike set_char).
 #[kani::proof]
 fn cell_new_any_codepoint_valid_state() {
     let codepoint: u32 = kani::any();

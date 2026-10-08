@@ -40,6 +40,9 @@ mod cli;
 #[path = "../../src/dmg.rs"]
 #[allow(dead_code)]
 mod dmg;
+#[path = "../../src/durable.rs"]
+#[allow(dead_code)]
+mod durable;
 #[path = "../../src/gates.rs"]
 #[allow(dead_code)]
 mod gates;
@@ -61,6 +64,18 @@ mod publish;
 #[path = "../../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
+#[path = "../../src/trust_closure.rs"]
+#[allow(dead_code)]
+mod trust_closure;
+#[path = "../../src/trust_compare.rs"]
+#[allow(dead_code)]
+mod trust_compare;
+#[path = "../../src/trust_facts.rs"]
+#[allow(dead_code)]
+mod trust_facts;
+#[path = "../../src/trust_oblig.rs"]
+#[allow(dead_code)]
+mod trust_oblig;
 #[path = "../../src/verify.rs"]
 #[allow(dead_code)]
 mod verify;
@@ -70,11 +85,16 @@ mod channel_floor_model;
 mod channel_latest;
 mod claim_landing_model;
 mod cut_handoff;
+mod cut_launcher;
+mod d27_refute;
 mod durable_post_intent_model;
 mod handoff_policy_bundle;
 mod journal_prefix_model;
 mod ledger_race;
+mod linux_release_arch;
 mod machine_roster;
+mod pack_arch_gate;
+mod packlane_order;
 mod paint_smoke;
 mod plist_stamp;
 mod publisher_fence_liveness;
@@ -83,3 +103,4 @@ mod release_lease;
 mod resume;
 mod signconf;
 mod transcript_grid;
+mod trust_facts_model;

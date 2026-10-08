@@ -32,8 +32,9 @@ impl DiskBackedScrollback {
         // Compress and add to warm tier.
         self.warm.push_block(&lines);
 
-        // If warm tier is over limit, evict to cold.
-        if self.warm.line_count() > self.warm_limit {
+        // While the warm tier is over its limit, evict to cold: a batch can
+        // arrive as several blocks (see `WarmTier::push_block`).
+        while self.warm.line_count() > self.warm_limit && self.warm.block_count() > 0 {
             self.evict_warm_to_cold()?;
         }
 

@@ -27,14 +27,9 @@ use aterm_render::{
     FaceId, FacePick, Renderer, StyleBits, Theme, fallback_chain_order, resolve_styled_face,
 };
 
-/// The committed JetBrains Mono fixture (a liga/calt ligature font), or `None`
-/// → SKIP (mirrors tests/ligatures.rs).
-fn ligature_test_font() -> Option<Vec<u8>> {
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/jetbrains-mono.ttf"
-    );
-    std::fs::read(FIXTURE).ok()
+/// The committed JetBrains Mono fixture (a liga/calt ligature font).
+fn ligature_test_font() -> Vec<u8> {
+    include_bytes!("fixtures/jetbrains-mono.ttf").to_vec()
 }
 
 /// The bundled DejaVu Sans Mono asset (always committed — no SKIP).
@@ -253,10 +248,7 @@ fn fixture_renderer(bytes: &[u8]) -> Renderer {
 /// ink), so the equality is non-vacuous.
 #[test]
 fn bold_ligature_run_draws_from_real_styled_face() {
-    let Some(bytes) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font fixture");
-        return;
-    };
+    let bytes = ligature_test_font();
     let text_reg: &[u8] = b"a => b";
     let text_bold: &[u8] = b"\x1b[1ma => b";
 
@@ -300,10 +292,7 @@ fn bold_ligature_run_draws_from_real_styled_face() {
 /// is what changed the ink.
 #[test]
 fn synthetic_styles_off_renders_regular() {
-    let Some(bytes) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font fixture");
-        return;
-    };
+    let bytes = ligature_test_font();
     let text_reg: &[u8] = b"abc";
     let text_bold: &[u8] = b"\x1b[1mabc";
     let mut r = fixture_renderer(&bytes);
@@ -334,20 +323,23 @@ fn synthetic_styles_off_renders_regular() {
 /// the first primary miss, and the setter's hot-reload no-op guard holds.
 #[test]
 fn config_fallback_fonts_head_the_chain_and_load() {
-    let Some(jb) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font fixture");
-        return;
-    };
+    let jb = ligature_test_font();
     let dv_path = dejavu_path();
     let dv = std::fs::read(&dv_path).expect("committed DejaVu asset");
     // Find a probe char the primary (JetBrains Mono) lacks but DejaVu covers,
     // outside the procedural ranges (box drawing / blocks / braille), so the
     // fallback chain is genuinely consulted. Scanned, not hardcoded, so a
     // fixture swap can't silently vacate the test.
-    let jb_font = fontdue::Font::from_bytes(jb.as_slice(), fontdue::FontSettings::default())
-        .expect("fixture parses");
-    let dv_font = fontdue::Font::from_bytes(dv.as_slice(), fontdue::FontSettings::default())
-        .expect("asset parses");
+    let jb_font = aterm_render::font::Font::from_bytes(
+        jb.as_slice(),
+        aterm_render::font::FontSettings::default(),
+    )
+    .expect("fixture parses");
+    let dv_font = aterm_render::font::Font::from_bytes(
+        dv.as_slice(),
+        aterm_render::font::FontSettings::default(),
+    )
+    .expect("asset parses");
     let probe = (0x2000u32..0x2C00)
         .filter(|cp| !(0x2500..=0x25FF).contains(cp) && !(0x2800..=0x28FF).contains(cp))
         .filter_map(char::from_u32)
@@ -400,10 +392,7 @@ fn config_fallback_fonts_head_the_chain_and_load() {
 /// this order-only test hermetic — no env mutation, no font I/O.
 #[test]
 fn config_symbol_and_emoji_fonts_head_their_chains() {
-    let Some(jb) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font fixture");
-        return;
-    };
+    let jb = ligature_test_font();
     let mut r = fixture_renderer(&jb);
     let sym = "/nonexistent/aterm-w6-symbol-marker.otf";
     let emo = "/nonexistent/aterm-w6-emoji-marker.ttc";

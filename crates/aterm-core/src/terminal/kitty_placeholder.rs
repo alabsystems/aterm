@@ -2,26 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kitty graphics Unicode placeholder decoding (M3).
+//! Kitty graphics Unicode placeholder decoding.
 //!
-//! A "virtual" Kitty image placement is drawn by writing the placeholder character
-//! [`PLACEHOLDER`] (U+10EEEE) into ordinary text cells. Each placeholder cell
-//! carries up to three combining diacritics that encode, in order, the image ROW,
-//! the image COLUMN, and the high byte of the image ID; the low 24 bits of the
-//! image ID come from the cell's foreground color. The terminal then draws the
-//! matching sub-tile of the stored image in that cell — so an image can flow
-//! through a pager / multiplexer as plain text + colors.
+//! A virtual Kitty placement is drawn by writing [`PLACEHOLDER`] (U+10EEEE)
+//! into text cells. Each cell carries up to three combining diacritics
+//! encoding the image row, the image column and the high byte of the image id;
+//! the low 24 bits of the id come from the foreground colour, and the
+//! underline colour names the virtual placement (`p=`, `0` lets the terminal
+//! pick). An image can so flow through a pager or multiplexer as text.
 //!
-//! The cell's UNDERLINE colour names the virtual placement (`p=`) it shows — `0`
-//! (no underline colour) lets the terminal pick one.
-//!
-//! This module is the DECODE half ([`decode_cell`]: a cell's char, marks and
-//! colours → which image, placement and tile); the engine decodes a placeholder
-//! cell at render time and emits an `ImageRef` into the same shared-image render
-//! path that direct placements use (see `render_cells::images_row_into`), and the
-//! handler decodes them to damage the cells an image change repaints. The
-//! diacritic table is the canonical Kitty `rowcolumn-diacritics` list (297
-//! entries, sorted by codepoint so the array index IS the encoded value).
+//! [`decode_cell`] maps a cell's char, marks and colours to image, placement
+//! and tile. The engine decodes at render time into the shared-image path
+//! (`render_cells::images_row_into`); the handler decodes to damage the cells
+//! an image change repaints. The diacritic table is Kitty's
+//! `rowcolumn-diacritics` list (297 entries, sorted, index = encoded value).
 
 use aterm_grid::{CellExtra, Grid};
 

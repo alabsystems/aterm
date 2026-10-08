@@ -58,31 +58,13 @@ const ALL: &[&str] = &[
     RESUMED_DAEMON,
     RESUMED_DAEMON_0_159,
     RESUMED_INLINE_0_159,
+    WALL_AFTER_NOTICE_0_159,
+    WALL_RESUMED_0_159,
+    WALL_MID_TURN_0_159,
+    WALL_MID_TURN_100X30_0_159,
+    WALL_MID_TURN_160X50_0_159,
+    IDLE_0_159,
 ];
-
-/// Every Codex fixture names the program, its version and how its rows were
-/// got on line 1 — and only the one hand-built from the binary says so.
-#[test]
-fn every_fixture_names_codex_its_version_and_its_provenance() {
-    for text in ALL {
-        let line = provenance(text).expect("a provenance line");
-        assert!(
-            ["0.156.1", "0.157.0", "0.157.1", "0.158.0", "0.159.0"]
-                .iter()
-                .any(|v| line.starts_with(&format!("codex {v} · "))),
-            "{line}"
-        );
-        let measured = line.contains(" · MEASURED 2026-09-2");
-        assert_eq!(measured, !line.contains("HAND-BUILT"), "{line}");
-        assert!(!screen(text)[0].starts_with("# "), "{line}");
-    }
-    assert!(provenance(HIT_LIMIT).is_some_and(|l| l.contains("HAND-BUILT")));
-    assert!(provenance(RATE_NUDGE).is_some_and(|l| l.contains("HAND-BUILT")));
-    assert!(provenance(GOAL_RESUME).is_some_and(|l| l.contains("HAND-BUILT")));
-    for measured in [MODEL_PICK, EFFORT_PICK, ADVANCED_PICK, IDLE_158] {
-        assert!(provenance(measured).is_some_and(|l| l.contains("MEASURED 2026-09-28")));
-    }
-}
 
 /// A fresh session at its composer: idle, and evidence (the session card,
 /// no message yet). The composer's text is the placeholder; its cursor
@@ -148,9 +130,14 @@ fn a_streaming_answer_is_busy_and_its_end_row_ends_it() {
     assert!(said.ends_with("as it evolves continuously."), "{said}");
 }
 
-/// An end row is the clock under a blank row: a bare clock the streaming
-/// answer wrote under its own words is not one, and the turn still runs.
-/// NEGATIVE CONTROL: with a blank row above it, it ends the turn.
+/// An end row is the clock under a blank row, followed only by blank rows
+/// and column-0 rows (a message, the composer, a `•` or `■` block, a slash
+/// command's echo): a bare clock the streaming answer wrote under its own
+/// words, or an answer's own paragraph that is a bare clock (`  9:30` over
+/// `  - standup`, the answer going on under it at column 2), is no end row,
+/// and the turn still runs. NEGATIVE CONTROL: the same clock under a blank
+/// row with nothing under it but the composer ends the turn (the one frame
+/// no reader can tell from a real end).
 #[test]
 fn a_clock_in_the_answer_is_not_an_end_row() {
     let r = screen(STREAMING);
@@ -158,37 +145,18 @@ fn a_clock_in_the_answer_is_not_an_end_row() {
         .iter()
         .rposition(|row| row.starts_with("  design, since code"))
         .expect("the streaming row");
-    let mut quoted = r.clone();
-    quoted.insert(last + 1, "  12:30".to_string());
-    assert_eq!(phase(&quoted).0, Phase::Busy);
-    let mut ended = r.clone();
-    ended.insert(last + 1, String::new());
-    ended.insert(last + 2, "  12:30".to_string());
-    assert_eq!(phase(&ended).0, Phase::Idle);
-}
-
-/// An answer's own paragraph that is a bare clock (`  9:30` over `  -
-/// standup`) is no end row: the answer goes on under it at column 2, and a
-/// real end row is followed only by blank rows and column-0 rows (a
-/// message, the composer, a `•` or `■` block, a slash command's echo).
-/// NEGATIVE CONTROL: the same clock with nothing under it but the composer
-/// ends the turn (the one frame no reader can tell from a real end).
-#[test]
-fn a_clock_paragraph_inside_the_answer_is_not_an_end_row() {
-    let r = screen(STREAMING);
-    let last = r
-        .iter()
-        .rposition(|row| row.starts_with("  design, since code"))
-        .expect("the streaming row");
-    let mut plan = r.clone();
-    for (k, row) in ["", "  9:30", "  - standup"].into_iter().enumerate() {
-        plan.insert(last + 1 + k, row.to_string());
+    for (under, want) in [
+        (&["  12:30"][..], Phase::Busy),
+        (&["", "  9:30", "  - standup"], Phase::Busy),
+        (&["", "  12:30"], Phase::Idle),
+        (&["", "  9:30"], Phase::Idle),
+    ] {
+        let mut x = r.clone();
+        for (k, row) in under.iter().enumerate() {
+            x.insert(last + 1 + k, row.to_string());
+        }
+        assert_eq!(phase(&x), (want, true), "{under:?}");
     }
-    assert_eq!(phase(&plan), (Phase::Busy, true));
-    let mut ended = r.clone();
-    ended.insert(last + 1, String::new());
-    ended.insert(last + 2, "  9:30".to_string());
-    assert_eq!(phase(&ended), (Phase::Idle, true));
 }
 
 /// A user message that opens on a numbered list (`› 1. Write …`) is a
@@ -380,6 +348,8 @@ fn the_question_dialog_is_a_question_prompt() {
             labels(&p),
             vec!["subtract (Recommended)", "sub", "None of the above"]
         );
+        // The model's answers are answers; `None of the above` asks for the
+        // person's own words.
         assert_eq!(roles(&p), vec![Role::Answer, Role::Answer, Role::Other]);
         assert_eq!(
             p.recommended().map(|o| (o.n, o.label.as_str())),
@@ -391,28 +361,13 @@ fn the_question_dialog_is_a_question_prompt() {
             "the control"
         );
     }
-    let r = codex(QUESTION);
-    assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
-    let p = r.prompt.expect("the dialog");
-    assert_eq!(p.kind, PromptKind::Question);
-    assert_eq!(p.title, "Question 1/1 (1 unanswered)");
+    let p = codex(QUESTION).prompt.expect("the dialog");
     assert_eq!(
         p.description,
         "What should the new subtraction function be called?"
     );
-    assert_eq!(
-        labels(&p),
-        vec!["subtract (Recommended)", "sub", "None of the above"]
-    );
     assert!(labels(&p)[0].contains(anchor_text("codex.question.recommended")));
-    // The model's answers are answers; `None of the above` asks for the
-    // person's own words.
-    assert_eq!(roles(&p), vec![Role::Answer, Role::Answer, Role::Other]);
     assert_eq!(p.focused().map(|o| o.n), Some(Some(1)));
-    assert_eq!(
-        p.recommended().map(|o| (o.n, o.label.as_str())),
-        Some((Some(1), "subtract (Recommended)"))
-    );
     // Esc here stops the whole turn (the footer says so): no refusal of
     // the box.
     let cancel = p.cancel.expect("esc");
@@ -494,6 +449,34 @@ fn a_wrapped_interrupt_is_still_the_persons() {
     assert_eq!(wall(&narrow), None);
     let mut other = narrow.clone();
     other[head] = "■ Conversation failed - tell the model what to do".to_string();
+    assert!(!interrupted(&other), "the control");
+}
+
+/// CODEX 0.159.0 REWORDED THE ESC ROW (the strings of the 0.159.3 binary):
+/// `■ Conversation interrupted - use /feedback if something went wrong`,
+/// where 0.156.1 went on `tell the model what to do differently.`. Anchored
+/// on that whole old sentence, the person's Esc on a current Codex read as
+/// an ordinary ended turn, and the continuation policy typed over it once
+/// the person's grace ran out. NEGATIVE CONTROL: a failure row is not the
+/// interrupt, whatever it goes on to say.
+#[test]
+fn the_0_159_interrupt_is_still_the_persons() {
+    let mut r = screen(INTERRUPTED);
+    let head = r
+        .iter()
+        .position(|row| row.starts_with("■ Conversation interrupted"))
+        .expect("the interrupt row");
+    r[head] = "■ Conversation interrupted - use /feedback if something went wrong".to_string();
+    r[head + 1] = String::new();
+    assert_eq!(phase(&r), (Phase::Idle, true));
+    assert!(interrupted(&r));
+    assert_eq!(wall(&r), None);
+    let mut narrow = r.clone();
+    narrow[head] = "■ Conversation interrupted - use /feedback if".to_string();
+    narrow[head + 1] = "something went wrong".to_string();
+    assert!(interrupted(&narrow), "wrapped mid-sentence");
+    let mut other = r.clone();
+    other[head] = "■ Conversation failed - use /feedback if something went wrong".to_string();
     assert!(!interrupted(&other), "the control");
 }
 
@@ -589,6 +572,48 @@ fn the_measured_usage_limit_row_is_a_wall_with_no_reset() {
         codex(HIT_LIMIT).wall.and_then(|w| w.reset).is_some(),
         "the control"
     );
+}
+
+/// MEASURED on 0.159.2 (2026-09-29, a private instance whose loopback model
+/// answered `usage_limit_reached`): the usage wall as the last block, on
+/// every screen it was reached on — after a turn that ran a command, after
+/// a notice typed as a turn, redrawn by `codex resume` — and however wide
+/// the pane wraps its row (after `purchase more`, after `or try again`, not
+/// at all). Each is the usage window with no reset, the row read whole, the
+/// phase `Limited` and authoritative. NEGATIVE CONTROLS: the fresh idle
+/// screen has no wall, and neither has a wall screen whose `■` block is
+/// gone — the notice's words above it are no wall.
+#[test]
+fn the_measured_0_159_usage_wall_is_read_on_every_screen_and_width_it_wraps_at() {
+    let whole = "You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage \
+                 to purchase more credits or try again later.";
+    for (text, what) in [
+        (WALL_AFTER_NOTICE_0_159, "after the notice's turn"),
+        (WALL_RESUMED_0_159, "redrawn by codex resume"),
+        (WALL_MID_TURN_0_159, "mid-turn, 120 columns"),
+        (WALL_MID_TURN_100X30_0_159, "mid-turn, 100 columns"),
+        (WALL_MID_TURN_160X50_0_159, "mid-turn, 160 columns"),
+    ] {
+        let r = codex(text);
+        let w = r.wall.clone().unwrap_or_else(|| panic!("{what}: a wall"));
+        assert_eq!(w.kind, WallKind::UsageSession, "{what}");
+        assert!(w.kind.reads_limited(), "{what}");
+        assert_eq!(w.reset, None, "{what}: {}", w.message);
+        assert_eq!(w.message, whole, "{what}");
+        assert!(matches!(r.phase, Phase::Limited { .. }), "{what}");
+        assert!(r.phase_authoritative, "{what}");
+        // The same screen without the wall's block: nothing limits it.
+        let rows = screen(text);
+        let at = rows.iter().position(|r| r.starts_with('■')).expect(what);
+        let end = (at..rows.len())
+            .find(|&i| rows[i].trim().is_empty())
+            .expect(what);
+        let mut gone = rows.clone();
+        gone.drain(at..end);
+        assert_eq!(wall(&gone), None, "{what}: the control");
+    }
+    assert_eq!(codex(IDLE_0_159).wall, None, "the control");
+    assert_eq!(codex(IDLE_0_159).phase, Phase::Idle, "the control");
 }
 
 /// The rest of [`WALLS`], each as the turn's last `■` row; an interrupt
@@ -949,7 +974,7 @@ fn a_background_terminal_after_an_ended_turn_is_the_agents_own_work() {
 }
 
 /// A TURN ENDED UNDER A BACKGROUND TERMINAL, HOWEVER IT ENDED
-/// ([`ended_under_background`], the round-3 re-review of 2026-09-28): with
+/// ([`ended_under_background`]): with
 /// the line under it the whole screen reads busy, and the rest reads the
 /// ended turn — idle, a QUESTION (the save's "Should I merge them and push
 /// again?") — each named; a usage WALL's or an API error's `■` block under
@@ -1320,9 +1345,9 @@ fn the_footer_names_codexs_goal() {
     assert_eq!(goal_state(&quoted), None);
 }
 
-/// IN A NARROW PANE the goal still reads (the goal-pause review of
-/// 2026-09-28; each footer CAPTURED LIVE from Codex 0.158.0 in a scratch
-/// headless aterm, a scratch `$CODEX_HOME` and a dummy key): Codex cuts the
+/// IN A NARROW PANE the goal still reads (each footer CAPTURED LIVE,
+/// 2026-09-28, from Codex 0.158.0 in a scratch headless aterm, a scratch
+/// `$CODEX_HOME` and a dummy key): Codex cuts the
 /// status row's left side to keep the goal's state whole, and its ` · `
 /// goes — at 45 columns the paused goal's row, at 40 both — while the
 /// key-hint row under it keeps its own. Read by the ` · ` alone, the

@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! OSC 8 hyperlink URI scheme allowlist — conformance table (#7919, #7989).
+//! OSC 8 hyperlink URI scheme allowlist: conformance table.
 //!
 //! Locks the allowlist in `handler_osc.rs::is_allowed_scheme` and the
 //! orthogonal URI guards in `handle_osc_8` behaviorally: feed
-//! `OSC 8 ; ; URI ST  X  OSC 8 ; ; ST` and observe whether the printed
-//! cell carries the hyperlink (`Screen::hyperlink_at`). A retained link
-//! means the URI passed EVERY check; a missing link means it was refused
-//! at parse time and never reached the grid.
+//! `OSC 8 ; ; URI ST  X  OSC 8 ; ; ST` and observe whether the printed cell
+//! carries the hyperlink (`Screen::hyperlink_at`). A retained link means the
+//! URI passed every check; a missing link means it was refused at parse time.
 //!
-//! Why an allowlist (not a blocklist): F01-4 (HN-P1) demonstrated that
-//! attacker-registered macOS URL handlers (`slack:`, `vscode:`, ...) slip
-//! past any blocklist and launch native apps via `NSWorkspace.open`. The
-//! default-safe set is exactly: http, https, mailto, sftp, tel.
+//! An allowlist, not a blocklist: attacker-registered macOS URL handlers
+//! (`slack:`, `vscode:`, ...) would slip past any blocklist and launch native
+//! apps via `NSWorkspace.open`. The default-safe set is exactly: http, https,
+//! mailto, sftp, tel.
 
 use aterm_conformance::Screen;
 
@@ -106,13 +105,13 @@ fn osc8_dangerous_schemes_rejected() {
             "git://example.com/repo.git",
             "git->ssh argument injection class",
         ),
-        // ftp: cleartext fetch; removed from the safe set with file: (#7989).
+        // ftp: cleartext fetch; not in the safe set.
         (
             "ftp://example.com/file",
             "cleartext fetch / legacy handler abuse",
         ),
-        // Attacker-registered app handlers — the F01-4 (HN-P1) finding that
-        // forced the blocklist->allowlist conversion (#7919).
+        // Attacker-registered app handlers: the reason the scheme check is an
+        // allowlist rather than a blocklist.
         ("slack://settings", "attacker-registered app URL handler"),
         ("vscode://payload", "attacker-registered app URL handler"),
     ];
@@ -163,7 +162,7 @@ fn osc8_garbage_schemes_rejected() {
 
 #[test]
 fn osc8_overlength_uri_rejected_independently() {
-    // Valid scheme, no control chars, no BiDi — ONLY too long.
+    // Valid scheme, no control chars, no BiDi — only too long.
     // MAX_HYPERLINK_URL_BYTES = 8192 (terminal/mod.rs); memory-exhaustion
     // guard against OSC 8 spam with megabyte URIs.
     let long_uri = format!("https://example.com/{}", "a".repeat(8200));
@@ -180,7 +179,7 @@ fn osc8_overlength_uri_rejected_independently() {
 
 #[test]
 fn osc8_control_char_in_uri_rejected_independently() {
-    // Valid scheme, under-length, no BiDi — ONLY an embedded control char.
+    // Valid scheme, under-length, no BiDi — only an embedded control char.
     // Control chars in URIs enable log/status-bar spoofing and splitting
     // attacks when the URI is later rendered or passed to an opener.
     //
@@ -202,8 +201,8 @@ fn osc8_control_char_in_uri_rejected_independently() {
 
 #[test]
 fn osc8_bidi_override_in_uri_rejected_independently() {
-    // Valid scheme, under-length, no control chars — ONLY a BiDi override.
-    // Trojan Source (#7958, CVE-2021-42574): U+202E visually reorders
+    // Valid scheme, under-length, no control chars — only a BiDi override.
+    // Trojan Source (CVE-2021-42574): U+202E visually reorders
     // "https://safe.example\u{202E}moc.live" in previews/status bars to
     // spoof the destination hostname. Reject outright, never strip.
     assert_eq!(

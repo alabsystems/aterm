@@ -1,0 +1,50 @@
+# claude-code 2.1.287 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · auto mode, three consecutive classifier blocks (the stub answers the classifier <block>yes</block>): the denial-limit fallback box, 'Auto mode classifier requires confirmation for this command.'; approve=none
+
+
+❯ toolstart
+
+⏺ Bash(touch lab-witness-a.txt)
+  ⎿  Done
+
+⏺ Tool call done.
+
+✻ Baked for 0s · done 2:43 PM
+
+❯ toolstart
+
+⏺ Bash(python3 -c "print(42)")
+  ⎿  Error: Auto mode could not evaluate this action and is blocking it for safety — run with --debug for details. This is not a judgment that
+     the action is unsafe. This is usually transient — wait briefly and try this action again as-is; don't rewrite it. If it keeps failing,
+     continue with other tasks that don't require this action and come back to it later. Note: reading files, searching code, and other
+     read-only operations do not require the classifier and can still be used.
+
+⏺ Tool call done.
+
+✻ Worked for 0s · done 2:44 PM
+
+❯ toolstart
+
+⏺ Bash(python3 -c "print(1)")
+  ⎿  Denied by auto mode classifier ∙ [Lab Stub Block] the lab stub blocks every action it is asked about. ∙ see
+     https://code.claude.com/docs/s/claude-code-auto-mode
+
+⏺ Bash(python3 -c "print(2)")
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Print two
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ python3 -c "print(2)"
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Auto mode classifier requires confirmation for this command.
+ │ 3 consecutive actions were blocked. Please review the transcript before continuing.
+ │
+ │ Latest blocked action: [Lab Stub Block] the lab stub blocks every action it is asked about.
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: python3 *
+   3. No
+
+ Esc to cancel · Tab to amend

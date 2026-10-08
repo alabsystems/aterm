@@ -80,26 +80,30 @@ fn real_shell_session() -> Terminal {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let mut master: libc::c_int = -1;
-    let pid = unsafe {
-        libc::forkpty(
-            &mut master,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::addr_of!(ws).cast_mut(),
-        )
-    };
-    assert!(pid >= 0, "forkpty failed");
+    // Both ends close-on-exec from birth, not `forkpty`'s inheritable master:
+    // a sibling test's child forked meanwhile must not hold the master.
+    let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
+    let sh = std::ffi::CString::new("/bin/sh").unwrap();
+    let dashc = std::ffi::CString::new("-c").unwrap();
+    let cmd = std::ffi::CString::new("printf 'ATERM_RENDER_OK\\n'").unwrap();
+    let argv = [sh.as_ptr(), dashc.as_ptr(), cmd.as_ptr(), ptr::null()];
+    // SAFETY: `slave` is the live slave just opened; `ws` outlives the call.
+    unsafe { libc::ioctl(slave, libc::TIOCSWINSZ, ptr::addr_of!(ws)) };
+    // SAFETY: the child calls only login_tty (forkpty's own child step),
+    // execvp and _exit, on argv built before the fork.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
     if pid == 0 {
-        let sh = std::ffi::CString::new("/bin/sh").unwrap();
-        let dashc = std::ffi::CString::new("-c").unwrap();
-        let cmd = std::ffi::CString::new("printf 'ATERM_RENDER_OK\\n'").unwrap();
-        let argv = [sh.as_ptr(), dashc.as_ptr(), cmd.as_ptr(), ptr::null()];
         unsafe {
-            libc::execvp(sh.as_ptr(), argv.as_ptr());
+            if libc::login_tty(slave) == 0 {
+                libc::execvp(sh.as_ptr(), argv.as_ptr());
+            }
             libc::_exit(127);
         }
     }
+    // The parent's copy of the slave goes, so the read below sees EOF once the
+    // shell exits.
+    unsafe { libc::close(slave) };
     let mut term = Terminal::new(24, 80);
     let mut buf = [0u8; 4096];
     let mut total = 0usize;

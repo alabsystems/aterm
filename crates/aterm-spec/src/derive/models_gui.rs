@@ -662,7 +662,9 @@ pub fn active_handle_model() -> Model {
 /// `OneHopNoCycle`. This locks in the safety the removed hop-cap used to provide.
 ///
 /// Tier-1 binding, one test per hop kind in aterm-gui's `control::tests`, each taking
-/// the real first line `proxy_forward_plan` sends, stripping its handshake, and asking
+/// the real first line the forward presents — `proxy_forward_plan`'s verb, with the
+/// token the forward takes once connected: a child's edge token as planned, a
+/// sibling's read beside its socket — stripping its handshake, and asking
 /// the real router again — with Owner scope, where forwarding is possible at all —
 /// whether the target would forward on; every hop is validated as this model's
 /// `Forward`, which `Buggy = 1` must reject:

@@ -1,68 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DEVICE LAYER — the two-variant backend enum under `renderer.rs`'s
-//! resource seams (W3 of `docs/measured/metal-port-map-2026-08-31.md` §5).
+//! The device layer: a two-variant backend enum under `renderer.rs`'s
+//! resource and encode seams. The pipeline table owns what a pipeline is; this
+//! layer owns how a resource comes to exist and how a frame is encoded.
+//! Everything is `pub(crate)`.
 //!
-//! # Shape and justification
-//!
-//! A sibling file rather than a module inside `renderer.rs`, for the same
-//! reason THE PIPELINE TABLE is one: `renderer.rs` is 18.5k lines, and the
-//! map's recommendation (§4) is "an internal device layer shaped like the
-//! pipeline table" — one spec surface, two builders, parity tests per axis.
-//! The table owns WHAT a pipeline is; this layer owns HOW a resource comes to
-//! exist. Everything here is `pub(crate)`; nothing leaks into the gui-facing
-//! surface.
-//!
-//! It wraps EXACTLY the resource classes the map's §3 inventory names, no
-//! more: instance/vertex buffers (write-from-0 + geometric grow), textures
-//! (create + full/row-ranged upload), uniform buffers, texture views (the
-//! Unorm/sRGB alias), samplers (the two clamp presets). Bind groups are
-//! deliberately ABSENT — Metal has no bind-group object; the map ports each
-//! of the 7 layouts to 1-3 `set*` calls per draw stream, which is W4's encode
-//! job, not a resource.
+//! It wraps instance/vertex buffers (write from 0, geometric grow), textures
+//! (create, full and row-ranged upload), uniform buffers, texture views (the
+//! Unorm/sRGB alias) and samplers (two clamp presets). Bind groups are absent:
+//! Metal has none, and each layout becomes a few `set*` calls per draw.
 //!
 //! # Which arm is live where
 //!
-//! The file has two halves, and they are compiled differently.
+//! The resource half (`TexUsage`, `SamplerKind`, `DeviceHandle`,
+//! `LayerTexture`, `LayerBuffer`, `LayerSampler`) compiles only under
+//! `cfg(wgpu_arm)` (non-macOS targets, and macOS with the `wgpu-oracle`
+//! feature tests enable). On Linux and Windows [`DeviceHandle::Wgpu`] is
+//! production. Its Metal variants are a test-only differential rig minted
+//! through [`crate::metal::resources::MetalResourceDevice`], so every texture
+//! carries its loss-domain stamp. The macOS production renderer allocates in
+//! `metal/` directly (`FrameRes::Metal`) and compiles no wgpu.
 //!
-//! THE RESOURCE HALF (`TexUsage`, `SamplerKind`, `DeviceHandle`,
-//! `LayerTexture`, `LayerBuffer`, `LayerSampler`) is the wgpu arm's
-//! resource seam, compiled only under `cfg(wgpu_arm)` (`build.rs` — every
-//! non-macOS target, and macOS only under the `wgpu-oracle` feature the
-//! test/bench builds turn on). On Linux and Windows [`DeviceHandle::Wgpu`] is
-//! production, and its behavior is IDENTICAL to the direct wgpu calls this
-//! layer replaced — same descriptors, same labels, same usage bits, same
-//! upload layouts; the paint-parity suite and the aterm-gui suite run through
-//! it. Its Metal variants are a test-only differential rig
-//! (`cfg(all(target_os = "macos", test))`, the W3/W4 ladder and the
-//! atlas-grow parity), minted through
-//! [`crate::metal::resources::MetalResourceDevice`] so every texture carries
-//! its loss-domain stamp (the W1 judge's two-latch residual, sealed
-//! structurally in `metal::resources`). The macOS production renderer
-//! allocates its resources in `metal/` directly (`FrameRes::Metal`, THE FLIP,
-//! map §5 W6), and the shipped macOS closure compiles no wgpu.
-//!
-//! THE FRAME-SEAM HALF ([`TexelFormat`], [`ClearColor4`], [`FrameLoad`],
-//! [`FrameEncoder`], [`FramePass`], the `Frame*` handle enums, and
-//! [`metal_try_read_back`] / [`metal_stage_readback`]) is compiled on EVERY
-//! build, its Metal arms under `cfg(target_os = "macos")` alone. It is the
-//! macOS production encode's seam: `renderer.rs::run_frame_plan` drives a
-//! [`FrameEncoder::Metal`] with `FrameRes::Metal`'s views, uniforms,
-//! pipelines, atlases and streams, the scroll shift
-//! (`metal_shift_offscreen_band_px`) copies through one, and the capture
-//! read-back is [`metal_try_read_back`].
+//! The frame-seam half ([`TexelFormat`], [`ClearColor4`], [`FrameLoad`],
+//! [`FrameEncoder`], [`FramePass`], the `Frame*` handle enums,
+//! [`metal_try_read_back`], [`metal_stage_readback`]) compiles on every build,
+//! with Metal arms on macOS. `renderer.rs::run_frame_plan` drives a
+//! [`FrameEncoder::Metal`] in macOS production; the scroll shift
+//! (`metal_shift_offscreen_band_px`) and capture readback
+//! ([`metal_try_read_back`]) use it too.
 //!
 //! # Crossing back out
 //!
-//! The wgpu-typed seams (bind-group creation, `encode_frame`, the present
-//! path) take the resource out of the enum via
-//! [`LayerTexture::wgpu`]/[`LayerBuffer::wgpu`] and friends. On a Metal
-//! resource those accessors PANIC BY NAME: a cross-backend guard for the
-//! oracle build, where both arms are compiled side by side — not a to-do
-//! list, since production never holds a Metal variant of the resource enums.
-//! The frame-seam handles guard the same way: a handle crossed into the other
-//! arm's encoder panics by name ("device layer").
+//! wgpu-typed seams take resources out via [`LayerTexture::wgpu`],
+//! [`LayerBuffer::wgpu`] and friends, which panic by name on a Metal resource.
+//! Frame-seam handles crossed into the other arm's encoder also panic by name
+//! ("device layer"). Production never holds a mismatched pair.
 
 #[cfg(target_os = "macos")]
 use crate::metal::ffi as mtl;
@@ -71,8 +44,8 @@ use crate::metal::resources::SharedBuffer;
 #[cfg(target_os = "macos")]
 use crate::metal::resources::{MetalResourceDevice, SealedTexture};
 
-/// The texel formats the map's §3 inventory uses — exactly the six the Metal
-/// foundation models (`metal::ffi::PixelFormat`), spelled backend-neutrally.
+/// The six texel formats the Metal foundation models
+/// (`metal::ffi::PixelFormat`), spelled backend-neutrally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TexelFormat {
     R8Unorm,
@@ -113,10 +86,9 @@ impl TexelFormat {
         }
     }
 
-    /// Recover the neutral spelling from a wgpu format — for call sites whose
-    /// format arrives resolved (e.g. `format_plan::offscreen_format`). `None`
-    /// for a format outside the map's closed set of six, which no production
-    /// texture uses.
+    /// Recover the neutral format from a wgpu format (for already-resolved
+    /// formats such as `format_plan::offscreen_format`). `None` outside the six
+    /// formats in use.
     #[cfg(wgpu_arm)]
     pub(crate) const fn from_wgpu(f: wgpu::TextureFormat) -> Option<Self> {
         match f {
@@ -146,14 +118,10 @@ impl TexelFormat {
     }
 }
 
-/// What a texture is FOR, backend-neutrally. Maps 1:1 onto the wgpu usage
-/// bits the pre-layer descriptors spelled (so the wgpu arm is byte-identical
-/// to what it replaced) and onto Metal's smaller usage vocabulary (Metal has
-/// no copy bits — blits need none, and `replaceRegion:` needs only non-Private
-/// storage, which the mint's Managed textures have; see
-/// `crate::metal::ffi::Device::new_texture_2d` for what Managed does and does
-/// NOT permit — CPU reads go through a blit into a Shared buffer, never a
-/// `getBytes:`).
+/// What a texture is for, backend-neutrally. Maps onto the wgpu usage bits and
+/// onto Metal's smaller vocabulary (no copy bits; `replaceRegion:` needs only
+/// non-Private storage, which the Managed mint provides; CPU reads go through
+/// a blit into a Shared buffer, see `crate::metal::ffi::Device::new_texture_2d`).
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg(wgpu_arm)]
 pub(crate) struct TexUsage {
@@ -178,8 +146,8 @@ impl TexUsage {
         copy_dst: true,
     };
 
-    /// The offscreen-family shape: drawn into, blitted from, scroll-shifted
-    /// back into, and sampled by the present blit
+    /// The offscreen family: drawn into, blitted from, scroll-shifted into, and
+    /// sampled by the present blit
     /// (`RENDER_ATTACHMENT | COPY_SRC | COPY_DST | TEXTURE_BINDING`).
     pub(crate) const OFFSCREEN: Self = Self {
         sampled: true,
@@ -219,12 +187,8 @@ impl TexUsage {
     }
 }
 
-/// The two sampler presets the renderer builds (map §3: "4 samplers
-/// (nearest/linear clamp)" — two presets, built at up to four sites). The
-/// wgpu arm reproduces the exact descriptors the pre-layer sites spelled
-/// (clamp-to-edge everywhere, `MipmapFilterMode::Nearest` on the never-mipped
-/// textures); the Metal arm is the matching `SamplerDesc` preset, already
-/// GPU-verified equivalent by the W1 foundation tests.
+/// The two sampler presets (nearest and linear, clamp to edge, never mipped).
+/// The Metal arm uses the matching `SamplerDesc` preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(wgpu_arm)]
 pub(crate) enum SamplerKind {
@@ -234,11 +198,10 @@ pub(crate) enum SamplerKind {
     LinearClamp,
 }
 
-/// One backend, borrowed — the handle a routed construction site does its
-/// resource work through. Production hands out only the Wgpu arm
-/// ([`crate::GpuContext::device_layer`]); the Metal arm exists for the
-/// differential ladder (macOS production renders through the armed Metal
-/// path, never through this handle).
+/// One backend, borrowed: the handle a construction site creates resources
+/// through. Production hands out only the wgpu arm
+/// ([`crate::GpuContext::device_layer`]); the Metal arm is for differential
+/// tests.
 #[derive(Clone, Copy)]
 #[cfg(wgpu_arm)]
 pub(crate) enum DeviceHandle<'a> {
@@ -253,11 +216,9 @@ pub(crate) enum DeviceHandle<'a> {
 
 #[cfg(wgpu_arm)]
 impl DeviceHandle<'_> {
-    /// Create a 2-D texture. `alias` declares a format the texture may later
-    /// be viewed as (the Unorm/sRGB FORMAT LAW alias): the wgpu arm lists it in
-    /// `view_formats` (required there), the Metal arm needs no declaration for
-    /// the one alias pair in use — Unorm<->sRGB is Metal's documented
-    /// sRGB-variant exemption (measured in `metal::ffi::texture_view`).
+    /// Create a 2-D texture. `alias` declares a format the texture may later be
+    /// viewed as (the Unorm/sRGB alias): wgpu lists it in `view_formats`; Metal
+    /// needs no declaration for the sRGB-variant pair.
     pub(crate) fn create_texture_2d(
         &self,
         label: &'static str,
@@ -302,9 +263,8 @@ impl DeviceHandle<'_> {
         }
     }
 
-    /// Full-extent upload of level 0 — `queue.write_texture` from origin
-    /// (0,0) / `replaceRegion:` over the whole `width` x `height`. `bytes`
-    /// is tightly packed at `bytes_per_row`.
+    /// Full-extent upload of level 0 (`queue.write_texture` / `replaceRegion:`).
+    /// `bytes` is tightly packed at `bytes_per_row`.
     pub(crate) fn upload_texture_full(
         &self,
         tex: &LayerTexture,
@@ -316,9 +276,8 @@ impl DeviceHandle<'_> {
         self.upload_texture_rows(tex, 0, height, bytes, bytes_per_row, width);
     }
 
-    /// Row-ranged upload: rows `[y0, y0 + rows)` of level 0, full width — the
-    /// atlas-grow in-place append (map §3: "atlas grow via row-ranged
-    /// writes"). `bytes` holds exactly the band, tightly packed.
+    /// Row-ranged upload of rows `[y0, y0 + rows)` at full width, for the
+    /// atlas append. `bytes` holds exactly the band.
     pub(crate) fn upload_texture_rows(
         &self,
         tex: &LayerTexture,
@@ -374,20 +333,17 @@ impl DeviceHandle<'_> {
                      {bytes_per_row}*{rows} bytes, got {}",
                     bytes.len()
                 );
-                // SAFETY: the mint only creates Managed (non-Private) 2-D
-                // textures, so `replaceRegion:` is legal on every one; the
-                // band length is asserted just above against the stride, and
-                // `replaceRegion:` copies synchronously before returning.
+                // SAFETY: the mint creates only Managed 2-D textures, so
+                // `replaceRegion:` is legal; the band length is asserted above
+                // and the copy is synchronous.
                 unsafe { tex.metal().upload(region, bytes, bytes_per_row as usize) };
             }
         }
     }
 
-    /// A per-frame instance-stream buffer (`VERTEX | COPY_DST` on wgpu; a
-    /// shared-storage `MTLBuffer` on Metal, where vertex-stream use needs no
-    /// usage declaration). Size 0 is legal on the wgpu arm (the lazy streams
-    /// start empty); the Metal arm floors at 1 byte because
-    /// `newBufferWithLength:0` returns nil.
+    /// A per-frame instance-stream buffer (`VERTEX | COPY_DST` on wgpu, a
+    /// shared-storage `MTLBuffer` on Metal). Size 0 is legal on wgpu; Metal
+    /// floors at 1 byte because `newBufferWithLength:0` returns nil.
     pub(crate) fn create_instance_buffer(&self, label: &'static str, size: u64) -> LayerBuffer {
         match self {
             #[cfg(wgpu_arm)]
@@ -428,16 +384,13 @@ impl DeviceHandle<'_> {
         }
     }
 
-    /// Write `bytes` into `buf` from offset 0 — the ONLY write shape the
-    /// renderer uses (map §3: "offset-0-only writes suffice; every stream
-    /// writes from 0").
+    /// Write `bytes` into `buf` from offset 0, the only write shape the
+    /// renderer uses.
     ///
     /// # Safety
-    /// The Wgpu arm has no precondition (wgpu stages the write itself). The
-    /// Metal arm memcpys into shared storage the GPU may also read: the
-    /// caller must ensure no in-flight GPU work reads `buf` — the discipline
-    /// every Metal-arm caller (the differential/parity tests) upholds by
-    /// waiting out its command buffers before rewriting a stream.
+    /// None on the wgpu arm. On the Metal arm this copies into shared storage
+    /// the GPU may read: the caller must ensure no in-flight GPU work reads
+    /// `buf`.
     pub(crate) unsafe fn write_buffer_from_zero(&self, buf: &LayerBuffer, bytes: &[u8]) {
         match self {
             #[cfg(wgpu_arm)]
@@ -490,9 +443,8 @@ impl DeviceHandle<'_> {
         }
     }
 
-    /// The live wgpu device — for the wgpu-typed construction seams
-    /// (bind-group layouts, bind groups, pipelines, shader modules). Panics
-    /// by name on the Metal arm, exactly like [`LayerTexture::wgpu`].
+    /// The live wgpu device, for wgpu-typed construction (layouts, bind
+    /// groups, pipelines, modules). Panics by name on the Metal arm.
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu_device(&self) -> &wgpu::Device {
         match self {
@@ -524,9 +476,8 @@ impl DeviceHandle<'_> {
             Self::Wgpu { device, .. } => device.limits().max_texture_dimension_2d,
             #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => {
-                // Every Apple-silicon family (Apple4+) supports 16384; the
-                // foundation targets nothing older. Metal exposes no direct
-                // property; the family floor is the honest constant.
+                // Every Apple-silicon family supports 16384; Metal exposes no
+                // property for it.
                 16384
             }
         }
@@ -545,10 +496,8 @@ pub(crate) enum LayerTexture {
 
 #[cfg(wgpu_arm)]
 impl LayerTexture {
-    /// The live wgpu texture — the crossing into the wgpu-typed seams (bind
-    /// groups, encode, present). Panics by name on the Metal variant, which
-    /// exists only in the macOS oracle test build: a guard against mixing
-    /// backends there, unreachable from production.
+    /// The live wgpu texture, for the wgpu-typed seams. Panics by name on the
+    /// Metal variant (test builds only).
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(&self) -> &wgpu::Texture {
         match self {
@@ -656,9 +605,7 @@ impl LayerBuffer {
         }
     }
 
-    /// `wgpu::Buffer::slice`, forwarded — so the pre-existing
-    /// `.buf.slice(..)` call sites in the (untouched, W5) present path keep
-    /// compiling verbatim over the routed field.
+    /// `wgpu::Buffer::slice`, forwarded.
     #[cfg(wgpu_arm)]
     pub(crate) fn slice<S: std::ops::RangeBounds<wgpu::BufferAddress>>(
         &self,
@@ -730,25 +677,13 @@ impl LayerSampler {
 }
 
 // ======================================================================
-// W4 — THE ABSTRACT ENCODE SEAM (map §5 W4; the verbs under
-// `renderer.rs::run_frame_plan`).
-//
-// The same two-variant discipline as the resource layer above, extended to
-// the ENCODE vocabulary the map's §2 pass graph measured: open a pass
-// (Clear-or-Load, one optional scissor, the shared 16-byte uniforms bound
-// once), switch pipeline/atlas only on change, bind one instance stream,
-// draw instanced quads, copy texture rects mid-frame, submit. The Wgpu arm
-// forwards to EXACTLY the wgpu calls `encode_frame`'s macro ladder issued
-// before this seam existed — same labels, same descriptor literals, same
-// call order — so the live path is unchanged. The Metal arm forwards to the
-// W1 encoder (`metal::encoder`) verbatim: no new FFI, and it inherits the
-// W3 loss-domain seal (a foreign-domain target/copy refuses inside
-// `render_pass`/`copy_texture_sub_rect`) plus the W1 draw-state refusals
-// (no-pipeline draw, no-stream instanced draw, overlapping self-copy).
-//
-// Handles come in per-arm pairs; crossing a handle into the wrong arm
-// panics BY NAME ("device layer"), exactly like `LayerTexture::wgpu` — the
-// crossing guards are armed in the tests below.
+// The encode seam (the verbs under `renderer.rs::run_frame_plan`): open a
+// pass (Clear or Load, optional scissor, shared uniforms bound once), switch
+// pipeline and atlas only on change, bind one instance stream, draw instanced
+// quads, copy texture rects, submit. The wgpu arm issues the same wgpu calls
+// in the same order as a direct encode; the Metal arm forwards to
+// `metal::encoder`, inheriting its loss-domain seal and draw-state refusals.
+// Crossing a handle into the wrong arm panics by name ("device layer").
 // ======================================================================
 
 #[cfg(target_os = "macos")]
@@ -759,11 +694,10 @@ use crate::metal::encoder::{
 #[cfg(target_os = "macos")]
 use crate::metal::ffi::LoadAction;
 
-/// THE FLIP's neutral f64 colour quadruple — `wgpu::Color`'s exact shape,
-/// spelled without the crate so the shared frame planner compiles on the
-/// wgpu-free macOS production build. The Wgpu arm converts loss-lessly at the
-/// encode boundary (`ClearColor4::wgpu`); the Metal arm builds its
-/// `MTLClearColor` from the same four doubles, as it always did.
+/// A neutral f64 colour quadruple with `wgpu::Color`'s shape, so the frame
+/// planner compiles without wgpu. The wgpu arm converts losslessly
+/// (`ClearColor4::wgpu`); Metal builds its `MTLClearColor` from the same four
+/// doubles.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ClearColor4 {
     pub(crate) r: f64,
@@ -793,12 +727,9 @@ impl ClearColor4 {
     }
 }
 
-/// What happens to the pass target's texels before the first draw — the
-/// backend-neutral spelling of `wgpu::LoadOp<wgpu::Color>` restricted to the
-/// two states the frame ladder uses (map §2: "pass 0 Clear-or-Load, later
-/// passes Load"). Carries the f64 quadruple on BOTH arms so the
-/// Wgpu arm round-trips the exact value it was handed and the Metal arm's
-/// `MTLClearColor` is built from the same four doubles.
+/// What happens to a pass target's texels before the first draw: Clear or Load
+/// (pass 0 Clear-or-Load, later passes Load), carrying the f64 clear colour on
+/// both arms.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FrameLoad {
     /// Clear to this colour (linear for an sRGB-typed view, raw for Unorm —
@@ -808,9 +739,8 @@ pub(crate) enum FrameLoad {
     Load,
 }
 
-/// A pass TARGET view on one backend: the offscreen's Unorm or sRGB-alias
-/// view. On Metal a view IS a sealed texture (inherited loss-domain stamp),
-/// which is exactly what `render_pass` seals against.
+/// A pass target view: the offscreen's Unorm or sRGB alias view. On Metal a
+/// view is a sealed texture with the inherited loss-domain stamp.
 #[derive(Clone, Copy)]
 pub(crate) enum FrameView<'a> {
     #[cfg(wgpu_arm)]
@@ -828,10 +758,8 @@ pub(crate) enum FramePipeline<'a> {
     Metal(&'a mtl::Obj),
 }
 
-/// An ATLAS bind on one backend: wgpu's bind group 1 (texture + sampler), or
-/// the Metal texture/sampler pair with its `BindSpec` slots spelled by the
-/// caller (the table's `binds` column — the indices are DATA here, never this
-/// module's opinion).
+/// An atlas bind: wgpu bind group 1, or the Metal texture/sampler pair with the
+/// caller's `BindSpec` slots.
 #[derive(Clone, Copy)]
 pub(crate) enum FrameAtlas<'a> {
     #[cfg(wgpu_arm)]
@@ -847,9 +775,9 @@ pub(crate) enum FrameAtlas<'a> {
     },
 }
 
-/// A bound instance stream on one backend: wgpu vertex-buffer slot 0, or the
-/// Metal stream at `INSTANCE_STREAM_SLOT` (via the W1 encoder's dedicated
-/// `set_instance_stream`, which is what arms the no-stream draw refusal).
+/// A bound instance stream: wgpu vertex slot 0, or the Metal stream at
+/// `INSTANCE_STREAM_SLOT` (via `set_instance_stream`, which arms the no-stream
+/// draw refusal).
 #[derive(Clone, Copy)]
 pub(crate) enum FrameStream<'a> {
     #[cfg(wgpu_arm)]
@@ -858,10 +786,9 @@ pub(crate) enum FrameStream<'a> {
     Metal(&'a mtl::Obj),
 }
 
-/// The shared 16-byte frame uniforms on one backend: wgpu's bind group 0, or
-/// the Metal buffer with its `BindSpec`-derived stage slots (vertex
-/// `[[buffer(vu)]]`, plus the fragment re-bind `fs_glyph` needs — Metal
-/// argument tables are per-stage, so one buffer costs two binds there).
+/// The shared 16-byte frame uniforms: wgpu bind group 0, or the Metal buffer
+/// at its `BindSpec` slots (vertex, plus the fragment re-bind `fs_glyph`
+/// needs, since Metal argument tables are per stage).
 #[derive(Clone, Copy)]
 pub(crate) enum FrameUniforms<'a> {
     #[cfg(wgpu_arm)]
@@ -877,10 +804,9 @@ pub(crate) enum FrameUniforms<'a> {
     },
 }
 
-/// A texture on one backend for the mid-frame COPY verbs (scroll shift). The
-/// Wgpu side is a raw `wgpu::Texture` (the wgpu arm's offscreen family is
-/// wgpu-typed); the Metal side is sealed, so the copy verbs can refuse a
-/// foreign loss domain.
+/// A texture for the mid-frame copy verbs (scroll shift): a raw
+/// `wgpu::Texture`, or a sealed Metal texture so copies can refuse a foreign
+/// loss domain.
 #[derive(Clone, Copy)]
 pub(crate) enum FrameCopyTexture<'a> {
     #[cfg(wgpu_arm)]
@@ -896,7 +822,7 @@ pub(crate) enum SubmittedFrame {
     /// wgpu owns completion tracking; there is nothing further to hold.
     #[cfg(wgpu_arm)]
     Wgpu,
-    /// The W1 `Submitted`: wait on it, or poll `try_outcome` (the map's
+    /// The Metal `Submitted`: wait on it, or poll `try_outcome` (the
     /// completion-handler substitute).
     #[cfg(target_os = "macos")]
     Metal(MtlSubmitted),
@@ -926,17 +852,15 @@ impl<'s> FrameEncoder<'s> {
         }
     }
 
-    /// The Metal arm: one W1 command buffer on the session's ONE queue.
+    /// The Metal arm: one command buffer on the session's one queue.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(session: &'s EncodeSession) -> Result<Self, String> {
         Ok(Self::Metal(session.begin()?))
     }
 
-    /// Open one render pass: attach `view` with `load`/Store, apply the
-    /// optional scissor, bind the shared frame uniforms once. Argument order
-    /// IS the wgpu call order the ladder used (pass, then scissor, then bind
-    /// group 0); the Metal arm opens the W1 pass with the scissor in its
-    /// descriptor and then binds the uniform block at its `BindSpec` slots.
+    /// Open one render pass: attach `view` with `load`/Store, apply the optional
+    /// scissor, bind the shared uniforms once (in wgpu call order: pass,
+    /// scissor, bind group 0).
     pub(crate) fn begin_pass<'e>(
         &'e mut self,
         label: &'static str,
@@ -1043,11 +967,9 @@ impl<'s> FrameEncoder<'s> {
         }
     }
 
-    /// Texture→texture sub-rect copy — the scroll shift's two staged moves.
-    /// The Wgpu arm issues the exact `copy_texture_to_texture` calls the
-    /// pre-seam `shift_offscreen_band_px` issued; the Metal arm routes through
-    /// the W1 verb, which validates rects off the live textures and REFUSES an
-    /// overlapping same-texture copy (Metal documents it undefined).
+    /// Texture-to-texture sub-rect copy (the scroll shift's staged moves). The
+    /// Metal arm validates rects off the live textures and refuses an
+    /// overlapping same-texture copy.
     pub(crate) fn copy_texture_rect(
         &mut self,
         src: FrameCopyTexture<'_>,
@@ -1118,9 +1040,8 @@ impl<'s> FrameEncoder<'s> {
         }
     }
 
-    /// Commit the frame. Wgpu: `queue.submit([enc.finish()])`, exactly the
-    /// ladder's single submit. Metal: the W1 `commit`, whose `Submitted`
-    /// handle the caller waits on or polls.
+    /// Commit the frame (wgpu `queue.submit`, or Metal `commit`, whose
+    /// `Submitted` the caller waits on or polls).
     pub(crate) fn submit(self) -> SubmittedFrame {
         match self {
             #[cfg(wgpu_arm)]
@@ -1171,10 +1092,9 @@ impl FramePass<'_, '_> {
         }
     }
 
-    /// Bind the atlas — wgpu bind group 1, or the Metal fragment
-    /// texture/sampler pair at the row's `BindSpec` slots. Issued on change
-    /// only; both argument tables persist across pipeline switches, so the
-    /// dedup is sound on either arm.
+    /// Bind the atlas (wgpu group 1, or the Metal texture/sampler pair at the
+    /// row's slots). Issued on change only; both argument tables persist across
+    /// pipeline switches.
     pub(crate) fn bind_atlas(&mut self, atlas: FrameAtlas<'_>) {
         match (self, atlas) {
             #[cfg(wgpu_arm)]
@@ -1200,8 +1120,8 @@ impl FramePass<'_, '_> {
         }
     }
 
-    /// Bind the per-draw instance stream — wgpu vertex-buffer slot 0, or the
-    /// W1 `set_instance_stream` at `INSTANCE_STREAM_SLOT`.
+    /// Bind the per-draw instance stream: wgpu vertex-buffer slot 0, or
+    /// Metal `set_instance_stream` at `INSTANCE_STREAM_SLOT`.
     pub(crate) fn set_stream(&mut self, stream: FrameStream<'_>) {
         match (self, stream) {
             #[cfg(wgpu_arm)]
@@ -1218,10 +1138,8 @@ impl FramePass<'_, '_> {
         }
     }
 
-    /// The frame ladder's one draw shape: `instances` quads of 6 vertices
-    /// (`draw(0..6, 0..n)` / `drawPrimitives(Triangle, 6, n)`). The Metal arm
-    /// can refuse (the W1 no-pipeline / no-stream guards); the wgpu arm
-    /// cannot fail.
+    /// Draw `instances` quads of 6 vertices. The Metal arm can refuse (no
+    /// pipeline or no stream); the wgpu arm cannot fail.
     pub(crate) fn draw_quads(&mut self, instances: u32) -> Result<(), String> {
         match self {
             #[cfg(wgpu_arm)]
@@ -1239,25 +1157,19 @@ impl FramePass<'_, '_> {
     }
 }
 
-/// W4 item 2 — `try_read_back`'s METAL ARM: copy `texture`'s `width` x
-/// `height` Rgba8 texels into a shared staging buffer and unpack them into an
-/// `aterm_render::Frame`, reproducing the wgpu arm's byte contract EXACTLY:
+/// Metal arm of `try_read_back`: copy `texture`'s `width` x `height` Rgba8
+/// texels into a shared staging buffer and unpack into an
+/// `aterm_render::Frame` with the wgpu arm's byte contract:
 ///
-/// * the staging stride is [`crate::padded_bytes_per_row`] — the SAME 256-byte
-///   row alignment wgpu imposes, even though Metal itself would accept the
-///   tight stride (the stride bug's cautionary sibling, map §3: the Frame
-///   byte contract must match, not merely the final pixels);
-/// * the unpack is [`crate::frame_from_padded_rgba`] — the one shared
-///   spelling of the `0xTTRRGGBB` transmittance packing;
-/// * completion is STATUS POLLING on the W1 [`MtlSubmitted`] (the map's
-///   substitute for `addCompletedHandler:`), bounded by a deadline so a hung
-///   command buffer is an `Err`, not a hang — and the poll's first terminal
-///   answer feeds the loss latch exactly once, so device loss propagates the
-///   same way the wgpu arm's failed `map_async` does.
+/// * stride [`crate::padded_bytes_per_row`] (256-byte rows, although Metal
+///   would accept tight rows);
+/// * unpack via [`crate::frame_from_padded_rgba`];
+/// * completion by status polling on [`MtlSubmitted`] with a deadline, so a
+///   hung command buffer is an `Err`; the first terminal answer feeds the loss
+///   latch once.
 ///
-/// The copy itself is the W1 `copy_texture_to_buffer`, which validates the
-/// extent, the format-derived minimum stride, and the destination length off
-/// the LIVE objects, and refuses a foreign loss domain.
+/// The copy validates extent, stride and destination length against the live
+/// objects and refuses a foreign loss domain.
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_try_read_back(
     session: &EncodeSession,
@@ -1268,26 +1180,18 @@ pub(crate) fn metal_try_read_back(
 ) -> Result<aterm_render::Frame, String> {
     let (w, h) = (width as usize, height as usize);
     let (readback, stride) = metal_stage_readback(session, mint, texture, w, h)?;
-    // SAFETY: `readback` is shared storage sized `stride * h`, and
-    // `metal_stage_readback` returned only after the command buffer that
-    // wrote it reported Completed.
+    // SAFETY: `readback` is shared storage of `stride * h` bytes, and
+    // `metal_stage_readback` returned after the writing command buffer
+    // completed.
     let bytes = unsafe { mtl::buffer_bytes(&readback, stride * h) };
     Ok(crate::frame_from_padded_rgba(&bytes, w, h, stride))
 }
 
-/// The ONE staging spelling under [`metal_try_read_back`]: copy the texture
-/// into a fresh shared buffer at the [`crate::padded_bytes_per_row`] stride,
-/// poll to a terminal outcome, and return the buffer WITH the stride it was
-/// written at.
-///
-/// Split out (rather than inlined above) so the padding CONTRACT is armable:
-/// a coherent tight-stride rewrite of the readback — same `Frame`, silently
-/// divergent staging shape, the stride bug's sibling the map warns about —
-/// is observationally invisible through `Frame` consumers, and a W4-judge
-/// plant proved the whole suite stays green under one. The judge's
-/// `the_padding_tail_is_neither_written_nor_consulted` therefore drives THIS
-/// function and asserts both the returned stride and where the copy actually
-/// landed the rows, so the drift has somewhere to die.
+/// The staging step of [`metal_try_read_back`]: copy the texture into a fresh
+/// shared buffer at [`crate::padded_bytes_per_row`], poll to terminal, and
+/// return the buffer with its stride. Separate so
+/// `the_padding_tail_is_neither_written_nor_consulted` can check the stride and
+/// row placement, which `Frame` consumers cannot see.
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_stage_readback(
     session: &EncodeSession,
@@ -1328,18 +1232,11 @@ mod tests {
     use crate::metal::loss::LossLatch;
     use std::sync::Arc;
 
-    /// THE LAUNDERING PROBE (the W3 judge's follow-up to the two-latch
-    /// probe): every route by which a texture minted in loss domain 2 could
-    /// reach a domain-1 encode or present THROUGH CONSTRUCTORS THIS CRATE
-    /// EXPOSES OUTSIDE `metal/` — the alias view, the copy destination, a
-    /// second swapchain's drawable and its alias, the cross present — must
-    /// refuse by name. The two forging constructors are unspeakable here by
-    /// visibility (`SealedTexture::from_parts` is `pub(super)`, the fields
-    /// are private — both verified as compile errors when this probe was
-    /// cut), so runtime refusal of every REACHABLE route closes the set. The
-    /// one deliberate non-refusal is pinned at the end: a CPU-synchronous
-    /// `replaceRegion:` upload crosses domains legally because no queue is
-    /// involved — there is nothing to cross-wire.
+    /// Every route outside `metal/` by which a texture minted in loss domain 2
+    /// could reach a domain-1 encode or present (alias view, copy destination,
+    /// a second swapchain's drawable and alias, cross present) refuses by name.
+    /// Forging constructors are private. A CPU-synchronous `replaceRegion:`
+    /// upload across domains is allowed, since no queue is involved.
     #[test]
     fn no_texture_launders_across_loss_domains() {
         use crate::metal::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -1353,11 +1250,7 @@ mod tests {
             crate::stderr_line!("SKIP: no Metal device");
             return;
         };
-        // The house convention for first-party Metal tests (see the ffi
-        // module docs and every swapchain/encoder test): hold one pool across
-        // the test so `Obj::drop`-time autoreleases have somewhere to land —
-        // measured under OBJC_DEBUG_MISSING_POOLS=YES, this takes the
-        // first-party unpooled count to zero.
+        // Hold one pool across the test for `Obj::drop` autoreleases.
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
         let latch1 = Arc::new(LossLatch::new());
         let session1 = EncodeSession::new(&dev, Arc::clone(&latch1)).expect("session 1");
@@ -1406,9 +1299,8 @@ mod tests {
             .expect_err("an aliased foreign texture must not become a copy dst");
         assert!(err.contains("loss domain"), "route B names the seal: {err}");
 
-        // ROUTE C: a second swapchain in domain 2 — its drawable rendered on
-        // session 1, the drawable's alias likewise, and its present via
-        // session 1.
+        // Route C: a second swapchain in domain 2, its drawable and alias
+        // rendered on session 1, and its present via session 1.
         let mut sc2 = Swapchain::standalone(
             &dev,
             &SwapchainConfig {
@@ -1444,12 +1336,9 @@ mod tests {
             "route C present: {err}"
         );
 
-        // THE PINNED NON-HAZARD: a CPU-synchronous upload through a domain-1
-        // handle into a domain-2 texture is allowed — `replaceRegion:` has no
-        // queue, so there is no ordering to cross-wire. If this ever starts
-        // refusing, the seal grew past its hazard; if uploads ever become
-        // queue-based (a blit-encoder staging path), THIS is the line that
-        // must start refusing instead.
+        // A CPU-synchronous upload from a domain-1 handle into a domain-2
+        // texture is allowed: `replaceRegion:` has no queue. If uploads ever
+        // become queue-based, this must start refusing.
         let handle1 = DeviceHandle::Metal(&mint1);
         let wrapped = LayerTexture::Metal(rogue);
         handle1.upload_texture_rows(&wrapped, 2, 2, &[7u8; 64], 32, 8);
@@ -1480,9 +1369,8 @@ mod tests {
         Some(MetalResourceDevice::new(&dev, Arc::new(LossLatch::new())))
     }
 
-    /// The seal's raw material: a texture minted by the layer's Metal arm
-    /// carries the mint's latch, and an alias view INHERITS it (one storage,
-    /// one loss domain) — pointer identity, not equality.
+    /// A texture minted by the Metal arm carries the mint's latch, and an alias
+    /// view inherits it (pointer identity).
     #[test]
     fn metal_texture_carries_its_mints_latch_and_alias_inherits_it() {
         let Some(mint) = mint() else {
@@ -1515,11 +1403,8 @@ mod tests {
         );
     }
 
-    /// ARMS the crossing guards: a Metal resource reaching a wgpu-only seam
-    /// (and a wgpu handle reaching a Metal-only seam) must panic BY NAME —
-    /// "device layer" — never misbehave silently. These panics are the oracle
-    /// build's cross-backend guards; this test is what keeps them honest
-    /// messages.
+    /// A Metal resource at a wgpu-only seam, and a wgpu handle at a Metal-only
+    /// seam, panic by name ("device layer").
     #[test]
     fn crossing_a_metal_resource_into_a_wgpu_seam_panics_by_name() {
         let Some(mint) = mint() else {
@@ -1579,10 +1464,8 @@ mod tests {
         }
     }
 
-    /// ARMS the Metal arm's length guards: a row band shorter than
-    /// `bytes_per_row * rows` and a buffer write longer than the buffer must
-    /// both die on the layer's own assert — never reach `replaceRegion:` /
-    /// `memcpy` with a short source (the read-past-the-slice class).
+    /// The Metal arm's length guards: a short row band and an overlong buffer
+    /// write both fail the layer's assert before `replaceRegion:` / `memcpy`.
     #[test]
     fn the_metal_arm_refuses_short_uploads_and_oversized_writes() {
         let Some(mint) = mint() else {
@@ -1626,15 +1509,9 @@ mod tests {
         assert!(msg.contains("MTLBuffer"), "got: {msg}");
     }
 
-    /// W4 item 2 — THE PADDING-CONTRACT PROOF: the same tightly-packed RGBA8
-    /// texels, uploaded to a texture on EACH backend, must read back as
-    /// byte-identical `Frame`s through each backend's own readback arm — at a
-    /// width (17: 68 bytes/row, padded to 256) where the 256-byte stride is
-    /// LIVE, so a Metal arm using Metal's legal tight stride, mis-sizing the
-    /// staging buffer, or unpacking rows at the wrong offset all diverge.
-    /// Both frames are ALSO checked against the expected packing computed
-    /// straight from the source bytes, so the two arms cannot agree by
-    /// sharing a bug.
+    /// The same RGBA8 texels uploaded on each backend read back as identical
+    /// `Frame`s at width 17 (68 bytes per row padded to 256), and both match the
+    /// expected packing computed from the source bytes.
     #[test]
     fn the_metal_readback_reproduces_the_wgpu_padding_contract() {
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
@@ -1728,18 +1605,13 @@ mod tests {
         assert!(!latch.is_lost(), "a readback is not a device loss");
     }
 
-    /// W4-judge item 4 — THE PADDING BYTES' HANDLING, pinned in BOTH
-    /// directions at TWO live-padding widths (one padding block: 17 px, 68 ->
-    /// 256; a multi-block stride: 97 px, 388 -> 512):
+    /// Padding bytes at widths 17 and 97:
     ///
-    ///  * the tail is NOT WRITTEN: the Metal `copy_texture_to_buffer` lands
-    ///    each row's `w*4` texel bytes at its padded base and leaves the
-    ///    poisoned `[w*4, padded)` tail untouched, byte for byte;
-    ///  * the tail is NOT CONSULTED: `frame_from_padded_rgba` — the ONE
-    ///    unpack both arms share — produces identical `Frame`s from a
-    ///    poisoned-tail and a zeroed-tail staging buffer;
-    ///  * both arms' end-to-end readbacks equal the independent expectation
-    ///    computed straight from the source bytes.
+    ///  * not written: the Metal copy lands each row at its padded base and
+    ///    leaves the poisoned tail untouched;
+    ///  * not consulted: `frame_from_padded_rgba` gives identical `Frame`s from
+    ///    a poisoned and a zeroed tail;
+    ///  * both arms' readbacks equal the expected packing.
     #[test]
     fn the_padding_tail_is_neither_written_nor_consulted() {
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
@@ -1821,11 +1693,8 @@ mod tests {
                 );
             }
 
-            // THE PRODUCTION STAGING SPELLING, pinned: drive the exact
-            // helper `metal_try_read_back` stages through and assert the
-            // stride it RETURNS and the bases it actually WROTE — the arm a
-            // planted coherent tight-stride readback (same Frame, divergent
-            // staging shape) proved the Frame-level tests cannot provide.
+            // Drive the staging helper `metal_try_read_back` uses and check the
+            // returned stride and where the rows landed.
             let (buf, stride) =
                 super::metal_stage_readback(&session, &mint, mt.metal(), wu, hu).expect("stage");
             assert_eq!(

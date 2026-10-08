@@ -5,9 +5,9 @@
 //!
 //! ## Design
 //!
-//! The packed 8-byte `Cell` handles common attributes efficiently.
-//! For rare features like hyperlinks and combining characters, we use
-//! an external lookup table (`CellExtras`) to avoid bloating every cell.
+//! The packed 8-byte `Cell` handles common attributes. Rare features such as
+//! hyperlinks and combining characters live in an external lookup table
+//! (`CellExtras`) so they do not bloat every cell.
 //!
 //! ## Storage Strategy
 //!
@@ -21,15 +21,8 @@
 //!                          └──────────────────────────────┘
 //! ```
 //!
-//! This keeps the common case fast (8-byte cells) while supporting
-//! all terminal features when needed.
-//!
-//! ## Memory Optimization (M9)
-//!
-//! `CellExtra` uses packed storage for RGB colors:
-//! - Bitflags track which fields are present (avoids Option discriminants)
-//! - Three RGB colors packed into a single 9-byte array
-//! - Saves ~16 bytes per extra vs naive Option<[u8; 3]> fields
+//! `CellExtra` packs its RGB colors: bitflags record which fields are present
+//! (no Option discriminants) and three RGB colors share one 9-byte array.
 //!
 //! ## Usage
 //!
@@ -37,14 +30,7 @@
 //! - Combining characters: Unicode combining marks (U+0300-U+036F, etc.)
 //! - Underline colors: SGR 58/59 for colored underlines
 //!
-//! ## Verification
-//!
-//! Kani proofs (5 symbolic, genuine verification):
-//! - `cell_coord_hash_consistent` - CellCoord PartialEq reflexivity (symbolic row/col)
-//! - `combining_mark_range_valid` - Combining mark detection over U+0300..U+036F (symbolic codepoint)
-//! - `hyperlink_data_box_niche` - `Option<Arc<HyperlinkData>>` uses niche optimization (8 bytes)
-//! - `fnv1a_nonzero_single_byte` - FNV-1a hash non-zero for all 256 byte values
-//! - `fnv1a_nonzero_two_bytes` - FNV-1a hash non-zero for all 2-byte sequences
+//! Kani proofs are in `extra_kani_proofs.rs`.
 
 use aterm_alloc::SmallVec;
 use std::sync::Arc;
@@ -89,17 +75,14 @@ mod extra_flags {
 
 /// Hyperlink data: URL and optional ID from OSC 8 sequences.
 ///
-/// Packed into a single heap allocation to save 24 bytes in `CellExtra`
-/// (one 8-byte pointer vs two 16-byte `Option<Arc<str>>` fields).
-/// Hyperlinks are rare (most cells have none), so the extra indirection is negligible.
+/// One heap allocation instead of two `Option<Arc<str>>` fields keeps
+/// `CellExtra` 24 bytes smaller; hyperlinks are rare, so the indirection is
+/// negligible.
 ///
-/// Held by `Arc`, not `Box`: an OSC 8 run writes the SAME (url, id) pair to every
-/// covered cell, so the bulk writer builds one payload per run and hands each cell
-/// a refcount bump instead of its own malloc (`ls --hyperlink=always`, hyperlinked
-/// man pages and OSC 8 diagnostics otherwise issue thousands of small mallocs per
-/// screenful). The sharing is unobservable: every single-cell mutator goes through
-/// `Arc::make_mut`, so a per-cell url/id write copies-on-write exactly as it did
-/// when each cell owned its own `Box`.
+/// Held by `Arc`: an OSC 8 run writes the same (url, id) pair to every covered
+/// cell, so the bulk writer builds one payload per run and each cell takes a
+/// refcount bump instead of a malloc. Every single-cell mutator goes through
+/// `Arc::make_mut`, so the sharing is unobservable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HyperlinkData {
     /// Hyperlink URL (OSC 8).
@@ -110,21 +93,20 @@ pub(crate) struct HyperlinkData {
     pub id: Option<Arc<str>>,
 }
 
-// The image PAYLOAD lives in the vocabulary crate, not here: history
-// (`aterm_scrollback::ImageSpan`) has to hold the very same `Arc` a live cell
-// does, and `aterm-scrollback` sits BELOW this crate, so a type defined here
-// could only reach it by copying — one copy per row of history the footprint
-// covers, defeating both the renderer's pointer-keyed decode cache and the
-// memory budget. Re-exported so `aterm_grid::ImageData` stays the name every
-// caller already uses.
-pub use aterm_types::{ImageData, ImageFormat, ImageScaling, SourceRect};
+// The image payload (and a Kitty placement's tag) lives in the vocabulary
+// crate: history (`aterm_scrollback::ImageSpan`) must hold the same `Arc` a
+// live cell does, and `aterm-scrollback` sits below this crate, so a type
+// defined here could only reach it by copying (defeating the renderer's
+// pointer-keyed decode cache and the memory budget). Re-exported so
+// `aterm_grid::ImageData` stays the name callers use.
+pub use aterm_types::{ImageData, ImageFormat, ImageScaling, KittyPlacementTag, SourceRect};
 
 /// A single cell's reference into a placed [`ImageData`].
 ///
-/// The shared image lives behind the `Arc`; `cell_row`/`cell_col` say which tile
-/// of the `rows`×`cols` footprint THIS cell paints (0-indexed from the image's
-/// top-left). The renderer maps that tile to a pixel sub-rect of the decoded
-/// image. Cheap to clone (one `Arc` bump + two `u16` + a `Copy` tag).
+/// The shared image lives behind the `Arc`; `cell_row`/`cell_col` say which
+/// tile of the `rows`×`cols` footprint this cell paints (0-indexed from the
+/// image's top-left). The renderer maps that tile to a pixel sub-rect of the
+/// decoded image. Cheap to clone (one `Arc` bump + two `u16` + a `Copy` tag).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef {
     /// The shared image this cell belongs to.
@@ -140,22 +122,18 @@ pub struct ImageRef {
     pub kitty: Option<KittyPlacementTag>,
 }
 
-/// The identity of one Kitty graphics placement, stamped into every cell it
-/// covers.
-///
-/// Rows that scroll into history keep their pixels but not this tag: Kitty
-/// deletion addresses the screen, so a placement that left it is no longer a
-/// delete target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KittyPlacementTag {
-    /// The image id (`i=`, or the id the terminal assigned an `I=` number).
-    pub image_id: u32,
-    /// The client's placement id (`p=`); `0` when the client named none.
-    pub placement_id: u32,
-    /// A per-terminal serial, unique to this one placement act, so two
-    /// unnamed placements of the same image stay distinct targets.
-    pub serial: std::num::NonZeroU32,
+impl ImageRef {
+    /// Where this layer stacks among the images sharing its cell, lowest
+    /// first ([`aterm_types::layer_order`]).
+    #[must_use]
+    pub fn draw_key(&self) -> (i32, u32, u32) {
+        aterm_types::layer_order(self.image.z_index, self.kitty)
+    }
 }
+
+/// Most image layers one cell holds: a placement stacked past it pushes the
+/// lowest layer out (a DoS bound — each layer is a boxed ref per covered cell).
+pub const MAX_IMAGE_LAYERS: usize = 16;
 
 /// Extra attributes for a cell that don't fit in the packed 8-byte structure.
 ///
@@ -169,23 +147,21 @@ pub struct KittyPlacementTag {
 /// A Kitty Unicode placeholder needs no field of its own: it is its character,
 /// combining marks and colours, decoded at render time.
 ///
-/// ## Memory Layout (M9 optimization + perf-memory boxing)
+/// ## Memory layout
 ///
-/// Uses packed storage to minimize size:
 /// - `flags: u16` - presence bitflags + extended flags (bits 3-15)
 /// - `colors: [u8; 9]` - packed RGB: underline[0-2], fg[3-5], bg[6-8]
 /// - `hyperlink: Option<Arc<HyperlinkData>>` - packed URL+ID (8 bytes via niche),
 ///   shared across the cells of one OSC 8 run (copy-on-write on per-cell edits)
-/// - `complex_char: Option<Box<Arc<str>>>` - boxed; rare, so the 8-byte niche
-///   pointer replaces the 16-byte inline `Arc<str>` fat pointer on the common path
+/// - `complex_char: Option<Box<Arc<str>>>` - boxed so the common path pays an
+///   8-byte niche pointer instead of a 16-byte fat pointer
 /// - `combining: SmallVec<char, 2>` - inline for the common case
-/// - `image: Option<Box<ImageRef>>` - inline-image ref, niche optimized (8 bytes)
+/// - `image: Option<Box<SmallVec<ImageRef, 1>>>` - inline-image layers, niche
+///   optimized (8 bytes)
 ///
-/// Total: 64 bytes (56 after boxing `complex_char`, plus 8 for the niche
-/// `image` pointer). Boxing only adds an allocation when a grapheme-cluster
-/// complex char (or inline image) is actually present; the values returned by
-/// the accessors are byte-identical. `CellExtra` is allocated only for cells
-/// that carry any extra at all (rare), so the cost is paid only by those cells.
+/// Total: 64 bytes. Boxing adds an allocation only when a grapheme-cluster
+/// complex char or inline image is present. `CellExtra` exists only for cells
+/// carrying some extra.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CellExtra {
     /// Bitflags: bits 0-2 track color presence, bits 3-15 for extended flags.
@@ -195,19 +171,18 @@ pub struct CellExtra {
     /// Only valid if corresponding HAS_* flag is set.
     colors: [u8; 9],
 
-    /// Indexed underline color palette index (#7445).
+    /// Indexed underline color palette index.
     ///
-    /// When `Some(idx)`, the underline color is an indexed palette color that
-    /// should be resolved from the live palette at render time. This allows
-    /// OSC 4 palette changes to dynamically update underline colors.
-    /// When `Some`, the `HAS_UNDERLINE_COLOR` flag is also set and `colors[0..3]`
-    /// hold the index in `[0]` (the RGB bytes are unused in this mode).
+    /// When `Some(idx)`, the underline color is an indexed palette color
+    /// resolved from the live palette at render time, so OSC 4 palette changes
+    /// update it. The `HAS_UNDERLINE_COLOR` flag is then clear (see
+    /// `set_underline_color_u32`).
     underline_color_idx: Option<u8>,
 
     /// Hyperlink URL and optional ID (OSC 8), packed into a single allocation.
     /// Uses niche optimization: None = null pointer = 0 overhead.
-    /// `Arc` (not `Box`) so one OSC 8 run allocates once and every covered cell
-    /// takes a refcount bump — see [`HyperlinkData`].
+    /// `Arc` so one OSC 8 run allocates once and every covered cell takes a
+    /// refcount bump; see [`HyperlinkData`].
     hyperlink: Option<Arc<HyperlinkData>>,
 
     /// Complex character string (non-BMP, grapheme clusters, combining marks).
@@ -221,11 +196,12 @@ pub struct CellExtra {
     /// Most cells have 0-2 combining chars; SmallVec avoids allocation.
     combining: SmallVec<char, 2>,
 
-    /// Inline image reference (iTerm2 OSC 1337 `File=`).
-    /// Present when this cell is covered by an inline image; the renderer paints
-    /// the cell's tile of the shared image and skips the glyph. Boxed for niche
-    /// optimization (8 bytes when absent).
-    image: Option<Box<ImageRef>>,
+    /// The inline images covering this cell, bottom layer first (never empty
+    /// when present). One for an iTerm2 or sixel image, which owns its cells;
+    /// Kitty placements stack in [`ImageRef::draw_key`] order. The renderer
+    /// paints each layer's tile of its shared image in that order. Boxed for
+    /// niche optimization (8 bytes when absent).
+    image: Option<Box<SmallVec<ImageRef, 1>>>,
 }
 
 impl CellExtra {
@@ -273,13 +249,10 @@ impl CellExtra {
         match url {
             Some(url) => {
                 if let Some(data) = &mut self.hyperlink {
-                    // COPY-ON-WRITE IS MANDATORY, not an optimization: the bulk
-                    // run writer shares ONE payload across every cell of an OSC 8
-                    // run, so mutating in place here would silently rewrite the
-                    // whole run's link. `make_mut` reproduces the old per-cell
-                    // `Box` semantics exactly, and never clones on the
-                    // per-character path, which builds its own payload (refcount
-                    // 1) before touching it.
+                    // Copy-on-write is required: the bulk run writer shares one
+                    // payload across an OSC 8 run, so mutating in place would
+                    // rewrite the whole run's link. The per-character path builds
+                    // its own payload (refcount 1), so it never clones here.
                     let data = Arc::make_mut(data);
                     data.url = url;
                     data.id = None; // Clear stale ID from previous hyperlink
@@ -293,14 +266,12 @@ impl CellExtra {
         }
     }
 
-    /// Attach an already-built — and possibly SHARED — hyperlink payload.
+    /// Attach an already-built, possibly shared, hyperlink payload.
     ///
-    /// Replaces URL and ID together, matching [`Self::set_hyperlink`]'s contract
-    /// (which clears any stale ID), but without the per-cell allocation: the bulk
-    /// run writer builds one `Arc<HyperlinkData>` per OSC 8 run and gives each
-    /// covered cell a refcount bump instead of its own `HyperlinkData` malloc.
-    /// Sharing stays unobservable because every single-cell mutator
-    /// (`set_hyperlink`, `set_hyperlink_id`) copies-on-write via `Arc::make_mut`.
+    /// Replaces URL and ID together, like [`Self::set_hyperlink`] (which clears
+    /// any stale ID), without a per-cell allocation: the bulk run writer builds
+    /// one `Arc<HyperlinkData>` per OSC 8 run. Single-cell mutators
+    /// (`set_hyperlink`, `set_hyperlink_id`) copy-on-write via `Arc::make_mut`.
     #[inline]
     pub(crate) fn set_hyperlink_data(&mut self, data: Option<Arc<HyperlinkData>>) {
         self.hyperlink = data;
@@ -369,7 +340,7 @@ impl CellExtra {
     #[inline]
     pub fn set_underline_color(&mut self, color: Option<[u8; 3]>) {
         self.set_color(0, extra_flags::HAS_UNDERLINE_COLOR, color);
-        // Always clear indexed state when setting explicit RGB (#7445).
+        // Always clear indexed state when setting explicit RGB.
         self.underline_color_idx = None;
     }
 
@@ -377,10 +348,9 @@ impl CellExtra {
     ///
     /// Type byte TT determines interpretation:
     /// - `0x01`: RGB color — stores `[R, G, B]` from the low 24 bits.
-    /// - `0x02`: Indexed palette color (#7445) — stores the palette index and
-    ///   the renderer resolves from the live palette at draw time so that
-    ///   OSC 4 palette changes update the underline color dynamically.
-    /// - Other: Treated as RGB (backwards compatibility).
+    /// - `0x02`: Indexed palette color — stores the palette index, resolved
+    ///   from the live palette at draw time so OSC 4 changes apply.
+    /// - Other: treated as RGB.
     #[inline]
     pub fn set_underline_color_u32(&mut self, color: Option<u32>) {
         match color {
@@ -407,18 +377,17 @@ impl CellExtra {
         }
     }
 
-    /// The underline colour in the PACKED `0xTT_XXXXXX` form — the exact inverse
-    /// of [`set_underline_color_u32`](Self::set_underline_color_u32).
+    /// The underline colour in packed `0xTT_XXXXXX` form, the inverse of
+    /// [`set_underline_color_u32`](Self::set_underline_color_u32).
     ///
-    /// `0x02_0000II` for an indexed colour (so it still re-resolves against the
-    /// live palette after a round trip), `0x01_RRGGBB` for an explicit RGB one,
-    /// `None` when no SGR 58 colour is set. The indexed form is checked first
-    /// because `set_underline_color_u32` clears `HAS_UNDERLINE_COLOR` when it
-    /// stores an index, so the two are never both present.
+    /// `0x02_0000II` for an indexed colour (so it re-resolves against the live
+    /// palette after a round trip), `0x01_RRGGBB` for RGB, `None` when no SGR 58
+    /// colour is set. The indexed form is checked first; `set_underline_color_u32`
+    /// clears `HAS_UNDERLINE_COLOR` when storing an index, so both are never
+    /// present.
     ///
-    /// This is the form scrollback carries and the form the wide-spacer mirror
-    /// copies, so a colour crosses either boundary without being flattened to
-    /// RGB on the way.
+    /// Scrollback and the wide-spacer mirror carry this form, so a colour is
+    /// not flattened to RGB across either boundary.
     #[must_use]
     #[inline]
     pub fn underline_color_u32(&self) -> Option<u32> {
@@ -429,7 +398,7 @@ impl CellExtra {
         Some(0x01_00_00_00 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
     }
 
-    /// Whether the underline color is an indexed palette color (#7445).
+    /// Whether the underline color is an indexed palette color.
     ///
     /// When true, [`underline_color_index`](Self::underline_color_index) returns
     /// the palette index and the renderer should resolve from the live palette.
@@ -439,7 +408,7 @@ impl CellExtra {
         self.underline_color_idx.is_some()
     }
 
-    /// Get the palette index for an indexed underline color (#7445).
+    /// Get the palette index for an indexed underline color.
     ///
     /// Returns `Some(index)` when the underline color is an indexed palette
     /// color, `None` otherwise.
@@ -514,39 +483,95 @@ impl CellExtra {
     /// complex-char string.
     ///
     /// Preserves SGR colors (`fg_rgb`/`bg_rgb`/`underline_color`), hyperlinks,
-    /// flags, and graphics placeholders. Used by DECSERA's selective wipe,
-    /// which turns a cell into a space (`set_char`) but must keep its
-    /// out-of-line truecolor/underline overflow while dropping any stale
-    /// combining mark or orphaned grapheme-cluster string that would otherwise
-    /// leak into copy/selection/search/render (mirrors the #7456 cleanup for
-    /// the selective-wipe path).
+    /// flags and graphics placeholders. Used by DECSERA's selective wipe, which
+    /// turns a cell into a space (`set_char`) but keeps its truecolor/underline
+    /// overflow while dropping stale combining marks or grapheme-cluster
+    /// strings that would leak into copy/selection/search/render.
     #[inline]
     pub fn clear_char_marks(&mut self) {
         self.combining.clear();
         self.complex_char = None;
     }
 
-    /// Get the inline image reference for this cell (iTerm2 OSC 1337).
+    /// The inline images covering this cell, bottom layer first (draw order).
+    #[must_use]
+    #[inline]
+    pub fn images(&self) -> &[ImageRef] {
+        self.image
+            .as_deref()
+            .map_or(&[], |layers| layers.as_slice())
+    }
+
+    /// The inline images covering this cell, bottom layer first, for an edit
+    /// that keeps each layer's [`ImageRef::draw_key`] (a Kitty frame swap).
+    #[inline]
+    pub fn images_mut(&mut self) -> &mut [ImageRef] {
+        self.image
+            .as_deref_mut()
+            .map_or(&mut [], |layers| layers.as_mut_slice())
+    }
+
+    /// The topmost inline image covering this cell.
     #[must_use]
     #[inline]
     pub fn image(&self) -> Option<&ImageRef> {
-        self.image.as_deref()
+        self.images().last()
     }
 
-    /// Set the inline image reference for this cell (iTerm2 OSC 1337).
+    /// Make `image` the cell's only image (`None`: no image) — an iTerm2 or
+    /// sixel image owns the cells it covers.
     #[inline]
     pub fn set_image(&mut self, image: Option<ImageRef>) {
-        self.image = image.map(Box::new);
+        self.image = image.map(|image| {
+            let mut layers = SmallVec::new();
+            layers.push(image);
+            Box::new(layers)
+        });
+    }
+
+    /// Add `image` as a layer, in [`ImageRef::draw_key`] order (after the
+    /// layers it ties with), keeping at most [`MAX_IMAGE_LAYERS`]: the lowest
+    /// layer goes first.
+    pub fn stack_image(&mut self, image: ImageRef) {
+        let layers = self.image.get_or_insert_with(Box::default);
+        let key = image.draw_key();
+        let at = layers.partition_point(|layer| layer.draw_key() <= key);
+        layers.push(image);
+        layers.as_mut_slice()[at..].rotate_right(1);
+        if layers.len() > MAX_IMAGE_LAYERS {
+            layers.as_mut_slice().rotate_left(1);
+            layers.pop();
+        }
+    }
+
+    /// Keep only the image layers `keep` accepts, in their order.
+    pub fn retain_images(&mut self, mut keep: impl FnMut(&ImageRef) -> bool) {
+        let Some(layers) = self.image.as_mut() else {
+            return;
+        };
+        let slice = layers.as_mut_slice();
+        let mut kept = 0;
+        for at in 0..slice.len() {
+            if keep(&slice[at]) {
+                slice.swap(kept, at);
+                kept += 1;
+            }
+        }
+        while layers.len() > kept {
+            layers.pop();
+        }
+        if layers.is_empty() {
+            self.image = None;
+        }
     }
 
     /// Calculate memory used by this extra.
     #[must_use]
     pub fn memory_used(&self) -> usize {
         let base = std::mem::size_of::<Self>();
-        // Upper bound, as before: the URL bytes were already counted once per
-        // cell even though the `Arc<str>` is shared, and the `HyperlinkData`
-        // payload is now shared across the cells of a run too. Over-reporting is
-        // the safe direction for a memory budget — it never under-counts.
+        // An upper bound: the URL bytes are counted per cell even though the
+        // `Arc<str>` and the `HyperlinkData` payload are shared across a run.
+        // Over-reporting is the safe direction for a memory budget.
         let hyperlink_mem = self.hyperlink.as_ref().map_or(0, |data| {
             std::mem::size_of::<HyperlinkData>()
                 + data.url.len()
@@ -566,11 +591,15 @@ impl CellExtra {
             0 // Inline storage, already counted in base
         };
         // The image payload is shared via Arc (counted once at the source, not
-        // per covered cell); each cell pays only the boxed ImageRef.
-        let image_mem = self
-            .image
-            .as_ref()
-            .map_or(0, |_| std::mem::size_of::<ImageRef>());
+        // per covered cell); each cell pays only its boxed layer refs.
+        let image_mem = self.image.as_ref().map_or(0, |layers| {
+            std::mem::size_of::<SmallVec<ImageRef, 1>>()
+                + if layers.spilled() {
+                    layers.capacity() * std::mem::size_of::<ImageRef>()
+                } else {
+                    0
+                }
+        });
         base + hyperlink_mem + complex_char_mem + combining_mem + image_mem
     }
 }

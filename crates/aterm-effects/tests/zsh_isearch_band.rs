@@ -127,9 +127,13 @@
 //! wrap's prefix): `backhop`'s held retreat flushed `licensed key` and laid
 //! (R, 38) under `hello`'s first `l`, bash's laid (R, 31); `multiline`'s
 //! switch passed as a soft wrap, `licensed key`, and laid (R, 35) under
-//! `cd /d`'s `d`. The two torn-read laws stay ignored: they need a read
-//! boundary inside ONE zle redisplay, which a local whole read never
-//! presents.
+//! `cd /d`'s `d`. A read torn inside ONE zle redisplay (a remote zsh, a
+//! redisplay past the tty's chunk) can present the match's own glyph at the
+//! caret as a key's echo: that lay is RECALLED once zle prints its status
+//! row and the caret rests behind it — shortened, not refused
+//! (RAINBOW-PATH-V3 §8 D-13). The recall's laws pass; the zero-ink laws are
+//! kept as ignored latent rows with their residual (measured before the
+//! recall, 2026-09-30: lays on row R lived about 2 s).
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
@@ -146,13 +150,11 @@ const CW: usize = 7;
 const CH: usize = 14;
 /// A 120 Hz window's frame train.
 const FRAME_US: u64 = 8_333;
-/// A pixel is INK at this level (premultiplied channel or source-over
-/// opacity, 0..255) — below the glass census's 20/255 on purpose, so a faint
-/// stub counts.
+/// A pixel is ink at this level (premultiplied channel or source-over opacity,
+/// 0..255), below the glass census's 20/255 so a faint stub counts.
 const INK: u8 = 8;
 /// Idle after the last key by which every life has ended: the longest swoosh
-/// is a 1.5 s rest plus 0.79 s at the slowest tempo (`review_real_bytes.rs`'s
-/// `IDLE_CEILING_MS`).
+/// is a 1.5 s rest plus 0.79 s (`review_real_bytes.rs`'s `IDLE_CEILING_MS`).
 const IDLE_CEILING_MS: u64 = 2_500;
 
 /// One recorded take and the grid it was recorded at.
@@ -245,9 +247,8 @@ const BACKHOP: Take = Take {
     preroll: 5,
 };
 
-/// The searches whose match is NOT at the entry's first column, so zle walks
-/// the caret along the match row as the keys narrow it — forward, and (the
-/// last) back.
+/// Searches whose match is not at the entry's first column, so zle walks the
+/// caret along the match row: forward, and (the last) back.
 const HOP_TAKES: [Take; 4] = [HOP, HOP2, HOP2_BOTTOM, BACKHOP];
 
 const MULTILINE: Take = Take {
@@ -305,13 +306,10 @@ const fn codex_wrapped(name: &'static str, src: &'static str) -> Composer {
     }
 }
 
-/// Claude Code's four composer takes (2026-09-21) and Codex's four
-/// (2026-09-16 and the wrapped composer of 2026-09-22); and Claude Code
-/// 2.1.280's re-wrap takes (2026-09-23, fix/trail-soft-wrap): the seven
-/// `claude_wrap_band.rs` replays (the soft-wrapped caret, the key that pushes
-/// a word down, the controls) and `wrap_code_reflow.rs`'s recording (the
-/// lifted word, the hard-broken token, the typo fixed mid-word) — every
-/// shape whose re-anchor lays a cell other than `landing − 1`.
+/// Claude Code's four composer takes, Codex's four, and Claude Code's re-wrap
+/// takes (the seven `claude_wrap_band.rs` replays and `wrap_code_reflow.rs`'s
+/// recording): every shape whose re-anchor lays a cell other than
+/// `landing − 1`.
 const COMPOSERS: [Composer; 16] = [
     claude(
         "claude-insert",
@@ -385,9 +383,8 @@ const COMPOSERS: [Composer; 16] = [
     },
 ];
 
-/// The owner's prompt, `user@hostmachine0000 aterm % `: its width is the
-/// column the line (and the i-search's match) starts at in the python-pty
-/// takes.
+/// The prompt `user@hostmachine0000 aterm % `: its width is the column where
+/// the line and the match start in the python-pty takes.
 const PROMPT_COLS: u16 = 31;
 
 #[derive(Clone)]
@@ -449,9 +446,9 @@ fn events_in(fixture: &str, clock: Clock) -> Vec<(u64, Ev)> {
         .collect()
 }
 
-/// Cut one PTY read into the pieces a torn read can stop between: every
-/// escape sequence (CSI to its final byte, OSC to BEL/ST, a two-byte ESC),
-/// every C0 control, every run of printable text.
+/// Cut one PTY read into the pieces a torn read can stop between: every escape
+/// sequence (CSI to its final byte, OSC to BEL/ST, two-byte ESC), every C0
+/// control, every printable run.
 fn pieces(b: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -531,18 +528,17 @@ enum Tear {
 #[derive(Clone, Copy, Debug)]
 struct Present {
     tear: Tear,
-    /// Present only when the host would — on PTY output, on a key, and on the
-    /// wake the engine asks for (`needs_frame_cadence`, else
-    /// `next_change_deadline`) — instead of on every 120 Hz frame.
+    /// Present only when the host would (on PTY output, a key, and the wake the
+    /// engine asks for: `needs_frame_cadence`, else `next_change_deadline`)
+    /// instead of every 120 Hz frame.
     host_wake: bool,
     /// Hand the engine the print anchor's glyph with the anchor, as
-    /// `app_render.rs` does; `false` is a host that feeds only the anchor, and
-    /// the engine reads the caret row's probes instead.
+    /// `app_render.rs` does; `false` feeds the anchor only, and the engine reads
+    /// the caret row's probes.
     anchor_glyph: bool,
-    /// Hand the engine the caret whether or not DECTCEM draws it, as the
-    /// single-pane window does (`app_render.rs`: a hidden cursor is still a
-    /// caret, for the pet); `false` is the composed, focus and headless
-    /// paths, which hand over only a drawn caret. zle never hides it.
+    /// Hand over the caret whether or not DECTCEM draws it, as the single-pane
+    /// window does; `false` is the composed, focus and headless paths (drawn
+    /// carets only). zle never hides it.
     window_caret: bool,
 }
 
@@ -728,10 +724,9 @@ impl Host {
             .to_string()
     }
 
-    /// The host's order: `sync_cursor_effect_scroll`, LOCK A's witness rows
-    /// (the caret's row, then every row the ribbon names), then
-    /// `tick_cursor_fx`'s row probe with its neighbours, the print anchor
-    /// with its glyph, and the tick.
+    /// The host's order: `sync_cursor_effect_scroll`, lock A's witness rows
+    /// (the caret's row, then every row the ribbon names), the cursor step's
+    /// row probe with neighbours, the print anchor with its glyph, the tick.
     fn frame(&mut self) {
         let scroll = self.term.content_scroll_state();
         match ContentScrollState::delta_since(self.scroll, scroll) {
@@ -892,9 +887,9 @@ impl Host {
         }
     }
 
-    /// Where zle's fake cursor `_` stands now: the i-search STATUS row — the
-    /// first row below the match row whose text holds `search:` (one row
-    /// down; under a wrapped match, two) — and the `_`'s column on it.
+    /// Where zle's fake cursor `_` stands: the status row (the first row below
+    /// the match row holding `search:`; two down under a wrapped match) and its
+    /// column.
     fn fake_cursor(&mut self) -> Option<(u16, u16)> {
         let (_, r) = self.census_from?;
         if self.search_end_us.is_some() {
@@ -955,12 +950,12 @@ impl Host {
         }
     }
 
-    /// The hint `app_input.rs` stamps for what the keyboard sent. A printable
+    /// The hint `app_input.rs` stamps for what the keyboard sent: a printable
     /// key is a typed glyph (`note_typed_expected`); Enter is the Return
-    /// licence; an arrow, ⌥←/⌥→, Home or End is navigation (the generic
-    /// disarm, then `note_motion`); Backspace erases one priced glyph; Ctrl-R, Ctrl-G and
-    /// Ctrl-C are the generic different-class disarm (`clear_typed`); a
-    /// multi-byte `aterm ctl send` text is not typing and stamps nothing.
+    /// licence; an arrow, ⌥←/⌥→, Home or End is navigation
+    /// (`clear_typed_keeping_hand`, then `note_motion`); Backspace (same disarm)
+    /// erases one priced glyph; Ctrl-R, Ctrl-G and Ctrl-C are the generic
+    /// disarm (`clear_typed`); multi-byte `aterm ctl send` text stamps nothing.
     fn hint(&mut self, bytes: &[u8]) {
         match bytes {
             [b] if (0x20..0x7f).contains(b) => {
@@ -981,13 +976,13 @@ impl Host {
                 self.glow.note_return(self.now);
             }
             [0x7f] => {
-                self.glow.clear_typed(self.now);
+                self.glow.clear_typed_keeping_hand(self.now);
                 self.glow.note_backspace_erasing(self.now, Some(1));
             }
             b"\x1b[A" | b"\x1b[B" | b"\x1b[C" | b"\x1b[D" | b"\x1b[1;3C" | b"\x1b[1;3D"
             | b"\x1b[H" | b"\x1b[F" => {
                 self.end_search();
-                self.glow.clear_typed(self.now);
+                self.glow.clear_typed_keeping_hand(self.now);
                 self.glow.note_motion(self.now);
             }
             [0x12] => {
@@ -1081,9 +1076,8 @@ impl Host {
     }
 }
 
-/// Fold quads into per-cell ink pixels; `scratch` is a per-pixel max buffer,
-/// cleared again before returning. Only the pixels the quads touch are
-/// visited.
+/// Fold quads into per-cell ink pixels. `scratch` is a per-pixel max buffer,
+/// cleared before returning; only touched pixels are visited.
 fn fold(quads: &[GlowQuad], g: Geom, scratch: &mut [u8]) -> BTreeMap<(u16, u16), u32> {
     let w = g.cols * CW;
     let h = g.rows * CH;
@@ -1225,14 +1219,17 @@ fn untyped_status_cells(h: &Host) -> Vec<(u16, u16, char)> {
     bad
 }
 
-/// **NO INK ON THE MATCH ROW — THE OWNER'S STUB.** Every read presented
-/// whole (one zle redisplay is one write is one read), at 120 Hz and on the
-/// host's own wake schedule, the anchor's glyph handed over or not. From the
-/// Ctrl-R on nothing is typed on row R — zle only re-underlines the match
-/// there — so no cell of it may carry the ribbon's ink: neither its
-/// body/rail nor its hot edge.
+/// **NO INK ON THE MATCH ROW — THE OWNER'S STUB — AND NO BAND UNDER zle'S
+/// FAKE CURSOR — THE OWNER'S SLAB.** Every read presented whole (one zle
+/// redisplay is one write is one read), at 120 Hz and on the host's own wake
+/// schedule, the anchor's glyph handed over or not. From the Ctrl-R on
+/// nothing is typed on row R — zle only re-underlines the match there — so
+/// no cell of it may carry the ribbon's ink: neither its body/rail nor its
+/// hot edge. And on the status row: no ribbon cell under anything but the
+/// search's typed glyphs, none under or right of the `_`, and no band ink at
+/// or right of the `_` on any frame.
 #[test]
-fn whole_reads_lay_no_ink_on_the_match_row() {
+fn whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor() {
     let mut bad = String::new();
     for take in OWNER_TAKES {
         for present in WHOLE {
@@ -1242,43 +1239,37 @@ fn whole_reads_lay_no_ink_on_the_match_row() {
             let over: Vec<_> = h.over_lives.keys().filter(|(row, _)| *row == r).collect();
             if !body.is_empty() || !over.is_empty() {
                 bad.push_str(&format!(
-                    "\n{}/{present:?}: body {body:?} hot edge {over:?}\n{}",
+                    "\n{}/{present:?}: ribbon ink on the match row R: body {body:?} hot edge {over:?}\n{}",
                     take.name,
                     h.report(take.name)
                 ));
             }
+            let cells = untyped_status_cells(&h);
+            if !cells.is_empty() || !h.beyond.is_empty() {
+                let cols: BTreeSet<u16> = h.beyond.iter().map(|b| b.1).collect();
+                bad.push_str(&format!(
+                    "\n{}/{present:?}: band on the minibuffer: cells {cells:?}; ink at/right of `_` on {} frames, cols {cols:?}",
+                    take.name,
+                    h.beyond.len()
+                ));
+            }
         }
     }
-    assert!(bad.is_empty(), "ribbon ink on the match row R:{bad}");
+    assert!(bad.is_empty(), "the owner's shape lit:{bad}");
 }
 
-/// **NO INK ON THE MATCH ROW WHEN THE MATCH HOPS.** A match that is not at
-/// the history entry's first column: zle puts the caret on the newest
-/// entry's rightmost occurrence, so a key walks the VISIBLE caret along row
-/// R — `hop` (history `git log --stat` then `ls -la`, keys `log`: the `l`
-/// hops four cells onto `ls -la`'s last `l`) and `hop2` (`echo hello world`
-/// then `ls -la`, keys `lo w`: the `l` hops the same four cells, the `o`
-/// four more onto `hello`'s `lo`), the latter again with the prompt on a
-/// full screen's last row, so the Ctrl-R scrolls it up one. Each hop is four
-/// cells on one credit and lands under a glyph its key never typed (`-`,
-/// then `hello`'s `l`); nothing is typed on row R, so no cell of it may carry
-/// the ribbon's ink, and each hop is refused `program-row`. The first hop's
-/// press is forgotten with its refusal: kept banked, the `l` press matched
-/// the `l` of `hello` under the second hop's landing, and that landing was
-/// laid (RED with the forget dropped: (R, 38) under `hello`'s `l`, judged
-/// `no-credits`).
-/// Measured before the fix, every presentation: the `l`'s credit-starved
-/// landing laid under `-` at (R, 34), `hop2`'s `o` laid under `hello`'s `l`
-/// at (R, 38), and the ribbon then walked (R, 35..37) between them.
+/// No ink on the match row when the match hops. `hop` (`git log --stat` then
+/// `ls -la`, keys `log`: `l` hops four cells to `ls -la`'s last `l`) and `hop2`
+/// (`echo hello world` then `ls -la`, keys `lo w`: `l` hops four cells, `o`
+/// four more to `hello`'s `lo`), the latter also with the prompt on a full
+/// screen's last row. Each hop is four cells on one credit and lands under a
+/// glyph its key never typed, so it is refused `program-row`, and its press is
+/// forgotten (else it would match `hello`'s `l` at the next landing).
 ///
-/// `backhop` (`echo hello world`, keys `lo`) walks the match BACK: `l` puts
-/// the caret on `world`'s `l` (R, 45), `lo` retreats it six cells to
-/// `hello`'s `lo` (R, 39). A same-row retreat with a press in flight is held
-/// as Ink's park and judged at its own clock, where no probe is that
-/// frame's; the landing gate now reads the glyph the landing held when the
-/// park was held (`HeldPark::landing_cell`). RED before, every presentation:
-/// the flush was `licensed key (R, 45)->(R, 39)` and laid (R, 38) under
-/// `hello`'s first `l`, with ink at (R, 38..39).
+/// `backhop` (`echo hello world`, keys `lo`) walks back: `l` to `world`'s `l`
+/// (R, 45), `lo` six cells back to `hello`'s `lo` (R, 39). The retreat is held
+/// as Ink's park and judged at its own clock, so the landing gate reads the
+/// glyph held with the park (`HeldPark::landing_cell`).
 #[test]
 fn a_match_that_hops_along_its_row_lays_no_ink_there() {
     let mut bad = String::new();
@@ -1327,20 +1318,13 @@ fn a_match_that_hops_along_its_row_lays_no_ink_there() {
     );
 }
 
-/// **AN ENTRY SWITCH SHAPED LIKE A SOFT-WRAPPED CARET LAYS NOTHING.** zsh
-/// Ctrl-R, `a` then `d` (150 ms apart, and 600 ms in `multiline-slow`):
-/// `a` puts the caret on `cat a`'s `a` (R, 35); `ad` switches to an older
-/// two-line entry whose first line holds `d` at that very column and whose
-/// indented second line starts with the match, caret (R+1, 2). That is
-/// exactly Claude Code 2.1.280's soft-wrapped caret — the landing row blank
-/// up to the landing, the origin changed to the fresh key's glyph — and the
-/// soft wrap moves the landing gate's witness to the origin, where `d`
-/// passed it. What tells them apart is the origin row left of the origin:
-/// the composer's key goes in AT the fold and leaves it as it was; zle
-/// rewrote `cat ` as `cd /`. RED before `soft_wrapped_caret` read that
-/// prefix: `licensed key (R, 35)->(R+1, 2)`, a cell at (R, 35) under the
-/// `d` of `cd /d` and body ink at (R, 35) and (R+1, 35), in every
-/// presentation of both takes.
+/// An entry switch shaped like a soft-wrapped caret lays nothing. `a` puts the
+/// caret on `cat a`'s `a` (R, 35); `ad` switches to an older two-line entry
+/// whose first line holds `d` at that column and whose indented second line
+/// starts with the match, caret (R+1, 2). That looks like Claude Code's
+/// soft-wrapped caret, but zle rewrote the origin row left of the origin
+/// (`cat ` to `cd /`), while a composer key goes in at the fold and leaves it,
+/// so `soft_wrapped_caret` rejects it.
 #[test]
 fn an_entry_switch_shaped_like_a_soft_wrap_lays_nothing_on_the_match() {
     let mut bad = String::new();
@@ -1394,16 +1378,12 @@ fn an_entry_switch_shaped_like_a_soft_wrap_lays_nothing_on_the_match() {
     );
 }
 
-/// **BASH'S REVERSE-I-SEARCH RETREAT LAYS NOTHING UNDER THE MATCH.** bash
-/// 3.2, history `echo hello world`, Ctrl-R, `lo w`: `l` hops the caret onto
-/// `world`'s `l` (R, 37); `lo` retreats it to `hello`'s `lo` (R, 32) — the
-/// same held-park retreat as zsh's `backhop`, its landing cell `hello`'s
-/// first `l`. It is refused `program-row` and (R, 31) never gets a cell.
-/// RED before the flushed park's witness: `licensed key (R, 37)->(R, 32)`,
-/// its landing laid at (R, 31). Not pinned here: each later query key inserts
-/// itself inside `(reverse-i-search)` and shifts the line one cell right
-/// (`ESC[1@`), a typed `+1` whose cell is the match's own text — the
-/// ordinary one-cell echo, which no witness reads.
+/// Bash's reverse-i-search retreat lays nothing under the match: bash 3.2,
+/// `echo hello world`, Ctrl-R, `lo w`. `lo` retreats from `world`'s `l`
+/// (R, 37) to `hello`'s `lo` (R, 32), the same held-park retreat as zsh's
+/// `backhop`; it is refused `program-row` and (R, 31) gets no cell. Not pinned:
+/// later query keys insert inside `(reverse-i-search)` (`ESC[1@`), an ordinary
+/// one-cell echo.
 #[test]
 fn bash_s_reverse_search_retreat_lays_nothing_under_the_match() {
     for present in WHOLE {
@@ -1431,30 +1411,6 @@ fn bash_s_reverse_search_retreat_lays_nothing_under_the_match() {
             h.report("bash")
         );
     }
-}
-
-/// **NO BAND UNDER zle'S FAKE CURSOR — THE OWNER'S SLAB.** The same replays:
-/// no ribbon cell on the status row under anything but the search's typed
-/// glyphs, none under or right of the `_`, and no band ink at or right of
-/// the `_` on any frame.
-#[test]
-fn the_status_row_carries_no_band_under_zle_s_fake_cursor() {
-    let mut bad = String::new();
-    for take in OWNER_TAKES {
-        for present in WHOLE {
-            let h = replay(take, present);
-            let cells = untyped_status_cells(&h);
-            if !cells.is_empty() || !h.beyond.is_empty() {
-                let cols: BTreeSet<u16> = h.beyond.iter().map(|b| b.1).collect();
-                bad.push_str(&format!(
-                    "\n{}/{present:?}: cells {cells:?}; ink at/right of `_` on {} frames, cols {cols:?}",
-                    take.name,
-                    h.beyond.len()
-                ));
-            }
-        }
-    }
-    assert!(bad.is_empty(), "band on the minibuffer:{bad}");
 }
 
 /// **THE MINIBUFFER'S ECHOES ARE REFUSED, NOT LAID.** The mechanism, on the
@@ -1494,11 +1450,9 @@ fn the_minibuffer_echoes_are_refused_program_row() {
     );
 }
 
-/// **THE SHAPE WITH THE FEWEST BYTES.** A visible caret parked after a
-/// 3-column prompt that never moves; per key the program drops a row, prints
-/// `<glyph>_` on the status row and climbs back — zle's i-search refresh
-/// without the match text. Nothing is laid under the fake cursor, whether the
-/// glyph comes from the host or from the caret row's probes.
+/// The shape with the fewest bytes: a visible caret parked after a 3-column
+/// prompt; per key the program drops a row, prints `<glyph>_` and climbs back.
+/// Nothing is laid under the fake cursor, glyph from the host or the probes.
 #[test]
 fn a_minibuffer_echo_below_a_stationary_caret_lays_nothing_under_its_fake_cursor() {
     for anchor_glyph in [true, false] {
@@ -1542,13 +1496,10 @@ fn a_minibuffer_echo_below_a_stationary_caret_lays_nothing_under_its_fake_cursor
     }
 }
 
-/// **THE SAME LAW OVER A LONGER SEARCH.** The search carried on past the
-/// failing `d`: Backspace, `ude` to match again, Right to leave the search,
-/// then ` x` typed on the prompt row. While the search runs, the status row
-/// carries no band under a glyph nobody typed and the prompt row carries
-/// none at all; after it, the prompt row carries only the Right hop's own
-/// cells and the keys typed there (a Right over text lays its hop at any
-/// prompt) — never the prompt's text.
+/// A longer search: Backspace, `ude`, Right to leave, ` x` on the prompt row.
+/// During the search the status row has no band under untyped glyphs and the
+/// prompt row none at all; after it the prompt row carries only the Right
+/// hop's own cells and the keys typed there.
 #[test]
 fn a_longer_search_lays_no_band_on_cells_nobody_typed() {
     let h = replay(CONTINUE, APP);
@@ -1583,13 +1534,9 @@ fn a_longer_search_lays_no_band_on_cells_nobody_typed() {
     );
 }
 
-/// **MUST NOT BREAK — TYPING AFTER THE SEARCH.** Once the search is left
-/// (Right) the hand types ` x` on the prompt row, and each of those two keys
-/// lights its OWN cell — the ribbon cell under its own glyph, born within
-/// 100 ms of its own key: the fix darkens the minibuffer, never the prompt
-/// row's own typing after it. (Keyed on the glyph and the key's clock: the
-/// Right's hop has already laid a cell at the space's column, under the
-/// `l` that stood there.)
+/// Typing after the search: after Right, each of ` x` lights its own cell,
+/// under its glyph, born within 100 ms of its key. (Keyed on glyph and clock:
+/// the Right's hop already laid a cell at the space's column.)
 #[test]
 fn typing_on_the_prompt_row_after_leaving_the_search_still_lights_its_cells() {
     let h = replay(CONTINUE, APP);
@@ -1615,14 +1562,10 @@ fn typing_on_the_prompt_row_after_leaving_the_search_still_lights_its_cells() {
     }
 }
 
-/// **THE REFUSED PRESSES ARE FORGOTTEN.** Each refused minibuffer echo drops
-/// the presses it was the echo of (the in-flight law): `u`, `d` and `e`
-/// echoed on the status row, so nothing typed during the search may pay for
-/// a move after it. The Right that leaves the search is licensed by its own
-/// key, and no verdict from the Ctrl-R on is `licence=inflight`. RED with the
-/// refusal kept but the forget dropped: the three presses stay banked and
-/// the Right's hop reads `licensed inflight (10, 31)->(10, 32)`, paid by
-/// keys that echoed elsewhere.
+/// Refused presses are forgotten: `u`, `d` and `e` echoed on the status row,
+/// so nothing typed during the search pays for a later move. The Right is
+/// licensed by its own key, and no verdict from the Ctrl-R on is
+/// `licence=inflight`.
 #[test]
 fn the_refused_search_keys_pay_for_nothing_after_the_search() {
     let h = replay(CONTINUE, APP);
@@ -1651,13 +1594,10 @@ fn the_refused_search_keys_pay_for_nothing_after_the_search() {
     );
 }
 
-/// **THE WRAPPED MATCH.** An 85-character history entry after the 31-column
-/// prompt wraps, so zle draws its status row under the match's LAST line.
-/// The first key's match is the entry's last `g` (of `bug`), on that last
-/// line, one row above the status row; from `gi` on the caret parks on the
-/// match's first glyph, two rows above it — out of the caret row probe's
-/// reach. Handed the anchor's glyph as the app hands it, the lane lays
-/// nothing under the fake cursor there either.
+/// The wrapped match: an 85-character entry after the 31-column prompt wraps,
+/// so the status row sits under the match's last line. From `gi` on the caret
+/// parks two rows above the status row, beyond the probe's reach; with the
+/// anchor's glyph handed over, nothing is laid under the fake cursor.
 #[test]
 fn a_wrapped_match_lays_nothing_under_zle_s_fake_cursor() {
     let h = replay(WRAPPED, APP);
@@ -1685,48 +1625,52 @@ fn a_wrapped_match_lays_nothing_under_zle_s_fake_cursor() {
     assert!(h.beyond.is_empty(), "ink at/right of `_`: {:?}", h.beyond);
 }
 
-/// **THE GATES' BLAST RADIUS — THE COMPOSERS.** Claude Code's and Codex's
-/// composer takes fed as the app feeds them — each key banked with its
-/// glyph, the anchor handed over with its glyph, the caret as the
-/// single-pane window hands it over and as the composed paths do — print
-/// off the caret's row again and again (the parked arm the minibuffer gate
-/// sits on), and neither gate refuses anything there. Both gates log every
-/// refusal `program-row`, and these takes have no other `program-row`
-/// verdict, so none at all means neither fired and every cell these takes
-/// lit is lit as before the gates.
+/// The gates' blast radius: Claude Code's and Codex's composer takes, fed as
+/// the app feeds them (window and composed carets), print off the caret's row
+/// repeatedly, and neither gate refuses anything. Both gates log refusals as
+/// `program-row`, and these takes have no other such verdict, so none at all
+/// means neither fired.
 #[test]
 fn the_gates_refuse_nothing_in_claude_code_s_or_codex_s_composer() {
+    // Each take under each caret is its own replay: they run on the binary's
+    // threads and are judged in order (2026-09-30: the 32 replays, one after
+    // another, were this binary's 25 s wall; on the pool, 4.9 s).
+    let runs: Vec<(&Composer, bool)> = COMPOSERS
+        .iter()
+        .flat_map(|take| [(take, true), (take, false)])
+        .collect();
+    let read = crate::common::par_map(&runs, |&(take, window_caret)| {
+        let h = replay_composer(
+            take,
+            Present {
+                window_caret,
+                ..APP
+            },
+        );
+        let licensed = h
+            .ring
+            .iter()
+            .filter(|v| v.licence != AdmissionRecord::LICENCE_NONE)
+            .count();
+        let refused: Vec<Verdict> = h
+            .ring
+            .iter()
+            .filter(|v| v.reason == CursorGlow::DECLINE_PROGRAM_ROW)
+            .copied()
+            .collect();
+        (h.keys.len(), licensed, h.parked_prints.len(), refused)
+    });
     let mut bad = String::new();
     let mut parked = 0usize;
-    for take in &COMPOSERS {
-        for window_caret in [true, false] {
-            let h = replay_composer(
-                take,
-                Present {
-                    window_caret,
-                    ..APP
-                },
-            );
-            assert!(h.keys.len() >= 5, "non-vacuity: {} types", take.name);
-            let licensed = h
-                .ring
-                .iter()
-                .filter(|v| v.licence != AdmissionRecord::LICENCE_NONE)
-                .count();
-            assert!(licensed >= 5, "non-vacuity: {} lights its keys", take.name);
-            parked += h.parked_prints.len();
-            let refused: Vec<Verdict> = h
-                .ring
-                .iter()
-                .filter(|v| v.reason == CursorGlow::DECLINE_PROGRAM_ROW)
-                .copied()
-                .collect();
-            if !refused.is_empty() {
-                bad.push_str(&format!(
-                    "\n{} (window caret {window_caret}): {refused:?}",
-                    take.name
-                ));
-            }
+    for (&(take, window_caret), (keys, licensed, parked_prints, refused)) in runs.iter().zip(read) {
+        assert!(keys >= 5, "non-vacuity: {} types", take.name);
+        assert!(licensed >= 5, "non-vacuity: {} lights its keys", take.name);
+        parked += parked_prints;
+        if !refused.is_empty() {
+            bad.push_str(&format!(
+                "\n{} (window caret {window_caret}): {refused:?}",
+                take.name
+            ));
         }
     }
     assert!(
@@ -1736,17 +1680,12 @@ fn the_gates_refuse_nothing_in_claude_code_s_or_codex_s_composer() {
     assert!(bad.is_empty(), "a gate refused a composer echo:{bad}");
 }
 
-/// **A HIDDEN CARET KEEPS ITS LANE ON EVERY PATH.** A TUI that hides the
-/// caret, parks it on the row below its input and draws its OWN fake cursor
-/// after each echoed key (`> a█`, `> ab█`, …): every print run ends on the
-/// fake cursor, a glyph no key typed. The composed, focus and headless
-/// paths hand over no caret while DECTCEM hides it; the single-pane window
-/// hands it over (a hidden cursor is still a caret, for the pet) and says it
-/// is hidden (`observe_caret_drawn`), so the minibuffer gate — a law about a
-/// VISIBLE caret — stays out of it on both: the same cells, and no
-/// `program-row` refusal. RED with the gate reading the window's hidden
-/// caret as parked: the window path refuses all three echoes and lays
-/// nothing.
+/// A hidden caret keeps its lane on every path: a TUI hides the caret, parks it
+/// below its input and draws its own fake cursor after each echo (`> a█`), so
+/// every run ends on a glyph no key typed. The composed paths hand over no
+/// hidden caret; the single-pane window hands it over marked hidden
+/// (`observe_caret_drawn`), so the visible-caret gate stays out: same cells,
+/// no `program-row` refusal.
 #[test]
 fn a_hidden_caret_s_echo_is_judged_alike_on_every_path() {
     let lay = |window_caret| {
@@ -1798,9 +1737,8 @@ fn a_hidden_caret_s_echo_is_judged_alike_on_every_path() {
     }
 }
 
-/// **THE CONTROL — PLAIN TYPING.** The same four keys typed at the plain
-/// prompt light their four cells and are gone by the idle ceiling: the
-/// normal schedule, unchanged.
+/// Control: the same four keys at the plain prompt light four cells and are
+/// gone by the idle ceiling.
 #[test]
 fn plain_prompt_typing_lights_and_retires_on_the_normal_schedule() {
     let mut h = Host::new(PLAIN.rows, PLAIN.cols, APP);
@@ -1832,10 +1770,8 @@ fn plain_prompt_typing_lights_and_retires_on_the_normal_schedule() {
     );
 }
 
-/// **A PARKED CARET'S OWN ECHO STILL LIGHTS.** The negative control for the
-/// gate: the same stationary visible caret, but the program's run on the row
-/// below ends on the KEY — the ordinary parked-caret echo the lane exists
-/// for — so each key's cell is laid under its own glyph.
+/// A parked caret's own echo still lights: the program's run on the row below
+/// ends on the key, so each key's cell is laid under its own glyph.
 #[test]
 fn a_parked_caret_s_own_echo_still_lights() {
     let mut h = Host::new(24, 100, APP);
@@ -1860,14 +1796,56 @@ fn a_parked_caret_s_own_echo_still_lights() {
     );
 }
 
-/// **TYPEAHEAD INTO THE MINIBUFFER.** Two keys pressed before the first
-/// one's echo is presented: both echoes end on `_`, foreign to both live
-/// presses, so the first is refused by the glyph gate, and the second finds
-/// no credit (the first refusal forgot both presses; a stamp with no credit
-/// behind it licenses no light) — nothing is laid under the fake cursor.
-/// This law holds with or without that forget (the gate alone refuses both
-/// echoes); `the_refused_search_keys_pay_for_nothing_after_the_search` is
-/// the one that pins it.
+/// Enter hands the line over: `ls` at the prompt on row R, then Enter; the
+/// program draws its input two rows down and parks its visible caret on row R,
+/// echoing keys on the input row. Enter took the hand off row R, so the
+/// hand's-row hold does not refuse the program's echoes: each key lays under
+/// its glyph, and the first names the input row as the hand's.
+#[test]
+fn a_parked_caret_s_own_echo_lights_after_enter_on_the_caret_s_row() {
+    let mut h = Host::new(24, 100, APP);
+    h.feed(b"\x1b[5;1Hp% ");
+    let r = h.term.cursor().row;
+    h.census_from = Some((h.us(), r));
+    for k in "ls".chars() {
+        h.idle_ms(120);
+        h.hint(&[k as u8]);
+        h.feed(k.to_string().as_bytes());
+    }
+    h.idle_ms(120);
+    assert_eq!(
+        h.cells_on(r),
+        vec![(3, 'l'), (4, 's')],
+        "PRECONDITION: the hand typed on row R:\n{}",
+        h.report("prompt")
+    );
+    h.hint(b"\r");
+    h.feed(b"\r\n");
+    // The program starts: its input row two rows down, the visible caret
+    // parked back on row R.
+    h.idle_ms(400);
+    h.census_from = Some((h.us(), r + 2));
+    h.feed(format!("\x1b[{};1H> \x1b[{};3H", r + 3, r + 1).as_bytes());
+    for (i, k) in "abc".chars().enumerate() {
+        h.idle_ms(120);
+        h.hint(&[k as u8]);
+        h.feed(format!("\x1b[{};{}H{k}\x1b[{};3H", r + 3, 3 + i, r + 1).as_bytes());
+        assert_eq!(h.term.cursor().row, r, "the caret stays parked on row R");
+    }
+    h.idle_ms(200);
+    assert_eq!(h.text(r + 2), "> abc");
+    assert_eq!(
+        h.cells_on(r + 2),
+        vec![(2, 'a'), (3, 'b'), (4, 'c')],
+        "each key laid under its own glyph:\n{}",
+        h.report("after enter")
+    );
+}
+
+/// Typeahead into the minibuffer: two keys pressed before the first echo is
+/// presented both end on `_`; the first is refused by the glyph gate and the
+/// second finds no credit, so nothing is laid under the fake cursor. The forget
+/// itself is pinned by `the_refused_search_keys_pay_for_nothing_after_the_search`.
 #[test]
 fn typeahead_into_the_minibuffer_lays_nothing() {
     let mut h = Host::new(24, 100, APP);
@@ -1894,10 +1872,9 @@ fn typeahead_into_the_minibuffer_lays_nothing() {
     );
 }
 
-/// **A GLYPH-LESS PRESS KEEPS THE LANE.** The host banks a wide glyph (and an
-/// IME commit) by its cell count alone, so the gate cannot judge it: a CJK
-/// key echoed on the row below a parked visible caret is laid exactly as
-/// before, though the run ends on the glyph's continuation column.
+/// A glyph-less press keeps the lane: a wide glyph or IME commit is banked by
+/// cell count alone, so a CJK key echoed below a parked visible caret is laid
+/// as usual though the run ends on its continuation column.
 #[test]
 fn a_wide_glyph_echo_below_a_parked_caret_still_lights() {
     let mut h = Host::new(24, 100, APP);
@@ -1925,16 +1902,50 @@ fn a_wide_glyph_echo_below_a_parked_caret_still_lights() {
     );
 }
 
-/// **LATENT, NOT THE OWNER'S SHAPE: A PRESENT INSIDE ONE zle WRITE.** A
-/// present after every piece of every redisplay: the caret visits every
-/// intermediate cell, the match's re-underlined glyphs among them, and the
-/// visible lane lays cells on row R. Every local take delivered each
-/// redisplay as one read; a redisplay larger than the tty's output chunk (a
-/// long wrapped match) or a remote zsh over ssh could arrive split, and then
-/// this is what the glass would show.
-#[test]
-#[ignore = "latent: needs a read boundary inside one zle redisplay; local whole reads (spawn.rs, one term-lock hold per read under 8 KiB) never present one"]
-fn torn_reads_lay_no_band_on_the_match_row() {
+/// How long light laid on a torn redisplay may stay on the match row: the
+/// caret's rest (`CursorGlow::TORN_REST_S`, 32 ms) and a frame to see it,
+/// then the recall's retract (`12·n + 240` ms for the one or two cells laid)
+/// and its last frame.
+const RECALL_BOUND_MS: u64 = 330;
+
+/// Band ink on the match row that outlived [`RECALL_BOUND_MS`] — from its
+/// first frame when one read tore, from the search's last key when every
+/// read did (each key then re-lays the match's glyph while the last lay is
+/// still retracting) — and live ribbon cells left on it once the replay
+/// rested.
+fn match_row_kept(h: &Host) -> Vec<String> {
+    let r = h.match_row();
+    let every = h.present.tear == Tear::Every;
+    let last_key = h.last_key_us();
+    let mut kept: Vec<String> = h
+        .lives
+        .iter()
+        .filter(|((row, _), l)| {
+            let from = if every { last_key } else { l.first_us };
+            *row == r && l.last_us.saturating_sub(from) > RECALL_BOUND_MS * 1000
+        })
+        .map(|((_, c), l)| {
+            let from = if every { last_key } else { l.first_us };
+            format!("ink ({r},{c}) {} ms", l.last_us.saturating_sub(from) / 1000)
+        })
+        .collect();
+    kept.extend(live_cols(h, r).iter().map(|c| format!("live ({r},{c})")));
+    kept
+}
+
+/// Any band ink on the match row, with how long each cell carried it.
+fn match_row_inked(h: &Host) -> Vec<String> {
+    let r = h.match_row();
+    h.lives
+        .iter()
+        .filter(|((row, _), _)| *row == r)
+        .map(|((_, c), l)| format!("({r},{c}) {} ms", (l.last_us - l.first_us) / 1000))
+        .collect()
+}
+
+/// Every owner take with a present after every piece of every read, on the
+/// 120 Hz train and on the host's wake: what `law` finds, per replay.
+fn every_tear(law: fn(&Host) -> Vec<String>) -> String {
     let mut bad = String::new();
     for take in OWNER_TAKES {
         for host_wake in [false, true] {
@@ -1946,24 +1957,20 @@ fn torn_reads_lay_no_band_on_the_match_row() {
                     ..APP
                 },
             );
-            let r = h.match_row();
-            let body: Vec<_> = h.lives.keys().filter(|(row, _)| *row == r).collect();
-            if !body.is_empty() {
-                bad.push_str(&format!("\n{}/{host_wake}: {body:?}", take.name));
+            let found = law(&h);
+            if !found.is_empty() {
+                bad.push_str(&format!("\n{}/{host_wake}: {found:?}", take.name));
             }
         }
     }
-    assert!(bad.is_empty(), "band body on the match row R:{bad}");
+    bad
 }
 
-/// **LATENT: ONE TORN READ, EVERY BOUNDARY.** Each of the search's output
-/// reads torn at each of its piece boundaries, one at a time, everything
-/// else whole: the match row's band body stays dark.
-#[test]
-#[ignore = "latent: needs a read boundary inside one zle redisplay; local whole reads (spawn.rs, one term-lock hold per read under 8 KiB) never present one"]
-fn one_torn_read_at_any_boundary_lays_no_band_on_the_match_row() {
-    let mut bad = String::new();
-    let mut tried = 0usize;
+/// Each owner take's search reads torn at each of their piece boundaries,
+/// one at a time, everything else whole: what `law` finds, per tear, with
+/// how many tears were tried and how many recalls the ring logged.
+fn one_tear(law: fn(&Host) -> Vec<String>) -> (String, usize, usize) {
+    let (mut bad, mut tried, mut recalled) = (String::new(), 0, 0);
     for take in OWNER_TAKES {
         let evs = events(take.src);
         let from = evs
@@ -1989,27 +1996,253 @@ fn one_torn_read_at_any_boundary_lays_no_band_on_the_match_row() {
                         ..APP
                     },
                 );
-                let r = h.match_row();
-                let cols: Vec<u16> = h
-                    .lives
-                    .keys()
-                    .filter(|(row, _)| *row == r)
-                    .map(|(_, c)| *c)
-                    .collect();
-                if !cols.is_empty() {
+                recalled += h.ring.iter().filter(|v| v.licence == "recall").count();
+                let found = law(&h);
+                if !found.is_empty() {
                     bad.push_str(&format!(
-                        "\n{} read {n} torn after piece {k}: match-row cols {cols:?}",
+                        "\n{} read {n} torn after piece {k}: {found:?}",
                         take.name
                     ));
                 }
             }
         }
     }
+    (bad, tried, recalled)
+}
+
+/// **A PRESENT INSIDE ONE zle WRITE IS RECALLED.** A present after every
+/// piece of every redisplay: the caret visits every intermediate cell, and
+/// the frame that caught zle printing the match's own glyph at the caret is
+/// the very frame a typed echo draws, so the visible lane lays it. zle then
+/// prints its status row below and walks the caret back ON the match, left
+/// of what was laid, with no key behind the move — a glyph's echo never
+/// leaves the caret behind it — and the lay is recalled (`licence=recall`):
+/// nothing on row R outlives the last key's recall. Every local take
+/// delivered each redisplay as one read; a redisplay larger than the tty's
+/// output chunk (a long wrapped match) or a remote zsh over ssh can arrive
+/// split. RED before the recall (2026-09-30): the lays lived about 2 s on
+/// row R (`c` at (R, 31) from 161 ms to 2,208 ms in the bare take). The
+/// zero-ink law is the latent row [`torn_reads_lay_no_band_on_the_match_row`].
+#[test]
+fn torn_reads_leave_no_band_on_the_match_row() {
+    let bad = every_tear(match_row_kept);
+    assert!(bad.is_empty(), "band kept on the match row R:{bad}");
+}
+
+/// **ONE TORN READ, EVERY BOUNDARY, IS RECALLED.** Whatever the torn frame
+/// laid on the match row is recalled when the caret rests, and nothing on
+/// it outlives the recall. Non-vacuous: the sweep must catch a lay and
+/// recall it. The zero-ink law is the latent row
+/// [`one_torn_read_at_any_boundary_lays_no_band_on_the_match_row`].
+#[test]
+fn one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row() {
+    let (bad, tried, recalled) = one_tear(match_row_kept);
+    assert!(tried > 100, "the sweep tried {tried} tears");
+    assert!(recalled > 0, "non-vacuity: some tear laid and was recalled");
+    assert!(
+        bad.is_empty(),
+        "a single torn read left band on the match row:{bad}"
+    );
+}
+
+/// **LATENT: A TORN REDISPLAY LAYS NO BAND ON THE MATCH ROW AT ALL.** The
+/// law the recall does not meet: it SHORTENS the band a frame caught
+/// mid-redisplay lays, it does not refuse it (RAINBOW-PATH-V3 §8 D-13 — no
+/// lay-time witness tells zle printing the match's glyph at the caret from
+/// the key's echo). Measured 2026-09-30 with the recall: every read torn,
+/// (R, 31) carried ink 731 ms (g150), 469 ms (g60), 310 ms (burst) and
+/// 861 ms (cap120) on the 120 Hz train — the whole search, each key
+/// re-laying it — and one read torn, 62 of 185 tears laid, each cell for
+/// at most 238 ms (before the recall: 1.7-2.0 s).
+#[test]
+#[ignore = "latent: the recall shortens a torn redisplay's band (<= 0.24 s; 0.3-0.9 s while every read tears), it does not refuse it — RAINBOW-PATH-V3 §8 D-13"]
+fn torn_reads_lay_no_band_on_the_match_row() {
+    let bad = every_tear(match_row_inked);
+    assert!(bad.is_empty(), "band on the match row R:{bad}");
+}
+
+/// **LATENT: ONE TORN READ LAYS NO BAND ON THE MATCH ROW AT ALL** — the
+/// single-tear sweep under the zero-ink law
+/// ([`torn_reads_lay_no_band_on_the_match_row`] says why it is latent).
+#[test]
+#[ignore = "latent: the recall shortens a torn redisplay's band (<= 0.24 s; 0.3-0.9 s while every read tears), it does not refuse it — RAINBOW-PATH-V3 §8 D-13"]
+fn one_torn_read_at_any_boundary_lays_no_band_on_the_match_row() {
+    let (bad, tried, _) = one_tear(match_row_inked);
     assert!(tried > 100, "the sweep tried {tried} tears");
     assert!(
         bad.is_empty(),
         "a single torn read laid band on the match row:{bad}"
     );
+}
+
+/// **A CARET THAT RESTS RIGHT OF THE ECHO KEEPS IT** — the recall's
+/// negative control. A highlighter's redraw (the key's echo, then back to the
+/// word's start and the word reprinted in its new colour), torn after every
+/// piece, walks the caret left of the echo mid-write but rests right of it:
+/// the key's cell stays. An arrow pressed right after an echo walks the
+/// caret onto it behind a key: that cell stays too. Nothing is recalled.
+#[test]
+fn a_caret_resting_right_of_the_echo_or_behind_a_key_keeps_it() {
+    let mut h = Host::new(24, 100, APP);
+    h.feed(b"\x1b[5;1Hp% ");
+    let r = h.term.cursor().row;
+    h.census_from = Some((h.us(), r));
+    for k in "ls".chars() {
+        h.idle_ms(120);
+        h.hint(&[k as u8]);
+        h.feed(k.to_string().as_bytes());
+    }
+    h.idle_ms(120);
+    h.hint(b"x");
+    for piece in [&b"x"[..], b"\x1b[3D", b"\x1b[32mlsx\x1b[m"] {
+        h.feed(piece);
+        h.now += Duration::from_micros(50);
+    }
+    h.idle_ms(120);
+    h.hint(b"y");
+    h.feed(b"y");
+    h.idle_ms(20);
+    h.hint(b"\x1b[D");
+    h.feed(b"\x1b[D");
+    h.idle_ms(100);
+    assert_eq!(
+        (h.term.cursor().row, h.term.cursor().col),
+        (r, 6),
+        "the arrow put the caret on `y`"
+    );
+    let live: Vec<u16> = h
+        .glow
+        .v2_ribbon()
+        .expect("rainbow kitty owns the frame")
+        .cells()
+        .iter()
+        .filter(|x| x.row == r && !x.leaving())
+        .map(|x| x.col)
+        .collect();
+    assert!(
+        [3, 4, 5, 6].iter().all(|c| live.contains(c)),
+        "`lsxy` stays lit: {live:?}\n{}",
+        h.report("rest right")
+    );
+    assert!(
+        h.ring.iter().all(|v| v.licence != "recall"),
+        "nothing recalled:\n{}",
+        h.report("rest right")
+    );
+}
+
+/// A prompt `p% ` on the fifth row, the census running from it; the row.
+fn plain_prompt(h: &mut Host) -> u16 {
+    h.feed(b"\x1b[5;1Hp% ");
+    let r = h.term.cursor().row;
+    h.census_from = Some((h.us(), r));
+    r
+}
+
+/// The live (not leaving) ribbon cells on `row`.
+fn live_cols(h: &Host, row: u16) -> Vec<u16> {
+    h.glow
+        .v2_ribbon()
+        .expect("rainbow kitty owns the frame")
+        .cells()
+        .iter()
+        .filter(|x| x.row == row && !x.leaving())
+        .map(|x| x.col)
+        .collect()
+}
+
+/// **A KEYLESS WALK BACK ONTO A TYPED ECHO KEEPS IT** — the recall's other
+/// negative controls; each walks the caret back onto the cell a key just
+/// laid, with no key behind the move. A highlighter's redraw split across
+/// reads (the echo, a step left, 60 ms, the glyph recoloured), the same
+/// redraw torn into the next key's echo, and a keyless step left 10 ms after
+/// the echo (vi-mode Escape: its key is no typed press) print nothing off
+/// the echo's row. vim's `showmatch` does (the ruler), but the hand was
+/// already typing on the row. And an earlier key's cell at or right of where
+/// the caret rests keeps the lay whatever was printed. RED before the recall
+/// asked for a print off the row and a hand off it (2026-09-30): the first
+/// three and `showmatch` recalled every cell (lit `[]`, not `[3]`, `[3, 4]`,
+/// `[3]` and `[4]`).
+#[test]
+fn a_keyless_walk_back_onto_a_typed_echo_keeps_it() {
+    let mut bad = String::new();
+    // The highlighter's redraw, split 60 ms across reads.
+    let mut h = Host::new(24, 100, APP);
+    let r = plain_prompt(&mut h);
+    h.idle_ms(120);
+    h.hint(b"l");
+    h.feed(b"l");
+    h.feed(b"\x1b[D");
+    h.idle_ms(60);
+    h.feed(b"\x1b[32ml\x1b[m");
+    h.idle_ms(100);
+    let lit = live_cols(&h, r);
+    if lit != [3] {
+        bad.push_str(&format!("\nsplit redraw: {lit:?}\n{}", h.report("split")));
+    }
+    // …torn into the next key's echo.
+    let mut h = Host::new(24, 100, APP);
+    let r = plain_prompt(&mut h);
+    h.idle_ms(120);
+    h.hint(b"l");
+    h.feed(b"l");
+    h.feed(b"\x1b[D");
+    h.idle_ms(16);
+    h.hint(b"s");
+    h.feed(b"\x1b[32ml\x1b[ms");
+    h.idle_ms(100);
+    let lit = live_cols(&h, r);
+    if lit != [3, 4] {
+        bad.push_str(&format!(
+            "\ninto the next key: {lit:?}\n{}",
+            h.report("next")
+        ));
+    }
+    // A keyless step left 10 ms after the echo (vi-mode Escape).
+    let mut h = Host::new(24, 100, APP);
+    let r = plain_prompt(&mut h);
+    h.idle_ms(120);
+    h.hint(b"l");
+    h.feed(b"l");
+    h.idle_ms(10);
+    h.glow.clear_typed(h.now);
+    h.feed(b"\x1b[D");
+    h.idle_ms(100);
+    let lit = live_cols(&h, r);
+    if lit != [3] {
+        bad.push_str(&format!("\nvi escape: {lit:?}\n{}", h.report("escape")));
+    }
+    // An earlier key's cell right of the rest, after a print off the row.
+    let mut h = Host::new(24, 100, APP);
+    let r = plain_prompt(&mut h);
+    for k in "ls".chars() {
+        h.idle_ms(120);
+        h.hint(&[k as u8]);
+        h.feed(k.to_string().as_bytes());
+    }
+    h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+    h.idle_ms(100);
+    let lit = live_cols(&h, r);
+    if lit != [3, 4] {
+        bad.push_str(&format!("\nforeign cell: {lit:?}\n{}", h.report("foreign")));
+    }
+    // vim's `showmatch`: `)` typed on a row the hand is typing on, the
+    // ruler printed below, the caret resting on the `(` a while.
+    let mut h = Host::new(24, 100, APP);
+    let r = plain_prompt(&mut h);
+    h.idle_ms(120);
+    h.hint(b"(");
+    h.feed(b"(");
+    h.idle_ms(6_000);
+    h.hint(b")");
+    h.feed(b")");
+    h.feed(b"\x1b[24;90H1,5\x1b[5;4H");
+    h.idle_ms(100);
+    let lit = live_cols(&h, r);
+    if lit != [4] {
+        bad.push_str(&format!("\nshowmatch: {lit:?}\n{}", h.report("showmatch")));
+    }
+    assert!(bad.is_empty(), "a typed echo was recalled:{bad}");
 }
 
 /// **NOTHING PERSISTS.** Whatever the search's replays lit — whole, torn at

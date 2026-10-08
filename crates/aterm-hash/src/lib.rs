@@ -3,9 +3,8 @@
 
 //! Fast non-cryptographic hashing for aterm.
 //!
-//! This crate provides an inline implementation of the FxHash algorithm,
-//! replacing the external `rustc-hash` dependency. FxHash is a speedy,
-//! non-cryptographic hash designed by Orson Peters for use in `rustc`.
+//! An inline FxHash, bit-compatible with `rustc-hash` 2.1: the fast,
+//! non-cryptographic hash `rustc` uses.
 //!
 //! # Exported types
 //!
@@ -13,6 +12,9 @@
 //! - [`FxBuildHasher`] -- a zero-sized [`BuildHasher`] that creates `FxHasher`s
 //! - [`FxHashMap`] -- type alias for `HashMap<K, V, FxBuildHasher>`
 //! - [`FxHashSet`] -- type alias for `HashSet<V, FxBuildHasher>`
+//! - [`fnv1a_64`], [`fnv1a_64_extend`], [`Fnv1a64`], [`fnv_mix_u64`],
+//!   [`FNV64_OFFSET`], [`FNV64_PRIME`] -- FNV-1a/64, the one hash whose values
+//!   may persist or cross a crate boundary (see the `fnv` module)
 //!
 //! # Example
 //!
@@ -26,6 +28,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
+
+mod fnv;
+pub use fnv::{FNV64_OFFSET, FNV64_PRIME, Fnv1a64, fnv_mix_u64, fnv1a_64, fnv1a_64_extend};
 
 /// Type alias for a hash map using the Fx hashing algorithm.
 pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
@@ -41,10 +46,8 @@ const K: usize = 0xf1357aea2e62a9c5;
 #[cfg(target_pointer_width = "32")]
 const K: usize = 0x93d765dd;
 
-/// A speedy, non-cryptographic hasher.
-///
-/// Uses a polynomial hash with a single bit rotation as a finishing step,
-/// designed by Orson Peters. This is the same algorithm used by `rustc-hash`.
+/// A fast, non-cryptographic hasher (the `rustc-hash` FxHash algorithm): a
+/// polynomial hash with a single bit rotation as a finishing step.
 ///
 /// **Do not use for cryptographic purposes or untrusted input where HashDoS
 /// resistance is required.**
@@ -98,23 +101,15 @@ impl Hasher for FxHasher {
 
     #[inline]
     fn write_u128(&mut self, i: u128) {
-        // Split `i` into usize-width words via its little-endian byte
-        // representation. Bit-identical to the previous
-        // `(i & usize::MAX as u128) as usize` / `(i >> 64) as usize` pair
-        // (and the 32-bit `i >> 32/64/96` chain): word k of the LE bytes IS
-        // those bits of `i`. Written this way because 128-bit shift
-        // obligations get no native full-verifier evidence (u128 `>>` stayed
-        // DESIGN-REQUIRED at any shift amount), leaving this function
-        // INCONCLUSIVE under the strict gate.
+        // Split `i` into usize-width words via its little-endian bytes (word k
+        // of the bytes is those bits of `i`), avoiding 128-bit shifts, which
+        // the strict verifier cannot discharge.
         let b = i.to_le_bytes();
-        // Unsizing coercion to a slice first: range-indexing an array goes
-        // through `std::ops::Index::index`, which the native TrustIr lowering
-        // does not model, while the identical range on a slice lowers fine.
+        // Coerce to a slice first: the TrustIr lowering does not model array
+        // range-indexing (`Index::index`), but does model slice ranges.
         let bs: &[u8] = &b;
-        // `read_u64_le(bs)`/`read_u32_le(bs)` read exactly the leading
-        // 8/4 bytes, and the `bs.len() >= 16` guards are always true (`b` is
-        // `[u8; 16]`); the guards re-establish the slice length locally for
-        // the L0 solver, which does not carry the array length through the
+        // The `bs.len() >= 16` guards always hold (`b` is `[u8; 16]`); they
+        // restate the length for the L0 solver, which loses it through the
         // unsizing coercion.
         #[cfg(target_pointer_width = "64")]
         {
@@ -167,21 +162,15 @@ fn multiply_mix(x: u64, y: u64) -> u64 {
     #[cfg(target_pointer_width = "64")]
     {
         let full = (x as u128) * (y as u128);
-        // Split the 128-bit product into its two u64 halves via the
-        // little-endian byte representation: bit-identical to
-        // `(full & u64::MAX as u128) as u64` and `(full >> 64) as u64`, but
-        // avoids 128-bit shift obligations, which get no native
-        // full-verifier evidence (see `write_u128`).
+        // Split the 128-bit product into its u64 halves via the little-endian
+        // bytes, avoiding 128-bit shifts (see `write_u128`).
         let b = full.to_le_bytes();
-        // Unsizing coercion to a slice first: range-indexing an array goes
-        // through `std::ops::Index::index`, which the native TrustIr lowering
-        // does not model, while the identical range on a slice lowers fine.
+        // Coerce to a slice first: the TrustIr lowering does not model array
+        // range-indexing (`Index::index`), but does model slice ranges.
         let bs: &[u8] = &b;
-        // `read_u64_le(bs)` reads exactly the first 8 bytes, so it equals
-        // `read_u64_le(&bs[0..8])`. The `bs.len() >= 16` guard is always
-        // true (`b` is `[u8; 16]`); it re-establishes the slice length
-        // locally for the L0 solver, which does not carry the array length
-        // through the unsizing coercion.
+        // `read_u64_le(bs)` reads exactly the first 8 bytes. The
+        // `bs.len() >= 16` guard always holds; it restates the length for the
+        // L0 solver.
         let lo = read_u64_le(bs);
         let hi = if bs.len() >= 16 {
             read_u64_le(&bs[8..16])
@@ -206,27 +195,18 @@ fn multiply_mix(x: u64, y: u64) -> u64 {
 
 /// Reads a `u64` from the first 8 bytes of `b`, little-endian.
 ///
-/// Every caller passes a range-sliced subslice of length exactly 8, where
-/// this is bit-identical to `u64::from_le_bytes(b.try_into().unwrap())`.
-/// The guard covers the (unreachable at all call sites) short-slice case so
-/// the function is provably panic-free; it never changes a real result.
-///
-/// Written with plain indexing, primitive casts, and constant shifts (no
-/// `TryInto`/`from_le_bytes` machinery) so the Trust native full verifier
-/// can lower it to typed TrustIr: `std::convert::TryInto::try_into` is an
-/// unsupported call target in that lowering and was the sole cause of the
-/// strict gate's `Result: FAIL` despite all L0 obligations proving.
+/// Callers pass exactly 8 bytes, where this equals
+/// `u64::from_le_bytes(b.try_into().unwrap())`; the short-slice guard only
+/// makes it provably panic-free. Plain indexing and constant shifts (no
+/// `TryInto`) let the Trust full verifier lower it to TrustIr.
 #[inline]
 fn read_u64_le(b: &[u8]) -> u64 {
     if b.len() < 8 {
         return 0;
     }
-    // Composed from two little-endian u32 halves via `read_u32_le` so the
-    // per-function obligation count stays within the native full verifier's
-    // evidence coverage (a single-expression `b[0] | ... | b[7] << 56` fold
-    // left the fold's tail hardened-Shl boundaries DESIGN-REQUIRED) and
-    // every shift coefficient stays at or below 2^32. Bit-identical to that
-    // fold, i.e. to `u64::from_le_bytes` on the same 8 bytes.
+    // Composed from two u32 halves so the function's obligations stay within
+    // the full verifier's coverage and every shift coefficient is at most
+    // 2^32. Equal to `u64::from_le_bytes` on the same 8 bytes.
     let lo = read_u32_le(&b[0..4]);
     let hi = read_u32_le(&b[4..8]);
     (lo as u64) | ((hi as u64) << 32)
@@ -245,8 +225,8 @@ fn read_u32_le(b: &[u8]) -> u32 {
     (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
 }
 
-/// A wyhash-inspired non-collision-resistant hash for byte slices, designed
-/// by Orson Peters with a focus on small strings and small code size.
+/// A wyhash-inspired, non-collision-resistant hash for byte slices, tuned for
+/// small strings and small code size.
 #[inline]
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let len = bytes.len();
@@ -262,9 +242,8 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
             s1 ^= read_u32_le(&bytes[len - 4..]) as u64;
         } else {
             // len is 0..=3 here. Slice patterns carry the length statically,
-            // so there are no panic paths for the verifier to refute; each
-            // arm is the original `lo = bytes[0]`, `mid = bytes[len / 2]`,
-            // `hi = bytes[len - 1]` evaluated for that concrete length.
+            // so no panic paths remain; each arm computes `lo = bytes[0]`,
+            // `mid = bytes[len / 2]`, `hi = bytes[len - 1]` for that length.
             match *bytes {
                 [] => {}
                 [a] => {
@@ -284,17 +263,9 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
             }
         }
     } else {
-        // The final 16 bytes, read as two direct bounded ranges of `bytes`
-        // (len > 16 here, so len - 16 >= 1). This is byte-identical to the
-        // previous `suffix = &bytes[len - 16..]` +
-        // `get(..).and_then(try_into).map_or(0, from_le_bytes)` chain, whose
-        // `0` fallback was unreachable because `suffix` always had length 16.
-        //
-        // The reads are hoisted above the loop: `bytes` is immutable and the
-        // reads are pure, so evaluation order cannot change behavior, and in
-        // the pre-loop straight-line context the verifier lowers these bounds
-        // checks to its supported form (post-loop they hit an unsupported-MIR
-        // `FullVerification::BoundsCheck` path in the trust-vc adapter).
+        // The final 16 bytes (len > 16 here), read as two bounded ranges.
+        // Hoisted above the loop, where the verifier supports these bounds
+        // checks; `bytes` is immutable, so the order does not matter.
         let tail_lo = read_u64_le(&bytes[len - 16..len - 8]);
         let tail_hi = read_u64_le(&bytes[len - 8..len]);
 
@@ -342,9 +313,7 @@ mod tests {
     use super::*;
     use std::hash::Hash;
 
-    // -----------------------------------------------------------------------
-    // Bit-exact compatibility with rustc-hash 2.1
-    // -----------------------------------------------------------------------
+    // Bit-exact compatibility with rustc-hash 2.1.
 
     macro_rules! test_hash {
         ($($value:expr => $result:expr,)*) => {
@@ -447,8 +416,7 @@ mod tests {
 
     #[test]
     fn test_fxhasher_default_via_buildhasherdefault() {
-        // Verify compatibility with std::hash::BuildHasherDefault<FxHasher>,
-        // which is used in aterm-core for Kani-mode deterministic maps.
+        // Compatible with std::hash::BuildHasherDefault<FxHasher>.
         use std::hash::BuildHasherDefault;
         let bh: BuildHasherDefault<FxHasher> = BuildHasherDefault::default();
         let h1 = bh.hash_one(42_u64);

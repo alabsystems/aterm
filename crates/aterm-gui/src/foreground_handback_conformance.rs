@@ -22,7 +22,8 @@
 //! * `fg`     — the scripted foreground (0 the shell, 1 the job);
 //! * `life`   — the script's position (0 prompt, 1 job holds, 2 dead, 3 back,
 //!   4 stopped, 5 the shell holds while the job is stopped);
-//! * `leak`   — `Terminal::program_owns_terminal()`, the evidence gate;
+//! * `leak`   — `Terminal::program_owns_terminal()`, the evidence gate, less
+//!   the 2004 bit that `paste` projects ([`leak`]);
 //! * `paste`  — `modes().bracketed_paste`;
 //! * `prompt` — the shell's post-reclaim text (`zsh: killed`, or
 //!   `zsh: suspended`) is on screen;
@@ -73,7 +74,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{Terminal, program_evidence};
 use aterm_spec::derive::{Model, foreground_handback_model, foreground_handback_ownership_model};
 use aterm_spec::interp;
 
@@ -93,8 +94,9 @@ const CHILD: i32 = 4300;
 /// The model variables the real pipeline projects onto.
 const PROJECTED: [&str; 6] = ["fg", "life", "leak", "paste", "prompt", "tail"];
 
-/// Generous: a loaded machine only slows the reader down.
-const PATIENCE: Duration = Duration::from_secs(10);
+/// A hang detector, never a latency budget: a loaded machine only slows the
+/// reader down.
+const PATIENCE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// What zle writes before it hands a command the terminal.
 const ZLE_PROMPT: &[u8] = b"\x1b[?2004h% ";
@@ -110,11 +112,17 @@ const SUSPENDED: &[u8] = b"\r\nzsh: suspended  claude\r\n% \x1b[?2004h";
 const REPAINT: &[u8] = b"\x1b[?2004h\x1b[2J\x1b[HFRAME2";
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + PATIENCE;
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let seen =
+        aterm_spec::wait::within(PATIENCE, Duration::from_millis(1), || done().then_some(()));
+    assert!(seen.is_some(), "timed out waiting for {what}");
+}
+
+/// The model's `leak`: the evidence gate without bracketed paste, which
+/// `paste` projects. zle's own `2004h` at its prompt is evidence too since PG1
+/// (docs/AUDIT-side-effects-2026-10-07.md), and the host gives it to the live
+/// shell.
+fn leak(t: &Terminal) -> bool {
+    t.program_evidence() & !program_evidence::BRACKETED_PASTE != 0
 }
 
 fn screen_has(t: &Terminal, needle: &str) -> bool {
@@ -130,40 +138,13 @@ fn is_dead(dead: &Dead, pgid: i32) -> bool {
         .contains(&pgid)
 }
 
-/// `openpty(3)`, serialized across this module's rigs and retried. macOS's
-/// libutil `openpty` is not safe to call from several threads at once: with
-/// thirteen rigs attaching in parallel (2026-09-25, the one-shot and
-/// lock-depth rows) it failed now and then with a meaningless errno (`-6`),
-/// always in whichever rig lost the race. Other test modules open ptys too, so
-/// the lock alone cannot exclude them; a failed open is retried.
-fn open_pty_pair() -> (i32, i32) {
-    static OPENPTY: Mutex<()> = Mutex::new(());
-    let _serial = OPENPTY.lock().unwrap_or_else(|p| p.into_inner());
-    let mut last = String::new();
-    for _ in 0..20 {
-        let (mut master, mut slave) = (-1i32, -1i32);
-        // SAFETY: openpty(3) into two valid out-slots; no name/termios/winsize.
-        let opened = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if opened == 0 {
-            return (master, slave);
-        }
-        last = std::io::Error::last_os_error().to_string();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("openpty failed 20 times: {last}");
-}
-
-/// [`open_pty_pair`] with the slave in raw mode, so byte counts are exact.
+/// A PTY pair with both ends close-on-exec from birth
+/// (`aterm_pty::open_pty_pair`) and the slave in raw mode, so byte counts are
+/// exact. Rigs attach in parallel and need no lock: the `-6` an open once
+/// failed with here was XNU's `EREDRIVEOPEN`, a lost race for a pty minor
+/// inside the kernel's `/dev/ptmx` clone open, which the opener redrives.
 fn open_raw_pty() -> (i32, i32) {
-    let (master, slave) = open_pty_pair();
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     // SAFETY: a zeroed termios is a valid out-slot for tcgetattr, then
     // cfmakeraw/tcsetattr on the test-owned slave fd.
     unsafe {
@@ -291,7 +272,7 @@ impl Rig {
         [
             ("fg", i64::from(self.fg.load(Ordering::SeqCst) == JOB)),
             ("life", self.life),
-            ("leak", i64::from(t.program_owns_terminal())),
+            ("leak", i64::from(leak(&t))),
             ("paste", i64::from(t.modes().bracketed_paste)),
             (
                 "prompt",
@@ -359,6 +340,116 @@ fn projected(state: &State) -> State {
 /// The real projection must be the model's state after the same prefix.
 fn check(rig: &Rig, model_state: &State, at: &str) {
     assert_eq!(rig.project(), projected(model_state), "{at}");
+}
+
+/// Exactly one handback, from `from` to `to`.
+fn assert_one_handback(rig: &Rig, from: i32, to: i32) {
+    let events = rig.restored_n(1);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(
+        events[0].starts_with(&format!("from={from} to={to} ")),
+        "{events:?}"
+    );
+}
+
+/// From the model's initial state: the prompt, zle's exec, and the job takes
+/// the terminal and arms the incident's modes — `Launch` and the job's write,
+/// parsed and checked. Returns the model's state after them.
+fn launch_the_job(rig: &mut Rig, model: &Model) -> State {
+    let mut s = model.init_state();
+    rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
+    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
+    rig.set_fg(JOB);
+    rig.life = 1;
+    fire(model, &mut s, &["Launch"]);
+    rig.write(INCIDENT, "the job's modes", |t| {
+        t.program_owns_terminal() && screen_has(t, "FRAME")
+    });
+    fire(
+        model,
+        &mut s,
+        &["JobWrite", "ReadJob", "Park", "Deliver", "Parse"],
+    );
+    check(rig, &s, "the job's output parsed");
+    s
+}
+
+/// Ctrl-Z: the job stops ALIVE and zsh takes the terminal and says so —
+/// `Stop`, `Reclaim` (checked) and the shell's write, fired on `model`.
+fn stop_the_job(rig: &mut Rig, model: &Model, s: &mut State) {
+    rig.life = 4;
+    fire(model, s, &["Stop"]);
+    rig.set_fg(SHELL);
+    rig.life = 5;
+    fire(model, s, &["Reclaim"]);
+    check(rig, s, "Stop + Reclaim");
+    rig.write(SUSPENDED, "zsh: suspended", |t| {
+        screen_has(t, "zsh: suspended") && t.modes().bracketed_paste
+    });
+    fire(
+        model,
+        s,
+        &["ShellWrite", "ReadShell", "Park", "Deliver", "Parse"],
+    );
+}
+
+/// `fg`: zle turns 2004 off, the job takes the terminal back and repaints —
+/// `Resume` and the job's write, checked at `at` — and runs with its modes:
+/// every mode it armed (`evidence`, where the caller read it), its alt screen
+/// and mouse, and the committed `JobKeepsItsModesWhileAlive`.
+fn resume_with_its_modes(
+    rig: &mut Rig,
+    model: &Model,
+    s: &mut State,
+    at: &str,
+    evidence: Option<u16>,
+) {
+    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
+    rig.set_fg(JOB);
+    rig.life = 1;
+    fire(model, s, &["Resume"]);
+    rig.write(REPAINT, "the job's repaint", |t| screen_has(t, "FRAME2"));
+    fire(
+        model,
+        s,
+        &["JobWrite", "ReadJob", "Park", "Deliver", "Parse"],
+    );
+    check(rig, s, at);
+    {
+        let term = rig.term();
+        let t = term.lock().expect("terminal lock");
+        if let Some(evidence) = evidence {
+            assert_eq!(t.program_evidence(), evidence, "every mode it armed");
+        }
+        assert!(t.is_alternate_screen());
+        assert!(
+            t.encode_mouse_motion(0, 10, 5, 0).is_some(),
+            "its mouse still reports"
+        );
+    }
+    assert!(model.check_invariant("JobKeepsItsModesWhileAlive", s));
+}
+
+/// The job dies holding the terminal and zsh takes it back and writes —
+/// `Die`, `Reclaim` and the shell's write, checked — and the job's modes are
+/// handed back once, from the job to the shell.
+fn die_and_hand_back(rig: &mut Rig, model: &Model, s: &mut State) {
+    rig.life = 2;
+    fire(model, s, &["Die"]);
+    rig.set_fg(SHELL);
+    rig.life = 3;
+    fire(model, s, &["Reclaim"]);
+    rig.write(RECLAIM, "zsh's reclaim output", |t| {
+        screen_has(t, "zsh: killed") && t.modes().bracketed_paste
+    });
+    fire(
+        model,
+        s,
+        &["ShellWrite", "ReadShell", "Park", "Deliver", "Parse"],
+    );
+    check(rig, s, "the death edge parsed");
+    assert_eq!((s["prompt"], s["leak"], s["paste"]), (1, 0, 1));
+    assert_one_handback(rig, JOB, SHELL);
 }
 
 /// The incident, step by step, on the real reader. Returns the rig at its
@@ -584,7 +675,7 @@ fn foreground_handback_a_mixed_batch_is_cut_at_the_park() {
         {
             let term = rig.term();
             let t = term.lock().expect("terminal lock");
-            assert!(!t.program_owns_terminal(), "attempt {attempt}: clean");
+            assert!(!leak(&t), "attempt {attempt}: clean");
             assert!(!t.is_alternate_screen(), "attempt {attempt}");
             assert!(screen_has(&t, "zsh: killed"), "the shell's text is on main");
         }
@@ -713,37 +804,10 @@ fn foreground_handback_a_stopped_job_keeps_its_modes_until_it_dies() {
     let model = foreground_handback_model();
     FG_STOP.store(SHELL, Ordering::SeqCst);
     let mut rig = Rig::attach(91, (probe_stop, &FG_STOP), (gone_stop, &DEAD_STOP), b"");
-    let mut s = model.init_state();
-    rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
-    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
-    rig.set_fg(JOB);
-    rig.life = 1;
-    fire(&model, &mut s, &["Launch"]);
-    rig.write(INCIDENT, "the job's modes", |t| {
-        t.program_owns_terminal() && screen_has(t, "FRAME")
-    });
-    fire(
-        &model,
-        &mut s,
-        &["JobWrite", "ReadJob", "Park", "Deliver", "Parse"],
-    );
-    check(&rig, &s, "the job's output parsed");
+    let mut s = launch_the_job(&mut rig, &model);
 
     // Ctrl-Z: the job stops ALIVE; zsh takes the terminal and says so.
-    rig.life = 4;
-    fire(&model, &mut s, &["Stop"]);
-    rig.set_fg(SHELL);
-    rig.life = 5;
-    fire(&model, &mut s, &["Reclaim"]);
-    check(&rig, &s, "Stop + Reclaim");
-    rig.write(SUSPENDED, "zsh: suspended", |t| {
-        screen_has(t, "zsh: suspended") && t.modes().bracketed_paste
-    });
-    fire(
-        &model,
-        &mut s,
-        &["ShellWrite", "ReadShell", "Park", "Deliver", "Parse"],
-    );
+    stop_the_job(&mut rig, &model, &mut s);
     check(&rig, &s, "the stop edge parsed");
     assert!(
         rig.restored().is_empty(),
@@ -753,52 +817,17 @@ fn foreground_handback_a_stopped_job_keeps_its_modes_until_it_dies() {
     let evidence = rig.term().lock().expect("terminal lock").program_evidence();
 
     // `fg`: zle turns 2004 off, the job gets the terminal back and repaints.
-    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
-    rig.set_fg(JOB);
-    rig.life = 1;
-    fire(&model, &mut s, &["Resume"]);
-    rig.write(REPAINT, "the job's repaint", |t| screen_has(t, "FRAME2"));
-    fire(
+    resume_with_its_modes(
+        &mut rig,
         &model,
         &mut s,
-        &["JobWrite", "ReadJob", "Park", "Deliver", "Parse"],
+        "fg: the job runs with its modes",
+        Some(evidence),
     );
-    check(&rig, &s, "fg: the job runs with its modes");
-    {
-        let term = rig.term();
-        let t = term.lock().expect("terminal lock");
-        assert_eq!(t.program_evidence(), evidence, "every mode it armed");
-        assert!(t.is_alternate_screen());
-        assert!(
-            t.encode_mouse_motion(0, 10, 5, 0).is_some(),
-            "its mouse still reports"
-        );
-    }
-    assert!(model.check_invariant("JobKeepsItsModesWhileAlive", &s));
 
     // Only now does it die: handed back once, at the death edge.
     rig.kill(JOB);
-    rig.life = 2;
-    fire(&model, &mut s, &["Die"]);
-    rig.set_fg(SHELL);
-    rig.life = 3;
-    fire(&model, &mut s, &["Reclaim"]);
-    rig.write(RECLAIM, "zsh's reclaim output", |t| {
-        screen_has(t, "zsh: killed") && t.modes().bracketed_paste
-    });
-    fire(
-        &model,
-        &mut s,
-        &["ShellWrite", "ReadShell", "Park", "Deliver", "Parse"],
-    );
-    check(&rig, &s, "the death edge parsed");
-    assert_eq!((s["prompt"], s["leak"], s["paste"]), (1, 0, 1));
-    let events = rig.restored_n(1);
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert!(
-        events[0].starts_with(&format!("from={JOB} to={SHELL} ")),
-        "{events:?}"
-    );
+    die_and_hand_back(&mut rig, &model, &mut s);
 
     // The reviewed design (a handback at every change) lands where the
     // `Alive = 0` replay does: the job resumed without its modes.
@@ -886,21 +915,7 @@ fn gone_pipe_leader_only(_master: i32, pgid: i32, _role: FgRole) -> bool {
 /// checkpoint compared against `model`.
 fn run_pipeline_to_the_stop(rig: &mut Rig, model: &Model, table: &Table) -> State {
     Table::set(table.stopped, JOB, false);
-    let mut s = model.init_state();
-    rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
-    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
-    rig.set_fg(JOB);
-    rig.life = 1;
-    fire(model, &mut s, &["Launch"]);
-    rig.write(INCIDENT, "the job's modes", |t| {
-        t.program_owns_terminal() && screen_has(t, "FRAME")
-    });
-    fire(
-        model,
-        &mut s,
-        &["JobWrite", "ReadJob", "Park", "Deliver", "Parse"],
-    );
-    check(rig, &s, "the job's output parsed");
+    let mut s = launch_the_job(rig, model);
 
     // `sleep 0` exits and is reaped: the group's LEADER answers ESRCH, while
     // the TUI after it in the pipeline runs on. In the model the job lives.
@@ -909,20 +924,7 @@ fn run_pipeline_to_the_stop(rig: &mut Rig, model: &Model, table: &Table) -> Stat
 
     // Ctrl-Z: the TUI stops ALIVE; zsh takes the terminal and says so.
     Table::set(table.stopped, JOB, true);
-    rig.life = 4;
-    fire(model, &mut s, &["Stop"]);
-    rig.set_fg(SHELL);
-    rig.life = 5;
-    fire(model, &mut s, &["Reclaim"]);
-    check(rig, &s, "Stop + Reclaim");
-    rig.write(SUSPENDED, "zsh: suspended", |t| {
-        screen_has(t, "zsh: suspended") && t.modes().bracketed_paste
-    });
-    fire(
-        model,
-        &mut s,
-        &["ShellWrite", "ReadShell", "Park", "Deliver", "Parse"],
-    );
+    stop_the_job(rig, model, &mut s);
     s
 }
 
@@ -953,53 +955,18 @@ fn foreground_handback_a_stopped_pipeline_whose_leader_exited_keeps_its_modes() 
 
     // `fg`: SIGCONT, the TUI runs again and repaints.
     Table::set(table.stopped, JOB, false);
-    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
-    rig.set_fg(JOB);
-    rig.life = 1;
-    fire(&model, &mut s, &["Resume"]);
-    rig.write(REPAINT, "the job's repaint", |t| screen_has(t, "FRAME2"));
-    fire(
+    resume_with_its_modes(
+        &mut rig,
         &model,
         &mut s,
-        &["JobWrite", "ReadJob", "Park", "Deliver", "Parse"],
+        "fg: the pipeline runs with its modes",
+        Some(evidence),
     );
-    check(&rig, &s, "fg: the pipeline runs with its modes");
-    {
-        let term = rig.term();
-        let t = term.lock().expect("terminal lock");
-        assert_eq!(t.program_evidence(), evidence, "every mode it armed");
-        assert!(t.is_alternate_screen());
-        assert!(
-            t.encode_mouse_motion(0, 10, 5, 0).is_some(),
-            "its mouse still reports"
-        );
-    }
-    assert!(model.check_invariant("JobKeepsItsModesWhileAlive", &s));
 
     // The TUI is killed: nothing of the group is stopped and its leader is
     // gone. Handed back once, at this death edge.
     assert!(is_dead(table.leaders, JOB), "the leader stayed gone");
-    rig.life = 2;
-    fire(&model, &mut s, &["Die"]);
-    rig.set_fg(SHELL);
-    rig.life = 3;
-    fire(&model, &mut s, &["Reclaim"]);
-    rig.write(RECLAIM, "zsh's reclaim output", |t| {
-        screen_has(t, "zsh: killed") && t.modes().bracketed_paste
-    });
-    fire(
-        &model,
-        &mut s,
-        &["ShellWrite", "ReadShell", "Park", "Deliver", "Parse"],
-    );
-    check(&rig, &s, "the death edge parsed");
-    assert_eq!((s["prompt"], s["leak"], s["paste"]), (1, 0, 1));
-    let events = rig.restored_n(1);
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert!(
-        events[0].starts_with(&format!("from={JOB} to={SHELL} ")),
-        "{events:?}"
-    );
+    die_and_hand_back(&mut rig, &model, &mut s);
 }
 
 /// NEGATIVE CONTROL: the same pipeline under the reviewed probe (the leader
@@ -1034,12 +1001,7 @@ fn foreground_handback_negative_control_the_leader_alone_strips_a_stopped_pipeli
         projected(&s),
         "exactly where the Alive = 0 replay lands"
     );
-    let events = rig.restored_n(1);
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert!(
-        events[0].starts_with(&format!("from={JOB} to={SHELL} ")),
-        "{events:?}"
-    );
+    assert_one_handback(&rig, JOB, SHELL);
 
     // `fg`: the job runs again, without the modes it armed.
     Table::set(table.stopped, JOB, false);
@@ -1161,51 +1123,17 @@ fn foreground_handback_a_backgrounded_leaderless_pipeline_keeps_its_modes() {
     );
 
     // `fg`: it takes the terminal and repaints, with its modes.
-    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
-    rig.set_fg(JOB);
-    rig.life = 1;
-    fire(&model, &mut s, &["Resume"]);
-    rig.write(REPAINT, "the job's repaint", |t| screen_has(t, "FRAME2"));
-    fire(
+    resume_with_its_modes(
+        &mut rig,
         &model,
         &mut s,
-        &["JobWrite", "ReadJob", "Park", "Deliver", "Parse"],
+        "fg: the pipeline runs with its modes",
+        None,
     );
-    check(&rig, &s, "fg: the pipeline runs with its modes");
-    {
-        let term = rig.term();
-        let t = term.lock().expect("terminal lock");
-        assert!(t.is_alternate_screen());
-        assert!(
-            t.encode_mouse_motion(0, 10, 5, 0).is_some(),
-            "its mouse still reports"
-        );
-    }
-    assert!(model.check_invariant("JobKeepsItsModesWhileAlive", &s));
 
     // Killed while it holds the terminal: the edge's HOLDER, by the leader
     // rule, handed back once at this death edge.
-    rig.life = 2;
-    fire(&model, &mut s, &["Die"]);
-    rig.set_fg(SHELL);
-    rig.life = 3;
-    fire(&model, &mut s, &["Reclaim"]);
-    rig.write(RECLAIM, "zsh's reclaim output", |t| {
-        screen_has(t, "zsh: killed") && t.modes().bracketed_paste
-    });
-    fire(
-        &model,
-        &mut s,
-        &["ShellWrite", "ReadShell", "Park", "Deliver", "Parse"],
-    );
-    check(&rig, &s, "the death edge parsed");
-    assert_eq!((s["prompt"], s["leak"], s["paste"]), (1, 0, 1));
-    let events = rig.restored_n(1);
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert!(
-        events[0].starts_with(&format!("from={JOB} to={SHELL} ")),
-        "{events:?}"
-    );
+    die_and_hand_back(&mut rig, &model, &mut s);
 }
 
 /// NEGATIVE CONTROL: the same schedule under the reviewed probe (the holder
@@ -1239,12 +1167,7 @@ fn foreground_handback_negative_control_the_holder_rule_strips_a_backgrounded_pi
         (5, 0),
         "the running background job's modes were stripped"
     );
-    let events = rig.restored_n(1);
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert!(
-        events[0].starts_with(&format!("from={SHELL} to={LS} ")),
-        "{events:?}"
-    );
+    assert_one_handback(&rig, SHELL, LS);
     let mut resumed = s;
     resumed.insert("leak", 0);
     fire(&model, &mut resumed, &["Resume"]);
@@ -1303,21 +1226,7 @@ fn run_parked(carry: bool) -> (Rig, State) {
             b"",
         )
     };
-    let mut s = model.init_state();
-    rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
-    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
-    rig.set_fg(JOB);
-    rig.life = 1;
-    fire(&model, &mut s, &["Launch"]);
-    rig.write(INCIDENT, "the job's modes", |t| {
-        t.program_owns_terminal() && screen_has(t, "FRAME")
-    });
-    fire(
-        &model,
-        &mut s,
-        &["JobWrite", "ReadJob", "Park", "Deliver", "Parse"],
-    );
-    check(&rig, &s, "the job's output parsed");
+    let mut s = launch_the_job(&mut rig, &model);
     assert_eq!(
         rig.session.fg_holder.load(Ordering::Acquire),
         JOB,
@@ -1359,12 +1268,7 @@ fn foreground_handback_a_job_that_dies_while_the_reader_is_parked_is_still_an_ed
         (s["prompt"], s["leak"], s["paste"], s["tail"]),
         (1, 0, 1, 0)
     );
-    let events = rig.restored_n(1);
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert!(
-        events[0].starts_with(&format!("from={JOB} to={SHELL} ")),
-        "{events:?}"
-    );
+    assert_one_handback(&rig, JOB, SHELL);
     assert!(
         !rig.term()
             .lock()
@@ -1460,7 +1364,7 @@ fn foreground_handback_a_live_holder_handing_the_terminal_to_its_child_keeps_its
     {
         let term = rig.term();
         let t = term.lock().expect("terminal lock");
-        assert!(!t.program_owns_terminal() && !t.is_alternate_screen());
+        assert!(!leak(&t) && !t.is_alternate_screen());
         assert!(t.modes().cursor_visible && t.modes().bracketed_paste);
     }
     let events = rig.restored_n(2);

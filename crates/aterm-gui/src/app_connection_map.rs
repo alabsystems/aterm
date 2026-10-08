@@ -17,8 +17,6 @@
 //! terminal), every mutator repaints + refreshes the a11y tree, and the
 //! pointer follows the palette's claim/hover/arm discipline.
 
-use winit::window::CursorIcon;
-
 use aterm_session::SessionId;
 
 use crate::App;
@@ -207,44 +205,24 @@ impl App {
         let (groups, flows) = self.connection_map_parts();
         let mut state = ConnectionMapState::new(wid, groups, flows);
         let _ = state.set_annotations(self.connection_map_annotations());
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return Err("the front window is gone".to_string());
-        };
-        // Structural mutual exclusion: the one overlay slot.
-        ws.overlay = Some(crate::overlay::Overlay::ConnectionMap(state));
-        ws.scroll_residual = 0.0;
-        if let Some(w) = &ws.os_window {
-            // §5.1 host+raise: the map is not just placed on the front window
-            // — that window comes forward with it.
-            w.focus_window();
-            w.request_redraw();
+        // §5.1 host+raise: the map is not just placed on the front window —
+        // that window comes forward with it.
+        if self.install_overlay_card(
+            wid,
+            crate::overlay::Overlay::ConnectionMap(state),
+            true,
+            Self::connection_map_claims_pointer,
+            Self::connection_map_pointer_motion,
+        ) {
+            Ok(())
+        } else {
+            Err("the front window is gone".to_string())
         }
-        self.settle_pointer_drags(wid);
-        let _ = self.connection_map_claims_pointer(wid);
-        if let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
-            self.connection_map_pointer_motion(wid, x, y);
-        }
-        self.overlay_a11y_update();
-        Ok(())
     }
 
     /// Close the map on `wid` (no-op unless it is the open variant).
     pub(crate) fn connection_map_exit(&mut self, wid: WindowId) {
-        let mut closed = false;
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.connection_map().is_some()
-        {
-            ws.overlay = None;
-            ws.scroll_residual = 0.0;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-            closed = true;
-        }
-        self.overlay_a11y_update();
-        if closed && let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
-            self.on_cursor_moved(wid, x, y);
-        }
+        self.close_overlay_card(wid, |ws| ws.connection_map().is_some());
     }
 
     /// Re-snapshot the graph into every OPEN map — the §2.4 freshness leg of
@@ -298,14 +276,6 @@ impl App {
         }
     }
 
-    fn connection_map_repaint(&mut self, wid: WindowId) {
-        self.sync_connection_map_pointer_cursor(wid);
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
-        }
-        self.overlay_a11y_update();
-    }
-
     /// Move the map cursor by `delta` over the chip/arrow items.
     pub(crate) fn connection_map_move(&mut self, wid: WindowId, delta: isize) {
         if let Some(m) = self
@@ -315,7 +285,7 @@ impl App {
         {
             m.move_selection(delta);
         }
-        self.connection_map_repaint(wid);
+        self.repaint_connection_map_pointer(wid, true);
     }
 
     /// The Esc press: cancel an armed confirm first, close second.
@@ -328,7 +298,7 @@ impl App {
         if close {
             self.connection_map_exit(wid);
         } else {
-            self.connection_map_repaint(wid);
+            self.repaint_connection_map_pointer(wid, true);
         }
     }
 
@@ -344,7 +314,7 @@ impl App {
         if let Some((src, dst)) = resolved {
             self.connection_map_disconnect(&src, &dst);
         }
-        self.connection_map_repaint(wid);
+        self.repaint_connection_map_pointer(wid, true);
     }
 
     /// The Enter/Click activation: chips raise (the `raise` verb's body —
@@ -363,7 +333,7 @@ impl App {
                         "connection map: {} is not hosted here (nothing to raise)",
                         sid.as_str()
                     );
-                    self.connection_map_repaint(wid);
+                    self.repaint_connection_map_pointer(wid, true);
                     return;
                 };
                 self.connection_map_exit(wid);
@@ -373,34 +343,19 @@ impl App {
             }
             Some(MapActivation::Disconnect(src, dst)) => {
                 self.connection_map_disconnect(&src, &dst);
-                self.connection_map_repaint(wid);
+                self.repaint_connection_map_pointer(wid, true);
             }
-            Some(MapActivation::Armed) => self.connection_map_repaint(wid),
+            Some(MapActivation::Armed) => self.repaint_connection_map_pointer(wid, true),
             Some(MapActivation::None) | None => {}
         }
     }
 
-    /// Dissolve exactly the `src → dst` direction (origin `map`): recorded
-    /// halves pair-precisely by held token, unrecorded wire-grant rows via
-    /// the sweep ([`crate::connections::disconnect_kind_in`]). Rows live in
-    /// the DESTINATION's table; a dst gone from the registry has no table
-    /// left to touch, so only the refresh runs (the menu's honesty rule: the
-    /// map said "connected", so recompose to the truth regardless).
+    /// Dissolve exactly the `src → dst` direction (origin `map`,
+    /// [`App::disconnect_direction`]). A dst gone from the registry leaves
+    /// only the refresh to run (the menu's honesty rule: the map said
+    /// "connected", so recompose to the truth regardless).
     fn connection_map_disconnect(&mut self, src: &SessionId, dst: &SessionId) {
-        let ctx = {
-            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-            g.by_sid(dst).map(|h| h.ctx.clone())
-        };
-        if let Some(ctx) = ctx {
-            let _ = crate::connections::disconnect_kind_in(
-                &self.connections,
-                src,
-                dst,
-                &ctx.edges,
-                None,
-                "map",
-            );
-        }
+        let _ = self.disconnect_direction(src, dst, "map");
         // The §2.4 poke: marks + menus + the open map itself recompose now.
         self.refresh_connection_surfaces();
     }
@@ -491,41 +446,19 @@ impl App {
     /// Modal pointer boundary: whether the open map owns the gesture on
     /// `wid`. Mirrors [`Self::session_picker_claims_pointer`].
     pub(crate) fn connection_map_claims_pointer(&mut self, wid: WindowId) -> bool {
-        if self
-            .windows
-            .get(&wid)
-            .is_none_or(|ws| ws.connection_map().is_none())
-        {
-            return false;
-        }
-        let mut changed = None;
-        if let Some((_, view)) = self.active_native_view(wid)
-            && let Some(state) = self.native_runtime.view_state_mut(view)
-        {
-            let common = state.common_mut();
-            let hovered = common.hovered.take().is_some();
-            let pressed = common.pressed.take().is_some();
-            if hovered || pressed {
-                changed = Some(view);
-            }
-        }
-        if let Some(view) = changed {
-            self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
-            self.request_redraw_all_windows();
-        }
-        self.sync_connection_map_pointer_cursor(wid);
-        true
+        self.overlay_card_claims_pointer(
+            wid,
+            |ws| ws.connection_map().is_some(),
+            Self::sync_connection_map_pointer_cursor,
+        )
     }
 
     /// The item index under a window-space point, through the same zoom-aware
     /// transform the card was composited with.
     fn connection_map_item_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
         let map = self.windows.get(&wid)?.connection_map()?;
-        let transform = self.overlay_coordinate_transform(wid)?;
-        let (frame_x, frame_y) = self.window_to_frame(wid, x, y);
-        let local_x = (frame_x - transform.origin_x) / f64::from(transform.scale);
-        let local_y = (frame_y - transform.origin_y) / f64::from(transform.scale);
-        crate::connection_map::map_item_hit(map, &transform.geom, local_x as f32, local_y as f32)
+        let (transform, x, y) = self.overlay_card_point(wid, x, y)?;
+        crate::connection_map::map_item_hit(map, &transform.geom, x, y)
     }
 
     /// Keep the OS cursor aligned with the map's item hover.
@@ -535,30 +468,12 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.connection_map())
             .is_some_and(ConnectionMapState::pointer_over_item);
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && (ws.hover_pointer != pointer || ws.native_text_cursor)
-        {
-            ws.hover_pointer = pointer;
-            ws.native_text_cursor = false;
-            if let Some(w) = &ws.os_window {
-                w.set_cursor(if pointer {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                });
-            }
-        }
+        self.set_overlay_card_cursor(wid, pointer);
     }
 
     fn repaint_connection_map_pointer(&mut self, wid: WindowId, changed: bool) {
         self.sync_connection_map_pointer_cursor(wid);
-        if !changed {
-            return;
-        }
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
-        }
-        self.overlay_a11y_update();
+        self.redraw_overlay_card(wid, changed);
     }
 
     /// Hover-select the item under a pointer motion.

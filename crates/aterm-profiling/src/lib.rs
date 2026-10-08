@@ -63,8 +63,7 @@
 //! A paren-balancing scan of those 198 sites (not an eyeball) closes the arity
 //! set at `{1: 194, 2: 4}` with no trailing commas and no three-argument form,
 //! in four structural shapes: 1-arg single-line 193, 1-arg multi-line 1, 2-arg
-//! single-line 2, 2-arg multi-line 2. `tests/consumer_forms.rs` carries all
-//! four verbatim.
+//! single-line 2, 2-arg multi-line 2.
 //!
 //! [`function_scope!`], [`register_thread!`] and [`finish_frame!`] are here for
 //! parity only — upstream's empty backend exports them, and a consumer bump
@@ -82,9 +81,8 @@
 //!   (`let base = pass.base.take();`, render.rs:1830 / compute.rs:483). How
 //!   long the expansion keeps that borrow alive decides whether wgpu-core
 //!   still compiles, and the answer is less obvious than it looks, so it was
-//!   MEASURED: four transcribers, each compiled against
-//!   `tests/consumer_forms.rs`, which reproduces both functions statement for
-//!   statement.
+//!   MEASURED: four transcribers, each compiled against a reproduction of both
+//!   functions.
 //!
 //!   | expansion of the 2-argument arm | result |
 //!   |---|---|
@@ -101,8 +99,7 @@
 //!   the end of the enclosing block. Upstream's tracy backend sidesteps it by
 //!   copying the text out on the spot (`_tracy_span.emit_text($data);`,
 //!   `tracy_impl.rs`) rather than storing it. Expanding to nothing inherits the
-//!   property without having to be careful about it, and the counterfactual is
-//!   re-runnable — `consumer_forms.rs` documents how it was armed.
+//!   property without having to be careful about it.
 //! * **Allocation.** `wgpu-core/src/instance.rs:469` passes
 //!   `&*alloc::format!("{_backend:?}")`. Any shim that touches `$data`
 //!   allocates a `String` per backend on every `Global::enumerate_adapters`

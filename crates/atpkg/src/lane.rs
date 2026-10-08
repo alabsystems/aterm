@@ -25,9 +25,11 @@
 //! THE ANSWER. Exit 0 and silence: no stock Rust tool at command position. Exit 0 and
 //! one stderr line: one stood there, cleared by `ATERM_STOCK_REASON='<why>'` in front
 //! of it. Exit [`crate::reroute::REFUSAL_EXIT`] (2) with [`rust_lane::refusal`] on
-//! stderr — the Trust spelling of the same command, the directory's stock pin, the
-//! escape: one did. Exit 1: the input could not be read (not JSON, or not UTF-8), so
-//! nothing is claimed either way.
+//! stderr — the Trust spelling of the same command; the stock pin in force
+//! (`$RUSTUP_TOOLCHAIN`, else the directory's toolchain file), unless the command
+//! names its own channel or toolchain; the escape: one did. Exit 1: the input or the
+//! arguments could not be read (not JSON, not UTF-8, over [`MAX_INPUT_BYTES`], a usage
+//! error), so there is no verdict either way.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +40,27 @@ use crate::reroute::Pin;
 /// The most input one call reads. An agent's command line can be large (a heredoc
 /// body), but a guard that buffers without bound is its own hazard.
 pub const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// All of `input`, up to [`MAX_INPUT_BYTES`]. Input past the limit is refused, never cut:
+/// a verdict on a prefix would be a false clean (or a false "not JSON").
+///
+/// # Errors
+/// The reader failed, or held more than [`MAX_INPUT_BYTES`].
+pub fn read_input(input: impl std::io::Read) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    input
+        .take(MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("could not read stdin: {e}"))?;
+    if buf.len() as u64 > MAX_INPUT_BYTES {
+        return Err(format!(
+            "stdin is over {} MiB (the limit)",
+            MAX_INPUT_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(buf)
+}
 
 /// Where the command line comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,19 +204,13 @@ pub fn answer(
         rust_lane::Verdict::Clean => Answer::Clean,
         rust_lane::Verdict::Escaped { hit, reason } => Answer::Escaped(format!(
             "aterm: {} `{}` let through — {}={reason:?}; say why in your reply.",
-            if hit.toolchain_dir.is_some() {
-                "compatibility"
-            } else {
-                "stock"
-            },
+            if hit.compat { "compatibility" } else { "stock" },
             hit.used,
             rust_lane::STOCK_REASON
         )),
         rust_lane::Verdict::Stock(hit) => {
             let pin = Pin::for_dir(cwd, env_toolchain);
-            let pin = pin
-                .as_ref()
-                .map(|p| (Path::new(p.source.as_str()), p.channel.as_str()));
+            let pin = pin.as_ref().map(|p| (&p.source, p.channel.as_str()));
             Answer::Refused(rust_lane::refusal(&hit, pin))
         }
     }
@@ -201,6 +218,20 @@ pub fn answer(
 
 #[cfg(test)]
 mod tests {
+    /// Input at the limit is read whole; one byte past it is refused, never judged on a
+    /// prefix (a cut command line would read clean, a cut JSON object as "not JSON").
+    #[test]
+    fn input_past_the_limit_is_refused_not_cut() {
+        let limit = usize::try_from(super::MAX_INPUT_BYTES).unwrap();
+        let at = vec![b'a'; limit];
+        assert_eq!(super::read_input(&at[..]).map(|v| v.len()), Ok(limit));
+        let over = vec![b'a'; limit + 1];
+        assert_eq!(
+            super::read_input(&over[..]),
+            Err("stdin is over 8 MiB (the limit)".to_string())
+        );
+    }
+
     use super::*;
 
     fn s(list: &[&str]) -> Vec<String> {
@@ -301,6 +332,19 @@ mod tests {
             line.contains("ATERM_STOCK_REASON=\"wasm32 cell\""),
             "{line}"
         );
+        // A Trust channel's cargo is its toolchain's compatibility cargo, never stock.
+        let Answer::Escaped(line) = answer(
+            "ATERM_STOCK_REASON='compat smoke' cargo +trust build",
+            None,
+            None,
+            None,
+        ) else {
+            panic!("an escaped command is let through");
+        };
+        assert!(
+            line.starts_with("aterm: compatibility `cargo +trust build` let through"),
+            "{line}"
+        );
         let Answer::Refused(text) = answer("stdbuf -oL cargo +1.97.1 test -p x", None, None, None)
         else {
             panic!("a stock command is refused");
@@ -312,7 +356,7 @@ mod tests {
         assert!(text.contains("targo trust test -p x"), "{text}");
         assert!(text.contains("targo --unverified test -p x"), "{text}");
         // The directory's stock pin, and `$RUSTUP_TOOLCHAIN` above it.
-        let dir = std::env::temp_dir().join(format!("atpkg-lane-{}", std::process::id()));
+        let dir = crate::testdir::dir("atpkg-lane-");
         let sub = dir.join("src");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(
@@ -332,9 +376,12 @@ mod tests {
             panic!("refused");
         };
         assert!(
-            env.contains("pins stock \"stable\" ($RUSTUP_TOOLCHAIN)"),
+            env.contains(
+                "\n$RUSTUP_TOOLCHAIN names stock \"stable\"; build with the Trust spelling"
+            ),
             "{env}"
         );
+        assert!(!env.contains("This directory"), "{env}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,56 +1,33 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The network layer: `curl` calls to GitHub — the Releases API when a token is
-//! available, and the unmetered web host (`github.com/…/releases/…`) with no
-//! credential at all. Artifact-agnostic — these fetch arbitrary API JSON, asset bytes
-//! and redirect headers; the consuming crate decides what the bytes mean.
+//! The network layer: anonymous `curl` calls to GitHub's unmetered web host
+//! (`github.com/…/releases/…`). No credential is ever sent. Artifact-agnostic — these
+//! fetch asset bytes and redirect headers; the consuming crate decides what the bytes
+//! mean.
 //!
-//! Two HOSTS, MEASURED 2026-09-02/03 against the shipped channel. `api.github.com` is
-//! metered (~60 requests/hour per IP anonymously, 5000 with a token) and is used ONLY on
-//! the token lane: the releases LIST and the asset API URL (`…/releases/assets/<id>`,
-//! `Accept: application/octet-stream`, the credential on stdin; curl `-L` follows the 302
-//! to storage and drops the `Authorization` header on the cross-host redirect by default).
-//! `github.com` is not metered at all: for a PUBLIC repo
+//! MEASURED 2026-09-02/03 against the shipped channel: `github.com` is not metered at
+//! all. For a PUBLIC repo
 //! `https://github.com/{owner}/{repo}/releases/download/{tag}/{name}` answers 200
 //! anonymously via a 302 to `release-assets.githubusercontent.com` with no
 //! `x-ratelimit-*` headers, `…/releases/latest/download/{name}` answers a 302 whose
 //! `Location` names the newest published release's tag ([`head_no_redirect`]), a missing
-//! asset answers 404, and a PRIVATE repo answers 404 on both URL shapes (no credential is
-//! accepted there — and none is ever sent: [`refuse_credential_off_api`]). This module
-//! classifies the answer PER HOST — a 403 is a rate limit on the API host and a blocked
-//! host on the web one.
+//! asset answers 404, and a PRIVATE repo answers 404 on both URL shapes. The metered
+//! `api.github.com` (~60 requests/hour per IP anonymously) is on no lane; the failure
+//! classifier still reads answers PER HOST — a 403 is a rate limit on the API host and a
+//! blocked host on the web one — and the only throttle `github.com` has is a 429.
 //!
-//! # Why the token is OPTIONAL
+//! Every request keeps the same hardening: `-q` first, the scrubbed config-dir env, the
+//! `--` end-of-options marker, and `/dev/null` for stdin. Those defend against a hostile
+//! curlrc and a server-controlled URL.
 //!
-//! A private repo cannot be read without one, but a PUBLIC one can — and aterm's
-//! shipped update channel is public. Making the token mandatory here is what made a
-//! freshly installed Mac refuse to even ask: the caller returned before any network
-//! call, so a repo it could have read anonymously looked like "no updates, forever".
-//! `token: Option<&str>` splits the two lanes explicitly:
-//!
-//! * `Some(t)` — byte-for-byte the historical path. The token is fed to curl through
-//!   STDIN ([`curl_fetch`], `curl --config -`), NEVER on argv, so it is not exposed
-//!   to same-user processes via `ps`.
-//! * `None` — the `--config -` channel is omitted from the argv entirely (not passed
-//!   an empty config: an absent option cannot be mis-parsed) and stdin is
-//!   `/dev/null`, so curl can never block on an EOF nobody will send. Every OTHER
-//!   hardening is unchanged — `-q` first, the scrubbed config-dir env, the `--`
-//!   end-of-options marker — because those defend against a hostile curlrc and a
-//!   server-controlled URL, which have nothing to do with authentication.
-//!
-//! An anonymous API caller is rate-limited to ~60 requests/hour PER IP (5000/hour with
-//! a token), so [`HttpError`] classifies that state separately: a rate limit is not an
-//! auth failure and must not be reported as one. The web lane never meets it — the only
-//! throttle `github.com` has is a 429 of its own.
-//!
-//! A third lane fetches for the vendor-direct agents ([`vendor_get`],
+//! A second lane fetches for the vendor-direct agents ([`vendor_get`],
 //! [`vendor_content_length`], [`vendor_download_to`]): anonymous, https on every hop,
 //! byte-capped, with the CA-trust overrides dropped from curl's environment, and the only
 //! lane that asks conditionally.
 
+use aterm_uds::spawnfd::Command;
 use std::path::Path;
-use std::process::Command;
 
 /// A classified transport failure. The web lane ([`head_no_redirect`]) reports what the
 /// wire said or that it could not be read; the vendor lane ([`vendor_get`],
@@ -85,39 +62,20 @@ impl std::fmt::Display for HttpError {
     }
 }
 
-/// Whether `token` is safe to interpolate into a curl config-file line. The token is
-/// delivered as `header = "Authorization: Bearer <token>"` on curl's `--config -`
-/// stdin; a token carrying a quote, backslash, or newline could close the quoted
-/// value and inject additional curl directives (e.g. `insecure` to disable TLS, or
-/// `proxy = http://attacker/` to exfiltrate). A real GitHub PAT is `[A-Za-z0-9_.-]+`,
-/// so we reject any control character, quote, or backslash — defense in depth even
-/// though the token comes from a trusted source (env / keychain / 0600 file).
-fn token_config_safe(token: &str) -> bool {
-    !token
-        .bytes()
-        .any(|b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\')
-}
-
 /// Build curl's FULL parameter list (everything after the binary name): `-q` first,
-/// the caller's options, the fixed User-Agent, the `--config -` stdin auth channel
-/// (only when `authenticated`), and LAST `--` + the URL. Pure and separate from the
-/// spawn so the ordering — the security- AND correctness-critical part — is
-/// unit-testable.
+/// the caller's options, the fixed User-Agent, and LAST `--` + the URL. Pure and
+/// separate from the spawn so the ordering — the security- AND correctness-critical
+/// part — is unit-testable.
 ///
 /// ORDERING INVARIANTS (each guards against a real failure):
-/// * `-q` is the very first parameter (see [`curl_fetch`] — booby-trapped curlrc).
-/// * `--config -` comes BEFORE the `--` end-of-options marker: everything after
-///   `--` is a URL to curl, so a misplaced marker silently DISABLES authentication
-///   and turns the remaining options into bogus URLs. Exactly that shipped in
-///   v0.5.10/v0.5.11 (the caller-side `--` in `download_bytes`/`download_to`
-///   preceded the appended auth args): every private-repo asset download failed
-///   404-unauthenticated, bricking auto-update on those builds.
-/// * `--` immediately precedes the URL: the asset URL from the releases JSON is the
-///   one fully server-controlled string that reaches curl, so a leading-dash value
-///   (`-K/tmp/evil`) must parse as a URL, never as an option.
-/// * When `authenticated` is false the auth channel is OMITTED, not emptied: there
-///   is no `--config` at all, so an anonymous request carries no `Authorization`
-///   header and cannot be turned into one by a mangled config stream.
+/// * `-q` is the very first parameter (see [`curl_command`] — booby-trapped curlrc).
+/// * `--` comes after EVERY option: everything after it is a URL to curl, so a
+///   misplaced marker turns the remaining options into bogus URLs. Exactly that shipped
+///   in v0.5.10/v0.5.11 (a caller-side `--` in `download_bytes`/`download_to` preceded
+///   the appended options), bricking auto-update on those builds.
+/// * `--` immediately precedes the URL: the URL is the one server-influenced string
+///   that reaches curl, so a leading-dash value (`-K/tmp/evil`) must parse as a URL,
+///   never as an option.
 ///
 /// The `curl` binary to spawn. On unix curl lives at the well-known absolute path
 /// `/usr/bin/curl`, which we spawn verbatim so a `PATH`-injected shim can never be
@@ -143,7 +101,7 @@ fn curl_bin() -> &'static str {
 // callees). Needed from $HOME/trust, in a promoted seal: totality for generic
 // `extend`/`collect` (TRUST_100PCT_PLAN T3); then drop this.
 #[cfg_attr(trust_verify, trust::skip)]
-fn curl_argv(args: &[&str], url: &str, authenticated: bool) -> Vec<String> {
+fn curl_argv(args: &[&str], url: &str) -> Vec<String> {
     // The capacity is a pre-size HINT only; clamp it so the `+ 7` and the resulting
     // allocation size are provably panic-free for any abstract `args` (the verifier
     // refutes the unclamped form with a huge unconstrained slice length). Every
@@ -158,115 +116,48 @@ fn curl_argv(args: &[&str], url: &str, authenticated: bool) -> Vec<String> {
             .iter()
             .map(|s| (*s).to_string()),
     );
-    if authenticated {
-        v.extend(["--config", "-"].iter().map(|s| (*s).to_string()));
-    }
     v.push("--".to_string());
     v.push(url.to_string());
     v
 }
 
-/// Validate the credential and build the EXACT process [`curl_fetch`] spawns, minus
-/// only the stdio wiring and the stdin write.
+/// Build the argv-and-env part of the curl process; [`curl_fetch`] adds the stdio.
 ///
-/// This is the testable seam for C3. The guarantee "the token never reaches argv" has
-/// to be checked where the process is actually assembled: asserting it on
-/// [`curl_argv`] alone is weaker than it looks, because `curl_argv` is never GIVEN the
-/// token and so cannot leak it no matter what. A `.arg("-H").arg(format!(
-/// "Authorization: Bearer {t}"))` appended in the spawn path — the tempting way to
-/// "simplify away" the stdin channel — is invisible to such a test (verified by
-/// mutation: the whole suite stayed green). Routing the token through here, and
-/// asserting on the resulting argv, closes that.
-///
-/// Takes the token so that a future change which DOES put it on argv is observable;
-/// it must only ever be used to decide `authenticated` and to validate.
-fn curl_prepared(args: &[&str], url: &str, token: Option<&str>) -> Result<Command, String> {
-    if let Some(token) = token {
-        // Fail CLOSED on an empty token rather than emitting a bare `Bearer `: a
-        // caller that reached here with `Some("")` has a bug, and a header GitHub
-        // reads as a malformed credential is worse than an honest anonymous request
-        // (which the `None` lane exists to make).
-        if token.is_empty() {
-            return Err(
-                "update token is empty — refusing to send a bare `Authorization: Bearer` \
-                 header (pass no token to request anonymously)"
-                    .to_string(),
-            );
-        }
-        if !token_config_safe(token) {
-            return Err(
-                "update token contains illegal characters (control/quote/backslash) — refusing \
-                 to build the curl config line"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(curl_command(args, url, token.is_some()))
-}
-
-/// Build the argv-and-env part of the curl process. See [`curl_prepared`], the seam
-/// callers and tests go through.
-fn curl_command(args: &[&str], url: &str, authenticated: bool) -> Command {
-    let mut command = Command::new(curl_bin());
+/// Built through [`aterm_uds::spawnfd::command`], which decides a Windows child's
+/// console: started by the window (no console of its own), curl.exe gets a windowless
+/// console instead of a VISIBLE one per request, and keeps sharing the console of a
+/// terminal it was started from. Every lane — web and vendor ([`vendor_command`]) —
+/// comes through here.
+fn curl_command(args: &[&str], url: &str) -> Command {
+    let mut command = aterm_uds::spawnfd::command(curl_bin());
     command
         // `-q` MUST be first (curl_argv puts it first): curl reads the default
-        // ~/.curlrc (or $CURL_HOME / $XDG_CONFIG_HOME) EVEN when `--config` is
-        // given, unless `-q` is the very first parameter. A hostile/booby-trapped
-        // curlrc could add `insecure` + `proxy = http://attacker/` and exfiltrate
-        // the Bearer token we plumb in `curl_fetch`. `-q` disables ONLY the default
-        // config file — it does NOT disable the explicit `--config -` stdin that
-        // carries the Authorization header, so token delivery is unaffected. Also
+        // ~/.curlrc (or $CURL_HOME / $XDG_CONFIG_HOME) unless `-q` is the very first
+        // parameter. A hostile/booby-trapped curlrc could add `insecure` +
+        // `proxy = http://attacker/` and read or rewrite every byte fetched. Also
         // scrub the config-dir env vars so the default-config lookup cannot be
-        // redirected. BOTH lanes keep this: a hostile curlrc is an ambient-environment
-        // threat, orthogonal to whether this particular request carries a credential.
-        .args(curl_argv(args, url, authenticated))
+        // redirected.
+        .args(curl_argv(args, url))
         .env_remove("CURL_HOME")
         .env_remove("XDG_CONFIG_HOME");
     command
 }
 
-/// Run curl against `url` with extra `args`, on one of two lanes.
-///
-/// `Some(token)` feeds the secret `Authorization` header through STDIN
-/// (`curl --config -`) so the token NEVER appears in argv — argv is world-visible to
-/// same-user processes via `ps`. `None` omits the auth channel altogether (public
-/// channel / no credential provisioned) and gives curl `/dev/null` for stdin, so it
-/// cannot block waiting for a config stream that will never be written or closed.
+/// Run curl against `url` with extra `args`, anonymously, with `/dev/null` for stdin.
 ///
 /// The URL is passed separately so [`curl_argv`] can place the `--` end-of-options
-/// marker directly before it, AFTER every option including the auth channel (callers
-/// must NOT put `--` in `args` — that is the v0.5.10 auto-update-bricking
-/// regression). Returns the completed process output.
+/// marker directly before it, AFTER every option (callers must NOT put `--` in `args`:
+/// every option after it would be read as a URL). Returns the completed process output.
 // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
-fn curl_fetch(
-    args: &[&str],
-    url: &str,
-    token: Option<&str>,
-) -> Result<std::process::Output, String> {
-    use std::io::Write;
-    use std::process::Stdio;
-    let mut command = curl_prepared(args, url, token)?;
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let Some(token) = token else {
-        return command
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("spawn curl: {e}"));
-    };
-    let mut child = command
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn curl: {e}"))?;
-    {
-        let mut stdin = child.stdin.take().ok_or("curl stdin unavailable")?;
-        stdin
-            .write_all(format!("header = \"Authorization: Bearer {token}\"\n").as_bytes())
-            .map_err(|e| format!("write curl config: {e}"))?;
-    } // drop stdin → EOF so curl proceeds
-    child
-        .wait_with_output()
-        .map_err(|e| format!("curl wait: {e}"))
+fn curl_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> {
+    use aterm_uds::spawnfd::Stdio;
+    curl_command(args, url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn curl: {e}"))
 }
 
 /// How many times a request whose BODY is captured from curl's stdout is attempted,
@@ -373,7 +264,7 @@ fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<Head
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
         let last = attempt >= attempts;
-        let out = curl_fetch(args, url, None).map_err(HttpError::Transport)?;
+        let out = curl_fetch(args, url).map_err(HttpError::Transport)?;
         if !out.status.success() {
             if !last {
                 continue;
@@ -426,13 +317,12 @@ fn location_header(headers: &str) -> Option<String> {
     found
 }
 
-/// Reject any asset URL that is not plain `https://…`. The asset URL comes from the
-/// releases JSON's `assets[].url` — the one fully server-controlled string that
-/// reaches curl — so, like the API host and the token charset elsewhere in this
-/// crate, it must be validated: a `file://` / `ftp://` value would let a hostile or
-/// MITM'd response turn the downloader into a local-file / SSRF read. Combined with a
-/// literal `--` before the URL in the argv (so a `-K…`-style value can't be parsed as
-/// a curl option), this keeps the one untrusted curl input inert.
+/// Reject any asset URL that is not plain `https://…`. The asset URL is the one
+/// server-influenced string that reaches curl, so it must be validated: a `file://` /
+/// `ftp://` value would let a hostile or MITM'd input turn the downloader into a
+/// local-file / SSRF read. Combined with a literal `--` before the URL in the argv (so
+/// a `-K…`-style value can't be parsed as a curl option), this keeps the one untrusted
+/// curl input inert.
 fn require_https_url(url: &str) -> Result<(), String> {
     if url.starts_with("https://") {
         Ok(())
@@ -451,29 +341,12 @@ fn require_https_url(url: &str) -> Result<(), String> {
 /// one buffer — and the buffer is exactly what the Ed25519 check reads.
 /// [`download_bytes`] retries the subprocess instead.
 ///
-/// Refuse to pair a credential with any host but `api.github.com` — STRUCTURALLY, at
-/// the one place every asset download passes through, rather than by each caller's
-/// discipline. A GitHub token belongs on GitHub's API and nowhere else: the release
-/// download host (`github.com/…/releases/download`) 302s to object storage and reads no
-/// `Authorization` header, a vendor host is not GitHub at all, and a caller that reached
-/// here with `Some(token)` and a web URL has a bug that would otherwise leak the secret
-/// silently. `require_https_url` is the scheme gate; this is the host gate.
-fn refuse_credential_off_api(asset_url: &str, token: Option<&str>) -> Result<(), String> {
-    if token.is_some() && !crate::cdn::is_api_host(asset_url) {
-        return Err(format!(
-            "refusing to send a credential to a non-API host: {asset_url}"
-        ));
-    }
-    Ok(())
-}
-
 /// NOTE: no `-w "\n%{http_code}"` here (and none in [`download_to_args`]). These carry
 /// `-f`, so curl's exit status already reports a non-2xx, and appending the status to
 /// stdout would CORRUPT the downloaded bytes — including the appcast the Ed25519
 /// signature covers. Asset downloads therefore stay unclassified; every public/private
 /// verdict is taken from the discovery step that always runs first — the evergreen
-/// pointer's HEAD on the web lane ([`head_no_redirect`]), the releases LIST on the
-/// token lane.
+/// pointer's HEAD ([`head_no_redirect`]).
 fn download_bytes_args(cap: &str) -> [&str; 9] {
     [
         "-fsSL",
@@ -488,7 +361,7 @@ fn download_bytes_args(cap: &str) -> [&str; 9] {
         "-H",
         "Accept: application/octet-stream",
         // The `--` end-of-options guard for the server-controlled asset URL is
-        // appended by `curl_argv` (AFTER the auth channel — see its invariants);
+        // appended by `curl_argv` (after every option — see its invariants);
         // `require_https_url` closes the scheme-injection vector.
     ]
 }
@@ -504,13 +377,8 @@ fn download_bytes_args(cap: &str) -> [&str; 9] {
 /// `download_bytes_args`.
 // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn download_bytes(
-    asset_url: &str,
-    token: Option<&str>,
-    max_filesize: u64,
-) -> Result<Vec<u8>, String> {
+pub fn download_bytes(asset_url: &str, max_filesize: u64) -> Result<Vec<u8>, String> {
     require_https_url(asset_url)?;
-    refuse_credential_off_api(asset_url, token)?;
     let cap = max_filesize.to_string();
     // Bounded: the final attempt returns on both arms.
     let mut attempt: u32 = 0;
@@ -520,7 +388,7 @@ pub fn download_bytes(
             // curl's own inter-retry backoff, preserved: 1 s, then 2 s.
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
-        let out = curl_fetch(&download_bytes_args(&cap), asset_url, token)?;
+        let out = curl_fetch(&download_bytes_args(&cap), asset_url)?;
         if out.status.success() {
             return Ok(out.stdout);
         }
@@ -530,11 +398,9 @@ pub fn download_bytes(
         // into exit 22 with the status in curl's own message; name it, so the check
         // lane can take its deferred, no-ledger path instead of booking a
         // `pipeline` failure (2026-08-19 audit). On the API asset endpoint the only
-        // 403 a client ever meets is the rate limit (a private asset answers 404),
-        // and with a token an auth failure has already been classified by the
-        // releases list. On the WEB host a 403 is a blocked host and a 404 a
-        // missing/private asset — both verdicts, named per host by
-        // `classify_asset_failure`.
+        // 403 a client ever meets is the rate limit (a private asset answers 404).
+        // On the WEB host a 403 is a blocked host and a 404 a missing/private asset —
+        // both verdicts, named per host by `classify_asset_failure`.
         if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
             return Err(verdict);
         }
@@ -573,6 +439,24 @@ const NOT_FOUND_ERROR_PREFIX: &str = "HTTP 404";
 #[must_use]
 pub fn download_error_is_not_found(error: &str) -> bool {
     error.starts_with(NOT_FOUND_ERROR_PREFIX)
+}
+
+/// Whether a [`download_to`] error is THIS MACHINE failing to store the bytes it was
+/// served — a full disk, a quota — rather than the host failing to serve them: curl's
+/// write error (exit 23), in whichever words its build prints it. A write that fails
+/// mid-receive can leave with exit 56 and the same words, as macOS's curl 8.7.1 did onto
+/// a full volume (2026-09-30): `curl: (56) Failure writing output to destination,
+/// passed 8192 returned 1923`. The host answered, so the check lane books neither a
+/// broken download pipeline nor a blocked host for it.
+#[must_use]
+pub fn download_error_is_local_write(error: &str) -> bool {
+    [
+        "curl: (23)",
+        "Failure writing output to destination",
+        "Failed writing body",
+    ]
+    .iter()
+    .any(|words| error.contains(words))
 }
 
 /// Whether an HTTP status on `url` is GitHub telling this client to slow down. PER HOST:
@@ -625,30 +509,22 @@ fn curl_http_error_code(stderr: &str) -> Option<u16> {
 /// update channel must agree on: the client's container download cap
 /// (`aterm-update` github.rs) and the cutter's publish-size guard
 /// (`aterm-release` `UPDATER_MAX_DMG_BYTES`) must be this constant, not private
-/// copies. They drifted once — 2026-08-02 raised the cutter's bound to 2 GiB
-/// for the batteries-included DMGs, the client's container site kept 512 MiB,
-/// and every 0.15.0 install accepted the v0.17.0 manifest and then could never
-/// fetch its 775 MB payload (curl exit 56, "Maximum file size exceeded"),
-/// which reads as a network failure and never escalates.
+/// copies: a client cap below the cutter's accepts a manifest whose payload it
+/// can never fetch (curl exit 56, "Maximum file size exceeded"), which reads as
+/// a network failure and never escalates.
 pub const RELEASE_ASSET_DOWNLOAD_BOUND: u64 = 2_147_483_648;
 
 /// The wall-clock backstop for a file-sink asset download, DERIVED from the size cap
 /// instead of fixed.
 ///
-/// A ceiling decoupled from the payload is what strands a big container on a slow link.
-/// The fixed 600 s this replaces demanded 1.3 MB/s (~10 Mbit/s) sustained to move the
-/// shipped 775 MB batteries-included container, and 13 MB/s to move atpkg's 8 GiB
-/// `ARTIFACT_CAP` — and since nothing resumes (the caller deletes the `.part` on
-/// failure), such a machine died at the SAME wall on every single cycle and could never
-/// update at all, while the operator-facing notification blamed a "broken update
-/// pipeline". The 600 came in with the original extraction and was never revisited when
-/// the size bound was raised to 2 GiB: the same coupled-constant miss that once shipped
-/// a 512 MiB client cap against 775 MB containers.
+/// A ceiling decoupled from the payload strands a big container on a slow link: a
+/// fixed 600 s demands ~10 Mbit/s sustained for a 775 MB container, and a machine below
+/// that dies at the SAME wall on every cycle and never updates.
 ///
 /// The floor rate is a deliberately slow 64 KiB/s so this stays a BACKSTOP, never a
 /// second stall detector — `--speed-limit`/`--speed-time` are what express "stalled",
-/// and this only bounds a transfer that trickles forever. Never below the historical
-/// 600 s, never above 6 h.
+/// and this only bounds a transfer that trickles forever. Never below 600 s, never
+/// above 6 h.
 fn download_max_time_secs(max_filesize: u64) -> u64 {
     (max_filesize / 65_536).clamp(600, 21_600)
 }
@@ -662,13 +538,9 @@ fn download_max_time_secs(max_filesize: u64) -> u64 {
 /// [`CURL_ATTEMPTS`].
 fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a str; 19] {
     [
-        // `-s` matters as much as `-S` here, and its absence was load-bearing: without
-        // it curl writes its PROGRESS METER to stderr, and this lane's stderr is
-        // captured into the failure message. A machine that failed this download 95
-        // consecutive times logged 95 walls of `--:--:--   0` with the actual cause
-        // buried at the end of each one, unreadable
-        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). `-S` keeps real errors,
-        // which is the pairing `download_bytes_args` already uses.
+        // `-s`: without it curl writes its PROGRESS METER to stderr, which this lane
+        // captures into the failure message, burying the cause. `-S` keeps real
+        // errors, the pairing `download_bytes_args` uses.
         "-fsSL",
         // https-only redirects — see `download_bytes_args`.
         "--proto-redir",
@@ -720,19 +592,13 @@ fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a 
 /// has much to gain. The 630 MB toolchain artifact does, and uses the resumable form.
 // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn download_to(
-    asset_url: &str,
-    token: Option<&str>,
-    dest: &Path,
-    max_filesize: u64,
-) -> Result<(), String> {
+pub fn download_to(asset_url: &str, dest: &Path, max_filesize: u64) -> Result<(), String> {
     require_https_url(asset_url)?;
-    refuse_credential_off_api(asset_url, token)?;
     let dest_s = dest.to_str().ok_or("non-UTF-8 destination path")?;
     let cap = max_filesize.to_string();
     // Both must outlive the argv array, which borrows them as `&str`.
     let max_time = download_max_time_secs(max_filesize).to_string();
-    let out = curl_fetch(&download_to_args(&cap, &max_time, dest_s), asset_url, token)?;
+    let out = curl_fetch(&download_to_args(&cap, &max_time, dest_s), asset_url)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         // Same per-host classification as `download_bytes`: a rate limit is named so
@@ -806,7 +672,7 @@ fn resume_plan(existing: u64, max_filesize: u64) -> ResumePlan {
 /// was clobbered and is now shorter (curl 416), a server that refuses ranges (curl 33), a
 /// corrupt local file — would otherwise be retried from the same dead offset forever, six
 /// hours apart, for the life of the machine. One attempt that makes no progress discards
-/// it and the next starts clean, which is exactly today's cost and no worse.
+/// it and the next starts clean.
 fn keep_partial(before: u64, after: u64) -> bool {
     after > before
 }
@@ -821,12 +687,7 @@ fn keep_partial(before: u64, after: u64) -> bool {
 /// URL shape by construction, as does any asset whose name stem is not its release tag.
 /// `--fail` wrote no body, no range was consulted, and the prefix is not what was
 /// refused, so the anti-wedge discard has nothing to protect against here — and it costs
-/// real bytes, because two HOSTS serve the SAME signed object through this same `.part`:
-/// atpkg (`net.rs` `download` / `download_for`) probes the derived `github.com` URL
-/// FIRST and falls back to the credential-bearing API URL. Discarding on the probe's 404
-/// deleted the API lane's progress on every pass, so a 630 MB artifact from a private
-/// `[packages.links]` repo restarted from byte 0 forever and resume could never take
-/// hold for it.
+/// real bytes whenever another attempt resumes the same `.part`.
 ///
 /// Every other failure keeps the anti-wedge rule byte for byte: a 416 or curl 33 (there
 /// the prefix IS what was refused), a stall, a transport error, and every status on the
@@ -923,54 +784,39 @@ fn download_resume_args_https_only<'a>(
 ///
 /// # A range-refused resume retries fresh ONCE, in-call
 ///
-/// [`keep_partial`] already guaranteed a range-refusing server could not WEDGE the lane
-/// — the dead prefix was discarded and the NEXT call started clean. But "next call" was
-/// a whole failed pass away (six hours, or one spurious failed row in a progress
-/// surface). When the failure names the range itself ([`range_refused`]: curl 33, or a
-/// 416 because the upstream object shrank), this call now discards the `.part` and
-/// retries from offset 0 immediately — at most once per call, with the cap recomputed
-/// from the FULL `max_filesize` and a fresh curl process (hence a fresh wall clock) for
-/// the fresh attempt. Any other failure keeps today's semantics exactly, and the sha256
-/// gate downstream is untouched either way.
+/// [`keep_partial`] alone would leave the clean restart to the NEXT call, a whole failed
+/// pass away. When the failure names the range itself ([`range_refused`]: curl 33, or a
+/// 416 because the upstream object shrank), this call discards the `.part` and retries
+/// from offset 0 immediately — at most once per call, with the cap recomputed from the
+/// FULL `max_filesize` and a fresh curl process (hence a fresh wall clock). Any other
+/// failure keeps the plain rule, and the sha256 gate downstream is untouched either way.
 ///
 /// # A verdict about the URL does not discard the prefix
 ///
-/// The big-artifact caller fetches through TWO hosts for the SAME signed object — the
-/// derived `github.com` download URL first, the credential-bearing API URL second — and
-/// both write this one `.part`. A web-host 403/404 is the first host answering about the
-/// URL, not about the bytes, so the prefix is LEFT for the lane that follows
-/// ([`keep_partial_after_failure`]). Without that, a private release repo (which answers
-/// 404 on the derived URL shape) had the API lane's progress deleted by the next pass's
-/// doomed probe, and resume never took hold for it.
+/// A web-host 403/404 is the host answering about the URL, not about the bytes, so the
+/// prefix is LEFT for whatever attempt resumes it ([`keep_partial_after_failure`]).
 // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to_resumable(
     asset_url: &str,
-    token: Option<&str>,
     dest: &Path,
     max_filesize: u64,
 ) -> Result<(), String> {
-    download_to_resumable_with(asset_url, token, dest, max_filesize, ResumeLane::Release)
+    download_to_resumable_with(asset_url, dest, max_filesize, ResumeLane::Release)
         .map_err(|e| e.to_string())
 }
 
 /// [`download_to_resumable`] for a VENDOR-hosted asset: identical transfer, `.part`
 /// lifecycle and cap arithmetic, with curl's own scheme pin (`--proto =https`) added
 /// beside the redirect pin so neither the first hop nor any redirect can leave https.
-///
-/// Must be called with `token = None` — a vendor host is never GitHub, and the GitHub
-/// credential must not be presented to it. The transport ENFORCES that
-/// (`refuse_credential_off_api`): a credential paired with any non-API host is refused
-/// before curl is spawned.
 // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to_resumable_https_only(
     asset_url: &str,
-    token: Option<&str>,
     dest: &Path,
     max_filesize: u64,
 ) -> Result<(), String> {
-    download_to_resumable_with(asset_url, token, dest, max_filesize, ResumeLane::HttpsOnly)
+    download_to_resumable_with(asset_url, dest, max_filesize, ResumeLane::HttpsOnly)
         .map_err(|e| e.to_string())
 }
 
@@ -994,13 +840,11 @@ enum ResumeLane {
 #[cfg_attr(trust_verify, trust::skip)]
 fn download_to_resumable_with(
     asset_url: &str,
-    token: Option<&str>,
     dest: &Path,
     max_filesize: u64,
     lane: ResumeLane,
 ) -> Result<(), HttpError> {
     require_https_url(asset_url).map_err(HttpError::Transport)?;
-    refuse_credential_off_api(asset_url, token).map_err(HttpError::Transport)?;
     let Some(part) = part_path(dest) else {
         return Err(HttpError::Transport(
             "destination has no file name".to_string(),
@@ -1041,7 +885,7 @@ fn download_to_resumable_with(
         let out = if lane == ResumeLane::VendorDirect {
             vendor_fetch(&args, asset_url)
         } else {
-            curl_fetch(&args, asset_url, token)
+            curl_fetch(&args, asset_url)
         }
         .map_err(HttpError::Transport)?;
         if !out.status.success() {
@@ -1464,7 +1308,7 @@ fn vendor_head_args() -> [&'static str; 15] {
 /// The vendor-lane curl process: the anonymous argv (`-q` first, `--` before the URL,
 /// never a credential channel) with [`VENDOR_ENV_SCRUB`] removed from its environment.
 fn vendor_command(args: &[&str], url: &str) -> Command {
-    let mut command = curl_command(args, url, false);
+    let mut command = curl_command(args, url);
     for var in VENDOR_ENV_SCRUB {
         command.env_remove(var);
     }
@@ -1475,7 +1319,7 @@ fn vendor_command(args: &[&str], url: &str) -> Command {
 // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn vendor_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> {
-    use std::process::Stdio;
+    use aterm_uds::spawnfd::Stdio;
     vendor_command(args, url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1713,7 +1557,7 @@ pub fn vendor_download_to(url: &str, dest: &Path, cap: u64) -> Result<(), HttpEr
             "refusing a zero byte cap for {url}"
         )));
     }
-    download_to_resumable_with(url, None, dest, cap, ResumeLane::VendorDirect)
+    download_to_resumable_with(url, dest, cap, ResumeLane::VendorDirect)
 }
 
 #[cfg(test)]
@@ -1795,13 +1639,13 @@ mod tests {
     }
 
     /// The web lane is the SAME request as the API lane with a different URL: same
-    /// flags, same header, same `--` guard, no auth channel. Nothing about the transfer
-    /// changes with the host — only where the bytes come from.
+    /// flags, same header, same `--` guard. Nothing about the transfer changes with the
+    /// host — only where the bytes come from.
     #[test]
     fn the_asset_argv_for_a_web_url_differs_from_the_api_argv_only_in_the_url() {
         let args = super::download_bytes_args("5000000");
-        let api = super::curl_argv(&args, API_ASSET, false);
-        let web = super::curl_argv(&args, WEB_ASSET, false);
+        let api = super::curl_argv(&args, API_ASSET);
+        let web = super::curl_argv(&args, WEB_ASSET);
         assert_eq!(api.len(), web.len());
         let differing: Vec<(usize, &String, &String)> = api
             .iter()
@@ -1816,21 +1660,16 @@ mod tests {
             api.len() - 1,
             "only the URL, and it is last"
         );
-        assert!(
-            !web.iter().any(|a| a == "--config"),
-            "no credential channel on the web lane"
-        );
     }
 
     use super::{
         CURL_ATTEMPTS, HINT_BOUNDS, HttpError, LANE_BOUNDS, RELEASE_ASSET_DOWNLOAD_BOUND,
-        curl_argv, curl_bin, curl_fetch, curl_prepared, download_bytes_args,
-        download_max_time_secs, download_resume_args, download_resume_args_https_only,
-        download_to_args, download_to_resumable, download_to_resumable_https_only, head_args,
-        keep_partial, keep_partial_after_failure, location_header, part_path, range_refused,
-        resume_plan, token_config_safe, transient_status, vendor_get_args,
+        curl_argv, curl_bin, download_bytes_args, download_max_time_secs, download_resume_args,
+        download_resume_args_https_only, download_to_args, download_to_resumable,
+        download_to_resumable_https_only, head_args, keep_partial, keep_partial_after_failure,
+        location_header, part_path, range_refused, resume_plan, transient_status, vendor_get_args,
     };
-    use std::process::Command;
+    use aterm_uds::spawnfd::Command;
 
     /// The curl binary is platform-selected: a pinned absolute path on unix (no
     /// `PATH`-shim substitution), and the on-`PATH` `curl.exe` Windows ships since
@@ -1845,13 +1684,12 @@ mod tests {
     }
 
     /// The v0.5.10/v0.5.11 auto-update-bricking regression: the `--` end-of-options
-    /// marker must come AFTER every option — in particular after the `--config -`
-    /// stdin auth channel — and immediately BEFORE the URL. When callers placed `--`
-    /// themselves (before `curl_auth` appended the auth args), every option after it
-    /// was parsed as a URL: the real request went out UNAUTHENTICATED (404 on the
-    /// private repo) and asset downloads failed on every client, permanently.
+    /// marker must come AFTER every option and immediately BEFORE the URL. When callers
+    /// placed `--` themselves, every option after it was parsed as a URL and asset
+    /// downloads failed on every client, permanently. `-q` (the curlrc defense) leads.
     #[test]
-    fn argv_orders_auth_before_end_of_options_and_url_last() {
+    fn argv_puts_q_first_and_end_of_options_right_before_the_url() {
+        const URL: &str = "https://github.com/o/r/releases/download/v1.0.0/a.toml";
         let v = curl_argv(
             &[
                 "-fsSL",
@@ -1860,32 +1698,23 @@ mod tests {
                 "-H",
                 "Accept: application/octet-stream",
             ],
-            "https://api.github.com/repos/o/r/releases/assets/1",
-            true,
+            URL,
         );
         assert_eq!(
             v[0], "-q",
             "-q must be the very first parameter (curlrc defense)"
         );
-        let dashdash = v.iter().position(|a| a == "--").expect("`--` present");
-        let config = v
-            .iter()
-            .position(|a| a == "--config")
-            .expect("--config present");
-        assert_eq!(v[config + 1], "-", "auth config is read from stdin");
         assert!(
-            config < dashdash,
-            "the auth channel must be an OPTION (before `--`), not a URL: {v:?}"
+            v.iter().any(|a| a == "User-Agent: aterm-update"),
+            "the fixed User-Agent still identifies us: {v:?}"
         );
+        let dashdash = v.iter().position(|a| a == "--").expect("`--` present");
         assert_eq!(
             dashdash,
             v.len() - 2,
             "`--` must immediately precede the URL and nothing else: {v:?}"
         );
-        assert_eq!(
-            v[v.len() - 1],
-            "https://api.github.com/repos/o/r/releases/assets/1"
-        );
+        assert_eq!(v[v.len() - 1], URL);
         assert_eq!(
             v.iter().filter(|a| *a == "--").count(),
             1,
@@ -1897,116 +1726,10 @@ mod tests {
     /// after `--` so curl treats it as a URL (then fails DNS), never as an option.
     #[test]
     fn leading_dash_url_stays_inert() {
-        for authenticated in [true, false] {
-            let v = curl_argv(&["-fsSL"], "-K/tmp/evil", authenticated);
-            let dashdash = v.iter().position(|a| a == "--").unwrap();
-            assert_eq!(v[dashdash + 1], "-K/tmp/evil");
-            assert_eq!(dashdash + 2, v.len());
-        }
-    }
-
-    /// THE token-optional argv contract. An anonymous request must carry NO auth
-    /// channel at all — not an empty one — while keeping every ordering invariant
-    /// the authenticated lane relies on. If `--config` ever leaks back into this
-    /// argv, curl blocks reading a stdin nobody writes and the check hangs forever.
-    #[test]
-    fn argv_omits_the_auth_channel_when_unauthenticated() {
-        let v = curl_argv(
-            &["-sS", "-H", "Accept: application/vnd.github+json"],
-            "https://api.github.com/repos/o/r/releases?per_page=100&page=1",
-            false,
-        );
-        assert!(
-            !v.iter().any(|a| a == "--config"),
-            "an anonymous request must not open the auth config channel: {v:?}"
-        );
-        assert!(
-            !v.iter()
-                .any(|a| a.contains("Authorization") || a.contains("Bearer")),
-            "an anonymous request must carry no credential material: {v:?}"
-        );
-        // The three invariants that are NOT about authentication still hold.
-        assert_eq!(
-            v[0], "-q",
-            "the curlrc defense is orthogonal to auth and must survive: {v:?}"
-        );
-        assert!(
-            v.iter().any(|a| a == "User-Agent: aterm-update"),
-            "the fixed User-Agent still identifies us: {v:?}"
-        );
-        let dashdash = v.iter().position(|a| a == "--").expect("`--` present");
-        assert_eq!(
-            v.iter().filter(|a| *a == "--").count(),
-            1,
-            "exactly one end-of-options marker: {v:?}"
-        );
-        assert_eq!(
-            dashdash,
-            v.len() - 2,
-            "`--` must immediately precede the URL and nothing else: {v:?}"
-        );
-        assert_eq!(
-            v[v.len() - 1],
-            "https://api.github.com/repos/o/r/releases?per_page=100&page=1"
-        );
-    }
-
-    /// The property C3 exists to protect: even WITH a token, nothing on argv is
-    /// derived from it — the credential only ever travels over the `--config -`
-    /// stdin channel. argv is world-readable to same-user processes via `ps`.
-    #[test]
-    fn a_present_token_never_reaches_argv() {
-        const SECRET: &str = concat!("gh", "p_TOPSECRETtokenvalue0123456789ABCD");
-        let v = curl_argv(&["-sS"], "https://api.github.com/repos/o/r/releases", true);
-        assert!(
-            !v.iter().any(|a| a.contains(SECRET)),
-            "curl_argv must not be able to carry a token at all: {v:?}"
-        );
-        // …structurally: the argv builder is not even given the token, and the only
-        // thing that changes with `authenticated` is the stdin channel opener.
-        let anon = curl_argv(&["-sS"], "https://api.github.com/repos/o/r/releases", false);
-        let removed: Vec<_> = v.iter().filter(|a| !anon.contains(a)).collect();
-        assert_eq!(
-            removed,
-            ["--config", "-"].iter().collect::<Vec<_>>(),
-            "the ONLY authenticated-lane difference is the stdin config channel: {v:?}"
-        );
-    }
-
-    /// C3, enforced where the process is ACTUALLY built and WITH a real secret in hand.
-    ///
-    /// `a_present_token_never_reaches_argv` checks `curl_argv`, which is never given
-    /// the token and therefore cannot leak it however it is written — a weaker property
-    /// than it looks. `curl_prepared` DOES receive the credential, so this test can
-    /// assert the thing that actually matters: a live token went in, and nothing
-    /// derived from it came out on argv. Verified non-vacuous by mutation (appending
-    /// `-H "Authorization: Bearer {t}"` in the spawn path fails exactly here).
-    #[test]
-    fn the_spawned_command_carries_no_credential_on_either_lane() {
-        const SECRET: &str = concat!("gh", "p_TOPSECRETtokenvalue0123456789ABCD");
-        const URL: &str = "https://api.github.com/repos/o/r/releases";
-        for token in [Some(SECRET), None] {
-            let argv = argv_of(&curl_prepared(&["-sS"], URL, token).expect("valid token"));
-            assert!(
-                !argv.iter().any(|a| a.contains(SECRET)),
-                "the token must never appear on argv (token={token:?}): {argv:?}"
-            );
-            // Nor may the header it would ride in, under any spelling.
-            assert!(
-                !argv.iter().any(|a| {
-                    let a = a.to_ascii_lowercase();
-                    a.contains("authorization") || a.contains("bearer")
-                }),
-                "no Authorization/Bearer header may appear on argv: {argv:?}"
-            );
-            // …and the argv is EXACTLY curl_argv's list, so nothing was appended
-            // after the `--` end-of-options marker either.
-            assert_eq!(
-                argv,
-                curl_argv(&["-sS"], URL, token.is_some()),
-                "curl_fetch must spawn curl_argv's list verbatim (token={token:?})"
-            );
-        }
+        let v = curl_argv(&["-fsSL"], "-K/tmp/evil");
+        let dashdash = v.iter().position(|a| a == "--").unwrap();
+        assert_eq!(v[dashdash + 1], "-K/tmp/evil");
+        assert_eq!(dashdash + 2, v.len());
     }
 
     /// The spawned program + argv, as owned strings.
@@ -2040,61 +1763,6 @@ mod tests {
         );
     }
 
-    /// The token is delivered as `header = "Authorization: Bearer <t>"` on curl's stdin
-    /// config, so `token_config_safe` is the curl-directive injection guard. One row per
-    /// token shape with its verdict; then the guard, and the empty-token refusal, must
-    /// fire in `curl_fetch` BEFORE any spawn. An empty token is not "anonymous", it is a
-    /// caller bug that GitHub would answer with a 401 that looks like a revoked token.
-    #[test]
-    fn tokens_are_screened_for_curl_config_injection_before_any_spawn() {
-        for (token, safe, why) in [
-            (
-                concat!("gh", "p_ABCdef0123456789ABCdef0123456789ABCd"),
-                true,
-                "classic PAT",
-            ),
-            (
-                concat!("github", "_pat_11ABC_def.ghi-jkl"),
-                true,
-                "fine-grained PAT",
-            ),
-            (
-                "classic-40-hex-abcdef0123456789abcdef0123456789abcdef01",
-                true,
-                "40-hex token",
-            ),
-            // Each of these could break out of `header = "...: Bearer <t>"` and inject a
-            // curl directive.
-            (
-                "x\"\ninsecure",
-                false,
-                "close the quote, add `insecure` (disable TLS)",
-            ),
-            (
-                "x\nproxy = http://evil/",
-                false,
-                "newline starts a new directive",
-            ),
-            ("x\"y", false, "stray quote"),
-            ("x\\y", false, "backslash escape"),
-            ("x\ty", false, "control char (tab)"),
-            ("x\r\nfoo", false, "CRLF"),
-        ] {
-            assert_eq!(token_config_safe(token), safe, "{why}: {token:?}");
-        }
-
-        let err = curl_fetch(&["-sS"], "https://api.github.com/repos/o/r", Some(""))
-            .expect_err("an empty token must be refused before spawning curl");
-        assert!(err.contains("empty"), "{err}");
-        assert!(
-            err.contains("anonymously"),
-            "the remedy (request anonymously) must be named: {err}"
-        );
-        let err = curl_fetch(&["-sS"], "https://api.github.com/repos/o/r", Some("a\"b"))
-            .expect_err("an injection-shaped token must be refused");
-        assert!(err.contains("illegal characters"), "{err}");
-    }
-
     /// The bound is GitHub's own per-asset ceiling, so the only thing that can
     /// strand a payload is GitHub refusing to host it. A private lower copy is
     /// how 0.15.0 shipped a 512 MiB client cap against 775 MB containers:
@@ -2124,42 +1792,6 @@ mod tests {
         // …and a small cap never drops BELOW the historical wall.
         assert_eq!(download_max_time_secs(1024), 600);
         assert_eq!(download_max_time_secs(0), 600);
-    }
-
-    /// Invariant (b), pinned at the TRANSPORT: a credential paired with any host but
-    /// `api.github.com` is refused before curl is spawned, on every download entry point
-    /// — the byte lane, the file-sink lane, both resumable lanes. The anonymous web
-    /// fetch and the authenticated API fetch are the only two pairings that pass the
-    /// gate (asserted on the gate itself, so no network request is made here).
-    #[test]
-    fn a_credential_is_refused_for_any_non_api_host() {
-        const SECRET: &str = concat!("gh", "p_TOPSECRETtokenvalue0123456789ABCD");
-        const VENDOR: &str = "https://vendor.example/toolchain/trust-5520.tar.zst";
-        assert!(super::refuse_credential_off_api(API_ASSET, Some(SECRET)).is_ok());
-        assert!(super::refuse_credential_off_api(WEB_ASSET, None).is_ok());
-        assert!(super::refuse_credential_off_api(VENDOR, None).is_ok());
-        for url in [WEB_ASSET, VENDOR, "https://api.github.com.evil.example/x"] {
-            let refused = super::refuse_credential_off_api(url, Some(SECRET)).unwrap_err();
-            assert!(refused.contains("non-API host"), "{refused}");
-            assert!(
-                !refused.contains(SECRET),
-                "never echo the secret: {refused}"
-            );
-        }
-        let dest = std::env::temp_dir().join("aterm-http-credential-gate");
-        let refusals = [
-            super::download_bytes(WEB_ASSET, Some(SECRET), 1024).unwrap_err(),
-            super::download_to(WEB_ASSET, Some(SECRET), &dest, 1024).unwrap_err(),
-            download_to_resumable(WEB_ASSET, Some(SECRET), &dest, 1024).unwrap_err(),
-            download_to_resumable_https_only(VENDOR, Some(SECRET), &dest, 1024).unwrap_err(),
-        ];
-        for refused in refusals {
-            assert!(
-                refused.contains("non-API host"),
-                "the gate must be the refusal, not a network error: {refused}"
-            );
-        }
-        assert!(!dest.exists(), "nothing was spawned, nothing was written");
     }
 
     /// "No stall" must not be spelled as "no bound". The asset download bounds the
@@ -2404,7 +2036,7 @@ mod tests {
                 "{var} scrubbed: {vendor:?}"
             );
         }
-        let github = removed(&super::curl_command(&["-sS"], WEB_ASSET, false));
+        let github = removed(&super::curl_command(&["-sS"], WEB_ASSET));
         assert!(!github.iter().any(|k| k == "SSL_CERT_FILE"), "{github:?}");
     }
 
@@ -2885,10 +2517,8 @@ mod tests {
         let v = curl_argv(
             &args,
             "https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml",
-            false,
         );
         assert_eq!(v[0], "-q");
-        assert!(!v.iter().any(|a| a == "--config"));
         let dashdash = v.iter().position(|a| a == "--").expect("`--` present");
         assert_eq!(dashdash, v.len() - 2);
         // The scheme gate runs before any spawn.
@@ -2924,7 +2554,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------
-    // RESUMABLE ARTIFACT DOWNLOAD (aup-3)
+    // RESUMABLE ARTIFACT DOWNLOAD
     //
     // The win is measured in BYTES RE-FETCHED PER FAILED ATTEMPT, which needs a real
     // transfer to observe. Everything a network cannot be asked about — the size
@@ -3036,12 +2666,10 @@ mod tests {
         // And the scheme gate still refuses a non-https URL before spawning anything.
         let dir = std::env::temp_dir().join(format!("aterm-vendor-lane-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let err =
-            download_to_resumable_https_only("http://example.invalid/x", None, &dir.join("x"), 10)
-                .unwrap_err();
+        let err = download_to_resumable_https_only("http://example.invalid/x", &dir.join("x"), 10)
+            .unwrap_err();
         assert!(err.contains("non-https"), "{err}");
-        let err =
-            download_to_resumable("ftp://example.invalid/x", None, &dir.join("x"), 10).unwrap_err();
+        let err = download_to_resumable("ftp://example.invalid/x", &dir.join("x"), 10).unwrap_err();
         assert!(err.contains("non-https"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3061,13 +2689,9 @@ mod tests {
         );
     }
 
-    /// …and the one exemption from it. The artifact lane probes the DERIVED web URL
-    /// first and the credential-bearing API URL second — two hosts, one signed object,
-    /// one `.part`. A private release repo answers 404 on that derived URL shape, so the
-    /// probe fails having read nothing: the anti-wedge rule alone then discarded the
-    /// prefix the API lane had left, and a 630 MB artifact restarted from byte 0 on
-    /// every pass, forever. A verdict about the URL must spare the prefix the other lane
-    /// resumes.
+    /// …and the one exemption from it: a web-host 403/404 is a verdict about the URL
+    /// (a private release repo answers 404 on the derived URL shape), read nothing, and
+    /// must spare the prefix another attempt resumes.
     #[test]
     fn a_web_host_url_verdict_spares_the_prefix_the_other_lane_resumes() {
         // What a stalled API-lane attempt left in `<dest>.part`.
@@ -3156,7 +2780,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aterm-resume-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("a.tar.zst");
-        let err = download_to_resumable("file:///etc/passwd", None, &dest, 1 << 20)
+        let err = download_to_resumable("file:///etc/passwd", &dest, 1 << 20)
             .expect_err("a non-https asset URL must be refused");
         assert!(err.contains("non-https"), "{err}");
         assert!(!dest.exists() && !dir.join("a.tar.zst.part").exists());

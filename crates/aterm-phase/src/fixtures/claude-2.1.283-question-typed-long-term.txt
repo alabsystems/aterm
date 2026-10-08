@@ -1,0 +1,45 @@
+# claude-code 2.1.283 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm (origin/main 63323e4a4, 120x44) · CASE 1: LONG_TERM text sent into the focused free-text row (does it wrap?) · capture c1-04 · the account name redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   ~/scratch.noindex/q-measure-20649/m/work
+
+
+⏺ agents-md: no CLAUDE.md found; AGENTS.md loaded: /Users//user00/scratch.noindex/q-measure-20649/AGENTS.md
+
+❯ Use the AskUserQuestion tool exactly once with ONE question: question "Which colour do you prefer?", header "Colour",
+  options "Red (Recommended)" (description "A warm colour") and "Blue" (description "A cool colour"), single-select.
+  After I answer, reply with the exact tool result text you received, verbatim, and nothing else.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Colour
+
+Which colour do you prefer?
+
+  1. Red (Recommended)
+     A warm colour
+  2. Blue
+     A cool colour
+❯ 3. Decide yourself: choose the option that best serves long-term correctness and total value, even at the cost of
+     short-term deliverables. Say which you chose and why in one line, then continue without asking again. (Answered by
+     the aterm harness by policy; the user was not asked.)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

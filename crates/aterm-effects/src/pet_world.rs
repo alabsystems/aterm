@@ -93,8 +93,7 @@ enum Window {
     Cells(usize, usize, usize, usize),
 }
 
-/// One map-local cell the LIVE CARET'S 3x3 RING protects and nothing else
-/// does.
+/// One map-local cell that only the live caret's 3x3 ring protects.
 #[derive(Clone, Copy, Debug)]
 struct CaretCell {
     row: usize,
@@ -328,15 +327,18 @@ pub struct PetWorld {
     glyphs: Vec<Option<PetGlyph>>,
     blocked_prefix: Vec<u16>,
     protected_prefix: Vec<u16>,
+    /// Per cell: is anything painted there in the text layer — a glyph, a
+    /// colored background, a selection, an image, a host overlay spliced in
+    /// after this observation, an expanded row, or a cell nobody observed?
+    /// `cells` minus the caret's keep-off ring: the Z-ORDER plane
+    /// ([`PetWorld::ink_clearance`]).
+    inked: Vec<bool>,
     coverage: PetPane,
-    /// Map-local cells the LIVE CARET'S 3x3 RING protects and nothing else
-    /// does — at most nine. Kept apart so the two visibility readings can
-    /// forgive exactly the right subset and nothing more:
-    /// [`PetWorld::clearance_past_caret`] forgives only the blank ones (a
-    /// ring cell that also carries a glyph, a selection, an image or a
-    /// non-default background is not forgiven and stays blocked), while
-    /// [`PetWorld::under_text_clearance_past_caret`] — the reading that
-    /// already admits ordinary ink — may forgive the whole ring.
+    /// Map-local cells only the live caret's 3x3 ring protects, at most nine,
+    /// kept apart so each visibility reading forgives the right subset:
+    /// [`PetWorld::clearance_past_caret`] forgives only the blank ones, while
+    /// [`PetWorld::under_text_clearance_past_caret`] (which admits ordinary
+    /// ink) may forgive the whole ring.
     caret_cells: [Option<CaretCell>; 9],
     stamp: Option<PetWorldStamp>,
     anchors: [Option<PetAnchor>; MAX_WORLD_ANCHORS],
@@ -353,6 +355,7 @@ impl Default for PetWorld {
             glyphs: vec![None; MAX_WORLD_CELLS],
             blocked_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
             protected_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
+            inked: vec![true; MAX_WORLD_CELLS],
             coverage: PetPane::default(),
             caret_cells: [None; 9],
             stamp: None,
@@ -442,6 +445,17 @@ impl PetWorld {
     ) -> bool {
         self.retire();
         let s = facts.stamp.surface;
+        // A SUB-ROW SCROLL OFFSET IS NOT INCOHERENCE (2026-10-01). The
+        // renderer applies `scroll_frac_px` at present time as one rigid
+        // shift of the whole grid band — text, caret AND every free sprite
+        // composited into it, the pet among them (`aterm-render`'s
+        // `render_input_cached` renders the frame, sprites included, and
+        // only then translates the band; `aterm-gpu` shifts its offscreen
+        // after the sprites and before the chrome).
+        // So the cells read here are exactly the cells the pet is drawn
+        // against, and the frame's translation moves both together. Refusing
+        // it blanked the resident for every frame of a trackpad glide's tail
+        // or overscroll bounce at the live bottom.
         if s.terminal_id == 0
             || input.terminal_id != s.terminal_id
             || input.content_seq != facts.stamp.content_seq
@@ -461,7 +475,6 @@ impl PetWorld {
                 .col
                 .checked_add(pane.cols)
                 .is_none_or(|n| n > input.cols)
-            || input.scroll_frac_px != 0
             || input.selections.len() > MAX_REGIONS
             || exclusions.len() > MAX_REGIONS
             || exclusions.iter().any(|r| !r.valid())
@@ -502,10 +515,8 @@ impl PetWorld {
             rows,
             cols,
         };
-        // A frame with no selection at all answers `false` for every cell (a
-        // `TextSelection` in state `None` contains nothing, clipped or not), and
-        // that is the overwhelmingly common frame. Ask once instead of walking
-        // the clip rectangle and the anchor arithmetic 8,600 times.
+        // With no selection every cell answers `false`, the common frame, so
+        // ask once instead of per cell.
         let any_selection = input.any_selection();
         for r in 0..rows {
             let local_r = self.coverage.row + r;
@@ -518,17 +529,23 @@ impl PetWorld {
                 let start = r * MAX_WORLD_COLS;
                 self.cells[start..start + cols].fill(PetCell::Unknown);
                 self.glyphs[start..start + cols].fill(None);
+                self.inked[start..start + cols].fill(true);
                 continue;
             };
-            // The row's sidecars, fetched once and walked with a cursor as the
-            // columns ascend — see `RowScan`. Byte-identical to the per-cell
-            // `input.*_at` calls it replaces.
+            // The row's sidecars, fetched once and walked with ascending
+            // cursors (`RowScan`); identical to the per-cell `input.*_at` calls.
             let mut scan = RowScan::new(input, frame_r);
             // The implicit cell is a pure function of `default_bg`, which only
             // moves at a pane seam — never at all on a single-terminal frame.
             let mut implicit_bg = None;
             let mut implicit = RenderCell::default();
-            for c in 0..cols {
+            // Counted, not `for c in 0..cols`: this body runs for every
+            // examined cell of every frame, and an unoptimized build calls the
+            // range iterator out of line per step. Same columns, same order.
+            let mut next_c = 0;
+            while next_c < cols {
+                let c = next_c;
+                next_c += 1;
                 let local_c = self.coverage.col + c;
                 let frame_c = pane.col + local_c;
                 // A present RenderInput row is authoritative even when its
@@ -537,7 +554,7 @@ impl PetWorld {
                 // contract. Images and selection can still cover that tail.
                 // A missing ROW above remains unknown, as does map overflow.
                 let default_bg = scan.default_bg(frame_c);
-                if implicit_bg != Some(default_bg) {
+                if !matches!(implicit_bg, Some(bg) if bg == default_bg) {
                     implicit_bg = Some(default_bg);
                     implicit = RenderCell {
                         bg: [
@@ -562,12 +579,10 @@ impl PetWorld {
                     self.selection_rect =
                         Some(self.selection_rect.map_or(rect, |old| old.union(rect)));
                 }
-                // THE CARET'S 3x3 PROTECTION RING. It stays exactly as
-                // shipped for PLACEMENT — measured, it is what keeps the pet
-                // from parking in the first columns of the line, where every
-                // line of output lands — but see `caret_cells` below: it is
-                // a ring around the only place the escort is ever seated, so
-                // for VISIBILITY it may not stand in for ink.
+                // The caret's 3x3 protection ring keeps the pet from parking in
+                // the line's first columns, where output lands. It is a ring
+                // around the escort's own seat, so for visibility it must not
+                // stand in for ink (see `caret_cells` below).
                 let cursor = input.cursor_visible
                     && input.display_offset == 0
                     && frame_r.abs_diff(input.cursor_row) <= 1
@@ -599,10 +614,9 @@ impl PetWorld {
                     // the pane or coverage edge cannot certify isolation.
                     && c > 0
                     && c + 1 < cols
-                    // These two probes step BACKWARDS, so they are the one place
-                    // that asks `input` directly rather than through `scan`,
-                    // whose cursors answer ascending columns only. An isolated
-                    // braille dot is rare enough that the search is not a cost.
+                    // These probes step backwards, so they ask `input` directly
+                    // rather than the ascending `scan` cursors; isolated
+                    // braille dots are rare.
                     && [frame_c - 1, frame_c + 1].into_iter().all(|column| {
                         // A present row's implicit tail is certified blank,
                         // just like the cell being classified above.
@@ -628,6 +642,8 @@ impl PetWorld {
                     || excluded
                     || scan.image(frame_c).is_some()
                     || line != LineSize::SingleWidth;
+                // The class this cell would have with no caret at all.
+                self.inked[r * MAX_WORLD_COLS + c] = others || glyph || bg != default_bg;
                 // Recorded so the visibility layer can forgive a cell the
                 // LIVE CARET'S RING alone protects, without forgiving
                 // anything else. The pet is seated beside the caret BY
@@ -663,16 +679,17 @@ impl PetWorld {
         // A rectangle costs four reads regardless of sprite size. Counts fit
         // u16 because the complete inspected window has at most 16,384 cells.
         let stride = MAX_WORLD_COLS + 1;
-        // Only the top and left borders need resetting. Every interior cell
-        // in the current scan is overwritten below; rectangle queries cannot
-        // reach the retained cells outside coverage. A small pane should not
-        // clear two maximum-sized tables on every presentation.
+        // Only the top and left borders need resetting: every interior cell in
+        // this scan is overwritten below, and rectangle queries cannot reach
+        // retained cells outside coverage.
         self.blocked_prefix[..=cols].fill(0);
         self.protected_prefix[..=cols].fill(0);
         for r in 0..rows {
             self.blocked_prefix[(r + 1) * stride] = 0;
             self.protected_prefix[(r + 1) * stride] = 0;
-            for c in 0..cols {
+            // Counted for the same reason as the cell scan above.
+            let mut c = 0;
+            while c < cols {
                 let index = (r + 1) * stride + c + 1;
                 self.blocked_prefix[index] = self.blocked_prefix[index - 1]
                     + self.blocked_prefix[index - stride]
@@ -685,6 +702,7 @@ impl PetWorld {
                         self.cells[r * MAX_WORLD_COLS + c],
                         PetCell::Unknown | PetCell::Protected
                     ));
+                c += 1;
             }
         }
         // A target must name selected pixels we actually examined. It never
@@ -783,41 +801,35 @@ impl PetWorld {
 
     /// Certify all cells touched by the rectangle and a margin on every side.
     ///
-    /// FAIL-CLOSED, and deliberately two-valued: a rectangle this map never
-    /// examined answers `false`, the same byte as a genuinely obstructed one.
-    /// That is the correct answer for PLACEMENT — never stand where you
-    /// cannot see — and the WRONG one for VISIBILITY. [`Self::clearance`] is
-    /// the three-valued answer, and v0.81.0's blinking pet was exactly this
-    /// `false` being read as "there is ink there" by a per-frame alpha veto:
-    /// a bound on what the code knows, returned as a fact about the world.
+    /// Fail-closed and two-valued: a rectangle this map never examined answers
+    /// `false`, like an obstructed one. Right for placement (never stand where
+    /// you cannot see), wrong for visibility; [`Self::clearance`] is the
+    /// three-valued answer.
     #[must_use]
     pub fn clear(&self, rect: PetRect, margin: f32) -> bool {
         self.clearance(rect, margin) == Some(true)
     }
 
-    /// The full body may stand behind ordinary text and colored backgrounds.
-    /// Selection, cursor protection, images and unknown geometry still exclude
-    /// it. The renderer must put an admitted occupied body under the text.
+    /// The full body may stand behind ordinary text and coloured backgrounds;
+    /// selection, cursor protection, images and unknown geometry still exclude
+    /// it. The renderer must draw an admitted occupied body under the text.
     ///
-    /// FAIL-CLOSED and two-valued for the same reason [`Self::clear`] is;
+    /// Fail-closed and two-valued like [`Self::clear`];
     /// [`Self::under_text_clearance`] is the three-valued answer.
     #[must_use]
     pub fn under_text_clear(&self, rect: PetRect, margin: f32) -> bool {
         self.under_text_clearance(rect, margin) == Some(true)
     }
 
-    /// THREE-VALUED CLEARANCE — the distinction [`Self::clear`] cannot make.
+    /// Three-valued clearance:
     ///
-    /// * `Some(true)`  — every cell the rectangle and its margin touch was
-    ///   examined by this snapshot and is free.
-    /// * `Some(false)` — an examined cell is occupied or protected, or the
-    ///   query itself is degenerate (a non-finite rectangle or margin is a
-    ///   refusal to answer, not an observation of ink).
-    /// * `None`        — I CANNOT SEE THERE. There is no coherent snapshot at
-    ///   all, or the rectangle leaves the observed coverage window, which is
-    ///   centred on the caret and therefore SLIDES AS THE USER TYPES. This is
-    ///   a bound on this map, never a claim about the terminal; a caller that
-    ///   collapses it into `false` has invented ink.
+    /// * `Some(true)`: every cell the rectangle and margin touch was examined by
+    ///   this snapshot and is free.
+    /// * `Some(false)`: an examined cell is occupied or protected, or the query
+    ///   is degenerate (non-finite rectangle or margin).
+    /// * `None`: unknown. There is no coherent snapshot, or the rectangle leaves
+    ///   the coverage window, which is centred on the caret and slides as the
+    ///   user types. Collapsing this to `false` invents ink.
     #[must_use]
     pub fn clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_in(&self.blocked_prefix, Forgive::Nothing, rect, margin)
@@ -830,45 +842,63 @@ impl PetWorld {
         self.clearance_in(&self.protected_prefix, Forgive::Nothing, rect, margin)
     }
 
-    /// As [`Self::clearance`], except that the LIVE CARET'S OWN CELLS — and
-    /// only those, and only where nothing else already protects them — do not
-    /// count as obstruction.
+    /// As [`Self::clearance`], except that the live caret's own ring cells, where
+    /// nothing else protects them, do not count as obstruction.
     ///
-    /// THE CARET IS NOT AN OBSTRUCTION TO ITS OWN ESCORT, but the two layers
-    /// want different things from that sentence and both are right:
+    /// Placement keeps the caret protected ([`Self::clearance`]) so the pet never
+    /// rests on the cursor; visibility uses this, so a pet walking past the
+    /// caret is not hidden while it overlaps it.
     ///
-    ///  * PLACEMENT keeps the caret protected ([`Self::clearance`]), so the
-    ///    pet never comes to REST on top of the cursor and hides the one cell
-    ///    the user is watching;
-    ///  * VISIBILITY uses this, so a pet merely walking PAST the caret is not
-    ///    deleted for the two frames it overlaps it. Blanking a whole cat
-    ///    because of a cell that carries no glyph is how v0.81.0 came to
-    ///    flash with no new text under the pet at all.
-    ///
-    /// Only the ring cells that would be `Clear` without the caret are
-    /// forgiven here: a ring cell that also carries a glyph, a selection, an
-    /// image or a non-default background is NOT, and stays blocked.
+    /// Only ring cells that would be `Clear` without the caret are forgiven; a
+    /// ring cell with a glyph, selection, image or non-default background stays
+    /// blocked.
     #[must_use]
     pub fn clearance_past_caret(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_in(&self.blocked_prefix, Forgive::BlankCaret, rect, margin)
     }
 
     /// [`Self::clearance_past_caret`] as a two-valued, fail-closed answer:
-    /// occupancy for a body that is standing beside the live caret, with the
-    /// caret's blank ring cells discounted and nothing else.
+    /// occupancy for a body beside the live caret, discounting only the caret's
+    /// blank ring cells.
     #[must_use]
     pub fn clear_past_caret(&self, rect: PetRect, margin: f32) -> bool {
         self.clearance_past_caret(rect, margin) == Some(true)
     }
 
-    /// THE VISIBILITY VERDICT the emitted sprite is judged by: a resident may
-    /// stand under ordinary ink, and the caret's own ring is not an
-    /// obstruction to its escort. Every caret ring cell is forgivable here,
-    /// because absent the caret each one is `Ink` or `Clear` and this reading
-    /// admits both; selections, images and unknown geometry still veto.
+    /// The visibility verdict the emitted sprite is judged by: a resident may
+    /// stand under ordinary ink, and the caret's ring does not obstruct its
+    /// escort. Every ring cell is forgivable here (absent the caret each is
+    /// `Ink` or `Clear`); selections, images and unknown geometry still veto.
     #[must_use]
     pub fn under_text_clearance_past_caret(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_in(&self.protected_prefix, Forgive::AnyCaret, rect, margin)
+    }
+
+    /// Z-ORDER, three-valued: is the rectangle free of anything painted in
+    /// the text layer, so a body there may be drawn IN FRONT of it? Every
+    /// non-`Clear` cell counts except the live caret's keep-off ring. `None`
+    /// outside this map; a degenerate query and an unobserved cell answer
+    /// inked, the safe side for layering.
+    ///
+    /// THE CARET'S RING IS NOT INK. It keeps the pet from coming to rest on
+    /// the cursor, but a blank ring cell paints nothing for the body to sit
+    /// in front of or behind (the cursor itself is drawn above every pet
+    /// layer). Counting it (the z-order was `!clear(body)`) flipped a typing
+    /// escort under and over the glyphs at the keystroke rate as its body
+    /// crossed caret+1.
+    ///
+    /// A walk, not a prefix plane: its one caller asks once per frame about
+    /// a sprite-sized window, far cheaper than a table rebuilt per observation.
+    #[must_use]
+    pub fn ink_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
+        self.stamp?;
+        match self.window(rect, margin) {
+            Window::Degenerate => Some(false),
+            Window::Outside => None,
+            Window::Cells(r0, c0, r1, c1) => Some((r0..r1).all(|r| {
+                !self.inked[r * MAX_WORLD_COLS + c0..r * MAX_WORLD_COLS + c1].contains(&true)
+            })),
+        }
     }
 
     fn clearance_in(
@@ -942,18 +972,13 @@ impl PetWorld {
     }
 
     /// The swept-body test for a resident travelling behind text, for a body
-    /// LEAVING the caret's escort seat.
+    /// leaving the caret's escort seat.
     ///
-    /// A swept corridor always contains the body it departs from, and
-    /// [`STATION_LEAD`] seats the escort one cell past the caret — inside
-    /// the caret's 3x3 keep-off ring by construction. Read strictly, the
-    /// corridor out of that seat is refused for containing the seat itself:
-    /// the pet could never leave the caret to take a perch, which is a bound
-    /// on the reading returned as a fact about the route. The caret is not
-    /// an obstruction to its own escort here either, and a body merely
-    /// passing over it is already admitted by
-    /// [`Self::under_text_clearance_past_caret`], which is the reading the
-    /// emitted sprite is judged by.
+    /// A swept corridor contains the body it departs from, and [`STATION_LEAD`]
+    /// seats the escort one cell past the caret, inside the caret's keep-off
+    /// ring; read strictly, the pet could never leave. So the caret does not
+    /// obstruct its escort here either, matching
+    /// [`Self::under_text_clearance_past_caret`].
     #[must_use]
     pub fn under_text_corridor_clear_past_caret(
         &self,
@@ -1081,9 +1106,7 @@ impl PetWorld {
         ];
         let mut best = None;
         let mut best_distance = f32::INFINITY;
-        // The allowed neighborhood bounds the loop, not merely its answers.
-        // The previous full-width pass tested up to 256 columns even for an
-        // eight-column home search on a dense coding console.
+        // The allowed neighbourhood bounds the loop, not just its answers.
         let first_col = (target.1 - max_distance - self.coverage.col as f32 - margin)
             .ceil()
             .max(0.0) as usize;
@@ -1111,31 +1134,22 @@ impl PetWorld {
     }
 }
 
-/// **ONE ROW FETCH AND ONE CURSOR PER SIDECAR, INSTEAD OF A SEARCH PER CELL.**
+/// One row fetch and one cursor per sidecar instead of a search per cell.
 ///
-/// The classification walk asks `RenderInput` five questions about EVERY cell
-/// it visits, and each of those methods starts by re-fetching the ROW
-/// (`self.clusters.get(row)`, `self.default_bg_spans.get(row)`, …) and then
-/// binary-searches or partitions inside it. Columns ascend by exactly one
-/// across a row, so the row fetch is loop-invariant and every search is a
-/// one-step advance from where the last one landed. This holds the row slices
-/// for the life of the row and walks each with its own cursor, which makes each
-/// question amortised O(1) with no search at all — and collapses the ordinary
-/// single-terminal frame, where four of the five sidecars are empty and the
-/// fifth is uniform, to a constant read.
+/// The classification walk asks `RenderInput` five questions per cell, and each
+/// method re-fetches the row and searches inside it. Columns ascend by one, so
+/// this holds the row slices and walks each with its own cursor: amortised O(1)
+/// per question, and a constant read on the usual frame where four sidecars are
+/// empty and the fifth uniform.
 ///
-/// EXACTNESS IS THE POINT: the emitted classification must be byte-identical,
-/// not merely similar. A cursor is equivalent to the method it replaces only
-/// while the row's list is ordered the way that method's own search requires,
-/// so each list is checked ONCE per row — the lists are empty or tiny — and an
-/// unordered one falls back to calling the method itself. A frame whose
-/// producer handed over an unordered row therefore still gets exactly the bytes
-/// the binary search gave it, unspecified result and all.
+/// The classification must be byte-identical to the methods'. A cursor matches
+/// only while the row's list is ordered as the method's search requires, so each
+/// list is checked once per row and an unordered one falls back to the method
+/// itself.
 ///
-/// The cursors answer a NON-DECREASING column sequence only. The speck probe's
-/// two neighbours (`col - 1`, `col + 1`) deliberately keep calling `input`
-/// directly: they step backwards, and they are reached only by an isolated
-/// braille dot, so they are not on the hot path they would invalidate.
+/// The cursors answer a non-decreasing column sequence only. The speck probe's
+/// neighbours (`col - 1`, `col + 1`) call `input` directly: they step backwards
+/// and are reached only by an isolated braille dot.
 struct RowScan<'a> {
     input: &'a RenderInput,
     row: usize,
@@ -1143,7 +1157,10 @@ struct RowScan<'a> {
     line: LineRow<'a>,
     clusters: SparseRow<'a, Box<str>>,
     combining: SparseRow<'a, Box<[char]>>,
-    images: SparseRow<'a, ImageRef>,
+    /// Asked through `aterm_core::render::images_in_row_at`, as
+    /// `RenderInput::image_at` does: a cell may hold several image layers, and
+    /// image rows are nearly always empty.
+    images: &'a [(usize, ImageRef)],
 }
 
 /// The live default background along one row — `RenderInput::default_bg_at`.
@@ -1176,7 +1193,7 @@ enum LineRow<'a> {
     Unordered,
 }
 
-/// A sparse `(col, value)` sidecar row: clusters, combining marks, images.
+/// A sparse `(col, value)` sidecar row: clusters, combining marks.
 struct SparseRow<'a, T> {
     items: &'a [(usize, T)],
     /// Strictly ascending — what `binary_search_by_key` needs to be a
@@ -1218,9 +1235,8 @@ impl<'a, T> SparseRow<'a, T> {
 impl<'a> RowScan<'a> {
     fn new(input: &'a RenderInput, row: usize) -> Self {
         let bg = match input.default_bg_spans.get(row).map(Vec::as_slice) {
-            // A missing row AND an empty one both resolve every column to the
-            // frame-wide default, which is what `partition_point` on an empty
-            // slice plus the failed `get` already did.
+            // A missing row and an empty one both resolve every column to the
+            // frame-wide default, as the method does.
             None | Some([]) => BgRow::Uniform(input.default_bg),
             Some(spans) if spans.windows(2).all(|w| w[0].end_col <= w[1].end_col) => {
                 BgRow::Spans { spans, cursor: 0 }
@@ -1243,7 +1259,7 @@ impl<'a> RowScan<'a> {
             line,
             clusters: SparseRow::new(input.clusters.get(row)),
             combining: SparseRow::new(input.combining.get(row)),
-            images: SparseRow::new(input.images.get(row)),
+            images: input.images.get(row).map_or(&[], Vec::as_slice),
         }
     }
 
@@ -1279,12 +1295,11 @@ impl<'a> RowScan<'a> {
                 while spans.get(*cursor).is_some_and(|s| s.start_col <= col) {
                     *cursor += 1;
                 }
-                // `cursor` is now the method's `binary_search` insertion point.
-                // `Err(0)` — nothing starts at or before `col` — is unclaimed
-                // composite space, which renders single-width. Otherwise the
-                // last run starting at or before `col` is the only candidate,
-                // and it governs the column either as the exact `Ok` hit on its
-                // own `start_col` or by covering it.
+                // `cursor` is the method's `binary_search` insertion point.
+                // `Err(0)` (nothing starts at or before `col`) is unclaimed
+                // composite space, rendered single-width. Otherwise the last run
+                // starting at or before `col` governs it, by exact hit on its
+                // `start_col` or by covering it.
                 match cursor.checked_sub(1).map(|i| &spans[i]) {
                     Some(s) if s.start_col == col || col < s.end_col => s.line_size,
                     _ => LineSize::SingleWidth,
@@ -1303,7 +1318,9 @@ impl<'a> RowScan<'a> {
     }
 
     fn image(&mut self, col: usize) -> Option<&'a ImageRef> {
-        self.images.get(col)
+        aterm_core::render::images_in_row_at(self.images, col)
+            .last()
+            .map(|(_, image)| image)
     }
 }
 
@@ -1431,11 +1448,9 @@ mod tests {
         assert_eq!(after.ink_at(100, 100), None);
     }
 
-    /// A BOUND ON WHAT THIS MAP KNOWS IS NOT A FACT ABOUT THE WORLD. The
-    /// coverage window is centred on the caret and slides as the user types;
-    /// `clear` answers the same `false` for "there is ink there" and "that is
-    /// outside my window", and a visibility veto reading the second as the
-    /// first is what made the pet strobe at the keystroke rate in v0.81.0.
+    /// A bound on what the map knows is not a fact about the world: the
+    /// coverage window slides with the caret, and `clear` answers `false` both
+    /// for ink and for outside the window, so visibility must use `clearance`.
     #[test]
     fn outside_the_coverage_window_is_unknown_not_obstructed() {
         let mut term = Terminal::new(100, 300);
@@ -1447,6 +1462,9 @@ mod tests {
         let inside = PetRect::new(50.0, 60.0, 2.0, 5.0);
         assert_eq!(world.clearance(outside, 0.0), None, "unobserved");
         assert_eq!(world.clearance(inside, 0.0), Some(true));
+        assert_eq!(world.ink_clearance(outside, 0.0), None);
+        assert_eq!(world.ink_clearance(inside, 0.0), Some(true));
+        assert_eq!(world.ink_clearance(inside, f32::NAN), Some(false));
         // `clear` stays fail-closed for both, which is right for PLACEMENT.
         assert!(!world.clear(outside, 0.0));
         assert!(world.clear(inside, 0.0));
@@ -1471,9 +1489,8 @@ mod tests {
         assert_eq!(world.clearance(inside, f32::INFINITY), Some(false));
     }
 
-    /// The caret protects its own cell from PLACEMENT and not from
-    /// VISIBILITY, and it forgives exactly one cell — never a glyph, never a
-    /// selection, and never a neighbour.
+    /// The caret protects its own cells from placement but not visibility, and
+    /// forgives exactly those: never a glyph, a selection or a neighbour.
     #[test]
     fn the_caret_is_not_an_obstruction_to_its_own_escort() {
         let mut term = Terminal::new(10, 40);
@@ -1483,10 +1500,9 @@ mod tests {
         assert_eq!(world.cell(2, 10), PetCell::Protected);
         assert_eq!(world.clearance(on_caret, 0.0), Some(false));
         assert_eq!(world.clearance_past_caret(on_caret, 0.0), Some(true));
-        // THE WHOLE 3x3 RING: still protected, so PLACEMENT keeps its
-        // distance and the pet never parks over the cursor; still forgiven,
-        // so a sprite seated beside the caret is not deleted for standing in
-        // the caret's own keep-off margin. The ring is nine blank cells.
+        // The whole 3x3 ring (nine blank cells): still protected, so placement
+        // keeps its distance; still forgiven, so a sprite beside the caret is
+        // not hidden for standing in its keep-off margin.
         let ring = PetRect::new(1.0, 9.0, 3.0, 3.0);
         for (r, c) in [(1, 10), (3, 10), (2, 9), (2, 11), (1, 9), (3, 11)] {
             assert_eq!(world.cell(r, c), PetCell::Protected, "ring {r},{c}");
@@ -1494,6 +1510,8 @@ mod tests {
         assert_eq!(world.cell(2, 13), PetCell::Clear, "outside the ring");
         assert_eq!(world.clearance(ring, 0.0), Some(false));
         assert_eq!(world.clearance_past_caret(ring, 0.0), Some(true));
+        // And it is PROTECTION, not ink: nothing there to draw behind.
+        assert_eq!(world.ink_clearance(ring, 0.0), Some(true));
         // One cell past the ring on every side is still forgiven, because
         // those cells were never blocked in the first place.
         assert_eq!(
@@ -1506,6 +1524,7 @@ mod tests {
         let on_glyph = PetRect::new(4.0, 20.0, 1.0, 1.0);
         assert_eq!(world.clearance(on_glyph, 0.0), Some(false));
         assert_eq!(world.clearance_past_caret(on_glyph, 0.0), Some(false));
+        assert_eq!(world.ink_clearance(on_glyph, 0.0), Some(false));
         // And a wider body that also covers real ink is still obstructed.
         term.process(b"\x1b[7;5Hword\x1b[7;12H");
         let world = observe(&mut term);
@@ -1555,6 +1574,7 @@ mod tests {
                     rows: 1,
                     z_index: -1,
                     band_lift_px: 0,
+                    cell_offset_px: (0, 0),
                     scaling: ImageScaling::Fit,
                     source_rect: None,
                 }),
@@ -1585,6 +1605,19 @@ mod tests {
                 "selection and images remain protected in both planes"
             );
         }
+        // The z-order plane: what is PAINTED there, not what is protected.
+        for (row, inked) in [(2, true), (3, true), (5, true), (7, true), (9, false)] {
+            assert_eq!(
+                world.ink_clearance(PetRect::new(row as f32, 10.0, 1.0, 1.0), 0.0),
+                Some(!inked),
+                "row {row}"
+            );
+        }
+        // A host overlay spliced in after the observation (a preedit row)
+        // is glyphs the map cannot see: drawn under, like any other ink.
+        let blank = PetRect::new(9.0, 10.0, 1.0, 1.0);
+        assert!(world.observe_with_exclusions(&input, &facts, PetPane::full(&input), &[blank]));
+        assert_eq!(world.ink_clearance(blank, 0.0), Some(false));
     }
 
     #[test]
@@ -1697,12 +1730,14 @@ mod tests {
                                 reused.under_text_clearance(rect, 0.0),
                                 reused.clearance_past_caret(rect, 0.0),
                                 reused.under_text_clearance_past_caret(rect, 0.0),
+                                reused.ink_clearance(rect, 0.0),
                             ),
                             (
                                 fresh.clearance(rect, 0.0),
                                 fresh.under_text_clearance(rect, 0.0),
                                 fresh.clearance_past_caret(rect, 0.0),
                                 fresh.under_text_clearance_past_caret(rect, 0.0),
+                                fresh.ink_clearance(rect, 0.0),
                             ),
                             "{rows}x{cols}, present_rows={present_rows}, rect={rect:?}"
                         );
@@ -1740,10 +1775,19 @@ mod tests {
         assert_eq!(world.cell(0, 0), PetCell::Unknown);
         assert!(!world.clear(PetRect::new(0.0, 0.0, 2.0, 5.0), 0.0));
         assert!(world.clear(PetRect::new(50.0, 60.0, 2.0, 5.0), 0.0));
+        assert_eq!(
+            world.ink_clearance(PetRect::new(50.0, 60.0, 2.0, 5.0), 0.0),
+            Some(true)
+        );
         input.cells.truncate(50);
         assert!(world.observe(&input, &facts, PetPane::full(&input)));
         assert_eq!(world.cell(50, 60), PetCell::Unknown);
         assert!(!world.clear(PetRect::new(50.0, 60.0, 2.0, 5.0), 0.0));
+        // An unobserved row is drawn under, the safe side for layering.
+        assert_eq!(
+            world.ink_clearance(PetRect::new(50.0, 60.0, 2.0, 5.0), 0.0),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1919,18 +1963,17 @@ mod tests {
         assert!(world.nearest_perch(body, 0.2, 50.0).is_none());
     }
 
-    /// Sidecars shaped to hit EVERY branch the row cursors must reproduce:
-    /// absent rows, empty rows, ordered multi-pane spans, individually
-    /// malformed spans, run gaps, a zero-width run, and rows that are not
-    /// ordered at all (where the method's own search is the only answer).
+    /// Sidecars shaped to hit every branch the row cursors must reproduce:
+    /// absent rows, empty rows, ordered multi-pane spans, malformed spans, run
+    /// gaps, a zero-width run, and unordered rows (where only the method's own
+    /// search answers).
     fn adversarial_sidecars(input: &mut RenderInput) {
         let cols = input.cols;
         input.default_bg_spans = vec![
             // A row of spans is EMPTY: the frame-wide default governs it.
             Vec::new(),
-            // Two panes ABUTTING at column 20 — what a compositor actually
-            // emits, and the case that separates "first span ending after this
-            // column" from "first span not ending before it".
+            // Two panes abutting at column 20, as a compositor emits; separates
+            // "first span ending after this column" from "not ending before it".
             vec![
                 DefaultBgSpan::new(0, 20, 0x0011_2233),
                 DefaultBgSpan::new(20, cols, 0x0044_5566),
@@ -1975,13 +2018,12 @@ mod tests {
                 LineSizeSpan::new(5, 10, LineSize::DoubleHeightTop),
                 LineSizeSpan::new(20, 25, LineSize::DoubleWidth),
             ],
-            // A ZERO-WIDTH run. `binary_search` still finds column 10 by its
-            // `start_col`, so the run governs a column it does not cover — the
-            // one case a plain "does it cover the column" cursor gets wrong.
+            // A zero-width run: `binary_search` still finds column 10 by its
+            // `start_col`, so the run governs a column it does not cover.
             vec![LineSizeSpan::new(10, 10, LineSize::DoubleWidth)],
-            // Two runs sharing a `start_col`, and two in DESCENDING order:
-            // neither is a sorted slice, so `binary_search` answers whatever it
-            // answers and the cursor must not invent a tidier reading.
+            // Two runs sharing a `start_col`, and two in descending order: not
+            // sorted, so the cursor must reproduce whatever `binary_search`
+            // answers.
             vec![
                 LineSizeSpan::new(0, 10, LineSize::DoubleWidth),
                 LineSizeSpan::new(0, 20, LineSize::DoubleHeightBottom),
@@ -2015,6 +2057,7 @@ mod tests {
                         rows: 1,
                         z_index: 0,
                         band_lift_px: 0,
+                        cell_offset_px: (0, 0),
                         scaling: ImageScaling::Fit,
                         source_rect: None,
                     }),
@@ -2031,11 +2074,8 @@ mod tests {
         ];
     }
 
-    /// THE EQUIVALENCE THE WALK'S SPEED NOW RESTS ON. `RowScan` exists only
-    /// because it answers exactly what the per-cell `RenderInput` lookups
-    /// answer; anything less is a wrong classification, not a faster one. Every
-    /// column of every row — including rows past the end of each sidecar — is
-    /// compared against the method it replaced.
+    /// `RowScan` answers exactly what the per-cell `RenderInput` lookups answer,
+    /// at every column of every row, including rows past each sidecar's end.
     #[test]
     fn the_row_cursors_answer_exactly_what_the_per_cell_lookups_do() {
         let mut term = Terminal::new(12, 40);
@@ -2044,9 +2084,8 @@ mod tests {
         adversarial_sidecars(&mut input);
         for row in 0..input.rows + 2 {
             let mut scan = RowScan::new(&input, row);
-            // Ascending columns, which is the contract the cursors answer, and
-            // two past the frame's width because the walk's own neighbour
-            // arithmetic can reach there on a clamped pane.
+            // Ascending columns (the cursors' contract), two past the frame
+            // width, which the walk's neighbour arithmetic can reach.
             for col in 0..input.cols + 2 {
                 let at = (row, col);
                 assert_eq!(
@@ -2078,10 +2117,9 @@ mod tests {
         }
     }
 
-    /// The same equivalence seen from OUTSIDE, through `observe`: a pane-local
-    /// live default background decides Ink from Clear column by column, so a
-    /// cursor that lands one column early or late changes what the pet may
-    /// stand on. The seam is at column 20 and the test reads both sides of it.
+    /// The same equivalence through `observe`: a pane-local default background
+    /// decides Ink from Clear column by column, so a cursor one column off
+    /// changes what the pet may stand on. Reads both sides of the seam at 20.
     #[test]
     fn a_pane_local_default_background_decides_ink_column_by_column() {
         let mut term = Terminal::new(10, 40);
@@ -2111,11 +2149,10 @@ mod tests {
         assert_eq!(world.cell(5, 39), PetCell::Clear);
     }
 
-    /// ADVERSARIAL REVIEW TEST (not part of the change under review).
-    /// The shipped equivalence test queries all five accessors at EVERY column
-    /// in lockstep. The real walk does not: `cluster`/`combining` short-circuit
-    /// on `||`, and `image` is skipped whenever `selected || excluded` already
-    /// holds, so a cursor can be asked for column 40 having last seen column 3.
+    /// The real walk does not query every accessor at every column:
+    /// `cluster`/`combining` short-circuit on `||` and `image` is skipped when
+    /// `selected || excluded` holds, so a cursor can be asked for column 40
+    /// having last seen column 3.
     #[test]
     fn review_row_cursors_survive_skipped_and_sparse_query_orders() {
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
@@ -2226,6 +2263,7 @@ mod tests {
                                         rows: 1,
                                         z_index: 0,
                                         band_lift_px: 0,
+                                        cell_offset_px: (0, 0),
                                         scaling: ImageScaling::Fit,
                                         source_rect: None,
                                     }),
@@ -2293,13 +2331,10 @@ mod tests {
         }
     }
 
-    /// ADVERSARIAL REVIEW TEST (not part of the change under review).
-    /// The implicit sparse-tail cell is now REBUILT only when the row's default
-    /// background moves. Nothing in the change pins that: the shipped
-    /// `a_pane_local_default_background_decides_ink_column_by_column` fully
-    /// materializes its row, so `implicit` is never read there. This row has an
-    /// EMPTY materialized prefix, so every cell is the implicit one, and a
-    /// stale implicit paints the second pane's blank tail as Ink.
+    /// The implicit sparse-tail cell is rebuilt only when the row's default
+    /// background moves. This row has an empty materialized prefix, so every
+    /// cell is implicit, and a stale implicit would paint the second pane's
+    /// blank tail as Ink.
     #[test]
     fn review_sparse_tail_implicit_cell_tracks_a_mid_row_background_seam() {
         let mut term = Terminal::new(10, 40);

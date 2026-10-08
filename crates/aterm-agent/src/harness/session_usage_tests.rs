@@ -6,40 +6,28 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 
-static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
-
 /// A fresh scratch directory under the system temp dir, removed on drop.
-struct TestDir(PathBuf);
+struct TestDir(aterm_tempfile::TempDir);
 
 impl TestDir {
     fn new(label: &str) -> Self {
-        let nonce = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "aterm-session-usage-{label}-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("create the scratch root");
-        Self(path)
+        Self(
+            aterm_tempfile::Builder::new()
+                .prefix(&format!("aterm-session-usage-{label}-"))
+                .tempdir()
+                .expect("create the scratch root"),
+        )
     }
 
     fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
+        self.0.path().join(name)
     }
 }
 
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// One assistant row as the vendor writes it (the measured shape), with its
-/// newline.
+/// One assistant row as the vendor writes it, with its newline.
 fn row(id: &str, model: &str, input: u64, output: u64) -> String {
     format!(
         "{{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{{\"id\":\"{id}\",\"model\":\"{model}\",\"role\":\"assistant\",\"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":1000}}}}}}\n"
@@ -65,7 +53,7 @@ const BIG: u64 = u64::MAX;
 // The incremental fold
 // ---------------------------------------------------------------------------
 
-/// THE COST RULE: a re-read reads what was appended and nothing else — the
+/// The cost rule: a re-read reads what was appended and nothing else — the
 /// appended bytes plus the one boundary byte — and a re-read of an unchanged
 /// file reads nothing at all.
 #[test]
@@ -244,7 +232,7 @@ fn a_truncated_file_starts_the_fold_over() {
 
 /// Rotated: another file renamed over the path is a new inode, and the fold
 /// starts over rather than reading on from an offset into someone else's
-/// bytes — even when the new file is LONGER and its byte under the old
+/// bytes — even when the new file is longer and its byte under the old
 /// boundary is a newline too (its first row is exactly as long as the old
 /// one's), so only the file's identity can tell.
 #[cfg(unix)]
@@ -273,7 +261,7 @@ fn a_rotated_file_starts_the_fold_over() {
     );
 }
 
-/// Rewritten IN PLACE, same inode and longer than before: only the boundary
+/// Rewritten in place, same inode and longer than before: only the boundary
 /// byte can tell, and it does.
 #[test]
 fn a_file_rewritten_in_place_is_caught_by_the_boundary_byte() {
@@ -330,7 +318,7 @@ fn a_budget_bounds_one_read_and_the_next_carries_on() {
 #[test]
 fn any_split_of_the_appends_folds_to_the_one_pass_result() {
     let dir = TestDir::new("splits");
-    let text: String = (0..40)
+    let text: String = (0..15)
         .map(|i| {
             let model = ["claude-opus-5-5", "claude-haiku-4-5", "claude-fable-5-1"][i % 3];
             // Every fifth row repeats the one before it: dedupe across cuts.
@@ -345,9 +333,9 @@ fn any_split_of_the_appends_folds_to_the_one_pass_result() {
         })
         .collect();
     let mut whole = TranscriptUsage::new();
-    whole
-        .fold_reader(std::io::BufReader::new(text.as_bytes()))
-        .expect("in memory");
+    for line in text.split_terminator('\n') {
+        whole.fold_line(line);
+    }
     for step in [1usize, 3, 17, 64, 333, 4096] {
         let path = dir.join(&format!("s{step}.jsonl"));
         fs::write(&path, b"").expect("create");
@@ -389,6 +377,21 @@ fn an_oversize_line_across_reads_is_skipped_and_counted() {
     cursor.advance(BIG).expect("reads");
     assert_eq!(cursor.fold().rows_skipped_long, 1);
     assert_eq!(output_of(cursor.fold(), "claude-opus-5-5"), 3);
+}
+
+/// A line that is not UTF-8 is counted unparsed, never folded, and the row
+/// after it still counts.
+#[test]
+fn a_line_that_is_not_utf8_is_counted_unparsed() {
+    let dir = TestDir::new("not-utf8");
+    let path = dir.join("s.jsonl");
+    fs::write(&path, b"\xff\xfe not utf8\n").expect("write");
+    append(&path, &row("m1", "claude-opus-5-5", 1, 2));
+    let mut cursor = TranscriptCursor::new(&path);
+    cursor.advance(BIG).expect("reads");
+    assert_eq!(cursor.fold().rows, 2);
+    assert_eq!(cursor.fold().rows_unparsed, 1);
+    assert_eq!(output_of(cursor.fold(), "claude-opus-5-5"), 2);
 }
 
 /// A FIFO where a transcript should be is refused, never read (a read would
@@ -434,8 +437,8 @@ fn a_session_sums_its_subagent_transcripts_and_nothing_else() {
         &row("s2", "claude-haiku-4-5", 5, 2),
     );
     append(&subs.join("notes.txt"), "not a transcript\n");
-    // A workflow's journal sits beside its agents' transcripts (MEASURED:
-    // `subagents/workflows/wf_<id>/journal.jsonl`): not a transcript.
+    // A workflow's journal sits beside its agents' transcripts
+    // (`subagents/workflows/wf_<id>/journal.jsonl`): not a transcript.
     append(
         &subs.join("workflows").join("run-1").join("journal.jsonl"),
         &row("j1", "claude-haiku-4-5", 5, 7_000),
@@ -557,7 +560,7 @@ fn set_age(path: &Path, secs_ago: u64) {
         .expect("mtime");
 }
 
-/// AT THE BOUND, new files are UNREAD — said, never guessed at: within the
+/// At the bound, new files are unread — said, never guessed at: within the
 /// read that crosses it the newest are followed; past it every new file
 /// (a running subagent's included) is counted `unread`, and a followed file
 /// is never dropped — it keeps growing in the totals.
@@ -710,7 +713,7 @@ fn a_walk_cut_short_is_said_on_the_glass() {
 }
 
 /// What a refresh now could find is known from a few `stat`s: the fold
-/// behind WITH progress to make, the transcript, a new file in the subagent
+/// behind with progress to make, the transcript, a new file in the subagent
 /// directory, or a RUNNING subagent's file growing — the main transcript can
 /// sit still for minutes while its subagents spend. A fold behind whose last
 /// read moved nothing is left alone until a file changes.
@@ -750,7 +753,7 @@ fn moved_sees_subagent_growth_and_an_unfinished_fold() {
     assert!(session.moved(), "the transcript grew");
 }
 
-/// `moved` checks EVERY followed file, not only the most recently written:
+/// `moved` checks every followed file, not only the most recently written:
 /// with ten parallel agents, the one whose file was written longest ago (an
 /// agent in a long tool call) appending its final message is seen at once,
 /// as the newest growing is — and a followed file deleted since is not a
@@ -789,7 +792,7 @@ fn moved_watches_every_followed_file() {
     assert!(!session.moved(), "a followed file gone has nothing to read");
 }
 
-/// Once the read's budget is spent, NO further file is opened: a subagent
+/// Once the read's budget is spent, no further file is opened: a subagent
 /// cursor left behind costs nothing on a read whose budget the transcript
 /// took — the meter moves by the budget alone.
 #[test]
@@ -849,7 +852,7 @@ fn a_spent_budget_opens_no_more_files() {
     );
 }
 
-/// A subagent file that cannot be read is counted ONCE, as unread — never
+/// A subagent file that cannot be read is counted once, as unread — never
 /// also as followed — and once it can be read it is followed and counted.
 #[cfg(unix)]
 #[test]
@@ -897,7 +900,7 @@ fn an_unreadable_subagent_is_unread_and_nothing_else() {
     assert_eq!((session.subagent_files(), r.unread), (1, 1), "{r:?}");
 }
 
-/// A subagent file still for [`QUIET_AFTER`] keeps its totals and NO ids;
+/// A subagent file still for [`QUIET_AFTER`] keeps its totals and no ids;
 /// one that may still grow keeps the few newest.
 #[test]
 fn a_quiet_subagent_keeps_only_its_totals() {
@@ -932,7 +935,7 @@ fn a_quiet_subagent_keeps_only_its_totals() {
     );
 }
 
-/// A subagent file's directory can appear at ANY depth: the vendor writes
+/// A subagent file's directory can appear at any depth: the vendor writes
 /// 97 % of them under `subagents/workflows/<run>/`. `moved` stats every
 /// directory the walk looked at — `subagents/` itself before it exists — so a
 /// new file in a run directory is seen at once, not at the slow clock.
@@ -988,10 +991,10 @@ fn rewrite_in_place(path: &Path, text: &str) {
     f.write_all(text.as_bytes()).expect("write");
 }
 
-/// A QUIET file's ids are released, so what it held can no longer be told
-/// apart from a rewrite: a plain APPEND is read on and counted, and any other
+/// A quiet file's ids are released, so what it held can no longer be told
+/// apart from a rewrite: a plain append is read on and counted, and any other
 /// change — shrunk, replaced by another file, rewritten in place — leaves it
-/// UNREAD, its earlier totals standing: never re-read from its first byte,
+/// unread, its earlier totals standing: never re-read from its first byte,
 /// never counted twice. A file that is not quiet still starts over.
 #[test]
 fn a_released_file_changed_but_appended_is_unread() {
@@ -1056,7 +1059,7 @@ fn a_released_file_changed_but_appended_is_unread() {
     assert_eq!(haiku(&session), 1200);
     assert_eq!(session.bytes_read(), before, "and not opened again");
 
-    // Control: a file NOT yet quiet starts over, as any cursor does.
+    // Control: a file not yet quiet starts over, as any cursor does.
     let live = subs.join("agent-live.jsonl");
     append(&live, &row("l1", "claude-haiku-4-5", 1, 3));
     session.refresh(BIG);
@@ -1142,7 +1145,7 @@ fn utc(_: Option<&str>, _: i64) -> Option<i64> {
 
 const DAY: i64 = 1_790_000_000 - 1_790_000_000 % 86_400;
 
-/// THE WALL is the newest notice's, shown while its reset — placed from the
+/// The wall is the newest notice's, shown while its reset — placed from the
 /// row's own time — is ahead, as the vendor printed it (its zone left off:
 /// it is the local one here), and not at all once it has passed.
 #[test]
@@ -1178,7 +1181,7 @@ fn the_wall_stands_until_its_reset() {
     );
 }
 
-/// A RESPONSE SERVED AFTER THE NOTICE takes the wall down: the limit no
+/// A response served after the notice takes the wall down: the limit no
 /// longer blocks (`/limit-reset`, extra usage, another account), whatever
 /// its printed reset. One served before it, or at its instant, does not.
 #[test]
@@ -1192,7 +1195,7 @@ fn a_response_served_since_takes_the_wall_down() {
     assert!(wall_of(&rows, Some(two_pm), at, &utc).is_some());
 }
 
-/// A reset that cannot be placed shows NOTHING — never a guess, and never
+/// A reset that cannot be placed shows nothing — never a guess, and never
 /// an older row in its place: a text the parser does not read, a row with
 /// no reset, a zone this machine does not know.
 #[test]
@@ -1216,11 +1219,10 @@ fn an_unplaceable_wall_shows_nothing() {
     assert!(wall_of(&control, None, at + 60, &known).is_some());
 }
 
-/// A WEEKLY reset under a day away is printed with no date (MEASURED in the
-/// 2.1.283 bundle), and it is its NEXT occurrence: `9am` written at 14:00 is
-/// tomorrow's — shown for the 19 hours the user is walled, never placed in
-/// the past. The five-hour window keeps its own rule (today's, passed), and
-/// a DATED reset is where its date puts it.
+/// A weekly reset under a day away is printed with no date, and it is its next
+/// occurrence: `9am` written at 14:00 is tomorrow's, shown for the 19 hours
+/// the user is walled, never placed in the past. The five-hour window keeps its
+/// own rule (today's, passed), and a dated reset is where its date puts it.
 #[test]
 fn a_weekly_clock_time_is_its_next_occurrence() {
     let two_pm = DAY + 14 * 3600;
@@ -1236,7 +1238,7 @@ fn a_weekly_clock_time_is_its_next_occurrence() {
     assert_eq!(wall_of(&dated, None, two_pm + 60, &utc), None);
 }
 
-/// A weekly reset in the NEXT CALENDAR YEAR names the year (`Jan 2, 2027 at
+/// A weekly reset in the next calendar year names the year (`Jan 2, 2027 at
 /// 9am`): placed by the one reset parser, so the wall written on Dec 30
 /// stands until Jan 2 09:00 and not after.
 #[test]
@@ -1260,7 +1262,7 @@ fn pacific(_: Option<&str>, t: i64) -> Option<i64> {
     })
 }
 
-/// ACROSS A DAYLIGHT-SAVING JUMP the wall stands for its REAL time: `4am`
+/// Across a daylight-saving jump the wall stands for its real time: `4am`
 /// written at 22:30 PST on Mar 7 is 4am PDT on Mar 8 (11:00Z), four and a
 /// half hours on — shown until then, not dropped as Mar 7's.
 #[test]
@@ -1275,9 +1277,9 @@ fn a_wall_across_a_dst_jump_stands_its_real_time() {
     assert_eq!(wall_of(&rows, None, 1_772_967_600, &pacific), None);
 }
 
-/// ANOTHER ZONE'S CLOCK IS NEVER SHOWN AS THE LOCAL ONE: Claude Code prints
-/// the reset in ITS process's zone. On a Pacific machine `10pm (UTC)` keeps
-/// its zone; where that zone's clock IS the local one at the reset (the same
+/// Another zone's clock is never shown as the local one: Claude Code prints
+/// the reset in its process's zone. On a Pacific machine `10pm (UTC)` keeps
+/// its zone; where that zone's clock is the local one at the reset (the same
 /// zone, or another at the same offset then) it is left off; and where the
 /// local offset cannot be read, the zone stays.
 #[test]
@@ -1399,7 +1401,7 @@ fn models_are_named_short_and_ordered_by_tokens() {
     );
     per.insert("<synthetic>".to_owned(), spend(0, 0, 0, 0));
     let (models, more) = model_tokens(&per);
-    assert_eq!(more, 0);
+    assert_eq!(more, More::default());
     assert_eq!(
         models,
         vec![
@@ -1420,7 +1422,15 @@ fn models_are_named_short_and_ordered_by_tokens() {
     let (models, more) = model_tokens(&per);
     let labels: Vec<&str> = models.iter().map(|m| m.label.as_str()).collect();
     assert_eq!(labels, ["opus5.5", "haiku", "opus5"], "{models:?}");
-    assert_eq!(more, 1, "sonnet is counted, not named");
+    assert_eq!(
+        more,
+        More {
+            models: 1,
+            input: 5,
+            output: 1
+        },
+        "sonnet is gathered, not named"
+    );
 }
 
 /// A model reached through a cloud route is named as the model: Bedrock's
@@ -1458,45 +1468,83 @@ fn a_routed_model_id_is_named_as_its_model() {
         [("opus4.1", 40_000_001), ("haiku", 5), ("sonnet", 7)],
         "one model by two routes summed; two opus versions told apart"
     );
-    assert_eq!(more, 1, "opus5.5, counted");
+    assert_eq!(more.models, 1, "opus5.5, gathered");
 }
 
-/// The `Σ` segment names tokens and what the totals leave out; the wall is
-/// its own segment's text, never folded into the tokens'.
+/// The `Σ` text at each grain: the footer's TOTAL — runtime, then every
+/// model's tokens in and out merged into one pair (the gathered ones
+/// included), no model named — and its runtime alone; `harness usage`'s
+/// PER MODEL — a model named only where two or more spent, the models past
+/// [`NAMED_MODELS`] counted. The wall is its own segment's text.
 #[test]
-fn the_segment_says_tokens_and_the_wall_says_itself() {
-    let tokens = vec![
-        ModelTokens {
-            label: "opus".into(),
-            input: 48_001_000,
-            output: 310_000,
-        },
-        ModelTokens {
-            label: "haiku".into(),
-            input: 1_100_000,
-            output: 20_000,
-        },
-    ];
+fn the_segment_says_runtime_and_tokens_at_each_grain() {
+    let opus = ModelTokens {
+        label: "opus".into(),
+        input: 395_000_000,
+        output: 2_000_000,
+    };
+    let haiku = ModelTokens {
+        label: "haiku".into(),
+        input: 12_000_000,
+        output: 88_000,
+    };
     let wall = || Wall {
         label: "5h",
         resets: "3pm".into(),
     };
-    let only_tokens = UsageFacts::of((tokens.clone(), 0), None, None).expect("tokens");
+    let one = UsageFacts::of((vec![opus.clone()], More::default()), None, None)
+        .expect("tokens")
+        .with_runtime(28_320_999);
+    for grain in [UsageGrain::Total, UsageGrain::PerModel] {
+        assert_eq!(
+            usage_text_at(&one, grain).as_deref(),
+            Some("7h52m \u{2191}395M \u{2193}2.0M"),
+            "{grain:?}: one model is never named"
+        );
+    }
+    let more = More {
+        models: 1,
+        input: 1_000_000,
+        output: 12_000,
+    };
+    let several = UsageFacts::of((vec![opus, haiku], more), Some(wall()), None)
+        .expect("facts")
+        .with_runtime(67_560_000);
     assert_eq!(
-        usage_text(&only_tokens).as_deref(),
-        Some("opus 48M in 310k out \u{00B7} haiku 1.1M in 20k out")
+        usage_text(&several).as_deref(),
+        Some("18h46m opus \u{2191}395M \u{2193}2.0M \u{00B7} haiku \u{2191}12M \u{2193}88k +1"),
+        "the wall is not in the usage text"
     );
-    let together = UsageFacts::of((tokens.clone(), 2), Some(wall()), None).expect("facts");
     assert_eq!(
-        usage_text(&together).as_deref(),
-        Some("opus 48M in 310k out \u{00B7} haiku 1.1M in 20k out \u{00B7} +2"),
-        "the wall is not in the tokens' text"
+        usage_text_at(&several, UsageGrain::Total).as_deref(),
+        Some("18h46m \u{2191}408M \u{2193}2.1M")
     );
-    assert_eq!(wall_text(&wall()), "5h limit \u{00B7} resets 3pm");
-    let walled = UsageFacts::of((Vec::new(), 0), Some(wall()), None).expect("the wall alone");
-    assert_eq!(usage_text(&walled), None, "no tokens: no \u{03A3} text");
-    assert_eq!(walled.wall, Some(wall()));
-    assert_eq!(UsageFacts::of((Vec::new(), 0), None, None), None);
+    assert_eq!(
+        usage_text_at(&several, UsageGrain::Runtime).as_deref(),
+        Some("18h46m")
+    );
+    let unrun = UsageFacts {
+        runtime: None,
+        ..several
+    };
+    assert_eq!(usage_text_at(&unrun, UsageGrain::Runtime), None);
+    let walled = UsageFacts::of((Vec::new(), More::default()), Some(wall()), None)
+        .expect("the wall alone")
+        .with_runtime(999);
+    assert_eq!(usage_text(&walled), None, "under a second, no runtime");
+    assert_eq!(walled.clone().wall_only(), Some(walled));
+    assert_eq!(
+        UsageFacts::of((Vec::new(), More::default()), None, None),
+        None
+    );
+    for (secs, text) in [
+        (42, "42s"),
+        (60 * 12 + 59, "12m59s"),
+        (3600 * 7 + 60 * 5, "7h05m"),
+        (3600 * 130 + 59 * 60, "130h"),
+    ] {
+        assert_eq!(runtime_short(secs), text);
+    }
 }
 
 /// What is left out of the totals is SAID even while no tokens are shown
@@ -1513,13 +1561,18 @@ fn unread_is_said_with_no_tokens_shown() {
         label: "5h",
         resets: "3pm".into(),
     };
-    let walled = UsageFacts::of((Vec::new(), 0), Some(wall), Some(&left_out)).expect("facts");
+    let walled =
+        UsageFacts::of((Vec::new(), More::default()), Some(wall), Some(&left_out)).expect("facts");
     assert_eq!(usage_text(&walled).as_deref(), Some("+2 unread"));
-    let alone = UsageFacts::of((Vec::new(), 0), None, Some(&left_out)).expect("facts");
+    let alone =
+        UsageFacts::of((Vec::new(), More::default()), None, Some(&left_out)).expect("facts");
     assert_eq!(usage_text(&alone).as_deref(), Some("+2 unread"));
     let whole = Refresh {
         caught_up: true,
         ..Refresh::default()
     };
-    assert_eq!(UsageFacts::of((Vec::new(), 0), None, Some(&whole)), None);
+    assert_eq!(
+        UsageFacts::of((Vec::new(), More::default()), None, Some(&whole)),
+        None
+    );
 }

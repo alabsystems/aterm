@@ -1,40 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! "LUMEN WAKE" — the paragon cursor aurora. Pure host-side animation that turns
-//! cursor motion into emitted LIGHT: a comet of premultiplied additive quads
-//! streaking the swept path, a soft bloom crown around the head, and (per style)
-//! a particle system — sparkles or rising fire embers. The renderer is a dumb,
-//! deterministic compositor of [`GlowQuad`]s; ALL the art lives here.
+//! The cursor aurora: pure host-side animation that turns cursor motion into
+//! emitted light: a comet of premultiplied additive quads along the swept
+//! path, a soft bloom crown around the head, and (per style) a particle
+//! system of sparkles or rising embers. The renderer is a deterministic
+//! compositor of [`GlowQuad`]s; the art lives here.
 //!
-//! Every emitted quad is PREMULTIPLIED (colour already scaled by coverage via
-//! [`aterm_render::premul_rgb`]), single-cell-row, and clamped to the grid
-//! interior — the invariants that make the additive light BYTE-EXACT across the
-//! Metal and CPU backends and keep the row-scoped damage gate exact. The clock is
-//! injected as an [`Instant`], so the whole effect is unit-testable without
-//! sleeping, and it decays to EXACTLY empty so the event loop returns to 0% idle.
+//! Every emitted quad is premultiplied ([`aterm_render::premul_rgb`]),
+//! single-cell-row and clamped to the grid interior, which keeps the additive
+//! light byte-exact across the Metal and CPU backends and the row-scoped damage
+//! gate exact. The clock is an injected [`Instant`], so the effect is testable
+//! without sleeping, and it decays to exactly empty so the event loop idles.
 
 use aterm_time::Instant;
 use std::time::Duration;
 
+use aterm_hash::{FNV64_OFFSET, fnv_mix_u64};
 use aterm_render::{
     BeamClip, BeamVertex, CharFg, CometSample, FireHaloCell, FireMode, FirePatch, GlowQuad,
     HaloMode, RainHalo, beam_glow_quads, comet_beam, comet_glow_quads, custom_beam_quads,
     phaser_streak_quads, premul_rgb,
 };
-// THE PROFILE IS THE RASTERIZER'S, and the ribbon reaches it only through
-// [`ribbon_beam`] — one law, evaluated in one place. The proofs in this file
-// also state it directly (the smoothness oracle derives its bound from the
-// profile's own Lipschitz constant).
+// The profile is the rasterizer's, and the ribbon reaches it only through
+// [`ribbon_beam`]: one law, evaluated in one place (the smoothness oracle
+// derives its bound from the profile's Lipschitz constant).
 //
-// The JUMP STREAK evaluates it too, and cannot do otherwise: `ribbon_beam` is
-// an X-MAJOR rasterizer (a [`RibbonVertex`] is an `x` and a `spine`), and a
-// jump runs at whatever angle the caret actually travelled — a wrap, an Enter,
-// a screen-crossing fling. So the streak builds its cross-section out of
-// abutting [`comet_beam`] tubes and takes each one's WEIGHT from this
-// function. That is the same law at a second call site, which is the thing
-// worth having; the alternative was a second falloff written out beside it,
-// and the whole reason this file has one profile is that it used to have five.
+// The jump streak uses it too. `ribbon_beam` is an x-major rasterizer (a
+// [`RibbonVertex`] is an `x` and a `spine`) while a jump runs at any angle, so
+// the streak builds its cross-section from abutting [`comet_beam`] tubes and
+// takes each one's weight from this function.
 
 use crate::rainbow_kitty::{self as rk, CaretSeam, CompanionImpulse};
 
@@ -57,14 +52,12 @@ use crate::effect_util::{
     fire_ramp, lerp_rgb, push_fx_rect as push_rect, push_twinkle_star, star_accent, star_arm,
     star_arm_px, twinkle_env, twinkle_peak, water_ramp,
 };
-// THE ONE COLOUR LAW (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2). Every mark
-// of the rainbow family resolves its colour through `spectrum` and every
-// point-mark snaps to a name through `spectrum_snap`; this file no longer owns
-// an interpolation of its own.
+// The one colour law (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2): every mark
+// of the rainbow family resolves colour through `spectrum` and every point-mark
+// snaps to a name through `spectrum_snap`.
 use crate::spectrum::{SPECTRUM_STOPS, spectrum, spectrum_snap};
-// The LUT's length and the named stops are only ever asked for by the
-// proofs — the emit path carries indices and reads colours. Test-gated so
-// the lint tells the truth about the shipping binary.
+// The LUT length and named stops are asked for only by the proofs; test-gated
+// so the lint reflects the shipping binary.
 #[cfg(test)]
 use crate::spectrum::spectrum_stop;
 use crate::trail_sweep::line_cells_tail;
@@ -75,8 +68,8 @@ pub use crate::trail_pack::TrailParams;
 use crate::trail_pack::{Envelope, HaloChannel, RampParams, ThemeArm};
 
 // The engine's parts. A part with public items is re-exported whole, so every
-// path that named `cursor_glow::X` still resolves at the visibility it had
-// here; the parts with none are `impl CursorGlow` blocks the hub never names.
+// `cursor_glow::X` path resolves at its visibility here; parts with none are
+// `impl CursorGlow` blocks.
 mod companion;
 mod custody;
 mod emit;
@@ -107,22 +100,18 @@ struct Spark {
     born_cov: u8,
     /// Position along the comet 0.0 (tail) .. 1.0 (head), for the hue sweep.
     pos: f32,
-    /// Fade lifetime in seconds. Short for a LONE single-cell TYPING advance (a
-    /// tight wake that reads as the cursor LEADING, not dragging), CHAINED to the
-    /// observed inter-key cadence during sustained typing (so the streak never
-    /// goes dark between keys — see `CHAIN_GAP_MAX`), and the full comet
-    /// `duration` for a real JUMP. Per-spark, so typing stays crisp without
-    /// shortening the glorious jump comet.
+    /// Fade lifetime in seconds: short for a lone single-cell typing advance
+    /// (a tight wake that leads), chained to the inter-key cadence during
+    /// sustained typing (so the streak never goes dark between keys, see
+    /// `CHAIN_GAP_MAX`), and the full comet `duration` for a jump.
     life: f32,
-    /// TYPING spark (single-cell advance)? Typing sparks hold full brightness for
-    /// 55% of life then cosine-fade (the chained streak stays luminous across the
-    /// inter-key gap); jump sparks keep the classic linear fade.
+    /// Typing spark (single-cell advance)? Typing sparks hold full brightness
+    /// for 55% of life then cosine-fade; jump sparks fade linearly.
     typing: bool,
-    /// The spectrum hue (turns) this cell's light was LAID in. The PHASER band
-    /// renders each cell in its laid hue — the rolling sweep leaves a real
-    /// spatial rainbow behind the cursor. LIGHT NEVER RE-COLOURS AFTER IT LEAVES
-    /// THE EMITTER: re-sampling the live hue per frame collapses the whole band
-    /// into one flickering monochrome bar. Other styles ignore it.
+    /// The spectrum hue (turns) this cell's light was laid in. The Phaser band
+    /// renders each cell in its laid hue, leaving a spatial rainbow; light never
+    /// re-colours after leaving the emitter (re-sampling per frame collapses
+    /// the band into one flickering bar). Other styles ignore it.
     hue: f32,
     born: Instant,
 }
@@ -141,7 +130,7 @@ struct WaterSample {
     drip_h: f32,
 }
 
-/// One light particle (spark / ember), advanced ANALYTICALLY from `born`.
+/// One light particle (spark / ember), advanced analytically from `born`.
 #[derive(Clone, Copy)]
 struct Particle {
     x0: f32,
@@ -151,11 +140,10 @@ struct Particle {
     gy: f32,   // gravity px/sec^2 (down +, up -)
     life: f32, // seconds
     hue: f32,  // 0..1 (sparkle), or warmth seed (fire)
-    /// Birth-coverage scale (1.0 = full punch). LASER ablation showers divide
-    /// their light across the burst (`1/√burst`) because every spark is born
-    /// at the SAME impact point — the cutting-torch read — and a 30-streak
-    /// saturating-add pile there clamped the landing to a flat white blob.
-    /// Styles with birth SPREAD keep 1.0 (bit-exact through the multiply).
+    /// Birth-coverage scale (1.0 = full). Laser ablation showers divide their
+    /// light across the burst (`1/√burst`) because every spark is born at the
+    /// same impact point, where a saturating pile would clamp to a white blob.
+    /// Styles with birth spread keep 1.0.
     cov_scale: f32,
     born: Instant,
 }
@@ -173,19 +161,10 @@ struct Ring {
     scale: f32,
 }
 
-// (How much larger a landing star is drawn on LIGHT than on dark used to live
-// here as `RAINBOW_LAND_STAR_LIGHT_SCALE = 1.55`. It is the whole family's ink
-// tax, not the landing's private one, so it is now `effect_util::STAR_ARM_INK`
-// and every light star pays it — the light ribbon twinkle, the fresh-ink spark,
-// the poof hero and the landing sparkles used to pay 1.86, 1.71, 1.06 and 1.0.)
-
-/// One FIRE METEOR — the fire style's inter-line / long-jump streak: a
-/// straight pixel-space line of fire drawn ALONG the true jump vector, whose
-/// tail retracts into the landing over its short life. The vector — never the
-/// swept CELL path — is what the streak follows: a cell-path sweep parks a
-/// static fire bar on cells the cursor never visited. The landing FLARE slams at ARRIVAL (`arrived`),
-/// not at launch, so the eruption happens where — and when — the meteor
-/// strikes.
+/// One fire meteor: the fire style's inter-line / long-jump streak, a straight
+/// pixel-space line of fire along the true jump vector (never the swept cell
+/// path) whose tail retracts into the landing. The landing flare slams at
+/// arrival (`arrived`), not launch.
 #[derive(Clone, Copy)]
 struct Meteor {
     x0: f32,
@@ -201,13 +180,10 @@ struct Meteor {
     arrived: bool,
 }
 
-/// What a [`Vapor`] puff IS — palette + growth curve family.
-///
-/// `Steam`/`Smoke` are the FIRE style's thermal language (quench flash /
-/// hot-metal wisps) and render only while the fire style is active; `Poof` is
-/// the style-agnostic ERASE puff (see [`CursorGlow::note_kill`]) — a neutral
-/// grey "text went up in smoke" that any style may shed, so [`CursorGlow::emit_vapor`]
-/// gates per-PARTICLE rather than per-style.
+/// What a [`Vapor`] puff is: palette and growth-curve family. `Steam`/`Smoke`
+/// are the fire style's thermal language and render only under that style;
+/// `Poof` is the style-agnostic erase puff ([`CursorGlow::note_kill`]), so
+/// [`CursorGlow::emit_vapor`] gates per particle rather than per style.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VaporKind {
     Steam,
@@ -215,35 +191,28 @@ enum VaporKind {
     Poof,
 }
 
-/// WHICH NOISE one erase poof makes — the key that licensed it, carried to
+/// Which noise one erase poof makes: the key that licensed it, carried to
 /// [`CursorGlow::spawn_poof`] so the cue is chosen where the poof is spawned
-/// (one edge, one rate limit, no second source of truth).
-///
-/// The two erases are different gestures and get different voices: see the
-/// SOUND note at the head of [`CursorGlow::spawn_poof`].
+/// (see the sound note there).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PoofVoice {
-    /// A LINE-scale kill chord (^U/^K): the downward
-    /// [`crate::trail_sound::SoundKind::Kill`] swoosh — the erase's whole
-    /// voice, since the chord makes no keystroke sound of its own.
+    /// A line-scale kill chord (^U/^K): the
+    /// [`crate::trail_sound::SoundKind::Kill`] swoosh, the erase's whole voice.
     Swoosh,
-    /// A WORD-scale kill chord (^W, Alt-D, Alt/Ctrl-Backspace —
+    /// A word-scale kill chord (^W, Alt-D, Alt/Ctrl-Backspace,
     /// [`CursorGlow::note_word_kill`]): the
-    /// [`crate::trail_sound::SoundKind::KillWord`] word poof, the erase
-    /// poof's slightly larger, softer cousin — one word going, not a clause.
+    /// [`crate::trail_sound::SoundKind::KillWord`] word poof.
     WordPoof,
-    /// A plain BACKSPACE: the tiny [`crate::trail_sound::SoundKind::Poof`]
-    /// breath — the CLOUD's noise, the dispersal of the erase poof the
-    /// backspace already spoke on its cursor retreat.
+    /// A plain Backspace: the tiny [`crate::trail_sound::SoundKind::Poof`]
+    /// breath of the erase poof's dispersal.
     Puff,
 }
 
-/// One VAPOR puff — EMBERFORGE steam (quench) or smoke (a hot cursor), or the
-/// erase POOF: analytic like [`Particle`] but rendered as a growing, thinning
-/// RADIAL halo (never a quad). Steam expands fast, rises with a decelerating
-/// kick, and dies young — water flashing off hot steel; smoke drifts up slowly
-/// on buoyancy with a sinusoidal waft, swelling and lingering for seconds; a
-/// poof is a brief neutral-grey smoke puff — there and gone.
+/// One vapor puff: Emberforge steam (quench) or smoke (a hot cursor), or the
+/// erase poof. Analytic like [`Particle`] but rendered as a growing, thinning
+/// radial halo. Steam expands fast, rises with a decelerating kick and dies
+/// young; smoke drifts up on buoyancy with a waft and lingers for seconds; a
+/// poof is a brief neutral-grey puff.
 #[derive(Clone, Copy)]
 struct Vapor {
     x0: f32,
@@ -259,12 +228,10 @@ struct Vapor {
     born: Instant,
 }
 
-/// One LIGHTNING BOLT — a jagged midpoint-displaced polyline (grid-interior
-/// pixels) frozen at spawn so the channel holds its shape for its whole life
-/// (per-frame jitter reads as noise, a stable channel reads as a STRIKE). Only
-/// its brightness animates: a strobing double-strike envelope (attack → hard
-/// dip → restrike → collapse). Main channels are thick; `branch` forks are
-/// thinner and dimmer.
+/// One lightning bolt: a jagged midpoint-displaced polyline (grid-interior
+/// pixels) frozen at spawn so the channel holds its shape; only brightness
+/// animates (attack → dip → restrike → collapse). `branch` forks are thinner
+/// and dimmer.
 struct Bolt {
     /// Jagged channel points, origin → tip.
     pts: Vec<(f32, f32)>,
@@ -276,32 +243,27 @@ struct Bolt {
     branch: bool,
 }
 
-/// One OUTGOING style CROSSFADE — the complete animated state that was live
-/// when the style/pack switched, still ticking under its SNAPSHOTTED old
-/// config behind a cosine ramp-down (see the STYLE SWITCH contract in
-/// [`CursorGlow::tick`]). The residue must keep rendering under the config it
-/// was FORGED under — re-rendering it through the new style's emit path pops
-/// its brightness and shape-shifts it — so the whole animator moves here rather
-/// than being interpreted anew.
+/// One outgoing style crossfade: the complete animated state live when the
+/// style or pack switched, still ticking under its snapshotted old config
+/// behind a cosine ramp-down (see the style-switch contract in
+/// [`CursorGlow::tick`]). The residue keeps rendering under the config it was
+/// forged under, so the whole animator moves here.
 struct OutgoingFade {
-    /// The moved-out animator: collections MOVED (the forged light itself),
-    /// thermal/phase scalars COPIED (the residue keeps its earned warmth).
-    /// Its own `fading` list is empty by construction, so fade ticking is
-    /// exactly one level deep — never recursive.
+    /// The moved-out animator: collections moved, thermal and phase scalars
+    /// copied. Its own `fading` list is empty, so fade ticking is one level
+    /// deep.
     engine: Box<CursorGlow>,
     /// The outgoing config (style/colours/length/pack), frozen at the switch.
     cfg: GlowConfig,
     /// The cursor cell frozen at the switch, fed as `cur` to every fade tick:
-    /// `cur == engine.last` for the fade's whole life, so a move can NEVER be
-    /// observed and the residue decays and drifts only (no typing-driven
-    /// spawns) — while positional emitters (a standing flame body, the crown)
-    /// keep their anchor instead of vanishing on frame one.
+    /// `cur == engine.last`, so no move is observed and the residue only decays
+    /// and drifts, while positional emitters (a flame body, the crown) keep
+    /// their anchor.
     anchor: Option<(u16, u16)>,
     /// Ramp-down envelope start ([`CursorGlow::FADE_OUT_S`]).
     started: Instant,
-    /// The amplitude the outgoing style actually HELD at the switch (its own
-    /// ramp-IN level when a rapid chain re-switched mid-arrival) — chained
-    /// switches hand off at the level they reached, never popping to full.
+    /// The amplitude the outgoing style held at the switch (its own ramp-in
+    /// level on a rapid re-switch), so chained switches never pop to full.
     level0: f32,
 }
 
@@ -312,305 +274,235 @@ type BoltJag = (Vec<(f32, f32)>, Vec<(f32, f32)>);
 /// Per-window aurora animation state.
 #[derive(Default)]
 pub struct CursorGlow {
-    /// THE SALVAGED v0.28 WAKE — its own engine, its own state, reached by the
-    /// one `GlowStyle::Classic` branch in [`Self::tick`]. Kept inline (rather
-    /// than behind a `Box`) because it is a handful of Vecs and an f32 or two,
-    /// and it stays EMPTY for every other style: a session that never selects
-    /// `classic` pays three unused Vec headers and never a heap byte.
+    /// The classic wake engine, reached by the one `GlowStyle::Classic` branch
+    /// in [`Self::tick`]. Inline because it is a few Vecs and stays empty for
+    /// every other style.
     classic: crate::classic_wake::ClassicWake,
     sparks: Vec<Spark>,
-    /// ADMISSION DIAGNOSIS RING: the last [`ADMISSION_LOG_CAP`] content-
-    /// candidate lifecycle events (armed/confirmed/retired + reason +
-    /// generation + endpoints), served by the `trail` control verb. Purely
-    /// diagnostic — written beside decisions, never read by one.
+    /// Admission diagnosis ring: the last [`ADMISSION_LOG_CAP`] content-candidate
+    /// lifecycle events, served by the `trail` control verb. Diagnostic only;
+    /// never read by a decision.
     admission_log: AdmissionLog,
-    /// CUMULATIVE count of moves [`Self::spawn`] actually admitted (it returned
-    /// `true` — a witnessed move that laid light). The number that separates
-    /// "the proof confirmed but the move was never paired at the spawn seam"
-    /// from "light was laid and something downstream ate it": a
-    /// `confirmed`-heavy [`AdmissionTally`] with `spawns == 0` means admission
-    /// and morphology disagree. Diagnostic only, like the ring beside it —
-    /// never read by an admission, morphology, or rendering path, and (also
-    /// like the ring) deliberately outliving every transient teardown, because
-    /// a ledger that resets on the next unowned batch answers nothing.
+    /// Cumulative count of moves [`Self::spawn`] admitted (a witnessed move that
+    /// laid light). A `confirmed`-heavy [`AdmissionTally`] with `spawns == 0`
+    /// means admission and morphology disagree. Diagnostic only, and it
+    /// survives every transient teardown.
     spawns: u64,
     /// Resident, bounded swept-cell scratch. Built backward from the landing
     /// point so an outlier cursor jump never walks or allocates the discarded prefix.
     path_scratch: Vec<(i32, i32)>,
     particles: Vec<Particle>,
     ring: Option<Ring>,
-    /// The cell height (device px) of the most recent [`Self::tick`], so
-    /// [`Self::note_scroll`] — which the host calls with a ROW count and no
-    /// geometry — can translate the PIXEL-addressed light pools. Zero until the
-    /// first tick; that case fails closed (the pools are dropped rather than
-    /// left stranded), because a scroll before any frame has been drawn cannot
-    /// have light worth keeping.
+    /// The cell height (device px) of the last [`Self::tick`], so
+    /// [`Self::note_scroll`] (called with a row count only) can translate the
+    /// pixel-addressed light pools. Zero before the first tick, in which case
+    /// the pools are dropped.
     last_ch: u16,
-    /// The grid-interior top Y (window px) of the most recent [`Self::tick`],
-    /// beside [`Self::last_ch`] and for the same reason: a ROW-BAND move
-    /// ([`Self::note_band_move`]) reaches the engine as three row numbers and
-    /// no geometry, and the pixel pools it must carry are addressed in
-    /// window-absolute px — the band's pixel span is `origin_y + top·ch ..
-    /// origin_y + (bottom+1)·ch`, so without the origin a chrome band above
-    /// the grid (a titlebar, a tab strip) would mis-place every band edge by
-    /// its own height. Zero until the first tick, which the band path treats
-    /// exactly as the scroll path treats an unknown cell height: the pools
-    /// are dropped, never stranded.
+    /// The grid-interior top Y (window px) of the last [`Self::tick`]: a
+    /// row-band move ([`Self::note_band_move`]) arrives as row numbers, and the
+    /// band's pixel span is `origin_y + top·ch .. origin_y + (bottom+1)·ch`,
+    /// so chrome above the grid must be accounted for. Zero before the first
+    /// tick, in which case the pools are dropped.
     last_origin_y: u16,
-    /// How many ROW-BAND MOVES the host has reported ([`Self::note_band_move`])
-    /// — the `band_moves=` column of `trail status`. One per band the host
-    /// replayed, not per batch: a Codex answer streaming forty lines reads
-    /// `band_moves=40` and `resets=0`; a regression that fell back to the
-    /// wholesale reset reads the reverse. A pure counter, never read by the
-    /// effect itself.
+    /// How many row-band moves the host reported ([`Self::note_band_move`]):
+    /// `trail status`'s `band_moves=`, one per band replayed. A counter only.
     coord_band_moves: u64,
-    /// THE PRESS-CREDIT RING — the typed-echo coalescer's ledger, one slot
-    /// per keyed glyph (`note_typed_glyph`), spent by `classify_move` when a
-    /// batched same-row echo is proven to be typing (`rainbow_coalesce`).
-    /// Style-agnostic: it is what turns a late three-cell echo into
-    /// `Licence::Typed` at the seam instead of a jump.
+    /// The press-credit ring: the typed-echo coalescer's ledger, one slot per
+    /// keyed glyph (`note_typed_glyph`), spent by `classify_move` when a batched
+    /// same-row echo is proven typing (`rainbow_coalesce`). Style-agnostic.
     type_press_ring: PressCredits,
     last_committed_type: Option<Instant>,
-    /// THE FAMILY METRIC ([`crate::typing_momentum`]) — the ONE integrator
-    /// the host's companions, the sing-along and v2's spine read
-    /// (`RAINBOW-KITTY-V2.md` §17.1: "the FAMILY metric, untouched").
+    /// The family metric ([`crate::typing_momentum`]): the one integrator the
+    /// host's companions, the sing-along and v2's spine read
+    /// (`RAINBOW-KITTY-V2.md` §17.1).
     momentum: TypingMomentum,
     /// The correlated typing advance the host's cursor cat mirrors
     /// ([`Self::take_cursor_cat_motion_pulse`]); set in `spawn`, cleared at
     /// the top of every tick.
     momentum_pulse: Option<CursorCatMotionPulse>,
-    /// Live FIRE METEORS (≤ [`Self::METEOR_CAP`]) — the fire style's jump
+    /// Live fire meteors (≤ [`Self::METEOR_CAP`]) — the fire style's jump
     /// streaks; see [`Meteor`].
     fire_meteors: Vec<Meteor>,
-    /// Live VAPOR (steam + smoke) puffs, rendered as radial halos. Bounded by
+    /// Live vapor (steam + smoke) puffs, rendered as radial halos. Bounded by
     /// [`Self::MAX_VAPOR`].
     vapor: Vec<Vapor>,
     /// When the hot cursor last shed a smoke wisp (rate limiter).
     last_smoke: Option<Instant>,
-    /// This frame's RADIAL light ([`RainHalo`]s — fire embers, crown, impact
-    /// flash), rebuilt by every [`Self::tick`] alongside `out` and consumed by
-    /// the host into `RenderInput.glow_halo`. Soft round light with built-in
-    /// integer elliptical falloff — the retirement of the audited square
-    /// embers and concentric-box crown. Bounded by [`Self::MAX_HALOS`].
+    /// This frame's radial light ([`RainHalo`]s: fire embers, crown, impact
+    /// flash), rebuilt by every [`Self::tick`] beside `out` and consumed into
+    /// `RenderInput.glow_halo`. Soft round light with integer elliptical
+    /// falloff. Bounded by [`Self::MAX_HALOS`].
     halo_out: Vec<RainHalo>,
-    /// This frame's PER-PIXEL FIRE (campaign 2): [`FirePatch`]es evaluated at
-    /// every device pixel by the shared integer field (CPU sampler == WGSL
-    /// twin, byte-exact) — the SOTA flame body. Replaces the texel-column
-    /// rasterization entirely; drawn at the under-ink seam so the P6 dark
-    /// cores keep working. Mode picks Add (dark themes) or Over (ink-fire on
-    /// light themes).
+    /// This frame's per-pixel fire: [`FirePatch`]es evaluated at every device
+    /// pixel by the shared integer field (CPU sampler and WGSL twin,
+    /// byte-exact), the flame body. Drawn at the under-ink seam so the dark
+    /// cores work. Mode is Add on dark themes, Over (ink-fire) on light ones.
     patch_out: Vec<FirePatch>,
-    /// This frame's UNDER-INK light (the flame field's BODY, P6): drawn by the
-    /// renderer between the cell backgrounds and the glyph ink
-    /// (`RenderInput.glow_under`), so letters engulfed by the fire read as
-    /// silhouettes INSIDE the flame volume. Tips, embers, beam, crown stay in
-    /// `out`/`halo_out` (above the ink).
+    /// This frame's under-ink light (the flame body), drawn between cell
+    /// backgrounds and glyph ink (`RenderInput.glow_under`) so engulfed letters
+    /// read as silhouettes inside the flame. Tips, embers, beam and crown stay
+    /// in `out`/`halo_out`, above the ink.
     under_out: Vec<GlowQuad>,
-    /// This frame's CHARRED INK (P6): per-cell final-fg overrides for engulfed
-    /// glyphs (`RenderInput.char_fg`) — the letterform itself becomes the
-    /// darkest thing inside the flame, scaled by engulfment.
+    /// This frame's charred ink: per-cell final-fg overrides for engulfed glyphs
+    /// (`RenderInput.char_fg`), darkest inside the flame, scaled by engulfment.
     char_out: Vec<CharFg>,
-    /// This frame's CONTRAST-HALO strengths: per-cell fire engulfment weights
+    /// This frame's contrast-halo strengths: per-cell engulfment weights
     /// (`RenderInput.fire_halo`) driving the dark dilation ring the renderers
-    /// stamp UNDER each engulfed glyph's ink — the colour-free legibility
-    /// stream (the ink itself never recolours; the no-recolor law).
+    /// stamp under each engulfed glyph's ink (the ink itself never recolours).
     fire_halo_out: Vec<FireHaloCell>,
     /// Per-cell engulfment accumulator scratch (row, col, weight), rebuilt by
     /// the flame-field emitter each frame; tiny (≤ ~36 cells).
     engulf_scratch: Vec<(u16, u16, f32)>,
-    /// Live LIGHTNING bolts (Laser style; ≤ [`Self::MAX_BOLTS`]).
+    /// Live lightning bolts (Laser style; ≤ [`Self::MAX_BOLTS`]).
     bolts: Vec<Bolt>,
-    /// Host-fed REDUCED-MOTION arm for the fresh-ink pop: when set, the pop
-    /// renders as a brightness STEP-FADE only (no scale spring, no birth
-    /// halo). NOTE the GUI's motion policy currently zeroes the whole aurora
-    /// amplitude under Reduced (reduced ⇒ `intensity == 0` ⇒ nothing draws,
-    /// pops included — which is how load-shed drops pops with the other
-    /// effects), so this arm is the engine-level contract for hosts that run
-    /// the aurora with reduced DYNAMICS at nonzero intensity (embedders /
-    /// future graded policies), mirroring the sparkle/rain reduced twins.
+    /// Host-fed reduced-motion arm for the fresh-ink pop: the pop renders as a
+    /// brightness step-fade only (no scale spring, no birth halo). The GUI's
+    /// motion policy zeroes the whole aurora under Reduced, so this is the
+    /// engine-level contract for hosts running reduced dynamics at nonzero
+    /// intensity, like the sparkle/rain reduced twins.
     reduced_motion: bool,
     /// Last observed cursor cell (terminal coords), to detect a move.
     last: Option<(u16, u16)>,
-    /// The last VISIBLE cursor cell + when — the ConPTY hide-bridge, mirroring
-    /// [`crate::cursor_trail::CursorTrail`]: conhost hides the cursor for
-    /// ~20-35ms during every keystroke-echo repaint, and without bridging that
-    /// window the glow drops its spark for nearly every key at human typing
-    /// cadence (the Windows-only "gaps in the back of the trail"). See
+    /// The last visible cursor cell and when, for the ConPTY hide bridge
+    /// (mirroring [`crate::cursor_trail::CursorTrail`]): conhost hides the
+    /// cursor briefly during every keystroke-echo repaint, which would drop
+    /// the glow's spark for most keys. See
     /// [`crate::cursor_trail::HIDE_BRIDGE_MS`].
     last_visible: Option<((u16, u16), Instant)>,
-    /// THE HIDE-BRIDGE ESTIMATE'S WITNESS: the cell the caret was last
-    /// actually OBSERVED at,
-    /// kept only while [`Self::last_visible`] holds the anchored lane's
-    /// RELOCATION — its estimate of where a hidden caret will be shown
-    /// (`echo_anchor_pass`, Rainbow Kitty) — and `None` whenever
-    /// `last_visible` is an observation. A show frame landing exactly
-    /// here, left of the estimate on its row, is no move at all: the
-    /// estimate was wrong and the caret never left (`tick`). Rides a
-    /// scroll or band move with `last_visible`; dies with the space.
+    /// The hide-bridge estimate's witness: the cell the caret was last
+    /// actually observed at, kept only while [`Self::last_visible`] holds the
+    /// anchored lane's relocation estimate (`echo_anchor_pass`, Rainbow Kitty)
+    /// and `None` when it is an observation. A show exactly here, left of the
+    /// estimate on its row, is no move (`tick`). Rides scroll and band moves
+    /// with `last_visible`.
     hide_bridge_shown: Option<(u16, u16)>,
-    /// THE ECHO ANCHOR (host-fed, [`Self::observe_print_anchor`]): where the
-    /// terminal's most recent PTY print run ENDED — `(row, col, seq)` in the
-    /// same active-grid coordinates as `tick`'s `cur`, with `seq` advancing on
-    /// every print action so an unchanged position still reads as "output
-    /// landed". This is the trail's only truthful sensor for a TUI whose
-    /// repaint bracket leaves the DEC cursor hidden (DECTCEM off across
-    /// frames) or PARKED away from the caret (CUP 1;1 before show): the
-    /// keystroke's echo mutates cells at a row the sampled cursor never
-    /// visits, so the cursor-move lane observes nothing — a total,
-    /// ledger-silent suppression. See [`Self::echo_anchor_pass`].
+    /// The echo anchor (host-fed, [`Self::observe_print_anchor`]): where the
+    /// terminal's latest PTY print run ended, `(row, col, seq)` in `tick`'s
+    /// grid coordinates, with `seq` advancing on every print so an unchanged
+    /// position still reads as new output. The only truthful sensor for a TUI
+    /// whose repaint leaves the cursor hidden or parked away from the caret
+    /// (CUP 1;1 before show). See [`Self::echo_anchor_pass`].
     print_anchor: Option<(u16, u16, u64)>,
-    /// THE ECHO ANCHOR'S GLYPH (host-fed,
-    /// [`Self::observe_print_anchor_glyph`]): what the terminal holds at the
-    /// print run's LAST cell — `(row, col - 1)` of [`Self::print_anchor`] —
-    /// in the row probe's per-column convention, sampled under the same lock
-    /// as the anchor it belongs to. `None` — unknown — whenever the host
-    /// handed over an anchor without it ([`Self::observe_print_anchor`]):
-    /// the visible-parked glyph gate in [`Self::echo_anchor_pass`] then reads
-    /// only the caret row's own probes, and every other lane never reads it.
+    /// The echo anchor's glyph (host-fed, [`Self::observe_print_anchor_glyph`]):
+    /// the terminal's content at the print run's last cell, in the row probe's
+    /// per-column convention, sampled under the anchor's lock. `None` when the
+    /// host gave no glyph; the visible-parked glyph gate in
+    /// [`Self::echo_anchor_pass`] then reads only the caret row's probes.
     print_anchor_glyph: Option<char>,
-    /// THE CARET THIS FRAME HANDED OVER IS NOT DRAWN (host-fed,
+    /// The caret handed over this frame is not drawn (host-fed,
     /// [`Self::observe_caret_drawn`]): DECTCEM hides it. Only the single-pane
-    /// window hands a hidden caret to [`Self::tick`] at all (a hidden cursor
-    /// is still a caret, for the pet); every other host hands over `None`
-    /// instead and never calls the observer, so `false` — drawn — is the
-    /// default. Read by the minibuffer gate in [`Self::echo_anchor_pass`]
-    /// alone, which is a law about a VISIBLE caret.
+    /// window hands a hidden caret to [`Self::tick`] (for the pet); other hosts
+    /// hand `None`, so the default is drawn. Read only by the minibuffer gate
+    /// in [`Self::echo_anchor_pass`].
     caret_hidden: bool,
     /// The print-anchor `seq` already consumed by [`Self::echo_anchor_pass`],
     /// so one host sample is judged exactly once.
     print_anchor_seen: u64,
-    /// Per-row memory of where the last print run on that row ended — the
-    /// launch cell for an anchored echo sweep (a whole-row TUI rewrite passes
-    /// through col 0 every keystroke, but its END advances by exactly the
-    /// typed cells, so end-to-end is the echo sweep) — plus the program-row
-    /// taint brand (see [`AnchorRow`]). Tiny LRU: TUIs interleave
-    /// the input row with a spinner/status row, and a single slot would reset
-    /// the launch column on every interleave.
+    /// Per-row memory of where the last print run on that row ended (the launch
+    /// cell for an anchored echo sweep: a whole-row TUI rewrite's end advances
+    /// by exactly the typed cells) plus the program-row taint brand
+    /// ([`AnchorRow`]). A small LRU, since TUIs interleave the input row with
+    /// status rows.
     anchor_rows: [Option<AnchorRow>; ANCHOR_ROWS],
-    /// Round-robin write head for [`Self::anchor_rows`] insertions.
-    anchor_rows_head: usize,
-    /// The last LICENSED anchored echo sweep — `(row, at)`. The second
-    /// row-discrimination arm: while this is younger than
-    /// [`Self::TYPE_HINT_FRESH`], the echo lane is SPOKEN FOR — a different
-    /// row's advance may not consume a stamp, however fresh. The taint brand
-    /// alone cannot refuse a program row's FIRST-ever end-advance (fc_hidden's
-    /// spinner counter holds a constant width until `(9)` becomes `(10)`, so
-    /// its first advance can land mid-burst with no keyless history), but the
-    /// input row re-lights every ~echo during any burst, so the holder is
-    /// always fresher than the stamp window when it matters. Cleared with the
-    /// anchor-row memory on reset/scroll (coordinate-space state).
+    /// The touch clock [`Self::anchor_rows`] evicts by, stamped into each
+    /// written entry ([`AnchorRow::touched`]), so a new row takes the least
+    /// recently printed row's slot.
+    anchor_rows_clock: u64,
+    /// The last licensed anchored echo sweep, `(row, at)`: the spoken-for arm
+    /// of row discrimination. While younger than [`Self::TYPE_HINT_FRESH`], no
+    /// other row's advance may consume a stamp. The taint brand cannot refuse a
+    /// program row's first advance (a counter going `(9)` → `(10)`), but the
+    /// input row re-lights on every echo during a burst. Cleared with the
+    /// anchor-row memory on reset or scroll.
     last_anchor_sweep: Option<(u16, Instant)>,
-    /// THE PAID PENDING-WRAP CELL: the row whose
-    /// pane-edge glyph the anchored lane licensed as its OWN print (the
-    /// `wrap_parked` arm — the print anchor one past the caret parked on
-    /// the pane's last column), with no caret move observed since. The
-    /// fold that follows from that column carries only the landing row's
-    /// head — the last column was paid and lit when it was printed — so
-    /// the fold shapes price and the spend takes `cc_local`, not
-    /// `cc_local + 1`. One-shot: the next observed caret move consumes it;
-    /// it rides its row on a scroll or band move and dies with the
-    /// coordinate space.
+    /// The paid pending-wrap cell: the row whose pane-edge glyph the anchored
+    /// lane licensed as its own print (`wrap_parked`: print anchor one past a
+    /// caret parked on the pane's last column), with no caret move since. The
+    /// following fold carries only the landing row's head, so the fold shapes
+    /// and spend take `cc_local`, not `cc_local + 1`. One-shot: the next
+    /// observed caret move consumes it; it rides scroll and band moves.
     wrap_paid_row: Option<u16>,
     /// When the cursor last moved (drives the bloom-crown fade around the head).
     last_move: Option<Instant>,
     /// Deadline until which the bloom crown is still emitted (cached so
     /// [`is_active`] needs no clock); keeps the timer armed past comet decay.
     crown_until: Option<Instant>,
-    /// The crown window applied by the LAST move: [`Self::CROWN_TYPING_MS`] for a
-    /// single-cell typing advance (chains across human inter-key gaps),
-    /// [`Self::CROWN_MS`] for a jump. Consumed by `emit_crown`'s fade math.
+    /// The crown window of the last move: [`Self::CROWN_TYPING_MS`] for a
+    /// single-cell typing advance, [`Self::CROWN_MS`] for a jump. Read by
+    /// `emit_crown`.
     crown_window_ms: u64,
-    /// The [`GlowStyle`] this animator ran under LAST tick. `None` until the first
-    /// tick. When the live style CHANGES mid-animation, the still-in-flight sparks /
-    /// particles / bolts were forged under the OLD style's geometry, colours, and
-    /// heat envelope; re-rendering them through the NEW style's emit path pops their
-    /// brightness and shape-shifts the residue. The instant this disagrees with
-    /// the live `cfg.style`, `tick` MOVES that foreign light into an
-    /// [`OutgoingFade`] — where it keeps rendering under its OLD config behind a
-    /// ramp-down — keeping the coordinate tracking and the typing warmth live.
+    /// The [`GlowStyle`] of the last tick (`None` before the first). In-flight
+    /// light was forged under the old style's geometry and colours, so when the
+    /// live style changes `tick` moves it into an [`OutgoingFade`], which keeps
+    /// rendering it under its old config behind a ramp-down, while coordinate
+    /// tracking and typing warmth stay live.
     last_style: Option<GlowStyle>,
-    /// The Trail Pack fingerprint this animator ran under LAST tick (0 when the
-    /// live style was a built-in). A pack→pack swap keeps `style == Custom`, so
-    /// the `last_style` guard alone would let foreign in-flight light re-render
-    /// under the new pack; comparing this fingerprint too drops that stale light
-    /// on any pack change (`TrailParams::pack_fp` is a compile-time hash of the
-    /// pack id + source bytes).
+    /// The Trail Pack fingerprint of the last tick (0 for a built-in). A
+    /// pack→pack swap keeps `style == Custom`, so this catches pack changes
+    /// `last_style` misses (`TrailParams::pack_fp` hashes pack id and source).
     last_pack_fp: u32,
     /// Rolling hue phase (turns) for rainbow/sparkle, advanced per spawn.
     hue: f32,
-    /// Typing-cadence HEAT 0..1 — sustained fast typing "accelerates" the wake
-    /// (brighter, longer), a pause lets it cool. Decayed lazily from `heat_at`,
-    /// so idle gaps cost nothing and never keep the animation timer armed.
+    /// Typing-cadence heat 0..1: sustained fast typing brightens and lengthens
+    /// the wake; a pause cools it. Decayed lazily from `heat_at`, so idle costs
+    /// nothing.
     heat: f32,
     /// When `heat` was last decayed (the lazy-decay stamp).
     heat_at: Option<Instant>,
-    /// Jump FLARE 0..1 — slammed to full by a real cursor jump, cooling fast
-    /// ([`Self::FLARE_DECAY_TAU`]). Fire's blaze level is `heat.max(flare)`, so a
-    /// long leap ignites the comet white-hot even from a cold keyboard, then the
-    /// streak visibly cools back through orange to deep red as it fades.
+    /// Jump flare 0..1: slammed to full by a real jump, cooling fast
+    /// ([`Self::FLARE_DECAY_TAU`]). Fire's blaze is `heat.max(flare)`, so a long
+    /// leap ignites white-hot from a cold keyboard and cools through orange to
+    /// red.
     flare: f32,
-    /// EMBERFORGE COAL BED 0..1 — the slow thermal integrator under the fast
-    /// heat: FORWARD keystrokes at any human cadence charge it (a much wider
-    /// cadence window than the fast heat's), and it cools over seconds
-    /// ([`Self::COAL_TAU`]), so relaxed typing keeps a visible ember floor
-    /// alive across thinking pauses, while full blaze is EARNED over a sentence
-    /// or two of sustained forward momentum, never seven keys.
+    /// Emberforge coal bed 0..1: the slow thermal integrator under the fast
+    /// heat. Forward keystrokes at any human cadence charge it and it cools over
+    /// seconds ([`Self::COAL_TAU`]), so relaxed typing keeps an ember floor
+    /// across pauses and full blaze takes sustained forward momentum.
     coal: f32,
-    /// Backspace QUENCH meter 0..1: each delete adds [`Self::QUENCH_GAIN`]
-    /// (decaying on [`Self::QUENCH_TAU`]), damps the display temperature —
-    /// deletion DOUSES the fire instead of feeding it — and escalates, so a
-    /// backspace RUN reads as a real quench. Fed at the host key edge by
-    /// [`Self::note_backspace`]; only a later exact candidate may move visibly.
+    /// Backspace quench meter 0..1: each delete adds [`Self::QUENCH_GAIN`]
+    /// (decaying on [`Self::QUENCH_TAU`]) and damps the display temperature, so
+    /// a backspace run reads as a quench. Fed at the key edge by
+    /// [`Self::note_backspace`].
     quench: f32,
-    /// A fresh backspace classifier ([`Self::note_backspace`]). It can classify
-    /// an already content-confirmed one-cell candidate as a DELETION (no
-    /// heat/coal gain), but never admits an observed move by itself. Expires
-    /// after [`Self::QUENCH_HINT_FRESH`].
+    /// A fresh Backspace classifier ([`Self::note_backspace`]). It can classify
+    /// an already confirmed one-cell candidate as a deletion but never admits a
+    /// move by itself. Expires after [`Self::QUENCH_HINT_FRESH`].
     quench_hint: Option<Instant>,
-    /// A fresh NAVIGATION classifier ([`Self::note_navigation`]). The timestamp
-    /// never admits a cursor delta; it only suppresses an older ambiguous class,
-    /// so Ctrl-A/E, Home/End, arrows and word motions cannot turn a later child
-    /// relocation into heat or light. Expires after [`Self::NAV_HINT_FRESH`];
-    /// unlike the quench hint it never cools heat/coal.
+    /// A fresh navigation classifier ([`Self::note_navigation`]). It never
+    /// admits a cursor delta; it suppresses an older ambiguous class so
+    /// navigation cannot turn a later child relocation into heat or light.
+    /// Expires after [`Self::NAV_HINT_FRESH`]; never cools heat or coal.
     nav_hint: Option<Instant>,
-    /// A fresh TYPED-GLYPH key-hint ([`Self::note_typed`]): armed by the host on
-    /// a PLAIN Character/Space echo key only — never Enter, Tab, navigation, or
-    /// modified chords, whose jumps keep the owner-mandated meteors/ZOOMs.
-    /// Once [`Self::note_typed_expected`] has supplied and confirmed the exact
-    /// content/target candidate, this hint classifies a one-row delta beyond the
-    /// typed advance as a TYPED RE-ANCHOR (see `spawn`): a TUI that repaints its
-    /// inset input box per keystroke can relocate the caret without sweeping the
-    /// interpolated cells. The timestamp alone never admits that relocation.
-    /// Each stamp expires after [`Self::TYPE_HINT_FRESH`] and is one-shot —
-    /// consumed by exactly one observed echo sweep. BANKED, not 1-deep (see
-    /// [`TypedStamps`]): K presses inside one frame gap bank K stamps, so an
-    /// echo arriving as several sweeps licenses every one of them instead of
-    /// declining all but the first into a background-black hole.
+    /// Fresh typed-glyph key hints ([`Self::note_typed`]): armed only for plain
+    /// Character/Space echo keys, never Enter, Tab, navigation or modified
+    /// chords. With a confirmed exact candidate
+    /// ([`Self::note_typed_expected`]), a hint classifies a one-row delta beyond
+    /// the typed advance as a typed re-anchor (see `spawn`); the timestamp alone
+    /// admits nothing. Each stamp expires after [`Self::TYPE_HINT_FRESH`] and is
+    /// consumed by exactly one echo sweep. Banked ([`TypedStamps`]), so K
+    /// presses in one frame gap license K sweeps.
     type_hint: TypedStamps,
-    /// A fresh RETURN key-hint ([`Self::note_return`] — a main-screen Enter).
-    /// This is retained only as a bounded morphology/classifier signal; it is
-    /// never movement provenance. A Return has no causal content witness, so
-    /// its cursor relocation stays dark under the exact-candidate gate.
+    /// A fresh Return hint ([`Self::note_return`], main-screen Enter): a bounded
+    /// morphology signal only, never movement provenance.
     return_hint: Option<Instant>,
-    /// A fresh USER-GESTURE classifier for cursor-moving input whose echo is
-    /// not a typed glyph: a Tab's cross-row completion, a scripted preview,
-    /// the classic trail's lockstep twin of an insert. Under v2 it is handed
-    /// over as `Licence::Synthetic` (a wake + meteor, not a walk), which is
-    /// why a delivered insert has its own class ([`InsertSeam`]) and this
-    /// one no longer carries a paste. Controller,
-    /// mouse and wheel reports cannot prove which later PTY move they
-    /// caused, so production hosts cancel those candidates fail-closed.
+    /// A fresh user-gesture classifier for cursor-moving input whose echo is
+    /// not a typed glyph: a Tab's cross-row completion, a scripted preview, the
+    /// classic trail's twin of an insert. v2 receives it as
+    /// `Licence::Synthetic` (wake and meteor, not a walk); a delivered insert
+    /// has its own class ([`InsertSeam`]). Controller, mouse and wheel reports
+    /// cannot prove which PTY move they caused, so hosts cancel those.
     user_gesture_hint: Option<Instant>,
-    /// THE DELIVERED-INSERT SEAM ([`InsertSeam`]): the licence a delivered
-    /// insert arms, its undo, the span it laid, the refused hop one delivery
-    /// may retro-license, the presses an unknown width's hop echoed, and
-    /// `trail status`'s insert rows.
+    /// The delivered-insert seam ([`InsertSeam`]): the licence, its undo, the
+    /// span laid, the refused hop one delivery may retro-license, the presses
+    /// an unknown width's hop echoed, and `trail status`'s insert rows.
     insert: InsertSeam,
     /// The in-flight rows of `trail status` ([`InFlightTally`]).
     in_flight_tally: InFlightTally,
-    /// A same-row backward typed-paired move HELD for its return
+    /// A same-row backward typed-paired move held for its return
     /// ([`HeldPark`]). Flushed by every edge that would have judged it.
     held_park: Option<HeldPark>,
+    /// The last typed lay, until the caret rests ([`TornLay`]).
+    torn_lay: Option<TornLay>,
     /// This tick's source prefix was sampled unchanged before the witness
     /// row count was consumed, and the key did not carry the source row's
     /// text down with the caret ([`CursorGlow::key_pushed_text_down`]).
@@ -625,124 +517,92 @@ pub struct CursorGlow {
     /// One bounded resident buffer, populated only for a cross-row park.
     park_source_cells: Vec<char>,
     park_source_confirmed: bool,
-    /// The row of the last LICENSED move and its clock — the insert's row
-    /// identity witness ([`Self::insert_row_identity`]): a row the hand was
-    /// licensed on within the ribbon's chain window may spend a partial
-    /// insert echo; any other row must show the insert's whole width.
+    /// The row and clock of the last licensed move: the insert's row witness
+    /// ([`Self::insert_row_identity`]). A row licensed within the chain window
+    /// may spend a partial insert echo; any other row needs the whole width.
     last_licensed_row: Option<(u16, Instant)>,
-    /// A fresh COMPOSER-NEWLINE hint ([`Self::note_newline_break`] — an
-    /// alt-screen Shift+Enter, the chord agent composers bind to "insert a line
-    /// break without submitting").
+    /// The hand's row: where the last licensed typed echo landed (stamp- or
+    /// pool-paired). Line-editing presses and modifier edges keep it
+    /// ([`Self::clear_typed_keeping_hand`]); every other press drops it
+    /// ([`Self::clear_typed`], and [`Self::note_return`]'s Enter into a shell;
+    /// an Enter into a composer keeps it, [`Self::note_return_keeping_hand`]),
+    /// as do reset and teardown. A scroll or band move carries it with the row,
+    /// or with the caret when the hand typed at it ([`HandRow::caret_row`]).
+    /// The parked-caret arm of [`Self::echo_anchor_pass`] reads it: while the
+    /// drawn caret stands on this row, advances on other rows are a program's
+    /// and forget nothing, and presses kept by a refusal below the caret are
+    /// held to this row ([`PressCredits::held_through`]).
+    hand_row: Option<HandRow>,
+    /// A fresh composer-newline hint ([`Self::note_newline_break`]: an
+    /// alt-screen Shift+Enter, bound by agent composers to a line break without
+    /// submitting).
     ///
-    /// THE ONE SIGNAL THE GEOMETRY CANNOT CARRY. The TUI-relocation retirement
-    /// (see [`Self::retire_abandoned_light`]) retires the previous row's ribbon
-    /// on a typing-classified row change that no fold, gesture or scroll
-    /// explains, because such a change means a repaint MOVED the input line and
-    /// the light above is decorating cells that no longer hold what laid it. A
-    /// composer newline produces the identical observed move — one row down,
-    /// back to the box's left inset — and is the exact opposite case: the user
-    /// authored that line break, and the row it leaves still holds the text they
-    /// just typed. Nothing in `(pr, pc) → (cr, cc)` separates the two, which is
-    /// why this was carried as a known residual until the host started arming
-    /// the distinction.
+    /// Geometry cannot carry it. [`Self::retire_abandoned_light`] retires the
+    /// previous row's ribbon on an unexplained typing-classified row change (a
+    /// repaint moved the input line). A composer newline makes the identical
+    /// move, one row down to the box's inset, but the row it leaves still holds
+    /// the user's text.
     ///
-    /// Shift+Enter also carries typed morphology once an exact candidate exists,
-    /// so it cannot be told from a glyph echo by movement shape either. A
-    /// licence term ([`Self::one_shot_licensed`], the park refusal) that is
-    /// CONSUMED ONCE at the spawn seam, exactly as the Return's is: the
-    /// composer's own row change takes it (`Licence::Return`), and the
-    /// peeks then see a spent hint (peeked and never taken, one chord would
-    /// license every program move for 250 ms). Expires after
-    /// [`Self::RETURN_HINT_FRESH`] — the same bounded classifier window as
-    /// Enter.
+    /// A licence term ([`Self::one_shot_licensed`], the park refusal) consumed
+    /// once at the spawn seam, like the Return's: the composer's own row change
+    /// takes it (`Licence::Return`). Expires after [`Self::RETURN_HINT_FRESH`].
     newline_hint: Option<Instant>,
-    /// A fresh REFLOW classifier. Coordinate-space changes reset both engines;
-    /// no trustworthy old path exists in the new geometry, so reflow is
-    /// deliberately dark and this timestamp never admits a movement birth.
+    /// A fresh reflow classifier. Coordinate changes reset both engines, so
+    /// reflow is dark and this never admits a movement birth.
     reflow_hint: Option<Instant>,
-    /// A fresh KILL key-hint ([`Self::note_kill`] — Ctrl-K/U/W, Alt-D,
-    /// word-delete Backspaces, forward Delete): the license for the erase POOF.
-    /// A poof can only fire within [`Self::KILL_HINT_FRESH`] of a kill key AND
-    /// a same-row NET SHRINK of the probed row content (see `poof_scan`) — the
-    /// key alone never poofs (a kill that erased nothing is silent), and a
-    /// shrink alone never poofs (Ink repaints rewrite rows constantly).
+    /// A fresh kill key hint ([`Self::note_kill`]: Ctrl-K/U/W, Alt-D,
+    /// word-delete Backspace, forward Delete), the licence for the erase poof.
+    /// A poof needs both this hint within [`Self::KILL_HINT_FRESH`] and a
+    /// same-row net shrink of the probed row (`poof_scan`); neither alone
+    /// poofs.
     kill_hint: Option<Instant>,
-    /// WHICH SCALE the fresh kill hint is: `true` iff [`Self::note_word_kill`]
-    /// armed it (^W, Alt-D, Alt/Ctrl-Backspace — one word going), `false` for
-    /// the line-scale chords (^K/^U — a clause). Read exactly once, where the
-    /// poof chooses its voice ([`PoofVoice`]); carries no freshness of its own
-    /// because it is meaningless without a fresh `kill_hint`, and every
-    /// `note_kill` re-stamps it.
+    /// The fresh kill hint's scale: `true` iff [`Self::note_word_kill`] armed it
+    /// (one word), `false` for line-scale chords (^K/^U). Read once, where the
+    /// poof chooses its voice ([`PoofVoice`]); meaningless without a fresh
+    /// `kill_hint`, and re-stamped by every `note_kill`.
     kill_hint_word: bool,
-    /// The instant of a caret-MOVING kill whose own caret retreat is still
-    /// OWED: stamped by [`Self::note_kill`] with `moves_cursor`, spent by
-    /// the first nav-shaped move `spawn` judges within
-    /// [`Self::KILL_HINT_FRESH`] of it, and superseded by a real navigation
-    /// press ([`Self::note_motion`]). The retreat is ONE move; everything
-    /// after it is navigation — [`Self::kill_hint`] alone is cleared only
-    /// by the poof that fires or by expiry, so a Ctrl-W whose erase was
-    /// never witnessed (a second kill inside `POOF_MIN_GAP`, a scrolled or
-    /// unwired probe, a ContentOnly alt-screen frame) would swallow the
-    /// user's next real word move. It carries ITS OWN clock: the kill hint
-    /// is also the poof's row-content proof, which the host's
-    /// `drop_row_probe` after every band-move and scroll replay clears
-    /// without the retreat changing class.
+    /// The instant of a caret-moving kill whose own retreat is still owed:
+    /// stamped by [`Self::note_kill`] with `moves_cursor`, spent by the first
+    /// nav-shaped move `spawn` judges within [`Self::KILL_HINT_FRESH`], and
+    /// superseded by a real navigation press ([`Self::note_motion`]). The
+    /// retreat is one move; without this, a kill whose erase was never
+    /// witnessed would swallow the next word move. It has its own clock
+    /// because [`Self::kill_hint`] is also the poof's row proof, which
+    /// `drop_row_probe` clears after every band move and scroll.
     kill_retreat_pending: Option<Instant>,
-    /// The kill — by its key's stamp, the one [`Self::kill_hint`] and
-    /// [`Self::kill_retreat_pending`] carry — whose `rk::Event::Kill` has
-    /// already gone to v2, from whichever witness came first: the retreat
-    /// (the move seam, so the ribbon takes the erase-retreat arm) or the
-    /// poof that proves the span. ONE KILL, ONE `Kill`: keyed on the kill's
-    /// own stamp, a new kill is simply a new key, and a witness for a kill
-    /// already reported stands down (a slow link lands the retreat after
-    /// `POOF_FALLBACK_GRACE`, when the caret fallback has already minted the
-    /// kill; a second `note_kill` before the first's poof scan is a new
-    /// key). A stationary ^K / Alt-D never moves the caret, so its poof's
-    /// `Kill` is the first witness, as ever.
+    /// The kill (by its key stamp) whose `rk::Event::Kill` has already gone to
+    /// v2, from whichever witness came first: the retreat (so the ribbon takes
+    /// the erase-retreat arm) or the poof that proves the span. One kill, one
+    /// `Kill`: a witness for an already-reported kill stands down. A stationary
+    /// ^K / Alt-D never moves the caret, so its poof is the first witness.
     kill_reported_to_v2: Option<Instant>,
-    /// A fresh PLAIN-BACKSPACE poof license ([`Self::note_backspace`]), kept
-    /// SEPARATE from [`Self::kill_hint`] so it never borrows the kill hint's
-    /// nav/quench escalation semantics. `poof_scan` ORs it into the
-    /// `fresh_kill` gate, so a plain Backspace licenses the erase POOF on the
-    /// SAME Full-trust proof surface the kill chords use: the shared
-    /// full-trust span-shrink diff / witnessed caret fallback covers the erase
-    /// (a Backspace that provably erased nothing stays silent — see
-    /// `bs_only` in `poof_scan` — and a ContentOnly probe licenses no poof
-    /// branch at all, see [`ProbeTrust`]). Cat-INDEPENDENT:
-    /// `poof_scan` never consults the
-    /// cursor cat, so the delete burst fires whether or not the cat is flying
-    /// (the cat's tongue-out "oops" layers on top when it happens to be present).
+    /// A fresh plain-Backspace poof licence ([`Self::note_backspace`]), separate
+    /// from [`Self::kill_hint`] so it never borrows the kill's nav/quench
+    /// semantics. `poof_scan` ORs it into the `fresh_kill` gate, so a Backspace
+    /// poofs on the same full-trust proof surface as the kill chords (one that
+    /// erased nothing stays silent, see `bs_only`; a ContentOnly probe licenses
+    /// no poof, [`ProbeTrust`]). Independent of the cursor cat.
     bs_poof_hint: Option<Instant>,
-    /// Legacy kill/fallback timing witness: the cursor row's FILL as it stood
-    /// when the erase key arrived —
-    /// `(row, fill)`, stamped by [`Self::note_backspace`] AND [`Self::note_kill`]
-    /// from whatever probe the host had last handed over.
+    /// The cursor row's fill when the erase key arrived, `(row, fill)`, stamped
+    /// by [`Self::note_backspace`] and [`Self::note_kill`] from the host's last
+    /// probe.
     ///
-    /// WHY A STAMP AND NOT THE LIVE DIFF. `poof_scan`'s span branch proves an
-    /// erasure by diffing the PREVIOUS presented row against this frame's. That
-    /// works while frames are flowing, and only while frames are flowing: the
-    /// host probes the row as part of composing, so on a QUIET screen the first
-    /// probe a lone Backspace ever produces is already the POST-erase row, and
-    /// every diff from then on is post-vs-post — provably equal, forever. The
-    /// Plain Backspace shares this witness with the kill chords.
-    ///
-    /// It is ALSO the clock the caret fallback's grace can be released early
-    /// against — see [`Self::poof_erase_witnessed`].
+    /// A stamp rather than the live diff: `poof_scan`'s span branch diffs the
+    /// previous presented row against this frame's, but on a quiet screen the
+    /// first probe after a lone Backspace is already post-erase, so every diff
+    /// would compare post with post. Also the clock the caret fallback's grace
+    /// can be released early against ([`Self::poof_erase_witnessed`]).
     bs_baseline: Option<(u16, u16)>,
-    /// A fresh REPAINT-BLINK hint ([`Self::note_repaint_blink`]): the host saw
-    /// the attached app's DECTCEM-hide-inside-DEC-2026 repaint bracket (the
-    /// terminal's `repaint_blink_epoch` advanced — Claude Code wraps EVERY
-    /// keystroke's redraw in one). On the ALT screen (`ctx_alt`) the typed/
-    /// backspace RE-ANCHOR classifier additionally requires this hint to be
-    /// fresh ([`Self::BLINK_HINT_FRESH`]): a full-redraw TUI re-anchors its
-    /// caret per keystroke. This only tunes already-admitted candidate
-    /// morphology; the blink itself never authorizes a vim/less relocation.
-    /// Main screen is blink-blind (the conjunct is vacuous there).
+    /// A fresh repaint-blink hint ([`Self::note_repaint_blink`]): the app's
+    /// DECTCEM-hide-inside-DEC-2026 repaint bracket (the terminal's
+    /// `repaint_blink_epoch` advanced; Claude Code wraps every keystroke's
+    /// redraw in one). On the alt screen the typed/Backspace re-anchor also
+    /// requires it fresh ([`Self::BLINK_HINT_FRESH`]). It only tunes admitted
+    /// candidate morphology; the main screen ignores it.
     blink_hint: Option<Instant>,
-    /// Per-frame ALT-SCREEN context ([`Self::note_context`], stamped by the
-    /// host beside the row probe each frame). Gates the re-anchor's blink
-    /// requirement: `false` (main screen / unwired host) keeps the shipped
-    /// classifier byte-identical.
+    /// Per-frame alt-screen context ([`Self::note_context`], stamped beside the
+    /// row probe). Gates the re-anchor's blink requirement; `false` (main
+    /// screen or unwired host) leaves the classifier unchanged.
     ctx_alt: bool,
     /// Focused pane columns in the window-coordinate space consumed by this
     /// engine: `(first_col, width)`. The host refreshes it before every tick so
@@ -752,118 +612,79 @@ pub struct CursorGlow {
     /// When the last erase poof fired — the rate limiter ([`Self::POOF_MIN_GAP`])
     /// so a held kill-key repeat billows at a readable cadence, not per frame.
     last_poof: Option<Instant>,
-    /// The fresh-typed GLYPH TINT's palette, memoized on the `(theme_fg,
-    /// theme_bg)` it was derived from.
-    ///
-    /// [`fresh_ink_glyph_palette`] bisects up to [`FRESH_INK_GLYPH_BISECT`]
-    /// times per band over seven bands, and each probe evaluates a `powf`-based
-    /// luminance — a few hundred gamma evaluations. That is nothing once, and
-    /// silly every frame for a value that only changes when the THEME changes.
-    /// Refreshed in [`Self::tick`], where `&mut self` exists; the emitter is
-    /// `&self` and reads it.
-    ///
-    /// `Some((key, None))` is a memoized REFUSAL — a theme with no usable side
-    /// costs one evaluation too, and re-deciding it every frame would be the
-    /// same waste.
+    /// The fresh-typed glyph tint's palette, memoized on the
+    /// `(theme_fg, theme_bg)` it was derived from. [`fresh_ink_glyph_palette`]
+    /// runs a few hundred gamma evaluations that change only with the theme.
+    /// Refreshed in [`Self::tick`]; the `&self` emitter reads it.
+    /// `Some((key, None))` memoizes a refusal (a theme with no usable side).
     glyph_palette: Option<GlyphPaletteMemo>,
-    /// ERASE MOMENTUM — the mirror of the canonical typing metric, for the
-    /// gesture going the other way (owner, 2026-08-06: bring the delete poof
-    /// back "with a similar momentum as forward typing").
+    /// Erase momentum: the mirror of the typing metric for deletion. The same
+    /// law (a [`TypingMomentum`], the same rate-normalized accrual and 2 s
+    /// decay), fed only by erase edges ([`Self::note_backspace`],
+    /// [`Self::note_kill`]), so a held Backspace run builds like a typing run
+    /// and a single correction stays a small puff (owner, 2026-08-06).
     ///
-    /// The SAME law, deliberately: a [`TypingMomentum`] instance, the same
-    /// rate-normalized accrual, the same 2 s decay. Only the gesture that feeds
-    /// it differs — every erase edge ([`Self::note_backspace`],
-    /// [`Self::note_kill`]) credits it, and nothing else can. So a held
-    /// backspace run builds exactly the way a typing run builds, one erase at a
-    /// time, and a single correction mid-sentence stays a single small puff.
-    ///
-    /// It does NOT touch [`RainbowState::momentum`]: forward momentum still
-    /// only builds from forward typing and still DRAINS on a delete (the
-    /// erase-never-builds law is untouched). This is a second, independent
-    /// metric that exists so the delete gesture has a speedometer of its own.
+    /// Independent of [`RainbowState::momentum`]: forward momentum still builds
+    /// only from forward typing and drains on a delete.
     erase_mom: TypingMomentum,
-    /// SOUND CUES recorded at the spawn/poof edges this frame — the aural
-    /// twin of the visual spawns, drained by the host each tick
-    /// ([`Self::drain_sound_cues`]) and fed to the trail synth
-    /// ([`crate::trail_sound::TrailSynth`]). Bounded ([`Self::MAX_SOUND_CUES`])
-    /// and cleared on every disable/reset path, so the proven-inert contract
-    /// holds for sound exactly as for light.
+    /// Sound cues recorded at the spawn/poof edges this frame, drained by the
+    /// host each tick ([`Self::drain_sound_cues`]) into the trail synth
+    /// ([`crate::trail_sound::TrailSynth`]). Bounded
+    /// ([`Self::MAX_SOUND_CUES`]) and cleared on every disable/reset path.
     sound_cues: Vec<SoundCue>,
-    /// KEY-TIME CLICK CREDITS: typing clicks the host already cued at the
-    /// PHYSICAL keypress ([`Self::cue_keystroke`]) whose echo has not been
-    /// observed yet. The echo path consumes one per typing-classified spawn
-    /// and stays SILENT for it — one character must click exactly once, and
-    /// without the ledger a key-time click plus its echo click would double.
-    /// Capped at [`Self::MAX_KEYED_CLICKS`] so a run of keys an app SWALLOWS
-    /// (a password prompt, vim normal mode) cannot bank unbounded silence.
+    /// Key-time click credits: typing clicks already cued at the physical
+    /// keypress ([`Self::cue_keystroke`]) whose echo is not yet observed. The
+    /// echo path consumes one per typing-classified spawn and stays silent, so
+    /// each character clicks once. Capped at [`Self::MAX_KEYED_CLICKS`] so
+    /// swallowed keys (a password prompt, vim normal mode) cannot bank
+    /// unbounded silence.
     keyed_clicks: u8,
-    /// When the NEWEST key-time click was cued — the credits' freshness
-    /// anchor. Whole-burst semantics deliberately: five keys inside one
-    /// [`Self::KEYED_CLICK_FRESH`] window keep all five credits alive, so a
-    /// batched five-cell echo run stays silent for all of them. Past the
-    /// window the ledger zeroes, so a swallowed key can mute at most one
-    /// window's worth of later output-driven clicks instead of leaking
-    /// silence forever.
+    /// When the newest key-time click was cued: the credits' freshness anchor.
+    /// Keys inside one [`Self::KEYED_CLICK_FRESH`] window keep all credits
+    /// alive, so a batched echo run stays silent; past the window the ledger
+    /// zeroes.
     keyed_click_at: Option<Instant>,
-    /// When the PREVIOUS key-time click was cued — the inter-key cadence clock
-    /// the timbre prediction reads ([`Self::cue_keystroke`]). Deliberately NOT
-    /// [`Self::keyed_click_at`]: that one zeroes the instant the ledger empties,
-    /// which at ordinary typing speed happens after every single echo, so it
-    /// would report "no previous key" mid-burst and predict a cold click.
-    /// Never cleared on the dark/reset paths either — a stale value only
-    /// widens the measured gap, and a wide gap earns exactly zero cadence
-    /// credit, which is the right answer for the first key of a new burst.
+    /// When the previous key-time click was cued: the inter-key cadence clock
+    /// for timbre prediction ([`Self::cue_keystroke`]). Separate from
+    /// [`Self::keyed_click_at`], which zeroes whenever the ledger empties.
+    /// Never cleared: a stale value only widens the gap, which earns no cadence
+    /// credit, right for the first key of a burst.
     key_cue_at: Option<Instant>,
-    /// The live style/pack's per-keystroke heat GAIN and cooling τ,
-    /// snapshotted ([`Self::store_key_timbre`]) by every [`Self::tick`] that
-    /// may open the key seam — every tick past the MASTER SWITCH, the classic
-    /// wake and a degenerate grid included — not only by a drawing one. Both are pure functions of the config
-    /// (neither reads `intensity`), so the dark-but-audible path computes
-    /// bit-identical values, and a click minted during a load-shed frame
-    /// reads THIS tick's timbre rather than the last lit tick's. [`Self::cue_keystroke`] runs from the
-    /// host's key handler, which holds no [`GlowConfig`] — without these it
-    /// could not reconstruct the heat the echo is about to reach, and the
-    /// key-time click would carry the PRE-keystroke timbre (one keystroke of
-    /// lag in the sound, the exact "feels behind" the seam exists to remove).
-    /// Read only behind [`Self::sound_live`], and no tick opens that seam
-    /// without writing these first (every [`Self::settle_key_seam`] call site
-    /// stores them above it), so the zeroed `Default` is unreachable in the
-    /// cue path.
+    /// The live style's per-keystroke heat gain and cooling τ, snapshotted
+    /// ([`Self::store_key_timbre`]) by every [`Self::tick`] that may open the
+    /// key seam (every tick past the master switch, including the classic wake
+    /// and degenerate grids). Both are pure functions of the config, so a click
+    /// minted during a load-shed frame reads this tick's timbre.
+    /// [`Self::cue_keystroke`] runs from the host's key handler without a
+    /// [`GlowConfig`], so it needs these to click at the heat the echo is about
+    /// to reach. Read only behind [`Self::sound_live`], which is never set
+    /// without storing these first.
     heat_gain_live: f32,
     heat_tau_live: f32,
-    /// Whether the LAST [`Self::tick`] left the key seam OPEN — it ran the
-    /// live path (master on, real geometry, nonzero amplitude), OR it went
-    /// dark for any reason but the master switch (a motion policy, the
-    /// load-shed envelope, a degenerate grid, the classic wake's own dark
-    /// frame) while [`GlowConfig::audible`] said the key still belongs to
-    /// this window. One law, [`Self::settle_key_seam`], on every style.
-    /// [`Self::cue_keystroke`] records nothing unless this is set.
+    /// Whether the last [`Self::tick`] left the key seam open: it ran the live
+    /// path, or went dark for any reason other than the master switch (motion
+    /// policy, load shed, degenerate grid, classic wake's dark frame) while
+    /// [`GlowConfig::audible`] said the key belongs to this window. One law,
+    /// [`Self::settle_key_seam`], for every style. [`Self::cue_keystroke`]
+    /// records nothing unless set.
     ///
-    /// THE LAW IT CARRIES, restated: sound is silenced by exactly the gates
-    /// that are ABOUT SOUND. It used to be "the gates that silence the
-    /// light", which handed a load-shed latch and macOS `Reduce Motion` a
-    /// mute switch over a click that costs no GPU. The master switch and
-    /// serious mode still close it (they arrive as [`GlowConfig::enabled`]),
-    /// unfocus still closes it (it arrives as `audible = false`), and the
-    /// host's own sound knobs never reach here at all — they gate before a
-    /// cue is minted. Also false before the first tick, so a host that never
-    /// ticks (headless, tests) is byte-identical.
+    /// Sound is silenced only by gates about sound: the master switch and
+    /// serious mode ([`GlowConfig::enabled`]) and unfocus (`audible = false`);
+    /// the host's sound knobs gate before a cue is minted. False before the
+    /// first tick.
     ///
-    /// It has an OUT-OF-BAND READER: [`Self::sound_seam_open`], which
-    /// `aterm ctl tone` prints as `engine_sound=` and `aterm ctl trail
-    /// status` as `sound_seam=`. A future edit to either dark return is
-    /// changing a user-visible answer, not only a private gate.
+    /// Read out of band by [`Self::sound_seam_open`] (`aterm ctl tone`'s
+    /// `engine_sound=`, `aterm ctl trail status`'s `sound_seam=`), so changing
+    /// either dark return changes a user-visible answer.
     sound_live: bool,
-    /// THIS frame's cursor-row content probe ([`Self::observe_row`]) — the
-    /// newer half of the poof detector's double buffer. Per-COLUMN chars
-    /// (resolved lead char at its column, `'\0'` at wide continuations, `' '`
-    /// for blanks) so the vanished-span math survives CJK/emoji. Reused
-    /// capacity: zero steady-state allocation on the probe path.
+    /// This frame's cursor-row content probe ([`Self::observe_row`]), the newer
+    /// half of the poof detector's double buffer. Per-column chars (lead char
+    /// at its column, `'\0'` at wide continuations, `' '` for blanks) so the
+    /// span math survives CJK and emoji. Reused capacity.
     row_cur: Vec<char>,
-    /// The LAST-observed row probe (rotated from `row_cur` by `poof_scan` via
-    /// `mem::swap`) — always the last-presented truth: content cannot change
-    /// without damage → present → tick, so staleness is bounded by
-    /// [`Self::POOF_PROBE_STALE`] only as belt-and-braces.
+    /// The last-observed row probe (swapped from `row_cur` by `poof_scan`): the
+    /// last-presented truth. [`Self::POOF_PROBE_STALE`] bounds staleness as a
+    /// backstop.
     row_prev: Vec<char>,
     /// Metadata for `row_cur` (`None` ⇒ no fresh probe arrived this frame; the
     /// previous probe stays in place and the detector idles).
@@ -874,63 +695,48 @@ pub struct CursorGlow {
     /// the ribbon pool and deadline calculation after its visible cells
     /// retire; read only by the next typed echo on this row.
     recent_typed_run: Option<RecentTypedRun>,
-    /// THIS frame's capture of the row ABOVE the probed cursor row
-    /// ([`Self::observe_neighbor_rows`]) — the content witnesses' newer half
-    /// (see [`NbrProbe`]; f207c75f5 dropped these copies when the stars moved
-    /// to v2's bitsets, and the soft-wrap and minibuffer witnesses brought
-    /// them back). Same per-column char convention as `row_cur`. Readable
-    /// ONLY through the
-    /// probe metadata's [`NbrProbe::Probed`] state, so a frame that skipped
-    /// the neighbor capture can never serve these bytes stale.
+    /// This frame's capture of the row above the probed cursor row
+    /// ([`Self::observe_neighbor_rows`]), the content witnesses' newer half
+    /// ([`NbrProbe`]), used by the soft-wrap and minibuffer witnesses. Same
+    /// per-column convention as `row_cur`. Readable only in the
+    /// [`NbrProbe::Probed`] state, so a skipped capture is never served stale.
     row_above_cur: Vec<char>,
     /// Last-presented capture of the row above (rotated from `row_above_cur`
     /// by `poof_scan`, in lockstep with `row_prev`).
     row_above_prev: Vec<char>,
-    /// THIS frame's capture of the row BELOW the probed cursor row.
+    /// This frame's capture of the row below the probed cursor row.
     row_below_cur: Vec<char>,
     /// Last-presented capture of the row below.
     row_below_prev: Vec<char>,
-    /// EASED display temperature 0..1 — the ONE number every fire layer reads
-    /// (see [`Self::fire_t`]): it chases `max(heat, flare, coal floor)` damped
-    /// by the quench, with a short attack and a slower release, so the whole
-    /// look ramps as one body and no layer ever pops. Fire-only (other styles
-    /// keep the raw, instant [`Self::blaze`]).
+    /// Eased display temperature 0..1, the one number every fire layer reads
+    /// ([`Self::fire_t`]): it chases `max(heat, flare, coal floor)` damped by
+    /// the quench, with a short attack and slower release, so the look ramps as
+    /// one body. Fire-only (other styles use the raw [`Self::blaze`]).
     disp_t: f32,
-    /// The flame field's integrated TIME PHASE (seconds, churn-weighted):
-    /// advanced by dt·churn(T) in the lazy-decay block, so the field speeds up
-    /// smoothly as the fire builds instead of rescaling (which would pop), and
-    /// never resets mid-burn. Pure function of injected clocks.
+    /// The flame field's integrated time phase (seconds, churn-weighted),
+    /// advanced by dt·churn(T) in the lazy-decay block so the field speeds up
+    /// smoothly as the fire builds and never resets mid-burn.
     flame_phase: f32,
-    /// The cursor METAL's temperature 0..1 — hysteretic (heats over
-    /// [`Self::TEMP_ATTACK_TAU`], cools over the slower
-    /// [`Self::TEMP_RELEASE_TAU`], 2× faster while quenched): the forge arc a
-    /// real tool has. Drives the block-cursor forge fill
-    /// ([`Self::forge_fill`]) and, later, the smoking threshold. Fire-only
-    /// (zeroed for every other style so its visibility arm in
-    /// [`Self::is_active`] is inert there).
+    /// The cursor metal's temperature 0..1, hysteretic (heats over
+    /// [`Self::TEMP_ATTACK_TAU`], cools over [`Self::TEMP_RELEASE_TAU`], 2×
+    /// faster while quenched). Drives the block-cursor forge fill
+    /// ([`Self::forge_fill`]). Fire-only; zero for other styles so its arm in
+    /// [`Self::is_active`] is inert there.
     cursor_temp: f32,
-    /// Last TYPING advance (single-cell move), for the inter-key cadence.
+    /// Last typing advance (single-cell move), for the inter-key cadence.
     last_type: Option<Instant>,
     /// Deterministic spark/ember PRNG state.
     rng: u32,
-    /// Reused each frame by [`Self::emit_comet`] and [`Self::emit_custom`] as the
-    /// swept-cell run builder, so the animated beam reuses one resident nested Vec
-    /// instead of allocating a fresh `Vec<Vec<CometSample>>` every redraw.
-    /// `comet_run` is the in-progress run.
+    /// Swept-cell run builder reused each frame by [`Self::emit_comet`] and
+    /// [`Self::emit_custom`]; `comet_run` is the run in progress.
     ///
-    /// The INNER buffers are pooled too: each emitter `clear()`s the existing
-    /// entries in place (never `comet_runs.clear()`, which would free them) and
-    /// publishes a finished run by SWAPPING it with the pooled entry at the live
-    /// watermark — so `comet_run` always comes back holding an already-allocated,
-    /// already-emptied buffer instead of the capacity-0 `Vec` a `mem::take` would
-    /// leave behind. Entries past the emitter's local `runs_len` watermark are
-    /// spares from earlier frames, which is why every consumer reads
-    /// `&comet_runs[..runs_len]` rather than the whole spine. Growth is bounded by
-    /// runs ≤ sparks ≤ [`Self::MAX_SPARKS`].
-    ///
-    /// Shared between the two emitters on purpose: `tick` takes exactly ONE of the
-    /// two arms per frame and both clear on entry, so a style switch cannot leak
-    /// samples across frames.
+    /// Inner buffers are pooled: each emitter clears entries in place and
+    /// publishes a finished run by swapping it with the pooled entry at the
+    /// live watermark, so `comet_run` always returns holding an allocated,
+    /// empty buffer. Entries past `runs_len` are spares, so consumers read
+    /// `&comet_runs[..runs_len]`. Bounded by runs ≤ sparks ≤
+    /// [`Self::MAX_SPARKS`]. `tick` takes exactly one of the two emitters per
+    /// frame and both clear on entry.
     comet_runs: Vec<Vec<CometSample>>,
     comet_run: Vec<CometSample>,
     /// Reused by [`Self::emit_water`] for the deduplicated curved wake spine
@@ -947,127 +753,94 @@ pub struct CursorGlow {
     /// so a strike frame allocates nothing after the first growth.
     bolt_verts: Vec<BeamVertex>,
     /// Ping-pong scratch for [`Self::spawn_bolt`]'s midpoint-displacement
-    /// rounds. The jag used to build a FRESH `Vec` per round — `vec![from, to]`
-    /// plus one `Vec::with_capacity` per round, two rounds for a crackle and
-    /// four for a jump — so every strike cost three heap buffers to describe a
-    /// polyline five points long, and hot typing crackles several a second.
-    /// Taken out of `self` around the jag because the loop calls
-    /// [`Self::frand`], and handed straight back.
+    /// rounds, so a strike allocates nothing. Taken out of `self` around the
+    /// jag (the loop calls [`Self::frand`]) and handed back.
     bolt_jag: BoltJag,
     /// Reused by [`Self::emit_comet`]'s Laser arm for the per-layer filament
     /// polyline, so a laser frame allocates nothing after the first growth.
     comet_verts: Vec<BeamVertex>,
-    /// Live OUTGOING style crossfades (≤ [`Self::FADE_CAP`], oldest dropped) —
-    /// see [`OutgoingFade`] and the STYLE SWITCH contract in [`Self::tick`].
-    /// Empty in steady state: the no-switch tick path pays ONE `is_empty` test,
-    /// so every built-in style's output stays byte-identical (the golden proof).
+    /// Live outgoing style crossfades (≤ [`Self::FADE_CAP`], oldest dropped);
+    /// see [`OutgoingFade`] and the style-switch contract in [`Self::tick`].
+    /// Empty in steady state, where the tick pays one `is_empty` test.
     fading: Vec<OutgoingFade>,
     /// Resident quad scratch for the fade ticks (their `out` twin), so a
     /// crossfade frame allocates nothing after the first growth.
     fade_scratch: Vec<GlowQuad>,
-    /// When the LIVE style last ARRIVED (a switch): drives the incoming
-    /// ~[`Self::RAMP_IN_S`] intensity ramp-IN so the new style rises under the
-    /// outgoing fade instead of popping to full. `None` in steady state — the
-    /// no-switch path applies NO scale at all (byte-identity preserved).
+    /// When the live style last arrived: drives the incoming
+    /// [`Self::RAMP_IN_S`] ramp-in so the new style rises under the outgoing
+    /// fade. `None` in steady state, where no scale is applied.
     ramp_in_at: Option<Instant>,
-    /// The full config of the LAST tick — the snapshot an [`OutgoingFade`] is
-    /// forged from when the NEXT tick detects a switch (`last_style` alone
-    /// cannot reproduce the outgoing colours/length/pack for the residue).
+    /// The full config of the last tick, snapshotted into an [`OutgoingFade`]
+    /// when the next tick detects a switch.
     last_cfg: Option<GlowConfig>,
-    /// LATCH: the `!cfg.enabled` teardown has already run and nothing has
-    /// dirtied wiped state since (driver-02). While set, the dark tick skips
-    /// the ~60-80 idempotent stores of [`Self::clear_transient_state`] +
-    /// [`Self::clear_thermals`] it used to re-issue every frame — and a
-    /// wake-off session pays that dark tick on every presented frame, because
-    /// the pipeline's gate is `enabled_any()`, never per-engine. Dropped by
-    /// every enabled tick, by [`Self::reset`], and via [`Self::unsettle`] at
-    /// each mutating entry that writes wiped state. Entries that only move
-    /// state TOWARD the wiped fixpoint (`clear_blink`, `clear_typed`,
-    /// `drop_row_probe`, the drains/takes/swaps) keep it, as do the two that
-    /// are structurally inert while dark: `cue_keystroke` no-ops while
-    /// `sound_live` is false — this latch is set by the master-off /
-    /// degenerate-grid branch and by no other, and ONLY when that branch
-    /// leaves the seam shut (a degenerate grid the key belongs to stays open
-    /// and unlatched), so the argument rests on neither the zero-amplitude
-    /// return nor the classic wake, which leave the seam open for a heard dark
-    /// frame — and `observe_neighbor_rows`
-    /// no-ops until an `observe_row` — which unsettles — lands first.
-    /// `#[derive(Default)]` starts it false, so the first dark tick still
-    /// runs one (no-op) wipe before latching.
+    /// Latch: the `!cfg.enabled` teardown has run and nothing has dirtied wiped
+    /// state since, so the dark tick skips re-issuing
+    /// [`Self::clear_transient_state`] and [`Self::clear_thermals`] every frame
+    /// (the pipeline gates on `enabled_any()`, not per engine). Dropped by every
+    /// enabled tick, [`Self::reset`], and [`Self::unsettle`] at each entry that
+    /// writes wiped state. Entries that only move state toward the wiped
+    /// fixpoint (`clear_blink`, `clear_typed`, `drop_row_probe`, drains) keep
+    /// it. `cue_keystroke` is inert here because the latch is set only by the
+    /// master-off / degenerate-grid branch when it leaves the seam shut;
+    /// `observe_neighbor_rows` is inert until an `observe_row` (which
+    /// unsettles). Starts false, so the first dark tick runs one wipe.
     dark_settled: bool,
-    /// **THE RAINBOW KITTY ENGINE** — `RAINBOW-KITTY-V2.md` §17.2's seam
-    /// object, the thing every `if self.v2.engaged()` in this file delegates
-    /// to (D14). Default: disengaged, nothing live. Engaged at the top of
-    /// [`Self::tick`] whenever the resolved style is
-    /// [`GlowStyle::RainbowKitty`] (unconditional since §17.3 phase 7 —
-    /// there is no other rainbow kitty); disengaged, every seam point is
-    /// one cached-bool branch and the other nine styles run their own code
-    /// byte for byte.
+    /// The Rainbow Kitty engine (`RAINBOW-KITTY-V2.md` §17.2's seam object),
+    /// which every `if self.v2.engaged()` delegates to (D14). Engaged at the
+    /// top of [`Self::tick`] whenever the style is [`GlowStyle::RainbowKitty`];
+    /// disengaged, each seam point is one cached-bool branch and the other
+    /// styles run their own code.
     v2: rk::Engine,
     /// v2's polyline scratch ([`rk::Frame::beams`]): resident and reused, so
     /// the engine allocates nothing per frame (§18).
     v2_beams: Vec<BeamVertex>,
-    /// The `&[bool]` view of the host's row probe for v2's glyph gate (§5.4,
-    /// seam point 13): resident, cleared and refilled from the SAME `cols`
-    /// the v1 probe copies — never a second grid scan.
+    /// The host row probe as v2's glyph-gate input (§5.4, seam point 13):
+    /// resident, refilled from the same `cols` the v1 probe copies.
     v2_probe_scratch: Vec<rk::stardust::CellInk>,
-    /// **THE CONTENT WITNESS'S ROWS** for this frame
-    /// ([`Self::observe_ribbon_row`], [`Self::capture_ribbon_row`],
-    /// `rk::witness`): the live grid rows the
-    /// resident ribbon occupies, captured by the host under its terminal
-    /// lock before the tick and read by the engine's witness right after
-    /// it. At most [`CURSOR_WITNESS_ROWS`] slots, resident and reused;
-    /// `witness_rows_n` is how many are filled THIS frame, taken to zero by
-    /// every tick so a stale sample can never be read against a later
-    /// frame's cells.
+    /// The content witness's rows for this frame ([`Self::observe_ribbon_row`],
+    /// [`Self::capture_ribbon_row`], `rk::witness`): the grid rows the ribbon
+    /// occupies, captured by the host under its terminal lock before the tick
+    /// and read right after it. At most [`CURSOR_WITNESS_ROWS`] resident slots;
+    /// `witness_rows_n` is zeroed by every tick so a stale sample is never read.
     witness_rows: Vec<WitnessRowBuf>,
     witness_rows_n: usize,
-    /// **THE ROWS THE HOST WAS ASKED FOR** this frame — exactly what
-    /// [`Self::ribbon_rows`] last handed out, and how many — so the follow
-    /// pass counts as WITHHELD only a row the host was asked for and did
-    /// not deliver ([`rk::Engine::follow_rows`]). Recomputing the list at
-    /// the tick would ask a different question: by then the waiting key
-    /// whose arming rows the list named ([`rk::Engine::ribbon_rows_for`])
-    /// may be spent, and a row asked for and not delivered would be
-    /// forgotten. Written by a `&self` query, hence the `Cell`; taken by
-    /// every tick, so it never outlives its frame.
+    /// The rows the host was asked for this frame (what [`Self::ribbon_rows`]
+    /// last handed out, and how many), so the follow pass counts as withheld
+    /// only rows asked for and not delivered ([`rk::Engine::follow_rows`]).
+    /// Recomputing at the tick could differ, since the waiting key that named
+    /// arming rows ([`rk::Engine::ribbon_rows_for`]) may be spent. A `Cell`
+    /// because a `&self` query writes it; taken by every tick.
     witness_asked: std::cell::Cell<([u16; RIBBON_LIST_ROWS], usize)>,
     /// The caret seam v2 handed back on the last engaged tick (§7.1); the
     /// host reads it through [`Self::caret_flare_at`] / [`Self::caret_paint`]
     /// when it builds the caret's `RainbowConfig`.
     v2_caret: CaretSeam,
-    /// **THE CARET'S SEATED STOP** (§7.1, D4) — the field `t` the caret block
-    /// mixes toward, and the caret cell it was seated at. Seated on an engaged
-    /// tick ONLY when the caret CELL changed since the last seat, or when the
-    /// caret's own cell owns field light; HELD on every other tick, so a cell
-    /// death under a parked caret cannot move its colour — the measured
-    /// landing pop [`Self::rainbow_head_rgb`] documents. `None` until the
-    /// first engaged tick, and cleared whenever v2 lets go of the frame.
+    /// The caret's seated stop (§7.1, D4): the field `t` the caret block mixes
+    /// toward, and the caret cell it was seated at. Re-seated on an engaged tick
+    /// only when the caret cell changed or its own cell owns field light, and
+    /// held otherwise, so a cell dying under a parked caret cannot move its
+    /// colour ([`Self::rainbow_head_rgb`]). `None` until the first engaged tick
+    /// and whenever v2 lets go of the frame.
     v2_stop: Option<(f32, Option<(u16, u16)>)>,
-    /// **THE FLOW ENTRY EDGE** — whether the last [`Self::take_flow_entry`]
-    /// drain found the theme OPEN ([`rk::Flow::open`]).
-    ///
-    /// One `bool` of memo, and the seam's whole state: the RUN itself is the
-    /// engine's ([`rk::spine::Spine::flow`] — one counter, per the flow law),
-    /// and this only remembers which side of the open bar the last drain saw
-    /// it on, so the pet can be told ONCE per entry and nothing at all on an
-    /// exit.
+    /// The flow entry edge: whether the last [`Self::take_flow_entry`] drain
+    /// found the theme open ([`rk::Flow::open`]). The run itself is the
+    /// engine's ([`rk::spine::Spine::flow`]); this only remembers which side of
+    /// the bar the last drain saw, so the pet is told once per entry.
     flow_open: bool,
     /// v2's cue sink ([`rk::Frame::cues`]): resident, drained into
-    /// [`Self::sound_cues`] under v1's own `MAX_SOUND_CUES` refusal after every
-    /// engaged tick, so the backlog a non-draining host accumulates is bounded
-    /// exactly as v1 bounds it and the steady frame allocates nothing (§18).
+    /// [`Self::sound_cues`] under `MAX_SOUND_CUES` after every engaged tick, so
+    /// a non-draining host's backlog stays bounded and the frame allocates
+    /// nothing (§18).
     v2_cues: Vec<SoundCue>,
 }
 
-/// Window-space geometry the host passes in (pixels). Effect-stream pixel
-/// emissions (fire patches, glow/halo/nova quads, beams) are WINDOW-ABSOLUTE:
-/// producers add `origin` once and the renderer adds nothing. `origin` is the
-/// grid-interior top-left in window px (`pad`, `pad + head + strip_px`); `win`
-/// is the full frame extent, so clamps relax to the window edge and effects
-/// may draw above the grid (the titlebar chrome band). With `origin == (0,0)`
-/// and `win` equal to the grid extents, every emission is byte-identical to
-/// the old pad-relative contract (the identity law tests rely on this).
+/// Window-space geometry the host passes in (pixels). Effect pixel emissions
+/// (fire patches, glow/halo/nova quads, beams) are window-absolute: producers
+/// add `origin` once and the renderer adds nothing. `origin` is the grid
+/// interior's top-left in window px (`pad`, `pad + head + strip_px`); `win` is
+/// the full frame extent, so effects may draw above the grid (the titlebar
+/// band). With `origin == (0,0)` and `win` equal to the grid extents, every
+/// emission is pad-relative (the identity law tests rely on this).
 #[derive(Clone, Copy)]
 pub struct Geom {
     pub cw: usize,
@@ -1082,21 +855,19 @@ pub struct Geom {
     pub win_w: u16,
     /// Full frame height in px.
     pub win_h: u16,
-    /// RISE ALLOWANCE above the grid in px — the chrome band the host opened for
-    /// effects (the macOS titlebar under `fullSizeContentView`; `ATERM_HEADROOM_PX`
-    /// headless). Distinct from `origin_y`, which also folds in `pad` and the tab
-    /// strip: the fire-root/rise clamps relax by exactly THIS component, so with
-    /// `head == 0` every clamp reproduces the historical grid-relative behavior
-    /// byte-for-byte (the identity law) — pad and strip never granted rise room
-    /// before the effects layer and must not silently start to.
+    /// Rise allowance above the grid in px: the chrome band the host opened for
+    /// effects (the macOS titlebar under `fullSizeContentView`;
+    /// `ATERM_HEADROOM_PX` headless). Distinct from `origin_y`, which also folds
+    /// in `pad` and the tab strip; the fire-root/rise clamps relax by exactly
+    /// this, so `head == 0` reproduces grid-relative clamps (the identity law).
     pub head: u16,
 }
 
 impl Geom {
-    /// The EFFECTS BOX — where effect pixels may land, in window px. The grid box
-    /// plus the `head` band above it: `x ∈ [fx_left, fx_right)`,
-    /// `y ∈ [fx_top, fx_bot)`. Every pixel-emission clamp uses THESE bounds, not
-    /// the raw window — see the identity law on [`Geom::head`].
+    /// The effects box, where effect pixels may land (window px): the grid box
+    /// plus the `head` band above it, `x ∈ [fx_left, fx_right)`,
+    /// `y ∈ [fx_top, fx_bot)`. Every pixel clamp uses these bounds; see
+    /// [`Geom::head`].
     #[inline]
     pub(crate) fn fx_left(&self) -> i32 {
         i32::from(self.origin_x)
@@ -1114,7 +885,7 @@ impl Geom {
         i32::from(self.origin_y) + (self.rows * self.ch) as i32
     }
 
-    /// Window-px CENTRE of a grid cell — `origin + (index + 0.5) · cell` on
+    /// Window-px centre of a grid cell — `origin + (index + 0.5) · cell` on
     /// each axis, the one cell→pixel anchor every emitter shares.
     #[inline]
     pub(crate) fn cell_center(&self, row: u16, col: u16) -> (f32, f32) {
@@ -1139,10 +910,9 @@ impl Geom {
 }
 
 /// One observed cursor move as [`CursorGlow::spawn`]'s classifier read it: the
-/// raw endpoints / clock / config / geometry plus the typing-vs-jump
-/// classification every later spawn phase keys on. Built once per move by
-/// `classify_move` (which also owns the hint consumption), so the phases read
-/// pure data.
+/// raw endpoints, clock, config and geometry plus the typing-vs-jump verdicts
+/// every later spawn phase keys on. Built once per move by `classify_move`,
+/// which owns hint consumption, so the phases read pure data.
 struct MoveCtx<'a> {
     pr: u16,
     pc: u16,
@@ -1151,84 +921,63 @@ struct MoveCtx<'a> {
     now: Instant,
     cfg: &'a GlowConfig,
     geom: Geom,
-    /// |Δrow|, |Δcol| and Chebyshev distance of the RAW observed move.
+    /// |Δrow|, |Δcol| and Chebyshev distance of the raw observed move.
     dr_abs: i32,
     dc_abs: i32,
     /// Focused pane's horizontal bounds in this move's window-coordinate
     /// space. They equal `(0, geom.cols)` for a single pane.
     pane_col0: usize,
     pane_cols: usize,
-    /// The classifier verdicts — see the classifier comments in `classify_move`.
-    /// (`wrap` — `shape_wrap || re_anchor` — is a classifier-local now: its
-    /// last downstream reader was the momentum advance, which moved into
-    /// `classify_move` with the press-hint restoration; `dist`/`typing` below
-    /// already carry its collapse for every other phase.)
+    /// The classifier verdicts; see `classify_move`. `dist`/`typing` below
+    /// carry the wrap collapse for every later phase.
     shape_wrap: bool,
-    /// The cells a `shape_wrap` fold actually PAID for (the fold's cells —
-    /// the origin row's tail from `pc` to the pane's edge
-    /// plus the landing row's head before `cc` — bounded by the credits in
-    /// the ring at the spend) — what the seam's fold sweep lays, ending at
-    /// the landing and folded onto the origin row exactly as the key's
-    /// `Typed` replay would; `0` off the fold or with nothing paid.
+    /// The cells a `shape_wrap` fold paid for (origin tail from `pc` to the
+    /// pane's edge plus landing head before `cc`, bounded by the credits at the
+    /// spend): what the seam's fold sweep lays, as the key's `Typed` replay
+    /// would. `0` off the fold or with nothing paid.
     fold_laid: usize,
     echo_run: bool,
     re_anchor: bool,
     rainbow_coalesce: bool,
-    /// The coalesce shape matched in every respect EXCEPT the press CREDIT
-    /// budget — the anti-stray law that keeps one credit from painting a
-    /// ribbon over a word the user only skimmed. The ring's `no-credits`
-    /// reason, and a forget edge (the pool did not describe the hop); no
-    /// emitter reads it.
+    /// The coalesce shape matched in every respect except the press-credit
+    /// budget (the anti-stray law). The ring's `no-credits` reason and a forget
+    /// edge; no emitter reads it.
     credit_starved: bool,
-    /// A typed-paired same-row forward hop WIDER than the sweep cap
-    /// (`RAINBOW_TYPED_SWEEP_MAX`): a re-anchor that lays only its landing,
-    /// and a forget edge (the pool cannot describe a hop the cap refuses).
+    /// A typed-paired same-row forward hop wider than the sweep cap
+    /// (`RAINBOW_TYPED_SWEEP_MAX`): a landing-only re-anchor and a forget edge.
     typed_over_cap: bool,
-    /// **THE TYPED RE-ANCHOR LAYS ITS LANDING** — the classifier's own
-    /// predicate for the spend ("lays exactly ONE cell, the landing"),
-    /// carried to the seam so the sweep that lays it is the same verdict
-    /// the credit was spent on. `false` for every non-re-anchor and for the
-    /// styles that have no ribbon.
+    /// The typed re-anchor lays its landing: the classifier's spend predicate
+    /// (one cell, the landing), carried to the seam so the sweep and the spend
+    /// agree. `false` for non-re-anchors and styles with no ribbon.
     re_anchor_lays_landing: bool,
-    /// The VISIBLE lane's typed re-anchor would have laid its one cell under
-    /// a glyph NO live press typed ([`CursorGlow::probe_glyph_before`] — for
-    /// a flushed park, the glyph it was held over, [`HeldPark::landing_cell`]
-    /// — against [`PressCredits::foreign_to_live`]): the classifier forgot
-    /// the presses instead of spending one, and [`CursorGlow::spawn_judged`]
-    /// declines the move `program-row` before v2 sees it. The cell is the
-    /// landing, or a `soft_wrap`'s origin; a `lift` lays none and is never
-    /// refused here. Never set with `soft_wrap`, `lift` or
-    /// `re_anchor_lays_landing`.
+    /// The visible lane's typed re-anchor would have laid its one cell under a
+    /// glyph no live press typed ([`CursorGlow::probe_glyph_before`], or for a
+    /// flushed park [`HeldPark::landing_cell`], against
+    /// [`PressCredits::foreign_to_live`]). The classifier forgot the presses and
+    /// [`CursorGlow::spawn_judged`] declines the move `program-row` before v2
+    /// sees it. Never set with `soft_wrap`, `lift` or `re_anchor_lays_landing`.
     landing_foreign: bool,
-    /// **THE SOFT-WRAPPED CARET** ([`CursorGlow::soft_wrapped_caret`]): the
-    /// typed fold or re-anchor is a key whose glyph stands at the ORIGIN
-    /// `(pr, pc)` while the caret alone wrapped to the continuation row's
-    /// indent. `Some(word_col0)` names the first column of the word the key
-    /// ends on the origin row. The move then lays and spends exactly one
-    /// cell, the key's own at the origin, and never a landing-row cell.
+    /// The soft-wrapped caret ([`CursorGlow::soft_wrapped_caret`]): the key's
+    /// glyph stands at the origin `(pr, pc)` while the caret alone wrapped to
+    /// the continuation indent. `Some(word_col0)` is the first column of the
+    /// word the key ends. The move lays and spends one cell, at the origin.
     soft_wrap: Option<u16>,
-    /// **THE LIFTED WORD** ([`CursorGlow::lifted_word`]): the typed
-    /// same-row retreat is the composer moving the word `cc..pc` UP onto
-    /// the end of the row above; `Some(col)` names where it starts there.
-    /// Its landing is the word's old first column, not a glyph the key
-    /// wrote, so the re-anchor's landing sweep stands down.
+    /// The lifted word ([`CursorGlow::lifted_word`]): the same-row retreat is
+    /// the composer moving the word `cc..pc` up onto the end of the row above;
+    /// `Some(col)` is where it starts there. The landing sweep stands down.
     lift: Option<u16>,
-    /// The move was licensed by the IN-FLIGHT POOL alone: no stamp was
-    /// fresh, and the unpaid presses paid for the echo (a batch, or one
-    /// press for its own +1). The ring row reads `licence=inflight`.
+    /// Licensed by the in-flight pool alone (no stamp fresh; unpaid presses
+    /// paid for the echo). The ring row reads `licence=inflight`.
     in_flight_licence: bool,
-    /// `shape_wrap || re_anchor` — the classifier's one wrap verdict, kept on
-    /// the ctx because the momentum advance and the fold-shaped cat pulse
-    /// both key on it.
+    /// `shape_wrap || re_anchor`: the classifier's wrap verdict, read by the
+    /// momentum advance and the fold-shaped cat pulse.
     wrap: bool,
-    /// The press-hint half of typed pairing: a fresh key-time `typed_at`
-    /// stamp. Identical to `typed_pair` under the license law; kept as its own
-    /// field because the momentum spine and the classifier read it for
-    /// different reasons.
+    /// The press-hint half of typed pairing: a fresh key-time `typed_at` stamp.
+    /// Equal to `typed_pair` under the licence law; kept separate because the
+    /// momentum spine and classifier read it for different reasons.
     typed_hinted: bool,
-    /// The fresh typed stamp the classifier consumed — the KEY's clock, which
-    /// the seam hands v2's sweep as the birth of a late-echoed glyph cell so
-    /// the frame that echoes the key already shows it lit.
+    /// The fresh typed stamp the classifier consumed: the key's clock, handed to
+    /// v2's sweep as the birth of a late-echoed cell.
     typed_at: Option<Instant>,
     /// The observed move paired with a fresh Backspace quench hint — a
     /// backspace landing wearing a wrap shape; excluded from the advance.
@@ -1245,14 +994,6 @@ struct MoveCtx<'a> {
     nav_taken: Option<Instant>,
 }
 
-/// One step of the frame-fingerprint FOLD. FNV-1a is deliberately cheap here:
-/// the input is a fixed-shape render stream, and every record is first
-/// losslessly packed into non-overlapping words by [`FrameFingerprint`].
-#[inline]
-fn fp_fold(fp: u64, key: u64) -> u64 {
-    (fp ^ key).wrapping_mul(0x0000_0100_0000_01b3)
-}
-
 /// Build a deterministic, field-complete fingerprint of the cursor-effect
 /// payload handed to the renderer.
 ///
@@ -1266,7 +1007,6 @@ fn fp_fold(fp: u64, key: u64) -> u64 {
 struct FrameFingerprint(Option<u64>);
 
 impl FrameFingerprint {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const GLOW_OUT: u64 = 0x676c_6f77_5f6f_7574;
     const FIRE_PATCH: u64 = 0x6669_7265_7061_7463;
     const GLOW_UNDER: u64 = 0x676c_6f77_756e_6472;
@@ -1277,7 +1017,7 @@ impl FrameFingerprint {
 
     #[inline]
     fn write(&mut self, word: u64) {
-        self.0 = Some(fp_fold(self.0.unwrap_or(Self::OFFSET), word));
+        self.0 = Some(fnv_mix_u64(self.0.unwrap_or(FNV64_OFFSET), word));
     }
 
     #[inline]
@@ -1291,11 +1031,23 @@ impl FrameFingerprint {
             return;
         }
         self.begin_stream(tag, quads.len());
-        for q in quads {
-            for word in q.damage_words() {
-                self.write(word);
+        // One local fold rather than a `write` per word: the same
+        // `fnv_mix_u64` chain over the same words in the same order. A ribbon
+        // frame streams thousands of quads through here, so the loops are
+        // counted: an unoptimized build calls an iterator's `next` out of line.
+        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
+        let mut qi = 0;
+        while qi < quads.len() {
+            let words = quads[qi].damage_words();
+            let words = words.as_slice();
+            let mut wi = 0;
+            while wi < words.len() {
+                hash = fnv_mix_u64(hash, words[wi]);
+                wi += 1;
             }
+            qi += 1;
         }
+        self.0 = Some(hash);
     }
 
     fn fire_patches(&mut self, patches: &[FirePatch]) {
@@ -1357,11 +1109,10 @@ impl FrameFingerprint {
 }
 
 impl CursorGlow {
-    /// Hard cap on emitted quads (defends the renderer + the per-frame upload); the
-    /// snapshot is truncated so BOTH backends see identical geometry. Sized for the
-    /// LASER's six fine-stride bloom layers over a FULL-length (uncapped) jump beam
-    /// plus its lightning bolts — instances are tiny (~12 B), so even a saturated
-    /// snapshot uploads ~200 KB, still trivial per frame.
+    /// Hard cap on emitted quads (protects the renderer and per-frame upload);
+    /// the snapshot is truncated so both backends see identical geometry. Sized
+    /// for the laser's six bloom layers over a full-length jump beam plus its
+    /// bolts (~12 B per instance).
     const MAX_QUADS: usize = 16384;
     /// Hard cap on live swept-path samples for every style. `cfg.length` bounds
     /// one move, but without a resident cap a flood of moves at the same instant
@@ -1375,17 +1126,12 @@ impl CursorGlow {
     /// keystroke and jump splashes can emit 26 at once, so the per-move burst is
     /// not itself a bound on resident work.
     const MAX_PARTICLES: usize = 512;
-    /// Longest same-row typed-coalesce the ribbon sweeps as CONTINUED TYPING
-    /// (cells): a repaint re-anchor (Claude Code's inset box growing) hops the
-    /// caret across cells it never visited — beyond this cap the move keeps the
-    /// single landing spark.
+    /// Longest same-row typed coalesce the ribbon sweeps as continued typing
+    /// (cells); beyond it the move keeps the single landing spark.
     ///
-    /// It is [`TYPED_STAMP_DEPTH`] (see that constant for the arithmetic),
-    /// and the two must stay equal: one observed move can spend at most
-    /// this many cells, so banking more presses than that cannot license
-    /// anything a move could ever sweep. What separates a real batched echo
-    /// from a re-anchor at ANY length is the press ledger
-    /// ([`PressCredits`]), not the length itself.
+    /// Equal to [`TYPED_STAMP_DEPTH`] by construction: one observed move spends
+    /// at most this many cells. The press ledger ([`PressCredits`]), not the
+    /// length, separates a batched echo from a re-anchor.
     const RAINBOW_TYPED_SWEEP_MAX: usize = TYPED_STAMP_DEPTH;
     /// The anchored lane's bound (cells) for a row whose identity no licensed
     /// anchored echo has proven yet (`echo_anchor_pass`): a program row's
@@ -1394,14 +1140,10 @@ impl CursorGlow {
     /// delivered insert's row take the full cap.
     const ANCHOR_UNPROVEN_ROW_MAX: usize = 32;
 
-    // ── THE ZOOM STREAK'S SHAPE (see `emit_rainbow_jumps`) ─────────────────
+    // ── The zoom streak's shape (see `emit_rainbow_jumps`) ─────────────────
     //
-    // Four numbers, and between them they replace the three-row `SEG` table
-    // that drew the streak as three chained flat bars. Every one of them is an
-    // ENDPOINT of a continuous ramp rather than a value some stretch of the
-    // mark is held at, which is the whole difference: the old table's rows met
-    // at 0.34 vs 0.608 coverage and 0.45 vs 0.75 thickness, and those two
-    // mismatches were the seams the owner read as "a not smooth gradient".
+    // Four numbers, each an endpoint of a continuous ramp rather than a level
+    // some stretch of the mark is held at, so the streak has no seams.
 
     /// Most simultaneous live lightning bolts, main channels + branch forks
     /// (oldest evicted first). A jump strike spawns 1 main + up to 4 branches,
@@ -1409,28 +1151,26 @@ impl CursorGlow {
     const MAX_BOLTS: usize = 24;
     /// Bloom-crown fade window (the crown follows the head for this long post-move).
     const CROWN_MS: u64 = 200;
-    /// TYPING crown window: a single-cell advance keeps the crown lit this long, so
-    /// at human typing cadence (≤~350ms between keys) the crown NEVER lapses
-    /// mid-sentence — the glow stream stays non-empty across the inter-key gap
-    /// (which also keeps the renderer's SDR attack envelope from resetting and
-    /// re-blooming on every key — the "laggy pulse" report). Jumps keep [`CROWN_MS`].
+    /// Typing crown window: a single-cell advance keeps the crown lit this long,
+    /// so at human cadence the glow stream stays non-empty across inter-key gaps
+    /// (and the renderer's SDR attack envelope does not re-bloom per key). Jumps
+    /// keep [`CROWN_MS`].
     const CROWN_TYPING_MS: u64 = 350;
     /// Heat earned by one keystroke at full cadence (≈7 fast keys to full heat).
     const HEAT_GAIN: f32 = 0.16;
     /// Exponential heat cool-down time constant (seconds to ~37%).
     const HEAT_DECAY_TAU: f32 = 0.9;
-    /// Jump-flare cool-down time constant: fast enough that the white-hot burst
-    /// reads as an EVENT (blaze → orange → ember inside the comet's own fade),
-    /// slow enough that the cooling arc is visible rather than a single flash.
+    /// Jump-flare cool-down τ: fast enough that the white-hot burst reads as an
+    /// event, slow enough that the cooling arc is visible.
     const FLARE_DECAY_TAU: f32 = 0.45;
     /// Inter-key gap (seconds) at or under which a keystroke earns full heat…
     const HEAT_GAP_FULL: f32 = 0.09;
     /// …and the gap beyond which it earns none (relaxed typing stays cool).
     const HEAT_GAP_ZERO: f32 = 0.40;
-    /// TYPING CONTINUITY: an inter-key gap at or under this (== [`Self::HEAT_GAP_ZERO`]
-    /// — beyond the heat window it isn't "typing") lets the new spark's life CHAIN to
-    /// the observed cadence, so the streak is continuous at any human typing rhythm
-    /// instead of pulsing per key with dark rests (the quiet-shell "gapping" report).
+    /// Typing continuity: an inter-key gap at or under this
+    /// (== [`Self::HEAT_GAP_ZERO`]) chains the new spark's life to the observed
+    /// cadence, so the streak is continuous at any human rhythm instead of
+    /// pulsing per key.
     const CHAIN_GAP_MAX: f32 = 0.40;
     /// Chained life = observed gap + this margin (the previous spark comfortably
     /// outlives the gap)…
@@ -1438,17 +1178,17 @@ impl CursorGlow {
     /// …capped here so the post-stop tail stays crisp (≤500ms after the last key).
     const CHAIN_LIFE_MAX: f32 = 0.50;
     // ---- EMBERFORGE thermal model (fire only) --------------------------------
-    /// Fire's fast-heat gain per forward keystroke at full cadence — much lower
-    /// than the shared [`Self::HEAT_GAIN`]: full blaze is EARNED over ~30-40
-    /// sustained keys (fast heat + the coal floor together), not seven.
+    /// Fire's fast-heat gain per forward keystroke at full cadence, well below
+    /// [`Self::HEAT_GAIN`]: full blaze takes ~30-40 sustained keys (fast heat
+    /// plus the coal floor).
     const FIRE_HEAT_GAIN: f32 = 0.045;
     /// Fire's heat cool-down τ — slower than the shared 0.9 s: momentum
     /// survives a short thought instead of resetting between phrases.
     const FIRE_HEAT_TAU: f32 = 2.8;
     /// Coal-bed cool-down τ (seconds to ~37%) — the slow persistence floor.
     const COAL_TAU: f32 = 6.0;
-    /// Coal charged by one FORWARD keystroke at full cadence credit: with the
-    /// τ above, ~60+ sustained keys reach a strong bed — the LONG momentum arc.
+    /// Coal charged by one forward keystroke at full cadence credit: with the
+    /// τ above, ~60+ sustained keys reach a strong bed — the long momentum arc.
     const COAL_GAIN: f32 = 0.022;
     /// Inter-key gap earning full coal credit — deliberately wider than the
     /// fast heat's window: HUMAN-cadence typing must charge the bed…
@@ -1461,7 +1201,7 @@ impl CursorGlow {
     const QUENCH_GAIN: f32 = 0.28;
     /// …decaying on this τ once the deleting stops.
     const QUENCH_TAU: f32 = 1.2;
-    /// Each delete also cools the standing heat AND the coal bed by this factor.
+    /// Each delete also cools the standing heat and the coal bed by this factor.
     const QUENCH_COOL: f32 = 0.8;
     /// A full quench suppresses this fraction of the display temperature.
     const QUENCH_DAMP: f32 = 0.6;
@@ -1473,180 +1213,128 @@ impl CursorGlow {
     /// Echo latency is tens of milliseconds; a quarter second covers a loaded
     /// PTY without correlating the candidate to a later, unrelated move.
     pub(crate) const TYPE_HINT_FRESH: f32 = 0.25;
+    /// How long the caret must stand still before a typed lay is judged
+    /// against where it rests ([`TornLay`]): two 60 Hz frames, past the
+    /// continuation of a read that tore inside one redisplay.
+    pub(crate) const TORN_REST_S: f32 = 0.032;
     /// Freshness window for the RETURN classifier ([`Self::return_hint`]).
     const RETURN_HINT_FRESH: f32 = 0.25;
-    /// Freshness window for the Tab/paste gesture stamp
-    /// ([`Self::user_gesture_hint`]). The stamp predates the LICENSE and was
-    /// only ever consumed, never dated; the license needs a window, and this
-    /// is the 0.25 s class every other press-hint already lives in.
+    /// Freshness window for the Tab/scripted gesture stamp
+    /// ([`Self::user_gesture_hint`]), in the 0.25 s class of the other press
+    /// hints.
     const USER_GESTURE_HINT_FRESH: f32 = 0.25;
-    /// Freshness window for the DELIVERED-INSERT licence
-    /// ([`InsertSeam`]): the insert IS an unpaid credit of `cells`
-    /// cells — a debounced TUI (Claude Code's Ink prompt under load) echoes
-    /// up to ~1.4 s after the bytes land, measured, and a 0.25 s window
-    /// would refuse most of them. Two seconds is the insert's OWN measured
-    /// bound, not the typed press's in-flight patience
-    /// (`IN_FLIGHT_PATIENCE_S`, 10 s, from a typed-stall measurement the
-    /// paste path has not had — stall.py has no paste run). A paste
-    /// delivered into an app stall longer than this is a recorded residual:
-    /// when it is measured, this moves to the in-flight patience — the
-    /// shape bounds hold at any window. It is safe at this length only
-    /// because the SHAPE bounds what
-    /// it can buy: one same-row forward echo, no wider than the insert plus
-    /// the unpaid typed credits behind it, on a row that is not a program
-    /// row, once.
+    /// Freshness window for the delivered-insert licence ([`InsertSeam`]). A
+    /// debounced TUI (Claude Code's Ink prompt under load) can echo over a
+    /// second after the bytes land, so 0.25 s would refuse most inserts. It is
+    /// shorter than the typed press's in-flight patience
+    /// (`IN_FLIGHT_PATIENCE_S`). Safe at this length because the shape bounds
+    /// what it can buy: one same-row forward echo, no wider than the insert plus
+    /// the unpaid typed credits behind it, on a non-program row, once.
     pub const INSERT_HINT_FRESH: f32 = 2.0;
-    /// The same window for the UNKNOWN-WIDTH class — a bare Tab or ⌃V,
-    /// whose echo is the local program's and whose bytes were one keystroke
-    /// already on the wire.
+    /// The same window for the unknown-width class (a bare Tab or ⌃V, whose
+    /// echo is the local program's).
     ///
-    /// **WHY IT IS NOT [`Self::INSERT_HINT_FRESH`]** (2026-09-21). Two
-    /// seconds is a PASTE's number: the host's write of a large body can
-    /// land slowly, and the width check bounds what the licence can buy
-    /// anyway. The unknown class has no width to check — its admission is
-    /// the row witness and the 32-cell bound — so for the whole two seconds
-    /// the FIRST same-row forward advance on the hand's row was taken as
-    /// the gesture's echo, and 1.75 s of that is past every other licence's
-    /// freshness. A background job printing on the prompt row was lit as a
-    /// 32-cell sweep: ink over bytes no key asked for.
+    /// Shorter than [`Self::INSERT_HINT_FRESH`]: the unknown class has no width
+    /// to check (only the row witness and the 32-cell bound), so a long window
+    /// would light any same-row forward advance on the hand's row (a background
+    /// job printing on the prompt row) as the gesture's echo. The floor is
+    /// `a_spinner_row_advancing_after_a_tab_stays_dark`, which needs a Tab's
+    /// completion to still be the Tab's 800 ms later; one second keeps that
+    /// with margin.
     ///
-    /// **THE NUMBER, AND WHAT SET IT.** A local bash completion's echo was
-    /// measured on glass at `<= 115 ms` — the recorder's own sampling
-    /// floor, which is to say the instrument could not resolve it
-    /// (`index.json`'s `analysis` reads `AT CAPTURE FLOOR`), so that is a
-    /// bound and not a reading. The FLOOR on this constant is not that
-    /// measurement but this crate's own standing law
-    /// (`a_spinner_row_advancing_after_a_tab_stays_dark`), which requires a
-    /// Tab's completion to still be the Tab's **800 ms** later; 0.75 broke
-    /// it, and weakening a shipped law to fit a guessed constant is not a
-    /// trade this lane gets to make. One second keeps every existing law
-    /// with 200 ms to spare and halves the window a program hop can walk
-    /// into.
-    ///
-    /// It is a POLICY, not a bound — a completion that shells out over a
-    /// slow network can take longer, and past this its echo goes unlit
-    /// rather than the window staying open for program output. That is the
-    /// trade the owner's report picks: an unexpected rainbow is the defect;
-    /// a completion that paints no trail is not.
-    ///
-    /// **WHAT WAS TRIED INSTEAD AND DOES NOT WORK:** a COLUMN witness
-    /// beside the row one, refusing a hop that does not BEGIN where the
-    /// hand stood when the gesture was armed. It cannot bind. The caret can
-    /// only reach another column by a move, and the first same-row forward
-    /// move after the Tab therefore always starts at the hand's own column
-    /// — it is admitted, and the licence is spent, before any later hop can
-    /// be tested. Measured: both arms of the twin scored 1. Time is the
-    /// only discriminator this seam has.
+    /// A policy, not a bound: a slower completion goes unlit rather than
+    /// leaving the window open for program output. A column witness cannot
+    /// replace the time bound: the first same-row forward move after a Tab
+    /// always starts at the hand's column, so the licence is spent before any
+    /// later hop could be tested.
     pub const INSERT_GESTURE_HINT_FRESH: f32 = 1.0;
     /// How long after a delivered insert was laid a keyless same-row retreat
-    /// landing inside its span is read as the program's REWRITE of that
-    /// insert (Claude Code swaps a dropped path for `[Image #1] ` 300-400 ms
-    /// after echoing it, measured). Past this the retreat is program output
-    /// like any other and retracts nothing.
+    /// inside its span reads as the program's rewrite of it (Claude Code swaps a
+    /// dropped path for `[Image #1] ` a few hundred ms after echoing it). Past
+    /// this the retreat is ordinary program output.
     pub const INSERT_REWRITE_FRESH: f32 = 2.0;
     /// How long after a refused same-row forward hop a delivery receipt may
-    /// still claim it ([`PendingHop`]) — the writer thread publishes within
-    /// microseconds of the write returning, and the frame that observed the
-    /// echo is at most one present interval behind it; anything older is
-    /// program output that happened to precede a paste.
+    /// still claim it ([`PendingHop`]): the writer publishes microseconds after
+    /// the write, and the observing frame is at most one present behind.
     pub const INSERT_RETRO_FRESH: f32 = 0.25;
-    /// The unknown-width bound for an insert the host cannot price: a Tab
-    /// completion (one `\t` byte, the shell decides the width) and a raw ⌃V
-    /// (the app's own placeholder). A same-row forward echo of at most this
-    /// many cells may spend it. It is the widest PLACEHOLDER Claude Code
-    /// prints (`[Pasted text #1 +N lines] ` ≈ 28 cells) plus a Tab
-    /// completion — 32, decoupled from the press bank's depth so the bank
-    /// can grow for a stall without widening the unknown class's one-shot
-    /// exposure. Counted ONCE per licence, not per arm: a second unknown
-    /// arm accumulating into an unspent one — a Tab auto-repeat — leaves
-    /// the bound where it is.
+    /// The unknown-width bound for an insert the host cannot price (a Tab
+    /// completion, a raw ⌃V placeholder): a same-row forward echo of at most
+    /// this many cells may spend it. Covers Claude Code's widest placeholder
+    /// (`[Pasted text #1 +N lines] `, ~28 cells) plus a completion, and is
+    /// independent of the press bank's depth. Counted once per licence, so an
+    /// auto-repeated Tab does not widen it.
     pub const INSERT_GESTURE_CELLS: u16 = 32;
-    /// Freshness window for the REFLOW classifier ([`Self::reflow_hint`]). It is
+    /// Freshness window for the reflow classifier ([`Self::reflow_hint`]). It is
     /// retained for bounded lifecycle observation, not movement admission.
     const REFLOW_HINT_FRESH: f32 = 0.40;
-    /// A kill key-hint stays armed this long for its row-shrink echo (seconds)
-    /// — see [`Self::note_kill`]. Wider than the typed hint: a kill's erase is
-    /// often a full-box TUI repaint (Ink rewrites every prompt row), which can
-    /// land a frame or two later than a single-glyph echo.
+    /// How long a kill key hint stays armed for its row-shrink echo (seconds;
+    /// see [`Self::note_kill`]). Wider than the typed hint: a kill's erase is
+    /// often a full-box TUI repaint that lands a frame or two later.
     const KILL_HINT_FRESH: f32 = 0.35;
-    /// A repaint-blink hint ([`Self::note_repaint_blink`]) stays fresh this
-    /// long (seconds). Wider than the per-keystroke hints: the blink is noted
-    /// at the PREVIOUS burst's present, so it must comfortably outlive one
-    /// human inter-key gap for the NEXT keystroke's re-anchor — while staying
-    /// far under the seconds-scale pause that separates "the TUI is repainting
-    /// per keystroke" from "the app stopped doing that".
+    /// How long a repaint-blink hint ([`Self::note_repaint_blink`]) stays fresh
+    /// (seconds). The blink is noted at the previous burst's present, so it
+    /// must outlive one inter-key gap for the next keystroke's re-anchor, while
+    /// staying well under the pause that means the TUI stopped repainting per
+    /// key.
     const BLINK_HINT_FRESH: f32 = 0.5;
-    /// Coarse poll cadence while ONLY a pending kill hint keeps the engine
-    /// live (see [`Self::next_change_deadline`]): the caret fallback needs a
-    /// handful of ticked frames after [`Self::POOF_FALLBACK_GRACE`] (0.06 s),
-    /// not a 60 fps re-tick for the whole 0.35 s hint window.
+    /// Coarse poll cadence while only a pending kill hint keeps the engine live
+    /// ([`Self::next_change_deadline`]): the caret fallback needs a few frames
+    /// after [`Self::POOF_FALLBACK_GRACE`], not 60 fps for the whole hint
+    /// window.
     const KILL_HINT_POLL_INTERVAL: Duration = Duration::from_millis(40);
-    /// Minimum gap between erase poofs (seconds): a held kill-key repeat
-    /// billows at a readable ~7 Hz instead of stacking a puff per frame.
-    /// The caret-anchored fallback waits this long after the kill keypress so
-    /// the PRECISE span branch always gets first shot at the echo (a shell's
-    /// EL lands within a frame or two; Claude Code's reflow never span-matches
-    /// at any delay, so the fallback costs it ~4 imperceptible frames).
+    /// Minimum gap between erase poofs (seconds), so a held kill-key repeat
+    /// billows at a readable rate. The caret-anchored fallback waits this long
+    /// after the key so the precise span branch gets the first shot at the echo.
     ///
-    /// It is a CAP, not a floor: [`Self::poof_erase_witnessed`] releases it the
-    /// moment the probe proves the erase is already on glass, because at that
-    /// point the span branch has had its shot on that very probe and declined.
-    /// The timer is what governs the cases with no witness — a reflow that
-    /// re-rowed the caret, a kill whose echo never shows, a host that had no
-    /// probe to stamp at the key.
+    /// A cap, not a floor: [`Self::poof_erase_witnessed`] releases it as soon
+    /// as the probe shows the erase on glass (the span branch has then had its
+    /// shot). The timer governs cases with no witness: a reflow that re-rowed
+    /// the caret, an echo that never shows, a host with no probe at the key.
     const POOF_FALLBACK_GRACE: f32 = 0.06;
     const POOF_MIN_GAP: f32 = 0.14;
-    /// A stored row probe older than this cannot witness a kill (seconds).
-    /// Belt-and-braces: content cannot change without damage → present → tick,
-    /// so the previous probe is normally the last-presented truth — this cap
-    /// only fences a pathological host that stops probing mid-session.
+    /// A stored row probe older than this cannot witness a kill (seconds). A
+    /// backstop against a host that stops probing mid-session.
     const POOF_PROBE_STALE: f32 = 5.0;
-    /// Quench added by one KILL key ([`Self::note_kill`]) — a kill is a BIG
-    /// douse (a whole span of text gone at once), roughly two backspaces'
-    /// worth, so ~2 kills fully quench a standing blaze.
+    /// Quench added by one kill key ([`Self::note_kill`]): about two
+    /// backspaces' worth, so two kills fully quench a standing blaze.
     const KILL_QUENCH_GAIN: f32 = 0.55;
-    /// Display-temperature ATTACK ease (seconds to ~63% of a rise): nothing
-    /// pops in — every brightening is a swell, and the blaze is EARNED across a
-    /// real run (roughly a second of sustained key-repeat to approach the wall)…
+    /// Display-temperature attack ease (seconds to ~63% of a rise): every
+    /// brightening is a swell, and the blaze builds over about a second of
+    /// sustained typing.
     const DISP_ATTACK_S: f32 = 0.34;
-    /// …except a SLAM (a jump flare opening a gap > 0.5): a fast whoosh so the
+    /// …except a slam (a jump flare opening a gap > 0.5): a fast whoosh so the
     /// eruption still lands within a couple of frames.
     const DISP_SLAM_S: f32 = 0.05;
-    /// Display-temperature RELEASE τ — the fire dies down slower than it leaps.
+    /// Display-temperature release τ — the fire dies down slower than it leaps.
     const DISP_RELEASE_TAU: f32 = 0.45;
-    /// Bounded ring for `flame_phase` (the fire's churn clock), exactly like
-    /// `rainbow.phase`'s 1024 wrap: without it the phase integrates every dt forever,
-    /// and f32 ULP overtakes the ~0.03/frame increment near ~5e5 (quantize →
-    /// freeze over a multi-day session), while the `* 1024.0 as u32` field cast
-    /// saturates at u32::MAX past ~4.19e6. `TAU · 640` keeps BOTH forge sines
-    /// (`× 1.7`, `× 2.3`) seamless across the wrap — `640 · 1.7 = 1088` and
-    /// `640 · 2.3 = 1472` are whole turns — and the field's own u32 ring reseats
-    /// one frame only after ~40 min of CONTINUOUS active fire (never mid-burst).
+    /// Bounded ring for `flame_phase` (the fire's churn clock), like
+    /// `rainbow.phase`'s 1024 wrap: unbounded, f32 precision would freeze the
+    /// phase over a long session and the `* 1024.0 as u32` cast would saturate.
+    /// `TAU · 640` keeps both forge sines (`× 1.7`, `× 2.3`) seamless across the
+    /// wrap (1088 and 1472 whole turns); the field's own u32 ring reseats only
+    /// after ~40 min of continuous fire.
     const FLAME_PHASE_RING: f32 = std::f32::consts::TAU * 640.0;
     /// Cursor-metal attack τ (heats over ~1.5 s of standing blaze)…
     const TEMP_ATTACK_TAU: f32 = 1.5;
-    /// …and release τ (cools much slower — forged metal holds its heat; the
-    /// quench meter divides this, so deleting cools the cursor visibly faster).
-    /// ~1.4 s to 63% cooled, fully dull inside ~4.5 s.
+    /// Release τ: cools much slower than it heats (forged metal holds heat);
+    /// the quench meter divides it, so deleting cools faster.
     const TEMP_RELEASE_TAU: f32 = 1.4;
     /// Below this metal temperature the cursor fill is untouched (pure theme).
     const FORGE_MIN_TEMP: f32 = 0.12;
-    /// Coarse wake cadence for the forge-ember-only cooling tail (~11 fps): the
-    /// ember's u8-quantized colour changes imperceptibly between these, so the
-    /// present gate dedups anyway — see [`Self::next_change_deadline`].
+    /// Coarse wake cadence for the forge-ember-only cooling tail: the ember's
+    /// u8 colour barely changes between these, and the present gate dedups
+    /// anyway ([`Self::next_change_deadline`]).
     const EMBER_POLL_INTERVAL: Duration = Duration::from_millis(90);
-    /// Same-row fire moves at/past this many columns become a METEOR (any row
+    /// Same-row fire moves at/past this many columns become a meteor (any row
     /// change already does — matching the rainbow kitty's jump classification).
     const METEOR_MIN_COLS: i32 = 8;
     /// Most simultaneous live fire meteors (oldest evicted first).
     const METEOR_CAP: usize = 4;
-    /// A fresh meteor whose ORIGIN equals a live meteor's LANDING within this
-    /// window RETARGETS that meteor instead of spawning a second one — shell
-    /// repaint choreography (CR → prompt reprint, observed as several hops
-    /// over a frame or three; the reprint can lag ~100 ms on a long edit
-    /// line) collapses into ONE clean streak instead of a multi-hop smear.
-    /// Must stay under the strike fraction of the
-    /// shortest meteor life so a retarget always wins the race with arrival.
+    /// A fresh meteor whose origin equals a live meteor's landing within this
+    /// window retargets that meteor instead of spawning another, so shell
+    /// repaint choreography (CR → prompt reprint over a few frames) becomes one
+    /// streak. Must stay under the strike fraction of the shortest meteor life
+    /// so a retarget always beats arrival.
     const METEOR_RETARGET_S: f32 = 0.12;
     /// The head strikes (arrival flare) at this fraction of the meteor's life
     /// — the tail then finishes retracting into the eruption.
@@ -1656,64 +1344,50 @@ impl CursorGlow {
     const MAX_HALOS: usize = 512;
     /// Hard cap on live vapor puffs (steam + smoke).
     const MAX_VAPOR: usize = 128;
-    /// The cursor metal SMOKES above this temperature (the brief's "heats up
+    /// The cursor metal smokes above this temperature (the brief's "heats up
     /// over use and starts smoking").
     const SMOKE_TEMP: f32 = 0.35;
 
-    /// PHASER CONSTANT-DISTANCE STREAK: within a rhythm the fat band's life is
-    /// this many observed inter-key gaps (+ margin), so it always spans the
-    /// SAME distance at ANY cadence: THREE letters back solidly lit behind the
-    /// cursor (the 55%-hold typing envelope keeps a cell bright through ~2.5
-    /// gaps of age), the fourth ghosting out.
+    /// Phaser constant-distance streak: within a rhythm the band's life is this
+    /// many observed inter-key gaps, so it spans the same distance at any
+    /// cadence: three letters solidly lit behind the cursor, the fourth fading.
     const PHASER_CHAIN_KEYS: f32 = 4.5;
-    /// The chain window — a REAL typing rhythm only, deliberately much
-    /// tighter than the rainbow kitty's: a longer window lets a key typed after a thinking
-    /// pause inherit a multi-second life and park the band over old text. Past
-    /// this gap a keystroke is a new burst: base time, then a crisp fade.
+    /// The Phaser chain window, a real typing rhythm only and much tighter than
+    /// Rainbow Kitty's, so a key after a pause does not inherit a long life and
+    /// park the band over old text.
     const PHASER_CHAIN_GAP_MAX: f32 = 0.75;
     /// …capped just above `PHASER_CHAIN_KEYS × PHASER_CHAIN_GAP_MAX` so the
     /// slowest chained rhythm still earns its full three-letter span.
     const PHASER_CHAIN_LIFE_MAX: f32 = 3.5;
-    /// LIGHTNING TRAIL residual: the fraction of full beam power an aged trail
-    /// cell holds after its discharge bleed — the dim static charge that
-    /// lingers (and crackles) behind the cursor before the final fade.
+    /// Lightning trail residual: the fraction of beam power an aged trail cell
+    /// holds after its discharge bleed, the dim static charge before the fade.
     const LASER_RESIDUAL: f32 = 0.30;
-    /// FIRE streak text-safety caps — the OCCUPIED-CELL coverage discipline the
-    /// phaser shares (`cursor_phaser::WING_STACK_BUDGET`). The flame comet rides
-    /// the just-typed glyph row, and its near-white head stacks with the crown +
-    /// flame body + bloom, which saturates the 1-2 FRESHEST glyph cells to cream
-    /// on dark AND light. [`Self::FIRE_STREAK_COV_CAP`] bounds the per-sample
-    /// streak coverage over the OCCUPIED glyph cells so the letters keep contrast
-    /// through the flame. The BRIDGE sample sits on the EMPTY cursor cell — no
-    /// glyph to bury — so it keeps [`Self::FIRE_HEAD_COV_CAP`] full punch and the
-    /// light still visibly leaves the cursor.
+    /// Fire streak text-safety caps (the occupied-cell coverage discipline
+    /// shared with `cursor_phaser::WING_STACK_BUDGET`). The flame comet's head
+    /// stacks with the crown, body and bloom over the freshest glyph cells;
+    /// [`Self::FIRE_STREAK_COV_CAP`] bounds per-sample coverage over occupied
+    /// cells so letters keep contrast. The bridge sample on the empty cursor
+    /// cell keeps [`Self::FIRE_HEAD_COV_CAP`].
     const FIRE_STREAK_COV_CAP: f32 = 108.0;
     const FIRE_HEAD_COV_CAP: f32 = 168.0;
-    /// The STRUCTURAL legibility ceiling for the Trail Pack (`Custom`) path — a
-    /// NON-configurable per-sample coverage cap set to the proven streaming
-    /// posture (the phaser/rainbow kitty text-safety ceiling). Applied inside the custom
-    /// interpreter's sole emission funnels (the beam CometSample builder + the
-    /// particle loop) AND to the custom birth coverage, so a pack cannot express
-    /// or emit a value that would bury the glyphs beneath it — the "a pack cannot
-    /// opt out of the occupied-cell coverage ceiling" law. Every built-in stays
-    /// byte-identical because this only ever bounds `GlowStyle::Custom` samples.
+    /// Structural legibility ceiling for the Trail Pack (`Custom`) path: a
+    /// non-configurable per-sample coverage cap, applied in the custom
+    /// interpreter's emission funnels (beam `CometSample` builder, particle
+    /// loop) and to custom birth coverage, so no pack can bury the glyphs.
+    /// Bounds only `GlowStyle::Custom`.
     const CUSTOM_COV_CAP: f32 = 150.0;
-    /// The STRUCTURAL life ceiling for the Trail Pack (`Custom`) wake — a
-    /// NON-configurable cap on a custom spark's base heat life so no combination
-    /// of `heat.life_base_mul`/`life_a`/`life_b` can park a wake past this bound
-    /// (chaining may still reach `chain_life_max`, itself ≤4 s by the schema).
-    /// Equal to the pack particle-life ceiling; Custom-only, so built-ins are
-    /// byte-identical.
+    /// Structural life ceiling for the Trail Pack (`Custom`) wake: caps a custom
+    /// spark's base heat life whatever `heat.life_base_mul`/`life_a`/`life_b`
+    /// say (chaining may still reach `chain_life_max`, ≤ 4 s by schema). Equal
+    /// to the pack particle-life ceiling; Custom-only.
     const MAX_TRAIL_SPARK_LIFE: f32 = 2.0;
     /// How far back along the charged trail (live typing sparks, newest first)
     /// a crackle arc may root — the stray arcs dance over the whole lingering
     /// trail, not just off the write head.
     const CRACKLE_TRAIL_CELLS: usize = 12;
-    /// BEAM typing continuity: the tube's spark life chains to this many
-    /// inter-key gaps, so the rod STEADILY spans about the last three-and-a-half
-    /// typed letters at ANY cadence (with `beam_power`'s 40% full-power hold,
-    /// the newest letter or two ride at full brightness) — a solid rod of
-    /// light, not a comet smear.
+    /// Beam typing continuity: the tube's spark life chains to this many
+    /// inter-key gaps, so the rod spans about the last three and a half letters
+    /// at any cadence (the newest one or two at full power).
     const BEAM_CHAIN_KEYS: f32 = 3.5;
     /// The beam's chain window (generous, mirroring the phaser's: a steady
     /// tube must survive leisurely rhythms too)…
@@ -1731,16 +1405,14 @@ impl CursorGlow {
             .or_else(|| self.last_visible.map(|(cell, _)| cell))
     }
 
-    /// REDUCED-MOTION arm for the FRESH-INK pop (see the `reduced_motion`
-    /// field doc): when set, a pop is a brightness STEP-FADE only — no scale
-    /// spring, no birth halo. State-only and idempotent; the host folds its
-    /// motion policy here beside the tick (the sparkle/rain reduced twins'
-    /// pattern — this engine cannot depend on the GUI's `motion` module).
+    /// Reduced-motion arm for the fresh-ink pop (see the `reduced_motion`
+    /// field): a pop is a brightness step-fade only. Idempotent; the host sets
+    /// it beside the tick, like the sparkle/rain reduced twins.
     pub fn set_reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
-        // SEAM POINT 2 (§17.2, §6.11): the posture change → v2, dated to the
-        // last drawn tick (this setter carries no clock, and the engine also
-        // reads the posture off its `Config` on every tick).
+        // Seam point 2 (§17.2, §6.11): the posture change goes to v2, dated to
+        // the last drawn tick (the engine also reads it from `Config` each
+        // tick).
         if self.v2.engaged()
             && let Some(at) = self.heat_at
         {
@@ -1748,62 +1420,48 @@ impl CursorGlow {
         }
     }
 
-    /// **THE FOCUS SEAM** (2026-09-13, Rainbow Path v3 step 1, law G1):
-    /// the window's OS focus changed — `App::on_focus`'s `WindowEvent::Focused`
-    /// arm, forwarded on the event's own clock. Rainbow Kitty v2 embers its
-    /// ribbon out over `ribbon::FOCUS_EMBER_S` (0.30 s) on `spend` and puts
-    /// every star on the same ember (`rk::Event::Focus(false)`); a regain
-    /// inside the ember re-arms the light from the level it had through the
-    /// one sanctioned attack, `edge-in` (`Focus(true)`). The design of record
-    /// (`RAINBOW-KITTY-V2.md` §8.2) has carried the ember since 2026-09-05
-    /// and the ribbon has pinned it since, but no host ever sent the event —
-    /// on glass a blur was a one-frame cut the moment the motion policy took
-    /// the amplitude to zero (`Engine::set_engaged(false)` → `reset`), or no
-    /// change at all while the typed wake kept the amplitude up.
+    /// The focus seam (law G1): the window's OS focus changed, forwarded from
+    /// `App::on_focus` on the event's clock. Rainbow Kitty v2 embers its ribbon
+    /// out over `ribbon::FOCUS_EMBER_S` and puts every star on the same ember
+    /// (`rk::Event::Focus(false)`); a regain inside the ember re-arms from the
+    /// current level through `edge-in` (`Focus(true)`) (`RAINBOW-KITTY-V2.md`
+    /// §8.2).
     ///
-    /// RAW focus, not the host's presentability fold: the fold ORs in the
-    /// live typed wake so a control-socket agent's window keeps drawing, and
-    /// under it a human's alt-tab away from a fresh ribbon would never ember
-    /// (the wake outlives the swoosh). The wake's own promise is kept by the
-    /// ribbon instead: a typed key laid while the ember burns clears it and
-    /// re-lights from the level (`Ribbon::on_event`'s `Typed` arm), so an
-    /// unfocused window that is being typed into still shows the light of
-    /// the keys being typed, and only a window nobody is typing into goes
-    /// dark on blur. The sound already gated on raw focus
-    /// (`app_render::trail_sound_gain`); the light now does the same.
+    /// Raw focus, not the host's presentability fold (which ORs in the typed
+    /// wake so an agent-driven window keeps drawing). The ribbon keeps the
+    /// wake's promise instead: a key typed during the ember clears it and
+    /// re-lights, so only a window nobody types into goes dark on blur. Sound
+    /// gates on raw focus too (`app_render::trail_sound_gain`).
     ///
-    /// Inert for every style but rainbow kitty (the v2 gate), and inert
-    /// while v2 is not engaged: a window that was dark stays dark.
+    /// Inert for other styles and while v2 is not engaged.
     pub fn note_focus(&mut self, focused: bool, now: Instant) {
         if self.v2.engaged() {
             self.v2.on_event(rk::Event::Focus(focused), now);
         }
     }
 
-    /// HOST REPAINT-BLINK: the focused terminal's `repaint_blink_epoch`
-    /// advanced — the attached app hid the cursor INSIDE a DEC-2026
-    /// synchronized update, the per-keystroke full-redraw bracket (Claude
-    /// Code). Arms a short classifier ([`Self::BLINK_HINT_FRESH`]) that selects
-    /// RE-ANCHOR morphology for an independently admitted typed/delete candidate
-    /// on the alt screen. The blink never admits movement and never gates bytes.
+    /// Host repaint blink: the focused terminal's `repaint_blink_epoch`
+    /// advanced (the app hid the cursor inside a DEC-2026 synchronized update,
+    /// Claude Code's per-keystroke redraw). Arms a short classifier
+    /// ([`Self::BLINK_HINT_FRESH`]) selecting re-anchor morphology for an
+    /// admitted typed/delete candidate on the alt screen. Never admits movement
+    /// or gates bytes.
     pub fn note_repaint_blink(&mut self, now: Instant) {
         self.unsettle();
         self.blink_hint = Some(now);
     }
 
     /// Drop the blink hint — a tab/pane switch re-pointed this window at a
-    /// DIFFERENT terminal, and a blink carried from the old one must not
+    /// different terminal, and a blink carried from the old one must not
     /// classify a candidate (or, host-side, the probe) against the new one.
     pub fn clear_blink(&mut self) {
         self.blink_hint = None;
     }
 
-    /// HOST PER-FRAME CONTEXT: whether the probed terminal is on the ALT
-    /// screen this frame (read under the host's frame hold beside the row
-    /// probe).
-    /// Only the re-anchor classifier consults it — `false` (main screen, or a
-    /// host/test that never calls this) keeps the classifier byte-identical
-    /// to the pre-context behavior.
+    /// Host per-frame context: whether the probed terminal is on the alt screen
+    /// this frame (read beside the row probe). Only the re-anchor classifier
+    /// consults it; `false` (main screen, or a host that never calls this)
+    /// leaves the classifier unchanged.
     pub fn note_context(&mut self, alt: bool) {
         self.ctx_alt = alt;
     }
@@ -1832,18 +1490,14 @@ impl CursorGlow {
         self.v2.set_pane(self.pane_columns);
     }
 
-    /// Any light still alive → keep the animation timer armed. The cursor-
-    /// metal arm is the one non-quad member: the forge fill is VISIBLE state
-    /// (it rides `cursor_fill_override`), so the cursor must keep animating —
-    /// and re-presenting — until it has visibly cooled back to the theme fill;
-    /// it then snaps to exactly 0 and the timer disarms (idle stays zero-work).
-    /// A PENDING kill hint also arms: a reflowing TUI (Claude Code) answers
-    /// the kill via the caret fallback, which only evaluates on a ticked frame
-    /// AFTER its grace — but the app's own redraw burst ends within ~50 ms and
-    /// the screen goes idle; without this the fallback never runs and the poof
-    /// is silently lost. Bounded by [`Self::KILL_HINT_FRESH`] (0.35 s) — the
-    /// hint expires or is consumed, and the timer disarms with it. It paces
-    /// COARSELY, not at frame cadence — see [`Self::next_change_deadline`].
+    /// Any light still alive keeps the animation timer armed. The cursor metal
+    /// is the one non-quad member: the forge fill is visible
+    /// (`cursor_fill_override`), so the cursor animates until it has cooled to
+    /// the theme fill, then snaps to 0. A pending kill hint also arms: a
+    /// reflowing TUI's kill is answered by the caret fallback, which runs only
+    /// on a ticked frame after its grace, after the app's redraw burst has gone
+    /// idle. Bounded by [`Self::KILL_HINT_FRESH`] and paced coarsely
+    /// ([`Self::next_change_deadline`]).
     pub fn is_active(&self) -> bool {
         self.classic.is_active()
             || self.has_live_motion()
@@ -1855,34 +1509,27 @@ impl CursorGlow {
             // A held park is pending work: its verdict is due ≤ 0.25 s after
             // the park, and only a tick can deliver it ([`HeldPark`]).
             || (self.v2.engaged() && self.held_park.is_some())
+            // …and so is a typed lay awaiting the caret's rest ([`TornLay`]).
+            || (self.v2.engaged() && self.torn_lay.is_some())
     }
 
-    /// THE FORGE EMBER IS LIVE while the metal is visibly hot OR while the
-    /// display temperature it chases (`TEMP_ATTACK_TAU`, 1.5 s) is still
-    /// above the visibility threshold — the heating arc is a pending visible
-    /// change. Read by both wake predicates so they cannot drift: before it,
-    /// a Fire strike whose moving light died first read `cursor_temp` below
-    /// the threshold, told the host to sleep, and crossed the threshold
-    /// upward ~60 ms later with nobody to draw it (the 2026-09-14 audit).
-    /// Fire-gated: every style integrates `disp_t` (a non-Fire jump's flare
-    /// tail lasts ~1 s) but only Fire has a metal to heat; `last_style` is
-    /// the style of the tick that produced this state.
+    /// The forge ember is live while the metal is visibly hot or while the
+    /// display temperature it chases is still above the visibility threshold
+    /// (the heating arc is a pending visible change). Read by both wake
+    /// predicates so they cannot drift. Fire-gated: every style integrates
+    /// `disp_t`, but only Fire has a metal; `last_style` is the style of the
+    /// tick that produced this state.
     fn ember_live(&self) -> bool {
         self.cursor_temp > Self::FORGE_MIN_TEMP
             || (matches!(self.last_style, Some(GlowStyle::Fire))
                 && self.disp_t > Self::FORGE_MIN_TEMP)
     }
 
-    /// THE PENDING POOF WAKE — the earlier of the kill license or plain-
-    /// Backspace classifier that still needs detector service.
-    ///
-    /// WHY THIS EXISTS. Both paths need a detector tick, but they prove the
-    /// erasure differently: a kill uses its legacy row-diff/fallback license;
-    /// plain Backspace waits for an exact confirmed span. Naming only
-    /// `kill_hint` at the scheduling seams would strand the latter proof on a
-    /// quiet screen.
-    ///
-    /// One accessor, so a third licence cannot repeat the omission.
+    /// The pending poof wake: the earlier of the kill licence or the
+    /// plain-Backspace classifier that still needs detector service. Both need
+    /// a detector tick (a kill via its row-diff/fallback licence, a Backspace
+    /// via an exact confirmed span), so scheduling seams read this one
+    /// accessor.
     fn poof_hint_pending(&self) -> Option<Instant> {
         match (self.kill_hint, self.bs_poof_hint) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1890,15 +1537,11 @@ impl CursorGlow {
         }
     }
 
-    /// THE ERASE IS ALREADY ON GLASS: this frame's probe shows the caret's row
-    /// SHORTER than the row stamped at the erase key ([`Self::bs_baseline`]).
-    ///
-    /// This is the kill fallback's EARLY RELEASE from
-    /// [`Self::POOF_FALLBACK_GRACE`]; a plain Backspace shares it.
-    ///
-    /// `None` baseline (the host had no probe at the key) is deliberately NOT a
-    /// witness in either direction: it is the "was not composing" case, so the
-    /// fallback falls back to its timed grace.
+    /// The erase is already on glass: this frame's probe shows the caret's row
+    /// shorter than the row stamped at the erase key ([`Self::bs_baseline`]).
+    /// The kill fallback's early release from [`Self::POOF_FALLBACK_GRACE`];
+    /// a plain Backspace shares it. A `None` baseline (no probe at the key) is
+    /// no witness either way, so the fallback keeps its timed grace.
     fn poof_erase_witnessed(&self) -> bool {
         match (self.bs_baseline, self.row_cur_meta) {
             (Some((brow, bfill)), Some(cur)) => {
@@ -1910,25 +1553,20 @@ impl CursorGlow {
         }
     }
 
-    /// Whether any MOVING light is alive (everything is_active tracks EXCEPT
+    /// Whether any moving light is alive (everything is_active tracks except
     /// the standing forge ember and a pending kill hint).
     fn has_live_motion(&self) -> bool {
         self.needs_frame_cadence() || !self.vapor.is_empty()
     }
 
-    /// Whether live geometry changes quickly enough to require phase-locked
-    /// frame cadence. Vapor, forge ember, and kill-hint polling are deliberately
-    /// excluded: their coarse deadlines are part of the latency budget.
+    /// Whether live geometry changes fast enough to need phase-locked frame
+    /// cadence. Vapor, the forge ember and kill-hint polling are excluded:
+    /// their coarse deadlines are part of the latency budget.
     ///
-    /// The GUI scheduler consumes this exact predicate when choosing between
-    /// its phase-locked frame train and [`Self::next_change_deadline`]'s coarse
-    /// path, so a visible rainbow kitty tail cannot silently fall into
-    /// `frame cost + interval` cadence.
-    ///
-    /// A live OUTGOING style crossfade counts: its ~250 ms cosine ramp-down is
-    /// exactly the brisk-light case, and — because `is_active` reaches here via
-    /// `has_live_motion` — it also keeps the animation train ARMED across a
-    /// style switch, so something draws before the next keystroke.
+    /// The GUI scheduler uses this exact predicate to choose between its
+    /// phase-locked frame train and [`Self::next_change_deadline`]'s coarse
+    /// path. A live outgoing style crossfade counts, which also keeps the train
+    /// armed across a style switch (via `is_active` → `has_live_motion`).
     #[must_use]
     pub fn needs_frame_cadence(&self) -> bool {
         !self.sparks.is_empty()
@@ -1936,85 +1574,59 @@ impl CursorGlow {
             || !self.fire_meteors.is_empty()
             || !self.bolts.is_empty()
             || self.ring.is_some()
-            // THE CROWN'S WINDOW IS ARMED BY THE MOVE PATH FOR EVERY STYLE, so
-            // it is the one v1 term that can still hold the frame train while
-            // v2 owns the frame — every other rainbow-kitty pool (the ZOOMs,
-            // the starburst, the pops, the ring, the particles) is laid by the
-            // v1 spawn arm that SEAM POINT 1 returns before. Measured on the
-            // confirmation schedule (`under_v2_the_seam_never_paces_the_frame_
-            // train_for_v1s_crown`): 172 of 688 seam wakes were the crown's
-            // 350 ms typing window outliving the engine's 83 ms brisk light —
-            // wakes v2 never asked for. The crown is v1's head light; under v2
-            // it neither paces (here) nor paints (the emit gate).
+            // The crown's window is armed by the move path for every style, so
+            // it is the one v1 term that could hold the frame train while v2
+            // owns the frame (every other Rainbow Kitty pool is laid by the v1
+            // spawn arm seam point 1 returns before). Under v2 the crown neither
+            // paces (here) nor paints (the emit gate)
+            // (`under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown`).
             || (self.crown_until.is_some() && !self.v2.engaged())
             || !self.fading.is_empty()
-            // A live FRESH-INK pop is brisk light (its spring + ease-out move
-            // every frame): keep the phase-locked train armed until the ring
-            // drains — in practice the rainbow kitty sparks born beside every pop
-            // outlive it, but the pop's cadence must not depend on that.
-            // SEAM POINT 8 (§17.2, D14): OR in v2's three pools — stars,
-            // meteors, a live ribbon transient — which its own gate reads as
-            // `false` the instant it is not engaged (idle → zero, T6).
+            // A live fresh-ink pop is brisk light (spring and ease-out move
+            // every frame), so it keeps the train armed until the ring drains.
+            // Seam point 8 (§17.2, D14): OR in v2's pools (stars, meteors, a
+            // live ribbon transient), `false` whenever v2 is not engaged.
             || self.v2.needs_frame_cadence()
     }
 
-    /// RESPONSIVENESS: when the NEXT visible change is due, so the host can pace
-    /// the animation wake instead of pinning 60 fps for the whole effect
-    /// lifetime. Returns `None` when nothing is live (idle → the host sleeps on
-    /// `Wait`). While MOVING light animates, the full `frame_interval` (60 fps).
-    /// A PENDING kill hint with no moving light paces at a COARSE
-    /// [`Self::KILL_HINT_POLL_INTERVAL`]: the caret fallback needs only a few
-    /// ticked frames after its 0.06 s grace, not ~21 full recomposes over the
-    /// 0.35 s hint window — each of which re-takes the frame hold + the row
-    /// probe + the RepaintKey fingerprint exactly while a repaint burst contends the
-    /// term mutex. And once the only live term is the slowly-cooling FORGE
-    /// EMBER — whose colour is u8-quantized and changes imperceptibly
-    /// frame-to-frame, so the present gate already dedups the identical frames
-    /// — a COARSE poll is enough: the multi-second tail costs a handful of
-    /// cheap wakes, so a keypress never lands behind an in-flight recompose.
+    /// When the next visible change is due, so the host paces the animation
+    /// wake instead of pinning 60 fps for the effect's lifetime. `None` when
+    /// nothing is live. Moving light gets the full `frame_interval`. A pending
+    /// kill hint with no moving light paces at
+    /// [`Self::KILL_HINT_POLL_INTERVAL`] (the fallback needs only a few frames
+    /// after its grace, and full recomposes would contend the term mutex during
+    /// a repaint burst). The slowly cooling forge ember, whose u8 colour barely
+    /// changes, also polls coarsely, so a keypress never waits on a recompose.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
-        // SEAM POINT 9 (§17.2, D14): v2's next change — the earliest star
-        // death, flight end or ribbon transient — `None` the instant nothing
-        // of its is live, so it can only ever PULL a wake earlier, never hold
-        // the loop awake (T6: idle → zero).
+        // Seam point 9 (§17.2, D14): v2's next change (earliest star death,
+        // flight end or ribbon transient), `None` when nothing of v2's is live,
+        // so it can only pull a wake earlier.
         let v2_due = if self.v2.engaged() {
             self.v2.next_change_deadline(now)
         } else {
             None
         };
-        // BRISK light needs the full frame cadence. The shared predicate keeps
-        // this engine decision identical to the host scheduler's phase-lock gate.
+        // Brisk light needs the full frame cadence; the shared predicate keeps
+        // this identical to the host scheduler's phase-lock gate.
         //
-        // WHAT v1 MAY STILL PACE UNDER v2, and why each arm below is not a
-        // fall-through to a replaced mechanism: the crown is excluded by the
-        // predicate itself; the ember (`cursor_temp`) is Fire's and reads
-        // exactly `0.0` for every other style; the ring and the particles are
-        // laid only by the v1 spawn arm SEAM POINT 1 returns before. What
-        // remains is deliberately v1's: the poof hint (the erase detector's
-        // licence — the very tick that mints v2's `Kill`) and the kill smoke
-        // §5.6 keeps above stardust's erase stars. Both are coarse polls.
+        // What v1 may still pace under v2: the crown is excluded by the
+        // predicate; the ember (`cursor_temp`) is Fire's and zero elsewhere;
+        // the ring and particles come only from the v1 spawn arm seam point 1
+        // returns before. What remains is the poof hint (the erase detector's
+        // licence, whose tick mints v2's `Kill`) and the kill smoke (§5.6),
+        // both coarse polls.
         let v1_due = if self.needs_frame_cadence() {
             Some(now + frame_interval)
         } else if let Some(t) = self.poof_hint_pending() {
-            // The FIRST wake lands exactly as the fallback's grace opens (the
-            // `>=` admits a tick at hint+grace), then the coarse poll takes
-            // over — the poof fires at the caret's position AT grace-open,
-            // narrowing the moved-caret race a flat 40 ms cadence would allow.
-            // EITHER licence paces this: a plain Backspace from a quiet screen
-            // needs the wake just as much as a kill chord does (see
-            // [`Self::poof_hint_pending`]).
+            // The first wake lands as the fallback's grace opens (`>=` admits a
+            // tick at hint+grace), then the coarse poll takes over, so the poof
+            // fires at the caret's grace-open position. Either licence paces
+            // this ([`Self::poof_hint_pending`]).
             //
-            // NEVER `now` ITSELF. This read `grace_open.max(now).min(now +
-            // poll)`, which is `now` for the whole of a hint whose grace has
-            // already opened — a deadline the host arms and is woken by at
-            // once, i.e. a hot loop at render cost for the rest of the hint
-            // (≤ 0.29 s per Backspace). v1's 350 ms typing crown happened to
-            // hold the frame train across it for a one-cell retreat, so only a
-            // kill chord's 200 ms window ever exposed it; the moment v2's
-            // crown-free seam released the train it spun on every Backspace
-            // (the census loop caught it). The engine's `ARM_MIN` states the
-            // law: a deadline at `now` is a busy re-arm, not a next change.
+            // Never `now` itself: a deadline at `now` is a busy re-arm (the
+            // engine's `ARM_MIN` law), which would spin at render cost for the
+            // rest of the hint.
             let grace_open = t + Duration::from_secs_f32(Self::POOF_FALLBACK_GRACE);
             let poll = now + Self::KILL_HINT_POLL_INTERVAL;
             Some(if grace_open > now {
@@ -2023,30 +1635,22 @@ impl CursorGlow {
                 poll
             })
         } else if !self.vapor.is_empty() || self.ember_live() {
-            // The smoke-only tail joins the forge ember on the COARSE poll: a hot
-            // cursor keeps shedding 1-2 s wisps for seconds after typing stops, and
-            // each wisp drifts/grows well under a pixel per 90 ms — so pinning the
-            // full 60 fps present cadence over the whole cooling tail bought nothing
-            // but recompose+present cost. `is_active` still tracks vapor, so the
-            // window keeps ticking (and draining the smoke) — just coarsely.
+            // The smoke-only tail joins the forge ember on the coarse poll: a
+            // hot cursor sheds wisps for seconds after typing stops, each moving
+            // well under a pixel per poll. `is_active` still tracks vapor, so
+            // the window keeps ticking coarsely.
             Some(now + Self::EMBER_POLL_INTERVAL)
         } else {
             None
         };
-        // A held park schedules the tick that judges it: the flush in `tick`
-        // is strict (`> p.patience()`), so the arm lands one `ARM_MIN` past
-        // the park's OWN window rather than exactly on it. A same-row park
-        // lives for 0.25 s; a proved foreign-row park keeps custody of an
-        // in-flight press for 10 s. Scheduling the latter at 0.25 s leaves
-        // it fresh and re-arms a 1 ms timer on every tick for the remaining
-        // 9.75 s. The last unpaid press may expire sooner than the park if
-        // it was already in flight when the foreign repaint arrived; that
-        // expiry also ends custody. Never arm earlier than `now + ARM_MIN`.
-        // v2-gated: the park is v2's state and the Classic branch returns
-        // before the flush, so an ungated arm on a park stranded by a style
-        // switch would spin. Without this arm a deadline-driven host sleeps
-        // with the park held and its verdict comes at the next event, judged
-        // at the park's frozen clock.
+        // A held park schedules the tick that judges it. The flush is strict
+        // (`> p.patience()`), so the arm lands one `ARM_MIN` past the park's
+        // own window: 0.25 s for a same-row park, 10 s custody for a proved
+        // foreign-row park (arming the latter at 0.25 s would re-arm a 1 ms
+        // timer every tick). The last unpaid press may expire sooner and end
+        // custody too. Never earlier than `now + ARM_MIN`. v2-gated: the park is
+        // v2 state and the Classic branch returns before the flush, so a park
+        // stranded by a style switch would spin.
         let park_due = self.held_park.filter(|_| self.v2.engaged()).map(|p| {
             let park_expiry = p.at + p.patience() + rk::ARM_MIN;
             let credit_expiry = p.cross_row.then(|| {
@@ -2059,26 +1663,28 @@ impl CursorGlow {
                 .min(credit_expiry.unwrap_or(park_expiry))
                 .max(now + rk::ARM_MIN)
         });
-        [v1_due, v2_due, park_due].into_iter().flatten().min()
+        // A typed lay is judged when the caret has rested ([`TornLay`]).
+        let torn_due = self.torn_lay.filter(|_| self.v2.engaged()).map(|l| {
+            (l.moved_at + Duration::from_secs_f32(Self::TORN_REST_S) + rk::ARM_MIN)
+                .max(now + rk::ARM_MIN)
+        });
+        [v1_due, v2_due, park_due, torn_due]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
-    /// Wipe every piece of TRANSIENT state: the in-flight light (sparks,
-    /// particles, streaks, bursts, the whole glide-star family, meteors,
-    /// vapor, bolts, ring, crossfades), ALL input hints, the row probes, and
-    /// the rainbow kitty
-    /// tail/pop/wake machinery. The ONE teardown all three dark/reset paths
-    /// compose from — never hand-maintained lists at the call sites, which drift
-    /// and leave a disabled engine reporting live light or a stale hint alive to
-    /// fire on refocus. Everything transient clears here, unconditionally:
-    /// nothing presents while dark, a stale hint must not outlive the wipe,
-    /// and a wiped engine must report idle-zero so the host's frame train
-    /// disarms. `sound_live`, the SOUND LEDGER
-    /// ([`Self::clear_sound_ledger`]), the cursor-position tracking (`last` /
-    /// `last_visible` / `last_move`), and `ctx_alt` stay with the callers —
-    /// the four things the three paths deliberately differ on. The sound
-    /// ledger is the newest of them: a load-shed frame is dark but still
-    /// HEARD, so it must KEEP the credits an in-flight echo is about to
-    /// spend, while a master-off, reset or unfocused tick must not.
+    /// Wipe every piece of transient state: in-flight light (sparks, particles,
+    /// streaks, bursts, glide stars, meteors, vapor, bolts, ring, crossfades),
+    /// all input hints, the row probes, and the Rainbow Kitty tail/pop/wake
+    /// machinery. The one teardown all three dark/reset paths compose from, so
+    /// a disabled engine reports idle and no stale hint survives to fire on
+    /// refocus.
+    ///
+    /// Left to the callers, the four things the paths differ on: `sound_live`,
+    /// the sound ledger ([`Self::clear_sound_ledger`]; a load-shed frame is
+    /// dark but heard and keeps its credits), cursor-position tracking
+    /// (`last` / `last_visible` / `last_move`), and `ctx_alt`.
     fn clear_transient_state(&mut self) {
         self.recent_typed_run = None;
         self.park_source_intact = None;
@@ -2086,13 +1692,13 @@ impl CursorGlow {
         // A held park is judged before the teardown takes its stamp and
         // its pool: today's verdict, then the wipe.
         self.flush_held_park();
+        self.torn_lay = None;
         self.clear_visual_geometry();
         self.type_press_ring.forget();
         self.insert.orphans = None;
         self.last_committed_type = None;
-        // EVERY LICENSE TERM GOES. A teardown means the engine is dark or
-        // reset; a hint that survived it would license the first program move
-        // after the lights come back on.
+        // Every licence term goes: a surviving hint would license the first
+        // program move after the lights come back.
         self.quench_hint = None;
         self.nav_hint = None;
         self.type_hint.clear();
@@ -2104,6 +1710,7 @@ impl CursorGlow {
         self.newline_hint = None;
         self.insert.teardown();
         self.last_licensed_row = None;
+        self.hand_row = None;
         self.bs_poof_hint = None;
         self.bs_baseline = None;
         self.last_poof = None;
@@ -2127,10 +1734,9 @@ impl CursorGlow {
         self.bolts.clear();
         self.ring = None;
         self.crown_until = None;
-        // These are cached per-frame accessor planes rather than resident
-        // emitter state, but a reset can happen after a tick and before the
-        // host projects them. Clear them here so a torn snapshot cannot copy
-        // the just-invalidated frame over newer terminal content.
+        // Cached per-frame accessor planes: a reset can land between a tick
+        // and the host projecting them, so clear them to avoid copying an
+        // invalidated frame over newer content.
         self.halo_out.clear();
         self.patch_out.clear();
         self.under_out.clear();
@@ -2138,22 +1744,16 @@ impl CursorGlow {
         self.fire_halo_out.clear();
     }
 
-    /// THE KEY SEAM'S ONE LAW for every tick past the master switch: open
-    /// when this tick DREW, or when the host marked it [`GlowConfig::audible`]
-    /// (the key belongs to this window and the person asked for an aurora).
-    /// A tick that is dark only because of a motion policy, the load-shed
-    /// envelope, a degenerate grid, or the classic engine's own dark frame
-    /// is still heard. When the seam closes, the sound ledger goes with it,
-    /// and only then: a heard dark frame keeps its banked credits, so the
-    /// echoes of keys typed during it stay silent when they land.
+    /// The key seam's one law for every tick past the master switch: open when
+    /// this tick drew, or when the host marked it [`GlowConfig::audible`]. A
+    /// tick dark only from motion policy, load shed, a degenerate grid or the
+    /// classic engine's dark frame is still heard. The sound ledger clears only
+    /// when the seam closes, so a heard dark frame keeps its credits and the
+    /// echoes of keys typed during it stay silent.
     ///
-    /// Four call sites (the degenerate-grid return, the classic wake, the
-    /// zero-amplitude return, the live path) and ONE law. That is what the
-    /// `TrailSoundSeam` model's Tier-1 conformance drives on every style.
-    /// Before 2026-09-22 the classic wake returned above every writer, so its
-    /// seam was whatever the previous style left: a fresh `classic` session
-    /// never clicked, and one switched from another style kept clicking in
-    /// an unfocused window.
+    /// Four call sites (degenerate-grid return, classic wake, zero-amplitude
+    /// return, live path), one law, driven for every style by the
+    /// `TrailSoundSeam` model's Tier-1 conformance.
     fn settle_key_seam(&mut self, cfg: &GlowConfig, drew: bool) {
         let open = drew || cfg.audible;
         if !open {
@@ -2162,43 +1762,33 @@ impl CursorGlow {
         self.sound_live = open;
     }
 
-    /// UN-LATCH the dark-settled fast path (see [`Self::dark_settled`]): the
-    /// caller is about to write state the `!cfg.enabled` teardown owns — a
-    /// hint, a thermal kick, a row probe, freshly spawned light — so the next
-    /// disabled tick must run the FULL wipe once more instead of trusting the
-    /// latch. Idempotent and ~free; invoked from every externally reachable
-    /// mutation of wiped state, so the latch cannot hold a fresh candidate or
-    /// classifier cohort across a dark frame.
+    /// Un-latch the dark-settled fast path ([`Self::dark_settled`]): the caller
+    /// is about to write state the `!cfg.enabled` teardown owns (a hint, a
+    /// thermal kick, a row probe, new light), so the next disabled tick runs
+    /// the full wipe again. Called from every external mutation of wiped state.
     #[inline]
     fn unsettle(&mut self) {
         self.dark_settled = false;
     }
 
-    /// **THE CURTAIN AT A COORDINATE-SPACE SEAM** (2026-09-13, Rainbow Path
-    /// v3 §2.8, step 7; laws A2/A4, D-2, D-3): [`Self::reset`] for every
-    /// engine and hint of the space that just ended — EXCEPT that Rainbow
-    /// Kitty's ribbon is not cut. Its cohorts are drawn into the caret they
-    /// last stood under over `rk::ribbon::CURTAIN_S` (0.24 s) and spent to
-    /// exactly zero, with nothing laid until it is over
-    /// ([`rk::Engine::curtain`]); every other v2 mark — the flights and the
-    /// stars, whose px are the old space's — goes with the reset, and the
-    /// caret is learned from the next observed move. The host calls this
-    /// where it called `reset()` for the alternate screen, a tab or terminal
-    /// switch, a resize and a content invalidation; a style switch, a
-    /// teardown and serious mode still `reset()`. On glass the old law was a
-    /// one-frame cut: 15 lit cells → 0 inside 17 ms at alt-screen entry
-    /// (audit s8, the refresh's s19), 21 → 0 in one capture on a resize (s7).
-    /// For every style but rainbow kitty this IS `reset()`.
+    /// The curtain at a coordinate-space seam (laws A2/A4, D-2, D-3):
+    /// [`Self::reset`] for every engine and hint of the ended space, except
+    /// that Rainbow Kitty's ribbon is drawn into the caret it last stood under
+    /// over `rk::ribbon::CURTAIN_S` and spent to zero, with nothing laid until
+    /// it ends ([`rk::Engine::curtain`]). Other v2 marks (flights, stars, in
+    /// old-space px) go with the reset, and the caret is learned from the next
+    /// observed move. Hosts call this for alternate-screen entry, tab or
+    /// terminal switches, resizes and content invalidation; a style switch,
+    /// teardown and serious mode still `reset()`. For other styles it is
+    /// `reset()`.
     pub fn curtain(&mut self, now: Instant) {
         self.reset_space(Some(now));
     }
 
-    /// **HIDE RAINBOW KITTY'S NEXT FRAME** (Rainbow Path v3 §2.8, D-4, A4):
-    /// the viewport is showing history. Returns `true` when v2 owns the
-    /// frame and will run every clock and write nothing on the next tick —
-    /// the band is kept and reappears where its clocks say when the live
-    /// viewport returns; `false` for every other style, whose caller keeps
-    /// its own law (a `reset()` — their marks are px of the live grid).
+    /// Hide Rainbow Kitty's next frame (D-4, A4): the viewport shows history.
+    /// Returns `true` when v2 owns the frame and will run its clocks but write
+    /// nothing next tick, keeping the band for when the live viewport returns;
+    /// `false` for other styles, whose caller resets instead.
     pub fn hide_v2(&mut self) -> bool {
         if !self.v2.engaged() {
             return false;
@@ -2207,10 +1797,9 @@ impl CursorGlow {
         true
     }
 
-    /// Whether v2 owns the frame — the question a host path asks when it
-    /// must decide between KEEPING rainbow kitty's band and `reset()`-ing
-    /// every other style's marks, WITHOUT arming a one-frame hide it has no
-    /// tick to spend ([`Self::hide_v2`]'s contract; `TornBandLaw::Keep`).
+    /// Whether v2 owns the frame: for a host path deciding between keeping
+    /// Rainbow Kitty's band and resetting other styles' marks without arming a
+    /// hide it has no tick for ([`Self::hide_v2`]; `TornBandLaw::Keep`).
     #[must_use]
     pub fn v2_owns_frame(&self) -> bool {
         self.v2.engaged()
@@ -2234,46 +1823,38 @@ impl CursorGlow {
     /// [`Self::reset`]'s body; with `curtain = Some(now)` v2's ribbon takes
     /// the curtain instead of the cut ([`Self::curtain`]).
     fn reset_space(&mut self, curtain: Option<Instant>) {
-        // A layout/space transition invalidates coordinates WHOLESALE: the
-        // fade residue, the live light and pops, the row probes (a stale probe
-        // could witness a phantom cross-space "shrink"), and the hints all sit
-        // in the old space, and the thermals go with them. The keyed-click
-        // credits account for cues that just died with the layout — keeping
-        // them would mute the first echo click in the NEW coordinate space.
-        // `sound_live` is deliberately NOT cleared: the engine is still
-        // enabled and the next tick re-states it; a reset is a
-        // coordinate-space event, not a darkness one.
+        // A space transition invalidates coordinates wholesale: fade residue,
+        // live light, pops, row probes (a stale probe could witness a phantom
+        // shrink), hints and thermals. Keyed-click credits go too, or the first
+        // echo click in the new space would be muted. `sound_live` stays: a
+        // reset is a coordinate event, not darkness.
         self.unsettle();
         self.clear_transient_state();
         self.clear_sound_ledger();
         self.clear_thermals();
-        // The salvaged engine holds its OWN cursor memory and its own in-flight
-        // light, both in the coordinate space that just died — so it takes the
-        // same reset, for the same reason.
+        // The classic engine keeps its own cursor memory and light in the old
+        // space, so it resets too.
         self.classic.reset();
         self.last = None;
         self.last_visible = None;
         self.hide_bridge_shown = None;
-        // The echo-anchor row memory is coordinate-space state exactly like
-        // `last`: a stale launch column in a new space would synthesize a
-        // false anchored sweep. `print_anchor`/`print_anchor_seen` survive —
-        // they mirror the terminal's own monotonic sample, and a kept `seen`
-        // equal to the live seq means the pass idles until real new output.
+        // The echo-anchor row memory is coordinate-space state like `last`; a
+        // stale launch column would synthesize a false sweep.
+        // `print_anchor`/`print_anchor_seen` survive: they mirror the
+        // terminal's monotonic sample, so the pass idles until new output.
         self.forget_anchor_rows();
+        self.hand_row = None;
         self.wrap_paid_row = None;
         self.last_move = None;
         self.crown_window_ms = Self::CROWN_MS;
         self.ctx_alt = false;
         self.pane_columns = None;
-        // SEAM POINT 12 (§17.2, D14): a coordinate-space event drops every
-        // v2 mark, its spine and its buffered events with the rest — and the
-        // caret's seated stop, which was a reading of those marks.
-        // v2 lets go of the frame entirely: the next drawing tick engages a
-        // fresh engine, and a key struck before it lays nowhere (the engine
-        // no longer knows the caret) instead of at a cell the reset forgot
-        // the meaning of. Under a CURTAIN (`Self::curtain`) the engine keeps
-        // the frame and its ribbon eases out instead; everything else in it
-        // is reset the same way.
+        // Seam point 12 (§17.2, D14): a coordinate-space event drops every v2
+        // mark, its spine, its buffered events and the caret's seated stop. v2
+        // lets go of the frame: the next drawing tick engages a fresh engine,
+        // and a key struck before then lays nowhere. Under a curtain
+        // (`Self::curtain`) the engine keeps the frame and its ribbon eases
+        // out; everything else resets the same way.
         match curtain {
             Some(now) if self.v2.engaged() => self.v2.curtain(now),
             _ => self.v2.set_engaged(false),
@@ -2285,10 +1866,10 @@ impl CursorGlow {
         self.witness_asked.take();
     }
 
-    /// Advance one frame: observe the cursor at `cur` (`Some(row,col)` visible,
-    /// `None` hidden), spawn on a move, decay, and emit the CURRENT light quads
-    /// (grid-interior pixels) into `out`, returning a fingerprint that changes on
-    /// every visible change (0 when empty).
+    /// Advance one frame: observe the cursor at `cur` (`Some(row, col)`
+    /// visible, `None` hidden), spawn on a move, decay, and emit the current
+    /// light quads into `out`. Returns a fingerprint that changes on every
+    /// visible change (0 when empty).
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -2306,9 +1887,9 @@ impl CursorGlow {
         self.char_out.clear();
         self.fire_halo_out.clear();
         // The momentum pulse is a per-tick signal: clear it up front so the
-        // host reads only THIS tick's correlated advance (set in `spawn`).
+        // host reads only this tick's correlated advance (set in `spawn`).
         self.momentum_pulse = None;
-        // The witness's samples are THIS frame's and no other's: taken here,
+        // The witness's samples are this frame's and no other's: taken here,
         // so a tick that returns dark below cannot leave them for the next.
         let park_source = self.last.filter(|&(row, col)| {
             cur.is_some_and(|(next, _)| next != row) && self.park_source_unchanged(row, col)
@@ -2356,14 +1937,11 @@ impl CursorGlow {
         }
         let witness_n = std::mem::take(&mut self.witness_rows_n);
         let (asked, asked_n) = self.witness_asked.take();
-        // THE SEAM'S GATE (`RAINBOW-KITTY-V2.md` §17.2, §17.3 phase 7, D14):
-        // v2 IS the rainbow kitty — it owns the frame whenever the resolved
-        // style is rainbow kitty, and only on a tick that DRAWS (the master
-        // switch, a non-degenerate grid, a live amplitude), so a dark tick
-        // disengages it exactly as the teardowns below wipe the shared
-        // transient light. `set_engaged` resets on a TRANSITION only; the
-        // steady state is one cached bool, and for the other nine styles the
-        // `&&` chain ends at its first operand.
+        // The seam's gate (`RAINBOW-KITTY-V2.md` §17.2, D14): v2 owns the frame
+        // whenever the resolved style is Rainbow Kitty and this tick draws
+        // (master switch on, non-degenerate grid, live amplitude), so a dark
+        // tick disengages it. `set_engaged` resets only on a transition; for
+        // other styles the `&&` chain ends at its first operand.
         self.v2.set_engaged(
             matches!(cfg.style, GlowStyle::RainbowKitty)
                 && cfg.enabled
@@ -2378,56 +1956,37 @@ impl CursorGlow {
             // so a re-engage seats afresh instead of holding a stale hue.
             self.v2_stop = None;
         }
-        // GENUINE OFF (the master switch) or a degenerate geometry: full zero —
-        // the whole struct returns to rest (idle-zero). A momentary UNFOCUS is
-        // NOT wiped here: it arrives as `intensity <= 0` (the motion amplitude)
-        // and must not destroy minutes of earned forge momentum. That case is
-        // handled AFTER the lazy cooling below, so the metal merely COOLS by the
-        // elapsed gap and resumes on refocus.
-        // A grid with no rows or no columns is as degenerate as a zero cell
-        // size: the effects box is empty and the first star to settle would
-        // hit `clamp_to_glass` with `min > max` (the 2026-09-14 audit).
+        // Master switch off or degenerate geometry: full zero. A momentary
+        // unfocus arrives as `intensity <= 0` instead and is handled after the
+        // lazy cooling below, so earned forge momentum merely cools and resumes
+        // on refocus. A grid with no rows or columns is degenerate too (an
+        // empty effects box would give `clamp_to_glass` `min > max`).
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || geom.rows == 0 || geom.cols == 0 {
-            // Full zero includes any in-flight style crossfade: OFF means dark
-            // NOW, not a quarter-second of residue from the previous style.
+            // Full zero includes any in-flight crossfade: off means dark now.
             //
-            // THE KEY SEAM on this return depends on WHY it is taken. The
-            // MASTER SWITCH (and serious mode, which arrives as `enabled`)
-            // closes it: while the master is off a keypress records no cue,
-            // and any credit banked before the switch dies with the cues it
-            // was accounting for. A DEGENERATE GRID does not close it. That
-            // is a fact about the light's canvas, not a gate about sound, so
-            // it takes the one law every tick past the master switch takes
-            // ([`Self::settle_key_seam`]): dark, and heard exactly when the
-            // host marked it `audible`. It used to close the seam like the
-            // master switch, and `aterm ctl tone` had no name for that, so a
-            // focused window with a momentarily empty grid read
-            // `closed:engine-silent` — the alarm reserved for a regression.
+            // The key seam here depends on why the return is taken. The master
+            // switch (and serious mode, via `enabled`) closes it: keypresses
+            // record no cue and banked credits die. A degenerate grid is a fact
+            // about the light's canvas, not sound, so it takes the common law
+            // ([`Self::settle_key_seam`]): dark, and heard when `audible`.
             if cfg.enabled {
                 self.store_key_timbre(cfg);
                 self.settle_key_seam(cfg, false);
             } else {
                 self.sound_live = false;
             }
-            // LATCHED (driver-02): after one full teardown every store in the
-            // wipe pair below is already at its cleared value, and only an
-            // enabled tick, [`Self::reset`], or an [`Self::unsettle`] caller
-            // can dirty them again — each of which drops the latch. So the
-            // wipe runs ONCE per darkness, not once per frame, and a session
-            // running e.g. only sparkle words pays two tracking stores here
-            // instead of the ~60-80-store teardown. The cursor tracking stays
-            // OUTSIDE the latch on purpose: re-enabling mid-session must see
-            // the live position, or the first lit frame spawns one giant
-            // spurious comet (the cursor_trail.rs disabled-branch rationale).
+            // Latched: after one full teardown every store below is already
+            // cleared, and only an enabled tick, [`Self::reset`] or an
+            // [`Self::unsettle`] caller can dirty them (each drops the latch),
+            // so the wipe runs once per darkness. Cursor tracking stays outside
+            // the latch so re-enabling sees the live position and spawns no
+            // spurious comet.
             //
-            // The latch is set ONLY while the seam is shut. A degenerate grid
-            // the key belongs to leaves the seam open, and `cue_keystroke`
-            // writes the sound ledger without unsettling, so latching there
-            // would hold a dirty ledger past a later master-off. It runs the
-            // teardown every frame instead, which only a transient empty grid
-            // pays. The sound ledger survives it for the reason it survives a
-            // shed frame: the echoes of keys typed during it must still find
-            // their credits.
+            // The latch is set only while the seam is shut: with the seam open
+            // `cue_keystroke` writes the sound ledger without unsettling, so a
+            // degenerate grid runs the teardown every frame instead. The sound
+            // ledger survives it so keys typed meanwhile still find their
+            // credits.
             if !self.dark_settled {
                 self.clear_transient_state();
                 if !self.sound_live {
@@ -2441,38 +2000,26 @@ impl CursorGlow {
             self.hide_bridge_shown = None;
             return 0;
         }
-        // Any ENABLED tick may spawn light, bank heat, or arm hints: the next
+        // Any enabled tick may spawn light, bank heat, or arm hints: the next
         // dark frame must run one full teardown before it may latch again.
         self.dark_settled = false;
 
-        // THE CLASSIC WAKE takes the frame whole. It is the v0.28 engine, not a
-        // dressing of this one, so it runs BEFORE the modern spawn/admission/
-        // emit machinery and returns in its place — which is also the point:
-        // v0.28 spawned on observed cursor MOTION, while today's engine spawns
-        // only on a move the host has licensed AND whose shape a style's gates
-        // mint geometry from. That gate is why today's styles draw nothing at
-        // all for a screen-crossing jump (`DECLINE_OFF_SHAPE`), and routing the
-        // salvage through it would restore the old art with the old feel
-        // amputated. Nothing here reads or writes the modern engine's animation
-        // state, so no built-in style's output can move because this branch
-        // exists.
+        // The classic wake takes the frame whole. It is a separate engine that
+        // spawns on observed cursor motion, so it runs before the licensed
+        // spawn/admission/emit machinery (whose shape gates would draw nothing
+        // for a screen-crossing jump, `DECLINE_OFF_SHAPE`) and returns in its
+        // place. It touches none of this engine's animation state.
         if matches!(cfg.style, GlowStyle::Classic) {
-            // The erase licences expire only in `poof_scan`, which this
-            // branch never reaches, and the classic engine never consumes
-            // them — armed, they answered `is_active` / the 40 ms poof poll
-            // for the rest of the focused session after one Backspace or
-            // kill (a permanent wake loop; the 2026-09-14 audit). Dropped
-            // here rather than expired: keeping them alive for the 0.35 s
-            // window would still buy ~9 idle wakes per erase key for a poof
-            // this engine cannot draw.
+            // The erase licences expire only in `poof_scan`, which this branch
+            // never reaches, and the classic engine never consumes them; left
+            // armed they would keep `is_active` and the poof poll waking for the
+            // rest of the session. Dropped, since this engine cannot draw a poof.
             self.kill_hint = None;
             self.bs_poof_hint = None;
             self.bs_baseline = None;
-            // The classic wake SOUNDS (its voice is the phaser's `pew`), and
-            // its key seam obeys the one law every style obeys. The v0.28
-            // engine mints no echo cues of its own, so the key-time click is
-            // its only sound; the timbre snapshot rides the same config the
-            // modern path reads.
+            // The classic wake sounds (the phaser's `pew`) and its key seam
+            // obeys the common law. It mints no echo cues, so the key-time click
+            // is its only sound; the timbre snapshot uses the same config.
             self.store_key_timbre(cfg);
             self.settle_key_seam(cfg, cfg.intensity > 0.0);
             return self.classic.tick(cur, now, cfg, geom, out);
@@ -2485,29 +2032,21 @@ impl CursorGlow {
         // colour latch to initialize here, so navigation before the first key
         // cannot make the visible rainbow stale.
 
-        // STYLE SWITCH mid-animation: the still-in-flight sparks / particles /
-        // bolts / meteors were forged under the OLD style's geometry, colours, and
-        // heat envelope. Re-rendering them through the NEW style's emit path pops
-        // their brightness and shape-shifts the residue, so the new style NEVER
-        // inherits them — but DROPPING them outright darkens the screen until the
-        // next keystroke, re-attacks the SDR envelope off an empty stream, and
-        // disarms the animation train mid-switch. The contract is therefore a
-        // CROSSFADE: the live animated state MOVES into an [`OutgoingFade`] that keeps
-        // ticking under its SNAPSHOTTED old config — decay and drift only, never
-        // a typing-driven spawn — behind a ~250 ms cosine ramp-down, while the
-        // incoming style ramps IN over ~120 ms (`ramp_in_at` below). Typing
-        // WARMTH (heat/flare/coal/quench + the eased display temperatures)
-        // CARRIES into the incoming style so it doesn't start cold mid-typing;
-        // coordinate tracking (last / last_visible / last_move) and the input
-        // hints survive as before, so the switch spawns no phantom comet and a
-        // pending key→echo pairing still lands. Pending SOUND cues are dropped at
-        // the edge — a cue spawned under the old style must never play the new
-        // style's palette. Rapid switch chains hand each outgoing style off at
-        // the amplitude it actually reached (`OutgoingFade::level0`), capped at
-        // [`Self::FADE_CAP`] concurrent fades (oldest dropped). A pack→pack swap
-        // keeps `style == Custom`, so also fade when the live pack fingerprint
-        // disagrees — otherwise light forged under the old pack would re-render
-        // through the new pack's interpreter.
+        // Style switch mid-animation. In-flight sparks, particles, bolts and
+        // meteors were forged under the old style; re-rendering them through
+        // the new emit path would pop and reshape them, and dropping them would
+        // darken the screen and disarm the animation train. So the live state
+        // moves into an [`OutgoingFade`] that ticks under its snapshotted old
+        // config (decay and drift only) behind a ~250 ms cosine ramp-down, while
+        // the new style ramps in over ~120 ms (`ramp_in_at`).
+        //
+        // Typing warmth (heat, flare, coal, quench, eased temperatures) carries
+        // into the new style; coordinate tracking and input hints survive, so no
+        // phantom comet spawns and a pending key→echo pairing still lands.
+        // Pending sound cues are dropped at the edge. Chained switches hand off
+        // at the level reached (`OutgoingFade::level0`), capped at
+        // [`Self::FADE_CAP`]. A pack→pack swap keeps `style == Custom`, so a
+        // changed pack fingerprint also triggers the fade.
         let live_pack_fp = cfg.pack.as_ref().map_or(0, |p| p.pack_fp);
         let style_changed = self.last_style.is_some_and(|s| s != cfg.style);
         let pack_changed = self.last_style.is_some() && self.last_pack_fp != live_pack_fp;
@@ -2516,24 +2055,18 @@ impl CursorGlow {
         }
         self.last_style = Some(cfg.style);
         self.last_pack_fp = live_pack_fp;
-        // COMPARE-ON-WRITE (driver-05): `last_cfg` backs exactly one cold
-        // read — the outgoing-fade snapshot in `begin_style_fade` — yet the
-        // unconditional store moved ~0.5 KiB per enabled frame. The invariant
-        // is unchanged: after every enabled tick `last_cfg == Some(*cfg)`
-        // still holds (equal ⇒ the stored bytes already ARE this tick's
-        // values; the derive is structural), so the steady state pays a
-        // short-circuiting field compare — the `Option<TrailParams>`
-        // discriminant test skips the ~440-byte pack body whenever no pack is
-        // armed — instead of the copy. A NaN field compares unequal and
-        // simply re-stores: today's behaviour, made explicit.
+        // Compare-on-write: `last_cfg` backs one cold read (the fade snapshot
+        // in `begin_style_fade`). After every enabled tick
+        // `last_cfg == Some(*cfg)` holds; the steady state pays a
+        // short-circuiting compare (the `Option<TrailParams>` discriminant
+        // skips the pack body when none is armed) instead of a copy. A NaN
+        // field compares unequal and re-stores.
         if self.last_cfg.as_ref() != Some(cfg) {
             self.last_cfg = Some(*cfg);
         }
-        // Incoming ramp-IN (~120 ms): scale the live style's amplitude so it
-        // RISES under the outgoing fade instead of popping to full brightness.
-        // Strictly inert without a recent switch: `ramp_in_scale` returns
-        // exactly 1.0 and the caller's config reference is used untouched, so
-        // the no-switch path stays byte-identical (the golden proof).
+        // Incoming ramp-in (~120 ms): scale the live amplitude so the new style
+        // rises under the outgoing fade. Without a recent switch
+        // `ramp_in_scale` is exactly 1.0 and `cfg` is used untouched.
         let ramped_cfg;
         let cfg = {
             let scale = self.ramp_in_scale(now);
@@ -2555,12 +2088,9 @@ impl CursorGlow {
             let elapsed = now.saturating_duration_since(t0);
             let dt = elapsed.as_secs_f32();
             if dt > 0.0 {
-                // Fire cools on its own slower τ (momentum survives a short
-                // thought); every other style keeps the shipped 0.9 s. A Trail
-                // Pack may override the decay τ (custom only): `None` and every
-                // built-in (no pack) keep HEAT_DECAY_TAU byte-for-byte. Shared
-                // with the key-time click's timbre prediction via `heat_tau`,
-                // so the two cannot drift apart.
+                // Fire cools on its own slower τ; other styles use 0.9 s. A
+                // Trail Pack may override the decay τ (Custom only). Shared with
+                // the key-time click's timbre prediction via `heat_tau`.
                 let heat_tau = Self::heat_tau(cfg);
                 self.heat *= (-dt / heat_tau).exp();
                 if self.heat < 0.005 {
@@ -2570,10 +2100,10 @@ impl CursorGlow {
                 if self.flare < 0.005 {
                     self.flare = 0.0;
                 }
-                // EMBERFORGE thermal evolution (fire only; ~5 flops for others'
-                // zeros). Order matters: integrators decay first, then the eased
-                // display temperature chases the fresh target, so one tick's
-                // consumers all read one coherent temperature.
+                // Emberforge thermal evolution (fire only; others' values are
+                // zero). Integrators decay first, then the eased display
+                // temperature chases the new target, so one tick's consumers
+                // read one coherent temperature.
                 self.coal *= (-dt / Self::COAL_TAU).exp();
                 if self.coal < 0.005 {
                     self.coal = 0.0;
@@ -2594,28 +2124,24 @@ impl CursorGlow {
                 } else if rise > 0.0 {
                     Self::DISP_ATTACK_S
                 } else {
-                    // An active QUENCH accelerates the die-down (up to ~3×):
-                    // water on hot steel kills a fire fast, while a natural
-                    // pause keeps the slower cinematic release.
+                    // An active quench accelerates the die-down (up to ~3×); a
+                    // natural pause keeps the slower release.
                     Self::DISP_RELEASE_TAU / (1.0 + 2.0 * self.quench)
                 };
                 self.disp_t += rise * (1.0 - (-dt / ease).exp());
                 if self.disp_t < 0.005 {
                     self.disp_t = 0.0;
                 }
-                // The flame field's clock: integrate churn-weighted time so
-                // the fire's motion accelerates smoothly with its temperature.
-                // Wrap on a bounded ring (like `rainbow.phase`) so a multi-day
-                // session can't let f32 ULP overtake the increment (freeze) or
-                // saturate the field's `* 1024.0 as u32` cast — see FLAME_PHASE_RING.
+                // The flame field's clock integrates churn-weighted time so its
+                // motion accelerates smoothly with temperature, wrapped on
+                // `FLAME_PHASE_RING`.
                 self.flame_phase += dt * (1.6 + 2.2 * self.disp_t);
                 if self.flame_phase >= Self::FLAME_PHASE_RING {
                     self.flame_phase -= Self::FLAME_PHASE_RING;
                 }
                 if matches!(cfg.style, GlowStyle::Fire) {
                     // Cursor metal chases the display temperature with
-                    // hysteresis; the quench meter halves the cooling τ at full
-                    // (water on hot steel).
+                    // hysteresis; a full quench halves the cooling τ.
                     let temp_tau = if self.disp_t > self.cursor_temp {
                         Self::TEMP_ATTACK_TAU
                     } else {
@@ -2632,111 +2158,82 @@ impl CursorGlow {
             }
         }
         self.heat_at = Some(now);
-        // THE KEY-TIME CLICK'S TIMBRE INPUTS, written by every tick that gets
-        // past the master switch (the degenerate-grid return and the classic
-        // wake above store them through the same [`Self::store_key_timbre`])
-        // — including one that is about to return dark for a motion or
-        // performance reason, which now still sounds its keys.
-        // THE INVARIANT THIS SITE EXISTS FOR, stated exactly: both
-        // [`Self::settle_key_seam`] calls below sit BELOW this store, so the
-        // seam can never open on a stale thermal snapshot.
-        // Both are pure functions of `cfg`: `heat_gain` reads fire-ness and
-        // `pack.heat.gain`, `heat_tau` reads the style and `pack.heat.tau`,
-        // and NEITHER reads `intensity` — so the ramp shadow above (which
-        // scales `intensity` alone) cannot move them, and the value computed
-        // here is bit-identical to the one the lit path used to compute ~40
-        // lines further down. Sited directly under the lazy decay that just
-        // aged the integrators they pair with, so a cue minted after any
-        // non-master-off tick reads a COHERENT thermal snapshot rather than a
-        // `Default` zero.
+        // The key-time click's timbre inputs, written by every tick past the
+        // master switch (the degenerate-grid return and the classic wake store
+        // them through [`Self::store_key_timbre`] too), including ticks about to
+        // return dark for motion or performance reasons. Both
+        // [`Self::settle_key_seam`] calls below sit under this store, so the
+        // seam never opens on a stale snapshot. `heat_gain` and `heat_tau` are
+        // pure functions of `cfg` that ignore `intensity`, so the ramp shadow
+        // cannot move them; sited right after the lazy decay so a cue reads a
+        // coherent thermal snapshot.
         self.store_key_timbre(cfg);
 
-        // ZERO AMPLITUDE (unfocused / motion-reduced / a genuine 0 intensity):
-        // emit NO light and spawn nothing, but KEEP the long-lived thermal
-        // integrators (coal, cursor_temp, heat, flame_phase) that the lazy cooling
-        // above already aged by the elapsed gap. A momentary focus blip then costs
-        // only its own duration of cooling — the earned forge momentum survives
-        // and resumes on refocus — while a long unfocus (or a real 0 intensity)
-        // cools to EXACTLY zero over that same lazy decay, so `is_active` disarms
-        // and no perpetual wake leaks (idle-zero holds). Only `reset()` — called
-        // on a real layout/space change — wipes the momentum outright. The visible
-        // MOVING light and the transient candidate/classifier cohort are dropped
-        // (nothing presents while dark); the cursor
-        // position is tracked so refocus spawns no phantom comet.
+        // Zero amplitude (unfocused, motion-reduced, or a real 0 intensity):
+        // emit no light and spawn nothing, but keep the long-lived thermal
+        // integrators (coal, cursor_temp, heat, flame_phase) that the lazy
+        // cooling already aged. A focus blip costs only its own duration of
+        // cooling; a long unfocus cools to exactly zero, so `is_active` disarms.
+        // Only `reset()` wipes momentum. Moving light and the transient
+        // candidate/classifier cohort are dropped; cursor position is tracked so
+        // refocus spawns no phantom comet.
         if cfg.intensity <= 0.0 {
-            // The crossfade residue and the pops are MOVING light exactly like
-            // the sparks: nothing presents while dark, so an unfocus /
-            // reduced-motion blip mid-switch drops them rather than resuming
-            // them stale later. (The ramp-IN floor keeps a genuine switch off
-            // this path: a live positive intensity is never scaled to 0 by the
-            // ramp.)
+            // Crossfade residue and pops are moving light, dropped while dark
+            // (the ramp-in floor keeps a genuine switch off this path).
             //
-            // THE KEY SEAM DOES NOT CLOSE WITH THE LIGHT. Zero amplitude is
-            // dark, and dark used to mean silent — which made a load-shed
-            // frame and a `Reduce Motion` session mute every keystroke, a
-            // MOTION/PERFORMANCE policy deleting an AUDIO feature for a click
-            // that costs no GPU. So the seam now asks [`GlowConfig::audible`]
-            // instead: dark for a motion or performance reason is still
-            // HEARD, dark because the key belongs to another window is not.
-            // The light's behaviour on this path is unchanged in every other
-            // respect. NOTE: no `clear_thermals` here — the lazy decay above
-            // already cooled the long-lived integrators by the elapsed gap,
-            // which is the whole focus-blip contract this branch guards.
-            //
-            // The SOUND ledger is transient state the audio half owns, so it
-            // goes only when the seam goes ([`Self::settle_key_seam`]): wiping
-            // the banked key credits on every shed frame would double-click
-            // the whole burst the moment the latch flapped back to lit (the
-            // in-flight echoes would find no credit to spend). An unfocused
-            // tick keeps today's wipe.
+            // The key seam does not close with the light: it asks
+            // [`GlowConfig::audible`], so dark for a motion or performance
+            // reason is still heard, while dark because the key belongs to
+            // another window is not. No `clear_thermals` here: the lazy decay
+            // already cooled the integrators. The sound ledger goes only when
+            // the seam goes ([`Self::settle_key_seam`]); wiping credits on every
+            // shed frame would double-click the burst when the frame relit.
             self.settle_key_seam(cfg, false);
             self.clear_transient_state();
             self.track_shown_caret(cur, now);
             return 0;
         }
-        // Past both dark returns: this tick DRAWS, so the key seam is open.
-        // Only the MASTER-OFF return shuts it unconditionally (it is the
-        // `cursor_trail = false` / serious-mode case the user asked for);
-        // every other return — a degenerate grid, the classic wake, zero
-        // amplitude — asks `cfg.audible` through the same
-        // [`Self::settle_key_seam`], so a shed or motion-reduced frame is dark
-        // but heard. The thermal constants this click reads are written
-        // above, at the end of the lazy decay, so every tick past the master
-        // switch leaves them fresh.
+        // Past both dark returns this tick draws, so the key seam is open. Only
+        // the master-off return shuts it unconditionally; the degenerate grid,
+        // classic wake and zero amplitude ask `cfg.audible` through
+        // [`Self::settle_key_seam`]. The timbre constants were stored above.
         self.settle_key_seam(cfg, true);
 
         self.expire_seam_holds(now);
+        // A scroll that left the hand's row in doubt is settled by the caret
+        // before anything this frame reads the row ([`HandRow::settle`]).
+        if let (Some(hand), Some((caret_row, _))) = (self.hand_row.as_mut(), cur) {
+            hand.settle(caret_row);
+        }
         // Spawn on a real move between two visible positions — where "visible"
-        // BRIDGES ConPTY's per-echo hide window ([`Self::hidden_bridge_source`]).
+        // bridges ConPTY's per-echo hide window ([`Self::hidden_bridge_source`]).
         let spawn_from = self
             .last
             .or_else(|| self.hidden_bridge_source(cur, now, cfg, geom));
         self.judge_observed_caret(spawn_from, cur, now, cfg, geom);
         self.carried_key_move = None;
-        // The hidden/parked-caret echo lane: when the DEC cursor cannot
-        // witness the keystroke's echo (hidden across frames, or parked on a
-        // different row), the host-fed print anchor is the mutation site of
-        // the licensed move. Runs AFTER the move lane so a visible cursor
-        // move always owns its own tick.
+        // The hidden/parked-caret echo lane: when the cursor cannot witness the
+        // echo (hidden across frames, or parked on another row), the host-fed
+        // print anchor is the licensed move's mutation site. Runs after the
+        // move lane so a visible move owns its own tick.
         let cursor_move_observed = spawn_from
             .zip(cur)
             .is_some_and(|((pr, pc), (cr, cc))| pr != cr || pc != cc);
         // The paid pending-wrap witness is read by the fold judged above and
-        // consumed by ANY observed caret move (the fold, a Backspace, a
-        // relocation): it names the caret parked on the paid cell.
+        // consumed by any observed caret move.
         if cur.is_some() && cur != self.last_visible.map(|(cell, _)| cell) {
             self.wrap_paid_row = None;
         }
         let content_echo = self.same_caret_typed_echo(cur, cursor_move_observed, now, cfg, geom);
         self.echo_anchor_pass(cur, cursor_move_observed || content_echo, now, cfg, geom);
         self.track_shown_caret(cur, now);
+        self.settle_torn_lay(cur, now);
 
-        // ERASE POOF detection: a fresh kill-key hint paired with a same-row NET
-        // SHRINK of the probed row content (stable surviving prefix + suffix)
-        // puffs smoke off the exact vanished span — before the decay/emit passes
-        // below so the puffs join THIS frame's emit. Runs off the host-fed row
-        // probe ([`Self::observe_row`]); hosts that never probe or never arm the
-        // kill hint take two `Option` reads and are otherwise byte-identical.
+        // Erase poof detection: a fresh kill hint paired with a same-row net
+        // shrink of the probed row (stable prefix and suffix) puffs smoke off
+        // the vanished span, before decay/emit so the puffs join this frame.
+        // Runs off the host row probe ([`Self::observe_row`]); hosts that never
+        // probe or arm the hint pay two `Option` reads.
         self.poof_scan(now, cfg, geom);
 
         self.sparks.retain(|s| Self::spark_resident_at(now, s));
@@ -2751,10 +2248,9 @@ impl CursorGlow {
             .retain(|m| now.saturating_duration_since(m.born).as_secs_f32() < m.life);
         self.vapor
             .retain(|v| now.saturating_duration_since(v.born).as_secs_f32() < v.life);
-        // A HOT cursor SMOKES: while the metal is above SMOKE_TEMP, wisps
-        // shed off its top edge at a temperature-scaled rate (hotter = denser
-        // smoke), each with its own drift/waft/life. Ceases as it cools —
-        // vapor drains and the idle-zero law holds.
+        // A hot cursor smokes: above `SMOKE_TEMP`, wisps shed off its top edge
+        // at a temperature-scaled rate, each with its own drift and life. Stops
+        // as it cools, so vapor drains to idle.
         if matches!(cfg.style, GlowStyle::Fire)
             && self.cursor_temp > Self::SMOKE_TEMP
             && let Some((cr, cc)) = cur
@@ -2782,12 +2278,10 @@ impl CursorGlow {
                 self.last_smoke = Some(now);
             }
         }
-        // ARRIVAL-TIME STRIKE: the eruption fires when the meteor head lands
-        // (not at launch) — flare, landing ring, and the ember debris fountain
-        // all happen where and when the streak's tail drains in. Deferring the
-        // fountain to the strike (along the FINAL vector) also makes it immune
-        // to shell repaint choreography: a retargeted meteor strews its debris
-        // along the coalesced path, never along a parked intermediate hop.
+        // Arrival-time strike: flare, landing ring and ember fountain fire when
+        // the meteor head lands. The fountain follows the final vector, so a
+        // retargeted meteor strews debris along the coalesced path, never an
+        // intermediate repaint hop.
         let mut struck: Option<Meteor> = None;
         for m in &mut self.fire_meteors {
             if !m.arrived
@@ -2843,29 +2337,22 @@ impl CursorGlow {
         }
         let mut halos = std::mem::take(&mut self.halo_out);
         let mut patches = std::mem::take(&mut self.patch_out);
-        // `under_out` (the glow_under stream, composited BENEATH the glyph ink)
-        // carries the rainbow ribbon body + jump ZOOMs and Water's fluid wake,
-        // so letters draw OVER those broad marks at full contrast. (The fire's
-        // flame body left this stream for the per-pixel `patch_out` field; the
-        // stream itself — pipeline splice, both renderers' under pass, fp fold
-        // — stayed live.)
+        // `under_out` (the glow_under stream, composited beneath glyph ink)
+        // carries the rainbow ribbon body, jump zooms and Water's fluid wake, so
+        // letters draw over those broad marks at full contrast.
         let mut under = std::mem::take(&mut self.under_out);
         let mut charred = std::mem::take(&mut self.char_out);
         let mut halo_cells = std::mem::take(&mut self.fire_halo_out);
         let mut engulf = std::mem::take(&mut self.engulf_scratch);
-        // Bolts FIRST: on a monster jump the fat beam alone can saturate the quad
-        // budget, and the lightning is the star — truncation must shed beam haze,
-        // never a strike.
-        // Lightning strikes (Laser only): reuse the resident bolt scratch via the
-        // same mem::take idiom as the halo/patch/under/char/engulf scratches above.
+        // Bolts first: on a huge jump the beam alone can fill the quad budget,
+        // and truncation must shed beam haze, never a strike. Lightning (Laser
+        // only) reuses the resident bolt scratch via `mem::take`.
         let mut bolt_verts = std::mem::take(&mut self.bolt_verts);
-        // ONE branch: a resolved Trail Pack drives the DATA interpreter; every
-        // built-in falls to the UNCHANGED emit sequence below. Because the whole
-        // sequence is wrapped, NO built-in emitter gains a `cfg.pack` read — the
-        // additivity mandate ("no builtin tick path branches on pack state") holds
-        // structurally, and the shared tail (MAX_QUADS/MAX_HALOS truncation + the
-        // fingerprint fold) runs identically for both. `cfg.pack` is only ever
-        // `Some` when `style == GlowStyle::Custom` (the resolver's contract).
+        // One branch: a resolved Trail Pack drives the data interpreter; every
+        // built-in takes the emit sequence below. No built-in emitter reads
+        // `cfg.pack`, and the shared tail (MAX_QUADS/MAX_HALOS truncation and
+        // the fingerprint fold) runs for both. `cfg.pack` is `Some` only when
+        // `style == GlowStyle::Custom`.
         if let Some(p) = cfg.pack.as_ref() {
             self.emit_custom(now, cfg, geom, cur, out, &mut halos, p);
             out.truncate(Self::MAX_QUADS);
@@ -2875,13 +2362,10 @@ impl CursorGlow {
             // emits source-over veil halos instead of additive quads.
             self.emit_comet(now, cfg, geom, cur, out, &mut halos);
             out.truncate(Self::MAX_QUADS);
-            // The per-pixel fire (Fire only): FirePatches render at the under-ink
-            // seam (P6 — letters read as silhouettes inside the volume) through the
-            // shared byte-exact integer field. NOT gated on the GlowQuad budget — the
-            // flame writes the SEPARATE patch/halo streams (each self-capped inside
-            // `emit_flames`), so the old `out.len() < MAX_QUADS` gate could only ever
-            // drop the whole flame body for a frame if a foreign emitter had already
-            // saturated `out`.
+            // Per-pixel fire (Fire only): FirePatches render at the under-ink
+            // seam through the shared byte-exact integer field. Not gated on
+            // the GlowQuad budget: the flame writes the separate patch/halo
+            // streams, each self-capped in `emit_flames`.
             self.emit_flames(
                 now,
                 cfg,
@@ -2901,26 +2385,18 @@ impl CursorGlow {
                 self.emit_water(now, cfg, geom, cur, &mut under);
             }
             if self.v2.engaged() {
-                // SEAM POINT 3 (§17.2, D14): v2 owns the rainbow's whole emit
-                // phase — the ZOOMs, the starburst, the ribbon and its
-                // starfield, the fresh-ink light and glyph tint, the wake — in
-                // ONE call at the SAME position (after fire / water, before
-                // crown / forge / ring / particles / vapor), writing into the
-                // SAME `under` / `out` / `halos` scratch, so the §3.4 ledger
-                // below prices its output exactly as it prices v1's.
-                // `Config::from_glow` is a seven-field copy, not a resolution;
-                // the beams scratch and the cue sink are resident (§18: zero
-                // allocation per frame). `rainbow_exit_swoosh` above stays
-                // v1-only — v2's ribbon owns its own ending.
-                // §18's "zero allocation per frame", made true for the streams
-                // the host lends v2. Its peaks are STATE-dependent — a hot
-                // meteor's coma beside a full sky is a later frame than a
-                // cold one's — so a scratch grown on demand can still grow on
-                // a steady tick long after warm-up (measured: the 17th halo of
-                // a burst, 768 bytes, on tick 314 of a settled session). The
-                // streams are sized to their caps ONCE, on the first engaged
-                // frame, exactly as the engine sizes its own pools; every
-                // later frame is a capacity compare.
+                // Seam point 3 (§17.2, D14): v2 owns the rainbow's whole emit
+                // phase (zooms, starburst, ribbon and starfield, fresh-ink light
+                // and glyph tint, the wake) in one call at the same position
+                // (after fire/water, before crown/forge/ring/particles/vapor),
+                // into the same `under` / `out` / `halos` scratch.
+                // `Config::from_glow` is a field copy; the beams scratch and cue
+                // sink are resident. `rainbow_exit_swoosh` stays v1-only.
+                //
+                // §18's zero allocation per frame for the lent streams: their
+                // peaks are state-dependent, so an on-demand scratch could still
+                // grow long after warm-up. They are sized to their caps once, on
+                // the first engaged frame; later frames pay a capacity compare.
                 Self::reserve_v2_scratch(&mut under, out, &mut halos);
                 if self.v2_beams.capacity() < Self::V2_BEAM_SCRATCH {
                     self.v2_beams.reserve(Self::V2_BEAM_SCRATCH);
@@ -2929,26 +2405,14 @@ impl CursorGlow {
                     self.v2_cues.reserve(Self::V2_CUE_SCRATCH);
                 }
                 let v2_cfg = rk::Config::from_glow(cfg, self.reduced_motion);
-                // THE FOLLOW PASS (2026-09-21, the band follows its text):
-                // BEFORE the tick replays this frame's events, the engine
-                // reads the rows the host sampled under its lock and carries
-                // every run whose text moved a row up or down — a
-                // bottom-anchored composer growing without a scroll — to
-                // the row its glyphs now stand on, with every clock intact
-                // (`rk::Engine::follow_rows`). The same samples feed the
-                // witness after the tick, below.
+                // The follow pass: before the tick replays this frame's events,
+                // the engine reads the rows the host sampled under its lock and
+                // carries every run whose text moved a row (a bottom-anchored
+                // composer growing without a scroll) to its glyphs' new row, with
+                // clocks intact (`rk::Engine::follow_rows`). The same samples
+                // feed the witness after the tick.
                 if witness_n > 0 {
-                    let mut samples = [rk::witness::RowSample {
-                        row: u16::MAX,
-                        cols: &[],
-                    }; CURSOR_WITNESS_ROWS];
-                    let n = witness_n.min(samples.len()).min(self.witness_rows.len());
-                    for (sample, slot) in samples.iter_mut().zip(&self.witness_rows[..n]) {
-                        *sample = rk::witness::RowSample {
-                            row: slot.row,
-                            cols: &slot.cols,
-                        };
-                    }
+                    let (samples, n) = witness_samples(&self.witness_rows, witness_n);
                     let park = self.held_park.filter(|p| !p.cross_row && p.fresh(now));
                     let pair = park.map(|p| ((p.row, p.origin), (p.landing_row, p.landing)));
                     let (_, proved) =
@@ -2970,66 +2434,49 @@ impl CursorGlow {
                 };
                 self.v2.tick(now, geom, &v2_cfg, &mut frame);
                 self.v2_caret = frame.caret;
-                // SEAM POINT 11 (§17.2): the frame's cues join the one backlog
-                // the host drains, under v1's own refusal — a full backlog
-                // drops the newest, exactly as `cue_sound` does — so a host
-                // that never drains (a harness, a wedged worker) sees the
-                // same bound v1 gives it, and the resident sink keeps the
-                // steady frame allocation-free (§18).
+                // Read the walk of the typed run this frame began off the cells
+                // just laid (§46), for a revive after a rest.
+                self.read_fresh_run_origin(now);
+                // Seam point 11 (§17.2): the frame's cues join the host's one
+                // backlog under the same refusal as `cue_sound` (a full backlog
+                // drops the newest), so a non-draining host sees a bound and the
+                // steady frame allocates nothing (§18).
                 for cue in self.v2_cues.drain(..) {
                     if self.sound_cues.len() < Self::MAX_SOUND_CUES {
                         self.sound_cues.push(cue);
                     }
                 }
-                // THE CARET'S STOP IS SEATED HERE, on the seam's own tick and
-                // only on an event the caret can see: its CELL moved (a key,
-                // a jump, an Enter, a backspace — the frame's `Move` is
-                // ingested above, so `field_t` is this frame's answer at the
-                // new cell), or the cell under it owns field light (a lay at
-                // the caret, an erase onto a lit cell). Every other tick
-                // HOLDS the seat; see [`Self::rainbow_head_rgb`] for the
-                // measured pop this closes. `field_at` is O(1) in columns
-                // (§18), so a steady frame pays one lane lookup.
+                // The caret's stop is seated here, only on an event the caret
+                // can see: its cell moved (the frame's `Move` is already
+                // ingested, so `field_t` is this frame's answer at the new cell),
+                // or the cell under it owns field light. Otherwise the seat is
+                // held ([`Self::rainbow_head_rgb`]). `field_at` is O(1) in
+                // columns.
                 let owns_light = cur.is_some_and(|(r, c)| self.v2.field_at(r, c).is_some());
                 if owns_light || self.v2_stop.is_none_or(|(_, at)| at != cur) {
                     self.v2_stop = Some((self.v2_caret.field_t, cur));
                 }
-                // THE CONTENT WITNESS (2026-09-12, the abandoned band): after
-                // the tick that laid this frame's cells, read every resident
-                // cell against the grid rows the host sampled under its lock
-                // — the batch already applied, so a prompt redraw that put
-                // the same text back is seen as the same text (D2) — and
-                // retire, on the fast melt, the cells whose glyph has changed
-                // or gone (`rk::witness`). The ribbon is an absolute-cell
-                // record of the keys; this is the one place it learns that
-                // the text it was laid under has moved.
+                // The content witness: after the tick that laid this frame's
+                // cells, read every resident cell against the rows the host
+                // sampled under its lock (with the batch applied, so a redraw
+                // restoring the same text is the same text, D2) and retire on
+                // the fast melt the cells whose glyph changed or went
+                // (`rk::witness`). This is where the absolute-cell ribbon
+                // learns its text has moved.
                 if witness_n > 0 {
-                    let mut samples = [rk::witness::RowSample {
-                        row: u16::MAX,
-                        cols: &[],
-                    }; CURSOR_WITNESS_ROWS];
-                    let n = witness_n.min(samples.len()).min(self.witness_rows.len());
-                    for (sample, slot) in samples.iter_mut().zip(&self.witness_rows[..n]) {
-                        *sample = rk::witness::RowSample {
-                            row: slot.row,
-                            cols: &slot.cols,
-                        };
-                    }
+                    let (samples, n) = witness_samples(&self.witness_rows, witness_n);
                     self.v2.witness_rows(&samples[..n], now);
                 }
             } else {
-                // THE CROWN IS THE OTHER NINE STYLES' HEAD LIGHT: pure RADIAL
-                // light (RainHalo), no GlowQuad budget to guard, its own
-                // MAX_HALOS cap bounds it. v2 owns the rainbow kitty's head
-                // (§7.1's caret seam, the ribbon's nozzle) and lists the crown
-                // among the layers its one call precedes, not among the ones
-                // it keeps — so it neither paints nor paces
-                // ([`Self::needs_frame_cadence`]) while v2 owns the frame.
+                // The crown is the other styles' head light: radial light
+                // (RainHalo) capped by MAX_HALOS. v2 owns Rainbow Kitty's head
+                // (§7.1's caret seam, the ribbon's nozzle), so while v2 owns the
+                // frame the crown neither paints nor paces
+                // ([`Self::needs_frame_cadence`]).
                 self.emit_crown(now, cfg, geom, cur, &mut halos);
             }
-            // The forge dressing rides `cursor_temp`, NOT the crown's last-move
-            // window, so it must run whether or not a crown is live (fixes the
-            // hard-pop at window expiry / the per-keystroke blink at slow typing).
+            // The forge dressing rides `cursor_temp`, not the crown's window,
+            // so it runs whether or not a crown is live.
             if out.len() < Self::MAX_QUADS {
                 self.emit_forge_cursor(cfg, geom, cur, out, &mut halos);
             }
@@ -3041,9 +2488,8 @@ impl CursorGlow {
             }
             self.emit_vapor(now, cfg, geom, &mut halos);
             self.bolt_verts = bolt_verts;
-            // THE HALO CAP (§18): every style's streams are self-capped at
-            // the emitter (v2's by construction; §3.4's ledger died with v1),
-            // so the only shared pass left is the halo count.
+            // The halo cap (§18): every style's streams are self-capped at the
+            // emitter, so the only shared pass left is the halo count.
             Self::cap_and_clear_v2_streams(&mut halos);
         } // end built-in emit branch (the custom interpreter above is the other arm)
         self.halo_out = halos;
@@ -3053,16 +2499,14 @@ impl CursorGlow {
         self.fire_halo_out = halo_cells;
         self.engulf_scratch = engulf;
 
-        // OUTGOING style crossfades: tick each moved-out animator under its
-        // snapshotted OLD config behind the cosine ramp-down and merge its
-        // light into THIS frame's streams (additive premultiplied light is
-        // order-independent, so merge order can't change the composite).
-        // Provably inert when no switch happened — the list is empty and this
-        // is one `is_empty` test. Runs BEFORE the shared truncation + fp fold
-        // below, so caps and fingerprints see ONE merged frame: the glow
-        // stream never goes empty mid-switch (the renderer's SDR attack
-        // envelope keeps its sustain instead of re-attacking — the switch
-        // strobe), and the changing fade bytes keep the present train fed.
+        // Outgoing crossfades: tick each moved-out animator under its old config
+        // behind the cosine ramp-down and merge its light into this frame's
+        // streams (additive premultiplied light is order-independent). One
+        // `is_empty` test when no switch happened. Runs before the shared
+        // truncation and fp fold, so caps and fingerprints see one merged frame:
+        // the glow stream never goes empty mid-switch (the SDR attack envelope
+        // keeps its sustain) and the changing fade bytes keep the present train
+        // fed.
         self.tick_fades(now, geom, out);
 
         // Bound the snapshot identically for both renderers.
@@ -3071,9 +2515,8 @@ impl CursorGlow {
         }
         self.under_out.truncate(Self::MAX_QUADS);
 
-        // Radial halos are part of the visible frame exactly like the quads;
-        // bound them identically for both backends before fingerprinting the
-        // exact payload of every plane.
+        // Radial halos are part of the visible frame like the quads: bound them
+        // the same way for both backends before fingerprinting every plane.
         self.halo_out.truncate(Self::MAX_HALOS);
         let mut fp = FrameFingerprint::default();
         fp.glow_quads(FrameFingerprint::GLOW_OUT, out);
@@ -3083,14 +2526,11 @@ impl CursorGlow {
         fp.fire_halos(&self.fire_halo_out);
         fp.rain_halos(&self.halo_out);
 
-        // The FORGE cursor fill is visible frame state (it rides the host's
-        // `cursor_fill_override`), so fold it in WHILE THE METAL IS CHANGING —
-        // a heating/cooling cursor keeps presenting until the fill's quantized
-        // colour settles. At REST the fill is a CONSTANT dull ember (forge_fill
-        // never returns None now), which needs no per-frame fp churn: it rides
-        // cursor_fill_override and stays drawn, so we do NOT fold it and the
-        // idle fingerprint returns to 0 (idle-zero preserved). Fire-gated so
-        // other styles' fingerprints are byte-identical to before.
+        // The forge cursor fill is visible state (`cursor_fill_override`), so
+        // fold it in while the metal is changing, until its quantized colour
+        // settles. At rest the fill is a constant dull ember that stays drawn,
+        // so it is not folded and the idle fingerprint returns to 0.
+        // Fire-gated.
         if matches!(cfg.style, GlowStyle::Fire)
             && self.cursor_temp > Self::FORGE_MIN_TEMP
             && let Some(fill) = self.forge_fill()
@@ -3100,74 +2540,59 @@ impl CursorGlow {
         fp.finish()
     }
 
-    // ----- style crossfade (the STYLE SWITCH contract in `tick`) -----
+    // ----- style crossfade (the style-switch contract in `tick`) -----
 
-    /// Outgoing ramp-DOWN length. Long enough that the eye reads a handoff
-    /// (and comfortably overlaps the ~120 ms ramp-IN, so the switch never
-    /// shows a trough), short enough that three rapid switches in a row stay
-    /// legible under the [`Self::FADE_CAP`]-bounded fade list. Cosine-eased in
-    /// `tick_fades` — it lands at exactly 0 (no exp-tau tail to babysit) and
-    /// its zero-slope start blends into the old style's own exp-tau decays
-    /// without a corner.
+    /// Outgoing ramp-down length: long enough to read as a handoff and overlap
+    /// the ramp-in without a trough, short enough that rapid switches stay
+    /// legible under [`Self::FADE_CAP`]. Cosine-eased in `tick_fades`, landing
+    /// at exactly 0, with a zero-slope start that blends into the old style's
+    /// own decays.
     const FADE_OUT_S: f32 = 0.25;
-    /// Incoming ramp-IN length: the same ~120 ms attack family as the eased
-    /// display temperatures (`DISP_ATTACK_S`), so the new style swells the way
-    /// everything else in this engine does — quickly, but never as a pop.
+    /// Incoming ramp-in length: the same attack family as the eased display
+    /// temperatures (`DISP_ATTACK_S`), so the new style swells rather than pops.
     const RAMP_IN_S: f32 = 0.12;
-    /// The ramp-IN's starting amplitude. Nonzero for two reasons: a dead-zero
-    /// first frame would trip `tick`'s `intensity <= 0` full-wipe path (which
-    /// must stay reserved for a GENUINE unfocus/reduced-motion zero), and the
-    /// incoming style showing a faint immediate presence is what makes the
-    /// handoff read as a crossfade rather than fade-out-then-in.
+    /// The ramp-in's starting amplitude. Nonzero because a zero first frame
+    /// would take `tick`'s `intensity <= 0` path (reserved for a genuine zero),
+    /// and a faint immediate presence makes the handoff read as a crossfade.
     const RAMP_IN_FLOOR: f32 = 0.15;
-    /// Concurrent outgoing fades. Two is enough for the product gesture
-    /// ("quickly select multiple trails in a sequence"): with a 250 ms
-    /// envelope, a third overlapping switch means the oldest fade is already
-    /// nearly dark — dropping it is invisible, and the bound keeps a
-    /// scroll-wheel spin through the style menu O(1).
+    /// Concurrent outgoing fades. With a 250 ms envelope a third overlapping
+    /// switch finds the oldest fade nearly dark, so dropping it is invisible,
+    /// and a scroll-wheel spin through the style menu stays O(1).
     const FADE_CAP: usize = 2;
 
-    /// Begin an outgoing crossfade for the style that was live UNTIL this tick:
-    /// MOVE the in-flight animated collections (the forged light itself) into a
-    /// boxed ghost animator, COPY the thermal/phase scalars it needs to keep
-    /// rendering that light at its earned warmth, and leave the live engine's
-    /// own warmth in place (the carry-over: the incoming style must not start
-    /// cold mid-typing). Called from `tick` the instant the style/pack guard
-    /// disagrees; the caller has NOT yet overwritten `last_style`/`last_cfg`,
-    /// so both still describe the outgoing style.
+    /// Begin an outgoing crossfade for the style live until this tick: move the
+    /// in-flight collections into a boxed ghost animator, copy the thermal and
+    /// phase scalars it needs, and leave the live engine's warmth in place so
+    /// the incoming style does not start cold. Called from `tick` when the
+    /// style/pack guard disagrees, before `last_style`/`last_cfg` are
+    /// overwritten.
     fn begin_style_fade(&mut self, now: Instant) {
-        // The outgoing style hands off at the amplitude it actually held: if it
-        // was itself still ramping in (a rapid switch chain), its fade starts
-        // from that partial level instead of popping back up to full. Read
-        // BEFORE re-arming the ramp for the incoming style below.
+        // The outgoing style hands off at the amplitude it held (a partial
+        // ramp-in during a rapid switch chain). Read before re-arming the ramp.
         let level0 = self.ramp_in_scale(now);
         self.ramp_in_at = Some(now);
-        // A cue spawned under the old style must never play the new style's
-        // palette (the host maps cues → sounds by the CURRENT style when it
-        // drains, after this tick): drop the pending backlog at the edge.
+        // A cue spawned under the old style must not play the new style's
+        // palette (the host maps cues by the current style), so drop the
+        // backlog.
         self.sound_cues.clear();
-        // The credits are the ledger for exactly those dropped cues. Left
-        // standing, they would silence the first echo clicks under the NEW
-        // style for a key whose click was never actually played.
+        // The credits account for exactly those dropped cues; left standing
+        // they would silence echo clicks whose key click never played.
         self.clear_keyed_clicks();
         let Some(cfg) = self.last_cfg else {
-            // Unreachable in practice (the switch guard requires a prior tick,
-            // which recorded its config) — but a missing snapshot must mean "no
-            // residue", never a fade under the WRONG config.
+            // A switch requires a prior tick, which recorded its config; a
+            // missing snapshot means no residue, never a fade under the wrong
+            // config.
             return;
         };
         let mut ghost = Box::<CursorGlow>::default();
-        // MOVE the forged light: the ghost owns it now; the live engine starts
+        // Move the forged light: the ghost owns it now; the live engine starts
         // the incoming style with empty collections (plus carried warmth).
         ghost.sparks = std::mem::take(&mut self.sparks);
         ghost.particles = std::mem::take(&mut self.particles);
-        // The landing starburst is forged light like the ZOOM streak: it finishes
-        // its bloom under the OUTGOING (rainbow) config in the ghost — the
-        // incoming style never births one, so re-judging it there would hard-cut
-        // it mid-bloom.
-        // A fast glide's streak IS a `rainbow.jumps` entry since step 13, so it
-        // is handed to the ghost by the line above with every other ZOOM — one
-        // mark, one crossfade rule. Only the velocity spine still needs saying.
+        // The landing starburst is forged light like the zoom streak and
+        // finishes its bloom in the ghost. A fast glide's streak is a
+        // `rainbow.jumps` entry and moves with the other zooms; only the
+        // velocity spine needs handling here.
         ghost.fire_meteors = std::mem::take(&mut self.fire_meteors);
         ghost.vapor = std::mem::take(&mut self.vapor);
         ghost.bolts = std::mem::take(&mut self.bolts);
@@ -3176,16 +2601,12 @@ impl CursorGlow {
         ghost.crown_window_ms = self.crown_window_ms;
         ghost.last_move = self.last_move;
         ghost.last_smoke = self.last_smoke.take();
-        // Fresh-ink pops are forged light exactly like the sparks: they finish
-        // fading under the OUTGOING (rainbow) config in the ghost — re-judging
-        // them under the incoming style would either drop them mid-pop (a hard
-        // cut) or render them through a style that never births pops.
+        // Fresh-ink pops finish fading in the ghost under the outgoing config,
+        // like the sparks.
         ghost.reduced_motion = self.reduced_motion;
-        // COPY the thermal/phase scalars: the residue keeps rendering at the
-        // warmth it was forged with, while the live engine KEEPS heat / flare /
-        // coal / quench and the eased display temperatures too — that carried
-        // warmth is what the incoming style's emitters read on their first
-        // frame, so mid-typing switches arrive already glowing.
+        // Copy the thermal and phase scalars: the residue renders at the warmth
+        // it was forged with, and the live engine keeps its own, so mid-typing
+        // switches arrive already glowing.
         ghost.heat = self.heat;
         ghost.heat_at = self.heat_at;
         ghost.flare = self.flare;
@@ -3194,39 +2615,32 @@ impl CursorGlow {
         ghost.disp_t = self.disp_t;
         ghost.cursor_temp = self.cursor_temp;
         ghost.flame_phase = self.flame_phase;
-        // The canonical metric is carried warmth exactly like `heat`: the
-        // ghost's frozen copy keeps its residue rendering at the momentum it
-        // was forged with, and the LIVE engine keeps its own copy so a
-        // mid-typing switch into rainbow kitty re-attacks the spine toward the earned
-        // value instead of restarting the earn from zero.
+        // The typing metric is carried warmth like `heat`: the ghost's copy
+        // keeps the residue at its momentum, and the live engine keeps its own
+        // so a switch into Rainbow Kitty re-attacks toward the earned value.
         ghost.momentum = self.momentum;
-        // The living-flow surface carries across the fork and is NOT restarted
-        // below with the style phases: the ghost's residue is the same light
-        // this frame drew, so its swells have to be where they already were —
-        // a fresh `0` would print the switch as a jump in the fading mark. It
-        // is not a style phase at all (see [`RainbowState::flow`]): it is a
-        // constant-rate surface clock the incoming style simply inherits.
+        // The living-flow surface carries across the fork and is not restarted
+        // with the style phases: the ghost draws the same light as this frame,
+        // so its swells must stay put. It is a constant-rate surface clock
+        // ([`RainbowState::flow`]) the incoming style inherits.
         ghost.hue = self.hue;
         ghost.rng = self.rng;
-        // The ghost's anchor: `tick_fades` feeds this SAME cell as `cur`
-        // forever, so `cur == last` guarantees no move is ever observed (no
-        // spawn), while positional emitters keep their footing. The input
-        // hints deliberately do NOT copy — they classify FUTURE input, which
-        // belongs to the live style.
+        // The ghost's anchor: `tick_fades` feeds this cell as `cur`, so
+        // `cur == last` and no move is ever observed, while positional
+        // emitters keep their footing. Input hints are not copied; they belong
+        // to the live style.
         ghost.last = self.last;
         // Pin the ghost's own switch guard to its config so its ticks never
         // re-detect a change (and never nest another fade).
         ghost.last_style = Some(cfg.style);
         ghost.last_pack_fp = cfg.pack.as_ref().map_or(0, |p| p.pack_fp);
         ghost.last_cfg = Some(cfg);
-        // Style-specific PHASES restart for the incoming style (the ghost took
-        // the copies above): a fresh flame field / ribbon spine attacks from 0
-        // over ~100 ms — the built-in half of the ramp-in.
+        // Style-specific phases restart for the incoming style: a fresh flame
+        // field or ribbon spine attacks from 0 (the built-in half of the ramp).
         self.flame_phase = 0.0;
-        // CLASSIFIER state, not forged light: the ghost already takes
-        // `glide.stars`/`glide.vel`'s visible output, but a stale run direction
-        // or landing anchor carried across a style switch would mint a landing
-        // burst at a coordinate that no longer exists.
+        // Classifier state, not forged light: a stale run direction or landing
+        // anchor carried across a switch would mint a landing burst at a
+        // coordinate that no longer exists.
         if self.fading.len() >= Self::FADE_CAP {
             // Chained switches: the oldest fade is the darkest — shed it.
             self.fading.remove(0);
@@ -3240,11 +2654,10 @@ impl CursorGlow {
         });
     }
 
-    /// The incoming style's ramp-IN amplitude at `now`: EXACTLY `1.0` in steady
-    /// state (`ramp_in_at == None` — the no-switch path applies no scale at
-    /// all, so built-ins stay byte-identical), else a cosine ease from
-    /// [`Self::RAMP_IN_FLOOR`] to 1.0 over [`Self::RAMP_IN_S`], self-clearing
-    /// once complete so steady state costs one `Option` read.
+    /// The incoming style's ramp-in amplitude at `now`: exactly `1.0` in steady
+    /// state (`ramp_in_at == None`), else a cosine ease from
+    /// [`Self::RAMP_IN_FLOOR`] to 1.0 over [`Self::RAMP_IN_S`], clearing itself
+    /// when complete.
     fn ramp_in_scale(&mut self, now: Instant) -> f32 {
         let Some(t0) = self.ramp_in_at else {
             return 1.0;
@@ -3258,13 +2671,11 @@ impl CursorGlow {
         Self::RAMP_IN_FLOOR + (1.0 - Self::RAMP_IN_FLOOR) * eased
     }
 
-    /// Tick every live [`OutgoingFade`] under its snapshotted OLD config with
-    /// the cosine ramp-down applied to its intensity, and merge the emitted
-    /// streams into this frame's output. A fade is dropped when its envelope
-    /// is spent OR the moment it contributes nothing visible — so "a fade is
-    /// live" always implies "the frame shows cursor-effect output", the no-gap
-    /// invariant the switch strobe fix rests on. Ghost sound cues are cleared
-    /// unconditionally (the residue never talks; sound cannot cross styles).
+    /// Tick every live [`OutgoingFade`] under its old config with the cosine
+    /// ramp-down on its intensity, and merge the streams into this frame's
+    /// output. A fade is dropped when its envelope is spent or it contributes
+    /// nothing visible, so a live fade always means visible output. Ghost sound
+    /// cues are always cleared (sound cannot cross styles).
     fn tick_fades(&mut self, now: Instant, geom: Geom, out: &mut Vec<GlowQuad>) {
         if self.fading.is_empty() {
             return;
@@ -3276,7 +2687,7 @@ impl CursorGlow {
             if u >= 1.0 {
                 return false; // envelope spent
             }
-            // Cosine ramp-down FROM the level the outgoing style actually held
+            // Cosine ramp-down from the level the outgoing style actually held
             // (a chained switch hands off mid-ramp without popping to full).
             let env = f.level0 * (0.5 + 0.5 * (std::f32::consts::PI * u).cos());
             let mut c = f.cfg;
@@ -3285,7 +2696,7 @@ impl CursorGlow {
                 return false; // inert amplitude — ticking would only wipe
             }
             // `cur == engine.last` (the frozen anchor) ⇒ never a move ⇒ never a
-            // spawn: the residue decays and drifts only, under its OLD config.
+            // spawn: the residue decays and drifts only, under its old config.
             f.engine.tick(f.anchor, now, &c, geom, &mut scratch);
             f.engine.sound_cues.clear();
             let contributed = !(scratch.is_empty()
@@ -3301,7 +2712,7 @@ impl CursorGlow {
             self.char_out.extend_from_slice(&f.engine.char_out);
             self.fire_halo_out
                 .extend_from_slice(&f.engine.fire_halo_out);
-            // A fade that painted NOTHING is already invisible — retire it now
+            // A fade that painted nothing is already invisible — retire it now
             // rather than holding `is_active` armed for dark residue.
             contributed
         });
@@ -3320,37 +2731,29 @@ impl CursorGlow {
     }
 }
 
-// THE EASED SEGMENT LOOKUP IS DELETED with the luma compensation it placed.
-// `rainbow_gradient_segment` split `t` across six anchors and eased inside the
-// pair — the shape of the OLD colour law, an sRGB lerp between adjacent anchors,
-// whose green->blue leg is defect (b) of the design: `#1ACC80`, a hue that is not
-// on the arc, at a value 20% under both of its own endpoints. Colour resolves
-// through `spectrum` now, and the easing lives INSIDE the generated table (the
-// anchors sit on exact indices with zero hue slope either side of them), so the
-// arc is C¹ at every anchor and at both ends of the reflected sweep without any
-// caller placing a companion scalar per band.
+/// The first `n` host-sampled witness `rows` lent to the engine as
+/// [`rk::witness::RowSample`]s — a stack array (the steady frame allocates
+/// nothing) and how many of its slots are filled.
+fn witness_samples(
+    rows: &[WitnessRowBuf],
+    n: usize,
+) -> ([rk::witness::RowSample<'_>; CURSOR_WITNESS_ROWS], usize) {
+    let mut samples = [rk::witness::RowSample {
+        row: u16::MAX,
+        cols: &[],
+    }; CURSOR_WITNESS_ROWS];
+    let n = n.min(samples.len()).min(rows.len());
+    for (sample, slot) in samples.iter_mut().zip(&rows[..n]) {
+        *sample = rk::witness::RowSample {
+            row: slot.row,
+            cols: &slot.cols,
+        };
+    }
+    (samples, n)
+}
 
-// THE FAMILY'S SPECTRUM AT ONE CELL is [`spectrum`] — full stop, at every cell,
-// at every cadence. `rotate_hue` and `rainbow_momentum_bands` used to stand here
-// and spin all six anchors by ±`RAINBOW_HUE_SWING · disp` around the wheel; both
-// are deleted. See §2.3 of the design of record: rotation is the one mechanism
-// that could move a named anchor into an unnamed window (blue 204° → 189.6°,
-// cyan), it made the trail's colours a function of typing speed, and it charged
-// six HSV round trips per swept cell per frame to do it. Every caller now
-// resolves the ONE spectrum at a position, so "which rainbow is this?" has one
-// answer everywhere in the file.
-
-// THE MARK'S SHORT-AXIS COLOUR CROSSFADE IS DELETED (§2.1). It resolved a cell's
-// colour as `spectrum(hue_t + (tv - hue_t) * bloom)` — the laid position blended,
-// by an amount that grew with MOMENTUM and with nearness to the head, toward
-// where the sample sat DOWN the cell. So a cell's position depended on which
-// pixel of it you asked AND on how fast the user was typing: two of the five
-// laws §2.1 collapses, inside one expression. The head, where `bloom` is
-// largest, drifted furthest — its dominant band could sit two named stops from
-// the cell beside it while both were drawing the same keystroke's light.
-//
-// A cell has ONE position now and every layer reads it, so there is nothing left
-// to crossfade between.
+// The family's spectrum at one cell is [`spectrum`], at every cell and every
+// cadence: a cell has one position and every layer reads it (§2.1, §2.3).
 
 #[cfg(test)]
 mod tests;

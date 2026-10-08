@@ -7,11 +7,8 @@ use super::Damage;
 use super::rect::LineDamageBounds;
 use crate::row_u16;
 
-/// Iterator over damaged rows.
-///
-/// Uses different strategies for `Full` vs `Partial` damage:
-/// - `Full`: Simple counter from 0 to max
-/// - `Partial`: Bitset-based iteration using `trailing_zeros()` to skip undamaged rows
+/// Iterator over damaged rows: a counter for `Full`, a `trailing_zeros()`
+/// bitset scan for `Partial`.
 #[non_exhaustive]
 pub enum DamagedRowIterator<'a> {
     /// Full damage - iterate all rows.
@@ -55,10 +52,8 @@ impl Iterator for DamagedRowIterator<'_> {
     }
 }
 
-/// Fast iterator over set bits in a bitset using `trailing_zeros()`.
-///
-/// This iterator efficiently skips over undamaged rows by using bit manipulation
-/// to find the next set bit without checking each row individually.
+/// Iterator over the set bits of a bitset, skipping clean rows via
+/// `trailing_zeros()`.
 pub struct BitsetRowIterator<'a> {
     /// Reference to the bitset words.
     bits: &'a [u64],
@@ -130,10 +125,8 @@ impl Iterator for BitsetRowIterator<'_> {
     }
 }
 
-/// Iterator over damaged rows with their column bounds.
-///
-/// This is the recommended iterator for rendering as it provides
-/// both the row index and the damaged column range.
+/// Iterator over damaged rows with their damaged column range (the renderer's
+/// iterator).
 pub struct DamageBoundsIterator<'a> {
     damage: &'a Damage,
     row_iter: DamagedRowIterator<'a>,
@@ -170,10 +163,8 @@ impl Iterator for DamageBoundsIterator<'_> {
     }
 }
 
-/// Iterator that merges adjacent damaged lines into rectangles.
-///
-/// This reduces the number of draw calls needed for rendering by combining
-/// consecutive damaged rows with overlapping column ranges into single rectangles.
+/// Iterator merging consecutive damaged rows with overlapping column ranges
+/// into rectangles (fewer draw calls).
 #[cfg(any(test, kani, feature = "testing"))]
 pub struct MergedDamageIterator<'a> {
     inner: DamageBoundsIterator<'a>,

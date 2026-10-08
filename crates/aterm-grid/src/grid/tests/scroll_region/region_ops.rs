@@ -20,15 +20,7 @@ fn grid_insert_lines_with_scroll_region() {
     grid.set_cursor(3, 0);
     grid.insert_lines(2);
 
-    // Expected result:
-    // Row 0: A (unchanged, outside region)
-    // Row 1: B (unchanged, outside region)
-    // Row 2: C (unchanged, top of region but above cursor)
-    // Row 3: (blank - inserted)
-    // Row 4: (blank - inserted)
-    // Row 5: D (shifted from row 3, E and F pushed off bottom of region)
-    // Row 6: G (unchanged, outside region)
-    // Row 7: H (unchanged, outside region)
+    // Expected rows: A B C _ _ D G H (_ = inserted blank; E, F pushed off).
 
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
@@ -83,15 +75,7 @@ fn grid_delete_lines_with_scroll_region() {
     grid.set_cursor(3, 0);
     grid.delete_lines(2);
 
-    // Expected result:
-    // Row 0: A (unchanged, outside region)
-    // Row 1: B (unchanged, outside region)
-    // Row 2: C (unchanged, top of region but above cursor)
-    // Row 3: F (shifted from row 5)
-    // Row 4: (blank - inserted at bottom of region)
-    // Row 5: (blank - inserted at bottom of region)
-    // Row 6: G (unchanged, outside region)
-    // Row 7: H (unchanged, outside region)
+    // Expected rows: A B C F _ _ G H (_ = blank inserted at region bottom).
 
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
@@ -145,15 +129,7 @@ fn grid_scroll_region_up_within_region() {
     // Scroll region up by 2 lines
     grid.scroll_region_up(2);
 
-    // Expected result:
-    // Row 0: A (unchanged, outside region)
-    // Row 1: B (unchanged, outside region)
-    // Row 2: E (shifted from row 4)
-    // Row 3: F (shifted from row 5)
-    // Row 4: (blank - inserted at bottom of region)
-    // Row 5: (blank - inserted at bottom of region)
-    // Row 6: G (unchanged, outside region)
-    // Row 7: H (unchanged, outside region)
+    // Expected rows: A B E F _ _ G H (_ = blank inserted at region bottom).
 
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
@@ -287,15 +263,10 @@ fn grid_repeated_top_anchored_scrolls_coalesce_footer_row_splices() {
     assert_eq!(grid.take_selection_row_update(), None);
 }
 
-/// FRESH-SESSION blank displaced rows carry no transcript: while the grid
-/// holds no history at all, a top-anchored region scroll over them archives
-/// NOTHING — no minted blank history line, no scrollbar growth, no footer
-/// splice. (A fresh Codex session scrolls its region before anything printed
-/// at the physical top; archiving those rows used to fill the ring with
-/// blanks that a later rows-grow reveal painted as a dead band above the
-/// content.) The gate is scoped to that band alone — once ANY history
-/// exists, blank displaced rows archive like written ones (pinned below by
-/// `grid_top_anchored_scroll_archives_interior_blank_between_written_lines`).
+/// While the grid holds no history, a top-anchored region scroll over blank
+/// rows archives nothing: no blank history line, no scrollbar growth, no footer
+/// splice. Once any history exists, blank displaced rows archive like written
+/// ones (`grid_top_anchored_scroll_archives_interior_blank_between_written_lines`).
 #[test]
 fn grid_top_anchored_scroll_of_never_written_rows_mints_no_history() {
     let mut grid = Grid::with_scrollback(5, 10, 10);
@@ -328,13 +299,9 @@ fn grid_top_anchored_scroll_of_never_written_rows_mints_no_history() {
     grid.assert_invariants();
 }
 
-/// A blank row displaced BETWEEN written lines is transcript: Codex streams
-/// "A", a paragraph break (a row it "prints" by printing nothing), then "B",
-/// one insert-history scroll at a time. The separator is displaced alone —
-/// blankness must not drop it once any history exists. (Pre-fix, the
-/// never-written gate keyed on `Row::len == 0` for the whole displaced set,
-/// which also holds for that separator, so the paragraph break silently
-/// vanished from history.)
+/// A blank row displaced between written lines is transcript (a paragraph
+/// break streamed as "A", blank, "B" one scroll at a time) and archives once
+/// any history exists.
 #[test]
 fn grid_top_anchored_scroll_archives_interior_blank_between_written_lines() {
     let mut grid = Grid::with_scrollback(5, 10, 10);
@@ -367,11 +334,8 @@ fn grid_top_anchored_scroll_archives_interior_blank_between_written_lines() {
     grid.assert_invariants();
 }
 
-/// A written row erased back to blank (EL/ED with the default background sets
-/// `Row::len` to 0 — indistinguishable from never-written by len alone) is
-/// still transcript once history exists: the erase is part of what the
-/// application displayed, so the displaced row archives as an empty line
-/// rather than being dropped.
+/// A written row erased back to blank (`Row::len` 0 after EL/ED) is still
+/// transcript once history exists and archives as an empty line.
 #[test]
 fn grid_top_anchored_scroll_archives_written_then_erased_row() {
     let mut grid = Grid::with_scrollback(5, 10, 10);
@@ -406,11 +370,10 @@ fn grid_top_anchored_scroll_archives_written_then_erased_row() {
     grid.assert_invariants();
 }
 
-/// A fresh-session batch scroll whose displaced set MIXES leading
-/// never-written rows with written content drops ONLY the leading blank
-/// prefix: history starts at the first written row (no blank minted at the
-/// top of empty history), the footer splice covers only the archived count,
-/// and the visible result equals a single scroll of the full amount.
+/// A fresh-session batch scroll mixing leading never-written rows with written
+/// content drops only the leading blank prefix: history starts at the first
+/// written row, the footer splice covers only the archived count, and the
+/// screen equals a single scroll of the full amount.
 #[test]
 fn grid_fresh_session_mixed_batch_scroll_drops_only_leading_blank_prefix() {
     let mut grid = Grid::with_scrollback(5, 10, 10);
@@ -658,15 +621,7 @@ fn grid_scroll_region_down_within_region() {
     // Scroll region down by 2 lines
     grid.scroll_region_down(2);
 
-    // Expected result:
-    // Row 0: A (unchanged, outside region)
-    // Row 1: B (unchanged, outside region)
-    // Row 2: (blank - inserted at top of region)
-    // Row 3: (blank - inserted at top of region)
-    // Row 4: C (shifted from row 2)
-    // Row 5: D (shifted from row 3, E and F pushed off)
-    // Row 6: G (unchanged, outside region)
-    // Row 7: H (unchanged, outside region)
+    // Expected rows: A B _ _ C D G H (_ = blank inserted at top; E, F pushed off).
 
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
@@ -678,9 +633,7 @@ fn grid_scroll_region_down_within_region() {
     assert_eq!(grid.cell(7, 0).unwrap().char(), 'H');
 }
 
-/// Verify that scroll_region_up resets display_offset to 0 when called with
-/// nonzero display_offset (#5019). Previously this was a debug_assert panic;
-/// now the function self-heals by snapping to live view.
+/// scroll_region_up with a nonzero display_offset snaps to the live view.
 #[test]
 fn grid_scroll_region_up_resets_nonzero_display_offset() {
     let mut grid = Grid::with_scrollback(8, 10, 20);
@@ -699,7 +652,7 @@ fn grid_scroll_region_up_resets_nonzero_display_offset() {
     grid.assert_invariants();
 }
 
-/// Verify that scroll_region_down resets display_offset to 0 (#5019).
+/// Verify that scroll_region_down resets display_offset to 0.
 #[test]
 fn grid_scroll_region_down_resets_nonzero_display_offset() {
     let mut grid = Grid::with_scrollback(8, 10, 20);
@@ -717,7 +670,7 @@ fn grid_scroll_region_down_resets_nonzero_display_offset() {
     grid.assert_invariants();
 }
 
-/// Verify that insert_lines resets display_offset to 0 (#5019).
+/// Verify that insert_lines resets display_offset to 0.
 #[test]
 fn grid_insert_lines_resets_nonzero_display_offset() {
     let mut grid = Grid::with_scrollback(8, 10, 20);
@@ -736,7 +689,7 @@ fn grid_insert_lines_resets_nonzero_display_offset() {
     grid.assert_invariants();
 }
 
-/// Verify that delete_lines resets display_offset to 0 (#5019).
+/// Verify that delete_lines resets display_offset to 0.
 #[test]
 fn grid_delete_lines_resets_nonzero_display_offset() {
     let mut grid = Grid::with_scrollback(8, 10, 20);
@@ -755,16 +708,11 @@ fn grid_delete_lines_resets_nonzero_display_offset() {
     grid.assert_invariants();
 }
 
-// -------------------------------------------------------------------------
-// Margined IL/DL tests (DECLRMM, #7408)
-// -------------------------------------------------------------------------
+// Margined IL/DL tests (DECLRMM)
 
-/// IL with DECLRMM: rectangular shift within horizontal margins.
-///
-/// Grid 6x10, scroll region rows 1-4, horizontal margins cols 2-5.
-/// Cursor at row 2. insert_lines_margined(1, true) should shift cells
-/// within cols 2-5 down by 1 row within rows 2-4, leaving cols 0-1 and
-/// cols 6-9 untouched.
+/// IL with DECLRMM shifts a rectangle: 6x10 grid, region rows 1-4, margins
+/// cols 2-5, cursor row 2. Cols 2-5 of rows 2-4 move down one; cols 0-1 and
+/// 6-9 are untouched.
 #[test]
 fn grid_insert_lines_margined_rectangular_shift() {
     let mut grid = Grid::new(6, 10);
@@ -837,12 +785,9 @@ fn grid_insert_lines_margined_rectangular_shift() {
     grid.assert_invariants();
 }
 
-/// DL with DECLRMM: rectangular shift within horizontal margins.
-///
-/// Grid 6x10, scroll region rows 1-4, horizontal margins cols 2-5.
-/// Cursor at row 2. delete_lines_margined(1, true) should shift cells
-/// within cols 2-5 up by 1 row within rows 2-4, leaving cols 0-1 and
-/// cols 6-9 untouched.
+/// DL with DECLRMM shifts a rectangle: 6x10 grid, region rows 1-4, margins
+/// cols 2-5, cursor row 2. Cols 2-5 of rows 2-4 move up one; cols 0-1 and
+/// 6-9 are untouched.
 #[test]
 fn grid_delete_lines_margined_rectangular_shift() {
     let mut grid = Grid::new(6, 10);

@@ -32,15 +32,19 @@ pub(crate) const DEFAULT_MEMORY_BUDGET: usize = 100 * 1024 * 1024;
 pub const DEFAULT_LINE_LIMIT: usize = 100_000;
 
 /// Maximum decompressed size for a single scrollback page (64 MiB).
+///
+/// ONE limit for writer and reader: every page decoder admits this much (the
+/// LZ4 cap in `lz4.rs` is this constant, the zstd decode below caps here) and
+/// the warm tier pages its blocks by it (`WarmTier::push_block`), so no block
+/// the store writes is one it cannot read back. Cold pages and disk pages are
+/// built one per warm block, so the bound carries to them.
 pub(crate) const MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Binary search on a sorted cumulative array, counting iterations in `steps`.
 ///
-/// `steps` was previously an `impl FnMut()` callback; it is now a plain
-/// `&mut usize` increment so the strict Trust gate sees a closed body (an
-/// opaque callback is an absent callee it must assume may panic). Every
-/// caller only ever counted iterations, so the observable behavior is
-/// identical.
+/// `steps` is a plain `&mut usize`, not a callback, so the strict Trust gate
+/// sees a closed body (an opaque callback is an absent callee it must assume
+/// may panic).
 pub(crate) fn binary_search_counted(
     cumulative: &[usize],
     target: usize,

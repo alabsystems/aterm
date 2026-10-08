@@ -1,54 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE canonical typing-momentum metric — one leaky integrator in `[0, 1]`
-//! that every rainbow kitty "earned drama" consumer reads (owner: "the kitty face is a
-//! little too distracting and so are the stars. these should appear with more
-//! momentum on the cursor motion … more carefully define that metric where it
-//! decays over time and it builds up with non-delete typing activity
-//! continuously").
+//! The canonical typing-momentum metric: one leaky integrator in `[0, 1]` that
+//! every rainbow-kitty "earned drama" consumer reads.
 //!
-//! Before this module there were THREE parallel momentum trackers feeding the
-//! Rainbow kitty family: the style-shared typing `heat` (a per-key cadence-credit
-//! envelope, also slammed to 1.0 by jump flares), the cursor cat's private
-//! `score` (0.34/key, τ 1.2 s), and the eased display spines derived from
-//! each. They disagreed about what "momentum" meant — a key-repeat flood
-//! maxed `heat` in ~8 keys, a jump flare lit the star field without a single
-//! keystroke, and the cat's earn law was a key COUNT — which is exactly how
-//! casual bursts kept buying the full fireworks. This module is the single
-//! replacement law; [`crate::cursor_glow::CursorGlow`] (ribbon spine → stars,
-//! fresh-ink pops, iridescence) and [`crate::kitty_cursor::CursorCat`] each hold
-//! one instance fed by the same host keystream, so every consumer reads the same
-//! number: `momentum_unifies_glow_and_cat_metrics` (cursor_glow tests) pins
-//! that the two instances evolve identically under one key script.
+//! [`crate::cursor_glow::CursorGlow`] (ribbon spine → stars, fresh-ink pops,
+//! iridescence) and [`crate::kitty_cursor::CursorCat`] each hold one instance
+//! fed by the same host keystream, so every consumer reads the same number
+//! (`momentum_unifies_glow_and_cat_metrics` pins that they evolve identically).
 //!
 //! ## The law
 //!
-//! * **Builds ONLY from non-delete printable typing advances.** A forward
-//!   glyph echo calls [`TypingMomentum::advance`]; deletes, kills, and
-//!   navigation never call it, so no amount of erasing or scrubbing reads as
-//!   "typing momentum".
+//! * **Builds only from non-delete printable typing advances.** A forward
+//!   glyph echo calls [`TypingMomentum::advance`]; deletes, kills and
+//!   navigation never do.
 //! * **Rate-normalized accrual.** Each advance credits
-//!   `RATE × min(gap, CREDIT_CAP_S)` where `gap` is the time since the last
-//!   stamp: momentum is earned by TIME SPENT TYPING, not by key count. A
-//!   30 ms key-repeat flood and a 120 ms human sprint both build at exactly
-//!   [`TYPING_MOMENTUM_RATE`] per wall-clock second — key-repeat cannot
-//!   outrun real typing (the accrual cap), and a lone key after a long pause
-//!   earns at most one full credit (`RATE × CREDIT_CAP_S ≈ 0.23`), so credit
-//!   can never be banked across a pause.
-//! * **Exponential decay, τ = 2 s.** Chosen so an ordinary inter-word breath
-//!   (0.4–0.8 s) keeps 67–82 % of an earned run — real prose rhythm sustains
-//!   the metric — while a 3–4 s thinking pause drains even a full metric
-//!   below every visual onset. Pauses ONLY decay it: there is no idle floor.
+//!   `RATE × min(gap, CREDIT_CAP_S)`, where `gap` is the time since the last
+//!   stamp: momentum is time spent typing, not key count. A key-repeat flood and
+//!   a human sprint build at the same [`TYPING_MOMENTUM_RATE`] per second, and a
+//!   lone key after a long pause earns at most one credit (≈ 0.23).
+//! * **Exponential decay, τ = 2 s.** An inter-word breath (0.4–0.8 s) keeps
+//!   67–82 % of an earned run, while a 3–4 s pause drains a full metric below
+//!   every visual onset. There is no idle floor.
 //! * **Deletes never build; they mildly drain.** A backspace subtracts
-//!   [`TYPING_MOMENTUM_DELETE_DRAIN`] (a kill chord twice that): one typo
-//!   correction dents an earned run without erasing it, a delete flood walks
-//!   it to zero. The drain also re-stamps the clock, so the gap credit a
-//!   delete interrupts is spent, not saved.
+//!   [`TYPING_MOMENTUM_DELETE_DRAIN`] (a kill chord twice that) and re-stamps
+//!   the clock, so the interrupted gap credit is spent.
 //!
-//! With `RATE × τ = 1.3` the flood equilibrium clamps at 1.0, and flat-out
-//! typing crosses the cat's 0.75 band in ~1.7 s and reaches 1.0 in ~2.9 s —
-//! the arc the raised thresholds in [`crate::kitty_cursor`] are tuned against.
+//! With `RATE × τ = 1.3` the flood equilibrium clamps at 1.0; flat-out typing
+//! crosses the cat's 0.75 band in ~1.7 s and reaches 1.0 in ~2.9 s, the arc
+//! the thresholds in [`crate::kitty_cursor`] are tuned against.
 
 use aterm_time::Instant;
 
@@ -62,18 +42,15 @@ pub const TYPING_MOMENTUM_TAU: f32 = 2.0;
 /// (casual-burst territory stays low), 0.75 at ~1.7 s, 1.0 at ~2.9 s.
 pub const TYPING_MOMENTUM_RATE: f32 = 0.65;
 
-/// Per-advance credit window (seconds): one keystroke may credit at most
-/// `RATE × CREDIT_CAP_S` no matter how long the pause before it. Sized just
-/// above the fastest deliberate typing cadence (~300 ms/key) so every human
-/// rhythm from sprint to stroll earns the same per-second rate, while slower
-/// pecking (gaps ≥ the cap) earns fixed per-key credit that the τ-decay
-/// between keys progressively out-runs — a 1 s/key stroll equilibrates near
-/// 0.58, below the cat band, forever.
+/// Per-advance credit window (seconds): one keystroke credits at most
+/// `RATE × CREDIT_CAP_S`. Just above the fastest deliberate cadence
+/// (~300 ms/key), so human rhythms earn the same per-second rate, while slow
+/// pecking is out-run by the decay (a 1 s/key stroll settles near 0.58, below
+/// the cat band).
 pub const TYPING_MOMENTUM_CREDIT_CAP_S: f32 = 0.35;
 
-/// Mild per-backspace drain. Deletes NEVER build; this drain is deliberately
-/// small (about half of one full advance credit) so fixing a typo mid-flow
-/// keeps an earned run alive, while a held delete run visibly un-earns it.
+/// Mild per-backspace drain (about half one advance credit): fixing a typo
+/// keeps an earned run alive, a held delete un-earns it.
 pub const TYPING_MOMENTUM_DELETE_DRAIN: f32 = 0.12;
 
 /// Kill-chord drain: erasing a SPAN un-earns like ~two deletes (the same
@@ -108,11 +85,9 @@ impl TypingMomentum {
         if v < SNAP_ZERO { 0.0 } else { v }
     }
 
-    /// One NON-DELETE printable typing advance (a forward glyph echo, a wrap,
-    /// a coalesced multi-glyph echo — anything that is letters arriving).
-    /// Decays to `now`, then credits `RATE × min(gap, CREDIT_CAP_S)` — the
-    /// rate normalization that makes key-repeat floods and human sprints
-    /// build at the same per-second pace (module doc, "accrual cap").
+    /// One non-delete printable typing advance (forward glyph echo, wrap,
+    /// coalesced multi-glyph echo). Decays to `now`, then credits
+    /// `RATE × min(gap, CREDIT_CAP_S)`.
     pub fn advance(&mut self, now: Instant) {
         let gap = self.at.map_or(TYPING_MOMENTUM_CREDIT_CAP_S, |at| {
             now.saturating_duration_since(at).as_secs_f32()
@@ -149,11 +124,10 @@ impl TypingMomentum {
         self.at = None;
     }
 
-    /// The analytic instant the decaying metric crosses `threshold`
-    /// (`> 0`): `stamp + τ·ln(v/threshold)`, or the stamp itself when the
-    /// stored value is already at/below it. `None` while unstamped. Lets a
-    /// frame-rate-independent consumer (the cat's fade-out) recover the TRUE
-    /// crossing even when frames arrive arbitrarily late.
+    /// The analytic instant the decaying metric crosses `threshold` (`> 0`):
+    /// `stamp + τ·ln(v/threshold)`, or the stamp when already at/below it.
+    /// `None` while unstamped. Lets a consumer recover the true crossing even
+    /// when frames arrive late.
     #[must_use]
     pub fn low_crossing(&self, threshold: f32) -> Option<Instant> {
         let at = self.at?;
@@ -186,10 +160,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// THE ACCRUAL CAP: a 5 ms key-repeat flood and a 30 ms sprint spanning
-    /// the same wall-clock second land on the same metric (rate-normalized —
-    /// momentum is time spent typing, not key count), and both stay under the
-    /// analytic ceiling `RATE·τ·(1 − e^(−t/τ))`.
+    /// The accrual cap: a 5 ms key-repeat flood and a 30 ms sprint over the same
+    /// second land on the same metric, both under `RATE·τ·(1 − e^(−t/τ))`.
     #[test]
     fn accrual_is_rate_capped_so_key_repeat_cannot_outrun_typing() {
         let t0 = Instant::now();
@@ -218,8 +190,7 @@ mod tests {
         );
     }
 
-    /// NON-DELETE-ONLY: deletes and kills never raise the metric, from rest
-    /// or from a warm run.
+    /// Deletes and kills never raise the metric, from rest or from a warm run.
     #[test]
     fn deletes_and_kills_never_build() {
         let t0 = Instant::now();
@@ -245,9 +216,7 @@ mod tests {
         );
     }
 
-    /// τ = 2 s: from a full metric, half is left after τ·ln 2 and e⁻² ≈ 13.5 %
-    /// after 2τ — the documented "prose breaths survive, thinking pauses
-    /// drain" curve.
+    /// τ = 2 s: from full, half remains after τ·ln 2 and e⁻² ≈ 13.5 % after 2τ.
     #[test]
     fn decay_follows_the_documented_tau() {
         let t0 = Instant::now();

@@ -31,19 +31,18 @@ use std::process::{Command, Output, Stdio};
 const BUILD: u64 = 2_026_092_201;
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     layout: atpkg::store::Layout,
 }
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "atpkg-run-managed-name-{}-{case}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-run-managed-name-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let layout = atpkg::store::Layout {
             prefix: atpkg::store::default_prefix(&home),
@@ -115,10 +114,10 @@ impl Fixture {
         Command::new(program)
             .args(args)
             .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env(
                 "ATPKG_REGISTRY",
-                format!("dir:{}", self.root.join("registry").display()),
+                format!("dir:{}", self.root.path().join("registry").display()),
             )
             .env_remove("DISABLE_AUTOUPDATER")
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
@@ -134,12 +133,6 @@ impl Fixture {
         let mut argv = vec!["run", "claude", "--"];
         argv.extend_from_slice(args);
         self.run(std::path::Path::new(env!("CARGO_BIN_EXE_atpkg")), &argv)
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

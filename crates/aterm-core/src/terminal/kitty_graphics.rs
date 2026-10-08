@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kitty graphics protocol (APC `G`) command PARSER.
+//! Kitty graphics protocol (APC `G`) command parser.
 //!
 //! Parses one Kitty graphics command — `APC G <control> ; <base64 payload> ST` —
 //! into a structured [`KittyCommand`]. The control data is a comma-separated list
@@ -15,7 +15,7 @@
 //! unit-testable without a `Terminal`. The image store, placements and deletes
 //! built on it live in `handler_actions.rs` (`handle_complete_kitty_command`,
 //! which lists what the engine does not implement); `kitty_graphics` is
-//! advertised TRUE on the strength of that core (`aterm-types`
+//! advertised true on the strength of that core (`aterm-types`
 //! `terminal_core.rs`).
 
 /// The `a=` action of a Kitty graphics command.
@@ -25,7 +25,7 @@ pub enum KittyAction {
     /// `a=t` — transmit image data (store it), do not display yet.
     #[default]
     Transmit,
-    /// `a=T` — transmit AND immediately display at the cursor.
+    /// `a=T` — transmit and immediately display at the cursor.
     TransmitAndDisplay,
     /// `a=q` — query: does the terminal support this / is the id known.
     Query,
@@ -74,7 +74,7 @@ pub enum KittyFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum KittyMedium {
-    /// `t=d` — direct: the payload IS the (base64) image data (the default).
+    /// `t=d` — direct: the payload is the (base64) image data (the default).
     #[default]
     Direct,
     /// `t=f` — a regular file; the payload is its (base64) path.
@@ -86,7 +86,7 @@ pub enum KittyMedium {
 }
 
 /// A parsed Kitty graphics command. Every numeric field is `Option` so an absent
-/// key is distinguishable from an explicit `0`; the payload is base64-DECODED
+/// key is distinguishable from an explicit `0`; the payload is base64-decoded
 /// (empty when absent or undecodable).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[allow(
@@ -109,12 +109,12 @@ pub struct KittyCommand {
     pub number: Option<u32>,
     /// `p=` — placement id. `p=0` means "none".
     pub placement: Option<u32>,
-    /// `x=` — for a display, the LEFT edge of the source rectangle in pixels;
-    /// for a delete (`d=p`/`q`/`x`), the 1-based cell COLUMN; for `d=r`, the
+    /// `x=` — for a display, the left edge of the source rectangle in pixels;
+    /// for a delete (`d=p`/`q`/`x`), the 1-based cell column; for `d=r`, the
     /// lowest image id of the range.
     pub x: Option<u32>,
-    /// `y=` — for a display, the TOP edge of the source rectangle in pixels;
-    /// for a delete (`d=p`/`q`/`y`), the 1-based cell ROW; for `d=r`, the
+    /// `y=` — for a display, the top edge of the source rectangle in pixels;
+    /// for a delete (`d=p`/`q`/`y`), the 1-based cell row; for `d=r`, the
     /// highest image id of the range.
     pub y: Option<u32>,
     /// `w=` — width of the source rectangle in pixels (`0`/absent = to the
@@ -125,18 +125,23 @@ pub struct KittyCommand {
     pub crop_height: Option<u32>,
     /// `C=1` — do not move the cursor after placing the image.
     pub cursor_stays: bool,
-    /// `U=1` — a VIRTUAL placement: the image is shown only where the client
+    /// `U=1` — a virtual placement: the image is shown only where the client
     /// prints Unicode placeholders, never stamped at the cursor.
     pub virtual_placement: bool,
-    /// `s=` — source image width in pixels (for raw formats).
+    /// `s=` — source image width in pixels (for raw formats); for `a=a`, the
+    /// animation state (1 stop, 2 run while loading, 3 run).
     pub width: Option<u32>,
-    /// `v=` — source image height in pixels (for raw formats).
+    /// `v=` — source image height in pixels (for raw formats); for `a=a`, the
+    /// loop count (1 forever, `n` n−1 times).
     pub height: Option<u32>,
-    /// `c=` — display width in CELLS (columns).
+    /// `c=` — display width in cells (columns); for `a=f`, `a=c` and `a=a`,
+    /// a frame number.
     pub columns: Option<u32>,
-    /// `r=` — display height in CELLS (rows).
+    /// `r=` — display height in cells (rows); for `a=f`, `a=c`, `a=a` and a
+    /// frame delete, a frame number.
     pub rows: Option<u32>,
-    /// `z=` — z-index (may be negative: behind the text).
+    /// `z=` — z-index (may be negative: behind the text); for `a=f` and
+    /// `a=a`, a frame's gap in milliseconds (negative: gapless).
     pub z_index: Option<i32>,
     /// `X=` — for a display, the pixel offset within the first cell at which
     /// the image starts; for `a=f`, the frame's composition mode; for `a=c`,
@@ -146,7 +151,7 @@ pub struct KittyCommand {
     /// the image starts; for `a=f`, the frame's background colour; for `a=c`,
     /// the source rectangle's top edge.
     pub cell_y_offset: Option<u32>,
-    /// `P=` — the image id of a relative placement's PARENT. `P=0` means none.
+    /// `P=` — the image id of a relative placement's parent. `P=0` means none.
     pub parent_id: Option<u32>,
     /// `Q=` — the placement id of a relative placement's parent. `Q=0` means
     /// none.
@@ -161,12 +166,81 @@ pub struct KittyCommand {
     pub more: bool,
     /// `o=z` — the payload is zlib-compressed.
     pub compressed: bool,
-    /// `d=` — for `a=d` delete, WHAT to delete: `i`/`I` = by image id (`i=`),
+    /// `d=` — for `a=d` delete, what to delete: `i`/`I` = by image id (`i=`),
     /// `a`/`A` = all, etc. `None` (no `d=`) means delete all visible placements.
     pub delete_target: Option<char>,
-    /// The base64-DECODED payload (image bytes for `t=d`, else a path / shm name).
+    /// The base64-decoded payload (image bytes for `t=d`, else a path / shm name).
     /// Empty when there was no payload or it failed to decode.
     pub payload: Vec<u8>,
+}
+
+/// The largest width or height, in pixels, of an image kitty loads (its
+/// `MAX_IMAGE_DIMENSION`).
+pub(crate) const MAX_KITTY_DIMENSION: u32 = 10_000;
+
+/// What a command that arrives while a chunked load (`m=1`) is in flight does
+/// to that load. kitty's `grman_handle_command` (`graphics.c`) routes it by
+/// action and medium, never by its other keys, once it has refused the two
+/// commands it refuses before routing: one naming both `i=` and `I=`, and a
+/// query naming no `i=`. Neither reaches this routing
+/// (`handle_kitty_command` in `handler_actions.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DuringLoad {
+    /// A chunk of the load: a transmit, query or frame load on the direct
+    /// medium, whatever else it carries. Only its payload, `m=` and a non-zero
+    /// `q=` count, so a client that repeats the first chunk's keys on every
+    /// chunk, and the `a=f` the protocol puts on every frame chunk, still
+    /// assemble.
+    Continues,
+    /// A command of its own that ends the load first: a delete (the protocol:
+    /// "the partial upload must be aborted"), or a transmit, query or frame
+    /// load on another medium, which kitty reads at once.
+    Ends,
+    /// A command of its own that leaves the load in flight: a put, a
+    /// composition or an animation control.
+    Beside,
+}
+
+impl KittyCommand {
+    /// How this command is read while a chunked load is in flight. Only a
+    /// command that would continue a load can open one with `m=1`, and only
+    /// when kitty accepts it as a first chunk (`handle_kitty_command`).
+    pub(crate) fn during_load(&self) -> DuringLoad {
+        match self.action {
+            KittyAction::Delete => DuringLoad::Ends,
+            KittyAction::Display | KittyAction::Compose | KittyAction::Animate => {
+                DuringLoad::Beside
+            }
+            KittyAction::Transmit
+            | KittyAction::TransmitAndDisplay
+            | KittyAction::Query
+            | KittyAction::Frame => {
+                if self.medium == KittyMedium::Direct {
+                    DuringLoad::Continues
+                } else {
+                    DuringLoad::Ends
+                }
+            }
+        }
+    }
+
+    /// Whether this command declares data of a size kitty begins to load: no
+    /// declared side (`s=`, `v=`) over `MAX_KITTY_DIMENSION`, whatever the
+    /// format, and for raw pixels both sides declared and at least 1. kitty
+    /// compares the declared sides with its limit before it looks at the
+    /// format (`handle_add_command` for a transmit or query,
+    /// `handle_animation_frame_load_command` for `a=f`), then refuses raw
+    /// pixels with no area (`initialize_load_data`). It aborts any other
+    /// command at its first chunk, so it holds no load in flight for it and
+    /// stores no image from it. A PNG need declare no size: its own is read
+    /// from its data.
+    pub(crate) fn declares_loadable_size(&self) -> bool {
+        let within = |side: Option<u32>| side.is_none_or(|n| n <= MAX_KITTY_DIMENSION);
+        let has_area = |side: Option<u32>| side.is_some_and(|n| n >= 1);
+        within(self.width)
+            && within(self.height)
+            && (self.format == KittyFormat::Png || (has_area(self.width) && has_area(self.height)))
+    }
 }
 
 /// Parse a Kitty graphics APC command from the raw APC payload (the bytes between
@@ -394,6 +468,34 @@ mod tests {
         assert_eq!(c.payload, b"raw");
     }
 
+    /// No side declared over `MAX_KITTY_DIMENSION` loads, whatever the
+    /// format, and raw pixels also need both sides of at least 1, as in
+    /// kitty; a PNG need declare no size.
+    #[test]
+    fn a_loadable_size_is_kittys() {
+        let cases = [
+            ("f=32,s=1,v=1", true),
+            ("f=24,s=10000,v=10000", true),
+            ("f=32", false),
+            ("f=32,s=2", false),
+            ("f=32,v=2", false),
+            ("f=32,s=0,v=2", false),
+            ("f=24,s=2,v=0", false),
+            ("f=32,s=10001,v=1", false),
+            ("f=24,s=1,v=10001", false),
+            ("f=100", true),
+            ("f=100,s=2,v=2", true),
+            ("f=100,s=0", true),
+            ("f=100,s=10000,v=10000", true),
+            ("f=100,s=10001,v=1", false),
+            ("f=100,v=10001", false),
+        ];
+        for (control, loadable) in cases {
+            let c = parse_kitty_command(&apc(control, b"")).expect("parses");
+            assert_eq!(c.declares_loadable_size(), loadable, "{control}");
+        }
+    }
+
     #[test]
     fn raw_rgb_dimensions_and_medium() {
         let c = parse_kitty_command(&apc("f=24,s=10,v=20,t=f", b"")).expect("parses");
@@ -520,7 +622,7 @@ mod tests {
             "source over an opaque pixel"
         );
         assert_eq!(&under[..4], &[0, 0, 255, 255], "the rest untouched");
-        // The same pixel COPIED keeps its own alpha.
+        // The same pixel copied keeps its own alpha.
         compose_rgba(
             &mut under,
             2,

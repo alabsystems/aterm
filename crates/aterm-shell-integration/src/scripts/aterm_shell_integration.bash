@@ -26,6 +26,42 @@
 # Only run in interactive shells
 [[ $- != *i* ]] && return
 
+# Not traced: see THE TRACE, just below.
+{ __aterm_load_flags=$-; set +xv; } 2>/dev/null
+
+# ─── THE TRACE (2026-10-03) — the zsh script's twin ───
+#
+# A user's XTRACE (`set -x` at the prompt, or in an rc) traced every line aterm
+# runs around a command, where bare bash traces only the command: about 165
+# lines of DEBUG-trap preexec and PROMPT_COMMAND per command, and in them the
+# capability nonce, in plain text, about 18 times per command, on the screen and
+# in the scrollback (measured on bash 3.2.57 and 5.2.37: 668 trace lines and the
+# nonce 72 times over four commands; bare bash 4 and 0). An rc's `set -x` traced
+# the load too, `__aterm_shell_nonce=<nonce>` first, and so did a typed upgrade
+# under one, with the new key. VERBOSE (`set -v`) echoed the command
+# substitutions aterm runs (`__aterm_urlencode "$cwd"`). bash 3.2 has no
+# `local -`, and `set +x` is itself traced — but on the stderr the command runs
+# with, so `{ set +xv; } 2>/dev/null` turns both off and prints nothing, and
+# turning XTRACE on is never traced. So every function the shell runs on aterm's
+# behalf — the DEBUG trap's, the PROMPT_COMMAND trampoline, the prompt handler
+# (for a loader from before this), what PS1 calls, the documented helper — OPENS
+# by taking `$-` and turning both off in that group, and CLOSES by putting back
+# what it took (`__aterm_flags_put`, whose own `return` is traced only into a
+# silenced stderr). The user's own code that aterm runs — a scalar
+# PROMPT_COMMAND, a DEBUG trap set before aterm's — runs with the user's flags
+# put back first, so it is traced as in bare bash. The load does the same: both
+# off on the line above, put back wherever this file returns, so an rc's
+# `set -x`, or a typed upgrade under one, traces nothing of it but its first
+# line, `[[ $- != *i* ]]`. What remains is bash's own trace of the hooks'
+# calls — the DEBUG trap's `__aterm_preexec <$_>` before each command and
+# PROMPT_COMMAND's `__aterm_prompt_command` — and an `eval` line before a scalar
+# PROMPT_COMMAND of the user's; none carries the nonce. Under BASH_XTRACEFD
+# (bash 4.1+) the trace is not on stderr, so each function's opening `local` and
+# `set +xv` and its closing `return` reach it too: about 15 lines a command, no
+# nonce (measured on bash 5.2.37; 290 and the nonce 21 times before). A loader
+# from before this, frozen in a running shell, still traces its trampoline's own
+# lines (no nonce); the body it takes does not.
+
 # ─── The multiplexer boundary (screen / tmux) ───
 #
 # aterm hosts ONE session per PTY. Run screen or tmux in that PTY and the
@@ -92,19 +128,27 @@ else
     esac
 fi
 
+# A user's ATERM_MUX=0 (or off/no/none/false) turns the whole check off:
+# keep it, and say nothing.
+case "${ATERM_MUX:-}" in 0|off|no|none|false) __aterm_mux="" ;; esac
+
 # THE IN-PLACE UPGRADE (2026-09-26). The guard below is exported, so a NON-empty
 # value normally proves this shell did not come straight from aterm (a pane — see
 # above). There is one other way to arrive here with it set: THIS VERY SHELL
 # sourcing the file again — the live agent upgrade's relaunch line sources a newer
 # build's loader into a shell spawned before loaders existed (`typed_rekey` in
 # aterm-shell-integration). That shell, and only that shell, already holds
-# `$__aterm_shell_nonce`: a plain global, never exported, so no pane or child shell
-# can have inherited it. For it the guard is its own, and the load goes on as an
+# `$__aterm_shell_nonce` AND the prompt hook its integration defined,
+# `__aterm_prompt_command` (every build's since 0.61): a function, never exported,
+# so no pane or child shell can have inherited it. The nonce alone is no proof —
+# the typed line assigns it in a NESTED shell too (the zsh script says why). For
+# the shell that holds both the guard is its own, and the load goes on as an
 # upgrade in place: everything below is idempotent, and what must run once per
 # shell (the package blocks, the PROMPT_COMMAND and DEBUG-trap wiring) is skipped
 # where it already ran.
 __aterm_fresh_load=1
-if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" && -n "${__aterm_shell_nonce+x}" ]]; then
+if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" && -n "${__aterm_shell_nonce+x}" ]] &&
+   declare -F __aterm_prompt_command >/dev/null; then
     __aterm_fresh_load=0
     ATERM_SHELL_INTEGRATION_INSTALLED=
 fi
@@ -134,7 +178,10 @@ if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]]; then
         fi
     fi
     unset __aterm_mux
-    return
+    # The user's flags, as the load found them (see THE TRACE).
+    case $__aterm_load_flags in *v*) set -v ;; esac
+    case $__aterm_load_flags in *x*) set -x ;; esac
+    { return; } 2>/dev/null
 fi
 export ATERM_SHELL_INTEGRATION_INSTALLED=1
 # Past the guard, so aterm started this shell ITSELF. Record the multiplexer
@@ -190,8 +237,8 @@ unset ATERM_MUX ATERM_MUX_OUTER_SESSION_ID __aterm_mux
 # `TerminalModes::require_shell_integration_nonce` is enabled.
 #
 # In an upgrade in place (see above) the environment holds no nonce any more — it
-# was scrubbed at this shell's first load — so the one the shell already signs
-# with is kept.
+# was scrubbed at this shell's first load — so the one the shell holds is kept: in
+# a typed upgrade, the key its line assigned just before sourcing this file.
 __aterm_shell_nonce="${ATERM_SHELL_NONCE:-${__aterm_shell_nonce:-}}"
 unset ATERM_SHELL_NONCE
 
@@ -290,15 +337,39 @@ __aterm_body_check() {
 # THE TRAMPOLINE: the PROMPT_COMMAND entry, and the one piece of the prompt path
 # that never changes. The in-prompt flag is raised FIRST, so a body sourced by the
 # check is never taken for a user's command by the DEBUG trap; the body sourced is
-# the body whose prompt handler runs in the SAME prompt.
+# the body whose prompt handler runs in the SAME prompt. Its first command takes
+# `$?`, the user's `$_` and flags, and turns XTRACE and VERBOSE off, untraced (see
+# THE TRACE); the handler is handed all three, may change `__aterm_flags` (the
+# user's PROMPT_COMMAND it runs may), and the flags go back here, last — whatever
+# body ran, an older one included. It returns 0, as the handler does: bash puts
+# `$?` back after PROMPT_COMMAND anyway, and a status it returned was a failed
+# command to the user's ERR trap and `set -e` (see the handler's end).
 __aterm_prompt_command() {
-    local __aterm_status=$?
+    { local __aterm_status=$? __aterm_lastarg=$_ __aterm_flags=$-; set +xv; } 2>/dev/null
     __aterm_in_prompt_cmd=1
     __aterm_body_check
-    __aterm_body_prompt_command "$__aterm_status"
+    __aterm_body_prompt_command "$__aterm_status" "$__aterm_flags" "$__aterm_lastarg"
+    case $__aterm_flags in *v*) set -v ;; esac
+    case $__aterm_flags in *x*) set -x ;; esac
 }
 
 # @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
+
+# Not traced (see THE TRACE): a loader from before it sources this body at a
+# switch with the user's XTRACE on. Put back at the body's end.
+{ __aterm_body_flags=$-; set +xv; } 2>/dev/null
+
+# The user's XTRACE and VERBOSE, as `$1` (a `$-`) holds them: put back where a
+# function of aterm's that turned them off returns, or runs the user's own code.
+# It returns `$2` (0 when not given), and its last argument is what `$_` reads
+# after it: the caller that runs the user's code next (`|| eval`, `&& eval`)
+# hands that code the `$?` and `$_` bare bash would. Turning either flag on is
+# not traced, and the `return` after it is traced only into a silenced stderr.
+__aterm_flags_put() {
+    case $1 in *v*) set -v ;; esac
+    case $1 in *x*) set -x ;; esac
+    { return "${2:-0}"; } 2>/dev/null
+}
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
@@ -470,14 +541,18 @@ fi
 # that precedes it — no fork). Builtin `read` on a builtin redirection; the
 # `|| [[ -n ... ]]` keeps a final line without a newline. Its own global, not
 # $REPLY: the hot path runs between a user's `read` and the line that consumes
-# $REPLY, and must not clobber it. `local` with a value, so `set -u` holds.
+# $REPLY, and must not clobber it. `local` with a value, so `set -u` holds. The
+# failed open sits on the left of `|| :`: bash 5 counts it a failed command, so
+# in a session with no hook a user's `set -e` closed the shell at the prompt after
+# it, and `set -E` fired the ERR trap at every prompt and command (measured on
+# bash 5.2.37; bash 3.2.57 lets it pass).
 __aterm_atpkg_hook_now=""
 __aterm_atpkg_hook_read() {
     __aterm_atpkg_hook_now=""
     local __aterm_line=""
     while IFS= read -r __aterm_line || [[ -n "$__aterm_line" ]]; do
         __aterm_atpkg_hook_now+="$__aterm_line"$'\n'
-    done 2>/dev/null < "$__aterm_atpkg_hook"
+    done 2>/dev/null < "$__aterm_atpkg_hook" || :
     return 0
 }
 # The copy the shell.d loop above sourced at load is the copy last sourced —
@@ -519,12 +594,19 @@ __aterm_managed_path_live() {
     #    falls through: steps 2 and 3 keep the reroute dir in front regardless
     #    (review finding 2026-09-16: an early return here left a PATH prepend at
     #    the prompt shadowing the reroute stubs for the shell's life).
+    #    This step and step 4 run at every prompt and before every command, so
+    #    neither leaves a failed command: the derivation says no (status 1)
+    #    wherever the session already has its reroute dir, and `hash -d` fails
+    #    for a name not hashed — at every prompt once any command has been —
+    #    and to a user's `set -e` either closed the shell (the hook rewritten
+    #    by an atpkg install or update, or one `ls` in a tab with agents/), and
+    #    `set -E` fired the ERR trap (measured on bash 3.2.57 and 5.2.37).
     __aterm_atpkg_hook_read
     if [ "$__aterm_atpkg_hook_now" != "$__aterm_atpkg_hook_seen" ]; then
         __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
         if [[ -n "$__aterm_atpkg_hook_now" ]]; then
             . "$__aterm_atpkg_hook"
-            __aterm_managed_derive_reroute
+            __aterm_managed_derive_reroute || :
             __aterm_reroute_path_front
             return 0
         fi
@@ -559,7 +641,7 @@ __aterm_managed_path_live() {
     fi
     # 4. The twin watch: the two managed names always walk PATH afresh.
     if (( __aterm_managed_agents_on )); then
-        hash -d claude codex 2>/dev/null
+        hash -d claude codex 2>/dev/null || :
     fi
     return 0
 }
@@ -595,11 +677,14 @@ __aterm_rekey_check() {
 # the empty string otherwise. Reads from the captured local — never from
 # the environment — so the nonce is not inherited by subprocesses.
 # Kept as the documented helper / external entry point; the hot emitters
-# below use $__aterm_id_suffix_str instead to avoid a fork per marker.
+# below use $__aterm_id_suffix_str instead to avoid a fork per marker. Not
+# traced (see THE TRACE): under its caller's `set -x` it printed the nonce.
 __aterm_id_suffix() {
+    { local __aterm_flags=$-; set +xv; } 2>/dev/null
     if [[ -n "$__aterm_shell_nonce" ]]; then
         printf ';id=%s' "$__aterm_shell_nonce"
     fi
+    __aterm_flags_put "$__aterm_flags"
 }
 
 # Percent-encode a string for use in file:// URIs (RFC 3986).
@@ -637,14 +722,60 @@ __aterm_urlencode() {
         esac
     done
     # Emitted once rather than streamed per character; the sole caller already
-    # captures the whole result via `cwd=$(__aterm_urlencode "$PWD")`.
+    # captures the whole result via `cwd=$(__aterm_urlencode "$cwd")`.
     printf '%s' "$out"
+}
+
+# Git Bash, MSYS2 and Cygwin run on Windows with a POSIX view of it: $PWD is
+# `/c/Users//x`, `/cygdrive/c/x` or `/usr/bin`, none of which names a Windows
+# directory, so aterm could neither show it nor open a tab there. There OSC 7
+# carries the RFC 8089 drive form the pwsh integration sends, `/C:/Users//x`,
+# with the colon percent-encoded like any byte outside the class above.
+case "$OSTYPE" in
+    msys* | cygwin*) __aterm_win_posix=1 ;;
+    *) __aterm_win_posix= ;;
+esac
+__aterm_win_cwd_from=
+__aterm_win_cwd_to=
+
+# Set __aterm_win_cwd_to to the Windows form of POSIX path $1 (a variable, not
+# output, so the per-prompt caller forks nothing for it).
+__aterm_win_cwd() {
+    local LC_ALL=C p="$1" d w
+    [[ "$p" == "$__aterm_win_cwd_from" ]] && return
+    __aterm_win_cwd_from="$p"
+    # MSYS mounts drive X at /x: rewrite that by expansion alone.
+    if [[ "$OSTYPE" == msys* && ("$p" == /[a-zA-Z] || "$p" == /[a-zA-Z]/*) ]]; then
+        d="${p:1:1}"
+        case "$d" in
+            [a-z])
+                w=abcdefghijklmnopqrstuvwxyz
+                w="${w%%"$d"*}"
+                d=ABCDEFGHIJKLMNOPQRSTUVWXYZ
+                d="${d:${#w}:1}"
+                ;;
+        esac
+        __aterm_win_cwd_to="/$d:${p:2}"
+        return
+    fi
+    # Anything else (/usr/bin, /tmp, Cygwin's /cygdrive/c) goes through the
+    # shell's own mount table, once per directory.
+    w=$(cygpath -m -- "$p" 2>/dev/null)
+    case "$w" in
+        [a-zA-Z]:*) __aterm_win_cwd_to="/$w" ;;
+        //*) __aterm_win_cwd_to="$w" ;;
+        *) __aterm_win_cwd_to="$p" ;;
+    esac
 }
 
 # Report current working directory (OSC 7)
 __aterm_report_cwd() {
-    local cwd
-    cwd=$(__aterm_urlencode "$PWD")
+    local cwd="$PWD"
+    if [[ -n "$__aterm_win_posix" ]]; then
+        __aterm_win_cwd "$cwd"
+        cwd="$__aterm_win_cwd_to"
+    fi
+    cwd=$(__aterm_urlencode "$cwd")
     __aterm_osc "7;file://${HOSTNAME:-$(hostname)}${cwd}"
 }
 
@@ -711,12 +842,54 @@ __aterm_mark_integration_rev() {
     __aterm_osc "633;P;AtermIntegration=${__aterm_body_rev}${__aterm_id_suffix_str}"
 }
 
-# Capture command before execution
-# Uses DEBUG trap which fires before each command
+# Capture command before execution. The DEBUG trap's entry, which fires before
+# each command: XTRACE and VERBOSE off first, and put back as it returns (see THE
+# TRACE), around the work below. It returns 0: under a user's `extdebug` a DEBUG
+# trap that returns non-zero skips the command.
+#
+# The trap hands it the user's `$_` (its command is `__aterm_preexec "$_"`): bash
+# sets `$_` to the last argument of the simple command that ran last, and before
+# each of the user's commands that is the trap's own, so its last argument is
+# what `$_` reads after it — bash-preexec's technique. Called bare, the trap left
+# `$_` reading `__aterm_preexec` before every command, and `mkdir -p d && cd
+# "$_"` said `cd: __aterm_preexec: No such file or directory` (measured on bash
+# 3.2.57 and 5.2.37; bare bash enters d). A shell whose loader set the bare trap
+# keeps it — the wiring is the loader's, once per shell — and calls this with no
+# argument; its next tab has the fixed one.
+#
+# The work is handed the function the trap fired in, the shell's own
+# `FUNCNAME[1]` — only under function tracing (`T` in `$-`: `set -o functrace`,
+# or bash 4+'s `extdebug`), the one mode in which the trap fires inside a
+# function. Without it a function that calls this one wraps the trap — what
+# starship's init does on bash < 4.4 when it finds a DEBUG trap set: it sets the
+# trap to a function of its own, which evals the one it found. Taken for "the
+# trap fired in a function", every command typed after such a wrapper went
+# unreported (no 633;E or 133;C; measured with starship's layering typed at a
+# prompt, on bash 3.2.57 and 5.2.37).
 __aterm_preexec() {
+    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    local __aterm_in_fn=""
+    case $__aterm_flags in *T*) __aterm_in_fn=${FUNCNAME[1]-} ;; esac
+    # Past the command's first simple command there is nothing to capture, so
+    # only a chained handler is left to run.
+    if [[ -n "$__aterm_prev_debug_handler" || -z "$__aterm_last_command" ]]; then
+        __aterm_preexec_run "${1-}" "$__aterm_in_fn"
+    fi
+    # Put back only a flag it turned off: the trap fires before every simple
+    # command at the top level (each pass of a loop typed at the prompt), and
+    # the silenced `return` costs a redirection. `case` returns 0 (extdebug).
+    case $__aterm_flags in *[xv]*) __aterm_flags_put "$__aterm_flags" ;; esac
+}
+
+__aterm_preexec_run() {
     # Always chain the previous DEBUG trap handler first, before any early
-    # returns, so pre-existing handlers (starship, pyenv, etc.) always run.
-    [[ -n "$__aterm_prev_debug_handler" ]] && eval "$__aterm_prev_debug_handler"
+    # returns, so pre-existing handlers (starship, pyenv, etc.) always run —
+    # with the user's flags, `$?` 0 and the user's `$_`, and re-taking the
+    # flags after it, which it may change.
+    if [[ -n "$__aterm_prev_debug_handler" ]]; then
+        __aterm_flags_put "$__aterm_flags" 0 "$1" && eval "$__aterm_prev_debug_handler"
+        { __aterm_flags=$-; set +xv; } 2>/dev/null
+    fi
 
     # Skip if this is from PROMPT_COMMAND (ours or the user's original).
     # PROMPT_COMMAND may be an ARRAY (bash 5.1+): bash runs EVERY element as
@@ -734,6 +907,17 @@ __aterm_preexec() {
         [[ "$BASH_COMMAND" == "$__aterm_pc_elem" ]] && return
     done
     [[ "$BASH_COMMAND" == "__aterm_"* ]] && return
+    # Nor a line of a function: the line the user typed runs at the top level,
+    # and the trap fires inside a function (`$2`) only under the user's `set -o
+    # functrace` (`set -T`; bash-preexec's subshell mode sets it, and bash 4+'s
+    # `extdebug` turns it on), for a function the shell is already running. There
+    # it fired for the lines of aterm's prompt handler after it lowers the
+    # in-prompt flag, and of the trampoline before it raises it: every prompt
+    # reported `return $last_status` as the user's command, its 133;C before the
+    # prompt's 133;B, and the command typed at it got no 633;E or 133;C at all
+    # (measured on bash 3.2.57 and 5.2.37). Any function, not only aterm's: one
+    # an element of an array PROMPT_COMMAND runs is no command typed either.
+    [[ -n "$2" ]] && return
 
     # Only capture the first command (not subshells)
     if [[ -z "$__aterm_last_command" ]]; then
@@ -792,9 +976,15 @@ __aterm_tty_repair() {
 }
 
 # PROMPT_COMMAND handler - runs before each prompt, from the loader's trampoline,
-# which hands it the status the command before it left.
+# which hands it the status the command before it left, the user's flags with
+# XTRACE and VERBOSE already off, and the user's `$_`; the flags are the
+# trampoline's `__aterm_flags`, which this re-takes after the user's own
+# PROMPT_COMMAND and the trampoline puts back (see THE TRACE). A loader from
+# before it hands the status alone, with the user's flags still on: they are
+# taken and turned off here, and put back at the end.
 __aterm_body_prompt_command() {
-    local last_status=$1
+    { [[ -n ${2+x} ]] || local __aterm_flags=$-; set +xv; } 2>/dev/null
+    local last_status=$1 __aterm_lastarg=${3-}
     __aterm_last_exit=$last_status
     __aterm_in_prompt_cmd=1
 
@@ -840,10 +1030,23 @@ __aterm_body_prompt_command() {
     # Run original PROMPT_COMMAND if any (scalar case only).
     # When PROMPT_COMMAND is an array, bash chains array elements automatically;
     # we prepended ourselves at index 0, so the rest run without eval.
-    # Restore $? so the user's prompt sees the real exit status.
+    # It reads the `$?` and `$_` the command left, and runs with the user's
+    # flags, as in bare bash (see THE TRACE). A status other than 0 is handed on
+    # as a function's return on the left of `||`, which is no failed command to
+    # a user's ERR trap or `set -e` — the zsh script's `__aterm_line_init_pass`.
+    # The `( exit $last_status )` here was one: the ERR trap fired for it under
+    # `set -E`, and after a command that failed where bash does not stop
+    # (`false && true`) `set -e` closed the shell (measured on bash 3.2.57 and
+    # 5.2.37).
     if ! (( __aterm_prompt_cmd_is_array )) && [[ -n "$__aterm_original_prompt_command" ]]; then
-        ( exit $last_status )
-        eval "$__aterm_original_prompt_command"
+        if (( last_status )); then
+            __aterm_flags_put "$__aterm_flags" "$last_status" "$__aterm_lastarg" ||
+                eval "$__aterm_original_prompt_command"
+        else
+            __aterm_flags_put "$__aterm_flags" 0 "$__aterm_lastarg" &&
+                eval "$__aterm_original_prompt_command"
+        fi
+        { __aterm_flags=$-; set +xv; } 2>/dev/null
     fi
 
     # One-shot prompt setup. Runs after the original PROMPT_COMMAND so it
@@ -864,17 +1067,51 @@ __aterm_body_prompt_command() {
         local __aterm_b_suffix=""
         [[ -n "$__aterm_shell_nonce" ]] && __aterm_b_suffix=";id=${__aterm_shell_nonce}"
         local __aterm_b="\[\033]133;B${__aterm_b_suffix}\a\]"
-        # Strip any previous variant (with or without a nonce suffix) so
-        # nonce rotation does not leave stale id= tails on PS1.
-        local __aterm_b_re='\\\[\\033\]133;B(;id=[0-9a-fA-F]+)?\\a\\\]$'
-        if [[ "$PS1" =~ $__aterm_b_re ]]; then
-            PS1="${PS1%${BASH_REMATCH[0]}}"
-        fi
+        # Strip every previous variant (with or without a nonce suffix) so
+        # nonce rotation does not leave stale id= tails on PS1. Only a suffix
+        # that is a whole mark goes: the last `\[\033]133;B`, then `\a\]` or
+        # `;id=<hex>\a\]` and nothing else. Found with QUOTED globs and cut by
+        # LENGTH, never `${PS1%…}` or a regex: unquoted, the mark's backslashes
+        # read as glob escapes; a regex matches nothing in a PS1 holding a byte
+        # the tab's UTF-8 locale cannot decode (a Latin-1 `Gruß`); and bash 5's
+        # `%` empties a PS1 that starts with such a byte before a backslash.
+        # Each of the first two left PS1 gaining a mark at every prompt (review
+        # findings 2026-10-01). A loop, so a shell that grew them under an older
+        # body sheds them all at its next prompt; each pass removes a non-empty
+        # suffix, so it ends.
+        local __aterm_b_lead='\[\033]133;B' __aterm_b_end='\a\]'
+        local __aterm_b_tail __aterm_b_id
+        while [[ "$PS1" == *"$__aterm_b_lead"* ]]; do
+            __aterm_b_tail="${PS1##*"$__aterm_b_lead"}"
+            if [[ "$__aterm_b_tail" != "$__aterm_b_end" ]]; then
+                [[ "$__aterm_b_tail" == ";id="?*"$__aterm_b_end" ]] || break
+                __aterm_b_id="${__aterm_b_tail:4:${#__aterm_b_tail}-4-${#__aterm_b_end}}"
+                [[ "$__aterm_b_id" != *[!0-9a-fA-F]* ]] || break
+            fi
+            PS1="${PS1:0:${#PS1}-${#__aterm_b_lead}-${#__aterm_b_tail}}"
+        done
         PS1="${PS1}${__aterm_b}"
     fi
 
+    # PS1 now carries the nonce (either 133;B above or __aterm_set_prompt's), so
+    # it must not ride into a child's environment (#8015). A PS1 the user's rc
+    # exported, or one bash imported from its own environment, keeps the export
+    # attribute through every reassignment; drop it here, every prompt, after
+    # the user's PROMPT_COMMAND and before any command they type, so a later
+    # `export PS1` is undone too. A builtin, no fork; bash 3.2 has it; on an
+    # unset PS1 it creates nothing.
+    export -n PS1
+
+    # It returns 0, whatever the command's status. PROMPT_COMMAND's status is a
+    # command's to a user's ERR trap, which fired again at the prompt after
+    # every failed command (bare bash: once, for the command; twice more under
+    # `set -E`), and to `set -e`, which closed the shell at the prompt after a
+    # failure bash itself lets pass (`false && true`). Nothing needs it: bash
+    # puts `$?` back after PROMPT_COMMAND — and after each element of an array
+    # one, which run after it — so PS1 reads the command's (measured on bash
+    # 3.2.57 and 5.2.37).
     __aterm_in_prompt_cmd=0
-    return $last_status
+    [[ -n ${2+x} ]] || __aterm_flags_put "$__aterm_flags"
 }
 
 # ─── Prompt Override ───
@@ -923,8 +1160,11 @@ __aterm_set_prompt() {
 }
 
 # Error-aware prompt character: separator color on success, error color on failure.
-# Uses \001/\002 (raw \[/\]) since this is called via $() inside PS1.
+# Uses \001/\002 (raw \[/\]) since this is called via $() inside PS1. Like the
+# segment below, it runs in the subshell the `$()` makes, so XTRACE and VERBOSE
+# go off for it alone (see THE TRACE).
 __aterm_err_prompt() {
+    { set +xv; } 2>/dev/null
     if [[ ${__aterm_last_exit:-0} -ne 0 ]]; then
         printf '\001\033[38;5;%sm\002$\001\033[0m\002 ' "${ATERM_PROMPT_ERROR_COLOR:-1}"
     else
@@ -933,6 +1173,7 @@ __aterm_err_prompt() {
 }
 
 __aterm_git_segment() {
+    { set +xv; } 2>/dev/null
     local branch
     branch=$(command git rev-parse --abbrev-ref HEAD 2>/dev/null) || return
     [[ -n "$branch" ]] && printf ' (%s)' "$branch"
@@ -980,8 +1221,8 @@ __aterm_setup_keybindings() {
 # re-sourced live leaves the user's bindings alone.
 
 # The body ends in success: the loader moves its revision only when the source
-# returned 0.
-true
+# returned 0. The flags it found go back last (see THE TRACE); that returns 0.
+__aterm_flags_put "$__aterm_body_flags"
 
 # @@ATERM-INTEGRATION-BODY-END@@
 
@@ -1030,5 +1271,10 @@ if (( __aterm_fresh_load )); then
     else
         PROMPT_COMMAND="__aterm_prompt_command"
     fi
-    trap '__aterm_preexec' DEBUG
+    # The user's `$_` handed through (see `__aterm_preexec`).
+    trap '__aterm_preexec "$_"' DEBUG
 fi
+
+# The user's flags, as the load found them (see THE TRACE). A function of
+# aterm's, so the trap just set does not take the line for a user's command.
+__aterm_flags_put "$__aterm_load_flags"

@@ -6,26 +6,13 @@
 
 //! LZ4 Block Format
 //!
-//! As defined in <https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md>
-//!
-//! Currently for no_std support only the block format is supported.
-//!
-//! # Example: block format roundtrip
-//! ```
-//! use aterm_lz4::block::{compress_prepend_size, decompress_size_prepended};
-//! let input: &[u8] = b"Hello people, what's up?";
-//! let compressed = compress_prepend_size(input);
-//! let uncompressed = decompress_size_prepended(&compressed).unwrap();
-//! assert_eq!(input, uncompressed);
-//! ```
-//!
+//! As defined in <https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md>.
 
 pub(crate) mod compress;
 pub(crate) mod hashtable;
 
-// The upstream raw-pointer decoder (`decompress.rs`) was never compiled here:
-// every consumer built the bounds-checked one, so it was deleted rather than
-// carried as untested unsafe code.
+// Upstream's raw-pointer `decompress.rs` is not carried; the bounds-checked
+// decoder takes its name.
 pub(crate) mod decompress_safe;
 pub(crate) use decompress_safe as decompress;
 
@@ -51,9 +38,8 @@ const MFLIMIT: usize = 12;
 /// bytes.
 const LAST_LITERALS: usize = 5;
 
-/// Due the way the compression loop is arrange we may read up to (register_size - 2) bytes from the
-/// current position. So we must end the matches 6 bytes before the end, 1 more than required by the
-/// spec.
+/// The compression loop may read up to (register_size - 2) bytes past the current position, so
+/// matches end 6 bytes before the end of input: 1 more than the spec requires.
 const END_OFFSET: usize = LAST_LITERALS + 1;
 
 /// https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md#end-of-block-restrictions
@@ -138,19 +124,15 @@ impl Error for CompressError {}
 /// the rest of the bytes after the length encoding.
 #[inline]
 pub fn uncompressed_size(input: &[u8]) -> Result<(usize, &[u8]), DecompressError> {
-    // Read the 4 little-endian length bytes via explicit `get`s (not
-    // `&input[..4].try_into()`): slice→array `TryInto::try_into` is a std absent
-    // callee the fail-closed verifier cannot prove panic-free, and direct
-    // indexing after a `len() < 4` guard doesn't chain to the bounds obligation
-    // in the verifier's model. Each `get` lowers to native MIR and returns the
-    // same clean error on a truncated header. Behavior-identical.
+    // Explicit `get`s, not `input[..4].try_into()`: slice→array `try_into` is
+    // a std absent callee the verifier cannot prove panic-free, and indexing
+    // after a `len() < 4` guard does not discharge the bounds obligation.
     let (b0, b1, b2, b3) = match (input.first(), input.get(1), input.get(2), input.get(3)) {
         (Some(&b0), Some(&b1), Some(&b2), Some(&b3)) => (b0, b1, b2, b3),
         _ => return Err(DecompressError::ExpectedAnotherByte),
     };
     let uncompressed_size = u32::from_le_bytes([b0, b1, b2, b3]) as usize;
-    // `get(4..)` on a `len >= 4` slice (all four `get`s above succeeded) is
-    // always `Some` (empty tail when `len == 4`); the match keeps it total.
+    // Always `Some` after the four `get`s; the match keeps it total.
     let rest = match input.get(4..) {
         Some(rest) => rest,
         None => return Err(DecompressError::ExpectedAnotherByte),

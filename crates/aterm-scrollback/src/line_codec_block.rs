@@ -27,7 +27,9 @@ pub fn serialize_lines(lines: &[Line]) -> Vec<u8> {
     // The estimate is only a capacity hint (never affects the serialized
     // bytes): saturating arithmetic and the pre-allocation bound keep the
     // strict L0 gate's overflow / allocation-budget obligations provable,
-    // while every real block remains far below the 64 MiB page cap.
+    // while a block the warm tier stores passes the 64 MiB page cap only
+    // when a single line over the cap gets a page of its own
+    // (`serialize_pages`).
     let estimate = lines
         .iter()
         .map(Line::serialized_size_estimate)
@@ -53,6 +55,71 @@ pub fn serialize_lines(lines: &[Line]) -> Vec<u8> {
     }
     result
 }
+
+/// [`serialize_lines`] for a store that must decode what it writes: the lines
+/// in consecutive pages, oldest first, as `(lines in the page, page bytes)`,
+/// none longer than `max_page_bytes` unless one line alone is, which then gets
+/// a page of its own. A page is byte-identical to `serialize_lines` of its
+/// lines, and lines that fit make exactly one page.
+///
+/// MEASURED, not estimated: a record that overflows its page is taken back
+/// off it and starts the next one, so the bound holds whatever the size
+/// estimate says.
+// Skip: same PtrMetadata/extend alloc class as `serialize_lines`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn serialize_pages(lines: &[Line], max_page_bytes: usize) -> Vec<(usize, Vec<u8>)> {
+    // The `serialize_lines` capacity hint, for the one page lines that fit
+    // make; a page past the first starts unreserved.
+    let estimate = lines
+        .iter()
+        .map(Line::serialized_size_estimate)
+        .fold(4usize, usize::saturating_add)
+        .min(max_page_bytes);
+    let mut pages = Vec::with_capacity(1);
+    let mut page = Vec::with_capacity(estimate);
+    page.extend_from_slice(&[0; 4]);
+    let mut count = 0usize;
+    for line in lines {
+        let mark = page.len();
+        line.append_serialized(&mut page);
+        if page.len() > max_page_bytes && count > 0 {
+            page.truncate(mark);
+            pages.push(seal_page(page, count));
+            page = Vec::from([0; 4]);
+            line.append_serialized(&mut page);
+            count = 0;
+        }
+        count = count.saturating_add(1);
+    }
+    if count > 0 {
+        pages.push(seal_page(page, count));
+    }
+    pages
+}
+
+/// Write a [`serialize_pages`] page's `[count:4]` header (saturating at
+/// `u32::MAX`, as [`serialize_lines`] does).
+fn seal_page(mut page: Vec<u8>, count: usize) -> (usize, Vec<u8>) {
+    if let Some(header) = page.get_mut(..4) {
+        header.copy_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
+    }
+    (count, page)
+}
+
+// Pages split only at line boundaries, so the store's pages all decode only if
+// the largest record an honest grid writes fits one alone: the content cap, 15
+// bytes of framing, and per column of the widest grid (`MAX_HYPERLINK_SPANS`)
+// an attribute run (14 bytes), an underline colour (8) and a link at the
+// ingestion caps. About 37 MB against the 64 MiB page cap.
+const _: () = assert!(
+    max_linked_record_bytes(
+        super::line_codec::MAX_LINE_CONTENT_BYTES
+            + 15
+            + super::line_codec::MAX_HYPERLINK_SPANS * (14 + 8),
+        super::line_codec::MAX_HYPERLINK_SPANS,
+    ) + 4
+        <= crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES
+);
 
 /// Compute the byte size of a legacy (v0) line record.
 ///
@@ -230,6 +297,24 @@ fn hyperlinks_size_v3(data: &[u8], base_size: usize) -> Option<usize> {
 /// never clip a LEGITIMATE block — it only rejects a crafted over-count one.
 pub(crate) const MAX_DECODE_PAGE_LINES: usize = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// Serialized line records this thread's block walks have accepted — the unit
+    /// of DECODE WORK every read of a warm block or cold page pays. Counted HERE,
+    /// at the one walk both the real decode ([`deserialize_lines_capped`]) and the
+    /// eviction's framing check ([`count_page_lines`]) run, so a regression that
+    /// decompresses the whole scrollback to trim one line (the #5893 truncate, the
+    /// #5918 remove_newest) shows up as a count proportional to the scrollback,
+    /// whatever the clock says. Thread-local: parallel tests do not share it.
+    static RECORDS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Read and reset this thread's [`RECORDS_WALKED`].
+#[cfg(test)]
+pub(crate) fn take_records_walked() -> usize {
+    RECORDS_WALKED.with(|c| c.replace(0))
+}
+
 /// Walk the framed records of a serialized block, offering each COMPLETE record's
 /// bytes to `accept`.
 ///
@@ -295,6 +380,8 @@ fn walk_records(
         offset = line_end;
     }
 
+    #[cfg(test)]
+    RECORDS_WALKED.with(|c| c.set(c.get() + accepted));
     (accepted, offset)
 }
 
@@ -313,12 +400,9 @@ fn declared_count(data: &[u8]) -> Option<usize> {
 /// [`deserialize_lines_capped`]).
 ///
 /// The warm→cold eviction path re-compresses the decompressed page bytes
-/// verbatim, so all it needs from them is the framing check
-/// `deserialize_page_lines(..).len()` used to provide — not the `Vec<Line>` that
-/// check built and dropped. At the default tier limits an eviction fires once per
-/// 100 pushed lines, so that materialization amortized to a full `Line`
-/// construct+destruct (heap content copy, boxed attrs `Rle`, boxed hyperlink
-/// `SmallVec`) for EVERY line aging out of the warm tier, on the output thread.
+/// verbatim, so it needs only the framing check, not a `Vec<Line>`. Building
+/// one would cost a full `Line` construct+destruct for EVERY line aging out of
+/// the warm tier, on the output thread.
 ///
 /// Same framing walk and same acceptance predicate as the real decode — see
 /// [`walk_records`] and `Line::record_is_valid`. Deliberately silent: the

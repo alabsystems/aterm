@@ -3,11 +3,15 @@
 
 [package]
 name = "aterm-buffer"
+# Integration tests are declared below, not discovered: every file is a module
+# of the one `buffer_suite` binary, which mounts `tests/support/` once. With
+# autotests off a `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm buffer-primitives kernel (ATERM_DESIGN §4): the 11-verb BufferApi over the single event-log spine. RING-3, FROZEN at M1."
+description = "aterm buffer-primitives kernel: a text-line Surface over one bounded event-log spine (apply, read_text, snapshot, subscribe/poll, transact)."
 
 [dependencies]
 # The capability witnesses: `ReadCap`/`WriteCap` are `aterm_cap::Cap<E>`, so
@@ -15,13 +19,16 @@ description = "aterm buffer-primitives kernel (ATERM_DESIGN §4): the 11-verb Bu
 aterm-cap = { workspace = true }
 
 [dev-dependencies]
-# The tests are their own trusted launcher: `launcher-mint` on the dev edge only
-# (aterm-cap's `mint_reachability` gate allows dev enablers, never production).
+# The tests are their own trusted launcher: `launcher-mint` on the dev edge
+# only (aterm-cap's `mint_reachability` gate refuses it in production).
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
-proptest = { workspace = true }
-# Tier-1 conformance (conformance_eventlog.rs) validates the real EventLog
-# against the DERIVED ring spec generated from aterm_spec::derive::ring_model().
+# Tier-1 conformance: the derived models in `aterm_spec::derive`, checked
+# against the real `Surface`/`EventLog`.
 aterm-spec = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "buffer_suite"
+path = "tests/buffer_suite.rs"

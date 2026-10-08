@@ -3,9 +3,6 @@
 // Author: Andrew Yates
 
 //! Clipboard types for OSC 52 and OSC 1337 clipboard operations.
-//!
-//! Extracted from `aterm-core::terminal::types::clipboard` to break circular
-//! dependencies (Part of #5663, #2341).
 
 // ============================================================================
 // OSC 52 Clipboard Types

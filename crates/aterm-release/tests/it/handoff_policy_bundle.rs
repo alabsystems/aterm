@@ -28,11 +28,15 @@ fn repo_root() -> PathBuf {
 /// in its default tier: `Ok` when the seal is intact.
 #[cfg(target_os = "macos")]
 fn verify_seal(app: &Path) -> Result<(), String> {
-    let out = std::process::Command::new("/usr/bin/codesign")
-        .args(["--verify", "--deep", "--strict"])
-        .arg(app)
-        .output()
-        .map_err(|e| format!("run codesign: {e}"))?;
+    // Under a hang detector: a codesign macOS stops answering mid-run fails
+    // this test in a minute instead of hanging the suite.
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(app),
+        std::time::Instant::now() + aterm_uds::deadline::CODESIGN_HANG,
+    )
+    .map_err(|e| format!("run codesign: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -47,6 +51,10 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
         BUNDLE_PATH, PolicyRead, SOURCE_PATH, read_from_bundle,
     };
 
+    // Signing and verifying a copy of an Apple binary wait on trustd.
+    if aterm_uds::deadline::trust_service_silent() {
+        return;
+    }
     let repo = repo_root();
     let scratch = std::env::temp_dir().join(format!(
         "aterm-release-policy-bundle-{}",

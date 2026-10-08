@@ -6,7 +6,7 @@
 use super::*;
 
 // ===================================================================
-// THE WAKE CENSUS AT THE SEAM (after2-measure, residual (i)).
+// The wake census at the seam.
 // ===================================================================
 
 /// One gesture of the confirmation capture's schedule.
@@ -22,10 +22,10 @@ enum CensusGesture {
     Enter,
 }
 
-/// The BEFORE capture's schedule (`capture-before.md`), in ms from the
-/// first key: 35 keys at 70 ms, a 1.5 s pause, 9 keys at 35 ms, a 1 s
-/// pause, four Ctrl-A / Ctrl-E jumps 500 ms apart, four backspaces at
-/// 100 ms, Enter, and the tail the lane is judged on.
+/// The capture schedule, in ms from the first key: 35 keys at 70 ms, a 1.5 s
+/// pause, 9 keys at 35 ms, a 1 s pause, four Ctrl-A / Ctrl-E jumps 500 ms
+/// apart, four backspaces at 100 ms, Enter, and the tail the lane is judged
+/// on.
 fn census_schedule() -> Vec<(u64, CensusGesture)> {
     let mut s = Vec::new();
     let mut t = 0u64;
@@ -81,9 +81,9 @@ struct SeamCensus {
     /// ms after the last gesture at which `needs_frame_cadence` first read
     /// `false` (and stayed so).
     cadence_false_ms: Option<u64>,
-    /// ms after the last gesture at which the ENGINE's own brisk light
-    /// first released (`Engine::needs_frame_cadence` false, and stayed
-    /// so) — the seam may not hold the train past this.
+    /// ms after the last gesture at which the engine's own brisk light first
+    /// released (`Engine::needs_frame_cadence` false, and stayed so); the seam
+    /// may not hold the train past this.
     engine_brisk_false_ms: Option<u64>,
     /// ms after the last gesture at which `next_change_deadline` first read
     /// `None`.
@@ -92,10 +92,9 @@ struct SeamCensus {
     crown_last_ms: Option<u64>,
 }
 
-/// Drive the seam through [`census_schedule`] as the host's lane would: a
-/// wake at every gesture and at every deadline the seam offers, one tick
-/// per wake, and the owner of the deadline it offers next. The engine is
-/// v2 — the only rainbow kitty since phase 7; `lane` is the host's
+/// Drive the seam through [`census_schedule`] as the host's lane would: a wake
+/// at every gesture and every deadline the seam offers, one tick per wake,
+/// recording the owner of each offered deadline. `lane` is the host's
 /// effect-present interval.
 fn seam_wake_census(lane: Duration) -> SeamCensus {
     let g = Geom {
@@ -226,15 +225,10 @@ fn seam_wake_census(lane: Duration) -> SeamCensus {
     census
 }
 
-/// THE SEAM'S WAKE CENSUS, printed for the record (`--nocapture`): the
-/// confirmation capture's schedule through v2, wakes by owner. The law
-/// it pins is the seam half of residual (i): under v2 the crown — v1's,
-/// replaced by v2's own head light — never holds the frame train, and
-/// the seam's cadence follows the ENGINE's (false within a tick of the
-/// engine's 83 ms, not v1's 350 ms typing crown). The v1 control that
-/// once bounded v2's train (v2's brisk wakes ≤ every wake v1 asked for;
-/// it held) died with v1 at phase 7 — the remaining clauses are
-/// absolute.
+/// The seam's wake census, printed with `--nocapture`: wakes by owner over the
+/// capture schedule. Pins that no crown holds the frame train and that the
+/// seam's cadence follows the engine's (false within a tick of the engine's
+/// 83 ms).
 #[test]
 fn under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown() {
     let lane = Duration::from_micros(16_667);
@@ -263,9 +257,8 @@ fn under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown() {
         0,
         "a v1 brisk pool held the frame train under v2"
     );
-    // The seam releases the train on the ENGINE's word — the retracting
-    // mark after Enter is brisk light by the ribbon's own law, and no v1
-    // term may outlive it.
+    // The seam releases the train on the engine's word: the retracting mark
+    // after Enter is brisk light by the ribbon's own law.
     let cadence_false = v2
         .cadence_false_ms
         .expect("the seam's cadence never released");
@@ -281,21 +274,14 @@ fn under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown() {
         "the seam offered wakes {none} ms after the last key"
     );
     assert_eq!(v2.fp_only, 0, "a fingerprint-only pin with no deadline");
-    // v2's brisk wakes are its only frame-cadence wakes; its tail wakes
-    // are paced steps (≥ `TAIL_FLOOR` apart), each a visible change, and
-    // are counted separately above — so the train is at most ONE wake
-    // per lane tick over the session (the last gesture plus the cadence
-    // the seam held after it): a brisk wake the lane did not tick for is
-    // a busy re-arm. Measured 2026-09-06 on this schedule: 474 brisk
-    // wakes against 502 lane ticks (7 960 ms of gestures + 399 ms of
-    // cadence at 16.667 ms).
+    // v2's brisk wakes are its only frame-cadence wakes; tail wakes are paced
+    // steps (≥ `TAIL_FLOOR` apart), counted separately. So the train is at
+    // most one wake per lane tick over the session (the last gesture plus the
+    // cadence held after it); an unticked brisk wake is a busy re-arm.
     //
-    // This fixture feeds the engine NO glyph probe, so not one stardust
-    // star of any lane is born in the whole script and the brisk wakes
-    // counted here are the RIBBON's and the METEOR's: 346 with
-    // `sow_exhaust` compiled out and 346 with it in (measured
-    // 2026-09-16). The exhaust's frame-train cost is bounded where it can
-    // be seen, over a probed sky — `rk::stardust::tests::`
+    // No glyph probe is fed, so no stardust is born and these brisk wakes are
+    // the ribbon's and the meteor's. The exhaust's frame-train cost is bounded
+    // over a probed sky in `rk::stardust::tests::`
     // `the_exhaust_costs_the_frame_train_its_own_window_and_no_more`.
     let train_v2 = v2.wakes.get(&SeamOwner::V2Brisk).copied().unwrap_or(0);
     let last_ms = census_schedule().last().map_or(0, |s| s.0);

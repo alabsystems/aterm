@@ -2,20 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kani proofs for cursor movement operations (cursor_ops.rs).
-//!
-//! Verifies the documented REQUIRES/ENSURES contracts for all cursor
-//! movement functions in `Grid`. Uses `Grid::kani_mock` with fixed
-//! 4×8 dimensions to avoid state explosion.
-//!
-//! Part of #376 (terminal module proof coverage gap).
+//! Kani proofs for cursor movement (cursor_ops.rs): the REQUIRES/ENSURES
+//! contracts of `Grid`'s cursor functions, on a fixed 4×8 `Grid::kani_mock`.
 
 use super::*;
 use crate::Cell;
 
-// =============================================================================
 // Cursor positioning
-// =============================================================================
 
 /// `set_cursor` clamps row and col to valid bounds.
 ///
@@ -62,14 +55,10 @@ fn move_cursor_to_clamps_to_bounds() {
     );
 }
 
-// =============================================================================
 // cursor_up / cursor_down — scroll region margin respect
-// =============================================================================
 
-/// `cursor_up` respects the scroll region top margin.
-///
-/// When the cursor starts within the scroll region, it stops at `scroll_region.top`.
-/// When outside the scroll region, it stops at row 0.
+/// `cursor_up` stops at `scroll_region.top` when it starts inside the region,
+/// else at row 0.
 ///
 /// ENSURES: cursor.row < visible_rows
 /// ENSURES: (was in region) implies cursor.row >= scroll_region.top
@@ -129,10 +118,8 @@ fn cursor_up_outside_region_stops_at_zero() {
     );
 }
 
-/// `cursor_down` respects the scroll region bottom margin.
-///
-/// When the cursor starts within the scroll region, it stops at `scroll_region.bottom`.
-/// When outside the scroll region, it stops at the last row.
+/// `cursor_down` stops at `scroll_region.bottom` when it starts inside the
+/// region, else at the last row.
 ///
 /// ENSURES: cursor.row < visible_rows
 /// ENSURES: (was in region) implies cursor.row <= scroll_region.bottom
@@ -170,9 +157,7 @@ fn cursor_down_respects_scroll_region() {
     );
 }
 
-// =============================================================================
 // cursor_forward / cursor_backward — column bounds
-// =============================================================================
 
 /// `cursor_forward` advances column without exceeding max_col.
 ///
@@ -223,9 +208,7 @@ fn cursor_backward_stays_in_bounds() {
     );
 }
 
-// =============================================================================
 // carriage_return / backspace
-// =============================================================================
 
 /// `carriage_return` sets column to 0.
 ///
@@ -271,9 +254,7 @@ fn backspace_decrements_col() {
     }
 }
 
-// =============================================================================
 // line_feed / reverse_line_feed
-// =============================================================================
 
 /// `line_feed` keeps cursor row in bounds.
 ///
@@ -368,9 +349,7 @@ fn reverse_line_feed_behavior_in_scroll_region() {
     );
 }
 
-// =============================================================================
 // save_cursor / restore_cursor
-// =============================================================================
 
 /// `save_cursor` marks saved state as valid and preserves position.
 ///
@@ -451,14 +430,10 @@ fn save_restore_cursor_roundtrip() {
     );
 }
 
-// =============================================================================
-// set_cursor -> row_index validity chain (#6029 finding #5)
-// =============================================================================
+// set_cursor -> row_index validity chain
 
-/// After `set_cursor`, `row_index(cursor.row)` returns a valid ring buffer index.
-///
-/// Proves the full chain: clamped cursor positions are always valid for
-/// subsequent row access in live view (display_offset == 0).
+/// After `set_cursor`, `row_index(cursor.row)` is a valid ring index in live
+/// view (display_offset == 0).
 ///
 /// ENSURES: row_index(cursor.row).is_some()
 /// ENSURES: row_index(cursor.row) yields index < ring_buffer.len()

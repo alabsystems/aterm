@@ -2,20 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::supervise::ScratchDir;
 use std::path::PathBuf;
 
 const NOW: u64 = 1_790_311_076;
 const TAB: &str = "s-b5cf2faabac5ce5127bd";
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-upgrade-status-{name}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
-}
 
 fn opts(dir: &std::path::Path) -> Opts {
     Opts {
@@ -28,6 +19,9 @@ fn opts(dir: &std::path::Path) -> Opts {
         hand_back: true,
         background: false,
         aterm_state: None,
+        // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
+        ask: true,
+        several_logins: false,
     }
 }
 
@@ -54,8 +48,7 @@ fn behind_in(tab: &'static str) -> impl Fn(&BTreeSet<String>) -> Option<Vec<Hold
     }
 }
 
-/// The measured shape (2026-09-24, 03396a15): native 2.1.281 behind managed
-/// 2.1.282 since 13:09, waiting on a busy turn.
+/// A native 2.1.281 behind managed 2.1.282 since 13:09, waiting on a busy turn.
 fn pending(behind_for: u64) -> Row {
     Row {
         session: "03396a15-856e-4f1b-8174-ae9a3e4b369f".to_string(),
@@ -71,11 +64,10 @@ fn pending(behind_for: u64) -> Row {
     }
 }
 
-/// PENDING IS NOT STALLED: a session waiting for its turn end is the upgrade
-/// working, and neither the tab nor the band is marked for it. It reads
-/// stalled once it is [`STALLED_AFTER_S`] behind, when the agent runs where
-/// typing into the tab cannot reach, and when the upgrade stopped — unless
-/// the owner's own word holds it.
+/// Pending is not stalled: a session waiting for its turn end marks neither
+/// tab nor band. It reads stalled once [`STALLED_AFTER_S`] behind, when the
+/// agent runs where typing cannot reach, and when the upgrade stopped, unless
+/// the user's own word holds it.
 #[test]
 fn only_an_upgrade_that_will_not_move_on_its_own_is_stalled() {
     assert_eq!(pending(3_600).stall(NOW), None, "an hour behind is healthy");
@@ -110,11 +102,9 @@ fn only_an_upgrade_that_will_not_move_on_its_own_is_stalled() {
         assert_eq!(stopped.stall(NOW).as_deref(), Some(stall), "{why}");
         assert!(stopped.stall_words(NOW).is_some());
     }
-    // A ROUND THAT GAVE UP IS NO STALL OF ITS OWN (the owner, 2026-09-27: "you
-    // should NEVER have upgrades stalled"): it rests, and the next round asks
-    // again on its own. Its age still reads `overdue`, as every round's does,
-    // so a long-behind tab (1d22h, the owner's) says the same word through
-    // every round rather than flapping between them. Resting, it is not
+    // A round that gave up is no stall of its own: it rests and the next round
+    // asks again. Its age still reads `overdue`, as every round's does, so a
+    // long-behind tab says the same word throughout. Resting, it is not
     // `moving`: it moves only after the rest, a notice and a READY.
     for (behind, stall) in [(60, None), (46 * 3_600, Some("overdue"))] {
         let gave_up = Row {
@@ -193,10 +183,7 @@ fn the_column_names_the_state_the_target_the_reason_and_the_age() {
         request: Request::DeferUntil(NOW + 60),
         ..pending(120)
     };
-    assert_eq!(
-        deferred.column(NOW),
-        format!("deferred/2.1.282/defer-until:{}/2m", NOW + 60)
-    );
+    assert_eq!(deferred.column(NOW), "deferred/2.1.282/defer:1m/2m");
     let skipped = Row {
         request: Request::Skip("2.1.282".to_string()),
         ..pending(120)
@@ -213,6 +200,32 @@ fn the_column_names_the_state_the_target_the_reason_and_the_age() {
         ..pending(120)
     };
     assert_eq!(done.column(NOW), "done/2.1.282/-/30s");
+    // `--status`'s sentence: what holds the move, in words.
+    for (row, why) in [
+        (&deferred, "deferred by the owner's word for 1m"),
+        (&skipped, "skipped by the owner's word"),
+        (&restarting, "its move is under way"),
+        (&done, "done"),
+    ] {
+        assert_eq!(
+            row.summary(NOW),
+            format!("Claude Code 2.1.281 → 2.1.282: {why}")
+        );
+    }
+    // A restart that has not moved is said stuck, never "under way".
+    let stuck = Row {
+        phase: Phase::Exiting {
+            at_s: NOW - super::super::STALE_S - 1,
+        },
+        ..pending(120)
+    };
+    assert!(
+        stuck.summary(NOW).starts_with(
+            "Claude Code 2.1.281 → 2.1.282: its restart is stuck: it was asked to end"
+        ),
+        "{}",
+        stuck.summary(NOW)
+    );
     for row in [pending(1), asked, deferred, skipped, restarting, done] {
         let col = row.column(NOW);
         assert!(!col.contains(char::is_whitespace), "{col}");
@@ -220,14 +233,11 @@ fn the_column_names_the_state_the_target_the_reason_and_the_age() {
     }
 }
 
-/// THE VIEW AND THE DRIVE READ ONE WORD AFTER A GONE NOTICE (the review of
-/// 2026-09-27 asked whether they disagreed): a `--skip` or `--defer` given
-/// for the notice's tab keeps its fence when the new round moves the record
-/// to the holder's tab ([`St::notice_gone`]). The drive does not honour it
-/// there ([`St::request_for`]), and neither does the owner's row, which is
-/// read through the same fence ([`Row::of`]): no `skipped` or `deferred`
-/// shown over notices being typed. NEGATIVE CONTROL: a holder in the tab the
-/// word named is held, in both.
+/// The view and the drive read one word after a gone notice: a `--skip` or
+/// `--defer` for the notice's tab keeps its fence when the new round moves the
+/// record to the holder's tab ([`St::notice_gone`]). Neither the drive
+/// ([`St::request_for`]) nor the row ([`Row::of`]) honours it there. Negative
+/// control: a holder in the named tab is held in both.
 #[test]
 fn a_word_fenced_to_a_gone_notices_tab_holds_neither_the_view_nor_the_drive() {
     for request in [
@@ -260,18 +270,12 @@ fn a_word_fenced_to_a_gone_notices_tab_holds_neither_the_view_nor_the_drive() {
     }
 }
 
-/// N2 OF THE LIVE RE-TEST OF 2026-09-26: A RESTART WHOSE CARRY-ON IS TYPED
-/// IS RESTARTING WHILE ITS MODEL IS WAITED FOR — the column read blank for
-/// the 24 s between the carry-on and its answer: the typed path saves the
-/// record DONE with no `done_at` (set once the model is read), and the view
-/// dropped a done row that old. It reads `restarting/<to>/continued/<behind>`
-/// until `confirm_by` (the model's wait), and is handed over. PAST IT, the
-/// model still unread — it is read at the next idle point, after the
-/// carry-on's answer, which may run forty minutes (the review of the N2
-/// fix) — the row is `done`, aged from `confirm_by`, and the view names the
-/// instant it turns; the model read, `done` from then. NEGATIVE CONTROL: a
-/// done record with no `done_at` that owes nothing (an older build's) is
-/// dropped, as before.
+/// A restart whose carry-on is typed is `restarting/<to>/continued/<behind>`
+/// while its model is awaited: the typed path saves it done with no `done_at`,
+/// and until `confirm_by` it is handed over. Past it, model still unread, the
+/// row is `done`, aged from `confirm_by`, and the view names the instant it
+/// turns; with the model read, `done` from then. Negative control: a done
+/// record with no `done_at` that owes nothing is dropped.
 #[test]
 fn a_carried_on_restart_reads_restarting_while_its_model_is_waited_for() {
     let carried = Row {
@@ -282,7 +286,7 @@ fn a_carried_on_restart_reads_restarting_while_its_model_is_waited_for() {
     assert_eq!(carried.column(NOW), "restarting/2.1.282/continued/2m");
     assert_eq!(carried.column(NOW + 60), "restarting/2.1.282/continued/3m");
     assert_eq!(carried.column(NOW + 61 + 40 * 60), "done/2.1.282/-/40m");
-    let dir = scratch("confirming");
+    let dir = ScratchDir::new("upgrade-status", "confirming");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let now = now_s();
@@ -333,7 +337,7 @@ fn a_carried_on_restart_reads_restarting_while_its_model_is_waited_for() {
         sent.last().expect("sent")[0].column(now + 135),
         "done/2.1.282/-/5s"
     );
-    // NEGATIVE CONTROL: done, no `done_at`, nothing owed.
+    // Negative control: done, no `done_at`, nothing owed.
     save(
         &o,
         "aaa",
@@ -346,14 +350,13 @@ fn a_carried_on_restart_reads_restarting_while_its_model_is_waited_for() {
         sent.push(rows.to_vec())
     });
     assert!(sent.last().expect("sent").is_empty(), "{sent:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--status` reads every state file, filtered to one tab when asked, and
 /// carries how long and why.
 #[test]
 fn status_rows_come_from_the_state_files_and_filter_by_tab() {
-    let dir = scratch("rows");
+    let dir = ScratchDir::new("upgrade-status", "rows");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let mine = St {
@@ -390,7 +393,7 @@ fn status_rows_come_from_the_state_files_and_filter_by_tab() {
             "upgrade tab={TAB} session=aaa from=2.1.281 to=2.1.282(managed) phase=pending \
              pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- \
              stalled=overdue held_by=- release=- rung=land looked=- by=- point=- guard=- \
-             watch_at=15h38m"
+             watch_at=15h38m cause=own-work told=-"
         )
     );
     let json = only[0].to_json(NOW);
@@ -399,16 +402,15 @@ fn status_rows_come_from_the_state_files_and_filter_by_tab() {
         Some(30_120)
     );
     assert_eq!(json.get("stalled").and_then(Value::as_str), Some("overdue"));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// THE OWNER'S WORD lands in the tab's upgrade under the sweep lock, with a
+/// The user's word lands in the tab's upgrade under the sweep lock with a
 /// ledger line; `--now` re-arms a stopped upgrade; a restart under way and a
-/// tab with nothing recorded are refused, and a lock another sweep holds is
+/// tab with nothing recorded are refused; a lock another sweep holds is
 /// `busy:another-sweep`, writing nothing.
 #[test]
 fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold() {
-    let dir = scratch("ask");
+    let dir = ScratchDir::new("upgrade-status", "ask");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let st = St {
@@ -421,7 +423,7 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
         ..St::default()
     };
     save(&o, "aaa", &st);
-    let row = ask(&o, TAB, Ask::Now).expect("the ask lands");
+    let row = ask(&o, TAB, Ask::Now, false).expect("the ask lands");
     assert_eq!(row.request, Request::Now);
     let written = load(&o, "aaa").expect("state");
     assert_eq!(written.request, Request::Now);
@@ -434,9 +436,9 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
     let ledger = std::fs::read_to_string(super::super::ledger_path(&o)).expect("ledger");
     assert!(ledger.contains(r#""step":"requested:now""#), "{ledger}");
 
-    let row = ask(&o, TAB, Ask::Skip).expect("skip");
+    let row = ask(&o, TAB, Ask::Skip, false).expect("skip");
     assert_eq!(row.request, Request::Skip("2.1.282".to_string()));
-    let row = ask(&o, TAB, Ask::Defer(3_600)).expect("defer");
+    let row = ask(&o, TAB, Ask::Defer(3_600), false).expect("defer");
     assert!(matches!(row.request, Request::DeferUntil(t) if t >= now_s() + 3_590));
 
     // A stopped upgrade: `--now` re-arms it, and the newest live one wins.
@@ -449,13 +451,12 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
             ..st.clone()
         },
     );
-    let row = ask(&o, TAB, Ask::Now).expect("re-armed");
+    let row = ask(&o, TAB, Ask::Now, false).expect("re-armed");
     assert_eq!(row.phase, Phase::Pending);
     assert!(load(&o, "aaa").expect("state").marker.is_empty());
 
-    // REFUSED or FAILED is not re-armed (review of 2026-09-25: that restored
-    // typing, and after READY a SIGTERM, for an upgrade stopped for good):
-    // `--now` is refused and nothing is written; `--skip` still ends it.
+    // Refused or failed is not re-armed by `--now` (nothing is written);
+    // `--skip` still ends it.
     for why in [
         "not-a-shell-job",
         "argv:--print",
@@ -469,10 +470,9 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
         save(&o, "aaa", &stopped);
         // As written: the one writer stamps its progress (`St::progress_at`).
         let stopped = load(&o, "aaa").expect("saved");
-        let e = ask(&o, TAB, Ask::Now).expect_err("not re-armed");
+        let e = ask(&o, TAB, Ask::Now, false).expect_err("not re-armed");
         assert!(e.contains(&format!("stopped ({why})")), "{why}: {e}");
-        // Never "for good": it starts a new round on its own (2026-09-27),
-        // at its next look — a stop older than the stamp is due at once.
+        // Never "for good": it starts a new round at its next look.
         assert!(!e.contains("for good"), "{why}: {e}");
         assert!(
             e.contains("starts a new round on its own at its next look"),
@@ -480,13 +480,13 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
         );
         assert!(e.contains("--skip"), "{why}: {e}");
         assert_eq!(load(&o, "aaa"), Some(stopped), "{why}: nothing written");
-        let row = ask(&o, TAB, Ask::Skip).expect("a skip ends it");
+        let row = ask(&o, TAB, Ask::Skip, false).expect("a skip ends it");
         assert_eq!(row.stall(now_s()), None, "{why}");
     }
     save(&o, "aaa", &st);
 
     // Nothing recorded for another tab: refused, nothing written.
-    let e = ask(&o, "s-0000", Ask::Now).expect_err("no upgrade there");
+    let e = ask(&o, "s-0000", Ask::Now, false).expect_err("no upgrade there");
     assert!(e.contains("no upgrade is recorded"), "{e}");
 
     // A restart under way is neither held nor hurried.
@@ -499,7 +499,7 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
             ..st.clone()
         },
     );
-    let e = ask(&o, "s-busy", Ask::Defer(60)).expect_err("in flight");
+    let e = ask(&o, "s-busy", Ask::Defer(60), false).expect_err("in flight");
     assert!(e.contains("already under way"), "{e}");
     assert_eq!(
         load(&o, "ccc").expect("state").request,
@@ -517,18 +517,15 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
     assert!(started.elapsed() >= wait, "it waited its bound");
     assert_eq!(load(&o, "aaa"), before, "nothing written while busy");
     drop(held);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A WORD FOR THE BUILD THE OWNER WAS SHOWN ([`ask_for`], the window's band
-/// row and tab menu): pressed after the upgrade moved on to a newer target,
-/// no word lands — not the skip, which would skip a build the owner never
-/// saw, nor `Now` or a deferral — and nothing is written, ledgered or
-/// announced. NEGATIVE CONTROL: the same words for the target the upgrade
-/// moves to now land, as `ask`'s do (`2.1.283.0` is the same build).
+/// A word for a build the user was shown ([`ask_for`]) lands nothing once the
+/// upgrade moved to a newer target: nothing written, ledgered or announced.
+/// Negative control: the same words for the current target land
+/// (`2.1.283.0` is the same build).
 #[test]
 fn a_word_for_a_target_that_moved_on_lands_on_nothing() {
-    let dir = scratch("ask-for");
+    let dir = ScratchDir::new("upgrade-status", "ask-for");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let st = St {
@@ -568,23 +565,21 @@ fn a_word_for_a_target_that_moved_on_lands_on_nothing() {
         Request::Now,
         "written"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// THE OWNER'S WORD IS A PUSH (ours: no minute sweep reads it): a word that
-/// lands replaces the [`word_marker`] under the harness state — a new file,
-/// so the host's activation wake sees its identity change and the tab's
-/// worker takes the word at its next idle point. NEGATIVE CONTROL: a word
-/// refused (nothing recorded for the tab) replaces nothing.
+/// The user's word is a push: a word that lands replaces the [`word_marker`]
+/// file, so the host's activation wake sees it change and the tab's worker
+/// takes the word at its next idle point. Negative control: a refused word
+/// replaces nothing.
 #[test]
 fn an_owners_word_that_lands_wakes_the_window() {
     use std::os::unix::fs::MetadataExt as _;
-    let dir = scratch("word-push");
+    let dir = ScratchDir::new("upgrade-status", "word-push");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let marker = word_marker(&o.state);
     assert!(!marker.exists(), "no word yet");
-    let e = ask(&o, TAB, Ask::Now).expect_err("nothing recorded");
+    let e = ask(&o, TAB, Ask::Now, false).expect_err("nothing recorded");
     assert!(e.contains("no upgrade is recorded"), "{e}");
     assert!(!marker.exists(), "a refused word wakes nobody");
     save(
@@ -600,25 +595,22 @@ fn an_owners_word_that_lands_wakes_the_window() {
             ..St::default()
         },
     );
-    ask(&o, TAB, Ask::Now).expect("lands");
+    ask(&o, TAB, Ask::Now, false).expect("lands");
     let first = std::fs::metadata(&marker)
         .expect("the word announced")
         .ino();
-    ask(&o, TAB, Ask::Skip).expect("lands again");
+    ask(&o, TAB, Ask::Skip, false).expect("lands again");
     let second = std::fs::metadata(&marker).expect("announced again").ino();
     assert_ne!(first, second, "a new file each time: its identity changes");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// THE RELAUNCH'S RECORDS ARE NO UPGRADES: an agent relaunched after an
-/// exit, or restarted in place for its memory or its model, files its record
-/// beside the upgrade's (`St::cause`), and the owner's view neither shows it
-/// as an upgrade of the tab nor lets a word land on it. NEGATIVE CONTROL: the
-/// upgrade's own record (no cause) beside it is shown, and is the one a word
-/// lands on.
+/// Relaunch records are no upgrades: a relaunched or restarted-in-place agent's
+/// record (`St::cause`) is neither shown as an upgrade nor takes a word.
+/// Negative control: the upgrade's own record beside it is shown and takes the
+/// word.
 #[test]
 fn a_relaunchs_record_is_no_upgrade_of_the_tab() {
-    let dir = scratch("relaunch-records");
+    let dir = ScratchDir::new("upgrade-status", "relaunch-records");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let upgrade = St {
@@ -645,7 +637,7 @@ fn a_relaunchs_record_is_no_upgrade_of_the_tab() {
         );
     }
     assert!(rows_at(&o, NOW).is_empty(), "the relaunch's records only");
-    let e = ask(&o, TAB, Ask::Now).expect_err("no upgrade there");
+    let e = ask(&o, TAB, Ask::Now, false).expect_err("no upgrade there");
     assert!(e.contains("no upgrade is recorded"), "{e}");
     save(&o, "zzz", &upgrade);
     let rows = rows_at(&o, NOW);
@@ -653,18 +645,16 @@ fn a_relaunchs_record_is_no_upgrade_of_the_tab() {
         rows.iter().map(|r| r.session.as_str()).collect::<Vec<_>>(),
         ["zzz"]
     );
-    let row = ask(&o, TAB, Ask::Now).expect("the upgrade's record");
+    let row = ask(&o, TAB, Ask::Now, false).expect("the upgrade's record");
     assert_eq!(row.session, "zzz");
     assert_eq!(load(&o, "exit").expect("kept").request, Request::None);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// THE VIEW NAMES WHEN IT NEXT CHANGES BY TIME ALONE, so the host looks again
-/// then and never on a timer: an upgrade turning overdue, the owner's
-/// `--now` no longer quieting it, a `--defer` running out, a finished move
-/// leaving the summary — the earliest of them still to come. NEGATIVE
-/// CONTROLS: an overdue row with nothing else to come names nothing, and a
-/// restart in flight names nothing.
+/// The view names when it next changes by time alone (turning overdue, a
+/// `--now` expiring, a `--defer` running out, a finished move leaving the
+/// summary), the earliest to come, so the host needs no timer. Negative
+/// controls: an overdue row with nothing to come and a restart in flight name
+/// nothing.
 #[test]
 fn the_view_names_the_instant_it_next_changes() {
     assert_eq!(
@@ -700,10 +690,52 @@ fn the_view_names_the_instant_it_next_changes() {
         Some(NOW + 90).min(Some(NOW - 30 + DONE_SHOWN_S + 1)),
         "the earliest"
     );
+    // Already overdue, and busy with its own work: the next thing that reads
+    // otherwise by time alone is the digest's day (`Row::attention`).
     assert_eq!(
         next_change(&[pending(7 * 3_600)], NOW),
+        Some(NOW - 7 * 3_600 + DIGEST_AFTER_S),
+        "already overdue: the digest's day"
+    );
+    assert_eq!(
+        next_change(
+            &[Row {
+                wait: "box".into(),
+                ..pending(7 * 3_600)
+            }],
+            NOW
+        ),
         None,
-        "already overdue"
+        "already overdue, waiting on nothing that turns into news by time"
+    );
+    // A suspended agent, a draft unsent, an agent asked to end and alive, an
+    // agent gone with its resume line not typed: each names its instant.
+    for (wait, want) in [
+        ("not-foreground", NOW - 60 + SUSPENDED_AFTER_S),
+        ("draft", NOW - 60 + DIGEST_AFTER_S),
+    ] {
+        let r = Row {
+            wait: wait.into(),
+            wait_since: NOW - 60,
+            ..pending(7 * 3_600)
+        };
+        assert_eq!(r.next_attention_at(NOW), Some(want), "{wait}");
+    }
+    let hung = Row {
+        phase: Phase::Exiting { at_s: NOW - 60 },
+        ..pending(60)
+    };
+    assert_eq!(
+        hung.next_attention_at(NOW),
+        Some(NOW - 60 + HUNG_EXIT_AFTER_S + 1)
+    );
+    let gone = Row {
+        exited_at: NOW - 30,
+        ..hung
+    };
+    assert_eq!(
+        gone.next_attention_at(NOW),
+        Some(NOW - 30 + super::super::STALE_S + 1)
     );
     // A wait no rung passes turns `blocked` by time alone (ruling 380), on
     // its blocker's own clock.
@@ -719,8 +751,8 @@ fn the_view_names_the_instant_it_next_changes() {
         Some(NOW - 60 + BLOCKED_AFTER_S),
         "turning blocked"
     );
-    // A restart under way turns `stuck` at its bound, by time alone (S2 of
-    // the in-flight review, 2026-09-27) — and once stuck, changes no more.
+    // A restart under way turns `stuck` at its bound, by time alone, then
+    // changes no more.
     let restarting = Row {
         phase: Phase::Exiting { at_s: NOW },
         ..pending(60)
@@ -729,9 +761,32 @@ fn the_view_names_the_instant_it_next_changes() {
         next_change(&[restarting], NOW),
         Some(NOW + super::super::STALE_S + 1)
     );
+    // A relaunched agent that reaches no idle point turns a fault line at its
+    // own bound (`RELAUNCH_STUCK_S`), by time alone — and changes no more.
     let stuck = Row {
         phase: Phase::Relaunched {
             at_s: NOW - super::super::STALE_S - 1,
+        },
+        ..pending(60)
+    };
+    assert_eq!(
+        next_change(std::slice::from_ref(&stuck), NOW),
+        Some(NOW - super::super::STALE_S - 1 + RELAUNCH_STUCK_S)
+    );
+    let stuck = Row {
+        phase: Phase::Relaunched {
+            at_s: NOW - RELAUNCH_STUCK_S - 1,
+        },
+        ..pending(60)
+    };
+    // ... and an interrupt at twice that (`RELAUNCH_INTERRUPT_S`), then no more.
+    assert_eq!(
+        next_change(std::slice::from_ref(&stuck), NOW),
+        Some(NOW - RELAUNCH_STUCK_S - 1 + RELAUNCH_INTERRUPT_S)
+    );
+    let stuck = Row {
+        phase: Phase::Relaunched {
+            at_s: NOW - RELAUNCH_INTERRUPT_S - 1,
         },
         ..pending(60)
     };
@@ -739,26 +794,16 @@ fn the_view_names_the_instant_it_next_changes() {
     assert_eq!(next_change(&[], NOW), None);
 }
 
-/// T1-h, THE VIEW'S HALF (design record 2026-09-28, "No upgrade stuck
-/// forever", §3.2 C3): a record's watch is an instant the view names, so the
-/// window's host wakes for it with no point offered and no timer of its own
-/// — and once it has come, the look lists the tab DUE ([`View::watch_due`]),
-/// which the host hands to the watch. Only live tabs are listed, and only
-/// once past, and by the records alone (their holders need not read).
-/// NEGATIVE CONTROLS: the same row without the watch's instant (`next_change`
-/// without its arm, the code before step 7) names nothing — an overdue
-/// upgrade then had no instant left, and nothing woke for it; past the
-/// instant, it is no instant any more; before it, the tab is not due; a
-/// record of a tab this instance does not show is never listed.
+/// A record's watch is an instant the view names, so the host wakes for it
+/// without a timer, and once past, the look lists the tab due
+/// ([`View::watch_due`]). Only live tabs, only once past, and by the records
+/// alone. Negative controls: a row without the watch instant names nothing;
+/// past it, it is no instant; before it, the tab is not due; a tab this
+/// instance does not show is never listed.
 ///
-/// A LOOK THAT STOPS SHORT STILL NAMES THE WATCH (the watch's review,
-/// 2026-09-28): the instant came from `next_change`, after the holders were
-/// read, so one session file `session_files` refuses — or one record that
-/// does not read whole — left the host no timer for a session offering no
-/// point, for as long as that file stayed. The instant and the due list are
-/// now each record's own. NEGATIVE CONTROLS, run on the code before this fix:
-/// the holders-unread look answered `None`, and the not-whole look listed
-/// nothing.
+/// A look that stops short still names the watch: each record's instant and
+/// due status are its own, so an unreadable session file or a partly
+/// unreadable record set does not drop them.
 #[test]
 fn the_view_names_a_records_watch_and_lists_it_due_once_past() {
     let watched = Row {
@@ -770,20 +815,27 @@ fn the_view_names_a_records_watch_and_lists_it_due_once_past() {
         Some(NOW + 600),
         "the watch's instant, on an overdue row that names no other"
     );
+    // Without the watch's arm only the classifier's own horizon (the day's
+    // digest line, [`Row::next_attention_at`]) names an instant: the watch's
+    // is not among them, and once it has passed, no instant of it remains.
+    let unwatched = Row {
+        watch_at: 0,
+        ..watched.clone()
+    };
+    let horizon = unwatched.next_attention_at(NOW);
+    assert!(horizon.is_some_and(|at| at > NOW + 600), "{horizon:?}");
     assert_eq!(
-        next_change(
-            &[Row {
-                watch_at: 0,
-                ..watched.clone()
-            }],
-            NOW
-        ),
-        None,
-        "without the watch's arm nothing wakes the host for it"
+        next_change(std::slice::from_ref(&unwatched), NOW),
+        horizon,
+        "without the watch's arm nothing wakes the host for it before the horizon"
     );
-    assert_eq!(next_change(&[watched], NOW + 600), None, "once past");
+    assert_eq!(
+        next_change(std::slice::from_ref(&watched), NOW + 600),
+        watched.next_attention_at(NOW + 600),
+        "once past, the watch names no instant"
+    );
 
-    let dir = scratch("watch-due");
+    let dir = ScratchDir::new("upgrade-status", "watch-due");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let st = St {
@@ -847,7 +899,877 @@ fn the_view_names_a_records_watch_and_lists_it_due_once_past() {
     let _ = std::fs::remove_file(&locked);
     view.stand_down(&mut |_| {});
     assert!(view.watch_due().is_empty());
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A record nothing has checked, as the pure reading of its fields
+/// ([`unwatched_since`]): its watch more than a gap late, no look for
+/// [`UNWATCHED_AFTER_S`], the machine awake past [`WAKE_GRACE_S`]; then since
+/// when (last look, or the watch it was due). [`unwatched_turns_at`] is exactly
+/// the first second it reads so.
+///
+/// Negative controls: nothing flags within the wake grace; a record looked at
+/// within the bound never flags; no watch owed (`watch_at` 0) or an unknown
+/// awake clock never flags; the lateness gap keeps a stopped round from
+/// flagging the second its rest ends.
+#[test]
+fn a_record_nothing_has_checked_reads_unwatched_past_the_wake_grace() {
+    use crate::harness::upgrade_drive::WATCH_GAP;
+    let long_awake = NOW - 86_400;
+    // The stuck record the design was written for, watched at its gap.
+    let looked = NOW - UNWATCHED_AFTER_S - 60;
+    let due = looked + WATCH_GAP;
+    assert_eq!(unwatched_since(due, looked, NOW, long_awake), Some(looked));
+    // Never looked at: since the watch it was due.
+    let first = NOW - WATCH_GAP - 60;
+    assert_eq!(unwatched_since(first, 0, NOW, long_awake), Some(first));
+    // Within the wake grace: nothing, to its last second.
+    for woke in [NOW - 60, NOW - WAKE_GRACE_S + 1] {
+        assert_eq!(
+            unwatched_since(due, looked, NOW, woke),
+            None,
+            "woke {} s ago",
+            NOW - woke
+        );
+    }
+    assert_eq!(
+        unwatched_since(due, looked, NOW, NOW - WAKE_GRACE_S),
+        Some(looked),
+        "the grace is over"
+    );
+    // Looked at within the bound: its watch is not due, or not a gap late.
+    for looked_at in [NOW - 60, NOW - WATCH_GAP, NOW - UNWATCHED_AFTER_S] {
+        assert_eq!(
+            unwatched_since(looked_at + WATCH_GAP, looked_at, NOW, long_awake),
+            None,
+            "looked {} s ago",
+            NOW - looked_at
+        );
+    }
+    // Owed no watch, and no awake clock.
+    assert_eq!(unwatched_since(0, looked, NOW, long_awake), None);
+    assert_eq!(unwatched_since(due, looked, NOW, 0), None);
+    // The design's bound alone: a round that stopped ten hours ago, looked at
+    // then, its rest over a second ago.
+    let rested = NOW - 10 * 3_600;
+    assert!(NOW - rested > UNWATCHED_AFTER_S, "the bound alone flags it");
+    assert_eq!(
+        unwatched_since(NOW - 1, rested, NOW, long_awake),
+        None,
+        "its watch is a second late"
+    );
+    assert_eq!(
+        unwatched_since(NOW - WATCH_GAP - 1, rested, NOW, long_awake),
+        Some(rested),
+        "a whole gap late"
+    );
+    // The instant it turns, whichever bound decides: lateness, last look, or
+    // wake grace.
+    for (watch_at, looked_at, awake) in [
+        (due, looked, long_awake),
+        (NOW - 1, rested, long_awake),
+        (NOW + 600, NOW + 600 - WATCH_GAP, long_awake),
+        (due, looked, NOW - 60),
+        (first, 0, long_awake),
+    ] {
+        let t = unwatched_turns_at(watch_at, looked_at, awake).expect("owed, awake known");
+        assert_eq!(
+            unwatched_since(watch_at, looked_at, t - 1, awake),
+            None,
+            "{watch_at} {looked_at} {awake}: not before {t}"
+        );
+        assert!(
+            unwatched_since(watch_at, looked_at, t, awake).is_some(),
+            "{watch_at} {looked_at} {awake}: at {t}"
+        );
+    }
+    assert_eq!(unwatched_turns_at(0, looked, long_awake), None);
+    assert_eq!(unwatched_turns_at(due, looked, 0), None);
+}
+
+/// The awake clock is the machine's last wake or boot ([`system_awake_since`]:
+/// `kern.waketime`/`kern.boottime` on macOS, `/proc/stat` `btime` on Linux),
+/// past and after 2001; a test build reads its pin ([`awake_since`], `0` unless
+/// set), so no test depends on the machine.
+#[test]
+fn the_awake_clock_is_the_machines_last_wake_or_boot() {
+    let at = system_awake_since();
+    let now = now_s();
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        assert!(
+            at > 1_000_000_000 && at <= now,
+            "awake since {at}, now {now}"
+        );
+    } else {
+        assert_eq!(at, 0, "no awake clock here");
+    }
+    assert_eq!(awake_since(), 0, "a test reads its pin, not the machine");
+    pin_awake_since(NOW - 60);
+    assert_eq!(awake_since(), NOW - 60);
+    pin_awake_since(0);
+    assert_eq!(awake_since(), 0);
+}
+
+/// AN UNWATCHED RECORD IS TOLD AS ATERM'S OWN FAULT (design record 2026-09-28,
+/// C6 and C10, §5's words; the owner's ruling of 2026-09-29): a stall
+/// ([`Row::stall`] `unwatched`) and ONE fault line in the log
+/// ([`Row::attention`], kind `unwatched`) — never a row or the tab's mark,
+/// since the owner has nothing to do about aterm's own timer — over what the
+/// record's last look said — a healthy pending round, and every
+/// round that would be a record (one asking on its own, one resting after a
+/// give-up, a limit before its reset): no look has come since, so none of
+/// that is known. Its words, within the band's 64 characters, say for how
+/// long and whose fault; the line says the bound, never the running age, so
+/// it is written once; `--status` says `stalled=unwatched` and `told=unwatched`,
+/// and the `upgrade=` column for how long. No word of the owner's mends it
+/// (`Upgrade now` is not offered, [`Remedy::Waits`]).
+///
+/// Negative controls: the same record within the wake grace, looked at within
+/// the bound, or with an unknown awake clock reads its last look; finished,
+/// restarting, stopped-after-exit and skipped records never read it.
+#[test]
+fn an_unwatched_record_is_told_as_aterms_own_fault() {
+    use crate::harness::upgrade_drive::WATCH_GAP;
+    let unread = |row: Row| Row {
+        watch_at: NOW - WATCH_GAP - 600,
+        looked_at: NOW - UNWATCHED_AFTER_S - 600,
+        awake_since: NOW - 86_400,
+        ..row
+    };
+    let healthy = pending(3_600);
+    assert_eq!(healthy.stall(NOW), None, "an hour behind is healthy");
+    let row = unread(healthy.clone());
+    assert_eq!(row.unwatched(NOW), Some(NOW - UNWATCHED_AFTER_S - 600));
+    assert_eq!(row.stall(NOW).as_deref(), Some("unwatched"));
+    let words = row.stall_words(NOW).expect("stalled");
+    assert_eq!(words, "not checked for 1 h \u{2014} aterm's own fault");
+    assert!(words.chars().count() <= 64, "{words}");
+    assert_eq!(row.badge(NOW), None, "aterm's own fault marks no tab");
+    let Attention::Fault(need) = row.attention(NOW) else {
+        panic!("a fault line: {:?}", row.attention(NOW));
+    };
+    assert_eq!(need.kind, "unwatched");
+    assert!(
+        need.why.contains("more than 1h") && need.why.contains("aterm's own"),
+        "{}",
+        need.why
+    );
+    assert_eq!(
+        row.attention(NOW + 3 * 3_600),
+        row.attention(NOW),
+        "the line says the bound, never the running age"
+    );
+    assert_eq!(row.remedy(NOW), Some(Remedy::Waits), "no word mends it");
+    assert!(!row.moving(NOW));
+    assert_eq!(row.column(NOW), "stalled/2.1.282/unwatched:1h10m/1h");
+    let line = row.line(NOW);
+    assert!(line.contains(" stalled=unwatched "), "{line}");
+    assert!(line.contains(" told=unwatched"), "{line}");
+    let json = row.to_json(NOW);
+    assert_eq!(
+        json.get("stalled").and_then(Value::as_str),
+        Some("unwatched")
+    );
+    assert_eq!(json.get("told").and_then(Value::as_str), Some("unwatched"));
+    // Its age is said, restated as it grows, at an instant the view names.
+    assert_eq!(row.age_said(NOW).as_deref(), Some("1 h"));
+    let rows = [Row {
+        behind_said: row.age_said(NOW),
+        ..row.clone()
+    }];
+    let next = next_change(&rows, NOW).expect("the age's next word");
+    assert_eq!(next, NOW - UNWATCHED_AFTER_S - 600 + 2 * 3_600);
+    assert_eq!(row.age_said(next).as_deref(), Some("2 h"));
+    // Over every round that would be a record.
+    let records = [
+        Row {
+            phase: Phase::Announced {
+                at_s: NOW - 600,
+                asks: 1,
+            },
+            wait: "background".to_string(),
+            ..pending(7 * 3_600)
+        },
+        Row {
+            phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+            retry_at: NOW + 3_600,
+            ..pending(7 * 3_600)
+        },
+        Row {
+            wait: "limited".to_string(),
+            limit_until: NOW + 3_600,
+            ..pending(7 * 3_600)
+        },
+    ];
+    for record in records {
+        assert!(record.asks_on_its_own(NOW), "{record:?}");
+        assert!(record.badge(NOW).is_none(), "a record: {record:?}");
+        let told = unread(record);
+        assert!(!told.asks_on_its_own(NOW), "{told:?}");
+        assert_eq!(told.stall(NOW).as_deref(), Some("unwatched"), "{told:?}");
+        assert!(
+            matches!(told.attention(NOW), Attention::Fault(ref n) if n.kind == "unwatched"),
+            "{told:?}"
+        );
+        assert!(told.badge(NOW).is_none(), "{told:?}");
+        assert_eq!(told.remedy(NOW), Some(Remedy::Waits), "{told:?}");
+    }
+    // Negative controls: what its last look said.
+    for (why, other) in [
+        (
+            "within the wake grace",
+            Row {
+                awake_since: NOW - 60,
+                ..row.clone()
+            },
+        ),
+        (
+            "looked at within the bound",
+            Row {
+                looked_at: NOW - 60,
+                watch_at: NOW - 60 + WATCH_GAP,
+                ..row.clone()
+            },
+        ),
+        (
+            "the awake clock unknown",
+            Row {
+                awake_since: 0,
+                ..row.clone()
+            },
+        ),
+    ] {
+        assert_eq!(other.unwatched(NOW), None, "{why}");
+        assert_eq!(other.stall(NOW), healthy.stall(NOW), "{why}");
+        assert_eq!(other.column(NOW), healthy.column(NOW), "{why}");
+    }
+    for (why, other) in [
+        (
+            "finished",
+            Row {
+                phase: Phase::Done,
+                done_at: NOW - 60,
+                ..row.clone()
+            },
+        ),
+        (
+            "under way",
+            Row {
+                phase: Phase::Exiting { at_s: NOW - 60 },
+                ..row.clone()
+            },
+        ),
+        (
+            "stopped after its agent was gone",
+            Row {
+                phase: Phase::Failed("no-resume-hint".to_string()),
+                exited_at: NOW - 600,
+                ..row.clone()
+            },
+        ),
+    ] {
+        assert_eq!(other.unwatched(NOW), None, "{why}");
+        assert_ne!(other.stall(NOW).as_deref(), Some("unwatched"), "{why}");
+    }
+    // The owner's `--skip` holds it (and its record owes no watch at all).
+    let skipped = Row {
+        request: Request::Skip("2.1.282".to_string()),
+        ..row.clone()
+    };
+    assert_eq!(skipped.stall(NOW), None);
+    assert!(skipped.badge(NOW).is_none());
+}
+
+/// Over a real record and [`View`]: the watch is named and listed due, and with
+/// no look stamping it the instant it turns `unwatched` ([`next_change`]) is
+/// named next, so a live host that cannot watch wakes to mark it; at that
+/// instant the row stalls `unwatched`.
+///
+/// Negative controls: a look stamped at the watch moves it a gap on; an unknown
+/// awake clock names nothing; a wake a minute before holds it off for the
+/// grace.
+#[test]
+fn the_view_marks_a_record_nothing_checks_at_an_instant_it_names() {
+    use crate::harness::upgrade_drive::WATCH_GAP;
+    let dir = ScratchDir::new("upgrade-status", "unwatched");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - 60,
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &st, NOW);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let held = behind_in(TAB);
+    let due = NOW + upgrade::REASK_S;
+    let turns = due + WATCH_GAP + 1;
+    let look = |awake: u64, at: u64| {
+        pin_awake_since(awake);
+        let mut view = View::default();
+        let mut sent: Vec<Row> = Vec::new();
+        let next = view.refresh_with(&o, &tabs, at, &held, &mut |rows| sent = rows.to_vec());
+        (next, sent, view.watch_due().to_vec())
+    };
+    let long_awake = NOW - 86_400;
+    let (next, _, _) = look(long_awake, NOW);
+    assert_eq!(next, Some(due), "the watch first");
+    let (next, sent, watch) = look(long_awake, due);
+    assert_eq!(watch, [TAB], "due at its instant");
+    assert_eq!(sent[0].stall(due), None, "a record while its watch is due");
+    assert_eq!(next, Some(turns), "then the instant it turns, named");
+    let (_, sent, watch) = look(long_awake, turns);
+    assert_eq!(watch, [TAB], "still listed due: the host keeps trying");
+    assert_eq!(sent[0].stall(turns).as_deref(), Some("unwatched"));
+    assert_eq!(sent[0].stalled.as_deref(), Some("unwatched"), "sent so");
+    assert!(
+        matches!(sent[0].attention(turns), Attention::Fault(ref n) if n.kind == "unwatched"),
+        "aterm's own fault: a line in the log"
+    );
+    assert!(sent[0].badge(turns).is_none(), "and no tab is marked");
+    // The awake clock unknown: no such instant, and nothing flagged.
+    let (next, _, _) = look(0, due);
+    assert_ne!(next, Some(turns));
+    let (_, sent, _) = look(0, turns);
+    assert_eq!(sent[0].stall(turns), None);
+    // Woken a minute before: held off until the grace is over, and named.
+    let woke = turns - 60;
+    let (next, sent, _) = look(woke, turns);
+    assert_eq!(sent[0].stall(turns), None, "inside the wake grace");
+    assert_eq!(next, Some(woke + WAKE_GRACE_S), "the grace's end, named");
+    // The healthy host: a look stamped at the watch moves it a gap on, and a
+    // second past that the record is due again, not unwatched.
+    let mut looked = super::super::load(&o, "aaa").expect("the record");
+    looked.looked_at = due;
+    super::super::save_at(&o, "aaa", &looked, due);
+    let (next, sent, watch) = look(long_awake, due + 1);
+    assert!(watch.is_empty(), "watched: not due again until a gap on");
+    assert_eq!(sent[0].stall(due + 1), None);
+    assert_eq!(next, Some(due + WATCH_GAP), "its next watch");
+    let (next, sent, watch) = look(long_awake, turns);
+    assert_eq!(watch, [TAB], "due again");
+    assert_eq!(sent[0].stall(turns), None, "a second late, not unwatched");
+    assert_eq!(
+        next,
+        Some(due + 2 * WATCH_GAP + 1),
+        "unless that one is missed"
+    );
+    pin_awake_since(0);
+}
+
+/// The host's watch starting, or resuming after sleep, is a wake too: the host
+/// looks at the view before firing the watches it finds due, so marking by the
+/// awake clock alone would flash `unwatched` at every start or resume. Over a
+/// real record and [`View`]'s looks at chosen clocks ([`View::note_look`]): the
+/// first look reads no `unwatched` and names the grace's end; past it, an
+/// unstamped record is told; the first look after a sleep (wall clock ahead of
+/// monotonic) or after the view stood down is a start again. Negative
+/// controls: without looks noted it flashes at the first look; a host watching
+/// all along is told at the same second.
+#[test]
+fn a_host_that_has_just_begun_or_resumed_watching_flags_nothing_unwatched() {
+    use crate::harness::upgrade_drive::WATCH_GAP;
+    use std::time::{Duration, Instant};
+    let dir = ScratchDir::new("upgrade-status", "unwatched-host");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - 60,
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &st, NOW);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let held = behind_in(TAB);
+    let turns = NOW + upgrade::REASK_S + WATCH_GAP + 1;
+    pin_awake_since(NOW - 86_400);
+    let t0 = Instant::now();
+    let after = |s: u64| t0 + Duration::from_secs(s);
+    let look = |view: &mut View, at: u64| {
+        let mut sent: Vec<Row> = Vec::new();
+        let next = view.refresh_with(&o, &tabs, at, &held, &mut |rows| sent = rows.to_vec());
+        (next, sent.remove(0))
+    };
+    // Negative control: no look noted: the flash.
+    let (_, row) = look(&mut View::default(), turns);
+    assert_eq!(row.stalled.as_deref(), Some("unwatched"), "main flashes");
+
+    // The host's first look: not missed yet, and the grace's end named.
+    let mut view = View::default();
+    view.note_look(t0, turns);
+    let (next, row) = look(&mut view, turns);
+    assert_eq!(row.stalled, None, "{row:?}");
+    assert_eq!(row.stall(turns), None);
+    assert_eq!(next, Some(turns + WAKE_GRACE_S), "the grace's end, named");
+    // Past it, watching all along and never stamped: told.
+    let later = turns + WAKE_GRACE_S;
+    view.note_look(after(WAKE_GRACE_S), later);
+    let (_, row) = look(&mut view, later);
+    assert_eq!(row.stalled.as_deref(), Some("unwatched"), "told past it");
+    // The first look after a sleep of eight hours: a start again.
+    let resumed = later + 8 * 3_600;
+    view.note_look(after(WAKE_GRACE_S + 60), resumed);
+    let (_, row) = look(&mut view, resumed);
+    assert_eq!(row.unwatched(resumed), None, "the first look after a sleep");
+    assert_eq!(row.stalled.as_deref(), Some("overdue"), "its own stall");
+    // Negative control: awake all along, clocks together: told.
+    let mut awake = View::default();
+    awake.note_look(t0, turns - 8 * 3_600);
+    awake.note_look(after(8 * 3_600), turns);
+    let (_, row) = look(&mut awake, turns);
+    assert_eq!(
+        row.stalled.as_deref(),
+        Some("unwatched"),
+        "no sleep between"
+    );
+    // Stood down (the switch off an hour), and back on: a start again.
+    view.stand_down(&mut |_| {});
+    let back = resumed + 3_600;
+    view.note_look(after(WAKE_GRACE_S + 60 + 3_600), back);
+    let (_, row) = look(&mut view, back);
+    assert_eq!(row.unwatched(back), None, "the first look back on");
+    assert_eq!(row.stalled.as_deref(), Some("overdue"), "its own stall");
+    pin_awake_since(0);
+}
+
+/// Two stand-in agents (this test binary, parked, in `tab`) run as JOBS of a
+/// job-control zsh that leads a pseudo-terminal of its own: one started in
+/// the background, as a person's `^Z` leaves an agent — its own process
+/// group, not the terminal's foreground — and one the zsh became, the
+/// terminal's foreground. `(front, back pid, the pty's (master, slave))`:
+/// the caller kills both (`SIGKILL`), closes the pty and reaps the front.
+///
+/// The test holds the SLAVE open for the jobs' life, as their terminal's
+/// other holder: both run with stdio on `/dev/null` (a parked test binary
+/// writing to a terminal nobody reads would sit in its exit's drain), so once
+/// both have exec'd no job holds the terminal, its last slave closes, and
+/// the session loses it (`ps` reads no tty, `tpgid` none) — the front then
+/// reads as aside too. Until 2026-09-30 an inheritable `openpty(3)` slave,
+/// leaked into both jobs, kept it open by accident.
+#[cfg(unix)]
+fn jobs_on_a_tty(
+    dir: &std::path::Path,
+    tab: &str,
+) -> (
+    std::process::Child,
+    u32,
+    (std::os::fd::OwnedFd, std::os::fd::OwnedFd),
+) {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::process::CommandExt as _;
+    // Both ends close-on-exec from birth: the zsh below holds its terminal,
+    // never a copy of its master, and no child another test spawns holds either.
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    // SAFETY: both descriptors were just opened above and are owned here
+    // alone.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
+    let exe = std::env::current_exe().expect("exe");
+    let park = format!(
+        "'{}' harness::upgrade_drive::tests::park_when_asked --exact </dev/null >/dev/null 2>&1",
+        exe.display()
+    );
+    let pid_file = dir.join("back.pid");
+    let mut zsh = std::process::Command::new("/bin/zsh");
+    zsh.args([
+        "-f",
+        "-c",
+        &format!(
+            "setopt monitor; {park} & print -r -- $! > '{}'; exec {park}",
+            pid_file.display()
+        ),
+    ])
+    .env("UPGRADE_DRIVE_TEST_PARK", "1")
+    .env("ATERM_PARENT_SESSION_ID", tab)
+    .stdin(tty(&slave))
+    .stdout(tty(&slave))
+    .stderr(tty(&slave));
+    // SAFETY: async-signal-safe calls only, between fork and exec: a new
+    // session, and the terminal on stdin made its controlling terminal.
+    unsafe {
+        zsh.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut front = zsh.spawn().expect("zsh");
+    // Exec'd, not a fork of the zsh still reading as it.
+    let parked = |pid: u32| {
+        atpkg::caller_shell::process_args(pid).is_some_and(|a| {
+            a.env_var("UPGRADE_DRIVE_TEST_PARK").is_some()
+                && std::path::Path::new(&a.exec_path) == exe.as_path()
+        })
+    };
+    for _ in 0..3_000 {
+        let back = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if let Some(back) = back.filter(|&b| parked(b) && parked(front.id())) {
+            return (front, back, (master, slave));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = front.kill();
+    drop((master, slave));
+    let _ = front.wait();
+    panic!("the two jobs never ran");
+}
+
+/// A tab whose agent is not in front (suspended with `^Z`) is never told
+/// "aterm's own fault": no worker runs for it, so nothing stamps the record.
+/// Over real processes on a real pty and real session files, the holder is
+/// proven in its tab and read not in front by both the window's roster and the
+/// CLI's kernel read; its row reads `not-foreground`, never `unwatched`.
+/// Negative control: the job in front with the same record reads `unwatched`.
+#[cfg(unix)]
+#[test]
+fn a_tab_whose_agent_is_not_in_front_is_never_told_aterms_own_fault() {
+    const BACK: &str = "0badf00d-aaaa-2222-3333-444455556666";
+    const FRONT: &str = "0badf00d-bbbb-2222-3333-444455556666";
+    let dir = ScratchDir::new("upgrade-status", "aside");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let (mut front, back, pty) = jobs_on_a_tty(&dir, TAB);
+    register_as(&o.home, back, BACK, "2.1.281");
+    register_as(&o.home, front.id(), FRONT, "2.1.281");
+    let group = super::super::process_group(front.id()).expect("group");
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(group),
+    }];
+    let now = now_s();
+    // Behind seven hours, nothing having looked for three.
+    for session in [BACK, FRONT] {
+        let st = St {
+            phase: Phase::Pending,
+            from: "2.1.281".to_string(),
+            to: "2.1.282".to_string(),
+            source: "managed".to_string(),
+            tab: TAB.to_string(),
+            pending_since: now - 7 * 3_600,
+            looked_at: now - 3 * 3_600,
+            ..St::default()
+        };
+        super::super::save_at(&o, session, &st, now - 7 * 3_600);
+    }
+    pin_awake_since(now - 86_400);
+    let sessions: BTreeSet<String> = [BACK, FRONT].map(str::to_string).into();
+    let in_window = holders(&o.home, &sessions, Some(&tabs));
+    let by_cli = holders(&o.home, &sessions, None);
+    let (cli, vetted) = status_rows(&o, true);
+    let mut view = View::default();
+    let mut sent: Vec<Row> = Vec::new();
+    let _ = view.refresh_with(
+        &o,
+        &tabs,
+        now,
+        &|s| holders(&o.home, s, Some(&tabs)),
+        &mut |rows| sent = rows.to_vec(),
+    );
+    // SAFETY: `kill` sends one signal to the pid this test's jobs reported;
+    // SIGKILL, never a core-dump signal (AGENTS.md).
+    unsafe {
+        libc::kill(libc::pid_t::try_from(back).expect("pid"), libc::SIGKILL);
+    }
+    let _ = front.kill();
+    // The terminal hung up before the reap: an exit never waits on a drain.
+    drop(pty);
+    let _ = front.wait();
+    pin_awake_since(0);
+
+    for (how, held) in [("window", in_window), ("cli", by_cli)] {
+        let held = held.expect("the session files read");
+        let of = |s: &str| held.iter().find(|h| h.session == s).cloned().expect(s);
+        assert_eq!(
+            of(BACK).tab.as_deref(),
+            Some(TAB),
+            "{how}: proven in its tab"
+        );
+        assert!(of(BACK).aside, "{how}: not in front");
+        assert_eq!(of(FRONT).tab.as_deref(), Some(TAB), "{how}");
+        assert!(!of(FRONT).aside, "{how}: NEGATIVE CONTROL, in front");
+    }
+    assert!(vetted, "the CLI's holders read");
+    for (how, rows) in [("cli", &cli), ("window", &sent)] {
+        let of = |s: &str| rows.iter().find(|r| r.session == s).expect(s);
+        let (aside, front) = (of(BACK), of(FRONT));
+        assert_eq!(
+            front.stall(now).as_deref(),
+            Some("unwatched"),
+            "{how}: NEGATIVE CONTROL, its tab's agent"
+        );
+        assert_eq!(aside.aside, NOT_FOREGROUND, "{how}");
+        assert_eq!(aside.wait, NOT_FOREGROUND, "{how}: what holds it");
+        assert_eq!(aside.unwatched(now), None, "{how}");
+        assert_eq!(aside.stall(now).as_deref(), Some("overdue"), "{how}");
+        assert!(aside.badge(now).is_none(), "{how}: no tab mark");
+        // A record at first; one digest line once it has stood an hour
+        // ([`SUSPENDED_AFTER_S`]): the owner's own setup, never aterm's fault.
+        let stood = Row {
+            wait_since: now - SUSPENDED_AFTER_S - 60,
+            ..aside.clone()
+        };
+        let Attention::Digest(need) = stood.attention(now) else {
+            panic!("{how}: one digest line: {:?}", stood.attention(now));
+        };
+        assert_eq!(need.kind, "suspended", "{how}");
+        let cause = aside.overdue_cause(now);
+        assert_eq!(cause, "its agent is not in front in its tab", "{how}");
+        assert!(!cause.contains("fault"), "{how}: {cause}");
+        let words = aside.stall_words(now).expect("stalled");
+        assert!(
+            words.ends_with("it is not in front in its tab"),
+            "{how}: {words}"
+        );
+        assert_eq!(aside.remedy(now), Some(Remedy::Waits), "{how}");
+        assert!(
+            !aside.asks_on_its_own(now),
+            "{how}: a row, the person's to mend"
+        );
+        let line = aside.line(now);
+        assert!(
+            line.contains(" wait=not-foreground wait_for=- "),
+            "{how}: {line}"
+        );
+        assert!(line.contains(" cause=person "), "{how}: {line}");
+    }
+}
+
+/// A tab another supervisor's claim holds is never told "aterm's own fault":
+/// the host runs no worker behind a live claim. Told the claimed tabs
+/// ([`View::set_claimed`]), a real [`View`] reads the move as held by that
+/// claim and never `unwatched`; stood down, it forgets them. `--status` reads
+/// the claim from the instance ([`status_rows`]) by the same rule
+/// ([`Row::set_aside`]). Negative controls: no claim, or another tab's, reads
+/// `unwatched`; a conversation resumed outside aterm is its own
+/// ([`Row::outside`]).
+#[test]
+fn a_tab_another_supervisor_claims_reads_its_claim_never_aterms_own_fault() {
+    let dir = ScratchDir::new("upgrade-status", "claimed");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - 7 * 3_600,
+        looked_at: NOW - 3 * 3_600,
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &st, NOW - 7 * 3_600);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let held = behind_in(TAB);
+    pin_awake_since(NOW - 86_400);
+    let look = |view: &mut View, claimed: &[&str]| {
+        let claimed: Vec<String> = claimed.iter().map(|t| (*t).to_string()).collect();
+        view.set_claimed(&claimed);
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent = rows.to_vec());
+        sent.remove(0)
+    };
+    let unclaimed = look(&mut View::default(), &[]);
+    assert_eq!(
+        unclaimed.stall(NOW).as_deref(),
+        Some("unwatched"),
+        "NEGATIVE CONTROL"
+    );
+    let elsewhere = look(&mut View::default(), &["s-another"]);
+    assert_eq!(
+        elsewhere.stall(NOW).as_deref(),
+        Some("unwatched"),
+        "another tab's claim"
+    );
+    let mut view = View::default();
+    let row = look(&mut view, &[TAB]);
+    assert_eq!((row.aside.as_str(), row.wait.as_str()), (CLAIMED, CLAIMED));
+    assert_eq!(row.unwatched(NOW), None);
+    assert_eq!(row.stall(NOW).as_deref(), Some("overdue"));
+    assert!(
+        row.badge(NOW).is_none(),
+        "another supervisor's claim marks no tab"
+    );
+    assert!(
+        matches!(row.attention(NOW), Attention::Quiet),
+        "the owner's own setup, a record: {:?}",
+        row.attention(NOW)
+    );
+    let cause = row.overdue_cause(NOW);
+    assert_eq!(cause, "another supervisor holds its tab");
+    assert!(!cause.contains("fault"), "{cause}");
+    let words = row.stall_words(NOW).expect("stalled");
+    assert!(
+        words.ends_with("another supervisor holds its tab"),
+        "{words}"
+    );
+    assert!(
+        row.waiting_line("09:00")
+            .contains("it moves once that supervisor lets the tab go"),
+        "{}",
+        row.waiting_line("09:00")
+    );
+    // Stood down, the claims are forgotten with everything else: the next
+    // look, told none, reads the record as it is.
+    view.stand_down(&mut |_| {});
+    let mut sent: Vec<Row> = Vec::new();
+    let _ = view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent = rows.to_vec());
+    assert_eq!(
+        sent[0].stall(NOW).as_deref(),
+        Some("unwatched"),
+        "forgotten"
+    );
+    // `--status`, the claims the instance names.
+    let cli = |claimed: &[&str], held: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>| {
+        let claimed: BTreeSet<String> = claimed.iter().map(|t| (*t).to_string()).collect();
+        let (mut rows, vetted) = status_rows_with(&o, NOW, held, &|| claimed.clone());
+        assert!(vetted);
+        rows.remove(0)
+    };
+    let by_cli = cli(&[TAB], &held);
+    let facts = |r: &Row| {
+        (
+            r.aside.clone(),
+            r.wait.clone(),
+            r.wait_since,
+            r.stall(NOW),
+            r.cause_word(NOW),
+            r.told_word(NOW),
+        )
+    };
+    assert_eq!(facts(&by_cli), facts(&row), "the window's facts");
+    assert_eq!(by_cli.unwatched(NOW), None);
+    let line = by_cli.line(NOW);
+    for field in [
+        " wait=claimed wait_for=- ",
+        " stalled=overdue ",
+        " cause=person ",
+    ] {
+        assert!(line.contains(field), "{field}: {line}");
+    }
+    for claimed in [&[][..], &["s-another"][..]] {
+        assert_eq!(
+            cli(claimed, &held).stall(NOW).as_deref(),
+            Some("unwatched"),
+            "NEGATIVE CONTROL, {claimed:?}"
+        );
+    }
+    let outside = cli(&[TAB], &|sessions: &BTreeSet<String>| {
+        Some(
+            sessions
+                .iter()
+                .map(|s| holder(s, "2.1.281", None))
+                .collect(),
+        )
+    });
+    assert!(outside.outside && outside.aside.is_empty(), "{outside:?}");
+    assert_eq!(outside.stall(NOW).as_deref(), Some("overdue"));
+    pin_awake_since(0);
+}
+
+/// A RECORD NO BUILD GAVE A TAB READS THE CLAIM ON ITS HOLDER'S TAB (the
+/// review of 2026-09-30): a build before 2026-09-25 recorded no tab, and
+/// `--status` shows such a row under the tab its holder is proven in — but
+/// read its aside BEFORE it filled that tab in, so no claim could hold it
+/// and the row read `stalled=unwatched`, "aterm's own fault", where the
+/// window names the claim. Read once its tab is known, it reads the claim.
+/// NEGATIVE CONTROLS: the same record with no tab claimed, or another tab,
+/// reads `unwatched` as ever.
+#[test]
+fn a_record_with_no_recorded_tab_reads_the_claim_on_its_holders_tab() {
+    let dir = ScratchDir::new("upgrade-status", "claimed-untabbed");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        pending_since: NOW - 7 * 3_600,
+        looked_at: NOW - 3 * 3_600,
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &st, NOW - 7 * 3_600);
+    pin_awake_since(NOW - 86_400);
+    let cli = |claimed: &[&str]| {
+        let claimed: BTreeSet<String> = claimed.iter().map(|t| (*t).to_string()).collect();
+        let (mut rows, vetted) = status_rows_with(&o, NOW, &behind_in(TAB), &|| claimed.clone());
+        assert!(vetted);
+        rows.remove(0)
+    };
+    let row = cli(&[TAB]);
+    assert_eq!(row.tab, TAB, "shown under its holder's tab");
+    assert_eq!((row.aside.as_str(), row.wait.as_str()), (CLAIMED, CLAIMED));
+    assert_eq!(row.unwatched(NOW), None);
+    assert_eq!(row.stall(NOW).as_deref(), Some("overdue"));
+    for claimed in [&[][..], &["s-another"][..]] {
+        assert_eq!(
+            cli(claimed).stall(NOW).as_deref(),
+            Some("unwatched"),
+            "NEGATIVE CONTROL, {claimed:?}"
+        );
+    }
+    pin_awake_since(0);
+}
+
+/// THE ROW A WORD PRINTS IS READ AS `--status` READS IT (the review of
+/// 2026-09-30): `aterm harness upgrade <sid> --now` printed the row the word
+/// left with no aside read, so on a tab another supervisor's claim holds —
+/// no host runs a worker there, and `--status` names the claim — it printed
+/// `stalled=unwatched`, "aterm's own fault". The one rule reads it now
+/// ([`Row::set_aside`]). NEGATIVE CONTROLS: no tab claimed, or another tab,
+/// and the same word's row reads `unwatched` as ever.
+#[test]
+fn the_row_a_word_prints_reads_the_claim_on_its_tab() {
+    let dir = ScratchDir::new("upgrade-status", "ask-claimed");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let now = now_s();
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: now - 7 * 3_600,
+        looked_at: now - 3 * 3_600,
+        ..St::default()
+    };
+    pin_awake_since(now - 86_400);
+    let hurry = |claimed: &[&str]| {
+        super::super::save_at(&o, "aaa", &st, now - 7 * 3_600);
+        let claimed: BTreeSet<String> = claimed.iter().map(|t| (*t).to_string()).collect();
+        ask_aside(&o, TAB, Ask::Now, &|| claimed.clone()).expect("the word lands")
+    };
+    let row = hurry(&[TAB]);
+    assert_eq!((row.aside.as_str(), row.wait.as_str()), (CLAIMED, CLAIMED));
+    assert_eq!(row.unwatched(now_s()), None);
+    let line = row.line(now_s());
+    assert!(
+        line.contains(" wait=claimed ") && !line.contains("unwatched"),
+        "{line}"
+    );
+    for claimed in [&[][..], &["s-another"][..]] {
+        assert_eq!(
+            hurry(claimed).stall(now_s()).as_deref(),
+            Some("unwatched"),
+            "NEGATIVE CONTROL, {claimed:?}"
+        );
+    }
+    pin_awake_since(0);
 }
 
 /// A RECORD NO BUILD GAVE A TAB IS WATCHED IN THE TAB ITS HOLDER IS PROVEN IN
@@ -862,7 +1784,7 @@ fn the_view_names_a_records_watch_and_lists_it_due_once_past() {
 /// watched off a guess.
 #[test]
 fn a_record_with_no_recorded_tab_is_watched_in_its_holders_tab() {
-    let dir = scratch("watch-untabbed");
+    let dir = ScratchDir::new("upgrade-status", "watch-untabbed");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let st = St {
@@ -902,18 +1824,13 @@ fn a_record_with_no_recorded_tab_is_watched_in_its_holders_tab() {
         elsewhere.watch_due().is_empty(),
         "holders unread: no tab proven"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// THE MOMENT A PERSON STOPS BEING NAMED IS A CHANGE THE VIEW NAMES (the review
-/// of 2026-09-28): the words stop naming a person no look has seen lately
-/// ([`Row::person_seen`]), but the host hands the window a row only when it
-/// changes, and looks again only at the instant [`next_change`] names — so the
-/// band kept "someone is using its tab" for as long as the stall stood. The
-/// row carries the flag ([`Row::person_named`]), as it carries its stall, and
-/// the view names the instant it flips. NEGATIVE CONTROLS: past that instant
-/// nothing more is to come; a Codex tab's attended wait and every other wait
-/// name none; the same row read before the flip is the same row.
+/// The moment a person stops being named is a change the view names: the row
+/// carries [`Row::person_named`] and [`next_change`] names the instant it flips,
+/// since the host only looks at named instants. Negative controls: past it
+/// nothing is to come; a Codex tab's attended wait and other waits name none;
+/// the row before the flip is unchanged.
 #[test]
 fn the_view_names_the_instant_a_person_stops_being_named() {
     let flips = NOW - 10 + ATTENDED_SEEN_S + 1;
@@ -936,7 +1853,11 @@ fn the_view_names_the_instant_a_person_stops_being_named() {
     };
     assert_eq!(next_change(std::slice::from_ref(&codex), NOW), None);
     assert!(!codex.person_seen(NOW));
-    assert_eq!(next_change(&[pending(7 * 3_600)], NOW), None);
+    // (A row busy with its own work names the digest's day, not a flip.)
+    assert_eq!(
+        next_change(&[pending(7 * 3_600)], NOW),
+        Some(NOW - 7 * 3_600 + DIGEST_AFTER_S)
+    );
 
     // The row handed over changes at the flip, and by that alone.
     let st = St {
@@ -968,12 +1889,12 @@ fn the_view_names_the_instant_a_person_stops_being_named() {
     );
 }
 
-/// The host hands the window its tabs' rows only when they CHANGE, and a row
-/// that crosses [`STALLED_AFTER_S`] is a change; a tab the roster no longer
-/// lists is left out; standing down sends one empty summary.
+/// The host hands the window rows only when they change, and crossing
+/// [`STALLED_AFTER_S`] is a change; a tab no longer on the roster is left out;
+/// standing down sends one empty summary.
 #[test]
 fn the_host_sends_its_tabs_rows_only_when_they_change() {
-    let dir = scratch("view");
+    let dir = ScratchDir::new("upgrade-status", "view");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let st = St {
@@ -1047,19 +1968,15 @@ fn the_host_sends_its_tabs_rows_only_when_they_change() {
     assert!(sent[2].is_empty(), "standing down hands over no rows");
     view.stand_down(&mut |rows| sent.push(rows.to_vec()));
     assert_eq!(sent.len(), 3, "said once");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// UPGRADE RECORDS THAT CANNOT BE READ WHOLE say nothing, like a roster or
-/// session files that cannot be read (review of 2026-09-27): read as no
-/// records, a successor's first look — always handed over — handed the
-/// window no rows, and it withdrew every carried stall row whose tab still
-/// stalled. A state directory that is not listable and a record listed but
-/// not readable hand over nothing; `--status` shows what does read, as
-/// before. No directory at all is a look: nothing was ever recorded.
+/// Upgrade records that cannot be read whole say nothing (as an unreadable
+/// roster or session files do), so a successor's look does not withdraw stall
+/// rows. An unlistable state directory or an unreadable listed record hands
+/// over nothing; `--status` shows what reads. No directory at all is a look.
 #[test]
 fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
-    let dir = scratch("unreadable-records");
+    let dir = ScratchDir::new("upgrade-status", "unreadable-records");
     let o = opts(&dir);
     let tabs = [LiveTab {
         sid: TAB.to_string(),
@@ -1117,49 +2034,16 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
     assert_eq!(sent.len(), 2);
     assert!(sent[1].is_empty(), "no directory: no records, handed over");
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// The state's new fields survive the file, and a file an older build wrote
-/// (no `pending_since`) reads as behind since it was minted.
-#[test]
-fn the_owners_view_survives_the_state_file_and_an_older_file_reads_its_salt() {
-    let st = St {
-        phase: Phase::Announced { at_s: 9, asks: 2 },
-        to: "2.1.282".to_string(),
-        salt: 100,
-        pending_since: 50,
-        wait: "not-idle:shell".to_string(),
-        wait_since: 60,
-        request: Request::DeferUntil(700),
-        request_tab: TAB.to_string(),
-        outcome: "claude restarted on 2.1.282 · model x".to_string(),
-        done_at: 800,
-        ..St::default()
-    };
-    assert_eq!(St::from_json(&st.to_json()), Some(st.clone()));
-    let older = St {
-        pending_since: 0,
-        ..st.clone()
-    };
-    let text = older.to_json().replace(r#""pending_since":0,"#, "");
-    let read = St::from_json(&text).expect("an older file");
-    assert_eq!(read.behind_since(), 100, "the salt is when it was minted");
-    let unknown = st.to_json().replace("defer-until:700", "someday");
-    assert_eq!(
-        St::from_json(&unknown).expect("still read").request,
-        Request::None,
-        "an unreadable request asks for nothing"
-    );
 }
 
 /// ONE STATE FILE, OLDER WRITERS: a file written by the build before the
 /// owner's view, by a build that wrote fields this one does not read
 /// (`told`, `ready`, the retired board's `yielded`/`yielded_until`) and by the
 /// owner's-view build (`request`, `wait`, `pending_since`…) is read by this
-/// one, each missing field at its default and an unknown one ignored — and a
-/// field this build writes that another reads as unknown changes nothing it
-/// reads.
+/// one, each missing field at its default (no `pending_since`: behind since
+/// its salt) and an unknown one ignored — and a field this build writes that
+/// another reads as unknown changes nothing it reads. This build's own fields
+/// survive the file, and a request word it cannot read asks for nothing.
 #[test]
 fn a_state_file_from_either_older_writer_is_read_with_its_missing_fields_at_default() {
     // The build before the owner's view: none of its fields.
@@ -1189,7 +2073,7 @@ fn a_state_file_from_either_older_writer_is_read_with_its_missing_fields_at_defa
         (Request::Now, "settling", 5)
     );
     assert_eq!(st.request_at, 0, "no word time: an older writer's");
-    // The retired board's `yielded` and `yielded_until`: ignored.
+    // Retired `yielded` and `yielded_until` fields: ignored.
     let board = owners.replace(
         r#""asks":2,"#,
         r#""asks":2,"yielded":1,"yielded_until":270,"#,
@@ -1202,17 +2086,25 @@ fn a_state_file_from_either_older_writer_is_read_with_its_missing_fields_at_defa
     // And this build's own file carries all of it, back to itself.
     let both = St {
         phase: Phase::Announced { at_s: 90, asks: 2 },
-        request: Request::Now,
+        request: Request::DeferUntil(700),
         request_tab: "s-1".to_string(),
         request_at: 88,
+        outcome: "claude restarted on 2.1.282 · model x".to_string(),
+        done_at: 800,
         ..st
     };
-    assert_eq!(St::from_json(&both.to_json()), Some(both));
+    assert_eq!(St::from_json(&both.to_json()), Some(both.clone()));
+    let unknown = both.to_json().replace("defer-until:700", "someday");
+    assert_eq!(
+        St::from_json(&unknown).expect("still read").request,
+        Request::None,
+        "an unreadable request asks for nothing"
+    );
 }
 
-/// A control socket at `<dir>/t.sock` (its token beside it) that answers
-/// `OK` to every request and records them, standing in for the window's own
-/// instance. The accept loop ends with the test process.
+/// A control socket at `<dir>/t.sock` (token beside it) answering `OK` to every
+/// request and recording them, standing in for the window's instance. The
+/// accept loop ends with the test process.
 #[cfg(unix)]
 fn recording_socket(
     dir: &std::path::Path,
@@ -1251,14 +2143,13 @@ fn recording_socket(
     (sock.to_string_lossy().into_owned(), asked)
 }
 
-/// THE TAB'S MARK (gap audit 2026-09-24: both lagging tabs read
-/// `attention=-`): the host raises `meta set attention owner=upgrade` on a
-/// STALLED tab once, and lowers it when the stall ends. NEGATIVE CONTROL: a
-/// tab that is merely waiting for its turn end is never marked.
+/// The tab's mark: the host raises `meta set attention owner=upgrade` on a
+/// stalled tab once and lowers it when the stall ends. Negative control: a tab
+/// merely waiting for its turn end is never marked.
 #[cfg(unix)]
 #[test]
 fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
-    let dir = scratch("mark");
+    let dir = ScratchDir::new("upgrade-status", "mark");
     let (sock, asked) = recording_socket(&dir);
     let o = Opts {
         sock: Some(sock),
@@ -1273,10 +2164,14 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
         pending_since: now_s() - 60,
         ..St::default()
     };
-    // A refusal: a stall a new round meets again. (A round that gave up is
-    // none: `a_give_up_rests_unmarked_and_now_re_arms_it_at_once`.)
+    // THE ONE STALL THAT MARKS THE TAB: the upgrade ended the agent and it is
+    // not back (the owner is needed now, and the action is theirs alone). A
+    // refusal, a round that gave up and an overdue wait are none: the log, or
+    // the digest (`an_overdue_tab_is_never_marked`, `attention_is_decided_by_
+    // the_owners_action_never_by_age`).
     let stalled = St {
-        phase: Phase::Failed("not-a-shell-job".to_string()),
+        phase: Phase::Failed("stale-exit".to_string()),
+        exited_at: now_s() - 600,
         ..waiting.clone()
     };
     save(&o, "aaa", &waiting);
@@ -1292,14 +2187,30 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
     };
     let mut view = View::default();
     let held = behind_in(TAB);
+    // The agent the upgrade ended is gone: no process holds its conversation.
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
     let sweep = |view: &mut View| {
         let _ = view.refresh_with(&o, &tabs, now_s(), &held, &mut |_| {});
     };
+    let sweep_after_exit = |view: &mut View| {
+        let _ = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |_| {});
+    };
     sweep(&mut view);
-    assert!(meta(&asked).is_empty(), "waiting is never marked");
+    // THE FIRST LOOK OF A PROCESS LOWERS WHAT AN EARLIER ONE RAISED (a
+    // seamless update carries every keyed attention across the handoff, and
+    // this view starts with nothing marked; round eight, #20): one idempotent
+    // `unset` for the tab it wants no mark on, and nothing that marks.
+    assert_eq!(
+        meta(&asked),
+        [format!("@{TAB} meta unset attention owner=upgrade")],
+        "waiting is never marked"
+    );
+    asked.lock().expect("log").clear();
+    sweep(&mut view);
+    assert!(meta(&asked).is_empty(), "and the sweep is once");
     save(&o, "aaa", &stalled);
-    sweep(&mut view);
-    sweep(&mut view);
+    sweep_after_exit(&mut view);
+    sweep_after_exit(&mut view);
     let marked = meta(&asked);
     assert_eq!(marked.len(), 1, "raised once: {marked:?}");
     assert!(
@@ -1309,8 +2220,9 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
         "{marked:?}"
     );
     assert!(
-        marked[0].contains("not its shell's foreground job"),
-        "{marked:?}"
+        marked[0].contains("could not start it again")
+            && marked[0].contains("Resume it in that tab with this command: claude --resume aaa"),
+        "the mark says why the owner and the one action: {marked:?}"
     );
     save(
         &o,
@@ -1320,14 +2232,112 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
             ..stalled.clone()
         },
     );
-    sweep(&mut view);
+    sweep_after_exit(&mut view);
     let marked = meta(&asked);
     assert_eq!(
         marked.last().map(String::as_str),
         Some(format!("@{TAB} meta unset attention owner=upgrade").as_str()),
         "the owner's skip ends the stall: {marked:?}"
     );
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A MARK THIS VIEW DID NOT RAISE IS LOWERED AT ITS FIRST LOOK (round eight,
+/// #20): a seamless update carries every keyed owner's attention but the
+/// server's into the successor, and the successor's view began with nothing
+/// it had raised — so an `owner=upgrade` "upgrade stalled" mark its producer
+/// raised stood on the tab after the stall it named was over, and was
+/// carried on at every later update. Now the successor's first whole look
+/// lowers the `owner=upgrade` entry of every live tab it does not want
+/// marked, once, by that key alone. NEGATIVE CONTROLS: its later looks send
+/// nothing more; a tab it wants marked is written, never lowered; and a view
+/// that stood down settles its tabs again at its next look.
+#[test]
+fn a_carried_upgrade_mark_is_lowered_by_the_successors_first_look() {
+    let dir = ScratchDir::new("upgrade-status", "mark-carried");
+    let (sock, asked) = recording_socket(&dir);
+    let o = Opts {
+        sock: Some(sock),
+        ..opts(&dir)
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let waiting = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: now_s() - 60,
+        ..St::default()
+    };
+    // The one stall that marks a tab: the agent the upgrade ended is not
+    // back (`only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_
+    // recovers`), no process holding its conversation.
+    let stalled = St {
+        phase: Phase::Failed("stale-exit".to_string()),
+        exited_at: now_s() - 600,
+        ..waiting.clone()
+    };
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let held = behind_in(TAB);
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    let sweep = |view: &mut View| {
+        let _ = view.refresh_with(&o, &tabs, now_s(), &held, &mut |_| {});
+    };
+    let sweep_after_exit = |view: &mut View| {
+        let _ = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |_| {});
+    };
+    let taken = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
+        asked
+            .lock()
+            .map(|mut a| {
+                std::mem::take(&mut *a)
+                    .into_iter()
+                    .filter(|l| l.contains(" meta "))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let lowered = format!("@{TAB} meta unset attention owner=upgrade");
+    // The producer's view raises the mark, and the update carries it.
+    save(&o, "aaa", &stalled);
+    let mut producer = View::default();
+    sweep_after_exit(&mut producer);
+    assert!(
+        taken(&asked)
+            .iter()
+            .any(|l| l.starts_with(&format!("@{TAB} meta set attention owner=upgrade"))),
+        "raised"
+    );
+    // The stall is over in the successor; its fresh view lowers the mark.
+    save(&o, "aaa", &waiting);
+    let mut successor = View::default();
+    sweep(&mut successor);
+    assert_eq!(
+        taken(&asked),
+        std::slice::from_ref(&lowered),
+        "lowered at the first look"
+    );
+    sweep(&mut successor);
+    assert!(taken(&asked).is_empty(), "once");
+    // NEGATIVE CONTROL: a successor that still wants it marked writes it.
+    save(&o, "aaa", &stalled);
+    let mut wanting = View::default();
+    sweep_after_exit(&mut wanting);
+    let said = taken(&asked);
+    assert!(!said.contains(&lowered), "{said:?}");
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with(&format!("@{TAB} meta set attention owner=upgrade"))),
+        "{said:?}"
+    );
+    // A view that stood down settles its tabs again at its next look.
+    save(&o, "aaa", &waiting);
+    successor.stand_down(&mut |_| {});
+    let _ = taken(&asked);
+    sweep(&mut successor);
+    assert_eq!(taken(&asked), [lowered]);
 }
 
 /// WHAT A ROW SAYS IT MOVES: a build upgrade names both builds (and the
@@ -1357,13 +2367,11 @@ fn a_row_names_the_move_a_model_restart_included() {
     assert_eq!(named.move_words(), "Claude Code 2.1.282 → claude-opus-5-5");
 }
 
-/// WHAT IS SHOWN IS VETTED AGAINST THE LIVE PROCESSES (review of 2026-09-25:
-/// a state file outlives what it describes, and was shown for as long as its
-/// TAB lived). A pending, announced or stopped upgrade stands only while a
-/// live process holds its conversation, IN ITS TAB, on a build OLDER than its
-/// target; a finished move and a restart in flight always stand. The host
-/// counts no holder whose tab it could not prove; the CLI, with no roster,
-/// does not disprove one.
+/// What is shown is vetted against live processes: a pending, announced or
+/// stopped upgrade stands only while a live process holds its conversation in
+/// its tab on a build older than its target; a finished move and a restart in
+/// flight always stand. The host counts no holder whose tab it cannot prove;
+/// the CLI, with no roster, disproves none.
 #[test]
 fn a_row_stands_only_while_its_conversation_is_live_and_behind_in_its_tab() {
     let row = pending(7 * 3_600);
@@ -1401,9 +2409,8 @@ fn a_row_stands_only_while_its_conversation_is_live_and_behind_in_its_tab() {
     let unproven = [holder(s, "2.1.281", None)];
     assert!(!row.standing(&unproven, false), "the host proves the tab");
     assert!(row.standing(&unproven, true), "the CLI cannot disprove it");
-    // A SAME-BUILD restart (a model move, the build current)
-    // waits on a holder still ON its build — and, like any other, not on one
-    // past it or in another tab.
+    // A same-build restart (a model move) waits on a holder still on its
+    // build, and not on one past it or in another tab.
     let model = Row {
         from: "2.1.282".to_string(),
         ..row.clone()
@@ -1445,16 +2452,21 @@ fn a_row_stands_only_while_its_conversation_is_live_and_behind_in_its_tab() {
     }
 }
 
-/// THE TAB'S MARK IS SENT ONCE PER STALL (review of 2026-09-25: the overdue
-/// text carried `behind for 7h1m`, so each minutely sweep re-sent `meta set
-/// attention` — three sets in three minutes, each a meta-change event and a
-/// wake, and each taking the shown attention back from a later owner). Three
-/// sweeps a minute apart on an overdue tab send ONE set, and its text holds no
-/// age; a change of KIND is a new text, sent once more.
+/// AN OVERDUE TAB IS NEVER MARKED (the owner, 2026-09-28: "don't continue to
+/// persist alerts to the user that are not actionable"; the tab of that day
+/// wore an orange diamond for 7 hours for a session that was merely behind
+/// and busy), and THE TAB'S MARK OF A STALL THAT IS ONE IS SENT ONCE (review
+/// of 2026-09-25: the overdue text carried `behind for 7h1m`, so each minutely
+/// sweep re-sent `meta set attention` — three sets in three minutes, each a
+/// meta-change event and a wake, and each taking the shown attention back from
+/// a later owner). Three sweeps a minute apart on an overdue tab send NONE;
+/// when the agent it was moving is gone (the upgrade ended it and it is not
+/// back) the mark is sent ONCE, holding no age; a change of KIND is a new
+/// text, sent once more.
 #[cfg(unix)]
 #[test]
-fn an_overdue_tab_is_marked_once_not_once_a_minute() {
-    let dir = scratch("mark-once");
+fn an_overdue_tab_is_never_marked() {
+    let dir = ScratchDir::new("upgrade-status", "mark-once");
     let (sock, asked) = recording_socket(&dir);
     let o = Opts {
         sock: Some(sock),
@@ -1504,54 +2516,60 @@ fn an_overdue_tab_is_marked_once_not_once_a_minute() {
         },
     );
     view.refresh_with(&o, &tabs, now + 180, &held, &mut |_| {});
-    let marked = sets(&asked);
-    assert_eq!(marked.len(), 1, "one set for one stall: {marked:?}");
-    // The CAUSE by class (design record 2026-09-28): a turn and a background
-    // shell are both its own work, one text for both.
     assert!(
-        marked[0].ends_with("upgrade stalled: behind for more than 6h, held by its own work"),
-        "no running age, no wait: {marked:?}"
+        sets(&asked).is_empty(),
+        "behind for hours is no reason to mark a tab: {:?}",
+        sets(&asked)
     );
-    // A new KIND of stall is new words: said once more.
+    // The upgrade ended the agent and it is not back: marked once, whatever
+    // the number of looks, and a refusal (a digest line) marks nothing.
     save(
         &o,
         "aaa",
         &St {
             phase: Phase::Failed("not-a-shell-job".to_string()),
-            ..overdue
+            ..overdue.clone()
         },
     );
     view.refresh_with(&o, &tabs, now + 240, &held, &mut |_| {});
-    view.refresh_with(&o, &tabs, now + 300, &held, &mut |_| {});
+    assert!(sets(&asked).is_empty(), "a refusal is the digest's");
+    save(
+        &o,
+        "aaa",
+        &St {
+            phase: Phase::Failed("stale-exit".to_string()),
+            exited_at: now,
+            ..overdue
+        },
+    );
+    // (The agent it ended is gone: no process holds its conversation.)
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    view.refresh_with(&o, &tabs, now + 300, &nobody, &mut |_| {});
+    view.refresh_with(&o, &tabs, now + 360, &nobody, &mut |_| {});
     let marked = sets(&asked);
-    assert_eq!(marked.len(), 2, "{marked:?}");
+    assert_eq!(marked.len(), 1, "{marked:?}");
     assert!(
-        marked[1].contains("not its shell's foreground job"),
+        marked[0].contains("could not start it again")
+            && marked[0].contains("Resume it in that tab with this command: claude --resume aaa"),
         "{marked:?}"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// THE OWNER'S `--now` ENDS AN OVERDUE STALL (review of 2026-09-25): a
-/// session the owner had already hurried still read `stalled/…/overdue`, the
-/// band's row told them to run the `--now` they had run, and the waiting
-/// record counted it as staying behind. Under `--now` it is moving: pending,
-/// no stall, no remedy, no mark. And the remedy of an overdue stall names
-/// `--now` only where `--now` moves it — past the settling window or the
-/// attended guard, or at the turn end of a TURN it waits for; one waiting on
-/// the READY answer, a draft, a box, a hold, work under the agent — or
-/// Claude's status off idle for anything but a turn: a background shell
-/// (`not-idle:shell`), a question waiting on a person (`not-idle:waiting`),
-/// a status nobody read (`not-idle`), none of which `--now` ends, since it
-/// still asks Claude idle — names that wait ([`Remedy::Waits`]; review of
-/// 2026-09-25: it offered `--now` for those, and once given the word hid the
-/// stall for good). NEGATIVE CONTROLS: without the word it is overdue, and a
-/// STOP is still a stall under `--now`.
+/// The user's `--now` ends an overdue stall: under `--now` it is moving (no
+/// stall, remedy or mark). An overdue stall's remedy names `--now` only where
+/// `--now` moves it; waits it cannot end (the READY answer, a draft, a box, a
+/// hold, work under the agent, or a non-idle status other than a turn) name
+/// [`Remedy::Waits`]. Negative controls: without the word it is overdue, and a
+/// stop is still a stall under `--now`.
 #[test]
 fn an_owners_now_ends_an_overdue_stall_and_its_remedy_is_the_waits() {
     let overdue = pending(7 * 3_600);
     assert_eq!(overdue.stall(NOW).as_deref(), Some("overdue"));
-    assert!(overdue.badge(NOW).is_some());
+    assert_eq!(
+        overdue.badge(NOW),
+        None,
+        "behind is no reason to mark a tab"
+    );
     let hurried = Row {
         request: Request::Now,
         request_at: NOW - 60,
@@ -1580,13 +2598,10 @@ fn an_owners_now_ends_an_overdue_stall_and_its_remedy_is_the_waits() {
         ..hurried
     };
     assert!(stopped.stall(NOW).is_some(), "a stop is still a stall");
-    // What `--now` still moves once overdue (ruling 380, the owner's decision
-    // of 2026-09-28): an overdue upgrade has stood hours on the ladder's last
-    // rung, which `--now` is — the settle, a person near the tab and a turn
-    // still running are nothing it moves (they were `Now` until that day,
-    // and the row promised a move "at its next turn end" to a goal-mode
-    // Codex whose turns never ended). Its own text left typed, and a notice
-    // behind a full queue, it still moves.
+    // What `--now` still moves once overdue: an overdue upgrade already stands
+    // on the ladder's last rung, which `--now` is, so the settle, a nearby
+    // person and a running turn are not moved by it. Its own text left typed
+    // and a notice behind a full queue still are.
     for (wait, remedy) in [
         ("", Remedy::Waits),
         ("settling", Remedy::Waits),
@@ -1615,17 +2630,13 @@ fn an_owners_now_ends_an_overdue_stall_and_its_remedy_is_the_waits() {
     }
 }
 
-/// EVERY OWNER'S WORD ARMS A NEW ROUND (review of 2026-09-25). A hold on an
-/// announced upgrade puts it back to pending — and with the salt kept, the
-/// notice after the hold asked for the SAME READY marker as the one before
-/// it, so a READY given before the word answered a notice typed after it.
-/// Now each word mints a new salt past every marker the old one could make:
-/// a new round, a new marker. How long the session has been behind is kept.
-/// NEGATIVE CONTROL: a step's own state keeps its round (the same target
-/// reuses the state as it is).
+/// Every word from the user arms a new round: each word mints a new salt past
+/// every marker the old one could make, so a READY given before the word never
+/// answers a notice typed after it. Time behind is kept. Negative control: a
+/// step's own state keeps its round.
 #[test]
 fn every_owners_word_arms_a_new_round() {
-    let dir = scratch("round");
+    let dir = ScratchDir::new("upgrade-status", "round");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let to = Version::parse("2.1.282").expect("v");
@@ -1644,13 +2655,13 @@ fn every_owners_word_arms_a_new_round() {
         ..St::default()
     };
     save(&o, "aaa", &announced);
-    ask(&o, TAB, Ask::Defer(600)).expect("defer");
+    ask(&o, TAB, Ask::Defer(600), false).expect("defer");
     let held = load(&o, "aaa").expect("state");
     assert_eq!(held.phase, Phase::Pending, "the hold ends the notice");
     assert!(held.marker.is_empty(), "and its marker");
     assert!(held.markers.is_empty(), "every marker of its round");
-    // The agent it asked to wind down is released (2026-09-26): one line is
-    // owed, typed at the next step that may type.
+    // The agent asked to wind down is released: one line is owed, typed at the
+    // next step that may type.
     assert_eq!(held.release, "deferred");
     assert!(held.salt > salt, "the re-armed notice is a new round");
     assert_eq!(held.behind_since(), salt, "behind since the first round");
@@ -1665,7 +2676,7 @@ fn every_owners_word_arms_a_new_round() {
     }
     assert!(held.request_at >= now_s() - 5, "when the word was given");
     // `--now` over a pending upgrade: a round of its own too.
-    ask(&o, TAB, Ask::Now).expect("--now");
+    ask(&o, TAB, Ask::Now, false).expect("--now");
     let hurried = load(&o, "aaa").expect("state");
     assert!(hurried.salt > held.salt, "the owner's word opens a round");
     // Negative control: a step's own state for the same target keeps it.
@@ -1678,19 +2689,16 @@ fn every_owners_word_arms_a_new_round() {
             source: upgrade::Source::Managed,
         },
         None,
+        super::super::Proc::default(),
         now_s(),
     );
     assert_eq!(kept.salt, hurried.salt);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// AN INEFFECTIVE `--now` CANNOT HIDE A STALL FOR GOOD (review of
-/// 2026-09-25): `Request::Now` never lapses, and it lowered the band row and
-/// the tab's mark for as long as it stood — thirty days on, a session stuck
-/// behind a background shell still read `pending … moving`. The word quiets
-/// the stall for [`NOW_QUIETS_S`] from when it was given; a session it has
-/// not moved by then reads `overdue` again, its remedy the wait it is stuck
-/// on. NEGATIVE CONTROL: inside that window the stall stays quiet.
+/// An ineffective `--now` cannot hide a stall for good: the word quiets the
+/// stall for [`NOW_QUIETS_S`] from when it was given; unmoved by then it reads
+/// `overdue` again with the remedy of what it is stuck on. Negative control:
+/// inside that window it stays quiet.
 #[test]
 fn an_owners_now_quiets_an_overdue_stall_only_for_a_bounded_time() {
     let shell = Row {
@@ -1706,7 +2714,7 @@ fn an_owners_now_quiets_an_overdue_stall_only_for_a_bounded_time() {
     let later = NOW + NOW_QUIETS_S;
     assert_eq!(shell.stall(later).as_deref(), Some("overdue"));
     assert_eq!(shell.remedy(later), Some(Remedy::Waits));
-    assert!(shell.badge(later).is_some(), "the mark comes back");
+    assert_eq!(shell.badge(later), None, "never a mark: the column says it");
     let month = NOW + 30 * 86_400;
     assert_eq!(shell.stall(month).as_deref(), Some("overdue"));
     // A word an older build wrote carries no time: it quiets nothing.
@@ -1727,11 +2735,12 @@ fn an_owners_now_quiets_an_overdue_stall_only_for_a_bounded_time() {
 /// rests until its next one, which `--status` names (`next_round=`), and is
 /// never marked; the owner's `--now` re-arms it at once, as its remedy says,
 /// and nothing is marked then either. NEGATIVE CONTROL: the same row as a
-/// refusal (`not-a-shell-job`, which a new round meets again) is marked.
+/// refusal (`not-a-shell-job`, which a new round meets again) is a stall, a
+/// line in the digest, but no mark.
 #[cfg(unix)]
 #[test]
 fn a_give_up_rests_unmarked_and_now_re_arms_it_at_once() {
-    let dir = scratch("re-armed");
+    let dir = ScratchDir::new("upgrade-status", "re-armed");
     let (sock, asked) = recording_socket(&dir);
     let o = Opts {
         sock: Some(sock),
@@ -1778,7 +2787,7 @@ fn a_give_up_rests_unmarked_and_now_re_arms_it_at_once() {
         Some(Remedy::AskAgain),
         "--now asks at once"
     );
-    let row = ask(&o, TAB, Ask::Now).expect("--now re-arms a give-up");
+    let row = ask(&o, TAB, Ask::Now, false).expect("--now re-arms a give-up");
     assert_eq!(row.phase, Phase::Pending);
     assert_eq!(row.stall(now), None, "{row:?}");
     view.refresh_with(&o, &tabs, now + 60, &held, &mut |rows| last = rows.to_vec());
@@ -1787,10 +2796,23 @@ fn a_give_up_rests_unmarked_and_now_re_arms_it_at_once() {
     let meta = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
         asked
             .lock()
-            .map(|a| a.iter().filter(|l| l.contains(" meta ")).cloned().collect())
+            .map(|a| {
+                a.iter()
+                    .filter(|l| l.contains(" meta set "))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     };
-    assert!(meta(&asked).is_empty(), "never marked: {:?}", meta(&asked));
+    // Marks SET, never the view's first-look lowering of one it did not
+    // raise (round eight, #20).
+    let sets = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
+        meta(asked)
+            .into_iter()
+            .filter(|l| l.contains(" meta set "))
+            .collect()
+    };
+    assert!(sets(&asked).is_empty(), "never marked: {:?}", meta(&asked));
     // NEGATIVE CONTROL: a refusal a new round meets again is a stall.
     save(
         &o,
@@ -1807,15 +2829,16 @@ fn a_give_up_rests_unmarked_and_now_re_arms_it_at_once() {
         last[0].stall(now + 120).as_deref(),
         Some("refused:not-a-shell-job")
     );
-    assert_eq!(meta(&asked).len(), 1, "{:?}", meta(&asked));
-    let _ = std::fs::remove_dir_all(dir);
+    assert!(
+        meta(&asked).is_empty(),
+        "a refusal is the digest's, never a mark: {:?}",
+        meta(&asked)
+    );
 }
 
-/// A `line:` REFUSAL IS THE RELAUNCH LINE'S (review of 2026-09-25): it read
-/// "its launch flags cannot be carried into a resume", which a fish tab in
-/// another directory — whose flags are fine — could do nothing with. Each
-/// cause is said as what it is. NEGATIVE CONTROL: an `argv:` refusal is
-/// still the flags'.
+/// A `line:` refusal is the relaunch line's, said as its own cause, not "launch
+/// flags cannot be carried". Negative control: an `argv:` refusal is still the
+/// flags'.
 #[test]
 fn a_line_refusal_says_the_line_not_the_flags() {
     let refused = |why: &str| Row {
@@ -1827,10 +2850,15 @@ fn a_line_refusal_says_the_line_not_the_flags() {
     assert!(words.contains("fish"), "{words}");
     assert!(words.contains("directory"), "{words}");
     assert!(!words.contains("flags"), "{words}");
+    assert_eq!(
+        fish.badge(NOW),
+        None,
+        "a refusal is a digest line, not a mark"
+    );
     assert!(
-        fish.badge(NOW).is_some_and(|b| b.contains("fish")),
+        matches!(fish.attention(NOW), Attention::Digest(n) if n.kind == "refused-launch"),
         "{:?}",
-        fish.badge(NOW)
+        fish.attention(NOW)
     );
     for why in [
         "line:the line would be 1100 bytes (max 1000)",
@@ -1849,9 +2877,9 @@ fn a_line_refusal_says_the_line_not_the_flags() {
     assert_eq!(refused("line:x").remedy(NOW), Some(Remedy::ByHand));
 }
 
-/// The stand-in agent: THIS test binary parked in `harness::upgrade_drive`'s
-/// own park test, its tab given in its environment. Not `/bin/sleep`: a
-/// platform binary's environment is hidden from `KERN_PROCARGS2`.
+/// The stand-in agent: this test binary parked in `harness::upgrade_drive`'s
+/// park test, its tab in its environment. Not `/bin/sleep`: a platform
+/// binary's environment is hidden from `KERN_PROCARGS2`.
 #[cfg(unix)]
 fn parked_agent(tab: &str) -> std::process::Child {
     let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
@@ -1865,7 +2893,7 @@ fn parked_agent(tab: &str) -> std::process::Child {
         .expect("the stand-in agent");
     // Its environment is read once it has exec'd (a fork not yet exec'd reads
     // as this process, with this process's environment).
-    for _ in 0..500 {
+    for _ in 0..3_000 {
         if atpkg::caller_shell::process_args(child.id())
             .is_some_and(|a| a.env_var("UPGRADE_DRIVE_TEST_PARK").is_some())
         {
@@ -1893,18 +2921,15 @@ fn register_as(home: &std::path::Path, pid: u32, session: &str, version: &str) {
     .expect("session file");
 }
 
-/// NEGATIVE CONTROL THROUGH THE REAL READS (review of 2026-09-25, its scratch
-/// test replayed): a `Pending` seven hours old, in a LIVE tab, for a
-/// conversation whose live process's session file reports the TARGET build —
-/// moved there by hand, which the sweep answers `current` without touching
-/// the file — hands the window no row (so no `upgrade=`, no band row, no
-/// "moves onto it" count: the window counts only rows handed over) and marks
-/// no tab. The same process on the OLDER build is the stall it should be: one
-/// row, one mark. Once the conversation ends, the row and the mark go.
+/// Negative control through the real reads: a `Pending` seven hours old in a
+/// live tab, whose live process's session file reports the target build
+/// (moved by hand), hands the window no row and marks no tab. The same process
+/// on the older build is one row and one mark; once the conversation ends,
+/// both go.
 #[cfg(unix)]
 #[test]
 fn a_state_whose_session_is_current_or_gone_shows_nothing() {
-    let dir = scratch("phantom");
+    let dir = ScratchDir::new("upgrade-status", "phantom");
     let (sock, asked) = recording_socket(&dir);
     let o = Opts {
         sock: Some(sock),
@@ -1937,8 +2962,21 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
     let meta = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
         asked
             .lock()
-            .map(|a| a.iter().filter(|l| l.contains(" meta ")).cloned().collect())
+            .map(|a| {
+                a.iter()
+                    .filter(|l| l.contains(" meta set "))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
+    };
+    // Marks SET, never the view's first-look lowering of one it did not
+    // raise (round eight, #20).
+    let sets = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
+        meta(asked)
+            .into_iter()
+            .filter(|l| l.contains(" meta set "))
+            .collect()
     };
     let mut view = View::default();
     let mut sent: Vec<Vec<Row>> = Vec::new();
@@ -1951,7 +2989,7 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
         &|sessions| holders(&o.home, sessions, Some(&tabs)),
         &mut |rows| sent.push(rows.to_vec()),
     );
-    let current = (sent.clone(), meta(&asked));
+    let current = (sent.clone(), sets(&asked));
 
     register_as(&o.home, agent.id(), session, "2.1.281");
     let _ = view.refresh_with(
@@ -1968,7 +3006,7 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
         &|sessions| holders(&o.home, sessions, Some(&tabs)),
         &mut |rows| sent.push(rows.to_vec()),
     );
-    let behind = (sent.clone(), meta(&asked));
+    let behind = (sent.clone(), sets(&asked));
 
     let _ = agent.kill();
     let _ = agent.wait();
@@ -1980,7 +3018,6 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
         &mut |rows| sent.push(rows.to_vec()),
     );
     let gone = (sent.clone(), meta(&asked));
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(
         current.0,
@@ -1991,37 +3028,29 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
     assert_eq!(behind.0.len(), 2, "{:?}", behind.0);
     assert_eq!(behind.0[1].len(), 1);
     assert_eq!(behind.0[1][0].stalled.as_deref(), Some("overdue"));
-    assert_eq!(behind.1.len(), 1, "one mark: {:?}", behind.1);
-    assert!(
-        behind.1[0].starts_with(&format!("@{TAB} meta set attention owner=upgrade")),
-        "{:?}",
-        behind.1
-    );
+    // Behind for hours is no reason to mark a tab: the row is handed over
+    // (the `upgrade=` column, `--status`), and nothing more.
+    assert!(behind.1.is_empty(), "no mark: {:?}", behind.1);
     assert_eq!(gone.0.len(), 3);
     assert!(
         gone.0[2].is_empty(),
         "an ended conversation hands over none"
     );
-    assert_eq!(
-        gone.1.last().map(String::as_str),
-        Some(format!("@{TAB} meta unset attention owner=upgrade").as_str()),
-        "and its mark is lowered: {:?}",
+    assert!(
+        gone.1.is_empty(),
+        "and nothing was ever marked: {:?}",
         gone.1
     );
 }
 
-/// A STATE AN OLDER BUILD WROTE HAS NO TAB (measured 2026-09-25 on the
-/// owner's machine: both live pending states read `"tab":""` — the older
-/// build recorded the tab only at the announcement — so `--status` listed
-/// nothing for two sessions one and two builds behind, and `--now` could name
-/// neither). Such a state is shown under the tab its live holder is PROVEN
-/// in, and the owner's word for that tab lands on it and records the tab.
-/// NEGATIVE CONTROL: the same state whose holder is proven in ANOTHER tab is
-/// neither listed for this tab nor taken by a word for it.
+/// A state an older build wrote has no tab; it is shown under the tab its live
+/// holder is proven in, and the user's word for that tab lands and records the
+/// tab. Negative control: a holder proven in another tab is neither listed nor
+/// taken by a word for this one.
 #[cfg(unix)]
 #[test]
 fn a_state_with_no_recorded_tab_stands_in_the_tab_its_holder_is_in() {
-    let dir = scratch("untabbed");
+    let dir = ScratchDir::new("upgrade-status", "untabbed");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let session = "0badf00d-1111-2222-3333-444455556666";
@@ -2044,20 +3073,19 @@ fn a_state_with_no_recorded_tab_stands_in_the_tab_its_holder_is_in() {
 
     let mut elsewhere = parked_agent(other);
     register_as(&o.home, elsewhere.id(), session, "2.1.281");
-    let (listed_elsewhere, _) = status_rows(&for_tab(TAB));
-    let asked_elsewhere = ask(&o, TAB, Ask::Now);
+    let (listed_elsewhere, _) = status_rows(&for_tab(TAB), true);
+    let asked_elsewhere = ask(&o, TAB, Ask::Now, false);
     let _ = elsewhere.kill();
     let _ = elsewhere.wait();
     let untouched = load(&o, session);
 
     let mut here = parked_agent(TAB);
     register_as(&o.home, here.id(), session, "2.1.281");
-    let (listed, vetted) = status_rows(&for_tab(TAB));
-    let asked = ask(&o, TAB, Ask::Now);
+    let (listed, vetted) = status_rows(&for_tab(TAB), true);
+    let asked = ask(&o, TAB, Ask::Now, false);
     let _ = here.kill();
     let _ = here.wait();
     let written = load(&o, session).expect("state");
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(listed_elsewhere.is_empty(), "{listed_elsewhere:?}");
     let e = asked_elsewhere.expect_err("no holder in this tab");
@@ -2093,27 +3121,20 @@ fn register_status(
     .expect("session file");
 }
 
-/// L2 OF THE UPGRADE'S LEFTOVERS (2026-09-28): A ROW NO LOOK HAS REACHED
-/// READS CLAUDE'S OWN LIVE STATUS. A session minted behind at its attach, or
-/// whose last step acted (its notice typed), records no wait until a step
-/// looks again — and the window steps only at an idle screen or a break of
-/// the agent's own work, so a question box or a turn of hours is never
-/// looked at. Read as waiting on nothing, such a row offered `Upgrade now`
-/// at six hours, a word that cannot move a session a box holds (it asks
-/// Claude idle), and pressing it hid the stall for half an hour before it
-/// came back. The owner's view now reads the word the first look would
-/// record off the live holder's status (`not-idle:<status>`), in `--status`
-/// and in the window's rows alike: a box reads `it asked a question and
-/// waits` with no `Upgrade now`, a background shell `its own work runs`,
-/// each since the status says — never since 1970. A turn still running
-/// offers no `Upgrade now` either (ruling 380: `--now` is the ladder's last
-/// rung, and a goal's turn end may never come). NEVER OVER A RECORDED
-/// WORD. NEGATIVE CONTROLS: an idle holder leaves the row as recorded, and a
-/// recorded `settling` stands whatever the status.
+/// A row no look has reached reads Claude's live status: a session minted
+/// behind at attach, or whose last step typed its notice, records no wait
+/// until a step looks again, and steps only come at idle screens or breaks.
+/// The view reads the word the first look would record from the live holder's
+/// status (`not-idle:<status>`), in `--status` and window rows alike: a box
+/// reads `it asked a question and waits` with no `Upgrade now`, a background
+/// shell `its own work runs`, each since the status says. A running turn
+/// offers no `Upgrade now` either. Never over a recorded word. Negative
+/// controls: an idle holder leaves the row as recorded; a recorded `settling`
+/// stands.
 #[cfg(unix)]
 #[test]
 fn an_unreached_row_reads_claudes_live_status_never_over_a_recorded_word() {
-    let dir = scratch("unreached");
+    let dir = ScratchDir::new("upgrade-status", "unreached");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let mut agent = parked_agent(TAB);
@@ -2162,7 +3183,7 @@ fn an_unreached_row_reads_claudes_live_status_never_over_a_recorded_word() {
             status,
             status_since,
         );
-        let (cli, vetted) = status_rows(&o);
+        let (cli, vetted) = status_rows(&o, true);
         let mut view = View::default();
         let mut sent: Vec<Vec<Row>> = Vec::new();
         let _ = view.refresh_with(
@@ -2176,7 +3197,6 @@ fn an_unreached_row_reads_claudes_live_status_never_over_a_recorded_word() {
     }
     let _ = agent.kill();
     let _ = agent.wait();
-    let _ = std::fs::remove_dir_all(&dir);
 
     let want = [
         (
@@ -2192,8 +3212,8 @@ fn an_unreached_row_reads_claudes_live_status_never_over_a_recorded_word() {
             "2h",
         ),
         ("not-idle:shell", Remedy::Waits, "its own work runs", "2h"),
-        // Ruling 380: `--now` is the ladder's last rung, which a turn still
-        // running, the settle and nothing recorded no longer pass.
+        // `--now` is the ladder's last rung, which a running turn, the settle
+        // and nothing recorded do not pass.
         (
             "not-idle:busy",
             Remedy::Waits,
@@ -2230,9 +3250,8 @@ fn an_unreached_row_reads_claudes_live_status_never_over_a_recorded_word() {
             );
         }
     }
-    // A box after the notice: a person's to answer (round six, F6) — the
-    // upgrade's asking waits under it, never asks again and never gives up,
-    // so it is a row with a mark, never a record.
+    // A box after the notice is a person's to answer: the upgrade waits under
+    // it without re-asking or giving up, so it is a row with a mark.
     assert!(!seen[1].1[0].asks_on_its_own(now));
     assert!(!seen[3].1[0].asks_on_its_own(now), "a turn: no");
     assert_eq!(
@@ -2241,24 +3260,15 @@ fn an_unreached_row_reads_claudes_live_status_never_over_a_recorded_word() {
     );
 }
 
-/// THE WINDOW FOLLOWS A ROW READ OFF A LIVE STATUS (the review of the
-/// upgrade's leftovers, 2026-09-28). L2's reading is Claude's status as it
-/// stood at a look, and nothing looked again when it moved: `next_change`
-/// names no instant for a status, and the window's host looked only after a
-/// worker's step, an activation, a change of its tabs or that instant — none
-/// of which a box answered, and the turn that follows, makes. A look taken
-/// while a box was up kept "it asked a question and waits", with no `Upgrade
-/// now`, for the whole next turn, and an announced row read as a record or
-/// a warning by whichever status an unrelated look happened on. The view now
-/// names the tabs whose row follows its agent's live status
-/// ([`View::follows`]) — the host looks again whenever such a tab's screen
-/// moves — and the look at the move sends the changed row: the box answered,
-/// a turn still running, which waits for its end with no `Upgrade now`
-/// (ruling 380: the ladder's last rung). NEGATIVE CONTROL: a word a look recorded
-/// stands until the next step, and no tab is followed for it.
+/// The window follows a row read off a live status: the view names the tabs
+/// whose row follows their agent's live status ([`View::follows`]), the host
+/// looks again whenever such a tab's screen moves, and the look sends the
+/// changed row (box answered, a turn still running waits with no `Upgrade
+/// now`). Negative control: a word a look recorded stands until the next step,
+/// and no tab is followed for it.
 #[test]
 fn a_row_read_off_a_live_status_names_its_tab_for_the_host_to_follow() {
-    let dir = scratch("follows");
+    let dir = ScratchDir::new("upgrade-status", "follows");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let session = "0badf00d-1111-2222-3333-444455556666";
@@ -2315,7 +3325,7 @@ fn a_row_read_off_a_live_status_names_its_tab_for_the_host_to_follow() {
         sent.push(rows.to_vec());
     });
     let turn = view.follows().to_vec();
-    // NEGATIVE CONTROL: a recorded word.
+    // Negative control: a recorded word.
     record("settling");
     let _ = view.refresh_with(
         &o,
@@ -2327,7 +3337,6 @@ fn a_row_read_off_a_live_status_names_its_tab_for_the_host_to_follow() {
         },
     );
     let recorded = view.follows().to_vec();
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(
         boxed.0, watch,
@@ -2353,20 +3362,18 @@ fn a_row_read_off_a_live_status_names_its_tab_for_the_host_to_follow() {
     );
 }
 
-/// WHAT THE OWNER CAN DO, BY KIND OF STALL (review of 2026-09-25: the band
-/// named `--now` for every kind, and it moves two).
+/// What the user can do, by kind of stall.
 #[test]
 fn each_kind_of_stall_names_the_remedy_that_moves_it() {
     let base = pending(60);
     assert_eq!(base.remedy(NOW), None, "not stalled: nothing to do");
-    // Overdue on a turn still running: hours on the ladder's last rung,
-    // which `--now` is — it waits (ruling 380; `Now` until 2026-09-28).
+    // Overdue on a running turn: already on the ladder's last rung, which
+    // `--now` is, so it waits.
     assert_eq!(pending(7 * 3_600).remedy(NOW), Some(Remedy::Waits));
     assert_eq!(pending_with("queued").remedy(NOW), Some(Remedy::Now));
-    // A wait no rung passes, blocking the move a re-ask's interval: blocked,
-    // by hand — timed by its blocker's own clock, whatever other wait the
-    // last look found (a goal's `daemon-turn` between two `/exit`s refused
-    // for want of the marks: the review of 2026-09-28).
+    // A wait no rung passes, blocking the move for a re-ask interval: blocked,
+    // by hand, timed by its blocker's own clock whatever other wait the last
+    // look found.
     let blocked = Row {
         wait: "daemon-turn".into(),
         wait_since: NOW - 60,
@@ -2379,7 +3386,9 @@ fn each_kind_of_stall_names_the_remedy_that_moves_it() {
         Some("blocked:no-shell-integration")
     );
     assert_eq!(blocked.remedy(NOW), Some(Remedy::ByHand));
-    assert!(!blocked.asks_on_its_own(NOW) && blocked.badge(NOW).is_some());
+    // A wait no rung passes is the owner's setup, not the upgrade's damage: a
+    // record (a digest line for the missing shell integration), no tab mark.
+    assert!(!blocked.asks_on_its_own(NOW) && blocked.badge(NOW).is_none());
     // NEGATIVE CONTROLS: one look at it is no stall (a tab mid-handoff), and
     // the wait word alone — with no blocker's clock — is none either.
     let fresh = Row {
@@ -2411,13 +3420,13 @@ fn each_kind_of_stall_names_the_remedy_that_moves_it() {
     }
 }
 
-/// THE CODEX LANE IN THE OWNER'S VIEW: a Codex upgrade's state (`codex-<tab>`)
-/// is a row like Claude's — `--status`, the host's `upgrade=` column, and
-/// `--now|--defer|--skip` — standing only while the Codex TUI that leads its
-/// tab still runs a build older than the target, and said as Codex's.
+/// The Codex lane in the status view: a `codex-<tab>` state is a row like
+/// Claude's (`--status`, `upgrade=`, `--now|--defer|--skip`), standing only
+/// while the tab's Codex TUI runs a build older than the target, and said as
+/// Codex's.
 #[test]
 fn a_codex_upgrade_is_listed_held_and_hurried_like_claudes() {
-    let dir = scratch("codex");
+    let dir = ScratchDir::new("upgrade-status", "codex");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let session = format!("codex-{TAB}");
@@ -2475,18 +3484,17 @@ fn a_codex_upgrade_is_listed_held_and_hurried_like_claudes() {
         "gone once its TUI is current"
     );
     // The owner's word lands on it, by its tab.
-    let held = ask(&o, TAB, Ask::Defer(3_600)).expect("a Codex upgrade to defer");
+    let held = ask(&o, TAB, Ask::Defer(3_600), false).expect("a Codex upgrade to defer");
     assert_eq!(held.agent, upgrade::Agent::Codex);
     assert!(matches!(held.request, Request::DeferUntil(_)));
     assert!(held.column(now_s()).starts_with("deferred/0.157.1/"));
-    let skipped = ask(&o, TAB, Ask::Skip).expect("a Codex upgrade to skip");
+    let skipped = ask(&o, TAB, Ask::Skip, false).expect("a Codex upgrade to skip");
     assert_eq!(skipped.request, Request::Skip("0.157.1".to_string()));
-    let hurried = ask(&o, TAB, Ask::Now).expect("a Codex upgrade to hurry");
+    let hurried = ask(&o, TAB, Ask::Now, false).expect("a Codex upgrade to hurry");
     assert_eq!(hurried.request, Request::Now);
     let st = load(&o, &session).expect("the state");
     assert_eq!(st.agent, upgrade::Agent::Codex, "the word keeps the lane");
     assert_eq!(st.request_tab, TAB);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// [`holders`] as the window's host reads them, for `home` under `tabs`.
@@ -2521,15 +3529,13 @@ fn codex_state(o: &Opts, phase: Phase, exited_at: u64) -> String {
 
 #[test]
 fn a_codex_move_that_failed_after_its_exit_stands_with_no_holder() {
-    // The review's repro: every failure a Codex move meets AFTER its `/exit`
-    // was vetted against a Codex TUI on the old build in its tab — gone by
-    // construction — and dropped from `--status`, the band and `upgrade=`;
-    // the owner learned of it from the ledger alone.
+    // A Codex move failing after its `/exit` has no old-build TUI to vet
+    // against, yet must still show in `--status`, band and `upgrade=`.
     let tabs = [LiveTab {
         sid: TAB.to_string(),
         fgpgid: Some(7),
     }];
-    // The HOST'S OWN holder read (the process table, this home's Codex TUIs
+    // The host's own holder read (the process table, this home's Codex TUIs
     // by the roster): the TUI is gone, so it finds none, as in the window.
     let real = |o: &Opts| host_holders(o.home.clone(), tabs.to_vec());
     for why in [
@@ -2540,11 +3546,11 @@ fn a_codex_move_that_failed_after_its_exit_stands_with_no_holder() {
         "shell-gone",
         "relaunch-refused",
     ] {
-        let dir = scratch(&format!("cx-failed-{why}"));
+        let dir = ScratchDir::new("upgrade-status", &format!("cx-failed-{why}"));
         let o = opts(&dir);
         let exited = now_s() - 120;
         codex_state(&o, Phase::Failed(why.to_string()), exited);
-        let (shown, vetted) = status_rows(&o);
+        let (shown, vetted) = status_rows(&o, true);
         assert!(vetted, "{why}");
         assert_eq!(shown.len(), 1, "{why}: listed by --status");
         let mut sent: Vec<Vec<Row>> = Vec::new();
@@ -2568,12 +3574,10 @@ fn a_codex_move_that_failed_after_its_exit_stands_with_no_holder() {
             &mut |r| sent.push(r.to_vec()),
         );
         assert_eq!(sent.last().map(Vec::len), Some(0), "{why}");
-        let _ = std::fs::remove_dir_all(dir);
     }
-    // NEGATIVE CONTROL: a failure BEFORE any exit — its TUI never went (a
-    // launch whose flags cannot be resumed) — is still vetted against it:
-    // with no Codex on the old build in the tab, nothing is shown.
-    let dir = scratch("cx-failed-before");
+    // Negative control: a failure before any exit (its TUI never went) is
+    // still vetted: with no old-build Codex in the tab, nothing is shown.
+    let dir = ScratchDir::new("upgrade-status", "cx-failed-before");
     let o = opts(&dir);
     codex_state(&o, Phase::Failed("argv:unknown-flag".to_string()), 0);
     let mut sent: Vec<Vec<Row>> = Vec::new();
@@ -2582,16 +3586,15 @@ fn a_codex_move_that_failed_after_its_exit_stands_with_no_holder() {
         sent.push(r.to_vec());
     });
     assert_eq!(sent.last().map(Vec::len), Some(0));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn a_codex_move_in_flight_refuses_the_owners_word_in_its_own_terms() {
     // No Codex is ever signalled: its move begins with a typed `/exit`.
-    let dir = scratch("cx-in-flight");
+    let dir = ScratchDir::new("upgrade-status", "cx-in-flight");
     let o = opts(&dir);
     codex_state(&o, Phase::Exiting { at_s: now_s() }, 0);
-    let err = ask(&o, TAB, Ask::Now).expect_err("a move in flight");
+    let err = ask(&o, TAB, Ask::Now, false).expect_err("a move in flight");
     assert!(err.contains("once its `/exit` is typed"), "{err}");
     assert!(!err.contains("signalled"), "{err}");
     // One that stopped after its `/exit` names what takes it back — nothing
@@ -2601,12 +3604,11 @@ fn a_codex_move_in_flight_refuses_the_owners_word_in_its_own_terms() {
         Phase::Failed("no-resume-hint".to_string()),
         now_s() - 60,
     );
-    let err = ask(&o, TAB, Ask::Now).expect_err("stopped");
+    let err = ask(&o, TAB, Ask::Now, false).expect_err("stopped");
     assert!(err.contains("`codex resume` in the tab"), "{err}");
     assert!(!err.contains("quit it"), "{err}");
-    let quiet = ask(&o, TAB, Ask::Skip).expect("a skip of the record");
+    let quiet = ask(&o, TAB, Ask::Skip, false).expect("a skip of the record");
     assert_eq!(quiet.stall(now_s()), None);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A Claude Code state for [`TAB`] in `phase`, its agent seen gone at
@@ -2630,18 +3632,12 @@ fn claude_state(o: &Opts, phase: Phase, exited_at: u64) -> String {
     session
 }
 
-/// S1 OF THE IN-FLIGHT REVIEW (2026-09-27): A CLAUDE CODE MOVE THAT FAILED
-/// AFTER ITS SIGTERM ENDED THE AGENT stands with no holder, as a Codex one
-/// does (`a_codex_move_that_failed_after_its_exit_stands_with_no_holder`):
-/// until then it was vetted against a live Claude Code on the old build in
-/// its tab — gone by construction — and dropped from `--status`, the band
-/// and `upgrade=`; the owner learned of it from the ledger alone. It says
-/// what takes the conversation back (`claude --resume`), never "quit it":
-/// nothing runs to quit. NEGATIVE CONTROLS: a failure before any exit (a
-/// signal the kernel refused) is still vetted against a holder; and once a
-/// live process holds the conversation again — resumed by hand — the record
-/// is an ordinary stopped upgrade: shown for a holder on the old build in
-/// its tab (quit it and resume it by hand), gone for one on the target.
+/// A Claude Code move that failed after its SIGTERM ended the agent stands with
+/// no holder, as a Codex one does
+/// (`a_codex_move_that_failed_after_its_exit_stands_with_no_holder`), naming
+/// `claude --resume` as what takes the conversation back. Negative controls: a
+/// failure before any exit is vetted against a holder; once a live process
+/// holds the conversation again, it is an ordinary stopped upgrade.
 #[test]
 fn a_claude_move_that_failed_after_its_exit_stands_with_no_holder() {
     let tabs = [LiveTab {
@@ -2650,11 +3646,11 @@ fn a_claude_move_that_failed_after_its_exit_stands_with_no_holder() {
     }];
     let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
     for why in ["stale-exit", "shell-gone", "no-resume", "relaunch-refused"] {
-        let dir = scratch(&format!("cl-failed-{why}"));
+        let dir = ScratchDir::new("upgrade-status", &format!("cl-failed-{why}"));
         let o = opts(&dir);
         let exited = now_s() - 120;
         claude_state(&o, Phase::Failed(why.to_string()), exited);
-        let (shown, vetted) = status_rows(&o);
+        let (shown, vetted) = status_rows(&o, true);
         assert!(vetted, "{why}");
         assert_eq!(shown.len(), 1, "{why}: listed by --status");
         let mut sent: Vec<Vec<Row>> = Vec::new();
@@ -2678,7 +3674,7 @@ fn a_claude_move_that_failed_after_its_exit_stands_with_no_holder() {
         // is the tab's standing row, never a record (ruling 283).
         assert!(!rows[0].asks_on_its_own(now_s()), "{why}");
         // The owner's `--now` names what takes it back.
-        let err = ask(&o, TAB, Ask::Now).expect_err("stopped");
+        let err = ask(&o, TAB, Ask::Now, false).expect_err("stopped");
         assert!(err.contains("claude --resume"), "{why}: {err}");
         assert!(!err.contains("quit it"), "{why}: {err}");
         // A day on, the window lets it go; the ledger keeps it.
@@ -2691,20 +3687,18 @@ fn a_claude_move_that_failed_after_its_exit_stands_with_no_holder() {
             &mut |r| sent.push(r.to_vec()),
         );
         assert_eq!(sent.last().map(Vec::len), Some(0), "{why}");
-        let _ = std::fs::remove_dir_all(dir);
     }
-    // NEGATIVE CONTROL: before any exit — the kernel refused the signal, and
-    // the agent lives on — it is vetted against a holder as before.
-    let dir = scratch("cl-failed-before");
+    // Negative control: before any exit (signal refused, agent alive) it is
+    // vetted against a holder.
+    let dir = ScratchDir::new("upgrade-status", "cl-failed-before");
     let o = opts(&dir);
     claude_state(&o, Phase::Failed("signal-refused".to_string()), 0);
     let mut sent: Vec<Vec<Row>> = Vec::new();
     let mut view = View::default();
     view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |r| sent.push(r.to_vec()));
     assert_eq!(sent.last().map(Vec::len), Some(0));
-    let _ = std::fs::remove_dir_all(dir);
     // Resumed by hand: an ordinary stopped upgrade, vetted by its holder.
-    let dir = scratch("cl-failed-resumed");
+    let dir = ScratchDir::new("upgrade-status", "cl-failed-resumed");
     let o = opts(&dir);
     claude_state(&o, Phase::Failed("stale-exit".to_string()), now_s() - 60);
     let held_on = |version: &'static str| {
@@ -2724,17 +3718,12 @@ fn a_claude_move_that_failed_after_its_exit_stands_with_no_holder() {
         sent.push(r.to_vec());
     });
     assert_eq!(sent.last().map(Vec::len), Some(0), "on the target: gone");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A NEW ROUND INHERITS NOTHING OF THE OLD ONE'S RESTART ([`St::rearm`], the
-/// merge with the rest and re-arm of 2026-09-27): a Claude Code move that
-/// stopped after its SIGTERM ended the agent is re-armed on the same record
-/// once it has rested. A stop of the new round before any signal (the
-/// conversation resumed elsewhere) is one whose agent lives — never read as a
-/// failure after an exit, which would show `claude --resume` for a live
-/// agent and skip the holder's vetting for a day. NEGATIVE CONTROL: before
-/// the re-arm, the old stop is the old restart's.
+/// A new round inherits nothing of the old one's restart ([`St::rearm`]): a
+/// re-armed record's new stop before any signal is one whose agent lives,
+/// never read as a failure after an exit. Negative control: before the re-arm
+/// the old stop is the old restart's.
 #[test]
 fn a_rearmed_round_forgets_when_the_old_restarts_agent_was_seen_gone() {
     let mut st = St {
@@ -2759,17 +3748,12 @@ fn a_rearmed_round_forgets_when_the_old_restarts_agent_was_seen_gone() {
     assert!(!Row::of("c", &st, NOW + 60).failed_after_exit(), "{st:?}");
 }
 
-/// S2 OF THE IN-FLIGHT REVIEW (2026-09-27): A RESTART UNDER WAY THAT DOES
-/// NOT MOVE READS STALLED. Until then `Row::stall` answered `None` for an
-/// exiting or relaunched row at any age, and the column read
-/// `restarting/<to>/exiting/<age>` for good — a SIGTERMed agent hung in its
-/// shutdown, or a relaunched one that never reaches an idle point, was
-/// named nowhere. Past [`super::super::STALE_S`] from the phase's own start it reads
-/// `stuck:<what>` — checked before the column turns an in-flight row into
-/// `restarting` — says what it waits on (nothing is forced: no harder
-/// signal, no kill), and its remedy is to wait ([`Remedy::Waits`]); its
-/// mark is stable, and the owner's view wakes at the bound by time alone.
-/// NEGATIVE CONTROL: within the bound it reads `restarting`, as before.
+/// A restart under way that does not move reads stalled: past
+/// [`super::super::STALE_S`] from its phase's start it reads `stuck:<what>`
+/// (checked before the column shows `restarting`), says what it waits on
+/// (nothing is forced), and its remedy waits ([`Remedy::Waits`]); its mark is
+/// stable and the view wakes at the bound. Negative control: within the bound
+/// it reads `restarting`.
 #[test]
 fn a_restart_under_way_past_its_bound_reads_stuck_and_says_what_it_waits_on() {
     let stale = super::super::STALE_S;
@@ -2820,12 +3804,39 @@ fn a_restart_under_way_past_its_bound_reads_stuck_and_says_what_it_waits_on() {
         for asks in ["restart", "relaunch", "kill"] {
             assert!(!words.to_lowercase().contains(asks), "{kind}: {words}");
         }
-        // The tab's mark is sent once per stall: it does not age.
-        assert_eq!(r.badge(NOW), r.badge(NOW + 3_600), "{kind}");
-        assert!(r.badge(NOW).is_some_and(|b| b.len() <= 200), "{kind}");
+        // Within the bound of a shutdown nothing is marked; long past it, the
+        // agent that was ended and is not back marks its tab (an interrupt),
+        // once, and the text does not age. A relaunched agent that has not
+        // reached an idle point is the supervisor's box to answer: no mark.
+        assert_eq!(r.badge(NOW), None, "{kind}: too soon to mark a tab");
+        let late = NOW + 3_600;
+        match kind {
+            // A relaunched agent that has reached no idle point is the
+            // supervisor's box to answer for RELAUNCH_INTERRUPT_S (a fault
+            // line at RELAUNCH_STUCK_S); past it only the owner can look at
+            // the tab: an interrupt with the one action.
+            "stuck:relaunched" => {
+                assert_eq!(
+                    r.badge(NOW + RELAUNCH_STUCK_S),
+                    None,
+                    "{kind}: a log line first"
+                );
+                let mark = r.badge(late).expect("the owner is needed");
+                assert!(
+                    mark.contains("has not reached a prompt")
+                        && mark.ends_with("Look at that tab and answer what it shows"),
+                    "{mark}"
+                );
+                assert_eq!(r.badge(late), r.badge(late + 3_600), "{kind}: stable");
+            }
+            _ => {
+                assert!(r.badge(late).is_some_and(|b| b.len() <= 200), "{kind}");
+                assert_eq!(r.badge(late), r.badge(late + 3_600), "{kind}");
+            }
+        }
     }
     // The owner's view wakes at the bound, by time alone.
-    let dir = scratch("stuck-wake");
+    let dir = ScratchDir::new("upgrade-status", "stuck-wake");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let at = now_s() - 10;
@@ -2838,7 +3849,6 @@ fn a_restart_under_way_past_its_bound_reads_stuck_and_says_what_it_waits_on() {
     let mut view = View::default();
     let next = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |_| {});
     assert_eq!(next, Some(at + stale + 1));
-    let _ = std::fs::remove_dir_all(dir);
     // A Codex row's words are its own.
     let codex = Row {
         agent: upgrade::Agent::Codex,
@@ -2853,11 +3863,9 @@ fn a_restart_under_way_past_its_bound_reads_stuck_and_says_what_it_waits_on() {
     assert!(words.contains("/exit"), "{words}");
 }
 
-/// A CLAUDE CODE WAITING ON ITS OWN WORK IS WORDED FOR THE OWNER (2026-09-26:
-/// two poll loops that could never end held a tab four days behind, and the
-/// row read a bare `waiting (background)`). The words fit the band's first
-/// line (64 characters) at any age below 100 days, and `--now` is not
-/// offered: it cannot move a session past its own work.
+/// A Claude Code waiting on its own work is worded for the user within the
+/// band's 64 characters at any age below 100 days, and `--now` is not offered
+/// (owner, 2026-09-26).
 #[test]
 fn a_claude_wait_on_its_own_work_is_worded_for_the_owner() {
     for wait in ["background", "not-idle:shell"] {
@@ -2876,8 +3884,8 @@ fn a_claude_wait_on_its_own_work_is_worded_for_the_owner() {
         ..pending(7 * 3_600)
     };
     assert!(!busy.stall_words(NOW).expect("overdue").contains("own work"));
-    // A status that disagrees with an idle screen (2026-09-27) is named, and
-    // `--now` — which still asks Claude idle — is not offered for it.
+    // A status disagreeing with an idle screen is named, and `--now` is not
+    // offered for it.
     for status in ["busy", "shell"] {
         let stale = Row {
             wait: format!("status-stale:{status}"),
@@ -2890,19 +3898,11 @@ fn a_claude_wait_on_its_own_work_is_worded_for_the_owner() {
     }
 }
 
-/// A PERSON AT THE TAB IS NAMED ONLY WHILE A LOOK HAS SEEN THEM (2026-09-27,
-/// s-d3346, messages.log): the step at 20:27:27 found the owner's "ok" of
-/// 20:26:42 within the grace and recorded `attended`; the harness continued the
-/// agent at 20:28:42 and no look was taken while that turn ran, so the band
-/// said "someone is typing in its tab" until its row was retired at 02:18:04,
-/// `behind for 13 h`. A wait no look has confirmed for [`ATTENDED_SEEN_S`] is
-/// the last point's: the move waits for the next turn end. NEGATIVE CONTROL: a
-/// look 30 s ago names the person (a click or a scroll stamps as a key does:
-/// "using"). Neither is a wait `Upgrade now` moves (ruling 380 (b), the
-/// merge of 2026-09-28): an overdue upgrade already stands at the ladder's
-/// Land rung, which `--now` is — the first pause, a keystroke in the last
-/// 20 s still holding it — so its remedy is the one that waits (until that
-/// ruling `--now` waived the person and moved both).
+/// A person at the tab is named only while a look has seen them: a wait no
+/// look has confirmed for [`ATTENDED_SEEN_S`] waits for the next turn end
+/// instead. Negative control: a look 30 s ago names the person ("using"). An
+/// overdue upgrade already stands at the Land rung, which `--now` is, so
+/// neither is moved by `Upgrade now`.
 #[test]
 fn a_person_at_the_tab_is_named_only_while_a_look_has_seen_them() {
     let at = |seen_ago: u64| Row {
@@ -2950,7 +3950,10 @@ fn a_person_at_the_tab_is_named_only_while_a_look_has_seen_them() {
     // mark either — it said "waiting on a person (a question, a draft, a
     // login or a hold)" beside the row's "it waits for its next turn end".
     // It changes once, at the instant the row does, and not again.
-    let mark = |seen_ago: u64| at(seen_ago).badge(NOW).expect("overdue, marked");
+    let mark = |seen_ago: u64| {
+        assert_eq!(at(seen_ago).badge(NOW), None, "a wait marks no tab");
+        at(seen_ago).overdue_cause(NOW)
+    };
     assert!(mark(30).ends_with("waiting on a person (a question, a draft, a login or a hold)"));
     for ago in [ATTENDED_SEEN_S + 1, 6 * 3_600] {
         assert!(mark(ago).ends_with("held by its own work"), "{}", mark(ago));
@@ -2967,29 +3970,26 @@ fn a_person_at_the_tab_is_named_only_while_a_look_has_seen_them() {
     );
     assert!(
         unrecorded
-            .badge(NOW)
-            .is_some_and(|m| m.ends_with("held by its own work"))
+            .overdue_cause(NOW)
+            .ends_with("held by its own work")
     );
     // A Codex tab's person is named by the word alone, row and mark alike.
     let codex = Row {
         agent: upgrade::Agent::Codex,
         ..at(6 * 3_600)
     };
-    assert!(codex.badge(NOW).is_some_and(|m| {
-        m.ends_with("waiting on a person (a question, a draft, a login or a hold)")
-    }));
+    assert!(
+        codex
+            .overdue_cause(NOW)
+            .ends_with("waiting on a person (a question, a draft, a login or a hold)")
+    );
 }
 
-/// THE OWNER IS TOLD WHAT HOLDS THE MOVE (2026-09-27): the agent's notice
-/// named the shells under it by pid, age and command, and the owner saw only
-/// `waiting (background): its own work runs` — the processes were named to
-/// the owner only in the give-up's ledger row, after four notices. `--status`
-/// now carries `held_by=` (each by pid, name and age at the read — never what
-/// it runs: a command is the agent's own words, quoted to the agent alone),
-/// its JSON the same as a list, and the row the owner's words for the band.
-/// The row keeps each process's START, so the same shells read the same row
-/// at every look and the window sends it once. At most five are named, the
-/// rest counted. NEGATIVE CONTROL: nothing held reads `held_by=-` and no words.
+/// The user is told what holds the move: `--status` carries `held_by=` (pid,
+/// name and age; never the command, which is quoted to the agent alone), its
+/// JSON a list, and the row the band's words. Each process's start is kept so
+/// the same shells read the same row every look. At most five are named, the
+/// rest counted. Negative control: nothing held reads `held_by=-` and no words.
 #[test]
 fn the_owner_is_told_which_processes_hold_the_move() {
     let started = NOW - (5 * 86_400 + 4 * 3_600);
@@ -3041,7 +4041,7 @@ fn the_owner_is_told_which_processes_hold_the_move() {
         "{:?}",
         many.held_words(NOW)
     );
-    // NEGATIVE CONTROL: nothing held.
+    // Negative control: nothing held.
     let free = pending(7 * 3_600);
     assert!(
         free.line(NOW).contains(" held_by=- release=- "),
@@ -3057,19 +4057,12 @@ fn the_owner_is_told_which_processes_hold_the_move() {
     );
 }
 
-/// L5 OF THE UPGRADE'S LEFTOVERS (2026-09-28): A RELEASE STILL OWED IS
-/// SHOWN. An owed release (`St::release`) is the one piece of state that
-/// means an agent the upgrade asked to wind down is stopped NOW, waiting for
-/// the line that tells it to carry on; it was on no surface — `--status`
-/// showed it only as an undocumented `wait=release:<gate>` while its own gate
-/// held it, the band had no words for that wait, and an overdue round that
-/// gave up read "it has not agreed to the move yet", which points the other
-/// way. Now `--status` carries `release=<why>` (then the ladder's `rung=`,
-/// the line's last field since ruling 380), `--json`
+/// A release still owed is shown: an owed release (`St::release`) means an
+/// agent asked to wind down is stopped now, waiting to be told to carry on.
+/// `--status` carries `release=<why>` (before the final `rung=`), `--json`
 /// carries `release`, the wait reads as words, and the gave-up words say the
-/// line is owed. NEGATIVE CONTROLS: a released round reads `release=-` and
-/// the gave-up words as before; a Codex record, whose lane types no release,
-/// reads `release=-`.
+/// line is owed. Negative controls: a released round reads `release=-`; a
+/// Codex record (no release lane) reads `release=-`.
 #[test]
 fn a_release_still_owed_is_shown_and_worded() {
     let owed = St {
@@ -3101,9 +4094,8 @@ fn a_release_still_owed_is_shown_and_worded() {
         "{words}"
     );
     assert!(!words.contains("release"), "no raw word: {words}");
-    // The release's own gate holding the line, on a round still asking (a
-    // retargeted one: `St::for_target` owes it `retargeted`): its words, short
-    // enough for the band's first line.
+    // The release's own gate holding the line on a still-asking round: its
+    // words fit the band's first line.
     let held = Row {
         wait: "release:draft".to_string(),
         release: "retargeted".to_string(),
@@ -3114,9 +4106,7 @@ fn a_release_still_owed_is_shown_and_worded() {
     assert!(!words.contains("release"), "{words}");
     assert!(words.chars().count() <= 64, "{words}");
     assert_eq!(held.remedy(NOW), Some(Remedy::Waits), "--now types no line");
-    // A GATE'S WORD LEFT OVER A RELEASE NOTHING OWES (the review of the
-    // leftovers, 2026-09-28: a dropped release kept its recorded wait) says
-    // no line is owed: the words follow the release, never the wait alone.
+    // A gate's word left over a release nothing owes says no line is owed.
     let stale = Row {
         release: String::new(),
         ..held.clone()
@@ -3124,7 +4114,7 @@ fn a_release_still_owed_is_shown_and_worded() {
     let words = stale.stall_words(NOW).expect("overdue");
     assert!(!words.contains("carry on"), "nothing is owed: {words}");
     assert!(!words.contains("owed"), "nothing is owed: {words}");
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let released = Row::of(
         "aaa",
         &St {
@@ -3168,8 +4158,9 @@ fn a_release_still_owed_is_shown_and_worded() {
 /// (not-idle:busy)`, `waiting (background)`): every wait a Claude step
 /// records reads as words, a wait with none is left out, and the words fit
 /// the band's first line. An ANNOUNCED move on its own work is still asking
-/// by itself (D5): it marks no tab. NEGATIVE CONTROL: the same wait before
-/// any notice, and a turn still running, do.
+/// by itself (D5): it marks no tab — and neither does the same wait before
+/// any notice, nor a turn still running (the owner, 2026-09-28: behind for
+/// hours is no reason to mark a tab).
 #[test]
 fn a_claude_stall_never_prints_its_wait_word() {
     for wait in [
@@ -3194,6 +4185,9 @@ fn a_claude_stall_never_prints_its_wait_word() {
         "in-flight",
         "release:draft",
         "release:not-idle",
+        upgrade::NEXT_POINT,
+        NOT_FOREGROUND,
+        CLAIMED,
         "something-new",
     ] {
         let row = Row {
@@ -3209,6 +4203,17 @@ fn a_claude_stall_never_prints_its_wait_word() {
         );
         assert!(words.chars().count() <= 64, "{wait}: {words}");
     }
+    // Nothing holds it: its words say when it goes, since a grouped band
+    // prints no remedy line beside them.
+    let next = Row {
+        wait: upgrade::NEXT_POINT.to_string(),
+        ..pending(10 * 86_400 + 23 * 3_600)
+    };
+    assert_eq!(
+        next.stall_words(NOW).as_deref(),
+        Some("behind for 10 days: its next step goes at its next pause")
+    );
+    assert!(NEXT_POINT_CAUSE.ends_with(NEXT_POINT_WORDS));
     let asked = |wait: &str| Row {
         phase: Phase::Announced { at_s: NOW, asks: 1 },
         wait: wait.to_string(),
@@ -3217,16 +4222,78 @@ fn a_claude_stall_never_prints_its_wait_word() {
     assert!(asked("background").asks_on_its_own(NOW));
     assert_eq!(asked("background").badge(NOW), None);
     assert!(!pending_with("background").asks_on_its_own(NOW));
-    assert!(pending_with("background").badge(NOW).is_some());
+    assert!(pending_with("background").badge(NOW).is_none());
     // An announced move whose turn is still running is the upgrade asking
     // on its own too (ruling 380, the owner's decision of 2026-09-28): an
     // overdue upgrade stands on the ladder's last rung, which `--now` is, so
-    // no word of the owner's moves it sooner — a record, no tab mark.
-    // Before any notice it is still the owner's to see.
+    // no word of the owner's moves it sooner. A record, no tab mark — as is
+    // every wait: only an interrupt marks a tab.
     assert!(asked("not-idle:busy").asks_on_its_own(NOW));
     assert_eq!(asked("not-idle:busy").badge(NOW), None);
     assert!(!pending_with("not-idle:busy").asks_on_its_own(NOW));
-    assert!(pending_with("not-idle:busy").badge(NOW).is_some());
+    assert!(pending_with("not-idle:busy").badge(NOW).is_none());
+}
+
+/// A limit whose reset no look read is bounded: with `limit_until` 0, a
+/// `limited` wait is told `LIMIT_GRACE_S` past a week from when it began (no
+/// limit lasts longer), in words naming no reset; the view names that instant.
+/// Negative controls: a young wait is still a record, an unknown start is
+/// never told, and a named future reset wins.
+#[test]
+fn a_limit_whose_reset_no_look_read_is_told_once_any_limit_has_ended() {
+    let row = |since: u64| Row {
+        wait_since: since,
+        limit_until: 0,
+        behind_since: NOW - 9 * 24 * 3_600,
+        ..pending_with("limited")
+    };
+    let long = row(NOW - LONGEST_LIMIT_S - LIMIT_GRACE_S - 60);
+    assert!(long.limit_passed(NOW));
+    assert_eq!(long.stall(NOW).as_deref(), Some("overdue"));
+    assert!(!long.asks_on_its_own(NOW), "no longer a record");
+    assert_eq!(long.badge(NOW), None, "a fault line in the log, no mark");
+    assert!(
+        matches!(long.attention(NOW), Attention::Fault(ref n) if n.kind == "limit-passed"),
+        "{:?}",
+        long.attention(NOW)
+    );
+    let words = long.stall_words(NOW).expect("its words");
+    assert!(words.contains("outlasted any usage limit"), "{words}");
+    assert!(
+        !words.contains("reset passed"),
+        "no reset time invented: {words}"
+    );
+
+    // Negative control: a young wait is a record; the view wakes at the bound.
+    let began = NOW - 3_600;
+    let young = row(began);
+    assert!(!young.limit_passed(NOW));
+    assert!(
+        young.asks_on_its_own(NOW),
+        "a record until any limit can have ended"
+    );
+    assert_eq!(young.attention(NOW), Attention::Quiet);
+    let bound = began + LONGEST_LIMIT_S + LIMIT_GRACE_S;
+    let mut t = NOW;
+    let mut named = false;
+    while let Some(next) = next_change(std::slice::from_ref(&young), t) {
+        if next >= bound {
+            named = next == bound;
+            break;
+        }
+        t = next;
+    }
+    assert!(named, "the view names the bound's instant");
+    // Negative controls: an unknown start, and a named reset still ahead.
+    assert!(!row(0).limit_passed(NOW), "an unknown start is never told");
+    let ahead = Row {
+        limit_until: NOW + 3_600,
+        ..row(NOW - LONGEST_LIMIT_S - LIMIT_GRACE_S - 60)
+    };
+    assert!(
+        !ahead.limit_passed(NOW),
+        "the named reset wins over the bound"
+    );
 }
 
 fn pending_with(wait: &str) -> Row {
@@ -3236,27 +4303,23 @@ fn pending_with(wait: &str) -> Row {
     }
 }
 
-/// THE OVERDUE MARK NAMES ITS CAUSE (design record 2026-09-28, §1.4): tab
-/// #1's mark read "behind for more than 6h" for as long as it stood — true,
-/// and silent on what held it and who could end it. It names the class now:
-/// the agent's own work, a person, a usage limit, aterm's own notice, a wait
-/// no look has recorded, and — loud — a word this build does not classify.
-/// One text per class whatever the word under it (the mark is sent once per
-/// stall), each within the attention cap. The old text was one for every
-/// class, so the `assert_ne!` of two classes below is what it fails.
+/// AN OVERDUE MOVE NAMES ITS CAUSE, BY CLASS (design record 2026-09-28, §1.4):
+/// tab #1's mark read "behind for more than 6h" for as long as it stood —
+/// true, and silent on what held it and who could end it. The class
+/// ([`Row::cause`], in words [`Row::overdue_cause`]) is the agent's own
+/// work, a person, a usage limit, aterm's own notice, a wait no look has
+/// recorded, and — loud — a word this build does not classify; one text per
+/// class whatever the word under it. Since the owner's ruling of 2026-09-28
+/// ("don't continue to persist alerts that are not actionable") an overdue
+/// tab is NEVER MARKED — the class is what the digest line, `--status` and
+/// the log say (`an_overdue_tab_is_never_marked`).
 #[test]
-fn an_overdue_mark_names_its_cause_by_class() {
+fn an_overdue_move_names_its_cause_by_class() {
     let mark = |wait: &str| {
-        pending_with(wait)
-            .badge(NOW)
-            .unwrap_or_else(|| panic!("{wait}: overdue, marked"))
+        assert_eq!(pending_with(wait).badge(NOW), None, "{wait}: never marked");
+        pending_with(wait).overdue_cause(NOW)
     };
-    let cause = |wait: &str| {
-        mark(wait)
-            .split_once("behind for more than 6h, ")
-            .map(|(_, c)| c.to_string())
-            .unwrap_or_else(|| panic!("{wait}: {}", mark(wait)))
-    };
+    let cause = |wait: &str| mark(wait);
     let classes: [(&[&str], &str); 5] = [
         (
             &[
@@ -3309,21 +4372,8 @@ fn an_overdue_mark_names_its_cause_by_class() {
             assert_eq!(got, words, "{wait}");
         }
     }
-    // A person at the tab, seen by a look lately: a person. Past that, the
-    // move waits for the agent's next turn end: its own work
-    // ([`a_person_at_the_tab_is_named_only_while_a_look_has_seen_them`]).
-    let attended = |seen_ago: u64| Row {
-        wait_seen: NOW - seen_ago,
-        ..pending_with("attended")
-    };
-    assert_eq!(
-        attended(30).overdue_cause(NOW),
-        "waiting on a person (a question, a draft, a login or a hold)"
-    );
-    assert_eq!(
-        attended(ATTENDED_SEEN_S + 1).overdue_cause(NOW),
-        "held by its own work"
-    );
+    // (A person at the tab is a person only while a look has seen them:
+    // `a_person_at_the_tab_is_named_only_while_a_look_has_seen_them`.)
     // Processes recorded under it, no word: its own work.
     let held = Row {
         held_by: vec![HeldBy {
@@ -3339,18 +4389,8 @@ fn an_overdue_mark_names_its_cause_by_class() {
         cause("something-new"),
         "a wait aterm does not classify (something-new)"
     );
-    for wait in [
-        "not-idle:busy",
-        "box",
-        "announce-refused:changed",
-        "something-new",
-    ] {
-        assert!(mark(wait).len() <= 200, "{wait}");
-    }
-    // Two classes, two texts: the old mark (`… upgrade stalled: behind for
-    // more than 6h`, whatever held it) fails here.
+    // Two classes, two texts.
     assert_ne!(mark("not-idle:busy"), mark("box"));
-    assert!(!mark("box").ends_with("behind for more than 6h"));
     // The words the review of 2026-09-28 found falling to "does not
     // classify": the Codex thread's own turn, a resting round, and the waits
     // on a tab or conversation aterm cannot reach.
@@ -3370,34 +4410,6 @@ fn an_overdue_mark_names_its_cause_by_class() {
         ("thread-locked", "aterm cannot reach its tab to ask"),
     ] {
         assert_eq!(pending_with(wait).overdue_cause(NOW), words, "{wait}");
-    }
-}
-
-/// A ROUND THAT GAVE UP, RESTING, NAMES ITS CAUSE (review of 2026-09-28):
-/// `stall()` reads it `overdue` once it is that far behind, and while it
-/// rests its step's word is `failed` — which the mark called "a wait aterm
-/// does not classify (failed)", of tab #1's own shape (asked four times,
-/// given up, resting behind pid 51435). It is the agent's own work that
-/// outlasted the notices, with or without the processes recorded.
-#[test]
-fn a_resting_round_that_gave_up_is_marked_as_its_own_work() {
-    let resting = |held_by: Vec<HeldBy>| Row {
-        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
-        wait: "failed".to_string(),
-        held_by,
-        ..pending(7 * 3_600)
-    };
-    let zsh = HeldBy {
-        pid: 51_435,
-        name: "zsh".to_string(),
-        since: NOW - 3 * 86_400,
-    };
-    for row in [resting(Vec::new()), resting(vec![zsh])] {
-        assert_eq!(row.stall(NOW).as_deref(), Some("overdue"));
-        assert_eq!(row.overdue_cause(NOW), "held by its own work");
-        if let Some(mark) = row.badge(NOW) {
-            assert!(!mark.contains("does not classify"), "{mark}");
-        }
     }
 }
 
@@ -3464,7 +4476,7 @@ fn an_overdue_codex_mark_classes_the_ladders_and_goal_pauses_words() {
             assert!(mark.len() <= 200, "{wait}");
         }
     }
-    // NEGATIVE CONTROL: an untaught word is still named, loud.
+    // Negative control: an untaught word is still named, loud.
     assert_eq!(
         codex("goal-brand-new").overdue_cause(NOW),
         "a wait aterm does not classify (goal-brand-new)"
@@ -3475,14 +4487,13 @@ fn an_overdue_codex_mark_classes_the_ladders_and_goal_pauses_words() {
 /// 2026-09-28): tab #1's stall ran through `background` at a break,
 /// `announce-refused:changed` where the notice's fence refused at an idle
 /// point, and `attended`/`draft` when a person touched the tab. Read from the
-/// word alone, each moved the mark's class and so its text, and every move
-/// re-sent `meta set attention` — the upgrade taking the tab's attention
-/// back from any owner that raised it since, for the whole stall. While
-/// processes run under the agent those passing words read as its own work;
-/// with none recorded, the same words still name their own class — the
-/// branch the precedence adds, shown working.
+/// word alone, each moved the class and so the text (then the tab's mark,
+/// re-sent at each move; now the digest line's words and its once-only
+/// identity). While processes run under the agent those passing words read
+/// as its own work; with none recorded, the same words still name their own
+/// class — the branch the precedence adds, shown working.
 #[test]
-fn an_overdue_mark_holds_through_the_notice_paths_passing_words() {
+fn an_overdue_move_holds_its_class_through_the_notice_paths_passing_words() {
     let zsh = HeldBy {
         pid: 51_435,
         name: "zsh".to_string(),
@@ -3496,27 +4507,47 @@ fn an_overdue_mark_holds_through_the_notice_paths_passing_words() {
         "background",
         "announce-refused:changed",
         "attended",
-        "draft",
-        "held",
         "announce-refused:yield",
+        "failed",
         "",
     ];
-    let first = under(words[0]).badge(NOW).expect("overdue, marked");
-    assert!(first.ends_with("held by its own work"), "{first}");
+    let first = under(words[0]).overdue_cause(NOW);
+    assert_eq!(first, "held by its own work");
     for wait in words {
-        assert_eq!(under(wait).badge(NOW).as_ref(), Some(&first), "{wait}");
+        assert_eq!(under(wait).overdue_cause(NOW), first, "{wait}");
+        assert_eq!(under(wait).badge(NOW), None, "{wait}: never marked");
     }
-    // Nothing under it: the word's own class (what the precedence changes) —
-    // for a person at the tab, one a look has seen lately (past that, its
-    // own work too: `a_person_at_the_tab_is_named_only_while_a_look_has_seen_them`).
+    // A PERSON'S DRAFT AND A HOLD STAND (the safety review of 2026-09-28):
+    // text a person typed and did not send, or a halt or another driver's
+    // lease, is theirs until they end it, whatever runs under the agent — the
+    // draft that was a misread (`a_displaced_grid_never_makes_a_placeholder_a_
+    // draft`) is fixed at its source, so a `draft` that stands is real. The
+    // class of the ROUND still holds through a look that finds one
+    // (`the_agents_own_work_is_the_rounds_not_the_last_looks`).
+    for wait in [
+        "draft",
+        "held",
+        "announce-refused:draft",
+        "announce-refused:held",
+        "announce-refused:box",
+    ] {
+        assert_eq!(
+            under(wait).overdue_cause(NOW),
+            "waiting on a person (a question, a draft, a login or a hold)",
+            "{wait}"
+        );
+    }
+    // Nothing under it: the word's own class; a person counts only if a look
+    // saw them lately
+    // (`a_person_at_the_tab_is_named_only_while_a_look_has_seen_them`).
     let seen = Row {
         wait_seen: NOW,
         ..pending_with("attended")
     };
-    assert_ne!(seen.badge(NOW).as_ref(), Some(&first));
+    assert_ne!(seen.overdue_cause(NOW), first);
     assert_ne!(
-        pending_with("announce-refused:changed").badge(NOW).as_ref(),
-        Some(&first)
+        pending_with("announce-refused:changed").overdue_cause(NOW),
+        first
     );
     // A standing box or limit is a hand that must act, named over the
     // processes: a real change of hands, and a new text.
@@ -3559,317 +4590,13 @@ fn a_codex_wait_on_its_daemon_is_worded_for_the_owner() {
     assert!(!claude.stall_words(NOW).expect("overdue").contains("/ps"));
 }
 
-/// THE WAITING RECORD IS WORDED BY WHAT HOLDS IT (ruling 380, as the review
-/// of 2026-09-28 amended it: the record promised "the first pause in your
-/// typing" of a goal-mode Codex its daemon's turns held). Where only the
-/// ladder's comfort holds it — the settle, a person near the tab, a turn at
-/// the look — the ladder's promise, with the Land rung's clock and the
-/// KEYS_GAP_S rule; where a floor stands, the floor and when it moves. Only
-/// this tab's OWN goal, named by the kernel, is one the owner may pause here;
-/// a turn aterm cannot place is worded as another session's, never a goal to
-/// pause (the review's two-tab case). NEGATIVE CONTROL: no line promises the
-/// pause in the person's typing.
-#[test]
-fn the_waiting_record_is_worded_by_what_holds_it() {
-    let row = |agent: upgrade::Agent, wait: &str| Row {
-        agent,
-        wait: wait.to_string(),
-        ..pending(600)
-    };
-    for wait in [
-        "",
-        "settling",
-        "attended",
-        "not-idle:busy",
-        "status-stale:busy",
-    ] {
-        let words = row(upgrade::Agent::Claude, wait).waiting_line("2:15 PM");
-        assert_eq!(
-            words,
-            "nothing to do: it starts on its own at a quiet moment in the tab, and from 2:15 PM \
-             as soon as it is idle and nobody has typed there for 20 seconds",
-            "{wait}"
-        );
-    }
-    for (wait, needles) in [
-        (
-            "goal",
-            &[
-                "a goal is running in this tab",
-                "from 2:15 PM aterm pauses the goal for a moment",
-                "resumes it right after",
-                "nothing to do",
-            ][..],
-        ),
-        (
-            "daemon-turn",
-            &[
-                "a turn is running in this tab",
-                "or a subagent's it started",
-                "that turn is over",
-            ][..],
-        ),
-        (
-            "daemon-busy",
-            &[
-                "may be this tab's own",
-                "a subagent of this conversation",
-                "another Codex session's",
-                "that turn is over",
-            ][..],
-        ),
-        (
-            "no-shell-integration",
-            &["shell integration", "quit Codex in the tab", "codex resume"][..],
-        ),
-        ("draft", &["a draft", "sent or cleared"][..]),
-        ("box", &["a box on its screen", "that choice is made"][..]),
-        (
-            "background-terminal",
-            &["background terminal", "once that is over"][..],
-        ),
-    ] {
-        let words = row(upgrade::Agent::Codex, wait).waiting_line("2:15 PM");
-        for needle in needles {
-            assert!(words.contains(needle), "{wait}: {words}");
-        }
-        assert!(!words.contains("pause in your typing"), "{wait}: {words}");
-        if wait != "goal" {
-            assert!(
-                !words.contains("goal") && !words.contains("pause"),
-                "{wait}: {words}"
-            );
-        }
-        // A turn aterm cannot place is never presumed another session's (the
-        // third review of 2026-09-28: the owner's were subagents of the tab's
-        // own conversation).
-        assert!(!words.contains("most often"), "{wait}: {words}");
-    }
-}
-
-/// Every wait word a lane's source spells whole: the `"wait:<word>"` and
-/// `"held-back:<word>"` step literals and the `Wait("<word>")` gate
-/// literals of the Claude Code and Codex lanes. Words a step composes at run
-/// time (`wait:{why}`) are [`the_waiting_record_never_shows_a_raw_wait_word`]'s
-/// own list.
-fn spelled_wait_words() -> Vec<String> {
-    let sources = [
-        include_str!("upgrade.rs"),
-        include_str!("upgrade_drive.rs"),
-        include_str!("upgrade_codex.rs"),
-        include_str!("upgrade_codex_drive.rs"),
-        include_str!("relaunch.rs"),
-    ];
-    let mut words = Vec::new();
-    for source in sources {
-        for marker in ["\"wait:", "\"held-back:", "Wait(\""] {
-            for (at, _) in source.match_indices(marker) {
-                let rest = &source[at + marker.len()..];
-                let end = rest
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == ':'))
-                    .unwrap_or(rest.len());
-                if rest[end..].starts_with('"') && end > 0 {
-                    words.push(rest[..end].to_string());
-                }
-            }
-        }
-    }
-    words.sort();
-    words.dedup();
-    words
-}
-
-/// THE WAITING RECORD NEVER SHOWS A RAW WAIT WORD (the review of
-/// 2026-09-28): its sentence fell back to the wait's own token for any word
-/// it had no words for — `announce-refused:changed; it moves on its own once
-/// that is over`, of tab #1's own shape, and `changed`, `switch`,
-/// `daemon-version`, `pin:busy-thread`, `threads-ambiguous`,
-/// `files-unreadable`, a dropped release's `release:attended` — on the
-/// owner's only view of a healthy upgrade. Every word the two lanes can
-/// record, spelled whole in their source ([`spelled_wait_words`]) or composed
-/// at run time (below), and a word no build knows, runs through
-/// `waiting_line` for a Claude Code row and a Codex row: none shows its
-/// token. NEGATIVE CONTROL: the check itself catches the old fallback's
-/// shape.
-#[test]
-fn the_waiting_record_never_shows_a_raw_wait_word() {
-    let spelled = spelled_wait_words();
-    // The scan found the lanes' words (a vacuous scan would pass anything).
-    for known in [
-        "tab-not-live",
-        "no-socket",
-        "goal-pausing",
-        "switch",
-        "attended",
-    ] {
-        assert!(spelled.iter().any(|w| w == known), "{known}: {spelled:?}");
-    }
-    // What the steps compose at run time: `foreground_shell`, the unique
-    // owner, `look`, both typing fences, the announce refusal
-    // (`first_word`), a release's gate, the SIGTERM's refusal, the Codex
-    // daemon's and pin's steps, the goal pause's refusals, `/exit`'s.
-    let composed = [
-        "not-foreground",
-        "not-a-shell-job",
-        "ids",
-        "session-files-unreadable",
-        "conversation-owner-ambiguous",
-        "no-process",
-        "screen-unreadable",
-        "changed",
-        "announce-refused:changed",
-        "announce-refused:yield",
-        "announce-refused:typing",
-        "announce-refused:turn-refused",
-        "release:attended",
-        "release:draft",
-        "release:background",
-        "release:not-idle:busy",
-        "signal-held",
-        "signal-refused",
-        "not-idle:busy",
-        "not-idle:waiting",
-        "not-idle:compacting",
-        "status-stale:busy",
-        "daemon-first:busy-thread",
-        "daemon-first:background-terminal",
-        "daemon-first:owner-held",
-        "daemon-first:unseen-client",
-        "daemon-first:clients-unreadable",
-        "daemon-first:attended",
-        "daemon-first:held",
-        "daemon-first:update-failed",
-        "daemon-first:vendor-ahead",
-        "daemon-first:daemon-version",
-        "daemon-version",
-        "daemon-env",
-        "pin:busy-thread",
-        "pin:daemon-version",
-        "goal:switch",
-        "goal:record",
-        "goal:no-shell-integration",
-        "goal-pause-refused:held",
-        "goal-resume-refused:held",
-        "left-typed:draft",
-        "exit-refused",
-        "failed:gave-up",
-        "threads-ambiguous",
-        "files-unreadable",
-        "shell-dialect",
-        "yield",
-        "typing",
-        "prompt-moved",
-        "tab-ambiguous",
-        "terminal",
-        // A word no build knows.
-        "zz-brand-new:word",
-    ];
-    // A raw token: a word of the wait's own shape — `x:y`, `x-y` — or the
-    // old fallback's `<word>; …`.
-    let raw = |line: &str, wait: &str| {
-        let token = super::word(wait);
-        line.starts_with(&format!("{token}; "))
-            || ((token.contains(':') || token.contains('-')) && line.contains(&token))
-            || line
-                .as_bytes()
-                .windows(3)
-                .any(|w| w[0].is_ascii_lowercase() && w[1] == b':' && w[2].is_ascii_lowercase())
-    };
-    // NEGATIVE CONTROL: the old fallback's shape is caught.
-    assert!(raw(
-        "announce-refused:changed; it moves on its own once that is over",
-        "announce-refused:changed"
-    ));
-    assert!(raw(
-        "changed; it moves on its own once that is over",
-        "changed"
-    ));
-    for agent in [upgrade::Agent::Claude, upgrade::Agent::Codex] {
-        for wait in spelled.iter().map(String::as_str).chain(composed) {
-            let row = Row {
-                agent,
-                wait: wait.to_string(),
-                ..pending(600)
-            };
-            let line = row.waiting_line("2:15 PM");
-            assert!(!raw(&line, wait), "{agent:?} {wait}: {line}");
-            assert!(!line.is_empty(), "{agent:?} {wait}");
-        }
-    }
-    // The words the review found raw, each worded by what holds it.
-    let line = |agent: upgrade::Agent, wait: &str| {
-        Row {
-            agent,
-            wait: wait.to_string(),
-            ..pending(600)
-        }
-        .waiting_line("2:15 PM")
-    };
-    use upgrade::Agent::{Claude, Codex};
-    for (agent, wait, needle) in [
-        // In the no-stall branch's words (why the fence refused), tried
-        // again: nothing to do.
-        (
-            Claude,
-            "announce-refused:changed",
-            "could not type its notice: the screen moved as it typed; it tries again at the \
-             next quiet moment: nothing to do",
-        ),
-        (
-            Codex,
-            "announce-refused:changed",
-            "could not type its notice: the screen moved as it typed; it tries again at the \
-             next quiet moment: nothing to do",
-        ),
-        (Codex, "changed", "tries again at the next quiet moment"),
-        (
-            Claude,
-            "changed-before-signal",
-            "tries again at the next quiet moment",
-        ),
-        (Codex, "switch", "usage limit"),
-        (Codex, "daemon-version", "Codex daemon"),
-        (Codex, "pin:busy-thread", "Codex daemon"),
-        (Codex, "daemon-env", "Codex daemon"),
-        (Codex, "threads-ambiguous", "cannot yet read its tab"),
-        (Codex, "files-unreadable", "cannot yet read its tab"),
-        (Codex, "shell-dialect", "cannot yet read its tab"),
-        (Codex, "ids", "cannot yet read its tab"),
-        (Claude, "zz-brand-new:word", "a step of its own"),
-    ] {
-        let words = line(agent, wait);
-        assert!(words.contains(needle), "{agent:?} {wait}: {words}");
-    }
-    // A Claude Code release its gate held no longer owed: the ladder's
-    // comfort, never the gate's word nor a person who may be long gone.
-    let dropped = line(Claude, "release:attended");
-    assert!(
-        dropped.starts_with("nothing to do: it starts on its own"),
-        "{dropped}"
-    );
-    let owed = Row {
-        release: "carry on".to_string(),
-        wait: "release:attended".to_string(),
-        ..pending(600)
-    };
-    assert!(!owed.waits_for_comfort());
-    assert!(
-        owed.waiting_line("2:15 PM")
-            .contains("owed the line telling it to carry on")
-    );
-}
-
-/// A CODEX GOAL THE MOVE PAUSED, AS THE OWNER READS IT (the owner's decision
-/// of 2026-09-28): the tab's goal record (`goal_hold`) read into its row —
-/// while the upgrade holds the goal paused, the waiting record says aterm
-/// paused it for a moment and resumes it, with nothing to do, whatever the
-/// step's wait word; resting after a hold that ended without its move, that
-/// the goal runs again and the move is tried later; and a goal LEFT PAUSED —
-/// its resume not made past `GOAL_LEFT_AFTER_S` — is a row of its own
-/// (`goal-paused`), whatever the owner's word, with the one hand step's
-/// remedy (by hand) and its own words. NEGATIVE CONTROLS: a hold within its
-/// time is no stall; the switch's hold is none of the row's; a Claude row
-/// reads no goal.
+/// A Codex goal the move paused, as the user reads it (`goal_hold` read into the
+/// row): while held, the record says aterm paused it briefly and resumes it;
+/// after a hold ending without the move, the goal runs again and the move is
+/// retried; a goal left paused past `GOAL_LEFT_AFTER_S` is a row of its own
+/// (`goal-paused`) with the hand step's remedy. Negative controls: a hold
+/// within its time is no stall; the switch's hold is not the row's; a Claude
+/// row reads no goal.
 #[test]
 fn a_goal_the_move_paused_is_said_and_one_left_paused_is_a_row() {
     use crate::harness::goal_hold::{Hold, How, Owner, Stage};
@@ -3911,10 +4638,9 @@ fn a_goal_the_move_paused_is_said_and_one_left_paused_is_a_row() {
     assert_eq!(left.remedy(late), Some(Remedy::ByHand));
     let why = left.stall_words(late).expect("words");
     assert!(why.contains("has not been able to resume it yet"), "{why}");
-    // NEVER WHILE ATERM STILL HOLDS IT AS IT SHOULD (the goal-pause review
-    // of 2026-09-28): a switch open on the tab (the session is the switch's
-    // until its reset), the paused goal's last turn still running, a resume
-    // just made, the switch's own wait — no row, the waiting record instead.
+    // Never while aterm still holds it as it should: a switch open on the tab,
+    // the paused goal's last turn running, a resume just made, the switch's
+    // own wait. The waiting record instead.
     let under_switch = codex("goal-resume").with_goal(Some(&paused), true, late);
     assert_eq!(
         (under_switch.goal_left_since, under_switch.stall(late)),
@@ -3928,8 +4654,8 @@ fn a_goal_the_move_paused_is_said_and_one_left_paused_is_a_row() {
             "{holding}"
         );
     }
-    // LEFT PAUSED ON PURPOSE — its thread fell into a sandbox: a row at
-    // once, its own words, the relaunch its hand step.
+    // Left paused on purpose (its thread fell into a sandbox): a row at once,
+    // with the relaunch as its hand step.
     let sandboxed = codex(cx::SANDBOXED).with_goal(Some(&paused), false, NOW);
     assert_eq!(sandboxed.stall(NOW).as_deref(), Some("goal-sandboxed"));
     assert_eq!(sandboxed.remedy(NOW), Some(Remedy::ByHand));
@@ -3964,12 +4690,28 @@ fn a_goal_the_move_paused_is_said_and_one_left_paused_is_a_row() {
     };
     let resting = codex("goal").with_goal(Some(&rested), false, NOW);
     assert_eq!(resting.goal_rest_until, NOW - 60 + cx::GOAL_REST_S);
+    // The ask flow (`upgrade_ask = true`, not `quiet`): aterm pauses it
+    // again later.
+    let asking = Row {
+        quiet: false,
+        ..resting.clone()
+    };
     assert!(
-        resting
-            .waiting_line("2:15 PM")
-            .contains("tries again later"),
+        asking.waiting_line("2:15 PM").contains("tries again later"),
         "{}",
-        resting.waiting_line("2:15 PM")
+        asking.waiting_line("2:15 PM")
+    );
+    // Under the default quiet flow no new pause comes: the goal holds it
+    // while it runs.
+    let quiet = Row {
+        quiet: true,
+        ..resting.clone()
+    }
+    .waiting_line("2:15 PM");
+    assert!(
+        !quiet.contains("tries again")
+            && quiet.ends_with("it moves once the goal stops: `/goal pause` in this tab stops it"),
+        "{quiet}"
     );
     // The switch's hold is none of the row's; a Claude row reads no goal.
     let switch = Hold {
@@ -3982,10 +4724,9 @@ fn a_goal_the_move_paused_is_said_and_one_left_paused_is_a_row() {
     assert_eq!((claude.goal_held_since, claude.goal_left_since), (0, 0));
 }
 
-/// THE RUNG `--status` SAYS (`rung=`, the review of 2026-09-28): the
-/// ladder's rung while the move is owed, `land` under the owner's `--now`,
-/// and `-` once it is under way, done or stopped — followed by the watch's
-/// fields (`looked=` first); the JSON carries it too.
+/// `--status`'s `rung=`: the ladder's rung while the move is owed, `land` under
+/// `--now`, `-` once under way, done or stopped; followed by the watch's
+/// fields (`looked=` first). The JSON carries it too.
 #[test]
 fn the_status_line_says_the_rung() {
     for (behind, rung) in [
@@ -4017,14 +4758,12 @@ fn the_status_line_says_the_rung() {
     assert!(under_way.line(NOW).contains(" rung=- looked="));
 }
 
-/// A WORD HOLDS A GAVE-UP UPGRADE'S LATE READY TOO (2026-09-26). An upgrade
-/// that gave up asking still honours a READY to its notices
-/// (`upgrade::next_step`), so the owner's `--skip` or `--defer` forgets them:
-/// no answer given before the word acts after it. NEGATIVE CONTROL: the record
-/// left alone keeps them.
+/// A word also holds a gave-up upgrade's late READY: a gave-up upgrade still
+/// honours a READY (`upgrade::next_step`), so `--skip` or `--defer` forgets
+/// them. Negative control: left alone, the record keeps them.
 #[test]
 fn a_word_on_a_gave_up_upgrade_forgets_its_answers() {
-    let dir = scratch("gave-up-word");
+    let dir = ScratchDir::new("upgrade-status", "gave-up-word");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let gave_up = St {
@@ -4045,7 +4784,7 @@ fn a_word_on_a_gave_up_upgrade_forgets_its_answers() {
     assert_eq!(load(&o, "aaa").expect("state").markers.len(), 2);
     for word in [Ask::Skip, Ask::Defer(600)] {
         save(&o, "aaa", &gave_up);
-        ask(&o, TAB, word).expect("the word");
+        ask(&o, TAB, word, false).expect("the word");
         let held = load(&o, "aaa").expect("state");
         assert!(
             held.marker.is_empty() && held.markers.is_empty(),
@@ -4053,7 +4792,6 @@ fn a_word_on_a_gave_up_upgrade_forgets_its_answers() {
         );
         assert_eq!(held.release, "gave-up", "the release still owed");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A held-back agent names what it runs under (`tmux`), and one whose terminal
@@ -4078,18 +4816,13 @@ fn a_held_back_agent_without_an_owner_name_reads_as_a_sentence() {
     assert_eq!(runs_under("screen"), "screen");
 }
 
-/// WHEN THE NEXT ROUND STARTS, instead of a permanent `gave-up` (the owner,
-/// 2026-09-27: `--status` read `stalled=gave-up` for 1d22h): every stopped
-/// round's row says it — `next_round=<span>` on the line, `next_round_s` and
-/// `retry_at` in the JSON, `next-round:<span>` in the column of a round that
-/// is no stall — and `due` once it has rested (a stop an older build
-/// recorded, with no stamp, is due at once). A round the owner's skip holds
-/// has no next round (`-`), nor a round that gave up and acts on a late READY
-/// (`-`; `ready` in the column). A REFUSAL — which a new round meets again
-/// unless something changed — stays a stall, and keeps it through the re-armed
-/// round's first look (`last_stop`) until its first notice goes: without
-/// that its band row resolved at every re-arm and a new one was posted a
-/// minute later, every two hours.
+/// When the next round starts: every stopped round's row says it
+/// (`next_round=<span>`, `next_round_s` and `retry_at` in JSON,
+/// `next-round:<span>` in the column of a non-stall), and `due` once rested (an
+/// unstamped stop is due at once). A skipped round has no next round (`-`), nor
+/// a gave-up round acting on a late READY (`ready` in the column). A refusal
+/// stays a stall through the re-armed round's first look (`last_stop`) until
+/// its first notice, so its band row does not flap at every re-arm.
 #[test]
 fn a_stopped_round_says_when_its_next_round_starts() {
     let base = St {
@@ -4116,9 +4849,8 @@ fn a_stopped_round_says_when_its_next_round_starts() {
         "{}",
         row.line(NOW)
     );
-    // The column says it is pending on its next round, however far behind (day
-    // five, D20: `stalled/…/overdue` beside a band that said it retries later);
-    // the line keeps the stall word and `next_round=`.
+    // The column says pending on its next round, however far behind; the line
+    // keeps the stall word and `next_round=`.
     assert_eq!(row.column(NOW), "pending/2.1.282/next-round:1h/20h");
     let json = row.to_json(NOW);
     assert_eq!(
@@ -4162,13 +4894,10 @@ fn a_stopped_round_says_when_its_next_round_starts() {
         "{}",
         skipped.line(NOW)
     );
-    // A LATE READY the gave-up round heard (the no-stall review of
-    // 2026-09-27): no new round starts while it stands — the round acts on
-    // it — so none is `due`, however long it has rested; it is still the
-    // upgrade asking on its own, pending on that answer (`ready`), and an
-    // overdue one's words say so, never that it rests and asks again.
-    // NEGATIVE CONTROL: a Codex round that gave up hears no late READY,
-    // whatever READY clock its announced round left, and is due.
+    // A late READY a gave-up round heard: no new round starts while it stands,
+    // so none is `due`; it is still asking on its own (`ready`), and an overdue
+    // one's words say so. Negative control: a gave-up Codex round hears no late
+    // READY and is due.
     let heard = St {
         ready_since: NOW - 60,
         failed_at: 0,
@@ -4214,9 +4943,9 @@ fn a_stopped_round_says_when_its_next_round_starts() {
     // Nothing else stopped has a next round.
     assert_eq!(Row::of("aaa", &base, NOW).next_round_in(NOW), None);
 
-    // A refusal: a stall, with its next round; re-armed, the same stall
-    // until the new round's first notice. (An hour behind: past six hours a
-    // pending round reads `overdue` whatever it waits on.)
+    // A refusal: a stall with its next round; re-armed, the same stall until
+    // the new round's first notice (an hour behind, since past six hours a
+    // pending round reads `overdue`).
     let young = St {
         pending_since: NOW - 3_600,
         ..base.clone()
@@ -4251,15 +4980,12 @@ fn a_stopped_round_says_when_its_next_round_starts() {
     assert_eq!(Row::of("aaa", &st, NOW).stall(NOW), None);
 }
 
-/// RULING 283 (the owner, 2026-09-27: "you should NEVER have upgrades
-/// stalled"): a round that stopped and will ask again on its own is the
-/// upgrade working — it marks no tab. A round that gave up keeps `Upgrade
-/// now` (re-arms at once) even when it reads `overdue`; a first stop of any
-/// other reason is asked again after its rest. A stop that REPEATS is the
-/// person's: it carries its stall through the re-armed round (one entry,
-/// never resolved at the re-arm) and marks the tab. NEGATIVE CONTROLS: a
-/// refusal marks from its first stop; a gave-up round the owner skipped is
-/// held, not asking.
+/// A round that stopped and will ask again on its own is the upgrade working
+/// and marks no tab. A gave-up round keeps `Upgrade now` even when `overdue`; a
+/// first stop for another reason is asked again after its rest. A repeating
+/// stop is the person's: it carries its stall through the re-armed round and
+/// marks the tab. Negative controls: a refusal marks from its first stop; a
+/// gave-up round the user skipped is held, not asking.
 #[test]
 fn a_stop_that_asks_again_marks_nothing_and_one_that_repeats_carries_its_stall() {
     const NOW: u64 = 1_790_311_076;
@@ -4306,19 +5032,21 @@ fn a_stop_that_asks_again_marks_nothing_and_one_that_repeats_carries_its_stall()
         ..once.clone()
     };
     assert!(twice.repeating_stop() && !twice.asks_on_its_own(NOW));
-    // THE COLUMN AGREES WITH THE BAND (day five, D20): a round that asks again
-    // on its own is pending on its next round; a stop that repeats is the
-    // stall.
+    // The column agrees with the band: a round asking again on its own is
+    // pending on its next round; a repeating stop is the stall.
     assert_eq!(gave_up.column(NOW), "pending/2.1.282/next-round:10m/8h");
     assert_eq!(once.column(NOW), "pending/2.1.282/next-round:10m/8h");
     assert_eq!(
         twice.column(NOW),
         "stalled/2.1.282/failed:signal-refused/8h"
     );
-    let mark = twice.badge(NOW).expect("a repeating stop marks its tab");
+    // A stop that repeats is ONE line in the digest, never a mark on the tab
+    // (the owner, 2026-09-28): it can wait, and the owner's action is theirs.
+    assert_eq!(twice.badge(NOW), None);
     assert!(
-        mark.ends_with("upgrade stalled: the system refused to stop the old Claude"),
-        "{mark}"
+        matches!(twice.attention(NOW), Attention::Digest(n) if n.kind == "repeating-stop"),
+        "{:?}",
+        twice.attention(NOW)
     );
     // Re-armed: the stall is carried through the new round (one entry).
     for phase in [
@@ -4350,23 +5078,34 @@ fn a_stop_that_asks_again_marks_nothing_and_one_that_repeats_carries_its_stall()
         streak_why: "not-a-shell-job".into(),
         ..base
     };
-    assert!(!refused.asks_on_its_own(NOW) && refused.badge(NOW).is_some());
+    assert!(!refused.asks_on_its_own(NOW) && refused.badge(NOW).is_none());
+    assert!(
+        matches!(refused.attention(NOW), Attention::Digest(n) if n.kind == "refused-launch"),
+        "a refusal is the owner's launch choice: a digest line"
+    );
     assert_eq!(
         refused.column(NOW),
         "stalled/2.1.282/refused:not-a-shell-job/8h"
     );
 }
 
-/// A PERSON'S HOLD IS NOT THE UPGRADE ASKING ON ITS OWN (round six, F6): an
+/// A PERSON'S HOLD IS NOT THE UPGRADE ASKING ON ITS OWN (round six, F6), AND
+/// IT IS NOT AN ALERT EITHER (the owner, 2026-09-28: an alert persists only
+/// where they can act, and says why and what). The row's STATE is exact: an
 /// announced round whose notice waits on a draft, a box, aterm's hold, a
 /// login or a question is never asked again (the re-ask waits under the same
-/// gate), so it never gives up either, and only the person ends it. Overdue,
-/// it is a row with a tab mark naming a person as what holds it.
+/// gate), so it never gives up either, and only the person ends it. Its
+/// LOUDNESS is the classifier's: the person who holds it is at the tab, so a
+/// hold is a record while the last notice is fresh, ONE log line naming the
+/// waits once a day has passed with no progress, and — a draft nobody sent,
+/// stood for a day — ONE digest line. Never a tab mark, never a row: round
+/// six's "a row with a mark naming a person" is superseded (design record
+/// 2026-09-29, D14).
 ///
-/// FAILS WITHOUT THE FIX: each read `asks_on_its_own`, the mark was `None`
-/// and the Messages entry a log-only record, for days.
+/// FAILS WITHOUT THE STATE FIX: each read `asks_on_its_own`. FAILS WITHOUT
+/// THE CLASSIFIER: the mark was `Some("… waiting on a person …")`.
 #[test]
-fn a_person_held_announced_upgrade_is_a_row_with_a_mark() {
+fn a_person_held_announced_upgrade_is_a_record_never_a_mark() {
     for wait in [
         "draft",
         "box",
@@ -4375,9 +5114,11 @@ fn a_person_held_announced_upgrade_is_a_row_with_a_mark() {
         "not-idle:waiting",
         "release:draft",
     ] {
+        // The hold has STOOD: the same word a whole REASK_S and the last ask
+        // that old; the last notice is an hour old.
         let row = Row {
             phase: Phase::Announced {
-                at_s: NOW - 86_400,
+                at_s: NOW - 3_600,
                 asks: 1,
             },
             wait: wait.into(),
@@ -4385,9 +5126,42 @@ fn a_person_held_announced_upgrade_is_a_row_with_a_mark() {
         };
         assert_eq!(row.stall(NOW).as_deref(), Some("overdue"), "{wait}");
         assert!(!row.asks_on_its_own(NOW), "{wait}: only a person moves it");
-        let mark = row.badge(NOW).expect("a person's hold marks its tab");
-        assert!(mark.contains("waiting on a person"), "{wait}: {mark}");
+        assert_eq!(row.badge(NOW), None, "{wait}: a person's hold marks no tab");
+        assert_eq!(row.attention(NOW), Attention::Quiet, "{wait}");
+        // A DAY WITH NO PROGRESS: one fault line in the log, quoting the
+        // waits — a record, never a row or a mark.
+        let stale = Row {
+            phase: Phase::Announced {
+                at_s: NOW - BACKSTOP_S,
+                asks: 1,
+            },
+            ..row.clone()
+        };
+        assert!(!stale.asks_on_its_own(NOW), "{wait}");
+        assert_eq!(stale.badge(NOW), None, "{wait}");
+        assert!(
+            matches!(stale.attention(NOW), Attention::Fault(n) if n.kind == "no-progress"),
+            "{wait}: {:?}",
+            stale.attention(NOW)
+        );
+        assert_eq!(stale.interrupt(NOW), None, "{wait}");
     }
+    // A DRAFT NOBODY SENT, a day on: ONE line in the digest, still no mark.
+    let draft = Row {
+        phase: Phase::Announced {
+            at_s: NOW - 3_600,
+            asks: 1,
+        },
+        wait: "draft".into(),
+        ..pending(30 * 3_600)
+    };
+    assert!(!draft.asks_on_its_own(NOW));
+    assert_eq!(draft.badge(NOW), None);
+    assert!(
+        matches!(draft.attention(NOW), Attention::Digest(n) if n.kind == "typed-draft"),
+        "{:?}",
+        draft.attention(NOW)
+    );
     // NEGATIVE CONTROL: the agent's own work, and a limit, still ask on
     // their own inside the move clock.
     for wait in ["background", "awaiting-ready", "limited"] {
@@ -4397,16 +5171,19 @@ fn a_person_held_announced_upgrade_is_a_row_with_a_mark() {
                 asks: 1,
             },
             wait: wait.into(),
+            // (a READY answer that has waited seven hours is aterm's fault,
+            // told in the log: this control is a wait that just began)
+            wait_since: NOW - 600,
             ..pending(STALLED_AFTER_S + 3_600)
         };
         assert!(row.asks_on_its_own(NOW), "{wait}");
         assert_eq!(row.badge(NOW), None, "{wait}");
+        assert_eq!(row.attention(NOW), Attention::Quiet, "{wait}");
     }
-    // NEGATIVE CONTROL (review two): a PASSING hold — a person typing their
-    // next prompt at one idle look — is the notice's gate working, not a
-    // hold that kept the re-ask from happening: a fresh `draft` after an ask
-    // ten minutes old, or one a minute old after a stale ask, still asks on
-    // its own, with no mark; the view wakes for the instant it has stood.
+    // Negative control: a passing hold (a person typing at one idle look) is
+    // the gate working: a fresh `draft` after a ten-minute-old ask, or a
+    // minute-old one after a stale ask, still asks on its own with no mark;
+    // the view wakes when it has stood.
     for (wait_age, ask_age) in [(60, 600), (60, 86_400), (86_400, 600)] {
         let row = Row {
             phase: Phase::Announced {
@@ -4431,15 +5208,18 @@ fn a_person_held_announced_upgrade_is_a_row_with_a_mark() {
 
 /// THE MOVE CLOCK (round six, F7; [`MOVE_BUDGET_S`]): a session whose own
 /// work never ends is asked, given up on, rested and asked again for as long
-/// as it runs. A day behind, that is no longer only a record: every phase
-/// of the cycle — asking, resting after a give-up, a first stop — is a row
-/// with a mark, and the view wakes for the instant it turns. A usage limit
-/// stays a record until its reset (ruling 307).
+/// as it runs. A day behind, the row's WORDS say so — nothing is "pending on
+/// its next round" for a day, whatever its rounds do — and the classifier
+/// makes the day news, once: an agent whose own work has answered a whole
+/// round with "not yet" a day behind is ONE digest line (`own-work`), never a
+/// row, a mark or an interrupt (round six's "every phase of the cycle is a
+/// row with a mark" is superseded, design record 2026-09-29, D14). A usage
+/// limit stays a record until its reset (ruling 307).
 ///
 /// FAILS WITHOUT THE FIX: five rounds given up in a row, three days behind,
-/// read `asks_on_its_own` with no mark.
+/// read `asks_on_its_own` with nothing in the digest.
 #[test]
-fn a_day_behind_is_a_row_whatever_the_rounds_do() {
+fn a_day_behind_is_news_whatever_the_rounds_do() {
     let gave_up = Row {
         phase: Phase::Failed(upgrade::GAVE_UP.into()),
         streak_why: upgrade::GAVE_UP.into(),
@@ -4450,10 +5230,19 @@ fn a_day_behind_is_a_row_whatever_the_rounds_do() {
     };
     assert!(
         !gave_up.asks_on_its_own(NOW),
-        "five rounds given up in a row, 3 days behind, is a stall the person must see"
+        "five rounds given up in a row, 3 days behind, is not the upgrade working"
     );
-    let mark = gave_up.badge(NOW).expect("marked");
-    assert!(mark.contains("held by its own work"), "{mark}");
+    assert!(
+        gave_up.will_ask_again(NOW),
+        "but it does ask again on its own, at any age: the words of its record say so"
+    );
+    assert_eq!(gave_up.badge(NOW), None, "one digest line, never a mark");
+    assert!(
+        matches!(gave_up.attention(NOW), Attention::Digest(n) if n.kind == "own-work"),
+        "{:?}",
+        gave_up.attention(NOW)
+    );
+    // The round still asking: the digest comes when the round is answered.
     let asking = Row {
         phase: Phase::Announced {
             at_s: NOW - 600,
@@ -4462,8 +5251,9 @@ fn a_day_behind_is_a_row_whatever_the_rounds_do() {
         wait: "background".into(),
         ..pending(3 * 86_400)
     };
-    assert!(!asking.asks_on_its_own(NOW));
-    assert!(asking.badge(NOW).is_some());
+    assert!(!asking.asks_on_its_own(NOW) && asking.will_ask_again(NOW));
+    assert_eq!(asking.badge(NOW), None);
+    assert_eq!(asking.attention(NOW), Attention::Quiet);
     let first_stop = Row {
         phase: Phase::Failed("signal-refused".into()),
         stop_streak: 1,
@@ -4471,13 +5261,34 @@ fn a_day_behind_is_a_row_whatever_the_rounds_do() {
         wait: "failed".into(),
         ..pending(3 * 86_400)
     };
-    assert!(!first_stop.asks_on_its_own(NOW));
+    assert!(!first_stop.asks_on_its_own(NOW) && first_stop.will_ask_again(NOW));
+    assert_eq!(first_stop.badge(NOW), None);
+    // NEGATIVE CONTROL: a stop that repeats, and a person's hold that has
+    // stood, do NOT ask again by themselves, at any age.
+    let repeating = Row {
+        phase: Phase::Failed("no-resume".into()),
+        stop_streak: 2,
+        streak_why: "no-resume".into(),
+        ..first_stop.clone()
+    };
+    assert!(!repeating.will_ask_again(NOW));
+    let held = Row {
+        phase: Phase::Announced {
+            at_s: NOW - 86_400,
+            asks: 1,
+        },
+        wait: "draft".into(),
+        ..pending(3 * 86_400)
+    };
+    assert!(!held.will_ask_again(NOW));
     // A limit ends by itself: a record however far behind.
     let limited = Row {
         wait: "limited".into(),
         ..asking.clone()
     };
     assert!(limited.asks_on_its_own(NOW));
+    assert_eq!(limited.badge(NOW), None);
+    assert_eq!(limited.attention(NOW), Attention::Quiet);
     // NEGATIVE CONTROL: the same cycle a few hours behind is the upgrade
     // working — and the view's next wake is the instant the clock runs out.
     let young = Row {
@@ -4486,12 +5297,277 @@ fn a_day_behind_is_a_row_whatever_the_rounds_do() {
     };
     assert!(young.asks_on_its_own(NOW));
     assert_eq!(young.badge(NOW), None);
+    assert_eq!(young.attention(NOW), Attention::Quiet);
     assert_eq!(
         next_change(std::slice::from_ref(&young), NOW),
         Some(young.behind_since + MOVE_BUDGET_S)
     );
     let turned = young.behind_since + MOVE_BUDGET_S;
-    assert!(!young.asks_on_its_own(turned) && young.badge(turned).is_some());
+    assert!(!young.asks_on_its_own(turned));
+    assert_eq!(young.badge(turned), None, "the day is news, not a mark");
+    assert!(
+        matches!(young.attention(turned), Attention::Digest(n) if n.kind == "own-work"),
+        "{:?}",
+        young.attention(turned)
+    );
+}
+
+/// A LIMIT WHOSE NAMED RESET HAS PASSED IS TOLD (the assessment of
+/// 2026-09-29, A1; design record 2026-09-28, §3.2 C6, `Wall(until)`): a tab
+/// left at its usage limit's notice after the reset the transcript named —
+/// no turn since to clear it, the loop's wall guard withholding every point
+/// while the notice stands — was a record for ever: `asks_on_its_own` and
+/// `past_move_budget` read `limited` alone, and no record kept the reset
+/// (`HarnessUpgradeProgress`'s `LimitRecordForEver`). Now the record keeps
+/// the reset (`limit_until`), and [`LIMIT_GRACE_S`] past it the move is told
+/// whatever its age, its phase or the owner's `--now` (which never waives a
+/// limit) — AS ATERM'S OWN FAULT, ONE LINE IN THE LOG (`limit-passed`): the
+/// resume that continues a session at its reset has not cleared the notice,
+/// which the owner can do nothing about now. Never a row, a mark or a digest
+/// line (the owner's rule of 2026-09-28: an alert persists only where the
+/// owner can act); the view wakes for that instant. NEGATIVE CONTROLS —
+/// ruling 307 kept: a reset still ahead, a reset inside its grace, and a
+/// record with no reset read (`0`, every record before this) are a record at
+/// any age, unmarked and quiet.
+///
+/// FAILS WITHOUT THE FIX: the limit four hours past its reset, a day and
+/// more behind, read `asks_on_its_own` and quiet.
+#[test]
+fn a_limit_whose_named_reset_has_passed_is_told() {
+    let passed = NOW - LIMIT_GRACE_S - 3 * 3_600;
+    let at = |phase: Phase, behind_for: u64, limit_until: u64| Row {
+        phase,
+        wait: "limited".into(),
+        limit_until,
+        ..pending(behind_for)
+    };
+    let announced = Phase::Announced {
+        at_s: NOW - 600,
+        asks: 2,
+    };
+    let rested = Phase::Failed(upgrade::GAVE_UP.into());
+    for phase in [Phase::Pending, announced.clone(), rested.clone()] {
+        // A day and more behind, and an hour: told either way.
+        for behind_for in [MOVE_BUDGET_S + 3_600, 3_600] {
+            let row = at(phase.clone(), behind_for, passed);
+            assert!(row.limit_passed(NOW), "{phase:?}");
+            assert!(!row.asks_on_its_own(NOW), "{phase:?}/{behind_for}");
+            assert_eq!(row.stall(NOW).as_deref(), Some("overdue"), "{phase:?}");
+            // A fault line in the log, once: never a mark, a row or an
+            // interrupt.
+            assert_eq!(row.badge(NOW), None, "{phase:?}/{behind_for}: no mark");
+            assert_eq!(row.interrupt(NOW), None);
+            let Attention::Fault(need) = row.attention(NOW) else {
+                panic!("{phase:?}/{behind_for}: {:?}", row.attention(NOW));
+            };
+            assert_eq!(need.kind, "limit-passed");
+            assert!(
+                need.why.contains("reset passed 4 h ago")
+                    && need.why.contains("still read the limit"),
+                "{need:?}"
+            );
+            assert!(need.why.chars().count() <= NEED_WHY_MAX, "{need:?}");
+            assert!(need.then.chars().count() <= NEED_THEN_MAX, "{need:?}");
+            assert!(
+                !need.why.contains("paused by a usage limit"),
+                "never the limit itself: {need:?}"
+            );
+            // The row's words say it passed, and when; never "at a usage
+            // limit".
+            let words = row.stall_words(NOW).expect("stalled");
+            assert!(
+                words.contains("its usage limit's reset passed 4 h ago"),
+                "{words}"
+            );
+            assert!(!words.contains("it is at a usage limit"), "{words}");
+            let line = row.line(NOW);
+            assert!(
+                line.contains(" cause=limit-passed told=limit-passed"),
+                "{line}"
+            );
+        }
+    }
+    // The owner's `--now` waives no limit, and quiets none past its reset.
+    let hurried = Row {
+        request: Request::Now,
+        request_at: NOW - 60,
+        ..at(Phase::Pending, 3_600, passed)
+    };
+    assert!(
+        matches!(hurried.attention(NOW), Attention::Fault(_)),
+        "the word does not hide it"
+    );
+
+    // Negative controls: a limit is a record until its reset and grace at any
+    // age, as is one whose reset no look read.
+    for limit_until in [0, NOW + 3_600, NOW - LIMIT_GRACE_S + 60] {
+        for phase in [Phase::Pending, announced.clone(), rested.clone()] {
+            let row = at(phase.clone(), 3 * 86_400, limit_until);
+            assert!(!row.limit_passed(NOW), "{limit_until}");
+            assert!(row.asks_on_its_own(NOW), "{limit_until}/{phase:?}");
+            assert_eq!(row.badge(NOW), None, "{limit_until}/{phase:?}");
+            assert_eq!(
+                row.attention(NOW),
+                Attention::Quiet,
+                "{limit_until}/{phase:?}"
+            );
+            assert!(
+                row.line(NOW).contains(" cause=limit told=-"),
+                "{}",
+                row.line(NOW)
+            );
+        }
+    }
+    // A reset named but not the recorded wait (the model answered since, the
+    // screen moved on): nothing of the limit's is told.
+    let moved_on = Row {
+        wait: "not-idle:busy".into(),
+        limit_until: passed,
+        ..pending(3_600)
+    };
+    assert!(!moved_on.limit_passed(NOW) && moved_on.attention(NOW) == Attention::Quiet);
+
+    // THE VIEW WAKES FOR THE INSTANT: a reset still ahead is named, its grace
+    // past it, and the class turns there — a second before, quiet.
+    let ahead = at(Phase::Pending, 3_600, NOW + 600);
+    let turns = NOW + 600 + LIMIT_GRACE_S;
+    assert_eq!(
+        next_change(std::slice::from_ref(&ahead), NOW),
+        Some(turns),
+        "named"
+    );
+    assert_eq!(ahead.attention(turns - 1), Attention::Quiet);
+    assert!(matches!(ahead.attention(turns), Attention::Fault(_)));
+    assert_eq!(ahead.next_attention_at(NOW), Some(turns));
+    // With no reset read, the reset's instant is never named; the BOUND is
+    // (a week after the wait began, `LONGEST_LIMIT_S`, the review of
+    // 2026-09-29 — until then "none comes", a record for ever): quiet a
+    // second before it, a fault at it.
+    let unnamed = Row {
+        limit_until: 0,
+        ..ahead.clone()
+    };
+    assert_eq!(
+        next_change(std::slice::from_ref(&unnamed), NOW),
+        Some(unnamed.behind_since + STALLED_AFTER_S),
+        "the age's rung first, which a limit's record does not turn on"
+    );
+    assert_ne!(unnamed.wait_since, 0, "the fixture's wait has a start");
+    let bound = unnamed.wait_since + LONGEST_LIMIT_S + LIMIT_GRACE_S;
+    assert_eq!(
+        unnamed.attention(bound - 1),
+        Attention::Quiet,
+        "never before any limit can have ended"
+    );
+    assert!(
+        matches!(unnamed.attention(bound), Attention::Fault(_)),
+        "told at the bound"
+    );
+    assert_eq!(unnamed.next_attention_at(NOW), Some(bound), "and named");
+
+    // The record keeps the reset the transcript named, through its file.
+    let st = St {
+        phase: Phase::Pending,
+        to: "2.1.283".into(),
+        wait: "limited".into(),
+        pending_since: NOW - 3_600,
+        limit_until: passed,
+        ..St::default()
+    };
+    let back = St::from_json(&st.to_json()).expect("parses");
+    assert_eq!(back.limit_until, passed);
+    let row = Row::of("s", &back, NOW);
+    assert_eq!(row.limit_until, passed);
+    assert!(matches!(row.attention(NOW), Attention::Fault(_)));
+    assert_eq!(
+        row.to_json(NOW).get("limit_until").and_then(Value::as_u64),
+        Some(passed)
+    );
+}
+
+/// WHAT HOLDS THE MOVE AND WHAT THE OWNER IS TOLD, ON `--status` (design
+/// record 2026-09-28, §3.2 C8): `cause=` names the class of the wait — for a
+/// record as for a row — and `told=` whether the owner has been told and of
+/// what (`-`: nothing told; else the KIND of the fault line, digest line or
+/// interrupt, [`Row::attention`]). The line said the wait word and the stall
+/// alone, so "is the owner told, and of what?" had no answer but the window.
+/// `--json` carries both as `cause` and `told` (and the class as a sentence,
+/// `cause_words`). A wait is a record: told only where the owner's rule says.
+#[test]
+fn status_says_what_holds_the_move_and_what_the_owner_is_told() {
+    let words = |row: &Row| {
+        let line = row.line(NOW);
+        let field = |key: &str| {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(key))
+                .unwrap_or_else(|| panic!("{key} in {line}"))
+                .to_string()
+        };
+        let json = row.to_json(NOW);
+        let j = |key: &str| {
+            json.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(field("cause="), j("cause"), "{line}");
+        assert_eq!(field("told="), j("told"), "{line}");
+        assert!(
+            !j("cause_words").is_empty() || field("cause=") == "-",
+            "{line}"
+        );
+        (field("cause="), field("told="))
+    };
+    let pair = |c: &str, t: &str| (c.to_string(), t.to_string());
+    // Its own work: a record an hour behind, and past six hours — still a
+    // record (a timer is not an inability).
+    assert_eq!(words(&pending(3_600)), pair("own-work", "-"));
+    assert_eq!(words(&pending(STALLED_AFTER_S + 60)), pair("own-work", "-"));
+    // The same work held for a day: one digest line.
+    assert_eq!(
+        words(&pending(MOVE_BUDGET_S + 60)),
+        pair("own-work", "own-work")
+    );
+    // A person's box, past six hours: a record.
+    let boxed = Row {
+        wait: "box".into(),
+        ..pending(STALLED_AFTER_S + 60)
+    };
+    assert_eq!(words(&boxed), pair("person", "-"));
+    // Aterm's own refused notice: told as aterm's fault in the log, whatever
+    // runs under the agent.
+    let refused = Row {
+        wait: "announce-refused:changed".into(),
+        refused: 3,
+        refused_at: NOW - TELL_S,
+        held_by: vec![HeldBy {
+            pid: 51_435,
+            name: "zsh".into(),
+            since: NOW - 86_400,
+        }],
+        ..pending(3_600)
+    };
+    assert_eq!(words(&refused), pair("own-work", "harness-stuck"));
+    // A stop that has not repeated is a record; a move done tells nothing.
+    let stopped = Row {
+        phase: Phase::Failed("signal-refused".into()),
+        stop_streak: 2,
+        streak_why: "signal-refused".into(),
+        wait: "failed".into(),
+        ..pending(3_600)
+    };
+    assert_eq!(words(&stopped).1, "repeating-stop");
+    let done = Row {
+        phase: Phase::Done,
+        ..pending(3_600)
+    };
+    assert_eq!(words(&done), pair("-", "-"));
+    // A wait this build does not classify is named as such.
+    let odd = Row {
+        wait: "something-new".into(),
+        ..pending(3_600)
+    };
+    assert_eq!(words(&odd), pair("unclassified", "-"));
 }
 
 /// The window reads a `--now` refused for a stopped round as typed words;
@@ -4509,6 +5585,1472 @@ fn a_stopped_refusal_is_typed_for_the_window_and_a_sentence_for_the_shell() {
     );
     assert_eq!(refusal_sentence("busy:another-sweep"), "busy:another-sweep");
     assert_eq!(refused_stopped("stale:2.1.283"), None);
+}
+
+// ---------------------------------------------------------------- what the owner is told
+
+/// EVERY WAIT WORD A CLAUDE CODE OR CODEX STEP CAN RECORD, for the sweeps of
+/// the attention tests below.
+const WAITS: &[&str] = &[
+    "",
+    "settling",
+    "attended",
+    "busy",
+    "not-idle:busy",
+    "not-idle:shell",
+    "not-idle:waiting",
+    "not-idle",
+    "status-stale:busy",
+    "held",
+    "limited",
+    "login",
+    "queued",
+    "draft",
+    "box",
+    "background",
+    "awaiting-ready",
+    "release:awaiting-ready",
+    "announce-refused:changed",
+    "announce-refused:yield",
+    "announce-refused:held",
+    "changed",
+    "changed-before-signal",
+    "signal-refused",
+    "notice-owned-by-other-process",
+    "tasked",
+    "self",
+    "not-foreground",
+    "ids",
+    "terminal:tmux",
+    "terminal:none",
+    "background-terminal",
+    "daemon-first:busy-thread",
+    "daemon-first:background-terminal",
+    "daemon-first:owner-held",
+    "daemon-first:unseen-client",
+    "daemon-first:clients-unreadable",
+    "daemon-first:attended",
+    "daemon-first:held",
+    "daemon-first:update-failed",
+    "daemon-first:vendor-ahead",
+    "daemon-first:behind",
+    "left-typed-backoff",
+    "left-typed:x",
+    "no-shell-integration",
+    "thread-locked",
+    // The Codex lane's ladder and goal pause (rulings 380 and 381), and the
+    // words the waiting record classes since the review of 2026-09-28.
+    "goal",
+    "goal:switch",
+    "goal-held",
+    "goal-pausing",
+    "goal-pause-refused",
+    "goal-resume",
+    "goal-resuming",
+    "daemon-turn",
+    "daemon-busy",
+    "no-daemon",
+    "daemon-version",
+    "daemon-env",
+    "pin",
+    "in-flight",
+    "screen-unreadable",
+    "threads-ambiguous",
+    "files-unreadable",
+    "session-files-unreadable",
+    "shell-dialect",
+    "no-process",
+    "argv-unreadable",
+    "exe-unreadable",
+    "version-unreadable",
+    "tab-not-live",
+    "no-socket",
+    "conversation-in-other-tab",
+];
+
+/// HOW LOUD AN UPGRADE IS IS DECIDED BY WHETHER THE OWNER CAN DO ANYTHING,
+/// NEVER BY HOW LONG THE SESSION HAS BEEN BEHIND — AND NO WAIT IS QUIET FOR
+/// EVER (the owner, 2026-09-28: "don't continue to persist alerts to the user
+/// that are not actionable"; the tab of that day carried a warn row, an orange
+/// diamond and a menu-bar line for 7 hours because a timer crossed six; and
+/// the review of the plan that removed them found that, at thirty days, a
+/// held, limited, queued, boxed, attended or settling record read quiet, the
+/// six-hour row having been the only thing that caught a session nobody
+/// asked). For every wait word, in either phase, for either agent: a record
+/// an hour old is quiet (bar the two owner-only facts that need no time); the
+/// same record with no progress in a hundred days is NEVER quiet and never an
+/// interrupt — a digest line where the owner has the one action that ends it,
+/// otherwise a fault line in the log, one, quoting the last waits.
+#[test]
+fn every_wait_has_a_horizon_and_none_interrupts_by_age() {
+    for agent in [upgrade::Agent::Claude, upgrade::Agent::Codex] {
+        for phase in [Phase::Pending, Phase::Announced { at_s: NOW, asks: 1 }] {
+            for wait in WAITS {
+                let row = |ago: u64| Row {
+                    agent,
+                    phase: match phase {
+                        Phase::Announced { asks, .. } => Phase::Announced {
+                            at_s: NOW - ago + 60,
+                            asks,
+                        },
+                        _ => Phase::Pending,
+                    },
+                    wait: (*wait).to_string(),
+                    // The wait itself began a minute ago: only the record's
+                    // age moves.
+                    wait_since: NOW - 60,
+                    minted_at: NOW - ago,
+                    held_by: vec![HeldBy {
+                        pid: 7,
+                        name: "zsh".into(),
+                        since: NOW - 600,
+                    }],
+                    ..pending(ago)
+                };
+                let at = format!("{agent:?} {phase:?} wait={wait:?}");
+                match row(3_600).attention(NOW) {
+                    Attention::Quiet => {}
+                    Attention::Digest(n) if matches!(n.kind, "no-terminal" | "no-integration") => {}
+                    other => panic!("an hour old and already loud: {at}: {other:?}"),
+                }
+                match row(100 * 86_400).attention(NOW) {
+                    Attention::Quiet => panic!("quiet for a hundred days: {at}"),
+                    Attention::Interrupt(n) => panic!("a wait interrupts nobody: {at}: {n:?}"),
+                    Attention::Fault(n) => assert!(
+                        matches!(
+                            n.kind,
+                            "no-progress" | "harness-stuck" | "daemon-update-failing"
+                        ),
+                        "{at}: {}",
+                        n.kind
+                    ),
+                    // The classes that need the owner name the one action.
+                    Attention::Digest(n) => {
+                        assert!(!n.then.is_empty() && !n.why.is_empty(), "{at}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A WAIT NO CLASS CLAIMS TURNS A FAULT LINE AT ITS OWN HORIZON, never
+/// silence, and a notice typed or a round begun is progress: a person's box,
+/// login, hold or attendance and a settle stand a day (the supervisor answers
+/// a box, the person ends the rest), a usage limit a week and a day, notices
+/// unread behind a full queue three days; the instant is named
+/// ([`Row::next_attention_at`]) so the host looks then. A relaunched agent
+/// that reaches no idle point is one after [`RELAUNCH_STUCK_S`]. NEGATIVE
+/// CONTROLS: a row that names no record (one read off Claude's live status)
+/// has no start to count from, and a notice just typed keeps a hundred-day-old
+/// record quiet.
+#[test]
+fn a_quiet_wait_turns_a_fault_line_at_its_own_horizon() {
+    let row = |wait: &str, ago: u64| Row {
+        wait: wait.to_string(),
+        wait_since: NOW - 60,
+        minted_at: NOW - ago,
+        ..pending(ago)
+    };
+    for (wait, bound) in [
+        ("box", BACKSTOP_S),
+        ("login", BACKSTOP_S),
+        ("held", BACKSTOP_S),
+        ("attended", BACKSTOP_S),
+        ("not-idle:waiting", BACKSTOP_S),
+        ("limited", LIMIT_MAX_S),
+        ("queued", QUEUED_MAX_S),
+    ] {
+        assert_eq!(
+            row(wait, bound - 60).attention(NOW),
+            Attention::Quiet,
+            "{wait}: within its horizon"
+        );
+        let Attention::Fault(n) = row(wait, bound + 60).attention(NOW) else {
+            panic!("{wait}: past its horizon");
+        };
+        assert_eq!(n.kind, "no-progress", "{wait}");
+        assert_eq!(n.since, NOW - bound - 60, "{wait}: counted from the start");
+        assert!(n.why.contains("No progress in"), "{}", n.why);
+        assert!(
+            n.log_line.starts_with("upgrade need=no-progress tab="),
+            "{}",
+            n.log_line
+        );
+        assert_eq!(
+            row(wait, bound - 60).next_attention_at(NOW),
+            Some(NOW + 60),
+            "{wait}: the host wakes at the horizon"
+        );
+    }
+    // A notice typed is progress: the horizon counts from it.
+    let asked = Row {
+        phase: Phase::Announced {
+            at_s: NOW - 600,
+            asks: 1,
+        },
+        noticed_at: NOW - 600,
+        ..row("box", 100 * 86_400)
+    };
+    assert_eq!(asked.attention(NOW), Attention::Quiet);
+    // A relaunched agent that never reaches an idle point.
+    let relaunched = |ago: u64| Row {
+        phase: Phase::Relaunched { at_s: NOW - ago },
+        ..pending(60)
+    };
+    assert_eq!(
+        relaunched(RELAUNCH_STUCK_S - 60).attention(NOW),
+        Attention::Quiet
+    );
+    assert!(matches!(
+        relaunched(RELAUNCH_STUCK_S + 60).attention(NOW),
+        Attention::Fault(ref n) if n.kind == "relaunch-stuck"
+    ));
+    // NEGATIVE CONTROL: a row that names no record.
+    let live = Row {
+        minted_at: 0,
+        ..row("box", 100 * 86_400)
+    };
+    assert_eq!(live.attention(NOW), Attention::Quiet);
+    assert_eq!(live.next_attention_at(NOW), None);
+}
+
+/// THE AGENT'S OWN WORK IS THE ROUND'S, NOT THE LAST LOOK'S (the safety
+/// review of 2026-09-28: right after each notice, give-up and re-arm the act
+/// had cleared the wait and the list of holders, and the class fell to quiet
+/// until the next look — thirteen flips in one round, each a new log line and
+/// a dismissed entry back). The last look that saw the work is remembered for
+/// [`OWN_WORK_HOLD_S`], across the acts and across the box or draft a look met
+/// in between; a limit is its own class, and the memory runs out.
+#[test]
+fn the_agents_own_work_is_the_rounds_not_the_last_looks() {
+    let digest =
+        |r: &Row| matches!(r.attention(NOW), Attention::Digest(ref n) if n.kind == "own-work");
+    let zsh = HeldBy {
+        pid: 51_435,
+        name: "zsh".to_string(),
+        since: NOW - 3 * 3_600,
+    };
+    let round = Row {
+        phase: Phase::Failed(upgrade::GAVE_UP.into()),
+        streak_why: upgrade::GAVE_UP.into(),
+        stop_streak: 2,
+        own_work_at: NOW - 60,
+        ..pending(27 * 3_600)
+    };
+    // The look that saw it.
+    let looked = Row {
+        wait: "failed".into(),
+        held_by: vec![zsh],
+        ..round.clone()
+    };
+    assert!(digest(&looked));
+    // Right after an act: no wait, no holders — and the same class.
+    let acted = Row {
+        wait: String::new(),
+        ..round.clone()
+    };
+    assert!(digest(&acted), "an act is no end of the work");
+    // A box or a draft a look met between two looks at it.
+    for wait in ["box", "draft", "login", "held", "attended"] {
+        let between = Row {
+            wait: wait.into(),
+            ..round.clone()
+        };
+        assert!(digest(&between), "{wait}: between two looks at the work");
+    }
+    // NEGATIVE CONTROLS: a limit is its own class, and the memory runs out.
+    let limited = Row {
+        wait: "limited".into(),
+        ..round.clone()
+    };
+    assert!(!digest(&limited));
+    let stale = Row {
+        own_work_at: NOW - OWN_WORK_HOLD_S - 60,
+        ..acted.clone()
+    };
+    assert!(!digest(&stale), "an hour after the last look that saw it");
+    // The instant the memory runs out is named.
+    assert_eq!(
+        acted.next_attention_at(NOW),
+        Some(NOW - 60 + OWN_WORK_HOLD_S),
+        "the host wakes when the memory runs out"
+    );
+}
+
+/// THE ONLY INTERRUPT IS AN AGENT THE UPGRADE ENDED AND THAT IS NOT BACK: a
+/// move that stopped after the agent was seen gone (`agent-down`, the
+/// resume command one action away), a shutdown that outlived three times its
+/// bound (`hung-exit`; nothing harder is ever sent), an agent gone with its
+/// resume line not typed past the bound. NEGATIVE CONTROLS: every other stop,
+/// a restart within its bounds, a refusal, a give-up, a relaunched agent that
+/// has not reached an idle point (the supervisor's box), a finished move and
+/// the owner's word are not.
+#[test]
+fn only_an_agent_the_upgrade_ended_interrupts() {
+    let stale = super::super::STALE_S;
+    let interrupt = |r: &Row| match r.attention(NOW) {
+        Attention::Interrupt(n) => Some(n.kind),
+        _ => None,
+    };
+    let base = pending(7 * 3_600);
+    for (why, row, want) in [
+        (
+            "stopped after the exit",
+            Row {
+                phase: Phase::Failed("stale-exit".into()),
+                exited_at: NOW - 600,
+                ..base.clone()
+            },
+            Some("agent-down"),
+        ),
+        (
+            "no-resume after the exit",
+            Row {
+                phase: Phase::Failed("no-resume".into()),
+                exited_at: NOW - 600,
+                ..base.clone()
+            },
+            Some("agent-down"),
+        ),
+        (
+            "gone, its resume line not typed past the bound",
+            Row {
+                phase: Phase::Exiting {
+                    at_s: NOW - stale - 60,
+                },
+                exited_at: NOW - stale - 30,
+                ..base.clone()
+            },
+            Some("agent-down"),
+        ),
+        (
+            "asked to end, alive three bounds on",
+            Row {
+                phase: Phase::Exiting {
+                    at_s: NOW - HUNG_EXIT_AFTER_S - 1,
+                },
+                ..base.clone()
+            },
+            Some("hung-exit"),
+        ),
+        (
+            "asked to end, alive within three bounds",
+            Row {
+                phase: Phase::Exiting {
+                    at_s: NOW - stale - 60,
+                },
+                ..base.clone()
+            },
+            None,
+        ),
+        (
+            "gone, within the bound",
+            Row {
+                phase: Phase::Exiting { at_s: NOW - 60 },
+                exited_at: NOW - 30,
+                ..base.clone()
+            },
+            None,
+        ),
+        (
+            "relaunched, no idle point yet",
+            Row {
+                phase: Phase::Relaunched {
+                    at_s: NOW - 3 * stale,
+                },
+                exited_at: NOW - 3 * stale,
+                ..base.clone()
+            },
+            None,
+        ),
+        (
+            "a first stop with the agent alive",
+            Row {
+                phase: Phase::Failed("signal-refused".into()),
+                stop_streak: 1,
+                streak_why: "signal-refused".into(),
+                ..base.clone()
+            },
+            None,
+        ),
+        (
+            "a refusal",
+            Row {
+                phase: Phase::Failed("not-a-shell-job".into()),
+                ..base.clone()
+            },
+            None,
+        ),
+        (
+            "a round that gave up",
+            Row {
+                phase: Phase::Failed(upgrade::GAVE_UP.into()),
+                stop_streak: 3,
+                streak_why: upgrade::GAVE_UP.into(),
+                ..base.clone()
+            },
+            None,
+        ),
+        (
+            "done",
+            Row {
+                phase: Phase::Done,
+                ..base.clone()
+            },
+            None,
+        ),
+        (
+            "the owner's skip of an agent that is down",
+            Row {
+                phase: Phase::Failed("stale-exit".into()),
+                exited_at: NOW - 600,
+                request: Request::Skip("2.1.282".into()),
+                ..base.clone()
+            },
+            None,
+        ),
+    ] {
+        assert_eq!(interrupt(&row), want, "{why}");
+    }
+    // The interrupt's one action is the command that takes the conversation
+    // back: named in the sentence, carried whole in `command` (never cut into
+    // the sentence, which is capped: the launch's flags make it long), and
+    // appended by every surface that says the action.
+    let down = Row {
+        phase: Phase::Failed("stale-exit".into()),
+        exited_at: NOW - 600,
+        ..base
+    };
+    let Attention::Interrupt(need) = down.attention(NOW) else {
+        panic!("{:?}", down.attention(NOW));
+    };
+    assert_eq!(need.severity, NeedSeverity::Error);
+    assert_eq!(
+        need.command.as_deref(),
+        Some("claude --resume 03396a15-856e-4f1b-8174-ae9a3e4b369f")
+    );
+    assert_eq!(need.then, "Resume it in that tab with this command");
+    assert_eq!(need.fingerprint, format!("agent-down/{TAB}"));
+}
+
+/// A WHOLE ROUND NEVER FLIPS THE OWNER'S LINE AT ITS ACTS (the safety review
+/// of 2026-09-28 replayed one round of tab 1's kind - a resting look, the
+/// rest, the re-arm, four notices with a look either side of each, the give-up, the
+/// release, three resting looks - and read the class change THIRTEEN times:
+/// every act cleared the wait and the holders the last look recorded, so the
+/// own-work line fell to quiet and rose again, each rise a new log line and a
+/// dismissed entry back). Driven through the record's own transitions
+/// (`note_step`, `note_held`, `announced`, `give_up`, `released`, `rearm`) and
+/// read after each with the real classifier: the line stands, unbroken, from
+/// the first look. NEGATIVE CONTROL: with the work never seen (no holders, a
+/// status that is no work) the same round is quiet throughout.
+#[test]
+fn a_whole_round_never_flips_the_owners_line_at_its_acts() {
+    let round = |seen: bool| {
+        let held = if seen {
+            vec![upgrade::Held {
+                pid: 4000,
+                name: "zsh".into(),
+                age_s: 600,
+                command: String::new(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let work = if seen { "wait:background" } else { "wait:box" };
+        let resting = if seen { "wait:failed" } else { "wait:box" };
+        let t0 = NOW;
+        let mut st = St {
+            from: "2.1.283".into(),
+            to: "2.1.284".into(),
+            tab: TAB.into(),
+            pending_since: t0 - 30 * 3_600,
+            salt: t0 - 30 * 3_600,
+            streak_why: upgrade::GAVE_UP.into(),
+            stop_streak: 1,
+            failed_at: t0 - 100,
+            phase: Phase::Failed(upgrade::GAVE_UP.into()),
+            ..St::default()
+        };
+        let mut classes: Vec<String> = Vec::new();
+        let mut record = |st: &St, now: u64| {
+            classes.push(match Row::of("c", st, now).attention(now) {
+                Attention::Quiet => "quiet".to_string(),
+                Attention::Fault(n) => format!("fault:{}", n.kind),
+                Attention::Digest(n) => format!("digest:{}", n.kind),
+                Attention::Interrupt(n) => format!("interrupt:{}", n.kind),
+            });
+        };
+        let mut now = t0;
+        st.note_step(resting, "busy", now);
+        st.note_held(resting, &held, now);
+        record(&st, now);
+        // The rest: the host looks at a resting round about every ten minutes
+        // (the ladder's last rung), two hours to the re-arm.
+        for k in 1..12u64 {
+            st.note_step(resting, "busy", t0 + 600 * k);
+            st.note_held(resting, &held, t0 + 600 * k);
+            record(&st, t0 + 600 * k + 1);
+        }
+        now = t0 + 7_200;
+        let _ = st.rearm(now);
+        st.note_step("rearmed:unanswered", "busy", now);
+        st.note_held("rearmed:unanswered", &[], now);
+        record(&st, now + 1);
+        for ask in 1..=4u32 {
+            now += 60;
+            st.note_step(work, "busy", now);
+            st.note_held(work, &held, now);
+            record(&st, now + 1);
+            now += 30;
+            st.announced(format!("M{ask}"), now, ask);
+            st.note_step(&format!("announced:{ask}"), "busy", now);
+            st.note_held(&format!("announced:{ask}"), &[], now);
+            record(&st, now + 1);
+            now += 60;
+            st.note_step(work, "busy", now);
+            st.note_held(work, &held, now);
+            record(&st, now + 1);
+            now += 1_740;
+        }
+        st.give_up(now);
+        st.note_step("gave-up", "busy", now);
+        st.note_held("gave-up", &[], now);
+        record(&st, now + 1);
+        st.released();
+        st.note_step("released:gave-up", "busy", now + 5);
+        st.note_held("released:gave-up", &[], now + 5);
+        record(&st, now + 6);
+        for k in 1..=3u64 {
+            st.note_step(resting, "busy", now + 60 * k);
+            st.note_held(resting, &held, now + 60 * k);
+            record(&st, now + 60 * k + 1);
+        }
+        classes
+    };
+    let seen = round(true);
+    assert!(
+        seen.iter().all(|c| c == "digest:own-work"),
+        "the line never dips at an act: {seen:?}"
+    );
+    // NEGATIVE CONTROL: work never seen - a person's box at every look, and
+    // nothing under the agent: the same round says nothing of the agent's own
+    // work.
+    let unseen = round(false);
+    assert!(
+        unseen.iter().all(|c| c != "digest:own-work"),
+        "no work seen, no work line: {unseen:?}"
+    );
+}
+
+/// EVERY INTERRUPT IS A STALL THE HOST POSTS: the window's host keys its band
+/// row on `Row::stall` and takes the shape from the class
+/// (`upgrade_host::post_upgrade_stalls`), so an interrupt with no stall word
+/// would be a row nothing posts. The agent gone (a stop after its exit, an
+/// exit stale past its bound) and the shutdown that hung, for either agent.
+#[test]
+fn every_interrupt_is_a_stall_the_host_posts() {
+    let stale = super::super::STALE_S;
+    for agent in [upgrade::Agent::Claude, upgrade::Agent::Codex] {
+        for (why, row) in [
+            (
+                "stopped after the exit",
+                Row {
+                    phase: Phase::Failed("stale-exit".into()),
+                    exited_at: NOW - 600,
+                    ..pending(60)
+                },
+            ),
+            (
+                "no resume",
+                Row {
+                    phase: Phase::Failed("no-resume".into()),
+                    exited_at: NOW - 600,
+                    ..pending(60)
+                },
+            ),
+            (
+                "gone, its line not typed",
+                Row {
+                    phase: Phase::Exiting {
+                        at_s: NOW - stale - 60,
+                    },
+                    exited_at: NOW - stale - 30,
+                    ..pending(60)
+                },
+            ),
+            (
+                "hung",
+                Row {
+                    phase: Phase::Exiting {
+                        at_s: NOW - HUNG_EXIT_AFTER_S - 60,
+                    },
+                    ..pending(60)
+                },
+            ),
+            (
+                "relaunched, never at a prompt",
+                Row {
+                    phase: Phase::Relaunched {
+                        at_s: NOW - RELAUNCH_INTERRUPT_S - 60,
+                    },
+                    exited_at: NOW - RELAUNCH_INTERRUPT_S - 120,
+                    ..pending(60)
+                },
+            ),
+        ] {
+            let row = Row { agent, ..row };
+            assert!(row.interrupt(NOW).is_some(), "{agent:?} {why}");
+            assert!(row.stall(NOW).is_some(), "{agent:?} {why}: no stall word");
+            // …and never the `overdue` word: the one stall the window's host
+            // may group into a single row for several tabs
+            // (`upgrade_host::post_upgrade_stalls`) - an interrupt is per tab.
+            assert_ne!(
+                row.stall(NOW).as_deref(),
+                Some("overdue"),
+                "{agent:?} {why}: an interrupt is never an overdue row"
+            );
+        }
+    }
+}
+
+/// THE AGENT'S OWN WORK IS NEWS ONLY AFTER A DAY AND A ROUND (tab 1 of
+/// 2026-09-28: a workflow, two monitors and a watcher held the move; the row
+/// said "behind for 2 days" at 11 s, and named 16 processes for a wait that
+/// was not about them): quiet within the first day, quiet with no whole round
+/// of notices answered "not yet", ONE digest line past both — and the words
+/// carry the counts, never a pid. The day is the PROCESS's ([`Row::behind_since`]): a record that
+/// outlived a restart no longer lends its age
+/// (`an_age_belongs_to_one_process`).
+#[test]
+fn the_agents_own_work_is_news_only_after_a_day_and_a_round() {
+    let round = |behind: u64, rounds: u32, works: bool| Row {
+        phase: Phase::Failed(upgrade::GAVE_UP.into()),
+        stop_streak: rounds,
+        streak_why: if rounds > 0 {
+            upgrade::GAVE_UP.into()
+        } else {
+            String::new()
+        },
+        wait: "failed".into(),
+        held_by: if works {
+            (0..16)
+                .map(|i| HeldBy {
+                    pid: 4000 + i,
+                    name: "zsh".into(),
+                    since: NOW - 600,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        ..pending(behind)
+    };
+    let digest = |r: &Row| match r.attention(NOW) {
+        Attention::Digest(n) => Some(n),
+        _ => None,
+    };
+    for (why, r) in [
+        ("within the first day", round(DIGEST_AFTER_S - 1, 2, true)),
+        (
+            "no whole round answered not yet",
+            round(30 * 3_600, 0, true),
+        ),
+    ] {
+        assert_eq!(r.attention(NOW), Attention::Quiet, "{why}");
+    }
+    // A resting round IS the agent's own work outlasting the notices, with
+    // or without the processes recorded (review of 2026-09-28); the words
+    // say only what is known.
+    let bare_row = round(30 * 3_600, 2, false);
+    let bare = digest(&bare_row).expect("a round given up on");
+    assert_eq!(
+        bare.why,
+        "aterm never ends running work, and it is busy with work of its own"
+    );
+    assert_eq!(bare.then, "Ask it to wrap up in the tab when it suits you");
+    assert_eq!(
+        bare_row.more_lines(&bare, NOW)[0],
+        "Asked 8 times in 1d6h and declined"
+    );
+    let news_row = round(DIGEST_AFTER_S, 2, true);
+    let news = digest(&news_row).expect("a day, a round, work");
+    assert_eq!((news.kind, news.severity), ("own-work", NeedSeverity::Info));
+    // THE REASON THE OWNER IS NEEDED is aterm's rule, with the count of what
+    // runs; the notices declined are the details (`more_lines`), and no pid is
+    // ever in a sentence.
+    assert_eq!(
+        news.why,
+        "aterm never ends running work, and 16 programs under it are still running"
+    );
+    assert_eq!(news.then, "Stop that work in the tab when it suits you");
+    let more = news_row.more_lines(&news, NOW);
+    assert_eq!(more[0], "Asked 8 times in 1d and declined", "{more:?}");
+    assert!(more[1].starts_with("Held by "), "{more:?}");
+    assert!(more.len() <= 3 && more.iter().all(|l| l.chars().count() <= 200));
+    assert!(!news.why.contains("pid") && !news.then.contains("pid"));
+    assert!(
+        news.log_line.contains("held by pid 4000"),
+        "{}",
+        news.log_line
+    );
+    // An ANNOUNCED round counts its own notices so far.
+    let asking = Row {
+        phase: Phase::Announced {
+            at_s: NOW - 600,
+            asks: 2,
+        },
+        wait: "background".into(),
+        ..round(30 * 3_600, 1, true)
+    };
+    let news = digest(&asking).expect("announced, a round behind it");
+    assert_eq!(
+        asking.more_lines(&news, NOW)[0],
+        "Asked 6 times in 1d6h and declined"
+    );
+}
+
+/// A RECORD AN OLDER BUILD WROTE IS AGED FROM ITS MINTING UNTIL A VISIT SETTLES
+/// IT (the review of 2026-09-28): the owner's tab, read before any visit of the
+/// fixed build had vetted the age against the process that holds the
+/// conversation, would have read "behind for 3d5h" — the stale clock the owner
+/// complained about — in the log or the digest badge. The record names no
+/// process and keeps no wait log, and its age (09-25 14:50) predates its own
+/// minting (09-28 11:02): it is read from the minting, the safe direction (a
+/// later digest, never an earlier one). NEGATIVE CONTROLS: every record this
+/// build writes names its process or keeps a wait log, and is read as it
+/// stands; so is an age from within the record's own life.
+#[test]
+fn a_record_an_older_build_wrote_is_aged_from_its_minting_until_a_visit_settles_it() {
+    let (minted, carried, at) = (1_790_618_538, 1_790_373_026, 1_790_658_000);
+    let legacy = St {
+        from: "2.1.283".to_string(),
+        to: "2.1.284".to_string(),
+        tab: TAB.to_string(),
+        pending_since: carried,
+        salt: minted,
+        wait: "draft".to_string(),
+        wait_since: 1_790_640_516,
+        ..St::default()
+    };
+    let row = Row::of("s", &legacy, at);
+    assert_eq!(row.behind_since, minted, "not three days");
+    assert!(
+        row.column(at).ends_with("/10h57m"),
+        "the age the owner reads: {}",
+        row.column(at)
+    );
+    for (why, st) in [
+        (
+            "it names its process",
+            St {
+                proc_start: "Sun Sep 27 16:20:11 2026".to_string(),
+                ..legacy.clone()
+            },
+        ),
+        (
+            "it keeps a wait log",
+            St {
+                waits: vec![super::super::WaitNote {
+                    at: 1_790_640_516,
+                    word: "draft".to_string(),
+                    note: String::new(),
+                }],
+                ..legacy.clone()
+            },
+        ),
+        (
+            "its age is within its own life",
+            St {
+                pending_since: minted + 60,
+                ..legacy.clone()
+            },
+        ),
+    ] {
+        assert_eq!(
+            Row::of("s", &st, at).behind_since,
+            st.behind_since(),
+            "{why}: read as it stands"
+        );
+    }
+}
+
+/// THE INTERRUPT'S MARK NEVER CUTS THE ACTION (the review of 2026-09-28: with
+/// a long model name in the move's words the 200-byte cut fell inside the
+/// resume command's conversation id, and an owner copying it from the
+/// notification got "no conversation found"): the head — the move and why —
+/// gives way, with an ellipsis, before the action loses a byte.
+#[test]
+fn the_interrupt_mark_never_cuts_the_action() {
+    let session = "07422bc3-1be9-4875-9672-2eaf7b28aa21";
+    for model in [
+        "",
+        "opus",
+        "claude-opus-5-5-20260901",
+        "claude-sonnet-4-5-20250929-with-a-long-name-that-goes-on-and-on",
+    ] {
+        let down = Row {
+            phase: Phase::Failed("stale-exit".into()),
+            exited_at: NOW - 600,
+            session: session.to_string(),
+            model: model.to_string(),
+            ..pending(7 * 3_600)
+        };
+        let mark = down.badge(NOW).expect("the agent is down");
+        assert!(mark.len() <= 200, "{model}: {} bytes", mark.len());
+        assert!(
+            mark.ends_with(&format!(
+                "Resume it in that tab with this command: claude --resume {session}"
+            )),
+            "{model}: {mark}"
+        );
+        assert!(
+            mark.contains("could not start it again") || mark.contains('…'),
+            "{mark}"
+        );
+    }
+}
+
+/// THE HOST IS TOLD THE INSTANT A ROW READS OTHERWISE BY TIME ALONE, FOR EVERY
+/// ROW (the safety review of 2026-09-28 swept 176,640 rows and found 144 where
+/// the class turned at one instant and the host was told at another, so the
+/// log line and the digest entry came late or not at all): read off
+/// [`Row::attention`] itself — every span its classifier compares an age
+/// against, added to every instant it compares it from — never a second copy
+/// of its horizons. Here: for a grid of rows the instant named is an instant
+/// the class really differs at, and no scanned instant before it does.
+#[test]
+fn next_attention_at_names_every_change_by_time() {
+    let phases = [
+        Phase::Pending,
+        Phase::Announced {
+            at_s: NOW - 600,
+            asks: 1,
+        },
+        Phase::Failed(upgrade::GAVE_UP.into()),
+        Phase::Failed("signal-refused".into()),
+        Phase::Relaunched { at_s: NOW - 600 },
+        Phase::Exiting { at_s: NOW - 100 },
+    ];
+    let horizon = 12 * 86_400;
+    let step = 600;
+    let mut rows = 0;
+    for agent in [upgrade::Agent::Claude, upgrade::Agent::Codex] {
+        for phase in &phases {
+            for wait in WAITS.iter().step_by(3) {
+                for held in [false, true] {
+                    for (ago, remembered) in [(3_600, 0), (30 * 3_600, NOW - 600), (9 * 86_400, 0)]
+                    {
+                        let row = Row {
+                            agent,
+                            phase: phase.clone(),
+                            wait: (*wait).to_string(),
+                            wait_since: NOW - 60,
+                            minted_at: NOW - ago,
+                            own_work_at: remembered,
+                            streak_why: upgrade::GAVE_UP.to_string(),
+                            stop_streak: 2,
+                            held_by: if held {
+                                vec![HeldBy {
+                                    pid: 7,
+                                    name: "zsh".into(),
+                                    since: NOW - 600,
+                                }]
+                            } else {
+                                Vec::new()
+                            },
+                            ..pending(ago)
+                        };
+                        rows += 1;
+                        let here = row.attention(NOW).level();
+                        let named = row.next_attention_at(NOW);
+                        // The first scanned instant the class differs at.
+                        let first = (1..=horizon / step)
+                            .map(|k| NOW + k * step)
+                            .find(|t| row.attention(*t).level() != here);
+                        let at = format!("{agent:?} {phase:?} wait={wait:?} held={held} ago={ago}");
+                        match (named, first) {
+                            (Some(n), _) => {
+                                assert!(n > NOW, "{at}: in the future");
+                                assert_ne!(row.attention(n).level(), here, "{at}: a real change");
+                                if let Some(f) = first {
+                                    assert!(n <= f, "{at}: named {n}, differs by {f}");
+                                }
+                            }
+                            (None, Some(f)) => panic!("{at}: unnamed, but differs by {f}"),
+                            (None, None) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(rows > 500, "{rows} rows swept");
+}
+
+/// THE FIRST LOOK OF A PROCESS LOWERS WHAT AN EARLIER ONE RAISED (the review
+/// of 2026-09-28: a seamless update carries every keyed attention across the
+/// handoff — the upgrade's `owner=upgrade` among them — while the successor's
+/// view starts with nothing marked, so a tab the old build marked for a wait
+/// that is no interrupt any more kept its orange diamond, and the menu-bar row
+/// and rim that read the same attention, for the life of the tab). One
+/// idempotent `meta unset attention owner=upgrade` per live tab the look
+/// wants no mark on, sent once; a tab it does mark is marked, not lowered.
+#[cfg(unix)]
+#[test]
+fn a_first_look_lowers_a_mark_an_earlier_process_raised() {
+    let dir = ScratchDir::new("upgrade-status", "carried-mark");
+    let (sock, asked) = recording_socket(&dir);
+    let o = Opts {
+        sock: Some(sock),
+        ..opts(&dir)
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    save(
+        &o,
+        "aaa",
+        &St {
+            phase: Phase::Failed("stale-exit".to_string()),
+            from: "2.1.281".to_string(),
+            to: "2.1.282".to_string(),
+            tab: TAB.to_string(),
+            pending_since: now_s() - 60,
+            exited_at: now_s() - 600,
+            ..St::default()
+        },
+    );
+    let tabs = [
+        LiveTab {
+            sid: TAB.to_string(),
+            fgpgid: Some(7),
+        },
+        LiveTab {
+            sid: "s-other".to_string(),
+            fgpgid: Some(8),
+        },
+    ];
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    let mut view = View::default();
+    let meta = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
+        asked
+            .lock()
+            .map(|a| a.iter().filter(|l| l.contains(" meta ")).cloned().collect())
+            .unwrap_or_default()
+    };
+    let _ = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |_| {});
+    let first = meta(&asked);
+    assert_eq!(first.len(), 2, "{first:?}");
+    assert_eq!(
+        first[0], "@s-other meta unset attention owner=upgrade",
+        "the tab no mark is wanted on is lowered, first"
+    );
+    assert!(
+        first[1].starts_with(&format!("@{TAB} meta set attention owner=upgrade ")),
+        "and the agent that is down is marked, not lowered: {first:?}"
+    );
+    let _ = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |_| {});
+    assert_eq!(meta(&asked), first, "the sweep is once, the mark is once");
+}
+
+/// A DIGEST LINE IS KEYED BY KIND AND TAB, NEVER BY THE BUILD, AN AGE OR THE
+/// WORDS (the row of 2026-09-28 was keyed by the build: Claude ships about
+/// daily, and each release raised what the owner had dismissed): the same
+/// tab's `no-terminal` line has one fingerprint for 2.1.284 and for 2.1.290,
+/// however old, and another tab's has its own. Every sentence fits its cap
+/// and asks for no restart (the reporters' guard reads the same words).
+#[test]
+fn a_digest_line_is_keyed_by_kind_and_tab_and_says_no_restart() {
+    let needle = ["restart", "relaunch", "reopen", "next launch", "reboot"];
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut faults = std::collections::BTreeSet::new();
+    for agent in [upgrade::Agent::Claude, upgrade::Agent::Codex] {
+        for wait in WAITS {
+            for (phase, streak_why, rounds) in [
+                (Phase::Pending, "", 0),
+                (Phase::Announced { at_s: NOW, asks: 1 }, upgrade::GAVE_UP, 2),
+                (Phase::Failed("not-a-shell-job".into()), "", 0),
+                (
+                    Phase::Failed("line:a control character in the line".into()),
+                    "",
+                    0,
+                ),
+                (Phase::Failed("argv:--frob".into()), "", 0),
+                (Phase::Failed("signal-refused".into()), "signal-refused", 3),
+                (Phase::Failed("stale-exit".into()), "", 0),
+                (Phase::Exiting { at_s: 0 }, "", 0),
+            ] {
+                let exited = if matches!(&phase, Phase::Failed(w) if w == "stale-exit") {
+                    NOW - 600
+                } else {
+                    0
+                };
+                let mk = |to: &str, behind: u64, tab: &str| Row {
+                    agent,
+                    phase: phase.clone(),
+                    wait: (*wait).to_string(),
+                    wait_since: NOW - 30 * 3_600,
+                    exited_at: exited,
+                    to: to.to_string(),
+                    tab: tab.to_string(),
+                    stop_streak: rounds,
+                    streak_why: streak_why.to_string(),
+                    held_by: vec![HeldBy {
+                        pid: 7,
+                        name: "zsh".into(),
+                        since: NOW - 600,
+                    }],
+                    ..pending(behind)
+                };
+                let (a, b) = (
+                    mk("2.1.284", 30 * 3_600, TAB),
+                    mk("2.1.290", 90 * 3_600, TAB),
+                );
+                let (na, nb) = match (a.attention(NOW), b.attention(NOW)) {
+                    (
+                        Attention::Fault(x) | Attention::Digest(x) | Attention::Interrupt(x),
+                        Attention::Fault(y) | Attention::Digest(y) | Attention::Interrupt(y),
+                    ) => (x, y),
+                    _ => continue,
+                };
+                let fault = matches!(a.attention(NOW), Attention::Fault(_));
+                assert_eq!(na.fingerprint, nb.fingerprint, "{agent:?} {wait} {phase:?}");
+                assert_eq!(na.kind, nb.kind);
+                let other = mk("2.1.284", 30 * 3_600, "s-other");
+                if let Attention::Fault(o) | Attention::Digest(o) | Attention::Interrupt(o) =
+                    other.attention(NOW)
+                {
+                    assert_ne!(o.fingerprint, na.fingerprint, "another tab is its own line");
+                }
+                for text in [&na.why, &na.then, &na.title.to_string()] {
+                    for n in needle {
+                        assert!(!text.to_lowercase().contains(n), "{n} in {text}");
+                    }
+                }
+                // The band's title law, with the place the host adds
+                // (`in tab 12`): six words (a bare number is no word), 48
+                // characters, no seam, no trailing period.
+                let placed = format!("{} in tab 12", na.title);
+                let words = placed
+                    .split_whitespace()
+                    .filter(|w| !w.chars().all(|c| c.is_ascii_digit()))
+                    .count();
+                assert!(words <= 6, "{placed}");
+                assert!(placed.chars().count() <= 48, "{placed}");
+                assert!(
+                    !placed.contains(" — ") && !placed.contains("; ") && !placed.contains(": "),
+                    "{placed}"
+                );
+                assert!(!placed.ends_with('.'), "{placed}");
+                assert!(na.why.chars().count() <= NEED_WHY_MAX, "{}", na.why);
+                assert!(na.then.chars().count() <= NEED_THEN_MAX, "{}", na.then);
+                assert!(
+                    !na.why.contains('…') && !na.then.contains('…'),
+                    "cut: {na:?}"
+                );
+                assert!(!na.log_line.contains('\n') && !na.log_line.is_empty());
+                // The exceptions engine's rule for a `Need` — ONE action, one
+                // line (it refuses `; `, ` or ` and a newline): only a fault,
+                // which no one is asked to act on, may say two things.
+                assert!(!na.why.contains('\n') && !na.then.contains('\n'));
+                if !fault {
+                    assert!(
+                        !na.then.contains("; ") && !na.then.contains(" or "),
+                        "{}: {}",
+                        na.kind,
+                        na.then
+                    );
+                }
+                if fault {
+                    faults.insert(na.kind);
+                } else {
+                    kinds.insert(na.kind);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        kinds,
+        std::collections::BTreeSet::from([
+            "agent-down",
+            "daemon-busy",
+            "hung-exit",
+            "no-integration",
+            "no-terminal",
+            "other-client",
+            "own-work",
+            "refused-launch",
+            "repeating-stop",
+            "suspended",
+            "typed-draft",
+        ]),
+        "every kind the sweep reaches"
+    );
+    assert_eq!(
+        faults,
+        std::collections::BTreeSet::from(["daemon-update-failing", "harness-stuck"]),
+        "every fault the sweep reaches"
+    );
+}
+
+/// A ROW THAT CROSSES A HORIZON IS A CHANGED ROW (the level a row carries,
+/// [`Level`]): a wait that turns an hour old is a digest line from that
+/// instant, and the window is told THEN — not at some later change. Without
+/// the carried level the rows before and after the instant were equal, the
+/// host woke at the instant [`next_change`] names, and nothing was sent.
+/// NEGATIVE CONTROL: a wait that stays quiet crosses the same instants and
+/// sends nothing.
+#[cfg(unix)]
+#[test]
+fn a_row_that_crosses_a_horizon_is_a_changed_row() {
+    let dir = ScratchDir::new("upgrade-status", "horizon");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let now = now_s();
+    let waiting = |wait: &str| St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: now - 2 * 3_600,
+        wait: wait.to_string(),
+        wait_since: now - SUSPENDED_AFTER_S + 100,
+        ..St::default()
+    };
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let held = behind_in(TAB);
+    for (wait, at_horizon) in [
+        ("not-foreground", Level::Digest("suspended")),
+        ("limited", Level::Quiet),
+    ] {
+        save(&o, "aaa", &waiting(wait));
+        let mut view = View::default();
+        let sent: std::cell::RefCell<Vec<Vec<Level>>> = std::cell::RefCell::default();
+        let look = |view: &mut View, at: u64| {
+            view.refresh_with(&o, &tabs, at, &held, &mut |rows| {
+                sent.borrow_mut()
+                    .push(rows.iter().map(|r| r.level).collect());
+            })
+        };
+        let next = look(&mut view, now);
+        if at_horizon == Level::Quiet {
+            // Nothing crosses a horizon of the classifier's before the
+            // stall's six hours (`STALLED_AFTER_S`, which still ages the
+            // `upgrade=` column and the words).
+            // (or the record's watch, [`super::super::watch_at`], if that
+            // comes first: it is the host's wake, not a class change)
+            let watch = super::super::load(&o, "aaa")
+                .and_then(|st| super::super::watch_at(&st))
+                .unwrap_or(u64::MAX);
+            assert_eq!(
+                next,
+                Some((now - 2 * 3_600 + STALLED_AFTER_S).min(watch)),
+                "{wait}"
+            );
+        } else {
+            assert_eq!(next, Some(now + 100), "{wait}: woken at the horizon");
+        }
+        let _ = look(&mut view, now + 50);
+        assert_eq!(
+            *sent.borrow(),
+            [vec![Level::Quiet]],
+            "{wait}: unchanged, sent once"
+        );
+        let _ = look(&mut view, now + 101);
+        if at_horizon == Level::Quiet {
+            assert_eq!(
+                sent.borrow().len(),
+                1,
+                "{wait}: nothing crossed, nothing sent"
+            );
+        } else {
+            assert_eq!(
+                *sent.borrow(),
+                [vec![Level::Quiet], vec![at_horizon]],
+                "{wait}: the horizon is a changed row"
+            );
+        }
+    }
+}
+
+/// ATERM'S OWN FAULT IS A RECORD, NEVER A DIGEST LINE OR A MARK (the owner,
+/// 2026-09-28: "don't continue to persist alerts to the user that are not
+/// actionable"): a wait this build does not classify, and a notice the fence
+/// keeps refusing, are aterm's to fix. Young they are the upgrade working;
+/// 90 minutes on they are ONE Warn line in the log (`Attention::Fault`) and
+/// the wait log says the rest. A daemon move that keeps failing is the same
+/// after a day. NEGATIVE CONTROLS: the agent's own work, a person, a limit
+/// and a suspended job are never a fault, at any age.
+#[test]
+fn aterms_own_fault_is_one_log_line_never_a_digest_line_or_a_mark() {
+    // (The session has been behind for as long as the wait, and at least six
+    // hours: what is under test is the wait's own clock.)
+    let at = |agent, wait: &str, waited: u64| Row {
+        agent,
+        wait: wait.to_string(),
+        wait_since: NOW - waited,
+        ..pending(waited.max(6 * 3_600))
+    };
+    for (agent, wait) in [
+        (upgrade::Agent::Claude, "announce-refused:changed"),
+        (upgrade::Agent::Claude, "changed"),
+        (upgrade::Agent::Claude, "signal-refused"),
+        (upgrade::Agent::Claude, "tasked"),
+        (upgrade::Agent::Claude, "self"),
+        (upgrade::Agent::Claude, "ids"),
+        (upgrade::Agent::Claude, "not-idle"),
+        // A settle that never settles, an answer awaited past a whole round
+        // and a tab aterm cannot reach are aterm's own business too.
+        (upgrade::Agent::Claude, "settling"),
+        (upgrade::Agent::Claude, "awaiting-ready"),
+        (upgrade::Agent::Claude, "tab-not-live"),
+        (upgrade::Agent::Codex, "left-typed-backoff"),
+    ] {
+        let young = at(agent, wait, HARNESS_TELL_S - 60);
+        assert_eq!(young.attention(NOW), Attention::Quiet, "{wait}: young");
+        let old = at(agent, wait, HARNESS_TELL_S + 60);
+        assert!(
+            matches!(old.attention(NOW), Attention::Fault(ref n) if n.kind == "harness-stuck"),
+            "{wait}: {:?}",
+            old.attention(NOW)
+        );
+        assert_eq!(old.level, Level::Quiet, "(a hand-built row carries none)");
+        assert_eq!(old.attention(NOW).level(), Level::Fault("harness-stuck"));
+        assert_eq!(old.badge(NOW), None, "{wait}: a fault marks no tab");
+        let days = at(agent, wait, 5 * 86_400);
+        assert!(matches!(days.attention(NOW), Attention::Fault(_)), "{wait}");
+        // The wait's own clock moves the horizon, not the session's age.
+        assert_eq!(
+            old.next_attention_at(NOW - 3_600),
+            Some(old.wait_since + HARNESS_TELL_S),
+            "{wait}"
+        );
+    }
+    // A Pending record NO LOOK has recorded a wait for: minted and never
+    // visited (or every visit returned before it recorded). The six-hour row
+    // used to shout at it; quiet by age, it is told once as aterm's fault.
+    let minted = |minted_ago: u64, phase: Phase, wait: &str| Row {
+        phase,
+        wait: wait.to_string(),
+        wait_since: if wait.is_empty() { 0 } else { NOW - 60 },
+        minted_at: NOW - minted_ago,
+        ..pending(100 * 86_400)
+    };
+    assert_eq!(
+        minted(HARNESS_TELL_S - 60, Phase::Pending, "").attention(NOW),
+        Attention::Quiet,
+        "a record only just minted has had no look yet"
+    );
+    assert!(
+        matches!(
+            minted(HARNESS_TELL_S + 60, Phase::Pending, "").attention(NOW),
+            Attention::Fault(ref n) if n.kind == "harness-stuck" && n.why.contains("No look")
+        ),
+        "{:?}",
+        minted(HARNESS_TELL_S + 60, Phase::Pending, "").attention(NOW)
+    );
+    assert_eq!(
+        minted(HARNESS_TELL_S + 60, Phase::Pending, "").next_attention_at(NOW - 3_600),
+        Some(NOW - HARNESS_TELL_S - 60 + HARNESS_TELL_S),
+        "the host wakes at the instant it turns a fault"
+    );
+    // NEGATIVE CONTROLS: an announced round (the notice just went out, the
+    // next look is coming), a record that names its wait, and one an older
+    // build minted (no instant) are not this fault.
+    for (why, row) in [
+        (
+            "announced",
+            minted(
+                5 * 86_400,
+                Phase::Announced {
+                    at_s: NOW - 600,
+                    asks: 1,
+                },
+                "",
+            ),
+        ),
+        (
+            "a recorded wait",
+            minted(5 * 86_400, Phase::Pending, "background"),
+        ),
+        (
+            "no minting instant",
+            Row {
+                minted_at: 0,
+                ..minted(0, Phase::Pending, "")
+            },
+        ),
+    ] {
+        assert!(
+            !matches!(row.attention(NOW), Attention::Fault(_)),
+            "{why}: {:?}",
+            row.attention(NOW)
+        );
+    }
+    let daemon = |waited: u64| at(upgrade::Agent::Codex, "daemon-first:update-failed", waited);
+    assert_eq!(daemon(DIGEST_AFTER_S - 60).attention(NOW), Attention::Quiet);
+    assert!(matches!(
+        daemon(DIGEST_AFTER_S + 60).attention(NOW),
+        Attention::Fault(ref n) if n.kind == "daemon-update-failing"
+    ));
+    for wait in [
+        "background",
+        "not-idle:busy",
+        "not-idle:shell",
+        "not-idle:waiting",
+        "draft",
+        "box",
+        "login",
+        "limited",
+        "held",
+        "attended",
+        "not-foreground",
+    ] {
+        for waited in [HARNESS_TELL_S + 60, 5 * 86_400] {
+            assert!(
+                !matches!(
+                    at(upgrade::Agent::Claude, wait, waited).attention(NOW),
+                    Attention::Fault(_)
+                ),
+                "{wait} after {waited}s is somebody else's, not aterm's fault"
+            );
+        }
+    }
+    // Aterm's own words left typed, however they stand: only a person sends
+    // or clears them, so they are a person's hold, never aterm's fault.
+    for agent in [upgrade::Agent::Claude, upgrade::Agent::Codex] {
+        for wait in [
+            "left-typed:unsent",
+            "left-typed:mixed",
+            "left-typed:box",
+            "left-typed:no-composer",
+        ] {
+            let row = at(agent, wait, 5 * 86_400);
+            assert!(
+                !matches!(row.attention(NOW), Attention::Fault(_)),
+                "{wait}: {:?}",
+                row.attention(NOW)
+            );
+            assert_eq!(row.cause_word(NOW), "person", "{wait}");
+        }
+        // Unless aterm cannot read the tab: its words may be gone already.
+        assert_eq!(
+            wait_class("left-typed:screen-unreadable"),
+            WaitClass::TabUnread
+        );
+        assert!(!person_holds("left-typed:screen-unreadable"));
+    }
+}
+
+/// A CODEX DAEMON THREAD THAT HOLDS THE MOVE FOR A DAY IS NEWS (no notice can
+/// ask a thread anything, so there is no round to wait for): a digest line
+/// with the one action that ends it — a thread is stopped (`codex agents`
+/// lists them), a background terminal is closed with `/stop`. Younger it is
+/// the upgrade waiting for the daemon's own work.
+#[test]
+fn a_codex_daemon_thread_is_news_after_a_day() {
+    let row = |wait: &str, waited: u64| Row {
+        agent: upgrade::Agent::Codex,
+        wait: wait.to_string(),
+        wait_since: NOW - waited,
+        ..pending(100 * 86_400)
+    };
+    for wait in [
+        "daemon-first:busy-thread",
+        "daemon-first:background-terminal",
+    ] {
+        assert_eq!(
+            row(wait, DIGEST_AFTER_S - 60).attention(NOW),
+            Attention::Quiet,
+            "{wait}"
+        );
+        let Attention::Digest(n) = row(wait, DIGEST_AFTER_S + 60).attention(NOW) else {
+            panic!("{wait}");
+        };
+        assert_eq!(n.kind, "daemon-busy");
+        assert_eq!(n.fingerprint, format!("daemon-busy/{TAB}"));
+        if wait.ends_with("busy-thread") {
+            assert_eq!(n.command.as_deref(), Some("codex agents"));
+            assert!(n.then.contains("codex agents"), "{}", n.then);
+        } else {
+            assert!(n.then.contains("/stop"), "{}", n.then);
+        }
+    }
+}
+
+/// `--status --json` SAYS HOW LOUD THE OWNER IS TOLD AND WHY (the screen's
+/// introspection: the class every surface follows is printed where the owner
+/// or an agent reads the upgrade): `attention` is `quiet`, `fault`, `digest`
+/// or `interrupt`, `attention_kind` names the kind, `cause` the class that
+/// holds the move (one word) and `cause_words` the same class as a sentence.
+#[test]
+fn the_status_json_says_how_loud_the_owner_is_told_and_why() {
+    let text = |row: &Row, key: &str| {
+        row.to_json(NOW)
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let waiting = pending(7 * 3_600);
+    assert_eq!(text(&waiting, "attention").as_deref(), Some("quiet"));
+    assert_eq!(text(&waiting, "attention_kind").as_deref(), Some(""));
+    assert_eq!(text(&waiting, "cause").as_deref(), Some("own-work"));
+    assert_eq!(
+        text(&waiting, "cause_words").as_deref(),
+        Some("held by its own work")
+    );
+    let draft = Row {
+        wait: "draft".to_string(),
+        wait_since: NOW - 30 * 3_600,
+        ..pending(31 * 3_600)
+    };
+    assert_eq!(text(&draft, "attention").as_deref(), Some("digest"));
+    assert_eq!(
+        text(&draft, "attention_kind").as_deref(),
+        Some("typed-draft")
+    );
+    let down = Row {
+        phase: Phase::Failed("stale-exit".into()),
+        exited_at: NOW - 600,
+        ..pending(7 * 3_600)
+    };
+    assert_eq!(text(&down, "attention").as_deref(), Some("interrupt"));
+    assert_eq!(text(&down, "attention_kind").as_deref(), Some("agent-down"));
+}
+
+/// AN UPGRADE THAT CANNOT RUN AT ALL (its state folder cannot hold the lock:
+/// `busy:state-unwritable`, `busy:lock-unopenable`) has no record and so no
+/// row to classify; the HOST files it once, as a digest line, and only the
+/// owner can mend a folder's permissions. Its sentence obeys every rule a
+/// `Need` does: a reason and ONE action within the caps, no restart word, a
+/// glass title within the law, a key that names no tab.
+#[test]
+fn an_upgrade_that_cannot_run_is_one_owner_sentence() {
+    for step in ["busy:state-unwritable", "busy:lock-unopenable"] {
+        let need = Need::upgrade_cannot_run(step);
+        assert_eq!(need.kind, "upgrade-cannot-run");
+        assert_eq!(need.fingerprint, "upgrade-cannot-run/-");
+        assert_eq!(need.severity, NeedSeverity::Warn);
+        // The step is the log's word, never the person's.
+        assert!(!need.why.contains("busy"), "{}", need.why);
+        assert!(need.why.chars().count() <= NEED_WHY_MAX);
+        assert!(need.then.chars().count() <= NEED_THEN_MAX);
+        assert!(!need.then.contains("; ") && !need.then.contains(" or "));
+        for text in [&need.why, &need.then, &need.title.to_string()] {
+            for n in ["restart", "relaunch", "reopen", "next launch", "reboot"] {
+                assert!(!text.to_lowercase().contains(n), "{n} in {text}");
+            }
+        }
+        let placed = format!("{} in tab 12", need.title);
+        assert!(placed.split_whitespace().count() <= 7 && placed.chars().count() <= 48);
+        assert!(!need.log_line.contains('\n') && need.log_line.contains(step));
+    }
+    // A step word longer than a sentence can hold is cut in the log line.
+    let long = Need::upgrade_cannot_run(&"x".repeat(200));
+    assert!(long.log_line.chars().count() < 100, "{}", long.log_line);
 }
 
 /// `--status` says the watch's fields after `release=` (only `refused=`,
@@ -4536,7 +7078,10 @@ fn status_says_the_watchs_fields_last() {
     let now = 1_790_632_822;
     let line = Row::of("446a0b3c-1979-414f-ae20-e06e26a2ef44", &st, now).line(now);
     assert!(
-        line.ends_with(" looked=13m by=0.99.0 point=9h7m guard=wall watch_at=16m"),
+        line.ends_with(
+            " looked=13m by=0.99.0 point=9h7m guard=wall watch_at=16m cause=unrecorded \
+             told=no-progress"
+        ),
         "{line}"
     );
     let never = St {
@@ -4545,7 +7090,7 @@ fn status_says_the_watchs_fields_last() {
     };
     let line = Row::of("446a0b3c-1979-414f-ae20-e06e26a2ef44", &never, now).line(now);
     assert!(
-        line.ends_with(" looked=- by=- point=- guard=- watch_at=-"),
+        line.ends_with(" looked=- by=- point=- guard=- watch_at=- cause=- told=-"),
         "{line}"
     );
     // A notice aterm could not type (`refused=`, said only while there is
@@ -4557,31 +7102,140 @@ fn status_says_the_watchs_fields_last() {
     };
     let line = Row::of("446a0b3c-1979-414f-ae20-e06e26a2ef44", &refused, now).line(now);
     assert!(
-        line.ends_with(" guard=wall watch_at=16m refused=2/10m"),
+        line.ends_with(" guard=wall watch_at=16m cause=unrecorded told=no-progress refused=2/10m"),
         "{line}"
     );
 }
 
-/// ATERM'S OWN NOTICE, WHICH ITS FENCE WOULD NOT TYPE, IS TOLD AS SUCH
-/// (2026-09-28, s-d3346, the record as it stood at 20:30): pending to 2.1.284
-/// since 09-27 13:13, the owner's `--now` at 14:50:50, and the notice refused
-/// by its own fence from 14:50:58 (`announce-refused:changed`), three looks.
-/// On 0.98 and main the band said "Couldn't upgrade Claude yet" with no word
-/// that aterm itself could not type, offered no `Upgrade now`, and said it
-/// "moves once that ends". The row now names aterm's refusal, how often and
-/// for how long, and the mark names the cause; a refusal that stands `TELL_S`
-/// is told before six hours behind. `Upgrade now` is offered only where it is
-/// not already in force (the next look types it, owning its point:
-/// `upgrade_drive::owns_turn_ends`): under the owner's `--now` — this record —
-/// it would ask for the very notice aterm cannot type, so the row waits (the
-/// review of 2026-09-28: pressed, it put the same row back at once), and the
-/// owner's word starts the count over (`St::new_round`). NEGATIVE CONTROLS: a
-/// refusal within `TELL_S` of a move under six hours behind is no stall; a
-/// record with no refusal counted keeps the old words; the same refusal with
-/// no word in force offers `Upgrade now`.
+/// A NOTICE STOPPED PART-WAY IS NEVER "NOTHING TO DO" (review of 2026-09-30,
+/// findings 12 and 15): the host stops a pressed notice at a person's key, a
+/// screen switch or its deadline — or types it whole and its guarded Enter
+/// misses — presses no Enter, and the part typed sits in the prompt
+/// (`announce-refused:cut-<why>`). The owner reads that aterm stopped it,
+/// unsent, and that the part left waits in the prompt to be sent or cleared:
+/// aterm never takes it back (the safety review of 2026-09-30). What stands
+/// of it is ATERM'S (`left-typed:<why>`), never read as a person's draft —
+/// but only a person moves it, nothing of aterm's will (the re-review): a
+/// person's hold however it stands — alone and unsent, behind a box or no
+/// drawn composer, or with a person's keys among it (`left-typed:mixed`).
+/// NEGATIVE CONTROLS: a notice its fence
+/// refused whole typed nothing, and is tried again — nothing to do; a
+/// person's own draft is a person's hold.
+#[test]
+fn a_notice_stopped_part_way_names_the_part_left_in_the_prompt() {
+    for why in ["person", "changed", "deadline", "guard"] {
+        let wait = format!("announce-refused:cut-{why}");
+        assert_eq!(
+            claude_wait_words(&wait),
+            Some("aterm stopped its notice part-way, unsent"),
+            "{wait}"
+        );
+        let line = pending_with(&wait).waiting_line("09:00");
+        assert!(
+            line.contains("the part it left in its prompt waits to be sent or cleared there")
+                && !line.contains("nothing to do")
+                && !line.contains("take"),
+            "{wait}: {line}"
+        );
+    }
+    for why in ["unsent", "box", "no-composer"] {
+        let wait = format!("left-typed:{why}");
+        assert_eq!(
+            claude_wait_words(&wait),
+            Some("aterm's own words are still in its prompt, unsent"),
+            "{wait}"
+        );
+        let row = pending_with(&wait);
+        let line = row.waiting_line("09:00");
+        assert!(
+            line.contains("it moves once they are sent or cleared in its tab")
+                && !line.contains("take"),
+            "{wait}: {line}"
+        );
+        assert_eq!(wait_class(&wait), WaitClass::Person, "{wait}");
+        assert!(person_holds(&wait), "{wait}");
+    }
+    let mixed = "left-typed:mixed";
+    assert_eq!(
+        claude_wait_words(mixed),
+        Some("aterm's words are in its prompt, with a person's keys")
+    );
+    assert!(
+        pending_with(mixed)
+            .waiting_line("09:00")
+            .contains("that draft is sent or cleared")
+    );
+    assert_eq!(wait_class(mixed), WaitClass::Person);
+    assert!(person_holds(mixed));
+    // Negative controls.
+    let line = pending_with("announce-refused:changed").waiting_line("09:00");
+    assert!(line.contains("nothing to do"), "{line}");
+    assert_eq!(wait_class("draft"), WaitClass::Person);
+    assert_eq!(
+        claude_wait_words("draft"),
+        Some("a draft waits in its prompt")
+    );
+}
+
+/// A Codex lane's own words left unsent are a person's to clear: the user reads
+/// that the harness's text stands unsent and the move goes once it is cleared,
+/// never "sent" (a sent `/exit` ends Codex with no relaunch) and never lifted by
+/// `--now`, nor "nothing to do" while a goal is held paused. Negative controls:
+/// with a person's keys among it (`mixed`), their draft; a goal held with no
+/// words left, the goal's own "nothing to do".
+#[test]
+fn a_codex_lanes_own_words_left_unsent_are_a_person_to_clear() {
+    let row = |wait: &str| Row {
+        agent: upgrade::Agent::Codex,
+        wait: wait.to_string(),
+        ..pending(7 * 3_600)
+    };
+    let unsent = row("left-typed:unsent");
+    let line = unsent.waiting_line("09:00");
+    assert!(
+        line.contains("the harness's own text is still in its composer, unsent")
+            && line.contains("it moves once that text is cleared in its tab")
+            && !line.contains("beside a person's typing")
+            && !line.contains("sent or cleared"),
+        "{line}"
+    );
+    assert_eq!(wait_class("left-typed:unsent"), WaitClass::Person);
+    assert_ne!(unsent.remedy(NOW), Some(Remedy::Now));
+    let goal_held = |wait: &str| Row {
+        goal_held_since: NOW - 600,
+        ..row(wait)
+    };
+    let line = goal_held("left-typed:unsent").waiting_line("09:00");
+    assert!(
+        line.contains("it moves once that text is cleared in its tab")
+            && !line.contains("nothing to do"),
+        "{line}"
+    );
+    assert!(
+        goal_held("goal:paused")
+            .waiting_line("09:00")
+            .ends_with("nothing to do"),
+        "NEGATIVE CONTROL"
+    );
+    // Negative control.
+    let line = row("left-typed:mixed").waiting_line("09:00");
+    assert!(
+        line.contains("beside a person's typing") && line.contains("that draft is sent or cleared"),
+        "{line}"
+    );
+}
+
+/// aterm's own notice that its fence would not type is told as such: the row
+/// names aterm's refusal, how often and for how long, and the mark names the
+/// cause; a refusal standing `TELL_S` is told before six hours behind.
+/// `Upgrade now` is offered only where not already in force: under `--now` it
+/// would ask for the very notice aterm cannot type, so the row waits, and the
+/// word restarts the count (`St::new_round`). Negative controls: a refusal
+/// within `TELL_S` under six hours behind is no stall; no refusal counted
+/// keeps the old words; with no word in force `Upgrade now` is offered.
 #[test]
 fn a_notice_aterm_could_not_type_is_told_as_aterms_own() {
-    // 2026-09-28 14:50:50 PDT, and the look at 20:30.
+    // The word's instant, and a look hours later.
     let now_word: u64 = 1_790_632_250;
     let now = now_word + 20_350;
     let a = Row {
@@ -4607,7 +7261,7 @@ fn a_notice_aterm_could_not_type_is_told_as_aterms_own() {
         Some(Remedy::Waits),
         "the owner's --now is in force: pressing it again moves nothing"
     );
-    // NEGATIVE CONTROL: no word in force — Upgrade now is offered.
+    // Negative control: no word in force: `Upgrade now` is offered.
     let unasked = Row {
         request: Request::None,
         request_at: 0,
@@ -4621,10 +7275,15 @@ fn a_notice_aterm_could_not_type_is_told_as_aterms_own() {
         ),
         "{words}"
     );
-    let mark = a.badge(now).expect("marked");
+    // ATERM'S OWN FAILURE IS A RECORD, NEVER A MARK (the owner, 2026-09-28):
+    // the words above are the record's and `--status`'s; the tab's diamond,
+    // the menu-bar row and the notification are for an agent that is down.
+    assert_eq!(a.badge(now), None, "aterm's own failure marks no tab");
     assert!(
-        mark.ends_with("behind for more than 6h, aterm could not type its notice"),
-        "{mark}"
+        matches!(a.attention(now), Attention::Fault(ref n) if n.kind == "harness-stuck"
+            && n.why.contains("refused 3 times")),
+        "{:?}",
+        a.attention(now)
     );
     assert!(a.line(now).ends_with(" refused=3/5h39m"), "{}", a.line(now));
 
@@ -4637,11 +7296,19 @@ fn a_notice_aterm_could_not_type_is_told_as_aterms_own() {
     };
     assert!(young.refused_notice(now));
     assert_eq!(young.stall(now).as_deref(), Some("overdue"));
-    let mark = young.badge(now).expect("marked");
-    assert!(
-        mark.ends_with("upgrade stalled: aterm could not type its notice"),
-        "{mark}"
-    );
+    assert_eq!(young.badge(now), None);
+    assert!(matches!(
+        young.attention(now),
+        Attention::Fault(ref n) if n.kind == "harness-stuck"
+    ));
+    // The fault counts from the FIRST refusal of the streak, whatever the
+    // refusal's reason has been since (`changed`, then `yield`).
+    let switched = Row {
+        wait: "announce-refused:yield".to_string(),
+        wait_since: now - 60,
+        ..young.clone()
+    };
+    assert!(matches!(switched.attention(now), Attention::Fault(_)));
     // NEGATIVE CONTROLS: within TELL_S it is not told yet; nothing counted,
     // nothing told.
     let fresh = Row {
@@ -4649,6 +7316,7 @@ fn a_notice_aterm_could_not_type_is_told_as_aterms_own() {
         ..young.clone()
     };
     assert_eq!(fresh.stall(now), None);
+    assert_eq!(fresh.attention(now), Attention::Quiet);
     let uncounted = Row {
         refused: 0,
         refused_at: 0,
@@ -4656,10 +7324,9 @@ fn a_notice_aterm_could_not_type_is_told_as_aterms_own() {
     };
     assert_eq!(uncounted.stall(now), None);
 
-    // THE OWNER'S WORD STARTS THE COUNT OVER (`St::new_round`): the row as
-    // the word leaves it is no stall, so an `Upgrade now` pressed on it is
-    // not followed by the same row again.
-    let dir = scratch("refused-word");
+    // The user's word restarts the count (`St::new_round`): the row it leaves
+    // is no stall, so a pressed `Upgrade now` is not followed by the same row.
+    let dir = ScratchDir::new("upgrade-status", "refused-word");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let refused_st = St {
@@ -4675,23 +7342,17 @@ fn a_notice_aterm_could_not_type_is_told_as_aterms_own() {
         ..St::default()
     };
     save(&o, "aaa", &refused_st);
-    let row = ask(&o, TAB, Ask::Now).expect("the word lands");
+    let row = ask(&o, TAB, Ask::Now, false).expect("the word lands");
     assert_eq!((row.refused, row.refused_at), (0, 0), "{row:?}");
     assert_eq!(row.stall(now_s()), None, "no stall to put back");
     let written = load(&o, "aaa").expect("state");
     assert_eq!((written.refused, written.refused_at), (0, 0));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A ROUND RE-ARMED AFTER A GIVE-UP, ITS AGENT'S OWN WORK STILL HOLDING IT, IS
-/// A RECORD (2026-09-28, s-692e6 "Free disk space": every notice answered "not
-/// yet, my workflow still runs"; each re-armed round's pending stretch raised a
-/// fresh warn row — "Couldn't upgrade Claude yet, window 1, tab 2 · behind for
-/// 7 h" — that went again at its first notice, round after round). Until its
-/// next notice goes, the round waits on the same work its agent named: the
-/// upgrade working, a record, as the announced and resting rounds around it
-/// are. NEGATIVE CONTROLS: a first round waiting on the same work is a row, as
-/// ever; a re-armed round waiting on a person is a row; one whose notice aterm
+/// A round re-armed after a give-up, still held by its agent's own work, is a
+/// record until its next notice goes, like the announced and resting rounds
+/// around it. Negative controls: a first round waiting on the same work is a
+/// row; a re-armed round waiting on a person is a row; one whose notice aterm
 /// could not type past `TELL_S` is told.
 #[test]
 fn a_rearmed_round_its_agents_own_work_holds_is_a_record() {
@@ -4715,7 +7376,7 @@ fn a_rearmed_round_its_agents_own_work_holds_is_a_record() {
         ..rearmed("attended")
     };
     assert!(held.asks_on_its_own(NOW));
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     assert!(
         !pending_with("not-idle:shell").asks_on_its_own(NOW),
         "a first round"
@@ -4727,4 +7388,1533 @@ fn a_rearmed_round_its_agents_own_work_holds_is_a_record() {
         ..rearmed("announce-refused:changed")
     };
     assert!(!refused.asks_on_its_own(NOW), "aterm's own failure: told");
+}
+
+// ---------------------------------------------------------------- the second review (2026-09-29)
+
+/// A SESSION ASKED AGAIN AND AGAIN IS NEWS (the safety review of 2026-09-29):
+/// the digest read "a whole round declined" off the GIVE-UP that ends a round,
+/// and the backstop counted every ask as progress, so a session asked at the
+/// end of every run of its work never reached either and read quiet for a
+/// hundred days. A whole round is [`upgrade::MAX_ASKS`] declined notices, given
+/// up on or not. NEGATIVE CONTROLS: fewer asks in a young round, a day not yet
+/// behind, and no work under the agent stay quiet.
+#[test]
+fn a_session_asked_again_and_again_is_news() {
+    let day = 86_400;
+    let holders: Vec<HeldBy> = (0..3)
+        .map(|i| HeldBy {
+            pid: 4000 + i,
+            name: "zsh".into(),
+            since: NOW - 600,
+        })
+        .collect();
+    let asked = |asks: u32, behind: u64| Row {
+        session: "07422bc3-1be9-4875-9672-2eaf7b28aa21".into(),
+        tab: TAB.into(),
+        from: "2.1.283".into(),
+        to: "2.1.284".into(),
+        source: "managed".into(),
+        phase: Phase::Announced {
+            at_s: NOW - 60,
+            asks,
+        },
+        behind_since: NOW - behind,
+        minted_at: NOW - behind,
+        noticed_at: NOW - 60,
+        wait: "background".into(),
+        wait_since: NOW - 3_600,
+        own_work_at: NOW - 60,
+        held_by: holders.clone(),
+        ..Row::default()
+    };
+    // The reviewer's probe: the ninth ask of a hundred-day-old round.
+    for (asks, behind) in [
+        (9, 100 * day),
+        (6, 30 * day),
+        (upgrade::MAX_ASKS, 26 * 3_600),
+    ] {
+        match asked(asks, behind).attention(NOW) {
+            Attention::Digest(need) => assert_eq!(need.kind, "own-work", "{asks} asks"),
+            other => panic!("{asks} asks, {}s behind: {:?}", behind, other.level()),
+        }
+    }
+    // And asking again does not make it "progress": the backstop counts an ask
+    // past a round's own as none.
+    let row = Row {
+        wait: "box".into(),
+        held_by: Vec::new(),
+        own_work_at: 0,
+        ..asked(9, 100 * day)
+    };
+    assert!(
+        matches!(row.attention(NOW), Attention::Fault(need) if need.kind == "no-progress"),
+        "{:?}",
+        row.attention(NOW).level()
+    );
+    // NEGATIVE CONTROLS.
+    assert_eq!(
+        asked(upgrade::MAX_ASKS - 1, 30 * day).attention(NOW),
+        Attention::Quiet
+    );
+    assert_eq!(
+        asked(9, 20 * 3_600).attention(NOW),
+        Attention::Quiet,
+        "not yet a day"
+    );
+    // A person's box is a person's, however many notices were asked.
+    let boxed = Row {
+        wait: "box".into(),
+        held_by: Vec::new(),
+        own_work_at: 0,
+        ..asked(9, 100 * day)
+    };
+    assert!(
+        !matches!(boxed.attention(NOW), Attention::Digest(_)),
+        "a box is not the agent's work: {:?}",
+        boxed.attention(NOW).level()
+    );
+    // The same session after ONE give-up is news as it always was.
+    let gave_up = Row {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        streak_why: upgrade::GAVE_UP.to_string(),
+        stop_streak: 1,
+        wait: "failed".into(),
+        ..asked(9, 100 * day)
+    };
+    assert!(matches!(gave_up.attention(NOW), Attention::Digest(_)));
+}
+
+/// A RELAUNCHED AGENT THAT REACHES NO PROMPT IS A LOG LINE, THEN AN INTERRUPT
+/// (the safety review of 2026-09-29): the upgrade ended the owner's agent, it
+/// came back on a screen that is neither a box (the supervisor answers those
+/// within moments) nor idle, and for as long as it stood there was one Warn line
+/// in a log the owner does not read. The same fact as an agent that did not
+/// come back: only the owner can look at the tab. A fault line at
+/// [`RELAUNCH_STUCK_S`], the owner interrupted at [`RELAUNCH_INTERRUPT_S`]
+/// with the one action, and no interrupt for a relaunch that reached its
+/// prompt.
+#[test]
+fn a_relaunched_agent_that_reaches_no_prompt_is_a_log_line_then_an_interrupt() {
+    let relaunched = |age: u64| Row {
+        session: "07422bc3-1be9-4875-9672-2eaf7b28aa21".into(),
+        tab: TAB.into(),
+        from: "2.1.283".into(),
+        to: "2.1.284".into(),
+        phase: Phase::Relaunched { at_s: NOW - age },
+        behind_since: NOW - age - 600,
+        exited_at: NOW - age - 5,
+        ..Row::default()
+    };
+    let young = relaunched(RELAUNCH_STUCK_S - 1);
+    assert_eq!(young.attention(NOW), Attention::Quiet);
+    assert!(young.badge(NOW).is_none());
+    let stuck = relaunched(RELAUNCH_STUCK_S);
+    assert!(matches!(stuck.attention(NOW), Attention::Fault(n) if n.kind == "relaunch-stuck"));
+    assert!(
+        stuck.interrupt(NOW).is_none() && stuck.badge(NOW).is_none(),
+        "a log line first"
+    );
+    for age in [RELAUNCH_INTERRUPT_S, 3_600, 2 * 86_400] {
+        let row = relaunched(age);
+        let need = row
+            .interrupt(NOW)
+            .unwrap_or_else(|| panic!("{age} s: {:?}", row.attention(NOW).level()));
+        assert_eq!(need.kind, "relaunch-stuck");
+        assert_eq!(
+            need.why,
+            "It came back after the upgrade and has not reached a prompt"
+        );
+        assert_eq!(need.then, "Look at that tab and answer what it shows");
+        assert!(need.command.is_none());
+        assert_eq!(need.fingerprint, format!("relaunch-stuck/{TAB}"));
+        assert!(
+            row.badge(NOW)
+                .is_some_and(|b| b.len() <= 200 && b.ends_with(&need.then))
+        );
+    }
+    // NEGATIVE CONTROL: the owner's own word holds it, as it holds any.
+    let held = Row {
+        request: Request::Skip("2.1.284".into()),
+        ..relaunched(3_600)
+    };
+    assert_eq!(held.attention(NOW), Attention::Quiet);
+}
+
+/// LOOKS AT THE SAME WORK DO NOT CHANGE THE ROW (the safety review of
+/// 2026-09-29, against the plan's claim that rows are re-sent only when a class
+/// changes): the record stamped `own_work_at` at every look, the row carried
+/// the stamp and compared it, and a tab whose work held the move sent the
+/// window a summary — and woke its GUI thread — at every look, about a minute
+/// at a break. The stamp is renewed at most every quarter of the hold it
+/// feeds ([`OWN_WORK_RESTAMP_S`]).
+#[test]
+fn looks_at_the_same_work_do_not_change_the_row() {
+    let t0 = 1_790_000_000;
+    let mut st = St {
+        phase: Phase::Announced { at_s: t0, asks: 1 },
+        from: "2.1.283".into(),
+        to: "2.1.284".into(),
+        tab: TAB.into(),
+        salt: t0,
+        pending_since: t0,
+        ..St::default()
+    };
+    let held = |now: u64| {
+        vec![upgrade::Held {
+            pid: 4000,
+            name: "zsh".into(),
+            age_s: now - t0,
+            command: String::new(),
+        }]
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    for minute in 0..30 {
+        let now = t0 + 60 * minute;
+        st.note_step("wait:background", "busy", now);
+        st.note_held("wait:background", &held(now), now);
+        rows.push(Row::of("s", &st, now));
+    }
+    let changes = rows.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    // Thirty looks, a minute apart, over half an hour: the stamp is renewed
+    // once (at the restamp interval), not at every look.
+    assert!(changes <= 2, "{changes} changes over 30 looks");
+    assert!(changes >= 1 || rows[0] == rows[29]);
+    // NEGATIVE CONTROL: a look a restamp interval later is a changed row (the
+    // remembered work must not run out while it is seen).
+    let later = t0 + 60 * 30 + super::super::OWN_WORK_RESTAMP_S;
+    st.note_step("wait:background", "busy", later);
+    st.note_held("wait:background", &held(later), later);
+    assert_eq!(st.own_work_at, later);
+}
+
+/// A NOTICE A PERSON OR A PEER REFUSED IS NOT ATERM'S TO FIX (the safety review
+/// of 2026-09-29): `announce-refused:held` (another driver's lease),
+/// `:draft` and `:box` are the fence telling the truth, and for 90 minutes they
+/// read as a Fault naming aterm's screen. A refusal that names a person's
+/// state stands until they end it: the day's backstop, and a draft is news at a
+/// day as any draft is. NEGATIVE CONTROL: the refusal aterm's own screen causes
+/// (`changed`) is aterm's, at 90 minutes.
+#[test]
+fn a_refusal_a_person_or_a_peer_caused_is_not_blamed_on_aterm() {
+    let refused = |why: &str, waited: u64| Row {
+        session: "07422bc3-1be9-4875-9672-2eaf7b28aa21".into(),
+        tab: TAB.into(),
+        from: "2.1.283".into(),
+        to: "2.1.284".into(),
+        phase: Phase::Pending,
+        behind_since: NOW - waited - 3_600,
+        minted_at: NOW - waited - 3_600,
+        wait: format!("announce-refused:{why}"),
+        wait_since: NOW - waited,
+        refused: 5,
+        refused_at: NOW - waited,
+        ..Row::default()
+    };
+    for why in ["held", "draft", "box"] {
+        let row = refused(why, 2 * 3_600);
+        assert_eq!(row.attention(NOW), Attention::Quiet, "{why} for 2 h");
+        assert!(row.interrupt(NOW).is_none());
+    }
+    // A day on: a peer's lease or a box is a backstop line; a draft is news.
+    for why in ["held", "box"] {
+        let row = refused(why, 2 * 86_400);
+        assert!(
+            matches!(row.attention(NOW), Attention::Fault(n) if n.kind == "no-progress"),
+            "{why} for 2 days: {:?}",
+            row.attention(NOW).level()
+        );
+    }
+    assert!(
+        matches!(refused("draft", 2 * 86_400).attention(NOW), Attention::Digest(n) if n.kind == "typed-draft")
+    );
+    // NEGATIVE CONTROL: aterm's own screen refusing (`changed`) is aterm's fault.
+    let own = refused("changed", 2 * 3_600);
+    assert!(
+        matches!(own.attention(NOW), Attention::Fault(n) if n.kind == "harness-stuck"),
+        "{:?}",
+        own.attention(NOW).level()
+    );
+}
+
+/// THE MANUAL RESUME KEEPS THE LAUNCH'S FLAGS UNDER EVERY SHAPE OF THE RELAUNCH LINE
+/// the harness itself builds ([`upgrade::relaunch_line_env`]): with and without the
+/// survey export, with and without the subshell's `cd`, under zsh, bash and fish
+/// (which has no `cd` form). A change to the line's shape that hides the program from
+/// [`resume_command`] fails here, not on the owner's tab 1.
+///
+/// AND IT IS THE ONE LINE (2026-10-02): the one every other place tells for the
+/// launch ([`crate::harness::upgrade_drive::resume_command_kept`]), each word quoted
+/// as it quotes it — read by a rule of its own, a 1M model's `[1m]` or a directory
+/// with a space dropped every flag — and the whole of it on the tab's mark, within its
+/// 200 bytes. NEGATIVE CONTROL: a quote in a flag's value, which fish writes with a
+/// backslash no blind read of the line takes exactly, gives the bare line under fish.
+#[test]
+fn the_manual_resume_keeps_its_flags_under_every_line_the_harness_builds() {
+    let session = "07422bc3-1be9-4875-9672-2eaf7b28aa21";
+    let exe = std::path::Path::new("/Users//x/Library/Application Support/aterm/pkg/agents/claude");
+    let survey = [("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1")];
+    let heal = std::path::Path::new("/Users//x/.aterm/shell.d/00-atpkg.zsh");
+    let mut built = 0;
+    for flags in [
+        &["--dangerously-skip-permissions"][..],
+        &[
+            "--dangerously-skip-permissions",
+            "--model",
+            "claude-opus-5-5[1m]",
+        ],
+        &[
+            "--permission-mode",
+            "bypassPermissions",
+            "--add-dir",
+            "/Users//me/My Project",
+        ],
+        &["--append-system-prompt", "it's"],
+    ] {
+        let launch: Vec<String> = std::iter::once("claude")
+            .chain(flags.iter().copied())
+            .map(ToString::to_string)
+            .collect();
+        let told = crate::harness::upgrade_drive::resume_command_kept(None, &launch, session)
+            .expect("a line");
+        assert_ne!(told, format!("claude --resume {session}"), "{flags:?}");
+        let args: Vec<String> = flags
+            .iter()
+            .copied()
+            .chain(["--resume", session])
+            .map(ToString::to_string)
+            .collect();
+        for dialect in [
+            upgrade::Dialect::Zsh,
+            upgrade::Dialect::Bash,
+            upgrade::Dialect::Fish,
+        ] {
+            let want =
+                if dialect == upgrade::Dialect::Fish && flags.iter().any(|f| f.contains('\'')) {
+                    format!("claude --resume {session}")
+                } else {
+                    told.clone()
+                };
+            for env in [&survey[..], &[]] {
+                for cd in [None, Some("/Users//x/work tree")] {
+                    for heal in [None, Some(heal)] {
+                        let Ok(line) =
+                            upgrade::relaunch_line_env(dialect, heal, cd, env, exe, &args)
+                        else {
+                            assert!(
+                                dialect == upgrade::Dialect::Fish && cd.is_some(),
+                                "only fish's cd is refused"
+                            );
+                            continue;
+                        };
+                        built += 1;
+                        let row = Row {
+                            session: session.to_string(),
+                            tab: TAB.into(),
+                            from: "2.1.283".into(),
+                            to: "2.1.284".into(),
+                            phase: Phase::Failed("stale-exit".to_string()),
+                            exited_at: NOW - 600,
+                            line: line.clone(),
+                            ..Row::default()
+                        };
+                        let need = row.interrupt(NOW).expect("agent-down");
+                        assert_eq!(need.command.as_deref(), Some(&*want), "{line}");
+                        let mark = row.badge(NOW).expect("marked");
+                        assert!(mark.len() <= 200 && mark.ends_with(&want), "{mark}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(built >= 4 * 18, "the matrix built {built} lines");
+}
+
+/// A SESSION THE HARNESS RELAUNCHED UNDER A LOGIN OF ITS CHOOSING IS RESUMED
+/// BY HAND UNDER THE SHELL'S, AND THE REMEDY SAYS SO IN ONE CLAUSE (the
+/// accounts design, §6; `resume::SHELL_LOGIN_CLAUSE` has the reasons): the
+/// command carries the launch's flags and NO environment — a login directory
+/// would be the first thing a 200-byte mark drops — and the sentence that
+/// hands it over names which login it runs under. Read off the record's own
+/// relaunch line under every shape the harness builds, a directory with a
+/// space and an apostrophe and the empty value (the default login, named)
+/// alike; each sentence still fits its cap. NEGATIVE CONTROL: a line that
+/// carries no login — every line of a machine with no roster — leaves each
+/// sentence exactly as it was.
+#[test]
+fn a_resume_by_hand_says_which_login_it_runs_under() {
+    use crate::harness::accounts::LOGIN_ENV;
+    use crate::harness::resume::SHELL_LOGIN_CLAUSE;
+    let session = "07422bc3-1be9-4875-9672-2eaf7b28aa21";
+    let dir = "/tmp/aterm state/logins/owner's work-2";
+    let exe = std::path::Path::new("/tmp/aterm state/pkg/agents/claude");
+    let args: Vec<String> = ["--dangerously-skip-permissions", "--resume", session]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let survey = ("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1");
+    let heal = std::path::Path::new("/tmp/aterm state/shell.d/00-atpkg.zsh");
+    let want = format!("claude --dangerously-skip-permissions --resume {session}");
+    let down = |why: &str, line: &str| Row {
+        session: session.to_string(),
+        tab: TAB.into(),
+        from: "2.1.283".into(),
+        to: "2.1.284".into(),
+        phase: Phase::Failed(why.to_string()),
+        exited_at: NOW - 600,
+        line: line.to_string(),
+        ..Row::default()
+    };
+    let mut built = 0;
+    for dialect in [upgrade::Dialect::Zsh, upgrade::Dialect::Bash] {
+        for login in [Some(dir), Some(""), None] {
+            for cd in [None, Some("/tmp/work tree")] {
+                for heal in [None, Some(heal)] {
+                    let env: Vec<(&str, &str)> = login
+                        .map(|value| (LOGIN_ENV, value))
+                        .into_iter()
+                        .chain([survey])
+                        .collect();
+                    let line = upgrade::relaunch_line_env(dialect, heal, cd, &env, exe, &args)
+                        .expect("a line");
+                    built += 1;
+                    assert_eq!(resume_login(&line).as_deref(), login, "{dialect:?}: {line}");
+                    for why in ["stale-exit", "shell-gone"] {
+                        let need = down(why, &line).interrupt(NOW).expect("agent-down");
+                        assert_eq!(need.command.as_deref(), Some(&*want), "{line}");
+                        assert_eq!(
+                            need.then.ends_with(SHELL_LOGIN_CLAUSE),
+                            login.is_some(),
+                            "{why}: {} <- {line}",
+                            need.then
+                        );
+                        assert!(need.then.chars().count() <= NEED_THEN_MAX, "{}", need.then);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(built, 24);
+    // The sentences, whole: the clause is the only difference.
+    let moved = format!(" {LOGIN_ENV}='' '/opt/claude' '--resume' '{session}'");
+    let plain = format!(" '/opt/claude' '--resume' '{session}'");
+    for (why, sentence) in [
+        ("stale-exit", "Resume it in that tab with this command"),
+        (
+            "shell-gone",
+            "Open a new tab and resume it there with this command",
+        ),
+    ] {
+        assert_eq!(
+            down(why, &moved).interrupt(NOW).expect("agent-down").then,
+            format!("{sentence}, under that shell's own Claude login")
+        );
+        assert_eq!(
+            down(why, &plain).interrupt(NOW).expect("agent-down").then,
+            sentence
+        );
+    }
+    // A variable that only LOOKS like the login — a flag's value, another
+    // name — is none; nor is one on an earlier command of the line.
+    for line in [
+        format!(" '/opt/claude' '--append-system-prompt' '{LOGIN_ENV}=/x' '--resume' '{session}'"),
+        format!(" CLAUDE_CONFIG_DIR='/x' '/opt/claude' '--resume' '{session}'"),
+        format!(" {LOGIN_ENV}=/x true; '/opt/claude' '--resume' '{session}'"),
+        String::new(),
+    ] {
+        assert_eq!(resume_login(&line), None, "{line}");
+    }
+    // A Codex has no such login, whatever its record's line holds.
+    let codex = Row {
+        agent: upgrade::Agent::Codex,
+        ..down("stale-exit", &moved)
+    };
+    assert!(
+        !codex
+            .interrupt(NOW)
+            .expect("agent-down")
+            .then
+            .ends_with(SHELL_LOGIN_CLAUSE)
+    );
+    assert_eq!(
+        crate::harness::resume::login_clause(Some("")),
+        SHELL_LOGIN_CLAUSE
+    );
+    assert_eq!(crate::harness::resume::login_clause(None), "");
+}
+
+/// THE INTERRUPT'S ACTION FOLLOWS FROM WHY THE AGENT COULD NOT BE BROUGHT BACK,
+/// AND CARRIES THE LAUNCH'S OWN FLAGS (the safety review of 2026-09-29): the one
+/// sentence was "Type claude --resume <id> in that tab" for every reason — for a
+/// tab whose shell is gone there is no prompt to type at, for a Codex whose
+/// rollout is gone nothing to resume, and for tab 1 (started with
+/// `--dangerously-skip-permissions`, which the harness's own relaunch line
+/// keeps) it brought the orchestrator back in another permission mode. The
+/// command is the record's own planned line's flags and the conversation, in
+/// `Need::command`, never cut into the capped sentence. NEGATIVE CONTROLS: a
+/// line whose flags would not leave the mark its head room, another program's,
+/// one with no `--resume`, or no line at all carries none.
+#[test]
+fn the_interrupts_action_follows_its_reason_and_keeps_the_launchs_flags() {
+    let session = "07422bc3-1be9-4875-9672-2eaf7b28aa21";
+    let line = ". '/Users//x/.aterm/shell.d/00-atpkg.zsh'; rehash; '/Users//x/Library/Application Support/aterm/pkg/agents/claude' '--dangerously-skip-permissions' '--resume' '07422bc3-1be9-4875-9672-2eaf7b28aa21'";
+    let down = |why: &str, line: &str| Row {
+        session: session.to_string(),
+        tab: TAB.into(),
+        from: "2.1.283".into(),
+        to: "2.1.284".into(),
+        phase: Phase::Failed(why.to_string()),
+        exited_at: NOW - 600,
+        line: line.to_string(),
+        ..Row::default()
+    };
+    let need = |row: &Row| row.interrupt(NOW).expect("agent-down");
+    // The flags are kept.
+    let n = need(&down("stale-exit", line));
+    assert_eq!(n.then, "Resume it in that tab with this command");
+    assert_eq!(
+        n.command.as_deref(),
+        Some(&*format!(
+            "claude --dangerously-skip-permissions --resume {session}"
+        ))
+    );
+    // Every after-exit reason names its own action.
+    assert_eq!(
+        need(&down("shell-gone", line)).then,
+        "Open a new tab and resume it there with this command"
+    );
+    for why in ["no-resume", "relaunch-refused", "exited-before-continuing"] {
+        assert_eq!(
+            need(&down(why, line)).then,
+            "Resume it in that tab with this command",
+            "{why}"
+        );
+    }
+    // The mark says the command whole, whatever the head has to give up.
+    let mark = down("stale-exit", line).badge(NOW).expect("marked");
+    assert!(
+        mark.len() <= 200
+            && mark.ends_with(&format!(
+                "claude --dangerously-skip-permissions --resume {session}"
+            )),
+        "{mark}"
+    );
+    // THE WHOLE LINE — its sentence, the login clause and the flags — IS
+    // BUDGETED AGAINST THE MARK, AND THE PERMISSION MODE IS THE LAST THING IT
+    // GIVES UP (round three of the joint audit of 2026-10-01): a fixed flag
+    // allowance blind to the sentence beside it cut the conversation id off
+    // a mark whose sentence carries the login clause, and past the allowance
+    // every flag went at once, `--dangerously-skip-permissions` with them.
+    let launched = |flags: &str, login: bool| {
+        let export = if login {
+            format!(
+                "{}='/Users//x/.aterm/accounts/work' ",
+                crate::harness::accounts::LOGIN_ENV
+            )
+        } else {
+            String::new()
+        };
+        format!(". '/x/rc.zsh'; rehash; {export}'/x/claude' {flags} '--resume' '{session}'")
+    };
+    let skip = format!("claude --dangerously-skip-permissions --resume {session}");
+    let plan = format!(
+        "claude --allow-dangerously-skip-permissions --permission-mode plan --resume {session}"
+    );
+    for (flags, login, why, then, want) in [
+        // 78 bytes of flags under the login clause: the mode alone.
+        (
+            "'--dangerously-skip-permissions' '--model' 'claude-opus-5-5[1m]' '--add-dir' '/x/src'",
+            true,
+            "stale-exit",
+            "Resume it in that tab with this command, under that shell's own Claude login",
+            skip.as_str(),
+        ),
+        (
+            "'--dangerously-skip-permissions' '--model' 'claude-opus-5-5[1m]' '--add-dir' '/x/src'",
+            true,
+            "shell-gone",
+            "Open a new tab and resume it there with this command, under that shell's own Claude \
+             login",
+            skip.as_str(),
+        ),
+        // Past the allowance, no login: the mode alone, never the bare line.
+        (
+            "'--dangerously-skip-permissions' '--model' 'claude-opus-5-5[1m]' '--add-dir' \
+             '/Users//x/src'",
+            false,
+            "stale-exit",
+            "Resume it in that tab with this command",
+            skip.as_str(),
+        ),
+        // A mode the mark holds only without the login clause: the clause
+        // gives way first.
+        (
+            "'--allow-dangerously-skip-permissions' '--permission-mode' 'plan' \
+             '--append-system-prompt' 'You orchestrate this repo'",
+            true,
+            "shell-gone",
+            "Open a new tab and resume it there with this command",
+            plan.as_str(),
+        ),
+    ] {
+        let row = down(why, &launched(flags, login));
+        let n = need(&row);
+        assert_eq!(
+            (n.then.as_str(), n.command.as_deref()),
+            (then, Some(want)),
+            "{why}: {flags}"
+        );
+        let mark = row.badge(NOW).expect("marked");
+        assert!(mark.len() <= 200 && mark.ends_with(want), "{why}: {mark}");
+    }
+    // Codex: `codex resume`, and none where the rollout is gone.
+    let codex = |why: &str| Row {
+        agent: upgrade::Agent::Codex,
+        ..down(why, "")
+    };
+    assert_eq!(
+        need(&codex("no-resume-hint")).command.as_deref(),
+        Some("codex resume")
+    );
+    let gone = need(&codex("no-rollout"));
+    assert_eq!(
+        (gone.then.as_str(), gone.command),
+        ("Start Codex again in that tab", None)
+    );
+    // NEGATIVE CONTROLS.
+    let long = format!(
+        ". '/x/rc.zsh'; rehash; '/x/claude' '--model' '{}' '--resume' 'id'",
+        "m".repeat(90)
+    );
+    for odd in [
+        "",
+        long.as_str(),
+        ". '/x/rc.zsh'; rehash; '/x/other' '--flag' '--resume' 'id'",
+        ". '/x/rc.zsh'; rehash; '/x/claude' '--flag'",
+    ] {
+        assert_eq!(
+            need(&down("stale-exit", odd)).command.as_deref(),
+            Some(&*format!("claude --resume {session}")),
+            "{odd:?}"
+        );
+    }
+}
+
+/// THE OWN-WORK LINE NAMES WHAT KEEPS THE AGENT BUSY (the second review of
+/// 2026-09-29: for tab 1 "16 programs under it" was true and not the whole
+/// truth — a `/goal` re-prompts Claude at every turn end, its status stays
+/// busy, and stopping the programs alone does not open the restart's gate).
+#[test]
+fn the_own_work_line_names_the_goal_the_programs_and_the_break() {
+    let day = 86_400;
+    let holders = |n: u32| -> Vec<HeldBy> {
+        (0..n)
+            .map(|i| HeldBy {
+                pid: 4000 + i,
+                name: "zsh".into(),
+                since: NOW - 600,
+            })
+            .collect()
+    };
+    let round = |wait: &str, held: u32, goal: bool| Row {
+        session: "07422bc3-1be9-4875-9672-2eaf7b28aa21".into(),
+        tab: TAB.into(),
+        from: "2.1.283".into(),
+        to: "2.1.284".into(),
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        streak_why: upgrade::GAVE_UP.to_string(),
+        stop_streak: 2,
+        behind_since: NOW - 2 * day,
+        minted_at: NOW - 2 * day,
+        wait: wait.into(),
+        wait_since: NOW - 3_600,
+        own_work_at: NOW - 60,
+        held_by: holders(held),
+        goal,
+        ..Row::default()
+    };
+    let words = |row: &Row| match row.attention(NOW) {
+        Attention::Digest(n) => {
+            assert_eq!(n.kind, "own-work");
+            assert!(
+                n.why.chars().count() <= NEED_WHY_MAX && n.then.chars().count() <= NEED_THEN_MAX
+            );
+            (n.why, n.then)
+        }
+        other => panic!("{:?}", other.level()),
+    };
+    assert_eq!(
+        words(&round("failed", 16, true)),
+        (
+            "aterm never ends running work: 16 programs run under it and its /goal is active"
+                .to_string(),
+            "End or pause its /goal, or stop that work, in the tab when it suits you".to_string()
+        )
+    );
+    assert_eq!(
+        words(&round("failed", 1, true)).0,
+        "aterm never ends running work: 1 program runs under it and its /goal is active"
+    );
+    assert_eq!(
+        words(&round("failed", 0, true)).0,
+        "aterm never ends running work, and its /goal is still active"
+    );
+    assert_eq!(
+        words(&round("failed", 16, false)),
+        (
+            "aterm never ends running work, and 16 programs under it are still running".to_string(),
+            "Stop that work in the tab when it suits you".to_string()
+        )
+    );
+    assert_eq!(
+        words(&round("background", 0, false)).0,
+        "aterm never ends running work, and it is waiting on background work of its own"
+    );
+    assert_eq!(
+        words(&round("failed", 0, false)),
+        (
+            "aterm never ends running work, and it is busy with work of its own".to_string(),
+            "Ask it to wrap up in the tab when it suits you".to_string()
+        )
+    );
+}
+
+/// A CODEX GOAL THE MOVE PAUSED AND COULD NOT RESUME IS THE UPGRADE'S OWN DAMAGE
+/// (the owner's decision of 2026-09-28, ruling 381: aterm never leaves the goal
+/// paused): an interrupt with the one hand step in the tab, whatever became of the
+/// move and whatever the owner's word on it says. Its thread fallen into a sandbox
+/// names the relaunch first. NEGATIVE CONTROL: with nothing left paused, the same
+/// finished move is quiet.
+#[test]
+fn a_codex_goal_left_paused_is_an_interrupt_whatever_the_owners_word_says() {
+    let paused = Row {
+        agent: upgrade::Agent::Codex,
+        phase: Phase::Done,
+        done_at: NOW - 60,
+        goal_left_since: NOW - 600,
+        ..pending(3_600)
+    };
+    let Attention::Interrupt(need) = paused.attention(NOW) else {
+        panic!("{:?}", paused.attention(NOW));
+    };
+    assert_eq!(need.kind, "goal-paused");
+    assert_eq!(need.then, "Type /goal resume in that tab");
+    assert_eq!(need.since, NOW - 600);
+    assert!(
+        paused
+            .badge(NOW)
+            .is_some_and(|m| m.contains("/goal resume")),
+        "{:?}",
+        paused.badge(NOW)
+    );
+    // The owner's `--skip` or `--defer` does not reach a paused goal.
+    for request in [
+        Request::Skip("2.1.282".to_string()),
+        Request::DeferUntil(NOW + 3_600),
+    ] {
+        let held = Row {
+            request,
+            ..paused.clone()
+        };
+        assert!(held.interrupt(NOW).is_some(), "{:?}", held.request);
+    }
+    let sandboxed = Row {
+        wait: "goal-sandboxed".to_string(),
+        ..paused.clone()
+    };
+    let need = sandboxed.interrupt(NOW).expect("an interrupt");
+    assert_eq!(need.title, "Goal left paused");
+    assert!(
+        need.then.starts_with("Quit Codex in that tab"),
+        "{}",
+        need.then
+    );
+    for need in [paused.interrupt(NOW), sandboxed.interrupt(NOW)]
+        .into_iter()
+        .flatten()
+    {
+        assert!(need.why.chars().count() <= NEED_WHY_MAX, "{}", need.why);
+        assert!(need.then.chars().count() <= NEED_THEN_MAX, "{}", need.then);
+        let words = format!("{} {}", need.why, need.then).to_lowercase();
+        for banned in ["restart", "relaunch", "reopen", "next launch", "reboot"] {
+            assert!(!words.contains(banned), "{banned}: {words}");
+        }
+    }
+    let resumed = Row {
+        goal_left_since: 0,
+        ..paused
+    };
+    assert_eq!(resumed.attention(NOW), Attention::Quiet);
+}
+
+/// NO UPGRADE STUCK FOREVER, bound to the reducer and the view (design record
+/// 2026-09-28, §4.4): the Tier-1 binds of `HarnessUpgradeProgress`.
+#[path = "upgrade_progress_tests.rs"]
+mod progress;
+
+/// A round re-armed after a give-up is its rest until a look says otherwise:
+/// the re-arm clears the recorded wait and the processes under the agent, so
+/// the round's first look (nothing recorded, a person at the tab, a draft)
+/// must not read as a new cause; each is asking on its own, no mark
+/// (`rest_carries_on`). Negative controls: the same words in a first round are
+/// a row; a person's hold standing a whole re-ask is a row; a wait `Upgrade
+/// now` moves is a row (`a_rearmed_round_its_agents_own_work_holds_is_a_record`).
+#[test]
+fn a_rearmed_rounds_first_looks_are_still_its_rest() {
+    let rearmed = |wait: &str, since: u64| Row {
+        last_stop: upgrade::GAVE_UP.to_string(),
+        wait_since: since,
+        ..pending_with(wait)
+    };
+    for (wait, since) in [("", 0), ("attended", NOW - 30), ("draft", NOW - 60)] {
+        let row = rearmed(wait, since);
+        assert_eq!(row.stall(NOW).as_deref(), Some("overdue"), "{wait:?}");
+        assert!(row.asks_on_its_own(NOW), "{wait:?}: its rest, a record");
+        assert_eq!(row.badge(NOW), None, "{wait:?}: no mark");
+    }
+    // Negative controls.
+    for wait in ["", "attended", "draft"] {
+        assert!(
+            !pending_with(wait).asks_on_its_own(NOW),
+            "{wait:?}: a first round is a row"
+        );
+    }
+    let stood = rearmed("draft", NOW - upgrade::REASK_S);
+    assert!(!stood.asks_on_its_own(NOW), "a draft that stood: a row");
+    // The tab is marked for an interrupt only (owner rules, 2026-09-28): a
+    // draft that stood is not the rest, but a wait is no mark.
+    assert_eq!(stood.badge(NOW), None, "no mark for a wait");
+    let queued = rearmed("queued", NOW - 60);
+    assert!(
+        !queued.asks_on_its_own(NOW),
+        "`Upgrade now` moves it: a row"
+    );
+}
+
+/// What time alone changes reaches the window: the host sends a summary only
+/// when it differs, so a time-driven change must change the row at an instant
+/// the view names: a row stall reaches its next age word (`behind for 7 h` →
+/// `8 h`), a re-armed round's draft standing a whole re-ask stops being its
+/// rest, and the move clock turns a record into a row. A record whose words
+/// state its age (shown in Settings ▸ Messages) reaches its next word too.
+/// Negative control: read at the same second nothing differs (and
+/// `a_stall_whose_words_carry_no_age_never_wakes_for_it`).
+#[test]
+fn what_time_alone_changes_is_a_changed_row_at_a_named_instant() {
+    let read = |mut row: Row, now: u64| {
+        row.read_at(now);
+        row
+    };
+    // An overdue row's age, by the hour past its first hour.
+    let overdue = read(pending(7 * 3_600), NOW);
+    assert!(!overdue.on_its_own);
+    assert_eq!(overdue.behind_said.as_deref(), Some("7 h"));
+    assert_eq!(
+        next_change(std::slice::from_ref(&overdue), NOW),
+        Some(NOW + 3_600)
+    );
+    assert_eq!(read(pending(7 * 3_600), NOW), overdue, "the same second");
+    let later = read(pending(7 * 3_600), NOW + 3_600);
+    assert_eq!(later.behind_said.as_deref(), Some("8 h"));
+    assert_ne!(later, overdue, "an hour on: sent again");
+    // A record states its age too: the next hour, never a minute, and read an
+    // hour on it differs.
+    let rearmed = |wait: &str| Row {
+        last_stop: upgrade::GAVE_UP.to_string(),
+        wait_since: NOW - 60,
+        ..pending_with(wait)
+    };
+    let resting = read(rearmed("not-idle:shell"), NOW);
+    assert!(resting.on_its_own);
+    assert!(
+        resting
+            .stall_words(NOW)
+            .is_some_and(|w| w.starts_with("behind for 7 h")),
+        "{:?}",
+        resting.stall_words(NOW)
+    );
+    assert_eq!(resting.behind_said.as_deref(), Some("7 h"));
+    assert_eq!(
+        next_change(std::slice::from_ref(&resting), NOW),
+        Some(NOW + 3_600)
+    );
+    let resting_later = read(rearmed("not-idle:shell"), NOW + 3_600);
+    assert!(resting_later.on_its_own, "still a record an hour on");
+    assert_eq!(resting_later.behind_said.as_deref(), Some("8 h"));
+    assert_ne!(resting_later, resting, "an hour on: sent again");
+    // Half an hour on, the next word is still the hour's, never a minute's.
+    let half = NOW + 1_800;
+    assert_eq!(
+        next_change(
+            std::slice::from_ref(&read(rearmed("not-idle:shell"), half)),
+            half
+        ),
+        Some(NOW + 3_600)
+    );
+    // The move clock: a record turned a row is a changed row.
+    let past = read(rearmed("not-idle:shell"), NOW - 7 * 3_600 + MOVE_BUDGET_S);
+    assert!(!past.on_its_own);
+    assert_ne!(past, resting);
+    // A re-armed round's draft that has stood.
+    let draft = read(rearmed("draft"), NOW);
+    assert!(draft.on_its_own, "a draft just typed: its rest");
+    let stands = NOW - 60 + upgrade::REASK_S;
+    assert_eq!(next_change(std::slice::from_ref(&draft), NOW), Some(stands));
+    let stood = read(rearmed("draft"), stands);
+    assert!(!stood.on_its_own, "a hold that stood: a row");
+    assert_ne!(stood, draft);
+}
+
+/// Only a row whose words state its age wakes for it: under an hour
+/// [`behind_words`] counts minutes, so a young held-back, failed, refused,
+/// stuck or blocked row, whose words ([`stall_reason`]) carry no age, must not
+/// wake the host every minute. Only `overdue` says `behind for …`
+/// (`Row::age_said`). Negative control: a 7 h overdue row wakes at the next
+/// hour.
+#[test]
+fn a_stall_whose_words_carry_no_age_never_wakes_for_it() {
+    let read = |mut row: Row, now: u64| {
+        row.read_at(now);
+        row
+    };
+    let held = Row {
+        wait: "terminal:vim".to_string(),
+        ..pending(5 * 60)
+    };
+    let refused = Row {
+        phase: Phase::Failed("not-a-shell-job".to_string()),
+        ..pending(5 * 60)
+    };
+    for (what, row) in [("held-back", held), ("refused", refused)] {
+        let first = read(row.clone(), NOW);
+        let stall = first.stalled.clone().expect("a stall");
+        assert_ne!(stall, "overdue", "{what}");
+        assert!(!first.on_its_own, "{what}: a row");
+        assert!(
+            !first
+                .stall_words(NOW)
+                .unwrap_or_default()
+                .contains("behind for"),
+            "{what}: its words carry no age"
+        );
+        assert_eq!(first.behind_said, None, "{what}");
+        assert_eq!(first.age_said(NOW), None, "{what}");
+        let wake = next_change(std::slice::from_ref(&first), NOW);
+        assert!(
+            wake.is_none_or(|t| t >= NOW + 3_600),
+            "{what}: no minute wake, got {wake:?}"
+        );
+        assert_eq!(
+            read(row, NOW + 60),
+            first,
+            "{what}: a minute on, nothing to send"
+        );
+    }
+    // Negative control: an overdue row states its age and wakes for it.
+    let overdue = read(pending(7 * 3_600), NOW);
+    assert_eq!(overdue.stalled.as_deref(), Some("overdue"));
+    assert_eq!(overdue.behind_said.as_deref(), Some("7 h"));
+    assert_eq!(
+        next_change(std::slice::from_ref(&overdue), NOW),
+        Some(NOW + 3_600)
+    );
+    assert_ne!(read(pending(7 * 3_600), NOW + 3_600), overdue);
+}
+
+/// AN ANNOUNCED ROUND UNDER THE QUIET FLOW IS JUDGED AS A PENDING ONE (the
+/// review of 2026-09-30): nothing asks it again there — the quiet step
+/// answers a round an older aterm announced, and never re-asks nor gives up
+/// — so its busy agent's stall reads `overdue` at six hours behind (the
+/// column and `--status`), never "asked again every half hour"; either way
+/// it is a record, not a mark (the owner's rule: a timer is not an
+/// inability).
+/// The flow reaches the row from the reader's options (`upgrade_ask`,
+/// [`rows`]). NEGATIVE CONTROLS: the same round under the ask flow asks on
+/// its own, a record with no mark; a usage limit is a record in either flow.
+#[test]
+fn an_announced_round_under_the_quiet_flow_reads_overdue_at_six_hours() {
+    let announced = |quiet: bool| Row {
+        phase: Phase::Announced {
+            at_s: NOW - 600,
+            asks: 2,
+        },
+        quiet,
+        ..pending(STALLED_AFTER_S + 3_600)
+    };
+    let quiet = announced(true);
+    assert_eq!(quiet.stall(NOW).as_deref(), Some("overdue"));
+    assert!(!quiet.asks_on_its_own(NOW), "nothing asks it again");
+    assert_eq!(quiet.badge(NOW), None, "a record, never a mark");
+    assert!(matches!(quiet.attention(NOW), Attention::Quiet));
+    assert!(quiet.line(NOW).contains(" stalled=overdue "));
+    let mut sent = quiet.clone();
+    sent.read_at(NOW);
+    assert!(!sent.on_its_own, "sent as a row");
+    // Negative controls.
+    let asked = announced(false);
+    assert!(asked.asks_on_its_own(NOW), "the ask flow asks again");
+    assert_eq!(asked.badge(NOW), None);
+    for quiet in [true, false] {
+        let limited = Row {
+            wait: "limited".into(),
+            ..announced(quiet)
+        };
+        assert!(limited.asks_on_its_own(NOW), "a limit: {quiet}");
+        assert_eq!(limited.badge(NOW), None, "{quiet}");
+    }
+    // The flow, from the reader's options.
+    let dir = ScratchDir::new("upgrade-status", "quiet-flow");
+    let mut o = opts(&dir);
+    let st = St {
+        phase: Phase::Announced {
+            at_s: NOW - 600,
+            asks: 1,
+        },
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &st, NOW);
+    assert!(!rows(&o)[0].quiet, "`upgrade_ask = true`");
+    o.ask = false;
+    assert!(rows(&o)[0].quiet, "the default");
+}
+
+/// A STATUS THAT LAGS IS NO COMFORT UNDER THE QUIET FLOW, AND `--now` MOVES
+/// IT (round eight, #5): the ask flow's notice goes through a status of
+/// Claude's own that lags its idle screen, and its turn rewrites the status;
+/// the quiet flow types nothing, so the record that said "nothing to do: it
+/// starts on its own at a quiet moment" of a `status-stale` wait was false,
+/// and once overdue its row offered no `Upgrade now` (`Remedy::Waits`). Now
+/// the record says what moves it — Claude's own `idle`, or the owner's word —
+/// and the overdue row's remedy is `--now`, which the quiet restart reads the
+/// lag past on (`upgrade::quiet_step`). A quiet round that GAVE UP (on its
+/// agent's own work, an older aterm's notice) says the next round moves it at
+/// a quiet moment, never that it "asks again". NEGATIVE CONTROLS: the ask
+/// flow's rows, as before.
+#[test]
+fn a_lagging_status_under_the_quiet_flow_is_no_comfort_and_now_moves_it() {
+    for status in ["busy", "shell"] {
+        let row = |quiet: bool, behind_for: u64| Row {
+            wait: format!("status-stale:{status}"),
+            quiet,
+            ..pending(behind_for)
+        };
+        let quiet = row(true, 3_600);
+        assert!(!quiet.waits_for_comfort(), "{status}");
+        let line = quiet.waiting_line("16:00");
+        assert!(!line.contains("nothing to do"), "{status}: {line}");
+        assert!(line.contains("says it is idle"), "{status}: {line}");
+        assert!(line.contains("upgrade now"), "{status}: {line}");
+        assert_eq!(
+            row(true, STALLED_AFTER_S + 60).remedy(NOW),
+            Some(Remedy::Now),
+            "{status}"
+        );
+        // NEGATIVE CONTROLS: the ask flow's notice goes through the lag.
+        assert!(row(false, 3_600).waits_for_comfort(), "{status}");
+        assert!(
+            row(false, 3_600)
+                .waiting_line("16:00")
+                .contains("nothing to do"),
+            "{status}"
+        );
+        assert_eq!(
+            row(false, STALLED_AFTER_S + 60).remedy(NOW),
+            Some(Remedy::Waits),
+            "{status}"
+        );
+    }
+    // A quiet round that gave up says what comes next as it is.
+    let gave_up = |quiet: bool| Row {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        wait: "failed".to_string(),
+        quiet,
+        ..pending(STALLED_AFTER_S + 3_600)
+    };
+    let words = gave_up(true).stall_words(NOW).expect("overdue");
+    assert!(words.contains("moves it at a quiet moment"), "{words}");
+    assert!(!words.contains("asks again"), "{words}");
+    let words = gave_up(false).stall_words(NOW).expect("overdue");
+    assert!(words.contains("asks again"), "{words}");
+}
+
+/// A LIMIT PAST ITS NAMED RESET IS THE QUIET MOVE'S BEFORE IT IS TOLD (the
+/// review of 2026-09-30, [`Row::limit_told_at`]): under the quiet flow a tab
+/// whose limit row named its reset may be moved from that reset's grace on —
+/// the very instant the view told it until the fix, so every quiet move at a
+/// spent limit was marked "upgrade stalled", aterm's own fault, for the
+/// moments before it went. Such a row is told [`QUIET_MOVE_S`] later, and
+/// the view wakes for that instant. NEGATIVE CONTROLS: the ask flow's row,
+/// and a quiet row whose reset no row named (bounded by the week), are told
+/// at the grace's end, as before.
+#[test]
+fn a_quiet_move_at_a_spent_limit_has_its_chance_before_the_tell() {
+    // The reset's grace ends now.
+    let reset = NOW - LIMIT_GRACE_S;
+    let at = |quiet: bool, limit_until: u64| Row {
+        wait: "limited".into(),
+        limit_until,
+        quiet,
+        ..pending(3 * 86_400)
+    };
+    let quiet = at(true, reset);
+    assert!(!quiet.limit_passed(NOW), "the quiet move's chance");
+    assert!(quiet.asks_on_its_own(NOW), "a record meanwhile");
+    assert!(
+        matches!(quiet.attention(NOW), Attention::Quiet),
+        "no line while the move may go"
+    );
+    let told = NOW + QUIET_MOVE_S;
+    assert_eq!(
+        next_change(std::slice::from_ref(&quiet), NOW),
+        Some(told),
+        "the view wakes for it"
+    );
+    assert!(matches!(quiet.attention(told - 1), Attention::Quiet));
+    assert!(quiet.limit_passed(told));
+    assert!(
+        matches!(quiet.attention(told), Attention::Fault(ref n) if n.kind == "limit-passed"),
+        "told, in the log, once the chance has passed"
+    );
+    assert_eq!(quiet.badge(told), None, "and never a mark");
+    // NEGATIVE CONTROLS: the ask flow, and a reset no row named.
+    let asked = at(false, reset);
+    assert!(asked.limit_passed(NOW) && matches!(asked.attention(NOW), Attention::Fault(_)));
+    let unnamed = Row {
+        wait_since: NOW - LONGEST_LIMIT_S - LIMIT_GRACE_S,
+        ..at(true, 0)
+    };
+    assert!(unnamed.limit_passed(NOW), "the week's bound: no move waits");
+    assert!(matches!(unnamed.attention(NOW), Attention::Fault(_)));
+}
+
+/// A row served later than it was read is judged with the awake clock as it
+/// stands ([`Row::reread`], used by the window's `ls` column and a word's
+/// re-apply): a row read before a sleep and served after the wake reads no
+/// `unwatched` inside the wake grace, and a row carrying the host's own watch
+/// start keeps that grace. Negative control: judged with the clock it was read
+/// with, it reads `unwatched`.
+#[test]
+fn a_row_served_late_is_judged_with_the_awake_clock_as_it_stands() {
+    let bed = NOW - 8 * 3_600;
+    let slept = Row {
+        watch_at: bed + 3_600,
+        looked_at: bed - 60,
+        awake_since: bed - 86_400,
+        ..pending(3_600)
+    };
+    assert_eq!(slept.stall(NOW).as_deref(), Some("unwatched"), "as read");
+    // Woken a minute ago.
+    pin_awake_since(NOW - 60);
+    let mut served = slept.clone();
+    served.reread(NOW);
+    assert_eq!(served.awake_since, NOW - 60);
+    assert_eq!(served.stall(NOW), None, "inside the wake grace");
+    assert_eq!(served.stalled, None, "and read so");
+    // The host's own grace, later than the machine's clock, is kept.
+    pin_awake_since(bed - 86_400);
+    let mut hosted = Row {
+        awake_since: NOW - 30,
+        ..slept.clone()
+    };
+    hosted.reread(NOW);
+    assert_eq!(hosted.awake_since, NOW - 30, "never lowered");
+    assert_eq!(hosted.stall(NOW), None);
+    pin_awake_since(0);
+}
+
+/// A QUIET GIVE-UP ITS AGENT'S OWN WORK HELD IS A WAIT THE OWNER'S `--NOW`
+/// DOES NOT MOVE (round eight, #4's review): the quiet flow gives a round up
+/// only once the agent's own work has held its restart a whole re-ask window,
+/// and the round `--now` re-arms waits on that same work — the quiet
+/// restart's gate holds `background` while anything runs under the agent or
+/// at a break, whatever the owner said. The row read [`Remedy::AskAgain`]:
+/// "Upgrade now moves it at its next pause", the button offered, nothing
+/// moved. Now the work seen since its notice ([`St::work_seen`], carried
+/// into the row of a give-up alone) or running under the agent at the last
+/// look ([`Row::held_by`]) makes it [`Remedy::Waits`]. NEGATIVE CONTROLS: the
+/// ask flow's give-up (`--now` asks it again), a quiet give-up no work held
+/// (a status that only lagged: `--now` reads it past), an announced round's
+/// work (no give-up: the row carries none of it), and the owner's hold (no
+/// remedy at all).
+#[test]
+fn a_quiet_give_up_its_own_work_held_is_a_wait_the_owners_now_does_not_move() {
+    let gave_up = St {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - 3_600,
+        failed_at: NOW - 60,
+        work_seen: true,
+        ..St::default()
+    };
+    let quiet = |st: &St| Row {
+        quiet: true,
+        ..Row::of("c", st, NOW)
+    };
+    let row = quiet(&gave_up);
+    assert!(row.work_seen);
+    assert!(row.rests_on_own_work());
+    assert_eq!(row.remedy(NOW), Some(Remedy::Waits));
+    let running = quiet(&St {
+        work_seen: false,
+        held_by: vec![HeldBy {
+            pid: 4242,
+            name: "zsh".to_string(),
+            since: NOW - 7_200,
+        }],
+        ..gave_up.clone()
+    });
+    assert!(running.rests_on_own_work());
+    assert_eq!(running.remedy(NOW), Some(Remedy::Waits));
+    // NEGATIVE CONTROLS.
+    let asked = Row {
+        quiet: false,
+        ..row.clone()
+    };
+    assert!(!asked.rests_on_own_work());
+    assert_eq!(asked.remedy(NOW), Some(Remedy::AskAgain));
+    let lagged = quiet(&St {
+        work_seen: false,
+        ..gave_up.clone()
+    });
+    assert!(!lagged.rests_on_own_work());
+    assert_eq!(lagged.remedy(NOW), Some(Remedy::AskAgain));
+    let announced = quiet(&St {
+        phase: Phase::Announced {
+            at_s: NOW - 60,
+            asks: 1,
+        },
+        ..gave_up.clone()
+    });
+    assert!(!announced.work_seen);
+    assert!(!announced.rests_on_own_work());
+    let skipped = quiet(&St {
+        request: Request::Skip("2.1.282".to_string()),
+        request_tab: TAB.to_string(),
+        request_at: NOW - 10,
+        ..gave_up
+    });
+    assert_eq!(skipped.remedy(NOW), None);
+}
+
+/// A QUIET GIVE-UP THE OWNER'S `--NOW` DOES MOVE KEEPS `UPGRADE NOW` (round
+/// eight, the review of #4's review). Two give-ups whose work was seen read
+/// [`Remedy::Waits`] — "it moves once that ends", no button — although that
+/// end moves neither and `--now` does:
+///
+/// - A CODEX give-up. The Codex lane never re-arms a resting round at the
+///   end of its TUI's work (its reducer reads no `work_ended`, and a stopped
+///   round's visit returns `wait:failed` until its rest is over), so the
+///   round waits out [`upgrade::RETRY_S`] whatever the work does. `--now`
+///   re-arms it pending, and the quiet restart goes at the first idle point
+///   once nothing runs under the TUI.
+/// - A CLAUDE CODE give-up whose shells HAVE ENDED, its status still `shell`
+///   over an idle screen: the end-of-work re-arm asks the restart's gate,
+///   which never reads a lagging status past on its own (`status-stale`), so
+///   nothing moves it until its rest is over — while the owner's `--now`
+///   reads the lag past (`upgrade::quiet_step`). `work_seen` says work was
+///   seen once since the notice, not that it holds the round now.
+///
+/// Both keep [`Remedy::AskAgain`]. NEGATIVE CONTROLS: the same Claude Code
+/// give-up while the shells still run (`held_by`), or resting at a break of
+/// its work (`failed`, no end read), stays [`Remedy::Waits`].
+#[test]
+fn a_quiet_give_up_the_owners_now_does_move_keeps_upgrade_now() {
+    let gave_up = St {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - 3_600,
+        failed_at: NOW - 60,
+        work_seen: true,
+        wait: "failed".to_string(),
+        ..St::default()
+    };
+    let quiet = |st: &St| Row {
+        quiet: true,
+        ..Row::of("c", st, NOW)
+    };
+    let codex = quiet(&St {
+        agent: upgrade::Agent::Codex,
+        ..gave_up.clone()
+    });
+    assert!(
+        codex.work_seen,
+        "PRECONDITION: the give-up saw the TUI's work"
+    );
+    assert!(
+        !codex.rests_on_own_work(),
+        "no end of work re-arms a Codex round"
+    );
+    assert_eq!(codex.remedy(NOW), Some(Remedy::AskAgain));
+    let lagging = quiet(&St {
+        wait: "status-stale:shell".to_string(),
+        ..gave_up.clone()
+    });
+    assert!(lagging.work_seen && lagging.held_by.is_empty());
+    assert!(
+        !lagging.rests_on_own_work(),
+        "the work ended; only the status lags, which `--now` reads past"
+    );
+    assert_eq!(lagging.remedy(NOW), Some(Remedy::AskAgain));
+    // NEGATIVE CONTROLS: what still holds a Claude Code round is its work.
+    let running = quiet(&St {
+        held_by: vec![HeldBy {
+            pid: 4242,
+            name: "zsh".to_string(),
+            since: NOW - 7_200,
+        }],
+        ..gave_up.clone()
+    });
+    assert!(running.rests_on_own_work());
+    assert_eq!(running.remedy(NOW), Some(Remedy::Waits));
+    let at_a_break = quiet(&gave_up);
+    assert!(at_a_break.rests_on_own_work());
+    assert_eq!(at_a_break.remedy(NOW), Some(Remedy::Waits));
+}
+
+/// A MOVE THE PERSON HOLDS SAYS SO WHERE THEY ARE (the owner, 2026-09-30,
+/// s-61dfc15a: `wait:awaiting-ready`, the agent's READY, then
+/// `wait:attended` and nothing since — 5 h 38 min behind, so only a keystroke
+/// within `KEYS_GAP_S` held it, and nothing on the screen said so: "hey! why
+/// didn't you upgrade?"). The incident's shape notes the build, that it is
+/// ready and what holds it — the person using the tab, or the draft they
+/// leave when they pause — never a promise of when it goes: the same words
+/// at the first rung, where anyone within `human_grace_s` holds it, before
+/// the READY, and overdue. A row the draft held has words for a draft alone.
+/// The looks that only restamp the person move the row, never the note.
+/// NEGATIVE CONTROLS: no note once no look has seen the person, for any other
+/// wait, once the move is under way, under the owner's holding word, or for a
+/// Codex row.
+#[test]
+fn a_move_the_person_holds_is_noted_for_their_footer() {
+    use crate::harness::footer::UpgradeWords;
+    let words = |whole: &str, short: &str| UpgradeWords {
+        whole: whole.to_string(),
+        short: short.to_string(),
+    };
+    let st = St {
+        from: "2.1.285".to_string(),
+        to: "2.1.286".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - (5 * 3_600 + 38 * 60),
+        phase: Phase::Announced {
+            at_s: NOW - 600,
+            asks: 1,
+        },
+        ready_since: NOW - 20,
+        wait: "attended".to_string(),
+        wait_since: NOW - 20,
+        wait_seen: NOW - 5,
+        ..St::default()
+    };
+    let held = Row::of("c", &st, NOW);
+    assert!(held.ready && held.person_named, "{held:?}");
+    assert_eq!(held.rung(NOW), upgrade::Rung::Land);
+    let note = held.pause_note(NOW).expect("held by the person: noted");
+    assert_eq!(
+        note.using,
+        Some(words(
+            "Claude Code 2.1.286 is ready \u{b7} waits while you use this tab",
+            "2.1.286 waits while you use this tab"
+        ))
+    );
+    assert_eq!(
+        note.draft,
+        words(
+            "Claude Code 2.1.286 is ready \u{b7} waits until your draft is sent or cleared",
+            "2.1.286 waits until your draft is sent or cleared"
+        )
+    );
+    assert_eq!(note.words(false), note.using.as_ref());
+    assert_eq!(note.words(true), Some(&note.draft));
+    // The first rung, where anyone at the tab within `human_grace_s` holds
+    // it: the same words — no pause of a keystroke's length is promised.
+    let early = Row::of(
+        "c",
+        &St {
+            pending_since: NOW - upgrade::RUNG_KEYS_S / 2,
+            ..st.clone()
+        },
+        NOW,
+    );
+    assert!(early.rung(NOW) < upgrade::Rung::KeysOnly);
+    assert_eq!(early.pause_note(NOW), Some(note.clone()));
+    // The person paused with a draft in the composer: the draft holds it, and
+    // there are words for a draft alone — an empty composer says it was sent
+    // or cleared since.
+    let drafted = Row::of(
+        "c",
+        &St {
+            wait: "draft".to_string(),
+            ..st.clone()
+        },
+        NOW,
+    );
+    assert!(!drafted.person_named);
+    assert_eq!(
+        drafted.pause_note(NOW),
+        Some(crate::harness::footer::UpgradeNote {
+            using: None,
+            draft: note.draft.clone(),
+        })
+    );
+    // Before the READY: what holds it, the agent not yet agreed.
+    let asking = Row::of(
+        "c",
+        &St {
+            ready_since: 0,
+            ..st.clone()
+        },
+        NOW,
+    );
+    assert!(!asking.ready);
+    let asked = asking.pause_note(NOW).expect("held by the person: noted");
+    assert_eq!(
+        asked.using,
+        Some(words(
+            "Claude Code 2.1.286 waits while you use this tab",
+            "2.1.286 waits while you use this tab"
+        ))
+    );
+    assert_eq!(
+        asked.draft.whole,
+        "Claude Code 2.1.286 waits until your draft is sent or cleared"
+    );
+    // Only an announced round's READY is one.
+    let pending = Row::of(
+        "c",
+        &St {
+            phase: Phase::Pending,
+            ..st.clone()
+        },
+        NOW,
+    );
+    assert!(!pending.ready);
+    assert_eq!(pending.pause_note(NOW), Some(asked));
+    // Overdue is still the person's to move.
+    let overdue = Row::of(
+        "c",
+        &St {
+            pending_since: NOW - 7 * 3_600,
+            ..st.clone()
+        },
+        NOW,
+    );
+    assert_eq!(overdue.stall(NOW).as_deref(), Some("overdue"));
+    assert_eq!(overdue.pause_note(NOW), Some(note.clone()));
+    // A look that only restamps the person moves the row, not the note.
+    let later = Row::of(
+        "c",
+        &St {
+            wait_seen: NOW + 15,
+            ..st.clone()
+        },
+        NOW + 20,
+    );
+    assert_ne!(later, held, "the row moves at every look");
+    assert_eq!(later.pause_note(NOW + 20), Some(note), "its note does not");
+
+    // NEGATIVE CONTROLS.
+    let unseen = st.wait_seen + ATTENDED_SEEN_S + 1;
+    assert_eq!(Row::of("c", &st, unseen).pause_note(unseen), None, "unseen");
+    for wait in [
+        "not-idle:busy",
+        "box",
+        "settling",
+        "awaiting-ready",
+        "left-typed:mixed",
+        "release:draft",
+    ] {
+        let other = Row::of(
+            "c",
+            &St {
+                wait: wait.to_string(),
+                ..st.clone()
+            },
+            NOW,
+        );
+        assert_eq!(other.pause_note(NOW), None, "{wait}");
+    }
+    for phase in [
+        Phase::Exiting { at_s: NOW - 1 },
+        Phase::Relaunched { at_s: NOW - 1 },
+        Phase::Done,
+    ] {
+        let moved = Row::of(
+            "c",
+            &St {
+                phase: phase.clone(),
+                ..st.clone()
+            },
+            NOW,
+        );
+        assert_eq!(moved.pause_note(NOW), None, "{phase:?}");
+    }
+    for request in [
+        Request::Skip("2.1.286".to_string()),
+        Request::DeferUntil(NOW + 3_600),
+    ] {
+        let held_back = Row::of(
+            "c",
+            &St {
+                request: request.clone(),
+                request_tab: TAB.to_string(),
+                ..st.clone()
+            },
+            NOW,
+        );
+        assert_eq!(held_back.pause_note(NOW), None, "{request:?}");
+    }
+    for wait in ["attended", "draft"] {
+        let codex = Row::of(
+            "codex-c",
+            &St {
+                agent: upgrade::Agent::Codex,
+                wait: wait.to_string(),
+                ..st.clone()
+            },
+            NOW,
+        );
+        assert_eq!(
+            codex.pause_note(NOW),
+            None,
+            "Claude Code's lane alone: {wait}"
+        );
+    }
+}
+
+/// A word that is a token already is handed back as it is, and reads exactly
+/// as the character-at-a-time cut reads it; every near miss takes the cut.
+#[test]
+fn a_token_word_reads_as_the_cut_reads_it() {
+    let cut = |s: &str| {
+        let w: String = s
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '(' | ')'))
+            .take(64)
+            .collect();
+        if w.is_empty() { "-".to_string() } else { w }
+    };
+    let long = "a".repeat(64);
+    let longer = "b".repeat(65);
+    for s in [
+        "claude",
+        "wait:own-work(3)",
+        "0.158.0_x",
+        long.as_str(),
+        longer.as_str(),
+        "",
+        "two words",
+        "\u{e9}",
+        "tab\t",
+        "!!",
+    ] {
+        assert_eq!(word(s), cut(s), "{s:?}");
+    }
 }

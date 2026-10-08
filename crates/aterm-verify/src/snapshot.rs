@@ -10,13 +10,14 @@
 //! had asked for, and none of it was visible in the ladder.
 //!
 //! So every run happens in a git WORKTREE of the caller's repository at
-//! `<caller-root>-verify.noindex` (or `--snapshot <dir>`). The `.noindex`
+//! `<main-checkout>-verify.noindex` (or `--snapshot <dir>`): one per repository,
+//! shared by every linked worktree's run ([`snapshot_home`]). The `.noindex`
 //! suffix keeps Spotlight out of the sources and every target dir without
 //! touching macOS defaults. Before
 //! anything is planned, the worktree is synced to exactly what the caller has:
 //!
 //!  1. `git checkout --detach --force <caller HEAD>`;
-//!  2. `git clean -fd` — NEVER `-x`, so the ignored lane target dirs stay warm;
+//!  2. `git clean -fd` — NEVER `-x`, so the ignored target dirs stay warm;
 //!  3. `git diff --binary HEAD` from the caller, piped to `git apply --binary`;
 //!  4. every untracked, non-ignored file copied across;
 //!  5. every edit an assume-unchanged or skip-worktree flag hides from `git
@@ -132,7 +133,25 @@ pub fn place(root: &Path, caller: Option<&Path>) -> String {
     }
 }
 
-/// `<caller-root>-verify.noindex`, beside the caller's checkout.
+/// The checkout whose snapshot a run from `caller` uses: the MAIN checkout of
+/// `caller`'s repository (the parent of its common git dir), so every linked
+/// worktree's run shares one snapshot ([`default_root`] of it) and finds its
+/// lanes warm. Sharing is safe because the gate holds the machine lock for a
+/// whole run before it prepares a snapshot ([`hold_machine`]), and each sync
+/// re-points the snapshot at its caller — the tree, the submodule's borrowed
+/// objects, the worktree check — so nothing in it belongs to one caller. Before
+/// 2026-10-02 each worktree got a snapshot of its own, and every slice built
+/// cold (a cold merge contract ran ~52 min where a warm one ran ~32, and left
+/// ~14 GiB per worktree). `caller` itself when git cannot say.
+#[must_use]
+pub fn snapshot_home(caller: &Path, path_env: &OsStr) -> PathBuf {
+    rev_parse_path(caller, path_env, "--git-common-dir")
+        .filter(|common| common.file_name() == Some(OsStr::new(".git")))
+        .and_then(|common| common.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| caller.to_path_buf())
+}
+
+/// `<checkout>-verify.noindex`, beside the checkout [`snapshot_home`] names.
 #[must_use]
 pub fn default_root(caller: &Path) -> PathBuf {
     let name = caller
@@ -369,13 +388,20 @@ fn take_ticket(queue: &Path) -> Result<Ticket, String> {
         .create_new(true)
         .open(&tmp)
         .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
-    if let Err(e) = file.try_lock() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the take lands in a Ticket, whose Drop releases by LOCK_UN; a failed \
+                  queueing lets go by unlock() below"
+    )]
+    let taken = file.try_lock();
+    if let Err(e) = taken {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("cannot lock {}: {e:?}", tmp.display()));
     }
     let path = queue.join(name);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
+        let _ = file.unlock();
         return Err(format!("cannot queue {}: {e}", path.display()));
     }
     Ok(Ticket { path, file })
@@ -406,7 +432,12 @@ fn ahead_in_line(queue: &Path, mine: &Ticket) -> usize {
             let Ok(file) = std::fs::File::open(path) else {
                 return false;
             };
-            match file.try_lock() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a probe: a dead waiter's ticket it takes is unlinked, then unlocked"
+            )]
+            let taken = file.try_lock();
+            match taken {
                 Ok(()) => {
                     let _ = std::fs::remove_file(path);
                     let _ = file.unlock();
@@ -487,7 +518,12 @@ fn acquire_machine_in(
             .truncate(false)
             .open(&path)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        match file.try_lock() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the take lands in a MachineHold, whose Drop releases by LOCK_UN"
+        )]
+        let taken = file.try_lock();
+        match taken {
             Ok(()) => {
                 let since = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -583,7 +619,7 @@ fn span(secs: u64) -> String {
 #[must_use]
 pub fn machine_could_not_run_text(why: &str) -> String {
     format!(
-        "  FAIL  machine: {why}\n  VERIFY: COULD NOT RUN — the gate could not take this \
+        "  NOT RUN machine: {why}\n  VERIFY: COULD NOT RUN — the gate could not take this \
          machine's gate lock, so it decided nothing. This is NOT a finding about your change.\n"
     )
 }
@@ -592,7 +628,7 @@ pub fn machine_could_not_run_text(why: &str) -> String {
 #[must_use]
 pub fn could_not_run_text(why: &str) -> String {
     format!(
-        "  FAIL  snapshot: {why}\n  VERIFY: COULD NOT RUN — the gate could not prepare the \
+        "  NOT RUN snapshot: {why}\n  VERIFY: COULD NOT RUN — the gate could not prepare the \
          snapshot it verifies, so it decided nothing. This is NOT a finding about your change.\n"
     )
 }
@@ -1977,6 +2013,66 @@ mod tests {
             default_root(Path::new("/Users//x/aterm")),
             PathBuf::from("/Users//x/aterm-verify.noindex")
         );
+    }
+
+    /// A LINKED WORKTREE'S RUN SHARES THE MAIN CHECKOUT'S SNAPSHOT: its home is
+    /// the main checkout, so every slice's gate finds the lanes warm. The main
+    /// checkout's home is itself; a directory git cannot open is its own.
+    #[test]
+    fn every_worktree_of_a_repository_shares_the_main_checkouts_snapshot() {
+        let base = crate::mktemp_dir("atv-snap-home").expect("mktemp");
+        let main = base.join("repo");
+        let linked = base.join("slice");
+        let path_env = std::env::var_os("PATH").unwrap_or_default();
+        let run = |dir: &Path, args: &[&str]| {
+            let out = git(dir, &path_env).args(args).output().expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {:?}", out);
+        };
+        std::fs::create_dir_all(&main).expect("main dir");
+        run(&main, &["init", "-q"]);
+        run(
+            &main,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "c",
+            ],
+        );
+        run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().expect("utf8"),
+            ],
+        );
+        let main = std::fs::canonicalize(&main).expect("canonical main");
+        assert_eq!(
+            snapshot_home(&linked, &path_env),
+            main,
+            "a linked worktree's home"
+        );
+        assert_eq!(
+            snapshot_home(&main, &path_env),
+            main,
+            "the main checkout's own"
+        );
+        let plain = base.join("not-a-repo");
+        std::fs::create_dir_all(&plain).expect("plain dir");
+        assert_eq!(
+            snapshot_home(&plain, &path_env),
+            plain,
+            "outside git: itself"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

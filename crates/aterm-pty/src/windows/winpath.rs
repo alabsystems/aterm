@@ -15,8 +15,7 @@
 //! straight from the registry (auto-expanding `%VAR%` references), unions them with
 //! whatever `PATH` was inherited (so a session-specific addition is never LOST), and
 //! sets that as the child shell's `PATH`. Always on: it only ever adds what the
-//! registry says is on `PATH` and loses nothing inherited (the
-//! `ATERM_NO_PATH_REFRESH` opt-out is gone, 2026-09-24).
+//! registry says is on `PATH` and loses nothing inherited.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::HotTier;
+use crate::HyperlinkSpan;
 use crate::Scrollback;
 use std::cell::Cell;
 
@@ -331,10 +332,8 @@ fn warm_tier_push_front_restores_popped_block() {
 
 /// Exact rebuild-work proof for the high-block warm tiers used in budget tests.
 ///
-/// The `warm_eviction_cost_bounded_with_many_blocks` wall-clock guard fills a
-/// `Scrollback` with `block_size=5`, then slashes the memory budget. This test
-/// reproduces that configured setup, isolates the resulting `WarmTier`, and
-/// proves that repeated `pop_front()` calls perform exactly
+/// Fills a `Scrollback` with `block_size=5`, isolates the resulting
+/// `WarmTier`, and proves that repeated `pop_front()` calls perform exactly
 /// `B * (B - 1) / 2` cumulative index rebuild steps for the warm-block counts
 /// this high-block test shape creates.
 #[test]
@@ -429,4 +428,63 @@ fn warm_block_to_cold_rejects_oversized_lz4_prefix() {
         result.is_err(),
         "to_cold_compressed should reject oversized LZ4 prefix"
     );
+}
+
+/// A row whose every cell is its own OSC 8 link, alternating two URLs at the
+/// 8 KiB ingestion cap: the most bytes an honest row of `cols` cells carries.
+fn row_of_links(text: &str, cols: u16, urls: &[std::sync::Arc<str>; 2]) -> Line {
+    let spans = (0..cols)
+        .map(|col| HyperlinkSpan::new(col, col + 1, urls[usize::from(col % 2)].clone()))
+        .collect();
+    Line::with_hyperlinks(text, crate::Rle::new(), spans)
+}
+
+/// No warm block is stored past what its reader decodes (SB1,
+/// docs/AUDIT-persisted-state-2026-10-07.md). Seventy 320-column rows of links
+/// (~184 MB serialized, three pages) share a promotion batch with thirty plain
+/// lines; aged through the warm tier into the cold one, every line must still
+/// be there, readable at its index, links intact, and the warm tier must never
+/// hold more than its limit while the batch's blocks leave it.
+#[test]
+fn rows_of_links_past_the_page_cap_age_out_whole() {
+    const COLS: u16 = 320;
+    let urls: [std::sync::Arc<str>; 2] = ["a", "b"].map(|fill| {
+        let mut url = String::from("https://example.com/");
+        url.push_str(&fill.repeat(8192 - url.len()));
+        std::sync::Arc::from(url)
+    });
+    let linked = |i: usize| i % 10 >= 3 && i < 100;
+    // Enough after the batch for its block to reach the front of the warm
+    // tier and be evicted past the quarantine threshold's retries.
+    let total = 1_100 + crate::codec::DEFAULT_HOT_LIMIT + crate::codec::DEFAULT_WARM_LIMIT;
+    let mut sb = Scrollback::with_defaults();
+    for i in 0..total {
+        let text = format!("line {i:05}");
+        sb.push_line(if linked(i) {
+            row_of_links(&text, COLS, &urls)
+        } else {
+            Line::from(text.as_str())
+        });
+        assert!(
+            sb.warm_line_count() <= crate::codec::DEFAULT_WARM_LIMIT,
+            "warm tier over its limit after line {i}"
+        );
+    }
+
+    assert_eq!(sb.line_count(), total, "no line was dropped");
+    assert_eq!(sb.pressure_evicted_lines(), 0);
+    assert!(
+        sb.cold_line_count() >= 100,
+        "the first batch aged into cold"
+    );
+    for i in 0..total {
+        let line = sb.get_line(i).expect("decodes").expect("in range");
+        assert_eq!(line.to_string(), format!("line {i:05}"));
+        let links = line.hyperlinks().map_or(0, <[HyperlinkSpan]>::len);
+        assert_eq!(
+            links,
+            if linked(i) { usize::from(COLS) } else { 0 },
+            "line {i}"
+        );
+    }
 }

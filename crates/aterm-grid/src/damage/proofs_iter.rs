@@ -1,30 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kani proofs for damage iteration correctness.
+//! Kani proofs for damage iteration.
 //!
-//! The `BitsetRowIterator` is the core of the render hot path — it converts
-//! a bitset of damaged rows into a sequence of row indices using
-//! `trailing_zeros()`. These proofs verify the four fundamental properties:
-//!
-//! 1. **Soundness**: yielded rows have their bit set
-//! 2. **Completeness**: set bits below max_row are yielded
-//! 3. **Monotonicity**: consecutive yields are strictly increasing
-//! 4. **Bound**: no yielded row >= max_row
-//!
-//! The `DamageBoundsIterator` wraps the row iterator to produce column
-//! bounds for each damaged row. These proofs verify the bounds are valid.
+//! `BitsetRowIterator` turns a bitset of damaged rows into row indices via
+//! `trailing_zeros()`. Proved: soundness (yielded rows have their bit set),
+//! completeness (set bits below max_row are yielded), monotonicity (strictly
+//! increasing) and bound (no row >= max_row). `DamageBoundsIterator` yields
+//! valid column bounds per damaged row.
 
 use super::*;
 
-// Constrain bitset to 8 bits (rows 0..7) and max 8 rows to keep
-// CBMC tractable. The algorithm is word-level — behaviour for bits 0..7
-// generalises to bits 0..63 within a word.
+// Bitsets limited to 8 bits and 8 rows for CBMC; the algorithm is word-level,
+// so bits 0..7 generalise to 0..63.
 
-/// BitsetRowIterator: every yielded row has its bit set in the bitset.
-///
-/// Proves soundness — the iterator never reports a row as damaged
-/// when its bit is clear.
+/// BitsetRowIterator soundness: every yielded row has its bit set.
 #[kani::proof]
 #[kani::unwind(10)]
 fn bitset_iter_yields_only_set_bits() {
@@ -44,10 +34,7 @@ fn bitset_iter_yields_only_set_bits() {
     }
 }
 
-/// BitsetRowIterator: consecutive yields are strictly increasing.
-///
-/// Proves monotonicity — the iterator visits rows in ascending order.
-/// Combined with soundness, this proves no row is yielded twice.
+/// BitsetRowIterator monotonicity: yields strictly increase (so no row repeats).
 #[kani::proof]
 #[kani::unwind(10)]
 fn bitset_iter_monotonic() {
@@ -68,10 +55,8 @@ fn bitset_iter_monotonic() {
     }
 }
 
-/// BitsetRowIterator: a set bit below max_row is always yielded.
-///
-/// Marks exactly one bit and proves the iterator produces exactly
-/// one element matching that bit position.
+/// BitsetRowIterator completeness: one marked bit below max_row yields exactly
+/// that row.
 #[kani::proof]
 #[kani::unwind(10)]
 fn bitset_iter_completeness_single_bit() {
@@ -95,9 +80,7 @@ fn bitset_iter_completeness_single_bit() {
     kani::assert(iter.next().is_none(), "no more values after single set bit");
 }
 
-/// BitsetRowIterator: set bits at or above max_row are NOT yielded.
-///
-/// Proves the upper bound is respected even when bits are set beyond it.
+/// BitsetRowIterator bound: bits at or above max_row are not yielded.
 #[kani::proof]
 #[kani::unwind(10)]
 fn bitset_iter_respects_max_row_bound() {
@@ -128,11 +111,7 @@ fn bitset_iter_empty_yields_nothing() {
     kani::assert(iter.next().is_none(), "empty bitset must yield nothing");
 }
 
-/// BitsetRowIterator: count of yielded rows equals popcount of
-/// bits below max_row.
-///
-/// Exhaustively iterates the full output and verifies the total count
-/// matches the number of set bits in the valid range.
+/// BitsetRowIterator yields exactly popcount(bits below max_row) rows.
 #[kani::proof]
 #[kani::unwind(10)]
 fn bitset_iter_count_matches_popcount() {
@@ -157,13 +136,9 @@ fn bitset_iter_count_matches_popcount() {
     );
 }
 
-/// DamageBoundsIterator: yielded bounds have left < right (non-empty).
-///
-/// After marking a cell, the iterator must only produce non-empty bounds.
-///
-/// Rows capped at 4, cols at 16: Damage + column tracking + iterator
-/// state exceeds CBMC memory budget at rows=8/cols=100 (OOM exit 241).
-/// The algorithm is row/col-independent so smaller bounds cover all paths.
+/// DamageBoundsIterator yields non-empty bounds (left < right) after a mark.
+/// Rows capped at 4 and cols at 16 for CBMC memory; the algorithm is
+/// size-independent.
 #[kani::proof]
 #[kani::unwind(6)]
 fn damage_bounds_iter_yields_nonempty_bounds() {
@@ -192,14 +167,8 @@ fn damage_bounds_iter_yields_nonempty_bounds() {
     }
 }
 
-/// DamageBoundsIterator: a cell marked within visible range is yielded.
-///
-/// This is the completeness property for the bounds iterator —
-/// if a cell is marked and is within the visible column range,
-/// the iterator must yield bounds covering that cell.
-///
-/// Rows capped at 4, cols at 16: same CBMC budget constraint as
-/// damage_bounds_iter_yields_nonempty_bounds (OOM exit 241 at higher).
+/// DamageBoundsIterator completeness: a marked cell within the visible columns
+/// is covered by the yielded bounds (same 4x16 cap).
 #[kani::proof]
 #[kani::unwind(6)]
 fn damage_bounds_iter_yields_marked_cell() {
@@ -237,14 +206,8 @@ fn damage_bounds_iter_yields_marked_cell() {
     );
 }
 
-/// DamageBoundsIterator: marking a cell outside visible columns
-/// yields nothing for that row.
-///
-/// When a cell is marked at col >= cols, the bounds iterator should
-/// filter it out because after clamping, left >= right.
-///
-/// Rows capped at 4, cols at 16: same CBMC budget constraint as
-/// damage_bounds_iter_yields_nonempty_bounds (OOM exit 241 at higher).
+/// DamageBoundsIterator filters a cell marked at col >= cols (left >= right
+/// after clamping); same 4x16 cap.
 #[kani::proof]
 #[kani::unwind(6)]
 fn damage_bounds_iter_filters_out_of_range_columns() {

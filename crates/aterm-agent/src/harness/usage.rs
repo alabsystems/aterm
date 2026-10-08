@@ -1,85 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The usage view (design §5.2): Claude Code's transcript rows, read into one
-//! per-account view; the one-line HUD; the `harness usage --json` document
-//! (schema 1).
+//! The usage view: Claude Code's transcript rows folded into one per-account
+//! view, the one-line HUD, and the `harness usage --json` document (schema 1).
 //!
-//! Everything here is a pure function of its arguments. No clock is read
-//! (`as_of` and every `age_s` are injected), no environment, no network, no
-//! control socket. The one I/O surface is [`TranscriptUsage::fold_reader`],
-//! which takes a `BufRead` the caller opened.
+//! Everything here is a pure function of its arguments (no clock, environment,
+//! network or file); [`super::session_usage::TranscriptCursor`] reads the bytes.
 //!
-//! # The input
-//!
-//! **Transcript rows** ([`TranscriptUsage`]) are the lines of
-//! `~/.claude/projects/<slug>/<uuid>.jsonl`: one JSON object per line. An
-//! assistant row carries `message.{id,model,usage}`, and the SAME `message.id`
-//! repeats once per content block with the usage object copied onto each, so a
-//! sum must count each id once. MEASURED on this box, 2026-09-19, over 30
-//! transcripts and 15,901 assistant rows: the longest line was 1,125,606
-//! bytes; an id repeated at most 11 times and never more than 5 rows apart;
-//! all 8,202 repeated usage objects were byte-for-byte the same as the first;
-//! every usage carried all four token counts as integers; `isSidechain` was a
-//! key on every row and `true` on none. The bounds below are set from those
-//! numbers, with room:
+//! Rows are the lines of `~/.claude/projects/<slug>/<uuid>.jsonl`. An assistant
+//! row carries `message.{id,model,usage}`, repeated once per content block, so
+//! each id counts once; a repeat with larger counts sums only the difference.
+//! A row without an id is summed (over-count never hides cost), sidechain rows
+//! are real spend, and an unpriced model yields `usd: null`. Bounds:
 //!
 //! | bound | value | why |
 //! |---|---|---|
-//! | [`MAX_LINE_BYTES`] | 16 MiB | 16× the longest measured row; a longer one is skipped and counted, never buffered |
-//! | [`SEEN_IDS_MAX`] | 4096 | ids are remembered in arrival order and the oldest forgotten past this; ~700× the measured 5-row repeat distance |
+//! | [`MAX_LINE_BYTES`] | 16 MiB | a longer row is skipped and counted, never buffered |
+//! | [`SEEN_IDS_MAX`] | 4096 | ids are remembered in arrival order, oldest forgotten past this; repeats arrive within a few rows |
 //! | [`MAX_ID_BYTES`] | 128 | a longer `message.id` is treated as absent (summed, not deduped) so a hostile id cannot fill the set |
-//! | [`MAX_MODELS`] | 64 | past this many distinct model ids, further ones fold into `"(other)"` |
+//! | [`MAX_MODELS`] | 64 | further distinct model ids fold into `"(other)"` |
 //!
-//! # What is assumed
-//!
-//! A repeat whose usage DIFFERS from the one held RAISES each of the four
-//! counts to the largest seen for that id and sums only the difference — the
-//! message is still counted once. MEASURED 2026-09-25 over this box's
-//! `~/.claude/projects` (1,527 subagent `agent-*.jsonl` files, 24,723 ids):
-//! a SUBAGENT's message is streamed over several rows — first the
-//! message_start usage (`stop_reason: null`, output 4-9), then the final one
-//! (output in the hundreds or thousands; `stop_reason` set, or still `null` on
-//! 619 ids) — and on 18,760 differing repeats a count never went DOWN; input
-//! never differed, and a cache count once. Keeping the first row, as this
-//! fold did until then, left 93 % of subagent output uncounted (2,018,759 of
-//! 27,613,681 tokens); raising to the largest equals keeping the final row,
-//! even where that row's `stop_reason` is still null. Main transcripts showed
-//! no differing repeat at all (36 files, 4,607 ids). A row with
-//! usage but no id cannot be deduped: it is summed and counted, because for a
-//! spend figure an over-count is the direction that does not hide cost. A
-//! sidechain row (`isSidechain: true`) is real API spend and is summed, and
-//! counted so the view can say so. A token field that is missing reads as 0;
-//! a usage object with none of the four is "no usage". A price the caller has
-//! not supplied yields `usd: null`, never `0`: zero would claim the tokens were
-//! free.
-//!
-//! # Honesty of "per model" (design §5.2)
-//!
-//! The windows (`five_hour`, `seven_day`, `spend_limit`, …) are per ACCOUNT:
-//! the vendor reports them account-wide. Nothing here fills them any more:
-//! their one reader, of the vendor's statusLine payload, had no producer once
-//! the `harness statusline` bridge retired (decision B) and was deleted
-//! 2026-09-27, and the view that held them went with it (the review of that
-//! day: tests of a path no producer reached read as coverage), so `harness
-//! usage` names none — `"windows":{}` in the JSON, kept for the schema, and
-//! the HUD's `?%`; the painted `/usage` panel's windows are `harness limits`'
-//! to print ([`usage_panel_windows`]). The per-model figures are SPEND —
-//! tokens and, with a caller-supplied [`PriceTable`], dollars — folded from the
-//! transcript. Nothing here carries a built-in price; the table is injected.
-//!
-//! STATUS: unit-tested against inline fixtures and the measured row shapes
-//! above, and REACHED from the front door: `aterm harness usage [--json]`
-//! prints the view. As of 2026-09-27 the transcript fold
-//! ([`TranscriptUsage`]) also reaches the window's Claude Code footer — its
-//! `Σ` tokens and its limit wall ([`LimitNoticeRow`]) — through
-//! [`super::session_usage`], which folds it incrementally per file, subagent
-//! transcripts included; `harness usage` folds through the same code. No
-//! status bar renders the HUD (design §5.2's `Lane::Harness` does not exist),
-//! and the Sheets sync of §5.2 is unwritten.
+//! The per-account rate-limit windows are not filled here (`"windows":{}`, `?%`
+//! in the HUD); `harness limits` prints them ([`usage_panel_windows`]). The fold
+//! also feeds the window footer's `Σ` tokens and limit wall
+//! ([`LimitNoticeRow`]) through [`super::session_usage`].
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, BufRead};
 
 use aterm_json::{Map, Value};
 
@@ -89,18 +35,16 @@ use aterm_json::{Map, Value};
 
 /// The longest transcript line that is parsed; a longer one is counted in
 /// [`TranscriptUsage::rows_skipped_long`] and its bytes are discarded as they
-/// stream, so memory stays bounded whatever the file holds. 16× the longest
-/// row MEASURED on this box (1,125,606 bytes).
+/// stream, so memory stays bounded. Real rows reach about 1.1 MB.
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
-/// How many `message.id`s [`TranscriptUsage`] remembers for dedupe. Ids are
-/// kept in arrival order; once more than this many are held, the oldest is
-/// forgotten and a later repeat of it would be summed again. MEASURED: repeats
-/// arrive within 5 rows of each other, so the bound is ~700× what is needed.
+/// How many `message.id`s [`TranscriptUsage`] remembers for dedupe, in arrival
+/// order; past this the oldest is forgotten and a later repeat of it would be
+/// summed again. Repeats arrive within a few rows of each other.
 pub const SEEN_IDS_MAX: usize = 4096;
 
-/// A `message.id` longer than this is treated as absent. Real ids are
-/// `msg_…` strings of a few dozen bytes (MEASURED).
+/// A `message.id` longer than this is treated as absent. Real ids are `msg_…`
+/// strings of a few dozen bytes.
 pub const MAX_ID_BYTES: usize = 128;
 
 /// Distinct model ids [`TranscriptUsage`] keeps separately; further ones fold
@@ -200,7 +144,7 @@ impl ModelSpend {
         self.messages = self.messages.saturating_add(1);
     }
 
-    /// Add a message's token counts WITHOUT counting another message — the
+    /// Add a message's token counts without counting another message — the
     /// growth a streamed repeat of one id brings.
     fn add_tokens(&mut self, t: TokenUsage) {
         self.input = self.input.saturating_add(t.input);
@@ -226,13 +170,15 @@ pub enum Fold {
     Summed,
     /// A repeat of an id already counted, with the same usage: folded away.
     Duplicate,
-    /// A repeat of an id already counted whose usage DIFFERED — a streamed
-    /// message's later row: each count was raised to the largest seen for
-    /// the id and the difference summed (the message still counts once),
-    /// and the repeat was counted.
+    /// A repeat of a counted id whose usage differed (a streamed message's
+    /// later row): each count was raised to the largest seen and the
+    /// difference summed.
     Conflict,
     /// A row that is not an assistant row (user, progress, summary, …).
     NotAssistant,
+    /// A main-chain `turn_duration` row: the turn it closes was folded into
+    /// the session's working time ([`TranscriptUsage::busy_ms`]).
+    Turn,
     /// An assistant row with no usage object.
     NoUsage,
     /// Not JSON, not an object, or not UTF-8.
@@ -296,7 +242,7 @@ impl SeenIds {
 }
 
 /// Spend per model, folded one transcript line at a time. Every count below
-/// is exposed so a view can say what it did NOT count.
+/// is exposed so a view can say what it did not count.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptUsage {
     per_model: BTreeMap<String, ModelSpend>,
@@ -318,29 +264,87 @@ pub struct TranscriptUsage {
     pub rows_without_id: u64,
     /// Repeats folded away (same id, same usage) plus conflicts.
     pub duplicates: u64,
-    /// Repeats whose usage differed from the largest held for the id — a
-    /// streamed message's later rows; each raised the counts to the largest
-    /// seen and summed the difference.
+    /// Repeats whose usage differed from the largest held for the id; each
+    /// raised the counts and summed the difference.
     pub conflicting_repeats: u64,
     /// Assistant rows with `isSidechain: true`; summed like any other.
     pub sidechain_rows: u64,
     /// The newest limit notice Claude Code wrote into the transcript, per
     /// window it names ([`LimitNoticeRow`]).
     limit_notices: BTreeMap<String, LimitNoticeRow>,
-    /// Unix seconds of the newest row the API SERVED ([`Self::served_at`]).
+    /// Unix seconds of the newest row the API served ([`Self::served_at`]).
     served_at: Option<i64>,
+    /// The time Claude was working ([`Self::busy_ms`]).
+    busy: BusySpans,
 }
 
-/// A limit notice as Claude Code WROTE it into the transcript: an assistant
-/// row with `isApiErrorMessage: true` whose text is the notice (`You've hit
-/// your session limit · resets 3pm (…)`), stamped with the row's own
-/// `timestamp` — the shape the login wall's row has
-/// (`upgrade::transcript_login_wall`), with `error: rate_limit`. MEASURED in
-/// the 2.1.283 bundle: a rejected rate limit becomes such a row, while the
-/// usage WARNING is only a UI notification and is never written. The row's
-/// time does not move when the conversation is re-rendered (a resume, a
-/// restart, a handoff): it is when the limit was hit, and the reset is placed
-/// from it.
+/// The time Claude was WORKING in one transcript: the union of its main
+/// chain's turns, each `[timestamp − durationMs, timestamp]` of a
+/// `{"type":"system","subtype":"turn_duration"}` row (MEASURED: Claude Code
+/// writes one at every turn's end — 2.1.282, .283, .284 and .286 on this
+/// box). The UNION, not the sum: a turn that waited on a workflow's
+/// subagents is written when they finish, so it can overlap the turns after
+/// it (the sum read 8.04h against a union of 7.88h in one measured session,
+/// 19.27h against 18.77h in another); the first-to-last span is mostly idle
+/// (32.3h and 31.8h for the same two).
+///
+/// Held as disjoint spans in time order with their running sum: a new turn
+/// merges with the spans it overlaps, which are at the back in a transcript
+/// written in time order, so a row costs O(1) amortised. At most
+/// [`BUSY_SPANS_MAX`] spans are kept; past it the oldest leaves the deque
+/// (its time stays in the sum), and a later turn reaching back over a span
+/// that left counts that overlap twice — the stated bound, far past any
+/// measured session (a span per turn; 528 turns in the 150 newest
+/// transcripts here).
+///
+/// What it does NOT count, MEASURED in the 2.1.286 bundle: a turn the person
+/// interrupts (Esc) writes no row (`if (… && !signal.aborted)` guards the
+/// append), and neither does a turn in flight when the process ends (a
+/// relaunch, a crash) — that time is lost, an undercount. A turn still
+/// running is not counted until it ends: the figure never goes down, and
+/// Claude's own spinner times the turn in flight.
+#[derive(Debug, Clone, Default)]
+struct BusySpans {
+    /// Disjoint `[start, end)` spans in unix milliseconds, in time order.
+    spans: VecDeque<(i64, i64)>,
+    /// The sum of every span's length, those that left the deque included.
+    total_ms: u64,
+}
+
+/// The most disjoint spans [`BusySpans`] keeps.
+pub const BUSY_SPANS_MAX: usize = 4096;
+
+impl BusySpans {
+    /// Fold one turn `[start, end)`.
+    fn note(&mut self, start: i64, end: i64) {
+        if end <= start {
+            return;
+        }
+        let len = |(a, b): (i64, i64)| u64::try_from(b - a).unwrap_or(0);
+        // The spans the turn touches: from the first ending at or after its
+        // start to the last starting at or before its end.
+        let from = self.spans.partition_point(|&(_, b)| b < start);
+        let to = self.spans.partition_point(|&(a, _)| a <= end);
+        let mut merged = (start, end);
+        for span in self.spans.drain(from..to.max(from)) {
+            merged = (merged.0.min(span.0), merged.1.max(span.1));
+            self.total_ms = self.total_ms.saturating_sub(len(span));
+        }
+        self.spans.insert(from, merged);
+        self.total_ms = self.total_ms.saturating_add(len(merged));
+        if self.spans.len() > BUSY_SPANS_MAX {
+            self.spans.pop_front();
+        }
+    }
+}
+
+/// A limit notice as Claude Code wrote it into the transcript: an assistant
+/// row with `isApiErrorMessage: true` and `error: rate_limit` whose text is
+/// the notice (`You've hit your session limit · resets 3pm (…)`), stamped with
+/// the row's own `timestamp` (the login wall's row shape,
+/// `upgrade::transcript_login_wall`). A rejected rate limit becomes such a row;
+/// the usage warning is UI-only. The row's time survives re-rendering, so the
+/// reset is placed from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitNoticeRow {
     /// The reset the notice names, as its text prints it
@@ -357,6 +361,26 @@ fn row_time(obj: &Map) -> Option<i64> {
         .and_then(Value::as_str)
         .and_then(super::upgrade_models::parse_utc)
         .and_then(|t| i64::try_from(t).ok())
+}
+
+/// Unix MILLISECONDS of a transcript row's own `timestamp`: [`row_time`]
+/// plus its fraction's first three digits (Claude Code stamps
+/// `2026-09-29T15:11:53.390Z`).
+fn row_time_ms(obj: &Map) -> Option<i64> {
+    let stamp = obj.get("timestamp").and_then(Value::as_str)?;
+    let secs = row_time(obj)?;
+    let millis = stamp
+        .strip_suffix('Z')
+        .and_then(|head| head.get(19..))
+        .and_then(|fraction| fraction.strip_prefix('.'))
+        .map_or(0, |digits| {
+            digits
+                .bytes()
+                .chain(std::iter::repeat(b'0'))
+                .take(3)
+                .fold(0_i64, |ms, d| ms * 10 + i64::from(d.wrapping_sub(b'0')))
+        });
+    secs.checked_mul(1000)?.checked_add(millis)
 }
 
 /// The window a limit notice's text NAMES, reached: `session limit` /
@@ -395,11 +419,10 @@ impl TranscriptUsage {
         &self.per_model
     }
 
-    /// The model id the NEWEST summed row of the main chain named — the
-    /// session's model as its transcript last recorded it (a `/model` switch
-    /// shows from the first answer after it; a subagent's sidechain row names
-    /// its own; a row that names none — [`UNKNOWN_MODEL`], Claude Code's
-    /// `<synthetic>` — leaves it as it was). `None` before such a row.
+    /// The model id the newest summed main-chain row named: the session's
+    /// model as its transcript last recorded it. Sidechain rows and rows naming
+    /// none ([`UNKNOWN_MODEL`], Claude Code's `<synthetic>`) do not move it.
+    /// `None` before such a row.
     pub fn last_model(&self) -> Option<&str> {
         self.last_model.as_deref()
     }
@@ -415,10 +438,8 @@ impl TranscriptUsage {
     }
 
     /// Fold one line. Never panics; a hostile line is [`Fold::Unparsed`] or
-    /// [`Fold::TooLong`].
-    ///
-    /// A line [`cannot_be_assistant`] rejects is never handed to the JSON
-    /// parser — see that function for what the cut costs and what it saves.
+    /// [`Fold::TooLong`]. A line [`cannot_be_assistant`] rejects never reaches
+    /// the JSON parser.
     pub fn fold_line(&mut self, line: &str) -> Fold {
         self.rows = self.rows.saturating_add(1);
         if line.len() > MAX_LINE_BYTES {
@@ -440,8 +461,15 @@ impl TranscriptUsage {
             self.rows_unparsed = self.rows_unparsed.saturating_add(1);
             return Fold::Unparsed;
         };
-        if obj.get("type").and_then(Value::as_str) != Some("assistant") {
-            return Fold::NotAssistant;
+        match obj.get("type").and_then(Value::as_str) {
+            Some("assistant") => {}
+            Some("system")
+                if obj.get("subtype").and_then(Value::as_str) == Some("turn_duration") =>
+            {
+                self.note_turn(obj);
+                return Fold::Turn;
+            }
+            _ => return Fold::NotAssistant,
         }
         let api_error = obj.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
         // Only the vendor's API-error rows need content for a limit notice.
@@ -479,11 +507,10 @@ impl TranscriptUsage {
             .and_then(|m| m.get("id"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty() && s.len() <= MAX_ID_BYTES);
-        // A response the API SERVED: the rule the login wall lifts by
-        // (`upgrade::LoginRow::Lifted`, a row of a real model id — Claude
-        // Code files its own rows under `<synthetic>`, which is none), not an
-        // API-error row, and — below — a message not already counted at
-        // these figures.
+        // A response the API served: not an API-error row, from a real model
+        // id (Claude Code's own rows are `<synthetic>`), and below, a message
+        // not already counted at these figures. The login wall lifts by the
+        // same rule (`upgrade::LoginRow::Lifted`).
         let served = !api_error && model != UNKNOWN_MODEL && super::upgrade::is_model_id(model);
         let Some(id) = id else {
             self.rows_without_id = self.rows_without_id.saturating_add(1);
@@ -520,14 +547,35 @@ impl TranscriptUsage {
         }
     }
 
-    /// Unix seconds of the newest response the API SERVED in this file: an
-    /// assistant row with usage from a real model (not Claude Code's own
-    /// `<synthetic>` rows, not `isApiErrorMessage`), whose message is new or
-    /// grew (a repeat at the same figures is not a new response). A limit
-    /// wall with a response served after its notice no longer blocks
-    /// (`/limit-reset`, extra usage, another account).
+    /// Unix seconds of the newest response the API served in this file: an
+    /// assistant row with usage from a real model (not `<synthetic>`, not
+    /// `isApiErrorMessage`) whose message is new or grew. A limit wall with a
+    /// response served after its notice no longer blocks (`/limit-reset`,
+    /// extra usage, another account).
     pub fn served_at(&self) -> Option<i64> {
         self.served_at
+    }
+
+    /// Milliseconds Claude was working in this transcript: the union of its
+    /// main chain's finished turns ([`BusySpans`]). `0` before a turn ends.
+    pub fn busy_ms(&self) -> u64 {
+        self.busy.total_ms
+    }
+
+    /// Fold a `turn_duration` row: the turn `[timestamp − durationMs,
+    /// timestamp]`. A sidechain's row, or one without both fields, is not
+    /// a main turn and is left out.
+    fn note_turn(&mut self, obj: &Map) {
+        if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        let (Some(end), Some(ms)) = (
+            row_time_ms(obj),
+            num_u64(obj.get("durationMs")).and_then(|ms| i64::try_from(ms).ok()),
+        ) else {
+            return;
+        };
+        self.busy.note(end.saturating_sub(ms), end);
     }
 
     fn note_served(&mut self, obj: &Map) {
@@ -574,48 +622,6 @@ impl TranscriptUsage {
         }
     }
 
-    /// Fold every line of a reader, streaming: a line past [`MAX_LINE_BYTES`]
-    /// is discarded as it arrives and counted, never held. Stops at the first
-    /// read error, keeping what was folded before it.
-    pub fn fold_reader<R: BufRead>(&mut self, mut reader: R) -> io::Result<()> {
-        let mut line: Vec<u8> = Vec::new();
-        let mut overflow = false;
-        loop {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                if overflow {
-                    self.note_long_line();
-                } else if !line.is_empty() {
-                    self.fold_bytes(&line);
-                }
-                return Ok(());
-            }
-            let (chunk, newline) = match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => (&buf[..i], true),
-                None => (buf, false),
-            };
-            let used = chunk.len() + usize::from(newline);
-            if !overflow {
-                if line.len().saturating_add(chunk.len()) > MAX_LINE_BYTES {
-                    overflow = true;
-                    line.clear();
-                } else {
-                    line.extend_from_slice(chunk);
-                }
-            }
-            reader.consume(used);
-            if newline {
-                if overflow {
-                    self.note_long_line();
-                    overflow = false;
-                } else {
-                    self.fold_bytes(&line);
-                }
-                line.clear();
-            }
-        }
-    }
-
     /// Fold one line's raw bytes: [`Self::fold_line`] when they are UTF-8,
     /// else counted unparsed.
     pub(crate) fn fold_bytes(&mut self, line: &[u8]) {
@@ -630,13 +636,11 @@ impl TranscriptUsage {
         }
     }
 
-    /// Add another fold's spend and counters to this one — the files of one
-    /// session, summed for a view. The [`MAX_MODELS`] bound holds: a model
-    /// past it folds into [`OTHER_MODEL`]. The dedupe sets are not merged:
-    /// each file's ids were deduped within that file. Limit notices and the
-    /// served time are not summed: the limit wall is the main transcript's
-    /// own (`session_usage::SessionUsage::main`), and a subagent's notice is
-    /// not the session's.
+    /// Add another fold's spend and counters to this one (the files of one
+    /// session). The [`MAX_MODELS`] bound holds. Dedupe sets are not merged
+    /// (each file deduped within itself). Limit notices and the served time
+    /// are not summed: the limit wall is the main transcript's
+    /// (`session_usage::SessionUsage::main`).
     pub(crate) fn absorb(&mut self, other: &Self) {
         for (model, spend) in &other.per_model {
             let key = self.model_key(model).to_owned();
@@ -656,17 +660,16 @@ impl TranscriptUsage {
             *mine = mine.saturating_add(theirs);
         }
         // The session's model is the first absorbed fold's that names one:
-        // `session_usage::SessionUsage::total_fold` absorbs the main transcript
-        // first, and a subagent's rows are sidechain rows, which name none.
+        // `SessionUsage::total_fold` absorbs the main transcript first, and
+        // subagent rows are sidechain rows, which name none.
         if self.last_model.is_none() {
             self.last_model.clone_from(&other.last_model);
         }
     }
 
-    /// Forget all but the newest `keep` message ids — for a FINISHED file,
-    /// whose totals are all a view needs: the few newest are kept so a
-    /// message still streaming when the file paused is raised, not counted
-    /// again, if the file grows once more.
+    /// Forget all but the newest `keep` message ids, for a finished file: a
+    /// message still streaming when the file paused is then raised, not
+    /// counted again, if the file grows.
     pub(crate) fn shed_seen(&mut self, keep: usize) {
         self.seen.shed(keep);
         self.seen.order.shrink_to_fit();
@@ -696,12 +699,9 @@ impl TranscriptUsage {
         }
     }
 
-    /// Sum one row's usage under `model`; a main-chain row (not a subagent's
-    /// `sidechain`) that names a model id also names the session's model
-    /// ([`Self::last_model`]) — Claude Code's own `<synthetic>` rows (an API
-    /// error, the usage-limit notice, `No response requested.`) carry usage
-    /// and an id but name no model, and never move it (the review of
-    /// 2026-09-27: right after a limit the HUD read `<synthetic>`).
+    /// Sum one row's usage under `model`. A main-chain row naming a model id
+    /// also sets [`Self::last_model`]; Claude Code's `<synthetic>` rows (an API
+    /// error, the usage-limit notice, `No response requested.`) never move it.
     fn add(&mut self, model: &str, usage: TokenUsage, sidechain: bool) {
         if !sidechain && model != UNKNOWN_MODEL && super::upgrade::is_model_id(model) {
             self.last_model = Some(model.to_owned());
@@ -711,37 +711,24 @@ impl TranscriptUsage {
     }
 }
 
-/// Whether this line PROVABLY is not an assistant row, decided on the raw
-/// bytes so the JSON parser never sees it.
-///
-/// A transcript is mostly rows this fold does not want. MEASURED 2026-09-22
-/// over a real 16,228,604-byte transcript (9,772 rows): 6,294 rows — 8,071,052
-/// bytes, half the file — are non-assistant, and building a `Value` tree for
-/// each one was half the fold's whole cost. MEASURED with and without the cut,
-/// same binary, best of 7 in release: that file folds in 34.06 ms without it
-/// and 21.33 ms with it (-37%), and a 222,717-byte one in 0.31 ms against
-/// 0.24 ms.
-///
-/// The cut is SOUND for the question it answers. A JSON string whose value is
-/// `assistant` either carries those nine bytes literally or spells at least one
-/// of them with a `\u` escape — no other JSON escape produces a letter — so a
-/// line holding neither `assistant` nor `\u` cannot say `"type":"assistant"`
-/// however it is written. MEASURED on the same file: 8 of those 6,294 rows
-/// carry a `\u` and are parsed as before.
-///
-/// What it COSTS, stated rather than hidden: a line that is object-shaped and
-/// malformed now answers [`Fold::NotAssistant`] instead of [`Fold::Unparsed`],
-/// because nothing parsed it. That is why the object shape is part of the test
-/// — junk that is not `{…}` still reaches the parser and is still counted
-/// unparsed — and why the one corruption that loses spend, a TORN ASSISTANT
-/// ROW, is unaffected: it carries the word `assistant` and is parsed, and
-/// counted, exactly as before.
+/// Whether this line provably is not an assistant row, decided on the raw
+/// bytes so the JSON parser never sees it. Sound: `"assistant"` in JSON is
+/// either literal or uses a `\u` escape, so a line with neither cannot say
+/// `"type":"assistant"`. A malformed object-shaped line answers
+/// [`Fold::NotAssistant`] instead of [`Fold::Unparsed`].
 fn cannot_be_assistant(line: &str) -> bool {
     line.starts_with('{')
         && line.ends_with('}')
         && !line.contains("assistant")
+        && !line.contains(TURN_DURATION)
         && !line.contains("\\u")
 }
+
+/// The subtype of the row Claude Code writes at every turn's end: it is let
+/// past [`cannot_be_assistant`]'s cut the same way, by its literal bytes (a
+/// `\u`-escaped spelling is parsed anyway), and folded into
+/// [`TranscriptUsage::busy_ms`].
+const TURN_DURATION: &str = "turn_duration";
 
 // ---------------------------------------------------------------------------
 // Prices — injected, never built in
@@ -838,16 +825,20 @@ pub struct SpendView {
 /// One account: its spend (per model) and the model its live session runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountView {
-    /// The owner's label for the account (`accounts.toml`).
+    /// The owner's label for the account (`accounts.toml`). `harness usage`
+    /// names the roster row its Claude Code's login names, where two or more
+    /// are listed, and says `account` where it cannot tell.
     pub label: String,
-    /// The config directory, when the caller wants it shown.
+    /// The config directory, when the caller wants it shown (`harness usage`
+    /// shows none).
     pub dir: Option<String>,
-    /// Whether this is the account the live session runs under.
+    /// Whether this is the account the live session runs under: always, for
+    /// the one account `harness usage` shows. Not the machine's active
+    /// account, which is `harness accounts --json`'s.
     pub active: bool,
     /// Spend by model id.
     pub spend: BTreeMap<String, SpendView>,
-    /// The session's model id: the one its transcript's newest summed row
-    /// names ([`TranscriptUsage::last_model`], taken by
+    /// The session's model id ([`TranscriptUsage::last_model`], taken by
     /// [`Self::add_transcript`]).
     pub model: Option<String>,
 }
@@ -904,51 +895,29 @@ impl UsageView {
 }
 
 // ---------------------------------------------------------------------------
-// The `/usage` panel, read off aterm's own grid (design §5.2 "source 0")
+// The `/usage` panel, read off aterm's own grid
 // ---------------------------------------------------------------------------
 
-/// One rate-limit window the vendor PAINTED on its `/usage` panel, before its
-/// reset text is placed on a clock.
-///
-/// This is the producer design §5.8.1 rank 1 always described and nothing
-/// built: [`super::source::Source::Grid`] was admissible and rankable, and no reader
-/// could construct one. What the vendor prints was MEASURED twice against
-/// Claude Code 2.1.278 on 2026-09-22 — once by extracting the renderer from
-/// the installed binary, and once by driving a real session and reading the
-/// screen back over aterm's own control socket.
-///
-/// **The footer carries no quota figure, and saying so is the finding.** The
-/// footer's only percentage is the CONTEXT indicator
-/// (`aterm_phase::context_left`: `7% until auto-compact`), which is not a
-/// quota; a captured idle footer read `⏵⏵ auto mode on (shift+tab to cycle) ·
-/// ← for agents` and nothing else. A limit BANNER
-/// (`aterm_phase::limit_notice`) carries a reset and an exhausted-yes and
-/// never a percentage. The one surface that paints a quota figure is the
-/// `/usage` panel, and this is its reader.
+/// One rate-limit window Claude Code painted on its `/usage` panel, before its
+/// reset text is placed on a clock; the producer of
+/// [`super::source::Source::Grid`]. The panel is the only surface that paints
+/// a quota figure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelWindow {
     /// The window key this row names (the vendor's own: `five_hour`, …).
     pub name: String,
-    /// The whole-number percent the vendor printed (`7% used` → 7). The
-    /// vendor floors its own figure (`Math.floor(utilization)`, MEASURED), so
-    /// this is the painted integer and never a re-derivation of it.
+    /// The whole-number percent printed (`7% used` → 7). The vendor floors its
+    /// own figure, so this is the painted integer, never re-derived.
     pub used_pct: u32,
-    /// The text after `Resets `, exactly as painted, NOT placed on a clock:
-    /// this module reads no clock. `None` when the row carried no reset.
+    /// The text after `Resets `, exactly as painted and not placed on a clock.
+    /// `None` when the row carried no reset.
     pub reset_text: Option<String>,
 }
 
-/// The panel titles whose window key is MEASURED, and the key each names.
-///
-/// `Current week (Fable)` is the row that matters most: design §5.8.2 records
-/// the Fable window as `seven_day_overage_included`, delivered only through
-/// the `anthropic-ratelimit-unified-*` headers — "not in the statusLine
-/// `rate_limits` schema and not a `cachedUsageUtilization` key … so the HUD
-/// cannot show it". The vendor PAINTS it (captured 2026-09-22:
-/// `Current week (Fable)` at `100% used`), and the vendor's own label map
-/// spells that bucket `seven_day_overage_included:"Fable limit"`. So the grid
-/// is not merely a fallback for figures the statusLine also carries — it is
-/// the only readable source for that one.
+/// The panel titles with a known window key, and the key each names.
+/// `Current week (Fable)` is the vendor's `seven_day_overage_included` bucket,
+/// which the statusLine schema does not carry, so the painted panel is the
+/// only readable source for it.
 const PANEL_TITLES: [(&str, &str); 5] = [
     ("Current session", "five_hour"),
     ("Current week (all models)", "seven_day"),
@@ -958,10 +927,9 @@ const PANEL_TITLES: [(&str, &str); 5] = [
 ];
 
 /// How many rows past a title row the reader looks for that window's figure.
-/// MEASURED: the wide layout (panel width ≥ 62) needs 2 — title, then
-/// `<bar> N% used`, then `Resets …`; the narrow layout needs 5 — title with
-/// the reset wrapped onto the next row, the bar (which itself wraps at
-/// 100 %), a blank, then `N% used`.
+/// The wide layout (panel width ≥ 62) needs 2 (title, `<bar> N% used`,
+/// `Resets …`); the narrow layout needs 5 (title with the reset wrapped below,
+/// the bar, which itself wraps at 100 %, a blank, then `N% used`).
 const PANEL_BLOCK_ROWS: usize = 7;
 
 /// The longest window key this reader will mint for an unmeasured display
@@ -1025,14 +993,11 @@ fn panel_key_slug(display: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// The window key a panel title names, and what the title row carries AFTER
-/// it (the narrow layout's ` · Resets …`, or the copied text form's
-/// `: 62% used · resets …`).
-///
-/// A `Current week (<x>)` whose display name is not one of the measured ones
-/// mints `seven_day_<slug>` — UNVERIFIED as a vendor key, and deliberately
-/// not a guess that could land on a measured one, because every measured key
-/// is matched first.
+/// The window key a panel title names, and what the title row carries after
+/// it (the narrow layout's ` · Resets …`, or the text form's
+/// `: 62% used · resets …`). An unknown `Current week (<x>)` mints
+/// `seven_day_<slug>`, unverified as a vendor key; known keys are matched
+/// first, so it never lands on one.
 fn panel_title(row: &str) -> Option<(String, &str)> {
     let t = row.trim();
     for (title, key) in PANEL_TITLES {
@@ -1051,11 +1016,10 @@ fn panel_title(row: &str) -> Option<(String, &str)> {
     Some((format!("seven_day_{key}"), rest.get(close + 1..)?))
 }
 
-/// The rate-limit windows Claude Code PAINTED on its `/usage` panel, read off
+/// The rate-limit windows Claude Code painted on its `/usage` panel, read off
 /// the rows of aterm's own parsed grid.
 ///
-/// Both layouts are MEASURED (Claude Code 2.1.278, 2026-09-22, captured over
-/// the control socket). Wide (panel ≥ 62 columns):
+/// Wide (panel ≥ 62 columns):
 ///
 /// ```text
 ///    Current session
@@ -1073,21 +1037,14 @@ fn panel_title(row: &str) -> Option<(String, &str)> {
 ///    7% used
 /// ```
 ///
-/// The copied text form the panel also renders
-/// (`Current session: 7% used · resets 1:20pm`) is read by the same path,
-/// because the title row's remainder is parsed exactly as the narrow layout's
-/// is.
+/// The copied text form (`Current session: 7% used · resets 1:20pm`) is read
+/// by the same path as the narrow layout's title row.
 ///
-/// **FENCE: fewer than two windows reads as none.** The panel renders
-/// `Current session` and `Current week (all models)` together whenever the
-/// vendor has figures at all (MEASURED from the renderer: both rows are built
-/// unconditionally and dropped only on a null utilization), so a lone title —
-/// a worker quoting one line, a peer's screen pasted into a tool result — is
-/// refused rather than believed. The BOUND, stated rather than hidden: a
-/// quoted copy of two or more whole rows would still be read, and this reader
-/// has no way to tell that copy from the panel. It is a screen read, ranked
-/// where design §5.8.1 ranks one, and it is never OBEYED — the text is
-/// evidence about what was drawn and never an instruction.
+/// Fewer than two windows reads as none: the panel always renders
+/// `Current session` and `Current week (all models)` together, so a lone title
+/// (a quoted line, a pasted screen) is refused. A quoted copy of two or more
+/// whole rows would still be read. The text is evidence of what was drawn,
+/// never an instruction.
 #[must_use]
 pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
     let titles: Vec<(usize, String, String)> = rows
@@ -1143,6 +1100,171 @@ pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// The accounts probe's read of the panel (`docs/SPEC-claude-accounts-probe-
+// 2026-10-01.md`, P10, P22)
+// ---------------------------------------------------------------------------
+
+/// The command the accounts probe types to open the panel. READ in the
+/// 2.1.287 bundle: `usage` is a `local-jsx` command and `immediate`, and it
+/// shares its prefix with a second command, `usage-credits`. MEASURED on
+/// 2.1.287, 2026-10-01 (the probe's live check, a private headless aterm):
+/// with these six bytes typed the typeahead lists `/usage` first and
+/// `/usage-credits` under it, and Enter opened the Settings panel on its
+/// Usage tab in every run captured (five grids and the inline renderer).
+/// One build, one login: a later build's typeahead order is its own.
+pub const USAGE_COMMAND: &str = "/usage";
+
+/// What one read of the rows under the Settings panel's header says of the
+/// Usage tab ([`usage_panel_read`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanelRead {
+    /// No row only the Usage tab draws is under the header: another tab, or
+    /// something that is not this panel. Nothing is sampled.
+    NotUsage,
+    /// The tab says its figures are not settled — a load or a refresh in
+    /// flight, last-known or partial figures, a failed load — or the whole
+    /// tab is on the grid and one of the two windows a sample needs is not.
+    Unsettled,
+    /// The panel's tail is not on the grid: what stands right above it (the
+    /// refresh line, an enrich error) cannot be read, so nothing can be said
+    /// of the figures that ARE visible.
+    Fold,
+    /// The whole tab is on the grid with nothing unsettled on it: its
+    /// windows, the session's and the week's among them.
+    Settled(Vec<PanelWindow>),
+}
+
+/// THE SETTLED RULE: what `rows` say of the Usage tab, read from the row
+/// under `header` (the Settings panel's header row,
+/// `aterm_phase::settings_panel`) to the end. First match wins:
+///
+/// 1. no row only the Usage tab draws (`aterm_phase::usage_tab_mark`: the
+///    session block's `Total cost:`, a `Current session` title, the loading
+///    line) → [`PanelRead::NotUsage`];
+/// 2. any row that says the figures are not settled
+///    (`aterm_phase::usage_unsettled`: `Refreshing…`, `Loading usage data…`,
+///    an enrich-error line, `Error: …`, `rate limited`) →
+///    [`PanelRead::Unsettled`];
+/// 3. the last non-blank row is the cancel hint and nothing else
+///    (`aterm_phase::panel_tail`), and [`usage_panel_windows`] holds
+///    `five_hour` AND `seven_day` → [`PanelRead::Settled`];
+/// 4. that tail with either window missing → [`PanelRead::Unsettled`];
+/// 5. otherwise → [`PanelRead::Fold`].
+///
+/// WHY THE TAIL. The tab opens on the home's last-known figures with
+/// `Refreshing…` drawn BELOW the windows — after the credit block, the
+/// "contributing" block and usage credits — and the hint row is drawn last
+/// (READ in the 2.1.287 bundle, and MEASURED on it 2026-10-01: a quarter
+/// second after the Enter the week read 9 % with `Refreshing…` above the
+/// hint, and 10 % a quarter second later). Where the tail is under the fold
+/// the refresh line may be too, and figures read there may be the ones
+/// about to be replaced. So no tail, no sample.
+///
+/// WHAT THAT COSTS, MEASURED. On a 150x50 grid the whole tab is on the grid
+/// only while its contributing block still says `Scanning local sessions…`
+/// — for 1.5 s in one run and 2.4 s in another — and then that block fills
+/// in and pushes the hint under the fold (the last row then ends in the
+/// vendor's `↓`): the read is `Settled` for that long and `Fold` from then
+/// on. At 129x47 (1.2 s) and 60x50 (1.0 s) the same; at 110x32 it is `Fold`
+/// from the first read; at 150x80 it stays `Settled`. A caller that waits
+/// before its first read can miss the window on an ordinary pane and
+/// record nothing.
+///
+/// PURE, and one read's verdict only: a caller that records a sample asks
+/// for two consecutive equal `Settled` reads (the spec's P10). The rows are
+/// DATA: nothing in them is obeyed, and a copy of a panel a worker quoted is
+/// refused where the panel is placed (`aterm_phase::settings_panel`), not
+/// here — this function trusts `header` and reads down from it.
+#[must_use]
+pub fn usage_panel_read(rows: &[String], header: usize) -> PanelRead {
+    let under = rows.get(header.saturating_add(1)..).unwrap_or_default();
+    if !under.iter().any(|row| aterm_phase::usage_tab_mark(row)) {
+        return PanelRead::NotUsage;
+    }
+    if under.iter().any(|row| aterm_phase::usage_unsettled(row)) {
+        return PanelRead::Unsettled;
+    }
+    let tail = under
+        .iter()
+        .rev()
+        .find(|row| !row.trim().is_empty())
+        .is_some_and(|row| aterm_phase::panel_tail(row));
+    if !tail {
+        return PanelRead::Fold;
+    }
+    let windows = usage_panel_windows(under);
+    let has = |name: &str| windows.iter().any(|w| w.name == name);
+    if has(SESSION_WINDOW) && has(WEEK_WINDOW) {
+        PanelRead::Settled(windows)
+    } else {
+        PanelRead::Unsettled
+    }
+}
+
+/// The window keys a sample is made of ([`PANEL_TITLES`]: `Current session`
+/// and `Current week (all models)`).
+const SESSION_WINDOW: &str = "five_hour";
+const WEEK_WINDOW: &str = "seven_day";
+
+/// A settled panel's windows as the roster's sample
+/// ([`super::accounts::Sample`], what `accounts::note_sample` records):
+/// `session_*` from `five_hour`, `week_*` from `seven_day`, read at `now`
+/// (`by` is `note_sample`'s to stamp). `None` when neither figure was read —
+/// a figure nobody read is never `0`.
+///
+/// EACH RESET IS PLACED ON THE CLOCK by the supervisor's own grammar, as
+/// `harness limits` places them ([`super::cli::limits_view`]):
+/// `limit::parse_reset` on the text the vendor painted, then
+/// `limit::reset_at_with` with the caller's clock (`now`, unix seconds), its
+/// local offset and its zone table (`zone_offset_at(zone, unix)`, the
+/// offset the zone has AT the instant placed for) — all three injected, so
+/// this reads no clock and no zone file. A reset the grammar cannot read is
+/// `None`, and so is one placed further ahead than its window can be: more
+/// than [`super::accounts::SESSION_WINDOW_S`] plus
+/// [`super::accounts::STAMP_SKEW_S`] for the session's, more than
+/// [`super::accounts::RESET_BELIEVED_S`] for the week's. Its figure is kept:
+/// the roster then counts it for one window length from the sample
+/// (`Sample::session`, `Sample::week`). A reset placed in the PAST is kept
+/// as placed, and voids its figure there: the window the panel showed has
+/// ended.
+#[must_use]
+pub fn panel_sample(
+    windows: &[PanelWindow],
+    now: i64,
+    local_offset_s: i64,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+) -> Option<super::accounts::Sample> {
+    use super::accounts::{RESET_BELIEVED_S, SESSION_WINDOW_S, STAMP_SKEW_S, Sample};
+    use crate::supervise::limit;
+    let read = |name: &str, ahead_max: i64| {
+        let window = windows.iter().find(|w| w.name == name)?;
+        let reset = window
+            .reset_text
+            .as_deref()
+            .and_then(limit::parse_reset)
+            .map(|spec| limit::reset_at_with(&spec, now, local_offset_s, zone_offset_at))
+            .filter(|at| at.saturating_sub(now) <= ahead_max);
+        Some((window.used_pct, reset))
+    };
+    let session = read(
+        SESSION_WINDOW,
+        SESSION_WINDOW_S.saturating_add(STAMP_SKEW_S),
+    );
+    let week = read(WEEK_WINDOW, RESET_BELIEVED_S);
+    if session.is_none() && week.is_none() {
+        return None;
+    }
+    Some(Sample {
+        session_pct: session.map(|(pct, _)| pct),
+        session_reset: session.and_then(|(_, reset)| reset),
+        week_pct: week.map(|(pct, _)| pct),
+        week_reset: week.and_then(|(_, reset)| reset),
+        at: now,
+        by: String::new(),
+    })
+}
+
 /// The fold's per-model totals as spend rows, priced where the table allows.
 pub fn spend_from_transcript(
     usage: &TranscriptUsage,
@@ -1183,9 +1305,8 @@ pub fn model_short(id: &str) -> String {
 }
 
 /// Line-breaking characters become spaces: the HUD is one line of a status
-/// field, and the question of what breaks a line is
-/// [`crate::supervise::limit::breaks_a_line`] — not `char::is_control()`,
-/// which is Cc-only and let `U+2028` through this sweep into that field.
+/// field. What breaks a line is [`crate::supervise::limit::breaks_a_line`],
+/// not `char::is_control()` (Cc-only, which misses `U+2028`).
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -1211,11 +1332,10 @@ fn truncate_to(mut s: String, max: usize) -> String {
 
 /// The one-line HUD: `fable ?%/5h · ?%/7d · acct work · resets ? · none`.
 ///
-/// The model is the shown account's live model family. The two windows'
-/// figures and the reset are `?` and their source `none`: no reader here
-/// knows a window (module doc) — `harness limits` prints the ones the
-/// vendor's `/usage` panel painted — and the line says so rather than
-/// inventing a number. Cut to [`HUD_MAX_BYTES`] on a char boundary.
+/// The model is the account's live model family, and `acct` its label
+/// ([`AccountView::label`]). The windows' figures and reset are `?` with
+/// source `none`, since nothing here knows a window (see `harness limits`).
+/// Cut to [`HUD_MAX_BYTES`] on a char boundary.
 pub fn hud_line(view: &UsageView) -> String {
     let Some(acct) = view.shown() else {
         return "no account".to_owned();
@@ -1295,10 +1415,9 @@ fn account_json(a: &AccountView) -> Value {
     Value::Object(o)
 }
 
-/// The `harness usage --json` document, schema 1 (design §5.2). Keys are
-/// emitted in sorted order (the writer's rule). `identity` and `failover` are
-/// not this slice's to know and are absent; `sheet` is the fixed
-/// `{enabled:false,last_sync:null,last_error:null}` until Sheets sync exists.
+/// The `harness usage --json` document, schema 1, keys in sorted order.
+/// `identity` and `failover` are absent; `sheet` is the fixed
+/// `{enabled:false,last_sync:null,last_error:null}`.
 pub fn usage_json(view: &UsageView) -> String {
     let mut root = Map::new();
     root.insert("schema".to_owned(), Value::from(1u64));
@@ -1325,18 +1444,15 @@ pub fn usage_json(view: &UsageView) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::io::{BufReader, Write};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     // -- fixtures -----------------------------------------------------------
 
     /// The `/usage` panel exactly as Claude Code 2.1.278 painted it in a
     /// 120-column session, captured over aterm's control socket 2026-09-22.
-    /// The leading three-space indent is the vendor's, kept verbatim.
-    const PANEL_WIDE: &str = "\
-   Settings  Status   Config   Usage   Stats
+    /// The leading three-space indent is the vendor's, kept verbatim (the
+    /// literal opens on its first row: a `\` continuation there ate that
+    /// row's indent, which the Settings-panel reader places the header by).
+    const PANEL_WIDE: &str = "   Settings  Status   Config   Usage   Stats
 
    Session
 
@@ -1363,8 +1479,7 @@ mod tests {
     /// The same panel at 56 columns, where the reset WRAPS onto the row under
     /// the title and the meter, the blank and the figure follow it. Same
     /// capture, same session, resized.
-    const PANEL_NARROW: &str = "\
-   Current session · Resets 1:20pm
+    const PANEL_NARROW: &str = "   Current session · Resets 1:20pm
    (America/Los_Angeles)
    ███▊
 
@@ -1397,29 +1512,6 @@ mod tests {
 
     fn fold_all(t: &mut TranscriptUsage, lines: &[&str]) -> Vec<Fold> {
         lines.iter().map(|l| t.fold_line(l)).collect()
-    }
-
-    static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
-
-    struct TestDir(PathBuf);
-
-    impl TestDir {
-        fn new(label: &str) -> Self {
-            let nonce = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "aterm-harness-usage-{label}-{}-{nonce}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("create the scratch root");
-            Self(path)
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
 
     fn view_with(acct: AccountView) -> UsageView {
@@ -1535,9 +1627,8 @@ mod tests {
 
     #[test]
     fn the_byte_prefilter_never_drops_a_row_the_parser_would_have_summed() {
-        // The prefilter's whole risk is an assistant row it does not recognise.
-        // NEGATIVE CONTROL: the type value spelled with a `\u` escape is legal
-        // JSON, carries the word nowhere, and must still be summed.
+        // Negative control for the prefilter: the type value spelled with a
+        // `\u` escape is legal JSON without the literal word, and is summed.
         let mut t = TranscriptUsage::new();
         let escaped = r#"{"type":"\u0061ssistant","message":{"id":"msg_esc","model":"m","usage":{"input_tokens":7}}}"#;
         assert!(!cannot_be_assistant(escaped), "a `\\u` line must be parsed");
@@ -1555,7 +1646,7 @@ mod tests {
             assert_eq!(t.fold_line(skipped), Fold::NotAssistant, "{skipped}");
         }
 
-        // And the rows it may NOT skip, each for its own reason.
+        // And the rows it may not skip, each for its own reason.
         for parsed in [
             r#"{"type":"assistant","message":{}}"#, // says the word
             r#"{"type":"user","text":"\u00e9"}"#,   // carries an escape
@@ -1565,10 +1656,9 @@ mod tests {
             assert!(!cannot_be_assistant(parsed), "{parsed}");
         }
 
-        // WHAT THE CUT COSTS, pinned rather than left to be discovered: a torn
-        // ASSISTANT row still counts unparsed (it says the word), while a torn
-        // object-shaped row that cannot be one now counts NotAssistant, because
-        // nothing parsed it.
+        // The cut's cost: a torn assistant row still counts unparsed (it says
+        // the word), while a torn object-shaped row that cannot be one counts
+        // NotAssistant.
         let mut u = TranscriptUsage::new();
         assert_eq!(
             u.fold_line(r#"{"type":"assistant","message":{"usage":}"#),
@@ -1609,7 +1699,7 @@ mod tests {
         assert_eq!(t.fold_line(&long), Fold::TooLong);
         assert_eq!(t.rows_skipped_long, 1);
         assert!(t.per_model().is_empty());
-        // The longest real row measured (1,125,606 bytes) is well inside.
+        // A real-sized row (about 1.1 MB) is well inside.
         let real_sized = format!(
             r#"{{"type":"assistant","message":{{"id":"msg_r","model":"m","usage":{{"input_tokens":1}},"pad":"{}"}}}}"#,
             "x".repeat(1_125_606)
@@ -1653,6 +1743,35 @@ mod tests {
         assert_eq!(t.duplicates, 2);
     }
 
+    /// WORKING TIME is the UNION of the main chain's turns, each the
+    /// `[timestamp − durationMs, timestamp]` of the `turn_duration` row
+    /// Claude Code writes at its end (2.1.284's shape): a turn written late
+    /// over the turns after it (a workflow's) counts once, a sidechain's row
+    /// not at all, and a row past the raw-byte cut is still parsed.
+    #[test]
+    fn working_time_is_the_union_of_the_main_chains_turns() {
+        let turn = |at: &str, ms: u64, side: bool| {
+            format!(
+                r#"{{"parentUuid":"p","isSidechain":{side},"type":"system","subtype":"turn_duration","durationMs":{ms},"messageCount":28,"timestamp":"2026-09-29T15:{at}Z","uuid":"u","isMeta":false,"version":"2.1.284"}}"#
+            )
+        };
+        let mut t = TranscriptUsage::new();
+        assert_eq!(t.fold_line(&turn("00:10.500", 10_500, false)), Fold::Turn);
+        assert_eq!(t.busy_ms(), 10_500);
+        // 15:00:20–15:00:30, then a workflow turn written at 15:01:00 that
+        // began at 15:00:05: it covers both before it, and 15:00:10.5–20.
+        fold_all(
+            &mut t,
+            &[
+                &turn("00:30.000", 10_000, false),
+                &turn("01:00.000", 55_000, false),
+                &turn("02:00.000", 30_000, true),
+            ],
+        );
+        assert_eq!(t.busy_ms(), 60_000, "the union, not the 75.5 s sum");
+        assert_eq!(t.assistant_rows, 0, "no turn row is an answer");
+    }
+
     /// THE MEASURED SUBAGENT SHAPE (2026-09-25, `agent-*.jsonl`): one message
     /// streamed over three rows — `stop_reason` null with the message_start
     /// output twice, then the final row. Its output is the final 349, once;
@@ -1679,11 +1798,11 @@ mod tests {
         assert_eq!((m.input, m.cache_write, m.cache_read), (3, 1200, 20_000));
     }
 
-    /// A LIMIT NOTICE WRITTEN INTO THE TRANSCRIPT (the vendor's own row shape:
-    /// `model: <synthetic>`, `isApiErrorMessage: true`, the notice as its
-    /// text, its own `timestamp`) is kept per window it names, the newest
-    /// one — with the reset its text names. A notice that names no window,
-    /// an ordinary assistant row quoting the words, and an older row are not.
+    /// A limit notice written into the transcript (`model: <synthetic>`,
+    /// `isApiErrorMessage: true`, the notice as text, its own `timestamp`) is
+    /// kept per window it names, the newest one, with the reset its text names.
+    /// A notice naming no window, an ordinary row quoting the words, and an
+    /// older row are not.
     #[test]
     fn a_limit_notice_row_is_kept_with_its_time() {
         let notice = |text: &str, ts: &str, api_error: bool| {
@@ -1804,10 +1923,10 @@ mod tests {
         }
     }
 
-    /// THE SERVED TIME is the newest response the API served: a row with
-    /// usage whose message is new or grew, or has no id — not Claude Code's
-    /// own rows (`isApiErrorMessage`, `<synthetic>`), not a repeat at the
-    /// same figures, not a row without usage or without a model.
+    /// The served time is the newest response the API served: a row with usage
+    /// whose message is new or grew, or has no id. Not Claude Code's own rows
+    /// (`isApiErrorMessage`, `<synthetic>`), not a same-figure repeat, not a
+    /// row without usage or model.
     #[test]
     fn the_served_time_is_the_newest_served_response() {
         let at = |minute: u32| format!("2026-09-24T21:{minute:02}:00.000Z");
@@ -1955,48 +2074,6 @@ mod tests {
         assert_eq!(t.per_model()["model-000"].messages, 2);
     }
 
-    #[test]
-    fn transcript_fold_reader_streams_a_file_past_an_oversize_line() {
-        let dir = TestDir::new("reader");
-        let path = dir.0.join("session.jsonl");
-        {
-            let mut f = fs::File::create(&path).expect("create");
-            writeln!(f, "{}", assistant_row("msg_1", "m", 10, 1)).expect("write");
-            writeln!(f, "{}", assistant_row("msg_1", "m", 10, 1)).expect("write");
-            write!(f, "{{\"type\":\"assistant\",\"pad\":\"").expect("write");
-            // Written in chunks so the reader sees it across many fill_buf calls.
-            let chunk = "y".repeat(64 * 1024);
-            for _ in 0..(MAX_LINE_BYTES / chunk.len() + 1) {
-                f.write_all(chunk.as_bytes()).expect("write");
-            }
-            writeln!(f, "\"}}").expect("write");
-            f.write_all(b"\xff\xfe not utf8\n").expect("write");
-            writeln!(f, "{}", assistant_row("msg_2", "m", 5, 2)).expect("write");
-            // Last line without a trailing newline still folds.
-            write!(f, "{}", assistant_row("msg_3", "m", 1, 1)).expect("write");
-        }
-        let mut t = TranscriptUsage::new();
-        let file = fs::File::open(&path).expect("open");
-        t.fold_reader(BufReader::with_capacity(8 * 1024, file))
-            .expect("fold");
-        assert_eq!(t.rows, 6);
-        assert_eq!(t.rows_skipped_long, 1);
-        assert_eq!(t.rows_unparsed, 1);
-        assert_eq!(t.duplicates, 1);
-        let s = t.per_model()["m"];
-        assert_eq!((s.input, s.output, s.messages), (16, 4, 3));
-    }
-
-    #[test]
-    fn transcript_fold_reader_empty_and_newline_only_inputs() {
-        let mut t = TranscriptUsage::new();
-        t.fold_reader(BufReader::new(&b""[..])).expect("fold");
-        assert_eq!(t.rows, 0);
-        t.fold_reader(BufReader::new(&b"\n\n"[..])).expect("fold");
-        assert_eq!(t.rows, 2);
-        assert_eq!(t.rows_unparsed, 0, "blank lines are not errors");
-    }
-
     // -- PriceTable ---------------------------------------------------------
 
     #[test]
@@ -2079,10 +2156,10 @@ mod tests {
 
     // -- the view -----------------------------------------------------------
 
-    /// The account's model is the one its transcript's newest main-chain row
-    /// names: a `/model` switch shows from the first answer after it, and a
-    /// subagent's sidechain row on another model does not move it.
-    /// NEGATIVE CONTROL: a fold with no row that names a model names none.
+    /// The account's model is the one the newest main-chain row names: a
+    /// `/model` switch shows from the next answer, and a sidechain row on
+    /// another model does not move it. Negative control: no naming row names
+    /// none.
     #[test]
     fn the_account_model_is_the_newest_main_chain_row_of_its_transcript() {
         let mut t = TranscriptUsage::new();
@@ -2112,14 +2189,9 @@ mod tests {
         assert_eq!(a.model, None);
     }
 
-    /// `harness usage` reads the session's SUM (`SessionUsage::total_fold`),
-    /// which absorbs the main transcript's fold and then each subagent's into
-    /// a fresh one: the sum names the main transcript's model, and a
-    /// subagent's file — sidechain rows on another model — does not move it.
-    /// FAILED before 2026-09-28 (the merge of the model rule with the
-    /// session sum): `absorb` carried spend and counters but no model, so the
-    /// view `harness usage` prints named none. NEGATIVE CONTROL: a sum of
-    /// folds that name no model names none.
+    /// The session sum (`SessionUsage::total_fold`) names the main transcript's
+    /// model; a subagent's sidechain rows on another model do not move it.
+    /// Negative control: a sum of folds that name no model names none.
     #[test]
     fn the_session_sum_names_the_main_transcripts_model() {
         let mut main = TranscriptUsage::new();
@@ -2140,19 +2212,17 @@ mod tests {
         let mut a = AccountView::new("account", true);
         a.add_transcript(&all, &PriceTable::new());
         assert_eq!(a.model.as_deref(), Some("claude-fable-5-1"));
-        // NEGATIVE CONTROL: nothing named anywhere, nothing named in the sum.
+        // Negative control: nothing named anywhere, nothing named in the sum.
         let mut none = TranscriptUsage::new();
         none.absorb(&sub);
         none.absorb(&TranscriptUsage::new());
         assert_eq!(none.last_model(), None);
     }
 
-    /// THE REVIEW OF 2026-09-27: Claude Code's `<synthetic>` rows (an API
-    /// error, the usage-limit notice, `No response requested.`) carry usage
-    /// and an id on the main chain, and right after a limit — when `harness
-    /// usage` is read — the HUD named `<synthetic>`. A row that names no
-    /// model id leaves the session's model as it was. NEGATIVE CONTROL: a
-    /// real model after it moves it.
+    /// Claude Code's `<synthetic>` rows (an API error, the usage-limit notice,
+    /// `No response requested.`) carry usage and an id on the main chain but
+    /// leave the session's model as it was. Negative control: a real model
+    /// after it moves it.
     #[test]
     fn a_synthetic_row_never_names_the_sessions_model() {
         let synthetic = r#"{"type":"assistant","isSidechain":false,"message":{"id":"msg_x","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your limit"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
@@ -2175,7 +2245,7 @@ mod tests {
         let mut only = TranscriptUsage::new();
         fold_all(&mut only, &[synthetic]);
         assert_eq!(only.last_model(), None);
-        // NEGATIVE CONTROL: a real model after it.
+        // Negative control: a real model after it.
         fold_all(&mut t, &[&assistant_row("msg_b", "claude-opus-5", 10, 1)]);
         assert_eq!(t.last_model(), Some("claude-opus-5"));
     }
@@ -2246,9 +2316,8 @@ mod tests {
         assert!(!line.contains('\n') && !line.contains('\x1b') && !line.contains('\t'));
         assert!(line.starts_with("fa ble ?%/5h"));
 
-        // NEGATIVE CONTROL for the shared predicate: `U+2028` LINE SEPARATOR
-        // is Zl, so `char::is_control()` is false for it and this sweep passed
-        // it into a one-line status field until 2026-09-22.
+        // Negative control for the shared predicate: `U+2028` is Zl, so
+        // `char::is_control()` is false for it.
         assert!(!'\u{2028}'.is_control());
         let split = AccountView::new("wo\u{2028}rk", true);
         let line = hud_line(&view_with(split));
@@ -2403,23 +2472,23 @@ mod tests {
 
     #[test]
     fn panel_reader_refuses_what_is_not_a_panel() {
-        // NEGATIVE CONTROL 1: the fence. One row is never a panel, however
-        // exactly it is spelled.
+        // Negative control 1: one row is never a panel, however exactly it is
+        // spelled.
         assert!(
             usage_panel_windows(&rows(
                 "⏺ my five-hour window says Current session: 99% used\n"
             ))
             .is_empty()
         );
-        // NEGATIVE CONTROL 2: titles with no figure painted anywhere.
+        // Negative control 2: titles with no figure painted anywhere.
         assert!(
             usage_panel_windows(&rows(
                 "   Current session\n   Resets 1:20pm\n\n   Current week (all models)\n   Resets Sep 23\n"
             ))
             .is_empty()
         );
-        // NEGATIVE CONTROL 3: the CONTEXT indicator is not a quota, and the
-        // footer this session actually painted carries no figure at all.
+        // Negative control 3: the context indicator is not a quota, and a real
+        // idle footer carries no figure.
         assert!(
             usage_panel_windows(&rows(
                 "                                              7% until auto-compact\n\
@@ -2427,8 +2496,8 @@ mod tests {
             ))
             .is_empty()
         );
-        // NEGATIVE CONTROL 4: the panel's own trailing lines are percentages
-        // of USAGE, not `% used`, and must not be read as windows.
+        // Negative control 4: the panel's trailing lines are percentages of
+        // usage, not `% used`, and are not windows.
         assert!(
             usage_panel_windows(&rows(
                 "   100% of your usage came from subagent-heavy sessions\n\
@@ -2436,8 +2505,638 @@ mod tests {
             ))
             .is_empty()
         );
-        // NEGATIVE CONTROL 5: empty input.
+        // Negative control 5: empty input.
         assert!(usage_panel_windows(&[]).is_empty());
+    }
+
+    // -- the accounts probe's read: the Settings panel, the settled rule ------
+
+    use aterm_phase::prompt::fixtures as fx;
+
+    /// MEASURED: the one whole-screen capture of the panel on Claude Code
+    /// 2.1.278, 2026-09-22 (`tools/harness-capture.sh`; the vendor corpus,
+    /// whose manifest holds its digest): 46 rows at 56 columns, the `▔` rule
+    /// on row 3, the header on row 4, three windows in the narrow layout,
+    /// and the vendor's `↓` ending row 46 — the tail is under the fold.
+    const SCREEN_2_1_278: &str =
+        include_str!("../../tests/testdata/vendor/2.1.278/screen/usage.txt");
+
+    /// The cancel hint as the panel draws it (three columns in), from the
+    /// anchor table.
+    fn hint() -> String {
+        format!("   {}", aterm_phase::anchor("prompt.cancel"))
+    }
+
+    /// The retry hint beside the cancel hint, as the 2.1.287 bundle composes
+    /// the row beside an enrich error or a failed load (READ, not measured:
+    /// the `settings:retry` binding's key and word, the byline's ` · `).
+    fn retry_hints() -> String {
+        format!("   r to retry · {}", aterm_phase::anchor("prompt.cancel"))
+    }
+
+    /// MEASURED on 2.1.287 (`aterm_phase::prompt::fixtures::USAGE_SETTLED`,
+    /// 150x50, half a second after the Enter): the Usage tab settled and
+    /// whole on the grid — the session at 1 %, the week at 10 %, the Fable
+    /// window at 0 %, the cancel hint last.
+    fn settled() -> Vec<String> {
+        fx::screen(fx::USAGE_SETTLED)
+    }
+
+    /// The index of the last non-blank row.
+    fn last_row(rows: &[String]) -> usize {
+        rows.iter()
+            .rposition(|r| !r.trim().is_empty())
+            .expect("a drawn row")
+    }
+
+    /// COMPOSED, NOT MEASURED, and only for the states no capture holds: the
+    /// MEASURED settled screen ([`settled`]) with `between` drawn right
+    /// above its hint row (each with the blank row the tab's `gap` puts
+    /// under it) and the hint row replaced by `tail`. The place is the READ
+    /// one: the 2.1.287 bundle draws the enrich-error line and `Refreshing…`
+    /// after the usage-credits block and before the hint row, and the
+    /// measured refreshing screen agrees.
+    fn composed(between: &[&str], tail: &str) -> Vec<String> {
+        let mut out = settled();
+        let at = last_row(&out);
+        assert!(aterm_phase::panel_tail(&out[at]), "{:?}", out[at]);
+        out[at] = tail.to_string();
+        for row in between.iter().rev() {
+            out.insert(at, String::new());
+            out.insert(at, (*row).to_string());
+        }
+        out
+    }
+
+    /// The panel's header on `rows`, as the phase reader places it.
+    fn header_of(rows: &[String]) -> usize {
+        aterm_phase::settings_panel(rows).expect("the panel").header
+    }
+
+    fn read(rows: &[String]) -> PanelRead {
+        usage_panel_read(rows, header_of(rows))
+    }
+
+    /// The windows of a read, as `(key, percent)`.
+    fn figures(read: &PanelRead) -> Vec<(String, u32)> {
+        let PanelRead::Settled(windows) = read else {
+            panic!("not settled: {read:?}")
+        };
+        windows
+            .iter()
+            .map(|w| (w.name.clone(), w.used_pct))
+            .collect()
+    }
+
+    fn three(session: u32, week: u32, fable: u32) -> Vec<(String, u32)> {
+        vec![
+            ("five_hour".to_string(), session),
+            ("seven_day".to_string(), week),
+            ("seven_day_overage_included".to_string(), fable),
+        ]
+    }
+
+    /// THE MEASURED SCREENS WHOSE TAIL IS UNDER THE FOLD — 2.1.278's one
+    /// capture (46 rows), 2.1.287 at 150x50 once the contributing block
+    /// filled in, and 2.1.287 at 110x32 from its first read — are each the
+    /// Settings panel under its `▔` rule, drawn by the fullscreen renderer,
+    /// the header the screen's fourth row; and the settled rule reads `Fold`
+    /// although the windows are on the grid (which `harness limits` prints
+    /// as they are). NEGATIVE CONTROLS for the panel's placement: the two
+    /// older fixtures (a header with no rule over it; no header at all), the
+    /// 2.1.278 capture with a composer's frame under it, and with its header
+    /// one column out or in, are no panel.
+    #[test]
+    fn the_measured_screens_with_the_tail_under_the_fold_are_no_sample() {
+        let screen = rows(SCREEN_2_1_278);
+        assert_eq!(screen.len(), 46);
+        let fullscreen = Some(aterm_phase::SettingsPanel {
+            rule: 2,
+            header: 3,
+            renderer: aterm_phase::PanelRenderer::Fullscreen,
+        });
+        for (what, screen, seen) in [
+            ("2.1.278", screen.clone(), three(18, 64, 100)),
+            (
+                "2.1.287 150x50",
+                fx::screen(fx::USAGE_FOLD),
+                three(1, 10, 0),
+            ),
+            (
+                "2.1.287 110x32",
+                fx::screen(fx::USAGE_SHORT),
+                three(2, 10, 0),
+            ),
+        ] {
+            assert_eq!(aterm_phase::settings_panel(&screen), fullscreen, "{what}");
+            assert!(
+                screen[last_row(&screen)].ends_with('↓'),
+                "{what}: {:?}",
+                screen[last_row(&screen)]
+            );
+            assert_eq!(usage_panel_read(&screen, 3), PanelRead::Fold, "{what}");
+            let on_the_grid: Vec<(String, u32)> = usage_panel_windows(&screen[4..])
+                .into_iter()
+                .map(|w| (w.name, w.used_pct))
+                .collect();
+            assert_eq!(on_the_grid, seen, "{what}");
+        }
+
+        assert_eq!(aterm_phase::settings_panel(&rows(PANEL_WIDE)), None);
+        assert_eq!(aterm_phase::settings_panel(&rows(PANEL_NARROW)), None);
+        let rule = "─".repeat(56);
+        let mut framed = screen.clone();
+        framed.extend([rule.clone(), "❯ ".to_string(), rule]);
+        assert_eq!(aterm_phase::settings_panel(&framed), None);
+        let mut shifted = screen.clone();
+        shifted[3] = shifted[3][1..].to_string();
+        assert_eq!(aterm_phase::settings_panel(&shifted), None);
+        let mut shifted = screen.clone();
+        shifted[3] = format!(" {}", shifted[3]);
+        assert_eq!(aterm_phase::settings_panel(&shifted), None);
+    }
+
+    /// THE HEADER'S GUARD, compiled by the server's own row matcher
+    /// (`aterm_observe::row_matcher`, what `key if=` and `await gone` test
+    /// every row of the screen with), matches the measured screen's header
+    /// row and no other row of it — on 2.1.278's capture and on every
+    /// 2.1.287 one, both renderers. NEGATIVE CONTROL: a copy of the header
+    /// quoted further in — a tool's output, the worker's words — is not
+    /// matched.
+    #[test]
+    fn the_header_guard_matches_the_measured_header_and_no_copy_of_it() {
+        for (what, screen) in [
+            ("2.1.278", rows(SCREEN_2_1_278)),
+            ("refreshing", fx::screen(fx::USAGE_REFRESHING)),
+            ("settled", fx::screen(fx::USAGE_SETTLED)),
+            ("fold", fx::screen(fx::USAGE_FOLD)),
+            ("whole", fx::screen(fx::USAGE_WHOLE)),
+            ("narrow", fx::screen(fx::USAGE_NARROW)),
+            ("short", fx::screen(fx::USAGE_SHORT)),
+            ("inline", fx::screen(fx::USAGE_INLINE)),
+        ] {
+            let panel = aterm_phase::settings_panel(&screen).expect("the panel");
+            let guard = panel.header_guard(&screen);
+            let matcher = aterm_observe::row_matcher(&guard).expect("the guard compiles");
+            let hits: Vec<usize> = (0..screen.len())
+                .filter(|&i| matcher.matches(&screen[i]))
+                .collect();
+            assert_eq!(hits, [panel.header], "{what}: {guard}");
+        }
+        let screen = fx::screen(fx::USAGE_SETTLED);
+        let guard = aterm_phase::settings_panel(&screen)
+            .expect("the panel")
+            .header_guard(&screen);
+        let matcher = aterm_observe::row_matcher(&guard).expect("the guard compiles");
+        let help = format!("aterm ctl key 'if={guard}' esc");
+        for copy in [
+            "  ⎿     Settings  Status   Config   Usage   Stats",
+            "    Settings  Status   Config   Usage   Stats",
+            "⏺ Settings  Status   Config   Usage   Stats",
+            "Settings  Status   Config   Usage   Stats",
+            help.as_str(),
+        ] {
+            assert!(!matcher.matches(copy), "{copy}");
+        }
+    }
+
+    /// MEASURED on 2.1.287: the whole tab on the grid, nothing unsettled,
+    /// the hint row last — `Settled`, with the figures the screen shows: at
+    /// 150x50 while the contributing block is still scanning, at 150x80 with
+    /// that block filled in, and at 60x50 in the narrow layout. NEGATIVE
+    /// CONTROL, also MEASURED: the screen the same run showed a quarter
+    /// second EARLIER has `Refreshing…` above the hint and is `Unsettled` —
+    /// and the week it shows (9 %) is not the week the settled one shows
+    /// (10 %): the figures of an unsettled panel are the ones being
+    /// replaced, which is the whole reason for the rule.
+    #[test]
+    fn a_whole_panel_with_nothing_unsettled_on_it_is_settled() {
+        assert_eq!(figures(&read(&settled())), three(1, 10, 0));
+        assert_eq!(
+            figures(&read(&fx::screen(fx::USAGE_WHOLE))),
+            three(2, 10, 0)
+        );
+        assert_eq!(
+            figures(&read(&fx::screen(fx::USAGE_NARROW))),
+            three(2, 10, 0)
+        );
+        let PanelRead::Settled(windows) = read(&settled()) else {
+            panic!("not settled")
+        };
+        assert_eq!(
+            (
+                windows[0].reset_text.as_deref(),
+                windows[1].reset_text.as_deref()
+            ),
+            (
+                Some("2am (America/Los_Angeles)"),
+                Some("Oct 8 at 9am (America/Los_Angeles)")
+            )
+        );
+
+        let refreshing = fx::screen(fx::USAGE_REFRESHING);
+        assert_eq!(read(&refreshing), PanelRead::Unsettled);
+        // What it would have recorded: the last-known week, and no Fable
+        // window at all.
+        let stale: Vec<(String, u32)> = usage_panel_windows(&refreshing[4..])
+            .into_iter()
+            .map(|w| (w.name, w.used_pct))
+            .collect();
+        assert_eq!(
+            stale,
+            [("five_hour".to_string(), 1), ("seven_day".to_string(), 9)]
+        );
+        // COMPOSED: the refresh line put on the settled screen is unsettled
+        // too, so the verdict is the row's and not that capture's.
+        assert_eq!(
+            read(&composed(&["   Refreshing…"], &hint())),
+            PanelRead::Unsettled
+        );
+        assert_eq!(read(&composed(&[], &hint())), read(&settled()));
+    }
+
+    /// COMPOSED (see [`composed`]; no capture holds one): each enrich-error
+    /// line the 2.1.287 bundle draws under the usage-credits block, with the
+    /// retry hint it brings beside the cancel hint — `Unsettled`, whichever
+    /// it is: the figures are last-known, partial or unrefreshed by the
+    /// vendor's own word. NEGATIVE CONTROL: the retry hint alone (no error
+    /// line read) is no tail, so that panel is `Fold`, never `Settled`.
+    #[test]
+    fn an_enrich_error_under_the_windows_is_unsettled() {
+        let hints = retry_hints();
+        for line in [
+            "   Showing last-known usage as of 2m ago (rate limited — try again in a moment)",
+            "   Showing last-known usage (could not refresh)",
+            "   Could not refresh usage data",
+            "   Partial usage data (rate limited — try again in a moment)",
+            "   Per-model breakdown unavailable (rate limited — try again in a moment)",
+        ] {
+            assert_eq!(
+                read(&composed(&[line], &hints)),
+                PanelRead::Unsettled,
+                "{line}"
+            );
+            // Under the cancel hint alone it is unsettled all the same: the
+            // line decides, not the hint beside it.
+            assert_eq!(
+                read(&composed(&[line], &hint())),
+                PanelRead::Unsettled,
+                "{line}"
+            );
+        }
+        assert_eq!(read(&composed(&[], &hints)), PanelRead::Fold);
+    }
+
+    /// COMPOSED (no capture holds either state): the MEASURED rule, header
+    /// and `Session` block, and — in the plan-limits component's place —
+    /// what the 2.1.287 bundle draws with no figures yet (`Loading usage
+    /// data…` over the cancel hint) and after a failed load (`Error: <why>`
+    /// over a retry hint and the cancel hint). Both are the Usage tab (the
+    /// session block's `Total cost:` is drawn above the component, always —
+    /// READ, and MEASURED on every capture) and both are `Unsettled`.
+    /// NEGATIVE CONTROL: the same rows with the loading line or the error
+    /// taken out are the Usage tab with no window on it — `Unsettled` under
+    /// the hint row by the missing windows, never `Settled`.
+    #[test]
+    fn a_loading_or_failed_panel_is_unsettled() {
+        let measured = settled();
+        let first_window = measured
+            .iter()
+            .position(|r| r.trim() == "Current session")
+            .expect("the first window");
+        let head = |rest: &[&str]| {
+            let mut out = measured[..first_window].to_vec();
+            for row in rest {
+                out.push((*row).to_string());
+                out.push(String::new());
+            }
+            out
+        };
+        let cancel = hint();
+        let retry = retry_hints();
+        let loading = head(&["   Loading usage data…", &cancel]);
+        assert!(loading.iter().any(|r| r.trim().starts_with("Total cost:")));
+        assert_eq!(read(&loading), PanelRead::Unsettled);
+        for why in [
+            "Failed to load usage data",
+            "Failed to load usage data: upstream timed out",
+            "Usage endpoint is rate limited. Please try again in a moment.",
+        ] {
+            let failed = head(&[&format!("   Error: {why}"), &retry]);
+            assert_eq!(read(&failed), PanelRead::Unsettled, "{why}");
+        }
+        // The loading line alone marks the tab (a thin client's session
+        // block draws no `Total cost:`).
+        let mut bare = measured[..=header_of(&measured)].to_vec();
+        bare.extend([
+            String::new(),
+            "   Loading usage data…".to_string(),
+            String::new(),
+            cancel.clone(),
+        ]);
+        assert_eq!(read(&bare), PanelRead::Unsettled);
+
+        assert_eq!(read(&head(&[&cancel])), PanelRead::Unsettled);
+        assert!(usage_panel_windows(&head(&[&cancel])).is_empty());
+    }
+
+    /// The fold, beyond the measured screens: the settled screen with the
+    /// vendor's `↓` ending its hint row (COMPOSED), and the settled screen
+    /// cut anywhere above its hint row, are `Fold` — more is below, and what
+    /// is below is where the refresh line is drawn. NEGATIVE CONTROL: the
+    /// same rows whole are `Settled`.
+    #[test]
+    fn a_panel_whose_tail_is_under_the_fold_is_no_sample() {
+        let whole = settled();
+        let tail = last_row(&whole);
+        let mut arrow = whole.clone();
+        arrow[tail] = format!("{:<149}↓", hint());
+        assert_eq!(read(&arrow), PanelRead::Fold);
+        // …from the first row that marks the tab (`Total cost:`) down.
+        let mark = whole
+            .iter()
+            .position(|r| r.trim().starts_with("Total cost:"))
+            .expect("the session block");
+        for cut in mark + 1..tail {
+            assert_eq!(read(&whole[..cut]), PanelRead::Fold, "cut at {cut}");
+        }
+        assert!(matches!(read(&whole), PanelRead::Settled(_)));
+        assert!(matches!(read(&whole[..=tail]), PanelRead::Settled(_)));
+        // A row after the hint row (the vendor draws none): the hint is not
+        // the tail, so nothing is sampled.
+        let mut after = whole[..=tail].to_vec();
+        after.push("   What's contributing to your limits usage?".to_string());
+        assert_eq!(read(&after), PanelRead::Fold);
+    }
+
+    /// COMPOSED from the measured settled screen, a window's rows taken out
+    /// (no capture holds a tab with one missing): only `Current session`
+    /// (the reader's own fence then yields no window at all), the session
+    /// with the Fable window but no `Current week (all models)`, and the
+    /// week with no session — each `Unsettled` under its hint row: the whole
+    /// tab is on the grid and the figures a sample needs are not. NEGATIVE
+    /// CONTROL: with both windows and no third, it is `Settled`.
+    #[test]
+    fn a_whole_panel_missing_the_session_or_the_week_is_unsettled() {
+        let whole = settled();
+        let title = |name: &str| {
+            whole
+                .iter()
+                .position(|r| r.trim() == name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let (session, week, fable, rest) = (
+            title("Current session"),
+            title("Current week (all models)"),
+            title("Current week (Fable)"),
+            title("What's contributing to your limits usage?"),
+        );
+        let without = |from: usize, to: usize| {
+            let mut out = whole[..from].to_vec();
+            out.extend_from_slice(&whole[to..]);
+            out
+        };
+        let only_session = without(week, rest);
+        assert!(only_session.iter().any(|r| r.contains("1% used")));
+        assert_eq!(read(&only_session), PanelRead::Unsettled);
+        let no_week = without(week, fable);
+        assert_eq!(usage_panel_windows(&no_week).len(), 2);
+        assert_eq!(read(&no_week), PanelRead::Unsettled);
+        let no_session = without(session, week);
+        assert_eq!(usage_panel_windows(&no_session).len(), 2);
+        assert_eq!(read(&no_session), PanelRead::Unsettled);
+
+        assert_eq!(
+            figures(&read(&without(fable, rest))),
+            [("five_hour".to_string(), 1), ("seven_day".to_string(), 10)]
+        );
+    }
+
+    /// COMPOSED: the MEASURED rule and header with none of the Usage tab's
+    /// rows under them — another tab's (invented rows in the Status and
+    /// Config tabs' shape: this build's other tabs were never captured, and
+    /// never will be committed: the Status tab names the login) — is
+    /// `NotUsage`, hint row or none. NEGATIVE CONTROL: one `Total cost:` row
+    /// under the same header and it is the Usage tab (`Unsettled`: no
+    /// window).
+    #[test]
+    fn a_settings_panel_on_another_tab_is_not_the_usage_tab() {
+        let measured = settled();
+        let other = |body: &[&str]| {
+            let mut out = measured[..=header_of(&measured)].to_vec();
+            out.push(String::new());
+            out.extend(body.iter().map(|r| (*r).to_string()));
+            out.extend([String::new(), hint()]);
+            out
+        };
+        for body in [
+            &[
+                "   Version: 0.0.0",
+                "   Session name: (none)",
+                "   cwd: /work",
+            ][..],
+            &[
+                "   Auto-compact                          true",
+                "   Theme                                 dark",
+            ][..],
+            &[][..],
+        ] {
+            let panel = other(body);
+            assert!(aterm_phase::settings_panel(&panel).is_some());
+            assert_eq!(read(&panel), PanelRead::NotUsage, "{body:?}");
+        }
+        assert_eq!(
+            read(&other(&["   Total cost:            $0.0000"])),
+            PanelRead::Unsettled
+        );
+        // A header index past the rows reads nothing, and says so.
+        assert_eq!(usage_panel_read(&settled(), 10_000), PanelRead::NotUsage);
+    }
+
+    /// MEASURED on 2.1.287 under the INLINE renderer: the panel under its
+    /// `─` rule, two columns in — the phase reader says `Inline`, which is
+    /// what the probe refuses to type under; the settled rule itself reads
+    /// the rows the same. And once that panel grew and the main screen
+    /// scrolled its rule and header away, there is no panel to read at all,
+    /// though its hint row is on the grid. NEGATIVE CONTROL: the fullscreen
+    /// capture of the same tab is `Fullscreen`.
+    #[test]
+    fn the_inline_renderers_panel_is_told_from_the_fullscreen_one() {
+        let inline = fx::screen(fx::USAGE_INLINE);
+        let panel = aterm_phase::settings_panel(&inline).expect("the inline panel");
+        assert_eq!(panel.renderer, aterm_phase::PanelRenderer::Inline);
+        assert_eq!(
+            figures(&usage_panel_read(&inline, panel.header)),
+            three(2, 10, 0)
+        );
+        assert_eq!(
+            aterm_phase::settings_panel(&fx::screen(fx::USAGE_INLINE_SCROLLED)),
+            None
+        );
+        assert_eq!(
+            aterm_phase::settings_panel(&settled()).map(|p| p.renderer),
+            Some(aterm_phase::PanelRenderer::Fullscreen)
+        );
+    }
+
+    // -- the sample ------------------------------------------------------------
+
+    /// 2026-10-02 04:20:00 UTC, 9:20 PM on Oct 1 in the panel's zone: the
+    /// minute the measured 150x50 screens were read (their done row says
+    /// `done 9:20 PM`).
+    const READ_AT: i64 = 1_790_914_800;
+
+    /// The zone table of the tests: the measured panels' zone, on daylight
+    /// time that week; nothing else is known.
+    fn zones(zone: &str, _at: i64) -> Option<i64> {
+        (zone == "America/Los_Angeles").then_some(-7 * 3600)
+    }
+
+    fn window(name: &str, pct: u32, reset: Option<&str>) -> PanelWindow {
+        PanelWindow {
+            name: name.to_string(),
+            used_pct: pct,
+            reset_text: reset.map(str::to_string),
+        }
+    }
+
+    /// THE SAMPLE OF THE MEASURED SETTLED PANEL: the session's figure and
+    /// the week's, each reset placed on the clock in the zone the panel
+    /// names — a bare clock time (`2am`, four hours forty ahead) and a dated
+    /// one (`Oct 8 at 9am`) — read at the injected `now`. The machine's own
+    /// offset (here nine hours east) is not used where the zone is known.
+    /// NEGATIVE CONTROL: with a zone table that knows nothing, the same text
+    /// is placed at the machine's offset — another instant.
+    #[test]
+    fn a_settled_panels_sample_places_each_reset_in_the_panels_zone() {
+        let PanelRead::Settled(windows) = read(&settled()) else {
+            panic!("not settled")
+        };
+        let east = 9 * 3600;
+        let sample = panel_sample(&windows, READ_AT, east, &zones).expect("a sample");
+        assert_eq!(
+            sample,
+            crate::harness::accounts::Sample {
+                session_pct: Some(1),
+                session_reset: Some(1_790_931_600),
+                week_pct: Some(10),
+                week_reset: Some(1_791_475_200),
+                at: READ_AT,
+                by: String::new(),
+            }
+        );
+        assert_eq!(
+            (
+                rfc3339_utc(1_790_931_600).as_str(),
+                rfc3339_utc(1_791_475_200).as_str()
+            ),
+            ("2026-10-02T09:00:00Z", "2026-10-08T16:00:00Z")
+        );
+        // The roster reads it as it reads any sample: both windows running.
+        assert_eq!(sample.session(READ_AT), Some((1, 1_790_931_600)));
+        assert_eq!(sample.week(READ_AT), Some((10, 1_791_475_200)));
+
+        let nowhere = panel_sample(&windows, READ_AT, east, &|_, _| None).expect("a sample");
+        assert_eq!((nowhere.session_pct, nowhere.week_pct), (Some(1), Some(10)));
+        assert_ne!(nowhere.session_reset, sample.session_reset);
+        assert_ne!(nowhere.week_reset, sample.week_reset);
+    }
+
+    /// A RESET FURTHER AHEAD THAN ITS WINDOW CAN BE IS NO RESET: the figure
+    /// is kept and the reset is `None` (the roster then counts the figure
+    /// for one window length). The session's bound is its five hours and the
+    /// stamp's skew; the week's is eight days. So is a reset the grammar
+    /// cannot read, and a window that carried none. NEGATIVE CONTROLS: the
+    /// same windows with a reset inside the bound keep it — the week's
+    /// seven days ahead, the session's four hours ahead.
+    #[test]
+    fn a_reset_beyond_its_windows_bound_is_dropped_and_its_figure_kept() {
+        use crate::harness::accounts::{RESET_BELIEVED_S, SESSION_WINDOW_S, STAMP_SKEW_S};
+        let sample = |session: Option<&str>, week: Option<&str>| {
+            panel_sample(
+                &[
+                    window("five_hour", 40, session),
+                    window("seven_day", 50, week),
+                ],
+                READ_AT,
+                0,
+                &zones,
+            )
+            .expect("a sample")
+        };
+        let ahead = |at: Option<i64>| at.map(|at| at - READ_AT);
+        // The two bounds, by value: five hours and five minutes; eight days.
+        assert_eq!(
+            (SESSION_WINDOW_S + STAMP_SKEW_S, RESET_BELIEVED_S),
+            (5 * 3600 + 300, 8 * 24 * 3600)
+        );
+        // Read at 9:20 PM in the panel's zone, Oct 1.
+        let zone = "(America/Los_Angeles)";
+        // The session: 1:20am is four hours ahead; a dated reset tomorrow
+        // evening is past five hours and five minutes.
+        let kept = sample(Some(&format!("1:20am {zone}")), None);
+        assert_eq!(ahead(kept.session_reset), Some(4 * 3600));
+        let dropped = sample(Some(&format!("Oct 2 at 9:20pm {zone}")), None);
+        assert_eq!(
+            (dropped.session_pct, dropped.session_reset),
+            (Some(40), None)
+        );
+        // The week: Oct 8 is seven days ahead; Oct 10 is nine.
+        let kept = sample(None, Some(&format!("Oct 8 at 9:20pm {zone}")));
+        assert_eq!(ahead(kept.week_reset), Some(7 * 24 * 3600));
+        let dropped = sample(None, Some(&format!("Oct 10 at 9:20pm {zone}")));
+        assert_eq!((dropped.week_pct, dropped.week_reset), (Some(50), None));
+        // A dated reset tomorrow is the WEEK's to keep and the session's to
+        // drop: the bound is each window's own.
+        let both = sample(
+            Some(&format!("Oct 2 at 9:20pm {zone}")),
+            Some(&format!("Oct 2 at 9:20pm {zone}")),
+        );
+        assert_eq!(
+            (both.session_reset, ahead(both.week_reset)),
+            (None, Some(24 * 3600))
+        );
+        // Words the grammar does not read, and no reset at all.
+        let unread = sample(Some("when the moon is full"), None);
+        assert_eq!(
+            (unread.session_pct, unread.session_reset, unread.week_reset),
+            (Some(40), None, None)
+        );
+    }
+
+    /// A FIGURE NOBODY READ IS `None`, NEVER `0`: a lone week window gives
+    /// no session figure, a lone session window no week's, and windows that
+    /// are neither (the Fable bucket, the spend limit) — or none at all —
+    /// give no sample. NEGATIVE CONTROL: the two windows together give both.
+    #[test]
+    fn a_window_that_was_not_read_gives_no_figure_and_none_gives_no_sample() {
+        let week = window("seven_day", 10, Some("Oct 8 at 9am (America/Los_Angeles)"));
+        let session = window("five_hour", 1, Some("2am (America/Los_Angeles)"));
+        let fable = window(
+            "seven_day_overage_included",
+            100,
+            Some("Oct 8 at 9am (America/Los_Angeles)"),
+        );
+        let of = |windows: &[PanelWindow]| panel_sample(windows, READ_AT, 0, &zones);
+
+        let lone = of(std::slice::from_ref(&week)).expect("the week alone");
+        assert_eq!(
+            (lone.session_pct, lone.session_reset, lone.week_pct),
+            (None, None, Some(10))
+        );
+        assert_eq!(lone.session(READ_AT), None);
+        let lone = of(std::slice::from_ref(&session)).expect("the session alone");
+        assert_eq!(
+            (lone.session_pct, lone.week_pct, lone.week_reset),
+            (Some(1), None, None)
+        );
+        assert_eq!(of(&[]), None);
+        assert_eq!(of(std::slice::from_ref(&fable)), None);
+        assert_eq!(of(&[fable.clone(), window("spend_limit", 12, None)]), None);
+        let both = of(&[fable, week, session]).expect("both");
+        assert_eq!((both.session_pct, both.week_pct), (Some(1), Some(10)));
+        // The command the probe types is the six bytes, no more.
+        assert_eq!(USAGE_COMMAND, "/usage");
     }
 
     #[test]
@@ -2447,8 +3146,8 @@ mod tests {
              \x20  Current week (Haiku 9 Super)\n   ███ 11% used\n   Resets Sep 23\n",
         ));
         assert_eq!(got.len(), 2);
-        // The slug is derived and labelled UNVERIFIED; what matters is that
-        // it can never collide with a key the reader measured.
+        // The slug is derived and unverified; it can never collide with a
+        // known key.
         assert_eq!(got[1].name, "seven_day_haiku_9_super");
         for (_, key) in PANEL_TITLES {
             assert_ne!(got[1].name, key);

@@ -3,6 +3,10 @@
 
 [package]
 name = "atpkg-keys"
+# Integration tests are declared below, not discovered: every file is a module
+# of the one `keys_suite` binary. With autotests off a `tests/*.rs` file listed
+# nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,6 +19,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "atpkg-keys"
 path = "src/main.rs"
+# A shim over the library with no test of its own (its libtest harness ran 0
+# tests); the integration tests still get the built binary.
+test = false
 
 [dependencies]
 # Producer-side: the FULL ring crate (RNG for keygen + the signing op). The CLIENT
@@ -22,12 +29,11 @@ path = "src/main.rs"
 # tool is owner-only and never shipped, so it carries the full crate. At/above the
 # deny.toml ring floor, so no ban is tripped.
 ring = "0.17.14"
-# Encode the 32-byte raw public key (for PINNED_PKG_ROOTKEY / the index release_key_pubkey).
-# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
-# to the retired `base64` package's `general_purpose::STANDARD` engine by
-# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
-# point every trust path uses: canonical padding REQUIRED and no trailing bits,
-# so a pinned key has exactly one spelling.
+# Encode the 32-byte raw public keys of the paper master and the machine keys (the pins.rs
+# anchor, the roster entries).
+# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# the entry point every trust path uses: canonical padding REQUIRED and no
+# trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
 # The MACHINE ROSTER type + its client verifier. The minting tool emits the roster through
 # the very same `Roster` struct the updater parses, so producer and client cannot drift on
@@ -36,6 +42,8 @@ aterm-update-core = { workspace = true }
 # RFC3339 formatting for `added_at` / `valid_until` (`aterm_types::rfc3339`), already in
 # the graph via aterm-update-core.
 aterm-types = { workspace = true }
+# The binary's mint clock (`aterm_time::unix_secs`), already in the graph via aterm-types.
+aterm-time = { workspace = true }
 # The master is read from /dev/tty with ECHO off (`tcgetattr`/`tcsetattr`), kept out of
 # swap best-effort (`mlock`), and protected from core dumps (`setrlimit(RLIMIT_CORE, 0)`).
 # Four narrow syscalls with no safe std wrapper; POSIX-only, like the rest of this tool.
@@ -49,6 +57,15 @@ atpkg = { path = "../atpkg" }
 aterm-spec = { workspace = true }
 # The owner→client integration test builds a real `.tar.zst` to drive the client install.
 zstd = { workspace = true }
+# Fixture directories removed on drop.
+aterm-tempfile = { workspace = true }
+# The real terminal the setup/join tests run the binary on (tests/pty.rs): both ends
+# close-on-exec from birth, and a `/dev/ptmx` open that lost the kernel's race redriven.
+aterm-pty = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "keys_suite"
+path = "tests/keys_suite.rs"

@@ -30,41 +30,18 @@
 //!     COUNTEREXAMPLE — a content-idle-arriving echo deferred past its arrival because a
 //!     recent aurora present kept the clock fresh — a genuine, non-vacuous catch.
 //!
-//! Verification is always required (batteries-on): an absent `ty` FAILS the test with a
-//! build hint, so a green run proves `ty` actually model-checked both configs. The
-//! certificate re-reds if the modeled coalescing logic drifts.
+//! TIERED (VERIFY-1): runs only where Trust `ty` is installed; absent, a NOT RUN notice
+//! names it and the test returns. The certificate re-reds if the modeled coalescing
+//! logic drifts.
 
+use crate::walk::ty_check;
 use aterm_spec::verify::ty_escalation;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 /// `crates/aterm-spec/tests/` → `crates/aterm-spec-models/specs/PresentCoalescing.tla`.
 fn spec_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../aterm-spec-models/specs/PresentCoalescing.tla")
-}
-
-/// Run `ty check <spec> --config <cfg> [extra...]`; return (exit-0, combined output).
-fn run(ty: &PathBuf, spec: &Path, cfg: &Path, extra: &[&str]) -> (bool, String) {
-    let mut cmd = Command::new(ty);
-    cmd.arg("check")
-        .arg(spec)
-        .arg("--config")
-        .arg(cfg)
-        .args(extra);
-    // ARMED: partial-order reduction is a speed feature that does not
-    // preserve coverage, and the `ty` this machine discovers has an
-    // UNSOUND one (it reduced a 128-state model to 1 and still printed
-    // "No errors found (exhaustive)"). Every `ty check` in this workspace
-    // arms the whole space through the one shared place.
-    aterm_spec::verify::arm_whole_space_check(&mut cmd);
-    let out = cmd.output().expect("run ty check");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.success(), combined)
 }
 
 #[test]
@@ -84,7 +61,7 @@ fn present_coalescing_proves_echo_never_starved_and_catches_aurora_poisoning() {
 
     // Buggy = 0 (the fix): the efficiency theorem must hold under an EXHAUSTIVE
     // (uncapped) BFS — no echo is ever deferred past one frame interval.
-    let (ok, out) = run(&ty, &spec, &okcfg, &["--require-exhaustive"]);
+    let (ok, out) = ty_check(&ty, &spec, &okcfg, &["--require-exhaustive"]);
     assert!(
         ok,
         "PresentCoalescing (Buggy=0, the fix) must model-check clean (ContentIdleEchoImmediate)\n{out}"
@@ -104,7 +81,7 @@ fn present_coalescing_proves_echo_never_starved_and_catches_aurora_poisoning() {
     let bugtext = oktext.replace("Buggy = 0", "Buggy = 1");
     assert_ne!(oktext, bugtext, "cfg must contain `Buggy = 0` to flip");
     std::fs::write(&bugcfg, bugtext).expect("write bug cfg");
-    let (bug_ok, bug_out) = run(&ty, &spec, &bugcfg, &[]);
+    let (bug_ok, bug_out) = ty_check(&ty, &spec, &bugcfg, &[]);
     assert!(
         !bug_ok,
         "PresentCoalescing (Buggy=1, old code) MUST yield a counterexample (aurora poisoning)\n{bug_out}"

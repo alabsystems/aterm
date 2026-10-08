@@ -34,17 +34,26 @@
 //! footer. Under a dialog its host may draw the AFK countdown row
 //! (`auto-continue in 16s · any key to stay`, right-aligned), one
 //! right-aligned plugin notice, and the REPL's `Background task update
-//! waiting while this panel is open` (the critique of 2026-09-25, R6).
+//! waiting while this panel is open`.
+//!
+//! **2.1.283** draws the same geometry (measured 2026-09-25 and read by
+//! this module unchanged; the fixtures `claude-2.1.283-question-*.txt`).
+//! Text typed into the free-text row wraps greedily at spaces onto rows at
+//! its label column (5, or 9 in multi-select), the dialog growing upward,
+//! and reflows by a cell when the focus leaves it; the row reads as its
+//! rows joined with one space, which is the text typed, exactly. The
+//! multi-select row ticks itself `[✔]` when typed into, and Enter with the
+//! focus in it unticks it.
 //!
 //! **NEVER READ WHOLE UNLESS SOUND.** A form is read only when every row of
 //! it is one of the rows above, the options are numbered `1..=N` from the
 //! first without a gap, the free-text row is option `N+1` (by position,
 //! never by its words: a person's text replaces them), the chat row is
 //! `N+2`, and exactly one row carries the `❯` focus (2.1.282 always draws
-//! one: none is a rendering this reader did not understand, R11). Anything
-//! else — a scrolled option list (`↑`/`↓` in the pointer column, R9), a
+//! one: none is a rendering this reader did not understand). Anything
+//! else — a scrolled option list (`↑`/`↓` in the pointer column), a
 //! numbering gap, an opened notes field, a head cut by the pane, a dialog
-//! withheld behind a draft in the composer (R5) — is
+//! withheld behind a draft in the composer — is
 //! [`QuestionForm::Unknown`]: still a question, never idle, and never
 //! answered.
 
@@ -393,7 +402,7 @@ impl QShape {
     /// A live question footer whose rows are none of the shapes read (a
     /// focused or unnumbered chat row the old walk stopped at, a shape a
     /// later release draws): rows `first..=footer`, the head off the screen
-    /// (`prompt::question_fallback`, R7).
+    /// (`prompt::question_fallback`).
     pub(crate) fn fallback(first: usize, footer: usize) -> Self {
         Self {
             footer: Some(footer),
@@ -464,16 +473,16 @@ fn checkbox(text: &str) -> Option<(bool, &str)> {
 /// preview's unnumbered `  Chat about this` / `❯ Chat about this` — as its
 /// number and focus.
 fn chat_row(row: &str) -> Option<(Option<u8>, bool)> {
-    let chat = anchor_text("question.chat");
+    let chat = const { anchor_text("question.chat") };
     if let Some((pointer, n, text)) = numbered(row) {
-        return (pointer != Pointer::Scrolled && text.trim_end() == chat)
+        return (pointer != Pointer::Scrolled && crate::text::trim_end(text) == chat)
             .then_some((Some(n), pointer == Pointer::Focus));
     }
     let (focused, rest) = match row.strip_prefix('❯') {
         Some(rest) => (true, rest),
         None => (false, row),
     };
-    (rest.starts_with(' ') && leading_spaces(rest) <= 2 && rest.trim() == chat)
+    (rest.starts_with(' ') && leading_spaces(rest) <= 2 && crate::text::trim(rest) == chat)
         .then_some((None, focused))
 }
 
@@ -484,7 +493,7 @@ fn button_row(row: &str) -> Option<(String, bool)> {
         Some(rest) => (true, rest.strip_prefix("    ")?),
         None => (false, row.strip_prefix("     ")?),
     };
-    let word = rest.trim_end();
+    let word = crate::text::trim_end(rest);
     (!word.is_empty() && !word.starts_with(' ') && !word.contains(char::is_whitespace))
         .then(|| (word.to_string(), focused))
 }
@@ -492,11 +501,11 @@ fn button_row(row: &str) -> Option<(String, bool)> {
 /// The tab bar: ` ☐ Colors` (one chip, column 1), or `←  ☐ A  ☒ B  ✔ Submit
 /// →` (column 0) — as its chips and whether a `✔ Submit` chip is drawn.
 pub(crate) fn tab_bar(row: &str) -> Option<(Vec<QuestionTab>, bool)> {
-    let t = row.trim_end();
+    let t = crate::text::trim_end(row);
     let (inner, submit_tab) = if let Some(rest) = t.strip_prefix('←') {
         let inner = rest.strip_suffix('→')?.trim_end();
         (
-            inner.strip_suffix(anchor_text("question.tab_submit"))?,
+            inner.strip_suffix(const { anchor_text("question.tab_submit") })?,
             true,
         )
     } else {
@@ -511,11 +520,11 @@ pub(crate) fn tab_bar(row: &str) -> Option<(Vec<QuestionTab>, bool)> {
         }
         let after = &inner[i + c.len_utf8()..];
         let end = after.find(['☐', '☒']).unwrap_or(after.len());
-        if lead && !inner[..i].trim().is_empty() {
+        if lead && !crate::text::trim(&inner[..i]).is_empty() {
             return None;
         }
         lead = false;
-        let header = after[..end].trim();
+        let header = crate::text::trim(&after[..end]);
         if header.is_empty() || !after.starts_with(' ') {
             return None;
         }
@@ -531,7 +540,7 @@ pub(crate) fn tab_bar(row: &str) -> Option<(Vec<QuestionTab>, bool)> {
 }
 
 fn blank(row: &str) -> bool {
-    row.trim().is_empty()
+    crate::text::trim(row).is_empty()
 }
 
 /// A row's width in cells when it can be measured: printable ASCII, as
@@ -543,7 +552,7 @@ fn blank(row: &str) -> bool {
 /// leaves out a wide character's second cell, so the row cannot be
 /// measured.
 fn measured(row: &str) -> Option<usize> {
-    let t = row.trim_end();
+    let t = crate::text::trim_end(row);
     t.chars()
         .all(|c| (' '..='~').contains(&c) || matches!(c, '❯' | '✔' | '↑' | '↓' | '│'))
         .then(|| t.chars().count())
@@ -613,25 +622,25 @@ fn cell_of(row: &str, c: char) -> Option<usize> {
     None
 }
 
-// ---- under the dialog (R6) ------------------------------------------------
+// ---- under the dialog -----------------------------------------------------
 
 /// The AFK countdown row (Lme(), right-aligned): `auto-continue in 16s ·
 /// any key to stay`.
 fn afk_row(row: &str) -> bool {
-    let t = row.trim();
-    t.starts_with(anchor_text("question.auto_continue"))
-        && t.ends_with(anchor_text("question.stay"))
+    let t = crate::text::trim(row);
+    t.starts_with(const { anchor_text("question.auto_continue") })
+        && t.ends_with(const { anchor_text("question.stay") })
 }
 
 /// The REPL's row while a panel holds the queue (Y_(), 2.1.282): `Background
 /// task update waiting while this panel is open`, or `<N> background task
 /// updates …`.
 fn panel_waiting_row(row: &str) -> bool {
-    let t = row.trim();
-    let Some(head) = t.strip_suffix(anchor_text("dialog.panel_waiting")) else {
+    let t = crate::text::trim(row);
+    let Some(head) = t.strip_suffix(const { anchor_text("dialog.panel_waiting") }) else {
         return false;
     };
-    let head = head.trim_end();
+    let head = crate::text::trim_end(head);
     head == "Background task update"
         || head
             .strip_suffix(" background task updates")
@@ -642,7 +651,7 @@ fn panel_waiting_row(row: &str) -> bool {
 /// dialog `width` cells wide: at least half the width of leading spaces, and
 /// none of a dialog's, a rule's or the composer's glyphs.
 fn plugin_notice_row(row: &str, width: usize) -> bool {
-    let t = row.trim();
+    let t = crate::text::trim(row);
     !t.is_empty()
         && leading_spaces(row) >= (width / 2).max(1)
         && !t.contains(['❯', '─', '│', '╭', '╰', '┌', '└'])
@@ -651,7 +660,7 @@ fn plugin_notice_row(row: &str, width: usize) -> bool {
 
 /// What sits under a dialog from row `from` down: blank rows, and at most
 /// one each of the AFK countdown row, a plugin notice and the panel's
-/// waiting row (the critique of 2026-09-25, R6). `Some(afk row)` when that
+/// waiting row. `Some(afk row)` when that
 /// is all; `None` when anything else is there.
 pub(crate) fn trailers(rows: &[String], from: usize, width: usize) -> Option<Option<usize>> {
     let (mut afk, mut plugin, mut panel) = (None, false, false);
@@ -676,7 +685,7 @@ pub(crate) fn trailers(rows: &[String], from: usize, width: usize) -> Option<Opt
 /// full-width rule is drawn.
 pub(crate) fn screen_width(rows: &[String]) -> usize {
     rows.iter()
-        .map(|r| r.trim_end().chars().count())
+        .map(|r| crate::text::trim_end(r).chars().count())
         .max()
         .unwrap_or(0)
 }
@@ -759,7 +768,7 @@ pub(crate) fn footed(rows: &[String], footer: usize, preview: bool) -> Option<QS
     if !is_rule(&rows[divider]) {
         return None;
     }
-    let width = rows[divider].trim_end().chars().count();
+    let width = crate::text::trim_end(&rows[divider]).chars().count();
     let afk = trailers(rows, footer + 1, width)?;
     let first_visible = || (0..=footer).find(|&i| !blank(&rows[i])).unwrap_or(footer);
     let cut = || QShape {
@@ -943,7 +952,7 @@ fn preview_zone(rows: &[String], divider: usize) -> Option<Walk> {
     }
     let notes: Vec<&String> = rows[notes_top..notes_end].iter().collect();
     let pristine = matches!(notes.as_slice(),
-        [row] if leading_spaces(row) == pane_col && row.trim() == anchor_text("question.notes"));
+        [row] if leading_spaces(row) == pane_col && crate::text::trim(row) == const { anchor_text("question.notes") });
     if !notes.iter().all(|r| leading_spaces(r) >= pane_col) {
         return None;
     }
@@ -976,8 +985,8 @@ fn preview_zone(rows: &[String], divider: usize) -> Option<Walk> {
 pub(crate) fn review(rows: &[String]) -> Option<QShape> {
     // The reader runs on the window's main thread every frame: a screen
     // with no `Ready to submit …` row is no review, at the cost of a scan.
-    let ready_text = anchor_text("question.review_ready");
-    if !rows.iter().any(|r| r.trim_end() == ready_text)
+    let ready_text = const { anchor_text("question.review_ready") };
+    if !rows.iter().any(|r| crate::text::trim_end(r) == ready_text)
         || crate::phase::composer_frame(rows).is_some()
     {
         return None;
@@ -993,7 +1002,7 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
     }
     let afk = trailers(rows, last + 1, width)?;
     let (pointer, n, cancel_label) = numbered(&rows[last])?;
-    let cancel_label = cancel_label.trim_end();
+    let cancel_label = crate::text::trim_end(cancel_label);
     if n != 2
         || pointer == Pointer::Scrolled
         || cancel_label.is_empty()
@@ -1005,11 +1014,12 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
     match numbered(&rows[submit]) {
         Some((p, 1, label))
             if p != Pointer::Scrolled
-                && label.trim_end() == anchor_text("question.review_submit") => {}
+                && crate::text::trim_end(label)
+                    == const { anchor_text("question.review_submit") } => {}
         _ => return None,
     }
     let ready = submit.checked_sub(2)?;
-    if !blank(&rows[submit - 1]) || rows[ready].trim_end() != ready_text {
+    if !blank(&rows[submit - 1]) || crate::text::trim_end(&rows[ready]) != ready_text {
         return None;
     }
     if rows[ready..=last].iter().any(|r| is_transcript_row(r)) {
@@ -1027,7 +1037,7 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
             afk,
             warning,
             pane_col: 0,
-            width: rule.map_or(0, |r| rows[r].trim_end().chars().count()),
+            width: rule.map_or(0, |r| crate::text::trim_end(&rows[r]).chars().count()),
             first,
             last,
             head_off_screen: rule.is_none(),
@@ -1063,10 +1073,10 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
     let Some(mut at) = skip_blanks(at) else {
         return partial(0);
     };
-    let warning_text = anchor_text("question.review_unanswered");
+    let warning_text = const { anchor_text("question.review_unanswered") };
     let warning = rows[at]
         .strip_prefix("⚠ ")
-        .is_some_and(|w| w.trim_end() == warning_text)
+        .is_some_and(|w| crate::text::trim_end(w) == warning_text)
         .then_some(at);
     if warning.is_some() {
         top = at;
@@ -1078,7 +1088,7 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
             None => return partial(0),
         }
     }
-    if rows[at].trim_end() != anchor_text("question.review_title") {
+    if crate::text::trim_end(&rows[at]) != const { anchor_text("question.review_title") } {
         return partial(top);
     }
     top = at;
@@ -1109,14 +1119,13 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
 /// you're typing.` (or `… a suggestion …`), one row or wrapped onto a few
 /// at one column. Read where the live UI draws it — outside the composer's
 /// frame, at column 0 or 1, no transcript row or user row between it and
-/// the frame when it is above it — as a question not read whole (the
-/// critique of 2026-09-25, R5: it read idle, a silent stall, while the
-/// draft stood).
+/// the frame when it is above it — as a question not read whole, never
+/// idle (a silent stall while the draft stands).
 pub(crate) fn deferred(rows: &[String]) -> Option<QShape> {
     let frame = crate::phase::composer_frame(rows)?;
     let texts = [
-        anchor_text("dialog.deferred_question"),
-        anchor_text("dialog.deferred_suggestion"),
+        const { anchor_text("dialog.deferred_question") },
+        const { anchor_text("dialog.deferred_suggestion") },
     ];
     for i in (0..rows.len()).rev() {
         if (frame.top..=frame.bottom).contains(&i) {
@@ -1126,7 +1135,7 @@ pub(crate) fn deferred(rows: &[String]) -> Option<QShape> {
         let col = leading_spaces(r);
         // The notice's first row is the start of one of the texts (the whole
         // of it, unwrapped): checked before anything is joined.
-        let head = r.trim();
+        let head = crate::text::trim(r);
         if head.is_empty() || col > 1 || !texts.iter().any(|t| t.starts_with(head)) {
             continue;
         }
@@ -1139,7 +1148,7 @@ pub(crate) fn deferred(rows: &[String]) -> Option<QShape> {
             }
             end += 1;
             joined.push(' ');
-            joined.push_str(next.trim());
+            joined.push_str(crate::text::trim(next));
         }
         if !texts.contains(&joined.as_str()) {
             continue;
@@ -1175,7 +1184,7 @@ pub(crate) fn dialog(rows: &[String], shape: &QShape) -> QuestionDialog {
         tabs,
         submit_tab,
         form,
-        auto_continue: shape.afk.map(|a| rows[a].trim().to_string()),
+        auto_continue: shape.afk.map(|a| crate::text::trim(&rows[a]).to_string()),
         width: shape.width,
     }
 }
@@ -1186,7 +1195,7 @@ fn question_text(rows: &[String], (start, end): (usize, usize)) -> QuestionText 
     let text = rows[start..end]
         .iter()
         .map(|r| {
-            let t = r.trim();
+            let t = crate::text::trim(r);
             if gutter {
                 t.strip_prefix('│').map_or(t, str::trim)
             } else {
@@ -1251,7 +1260,7 @@ fn select_form(rows: &[String], shape: &QShape) -> Result<QuestionForm, &'static
             (None, text)
         };
         let (label, label_rows, description, recommended) =
-            split_label(rows, h, until, text.trim_end(), shape.width);
+            split_label(rows, h, until, crate::text::trim_end(text), shape.width);
         options.push(QuestionOption {
             n,
             row: h,
@@ -1273,11 +1282,15 @@ fn select_form(rows: &[String], shape: &QShape) -> Result<QuestionForm, &'static
     } else {
         (None, free_text)
     };
-    let free_text = std::iter::once(free_text.trim())
-        .chain(rows[free_row + 1..free_end].iter().map(|r| r.trim()))
+    let free_text = std::iter::once(crate::text::trim(free_text))
+        .chain(
+            rows[free_row + 1..free_end]
+                .iter()
+                .map(|r| crate::text::trim(r)),
+        )
         .collect::<Vec<_>>()
         .join(" ");
-    let placeholder = anchor_text("question.other");
+    let placeholder = const { anchor_text("question.other") };
     let pristine = free_end == free_row + 1
         && free_checked != Some(true)
         && free_text.strip_suffix('.').unwrap_or(&free_text) == placeholder;
@@ -1353,7 +1366,7 @@ fn split_label(
     text: &str,
     width: usize,
 ) -> (String, Range<usize>, String, Recommended) {
-    let rec = anchor_text("question.recommended");
+    let rec = const { anchor_text("question.recommended") };
     // The option's row measured with its pointer as the one cell it is.
     let own = format!(" {}", rows[row].chars().skip(1).collect::<String>());
     let mut chain_end = row + 1;
@@ -1364,7 +1377,9 @@ fn split_label(
     }
     let recommended = if text.ends_with(rec) {
         Recommended::Label
-    } else if let Some(k) = (row + 1..chain_end).find(|&k| rows[k].trim_end().ends_with(rec)) {
+    } else if let Some(k) =
+        (row + 1..chain_end).find(|&k| crate::text::trim_end(&rows[k]).ends_with(rec))
+    {
         Recommended::Wrapped { label_end: k }
     } else {
         Recommended::No
@@ -1373,20 +1388,24 @@ fn split_label(
         Recommended::Wrapped { label_end } => label_end + 1,
         _ => row + 1,
     };
-    let label = std::iter::once(text.trim())
-        .chain(rows[row + 1..label_end].iter().map(|r| r.trim()))
+    let label = std::iter::once(crate::text::trim(text))
+        .chain(
+            rows[row + 1..label_end]
+                .iter()
+                .map(|r| crate::text::trim(r)),
+        )
         .collect::<Vec<_>>()
         .join(" ");
     let description = rows[label_end..until]
         .iter()
-        .map(|r| r.trim())
+        .map(|r| crate::text::trim(r))
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     (label, row..label_end, description, recommended)
 }
 
-/// The preview form's options (R8): each numbered row's cells left of the
+/// The preview form's options: each numbered row's cells left of the
 /// pane, and the rows continuing it there, joined; a trailing ` ✔` is the
 /// selection tick.
 fn preview_form(rows: &[String], shape: &QShape) -> Result<QuestionForm, &'static str> {
@@ -1409,7 +1428,7 @@ fn preview_form(rows: &[String], shape: &QShape) -> Result<QuestionForm, &'stati
             options.push(QuestionOption {
                 n,
                 row: i,
-                label: text.trim().to_string(),
+                label: crate::text::trim(text).to_string(),
                 label_rows: i..i + 1,
                 description: String::new(),
                 recommended: Recommended::No,
@@ -1425,7 +1444,7 @@ fn preview_form(rows: &[String], shape: &QShape) -> Result<QuestionForm, &'stati
                 return Err(NUMBERING);
             }
             last.label.push(' ');
-            last.label.push_str(left.trim());
+            last.label.push_str(crate::text::trim(left));
             last.label_rows.end = i + 1;
         }
         i += 1;
@@ -1433,10 +1452,10 @@ fn preview_form(rows: &[String], shape: &QShape) -> Result<QuestionForm, &'stati
     if options.is_empty() {
         return Err(NUMBERING);
     }
-    let rec = anchor_text("question.recommended");
+    let rec = const { anchor_text("question.recommended") };
     for o in &mut options {
         if let Some(l) = o.label.strip_suffix(" ✔") {
-            o.label = l.trim_end().to_string();
+            o.label = crate::text::trim_end(l).to_string();
             o.selected = true;
         }
         if o.label.ends_with(rec) {

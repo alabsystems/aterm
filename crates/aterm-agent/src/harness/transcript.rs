@@ -23,6 +23,8 @@ type Field = (&'static str, Shape);
 
 const USAGE: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
+    ("subtype", Shape::Scalar),
+    ("durationMs", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
     ("isApiErrorMessage", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -64,6 +66,21 @@ const COMMAND_FIELDS: [Field; 7] = {
 };
 const COMMAND: Shape = Shape::Object(&COMMAND_FIELDS);
 const CONTENT_PART: Shape = Shape::Object(&[("type", Shape::Scalar), ("text", Shape::Scalar)]);
+/// What is kept of a limit row's `quotaLimits`: whether the request was
+/// rejected, the reset it names, and which of the account's limits it was.
+/// MEASURED on this machine's transcripts (2026-10-01: every one of the ten
+/// rows that carry the key, Claude Code 2.1.273 and 2.1.283; 2.1.286's row
+/// is the accounts design §1's): `{"status":"rejected","resetsAt":<unix s,
+/// an integer>,"unifiedRateLimitFallbackAvailable":false,
+/// "rateLimitType":"five_hour" | "seven_day","overageStatus":…,
+/// "overageDisabledReason":…,"isUsingOverage":false}`, five of 2.1.273's
+/// with three `lowPriority…` keys besides. None of those other keys is read
+/// by anything here, and none is kept.
+const QUOTA_LIMITS: Shape = Shape::Object(&[
+    ("status", Shape::Scalar),
+    ("resetsAt", Shape::Scalar),
+    ("rateLimitType", Shape::Scalar),
+]);
 const CONVERSATION: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
@@ -74,12 +91,42 @@ const CONVERSATION: Shape = Shape::Object(&[
     ("timestamp", Shape::Scalar),
     ("subtype", Shape::Scalar),
     ("content", Shape::Scalar),
-    ("quotaLimits", Shape::Object(&[("resetsAt", Shape::Scalar)])),
+    ("quotaLimits", QUOTA_LIMITS),
     (
         "message",
         Shape::Object(&[("model", Shape::Scalar), ("content", Shape::Content)]),
     ),
 ]);
+
+/// The Codex turn/head and sandbox readers use only these discriminants and
+/// context facts. Instructions, environment state, tool payloads and messages
+/// are still validated, but never materialized merely to identify their row.
+const CODEX_METADATA: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
+    (
+        "payload",
+        Shape::Object(&[
+            ("type", Shape::Scalar),
+            ("role", Shape::Scalar),
+            ("cwd", Shape::Scalar),
+            ("model", Shape::Scalar),
+            ("sandbox_policy", Shape::Object(&[("type", Shape::Scalar)])),
+        ]),
+    ),
+]);
+
+struct CodexMetadata(Value);
+
+impl<'de> Deserialize<'de> for CodexMetadata {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        CODEX_METADATA.deserialize(de).map(Self)
+    }
+}
+
+pub(crate) fn codex_metadata(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<CodexMetadata>(line).map(|v| v.0)
+}
 
 struct Usage(Value);
 struct Metadata<const CONTENT: bool>(Value);
@@ -264,6 +311,13 @@ mod tests {
         ] {
             for text in [
                 value.to_owned(),
+                format!(r#"{{"type":{value},"payload":{value}}}"#),
+                format!(
+                    r#"{{"payload":{{"type":{value},"role":{value},"cwd":{value},"model":{value},"sandbox_policy":{{"type":{value}}}}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"ignored","t\u0079pe":"turn_context","payload":null,"payload":{{"cwd":"/old","c\u0077d":{value},"sandbox_policy":{{"type":"read-only","type":{value}}}}}}}"#
+                ),
                 format!(
                     r#"{{"message":{value},"effort":{value},"cwd":{value},"isApiErrorMessage":{value},"timestamp":{value}}}"#
                 ),
@@ -284,10 +338,51 @@ mod tests {
                 );
                 assert_eq!(
                     conversation(&text).expect("conversation"),
-                    project(full, CONVERSATION)
+                    project(full.clone(), CONVERSATION)
+                );
+                assert_eq!(
+                    codex_metadata(&text).expect("Codex metadata"),
+                    project(full, CODEX_METADATA)
                 );
             }
         }
+    }
+
+    /// THE LIMIT ROW, as Claude Code 2.1.286 writes it (the accounts design
+    /// §1's row; ids cut): the conversation projection keeps the three keys
+    /// of `quotaLimits` its readers ask for — `status`, `resetsAt`,
+    /// `rateLimitType` — and none of the overage keys; the other projections
+    /// keep no `quotaLimits` at all. A key of the wrong shape reads as the
+    /// null it stands for, and does not cost the row its other keys.
+    #[test]
+    fn the_conversation_keeps_a_limit_rows_status_reset_and_limit_type() {
+        let row = r#"{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"2026-09-30T19:02:11.123Z","quotaLimits":{"status":"rejected","resetsAt":1790870400,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false},"message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your weekly limit · resets Oct 1 at 9am (America/Los_Angeles)"}]}}"#;
+        let kept = conversation(row).expect("a row");
+        let quota = kept.get("quotaLimits").expect("quotaLimits");
+        assert_eq!(
+            aterm_json::to_string(quota).expect("json"),
+            r#"{"rateLimitType":"seven_day","resetsAt":1790870400,"status":"rejected"}"#
+        );
+        // NEGATIVE CONTROL: the projections that read no limit keep none.
+        for other in [usage(row), metadata(row), command(row)] {
+            assert_eq!(other.expect("a row").get("quotaLimits"), None);
+        }
+        // Vendor type drift: each key of the wrong shape is null, the others
+        // are kept.
+        let drift = row
+            .replace(r#""status":"rejected""#, r#""status":{"is":"rejected"}"#)
+            .replace(
+                r#""rateLimitType":"seven_day""#,
+                r#""rateLimitType":["seven_day"]"#,
+            );
+        let kept = conversation(&drift).expect("a row");
+        let quota = kept.get("quotaLimits").expect("quotaLimits");
+        assert_eq!(quota.get("status"), Some(&Value::Null));
+        assert_eq!(quota.get("rateLimitType"), Some(&Value::Null));
+        assert_eq!(
+            quota.get("resetsAt").and_then(Value::as_u64),
+            Some(1_790_870_400)
+        );
     }
 
     #[test]
@@ -306,6 +401,7 @@ mod tests {
                 assert!(usage(&text).is_err(), "{text}");
                 assert!(metadata(&text).is_err(), "{text}");
                 assert!(conversation(&text).is_err(), "{text}");
+                assert!(codex_metadata(&text).is_err(), "{text}");
             }
         }
         let deep = format!("{}0{}", "[".repeat(130), "]".repeat(130));

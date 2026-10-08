@@ -66,10 +66,10 @@
 //! script, so which osascript aterm ran is UNIDENTIFIED. The DECIDING fact is the
 //! live config: `~/.config/aterm/aterm.toml` sets neither `allow_notifications` nor
 //! `allow_osc52_query`, so this fallback was OFF on 2026-09-12 and no launch that day
-//! can be its. The binary also holds three osascript sites, not one — this fallback,
-//! `atpkg`'s `Elevation::Osascript` administrator dialog
-//! (`crates/atpkg/src/elevate.rs`), and the macOS-gated `display alert` a failed
-//! launch raises off the main thread (`crates/aterm-gui/src/lib.rs`) — so the name
+//! can be its. The binary also holds two osascript sites, not one — this fallback
+//! and the macOS-gated `display alert` a failed launch raises off the main thread
+//! (`crates/aterm-gui/src/lib.rs`); atpkg's osascript elevation went with the
+//! OS-installer door on 2026-09-24 — so the name
 //! alone never identifies the caller. An earlier reading of the same log counted three launches
 //! under `com.aterm.aterm` and credited them all to this fallback; the attribution
 //! was wrong, and the count came from a wider query than the TCC predicate used here. What both launches DID read in TCC is the same: one
@@ -92,9 +92,10 @@
 //! **aterm's own notices.** Two producers post text aterm wrote itself, not
 //! program output, and so are NOT behind `allow_notifications`: the consent
 //! attention path (`consent_observer::AttentionGate`) and the escalation herald
-//! (`status_item::Herald`, one notice per transition of a session into an
-//! agent prompt, question or usage limit, or into typed `attention`). Both use
-//! this same bounded queue and focus suppression, and both rate-limit
+//! (`status_item::Herald`, one notice per transition of a session into a
+//! frozen or stopped program, typed `attention`, an agent prompt or question,
+//! or an agent wall: usage, spend, context, login, API, overload, memory). Both
+//! use this same bounded queue and focus suppression, and both rate-limit
 //! themselves before the queue. The herald never runs in a headless instance.
 //! The embedded operator's notices (`operator_host`, "aterm operator") ride the
 //! same queue, and the update-health banner calls [`deliver`] directly.
@@ -111,8 +112,8 @@
 //! ride the queue). Nothing else changes: the menu bar, the tab marks, the band
 //! and `messages.log` still carry the herald's, the consent path's and update
 //! health's facts. The operator's notices are shown nowhere else, so off they
-//! are dropped and its queue (`aterm fleet status` and `next`) is their one
-//! record.
+//! are dropped and its queue (counted by `aterm fleet status`) is their
+//! one record.
 //! Program notifications (OSC 9/99/777) are [`NotifyMsg::program`] and answer
 //! to `allow_notifications` alone.
 
@@ -280,7 +281,7 @@ pub(crate) fn spawn_delivery(
 /// in the module doc.
 #[cfg(target_os = "macos")]
 pub(crate) fn deliver(title: Option<&str>, body: &str, _silent: bool) {
-    use std::process::{Command, Stdio};
+    use aterm_uds::spawnfd::Stdio;
 
     let title = title.unwrap_or("aterm");
 
@@ -289,7 +290,7 @@ pub(crate) fn deliver(title: Option<&str>, body: &str, _silent: bool) {
     // child) and tells us whether the binary exists — `Err` means not installed,
     // so we fall through to osascript. A non-zero exit means it IS installed but
     // failed; we do NOT double-notify via osascript in that case.
-    let mut tn = Command::new("terminal-notifier");
+    let mut tn = aterm_uds::spawnfd::command("terminal-notifier");
     tn.arg("-title")
         .arg(title)
         .arg("-message")
@@ -322,7 +323,7 @@ pub(crate) fn deliver(title: Option<&str>, body: &str, _silent: bool) {
         applescript_escape(body),
         applescript_escape(title),
     );
-    let _ = Command::new("osascript")
+    let _ = aterm_uds::spawnfd::command("osascript")
         .arg("-e")
         .arg(script)
         .stdin(Stdio::null())

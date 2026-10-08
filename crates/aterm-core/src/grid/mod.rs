@@ -3,12 +3,12 @@
 
 //! Terminal grid facade.
 //!
-//! `Grid`, `GridStorage`, `MaterializedRow`, and all production `impl Grid`
-//! methods now live in `aterm-grid`. This module re-exports them and provides
-//! backward-compatible import paths for leaf types and FFI/test shims.
+//! `Grid`, `GridStorage`, `MaterializedRow` and the `impl Grid` methods live in
+//! `aterm-grid`. This module re-exports them and provides import paths for leaf
+//! types and FFI/test shims.
 
 // ============================================================================
-// Leaf-type facade modules (explicit exports, Part of #6781)
+// Leaf-type facade modules
 // ============================================================================
 
 /// Packed cell representation (8 bytes). Re-exported from `aterm-grid`.
@@ -72,17 +72,13 @@ pub mod extra_collection {
 pub use aterm_grid::grid::Grid;
 pub use aterm_grid::grid::{MaterializedRow, materialize_from_line};
 
-// The scrollback-reflow offload job types. These already appear in
-// `Terminal::resize_offloading_scrollback` / `Terminal::finish_resize_offload`'s
-// PUBLIC signatures (as `aterm_grid::…`), so any aterm-core consumer that must
-// HOLD the job across calls — the wasm modules' cooperative (thread-free)
-// offload stashes it in module state between host turns — needs to NAME the
-// type. Re-exported here so that doesn't force a direct aterm-grid dependency.
+// The scrollback-reflow offload job types appear in
+// `Terminal::resize_offloading_scrollback`'s public signature; hosts that hold
+// the job across calls (the wasm modules' cooperative offload) name them here
+// without a direct aterm-grid dependency.
 pub use aterm_grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
-// The host-repaint policy `Terminal::resize_with_policy` /
-// `resize_offloading_scrollback_with_policy` take: the GUI selects it per
-// session from the PTY backend (ConPTY on Windows), so it must be nameable
-// without a direct aterm-grid dependency, like the job types above.
+// The host-repaint policy `Terminal::resize_with_policy` takes; the GUI picks it
+// per session from the PTY backend (ConPTY on Windows).
 pub use aterm_grid::grid::reflow::ResizePolicy;
 
 // The seamless update's history carry (`Terminal::history_fence` and the
@@ -92,16 +88,12 @@ pub use aterm_grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
 
-// ============================================================================
-// Modules that remain in aterm-core
-// ============================================================================
-
 #[cfg(test)]
 #[path = "../../test_support/grid/tests/mod.rs"]
 mod tests;
 
 // ============================================================================
-// Backward-compatible re-exports
+// Re-exports
 // ============================================================================
 
 pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
@@ -111,14 +103,9 @@ pub use page::PageStore;
 pub use row::{LineSize, Row, RowFlags};
 pub use style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, StyleTable};
 
-// Batch 2A: cursor and region types re-exported from aterm-grid.
 pub use aterm_grid::{CurrentStyle, Cursor, SavedCursor, SavedCursorState};
 
 // Grid dimension ingress bounds (§5.8): constructors and resize clamp to these.
 pub use aterm_grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
-
-// ----------------------------------------------------------------------------
-// Row index conversion helpers
-// ----------------------------------------------------------------------------
 
 pub(crate) use aterm_grid::row_u16;

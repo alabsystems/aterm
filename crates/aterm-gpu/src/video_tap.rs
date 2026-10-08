@@ -1,49 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! VIDEO introspection capture core: record the swapchain-destination frames
-//! submitted to `present()`, timestamped, so an AI driving aterm can inspect
-//! temporal renderer output (cursor-trail smoothness, per-keystroke flashes,
-//! and input→present-return latency) instead of relying on single-frame
-//! captures. This tap does not observe compositor selection, scanout, or photons.
+//! Video capture core: record the swapchain-destination frames submitted to
+//! `present()`, timestamped, so an agent driving aterm can inspect temporal
+//! output (cursor-trail smoothness, per-keystroke flashes, input-to-present
+//! latency). It does not observe compositor selection, scanout or photons.
 //!
-//! WHY THE SWAPCHAIN and not the offscreen: the offscreen readbacks (`image`
-//! verb, `present_input_readback`) are byte-exact for the GRID but structurally
-//! miss the swapchain-only passes — the EDR aurora, the SDR crown, the bell
-//! invert / drop-overlay / letterbox chrome baked into the blit. This tap copies
-//! `frame.texture` itself, in the SAME encoder as the present pass, after the
-//! last swapchain draw — the exact destination bytes queued alongside
-//! `present()`. This proves submitted texture content, not eventual display.
+//! It copies the swapchain texture, not the offscreen, because offscreen
+//! readbacks miss the swapchain-only passes (HDR aurora, SDR crown, bell
+//! invert, drop overlay, letterbox). The copy is recorded in the same encoder
+//! as the present pass, after the last draw.
 //!
-//! Discipline (the counted-drop recorder shape shared with the cast/temporal
-//! recorders): a small ring of staging buffers absorbs GPU latency; when the
-//! ring is saturated the frame is SKIPPED and counted, never blocked on; the
-//! harvested store restores capture-sequence order across asynchronous map
-//! callbacks, then applies byte-budgeted lowest-sequence eviction with a
-//! separate count. The present path pays one `Option` branch when the tap is off.
+//! A small ring of staging buffers absorbs GPU latency; when it is saturated
+//! the frame is skipped and counted, never waited on. The store restores
+//! capture-sequence order across asynchronous map callbacks and evicts the
+//! lowest sequences past the byte budget, counted separately. The present
+//! path pays one `Option` branch when the tap is off.
 //!
-//! THE PER-PIXEL CONVERSION RUNS OFF THE PRESENT THREAD: a mapped slot's raw
-//! padded bytes are memcpy'd out and shipped to the recording's dedicated
-//! conversion worker ([`ConvertWorker`]), which runs [`mapped_to_rgba8`] — the
-//! f16 decode + scRGB→SDR tonemap + sRGB encode + 2×2 downscale — and hands
-//! finished RGBA8 frames back for the ordered, budgeted store. The present
-//! thread's per-frame cost is one bounded memcpy plus channel traffic. (The
-//! conversion used to run synchronously in `after_present`, and one 7.25 s EDR
-//! recording episode starved input to p99 201 ms with 21 wake heals.) When no
-//! thread can be spawned (wasm, exhaustion) the harvest falls back to the old
-//! inline conversion; a worker more than [`CONVERT_BACKLOG`] frames behind is
-//! a counted mid-stream drop, never a block.
+//! Per-pixel conversion runs off the present thread: a mapped slot's raw bytes
+//! are copied to the recording's [`ConvertWorker`], which runs
+//! [`mapped_to_rgba8`] (f16 decode, scRGB-to-SDR tone map, sRGB encode, 2×2
+//! downscale) and returns RGBA8 frames for the ordered store. Without a thread
+//! (wasm, spawn failure) the harvest converts inline; a worker more than
+//! [`CONVERT_BACKLOG`] frames behind is a counted drop, never a block.
 
 use std::collections::VecDeque;
 use std::sync::mpsc;
 
-/// The colour space the platform compositor uses to interpret a window's
-/// presented texture.
-///
-/// This is explicit per-window metadata rather than an inference from the
-/// texture format: an 8-bit `Bgra8Unorm` surface can be tagged either sRGB or
-/// Display-P3 on macOS. `Rgba16Float` is only valid with
-/// [`Self::ExtendedLinearSrgb`] in aterm's present path.
+use aterm_render::{linear_to_srgb, srgb_to_linear};
+
+/// The colour space the platform compositor uses for a window's presented
+/// texture. Explicit per-window metadata, since an 8-bit `Bgra8Unorm` surface
+/// can be tagged sRGB or Display-P3 on macOS. `Rgba16Float` is valid only with
+/// [`Self::ExtendedLinearSrgb`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CaptureColorSpace {
     /// The platform tag could not be established. Exact capture refuses this
@@ -117,13 +106,10 @@ impl CaptureEncoding {
     }
 }
 
-/// One harvested frame: tightly-packed straight, non-linear sRGB RGBA8, plus
-/// the same-clock timestamp the GUI stamped right after `present()` returned
-/// (µs, `metrics::now_us` epoch).
-///
-/// The capture transform makes the bytes self-describing as ordinary sRGB:
-/// unprofiled PNG/video writers must not reinterpret a tagged Display-P3
-/// swapchain or clamp scRGB directly.
+/// One harvested frame: tightly packed straight sRGB RGBA8, plus the
+/// same-clock timestamp the GUI stamped right after `present()` returned (µs,
+/// `metrics::now_us` epoch). Converted to ordinary sRGB so unprofiled writers
+/// need no colour handling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapturedFrame {
     pub seq: u64,
@@ -134,16 +120,10 @@ pub struct CapturedFrame {
     pub rgba: Vec<u8>,
 }
 
-/// Insert one asynchronously harvested frame in capture-sequence order and
-/// enforce the byte budget by evicting the lowest sequence numbers.
-///
-/// GPU map callbacks may arrive out of order. Append-on-completion would make
-/// the recording timeline callback-ordered and make `pop_front` evict an
-/// arbitrary completion rather than the oldest captured frame. The store is
-/// bounded, so the linear insertion is bounded too.
-///
-/// Returns the number of frames evicted by this insertion; callers accumulate
-/// that separately from mid-stream `dropped`.
+/// Insert one harvested frame in capture-sequence order and enforce the byte
+/// budget by evicting the lowest sequences. Map callbacks can complete out of
+/// order, so appending on completion would scramble the timeline. Returns the
+/// number of frames evicted, counted separately from `dropped`.
 #[cfg_attr(
     any(test, feature = "spec-anchors"),
     aterm_spec::refines(
@@ -226,25 +206,20 @@ pub fn ordered_capture_store_push(
 /// The finalized recording handed to the dump path.
 pub struct VideoTake {
     pub frames: VecDeque<CapturedFrame>,
-    /// Frames LOST mid-stream (staging ring saturated / map failure /
-    /// conversion backlog or failure / device loss), counted so the artifact
-    /// is honest about coverage. Budget
-    /// evictions are counted separately in `evicted` (they truncate the HEAD
-    /// of the recording, a different honesty story than a mid-stream skip).
+    /// Frames lost mid-stream (ring saturated, map failure, conversion backlog
+    /// or failure, device loss). Budget evictions count in `evicted`.
     pub dropped: u64,
-    /// Frames evicted from the FRONT of the store when the byte budget
-    /// overflowed: `evicted > 0` means the head of the recording is gone
-    /// (`head_truncated` in the dump's index.json).
+    /// Frames evicted from the front when the byte budget overflowed; nonzero
+    /// means the head of the recording is gone (`head_truncated` in the dump).
     pub evicted: u64,
-    /// Frames deliberately skipped by the `fps=` capture gate. NOT a loss:
-    /// decimation is the client's explicit request, so it is never folded
-    /// into `dropped`.
+    /// Frames skipped by the `fps=` capture gate at the client's request; not
+    /// counted in `dropped`.
     pub decimated: u64,
     /// The fps cap the gate ran with (`None` = capture every present).
     pub fps_cap: Option<u32>,
     /// The byte budget the store ran with (echoed as `budget_mib`).
     pub budget_bytes: usize,
-    /// The client's REQUESTED duration (ms), echoed into index.json so the
+    /// The client's requested duration (ms), echoed into index.json so the
     /// consumer can judge the covered window against what was asked for.
     pub requested_ms: u64,
     /// Capture geometry actually used (post-downscale).
@@ -261,11 +236,8 @@ pub struct VideoTake {
     pub resized_early_stop: bool,
 }
 
-/// Abstract lifecycle phase of one [`VideoTap`] staging slot.
-///
-/// Payloads such as sequence/timestamp/colour encoding remain on the internal
-/// slot state. This phase is the pure, device-free projection used by the
-/// shipping transition gate and its derived-model conformance test.
+/// Abstract lifecycle phase of one [`VideoTap`] staging slot: the device-free
+/// projection used by the transition gate and its conformance test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoSlotPhase {
     /// Available for a new swapchain copy.
@@ -300,11 +272,9 @@ pub struct VideoSlotDecision {
     pub count_drop: bool,
 }
 
-/// Decide one genuine [`VideoTap`] staging-slot transition.
-///
-/// Invalid phase/event pairs return `None`: stale/duplicate map callbacks never
-/// mutate a reused slot. Map failures and finalization aborts both release the
-/// slot and count exactly one loss.
+/// Decide one [`VideoTap`] staging-slot transition. Invalid pairs return
+/// `None`, so stale or duplicate map callbacks never mutate a reused slot. Map
+/// failure and finalization abort both release the slot and count one loss.
 #[cfg_attr(
     any(test, feature = "spec-anchors"),
     aterm_spec::refines(
@@ -383,10 +353,8 @@ pub enum VideoPresentDecision {
     DropInvalidMetadata,
 }
 
-/// Classify a present without conflating decimation with invalid-metadata loss.
-///
-/// Metadata is intentionally irrelevant when the fps gate rejects the present:
-/// a frame the client did not request cannot inflate `dropped`.
+/// Classify a present, keeping decimation separate from invalid-metadata
+/// loss: a present the fps gate rejects never inflates `dropped`.
 #[cfg_attr(
     any(test, feature = "spec-anchors"),
     aterm_spec::refines(
@@ -448,17 +416,15 @@ struct Slot {
     state: SlotState,
 }
 
-/// W6b - which backend's staging buffer a slot holds. A ring is HOMOGENEOUS
-/// (chosen at `new`/`new_metal`); the cross-arm enqueue guards finalize a
-/// recording honestly if a renderer disarm flips the present path mid-take.
+/// Which backend's staging buffer a slot holds. A ring is homogeneous; the
+/// cross-arm enqueue guards finalize a recording if a disarm switches the
+/// present path mid-take.
 enum SlotBuf {
     #[cfg(wgpu_arm)]
     Wgpu(wgpu::Buffer),
-    /// The ARMED arm's slot: a shared-storage `MTLBuffer` plus, once this
-    /// present's Submit B is committed, a PROBE onto that command buffer -
-    /// status polling is the map's completion-handler substitute, and the
-    /// probe never feeds the loss latch (the present ring's `Submitted`
-    /// owns the once-feed).
+    /// Metal slot: a shared-storage `MTLBuffer` plus, once Submit B commits, a
+    /// probe onto that command buffer for status polling. The probe never feeds
+    /// the loss latch.
     #[cfg(target_os = "macos")]
     Metal {
         buf: crate::metal::resources::SharedBuffer,
@@ -467,9 +433,8 @@ enum SlotBuf {
 }
 
 impl SlotBuf {
-    /// Whether this slot stages through the wgpu arm — the cross-arm enqueue
-    /// guards' neutral spelling (compiles on the wgpu-free build, where it is
-    /// constantly false).
+    /// Whether this slot stages through the wgpu arm (always false on the
+    /// wgpu-free build).
     #[cfg(target_os = "macos")]
     fn is_wgpu(&self) -> bool {
         #[cfg(wgpu_arm)]
@@ -521,9 +486,8 @@ pub struct VideoTap {
     requested_ms: u64,
     /// Earliest gate time (µs on the `epoch` clock) the next frame is accepted.
     next_capture_us: u64,
-    /// Local monotonic origin for the fps gate. The gate only ever compares
-    /// spacing on this one clock, so it needs no shared epoch with the
-    /// `metrics::now_us` frame stamps.
+    /// Local monotonic origin for the fps gate, which only compares spacing
+    /// on this clock.
     // aterm-time so the type/clock matches the renderer's wasm-safe present clocks;
     // native builds get std's Instant unchanged (video tap is a native feature).
     epoch: aterm_time::Instant,
@@ -540,11 +504,9 @@ pub struct VideoTap {
     mixed_capture_encoding: bool,
     bpp: u32,
     resized_early_stop: bool,
-    /// Dedicated conversion lane: the per-pixel decode/tonemap/downscale runs
-    /// on this worker so `after_present` never pays per-pixel work on the
-    /// present thread. `None` — spawn failed, or the worker died mid-take —
-    /// falls back to the old inline conversion. There is no worker on wasm
-    /// (single-threaded; see `spawn_convert_worker`).
+    /// The conversion worker, so `after_present` never does per-pixel work.
+    /// `None` (spawn failed or worker died) falls back to inline conversion.
+    /// No worker on wasm.
     #[cfg(not(target_arch = "wasm32"))]
     worker: Option<ConvertWorker>,
 }
@@ -555,19 +517,15 @@ const RING: usize = 4;
 /// Default RAM budget for the harvested store (bytes).
 pub const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 
-/// Upper bound on conversions dispatched to the worker and not yet adopted
-/// back into the store. At ring depth on purpose: it bounds the transient
-/// raw-copy RAM to what the staging ring already commits, and a worker that
-/// far behind means conversion cannot keep pace with presents — the recorder
-/// discipline then counts a drop rather than ever blocking (or slowing) the
-/// present thread the way the old inline conversion did.
+/// Upper bound on conversions dispatched and not yet adopted. At ring depth, so
+/// transient raw-copy memory stays within what the ring already commits; a
+/// worker this far behind counts a drop instead of slowing the present thread.
 #[cfg(not(target_arch = "wasm32"))]
 const CONVERT_BACKLOG: usize = RING;
 
-/// One mapped slot's RAW padded bytes en route to the conversion worker, with
-/// the per-frame facts the pure [`mapped_to_rgba8`] needs. Per-tap geometry
-/// and format travel in the worker's closure instead — they are fixed for a
-/// recording's lifetime (a mid-capture resize finalizes the tap).
+/// One mapped slot's raw padded bytes for the conversion worker, with the
+/// per-frame inputs [`mapped_to_rgba8`] needs. Geometry and format live in the
+/// worker's closure; they are fixed for a recording.
 #[cfg(not(target_arch = "wasm32"))]
 struct ConvertJob {
     raw: Vec<u8>,
@@ -576,10 +534,9 @@ struct ConvertJob {
     capture_encoding: CaptureEncoding,
 }
 
-/// The recording's dedicated conversion lane. The worker thread lives exactly
-/// as long as the tap (its job sender drops with the tap / at `finish`), runs
-/// [`mapped_to_rgba8`] per job, and answers with `Some(frame)` or `None` on a
-/// conversion error (adopted as one counted mid-stream loss).
+/// The recording's conversion lane. The worker lives as long as the tap (its
+/// job sender drops at `finish`), runs [`mapped_to_rgba8`] per job, and returns
+/// `Some(frame)` or `None` on error (one counted loss).
 #[cfg(not(target_arch = "wasm32"))]
 struct ConvertWorker {
     job_tx: mpsc::Sender<ConvertJob>,
@@ -589,15 +546,11 @@ struct ConvertWorker {
     handle: std::thread::JoinHandle<()>,
 }
 
-/// Spawn the dedicated conversion worker for one recording. `None` when the
-/// platform cannot spawn a thread (thread exhaustion) — the harvest then
-/// falls back to converting inline on the present thread, the old behavior.
+/// Spawn the conversion worker for one recording, or `None` when no thread can
+/// be spawned (the harvest then converts inline).
 ///
-/// wasm has no worker at all: the harvest converts inline on the present
-/// thread. The whole lane is compiled out there rather than stubbed, because
-/// the wasm census's OB-12 reads thread vocabulary as a POSTURE claim — the
-/// shipped wasm closure is single-threaded, which is what makes its
-/// lock-order obligation vacuous.
+/// Compiled out on wasm, which converts inline: the wasm census reads thread
+/// vocabulary as a claim, and the wasm build is single-threaded.
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_convert_worker(
     src_w: u32,
@@ -645,9 +598,8 @@ fn spawn_convert_worker(
     }
 }
 
-/// Bytes per source pixel for every destination format the presented-frame taps
-/// support. Kept independent of a device so the decode contract can be tested
-/// exhaustively without an adapter.
+/// Bytes per source pixel for every destination format the taps support.
+/// Device-free, so the decode contract is testable without an adapter.
 fn capture_bpp(format: crate::device_layer::TexelFormat) -> Result<u32, String> {
     match format {
         crate::device_layer::TexelFormat::Bgra8Unorm
@@ -661,10 +613,9 @@ fn padded_row_bytes(width: u32, bpp: u32) -> u64 {
     (u64::from(width) * u64::from(bpp)).div_ceil(256) * 256
 }
 
-/// Strip GPU row padding, swizzle/decode the source format, and optionally box
-/// downsample 2×2. This is deliberately PURE: both the streaming [`VideoTap`]
-/// and the one-shot [`PresentedFrameTap`] use it, while unit tests feed it
-/// synthetic mapped bytes with no GPU/device.
+/// Strip row padding, swizzle or decode the source format, and optionally box
+/// downsample 2×2. Pure: used by [`VideoTap`] and [`PresentedFrameTap`] and
+/// tested with synthetic bytes.
 fn mapped_to_rgba8(
     data: &[u8],
     src_w: u32,
@@ -759,18 +710,11 @@ fn mapped_to_rgba8(
         }
     };
 
-    // Byte-indexed sRGB→linear decode table for the 2×2 box filter below. Every
-    // `fetch` return path yields channels in 0..=255 (the 8-bit swizzle,
-    // `display_p3_to_srgb8`, and `srgb8_from_linear` for f16 all quantize to a
-    // byte), so `decode[n]` is EXACTLY what `srgb_to_linear(n as f32 / 255.0)`
-    // returns for that same n — this is a bit-identical substitution, not an
-    // approximation. It trades 12 `powf` per OUTPUT pixel (4 samples × 3
-    // channels) for 256 `powf` per frame, which still matters off-thread (the
-    // conversion worker must keep pace with presents or frames drop) and
-    // matters doubly on the no-thread inline fallback. The encode side keeps its `powf`:
-    // `srgb8_from_linear` produces the stored pixel byte and its rounding is a
-    // pinned parity artifact. Only the downsampling path decodes, so the table
-    // is skipped otherwise.
+    // A 256-entry sRGB-to-linear table for the 2×2 box filter. Every `fetch`
+    // path yields byte-valued channels, so `decode[n]` equals
+    // `srgb_to_linear(n as f32 / 255.0)` exactly. It replaces 12 `powf` per
+    // output pixel with 256 per frame. The encode keeps `powf`, since its
+    // rounding is pinned. Built only when downsampling.
     let decode: [f32; 256] = if half_res {
         std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0))
     } else {
@@ -817,10 +761,9 @@ fn mapped_to_rgba8(
     Ok((rgba, dw as u32, dh as u32))
 }
 
-/// The CLIENT-SET controls for one recording (the `video` verb's knobs),
-/// bundled so they travel the `Wake::Video -> video_begin -> VideoTap` seam as
-/// one value. Geometry/format stay separate `new()` parameters — they come
-/// from the swapchain, not the client.
+/// The client-set controls for one recording (the `video` verb's knobs), passed
+/// as one value from `Wake::Video` through `video_begin` to `VideoTap`.
+/// Geometry and format come from the swapchain.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureOpts {
     /// Downscale 2×2 at harvest (quarter the bytes — the default for
@@ -917,9 +860,9 @@ impl VideoTap {
         }
     }
 
-    /// Enqueue the swapchain copy into THIS present's encoder (called between
-    /// the render-pass close and `queue.submit`). Never blocks: a saturated
-    /// ring or a mismatched size counts a drop / finalizes instead.
+    /// Enqueue the swapchain copy into this present's encoder (between the
+    /// render pass and `queue.submit`). Never blocks: a saturated ring counts a
+    /// drop and a size mismatch finalizes.
     #[cfg(wgpu_arm)]
     pub fn enqueue_copy(
         &mut self,
@@ -940,18 +883,15 @@ impl VideoTap {
             self.resized_early_stop = true;
             return;
         }
-        // `fps=` decimation gate, BEFORE any copy work (a skipped frame costs
-        // one compare). Counted in `decimated`, never in `dropped` — skipping
-        // is the client's explicit request, not a loss.
+        // The `fps=` gate, before any copy work. Skips count in `decimated`.
         let now_us = self.epoch.elapsed().as_micros() as u64;
         let Some(capture_encoding) =
             self.capture_encoding_for_present(now_us, color_space, sdr_white_scale)
         else {
             return;
         };
-        // W6b cross-arm guard: a wgpu-encoder copy cannot land in a Metal
-        // ring (a renderer disarm mid-take) — finalize honestly, like a
-        // resize, rather than mis-copy or panic.
+        // A wgpu copy cannot land in a Metal ring (a mid-take disarm); finalize
+        // like a resize.
         #[cfg(target_os = "macos")]
         if self
             .slots
@@ -1010,10 +950,9 @@ impl VideoTap {
         }
     }
 
-    /// W6b — build an ARMED-arm tap: the same ring, counters, budget, fps
-    /// gate and conversion lane, with Metal shared-storage staging slots and
-    /// STATUS-POLLED harvest in place of `map_async` (the map's
-    /// completion-handler substitute, productionized from the W5 replay).
+    /// Build a Metal-arm tap: the same ring, counters, budget, fps gate and
+    /// conversion lane, with shared-storage staging slots harvested by status
+    /// polling instead of `map_async`.
     #[cfg(target_os = "macos")]
     pub(crate) fn new_metal(
         mint: &crate::metal::resources::MetalResourceDevice,
@@ -1077,11 +1016,9 @@ impl VideoTap {
         })
     }
 
-    /// W6b — the ARMED enqueue: append this present's destination copy to
-    /// the SAME Submit B command buffer, before commit — the exact
-    /// "appended to the encoder before submit" ordering the wgpu tap uses.
-    /// Same gates, same counters, same finalize disciplines as
-    /// [`Self::enqueue_copy`], slot for slot.
+    /// Metal enqueue: append this present's destination copy to Submit B before
+    /// commit, with the same gates, counters and finalize rules as
+    /// [`Self::enqueue_copy`].
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_enqueue_copy(
         &mut self,
@@ -1155,9 +1092,8 @@ impl VideoTap {
         Ok(())
     }
 
-    /// W6b — attach the committed Submit B's probe to the Pending slot the
-    /// enqueue above filled (at most one per present). Called by the
-    /// renderer right after `commit`; a no-op when nothing is Pending.
+    /// Attach the committed Submit B's probe to the Pending slot filled above.
+    /// Called right after `commit`; no-op when nothing is pending.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_note_submitted(&mut self, probe: crate::metal::encoder::CbProbe) {
         for slot in &mut self.slots {
@@ -1171,12 +1107,10 @@ impl VideoTap {
         }
     }
 
-    /// W6b — the STATUS-POLLED harvest (the Metal arm of
-    /// [`Self::harvest_ready`]): a terminal `Completed` probe hands the
-    /// slot's shared bytes to the conversion lane exactly as a completed
-    /// map does; any other terminal outcome (or a lost probe) is one
-    /// counted drop. `block` waits each probe to terminal — the `finish`
-    /// drain; the per-present call never blocks.
+    /// Metal harvest (status-polled twin of [`Self::harvest_ready`]): a
+    /// `Completed` probe hands the slot's bytes to the conversion lane; any
+    /// other terminal outcome or a lost probe is one counted drop. `block`
+    /// waits each probe (the `finish` drain); the per-present call never blocks.
     #[cfg(target_os = "macos")]
     fn metal_harvest_ready(&mut self, block: bool) {
         self.adopt_converted();
@@ -1234,10 +1168,8 @@ impl VideoTap {
         self.adopt_converted();
     }
 
-    /// W6b — [`Self::convert_or_dispatch`]'s Metal twin: source the raw
-    /// padded bytes from the slot's shared buffer (the probe's `Completed`
-    /// is the coherence point) instead of a mapped range; the worker lane,
-    /// backlog bound and inline fallback are identical.
+    /// Metal twin of [`Self::convert_or_dispatch`]: reads the raw padded bytes
+    /// from the slot's shared buffer (coherent after `Completed`).
     #[cfg(target_os = "macos")]
     fn metal_convert_or_dispatch(
         &mut self,
@@ -1334,14 +1266,11 @@ impl VideoTap {
         }
     }
 
-    /// The `fps=` capture gate, PURE on `(self, now_us)` — no clock reads, so
-    /// the law is unit-testable with synthetic times. Semantics (pinned by
-    /// tests): with no cap every frame is accepted; with cap `n` a frame at
-    /// `now_us` is accepted iff at least `1_000_000 / n` µs have passed since
-    /// the last ACCEPTED frame (spacing is measured accept-to-accept — a
-    /// rejected frame never accrues catch-up debt, so a burst after a quiet
-    /// stretch still captures at most one frame per interval). The first frame
-    /// is always accepted. A rejection increments `decimated`.
+    /// The `fps=` gate, pure on `(self, now_us)`. With no cap every frame is
+    /// accepted; with cap `n` a frame is accepted iff at least `1_000_000 / n` µs
+    /// have passed since the last accepted frame (rejections accrue no catch-up
+    /// debt). The first frame is always accepted. A rejection increments
+    /// `decimated`.
     fn should_capture(&mut self, now_us: u64) -> bool {
         let Some(fps) = self.fps_cap else {
             return true;
@@ -1354,10 +1283,8 @@ impl VideoTap {
         true
     }
 
-    /// Apply the client fps gate before validating this present's live colour
-    /// metadata. An invalid source therefore counts one loss only when this was
-    /// a requested sampling opportunity; deliberately decimated presents remain
-    /// decimated rather than inflating `dropped`.
+    /// Apply the fps gate before validating this present's colour metadata, so
+    /// invalid metadata counts a loss only on a requested frame.
     fn capture_encoding_for_present(
         &mut self,
         now_us: u64,
@@ -1390,12 +1317,10 @@ impl VideoTap {
         }
     }
 
-    /// Post-present hook (GUI-side, right after `frame.present()` returned):
-    /// stamp the just-enqueued copy with the same-clock time, issue its
-    /// map_async, then NON-BLOCKING poll + harvest any completed earlier maps
-    /// (a raw memcpy handed to the conversion worker — never per-pixel work
-    /// here) and adopt any finished conversions into the store. Bounded work;
-    /// never waits on the GPU or the worker.
+    /// Post-present hook (right after `frame.present()`): stamp the enqueued
+    /// copy, issue its `map_async`, poll without blocking, hand completed maps
+    /// to the conversion worker, and adopt finished conversions. Never waits
+    /// on the GPU or the worker.
     #[cfg(wgpu_arm)]
     pub fn after_present(&mut self, device: &wgpu::Device, t_us: u64) {
         // Stamp + map the newest Pending slot (at most one per present).
@@ -1412,12 +1337,9 @@ impl VideoTap {
                             let _ = tx.send((i, r.is_ok()));
                         });
                     }
-                    // W6b — a Metal slot's "map" is its probe: the copy rides
-                    // the present's Submit B, so InFlight means "that command
-                    // buffer is not yet terminal". A Pending slot with NO
-                    // probe means the present never committed (Submit B
-                    // failed after the enqueue) — the harvest below books it
-                    // as a map error, one counted drop.
+                    // A Metal slot's map is its probe: InFlight means Submit B is
+                    // not yet terminal. A Pending slot with no probe never
+                    // committed; the harvest books it as one drop.
                     #[cfg(target_os = "macos")]
                     SlotBuf::Metal { .. } => {}
                 }
@@ -1446,18 +1368,16 @@ impl VideoTap {
         self.metal_harvest_ready(false);
     }
 
-    /// Whether this ring stages through the ARMED (Metal) arm — the renderer
+    /// Whether this ring stages through the armed (Metal) arm; the renderer
     /// wrapper's dispatch key (a ring is homogeneous; see `SlotBuf`).
     #[cfg(target_os = "macos")]
     pub(crate) fn ring_is_metal(&self) -> bool {
         self.slots.first().is_some_and(|s| !s.buffer.is_wgpu())
     }
 
-    /// THE FLIP — [`Self::after_present`] for a build with no wgpu device to
-    /// poll: the armed (Metal) ring's post-present hook. Same StartMap
-    /// transition per Pending slot (a Metal slot's "map" is its probe), same
-    /// non-blocking harvest; there is no wgpu map to start and no device to
-    /// poll, which is the entire difference.
+    /// [`Self::after_present`] for the wgpu-free build: the same per-slot start
+    /// transition (the probe is the map) and non-blocking harvest, with no
+    /// device to poll.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_after_present(&mut self, t_us: u64) {
         for slot in self.slots.iter_mut() {
@@ -1487,11 +1407,9 @@ impl VideoTap {
         self.metal_harvest_ready(false);
     }
 
-    /// Drain the completion channel: adopt finished off-thread conversions,
-    /// then route every newly mapped slot toward RGBA8. A dispatched slot is
-    /// copied out raw and unmapped HERE, so a slot's lifetime is still bounded
-    /// by map latency alone — conversion lag can never saturate the staging
-    /// ring, it can only (bounded, counted) drop via [`CONVERT_BACKLOG`].
+    /// Drain the completion channel: adopt finished conversions, then route
+    /// newly mapped slots toward RGBA8. A dispatched slot is copied and
+    /// unmapped here, so conversion lag never saturates the staging ring.
     #[cfg(wgpu_arm)]
     fn harvest_ready(&mut self) {
         self.adopt_converted();
@@ -1526,15 +1444,10 @@ impl VideoTap {
         self.adopt_converted();
     }
 
-    /// Route one successfully mapped slot's bytes toward RGBA8. With a live
-    /// worker the padded bytes are memcpy'd out (bounded, no per-pixel work)
-    /// and the decode/tonemap/downscale runs OFF the present thread; the
-    /// result is adopted by a later [`Self::adopt_converted`] drain, so this
-    /// returns `None`. `Some(frame)` is the inline fallback (no worker, or the
-    /// worker died) — the old synchronous behavior, pushed by the caller. A
-    /// worker already [`CONVERT_BACKLOG`] frames behind means conversion is
-    /// not keeping pace: count one mid-stream drop rather than queueing
-    /// unbounded raw copies or blocking the present thread.
+    /// Route one mapped slot's bytes toward RGBA8. With a live worker the bytes
+    /// are copied out and converted off-thread (adopted later by
+    /// [`Self::adopt_converted`]), returning `None`. `Some(frame)` is the inline
+    /// fallback. A worker [`CONVERT_BACKLOG`] frames behind counts a drop.
     #[cfg(wgpu_arm)]
     fn convert_or_dispatch(
         &mut self,
@@ -1573,9 +1486,8 @@ impl VideoTap {
         Some(self.copy_out(idx, seq, t_us, capture_encoding))
     }
 
-    /// Non-blocking adoption of finished off-thread conversions into the
-    /// ordered, budgeted store. A conversion failure is one counted mid-stream
-    /// loss, exactly like a map failure.
+    /// Adopt finished conversions into the store without blocking. A failure is
+    /// one counted loss.
     fn adopt_converted(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         loop {
@@ -1593,10 +1505,8 @@ impl VideoTap {
         }
     }
 
-    /// INLINE FALLBACK (no conversion worker): strip row padding +
-    /// swizzle/decode + (optionally) 2×2 box-downscale one mapped slot into a
-    /// tightly-packed RGBA8 frame, synchronously on the calling (present)
-    /// thread.
+    /// Inline fallback (no worker): convert one mapped slot to a tightly packed
+    /// RGBA8 frame on the calling thread.
     #[cfg(wgpu_arm)]
     fn copy_out(
         &self,
@@ -1627,11 +1537,9 @@ impl VideoTap {
         }
     }
 
-    /// Budget-bounded, sequence-ordered push (the cast/temporal recorder
-    /// discipline). Async map callbacks may complete out of order, so insertion
-    /// restores capture order before drop-oldest evicts the lowest sequence.
-    /// An eviction counts in `evicted`, NOT `dropped`: it truncates the HEAD of
-    /// the recording while `dropped` means a mid-stream skip.
+    /// Budget-bounded, sequence-ordered push. Out-of-order completions are
+    /// placed by sequence before the lowest is evicted. Evictions count in
+    /// `evicted` (head truncation), not `dropped`.
     fn push_frame(&mut self, f: CapturedFrame) {
         self.evicted += ordered_capture_store_push(
             &mut self.store,
@@ -1647,10 +1555,8 @@ impl VideoTap {
         self.resized_early_stop
     }
 
-    /// Frames harvested so far (for `video status`). Includes frames dispatched
-    /// to the conversion worker and not yet adopted: they were captured, and
-    /// counting them keeps this progress read equivalent to the old
-    /// synchronous harvest (a conversion failure later books a drop instead).
+    /// Frames harvested so far (`video status`), including frames dispatched
+    /// to the worker and not yet adopted.
     #[must_use]
     pub fn frames_so_far(&self) -> usize {
         #[cfg(not(target_arch = "wasm32"))]
@@ -1660,13 +1566,8 @@ impl VideoTap {
         self.store.len() + dispatched
     }
 
-    /// Finalize: BLOCKING drain of in-flight maps and dispatched conversions
-    /// (off the hot path by definition — the recording is over), then hand the
-    /// store out. Every frame the worker was still converting is adopted
-    /// before the take is sealed, so deferring the tonemap loses nothing.
-    /// THE FLIP — [`Self::finish`] for a build with no wgpu device: blocking
-    /// Metal drain (wait every in-flight probe terminal, harvest), then the
-    /// same abort sweep, conversion-lane drain, and take assembly.
+    /// Finalize on the wgpu-free build: wait every in-flight probe and harvest,
+    /// then the abort sweep, conversion-lane drain and take assembly.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_finish(mut self) -> VideoTake {
         self.metal_harvest_ready(true);
@@ -1685,12 +1586,13 @@ impl VideoTap {
         self.into_take()
     }
 
+    /// Finalize: blocking drain of in-flight maps and dispatched conversions
+    /// (the recording is over), then hand out the store. Frames still being
+    /// converted are adopted before the take is sealed.
     #[cfg(wgpu_arm)]
     pub fn finish(mut self, device: &wgpu::Device) -> VideoTake {
-        // W6b — the Metal drain first: wait every in-flight probe to
-        // terminal and harvest (blocking is the finish contract; the
-        // recording is over). The abort sweep below then cleans anything
-        // still outstanding on either arm.
+        // Metal drain first (blocking is the finish contract); the abort sweep
+        // below cleans anything outstanding on either arm.
         #[cfg(target_os = "macos")]
         self.metal_harvest_ready(true);
         let any_inflight = self
@@ -1717,9 +1619,9 @@ impl VideoTap {
         self.into_take()
     }
 
-    /// Conversion lane drain: dropping the job sender lets the worker run
-    /// its queue dry and exit; every outstanding result is adopted here. A
-    /// worker that died with jobs outstanding is counted honestly.
+    /// Drain the conversion lane: dropping the job sender lets the worker finish
+    /// and exit; every result is adopted. A worker that died with jobs
+    /// outstanding is counted.
     fn drain_convert_lane(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ConvertWorker {
@@ -1824,10 +1726,8 @@ pub struct PresentedFrameDecision {
     pub outcome: PresentedFrameOutcome,
 }
 
-/// Decide one genuine [`PresentedFrameTap`] lifecycle transition.
-///
-/// Invalid phase/event pairs return `None`, preventing a stale callback or
-/// repeated present hook from completing the wrong capture generation.
+/// Decide one [`PresentedFrameTap`] transition. Invalid pairs return `None`,
+/// so a stale callback cannot complete the wrong capture.
 #[cfg_attr(
     any(test, feature = "spec-anchors"),
     aterm_spec::refines(
@@ -1944,13 +1844,10 @@ impl PresentedFrameState {
     }
 }
 
-/// Independent one-shot tap for the exact presented destination.
-///
-/// Unlike [`VideoTap`], this has one staging buffer, no fps/budget policy, and
-/// captures only the first successful present after it is armed. It deliberately
-/// lives beside (not inside) the video recorder so a still-image request and an
-/// active recording can copy the same destination in one encoder without
-/// consuming or perturbing each other's state.
+/// One-shot tap for the exact presented destination: one staging buffer, no
+/// fps or budget policy, captures the first successful present after arming.
+/// Independent of [`VideoTap`], so a still and a recording can copy the same
+/// destination in one encoder without disturbing each other.
 pub(crate) struct PresentedFrameTap {
     buffer: SlotBuf,
     #[cfg(wgpu_arm)]
@@ -2014,7 +1911,7 @@ impl PresentedFrameTap {
         padded_row_bytes(self.src_w, self.bpp)
     }
 
-    /// W6b — the ARMED one-shot tap: same lifecycle, Metal staging + probe.
+    /// The armed one-shot tap: same lifecycle, Metal staging + probe.
     #[cfg(target_os = "macos")]
     pub(crate) fn new_metal(
         mint: &crate::metal::resources::MetalResourceDevice,
@@ -2057,10 +1954,9 @@ impl PresentedFrameTap {
         })
     }
 
-    /// W6b — the ARMED enqueue (see `VideoTap::metal_enqueue_copy`): append
-    /// the one-shot copy to this present's Submit B before commit. Mismatch
-    /// and metadata refusals are terminal and explicit, exactly the wgpu
-    /// arm's.
+    /// Metal enqueue (see `VideoTap::metal_enqueue_copy`): append the one-shot
+    /// copy to Submit B before commit. Mismatch and metadata refusals are
+    /// terminal and explicit.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_enqueue_copy(
         &mut self,
@@ -2125,7 +2021,7 @@ impl PresentedFrameTap {
         Ok(())
     }
 
-    /// W6b — attach the committed Submit B's probe (see
+    /// Attach the committed Submit B's probe (see
     /// `VideoTap::metal_note_submitted`).
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_note_submitted(&mut self, probe: crate::metal::encoder::CbProbe) {
@@ -2137,10 +2033,8 @@ impl PresentedFrameTap {
         }
     }
 
-    /// W6b — the STATUS-POLLED harvest: on a terminal `Completed` probe the
-    /// shared bytes convert exactly as a completed map's; any other
-    /// terminal outcome is the explicit error result. `block` is the
-    /// `finish` drain.
+    /// Metal harvest: a `Completed` probe converts the shared bytes; any other
+    /// terminal outcome is the error result. `block` is the `finish` drain.
     #[cfg(target_os = "macos")]
     fn metal_harvest(&mut self, block: bool) {
         let PresentedFrameState::InFlight { t_us } = self.state else {
@@ -2231,9 +2125,9 @@ impl PresentedFrameTap {
         decision.outcome
     }
 
-    /// Append this one-shot copy to the SAME encoder as the completed destination
-    /// render. A mismatch is terminal and explicit; it never silently returns a
-    /// differently-sized or differently-encoded frame.
+    /// Append this one-shot copy to the encoder that rendered the destination.
+    /// A mismatch is terminal and explicit; it never returns a different size
+    /// or encoding.
     #[cfg(wgpu_arm)]
     pub(crate) fn enqueue_copy(
         &mut self,
@@ -2272,7 +2166,7 @@ impl PresentedFrameTap {
                 return;
             }
         };
-        // W6b cross-arm guard: see VideoTap::enqueue_copy.
+        // Cross-arm guard: see VideoTap::enqueue_copy.
         #[cfg(target_os = "macos")]
         if matches!(self.buffer, SlotBuf::Metal { .. }) {
             self.result = Some(Err(
@@ -2331,7 +2225,7 @@ impl PresentedFrameTap {
                                 let _ = tx.send(result.is_ok());
                             });
                     }
-                    // W6b — the probe (attached at commit) is the map; the
+                    // The probe (attached at commit) is the map; the
                     // harvest below polls it.
                     #[cfg(target_os = "macos")]
                     SlotBuf::Metal { .. } => {}
@@ -2348,14 +2242,14 @@ impl PresentedFrameTap {
         self.result_status()
     }
 
-    /// Whether this one-shot stages through the ARMED (Metal) arm.
+    /// Whether this one-shot stages through the armed (Metal) arm.
     #[cfg(target_os = "macos")]
     pub(crate) fn tap_is_metal(&self) -> bool {
         !self.buffer.is_wgpu()
     }
 
-    /// THE FLIP — [`Self::after_present`] with no wgpu device to poll: the
-    /// armed one-shot's post-present hook (the probe is the map).
+    /// [`Self::after_present`] with no wgpu device to poll: the armed
+    /// one-shot's post-present hook (the probe is the map).
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_after_present(&mut self, t_us: u64) -> Result<(), String> {
         match self.state {
@@ -2375,7 +2269,7 @@ impl PresentedFrameTap {
         self.result_status()
     }
 
-    /// THE FLIP — [`Self::finish`] with no wgpu device: blocking probe drain.
+    /// [`Self::finish`] with no wgpu device: blocking probe drain.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_finish(&mut self) -> Result<(), String> {
         match self.state {
@@ -2468,7 +2362,7 @@ impl PresentedFrameTap {
                 );
             }
             PresentedFrameState::InFlight { .. } => {
-                // W6b — a Metal capture drains by probe, not by device poll.
+                // A Metal capture drains by probe, not by device poll.
                 #[cfg(target_os = "macos")]
                 if matches!(self.buffer, SlotBuf::Metal { .. }) {
                     self.metal_harvest(true);
@@ -2545,32 +2439,13 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f)
 }
 
-/// Linear → sRGB encode (standard piecewise), for the f16 scRGB capture path.
-fn linear_to_srgb(l: f32) -> f32 {
-    if l <= 0.003_130_8 {
-        12.92 * l
-    } else {
-        1.055 * l.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-fn srgb_to_linear(s: f32) -> f32 {
-    if s <= 0.040_45 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    }
-}
-
 fn srgb8_from_linear(linear: f32) -> u32 {
     (linear_to_srgb(linear.clamp(0.0, 1.0)) * 255.0 + 0.5) as u32
 }
 
-/// Convert the legacy Display-P3 interpretation of 8-bit swapchain coordinates
-/// into unprofiled sRGB output. Display-P3 and sRGB share a transfer curve, so
-/// this decodes that curve, applies the D65 linear-primary matrix, clips the
-/// out-of-sRGB gamut, then re-encodes. The matrix is the CSS Color 4
-/// Display-P3→linear-sRGB transform.
+/// Convert 8-bit Display-P3 coordinates to sRGB: decode the shared transfer
+/// curve, apply the CSS Color 4 Display-P3-to-linear-sRGB matrix, clip to the
+/// sRGB gamut, re-encode.
 fn display_p3_to_srgb8(p3: [u8; 3]) -> [u8; 3] {
     let [r, g, b] = p3.map(|channel| srgb_to_linear(f32::from(channel) / 255.0));
     let srgb_linear = [
@@ -2581,17 +2456,13 @@ fn display_p3_to_srgb8(p3: [u8; 3]) -> [u8; 3] {
     srgb_linear.map(|channel| srgb8_from_linear(channel) as u8)
 }
 
-/// Portable scRGB/EDR → SDR-linear capture transform.
+/// scRGB/EDR to SDR-linear capture transform.
 ///
-/// First remove Windows' *presentation-only* SDR-white multiplier so ordinary
-/// grid colours regain their original linear-sRGB values. If a resulting pixel
-/// exceeds SDR white, max-RGB compression divides all three channels by the
-/// peak. This is a deliberately small, bounded local tone map: it leaves every
-/// in-range SDR pixel byte-stable, maps the brightest highlight channel to
-/// `1.0`, and preserves highlight RGB ratios instead of independently clipping
-/// channels (which would turn coloured EDR crowns white/yellow). EDR luminance
-/// magnitude above white cannot be represented in an 8-bit SDR artifact; this
-/// transform preserves its chromatic structure without pretending otherwise.
+/// Remove Windows' presentation-only SDR-white multiplier, then, where a pixel
+/// exceeds SDR white, divide all channels by the peak (max-RGB compression).
+/// In-range pixels stay byte-stable and highlight hue is preserved instead of
+/// clipping each channel. Luminance above white cannot be represented in 8-bit
+/// SDR.
 fn tone_map_scrgb_to_sdr(scrgb: [f32; 3], sdr_white_scale: f32) -> [f32; 3] {
     let mut linear = scrgb.map(|channel| {
         let bounded = if channel.is_nan() || channel <= 0.0 {
@@ -2614,9 +2485,8 @@ fn tone_map_scrgb_to_sdr(scrgb: [f32; 3], sdr_white_scale: f32) -> [f32; 3] {
 mod tests {
     use super::*;
 
-    /// Device-free tap for the PURE store/gate laws (`push_frame`,
-    /// `should_capture` touch no slot/GPU state). `budget_bytes` is taken
-    /// verbatim — no 16 MiB floor — so a tiny test budget actually evicts.
+    /// Device-free tap for the store and gate laws. `budget_bytes` is taken as
+    /// given (no 16 MiB floor), so a tiny budget evicts.
     fn test_tap(budget_bytes: usize, fps_cap: Option<u32>) -> VideoTap {
         #[cfg(wgpu_arm)]
         let (done_tx, done_rx) = mpsc::channel();
@@ -2714,9 +2584,8 @@ mod tests {
         );
     }
 
-    /// PHASE-1 LAW: overflowing the byte budget counts EVICTED (head
-    /// truncation), never DROPPED (mid-stream loss) — the split the honest
-    /// `head_truncated` report is built on. Drop-oldest keeps the TAIL.
+    /// Overflowing the byte budget counts `evicted`, not `dropped`, and keeps
+    /// the tail.
     #[test]
     fn budget_eviction_counts_evicted_not_dropped() {
         // Budget holds exactly 3 of the 16-byte frames; push 5.
@@ -2764,12 +2633,10 @@ mod tests {
         assert_eq!(tail.store_bytes, 2 * 16);
     }
 
-    /// The OFF-THREAD conversion lane (the harvest no longer tonemaps on the
-    /// present thread) is a pure relocation: for both the SDR swizzle and the
-    /// EDR f16 scRGB→SDR tonemap path the worker's output is BYTE-IDENTICAL
-    /// to the inline [`mapped_to_rgba8`] fallback, frame stamps ride through
-    /// untouched, and dropping the job sender drains + exits the worker (the
-    /// `finish`/tap-drop lifecycle).
+    /// The off-thread conversion is byte-identical to inline
+    /// [`mapped_to_rgba8`] for the SDR swizzle and the f16 tone-map path, frame
+    /// stamps pass through, and dropping the job sender drains and exits the
+    /// worker.
     #[test]
     fn convert_worker_matches_inline_conversion_and_drains_on_drop() {
         let stride = 256; // COPY_BYTES_PER_ROW_ALIGNMENT padding
@@ -2852,10 +2719,9 @@ mod tests {
         }
     }
 
-    /// PHASE-2 LAW: `should_capture` with fps=10 (interval 100ms) accepts a
-    /// frame iff >= 100ms passed since the last ACCEPTED frame (accept-to-
-    /// accept spacing; the first frame always accepted; a rejected frame
-    /// accrues no catch-up debt). Rejections count `decimated` only.
+    /// `should_capture` at fps=10 accepts a frame iff 100 ms passed since the
+    /// last accepted one (first always accepted, no catch-up debt); rejections
+    /// count `decimated` only.
     #[test]
     fn should_capture_fps10_spacing() {
         let mut tap = test_tap(usize::MAX, Some(10));

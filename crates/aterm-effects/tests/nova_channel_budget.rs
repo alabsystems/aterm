@@ -1,34 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// THE SHARED `nova_add` CHANNEL HAS TWO PRODUCERS AND ONE BUDGET.
+// The shared `nova_add` channel has two producers and one budget.
 //
-// `nova::MAX_NOVA_QUADS` (1536) is spent by exactly one of them. The
-// decoration pass funds every classic nova and every supernova through
-// `MAX_NOVA_QUADS.saturating_sub(nova.len())` (word_decorations.rs, in
-// `emit_nova_axis` and `emit_super_axis`), so the DECORATION share is
-// hard-capped at 1536 by construction and the §3.2 burst mutex is what keeps
-// that cap from ever BINDING — i.e. from truncating a live effect mid-emission.
+// `nova::MAX_NOVA_QUADS` (1536) funds only the decoration pass: every classic
+// nova and supernova is funded through `MAX_NOVA_QUADS.saturating_sub(nova.len())`
+// (`emit_nova_axis` / `emit_super_axis` in word_decorations.rs), so that share
+// is capped at 1536 and the burst mutex keeps the cap from ever truncating a
+// live effect.
 //
-// PRISM WAKE (`output_streak`) is the second producer. The composed host
-// appends its per-pane quads into the same channel AFTER the decoration pass
-// has finished spending (app_render.rs `compose_output_streak`, whose
-// `nova_scratch.extend_from_slice` runs after `compose_word_decorations`), so
-// those quads are neither funded by that budget nor visible to it. The channel
-// TOTAL is therefore `decoration share + Σ panes streak share`, and it can
-// exceed 1536.
+// The prism wake (`output_streak`) appends its per-pane quads after the
+// decoration pass has spent the channel (`EffectsPipeline::streak_pane` after
+// `EffectsPipeline::word_panes`), unfunded and uncounted. The channel total is
+// `decoration share + sum of pane streak shares` and can exceed 1536.
 //
-// This file measures all three facts and pins what the overrun actually does:
+// This file pins:
 //
-//   1. the streak's own share is TAIL-bounded, not column-bounded — one ribbon
-//      row of ≤ cols cells plus ≤ MAX_COMETS heads of ≤ TAIL_MAX + 2 cells;
-//   2. four panes of build output on a realistic grid push the combined
-//      channel past 1536 while the decoration share sits at its own
-//      genome-reachable worst case (3 × 392);
-//   3. the consequence is COST, NOT CORRUPTION: the consumer
-//      (`Renderer::draw_nova` → `draw_flat_add`) walks the whole slice, so
-//      every over-budget quad is drawn — nothing truncates, nothing panics —
-//      and a reused host scratch does not reallocate per frame.
+//   1. the streak's share is tail-bounded, not column-bounded: one ribbon row
+//      of <= cols cells plus <= MAX_COMETS heads of <= TAIL_MAX + 2 cells;
+//   2. four panes of build output push the channel past 1536 while the
+//      decoration share sits at its reachable worst case (3 x 392);
+//   3. the overrun costs draw work, not correctness: the consumer
+//      (`Renderer::draw_nova` -> `draw_flat_add`) draws every quad, nothing
+//      truncates or panics, and the reused host scratch does not reallocate
+//      per frame.
 
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::Geom;
@@ -38,9 +33,9 @@ use aterm_render::{GlowQuad, Renderer, Theme, premul_rgb};
 use aterm_time::Instant;
 use std::time::Duration;
 
-/// The decoration share's genome-reachable worst case: `MAX_ACTIVE_NOVAS` (3)
-/// live classic novas at the ay-CHC `Q ≤ 392` certificate — the exact product
-/// `nova.rs` derives its "never binds" headroom from (3 × 392 = 1176 < 1536).
+/// The decoration share's reachable worst case: `MAX_ACTIVE_NOVAS` (3) live
+/// classic novas at the ay-CHC `Q <= 392` certificate, the product `nova.rs`
+/// derives its headroom from (3 x 392 = 1176 < 1536).
 const DECO_WORST_CASE: usize = 3 * 392;
 
 fn geom(cw: usize, ch: usize, cols: usize, rows: usize) -> Geom {
@@ -57,9 +52,9 @@ fn geom(cw: usize, ch: usize, cols: usize, rows: usize) -> Geom {
     }
 }
 
-/// The most demanding SHIPPABLE config: the host clamps `tail` into
-/// `TAIL_MIN..=TAIL_MAX` and `max_streaks` into `1..=MAX_COMETS`, so this is
-/// the corner of the config space, not an impossible one.
+/// The most demanding shippable config: the host clamps `tail` into
+/// `TAIL_MIN..=TAIL_MAX` and `max_streaks` into `1..=MAX_COMETS`, so this is a
+/// reachable corner.
 fn cfg() -> StreakConfig {
     StreakConfig {
         enabled: true,
@@ -76,8 +71,8 @@ fn cfg() -> StreakConfig {
 }
 
 /// Drive one engine through `frames` of full-width build output (one fresh row
-/// per frame at 120 Hz — the `cargo build` firehose), appending into `out`, and
-/// return the largest per-frame quad count it produced.
+/// per frame at 120 Hz), appending into `out`, and return the largest
+/// per-frame quad count.
 fn drive(seed: u64, g: Geom, frames: u64, out: &mut Vec<GlowQuad>) -> usize {
     let mut e = OutputStreak::new(seed);
     let c = cfg();
@@ -94,12 +89,11 @@ fn drive(seed: u64, g: Geom, frames: u64, out: &mut Vec<GlowQuad>) -> usize {
     peak
 }
 
-/// THE STREAK'S SHARE IS TAIL-BOUNDED. A comet lights `tail + 2` cells around
-/// its head, NOT the whole row: `OutputStreak::emit` sweeps
-/// `tail_start.floor() - 1 ..= head.round()`, and `push_grid_quad` emits exactly
-/// one row-band quad per cell. So the per-engine worst case is one ribbon
-/// (≤ cols) plus `MAX_COMETS` heads (≤ TAIL_MAX + 2 each) — `cols + 64` at the
-/// config corner, not `cols × (MAX_COMETS + 1)`.
+/// The streak's share is tail-bounded. A comet lights `tail + 2` cells around
+/// its head, not the whole row (`OutputStreak::emit` sweeps
+/// `tail_start.floor() - 1 ..= head.round()`, one row-band quad per cell), so
+/// the per-engine worst case is one ribbon (<= cols) plus `MAX_COMETS` heads,
+/// `cols + 64` at the config corner rather than `cols * (MAX_COMETS + 1)`.
 #[test]
 fn the_streak_share_is_tail_bounded_not_column_bounded() {
     for cols in [80usize, 120, 200, 400] {
@@ -112,14 +106,14 @@ fn the_streak_share_is_tail_bounded_not_column_bounded() {
             peak <= structural,
             "cols={cols}: peak {peak} must sit under the ribbon+heads bound {structural}"
         );
-        // NON-VACUITY: the flood really did open its full-width ribbon, so the
-        // bound above is being tested against a saturated engine.
+        // Non-vacuity: the flood opened its full-width ribbon, so the bound is
+        // tested against a saturated engine.
         assert!(
             peak >= cols,
             "cols={cols}: peak {peak} — the flood ribbon never opened, the bound is vacuous"
         );
-        // And the column-scaled reading of the same worst case overstates it by
-        // roughly MAX_COMETS: a comet is a head, not a painted bar.
+        // The column-scaled reading overstates the worst case by roughly
+        // MAX_COMETS: a comet is a head, not a painted bar.
         assert!(
             peak * 2 < cols * (MAX_COMETS + 1),
             "cols={cols}: peak {peak} vs the column-scaled reading {}",
@@ -128,10 +122,10 @@ fn the_streak_share_is_tail_bounded_not_column_bounded() {
     }
 }
 
-/// FOUR PANES OVERRUN THE BACKSTOP. Nothing sums the per-pane engines: each
-/// appends its own frame into the one window channel (`compose_output_streak`).
-/// With the decoration share at its own genome-reachable worst case, a four-way
-/// split of build output puts the channel past 1536.
+/// Four panes overrun the backstop: each pane's engine appends into the one
+/// window channel (`compose_output_streak`) and nothing sums them, so with the
+/// decoration share at its worst case a four-way split of build output passes
+/// 1536.
 #[test]
 fn four_panes_of_build_output_push_the_channel_past_the_backstop() {
     let (rows, cols) = (50usize, 200usize);
@@ -164,15 +158,14 @@ fn four_panes_of_build_output_push_the_channel_past_the_backstop() {
     );
 }
 
-/// WHAT THE OVERRUN DOES: nothing. The consumer is `Renderer::draw_nova` →
-/// `draw_flat_add`, a plain walk of the slice with a per-quad row gate and a
-/// per-quad clip (`Renderer::draw_flat_add`, aterm-render/src/lib.rs). There is
-/// no fixed buffer, no `MAX_NOVA_QUADS` clamp and no assert on the draw side, so
-/// an over-budget channel is DRAWN IN FULL: the quads past 1536 reach the glass.
+/// An overrun channel is drawn in full. `Renderer::draw_nova` ->
+/// `draw_flat_add` walks the slice with a per-quad row gate and clip; there is
+/// no fixed buffer, clamp or assert on the draw side, so quads past 1536 reach
+/// the glass.
 ///
-/// Pinned as a DIFFERENCE, which is the only way to tell "drawn" from "silently
-/// dropped" apart: the same frame rendered with the channel truncated at the
-/// backstop must not match the frame rendered with all of it.
+/// Pinned as a difference, the only way to tell "drawn" from "silently
+/// dropped": the frame with the channel truncated at the backstop must differ
+/// from the frame with all of it.
 #[test]
 fn the_over_budget_channel_is_drawn_in_full_not_truncated() {
     let Some(mut rend) = Renderer::from_system(18.0, Theme::default()) else {
@@ -186,8 +179,8 @@ fn the_over_budget_channel_is_drawn_in_full_not_truncated() {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25lcompiling aterm-effects v0.69.0");
 
-    // The decoration share, stacked on ONE cell so it cannot saturate the cells
-    // the streak lights: only the streak's own quads decide the difference.
+    // The decoration share, stacked on one cell so it cannot saturate the
+    // cells the streak lights: only the streak's quads decide the difference.
     let mut channel: Vec<GlowQuad> = (0..MAX_NOVA_QUADS)
         .map(|_| GlowQuad {
             row: 0,
@@ -231,8 +224,8 @@ fn the_over_budget_channel_is_drawn_in_full_not_truncated() {
         "the quads past MAX_NOVA_QUADS painted nothing — the draw side truncates after all"
     );
 
-    // …and the over-budget draw is deterministic, not reading past anything:
-    // the same channel renders byte-identically twice.
+    // The over-budget draw is deterministic: the same channel renders
+    // byte-identically twice.
     let mut again = term.cell_frame(rows, cols);
     again.nova_add.clone_from(&channel);
     assert_eq!(
@@ -242,11 +235,10 @@ fn the_over_budget_channel_is_drawn_in_full_not_truncated() {
     );
 }
 
-/// THE OTHER THING AN OVERRUN COULD HAVE COST: a per-frame allocation in the
-/// hot path. It does not. The host's channel is a RESIDENT scratch that is
-/// cleared, never freed (`ws.nova_scratch.clear()` then `extend_from_slice`,
-/// and `input_scratch.nova_add.clone_from`, which reuses capacity), so the
-/// growth past 1536 is paid ONCE and the steady state allocates nothing.
+/// An overrun does not cost a per-frame allocation: the host's channel is a
+/// resident scratch that is cleared, never freed (`ws.nova_scratch.clear()`
+/// then `extend_from_slice`, and `input_scratch.nova_add.clone_from`), so
+/// growth past 1536 is paid once and the steady state allocates nothing.
 #[test]
 fn the_resident_scratch_grows_once_not_every_frame() {
     let (rows, cols) = (50usize, 200usize);

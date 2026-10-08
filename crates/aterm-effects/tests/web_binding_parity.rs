@@ -3,38 +3,26 @@
 //
 //! Drift guard for the duplicated web-binding modules.
 //!
-//! `aterm-wasm` (CPU/self-contained bundle) and `aterm-gpu-web` (WebGPU parity)
-//! each carry a copy of SIX `#[wasm_bindgen]` surface modules — `effects_api`,
-//! `messages_api`, `notifications_api`, `predict_api`, `scroll_input_api`,
-//! `scrollback_tiers_api`. They deliberately are NOT single-sourced (a macro
-//! over `#[wasm_bindgen] impl` blocks degrades error locality and IDE
-//! navigation), so the ONLY thing keeping the copies honest is this test.
+//! `aterm-wasm` (CPU bundle) and `aterm-gpu-web` (WebGPU) each carry a copy of
+//! the same `#[wasm_bindgen]` surface modules (`effects_api`, `messages_api`,
+//! `notifications_api`, `predict_api`, `scroll_input_api`,
+//! `scrollback_tiers_api`). They are not single-sourced (a macro over
+//! `#[wasm_bindgen] impl` blocks hurts error locality and IDE navigation), so
+//! this test keeps the copies in line.
 //!
-//! COVERAGE IS DERIVED, NOT DECLARED. The subject set is the filename
-//! intersection of the two crates' `src/`, so a module duplicated into both is
-//! guarded the instant it lands. The predecessor of this file hand-listed its
-//! two subjects and named a third that never existed (`scene_surface_parity`
-//! had an EMPTY body — a green test asserting nothing); three modules were
-//! added after it and all three arrived unguarded. Filename identity is a
-//! heuristic, not a law, so [`NOT_DUPLICATED`] carves out the one counterexample
-//! (`lib.rs` is each crate's own entry point, 4415 vs 3414 lines). That list is
-//! hand-maintained — but it fails LOUD (a new shared name defaults to covered),
-//! which is the property the old ceiling lacked.
+//! Coverage is derived: the subject set is the filename intersection of the two
+//! crates' `src/`, so a module duplicated into both is guarded as soon as it
+//! lands. [`NOT_DUPLICATED`] excludes the one same-named file that is not a copy
+//! (`lib.rs`); any new shared name defaults to covered.
 //!
-//! SCOPE: the production binding surface — the JS-visible face, where drift is
-//! catastrophic. Everything from `mod tests` down is out of contract, because
-//! gpu-web's `render()` is wasm-only and it has no `rgba()`, so its natively
-//! testable surface genuinely differs. That carve-out is NOT a clean bill of
-//! health: gpu-web's `scrollback_tiers_api` copy is missing five `#[test]`s the
-//! wasm copy has, most of which look mirrorable (budget/limit tests over a
-//! production surface this guard proves matches line for line). That is real
-//! coverage loss, tracked separately.
+//! Scope: the production binding surface (the JS-visible face). Everything from
+//! `mod tests` down is out of contract, because gpu-web's `render()` is
+//! wasm-only and it has no `rgba()`, so its natively testable surface differs.
 //!
-//! Legitimate divergence is exactly THREE things, all normalized below: (1) the
+//! Legitimate divergence is exactly three things, all normalized below: (1) the
 //! host terminal type ident (`AtermTerminal` vs `AtermGpuTerminal`), (2) the
-//! per-crate doc/comment wording, and (3) whatever [`FOLDED`] declares, entry by
-//! entry, each with a written reason.
-//! Anything else that differs is unintended drift and MUST fail.
+//! per-crate doc/comment wording, and (3) each [`FOLDED`] entry, with its reason.
+//! Anything else that differs is drift and fails.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -43,30 +31,20 @@ use std::path::{Path, PathBuf};
 const WASM_CRATE: &str = "aterm-wasm";
 const GPU_WEB_CRATE: &str = "aterm-gpu-web";
 
-/// Same-named files in both crates that are NOT mirrored copies. Filename
-/// identity implies duplication for every file here EXCEPT these.
+/// Same-named files in both crates that are not mirrored copies.
 ///
-/// `lib.rs` is each crate's own entry point, not a shared binding surface: it
-/// wires a CPU raster pipeline in one crate and a WebGPU one in the other, and
-/// the two are ~4400 vs ~3400 lines. Guarding them against each other would be
-/// asserting a falsehood, so the exclusion is the honest call — but note it is a
-/// CEILING, the only hand-typed one here, and every other shared name defaults
-/// to covered. It is NO LONGER a total blind spot: `lib.rs` stays line-excluded,
-/// but its JS binding SURFACE is guarded by
-/// [`wasm_lib_facade_surface_is_mirrored_by_gpu_web`] (audit-2 item 14 — the gap
-/// that let five wasm-only facade methods go unmirrored). Only line-level parity
-/// is waived here, not surface parity.
+/// `lib.rs` is each crate's own entry point (a CPU raster pipeline in one, a
+/// WebGPU one in the other), so it is not compared line for line; its JS
+/// binding surface is still guarded by
+/// [`wasm_lib_facade_surface_is_mirrored_by_gpu_web`].
 const NOT_DUPLICATED: &[&str] = &["lib.rs"];
 
-/// A FLOOR on the derived set, never a ceiling: discovery may only add. Without
-/// it, deleting `aterm-gpu-web/src/predict_api.rs` would silently shrink
-/// coverage back toward the original bug instead of failing. Removing an entry
-/// is therefore a deliberate, reviewable act.
+/// A floor on the derived set: discovery may only add, so deleting one copy
+/// (e.g. `aterm-gpu-web/src/predict_api.rs`) fails instead of silently shrinking
+/// coverage.
 const KNOWN_DUPLICATED: &[&str] = &[
     "effects_api.rs",
-    // The message band (design ruling 340 of
-    // docs/DESIGN-unified-messages-2026-09-21.md): the GPU module's copy
-    // retired its CPU_ONLY_MODULES entry, 2026-09-28.
+    // The message band (docs/DESIGN-unified-messages-2026-09-21.md).
     "messages_api.rs",
     "notifications_api.rs",
     "predict_api.rs",
@@ -74,12 +52,11 @@ const KNOWN_DUPLICATED: &[&str] = &[
     "scrollback_tiers_api.rs",
 ];
 
-/// `*_api.rs` binding modules that exist in `aterm-wasm` ONLY, each with the
-/// reason the GPU module has no copy — so the asymmetry is STATED, not an
-/// accident nobody saw. A FLOOR in both directions
-/// ([`every_cpu_only_web_binding_module_is_declared`]): a new CPU-only `*_api.rs`
-/// must be listed here (or mirrored), and an entry that gains a gpu-web copy —
-/// which the filename intersection then guards line for line — must leave.
+/// `*_api.rs` binding modules that exist only in `aterm-wasm`, each with the
+/// reason the GPU module has no copy. Enforced both ways by
+/// [`every_cpu_only_web_binding_module_is_declared`]: a new CPU-only `*_api.rs`
+/// must be listed here (or mirrored), and an entry that gains a gpu-web copy
+/// must leave.
 const CPU_ONLY_MODULES: &[(&str, &str)] = &[(
     "dirty_band_present_api.rs",
     "the RGBA band-scoped present (audit E3) expands the CPU rasterizer's \
@@ -90,18 +67,15 @@ const CPU_ONLY_MODULES: &[(&str, &str)] = &[(
 /// One declared exception to parity: a source line that may appear in one copy
 /// and not the other, plus the reason that is legitimate rather than drift.
 struct Folded {
-    /// The EXACT trimmed source line. Never a prefix, never a pattern. A regex
-    /// over `#[cfg_attr(...)]` — or any general "strip attributes" rule — would
-    /// make this guard blind to `#[wasm_bindgen(getter)]` drift, which silently
-    /// changes the JS surface. Exactness is the whole safety property.
+    /// The exact trimmed source line, never a prefix or pattern: a general
+    /// "strip attributes" rule would hide `#[wasm_bindgen(getter)]` drift,
+    /// which changes the JS surface.
     line: &'static str,
-    /// Why the divergence is structural rather than a missed mirror-edit —
-    /// read by every reviewer who asks "can I add one?".
+    /// Why the divergence is structural rather than a missed mirror-edit.
     why: &'static str,
 }
 
-/// The declared exceptions (fold #3), in the shape `xtask`'s `WITNESS_REGISTRY`
-/// and census OB-3 use: every allowlist entry carries a written justification,
+/// The declared exceptions (fold #3). Each carries a written justification,
 /// printed by the fold test beside the line it excuses.
 const FOLDED: &[Folded] = &[Folded {
     line: r#"#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]"#,
@@ -137,10 +111,8 @@ fn rs_file_names(dir: &Path) -> BTreeSet<String> {
 
 /// The duplicated-module set as a fact of the filesystem.
 ///
-/// Both staleness assertions live HERE, not in one test, because every caller is
-/// a `for module in duplicated_modules()` loop: a derivation that silently
-/// yields nothing turns each of them into a vacuous pass, which is the precise
-/// failure mode (a green test asserting nothing) this file was rewritten to end.
+/// Both staleness assertions live here because every caller loops over this
+/// set: a derivation that yields nothing would make each of them pass vacuously.
 fn duplicated_modules() -> BTreeSet<String> {
     let wasm = src_dir(WASM_CRATE);
     let gpu = src_dir(GPU_WEB_CRATE);
@@ -168,11 +140,11 @@ fn read_module(crate_name: &str, module: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Everything above the test module — the production binding surface.
+/// Everything above the test module: the production binding surface.
 ///
-/// Splits on `mod tests`, NOT on `#[cfg(test)]`: the real gate is
-/// `#[cfg(all(test, not(target_arch = "wasm32")))]`, so a `#[cfg(test)]` matcher
-/// silently fails to split and compares whole files while looking correct.
+/// Splits on `mod tests`, not `#[cfg(test)]`: the real gate is
+/// `#[cfg(all(test, not(target_arch = "wasm32")))]`, which a `#[cfg(test)]`
+/// matcher would miss and compare whole files.
 fn production_slice(label: &str, src: &str) -> Vec<String> {
     let starts: Vec<usize> = src
         .lines()
@@ -314,9 +286,8 @@ fn production_binding_surface_is_identical() {
     }
 }
 
-/// Mutual omission is still drift from the shared engine contract. Keep the
-/// host-facing PHOSPHOR surface explicit so both bindings cannot "agree" by
-/// silently dropping matrix rain again.
+/// Mutual omission is still drift from the shared engine contract: both
+/// bindings must export the PHOSPHOR (matrix rain) surface.
 #[test]
 fn effects_api_requires_matrix_rain_surface() {
     let wasm = read_module(WASM_CRATE, "effects_api.rs");
@@ -336,11 +307,9 @@ fn effects_api_requires_matrix_rain_surface() {
     }
 }
 
-/// PRISM WAKE's twin of the rain symbol floor, and it exists for exactly the
-/// same reason: line parity proves the two copies AGREE, never that they agree
-/// on something. A symmetric deletion — dropping the streak from both bindings
-/// in one commit — reads as perfectly parallel and would sail through every
-/// other test in this file.
+/// The PRISM WAKE output-streak symbol floor: line parity proves the copies
+/// agree, not that they still carry the streak, so a symmetric deletion from
+/// both bindings fails here.
 #[test]
 fn effects_api_requires_output_streak_surface() {
     let wasm = read_module(WASM_CRATE, "effects_api.rs");
@@ -356,9 +325,8 @@ fn effects_api_requires_output_streak_surface() {
     }
 }
 
-/// The message band's symbol floor, for the same reason as the two above:
-/// line parity proves the copies agree, never that they agree on the band.
-/// A symmetric deletion of an export from both would read as parallel.
+/// The message band's symbol floor: a symmetric deletion of an export from
+/// both bindings fails here.
 #[test]
 fn messages_api_requires_band_surface() {
     let wasm = read_module(WASM_CRATE, "messages_api.rs");
@@ -376,6 +344,8 @@ fn messages_api_requires_band_surface() {
         "pub fn set_forced_colors(",
         "pub fn band_hover(",
         "pub fn band_press(",
+        "pub fn band_press_acts(",
+        "pub fn set_frame_period_ms(",
         "pub fn messages_log_since(",
         "pub fn messages_quit(",
         "pub fn messages_restore(",
@@ -389,7 +359,7 @@ fn messages_api_requires_band_surface() {
 }
 
 // Guard the normalizer and the splitter themselves: a real code difference must
-// NOT be masked by any fold (otherwise a green parity test is vacuous).
+// not be masked by any fold.
 #[test]
 fn normalizer_does_not_mask_code_drift() {
     let a = "let x = self.effects.advance(now);";
@@ -400,8 +370,8 @@ fn normalizer_does_not_mask_code_drift() {
         "normalizer must not hide code drift"
     );
 
-    // ...but it MUST fold the two unconditional divergences — host type ident
-    // and per-crate comment wording — to nothing.
+    // ...but it must fold the two unconditional divergences (host type ident
+    // and per-crate comment wording) to nothing.
     let wasm_ish = "/// CPU bundle.\nimpl AtermTerminal { fn f(&self) {} }";
     let gpu_ish = "/// WebGPU parity.\nimpl AtermGpuTerminal { fn f(&self) {} }";
     assert_eq!(
@@ -421,11 +391,9 @@ fn normalizer_does_not_mask_code_drift() {
         );
     }
 
-    // ...and NOTHING ELSE may. These are the non-vacuity ratchet: an undeclared
-    // attribute difference has to fail, or the guard is decoration. The first is
-    // an unrelated attribute; the second is a near-miss of the declared line,
-    // which is what proves FOLDED is an exact-literal list and not a pattern
-    // over `#[cfg_attr(...)]` — a pattern would wave through a real gate change.
+    // ...and nothing else may. An unrelated attribute difference must fail,
+    // and so must a near-miss of the declared line, which proves FOLDED is an
+    // exact-literal list and not a pattern over `#[cfg_attr(...)]`.
     for undeclared in [
         "#[inline]",
         "#[wasm_bindgen(getter)]",
@@ -446,12 +414,9 @@ fn normalizer_does_not_mask_code_drift() {
 }
 
 // ---------------------------------------------------------------------------
-// lib.rs binding-SURFACE floor (audit-2 item 14). `lib.rs` stays in
-// NOT_DUPLICATED (two different pipelines, WebGPU vs CPU raster, cannot be
-// compared line-for-line) — but that made its JS binding surface a blind spot:
-// `process_str`, `last_command_output`, `row_range_json`, `search_summary` and
-// `search_index_release` were added to aterm-wasm and never mirrored into
-// aterm-gpu-web, uncaught. This restores a floor at the SURFACE level.
+// lib.rs binding-surface floor. `lib.rs` is in NOT_DUPLICATED (WebGPU vs CPU
+// raster pipelines cannot be compared line for line), so its JS binding
+// surface is checked here instead.
 // ---------------------------------------------------------------------------
 
 /// Does the contiguous `#[…]` attribute run immediately above `impl_idx` carry
@@ -473,11 +438,9 @@ fn preceding_attrs_export_to_wasm(lines: &[&str], impl_idx: usize) -> bool {
 }
 
 /// The JS-visible method surface of a crate's `Aterm(Gpu)Terminal` facade:
-/// every `pub fn` inside a wasm-bindgen-attributed `impl` of that facade type.
-/// Non-`wasm_bindgen` impls (native test helpers, private-method impls) are
-/// skipped, so an internal `pub fn` never enters the surface. Block extent is
-/// the rustfmt column-0 `}` closer — never brace depth, which the JSON string
-/// literals in the method bodies would corrupt.
+/// every `pub fn` inside a wasm-bindgen-attributed `impl` of that type. Other
+/// impls are skipped. Block extent is the rustfmt column-0 `}` closer, not
+/// brace depth, which JSON string literals in method bodies would corrupt.
 fn wasm_facade_surface(src: &str) -> BTreeSet<String> {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = BTreeSet::new();
@@ -508,10 +471,9 @@ fn wasm_facade_surface(src: &str) -> BTreeSet<String> {
     out
 }
 
-/// wasm-facade exports LEGITIMATELY absent from the gpu-web facade — each a
-/// CPU-raster export with no WebGPU counterpart. Shaped like the `#[test]`
-/// floors: a reason plus a still-resolves check below, so a carve-out cannot
-/// outlive its cause.
+/// wasm-facade exports legitimately absent from the gpu-web facade (CPU-raster
+/// exports with no WebGPU counterpart), each with a reason and a
+/// still-wasm-only check below.
 const CPU_ONLY_FACADE_FNS: &[(&str, &str)] = &[(
     "rgba_ptr",
     "Byte offset of the CPU rasterizer's persistent `self.rgba` framebuffer in \
@@ -522,16 +484,15 @@ const CPU_ONLY_FACADE_FNS: &[(&str, &str)] = &[(
 )];
 
 /// Every method aterm-wasm exports on its `#[wasm_bindgen]` facade must also be
-/// exported by aterm-gpu-web's, save the reasoned CPU-only carve-outs.
-/// Deliberately ONE-directional — gpu-web adds GPU-only exports
-/// (`render_offscreen`/`adapter_info`/`gpu_ready`) wasm has no counterpart for,
-/// and those are not drift.
+/// exported by aterm-gpu-web's, except the CPU-only carve-outs. One-directional:
+/// gpu-web's GPU-only exports (`render_offscreen`/`adapter_info`/`gpu_ready`)
+/// are not drift.
 #[test]
 fn wasm_lib_facade_surface_is_mirrored_by_gpu_web() {
     let wasm = wasm_facade_surface(&read_module(WASM_CRATE, "lib.rs"));
     let gpu = wasm_facade_surface(&read_module(GPU_WEB_CRATE, "lib.rs"));
 
-    // Non-vacuity: a scanner that yields nothing must FAIL, not pass silently.
+    // Non-vacuity: a scanner that yields nothing must fail.
     assert!(
         wasm.len() > 50 && gpu.len() > 50,
         "facade-surface enumeration looks broken (wasm={}, gpu-web={}); the impl-opener \
@@ -552,8 +513,8 @@ fn wasm_lib_facade_surface_is_mirrored_by_gpu_web() {
          CPU-only export with no WebGPU counterpart — add it to CPU_ONLY_FACADE_FNS with a reason."
     );
 
-    // A carve-out that is no longer a divergence is a hole: require each to
-    // STILL be wasm-only.
+    // A carve-out that is no longer a divergence is a hole: each must still
+    // be wasm-only.
     for (name, _why) in CPU_ONLY_FACADE_FNS {
         assert!(
             wasm.contains(*name),

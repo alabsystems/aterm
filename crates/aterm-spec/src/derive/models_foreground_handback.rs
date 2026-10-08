@@ -34,8 +34,11 @@
 //! moment it exits, exactly like a SIGKILLed program, and nothing tells the two
 //! apart. Handing its mode back reverted the cursor and dropped the wrapped
 //! command onto the main screen. The incident's harm is the INPUT-hijacking
-//! modes (mouse, kitty, modifyOtherKeys, 1004, 2048, 2031), so only a gone
-//! program that armed one of those is handed back (`Display`).
+//! modes (mouse, kitty, modifyOtherKeys, 1004, 2004, 2048, 2031), so only a
+//! gone program that armed one of those is handed back (`Display`). 2004 joined
+//! them on 2026-10-07, PG1 (docs/AUDIT-side-effects-2026-10-07.md): a `cat`
+//! that armed it under a reader that does not parse the brackets left the
+//! host's multi-line paste guard off.
 
 use super::Model;
 
@@ -63,9 +66,13 @@ use super::Model;
 ///   open batch BEFORE the cut (at or before the last sample equal to `run`);
 ///   `bj2`/`bs2` — after the last sample. `edge` — the open batch carries a cut.
 /// * `full`, `dj1`, `dj2`, `ds1`, `ds2`, `dedge` — the delivered batch.
-/// * `leak` — program-owned modes in force (the evidence gate is open);
-///   `paste` — bracketed paste in force; `prompt` — the shell's post-reclaim
-///   output has been parsed.
+/// * `leak` — program-owned modes other than 2004 in force; `paste` —
+///   bracketed paste in force; `prompt` — the shell's post-reclaim output has
+///   been parsed. `leak` and `paste` each open the evidence gate — `paste`
+///   since PG1 (docs/AUDIT-side-effects-2026-10-07.md) — so `leak == 0` does
+///   not mean the gate is closed. The model keeps 2004 apart because zle arms
+///   it at every prompt as the live shell's own, and the model's job arms 2004
+///   only alongside an input mode (`hij`), so the job's handback reads `leak`.
 /// * `swept` — the UI thread's status sweep has observed the reclaimed shell.
 /// * `hij` — 1 when the job's modes include an INPUT-hijacking one (the
 ///   incident, `Launch`; its writes arm bracketed paste too), 0 when they are
@@ -258,7 +265,7 @@ pub fn foreground_handback_model() -> Model {
 /// several jobs under one shell, when the reader can MISS a job.
 ///
 /// 2026-09-27, the handback lane at load 59-65: a starved gather read a
-/// one-shot `/usr/bin/printf '\e[?1000h'` only after zsh had taken the
+/// one-shot `/usr/bin/printf '\033[?1000h'` only after zsh had taken the
 /// terminal back (residuals R1/R3 of [`foreground_handback_model`]), so its
 /// bytes were parsed as the SHELL's and the mouse bit's owner became the
 /// shell. Losing that one handback is the documented residual. What was not:

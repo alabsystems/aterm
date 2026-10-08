@@ -1,34 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The LEDGER KEY (round 19, design §3 / SPEC19 item 6): with a session
-//! focused, one keystroke — **⇧⌘L** on macOS (`cmd+shift+l`; `ctrl+shift+l`
-//! off macOS; the `open_ledger` action in `[keybindings]`) — runs
-//! `aterm drive ledger @<sid> --format html --out <file>` for that session and
-//! opens the file. No existing binding used `L` with Cmd-Shift (the chord
-//! table in `keybinding.rs` is the roster), and `l` is what the mocks' fleet
-//! screen binds to the same ledger.
+//! The ledger key: with a session focused, ⇧⌘L (`cmd+shift+l`; `ctrl+shift+l` off
+//! macOS; the `open_ledger` action in `[keybindings]`) runs
+//! `aterm drive ledger @<sid> --format html --out <file>` and opens the file.
 //!
-//! The ledger is the watcher's timeline as `aterm drive ledger` renders it:
-//! the human's turns, the size of each reply, the watcher's journal lines and
-//! this session's mail with the worker — the long form of the presence band's
-//! `◇ quiet` summary. It is a CHILD PROCESS on purpose: the ledger gathers
-//! through the control socket like any driver would (`history`, `timeline`,
-//! `inbox --peek`), and doing that in-process on the main thread would park the
-//! event loop on its own socket. The child is pointed at THIS instance by
-//! `drive --socket <this instance's socket>` ([`with_socket`]), so a nested or
-//! hand-launched instance reads its own sessions and never another's; the reply
-//! file is created `0600` by the CLI
-//! (a ledger carries what the manager typed and what the worker said).
+//! The ledger is the watcher's timeline: the human's turns, reply sizes, the
+//! watcher's journal lines and the session's mail with the worker (the long form of
+//! the presence band's `◇ quiet` summary). It runs as a child process because it
+//! gathers over the control socket (`history`, `timeline`, `inbox --peek`), which
+//! in-process on the main thread would block the event loop on its own socket. The
+//! child gets `drive --socket <this instance's socket>` ([`with_socket`]) so it reads
+//! this instance's sessions; the CLI creates the file `0600`.
 //!
-//! A headless instance (no OS window) composes the plan and launches nothing:
-//! there is no human to open a browser for, and the tests read the plan.
+//! A headless instance composes the plan and launches nothing.
 
 use std::path::{Path, PathBuf};
 
-/// The command a ledger keystroke composes: what `aterm` is asked, and where
-/// the file goes. Kept on the `App` (`last_ledger_plan`) so `chrome`-side
-/// tests and a future menu row can read what the key did.
+/// The command a ledger keystroke composes and where the file goes; kept on the
+/// `App` (`last_ledger_plan`) so tests can read what the key did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LedgerPlan {
     /// The focused session's stable id (`s-…`), as `@<sid>` names it.
@@ -53,9 +43,8 @@ pub(crate) fn ledger_argv(sid: &str, out: &Path) -> Vec<String> {
     ]
 }
 
-/// Where the ledger of `sid` is written: the temp dir, one file per keystroke
-/// (`aterm-ledger-<sid>-<unix seconds>.html`), so an earlier ledger left open
-/// in a browser is never rewritten under it.
+/// Output path for `sid`'s ledger: `aterm-ledger-<sid>-<unix seconds>.html` in the
+/// temp dir, one per keystroke, so a ledger open in a browser is never rewritten.
 pub(crate) fn ledger_out_path(sid: &str, unix_s: u64) -> PathBuf {
     let safe: String = sid
         .chars()
@@ -66,9 +55,7 @@ pub(crate) fn ledger_out_path(sid: &str, unix_s: u64) -> PathBuf {
 
 /// The plan for `sid`, now.
 pub(crate) fn plan_for(sid: &str) -> LedgerPlan {
-    let unix_s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let unix_s = aterm_time::unix_secs().unwrap_or(0);
     let out = ledger_out_path(sid, unix_s);
     LedgerPlan {
         sid: sid.to_string(),
@@ -77,10 +64,8 @@ pub(crate) fn plan_for(sid: &str) -> LedgerPlan {
     }
 }
 
-/// The `aterm` front door the key runs: the one beside this executable (the
-/// shipped `.app` keeps its CLI tools in `Contents/MacOS`, a dev tree in
-/// `target/<profile>/`), else `aterm` on the child `PATH`. Never `aterm-gui`
-/// itself: the ledger is a CLI verb.
+/// The `aterm` CLI the key runs: the one beside this executable (`Contents/MacOS`
+/// in the `.app`, `target/<profile>/` in a dev tree), else `aterm` on `PATH`.
 pub(crate) fn aterm_cli() -> PathBuf {
     let name = format!("aterm{}", std::env::consts::EXE_SUFFIX);
     std::env::current_exe()
@@ -90,9 +75,8 @@ pub(crate) fn aterm_cli() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-/// `argv` (a `drive …` command line) pointed at the instance whose socket is
-/// `sock`: `drive --socket <sock> …`. A flag, not the environment — no variable
-/// selects a socket (2026-09-24).
+/// `argv` (a `drive …` command line) pointed at the instance at `sock`:
+/// `drive --socket <sock> …`. The socket is chosen by flag, not environment.
 pub(crate) fn with_socket(argv: &[String], sock: Option<&str>) -> Vec<String> {
     let mut out = Vec::with_capacity(argv.len() + 2);
     out.extend(argv.first().cloned());
@@ -104,11 +88,8 @@ pub(crate) fn with_socket(argv: &[String], sock: Option<&str>) -> Vec<String> {
     out
 }
 
-/// Run `plan` on a thread of its own — the ledger gathers over the control
-/// socket and can take seconds — and open the file once the CLI wrote it.
-/// `sock` is this instance's control socket, so the child reads THESE
-/// sessions. Failures are logged, never raised: a key that could not open a
-/// browser must not take the window with it.
+/// Run `plan` on its own thread (gathering can take seconds), then open the file.
+/// `sock` is this instance's control socket. Failures are logged, never raised.
 pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
     let spawned = std::thread::Builder::new()
         .name("aterm-ledger-key".to_string())
@@ -116,7 +97,12 @@ pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
             // Waits on a CLI child the human is not blocked on.
             crate::qos::set_self(crate::qos::Role::Background);
             let cli = aterm_cli();
-            let mut cmd = std::process::Command::new(&cli);
+            // `aterm.exe` is the CONSOLE image: started bare by the window (which
+            // has no console) every key press opened a VISIBLE console window for
+            // the child's whole run on Windows (measured 2026-09-30);
+            // `spawnfd::command` gives it a windowless one. Not `qos::command`:
+            // the child is an aterm, which must not inherit a clamp.
+            let mut cmd = aterm_uds::spawnfd::command(&cli);
             cmd.args(with_socket(&plan.argv, sock.as_deref()));
             match cmd.output() {
                 Ok(out) if out.status.success() => {
@@ -138,9 +124,8 @@ pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
     }
 }
 
-/// Open `path` with the OS default handler for `.html` — the browser. The
-/// same helper the terminal's link open uses, given a `file://` URL to a file
-/// this process just had written.
+/// Open `path` with the OS default handler for `.html`, via the same helper as the
+/// terminal's link open.
 fn open_file(path: &Path) {
     let url = format!("file://{}", path.display());
     crate::app_mouse::open_url_external(&url);
@@ -155,9 +140,8 @@ impl crate::App {
         Some(plan_for(&sid))
     }
 
-    /// THE LEDGER KEY: compose the plan for the focused session, remember it,
-    /// and — when this window is a real OS window — run it. Headless, the plan
-    /// is all that happens.
+    /// Compose the ledger plan for the focused session, remember it, and run it when
+    /// this window is a real OS window (headless stops at the plan).
     pub(crate) fn open_session_ledger(&mut self, wid: crate::WindowId) {
         let Some(plan) = self.ledger_plan(wid) else {
             return;

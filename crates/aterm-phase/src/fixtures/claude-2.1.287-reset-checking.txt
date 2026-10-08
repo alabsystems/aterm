@@ -1,0 +1,9 @@
+# claude-code 2.1.287 · COMPOSED 2026-10-02, never captured: the texts are the bundle's (the pending line `eDe` N:L354351@32901 under the wall dialog's title N:L361856@32364 (`if(vt)`: the Dialog with one dim child and its input guide, which with no Select inside falls back to the guide `L` of N:L350368@5902); N is the 2.1.287 strings dump docs/SPEC-claude-accounts-resets-2026-10-02.md cites), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; same Dialog component), the values are invented · OPEN: replace with a capture (SPEC §6) · the row taken: the wall dialog's title over `Checking for a reset…`
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   Checking for a reset…
+
+   Enter to confirm · Esc to cancel

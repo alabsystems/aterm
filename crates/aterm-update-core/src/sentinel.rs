@@ -23,7 +23,33 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// A durable boot-health sentinel backed by a small file `"<build> <attempts>"`.
+/// The process that made one counted launch: its pid and the kernel's start time
+/// for it (seconds, microseconds). A reused pid never carries the start time of
+/// the process it replaced, so the pair names exactly one launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaunchName {
+    pub pid: u32,
+    pub started: (i64, i64),
+}
+
+/// The most launch names the sentinel keeps; the oldest go first. Every build that
+/// reaches the revert threshold counts only a few, so this only bounds the file.
+const MAX_NAMED_LAUNCHES: usize = 32;
+
+/// A durable boot-health sentinel backed by a small file
+/// `"<build> <attempts>[ <pid>:<seconds>:<micros>]*"`.
+///
+/// THE NAMES. The count is shared by every launch of the trial, and
+/// several aterm windows each hand off to the same trialed build, so launches of
+/// one trial overlap. A give-back measured as "the count moved since my snapshot"
+/// took a sibling's movement for its own: a sibling's give-back after the snapshot
+/// erased an EARLIER kept launch — the crash signal — and one before a counted
+/// launch left that launch counted. So each counted launch is named by the process
+/// that made it, and [`Self::forgive_launch_of`] gives back exactly the launch it
+/// names, once. The names follow the count on the same line: every reader this
+/// file has ever had reads the first two fields and ignores the rest, and an older
+/// writer rewrites the line without them — which leaves those launches counted,
+/// the answer that keeps the crash signal.
 pub struct Sentinel {
     path: PathBuf,
 }
@@ -38,7 +64,7 @@ impl Sentinel {
     /// Arm the sentinel just before applying a swap to `build`: records `build` with a
     /// zero attempt count, atomically (temp + rename). Overwrites any stale sentinel.
     pub fn arm(&self, build: u64) -> io::Result<()> {
-        self.write_state(build, 0)
+        self.write_record(build, 0, &[])
     }
 
     /// The armed `(build, attempts)`, or `None` if absent/unparseable (a corrupt sentinel
@@ -46,16 +72,45 @@ impl Sentinel {
     /// disruptive action and the swap itself was monotonic-gated).
     #[must_use]
     // Skip: read_to_string on the sentinel file — hardened utf8_reject class;
-    // the file is written by `write_state` below (pure-ASCII `build attempts` line),
+    // the file is written by `write_record` below (a pure-ASCII line),
     // so the UTF-8 rejection path is unreachable for uncorrupted files and a
     // corrupted sentinel correctly reads as None. Audited (update-atpkg).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn read_state(&self) -> Option<(u64, u32)> {
+        self.read_record()
+            .map(|(build, attempts, _)| (build, attempts))
+    }
+
+    /// The named launches of `running_build` still on the count (see
+    /// [`Self::forgive_launch_of`]); empty for another build or none.
+    #[must_use]
+    pub fn named_launches(&self, running_build: u64) -> Vec<LaunchName> {
+        match self.read_record() {
+            Some((build, _, names)) if build == running_build => names,
+            _ => Vec::new(),
+        }
+    }
+
+    /// The whole line: [`Self::read_state`] plus the launch names after it. A name
+    /// that does not parse is dropped — its launch stays counted.
+    // Skip: same read_to_string row as `read_state`, which this is the body of.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn read_record(&self) -> Option<(u64, u32, Vec<LaunchName>)> {
         let text = std::fs::read_to_string(&self.path).ok()?;
         let mut it = text.split_whitespace();
         let build = it.next()?.parse().ok()?;
         let attempts = it.next().unwrap_or("0").parse().ok()?;
-        Some((build, attempts))
+        let names = it
+            .filter_map(|token| {
+                let mut fields = token.split(':');
+                let name = LaunchName {
+                    pid: fields.next()?.parse().ok()?,
+                    started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+                };
+                fields.next().is_none().then_some(name)
+            })
+            .collect();
+        Some((build, attempts, names))
     }
 
     /// Confirm the running build booted healthy by removing the commit marker.
@@ -81,10 +136,25 @@ impl Sentinel {
     // attempt-counting is unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn observe_launch(&self, running_build: u64) -> io::Result<u32> {
-        match self.read_state() {
-            Some((b, attempts)) if b == running_build => {
+        self.observe_launch_by(running_build, None)
+    }
+
+    /// [`Self::observe_launch`], naming the process that made the launch, so that
+    /// exactly this launch can be given back ([`Self::forgive_launch_of`]). The
+    /// count and the name land in one atomic write. An unnamed launch can only
+    /// stay counted.
+    // Skip: same typed-TrustIr lowering gap as `observe_launch`; unit-tested.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn observe_launch_by(
+        &self,
+        running_build: u64,
+        name: Option<LaunchName>,
+    ) -> io::Result<u32> {
+        match self.read_record() {
+            Some((b, attempts, mut names)) if b == running_build => {
                 let next = attempts.saturating_add(1);
-                self.write_state(b, next)?;
+                names.extend(name);
+                self.write_record(b, next, &names)?;
                 Ok(next)
             }
             Some(_) => Ok(0),
@@ -102,19 +172,55 @@ impl Sentinel {
     /// the killer may forgive, and only for the build it killed; a sentinel for another
     /// build, or none, is untouched (`0`). A candidate that DIED on its own is not
     /// forgiven — that launch is the crash signal this file exists to count.
+    ///
+    /// UNNAMED: it cannot tell which launch it gives back, so the names stay as
+    /// they were. A launch that can be named is given back by
+    /// [`Self::forgive_launch_of`].
     // Skip: same typed-TrustIr lowering gap as `observe_launch`; unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn forgive_launch(&self, running_build: u64) -> io::Result<u32> {
-        match self.read_state() {
-            Some((b, attempts)) if b == running_build => {
+        match self.read_record() {
+            Some((b, attempts, names)) if b == running_build => {
                 let next = attempts.saturating_sub(1);
                 if next != attempts {
-                    self.write_state(b, next)?;
+                    self.write_record(b, next, &names)?;
                 }
                 Ok(next)
             }
             Some(_) | None => Ok(0),
         }
+    }
+
+    /// Give back the ONE launch of `running_build` that process `pid` made — born
+    /// at `started` when the caller knows it, else the pid alone — if it is still
+    /// on the count: its name leaves the record and the count drops by one, in one
+    /// atomic write. `Some(remaining)` when a launch was given back; `None` when
+    /// none of that process's is counted (never counted, or given back already),
+    /// so every later ask for the same launch is a no-op and no ask can take a
+    /// launch another process made.
+    // Skip: same typed-TrustIr lowering gap as `observe_launch`; unit-tested.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn forgive_launch_of(
+        &self,
+        running_build: u64,
+        pid: u32,
+        started: Option<(i64, i64)>,
+    ) -> io::Result<Option<u32>> {
+        let Some((b, attempts, mut names)) = self.read_record() else {
+            return Ok(None);
+        };
+        if b != running_build {
+            return Ok(None);
+        }
+        let Some(at) = names.iter().position(|name| {
+            name.pid == pid && started.is_none_or(|started| started == name.started)
+        }) else {
+            return Ok(None);
+        };
+        names.remove(at);
+        let next = attempts.saturating_sub(1);
+        self.write_record(b, next, &names)?;
+        Ok(Some(next))
     }
 
     /// Whether `running_build` should be reverted: it is armed AND has been observed
@@ -126,7 +232,8 @@ impl Sentinel {
         matches!(self.read_state(), Some((b, attempts)) if b == running_build && attempts >= max_attempts)
     }
 
-    /// Atomic AND durable write of `"<build> <attempts>"` via a `0600` temp + rename.
+    /// Atomic AND durable write of `"<build> <attempts>"` and the newest
+    /// [`MAX_NAMED_LAUNCHES`] launch names via a `0600` temp + rename.
     ///
     /// The fsyncs are not ceremony: this file is the transaction commit marker for a
     /// swap, and the crash it protects against is precisely the crash that would eat
@@ -136,13 +243,13 @@ impl Sentinel {
     /// crash-loops forever on the bad build with the retained old bundle sitting right
     /// there unused. The one file whose loss disables rollback must not skip the
     /// flush. Cost is irrelevant at this frequency (once per apply, plus
-    /// once per launch of an unconfirmed trial) — it is an 11-byte file.
+    /// once per launch of an unconfirmed trial) — it is a one-line file.
     // Skip: the audited atomic write-then-rename (the update-atpkg brick-fix):
     // OpenOptions+rename are DELIBERATELY path-based inside the 0700 private
     // dir; the hardened lane's direntry-identity contracts are the capability
     // lane's future surface. Verify-only classification of audited code.
     #[cfg_attr(trust_verify, trust::skip)]
-    fn write_state(&self, build: u64, attempts: u32) -> io::Result<()> {
+    fn write_record(&self, build: u64, attempts: u32, names: &[LaunchName]) -> io::Result<()> {
         use std::io::Write as _;
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let tmp = parent.join(format!(".boot-sentinel.tmp-{}", std::process::id()));
@@ -156,6 +263,13 @@ impl Sentinel {
             }
             let mut f = opts.open(&tmp)?;
             write!(f, "{build} {attempts}")?;
+            for name in &names[names.len().saturating_sub(MAX_NAMED_LAUNCHES)..] {
+                let LaunchName {
+                    pid,
+                    started: (seconds, micros),
+                } = name;
+                write!(f, " {pid}:{seconds}:{micros}")?;
+            }
             // Inside the braces: the payload must be on stable storage BEFORE the handle
             // drops and before the rename below publishes the name.
             //
@@ -169,7 +283,7 @@ impl Sentinel {
             // I/O error (ENOSPC, EIO) still aborts the apply rather than swapping in a
             // build whose rollback authority was never written. Same reasoning as the
             // directory sync below.
-            match f.sync_all() {
+            match crate::durable::sync_all(&f) {
                 Ok(()) => {}
                 Err(e)
                     if matches!(
@@ -184,7 +298,7 @@ impl Sentinel {
         // which some filesystems answer with ENOTSUP/EINVAL. Propagating that would
         // fail `arm()`, which Defers the entire update apply — a regression strictly
         // worse than the durability gap this closes.
-        let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+        let _ = crate::durable::sync_dir(parent);
         Ok(())
     }
 }

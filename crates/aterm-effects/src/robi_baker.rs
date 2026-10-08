@@ -2,26 +2,22 @@
 // Copyright 2026 Andrew Yates
 
 //! The Robi roster's bake path: one authored robot pose
-//! ([`crate::robi_glyphs_gen::ROBI_GLYPHS`]) rasterized into one EXACT-SIZE
+//! ([`crate::robi_glyphs_gen::ROBI_GLYPHS`]) rasterized into one exact-size
 //! straight-alpha RGBA8 tile, cached in a small LRU, and handed to the shared
 //! cat atlas through [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
 //!
-//! This is the [`crate::dog_baker`] pattern applied to the helper robot, minus
-//! every recolor axis: Robi authors ONLY `Recolor::Fixed` layers (a white robot
-//! with a cyan glow is his identity, not a genome), so the bake key carries no
-//! coat/iris/palette context at all — a pose at a size is one tile, ever. That
-//! keeps his ten animation frames from fragmenting the shared LRU while he
-//! cycles them at walk speed.
+//! The [`crate::dog_baker`] pattern without recolor axes: Robi authors only
+//! `Recolor::Fixed` layers, so the bake key is just pose + size and his
+//! animation frames do not fragment the shared LRU.
 
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
-use crate::cat_baker::{MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS};
+use crate::cat_baker::rgb;
+use crate::pet_baker::{ExactTileBaker, ExactTileKey, host_tile_id};
 use crate::robi_glyphs_gen::{ROBI_GLYPHS, RobiGlyphId};
 
-/// FNV namespace salt eaten FIRST by [`RobiBakeKey::host_id`], so a Robi key's
-/// id stream can never collide with a pet/dog/animal key that happens to share
-/// its field values (all rosters set the high bit and live in the same shared
-/// atlas).
+/// FNV namespace salt hashed first by [`RobiBakeKey::host_id`], so Robi ids
+/// cannot collide with pet/dog/animal keys in the shared atlas.
 const ROBI_HOST_SALT: u64 = 0x726f_6269_5f62_6f74; // b"robi_bot"
 
 /// Bake-cache key for one Robi tile: everything that can change a texel, and
@@ -30,7 +26,7 @@ const ROBI_HOST_SALT: u64 = 0x726f_6269_5f62_6f74; // b"robi_bot"
 pub struct RobiBakeKey {
     /// The authored pose frame.
     pub pose: RobiGlyphId,
-    /// Tile width in px. The tile is EXACTLY this wide — no patch strip.
+    /// Tile width in px (exact; no patch strip).
     pub w: u16,
     /// Tile height in px.
     pub h: u16,
@@ -49,33 +45,25 @@ impl RobiBakeKey {
     /// (the [`crate::pet_baker`] contract, in a salted namespace of its own).
     #[must_use]
     pub fn host_id(&self) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut h = FNV_OFFSET;
-        let mut eat = |b: u64| {
-            h ^= b;
-            h = h.wrapping_mul(FNV_PRIME);
-        };
-        eat(ROBI_HOST_SALT);
-        eat(self.pose as u64);
-        eat(u64::from(self.w));
-        eat(u64::from(self.h));
-        h | (1 << 63)
+        host_tile_id(&[
+            ROBI_HOST_SALT,
+            self.pose as u64,
+            u64::from(self.w),
+            u64::from(self.h),
+        ])
     }
 
-    /// The shared-atlas identity of one VERTICAL SLICE of this tile. Robi is
-    /// taller than the atlas's 2-row host-tile ceiling, so the emitter splits
-    /// his texels into stacked slices — each needs its own stable id, in the
-    /// same namespaced high half.
+    /// Shared-atlas identity of one vertical slice of this tile. Robi is taller
+    /// than the atlas's 2-row host-tile limit, so the emitter splits him into
+    /// stacked slices, each with its own id in the namespaced high half.
     #[must_use]
     pub fn host_id_slice(&self, slice: u16) -> u64 {
         (self.host_id() ^ (u64::from(slice) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | (1 << 63)
     }
 }
 
-/// Rasterize one authored Robi pose into a fresh `w × h` [`Tile`], painter
-/// order = layer order, every layer at its authored fixed fill (the roster has
-/// no recolor axes — see the module docs).
+/// Rasterize one authored Robi pose into a fresh `w × h` [`Tile`], in layer
+/// order, each layer at its authored fixed fill.
 #[must_use]
 pub fn bake_pose(pose: RobiGlyphId, w: u32, h: u32) -> Tile {
     let mut tile = Tile::new(w, h);
@@ -84,82 +72,26 @@ pub fn bake_pose(pose: RobiGlyphId, w: u32, h: u32) -> Tile {
     }
     let xform = PathTransform::fit(w, h);
     for layer in ROBI_GLYPHS[pose as usize].layers {
-        let hex = layer.fill;
-        let col = (
-            ((hex >> 16) & 0xff) as f32 / 255.0,
-            ((hex >> 8) & 0xff) as f32 / 255.0,
-            (hex & 0xff) as f32 / 255.0,
-        );
-        fill_path_fixed(&mut tile, layer.paths, col, 1.0, xform);
+        fill_path_fixed(&mut tile, layer.paths, rgb(layer.fill), 1.0, xform);
     }
     tile
 }
 
-/// One resident tile: its key, its texels, and the frame it was last touched on.
-struct RobiSlot {
-    key: RobiBakeKey,
-    tile: Tile,
-    last_used: u64,
+impl ExactTileKey for RobiBakeKey {
+    fn size(&self) -> (u16, u16) {
+        (self.w, self.h)
+    }
+
+    fn bake_tile(&self) -> Tile {
+        self.bake()
+    }
 }
 
-/// Host-side LRU of exact-size Robi tiles — the [`crate::pet_baker::PetBaker`]
-/// structure verbatim (see its docs for the budget rationale).
-///
-/// `Default` is a valid empty baker: the first
-/// [`begin_frame`](RobiBaker::begin_frame) adopts the cell metrics.
-#[derive(Default)]
-pub struct RobiBaker {
-    slots: Vec<RobiSlot>,
-    bytes: usize,
-    cell_w: u16,
-    cell_h: u16,
-    clock: u64,
-    bakes_left: u32,
-    version: u64,
-}
+/// Host-side LRU of exact-size Robi tiles (see [`crate::pet_baker::PetBaker`]
+/// for the budget).
+pub type RobiBaker = ExactTileBaker<RobiBakeKey>;
 
 impl RobiBaker {
-    /// Per-tick prologue: advance the LRU clock, reset the per-frame cold-bake
-    /// budget, and wholesale-clear on a cell-metric change. Call exactly once
-    /// per PRESENTED frame.
-    pub fn begin_frame(&mut self, cell_w: u16, cell_h: u16) {
-        self.clock = self.clock.wrapping_add(1);
-        self.bakes_left = MAX_BAKES_PER_FRAME;
-        if (cell_w, cell_h) != (self.cell_w, self.cell_h) {
-            self.clear();
-            self.cell_w = cell_w;
-            self.cell_h = cell_h;
-        }
-    }
-
-    /// Drop every resident tile and bump the version; silent when already empty.
-    pub fn clear(&mut self) {
-        if self.slots.is_empty() {
-            return;
-        }
-        self.slots.clear();
-        self.bytes = 0;
-        self.version = self.version.wrapping_add(1);
-    }
-
-    /// Monotonic bake/clear counter — fold it into the frame fingerprint.
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-
-    /// Resident tile count (`≤ MAX_SLOTS`).
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Resident texel bytes (`≤ MAX_ATLAS_BYTES`).
-    #[doc(hidden)]
-    #[cfg(test)]
-    pub fn resident_bytes(&self) -> usize {
-        self.bytes
-    }
-
     /// The authored aspect (width ÷ height) of a pose, from its asset viewbox.
     /// Clamped away from zero so a degenerate asset cannot produce a NaN/∞
     /// destination rect.
@@ -167,63 +99,12 @@ impl RobiBaker {
     pub fn aspect(pose: RobiGlyphId) -> f32 {
         (f32::from(ROBI_GLYPHS[pose as usize].aspect_x1000) / 1000.0).max(0.001)
     }
-
-    /// Look `key` up, baking on a miss when the per-frame budget allows.
-    /// Returns straight-alpha RGBA8, exactly `key.w · key.h · 4` bytes — ready
-    /// for [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile) with
-    /// [`RobiBakeKey::host_id`]. `None` means "not this frame" — keep drawing
-    /// the previous tile and ask again next frame.
-    pub fn tile(&mut self, key: &RobiBakeKey) -> Option<&[u8]> {
-        if key.w == 0 || key.h == 0 {
-            return None;
-        }
-        let want = usize::from(key.w) * usize::from(key.h) * 4;
-        if want > MAX_ATLAS_BYTES {
-            return None;
-        }
-        if let Some(i) = self.slots.iter().position(|s| s.key == *key) {
-            self.slots[i].last_used = self.clock;
-            return Some(self.slots[i].tile.pixels());
-        }
-        if self.bakes_left == 0 {
-            return None;
-        }
-        self.bakes_left -= 1;
-        let tile = key.bake();
-        while !self.slots.is_empty()
-            && (self.slots.len() >= MAX_SLOTS || self.bytes + want > MAX_ATLAS_BYTES)
-        {
-            self.evict_lru();
-        }
-        self.bytes += tile.pixels().len();
-        self.slots.push(RobiSlot {
-            key: *key,
-            tile,
-            last_used: self.clock,
-        });
-        self.version = self.version.wrapping_add(1);
-        Some(self.slots[self.slots.len() - 1].tile.pixels())
-    }
-
-    /// Drop the least-recently-used slot, lowest index breaking ties.
-    fn evict_lru(&mut self) {
-        let Some(victim) = self
-            .slots
-            .iter()
-            .enumerate()
-            .min_by_key(|(idx, s)| (s.last_used, *idx))
-            .map(|(idx, _)| idx)
-        else {
-            return;
-        };
-        self.bytes -= self.slots[victim].tile.pixels().len();
-        self.slots.remove(victim);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cat_baker::{MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS};
     use crate::robi_glyphs_gen::ROBI_GLYPH_IDS;
 
     fn key(pose: RobiGlyphId) -> RobiBakeKey {
@@ -283,7 +164,7 @@ mod tests {
         assert_eq!(first, direct.pixels());
     }
 
-    /// EXACT-SIZE tiles, and the pose axis actually moves texels.
+    /// Tiles are exact-size, and the pose axis changes texels.
     #[test]
     fn tiles_are_exact_size_and_the_pose_axis_is_wired() {
         let mut b = RobiBaker::default();

@@ -1,118 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-verify` — aterm's merge gate, as a program instead of a script.
+//! `aterm-verify` — aterm's merge gate: the stage ladder, its scheduling and its
+//! verdict.
 //!
-//! aterm has NO CI by owner decision (docs/AUDIT.md, docs/PROCESS.md): the merge
-//! contract is *the gate passing locally* before a slice enters the ff-only main
-//! merge-queue. That gate lived in `tools/verify.sh`, whose header claimed it was
-//! "intentionally dependency-free POSIX-ish bash" so it could "run on a clean
-//! checkout with nothing installed but the pinned stable toolchain". The rationale
-//! expired: every meaningful stage shells out to cargo, and the pin is a
-//! multi-hour Trust build — on a bare machine the script does not verify anything,
-//! it prints skips. So the ladder became this crate.
+//! aterm has no CI and no git hooks (owner, 2026-07-06 and 2026-09-25;
+//! docs/PROCESS.md): the merge contract is this gate passing locally before a
+//! change lands on main. `tools/verify.sh` is the shim that
+//! starts it: it resolves `$TRUST_STAGE2_BIN` to a physical path, puts it first
+//! on PATH, builds this crate with it and `exec`s the binary with the caller's
+//! arguments plus `--root <repo root>`. When that build fails the shim prints the
+//! flag-spelling-skew diagnostic and exits `3` itself; otherwise it passes the
+//! exit code through ([`exit`]).
 //!
-//! WHAT STAYS IN BASH. Exactly one job: resolving `$TRUST_STAGE2_BIN` to a
-//! physical path, putting it first on PATH, and printing the flag-spelling-skew
-//! diagnostic (the trust 576db732cd rename partitions stage2s between
-//! `-Zno-trust-verify=yes` and `-Ztrust-verify=off`, and no spelling satisfies
-//! both). A Rust driver cannot diagnose a rustc that refuses to compile the
-//! driver. That shim is not this crate's to write; this crate is what it drives.
-//!
-//! THE SHIM CONTRACT, for whoever writes it:
-//!  * build this crate with the stage2 it just put on PATH, then `exec` the
-//!    binary with the caller's arguments UNCHANGED and `--root <repo root>`
-//!    appended (a compiled binary cannot derive the root from its own path the
-//!    way a script can);
-//!  * if that build fails, the shim itself must print the flag-spelling-skew
-//!    diagnostic and exit `3` — a gate that cannot be compiled has decided
-//!    NOTHING, and `3` is the code that says so;
-//!  * pass the exit code through untouched: `0` pass, `1` a gate FAILED, `2`
-//!    usage, `3` COULD NOT RUN.
-//!  * everything else — the stage ladder, the skip accounting, the verdict — is
-//!    here, and re-implementing any of it in the shim would recreate the split
-//!    brain this port exists to remove.
-//!
-//! THE POINT, beyond taste: the gate's own logic is now TESTABLE. The scoping,
-//! the skip accounting and — above all — the verdict claim are ordinary functions
-//! with ordinary unit tests, and those tests run inside the merge contract they
-//! describe (this crate is a workspace member, so `targo test --workspace` is
-//! also the gate testing itself).
-//!
-//! WHAT WAS PRESERVED EXACTLY
-//!  * The `ok`/`FAIL`/`skip` ladder vocabulary and its column layout, and the
-//!    rule that a skip is an honest "tool absent" — never a silent pass.
-//!  * The VERDICT DISCIPLINE. The script once printed "merge contract satisfied"
-//!    on any `rc == 0`, so a `--scope` run over one of sixty-odd crates claimed
-//!    the whole contract, as did any run with a skipped stage. It counts and NAMES
-//!    skips and refuses the merge-contract sentence for any narrowed run. That is
-//!    the single most important property in the gate and [`verdict`] is where it
-//!    lives — one function, one sentence constant, exhaustively tested.
-//!  * The flag spellings `--fast` / `--full` / `--scope <crate>`, so
-//!    docs/PROCESS.md and every agent instruction keep working unedited.
-//!  * The change-scoped tier `--changed [--base <ref>]` ([`changed`]), including
-//!    the part that makes it safe rather than merely fast: THE DIRECTION OF
-//!    FAILURE IS FIXED. Anything the selection cannot answer honestly — absent
-//!    targo, no merge-base, an unreadable graph, a manifest-level change that
-//!    re-plans everything — WIDENS the run to the whole workspace and says so,
-//!    because a narrower that guesses low is a false green and one that guesses
-//!    high is only slow. And it is a NARROWING, so it forfeits the merge-contract
-//!    sentence exactly as `--scope` does.
-//!  * Fail-closed everywhere: no missing tool may produce a pass.
-//!  * Every stage that shells out shells out to the SAME command with the same
-//!    arguments and environment — tippy keeps its separate `CARGO_TARGET_DIR` and
-//!    `TRUST_NO_MIGRATE_WARN`, the doc-running stages bind
-//!    `RUSTDOC=<stage2>/trustdoc` whenever the stage2 carries an executable one
-//!    (the full rule is `stages::doc_driver`), and every driver invocation
-//!    still names its lane with `--unverified`.
-//!
-//! WHAT CHANGED ON PURPOSE
-//!  * Independent stages run CONCURRENTLY ([`sched`]) while the OUTPUT stays in
-//!    the ladder's declared order, so the run stays scannable. Concurrency is
-//!    constrained by the resource each stage actually contends for (see
-//!    [`plan::Lane`]) and the stages whose verdict depends on the clock — the
-//!    deadline tests ([`stages::DEADLINE_TESTS`]), the measuring tests
-//!    ([`stages::MEASURING_TESTS`]) and the two smokes — run exclusively, because
-//!    a gate that decides "present starvation" while a lint compiles on the other
-//!    seven cores would be measuring the gate, not the build.
-//!  * TWO TIERS (2026-09-26, [`plan::Tier`]). The merge contract — a bare
-//!    `tools/verify.sh` — is the LAND tier: correctness. The stages that measure
-//!    the machine or the release artifact ([`plan::MEASURE_TIER`]) are the
-//!    MEASURE tier, run by `--measure` and `--full`, named in the default run's
-//!    verdict as `not part of the merge contract`, recorded as `measured yes|no`
-//!    in the receipt ([`verdict::measured`]) and required by the release cutter
-//!    for the tree it cuts.
-//!  * Exit codes distinguish FAILED from COULD-NOT-RUN (`1` vs `3`) — the
-//!    distinction the 633-line BLOCKING `.githooks/pre-push` reasoned about
-//!    before it was demoted to advisory on 2026-08-24 (it had separate "✗ LINT
-//!    GATE COULD NOT RUN" and "✗ L0 TEMPORAL-SAFETY GATE COULD NOT RUN" arms).
-//!    The hook is gone — deleted on 2026-09-25 under the owner's no-hooks
-//!    mandate; the distinction is not, because it was never the hook's to own.
-//!    `tools/verify.sh` documents all four codes at its hand-off and passes
-//!    ours through untouched, and it reaches for `3` itself
-//!    on every path where the gate was never built. The ladder line is `FAIL`
-//!    either way — a broken environment still never reads as green.
-//!  * `--scope=` with an empty value is a usage error instead of silently meaning
-//!    "the whole workspace". In bash that spelling widened the claim to the merge
-//!    contract; that is the exact class of bug the verdict discipline exists to
-//!    stop. `--base=` is a usage error for the same reason: in bash it set an
-//!    empty ref, which then failed to find a merge-base and WIDENED the run
-//!    without the caller ever learning the flag was malformed.
-//!  * Every run verifies a pinned SNAPSHOT of the caller's git checkout
-//!    ([`snapshot`], 2026-09-13; a root git cannot open is COULD NOT RUN, and
-//!    the `--in-place` and `--selftest` modes are gone since 2026-09-27), and
-//!    a compiler or source tree that moves under a run stops every stage not
-//!    yet started and adds a `source identity` COULD NOT RUN row
-//!    ([`identity`]): a run with nothing failed ends COULD NOT RUN (exit 3),
-//!    and a stage that already FAILED keeps FAIL (exit 1). The 14 h `--fast`
-//!    run that motivated both was pulled four times mid-ladder in a live,
-//!    shared checkout and still printed one verdict. Neither changes any
-//!    stage's argv.
-//!  * The change-scoped SELECTION is a pure function of (diff paths, manifests,
-//!    members, inverted graph), so its seeds, its reverse-dependency closure and
-//!    every one of its widening triggers are unit-testable without a repo. In
-//!    bash the same logic could only be exercised by running the gate inside a
-//!    git checkout with a Trust stage2 installed, which is to say: never.
+//! What the gate holds:
+//!  * The `ok`/`FAIL`/`NOT RUN`/`skip` ladder vocabulary; a skip names an absent tool and is
+//!    never a silent pass. Fail closed: no missing tool produces a pass.
+//!  * The verdict discipline ([`verdict`]): skips are counted and named, and a
+//!    narrowed run (`--scope`, `--changed`) never prints the merge-contract
+//!    sentence.
+//!  * `--changed [--base <ref>]` ([`changed`]) fails wide: anything the selection
+//!    cannot answer (no targo, no merge-base, an unreadable graph, a
+//!    manifest-level change) widens the run to the whole workspace and says so.
+//!    The selection is a pure function of (diff paths, manifests, members,
+//!    inverted graph), unit-tested without a repo.
+//!  * Every driver invocation names its lane with `--unverified`; tippy keeps its
+//!    own `CARGO_TARGET_DIR` and `TRUST_NO_MIGRATE_WARN`; the doc-running stages
+//!    bind `RUSTDOC` per `stages::doc_driver`.
+//!  * Independent stages run concurrently ([`sched`]), constrained by the
+//!    resource each contends for ([`plan::Lane`]), while output stays in declared
+//!    order. Clock-sensitive stages ([`stages::MEASURING_TESTS`], the smokes)
+//!    run exclusively.
+//!  * Two tiers ([`plan::Tier`]): LAND, the merge contract; and MEASURE
+//!    ([`plan::MEASURE_TIER`], `--measure`/`--full`), whose receipt records
+//!    `measured yes|no` ([`verdict::measured`]) for the release cutter.
+//!  * `--scope=` and `--base=` with an empty value are usage errors.
+//!  * Every run verifies a pinned snapshot of the caller's git checkout
+//!    ([`snapshot`]). A compiler or source tree that moves mid-run stops every
+//!    unstarted stage and adds a `source identity` COULD NOT RUN row
+//!    ([`identity`]); a stage that already failed keeps FAIL.
 
 pub mod build_config;
 pub mod changed;
@@ -121,19 +47,18 @@ pub mod cli;
 pub mod differential;
 pub mod disk;
 pub mod exec;
+pub mod first_exec;
 pub mod glob;
 pub mod identity;
 pub mod ladder;
 pub mod lease;
 pub mod libtest;
-pub mod nearest;
 pub mod plan;
 pub mod receipt;
 pub mod sched;
 pub mod scope;
-// The smokes drive a unix control socket with unix process plumbing, and the
-// ladder that runs them is a unix program (`tools/verify.sh`); off unix the
-// two smoke rows are named skips (`stages::run_stage`).
+// The smokes drive a unix control socket with unix process plumbing; off unix
+// the two smoke rows are named skips (`stages::run_stage`).
 #[cfg(unix)]
 pub mod smoke;
 #[cfg(unix)]
@@ -141,6 +66,9 @@ pub mod smoke_stages;
 pub mod snapshot;
 pub mod stages;
 pub mod testrun;
+/// THE toolchain resolution, shared with atpkg (`aterm help rust`) as one
+/// std-only source file; this crate takes no dependencies.
+#[path = "../../atpkg/src/toolchain.rs"]
 pub mod toolchain;
 pub mod verdict;
 
@@ -154,39 +82,27 @@ use std::time::{Duration, Instant};
 pub use cli::Mode;
 pub use ladder::{Outcome, Report, Severity};
 pub use scope::Scope;
-pub use toolchain::Toolchain;
+pub use toolchain::{Toolchain, is_executable_file};
 pub use verdict::{MERGE_CONTRACT_SENTENCE, Verdict};
 
-/// Exit codes. FAILED and COULD-NOT-RUN are kept apart because a broken
-/// environment is not a finding about the tree, and conflating them is how a
-/// gate stops being read.
-///
-/// The blocking pre-push hook reasoned about that distinction, and this comment
-/// used to cite it as the reason. It is no longer a caller — it was advisory
-/// from 2026-08-24, read this run's RECEIPT ([`receipt`]) from 2026-09-17, and
-/// was deleted on 2026-09-25 (the owner's no-hooks mandate) — but the reason
-/// outlived it, and the distinction has a live consumer either way: `tools/verify.sh`
-/// documents all four codes where it
-/// `exec`s this binary, passes ours through untouched, and returns `3` itself
-/// whenever the gate could not be built at all.
+/// Exit codes. FAILED and COULD-NOT-RUN stay apart: a broken environment is not
+/// a finding about the tree. `tools/verify.sh` passes them through and returns
+/// `3` itself when the gate cannot be built.
 pub mod exit {
-    /// Nothing NEW failed: everything that ran was green, or every red was
+    /// Nothing new failed: everything that ran was green, or every red was
     /// inherited from main's receipt (the verdict text says *which* green).
     pub const PASS: i32 = 0;
     /// A gate FAILED — a real finding about the tree.
     pub const FAILED: i32 = 1;
     /// Usage error.
     pub const USAGE: i32 = 2;
-    /// COULD NOT RUN — the environment is broken and nothing was decided.
+    /// COULD NOT RUN — nothing was decided; each row says why.
     /// Never mistakable for green, and never mistakable for a finding either.
     pub const COULD_NOT_RUN: i32 = 3;
 }
 
-/// The environment read ONCE, at startup, on the main thread.
-///
-/// Stages run concurrently and `std::env::var` is a global read against a global
-/// that anything may mutate; snapshotting keeps every stage's decision a function
-/// of a value that can be constructed in a test.
+/// The environment, read once at startup on the main thread, so every concurrent
+/// stage decides from a value a test can construct.
 #[derive(Clone, Debug, Default)]
 pub struct EnvSnapshot {
     pub path: OsString,
@@ -194,29 +110,22 @@ pub struct EnvSnapshot {
     pub trust_stage2_bin: Option<PathBuf>,
     pub trust_mc_sysroot: Option<PathBuf>,
     pub ay_bin_dir: Option<PathBuf>,
-    /// `XDG_CONFIG_HOME` — where atpkg's own config (`aterm/aterm.toml`, the
-    /// `[packages].prefix` override) lives when set; the store probe reads the
-    /// same file atpkg does ([`toolchain::atpkg_prefix`]).
+    /// `XDG_CONFIG_HOME`: where atpkg's config (`aterm/aterm.toml`, the
+    /// `[packages].prefix` override) lives ([`toolchain::atpkg_prefix`]).
     pub xdg_config_home: Option<PathBuf>,
     /// `RUSTUP_HOME`, raw — where rustup keeps its toolchains when set (and not
     /// empty); [`toolchain::rustup_home`] turns it and `home` into the directory
     /// discovery probes, `~/.rustup` when unset.
     pub rustup_home: Option<OsString>,
     pub ssh_connection: Option<String>,
-    /// `CARGO_BUILD_JOBS` — the caller's job count. The main lane and the lint
-    /// lane inherit it as they inherit every variable; for the SIDE lanes, whose
-    /// caps are constants ([`stages::lane_build_jobs`]), it is a CEILING
-    /// ([`stages::lane_jobs`]): a 4-core machine that exports `4` must not have
-    /// the driver lane override it back up to 8. Kept RAW here and parsed by the
-    /// pure function: the snapshot's job is to read the environment exactly once,
-    /// on the main thread.
+    /// `CARGO_BUILD_JOBS`, raw. The main and lint lanes inherit it unless the
+    /// memory cap is lower ([`Ctx::with_memory_build_jobs`]); for the side
+    /// lanes, whose caps are constants ([`stages::lane_build_jobs`]), it is a
+    /// ceiling ([`Ctx::build_jobs_ceiling`]).
     pub cargo_build_jobs: Option<OsString>,
-    /// `RUSTDOC` or `CARGO_BUILD_RUSTDOC` — a caller-supplied doc-driver
-    /// binding. Cargo prefers either over the config's `[build] rustdoc`, so
-    /// the children inherit it and the doc-driver rule must account for it:
-    /// an explicit export is the operator's own per-invocation override (the
-    /// same escape hatch verify.sh's header sanctions for flag-spelling skew),
-    /// never grounds for a COULD-NOT-RUN.
+    /// `RUSTDOC` or `CARGO_BUILD_RUSTDOC`: the caller's doc-driver override,
+    /// which cargo prefers over the config's `[build] rustdoc`. The doc-driver
+    /// rule honours it and never turns it into a COULD-NOT-RUN.
     pub rustdoc_override: Option<OsString>,
 }
 
@@ -235,12 +144,9 @@ impl EnvSnapshot {
             rustup_home: std::env::var_os("RUSTUP_HOME"),
             ssh_connection: std::env::var("SSH_CONNECTION").ok(),
             cargo_build_jobs: std::env::var_os("CARGO_BUILD_JOBS"),
-            // NO empty-filter, deliberately: cargo has no treat-empty-as-unset
-            // rule for these (only RUSTC_WRAPPER gets one), so a set-but-empty
-            // RUSTDOC still masks CARGO_BUILD_RUSTDOC and still reaches the
-            // child — the snapshot mirrors that precedence exactly, and a
-            // broken export fails under the "(caller's RUSTDOC)" label that
-            // names whose binding it was.
+            // No empty-filter: cargo treats a set-but-empty RUSTDOC as set (only
+            // RUSTC_WRAPPER is treated as unset when empty), so it still masks
+            // CARGO_BUILD_RUSTDOC; a broken export fails as "(caller's RUSTDOC)".
             rustdoc_override: std::env::var_os("RUSTDOC")
                 .or_else(|| std::env::var_os("CARGO_BUILD_RUSTDOC")),
         }
@@ -255,24 +161,19 @@ pub struct Ctx {
     pub mode: Mode,
     pub scope: Scope,
     pub tools: Toolchain,
-    /// PATH handed to every child: the resolved stage2 directory first, when a
-    /// `targo` actually lives there, exactly as the script's `PATH=…` export did.
-    /// Passed per-child rather than by mutating our own environment — with stages
-    /// on threads, `set_var` is a data race, and an explicit value is testable.
+    /// PATH for every child: the resolved stage2 directory first when it holds a
+    /// `targo`. Passed per child, since `set_var` would race the stage threads.
     pub path_env: OsString,
     /// Private scratch directory for captured child output, removed at the end.
     pub scratch: PathBuf,
     pub env: EnvSnapshot,
-    /// Stages already decided before the ladder was planned — today exactly one:
-    /// `--changed`'s selection, which has to run BEFORE [`plan::plan`] because it
-    /// is what produces the [`Scope`] the plan is built from. Printed first,
-    /// tallied like any other stage, and subject to the same rule that a stage
-    /// recording no outcome cannot be counted.
+    /// Stages decided before the ladder was planned: `--changed`'s selection,
+    /// which produces the [`Scope`] [`plan::plan`] builds from. Printed first
+    /// and tallied like any other stage.
     pub prelude: Vec<Report>,
-    /// The caller's checkout this run's root is a SNAPSHOT of
-    /// ([`Ctx::in_snapshot_of`]) — every run of the gate binary. `None` only
-    /// for a context the gate's own tests build in-process on a root of their
-    /// making, whose ladder runs on that root.
+    /// The caller's checkout this run's root is a snapshot of
+    /// ([`Ctx::in_snapshot_of`]). `None` only for in-process test contexts,
+    /// whose ladder runs on a root they made.
     pub snapshot_of: Option<PathBuf>,
     /// `verify: …` header lines — the snapshot's (cold or pruned lanes) and
     /// the pinned child facts — printed under the source line.
@@ -280,64 +181,47 @@ pub struct Ctx {
     /// Variables removed from every child's inherited environment
     /// ([`exec::ExecEnv::remove_env`]): [`CHILD_ENV_REMOVED`], always.
     pub child_env_remove: Vec<&'static str>,
-    /// Variables given to every child ([`exec::ExecEnv::add_env`]): the
-    /// constants in [`CHILD_ENV`], seeded here at construction, plus the run's
-    /// pinned git stamp and its pinned test concurrency, appended by
-    /// [`Ctx::with_pinned_child_facts`]. The resolved facts are resolved once,
-    /// here, so every stage of one run agrees and a wrapper cannot change what
-    /// the merge contract measured without the receipt saying so.
-    ///
-    /// BUILDERS APPEND TO THIS VECTOR. Assigning to it would silently drop the
-    /// seeded constants on every context, and `CARGO_INCREMENTAL=0` is one of
-    /// them — the 36 GB -> 55 GB lane growth would come back with nothing in
-    /// the tree saying why.
+    /// Variables given to every child ([`exec::ExecEnv::add_env`]): [`CHILD_ENV`],
+    /// seeded at construction, plus the facts [`Ctx::with_pinned_child_facts`]
+    /// appends. Builders append; assigning would drop the seeded
+    /// `CARGO_INCREMENTAL=0`.
     pub child_env_add: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     /// The wall-clock ceiling on one stage child: [`exec::DEFAULT_CHILD_CEILING`]
     /// unless `--stage-timeout` moved it, `None` for `--stage-timeout off`.
     pub child_ceiling: Option<std::time::Duration>,
-    /// `--skip-gui-smoke`: the GUI smoke answers a named SKIP.
-    pub skip_gui_smoke: bool,
+    /// `--no-windows`: every stage that puts a window on the desktop
+    /// ([`plan::WINDOWED`]) answers a named SKIP.
+    pub no_windows: bool,
+    /// `--compile-qos`: the tier every compile-only child runs at
+    /// ([`exec::CompileQos`]) — UTILITY, unless this is a release's MEASURE run.
+    pub compile_qos: exec::CompileQos,
     /// The source state a snapshot's sync verified. The tripwire arms on it
     /// (and compares it with a fresh capture) rather than re-arming from
     /// whatever the root holds by the time the ladder starts.
     pub source_baseline: Option<identity::TreeState>,
-    /// The numbers the disk preflight budgets this run with ([`disk`]):
-    /// [`disk::Budget::MEASURED`] in every real run. The preflight laws scale
-    /// them down to bytes, so a fixture's few kilobytes of lanes can stand for
-    /// a snapshot's gigabytes.
+    /// The disk preflight's budget ([`disk`]): [`disk::Budget::MEASURED`] in a
+    /// real run; the preflight tests scale it down to bytes.
     pub disk_budget: disk::Budget,
     /// `--disk-floor`: require exactly this much free and skip the estimate.
-    /// `None` in a real run unless the flag was given. The gate's own fixture
-    /// tests set `Some(0)`, and the preflight laws set their own, so none of
-    /// them depends on how full the host volume happens to be.
+    /// Fixture tests set `Some(0)` so they never depend on the host volume.
     pub disk_floor: Option<u64>,
-    /// What the preflight calls, with the run's root, to read the free space
-    /// instead of [`disk::read_free`]'s `df`: `None` in a real run. The
-    /// preflight laws that budget with scaled numbers set it, so what they
-    /// decide is a function of the numbers they chose and never of the host
-    /// volume. A function of the root rather than a fixed reading, so a law can
-    /// answer from what the root holds WHEN it is called — which is how the
-    /// order of the cap's removal and the read is pinned.
+    /// Reads free space for the preflight in place of [`disk::read_free`]'s
+    /// `df`; `None` in a real run. A function of the root, so a test can answer
+    /// from what the root holds at call time.
     pub disk_free: Option<fn(&Path) -> disk::Reading>,
-    /// Where each stage's FINISH line goes the moment the stage finishes —
-    /// the run's own log ([`Ctx::with_progress_log`]). The ladder prints in
-    /// declared order, so a verdict decided in minute one used to stay unread
-    /// until the hour-long test stage ahead of it printed; this line is the
-    /// early read, and it names the outcome.
+    /// Where each stage's finish line goes the moment it finishes
+    /// ([`Ctx::with_progress_log`]), ahead of the ladder's declared-order print.
     pub progress_log: Option<std::fs::File>,
     /// `--baseline`: this run records main's own reds — HEAD must be a clean
     /// commit of `origin/main` — and publishes its receipt for branches to be
     /// judged against ([`differential`]).
     pub baseline: bool,
-    /// `--nearest-base` (opt-in, off by default, pending the owner's
-    /// decision): a run whose merge-base has no receipt that serves may be
-    /// judged against its nearest ancestor's ([`nearest`]).
-    pub nearest_base: bool,
-    /// `--test-jobs`: how many test binaries the test stage runs at once
-    /// ([`testrun`]; [`testrun::DEFAULT_JOBS`] unless the flag says otherwise).
+    /// `--test-jobs`: the most test binaries the test stage runs at once
+    /// ([`testrun::Limits::by_load`]; [`testrun::DEFAULT_JOBS`] unless the flag
+    /// says otherwise).
     pub test_jobs: u32,
     /// The `RUST_TEST_THREADS` [`Ctx::with_pinned_child_facts`] pinned, which
-    /// the test stage divides between the binaries it runs at once. `None`
+    /// the test stage hands every binary it runs, as cargo's own run does. `None`
     /// until it pinned one ([`Ctx::test_threads`] then answers the machine's
     /// parallelism, as the pin would).
     pub test_threads: Option<u32>,
@@ -345,78 +229,156 @@ pub struct Ctx {
     /// ([`testrun::RECORD_FLAG`]): this very binary, unless a test names the
     /// built `aterm-verify` because it runs the gate in-process.
     pub test_recorder: Option<PathBuf>,
+    /// Reads what the test pool widens by ([`testrun::Limits::by_load`]) in
+    /// place of [`Ctx::test_load`]'s machine reading;
+    /// `None` in a real run. A fixture ladder names an idle or a busy machine
+    /// with it, so how the test stage wires the load into its pool is a test
+    /// of its own, whatever the host's load.
+    pub test_load: Option<fn() -> Option<f64>>,
+    /// How the headless smoke paces its typing burst:
+    /// [`smoke_stages::Pacing::PRODUCTION`] except in the gate's fixture ladders
+    /// ([`Ctx::with_smoke_pacing`]).
+    #[cfg(unix)]
+    pub smoke_pacing: smoke_stages::Pacing,
+    /// The stages a FIXTURE ladder runs ([`Ctx::with_only_stages`]); every other
+    /// planned stage answers one SKIP row, so the run cannot claim the merge
+    /// contract, yet it still files a strength-1 whole-tree receipt that can
+    /// serve as a base. `None` in a real run: only [`Ctx::new_with_tools`] makes
+    /// a `Ctx` and it says `None`, and nothing in `main.rs` or `cli.rs` sets it.
+    pub only_stages: Option<Vec<plan::StageId>>,
+    /// The host's physical memory in bytes ([`exec::host_memory_bytes`]),
+    /// which decides whether the MEASURE tier's workspace build may overlap the
+    /// land tier's ([`plan::measure_overlap`]). `None` — unread, and in every
+    /// `Ctx` a test makes unless it says otherwise — takes the serial order.
+    pub host_memory: Option<u64>,
+    /// `host_memory` is Linux's `MemTotal`, which reads under the installed
+    /// RAM, so a RAM figure derived from it says so.
+    pub host_memtotal: bool,
+    /// The memory the host can give builds, in bytes
+    /// ([`exec::host_usable_bytes`]: physical less wired on macOS, Linux's
+    /// `MemAvailable`). Wired memory past what a healthy host holds comes off
+    /// the RAM every memory decision uses ([`Ctx::build_memory`]). `None` —
+    /// unread, and in every `Ctx` a test makes unless it says otherwise —
+    /// leaves the physical figure to decide alone.
+    pub host_usable: Option<u64>,
+    /// The compiler jobs the host's memory holds ([`memory_jobs_held`]), set by
+    /// [`Ctx::with_memory_build_jobs`] on every host whose wired memory is past
+    /// the allowance. Every lane that compiles stays at or under it
+    /// ([`Ctx::build_jobs_ceiling`]); a figure above a lane's own count changes
+    /// nothing. `None` leaves the count to the caller's `CARGO_BUILD_JOBS`, or
+    /// to cargo.
+    pub memory_jobs: Option<u32>,
 }
 
-/// The git stamp [`Ctx::with_pinned_child_facts`] hands every child: the inputs
-/// `crates/aterm-gui/build.rs` reads IN PLACE of asking git (its commit, full
-/// commit and dev counter). Build-script inputs of the gate's own child builds,
-/// set here and read by no shipped code — `aterm-update-core`'s `env_reads` gate
-/// lists this table as one the gate WRITES.
+/// A `CARGO_BUILD_JOBS` value as a job count: a positive integer, surrounding
+/// whitespace allowed. Anything else is `None`, which no job decision reads as
+/// a count; the raw value still reaches the main lane by inheritance, where
+/// cargo judges it.
+#[must_use]
+pub fn parse_build_jobs(raw: Option<&OsStr>) -> Option<u32> {
+    raw.and_then(OsStr::to_str)
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// The compiler jobs a host's memory holds: one per
+/// [`plan::WORKSPACE_BUILD_BYTES`] of `usable`, at least one, on a host whose
+/// wired memory is past the allowance ([`plan::build_memory`] below `ram`).
+/// `None` on a host within the allowance, or when either figure is unread.
+///
+/// It is every lane's ceiling ([`Ctx::build_jobs_ceiling`]), so it only ever
+/// lowers a count: a figure above a lane's own (a 36 GiB Mac with 4.2 GiB
+/// wired holds 15) changes nothing.
+#[must_use]
+pub fn memory_jobs_held(ram: Option<u64>, usable: Option<u64>) -> Option<u32> {
+    let (ram, usable) = (ram?, usable?);
+    if plan::build_memory(Some(ram), Some(usable)) >= Some(ram) {
+        return None;
+    }
+    Some(u32::try_from((usable / plan::WORKSPACE_BUILD_BYTES).max(1)).unwrap_or(u32::MAX))
+}
+
+/// The `CARGO_BUILD_JOBS` the lanes that inherit the environment get from the
+/// memory: [`memory_jobs_held`], when that is fewer than such a build would
+/// otherwise run; `None` leaves their count alone.
+///
+/// What a build would otherwise run is the caller's `CARGO_BUILD_JOBS`
+/// (`caller`, [`parse_build_jobs`]) or cargo's default, one per core
+/// (`cores`). So with no caller value, a host whose usable memory holds as
+/// many jobs as it has cores or more (a 36 GiB Mac with 4.2 GiB wired holds 15
+/// on 14 cores; a 2-core host with 4.5 GiB usable holds 2) gets no export, and
+/// a caller's export at or below the figure stands. The side lanes, whose own
+/// counts can exceed the cores, take [`memory_jobs_held`] as their ceiling
+/// whatever this answers.
+#[must_use]
+pub fn memory_job_cap(
+    ram: Option<u64>,
+    usable: Option<u64>,
+    cores: u32,
+    caller: Option<u32>,
+) -> Option<u32> {
+    let otherwise = caller.unwrap_or(cores).max(1);
+    memory_jobs_held(ram, usable).filter(|&held| held < otherwise)
+}
+
+/// The git stamp [`Ctx::with_pinned_child_facts`] hands every child: the commit,
+/// full commit and dev counter `crates/aterm/build.rs` reads instead of
+/// asking git. `aterm-update-core`'s `env_reads` gate lists this table as one
+/// the gate writes.
 pub const GIT_STAMP_ENV: [&str; 3] = [
     "ATERM_BUILD_GIT_COMMIT",
     "ATERM_BUILD_GIT_COMMIT_FULL",
     "ATERM_BUILD_DEV_COMMITS",
 ];
 
-/// Variables REMOVED from every child's inherited environment, in every run.
+/// Variables removed from every child's inherited environment.
 ///
-/// `CARGO_TARGET_DIR` (2026-09-13; unconditional since 2026-09-27, when every
-/// run became a snapshot). Every lane names its own directory under the run's
-/// root ([`plan::lane_dir`]), and a caller's redirect reaching a main-lane
-/// cargo child would build in the caller's contended target dir while the
-/// stages looked for its binaries in the snapshot's.
-pub const CHILD_ENV_REMOVED: [&str; 1] = ["CARGO_TARGET_DIR"];
+/// `CARGO_TARGET_DIR`: every lane names its own directory under the run's root
+/// ([`plan::lane_dir`]); a caller's redirect would build somewhere other than
+/// where the stages look for binaries.
+///
+/// [`LIBTEST_UNSTABLE_ENV`]: the test run passes `-Zunstable-options
+/// --report-time` ([`stages::LIBTEST_REPORT_TIME`]), under which libtest also
+/// reads `RUST_TEST_SHUFFLE*` (reorders tests) and `RUST_TEST_TIME_*` (a
+/// malformed value panics the binary). Removing them keeps the caller's shell
+/// out of the merge contract.
+pub const CHILD_ENV_REMOVED: [&str; 6] = [
+    "CARGO_TARGET_DIR",
+    "RUST_TEST_SHUFFLE",
+    "RUST_TEST_SHUFFLE_SEED",
+    "RUST_TEST_TIME_UNIT",
+    "RUST_TEST_TIME_INTEGRATION",
+    "RUST_TEST_TIME_DOCTEST",
+];
 
-/// Variables SET in every child's environment, in every run — after
-/// [`CHILD_ENV_REMOVED`] and before a stage's own [`exec::Cmd::envs`], so the
-/// gate's setting beats the caller's shell and a stage that names the variable
-/// itself still wins ([`exec::ExecEnv::add_env`]).
+/// What libtest reads from its environment once `-Zunstable-options` is on
+/// ([`stages::LIBTEST_REPORT_TIME`]) — each one in [`CHILD_ENV_REMOVED`].
+pub const LIBTEST_UNSTABLE_ENV: [&str; 5] = [
+    "RUST_TEST_SHUFFLE",
+    "RUST_TEST_SHUFFLE_SEED",
+    "RUST_TEST_TIME_UNIT",
+    "RUST_TEST_TIME_INTEGRATION",
+    "RUST_TEST_TIME_DOCTEST",
+];
+
+/// Variables set in every child's environment: after [`CHILD_ENV_REMOVED`] and
+/// before a stage's own [`exec::Cmd::envs`], so the gate beats the caller's shell
+/// and a stage's own setting beats the gate ([`exec::ExecEnv::add_env`]). They
+/// seed [`Ctx::child_env_add`] at construction, so every context has them.
 ///
-/// These seed [`Ctx::child_env_add`] at construction, so they hold on EVERY
-/// context — including one that never called
-/// [`Ctx::with_pinned_child_facts`], which appends the run's two resolved
-/// facts (the git stamp and the test concurrency) to the same vector. A pin
-/// that only a builder installs is a pin a caller can forget.
-///
-/// `CARGO_INCREMENTAL=0` (2026-09-21). The merge-contract tiers build each
-/// commit ONCE and reuse no cache afterwards, so incremental compilation buys
-/// them nothing and costs them the disk. (The reason given here until
-/// 2026-09-21 — "a snapshot nothing edits between runs" — was false for the
-/// one tier where incremental would have paid: `--changed` re-syncs the
-/// snapshot from an edited tree on every run, and gives up its incremental
-/// rebuilds to keep the lanes bounded. That is a trade, and it is stated as
-/// one.) MEASURED across incremental `--fast` runs:
-/// the snapshot's `target/` grew 36 GB -> 55 GB, `target-tippy/` held 16-18 GB
-/// and `target-drivers/` 16-20 GB, and on 2026-09-20 two contract runs died
-/// mid-ladder with `No space left on device` — their logs, in the snapshot's
-/// `.aterm-verify/logs`, name the stage: `13a8494eb`'s could not start its
-/// test stage (`aterm-verify: cannot run …/targo: No space left on device`),
-/// and `cb770c598`'s first run died inside its build. With those dirs deleted
-/// and `CARGO_INCREMENTAL=0` in the environment, the next run of `cb770c598`
-/// built them cold and left a snapshot measuring 23 GiB (`du -sh`, read by
-/// hand) — the incremental artifacts were most of the bloat ([`disk`] has the
-/// runs since). A
-/// caller's own `CARGO_INCREMENTAL=1` is overridden on purpose: it would
-/// re-create that growth on a run whose caches nobody reuses. The lane stamps
-/// stopped recording the variable the same day (`snapshot::LANE_ENV_VARS`).
+/// `CARGO_INCREMENTAL=0`: the gate builds each commit once and reuses no
+/// incremental cache, whose artifacts would otherwise dominate the lanes' disk
+/// use ([`disk`]). A caller's `CARGO_INCREMENTAL=1` is overridden on purpose.
 pub const CHILD_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
 
-/// THE RUN'S TOOLCHAIN, discovered from `env` under the pin `root` declares:
-/// the one [`Toolchain::discover_with_store`] a run makes, under the atpkg
-/// prefix resolved from the snapshot (the same file atpkg reads) — the prefix
-/// every store probe is handed (the compiler's, and the trust-mc / ay lanes' in
-/// `stages::kani_floor`).
+/// The run's toolchain, discovered once from `env` under the pin `root` declares
+/// and the atpkg prefix atpkg itself would read (also handed to the trust-mc / ay
+/// store probes in `stages::kani_floor`).
 ///
-/// ONE PER RUN, and handed to every consumer (review of 2026-09-25): the lane
-/// stamp (`main`'s snapshot), `--changed`'s selection and the stages each ran
-/// their own discovery, and since the staleness rule each discovery races two
-/// `trustc -vV` date probes against [`toolchain`]'s 5 s bound — a date that
-/// times out never demotes. After an atpkg update lays a new build, its first
-/// exec can take many seconds (a first-exec assessment), so one discovery
-/// timed out and kept the old rustup stage2 while the next demoted it: the
-/// stamp named one compiler and the stages ran another, and the next run
-/// PRUNED the lanes the new compiler had built. `main` calls this once and
-/// builds its context with [`Ctx::new_with_tools`].
+/// `main` calls this once and hands the result to the lane stamp, `--changed`'s
+/// selection and every stage ([`Ctx::new_with_tools`]). Separate discoveries can
+/// disagree: the staleness rule's `trustc -vV` probes have a 5 s bound, and a
+/// probe that times out never demotes.
 #[must_use]
 pub fn run_toolchain(env: &EnvSnapshot, root: &Path) -> Toolchain {
     let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
@@ -431,10 +393,8 @@ pub fn run_toolchain(env: &EnvSnapshot, root: &Path) -> Toolchain {
 
 impl Ctx {
     /// Build the run context, discovering its toolchain ([`run_toolchain`]).
-    /// `scratch` must already exist. A caller that has already discovered the
-    /// run's toolchain for another use hands it over with
-    /// [`Self::new_with_tools`] instead: two discoveries in one run can
-    /// disagree.
+    /// `scratch` must already exist. A caller that already has the run's
+    /// toolchain uses [`Self::new_with_tools`]: two discoveries can disagree.
     #[must_use]
     pub fn new(
         root: PathBuf,
@@ -447,9 +407,8 @@ impl Ctx {
         Self::new_with_tools(root, mode, scope, env, scratch, tools)
     }
 
-    /// [`Self::new`] with the run's ONE toolchain already discovered
-    /// ([`run_toolchain`]), so the lane stamp, the scope and every stage name
-    /// the same compiler.
+    /// [`Self::new`] with the run's toolchain already discovered
+    /// ([`run_toolchain`]), so the lane stamp, the scope and every stage agree.
     #[must_use]
     pub fn new_with_tools(
         root: PathBuf,
@@ -477,18 +436,34 @@ impl Ctx {
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
-            skip_gui_smoke: false,
+            no_windows: false,
+            compile_qos: exec::CompileQos::Utility,
             source_baseline: None,
             disk_budget: disk::Budget::MEASURED,
             disk_floor: None,
             disk_free: None,
             progress_log: None,
             baseline: false,
-            nearest_base: false,
             test_jobs: testrun::DEFAULT_JOBS,
             test_threads: None,
             test_recorder: None,
+            test_load: None,
+            #[cfg(unix)]
+            smoke_pacing: smoke_stages::Pacing::PRODUCTION,
+            only_stages: None,
+            host_memory: None,
+            host_memtotal: false,
+            host_usable: None,
+            memory_jobs: None,
         }
+    }
+
+    /// The RAM every memory decision of the plan uses
+    /// ([`plan::build_memory`] over [`Ctx::host_memory`] and
+    /// [`Ctx::host_usable`]).
+    #[must_use]
+    pub fn build_memory(&self) -> Option<u64> {
+        plan::build_memory(self.host_memory, self.host_usable)
     }
 
     /// The cores a load average is read against: the machine's parallelism.
@@ -498,7 +473,21 @@ impl Ctx {
             .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
     }
 
-    /// How many test binaries run at once ([`Ctx::test_jobs`], at least one).
+    /// The most compiler jobs any build of the run may take: the smaller of the
+    /// caller's `CARGO_BUILD_JOBS` ([`parse_build_jobs`]) and the jobs the
+    /// memory holds ([`Ctx::memory_jobs`]); `None` leaves cargo's own count.
+    /// The side lanes take it as the ceiling of their constants
+    /// ([`stages::lane_jobs`]). The main and lint lanes inherit the caller's
+    /// value, or get the memory's through [`Ctx::child_env_add`] when it is
+    /// below what they would otherwise run ([`memory_job_cap`]), so they never
+    /// run more than this either.
+    #[must_use]
+    pub fn build_jobs_ceiling(&self) -> Option<u32> {
+        let caller = parse_build_jobs(self.env.cargo_build_jobs.as_deref());
+        caller.into_iter().chain(self.memory_jobs).min()
+    }
+
+    /// The most test binaries that run at once ([`Ctx::test_jobs`], at least one).
     #[must_use]
     pub fn test_jobs(&self) -> usize {
         usize::try_from(self.test_jobs.max(1)).unwrap_or(1)
@@ -511,6 +500,17 @@ impl Ctx {
             std::thread::available_parallelism()
                 .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
         })
+    }
+
+    /// What the test pool reads against the cores: [`Ctx::test_load`]'s answer,
+    /// else the cores busy over the last second ([`exec::busy_cores`]), else the
+    /// one-minute load ([`exec::load_average`]).
+    #[must_use]
+    pub fn test_load(&self) -> Option<f64> {
+        self.test_load.map_or_else(
+            || exec::busy_cores().or_else(exec::load_average),
+            |read| read(),
+        )
     }
 
     /// The recording runner ([`Ctx::test_recorder`]): the named program, else
@@ -528,13 +528,6 @@ impl Ctx {
         if let Some(n) = jobs {
             self.test_jobs = n.get();
         }
-        self
-    }
-
-    /// A `--nearest-base` run ([`Ctx::nearest_base`]).
-    #[must_use]
-    pub fn with_nearest_base(mut self, nearest_base: bool) -> Self {
-        self.nearest_base = nearest_base;
         self
     }
 
@@ -569,44 +562,19 @@ impl Ctx {
         self
     }
 
-    /// Extra `verify: …` header lines.
-    /// PIN WHAT EVERY CHILD MUST AGREE ON, once, on the main thread.
+    /// Pin what every child must agree on, once, on the main thread:
     ///
-    /// TWO FACTS, both of which a run was previously letting each child decide
-    /// for itself, and both of which cost a measured defect:
-    ///
-    /// * THE GIT STAMP. `crates/aterm-gui/build.rs` derives the commit and the
-    ///   dev counter from git, and therefore `rerun-if-changed`s the files those
-    ///   answers come from. Those files live in the COMMON git dir, which for a
-    ///   linked worktree is the MAIN checkout's `.git` — 29 worktrees share one
-    ///   here. A `fetch`, `gc` or `pack-refs` in any of them invalidated this
-    ///   crate's compile in all of them, mid-gate (`packed-refs` mtime landed
-    ///   between two builds of one run, 2026-09-20). Resolved here and passed
-    ///   down, the build script asks git nothing and watches nothing, and the
-    ///   run's builds become reproducible as a side effect.
-    /// * TEST CONCURRENCY. The gate set `RUST_TEST_THREADS` nowhere, so it
-    ///   inherited whatever the invoking shell had. A wrapper capping it at 4
-    ///   changed what the merge contract measured without saying so, and cost
-    ///   2.17x per test on CPU-bound binaries (aterm-effects: 33.18 s uncapped,
-    ///   78.38 s capped). A contract that measures a different thing depending
-    ///   on who typed the command is not a contract. `test_threads`
-    ///   (`--test-threads`) overrides, and whatever is used is recorded.
-    /// * THE TOOLCHAIN (2026-09-24). The run resolves ONE physical stage2
-    ///   directory ([`Toolchain`]) and prepends it to every child's PATH, but
-    ///   the xtask verbs it drives — the Formatting stage's `gate lint
-    ///   --fmt-only`, `gate forge`, `gate cells-foreign` — call `Toolchain::discover`
-    ///   AGAIN in the child, and discovery ranks the rustup entry and the
-    ///   store's MOVING `current` ahead of PATH. So an atpkg update landing
-    ///   mid-run (runs of 33 min to 14 h are on record) formatted with the new
-    ///   build's trustfmt while the pinned stages built, tested and tippied with
-    ///   the old — and the tripwire, which stamps only the pinned directory's
-    ///   files, could not see it. On a machine whose rustup link named another
-    ///   tree the two disagreed on every run. `$TRUST_STAGE2_BIN` is every
-    ///   discovery's explicit, never-fallen-back-from override, so handing the
-    ///   children the resolved directory under that name makes each of them
-    ///   answer with this run's compiler. Only when a `targo` was really found:
-    ///   exporting a refused or absent directory would turn a child's own
-    ///   diagnosis into "TRUST_STAGE2_BIN names no toolchain".
+    /// * The git stamp ([`GIT_STAMP_ENV`]), all three facts or none. Otherwise
+    ///   `crates/aterm/build.rs` asks git and `rerun-if-changed`s files in the
+    ///   common git dir, which any worktree's `fetch` or `gc` touches mid-run.
+    /// * Test concurrency: `RUST_TEST_THREADS` is `test_threads`
+    ///   (`--test-threads`) or the machine's parallelism, never the caller's
+    ///   shell's value. Named in the notes.
+    /// * The toolchain: `$TRUST_STAGE2_BIN` is the resolved stage2 directory, so
+    ///   the xtask verbs that run their own `Toolchain::discover` (`gate lint
+    ///   --fmt-only`, `gate forge`, `gate cells-foreign`) use this run's compiler
+    ///   rather than a rustup link or the store's moving `current`. Set only when
+    ///   a `targo` was found there.
     #[must_use]
     pub fn with_pinned_child_facts(mut self, test_threads: Option<std::num::NonZeroU32>) -> Self {
         // Not said as a note: the toolchain header already names the directory.
@@ -631,8 +599,8 @@ impl Ctx {
         let dev_commits = git(&["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
             .and_then(|tag| git(&["rev-list", &format!("{tag}..HEAD"), "--count"]))
             .filter(|c| !c.is_empty());
-        // ALL OR NONE. The build script pins only when it has every fact, so half
-        // a pin would leave the watch armed while looking pinned.
+        // All or none: the build script pins only with every fact, so half a pin
+        // would leave its watch armed while looking pinned.
         if let (Some(commit), Some(full_commit), Some(dev)) = (commit, full_commit, dev_commits) {
             let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
             let stamp = if dirty {
@@ -672,6 +640,7 @@ impl Ctx {
         self
     }
 
+    /// Extra `verify: …` header lines.
     #[must_use]
     pub fn with_notes(mut self, notes: impl IntoIterator<Item = String>) -> Self {
         self.notes.extend(notes);
@@ -685,10 +654,114 @@ impl Ctx {
         self
     }
 
-    /// `--skip-gui-smoke`: the GUI smoke answers a named SKIP.
+    /// `--no-windows`: every stage that puts a window on the desktop
+    /// ([`plan::WINDOWED`]) answers a named SKIP.
     #[must_use]
-    pub fn with_gui_smoke_skipped(mut self, skip: bool) -> Self {
-        self.skip_gui_smoke = skip;
+    pub fn with_no_windows(mut self, no_windows: bool) -> Self {
+        self.no_windows = no_windows;
+        self
+    }
+
+    /// `--compile-qos`: the tier of every [`exec::Cmd::demoted`] child. A run
+    /// that keeps them at the inherited tier says so on its header, so a
+    /// ladder read later shows its compiles did not yield to the desktop.
+    #[must_use]
+    pub fn with_compile_qos(mut self, qos: exec::CompileQos) -> Self {
+        self.compile_qos = qos;
+        if qos == exec::CompileQos::Inherited {
+            self.notes.push(
+                "verify: compile children at the inherited QoS (--compile-qos inherited: a \
+                 release's MEASURE run, whose compile must not yield to peers' builds)"
+                    .to_string(),
+            );
+        }
+        self
+    }
+
+    /// The host's physical memory, in bytes ([`Ctx::host_memory`]).
+    #[must_use]
+    pub fn with_host_memory(mut self, bytes: Option<u64>) -> Self {
+        self.host_memory = bytes;
+        self
+    }
+
+    /// The memory the host can give builds, in bytes ([`Ctx::host_usable`]).
+    #[must_use]
+    pub fn with_host_usable(mut self, bytes: Option<u64>) -> Self {
+        self.host_usable = bytes;
+        self
+    }
+
+    /// On a host whose wired memory is past the allowance ([`plan::build_memory`]
+    /// below the physical RAM), in every mode, cap each build's compiler jobs at
+    /// one per [`plan::WORKSPACE_BUILD_BYTES`] of usable memory, at least one
+    /// ([`memory_jobs_held`]): as every side lane's ceiling ([`Ctx::memory_jobs`],
+    /// [`Ctx::build_jobs_ceiling`]), and by `CARGO_BUILD_JOBS` in every child's
+    /// environment for the lanes that inherit it when that is fewer than they
+    /// would otherwise run ([`memory_job_cap`]). Measured 2026-10-06: with
+    /// 4.5 GiB usable, the serialised test compile alone still ran six compilers
+    /// at once and swapped (every large crate in state U, 4.6 of 5 GiB of swap),
+    /// so serialising the builds is not enough without it. A host with room
+    /// keeps cargo's own job count, and a caller's smaller `CARGO_BUILD_JOBS`
+    /// stands. Call after the memory figures are set.
+    #[must_use]
+    pub fn with_memory_build_jobs(self) -> Self {
+        let cores = self.cores();
+        self.with_memory_build_jobs_on(cores)
+    }
+
+    /// [`Ctx::with_memory_build_jobs`] on a host with `cores` cores.
+    fn with_memory_build_jobs_on(mut self, cores: u32) -> Self {
+        // EVERY MODE, NOT ONLY THE LAND TIER (2026-10-06): a `--measure` run has
+        // no land-tier build to serialise, but its release build still ran
+        // cargo's six compilers on 4.4 GiB. The trigger is the degraded host
+        // itself — wired memory past the allowance, the figure every other
+        // memory decision reads ([`plan::build_memory`]) — not one plan's shape.
+        // The side lanes name their own `CARGO_BUILD_JOBS`, which beats
+        // `child_env_add` ([`exec::ExecEnv::add_env`]), so the cap reaches them
+        // through `memory_jobs` and [`Ctx::build_jobs_ceiling`] — recorded on
+        // EVERY degraded host (review of 2026-10-07): their constants (driver 8,
+        // release 6) exceed a small host's cores, so a 2-core host with 4.5 GiB
+        // usable, which needs no export, still ran 8 driver compilers.
+        let held = memory_jobs_held(self.host_memory, self.host_usable);
+        self.memory_jobs = held;
+        let caller = parse_build_jobs(self.env.cargo_build_jobs.as_deref());
+        if let Some(jobs) = memory_job_cap(self.host_memory, self.host_usable, cores, caller) {
+            self.notes.push(format!(
+                "builds: at most {jobs} compiler(s) at once (memory)"
+            ));
+            self.child_env_add
+                .push(("CARGO_BUILD_JOBS".into(), jobs.to_string().into()));
+        } else if let Some(held) = held {
+            // Said only where the figure lowers a side lane: below the widest
+            // lane's own count and below the caller's export, which already
+            // caps every lane ([`Ctx::build_jobs_ceiling`]). A host whose memory
+            // holds more than any lane runs says nothing, as the other memory
+            // notes say only what they change.
+            let widest = [
+                plan::Lane::DriverTarget,
+                plan::Lane::ConformanceRelease,
+                plan::Lane::XtaskTarget,
+                plan::Lane::TrustTarget,
+            ]
+            .into_iter()
+            .filter_map(stages::lane_build_jobs)
+            .max()
+            .unwrap_or(0);
+            if held < widest && caller.is_none_or(|caller| held < caller) {
+                self.notes.push(format!(
+                    "builds: at most {held} compiler(s) at once (memory)"
+                ));
+            }
+        }
+        self
+    }
+
+    /// Whether [`Ctx::host_memory`] is Linux's `MemTotal`
+    /// ([`Ctx::host_memtotal`]).
+    #[must_use]
+    pub fn with_host_memtotal(mut self, memtotal: bool) -> Self {
+        self.host_memtotal = memtotal;
         self
     }
 
@@ -718,6 +791,44 @@ impl Ctx {
         self
     }
 
+    /// Move the smokes' pacing ([`Ctx::smoke_pacing`]). Nothing but the gate's
+    /// fixture tests calls this: a real run always paces as measured.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_smoke_pacing(mut self, pacing: smoke_stages::Pacing) -> Self {
+        self.smoke_pacing = pacing;
+        self
+    }
+
+    /// Run only `stages` ([`Ctx::only_stages`]); every other planned stage is
+    /// one named SKIP row that spawns nothing, so the run still ends on the one
+    /// verdict, receipt and tripwire path a real run takes, over a ladder as
+    /// short as the law under test needs.
+    ///
+    /// WHY IT CANNOT BUY A CLAIM. The merge-contract sentence needs a ladder
+    /// with nothing skipped ([`verdict::claims`]), and a filtered-out stage IS a
+    /// skip — so a run that left any stage out can neither print the sentence
+    /// nor file `merge-contract yes`, whichever stages it kept. Naming every
+    /// planned stage is the unfiltered run.
+    ///
+    /// WHAT IT STILL FILES. Only the claim is gated: the run's receipt is
+    /// written as any whole-tree run's, `merge-contract no` with its skips
+    /// listed, so it is strength 1 ([`receipt::strength`]) and
+    /// [`differential::usable`] takes it as a base, which is what the
+    /// base-layer fixture tests read (`--baseline` publishes it as main's
+    /// reds). That is why only a fixture may call this: nothing in `main.rs`
+    /// or `cli.rs` does, and a real run through it would file a base that
+    /// lists only the stages it kept. The callers are the gate's fixture
+    /// tests, which gate the tripwire, receipt and base layers, whose laws are
+    /// decided around the ladder and not by any one stage of it (measured
+    /// 2026-10-02 at load 17: a scoped fixture ladder took 6 s, of which its
+    /// two test stages were 0.3 s).
+    #[must_use]
+    pub fn with_only_stages(mut self, stages: &[plan::StageId]) -> Self {
+        self.only_stages = Some(stages.to_vec());
+        self
+    }
+
     /// Budget the disk preflight with other numbers ([`Ctx::disk_budget`]).
     #[must_use]
     pub fn with_disk_budget(mut self, budget: disk::Budget) -> Self {
@@ -733,11 +844,9 @@ impl Ctx {
         self
     }
 
-    /// The command environment: cwd is the repo root (the script `cd`s there and
-    /// several stages pass root-relative paths), PATH is the computed one, and
-    /// every child gets the wall-clock ceiling — a hung stage has to be able to
-    /// end the run RED, because a gate that hangs has decided nothing and says
-    /// nothing.
+    /// The command environment: cwd is the repo root (stages pass root-relative
+    /// paths), PATH is the computed one, and every child gets the wall-clock
+    /// ceiling so a hung stage ends the run red.
     #[must_use]
     pub fn exec_env(&self) -> exec::ExecEnv<'_> {
         exec::ExecEnv {
@@ -747,6 +856,7 @@ impl Ctx {
             child_ceiling: self.child_ceiling,
             remove_env: &self.child_env_remove,
             add_env: &self.child_env_add,
+            compile_qos: self.compile_qos,
         }
     }
 
@@ -757,14 +867,9 @@ impl Ctx {
     }
 }
 
-/// The one line that names the compiler every stage below runs.
-///
-/// Pure over the two facts that decide it, so the sentence is a test and not a
-/// promise: the directory the toolchain walk settled on, and whether a `targo`
-/// was actually found in it. A RELATIVE path is called out rather than printed
-/// as if it were an answer — a gate that cannot say where its compiler is has
-/// not pinned one, and the whole point of the line is that a reader never has
-/// to take the pin on trust again.
+/// The line naming the compiler every stage runs, from the directory the
+/// toolchain walk settled on and whether a `targo` was found there. A relative
+/// path is called out rather than printed as an answer.
 #[must_use]
 pub fn toolchain_header_line(
     stage2_dir: &std::path::Path,
@@ -792,10 +897,8 @@ pub fn toolchain_header_line(
     )
 }
 
-/// The line under the header that says why the rustup `trust` toolchain a reader expects
-/// is not the one named above it ([`toolchain::Demoted`]): the walk ranked it below the
-/// atpkg store for being older. Without it the header names the store and a reader who
-/// knows `~/.rustup/toolchains/trust` resolves elsewhere has to re-derive the rule.
+/// The line under the header explaining why the rustup `trust` toolchain is not
+/// the one named ([`toolchain::Demoted`]): it is older than the atpkg store's.
 #[must_use]
 pub fn toolchain_demoted_line(demoted: &toolchain::Demoted) -> String {
     format!("verify: toolchain note — {}\n", demoted.sentence())
@@ -818,52 +921,25 @@ pub fn toolchain_header(ctx: &Ctx) -> String {
 
 /// Run the whole gate: ladder and verdict. Returns the process exit code.
 ///
-/// `out` receives, in this order: the [`toolchain_header`] line, any lease line,
-/// the prelude rungs, the `verify: NARROWED …` line ([`narrowing_note`]) for a
-/// `--changed` or `--scope` run, the `verify: source …` line (a git root only),
-/// the `verify: checkers …` line ([`checkers`]) and any `verify:` notes (the
-/// snapshot's lanes, the pinned child facts), the `verify: base …` line (what
-/// the run is judged against, [`differential`]; a git root only), `verify:
-/// build dirs over the cap: …` lines naming any the cap could not remove, the
-/// `verify: disk …` line (the free space on the volume holding the run's root,
-/// what its lanes hold, and what this run needs — with the terms of the sum,
-/// or as the `--disk-floor` in force), the ladder in declared order with a
-/// `  time  ` line under each stage (with the machine's load at its two ends
-/// when it could be read) — or, in its place, a `source identity` COULD NOT
-/// RUN row for a git checkout the gate cannot read, a `baseline preflight`
-/// COULD NOT RUN row for a `--baseline` that cannot be one, or a `disk
-/// preflight` COULD NOT RUN row for a volume with less free than that
-/// ([`disk`]) — the `source identity` row when the toolchain, a spec checker
-/// or the source tree moved mid-run, the `verify: MEASURE tier — …` line of a
-/// run of the MEASURE tier, the verdict (or the gate-defect `FAIL` and
-/// `VERIFY: COULD NOT RUN` lines), and after it the `verify: baseline …` line
-/// of a `--baseline` run (its receipt is filed only once the verdict is out)
-/// — byte-for-byte in the vocabulary `tools/verify.sh` established. Live
-/// progress goes to stderr so a long stage is not silent
-/// without polluting the scannable part, and every stage's [`finish_line`] —
-/// its outcome word included — goes to [`Ctx::progress_log`] the moment the
-/// stage ends, in the order stages FINISH rather than the order they print.
+/// `out` receives, in order: the [`toolchain_header`], any lease line, the
+/// prelude rungs, a narrowed run's [`narrowing_note`], the `verify:` header
+/// lines (source, [`checkers`], notes, the [`differential`] base, build dirs over
+/// the cap, disk), then the ladder in declared order with a `  time  ` line under
+/// each stage — or, in its place, a COULD NOT RUN row for an unreadable source,
+/// a refused `--baseline` or a failed [`disk`] preflight. After the ladder: a
+/// `source identity` row if anything moved mid-run, the MEASURE-tier line, the
+/// verdict (or the gate-defect `FAIL` and `VERIFY: COULD NOT RUN` lines), and a
+/// `--baseline` run's publish line. Live progress goes to stderr; every stage's
+/// [`finish_line`] goes to [`Ctx::progress_log`] in the order stages finish.
 ///
 /// # Errors
 /// Propagates write failures on `out`.
 pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
-    // WHICH COMPILER DECIDED THIS, named before anything is decided.
-    //
-    // MEASURED 2026-09-10, and it cost an 80-minute gate: a run was killed on
-    // the hypothesis that `verify.sh` resolved its toolchain through a mutable
-    // rustup symlink and that a peer's re-seal had split the gate across two
-    // compilers. It does not — the shim resolves a PHYSICAL path once (`cd
-    // "$cand_dir" && pwd -P`) and prepends it for the whole run — but nothing
-    // the gate printed said so, so two readers believed it and neither could
-    // check in less than a code read. One line ends that question forever.
+    // Name the compiler before anything is decided.
     out.write_all(toolchain_header(ctx).as_bytes())?;
-    // THE RUN'S LEASE on that compiler ([`lease`], 2026-09-26), held until this
-    // function returns — the whole ladder. Between two stages no process runs from
-    // the pinned directory, so without it atpkg could not tell the run was using it:
-    // its gc reclaimed a superseded build a long run still needed (COULD NOT RUN),
-    // and an unattended trust update re-laid the rustup view between two stages.
-    // Said in one line when held or refused (nothing for a toolchain atpkg does not
-    // manage); a lease that cannot be taken never stops the run.
+    // Lease the compiler ([`lease`]) for the whole ladder, so atpkg's gc and
+    // updates leave the pinned build alone between stages. Said in one line when
+    // held or refused; a lease that cannot be taken never stops the run.
     let _lease = if ctx.tools.have_targo() {
         let prefix = toolchain::atpkg_prefix(&ctx.env.home, ctx.env.xdg_config_home.as_deref());
         let who = format!(
@@ -882,14 +958,12 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     } else {
         None
     };
-    // The change-scope stage first: it is what CHOSE the scope every header
+    // The change-scope stage first: it is what chose the scope every header
     // below prints, so a reader meets the narrowing before its consequences.
     for r in &ctx.prelude {
         out.write_all(r.render().as_bytes())?;
     }
-    // A NARROWED RUN SAYS SO BEFORE IT SPENDS AN HOUR (2026-09-26): until then
-    // the only word that a `--changed` or `--scope` run cannot discharge the
-    // merge contract was its verdict, printed after the whole ladder.
+    // A narrowed run says so before it spends an hour, not only in its verdict.
     if let Some(note) = narrowing_note(&ctx.scope) {
         writeln!(out, "{note}")?;
     }
@@ -900,7 +974,7 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     // The toolchain half carries the spec checkers the tests will run
     // (2026-09-26, [`checkers`]): resolved once, here, named on the ladder
     // and in the receipt, and re-resolved with the compiler before every stage.
-    let mut toolchain = ctx.tools.identity(&ctx.path_env, &ctx.scratch);
+    let mut toolchain = identity::ToolchainIdentity::of(&ctx.tools, &ctx.path_env, &ctx.scratch);
     toolchain.checkers = Some(checkers::Checkers::capture(&ctx.env.home, &ctx.path_env));
     let tripwire = identity::Tripwire::arm_against(
         &ctx.root,
@@ -919,10 +993,25 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     for note in &ctx.notes {
         writeln!(out, "{note}")?;
     }
+    // On a host too small for both tiers' builds at once, say before an hour
+    // is spent that the MEASURE tier waits ([`plan::measure_overlap`]); on one
+    // with no room beside the land tier's builds, that the trust lane waits
+    // ([`plan::trust_overlap`]); and how wide the test pool is
+    // ([`plan::test_pool_note`]); on one whose wired memory leaves too little
+    // for the land tier's builds at once, that they build one at a time
+    // ([`plan::land_builds`]). The RAM is stated once, before them.
+    let stages = plan::plan(ctx);
+    for line in plan::memory_notes(
+        ctx.host_memory,
+        ctx.host_usable,
+        ctx.host_memtotal,
+        &stages,
+        ctx.test_jobs(),
+    ) {
+        writeln!(out, "{line}")?;
+    }
 
-    // A GIT CHECKOUT THE GATE CANNOT READ is not a root without a source
-    // (2026-09-13): with no identity there is no tripwire, and a run on it
-    // could go green on a tree nothing watched. No stage runs.
+    // A git checkout the gate cannot read has no tripwire, so no stage runs.
     if let identity::SourceIdentity::Unreadable(why) = &tripwire.source {
         let mut r = Report::new("source identity");
         r.cannot_run(identity::unreadable_label(why));
@@ -935,11 +1024,10 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         return Ok(verdict.exit);
     }
 
-    // WHAT THIS RUN IS JUDGED AGAINST, settled before anything is spent
-    // (2026-09-26, [`differential`]): main's receipt for the run's base, or
-    // the absolute rule and why. A `--baseline` that cannot be one — a dirty
-    // tree, a HEAD that is not main's — is refused here, before an hour of
-    // stages, and leaves no receipt: it would record reds that are not main's.
+    // Settle what this run is judged against ([`differential`]) before spending
+    // anything: main's receipt for the base, or the absolute rule. A `--baseline`
+    // that cannot be one (dirty tree, HEAD not main's) is refused here and leaves
+    // no receipt.
     let caller = ctx.caller_root();
     let head = match &tripwire.source {
         identity::SourceIdentity::Git(tree) => Some(tree),
@@ -964,25 +1052,15 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
             return Ok(verdict.exit);
         }
     }
-    // A base serves only a run made by the tools it was made by (2026-09-27,
-    // third review): this run's, as its receipt will name them.
+    // A base serves only a run made by the same tools: this run's, as its
+    // receipt will name them.
     let tools = run_tools(ctx, &tripwire);
     // A `--measure` run is judged by the absolute rule: the MEASURE tier is
     // not part of the merge contract, and a release cut takes its receipt only
     // when nothing in it was red — so no red of it is ever inherited.
     let base_plan = head.map(|tree| {
         if ctx.mode.runs(plan::Tier::Land) {
-            differential::resolve_with(
-                &caller,
-                &tree.head,
-                ctx.baseline,
-                &tools,
-                if ctx.nearest_base {
-                    differential::BaseMode::Nearest
-                } else {
-                    differential::BaseMode::Exact
-                },
-            )
+            differential::resolve(&caller, &tree.head, ctx.baseline, &tools)
         } else {
             differential::Plan::Absolute {
                 why: MEASURE_IS_ABSOLUTE.to_string(),
@@ -994,15 +1072,9 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         out.write_all(plan.header_line(ctx.baseline, &tree.head).as_bytes())?;
     }
 
-    // THE DISK, before anything is built (2026-09-21). Two contract runs died
-    // mid-ladder on a full volume and printed FAIL rows about it; this run
-    // budgets what it will write (2026-09-23: from what its lanes already
-    // hold, where it used to demand a flat 40 GiB of every run) and refuses —
-    // COULD NOT RUN, never a skip — when the volume has less free, printing
-    // the arithmetic and the regenerable dirs. Lanes over the cap are removed
-    // first, so the reading after it counts their bytes as free. A refusal
-    // leaves no receipt: nothing was decided, so the last real judgement of
-    // the commit stands.
+    // Disk preflight ([`disk`]): budget what this run will write from what its
+    // lanes hold, remove lanes over the cap first, and refuse (COULD NOT RUN, no
+    // receipt) when the volume has less free, printing the arithmetic.
     let lanes = disk::measure_lanes(&ctx.root);
     let mut plan = disk::plan(
         ctx.disk_budget,
@@ -1045,35 +1117,26 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         return Ok(verdict.exit);
     }
 
-    let plan = plan::plan(ctx);
     let mut reports: Vec<Report> = ctx.prelude.clone();
-    reports.reserve(plan.len());
+    reports.reserve(stages.len());
     let mut err = None;
 
-    // Per-stage (start offset, running time), for the `  time  ` line under
-    // each stage. STDOUT, not only a terminal's stderr (2026-09-13): 430 of a
-    // 14 h run's minutes sat inside one stage, and the captured log could not
-    // say which — the progress lines that could have were never written to a
-    // file. The line decides nothing; `decisions` readers skip it.
+    // Per-stage (start offset, running time) for the `  time  ` line, on stdout
+    // so the captured log shows where the time went. `decisions` readers skip it.
     let t0 = Instant::now();
     type Clock = (Duration, Duration, Option<ladder::StageLoad>);
-    let clocks: Mutex<Vec<Option<Clock>>> = Mutex::new(vec![None; plan.len()]);
-    // THE MACHINE'S LOAD AT EACH STAGE'S START AND END (2026-09-26), on the
-    // stage's `time` line, in the receipt and under the verdict's timing
-    // label ([`ladder::StageLoad`]) — until then only the opt-in `--timings`
-    // TSV (retired 2026-09-27) knew whether a red came from a busy machine.
+    let clocks: Mutex<Vec<Option<Clock>>> = Mutex::new(vec![None; stages.len()]);
+    // The one-minute load at each stage's start and end ([`ladder::StageLoad`]),
+    // on its `time` line, in the receipt and under the verdict's timing label.
     let cores = ctx.cores();
 
-    // Stages run concurrently, so a long one would otherwise be silent until its
-    // turn to print arrives. The START line is stderr-only and terminal-only.
-    // The FINISH line carries the stage's outcome word and goes to the run's
-    // log the moment the stage finishes (2026-09-23): the ladder prints in
-    // declared order, so a formatting FAIL decided in minute one stayed unread
-    // behind an hour-long test stage. stdout stays the clean, ordered ladder;
-    // the outcome word is the ladder's own vocabulary (`outcome_word`).
+    // Stages run concurrently, so a waiting stage would otherwise be silent. The
+    // START line is stderr- and terminal-only; the FINISH line carries the outcome
+    // word (`outcome_word`) and goes to the run's log as the stage finishes.
+    // stdout stays the ordered ladder.
     let progress = std::io::stderr().is_terminal();
     let done = sched::run_stages(
-        &plan,
+        &stages,
         |spec| {
             let started = Instant::now();
             let begun = t0.elapsed();
@@ -1085,19 +1148,36 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
             // tree or a compiler other than the one this run named. Its row
             // names the stage; why is said once, by the `source identity` row
             // the trip (it latches) adds after the ladder.
-            let report = if spec.lane != plan::Lane::Pure
+            let left_out = ctx
+                .only_stages
+                .as_ref()
+                .is_some_and(|only| !only.contains(&spec.id));
+            let report = if left_out {
+                // A fixture ladder's left-out stage: no child, no tripwire read.
+                // It is a SKIP row, which is what keeps the run from claiming
+                // the contract ([`Ctx::with_only_stages`]).
+                let mut r = Report::new(spec.title.clone());
+                r.skip(format!(
+                    "{} (not in this fixture ladder's stages)",
+                    spec.title
+                ));
+                r
+            } else if spec.lane != plan::Lane::Pure
                 && tripwire.check(identity::CHECK_CACHE).is_some()
             {
                 let mut r = Report::new(spec.title.clone());
                 r.cannot_run(format!(
-                    "not run: the tree or the toolchain moved before `{}` started",
+                    "the tree or the toolchain moved before `{}` started",
                     spec.title
                 ));
                 r
             } else {
                 stages::run_stage(ctx, spec)
             };
-            tripwire.stage_finished();
+            // A left-out stage did nothing a cached check could have missed.
+            if !left_out {
+                tripwire.stage_finished();
+            }
             let ran = started.elapsed();
             let load_end = exec::load_average();
             let mut report = report;
@@ -1111,7 +1191,7 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
                 // the line, not the run.
                 let _ = log.write_all(finished.as_bytes());
             }
-            if let Some(i) = plan.iter().position(|s| std::ptr::eq(s, spec))
+            if let Some(i) = stages.iter().position(|s| std::ptr::eq(s, spec))
                 && let Ok(mut c) = clocks.lock()
             {
                 c[i] = Some((begun, ran, report.load));
@@ -1119,9 +1199,7 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
             report
         },
         |i, report| {
-            // Flush per stage: the ladder is a live record, and a developer
-            // watching a ten-minute run must see each rung as it is decided —
-            // the script wrote unbuffered, and a buffered port would look hung.
+            // Flush per stage so a watcher sees each rung as it is decided.
             let clock = clocks.lock().ok().and_then(|c| c.get(i).copied().flatten());
             let mut text = report.render();
             if let Some((begun, ran, load)) = clock {
@@ -1149,29 +1227,18 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         out.write_all(r.render().as_bytes())?;
         reports.push(r);
     }
-    // DID THIS RUN MEASURE THE TREE (2026-09-26) — asked of the MEASURE
-    // tier's own stages, never of the run's verdict: a `--full` run whose
-    // Kani floor skipped still measured, and one whose paint row went red did
-    // not, whatever main's receipt excuses.
-    let stage_reports = &reports[ctx.prelude.len()..ctx.prelude.len() + plan.len()];
+    // Did this run measure the tree: asked of the MEASURE tier's own stages, not
+    // the verdict (a skipped Kani floor still measured; a red paint row did not,
+    // whatever main's receipt excuses).
+    let stage_reports = &reports[ctx.prelude.len()..ctx.prelude.len() + stages.len()];
     let measured = ctx
         .mode
         .runs(plan::Tier::Measure)
-        .then(|| verdict::measured(&plan, stage_reports, &ctx.scope, moved.is_some()));
+        .then(|| verdict::measured(&stages, stage_reports, &ctx.scope, moved.is_some()));
 
-    // A PLANNED STAGE THAT DECIDED NOTHING IS INVISIBLE TO THE VERDICT.
-    //
-    // `tally` counts outcomes, not stages, so a stage whose every branch fell
-    // through without recording one contributes no ok, no skip and no FAIL — and a
-    // whole-tree run missing it would still print the merge-contract sentence. No
-    // stage does that today (every terminating path in stages.rs and
-    // smoke_stages.rs records an entry), which is exactly why this is worth
-    // pinning: the invariant is currently true and nothing was holding it. A new
-    // stage with one unhandled branch is the realistic way it breaks, and the
-    // failure would be silent in the one direction that matters.
-    //
-    // Fail CLOSED and loudly: this is a defect in the gate, not a finding about
-    // the tree, so it exits COULD-NOT-RUN rather than FAIL.
+    // A planned stage that recorded no outcome is invisible to `tally`, so a
+    // whole-tree run missing it could still print the merge-contract sentence.
+    // That is a gate defect, not a finding: exit COULD-NOT-RUN.
     if let Some(silent) = reports.iter().find(|r| r.outcomes().next().is_none()) {
         writeln!(
             out,
@@ -1207,13 +1274,9 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
             .filter_map(|r| r.load.map(|l| (l, r.title.clone())))
             .collect(),
     };
-    // THE VERDICT IS DELIVERED BEFORE IT IS RECORDED (2026-09-27, third
-    // review). The receipt was filed first, so a ladder whose verdict could
-    // not be written — its reader gone — exited COULD NOT RUN while the store
-    // said `merge-contract yes` for the tree, which the release cutter counts
-    // as gated: the exit code and the record disagreed. Now a verdict that
-    // cannot be written leaves no receipt, as every other unwritable ladder
-    // line does; and once it is out, nothing after it changes the exit code.
+    // The verdict is written before the receipt is filed: a verdict that cannot
+    // be written leaves no receipt, and once it is out nothing after it changes
+    // the exit code.
     if let Some(m) = &measured {
         out.write_all(verdict::measured_line(m).as_bytes())?;
     }
@@ -1230,13 +1293,12 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     Ok(verdict.exit)
 }
 
-/// The compiler, the spec checkers and the build environment this run used,
-/// as its receipt names them: `<stage2 bin dir> trustc <commit-hash>`
-/// (`unknown` when trustc named none), the checkers' summary, the compile
-/// and test-run configuration every child inherits from this process
-/// ([`differential::build_env`]) and the cargo config files its children
-/// read in the run's root ([`build_config::of_this_process`], 2026-09-28) —
-/// what a base must have been made by ([`differential::tools_differ`]).
+/// The compiler, spec checkers and build environment this run used, as its
+/// receipt names them: `<stage2 bin dir> trustc <commit-hash>` (`unknown` when
+/// trustc named none), the checkers' summary, the inherited build and test-run
+/// configuration ([`differential::build_env`]) and the cargo config files its
+/// children read ([`build_config::of_this_process`]) — what a base must match
+/// ([`differential::tools_differ`]).
 fn run_tools(ctx: &Ctx, tripwire: &identity::Tripwire) -> differential::Tools {
     differential::Tools {
         toolchain: format!(
@@ -1309,47 +1371,25 @@ fn publish_line(caller: &Path, head: &str, text: &str, ctx: &Ctx) -> String {
     }
 }
 
-/// Record what this run decided about this commit and its tree, where the
-/// release cutter's receipt report (`crates/aterm-release/src/gates.rs`
-/// `receipt_report`) reads it ([`receipt`]): filed under the commit and under
-/// `<commit>^{tree}`, naming the scope (`changed:<base>` for a change-scoped
-/// run), the compiler and the spec checkers the run used. A run of the MEASURE
-/// tier also says whether it measured the tree (`measured yes|no`) and files
-/// under the measure keys the cutter's MEASURE requirement reads
-/// (`gates::measure_report`); a `--measure` run files there only.
+/// Record what this run decided about this commit and its tree ([`receipt`]),
+/// where the release cutter reads it (`crates/aterm-release/src/gates.rs`
+/// `receipt_report`): filed under the commit and `<commit>^{tree}`, naming the
+/// scope (`changed:<base>` for a change-scoped run), the compiler and the spec
+/// checkers. A MEASURE-tier run also records `measured yes|no` under the measure
+/// keys (`gates::measure_report`); a `--measure` run files there only.
 ///
-/// AND WHAT FAILED (2026-09-26): every finding, itemized, with when main first
-/// went red on it (carried from `judged.since_from` while main stays red on
-/// it), the reds that chain held which this run could not see
-/// ([`differential::hidden_failures`]), the base the run was judged against
-/// and the findings it judged INHERITED — what a later run's differential
-/// verdict reads ([`differential`]). A run whose source or compiler moved
-/// under it lists no failures, so it can never serve as a base. Returns the
-/// receipt text now standing under the commit, which a `--baseline` run
-/// publishes.
+/// It itemizes every finding with when main first went red on it (from
+/// `judged.since_from`), the reds the since chain held that this run could not
+/// see ([`differential::hidden_failures`]), the base, and the findings judged
+/// inherited ([`differential`]). A run whose source or compiler moved lists no
+/// failures, so it never serves as a base. Returns the receipt text now under
+/// the commit, which a `--baseline` run publishes.
 ///
-/// Only a run with a SOURCE IDENTITY over a CLEAN tree leaves one: a root
-/// that is not a git checkout has no commit to key a receipt by, and a run
-/// over uncommitted work verified bytes no commit holds. A weaker receipt
-/// never replaces the commit's whole-tree one ([`receipt::write`]). Failures
-/// are announced on stderr and cost the commit its record — never this run its
-/// verdict.
-///
-/// WHAT A RECEIPT SAYS ABOUT A RUN THAT COULD NOT RUN (2026-09-21). A verdict
-/// of COULD NOT RUN is written as `verdict COULD-NOT-RUN`, `merge-contract no`
-/// — a reader counts it as no pass and names it, never mistaking it for a
-/// judgement.
-/// A run that never reached its verdict writes NOTHING: no snapshot, an
-/// unreadable source, a refused `--baseline`, a volume with less free than the
-/// run needs ([`disk`]), or a ladder that could not be written — its verdict
-/// included, which is written before this is called (2026-09-27, third
-/// review; `main` exits 3 on the write error) — so the last real judgement of
-/// the commit stands.
-/// What used to be wrong was upstream of here: a child that never spawned, or
-/// died of `No space left on device`, was a `FAIL` row of a finding's
-/// severity, so a run that limped to its verdict would have written `verdict
-/// FAIL` about a tree nobody judged. [`ladder::Report::fail_child`] now
-/// classifies those as COULD NOT RUN.
+/// Only a run with a source identity over a clean tree files one, and a weaker
+/// receipt never replaces the commit's whole-tree one ([`receipt::write`]).
+/// COULD NOT RUN is written as `verdict COULD-NOT-RUN`, `merge-contract no`. A
+/// run that never reached its verdict writes nothing, so the last real judgement
+/// stands. Failures are announced on stderr and never change the verdict.
 fn write_receipt(
     ctx: &Ctx,
     tripwire: &identity::Tripwire,
@@ -1371,13 +1411,12 @@ fn write_receipt(
     let caller = ctx.caller_root();
     let tools = judged.tools.clone();
     // What the verdict excused, by id: every finding judged INHERITED.
-    let (base, inherited, base_nearest) = match judged.against {
+    let (base, inherited) = match judged.against {
         differential::Against::Base(base) => (
             Some(base.commit.clone()),
             differential::inherited_ids(tally, base),
-            base.nearest.as_ref().map(|_| base.commit.clone()),
         ),
-        differential::Against::Absolute(_) => (None, Vec::new(), None),
+        differential::Against::Absolute(_) => (None, Vec::new()),
     };
     let r = receipt::Receipt {
         head: tree.head.clone(),
@@ -1392,36 +1431,21 @@ fn write_receipt(
         .to_string(),
         merge_contract: verdict.claims_merge_contract,
         measured: judged.measured,
-        skipped: if tally.skips.is_empty() {
-            "none".to_string()
-        } else {
-            let shown: Vec<&str> = tally.skips.iter().take(4).map(String::as_str).collect();
-            let more = tally.skips.len().saturating_sub(shown.len());
-            let mut s = shown.join(", ");
-            if more > 0 {
-                s.push_str(&format!(" and {more} more"));
-            }
-            // One line, always: a newline here would forge a second key.
-            s.replace('\n', " ")
-        },
+        skipped: receipt::skipped_line(&tally.skips),
         toolchain: tools.toolchain,
         checkers: tools.checkers,
         build_env: tools.build_env,
         build_config: tools.build_config,
-        // NO LIST FROM A RUN THAT MOVED (2026-09-27): its verdict is COULD NOT
-        // RUN, but a list would still serve as main's reds to judge a branch
-        // against ([`differential::usable`]), with findings from bytes or tools
-        // other than the commit's.
+        // No list from a run that moved: it would serve as main's reds
+        // ([`differential::usable`]) with findings from other bytes or tools.
         failures: (!judged.moved).then(|| {
             differential::recorded_failures(tally, judged.since_from, &tree.head, judged.now)
         }),
         base,
-        base_nearest,
         inherited,
         baseline: ctx.baseline,
-        // The reds its since chain held that this run could not itemize — a
-        // test log it could not account for hides every one of that stage's —
-        // so their clocks run on (2026-09-27, second review).
+        // Reds the since chain held that this run could not itemize (a test log
+        // it could not account for hides that stage's), so their clocks run on.
         hidden: if judged.moved {
             Vec::new()
         } else {
@@ -1455,11 +1479,9 @@ fn write_receipt(
     }
 }
 
-/// The line a NARROWED run prints at its start, before any stage: why it is
-/// narrower than the merge contract, and that even a green verdict will not
-/// discharge it. `None` for the whole-tree run. The verdict still says the
-/// same at the end; this is so a reader does not learn it an hour late. It
-/// says nothing of the receipt: a run over uncommitted work writes none.
+/// The line a narrowed run prints before any stage: why it is narrower than the
+/// merge contract, and that even a green verdict will not discharge it. `None`
+/// for the whole-tree run.
 #[must_use]
 pub fn narrowing_note(scope: &Scope) -> Option<String> {
     let why = scope.narrowing()?;
@@ -1468,13 +1490,11 @@ pub fn narrowing_note(scope: &Scope) -> Option<String> {
     ))
 }
 
-/// The `  time  ` line under a stage: how long it ran, and when it started
-/// relative to the ladder — that offset is time spent waiting to start: for its
-/// lane, an earlier exclusive stage, or the lanes it is ordered after; an
-/// EXCLUSIVE stage also waits for every earlier unfinished stage in any lane,
-/// `Pure` included, and until nothing else is running — and, since
-/// 2026-09-26, the machine's one-minute load at the stage's start and end
-/// ([`ladder::StageLoad`]), when both could be read.
+/// The `  time  ` line under a stage: its running time, its start offset from
+/// the ladder (time spent waiting for its lane, an earlier exclusive stage or the
+/// lanes it is ordered after; an exclusive stage waits for everything earlier),
+/// and the one-minute load at its start and end when both were read
+/// ([`ladder::StageLoad`]).
 #[must_use]
 pub fn time_line(begun: Duration, ran: Duration, load: Option<ladder::StageLoad>) -> String {
     let load = load.map_or_else(String::new, |l| format!("; load {}", l.describe()));
@@ -1516,13 +1536,8 @@ pub fn outcome_word(report: &Report) -> &'static str {
 /// tripwire's remedy sentence points at it.
 pub const LOG_DIR: &str = "logs";
 
-/// Find the repo root by walking up from `start` until a directory holds both a
-/// `Cargo.toml` and `tools/verify.sh`.
-///
-/// The script derived the root from its own path; a compiled binary lives in
-/// `target/debug/`, which is not a stable anchor (`CARGO_TARGET_DIR` moves it),
-/// so the driver looks upward from where it was invoked instead. The shim passes
-/// `--root` explicitly, which skips this entirely.
+/// Find the repo root by walking up from `start` to a directory holding both
+/// `Cargo.toml` and `tools/verify.sh`. The shim passes `--root`, which skips this.
 #[must_use]
 pub fn locate_root(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);
@@ -1535,9 +1550,8 @@ pub fn locate_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// `mktemp -d` — the same tool the script used, for the same reason: it creates
-/// the private directory atomically, and `/tmp` keeps unix-socket paths well
-/// under macOS's 104-byte `sockaddr_un` ceiling however long `TMPDIR` is.
+/// `mktemp -d`: creates the private directory atomically, and `/tmp` keeps
+/// unix-socket paths under macOS's 104-byte `sockaddr_un` limit.
 ///
 /// # Errors
 /// Fails when `mktemp` is absent or refuses to create the directory.
@@ -1559,26 +1573,135 @@ pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-/// `[ -x <path> ]` for a file: exists, is not a directory, and carries an
-/// execute bit. Used for every "is the tool present" decision, so a
-/// non-executable script is the same event as a missing one — the script's rule.
+/// Put an executable `#!/bin/sh` stand-in running `body` at `path`, replacing
+/// whatever is there. A test helper, public only so the integration suites
+/// and this crate's own unit tests share one copy: the crate takes no
+/// dependencies, so it cannot borrow one from a tempfile crate.
+///
+/// ONE FILE PER TEXT (measured 2026-09-30, again 2026-10-02). The first-exec
+/// assessment is made one file at a time machine-wide, and it is per inode,
+/// not per content: 117 ms per new file at idle, so a fixture ladder's
+/// thirty-odd stand-ins spent 3.5 s of its 5 s alone, and the binary's
+/// fixtures, run fourteen at once, took 50 s each. On 2026-10-02 at load 60 on
+/// 14 cores thirty copies of one text ran in 4.3 to 47.9 s, thirty hard links
+/// of one new file in 0.54 to 0.60 s, and a fresh copy of a text already run
+/// still paid 0.15 to 1.7 s. So each distinct text is written once per process and linked
+/// into place, and the first fixture to run it pays for all of them. The
+/// shared file is read-only, so a stand-in written over in place fails loudly
+/// instead of rewriting every fixture's; replace one through here or by `mv`,
+/// which both swap the link. The tripwires' stamp (device, inode, length,
+/// mtime) never moves when a link is added. The shared files live in a `/tmp`
+/// directory of the process's own, which the system's `/tmp` sweep removes.
+///
+/// WRITE THE TEXT SO IT HOLDS NO PATH OF ITS OWN, or it is shared by no one:
+/// `$0` is the link that was run, so a name or a sibling file comes from it
+/// (`${0##*/}`, `${0%/*}/../log`) and a per-test value from the environment
+/// the test's command carries.
+///
+/// # Panics
+/// When `path`'s directory cannot be made or the stand-in cannot be written:
+/// a fixture without its stand-in decides nothing.
 #[cfg(unix)]
-#[must_use]
-pub fn is_executable_file(path: &Path) -> bool {
+#[doc(hidden)]
+pub fn standin(path: &Path, body: &str) {
+    use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    use std::sync::{OnceLock, PoisonError};
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static SHARED: Mutex<BTreeMap<String, PathBuf>> = Mutex::new(BTreeMap::new());
+
+    let text = format!("#!/bin/sh\n{body}\n");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+    let _ = std::fs::remove_file(path);
+    let shared = DIR
+        .get_or_init(|| mktemp_dir("atv-standins").ok())
+        .as_ref()
+        .and_then(|dir| {
+            let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(file) = shared.get(&text) {
+                return Some(file.clone());
+            }
+            let file = dir.join(shared.len().to_string());
+            std::fs::write(&file, &text).ok()?;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o555)).ok()?;
+            shared.insert(text.clone(), file.clone());
+            Some(file)
+        });
+    if shared.is_some_and(|file| std::fs::hard_link(file, path).is_ok()) {
+        return;
+    }
+    // No shared directory, or `path` is on another filesystem: a plain copy
+    // is slower to first exec and as correct.
+    std::fs::write(path, &text).expect("write");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
-/// Windows has no execute bit — a file is runnable by extension (`PATHEXT`), not by
-/// mode — so "exists and is not a directory" is the whole of the test there.
-#[cfg(not(unix))]
-#[must_use]
-pub fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|m| !m.is_dir())
-        .unwrap_or(false)
+/// [`standin`] for a text that cannot be shared: a body that is DATA, not text.
+/// Installs the one constant text `. "$0.body"` at `path` (so every stand-in
+/// made here, whatever it does, is one inode and one first-exec assessment per
+/// process) and writes `body` beside it as `<path>.body`, a plain file the
+/// stand-in SOURCES and never execs, so it is never assessed at all.
+///
+/// WHY. [`standin`] shares by text, and a fixture's text is rarely shared: it
+/// bakes in a path (`{root}`, `{exe}`) or a code (`exit 1` against `exit 2`),
+/// so each fixture was a fresh inode. Measured 2026-10-02 at load 75: twenty
+/// stand-ins of twenty distinct texts took 4.3-5.2 s to first-run (0.22 s
+/// each), twenty links of one text with a sourced body each, 0.44-0.48 s: one
+/// assessment (0.21 s) and 12-14 ms for each of the other nineteen.
+///
+/// WHAT CHANGES FOR THE BODY, against the same text run as the script
+/// (measured under macOS's `/bin/sh`, bash 3.2 in POSIX mode):
+/// - it is sourced into the stand-in's own shell: `$0` is still the link's
+///   path (never `<path>.body`), `$@`, `$#`, `$*` are the stand-in's arguments,
+///   and `exit N`, `exec` and `kill -KILL $$` act on the stand-in itself;
+/// - a `return` is legal and ends the stand-in with that status, where a script
+///   would report an error and carry on;
+/// - a syntax error names `<path>.body` and exits 1, where a script's exits 2;
+/// - the body has no shebang line of its own: it is `sh`'s, as in [`standin`];
+/// - `<path>.body` sits in `path`'s directory, so a test that lists the
+///   directory sees it, and the stand-in is run by a path (a stage's absolute
+///   one): `.` searches `PATH` for a `$0` with no slash, and where bash falls
+///   back to the working directory, dash answers `not found`.
+///
+/// WHAT IT IS NOT FOR. The stamp (device, inode, length, mtime) a tripwire
+/// reads never moves when a body is rewritten, which is the point and the
+/// limit: a stand-in whose changing identity a tripwire must see (a compiler
+/// rewritten mid-run) goes through [`standin`] with the text that moves it,
+/// and one the stage hard-links elsewhere (`ln -f "$0"`) carries no body with
+/// it. Rewrite a body through here: the data file is replaced by `rename`, so
+/// a stage that sources it as it is rewritten reads the old text or the new
+/// one, never a truncated file.
+///
+/// # Panics
+/// As [`standin`], and when the body cannot be written.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn standin_body(path: &Path, body: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+
+    let mut data = path.as_os_str().to_owned();
+    data.push(".body");
+    let data = PathBuf::from(data);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+    // Beside the data file, so the rename never crosses a filesystem; named by
+    // pid and a counter, so two writers of one path never share a temp file.
+    let mut tmp = data.as_os_str().to_owned();
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, format!("{body}\n")).expect("write the stand-in's body");
+    std::fs::rename(&tmp, &data).expect("rename the stand-in's body into place");
+    // The data is in place before the link is, so a stand-in is never run
+    // without its body.
+    standin(path, r#". "$0.body""#);
 }
 
 /// `command -v <name>` against the PATH the gate hands its children.
@@ -1591,8 +1714,175 @@ pub fn have_on_path(name: &str, path: &OsStr) -> bool {
 mod tests {
     use super::*;
 
-    /// THE TIME LINE CARRIES THE MACHINE'S LOAD (2026-09-26) when both ends
-    /// were read, and reads as it always did when they were not.
+    /// THE MEMORY CAP ONLY LOWERS (the review of 2026-10-07): it caps a host
+    /// whose wired memory is past the allowance, and never above the caller's
+    /// `CARGO_BUILD_JOBS` or, with none, the cores cargo would use. Until then a
+    /// 36 GiB, 14-core Mac with 4.2 GiB wired handed every main-lane child 15
+    /// in place of a caller's 4, and a 128 GiB host 61.
+    #[test]
+    fn the_memory_job_cap_only_ever_lowers_the_count() {
+        const GIB: u64 = disk::GIB;
+        let degraded = (Some(8 * GIB), Some(GIB * 9 / 2));
+        let cap = |(ram, usable): (Option<u64>, Option<u64>), cores, caller| {
+            memory_job_cap(ram, usable, cores, caller)
+        };
+        assert_eq!(cap(degraded, 8, None), Some(2), "4.5 GiB: two compilers");
+        assert_eq!(cap(degraded, 8, Some(4)), Some(2), "below the caller's 4");
+        assert_eq!(cap(degraded, 8, Some(2)), None, "the caller's 2 stands");
+        assert_eq!(cap(degraded, 8, Some(1)), None, "never above the caller");
+        assert_eq!(cap(degraded, 2, None), None, "never above the cores");
+        assert_eq!(
+            cap((Some(8 * GIB), Some(GIB)), 8, None),
+            Some(1),
+            "at least one"
+        );
+        assert_eq!(
+            cap((Some(8 * GIB), Some(7 * GIB)), 8, None),
+            None,
+            "a healthy host keeps its count"
+        );
+        assert_eq!(cap((None, Some(GIB)), 8, None), None, "unread RAM");
+        assert_eq!(cap((Some(8 * GIB), None), 8, None), None, "unread usable");
+        // Past the allowance yet roomy: usable memory holds more jobs than the
+        // count it would lower.
+        let mac36 = (Some(36 * GIB), Some(36 * GIB - GIB * 42 / 10));
+        assert_eq!(cap(mac36, 14, Some(4)), None, "36 GiB, caller 4");
+        assert_eq!(cap(mac36, 14, None), None, "36 GiB, 14 cores");
+        let gate128 = (Some(128 * GIB), Some(122 * GIB));
+        assert_eq!(cap(gate128, 18, None), None, "128 GiB, 18 cores");
+        // Whatever the host, a cap is at least one and below what the build
+        // would otherwise run, and is the figure the side lanes take.
+        for ram_gib in [4, 8, 16, 36, 128] {
+            for wired_gib in 0..=ram_gib {
+                let host = (Some(ram_gib * GIB), Some((ram_gib - wired_gib) * GIB));
+                for cores in [1, 2, 4, 14, 18] {
+                    for caller in [None, Some(1), Some(3), Some(64)] {
+                        if let Some(jobs) = cap(host, cores, caller) {
+                            assert!(
+                                (1..caller.unwrap_or(cores)).contains(&jobs),
+                                "{ram_gib} GiB, {wired_gib} wired, {cores} cores, \
+                                 caller {caller:?}: {jobs}"
+                            );
+                            assert_eq!(Some(jobs), memory_jobs_held(host.0, host.1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The side lanes this file's tests judge, with their own job counts.
+    const SIDE_LANES: [plan::Lane; 4] = [
+        plan::Lane::DriverTarget,
+        plan::Lane::ConformanceRelease,
+        plan::Lane::XtaskTarget,
+        plan::Lane::TrustTarget,
+    ];
+
+    /// THE SIDE LANES TAKE THE MEMORY'S FIGURE ON EVERY DEGRADED HOST (the
+    /// review of 2026-10-07): their own counts (driver 8, release 6, xtask and
+    /// trust 4) can exceed a small host's cores, so the figure is their ceiling
+    /// even where the main lane needs no export. Until then a 2-core host with
+    /// 4.5 GiB usable ran 8 driver compilers, and a 4-core one with 12 GiB
+    /// usable of 16 ran 8 where the memory holds 6. The ceiling never raises a
+    /// lane: a roomy degraded host keeps every constant.
+    #[test]
+    fn the_memory_figure_is_every_side_lanes_ceiling_on_a_degraded_host() {
+        const GIB: u64 = disk::GIB;
+        let lanes = |held| SIDE_LANES.map(|l| stages::lane_jobs(l, held));
+        let constants = SIDE_LANES.map(stages::lane_build_jobs);
+        let two_core = (Some(8 * GIB), Some(GIB * 9 / 2));
+        assert_eq!(memory_job_cap(two_core.0, two_core.1, 2, None), None);
+        assert_eq!(memory_jobs_held(two_core.0, two_core.1), Some(2));
+        assert_eq!(lanes(Some(2)), [Some(2); 4], "2 cores, 4.5 GiB usable");
+        let four_core = (Some(16 * GIB), Some(12 * GIB));
+        assert_eq!(memory_job_cap(four_core.0, four_core.1, 4, None), None);
+        assert_eq!(memory_jobs_held(four_core.0, four_core.1), Some(6));
+        assert_eq!(
+            lanes(Some(6)),
+            [Some(6), Some(6), Some(4), Some(4)],
+            "4 cores, 12 GiB usable of 16"
+        );
+        // Roomy yet past the allowance: the figure is above every constant.
+        let mac36 = memory_jobs_held(Some(36 * GIB), Some(36 * GIB - GIB * 42 / 10));
+        let gate128 = memory_jobs_held(Some(128 * GIB), Some(122 * GIB));
+        assert_eq!((mac36, gate128), (Some(15), Some(61)));
+        assert_eq!(lanes(mac36), constants, "36 GiB keeps every constant");
+        assert_eq!(lanes(gate128), constants, "128 GiB keeps every constant");
+        // Within the allowance, or unread: no figure.
+        assert_eq!(memory_jobs_held(Some(8 * GIB), Some(7 * GIB)), None);
+        assert_eq!(memory_jobs_held(None, Some(GIB)), None);
+        assert_eq!(memory_jobs_held(Some(8 * GIB), None), None);
+    }
+
+    /// What each child gets on the reviewer's small hosts, through the `Ctx`:
+    /// no export where the memory holds as many jobs as cargo runs, yet every
+    /// side-lane command at or under the figure; and the caller's smaller
+    /// export still wins.
+    #[test]
+    fn a_small_degraded_host_caps_its_side_lanes_without_an_export() {
+        const GIB: u64 = disk::GIB;
+        let host = |ram: u64, usable: u64, cores: u32, caller: Option<&str>| {
+            let mut c = Ctx::new(
+                PathBuf::from("/repo"),
+                Mode::Fast,
+                Scope::Workspace,
+                EnvSnapshot::default(),
+                PathBuf::from("/tmp"),
+            );
+            c.env.cargo_build_jobs = caller.map(Into::into);
+            c.with_host_memory(Some(ram))
+                .with_host_usable(Some(usable))
+                .with_memory_build_jobs_on(cores)
+        };
+        let exported = |c: &Ctx| {
+            c.child_env_add
+                .iter()
+                .rfind(|(k, _)| k == "CARGO_BUILD_JOBS")
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        let driver = |c: &Ctx| {
+            let (_, cmd) = stages::driver_build_cmds(c)
+                .into_iter()
+                .next()
+                .expect("a driver build");
+            cmd.envs
+                .iter()
+                .rfind(|(k, _)| k == "CARGO_BUILD_JOBS")
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        let two_core = host(8 * GIB, GIB * 9 / 2, 2, None);
+        assert_eq!(exported(&two_core), None, "2 cores already run 2");
+        assert_eq!(two_core.build_jobs_ceiling(), Some(2));
+        assert_eq!(driver(&two_core).as_deref(), Some("2"));
+        let four_core = host(16 * GIB, 12 * GIB, 4, None);
+        assert_eq!(exported(&four_core), None, "4 cores, memory holds 6");
+        assert_eq!(driver(&four_core).as_deref(), Some("6"));
+        // Negative control: the same memory on 8 cores is exported.
+        let eight_core = host(8 * GIB, GIB * 9 / 2, 8, None);
+        assert_eq!(exported(&eight_core).as_deref(), Some("2"));
+        assert_eq!(driver(&eight_core).as_deref(), Some("2"));
+        // The caller's 1 is below the memory's 2: it stands everywhere.
+        let caller_one = host(8 * GIB, GIB * 9 / 2, 8, Some("1"));
+        assert_eq!(exported(&caller_one), None);
+        assert_eq!(driver(&caller_one).as_deref(), Some("1"));
+        // A healthy host gets neither.
+        let healthy = host(8 * GIB, 7 * GIB, 2, None);
+        assert_eq!(healthy.memory_jobs, None);
+        assert_eq!(exported(&healthy), None);
+        assert_eq!(driver(&healthy).as_deref(), Some("8"));
+        // The start note says only what the figure changes: the 2-core host's
+        // side lanes are lowered, a degraded host whose memory holds more than
+        // any lane runs (this 36 GiB Mac with 4.2 GiB wired holds 15) and a
+        // caller already under the figure are not.
+        assert_eq!(two_core.notes.len(), 1, "{:?}", two_core.notes);
+        let roomy = host(36 * GIB, 318 * GIB / 10, 14, None);
+        assert!(roomy.memory_jobs.is_some_and(|held| held >= 8));
+        assert!(roomy.notes.is_empty(), "{:?}", roomy.notes);
+        assert!(caller_one.notes.is_empty(), "{:?}", caller_one.notes);
+    }
+
+    /// The time line carries the machine's load when both ends were read.
     #[test]
     fn the_time_line_names_the_load_at_the_stage_s_two_ends() {
         let d = |s: f64| Duration::from_secs_f64(s);
@@ -1629,10 +1919,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The `#[cfg(unix)]` half of [`is_executable_file`]. Gated because the
-    /// PREMISE is: a 0644 file is not executable, which is only true where a
-    /// mode exists. The `not(unix)` twin below pins the other half, so neither
-    /// arm of the predicate is unpinned on the target it ships to.
+    /// The unix half of [`is_executable_file`]: a 0644 file is not executable.
     #[cfg(unix)]
     #[test]
     fn executable_test_matches_the_shell_test() {
@@ -1651,10 +1938,57 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The `not(unix)` half: no execute bit exists, so a plain file IS runnable
-    /// (`PATHEXT` decides, not a mode) and only the directory and absent cases
-    /// remain false. Until `xtask gate cells` began type-checking test targets
-    /// this arm of the shipped predicate was compiled by no test anywhere.
+    /// Two bodies behind ONE inode run as two stand-ins, and a body rewritten
+    /// between two runs takes effect: the text is shared, the behaviour is the
+    /// data beside it. Non-vacuity: the two print and exit differently while
+    /// their inode is one, so a [`standin_body`] that dropped the body, kept
+    /// the first one for every path, or gave each path its own text fails here.
+    #[cfg(unix)]
+    #[test]
+    fn a_stand_in_s_body_is_data_behind_one_shared_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = mktemp_dir("atv-standin-body").expect("mktemp");
+        let run = |p: &Path| {
+            let out = Command::new(p)
+                .args(["x", "y z"])
+                .output()
+                .expect("run the stand-in");
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                out.status.code(),
+            )
+        };
+        let (a, b) = (tmp.join("bin/a"), tmp.join("bin/b"));
+        standin_body(&a, r#"echo "a ${0##*/} $# $2"; exit 7"#);
+        standin_body(&b, r#"echo "b ${0##*/}"; exit 3"#);
+        let id = |p: &Path| {
+            let m = std::fs::metadata(p).expect("stat");
+            (m.dev(), m.ino())
+        };
+        assert_eq!(id(&a), id(&b), "two bodies, ONE inode");
+        // `$0` is the link run, and the arguments are the stand-in's own.
+        assert_eq!(run(&a), ("a a 2 y z\n".into(), Some(7)));
+        assert_eq!(run(&b), ("b b\n".into(), Some(3)));
+
+        // Rewritten between two runs: the next run reads the new body, the
+        // inode (so the stamp a tripwire reads) and the other stand-in stay.
+        standin_body(&a, r#"echo "a again"; exit 9"#);
+        assert_eq!(run(&a), ("a again\n".into(), Some(9)));
+        assert_eq!(id(&a), id(&b), "a rewrite never moves the inode");
+        assert_eq!(run(&b), ("b b\n".into(), Some(3)));
+
+        // The data file is renamed into place: nothing else is left beside it.
+        let mut names: Vec<_> = std::fs::read_dir(tmp.join("bin"))
+            .expect("ls")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "a.body", "b", "b.body"]);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The `not(unix)` half: with no execute bit a plain file is runnable
+    /// (`PATHEXT` decides); only the directory and absent cases are false.
     #[cfg(not(unix))]
     #[test]
     fn executable_test_is_existence_where_there_is_no_execute_bit() {
@@ -1673,18 +2007,9 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// ONE RUN, ONE COMPILER (review of 2026-09-25). The lane stamp
-    /// (`choose_source`), `--changed`'s selection (`resolve_scope`) and the
-    /// stages (`Ctx::new`) each ran a discovery of their own, and each
-    /// discovery races the staleness rule's `trustc -vV` probes against a 5 s
-    /// bound: a store build's slow first exec made one of them keep the old
-    /// rustup stage2 and the next demote it, so the stamp named one compiler
-    /// and the stages ran another — and the next run pruned the new
-    /// compiler's lanes. The entrypoint now discovers ONCE
-    /// ([`run_toolchain`]) and hands that toolchain to all three, and the
-    /// context keeps what it is handed. NEGATIVE CONTROL: [`Ctx::new`], the
-    /// discovering constructor, finds none in an empty environment — the
-    /// handed toolchain is what made the difference.
+    /// The context keeps the toolchain it is handed ([`run_toolchain`]).
+    /// Negative control: [`Ctx::new`], which discovers, finds none in an empty
+    /// environment.
     #[test]
     fn a_run_discovers_its_toolchain_once_and_hands_it_to_every_consumer() {
         let tmp = mktemp_dir("atv-one-toolchain").expect("mktemp");
@@ -1721,11 +2046,8 @@ mod tests {
 
     #[test]
     fn every_child_inherits_the_wall_clock_ceiling_the_flag_set() {
-        // The wiring, end to end: the flag's value (`--stage-timeout`, parsed by
-        // `exec::parse_ceiling`) and the value every stage child is actually
-        // launched with (`Ctx::exec_env`). A gate whose stages silently ran with
-        // `child_ceiling: None` would hang exactly as it did before, and nothing
-        // else in the tree would notice.
+        // End to end: `--stage-timeout` (parsed by `exec::parse_ceiling`) reaches
+        // every stage child through `Ctx::exec_env`.
         let tmp = mktemp_dir("atv-ceiling").expect("mktemp");
         let ctx = || {
             Ctx::new(
@@ -1751,6 +2073,41 @@ mod tests {
             ctx().with_child_ceiling(off).exec_env().child_ceiling,
             None,
             "and an operator who types `off` gets the old unbounded wait"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn every_child_gets_the_compile_qos_the_flag_set() {
+        // The wiring from `--compile-qos` to the value every stage child is
+        // launched with (`Ctx::exec_env`; exec.rs decides what it does), and the
+        // header line that says a run did not demote its compiles.
+        let tmp = mktemp_dir("atv-compile-qos").expect("mktemp");
+        let ctx = || {
+            Ctx::new(
+                tmp.clone(),
+                Mode::Measure,
+                Scope::Workspace,
+                EnvSnapshot::default(),
+                tmp.clone(),
+            )
+        };
+        let plain = ctx();
+        assert_eq!(plain.exec_env().compile_qos, exec::CompileQos::Utility);
+        assert!(
+            !plain.notes.iter().any(|n| n.contains("QoS")),
+            "{:?}",
+            plain.notes
+        );
+        let release = ctx().with_compile_qos(exec::CompileQos::Inherited);
+        assert_eq!(release.exec_env().compile_qos, exec::CompileQos::Inherited);
+        assert!(
+            release
+                .notes
+                .iter()
+                .any(|n| n.contains("--compile-qos inherited")),
+            "{:?}",
+            release.notes
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1807,9 +2164,7 @@ mod tests {
             "{:?}",
             snap.child_env_add
         );
-        // And the run's OWN pinned facts join it rather than replacing it: a
-        // context that resolved the git stamp and the test concurrency still
-        // carries the incremental pin.
+        // The run's pinned facts join the seeded vector rather than replace it.
         let pinned = Ctx::new(
             tmp.clone(),
             Mode::Fast,
@@ -1835,20 +2190,67 @@ mod tests {
                 "a caller's target dir reaches a child: {:?}",
                 c.child_env_remove
             );
+            // The test run passes `-Zunstable-options`, under which libtest
+            // reads these: none may reach a child from the caller's shell.
+            for k in LIBTEST_UNSTABLE_ENV {
+                assert!(
+                    c.exec_env().remove_env.contains(&k),
+                    "{k} reaches a child, and the test run's libtest reads it: {:?}",
+                    c.child_env_remove
+                );
+            }
         }
         assert_eq!(ctx.disk_floor, None, "a real run estimates");
         assert_eq!(ctx.disk_budget, disk::Budget::MEASURED);
         assert!(ctx.disk_free.is_none(), "and reads the real volume");
+        assert!(ctx.only_stages.is_none(), "and runs every planned stage");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// THE TOOLCHAIN IS A PINNED CHILD FACT (2026-09-24). Discovery settled on a
-    /// directory found on PATH — no override exported — and every child the run
-    /// launches is handed exactly that physical directory as `$TRUST_STAGE2_BIN`, so
-    /// the xtask verbs' own `Toolchain::discover` answers with it instead of walking
-    /// the rustup entry and the store's moving `current` again. Driven through a real
-    /// child, because `add_env` reaching the process is the property, not the vector.
-    /// The negative control: a run that found no `targo` exports nothing.
+    /// A LADDER THAT LEAVES A STAGE OUT NEVER CLAIMS THE CONTRACT
+    /// ([`Ctx::with_only_stages`]): each stage it leaves out is one named skip,
+    /// and a skip forfeits the claim whatever else the run decided. The list is
+    /// empty here, so every row is the seam's own and nothing runs or fails —
+    /// as green a ladder as a run can have, which is what a seam that answered
+    /// a left-out stage with a pass would have crowned the merge contract.
+    #[cfg(unix)]
+    #[test]
+    fn a_ladder_that_leaves_a_stage_out_never_claims_the_contract() {
+        let tmp = mktemp_dir("atv-only-stages").expect("mktemp");
+        let scratch = tmp.join("scratch");
+        std::fs::create_dir_all(&scratch).expect("mkdir");
+        let ctx = Ctx::new(
+            tmp.clone(),
+            Mode::Fast,
+            Scope::Workspace,
+            EnvSnapshot::default(),
+            scratch,
+        )
+        .with_disk_floor(0)
+        .with_only_stages(&[]);
+        let mut out: Vec<u8> = Vec::new();
+        let code = run(&ctx, &mut out).expect("the ladder is writable");
+        let ladder = String::from_utf8(out).expect("utf-8 ladder");
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(code, exit::PASS, "{ladder}");
+        assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
+        assert!(ladder.contains("NOT the merge contract"), "{ladder}");
+        for spec in plan::plan(&ctx) {
+            assert!(
+                ladder.contains(&format!(
+                    "  skip  {} (not in this fixture ladder's stages)",
+                    spec.title
+                )),
+                "{} is not a skip row: {ladder}",
+                spec.title
+            );
+        }
+    }
+
+    /// Every child receives the directory discovery settled on as
+    /// `$TRUST_STAGE2_BIN`. Driven through a real child, since reaching the
+    /// process is the property. Negative control: no `targo`, nothing exported.
     #[cfg(unix)]
     #[test]
     fn every_child_is_handed_the_runs_own_toolchain_as_the_override() {
@@ -1965,16 +2367,9 @@ mod tests {
         std::fs::remove_dir_all(tmp).expect("fixture cleanup");
     }
 
-    /// THE PIN for the question that killed an 80-minute gate on 2026-09-10.
-    ///
-    /// A run was aborted on the hypothesis that the gate resolved its compiler
-    /// through a mutable rustup symlink and that a peer's re-seal had split it
-    /// across two toolchains. The shim had in fact resolved a PHYSICAL path
-    /// once and prepended it for the whole run — but the gate printed nothing
-    /// about it, so the claim could be neither supported nor refuted without a
-    /// code read, and two readers believed it. This holds the sentence that
-    /// answers it in the record itself, and holds that the two ways of NOT
-    /// being able to answer are said out loud rather than dressed as answers.
+    /// The toolchain header names the resolved absolute directory, and says so
+    /// plainly when it cannot (a relative path, no toolchain, a demoted rustup
+    /// entry).
     #[test]
     fn the_gate_names_the_absolute_toolchain_it_resolved_and_admits_when_it_cannot() {
         let line = toolchain_header_line(

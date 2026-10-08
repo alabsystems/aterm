@@ -84,6 +84,25 @@
 //!   its limit keeps up to one ring (1,000 lines) fewer than the outgoing
 //!   process held until new output refills the ring.
 //!
+//! A HELD PANE (a pane kept open after its command ended: `--hold`, a kept
+//! failed start) is no handed session — its screen rides the manifest's held
+//! list, visible rows only — but its scrollback crosses the same way (round
+//! eight of the update audit, finding 39): exported beside the handed
+//! sessions' — after them, and only into room they do not need: a handed
+//! session that keeps printing evicts held panes' exports when its follow
+//! would not fit the aggregate otherwise ([`ExportSessions`]); and only in the
+//! time they do not need: its first pass runs a chunk at a time between the
+//! handed sessions' follows, which it never holds up, and the park does not
+//! wait for it (round eight's #801) — joined with
+//! the fence its held capture took
+//! ([`name_held_sidecar`], a `.h<id>.hist` sidecar named on its
+//! `HeldPaneCarry`), opened before the proof ([`incoming_held`]) and imported
+//! after Commit into the read-only pane by the same worker. What does not
+//! cross is counted, and the producer writes WHY beside the count
+//! ([`HeldLoss`]): a hop that carries a held pane's screen alone (to an older
+//! build) is said as a held pane's, a policy's withholding as the new
+//! version's request, and a carry that failed as a failure.
+//!
 //! A SUCCESSOR'S HANDOFF POLICY that carries no scrollback (`carry =
 //! "visible"` or `"repaint"`, `aterm_update_core::handoff_policy`) is followed
 //! here too, not only by the screen carry: under such a ceiling nothing is
@@ -94,8 +113,16 @@
 //! ([`Fallback::Withheld`]) — in the log, and on the record
 //! (`history_withheld`), so the successor's band row says the new version
 //! asked for it instead of reading it as a failure that kept "the newest
-//! lines" (it kept none; [`LossSummary::withheld`]). A `full` ceiling is the
-//! carry above, unchanged.
+//! lines" (it kept none; [`LossSummary::withheld`]). A v0.97.0 producer
+//! follows such a policy but predates the record's word for it, so the
+//! successor also reads its OWN sealed policy: a record that counts lines,
+//! names no sidecar and carried none in its screen is the policy's
+//! withholding when that policy asked the record's producer for no
+//! scrollback ([`incoming`]'s `followed_no_scrollback`; round eight of the
+//! update audit, finding 87) — for a v0.97.0 producer alone, and only from a
+//! manifest that names no sidecar: an older producer followed no policy, and
+//! a newer one says what it withheld, so for either an unexplained loss stays
+//! a failure. A `full` ceiling is the carry above, unchanged.
 //!
 //! The sidecar is in NEITHER adoption-proof digest and no schema moved: an
 //! older successor skips the record keys and adopts exactly as before (the
@@ -151,7 +178,8 @@ pub(crate) const MAX_AGGREGATE_BYTES: u64 = 1024 * 1024 * 1024;
 /// How long the launched lane's park gate waits, after the successor has
 /// dialled, for the export's FIRST PASS to finish before it parks anyway (the
 /// sessions the pass had not reached then carry today's bounded history,
-/// counted).
+/// counted). The launched lane is macOS's.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const EXPORT_PATIENCE: Duration = Duration::from_secs(5);
 /// How long the park waits for an export it stops: the chunk it is reading,
 /// then its last look (at most [`LAST_LOOK_CHUNKS`] per session) — a
@@ -178,6 +206,12 @@ const LAST_LOOK_CHUNKS: usize = 2;
 /// contends with it, and the successor this lane forks has its whole boot
 /// ahead of it in the freeze anyway.
 pub(crate) const FORK_EXPORT_WAIT: Duration = Duration::from_secs(2);
+/// Of [`FORK_EXPORT_WAIT`], how long the fork lane's worker gives the held
+/// panes' first passes once every handed session's is done (round eight of
+/// the update audit, #801). Every reader is parked while it waits, and a held
+/// pane's scrollback is a finished command's: it may lengthen a desk's freeze
+/// by this much at most, never by the whole wait.
+pub(crate) const FORK_HELD_WAIT: Duration = Duration::from_millis(500);
 /// How long the successor's import keeps retrying while its pane is being
 /// rewrapped (a window settling at a new width right after the update).
 const IMPORT_PATIENCE: Duration = Duration::from_secs(5);
@@ -217,7 +251,7 @@ fn line_caps(cols: u16) -> (usize, usize) {
 /// The record's `history` value: `"<len> <sha256hex> <take>"`.
 #[must_use]
 pub(crate) fn stamp(len: u64, sha: &[u8; 32], take: u64) -> String {
-    format!("{len} {} {take}", hex(sha))
+    format!("{len} {} {take}", aterm_codec::hex::encode_lower(sha))
 }
 
 /// A stamp's three fields, or `None` for a malformed one.
@@ -240,16 +274,6 @@ pub(crate) fn parse_stamp(stamp: &str) -> Option<(u64, [u8; 32], u64)> {
         *byte = u8::from_str_radix(pair, 16).ok()?;
     }
     Some((len, sha, take))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }
 
 /// Drop the hyperlinks of every line in `lines` whose record would be over the
@@ -469,8 +493,14 @@ enum ExportEvent {
         local_id: u64,
         why: String,
     },
-    /// Every session's first pass is done: the park need not wait for it.
+    /// Every HANDED session's first pass is done. A held pane's first pass
+    /// runs between the handed sessions' follows (round eight of the update
+    /// audit, #801); the park gate waits for it too, boundedly
+    /// ([`ExportEvent::Passed`], [`HistoryExporter::passed`]).
     CaughtUp,
+    /// Every first pass is done, the held panes' too ([`ExportEvent::CaughtUp`]
+    /// came first).
+    Passed,
     /// The worker took its last look for the pause request of this
     /// generation ([`HistoryExporter::pause`]) and waits, taking no terminal
     /// lock, to be resumed or stopped.
@@ -484,8 +514,10 @@ enum ExportEvent {
 pub(crate) struct ExportResults {
     pub(crate) exports: Vec<HistoryExport>,
     pub(crate) refused: Vec<(u64, String)>,
-    /// The exporter had not finished when asked: the sessions it had not
-    /// reached carry today's bounded history, counted.
+    /// The exporter had not handed over every handed session's result when
+    /// asked: the sessions it had not reached carry today's bounded history,
+    /// counted. A held pane's pass the export did not finish is no part of it:
+    /// that pane is told as not exported ([`STOPPED_BEFORE_ITS_PASS`]).
     pub(crate) unfinished: bool,
     /// Nothing was exported because the successor's handoff policy carries no
     /// scrollback ([`HistoryPlan::Withheld`]): the join's "not exported" is
@@ -499,7 +531,9 @@ pub(crate) struct HistoryExporter {
     events: std::sync::mpsc::Receiver<ExportEvent>,
     cancel: Arc<AtomicBool>,
     /// The generation of the pause in force, `0` for none
-    /// ([`Self::pause`], [`Self::resume`]).
+    /// ([`Self::pause`], [`Self::resume`]): only the launched lane, macOS's,
+    /// pauses an export.
+    #[cfg(any(target_os = "macos", test))]
     pause: Arc<AtomicU64>,
     /// The last pause generation handed out.
     pause_generation: u64,
@@ -507,8 +541,17 @@ pub(crate) struct HistoryExporter {
     paused: u64,
     /// The worker, to wake from its follow tick when it is stopped.
     worker: std::thread::Thread,
+    /// Set when the worker's last act is done (its sidecars removed or handed
+    /// over): a dropped exporter is not joined, so a test reads this.
+    #[cfg(test)]
+    exited: Arc<AtomicBool>,
     results: ExportResults,
+    /// Whether the worker follows each history after its first pass (the
+    /// launched lane): it then hands its exports over only when it stops.
+    follow: bool,
     caught_up: bool,
+    /// Every first pass is done, the held panes' too ([`ExportEvent::Passed`]).
+    passed: bool,
     done: bool,
 }
 
@@ -517,6 +560,7 @@ impl std::fmt::Debug for HistoryExporter {
         formatter
             .debug_struct("HistoryExporter")
             .field("caught_up", &self.caught_up)
+            .field("passed", &self.passed)
             .field(
                 "paused",
                 &(self.pause_generation != 0 && self.paused == self.pause_generation),
@@ -524,6 +568,79 @@ impl std::fmt::Debug for HistoryExporter {
             .field("done", &self.done)
             .field("exported", &self.results.exports.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// The sessions one export takes, in the order it spends the handoff's
+/// aggregate ([`MAX_AGGREGATE_BYTES`]) and the successor reads it back
+/// (`take_sidecar`'s `remaining`): every handed session, then the held panes
+/// (`App::history_sessions`). A held pane's export only ever takes room the
+/// handed sessions do not need: its first pass comes after theirs, and a
+/// handed session's follow that would not fit evicts held panes' exports to
+/// make room ([`Aggregate::evict_for`]; the review of round eight's finding
+/// 39). Nor the time they need (round eight's #801): on the launched lane a
+/// held pane's first pass runs a chunk at a time between the handed
+/// sessions' follows, which go on every [`FOLLOW_EVERY`] however deep it is,
+/// so the park gate can wait for every first pass, the held panes' too
+/// ([`HistoryExporter::passed`], bounded by [`EXPORT_PATIENCE`], readers
+/// live) at no cost to a handed session; on the fork lane the held passes get
+/// at most [`FORK_HELD_WAIT`] of the freeze. So the handed sessions carry
+/// exactly what they would with no held pane exported, and a deep held pane's
+/// scrollback crosses whenever its pass fits the patience.
+#[derive(Default)]
+pub(crate) struct ExportSessions {
+    pub(crate) handed: Vec<ExportSession>,
+    pub(crate) held: Vec<ExportSession>,
+    /// The local id whose first pass the tests hold where it is (`u64::MAX`
+    /// for none): a pass that does not finish, as a deep one does not
+    /// before a park.
+    #[cfg(test)]
+    pub(crate) stalled: Option<Arc<AtomicU64>>,
+    /// How far every handed session's export has followed: the least of their
+    /// cursors (`fence.end`) after each follow, for the tests to wait on
+    /// instead of sleeping.
+    #[cfg(test)]
+    pub(crate) followed: Arc<AtomicU64>,
+}
+
+/// One session an export takes: its local id and its engine.
+pub(crate) type ExportSession = (u64, Arc<Mutex<Terminal>>);
+
+impl ExportSessions {
+    /// How many sessions the export takes.
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.handed.len() + self.held.len()
+    }
+
+    /// Whether the tests hold `local_id`'s first pass where it is
+    /// ([`Self::stalled`]); never outside them.
+    fn stalls(&self, local_id: u64) -> bool {
+        #[cfg(test)]
+        {
+            self.stalled
+                .as_ref()
+                .is_some_and(|stalled| stalled.load(Ordering::Acquire) == local_id)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = local_id;
+            false
+        }
+    }
+}
+
+impl From<Vec<ExportSession>> for ExportSessions {
+    /// Handed sessions only, no held pane.
+    fn from(handed: Vec<ExportSession>) -> Self {
+        Self {
+            handed,
+            held: Vec::new(),
+            #[cfg(test)]
+            stalled: None,
+            #[cfg(test)]
+            followed: Arc::default(),
+        }
     }
 }
 
@@ -536,12 +653,13 @@ pub(crate) enum HistoryPlan {
     Unexported,
     /// The launched lane's export, run with every reader live while the
     /// successor booted and FOLLOWING the history until the park paused it
-    /// ([`HistoryExporter::pause`]) before freezing anything.
+    /// ([`HistoryExporter::pause`]) before freezing anything. macOS's lane.
+    #[cfg(any(target_os = "macos", test))]
     Exported(HistoryExporter),
     /// The fork lane's sessions, exported by the worker once the capture is
     /// done — never beside the park, where its chunk reads would contend with
     /// the capture's and the layout's terminal locks.
-    Deferred(Vec<(u64, Arc<Mutex<Terminal>>)>),
+    Deferred(ExportSessions),
     /// The successor's signed handoff policy carries NO scrollback (a `carry`
     /// ceiling of `"visible"` or `"repaint"`,
     /// [`CarryCeiling::carries_scrollback`]): nothing is exported — an export
@@ -558,6 +676,7 @@ impl std::fmt::Debug for HistoryPlan {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unexported => formatter.write_str("Unexported"),
+            #[cfg(any(target_os = "macos", test))]
             Self::Exported(export) => formatter.debug_tuple("Exported").field(export).finish(),
             Self::Deferred(sessions) => write!(formatter, "Deferred({} sessions)", sessions.len()),
             Self::Withheld => formatter.write_str("Withheld"),
@@ -576,7 +695,7 @@ impl HistoryPlan {
     /// whole capture before this plan runs.
     pub(crate) fn deferred_under(
         ceiling: CarryCeiling,
-        sessions: impl FnOnce() -> Option<Vec<(u64, Arc<Mutex<Terminal>>)>>,
+        sessions: impl FnOnce() -> Option<ExportSessions>,
     ) -> Self {
         if !ceiling.carries_scrollback() {
             return Self::Withheld;
@@ -591,6 +710,7 @@ impl HistoryPlan {
     /// worker and removes every sidecar it wrote. (The park gate already
     /// stops such an export before it waits on it; this is the last word, so
     /// no export can reach the worker past a ceiling that forbids it.)
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn exported_under(ceiling: CarryCeiling, export: Option<HistoryExporter>) -> Self {
         if !ceiling.carries_scrollback() {
             drop(export);
@@ -610,10 +730,11 @@ impl HistoryPlan {
             },
             // Paused at the park already; this stops it and collects what it
             // finished.
+            #[cfg(any(target_os = "macos", test))]
             Self::Exported(export) => export.finish(Duration::ZERO),
             Self::Deferred(sessions) => {
                 match HistoryExporter::start(dir.to_path_buf(), sessions, false) {
-                    Ok(export) => export.finish(FORK_EXPORT_WAIT),
+                    Ok(export) => export.finish_deferred(FORK_EXPORT_WAIT, FORK_HELD_WAIT),
                     Err(error) => {
                         aterm_log::warn!(
                             "update apply: the scrollback export could not start ({error}); each \
@@ -641,7 +762,8 @@ impl HistoryExporter {
     /// `follow` (the launched lane, whose readers stay live until the park),
     /// the worker keeps each session's sidecar current after its first pass,
     /// every [`FOLLOW_EVERY`], until it is stopped; without (the fork lane,
-    /// which exports under the park), it stops after the first pass.
+    /// which exports under the park), it stops after the first pass. The
+    /// sidecars together stay within [`MAX_AGGREGATE_BYTES`].
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -652,14 +774,29 @@ impl HistoryExporter {
     )]
     pub(crate) fn start(
         dir: PathBuf,
-        sessions: Vec<(u64, Arc<Mutex<Terminal>>)>,
+        sessions: impl Into<ExportSessions>,
         follow: bool,
+    ) -> std::io::Result<Self> {
+        Self::start_within(dir, sessions.into(), follow, MAX_AGGREGATE_BYTES)
+    }
+
+    /// [`Self::start`] with the sidecars' aggregate bounded by `cap` — the
+    /// tests' way to reach the bound without writing a gigabyte.
+    fn start_within(
+        dir: PathBuf,
+        sessions: ExportSessions,
+        follow: bool,
+        cap: u64,
     ) -> std::io::Result<Self> {
         let (tx, events) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let pause = Arc::new(AtomicU64::new(0));
         let worker_pause = Arc::clone(&pause);
+        #[cfg(test)]
+        let exited = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let worker_exited = Arc::clone(&exited);
         // A name nobody else's attempt can take: `seamless-<pid>-…` so the
         // start-up sweep retires it if this process dies holding it, and a
         // fresh token so it never meets an attempt's `<nonce>` prefix.
@@ -682,19 +819,26 @@ impl HistoryExporter {
                     cancel: &worker_cancel,
                     pause: &worker_pause,
                 };
-                run_export(&dir, &tag, &sessions, follow, stop, &tx);
+                run_export(&dir, &tag, &sessions, follow, cap, stop, &tx);
+                #[cfg(test)]
+                worker_exited.store(true, Ordering::Release);
             })?
             .thread()
             .clone();
         Ok(Self {
             events,
             cancel,
+            #[cfg(any(target_os = "macos", test))]
             pause,
             pause_generation: 0,
             paused: 0,
             worker,
+            #[cfg(test)]
+            exited,
             results: ExportResults::default(),
+            follow,
             caught_up: false,
+            passed: false,
             done: false,
         })
     }
@@ -706,6 +850,7 @@ impl HistoryExporter {
                 self.results.refused.push((local_id, why));
             }
             ExportEvent::CaughtUp => self.caught_up = true,
+            ExportEvent::Passed => self.passed = true,
             ExportEvent::Paused(generation) => self.paused = generation,
             ExportEvent::Done => self.done = true,
         }
@@ -729,10 +874,9 @@ impl HistoryExporter {
         }
     }
 
-    /// Whether the worker's FIRST PASS is over for every session
-    /// (non-blocking) — what the park gate waits for. A following export
-    /// keeps running after it; a stopped one is over too.
-    pub(crate) fn caught_up(&mut self) -> bool {
+    /// Take every event the worker has sent so far, without waiting.
+    #[cfg(any(target_os = "macos", test))]
+    fn poll(&mut self) {
         while !self.done {
             match self.events.try_recv() {
                 Ok(event) => self.absorb(event),
@@ -740,22 +884,52 @@ impl HistoryExporter {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.done = true,
             }
         }
+    }
+
+    /// Whether the worker's FIRST PASS is over for every HANDED session
+    /// (non-blocking) — what the park names as the tabs it had not reached. A
+    /// following export keeps running after it; a stopped one is over too.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn caught_up(&mut self) -> bool {
+        self.poll();
         self.caught_up || self.done
+    }
+
+    /// Whether EVERY first pass is over, the held panes' too (non-blocking,
+    /// [`ExportEvent::Passed`]) — what the launched lane's park gate waits for,
+    /// bounded by [`EXPORT_PATIENCE`]. A held pane's pass runs between the
+    /// handed sessions' follows (round eight of the update audit, #801), so the
+    /// wait costs a handed session nothing, and every reader is live while it
+    /// lasts; a held pass the patience runs out on is paused, kept and told as
+    /// [`STOPPED_BEFORE_ITS_PASS`]. Keyed on [`Self::caught_up`] instead, the
+    /// park landed at the dial and left a deep held pane's scrollback behind —
+    /// the loss #39 was fixed to stop (round eight's last review).
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn passed(&mut self) -> bool {
+        self.poll();
+        self.passed || self.done
     }
 
     /// Wait up to `wait` for the first pass to finish ([`Self::caught_up`]).
     #[cfg(test)]
     pub(crate) fn await_caught_up(&mut self, wait: Duration) -> bool {
-        let deadline = std::time::Instant::now() + wait;
-        while !self.caught_up() {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match self.events.recv_timeout(left) {
-                Ok(event) => self.absorb(event),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => self.done = true,
-            }
-        }
-        true
+        self.drain_while(std::time::Instant::now() + wait, |export| !export.caught_up);
+        self.caught_up || self.done
+    }
+
+    /// The flag the worker sets when it has finished — read after a drop,
+    /// which does not join it.
+    #[cfg(test)]
+    pub(crate) fn exited(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.exited)
+    }
+
+    /// Wait up to `wait` for every first pass to finish, the held panes' too
+    /// ([`ExportEvent::Passed`]).
+    #[cfg(test)]
+    pub(crate) fn await_passed(&mut self, wait: Duration) -> bool {
+        self.drain_while(std::time::Instant::now() + wait, |export| !export.passed);
+        self.passed || self.done
     }
 
     /// Stop the worker and wait up to `wait` for it to say it has stopped —
@@ -784,6 +958,7 @@ impl HistoryExporter {
     /// audit, finding 14: a tab printing more than the screen carry's lines
     /// in that delay lost its whole exported history to `Outrun`). `true`
     /// when the worker answered (or had already stopped).
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn pause(&mut self, wait: Duration) -> bool {
         self.pause_generation = self.pause_generation.wrapping_add(1).max(1);
         let generation = self.pause_generation;
@@ -798,6 +973,7 @@ impl HistoryExporter {
     /// Undo [`Self::pause`]: the worker goes on following each history (and
     /// finishes a first pass the pause interrupted). Nothing when no pause is
     /// in force; a worker that never answered the pause simply never waits.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn resume(&mut self) {
         if self.pause.swap(0, Ordering::AcqRel) != 0 {
             self.worker.unpark();
@@ -808,13 +984,33 @@ impl HistoryExporter {
     /// does by itself: it is stopped here), then stop it — allowing it
     /// [`HALT_WAIT`] to hand over what it finished — and hand that over. A
     /// session it had not finished is not in the result.
-    pub(crate) fn finish(mut self, wait: Duration) -> ExportResults {
-        self.drain_until(std::time::Instant::now() + wait);
+    pub(crate) fn finish(self, wait: Duration) -> ExportResults {
+        self.finish_by(std::time::Instant::now() + wait)
+    }
+
+    /// THE FORK LANE'S FINISH ([`HistoryPlan::Deferred`]): up to `wait` for the
+    /// export, but past the handed sessions' first passes at most `held_wait`
+    /// for the held panes' (round eight of the update audit, #801). Every reader
+    /// is parked while this runs, and the held passes come last: run to the
+    /// whole wait, a desk of deep held panes held every live tab frozen for it.
+    fn finish_deferred(mut self, wait: Duration, held_wait: Duration) -> ExportResults {
+        let deadline = std::time::Instant::now() + wait;
+        self.drain_while(deadline, |export| !export.caught_up);
+        let held_deadline = deadline.min(std::time::Instant::now() + held_wait);
+        self.finish_by(held_deadline)
+    }
+
+    /// [`Self::finish`] by `deadline`.
+    fn finish_by(mut self, deadline: std::time::Instant) -> ExportResults {
+        self.drain_until(deadline);
         if !self.done {
             self.halt(HALT_WAIT);
         }
+        // Without following, each handed session's export was handed over as
+        // its pass finished, every one of them by `CaughtUp`.
+        let handed_over = self.done || (self.caught_up && !self.follow);
         let mut results = std::mem::take(&mut self.results);
-        results.unfinished = !self.done;
+        results.unfinished = !handed_over;
         results
     }
 }
@@ -830,6 +1026,7 @@ impl Drop for HistoryExporter {
 /// is still running and the successor has held its claim for less than
 /// [`EXPORT_PATIENCE`]. Waiting freezes nothing (every reader is live), so it
 /// applies in every mode, an explicit apply's included.
+#[cfg(any(target_os = "macos", test))]
 #[must_use]
 pub(crate) fn park_wait(exporting: bool, held_for: Duration) -> Option<&'static str> {
     (exporting && held_for < EXPORT_PATIENCE).then_some("the scrollback export is still running")
@@ -869,107 +1066,388 @@ impl Stop<'_> {
     }
 }
 
+/// Why a held pane's export was given up while the export followed
+/// ([`Aggregate::evict_for`]).
+const EVICTED: &str =
+    "its room in the handoff's scrollback budget went to a live tab's newer lines";
+
+/// Why a held pane has no export when the export stopped before its first
+/// pass finished, or began: the park came first, or the fork lane's time for
+/// held panes ran out ([`FORK_HELD_WAIT`]).
+const STOPPED_BEFORE_ITS_PASS: &str =
+    "the export stopped before it had read the pane's whole scrollback";
+
+/// THE HANDOFF'S SIDECAR BYTES AS ONE EXPORT SPENDS THEM: every sidecar's
+/// bytes against `cap` ([`MAX_AGGREGATE_BYTES`]), with the room a handed
+/// session's newer lines may take back from the held panes.
+struct Aggregate {
+    cap: u64,
+    written: u64,
+    /// The held panes whose exports a handed session's follow evicted since
+    /// the worker last told the exporter.
+    evicted: Vec<u64>,
+}
+
+impl Aggregate {
+    /// The room one more session's first pass may take.
+    fn room(&self) -> u64 {
+        self.cap.saturating_sub(self.written)
+    }
+
+    /// Whether `frame` more bytes fit.
+    fn fits(&self, frame: u64) -> bool {
+        self.written.saturating_add(frame) <= self.cap
+    }
+
+    /// Give back the bytes `export` was charged, as it is dropped.
+    fn release(&mut self, export: &OpenExport) {
+        self.written = self.written.saturating_sub(export.len);
+    }
+
+    /// A HANDED SESSION'S NEWER LINES OUTRANK A HELD PANE'S SCROLLBACK (the
+    /// review of round eight's finding 39). A held pane's export takes the
+    /// room the handed sessions' first passes left, and a live tab that keeps
+    /// printing between the dial and the park needs room to FOLLOW: without
+    /// it, its follow stops, and once more lines land than the screen carry
+    /// holds, the join leaves its whole older scrollback behind ([`join`]'s
+    /// `Outrun`) — a tab the person is using paying for panes that no longer
+    /// run. So a handed session's `frame` that does not fit evicts held
+    /// panes' exports from `held` — the largest first, which gives up the
+    /// fewest panes for the room — and only when that makes it fit: no held
+    /// pane is given up for a frame the handed sessions could not take
+    /// anyway. An evicted export's sidecar is removed as it drops, and the
+    /// pane is told as not exported ([`Self::evicted`]): its lines stay
+    /// behind, counted and said as a failed carry ([`HeldLoss::Failed`]).
+    /// Whether `frame` fits now.
+    fn evict_for(&mut self, frame: u64, held: &mut Vec<OpenExport>) -> bool {
+        let over = self.written.saturating_add(frame).saturating_sub(self.cap);
+        if over == 0 {
+            return true;
+        }
+        let evictable = held
+            .iter()
+            .fold(0_u64, |sum, export| sum.saturating_add(export.len));
+        if evictable < over {
+            return false;
+        }
+        let mut freed = 0_u64;
+        while freed < over {
+            let Some(at) = held
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, export)| (export.len, export.local_id))
+                .map(|(at, _)| at)
+            else {
+                break;
+            };
+            let export = held.swap_remove(at);
+            freed = freed.saturating_add(export.len);
+            self.written = self.written.saturating_sub(export.len);
+            self.evicted.push(export.local_id);
+        }
+        self.fits(frame)
+    }
+}
+
 fn run_export(
     dir: &Path,
     tag: &str,
-    sessions: &[(u64, Arc<Mutex<Terminal>>)],
+    sessions: &ExportSessions,
     follow: bool,
+    cap: u64,
     stop: Stop<'_>,
     events: &std::sync::mpsc::Sender<ExportEvent>,
 ) {
-    // A receiver that went away drops the event, and with it the file.
-    let send = |event| events.send(event).is_ok();
-    let mut written = 0_u64;
-    let mut open: Vec<OpenExport> = Vec::new();
-    // The next session the FIRST PASS takes: a pause may interrupt the pass,
-    // which then resumes here (only the launched lane, which follows, pauses).
-    let mut next = 0;
-    let mut caught_up = false;
-    loop {
-        while let Some((local_id, term)) = sessions.get(next) {
-            if stop.cancelled() || (follow && stop.paused() != 0) {
+    let worker = Worker {
+        dir,
+        tag,
+        sessions,
+        follow,
+        stop,
+        events,
+        aggregate: Aggregate {
+            cap,
+            written: 0,
+            evicted: Vec::new(),
+        },
+        open: Vec::new(),
+        open_held: Vec::new(),
+        next: 0,
+        next_held: 0,
+    };
+    // `Gone`: the exporter went away, and the worker's files with its state.
+    let _ = worker.run();
+}
+
+/// The exporter went away: a send failed, so nothing more is told, and the
+/// worker's open sidecars are removed as its state drops.
+struct Gone;
+
+/// The export worker's state ([`run_export`]).
+struct Worker<'a> {
+    dir: &'a Path,
+    tag: &'a str,
+    sessions: &'a ExportSessions,
+    /// The launched lane's: follow each history until the park stops it.
+    follow: bool,
+    stop: Stop<'a>,
+    events: &'a std::sync::mpsc::Sender<ExportEvent>,
+    aggregate: Aggregate,
+    /// A following export's open sidecars: the handed sessions'.
+    open: Vec<OpenExport>,
+    /// And apart from them the held panes', which a handed session's follow
+    /// may evict — the one whose first pass is still running among them
+    /// ([`OpenExport::pass`]).
+    open_held: Vec<OpenExport>,
+    /// The next handed session whose first pass is to run: a pause may
+    /// interrupt one, which then runs again from its start on resume (only the
+    /// launched lane, which follows, pauses).
+    next: usize,
+    /// The next held pane whose first pass is to begin.
+    next_held: usize,
+}
+
+impl Worker<'_> {
+    fn send(&self, event: ExportEvent) -> Result<(), Gone> {
+        self.events.send(event).map_err(|_| Gone)
+    }
+
+    /// Where `local_id`'s sidecar is written.
+    fn path(&self, local_id: u64) -> PathBuf {
+        self.dir.join(format!("{}.s{local_id}.hist", self.tag))
+    }
+
+    /// The export: the handed sessions' first passes, then — on the launched
+    /// lane — following every history until the park stops it, the held
+    /// panes' first passes run in the time between two follows.
+    fn run(mut self) -> Result<(), Gone> {
+        let mut caught_up = false;
+        let mut passed = false;
+        'export: loop {
+            let handed = self.handed_passes()?;
+            if !caught_up && handed && !self.stop.requested() {
+                caught_up = true;
+                self.send(ExportEvent::CaughtUp)?;
+            }
+            if !self.follow {
+                // The fork lane: every reader is parked, so nothing follows.
+                // The held panes' passes come after the handed sessions',
+                // each to its end, until the worker is stopped
+                // ([`HistoryExporter::finish_deferred`] bounds them).
+                if caught_up {
+                    while !self.stop.requested() && self.held_step()? {}
+                }
                 break;
             }
-            let path = dir.join(format!("{tag}.s{local_id}.hist"));
-            let room = MAX_AGGREGATE_BYTES.saturating_sub(written);
-            let sent = match begin_export(&path, *local_id, term, stop, room) {
-                Ok(Some(export)) => {
-                    written = written.saturating_add(export.len);
-                    if follow {
-                        open.push(export);
-                        true
-                    } else {
-                        send(export.close())
-                    }
+            // FOLLOW until stopped or paused: the readers are live, so the
+            // history keeps growing, and the park joins whatever this has
+            // taken by then.
+            //
+            // A HELD PANE'S FIRST PASS NEVER HOLDS THE FOLLOWING UP (round
+            // eight of the update audit, #801). Every first pass, the held
+            // panes' included, used to run before the first follow: on a desk
+            // of deep `--hold` panes the handed sessions went unfollowed for
+            // as long as those passes took, the park paused the export in the
+            // middle of one, and a tab printing meanwhile outran the join's
+            // last look (2,048 lines) plus the screen carry and lost its
+            // whole older scrollback — which, with no held pane exported, it
+            // kept. A held pass now runs a chunk at a time until the next
+            // follow is due, and the follow runs every [`FOLLOW_EVERY`] as
+            // with no held pane at all; a pause keeps a held pass where it
+            // stood, and a resume goes on from there.
+            let mut due = std::time::Instant::now() + FOLLOW_EVERY;
+            while !self.stop.requested() {
+                // A resume that overtook the pause which interrupted a handed
+                // session's first pass (or came before `CaughtUp` was told):
+                // take the passes up again.
+                if self.next < self.sessions.handed.len() || !caught_up {
+                    continue 'export;
                 }
+                if std::time::Instant::now() < due {
+                    let held = !passed && self.held_step()?;
+                    if !held {
+                        if !passed {
+                            passed = true;
+                            self.send(ExportEvent::Passed)?;
+                        }
+                        std::thread::park_timeout(
+                            due.saturating_duration_since(std::time::Instant::now()),
+                        );
+                    }
+                    continue;
+                }
+                self.follow_tick(FOLLOW_CHUNKS, true)?;
+                due = std::time::Instant::now() + FOLLOW_EVERY;
+            }
+            // The last look, as the park stops or pauses it: what landed since
+            // the last tick, bounded (the park waits for it on the main
+            // thread). A held pass still running is not taken further.
+            self.follow_tick(LAST_LOOK_CHUNKS, false)?;
+            if self.stop.cancelled() {
+                break;
+            }
+            // PAUSED: every sidecar written through, the park told, and no
+            // terminal lock taken until it resumes or stops the export.
+            for export in self.open.iter_mut().chain(&mut self.open_held) {
+                export.flush();
+            }
+            let generation = self.stop.paused();
+            // A resume that overtook this last look (the pause timed out, the
+            // park missed and resumed) leaves no pause to answer: waiting on
+            // generation 0 would stop following until the next park (round
+            // eight, finding 16).
+            if generation == 0 {
+                continue;
+            }
+            self.send(ExportEvent::Paused(generation))?;
+            while !self.stop.cancelled() && self.stop.paused() == generation {
+                std::thread::park_timeout(FOLLOW_EVERY);
+            }
+            // Stopped from the pause: the park landed and the export is handed
+            // over as the pause left it — no look past the park's own.
+            if self.stop.cancelled() {
+                break;
+            }
+        }
+        self.close()
+    }
+
+    /// THE HANDED SESSIONS' FIRST PASSES, from the first not done, each whole
+    /// in turn. Interrupted by a PAUSE, a pass is dropped (its file with it)
+    /// and taken again from its start on resume. Whether every one is done.
+    fn handed_passes(&mut self) -> Result<bool, Gone> {
+        let sessions = self.sessions;
+        while let Some((local_id, term)) = sessions.handed.get(self.next) {
+            if self.stop.cancelled() || (self.follow && self.stop.paused() != 0) {
+                return Ok(false);
+            }
+            let path = self.path(*local_id);
+            let stalls = sessions.stalls(*local_id);
+            match begin_export(
+                &path,
+                *local_id,
+                term,
+                self.stop,
+                &mut self.aggregate,
+                stalls,
+            ) {
+                Ok(Some(export)) if !self.follow => self.send(export.close())?,
+                Ok(Some(export)) => self.open.push(export),
                 // An empty history crosses by itself: nothing to write.
-                Ok(None) => true,
-                // Interrupted by a PAUSE: this session's pass is dropped (its
-                // file with it) and taken again from its start on resume.
-                Err(_) if follow && !stop.cancelled() && stop.paused() != 0 => break,
-                Err(why) => send(ExportEvent::NotExported {
+                Ok(None) => {}
+                Err(_) if self.follow && !self.stop.cancelled() && self.stop.paused() != 0 => {
+                    return Ok(false);
+                }
+                Err(why) => self.send(ExportEvent::NotExported {
                     local_id: *local_id,
                     why,
-                }),
-            };
-            if !sent {
-                return;
+                })?,
             }
-            next += 1;
+            self.next += 1;
         }
-        if !caught_up && next == sessions.len() && !stop.requested() {
-            caught_up = true;
-            if !send(ExportEvent::CaughtUp) {
-                return;
+        Ok(true)
+    }
+
+    /// One step of the HELD PANES' FIRST PASSES (round eight of the update
+    /// audit, #801): the next chunk of the pass that is running, else the
+    /// first chunk of the next held pane's. Without following, a pass that is
+    /// done is handed over at once. Whether a held pass is left to run.
+    fn held_step(&mut self) -> Result<bool, Gone> {
+        let sessions = self.sessions;
+        if let Some(at) = self
+            .open_held
+            .iter()
+            .position(|export| export.pass.is_some())
+        {
+            if sessions.stalls(self.open_held[at].local_id) {
+                std::thread::sleep(Duration::from_millis(1));
+                return Ok(true);
             }
-        }
-        if !follow {
-            break;
-        }
-        // FOLLOW until stopped or paused: the readers are live, so the
-        // history keeps growing, and the park joins whatever this has taken
-        // by then.
-        while !stop.requested() {
-            std::thread::park_timeout(FOLLOW_EVERY);
-            for export in &mut open {
-                if stop.requested() {
-                    break;
+            match self.open_held[at].pass_step(&mut self.aggregate) {
+                Ok(()) if !self.follow && self.open_held[at].pass.is_none() => {
+                    let export = self.open_held.swap_remove(at);
+                    self.send(export.close())?;
                 }
-                export.follow(&mut written, FOLLOW_CHUNKS);
+                Ok(()) => {}
+                Err(why) => {
+                    let export = self.open_held.swap_remove(at);
+                    self.aggregate.release(&export);
+                    self.send(ExportEvent::NotExported {
+                        local_id: export.local_id,
+                        why,
+                    })?;
+                }
             }
+            return Ok(true);
         }
-        // The last look, as the park stops or pauses it: what landed since
-        // the last tick, bounded (the park waits for it on the main thread).
-        for export in &mut open {
-            export.follow(&mut written, LAST_LOOK_CHUNKS);
+        let Some((local_id, term)) = sessions.held.get(self.next_held) else {
+            return Ok(false);
+        };
+        self.next_held += 1;
+        match open_export(&self.path(*local_id), *local_id, term, &mut self.aggregate) {
+            Ok(Some(export)) if !self.follow && export.pass.is_none() => {
+                self.send(export.close())?;
+            }
+            Ok(Some(export)) => self.open_held.push(export),
+            Ok(None) => {}
+            Err(why) => self.send(ExportEvent::NotExported {
+                local_id: *local_id,
+                why,
+            })?,
         }
-        if stop.cancelled() {
-            break;
-        }
-        // PAUSED: every sidecar written through, the park told, and no
-        // terminal lock taken until it resumes or stops the export.
-        for export in &mut open {
-            export.flush();
-        }
-        let generation = stop.paused();
-        if !send(ExportEvent::Paused(generation)) {
-            return;
-        }
-        while !stop.cancelled() && stop.paused() == generation {
-            std::thread::park_timeout(FOLLOW_EVERY);
-        }
-        // Stopped from the pause: the park landed and the export is handed
-        // over as the pause left it — no look past the park's own.
-        if stop.cancelled() {
-            break;
-        }
+        Ok(true)
     }
-    for export in open {
-        if !send(export.close()) {
-            return;
+
+    /// One look at what landed past each cursor, `chunks` at most: the handed
+    /// sessions first, each able to take room back from the held panes, then
+    /// the held panes whose first pass is done; then the evicted are told. A
+    /// tick (`interruptible`) stops at once for a stop or a pause; the last
+    /// look does not.
+    fn follow_tick(&mut self, chunks: usize, interruptible: bool) -> Result<(), Gone> {
+        for export in &mut self.open {
+            if interruptible && self.stop.requested() {
+                break;
+            }
+            export.follow(&mut self.aggregate, Some(&mut self.open_held), chunks);
         }
+        for export in &mut self.open_held {
+            if interruptible && self.stop.requested() {
+                break;
+            }
+            export.follow(&mut self.aggregate, None, chunks);
+        }
+        #[cfg(test)]
+        if let Some(cursor) = self.open.iter().map(|export| export.facts.fence.end).min() {
+            self.sessions.followed.store(cursor, Ordering::Release);
+        }
+        // The held panes' exports a handed session's follow evicted: each one
+        // told as not exported, before anything the park waits on.
+        for local_id in std::mem::take(&mut self.aggregate.evicted) {
+            self.send(ExportEvent::NotExported {
+                local_id,
+                why: EVICTED.to_string(),
+            })?;
+        }
+        Ok(())
     }
-    let _ = send(ExportEvent::Done);
+
+    /// Hand every open sidecar over, and tell each held pane whose first pass
+    /// did not finish (or never began) why it has none; then `Done`.
+    fn close(mut self) -> Result<(), Gone> {
+        let open = std::mem::take(&mut self.open);
+        let held = std::mem::take(&mut self.open_held);
+        for export in open.into_iter().chain(held) {
+            self.send(export.close())?;
+        }
+        let sessions = self.sessions;
+        for (local_id, _) in sessions.held.get(self.next_held..).unwrap_or_default() {
+            self.send(ExportEvent::NotExported {
+                local_id: *local_id,
+                why: STOPPED_BEFORE_ITS_PASS.to_string(),
+            })?;
+        }
+        self.send(ExportEvent::Done)
+    }
 }
 
 /// One session's sidecar while it is being written: its fence (whose `end`
@@ -992,14 +1470,60 @@ struct OpenExport {
     broken: Option<String>,
     /// Lines written with their links dropped ([`strip_over_cap_links`]).
     links_dropped: u64,
+    /// While its FIRST PASS runs: the fence the pass reads under, to its
+    /// `end`. `None` once the pass is done. A handed session's pass runs to its
+    /// end at once ([`begin_export`]); a held pane's a chunk at a time between
+    /// the follows ([`Worker::held_step`]), so until then it is no whole
+    /// history: not followed, and not handed over ([`Self::close`]).
+    pass: Option<HistoryFence>,
 }
 
 impl OpenExport {
-    /// Whether one more frame of `body` bytes fits this sidecar's and the
-    /// handoff's byte budgets.
-    fn fits(&self, body: usize, written: u64, room: u64) -> bool {
-        let frame = 4 + body as u64;
-        self.len.saturating_add(frame) <= MAX_SIDECAR_BYTES && written.saturating_add(frame) <= room
+    /// Append the next `lines` of the FIRST PASS as one frame, within the
+    /// sidecar's and the handoff's byte budgets, and charge it to `aggregate`;
+    /// the pass is done once the cursor reaches its fence's end.
+    fn pass_append(
+        &mut self,
+        mut lines: Vec<Line>,
+        aggregate: &mut Aggregate,
+    ) -> Result<(), String> {
+        let Some(fence) = self.pass else {
+            return Ok(());
+        };
+        if lines.is_empty() {
+            return Err("the history ended before its fence".to_string());
+        }
+        self.links_dropped += strip_over_cap_links(&mut lines, fence.cols);
+        let body = aterm_core::scrollback::serialize_lines(&lines);
+        let frame = 4 + body.len() as u64;
+        if self.len.saturating_add(frame) > MAX_SIDECAR_BYTES || !aggregate.fits(frame) {
+            return Err(format!(
+                "the history is over the {}-byte sidecar budget",
+                self.len
+                    .saturating_add(aggregate.room())
+                    .min(MAX_SIDECAR_BYTES)
+            ));
+        }
+        self.append(&lines, &body)
+            .map_err(|e| format!("could not write ({})", e.kind()))?;
+        aggregate.written = aggregate.written.saturating_add(frame);
+        if self.facts.fence.end >= fence.end {
+            self.pass = None;
+        }
+        Ok(())
+    }
+
+    /// The next chunk of the FIRST PASS, read under the fence it began on.
+    fn pass_step(&mut self, aggregate: &mut Aggregate) -> Result<(), String> {
+        let Some(fence) = self.pass else {
+            return Ok(());
+        };
+        let cursor = self.facts.fence.end;
+        let lines = locked(&self.term, |t| {
+            t.history_lines_since_fence(&fence, cursor, CHUNK_LINES)
+        })
+        .map_err(|broken| broken.to_string())?;
+        self.pass_append(lines, aggregate)
     }
 
     /// Append `lines` (the next ones after the cursor) as one frame.
@@ -1018,10 +1542,18 @@ impl OpenExport {
     /// One tick of FOLLOWING: take up to `chunks` chunks of the history that
     /// landed past the cursor, while the fence the first pass was taken on
     /// still holds. Stops following (and keeps what it has) the moment it
-    /// does not, retention passed the cursor, or a bound was reached.
-    fn follow(&mut self, written: &mut u64, chunks: usize) {
+    /// does not, retention passed the cursor, or a bound was reached. A
+    /// handed session passes the held panes' exports as `held`, which it may
+    /// evict to fit the aggregate ([`Aggregate::evict_for`]); a held pane
+    /// passes `None`.
+    fn follow(
+        &mut self,
+        aggregate: &mut Aggregate,
+        mut held: Option<&mut Vec<OpenExport>>,
+        chunks: usize,
+    ) {
         for _ in 0..chunks {
-            if !self.following || self.broken.is_some() {
+            if !self.following || self.broken.is_some() || self.pass.is_some() {
                 return;
             }
             let fence = self.facts.fence;
@@ -1050,15 +1582,20 @@ impl OpenExport {
             };
             let stripped = strip_over_cap_links(&mut lines, fence.cols);
             let body = aterm_core::scrollback::serialize_lines(&lines);
+            let frame = 4 + body.len() as u64;
             if self.facts.lines + lines.len() as u64 > MAX_EXPORT_LINES
-                || !self.fits(body.len(), *written, MAX_AGGREGATE_BYTES)
+                || self.len.saturating_add(frame) > MAX_SIDECAR_BYTES
+                || !(aggregate.fits(frame)
+                    || held
+                        .as_deref_mut()
+                        .is_some_and(|held| aggregate.evict_for(frame, held)))
             {
                 self.following = false;
                 return;
             }
             match self.append(&lines, &body) {
                 Ok(()) => {
-                    *written = written.saturating_add(4 + body.len() as u64);
+                    aggregate.written = aggregate.written.saturating_add(frame);
                     self.links_dropped += stripped;
                 }
                 Err(error) => {
@@ -1080,8 +1617,15 @@ impl OpenExport {
         }
     }
 
-    /// Close the sidecar: its event for the exporter.
+    /// Close the sidecar: its event for the exporter. One whose first pass
+    /// had not finished holds no whole history: it is not exported.
     fn close(mut self) -> ExportEvent {
+        if self.pass.is_some() {
+            return ExportEvent::NotExported {
+                local_id: self.local_id,
+                why: STOPPED_BEFORE_ITS_PASS.to_string(),
+            };
+        }
         if let Some(why) = self.broken.take() {
             return ExportEvent::NotExported {
                 local_id: self.local_id,
@@ -1105,14 +1649,15 @@ impl OpenExport {
     }
 }
 
-/// Export one session's fenced history to `path` — its FIRST PASS: every
-/// line the fence covers, oldest first, in chunks under short locks.
-fn begin_export(
+/// Open one session's sidecar at `path` and write the first chunk of its
+/// FIRST PASS — every line the fence covers, oldest first, in chunks under
+/// short locks ([`OpenExport::pass_step`] reads the rest). The bytes are
+/// charged to `aggregate` as they are written, and given back if it fails.
+fn open_export(
     path: &Path,
     local_id: u64,
     term: &Arc<Mutex<Terminal>>,
-    stop: Stop<'_>,
-    room: u64,
+    aggregate: &mut Aggregate,
 ) -> Result<Option<OpenExport>, String> {
     // THE FENCE AND THE FIRST CHUNK UNDER ONE LOCK (2026-09-26 review): the
     // export starts AT the oldest retained row, so on a tab at its retention
@@ -1133,7 +1678,7 @@ fn begin_export(
             .map_err(|broken| broken.to_string())?;
         Ok(Some((fence, first, lines)))
     })?;
-    let Some((fence, first, mut lines)) = first_read else {
+    let Some((fence, first, lines)) = first_read else {
         return Ok(None);
     };
     let file = create_private_new(path).map_err(|e| format!("could not create ({})", e.kind()))?;
@@ -1155,6 +1700,7 @@ fn begin_export(
         following: true,
         broken: None,
         links_dropped: 0,
+        pass: Some(fence),
     };
     let head = header(fence.cols);
     export
@@ -1162,33 +1708,45 @@ fn begin_export(
         .write_all(&head)
         .map_err(|e| format!("could not write ({})", e.kind()))?;
     export.hasher.update(head);
-    loop {
-        if lines.is_empty() {
-            return Err("the history ended before its fence".to_string());
+    aggregate.written = aggregate.written.saturating_add(export.len);
+    match export.pass_append(lines, aggregate) {
+        Ok(()) => Ok(Some(export)),
+        Err(why) => {
+            aggregate.release(&export);
+            Err(why)
         }
-        export.links_dropped += strip_over_cap_links(&mut lines, fence.cols);
-        let body = aterm_core::scrollback::serialize_lines(&lines);
-        if !export.fits(body.len(), export.len, room) {
-            return Err(format!(
-                "the history is over the {}-byte sidecar budget",
-                room.min(MAX_SIDECAR_BYTES)
-            ));
-        }
-        export
-            .append(&lines, &body)
-            .map_err(|e| format!("could not write ({})", e.kind()))?;
-        let cursor = export.facts.fence.end;
-        if cursor >= fence.end {
-            return Ok(Some(export));
-        }
-        if stop.requested() {
-            return Err("the attempt stopped".to_string());
-        }
-        lines = locked(term, |t| {
-            t.history_lines_since_fence(&fence, cursor, CHUNK_LINES)
-        })
-        .map_err(|broken| broken.to_string())?;
     }
+}
+
+/// Export one HANDED session's fenced history to `path`: its whole FIRST
+/// PASS, given up the moment the attempt asks the worker to stop (`stalls`:
+/// the tests hold it where it is, [`ExportSessions::stalled`]).
+fn begin_export(
+    path: &Path,
+    local_id: u64,
+    term: &Arc<Mutex<Terminal>>,
+    stop: Stop<'_>,
+    aggregate: &mut Aggregate,
+    stalls: bool,
+) -> Result<Option<OpenExport>, String> {
+    let Some(mut export) = open_export(path, local_id, term, aggregate)? else {
+        return Ok(None);
+    };
+    while export.pass.is_some() {
+        let step = if stop.requested() {
+            Err("the attempt stopped".to_string())
+        } else if stalls {
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(())
+        } else {
+            export.pass_step(aggregate)
+        };
+        if let Err(why) = step {
+            aggregate.release(&export);
+            return Err(why);
+        }
+    }
+    Ok(Some(export))
 }
 
 /// One handed session's history as the park saw it — its fence, taken under
@@ -1513,6 +2071,171 @@ pub(crate) fn stamp_manifest(
     verdicts
 }
 
+impl ExportResults {
+    /// The exports of the panes `held` names, taken out of these results for
+    /// the held carry ([`name_held_sidecar`]; round eight of the update audit,
+    /// finding 39), so [`stamp_manifest`] — which joins the handed sessions'
+    /// records — never sees them; and why a held pane with none has none
+    /// ([`HeldExports::unexported`]): the policy's withholding, as the handed
+    /// records say it; else `older_successor` when the attempt hands to a
+    /// build older than this one ([`exports_for_target`] false); else a
+    /// failure.
+    pub(crate) fn take_held(&mut self, held: &[u64], older_successor: bool) -> HeldExports {
+        let (exports, kept) = std::mem::take(&mut self.exports)
+            .into_iter()
+            .partition(|export| held.contains(&export.local_id));
+        self.exports = kept;
+        // A held pane's refusal is said as a held pane's — its screen is its
+        // visible rows, so no bounded history stands in for what did not
+        // cross — and kept out of the handed sessions' log.
+        let (refused, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refused)
+            .into_iter()
+            .partition(|(local_id, _)| held.contains(local_id));
+        self.refused = kept;
+        for (local_id, why) in refused {
+            aterm_log::warn!(
+                "update apply: held pane {local_id}'s scrollback was not exported ({why}); its \
+                 lines stay behind, counted"
+            );
+        }
+        HeldExports {
+            exports,
+            unexported: if self.withheld {
+                HeldLoss::Withheld
+            } else if older_successor {
+                HeldLoss::ScreenOnly
+            } else {
+                HeldLoss::Failed
+            },
+        }
+    }
+}
+
+/// WHY A HELD PANE'S SCROLLBACK LINES DID NOT CROSS (the review of round
+/// eight's finding 39), which the producer writes beside its count
+/// (`HeldPaneCarry::history_withheld` / `history_failed`) and the successor
+/// says on the band: the words true of a choice are false of a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldLoss {
+    /// BY DESIGN: the hop carries a held pane's screen alone — a successor
+    /// older than this build has no held importer ([`exports_for_target`]),
+    /// so nothing was exported for it. Said as a held pane's
+    /// ([`AdoptedHistory::held`]).
+    ScreenOnly,
+    /// BY REQUEST: the successor's signed handoff policy carries no
+    /// scrollback ([`HistoryPlan::Withheld`]). Said as the new version's
+    /// request ([`AdoptedHistory::withheld`]).
+    Withheld,
+    /// A FAILURE: the carry was offered and did not cross — the export had
+    /// not reached the pane, refused it or never started, a resize moved its
+    /// fence, the sidecar could not be named, or the history was deeper than
+    /// one export carries. Said as a failure, and never with the failure
+    /// row's "the newest lines came across": a held screen carries none
+    /// ([`LossSummary::held_failed`]).
+    Failed,
+}
+
+impl HeldLoss {
+    /// The reason a successor reads off a held pane's two wire keys: a record
+    /// that says both is read as failed, so a malformed one never makes a
+    /// failure read as a choice.
+    #[must_use]
+    pub(crate) const fn from_wire(withheld: bool, failed: bool) -> Self {
+        if failed {
+            Self::Failed
+        } else if withheld {
+            Self::Withheld
+        } else {
+            Self::ScreenOnly
+        }
+    }
+}
+
+/// The held panes' share of an attempt's export ([`ExportResults::take_held`]):
+/// each one's export, and why a pane with none has none.
+#[derive(Debug)]
+pub(crate) struct HeldExports {
+    pub(crate) exports: Vec<HistoryExport>,
+    pub(crate) unexported: HeldLoss,
+}
+
+impl Default for HeldExports {
+    /// No export and no plan to say why: a failure, never a choice.
+    fn default() -> Self {
+        Self {
+            exports: Vec::new(),
+            unexported: HeldLoss::Failed,
+        }
+    }
+}
+
+/// What a held pane's scrollback carry came to ([`name_held_sidecar`]): the
+/// stamp of the sidecar it names (`HeldPaneCarry::history`), the lines that do
+/// not cross and why ([`HeldLoss`], meaningful when `dropped` is not 0), and
+/// the named file, which the manifest writer retires with the rest of the
+/// attempt if it fails.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HeldHistory {
+    pub(crate) stamp: Option<String>,
+    pub(crate) dropped: u64,
+    pub(crate) why: HeldLoss,
+    pub(crate) path: Option<PathBuf>,
+}
+
+/// A HELD PANE'S SCROLLBACK CROSSES AS A HANDED SESSION'S DOES (round eight of
+/// the update audit, finding 39). A pane kept open after its command exited
+/// (`--hold`, a kept failed start) is no handed session: its screen rides the
+/// manifest's held list, visible rows only, and its scrollback used to be left
+/// behind on every update. Its history is exported beside the handed
+/// sessions' (`App::history_sessions`), and here joined with `head`, the fence
+/// its held capture took, exactly as [`join`] joins a session's — the screen
+/// carrying no line of it — and linked to `named`, its attempt-bound name
+/// `<dir>/seamless-<pid>-<nonce>.h<id>.hist` (the `h` keeps it apart from a
+/// session's `.s<id>.hist`). No export (a successor older than this build,
+/// a policy that carries no scrollback, an export that had not reached it), a
+/// fence that moved (a resize rewrapped it) or a link that cannot be made
+/// leaves the lines behind, counted, with WHY ([`HeldLoss`]): with no export,
+/// `unexported` — the attempt's reason ([`HeldExports::unexported`]) — and
+/// with one, a failure.
+pub(crate) fn name_held_sidecar(
+    export: Option<HistoryExport>,
+    head: HistoryFence,
+    named: PathBuf,
+    unexported: HeldLoss,
+) -> HeldHistory {
+    let joined = join(export.as_ref().map(|export| export.facts), head, 0);
+    let why = if export.is_some() {
+        HeldLoss::Failed
+    } else {
+        unexported
+    };
+    let Some(export) = export.filter(|_| joined.take > 0) else {
+        return HeldHistory {
+            stamp: None,
+            dropped: joined.dropped,
+            why,
+            path: None,
+        };
+    };
+    let source = export.file.keep();
+    let named = match std::fs::hard_link(&source, &named) {
+        Ok(()) => HeldHistory {
+            stamp: Some(stamp(export.len, &export.sha, joined.take)),
+            dropped: joined.dropped,
+            why,
+            path: Some(named),
+        },
+        Err(_) => HeldHistory {
+            stamp: None,
+            dropped: joined.dropped.saturating_add(joined.take),
+            why,
+            path: None,
+        },
+    };
+    let _ = std::fs::remove_file(source);
+    named
+}
+
 /// Say what the join decided: one line for the sessions whose history
 /// crosses whole, one WARN per session that falls back, with its count.
 pub(crate) fn log_verdicts(verdicts: &[(u64, Joined)]) {
@@ -1665,6 +2388,17 @@ pub(crate) struct AdoptedHistory {
     /// (`SessionRecord::history_withheld`) — a choice, said as one — rather
     /// than for want of a way to carry them.
     pub(crate) withheld: u64,
+    /// Of `dropped`, the lines a HELD pane's outgoing process left behind BY
+    /// DESIGN (an exited pane kept open, `--hold` or a kept failed start;
+    /// round eight of the update audit, finding 39): the hop carried its
+    /// screen alone ([`HeldLoss::ScreenOnly`], [`incoming_held`]).
+    pub(crate) held: u64,
+    /// This is a held pane's history ([`incoming_held`]): its screen carried
+    /// no line of its scrollback, so none of its newest lines crossed. Its
+    /// lines that are neither `withheld` nor `held` are a FAILED carry, said
+    /// as one but never with "the newest lines came across"
+    /// ([`LossSummary::held_failed`]).
+    pub(crate) held_pane: bool,
     pub(crate) lost: u64,
     pub(crate) claim: Option<OlderHistoryClaim>,
     /// Where the person was reading at the park
@@ -1738,9 +2472,17 @@ impl AdoptedHistory {
 /// session's screen this build refused (`screen_degraded`: the carried lines
 /// the sidecar's newest line meets went with that screen, so importing it
 /// would put a hole in the history), is removed and its lines counted.
+///
+/// The record's lines are the policy's withholding when it says so
+/// (`history_withheld`, v0.98.0 on) or when `followed_no_scrollback`: the
+/// record's producer is v0.97.0, this build's own sealed policy asked it for
+/// no scrollback, and the record carries none — what v0.97.0 writes when it
+/// follows one, with no way to say why (`seamless::take_incoming_from`; round
+/// eight of the update audit, finding 87).
 pub(crate) fn incoming(
     record: &crate::session_store::SessionRecord,
     screen_degraded: bool,
+    followed_no_scrollback: bool,
     path: &Path,
     dir: &Path,
     remaining: &mut u64,
@@ -1748,11 +2490,13 @@ pub(crate) fn incoming(
     let mut history = AdoptedHistory {
         carry: None,
         dropped: record.history_dropped,
-        withheld: if record.history_withheld {
+        withheld: if record.history_withheld || followed_no_scrollback {
             record.history_dropped
         } else {
             0
         },
+        held: 0,
+        held_pane: false,
         lost: record.history_lost,
         claim: None,
         viewport_from_bottom: record.viewport_from_bottom,
@@ -1786,6 +2530,58 @@ pub(crate) fn incoming(
     history
 }
 
+/// The successor's reading of one HELD pane's scrollback carry, before the
+/// proof (`seamless::take_incoming`; round eight of the update audit, finding
+/// 39): `dropped` lines its outgoing process could not carry
+/// (`HeldPaneCarry::history_dropped`), said by `why` — as a held pane's
+/// ([`AdoptedHistory::held`]) when the hop carried its screen alone, as the
+/// new version's request ([`AdoptedHistory::withheld`]) under a policy that
+/// carries no scrollback, and as a failure when the carry failed — and the
+/// sidecar `stamp` names opened at `path` as [`incoming`] opens a session's.
+/// A sidecar that cannot be taken costs its lines, counted as a failure.
+pub(crate) fn incoming_held(
+    stamp: Option<&str>,
+    dropped: u64,
+    why: HeldLoss,
+    local_id: u64,
+    path: &Path,
+    dir: &Path,
+    remaining: &mut u64,
+) -> AdoptedHistory {
+    let mut history = AdoptedHistory {
+        dropped,
+        held: if why == HeldLoss::ScreenOnly {
+            dropped
+        } else {
+            0
+        },
+        withheld: if why == HeldLoss::Withheld {
+            dropped
+        } else {
+            0
+        },
+        held_pane: true,
+        lost: dropped,
+        ..AdoptedHistory::default()
+    };
+    let Some(stamp) = stamp else {
+        return history;
+    };
+    let named = parse_stamp(stamp).map_or(0, |(_, _, take)| take);
+    match take_sidecar(path, dir, stamp, remaining) {
+        Ok(carry) => history.carry = Some(carry),
+        Err(why) => {
+            aterm_log::warn!(
+                "overlap handoff: held pane {local_id}'s scrollback sidecar was not taken \
+                 ({why}); {named} line(s) of its history stay behind, counted"
+            );
+            history.dropped = history.dropped.saturating_add(named);
+            history.lost = history.lost.saturating_add(named);
+        }
+    }
+    history
+}
+
 /// One session's import, as the successor settles it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportReport {
@@ -1799,6 +2595,11 @@ pub(crate) struct ImportReport {
     /// Of `dropped`, the lines a successor's handoff policy asked the
     /// outgoing side to leave behind ([`AdoptedHistory::withheld`]).
     pub(crate) withheld: u64,
+    /// Of `dropped`, the lines a held pane's outgoing process left behind
+    /// by design ([`AdoptedHistory::held`]).
+    pub(crate) held: u64,
+    /// The session is a held pane ([`AdoptedHistory::held_pane`]).
+    pub(crate) held_pane: bool,
     /// The named carry's lines, when it failed HERE (not yet counted).
     pub(crate) failed_lines: u64,
     /// Of `imported`, the lines whose records were over the line-record cap
@@ -1829,6 +2630,20 @@ impl ImportReport {
         self.withheld.min(self.dropped)
     }
 
+    /// Of [`Self::lost`], the lines a held pane's carry left behind by
+    /// design, bounded the same way.
+    #[must_use]
+    pub(crate) fn held(&self) -> u64 {
+        self.held.min(self.dropped)
+    }
+
+    /// Of [`Self::lost`], a HELD pane's lines whose carry failed — on the
+    /// outgoing side or here ([`held_failed`]).
+    #[must_use]
+    pub(crate) fn held_failed(&self) -> u64 {
+        held_failed(self.held_pane, self.lost(), self.withheld(), self.held())
+    }
+
     /// The report for a job whose import never ran (its worker could not
     /// start): everything it named is lost.
     #[must_use]
@@ -1838,6 +2653,8 @@ impl ImportReport {
             imported: 0,
             dropped: job.history.dropped,
             withheld: job.history.withheld,
+            held: job.history.held,
+            held_pane: job.history.held_pane,
             failed_lines: job.history.reserve(),
             links_dropped: 0,
             failed: job.history.carry.as_ref().map(|_| why.to_string()),
@@ -1977,20 +2794,78 @@ pub(crate) struct LossSummary {
     /// request and a failed one as a failure; the words that are true of the
     /// one are false of the other (`update_words::scrollback_left_behind`).
     pub(crate) withheld: u64,
+    /// …and how many held panes' outgoing process left behind by design
+    /// ([`AdoptedHistory::held`])…
+    pub(crate) held: u64,
+    /// …and how many of a HELD pane's lines a carry FAILED to bring
+    /// ([`AdoptedHistory::held_pane`]): a failure, but one under which no
+    /// newest line crossed, so the failure row's comfort is false of them
+    /// (the review of round eight's finding 39).
+    pub(crate) held_failed: u64,
 }
 
 /// This update's loss across every adopted session: the lines left behind,
 /// in how many tabs, and how many of them a policy withheld.
 #[must_use]
 pub(crate) fn loss_summary(reports: &[ImportReport]) -> LossSummary {
-    reports
-        .iter()
-        .filter(|report| report.lost() > 0)
-        .fold(LossSummary::default(), |sum, report| LossSummary {
-            lines: sum.lines.saturating_add(report.lost()),
+    summarize(reports.iter().map(|report| {
+        (
+            report.lost(),
+            report.withheld(),
+            report.held(),
+            report.held_failed(),
+        )
+    }))
+}
+
+/// Of a session's `lost` lines, the ones a HELD pane's carry failed to bring:
+/// all of them that are neither withheld nor held by design, for a held pane;
+/// none for a handed session, whose failures keep the failure row.
+#[must_use]
+const fn held_failed(held_pane: bool, lost: u64, withheld: u64, held: u64) -> u64 {
+    if held_pane {
+        lost.saturating_sub(withheld).saturating_sub(held)
+    } else {
+        0
+    }
+}
+
+/// The part of [`loss_summary`] the successor already holds AT COMMIT, before
+/// any import has run: each adopted session's `dropped` — the lines the
+/// outgoing process counted as left behind at its park (the record's
+/// `history_dropped`), plus a named sidecar this build could not take before
+/// its proof ([`incoming`]) — and the share of them a handoff policy withheld.
+/// The same fold over the same counts [`ImportReport`] carries on, so an
+/// import that fails nothing settles to exactly this.
+#[must_use]
+pub(crate) fn carried_loss<'a>(
+    histories: impl IntoIterator<Item = &'a AdoptedHistory>,
+) -> LossSummary {
+    summarize(histories.into_iter().map(|history| {
+        let withheld = history.withheld.min(history.dropped);
+        let held = history.held.min(history.dropped);
+        (
+            history.dropped,
+            withheld,
+            held,
+            held_failed(history.held_pane, history.dropped, withheld, held),
+        )
+    }))
+}
+
+/// `(lost, withheld, held, held_failed)` per session, folded into the band's
+/// one summary.
+fn summarize(losses: impl IntoIterator<Item = (u64, u64, u64, u64)>) -> LossSummary {
+    losses.into_iter().filter(|&(lost, ..)| lost > 0).fold(
+        LossSummary::default(),
+        |sum, (lost, withheld, held, held_failed)| LossSummary {
+            lines: sum.lines.saturating_add(lost),
             tabs: sum.tabs + 1,
-            withheld: sum.withheld.saturating_add(report.withheld()),
-        })
+            withheld: sum.withheld.saturating_add(withheld),
+            held: sum.held.saturating_add(held),
+            held_failed: sum.held_failed.saturating_add(held_failed),
+        },
+    )
 }
 
 /// One adopted session's import job.
@@ -2021,6 +2896,8 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
                 carry,
                 dropped,
                 withheld,
+                held,
+                held_pane,
                 claim,
                 viewport_from_bottom,
                 bottom_at_adopt,
@@ -2070,14 +2947,12 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
             // of `carry = "visible"`/`"repaint"` withholds every line) leaves
             // nothing the person was reading here, and the scrollback the
             // adopted program has written since is not it: the view stays at
-            // the live bottom rather than climbing into post-update output.
-            let reachable = history_at_adopt.map(|at| at.saturating_add(imported));
+            // the live bottom rather than climbing into post-update output. A
+            // screen that did not cross at all restored no history either
+            // (round eight, finding 38: the clamp was skipped there).
+            let reachable = history_at_adopt.unwrap_or(0).saturating_add(imported);
             let viewport_from_bottom = viewport_from_bottom
-                .map(|lines| {
-                    reachable.map_or(lines, |reachable| {
-                        u32::try_from(u64::from(lines).min(reachable)).unwrap_or(lines)
-                    })
-                })
+                .map(|lines| u32::try_from(u64::from(lines).min(reachable)).unwrap_or(lines))
                 .filter(|lines| *lines > 0);
             if let Some(lines) = viewport_from_bottom
                 && !input_at_adopt.as_ref().is_some_and(InputWatch::moved)
@@ -2092,6 +2967,8 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
                 imported,
                 dropped,
                 withheld,
+                held,
+                held_pane,
                 failed_lines,
                 links_dropped,
                 failed,
@@ -2103,7 +2980,7 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
 
 #[cfg(test)]
 #[path = "handoff_history_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 /// Tier-1 bind for `NativeUpdateHistoryCarry`: every path of the machine on
 /// the real export, park, join, sidecar and import.

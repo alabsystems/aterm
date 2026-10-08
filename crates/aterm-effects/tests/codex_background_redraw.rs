@@ -49,7 +49,7 @@ impl Host {
         self.term.row_cols_into(usize::from(c.row), &mut self.buf);
         self.glow.observe_row(c.row, c.col, &self.buf, self.now);
         // The caret row's two neighbours, as the host feeds them
-        // (`app_render.rs` `tick_cursor_fx`): the content classifiers that
+        // (`EffectsPipeline::cursor_step`): the content classifiers that
         // read the row above (a soft-wrapped caret, a lifted word) are only
         // exercised — and their refusals only pinned — with them.
         let r = usize::from(c.row);
@@ -308,13 +308,11 @@ fn a_real_return_and_natural_wrap_keep_their_immediate_row_move() {
 }
 
 /// A shell fold is not a soft-wrapped caret (`CursorGlow::soft_wrapped_caret`)
-/// even when two keys cross it in ONE echo: `b` fills the pane's last column
-/// over what was a blank in the last probe, exactly as a soft-wrapped key
-/// does, but `c` stands on the landing row left of the caret. A frame falls
-/// between the presses and the echo, so both keys are HELD and their cells
-/// come from the seam's sweep alone. Both glyphs are lit. RED if the
-/// classifier stopped reading the landing row: the move then sweeps only
-/// the origin's cell and `c` at (21, 0) stays dark.
+/// even when two keys cross it in one echo: `b` fills the pane's last column
+/// over a previously blank cell, as a soft-wrapped key does, but `c` stands on
+/// the landing row left of the caret. A frame falls between the presses and
+/// the echo, so both keys are held and their cells come from the seam's sweep.
+/// Both glyphs are lit (the classifier must read the landing row).
 #[test]
 fn a_coalesced_pair_across_the_pending_margin_wrap_lights_both_glyphs() {
     let mut h = Host::new();

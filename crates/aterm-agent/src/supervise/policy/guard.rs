@@ -5,33 +5,23 @@
 //!
 //! `key if=<re> <key>` presses only while some visible row matches `<re>`,
 //! checked under the same terminal lock as the write (aterm-gui
-//! `control_input.rs`, `input_if_row_matches`). The supervisor's old guard,
-//! `Do.you.want.to.proceed`, matched EVERY approval box and any copy of that
-//! phrase on the screen, so a box swapped between the read and the press was
-//! answered on the first box's verdict (audit APR-6, measured with a swapped
-//! rm box). [`row_guard`] builds the pattern from the row that was classified
-//! instead — the command row, indentation and all, anchored at both ends — so
-//! the press lands only while THAT row is still drawn where the box draws it.
-//! A transcript copy (`⎿  $ touch x`) or a different command does not match.
+//! `control_input.rs`, `input_if_row_matches`). [`row_guard`] builds the
+//! pattern from the row that was classified (the command row, indentation and
+//! all, anchored at both ends), so the press lands only while that row is
+//! still drawn, never on a swapped box or a transcript copy.
 //!
 //! The wire splits a control line on whitespace and nothing quotes, so the
-//! pattern holds no whitespace: a space is `\x20`, and only the regex
-//! metacharacters are escaped (the server's engine, `aterm_regex`, reads
-//! `\<` and `\>` as word boundaries, so `<` and `>` stay bare). The server
-//! refuses a pattern over [`MAX_GUARD_BYTES`]; a longer row is guarded by its
-//! anchored prefix.
+//! pattern holds no whitespace: a space is `\x20`, and only regex
+//! metacharacters are escaped (`aterm_regex` reads `\<` and `\>` as word
+//! boundaries, so `<` and `>` stay bare). A row past [`MAX_GUARD_BYTES`] is
+//! guarded by its anchored prefix.
 //!
-//! When the server can fence a press on the screen GENERATION of the read
-//! that was judged (`key if-gen=<epoch>.<seq>`, answered `OK skipped
-//! reason=changed` when the screen moved), [`key_args`] adds that fence in
-//! front of the row guard; [`server_fences_gen`] reads whether it can from the
-//! server's own `help` text, so an older server gets the row guard alone.
-//! The generation, not the content sequence: `seq=` is per grid and repeats
-//! after an alternate-screen re-entry (a fence on it pressed into the box that
-//! replaced the judged one, measured by lane C's review), and the server now
-//! refuses `if-seq=` with `ERR usage`. `if-fp=` is not sent beside it: within
-//! one generation the screen cannot change, so an `if-fp=` next to a matching
-//! `if-gen=` could never change the verdict.
+//! Where the server can fence a press on the judged read's screen generation
+//! (`key if-gen=<epoch>.<seq>`, answered `OK skipped reason=changed` when the
+//! screen moved), [`key_args`] adds that fence before the row guard;
+//! [`server_fences_gen`] reads the server's `help` to decide. The generation,
+//! not `seq=`, which repeats after an alternate-screen re-entry. `if-fp=` is
+//! not sent: within one generation the screen cannot change.
 
 /// The longest pattern the server compiles for a guard
 /// (`aterm_observe::row_matcher`'s `MAX_REGEX_PATTERN_LEN`).
@@ -41,20 +31,16 @@ pub const MAX_GUARD_BYTES: usize = 1024;
 /// row's end ([`row_guard`]).
 pub const ROW_END: &str = "\\s*$";
 
-/// An anchored, whitespace-free pattern that matches `row` exactly — its
+/// An anchored, whitespace-free pattern that matches `row` exactly (its
 /// leading indentation, its text, and any trailing whitespace the grid pads
-/// it with — and nothing else. A row whose pattern would exceed
+/// it with) and nothing else. A row whose pattern would exceed
 /// [`MAX_GUARD_BYTES`] is matched by the longest prefix that fits, still
 /// anchored at the start.
 ///
-/// The trailing run is [`ROW_END`], ANY whitespace (`\s`, the server
-/// engine's `char::is_whitespace`), not only spaces: the row this is built
-/// from was read through `text`, which trims what `str::trim_end` trims,
-/// while the server tests the guard against the row as drawn. Claude Code
-/// 2.1.281 draws its empty composer as `❯` and a NO-BREAK SPACE — `text`
-/// reads `❯`, the server matches `❯\u{a0}` — and a `\x20*$` end refused
-/// every write into it (`OK skipped`, measured live 2026-09-24: no
-/// continuation and no slash command ever reached the composer).
+/// The trailing run is [`ROW_END`], any whitespace (`\s`), not only spaces:
+/// `text` trims what `str::trim_end` trims, while the server tests the row as
+/// drawn, and Claude Code draws its empty composer as `❯` and a no-break
+/// space.
 pub fn row_guard(row: &str) -> String {
     let body = row.trim_end();
     let indent = body.chars().take_while(|c| *c == ' ').count();
@@ -106,12 +92,10 @@ pub fn key_args(guard: &str, key: &str, gen_fence: Option<&str>) -> String {
 
 /// Whether the server's `help` text (the whole catalog, or `help key`) says
 /// `key` takes the `if-gen=<epoch>.<seq>` generation fence. An entry is the
-/// row that names its verb in column 0 and the indented rows under it: `help
-/// key` wraps the one entry over many rows (`VerbSpec::entry_lines`), the full
-/// catalog prints each entry on one, and the fence is named in the entry's
-/// FENCES paragraph, never on its first row. The retired `if-seq=` spelling is
-/// not the fence: the server that knows `if-gen=` names `if-seq=` only to
-/// refuse it, and one that names `if-seq=` alone predates the generation.
+/// row naming its verb in column 0 and the indented rows under it, and the
+/// fence is named in the entry's FENCES paragraph, never its first row. The
+/// `if-seq=` spelling is not the fence: a server that knows `if-gen=` names
+/// `if-seq=` only to refuse it.
 pub fn server_fences_gen(help: &str) -> bool {
     entry_names_gen(help, "key")
 }
@@ -149,8 +133,8 @@ mod tests {
         move |row| m.matches(row)
     }
 
-    /// The guard compiles on the SERVER's engine, is one wire token, and
-    /// matches the judged row and no other row of the measured box.
+    /// The guard compiles on the server's engine, is one wire token, and
+    /// matches the judged row and no other row of the recorded box.
     #[test]
     fn a_row_guard_matches_its_row_and_nothing_else_on_the_box() {
         let rows = fixtures::bash_one_row();
@@ -200,11 +184,10 @@ mod tests {
         assert!(!m("   a b"));
     }
 
-    /// Claude Code 2.1.281's empty composer, as the server matches it: the
-    /// caret and a NO-BREAK SPACE, which `text` reads trimmed to `❯`. The
-    /// guard built from the read matches the drawn row (the live E2E's D1:
-    /// a `\x20*$` end answered every write `OK skipped`). Negative controls:
-    /// a draft, a caret indented as an option row is.
+    /// Claude Code 2.1.281's empty composer as the server matches it: the
+    /// caret and a no-break space, which `text` reads trimmed to `❯`. The
+    /// guard built from the read matches the drawn row. Negative controls: a
+    /// draft, and a caret indented as an option row is.
     #[test]
     fn the_guard_of_a_trimmed_read_matches_the_row_the_server_tests() {
         let g = row_guard("❯");
@@ -237,7 +220,7 @@ mod tests {
         ));
         // The server's own answers: `help key` (the one entry, wrapped over
         // many rows, the fence on a continuation row) and the full catalog
-        // golden (one row per verb). Each names if-gen= as the fence and
+        // (one row per verb). Each names if-gen= as the fence and
         // if-seq= only as a refusal.
         let help_key = aterm_types::control_verbs::spec("key")
             .expect("the key verb")
@@ -245,8 +228,10 @@ mod tests {
             .join("\n");
         assert!(!help_key.lines().next().unwrap().contains("if-gen="));
         assert!(server_fences_gen(&help_key), "{help_key}");
-        let shipped = include_str!("../../../../aterm-types/tests/fixtures/ctl_help_full.txt");
-        assert!(server_fences_gen(shipped));
+        let shipped = aterm_types::control_verbs::catalog_lines_full()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(server_fences_gen(&shipped));
         // NEGATIVE CONTROLS: the retired spelling alone is not the fence — a
         // host that names only `if-seq=` answers `if-gen=` as a usage error —
         // and a mention of if-gen under another verb is not key's.

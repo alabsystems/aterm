@@ -220,7 +220,7 @@ pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
     Ok(rolled)
 }
 
-/// The two changelogs a release claim writes (2026-09-23, owner ruling R2), from
+/// The two changelogs a release claim writes (owner ruling R2), from
 /// the PUBLISHED commit's `source` and main's current `main`:
 ///
 /// * the RELEASE commit's — `source` rolled ([`roll`]): its `[Unreleased]` becomes
@@ -399,7 +399,7 @@ fn unshipped_entries(main_body: &[&str], shipped: &[&str]) -> Vec<String> {
 }
 
 /// Extract a rolled section's body VERBATIM (spec §3: used once, verbatim,
-/// for manifest + `gh release create --notes-file` + the in-app notes): the
+/// for manifest + the release body the channel draft-create posts + the in-app notes): the
 /// raw lines between `## [<version>]` and the next `## [` heading, trimmed of
 /// leading/trailing blank lines only. Behavioral port of
 /// tools/extract-changelog.sh — minus its fall-back-to-Unreleased lane, which
@@ -452,13 +452,11 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
 /// in-app Software Update notes stay the rolled section verbatim (spec §3) —
 /// an installed copy already knows what aterm is.
 ///
-/// ONE macOS download (RETIRED 2026-08-26: the batteries-included seed, the
-/// Intel `-x86_64` DMG, the `-lite` twin and the `aterm-offline.dmg` alias):
-/// the guide names exactly the lean DMG, the zip, the evergreen aliases and
-/// the sidecars — nothing this release does not carry.
+/// ONE macOS download: the guide names exactly the lean DMG, the zip, the
+/// evergreen aliases and the sidecars — nothing this release does not carry.
 pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
     // No sizes: GitHub lists each asset's real size beside it, and a label here
-    // went stale as the app grew (~28 MB written, 40.6 MB shipped at v0.98.0).
+    // goes stale as the app grows.
     //
     // THE BOUND IS TAKEN ON THE WHOLE DOCUMENT, not on `changelog_body` alone:
     // the preamble is ~1.3 KB that the POST carries too, so bounding the body
@@ -491,33 +489,21 @@ pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
 /// **GITHUB REFUSES A RELEASE BODY OVER THIS**, in characters, and says so only
 /// as an opaque `422` on the create POST.
 ///
-/// Measured 2026-09-17, when the v0.87.0 cut failed at the draft step with
-/// `curl: (22) … error: 422` and nothing else to read. The tag was valid, the
-/// target commit was on the remote, and the identical request with a SHORT body
-/// succeeded — the only difference was the body, at 225,061 bytes. The rolled
-/// section is pasted verbatim, and it has been growing: 30 KB at v0.84.0,
-/// 52 KB at v0.85.0, 141 KB at v0.86.0, 225 KB here. v0.86.0's cut hit the same
-/// refusal and it was recorded as "transient GitHub convergence"; it was not
-/// transient, it was this, one release earlier.
+/// MEASURED: a 225,061-byte body failed the draft POST with `curl: (22) … 422`
+/// while the identical request with a short body succeeded. The rolled section
+/// is pasted verbatim and grows every release.
 ///
 /// COMPARED AGAINST [`github_length`], which counts UTF-16 code units — the
-/// safe reading of "characters" for an API that speaks JSON. It was compared
-/// against BYTES until the boundary panic below was found: bytes are merely
-/// conservative (UTF-8 never spends fewer bytes than characters, so nothing
-/// over-long could slip through) but they cut notes GitHub would have taken,
-/// and a byte budget cannot serve as a slice index at all. `publish.rs` reads
+/// safe reading of "characters" for an API that speaks JSON. `publish.rs` reads
 /// this too: the bound is taken at the POST as well as at the write, and a 422
 /// is diagnosed against it.
 pub const GITHUB_RELEASE_BODY_LIMIT: usize = 125_000;
 
 /// What GitHub is counting when it says "maximum is 125000 characters".
 ///
-/// NOT bytes: the first cut of this bound measured `str::len()`, which is
-/// merely conservative on a body of prose (every non-ASCII character costs
-/// more than it scores) but is wrong in the direction that matters — it cut
-/// notes GitHub would have taken. And a raw byte budget cannot be used as a
-/// slice index at all: `&body[..124_767]` PANICS when that byte is in the
-/// middle of an em dash, which this repo's changelog is full of.
+/// NOT bytes: `str::len()` cuts notes GitHub would have taken, and a raw byte budget cannot be used
+/// as a slice index at all: `&body[..124_767]` PANICS when that byte is in the middle of an em
+/// dash, which this repo's changelog is full of.
 ///
 /// UTF-16 code units are the safe reading of "characters" for an API that
 /// speaks JSON: it equals the scalar count for everything in the BMP and
@@ -589,9 +575,7 @@ mod release_body_bound_tests {
     /// saying so.
     ///
     /// THE TWIN: return `body.to_string()` unconditionally and the length
-    /// assertion goes red — which is exactly what shipped until 2026-09-17, and
-    /// what made the v0.87.0 draft POST fail with an opaque `422` at 225,061
-    /// bytes (and v0.86.0's before it, at 141 KB, misrecorded as transient).
+    /// assertion goes red (the opaque `422` on an oversized draft POST).
     #[test]
     fn an_oversized_body_is_cut_at_a_section_and_says_it_was() {
         let entry = "### Section\n\n- an entry long enough to matter, repeated to overflow\n\n";
@@ -685,10 +669,8 @@ mod release_body_bound_tests {
     /// The WHOLE document — preamble plus body — also lands under the limit,
     /// because the preamble is what the POST carries too.
     ///
-    /// EXACTLY the limit, with no slack: bounding `changelog_body` alone left
-    /// the assembled document over by the preamble's ~1.3 KB, and this
-    /// assertion used to have to allow `+ 2_000` to pass. That slack WAS the
-    /// defect — GitHub counts the document, not the section inside it.
+    /// EXACTLY the limit, with no slack: GitHub counts the document, not the
+    /// section inside it.
     #[test]
     fn the_assembled_document_fits_what_github_accepts() {
         let body = "### Section\n\n- entry\n\n".repeat(6000);
@@ -854,8 +836,8 @@ mod tests {
         assert!(doc.contains("`aterm.dmg` / `aterm-mac.zip`"), "{doc}");
         assert!(doc.contains("shasum -a 256 -c"), "{doc}");
         assert!(doc.contains("atpkg-index-N"), "{doc}");
-        // ONE macOS download: the guide must never again advertise a
-        // container the release does not carry (RETIRED 2026-08-26).
+        // ONE macOS download: the guide never advertises a container the
+        // release does not carry.
         for retired in [
             "x86_64",
             "lite.dmg",

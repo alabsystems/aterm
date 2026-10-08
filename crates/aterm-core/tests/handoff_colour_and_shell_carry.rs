@@ -2,19 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! An in-session update carries the colours an application set and its shell
-//! integration, not just the cells.
+//! integration, not just the cells: the OSC 4 palette, OSC 10/11 theme, OSC 133
+//! command blocks, and a command running across the update, which must still
+//! complete (`completed_command_seq` moves) when its `D` arrives.
 //!
-//! Before this carry, a seamless update reverted a base16-shell palette
-//! (OSC 4) and OSC 10/11 theme to the host's colours, dropped every OSC 133
-//! command block, and — the functional break — never completed a command that
-//! was running across the update: the successor's A→B→C→D machine sat at "no
-//! prompt" and ignored the `D` that ended it, so `completed_command_seq`, the
-//! counter agents wait on, never moved.
-//!
-//! These drive the seamless path the GUI takes — `checkpoint_carry` on the
-//! outgoing engine, `restore_checkpoint` into a freshly CONFIGURED successor —
-//! and check the negative control: a successor that adopts only the cells
-//! (the old carry) loses all of it.
+//! These drive the GUI's seamless path (`checkpoint_carry` on the outgoing
+//! engine, `restore_checkpoint` into a configured successor). Negative control:
+//! a successor that adopts only the cells loses all of it.
 
 use aterm_core::config::TerminalConfig;
 use aterm_core::terminal::{Rgb, Terminal};
@@ -48,7 +42,7 @@ fn outgoing() -> Terminal {
     t
 }
 
-/// The successor: a fresh engine configured by THIS process — whose theme
+/// The successor: a fresh engine configured by this process — whose theme
 /// foreground differs from the outgoing one's.
 fn successor() -> Terminal {
     let mut t = Terminal::new(ROWS, COLS);
@@ -131,7 +125,7 @@ fn a_command_running_across_the_handoff_completes_after_it() {
         "the carried absolute row names the same line on the successor"
     );
 
-    // The running command ends AFTER the update, and it counts.
+    // The running command ends after the update, and it counts.
     next.process(b"done\r\n\x1b]133;D;0\x07");
     assert_eq!(
         next.completed_command_seq(),
@@ -154,16 +148,14 @@ fn a_command_running_across_the_handoff_completes_after_it() {
 }
 
 // ---------------------------------------------------------------------------
-// The shell carry MEETS the history carry (2026-09-27 review).
+// The shell carry meets the history carry.
 //
-// The seamless adopt restores the checkpoint (continuing the source's
-// absolute numbering, with the carried marks at the source's rows), then
-// reserves keys for the history sidecar the import brings after Commit, then
-// attaches it. When the reserve raised the counter by the whole sidecar, every
-// restored row moved up by `take` while the carried marks stayed put: each one
-// then named a line `take` rows too old, and a command running across the
-// update completed with an output span reaching back into the imported
-// history. These drive restore + reserve + attach as the GUI's adopt does.
+// The seamless adopt restores the checkpoint (continuing the source's absolute
+// numbering, marks at the source's rows), reserves keys for the history sidecar
+// the import brings after Commit, then attaches it. The carried marks must keep
+// naming their lines, so a command running across the update completes with
+// exactly the source's output span. These drive restore + reserve + attach as
+// the GUI's adopt does.
 // ---------------------------------------------------------------------------
 
 use aterm_core::grid::OlderHistory;

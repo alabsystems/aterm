@@ -107,27 +107,15 @@ impl LineCache {
         }
     }
 
-    /// Read the character at `point`, reusing a materialized scrollback
-    /// row across consecutive reads on the same line.
+    /// [`Self::char_at`] for word motions: a double-width character's
+    /// continuation cell reads as the character itself, not the literal `' '`
+    /// the grid stores there.
     ///
-    /// Behaviour-identical to [`cell_char`]: out-of-bounds cells read as
-    /// space. `line_text` resolves each scrollback cell with the same
-    /// complex-char first-char mapping as `char_at`, so the cached chars
-    /// match `char_at` column-for-column.
-    /// [`Self::char_at`] for WORD MOTIONS: a double-width character's
-    /// continuation cell resolves to the character itself, not to the literal
-    /// `' '` the grid stores there.
-    ///
-    /// Without this, `日本語` reads as `日 · 本 · 語` — the classifier sees a
-    /// space between every glyph (`' '` is in [`DEFAULT_SEPARATORS`] and is
-    /// whitespace for WORD motions), so `w`/`b`/`e`/`W`/`B`/`E` step ONE glyph
-    /// at a time through CJK instead of crossing the run. Alacritty, which
-    /// these motions are ported from, skips the spacer explicitly.
-    ///
-    /// Deliberately SEPARATE from [`Self::char_at`]: that function's documented
-    /// contract is to be behaviour-identical to `cell_char` and to agree with
-    /// `line_text` column-for-column, which bracket matching and the paragraph
-    /// motions rely on. Only the word classifier wants the merged reading.
+    /// Otherwise `日本語` reads as `日 · 本 · 語` (`' '` is a separator and
+    /// WORD whitespace), and every word motion steps one glyph at a time.
+    /// Alacritty skips the spacer the same way. Kept separate from
+    /// `char_at`, whose column-for-column agreement with `cell_char` bracket
+    /// and paragraph motions rely on.
     pub(super) fn word_char_at(&mut self, grid: &dyn BufferAccess, point: ViPoint) -> char {
         let ch = self.char_at(grid, point);
         if point.col == 0 || !self.is_wide_continuation(grid, point) {
@@ -155,6 +143,12 @@ impl LineCache {
             .unwrap_or(false)
     }
 
+    /// Read the character at `point`, reusing a materialized scrollback
+    /// row across consecutive reads on the same line.
+    ///
+    /// Behaviour-identical to [`cell_char`]: out-of-bounds cells read as
+    /// space, and `line_text` resolves each scrollback cell as `char_at`
+    /// does, so the cached chars match column-for-column.
     pub(super) fn char_at(&mut self, grid: &dyn BufferAccess, point: ViPoint) -> char {
         if point.line >= 0 {
             // Visible rows: a direct lookup is already cheap and avoids
@@ -296,7 +290,7 @@ fn is_line_empty(grid: &dyn BufferAccess, line: i32) -> bool {
     // `char_at` re-materializes the entire row. Fetch the row once via
     // `line_text` (same per-cell resolution as `char_at`) and test
     // emptiness in a single pass. `None` (out of retained history) reads
-    // as empty, matching the old per-cell `char_at(..).unwrap_or(' ')`.
+    // as empty, as an out-of-bounds `cell_char` does.
     if line < 0 {
         return match grid.line_text(line) {
             None => true,

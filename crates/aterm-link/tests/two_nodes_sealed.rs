@@ -43,11 +43,11 @@ use harness::{until, until_within, Fleet, DEADLINE, FLEET};
 ///
 /// The connection is the point. `Fleet::god()` is a fresh sealed TCP connect, a
 /// handshake, an HMAC mint and a cap attach; opening one INSIDE a poll closure
-/// runs all four every [`harness::POLL_GAP`] — up to six thousand broker
-/// connections for a single wait that is only slow because the machine is busy,
-/// which is the load that made this file's own waits time out. One connection
-/// per wait is the same observation, without the harness competing with the
-/// bridge for the broker it is waiting on.
+/// runs all four every 10 ms poll of [`harness::until_within`] — up to six
+/// thousand broker connections for a single wait that is only slow because the
+/// machine is busy, which is the load that made this file's own waits time out.
+/// One connection per wait is the same observation, without the harness
+/// competing with the bridge for the broker it is waiting on.
 ///
 /// `budget` is stated by the caller, because the two classes of wait here are
 /// not the same: most rows are published by the arrival that caused them, and a
@@ -89,7 +89,7 @@ fn a_post_crosses_two_nodes_over_the_sealed_wire_and_ls_sees_both() {
     // that hosts nothing — that is the whole claim of the cross-host `ls` (§7).
     // §7'S ROW IS `<node> <host> <sid> …`, so the node and the session are the
     // FIRST and THIRD columns with the host between them — a session row has no
-    // `host=` of its own and prints `-` there (`main.rs`'s module header says
+    // `host=` of its own and prints `-` there (`cli.rs`'s module header says
     // which columns have no writer yet and why).
     let names = |out: &str, node: &str, sid: &str| {
         out.lines().any(|l| {
@@ -350,7 +350,7 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
     let log = fleet.tmp.join("watch.log");
     let out = std::fs::File::create(&log).expect("observer log");
     let err = out.try_clone().expect("observer log clone");
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_aterm-link"))
+    let child = std::process::Command::new(harness::link_to_launch())
         .args([
             "serve",
             "--fleet",

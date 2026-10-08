@@ -22,6 +22,7 @@ use super::version::{Version, is_vendor_build};
 #[cfg(test)]
 use crate::manifest::Channel;
 use crate::manifest::Index;
+use crate::sig::{BuildFloor, TrustedIndex};
 use crate::store::Layout;
 
 /// The latch file's schema.
@@ -70,12 +71,13 @@ impl Policy {
     /// The policy the lane reads: the yanks of the NEWEST index this machine verified —
     /// `fresh` (verified this pass) unless the latch holds a newer one — else the latch,
     /// else none. A replayed older index, still signed and inside its window, never lifts
-    /// a yank a newer one latched (design §1.4).
+    /// a yank a newer one latched (design §1.4). "Newer" is the build floor's order
+    /// ([`YankLatch::admits`]).
     #[must_use]
-    pub(crate) fn current(layout: &Layout, fresh: Option<&Index>) -> Self {
+    pub(crate) fn current(layout: &Layout, fresh: Option<&TrustedIndex>) -> Self {
         let latch = YankLatch::read(layout);
         match (fresh, latch) {
-            (Some(index), Some(latch)) if latch.index_build > index.index_build => latch.policy,
+            (Some(index), Some(latch)) if !latch.admits(index) => latch.policy,
             (Some(index), _) => Self::from_index(index),
             (None, latch) => latch.map(|l| l.policy).unwrap_or_default(),
         }
@@ -162,11 +164,16 @@ impl Policy {
 }
 
 /// The vendor yanks of the newest FRESHLY verified index (`<prefix>/vendor-yanks.toml`).
-/// Read when no index verifies this pass; replaced only by an index at least as new.
+/// Read when no index verifies this pass; replaced only by an index at least as new
+/// ([`Self::admits`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct YankLatch {
     /// The index build these yanks came from.
     pub index_build: u64,
+    /// The roster generation that index was authorized by — what the build floor records
+    /// beside its build ([`TrustedIndex::roster_seq`]); `None` for a latch written before
+    /// it was kept.
+    pub roster_seq: Option<u64>,
     /// Its vendor yanks.
     pub policy: Policy,
     /// When a fresh verification last wrote or confirmed it (Unix seconds; `0` for a
@@ -178,6 +185,8 @@ pub(crate) struct YankLatch {
 struct LatchFile {
     schema: u32,
     index_build: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    roster_seq: Option<u64>,
     #[serde(default)]
     checked_at: i64,
     #[serde(default)]
@@ -209,9 +218,35 @@ impl YankLatch {
         }
         Some(Self {
             index_build: file.index_build,
+            roster_seq: file.roster_seq,
             policy,
             checked_at: file.checked_at,
         })
+    }
+
+    /// Whether `index` is at least as new as the index these yanks came from, by the build
+    /// floor's own rule ([`BuildFloor::admits`], asked as `select_index` asks it): an index
+    /// that declares a strictly newer roster generation — which only the paper master can
+    /// mint — supersedes the latch whatever its `index_build`, as it re-bases the floor;
+    /// within a generation an older build never does. Ordered by build alone, a latch one
+    /// machine filled at an absurd `index_build` refused every yank the owner published
+    /// after revoking it. A latch written before the generation was kept is ordered by
+    /// build alone.
+    fn admits(&self, index: &TrustedIndex) -> bool {
+        let (index_build, generation, _) = rank(index);
+        self.admits_at(generation, index_build)
+    }
+
+    /// [`Self::admits`] for an index declaring `generation` at `index_build`.
+    fn admits_at(&self, generation: u64, index_build: u64) -> bool {
+        match self.roster_seq {
+            Some(roster_seq) => BuildFloor {
+                index_build: self.index_build,
+                roster_seq,
+            }
+            .admits(generation, index_build),
+            None => index_build >= self.index_build,
+        }
     }
 
     /// Whether a fresh verification wrote or confirmed the latch at most
@@ -240,7 +275,7 @@ impl YankLatch {
     ) -> io::Result<bool> {
         Self::update(
             layout,
-            index_build,
+            (index_build, 0, None),
             Policy::from_channel(channel),
             checked_at,
         )
@@ -253,15 +288,10 @@ impl YankLatch {
     /// The latch could not be written.
     pub(crate) fn update_from_index(
         layout: &Layout,
-        index: &Index,
+        index: &TrustedIndex,
         checked_at: i64,
     ) -> io::Result<bool> {
-        Self::update(
-            layout,
-            index.index_build,
-            Policy::from_index(index),
-            checked_at,
-        )
+        Self::update(layout, rank(index), Policy::from_index(index), checked_at)
     }
 
     /// [`Self::update_from_index`] for an index verified from CACHED bytes (the source was
@@ -270,30 +300,37 @@ impl YankLatch {
     ///
     /// # Errors
     /// The latch could not be written.
-    pub(crate) fn carry_from_cached_index(layout: &Layout, index: &Index) -> io::Result<bool> {
+    pub(crate) fn carry_from_cached_index(
+        layout: &Layout,
+        index: &TrustedIndex,
+    ) -> io::Result<bool> {
         let stamp = Self::read(layout).map_or(0, |l| l.checked_at);
-        Self::update(layout, index.index_build, Policy::from_index(index), stamp)
+        Self::update(layout, rank(index), Policy::from_index(index), stamp)
     }
 
+    /// Latch `policy` from the index [`rank`]ed `(index_build, generation, roster_seq)`
+    /// unless the latch holds a newer one.
     fn update(
         layout: &Layout,
-        index_build: u64,
+        (index_build, generation, roster_seq): (u64, u64, Option<u64>),
         policy: Policy,
         checked_at: i64,
     ) -> io::Result<bool> {
         let next = Self {
             index_build,
+            roster_seq,
             policy,
             checked_at,
         };
         if let Some(stored) = Self::read(layout)
-            && (index_build < stored.index_build || stored == next)
+            && (!stored.admits_at(generation, index_build) || stored == next)
         {
             return Ok(false);
         }
         let file = LatchFile {
             schema: LATCH_SCHEMA,
             index_build,
+            roster_seq,
             checked_at,
             yanks: next.policy.spellings(),
         };
@@ -301,6 +338,18 @@ impl YankLatch {
         durable::write_durable(&latch_path(layout), &bytes)?;
         Ok(true)
     }
+}
+
+/// Where `index` stands in the latch's order — its build, the generation it DECLARES
+/// ([`TrustedIndex::authorizing_seq`], what `select_index` admits a candidate by) and the
+/// generation that authorized it ([`TrustedIndex::roster_seq`], what the build floor
+/// records): the floor's own pair.
+fn rank(index: &TrustedIndex) -> (u64, u64, Option<u64>) {
+    (
+        index.index_build,
+        index.authorizing_seq(),
+        Some(index.roster_seq()),
+    )
 }
 
 #[cfg(test)]
@@ -323,27 +372,50 @@ mod tests {
         }
     }
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!(
-            "atpkg-vendor-policy-{label}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-vendor-policy-{label}-"))
     }
 
-    fn index(index_build: u64, yanked: &[&str]) -> Index {
-        Index {
-            schema: 2,
-            index_build,
-            generated_at: String::new(),
-            valid_until: "2099-01-01T00:00:00Z".into(),
-            machine_id: None,
-            roster_seq: None,
-            programs: BTreeMap::new(),
-            channels: vec![channel(yanked)],
-        }
+    fn index(index_build: u64, yanked: &[&str]) -> TrustedIndex {
+        index_at(crate::sig::testkit::SEQ, index_build, yanked)
+    }
+
+    /// The index `index_build` yanking `yanked`, declaring roster generation `generation`
+    /// and authorized under it through the real chain.
+    fn index_at(generation: u64, index_build: u64, yanked: &[&str]) -> TrustedIndex {
+        let yanked: Vec<String> = yanked.iter().map(|y| format!("\"{y}\"")).collect();
+        let body = format!(
+            "schema = 2\nindex_build = {index_build}\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
+             machine_id = \"{}\"\nroster_seq = {generation}\n\
+             [[channels]]\nname = \"stable\"\nyanked = [{}]\n",
+            crate::sig::testkit::MACHINE_ID,
+            yanked.join(", ")
+        );
+        crate::sig::testkit::trusted_index_at(generation, body.into_bytes())
+    }
+
+    /// THE MASTER'S RE-BASE REACHES THE LATCH, as it reaches the build floor
+    /// ([`crate::sig::BuildFloor::admits`]): an index a rostered machine signed at the TOML
+    /// integer ceiling was latched first, and the strictly newer generation's index — the
+    /// owner's revoking republish, at a sane build — binds its yanks and is latched in its
+    /// place. From there the latch orders as the floor does: an older build of that
+    /// generation never lifts the rescue's yank.
+    #[test]
+    fn a_newer_generation_supersedes_the_latch_whatever_its_index_build() {
+        let l = layout("rebase");
+        let poisoned = index_at(3, i64::MAX.unsigned_abs(), &[]);
+        YankLatch::update_from_index(&l, &poisoned, 100).unwrap();
+        let rescue = index_at(4, 101, &["claude@2.1.300"]);
+        assert!(
+            Policy::current(&l, Some(&rescue)).is_yanked("claude", v("2.1.300")),
+            "the newer generation's yank was ignored for the latched one"
+        );
+        assert!(YankLatch::update_from_index(&l, &rescue, 200).unwrap());
+        assert!(Policy::current(&l, None).is_yanked("claude", v("2.1.300")));
+        assert!(
+            Policy::current(&l, Some(&index_at(4, 100, &[]))).is_yanked("claude", v("2.1.300")),
+            "an older build of the new generation lifted the rescue's yank"
+        );
     }
 
     /// A replayed OLDER index (signed, in its window) never lifts a yank the latch took
@@ -506,6 +578,7 @@ mod tests {
     fn a_latch_is_current_for_an_hour_after_its_verification() {
         let at = |checked_at: i64| YankLatch {
             index_build: 44,
+            roster_seq: None,
             policy: Policy::default(),
             checked_at,
         };

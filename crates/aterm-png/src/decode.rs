@@ -4,11 +4,14 @@
 //! PNG decoding: chunk structure, filters, Adam7 de-interlacing, and the two
 //! output transforms.
 //!
-//! The pipeline is per-scanline, never per-image-buffer-of-u16s: a 4096x4096
-//! RGBA image is 64 MiB of output, and materialising an intermediate at wider
-//! samples would double or quadruple that for no gain. One row of source
-//! samples is unfiltered, transformed, and written into the caller's buffer
-//! before the next is touched.
+//! The pipeline is per-scanline from the inflate on: one row of source samples
+//! is decompressed, unfiltered, transformed, and written into the caller's
+//! buffer before the next is touched. A 4096x4096 RGBA image is 64 MiB of
+//! output, and holding the whole decompressed stream beside it (twice the
+//! output for 16-bit samples) would double that for no gain — and make a fixed
+//! cap on that intermediate, not the caller's own budget, decide which images
+//! load. So the caller's output buffer is the only allocation that scales with
+//! the image.
 //!
 //! Adam7 is the one place that shape bends: an interlaced pass row's pixels land
 //! at scattered (x, y) positions, so each pixel is written individually — which
@@ -17,14 +20,15 @@
 
 use std::io::Read;
 
+use aterm_codec::inflate::stream::ZlibReader;
+
 use crate::checksum::Crc32;
 use crate::{
     BitDepth, ColorType, DecodingError, Info, Limits, OutputInfo, SIGNATURE, SrgbRenderingIntent,
     Transformations, row_bytes,
 };
 
-/// Reads a PNG's header and image data. Mirrors the shape of the retired
-/// crate's decoder so consuming code reads the same.
+/// Reads a PNG's header and image data.
 pub struct Decoder<R> {
     source: R,
     limits: Limits,
@@ -58,7 +62,8 @@ impl<R: Read> Decoder<R> {
     ///
     /// # Errors
     /// [`DecodingError`] for a bad signature, a truncated or CRC-failing chunk,
-    /// an illegal header, or a structure PNG does not allow.
+    /// an illegal header, a structure PNG does not allow, or an output buffer
+    /// larger than the configured [`Limits`].
     pub fn read_info(mut self) -> Result<Reader, DecodingError> {
         let mut bytes = Vec::new();
         self.source
@@ -73,7 +78,6 @@ pub struct Reader {
     info: Info,
     /// The concatenated IDAT payload — one zlib stream.
     compressed: Vec<u8>,
-    limits: Limits,
     transformations: Transformations,
     output: OutputInfo,
 }
@@ -126,13 +130,9 @@ fn read_chunk(bytes: &[u8], offset: usize) -> Result<Chunk<'_>, DecodingError> {
 /// widenings, an `Option` and a second bounds check into one indexed load.
 type PaletteLut = [[u16; 4]; 256];
 
-/// Resolve the palette (and tRNS, when present) into [`PaletteLut`].
-///
-/// Every rule the per-pixel path applied is applied here instead, unchanged and
-/// in the same order — including the two that look like edge cases and are not:
-/// an index past the end of PLTE resolves to opaque black rather than failing
-/// the whole image, and a tRNS shorter than the palette leaves its missing
-/// entries fully opaque (PNG specification 11.3.2.1).
+/// Resolve the palette (and tRNS, when present) into [`PaletteLut`]: an index
+/// past the end of PLTE resolves to opaque black, and a tRNS shorter than the
+/// palette leaves its missing entries opaque (PNG specification 11.3.2.1).
 fn build_palette_lut(info: &Info) -> Result<Box<PaletteLut>, DecodingError> {
     let palette = info
         .palette
@@ -141,13 +141,8 @@ fn build_palette_lut(info: &Info) -> Result<Box<PaletteLut>, DecodingError> {
     let mut lut: Box<PaletteLut> = Box::new([[0u16; 4]; 256]);
     for (index, slot) in lut.iter_mut().enumerate() {
         let base = index * 3;
-        // An index past the palette is a malformed file, but refusing the WHOLE
-        // image over one stray byte is the worse failure: the retired crate
-        // renders the file and gives the undefined index a defined colour, and
-        // this crate's own header cites a colour-emoji strike that vanished
-        // entirely rather than rendering with one wrong pixel. So: black and
-        // opaque, which is exactly the entry `png` leaves in its palette table
-        // for an index it never filled in.
+        // Malformed, but one wrong pixel beats a vanished glyph: opaque black,
+        // the entry `png` left for an index it never filled in.
         const UNDEFINED_ENTRY: &[u8; 3] = &[0, 0, 0];
         let entry = palette
             .get(base..base + 3)
@@ -156,10 +151,8 @@ fn build_palette_lut(info: &Info) -> Result<Box<PaletteLut>, DecodingError> {
         slot[1] = u16::from(entry[1]);
         slot[2] = u16::from(entry[2]);
         if let Some(trns) = &info.trns {
-            // tRNS may be SHORTER than the palette; missing entries are fully
-            // opaque (PNG specification 11.3.2.1). With no tRNS at all the
-            // alpha slot stays 0 and the output colour type is Rgb, which never
-            // reads it — the per-pixel path left it 0 for the same reason.
+            // With no tRNS the alpha slot stays 0: the output is Rgb, which
+            // never reads it.
             slot[3] = u16::from(trns.get(index).copied().unwrap_or(255));
         }
     }
@@ -223,9 +216,8 @@ impl Reader {
         let mut seen_idat = false;
         let mut seen_plte = false;
         let mut seen_trns = false;
-        // Set once the run of IDATs has been interrupted by any other chunk.
-        // PNG requires the IDATs to be CONSECUTIVE, and a decoder that quietly
-        // concatenates across a gap accepts files the retired crate refused.
+        // Set once the run of IDATs is interrupted: PNG requires them
+        // consecutive.
         let mut idat_run_ended = false;
         let mut seen_iend = false;
         let mut offset = first.next;
@@ -236,13 +228,9 @@ impl Reader {
             if &chunk.kind != b"IDAT" {
                 idat_run_ended = seen_idat;
             }
-            // A ZERO-LENGTH chunk carries nothing to parse, and the retired
-            // crate never parsed one — its reader jumps straight from the length
-            // to the CRC. So an empty `tRNS` is ABSENT rather than present-
-            // and-empty, which matters: `output_info` branches on
-            // `trns.is_some()`, so parsing it would change the output's SHAPE
-            // (Rgba, w*4) and not merely its pixels. Same for an empty `PLTE`
-            // or `sRGB`. IDAT and IEND are structural and still count.
+            // A zero-length ancillary chunk is ABSENT, as in `png`: an empty
+            // `tRNS` must not flip `output_info`'s `trns.is_some()` and change
+            // the output's shape. IDAT and IEND are structural and still count.
             if chunk.data.is_empty() && !matches!(&chunk.kind, b"IDAT" | b"IEND") {
                 continue;
             }
@@ -295,11 +283,9 @@ impl Reader {
                             // "The tRNS chunk shall not contain more alpha
                             // values than there are palette entries"
                             // (specification 11.3.2.1). One that does is
-                            // IGNORED — the chunk still promotes the output to
-                            // RGBA, but every entry reads back opaque. That is
-                            // what the retired crate does, and reading the
-                            // over-long chunk anyway would silently make a
-                            // malformed strike translucent.
+                            // IGNORED, as in `png`: the output is still RGBA,
+                            // but every entry reads back opaque, so a malformed
+                            // strike is never made translucent.
                             Vec::new()
                         } else {
                             chunk.data.to_vec()
@@ -328,10 +314,7 @@ impl Reader {
                     seen_iend = true;
                     break;
                 }
-                // Every other chunk is ancillary to what aterm reads. Its CRC has
-                // already been checked by `read_chunk`, which is the part that
-                // matters: a file whose chunk structure does not hold together
-                // is not silently half-read.
+                // Other chunks are skipped; `read_chunk` has checked their CRC.
                 _ => {}
             }
         }
@@ -347,10 +330,14 @@ impl Reader {
         }
 
         let output = output_info(&info, transformations)?;
+        // Refused HERE, before a caller sizes a buffer by `output_buffer_size`:
+        // a Reader that exists never asks for more than the limit allows.
+        if output.buffer_size() > limits.bytes {
+            return Err(DecodingError::LimitsExceeded);
+        }
         Ok(Self {
             info,
             compressed,
-            limits,
             transformations,
             output,
         })
@@ -370,67 +357,31 @@ impl Reader {
 
     /// Decode the image into `buf`.
     ///
+    /// The image data is inflated and unfiltered a scanline at a time, so the
+    /// output buffer is the one allocation that scales with the image, and it
+    /// is the one [`Limits`] bounds (checked when the header was read).
+    ///
     /// # Errors
-    /// [`DecodingError`] if `buf` is too small, the compressed data is corrupt,
-    /// a filter byte is not one of the five defined types, or the image needs
-    /// more than the configured [`Limits`].
+    /// [`DecodingError`] if `buf` is too small, the compressed data is corrupt
+    /// or holds fewer or far more scanlines than the header declares, or a
+    /// filter byte is not one of the five defined types.
     pub fn next_frame(&mut self, buf: &mut [u8]) -> Result<OutputInfo, DecodingError> {
         let out_size = self.output.buffer_size();
         if buf.len() < out_size {
             return Err(DecodingError::Malformed("output buffer is too small"));
         }
-        if out_size > self.limits.bytes {
-            return Err(DecodingError::LimitsExceeded);
-        }
 
         let samples = self.info.color_type.samples();
         let depth = self.info.bit_depth.bits();
-        // Bytes the filtered, decompressed stream must hold: every pass's rows,
-        // each prefixed by its one filter byte.
-        let mut filtered_len = 0usize;
-        for (_, pass_w, pass_h) in self.passes() {
+        // Every pass's source stride, before a byte is inflated: a geometry whose
+        // scanline does not fit `usize` is refused outright.
+        let mut passes = Vec::with_capacity(7);
+        for (pass, pass_w, pass_h) in self.passes() {
             let stride = row_bytes(pass_w, samples, depth).ok_or(DecodingError::LimitsExceeded)?;
-            filtered_len = filtered_len
-                .checked_add(
-                    (stride.checked_add(1).ok_or(DecodingError::LimitsExceeded)?)
-                        .checked_mul(pass_h as usize)
-                        .ok_or(DecodingError::LimitsExceeded)?,
-                )
-                .ok_or(DecodingError::LimitsExceeded)?;
-        }
-        if filtered_len > self.limits.bytes {
-            return Err(DecodingError::LimitsExceeded);
+            passes.push((pass, pass_w, pass_h, stride));
         }
 
-        // A well-formed stream decompresses to EXACTLY `filtered_len`. The slack
-        // admits an encoder that padded the zlib stream without letting a
-        // decompression bomb through: the bound is still the image's own size
-        // plus one maximal DEFLATE stored block, which is the largest single
-        // block of padding an encoder can emit (RFC 1951 caps LEN at 65535).
-        // Past that the excess is not padding, and it gets its own error rather
-        // than being reported as corruption.
-        const TRAILING_SLACK: usize = 65_535;
-        // The PREFIX form: the Adler-32 sits at the end of the zlib STREAM, not
-        // at the end of the buffer. A concatenated IDAT payload with any bytes
-        // after the stream — one is enough — would otherwise have its checksum
-        // read out of the padding and a perfectly good image reported corrupt.
-        let raw = match aterm_codec::inflate::zlib_decompress_prefix(
-            &self.compressed,
-            filtered_len.saturating_add(TRAILING_SLACK),
-        ) {
-            Ok((raw, _consumed)) => raw,
-            Err(aterm_codec::inflate::InflateError::OutputTooLarge) => {
-                return Err(DecodingError::ExcessImageData);
-            }
-            Err(_) => return Err(DecodingError::BadZlib),
-        };
-        if raw.len() < filtered_len {
-            return Err(DecodingError::Truncated);
-        }
-
-        // Resolved once, here, rather than per pixel in `transform_pixel`.
-        // `None` for every other colour type and whenever EXPAND is off, which
-        // is what keeps the fast path from claiming rows it must not touch.
+        // `Some` exactly for Indexed + EXPAND; `transform_pixel` answers from it.
         let palette_lut = if self.transformations.contains(Transformations::EXPAND)
             && self.info.color_type == ColorType::Indexed
         {
@@ -440,35 +391,74 @@ impl Reader {
         };
         let palette_lut = palette_lut.as_deref();
 
+        // The PREFIX form: the Adler-32 sits at the end of the zlib STREAM, not
+        // at the end of the buffer. A concatenated IDAT payload with any bytes
+        // after the stream — one is enough — would otherwise have its checksum
+        // read out of the padding and a perfectly good image reported corrupt.
+        let mut stream = ZlibReader::new(self.compressed.as_slice());
+        // The first scanline that could not be placed (a filter type PNG does
+        // not define). The stream's own verdict comes first — corrupt, short or
+        // past the image is reported as that — so this waits for the drain.
+        let mut row_error = None;
         let bpp = (samples * depth as usize).div_ceil(8).max(1);
-        let mut cursor = 0usize;
         // Reused across rows: `prev` is the previous unfiltered row, which the
         // Up/Average/Paeth filters read.
         let mut prev: Vec<u8> = Vec::new();
         let mut current: Vec<u8> = Vec::new();
 
-        for (pass, pass_w, pass_h) in self.passes() {
-            let stride = row_bytes(pass_w, samples, depth).ok_or(DecodingError::LimitsExceeded)?;
+        for (pass, pass_w, pass_h, stride) in passes {
             prev.clear();
             prev.resize(stride, 0);
             current.clear();
             current.resize(stride, 0);
             for row in 0..pass_h {
-                let filter = raw[cursor];
-                cursor += 1;
-                current.copy_from_slice(&raw[cursor..cursor + stride]);
-                cursor += stride;
-                unfilter(filter, bpp, &prev, &mut current)?;
-                if self.info.interlaced {
-                    self.place_interlaced_row(buf, pass, row, pass_w, &current, palette_lut)?;
-                } else {
-                    self.place_row(buf, row, pass_w, &current, palette_lut)?;
+                let mut filter = [0u8];
+                read_image_data(&mut stream, &mut filter)?;
+                read_image_data(&mut stream, &mut current)?;
+                if row_error.is_some() {
+                    continue;
+                }
+                let placed = unfilter(filter[0], bpp, &prev, &mut current).and_then(|()| {
+                    if self.info.interlaced {
+                        self.place_interlaced_row(buf, pass, row, pass_w, &current, palette_lut)
+                    } else {
+                        self.place_row(buf, row, pass_w, &current, palette_lut)
+                    }
+                });
+                if let Err(e) = placed {
+                    row_error = Some(e);
+                    continue;
                 }
                 std::mem::swap(&mut prev, &mut current);
             }
         }
 
-        Ok(self.output)
+        // A well-formed stream ends with the last scanline. The slack admits an
+        // encoder that padded the zlib stream without letting a decompression
+        // bomb through: one maximal DEFLATE stored block, the largest single
+        // block of padding an encoder can emit (RFC 1951 caps LEN at 65535).
+        // Past that the excess is not padding, and it gets its own error rather
+        // than being reported as corruption.
+        const TRAILING_SLACK: usize = 65_535;
+        let mut excess = 0usize;
+        let mut sink = [0u8; 4096];
+        loop {
+            match stream.read(&mut sink) {
+                Ok(0) => break,
+                Ok(n) => {
+                    excess = excess.saturating_add(n);
+                    if excess > TRAILING_SLACK {
+                        return Err(DecodingError::ExcessImageData);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(DecodingError::BadZlib),
+            }
+        }
+        match row_error {
+            Some(e) => Err(e),
+            None => Ok(self.output),
+        }
     }
 
     /// Each pass that has pixels in it, as `(Adam7 pass number, width, height)`:
@@ -501,11 +491,8 @@ impl Reader {
         let line = self.output.line_size;
         let start = (y as usize) * line;
         let out_row = &mut buf[start..start + line];
-        // When the requested transforms turn out to be no-ops for THIS image —
-        // the overwhelmingly common case, an 8-bit RGBA screenshot asked for
-        // EXPAND | STRIP_16 — the output format equals the source format and the
-        // row is a straight copy. Going through `transform_pixel` per pixel
-        // would compute the same bytes far more slowly.
+        // Transforms that are no-ops for this image (the common case: 8-bit
+        // RGBA under EXPAND | STRIP_16) make the row a straight copy.
         if self.output.color_type == self.info.color_type
             && self.output.bit_depth == self.info.bit_depth
         {
@@ -555,11 +542,8 @@ impl Reader {
     ) -> Result<[u16; 4], DecodingError> {
         let depth = self.info.bit_depth.bits();
         let samples = self.info.color_type.samples();
-        // Indexed + EXPAND, resolved. The caller built this exactly when the
-        // branch below would have run, so reaching it here is the same test.
-        // Indexed depth is 1, 2, 4 or 8 (the header parser rejects anything
-        // else), so the sample cannot exceed 255 and the mask is a no-op that
-        // simply lets the compiler see it — no bounds check, no panic edge.
+        // Indexed + EXPAND. Indexed depth is at most 8, so the mask is a no-op
+        // that lets the compiler drop the bounds check.
         if let Some(lut) = palette_lut {
             let index = read_sample(row, x as usize, depth) as usize;
             return Ok(lut[index & 0xFF]);
@@ -574,9 +558,6 @@ impl Reader {
         // Full-scale value at the source depth: what "opaque" and "white" are.
         let src_max = ((1u32 << depth) - 1) as u16;
 
-        // Indexed + EXPAND does not appear below: it is answered above, out of
-        // the table. Keeping a second copy of the palette rules here would be
-        // unreachable code that drifts from the one that runs.
         let mut out = [0u16; 4];
 
         match self.info.color_type {
@@ -589,12 +570,6 @@ impl Reader {
                         out[0] = (u32::from(src[0]) * 255 / u32::from(src_max)) as u16;
                     }
                     if let Some(trns) = &self.info.trns {
-                        // The key is stored as two bytes whatever the depth, and
-                        // below 16 bits only the LOW byte is the sample — the
-                        // high byte is required to be zero and is ignored, not
-                        // compared. Comparing the full 16-bit word makes a
-                        // malformed key silently never match, where the retired
-                        // crate makes it match.
                         let key = mask_trns_key(u16::from_be_bytes([trns[0], trns[1]]), depth);
                         // The comparison is against the RAW sample, before any
                         // scaling — tRNS names a stored value, not a colour.
@@ -637,15 +612,10 @@ impl Reader {
 
 /// A `tRNS` colour key, reduced to the width the samples actually have.
 ///
-/// PNG stores the key as a 16-bit big-endian value for every depth, but at a
-/// depth below 16 only the low byte holds the sample; the high byte is required
-/// to be zero. A file that puts something else there is malformed, and the
-/// question is only what a decoder does with it. `png` masks (its `parse_trns`
-/// does `vec[0] = vec[1]; vec.truncate(1)` for `bit_depth < 16`), so a key of
-/// `0x012A` at depth 8 matches the sample `0x2A`. Comparing the full word
-/// instead would make that key match nothing at all — a silent pixel-level
-/// divergence on exactly the malformed input where the two decoders should
-/// agree.
+/// PNG stores the key as 16 bits at every depth; below 16 only the low byte is
+/// the sample and the high byte must be zero. A malformed key is masked, as
+/// `png` did, so `0x012A` at depth 8 matches the sample `0x2A` rather than
+/// nothing.
 fn mask_trns_key(key: u16, depth: u32) -> u16 {
     if depth < 16 { key & 0x00FF } else { key }
 }
@@ -730,6 +700,24 @@ fn adam7_pass_size(pass: usize, w: u32, h: u32) -> (u32, u32) {
     let pw = if w > x0 { (w - x0).div_ceil(dx) } else { 0 };
     let ph = if h > y0 { (h - y0).div_ceil(dy) } else { 0 };
     (pw, ph)
+}
+
+/// Fill `buf` from the image's zlib stream. A stream that ends cleanly (its
+/// Adler-32 verified) before `buf` is full holds fewer scanlines than the header
+/// declares; one that cannot be decompressed is corrupt.
+fn read_image_data(stream: &mut impl Read, buf: &mut [u8]) -> Result<(), DecodingError> {
+    let mut filled = 0;
+    while let Some(rest) = buf.get_mut(filled..)
+        && !rest.is_empty()
+    {
+        match stream.read(rest) {
+            Ok(0) => return Err(DecodingError::Truncated),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(DecodingError::BadZlib),
+        }
+    }
+    Ok(())
 }
 
 /// Reverse one scanline filter in place. `prev` is the already-unfiltered row

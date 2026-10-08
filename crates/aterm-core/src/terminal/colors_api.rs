@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Hyperlink, underline color, CWD, color palette, and BiDi config accessors.
-//!
-//! Extracted from mod.rs to reduce file size.
 
 use super::{ColorPalette, Rgb, Terminal};
 use std::ops::{Deref, DerefMut};
@@ -50,9 +48,7 @@ impl Drop for ColorPaletteMut<'_> {
 }
 
 impl Terminal {
-    /// Get the current hyperlink URL (OSC 8).
-    ///
-    /// Returns the URL that will be applied to newly printed characters.
+    /// The OSC 8 hyperlink URL applied to newly printed characters.
     #[must_use]
     pub fn current_hyperlink(&self) -> Option<&Arc<str>> {
         self.transient.current_hyperlink.as_ref()
@@ -67,11 +63,11 @@ impl Terminal {
             .map(Arc::as_ref)
     }
 
-    /// The hyperlink URL attached to the cell at VIEWPORT row `visible_row` —
+    /// The hyperlink URL attached to the cell at viewport row `visible_row` —
     /// the display-offset-AWARE twin of [`Self::hyperlink_at`], and the one a
-    /// host must ask when it is answering for what a person is LOOKING AT.
+    /// host must ask when it is answering for what a person is looking at.
     ///
-    /// [`Self::hyperlink_at`] keys the extras map by the LIVE screen row, so
+    /// [`Self::hyperlink_at`] keys the extras map by the live screen row, so
     /// scrolled back it answers about a line eight rows further down (or about
     /// a blank one) while the frame under the pointer was drawn from history.
     /// This resolves through the same [`Grid::visible_row_view`] the frame
@@ -79,7 +75,7 @@ impl Terminal {
     /// underline the renderer stamped always describe one cell. The two
     /// coincide at `display_offset == 0`.
     ///
-    /// Owned rather than borrowed because a scrolled-off row is MATERIALIZED:
+    /// Owned rather than borrowed because a scrolled-off row is materialized:
     /// its extras belong to the view, so no reference can outlive the
     /// resolution.
     ///
@@ -106,19 +102,14 @@ impl Terminal {
             .map(Arc::as_ref)
     }
 
-    /// Get the current working directory (OSC 7).
-    ///
-    /// Returns the path portion of the working directory URL set by the shell.
-    /// The path is decoded from percent-encoding.
+    /// The percent-decoded path of the working directory URL the shell set
+    /// (OSC 7).
     #[must_use]
     pub fn current_working_directory(&self) -> Option<&str> {
         self.current_working_directory.as_deref()
     }
 
-    /// Get the color palette.
-    ///
-    /// The palette maps indexed colors (0-255) to RGB values. Use this to
-    /// resolve indexed colors to their actual RGB values for rendering.
+    /// The indexed (0-255) color palette.
     #[must_use]
     pub fn color_palette(&self) -> &ColorPalette {
         &self.color.palette
@@ -252,10 +243,10 @@ impl Terminal {
         self.color.cursor_color
     }
 
-    /// Whether a program has RECOLOURED the cursor over the host's baseline —
+    /// Whether a program has recoloured the cursor over the host's baseline —
     /// a live OSC 12 that OSC 112 / RIS has not yet reset.
     ///
-    /// [`Self::set_default_cursor_color`] seeds BOTH the live value and the
+    /// [`Self::set_default_cursor_color`] seeds both the live value and the
     /// reset baseline from the theme, so [`Self::cursor_color`] being `Some`
     /// says nothing about whether anyone asked for that colour: on every
     /// default window it is the theme's own seed. The two slots diverge only

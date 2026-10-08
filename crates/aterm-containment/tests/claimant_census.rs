@@ -10,11 +10,12 @@
 
 #![cfg(target_os = "macos")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aterm_containment::DrClass;
 use aterm_containment::consent::{
-    Candidate, Claimant, Enumeration, classify_claimants, list_root, read_candidate, still_claims,
+    BundleIdentity, Candidate, Claimant, Enumeration, Retired, classify_claimants, list_root,
+    locate_candidate, read_candidate, retire_claimants, still_claims,
 };
 
 const ID: &str = "com.test.aterm-census";
@@ -39,16 +40,7 @@ fn lay_signed(root: &Path, name: &str, marker: &str) {
         format!("#!/bin/sh\necho {marker}\n"),
     )
     .expect("exe");
-    let status = std::process::Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(root.join(name))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    assert!(
-        matches!(status, Ok(s) if s.success()),
-        "codesign --sign - failed for {name}: {status:?}"
-    );
+    aterm_uds::deadline::sign_ad_hoc(&root.join(name));
 }
 
 #[test]
@@ -66,6 +58,7 @@ fn the_real_census_tells_a_rollback_and_a_backup_from_the_running_copy() {
         &[(root.clone(), true)],
         Some(&[]),
         list_root,
+        locate_candidate,
         |candidate| read_candidate(candidate, ID, &[]),
     );
 
@@ -111,6 +104,7 @@ fn still_claims_follows_the_bundle_on_disk() {
         signing: id.signing,
         team: id.team,
         running: false,
+        links: Vec::new(),
     };
     assert!(still_claims(&copy, ID), "the copy the census read");
     assert!(!still_claims(&copy, "com.test.someone-else"), "another id");
@@ -153,12 +147,13 @@ fn still_claims_tells_an_unsigned_copy_from_a_failed_read() {
         signing: id.signing,
         team: id.team,
         running: false,
+        links: Vec::new(),
     };
     assert!(still_claims(&copy, ID), "the same unsigned copy");
 
     // An unreadable executable makes `codesign` answer `Permission denied`: a
-    // read that failed, with no requirement text — which a text-only
-    // comparison would have taken for the unsigned copy. (Root reads it anyway.)
+    // failed read with no requirement text, not an unsigned copy. (Root reads
+    // it anyway.)
     // SAFETY: `geteuid` has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
         return;
@@ -172,4 +167,101 @@ fn still_claims_tells_an_unsigned_copy_from_a_failed_read() {
         !failed_read_matches,
         "codesign could not read it: no class, so not the copy"
     );
+}
+
+/// One bundle is one claimant however many names reach it. Beside a running
+/// copy (presented as Developer ID, however it is spelled) sit an ad-hoc
+/// rollback, an ad-hoc dev build `LaunchServices` registered, a link in the
+/// app folder to that dev build, and a link in a second app folder to the
+/// running copy. The census finds three bundles, not five: the link to the
+/// running copy is the running copy, and the link to the dev build is that
+/// build. The rollback is offered for the Trash; the dev build a link leads
+/// to is listed and never offered, and a plan naming the link moves nothing.
+#[test]
+fn a_link_is_the_bundle_it_names() {
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let base = std::fs::canonicalize(tmp.path()).expect("resolve tempdir");
+    let (apps, home_apps) = (base.join("Applications"), base.join("HomeApplications"));
+    let build = base.join("dev/target/release/bundle");
+    for dir in [&apps, &home_apps, &build] {
+        std::fs::create_dir_all(dir).expect("folder");
+    }
+    lay_signed(&apps, "aterm.app", "LIVE");
+    lay_signed(&apps, "aterm.app.rollback", "ROLLBACK");
+    lay_signed(&build, "aterm.app", "DEV");
+    let (running, rollback, dev) = (
+        apps.join("aterm.app"),
+        apps.join("aterm.app.rollback"),
+        build.join("aterm.app"),
+    );
+    let (dev_link, running_link) = (apps.join("aterm-dev.app"), home_apps.join("aterm.app"));
+    std::os::unix::fs::symlink(&dev, &dev_link).expect("link to the dev build");
+    std::os::unix::fs::symlink(&running, &running_link).expect("link to the running copy");
+
+    let census = classify_claimants(
+        Some(&running),
+        &[(apps.clone(), true), (home_apps, false)],
+        Some(std::slice::from_ref(&dev)),
+        list_root,
+        locate_candidate,
+        |candidate| {
+            if std::fs::canonicalize(candidate).is_ok_and(|real| real == running) {
+                Candidate::Ours(BundleIdentity {
+                    bundle_id: Some(ID.to_string()),
+                    dr_text: "designated => identifier \"x\" and anchor apple generic and \
+                              certificate leaf[subject.OU] = \"T\""
+                        .to_string(),
+                    dr: DrClass::Identity,
+                    signing: "developer-id",
+                    team: Some("T".to_string()),
+                })
+            } else {
+                read_candidate(candidate, ID, &[])
+            }
+        },
+    );
+    let found: Vec<(&Path, bool, &[PathBuf])> = census
+        .found
+        .iter()
+        .map(|c| (c.path.as_path(), c.running, c.links.as_slice()))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (running.as_path(), true, std::slice::from_ref(&running_link)),
+            (rollback.as_path(), false, &[][..]),
+            (dev.as_path(), false, std::slice::from_ref(&dev_link)),
+        ]
+    );
+    assert_eq!(census.enumeration, Enumeration::Complete);
+    let offered: Vec<&Path> = census
+        .offered_for_trash(true)
+        .iter()
+        .map(|c| c.path.as_path())
+        .collect();
+    assert_eq!(
+        offered,
+        vec![rollback.as_path()],
+        "the dev build a link leads to is never offered"
+    );
+    let moved = std::cell::RefCell::new(Vec::new());
+    let report = retire_claimants(
+        &[dev_link.clone(), dev.clone(), rollback.clone()],
+        &census,
+        |_| true,
+        |_| Some(false),
+        |path| {
+            moved.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        },
+    );
+    assert_eq!(
+        report,
+        vec![
+            (dev_link, Retired::NotOffered),
+            (dev, Retired::NotOffered),
+            (rollback.clone(), Retired::Moved)
+        ]
+    );
+    assert_eq!(*moved.borrow(), vec![rollback]);
 }

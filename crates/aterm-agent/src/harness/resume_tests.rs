@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use std::path::PathBuf;
-
 use super::*;
 
 fn argv(words: &[&str]) -> Vec<String> {
@@ -14,17 +12,15 @@ const OURS: &str = "5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
 const SIBLING: &str = "0a0b0c0d-1111-4222-8333-444455556666";
 
 /// A private `<claude dir>` with a `sessions/` directory, removed on drop.
-struct ClaudeDir(PathBuf);
+struct ClaudeDir(aterm_tempfile::TempDir);
 
 impl ClaudeDir {
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-resume-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("sessions")).expect("sessions dir");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-resume-{tag}-"))
+            .tempdir()
+            .expect("sessions dir");
+        std::fs::create_dir_all(root.path().join("sessions")).expect("sessions dir");
         Self(root)
     }
 
@@ -36,14 +32,11 @@ impl ClaudeDir {
             started * 1000,
             crate::harness::footer::lstart_utc(started),
         );
-        std::fs::write(self.0.join("sessions").join(format!("{file}.json")), text)
-            .expect("write record");
-    }
-}
-
-impl Drop for ClaudeDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        std::fs::write(
+            self.0.path().join("sessions").join(format!("{file}.json")),
+            text,
+        )
+        .expect("write record");
     }
 }
 
@@ -54,7 +47,7 @@ fn line_of(dir: &ClaudeDir, pid: u32, started: Option<u64>, argv: &[String]) -> 
     use crate::harness::footer;
     let offset = |_: Option<&str>, _: i64| None;
     footer::read_pid(
-        &dir.0,
+        dir.0.path(),
         pid,
         started,
         |_| (footer::LaunchFacts::default(), argv.to_vec()),
@@ -65,20 +58,19 @@ fn line_of(dir: &ClaudeDir, pid: u32, started: Option<u64>, argv: &[String]) -> 
             now: 0,
             offset_at: &offset,
         },
+        None,
     )
     .and_then(|facts| facts.resume)
 }
 
-/// THE BACKLOG'S CASE (2026-09-26): two live Claude Code processes filed
-/// under ONE working directory, the sibling's conversation the NEWER — the
-/// one `claude --continue` would resume. The command for each pid names that
-/// pid's own conversation, with its launch flags carried; never the other's,
-/// and never `--continue`. Read as the window reads it ([`line_of`]).
-/// NEGATIVE CONTROLS: a pid with no record, a record whose kernel start
-/// disagrees (a reused pid), a record filed under another pid's name, a
-/// record of another shape, and — the review of 2026-09-28 — a record with
-/// NO `procStart` where the kernel start is known all give no command, never
-/// a guess.
+/// Two live Claude Code processes filed under one working directory, the
+/// sibling's conversation the newer (the one `claude --continue` would
+/// resume). The command for each pid names that pid's own conversation, with
+/// its launch flags carried; never the other's, and never `--continue`. Read
+/// as the window reads it ([`line_of`]). Negative controls: a pid with no
+/// record, a record whose kernel start disagrees (a reused pid), a record
+/// filed under another pid's name, a record of another shape, and a record
+/// with no `procStart` where the kernel start is known all give no command.
 #[test]
 fn two_records_in_one_directory_each_pid_resumes_its_own_conversation() {
     let dir = ClaudeDir::new("two");
@@ -123,20 +115,20 @@ fn two_records_in_one_directory_each_pid_resumes_its_own_conversation() {
     dir.record(777, sibling_pid, SIBLING, sibling_start, 1);
     assert_eq!(line_of(&dir, 777, None, &launch), None);
     // A record of another shape.
-    std::fs::write(dir.0.join("sessions/778.json"), r#"{"pid":778}"#).expect("write");
+    std::fs::write(dir.0.path().join("sessions/778.json"), r#"{"pid":778}"#).expect("write");
     assert_eq!(line_of(&dir, 778, None, &launch), None);
     // A record with no `procStart`: the footer shows its facts, but where
-    // the kernel's start is known nothing ties the record to THIS process,
+    // the kernel's start is known nothing ties the record to this process,
     // so no line to type. With no start known the pid alone decides, as
     // above.
     std::fs::write(
-        dir.0.join("sessions/779.json"),
+        dir.0.path().join("sessions/779.json"),
         format!(r#"{{"pid":779,"sessionId":"{OURS}","cwd":"/Users/_owner/aterm"}}"#),
     )
     .expect("write");
     let offset = |_: Option<&str>, _: i64| None;
     let facts = crate::harness::footer::read_pid(
-        &dir.0,
+        dir.0.path(),
         779,
         Some(ours_start),
         |_| {
@@ -152,6 +144,7 @@ fn two_records_in_one_directory_each_pid_resumes_its_own_conversation() {
             now: 0,
             offset_at: &offset,
         },
+        None,
     )
     .expect("the footer reads the record");
     assert_eq!(facts.resume, None, "no procStart, a known start: no line");
@@ -220,14 +213,14 @@ fn the_line_carries_the_launch_flags_as_the_relaunch_does() {
     assert_eq!(bare_of("claude --continue"), None);
 }
 
-/// A resume line a reason names is NEVER CUT by a renderer that cuts
-/// (resume-hint review, 2026-09-26): [`never_cut`] keeps it whole, else in
-/// its bare form, else drops its clause — and a text naming no line is
-/// rendered untouched. The renderer here is a plain byte cap with `…`, the
-/// shape of the supervisor's escalation.
+/// A resume line a reason names is never cut by a renderer that cuts:
+/// [`never_cut`] keeps it whole, else with its permission mode alone, else in
+/// its bare form, else drops its clause,
+/// and a text naming no line is rendered untouched. The renderer here is a
+/// plain byte cap with `…`, the shape of the supervisor's escalation.
 ///
-/// NEGATIVE CONTROL: the same renderer given the text directly cuts the id
-/// mid-way — the defect the ladder exists for.
+/// Negative control: the same renderer given the text directly cuts the id
+/// mid-way.
 #[test]
 fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
     let cap = |n: usize| {
@@ -252,6 +245,13 @@ fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
     // Room for the id but not the tail: the whole line, the tail cut.
     let out = never_cut(&text, cap(text.len() - 5));
     assert!(out.contains(&line), "{out}");
+    // Room for its permission mode, not its other flags: the mode alone —
+    // the last flag a line gives up (round three of the joint audit of
+    // 2026-10-01; a bare line brings the orchestrator back in another mode).
+    let mode = format!("claude --dangerously-skip-permissions --resume {OURS}");
+    let room = "memory critical: restart it, then resume with ".len() + mode.len() + 3;
+    let out = never_cut(&text, cap(room));
+    assert!(out.contains(&mode), "{out}");
     // Room for the bare form only.
     let room = "memory critical: restart it, then resume with ".len() + bare.len() + 3;
     let out = never_cut(&text, cap(room));
@@ -259,7 +259,7 @@ fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
         out.contains(&bare) && !out.contains("--dangerously"),
         "{out}"
     );
-    // THE NEGATIVE CONTROL: the renderer alone cuts the command — it is
+    // Negative control: the renderer alone cuts the command — it is
     // named, and its conversation is not.
     let cut = cap(room)(&text);
     assert!(

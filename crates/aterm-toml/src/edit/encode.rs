@@ -5,9 +5,10 @@
 //!
 //! For a document that came from a parse and was not modified, this is exactly
 //! `concat` over the stored source fragments — every byte of the input landed
-//! in some node's repr, decor, preamble, or trailing, so putting them back in
-//! order reproduces the file. That is the property `tests/roundtrip.rs` asserts
-//! over every `.toml` file in the repository.
+//! in some node's repr, decor, preamble, or trailing, or is the leading
+//! byte-order mark the document records, so putting them back in order
+//! reproduces the file. That is the property `tests/roundtrip.rs` asserts over
+//! every `.toml` file in the repository.
 //!
 //! Nodes that were BUILT rather than parsed have no stored text, and fall back
 //! to the canonical spacing named in the `DEFAULT_*` constants below.
@@ -32,6 +33,11 @@ impl fmt::Display for DocumentMut {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::new();
         encode_document(&mut out, self.as_table(), self.trailing.as_str());
+        // Outside `out`: the encoder reads an empty `out` as the start of the
+        // file (no line to end, no blank line above the first header).
+        if self.bom {
+            f.write_char('\u{feff}')?;
+        }
         f.write_str(&out)
     }
 }
@@ -157,6 +163,7 @@ fn visit_nested_tables<'t>(
 fn encode_table(out: &mut String, table: &Table, path: &[&Key], is_array: bool) {
     let children = table.get_values();
     if !path.is_empty() && (is_array || !(table.implicit && children.is_empty())) {
+        end_line(out);
         // The first header in a document gets no leading blank line; every
         // later one does. Authored decor overrides both.
         let default_prefix = if out.is_empty() {
@@ -174,6 +181,7 @@ fn encode_table(out: &mut String, table: &Table, path: &[&Key], is_array: bool) 
         out.push_str(&table.decor.suffix_or(DEFAULT_TABLE_DECOR.1));
     }
     for (key_path, value) in children {
+        end_line(out);
         encode_key_value(
             out,
             &key_path,
@@ -181,6 +189,29 @@ fn encode_table(out: &mut String, table: &Table, path: &[&Key], is_array: bool) 
             DEFAULT_KEY_DECOR,
             DEFAULT_VALUE_DECOR,
         );
+    }
+    // The comment lines a removed last line was written under (`Table::trailing`).
+    if !table.trailing.as_str().is_empty() {
+        end_line(out);
+        out.push_str(table.trailing.as_str());
+    }
+}
+
+/// Terminate the line `out` ends on, if it is unterminated, so the next header
+/// or key-value line starts a line of its own.
+///
+/// The parser stores each line's terminator in the decor after the line's last
+/// token, so a file's final line, when the file ends without a newline, carries
+/// none: its suffix is `""` or ` # comment`. In a parsed, unmodified document
+/// nothing is printed after that line and this never fires. A line ADDED after
+/// it (a new key in the last table, a new table) would otherwise be glued on:
+/// `a = 1` + `b` printed `a = 1b = 2`, which does not parse, and
+/// `a = 1 # note` + `b` printed `a = 1 # noteb = 2`, which parses with `b`
+/// inside the comment. Only the header-and-key-value lines of a table come
+/// through here: the entries of an inline table share one line by definition.
+fn end_line(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
     }
 }
 

@@ -206,32 +206,52 @@ impl TurnLedger {
     }
 
     /// The floor ([`TurnLedger::unheld_below`]) while it still tells a reader
-    /// something: the ledger is empty, or the floor lies above its OLDEST
-    /// held record, so a turn id inside the window the ledger answers for may
-    /// be missing. Once every record under the floor has been evicted (the
-    /// oldest held id is at or past it), the floor sits below that window —
-    /// the same low-water eviction leaves, and [`TurnLedger::low_id`] already
-    /// answers the oldest record there — so it is stale and `None`: a floor
-    /// set by one update must not ride every `history` reply and every later
-    /// export for the rest of the session (round seven, finding 58's review).
+    /// something: until the records it lost would have AGED OUT of a ledger
+    /// carried whole. They are older than every record at or past the floor,
+    /// so that ledger has evicted them once it holds [`LEDGER_CAP`] such
+    /// records — this ledger is full, and its oldest record is at or past
+    /// the floor. From then on the floor is stale and `None`: a floor set by
+    /// one update must not ride every `history` reply and every later export
+    /// for the rest of the session (round seven, finding 58's review).
+    ///
+    /// Held records at or past the floor are not enough on their own: every
+    /// turn after a dropped ledger has an id at or past its floor, and a
+    /// halved carry holds only such records, so that rule went quiet one
+    /// turn after the update, or at once (round seven, finding 204).
     pub(crate) fn live_floor(&self) -> Option<u64> {
         let floor = self.unheld_below;
-        (floor > 0 && self.records.front().is_none_or(|front| floor > front.id)).then_some(floor)
+        let aged_out = self.records.len() >= LEDGER_CAP
+            && self.records.front().is_some_and(|front| front.id >= floor);
+        (floor > 0 && !aged_out).then_some(floor)
     }
 
     /// What a handoff's export carries as the ledger's `unheld_below`: the
-    /// ledger's own, raised past every turn still OPEN on this session. Such a
-    /// turn records into this process's ledger after the export took it (a
-    /// parked reader leaves its screen frozen, so an idle settle latches), and
-    /// the successor never sees that record — so the carried ledger must not
-    /// vouch for its id (round seven, finding 23).
-    #[cfg(any(unix, test))]
+    /// ledger's own, raised past every id a turn still OPEN on this session
+    /// can record under. Such a turn records into this process's ledger after
+    /// the export took it (a parked reader leaves its screen frozen, so an
+    /// idle settle latches), and the successor never sees that record — so
+    /// the carried ledger must not vouch for its id (round seven, finding 23).
+    ///
+    /// That id is the turn's own only while nothing records ahead of it: ONE
+    /// open turn, past every record. A turn at or below a record (a `lease
+    /// release force` preempted it, and the turn that took its slot
+    /// recorded), or one of several open at once, can land behind a newer
+    /// record, and [`TurnLedger::record`] re-numbers it with an id minted
+    /// after the export (round seven, finding 43) — any id up to `ceiling`,
+    /// the most this process mints before it exits (the turn-id count the
+    /// handoff's manifest carries, to which the Commit holds it). The carry
+    /// then vouches for no id up to `ceiling` (round eight, finding 40).
+    ///
     /// A floor gone stale ([`TurnLedger::live_floor`]) is not carried on.
-    pub(crate) fn carry_floor(&self) -> u64 {
-        self.open
-            .iter()
-            .map(|id| id.saturating_add(1))
-            .fold(self.live_floor().unwrap_or(0), u64::max)
+    #[cfg(any(unix, test))]
+    pub(crate) fn carry_floor(&self, ceiling: u64) -> u64 {
+        let live = self.live_floor().unwrap_or(0);
+        let Some(&newest) = self.open.iter().max() else {
+            return live;
+        };
+        let own_id = self.open.len() == 1 && self.high_id().is_none_or(|high| high < newest);
+        let past = if own_id { newest } else { newest.max(ceiling) };
+        live.max(past.saturating_add(1))
     }
 
     /// The highest recorded turn id, or `None` when empty — the events digest
@@ -315,44 +335,6 @@ pub(crate) fn clamp_text(s: &str) -> String {
     s[..end].to_string()
 }
 
-/// FNV-1a/64 — deterministic across processes (unlike `DefaultHasher`), so the
-/// screen hash is stable enough to diff a replayed turn against a recorded one.
-pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut h = Fnv1a64::new();
-    h.update(bytes);
-    h.finish()
-}
-
-/// The same FNV-1a/64 over successive byte slices. The agent-status sweep
-/// hashes visible rows while retaining only its last forty, so it must use
-/// exactly the algorithm that `status hash=` and `turn` use for one buffer.
-pub(crate) struct Fnv1a64(u64);
-
-impl Default for Fnv1a64 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Fnv1a64 {
-    pub(crate) const fn new() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-
-    pub(crate) fn update(&mut self, bytes: &[u8]) {
-        let mut h = self.0;
-        for &b in bytes {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self.0 = h;
-    }
-
-    pub(crate) const fn finish(self) -> u64 {
-        self.0
-    }
-}
-
 /// Milliseconds since the process epoch (a lazily-pinned monotonic `Instant`).
 /// Monotonic and cheap; used for turn `started_ms`/`dur_ms`, not wall-clock.
 pub(crate) fn now_ms() -> u64 {
@@ -367,6 +349,9 @@ pub(crate) fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// The turn-id ceiling the unit tests export under: past every id here.
+    const CEILING: u64 = 1 << 20;
+
     fn rec(id: u64) -> TurnRecord {
         TurnRecord {
             id,
@@ -380,24 +365,6 @@ mod tests {
             arch: ArchMark::default(),
             carried: false,
         }
-    }
-
-    #[test]
-    fn ring_drops_oldest_and_since_is_a_suffix() {
-        let mut l = TurnLedger::default();
-        for i in 1..=(LEDGER_CAP as u64 + 3) {
-            l.push(rec(i));
-        }
-        assert_eq!(l.high_id(), Some(LEDGER_CAP as u64 + 3));
-        assert_eq!(l.since(None).count(), LEDGER_CAP, "capped");
-        // The three oldest were evicted; `since` past the new floor is a suffix.
-        let hi = LEDGER_CAP as u64 + 3;
-        let got: Vec<u64> = l.since(Some(hi - 2)).map(|r| r.id).collect();
-        assert_eq!(
-            got,
-            vec![hi - 1, hi],
-            "only ids strictly greater than `after`"
-        );
     }
 
     /// DIFFERENTIAL: the `partition_point` seek must agree with the linear
@@ -479,6 +446,10 @@ mod tests {
         l.begin(10);
         l.begin(11);
         assert_eq!(l.record(rec(11), || unreachable!("in order")), 11);
+        // Exported now, turn 10 can only record behind 11, under an id still
+        // to be minted: the carry vouches for none up to the ceiling (round
+        // eight, finding 40).
+        assert_eq!(l.carry_floor(CEILING), CEILING + 1);
         let watermark = l.high_id();
         let mut minted = 11;
         let late = l.record(rec(10), || {
@@ -490,7 +461,7 @@ mod tests {
         assert_eq!(ids, vec![5, 11, 12], "rising in landing order");
         let streamed: Vec<u64> = l.since(watermark).map(|r| r.id).collect();
         assert_eq!(streamed, vec![12], "the watcher past 11 is sent it");
-        assert_eq!(l.carry_floor(), 0, "nothing is open any more");
+        assert_eq!(l.carry_floor(CEILING), 0, "nothing is open any more");
 
         // A sender that predates this (its ledger out of order) is put back
         // in order by the receiver, not left a record short.
@@ -512,43 +483,69 @@ mod tests {
             l.push(rec(id));
         }
         l.begin(4);
-        assert_eq!(l.carry_floor(), 5);
-        let adopted = TurnLedger::carried(l.since(None).cloned().collect(), l.carry_floor());
+        assert_eq!(l.carry_floor(CEILING), 5);
+        let adopted = TurnLedger::carried(l.since(None).cloned().collect(), l.carry_floor(CEILING));
         assert_eq!(adopted.low_id(), Some(5), "the floor, over the held 1");
         // An abandoned turn owes no record.
         l.abandon(4);
-        assert_eq!(l.carry_floor(), 0);
+        assert_eq!(l.carry_floor(CEILING), 0);
     }
 
-    /// A floor stays live while it lies inside the ledger's window, and goes
-    /// stale — neither reported nor carried on — once every record under it
-    /// is evicted (round seven, finding 58's review: it rode every `history`
-    /// reply and every later export for the life of the session).
+    /// A floor stays live until the records it lost would have aged out of a
+    /// ledger carried whole — [`LEDGER_CAP`] records at or past it have
+    /// landed — and only then goes stale, neither reported nor carried on
+    /// (round seven, finding 58's review: it rode every `history` reply and
+    /// every later export for the life of the session). Records at or past
+    /// it are not enough on their own: every turn after a dropped ledger has
+    /// an id at or past its floor, and a halved carry holds only such
+    /// records, so the floor went quiet after ONE new turn, or at once
+    /// (round seven, findings 204 and 205).
     #[test]
-    fn a_floor_goes_stale_once_the_records_under_it_are_evicted() {
+    fn a_floor_goes_stale_once_the_records_under_it_would_have_aged_out() {
+        let cap = LEDGER_CAP as u64;
         let empty = TurnLedger::carried(Vec::new(), 10);
         assert_eq!(empty.live_floor(), Some(10), "an empty ledger's floor");
-        assert_eq!(empty.carry_floor(), 10);
+        assert_eq!(empty.carry_floor(CEILING), 10);
+        // A dropped ledger, then one new turn: its id is the floor itself.
+        let mut dropped = TurnLedger::carried(Vec::new(), 10);
+        dropped.push(rec(10));
+        assert_eq!(dropped.live_floor(), Some(10), "one turn past a drop");
+        assert_eq!(
+            dropped.carry_floor(CEILING),
+            10,
+            "carried on by a second update"
+        );
+        // A halved carry: every held record is past the floor.
+        let at = TurnLedger::carried((10..=12).map(rec).collect(), 10);
+        assert_eq!(at.live_floor(), Some(10), "at the oldest held record");
+        assert_eq!(at.low_id(), Some(10), "the low-water says it too");
+        // An open turn at the export: records held under the floor.
         let mut l = TurnLedger::carried((1..=3).map(rec).collect(), 10);
         assert_eq!(l.live_floor(), Some(10), "above the oldest held record");
-        let at = TurnLedger::carried((10..=12).map(rec).collect(), 10);
-        assert_eq!(at.live_floor(), None, "at the oldest held record");
-        assert_eq!(at.low_id(), Some(10), "the low-water still says it");
-        for id in 10..10 + LEDGER_CAP as u64 {
+        // One record short of LEDGER_CAP at or past the floor: a ledger
+        // carried whole would still hold turn 9.
+        for id in 11..10 + cap - 1 {
+            dropped.push(rec(id));
+        }
+        for id in 10..10 + cap - 1 {
             l.push(rec(id));
         }
+        assert_eq!(dropped.len(), LEDGER_CAP - 1);
+        assert_eq!(dropped.live_floor(), Some(10), "not yet LEDGER_CAP turns");
+        assert_eq!(l.live_floor(), Some(10), "records under 10 still held");
+        dropped.push(rec(10 + cap - 1));
+        l.push(rec(10 + cap - 1));
         assert_eq!(l.low_id(), Some(10));
-        assert_eq!(l.live_floor(), None, "every record under 10 is evicted");
-        assert_eq!(l.carry_floor(), 0, "a stale floor is not carried on");
+        assert_eq!(l.live_floor(), None, "LEDGER_CAP turns past the floor");
+        assert_eq!(dropped.live_floor(), None, "the lost turns aged out");
+        assert_eq!(l.carry_floor(CEILING), 0, "a stale floor is not carried on");
         // An open turn still raises the carry over a stale floor.
-        l.begin(10 + LEDGER_CAP as u64);
-        assert_eq!(l.carry_floor(), 11 + LEDGER_CAP as u64);
+        l.begin(10 + cap);
+        assert_eq!(l.carry_floor(CEILING), 11 + cap);
     }
 
     #[test]
-    fn fnv_is_deterministic_and_text_clamps_on_boundary() {
-        assert_eq!(fnv1a_64(b"kitty"), fnv1a_64(b"kitty"));
-        assert_ne!(fnv1a_64(b"cat"), fnv1a_64(b"dog"));
+    fn text_clamps_on_boundary() {
         let long = "é".repeat(400); // 800 bytes, 2 per char
         let c = clamp_text(&long);
         assert!(c.len() <= MAX_TEXT && c.chars().all(|ch| ch == 'é'));

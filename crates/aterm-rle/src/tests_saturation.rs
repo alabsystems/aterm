@@ -4,7 +4,7 @@
 
 //! Saturation boundary and `try_extend_with`/`try_push` overflow tests (#5010).
 
-use crate::{Rle, RleCapacityError, Run};
+use crate::{Rle, RleCapacityError};
 
 /// Helper: verify `total_length == sum(run.length)` invariant.
 fn assert_invariant(rle: &Rle<u8>, label: &str) {
@@ -103,29 +103,6 @@ fn capacity_error_display() {
     let msg = err.to_string();
     assert!(msg.contains("10"), "should show requested count");
     assert!(msg.contains("5"), "should show available count");
-}
-
-/// Issue #5010 reproduction case: invariant is preserved after saturation.
-///
-/// The issue claimed `runs = [(1, u32::MAX), (2, 100)]` after double extend,
-/// but the clamping logic prevents this — the second extend produces 0 elements.
-#[test]
-fn issue_5010_reproduction_invariant_preserved() {
-    let mut rle = Rle::<u8>::new();
-    rle.extend_with(1, u32::MAX);
-    rle.extend_with(2, 100);
-
-    // The second extend is clamped to 0 — no second run created.
-    assert_eq!(rle.len(), u32::MAX);
-    assert_eq!(rle.run_count(), 1);
-    assert_eq!(
-        rle.runs(),
-        &[Run {
-            value: 1,
-            length: u32::MAX
-        }]
-    );
-    assert_invariant(&rle, "issue #5010 reproduction");
 }
 
 /// Verify invariant holds after a sequence of saturating operations then

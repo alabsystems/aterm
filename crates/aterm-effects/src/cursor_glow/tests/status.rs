@@ -5,14 +5,10 @@
 
 use super::*;
 
-/// Type one printable key, walking the SAME seam order the GUI host walks
-/// every frame under the LICENSE law: stamp the press, feed the row probe
-/// (the erase-poof lane's evidence, which survives the rip), then tick the
-/// cursor onto its landing.
-///
-/// THE PRESS STAMP IS THE POINT. A fixture that ticks a cursor delta with
-/// no fresh key hint is program output, and the license declines it — so
-/// every ribbon fixture goes through here rather than poking `spawn`.
+/// Type one printable key in the GUI host's seam order: stamp the press, feed
+/// the row probe (the erase-poof lane's evidence), then tick the cursor onto
+/// its landing. The press stamp matters: a cursor delta with no fresh key hint
+/// is program output, which the license declines.
 fn type_one_key(glow: &mut CursorGlow, cfg: &GlowConfig, g: Geom, at: Instant, row: u16, col: u16) {
     // The row as input time saw it: glyphs already typed, blanks after.
     let mut after = [' '; 40];
@@ -112,10 +108,8 @@ fn a_word_typed_at_human_cadence_earns_the_full_rainbow_ribbon() {
     }
 }
 
-/// The NEGATIVE control the soundness essays demand: ambient program
-/// output moves the cursor with no authored key behind it, so the status
-/// verb must report a DECLINE and a DARK ribbon. A verb that reported a
-/// ribbon here would be buying pixels with correctness.
+/// Negative control: ambient program output moves the cursor with no authored
+/// key, so status reports a decline and a dark ribbon.
 #[test]
 fn unauthored_output_is_declined_and_the_status_verb_shows_it_dark() {
     let g = geom();
@@ -143,9 +137,8 @@ fn unauthored_output_is_declined_and_the_status_verb_shows_it_dark() {
     assert_eq!(glow.ribbon_hue_bands(), 0);
 }
 
-/// The status ROW: fixed key order, every gate present, and the
-/// `ribbon_active` verdict derived (never asserted) — one cell, or four
-/// cells in one hue, is not a rainbow.
+/// The status row: fixed key order, every gate present, and `ribbon_active`
+/// derived; one cell, or four cells in one hue, is not a rainbow.
 #[test]
 fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     let base = TrailStatus {
@@ -271,9 +264,8 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         ..base
     };
     assert!(quiet.line().contains(" last_decline_reason=none"));
-    // The RIBBON VERDICT is derived from what is on glass, not asserted:
-    // one lone cell is a glow under the caret, and four same-hue cells are
-    // a monochrome bar. Neither is the flowing rainbow the docs promise.
+    // The ribbon verdict is derived from what is drawn: one lone cell is a
+    // glow under the caret, four same-hue cells a monochrome bar.
     assert!(base.ribbon_active());
     assert!(
         !TrailStatus {
@@ -299,13 +291,10 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         .ribbon_active(),
         "four cells in one hue is a bar, not a rainbow"
     );
-    // **A FALLING CURTAIN IS STILL A RIBBON** (2026-09-14; the house rule
-    // that a BOUND must not be returned as a FACT). `ribbon_segments` is
-    // floored at the arc's DIMMEST stop, so from about +99 ms of every
-    // 0.24 s curtain the claim is zero while the band is plainly on the
-    // glass — 1065 quads at alpha 102 down to 9, measured. The row now
-    // carries what is drawn and why the claim is under its floor, and the
-    // headline verdict reads them.
+    // A falling curtain is still a ribbon: `ribbon_segments` is floored at
+    // the arc's dimmest stop, so late in every 0.24 s curtain the claim is
+    // zero while the band is still drawn. The row carries what is drawn and
+    // why the claim is under its floor, and the verdict reads both.
     let curtain = TrailStatus {
         ribbon_segments: 0,
         ribbon_hue_bands: 0,
@@ -338,8 +327,8 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         .ribbon_active(),
         "a spent curtain is not an active ribbon"
     );
-    // A DARK BAND OUTSIDE A CURTAIN stays dark: the curtain clause may
-    // not be a back door for the claim floor.
+    // A dark band outside a curtain stays dark: the curtain clause is not a
+    // back door for the claim floor.
     assert!(
         !TrailStatus {
             ribbon_curtain_ms: None,
@@ -350,9 +339,8 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     );
 }
 
-/// A minimal `trail status` row carrying one [`rk::Flow`] — the flow
-/// laws assert the BYTES the socket prints, not the accessor alone, and
-/// every other field on the row is beside the point for them.
+/// A minimal `trail status` row carrying one [`rk::Flow`]; the flow tests
+/// assert the bytes the socket prints.
 fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
     TrailStatus {
         style_raw: "rainbow kitty pet",
@@ -398,16 +386,10 @@ fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
     }
 }
 
-/// **THE ROW REPORTS THE FLOW THE ENGINE IS IN.**
-///
-/// The whole point of the feature on the wire: an agent reading
-/// `trail status` can tell that the human is mid-flow — typing at speed,
-/// uninterrupted — and hold its turn. So a run of fast keys must MOVE
-/// `flow=` and `combo=` on the row the socket prints, and one Backspace
-/// must zero them, all the way through the real engine and the real row.
-///
-/// Nothing here asserts light: flow draws nothing of its own, and this is
-/// the sensor's law, not the theme's.
+/// The row reports the engine's flow: a run of fast keys moves `flow=` and
+/// `combo=` on the printed row, and one Backspace zeroes them, through the
+/// real engine. An agent reading `trail status` can tell the human is
+/// mid-flow. Flow draws nothing, so no light is asserted.
 #[test]
 fn the_trail_row_reports_the_flow_the_engine_is_in() {
     let g = geom();
@@ -426,9 +408,8 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
         "a hand that has not typed is not in flow"
     );
 
-    // A RUN AT SPEED — 12 cps, one key per tick, the caret walking its
-    // row. The spine needs ~a dozen keys to climb past `FLOW_KEY_DISP`,
-    // and the combo counts only the keys after that.
+    // A run at 12 cps, one key per tick. The spine needs about a dozen keys to
+    // pass `FLOW_KEY_DISP`; the combo counts keys after that.
     let mut now = t0;
     let mut entries = 0u32;
     for k in 0..48u32 {
@@ -459,8 +440,7 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
         "the row must carry the run it is in: {row}"
     );
 
-    // A DELETE ENDS IT — exit no. 1, on the key's own edge, and the row
-    // says so on the very next reading.
+    // A delete ends it on the key's own edge, visible on the next reading.
     glow.note_backspace(now + Duration::from_millis(83));
     let broken = glow.flow_status();
     assert_eq!(
@@ -496,11 +476,8 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
     );
 }
 
-/// **AUTO-REPEAT CANNOT FARM THE COMBO.** A held key at repeat cadence IS
-/// maximal momentum by definition — that is the documented bypass
-/// [`CursorGlow::celebrate`] takes — so the ladder must FREEZE under it,
-/// or leaning on one key would buy the state the feature exists to make
-/// you earn.
+/// Auto-repeat cannot farm the combo: a held key is maximal momentum (the
+/// bypass [`CursorGlow::celebrate`] takes), so the ladder freezes under it.
 #[test]
 fn a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it() {
     let g = geom();
@@ -540,14 +517,10 @@ fn a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it() {
     );
 }
 
-/// THE FIELD THAT WOULD HAVE NAMED THE BUG.
-///
-/// `glow_active` / `pet_active` / `cat_active` all read false while the
-/// rainbow block was eating OSC 12 — none of them is the gate that was
-/// open. The row must therefore name the style that owns the caret, the
-/// colour that owner built its body from, and WHERE that colour came from,
-/// so "is the cursor colour reaching the glass?" is a question the sensor
-/// answers instead of one a screen capture has to.
+/// The row names the style that owns the caret, the colour that owner built
+/// its body from, and where that colour came from, so whether the cursor
+/// colour reaches the glass is answered by the sensor, not a capture.
+/// `glow_active` / `pet_active` / `cat_active` cannot answer it.
 #[test]
 fn the_status_row_names_who_owns_the_block_cursor() {
     let quiet = TrailStatus {
@@ -573,7 +546,7 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         momentum: 0.0,
         momentum_display: 0.0,
         momentum_glow: 0.0,
-        // EVERY gate the row used to print, quiet…
+        // Every gate quiet…
         glow_active: false,
         pet_active: false,
         pet_action: "none",
@@ -600,9 +573,8 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         "nobody owns the caret ⇒ the terminal's own cursor colour paints it: {line}"
     );
 
-    // …and the SAME quiet row with a body effect live. This is the exact
-    // reading the two misdiagnoses lacked: three `*_active=false` gates
-    // beside a named owner holding the caret.
+    // …and the same quiet row with a body effect live: a named owner holding
+    // the caret beside three `*_active=false` gates.
     let owned = TrailStatus {
         block_fill: Some(BlockFill {
             owner: BlockFillOwner::Phaser,
@@ -626,10 +598,8 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         "…while the row names the style that owns the caret: {line}"
     );
 
-    // THE DEFECT ITSELF, READABLE IN ONE ROW. The pre-fix phaser was handed
-    // a red cursor colour and painted a near-white block anyway. `base` is
-    // what the host handed the owner; `fill` is what the owner painted —
-    // so the two disagreeing IS the bug, printed, with no capture needed.
+    // A body painting a colour other than the one it was handed is readable
+    // in one row: `base` is what the host handed, `fill` what was painted.
     let broken = TrailStatus {
         block_fill: Some(BlockFill {
             owner: BlockFillOwner::Phaser,
@@ -659,10 +629,8 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         .contains(" block_fill_rgb=0000ff")
     );
 
-    // The provenance is a PROPERTY OF THE OWNER, so a reader can tell a
-    // style that deliberately owns its colour from one that is eating the
-    // user's. Fire is orange because it is fire; the rainbow and the phaser
-    // blooms must start from the cursor's own colour.
+    // Provenance is a property of the owner: fire owns its orange; the
+    // rainbow and phaser blooms start from the cursor's own colour.
     for (owner, from) in [
         (BlockFillOwner::Rainbow, "cursor_color"),
         (BlockFillOwner::Phaser, "cursor_color"),
@@ -697,9 +665,8 @@ fn the_status_row_names_who_owns_the_block_cursor() {
             "{} is not legible in the row: {line}",
             owner.label()
         );
-        // A style-identity owner reports NO base — it was handed none —
-        // and the painted colour still shows. That is a complete reading,
-        // not a missing one.
+        // A style-identity owner reports no base (it was handed none), and
+        // the painted colour still shows.
         assert!(
             line.contains(if identity {
                 " block_fill_base=none"

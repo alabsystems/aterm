@@ -66,7 +66,6 @@ fn bin(name: &str) -> Binary {
             argv: vec![format!("/r/target/debug/deps/{name}-1").into()],
             env: vec![("CARGO_PKG_NAME".into(), "x".into())],
         },
-        alone: None,
     }
 }
 
@@ -133,7 +132,6 @@ fn judge_branch(main: &Report, branch: &Report) -> aterm_verify::Verdict {
         source: "receipt aaaaaaaaa".into(),
         failures,
         now: NOW,
-        nearest: None,
     };
     let t_branch = tally(std::slice::from_ref(branch));
     assert!(t_branch.failed(), "the branch is red");
@@ -677,7 +675,6 @@ fn a11_a_stale_origin_main_is_no_base() {
         hash: red_x(&m1, 0).hash,
         opaque: None,
         timing: None,
-        package: None,
     };
     assert_eq!(
         differential::judge(&x, &found.reds(NOW)),
@@ -765,7 +762,6 @@ fn a12_a_baseline_reads_mains_published_notes_first() {
         source: "note".into(),
         failures: recorded,
         now: NOW + 60,
-        nearest: None,
     };
     let f = t.all_findings().next().expect("X");
     assert!(matches!(
@@ -805,7 +801,6 @@ fn a14_an_unaccounted_baseline_does_not_restart_x_s_clock() {
         source: format!("note {}", differential::short(&r.head)),
         receipt: Receipt::parse(&r.render()).expect("a receipt round-trips"),
         clock_floor: None,
-        nearest: None,
     };
     let receipt = |head: &str, t: &Tally, chain: Option<&BaseReds>, when: u64| Receipt {
         head: head.to_string(),
@@ -885,14 +880,12 @@ fn a15_a_clock_behind_mains_receipt_is_judged_by_the_absolute_rule() {
             ..Receipt::default()
         },
         clock_floor: None,
-        nearest: None,
     });
     let f = Finding {
         id: red_x("", 0).id,
         hash: red_x("", 0).hash,
         opaque: None,
         timing: None,
-        package: None,
     };
     let Against::Base(at_real) = plan.against(NOW) else {
         panic!("a clock ahead of the receipt judges against it");
@@ -942,7 +935,6 @@ fn x_again() -> Finding {
         hash: red_x("", 0).hash,
         opaque: None,
         timing: None,
-        package: None,
     }
 }
 
@@ -1625,7 +1617,7 @@ fn d1_main_ahead_on_the_remote_is_no_base() {
     assert!(matches!(plan.against(NOW), Against::Absolute(Some(_))));
     assert_eq!(
         plan.header_line(false, &head),
-        format!("verify: base — {why}: every red counts (the absolute rule)\n")
+        format!("verify: base — {why}: every red counts\n")
     );
 
     // A remote commit this repository has never seen: the same answer.

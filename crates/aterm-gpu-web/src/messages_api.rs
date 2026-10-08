@@ -1,52 +1,47 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! THE MESSAGE BAND on [`AtermGpuTerminal`] — the unified message engine
-//! (`aterm_messages`, docs/DESIGN-unified-messages-2026-09-21.md) drawn by
-//! the GPU module, through the SAME composition the native window and the
-//! CPU twin run (`aterm_render::band`, ruling 331 of that design): a
-//! script's `notice` lines post rows, `messages` reads the log, and the rows
-//! RESERVE space above the grid (the frame — and the swapchain — grows by
-//! [`band_height_px`]; nothing overlays a terminal cell). This file is the
-//! CPU module's (`aterm-wasm`) line for line (`web_binding_parity` holds the
-//! two together, ruling 340); only the three host hooks each crate's
-//! `lib.rs` defines differ — the metrics, the bleed (here handed to the CPU
-//! face and the live GPU renderer) and what a band change means (here also
-//! the swapchain's size).
+//! The message band on [`AtermGpuTerminal`]: the unified message engine
+//! (`aterm_messages`, docs/DESIGN-unified-messages-2026-09-21.md) drawn through
+//! the same composition as the native window and the CPU module
+//! (`aterm_render::band`). A script's `notice` lines post rows, `messages`
+//! reads the log, and the rows reserve space above the grid: the frame and
+//! the swapchain grow by [`band_height_px`]; nothing overlays a cell. This
+//! file mirrors `aterm-wasm`'s (`web_binding_parity`); only the three host
+//! hooks in each `lib.rs` differ (metrics, bleed, and here the swapchain size).
 //!
-//! # The host seams
+//! # Host seams
 //!
-//! 1. [`notice`](AtermGpuTerminal::notice) — the `notice` verb's grammar
-//!    verbatim (`post`, `progress`, `done`, `dismiss`, `act`), every verdict,
-//!    cap, budget and reply word the engine's (`aterm_messages::wire`).
-//!    A success or info `post` is a RECORD: it goes to the log, never to the
-//!    glass (the owner's rule: FYI goes to the log).
-//! 2. [`messages_read`](AtermGpuTerminal::messages_read) — the `messages` verb:
-//!    the log's rows, every free field percent-encoded exactly as the control
-//!    socket encodes them; [`messages_entry`](AtermGpuTerminal::messages_entry)
-//!    is one record's row, what a page's Details view is built from.
+//! 1. [`notice`](AtermGpuTerminal::notice): the `notice` verb (`post`,
+//!    `progress`, `done`, `dismiss`, `act`) with the engine's verdicts, caps
+//!    and replies (`aterm_messages::wire`). A success or info `post` goes to
+//!    the log, never the band.
+//! 2. [`messages_read`](AtermGpuTerminal::messages_read): the `messages` verb,
+//!    fields percent-encoded as the control socket does;
+//!    [`messages_entry`](AtermGpuTerminal::messages_entry) is one record's row.
 //! 3. [`messages_next_wake_ms`](AtermGpuTerminal::messages_next_wake_ms) and
 //!    [`messages_tick`](AtermGpuTerminal::messages_tick) — the band's ONE clock:
 //!    the page arms one timer for the ms this returns (`-1`: nothing armed —
 //!    arm NO timer, so an idle page costs 0 % CPU), then ticks and renders.
 //! 4. [`set_band_motion`](AtermGpuTerminal::set_band_motion) — the page's
 //!    `prefers-reduced-motion`: `false` draws the still look;
+//!    [`set_frame_period_ms`](AtermGpuTerminal::set_frame_period_ms) — the
+//!    display's measured frame period, which glides and echoes are read on;
 //!    [`set_band_visible`](AtermGpuTerminal::set_band_visible) — the page's
 //!    visibility: a hidden page's band is off screen, and a hidden page arms
 //!    no timer at all (ruling 337, F2).
 //! 5. [`band_rows`](AtermGpuTerminal::band_rows),
 //!    [`band_height_px`](AtermGpuTerminal::band_height_px),
-//!    [`grid_top_px`](AtermGpuTerminal::grid_top_px) — where the grid starts
-//!    now: the page offsets every row it hands the terminal
-//!    (`selection_start`, `selection_extend`, `selection_word`,
-//!    `selection_line`, `encode_mouse_*`, `link_at`) by the band and
-//!    swallows presses on band rows. The pet's doors (`note_pointer_px`,
-//!    `pet_press_px`) take the canvas pixels unchanged, band included: the
-//!    engine folds the band into the pet's origin itself (ruling 347).
+//!    [`grid_top_px`](AtermGpuTerminal::grid_top_px): the page offsets every
+//!    row it hands the terminal (`selection_*`, `encode_mouse_*`, `link_at`)
+//!    by the band and swallows presses on band rows. The pet's doors
+//!    (`note_pointer_px`, `pet_press_px`) take canvas pixels unchanged.
 //! 6. [`band_hover`](AtermGpuTerminal::band_hover) and
 //!    [`band_press`](AtermGpuTerminal::band_press) — the pointer over the band,
 //!    in frame pixels: the chip under it lights, and a press does what the
-//!    `notice act` verb does; [`set_details_view`](AtermGpuTerminal::set_details_view)
+//!    `notice act` verb does; [`band_press_acts`](AtermGpuTerminal::band_press_acts)
+//!    — whether a press there does anything (the pointer's shape);
+//!    [`set_details_view`](AtermGpuTerminal::set_details_view)
 //!    — the page has a Details view, so every row ends in its link.
 //! 7. [`set_forced_colors`](AtermGpuTerminal::set_forced_colors) — CSS
 //!    `forced-colors`: the five system colours own the band, ungraded.
@@ -78,37 +73,19 @@
 //!    Folder` and `Explain heavy load` switch have no web meaning and are
 //!    not in it.
 //!
-//! Each export samples the clock ONCE at the boundary (the `predict_api`
-//! posture) and calls a `pub(crate)` `*_at` twin the tests drive at injected
-//! instants; the engine itself never reads a clock.
+//! Each export samples the clock once and calls a `pub(crate)` `*_at`
+//! variant the tests drive at injected instants.
 //!
-//! # The driver is the engine's
+//! The band's sequencing is `aterm_messages::drive`, the same driver the
+//! native window runs; this module supplies what only the page knows (grid
+//! rows, visibility, motion, forced colours, links, theme inks).
 //!
-//! The band's sequencing — settle, commit the rows, drain, the wire's paced
-//! paint, the layout, the motion frame, the paint key, the deadline fold —
-//! is `aterm_messages::drive` (ruling 336), the SAME driver the native
-//! window runs. This module passes it what only the page knows: one grid of
-//! `rows` to spare rows from, no handoff freeze, the page's visibility and
-//! `set_band_motion`, its forced colours, its links (withheld until the page
-//! says it has a Details view) and no `$HOME`, the page theme's inks.
-//!
-//! # Not on the web (by design, ruling 332)
-//!
-//! No native reporters (update, toolchain, crash, harness/upgrade, config,
-//! person-pass, presence row, strain/load rail, session waits); no Settings ▸
-//! Messages window — the engine's page is exported ([`messages_page`]) for a
-//! site to render, which no site does yet (ruling 388), and a site that
-//! builds a Details view from [`messages_entry`] says so with
-//! `set_details_view`; no `messages.log`
-//! file (the page keeps the lines [`messages_log_since`] hands it); no
-//! seamless-handoff carry. The web performs no authored intent: a press on a
-//! capsule is logged and answered `performed=0`; only `Details` is performed,
-//! and only by a page with a Details view.
+//! Not on the web: native reporters, a Settings window, a `messages.log`
+//! file and handoff carry. The web performs no authored intent: a capsule
+//! press is logged and answered `performed=0`, except `Details` on a page
+//! with a Details view.
 //!
 //! [`band_height_px`]: AtermGpuTerminal::band_height_px
-//! [`messages_entry`]: AtermGpuTerminal::messages_entry
-//! [`messages_page`]: AtermGpuTerminal::messages_page
-//! [`messages_log_since`]: AtermGpuTerminal::messages_log_since
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -123,7 +100,7 @@ use aterm_messages::page::{self, MessagesFilter, MessagesState};
 use aterm_messages::paint::{Geometry, Hover, HoverTarget};
 use aterm_messages::wire::{self, NoticeRequest, Paint, ReadQuery, WireGate};
 use aterm_messages::{
-    ActionIndex, Hit, Intent, Links, LogLine, Look, MessageCenter, MessageId, MessageLog, Shelf,
+    ActionIndex, Hit, Intent, LogLine, Look, MessageCenter, MessageId, MessageLog, Shelf,
     UpgradeWord, WallStamp, LOG_CAP, MAX_ROWS,
 };
 use aterm_render::band::{self as band_frame, BandFrame};
@@ -141,17 +118,15 @@ const POOL_CAP: usize = MAX_ROWS as usize;
 /// that falls further behind is told how many it missed (a `dropped` line).
 const JOURNAL_CAP: usize = LOG_CAP;
 
-/// How many of the page's kept lines a restore reads — the newest: twice the
-/// ring, room for a full ring of records each posted and retired. The older
-/// lines are counted, never decoded (the native load reads a bounded tail).
+/// How many of the page's kept lines a restore reads (the newest): twice the
+/// ring. Older lines are counted, never decoded.
 const RESTORE_CAP: usize = 2 * LOG_CAP;
 
-/// Percent-encode a string so it occupies ONE space-free token in a reply
-/// line: every byte that is not ASCII-graphic (and `%` itself) becomes `%XX`.
-/// A byte copy of `aterm_control::wire::pct_encode` — the control socket's
-/// encoder, which this module cannot link (`aterm-control` takes the engine's
-/// disk tier, whose zstd C library cannot target wasm32) — held to it over
-/// every byte and a UTF-8 corpus by `pct_encode_is_the_control_wires`.
+/// Percent-encode a string into one space-free token: every byte that is not
+/// ASCII-graphic (and `%` itself) becomes `%XX`. A copy of
+/// `aterm_control::wire::pct_encode`, which this crate cannot link (its disk
+/// tier's zstd cannot target wasm32); `aterm-wasm`'s
+/// `pct_encode_is_the_control_wires` holds the copies equal.
 pub(crate) fn pct_encode(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
@@ -183,9 +158,8 @@ fn whole(n: f64) -> u64 {
     }
 }
 
-/// The band's host metrics a lib hands this module: one cell's width and
-/// height, the frame's pad, and the grid's first pixel row before the band
-/// (the chrome's top pad and head) — all device px.
+/// The band's host metrics: cell width and height, frame pad, and the grid's
+/// first pixel row before the band (chrome top pad + head), in device px.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BandMetrics {
     pub(crate) cell_w: usize,
@@ -195,9 +169,7 @@ pub(crate) struct BandMetrics {
 }
 
 /// The band's state on one terminal: the engine's center and wire gate, the
-/// inks the page's theme derives, and the painted rows the next frame
-/// composes. `pub(crate)` for the lib's render hooks and the tests (the
-/// effects-field posture).
+/// theme-derived inks, and the painted rows the next frame composes.
 pub(crate) struct WebBand {
     /// The engine: rows, holds, the log ring, the motion grid.
     pub(crate) center: MessageCenter,
@@ -206,10 +178,10 @@ pub(crate) struct WebBand {
     /// Motion allowed (the page's reduced-motion).
     motion_ok: bool,
     /// The page is visible: a hidden page's band is off screen — the still
-    /// look — and it arms no timer (ruling 337, F2).
+    /// look — and it arms no timer.
     visible: bool,
     /// The page has a Details view: every row ends in its link, and a press
-    /// on a row opens it ([`Links::Painted`]).
+    /// on a row opens it ([`aterm_messages::Links::Painted`]).
     details: bool,
     /// The chip the pointer lights, `None` off the band.
     hover: Option<Hover>,
@@ -217,13 +189,13 @@ pub(crate) struct WebBand {
     forced: Option<ForcedPalette>,
     /// The page theme's background, foreground and cursor.
     theme: ThemeInks,
-    /// The configured palette's blue and cyan (slots 4 and 6), which a
-    /// near-grey cursor's meter borrows (ruling 250) — `band_palette`'s rule
-    /// on the native host: the CONFIGURED palette, never the live OSC 4 one.
+    /// The configured palette's blue and cyan (slots 4 and 6), borrowed by a
+    /// near-grey cursor's meter; the configured palette, never the live OSC 4
+    /// one.
     ansi: AnsiHues,
-    /// The inks the rows are painted with: the forced palette's
-    /// (`BandInks::forced`) while forced, else `BandInks::derive(theme, ansi,
-    /// Blend)` — re-derived on a theme, palette or forced-colours change.
+    /// The inks the rows are painted with: `BandInks::forced` while forced,
+    /// else `BandInks::derive(theme, ansi, Blend)`; re-derived on theme,
+    /// palette or forced-colours changes.
     pub(crate) inks: BandInks,
     /// The band's one view (`aterm_messages::drive::View`): the width law's
     /// layout, the motion frame the painted rows were drawn at, and the key
@@ -233,9 +205,9 @@ pub(crate) struct WebBand {
     rows: Vec<Vec<RenderCell>>,
     edges: Vec<Option<([u8; 3], [u8; 3])>>,
     rasters: Vec<Option<RowRaster>>,
-    /// The instant of the last tick, notice or motion change: a frame
-    /// re-prepares at it, so a resize or a theme change paints the frame the
-    /// clock last asked for.
+    /// Instant of the last tick, notice or motion change; a frame re-prepares
+    /// at it, so a resize or theme change paints the frame the clock last
+    /// asked for.
     now: Instant,
     /// Reclaimed prepend buffers ([`RenderInput::undo_host_row_prepend`]).
     pub(crate) pool: Vec<Vec<RenderCell>>,
@@ -300,18 +272,10 @@ impl WebBand {
         })
     }
 
-    /// How a `cols`-wide page lays the band out: links withheld until the page
-    /// has a Details view, and no `$HOME` to abbreviate (ruling 332).
+    /// How a `cols`-wide page lays the band out ([`Lay::web`]): links withheld
+    /// until the page has a Details view, and no `$HOME` to abbreviate.
     fn lay(&self, cols: usize) -> Lay {
-        Lay {
-            cols,
-            links: if self.details {
-                Links::Painted
-            } else {
-                Links::Withheld
-            },
-            home: || None,
-        }
+        Lay::web(cols, self.details)
     }
 
     /// The inks the rows are painted with (the field's doc).
@@ -359,11 +323,9 @@ impl WebBand {
     }
 
     /// Prepare the band's rows for a frame at `self.now` on a `cols`-wide
-    /// grid of `cell_w`-px cells `pad` px in: the drive's layout (re-laid only
-    /// when the center's fingerprint or the width moved), one motion frame,
-    /// and — only when what the rows are built from moved (the hover and the
-    /// forced palette among it) — the paint. `true` when the painted band
-    /// changed.
+    /// grid: the drive's layout (re-laid when the center's fingerprint or the
+    /// width moved), one motion frame, and a repaint only when its inputs
+    /// moved. `true` when the painted band changed.
     pub(crate) fn prepare(&mut self, cols: usize, cell_w: usize, pad: usize) -> bool {
         let geom = Self::geometry(cols, cell_w, pad);
         let look = self.look();
@@ -392,15 +354,22 @@ impl WebBand {
     /// on a hidden page: it arms no timer at all (the owner's 0 % CPU rule;
     /// ruling 337, F2), and whatever fell due while it was hidden is settled
     /// by the first tick once it is visible again.
-    pub(crate) fn next_wake(&self) -> Option<Instant> {
+    ///
+    /// The motion term is the native window's rule (ruling 435, F4): from the
+    /// prepared frame's instant, over a fresh layout when the grid is now
+    /// `cols` wide or the center moved since, and never a past instant.
+    pub(crate) fn next_wake(&self, now: Instant, cols: usize) -> Option<Instant> {
         if !self.visible {
             return None;
         }
-        // The kept layout's next change from the last tick's instant — this
-        // module's own rule, kept exact by the drive (ruling 337, F4).
-        let motion = (self.committed() > 0)
-            .then(|| self.view.deadline_from(&self.center, self.now, self.look()))
-            .flatten();
+        let reserved = u16::try_from(self.committed()).unwrap_or(u16::MAX);
+        let motion = drive::motion_deadline_over(
+            &self.center,
+            reserved,
+            false,
+            now,
+            [(&self.view, self.lay(cols), self.look())],
+        );
         [
             drive::state_deadline(&self.center, &self.gate, false),
             motion,
@@ -410,11 +379,10 @@ impl WebBand {
         .min()
     }
 
-    /// Compose the painted rows above the grid of `dst`, the frame `at`:
-    /// padded or trimmed to the committed count, sealed, each raster placed —
-    /// with every window-space effect stream TRANSLATED down with the grid
-    /// (the web pipeline's one chrome origin never included the band). The
-    /// rows prepended; `0` leaves `dst` untouched.
+    /// Compose the painted rows above the grid of `dst` at frame `at`: padded
+    /// or trimmed to the committed count, sealed, placed, with every
+    /// window-space effect stream translated down with the grid. Returns rows
+    /// prepended; `0` leaves `dst` untouched.
     pub(crate) fn compose(&mut self, dst: &mut RenderInput, at: BandFrame) -> usize {
         band_frame::compose_band(
             dst,
@@ -443,12 +411,9 @@ impl WebBand {
         })
     }
 
-    /// A fresh engine whose motion grid starts at `t0` — the tests' and the
-    /// parity reader's injected clock (the native golden anchors its center
-    /// the same way). The view and its painted rows stay: the next prepare
-    /// repaints exactly when what it would paint differs, as on any tick (the
-    /// view re-lays on the new center's fingerprint, and forgets its layout
-    /// the first time it prepares with no row).
+    /// A fresh engine whose motion grid starts at `t0` (the tests' injected
+    /// clock). The view and painted rows stay; the next prepare repaints only
+    /// if its output differs.
     #[cfg(test)]
     pub(crate) fn reset_at(&mut self, t0: Instant) {
         self.center = MessageCenter::new(MessageLog::default(), t0);
@@ -458,9 +423,8 @@ impl WebBand {
     }
 
     /// Whether the page's kept log may still be loaded: nothing restored,
-    /// minted, queued or drained on this band yet — the native launch loads
-    /// `messages.log` before its first post, and a row posted first would
-    /// hold an id the kept lines may use (ruling 345).
+    /// minted, queued or drained yet (a row posted first would hold an id the
+    /// kept lines may use).
     fn restorable(&self) -> bool {
         let log = self.center.log();
         !self.restored
@@ -471,17 +435,15 @@ impl WebBand {
             && self.journal_first == 0
     }
 
-    /// Hand a drained prepend back to the pool: the inverse of the last
-    /// frame's prepend on the kept scratch, so an echo frame under a band
-    /// keeps the damage-scoped refill (DMG-1).
+    /// Undo the last frame's prepend on the kept scratch, so an echo frame
+    /// under a band keeps the damage-scoped refill.
     pub(crate) fn undo(&mut self, dst: &mut RenderInput, engine_rows: usize) -> bool {
         dst.undo_host_row_prepend(engine_rows, &mut self.pool, POOL_CAP)
     }
 
-    /// The band row and column under frame pixel `(x, y)` — the grid's
-    /// first pixel row is `m.grid_top` before the band, and the band's rows
-    /// stack from there; the column is the engine's arithmetic
-    /// (`Geometry::cell_at`, ruling 328). `None` off the band.
+    /// The band row and column under frame pixel `(x, y)`: band rows stack
+    /// from `m.grid_top`; the column uses `Geometry::cell_at`. `None` off the
+    /// band.
     fn cell_under(&self, x: f64, y: f64, cols: usize, m: BandMetrics) -> Option<(usize, usize)> {
         if !(x >= 0.0 && y >= 0.0) {
             return None;
@@ -504,9 +466,9 @@ impl WebBand {
         }
     }
 
-    /// The chip a pointer on `hit` lights: a capsule (the `Details ›`
-    /// included); on the row body and the overflow row, with a Details view,
-    /// the link a press there follows. Nothing where a press does nothing.
+    /// The chip a pointer on `hit` lights: a capsule (including `Details ›`),
+    /// or with a Details view the row body's link. `None` where a press does
+    /// nothing.
     fn hover_target(&self, hit: Hit) -> Option<HoverTarget> {
         match hit {
             Hit::Capsule(_, k) => Some(HoverTarget::Capsule(k)),
@@ -600,9 +562,8 @@ fn read_kept(text: &str) -> Kept {
 }
 
 /// The page's host for [`AtermGpuTerminal::messages_page`] (the engine's
-/// `page::Host`, ruling 387): the wall clock at the export and the reader's
-/// offset the page passed — and, by design (ruling 332), none of the facts
-/// only a native host has.
+/// `page::Host`): wall clock and the reader's UTC offset, and none of the
+/// facts only a native host has.
 struct WebDesk {
     /// The wall clock at the export.
     now_unix_ms: u64,
@@ -621,10 +582,8 @@ impl page::Host for WebDesk {
         None
     }
 
-    /// Saved, as far as the engine can say: the page keeps its log itself
-    /// (rulings 342 and 345), and the engine's not-saved note speaks of a
-    /// log FILE that could not be opened, which the web never has — so it
-    /// is never said here.
+    /// Always saved: the page keeps its log itself, and the engine's
+    /// not-saved note refers to a log file the web never has.
     fn saved(&self) -> bool {
         true
     }
@@ -638,11 +597,8 @@ impl page::Host for WebDesk {
         None
     }
 
-    /// NO FILESYSTEM, so an `Open log` is never pressable: a page cannot see
-    /// a file (a restored record's path names the disk of the machine that
-    /// wrote it, if any), and the web performs no authored intent — a press
-    /// on one is logged and answered `performed=0` (ruling 341) — so a
-    /// pressable `Open log` would promise a file the press never opens.
+    /// No filesystem, so `Open log` is never pressable: a page cannot see a
+    /// file, and the web performs no authored intent.
     fn is_regular_file(&self, _path: &str) -> bool {
         false
     }
@@ -653,33 +609,28 @@ impl page::Host for WebDesk {
     }
 
     /// No harness: no tab's upgrade stands here, so a record's upgrade
-    /// words are not offered at all (ruling 315).
+    /// words are not offered at all.
     fn upgrade_stands(&self, _tab: &str) -> bool {
         false
     }
 
-    /// NO NAVIGATION IS PERFORMED HERE (ruling 389): the web performs no
-    /// authored intent (ruling 341), and every capsule a page lists is a
-    /// record's — a wire row carries none (ruling 172) and a restored line
-    /// comes back to the log only — which neither press route reaches:
-    /// `notice act` asks [`wire::press_target`] for a LIVE row and answers
-    /// `ERR notice: no live message <id>`, and a band press takes only live
-    /// rows. A pressable `Manual` would promise a press that cannot land.
+    /// No navigation is performed here: the web performs no authored intent,
+    /// and every capsule a page lists belongs to a record that neither press
+    /// route (`notice act` via [`wire::press_target`], or a band press)
+    /// reaches, since both take only live rows.
     fn performs_navigation(&self) -> bool {
         false
     }
 
-    /// One: ruling 314's one-line sentence, which the macOS host's
-    /// reporters (`message_reporters::sentence_lines`, host-side by ruling
-    /// 384) give every record but a tab's agent upgrade rows — and those are
-    /// the native harness reporter's, which no page has.
+    /// One sentence line per record, as the macOS reporters give every record
+    /// except harness upgrade rows, which no page has.
     fn sentence_lines(&self, _key: Option<&str>, _detail: &[String]) -> usize {
         1
     }
 }
 
-/// A page's `Date.prototype.getTimezoneOffset()` — minutes, positive WEST of
-/// UTC — as the engine's offset: seconds EAST of UTC. Junk (not a number, or
+/// A page's `Date.prototype.getTimezoneOffset()` (minutes, positive west of
+/// UTC) as the engine's offset (seconds east of UTC). Junk (not a number, or
 /// a day or more either way) reads as UTC.
 fn utc_offset_s(timezone_offset_min: f64) -> i64 {
     if timezone_offset_min.is_finite() && timezone_offset_min.abs() < 1440.0 {
@@ -729,13 +680,11 @@ impl AtermGpuTerminal {
         applied.reply
     }
 
-    /// A press on capsule `index` of row `id` — native's `notice act` after
-    /// its target is named: the engine's `act` logs the press (`Acted`) and
-    /// hands back the intent, and the band settles. The web performs one
-    /// intent, `Details`, and only with a Details view; without one a
-    /// `Details` press changes nothing (nothing was shown, so nothing is
-    /// marked seen). Returns the capsule's full label and whether the page
-    /// performs it; `None` when the row is gone.
+    /// A press on capsule `index` of row `id` (native's `notice act`): the
+    /// engine logs it (`Acted`) and returns the intent, and the band settles.
+    /// The web performs only `Details`, and only with a Details view; without
+    /// one a `Details` press changes nothing. Returns the capsule's label and
+    /// whether the page performs it; `None` when the row is gone.
     pub(crate) fn band_act_at(
         &mut self,
         id: MessageId,
@@ -798,11 +747,9 @@ impl AtermGpuTerminal {
             .map_or_else(|| "OK 0".to_string(), |row| format!("OK 1\n{row}"))
     }
 
-    /// [`Self::messages_page`] at wall time `wall_ms`, on a clock `offset_s`
-    /// seconds east of UTC: the engine's projection of this band's log
-    /// ([`MessagesState::of`], the native page's builder) through the page's
-    /// host, as the engine's lines (`page::wire_lines`). Nothing is worded
-    /// here.
+    /// [`Self::messages_page`] at wall time `wall_ms`, `offset_s` seconds east
+    /// of UTC: [`MessagesState::of`] over this band's log, rendered as
+    /// `page::wire_lines`.
     pub(crate) fn messages_page_at(
         &self,
         tag: &str,
@@ -827,9 +774,8 @@ impl AtermGpuTerminal {
         let before = self.band.center.committed_rows();
         let band = &mut self.band;
         band.now = now;
-        // One grid: the band never takes the terminal's last row (the
-        // drive's afford, measured against what the grid affords now — its
-        // rows plus the band's committed ones). No handoff freezes a page.
+        // The band never takes the terminal's last row (the drive's afford,
+        // against grid rows plus committed band rows). No handoff freeze.
         let afford = drive::afford(
             std::iter::once(u16::try_from(self.rows).unwrap_or(u16::MAX)),
             before,
@@ -841,11 +787,13 @@ impl AtermGpuTerminal {
                 frozen: false,
                 afford,
                 reserved: before,
+                // The band is this page's only chrome row: no other source
+                // rises to space its shrink against.
+                floor: None,
             },
         );
-        // No log file on the web: the drained lines wait in the journal for
-        // the page ([`Self::messages_log_since`]). The paced paint needs no
-        // bit of its own: the paint key sees it.
+        // No log file on the web: drained lines wait in the journal for
+        // [`Self::messages_log_since`]. The paint key covers the paced paint.
         let (lines, _) = drive::drain_and_pace(&mut band.center, &mut band.gate, now, true);
         band.journal_push(lines);
         let rows_moved = committed.regrid.is_some();
@@ -859,15 +807,14 @@ impl AtermGpuTerminal {
 
     /// [`Self::messages_next_wake_ms`] at `now`.
     pub(crate) fn messages_next_wake_ms_at(&self, now: Instant) -> f64 {
-        match self.band.next_wake() {
+        match self.band.next_wake(now, self.cols) {
             None => -1.0,
             Some(t) => (t.saturating_duration_since(now).as_secs_f64() * 1000.0).ceil(),
         }
     }
 
-    /// Re-prepare the band at `now` after a change of how it is drawn (the
-    /// look, the links, the hover, the inks): a band change reopens the frame
-    /// gate.
+    /// Re-prepare the band at `now` after a change of how it is drawn (look,
+    /// links, hover, inks); a band change reopens the frame gate.
     fn band_redraw_at(&mut self, now: Instant) {
         self.band.now = now;
         let m = self.band_metrics();
@@ -901,9 +848,8 @@ impl AtermGpuTerminal {
         }
         self.band.details = available;
         self.band.hover = None;
-        // The view's layout is keyed by the center and the width, not the
-        // links: a fresh view re-lays, and its invalidation repaints even an
-        // empty band (a painted one must not keep the old links).
+        // The view's layout is keyed by center and width, not links: a fresh
+        // view re-lays and repaints even an empty band.
         self.band.view = View::default();
         self.band.view.invalidate();
         self.band_redraw_at(now);
@@ -983,6 +929,26 @@ impl AtermGpuTerminal {
         }
     }
 
+    /// [`Self::band_press_acts`]: the arms [`Self::band_press_at`] performs.
+    pub(crate) fn band_press_acts_at(&self, x: f64, y: f64) -> bool {
+        let m = self.band_metrics();
+        self.band
+            .cell_under(x, y, self.cols, m)
+            .is_some_and(|(row, col)| match self.band.hit(row, col, self.cols) {
+                Hit::Capsule(..) => true,
+                Hit::Details(_) | Hit::Body(_) | Hit::Overflow => self.band.details,
+                Hit::Nothing => false,
+            })
+    }
+
+    /// [`Self::set_frame_period_ms`]: a positive, finite period only.
+    pub(crate) fn set_frame_period(&mut self, ms: f64) {
+        if ms.is_finite() && ms > 0.0 {
+            let period = aterm_messages::Duration::from_secs_f64(ms.min(1000.0) / 1000.0);
+            self.band.center.set_refresh(period);
+        }
+    }
+
     /// [`Self::messages_log_since`]: the center's shelved lines join the
     /// journal first, so a record posted since the last tick is in it.
     pub(crate) fn messages_log_since_at(&mut self, cursor: f64) -> String {
@@ -998,25 +964,20 @@ impl AtermGpuTerminal {
         self.messages_log_since_at(cursor)
     }
 
-    /// Hand the effects pipeline the band's height (the render hook, BEFORE
-    /// the effects): the rows [`Self::compose_band_into_frame`] prepends
-    /// after them — the same committed count. The pipeline's emissions stay
-    /// placed without the band (the compose translates them), but the page
-    /// hands its pointer in canvas pixels, band included (ruling 347), so the
-    /// pet's hit rect and the pointer it watches are read against the grid
-    /// where this frame draws it: a press on the drawn cat pets it, and a
-    /// press on the row above it reaches the terminal.
+    /// Hand the effects pipeline the band's height (render hook, before the
+    /// effects). Emissions stay placed without the band (compose translates
+    /// them), but the page's pointer arrives in canvas pixels, band included,
+    /// so the pet's hit rect is read against where this frame draws the grid.
     pub(crate) fn hand_band_to_effects(&mut self) {
         let px = u16::try_from(self.band_height_px()).unwrap_or(u16::MAX);
         self.effects.set_host_rows_px(px);
     }
 
-    /// [`Self::messages_restore`] at `now`: the kept lines replayed as the
-    /// native launch replays its file (`MessageLog::replay_all` — every
-    /// `Posted` loads retired `Stale` until a `Retired` line says how it
-    /// ended, a colliding id is re-minted, and the next id is above them
-    /// all), then a fresh center over that log. Nothing is queued: the page
-    /// already has these lines, so the journal never hands them back.
+    /// [`Self::messages_restore`] at `now`: replay the kept lines as the native
+    /// launch replays its file (`MessageLog::replay_all`: posts load as retired
+    /// `Stale` until a `Retired` line says otherwise, colliding ids re-mint, the
+    /// next id is above all), then build a fresh center. Nothing is queued to
+    /// the journal: the page already has these lines.
     pub(crate) fn messages_restore_at(&mut self, lines: &str, now: Instant) -> String {
         if !self.band.restorable() {
             return "ERR restore: only once, before the first notice".to_string();
@@ -1036,12 +997,10 @@ impl AtermGpuTerminal {
         )
     }
 
-    /// Compose the band onto the frame scratch (the render hook, after the
-    /// effects and the scroll stamp): re-prepare at the last instant — a
-    /// resize, a new cell size, pad or theme lands here — prepend the rows
-    /// with every window-space stream translated, move the grid band below
-    /// them, and hand the renderer the band's bleed. With no committed row it
-    /// changes nothing: no prepend, and the bleed stays `None`.
+    /// Compose the band onto the frame scratch (render hook, after effects and
+    /// scroll stamp): re-prepare at the last instant, prepend the rows with
+    /// window-space streams translated, move the grid band below them and hand
+    /// the renderer the bleed. With no committed row nothing changes.
     pub(crate) fn compose_band_into_frame(&mut self) {
         let m = self.band_metrics();
         let _ = self.band.prepare(self.cols, m.cell_w, m.pad);
@@ -1053,6 +1012,9 @@ impl AtermGpuTerminal {
             lo: 0,
             frame_w: self.cols * m.cell_w + 2 * m.pad,
             grid_top: m.grid_top,
+            // No measured room: the web keeps the cell-height rule alone
+            // (`seam_can_rail`), as it always drew.
+            room: None,
         };
         let n = self.band.compose(&mut self.frame_scratch, at);
         self.frame_scratch.grid_top_row += n;
@@ -1065,14 +1027,14 @@ impl AtermGpuTerminal {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl AtermGpuTerminal {
     /// One `notice` line — the words after `notice`: `post <tag> [sev=…]
-    /// [key=…] [hold=1..3600] <title>[ -- <detail>]`, `progress key=<key>
+    /// [key=…] [hold=1..120] <title>[ -- <detail>]`, `progress key=<key>
     /// [pct=…|done=n/total|busy] <title>`, `done <key> <ok|warn|withdraw>
     /// [words]`, `dismiss <id>` or `act <id> <index|label|details>`. Returns
     /// the reply line the control socket's `notice` verb answers, without its
     /// newline: `OK …`, or `ERR …` for every refusal (usage, caps — three
     /// live wire rows, 60 mints / 16 KiB / 10 presses a minute, a 120-char
-    /// title, a 2 KiB / 24-line / 240-char detail, `hold` 1–3600 s, `wire.`
-    /// keys up to 40 chars — and aterm's own lanes). A success or info `post`
+    /// title, a 2 KiB / 24-line / 240-char detail, `hold` 1–120 s, `wire.`
+    /// keys up to 40 chars — and aterm's own tags). A success or info `post`
     /// is a record: it lands in the log, never on the band. `act` answers
     /// `performed=1` only for `details` on a page with a Details view: the
     /// web performs no other intent. When
@@ -1082,55 +1044,33 @@ impl AtermGpuTerminal {
         self.notice_at(line, Instant::now(), wall_now())
     }
 
-    /// The `messages` verb — the words after `messages`: `[<n>] [since=<id>]
+    /// The `messages` verb (words after `messages`): `[<n>] [since=<id>]
     /// [tag=<tag>] [sev=<sev>] [live]`. Returns `OK <count>` then one
-    /// `message <id> …` row per record, `\n`-separated (no trailing newline),
-    /// every free field percent-encoded; or `ERR usage: …`. The log is the
-    /// in-memory ring for the page's lifetime: this is where a row's details
-    /// live on the web.
+    /// `message <id> …` row per record, `\n`-separated, free fields
+    /// percent-encoded; or `ERR usage: …`. The log is the in-memory ring.
     pub fn messages_read(&self, args: &str) -> String {
         self.messages_read_at(args, wall_now().unix_ms)
     }
 
-    /// One record's `messages` row — `OK 1` then the row, or `OK 0` when the
-    /// ring has no record `id`: what a page's Details view is built from
-    /// (every field `messages_read` carries, the full detail among them).
+    /// One record's `messages` row: `OK 1` then the row, or `OK 0` when there
+    /// is no record `id`. A page's Details view is built from this.
     pub fn messages_entry(&self, id: f64) -> String {
         self.messages_entry_at(id, wall_now().unix_ms)
     }
 
-    /// The Settings ▸ Messages page as the native window builds it, its
-    /// words already said (what a site still words itself: the module doc's
-    /// item 9): `OK <n>` then `n` lines, `\n`-separated. The `page` line
-    /// carries the page's chrome words too (`heading=`, `subtitle=`,
-    /// `all_words=` and `problems_words=` — `All · N`, `Problems · N` —,
-    /// `all_tags=`, `tag_menu=`, `copy_all_button=`, `copy_button=`,
-    /// `empty=` and the rest), a `chip` its painted `label=` (`ALab tools ·
-    /// 2`), an `entry` its `meta=` line and its `copy=` — what Copy puts on
-    /// the clipboard — and an `action` both the intent's own `label=`
-    /// (`Manual`) and the `button=` the native footer paints (`Open Manual`),
-    /// then `primary=1` on the one the native footer draws in the accent and
-    /// a bare Return presses (the engine's rule,
-    /// `aterm_messages::page::primary_index`, ruling 407), `primary=0` on the
-    /// rest.
-    /// Copy All's text is the page's build information, then for each entry
-    /// in order two line feeds and its `copy=`; Copy All is pressable while
-    /// `total=` is above 0. `tag` selects a chip (`""`: every tag; a chip's
-    /// `tag=`, or any tag that shows under it), `problems` keeps the
-    /// warnings and errors, and `timezone_offset_min` is
-    /// `new Date().getTimezoneOffset()` verbatim, for the local times and the
-    /// day headers. Each line is a kind word (`page`, `chip`, `day`, `entry`,
-    /// `action`) then TAB-separated `key=value` fields, each value unescaped
-    /// `\\` → `\`, `\t` → TAB, `\n` → LF, `\r` → CR and `\u` → U+001F, which
-    /// joins the lines of `sentence=` and `technical=` (`copy=` is one text,
-    /// its line breaks `\n`); a reader ignores a key or a kind it does not
-    /// know, and a key added later follows every older one of its kind (a
-    /// reader of round 36's grammar still parses). The grammar is the engine's
-    /// (`aterm_messages::page::wire_lines`), whose doc names every field. A
-    /// wire row carries no authored capsule (ruling 172), so the web's
-    /// entries have no `action` lines unless a restored log brought some,
-    /// and none of those is pressable here (`actionable=0`, ruling 389), so
-    /// none leads (`primary=0`).
+    /// The Settings ▸ Messages page as the native window builds it, fully
+    /// worded: `OK <n>` then `n` lines, `\n`-separated. Each line is a kind
+    /// word (`page`, `chip`, `day`, `entry`, `action`) then TAB-separated
+    /// `key=value` fields, values unescaped `\\` → `\`, `\t` → TAB, `\n` → LF,
+    /// `\r` → CR and `\u` → U+001F (joining the lines of `sentence=` and
+    /// `technical=`). Readers ignore unknown keys and kinds; new keys follow
+    /// older ones. The grammar is `aterm_messages::page::wire_lines`.
+    ///
+    /// `tag` selects a chip (`""`: every tag), `problems` keeps warnings and
+    /// errors, and `timezone_offset_min` is `new Date().getTimezoneOffset()`.
+    /// Copy All's text is the page's build information, then per entry two
+    /// line feeds and its `copy=`; it is pressable while `total=` > 0. Web
+    /// entries have no pressable `action` lines (`actionable=0`, `primary=0`).
     pub fn messages_page(&self, tag: &str, problems: bool, timezone_offset_min: f64) -> String {
         self.messages_page_at(
             tag,
@@ -1140,20 +1080,18 @@ impl AtermGpuTerminal {
         )
     }
 
-    /// Advance the band to now — call when the timer armed from
-    /// [`messages_next_wake_ms`](Self::messages_next_wake_ms) fires: retire
-    /// what expired, commit the row count, take the wire's paced paint and
-    /// prepare the frame. Bit 0: the band changed (render); bit 1: the row
-    /// count changed (the frame's height and [`grid_top_px`](Self::grid_top_px)
-    /// moved — a page with a fixed canvas re-grids now).
+    /// Advance the band to now, when the timer from
+    /// [`messages_next_wake_ms`](Self::messages_next_wake_ms) fires. Bit 0: the
+    /// band changed (render); bit 1: the row count changed (frame height and
+    /// [`grid_top_px`](Self::grid_top_px) moved; a fixed canvas re-grids).
     pub fn messages_tick(&mut self) -> u32 {
         self.messages_tick_at(Instant::now())
     }
 
     /// Milliseconds until the band next needs [`messages_tick`](Self::messages_tick)
-    /// (`0`: now), or `-1` when NOTHING is armed — arm no timer then. A moving
-    /// row asks on the engine's 33 ms grid; a held row only at its expiry; a
-    /// still look only for its time words' ticks; a hidden page never.
+    /// (`0`: now), or `-1` when nothing is armed (arm no timer). Moving rows ask
+    /// on a 33 ms grid, held rows at expiry, a still look at its time words'
+    /// ticks, a hidden page never.
     pub fn messages_next_wake_ms(&self) -> f64 {
         self.messages_next_wake_ms_at(Instant::now())
     }
@@ -1163,6 +1101,15 @@ impl AtermGpuTerminal {
     /// ticks. Re-arm the timer after a change.
     pub fn set_band_motion(&mut self, allowed: bool) {
         self.set_band_motion_at(allowed, Instant::now());
+    }
+
+    /// The page's display frame period in ms, measured from its
+    /// `requestAnimationFrame` timestamps: a glide and an echo in flight are
+    /// read on it, as the native window reads them on its display's (ruling
+    /// 436). Clamped to 240 Hz … 30 Hz; a page that never calls this reads
+    /// them at 60 Hz, and a value that is not a positive number is ignored.
+    pub fn set_frame_period_ms(&mut self, ms: f64) {
+        self.set_frame_period(ms);
     }
 
     /// Whether the page is visible (`!document.hidden`): a hidden page's band
@@ -1175,20 +1122,17 @@ impl AtermGpuTerminal {
     }
 
     /// Whether the page has a Details view (built from
-    /// [`messages_entry`](Self::messages_entry)): with one, every row ends in
-    /// its link (`Details ›`, `+N ›`, the overflow row's) and a press on a row
-    /// opens it; without, the links are withheld. Render when
-    /// [`needs_frame`](Self::needs_frame) turns true.
+    /// [`messages_entry`](Self::messages_entry)): if so, every row ends in its
+    /// link and a row press opens it; otherwise links are withheld. Render
+    /// when [`needs_frame`](Self::needs_frame) turns true.
     pub fn set_details_view(&mut self, available: bool) {
         self.set_details_view_at(available, Instant::now());
     }
 
     /// CSS `forced-colors`: while `active`, the five system colours (packed
     /// `0x00RRGGBB`: `Canvas`, `CanvasText`, `Highlight`, `HighlightText`,
-    /// `ButtonFace`) own the band, ungraded — the High Contrast mapping the
-    /// native window uses. `active = false` returns to the theme's inks (the
-    /// colours are then ignored). Render when
-    /// [`needs_frame`](Self::needs_frame) turns true.
+    /// `ButtonFace`) own the band ungraded; `false` returns to the theme's
+    /// inks. Render when [`needs_frame`](Self::needs_frame) turns true.
     pub fn set_forced_colors(
         &mut self,
         active: bool,
@@ -1209,12 +1153,19 @@ impl AtermGpuTerminal {
         );
     }
 
-    /// The pointer at frame pixel `(x, y)` (device px from the frame's
-    /// top-left; anything off the band — `(-1, -1)` on leave — clears it):
-    /// lights the chip a press there would follow. `true` when the lit chip
-    /// changed — render; moving along one chip changes nothing.
+    /// The pointer at frame pixel `(x, y)` (off the band, e.g. `(-1, -1)` on
+    /// leave, clears it) lights the chip a press would follow. `true` when the
+    /// lit chip changed.
     pub fn band_hover(&mut self, x: f64, y: f64) -> bool {
         self.band_hover_at(x, y, Instant::now())
+    }
+
+    /// Whether a press at frame pixel `(x, y)` would DO something — the page's
+    /// pointer is a hand there (`cursor: pointer`) and nowhere else on the
+    /// band, as the native window's is (ruling 436): a capsule, and with a
+    /// Details view a row's body, its link and the overflow row.
+    pub fn band_press_acts(&self, x: f64, y: f64) -> bool {
+        self.band_press_acts_at(x, y)
     }
 
     /// A press at frame pixel `(x, y)`: `OK none` off the band or where a
@@ -1228,36 +1179,30 @@ impl AtermGpuTerminal {
         self.band_press_at(x, y, Instant::now())
     }
 
-    /// The log lines (`m1` codec, one record's post, retirement or press
-    /// each) from `cursor` on: `OK <next> <n>` then the lines,
-    /// `\n`-separated. Keep them (IndexedDB) and pass `<next>` back next
-    /// time; start at 0. A page that fell more than the ring's 512 lines
-    /// behind reads a `dropped` line first, saying how many it missed.
+    /// The log lines (`m1` codec) from `cursor` on: `OK <next> <n>` then the
+    /// lines, `\n`-separated. Keep them and pass `<next>` back next time,
+    /// starting at 0. A page more than the ring's 512 lines behind reads a
+    /// `dropped` line first.
     pub fn messages_log_since(&mut self, cursor: f64) -> String {
         self.messages_log_since_at(cursor)
     }
 
-    /// The page is going away (`pagehide`, not persisted): every row still
-    /// open is recorded as cut off by the quit (ruling 267), and the lines
-    /// from `cursor` on — the quit records among them — come back as
-    /// [`messages_log_since`](Self::messages_log_since) answers.
+    /// The page is going away (`pagehide`, not persisted): every open row is
+    /// recorded as cut off by the quit, and the lines from `cursor` on come
+    /// back as [`messages_log_since`](Self::messages_log_since) answers.
     pub fn messages_quit(&mut self, cursor: f64) -> String {
         self.messages_quit_at(cursor, Instant::now())
     }
 
-    /// Load the log the page kept on earlier visits: the `m1` lines it saved
-    /// from [`messages_log_since`](Self::messages_log_since) and
-    /// [`messages_quit`](Self::messages_quit), `\n`-separated, oldest first.
-    /// Call ONCE, before the first [`notice`](Self::notice). The lines become
-    /// the log's records, never rows: a row still open when its page went
-    /// away comes back `stale` and stays off the band, a retired one keeps
-    /// its outcome, and every later post's id is above theirs. The newest
-    /// 1024 lines are read; a line the codec refuses is skipped, a repeated
-    /// one read once. Answers `OK records=<n> skipped=<n> dup=<n> over=<n>`
-    /// (the ring's records after the load, then the lines refused, repeated
-    /// and left unread), or `ERR restore: …` after a restore or a post, when
-    /// nothing changes. The restored lines never come back from
-    /// `messages_log_since`: the page has them already.
+    /// Load the log kept on earlier visits (lines from
+    /// [`messages_log_since`](Self::messages_log_since) and
+    /// [`messages_quit`](Self::messages_quit), oldest first). Call once, before
+    /// the first [`notice`](Self::notice). Lines become records, never rows:
+    /// a row open at page exit comes back `stale`, retired ones keep their
+    /// outcome, later ids are above theirs. The newest 1024 lines are read;
+    /// refused lines are skipped, repeats read once. Answers `OK records=<n>
+    /// skipped=<n> dup=<n> over=<n>`, or `ERR restore: …` after a restore or
+    /// post. Restored lines never come back from `messages_log_since`.
     pub fn messages_restore(&mut self, lines: &str) -> String {
         self.messages_restore_at(lines, Instant::now())
     }
@@ -1271,11 +1216,7 @@ impl AtermGpuTerminal {
 
     /// The band's height in device px (`band_rows · cell_height`): the frame
     /// grows by this, and the page offsets every row it hands the terminal
-    /// (`selection_start`, `selection_extend`, `selection_word`,
-    /// `selection_line`, `encode_mouse_*`, `link_at`) by it. The pet's
-    /// doors (`note_pointer_px`, `pet_press_px`) take the canvas pixels
-    /// unchanged: the engine folds the band into the pet's origin itself
-    /// (ruling 347).
+    /// by it. The pet's doors take canvas pixels unchanged.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
     pub fn band_height_px(&self) -> u32 {
         let m = self.band_metrics();
@@ -1323,12 +1264,10 @@ mod tests {
         (t, t0)
     }
 
-    /// The GPU module's band is the CPU twin's on the frame it hands its
-    /// renderer: a warning reserves one row above the grid (the frame
-    /// scratch grows by it, the grid band moves below it, both faces hold
-    /// the band's bleed), the tick reports the row count's move, and when
-    /// the row leaves the frame is the band-less one again. With no band row
-    /// the frame build changes nothing (the negative control).
+    /// A warning reserves one row above the grid (the scratch grows, the grid
+    /// band moves below it, both faces hold the bleed), the tick reports the
+    /// row-count change, and when the row leaves the frame is band-less again.
+    /// With no band row the frame build changes nothing.
     #[test]
     fn the_band_composes_into_the_gpu_frame() {
         let (mut plain, _) = clocked(12, 60);
@@ -1386,6 +1325,83 @@ mod tests {
         );
     }
 
+    /// THE BAND ON BOTH WEB RENDERERS (rulings 340 and 439), drawn through
+    /// this module itself: a held warning and a metered bar posted over
+    /// `notice`, committed by the tick and composed by the frame build
+    /// `render` runs, then drawn by the GPU renderer as `init` assembles it
+    /// (a native `GpuContext` in place of the canvas's, `init`'s own face,
+    /// `from_parts`) and by the CPU face that holds the band's bleed. The two land within the
+    /// grid's CPU/GPU tolerance; the frame is the band's two rows taller than
+    /// the band-less one, and those rows carry ink (a band that failed to
+    /// draw would compare equal to the grid alone there). No GPU: SKIP.
+    #[test]
+    fn the_band_frame_is_one_picture_on_both_web_renderers() {
+        let ctx = match aterm_gpu::GpuContext::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: no GPU: {e}");
+                return;
+            }
+        };
+        let (mut t, t0) = clocked(6, 24);
+        t.set_chrome(6, 0);
+        t.process(b"\x1b[31mRR\x1b[0m\r\n\x1b[44m  \x1b[0m\r\n\x1b[7mXX\x1b[0m\r\nab\r\n");
+        let _ = t.render_headless();
+        let plain = t.cpu.render_input(&t.frame_scratch);
+        for line in [
+            "post ci sev=warn hold=60 Disk nearly full -- 2 GB left",
+            "progress p pct=50 Downloading assets",
+        ] {
+            let reply = t.notice_at(line, t0, stamp());
+            assert!(reply.starts_with("OK"), "{reply}");
+        }
+        let _ = t.messages_tick_at(t0 + ms(2500));
+        assert_eq!(t.band_rows(), 2, "the warning and the bar, past its grace");
+        assert!(!t.render_headless(), "the band's frame is built");
+        assert!(
+            !t.frame_scratch.chrome_rasters.is_empty(),
+            "the bar's meter is drawn at pixel resolution"
+        );
+        let face = t.gpu_face().expect("the bundled font");
+        let mut gpu = match aterm_gpu::GpuRenderer::from_parts(ctx, face, None, t.theme) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: gpu renderer unavailable: {e}");
+                return;
+            }
+        };
+        gpu.set_chrome_bleed(t.cpu.chrome_bleed());
+        let cpu = t.cpu.render_input(&t.frame_scratch);
+        let gpu = gpu.render_input(&mut aterm_gpu::WindowGpu::new(), &t.frame_scratch, None);
+        let (_, ch) = t.cpu.cell_size();
+        assert_eq!(
+            (cpu.width, cpu.height),
+            (plain.width, plain.height + 2 * ch),
+            "the frame grows by the band's two rows"
+        );
+        assert_eq!((gpu.width, gpu.height), (cpu.width, cpu.height));
+        // Per channel of the packed `0x00RRGGBB` the page's RGBA8 carries.
+        let channel = |p: u32, s: u32| (p >> s) & 0xff;
+        let delta = cpu
+            .pixels
+            .iter()
+            .zip(&gpu.pixels)
+            .flat_map(|(&a, &b)| [0, 8, 16].map(|s| channel(a, s).abs_diff(channel(b, s))))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            delta <= 8,
+            "the web CPU/GPU band frames diverge by {delta} > 8"
+        );
+        let pad = t.cpu.pad();
+        let band = &gpu.pixels[pad * gpu.width..(pad + 2 * ch) * gpu.width];
+        let inked = band.iter().filter(|&&p| p & 0x00FF_FFFF != BG).count();
+        assert!(
+            inked > band.len() / 20,
+            "the GPU drew the band: {inked} inked pixels"
+        );
+    }
+
     /// The GPU module's copy carries the round's exports: a hidden page arms
     /// nothing, the forced colours are the engine's forced inks, and the
     /// log drains as codec lines — the CPU twin's tests, abridged, on this
@@ -1426,12 +1442,10 @@ mod tests {
         assert!(words.contains("Details"), "{words}");
     }
 
-    /// The pet's drawn body in FRAME px `(x0, x1, y0, y1)`, read off the frame
-    /// this module hands its renderer: the free sprite whose atlas tile is
-    /// the body's natural size (`ART_ROWS` cells tall at `ART_ASPECT` — motes
-    /// and word-cats bake at other sizes), placed where the rasterizers stamp
-    /// it, `pad` in and `grid_top` down (any band rows are already in its
-    /// `y`).
+    /// The pet's drawn body in frame px `(x0, x1, y0, y1)`: the free sprite
+    /// whose atlas tile is the body's natural size (`ART_ROWS` cells tall at
+    /// `ART_ASPECT`), placed `pad` in and `grid_top` down (band rows are
+    /// already in its `y`).
     fn drawn_pet_body(frame: &RenderInput, m: BandMetrics) -> Option<(f32, f32, f32, f32)> {
         use aterm_effects::kitty_pet::{ART_ASPECT, ART_ROWS};
         let nat_h = (ART_ROWS * m.cell_h as f32).round();
@@ -1442,11 +1456,9 @@ mod tests {
         Some((x0, x0 + f32::from(s.w), y0, y0 + f32::from(s.h)))
     }
 
-    /// The CPU twin's `the_pet_is_pressed_where_the_band_draws_it`, on this
-    /// module's own frame build: with a band row committed, a press at the
-    /// drawn cat's centre and one on its feet pet it, and a press on the text
-    /// half a row above the drawn body reaches the terminal. Without the band
-    /// the same holds (the control).
+    /// With a band row committed, a press at the drawn cat's centre or feet
+    /// pets it, and a press half a row above its body reaches the terminal.
+    /// The same holds without the band.
     #[test]
     fn the_pet_is_pressed_where_the_band_draws_it() {
         let (mut t, t0) = clocked(12, 60);
@@ -1504,15 +1516,13 @@ mod tests {
         }
     }
 
-    /// The GPU module restores the page's kept log as the CPU twin does
-    /// (ruling 345): a held warning its last visit left open comes back a
-    /// `stale` record — no band row, no swapchain growth, no timer — the next
-    /// post takes the next id and IS on the band (the negative control), and
-    /// a second restore is refused.
+    /// A held warning left open on the last visit restores as a `stale` record
+    /// (no band row, no swapchain growth, no timer); the next post takes the
+    /// next id and is on the band; a second restore is refused.
     #[test]
     fn the_gpu_band_restores_the_kept_log() {
         let (mut a, t0) = clocked(12, 60);
-        let _ = a.notice_at("post ci sev=warn hold=600 Disk nearly full", t0, stamp());
+        let _ = a.notice_at("post ci sev=warn hold=100 Disk nearly full", t0, stamp());
         let _ = a.messages_tick_at(t0 + ms(10));
         assert_eq!(a.band_rows(), 1);
         let kept: Vec<String> = a
@@ -1540,11 +1550,9 @@ mod tests {
         assert_eq!(t.band_rows(), 1);
     }
 
-    /// The three rows both web modules' page tests post — a record, a held
-    /// warning and an error, each detail a sentence and a technical line —
-    /// ticked a second later; and the page's lines for them read 90 s after
-    /// they were stamped, on a UTC clock (the CPU and the GPU module pin the
-    /// SAME lines: one grammar, the engine's).
+    /// Post a record, a held warning and an error (each detail a sentence and
+    /// a technical line), tick a second later, and read the page's lines 90 s
+    /// after posting on a UTC clock. Both web modules pin the same lines.
     fn post_page_rows(t: &mut AtermGpuTerminal, t0: Instant) -> Vec<String> {
         for (i, line) in [
             "post ci Build finished -- 12 tests\\nall green",
@@ -1580,11 +1588,9 @@ mod tests {
         ]
     }
 
-    /// The `page` line's chrome keys (ruling 396), after every older key: a
-    /// page whose tag filter admits `all` entries, `problems` of them
-    /// warnings or errors, under the chip worded `chip` (`None`: every tag).
-    /// The words are the engine's, byte for byte, as the native page paints
-    /// them.
+    /// The `page` line's chrome keys for a filter admitting `all` entries,
+    /// `problems` of them warnings or errors, under chip `chip` (`None`: every
+    /// tag), worded as the native page paints them.
     fn page_chrome(all: usize, problems: usize, chip: Option<&str>) -> String {
         let on = u8::from(chip.is_none());
         let current = chip.unwrap_or("All");
@@ -1593,12 +1599,9 @@ mod tests {
         )
     }
 
-    /// The GPU module's Settings ▸ Messages page is the CPU twin's (ruling
-    /// 387): the same rows posted through `notice` read back from
-    /// `messages_page` as the SAME lines the CPU module's test pins — the
-    /// engine's grammar with the page's chrome words, each entry's meta line
-    /// and Copy text (ruling 396), framed `OK <n>` — the Problems switch
-    /// leaves the record out, and a chip down is named by the chrome.
+    /// Rows posted via `notice` read back from `messages_page` as the same
+    /// lines the CPU module pins, framed `OK <n>`; the Problems switch leaves
+    /// the record out, and a selected chip is named by the chrome.
     #[test]
     fn the_gpu_page_is_the_twins_page() {
         let (mut t, t0) = clocked(12, 60);
@@ -1616,7 +1619,7 @@ mod tests {
         )));
         assert!(problems.contains("\nchip\ttag=ci\twords=CI\tcount=1\ton=0\tlabel=CI \u{00b7} 1\n"));
         assert!(!problems.contains("\ttitle=Build finished\t"), "{problems}");
-        // A chip down: the chrome names it, `All tags` is up (ruling 396).
+        // A chip down: the chrome names it, `All tags` is up.
         let deploy = t.messages_page_at("deploy", false, 0, wall);
         assert!(
             deploy.contains(&format!(
@@ -1627,14 +1630,9 @@ mod tests {
         );
     }
 
-    /// The GPU module's page offers what the CPU twin's offers (rulings 387,
-    /// 389): a restored native log's crash record reads its `Open log` and
-    /// its `Manual` NOT pressable, each with the words its footer button
-    /// paints (`button=`, ruling 396: `Open Manual` for `Manual`) and
-    /// neither the Primary (`primary=0`, ruling 407), and no press route
-    /// reaches the record; an agent's upgrade record offers no
-    /// word on the page while the log still names it — the SAME action lines
-    /// the CPU module's `the_web_page_offers_no_file_and_no_upgrade` pins.
+    /// A restored native crash record's `Open log` and `Manual` are listed but
+    /// not pressable (`button=` wording, `primary=0`) and no press route
+    /// reaches the record; an agent upgrade record offers no action.
     #[test]
     fn the_gpu_page_offers_what_the_twin_offers() {
         let (mut t, t0) = clocked(12, 60);
@@ -1686,7 +1684,7 @@ mod tests {
             ],
             "{page}"
         );
-        // Nothing pressable, nothing leads (ruling 407): the engine's rule
+        // Nothing pressable, nothing leads: the engine's rule
         // gives no Primary, and the key is the last of its line (appended).
         assert!(!page.contains("\tprimary=1"), "{page}");
         assert_eq!(

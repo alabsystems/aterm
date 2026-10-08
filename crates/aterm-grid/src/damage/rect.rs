@@ -32,10 +32,8 @@ impl LineDamageBounds {
         self.left >= self.right
     }
 
-    /// Check if two adjacent rows can be merged into a single rectangle.
-    ///
-    /// Two rows can be merged if they are consecutive and have overlapping
-    /// or adjacent column ranges.
+    /// Whether two rows are consecutive with overlapping or adjacent column
+    /// ranges, so they merge into one rectangle.
     #[inline]
     #[cfg(any(test, kani))]
     pub fn can_merge_with(&self, other: &Self) -> bool {
@@ -47,10 +45,8 @@ impl LineDamageBounds {
         self.left <= other.right && other.left <= self.right
     }
 
-    /// Merge with another bounds, returning a rectangle covering both.
-    ///
-    /// The result will have column bounds covering both inputs.
-    /// Call `can_merge_with` first to check if merging is beneficial.
+    /// Merge with another bounds into a rectangle covering both (check
+    /// `can_merge_with` first).
     #[inline]
     #[cfg(test)]
     pub fn merge_with(&self, other: &Self) -> DamageRect {
@@ -63,11 +59,8 @@ impl LineDamageBounds {
     }
 }
 
-/// A rectangular damage region spanning multiple rows.
-///
-/// Used to batch adjacent damaged rows for more efficient GPU rendering.
-/// Instead of rendering many thin horizontal strips, merged rectangles
-/// can be rendered with fewer draw calls.
+/// A rectangular damage region spanning several rows, batching adjacent
+/// damaged rows into fewer GPU draw calls.
 #[cfg(any(test, kani, feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DamageRect {

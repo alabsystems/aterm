@@ -1,29 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! How a supervisor lives with a session it does not own (audit SUP-6): a
-//! refusal is waited out rather than ending the watch, a badge a previous
-//! watcher left is settled at the start, the badges this one raised go with
-//! it, and the in-GUI host runs the same loop under a stop flag.
+//! How a supervisor lives with a session it does not own: a refusal is waited
+//! out rather than ending the watch, a badge a previous watcher left is
+//! settled at the start, the badges this one raised go with it, and the
+//! in-GUI host runs the same loop under a stop flag.
 //!
-//! * `ERR halted …` — an owner or fleet `hold` — parks the loop
-//!   ([`Session::park_on_hold`]): `status` says whether `hold=1` stands, and
-//!   the wait is the server's `await inbox … kinds=hold`, which latches on
-//!   the hold's transition. No press is re-sent after it: the loop reads and
-//!   decides again.
-//! * `ERR busy …` (another writer's turn or lease, a sink that cannot take
-//!   the frame) and `ERR rate` back the loop off ([`Session::back_off`]):
-//!   the wait is the refused point leaving the screen, bounded by a pause
+//! * `ERR halted …` (an owner or fleet `hold`) parks the loop
+//!   ([`Session::park_on_hold`]) on the server's `await inbox … kinds=hold`;
+//!   no press is re-sent after it: the loop reads and decides again.
+//! * `ERR busy …` and `ERR rate` back the loop off ([`Session::back_off`]):
+//!   it waits for the refused point to leave the screen, bounded by a pause
 //!   that doubles from 250 ms to 8 s.
-//! * At the start ([`Session::take_claim`], `claim.rs`) the session's
-//!   supervisor claim is taken, and then ([`Session::reconcile`]) the keyed
-//!   attention entry a previous supervisor left (owner `supervisor`: the
-//!   key is the proof, never the text) is adopted when the screen still shows its point — no
-//!   second badge, no second mail — and unset when it does not (the
-//!   stale-badge-after-a-restart case). A loop watching behind another
-//!   supervisor's claim settles nothing: the entry is that one's.
-//! * At the end ([`Session::release_attention`]) the badges this loop set
-//!   are cleared, if they are still its own, and the claim is released.
+//! * At the start ([`Session::take_claim`]) the claim is taken, and
+//!   ([`Session::reconcile`]) a keyed attention entry a previous supervisor
+//!   left is adopted when the screen still shows its point, else unset. A loop
+//!   behind another supervisor's claim settles nothing.
+//! * At the end ([`Session::release_attention`]) this loop's badges are
+//!   cleared, if still its own, and the claim is released.
 
 use super::escalate::{point_label, status_field};
 use super::*;
@@ -40,10 +34,14 @@ impl<C: Ctl> Session<'_, C> {
         let Some(line) = meta.lines().find(|l| l.starts_with("OK")) else {
             return;
         };
-        // The shell's reported directory (OSC 7) first; where it reported
-        // none, the agent process's own (`agent_cwd=`, 2026-09-27) — where it
-        // was launched, which is what `ApprovalCtx::cwd` means and exactly
-        // the folder Claude Code's trust dialog asks about.
+        // The agent process's OWN directory (`agent_cwd=`, read from the OS)
+        // first, else the shell's reported one (OSC 7): where it was launched,
+        // which is what `ApprovalCtx::cwd` means and the folder Claude Code's
+        // trust dialog asks about. The shell's is where its LAST PROMPT was,
+        // and stays there after `cd x && claude`, in a worktree and after the
+        // harness's own relaunch (`( cd -- DIR && exec claude --resume … )`):
+        // `meta` then says `cwd=…/proj agent_cwd=…/proj/sub`, and a relative
+        // `rm` was judged against the wrong folder.
         let field = |key: &str| {
             line.split_whitespace()
                 .find_map(|w| w.strip_prefix(key))
@@ -52,7 +50,7 @@ impl<C: Ctl> Session<'_, C> {
                 .filter(|p| p.starts_with('/'))
                 .map(PathBuf::from)
         };
-        self.cwd = field("cwd=").or_else(|| field("agent_cwd="));
+        self.cwd = field("agent_cwd=").or_else(|| field("cwd="));
     }
 
     /// A press or a dismissal the server did not take: parked on the hold
@@ -146,8 +144,9 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<(), Fail> {
         let pause = self.refusal_pause;
         self.refusal_pause = pause.saturating_mul(2).min(REFUSAL_PAUSE_MAX);
-        // The server refused it behind input the worker has not read: the
-        // next look reads `status` before it presses (`stall.rs`).
+        // The server refused it behind input the worker has not read — a
+        // published stall or a stopped job: the next look reads `status`
+        // before it presses (`stall.rs`).
         if why.contains("ERR busy input-unread") {
             self.stall_suspect = true;
         }
@@ -175,11 +174,7 @@ impl<C: Ctl> Session<'_, C> {
     /// `ADOPTED seq=<n> attention=<text>` or `CLEARED seq=<n> stale
     /// attention=<reply>`. The `meta` read also gives the session's cwd
     /// ([`Self::note_cwd`]).
-    pub(super) fn reconcile(
-        &mut self,
-        allow: &[String],
-        review: &mut dyn Review,
-    ) -> Result<(), Fail> {
+    pub(super) fn reconcile(&mut self, review: &mut dyn Review) -> Result<(), Fail> {
         let read = self.call(&["meta"])?;
         if self.unserved(&read) {
             return Err(Fail::Lost(format!("meta failed: {}", read.stderr.trim())));
@@ -231,7 +226,8 @@ impl<C: Ctl> Session<'_, C> {
                 self.adopted_limit = true;
             } else {
                 self.box_ask = Some(BoxAsk {
-                    key: review_key(&turn, allow),
+                    key: self.review_key(&turn),
+                    memory: false,
                 });
                 self.adopted_box = true;
             }
@@ -266,22 +262,15 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The in-GUI host's loop: `Self::watch`'s, under `opts` (normally
-    /// [`SuperviseOpts::hosted`]), until `stop` is set — checked at every
-    /// look, before every wait of a turn, every wait on a handed point and
-    /// every ride-out pause, and before EVERY wait by [`Self::call`], which
-    /// refuses one once the flag is set, as it refuses a write — so the loop
-    /// ends within one wait of it: the wait already asked for when the flag
-    /// landed, 20 s at most ([`WAIT_STEP`]); a ride-out pause, 8 s at most.
-    /// The transport's [`Ctl::interrupter`] ends a parked wait at once, but
-    /// it ends the connection with it, so the badges this loop raised can no
-    /// longer be cleared: a host that wants them cleared sets the flag and
-    /// lets the wait run out. Every line goes to `out` and, with
-    /// `opts.journal`, the journal; the approval ledger is kept where one was
-    /// set, else at `opts.ledger` — the host's, never the process's own state
-    /// directory by default. The badges it raised
-    /// are cleared as it ends. `Ok(())` for a stop or a spent budget, `Err`
-    /// with the reason for anything else (the session gone, an outage past
-    /// its window).
+    /// [`SuperviseOpts::hosted`]), until `stop` is set. The flag is checked at
+    /// every look and before every wait ([`Self::call`] refuses a wait or a
+    /// write once it is set), so the loop ends within one wait: 20 s at most
+    /// ([`WAIT_STEP`]), a ride-out pause 8 s at most. [`Ctl::interrupter`]
+    /// ends a wait at once but loses the connection, so the badges could no
+    /// longer be cleared. Every line goes to `out` and, with `opts.journal`,
+    /// the journal; the approval ledger is kept at `opts.ledger` unless one
+    /// was set. The badges it raised are cleared as it ends. `Ok(())` for a
+    /// stop or a spent budget, `Err` with the reason for anything else.
     pub fn run_hosted(
         &mut self,
         opts: &SuperviseOpts,

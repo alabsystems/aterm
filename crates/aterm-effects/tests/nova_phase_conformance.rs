@@ -2,23 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 bind for `NovaPhase`'s `Step` (`aterm_spec::derive::nova_phase_model`)
-//! over EVERY duration the genome can decode: the shipping phase function and
-//! emitter, walked at 1 ms, every window boundary validated against the model.
+//! over every duration the genome can decode: the real phase function and
+//! emitter, walked at 1 ms, each window boundary validated against the model.
 //!
 //! Two independent observables are projected, so the model's flash-counting
 //! rule is checked rather than restated:
 //!
-//! * `phase` is [`nova::phase`] — the pure `(t, D)` window the host and the
-//!   emitter both read — mapped onto `0 Armed .. 6 Settled`;
-//! * `flashes` counts the RISING EDGES of the star-glint crown that
-//!   [`nova::emit_nova`] actually emits. The model counts a flash exactly when
-//!   the walk enters Flash from Dip; the crown is what a user sees flash, so a
-//!   crown that bloomed twice, or in a window the model does not call Flash, is
-//!   rejected here.
+//! * `phase` is [`nova::phase`] (the pure `(t, D)` window the host and the
+//!   emitter both read), mapped onto `0 Armed .. 6 Settled`;
+//! * `flashes` counts rising edges of the star-glint crown that
+//!   [`nova::emit_nova`] emits. The model counts a flash only when the walk
+//!   enters Flash from Dip, so a crown that blooms twice, or outside Flash, is
+//!   rejected.
 //!
-//! This file binds the walk only. `Rearm` — where the model's `Buggy = 1`
-//! defect lives — is a host transition (the ignition grant, the spent mark,
-//! `hard_reset`, the thaw shift), and aterm-effects'
+//! `Rearm` (where the model's `Buggy = 1` defect lives) is a host transition;
 //! `word_decorations::nova_host_conformance` binds it on the real
 //! `WordDecorations` engine, with its negative control.
 
@@ -104,8 +101,8 @@ fn crown_lit(t: i64, env: &NovaEnv) -> bool {
 }
 
 /// One contiguous window of the real phase walk: the phase `nova::phase`
-/// reports throughout it, and how many times the shipping crown BLOOMED (dark
-/// to lit) inside it.
+/// reports throughout it, and how many times the crown bloomed (dark to lit)
+/// inside it.
 struct Window {
     phase: i64,
     blooms: i64,
@@ -136,11 +133,9 @@ fn real_windows(env: &NovaEnv) -> Vec<Window> {
     windows
 }
 
-/// Walk one arm: every window boundary is a real step, projected as `phase'` =
-/// the window entered and `flashes' = flashes + blooms in that window`, and
-/// validated against the model's `Step`. The model counts a flash exactly when
-/// the walk enters Flash from Dip, so a crown that blooms in any other window,
-/// or twice in one, is a step the model rejects. Returns the arm's final state.
+/// Walk one arm: each window boundary is a step projected as `phase'` = the
+/// window entered and `flashes' = flashes + blooms in that window`, validated
+/// against the model's `Step`. Returns the arm's final state.
 fn walk_arm(model: &aterm_spec::derive::Model, start: State, env: &NovaEnv) -> State {
     let d = env.feats.duration_ms;
     let windows = real_windows(env);

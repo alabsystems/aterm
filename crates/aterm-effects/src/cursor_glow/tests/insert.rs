@@ -5,23 +5,12 @@
 
 use super::*;
 
-// -- THE DELIVERED INSERT ("the image insert breaks the
-// rainbow") ---------------------------------------------------------------
+// -- The delivered insert -------------------------------------------------
 //
-// Measured on the shipped v0.81.0 binary in a private headless instance
-// (`ctl trail`): on a plain zsh prompt six keys were licensed one cell
-// each, the paste of `foo bar ` was judged as ONE move `origin=3,50
-// target=3,58` and DECLINED `no-fresh-hint`, and `x`/`y` were licensed
-// again from 58 — two ribbons severed by an 8-cell hole. Under a hidden
-// DEC caret (Claude Code's Ink prompt, and real Claude Code 2.1.268) the
-// 63-cell drop and its ~300 ms swap to `[Image #1] ` were never judged at
-// all (no ring row), and ` and` was licensed from the new caret: the
-// placeholder dark, the walk restarted. The paste reached the seam as
-// program output because the host stamped its gesture at the input
-// boundary and revoked it in the same turn (enqueue is not delivery) and
-// nothing re-stamped it when the bytes landed. The fix: the host's
-// completed write arms `note_insert_delivered`, the DELIVERED-INSERT
-// licence, and the seam lays its echo as ONE sweep joining the cohort.
+// A paste or drop reaches the seam as program output unless the host
+// re-stamps it when the bytes land (enqueue is not delivery). The host's
+// completed write arms `note_insert_delivered`, the delivered-insert
+// licence, and the seam lays its echo as one sweep joining the cohort.
 
 /// The seam's two cells of a row `a` and `b` walk the same step — the
 /// hue-continuity oracle: a cell that joined the cohort takes the stop
@@ -35,17 +24,13 @@ fn walk_step(glow: &CursorGlow, row: u16, a: u16, b: u16) -> f32 {
     at(b) - at(a)
 }
 
-/// THE DELIVERED INSERT, visible caret: three keys lay `2..5`; 400 ms of
+/// The delivered insert, visible caret: three keys lay `2..5`; 400 ms of
 /// quiet (every stamp stale); the host reports an 11-cell insert
-/// DELIVERED; the shell echoes it 20 ms later as one hop `5 → 16`. The
+/// delivered; the shell echoes it 20 ms later as one hop `5 → 16`. The
 /// hop is licensed under the insert class, the eleven cells are laid as
-/// ONE sweep joining the cohort (the walk steps by the same amount across
-/// `4 → 5` as it did across `3 → 4`), no momentum pulse and no cue are
-/// minted for it, and two keys typed after it continue the same walk.
-///
-/// RED-PROOF (the note stubbed to a tally): fails at
-/// `spawns == 4` with 3 — the ring's last row is `declined
-/// reason=no-fresh-hint origin=3,5 target=3,16`, the shipped verdict.
+/// one sweep joining the cohort (the walk steps by the same amount across
+/// `4 → 5` as across `3 → 4`), no momentum pulse and no cue are minted
+/// for it, and two keys typed after it continue the same walk.
 #[test]
 fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
     let g = geom();
@@ -129,16 +114,11 @@ fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
     );
 }
 
-/// THE DELIVERED INSERT, hidden caret (Claude Code's shape): the
-/// established input row's print anchor advances 60 cells with the
-/// delivered stamp behind it — wider than `RAINBOW_TYPED_SWEEP_MAX`, so
-/// this also pins that the bound is the insert's OWN width, not the typed
-/// coalesce cap. Licensed, laid `4..64`, the row is not branded, and the
-/// three typed echoes after it still anchor.
-///
-/// RED-PROOF (the note stubbed): fails at `spawns == 3` with
-/// 2 — the lane returns at its typed-bank gate and writes no ring row,
-/// the measured Claude Code shape.
+/// The delivered insert, hidden caret (Claude Code's shape): the input
+/// row's print anchor advances 60 cells with the delivered stamp behind
+/// it, wider than `RAINBOW_TYPED_SWEEP_MAX`, so the bound is the insert's
+/// own width, not the typed coalesce cap. Licensed, laid `4..64`, the row
+/// is not branded, and the three typed echoes after it still anchor.
 #[test]
 fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     let g = geom();
@@ -197,23 +177,17 @@ fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     );
 }
 
-/// THE PLACEHOLDER REWRITE: after the hidden-caret insert above, the TUI
-/// swaps the path for `[Image #1] ` 300 ms later and the row's end pulls
-/// back 64 -> 15 with no key. The seam reads the keyless retreat inside
-/// the fresh insert span as the insert's own rewrite: the ring records it
-/// `licensed licence=rewrite`, the cells at and right of the new caret
-/// retract farthest-first and are gone by `12·n + 240` ms plus the fade
-/// while the cells left of it keep their light under a live hand, and
-/// keys typed after it continue the same cohort from the new caret. The
-/// visible-caret twin runs the same shape through `spawn`. Two controls:
-/// a Backspace inside the span keeps its own class (it is the erase's
-/// retract, not a rewrite), and a keyless retreat with NO insert span
-/// behind it declines and retires nothing.
-///
-/// RED-PROOF (the note stubbed): fails at the first
-/// `spawns == 3` (the insert itself is refused); with the insert lit but
-/// no rewrite arm, at the `licence=rewrite` assert — the retreat is
-/// re-seeded silently and cells `15..64` stay lit under the blanks.
+/// The placeholder rewrite: after the hidden-caret insert, the TUI swaps
+/// the path for `[Image #1] ` 300 ms later and the row's end pulls back
+/// 64 -> 15 with no key. The seam reads the keyless retreat inside the
+/// fresh insert span as the insert's own rewrite (`licensed
+/// licence=rewrite`): the cells at and right of the new caret retract
+/// farthest-first and are gone by `12·n + 240` ms plus the fade, the cells
+/// left of it keep their light under a live hand, and keys typed after it
+/// continue the same cohort. The visible-caret twin runs the same shape
+/// through `spawn`. Controls: a Backspace inside the span keeps its own
+/// class, and a keyless retreat with no insert span behind it declines and
+/// retires nothing.
 #[test]
 fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     let g = geom();
@@ -222,7 +196,7 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
-    // HIDDEN CARET (the anchored lane).
+    // Hidden caret (the anchored lane).
     glow.tick(None, t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((11, 2, 1)));
     glow.tick(None, at(16), &c, g, &mut out);
@@ -284,7 +258,7 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
         "the hue continues across the rewrite into the keys after it"
     );
 
-    // VISIBLE-CARET TWIN through `spawn`.
+    // Visible-caret twin through `spawn`.
     let mut vis = CursorGlow::default();
     let mut vout = Vec::new();
     three_visible_echoes(&mut vis, t0, &mut vout);
@@ -363,20 +337,14 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     );
 }
 
-/// THE REWRITE RE-WITNESSES ITS ROW. The content witness retires a
-/// resident cell whose recorded glyph changed,
-/// and Claude Code's `[Image #1] ` IS different text over the insert's
-/// first eleven cells: on the tree that merged the witness with the
-/// rewrite, those cells melted 120 ms after the rewrite while the suffix
-/// took its designed farthest-first drain, and the next key laid beside
-/// a retired cell — a new cohort, the rainbow severed by a hole exactly
-/// the placeholder's width (the 0.84.0 shape, one width smaller). The
-/// engine's rewrite arm knows the rewrite is the insert's own (the host
-/// judged it `licence=rewrite`), so it forgets the row's records left of
-/// the new caret: the next walk arms the placeholder's glyphs instead of
-/// retiring the cells under them; the suffix's records fall out of the
-/// walk on their own (its cells are leaving). A later re-lay of the row
-/// with OTHER text still retires the placeholder's cells.
+/// The rewrite re-witnesses its row. The content witness retires a
+/// resident cell whose recorded glyph changed, and `[Image #1] ` is
+/// different text over the insert's first eleven cells. The engine's
+/// rewrite arm knows the rewrite is the insert's own, so it forgets the
+/// row's records left of the new caret: the next walk arms the
+/// placeholder's glyphs instead of retiring the cells under them, and the
+/// suffix's records fall out of the walk as its cells leave. A later
+/// re-lay of the row with other text still retires the placeholder's cells.
 #[test]
 fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
     let g = geom();
@@ -447,16 +415,9 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
         (walk_step(&vis, 3, 15, 16) - step).abs() < 1e-4,
         "the hue continues across the placeholder into the key after it"
     );
-    // A re-lay of the row with OTHER text under ONE cell of the
-    // placeholder is NOT a retirement (2026-09-16, `Witness::shape_verdicts`
-    // — the owner: *"you need to be fixing in general"*). Until then the
-    // changed glyph's cell retired on its own record, a one-cell hole in a
-    // band whose letters stood lit either side; the run's two never-armed
-    // blanks (the placeholder's spaces at 11 and 15) were already kept
-    // (2026-09-15: *"odd logic of drawing a part of the trail when moving
-    // the cursor and editing text"*, measured on glass as
-    // `..######.#####.###.#.-###.####....`). A change strictly inside a
-    // standing run is not evidence: the light stays whole and the record
+    // A re-lay with other text under one cell of the placeholder is not a
+    // retirement (`Witness::shape_verdicts`): a change strictly inside a
+    // standing run is not evidence, so the light stays whole and the record
     // takes the glyph standing there now.
     let mut other = typed.clone();
     other[12] = '2';
@@ -473,8 +434,8 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
         "the band is whole across the changed glyph and the run's spaces: {lit:?}"
     );
     // The witness was re-armed, not disarmed: a re-lay that reaches the
-    // run's END — its last recorded cell, the key typed after the
-    // placeholder — is a suffix and still retires.
+    // run's end (its last recorded cell, the key typed after the
+    // placeholder) is a suffix and still retires.
     let mut tail = other.clone();
     tail[16] = 'Z';
     vis.observe_ribbon_row(3, &tail);
@@ -491,11 +452,10 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
     );
 }
 
-/// THE CONTROL THE FIX MUST NOT REGRESS: the same two hops with NO
-/// delivery stamp behind them — a program flood exactly the insert's
-/// width — decline exactly as shipped. Visible: `no-fresh-hint`;
-/// hidden: no ring row at all, `spawns` frozen. To the PTY stream a
-/// flood and a paste are the same bytes; the delivery is the only
+/// Control: the same two hops with no delivery stamp behind them (a
+/// program flood exactly the insert's width) decline. Visible:
+/// `no-fresh-hint`; hidden: no ring row, `spawns` frozen. To the PTY
+/// stream a flood and a paste are the same bytes; the delivery is the only
 /// discriminator.
 #[test]
 fn a_program_flood_of_the_inserts_width_with_no_delivery_stamp_still_declines() {
@@ -554,10 +514,9 @@ fn a_program_flood_of_the_inserts_width_with_no_delivery_stamp_still_declines() 
     );
 }
 
-/// A delivery stamp is a LICENCE only while fresh and only once: stale
-/// after `INSERT_HINT_FRESH`, it declines exactly as a stale typed stamp
-/// does; spent by one echo, it cannot license a second hop inside the
-/// window.
+/// A delivery stamp licenses only while fresh and only once: stale after
+/// `INSERT_HINT_FRESH` it declines as a stale typed stamp does; spent by
+/// one echo, it cannot license a second hop inside the window.
 #[test]
 fn a_stale_or_spent_delivery_stamp_licenses_nothing() {
     let g = geom();
@@ -586,7 +545,7 @@ fn a_stale_or_spent_delivery_stamp_licenses_nothing() {
     assert_eq!(last.reason, CursorGlow::DECLINE_NO_FRESH_HINT);
 }
 
-/// A drop as the FIRST action on a never-typed input row (a fresh hidden
+/// A drop as the first action on a never-typed input row (a fresh hidden
 /// engine, no established echo row): the insert echo is licensed and the
 /// row is not branded, so the keys typed after it anchor with zero
 /// program-row refusals.
@@ -619,16 +578,14 @@ fn a_delivered_insert_brands_no_row() {
     assert_eq!(glow.spawns(), 4);
 }
 
-/// The insert licence is INERT for a program row: with the input row
+/// The insert licence is inert for a program row: with the input row
 /// established, a spinner row's first advance inside the delivery window
 /// is refused, spends nothing, and the licence survives for the input
 /// row's own echo.
 ///
-/// TIMED SO THAT ROW IDENTITY IS THE ONLY REFUSAL (the
-/// verifier's vacuity): the spinner is judged 365 ms after the input
-/// row's echo — past the spoken-for hold (`TYPE_HINT_FRESH`, 0.25 s) —
-/// so a mutant `insert_row_identity` that answers `true` lays the
-/// spinner as the insert and fails here at `spawns == 1` with 2.
+/// Timed so row identity is the only refusal: the spinner is judged 365 ms
+/// after the input row's echo, past `TYPE_HINT_FRESH` (0.25 s), so an
+/// `insert_row_identity` that answers `true` fails at `spawns == 1`.
 #[test]
 fn a_delivered_insert_is_inert_for_a_program_row() {
     let g = geom();
@@ -669,12 +626,11 @@ fn a_delivered_insert_is_inert_for_a_program_row() {
     );
 }
 
-/// The delivery stamp follows the TYPED BANK's retirement law, not the
-/// one-shots': a completed hidden→visible boundary (Claude Code's
-/// DECTCEM bracket, mid-burst) spares it while fresh; a class-changing
-/// press (`clear_typed`) leaves it armed — its witness is the delivery,
-/// not a key; and `revoke_input_hints_at` revokes it by its exact instant
-/// (a Tab queued behind a draining paste) and no other.
+/// The delivery stamp follows the typed bank's retirement law, not the
+/// one-shots': a completed hidden→visible boundary (a DECTCEM bracket
+/// mid-burst) spares it while fresh; a class-changing press
+/// (`clear_typed`) leaves it armed; and `revoke_input_hints_at` revokes it
+/// by its exact instant (a Tab queued behind a draining paste) and no other.
 #[test]
 fn a_delivered_insert_survives_a_hidden_boundary_while_fresh_and_is_revoked_at_its_own_instant() {
     let g = geom();
@@ -764,8 +720,8 @@ fn an_insert_and_a_key_in_one_frame_pay_the_surplus_from_the_press() {
     );
 }
 
-/// An insert builds no momentum (the FAMILY metric is the hand's), pulses
-/// nothing to the cat, and cues nothing — extends
+/// An insert builds no momentum (the family metric is the hand's), pulses
+/// nothing to the cat, and cues nothing; extends
 /// `program_output_alone_builds_no_momentum` to the delivered class.
 #[test]
 fn a_delivered_insert_builds_no_momentum_and_cues_nothing() {
@@ -789,9 +745,8 @@ fn a_delivered_insert_builds_no_momentum_and_cues_nothing() {
     );
 }
 
-/// A delivered insert mints NOTHING in every other style: the licence is
-/// read only at the Rainbow Kitty seam, so the other nine are
-/// byte-identical by construction — extends
+/// A delivered insert mints nothing in every other style: the licence is
+/// read only at the Rainbow Kitty seam; extends
 /// `an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style`.
 #[test]
 fn a_delivered_insert_mints_nothing_in_every_other_style() {

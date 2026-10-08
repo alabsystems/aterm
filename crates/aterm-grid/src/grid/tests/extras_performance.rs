@@ -2,19 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! CellExtras performance/complexity verification tests.
-//!
-//! Migrated from aterm-core as part of #6556 Batch 2.
-//! The `take_response_preserves_capacity` test remains in aterm-core
-//! because it depends on `crate::terminal::Terminal`.
+//! CellExtras performance/complexity tests.
 
 use super::*;
 
-// =============================================================================
 // Performance Tests (complexity verification)
-// =============================================================================
 
-/// Verify `shift_rows_up_by` with start_row=0 is O(1) via offset (#4542).
+/// Verify `shift_rows_up_by` with start_row=0 is O(1) via offset.
 #[test]
 fn extras_shift_full_screen_is_o1_partial_is_o_e() {
     let mut extras = CellExtras::new();
@@ -44,7 +38,7 @@ fn extras_shift_full_screen_is_o1_partial_is_o_e() {
     );
 }
 
-/// Verify `shift_rows_up_by(0, n)` is O(1) regardless of E (#4542).
+/// Verify `shift_rows_up_by(0, n)` is O(1) regardless of E.
 #[test]
 fn shift_rows_up_by_o1_regardless_of_entry_count() {
     fn measure_shift_ops(entries: usize) -> usize {
@@ -68,7 +62,7 @@ fn shift_rows_up_by_o1_regardless_of_entry_count() {
     assert_eq!(large, 0, "full-screen shift should be O(1): got {large}");
 }
 
-/// Verify scroll_up extras shift is O(1) via row-offset amortization (#4542).
+/// Verify scroll_up extras shift is O(1) via row-offset amortization.
 #[test]
 fn scroll_up_extras_shift_is_o1() {
     let rows = 100u16;
@@ -105,7 +99,7 @@ fn scroll_up_extras_shift_is_o1() {
     );
 }
 
-/// Verify `scroll_up` extras cost is O(1) regardless of E (#4542).
+/// Verify `scroll_up` extras cost is O(1) regardless of E.
 #[test]
 fn scroll_up_extras_cost_o1_regardless_of_e() {
     fn measure_scroll_shift_ops(extras_count: usize) -> usize {
@@ -286,161 +280,94 @@ fn row_has_hyperlinks_after_mutations() {
     assert!(extras.row_has_hyperlinks(0));
 }
 
-// =============================================================================
 // Region shift complexity tests
-// =============================================================================
+
+/// `entries` combining-mark extras at (`i % rows`, `i / rows + col0`), then the
+/// shift ops `shift` performs on them.
+fn measure_shift(
+    entries: usize,
+    rows: usize,
+    col0: u16,
+    shift: impl FnOnce(&mut CellExtras),
+) -> usize {
+    let mut extras = CellExtras::new();
+    for i in 0..entries {
+        let row = (i % rows) as u16;
+        let col = (i / rows) as u16 + col0;
+        extras
+            .get_or_create(CellCoord::new(row, col))
+            .add_combining('\u{0301}');
+    }
+    take_extras_shift_ops(); // clear
+    shift(&mut extras);
+    take_extras_shift_ops()
+}
+
+/// O(E): `measure(entries, n)` must not grow from `small_n` to `large_n` (the
+/// region size or shift count; `grown` names that growth) and must ~double with
+/// twice the entries.
+fn assert_shift_ops_o_e(
+    grown: &str,
+    small_n: u16,
+    large_n: u16,
+    measure: impl Fn(usize, u16) -> usize,
+) {
+    let small = measure(500, small_n);
+    let large = measure(500, large_n);
+
+    assert!(small > 0, "should register shift ops");
+    let ratio = large as f64 / small as f64;
+    assert!(
+        ratio > 0.5 && ratio < 2.0,
+        "{grown} should NOT change ops: small={small}, large={large}, ratio={ratio:.2}"
+    );
+
+    let double_entries = measure(1000, small_n);
+    let entry_ratio = double_entries as f64 / small as f64;
+    assert!(
+        entry_ratio > 1.5 && entry_ratio < 3.0,
+        "2x entries should ~double ops: base={small}, double={double_entries}, \
+         ratio={entry_ratio:.2}"
+    );
+}
 
 /// Verify shift_region_up_by is O(E), independent of region size.
 #[test]
 fn shift_region_up_by_is_o_e_not_o_region() {
-    fn measure_region_shift(entries: usize, region_size: u16) -> usize {
-        let mut extras = CellExtras::new();
-        for i in 0..entries {
-            let row = (i % 200) as u16;
-            let col = (i / 200) as u16;
-            extras
-                .get_or_create(CellCoord::new(row, col))
-                .add_combining('\u{0301}');
-        }
-        take_extras_shift_ops(); // clear
-        extras.shift_region_up_by(0, region_size.saturating_sub(1), 1);
-        take_extras_shift_ops()
-    }
-
-    let small_region = measure_region_shift(500, 10);
-    let large_region = measure_region_shift(500, 100);
-
-    assert!(small_region > 0, "should register shift ops");
-    let ratio = large_region as f64 / small_region as f64;
-    assert!(
-        ratio > 0.5 && ratio < 2.0,
-        "10x larger region should NOT change ops (O(E)): small={small_region}, \
-         large={large_region}, ratio={ratio:.2}"
-    );
-
-    let double_entries = measure_region_shift(1000, 10);
-    let entry_ratio = double_entries as f64 / small_region as f64;
-    assert!(
-        entry_ratio > 1.5 && entry_ratio < 3.0,
-        "2x entries should ~double ops: base={small_region}, double={double_entries}, \
-         ratio={entry_ratio:.2}"
-    );
+    assert_shift_ops_o_e("10x larger region (O(E))", 10, 100, |entries, region| {
+        measure_shift(entries, 200, 0, |e| {
+            e.shift_region_up_by(0, region.saturating_sub(1), 1)
+        })
+    });
 }
 
 /// Verify shift_region_down_by is O(E), independent of region size.
 #[test]
 fn shift_region_down_by_is_o_e_not_o_region() {
-    fn measure_region_shift(entries: usize, region_size: u16) -> usize {
-        let mut extras = CellExtras::new();
-        for i in 0..entries {
-            let row = (i % 200) as u16;
-            let col = (i / 200) as u16;
-            extras
-                .get_or_create(CellCoord::new(row, col))
-                .add_combining('\u{0301}');
-        }
-        take_extras_shift_ops(); // clear
-        extras.shift_region_down_by(0, region_size.saturating_sub(1), 1);
-        take_extras_shift_ops()
-    }
-
-    let small_region = measure_region_shift(500, 10);
-    let large_region = measure_region_shift(500, 100);
-
-    assert!(small_region > 0, "should register shift ops");
-    let ratio = large_region as f64 / small_region as f64;
-    assert!(
-        ratio > 0.5 && ratio < 2.0,
-        "10x larger region should NOT change ops (O(E)): small={small_region}, \
-         large={large_region}, ratio={ratio:.2}"
-    );
-
-    let double_entries = measure_region_shift(1000, 10);
-    let entry_ratio = double_entries as f64 / small_region as f64;
-    assert!(
-        entry_ratio > 1.5 && entry_ratio < 3.0,
-        "2x entries should ~double ops: base={small_region}, double={double_entries}, \
-         ratio={entry_ratio:.2}"
-    );
+    assert_shift_ops_o_e("10x larger region (O(E))", 10, 100, |entries, region| {
+        measure_shift(entries, 200, 0, |e| {
+            e.shift_region_down_by(0, region.saturating_sub(1), 1)
+        })
+    });
 }
 
 /// Verify shift_cols_right is O(E), independent of shift count.
 #[test]
 fn shift_cols_right_is_o_e_not_o_count() {
-    fn measure_col_shift(entries: usize, shift_count: u16) -> usize {
-        let mut extras = CellExtras::new();
-        for i in 0..entries {
-            let row = (i % 50) as u16;
-            let col = (i / 50) as u16 + 10;
-            extras
-                .get_or_create(CellCoord::new(row, col))
-                .add_combining('\u{0301}');
-        }
-        take_extras_shift_ops(); // clear
-        extras.shift_cols_right(0, 5, shift_count, 200);
-        take_extras_shift_ops()
-    }
-
-    let small_shift = measure_col_shift(500, 1);
-    let large_shift = measure_col_shift(500, 50);
-
-    assert!(small_shift > 0, "should register shift ops");
-    let ratio = large_shift as f64 / small_shift as f64;
-    assert!(
-        ratio > 0.5 && ratio < 2.0,
-        "50x larger shift count should NOT change ops: small={small_shift}, \
-         large={large_shift}, ratio={ratio:.2}"
-    );
-
-    let double_entries = measure_col_shift(1000, 1);
-    let entry_ratio = double_entries as f64 / small_shift as f64;
-    assert!(
-        entry_ratio > 1.5 && entry_ratio < 3.0,
-        "2x entries should ~double ops: base={small_shift}, double={double_entries}, \
-         ratio={entry_ratio:.2}"
-    );
+    assert_shift_ops_o_e("50x larger shift count", 1, 50, |entries, count| {
+        measure_shift(entries, 50, 10, |e| e.shift_cols_right(0, 5, count, 200))
+    });
 }
 
 /// Verify shift_cols_left is O(E), independent of shift count.
 #[test]
 fn shift_cols_left_is_o_e_not_o_count() {
-    fn measure_col_shift(entries: usize, shift_count: u16) -> usize {
-        let mut extras = CellExtras::new();
-        for i in 0..entries {
-            let row = (i % 50) as u16;
-            let col = (i / 50) as u16 + 50;
-            extras
-                .get_or_create(CellCoord::new(row, col))
-                .add_combining('\u{0301}');
-        }
-        take_extras_shift_ops(); // clear
-        extras.shift_cols_left(0, 10, shift_count, 200);
-        take_extras_shift_ops()
-    }
-
-    let small_shift = measure_col_shift(500, 1);
-    let large_shift = measure_col_shift(500, 30);
-
-    assert!(small_shift > 0, "should register shift ops");
-    let ratio = large_shift as f64 / small_shift as f64;
-    assert!(
-        ratio > 0.5 && ratio < 2.0,
-        "30x larger shift count should NOT change ops: small={small_shift}, \
-         large={large_shift}, ratio={ratio:.2}"
-    );
-
-    let double_entries = measure_col_shift(1000, 1);
-    let entry_ratio = double_entries as f64 / small_shift as f64;
-    assert!(
-        entry_ratio > 1.5 && entry_ratio < 3.0,
-        "2x entries should ~double ops: base={small_shift}, double={double_entries}, \
-         ratio={entry_ratio:.2}"
-    );
+    assert_shift_ops_o_e("30x larger shift count", 1, 30, |entries, count| {
+        measure_shift(entries, 50, 50, |e| e.shift_cols_left(0, 10, count, 200))
+    });
 }
 
-// =============================================================================
 // Rapid scroll allocation stress test
-// =============================================================================
 
 /// Verify that rapid sequential scrolls do not cause unbounded extras overhead.
 #[test]
@@ -478,28 +405,26 @@ fn rapid_scroll_extras_cost_bounded() {
     );
 }
 
-// =============================================================================
 // Reflow complexity verification
-// =============================================================================
 
-/// Verify reflow grow-columns processes O(rows) row operations.
-#[test]
-fn reflow_grow_row_ops_linear_in_rows() {
-    fn measure_reflow_rows(num_rows: u16, old_cols: u16, new_cols: u16) -> usize {
+/// Reflow row ops for a `num_rows`-row grid of full `ch` rows resized
+/// `old_cols` -> `new_cols`: 2x rows must ~2x the ops.
+fn assert_reflow_row_ops_linear(old_cols: u16, new_cols: u16, ch: char) {
+    let measure_reflow_rows = |num_rows: u16| {
         let mut grid = Grid::with_scrollback(num_rows, old_cols, 0);
         for row in 0..num_rows {
             grid.set_cursor(row, 0);
             for _ in 0..old_cols {
-                grid.write_char('A');
+                grid.write_char(ch);
             }
         }
         take_reflow_row_ops(); // clear
         grid.resize(num_rows, new_cols);
         take_reflow_row_ops()
-    }
+    };
 
-    let small = measure_reflow_rows(25, 40, 80);
-    let large = measure_reflow_rows(50, 40, 80);
+    let small = measure_reflow_rows(25);
+    let large = measure_reflow_rows(50);
 
     assert!(small > 0, "should register reflow row ops");
     let ratio = large as f64 / small as f64;
@@ -509,29 +434,14 @@ fn reflow_grow_row_ops_linear_in_rows() {
     );
 }
 
+/// Verify reflow grow-columns processes O(rows) row operations.
+#[test]
+fn reflow_grow_row_ops_linear_in_rows() {
+    assert_reflow_row_ops_linear(40, 80, 'A');
+}
+
 /// Verify reflow shrink-columns processes O(rows) row operations.
 #[test]
 fn reflow_shrink_row_ops_linear_in_rows() {
-    fn measure_reflow_rows(num_rows: u16, old_cols: u16, new_cols: u16) -> usize {
-        let mut grid = Grid::with_scrollback(num_rows, old_cols, 0);
-        for row in 0..num_rows {
-            grid.set_cursor(row, 0);
-            for _ in 0..old_cols {
-                grid.write_char('B');
-            }
-        }
-        take_reflow_row_ops(); // clear
-        grid.resize(num_rows, new_cols);
-        take_reflow_row_ops()
-    }
-
-    let small = measure_reflow_rows(25, 80, 40);
-    let large = measure_reflow_rows(50, 80, 40);
-
-    assert!(small > 0, "should register reflow row ops");
-    let ratio = large as f64 / small as f64;
-    assert!(
-        ratio > 1.5 && ratio < 3.0,
-        "2x rows should ~2x reflow ops: small={small}, large={large}, ratio={ratio:.2}"
-    );
+    assert_reflow_row_ops_linear(80, 40, 'B');
 }

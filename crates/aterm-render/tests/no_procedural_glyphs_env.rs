@@ -18,10 +18,8 @@ fn env_var_restores_font_glyphs_for_box_drawing() {
     // the workspace's one lock-scoped env helper.
     aterm_log::env::set("ATERM_NO_PROCEDURAL_GLYPHS", "1");
 
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system mono font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     for ch in ['─', '│', '┼', '█', '\u{28FF}'] {
         let key = r.glyph_key(ch);
         assert_ne!(

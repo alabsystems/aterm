@@ -16,15 +16,15 @@
 //! the other by copying it, which would re-decode (and re-charge memory for) one
 //! picture once per row of history it covers.
 //!
-//! The engine does NOT decode pixels — it carries no image codec. It stores the
-//! bytes as delivered plus the [`ImageFormat`] hint, and the renderer decodes
-//! once per distinct payload.
+//! The engine stores the bytes as delivered plus the [`ImageFormat`] hint, and
+//! the renderer decodes once per distinct payload. (The engine decodes a PNG
+//! only to compose Kitty animation frames, which yields raw pixels.)
 
 /// Source encoding of an inline image's raw payload.
 ///
-/// The engine does NOT decode pixels (it carries no image-codec dependency);
-/// it stores the raw bytes plus this hint, and the renderer decodes once. Only
-/// PNG is decoded today; an unknown format degrades to drawing nothing.
+/// The engine stores the raw bytes plus this hint, and the renderer decodes
+/// once. Only PNG is decoded today; an unknown format degrades to drawing
+/// nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
     /// PNG (`\x89PNG\r\n…`). The one container format the renderer decodes.
@@ -34,7 +34,8 @@ pub enum ImageFormat {
     /// raster in the engine (the `aterm-sixel` crate) since sixel has no
     /// container the renderer's PNG decoder could read. `ImageData.bytes` then
     /// holds exactly `4 * width * height` bytes; the renderer resamples them to
-    /// the footprint directly (no codec). This keeps the engine codec-free.
+    /// the footprint directly (no codec). A composed Kitty animation frame is
+    /// raw pixels too.
     RawRgba8 {
         /// Source raster width in pixels.
         width: u16,
@@ -79,6 +80,11 @@ pub struct ImageData {
     /// the first read their source `lift` px lower. With `0` both clauses are
     /// arithmetic no-ops, byte-identical to the pre-lift renderers.
     pub band_lift_px: u16,
+    /// Where the raster starts inside its first cell, in device px `(x, y)`
+    /// (Kitty `X=`/`Y=`, each less than a cell): the renderer lays the raster
+    /// out in the part of the footprint from that point on, and leaves the
+    /// strip before it transparent. `(0, 0)` for every other image.
+    pub cell_offset_px: (u16, u16),
     /// How the source raster maps onto the footprint: [`ImageScaling::Fit`]
     /// (the default), [`ImageScaling::Stretch`] or [`ImageScaling::PixelExact`].
     /// Which one is right depends on what the PROGRAM named — see the variants.
@@ -88,6 +94,35 @@ pub struct ImageData {
     /// protocol but Kitty always passes. The renderer crops FIRST, then applies
     /// [`scaling`](Self::scaling) to what is left.
     pub source_rect: Option<SourceRect>,
+}
+
+/// The identity of one Kitty graphics placement, stamped into every cell it
+/// covers and carried into history with the row, where it keeps ordering the
+/// cell's image layers. Kitty deletion addresses the screen, so a placement
+/// whose rows are in history is no delete target until they return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KittyPlacementTag {
+    /// The image id (`i=`, or the id the terminal assigned an `I=` number).
+    pub image_id: u32,
+    /// The client's placement id (`p=`); `0` when the client named none.
+    pub placement_id: u32,
+    /// When the image was first transmitted, as a per-terminal serial: kitty
+    /// draws images of one z-index in that order (its internal image id),
+    /// which a later transmit under the same id keeps.
+    pub image_serial: core::num::NonZeroU32,
+    /// A per-terminal serial, unique to this one placement act, so two
+    /// unnamed placements of the same image stay distinct targets.
+    pub serial: core::num::NonZeroU32,
+}
+
+/// Where an image layer stacks among the images sharing a cell, lowest
+/// first, as kitty draws them: by z-index, then by when the image was first
+/// transmitted, then by placement order. An image that is not a Kitty
+/// placement (`kitty` is `None`) sorts first among its z-index.
+#[must_use]
+pub fn layer_order(z_index: i32, kitty: Option<KittyPlacementTag>) -> (i32, u32, u32) {
+    let (image, serial) = kitty.map_or((0, 0), |tag| (tag.image_serial.get(), tag.serial.get()));
+    (z_index, image, serial)
 }
 
 /// How a placement's source raster maps onto its cell footprint.

@@ -9,6 +9,7 @@ use aterm_alloc::ArrayVec;
 use aterm_provenance::pty_wrap_ref;
 
 use super::table::{ActionType, TRANSITIONS};
+use super::utf8::Utf8Prefix;
 use super::{ActionSink, MAX_OSC_DATA, MAX_OSC_PARAMS, Parser, State};
 
 // `BatchActionSink` is only referenced by the test-only batch path
@@ -20,6 +21,23 @@ use super::BatchActionSink;
 use super::count_parser_loop_iteration;
 
 use super::MAX_INTERMEDIATES;
+
+/// Whether the per-byte `OscPut` pushes a data byte onto an `osc_data` of
+/// `len` bytes: the guard itself, which the `OscPut` arm calls and
+/// `proofs::osc_bulk_copy_matches_per_byte_puts` reasons from.
+#[inline]
+pub(crate) fn osc_put_keeps(len: usize) -> bool {
+    len < MAX_OSC_DATA
+}
+
+/// How many of `n` OSC data bytes the bulk path appends to an `osc_data` of
+/// `len` bytes: the prefix [`osc_put_keeps`] would keep one byte at a time.
+/// `proofs::osc_bulk_copy_matches_per_byte_puts` proves the two agree and the
+/// cap holds.
+#[inline]
+pub(crate) fn osc_bulk_copy_len(len: usize, n: usize) -> usize {
+    n.min(MAX_OSC_DATA.saturating_sub(len))
+}
 
 /// Shared byte-processing logic for both `ActionSink` and `BatchActionSink` paths.
 ///
@@ -35,14 +53,21 @@ macro_rules! process_byte_impl {
         //
         // Excluded states:
         //  - Ground: handled upstream (process_byte / process_ground_special_byte)
-        //  - DcsPassthrough / OscString / SosPmApcString: their custom table
-        //    overrides already map 0x80-0x9F to data actions (DcsPut / OscPut),
-        //    so C1 bytes are harmless payload in those states.
+        //  - the four control-string states (DcsPassthrough, DcsIgnore,
+        //    OscString, SosPmApcString): their custom table overrides already
+        //    map 0x80-0x9F to data actions (DcsPut / OscPut / ApcPut / Ignore),
+        //    so C1 bytes are harmless payload there, and the 8-bit ST that the
+        //    DCS and APC tables keep ends those strings in either C1 mode —
+        //    except, with C1 off, a 0x9C inside a UTF-8 character (below).
         if !$self.c1_controls_enabled
             && (0x80..=0x9F).contains(&$byte)
             && !matches!(
                 $self.state,
-                State::Ground | State::DcsPassthrough | State::OscString | State::SosPmApcString
+                State::Ground
+                    | State::DcsPassthrough
+                    | State::DcsIgnore
+                    | State::OscString
+                    | State::SosPmApcString
             )
         {
             // Silently drop — consistent with Ground state behavior.
@@ -56,29 +81,64 @@ macro_rules! process_byte_impl {
             $self.dispatch_osc($sink, false);
             $self.state = State::Ground;
         } else {
-            let transition = TRANSITIONS[$self.state as usize][$byte as usize];
             let prev_state = $self.state;
+            // With C1 controls off, a 0x9C that continues the UTF-8 character
+            // a DCS or APC payload ends in (`string_utf8`) is that character's
+            // byte, not the 8-bit ST its own entry makes it: U+672C 本 is
+            // `E6 9C AC`, and one continuation byte in 64 is 0x9C. It reads as
+            // every other continuation byte does (0x80's entry: the string's
+            // data action, staying in the string). `string_utf8` holds a prefix
+            // only in those three states. With C1 controls on, a raw 0x9C is
+            // the 8-bit ST wherever it falls.
+            let read_as = if $byte == 0x9C
+                && !$self.c1_controls_enabled
+                && $self.string_utf8.continues($byte)
+            {
+                0x80
+            } else {
+                $byte
+            };
+            let transition = TRANSITIONS[prev_state as usize][read_as as usize];
+            // The payload's UTF-8 head is kept over every byte a DCS or APC
+            // string reads in itself, and dropped when the string ends.
+            if matches!(
+                prev_state,
+                State::DcsPassthrough | State::DcsIgnore | State::SosPmApcString
+            ) {
+                $self.string_utf8 = if transition.next_state == prev_state {
+                    $self.string_utf8.step($byte)
+                } else {
+                    Utf8Prefix::NONE
+                };
+            }
 
-            // Handle DCS unhook when leaving DcsPassthrough. CAN (0x18) and SUB
-            // (0x1A) CANCEL the control string (VT500 "anywhere" transition to
-            // Ground via Execute), so the sink must be told to DISCARD rather
-            // than finalize — otherwise a half-decoded Sixel would be rendered.
-            // ESC (a real `ESC \` ST, or an ESC that breaks out) and 0x9C ST are
-            // legitimate terminators (canceled = false).
+            // CAN (0x18) and SUB (0x1A) CANCEL a control string (the VT500
+            // "anywhere" transition to Ground via Execute; xterm's string
+            // table sends both to the ground state without dispatching), so
+            // a DCS, OSC or APC string they end is DISCARDED, never
+            // delivered: a half-decoded sixel is not rendered, a truncated
+            // OSC 52 clipboard write, OSC 8 link or title is not dispatched,
+            // a truncated kitty command is not run. ESC (a real `ESC \` ST,
+            // or an ESC that breaks out), BEL (OSC) and 0x9C ST are
+            // legitimate terminators.
+            let canceled = $byte == 0x18 || $byte == 0x1A;
+
+            // Handle DCS unhook when leaving DcsPassthrough.
             if prev_state == State::DcsPassthrough && transition.next_state != State::DcsPassthrough
             {
                 if $self.dcs_active {
-                    let canceled = $byte == 0x18 || $byte == 0x1A;
                     $sink.dcs_unhook(canceled);
                     $self.dcs_active = false;
                 }
             }
 
-            // Handle OSC end when leaving OscString
+            // Handle OSC end when leaving OscString: a canceled string ends
+            // as one to discard (`osc_discard`, which `dispatch_osc` clears).
             if prev_state == State::OscString
                 && transition.next_state != State::OscString
                 && transition.action != ActionType::OscEnd
             {
+                $self.osc_discard |= canceled;
                 $self.dispatch_osc($sink, false);
             }
 
@@ -88,7 +148,7 @@ macro_rules! process_byte_impl {
                 && transition.action != ActionType::ApcEnd
             {
                 if $self.apc_active {
-                    $sink.apc_end();
+                    $sink.apc_end(canceled);
                     $self.apc_active = false;
                 }
             }
@@ -116,9 +176,7 @@ macro_rules! process_byte_impl {
                     $sink.esc_dispatch(pty_wrap_ref($self.intermediates.as_slice()), $byte);
                 }
                 ActionType::CsiDispatch => {
-                    if $self.param_started {
-                        $self.finalize_param();
-                    }
+                    $self.close_params($self.last_was_colon);
                     if $self.subparam_mask != 0 {
                         $sink.csi_dispatch_with_subparams(
                             pty_wrap_ref($self.params.as_slice()),
@@ -135,9 +193,7 @@ macro_rules! process_byte_impl {
                     }
                 }
                 ActionType::DcsHook => {
-                    if $self.param_started {
-                        $self.finalize_param();
-                    }
+                    $self.close_params($self.last_was_colon);
                     $sink.dcs_hook(
                         pty_wrap_ref($self.params.as_slice()),
                         pty_wrap_ref($self.intermediates.as_slice()),
@@ -152,7 +208,7 @@ macro_rules! process_byte_impl {
                     $self.osc_data.clear();
                 }
                 ActionType::OscPut => {
-                    if $self.osc_data.len() < MAX_OSC_DATA {
+                    if osc_put_keeps($self.osc_data.len()) {
                         $self.osc_data.push($byte);
                     }
                 }
@@ -170,7 +226,7 @@ macro_rules! process_byte_impl {
                 }
                 ActionType::ApcEnd => {
                     if $self.apc_active {
-                        $sink.apc_end();
+                        $sink.apc_end(false);
                         $self.apc_active = false;
                     }
                 }
@@ -243,6 +299,7 @@ impl Parser {
             &self.utf8_buffer,
             &self.utf8_len,
             &self.utf8_expected,
+            &self.string_utf8,
             &self.subparam_mask,
             &self.last_was_colon
         )
@@ -303,7 +360,7 @@ impl Parser {
         S: ActionSink,
         ProcessByte: FnMut(&mut Self, u8, &mut S),
     {
-        if (0xC0..=0xF7).contains(&byte) {
+        if super::utf8::is_utf8_lead(byte) {
             self.start_utf8(byte);
             return;
         }
@@ -317,7 +374,10 @@ impl Parser {
             return;
         }
 
-        if (0xA0..=0xBF).contains(&byte) || byte >= 0xF8 {
+        // Every other high byte begins no well-formed sequence: a stray
+        // continuation (`A0..=BF`), `C0`/`C1` and `F5..=FF`. Each is a maximal
+        // subpart on its own.
+        if byte >= 0xA0 {
             sink.print(char::REPLACEMENT_CHARACTER);
             return;
         }
@@ -409,7 +469,7 @@ impl Parser {
                 // non-ASCII characters for amortized dispatch overhead.
                 // The decode logic is in a separate function to keep the
                 // hot ASCII dispatch loop compact for L1i cache.
-                if (0xC0..=0xF7).contains(&byte) {
+                if super::utf8::is_utf8_lead(byte) {
                     let consumed = self.decode_multibyte_run(byte, remaining, sink);
                     remaining = remaining.get(consumed..).unwrap_or(&[]);
                     continue;
@@ -474,17 +534,15 @@ impl Parser {
         // in the OscString state. Scan for the first C0 control byte
         // and bulk-append everything before it.
         //
-        // VERIFIED EQUIVALENT to the byte-by-byte slow path (do not "fix"):
-        // `n` is the position of the FIRST control byte, so every byte in
-        // [0..n) is a data byte that the slow path maps to OscPut. OscPut
-        // pushes only while `osc_data.len() < MAX_OSC_DATA`, so the slow
-        // path keeps exactly the first `MAX_OSC_DATA - len` of them and
-        // drops the rest. `copy_len = n.min(capacity_left)` copies that
-        // same prefix; bytes in [copy_len..n) are dropped identically.
-        // `remaining.get(n..)` then lands on the control byte,
-        // which both paths process the same way. The regression test
-        // `osc_over_capacity_truncation_parity` (tests/batch.rs) asserts
-        // this across the MAX_OSC_DATA boundary.
+        // EQUIVALENT to the byte-by-byte slow path (do not "fix"): `n` is
+        // the position of the FIRST control byte, so every byte in [0..n)
+        // is a data byte the slow path maps to OscPut, which pushes only
+        // while `osc_put_keeps(osc_data.len())`. `osc_bulk_copy_len` keeps
+        // that same prefix and drops the rest (proved against that guard for
+        // every `len` and `n`: `proofs::osc_bulk_copy_matches_per_byte_puts`), and
+        // `remaining.get(n..)` then lands on the control byte, which both
+        // paths process the same way. `osc_over_capacity_truncation_parity`
+        // (tests/batch.rs) drives both paths across the boundary.
         if self.state == State::OscString {
             let n = if self.c1_controls_enabled {
                 remaining
@@ -495,8 +553,7 @@ impl Parser {
                 super::simd::find_c0_control(remaining).unwrap_or(remaining.len())
             };
             if n > 0 {
-                let capacity_left = MAX_OSC_DATA.saturating_sub(self.osc_data.len());
-                let copy_len = n.min(capacity_left);
+                let copy_len = osc_bulk_copy_len(self.osc_data.len(), n);
                 self.osc_data
                     .extend_from_slice(remaining.get(..copy_len).unwrap_or(&[]));
                 remaining = remaining.get(n..).unwrap_or(&[]);
@@ -515,10 +572,16 @@ impl Parser {
         // bulk-copy up to the boundary, then fall through to process_byte for
         // the boundary byte: a 0x7F is Ignored (no dcs_put, stays in
         // DcsPassthrough) and the loop re-enters this branch for the remainder.
+        //
+        // The run's last bytes bring the payload's UTF-8 head up to date
+        // (`Utf8Prefix::after`), so the byte path reads a 0x9C at the boundary
+        // as ST or as a character's byte exactly as it would have byte by byte.
         if self.state == State::DcsPassthrough && self.dcs_active {
             let n = Self::find_dcs_passthrough_boundary(remaining);
             if n > 0 {
-                sink.dcs_put_bulk(pty_wrap_ref(remaining.get(..n).unwrap_or(&[])));
+                let run = remaining.get(..n).unwrap_or(&[]);
+                sink.dcs_put_bulk(pty_wrap_ref(run));
+                self.string_utf8 = self.string_utf8.after(run);
                 remaining = remaining.get(n..).unwrap_or(&[]);
             }
             // Fall through to process_byte for the boundary byte.
@@ -541,12 +604,15 @@ impl Parser {
         if self.state == State::SosPmApcString {
             let n = Self::find_dcs_terminator(remaining);
             if n > 0 {
+                let run = remaining.get(..n).unwrap_or(&[]);
                 if self.apc_active {
-                    sink.apc_put_bulk(pty_wrap_ref(remaining.get(..n).unwrap_or(&[])));
+                    sink.apc_put_bulk(pty_wrap_ref(run));
                 }
+                self.string_utf8 = self.string_utf8.after(run);
                 remaining = remaining.get(n..).unwrap_or(&[]);
             }
-            // Fall through to process_byte for the terminator.
+            // Fall through to process_byte for the terminator (or for a 0x9C
+            // inside a UTF-8 character, which stays in the string).
         }
 
         remaining
@@ -568,11 +634,9 @@ impl Parser {
     /// True DCS terminators: 0x18 (CAN), 0x1A (SUB), 0x1B (ESC), 0x9C (ST).
     /// Unlike OSC, DCS treats 0x9C as ST even when C1 controls are otherwise
     /// disabled: the transition table leaves 0x9C as a DCS terminator, so the
-    /// fast path must scan for it too.
-    ///
-    /// Unlike OSC, DCS treats 0x9C as ST even when C1 controls are
-    /// otherwise disabled: the transition table leaves 0x9C as a DCS
-    /// terminator, so the fast path must scan for it too.
+    /// fast path must scan for it too. Whether a 0x9C found here IS the ST
+    /// (with C1 off, one inside a UTF-8 character is not) is the byte path's
+    /// call, which the bulk paths hand it.
     ///
     /// The scan is SIMD-accelerated via [`super::simd::find_any_of`]
     /// (OR-reduced equality compares); its scalar fallback is the same
@@ -763,24 +827,13 @@ impl Parser {
     fn parse_osc_general<S: ActionSink>(data: &[u8], sink: &mut S, bel_terminated: bool) {
         // THE LAST SLOT CARRIES THE REMAINDER VERBATIM, semicolons and all.
         //
-        // This used to `break` when the buffer filled, DISCARDING every segment
-        // past the cap. That is the same defect #7268 fixed by raising the cap
-        // from 8 to 16 — raising it only moves the cliff, it does not remove it,
-        // and the payloads that carry semicolons have no bound to raise it to.
-        //
-        // It is not a cosmetic loss, because the consumers that matter re-JOIN:
-        // `set_title` joins `params[1..]` and `handle_osc_8` joins `params[2..]`
-        // with ';', added deliberately so titles and URIs containing literal
-        // semicolons survive. Past 15 semicolons the tail was simply gone — and
-        // for OSC 8 the TRUNCATED uri still passed the length/scheme/control
-        // gate, was stored on the cells, and was what the click path opened. A
-        // Cmd-click went to a URL the emitter never wrote.
-        //
-        // Keeping the tail in the final slot makes `join(';')` reconstruct the
-        // original exactly, at any number of semicolons, with no allocation and
-        // no larger buffer. A handler that indexes a FIXED early param is
-        // unaffected: the change only ever alters the CONTENT of the last slot,
-        // which previously held a truncated prefix of the same payload.
+        // Consumers re-join: `set_title` joins `params[1..]` and `handle_osc_8`
+        // joins `params[2..]` with ';', so titles and URIs with literal
+        // semicolons survive. Dropping segments past the cap would truncate an
+        // OSC 8 URI that still passes the link gate, and a Cmd-click would open
+        // a URL the emitter never wrote. With the tail in the last slot,
+        // `join(';')` reconstructs the payload at any semicolon count, with no
+        // allocation; handlers that index a fixed early param are unaffected.
         let mut params: ArrayVec<&[u8], MAX_OSC_PARAMS> = ArrayVec::new();
         let mut rest = data;
         loop {
@@ -804,9 +857,10 @@ impl Parser {
 
     /// Decode and dispatch a run of multi-byte UTF-8 characters.
     ///
-    /// Called when a UTF-8 lead byte (0xC0..=0xF7) is encountered in the
-    /// ground-state fast path. Decodes consecutive multi-byte characters
-    /// into a buffer and dispatches via `print`/`print_unicode_bulk`.
+    /// Called when a UTF-8 lead byte ([`super::utf8::is_utf8_lead`]) is
+    /// encountered in the ground-state fast path. Decodes consecutive
+    /// multi-byte characters into a buffer and dispatches via
+    /// `print`/`print_unicode_bulk`.
     ///
     /// Separated from the main dispatch loop (`#[inline(never)]`) to keep
     /// the hot ASCII path compact for L1 instruction cache. The function
@@ -869,7 +923,7 @@ impl Parser {
                 // A multibyte lead the bulk lane could not take (a different
                 // class than a run it just finished, or a malformed/incomplete
                 // sequence): decode exactly one via the scalar oracle.
-                Some(&lead) if (0xC0..=0xF7).contains(&lead) => {
+                Some(&lead) if super::utf8::is_utf8_lead(lead) => {
                     match Self::decode_multibyte_char(lead, rem.get(1..).unwrap_or(&[])) {
                         Some((c, consumed)) => {
                             // Not full (checked above), so this cannot overflow.

@@ -7,8 +7,6 @@
 //! These type aliases define the function signatures for callbacks the Terminal
 //! uses to notify the UI layer of various events (notifications, color
 //! changes, clipboard and window operations).
-//!
-//! Extracted from `aterm-core::terminal::callbacks` (Part of #5663, Phase 2).
 
 use crate::{ClipboardOperation, Notification, Rgb, WindowOperation, WindowResponse};
 

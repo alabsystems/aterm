@@ -1,151 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THREAD-AFFINITY CONTAINER — [`MainThreadBound<T>`], the W12 capability.
+//! A thread-affinity container, [`MainThreadBound<T>`], built from the
+//! [`MainThread`] witness and [`run_on_main`].
 //!
-//! `vendor/winit/src/platform_impl/macos/window.rs` holds two of them
-//! (lines 20 and 29) and they are why that file still imports
-//! `objc2_foundation`. Its `Window` must be `Send + Sync` — winit's public API
-//! says so, and `maybe_wait_on_main` takes a `Send` closure — while the two
-//! things it owns, a `Retained<WinitWindow>` and a
-//! `Retained<WindowDelegate>`, are unconditionally `!Send`. A container that
-//! makes a main-thread value inhabit a `Send` struct is the only shape that
-//! reconciles those, and this crate did not have one: it had the
-//! [`MainThread`] witness (W1, restored after a judge's counterexample) and
-//! [`run_on_main`] (W10), which are exactly the two pieces such a container is
-//! built out of, and nothing that put them together.
+//! `vendor/winit`'s `Window` must be `Send + Sync` while the `Retained`s it
+//! owns (`WinitWindow`, `WindowDelegate`) are `!Send`; this container lets a
+//! main-thread value live in a `Send` struct.
 //!
-//! # THE HAZARD, NAMED FIRST
+//! # Obligations
 //!
-//! **A container that is `Send` while its contents are not is the whole design,
-//! and is also the way it goes wrong.** `unsafe impl<T> Send` is not a bound
-//! that is *relaxed* here, it is a bound that is *removed*, unconditionally,
-//! for every `T` — including every `T` for which `Send` is false. Nothing about
-//! that is safe on its own. It is made safe by four separate obligations, and
-//! the type is worth exactly as much as the weakest of them:
+//! `Send` and `Sync` are implemented unconditionally in `T`, which is sound
+//! only because:
 //!
-//! 1. **The value can only be BORN on the main thread.** [`MainThreadBound::new`] takes a
+//! 1. The value is born on the main thread: [`MainThreadBound::new`] takes a
 //!    [`MainThread`].
-//! 2. **The value can only be READ on the main thread.** [`MainThreadBound::get`],
-//!    [`MainThreadBound::get_mut`] and [`MainThreadBound::into_inner`] each take one, and
-//!    [`MainThread`] is `!Send`, so a witness minted on the main thread cannot
-//!    be carried to another one.
-//! 3. **The value can only be DROPPED on the main thread.** [`Drop`] reschedules
-//!    through [`run_on_main`]. This is the obligation that has no type-system
-//!    half at all, and the one the counterexample in
-//!    `tests/main_thread_bound_drive.rs` is built around.
-//! 4. **The value never MOVES while it is being used.** Rust's move is a
-//!    `memcpy`, and a container that is `Send` gets moved across threads by
-//!    definition. A `T` whose ADDRESS is load-bearing — this crate's own
-//!    [`crate::WeakSlot`] is one — would be silently broken by that. It is not
-//!    a new hazard (any move breaks such a `T`) and this crate's answer is
-//!    already in place: [`crate::WeakObj`] boxes its slot so a move copies the
-//!    box pointer. Named here because "`Send`" is the word that makes a reader
-//!    think about threads and stop thinking about addresses.
+//! 2. It is read only on the main thread: [`MainThreadBound::get`],
+//!    [`MainThreadBound::get_mut`] and [`MainThreadBound::into_inner`] take a
+//!    witness, and [`MainThread`] is `!Send`.
+//! 3. It is dropped only on the main thread: [`Drop`] reschedules through
+//!    [`run_on_main`]. No type-system check backs this one;
+//!    `tests/main_thread_bound_drive.rs` exercises it.
+//! 4. A `T` whose address is load-bearing (e.g. [`crate::WeakSlot`]) must
+//!    still not be moved, as with any move; [`crate::WeakObj`] boxes its slot.
 //!
-//! # THE SEND/SYNC DECISION, TAKEN DELIBERATELY
+//! A `T: Send` bound would make `MainThreadBound<Retained<_>>` `!Send`,
+//! defeating the purpose; `Sync` without `Send` would forbid building
+//! `Window` by value.
 //!
-//! Both are **unconditional in `T`**, and both are `unsafe impl`s this module
-//! writes by hand. The alternatives were considered and are worse in a way that
-//! is not a matter of taste:
+//! **`Send`:** moving the container moves `T`'s bytes, which nothing on the
+//! far thread can read, write or drop (2, 3). A `!Send` value can only have
+//! reached the main thread through a container like this, whose `new` needs a
+//! witness; a `Send` value is fine anywhere. A witness minted with the
+//! `unsafe` [`MainThread::new_unchecked`] off the main thread breaks 1-3 at
+//! once, which is that constructor's obligation.
 //!
-//! * **`T: Send` bound instead.** Then `MainThreadBound<Retained<WinitWindow>>`
-//!   is `!Send`, which is the exact situation the type exists to escape, and
-//!   `winit::Window` stops being `Send`. The type would compile and do nothing.
-//! * **`Sync` only, not `Send`.** Then the container may be shared but not
-//!   moved, and `Window` — an owned field, moved into the struct and moved out
-//!   of `Window::new` — cannot be built.
+//! **`Sync`:** `&T` is reachable only through [`MainThreadBound::get`]
+//! (witness) or [`MainThreadBound::get_on_main`] (runs on the main thread), so
+//! every `&T` exists on the one main thread; `&mut T` needs `&mut self`.
 //!
-//! ## Why `Send` is sound for a `T` that is not
+//! [`MainThreadBound::get_on_main`] returns `R: Send` from a closure over a
+//! higher-ranked `&T`, so a borrow of the value cannot cross back (the same
+//! rule as [`run_on_main`]; no [`crate::AutoreleasePool`] is handed in either).
 //!
-//! Sending the container moves `T`'s BYTES to another thread. Nothing on that
-//! thread can read them, write them, or run a destructor over them:
-//! obligations 2 and 3 above. The bytes are inert. The one remaining question
-//! is whether the value could have ORIGINATED off the main thread — objc2's
-//! `MainThreadBound` asserts it cannot, in one line, without the case split
-//! that makes it true, so here is the split:
+//! # Drop
 //!
-//! * If `T: Send`, origin is irrelevant: a `Send` value is by definition
-//!   correct on any thread.
-//! * If `T: !Send`, the value could only reach the main thread by crossing
-//!   threads, which for a `!Send` type requires a container like this one,
-//!   whose `new` requires a [`MainThread`]. The base case is `new` on the main
-//!   thread; the induction covers the rest. There is no third way into a
-//!   `!Send` value's crossing that this crate provides.
+//! Dropping a `Retained` may be the last release, which runs the declared
+//! class's `-dealloc` and its Rust ivar destructor. The rescheduled `Drop`
+//! makes that happen on the main thread even when the container is dropped
+//! elsewhere (closing `S3`'s release end for values held here only; AppKit
+//! still releases its own references wherever it likes).
+//! `tests/main_thread_bound_drive.rs` contrasts a `NaiveBound<T>` with the
+//! same `unsafe impl Send` and an ordinary drop.
 //!
-//! The residual is honest and is written here rather than assumed away: a
-//! caller who mints a witness with [`MainThread::new_unchecked`] on a thread
-//! that is not main breaks obligations 1-3 at once. That constructor is
-//! `unsafe` and carries the obligation at every use; this type does not add a
-//! second copy of it.
-//!
-//! ## Why `Sync` is sound for a `T` that is not
-//!
-//! `Sync` means `&MainThreadBound<T>` may be sent. A thread holding one can
-//! reach `&T` only through [`MainThreadBound::get`] (needs a witness it cannot have) or
-//! through [`MainThreadBound::get_on_main`] (which runs the closure ON the main thread).
-//! So every `&T` this type ever produces exists on the main thread, and there
-//! is exactly one main thread — which is precisely the property `T: Sync`
-//! would otherwise have to supply. `&mut T` needs `&mut self`, which the borrow
-//! checker already refuses to coexist with any `&self` a second thread might
-//! hold.
-//!
-//! # WHAT `get_on_main` CANNOT BE ASKED FOR, AND WHY THAT IS THE SAME RULE AS W10
-//!
-//! `f` returns `R: Send`, and the closure's parameter is a
-//! higher-ranked `&T` with no lifetime the signature can unify with `R`. So
-//! `get_on_main(|t| t)` does not compile: a borrow of the main thread's value
-//! cannot be the thing that crosses back. That is [`run_on_main`]'s rule —
-//! *nothing may cross the boundary that depends on a pool or on the other
-//! thread's state* — arriving one level out, and it is the reason this module
-//! does not hand the closure an [`crate::AutoreleasePool`] either. The attempt
-//! is a `compile_fail` example on [`MainThreadBound::get_on_main`].
-//!
-//! # THE DROP, WHICH IS `S3`'s RELEASE END FOR EVERYTHING THIS TYPE HOLDS
-//!
-//! The crate's soundness list records `S3` — *`dealloc` runs on whatever thread
-//! performs the last release* — as closed at its BIRTH end (the [`MainThread`]
-//! witness on `alloc_init`) and **still open at its RELEASE end**, because
-//! nothing can make a framework release an object on the thread that made it.
-//!
-//! For a value THIS TYPE HOLDS, the release end is closed, and closing it is
-//! the point of the `Drop` impl. `MainThreadBound<Retained<WindowDelegate>>`
-//! drops a [`crate::Retained`], which calls `objc_release`, which can be the
-//! last release, which runs the declared class's `-dealloc`, which runs the
-//! Rust ivar destructor. Without the reschedule that destructor runs on
-//! whatever thread dropped the container — reachable from **safe** code, with
-//! no `unsafe` token at the call site, by nothing more than moving a `Window`
-//! into a `std::thread::spawn`. That is the same shape as the counterexample
-//! that restored the [`MainThread`] parameter in the first place, and it is
-//! measured rather than argued: `tests/main_thread_bound_drive.rs` declares a
-//! `NaiveBound<T>` with the identical `unsafe impl Send` and an ordinary drop,
-//! and watches its `T`'s destructor run off the main thread while this type's
-//! runs on it.
-//!
-//! **This closes S3's release end for values inside this container only.** An
-//! object AppKit is holding elsewhere is released wherever AppKit releases it,
-//! and nothing here changes that.
-//!
-//! # WHAT THIS TYPE CAN DO THAT `run_on_main` ALONE CANNOT — AND THE TWO HANGS
-//!
-//! [`run_on_main`] from a non-main thread blocks until the main thread services
-//! its queue. [`Drop`] inherits that, so **dropping a
-//! `MainThreadBound<T>` off the main thread hangs if the main thread is not
-//! running an event loop** — in a libtest binary, whose main thread is parked
-//! joining workers, it hangs for ever. That is why this capability's evidence
-//! is a driver.
-//!
-//! `Drop` skips the dispatch entirely when `T` needs no destructor. That is not
-//! only an optimisation: it means a container of a `Copy`-ish `T` cannot hang
-//! at all, which is a different guarantee from "it is fast".
-//!
-//! The second hang is [`run_on_main`]'s own hazard 2 arriving here: dropping a
-//! container off-main while the main thread is *inside* another
-//! [`MainThreadBound::get_on_main`] closure. The outer call took the direct branch, so the
-//! main thread is not draining its queue, and the drop waits on a queue nobody
-//! is servicing. Neither hang is a defect in this type — both are
-//! `dispatch_sync`'s semantics — and both are silent, which is worth knowing
-//! because the loud main-queue trap is the one that gets remembered.
+//! A `T` without drop glue is dropped in place and never blocks. Otherwise an
+//! off-main drop blocks on the main queue, so it hangs silently if the main
+//! thread runs no event loop (e.g. libtest) or is inside another
+//! [`MainThreadBound::get_on_main`] closure — `dispatch_sync` semantics, as in
+//! [`run_on_main`].
 
 use std::mem::ManuallyDrop;
 
@@ -153,10 +65,8 @@ use crate::declare::MainThread;
 use crate::dispatch::run_on_main;
 
 /// A value that may only be touched on the process main thread, in a container
-/// that may travel anywhere.
-///
-/// See the module docs for the four obligations that make the `Send`/`Sync`
-/// impls sound and for the one that has no type-system half.
+/// that may travel anywhere. See the module docs for the obligations behind the
+/// `Send`/`Sync` impls.
 ///
 /// # Examples
 ///
@@ -176,29 +86,21 @@ use crate::dispatch::run_on_main;
 /// ```
 pub struct MainThreadBound<T>(ManuallyDrop<T>);
 
-// SAFETY: the value is BORN on the main thread (`new` takes a `MainThread`),
-// READ only on the main thread (`get`/`get_mut`/`into_inner` each take one, and
-// `MainThread` is `!Send`, so a witness cannot be carried to another thread),
-// and DROPPED only on the main thread (the `Drop` impl below reschedules
-// through `run_on_main`). What crosses a thread boundary is therefore an inert
-// copy of `T`'s bytes that nothing on the far side can read, write or destroy.
-// The module docs carry the case split for why a `!Send` `T` cannot have
-// originated anywhere else.
+// SAFETY: the value is born on the main thread (`new` takes a `MainThread`),
+// read only there (`get`/`get_mut`/`into_inner` take a `!Send` witness), and
+// dropped only there (`Drop` reschedules through `run_on_main`). What crosses
+// threads is an inert copy of `T`'s bytes. See the module docs for why a
+// `!Send` `T` cannot have originated elsewhere.
 unsafe impl<T> Send for MainThreadBound<T> {}
 
-// SAFETY: `&MainThreadBound<T>` yields a `&T` only through `get` (which takes a
-// witness) or `get_on_main` (which runs its closure on the main thread), so
-// every shared reference to the value exists on the one main thread; `&mut T`
-// needs `&mut self`, which cannot coexist with a `&self` held elsewhere. That
-// is the property `T: Sync` would otherwise have had to supply.
+// SAFETY: `&T` is reachable only through `get` (witness) or `get_on_main` (runs
+// on the main thread), so every shared reference exists on the main thread;
+// `&mut T` needs `&mut self`. That is what `T: Sync` would otherwise supply.
 unsafe impl<T> Sync for MainThreadBound<T> {}
 
 impl<T> MainThreadBound<T> {
-    /// Put `inner` in the container.
-    ///
-    /// The witness is what makes obligation 1 a compile-time fact rather than a
-    /// convention: a `!Send` value cannot have arrived from another thread, so
-    /// a caller who can produce one here is on the thread the value belongs to.
+    /// Put `inner` in the container. The witness guarantees the caller is on
+    /// the thread the value belongs to (obligation 1).
     #[inline]
     #[must_use]
     pub const fn new(inner: T, _mt: MainThread) -> Self {
@@ -207,13 +109,9 @@ impl<T> MainThreadBound<T> {
 
     /// The value, borrowed, on the thread it belongs to.
     ///
-    /// # The witness cannot be carried to the thread the container went to
-    ///
-    /// Obligation 2 is discharged by [`MainThread`] being `!Send`, not by
-    /// anything this method does. So the shape a caller would reach for —
-    /// send the container to a worker and take the witness along — does not
-    /// compile, and the diagnostic names the marker field rather than the
-    /// witness type (*"`*const u8` cannot be sent between threads safely"*):
+    /// The witness is `!Send`, so it cannot follow the container to a worker
+    /// (the error names the marker field, "`*const u8` cannot be sent between
+    /// threads safely"):
     ///
     /// ```compile_fail
     /// # use aterm_objc::{MainThread, MainThreadBound};
@@ -239,11 +137,7 @@ impl<T> MainThreadBound<T> {
         &mut self.0
     }
 
-    /// Take the value out.
-    ///
-    /// The witness is load-bearing on this one for a second reason: the value
-    /// leaves the container's protection here, so it must leave onto the thread
-    /// it is allowed to live on.
+    /// Take the value out, onto the main thread where it may live.
     #[inline]
     #[must_use]
     pub fn into_inner(self, _mt: MainThread) -> T {
@@ -255,17 +149,13 @@ impl<T> MainThreadBound<T> {
         unsafe { ManuallyDrop::take(&mut this.0) }
     }
 
-    /// Run `f` against the value on the main thread, and bring its result back.
+    /// Run `f` against the value on the main thread and bring its result back.
     ///
-    /// This is the accessor that works from ANY thread, and the one the winit
-    /// port uses: `maybe_wait_on_main` is a `Send` closure over a
-    /// `WindowDelegate` that is `!Send`.
+    /// Works from any thread (winit's `maybe_wait_on_main` uses it with a `!Send`
+    /// `WindowDelegate`).
     ///
-    /// # What cannot cross back
-    ///
-    /// `R: Send`, and `f`'s parameter is a higher-ranked `&T` with no lifetime
-    /// `R` can unify with — so a borrow of the value cannot be the return.
-    /// That is [`run_on_main`]'s rule, and the attempt does not compile:
+    /// `R: Send`, and `f` takes a higher-ranked `&T` with no lifetime `R` can
+    /// unify with, so a borrow of the value cannot come back:
     ///
     /// ```compile_fail
     /// # use aterm_objc::{MainThread, MainThreadBound};
@@ -276,15 +166,7 @@ impl<T> MainThreadBound<T> {
     /// let escaped: &Rc<u8> = bound.get_on_main(|rc| rc);
     /// ```
     ///
-    /// **THE SAME DEFECT, SPELLED SO THAT `R: Send` CANNOT SEE IT.** The
-    /// attempt above is refused with
-    /// *"`&Rc<u8>` cannot be sent between threads safely"* — i.e. by the `Send`
-    /// bound, because `Rc` is `!Sync`. A guard that stopped there would be armed
-    /// at one spelling: for a `T` that IS `Sync`, `&T` is `Send` and that bound
-    /// is satisfied. The lifetime is the second, independent tooth, and it is
-    /// the one that actually holds — verified by compiling this and reading
-    /// which error comes back (*"lifetime may not live long enough … returning
-    /// this value requires that `'1` must outlive `'2`"*):
+    /// For a `Sync` `T`, `&T` is `Send`, and the lifetime alone refuses it:
     ///
     /// ```compile_fail
     /// # use aterm_objc::{MainThread, MainThreadBound};
@@ -295,15 +177,7 @@ impl<T> MainThreadBound<T> {
     /// let escaped: &Mutex<u8> = bound.get_on_main(|m| m);
     /// ```
     ///
-    /// **AND THE SAME DEFECT SPELLED SO THE RETURN TYPE CANNOT SEE IT
-    /// EITHER.** Both attempts above smuggle the borrow out as `R`. A borrow
-    /// does not have to leave through the return: it can be written into a
-    /// slot the closure captured, and then `R` is `()` and proves nothing at
-    /// all. W15 asked this and read the answer — the slot is a `Mutex<u8>`, so
-    /// `&Mutex<u8>` IS `Send` and `F: Send` is satisfied too, leaving the
-    /// higher-ranked lifetime as the only thing that can refuse it. It does,
-    /// with `E0521`, *"`r` is a reference that is only valid in the closure
-    /// body … `r` escapes the closure body here"*:
+    /// Writing the borrow into a captured slot is refused too (`E0521`):
     ///
     /// ```compile_fail
     /// # use aterm_objc::{MainThread, MainThreadBound};
@@ -319,12 +193,11 @@ impl<T> MainThreadBound<T> {
     /// # Blocking
     ///
     /// Off the main thread this blocks until the main thread services its
-    /// queue — see [`run_on_main`] and the module docs' two hangs.
+    /// queue — see [`run_on_main`].
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is re-raised here with its original payload,
-    /// on the calling thread.
+    /// If `f` panics, the panic is re-raised here with its original payload.
     #[inline]
     pub fn get_on_main<F, R>(&self, f: F) -> R
     where
@@ -336,43 +209,28 @@ impl<T> MainThreadBound<T> {
 }
 
 impl<T> Drop for MainThreadBound<T> {
-    /// Obligation 3, and the whole reason this is not a newtype over
-    /// `ManuallyDrop` with two `unsafe impl`s bolted on.
-    ///
-    /// A `T` with no destructor is dropped in place, which is what keeps a
-    /// container of such a `T` from being able to block at all. Everything else
-    /// goes back to the main thread first.
+    /// Obligation 3. A `T` with no destructor is dropped in place, so it never
+    /// blocks; anything else is dropped on the main thread.
     fn drop(&mut self) {
         if !std::mem::needs_drop::<T>() {
             return;
         }
         run_on_main(|_mt| {
-            // THE WHOLE CONTAINER IS WHAT CROSSES, NOT THE FIELD — and this
-            // rebinding is what says so. Edition-2021 closures capture
-            // DISJOINT FIELDS, so writing `&mut self.0` directly captures a
-            // `&mut ManuallyDrop<T>`, which is `Send` only if `T` is, and the
-            // whole point of this type is that `T` is not: it fails to compile
-            // with "consider restricting type parameter `T` with trait `Send`",
-            // which is the one restriction that would make the type useless.
-            // Naming `self` captures `&mut MainThreadBound<T>` instead, and
-            // THAT is `Send` — by this module's own `unsafe impl`, for the
-            // reasons in the module docs. So the borrow checker is not being
-            // worked around here; it is agreeing that the container is the
-            // thing designed to travel.
+            // Rebind `self` so the closure captures the whole container
+            // (`Send` by this module's impl) rather than the disjoint field
+            // `&mut ManuallyDrop<T>`, which is `Send` only if `T` is.
             let this = &mut *self;
             // SAFETY: this is the container's own `Drop`, so the value is
-            // dropped exactly once and is never read afterwards; `run_on_main`
-            // has put us on the main thread, which is the thread `new`'s
-            // witness established the value belongs to.
+            // dropped once and never read again; `run_on_main` put us on the
+            // main thread, where `new`'s witness says it belongs.
             unsafe { ManuallyDrop::drop(&mut this.0) };
         });
     }
 }
 
 impl<T> std::fmt::Debug for MainThreadBound<T> {
-    /// Deliberately opaque: printing the value would need a witness this
-    /// formatter cannot be given, and `Debug` must not block on the main
-    /// queue.
+    /// Opaque: printing the value needs a witness `Debug` cannot have, and
+    /// `Debug` must not block on the main queue.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MainThreadBound").finish_non_exhaustive()
     }

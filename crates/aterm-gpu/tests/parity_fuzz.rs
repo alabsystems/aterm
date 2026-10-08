@@ -8,21 +8,20 @@
 // wide CJK, combining diacritics, procedural box/block/braille/sextant/Powerline
 // glyphs, inline IMAGES (iTerm2 OSC 1337 File=, opaque + transparent), and
 // DECDWL/DECDHL line sizes — and asserts the two paths stay within the usual
-// glyph-antialiasing/blend tolerance on EVERY frame. A deterministic PRNG (no
-// proptest dep, like the lz4 fuzz) keeps it reproducible; gated on a GPU.
+// glyph-antialiasing/blend tolerance on EVERY frame. A deterministic PRNG keeps
+// it reproducible; gated on a GPU.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::Theme;
 
-mod common;
-use common::{
+use crate::common::{
     backends, count_exceeding_frame as count_exceeding,
     max_channel_delta_frame as max_channel_delta,
 };
 
-/// A 2x2-cell RGBA PNG: left column opaque, right column 50%-alpha — so the fuzz
-/// exercises BOTH the straight-RGBA image blit and the straight-alpha-over-bg
-/// composite the GPU image pass shares with the colour-emoji path.
+/// A 2x2-cell RGBA PNG: left column opaque, right column 50% alpha, covering
+/// both the straight-RGBA image blit and the alpha-over-bg composite the GPU
+/// image pass shares with colour emoji.
 fn image_osc(cw: u32, ch: u32) -> Vec<u8> {
     let (iw, ih) = (2 * cw, 2 * ch);
     let mut rgba = Vec::with_capacity((iw * ih * 4) as usize);
@@ -48,22 +47,12 @@ fn image_osc(cw: u32, ch: u32) -> Vec<u8> {
     out
 }
 
-/// Per-pixel ceiling for the rare divergent pixel. HISTORY: this bound was long
-/// attributed to software-vs-hardware sRGB encode differences at AA glyph edges
-/// (measured 21 on NVIDIA dx12/vulkan, then 48 on macOS Metal once the descender
-/// tokens landed) — but the true cause was an image-vs-glyph Z-ORDER divergence:
-/// the CPU stamped inline images BEFORE glyphs, so a glyph spilling into a
-/// covered cell from an uncovered neighbour (a wide emoji's half in its covered
-/// continuation column) sat OVER the tile on CPU and UNDER it on GPU. With the
-/// CPU image stamp moved to the GPU's stream slot (pass 2b, after glyphs) the
-/// measured worst over this fixed seed collapsed to 1 on Metal — the two sRGB
-/// encodes really are byte-tight. The ceiling keeps the pre-fix NVIDIA headroom
-/// until re-measured there; tighten toward single digits after a Windows run.
+/// Per-pixel ceiling for the rare divergent AA-fringe pixel. Metal measures
+/// 1 over this seed (inline images are stamped after glyphs on both
+/// backends); the ceiling keeps headroom for other GPU drivers.
 const EDGE_CEIL: i32 = 40;
-/// Max such fringe pixels per frame. MEASURED worst after the z-order fix:
-/// 0 px/frame (macOS Metal; the pre-fix worst was 2). 8 is margin for the
-/// unmeasured NVIDIA rig. A real regression (a whole glyph/region wrong) blows
-/// the count into the thousands and is still caught.
+/// Max fringe pixels per frame (Metal measures 0). A real regression (a wrong
+/// glyph or region) produces thousands.
 const MAX_FRINGE_PX: usize = 8;
 
 /// Tokens the fuzz strings together. Each is raw bytes fed to the terminal.
@@ -74,10 +63,9 @@ const TOKENS: &[&[u8]] = &[
     b"123",
     b".rs",
     b"/usr",
-    // Descenders: with `baseline = round(ascent)` some faces (the Windows
-    // candidates) let g/j/p/q/y rasters overshoot the row band by a pixel —
-    // the exact class the shared `row_scale` band clip keeps CPU/GPU-identical.
-    // No other token exercises it.
+    // Descenders: with `baseline = round(ascent)` some faces let g/j/p/q/y
+    // overshoot the row band by a pixel, which the shared `row_scale` band
+    // clip keeps identical. No other token exercises it.
     b"gjpq",
     b"yes/go",
     b"\x1b[1m",
@@ -121,9 +109,8 @@ fn cpu_gpu_parity_fuzz() {
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    // CPU/GPU byte-parity fuzz: compare the SHARED base render. The GPU-only
-    // bloom and heat shimmer are present-quality layers outside the parity
-    // proof — disable them here.
+    // Compare the shared base render: GPU-only bloom and heat shimmer are
+    // outside the parity check.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     // Deterministic parity: block on the lazy fallback parses so neither
@@ -159,9 +146,8 @@ fn cpu_gpu_parity_fuzz() {
         }
         let token_count = 12 + (next() % 40) as usize;
         for _ in 0..token_count {
-            // ~1 in 8 tokens is an inline image (over the text underneath), so a
-            // good fraction of frames carry the image pixel pass without it
-            // dominating the curated glyph/style/decoration coverage.
+            // ~1 in 8 tokens is an inline image over the text, so many frames
+            // exercise the image pass without it dominating.
             if next() % 8 == 0 {
                 term.process(&image_token);
                 continue;
@@ -179,17 +165,11 @@ fn cpu_gpu_parity_fuzz() {
         );
         let d = max_channel_delta(&cpu_frame, &gpu_frame);
         worst = worst.max(d);
-        // LINEAR-LIGHT parity, bounded BY MAGNITUDE *and* COUNT. Compositing is in
-        // LINEAR light (the CPU `blend` + the GPU's sRGB-typed target). The
-        // OVERWHELMING majority of pixels stay BYTE-TIGHT (<=8): interiors, fills,
-        // decorations, emoji are byte-exact. A SMALL number of glyph AA-FRINGE
-        // pixels differ more — the CPU's SOFTWARE sRGB and the GPU's HARDWARE sRGB
-        // encode the same blend slightly differently, amplified near black. This is
-        // INHERENT to mixing a software + hardware sRGB pipeline and cosmetically
-        // invisible; the GPU is the rendering SOURCE OF TRUTH (introspection reads
-        // it back), so the CPU is a close reference. Bounding BOTH the per-pixel
-        // ceiling AND the fringe-pixel COUNT keeps the rigour: a real regression
-        // blows the count into the thousands and is still caught.
+        // Compositing is in linear light (CPU `blend`, GPU sRGB target). Almost
+        // every pixel is within 8; a few glyph AA-fringe pixels differ more
+        // because software and hardware sRGB encodes round differently near
+        // black. Bounding both the per-pixel ceiling and the fringe count
+        // still catches real regressions.
         let exc = count_exceeding(&cpu_frame, &gpu_frame, 8);
         worst_exc = worst_exc.max(exc);
         assert!(

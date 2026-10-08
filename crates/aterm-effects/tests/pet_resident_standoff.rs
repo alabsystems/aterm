@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ONE DISTANCE FROM THE CARET, NOT TWO.
+//! The pet keeps one distance from the caret, not two.
 //!
-//! The caret's escort seats the pet `STATION_LEAD` past the caret — one
-//! cell, the shipped v0.76.0 law. The console layer's RESIDENT — the pet
-//! watching a running command's output from beside a parked caret — used
-//! to reach the same caret through its own home rule, which added
-//! `HOME_BREATHING_ROOM` (two more cells) to the station: the escort stood
-//! at `caret + 1` and the resident at `caret + 3`, and the owner saw the cat
-//! change its mind about where "beside me" is whenever a command started
-//! printing. The escort's distance is the only precedent (v0.76.0 had no
-//! resident path at all), so the resident's home is now the escort's stand.
+//! The caret's escort seats the pet `STATION_LEAD` (one cell) past the caret.
+//! The console layer's resident (the pet watching a running command's output
+//! beside a parked caret) takes the escort's stand as its home, so the pet
+//! does not shift when a command starts printing.
 //!
-//! THE ORACLE IS THE PET ITSELF, as in `pet_escort_primacy` and
+//! The oracle is the pet itself, as in `pet_escort_primacy` and
 //! `pet_position_authority`: `set_console_presentable(false)` returns every
-//! console entry point early, so a twin brain driven with it off IS the
-//! v0.76.0 escort. The fixture is `pet_position_authority`'s streaming
-//! case with a shell-integration block left EXECUTING, which is what makes
-//! the live brain take the resident path.
+//! console entry point early, so a twin brain driven with it off is the
+//! escort alone. The fixture is `pet_position_authority`'s streaming case
+//! with a shell-integration block left executing, which makes the live brain
+//! take the resident path.
 
 use std::time::{Duration, Instant};
 
@@ -41,7 +36,7 @@ struct Scene {
 }
 
 impl Scene {
-    /// `presentable == false` is the v0.76.0 escort with no console layer.
+    /// `presentable == false` is the escort with no console layer.
     fn new(presentable: bool, ink: bool, home: &[u8]) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         term.process(b"\x1b]11;#000000\x07");
@@ -135,12 +130,11 @@ struct Settled {
     attention: PetAttention,
 }
 
-/// `pet_position_authority`'s streaming case — one 57-column line every
-/// 240 ms into a screen that is not yet full, the newline landing on the
-/// following frame as a real `echo` does — with a shell-integration block
-/// left EXECUTING, so the console layer's output watcher is the arm that
-/// answers. Then the output PAUSES with the caret parked, and the body is
-/// left alone until it stops moving.
+/// `pet_position_authority`'s streaming case (one 57-column line every
+/// 240 ms into a screen not yet full, the newline landing on the following
+/// frame as a real `echo` does) with a shell-integration block left
+/// executing, so the console layer's output watcher answers. Then output
+/// pauses with the caret parked, and the body is left until it stops moving.
 fn watch(presentable: bool, ink: bool, park: Park, trace: &mut Vec<String>) -> Settled {
     let mut now = Instant::now();
     let mut scene = Scene::new(
@@ -215,7 +209,7 @@ fn watch(presentable: bool, ink: bool, park: Park, trace: &mut Vec<String>) -> S
     }
 }
 
-/// The v0.76.0 station, computed from the shipped law rather than recalled.
+/// The escort station, computed from its law.
 fn escort_station(caret_col: u16) -> f32 {
     PetBrain::station(caret_col, COLS, art_cols(CELL_W, CELL_H))
 }
@@ -238,15 +232,10 @@ fn report(tag: &str, s: &Settled) -> String {
     )
 }
 
-/// THE PIN. For every way a command's output can leave the caret parked —
-/// column 0 after a newline, mid-row after a progress line — with and
-/// without the host's ink seam fed, the body the console layer's resident
-/// settles is within one cell of the body the v0.76.0 escort settles, on
-/// the same row. Measured before this pin: escort 1.30 cells past the
-/// caret on the caret's row; resident 3.00–3.10 cells past it, one row
-/// below (`caret + STATION_LEAD + HOME_BREATHING_ROOM`, then a strict
-/// perch search that could not answer with anything inside the caret's
-/// ring). After: resident 1.00–1.19, escort 1.30, same row.
+/// For every way a command's output can leave the caret parked (column 0
+/// after a newline, mid-row after a progress line), with and without the
+/// host's ink seam fed, the resident's settled body is within one cell of the
+/// escort's, on the same row.
 #[test]
 fn the_resident_settles_where_the_escort_settles() {
     let mut table = Vec::new();
@@ -260,9 +249,9 @@ fn the_resident_settles_where_the_escort_settles() {
             let tag = format!("ink={ink} park={park:?}");
             table.push(report(&format!("escort   {tag}"), &bare));
             table.push(report(&format!("resident {tag}"), &live));
-            // PRECONDITIONS, so the pin cannot pass vacuously: both bodies
-            // are on glass, the caret parked where the fixture says, and the
-            // live brain really took the resident path.
+            // Preconditions, so the pin cannot pass vacuously: both bodies are
+            // on glass, the caret parked where the fixture says, and the live
+            // brain took the resident path.
             assert!(
                 bare.frame.alpha > 0 && live.frame.alpha > 0,
                 "{tag}: a body is off glass"
@@ -287,11 +276,9 @@ fn the_resident_settles_where_the_escort_settles() {
                     live.gap, bare.gap, live.frame.row, bare.frame.row,
                 ));
             }
-            // AND THE RESIDENT IS ON THE ESCORT'S LADDER, not merely close to
-            // wherever the escort happened to stop: `pet_escort_primacy`'s
-            // own bound, half a cell of slack for the chase's easing and
-            // `body_px`'s rounding; a whole extra cell of standoff is the
-            // thing this test refuses.
+            // The resident is on the escort's ladder, not merely near where
+            // the escort stopped: `pet_escort_primacy`'s bound, half a cell of
+            // slack for the chase's easing and `body_px` rounding.
             let want = escort_station(live.caret.1);
             if (live.frame.col - want).abs() > 0.5 {
                 failures.push(format!(

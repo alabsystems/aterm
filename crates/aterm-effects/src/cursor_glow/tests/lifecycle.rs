@@ -51,11 +51,10 @@ fn jump_spawns_light_and_fades_to_empty() {
     assert!(!glow.is_active());
 }
 
-/// TYPING CONTINUITY LAW: single-cell advances at a human 300ms cadence CHAIN —
-/// mid-gap, well past the old ~99-165ms typing-spark life, the glow is still
-/// emitting light and still active (the streak never goes dark between keys,
-/// which also keeps the renderer's SDR attack envelope from resetting per key —
-/// the quiet-shell "gapping / laggy pulse" report).
+/// Typing continuity: single-cell advances at a 300 ms cadence chain, so
+/// mid-gap the glow is still emitting and active; the streak never goes dark
+/// between keys, and the renderer's SDR attack envelope does not reset per
+/// key.
 #[test]
 fn typing_chain_never_goes_dark() {
     let mut glow = CursorGlow::default();
@@ -70,9 +69,8 @@ fn typing_chain_never_goes_dark() {
         glow.note_synthetic_typed(at, 1);
         glow.tick(Some((2, k as u16)), at, &c, g, &mut out);
     }
-    // Mid-gap probe: 280ms after the third key — the OLD typing spark (~99-165ms)
-    // and the old 200ms crown would both be dead here; the chained spark
-    // (gap+margin = 400ms) and the 350ms typing crown must still shine.
+    // Mid-gap probe, 280 ms after the third key: the chained spark
+    // (gap+margin = 400 ms) and the 350 ms typing crown still shine.
     let fp = glow.tick(
         Some((2, 3)),
         t0 + Duration::from_millis(300 * 3 + 280),
@@ -88,12 +86,10 @@ fn typing_chain_never_goes_dark() {
     assert_invariants(&out, g);
 }
 
-/// ConPTY HIDE-BRIDGE LAW: Windows' conhost hides the cursor for ~20-35ms on
-/// EVERY keystroke echo (hide → advance → show). A presented hidden frame
-/// between two adjacent positions must NOT eat the spark — the glow bridges
-/// the hide and spawns from the last visible cell (without this, the trail's
-/// back half is missing at human typing cadence — the owner's report; macOS
-/// never hides, hence "fine on osx").
+/// ConPTY hide-bridge law: conhost hides the cursor for ~20-35 ms on every
+/// keystroke echo (hide → advance → show). A presented hidden frame between
+/// two adjacent positions must not eat the spark: the glow bridges the hide
+/// and spawns from the last visible cell.
 #[test]
 fn conpty_hide_gap_still_spawns_the_typing_spark() {
     let mut glow = CursorGlow::default();
@@ -119,9 +115,8 @@ fn conpty_hide_gap_still_spawns_the_typing_spark() {
     );
 }
 
-/// The bridge is CONSERVATIVE: a far teleport mid-hide (a full-screen app
-/// repainting with the cursor parked hidden) still spawns NOTHING — the
-/// phantom-comet case the hide/show guard exists for.
+/// The bridge is conservative: a far teleport mid-hide (a full-screen app
+/// repainting with the cursor hidden) spawns nothing.
 #[test]
 fn hidden_far_teleport_stays_suppressed() {
     let mut glow = CursorGlow::default();
@@ -197,13 +192,9 @@ fn every_style_keeps_the_invariants() {
         GlowStyle::Laser,
         GlowStyle::Beam,
         GlowStyle::Water,
-        // The salvaged v0.28 engine emits through the SAME `push_fx_rect` /
-        // `comet_glow_quads` seams as every style above, so it owes the same
-        // debts — single-cell-row banding and the effects-box clamp — and
-        // this is the one mechanical check that collects them. It is in this
-        // list precisely because its emit path is NOT the shared one: a
-        // separate engine is exactly the kind that drifts out of the
-        // invariants unnoticed.
+        // Classic emits through the same `push_fx_rect` / `comet_glow_quads`
+        // seams but via its own engine, so it is checked here for the same
+        // single-cell-row banding and effects-box clamp.
         GlowStyle::Classic,
     ] {
         let mut glow = CursorGlow::default();

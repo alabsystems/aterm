@@ -21,7 +21,7 @@
 //! no implicit bind, no default port, no ambient authority.
 
 use std::io;
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -33,16 +33,44 @@ use rustls::{ClientConfig, ServerConfig};
 use crate::tls::{self, TlsTransport};
 use crate::{Granted, RemoteEndpoint, present_capability, verify_capability};
 
-/// What happened on one accepted connection — surfaced to the caller's logger so
-/// the network listener has an auditable trail (mirrors the local socket's
-/// `log_denial`). Never carries a secret.
+/// What happened on the listener — surfaced to the caller's logger so the network
+/// listener has an auditable trail (mirrors the local socket's `log_denial`).
+/// Every connection event names the peer's address. Never carries a secret.
 #[derive(Clone, Debug)]
 pub enum NetEvent {
-    /// A dialer verified and was relayed to the local control socket.
-    Relayed(Granted),
-    /// A connection was refused (bad handshake, denied capability, dial error).
-    /// The string is a non-sensitive reason for the audit log.
-    Rejected(String),
+    /// A dialer's capability verified: its relay to the local control socket
+    /// starts now.
+    Admitted {
+        /// The dialer's address.
+        peer: SocketAddr,
+        /// What its capability authorizes.
+        granted: Granted,
+    },
+    /// An admitted dialer's relay ended: `error` is `None` for an ordinary close.
+    Closed {
+        /// The dialer's address.
+        peer: SocketAddr,
+        /// Why the relay failed, when it did.
+        error: Option<String>,
+    },
+    /// A connection was turned away before any relay. `reason` is a
+    /// non-sensitive clause (`wrong drive token`, `no handshake within 10s`, …).
+    Refused {
+        /// The dialer's address.
+        peer: SocketAddr,
+        /// Why it was not admitted.
+        reason: String,
+    },
+    /// The listener stopped serving: nothing more is accepted.
+    Stopped(String),
+}
+
+/// The deadline shape a socket read or write takes when its timer runs out.
+fn is_deadline(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 /// Total wall-clock deadline on the UNAUTHENTICATED phase of an accepted
@@ -178,15 +206,15 @@ const WD_FIRED: u8 = 2;
 /// armed for a total wall-clock `handshake_timeout`, which force-closes that clone
 /// if the deadline elapses before the handshaking thread claims [`WD_AUTHED`].
 /// Both ends of the drive ([`accept_and_relay_inner`], [`dial_and_relay_pinned_inner`])
-/// arm one; keeping it in a single type is what stops the two copies drifting.
+/// arm one, and the dialer arms one more over each exchange it makes before the
+/// relay ([`within_wall_clock`]); keeping it in a single type is what stops the
+/// copies drifting.
 ///
 /// **Event-driven, not polled.** The thread parks for the WHOLE remaining deadline
 /// in one go and [`finish`](Self::finish) `unpark`s it the instant the handshake
-/// claims `WD_AUTHED`, so a connection that authenticates early — loopback/LAN,
-/// i.e. the normal case — does not wait out a poll interval before the join
-/// returns. It previously slept in 50 ms steps, which made that whole step the
-/// connection-setup latency (~55 ms loopback vs ~0.6 ms for the same handshake
-/// with no watchdog).
+/// claims `WD_AUTHED`, so a connection that authenticates early (the normal case)
+/// never waits out a poll interval before the join returns: a 50 ms poll step was
+/// ~99% of loopback connection setup.
 ///
 /// **The deadline is not weakened by the wake.** Every wake — `unpark`, or one of
 /// `park_timeout`'s permitted spurious wakeups — re-reads the tri-state and
@@ -298,17 +326,28 @@ where
     F: FnOnce(&str, &str) -> Option<EdgeToken>,
     G: FnOnce() -> io::Result<CtlStream>,
 {
-    accept_and_relay_inner(tcp, config, lookup, connect_local, HANDSHAKE_TIMEOUT)
+    accept_and_relay_inner(
+        tcp,
+        config,
+        lookup,
+        connect_local,
+        HANDSHAKE_TIMEOUT,
+        |_| {},
+    )
 }
 
 /// [`accept_and_relay`] with the unauthenticated-phase deadline injected (tests
-/// use a short value to exercise the slow-loris timeout without a real wait).
+/// use a short value to exercise the slow-loris timeout without a real wait),
+/// and `on_admit` called the moment the capability verifies — before the local
+/// socket is dialed — so [`serve`] can log a connection when it starts, not
+/// only when it ends.
 fn accept_and_relay_inner<F, G>(
     tcp: TcpStream,
     config: Arc<ServerConfig>,
     lookup: F,
     connect_local: G,
     handshake_timeout: Duration,
+    on_admit: impl FnOnce(&Granted),
 ) -> io::Result<Granted>
 where
     F: FnOnce(&str, &str) -> Option<EdgeToken>,
@@ -318,11 +357,8 @@ where
     tcp.set_read_timeout(Some(handshake_timeout))?;
     tcp.set_write_timeout(Some(handshake_timeout))?;
 
-    // Total wall-clock deadline on the whole unauthenticated phase (handshake +
-    // AUTH read): a watchdog force-closes a clone of the socket once the deadline
-    // elapses, so a peer that DRIBBLES bytes (resetting the per-syscall timer) is
-    // still cut off. Exactly one of {authed, fired} wins the CAS, so the watchdog
-    // never shuts a socket the relay will use.
+    // Total wall-clock deadline on the handshake + AUTH read, which a peer that
+    // dribbles bytes cannot reset ([`HandshakeWatchdog`]).
     let watchdog = HandshakeWatchdog::arm(&tcp, handshake_timeout)?;
 
     // The unauthenticated phase. Any error here (incl. the watchdog's force-close)
@@ -333,14 +369,20 @@ where
         let granted = verify_capability(transport.stream(), &exporter, lookup)?;
         Ok((transport, granted))
     })();
-    // Claim AUTHED iff the watchdog has not already fired; then wake and join it
-    // (so its socket clone is dropped before we touch the connection again).
     let authed_in_time = watchdog.finish();
 
+    // A deadline — the watchdog's force-close (which the blocked read sees as an
+    // end of stream) or the per-syscall timer — is said as one, never as the
+    // `unexpected end of file` it surfaces as.
     let (mut transport, granted) = match unauth {
         Ok(v) if authed_in_time => v,
-        Ok(_) => return Err(io::Error::other("handshake deadline exceeded")),
-        Err(e) => return Err(e),
+        Err(e) if authed_in_time && !is_deadline(&e) => return Err(e),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no handshake within {handshake_timeout:?}"),
+            ));
+        }
     };
 
     // Authenticated: drop the handshake deadline before the (long-lived) relay,
@@ -350,8 +392,16 @@ where
         sock.set_read_timeout(None)?;
         sock.set_write_timeout(None)?;
     }
-    // NOW (and only now) dial the local control socket and bridge the two.
-    let local = connect_local()?;
+    on_admit(&granted);
+    // NOW (and only now) dial the local control socket and bridge the two. Its
+    // failure is this instance's, and the words say so: bare, it reads as the
+    // peer's (`<peer> disconnected: No such file or directory`).
+    let local = connect_local().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not reach this aterm's control socket: {e}"),
+        )
+    })?;
     tls::relay(transport, local)?;
     Ok(granted)
 }
@@ -392,16 +442,16 @@ pub fn serve<F, G, E>(
     // wakeups and a running-flag shutdown bound. If mode setup fails, a blocking
     // accept would violate the latter, so fail closed rather than entering it.
     if let Err(error) = listener.set_nonblocking(true) {
-        on_event(NetEvent::Rejected(format!(
-            "could not configure listener readiness: {error}"
+        on_event(NetEvent::Stopped(format!(
+            "could not make the listener non-blocking: {error}"
         )));
         return;
     }
     let inflight = Arc::new(AtomicUsize::new(0));
 
     while running.load(Ordering::Relaxed) {
-        let tcp = match listener.accept() {
-            Ok((s, _)) => s,
+        let (tcp, peer) = match listener.accept() {
+            Ok(accepted) => accepted,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // The common idle path blocks in the kernel with no polling CPU,
                 // but wakes at once when a connection reaches the accept queue.
@@ -431,7 +481,10 @@ pub fn serve<F, G, E>(
         // back and refuse rather than spawn unbounded work.
         if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
             inflight.fetch_sub(1, Ordering::SeqCst);
-            on_event(NetEvent::Rejected("listener at capacity".to_owned()));
+            on_event(NetEvent::Refused {
+                peer,
+                reason: "the listener is at capacity".to_owned(),
+            });
             continue; // dropping `tcp` closes the connection
         }
         let guard = InFlightGuard(Arc::clone(&inflight));
@@ -442,9 +495,31 @@ pub fn serve<F, G, E>(
         let on_event = on_event.clone();
         std::thread::spawn(move || {
             let _slot = guard; // released (slot freed) when this thread ends
-            let ev = match accept_and_relay(tcp, config, lookup, connect_local) {
-                Ok(granted) => NetEvent::Relayed(granted),
-                Err(e) => NetEvent::Rejected(e.to_string()),
+            let admitted = std::cell::Cell::new(false);
+            let result = accept_and_relay_inner(
+                tcp,
+                config,
+                lookup,
+                connect_local,
+                HANDSHAKE_TIMEOUT,
+                |granted| {
+                    admitted.set(true);
+                    on_event(NetEvent::Admitted {
+                        peer,
+                        granted: granted.clone(),
+                    });
+                },
+            );
+            let ev = match result {
+                Ok(_) => NetEvent::Closed { peer, error: None },
+                Err(e) if admitted.get() => NetEvent::Closed {
+                    peer,
+                    error: Some(e.to_string()),
+                },
+                Err(e) => NetEvent::Refused {
+                    peer,
+                    reason: e.to_string(),
+                },
             };
             on_event(ev);
         });
@@ -476,7 +551,7 @@ pub fn serve<F, G, E>(
 /// hold. `pin == None` presents and relays with no nonce read.
 ///
 /// **Fail-closed.** A pinned session the remote does not report — relaunched,
-/// closed, or a roster that could not be read — refuses to dial rather than relay
+/// closed, or a roster that could not be read — relays nothing rather than relay
 /// unverified: a pin the operator asked for is never silently skipped.
 ///
 /// # Errors
@@ -579,8 +654,22 @@ pub fn dial_and_relay_probed<A: ToSocketAddrs>(
     )
 }
 
+/// The probe's reply did not arrive within its bound.
+fn probe_not_accepted(probe: ConnectProbe) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "the remote accepted no connection within {}s",
+            probe.within.as_secs().max(1)
+        ),
+    )
+}
+
 /// Send `probe` and read its one-line reply within its bound (see
 /// [`ConnectProbe`]). Byte at a time, so nothing past the line is consumed.
+/// The per-read timeout below bounds an idle remote; the wall-clock bound
+/// against one that dribbles is [`within_wall_clock`], which the dial wraps
+/// this in.
 fn expect_probe_answer(
     transport: &mut TlsTransport<rustls::ClientConnection>,
     probe: ConnectProbe,
@@ -590,15 +679,7 @@ fn expect_probe_answer(
     stream.write_all(probe.request)?;
     stream.flush()?;
     let deadline = Instant::now() + probe.within;
-    let not_accepted = || {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "the remote accepted no connection within {}s",
-                probe.within.as_secs().max(1)
-            ),
-        )
-    };
+    let not_accepted = || probe_not_accepted(probe);
     let mut line = Vec::with_capacity(160);
     let mut byte = [0u8; 1];
     loop {
@@ -656,18 +737,24 @@ const ROSTER_MAX_LINE: usize = 512;
 /// names its live nonce; a pin with no `sid` is observed when ANY session still
 /// carries the pinned nonce. `None` when the remote reports no such session — a
 /// relaunched or closed one — which the enforcement point refuses. The read is
-/// bounded by the handshake deadline, so a remote that never answers fails the
-/// dial instead of hanging it.
+/// bounded by the handshake deadline — per read here, and in wall-clock time
+/// by [`within_wall_clock`], which the dial wraps this in — so a remote that
+/// never answers, or answers a byte at a time, fails the dial instead of
+/// hanging it.
 fn observe_launch_nonce(
     pin: &RemoteEndpoint,
     transport: &mut TlsTransport<rustls::ClientConnection>,
 ) -> io::Result<Option<String>> {
     use std::io::Write as _;
+    // `read_line`'s own end-of-stream words name the capability line, which
+    // this exchange is past.
     let roster = |e: io::Error| {
-        io::Error::new(
-            e.kind(),
-            format!("reading the remote's session roster: {e}"),
-        )
+        let said = if e.kind() == io::ErrorKind::UnexpectedEof {
+            "the remote closed the connection before sending its session roster".to_owned()
+        } else {
+            format!("reading the remote's session roster: {e}")
+        };
+        io::Error::new(e.kind(), format!("{said}; nothing was relayed"))
     };
     let stream = transport.stream();
     stream.get_mut().set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -680,7 +767,8 @@ fn observe_launch_nonce(
         .filter(|n| *n <= ROSTER_MAX_ROWS)
         .ok_or_else(|| {
             io::Error::other(format!(
-                "the remote refused its session roster ({:?}); refusing to dial (fail-closed)",
+                "the remote refused `sessions bridge` ({:?}), so expect_nonce cannot be checked; \
+                 nothing was relayed",
                 head.chars().take(80).collect::<String>()
             ))
         })?;
@@ -708,6 +796,32 @@ fn roster_nonce(pin: &RemoteEndpoint, rows: &[String]) -> Option<String> {
         parsed
             .find(|(sid, _)| *sid == pin.sid)
             .map(|(_, nonce)| nonce.to_string())
+    }
+}
+
+/// Run one pre-relay exchange with the authenticated remote under a TOTAL
+/// wall-clock `bound`, the same way the unauthenticated phase is bounded.
+///
+/// A per-read socket timeout is not enough here either: rustls reads a whole
+/// TLS record before a read returns, across as many socket reads as it takes,
+/// so a remote that sends a record a byte at a time — slow, buggy, hostile, or
+/// paced by anything on the path — restarts that timer with every byte and
+/// holds the dial (and the caller behind it) for as long as it likes. The
+/// [`HandshakeWatchdog`] force-closes the socket at `bound`, which ends the
+/// exchange's blocked read whatever the remote does; past the bound the
+/// result is `late()`, never the end-of-stream the force-close surfaces as.
+fn within_wall_clock<T>(
+    transport: &mut TlsTransport<rustls::ClientConnection>,
+    bound: Duration,
+    exchange: impl FnOnce(&mut TlsTransport<rustls::ClientConnection>) -> io::Result<T>,
+    late: impl FnOnce() -> io::Error,
+) -> io::Result<T> {
+    let watchdog = HandshakeWatchdog::arm(transport.stream().get_ref(), bound)?;
+    let result = exchange(transport);
+    if watchdog.finish() {
+        result
+    } else {
+        Err(late())
     }
 }
 
@@ -763,13 +877,9 @@ where
     tcp.set_read_timeout(Some(handshake_timeout))?;
     tcp.set_write_timeout(Some(handshake_timeout))?;
 
-    // Total wall-clock deadline on the whole unauthenticated phase (TLS handshake +
-    // the OK/DENIED verdict read inside `present_capability`): a watchdog force-closes
-    // a clone of the socket once the deadline elapses, so a pinned-but-compromised
-    // peer that DRIBBLES bytes (resetting the per-syscall timer) is still cut off.
-    // Exactly one of {authed, fired} wins the CAS, so the watchdog never shuts a
-    // socket the relay will use. The clone MUST be taken before `tcp` is moved into
-    // `tls::connect`.
+    // Total wall-clock deadline on the TLS handshake + the OK/DENIED verdict read,
+    // which a peer that dribbles bytes cannot reset ([`HandshakeWatchdog`]). Armed
+    // before `tcp` moves into `tls::connect`.
     let watchdog = HandshakeWatchdog::arm(&tcp, handshake_timeout)?;
 
     // The unauthenticated phase: complete TLS, then present the channel-bound
@@ -781,14 +891,20 @@ where
         present_capability(transport.stream(), &exporter, src, op, token)?;
         Ok(transport)
     })();
-    // Claim AUTHED iff the watchdog has not already fired; then wake and join it
-    // (so its socket clone is dropped before we touch the connection again).
     let authed_in_time = watchdog.finish();
 
+    // A deadline — the watchdog's force-close (which the blocked read sees as an
+    // end of stream) or the per-syscall timer — is said as one, never as the
+    // `unexpected end of file` it surfaces as.
     let mut transport = match unauth {
         Ok(t) if authed_in_time => t,
-        Ok(_) => return Err(io::Error::other("handshake deadline exceeded")),
-        Err(e) => return Err(e),
+        Err(e) if authed_in_time && !is_deadline(&e) => return Err(e),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("the remote did not finish the handshake within {handshake_timeout:?}"),
+            ));
+        }
     };
 
     // Authenticated: drop the handshake deadline before the (long-lived) relay,
@@ -805,29 +921,47 @@ where
     // fingerprint provably equals `pin.fingerprint`; only the launch-nonce half
     // remains, read here via `observe_nonce`. A pinned session the remote does not
     // report (`None`) FAILS CLOSED — an operator-requested guard is never silently
-    // skipped. `pin == None` never touches `observe_nonce`, so the un-pinned path is
-    // byte-identical to the un-pinned dial.
+    // skipped.
     if let Some(pin) = &pin {
-        match observe_nonce(&mut transport)? {
-            Some(nonce) if pin.matches(&pin.fingerprint, &nonce) => {}
-            Some(_) => {
-                return Err(io::Error::other(
-                    "launch-nonce pin mismatch: the remote is a relaunched/rebound session; \
-                     refusing to relay",
-                ));
-            }
-            None => {
-                return Err(io::Error::other(
-                    "connection pins a launch nonce but the remote reported no session with \
-                     the pinned identity (relaunched or closed); refusing to dial (fail-closed)",
-                ));
-            }
+        // TCP, TLS and the token are done by now: only the relay is refused.
+        let sid = pin.sid.escape_debug();
+        let observed = within_wall_clock(&mut transport, handshake_timeout, observe_nonce, || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the remote sent no session roster within {handshake_timeout:?}; nothing was \
+                     relayed"
+                ),
+            )
+        })?;
+        let refusal = match observed {
+            Some(nonce) if pin.matches(&pin.fingerprint, &nonce) => None,
+            Some(_) if !pin.sid.is_empty() => Some(format!(
+                "session {sid} was relaunched: its launch nonce no longer matches expect_nonce; \
+                 nothing was relayed"
+            )),
+            None if !pin.sid.is_empty() => Some(format!(
+                "the remote has no session {sid}; nothing was relayed"
+            )),
+            Some(_) | None => Some(
+                "no remote session carries expect_nonce (relaunched or closed); nothing was \
+                 relayed"
+                    .to_owned(),
+            ),
+        };
+        if let Some(refusal) = refusal {
+            return Err(io::Error::other(refusal));
         }
     }
 
     // Prove the remote serves the connection before any of the caller's bytes.
     if let Some(probe) = probe {
-        expect_probe_answer(&mut transport, probe)?;
+        within_wall_clock(
+            &mut transport,
+            probe.within,
+            |transport| expect_probe_answer(transport, probe),
+            || probe_not_accepted(probe),
+        )?;
     }
 
     if !prebuffer.is_empty() {
@@ -842,11 +976,18 @@ where
 mod tests {
     use super::*;
     use crate::tls::{cert_fingerprint, client_config, server_config};
+    use aterm_spec::wait::MUST_HAPPEN;
     use std::io::{Read, Write};
     use std::sync::Mutex;
 
     const TEST_CERT_DER: &[u8] = include_bytes!("testdata/cert.der");
     const TEST_KEY_DER: &[u8] = include_bytes!("testdata/key.pkcs8.der");
+
+    /// How many bytes the slow-loris peers dribble, one per 80 ms: over five
+    /// minutes of a per-syscall timer kept alive, so only the wall-clock
+    /// watchdog ends the handshake inside the minute's hang detector. A peer
+    /// stops at the first byte the cut connection refuses.
+    const DRIBBLE_BYTES: usize = 4_000;
 
     /// Echo whatever arrives on `s` back to it, until EOF. Stands in for the
     /// host's local control socket.
@@ -868,12 +1009,13 @@ mod tests {
 
     #[test]
     fn real_listener_readiness_wakes_before_the_shutdown_interval() {
-        // Deliberately much longer than production's 200 ms bound: a sleep-based
-        // implementation pays all five seconds and fails by a wide margin. The
-        // two-second wake ceiling still distinguishes that negative control but
-        // tolerates severe scheduler starvation in a parallel debug test run.
-        const TEST_WAIT: Duration = Duration::from_secs(5);
-        const MAX_READY_WAKE: Duration = Duration::from_secs(2);
+        // Deliberately much longer than production's 200 ms bound: a
+        // sleep-based implementation pays the whole five minutes and fails by a
+        // wide margin. The wake ceiling is a minute's hang detector (AGENTS.md),
+        // never a latency budget, so it still distinguishes that negative
+        // control and no scheduler starvation of a loaded gate reaches it.
+        const TEST_WAIT: Duration = Duration::from_secs(300);
+        const MAX_READY_WAKE: Duration = MUST_HAPPEN;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -915,7 +1057,7 @@ mod tests {
             "an idle readiness wait returned too early to replace sleep polling ({elapsed:?})"
         );
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < MUST_HAPPEN,
             "the readiness timeout must retain the {ACCEPT_POLL:?} shutdown bound ({elapsed:?})"
         );
         assert_eq!(
@@ -1034,9 +1176,9 @@ mod tests {
     }
 
     /// THE WEDGED REMOTE. The remote's TLS listener accepts and verifies, but
-    /// its local control socket never answers (the 2026-09-25 state: queued,
-    /// never accepted). The probed dial reports it within the probe's bound,
-    /// by name, and never sends the caller's bytes.
+    /// its local control socket never answers (queued, never accepted). The
+    /// probed dial reports it within the probe's bound, by name, and never sends
+    /// the caller's bytes.
     #[test]
     fn a_probed_dial_into_a_remote_that_serves_nothing_fails_fast() {
         let (svc_a, svc_b) = CtlStream::pair().unwrap();
@@ -1056,8 +1198,10 @@ mod tests {
             error.to_string().contains("accepted no connection"),
             "{error}"
         );
+        // A hang detector (AGENTS.md): without the probe's bound the read has no
+        // timeout at all, and the wedged remote never answers.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < MUST_HAPPEN,
             "the probe bound held: {:?}",
             started.elapsed()
         );
@@ -1084,7 +1228,7 @@ mod tests {
         let echo = spawn_echo(svc_b);
         let probe = ConnectProbe {
             request: b"PING\n",
-            within: Duration::from_secs(5),
+            within: MUST_HAPPEN,
             is_refusal: |line| line.starts_with("ERR"),
         };
         let (driver, mut drv_client, host) = dial_probed(svc_a, probe, b"PRE\n");
@@ -1101,7 +1245,7 @@ mod tests {
         let echo = spawn_echo(svc_b);
         let refused = ConnectProbe {
             request: b"ERR control server busy; retry\n",
-            within: Duration::from_secs(5),
+            within: MUST_HAPPEN,
             is_refusal: |line| line.starts_with("ERR control server busy"),
         };
         let (driver, drv_client, host) = dial_probed(svc_a, refused, b"PRE\n");
@@ -1224,6 +1368,7 @@ mod tests {
                         CtlStream::pair().map(|(a, _b)| a)
                     },
                     Duration::from_millis(300),
+                    |_| {},
                 )
             }
         });
@@ -1232,16 +1377,21 @@ mod tests {
         let _stalled = TcpStream::connect(addr).unwrap();
         let started = Instant::now();
         let res = host.join().unwrap();
-        assert!(
-            res.is_err(),
-            "a stalled pre-auth peer must be dropped, not relayed"
-        );
+        let Err(err) = res else {
+            panic!("a stalled pre-auth peer must be dropped, not relayed");
+        };
+        // Said as the deadline it is, not as the raw end of stream or EAGAIN
+        // the force-close or the socket timer surfaces as.
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(err.to_string(), "no handshake within 300ms");
         assert!(
             !dialed_local.load(Ordering::SeqCst),
             "a peer that never authenticated must NEVER dial the local socket"
         );
+        // A hang detector (AGENTS.md): the stalled peer holds the socket open
+        // for as long as the test runs.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < MUST_HAPPEN,
             "the handshake deadline must fire promptly (~300ms), not hang"
         );
     }
@@ -1269,19 +1419,22 @@ mod tests {
                         CtlStream::pair().map(|(a, _b)| a)
                     },
                     Duration::from_millis(300),
+                    |_| {},
                 )
             }
         });
 
         // A valid TLS record HEADER (handshake, len=4096) so rustls keeps waiting
         // for the body — then dribble it 1 byte / 80ms, well under the 300ms
-        // per-syscall timeout, so ONLY the wall-clock watchdog can stop it.
+        // per-syscall timeout, so ONLY the wall-clock watchdog can stop it. It
+        // dribbles for over five minutes ([`DRIBBLE_BYTES`]), so a handler the
+        // watchdog does not cut is held far past the hang detector below.
         let mut peer = TcpStream::connect(addr).unwrap();
         let started = Instant::now();
         let dribbler = std::thread::spawn(move || {
             let _ = peer.write_all(&[0x16, 0x03, 0x03, 0x10, 0x00]);
             let _ = peer.flush();
-            for _ in 0..40 {
+            for _ in 0..DRIBBLE_BYTES {
                 if peer.write_all(&[0x00]).and_then(|()| peer.flush()).is_err() {
                     break; // server force-closed -> our writes start failing
                 }
@@ -1291,6 +1444,14 @@ mod tests {
 
         let res = host.join().unwrap();
         let elapsed = started.elapsed();
+        // The watchdog's force-close reaches the blocked read as an end of
+        // stream; it is still said as the deadline.
+        assert_eq!(
+            res.as_ref().map_err(io::Error::kind).err(),
+            Some(io::ErrorKind::TimedOut),
+            "{:?}",
+            res.as_ref().err()
+        );
         assert!(
             res.is_err(),
             "a dribbling pre-auth peer must be cut off, not relayed"
@@ -1304,14 +1465,11 @@ mod tests {
             "the cut-off must be the wall-clock watchdog (~300ms), not an instant reject ({elapsed:?})"
         );
         assert!(
-            // Upper bound. The watchdog is EVENT-DRIVEN: it parks for the whole
-            // remaining deadline in one go, so it force-closes at the deadline
-            // itself rather than at the next tick after it — which is why this
-            // bound is 5s against a 300ms deadline and no longer the 30s the
-            // sleep-polled shape needed. Without the watchdog the dial hangs for
-            // the whole handshake timeout, so this still fails loudly on
-            // 'runs unbounded' — AND now also on 'the wake starved the deadline'.
-            elapsed < Duration::from_secs(5),
+            // Upper bound: a minute's hang detector (AGENTS.md), never a latency
+            // budget. Without the watchdog the dribble keeps the per-syscall
+            // timer alive for its whole five minutes, so this still fails loudly
+            // on 'runs unbounded'.
+            elapsed < MUST_HAPPEN,
             "the wall-clock deadline must bound the dribble, not run unbounded ({elapsed:?})"
         );
         let _ = dribbler.join();
@@ -1332,12 +1490,14 @@ mod tests {
         // The "server": accept the TCP connection, send a valid TLS record HEADER
         // (handshake, len=4096) so the dialer's rustls keeps waiting for the body,
         // then dribble it 1 byte / 80ms — well under the 300ms per-syscall timeout,
-        // so ONLY the wall-clock watchdog can stop the dial.
+        // so ONLY the wall-clock watchdog can stop the dial. For over five minutes
+        // ([`DRIBBLE_BYTES`]): a dial the watchdog does not cut is held far past
+        // the hang detector below.
         let server = std::thread::spawn(move || {
             let (mut peer, _) = listener.accept().unwrap();
             let _ = peer.write_all(&[0x16, 0x03, 0x03, 0x10, 0x00]);
             let _ = peer.flush();
-            for _ in 0..40 {
+            for _ in 0..DRIBBLE_BYTES {
                 if peer.write_all(&[0x00]).and_then(|()| peer.flush()).is_err() {
                     break; // dialer force-closed -> our writes start failing
                 }
@@ -1362,215 +1522,156 @@ mod tests {
             |_t| Ok(None),
         );
         let elapsed = started.elapsed();
-        assert!(
-            res.is_err(),
-            "a dribbling server must be cut off, not left to hang the dial"
+        let Err(err) = res else {
+            panic!("a dribbling server must be cut off, not left to hang the dial");
+        };
+        // Said as the deadline, not as the `unexpected end of file` the
+        // watchdog's force-close surfaces as in the blocked handshake read.
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(
+            err.to_string(),
+            "the remote did not finish the handshake within 300ms"
         );
         assert!(
             elapsed >= Duration::from_millis(200),
             "the cut-off must be the wall-clock watchdog (~300ms), not an instant reject ({elapsed:?})"
         );
         assert!(
-            // Upper bound. The watchdog is EVENT-DRIVEN: it parks for the whole
-            // remaining deadline in one go, so it force-closes at the deadline
-            // itself rather than at the next tick after it — which is why this
-            // bound is 5s against a 300ms deadline and no longer the 30s the
-            // sleep-polled shape needed. Without the watchdog the dial hangs for
-            // the whole handshake timeout, so this still fails loudly on
-            // 'runs unbounded' — AND now also on 'the wake starved the deadline'.
-            elapsed < Duration::from_secs(5),
+            // Upper bound: a minute's hang detector (AGENTS.md), never a latency
+            // budget. Without the watchdog the dribble keeps the per-syscall
+            // timer alive for its whole five minutes, so this still fails loudly
+            // on 'runs unbounded'.
+            elapsed < MUST_HAPPEN,
             "the wall-clock deadline must bound the dribble, not run unbounded ({elapsed:?})"
         );
         let _ = server.join();
     }
 
-    /// One loopback connection through the SHIPPING drive path (a watchdog armed on
-    /// BOTH ends), timed from "start connecting" to "the first control byte has made
-    /// the full round trip through the authenticated relay" — the span a
-    /// `dial <name> <verb>` actually pays, since aterm-ctl rejects a bare
-    /// `dial <name>` and every remote verb is therefore a fresh TCP+TLS connection.
-    fn time_drive_setup(listener: &TcpListener, token: EdgeToken) -> Duration {
+    /// A pinned listener that grants the capability, reads `request` (the
+    /// dialer's first post-grant exchange), and then answers it with one TLS
+    /// record sent a byte every 80 ms — the ciphertext a slow, buggy or hostile
+    /// remote (or anything on the path pacing its segments) delivers. Each byte
+    /// restarts a per-read timer, and rustls reads the whole record before it
+    /// returns, so only a wall-clock bound ends the dialer's wait.
+    fn granting_listener_that_dribbles_after(
+        request: &'static [u8],
+    ) -> (SocketAddr, EdgeToken, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
-        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
-
-        let (svc_a, svc_b) = CtlStream::pair().unwrap();
-        let echo = spawn_echo(svc_b);
-        let svc_a = Arc::new(Mutex::new(Some(svc_a)));
-
-        // Park the host in accept() BEFORE the clock starts: we time the connection,
-        // not thread creation on the listener side.
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-        let listener_clone = listener.try_clone().unwrap();
-        let host = std::thread::spawn({
-            let svc_a = Arc::clone(&svc_a);
-            move || {
-                ready_tx.send(()).unwrap();
-                let (tcp, _) = listener_clone.accept().unwrap();
-                accept_and_relay(
-                    tcp,
-                    scfg,
-                    |_s, op| (op == "drive").then_some(token),
-                    move || Ok(svc_a.lock().unwrap().take().unwrap()),
-                )
+        let token = EdgeToken::generate();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let _ = tcp.set_read_timeout(Some(MUST_HAPPEN));
+            let Ok(mut transport) = tls::accept(tcp, scfg) else {
+                return;
+            };
+            let exporter = transport.exporter().to_vec();
+            if verify_capability(transport.stream(), &exporter, |_, _| Some(token)).is_err() {
+                return;
+            }
+            let mut heard = vec![0u8; request.len()];
+            if transport.stream().read_exact(&mut heard).is_err() || heard != request {
+                return;
+            }
+            // An application-data record claiming 16 KiB, then its body.
+            let sock = transport.stream().get_mut();
+            if sock.write_all(&[0x17, 0x03, 0x03, 0x40, 0x00]).is_err() {
+                return;
+            }
+            for _ in 0..DRIBBLE_BYTES {
+                if sock.write_all(&[0x00]).and_then(|()| sock.flush()).is_err() {
+                    break; // the dialer gave up
+                }
+                std::thread::sleep(Duration::from_millis(80));
             }
         });
-        ready_rx.recv().unwrap();
-
-        let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
-        let started = Instant::now();
-        let driver = std::thread::spawn(move || {
-            dial_and_relay_pinned(addr, ccfg, "probe", "drive", &token, b"", drv_local, None)
-        });
-        drv_client.write_all(b"P\n").unwrap();
-        drv_client.flush().unwrap();
-        let mut got = [0u8; 2];
-        drv_client.read_exact(&mut got).unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(&got, b"P\n");
-
-        drv_client.shutdown(std::net::Shutdown::Both).unwrap();
-        drop(drv_client);
-        let granted = host.join().unwrap().unwrap();
-        // Reach witness for the ARM: reaching `Granted` means the capability gate
-        // inside `accept_and_relay_inner` ran, and that function arms a watchdog
-        // unconditionally — so this sample provably contains the state under test.
-        assert_eq!(granted.op, "drive");
-        driver.join().unwrap().ok();
-        echo.join().ok();
-        elapsed
+        (addr, token, server)
     }
 
-    /// The CONTROL: the identical TLS 1.3 handshake, channel-bound capability
-    /// exchange and relay, assembled inline with NO watchdog. Nothing here calls
-    /// `accept_and_relay`/`dial_and_relay_pinned`, so no watchdog is ever armed — this is
-    /// the transport floor the drive path is measured against.
-    fn time_bare_handshake(listener: &TcpListener, token: EdgeToken) -> Duration {
-        let addr = listener.local_addr().unwrap();
-        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
-        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
-        let timeout = Duration::from_secs(10);
-
-        let (svc_a, svc_b) = CtlStream::pair().unwrap();
-        let echo = spawn_echo(svc_b);
-
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-        let listener_clone = listener.try_clone().unwrap();
-        let host = std::thread::spawn(move || -> io::Result<()> {
-            ready_tx.send(()).unwrap();
-            let (tcp, _) = listener_clone.accept().unwrap();
-            tcp.set_read_timeout(Some(timeout))?;
-            tcp.set_write_timeout(Some(timeout))?;
-            let mut transport = tls::accept(tcp, scfg)?;
-            let exporter = transport.exporter().to_vec();
-            let _granted = verify_capability(transport.stream(), &exporter, |_s, op| {
-                (op == "drive").then_some(token)
-            })?;
-            {
-                let sock = transport.stream().get_mut();
-                sock.set_read_timeout(None)?;
-                sock.set_write_timeout(None)?;
-            }
-            tls::relay(transport, svc_a)
+    /// Run `dial` on a thread and wait for its result, at most a minute's hang
+    /// detector.
+    fn dial_result(
+        what: &str,
+        dial: impl FnOnce() -> io::Result<()> + Send + 'static,
+    ) -> io::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(dial());
         });
-        ready_rx.recv().unwrap();
-
-        let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
-        let started = Instant::now();
-        let driver = std::thread::spawn(move || -> io::Result<()> {
-            let tcp = TcpStream::connect_timeout(&addr, timeout)?;
-            tcp.set_read_timeout(Some(timeout))?;
-            tcp.set_write_timeout(Some(timeout))?;
-            let mut transport = tls::connect(tcp, tls::fixed_server_name(), ccfg)?;
-            let exporter = transport.exporter().to_vec();
-            present_capability(transport.stream(), &exporter, "probe", "drive", &token)?;
-            {
-                let sock = transport.stream().get_mut();
-                sock.set_read_timeout(None)?;
-                sock.set_write_timeout(None)?;
-            }
-            tls::relay(transport, drv_local)
-        });
-        drv_client.write_all(b"P\n").unwrap();
-        drv_client.flush().unwrap();
-        let mut got = [0u8; 2];
-        drv_client.read_exact(&mut got).unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(&got, b"P\n");
-
-        drv_client.shutdown(std::net::Shutdown::Both).unwrap();
-        drop(drv_client);
-        host.join().unwrap().unwrap();
-        driver.join().unwrap().ok();
-        echo.join().ok();
-        elapsed
+        rx.recv_timeout(MUST_HAPPEN)
+            .unwrap_or_else(|_| panic!("{what}: the dial was still waiting after {MUST_HAPPEN:?}"))
     }
 
     #[test]
-    fn a_fast_handshake_is_not_paced_by_the_watchdogs_wake_interval() {
-        // TWO-SIDED, and the two arms differ ONLY by the watchdog:
-        //   ARM     — `accept_and_relay` + `dial_and_relay_pinned`: a watchdog on each end.
-        //   CONTROL — the same TLS handshake, capability exchange and relay inline,
-        //             with no watchdog at all.
-        //
-        // The watchdog used to sleep-poll in 50 ms steps and then be JOINED, so a
-        // connection whose unauthenticated phase finished early — loopback and LAN,
-        // i.e. the normal case — could not complete setup until the CURRENT step
-        // expired. Measured on loopback before this became event-driven: the ARM
-        // p50 was 55.4 ms against a 0.64 ms CONTROL, so ~99% of connection setup
-        // was the poll interval. Event-driven, the two arms coincide.
-        //
-        // The bound is RELATIVE (arm minus control) so a slow or loaded box moves
-        // both arms together; 30 ms is under two thirds of a 50 ms poll step, so
-        // the old shape fails it by ~25 ms every single time. The ARM pays two
-        // thread spawns and two cross-thread wakes the CONTROL does not, and on
-        // a saturated run queue each can wait milliseconds, so the arms are
-        // sampled INTERLEAVED (a load burst lands on both) and seven times, not
-        // three in two blocks against 20 ms (the load-sensitive test audit of
-        // 2026-09-27). The load-free form of the same property is
-        // `finishing_an_early_handshake_does_not_wait_out_a_wake_interval`.
-        const MAX_WATCHDOG_COST: Duration = Duration::from_millis(30);
-        const REPS: usize = 7;
-
-        let token = EdgeToken::generate();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        // Warm: the first connection of each shape pays rustls provider init.
-        let _ = time_bare_handshake(&listener, token);
-        let _ = time_drive_setup(&listener, token);
-
-        // Minimum over the repetitions: for a latency this is the sample least
-        // polluted by an unrelated scheduling stall, and the defect under test is
-        // deterministic (it is present in EVERY pre-fix sample, never just the tail).
-        let (mut control, mut arm) = (Duration::MAX, Duration::MAX);
-        for _ in 0..REPS {
-            control = control.min(time_bare_handshake(&listener, token));
-            arm = arm.min(time_drive_setup(&listener, token));
-        }
-
-        let cost = arm.saturating_sub(control);
+    fn a_probe_answer_dribbled_by_the_remote_is_cut_off_at_the_probe_bound() {
+        let (addr, token, server) = granting_listener_that_dribbles_after(b"version\n");
+        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
+        let (drv_local, drv_client) = CtlStream::pair().unwrap();
+        let probe = ConnectProbe {
+            request: b"version\n",
+            within: Duration::from_millis(400),
+            is_refusal: |_| false,
+        };
+        let error = dial_result("the probe", move || {
+            dial_and_relay_probed(
+                addr, ccfg, "driver-1", "drive", &token, b"", drv_local, None, probe,
+            )
+        })
+        .expect_err("a probe answer that never completes cannot pass the probe");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
         assert!(
-            cost < MAX_WATCHDOG_COST,
-            "the unauthenticated-phase watchdog must not pace a fast handshake: \
-             drive setup {arm:?} vs the same transport without a watchdog {control:?} \
-             (watchdog cost {cost:?}, budget {MAX_WATCHDOG_COST:?}). A cost near a whole \
-             wake interval means the watchdog is being waited out instead of woken."
+            error.to_string().contains("accepted no connection"),
+            "{error}"
         );
+        drop(drv_client);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn a_session_roster_dribbled_by_the_remote_is_cut_off_at_the_handshake_bound() {
+        let (addr, token, server) = granting_listener_that_dribbles_after(b"sessions bridge\n");
+        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
+        let (drv_local, drv_client) = CtlStream::pair().unwrap();
+        let pin = RemoteEndpoint {
+            host: addr.to_string(),
+            sid: "s1".into(),
+            nonce: "0011".into(),
+            fingerprint: "pinned".into(),
+        };
+        let error = dial_result("the roster", move || {
+            dial_and_relay_pinned_inner(
+                addr,
+                ccfg,
+                "driver-1",
+                "drive",
+                &token,
+                b"",
+                drv_local,
+                Duration::from_millis(300),
+                Some(pin.clone()),
+                None,
+                move |transport| observe_launch_nonce(&pin, transport),
+            )
+        })
+        .expect_err("a roster that never completes cannot satisfy the pin");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        drop(drv_client);
+        let _ = server.join();
     }
 
     /// The watchdog's wake, with no TLS and no second end: `finish` on a
     /// handshake that authenticated early must not wait for the watchdog
     /// thread to come round on its own. A thread that sleep-polls in steps is
-    /// JOINED only when its current step expires, so `finish` once the thread
-    /// is inside its wait pays the rest of that step (~50 ms for the old
-    /// shape) in every sample; the event-driven thread is woken by the
-    /// `unpark` and pays one scheduling latency. The deadline is armed at 60 s
+    /// JOINED only when its current step expires, so `finish` would pay the
+    /// rest of that step in every sample; the event-driven thread is woken by
+    /// the `unpark` and pays one scheduling latency. The deadline is armed at 60 s
     /// so no sample can end by it, and the minimum of ten filters a stalled
     /// wake without letting a poll step through.
     ///
     /// NON-VACUITY: `finish` is timed only once the thread has entered its
     /// wait. Called before that, it finds the state already claimed and
-    /// returns at once whatever the wait is — measured: the sleep-poll shape
-    /// passed this test until it waited for `waiting`.
+    /// returns at once whatever the wait is.
     #[test]
     fn finishing_an_early_handshake_does_not_wait_out_a_wake_interval() {
         const MAX_FINISH: Duration = Duration::from_millis(20);
@@ -1582,7 +1683,7 @@ mod tests {
         let fastest = (0..10)
             .map(|_| {
                 let watchdog = HandshakeWatchdog::arm(&tcp, Duration::from_secs(60)).unwrap();
-                let entered = Instant::now() + Duration::from_secs(10);
+                let entered = Instant::now() + MUST_HAPPEN;
                 while !watchdog.waiting.load(Ordering::Acquire) {
                     assert!(
                         Instant::now() < entered,
@@ -1620,13 +1721,15 @@ mod tests {
         // hammer the wake channel every 3 ms — for far LONGER than the deadline, and
         // longer than the ceiling asserted below, because a starvation bug only
         // shows while the wakes keep coming. The force-close must still land at the
-        // deadline: not before it, and not pushed out by the hammering.
+        // deadline: not before it, and not pushed out by the hammering. A correct
+        // watchdog ends the hammering at once: it stops at the force-close.
         const DEADLINE: Duration = Duration::from_millis(150);
         /// Must exceed `CEILING`, or a watchdog whose deadline restarts on every
         /// wake would simply fire once the hammering stopped and escape the test.
-        const HAMMER_BUDGET: Duration = Duration::from_secs(3);
-        /// Generous against scheduling noise but far under `HAMMER_BUDGET`.
-        const CEILING: Duration = Duration::from_millis(1500);
+        const HAMMER_BUDGET: Duration = Duration::from_secs(180);
+        /// A minute's hang detector (AGENTS.md), never a latency budget: far
+        /// under `HAMMER_BUDGET`, and out of reach of any scheduling noise.
+        const CEILING: Duration = MUST_HAPPEN;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1666,7 +1769,7 @@ mod tests {
                     ) =>
                 {
                     assert!(
-                        started.elapsed() < Duration::from_secs(20),
+                        started.elapsed() < MUST_HAPPEN,
                         "the deadline was STARVED outright: the watchdog never force-closed"
                     );
                 }
@@ -1748,7 +1851,7 @@ mod tests {
                         scfg,
                         |src, op| (src == "driver-1" && op == "drive").then_some(minted),
                         move || {
-                            let granted = told_rx.recv_timeout(Duration::from_secs(2)) == Ok(true);
+                            let granted = told_rx.recv_timeout(MUST_HAPPEN) == Ok(true);
                             *dial.lock().unwrap() = Some(granted);
                             // The local peer hangs up at once, so the relay ends.
                             CtlStream::pair().map(|(local, _peer)| local)
@@ -1757,7 +1860,7 @@ mod tests {
                 }
             });
             let tcp = TcpStream::connect(addr).unwrap();
-            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            tcp.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
             let mut dialer = tls::connect(tcp, tls::fixed_server_name(), ccfg).unwrap();
             let exporter = dialer.exporter().to_vec();
             let verdict =
@@ -2006,7 +2109,11 @@ mod tests {
         // the rebind guard must refuse to relay.
         let res = dial_with_pin(pin, Some("nonce-DIFFERENT"));
         let err = res.expect_err("a mismatching launch nonce must be rejected");
-        assert!(err.to_string().contains("mismatch"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "session s-1 was relaunched: its launch nonce no longer matches expect_nonce; \
+             nothing was relayed"
+        );
     }
 
     #[test]
@@ -2022,7 +2129,10 @@ mod tests {
         };
         let res = dial_with_pin(pin, None);
         let err = res.expect_err("an unverifiable pin must fail closed");
-        assert!(err.to_string().contains("fail-closed"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "the remote has no session s-1; nothing was relayed"
+        );
     }
 
     /// A fake remote control server behind the listener: it answers `sessions
@@ -2114,8 +2224,7 @@ mod tests {
     /// THE LAUNCH-NONCE PIN, observed over the real wire: the dialer asks the
     /// remote's `sessions bridge` (the listener has already authenticated its
     /// control socket at Owner scope) and compares the pinned session's live
-    /// nonce. Before this, the observer returned nothing and EVERY configured
-    /// `expect_nonce` refused to dial. The roster exchange never reaches the
+    /// nonce. The roster exchange never reaches the
     /// driver's own client: the verb it sends after comes back alone.
     #[test]
     fn the_roster_observer_passes_a_live_pin_and_refuses_a_stale_one() {
@@ -2137,17 +2246,186 @@ mod tests {
         );
         // A relaunched session: its sid answers with a fresh nonce.
         let err = dial_roster(pin("s-b", "old0"), ROSTER).expect_err("a stale nonce");
-        assert!(err.to_string().contains("mismatch"), "{err}");
-        // A closed session: the remote reports no such sid, or no such nonce.
-        for p in [pin("s-gone", "bbbb"), pin("", "old0")] {
-            let err = dial_roster(p, ROSTER).expect_err("an unreported session");
-            assert!(err.to_string().contains("fail-closed"), "{err}");
-        }
-        // A remote that refuses the roster fails closed too.
-        let err = dial_roster(pin("s-b", "bbbb"), "ERR scope\n").expect_err("a refused roster");
         assert!(
-            err.to_string().contains("refused its session roster"),
+            err.to_string().starts_with("session s-b was relaunched"),
             "{err}"
         );
+        // A closed session: the remote reports no such sid, or no such nonce —
+        // each said as the case it is.
+        let err = dial_roster(pin("s-gone", "bbbb"), ROSTER).expect_err("an unreported sid");
+        assert_eq!(
+            err.to_string(),
+            "the remote has no session s-gone; nothing was relayed"
+        );
+        let err = dial_roster(pin("", "old0"), ROSTER).expect_err("an unreported nonce");
+        assert_eq!(
+            err.to_string(),
+            "no remote session carries expect_nonce (relaunched or closed); nothing was relayed"
+        );
+        // A remote that refuses the roster fails closed too.
+        let err = dial_roster(pin("s-b", "bbbb"), "ERR scope\n").expect_err("a refused roster");
+        assert_eq!(
+            err.to_string(),
+            "the remote refused `sessions bridge` (\"ERR scope\"), so expect_nonce cannot be \
+             checked; nothing was relayed"
+        );
+    }
+
+    /// THE LISTENER'S TRAIL names who connected and when: `serve` reports an
+    /// admitted dialer as it starts (not only when its relay ends), each event
+    /// carries the dialer's address, and a refused one says why in words — here a
+    /// wrong drive token, whose dialer hears a typed refusal.
+    #[test]
+    fn serve_names_each_peer_and_says_why_one_was_turned_away() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let token = EdgeToken::generate();
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = std::sync::mpsc::channel::<NetEvent>();
+        let server = std::thread::spawn({
+            let running = Arc::clone(&running);
+            move || {
+                serve(
+                    &listener,
+                    &scfg,
+                    move |_src, op| (op == "drive").then_some(token),
+                    || {
+                        let (a, b) = CtlStream::pair()?;
+                        spawn_echo(b);
+                        Ok(a)
+                    },
+                    &running,
+                    move |ev| {
+                        let _ = tx.send(ev);
+                    },
+                );
+            }
+        });
+        // A liveness bound, not a measurement.
+        let next = || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the listener reports the connection")
+        };
+
+        // A dialer holding the right token: admitted while it is still connected.
+        let (drv_local, drv_client) = CtlStream::pair().unwrap();
+        let driver = std::thread::spawn(move || {
+            dial_and_relay_pinned(
+                addr,
+                client_config(cert_fingerprint(TEST_CERT_DER)),
+                "dial",
+                "drive",
+                &token,
+                b"",
+                drv_local,
+                None,
+            )
+        });
+        let NetEvent::Admitted { peer, .. } = next() else {
+            panic!("the first event is the admission");
+        };
+        assert_eq!(peer.ip(), addr.ip(), "the event names the dialer's address");
+        drv_client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(drv_client);
+        driver.join().unwrap().ok();
+        match next() {
+            NetEvent::Closed { peer: closed, .. } => assert_eq!(closed, peer),
+            other => panic!("the relay's end is reported: {other:?}"),
+        }
+
+        // A dialer holding a wrong token: refused, and each end says so.
+        let (drv_local, _drv_client) = CtlStream::pair().unwrap();
+        let refused = dial_and_relay_pinned(
+            addr,
+            client_config(cert_fingerprint(TEST_CERT_DER)),
+            "dial",
+            "drive",
+            &EdgeToken::generate(),
+            b"",
+            drv_local,
+            None,
+        )
+        .expect_err("a wrong token is refused");
+        assert!(crate::is_token_refused(&refused), "{refused}");
+        match next() {
+            NetEvent::Refused { peer, reason } => {
+                assert_eq!(peer.ip(), addr.ip());
+                assert_eq!(reason, "wrong drive token");
+            }
+            other => panic!("the refusal is reported: {other:?}"),
+        }
+
+        running.store(false, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// An admitted dialer whose relay cannot start because THIS instance's
+    /// control socket is gone: the close names the local socket, never reads as
+    /// the peer's failure.
+    #[test]
+    fn an_unreachable_local_socket_is_said_as_this_instances() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let token = EdgeToken::generate();
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = std::sync::mpsc::channel::<NetEvent>();
+        let server = std::thread::spawn({
+            let running = Arc::clone(&running);
+            move || {
+                serve(
+                    &listener,
+                    &scfg,
+                    move |_src, op| (op == "drive").then_some(token),
+                    || {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "No such file or directory (os error 2)",
+                        ))
+                    },
+                    &running,
+                    move |ev| {
+                        let _ = tx.send(ev);
+                    },
+                );
+            }
+        });
+        // A liveness bound, not a measurement.
+        let next = || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the listener reports the connection")
+        };
+        let (drv_local, drv_client) = CtlStream::pair().unwrap();
+        let driver = std::thread::spawn(move || {
+            dial_and_relay_pinned(
+                addr,
+                client_config(cert_fingerprint(TEST_CERT_DER)),
+                "dial",
+                "drive",
+                &token,
+                b"",
+                drv_local,
+                None,
+            )
+        });
+        assert!(matches!(next(), NetEvent::Admitted { .. }));
+        match next() {
+            NetEvent::Closed {
+                error: Some(error), ..
+            } => assert_eq!(
+                error,
+                "could not reach this aterm's control socket: No such file or directory (os \
+                 error 2)"
+            ),
+            other => panic!("the failed relay is reported: {other:?}"),
+        }
+        // The failed relay may already have dropped its end of the pair, and a
+        // shutdown then answers ENOTCONN.
+        drv_client.shutdown(std::net::Shutdown::Both).ok();
+        drop(drv_client);
+        driver.join().unwrap().ok();
+        running.store(false, Ordering::Relaxed);
+        server.join().unwrap();
     }
 }

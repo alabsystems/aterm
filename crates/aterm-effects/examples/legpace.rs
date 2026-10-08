@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PER-LEG ANCHOR RESIDENCY AND MEAN STEP — the census finding 3 is judged on.
+//! Per-leg anchor residency and mean step of the rainbow walk.
 //!
-//! * a WALK PHASE is a cohort's own walk origin, `t0 = p/P/16`;
-//! * a PASS is the first sixteen cells, `d = 0..=16`, the cells a band shows;
-//! * a phase RESIDES on anchor `A` when some cell of its pass lands within
-//!   ten spectrum entries of `A` (`|arc − A| ≤ 10/510`) — the window under
-//!   which the shipped identity walk resides on every named anchor 62.7 % of
-//!   the time;
-//! * the STEP of a leg is the CIE-Lab distance between one cell and the next,
+//! * a walk phase is a cohort's own walk origin, `t0 = p/P/16`;
+//! * a pass is the first sixteen cells, `d = 0..=16`, the cells a band shows;
+//! * a phase resides on anchor `A` when some cell of its pass lands within
+//!   ten spectrum entries of `A` (`|arc − A| ≤ 10/510`);
+//! * the step of a leg is the CIE-Lab distance between one cell and the next,
 //!   over every phase, counted into the leg its midpoint sits in.
 use aterm_effects::rainbow_kitty::meteor::tri;
 use aterm_effects::rainbow_kitty::ribbon::{

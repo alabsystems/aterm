@@ -258,7 +258,7 @@ fn run_ty_check(ty: &PathBuf, spec: &std::path::Path, cfg: &std::path::Path) -> 
     // "No errors found (exhaustive)"). Every `ty check` in this workspace
     // arms the whole space through the one shared place.
     aterm_spec::verify::arm_whole_space_check(&mut cmd);
-    let out = cmd.output().expect("run ty check");
+    let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty check");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

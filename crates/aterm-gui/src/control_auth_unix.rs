@@ -72,28 +72,6 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// Atomically (re)point the `latest` symlink at this instance's socket:
-/// symlink to the RELATIVE sock filename under a temp name, then rename over
-/// the link, so a client never observes a missing link and the newest
-/// instance always wins. Best-effort: on failure clients can still target the
-/// instance socket directly (`aterm-ctl --pid`). The one implementation is
-/// [`aterm_uds::latest::publish`], shared with the Windows pointer-file twin.
-pub(crate) fn publish_latest_link(link: &Path, sock_path: &str) {
-    aterm_uds::latest::publish(link, sock_path);
-}
-
-/// Generate 32 random bytes and return them as a 64-char lowercase hex string,
-/// via the workspace's ONE audited entropy surface ([`aterm_uds::rand`]:
-/// `getentropy(2)` with a BOUNDED `/dev/urandom` `read_exact` fallback — never
-/// a hand-rolled device read, which is exactly the pattern that caused the
-/// 2026-07 kernel panics). Returns `None` when no entropy source is available;
-/// the caller MUST then refuse to start the socket rather than serve a
-/// guessable token (fail closed).
-#[must_use]
-pub(crate) fn random_token_hex() -> Option<String> {
-    aterm_uds::rand::hex_token::<32>().ok()
-}
-
 /// Provision the capability token: generate a fresh token, write it to
 /// `path` at mode `0600` (truncating any prior token), and return the hex
 /// string. The token rotates every launch — a leaked token from a prior run
@@ -103,7 +81,7 @@ pub(crate) fn random_token_hex() -> Option<String> {
 /// `None` here MUST make the caller skip binding the socket (fail closed).
 #[must_use]
 pub(crate) fn provision_token(path: &Path) -> Option<String> {
-    let token = random_token_hex()?;
+    let token = super::random_token_hex()?;
     // SEC-3: create the token EXCLUSIVELY and refuse to follow a symlink.
     // Remove any prior file first (a stale token from our own previous run, or
     // an attacker-planted file/symlink at this path), then `O_CREAT|O_EXCL|

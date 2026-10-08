@@ -1,160 +1,60 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PAINT CONFORMANCE — the shape matrix that pixel-checks the shipped binary.
+//! Paint conformance: the shape matrix that pixel-checks the shipped binary.
 //!
-//! Born from the 2026-08-24 blackout audit (docs/RELEASE-PROOF-DISCIPLINE.md):
-//! v0.48.0 and v0.49.0 shipped the rainbow cursor trail dark past green gates
-//! because every proof measured a different machine, screen or profile than the
-//! owner runs, and nothing in CI or the cut ever pixel-checked a shipped
-//! artifact. This suite closes the CI half: it launches a RELEASE-profile
-//! `aterm` HEADLESS, drives real keystrokes through the control
-//! socket, records the take with `ctl video … full pace`, and asserts on the
-//! pixels — through `tools/paint-conformance/paint_probe.sh`, the same driver
-//! and scanner the release cut's paint smoke uses, so the two gates cannot
-//! drift apart.
+//! Launches a release-profile `aterm` headless, drives real keystrokes through
+//! the control socket, captures the take, and asserts on the pixels through
+//! `tools/paint-conformance/paint_probe.sh`, the same driver and scanner the
+//! release cut's paint smoke uses (docs/RELEASE-PROOF-DISCIPLINE.md).
 //!
-//! THE MATRIX has 23 live-artifact rows plus the scanner's own semantic
-//! negative controls. It covers prompt, fake-Claude, ESC7/ESC8 streamer and
-//! cold-output shapes; a single pane and a two-pane split (row 12 and its
-//! off twin, the composed path); pinned video and unpinned focused/unfocused images;
-//! shipped-default resident pet, earned flying cat and owner-spelling overlap;
-//! and four matched typed `off` twins. Those off twins preserve cursor/text
-//! deltas while requiring zero ribbon geometry and a quiet effect ledger, so a
-//! cursor, glyph or resident animal cannot satisfy the positive classifier.
+//! The matrix has 23 live-artifact rows plus the scanner's semantic negative
+//! controls: prompt, fake-Claude, ESC7/ESC8 streamer and cold-output shapes; a
+//! single pane and a two-pane split (row 12 and its off twin); pinned video and
+//! unpinned focused/unfocused images; the default resident pet, the earned
+//! flying cat and the owner-spelling overlap; and four matched typed `off`
+//! twins, which keep cursor/text deltas while requiring zero ribbon geometry
+//! and a quiet effect ledger.
 //!
-//! The companion rows close a different false-green class. Trail-only rows pin
-//! the companion-free `flying` style; companion rows pin their explicit style
-//! and pair every `ctl image` with the
-//! engine's exact `trail status`, then demand BOTH the semantic claim and a
-//! tall foreground connected component in that captured frame. A live pet/cat
-//! state with an omitted sprite fails; rainbow ink with no animal also fails.
+//! Trail-only rows pin the companion-free `flying` style. Companion rows pin
+//! their style, pair every `ctl image` with the engine's `trail status`, and
+//! demand both the semantic claim and a tall foreground component in that
+//! frame, so neither a live state with no sprite nor rainbow ink with no animal
+//! passes.
 //!
-//! WHY ROWS 5 AND 6 EXIST — THE OBSERVER RULE (docs/RELEASE-PROOF-DISCIPLINE.md).
-//! Rows 1-4 drive `ctl video`, and an in-flight recording PINS the motion-focus
-//! input for the recorded window (`App::motion_focus` = `focused || this window
-//! is being recorded`). So those rows animate the cursor effects even when the
-//! gate they depend on is broken. That is not hypothetical: it is how v0.48-v0.50
-//! shipped the trail dark past this very matrix — the instrument healed the bug
-//! it was sent to find. A second healer sat behind it: a `--headless` window
-//! seeds `focused: true` and only a real `WindowEvent::Focused` corrects it, so
-//! even an unrecorded headless take was a FOCUSED take.
+//! The observer rule: an in-flight `ctl video` recording pins the motion-focus
+//! input (`App::motion_focus` = `focused || this window is being recorded`),
+//! and a `--headless` window starts `focused: true`. Rows 1-4 therefore cannot
+//! catch a broken motion gate. Rows 5 and 6 remove both: `--capture image`
+//! takes a burst of `ctl image` renders (no recording) and `--focus out` goes
+//! through the same `App::on_focus` the OS event calls, while control-socket
+//! typing keeps driving the window. With the `cursor_fx_focus` typed-wake term
+//! removed, only that arm goes red.
 //!
-//! Rows 5 and 6 remove both. `--capture image` takes a BURST of `ctl image`
-//! captures — a queued render, no recording, `motion_focus` untouched — and
-//! `--focus out` routes through the same `App::on_focus` the OS event calls, so
-//! `WindowState::focused` is genuinely false while control-socket typing (which
-//! never grants OS key focus) keeps driving the window. That is the owner's real
-//! shape, and it is the only row in this file that can go red for the reason the
-//! file exists.
+//! Row 5's discriminator is hue spread, not pixel count: an unfocused typed
+//! window still moves a saturated block cursor and echoes glyphs, but only the
+//! rainbow trail spreads ink across the hue wheel.
 //!
-//! PROVEN RED, 2026-08-24. HEAD's `cursor_fx_focus` typed-wake term was removed
-//! in a scratch worktree (the v0.48-v0.50 blackout, reproduced) and the RELEASE
-//! binary rebuilt there; the healthy arm is the SAME worktree restored and
-//! rebuilt, so the two binaries differ in that term and nothing else.
+//! Ink means dynamic saturated pixels: saturated and changed against frame 0
+//! (static syntax colour is unchanged; echoed glyphs are unsaturated). The
+//! probe's thresholds: ≥150 such px across the take in ≥4 of 12 hue buckets.
+//! The typed rows use [`MATURE_RUN`]'s 29 keys, where healthy takes sit far
+//! above both floors and the controls stay near zero.
 //!
-//!   row 2's shape, `ctl video` (pinned)      broken: total_ink=4930 hues=9 PASS
-//!   row 5's shape, unpinned but still FOCUSED broken: total_ink=1100 hues=9 PASS
-//!   row 5's shape, unpinned AND unfocused     broken: total_ink=1470 hues=1 FAIL
-//!   row 5's shape, unpinned AND unfocused    healthy: total_ink=1553 hues=9 PASS
-//!   row 6's shape (control)                  healthy: total_ink<=196 hues=1 PASS
+//! The merge gate's test run skips every `measuring::…` test
+//! (`aterm_verify::stages::MEASURING_TESTS`); they are the MEASURE tier
+//! (`tools/verify.sh --measure`, `--full`), run alone in the exclusive
+//! `measuring tests` stage, and a release cut requires them green. A probe
+//! that decides nothing (exit 2, or paint's unproved exit 3) is recorded as
+//! COULD NOT RUN, never as a finding or as green.
 //!
-//! The first line is the blindness itself, measured: the gate that exists to
-//! catch this bug passed the bug. The second is the second healer, measured.
-//! Only the third arm — both healers removed — goes red.
-//!
-//! Note what the discriminator is in row 5: HUE SPREAD, not raw pixel count.
-//! An unfocused typed window still moves a saturated block cursor and echoes
-//! glyphs, and that lands ~1500 single-hue dynamic-saturated px in the take
-//! whether or not the trail paints. The RAINBOW trail is what spreads ink
-//! across the hue wheel — 9 of 12 buckets healthy, 1 dark — so row 5 is gated
-//! on `--min-hues` with a floor of 4 sitting between the two arms with margin
-//! on both sides.
-//!
-//! INK means dynamic saturated pixels: saturated AND changing against frame 0
-//! (static syntax color is saturated but byte-identical; echoed monochrome
-//! glyphs change but are unsaturated; only an effect is both). The thresholds
-//! live in the probe: ≥150 dynamic saturated px across ≥4 of 12 hue buckets.
-//! Re-measured 2026-08-24 across this whole matrix on a healthy HEAD (RELEASE
-//! profile, headless 584x350) — a stale calibration is a lie the next reader
-//! inherits, so these are the numbers the rows actually produced:
-//!
-//!   rows 1-4, capture=video   129-177 frames  total_ink 3856-5788  hues 8-10
-//!   row 5,    capture=image        29 frames  total_ink 1425-1553  hues 9
-//!   row 3,    the dark control     31 frames  total_ink 0
-//!   row 6,    the quiet control    25 frames  total_ink 0-196      hues 0-1
-//!
-//! The busiest SINGLE frame ran 98-136 px on every ink arm under the retired
-//! traverse, which is why the ≥150 floor gates the TAKE and not a frame.
-//!
-//! RE-MEASURED 2026-08-30, after the per-mark traverse shipped and the typed
-//! rows moved to [`MATURE_RUN`]'s 29 keys (shipped dist binary, same headless
-//! 584x350) — those 2026-08-24 lines above describe the fixed-40-cell
-//! traverse at 10-11 keys and are kept as history, not calibration:
-//!
-//!   rows 1/2/4, capture=video  246-250 frames  total_ink 35,162-46,827
-//!                              union_hues 11   driven_dark_us=0
-//!                              mature_lead_us 120-159k (the pre-glass lead;
-//!                              the 158,126 outlier is the merged tree's 3x
-//!                              sweep — still 3x under the probe's 500 ms
-//!                              MATURE_LEAD_MAX_US ceiling)
-//!   rows 5/6a/6b, image        67 frames       total_ink 9,698-9,765
-//!                              union_hues 11   ribbon_window_hues 11
-//!                              ribbon_bound 43 ribbon_dark 0
-//!
-//! best_ink (the busiest single frame) now runs 220-482 on the ink arms — the
-//! longer run stacks more concurrent sparks — so the 150 take-floor sits far
-//! under every healthy arm on both axes, and the controls still measure 0-766
-//! total with 0-3 hue buckets (the pet's coat, when one is minted saturated).
-//!
-//! WIRING: the merge gate (`tools/verify.sh`) runs this matrix in its exclusive
-//! `measuring tests` stage. The fingerprinted `tools/paint_guard.sh` that once
-//! ran it from `gate lint`'s guards lane, which nothing ran automatically, was
-//! deleted on 2026-09-27.
-//!
-//! RUNTIME, and why it moved: the probe's whole-run watchdog used to sleep out
-//! the full `--budget` and be killed on exit, which orphaned its `sleep` — and
-//! the orphan kept the probe's stdout/stderr open, so `Command::output()`
-//! below did not RETURN until the budget elapsed no matter how fast the row
-//! decided. Every row cost its 180 s budget; this file's four rows cost ~12
-//! min of pure waiting. The watchdog now retires itself off a sentinel.
-//! MEASURED 2026-08-24 after the watchdog fix: the historical SIX-row matrix,
-//! serialized against the release binary, `finished in 47.69s`. The four-row
-//! matrix it replaced could not finish in under 720 s (4 x its own 180 s
-//! budget) no matter how fast the rows decided. Rows 7 and 8 are bounded image
-//! bursts (36 and 108 frames respectively), not additional five-second videos.
-//!
-//! macOS-ONLY LANE, honestly: the scanner decodes frames by shelling to
-//! `sips`, and the artifact under judgment is the macOS bundle's binary, so the
-//! whole file is `#![cfg(target_os = "macos")]` and this target holds no tests
-//! elsewhere. The matrix runs on the mac that cuts releases, in the merge
-//! gate's measuring stage and the release smoke.
-//!
-//! QUIET-MACHINE LANE, too: the video rows audit a real-time pipeline, and
-//! one sweep run beside a full workspace compile charged row 1 with a
-//! 35,264 us rendered gap (normal sampling hole — the band, not the capture,
-//! went dark) that ten deliberate CPU/memory-load re-creations could not
-//! reproduce. Run verdict-bearing sweeps with no parallel builds, and re-run
-//! any charged video row on a quiet machine with `ATERM_PAINT_KEEP=1` before
-//! believing or dismissing it — the probe header's LOAD SENSITIVITY note
-//! carries the measurements.
-//!
-//! The binary under test is RELEASE profile (audit rule 1: parts of the old
-//! proof ran debug binaries). Without `ATERM_PAINT_BIN`, the shared conformance
-//! helper freshens `target/conformance-release/release/aterm`; its dedicated
-//! target avoids feature-thrashing the outer integration-test build and is
-//! reused by the spin matrix. The override drives a specific artifact.
-//!
-//! THE TESTS LIVE IN `measuring` (2026-09-23). Every row times frames on a live window,
-//! so a busy machine can turn one red without the code changing.
-//! The merge gate's test run skips every test named `measuring::…`
-//! (`aterm_verify::stages::MEASURING_TESTS`), and since 2026-09-26 they are the
-//! gate's MEASURE tier (`tools/verify.sh --measure`, `--full`), which runs them
-//! ALONE in its exclusive `measuring tests` stage — the merge contract does
-//! not, and a release cut requires them green for the tree it cuts. A probe
-//! that decides nothing (exit 2, and paint's unproved exit 3) is recorded as
-//! COULD NOT RUN, never as a finding and never as green. `targo test` by hand
-//! still runs them.
+//! macOS only: the scanner decodes frames with `sips` and the artifact is the
+//! macOS bundle's binary. The video rows audit a real-time pipeline, so
+//! verdict-bearing runs want a quiet machine; re-run a charged video row with
+//! `ATERM_PAINT_KEEP=1` before believing or dismissing it (the probe header's
+//! LOAD sensitivity note). The binary is release profile, handed over in
+//! `ATERM_PAINT_BIN`; without it a row says `not measured`
+//! (`support::release_bin`).
 #![cfg(target_os = "macos")]
 
 mod support;

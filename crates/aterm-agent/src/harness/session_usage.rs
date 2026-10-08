@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! THIS SESSION'S USAGE (owner function 2, 2026-09-25): what the Claude Code
-//! footer's `Σ` segment and its limit wall show ([`super::footer`]) and what
-//! `aterm harness usage` prints ([`super::cli`]) — ONE implementation for
+//! footer's `Σ` segment (one merged total, shown unless `[claude_footer] usage
+//! = false`) and its limit wall show ([`super::footer`]) and what `aterm
+//! harness usage` prints, per model ([`super::cli`]) — ONE implementation for
 //! both, read from the session's own FILES and nothing else. Nothing is read
 //! off the screen. The footer keeps one [`SessionUsage`] per watched session
 //! (`footer::FooterCache`), beside the transcript-tail memo it keeps per
@@ -27,13 +28,23 @@
 //!   measurement) — and a line is folded only once its newline is written.
 //!   Files that cannot be counted are said ([`Refresh::unread`]), never
 //!   silently left out of a total that calls itself complete.
+//! * **RUNTIME — the time Claude was working.** The union of the MAIN
+//!   transcript's finished turns, each `[timestamp − durationMs, timestamp]`
+//!   of the `turn_duration` row Claude Code writes at its end
+//!   ([`TranscriptUsage::busy_ms`], [`SessionUsage::busy_ms`]), carried as
+//!   [`UsageFacts::runtime`] once the fold caught up — `Σ 7h52m ↑395M ↓2.0M`.
+//!   Not the durations' sum (a workflow's turn overlaps the turns after it),
+//!   not the first-to-last span (mostly idle), not the `cost-state` API time
+//!   (written only at exit, with no timestamp). Subagent files add nothing
+//!   to it (measured: 0.00h and 0.13h outside the main turns in two long
+//!   sessions).
 //! * **THE LIMIT WALL — the one account figure.** Claude Code writes a limit
 //!   it hit into the transcript as a row of its own (`isApiErrorMessage`,
 //!   `You've hit your session limit · resets 3pm (…)`, its own `timestamp`;
 //!   [`super::usage::LimitNoticeRow`]). The newest such row in the MAIN
 //!   transcript, its reset placed from the row's time in real time
 //!   ([`wall_of`]), is shown while that reset is ahead and nothing has been
-//!   served since — `5h limit · resets 3pm` — and not at all once it has
+//!   served since — `5h ♻ 3pm` — and not at all once it has
 //!   passed, once a response is served after it in ANY of the session's
 //!   files (`/limit-reset`; the limit is the account's, so a workflow's
 //!   subagent served counts — [`SessionUsage::served_at`]), or when it
@@ -52,7 +63,15 @@
 //! notice row's shape (`isApiErrorMessage`, `<synthetic>`, the text, the
 //! `timestamp`), the `subagents/**/agent-*.jsonl` layout and the streamed
 //! usage growth were MEASURED on Claude Code 2.1.283; no vendor-corpus
-//! fixture carries a limit-notice transcript row yet.
+//! fixture carries a limit-notice transcript row yet. The `turn_duration`
+//! row (`durationMs`, `timestamp`, `isSidechain`) was MEASURED in real
+//! transcripts of 2.1.282, 2.1.283, 2.1.284 and 2.1.286 (528 of 548 prompted
+//! turns in the 150 newest here carry one). KNOWN UNDERCOUNT, read in the
+//! 2.1.286 bundle: the row is appended only `if (… && !signal.aborted)`, so a
+//! turn interrupted with Esc writes none, and a turn in flight when the
+//! process ends (a relaunch, a crash) never reaches its end — both turns'
+//! time is lost. Its paused time (a permission dialog) is subtracted from
+//! `durationMs` by the vendor, so a turn's span starts that much late.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -70,23 +89,10 @@ const READ_CHUNK: usize = 64 * 1024;
 /// of a torn last line ([`TranscriptCursor::advance`]).
 const PENDING_KEEP: usize = 1024 * 1024;
 
-/// The most subagent transcripts one session's fold follows. Every file
-/// followed keeps a cursor for the fold's life; past this bound every NEW
-/// file — the running subagents included — is left and counted
-/// ([`Refresh::unread`]). Within the one read that crosses it, the newest
-/// are admitted first.
-///
-/// THE CEILING, per session. A cursor at rest was MEASURED 2026-09-26 with a
-/// counting allocator (release, 16 messages per file, realistic paths) at
-/// about 5.4 KB while its file may still grow (its [`FINISHED_IDS_KEPT`]
-/// newest ids kept) and about 2.6 KB once it has been still for
-/// [`QUIET_AFTER`] (ids released). So, by arithmetic, at most about 11 MB
-/// per session with every followed file recent, about 5.3 MB once they are
-/// all quiet — one such fold per session the window's footer resolver
-/// WATCHES, released when the session leaves that watch (ten minutes after
-/// it was last asked for, unless a limit wall keeps it) or its tab closes;
-/// no other bound caps how many are held. MEASURED 2026-09-25: one real
-/// session had 551 subagent files, another 399.
+/// The most subagent transcripts one session's fold follows; past it every new
+/// file is left and counted ([`Refresh::unread`]), newest admitted first. A
+/// cursor costs about 5 KB while its file grows and 2.6 KB once quiet, so at
+/// most about 11 MB per session.
 pub const MAX_SUBAGENT_FILES: usize = 2048;
 
 /// A subagent file unchanged this long (by its mtime) RELEASES its message
@@ -104,12 +110,13 @@ const MAX_SUBAGENT_ENTRIES: usize = 16_384;
 /// a workflow's under `workflows/<run>/`.
 const MAX_SUBAGENT_DEPTH: usize = 4;
 
-/// The models the footer names; the rest are counted (`+2`).
-pub const FOOTER_MODELS: usize = 3;
+/// The models `aterm harness usage` names; the rest are counted (`+2`).
+/// The footer names none: its `Σ` sums every model ([`UsageGrain::Total`]).
+pub const NAMED_MODELS: usize = 3;
 
-/// The message ids a FINISHED subagent file keeps until it has been quiet
-/// [`QUIET_AFTER`]: the newest few, so a message still streaming when the
-/// file paused is raised, not counted again, if it grows once more.
+/// The message ids a finished subagent file keeps until quiet for
+/// [`QUIET_AFTER`]: the newest few, so a message still streaming when the file
+/// paused is raised, not counted again, if it grows.
 pub const FINISHED_IDS_KEPT: usize = 16;
 
 // ---------------------------------------------------------------------------
@@ -176,16 +183,15 @@ pub struct Advance {
     /// Whether the file was found shrunk, replaced or rewritten, and the
     /// fold started over from its first byte.
     pub restarted: bool,
-    /// Whether the file was found changed other than by an append AFTER its
-    /// message ids were released ([`TranscriptCursor::release`]): nothing
-    /// was read or restarted — its totals stand, and it is unread.
+    /// Whether the file changed other than by an append after its message ids
+    /// were released ([`TranscriptCursor::release`]): nothing was read or
+    /// restarted; its totals stand, and it is unread.
     pub rewritten: bool,
 }
 
-/// One transcript file folded INCREMENTALLY: the byte offset reached, the
-/// running [`TranscriptUsage`], and the torn last line still waiting for its
-/// newline. Each [`Self::advance`] reads only what was appended since the
-/// last one.
+/// One transcript file folded incrementally: the byte offset reached, the
+/// running [`TranscriptUsage`], and a torn last line awaiting its newline.
+/// Each [`Self::advance`] reads only what was appended since the last.
 #[derive(Debug, Clone)]
 pub struct TranscriptCursor {
     path: PathBuf,
@@ -201,8 +207,7 @@ pub struct TranscriptCursor {
     /// their newline is written. Only those bytes are held between reads.
     pending: Vec<u8>,
     /// The pending line passed [`MAX_LINE_BYTES`]: its bytes are discarded
-    /// up to its newline, and it is counted as skipped, as
-    /// [`TranscriptUsage::fold_reader`] does.
+    /// up to its newline, and it is counted as skipped, never held.
     overflow: bool,
     fold: TranscriptUsage,
     /// The file as the last read found it: unchanged, it is not opened.
@@ -242,14 +247,12 @@ impl TranscriptCursor {
         }
     }
 
-    /// Release a FINISHED file's message ids: its totals are all a view
-    /// needs. From here only a plain append (same inode, from the size
-    /// reached, the boundary byte in place) is read on; any other change
-    /// cannot be told apart from what was summed, and is `rewritten` —
-    /// counted unread, never re-read from its first byte. The BOUND, stated:
-    /// a rewrite in place that leaves the file at least as long and the
-    /// byte the fold stopped after where it was cannot be seen at all, by
-    /// this rule or the boundary check before it.
+    /// Release a finished file's message ids (its totals are all a view
+    /// needs). From here only a plain append (same inode, from the size
+    /// reached, the boundary byte in place) is read; any other change is
+    /// `rewritten`, counted unread, never re-read from the start. A rewrite in
+    /// place that keeps the file at least as long and the boundary byte where
+    /// it was cannot be seen.
     fn release(&mut self) {
         self.fold.shed_seen(0);
         self.released = true;
@@ -298,26 +301,18 @@ impl TranscriptCursor {
         self.restarts = self.restarts.saturating_add(1);
     }
 
-    /// Read what the file has appended since the last call, at most `budget`
-    /// bytes of it, and fold every line it completes.
+    /// Read what the file appended since the last call, at most `budget` bytes,
+    /// and fold every line it completes.
     ///
-    /// A file whose size, mtime and inode are what the last read left, read
-    /// to its end, is not opened at all (one `stat`). Otherwise only a
-    /// REGULAR file is read, opened non-blocking (a FIFO planted where a
-    /// transcript should be cannot park the caller). The fold starts over
-    /// when the file is shorter than the offset reached (truncated), is a
-    /// different file (rotated: another inode at the path), or no longer
-    /// holds the byte the fold stopped after (rewritten in place — the one
-    /// byte of that check is read, and counted, on every read that opens the
-    /// file past its start) — unless its ids were RELEASED, when such a change
-    /// is `rewritten` instead: nothing read, nothing restarted. What is held
-    /// between reads is the fold and the bytes of a torn last line — no line
-    /// buffer.
+    /// An unchanged file (size, mtime, inode) is not opened; only a regular
+    /// file is read, non-blocking. The fold starts over when the file was
+    /// truncated, rotated or rewritten (the byte before the offset changed),
+    /// unless its ids were released, when the change is `rewritten` instead.
     ///
     /// # Errors
     ///
-    /// The file cannot be opened or read; what was folded before the error
-    /// is kept, and the offset is exactly what was consumed.
+    /// The file cannot be opened or read; what was folded before the error is
+    /// kept, and the offset is exactly what was consumed.
     pub fn advance(&mut self, budget: u64) -> io::Result<Advance> {
         if let Ok(meta) = std::fs::metadata(&self.path)
             && self.unchanged(&meta)
@@ -452,10 +447,9 @@ pub struct Refresh {
     /// Whether every file FOLLOWED has been read to its end — the totals are
     /// not a mid-read prefix. What is not followed is [`Self::unread`].
     pub caught_up: bool,
-    /// Subagent transcripts that exist with rows NOT in the totals, each
-    /// counted once: not readable now; new past [`MAX_SUBAGENT_FILES`]
-    /// followed; or changed other than by an append after its ids were
-    /// released (its earlier totals stand; what it holds now is not read).
+    /// Subagent transcripts that exist with rows not in the totals, each
+    /// counted once: unreadable, past [`MAX_SUBAGENT_FILES`], or changed other
+    /// than by an append after its ids were released.
     pub unread: usize,
     /// The subagent walk stopped at its entry bound: more files may exist
     /// than were seen, and none of those is counted.
@@ -466,7 +460,7 @@ pub struct Refresh {
 }
 
 impl Refresh {
-    /// Whether the totals are the WHOLE session's: caught up, nothing
+    /// Whether the totals are the whole session's: caught up, nothing
     /// unread, the walk whole.
     #[must_use]
     pub fn complete(&self) -> bool {
@@ -560,18 +554,13 @@ impl SessionUsage {
         Some(path.parent()?.join(path.file_stem()?).join("subagents"))
     }
 
-    /// Whether a refresh now could find anything the last one did not: the
-    /// last one did not catch up and did read something (a fold that could
-    /// not move on is left to a change or the slower clock); the transcript
-    /// moved (size, mtime or inode); a directory the walk visited changed —
-    /// a new subagent file, at ANY depth (`subagents/workflows/<run>/`), or a
-    /// new run's directory; or any followed subagent file changed since its
-    /// last read — EVERY one, not the most recently written few: an agent in
-    /// a long tool call is the least recently written, and its final message
-    /// is what would be missed. `stat`s only, one per followed file (at most
-    /// [`MAX_SUBAGENT_FILES`]; a frozen, rewritten file is not asked again,
-    /// and one no longer there has nothing to read): nothing is opened and
-    /// nothing is walked.
+    /// Whether a refresh now could find anything the last one did not: the last
+    /// one did not catch up and did read something; the transcript moved (size,
+    /// mtime or inode); a directory the walk visited changed (a new subagent
+    /// file at any depth, or a new run's directory); or any followed subagent
+    /// file changed since its last read (every one: an agent in a long tool
+    /// call is the least recently written). `stat`s only, one per followed file
+    /// (at most [`MAX_SUBAGENT_FILES`]); nothing is opened or walked.
     #[must_use]
     pub fn moved(&self) -> bool {
         (!self.caught_up && self.progressed)
@@ -587,20 +576,14 @@ impl SessionUsage {
                 .any(|cursor| stamp_of(cursor.path()).is_some_and(|now| Some(now) != cursor.seen))
     }
 
-    /// Read what every file of the session appended since the last call —
-    /// the transcript first, then each subagent transcript — at most
-    /// `budget` bytes over all of them. A file whose size, mtime and inode
-    /// have not moved is not opened, and once the budget is spent no file is
-    /// opened at all; one walk of the subagent directory, one `lstat` per
-    /// entry.
+    /// Read what every file of the session appended since the last call (the
+    /// transcript first, then each subagent transcript), at most `budget` bytes
+    /// over all of them. Unchanged files are not opened; one directory walk.
     ///
-    /// A subagent file seen for the first time is admitted — newest first
-    /// among this read's new files — while fewer than [`MAX_SUBAGENT_FILES`]
-    /// are followed, and only if it can be read now; a followed file is never
-    /// dropped. What is not in the totals is [`Refresh::unread`]: a file past
-    /// the bound (from then on every new one), one that cannot be read, one
-    /// rewritten after its ids were released. A file still new when the
-    /// budget ran out is not admitted, and the read is not caught up.
+    /// A new subagent file is admitted (newest first) while fewer than
+    /// [`MAX_SUBAGENT_FILES`] are followed and it is readable; a followed file
+    /// is never dropped. A file still new when the budget ran out is not
+    /// admitted, and the read is not caught up.
     pub fn refresh(&mut self, budget: u64) -> Refresh {
         let mut left = budget;
         let mut caught_up = match self.main.advance(left) {
@@ -690,17 +673,24 @@ impl SessionUsage {
             .sum()
     }
 
-    /// Unix seconds of the newest response the API served in ANY of the
-    /// session's files ([`TranscriptUsage::served_at`]): the limit is the
-    /// account's, so a background workflow's subagent served after a notice
-    /// in the main transcript is as much a response served since as the main
-    /// thread's own.
+    /// Unix seconds of the newest response the API served in any of the
+    /// session's files ([`TranscriptUsage::served_at`]); the limit is the
+    /// account's, so a subagent's response counts as much as the main thread's.
     #[must_use]
     pub fn served_at(&self) -> Option<i64> {
         std::iter::once(&self.main)
             .chain(self.subagents.values())
             .filter_map(|cursor| cursor.fold().served_at())
             .max()
+    }
+
+    /// Milliseconds Claude was working in this conversation: its MAIN
+    /// transcript's finished turns ([`TranscriptUsage::busy_ms`]). Subagent
+    /// files are not read for it: their turns run inside the main chain's
+    /// (MEASURED on two long sessions, 0.00h and 0.13h outside them).
+    #[must_use]
+    pub fn busy_ms(&self) -> u64 {
+        self.main.fold().busy_ms()
     }
 
     /// The session's fold: every file's spend per model and its row counters,
@@ -787,31 +777,21 @@ pub struct Wall {
     /// `5h` or `7d`.
     pub label: &'static str,
     /// The reset as the notice printed it — `3pm`, `Oct 1 at 9am` — its
-    /// `(zone)` left off only where that zone's clock IS the local one at
+    /// `(zone)` left off only where that zone's clock is the local one at
     /// the reset (`10pm (UTC)` stays so on a Pacific machine); a span
     /// (`in 3h`, counted from the notice) as the local clock time it names.
     pub resets: String,
 }
 
-/// The wall `rows` (the newest limit-notice row per window, from the MAIN
-/// transcript's fold) shows at `now`: the NEWEST row's, while its reset is
-/// still ahead and nothing has been served since.
+/// The wall `rows` (the newest limit-notice row per window, from the main
+/// transcript's fold) shows at `now`: the newest row's, while its reset is
+/// ahead and nothing has been served since.
 ///
-/// * PLACED from the row's own time by the one reset parser
-///   (`supervise::limit::reset_in_zone`) in REAL time: `offset_at(zone, t)`
-///   is the notice's zone's offset at the instant `t` (`None`: the local
-///   zone's), so a daylight-saving jump between the notice and its reset
-///   lands where the zone's clock shows it. The five-hour window's bare
-///   clock time is at most five real hours ahead; any other window's is its
-///   NEXT occurrence — the vendor prints no date only when the reset is
-///   under a day away (MEASURED, 2.1.283's time formatter prints the date
-///   past 24 hours), so a weekly `9am` written at 14:00 is the next day's.
-///   A reset that cannot be placed — its zone unknown here, an offset that
-///   cannot be read — shows nothing: never a guess.
-/// * SERVED SINCE: `served_at` ([`TranscriptUsage::served_at`]) after the
-///   row is a response the API served after the wall — `/limit-reset`,
-///   extra usage, another account — so the wall no longer blocks and is not
-///   shown. It can only hide a wall, never show one.
+/// The reset is placed from the row's own time by
+/// `supervise::limit::reset_in_zone`, with `offset_at(zone, t)` giving the
+/// zone's offset (`None`: local); the five-hour window's bare clock time is at
+/// most five hours ahead, any other window's is its next occurrence. A reset
+/// that cannot be placed shows nothing. A `served_at` after the row hides it.
 #[must_use]
 pub fn wall_of(
     rows: &BTreeMap<String, LimitNoticeRow>,
@@ -878,10 +858,10 @@ fn local_clock(unix: i64, offset: i64, now: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The footer's facts and its one segment
+// The usage facts: the footer's merged `Σ`, `aterm harness usage`'s per model
 // ---------------------------------------------------------------------------
 
-/// One model's tokens in this session, as the footer names them.
+/// One model's tokens in this session, as `aterm harness usage` names them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelTokens {
     /// The model's short name (`opus`; `opus5.5` beside an `opus5`).
@@ -893,45 +873,96 @@ pub struct ModelTokens {
     pub output: u64,
 }
 
-/// What the footer's `Σ` segment says.
+/// The models past [`NAMED_MODELS`]: how many, and their tokens — counted
+/// (`+2`) where the models are named ([`UsageGrain::PerModel`]), summed in
+/// where they are merged ([`UsageGrain::Total`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct More {
+    /// How many models.
+    pub models: usize,
+    /// Their input tokens, as [`ModelTokens::input`] counts them.
+    pub input: u64,
+    /// Their output tokens.
+    pub output: u64,
+}
+
+/// What a `Σ` says: the footer's segment, `aterm harness usage`'s line.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct UsageFacts {
     /// This session's tokens per model, most first, at most
-    /// [`FOOTER_MODELS`] of them. LIVE: folded from its transcripts.
+    /// [`NAMED_MODELS`] of them. LIVE: folded from its transcripts.
     pub models: Vec<ModelTokens>,
-    /// Models past [`FOOTER_MODELS`], counted.
-    pub more_models: usize,
+    /// The models past [`NAMED_MODELS`].
+    pub more: More,
     /// Subagent transcripts NOT in these totals ([`Refresh::unread`]).
     pub unread: usize,
     /// More files may exist than were seen ([`Refresh::walk_cut`]).
     pub unread_more: bool,
     /// The limit wall still standing, from the transcript ([`wall_of`]).
     pub wall: Option<Wall>,
+    /// Seconds Claude was WORKING in this conversation: the union of its main
+    /// transcript's finished turns ([`TranscriptUsage::busy_ms`]); `None`
+    /// before a turn ends, or before the fold caught up ([`Self::with_runtime`]).
+    pub runtime: Option<u64>,
 }
 
 impl UsageFacts {
     /// The facts — the tokens, the wall, and what `left_out` (the refresh
     /// that folded them) left out of the totals, said whether or not any
-    /// tokens are shown yet — or `None` when there is nothing to show.
+    /// tokens are shown yet — or `None` when there is nothing to show. No
+    /// runtime: [`Self::with_runtime`] adds it.
     #[must_use]
     pub fn of(
-        models: (Vec<ModelTokens>, usize),
+        models: (Vec<ModelTokens>, More),
         wall: Option<Wall>,
         left_out: Option<&Refresh>,
     ) -> Option<Self> {
-        let (models, more_models) = models;
+        let (models, more) = models;
         let (unread, unread_more) = left_out.map_or((0, false), |r| (r.unread, r.walk_cut));
         (!models.is_empty() || wall.is_some() || unread > 0 || unread_more).then_some(Self {
             models,
-            more_models,
+            more,
             unread,
             unread_more,
             wall,
+            runtime: None,
         })
+    }
+
+    /// These facts with Claude's working time: `busy_ms` (the main
+    /// transcript's [`SessionUsage::busy_ms`]) in whole seconds, never
+    /// rounded up; none for `0` (no turn has ended).
+    #[must_use]
+    pub fn with_runtime(mut self, busy_ms: u64) -> Self {
+        self.runtime = (busy_ms >= 1000).then_some(busy_ms / 1000);
+        self
+    }
+
+    /// Whether these facts carry anything of the `Σ` segment's — what
+    /// [`Self::wall_only`] takes out.
+    #[must_use]
+    pub fn says_usage(&self) -> bool {
+        !self.models.is_empty()
+            || self.more.models > 0
+            || self.unread > 0
+            || self.unread_more
+            || self.runtime.is_some()
+    }
+
+    /// These facts with the `Σ` segment's part taken out — no tokens, no
+    /// unread count — and only the limit wall kept: what the footer shows
+    /// with `[claude_footer] usage = false`. `None` when no wall stands. The
+    /// fold behind them keeps running: the wall is read from it.
+    #[must_use]
+    pub fn wall_only(self) -> Option<Self> {
+        if !self.says_usage() {
+            return Some(self);
+        }
+        Self::of((Vec::new(), More::default()), self.wall, None)
     }
 }
 
-/// A model id's footer name: its family (`claude-opus-5-5` → `opus`), or,
+/// A model id's short name in `aterm harness usage`: its family (`claude-opus-5-5` → `opus`), or,
 /// when `family_shared`, the family with its version (`opus5.5`). Letters,
 /// digits and `.` only, at most 16 of them — a transcript is text another
 /// program wrote, and this ends up in a chrome row.
@@ -979,13 +1010,14 @@ fn model_of_route(id: &str) -> &str {
     }
 }
 
-/// The session's spend as the footer's per-model tokens: models with no
-/// tokens dropped, one label per family (the version added only where two
-/// models share a family; ids that still share a label — one model reached
-/// by two routes, [`model_of_route`] — are summed), most tokens first, the
-/// first [`FOOTER_MODELS`] named and the rest counted.
+/// The session's spend per model, what every [`UsageGrain`] reads (the
+/// footer's merges it): models with no tokens dropped, one label per family
+/// (the version added only where two models share a family; ids that still
+/// share a label — one model reached by two routes, [`model_of_route`] —
+/// are summed), most tokens first, the first [`NAMED_MODELS`] named and the
+/// rest gathered in [`More`].
 #[must_use]
-pub fn model_tokens(per_model: &BTreeMap<String, ModelSpend>) -> (Vec<ModelTokens>, usize) {
+pub fn model_tokens(per_model: &BTreeMap<String, ModelSpend>) -> (Vec<ModelTokens>, More) {
     let live: Vec<(&str, &ModelSpend)> = per_model
         .iter()
         .filter(|(_, s)| (s.input | s.output | s.cache_write | s.cache_read) != 0)
@@ -1019,8 +1051,12 @@ pub fn model_tokens(per_model: &BTreeMap<String, ModelSpend>) -> (Vec<ModelToken
             .cmp(&a.input.saturating_add(a.output))
             .then_with(|| a.label.cmp(&b.label))
     });
-    let more = all.len().saturating_sub(FOOTER_MODELS);
-    all.truncate(FOOTER_MODELS);
+    let rest = all.split_off(NAMED_MODELS.min(all.len()));
+    let more = rest.iter().fold(More::default(), |more, m| More {
+        models: more.models + 1,
+        input: more.input.saturating_add(m.input),
+        output: more.output.saturating_add(m.output),
+    });
     (all, more)
 }
 
@@ -1042,29 +1078,99 @@ pub fn tokens_short(n: u64) -> String {
     n.to_string()
 }
 
-/// The footer's usage segment text (after its `Σ` mark):
-/// `opus 48M in 310k out · haiku 1.1M in 20k out · +2`. Files left out of
-/// the totals are said after the models (`+3 unread`; `+3+ unread`, or `+?
-/// unread` alone, when the walk stopped short). The limit wall is NOT here:
-/// it is its own segment ([`wall_text`]), placed where a narrow row keeps it
-/// longest. `None` when there is nothing to say.
+/// How much of the usage a `Σ` line says ([`usage_text_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGrain {
+    /// Runtime, then each named model's tokens (the name only where two or
+    /// more models spent), the models past them counted, and what was left
+    /// out of the totals: `aterm harness usage`'s `Σ` line ([`usage_text`]).
+    PerModel,
+    /// Runtime and every model's tokens merged into one pair, no names; what
+    /// was left out still said: the footer's `Σ` segment (owner, 2026-09-30:
+    /// "I just can't have so many different model stats").
+    Total,
+    /// Runtime alone: the footer's `Σ` where the rule is too narrow for the
+    /// total.
+    Runtime,
+}
+
+/// A working time at the footer's grain, never rounded up: `42s`, `12m03s`,
+/// `7h52m`, `130h` — the seconds dropped past an hour, the minutes past 100
+/// hours. Every form carries an `s` or an `h`, so none reads as a token
+/// count (`12m` beside `12M`) where the `Σ` segment narrows to the runtime
+/// alone, with no arrow to mark tokens.
+#[must_use]
+pub fn runtime_short(secs: u64) -> String {
+    let (h, m) = (secs / 3600, secs % 3600 / 60);
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{m}m{:02}s", secs % 60),
+        _ if h < 100 => format!("{h}h{m:02}m"),
+        _ => format!("{h}h"),
+    }
+}
+
+/// `aterm harness usage`'s `Σ` line, per model ([`UsageGrain::PerModel`]).
+/// `None` when there is nothing to say.
 #[must_use]
 pub fn usage_text(facts: &UsageFacts) -> Option<String> {
-    let mut parts: Vec<String> = facts
-        .models
-        .iter()
-        .map(|m| {
-            format!(
-                "{} {} in {} out",
-                m.label,
-                tokens_short(m.input),
-                tokens_short(m.output)
-            )
-        })
-        .collect();
-    if facts.more_models > 0 {
-        parts.push(format!("+{}", facts.more_models));
+    usage_text_at(facts, UsageGrain::PerModel)
+}
+
+/// The usage text (after its `Σ` mark) at `grain`: `<runtime> ↑<in> ↓<out>[
+/// +N unread]` merged — `7h52m ↑395M ↓2.0M`, the footer's — or per model,
+/// `<runtime> [<model> ]↑<in> ↓<out>[ · …][ +N][ +N unread]` — `18h46m opus
+/// ↑395M ↓2.0M · haiku ↑12M ↓88k +1` (↑ in, ↓ out: Claude Code's own spinner
+/// arrows; input counts cache reads and writes). Files left out of the
+/// totals are said after them (`+3 unread`; `+3+ unread`, or `+? unread`
+/// alone, when the walk stopped short). The limit wall is NOT here: it is
+/// its own segment ([`wall_text`]), placed where a narrow row keeps it
+/// longest. `None` when the grain has nothing to say.
+#[must_use]
+pub fn usage_text_at(facts: &UsageFacts, grain: UsageGrain) -> Option<String> {
+    let pair = |input: u64, output: u64| {
+        format!(
+            "\u{2191}{} \u{2193}{}",
+            tokens_short(input),
+            tokens_short(output)
+        )
+    };
+    let mut parts: Vec<String> = facts.runtime.map(runtime_short).into_iter().collect();
+    if grain == UsageGrain::Runtime {
+        return parts.pop();
     }
+    let named = facts.models.len() + facts.more.models > 1;
+    let tokens = match grain {
+        UsageGrain::PerModel => {
+            let models: Vec<String> = facts
+                .models
+                .iter()
+                .map(|m| {
+                    if named {
+                        format!("{} {}", m.label, pair(m.input, m.output))
+                    } else {
+                        pair(m.input, m.output)
+                    }
+                })
+                .collect();
+            let mut text = models.join(" \u{00B7} ");
+            if facts.more.models > 0 {
+                text.push_str(&format!(" +{}", facts.more.models));
+            }
+            text
+        }
+        _ if facts.models.is_empty() => String::new(),
+        _ => {
+            let (input, output) = facts
+                .models
+                .iter()
+                .fold((facts.more.input, facts.more.output), |(i, o), m| {
+                    (i.saturating_add(m.input), o.saturating_add(m.output))
+                });
+            pair(input, output)
+        }
+    };
+    parts.extend((!tokens.is_empty()).then_some(tokens));
     match (facts.unread, facts.unread_more) {
         (0, false) => {}
         // The walk stopped short with nothing else left out: how many were
@@ -1072,13 +1178,21 @@ pub fn usage_text(facts: &UsageFacts) -> Option<String> {
         (0, true) => parts.push("+? unread".to_owned()),
         (n, more) => parts.push(format!("+{n}{} unread", if more { "+" } else { "" })),
     }
-    (!parts.is_empty()).then(|| parts.join(" \u{00B7} "))
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// The limit wall's segment text (after its mark): `5h limit · resets 3pm`.
+/// The limit wall's segment text (after its `⧗` mark, which says "limit"):
+/// the window, then [`super::footer::RESET_MARK`] for "resets" and the reset
+/// as the notice printed it — `5h ♻ 3pm`, `7d ♻ Oct 1 at 9am`, `5h ♻ 10pm
+/// (UTC)`.
 #[must_use]
 pub fn wall_text(wall: &Wall) -> String {
-    format!("{} limit \u{00B7} resets {}", wall.label, wall.resets)
+    format!(
+        "{} {} {}",
+        wall.label,
+        super::footer::RESET_MARK,
+        wall.resets
+    )
 }
 
 #[cfg(test)]

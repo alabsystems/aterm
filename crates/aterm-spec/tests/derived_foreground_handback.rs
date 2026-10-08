@@ -16,7 +16,8 @@
 //! PTY reader with a scripted foreground probe — is
 //! `aterm-gui/src/foreground_handback_conformance.rs`.
 
-use aterm_spec::derive::{Model, foreground_handback_model, foreground_handback_ownership_model};
+use crate::walk::only;
+use aterm_spec::derive::{foreground_handback_model, foreground_handback_ownership_model};
 use aterm_spec::{interp, verify};
 
 /// The incident: zle turns 2004 off, the job runs and writes, the reader
@@ -120,12 +121,6 @@ const ONE_SHOT: [&str; 13] = [
     "Deliver",
     "Parse",
 ];
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
 
 #[test]
 fn foreground_handback_proves_catches_and_has_no_dead_action() {

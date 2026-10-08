@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// VT conformance, batch 2 — more categories: save/restore cursor, insert/delete
-// char & line, erase variants, scroll region, alt-screen isolation, wide chars.
-// feed bytes → read screen via the engine API → assert.
+// VT conformance: save/restore cursor, insert/delete char & line, erase
+// variants, scroll region, alt-screen isolation, wide chars.
 
 use aterm_conformance::{Screen, run};
 

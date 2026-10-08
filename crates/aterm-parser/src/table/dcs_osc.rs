@@ -188,7 +188,9 @@ pub(super) const fn apply_dcs_passthrough_transitions(
         0x9B,
         Transition::new(State::DcsPassthrough, ActionType::DcsPut),
     );
-    // 0x9C remains as ST (string terminator) — do not override
+    // 0x9C remains as ST (string terminator) — do not override. With C1
+    // controls off, a 0x9C inside a UTF-8 character is the character's byte
+    // instead: that needs the bytes before it, so dispatch.rs decides it.
     set_range(
         table,
         State::DcsPassthrough,
@@ -219,6 +221,29 @@ pub(super) const fn apply_dcs_ignore_transitions(table: &mut [[Transition; 256];
         State::DcsIgnore,
         0x20,
         0x7F,
+        Transition::new(State::DcsIgnore, ActionType::Ignore),
+    );
+    // An ignored DCS is still a control string: it reads every byte exactly
+    // as `DcsPassthrough` does, only delivering none. The high bytes (UTF-8
+    // in the payload, binary data) stay in the string; without these entries
+    // a UTF-8 byte left it for Ground and the rest of the payload printed and
+    // ran as terminal input. 0x9C remains ST, as it is for a hooked DCS
+    // (and, the same way, not inside a UTF-8 character with C1 off).
+    set_range(
+        table,
+        State::DcsIgnore,
+        0x80,
+        0x9B,
+        Transition::new(State::DcsIgnore, ActionType::Ignore),
+    );
+    // 0x9C remains as ST (string terminator) — do not override. With C1
+    // controls off, a 0x9C inside a UTF-8 character is the character's byte
+    // instead: that needs the bytes before it, so dispatch.rs decides it.
+    set_range(
+        table,
+        State::DcsIgnore,
+        0x9D,
+        0xFF,
         Transition::new(State::DcsIgnore, ActionType::Ignore),
     );
 }
@@ -311,7 +336,9 @@ pub(super) const fn apply_sos_pm_apc_string_transitions(
         0x9B,
         Transition::new(State::SosPmApcString, ActionType::ApcPut),
     );
-    // 0x9C remains as ST (string terminator) — do not override
+    // 0x9C remains as ST (string terminator) — do not override. With C1
+    // controls off, a 0x9C inside a UTF-8 character is the character's byte
+    // instead: that needs the bytes before it, so dispatch.rs decides it.
     set_range(
         table,
         State::SosPmApcString,

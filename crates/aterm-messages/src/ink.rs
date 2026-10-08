@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BAND'S COLOURS (design ruling 324; the owner's architecture ask,
-//! ruling 140: *"design the logic in aterm core and then keep the osx layer
-//! lightweight so that we can make this cross platform"*).
+//! The band's colours.
 //!
-//! [`crate::paint`] decides the band's STRUCTURE — which character in which
+//! [`crate::paint`] decides the band's structure: which character in which
 //! cell, in which ink slot or chip form, every surface tone as a fraction of
-//! the row. This module RESOLVES that structure to colours: every decision an
-//! RGB value makes — the contrast floors, the crisp ink over a fill, the side
-//! holds, the glint's rail, the pastel edge line, the chip inks, an echo's
-//! fade — over a plain-RGB palette, [`BandInks`], derived from a theme's
-//! background, foreground and cursor ([`BandInks::derive`]) or from an
-//! OS-forced High Contrast palette ([`BandInks::forced`]). [`paint_band`]
-//! paints and resolves a whole band; the host maps each [`InkedCell`] onto
-//! its own cell type and each [`RowRaster`] onto its renderer's raster.
+//! the row. This module resolves that structure to colours (the contrast
+//! floors, the crisp ink over a fill, the side holds, the glint's rail, the
+//! pastel edge line, the chip inks, an echo's fade) over a plain-RGB palette,
+//! [`BandInks`], derived from a theme's background, foreground and cursor
+//! ([`BandInks::derive`]) or from an OS-forced High Contrast palette
+//! ([`BandInks::forced`]). [`paint_band`] paints and resolves a whole band;
+//! the host maps each [`InkedCell`] onto its own cell type and each
+//! [`RowRaster`] onto its renderer's raster.
 //!
 //! # Every bit kept
 //!
@@ -22,10 +20,9 @@
 //! band must look exactly as it did, so its floating point is the host's to
 //! the bit: fused multiply-adds stay fused, unfused sums stay unfused, and
 //! [`contrast`] is the WCAG ratio in `aterm_types::Rgb::contrast`'s own
-//! arithmetic — NOT [`crate::palette::contrast`], which fuses its luminance
-//! and differs from it by one ulp on about a third of all pairs. The side
-//! decisions (which end of the scale a word or a fill sits toward) read the
-//! fused [`luminance`], as they always did. Where a pedantic lint asks for a
+//! arithmetic, the engine's one ratio (the palette's picks read it too since
+//! ruling 438). The side decisions (which end of the scale a word or a fill
+//! sits toward) read the fused [`luminance`], as they always did. Where a pedantic lint asks for a
 //! rewrite that could move a bit, the code keeps its spelling and says why.
 
 use crate::animate::{BandMotion, FineTone, Tone};
@@ -40,7 +37,7 @@ use crate::palette::{MeterHue, enc, keeps_pastel, lin, oklch, outline_borrows_bl
 
 /// On-theme tones for the band and its compact chrome kin (the find bar, the
 /// config notices), as plain sRGB bytes. The painter names its word inks by
-/// SLOT, each one of these (`BandInks::slot`): `Ink::Label` → [`Self::label`],
+/// slot, each one of these (`BandInks::slot`): `Ink::Label` → [`Self::label`],
 /// `Value` → [`Self::value`], `Warn` → [`Self::warn`], `Error` →
 /// [`Self::error`], `Accent` → [`Self::accent`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -50,8 +47,8 @@ pub struct BandInks {
     /// headerbar grey ([`BarBase::Fixed`]); `COLOR_BTNFACE` under an
     /// OS-forced palette.
     pub bar_bg: [u8; 3],
-    /// The band's SECONDARY ink — an excerpt, the stats, a blank cell's ink,
-    /// the find panel's hint row — held to the same AA floor as
+    /// The band's secondary ink (an excerpt, the stats, a blank cell's ink,
+    /// the find panel's hint row), held to the same AA floor as
     /// [`Self::value`]; `COLOR_WINDOWTEXT` under an OS-forced palette.
     pub label: [u8; 3],
     /// The band's words: the theme's foreground floored to AA on
@@ -60,86 +57,71 @@ pub struct BandInks {
     /// A warning's words and glyph: an amber floored to AA on the band;
     /// `COLOR_WINDOWTEXT` under an OS-forced palette.
     pub warn: [u8; 3],
-    /// The ink of an ERROR row's words and glyph on the message band (design
-    /// ruling 265): a red, floored to AA on the band like [`Self::warn`] —
-    /// an error and a warning shared the warn yellow, so only the glyph told
-    /// `✕ Tests failed on main` from `⚠ Misspelled setting`, while the log
-    /// paints errors red. Collapses to the one ink under an OS-forced
-    /// palette, as `warn` does.
+    /// The ink of an error row's words and glyph on the message band: a red,
+    /// floored to AA on the band like [`Self::warn`], so `✕ Tests failed`
+    /// and `⚠ Misspelled setting` differ in more than the glyph. Collapses to
+    /// the one ink under an OS-forced palette, as `warn` does.
     pub error: [u8; 3],
-    /// Background of an editable WELL inset in the band (the find bar's query
-    /// field). The terminal's own background, so the band reads as a raised panel
-    /// with a recessed input in it — and so `value` text in the well keeps the
-    /// terminal's own fg/bg contrast rather than the band's smaller one.
+    /// Background of an editable well inset in the band (the find bar's query
+    /// field). The terminal's own background, so the band reads as a raised
+    /// panel with a recessed input in it, and `value` text in the well keeps
+    /// the terminal's own fg/bg contrast rather than the band's smaller one.
     pub field_bg: [u8; 3],
-    /// Text caret drawn in that well — the theme's CURSOR colour, contrast-floored
-    /// against `field_bg` so it stays visible on a recoloured background.
+    /// Text caret drawn in that well: the theme's cursor colour,
+    /// contrast-floored against `field_bg` so it stays visible.
     pub caret: [u8; 3],
-    /// A drawn BORDER for the well, for the case where its fill cannot carry the
-    /// boundary on its own — `Some(ink)` exactly when `field_bg == bar_bg`.
+    /// A drawn border for the well where its fill cannot carry the boundary
+    /// on its own: `Some(ink)` exactly when `field_bg == bar_bg`.
     ///
-    /// Every stock Windows High-Contrast scheme sets `COLOR_WINDOW == COLOR_BTNFACE`,
-    /// so the document/control split the forced mapping honours collapses to one tone
-    /// and the well loses its edge entirely: an editable field indistinguishable from
-    /// the band around it. HC's own convention is that surfaces are separated by
-    /// BORDERS rather than fills, and this is that border — the piece the fill-only
-    /// well was missing. `None` on every theme-derived scheme (`field_bg` is
-    /// `theme.bg` against a 0.10/0.16 blend, which is what makes the well read as an
-    /// inset), so nothing off an OS palette moves.
+    /// Every stock Windows High-Contrast scheme sets `COLOR_WINDOW ==
+    /// COLOR_BTNFACE`, so the fill alone leaves the field indistinguishable
+    /// from the band; HC separates surfaces by borders, and this is that
+    /// border. `None` on every theme-derived scheme (`field_bg` is `theme.bg`
+    /// against a 0.10/0.16 blend, which already makes the well an inset).
     pub well_rule: Option<[u8; 3]>,
-    /// The FILL of a determinate meter drawn in the band (the message band's
-    /// full-row meter, window edge to window edge — design ruling 55): the
-    /// theme's cursor accent, contrast-floored against [`Self::bar_bg`] so a
-    /// pale cursor on a pale band still reads as a fill. Under an OS-forced
-    /// palette it is `COLOR_HIGHLIGHT` — exactly what a native Win32 progress
-    /// bar paints its fill with under High Contrast.
+    /// The fill of a determinate meter drawn in the band (the message band's
+    /// full-row meter): the theme's cursor accent, contrast-floored against
+    /// [`Self::bar_bg`] so a pale cursor on a pale band still reads as a
+    /// fill. Under an OS-forced palette it is `COLOR_HIGHLIGHT`, what a native
+    /// Win32 progress bar paints its fill with under High Contrast.
     pub accent: [u8; 3],
-    /// The FILL a message-band METER wears (design ruling 250): [`Self::accent`]
-    /// — the theme's cursor, the owner's "cursor trail theme" — unless that
-    /// cursor is NEAR-GREY ([`crate::palette`]), where the bar borrows the
-    /// theme's own ANSI blue, or its cyan where only cyan carries the band's
-    /// words ([`BandInks::derive`]); floored to 3:1 on the band like the
-    /// accent. The owner: *"use the theme's own ANSI blue or cyan when the
-    /// cursor is near-grey, so the bar keeps colour and life; every other
-    /// theme keeps the cursor-trail colour."* A meter row's outlined Primary
-    /// rings in it too (ruling 249). `COLOR_HIGHLIGHT` under an OS-forced
-    /// palette, like the accent. Where the floor would darken the hue into
-    /// brown ([`crate::palette::keeps_pastel`] — Catppuccin Latte's
-    /// rosewater, the brick bar), the fill is the theme's own pastel instead
-    /// and [`Self::meter_edge`] draws its boundary (design ruling 264).
+    /// The fill a message-band meter wears: [`Self::accent`] (the theme's
+    /// cursor) unless that cursor is near-grey ([`crate::palette`]), where
+    /// the bar borrows the theme's own ANSI blue, or its cyan where only cyan
+    /// carries the band's words ([`BandInks::derive`]); floored to 3:1 on the
+    /// band like the accent. A meter row's outlined Primary rings in it too.
+    /// `COLOR_HIGHLIGHT` under an OS-forced palette. Where the floor would
+    /// darken the hue into brown ([`crate::palette::keeps_pastel`], e.g.
+    /// Catppuccin Latte's rosewater), the fill is the theme's own pastel
+    /// instead and [`Self::meter_edge`] draws its boundary.
     pub meter: [u8; 3],
-    /// The darker EDGE line a PASTEL fill ends in (design ruling 264): the
-    /// pastel deepened until it stands 3:1 from [`Self::meter_track`]
-    /// ([`crate::palette::pastel_edge`]), drawn over the fill's last pixels
-    /// by the row's raster ([`RowRaster::line`]). `None` on every fill the
-    /// 3:1 floor already carries — every built-in scheme but Catppuccin
-    /// Latte — and under an OS-forced palette.
+    /// The darker edge line a pastel fill ends in: the pastel deepened until
+    /// it stands 3:1 from [`Self::meter_track`]
+    /// ([`crate::palette::pastel_edge`]), drawn over the fill's last pixels by
+    /// the row's raster ([`RowRaster::line`]). `None` on every fill the 3:1
+    /// floor already carries (every built-in scheme but Catppuccin Latte) and
+    /// under an OS-forced palette.
     pub meter_edge: Option<[u8; 3]>,
-    /// The TRACK a meter's unfilled remainder is drawn on: [`Self::bar_bg`]
-    /// mixed [`TRACK_TINT`] toward [`Self::meter`] (design ruling 260), so the
-    /// empty part of a metered row reads as the bar's own channel — its hue,
-    /// barely — and never as a chip's ground ([`Self::chip_ground`], which it
-    /// used to equal: a Secondary's block read as part of the bar). Under an
-    /// OS-forced palette it is the document surface (`COLOR_WINDOW`), the HC
-    /// vocabulary's "well".
+    /// The track a meter's unfilled remainder is drawn on: [`Self::bar_bg`]
+    /// mixed [`TRACK_TINT`] toward [`Self::meter`], so the empty part of a
+    /// metered row reads as the bar's own channel and never as a chip's ground
+    /// ([`Self::chip_ground`]). Under an OS-forced palette it is the document
+    /// surface (`COLOR_WINDOW`), the HC vocabulary's "well".
     pub meter_track: [u8; 3],
-    /// A resting Secondary chip's FILL on an unmetered row: a step off
-    /// [`Self::bar_bg`] toward the ink (the grey the meter's track used to
-    /// share). Under an OS-forced palette `COLOR_WINDOW`, like the track.
+    /// A resting Secondary chip's fill on an unmetered row: a step off
+    /// [`Self::bar_bg`] toward the ink. Under an OS-forced palette
+    /// `COLOR_WINDOW`, like the track.
     pub chip_ground: [u8; 3],
-    /// The hue a metered row's OUTLINED Primary rings and labels in (rulings
-    /// 249 and 260): [`Self::meter`], unless that hue floored to AA for its
-    /// label reads BROWN ([`crate::palette::reads_brown`] — Catppuccin
-    /// Latte's rosewater), where the outline borrows the theme's ANSI blue.
-    /// The fill keeps [`Self::meter`]. `COLOR_HIGHLIGHT` under an OS-forced
-    /// palette, like the meter.
+    /// The hue a metered row's outlined Primary rings and labels in:
+    /// [`Self::meter`], unless that hue floored to AA for its label reads
+    /// brown ([`crate::palette::reads_brown`], e.g. Catppuccin Latte's
+    /// rosewater), where the outline borrows the theme's ANSI blue. The fill
+    /// keeps [`Self::meter`]. `COLOR_HIGHLIGHT` under an OS-forced palette.
     pub ring: [u8; 3],
-    /// The FILL of the message band's capsule under the pointer (design
-    /// §2.2): [`Self::bar_bg`] moved toward the ink — at least 0.30, and on
-    /// until it stands [`HOVER_RISE`]:1 from a resting chip's
-    /// [`Self::chip_ground`] (design ruling 260: the pointer's step was about
-    /// 1.2:1, a change the eye could miss) — while
-    /// [`Self::capsule_hover_ink`] still clears WCAG AA on it. Under an
+    /// The fill of the message band's capsule under the pointer:
+    /// [`Self::bar_bg`] moved toward the ink, at least 0.30 and on until it
+    /// stands [`HOVER_RISE`]:1 from a resting chip's [`Self::chip_ground`],
+    /// while [`Self::capsule_hover_ink`] still clears WCAG AA on it. Under an
     /// OS-forced palette it is `COLOR_HIGHLIGHT`: HC's own word for "the
     /// thing the pointer is on".
     pub capsule_hover: [u8; 3],
@@ -148,66 +130,60 @@ pub struct BandInks {
     /// own end where the risen fill needs it for AA ([`hover_ink`]);
     /// `COLOR_HIGHLIGHTTEXT` under an OS-forced palette.
     pub capsule_hover_ink: [u8; 3],
-    /// The FILL of the message band's PRIMARY capsule under the pointer:
-    /// [`Self::accent`] moved [`PRIMARY_HOVER_LIFT`] toward the theme's ink —
-    /// LIT, not dimmed. The resting Primary is the accent chip; painting it
-    /// in the grey [`Self::capsule_hover`] under the pointer read as DISABLED
-    /// (review, 2026-09-22: `Apply now` went from the bright chip to a grey
-    /// block), and the first lift of 0.25 was a step the eye could miss (the
-    /// same review's second pass, ruling 20: unmistakable, at least 0.45).
-    /// Floored so [`Self::capsule_primary_hover_ink`] keeps the 3:1 non-text
-    /// floor the accent itself is held to. Under an OS-forced palette it is
-    /// `COLOR_HIGHLIGHT`, like every hovered chip there.
+    /// The fill of the message band's Primary capsule under the pointer:
+    /// [`Self::accent`] moved [`PRIMARY_HOVER_LIFT`] toward the theme's ink,
+    /// lit, not dimmed (a grey hover would read as disabled). Floored so
+    /// [`Self::capsule_primary_hover_ink`] keeps the 3:1 non-text floor the
+    /// accent itself is held to. `COLOR_HIGHLIGHT` under an OS-forced
+    /// palette, like every hovered chip there.
     pub capsule_primary_hover: [u8; 3],
     /// The ink on [`Self::capsule_primary_hover`]: [`Self::bar_bg`]
-    /// theme-derived — the Primary's resting ink, so only the fill moves —
-    /// and `COLOR_HIGHLIGHTTEXT` under an OS-forced palette.
+    /// theme-derived (the Primary's resting ink, so only the fill moves), and
+    /// `COLOR_HIGHLIGHTTEXT` under an OS-forced palette.
     pub capsule_primary_hover_ink: [u8; 3],
     /// What the lit Primary moves [`PRIMARY_HOVER_LIFT`] toward: the theme's
-    /// ink. The band lifts the chip from the accent it actually WEARS — the
-    /// accent deepened to AA for its label (ruling 155) — so a deepened rest
-    /// and the lit form stay a whole lift apart (ruling 160). Under an
-    /// OS-forced palette `COLOR_HIGHLIGHT`, unread there.
+    /// ink. The band lifts the chip from the accent it actually wears (the
+    /// accent deepened to AA for its label), so a deepened rest and the lit
+    /// form stay a whole lift apart. `COLOR_HIGHLIGHT` under an OS-forced
+    /// palette, unread there.
     pub primary_lift_toward: [u8; 3],
-    /// The ink a WORD takes on the [`Self::accent`] fill of a metered band row
+    /// The ink a word takes on the [`Self::accent`] fill of a metered band row
     /// under an OS-forced palette: `COLOR_HIGHLIGHTTEXT`, the system's own
-    /// pairing for `COLOR_HIGHLIGHT` (the message band's full-row meter, ruling
-    /// 55). Theme-derived it is [`Self::bar_bg`] — the resting Primary's ink on
-    /// the accent — but the band floors each word's own ink against the fill
-    /// instead (the row's ink plan), so this is read under High Contrast only.
+    /// pairing for `COLOR_HIGHLIGHT`. Theme-derived it is [`Self::bar_bg`] (the
+    /// resting Primary's ink on the accent), but the band floors each word's
+    /// own ink against the fill instead, so this is read under High Contrast
+    /// only.
     pub on_accent: [u8; 3],
 }
 
 /// The OS-forced chrome palette: the five Win32 system colours every chrome
-/// surface is painted from while a High-Contrast scheme is active — and the
+/// surface is painted from while a High-Contrast scheme is active, and the
 /// five CSS `forced-colors` system colours a browser host reads (`Canvas`,
 /// `CanvasText`, `Highlight`, `HighlightText`, `ButtonFace`), which map onto
 /// them one to one.
 ///
-/// Stored as plain RGB triples in THEME byte order — the platform arm does the
-/// COLORREF (`0x00BBGGRR`) swap on the way in, so nothing downstream of here has to
-/// know GDI's byte order.
+/// Stored as plain RGB triples in theme byte order: the platform arm does the
+/// COLORREF (`0x00BBGGRR`) swap on the way in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ForcedPalette {
-    /// `COLOR_WINDOW` — the document / editable-field surface. Carries the find
-    /// bar's inset WELL and the tab strip's hover wash.
+    /// `COLOR_WINDOW`, the document / editable-field surface: the find bar's
+    /// inset well and the tab strip's hover wash.
     pub window: [u8; 3],
-    /// `COLOR_WINDOWTEXT` — THE ink. An HC palette has no secondary text tone,
-    /// because dimming text is precisely what an HC user opted out of: the band's
-    /// label, value, warn and inactive-tab roles all collapse onto this one colour
-    /// and let WEIGHT (bold) carry what hue and dimming used to.
+    /// `COLOR_WINDOWTEXT`, the one ink. An HC palette has no secondary text
+    /// tone (dimming text is what an HC user opted out of): the band's label,
+    /// value, warn and inactive-tab roles all collapse onto this colour and
+    /// let weight (bold) carry the hierarchy.
     pub window_text: [u8; 3],
-    /// `COLOR_HIGHLIGHT` — the SELECTED surface: the active tab chip, the `↻`
+    /// `COLOR_HIGHLIGHT`, the selected surface: the active tab chip, the `↻`
     /// update CTA, and the accent rule.
     pub highlight: [u8; 3],
     /// `COLOR_HIGHLIGHTTEXT` — ink on [`Self::highlight`].
     pub highlight_text: [u8; 3],
-    /// `COLOR_BTNFACE` — the control-face surface every chrome BAND is painted on.
-    /// Win32's own split is document = `WINDOW`, control = `BTNFACE`; the strip and
-    /// the find/notice bands are controls, the find bar's query field is a document.
-    /// Every stock HC scheme sets the two equal, so in practice they read as one
-    /// surface separated by the seam — which is the HC convention (borders, not
-    /// fills).
+    /// `COLOR_BTNFACE`, the control-face surface every chrome band is painted
+    /// on. Win32's own split is document = `WINDOW`, control = `BTNFACE`; the
+    /// strip and the find/notice bands are controls, the find bar's query
+    /// field is a document. Every stock HC scheme sets the two equal, so they
+    /// read as one surface separated by borders.
     pub btn_face: [u8; 3],
 }
 
@@ -218,12 +194,12 @@ pub struct ThemeInks {
     pub bg: [u8; 3],
     /// The terminal foreground.
     pub fg: [u8; 3],
-    /// The cursor: the meter's hue, the owner's "cursor trail theme".
+    /// The cursor: the meter's hue.
     pub cursor: [u8; 3],
 }
 
 /// The theme's ANSI blue and cyan (slots 4 and 6), which a band meter
-/// borrows when the cursor is near-grey (ruling 250).
+/// borrows when the cursor is near-grey.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AnsiHues {
     /// ANSI slot 4.
@@ -258,8 +234,8 @@ const ERROR_LIGHT: [u8; 3] = [0xCF, 0x22, 0x2E];
 const ERROR_DARK: [u8; 3] = [0xFF, 0x55, 0x55];
 
 impl BandInks {
-    /// The palette's ink for one of the painter's word-ink SLOTS (ruling
-    /// 320): each maps 1:1 onto a [`BandInks`] ink.
+    /// The palette's ink for one of the painter's word-ink slots: each maps
+    /// 1:1 onto a [`BandInks`] ink.
     #[must_use]
     pub(crate) const fn slot(&self, ink: Ink) -> [u8; 3] {
         match ink {
@@ -271,14 +247,14 @@ impl BandInks {
         }
     }
 
-    /// Appearance-aware, theme-derived band tones with WCAG-AA text
-    /// contrast, and the meter's hue (ruling 250): where the theme's cursor
-    /// is near-grey and the host knows the terminal palette's blue and cyan
-    /// (`ansi`), the meter's fill is the blue — or the cyan, where only the
-    /// cyan carries the band's words — chosen by [`MeterHue`]. A hue the 3:1
-    /// floor would darken into brown keeps its own pastel and a darker edge
-    /// instead (ruling 264, [`crate::palette::keeps_pastel`]). `base` says
-    /// where the band's ground comes from ([`BarBase`]).
+    /// Appearance-aware, theme-derived band tones with WCAG-AA text contrast,
+    /// and the meter's hue: where the theme's cursor is near-grey and the host
+    /// knows the terminal palette's blue and cyan (`ansi`), the meter's fill
+    /// is the blue, or the cyan where only the cyan carries the band's words,
+    /// chosen by [`MeterHue`]. A hue the 3:1 floor would darken into brown
+    /// keeps its own pastel and a darker edge instead
+    /// ([`crate::palette::keeps_pastel`]). `base` says where the band's ground
+    /// comes from ([`BarBase`]).
     #[must_use]
     #[allow(
         clippy::items_after_statements,
@@ -302,18 +278,18 @@ impl BandInks {
             const AA: f64 = 4.5;
             let field_bg = theme.bg;
             let value = ensure_contrast(theme.fg, bar_bg, AA);
-            // A meter fill is a SURFACE, not text: the 3:1 non-text floor (the same
-            // one the strip's inks use), so the cursor accent survives on a band it
-            // happens to resemble without being dragged to black/white needlessly.
+            // A meter fill is a surface, not text: the 3:1 non-text floor, so
+            // the cursor accent survives on a band it resembles without being
+            // dragged to black or white needlessly.
             let accent = ensure_contrast(theme.cursor, bar_bg, 3.0);
             let chip_ground = mix3(bar_bg, theme.fg, if light { 0.12 } else { 0.18 });
             let meter_track = mix3(bar_bg, accent, TRACK_TINT);
             Self {
                 bar_bg,
-                // `label` is the SECONDARY tone, not an optional one: it carries the find
-                // panel's whole hint row, its placeholder, and every inactive toggle. Held to
-                // the same AA floor as `value` — a dim role still has to be readable, and
-                // `value` (bold, full contrast) keeps the hierarchy on its own.
+                // `label` is the secondary tone, not an optional one: it carries
+                // the find panel's hint row, its placeholder and every inactive
+                // toggle. Held to the same AA floor as `value`; `value` (bold,
+                // full contrast) keeps the hierarchy on its own.
                 label: ensure_contrast(
                     mix3(theme.fg, theme.bg, if light { 0.40 } else { 0.48 }),
                     bar_bg,
@@ -324,10 +300,10 @@ impl BandInks {
                 error: ensure_contrast(error_base, bar_bg, AA),
                 field_bg,
                 caret: ensure_contrast(theme.cursor, field_bg, AA),
-                // The theme-derived well is an INSET: `field_bg` is the terminal background
-                // and `bar_bg` a 0.10/0.16 step off it, so the fill already draws the edge.
-                // The equality guard is not dead — a user theme is free to land on a `bg`
-                // that blends to itself.
+                // The theme-derived well is an inset: `field_bg` is the terminal
+                // background and `bar_bg` a 0.10/0.16 step off it, so the fill
+                // already draws the edge. The guard still matters: a user theme
+                // may land on a `bg` that blends to itself.
                 well_rule: (field_bg == bar_bg).then(|| ensure_contrast(theme.fg, field_bg, AA)),
                 accent,
                 meter: accent,
@@ -340,10 +316,10 @@ impl BandInks {
                     value,
                     capsule_hover_fill(bar_bg, theme.fg, value, chip_ground),
                 ),
-                // Toward the ink is AWAY from the band on every theme (the band is a
-                // step off `bg`, the ink its opposite), so the lit accent can only
-                // gain contrast for the `bar_bg` ink on it; the floor is belt and
-                // braces for a theme whose cursor sits between the two.
+                // Toward the ink is away from the band on every theme (the band
+                // is a step off `bg`, the ink its opposite), so the lit accent
+                // can only gain contrast for the `bar_bg` ink on it; the floor
+                // covers a theme whose cursor sits between the two.
                 capsule_primary_hover: ensure_contrast(
                     mix3(accent, theme.fg, PRIMARY_HOVER_LIFT),
                     bar_bg,
@@ -362,18 +338,18 @@ impl BandInks {
             c.meter = ensure_contrast(hue, c.bar_bg, 3.0);
             c.meter_track = mix3(c.bar_bg, c.meter, TRACK_TINT);
             c.ring = c.meter;
-            // THE OUTLINE'S HUE (ruling 260): a warm meter floored to AA for its
-            // label reads brown; the outline borrows the theme's blue.
+            // The outline's hue: a warm meter floored to AA for its label
+            // reads brown; the outline borrows the theme's blue.
             let label = |hue: [u8; 3]| keep_side(hue, c.bar_bg, 4.5);
             let blue = ensure_contrast(a.blue, c.bar_bg, 3.0);
             if outline_borrows_blue(label(c.meter), blue, label(blue)) {
                 c.ring = blue;
             }
         }
-        // THE PASTEL FILL (ruling 264): where the floor turned the hue brown, the
-        // fill is the hue itself — its track tinted toward it as any track is —
-        // and a darker edge line carries the boundary. The outline keeps what it
-        // measured on the floored hue.
+        // The pastel fill: where the floor turned the hue brown, the fill is the
+        // hue itself (its track tinted toward it as any track is) and a darker
+        // edge line carries the boundary. The outline keeps what it measured on
+        // the floored hue.
         if keeps_pastel(hue, c.meter) {
             c.meter = hue;
             c.meter_track = mix3(c.bar_bg, hue, TRACK_TINT);
@@ -382,21 +358,16 @@ impl BandInks {
         c
     }
 
-    /// The band tones under an OS-forced chrome palette ([`ForcedPalette`]) —
-    /// today, Windows High Contrast.
+    /// The band tones under an OS-forced chrome palette ([`ForcedPalette`]),
+    /// i.e. Windows High Contrast.
     ///
-    /// The band is a CONTROL surface (`COLOR_BTNFACE`) and the find bar's query field is
-    /// a DOCUMENT one (`COLOR_WINDOW`), which is Win32's own split and the reason those
-    /// two system colours exist separately at all. Every ink collapses onto
-    /// `COLOR_WINDOWTEXT`: `label` is normally a dim of `value`, and an HC scheme has no
-    /// dim — a user who turned High Contrast on asked for exactly one text colour, and
-    /// the find panel's hierarchy is carried by weight and position instead. `warn`
-    /// collapses too: HC deliberately discards hue as a channel, so a yellow-on-band
-    /// warning tone would either be overruled by the scheme or ignore it.
-    ///
-    /// Rejected alternative: mapping `warn` to `COLOR_HIGHLIGHT`. That colour means
-    /// SELECTED in the HC vocabulary (it is what the active tab chip uses), and
-    /// borrowing it for a severity would make a warning look like a selection.
+    /// The band is a control surface (`COLOR_BTNFACE`) and the find bar's
+    /// query field a document one (`COLOR_WINDOW`), Win32's own split. Every
+    /// ink collapses onto `COLOR_WINDOWTEXT`: an HC scheme has no dim, and a
+    /// user who turned High Contrast on asked for exactly one text colour.
+    /// `warn` collapses too: HC discards hue as a channel. `warn` is not
+    /// mapped to `COLOR_HIGHLIGHT`, which means "selected" in HC (the active
+    /// tab chip uses it), so a warning would look like a selection.
     #[must_use]
     pub fn forced(hc: ForcedPalette) -> Self {
         let on_band = forced_ink(hc.window_text, hc.btn_face);
@@ -409,8 +380,8 @@ impl BandInks {
             error: on_band,
             field_bg: hc.window,
             caret: in_well,
-            // See [`BandInks::well_rule`]: every stock HC scheme has WINDOW == BTNFACE,
-            // so the fill alone leaves the query field with no boundary at all.
+            // See [`BandInks::well_rule`]: every stock HC scheme has WINDOW ==
+            // BTNFACE, so the fill alone leaves the query field no boundary.
             well_rule: (hc.window == hc.btn_face).then_some(in_well),
             accent: hc.highlight,
             meter: hc.highlight,
@@ -430,45 +401,42 @@ impl BandInks {
 
 // ---- The chrome helpers -------------------------------------------------------
 
-/// The contrast floor applied on top of an OS-forced palette. Provably INERT on all
+/// The contrast floor applied on top of an OS-forced palette. Inert on all
 /// four stock Windows HC schemes (their `WINDOWTEXT`/`BTNFACE` and
-/// `HIGHLIGHTTEXT`/`HIGHLIGHT` pairs are 15:1 or better), so it never overrides what
-/// the OS chose. It exists for a hand-edited or third-party HC scheme that pairs two
-/// tones the OS itself never would: reaching for pure black/white there is still a
-/// high-contrast answer, whereas printing the scheme's own unreadable pair is not.
-/// The same 3.0 UI-text floor the tab strip's inks use, for the same reason.
+/// `HIGHLIGHTTEXT`/`HIGHLIGHT` pairs are 15:1 or better), so it never
+/// overrides what the OS chose; it exists for a hand-edited or third-party
+/// scheme that pairs two tones the OS never would. The same 3.0 UI-text
+/// floor the tab strip's inks use.
 pub(crate) const FORCED_INK_FLOOR: f64 = 3.0;
 
 /// How far the lit Primary's fill moves from the resting accent toward the
-/// theme's ink (`mix3` `t`). 0.25 shipped first and was too quiet — a hovered
-/// `Apply now` had to be compared with its resting self to be seen as lit;
-/// ruling 20 (2026-09-22) sets the floor at 0.45: unmistakable on its own.
+/// theme's ink (`mix3` `t`): enough to read as lit on its own, without
+/// comparing with the resting chip.
 pub const PRIMARY_HOVER_LIFT: f32 = 0.45;
 
-/// How far a meter's TRACK is mixed from the band toward the meter's hue
-/// (design ruling 260): the bar's own channel, faintly its colour.
+/// How far a meter's track is mixed from the band toward the meter's hue:
+/// the bar's own channel, faintly its colour.
 pub const TRACK_TINT: f32 = 0.10;
 
-/// The least contrast a hovered chip's fill stands from a resting chip's
-/// (design ruling 260).
+/// The least contrast a hovered chip's fill stands from a resting chip's.
 pub const HOVER_RISE: f64 = 1.5;
 
-/// Is this background a LIGHT one? A cheap perceptual-luma threshold (no
-/// sRGB-linear round-trip needed for a binary dark/light decision), in `f32`
-/// and unfused ON PURPOSE: twelve colours sit at a luma of exactly 150
-/// (`#01d1ed` … `#ef7f23`), and this arithmetic calls them light where the
-/// exact integer test would not (ruling 324). Every bundled dark scheme sits
-/// well below the threshold and every light scheme well above it. The ONE
-/// dark/light classifier for all chrome.
+/// Is this background a light one? A cheap perceptual-luma threshold (no
+/// sRGB-linear round-trip for a binary decision), in `f32` and unfused on
+/// purpose: twelve colours sit at a luma of exactly 150 (`#01d1ed` …
+/// `#ef7f23`), and this arithmetic calls them light where the exact integer
+/// test would not. Every bundled dark scheme sits well below the threshold
+/// and every light scheme well above it. The one dark/light classifier for
+/// all chrome.
 #[must_use]
 pub fn bg_is_light(bg: [u8; 3]) -> bool {
     let luma = 0.299 * f32::from(bg[0]) + 0.587 * f32::from(bg[1]) + 0.114 * f32::from(bg[2]);
     luma > 150.0
 }
 
-/// Linear blend of two RGB triples: `a` toward `b` by `t` ∈ \[0,1\] — the one
-/// blend every chrome surface derives its tones with; two copies of a colour
-/// blend is how two chrome surfaces drift apart by a rounding step.
+/// Linear blend of two RGB triples: `a` toward `b` by `t` ∈ \[0,1\], the one
+/// blend every chrome surface derives its tones with, so no two surfaces
+/// drift apart by a rounding step.
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
@@ -483,12 +451,14 @@ pub fn mix3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
 /// WCAG relative-contrast ratio between two RGB triples, in
 /// `aterm_types::Rgb::contrast`'s arithmetic, transcribed token for token:
 /// an UNFUSED weighted sum, its identity clamps, and the `lum1 > lum2`
-/// selection. It must stay unfused: [`crate::palette::contrast`] fuses its
-/// luminance and differs from this by one ulp on 33.8% of pairs (ruling 324).
+/// selection. It must stay unfused: a fused luminance differs from it by one
+/// ulp on 33.8% of pairs (ruling 324), though never across the 3:1 or 4.5:1
+/// line the palette decides at (ruling 438, all pairs).
 ///
-/// Public because [`ensure_contrast`] is a one-way ratchet — it can only push
-/// ink AWAY from its surface — and the tab strip needs to know when that ratchet has
-/// overshot (a DIMMED label the floor dragged past full strength is no longer a dim).
+/// Public because [`ensure_contrast`] is a one-way ratchet (it can only push
+/// ink away from its surface) and the tab strip needs to know when it has
+/// overshot (a dimmed label the floor dragged past full strength is no
+/// longer a dim).
 #[must_use]
 pub fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
     let lum1 = rgb_luminance(a).clamp(0.0, 1.0);
@@ -554,13 +524,13 @@ pub fn ensure_contrast(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
     best
 }
 
-/// [`ensure_contrast`] that crosses to the OTHER anchor when the near one
-/// cannot clear `target` — the floor for words on the meter's surface. The
-/// edge cell of a fill, the comet and the glint are MIXES of track and fill
-/// (ruling 138's tone coverage), so a word can land on a mid tone whose luma
-/// [`bg_is_light`] calls dark but that white cannot lift to AA against (the
-/// luma split is not the contrast crossover). One of black and white always
-/// clears √21 ≈ 4.58:1, so a target at or under AA is always met.
+/// [`ensure_contrast`] that crosses to the other anchor when the near one
+/// cannot clear `target`: the floor for words on the meter's surface. The
+/// edge cell of a fill, the comet and the glint are mixes of track and fill,
+/// so a word can land on a mid tone whose luma [`bg_is_light`] calls dark
+/// but that white cannot lift to AA against (the luma split is not the
+/// contrast crossover). One of black and white always clears √21 ≈ 4.58:1,
+/// so a target at or under AA is always met.
 #[must_use]
 pub fn ensure_contrast_either(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
     let near = ensure_contrast(c, bg, target);
@@ -592,14 +562,12 @@ pub fn forced_ink(ink: [u8; 3], on: [u8; 3]) -> [u8; 3] {
     ensure_contrast(ink, on, FORCED_INK_FLOOR)
 }
 
-/// The hovered capsule's fill: `bar_bg` moved toward `fg` — 0.30, and on in
+/// The hovered capsule's fill: `bar_bg` moved toward `fg`, 0.30 and on in
 /// steps of 0.05 until it stands [`HOVER_RISE`]:1 from `rest` (a resting
-/// chip's fill), while `ink` still clears WCAG AA on it (design ruling 260).
-/// Where no step does both, the old rule: 0.30, stepped back by 0.05 until
-/// `ink` clears AA. A step of 0 is `bar_bg` itself, which `ink` (= `value`)
-/// clears by construction, so the fill is always one the label is legible on
-/// — the floor is on the SURFACE here, because the ink is already at full
-/// contrast and cannot be pushed further.
+/// chip's fill), while `ink` still clears WCAG AA on it. Where no step does
+/// both: 0.30, stepped back by 0.05 until `ink` clears AA. A step of 0 is
+/// `bar_bg` itself, which `ink` (= `value`) clears by construction; the floor
+/// is on the surface because the ink is already at full contrast.
 fn capsule_hover_fill(bar_bg: [u8; 3], fg: [u8; 3], ink: [u8; 3], rest: [u8; 3]) -> [u8; 3] {
     const AA: f64 = 4.5;
     for step in 6..=14u8 {
@@ -622,9 +590,9 @@ fn capsule_hover_fill(bar_bg: [u8; 3], fg: [u8; 3], ink: [u8; 3], rest: [u8; 3])
     bar_bg
 }
 
-/// The band's WARN hue as a non-text mark on `ground` (Settings ▸ Messages'
-/// severity column, design ruling 262): the amber the band's warn words are
-/// drawn from, floored to the 3:1 non-text contrast on that ground.
+/// The band's warn hue as a non-text mark on `ground` (Settings ▸ Messages'
+/// severity column): the amber the band's warn words are drawn from, floored
+/// to the 3:1 non-text contrast on that ground.
 #[must_use]
 pub fn warn_mark(ground: [u8; 3]) -> [u8; 3] {
     let base = if bg_is_light(ground) {
@@ -644,11 +612,11 @@ pub fn hover_ink(value: [u8; 3], fill: [u8; 3]) -> [u8; 3] {
 
 // ---- The meter's inks ---------------------------------------------------------
 
-/// The inks a row's surface resolves its [`Tone`]s against (design §10.7,
-/// ruling 137): the track, the row's FILL (the cursor accent, `warn` on a
-/// Warn/Error row, `HIGHLIGHT` under High Contrast), the glint — one fixed
-/// perceptual step of that fill away from its words' ink ([`glint_step`],
-/// ruling 242) — and the fault hue a Fault echo's wash hands the fill to.
+/// The inks a row's surface resolves its [`Tone`]s against: the track, the
+/// row's fill (the cursor accent, `warn` on a Warn/Error row, `HIGHLIGHT`
+/// under High Contrast), the glint (one fixed perceptual step of that fill
+/// away from its words' ink, [`glint_step`]) and the fault hue a Fault echo's
+/// wash hands the fill to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeterInks {
     /// The track.
@@ -664,17 +632,16 @@ pub struct MeterInks {
 impl MeterInks {
     /// The inks of a row whose fill wears `fill`.
     ///
-    /// The glint (and the Complete echo's sweep, which is the same light)
-    /// is the fill moved one fixed perceptual step AWAY from the ink its
-    /// words wear on it ([`glint_step`], ruling 242): the words only ever
-    /// gain contrast under it, so no letter flips as it passes (ruling 158's
-    /// promise, kept by construction rather than by a hold).
+    /// The glint (and the Complete echo's sweep, the same light) is the fill
+    /// moved one fixed perceptual step away from the ink its words wear on it
+    /// ([`glint_step`]): the words only ever gain contrast under it, so no
+    /// letter flips as it passes.
     #[must_use]
     pub fn of(c: &BandInks, fill: [u8; 3]) -> Self {
-        // The glint is ONE fixed perceptual step (ruling 242): the fill moved
-        // in OkLab lightness AWAY from the ink its words wear on it, so no
-        // word loses contrast — or changes side — under it; where that step
-        // would be too faint to see, the row draws it in its rail band.
+        // The glint is one fixed perceptual step: the fill moved in OkLab
+        // lightness away from the ink its words wear on it, so no word loses
+        // contrast or changes side under it; where that step would be too
+        // faint to see, the row draws it in its rail band.
         Self {
             track: c.meter_track,
             fill,
@@ -683,32 +650,28 @@ impl MeterInks {
         }
     }
 
-    /// THE COMET KEEPS ITS WORDS' SIDE (visual review of the merged band,
-    /// 2026-09-24): the inks of a BUSY row's surface — the comet, its still
-    /// track, and its echoes — and the anchor its words floor toward.
+    /// The comet keeps its words' side: the inks of a busy row's surface (the
+    /// comet, its still track and its echoes) and the anchor its words floor
+    /// toward.
     ///
-    /// The comet sweeps under every word on the row. In the full accent its
-    /// head crossed the luminance at which no grey but black or white still
-    /// reads, so each letter it passed flipped from light ink to black and
-    /// back — scattered black letters, and a dark spinner cutting the green
-    /// into two blobs at the window's edge. So each of the comet's inks — the
-    /// fill, the head (no lift: a lift toward white is exactly the crossing),
-    /// and a Fault echo's warn — is moved in LINEAR light toward the far end
-    /// from the anchor, its hue kept, by the least amount that keeps the
-    /// anchor `COMET_SIDE_AA` (4.6:1) from it: on a dark band a deep, saturated
-    /// accent (the owner's "cursor trail theme") that the words ride in a
-    /// slowly brightening light ink (`floor_toward`). A determinate bar is
-    /// not a comet: it keeps the full accent, and its words ride it dark.
+    /// The comet sweeps under every word on the row; in the full accent its
+    /// head would cross the luminance where only black or white still reads,
+    /// flipping each letter it passed. So each of the comet's inks (the fill,
+    /// the head with no lift, and a Fault echo's warn) is moved in linear
+    /// light toward the far end from the anchor, its hue kept, by the least
+    /// amount that keeps the anchor `COMET_SIDE_AA` (4.6:1) from it: on a dark
+    /// band a deep, saturated accent the words ride in a slowly brightening
+    /// light ink (`floor_toward`). A determinate bar is not a comet: it keeps
+    /// the full accent, and its words ride it dark.
     #[must_use]
     pub fn comet(c: &BandInks, fill: [u8; 3]) -> (Self, [u8; 3]) {
         let anchor = words_anchor(c);
         let fill = keep_side(fill, anchor, COMET_SIDE_AA);
         (
             Self {
-                // The comet runs on the NEUTRAL channel (ruling 260): the
-                // determinate bar's track is tinted toward its hue, but a
-                // comet's own light is the hue, and its gradient keeps the
-                // two-level pixel steps it was measured to (ruling 242).
+                // The comet runs on the neutral channel: the determinate bar's
+                // track is tinted toward its hue, but a comet's own light is
+                // the hue, and its gradient keeps two-level pixel steps.
                 track: c.chip_ground,
                 fill,
                 glint: fill,
@@ -718,11 +681,10 @@ impl MeterInks {
         )
     }
 
-    /// A tone's colour against these inks — the track mixed toward the fill
-    /// by `fill`, that toward the glint by `lift`, plus `warn`'s share of
-    /// warn over the track — in LINEAR light, with one rounding at the end
-    /// (the pixel raster's own mix, ruling 242; ruling 157's single
-    /// rounding).
+    /// A tone's colour against these inks (the track mixed toward the fill by
+    /// `fill`, that toward the glint by `lift`, plus `warn`'s share of warn
+    /// over the track) in linear light, with one rounding at the end (the
+    /// pixel raster's own mix).
     #[must_use]
     pub fn rgb(&self, t: FineTone) -> [u8; 3] {
         LinInks::of(self).rgb(t)
@@ -730,8 +692,8 @@ impl MeterInks {
 }
 
 /// The end of the scale the words on a determinate fill `fill` ride toward:
-/// whichever of black and white reads better on it — one of them always
-/// clears √21 ≈ 4.58:1 (design ruling 158).
+/// whichever of black and white reads better on it (one of them always
+/// clears √21 ≈ 4.58:1).
 #[must_use]
 pub(crate) fn fill_anchor(fill: [u8; 3]) -> [u8; 3] {
     if contrast(BLACK, fill) >= contrast(WHITE, fill) {
@@ -741,17 +703,15 @@ pub(crate) fn fill_anchor(fill: [u8; 3]) -> [u8; 3] {
     }
 }
 
-/// THE CRISP INK ON A FILL (design ruling 222): the ink every word a
-/// determinate row writes over its fill wears — the theme's own ink that
-/// reads best on the row's RESTING fill among those on the fill's words'
-/// side (`fill_anchor`): its background (the terminal's, `field_bg`, or
-/// the band's, `bar_bg`) or its foreground (`value`). On the default ground
-/// that is the terminal's dark on the neon cursor green, where the old floor
-/// held a grey at exactly 4.5:1. Where no candidate sits on that side (a
-/// fill at the crossover) the one nearest it does. Chosen once per row from
-/// the fill's ink, never from the tone under a cell, so the edge, the glint,
-/// a glide or an echo passing under a word never changes which ink it is;
-/// the per-cell floor (`floor_word`) stays as the minimum.
+/// The crisp ink on a fill: the ink every word a determinate row writes over
+/// its fill wears. It is the theme's own ink that reads best on the row's
+/// resting fill among those on the fill's words' side (`fill_anchor`): its
+/// background (the terminal's, `field_bg`, or the band's, `bar_bg`) or its
+/// foreground (`value`). Where no candidate sits on that side (a fill at the
+/// crossover) the one nearest it does. Chosen once per row from the fill's
+/// ink, never from the tone under a cell, so the edge, the glint, a glide or
+/// an echo passing under a word never changes which ink it is; the per-cell
+/// floor (`floor_word`) stays as the minimum.
 #[must_use]
 pub fn fill_ink(c: &BandInks, fill: [u8; 3]) -> [u8; 3] {
     let dark = fill_anchor(fill) == BLACK;
@@ -781,8 +741,7 @@ pub fn fill_ink(c: &BandInks, fill: [u8; 3]) -> [u8; 3] {
 
 /// A determinate row's word ink on `under`: floored to [`WORD_AA`] by the
 /// least move toward `near` (`floor_toward`, continuous in the ground), or
-/// toward the other end where `near` itself cannot clear it (design ruling
-/// 158).
+/// toward the other end where `near` itself cannot clear it.
 #[must_use]
 pub(crate) fn floor_word(ink: [u8; 3], under: [u8; 3], near: [u8; 3]) -> [u8; 3] {
     let anchor = if contrast(near, under) >= WORD_AA {
@@ -798,9 +757,9 @@ fn opposite(anchor: [u8; 3]) -> [u8; 3] {
     if anchor == BLACK { WHITE } else { BLACK }
 }
 
-/// How far a BUSY row's comet may move off its track: every tone it draws
+/// How far a busy row's comet may move off its track: every tone it draws
 /// leaves the row's words' anchor ([`words_anchor`]) at least this far from
-/// it — AA with a hair of margin for the byte rounding of the mixes between.
+/// it (AA with a hair of margin for the byte rounding of the mixes between).
 pub(crate) const COMET_SIDE_AA: f64 = 4.6;
 
 /// White.
@@ -819,8 +778,8 @@ pub(crate) fn words_anchor(c: &BandInks) -> [u8; 3] {
     }
 }
 
-/// `ink` moved in LINEAR light toward the far end from `anchor` — its
-/// chromaticity kept, only its lightness moved — by the least amount that
+/// `ink` moved in linear light toward the far end from `anchor` (its
+/// chromaticity kept, only its lightness moved) by the least amount that
 /// leaves `anchor` at least `target`:1 on it; unchanged when it already is.
 /// `anchor` is the words' pure end on a busy row, or a chip's own ink
 /// ([`chip_inks`]): the far end is black from an anchor lighter than `ink`,
@@ -854,8 +813,8 @@ pub(crate) fn keep_side(ink: [u8; 3], anchor: [u8; 3], target: f64) -> [u8; 3] {
     at(hi)
 }
 
-/// `ink` floored to `target`:1 on `bg` by the LEAST move toward `anchor` —
-/// a continuous function of the ground, so a word under a moving tone
+/// `ink` floored to `target`:1 on `bg` by the least move toward `anchor`: a
+/// continuous function of the ground, so a word under a moving tone
 /// brightens and dims with it and never changes side (the comet's words,
 /// [`MeterInks::comet`]). `anchor` itself where even it falls short, which
 /// the comet's guard ([`hold_side`]) never lets happen.
@@ -878,18 +837,18 @@ pub(crate) fn floor_toward(ink: [u8; 3], bg: [u8; 3], anchor: [u8; 3], target: f
     mix_u8(ink, anchor, hi)
 }
 
-/// A ground held on its words' side: `bg` pulled back toward `track` (a
-/// comet cell's track, or a determinate row's resting fill for its glint) by
-/// the least amount that leaves `anchor` `target`:1 from it.
-/// The comet's inks already keep that side ([`MeterInks::comet`]); an sRGB
-/// mix BETWEEN two of them can still dip past it on a light band (luminance
-/// is not linear in the bytes), and this is where that is caught.
+/// A ground held on its words' side: `bg` pulled back toward `track` (a comet
+/// cell's track, or a determinate row's resting fill for its glint) by the
+/// least amount that leaves `anchor` `target`:1 from it. The comet's inks
+/// already keep that side ([`MeterInks::comet`]); an sRGB mix between two of
+/// them can still dip past it on a light band (luminance is not linear in the
+/// bytes), and this is where that is caught.
 pub(crate) fn hold_side(bg: [u8; 3], track: [u8; 3], anchor: [u8; 3], target: f64) -> [u8; 3] {
     if contrast(anchor, bg) >= target {
         return bg;
     }
-    // In LINEAR light (ruling 242): the held tone stays on the straight line
-    // between the two, inside the hull of the row's inks.
+    // In linear light: the held tone stays on the straight line between the
+    // two, inside the hull of the row's inks.
     let (mut lo, mut hi) = (0u8, 255u8);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
@@ -952,22 +911,21 @@ fn from_oklch(l: f64, c: f64, h: f64) -> [u8; 3] {
 
 // ---- One row resolved ---------------------------------------------------------
 
-/// One row's PIXEL raster in WINDOW pixels (design ruling 242), before the
-/// host maps it onto its frame: the ground one colour per window pixel
-/// column (empty for none — a rail row, the flat look), the rail band's
-/// colours (`None` keeps the ground; empty for no rail), whether the words
-/// lift clear of a level's rail, the columns whose chips keep their own
-/// fill, and the ink split.
+/// One row's pixel raster in window pixels, before the host maps it onto its
+/// frame: the ground one colour per window pixel column (empty for none: a
+/// rail row, the flat look), the rail band's colours (`None` keeps the
+/// ground; empty for no rail), whether the words lift clear of a level's
+/// rail, the columns whose chips keep their own fill, and the ink split.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RowRaster {
     /// One colour per window pixel column, `[0, win_w)`.
     pub ground: Vec<[u8; 3]>,
     /// The rail band's colour per window pixel column (`None`: the ground).
     pub rail: Vec<Option<[u8; 3]>>,
-    /// A LEVEL's rail (the strain row, ruling 248): the row's words keep
-    /// clear of it — the renderer lifts them into the room the face leaves
-    /// above its tallest letter and fits the rail, with one clear row, under
-    /// their lowest ink. A bar's glint rail never moves its words.
+    /// A level's rail (the strain row): the row's words keep clear of it (the
+    /// renderer lifts them into the room the face leaves above its tallest
+    /// letter and fits the rail, with one clear row, under their lowest ink).
+    /// A bar's glint rail never moves its words.
     pub clear_rail: bool,
     /// Cell columns `[start, end)` that keep their own fill.
     pub own: Vec<(u16, u16)>,
@@ -977,14 +935,14 @@ pub struct RowRaster {
     /// The one window pixel the fill's edge antialiases (a mix of the fill
     /// and the track), when the edge is inside the row.
     pub edge: Option<u32>,
-    /// The window pixels `[start, end)` a PASTEL fill's darker edge line is
-    /// drawn over (design ruling 264, [`BandInks::meter_edge`]): the fill's
-    /// last pixels, antialiased at both ends. `None` on every other row.
+    /// The window pixels `[start, end)` a pastel fill's darker edge line is
+    /// drawn over ([`BandInks::meter_edge`]): the fill's last pixels,
+    /// antialiased at both ends. `None` on every other row.
     pub line: Option<(u32, u32)>,
-    /// OUTLINED capsules (ruling 249): `(start, end, ring, inner)` — cell
-    /// columns, the ring's colour and the ground inside it.
+    /// Outlined capsules: `(start, end, ring, inner)`, cell columns, the
+    /// ring's colour and the ground inside it.
     pub rings: Vec<(u16, u16, [u8; 3], [u8; 3])>,
-    /// The cells whose glyph is a DRAWN band icon (ruling 251).
+    /// The cells whose glyph is a drawn band icon.
     pub icons: Vec<(u16, Icon)>,
 }
 
@@ -1016,11 +974,11 @@ pub struct Resolved {
     pub raster: Option<RowRaster>,
 }
 
-/// Paint every committed band row of `p` (`paint::paint`, ruling 319) and
-/// resolve each on `c` (`resolve`): `hover` lights the chip under the
-/// pointer (or the body's `Details ›`) on its row, `geom` maps each surface
-/// onto the window, and `forced` says an OS-forced palette is up (the host's
-/// High Contrast latch, read once per paint).
+/// Paint every committed band row of `p` (`paint::paint`) and resolve each
+/// on `c` (`resolve`): `hover` lights the chip under the pointer (or the
+/// body's `Details ›`) on its row, `geom` maps each surface onto the window,
+/// and `forced` says an OS-forced palette is up (the host's High Contrast
+/// latch, read once per paint).
 #[must_use]
 pub fn paint_band(
     p: &Presentation,
@@ -1036,14 +994,14 @@ pub fn paint_band(
         .collect()
 }
 
-/// The inks a row's words wear, chosen ONCE for the row (design ruling 242)
-/// — never per cell from the tone passing under it, so an edge, a glint, a
-/// comet or an echo moving under a word never changes its ink.
+/// The inks a row's words wear, chosen once for the row, never per cell from
+/// the tone passing under it, so an edge, a glint, a comet or an echo moving
+/// under a word never changes its ink.
 pub(crate) struct RowInks<'a> {
     band: [u8; 3],
-    /// Each column's surface (the MEAN over its pixels, what the cell record
-    /// carries), and whether it lies on the FILL's side of the row — `None`
-    /// on an unmetered row.
+    /// Each column's surface (the mean over its pixels, what the cell record
+    /// carries), and whether it lies on the fill's side of the row; `None` on
+    /// an unmetered row.
     meter: Option<&'a [([u8; 3], bool)]>,
     hc: bool,
     /// The High Contrast ink for a word on the fill (`HIGHLIGHTTEXT`).
@@ -1052,23 +1010,23 @@ pub(crate) struct RowInks<'a> {
     plan: InkPlan,
 }
 
-/// A row's ink rule (ruling 242).
+/// A row's ink rule.
 #[derive(Clone, Copy)]
 pub(crate) enum InkPlan {
-    /// The band's own inks, untouched: an unmetered row, a RAIL row (the
-    /// strain gauge's words sit on the band, ruling 243).
+    /// The band's own inks, untouched: an unmetered row, a rail row (the
+    /// strain gauge's words sit on the band).
     Band,
-    /// A BUSY row: every role's ink floored ONCE toward `anchor` against the
-    /// hottest tone the comet can reach (`hot`) and its `track` (ruling 152's
-    /// side hold keeps every tone between them on the far side).
+    /// A busy row: every role's ink floored once toward `anchor` against the
+    /// hottest tone the comet can reach (`hot`) and its `track` (the side hold
+    /// keeps every tone between them on the far side).
     Busy {
         anchor: [u8; 3],
         hot: [u8; 3],
         track: [u8; 3],
     },
-    /// A DETERMINATE row: over the fill, the row's one crisp ink (ruling 222)
-    /// floored against every tone the fill side can take; over the track, each
-    /// role's ink floored against the track toward the band's anchor.
+    /// A determinate row: over the fill, the row's one crisp ink floored
+    /// against every tone the fill side can take; over the track, each role's
+    /// ink floored against the track toward the band's anchor.
     Bar {
         crisp: [u8; 3],
         track: [u8; 3],
@@ -1132,11 +1090,10 @@ impl RowInks<'_> {
 /// under it: WCAG AA, the floor the band's own inks meet on `bar_bg`.
 pub const WORD_AA: f64 = 4.5;
 
-/// A chip face's `(ink, fill)` (ruling 155): under High Contrast the system's
-/// inks (a lit chip its hover pair, a resting one WINDOWTEXT on the band);
-/// an OUTLINED Primary the inside's ground and its accent label
-/// ([`outlined_inks`], ruling 249); every other chip its own AA pair
-/// ([`chip_inks`]).
+/// A chip face's `(ink, fill)`: under High Contrast the system's inks (a lit
+/// chip its hover pair, a resting one WINDOWTEXT on the band); an outlined
+/// Primary the inside's ground and its accent label ([`outlined_inks`]);
+/// every other chip its own AA pair ([`chip_inks`]).
 fn chip_face_inks(c: &BandInks, chip: ChipFace) -> ([u8; 3], [u8; 3]) {
     match chip.form {
         ChipForm::Forced if chip.lit => match chip.role {
@@ -1155,11 +1112,10 @@ fn chip_face_inks(c: &BandInks, chip: ChipFace) -> ([u8; 3], [u8; 3]) {
     }
 }
 
-/// RESOLVE one engine-painted row (ruling 319) on this palette: its
-/// surface's tones to colours — at PIXEL resolution where the look is graded
-/// ([`RowRaster`], ruling 242) — each cell's slot or chip face to its ink,
-/// chosen once for the row, the chips' rings, the drawn icon, and last an
-/// echo's fade.
+/// Resolve one engine-painted row on this palette: its surface's tones to
+/// colours (at pixel resolution where the look is graded, [`RowRaster`]),
+/// each cell's slot or chip face to its ink, chosen once for the row, the
+/// chips' rings, the drawn icon, and last an echo's fade.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
@@ -1167,13 +1123,13 @@ fn chip_face_inks(c: &BandInks, chip: ChipFace) -> ([u8; 3], [u8; 3]) {
 )]
 pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
     let hc = rp.forced;
-    // A measured LEVEL is a RAIL (ruling 243): its words sit on the band's own
-    // ground, the rail in the row's lowest pixels in the warn hue — never the
-    // cursor accent, never a fill a word rides.
+    // A measured level is a rail: its words sit on the band's own ground, the
+    // rail in the row's lowest pixels in the warn hue; never the cursor
+    // accent, never a fill a word rides.
     let rail = rp.kind == RowSurface::Rail;
-    // THE METER IS THE ROW: the fill's ink is the cursor accent, `warn` on a
+    // The meter is the row: the fill's ink is the cursor accent, `warn` on a
     // Warn/Error row; under High Contrast the system's HIGHLIGHT whatever the
-    // severity — the forced `warn` is WINDOWTEXT, an ink, not a surface — and
+    // severity (the forced `warn` is WINDOWTEXT, an ink, not a surface) and
     // the words on it HIGHLIGHTTEXT.
     let fill = match rp.fill {
         Fill::Meter => c.meter,
@@ -1181,11 +1137,11 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
     };
     let (inks, side) = inks_for(c, fill, rp.busy, rail, hc);
     // The glint in the lowest pixels, where the fill's words leave it no room
-    // at full height (ruling 242).
+    // at full height.
     let glint_rail = !rp.busy && !rail && !hc && glint_needs_rail(c, fill, &inks);
     let rail_glint_ink = glint_rail.then(|| glint_step(fill, fill_ink(c, fill), true));
     let lin = LinInks::of(&inks);
-    // Each cell's record: the MEAN tone over its pixels, and its side.
+    // Each cell's record: the mean tone over its pixels, and its side.
     let tones: Option<Vec<([u8; 3], bool)>> = rp.columns.as_ref().map(|columns| {
         columns
             .iter()
@@ -1212,16 +1168,15 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
             })
             .collect()
     });
-    // THE ROW'S INKS, chosen once (ruling 242).
+    // The row's inks, chosen once.
     let plan = if matches!(rp.kind, RowSurface::Plain | RowSurface::Rail) {
         InkPlan::Band
     } else if let Some(anchor) = side {
-        // Floored against the hottest tone the comet can reach — its head,
-        // held on the words' side — and its track: nothing it draws between
-        // them is nearer the anchor (linear light), so no word brightens or
-        // dims as the head passes.
-        // A still busy row draws its unlit track only: no comet to floor
-        // against (the look changing is a change of state, not a flicker).
+        // Floored against the hottest tone the comet can reach (its head, held
+        // on the words' side) and its track: nothing it draws between them is
+        // nearer the anchor (linear light), so no word brightens or dims as the
+        // head passes. A still busy row draws its unlit track only: no comet
+        // to floor against.
         let still = matches!(rp.kind, RowSurface::Busy { still: true });
         InkPlan::Busy {
             anchor,
@@ -1279,11 +1234,11 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
             .iter()
             .any(|&(a, b)| (usize::from(a)..usize::from(b)).contains(&x))
     };
-    // THE PIXEL RASTER (ruling 242): the ground pixel by pixel in linear
-    // light, its edge antialiased over one pixel (each pixel is the MEAN of
-    // the profile over it); the glint in the lowest pixels where the words
-    // leave it no room at full height; a level's rail (ruling 243).
-    // Which window pixels lie on the fill's side (the fade's anchors).
+    // The pixel raster: the ground pixel by pixel in linear light, its edge
+    // antialiased over one pixel (each pixel is the mean of the profile over
+    // it); the glint in the lowest pixels where the words leave it no room at
+    // full height; a level's rail. Which window pixels lie on the fill's side
+    // (the fade's anchors):
     let mut fill_side: Vec<bool> = Vec::new();
     let mut raster = (rp.raster_ground || rail).then(|| {
         let mut r = RowRaster::default();
@@ -1343,13 +1298,13 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
             let under = r.ground.get(s.under_px).copied().unwrap_or(inks.fill);
             r.split = Some((s.col, s.x, crisp, under));
         }
-        // THE PASTEL FILL'S EDGE (ruling 264): the fill's last pixels in the
-        // palette's darker edge ink — the boundary a pastel cannot carry on
-        // its own — drawn after the split took the fill's own ground for its
-        // glyph. Each pixel trades the fill for the edge by the line's
-        // coverage of it (antialiased at both ends), in linear light, scaled
-        // by the fill's own strength there, so a stalled slate or a Fault's
-        // wash takes the line with it.
+        // The pastel fill's edge: the fill's last pixels in the palette's
+        // darker edge ink (the boundary a pastel cannot carry on its own),
+        // drawn after the split took the fill's own ground for its glyph. Each
+        // pixel trades the fill for the edge by the line's coverage of it
+        // (antialiased at both ends), in linear light, scaled by the fill's own
+        // strength there, so a stalled slate or a Fault's wash takes the line
+        // with it.
         if let Some(edge_ink) = c.meter_edge
             && fill == c.meter
             && let Some(line) = rp.edge_line()
@@ -1373,11 +1328,11 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
             .icons
             .push((col, icon));
     }
-    // An echo's fade (ruling 244): the row fades as ONE layer, in linear
-    // light, toward the band — and for its first half (the words' opacity at
-    // least one half) the ground under the words is held on their side and
-    // the words floored on it, so they keep AA to the midpoint and never
-    // change side; the second half fades that composed state to the band.
+    // An echo's fade: the row fades as one layer, in linear light, toward the
+    // band; for its first half (the words' opacity at least one half) the
+    // ground under the words is held on their side and the words floored on
+    // it, so they keep AA to the midpoint and never change side; the second
+    // half fades that composed state to the band.
     if rp.fade > 0 {
         let alpha = 1.0 - f64::from(rp.fade) / 255.0;
         let track_anchor = words_anchor(c);
@@ -1421,13 +1376,12 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
 }
 
 /// The inks a row's surface resolves against, from what the painter says of
-/// the row — its fill's ink, whether it is busy, whether it is a rail, and
-/// the forced palette — and, on a BUSY row, the anchor its words floor
-/// toward. A busy row's surface keeps its words' side (the comet, its track
-/// and its echoes); a determinate row's Fault wash keeps the fill's words'
-/// side, its hue kept (ruling 222) — High Contrast keeps its raw warn; a
-/// RAIL (a measured level, ruling 243) wears warn over the band itself,
-/// never the cursor accent.
+/// the row (its fill's ink, whether it is busy, whether it is a rail, and
+/// the forced palette) and, on a busy row, the anchor its words floor toward.
+/// A busy row's surface keeps its words' side (the comet, its track and its
+/// echoes); a determinate row's Fault wash keeps the fill's words' side, its
+/// hue kept (High Contrast keeps its raw warn); a rail (a measured level)
+/// wears warn over the band itself, never the cursor accent.
 #[must_use]
 #[allow(
     clippy::fn_params_excessive_bools,
@@ -1465,13 +1419,13 @@ pub fn inks_for(
     }
 }
 
-/// The level rail's warn (ruling 248): the warn HUE at a surface's chroma.
-/// A theme's warn is an INK, and on a dark band a pale one (`#f1fa8c`, `OkLCh`
-/// chroma 0.13): a three-pixel line of it under the words' descenders read
-/// as an underline, not a level. The rail keeps the warn's lightness and hue
-/// and lifts its chroma to [`RAIL_CHROMA`] as far as sRGB allows (`#f2fd4a`
-/// there; the light bands' amber is already at the gamut's edge and stays).
-/// High Contrast keeps its system ink.
+/// The level rail's warn: the warn hue at a surface's chroma. A theme's warn
+/// is an ink, and on a dark band often a pale one (`#f1fa8c`, `OkLCh` chroma
+/// 0.13) that under the words' descenders would read as an underline, not a
+/// level. The rail keeps the warn's lightness and hue and lifts its chroma to
+/// [`RAIL_CHROMA`] as far as sRGB allows (`#f2fd4a` there; the light bands'
+/// amber is already at the gamut's edge and stays). High Contrast keeps its
+/// system ink.
 pub(crate) fn rail_warn(warn: [u8; 3], hc: bool) -> [u8; 3] {
     if hc {
         return warn;
@@ -1480,16 +1434,16 @@ pub(crate) fn rail_warn(warn: [u8; 3], hc: bool) -> [u8; 3] {
     from_oklch(l, ch.max(RAIL_CHROMA), h)
 }
 
-/// The level rail's `OkLCh` chroma floor (ruling 248): a vivid warn, never the
-/// pale ink tone the words' glyph wears.
+/// The level rail's `OkLCh` chroma floor: a vivid warn, never the pale ink
+/// tone the words' glyph wears.
 const RAIL_CHROMA: f64 = 0.19;
 
-/// THE ONE INK every word wears over a determinate row's fill (rulings 222
-/// and 242): the row's crisp ink ([`fill_ink`]), floored ONCE against every
-/// tone the fill's side can take — the fill, its glint where it is drawn at
-/// full height, a Fault's warn wash — so no edge, glint, glide or echo
-/// passing under a word ever changes its ink. (A STALLED bar is a state, not
-/// a motion: its dim slate takes its own ink, `crisp_on_stalled`.)
+/// The one ink every word wears over a determinate row's fill: the row's
+/// crisp ink ([`fill_ink`]), floored once against every tone the fill's side
+/// can take (the fill, its glint where drawn at full height, a Fault's warn
+/// wash), so no edge, glint, glide or echo passing under a word ever changes
+/// its ink. A stalled bar is a state, not a motion: its dim slate takes its
+/// own ink, `crisp_on_stalled`.
 #[must_use]
 pub fn crisp_on_fill(c: &BandInks, fill: [u8; 3], inks: &MeterInks) -> [u8; 3] {
     let anchor = fill_anchor(fill);
@@ -1506,18 +1460,18 @@ pub fn crisp_on_fill(c: &BandInks, fill: [u8; 3], inks: &MeterInks) -> [u8; 3] {
     crisp
 }
 
-/// The one ink over a STALLED bar's dim slate ([`crisp_on_fill`]'s
+/// The one ink over a stalled bar's dim slate ([`crisp_on_fill`]'s
 /// counterpart for the stall's state).
 fn crisp_on_stalled(c: &BandInks, fill: [u8; 3], inks: &MeterInks) -> [u8; 3] {
     let stalled = LinInks::of(inks).rgb(Tone::STALLED.into());
     floor_word(fill_ink(c, fill), stalled, fill_anchor(stalled))
 }
 
-/// A ground and the ink on it at layer opacity `alpha` (ruling 244): above
-/// one half, the ground fades in linear light but is held on the words'
-/// side of `anchor` ([`hold_side`]) and the ink, faded alike, is floored on
-/// it toward `anchor` — the words keep AA and never flip; below one half,
-/// that state at one half fades on toward `band` as one layer.
+/// A ground and the ink on it at layer opacity `alpha`: above one half, the
+/// ground fades in linear light but is held on the words' side of `anchor`
+/// ([`hold_side`]) and the ink, faded alike, is floored on it toward
+/// `anchor`, so the words keep AA and never flip; below one half, that state
+/// at one half fades on toward `band` as one layer.
 pub(crate) fn faded_pair(
     bg: [u8; 3],
     fg: [u8; 3],
@@ -1551,18 +1505,18 @@ pub(crate) fn faded_ground(g: [u8; 3], band: [u8; 3], alpha: f64, anchor: [u8; 3
     }
 }
 
-/// `a` toward `b` by `t` (0–1) in LINEAR light.
+/// `a` toward `b` by `t` (0–1) in linear light.
 #[must_use]
 pub fn lin_mix(a: [u8; 3], b: [u8; 3], t: f64) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0);
     [0, 1, 2].map(|k| enc(lin(a[k]).mul_add(1.0 - t, lin(b[k]) * t)))
 }
 
-/// A row's [`MeterInks`] in linear light, for the pixel raster (ruling 242):
-/// a tone is the track mixed toward the fill by `fill`, that toward the
-/// glint by `lift`, plus `warn`'s share of warn over the track — in linear
-/// light, so a gradient has no dark band between its ends and a Fault's
-/// cross-fade stays inside the track–fill–warn hull.
+/// A row's [`MeterInks`] in linear light, for the pixel raster: a tone is the
+/// track mixed toward the fill by `fill`, that toward the glint by `lift`,
+/// plus `warn`'s share of warn over the track, in linear light so a gradient
+/// has no dark band between its ends and a Fault's cross-fade stays inside
+/// the track–fill–warn hull.
 pub(crate) struct LinInks {
     track: [f64; 3],
     fill: [f64; 3],
@@ -1610,11 +1564,11 @@ pub fn delta_e(a: [u8; 3], b: [u8; 3]) -> f64 {
     100.0 * ((l1 - l0).powi(2) + (a1 - a0).powi(2) + (b1 - b0).powi(2)).sqrt()
 }
 
-/// The glint's one perceptual STEP (ruling 242): the fill moved
-/// `GLINT_DL` in `OkLab` lightness AWAY from the ink its words wear on it —
-/// so the words only ever gain contrast under it and never change side —
-/// with a small chroma lift. `rail`: the other way, for the rail band under
-/// the words, where no ink sits.
+/// The glint's one perceptual step: the fill moved `GLINT_DL` in `OkLab`
+/// lightness away from the ink its words wear on it (so the words only ever
+/// gain contrast under it and never change side), with a small chroma lift.
+/// `rail`: the other way, for the rail band under the words, where no ink
+/// sits.
 #[must_use]
 pub fn glint_step(fill: [u8; 3], words: [u8; 3], rail: bool) -> [u8; 3] {
     let (l, ch, h) = oklch(fill);
@@ -1623,7 +1577,7 @@ pub fn glint_step(fill: [u8; 3], words: [u8; 3], rail: bool) -> [u8; 3] {
     from_oklch(GLINT_DL.mul_add(dir, l).clamp(0.0, 1.0), ch * 1.12, h)
 }
 
-/// The glint's lightness step in `OkLab` (ruling 242: 0.07–0.10).
+/// The glint's lightness step in `OkLab`, within 0.07–0.10.
 const GLINT_DL: f64 = 0.085;
 
 /// Whether a row's glint belongs in the rail band: its full-height step
@@ -1634,8 +1588,8 @@ fn glint_needs_rail(c: &BandInks, fill: [u8; 3], inks: &MeterInks) -> bool {
     delta_e(inks.glint, fill) < 6.0
 }
 
-/// An OUTLINED Primary's inks (ruling 249): the ring, the ground inside it
-/// and the label on that ground.
+/// An outlined Primary's inks: the ring, the ground inside it and the label
+/// on that ground.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutlinedInks {
     /// The ring.
@@ -1646,16 +1600,15 @@ pub struct OutlinedInks {
     pub label: [u8; 3],
 }
 
-/// The inks of an outlined Primary on a metered row (ruling 249). At rest:
-/// the ring is the row's accent — the meter's hue, already 3:1 on the band,
-/// or the theme's blue where that hue floored for its label reads brown
-/// ([`BandInks::ring`], ruling 260) —
-/// the inside is the band's own ground, and the label is that accent moved
-/// in linear light, its hue kept, by the least amount that reads at AA on the
-/// inside (`keep_side`). Lit: the ring lifts [`PRIMARY_HOVER_LIFT`]
-/// toward the theme's ink (the lit solid Primary's lift, ruling 160), the
-/// inside takes up to an `OUTLINE_LIT_TINT` tint of the accent — the most
-/// its label still clears AA on — and the ring holds 3:1 on it.
+/// The inks of an outlined Primary on a metered row. At rest: the ring is the
+/// row's accent (the meter's hue, already 3:1 on the band, or the theme's
+/// blue where that hue floored for its label reads brown, [`BandInks::ring`]),
+/// the inside is the band's own ground, and the label is that accent moved in
+/// linear light, its hue kept, by the least amount that reads at AA on the
+/// inside (`keep_side`). Lit: the ring lifts [`PRIMARY_HOVER_LIFT`] toward the
+/// theme's ink, the inside takes up to an `OUTLINE_LIT_TINT` tint of the
+/// accent (the most its label still clears AA on), and the ring holds 3:1 on
+/// it.
 #[must_use]
 pub fn outlined_inks(c: &BandInks, lit: bool) -> OutlinedInks {
     // The lit tint steps back toward the band until the label can clear AA
@@ -1692,15 +1645,14 @@ pub fn outlined_inks(c: &BandInks, lit: bool) -> OutlinedInks {
 const OUTLINE_LIT_TINT: f64 = 0.18;
 
 /// A chip's `(ink, fill, bold)` off High Contrast, every label at AA on its
-/// own fill (design ruling 155) — over the band, the track or the fill,
-/// resting or lit. A Primary keeps its polarity, the band's ink on the
-/// accent: where that pair falls short (3.69:1 on Solarized Light, 4.28:1 on
-/// GitHub Light) the ACCENT deepens in linear light, its hue kept, by the
-/// least amount that clears AA ([`keep_side`]) — flooring the ink instead
-/// turned Solarized's label black on blue. The lit Primary is lifted from it
-/// and deepened the same way (ruling 160). A Primary on a metered row is
-/// OUTLINED instead ([`outlined_inks`], ruling 249). Every other label is
-/// lifted to AA by [`ensure_contrast_either`].
+/// own fill, over the band, the track or the fill, resting or lit. A Primary
+/// keeps its polarity, the band's ink on the accent: where that pair falls
+/// short (3.69:1 on Solarized Light, 4.28:1 on GitHub Light) the accent
+/// deepens in linear light, its hue kept, by the least amount that clears AA
+/// ([`keep_side`]), rather than turning the label black. The lit Primary is
+/// lifted from it and deepened the same way. A Primary on a metered row is
+/// outlined instead ([`outlined_inks`]). Every other label is lifted to AA by
+/// [`ensure_contrast_either`].
 #[must_use]
 pub(crate) fn chip_inks(
     c: &BandInks,
@@ -1710,10 +1662,9 @@ pub(crate) fn chip_inks(
 ) -> ([u8; 3], [u8; 3], bool) {
     let accent = keep_side(c.accent, c.bar_bg, WORD_AA);
     let (fg, bg, bold) = match (role, lit) {
-        // Lifted from the accent the chip WEARS, so a deepened rest keeps a
-        // whole lift between it and its lit form (ruling 160; Catppuccin
-        // Latte's rest and lit were 1.01:1 apart when the lit fill was
-        // lifted from the raw accent and deepened on its own).
+        // Lifted from the accent the chip wears, so a deepened rest keeps a
+        // whole lift between it and its lit form (lifting the raw accent and
+        // deepening it on its own can leave the two nearly equal).
         (CapsuleRole::Primary, true) => {
             let ink = c.capsule_primary_hover_ink;
             let lit = mix3(accent, c.primary_lift_toward, PRIMARY_HOVER_LIFT);
@@ -1734,25 +1685,20 @@ pub(crate) fn chip_inks(
 mod tests {
     use super::*;
 
-    /// THE CONTRAST IS aterm-types' ARITHMETIC, NOT THE PALETTE'S (ruling
-    /// 324): the pin pair `(#000000, #f8f8f2)` gives `…a6` in
-    /// `aterm_types::Rgb::contrast`'s unfused arithmetic (read from it, not
-    /// guessed) and `…a7` in the palette's fused one. Neither can be silently
-    /// "unified" without this failing.
+    /// THE CONTRAST IS aterm-types' ARITHMETIC (ruling 324): the pin pair
+    /// `(#000000, #f8f8f2)` gives `…a6` in `aterm_types::Rgb::contrast`'s
+    /// unfused arithmetic (read from it, not guessed), where a fused
+    /// luminance gives `…a7`; the palette imports this one (ruling 438).
     #[test]
-    fn contrast_is_the_types_arithmetic_not_the_palettes() {
+    fn contrast_is_the_types_arithmetic() {
         let (a, b) = ([0, 0, 0], [0xf8, 0xf8, 0xf2]);
         assert_eq!(contrast(a, b).to_bits(), 0x4033_b34e_4a38_aca6);
-        assert_eq!(
-            crate::palette::contrast(a, b).to_bits(),
-            0x4033_b34e_4a38_aca7
-        );
         assert_eq!(contrast(a, b).to_bits(), contrast(b, a).to_bits());
     }
 
-    /// THE f32 BOUNDARY IS KEPT (ruling 324): the twelve colours whose luma
-    /// is exactly 150 in exact arithmetic are LIGHT in the f32 one, and the
-    /// integer test's neighbours on each side stay where they were.
+    /// The f32 boundary is kept: the twelve colours whose luma is exactly 150
+    /// in exact arithmetic are light in the f32 one, and the integer test's
+    /// neighbours on each side stay where they are.
     #[test]
     fn bg_is_light_keeps_the_f32_boundary() {
         let at_150: [[u8; 3]; 12] = [
@@ -1780,8 +1726,8 @@ mod tests {
         assert!(bg_is_light([0xff, 0xff, 0xff]));
     }
 
-    /// Each ink slot is its one [`BandInks`] ink (ruling 320), on a dark and
-    /// a light derived palette and a forced one.
+    /// Each ink slot is its one [`BandInks`] ink, on a dark and a light
+    /// derived palette and a forced one.
     #[test]
     fn every_ink_slot_is_its_palette_ink() {
         let dark = BandInks::derive(
@@ -1825,11 +1771,11 @@ mod tests {
         }
     }
 
-    /// THE FORCED MAPPING (Windows High Contrast, CSS forced-colors): the
-    /// band is BTNFACE, the well WINDOW, the meter HIGHLIGHT on a WINDOW
-    /// track, every ink WINDOWTEXT, the lit chips HIGHLIGHT with
-    /// HIGHLIGHTTEXT; a well that shares the band's tone gets a border, and
-    /// nothing theme-derived survives (no pastel edge).
+    /// The forced mapping (Windows High Contrast, CSS forced-colors): the band
+    /// is BTNFACE, the well WINDOW, the meter HIGHLIGHT on a WINDOW track,
+    /// every ink WINDOWTEXT, the lit chips HIGHLIGHT with HIGHLIGHTTEXT; a
+    /// well that shares the band's tone gets a border, and nothing
+    /// theme-derived survives (no pastel edge).
     #[test]
     fn the_forced_palette_maps_each_system_colour_to_its_role() {
         let hc = ForcedPalette {

@@ -1,50 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive answer @<worker> [--box TOKEN] <answer>`: a CONTROLLING
-//! session types ITS OWN choice into a worker's Claude Code question dialog
-//! (AskUserQuestion) — the owner's "if being explicitly controlled via
-//! another aterm session … get the selection by the other controller
-//! session" (2026-09-23). The worker's window hands the dialog over when the
-//! session's word is `ask` (`aterm ctl @<worker> meta set questions ask`);
-//! the controller reads it (`aterm drive phase`: its `kind question`, its
-//! options, its `box <token>`) and answers it with this.
+//! `aterm drive answer @<worker> [--box TOKEN] <answer>`: a controlling session
+//! types its own choice into a worker's Claude Code question dialog
+//! (AskUserQuestion). The worker's window hands the dialog over when the
+//! session's word is `ask` (`aterm ctl @<worker> meta set questions ask`); the
+//! controller reads it (`aterm drive phase`) and answers it with this.
 //!
-//! One SCREEN at a time — the tab on display — through the window
-//! supervisor's own keys ([`Session::press_question`]): the focus moved one
-//! row a key, each move seen landing on a fresh read, then Enter guarded on
-//! the chosen row as drawn under the screen-generation fence. Never a digit,
-//! Esc, `n`, or a key on the free-text row, the chat row or the review's
-//! cancel; a person who keys the session meanwhile gets it (`LEFT`). The
-//! answer:
+//! One screen at a time, through the window supervisor's own keys
+//! ([`Session::press_question`]): the focus moved one row per key, each move
+//! seen landing, then Enter guarded on the chosen row under the
+//! screen-generation fence. Never a digit, Esc, `n`, or a key on the free-text
+//! row, chat row or review's cancel; a person keying meanwhile gets it
+//! (`LEFT`). The answer:
 //!
-//! * `<n>` or an option's exact label (case folded) — single-select and the
-//!   preview form: that option;
-//! * a multi-select: the options to CHECK, `, `-joined (numbers or labels) —
-//!   each whose check differs is toggled, then the button (`Next`/`Submit`);
-//! * `submit` on the review (Submit) tab;
-//! * `recommended` — what the window itself would press
-//!   ([`super::super::policy::question::answer_question`]);
-//! * `human` — nothing typed, `LEFT`.
+//! * `<n>` or an option's exact label (case folded): that option;
+//! * on a multi-select, the options to check, `, `-joined, then the button;
+//!   refused while the free-text row holds text;
+//! * `submit` on the review tab;
+//! * `recommended`: what the window presses under the `recommended` priority
+//!   ([`super::super::policy::question::answer_question`]), the whole tab on a
+//!   multi-select;
+//! * `human`: nothing typed, `LEFT`.
 //!
-//! Anything else is REFUSED: a free-text answer is a person's to type (the
-//! window's rules keep every key off that row). `--box TOKEN` refuses a
-//! dialog whose token ([`question_box_token`]) is not TOKEN — the one the
-//! controller read — so an answer never lands on another question.
+//! Anything else is refused: free text is a person's to type. `long-term` and
+//! `short-term`, where they name no option, are refused with the `meta set
+//! questions <word>` that has the window answer by that policy (the one writer
+//! of its text, which remembers writing it). `--box TOKEN` refuses a dialog
+//! whose token ([`question_box_token`]) differs, so an answer never lands on
+//! another question.
 //!
-//! Prints ONE line: `ANSWERED @<w> enters=<k> answer=<what> next=<the question
-//! on display after it|review|none>` (exit 0), `LEFT @<w> <why>` (exit 0),
-//! `NO-BOX @<w> …` (exit 1), `REFUSED @<w> <why>` (exit 2, nothing typed),
-//! `NOT-SERVED @<w> <why> (enters=<k>)` (exit 3: the host or the dialog did not
-//! take the answer as decided; the focus may have moved, and enters>0 answered
-//! part of it).
+//! Prints one line: `ANSWERED @<w> enters=<k> answer=<what> next=<…>` (exit
+//! 0), `LEFT @<w> <why>` (exit 0), `NO-BOX @<w> …` (exit 1), `REFUSED @<w>
+//! <why>` (exit 2, nothing typed), `NOT-SERVED @<w> <why> (enters=<k>)` (exit
+//! 3: the host or the dialog did not take the answer as decided).
 
 use std::io::Write;
 
 use aterm_phase::{QuestionDialog, QuestionForm, QuestionOption};
 
-use super::super::policy::approval::{Answer, AnswerTarget, Choice, Decision};
-use super::super::policy::question::{answer_question, focus_position, target_focus};
+use super::super::policy::approval::{Answer, AnswerTarget, Choice, Decision, QuestionPriority};
+use super::super::policy::question::{
+    Pane, answer_question, focus_position, recommended_set, target_focus,
+};
 use super::*;
 
 /// No question dialog on the screen.
@@ -75,11 +73,7 @@ pub fn question_box_token(dialog: &QuestionDialog) -> String {
     }
     name.push('\u{1e}');
     name.push_str(question);
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let h = aterm_hash::fnv1a_64(name.as_bytes());
     format!("{:08x}", (h ^ (h >> 32)) & 0xffff_ffff)
 }
 
@@ -108,9 +102,14 @@ fn option_named<'a>(options: &'a [QuestionOption], word: &str) -> Option<&'a Que
         .find(|o| o.label.trim().eq_ignore_ascii_case(word))
 }
 
-/// Plan `answer` on the dialog on display (module header). `Err` is the
-/// refusal: nothing is typed.
-fn plan(prompt: &aterm_phase::PromptV2, rows: &[String], answer: &str) -> Result<Plan, String> {
+/// Plan `answer` on the dialog on display (module header), for the worker
+/// `who`. `Err` is the refusal: nothing is typed.
+fn plan(
+    prompt: &aterm_phase::PromptV2,
+    rows: &[String],
+    answer: &str,
+    who: &str,
+) -> Result<Plan, String> {
     let Some(dialog) = prompt.question_dialog.as_ref() else {
         return Err("the dialog was not read whole".to_string());
     };
@@ -119,13 +118,59 @@ fn plan(prompt: &aterm_phase::PromptV2, rows: &[String], answer: &str) -> Result
         return Ok(Plan::Human);
     }
     if answer.eq_ignore_ascii_case("recommended") {
-        return match answer_question(prompt, rows) {
+        let decision = answer_question(
+            prompt,
+            rows,
+            QuestionPriority::Recommended,
+            None,
+            false,
+            Pane::of(rows),
+        );
+        return match decision {
+            // A multi-select's recommended answer is the whole tab: the
+            // decider returns one step of it, so it is planned as the
+            // explicit `a, b` answer is (each unchecked recommended option
+            // toggled, then the button), after the decider approved the tab,
+            // so its refusals still stand and nothing is ever unchecked.
             Decision::Approve {
-                choice: Choice::Answer(Answer::FocusEnter { target, .. }),
+                choice: Choice::Answer(answer),
+                ..
+            } if matches!(answer.enter_target(), Some(AnswerTarget::Option(_)))
+                && matches!(dialog.form, QuestionForm::Multi { .. }) =>
+            {
+                let QuestionForm::Multi {
+                    question,
+                    options,
+                    button,
+                    ..
+                } = &dialog.form
+                else {
+                    return Err("the dialog is no multi-select".to_string());
+                };
+                let want = recommended_set(options);
+                let mut targets: Vec<AnswerTarget> = options
+                    .iter()
+                    .filter(|o| want.contains(&o.n) && o.checked != Some(true))
+                    .map(|o| AnswerTarget::Option(o.n))
+                    .collect();
+                targets.push(AnswerTarget::Button);
+                let labels = options
+                    .iter()
+                    .filter(|o| want.contains(&o.n))
+                    .map(|o| o.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Ok(Plan::Keys {
+                    targets,
+                    said: format!("{} → {} ({labels})", question.text, button.label),
+                })
+            }
+            Decision::Approve {
+                choice: Choice::Answer(answer),
                 subject,
                 ..
-            } => Ok(Plan::Keys {
-                targets: vec![target],
+            } if answer.enter_target().is_some() => Ok(Plan::Keys {
+                targets: answer.enter_target().into_iter().collect(),
                 said: subject,
             }),
             Decision::Approve { .. } | Decision::Decline { .. } => {
@@ -136,8 +181,24 @@ fn plan(prompt: &aterm_phase::PromptV2, rows: &[String], answer: &str) -> Result
             )),
         };
     }
-    let free_text =
-        || format!("{answer:?} names no option: a free-text answer is a person's to type");
+    // A text priority is the window's policy, never an answer typed from here
+    // (where it names no option on the tab): its text is written by the loop
+    // that remembers writing it, and an out-of-process write would be a
+    // second owner of the free-text row. The session's word asks the window
+    // to.
+    let policy = QuestionPriority::parse(answer).filter(|p| p.text().is_some());
+    let refused_policy = |p: QuestionPriority| {
+        format!(
+            "{answer:?} is a question policy, not an answer: `aterm ctl {who} meta set questions \
+             {}` has the window answer this session's questions by it (an answer here is an \
+             option, `submit`, `recommended` or `human`)",
+            p.word()
+        )
+    };
+    let free_text = || match policy {
+        Some(p) => refused_policy(p),
+        None => format!("{answer:?} names no option: a free-text answer is a person's to type"),
+    };
     match &dialog.form {
         QuestionForm::Single { options, .. } | QuestionForm::Preview { options, .. } => {
             let o = option_named(options, answer).ok_or_else(free_text)?;
@@ -145,6 +206,18 @@ fn plan(prompt: &aterm_phase::PromptV2, rows: &[String], answer: &str) -> Result
                 targets: vec![AnswerTarget::Option(o.n)],
                 said: o.label.clone(),
             })
+        }
+        // The button submits the free-text row with the checks when the row
+        // holds text (ticked): an answer the controller did not name, and a
+        // free-text answer — never sent from here. Refused before any key.
+        QuestionForm::Multi { free_text: row, .. }
+            if !row.pristine || row.checked == Some(true) =>
+        {
+            Err(
+                "the free-text row holds text, which the button would submit with the options \
+                 named: a free-text answer is a person's to finish (`human` leaves the dialog)"
+                    .to_string(),
+            )
         }
         QuestionForm::Multi { options, .. } => {
             let mut want = Vec::new();
@@ -175,9 +248,12 @@ fn plan(prompt: &aterm_phase::PromptV2, rows: &[String], answer: &str) -> Result
             targets: vec![AnswerTarget::ReviewSubmit],
             said: "submit".to_string(),
         }),
-        QuestionForm::Review { .. } => Err(format!(
-            "{answer:?} on the review tab: `submit` sends the answers shown, `human` leaves it"
-        )),
+        QuestionForm::Review { .. } => Err(match policy {
+            Some(p) => refused_policy(p),
+            None => format!(
+                "{answer:?} on the review tab: `submit` sends the answers shown, `human` leaves it"
+            ),
+        }),
         QuestionForm::Unknown { why } => Err(format!("the dialog was not read whole: {why}")),
     }
 }
@@ -242,7 +318,7 @@ impl<C: Ctl> Session<'_, C> {
                 );
             }
         }
-        let (targets, said) = match plan(&prompt, &screen.rows, &opts.answer) {
+        let (targets, said) = match plan(&prompt, &screen.rows, &opts.answer, &who) {
             Ok(Plan::Human) => return say(format!("LEFT {who} human: nothing typed"), 0),
             Ok(Plan::Keys { targets, said }) => (targets, said),
             Err(why) => return say(format!("REFUSED {who} {why}"), EXIT_REFUSED),
@@ -301,6 +377,11 @@ impl<C: Ctl> Session<'_, C> {
                 Pressing::Done(Press::Unseen { .. }) => {
                     "a focus move's effect was not seen: nothing more was sent".to_string()
                 }
+                // `plan` never types a policy text: a controller's answer is
+                // an option.
+                Pressing::Done(Press::Typed { .. }) => {
+                    "a policy text was written where an option was chosen".to_string()
+                }
                 Pressing::Withheld => "the host has no guarded key".to_string(),
                 Pressing::Halted { why }
                 | Pressing::Refused { why }
@@ -342,12 +423,12 @@ mod tests {
 
     fn planned(text: &str, answer: &str) -> Result<Plan, String> {
         let (p, rows) = read(text);
-        plan(&p, &rows, answer)
+        plan(&p, &rows, answer, "@s-w")
     }
 
     /// Single-select: a number or an exact label (case folded) names the
     /// option; `recommended` is what the window would press; `human` types
-    /// nothing. NEGATIVE CONTROLS: a word that names no option is refused as
+    /// nothing. Negative controls: a word that names no option is refused as
     /// free text, and a number past the options is too.
     #[test]
     fn a_single_select_answer_names_one_option_or_is_refused() {
@@ -373,6 +454,108 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+    }
+
+    /// A text priority is no answer a controller types: `long-term` and
+    /// `short-term` (any case) are refused, nothing typed, and the refusal
+    /// names the session word that has the window answer by that policy.
+    /// Negative control: `recommended` plans the window's own option.
+    #[test]
+    fn a_text_priority_is_refused_naming_the_session_word_that_asks_the_window() {
+        for (answer, word) in [("long-term", "long-term"), ("Short-Term", "short-term")] {
+            let err = planned(f::QUESTION_283_FREE_TEXT_FOCUSED, answer).expect_err(answer);
+            assert!(
+                err.contains(&format!(
+                    "is a question policy, not an answer: `aterm ctl @s-w meta set questions \
+                     {word}` has the window answer this session's questions by it"
+                )),
+                "{answer}: {err}"
+            );
+        }
+        assert!(matches!(
+            planned(f::QUESTION_283_FREE_TEXT_FOCUSED, "recommended"),
+            Ok(Plan::Keys { ref targets, .. }) if targets == &[AnswerTarget::Option(1)]
+        ));
+    }
+
+    /// A priority word that is an option's label is that option: a question
+    /// whose options are `Long-term` / `Short-term` is answered by its label as
+    /// any other; the word is refused as a policy only where it names no
+    /// option on the tab. Single- and multi-select alike. Negative control: the
+    /// same word on a dialog without such a label is still refused.
+    #[test]
+    fn a_priority_word_that_labels_an_option_answers_that_option() {
+        let single = f::QUESTION_ONE.replace("  2. Light", "  2. Long-term");
+        for answer in ["long-term", "Long-term", " LONG-TERM "] {
+            assert_eq!(
+                planned(&single, answer),
+                Ok(Plan::Keys {
+                    targets: vec![AnswerTarget::Option(2)],
+                    said: "Long-term".to_string(),
+                }),
+                "{answer:?}"
+            );
+        }
+        let err = planned(&single, "short-term").expect_err("no such option");
+        assert!(
+            err.contains("is a question policy, not an answer")
+                && err.contains("meta set questions short-term"),
+            "{err}"
+        );
+        let multi =
+            f::QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED.replace("[ ] Olives", "[ ] Short-term");
+        assert_eq!(
+            planned(&multi, "short-term"),
+            Ok(Plan::Keys {
+                targets: vec![AnswerTarget::Option(2), AnswerTarget::Button],
+                said: "Short-term".to_string(),
+            })
+        );
+        let err = planned(&multi, "long-term").expect_err("no such option");
+        assert!(err.contains("is a question policy, not an answer"), "{err}");
+    }
+
+    /// `recommended` on a multi-select is the whole tab: every unchecked
+    /// recommended option toggled, then the button. A tab whose recommended
+    /// options are all checked is its button alone. Negative control: a
+    /// person's check outside the recommended set is still refused before any
+    /// key.
+    #[test]
+    fn recommended_on_a_multi_select_plans_the_whole_tab() {
+        let said = "Which glyph sets should be bundled? → Next (Box drawing (Recommended), \
+                    Powerline (Recommended))";
+        assert_eq!(
+            planned(f::QUESTION_MULTISELECT, "recommended"),
+            Ok(Plan::Keys {
+                targets: vec![
+                    AnswerTarget::Option(1),
+                    AnswerTarget::Option(3),
+                    AnswerTarget::Button
+                ],
+                said: said.to_string(),
+            })
+        );
+        assert_eq!(
+            planned(f::QUESTION_MULTISELECT, "recommended").map(|p| match p {
+                Plan::Keys { targets, .. } => targets,
+                Plan::Human => Vec::new(),
+            }),
+            planned(f::QUESTION_MULTISELECT, "1, 3").map(|p| match p {
+                Plan::Keys { targets, .. } => targets,
+                Plan::Human => Vec::new(),
+            }),
+            "the explicit answer's keys"
+        );
+        assert_eq!(
+            planned(f::QUESTION_MULTISELECT_CHECKED, "recommended"),
+            Ok(Plan::Keys {
+                targets: vec![AnswerTarget::Button],
+                said: said.to_string(),
+            })
+        );
+        let person = f::QUESTION_MULTISELECT.replace("[ ] Emoji", "[✔] Emoji");
+        let err = planned(&person, "recommended").expect_err("a person's check");
+        assert!(err.contains("not recommended"), "{err}");
     }
 
     /// Multi-select: the options to CHECK — each whose check differs is
@@ -405,7 +588,7 @@ mod tests {
     }
 
     /// The token is the same on every read of one screen and differs across
-    /// questions and tabs (the four-tab incident's tabs, the review).
+    /// questions and tabs.
     #[test]
     fn the_box_token_names_one_screen() {
         let token = |t: &str| question_box_token(&read(t).0.question_dialog.expect("read whole"));

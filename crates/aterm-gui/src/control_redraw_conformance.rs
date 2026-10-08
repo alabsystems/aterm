@@ -1,36 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Phase 1a exit gate: `aterm-control`'s verb matrix run against a
-//! [`GuiHost`] that holds a REAL `EventLoopProxy`, plus the one claim only that
-//! host can support — a control-socket `select` reaches the window as a `Wake`
-//! redraw.
+//! `aterm-control`'s verb matrix run against a [`GuiHost`] that holds a real
+//! `EventLoopProxy`, plus the one claim only that host supports: a
+//! control-socket `select` reaches the window as a `Wake` redraw.
 //!
-//! # WHY THIS IS A BINARY AND NOT A `#[test]` — do not convert it
+//! # Why a binary and not a `#[test]`
 //!
-//! `EventLoop` construction panics unless it runs on the process MAIN thread, on
-//! every target, and libtest runs every `#[test]` body on a spawned thread. So no
-//! test in this crate can mint an `EventLoopProxy<Wake>`, and the unit matrix in
-//! `control_host.rs` must build its host with `proxy: None`. That is the WHOLE
-//! delta from the shipped host, and it reaches exactly two things:
-//! [`SessionHost::request_redraw`] becomes a no-op and `capabilities().event_loop`
-//! reads false — so nothing over there can show a `select` repainting anything.
-//! Only a target that owns `fn main` can, which is what `src/bin/
-//! aterm-redraw-conformance.rs` exists to be.
+//! `EventLoop` construction panics off the process main thread, and libtest runs
+//! each `#[test]` on a spawned thread. So the unit matrix in `control_host.rs`
+//! builds its host with `proxy: None`, which makes
+//! [`SessionHost::request_redraw`] a no-op and `capabilities().event_loop` false.
+//! Only a target that owns `fn main` (`src/bin/aterm-redraw-conformance.rs`) can
+//! observe a repaint. A `harness = false` test would be a separate crate, and
+//! [`GuiHost`] is private to `control`.
 //!
-//! A `harness = false` integration test also owns `fn main`, and was rejected for
-//! a second reason: a test target is a separate crate, and [`GuiHost`] is private
-//! to `control`. Moving the gate there would mean widening the shipped API to
-//! satisfy a test.
+//! # Exit codes
 //!
-//! # Exit codes — CI gates on these, not on the prose
-//!
-//! * `0` — every check passed AND every promised redraw was delivered.
+//! * `0` — every check passed and every promised redraw was delivered.
 //! * `1` — a check failed, or a redraw the host accepted never arrived.
-//! * `2` — NOT RUN: no event loop is constructible here (headless, no display).
-//!
-//! `2` is deliberately not `0`: a gate that could not run must never be readable
-//! as a gate that passed.
+//! * `2` — not run: no event loop is constructible here (headless, no display).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,13 +44,13 @@ use crate::{SessionCtx, Wake, term_lock};
 const PASS: i32 = 0;
 /// A check failed, or a redraw the host accepted never reached the loop.
 const FAIL: i32 = 1;
-/// The gate could not execute here. NOT a pass; see the module docs.
+/// The gate could not execute here; not a pass.
 const NOT_RUN: i32 = 2;
 
 /// The session the host serves.
 const SID: u64 = 0;
-/// A registered SIBLING — resolvable fleet-wide, served by nobody here, so the
-/// negative phase has a sid that is real rather than merely unknown.
+/// A registered sibling: resolvable fleet-wide but served by nobody here, so the
+/// negative phase uses a real sid rather than an unknown one.
 const SIBLING_SID: u64 = 1;
 
 /// Long enough for macOS to launch its `NSApplication` (the first pump only gets
@@ -73,8 +62,8 @@ const DELIVERY_BUDGET: Duration = Duration::from_secs(2);
 /// How long "nothing arrived" is observed for before it counts as nothing.
 const QUIET: Duration = Duration::from_millis(250);
 
-/// Every `Wake` the loop actually DELIVERED. Delivery is the claim under test, so
-/// the harness asserts on this — never on the proxy having accepted the send.
+/// Every `Wake` the loop delivered. The harness asserts on delivery, never on
+/// the proxy having accepted the send.
 #[derive(Default)]
 struct DeliveredWakes {
     /// The `session` of each `Wake::Output` — what `request_redraw` posts.
@@ -124,8 +113,7 @@ fn pump_for_redraws(
     delivered.redraws_for(sid)
 }
 
-/// Pump for the WHOLE budget whatever arrives — the shape a negative claim needs,
-/// since "nothing was delivered" cannot short-circuit on success.
+/// Pump for the whole budget whatever arrives, as a negative claim needs.
 fn pump_until_quiet(
     event_loop: &mut EventLoop<Wake>,
     delivered: &mut DeliveredWakes,
@@ -142,12 +130,11 @@ fn pump_until_quiet(
     }
 }
 
-/// A session registered exactly as the GUI registers a tab — shared engine `Arc`,
-/// fabric identity, sink — so the host under test is the SHIPPED shape.
+/// A session registered as the GUI registers a tab (shared engine `Arc`, fabric
+/// identity, sink), so the host under test has the shipped shape.
 ///
-/// The `-1` master is not a shortcut: the only frame the matrix writes is empty,
-/// and `write_input` answers that one before it reaches the fd. Bytes-actually-land
-/// is proven next to the real sink, in `control_host.rs`.
+/// The `-1` master is safe: the matrix writes only an empty frame, which
+/// `write_input` answers before reaching the fd.
 fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHandle {
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
@@ -165,7 +152,6 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
         turns: Arc::new(Mutex::new(crate::turn_ledger::TurnLedger::default())),
         meta: Mutex::new(crate::session_timeline::SessionMeta::default()),
-        app_kitty: Mutex::new(crate::app_kitty::AppKittySlot::default()),
         timeline: Arc::new(Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
@@ -190,14 +176,12 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
     }
 }
 
-/// Run the gate on THIS thread, which the caller guarantees is the process main
-/// thread. Answers the process exit code; see the module docs for what each means.
+/// Run the gate on this thread, which must be the process main thread. Returns
+/// the process exit code (see the module docs).
 #[must_use]
 pub fn run_redraw_conformance() -> i32 {
-    // First, because everything below is meaningless without a proxy — and because
-    // the honest SKIP lives on this one error.
-    // The quiet builder: this harness owns no window and must never take the
-    // keyboard from the developer the gate is running beside.
+    // The quiet builder: this harness owns no window and must not take the
+    // keyboard. A build failure here is the NOT_RUN exit.
     let mut event_loop = match crate::quiet_driver_event_loop_builder::<Wake>().build() {
         Ok(event_loop) => event_loop,
         Err(err) => {
@@ -239,9 +223,8 @@ pub fn run_redraw_conformance() -> i32 {
         return FAIL;
     }
 
-    // Why DECLARED: this gate holds a live proxy, so unlike the #[test] host every
-    // capability is genuinely present — `run_all` would let one that stopped
-    // delivering take the easy arm of its check and still report green.
+    // Declared capabilities: this host has a live proxy, so a capability that
+    // stopped delivering must fail rather than take `run_all`'s easy arm.
     let outcomes = conformance::run_all_declared(
         &host,
         SID,
@@ -276,9 +259,8 @@ pub fn run_redraw_conformance() -> i32 {
     );
 
     let mut redraw_failures = 0usize;
-    // THE CLAIM THE UNIT MATRIX CANNOT MAKE: `select` answered OK on the wire AND
-    // the repaint reached the event loop. Both selection forms, because they take
-    // the two different `request_redraw` sites in `cmd_select`.
+    // `select` answers OK on the wire and the repaint reaches the event loop.
+    // Both forms, since they take the two `request_redraw` sites in `cmd_select`.
     for form in ["0 0 0 4", "clear"] {
         delivered.redraws.clear();
         let reply = cmd_select(&host, SID, form);
@@ -298,8 +280,7 @@ pub fn run_redraw_conformance() -> i32 {
         }
     }
 
-    // FAIL-CLOSED, end to end: a sibling sid this host does not serve must post
-    // NOTHING. Anything delivered here would repaint on a borrowed number.
+    // Fail closed: a sibling sid this host does not serve must post nothing.
     pump_until_quiet(&mut event_loop, &mut delivered, QUIET);
     delivered.redraws.clear();
     host.request_redraw(SIBLING_SID);

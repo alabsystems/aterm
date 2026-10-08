@@ -10,7 +10,7 @@
 //! trust-mc, so an unrunnable harness here would be a claim nothing checks.
 //!
 //! All proofs use symbolic inputs via `kani::any()` to explore the full bounded
-//! input space. Strengthened from concrete-only versions (Part of #6850).
+//! input space.
 
 use super::*;
 

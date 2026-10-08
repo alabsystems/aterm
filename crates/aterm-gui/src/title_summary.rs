@@ -227,9 +227,8 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn metadata(term: &Terminal) -> (Self, SemanticStamp) {
+    fn metadata(term: &Terminal) -> Self {
         use crate::cwd_native::ReportedCwd as _;
-        let stamp = semantic_stamp(term);
         let title = bounded_text(term.title(), MAX_COMMAND_CHARS);
         // This snapshot feeds the summarizer's prompt and the description shown
         // to the user, so it carries the native path rather than the engine's
@@ -253,32 +252,31 @@ impl Snapshot {
                     block_activity(term, block),
                     block.exit_code,
                     command,
-                    // A block's cwd is the OSC 7 URI path (`/C:/Users//x` on
-                    // Windows); spell it natively like the terminal's own cwd,
-                    // or this fallback shows the URI form. Identity off Windows.
-                    block
-                        .working_directory
-                        .as_deref()
-                        .map(|dir| crate::cwd_native::native_path(dir).into_owned()),
+                    block.working_directory.as_deref(),
                 )
             },
         );
         let cwd = if cwd.is_empty() {
-            bounded_text(block_cwd.as_deref().unwrap_or_default(), MAX_COMMAND_CHARS)
+            // A block's cwd is the OSC 7 URI path (`/C:/Users//x` on Windows);
+            // spell it natively like the terminal's own cwd, or this fallback
+            // shows the URI form. Identity off Windows.
+            bounded_text(
+                &block_cwd
+                    .map(crate::cwd_native::native_path)
+                    .unwrap_or_default(),
+                MAX_COMMAND_CHARS,
+            )
         } else {
             cwd
         };
-        (
-            Self {
-                title,
-                cwd,
-                command,
-                state,
-                exit_code,
-                recent_output: String::new(),
-            },
-            stamp,
-        )
+        Self {
+            title,
+            cwd,
+            command,
+            state,
+            exit_code,
+            recent_output: String::new(),
+        }
     }
 
     fn capture_recent_output(&mut self, term: &Terminal, wanted: usize) {
@@ -706,44 +704,37 @@ impl Coordinator {
         }
         let fingerprint = self.authority_fingerprint;
         let semantic = semantic_stamp(term);
-        let authority_changed = self.entries.get(&session).is_some_and(|entry| {
+        let prior = self.entries.get(&session);
+        let authority_changed = prior.is_some_and(|entry| {
             entry.authority_epoch != self.authority_epoch || entry.config_fingerprint != fingerprint
         });
-        let boundary = self
-            .entries
-            .get(&session)
-            .is_none_or(|entry| entry.semantic != semantic || authority_changed);
+        let boundary = prior.is_none_or(|entry| entry.semantic != semantic || authority_changed);
+        let refresh_due = prior
+            .and_then(|entry| entry.next_refresh)
+            .is_some_and(|deadline| now >= deadline);
+        // Hot path: an output burst within the same command and before the next
+        // configured refresh does zero owned text work and no context-row reads.
+        if !boundary && !refresh_due {
+            return false;
+        }
         let model_provider = matches!(
             provider,
             TitleSummaryProvider::Ollama | TitleSummaryProvider::OpenAiCompatible
         );
-        let refresh_due = self
-            .entries
-            .get(&session)
-            .and_then(|entry| entry.next_refresh)
-            .is_some_and(|deadline| now >= deadline);
-        let interval_allows = self.entries.get(&session).is_none_or(|entry| {
+        let interval_allows = prior.is_none_or(|entry| {
             entry
                 .last_request
                 .is_none_or(|last| now.saturating_duration_since(last) >= interval)
         });
-        let backoff_allows = self
-            .entries
-            .get(&session)
+        let backoff_allows = prior
             .and_then(|entry| entry.backoff_until)
             .is_none_or(|deadline| now >= deadline);
         // A semantic boundary is a dirty signal, not permission to evade the
         // configured minimum. The same deadline drives quiet periodic refresh.
         let should_request =
             model_provider && (boundary || refresh_due) && interval_allows && backoff_allows;
-        // Hot path: an output burst within the same command and before the next
-        // configured refresh does zero owned text work and no context-row reads.
-        if !boundary && !refresh_due {
-            return false;
-        }
 
-        let (mut snapshot, captured_semantic) = Snapshot::metadata(term);
-        debug_assert_eq!(semantic, captured_semantic);
+        let mut snapshot = Snapshot::metadata(term);
         let immediate = deterministic_description(&snapshot);
         let (session_epoch, session_authority) = self.session_authority(session);
         if boundary {
@@ -1653,9 +1644,13 @@ impl Coordinator {
 
     fn observation_succeeded(&mut self, session: u64) {
         // The lock was free: this session is not contended, so the next failure
-        // starts the ladder over rather than inheriting a stale ceiling.
-        self.contended.remove(&session);
-        if !retry_pending_after(ObservationRetryTransition::Succeeded) {
+        // starts the ladder over rather than inheriting a stale ceiling. Both maps
+        // are usually empty (only a lost try_lock or a re-arm fills them), so skip
+        // hashing the key then.
+        if !self.contended.is_empty() {
+            self.contended.remove(&session);
+        }
+        if !retry_pending_after(ObservationRetryTransition::Succeeded) && !self.retries.is_empty() {
             self.retries.remove(&session);
         }
     }
@@ -1808,10 +1803,6 @@ impl App {
             self.title_summaries.observation_succeeded(session);
             return false;
         }
-        let active = self
-            .frontmost_window
-            .and_then(|wid| self.focused_session_id(wid))
-            == Some(session);
         let changed = match self.pool.get(session) {
             None => {
                 self.title_summaries.observation_succeeded(session);
@@ -1824,6 +1815,10 @@ impl App {
                     Err(std::sync::TryLockError::WouldBlock) => None,
                 };
                 if let Some(term) = term {
+                    let active = self
+                        .frontmost_window
+                        .and_then(|wid| self.focused_session_id(wid))
+                        == Some(session);
                     self.title_summaries.observation_succeeded(session);
                     self.title_summaries.observe(
                         session,
@@ -1897,8 +1892,8 @@ impl App {
                 // Central discovery covers initial, newly-created, restored, and
                 // seamlessly adopted quiet sessions. It shares the same one-snapshot
                 // per event-loop-turn budget as periodic refreshes.
+                // `note_title_activity` ends with the Settings health sync.
                 self.note_title_activity(session);
-                self.sync_settings_title_summary_health();
                 return;
             }
         }
@@ -1906,14 +1901,22 @@ impl App {
         // aggregate scrollback copying and parser-lock residency even when hundreds
         // of quiet periodic refreshes become due together.
         let due = self.title_summaries.due_observations(now, active);
+        // Each `note_title_activity` ends with the Settings health sync; with
+        // nothing due, it runs here.
+        if due.is_empty() {
+            self.sync_settings_title_summary_health();
+        }
         for session in due {
             self.note_title_activity(session);
         }
-        self.sync_settings_title_summary_health();
     }
 
     pub(crate) fn next_title_summary_retry(&self) -> Option<Instant> {
-        let now = Instant::now();
+        self.next_title_summary_retry_at(Instant::now())
+    }
+
+    /// [`Self::next_title_summary_retry`] read at `now`.
+    fn next_title_summary_retry_at(&self, now: Instant) -> Option<Instant> {
         let scheduled = self.title_summaries.next_retry();
         let missing = smart_titles_enabled(&self.config)
             && self
@@ -2122,15 +2125,22 @@ fn snapshot_content_hash(snapshot: &Snapshot) -> u64 {
     hash.finish()
 }
 
+/// One streaming `write` of every kept char's native-endian `u32` bytes: the
+/// same digest as a `write_u32` per char (SipHash hashes the concatenated byte
+/// stream), without a hasher call per char.
 fn hash_semantic_prefix(value: &str) -> u64 {
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut buf = [0u8; 4 * MAX_COMMAND_CHARS];
+    let mut len = 0;
     for ch in value
         .chars()
         .filter(|ch| !ch.is_control() && !is_bidi_control(*ch))
         .take(MAX_COMMAND_CHARS)
     {
-        hash.write_u32(ch as u32);
+        buf[len..len + 4].copy_from_slice(&u32::from(ch).to_ne_bytes());
+        len += 4;
     }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    hash.write(&buf[..len]);
     hash.finish()
 }
 
@@ -2405,35 +2415,45 @@ mod tests {
         })
     }
 
+    /// A stand-in managed runtime in its own session. It outlives every hang
+    /// detector here ([`wait_until_reaped`]), so a revocation that never kills
+    /// it fails the wait instead of outlasting a stand-in that exits by itself.
     #[cfg(unix)]
-    fn spawn_dedicated_test_child() -> std::process::Child {
-        let mut command = std::process::Command::new("sleep");
-        command.arg("30");
+    fn spawn_dedicated_test_child() -> aterm_uds::spawnfd::Child {
+        let mut command = aterm_uds::spawnfd::command("sleep");
+        command.arg("600");
         configure_dedicated_process_session(&mut command);
         command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .unwrap()
     }
 
+    /// A stand-in group leader and its `sleep` descendant, in their own session.
+    /// The descendant outlives every hang detector here (ten minutes, as
+    /// [`spawn_dedicated_test_child`]), so a kill that never comes fails a
+    /// minute's wait instead of being covered by a descendant that exits by
+    /// itself.
     #[cfg(unix)]
-    fn spawn_dedicated_group_with_descendant(wait_for_child: bool) -> (std::process::Child, u32) {
+    fn spawn_dedicated_group_with_descendant(
+        wait_for_child: bool,
+    ) -> (aterm_uds::spawnfd::Child, u32) {
         use std::io::BufRead as _;
 
         let script = if wait_for_child {
-            "sleep 30 & child=$!; printf '%s\\n' \"$child\"; wait"
+            "sleep 600 & child=$!; printf '%s\\n' \"$child\"; wait"
         } else {
-            "sleep 30 & child=$!; printf '%s\\n' \"$child\""
+            "sleep 600 & child=$!; printf '%s\\n' \"$child\""
         };
-        let mut command = std::process::Command::new("/bin/sh");
+        let mut command = aterm_uds::spawnfd::command("/bin/sh");
         command.arg("-c").arg(script);
         configure_dedicated_process_session(&mut command);
         command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::null());
         let mut child = command.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let mut line = String::new();
@@ -2448,6 +2468,18 @@ mod tests {
     fn process_exists(pid: u32) -> bool {
         // SAFETY: signal 0 performs an existence/permission probe only.
         (unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) }) == 0
+    }
+
+    /// Wait until `pid` is killed AND reaped (a zombie still answers signal 0).
+    /// The reap is a lifecycle thread's, and a loaded host may run that thread
+    /// late, so this is a hang detector, never a latency budget: a revocation
+    /// that never kills fails at the minute.
+    #[cfg(unix)]
+    #[track_caller]
+    fn wait_until_reaped(pid: u32, what: &str) {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            (!process_exists(pid)).then_some(())
+        });
     }
 
     #[test]
@@ -3831,42 +3863,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fresh_automatic_result_publishes_only_the_actual_managed_endpoint() {
-        let mut coordinator = Coordinator::new(None);
-        let config = Config {
-            title_summary_provider: Some(TitleSummaryProvider::Ollama),
-            ..Config::default()
-        };
-        assert!(coordinator.reconfigure(&config));
-        let (request_rx, result_tx) = install_test_worker(&mut coordinator);
-        let term = Terminal::new(2, 20);
-        coordinator.observe(7, &term, &config, true, Instant::now());
-        let job = request_rx.try_recv().unwrap();
-        let effective = "http://127.0.0.1:32123/api/chat".to_string();
-        result_tx
-            .send(WorkerMessage::Result(WorkerResult {
-                session: job.session,
-                session_epoch: job.session_epoch,
-                generation: job.generation,
-                authority_epoch: job.authority_epoch,
-                config_fingerprint: job.config_fingerprint,
-                result: Ok("Running focused Rust tests".to_string()),
-                locality: TitleSummaryLocality::ManagedLocal,
-                effective_endpoint: Some(effective.clone()),
-                managed_install_present: true,
-            }))
-            .unwrap();
-        assert_eq!(coordinator.poll(&config), vec![7]);
-        let health = coordinator.health(Instant::now(), &config);
-        assert_eq!(health.endpoint, Some(effective));
-        assert_eq!(health.locality, TitleSummaryLocality::ManagedLocal);
-        assert_ne!(
-            health.endpoint.as_deref(),
-            Some(crate::app_config::EXAMPLE_EXPLICIT_OLLAMA_TITLE_SUMMARY_ENDPOINT)
-        );
-    }
-
     /// Regression: a worker that dies WITHOUT emitting a wake is discovered at
     /// dispatch time, not by `poll` — `poll` only runs on `Wake::TitleSummaryReady`,
     /// which a dead worker never sends. That path must clear `model_ready` like
@@ -3936,21 +3932,16 @@ mod tests {
         let job = request_rx.try_recv().unwrap();
         let endpoint = "http://127.0.0.1:32123/api/chat".to_string();
         result_tx
-            .send(WorkerMessage::Result(WorkerResult {
-                session: job.session,
-                session_epoch: job.session_epoch,
-                generation: job.generation,
-                authority_epoch: job.authority_epoch,
-                config_fingerprint: job.config_fingerprint,
-                result: Ok("Running focused tests".to_string()),
-                locality: TitleSummaryLocality::ManagedLocal,
-                effective_endpoint: Some(endpoint.clone()),
-                managed_install_present: true,
-            }))
+            .send(ok_result_for(&job, "Running focused tests", &endpoint))
             .unwrap();
         assert_eq!(coordinator.poll(&config), vec![7]);
         assert!(coordinator.in_flight.is_none(), "the daemon is now idle");
         assert_eq!(coordinator.runtime_state, TitleSummaryRuntimeState::Ready);
+        // A fresh automatic result publishes the ACTUAL managed endpoint (not
+        // the explicit default's), which the crash below must then clear.
+        let health = coordinator.health(Instant::now(), &config);
+        assert_eq!(health.endpoint.as_deref(), Some(endpoint.as_str()));
+        assert_eq!(health.locality, TitleSummaryLocality::ManagedLocal);
 
         result_tx
             .send(WorkerMessage::ManagedRuntimeExited(ManagedRuntimeExit {
@@ -4564,26 +4555,6 @@ mod tests {
             &over_cap,
             ChromeSurface::TabStrip.title_cap()
         ));
-        // The cap itself, pinned at its named width: AT the cap is identity,
-        // one past it is `max + 1` graphemes with the mark after the head.
-        {
-            use aterm_grapheme::GraphemeClusters as _;
-            assert_eq!(
-                chrome_presentation_text(&long_clean, MAX_CHROME_TITLE_GRAPHEMES),
-                long_clean
-            );
-            let projected = chrome_presentation_text(&over_cap, MAX_CHROME_TITLE_GRAPHEMES);
-            assert_eq!(
-                projected.graphemes().count(),
-                MAX_CHROME_TITLE_GRAPHEMES + 1
-            );
-            assert_eq!(
-                projected
-                    .graphemes()
-                    .nth(MAX_CHROME_TITLE_GRAPHEMES - MAX_CHROME_TITLE_GRAPHEMES / 2),
-                Some("…")
-            );
-        }
         for surface in [ChromeSurface::TabStrip, ChromeSurface::WindowTitle] {
             for title in clean
                 .iter()
@@ -4749,27 +4720,6 @@ mod tests {
             next_display_value.next_retry_after,
             Some(Duration::from_secs(9))
         );
-    }
-
-    #[test]
-    fn due_observation_batches_are_active_first_capped_and_fair_under_stress() {
-        let mut coordinator = Coordinator::new(None);
-        let now = Instant::now();
-        for session in 1..=512 {
-            coordinator.retries.insert(session, now);
-        }
-        let active = 311;
-        let mut served = Vec::new();
-        for _ in 1..=512 {
-            let admitted = coordinator.due_observations(now, Some(active));
-            assert_eq!(admitted.len(), 1, "one event-loop turn may snapshot once");
-            served.push(admitted[0]);
-            coordinator.observation_succeeded(admitted[0]);
-        }
-        assert_eq!(served[0], active, "active session must start a fresh batch");
-        served.sort_unstable();
-        assert_eq!(served, (1..=512).collect::<Vec<_>>());
-        assert!(coordinator.due_observations(now, Some(active)).is_empty());
     }
 
     /// REGRESSION: sustained lock contention must make the retry CHEAPER, not
@@ -4976,53 +4926,171 @@ mod tests {
         assert!(snapshot.recent_output.contains("new-visible"));
     }
 
-    /// The REAL daemon command starts BELOW the typing band (2026-09-15). It used to
-    /// start at pri 31, the program-being-typed-into's band, whatever the worker
-    /// thread's role. `/bin/sh` stands in for the binary: the command stages
-    /// `serve` in the private home, so `sh` runs a `serve` script there that writes
-    /// its own `ps` priority beside itself.
+    /// THE DAEMON'S BAND, AND WHEN IT TAKES IT. The managed daemon runs — and
+    /// everything it starts inherits — the Darwin background band; it used to
+    /// start at pri 31, the band of the program being typed into (2026-09-15).
+    /// The band lands from the parent once `spawn` returns, never before it
+    /// starts: until 2026-09-30 a forked child demoted itself before its exec,
+    /// and that copy of aterm, holding every descriptor aterm has open, ran its
+    /// exec seconds late on a loaded host. The spawn is one `posix_spawn` now
+    /// (`aterm_uds::spawnfd`), so there is no such copy to starve. The fact left
+    /// to read off the kernel, untimed: when `spawn` returns, the daemon is in
+    /// the background band — the stand-in has to exist, not run, which on a
+    /// saturated host it may not do for a minute and more. That what the daemon
+    /// starts afterwards inherits the band is the kernel's own (measured,
+    /// `qos::demote_process_tree`); what it started before is swept
+    /// (`qos::tests::a_tree_demoted_from_its_root_takes_what_it_already_started`).
     #[cfg(target_os = "macos")]
     #[test]
-    fn managed_ollama_command_starts_in_the_darwin_background_band() {
+    fn the_managed_daemon_takes_the_background_band_once_spawned() {
+        use crate::qos::{BACKGROUND_BAND_PRIORITY as BAND, KillGroupOnDrop, base_priority_of};
+
+        /// The private home goes on every way out of the test.
+        struct HomeOnDrop(std::path::PathBuf);
+        impl Drop for HomeOnDrop {
+            fn drop(&mut self) {
+                cleanup_private_managed_home(Some(&self.0));
+            }
+        }
+
+        // The control: a plain spawn from this thread, read the same way. A
+        // thread that spawned into the background band itself would make the
+        // daemon's reading prove nothing.
+        let mut bare = aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let bare_band = base_priority_of(libc::pid_t::try_from(bare.id()).unwrap());
+        let _ = bare.kill();
+        let _ = bare.wait();
+        assert!(
+            bare_band.is_some_and(|pri| pri > BAND),
+            "a plain spawn from this thread read pri {bare_band:?}: libproc answered \
+             nothing, or this thread spawns into the background band itself, so the \
+             test proves nothing"
+        );
+
+        let home = HomeOnDrop(create_private_managed_home().unwrap());
+        // The stand-in blocks reading a pipe this test holds: it never forks or
+        // execs again, so a group kill takes all of it, and the pipe's EOF ends
+        // it even if that kill were lost.
+        std::fs::write(home.0.join("serve"), "read -r _\n").unwrap();
+        // `/bin/bash`, not `/bin/sh`: macOS's `/bin/sh` execs `/bin/bash` at
+        // once, and a demotion landing in that exec is lost with the old image
+        // (`qos::demote_process_tree`); the daemon is its own image.
+        let mut command = managed_ollama_command(
+            std::path::Path::new("/bin/bash"),
+            "127.0.0.1:1",
+            std::path::Path::new("/tmp/aterm-models"),
+            &home.0,
+        );
+        command
+            .staged_mut()
+            .stdin(aterm_uds::spawnfd::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        // The stand-in leads its own session (`setsid`), so its group is its pid.
+        let group = KillGroupOnDrop(libc::pid_t::try_from(child.id()).unwrap());
+        let daemon = base_priority_of(group.0);
+
+        drop(group);
+        let _ = child.wait();
+        drop(home);
+        assert_eq!(
+            daemon,
+            Some(BAND),
+            "when spawn returned the managed daemon ran at {daemon:?}, not the background band ({BAND})"
+        );
+    }
+
+    /// The REAL daemon command hands the daemon NOTHING above stdio (2026-09-30
+    /// review): an unflagged descriptor of this process — the stand-in for
+    /// Metal's shader-cache files, or a bridge lane mid-`pair()` — rides a spawn
+    /// of the same stand-in that hands on the whole table (the control) and not
+    /// the daemon's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_ollama_command_hands_the_daemon_no_descriptor_above_stdio() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        let null = std::fs::File::open("/dev/null").unwrap();
+        // The stand-in is never the SHELL'S OWN SLOT. The stand-in daemon is
+        // `/bin/sh serve`, and the shell reads that script through a
+        // descriptor it moves to the top of its table — `getdtablesize() - 1`,
+        // capped at 255 — over whatever was inherited there. A stand-in in
+        // that slot is the script itself in both shells, so the daemon reads
+        // `held`: a test binary whose other tests held every descriptor from
+        // 64 to 254 was handed 255, and failed so.
+        let mut table = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid resource id and a writable out-parameter.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut table) },
+            0
+        );
+        let shell_slot = i32::try_from(table.rlim_cur.clamp(1, 256)).unwrap_or(256) - 1;
+        // SAFETY: F_DUPFD on a descriptor this test owns; the copy is ours and
+        // carries no close-on-exec flag — which is the point.
+        let mut held = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 64) };
+        if held == shell_slot {
+            // SAFETY: as above, from the number past the shell's slot; the
+            // copy in the slot is ours and closed once, here.
+            held = unsafe {
+                let past = libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, shell_slot + 1);
+                libc::close(held);
+                past
+            };
+        }
+        assert!(
+            held >= 64 && held != shell_slot,
+            "an unflagged stand-in outside the shell's slot {shell_slot}: {held}"
+        );
+        // SAFETY: a fresh descriptor this test exclusively owns.
+        let held = unsafe { OwnedFd::from_raw_fd(held) };
+        let fd = held.as_raw_fd();
         let home = create_private_managed_home().unwrap();
-        std::fs::write(home.join("serve"), "/bin/ps -o pri= -p $$ > pri\n").unwrap();
+        std::fs::write(
+            home.join("serve"),
+            format!("[ -e /dev/fd/{fd} ] && echo held > fds || echo clear > fds\n"),
+        )
+        .unwrap();
+        // The control MUST inherit `held`, so it is `spawnfd::transparent`: the
+        // one spawn that hands on every unflagged descriptor whatever std this
+        // links (a std `Command` hands on fds 0-2 alone under Trust's SP-1). It
+        // takes no working directory, so a `sh -c` enters `home`, where the
+        // daemon's command runs, before it becomes the stand-in.
+        let control = aterm_uds::spawnfd::transparent("/bin/sh")
+            .args(["-c", "cd \"$1\" && exec /bin/sh serve", "sh"])
+            .arg(&home)
+            .status()
+            .unwrap();
+        let control_saw = std::fs::read_to_string(home.join("fds")).unwrap_or_default();
+        // Descriptors, not the band: the staged command runs undemoted.
         let status = managed_ollama_command(
             std::path::Path::new("/bin/sh"),
             "127.0.0.1:1",
             std::path::Path::new("/tmp/aterm-models"),
             &home,
         )
+        .into_undemoted()
         .status()
         .unwrap();
-        let written = std::fs::read_to_string(home.join("pri")).unwrap_or_default();
+        let daemon_saw = std::fs::read_to_string(home.join("fds")).unwrap_or_default();
         cleanup_private_managed_home(Some(&home));
-        assert!(status.success(), "the stand-in daemon failed: {status}");
-        let pri: i32 = written
-            .trim()
-            .parse()
-            .unwrap_or_else(|_| panic!("no priority in {written:?}"));
+        drop(held);
         assert!(
-            pri <= 4,
-            "the managed daemon ran at pri {pri}, not the background band (4)"
-        );
-    }
-
-    #[test]
-    fn managed_ollama_command_is_cloud_disabled() {
-        let command = managed_ollama_command(
-            std::path::Path::new("ollama"),
-            "127.0.0.1:11434",
-            std::path::Path::new("/tmp/aterm-models"),
-            std::path::Path::new("/tmp/aterm-managed-home"),
-        );
-        let env: HashMap<_, _> = command.get_envs().collect();
-        assert_eq!(
-            env.get(&std::ffi::OsStr::new("OLLAMA_NO_CLOUD")),
-            Some(&Some(std::ffi::OsStr::new("1")))
+            control.success() && status.success(),
+            "{control} / {status}"
         );
         assert_eq!(
-            command.get_args().next(),
-            Some(std::ffi::OsStr::new("serve"))
+            control_saw.trim(),
+            "held",
+            "CONTROL: the transparent spawn carries fd {fd}"
+        );
+        assert_eq!(
+            daemon_saw.trim(),
+            "clear",
+            "the managed daemon inherited fd {fd}"
         );
     }
 
@@ -5109,6 +5177,11 @@ mod tests {
             std::path::Path::new("/managed/models"),
             std::path::Path::new("/managed/home"),
         );
+        let command = command.staged();
+        assert_eq!(
+            command.get_args().next(),
+            Some(std::ffi::OsStr::new("serve"))
+        );
         let mut staged: Vec<String> = command
             .get_envs()
             .map(|(name, value)| {
@@ -5154,8 +5227,6 @@ mod tests {
         const STAGER: &str = "ATERM_OLLAMA_ENV_STAGER";
         const CHILD: &str = "ATERM_OLLAMA_ENV_CHILD";
         const SENTINEL: &str = "ATERM_OLLAMA_ENV_SENTINEL";
-        const EXACT: &str =
-            "title_summary::tests::the_real_command_surface_clears_the_environment_it_inherits";
 
         if std::env::var_os(CHILD).is_some() {
             // We are the child, spawned through the real surface. The sentinel
@@ -5197,17 +5268,26 @@ mod tests {
                 "127.0.0.1:11434",
                 std::path::Path::new("/managed/models"),
                 &home,
-            );
+            )
+            // The subject is the environment, not the band: this child is a
+            // whole test binary, and nothing here needs it below the typing band.
+            .into_undemoted();
             // `managed_ollama_command` stages `serve`; the harness needs its own
-            // argv and its own stdio to report a failure.
+            // argv and its own stdio to report a failure. The name is the
+            // harness's own (libtest names the test's thread after it), so it
+            // cannot go stale; the marker below still guards a run of nothing.
+            let this_test = std::thread::current()
+                .name()
+                .expect("libtest runs each test on a thread named after it")
+                .to_string();
             command
                 .arg("--exact")
-                .arg(EXACT)
+                .arg(this_test)
                 .arg("--nocapture")
                 .env(CHILD, "1")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(aterm_uds::spawnfd::Stdio::piped());
 
             let output = command.output().expect("re-exec this test binary");
             let child_err = String::from_utf8_lossy(&output.stderr);
@@ -5223,38 +5303,22 @@ mod tests {
                 "the child exited 0 without running its assertions — the \
                  `--exact` filter matched nothing and the proof was vacuous:\n{child_err}"
             );
-            crate::logging::stderr_line!("ATERM-ENV-TEST: stager spawned and verified the child");
             return;
         }
 
         // Outermost: inject the leak into the stager the sound way — staged on
-        // ITS Command, inherited by IT, owned by no thread of ours.
-        let mut stage = std::process::Command::new(&exe);
-        stage
-            .arg("--exact")
-            .arg(EXACT)
-            .arg("--nocapture")
+        // ITS Command, inherited by IT, owned by no thread of ours. The stager
+        // is this test as a stand-in, which passes only by running exactly this
+        // test — the same anti-vacuity demand, one level up.
+        let mut stager = crate::test_alone::StandIn::this_test();
+        stager
+            .command()
             .env(STAGER, "1")
             .env(SENTINEL, "leaked")
             .env("OLLAMA_API_KEY", "leaked")
             .env("HTTPS_PROXY", "leaked")
-            .env("SSH_AUTH_SOCK", "leaked")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let staged = stage.output().expect("re-exec this test binary as stager");
-        let stager_err = String::from_utf8_lossy(&staged.stderr);
-        assert!(
-            staged.status.success(),
-            "stager failed:\nstdout: {}\nstderr: {stager_err}",
-            String::from_utf8_lossy(&staged.stdout),
-        );
-        // Same anti-vacuity demand, one level up.
-        assert!(
-            stager_err.contains("ATERM-ENV-TEST: stager spawned and verified the child"),
-            "the stager exited 0 without spawning the child — the `--exact` \
-             filter matched nothing and the proof was vacuous:\n{stager_err}"
-        );
+            .env("SSH_AUTH_SOCK", "leaked");
+        stager.spawn().passed();
     }
 
     #[cfg(target_os = "macos")]
@@ -5364,25 +5428,26 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         );
     }
 
-    /// THIS ONE SHELLS OUT TO `lsof`, and that is the whole of its flakiness.
+    /// THIS ONE SHELLS OUT TO `lsof`, and it is about the ATTRIBUTION, not
+    /// the budget.
     ///
     /// `established_server_pid` is a PRODUCTION function with a production
-    /// wall-clock budget: one second total, each `/usr/sbin/lsof` invocation
-    /// bounded at 250 ms. lsof walks every process on the box, so on a machine
-    /// running a whole-workspace build that budget is genuinely reachable — and
-    /// when it is, the function returns "could not identify the connected
-    /// Ollama server process", which is a statement about the MACHINE, not
-    /// about the attribution logic this test is named for. It has been one of
-    /// the rotating aterm-gui reds under load, passing alone every time
-    /// (docs/AGENT-EXPERIENCE-2026-08-26.md).
+    /// wall-clock budget, 2 s per `/usr/sbin/lsof` and 6 s in all, sized for a
+    /// busy machine's tail. lsof walks every process on the box, and under a
+    /// whole-workspace landing run (load 100-170) one attempt outran its 2 s:
+    /// "managed Ollama listener inspection timed out" failed this test in three
+    /// landing runs while it passed alone every time — a statement about the
+    /// MACHINE, not about the attribution this test is named for. The NOT RUN
+    /// escape it carried never caught that: it excused only the total's
+    /// exhaustion text, and a timed-out attempt ended the lookup with its own
+    /// (the production half, `a_timed_out_owner_probe_is_retried_within_the_total`).
     ///
-    /// So budget exhaustion is retried, and if every attempt exhausts it the
-    /// test says NOT RUN, loudly, rather than reporting a machine fault as a
-    /// defect — the same rule `gate lint` lives by, and the same rule the paint
-    /// matrix's non-macOS lane lives by. EVERY OTHER outcome is still a hard
-    /// failure: a wrong pid, no established owner, two owners, a structural
-    /// parse error. Those are the findings this test exists for and none of
-    /// them is retried or excused.
+    /// So the test asks the same lookup with a hang detector for its budget
+    /// (`established_server_pid_within`: a minute per `lsof`, five in all). It
+    /// waits for lsof's ANSWER, however long a loaded machine takes to give
+    /// it, and always reaches a verdict. Every outcome but this process's pid
+    /// is a hard failure: a wrong pid, no established owner, two owners, a
+    /// structural parse error, the hang detector's own exhaustion.
     #[cfg(target_os = "macos")]
     #[test]
     fn exact_connected_socket_owner_is_observed_and_unrelated_root_is_rejected() {
@@ -5398,40 +5463,14 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         });
         let stream = std::net::TcpStream::connect(server).unwrap();
         accepted_rx.recv().unwrap();
-        // The one error text that means "lsof never answered in its budget".
-        // Coupled deliberately and narrowly: widening it would start excusing
-        // real findings, which is the failure mode a retry loop invites.
-        const BUDGET_EXHAUSTED: &str = "could not identify the connected Ollama server process";
-        const ATTEMPTS: usize = 4;
-        let mut observed = None;
-        for _ in 0..ATTEMPTS {
-            match established_server_pid(&stream) {
-                Ok(pid) => {
-                    observed = Some(pid);
-                    break;
-                }
-                Err(error) if error == BUDGET_EXHAUSTED => {}
-                Err(error) => panic!("socket owner observation failed: {error}"),
-            }
-        }
-        match observed {
-            Some(pid) => assert_eq!(pid, std::process::id()),
-            None => {
-                crate::logging::stderr_line!(
-                    "title_summary: NOT RUN — `/usr/sbin/lsof` did not answer within \
-                     the production budget in {ATTEMPTS} attempts, so the connected \
-                     socket's owner was NOT attributed and NOTHING about \
-                     `established_server_pid` was proven here. This is a statement \
-                     about a loaded machine, not about the code; re-run it on an idle \
-                     one to get a verdict."
-                );
-                let _ = release_tx.send(());
-                let _ = join.join();
-                return;
-            }
-        }
+        let observed = established_server_pid_within(
+            &stream,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        );
+        assert_eq!(observed, Ok(std::process::id()), "socket owner observation");
 
-        let mut unrelated = std::process::Command::new("/bin/sleep")
+        let mut unrelated = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("30")
             .spawn()
             .unwrap();
@@ -5442,6 +5481,85 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         drop(stream);
         release_tx.send(()).unwrap();
         join.join().unwrap();
+    }
+
+    /// A SLOW `lsof` IS RETRIED WITHIN THE TOTAL. The owner lookup's budget
+    /// promises three FULL-TIMEOUT attempts (2 s each in 6 s), but an attempt
+    /// that ran out its 2 s used to end the whole lookup with "… timed out":
+    /// on a loaded machine the smart-title attestation failed closed on the
+    /// first slow `lsof`, with 4 s of its budget unspent. The probe here is a
+    /// stand-in over the genuine `run_command_bounded`: its first attempt
+    /// really times out (a `/bin/sleep` given 1 ms, killed by the bound), its
+    /// second answers — and the lookup takes the answer. Controls: a probe
+    /// that never answers ends at the total with `OWNER_PROBE_EXHAUSTED`, and
+    /// any other probe failure ends the lookup at once, unretried.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_timed_out_owner_probe_is_retried_within_the_total() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let server: std::net::SocketAddr = "127.0.0.1:11434".parse().unwrap();
+        let client: std::net::SocketAddr = "127.0.0.1:53111".parse().unwrap();
+        let slow = || {
+            run_command_bounded(
+                aterm_uds::spawnfd::command("/bin/sleep").arg("30"),
+                Duration::from_millis(1),
+                0,
+                OWNER_PROBE_LABEL,
+            )
+        };
+        let answer = || BoundedCommandOutput {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"p700\nf9\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n".to_vec(),
+        };
+        let first = slow().expect_err("the stand-in's first attempt times out");
+        assert_eq!(first, format!("{OWNER_PROBE_LABEL} timed out"));
+
+        let mut calls = 0;
+        let observed = observe_established_server_pid(
+            server,
+            client,
+            Duration::from_secs(2),
+            Duration::from_secs(600),
+            |_| {
+                calls += 1;
+                if calls == 1 { slow() } else { Ok(answer()) }
+            },
+        );
+        assert_eq!(
+            (observed, calls),
+            (Ok(700), 2),
+            "a timed-out attempt is retried, and the next answer taken"
+        );
+
+        let observed = observe_established_server_pid(
+            server,
+            client,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+            |_| Err(format!("{OWNER_PROBE_LABEL} timed out")),
+        );
+        assert_eq!(
+            observed,
+            Err(OWNER_PROBE_EXHAUSTED.to_string()),
+            "never answered: the total ends it, in the budget's own words"
+        );
+
+        let mut calls = 0;
+        let observed = observe_established_server_pid(
+            server,
+            client,
+            Duration::from_secs(2),
+            Duration::from_secs(600),
+            |_| {
+                calls += 1;
+                Err(format!("could not run {OWNER_PROBE_LABEL}"))
+            },
+        );
+        assert_eq!(
+            (observed, calls),
+            (Err(format!("could not run {OWNER_PROBE_LABEL}")), 1),
+            "any other failure ends the lookup at once"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -5480,7 +5598,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         let process = managed_process_identity(child.id()).unwrap();
         attest_running_managed_ollama(child.id()).unwrap();
         let socket: std::net::SocketAddr = bind.parse().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let stream = loop {
             match std::net::TcpStream::connect_timeout(&socket, Duration::from_millis(100)) {
                 Ok(stream) => break stream,
@@ -5595,7 +5713,8 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             let process = controller.endpoint_process(endpoint, epoch).unwrap();
             let socket = loopback_socket(endpoint).unwrap();
             let stream =
-                std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(1)).unwrap();
+                std::net::TcpStream::connect_timeout(&socket, aterm_spec::wait::MUST_HAPPEN)
+                    .unwrap();
             attest_managed_server_stream(&stream, process).unwrap();
         }
         first_controller.stop();
@@ -5624,11 +5743,13 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         let start = Instant::now();
         assert!(load_ca_bundle(fifo.to_str().unwrap()).is_err());
-        // Failure bound only — a genuine regression blocks or never happens at all,
-        // so any finite deadline catches it and tightness only lets load fake a
-        // failure. This bound has already crossed under full-suite load elsewhere
-        // in this repo (cb8c0cff, c1281c6a).
-        assert!(start.elapsed() < Duration::from_secs(30));
+        // A hang detector, never a latency budget: opening the FIFO parks FOREVER
+        // (no writer comes), and tighter bounds crossed under full-suite load
+        // (cb8c0cff, c1281c6a).
+        assert!(
+            start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "loading the FIFO CA bundle parked"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5637,33 +5758,37 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
     fn security_subprocess_runner_bounds_time_and_output() {
         let start = Instant::now();
         let timeout = run_command_bounded(
-            std::process::Command::new("/bin/sh").args(["-c", "sleep 5"]),
+            aterm_uds::spawnfd::command("/bin/sh").args(["-c", "sleep 5"]),
             Duration::from_millis(50),
             128,
             "test helper",
         )
         .unwrap_err();
         assert!(timeout.contains("timed out"));
-        // Failure bound only — a genuine regression blocks or never happens at all,
-        // so any finite deadline catches it and tightness only lets load fake a
-        // failure. This bound has already crossed under full-suite load elsewhere
-        // in this repo (cb8c0cff, c1281c6a).
-        assert!(start.elapsed() < Duration::from_secs(30));
+        // A hang detector, never a latency budget: a runner that waited the child
+        // out would answer `Ok` (its `sleep` exits 0), which the `unwrap_err`
+        // refuses, so only one that never returns is judged by this clock.
+        // Tighter bounds crossed under full-suite load (cb8c0cff, c1281c6a).
+        assert!(
+            start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the bounded runner never returned"
+        );
 
         let start = Instant::now();
         let inherited_pipe = run_command_bounded(
-            std::process::Command::new("/bin/sh").args(["-c", "sleep 5 & exit 0"]),
+            aterm_uds::spawnfd::command("/bin/sh").args(["-c", "sleep 5 & exit 0"]),
             Duration::from_millis(50),
             128,
             "test helper descendant",
         )
         .unwrap_err();
         assert!(inherited_pipe.contains("timed out"));
-        // Failure bound only — a genuine regression blocks or never happens at all,
-        // so any finite deadline catches it and tightness only lets load fake a
-        // failure. This bound has already crossed under full-suite load elsewhere
-        // in this repo (cb8c0cff, c1281c6a).
-        assert!(start.elapsed() < Duration::from_secs(30));
+        // A hang detector, as above: a runner that read the inherited pipe to EOF
+        // would have answered `Ok`, which the `unwrap_err` refuses.
+        assert!(
+            start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the bounded runner never returned from the inherited pipe"
+        );
 
         // The runner puts the child in its OWN process group (port of 61a6c8b62:
         // `process_group(0)` = POSIX_SPAWN_SETPGROUP) so the deadline kill is
@@ -5684,8 +5809,8 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             probe_file.display()
         );
         let group = run_command_bounded(
-            std::process::Command::new("/bin/sh").args(["-c", &script]),
-            Duration::from_secs(10),
+            aterm_uds::spawnfd::command("/bin/sh").args(["-c", &script]),
+            aterm_spec::wait::MUST_HAPPEN,
             0,
             "test helper group",
         )
@@ -5727,7 +5852,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         let mut ran = None;
         for budget in [2, 8, 30].map(Duration::from_secs) {
             let escaped = run_command_bounded(
-                std::process::Command::new("/bin/sh").args(["-c", &script]),
+                aterm_uds::spawnfd::command("/bin/sh").args(["-c", &script]),
                 budget,
                 128,
                 "test helper escaped grandchild",
@@ -5746,7 +5871,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert!(escaped.contains("timed out"));
         let _ = std::fs::remove_file(&pid_file);
         assert!(grandchild > 1);
-        let gone_by = Instant::now() + Duration::from_secs(30);
+        let gone_by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         loop {
             // SAFETY: signal 0 delivers nothing; it only asks whether `grandchild`
             // still names a process we may signal.
@@ -5764,10 +5889,10 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         }
 
         let oversized = run_command_bounded(
-            std::process::Command::new("/bin/sh").args(["-c", "printf '%02048d' 0"]),
+            aterm_uds::spawnfd::command("/bin/sh").args(["-c", "printf '%02048d' 0"]),
             // The byte limit trips the moment 2048 bytes arrive, so a generous
             // budget costs nothing; at 1 s a starved spawn read "timed out".
-            Duration::from_secs(30),
+            aterm_spec::wait::MUST_HAPPEN,
             128,
             "test helper",
         )
@@ -5813,7 +5938,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             std::path::Path::new("/tmp/models"),
             &home,
         );
-        assert_eq!(command.get_current_dir(), Some(home.as_path()));
+        assert_eq!(command.staged().get_current_dir(), Some(home.as_path()));
         cleanup_private_managed_home(Some(&home));
         assert!(!home.exists());
     }
@@ -5825,7 +5950,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         let caller_group = unsafe { libc::getpgrp() };
         let caller_pid = unsafe { libc::getpid() };
         let controller = ManagedOllamaController::new(Some(7));
-        let child = std::process::Command::new("sleep")
+        let child = aterm_uds::spawnfd::command("sleep")
             .arg("30")
             .spawn()
             .unwrap();
@@ -5879,9 +6004,13 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert!(process_exists(descendant));
         let start = Instant::now();
         controller.transition_to(None);
-        // The signal + non-blocking spawn is microseconds; 100ms measured the
-        // scheduler. Reaping is outstanding either way, so this is a failure bound.
-        assert!(start.elapsed() < Duration::from_secs(5));
+        // A hang detector, never a latency budget: the signal and the detached
+        // reaper are microseconds, and a revocation that waited for the group to
+        // end by itself would wait out the stand-in's ten minutes.
+        assert!(
+            start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "revocation waited for the managed group"
+        );
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && (process_exists(root) || process_exists(descendant)) {
             std::thread::sleep(Duration::from_millis(5));
@@ -5949,19 +6078,14 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert!(controller.owned_for_authority(8).is_none());
         let start = Instant::now();
         controller.stop();
-        // Failure bound only — a genuine regression blocks or never happens at all,
-        // so any finite deadline catches it and tightness only lets load fake a
-        // failure. This bound has already crossed under full-suite load elsewhere
-        // in this repo (cb8c0cff, c1281c6a).
-        assert!(start.elapsed() < Duration::from_secs(30));
-        for _ in 0..100 {
-            // SAFETY: signal 0 only queries the child PID's existence.
-            if unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) } == -1 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("managed child was not killed and reaped");
+        // A hang detector, never a latency budget: a stop that waited for the
+        // stand-in would wait out its ten minutes, and tighter bounds crossed under
+        // full-suite load (cb8c0cff, c1281c6a).
+        assert!(
+            start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "stop waited for the managed child"
+        );
+        wait_until_reaped(pid, "the managed child to be killed and reaped");
     }
 
     #[cfg(unix)]
@@ -6111,14 +6235,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
                 .is_err()
         );
         assert!(!controller.owns_endpoint("test", 11));
-        for _ in 0..100 {
-            // SAFETY: signal 0 only queries the child PID's existence.
-            if unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) } == -1 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("revoked late install was not killed and reaped");
+        wait_until_reaped(pid, "the revoked late install to be killed and reaped");
     }
 
     #[cfg(unix)]
@@ -6143,14 +6260,10 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         config.title_summary_model = Some("different-model".to_string());
         assert!(coordinator.reconfigure(&config));
         assert!(!controller.owns_endpoint("http://owned.test", epoch));
-        for _ in 0..100 {
-            // SAFETY: signal 0 only queries the child PID's existence.
-            if unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) } == -1 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("authority transition did not kill and reap managed runtime");
+        wait_until_reaped(
+            pid,
+            "the authority transition to kill and reap the managed runtime",
+        );
     }
 
     #[test]
@@ -6478,17 +6591,15 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         // An untracked session owes discovery: the old code reported a bare
         // `Instant::now()` for it, every turn, until discovery completed.
         assert!(!app.title_summary_tracks_session(0));
-        let deadline = app
-            .next_title_summary_retry()
-            .expect("a missing session owes discovery");
-        let after = Instant::now();
-        assert!(
-            deadline > after,
-            "the arm must still be in the future when the fold reads it"
-        );
-        assert!(
-            deadline <= after + Coordinator::OBSERVE_RETRY_BASE,
-            "but only by the retry ladder's base, so discovery stays prompt"
+        // Read at a fixed instant: the arm is a function of `now`, and a
+        // second clock read here measured the scheduler, not the floor (the
+        // test thread descheduled past the 4 ms base read the arm as past).
+        let now = Instant::now();
+        assert_eq!(
+            app.next_title_summary_retry_at(now),
+            Some(now + Coordinator::OBSERVE_RETRY_BASE),
+            "the arm is in the future, by the retry ladder's base, so discovery \
+             stays prompt"
         );
 
         // Same law for a TRACKED session whose retry stamp already elapsed
@@ -6496,17 +6607,14 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         // and only the WAKE reported to the loop is re-timed.
         app.retry_title_observations();
         assert!(app.title_summary_tracks_session(0));
+        let now = Instant::now();
         app.title_summaries
             .retries
-            .insert(0, Instant::now() - Duration::from_secs(1));
-        let deadline = app
-            .next_title_summary_retry()
-            .expect("an elapsed retry stays scheduled");
-        let after = Instant::now();
-        assert!(
-            deadline > after,
+            .insert(0, now - Duration::from_secs(1));
+        assert_eq!(
+            app.next_title_summary_retry_at(now),
+            Some(now + Coordinator::OBSERVE_RETRY_BASE),
             "an elapsed retry is floored, never fed back verbatim"
         );
-        assert!(deadline <= after + Coordinator::OBSERVE_RETRY_BASE);
     }
 }

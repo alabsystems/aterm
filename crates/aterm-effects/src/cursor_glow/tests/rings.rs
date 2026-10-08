@@ -5,10 +5,10 @@
 
 use super::*;
 
-/// LANDING RING — LIGHT-THEME fork (P0, the clearest additive gap): on dark
-/// the ring is an additive square shockwave (GlowQuads); on light (invisible
-/// on white) it inverts to an expanding DARKENED source-over veil ring in the
-/// halo stream, capped for legibility — and the additive stream stays empty.
+/// Landing ring, light-theme fork: on dark the ring is an additive square
+/// shockwave (GlowQuads); on light it is an expanding darkened source-over
+/// veil ring in the halo stream, capped for legibility, and the additive
+/// stream stays empty.
 #[test]
 fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     let g = geom();
@@ -65,12 +65,9 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     );
 }
 
-/// The landing ring's four bars PARTITION the square outline: no pixel is
-/// owned by two bars. The full-height verticals used to re-cover the th×th
-/// corner blocks the horizontals already own — an additive double-add that
-/// lit every corner of the expanding square as a ~2× "rivet" (the
-/// rainbow-comb ownership bug's sibling, 2026-09-01 audit). The outline
-/// must also stay CLOSED: every edge of the square keeps its light.
+/// The landing ring's four bars partition the square outline: no pixel is
+/// owned by two bars (an additive double-add would light each corner ~2×), and
+/// the outline stays closed on every edge.
 #[test]
 fn classic_ring_grade_is_floored_and_capped_like_the_kittys() {
     // Impact 1 (an 8-cell hop or less) is exactly what it was.
@@ -219,13 +216,10 @@ fn landing_ring_bars_partition_the_square_outline() {
     }
 }
 
-/// THE HALO-CENTRE LAW: a halo whose centre lies past the effects box
-/// keeps its TRUE centre in the emitted bands (the renderer's falloff must
-/// read ~0 on the surviving sliver), and a centre that cannot be
-/// represented (negative) culls the halo. The old `.clamp(0, br)` moved an
-/// off-right centre ONTO the edge, so a particle sliding off the grid
-/// flashed at up to ~96% of peak on its last visible pixels (2026-09-01
-/// audit).
+/// A halo whose centre lies past the effects box keeps its true centre in the
+/// emitted bands (the falloff reads ~0 on the surviving sliver), and a centre
+/// that cannot be represented (negative) culls the halo. Clamping it onto the
+/// edge would flash a particle sliding off the grid.
 #[test]
 fn halo_centres_past_the_box_stay_true_and_negative_centres_cull() {
     let g = geom(); // box [0,320) x [0,96)
@@ -252,16 +246,9 @@ fn halo_centres_past_the_box_stay_true_and_negative_centres_cull() {
     assert!(over_neg.is_empty(), "…including the cull side");
 }
 
-// `glide_star_forks_dark_additive_and_light_source_over` STOOD HERE and is
-// deleted (step 13). The fork it pinned — additive rainbow light on dark,
-// a darkened source-over streak on white — is the STREAK's law, not the
-// glide's, and the glide draws the streak now. It is pinned once, on the one
-// mark, by `rainbow_jump_zoom_light_theme_forks_to_source_over` and
-// `the_light_ground_grows_the_jump_without_breaching_its_ink_cap`.
-
-/// A cold Ctrl-A timestamp is not a jump witness. With no candidate and no
-/// ribbon, the relocation births neither terminus scatter nor a landing
-/// starburst — the audited stray-rainbow family.
+/// A cold navigation timestamp is not a jump witness: with no candidate and no
+/// ribbon it births no terminus scatter; a real jump still flies its meteor
+/// and a short cold nudge throws nothing.
 #[test]
 fn cold_navigation_timestamp_scatters_nothing() {
     let g = geom();
@@ -277,16 +264,9 @@ fn cold_navigation_timestamp_scatters_nothing() {
         glow.particles.is_empty(),
         "a cold-cursor jump dissolves no phantom terminus (finding 3)"
     );
-    // THE STARBURST FORKS ON DISTANCE (2026-08-29). The old law here was
-    // "a cold jump throws no stars — nothing was typed", and its docstring
-    // named the defect it guarded: at a 2-cell floor every arrow-key
-    // HISTORY RECALL on an untouched prompt threw stars and rang the
-    // chime — the owner's "stray pieces of rainbow". That was never about
-    // jumps; it was about the FLOOR. The owner then asked for the jump
-    // effects back ("I LOVED the jump effects … BRING THEM BACK"), so a
-    // cold Home/End — a REAL jump, past `RAINBOW_JUMP_MIN` — celebrates,
-    // and this 30-cell Ctrl-A is one. The recall case is pinned right
-    // after: a one-row cold move still throws nothing.
+    // The starburst forks on distance: a cold Home/End past
+    // `RAINBOW_JUMP_MIN` (this 30-cell Ctrl-A) celebrates, while a one-row
+    // cold move such as a history recall throws nothing (pinned below).
     assert!(
         glow.v2_status().is_some_and(|s| s.meteors >= 1),
         "a cold-cursor JUMP (30 cells) flies its meteor — punctuation, \

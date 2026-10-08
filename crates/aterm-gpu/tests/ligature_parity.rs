@@ -1,43 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// CPU==GPU parity with an ACTIVELY-LIGATING font. The other parity tests use the
-// host system font (which may not ligate the demo text), so this one builds BOTH
-// renderers on the bundled JetBrains Mono (as their family) and renders a row full
-// of programming operators ("a => b != c == d -> e <= f"). It asserts:
-//   1. the CPU frame actually ligated (it differs from the same renderer with
-//      ligatures forced off — so the test is non-vacuous), and
-//   2. the GPU frame matches the CPU frame within the usual <=8 LSB blend
-//      tolerance — i.e. the shared shaping plan keys + places the IDENTICAL
-//      ligature glyph on both paths.
-// Gated: no GPU / font -> skip cleanly.
+// CPU==GPU parity with a ligating font: both renderers use the bundled
+// JetBrains Mono as their family and render a row of operators
+// ("a => b != c == d -> e <= f"). Asserts:
+//   1. the CPU frame ligated (it differs from ligatures forced off), and
+//   2. the GPU frame matches it within the <=8 LSB blend tolerance, i.e. the
+//      shared shaping plan places the same ligature glyph on both paths.
+// No GPU: skip.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
-mod common;
-use common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
+use crate::common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
 
-// Layout-independent ligature font discovery. Order: (a) $ATERM_LIGATURE_TEST_FONT
-// if set and readable; (b) the committed fixture in the sibling aterm-render crate
-// (present in both canonical and vendored layouts). The resolved path is handed to
-// both renderers as their FAMILY (`backends_with_font`) — the window's own
-// `--font` seam — so nothing here writes the environment. None -> the caller SKIPs.
-fn ligature_test_font() -> Option<std::path::PathBuf> {
-    std::env::var("ATERM_LIGATURE_TEST_FONT")
+// The ligature test font: $ATERM_LIGATURE_TEST_FONT if set and present, else the
+// committed fixture in the sibling aterm-render crate. The path is handed to both
+// renderers as their family (`backends_with_font`), so nothing writes the
+// environment.
+fn ligature_test_font() -> std::path::PathBuf {
+    if let Some(p) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         .ok()
         .map(std::path::PathBuf::from)
         .filter(|p| p.exists())
-        .or_else(|| {
-            // aterm-gpu manifest is crates/aterm-gpu; the fixture is a sibling crate over.
-            const FIXTURE: &str = concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-            );
-            let p = std::path::PathBuf::from(FIXTURE);
-            p.exists().then_some(p)
-        })
+    {
+        return p;
+    }
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
+    );
+    let p = std::path::PathBuf::from(FIXTURE);
+    assert!(p.exists(), "{FIXTURE}: missing (a committed fixture)");
+    p
 }
 
 #[test]
@@ -46,12 +42,7 @@ fn ligature_font_gpu_matches_cpu() {
     let px = 18.0;
 
     // Builds BOTH renderers on the ligature font (see ligature_test_font).
-    let Some(font) = ligature_test_font() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let font = ligature_test_font();
 
     let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
@@ -98,25 +89,18 @@ fn ligature_font_gpu_matches_cpu() {
     );
 }
 
-/// CPU==GPU parity WITH a selection active over part of a ligature. The shared
-/// `ligature_break_cols_into` now breaks runs on selection columns, so a ligature must
-/// not span the selection-highlight boundary on EITHER path. This drives "a=>b"
-/// with col 1 (the '=' of the arrow) selected and asserts both that the CPU frame
-/// changed vs no-selection (non-vacuous: the break actually fired) and that the
-/// GPU frame still matches the CPU frame within the blend tolerance — i.e. both
-/// paths consumed the IDENTICAL break set + plan with the selection active.
+/// CPU==GPU parity with a selection over part of a ligature:
+/// `ligature_break_cols_into` breaks runs on selection columns, so a ligature
+/// never spans the highlight boundary. Selects col 1 of "a=>b" and asserts the
+/// CPU frame changed vs no selection (the break fired) and the GPU frame
+/// still matches within tolerance.
 #[test]
 fn ligature_selection_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
     // Builds BOTH renderers on the ligature font (see ligature_test_font).
-    let Some(font) = ligature_test_font() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let font = ligature_test_font();
 
     let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
@@ -159,47 +143,31 @@ fn ligature_selection_gpu_matches_cpu() {
     );
 }
 
-/// W4 (cursor ink integrity) CPU==GPU parity: a BLOCK cursor over ligature and
-/// wide-glyph geometry. The CPU side of these frames is PROVEN correct by
-/// aterm-render/tests/cursor_ink.rs (partition/no-bleed: the complement of the
-/// cursor rect is byte-identical to the no-cursor frame); this test binds the
-/// GPU's quad slicing (`glyph_quad` x-clip + widened `cursor_block` fill +
-/// ligature-run cut-out sources) to those frames pixel-for-pixel:
-///   * cursor on the '>' of '=>' (the covering-glyph column — pre-W4 the GPU
-///     moved the WHOLE arrow quad into the bg-coloured cursor stream, erasing
-///     the '=' cell's ink),
-///   * cursor on the '=' lead (pre-W4: empty placeholder = no cut-out at all),
-///   * cursor on a wide 日 lead (pre-W4: single-cell fill + full-glyph re-blit
-///     erased the ideograph's right half).
+/// Cursor ink integrity, CPU==GPU: a block cursor over ligature and wide-glyph
+/// geometry. The CPU side is verified by aterm-render/tests/cursor_ink.rs
+/// (outside the cursor rect the frame equals the no-cursor frame); this binds
+/// the GPU's quad slicing (`glyph_quad` x-clip, widened `cursor_block` fill,
+/// ligature-run cut-out sources) to those frames:
+///   * cursor on the '>' of '=>' (the covering-glyph column),
+///   * cursor on the '=' lead,
+///   * cursor on a wide 日 lead.
 ///
-/// Non-vacuous: each cursor frame must differ from the cursor-hidden frame.
+/// Non-vacuous: each cursor frame differs from the cursor-hidden frame.
 #[test]
 fn cursor_cutout_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
     // Builds BOTH renderers on the ligature font (see ligature_test_font).
-    let Some(font) = ligature_test_font() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let font = ligature_test_font();
 
     let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
     };
-    // 日 is not in the JetBrains fixture, so each renderer spawns its OWN
-    // background CJK fallback parse — and these are two independent Renderer
-    // instances (the CPU one, and the GPU's wrapped CPU face) whose parses
-    // land at different times. Idle, the whole test outruns both parses and
-    // compares tofu==tofu; under machine load, exactly one side's parse can
-    // land mid-test and one frame shows the real 日 against the other's
-    // provisional `.notdef` — a delta-229 "divergence" at the 日 cells,
-    // blamed on whichever cursor case was running (proven 2026-08-24:
-    // 8/30 failures at full-core load, 0 with these two lines). The rule
-    // every sibling parity suite already follows: CJK pixel tests block on
-    // lazy fallbacks.
+    // 日 is not in the fixture, so each renderer (the CPU one and the GPU's
+    // inner CPU face) parses its own CJK fallback in the background; under
+    // load one can land mid-test and compare real 日 against `.notdef`. Block
+    // on lazy fallbacks, as every CJK pixel test does.
     cpu.debug_block_on_lazy_fallbacks();
     gpu.debug_block_on_lazy_fallbacks();
 
@@ -243,11 +211,10 @@ fn cursor_cutout_gpu_matches_cpu() {
     }
 }
 
-/// Animated ink over an ACTIVELY-LIGATED run stays CPU==GPU: the run's single
-/// shaped glyph takes the ink colour of its owning column (both backends read
-/// the SAME per-column plan + the same ink slice), so inking every column of
-/// the run is byte-identical to recolouring the run via SGR truecolor fg on
-/// EACH backend — and the two backends agree within the suite's delta bar.
+/// Animated ink over a ligated run: the run's single glyph takes its owning
+/// column's ink colour (both backends read the same per-column plan and ink
+/// slice), so inking every column equals recolouring the run via SGR
+/// truecolor fg on each backend, and the backends agree within the bar.
 #[test]
 fn ligature_ink_gpu_matches_cpu() {
     use aterm_core::render::InkCell;
@@ -255,12 +222,7 @@ fn ligature_ink_gpu_matches_cpu() {
     let px = 18.0;
 
     // Builds BOTH renderers on the ligature font (see ligature_test_font).
-    let Some(font) = ligature_test_font() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let font = ligature_test_font();
 
     let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;

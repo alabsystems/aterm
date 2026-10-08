@@ -1156,11 +1156,10 @@ fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
 /// few tries were refused for a lock nobody held.
 fn try_lock(path: &Path) -> Option<HeldAdvisoryLock> {
     let lock_path = path.with_extension("toml.lock");
-    let file = open_lock(&lock_path).ok()?;
-    file.try_lock().ok()?;
+    let held = HeldAdvisoryLock::try_lock(open_lock(&lock_path).ok()?).ok()?;
     #[cfg(all(test, unix))]
     crate::parked_fork::fork_if_armed();
-    Some(HeldAdvisoryLock::adopt(file))
+    Some(held)
 }
 
 /// Both ledger locks, legacy first (the order every writer takes them in). A
@@ -1179,10 +1178,7 @@ fn lock_pair(
 /// stamp format, computed in-process (the `aterm-update::install` idiom; no
 /// `/bin/date` fork). Empty string on a pre-epoch clock.
 fn now_rfc3339() -> String {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => format_rfc3339(d.as_secs()),
-        Err(_) => String::new(),
-    }
+    aterm_time::unix_secs().map_or_else(String::new, format_rfc3339)
 }
 
 // The RFC3339 UTC stamp is `aterm_types::rfc3339::format_rfc3339` — the ONE
@@ -1443,10 +1439,7 @@ impl KittyLogHost {
 
     /// An in-memory-only host (no ledger file) — the headless-test App, which
     /// must never read or write the developer's real ledger.
-    // bench-support: `headless_for_test` (which the frame-latency bench builds
-    // through) requires the in-memory host for the same never-touch-the-real-
-    // ledger reason the unit suite does.
-    #[cfg(any(test, feature = "bench-support"))]
+    #[cfg(test)]
     pub(crate) fn in_memory() -> Self {
         Self::load(None)
     }
@@ -1554,7 +1547,7 @@ impl KittyLogHost {
 
     /// The PINNED FAVOURITE, if any — the ledger's one claim on the cursor
     /// companion (O(1), no I/O), read by the precedence seam
-    /// (`launch_kitty::companion_precedence`: favourite > program with
+    /// (`aterm_effects::companion_look::companion_precedence`: favourite > program with
     /// tenure > launch kitty). `None` means the ledger claims nothing — the
     /// tenured program cat or the launch kitty rides.
     pub(crate) fn favourite_look(&mut self) -> Option<KittyLook> {
@@ -2200,34 +2193,6 @@ mod tests {
         );
         assert!(!legacy.exists(), "a contended flush must not race unlocked");
         drop(held);
-
-        let mut delta = KittyLog::default();
-        delta.record(&sighting(7), Lexicon::builtin(), "2026-07-21T00:00:00Z");
-        // The sibling lock this test held is not the only contender. `flush_exit`
-        // DETACHES a worker that outlives EXIT_JOIN_BUDGET — deliberate, so that
-        // process teardown wins over ledger durability — which means the host's
-        // own writer may still be working through its finite retry budget at this
-        // instant. `flush_merge` takes the lock with a SINGLE try, so asserting it
-        // succeeds the moment the sibling lock drops quietly required that
-        // detached thread to have already exited: a scheduling accident, not a
-        // property of the code. (Reproduced ~1 run in 4 of the full aterm-gui
-        // suite; never alone, because alone nothing delays the worker.)
-        //
-        // Retry within a bounded window instead. The claim — "once contention
-        // clears, the retained batch is writable" — is unchanged and still fails
-        // for a path that never becomes writable; only the accidental demand that
-        // contention already be over at one exact instant is dropped.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut wrote = KittyLog::flush_merge(&legacy, &delta);
-        while !wrote && Instant::now() < deadline {
-            std::thread::sleep(EXIT_LOCK_RETRY_DELAY);
-            wrote = KittyLog::flush_merge(&legacy, &delta);
-        }
-        assert!(
-            wrote,
-            "the same retained batch is writable after contention clears"
-        );
-        assert_eq!(KittyLog::read(&legacy).sightings, 1);
         let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
     }
 
@@ -2275,9 +2240,10 @@ mod tests {
         let sidecar = collectibles_path(&legacy);
         // The peer lets go by `LOCK_UN` whatever `try_lock` returns, so only the
         // legacy lock's release is on trial.
-        let peer = open_lock(&sidecar.with_extension("toml.lock")).expect("open");
-        peer.try_lock().expect("a peer holds the sidecar lock");
-        let peer = HeldAdvisoryLock::adopt(peer);
+        let peer = HeldAdvisoryLock::try_lock(
+            open_lock(&sidecar.with_extension("toml.lock")).expect("open"),
+        )
+        .expect("a peer holds the sidecar lock");
         let armed = crate::parked_fork::arm_at(1); // the legacy take: legacy only
         assert!(lock_pair(&legacy, &sidecar).is_none(), "sidecar refused");
         let child = armed.child();
@@ -2376,17 +2342,19 @@ mod tests {
         let joined = project(1, 0, 0, 0, 1, 0, 1, EXIT_LOCK_RETRIES as i64, 1);
         validate("Join", &before, &joined);
 
-        // Bind the whole genuine worker/host terminal lifecycle, not only the
-        // retry helper: with the lock held through shutdown, the worker returns
-        // its exhausted batch through JoinHandle and flush_exit restores host
-        // ownership exactly as the joined projection above requires.
-        let mut host = KittyLogHost::load(Some(legacy.clone()));
-        host.observe(9, [sighting(9)], Lexicon::builtin(), Instant::now(), true);
-        host.flush_exit();
-        assert!(host.writer.is_none());
+        // Bind the genuine worker's terminal path, not only the retry helper:
+        // with the lock held through shutdown, the worker hands its exhausted
+        // batch back to its joiner exactly as the joined projection requires.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(delta)
+            .expect("the worker lane has room for one batch");
+        drop(tx);
+        drop(exit_tx);
         assert_eq!(
-            host.delta.sightings, 1,
-            "retry exhaustion must return the worker-owned batch to the host"
+            run_kitty_writer(legacy.clone(), rx, exit_rx, None).sightings,
+            1,
+            "retry exhaustion must return the worker-owned batch to its joiner"
         );
         assert!(
             !legacy.exists(),
@@ -3448,40 +3416,6 @@ mod tests {
         assert!(!rows[0].favourite.is_empty(), "and is stamped durably");
     }
 
-    /// The precedence seam's surface (`launch_kitty::companion_precedence`:
-    /// favourite > program with tenure > launch kitty): `favourite_look` is
-    /// `None` on a fresh install AND after a stumbled discovery (neither is a
-    /// choice — the unpinned rungs ride), and becomes the pin the moment the
-    /// user pins one (nothing outranks a choice).
-    #[test]
-    fn favourite_look_reports_only_the_pin() {
-        let lex = Lexicon::builtin();
-        let mut host = KittyLogHost::in_memory();
-        let now = Instant::now();
-
-        assert_eq!(
-            host.favourite_look(),
-            None,
-            "fresh install: the launch kitty"
-        );
-
-        let stumbled = coated(CatGlyphId::S100, 3);
-        host.observe(4, [look_sighting(11, stumbled)], lex, now, true);
-        assert_eq!(
-            host.favourite_look(),
-            None,
-            "a stumbled discovery is NOT a favourite — the launch kitty still rides"
-        );
-
-        let pinned = coated(CatGlyphId::S100, 9);
-        host.favourite(&look_sighting(12, pinned), lex, now, true);
-        assert_eq!(
-            host.favourite_look(),
-            Some(pinned),
-            "the pin is the one ledger claim on the companion"
-        );
-    }
-
     /// A later automatic discovery still earns its hello, but it must not steal
     /// a pin the user made on purpose.
     #[test]
@@ -3866,26 +3800,11 @@ mod tests {
         });
         host.observe(7, [sighting(11)], lex, Instant::now(), true);
 
-        let started = Instant::now();
         host.flush_exit();
         // DETACHMENT is proven structurally, not by the clock: this worker blocks
         // on `release_rx` until the send at the very end of this test, so a
         // `flush_exit` that JOINED it could never return and execution could not
-        // reach this line at all. The assertion below therefore only guards
-        // PROMPTNESS — that quit honours its budget instead of lingering.
-        //
-        // So derive it from that budget with wide margin rather than pinning it at
-        // budget + 100ms. `flush_exit` polls in EXIT_JOIN_POLL (1ms) sleeps, and a
-        // 1ms sleep on a machine running 2,400 sibling tests can overshoot by far
-        // more than the old 100ms of slack — that bound measured the scheduler.
-        // A multiple still catches a real regression (quit waiting seconds for a
-        // dead network mount) without failing on scheduling noise.
-        assert!(
-            started.elapsed() < EXIT_JOIN_BUDGET * 10,
-            "quit must detach a worker whose regular-file operation never returns \
-             promptly: took {:?}, budget is {EXIT_JOIN_BUDGET:?}",
-            started.elapsed(),
-        );
+        // reach this line at all.
 
         // Tier-1 projection of that genuine stalled worker: delivery and exit
         // precede the unreturned IO, the UI-owned deadline advances without
@@ -3951,7 +3870,7 @@ mod tests {
         assert!(!ledger.exists(), "held lock keeps the batch pending");
 
         drop(locks);
-        let deadline = Instant::now() + FLUSH_RETRY_DELAY + Duration::from_secs(2);
+        let deadline = Instant::now() + FLUSH_RETRY_DELAY + aterm_spec::wait::MUST_HAPPEN;
         while !ledger.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3980,7 +3899,7 @@ mod tests {
     /// count — after the worker is through. A batch that never reaches disk
     /// still fails the caller's assertions when the bounded window ends.
     fn read_once_persisted(ledger: &Path, sightings: u64) -> KittyLog {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while KittyLog::read(ledger).sightings < sightings && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }

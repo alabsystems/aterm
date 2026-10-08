@@ -4,54 +4,60 @@
 //! The supervisor's policies: pure decisions over what a screen shows, kept
 //! apart from the loop that reads screens and presses keys.
 //!
-//! * [`approval`] — THE approval decider: which option, if any, to choose on
-//!   an agent's approval box (read by the reader for the session's program),
-//!   under which rule, behind which guard — by default full power, every box
-//!   its answer (the owner's direction of 2026-09-24), owner decision 1's
-//!   proven rules alone under `approve = "safe"`, nothing under `"none"` —
-//!   or the refusal it amends with a reason the worker acts on
-//!   ([`Decision::Decline`], built by [`decline`]), and each keystroke of
-//!   that decline ([`decline_step`]).
-//! * [`question`] — THE question answer: a question dialog (Claude Code's
-//!   AskUserQuestion, read whole; Codex's, by its roles) answered with its
-//!   recommended option(s), or option 1 when none is marked — Claude Code's
-//!   by Enter on the focused row ([`RULE_ANSWER_RECOMMENDED`], under
-//!   `[harness] answer_questions`, independent of `approve`; the owner
-//!   directive of 2026-09-25); what a person has begun answering, and what
-//!   aterm-phase did not read whole, is escalated. [`approval::decide`] hands
-//!   every question to it.
-//! * [`git_config`] — what a git read would load that can run a program:
-//!   the read-only rule's check of the machine a git read runs on (the owner
-//!   ruling of 2026-09-25).
-//! * [`rm_breaker`] — the resolver behind the approval rule for the vendor's
-//!   rm circuit breaker: where every `rm` operand on a line points.
-//! * [`shell_startup`] — what the worker's Bash tool's shell carries in from
-//!   the person's own startup (Claude Code's shell snapshot, `.zshenv`, the
-//!   hook env scripts): an option, alias or function the rm rule and the
-//!   read-only classifier do not model makes them prove nothing.
-//! * [`guard`] — the press guard that binds a keystroke to the row that was
-//!   judged, and the content-sequence fence where the server has one.
-//! * [`turn_end`] — THE turn-end decider: what to do when a worker's turn
-//!   has ended (continue, wait out a wall, switch a model, compact, log in,
-//!   or escalate).
+//! * [`approval`]: the approval decider: which option, if any, to choose on an
+//!   agent's approval box, under which rule and guard (full power by default,
+//!   the proven rules alone under `approve = "safe"`, nothing under `"none"`),
+//!   or a refusal with a reason the worker acts on ([`Decision::Decline`],
+//!   [`decline`], [`decline_step`]) (owner, 2026-09-24; 2026-09-25).
+//! * [`question`]: the question answer, with the recommended option(s) or
+//!   option 1 ([`RULE_ANSWER_RECOMMENDED`], under `[harness]
+//!   answer_questions`), or under `long-term`/`short-term`
+//!   ([`QuestionPriority`]) by the worker from a fixed policy text
+//!   ([`LONG_TERM_TEXT`], [`SHORT_TERM_TEXT`]); what a person began, or what
+//!   aterm-phase did not read whole, is escalated.
+//! * [`git_config`]: what a git read would load that can run a program.
+//! * [`rm_breaker`]: where every `rm` operand on a line points, for the rm
+//!   circuit breaker's approval rule.
+//! * [`shell_startup`]: what the worker's shell carries in from the person's
+//!   startup, which makes the rm rule and the classifier prove nothing when
+//!   they do not model it.
+//! * [`guard`]: the press guard binding a keystroke to the judged row, and the
+//!   generation fence where the server has one.
+//! * [`reset`]: a limit reset's vocabulary between the loop and its host, and
+//!   the verdict on the confirmation its row opens ([`confirm_verdict`]:
+//!   Enter only where every condition holds).
+//! * [`turn_end`]: the turn-end decider (continue, wait out a wall, switch a
+//!   model, compact, log in, or escalate).
 
 pub mod approval;
+pub mod exception;
 pub mod git_config;
 pub mod guard;
+pub mod outlook;
 pub mod question;
+pub mod reset;
 pub mod rm_breaker;
 pub mod shell_startup;
 pub mod turn_end;
 
 pub use approval::{
     Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, Decision, DeclineStep, FooterMode,
-    NudgeCtx, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_DECLINE, RULE_GOAL_RESUME, RULE_MODEL_CONFIRM,
-    RULE_MODEL_RESTORE_PICK, RULE_MODEL_SWITCH, RULE_NO_SPEND, RULE_PLAN, RULE_RATE_NUDGE_KEEP,
-    RULE_RATE_NUDGE_SWITCH, RULE_READ_ONLY, RULE_READ_OUTSIDE_CWD, RULE_RM_BREAKER, RULE_TALL_BOX,
-    RULE_TRUST_ANY, RULE_TRUST_DIALOG, SecretRule, buys, decide, decide_screen, decline,
-    decline_step, decline_text, default_secrets, footer_mode, rm_breaker_label, roots_from_config,
+    NudgeCtx, QuestionPriority, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM,
+    RULE_ANSWER_SHORT_TERM, RULE_DECLINE, RULE_GOAL_RESUME, RULE_LIMIT_RESET, RULE_MODEL_CONFIRM,
+    RULE_MODEL_RESTORE_PICK, RULE_MODEL_SWITCH, RULE_NO_SPEND, RULE_PLAN, RULE_PROSE_LONG_TERM,
+    RULE_PROSE_SHORT_TERM, RULE_RATE_NUDGE_KEEP, RULE_RATE_NUDGE_SWITCH, RULE_READ_ONLY,
+    RULE_READ_OUTSIDE_CWD, RULE_RM_BREAKER, RULE_RM_BREAKER_WARN, RULE_TALL_BOX, RULE_TRUST_ANY,
+    RULE_TRUST_DIALOG, SecretRule, buys, decide, decide_screen, decline, decline_step,
+    decline_text, default_secrets, footer_mode, rm_breaker_label, roots_from_config,
 };
 pub use git_config::{GitView, WorkerEnv};
 pub use guard::{key_args, row_guard, server_fences_gen, server_fences_send};
-pub use question::{MAX_QUESTION_FOCUS_STEPS, RULE_ANSWER_RECOMMENDED, answer_question};
+pub use question::{
+    LONG_TERM_TEXT, MAX_QUESTION_FOCUS_STEPS, RULE_ANSWER_RECOMMENDED, SHORT_TERM_TEXT,
+    answer_question, is_question_rule,
+};
+pub use reset::{
+    KeepWhy, RESET_CONTINUES_WAIT, ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
+    Verdict, confirm_verdict,
+};
 pub use shell_startup::ShellStartup;

@@ -40,19 +40,14 @@
 //! The release cutter builds with the Trust toolchain atpkg installs. If that
 //! `trustc`/`targo` carries the tag, every object file, the proof snapshot and the
 //! release artifacts inherit it, and `tools/proof_snapshot.py` refuses "published proof
-//! snapshot has extended metadata" AFTER the ledger claim — a burned build number
-//! (v0.83.0, 2026-09-12: bundle `trust/8590`, seeded from a shell that was itself
-//! tracked). The 02:27 seed of `trust/8589` by the app's own update lane, from an
-//! untracked app, came out clean, and the cut succeeded once that bundle was first on
-//! PATH. So every build is healed as it is staged, before its flip ([`heal_staged`]: after
+//! snapshot has extended metadata" AFTER the ledger claim — a burned build number. So
+//! every build is healed as it is staged, before its flip ([`heal_staged`]: after
 //! it, the heal moved ctimes a running tippy pins), and so is each part of the rustup view
 //! before it is exchanged into place (`seam::swap_in`: a tracked `rename(2)` tags what it
 //! moves); every store-changing door and `aterm pkg repair` end with [`heal_store`], the
 //! cutter clears its own toolchain with [`heal`] and refuses before the claim whatever
 //! stays tagged (`aterm-release::gates::provenance_gate`), and `aterm pkg doctor` counts
-//! what is still tagged. Installs write in-process like any other program: until
-//! 2026-09-24 they were routed through untracked launchd lanes so their files came out
-//! clean, and that machinery was deleted once the heal cleared the real store in place.
+//! what is still tagged. Installs write in-process like any other program.
 //!
 //! Outside a release cut the tag changes nothing a user runs: every tagged tool runs
 //! normally. Its one everyday trace is archive metadata — macOS `tar` and `ditto -c -k`
@@ -616,7 +611,7 @@ fn heal_scratch(layout: &crate::store::Layout) -> PathBuf {
     }
 }
 
-/// Remove what the untracked lanes (deleted 2026-09-24) left in the store, which nothing
+/// Remove what the retired untracked install lanes left in the store, which nothing
 /// reads any more: every `store/<program>/<build>.tracked-install` record and the
 /// `<prefix>/tag-relay.tried` memo. Tagged files are measured, never recorded.
 fn sweep_lane_leftovers(layout: &crate::store::Layout) {
@@ -713,12 +708,8 @@ pub(crate) fn set_xattr_for_test(path: &Path, name: &str, value: &[u8]) -> io::R
 mod tests {
     use super::*;
 
-    fn tmp(label: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("atpkg-provenance-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-provenance-{label}-"))
     }
 
     /// The name this process cannot mint is read through the same syscall as a name it

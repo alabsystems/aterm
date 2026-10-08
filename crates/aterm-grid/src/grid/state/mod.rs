@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Private `Grid` state pods.
-//!
-//! These keep `Grid` as the stable public facade while separating storage,
-//! cursor/region, and presentation concerns.
+//! Private `Grid` state pods, separating storage, cursor/region and
+//! presentation concerns behind the `Grid` facade.
 
 mod scrollback;
 mod storage;

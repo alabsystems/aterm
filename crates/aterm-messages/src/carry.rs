@@ -56,6 +56,16 @@ pub struct CarriedMessage {
     /// it keeps its lower rank across the handoff (ruling 263); an older
     /// parent's rows carry `false`.
     pub retrospective: bool,
+    /// The row is the WIRE's ([`crate::model::Origin::wire_owned`]): a
+    /// keyless `notice post` row has no `wire.` key to say so, and stays the
+    /// wire's across the handoff by this (rulings 167, 192; round 43, ruling
+    /// 415 (h)); an older parent's rows carry `false`.
+    pub wire: bool,
+    /// Duplicate posts folded into the row (`Live::repeats`, 1 = posted
+    /// once): its Retired line's `rep=`, the page's `×N` and the wire's
+    /// `rep=` (round 43, ruling 415 (j)); an older parent's rows carry 1, and
+    /// 0 reads as 1.
+    pub repeats: u32,
 }
 
 /// Everything the successor needs: the next id and the live rows in glass

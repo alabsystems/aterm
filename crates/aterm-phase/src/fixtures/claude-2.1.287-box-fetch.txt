@@ -1,0 +1,50 @@
+# claude-code 2.1.287 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · default (manual) mode, a WebFetch tool use of the lab stub's own loopback URL: the 'Fetch' box (footerless: its refusal marked '(esc)'); approve=none
+❯ toolstart
+
+⏺ Bash(touch lab-witness-c.txt)
+  ⎿  Done
+
+⏺ Tool call done.
+
+✻ Worked for 0s · done 2:50 PM
+
+❯ toolstart
+
+⏺ Write(lab-write-d.txt)
+  ⎿  Wrote 2 lines to lab-write-d.txt
+      1 hello
+      2 world
+
+⏺ Tool call done.
+
+✻ Churned for 0s · done 2:51 PM
+
+❯ toolstart
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(notes.txt)
+  ⎿  Added 1 line, removed 1 line
+      1 -seed
+      1 +sprout
+      2  second line
+
+⏺ Tool call done.
+
+✻ Cogitated for 0s · done 2:52 PM
+
+❯ toolstart
+
+⏺ Fetch(http://127.0.0.1:64959/__status)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Fetch
+ Claude wants to fetch content from 127.0.0.1
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ url: http://127.0.0.1:64959/__status
+ prompt: Summarize the status
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to allow Claude to fetch this content?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for 127.0.0.1
+   3. No, and tell Claude what to do differently (esc)

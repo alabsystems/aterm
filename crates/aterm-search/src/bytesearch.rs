@@ -24,8 +24,8 @@
 //! together, so the machine has eight independent loads in flight and pays one
 //! branch and one bounds check per 64 bytes rather than per 8. That is worth
 //! roughly 3x over the same test written a word at a time — measured, at every
-//! size from a terminal line to a megabyte, in `benches/literal_scan.rs` and
-//! the scanner table in this module's tests. It does not reach a vector
+//! size from a terminal line to a megabyte, in the scanner table in this
+//! module's tests. It does not reach a vector
 //! implementation (`memchr` stays about 2-3x ahead on this machine) and is not
 //! meant to: it is eight bytes per compare against sixteen or thirty-two, with
 //! no dispatch, no warm-up and no `unsafe`.
@@ -580,10 +580,9 @@ fn two_way<const REV: bool>(
 
 /// One needle, prepared for repeated searching.
 ///
-/// The critical factorization is two `O(m)` passes and the skip byte is one
-/// more, all of which used to run on EVERY call — and a line with `k` matches
-/// calls `find` `k` times. Preparing the needle once per query and reusing it
-/// down the line is what makes that `O(m)` instead of `O(k·m)`.
+/// The critical factorization is two `O(m)` passes and the skip byte one more;
+/// a line with `k` matches calls `find` `k` times. Preparing once per query
+/// makes that `O(m)` instead of `O(k·m)`.
 pub(crate) struct Searcher<'n> {
     /// The bytes being searched for.
     needle: &'n [u8],
@@ -845,7 +844,7 @@ mod tests {
     }
 }
 
-/// Differential oracle: this module against the `memchr` it replaces.
+/// Differential: this module against naive reference scans.
 ///
 /// Substring search is the kind of algorithm where "it passed the tests I
 /// thought of" means nothing — Two-Way's critical factorization has cases that
@@ -853,20 +852,42 @@ mod tests {
 /// will not contain them. So the core of this module is EXHAUSTIVE: every
 /// haystack and every needle up to a length bound over a two- and three-letter
 /// alphabet, which is where periodicity, overlap and self-similarity all live.
-/// Millions of pairs, each compared against the reference — in BOTH directions,
-/// which is what covers the reverse view the reverse search reads through.
-///
-/// `memchr` is a `[dev-dependencies]` entry only; it reaches no shipped binary.
+/// Millions of pairs, each compared against an obviously-correct window scan —
+/// in BOTH directions, which is what covers the reverse view the reverse
+/// search reads through.
 #[cfg(test)]
 mod oracle {
     use super::{Searcher, memchr, memchr2, memrchr};
 
-    /// One-shot `memchr::memmem::find`, the shape the reference is written in.
+    /// The reference: naive scans, correct by inspection.
+    mod naive {
+        pub(super) fn memchr(n: u8, h: &[u8]) -> Option<usize> {
+            h.iter().position(|&b| b == n)
+        }
+        pub(super) fn memchr2(a: u8, b: u8, h: &[u8]) -> Option<usize> {
+            h.iter().position(|&x| x == a || x == b)
+        }
+        pub(super) fn memrchr(n: u8, h: &[u8]) -> Option<usize> {
+            h.iter().rposition(|&b| b == n)
+        }
+        pub(super) mod memmem {
+            pub(in super::super) fn find(h: &[u8], n: &[u8]) -> Option<usize> {
+                (0..=h.len().checked_sub(n.len())?).find(|&i| &h[i..i + n.len()] == n)
+            }
+            pub(in super::super) fn rfind(h: &[u8], n: &[u8]) -> Option<usize> {
+                (0..=h.len().checked_sub(n.len())?)
+                    .rev()
+                    .find(|&i| &h[i..i + n.len()] == n)
+            }
+        }
+    }
+
+    /// One-shot forward search through a fresh [`Searcher`].
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         Searcher::new(needle).find_in(haystack)
     }
 
-    /// One-shot `memchr::memmem::rfind`.
+    /// One-shot reverse search through a fresh [`Searcher`].
     fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         Searcher::new(needle).rfind_in(haystack)
     }
@@ -907,14 +928,14 @@ mod oracle {
     fn check_pair(haystack: &[u8], needle: &[u8]) {
         assert_eq!(
             ours::find(haystack, needle),
-            memchr::memmem::find(haystack, needle),
+            naive::memmem::find(haystack, needle),
             "find({:?}, {:?})",
             String::from_utf8_lossy(haystack),
             String::from_utf8_lossy(needle),
         );
         assert_eq!(
             ours::rfind(haystack, needle),
-            memchr::memmem::rfind(haystack, needle),
+            naive::memmem::rfind(haystack, needle),
             "rfind({:?}, {:?})",
             String::from_utf8_lossy(haystack),
             String::from_utf8_lossy(needle),
@@ -957,8 +978,8 @@ mod oracle {
                     .map(|_| alphabet[(next() as usize) % alphabet.len()])
                     .collect()
             };
-            let want_find = memchr::memmem::find(&haystack, &needle);
-            let want_rfind = memchr::memmem::rfind(&haystack, &needle);
+            let want_find = naive::memmem::find(&haystack, &needle);
+            let want_rfind = naive::memmem::rfind(&haystack, &needle);
             let forward_first = Searcher::new(&needle);
             assert_eq!(forward_first.find_in(&haystack), want_find);
             assert_eq!(forward_first.rfind_in(&haystack), want_rfind);
@@ -1077,10 +1098,10 @@ mod oracle {
         for len in 0..=200usize {
             // Absent.
             let filler = vec![b'.'; len];
-            assert_eq!(ours::memchr(b'!', &filler), memchr::memchr(b'!', &filler));
+            assert_eq!(ours::memchr(b'!', &filler), naive::memchr(b'!', &filler));
             assert_eq!(
                 ours::memchr2(b'!', b'?', &filler),
-                memchr::memchr2(b'!', b'?', &filler)
+                naive::memchr2(b'!', b'?', &filler)
             );
             // Present at each offset.
             for at in 0..len {
@@ -1088,17 +1109,17 @@ mod oracle {
                 haystack[at] = b'!';
                 assert_eq!(
                     ours::memchr(b'!', &haystack),
-                    memchr::memchr(b'!', &haystack),
+                    naive::memchr(b'!', &haystack),
                     "len {len} at {at}"
                 );
                 assert_eq!(
                     ours::memchr2(b'?', b'!', &haystack),
-                    memchr::memchr2(b'?', b'!', &haystack),
+                    naive::memchr2(b'?', b'!', &haystack),
                     "len {len} at {at}"
                 );
                 assert_eq!(
                     ours::memrchr(b'!', &haystack),
-                    memchr::memrchr(b'!', &haystack),
+                    naive::memrchr(b'!', &haystack),
                     "len {len} at {at}"
                 );
             }
@@ -1113,7 +1134,7 @@ mod oracle {
                     haystack[b] = b'y';
                     assert_eq!(
                         ours::memchr2(b'x', b'y', &haystack),
-                        memchr::memchr2(b'x', b'y', &haystack),
+                        naive::memchr2(b'x', b'y', &haystack),
                         "len {len}, x at {a}, y at {b}"
                     );
                 }
@@ -1136,12 +1157,12 @@ mod oracle {
                     haystack[at] = needle;
                     assert_eq!(
                         ours::memchr(needle, &haystack),
-                        memchr::memchr(needle, &haystack),
+                        naive::memchr(needle, &haystack),
                         "byte {needle:#04x} len {len} at {at}"
                     );
                     assert_eq!(
                         ours::memrchr(needle, &haystack),
-                        memchr::memrchr(needle, &haystack),
+                        naive::memrchr(needle, &haystack),
                         "byte {needle:#04x} len {len} at {at}"
                     );
                 }
@@ -1238,8 +1259,8 @@ mod oracle {
                         }
                     }
                     for byte in [b'\n', b' ', b'{', 0u8, 0xFFu8] {
-                        assert_eq!(ours::memchr(byte, &raw), memchr::memchr(byte, &raw));
-                        assert_eq!(ours::memrchr(byte, &raw), memchr::memrchr(byte, &raw));
+                        assert_eq!(ours::memchr(byte, &raw), naive::memchr(byte, &raw));
+                        assert_eq!(ours::memrchr(byte, &raw), naive::memrchr(byte, &raw));
                     }
                 }
             }

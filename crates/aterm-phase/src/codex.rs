@@ -24,10 +24,9 @@
 //! placeholder still DIM at column 2 (measured 2026-09-28 on a live goal-mode
 //! session, [`fixtures::GOAL_BUSY_0_158`]; the same mark was read on 0.157.1
 //! at a paused goal that morning) — while the transcript's own user rows
-//! still open with `›`. A reader that knew `›` alone found no composer on
-//! that screen, read it `idle` NOT authoritatively, and nothing that acts on
-//! an idle point (the supervisor, the live upgrade, `Upgrade now`) ever ran
-//! there again: the owner's tab sat a Codex upgrade behind for hours.
+//! still open with `›`. A reader that knows `›` alone finds no composer
+//! there, so nothing that acts on an idle point (the supervisor, the live
+//! upgrade, `Upgrade now`) ever runs on that tab.
 //!
 //! A turn ENDS on an end row under its last block — `  1:39 PM`, or `
 //! Worked for 1m 55s · 1:43 PM` after a long one (from 0.159.0, `Worked for
@@ -99,7 +98,10 @@ pub const CARETS: [char; 2] = ['›', '»'];
 
 /// Whether `row` opens with one of the input line's marks ([`CARETS`]).
 fn is_caret_row(row: &str) -> bool {
-    row.starts_with(CARETS)
+    // Compared on bytes, as every row of the screen is.
+    const _: () = assert!(CARETS.len() == 2 && CARETS[0] == '›' && CARETS[1] == '»');
+    let b = row.as_bytes();
+    b.starts_with("›".as_bytes()) || b.starts_with("»".as_bytes())
 }
 
 /// The composer: the LAST row in column 0 opening with an input-line mark
@@ -121,11 +123,11 @@ pub fn composer(rows: &[String]) -> Option<usize> {
     }
     let c = rows.iter().rposition(|r| is_caret_row(r))?;
     let below = &rows[c + 1..];
-    let footer = below.iter().rfind(|r| !r.trim().is_empty())?;
+    let footer = below.iter().rfind(|r| !crate::text::trim(r).is_empty())?;
     (leading_spaces(footer) == 2
         && !below
             .iter()
-            .any(|r| r.starts_with(BLOCK_GLYPHS) || r.trim_start().starts_with('└')))
+            .any(|r| r.starts_with(BLOCK_GLYPHS) || crate::text::trim_start(r).starts_with('└')))
     .then_some(c)
 }
 
@@ -140,13 +142,17 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
     let c = composer(rows)?;
     let end = match footer_top(rows, c) {
         // The footer, and the blank row above it.
-        Some(f) if f > c + 1 && rows[f - 1].trim().is_empty() => f - 1,
+        Some(f) if f > c + 1 && crate::text::trim(&rows[f - 1]).is_empty() => f - 1,
         Some(f) => f,
         None => c + 1,
     };
     let caret = rows[c].strip_prefix(CARETS).unwrap_or(&rows[c]).trim();
     let mut lines = vec![caret.to_string()];
-    lines.extend(rows[c + 1..end].iter().map(|r| r.trim().to_string()));
+    lines.extend(
+        rows[c + 1..end]
+            .iter()
+            .map(|r| crate::text::trim(r).to_string()),
+    );
     Some((c, lines))
 }
 
@@ -171,9 +177,9 @@ pub fn caret_on(rows: &[String]) -> Option<char> {
 fn footer_top(rows: &[String], c: usize) -> Option<usize> {
     let last = (c + 1..rows.len())
         .rev()
-        .find(|&i| !rows[i].trim().is_empty())?;
+        .find(|&i| !crate::text::trim(&rows[i]).is_empty())?;
     let mut top = last;
-    while top > c + 1 && !rows[top - 1].trim().is_empty() {
+    while top > c + 1 && !crate::text::trim(&rows[top - 1]).is_empty() {
         top -= 1;
     }
     Some(top)
@@ -187,7 +193,7 @@ fn footer_top(rows: &[String], c: usize) -> Option<usize> {
 /// not recognised, and names nothing.
 pub(crate) fn is_codex_screen(rows: &[String]) -> bool {
     composer(rows).is_some_and(|c| {
-        rows[c].contains(anchor_text("codex.composer.placeholder"))
+        rows[c].contains(const { anchor_text("codex.composer.placeholder") })
             || rows[..c].iter().any(|r| is_status_row(r))
     })
 }
@@ -202,12 +208,13 @@ pub(crate) fn is_codex_screen(rows: &[String]) -> bool {
 /// is the model's (`Working`, or a reasoning summary's title), so the row is
 /// known by its hint.
 fn is_status_row(row: &str) -> bool {
-    let hint = anchor_text("codex.busy.interrupt");
+    let hint = const { anchor_text("codex.busy.interrupt") };
     row.starts_with("• ")
         && row.match_indices(hint).any(|(at, _)| {
             let rest = &row[at + hint.len()..];
-            rest.strip_prefix(')')
-                .is_some_and(|tail| tail.trim_end().is_empty() || tail.starts_with(" · "))
+            rest.strip_prefix(')').is_some_and(|tail| {
+                crate::text::trim_end(tail).is_empty() || tail.starts_with(" · ")
+            })
         })
 }
 
@@ -245,18 +252,18 @@ pub const END_ROW_MARKS: [&str; 2] = [" · ", " • "];
 /// the one frame no reader can tell from an end.
 fn is_end_row(rows: &[String], i: usize) -> bool {
     let row = &rows[i];
-    if leading_spaces(row) != 2 || i == 0 || !rows[i - 1].trim().is_empty() {
+    if leading_spaces(row) != 2 || i == 0 || !crate::text::trim(&rows[i - 1]).is_empty() {
         return false;
     }
     if rows[i + 1..]
         .iter()
-        .find(|r| !r.trim().is_empty() && !is_tip_row(r))
+        .find(|r| !crate::text::trim(r).is_empty() && !is_tip_row(r))
         .is_some_and(|r| leading_spaces(r) != 0)
     {
         return false;
     }
-    let t = row.trim();
-    let clock = match t.strip_prefix(anchor_text("codex.turn.worked")) {
+    let t = crate::text::trim(row);
+    let clock = match t.strip_prefix(const { anchor_text("codex.turn.worked") }) {
         // The clock follows the LAST mark on the row, whichever it is.
         Some(rest) => match END_ROW_MARKS
             .iter()
@@ -288,7 +295,8 @@ fn is_end_row(rows: &[String], i: usize) -> bool {
 /// read as a row under the clock, the tip made every ended turn read as
 /// running, and no Codex turn end was ever continued or answered.
 fn is_tip_row(row: &str) -> bool {
-    leading_spaces(row) > 2 && row.trim_start().starts_with(anchor_text("codex.tip"))
+    leading_spaces(row) > 2
+        && crate::text::trim_start(row).starts_with(const { anchor_text("codex.tip") })
 }
 
 /// The last thing that ENDED a turn above `before`: an end row, or the head
@@ -310,7 +318,7 @@ fn last_end(rows: &[String], before: usize) -> Option<usize> {
 fn block_text(rows: &[String], head: usize) -> String {
     let mut out = vec![rows[head].trim_start_matches('■').trim()];
     for r in rows.iter().skip(head + 1) {
-        let t = r.trim();
+        let t = crate::text::trim(r);
         if t.is_empty() || r.starts_with(BLOCK_GLYPHS) || is_caret_row(r) || is_tip_line(r) {
             break;
         }
@@ -322,9 +330,9 @@ fn block_text(rows: &[String], head: usize) -> String {
 /// A row that is Codex's own TIP, however it is indented: `Tip: …`, or
 /// `└ Tip: …` under a status row (measured 0.158.0) — never a wall's words.
 fn is_tip_line(row: &str) -> bool {
-    let t = row.trim_start();
+    let t = crate::text::trim_start(row);
     let t = t.strip_prefix('└').map_or(t, str::trim_start);
-    row.starts_with(' ') && t.starts_with(anchor_text("codex.tip"))
+    row.starts_with(' ') && t.starts_with(const { anchor_text("codex.tip") })
 }
 
 /// Where the last turn stands, read above the composer.
@@ -363,7 +371,7 @@ fn turn(rows: &[String], composer: usize) -> Turn {
 /// person's message saying the words (`› 1 background terminal …`) is none.
 #[must_use]
 pub fn is_background_terminal_row(row: &str) -> bool {
-    let t = row.trim_start();
+    let t = crate::text::trim_start(row);
     row.starts_with(' ')
         && t.split_whitespace()
             .next()
@@ -447,7 +455,11 @@ pub fn phase(rows: &[String]) -> (Phase, bool) {
                 );
             }
             let asks = said_tail(rows)
-                .and_then(|t| t.lines().last().map(|l| l.trim_end().ends_with('?')))
+                .and_then(|t| {
+                    t.lines()
+                        .last()
+                        .map(|l| crate::text::trim_end(l).ends_with('?'))
+                })
                 .unwrap_or(false);
             (if asks { Phase::Question } else { Phase::Idle }, true)
         }
@@ -471,13 +483,16 @@ fn ended_on_block(rows: &[String]) -> Option<usize> {
 }
 
 /// Whether a PERSON stopped the last turn with Esc: it ended on `■
-/// Conversation interrupted - tell the model what to do differently.`
-/// (measured), read as the whole block — in a pane narrower than the
-/// sentence its head row wraps. The next message is theirs.
+/// Conversation interrupted - …` — `… tell the model what to do
+/// differently.` (measured on 0.156.1), `… use /feedback if something went
+/// wrong` (the strings of 0.159.0's binary), so the head is the anchor —
+/// read as the whole block: in a pane narrower than the sentence its head
+/// row wraps. The next message is theirs.
 #[must_use]
 pub fn interrupted(rows: &[String]) -> bool {
-    ended_on_block(rows)
-        .is_some_and(|e| block_text(rows, e).starts_with(anchor_text("codex.turn.interrupted")))
+    ended_on_block(rows).is_some_and(|e| {
+        block_text(rows, e).starts_with(const { anchor_text("codex.turn.interrupted") })
+    })
 }
 
 /// Codex's wall rows by kind, from the 0.156.1 binary's strings (codex-rs
@@ -564,10 +579,10 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
 
 /// `… try again at Sep 24th, 2026 3:05 PM.` → `Sep 24th 3:05 PM`.
 fn reset_of(message: &str) -> Option<String> {
-    let needle = anchor_text("codex.wall.retry_at").to_ascii_lowercase();
+    let needle = const { anchor_text("codex.wall.retry_at") }.to_ascii_lowercase();
     // ASCII lowering keeps every byte offset of `message`.
     let at = message.to_ascii_lowercase().rfind(&needle)?;
-    let rest = message[at + needle.len()..].trim().trim_end_matches('.');
+    let rest = crate::text::trim(&message[at + needle.len()..]).trim_end_matches('.');
     let words: Vec<&str> = rest
         .split_whitespace()
         .filter(|w| {
@@ -623,8 +638,8 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
             let body = rows[h].strip_prefix('•')?.trim();
             let tool_under = rows[h + 1..end]
                 .iter()
-                .find(|r| !r.trim().is_empty())
-                .is_some_and(|r| r.trim_start().starts_with('└'));
+                .find(|r| !crate::text::trim(r).is_empty())
+                .is_some_and(|r| crate::text::trim_start(r).starts_with('└'));
             if tool_under || TOOL_HEADS.iter().any(|t| body.starts_with(t)) {
                 return None;
             }
@@ -638,7 +653,7 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     out.extend(
         rows[from..end]
             .iter()
-            .map(|r| r.trim())
+            .map(|r| crate::text::trim(r))
             .filter(|t| !t.is_empty()),
     );
     (!out.is_empty()).then(|| out.join("\n"))
@@ -650,7 +665,7 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
 pub fn context_left(rows: &[String]) -> Option<u8> {
     let c = composer(rows)?;
     rows[c + 1..].iter().find_map(|r| {
-        let (head, _) = r.split_once(anchor_text("codex.context.left"))?;
+        let (head, _) = r.split_once(const { anchor_text("codex.context.left") })?;
         let digits = head.len() - head.trim_start_matches(|c: char| !c.is_ascii_digit()).len();
         let tail = &head[digits..];
         let n = tail.rsplit(|c: char| !c.is_ascii_digit()).next()?;
@@ -686,22 +701,20 @@ pub fn footer_status(rows: &[String]) -> Option<&str> {
     if codex_box(rows).is_some() {
         return None;
     }
-    let last = rows.iter().rposition(|r| !r.trim().is_empty())?;
+    let last = rows
+        .iter()
+        .rposition(|r| !crate::text::trim(r).is_empty())?;
     let mut top = last;
-    while top > 0 && !rows[top - 1].trim().is_empty() {
+    while top > 0 && !crate::text::trim(&rows[top - 1]).is_empty() {
         top -= 1;
     }
-    let names_goal = |r: &str| {
-        GOAL_STATES
-            .iter()
-            .any(|(id, _)| r.contains(anchor_text(id)))
-    };
+    let names_goal = |r: &str| GOAL_STATES.iter().any(|(text, _)| r.contains(text));
     rows[top..=last]
         .iter()
         .find(|r| {
             leading_spaces(r) == 2 && !key_hints_row(r) && (r.contains(" · ") || names_goal(r))
         })
-        .map(|r| r.trim())
+        .map(|r| crate::text::trim(r))
 }
 
 /// Whether a footer row is Codex's KEY-HINT row, the one under its status
@@ -710,19 +723,20 @@ pub fn footer_status(rows: &[String]) -> Option<&str> {
 /// narrow pane — 0.158.0, measured), and it keeps its ` · ` however narrow
 /// the pane is ([`footer_status`]).
 fn key_hints_row(row: &str) -> bool {
-    let t = row.trim_start();
+    let t = crate::text::trim_start(row);
     ["? for ", "\u{2190} for "].iter().any(|k| t.starts_with(k))
 }
 
-/// The footer's goal states, each by its anchor ([`goal_state`]).
+/// The footer's goal states, each by its anchor's text ([`goal_state`]),
+/// looked up once at compile time.
 const GOAL_STATES: [(&str, CodexGoal); 7] = [
-    ("codex.goal.pursuing", CodexGoal::Pursuing),
-    ("codex.goal.paused", CodexGoal::Paused),
-    ("codex.goal.limited", CodexGoal::UsageLimited),
-    ("codex.goal.stalled", CodexGoal::Stalled),
-    ("codex.goal.achieved", CodexGoal::Achieved),
-    ("codex.goal.unmet", CodexGoal::Unmet),
-    ("codex.goal.abandoned", CodexGoal::Unmet),
+    (anchor_text("codex.goal.pursuing"), CodexGoal::Pursuing),
+    (anchor_text("codex.goal.paused"), CodexGoal::Paused),
+    (anchor_text("codex.goal.limited"), CodexGoal::UsageLimited),
+    (anchor_text("codex.goal.stalled"), CodexGoal::Stalled),
+    (anchor_text("codex.goal.achieved"), CodexGoal::Achieved),
+    (anchor_text("codex.goal.unmet"), CodexGoal::Unmet),
+    (anchor_text("codex.goal.abandoned"), CodexGoal::Unmet),
 ];
 
 /// The reasoning efforts Codex's footer names after the model, lowercased
@@ -796,7 +810,7 @@ pub fn goal_state(rows: &[String]) -> Option<CodexGoal> {
     let status = footer_status(rows)?;
     GOAL_STATES
         .into_iter()
-        .find(|(id, _)| status.contains(anchor_text(id)))
+        .find(|(text, _)| status.contains(text))
         .map(|(_, g)| g)
 }
 
@@ -813,7 +827,7 @@ pub fn resume_box(rows: &[String]) -> Option<(usize, bool)> {
     let focused = p.options.iter().find(|o| o.focused)?;
     Some((
         focused.row,
-        focused.label == anchor_text("codex.goal.resume.yes"),
+        focused.label == const { anchor_text("codex.goal.resume.yes") },
     ))
 }
 
@@ -834,7 +848,7 @@ pub fn resume_box(rows: &[String]) -> Option<(usize, bool)> {
 pub(crate) fn codex_box(rows: &[String]) -> Option<(usize, usize)> {
     let cursor = rows
         .iter()
-        .rposition(|r| r.trim_start().starts_with('›') && option(r).is_some())?;
+        .rposition(|r| crate::text::trim_start(r).starts_with('›') && option(r).is_some())?;
     let first = (0..=cursor)
         .rev()
         .take_while(|&i| option(&rows[i]).is_some() || is_continuation(&rows[i]))
@@ -850,34 +864,34 @@ pub(crate) fn codex_box(rows: &[String]) -> Option<(usize, usize)> {
     let footer = (last + 1..(last + 4).min(rows.len())).find(|&i| is_hint_footer(&rows[i]))?;
     rows[footer + 1..]
         .iter()
-        .all(|r| r.trim().is_empty())
+        .all(|r| crate::text::trim(r).is_empty())
         .then_some((first, footer))
 }
 
 /// A box footer: Enter and Esc named as keys, or 0.155.1's `Press enter to
 /// continue`.
 fn is_hint_footer(row: &str) -> bool {
-    let t = row.trim().to_lowercase();
+    let t = crate::text::trim(row).to_lowercase();
     t.starts_with("press enter") || (t.contains("enter ") && t.contains("esc "))
 }
 
 /// A wrapped option label's tail: a non-blank row indented past the
 /// options' column that is not an option itself.
 fn is_continuation(row: &str) -> bool {
-    !row.trim().is_empty() && leading_spaces(row) >= 5 && option(row).is_none()
+    !crate::text::trim(row).is_empty() && leading_spaces(row) >= 5 && option(row).is_none()
 }
 
 /// `› 1. Trust and continue` / `  2. Quit` / `  › 1. subtract (Recommended)
 /// Uses a clear …` → `(1, "…")`, the whole text after the number.
 fn option(row: &str) -> Option<(u8, String)> {
-    let t = row.trim_start();
+    let t = crate::text::trim_start(row);
     let t = t.strip_prefix('›').map_or(t, str::trim_start);
     let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
     if digits.is_empty() || digits.len() > 2 {
         return None;
     }
     let rest = t[digits.len()..].strip_prefix(". ")?;
-    Some((digits.parse().ok()?, rest.trim().to_string()))
+    Some((digits.parse().ok()?, crate::text::trim(rest).to_string()))
 }
 
 /// An option's label: its text up to the column gap before a description
@@ -885,8 +899,8 @@ fn option(row: &str) -> Option<(u8, String)> {
 /// less a trailing one-key shortcut (`Yes, proceed (y)` → `Yes, proceed`).
 fn label_of(text: &str) -> (String, bool) {
     let (label, described) = match text.split_once("  ") {
-        Some((l, _)) => (l.trim(), true),
-        None => (text.trim(), false),
+        Some((l, _)) => (crate::text::trim(l), true),
+        None => (crate::text::trim(text), false),
     };
     let label = match label.rsplit_once(" (") {
         Some((head, key))
@@ -903,23 +917,25 @@ fn label_of(text: &str) -> (String, bool) {
 
 /// The box's kind, by its title (module header).
 fn kind_of(title: &str) -> PromptKind {
-    let t = title.trim();
-    if t.starts_with(anchor_text("codex.box.exec")) {
+    let t = crate::text::trim(title);
+    if t.starts_with(const { anchor_text("codex.box.exec") }) {
         PromptKind::Bash
-    } else if t.starts_with(anchor_text("codex.box.patch")) {
+    } else if t.starts_with(const { anchor_text("codex.box.patch") }) {
         PromptKind::Edit
-    } else if t == anchor_text("codex.trust.title") || t.starts_with("Do you trust the contents") {
+    } else if t == const { anchor_text("codex.trust.title") }
+        || t.starts_with("Do you trust the contents")
+    {
         PromptKind::Trust
-    } else if t == anchor_text("codex.plan.title") {
+    } else if t == const { anchor_text("codex.plan.title") } {
         PromptKind::PlanExit
-    } else if t == anchor_text("codex.nudge.title") {
+    } else if t == const { anchor_text("codex.nudge.title") } {
         PromptKind::RateNudge
-    } else if t == anchor_text("codex.pick.model")
-        || t.starts_with(anchor_text("codex.pick.effort"))
-        || t == anchor_text("codex.pick.advanced")
+    } else if t == const { anchor_text("codex.pick.model") }
+        || t.starts_with(const { anchor_text("codex.pick.effort") })
+        || t == const { anchor_text("codex.pick.advanced") }
     {
         PromptKind::ModelPick
-    } else if t == anchor_text("codex.goal.resume.title") {
+    } else if t == const { anchor_text("codex.goal.resume.title") } {
         PromptKind::GoalResume
     } else if t
         .strip_prefix("Question ")
@@ -938,28 +954,36 @@ fn kind_of(title: &str) -> PromptKind {
 /// roles.
 fn role_of(kind: PromptKind, label: &str) -> Role {
     let l = label.to_lowercase();
-    let once = anchor_text("codex.box.once").to_lowercase();
+    let once = const { anchor_text("codex.box.once") }.to_lowercase();
     match kind {
         PromptKind::Trust if l == "trust and continue" || l == "yes, continue" => Role::Trust,
         PromptKind::Trust if l == "quit" || l == "no, quit" => Role::Exit,
         PromptKind::Bash | PromptKind::Edit if l == once => Role::Once,
         // `(p)`: a prefix rule the TUI saves (`Approved command prefix
         // saved:`) — durable.
-        PromptKind::Bash if l.starts_with(&anchor_text("codex.box.persist").to_lowercase()) => {
+        PromptKind::Bash
+            if l.starts_with(&const { anchor_text("codex.box.persist") }.to_lowercase()) =>
+        {
             Role::Persist
         }
         // `(a)`: these files, for the session.
-        PromptKind::Edit if l.starts_with(&anchor_text("codex.box.session").to_lowercase()) => {
+        PromptKind::Edit
+            if l.starts_with(&const { anchor_text("codex.box.session") }.to_lowercase()) =>
+        {
             Role::Session
         }
         PromptKind::Bash | PromptKind::Edit | PromptKind::PlanExit if l.starts_with("no,") => {
             Role::Deny
         }
         // The plain first yes: implement the plan as planned, in this thread.
-        PromptKind::PlanExit if l == anchor_text("codex.plan.yes").to_lowercase() => Role::Once,
+        PromptKind::PlanExit if l == const { anchor_text("codex.plan.yes") }.to_lowercase() => {
+            Role::Once
+        }
         // The question's answers are the model's own; its last row asks for
         // the person's own words instead, as Claude Code's free-text row does.
-        PromptKind::Question if l == anchor_text("codex.question.none").to_lowercase() => {
+        PromptKind::Question
+            if l == const { anchor_text("codex.question.none") }.to_lowercase() =>
+        {
             Role::Other
         }
         PromptKind::Question => Role::Answer,
@@ -967,14 +991,18 @@ fn role_of(kind: PromptKind, label: &str) -> Role {
         // nothing; the keep that never shows it again writes Codex's config
         // — a standing setting; its switch is a model change, matched by
         // label in the decider.
-        PromptKind::RateNudge if l == anchor_text("codex.nudge.keep").to_lowercase() => Role::Deny,
-        PromptKind::RateNudge if l == anchor_text("codex.nudge.never").to_lowercase() => {
+        PromptKind::RateNudge if l == const { anchor_text("codex.nudge.keep") }.to_lowercase() => {
+            Role::Deny
+        }
+        PromptKind::RateNudge if l == const { anchor_text("codex.nudge.never") }.to_lowercase() => {
             Role::Persist
         }
         // The paused goal's box: leaving it paused settles nothing; its
         // resume is matched by its label in the decider (the upgrade's own
         // resume of a goal it paused, `resume_box`).
-        PromptKind::GoalResume if l == anchor_text("codex.goal.resume.leave").to_lowercase() => {
+        PromptKind::GoalResume
+            if l == const { anchor_text("codex.goal.resume.leave") }.to_lowercase() =>
+        {
             Role::Deny
         }
         _ => Role::Other,
@@ -988,12 +1016,12 @@ fn role_of(kind: PromptKind, label: &str) -> Role {
 fn box_top(rows: &[String], first: usize) -> usize {
     let above = (0..first)
         .rev()
-        .find(|&i| !rows[i].trim().is_empty())
+        .find(|&i| !crate::text::trim(&rows[i]).is_empty())
         .map_or(0, |i| i + 1);
     let mut blanks = 0;
     for i in (0..above).rev() {
         let r = &rows[i];
-        if r.trim().is_empty() {
+        if crate::text::trim(r).is_empty() {
             blanks += 1;
             if blanks == 2 {
                 return i + 2;
@@ -1012,14 +1040,14 @@ fn box_top(rows: &[String], first: usize) -> usize {
 /// or the rows under a bare `Destination:` up to a blank, joined with
 /// nothing (a path wraps mid-token).
 fn field(rows: &[String], top: usize, first: usize, name: &str) -> Option<String> {
-    let at = (top..first).find(|&i| rows[i].trim().starts_with(name))?;
-    let inline = rows[at].trim()[name.len()..].trim();
+    let at = (top..first).find(|&i| crate::text::trim(&rows[i]).starts_with(name))?;
+    let inline = crate::text::trim(&rows[at])[name.len()..].trim();
     if !inline.is_empty() {
         return Some(inline.to_string());
     }
     let block: String = rows[at + 1..first]
         .iter()
-        .map(|r| r.trim())
+        .map(|r| crate::text::trim(r))
         .take_while(|t| !t.is_empty())
         .collect();
     (!block.is_empty()).then_some(block)
@@ -1047,9 +1075,9 @@ fn field(rows: &[String], top: usize, first: usize, name: &str) -> Option<String
 pub fn prompt(rows: &[String]) -> Option<PromptV2> {
     let (first, footer) = codex_box(rows)?;
     let top = box_top(rows, first);
-    let title_row = (top..first).find(|&i| !rows[i].trim().is_empty())?;
+    let title_row = (top..first).find(|&i| !crate::text::trim(&rows[i]).is_empty())?;
     let head_off_screen = top == 0 && title_row == 0;
-    let title = rows[title_row].trim().to_string();
+    let title = crate::text::trim(&rows[title_row]).to_string();
     let kind = if head_off_screen {
         PromptKind::Other
     } else {
@@ -1065,7 +1093,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
                 n: Some(n),
                 label,
                 role: Role::Other,
-                focused: row.trim_start().starts_with('›'),
+                focused: crate::text::trim_start(row).starts_with('›'),
                 row: i,
             });
             described_last = described;
@@ -1074,7 +1102,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
             && let Some(o) = options.last_mut()
         {
             // A wrapped label; under a described option, the description's.
-            o.label = format!("{} {}", o.label, label_of(row.trim()).0);
+            o.label = format!("{} {}", o.label, label_of(crate::text::trim(row)).0);
         }
     }
     let numbered = options
@@ -1088,7 +1116,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
         let roles_of = if head_off_screen
             && options
                 .iter()
-                .any(|o| o.label == anchor_text("codex.box.once"))
+                .any(|o| o.label == const { anchor_text("codex.box.once") })
         {
             PromptKind::Bash
         } else {
@@ -1101,11 +1129,11 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
 
     let (command_rows, description, path) = match kind {
         PromptKind::Bash => {
-            let at = (top..first).find(|&i| rows[i].trim_start().starts_with("$ "));
+            let at = (top..first).find(|&i| crate::text::trim_start(&rows[i]).starts_with("$ "));
             let cmd: Vec<String> = at.map_or_else(Vec::new, |at| {
                 rows[at..first]
                     .iter()
-                    .map(|r| r.trim())
+                    .map(|r| crate::text::trim(r))
                     .take_while(|t| !t.is_empty())
                     .enumerate()
                     .map(|(k, t)| {
@@ -1130,14 +1158,14 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
             String::new(),
             rows[title_row + 1..first]
                 .iter()
-                .map(|r| r.trim())
+                .map(|r| crate::text::trim(r))
                 .find(|t| t.starts_with('/') || t.starts_with('~'))
                 .map(str::to_string),
         ),
         PromptKind::Question => {
             let question: Vec<&str> = rows[title_row + 1..first]
                 .iter()
-                .map(|r| r.trim())
+                .map(|r| crate::text::trim(r))
                 .filter(|t| !t.is_empty())
                 .collect();
             (Vec::new(), question.join(" "), None)
@@ -1182,7 +1210,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
 /// dialog, as Claude Code's reader reads one. `None` when no Esc is named
 /// (0.155.1's `Press enter to continue`).
 fn cancel_of(footer: &str) -> Option<Cancel> {
-    let lower = footer.trim().to_lowercase();
+    let lower = crate::text::trim(footer).to_lowercase();
     let at = lower.find("esc ")?;
     let verb: String = lower[at + 4..]
         .split(['·', '|'])
@@ -1312,6 +1340,28 @@ pub mod fixtures {
     /// off, the end row's clock after ` • `, the one-row footer.
     pub const RESUMED_INLINE_0_159: &str =
         include_str!("fixtures/codex-0.159.0-resumed-inline.txt");
+    /// 0.159.2, MEASURED: a notice typed as a turn (the live upgrade's, its
+    /// wording) and answered by the usage wall — the last block on the
+    /// screen, wrapped in a 120-column pane, naming no reset.
+    pub const WALL_AFTER_NOTICE_0_159: &str =
+        include_str!("fixtures/codex-0.159.2-wall-after-notice.txt");
+    /// 0.159.2, MEASURED: `codex resume` of that conversation — the notice
+    /// and the wall redrawn from the rollout as the last block, no warning
+    /// item in the footer.
+    pub const WALL_RESUMED_0_159: &str = include_str!("fixtures/codex-0.159.2-wall-resumed.txt");
+    /// 0.159.2, MEASURED: a turn that ran a command and then met the usage
+    /// wall, in a 120-column pane.
+    pub const WALL_MID_TURN_0_159: &str = include_str!("fixtures/codex-0.159.2-wall-mid-turn.txt");
+    /// 0.159.2, MEASURED: the same wall in a 100x30 pane, its row wrapped
+    /// after `purchase more`.
+    pub const WALL_MID_TURN_100X30_0_159: &str =
+        include_str!("fixtures/codex-0.159.2-wall-mid-turn-100x30.txt");
+    /// 0.159.2, MEASURED: the same wall in a 160x50 pane, its row on one line.
+    pub const WALL_MID_TURN_160X50_0_159: &str =
+        include_str!("fixtures/codex-0.159.2-wall-mid-turn-160x50.txt");
+    /// 0.159.2, MEASURED: a fresh session at its idle composer — no turn, no
+    /// wall (the startup logo's rows dropped).
+    pub const IDLE_0_159: &str = include_str!("fixtures/codex-0.159.2-idle.txt");
 }
 
 #[cfg(test)]

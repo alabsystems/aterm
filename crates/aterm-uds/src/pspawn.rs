@@ -1,29 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Start a program that inherits NO descriptor but stdio: `posix_spawn(2)` with
+//! Start a program that inherits no descriptor but stdio: `posix_spawn(2)` with
 //! Darwin's `POSIX_SPAWN_CLOEXEC_DEFAULT`, which marks every descriptor the
-//! caller did not name close-on-exec INSIDE the spawn, atomically.
+//! caller did not name close-on-exec inside the spawn, atomically.
 //!
-//! The PTY keeper holds a custody copy of every terminal's master. The one
-//! program it ever starts is `/usr/bin/open -a <its own bundle>`
-//! (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.1), and a master leaking into that
-//! child — or into the app `open` hands off to — would be a second holder no
-//! holder scan was asked about. A `fork` + strip in `pre_exec` has a window a
-//! concurrently opened descriptor can slip through; this flag has none.
+//! The PTY keeper holds a custody copy of every terminal's master, and the one
+//! program it starts is `/usr/bin/open -a <its own bundle>`. A master leaking
+//! into that child would be a holder no scan was asked about; a `fork` + strip
+//! in `pre_exec` leaves a window for a concurrently opened descriptor, this
+//! flag does not. The child's stdin/stdout/stderr are `/dev/null`.
 //!
-//! stdin/stdout/stderr are replaced by `/dev/null` in the child, so nothing the
-//! keeper's own stdio is attached to reaches the program either.
-//!
-//! Darwin only; elsewhere [`spawn_cloexec_default`] answers `Unsupported`
-//! (Linux has no such flag, and no keeper runs there yet).
+//! Darwin only; elsewhere [`spawn_cloexec_default`] answers `Unsupported`.
 
 use std::io;
 
 /// Spawn `program` with `args` (argv[1..]) and the caller's environment,
 /// inheriting no descriptor but a `/dev/null` stdio. Returns the child's pid;
-/// the CALLER reaps it (`waitpid`), as a single-threaded loop does on its next
-/// turn.
+/// the caller reaps it (`waitpid`).
 ///
 /// # Errors
 /// `InvalidInput` for an argument holding a NUL; anything `posix_spawn`
@@ -35,7 +29,7 @@ pub fn spawn_cloexec_default(program: &str, args: &[&str]) -> io::Result<u32> {
     use std::ffi::CString;
     type Attr = *mut core::ffi::c_void;
     type Actions = *mut core::ffi::c_void;
-    // spawn.h, measured with the SDK 2026-09-28.
+    // spawn.h.
     const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
     const POSIX_SPAWN_SETSIGDEF: i16 = 0x4;
     const POSIX_SPAWN_SETSIGMASK: i16 = 0x8;
@@ -153,10 +147,12 @@ pub fn spawn_cloexec_default(_program: &str, _args: &[&str]) -> io::Result<u32> 
 mod tests {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
-    /// A descriptor this process holds WITHOUT close-on-exec, at a number no
-    /// shell touches (200), does not reach the child. NEGATIVE CONTROL: an
-    /// ordinary `Command` spawn of the same probe sees it — so the probe can
-    /// see a leak, and the flag is what stops it.
+    /// A descriptor this process holds without close-on-exec, at a number no
+    /// shell touches (200), does not reach the child. Control: the same probe
+    /// started by a deliberately leaky `posix_spawn` (no
+    /// `POSIX_SPAWN_CLOEXEC_DEFAULT`, `spawnfd::test_support`) sees it. Not a
+    /// `std` `Command`: Trust's std no longer hands a child anything above
+    /// stdio (SP-1), so it could not show the leak this flag prevents.
     #[test]
     fn the_child_inherits_nothing_but_stdio() {
         unsafe extern "C" {
@@ -179,15 +175,9 @@ mod tests {
         );
         let probe = format!("[ -e /dev/fd/{raw} ] && exit 3; exit 0");
 
-        let control = std::process::Command::new("/bin/sh")
-            .args(["-c", &probe])
-            .status()
+        let control = crate::spawnfd::test_support::leaky_status("/bin/sh", &["-c", &probe])
             .expect("control spawn");
-        assert_eq!(
-            control.code(),
-            Some(3),
-            "an ordinary spawn carries fd {raw}"
-        );
+        assert_eq!(control.code(), Some(3), "a leaky spawn carries fd {raw}");
 
         let pid = super::spawn_cloexec_default("/bin/sh", &["-c", &probe]).expect("spawn");
         let mut status = -1;

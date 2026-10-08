@@ -5,8 +5,9 @@
 //!
 //! GENERATED, and deliberately: every value below is a fact about this
 //! platform's ABI, measured for THIS TRIPLE and checked against the
-//! dev-dependency oracle. See `src/lib.rs` for the method and the
-//! regeneration command. The only hand-written code in this file is the
+//! conformance oracle in `libc-oracle/` (see `src/lib.rs` for the method;
+//! regenerate with `libc-oracle/gen/regen.sh`). The only hand-written code
+//! in this file is the
 //! bodies of the C macros libc reimplements in Rust and the inherent
 //! siginfo_t accessors. The oracle audits their exact sets and checks
 //! their behavior against the reference libc.

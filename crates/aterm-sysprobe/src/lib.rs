@@ -33,15 +33,14 @@
 //!
 //! # Bounded
 //!
-//! A sweep takes at most [`MAX_PIDS`] pids; a path is read into a
+//! A sweep takes at most [`MAX_PIDS`] pids. A path is read into a
 //! [`PATH_CAP`]-byte buffer, once per process image (cached, and the cache
-//! given to every row each sweep), and only for rows that can matter —
+//! given to every row each sweep), and only for rows that can matter:
 //! [`NAMED_ROWS`] by CPU and as many by footprint, then any past
-//! [`NAME_FLOOR_CPU_NS`] or [`NAME_FLOOR_KIB`] — at most [`MAX_PATH_READS`]
-//! new reads a sweep; a
-//! file read (the Linux arm's `/proc`) goes through [`read_bounded`], one
-//! [`READ_CAP`]-byte stack buffer — never read-to-EOF, which on a device path
-//! that never ends is how this repository once took a machine down.
+//! [`NAME_FLOOR_CPU_NS`] or [`NAME_FLOOR_KIB`], at most [`MAX_PATH_READS`]
+//! new reads a sweep. A file read (the Linux arm's `/proc`) goes through
+//! [`read_bounded`], one [`READ_CAP`]-byte stack buffer, never to EOF: a
+//! device path that never ends would take the machine down.
 
 #![deny(missing_docs)]
 
@@ -112,10 +111,8 @@ impl Probe {
     /// One reading of the machine, stamped when it was taken. On a platform
     /// with no sampler (neither macOS nor Linux) every field is `None`.
     ///
-    /// Named `reading`, not `read` (the spec's sketch): a zero-argument
-    /// `.read()` is `RwLock::read` to the lock-order census, which scans
-    /// every crate the GUI links, and two readings in one scope read to it as
-    /// a re-entrant lock.
+    /// Not `read`: the lock-order census takes a zero-argument `.read()` for
+    /// `RwLock::read`, and two in one scope for a re-entrant lock.
     #[must_use]
     pub fn reading(&mut self) -> Reading {
         #[cfg(target_os = "macos")]
@@ -182,6 +179,238 @@ pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     {
         let _ = pid;
         None
+    }
+}
+
+/// The executable of process `pid`, read from the OS: `None` where it cannot
+/// be read (the process is gone, not ours, or the platform has no reader
+/// here). macOS asks `proc_pidpath`, Linux resolves `/proc/<pid>/exe`. In
+/// process, so a caller that asks about many pids forks nothing per pid.
+#[must_use]
+pub fn process_path(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_path(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .filter(|p| p.is_absolute())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// At most this many members of one process group are measured
+/// ([`group_memory`]): a 1 KiB pid buffer. An agent's group is its own
+/// process and the few helpers it forks without a group of their own.
+pub const MAX_GROUP_PIDS: usize = 256;
+
+/// One process group's memory ([`group_memory`]): the PHYSICAL FOOTPRINT of
+/// every member this user may read, summed.
+///
+/// WHY THE FOOTPRINT, NOT THE RESIDENT SET (measured 2026-09-29 on the
+/// owner's 128 GB Mac, a live Claude Code): `top` read `MEM 214G CMPRS 187G`
+/// for a process whose `ps` RSS was 29.8 GiB. The compressor and swap hold
+/// most of a runaway agent's pages, so the resident set UNDER-reads it
+/// sevenfold exactly when it matters; the footprint (`ri_phys_footprint`,
+/// Activity Monitor's `Memory`, what the kernel's own memory limits count)
+/// includes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupMemory {
+    /// The process group measured: the group of the pid asked about.
+    pub pgid: u32,
+    /// The members' physical footprints summed, MiB.
+    pub footprint_mib: u64,
+    /// How many members were measured (another user's are skipped).
+    pub measured: u32,
+}
+
+/// The memory of `pid`'s whole PROCESS GROUP ([`GroupMemory`]): a Claude
+/// Code's Bun process and the children it forks into its own group. A child
+/// that took a group of its own (Claude Code's Bash tool starts each shell
+/// with one: measured 2026-09-29, every `zsh -c source …/shell-snapshots/…`
+/// led its own group) is not counted, so a build the agent runs is not the
+/// agent's memory. `None` where it cannot be read: the pid is gone or not
+/// ours, the platform has no reader here (every platform but macOS).
+///
+/// Cost: one `PROC_PIDT_SHORTBSDINFO`, one `proc_listpids(PROC_PGRP_ONLY)`
+/// and one `proc_pid_rusage` per member — no sweep of the process table, no
+/// subprocess.
+#[must_use]
+pub fn group_memory(pid: u32) -> Option<GroupMemory> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::group_memory(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The machine's physical memory in MiB (`hw.memsize`), `None` where
+/// unknown (every platform but macOS).
+#[must_use]
+pub fn physical_memory_mib() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::physical_memory_mib()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The machine's memory now ([`machine_memory`]), MiB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MachineMemory {
+    /// Available: free, inactive and purgeable pages — memory the kernel can
+    /// hand out without paging anything out ([`available_mib_of`]).
+    pub available_mib: u64,
+    /// In use, as Activity Monitor's `Memory Used` counts it
+    /// ([`used_mib_of`]).
+    pub used_mib: u64,
+}
+
+/// The machine's memory available and in use now (one
+/// `host_statistics64(HOST_VM_INFO64)` and one `sysctl`), `None` where
+/// unknown (every platform but macOS). What the memory ceiling moves with
+/// (`aterm_agent::supervise::memory`).
+#[must_use]
+pub fn machine_memory() -> Option<MachineMemory> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::machine_memory()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Memory available, MiB: free plus inactive plus purgeable pages, from
+/// `HOST_VM_INFO64` (`free_count` already holds the speculative pages,
+/// which `vm_stat` prints apart). Never more than `physical_mib` where that
+/// is known: a purgeable page may also sit on the inactive queue, so the sum
+/// can count one twice. `None` for a zero page size.
+#[must_use]
+pub fn available_mib_of(
+    free: u64,
+    inactive: u64,
+    purgeable: u64,
+    page_bytes: u64,
+    physical_mib: Option<u64>,
+) -> Option<u64> {
+    if page_bytes == 0 {
+        return None;
+    }
+    let pages = free.saturating_add(inactive).saturating_add(purgeable);
+    let mib = pages.saturating_mul(page_bytes) >> 20;
+    Some(physical_mib.map_or(mib, |p| mib.min(p)))
+}
+
+/// The kernel's memory pressure level now
+/// (`kern.memorystatus_vm_pressure_level`, one `sysctl`), `None` where
+/// unknown (every platform but macOS).
+#[must_use]
+pub fn memory_pressure() -> Option<MemoryLevel> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::memory_pressure()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// KiB swapped in plus out since boot (`HOST_VM_INFO64` swapins plus
+/// swapouts, times `vm.pagesize`; one host statistics call and one
+/// `sysctl`): the counter whose rate the strain row prints as `swap N MB/s`
+/// ([`Reading::swap_pages`] is the same count in pages). A [`SwapMeter`]
+/// turns it into a rate. `None` where unknown (every platform but macOS).
+#[must_use]
+pub fn swapped_kib() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::swapped_kib()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The shortest span a [`SwapMeter`] takes a rate over: readings closer
+/// than this answer the last rate (two agents measured a millisecond apart
+/// must not read a burst, or nothing, off one page).
+pub const SWAP_SPAN_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest: a rate averaged over more than this says nothing about now,
+/// so the meter starts again and reads no rate until the next reading.
+pub const SWAP_SPAN_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// THE SWAP RATE of a caller that reads [`swapped_kib`] at its own times
+/// (the memory ceiling reads it with each agent's measure, every few
+/// seconds): KiB per second over the span since the last reading at least
+/// [`SWAP_SPAN_MIN`] before, never one longer than [`SWAP_SPAN_MAX`]. Pure
+/// (every instant is the caller's), so the host keeps one and feeds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SwapMeter {
+    /// The reading the next rate is taken from.
+    base: Option<(Instant, u64)>,
+    /// The last rate taken, KiB/s.
+    rate: Option<u32>,
+}
+
+impl SwapMeter {
+    /// A meter that has read nothing.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            base: None,
+            rate: None,
+        }
+    }
+
+    /// Read the counter `kib` ([`swapped_kib`]; `None`: unknown) at `at`,
+    /// and answer the swap rate in KiB/s: the rate since the base reading
+    /// once [`SWAP_SPAN_MIN`] has passed (the base moves here), the last
+    /// rate before then, and `None` with no base, an unknown counter, or a
+    /// base older than [`SWAP_SPAN_MAX`] (the meter starts again from this
+    /// reading). A counter that went backwards reads a rate of zero.
+    pub fn observe(&mut self, at: Instant, kib: Option<u64>) -> Option<u32> {
+        let Some(kib) = kib else {
+            *self = Self::new();
+            return None;
+        };
+        let Some((base_at, base_kib)) = self.base else {
+            self.base = Some((at, kib));
+            return None;
+        };
+        let span = at.saturating_duration_since(base_at);
+        if span > SWAP_SPAN_MAX {
+            *self = Self {
+                base: Some((at, kib)),
+                rate: None,
+            };
+            return None;
+        }
+        if span < SWAP_SPAN_MIN {
+            return self.rate;
+        }
+        let ms = u64::try_from(span.as_millis()).unwrap_or(u64::MAX).max(1);
+        let rate = kib.saturating_sub(base_kib).saturating_mul(1000) / ms;
+        self.rate = Some(u32::try_from(rate).unwrap_or(u32::MAX));
+        self.base = Some((at, kib));
+        self.rate
     }
 }
 

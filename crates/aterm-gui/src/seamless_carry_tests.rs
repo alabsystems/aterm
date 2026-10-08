@@ -12,11 +12,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aterm_core::terminal::{AltArchiveImport, Terminal, TerminalCheckpoint};
 
 use super::tests::{
-    ENV_LOCK, RestoreVar, StageCarry, StagedHandoff, child_proof_from, pipe_pair,
-    stage_carry_handoff, stage_history_handoff, stage_ladder_handoff,
+    ENV_LOCK, ScratchEnv, StageCarry, StagedHandoff, child_proof_from, pipe_pair, restage_session,
+    restore_env, stage_carry_handoff, stage_history_handoff, stage_ladder_handoff,
 };
 use super::*;
 use crate::handoff_carry::{self, ControlCarry};
+use crate::handoff_history::tests::history as shell_history;
 use crate::session_store::SessionRecord;
 use crate::turn_ledger::{ArchMark, TurnLedger, TurnRecord};
 
@@ -109,8 +110,10 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 claim_known: false,
                 attention_owners: Vec::new(),
                 viewport_from_bottom: None,
+                render_debt: None,
                 fabric: Default::default(),
                 timeline_id: 0,
+                journal_key: None,
             })
             .collect(),
         roster_seq: None,
@@ -250,9 +253,10 @@ fn outgoing(
     };
     StageCarry {
         screens: vec![checkpoint],
-        controls: handoff_carry::export(&[source]),
+        controls: handoff_carry::export(&[source], crate::control::turn_ids_for_handoff()),
         next_turn_id,
         fg_holders: Vec::new(),
+        render_debts: Vec::new(),
     }
 }
 
@@ -272,26 +276,12 @@ fn adopt(
     (t, ledger, outcome)
 }
 
-fn env_guard() -> Vec<RestoreVar> {
-    vec![
-        RestoreVar::new("XDG_RUNTIME_DIR"),
-        RestoreVar::new("HOME"),
-        RestoreVar::new(ENV_MANIFEST),
-        RestoreVar::new(ENV_NONCE),
-        RestoreVar::new(ENV_FDS),
-        RestoreVar::new(ENV_LAYOUT),
-        RestoreVar::new(ENV_TARGET),
-        RestoreVar::new(ENV_READY_FD),
-        RestoreVar::new(ENV_COMMIT_FD),
-        RestoreVar::new(ENV_PARENT_PID),
-        RestoreVar::new(ENV_PARENT_BIRTH),
-    ]
-}
-
 fn this_build() -> Option<String> {
     Some(encode_target_identity(
-        crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-        crate::build_info::GIT_COMMIT,
+        crate::build_info::build_number()
+            .parse::<u64>()
+            .unwrap_or(0),
+        crate::build_info::git_commit(),
     ))
 }
 
@@ -391,7 +381,7 @@ fn is_chrome(row: &str) -> bool {
 #[test]
 fn a_report_across_a_handoff_has_every_row_and_no_chrome() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let (n, m) = (60, 40);
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, n);
@@ -406,9 +396,12 @@ fn a_report_across_a_handoff_has_every_row_and_no_chrome() {
         ctl_files(&staged).is_empty(),
         "the receiver deleted the sidecar"
     );
+    // Past it by one overlap reserve (round eight of the update audit,
+    // finding 33): a producer that carried no reserve (0.98) went on minting
+    // in the overlap, and those ids must not be minted again here.
     assert!(
-        crate::control::turn_ids_minted() >= minted,
-        "turn ids continue above the carried count"
+        crate::control::turn_ids_minted() >= minted + crate::control::TURN_ID_RESERVE,
+        "turn ids continue above the carried count and its overlap"
     );
     let control = adopted[0].control.take().expect("the control carry came");
     let (mut t, ledger, outcome) = adopt(&carry.screens[0], Some(control));
@@ -446,7 +439,7 @@ fn a_report_across_a_handoff_has_every_row_and_no_chrome() {
 #[test]
 fn a_report_across_a_handoff_and_a_resize_says_gap_and_loses_nothing() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let (n, m) = (60, 40);
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, n);
@@ -488,7 +481,7 @@ fn a_report_across_a_handoff_and_a_resize_says_gap_and_loses_nothing() {
 #[test]
 fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 60);
     let mark = turns.lock().unwrap().records().last().unwrap().arch;
@@ -524,7 +517,7 @@ fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
 #[test]
 fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 60);
     let mark = turns.lock().unwrap().records().last().unwrap().arch;
@@ -547,6 +540,61 @@ fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
     let after = crate::control::cmd_offscreen(&h.term, &since);
     assert!(after.contains(&format!("origin={ORIGIN}")), "{after}");
     assert!(ctl_files(&staged).is_empty(), "nothing left behind");
+    staged.teardown();
+}
+
+/// Round eight, finding 73: a session this receiver degrades because its
+/// screen meta did not parse adopts onto a blank engine — no checkpoint at
+/// all, the one degrade that has none — and keeps its archive rows as well
+/// as its ledger. The engine is put back by the product's own call
+/// (`spawn::hydrate_adopted_engine`), which installed the control carry
+/// only beside a restored screen and dropped it here: `history` named
+/// `arch=<old origin>:<n>` marks that `offscreen` then read from the start
+/// of a fresh archive, and `aterm drive report` lost the turn's rows.
+#[test]
+fn a_receiver_degraded_screen_without_a_meta_keeps_its_archive_rows() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let mut app = FakeApp::new();
+    let (term, turns) = old_session(&mut app, 60);
+    let mark = turns.lock().unwrap().records().last().unwrap().arch;
+    let since = format!("since={}:{} max=5000", mark.origin, mark.last);
+    let before = crate::control::cmd_offscreen(&term, &since);
+    let carry = outgoing(&term, &turns, None);
+    let mut staged = stage_carry_handoff("carry-nometa", &carry);
+    restage_session(&mut staged, 0, &|_| "{".to_string(), &|grid| grid);
+    let mut adopted = as_successor(&staged, |_| take_incoming().adopted);
+    assert_eq!(adopted.len(), 1, "the session still adopts");
+    assert!(adopted[0].repaint, "degraded to a repaint");
+    assert!(adopted[0].checkpoint.is_none(), "no meta, no checkpoint");
+    let control = adopted[0].control.take().expect("the carry still came");
+    let rows = control.archive.as_ref().map_or(0, |a| a.rows.len());
+    assert!(rows > 0, "the rows came");
+    let successor = Arc::new(Mutex::new(live_engine(0xfeed)));
+    crate::spawn::hydrate_adopted_engine(
+        &successor,
+        None,
+        Some(control),
+        None,
+        None,
+        0,
+        &mut adopted[0].history,
+    );
+    let after = crate::control::cmd_offscreen(&successor, &since);
+    assert!(after.contains(&format!("origin={ORIGIN}")), "{after}");
+    let carried_rows = |reply: &str| -> Vec<String> {
+        reply
+            .lines()
+            .filter(|l| l.contains("counted"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(!carried_rows(&before).is_empty(), "{before}");
+    assert_eq!(
+        carried_rows(&after),
+        carried_rows(&before),
+        "the turn's rows read on"
+    );
     staged.teardown();
 }
 
@@ -608,7 +656,7 @@ fn a_lost_control_carry_names_its_cause() {
 #[test]
 fn a_bad_sidecar_only_drops_the_carry() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
     let carry = outgoing(&term, &turns, None);
@@ -677,17 +725,20 @@ fn a_bad_sidecar_only_drops_the_carry() {
 #[test]
 fn the_proof_digests_do_not_see_the_sidecar() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
     let mut with = outgoing(&term, &turns, Some(7));
     // The foreground holder rides the record, and is in neither digest either.
     with.fg_holders = vec![(0, 4242)];
+    // So does the render debt (R08).
+    with.render_debts = vec![(0, (-1, 0))];
     let without = StageCarry {
         screens: with.screens.clone(),
         controls: Vec::new(),
         next_turn_id: None,
         fg_holders: Vec::new(),
+        render_debts: Vec::new(),
     };
     let mut child = Vec::new();
     for (label, carry) in [
@@ -716,7 +767,7 @@ fn the_proof_digests_do_not_see_the_sidecar() {
 #[test]
 fn a_new_sender_hands_off_to_a_receiver_built_before_the_carry() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
     let carry = outgoing(&term, &turns, Some(crate::control::turn_ids_minted() + 5));
@@ -820,8 +871,12 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             claim_known: false,
             attention_owners: Vec::new(),
             viewport_from_bottom: None,
+            // The render debt the parent's engine owed the alternate screen
+            // (R08): a record scalar, so an old reader skips it.
+            render_debt: Some("-1,0".to_string()),
             fabric: Default::default(),
             timeline_id: 0,
+            journal_key: None,
         }],
         roster_seq: None,
         fabric_attached: Vec::new(),
@@ -847,6 +902,18 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         wire.contains("questions = \"recommended\"") && !old_wire.contains("questions"),
         "the question policy rides this build's wire and an old reader drops it"
     );
+    assert!(
+        wire.contains("render_debt = \"-1,0\"") && !old_wire.contains("render_debt"),
+        "the render debt rides this build's wire and an old reader drops it"
+    );
+    // Every question-policy word — the priority words among them — rides
+    // this build's wire as written.
+    for word in crate::session_timeline::QUESTIONS_POLICY_WORDS {
+        let mut one = new.clone();
+        one.sessions[0].questions = Some(word.to_string());
+        let back = SessionHandoff::from_toml(&one.to_toml().unwrap()).expect("its own wire");
+        assert_eq!(back.sessions[0].questions.as_deref(), Some(word));
+    }
     let read = SessionHandoff::from_toml(&old_wire).expect("this build reads an old manifest");
     assert_eq!(read.next_turn_id, None);
     assert_eq!(
@@ -863,12 +930,95 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         read.sessions[0].fg_holder, None,
         "an old manifest names no holder: the reader probes afresh"
     );
+    assert_eq!(
+        read.sessions[0].render_debt, None,
+        "an old manifest names no debt: the successor owes the program nothing"
+    );
     assert_eq!(read.sessions[0].screen.as_ref(), Some(&screen));
     assert_eq!(
         pre_carry_parse(&wire).unwrap(),
         read,
         "the two readers agree on the rest"
     );
+}
+
+/// THE RENDER DEBT crosses the handoff (R08), and only onto a screen it is
+/// about: the successor's `Adopted` carries what the parent's record stamped
+/// when the screen was carried onto the alternate screen, and nothing when the
+/// record has no key (a producer before the field, or a session that owed
+/// nothing), when the screen was carried blank on purpose (the program
+/// repaints), or when the session is on the main screen. Seeded onto a
+/// restored engine it is the engine's debt again, and the first full clear
+/// (the program repainting) zeroes it as ever.
+#[test]
+fn the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let mut app = FakeApp::new();
+    let (term, turns) = old_session(&mut app, 30);
+    {
+        let mut t = term.lock().unwrap();
+        t.resize(ROWS - 1, COLS);
+        t.process(b"\x1b[?1004h");
+        t.resize(ROWS, COLS);
+        assert_eq!(t.render_debt(), (-1, 0), "the flap left a residue");
+    }
+    let mut with = outgoing(&term, &turns, None);
+    with.render_debts = vec![(0, (-1, 0))];
+    let without = StageCarry {
+        screens: with.screens.clone(),
+        controls: Vec::new(),
+        next_turn_id: None,
+        fg_holders: Vec::new(),
+        render_debts: Vec::new(),
+    };
+
+    // The producer stamped it: the successor's adoption carries it.
+    let staged = stage_carry_handoff("render-debt-with", &with);
+    let adopted = as_successor(&staged, |_| take_incoming().adopted);
+    assert_eq!(adopted[0].render_debt, Some((-1, 0)));
+    let (mut t, _, _) = adopt(&with.screens[0], None);
+    assert_eq!(
+        t.render_debt(),
+        (0, 0),
+        "a restored engine starts with none"
+    );
+    let (shift, pushed) = adopted[0].render_debt.unwrap();
+    t.seed_render_debt(shift, pushed);
+    assert_eq!(t.render_debt(), (-1, 0), "seeded");
+    t.process(b"\x1b[2J");
+    assert_eq!(t.render_debt(), (0, 0), "the first full clear resets it");
+    staged.teardown();
+
+    // A record without the key: nothing is carried (a debt-free predecessor,
+    // or one that predates the field).
+    let staged = stage_carry_handoff("render-debt-without", &without);
+    let adopted = as_successor(&staged, |_| take_incoming().adopted);
+    assert_eq!(adopted[0].render_debt, None);
+    staged.teardown();
+
+    // NEGATIVE CONTROL: a screen carried blank on purpose (the program is
+    // asked to repaint) has no screen the debt is about.
+    let staged = stage_ladder_handoff("render-debt-repaint", &with, &[0]);
+    let adopted = as_successor(&staged, |_| take_incoming().adopted);
+    assert!(adopted[0].repaint);
+    assert_eq!(adopted[0].render_debt, None);
+    staged.teardown();
+
+    // NEGATIVE CONTROL: the main screen owes nothing, whatever a record says.
+    let mut shell = live_engine(ORIGIN);
+    shell.process(b"$ ls\r\n");
+    let main = StageCarry {
+        screens: vec![shell.checkpoint_carry(256).expect("parser is Ground")],
+        controls: Vec::new(),
+        next_turn_id: None,
+        fg_holders: Vec::new(),
+        render_debts: vec![(0, (-1, 0))],
+    };
+    let staged = stage_carry_handoff("render-debt-main", &main);
+    let adopted = as_successor(&staged, |_| take_incoming().adopted);
+    assert_eq!(adopted[0].render_debt, None);
+    staged.teardown();
 }
 
 /// M3: at startup the files a dead sender left (`seamless-<dead pid>-…`) are
@@ -916,7 +1066,7 @@ fn the_startup_sweep_retires_only_a_dead_senders_files() {
     assert!(dir.join("seamless-9999-dir").is_dir());
 
     // And the production predicate: a reaped child's pid is dead, ours is not.
-    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let mut child = aterm_uds::spawnfd::command("true").spawn().unwrap();
     let pid = child.id();
     child.wait().unwrap();
     assert!(!crate::control_auth::pid_alive(pid));
@@ -930,12 +1080,8 @@ fn the_startup_sweep_retires_only_a_dead_senders_files() {
 #[test]
 fn a_senders_retirements_take_its_sidecars_and_nothing_else() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore_xdg = RestoreVar::new("XDG_RUNTIME_DIR");
-    let tmp = std::env::temp_dir().join(format!("aterm-carry-retire-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
-    aterm_log::env::set("XDG_RUNTIME_DIR", &tmp);
+    let _scratch = ScratchEnv::runtime("retire");
     let dir = crate::control_auth::socket_dir().expect("scratch control dir");
-    std::fs::create_dir_all(&dir).unwrap();
     let pid = std::process::id();
     let path = |name: &str| dir.join(name.replace("PID", &pid.to_string()));
     for name in [
@@ -964,7 +1110,6 @@ fn a_senders_retirements_take_its_sidecars_and_nothing_else() {
     );
     assert!(!path("seamless-PID-aaaa.toml").exists());
     assert!(path("seamless-PID-bbbb.s0.ctl").exists());
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// `write_outgoing` never writes a sidecar through what is already at its
@@ -972,7 +1117,7 @@ fn a_senders_retirements_take_its_sidecars_and_nothing_else() {
 #[test]
 fn a_sidecar_is_never_written_through_a_planted_path() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let target = std::env::temp_dir().join(format!("aterm-carry-target-{}", std::process::id()));
     std::fs::write(&target, b"untouched").unwrap();
     let p = std::env::temp_dir().join(format!("aterm-carry-link-{}", std::process::id()));
@@ -1006,7 +1151,7 @@ fn a_sidecar_is_never_written_through_a_planted_path() {
 #[test]
 fn a_carried_turn_id_past_the_manifest_range_is_left_out() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
     let mut carry = outgoing(&term, &turns, None);
@@ -1045,7 +1190,7 @@ fn a_carried_turn_id_past_the_manifest_range_is_left_out() {
 fn a_fifo_at_the_sidecar_path_does_not_stall_the_adoption() {
     use std::os::unix::ffi::OsStrExt as _;
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
     let carry = outgoing(&term, &turns, None);
@@ -1062,7 +1207,8 @@ fn a_fifo_at_the_sidecar_path_does_not_stall_the_adoption() {
         std::thread::spawn(move || {
             let _ = tx.send(child_proof_from(take_incoming()));
         });
-        let got = rx.recv_timeout(std::time::Duration::from_secs(3));
+        // A hang detector, not a latency budget: a blocked open never returns.
+        let got = rx.recv_timeout(std::time::Duration::from_secs(60));
         if got.is_err() {
             // Release the open blocked on the FIFO so the thread can finish.
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -1075,7 +1221,7 @@ fn a_fifo_at_the_sidecar_path_does_not_stall_the_adoption() {
         got
     });
     let Ok(Some(((proof, _ready, _), adopted))) = outcome else {
-        panic!("take_incoming did not return within 3 s (blocked opening the FIFO)");
+        panic!("take_incoming did not return within 60 s (blocked opening the FIFO)");
     };
     assert_eq!(proof, staged.expected, "the proof still checks out");
     assert_eq!(adopted.len(), 1);
@@ -1101,7 +1247,9 @@ fn carried_with(
             handoff_carry::capture_head(0, &guard, term, turns, differ),
         )
     };
-    let bytes = handoff_carry::export(&[source]).remove(0).1;
+    let bytes = handoff_carry::export(&[source], crate::control::turn_ids_for_handoff())
+        .remove(0)
+        .1;
     (checkpoint, handoff_carry::decode(&bytes).expect("decodes"))
 }
 
@@ -1195,19 +1343,9 @@ fn history_after_a_dropped_ledger_says_its_floor() {
     assert_eq!(crate::control::cmd_history(&h.ctx, ""), "OK 0\n");
 }
 
-/// Round seven, finding 58's review: the floor is said only while it lies
-/// inside the window the ledger answers for. A supervisor's worker that runs
-/// past `LEDGER_CAP` more turns after the update has evicted every record
-/// under it, and `history` — and so every `drive ledger` report — goes back
-/// to a plain `OK <n>`.
-#[test]
-fn history_stops_saying_a_floor_the_ledger_has_evicted_past() {
-    let minted = crate::control::turn_ids_minted() + 50;
-    crate::control::raise_turn_ids(minted);
-    let h = host(live_engine(1), handoff_carry::adopted_ledger(None));
-    let floor = h.ctx.turns.lock().unwrap().unheld_below();
-    assert!(floor > minted);
-    let rec = |id: u64| TurnRecord {
+/// A turn record for the `history` tests: `id`, nothing else of note.
+fn history_rec(id: u64, carried: bool) -> TurnRecord {
+    TurnRecord {
         id,
         started_ms: 1,
         dur_ms: 1,
@@ -1217,29 +1355,99 @@ fn history_stops_saying_a_floor_the_ledger_has_evicted_past() {
         screen_hash: 1,
         seq: 1,
         arch: ArchMark::default(),
-        carried: false,
-    };
-    // The control: a record held under the floor keeps it said.
-    h.ctx.turns.lock().unwrap().push(rec(floor - 1));
-    let reply = crate::control::cmd_history(&h.ctx, "");
+        carried,
+    }
+}
+
+/// Round seven, finding 58's review: the floor is said only until the
+/// turns it lost would have aged out of the ledger anyway. A supervisor's
+/// worker that runs `LEDGER_CAP` more turns after the update has pushed
+/// them past the ring, and `history` — and so every `drive ledger` report —
+/// goes back to a plain `OK <n>`. Until then it is said, from the first new
+/// turn on: that turn's id IS the floor (every id minted after a dropped
+/// ledger is at or past it), and a floor at the oldest held record went
+/// quiet there, the tab's lost turns unmentioned from one turn after the
+/// update on (round seven, findings 204 and 205).
+#[test]
+fn history_stops_saying_a_floor_once_the_lost_turns_would_have_aged_out() {
+    let minted = crate::control::turn_ids_minted() + 50;
+    crate::control::raise_turn_ids(minted);
+    let h = host(live_engine(1), handoff_carry::adopted_ledger(None));
+    let floor = h.ctx.turns.lock().unwrap().unheld_below();
+    assert!(floor > minted);
+    // The worker's next turn, the first id this process mints.
+    h.ctx.turns.lock().unwrap().push(history_rec(floor, false));
+    let before = format!("since={}", minted - 10);
+    let reply = crate::control::cmd_history(&h.ctx, &before);
     assert!(
-        reply.starts_with(&format!("OK 1 unheld_below={floor}\n")),
+        reply.starts_with(&format!("OK 1 unheld_below={floor}\nturn {floor} ")),
         "{reply}"
     );
+    assert_eq!(
+        h.ctx
+            .turns
+            .lock()
+            .unwrap()
+            .carry_floor(crate::control::turn_ids_for_handoff()),
+        floor,
+        "carried on by a second update"
+    );
+    // One turn short of LEDGER_CAP: a ledger carried whole still held them.
     let cap = crate::turn_ledger::LEDGER_CAP as u64;
-    for id in floor + 1..=floor + cap {
-        h.ctx.turns.lock().unwrap().push(rec(id));
+    for id in floor + 1..floor + cap - 1 {
+        h.ctx.turns.lock().unwrap().push(history_rec(id, false));
     }
     let reply = crate::control::cmd_history(&h.ctx, "");
+    let short = format!("OK {} unheld_below={floor}\n", cap - 1);
+    assert!(reply.starts_with(&short), "{}", &reply[..60]);
+    h.ctx
+        .turns
+        .lock()
+        .unwrap()
+        .push(history_rec(floor + cap - 1, false));
+    let reply = crate::control::cmd_history(&h.ctx, &before);
     assert!(
         reply.starts_with(&format!("OK {cap}\n")),
         "{}",
-        &reply[..40]
+        &reply[..60]
     );
     assert_eq!(
-        h.ctx.turns.lock().unwrap().carry_floor(),
+        h.ctx
+            .turns
+            .lock()
+            .unwrap()
+            .carry_floor(crate::control::turn_ids_for_handoff()),
         0,
         "not carried on"
+    );
+}
+
+/// A ledger an update HALVED to fit says its floor too: every record it
+/// kept is past the floor, and the records under it were shed (round seven,
+/// finding 205's rule: a floor at the oldest held record is not stale).
+#[test]
+fn history_on_a_halved_ledger_says_its_floor() {
+    let minted = crate::control::turn_ids_minted() + 50;
+    crate::control::raise_turn_ids(minted);
+    let mut halved = ControlCarry {
+        turns: vec![history_rec(minted, true)],
+        unheld_below: minted,
+        archive: None,
+    };
+    let h = host(
+        live_engine(1),
+        handoff_carry::adopted_ledger(Some(&mut halved)),
+    );
+    let reply = crate::control::cmd_history(&h.ctx, &format!("since={}", minted - 10));
+    assert!(
+        reply.starts_with(&format!("OK 1 unheld_below={minted}\nturn {minted} ")),
+        "{reply}"
+    );
+    // An anchor at the floor lost nothing.
+    let past = format!("since={}", minted - 1);
+    assert!(
+        crate::control::cmd_history(&h.ctx, &past).starts_with("OK 1\n"),
+        "an anchor at the floor"
     );
 }
 
@@ -1252,8 +1460,9 @@ fn history_stops_saying_a_floor_the_ledger_has_evicted_past() {
 #[test]
 fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
     let minted = crate::control::turn_ids_minted() + 50;
-    // `take_incoming`: the manifest's `next_turn_id`.
-    crate::control::raise_turn_ids(minted);
+    // `take_incoming`: past the manifest's `next_turn_id` by one overlap
+    // reserve.
+    crate::control::raise_turn_ids(crate::seamless::intake_turn_floor(minted));
     let resume = |local: u64, ledger: TurnLedger| -> String {
         let store = crate::session_store::new_store();
         let h = crate::session_store::test_handle(local);
@@ -1293,18 +1502,7 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
     };
     // The control: a carried ledger halved to its newest record.
     let mut halved = ControlCarry {
-        turns: vec![TurnRecord {
-            id: minted,
-            started_ms: 1,
-            dur_ms: 1,
-            submitted: true,
-            status: "settled",
-            text: "t".to_string(),
-            screen_hash: 1,
-            seq: 1,
-            arch: ArchMark::default(),
-            carried: true,
-        }],
+        turns: vec![history_rec(minted, true)],
         unheld_below: minted,
         archive: None,
     };
@@ -1457,17 +1655,6 @@ fn deep_shell(lines: usize) -> Arc<Mutex<Terminal>> {
     Arc::new(Mutex::new(t))
 }
 
-fn shell_history(t: &Terminal) -> Vec<String> {
-    let grid = t.main_grid();
-    (0..grid.scrollback_lines())
-        .map(|i| {
-            grid.get_history_line(i)
-                .map(|l| l.to_string().trim_end().to_string())
-                .unwrap_or_default()
-        })
-        .collect()
-}
-
 fn hist_files(staged: &StagedHandoff) -> Vec<std::path::PathBuf> {
     let dir = staged.manifest_path.parent().unwrap().to_path_buf();
     std::fs::read_dir(&dir)
@@ -1489,6 +1676,7 @@ fn park_history(term: &Arc<Mutex<Terminal>>) -> (StageCarry, crate::handoff_hist
             controls: Vec::new(),
             next_turn_id: None,
             fg_holders: Vec::new(),
+            render_debts: Vec::new(),
         },
         head,
     )
@@ -1504,8 +1692,9 @@ fn stamp_with(
     let term = Arc::clone(term);
     let screens = vec![(0, carry.screens[0].clone())];
     move |manifest, dir, nonce| {
-        let results = crate::handoff_history::HistoryPlan::Deferred(vec![(0, Arc::clone(&term))])
-            .results(dir);
+        let results =
+            crate::handoff_history::HistoryPlan::Deferred(vec![(0, Arc::clone(&term))].into())
+                .results(dir);
         let verdicts = crate::handoff_history::stamp_manifest(
             manifest,
             &screens,
@@ -1526,7 +1715,7 @@ fn stamp_with(
 #[test]
 fn the_history_carry_crosses_the_real_wire_outside_the_proof() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let term = deep_shell(4000);
     let parent = shell_history(&term.lock().unwrap());
     assert!(parent.len() > 3900);
@@ -1580,7 +1769,7 @@ fn the_history_carry_crosses_the_real_wire_outside_the_proof() {
 #[test]
 fn a_receiver_built_before_the_history_carry_skips_it_and_proves() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = env_guard();
+    let _restore = restore_env();
     let term = deep_shell(2000);
     let (carry, head) = park_history(&term);
     let stamp = stamp_with(&term, &carry, head);

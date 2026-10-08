@@ -49,10 +49,8 @@ fn seeded_terminal() -> Terminal {
 
 #[test]
 fn stepped_scroll_matches_row_jump_stateless() {
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found (headless without fonts)");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
 
     // Path A: step one row at a time (the glide's tick pattern), rendering
     // every intermediate frame (the animation's real workload).
@@ -88,10 +86,8 @@ fn stepped_scroll_matches_row_jump_stateless() {
 
 #[test]
 fn stepped_scroll_matches_row_jump_damage_cached() {
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found (headless without fonts)");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
 
     // Path A: ONE persistent per-window cache sees every intermediate frame —
     // any row-reuse bug (stale rows surviving a scroll) would leave residue in

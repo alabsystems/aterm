@@ -102,6 +102,11 @@ pub(crate) struct SessionChromeInput {
     /// harness host's rows; `None` when none is recorded for the tab or no
     /// word would do anything.
     pub upgrade: Option<UpgradeMenu>,
+    /// WHY the tab's attention mark stands: the session's `meta set attention`
+    /// text, as the caller read it (the composer sanitizes and caps it again).
+    /// The mark alone says "needs attention"; the hover names the reason, so a
+    /// mark that stays is never a riddle. `None` = no reason recorded.
+    pub attention: Option<String>,
 }
 
 /// One tab's live agent upgrade, as its context menu offers it (gap #21):
@@ -520,11 +525,13 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
             identity.push(format!("cwd: {cwd}"));
         }
     }
-    if let Some(state) = input
-        .state
-        .as_deref()
-        .filter(|s| !s.is_empty() && !matches!(*s, "-" | "alive" | "spawning"))
-    {
+    // The state is news unless it is the live default or the activity line
+    // already says it (`activity: exited (exit 1)`).
+    if let Some(state) = input.state.as_deref().filter(|s| {
+        !s.is_empty()
+            && !matches!(*s, "-" | "alive" | "spawning")
+            && !input.activity.as_deref().is_some_and(|a| a.starts_with(s))
+    }) {
         identity.push(format!("state: {state}"));
     }
     let timeline: Vec<String> = input
@@ -582,6 +589,7 @@ fn event_words(kind: &str) -> &str {
         "state-change" => "state changed",
         "modes-restored" => "terminal modes restored",
         "hold" => "hold changed",
+        "hold-advisory" => "fabric lost (not halted)",
         "inbox" => "mail arrived",
         "post" => "mail sent",
         "in-doubt" => "input unconfirmed",
@@ -606,13 +614,34 @@ pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
         .as_deref()
         .and_then(|icon| crate::session_timeline::sanitize_metadata_value("icon", icon))
         .is_some();
-    if identity.len() <= 1 && !icon && connections.is_empty() {
+    let attention = attention_line(input);
+    if identity.len() <= 1 && !icon && connections.is_empty() && attention.is_none() {
         // Only the bare title line — nothing the chip doesn't already say.
         return None;
     }
     let mut lines = identity;
+    lines.extend(attention);
     lines.extend(connections);
     Some(lines.join("\n"))
+}
+
+/// The tooltip line that names why a tab's attention mark stands starts with
+/// this; the native hover ([`crate::toolbar`]) reads it to say the reason once.
+pub(crate) const NEEDS_ATTENTION_PREFIX: &str = "Needs attention: ";
+
+/// The tooltip's `Needs attention: <reason>` line: the reason the tab's mark
+/// stands, sanitized and capped at the `attention` field's own rules and then
+/// display-truncated like the description. `None` when no reason is recorded
+/// (the mark's own hover clause, `Needs attention`, still says THAT).
+fn attention_line(input: &SessionChromeInput) -> Option<String> {
+    let reason = input
+        .attention
+        .as_deref()
+        .and_then(|reason| crate::session_timeline::sanitize_metadata_value("attention", reason))?;
+    Some(format!(
+        "{NEEDS_ATTENTION_PREFIX}{}",
+        display_description(&reason)
+    ))
 }
 
 /// Compose the right-click CONTEXT-MENU model for one terminal tab: the same
@@ -848,6 +877,7 @@ mod tests {
             ],
             connections: Vec::new(),
             upgrade: None,
+            attention: None,
         }
     }
 
@@ -889,6 +919,11 @@ mod tests {
                 .unwrap()
                 .ends_with("\ncwd: ~/src/aterm\nstate: exited")
         );
+        // An activity line that already says it exited is the one exit line.
+        exited.activity = Some("exited (exit 1)".to_string());
+        let tip = compose_tooltip(&exited).unwrap();
+        assert!(tip.contains("activity: exited (exit 1)"), "{tip}");
+        assert!(!tip.contains("state: exited"), "{tip}");
         // A bare live session with a spawn event is only its label: no tooltip.
         let bare = SessionChromeInput {
             label: "zsh".to_string(),
@@ -963,6 +998,79 @@ mod tests {
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
             TabMenuEntry::Separator => true,
         }));
+    }
+
+    /// The tab's hover names why its mark stands: a recorded reason is one
+    /// `Needs attention: <reason>` line under the identity lines (before the
+    /// connections), and is enough on its own to earn a tooltip.
+    #[test]
+    fn the_tooltip_names_why_a_tab_needs_a_look() {
+        let stalled = SessionChromeInput {
+            attention: Some("Claude Code 2.1.283 -> 2.1.284 upgrade stalled".to_string()),
+            ..full_input()
+        };
+        let tip = compose_tooltip(&stalled).expect("composes");
+        assert!(
+            tip.ends_with(
+                "\ncwd: ~/src/aterm\nNeeds attention: Claude Code 2.1.283 -> 2.1.284 upgrade stalled"
+            ),
+            "{tip}"
+        );
+        let alone = SessionChromeInput {
+            label: "zsh".to_string(),
+            attention: Some("wedged on CI".to_string()),
+            ..SessionChromeInput::default()
+        };
+        assert_eq!(
+            compose_tooltip(&alone).as_deref(),
+            Some("zsh\nNeeds attention: wedged on CI"),
+            "a reason alone earns a tooltip"
+        );
+    }
+
+    /// No reason recorded, no line: the tooltip is exactly what it was, and an
+    /// empty or all-control reason counts as none.
+    #[test]
+    fn no_attention_no_line() {
+        assert!(
+            !compose_tooltip(&full_input())
+                .unwrap()
+                .contains("Needs attention")
+        );
+        for reason in [None, Some(String::new()), Some("\u{202e}\n".to_string())] {
+            let input = SessionChromeInput {
+                label: "zsh".to_string(),
+                attention: reason,
+                ..SessionChromeInput::default()
+            };
+            assert_eq!(compose_tooltip(&input), None);
+        }
+    }
+
+    /// The reason is capped and stripped of controls like every other line:
+    /// the stored `attention` is at most 256 bytes and the hover shows at most
+    /// the description cap of grapheme clusters, ellipsised.
+    #[test]
+    fn the_reason_is_capped_and_sanitized() {
+        let input = SessionChromeInput {
+            label: "zsh".to_string(),
+            attention: Some(format!("wedged\u{202e} on\nCI {}", "x".repeat(600))),
+            ..SessionChromeInput::default()
+        };
+        let tip = compose_tooltip(&input).expect("composes");
+        let line = tip.lines().nth(1).expect("the reason line");
+        assert!(
+            line.starts_with("Needs attention: wedged onCI xxx"),
+            "{line}"
+        );
+        assert!(!crate::session_timeline::metadata_has_forbidden_formatting(
+            line
+        ));
+        assert_eq!(tip.lines().count(), 2, "one line, no injected newline");
+        assert!(
+            line.chars().count()
+                <= NEEDS_ATTENTION_PREFIX.chars().count() + DESCRIPTION_DISPLAY_MAX + 1
+        );
     }
 
     /// A session with NOTHING beyond its label composes NO tooltip — exactly

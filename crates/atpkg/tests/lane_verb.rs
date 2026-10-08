@@ -24,7 +24,7 @@ use std::process::{Command, Output, Stdio};
 /// `stage0/bin` (the Trust names of the one measured 2026-09-28, and no `rustdoc`),
 /// a Trust toolchain under `~/`, and rustup's stock 1.97.1 under `~/`.
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     checkout: PathBuf,
 }
@@ -33,11 +33,12 @@ const STAGE0: &str = "build/aarch64-apple-darwin/stage0/bin";
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-lane-verb-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
-        let checkout = root.join("trust");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-lane-verb-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
+        let checkout = root.path().join("trust");
         let touch = |dir: &Path, names: &[&str]| {
             std::fs::create_dir_all(dir).expect("fixture dir");
             for name in names {
@@ -71,7 +72,7 @@ impl Fixture {
             .args(extra)
             .current_dir(&self.checkout)
             .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env_remove("RUSTUP_TOOLCHAIN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -89,12 +90,6 @@ impl Fixture {
 
     fn bash(&self, command: &str) -> Output {
         self.lane(&hook_payload(command), &[])
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -163,7 +158,7 @@ fn a_trust_toolchains_own_rustc_by_path_goes_through_the_wired_verb() {
     }
     // The relative directory is read under `--cwd` when one is given: there is no
     // Trust toolchain under the fixture's root, so the same words are stock.
-    let root = fx.root.display().to_string();
+    let root = fx.root.path().display().to_string();
     let out = fx.lane(
         &hook_payload("build/aarch64-apple-darwin/stage0/bin/rustc -Vv"),
         &["--cwd", &root],
@@ -226,5 +221,10 @@ fn the_wired_verb_answers_with_its_exit_code_and_stderr() {
     assert!(out.stderr.is_empty(), "{}", text(&out));
 
     let out = fx.lane(b"cargo build", &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+
+    // A usage error claims nothing either: never the refusal's 2. (No payload: the
+    // verb exits before it reads stdin, and a write could meet a closed pipe.)
+    let out = fx.lane(b"", &["--verbose"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
 }

@@ -5,10 +5,9 @@
 
 use super::*;
 
-/// UNIFIED-READERS PROOF: ONE canonical metric ([`crate::typing_momentum`])
-/// drives all three rainbow kitty "earned drama" consumer groups. The glow engine's
-/// instance and the cursor cat's instance evolve IDENTICALLY under one
-/// keystream (same law, same stamps), and each consumer keys off it:
+/// One canonical metric ([`crate::typing_momentum`]) drives all three rainbow
+/// kitty consumer groups. The glow engine's and the cursor cat's instances
+/// evolve identically under one keystream, and each consumer keys off it:
 /// (1) the star envelope/density via the eased `rainbow.disp` spine,
 /// (2) the fresh-ink pop via the spine frozen at birth (`InkPop::mom`),
 /// (3) the one-body cat wake via its band+dwell over the same value.
@@ -35,12 +34,9 @@ fn momentum_unifies_glow_and_cat_metrics() {
             cat.momentum(t)
         );
     }
-    // RETUNED 2026-08-29: ten keys at human cadence is a WORD, and a word
-    // now earns its air — the star onset moved to ~one word so the
-    // starfield appears in ordinary typing (owner: "where are the
-    // sparkles?"). What this phase still pins is the LAW the two engines
-    // share: the momentum value agrees at every stamp above, and the CAT
-    // — whose earn bar is its own, higher one — stays unearned here.
+    // Ten keys at human cadence is a word, enough for the star onset; this
+    // phase pins that both engines agree at every stamp and the cat (whose
+    // earn bar is higher) stays unearned.
     assert!(!cat.is_active(), "cat wake: unearned ⇒ no cat");
     assert_eq!(
         cat.frame(t).alpha,
@@ -61,13 +57,10 @@ fn momentum_unifies_glow_and_cat_metrics() {
         glow.typing_momentum(t) < before,
         "deletes drain, never build"
     );
-    // Phase 2 — sustained flow (~6.6 s): the shared value crosses the
-    // star onset and then the (raised 0.90) cat band, so the shower AND the
-    // one-body cat are earned together off the one metric. The cat's earn law
-    // was raised (band 0.90, dwell 3.0 s in kitty_cursor.rs) so this run must
-    // be longer than the old ~4.5 s to summon. Line ends continue via the
-    // wrap-shaped move, which classifies as typing — every key builds BOTH
-    // instances.
+    // Phase 2, sustained flow (~6.6 s): the shared value crosses the star
+    // onset and then the cat band (0.90, dwell 3.0 s in kitty_cursor.rs), so
+    // the shower and the cat are earned together. Line ends continue via the
+    // wrap-shaped move, which classifies as typing.
     let (mut row, mut col) = (3u16, 9u16);
     for _ in 0..110 {
         t += Duration::from_millis(60);
@@ -78,10 +71,8 @@ fn momentum_unifies_glow_and_cat_metrics() {
             col += 1;
         }
         cat.on_key(t, true);
-        // A real keystroke arms the committed-press hint the correlated
-        // advance now REQUIRES (M1): forward/wrap echoes credit momentum
-        // only when paired with it, so a program printing the same cells
-        // would build nothing here.
+        // A real keystroke arms the committed-press hint the correlated advance
+        // requires; a program printing the same cells would build nothing.
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((row, col)), t, &c, g, &mut out);
         assert!(
@@ -96,15 +87,12 @@ fn momentum_unifies_glow_and_cat_metrics() {
     );
 }
 
-/// EARNED BY REAL TYPING ONLY (M1): a program printing one glyph per frame
-/// walks the caret forward +1 col every tick — the exact `forward` shape —
-/// yet arms NO key-time press hint, so the correlated advance never fires:
-/// the metric stays flat at zero and no momentum pulse is ever offered to
-/// the cat. The same forward moves WITH a real press behind them build
-/// normally, so this is the correlation gate, not a dead advance. (The
-/// advance keys on the PRESS-HINT half — v0.43.0 law — not on candidate
-/// admission; see `classify_move`'s momentum comment and
-/// `momentum_climbs_through_streaming_collisions_that_retire_every_candidate`.)
+/// Earned by real typing only: a program printing one glyph per frame walks
+/// the caret forward +1 col every tick but arms no press hint, so the metric
+/// stays at zero and no pulse reaches the cat. The same moves with a real
+/// press build normally. The advance keys on the press hint, not candidate
+/// admission (see `classify_move` and
+/// `momentum_climbs_through_streaming_collisions_that_retire_every_candidate`).
 #[test]
 fn program_output_alone_builds_no_momentum() {
     let g = geom();
@@ -113,8 +101,8 @@ fn program_output_alone_builds_no_momentum() {
     let mut out = Vec::new();
     let mut t = Instant::now();
     glow.tick(Some((3, 0)), t, &c, g, &mut out);
-    // 20 forward advances as PURE OUTPUT — no `note_typed` behind any of
-    // them (a `printf` loop, a spinner, a streaming log).
+    // 20 forward advances as pure output, no `note_typed` behind any (a
+    // `printf` loop, a spinner, a streaming log).
     for col in 1..=20u16 {
         t += Duration::from_millis(40);
         glow.tick(Some((3, col)), t, &c, g, &mut out);
@@ -149,13 +137,12 @@ fn program_output_alone_builds_no_momentum() {
     );
 }
 
-/// Appendix-A seam: the classifier already knows whether a licensed
-/// cursor move is a fold. The cursor-cat channel must preserve that verdict
-/// for the ordinary next-row shape, an explicit preview-only same-row
-/// reflow projection, and the exact Backspace inverse — while a
-/// navigation-shaped relocation mints nothing. Shipping bottom-scroll
-/// reachability is bound by the real-App ContentScrollState test in
-/// `app_input`; this synthetic classifier test makes no such claim.
+/// The classifier knows whether a licensed cursor move is a fold, and the
+/// cursor-cat channel preserves that verdict for the ordinary next-row shape,
+/// an explicit preview-only same-row reflow projection, and the exact
+/// Backspace inverse; a navigation-shaped relocation mints nothing. Real
+/// bottom-scroll reachability is covered by the real-App ContentScrollState
+/// test in `app_input`.
 #[test]
 fn cursor_cat_motion_pulse_preserves_licensed_fold_shape() {
     let g = geom();
@@ -192,9 +179,9 @@ fn cursor_cat_motion_pulse_preserves_licensed_fold_shape() {
     same_row_preview.tick(Some((5, 38)), t0, &c, g, &mut out);
     same_row_preview.note_synthetic_typed(at, 1);
     same_row_preview.tick(Some((5, 0)), at, &c, g, &mut out);
-    // A same-row backward typed-paired move is HELD for its return
-    // (the Ink rewrite's park, 2026-09-12) and judged — the fold pulse
-    // included, dated at the move — on the next tick past the window.
+    // A same-row backward typed-paired move is held for its return (the Ink
+    // rewrite's park) and judged, fold pulse included and dated at the move,
+    // on the next tick past the window.
     assert!(
         same_row_preview.take_cursor_cat_motion_pulse().is_none(),
         "the park is held, not yet judged"

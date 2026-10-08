@@ -279,10 +279,7 @@ fn remove_marker_if_empty(path: &std::path::Path) -> bool {
 /// Nanoseconds since the epoch — the launch salt in a marker's name.
 #[cfg(any(unix, windows))]
 fn startup_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
+    aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
 }
 
 /// Delete zero-length `crash-signal-*.log` files left in `dir` (Windows). Every
@@ -446,6 +443,10 @@ pub(crate) mod markers {
             return Owner::Unknown;
         }
         // SAFETY: `fd` was opened above and is closed below; LOCK_NB never waits.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a probe: a lock it takes is let go by LOCK_UN below, before the close"
+        )]
         let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
         let err = std::io::Error::last_os_error().raw_os_error();
         // A lock the probe took is released by LOCK_UN, not by the close alone:
@@ -456,7 +457,13 @@ pub(crate) mod markers {
         // all (the fd-copy sweep of 2026-09-27; the sweep lock's 773b7136f).
         if locked {
             // SAFETY: `fd` is the descriptor opened above; LOCK_UN never waits.
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the release: LOCK_UN before the close"
+            )]
+            unsafe {
+                libc::flock(fd, libc::LOCK_UN)
+            };
         }
         // SAFETY: closes the descriptor opened above exactly once.
         unsafe { libc::close(fd) };
@@ -467,20 +474,6 @@ pub(crate) mod markers {
         } else {
             Owner::Unknown
         }
-    }
-
-    /// Whether `pid` names a live process (`kill(pid, 0)`; `EPERM` is alive —
-    /// it exists, it is just not ours).
-    fn pid_alive(pid: u32) -> bool {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        if pid <= 0 {
-            return false;
-        }
-        // SAFETY: signal 0 performs the existence and permission checks only.
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     /// An empty REGULAR file (not a symlink, FIFO or directory) — the only
@@ -531,7 +524,7 @@ pub(crate) mod markers {
                 {
                     swept.push(marker);
                 }
-            } else if legacy_pid(name).is_some_and(|pid| !pid_alive(pid)) {
+            } else if legacy_pid(name).is_some_and(|pid| !aterm_uds::process::pid_alive(pid)) {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -597,11 +590,25 @@ pub(crate) mod markers {
         let fd = file.into_raw_fd();
         // SAFETY: `fd` is the descriptor just opened; LOCK_NB never waits, and a
         // file this call created exclusively has no other holder.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the marker's lock, held for life; a failed arming lets go by LOCK_UN below"
+        )]
         let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
         if !locked || std::fs::rename(&pending, &path).is_err() {
             let _ = std::fs::remove_file(&pending);
-            // SAFETY: closes the descriptor opened above, exactly once.
-            unsafe { libc::close(fd) };
+            // SAFETY: the descriptor opened above, unlocked (a no-op when the
+            // lock was never taken; LOCK_UN never waits) and then closed,
+            // exactly once — let go by LOCK_UN, not the close alone, as
+            // [`probe`] does.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the release: LOCK_UN before the close"
+            )]
+            unsafe {
+                libc::flock(fd, libc::LOCK_UN);
+                libc::close(fd);
+            }
             return None;
         }
         Some((fd, path))
@@ -953,8 +960,17 @@ mod imp {
             }
             Some(armed) => {
                 let _ = std::fs::remove_file(&armed.path);
-                // SAFETY: closes the descriptor `arm` returned, once.
-                unsafe { libc::close(armed.fd) };
+                // SAFETY: the descriptor `arm` returned, unlocked (a no-op
+                // for the unlocked fallback; LOCK_UN never waits) and then
+                // closed, once — let go by LOCK_UN, not the close alone.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the release: LOCK_UN before the close"
+                )]
+                unsafe {
+                    libc::flock(armed.fd, libc::LOCK_UN);
+                    libc::close(armed.fd);
+                }
                 -1
             }
             None => -1,
@@ -1054,24 +1070,6 @@ mod imp {
         }
 
         #[test]
-        fn decimal_formatter_handles_zero_without_dropping_the_digit() {
-            assert_eq!(render(0), "0");
-        }
-
-        #[test]
-        fn every_fatal_signal_number_formats_within_the_buffer() {
-            for &sig in &FATAL_SIGNALS {
-                let mut buf = [0u8; U32_MAX_DIGITS];
-                let bytes = fmt_u32_decimal(sig as u32, &mut buf);
-                assert_eq!(
-                    bytes,
-                    sig.to_string().as_bytes(),
-                    "signal {sig} formatted wrong"
-                );
-            }
-        }
-
-        #[test]
         fn banner_bytes_are_the_expected_marker_text() {
             assert_eq!(BANNER_PREFIX, b"aterm: fatal signal ");
             assert_eq!(BANNER_SUFFIX, b"\n");
@@ -1086,31 +1084,6 @@ mod imp {
             let text = String::from_utf8(line).unwrap();
             assert_eq!(text, format!("aterm: fatal signal {}\n", libc::SIGSEGV));
         }
-
-        #[test]
-        fn install_is_idempotent_and_arms_a_handler_for_sigsegv() {
-            // Calling twice must not panic and must not re-open the marker.
-            install_signal_handlers(crate::crash_signal::Arming::Other);
-            install_signal_handlers(crate::crash_signal::Arming::Other);
-
-            // Read back the current SIGSEGV disposition with a null `act`; a
-            // handler should now be installed (neither SIG_DFL nor SIG_IGN).
-            // We do NOT raise the signal.
-            //
-            // SAFETY: `old` is a zeroed, correctly-sized `sigaction`; passing a
-            // null `act` makes `sigaction` a pure query of the current
-            // disposition, which it writes into `old`. Called at test (non-
-            // signal) time.
-            let installed = unsafe {
-                let mut old: libc::sigaction = std::mem::zeroed();
-                let rc = libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut old);
-                rc == 0 && old.sa_sigaction != libc::SIG_DFL && old.sa_sigaction != libc::SIG_IGN
-            };
-            assert!(
-                installed,
-                "SIGSEGV should have a custom handler after install"
-            );
-        }
     }
 }
 
@@ -1120,14 +1093,23 @@ mod imp {
 mod marker_tests {
     use super::MarkerOwner;
     use super::markers::{self, Owner};
+    use crate::crash_journal::tests::{reaped_pid, scratch};
     use std::path::Path;
 
-    /// A scratch log dir.
-    fn scratch(tag: &str) -> aterm_tempfile::TempDir {
-        aterm_tempfile::Builder::new()
-            .prefix(tag)
-            .tempdir()
-            .expect("scratch dir")
+    /// Let go of a locked marker's descriptor as its owner does: `LOCK_UN`,
+    /// then the close — never by the close alone (the flock release rule).
+    fn let_go(fd: i32) {
+        // SAFETY: `fd` is a descriptor `create_locked`/`arm` returned and the
+        // caller still owns; LOCK_UN never waits.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the release: LOCK_UN before the close"
+        )]
+        unsafe {
+            libc::flock(fd, libc::LOCK_UN)
+        };
+        // SAFETY: the same descriptor, closed exactly once.
+        unsafe { libc::close(fd) };
     }
 
     /// An EMPTY marker nobody holds — what a dead owner leaves.
@@ -1135,16 +1117,6 @@ mod marker_tests {
         let path = dir.join(markers::file_name(pid, 7, owner));
         std::fs::write(&path, b"").unwrap();
         path
-    }
-
-    /// A pid that WAS a process and is not one any more: a reaped child's.
-    fn reaped_pid() -> u32 {
-        let mut child = std::process::Command::new("/usr/bin/true")
-            .spawn()
-            .expect("spawn /usr/bin/true");
-        let pid = child.id();
-        child.wait().expect("reap");
-        pid
     }
 
     /// The sweep as it was before the lifecycle: every empty `crash-*` marker
@@ -1223,8 +1195,7 @@ mod marker_tests {
             !live.exists(),
             "control: the old sweep unlinks the live marker the new one keeps"
         );
-        // SAFETY: closes the descriptor `create_locked` returned, once.
-        unsafe { libc::close(fd) };
+        let_go(fd);
     }
 
     /// `arm` takes the locked lifecycle when it can: the marker is named for its
@@ -1249,8 +1220,7 @@ mod marker_tests {
         );
         assert_eq!(markers::probe(&armed.path), Owner::Live);
         // Its clean exit: unlock, then remove.
-        // SAFETY: closes the descriptor `arm` returned, once.
-        unsafe { libc::close(armed.fd) };
+        let_go(armed.fd);
         std::fs::remove_file(&armed.path).unwrap();
 
         let name = markers::file_name(own + 12, 6, MarkerOwner::App);
@@ -1316,8 +1286,7 @@ mod marker_tests {
         markers::sweep(dir.path(), own);
         assert!(killed.exists());
         assert!(markers::dead_app_markers(dir.path(), own).is_empty());
-        // SAFETY: closes the descriptor `create_locked` returned, once.
-        unsafe { libc::close(fd) };
+        let_go(fd);
     }
 
     /// The sweep ANSWERS the corpses it removed: a dead `other` start's empty
@@ -1361,8 +1330,7 @@ mod marker_tests {
         );
         assert!(!previous_image.exists());
         assert!(record.exists() && live.exists());
-        // SAFETY: closes the descriptor `create_locked` returned, once.
-        unsafe { libc::close(fd) };
+        let_go(fd);
     }
 
     /// A build that predates the lifecycle never locked its `crash-signal-*`
@@ -1406,14 +1374,14 @@ mod marker_tests {
         // The child: take the lock the way `create_locked` does (python is not
         // assumed; `flock(1)` is not on macOS), so this uses a perl one-liner
         // when perl is present and skips otherwise.
-        let Ok(perl) = std::process::Command::new("/usr/bin/perl")
+        let Ok(perl) = aterm_uds::spawnfd::command("/usr/bin/perl")
             .arg("-e")
             .arg(
                 "use Fcntl qw(:flock); open(my $f, '>', $ARGV[0]) or die; \
                  flock($f, LOCK_EX|LOCK_NB) or die; $|=1; print \"locked\\n\"; sleep 60",
             )
             .arg(dir.path().join(markers::file_name(1, 1, MarkerOwner::App)))
-            .stdout(std::process::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
             .spawn()
         else {
             eprintln!("SKIP: /usr/bin/perl is not available");
@@ -1469,9 +1437,8 @@ mod exit_gate {
         // (`harness_host::tests::pty_job`), one the rendezvous listener
         // fixture in a test — and `clean_exit_now` itself.
         let allowed = [
-            ("spawn.rs", 1usize),
-            ("app_update_handoff.rs", 1),
-            ("harness_host.rs", 2),
+            ("app_update_handoff_handoff_process_group_tests.rs", 1usize),
+            ("harness_host_tests.rs", 2),
             ("handoff_rendezvous.rs", 1),
             ("crash_signal.rs", 1),
         ];

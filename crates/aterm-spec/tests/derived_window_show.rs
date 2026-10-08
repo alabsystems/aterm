@@ -7,14 +7,9 @@
 //! `Buggy = 1` on every invariant; the update's paths are walked as the
 //! owner's schedules. Tier-1 is `aterm-gui/src/window_show_conformance.rs`.
 
-use aterm_spec::derive::{Model, native_update_window_show_model};
+use crate::walk::only;
+use aterm_spec::derive::native_update_window_show_model;
 use aterm_spec::{interp, verify};
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
 
 #[test]
 fn window_show_proves_catches_and_has_no_dead_action() {

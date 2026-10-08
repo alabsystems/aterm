@@ -594,11 +594,11 @@ fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
         return (files, false);
     }
     // SINGLE-FLIGHT per root list: the broad and symbol chain builders run on
-    // two threads at once at every launch, and each used to miss the memo and
-    // walk the whole tree — the same tree, twice. The second caller now waits
-    // on the first walk's gate and is answered from its memo. The walk itself
-    // still runs OUTSIDE the memo lock, so a caller asking for a DIFFERENT
-    // root list (tests walk private fixture roots) never waits behind it.
+    // two threads at once at every launch; the second caller waits on the
+    // first walk's gate and is answered from its memo instead of walking the
+    // same tree again. The walk itself still runs OUTSIDE the memo lock, so a
+    // caller asking for a DIFFERENT root list (tests walk private fixture
+    // roots) never waits behind it.
     let gate = walk_gate(roots);
     let _in_flight = gate
         .lock()
@@ -806,7 +806,7 @@ mod tests {
         std::fs::write(&installed, b"installed jetbrains mono").unwrap();
         let requests = vec![
             "JetBrains Mono".to_string(),
-            crate::bundled::PRIMARY_ID.to_string(),
+            crate::bundled::JETBRAINS_ID.to_string(),
         ];
         let batch =
             resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), Limits::default());
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(by_name.path, installed.to_string_lossy(), "installed wins");
         assert_eq!(&by_name.bytes[..], b"installed jetbrains mono");
         let by_id = batch.get(1).unwrap().as_ref().unwrap();
-        assert_eq!(by_id.path, crate::bundled::PRIMARY_ID);
+        assert_eq!(by_id.path, crate::bundled::JETBRAINS_ID);
 
         // Nothing installed: the NAME resolves to the compiled-in face, with its
         // bytes, under its identity (so its Bold/Italic siblings are found).
@@ -825,13 +825,13 @@ mod tests {
             let admitted = entry.result.as_ref().unwrap();
             assert_eq!(
                 admitted.path,
-                crate::bundled::PRIMARY_ID,
+                crate::bundled::JETBRAINS_ID,
                 "{}",
                 entry.requested
             );
             assert_eq!(
                 &admitted.bytes[..],
-                crate::bundled::face_for_id(crate::bundled::PRIMARY_ID).unwrap()
+                crate::bundled::face_for_id(crate::bundled::JETBRAINS_ID).unwrap()
             );
         }
         std::fs::remove_dir_all(root).unwrap();

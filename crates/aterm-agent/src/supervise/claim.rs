@@ -1,44 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The SUPERVISOR CLAIM (lane C's `meta set supervisor <holder> [ttl=<ms>]`):
-//! a loop that acts alone (`watch`, the in-GUI host) says so on the session,
-//! so `status supervisor=` names who answers its prompts, the server stops
-//! raising the agent's own boxes to the menu bar while the claim is live
-//! (the loop's keyed escalation does instead), and a SECOND supervisor on
-//! the same session learns it is second.
+//! The supervisor claim (`meta set supervisor <holder> [ttl=<ms>]`): a loop
+//! that acts alone (`watch`, the in-GUI host) says so on the session, so
+//! `status supervisor=` names who answers its prompts, the server stops
+//! raising the agent's own boxes to the menu bar while the claim is live, and
+//! a second supervisor on the same session learns it is second.
 //!
-//! * **Taken at the start** of an unattended loop, before its first look,
-//!   as a lease: `ttl=`[`CLAIM_TTL_MS`], renewed every [`CLAIM_RENEW`] by
-//!   the next request the loop makes ([`Session::renew_claim_if_due`]), so a
-//!   loop that dies — a crash, a kill — lets it lapse within the TTL and the
-//!   server hands the session's box back to the human. A lease, not the
-//!   connection-scoped form: the CLI's transport may open a connection per
-//!   request, and a connection-scoped claim would lapse with the first one.
-//!   Every wait of the loop is bounded by its 20 s step, so a request comes
-//!   at least that often.
-//! * **Released at the end** (`meta unset supervisor`), only when held.
-//! * **Another holder** (`ERR busy supervisor=<holder>`): the loop WATCHES
-//!   ONLY — it says so once (`WATCHING …`), decides no box (every one is
-//!   escalated to the review with the holder named), dismisses no survey,
-//!   types no probe, raises and clears no badge, and any write that would
-//!   still reach the wire is refused locally ([`Session::claim_refuses`]).
-//!   It tries for the claim again at every renewal, and says `CLAIMED …`
-//!   the moment it has it.
-//! * **A claim request not served** (an outage — at the start, or a
-//!   renewal): PENDING. The loop does not know whose the session is, so it
-//!   types and presses NOTHING ([`Session::claim_refuses`]: its input verbs
-//!   are refused locally, its badges still go) and asks again before its
-//!   very next request, until one is answered. A held claim whose renewal
-//!   went unanswered is pending too: the lease may have lapsed in the
-//!   outage and another supervisor taken it (lane B2's review — a pending
-//!   loop used to act as if it had none).
-//! * **A host without the claim** (a build before lane C: `ERR usage`, or an
-//!   edge token: `ERR denied`): the loop acts as it did before the claim
-//!   existed and says so once (`CLAIM unavailable …`).
+//! * Taken at the start of an unattended loop as a lease
+//!   (`ttl=`[`CLAIM_TTL_MS`]), renewed every [`CLAIM_RENEW`] by the loop's
+//!   next request ([`Session::renew_claim_if_due`]), so a dead loop's claim
+//!   lapses. A lease because the CLI may open a connection per request.
+//! * Released at the end (`meta unset supervisor`), only when held.
+//! * Another holder (`ERR busy supervisor=<holder>`): the loop only watches,
+//!   says `WATCHING …` once, escalates every box naming the holder, and
+//!   refuses its own writes locally ([`Session::claim_refuses`]); it retries
+//!   at every renewal and says `CLAIMED …` when it gets it.
+//! * A claim request not served (an outage): pending. The loop types and
+//!   presses nothing until a request is answered; a held claim whose renewal
+//!   went unanswered is pending too.
+//! * A host without the claim (`ERR usage`, or `ERR denied` for an edge
+//!   token): the loop acts without it and says `CLAIM unavailable …` once.
 //!
-//! No clock of its own and no polling: the renewal rides the requests the
-//! loop makes anyway.
+//! No clock of its own: the renewal rides the requests the loop makes anyway.
 
 use super::*;
 
@@ -51,8 +35,7 @@ pub const CLAIM_HELD: &str = "supervisor claim held by ";
 pub(super) const CLAIM_TTL_MS: u64 = 90_000;
 /// How often the claim is renewed (and, behind another holder, tried). Public
 /// because the in-GUI host's adopted-claim grace after a seamless update is
-/// counted in these steps: the time an external loop needs to renew, from the
-/// new instance, a claim the old one held (aterm-gui `harness_host`).
+/// counted in these steps (aterm-gui `harness_host`).
 pub const CLAIM_RENEW: Duration = Duration::from_secs(20);
 
 /// Where the loop stands on the session's supervisor claim.
@@ -93,8 +76,8 @@ fn busy_holder(r: &CtlReply) -> Option<String> {
         .map(super::super::report::pct_decode)
 }
 
-/// A claim line: `WATCHING …` is said — the watch's reader must know this
-/// loop answers nothing — and the rest (`CLAIMED`, `CLAIM unavailable`) are
+/// A claim line: `WATCHING …` is said (the watch's reader must know this loop
+/// answers nothing), and the rest (`CLAIMED`, `CLAIM unavailable`) are
 /// journaled.
 fn say_claim(line: &str, review: &mut dyn Review) {
     if line.starts_with("WATCHING") {
@@ -266,7 +249,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The loop's last act: the claim released, when it is held — and only
-    /// while it is still this loop's (`holder=`, lane E's server form): a
+    /// while it is still this loop's (`holder=`): a
     /// lease that lapsed in an outage may have been taken by another
     /// supervisor since, and a bare unset would clear that one's live claim.
     pub(super) fn release_claim(&mut self) {

@@ -10,7 +10,7 @@
 //!     `spec_xref_closure` runs it.
 //!   * `gate <verb>`: the checks the merge gate shells into this binary for
 //!     (`gate.rs`).
-//!   * `perf [--record]`: the measuring perf lanes and the same-box trend ledger
+//!   * `perf [--record]`: the perf measurements and the same-box trend ledger
 //!     (`perf.rs`). It has no automatic caller; it measures.
 //!   * `verify [args…]`: `tools/verify.sh`, the `targo --unverified verify` alias's target.
 
@@ -53,9 +53,8 @@ fn main() -> ExitCode {
                  \n\
                  harness-manifest  enumerate #[kani::proof] fns -> target/trust/harness-manifest.json\n\
                  gate <verb>       the merge gate's xtask checks: {}\n\
-                 perf [--record]   the perf lanes against tools/golden (--record rewrites them)\n\
-                 verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
-                 \x20                 (this is what the `targo --unverified verify` alias dispatches to)",
+                 perf [--record]   measure against tools/golden (--record rewrites the baselines)\n\
+                 verify [args…]    run tools/verify.sh (the `targo --unverified verify` alias)",
                 gate::verb_names().join("|")
             );
             ExitCode::FAILURE
@@ -69,26 +68,18 @@ fn main() -> ExitCode {
 
 /// Dispatch to `tools/verify.sh`, forwarding every argument verbatim.
 ///
-/// This exists ONLY because a cargo alias can expand to a cargo subcommand and
-/// nothing else, so the repo's one gate needs a Rust hop to become a first-class
-/// verb. It deliberately implements no policy: no default flags, no argument
-/// rewriting, no "helpful" mode selection. Everything the gate means lives in
-/// `tools/verify.sh`, and a second place that could disagree with it would
-/// reintroduce exactly the ambiguity that script's header exists to remove.
+/// It exists only because a cargo alias can expand to nothing but a cargo
+/// subcommand, and it holds no policy: everything the gate means lives in
+/// `tools/verify.sh`.
 ///
-/// Fail-closed in both directions that matter:
-///   * a missing / unrunnable `tools/verify.sh` is a FAILURE, never a silent
-///     success — `targo --unverified verify` must not be able to report "fine" without the
-///     gate having run;
-///   * a non-zero child status stays non-zero. A status that is non-zero but
-///     not representable as a non-zero `u8` (a signal death, or an exit code
-///     whose low byte is 0) maps to 1 rather than truncating to 0.
+/// Fail-closed: a missing or unrunnable script is a FAILURE, and a non-zero
+/// status stays non-zero (a signal death, or a code whose low byte is 0, maps
+/// to 1 rather than truncating to 0).
 fn verify(args: &[String]) -> ExitCode {
     let script = workspace_root().join("tools").join("verify.sh");
     if !script.is_file() {
         eprintln!(
-            "xtask verify: THE GATE IS MISSING — {} does not exist. Nothing was \
-             verified; this is a failure, not a pass.",
+            "xtask verify: FAILED — {} missing; nothing verified",
             script.display()
         );
         return ExitCode::FAILURE;
@@ -97,7 +88,7 @@ fn verify(args: &[String]) -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "xtask verify: could not execute {}: {e}. Nothing was verified.",
+                "xtask verify: FAILED — could not run {}: {e}; nothing verified",
                 script.display()
             );
             return ExitCode::FAILURE;
@@ -105,14 +96,12 @@ fn verify(args: &[String]) -> ExitCode {
     };
     match status.code() {
         Some(0) => ExitCode::SUCCESS,
-        // Preserve the gate's own exit code where it fits; never let a non-zero
-        // status become 0 through a `as u8` truncation.
+        // Keep the gate's own code where it fits; never truncate non-zero to 0.
         Some(code) => match u8::try_from(code) {
             Ok(0) => ExitCode::FAILURE,
             Ok(byte) => ExitCode::from(byte),
             Err(_) => ExitCode::FAILURE,
         },
-        // Killed by a signal: no exit code at all, and emphatically not a pass.
         None => {
             eprintln!("xtask verify: {} was killed by a signal", script.display());
             ExitCode::FAILURE
@@ -124,13 +113,10 @@ fn verify(args: &[String]) -> ExitCode {
 // Workspace layout
 // ---------------------------------------------------------------------------
 
-/// The workspace root (the dir that holds `crates/` and `target/`). `xtask`'s
-/// manifest dir is `<root>/crates/xtask`, so the root is two levels up.
+/// The workspace root: two levels above `<root>/crates/xtask`.
 pub(crate) fn workspace_root() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // `<root>/crates/xtask` -> up two -> `<root>`. Handle the (type-reachable but
-    // practically-impossible) shallow-path case without panicking: fall back to the
-    // manifest dir itself rather than `.expect()`, so the function is panic-free.
+    // Panic-free: a too-shallow path falls back to the manifest dir.
     match manifest.parent().and_then(Path::parent) {
         Some(root) => root.to_path_buf(),
         None => manifest.to_path_buf(),

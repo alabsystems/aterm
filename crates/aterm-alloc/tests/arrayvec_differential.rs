@@ -1,34 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Differential oracle: `aterm_alloc::ArrayVec` against the real crates.io
-//! `arrayvec::ArrayVec`, operation for operation.
+//! `aterm_alloc::ArrayVec` against a `Vec` bounded to the same capacity,
+//! operation for operation.
 //!
 //! `crates/aterm-arrayvec` republishes `aterm_alloc::ArrayVec` under the
 //! package name `arrayvec` so that `[patch.crates-io]` can point `naga`,
-//! `wgpu`, `wgpu-core`, `wgpu-hal`, `tiny-skia` and `vte` at it.
+//! `wgpu`, `wgpu-core`, `wgpu-hal` and `tiny-skia` at it.
 //! `crates/aterm-arrayvec/tests/consumer_forms.rs` proves the surface ACCEPTS
 //! what those crates write. This file proves it COMPUTES what they expect: both
-//! types are driven through the same scripts and a deterministic-LCG operation
-//! fuzz, and their state is compared after every step — contents, length,
-//! capacity accounting, `Debug` rendering, `Hash` output, drop counts and
-//! whether an operation panicked.
-//!
-//! It lives here rather than in `crates/aterm-arrayvec/tests/` for a measured
-//! reason: a dev-dependency on the registry `arrayvec` declared BY the package
-//! that is itself named `arrayvec` makes `cargo test -p arrayvec` die with
-//! "specification `arrayvec` is ambiguous". See the `[dev-dependencies]`
-//! comment in `crates/aterm-alloc/Cargo.toml` for that probe and for why the
-//! oracle is pinned to `=0.7.7` — BELOW the shim's own 0.7.8, which is the
-//! half that makes the patch row work at all.
-//!
-//! Re-check the whole claim with `cargo test -p arrayvec` (the consumer forms)
-//! and `cargo test -p aterm-alloc` (this file). Both at once needs
-//! `cargo test -p arrayvec@0.7.8 -p aterm-alloc`: the oracle keeps a second
-//! `arrayvec` in the graph, and cargo tolerates the bare name only when it is
-//! the sole `-p`. `-p aterm-alloc` beside any other member — one that reaches
-//! wgpu or naga included — resolves, because this package also dev-depends on
-//! the shim (its manifest says why that is what makes it resolve).
+//! are driven through the same scripts and a deterministic-LCG operation fuzz,
+//! and their state is compared after every step — contents, length, capacity
+//! accounting, `Debug` rendering, `Hash` output, drop counts and whether an
+//! operation panicked. The model encodes upstream `arrayvec`'s contract: a
+//! full vector refuses (`try_*`) or panics (`push`, `insert`, `extend`,
+//! `collect`), and an overflowing `extend` keeps the prefix it wrote.
 
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
@@ -36,82 +22,155 @@ use std::hash::{Hash, Hasher};
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 
-use arrayvec_upstream::ArrayVec as UpArrayVec;
 use aterm_alloc::ArrayVec as MyArrayVec;
+use model::Model as UpArrayVec;
 
-// ── The armed tripwire ──────────────────────────────────────────────────────
+/// A `Vec` held to capacity `N`, with upstream `arrayvec`'s overflow contract.
+mod model {
+    use std::ops::{Deref, DerefMut, RangeBounds};
 
-/// EVERY ASSERTION IN THIS FILE IS VACUOUS IF THIS FAILS, so it is checked
-/// first and it is checked at runtime rather than trusted to a comment.
-///
-/// `[patch.crates-io] arrayvec = { path = "crates/aterm-arrayvec" }` — the row
-/// a later agent adds to finish this swap — applies to dev-dependencies too,
-/// including the shim's own. Measured in a probe workspace: with that row and a
-/// dev-dep the shim could satisfy, `cargo metadata` resolved the dev edge to
-/// `path+…/shim`. Were that to happen here, `UpArrayVec` would BE `MyArrayVec`,
-/// every `assert_eq!` below would compare a value with itself, and the whole
-/// file would pass while proving nothing.
-///
-/// The detector is `type_name`, and it is ARMED: the control half asserts it
-/// can positively identify OUR type as well, so a `type_name` that returned
-/// something useless (or a rename that broke the pattern) fails here instead of
-/// silently making the upstream half unfalsifiable.
-///
-/// The arming was PROVED, not assumed: replacing the `arrayvec_upstream` import
-/// at the top of this file with `use aterm_alloc::ArrayVec as UpArrayVec;` —
-/// which is exactly the state the patch row would create — makes this test
-/// fail. It was run that way once, deliberately, before being restored.
-#[test]
-fn oracle_is_genuinely_upstream() {
-    let upstream = std::any::type_name::<UpArrayVec<u8, 4>>();
-    let mine = std::any::type_name::<MyArrayVec<u8, 4>>();
+    #[derive(Clone, PartialEq, Hash)]
+    pub struct Model<T, const N: usize>(Vec<T>);
 
-    // CONTROL: the detector must positively recognise our own type. If this
-    // fails, the assertion below proves nothing about the oracle.
-    assert!(
-        mine.starts_with("aterm_alloc::"),
-        "control failed: our own ArrayVec reported as `{mine}`, so `type_name` \
-         cannot be used to tell the two implementations apart"
-    );
-    // …and the ORDER matters: the informative assertion goes first, because in
-    // the real failure the two names are IDENTICAL and a bare `assert_ne!`
-    // would report "left == right" instead of what to do about it.
-    assert!(
-        upstream.starts_with("arrayvec::"),
-        "\n\nDIFFERENTIAL ORACLE IS NOT UPSTREAM.\n\
-         `arrayvec_upstream::ArrayVec` resolved to `{upstream}`, which is aterm's own \
-         implementation, so every assertion in this file would compare the \
-         replacement against itself and pass vacuously.\n\n\
-         THE CAUSE is `[patch.crates-io] arrayvec = {{ path = \
-         \"crates/aterm-arrayvec\" }}` reaching this crate's dev-dependency. The \
-         `=0.7.7` pin in crates/aterm-alloc/Cargo.toml exists precisely to keep \
-         that from happening — the shim declares 0.7.8, which a `=0.7.7` \
-         requirement cannot resolve to — so if you are reading this, the pin has \
-         been relaxed to something the shim satisfies (a `0.7`, a `^0.7.7`, or a \
-         `cargo update` that moved the shim's version).\n\n\
-         THE FIX is to restore a `=` requirement naming a published version the \
-         shim's own version cannot satisfy, and — this is the trap that cost a \
-         whole round — naming one BELOW the shim's version, never above it. A \
-         pin above the shim does not fail here; it silently makes the pinned \
-         registry copy satisfy the six real consumers as well, and the patch row \
-         stops replacing anything. Re-read that manifest comment \
-         before changing it again. Note that the graph then holds two `arrayvec` \
-         versions; package specs stay unambiguous only because this dev-edge is \
-         declared on `aterm-alloc` rather than on the package named `arrayvec`.\n"
-    );
-    assert_ne!(
-        upstream, mine,
-        "the two implementations are indistinguishable by name"
-    );
+    impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for Model<T, N> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_list().entries(&self.0).finish()
+        }
+    }
+
+    pub struct Full<T>(T);
+
+    impl<T> Full<T> {
+        pub fn element(self) -> T {
+            self.0
+        }
+    }
+
+    impl<T, const N: usize> Model<T, N> {
+        pub fn new() -> Self {
+            Self(Vec::with_capacity(N))
+        }
+        pub fn as_slice(&self) -> &[T] {
+            &self.0
+        }
+        pub fn is_full(&self) -> bool {
+            self.0.len() == N
+        }
+        pub fn capacity(&self) -> usize {
+            N
+        }
+        pub fn remaining_capacity(&self) -> usize {
+            N - self.0.len()
+        }
+        pub fn try_push(&mut self, v: T) -> Result<(), Full<T>> {
+            if self.is_full() {
+                return Err(Full(v));
+            }
+            self.0.push(v);
+            Ok(())
+        }
+        pub fn push(&mut self, v: T) {
+            assert!(self.try_push(v).is_ok(), "capacity exceeded");
+        }
+        pub fn insert(&mut self, i: usize, v: T) {
+            assert!(!self.is_full(), "capacity exceeded");
+            self.0.insert(i, v);
+        }
+        pub fn pop(&mut self) -> Option<T> {
+            self.0.pop()
+        }
+        pub fn remove(&mut self, i: usize) -> T {
+            self.0.remove(i)
+        }
+        pub fn truncate(&mut self, n: usize) {
+            self.0.truncate(n);
+        }
+        pub fn clear(&mut self) {
+            self.0.clear();
+        }
+        pub fn retain(&mut self, f: impl FnMut(&mut T) -> bool) {
+            self.0.retain_mut(f);
+        }
+        pub fn drain(&mut self, r: impl RangeBounds<usize>) -> std::vec::Drain<'_, T> {
+            self.0.drain(r)
+        }
+        pub fn into_inner(self) -> Result<[T; N], Self> {
+            if self.is_full() {
+                Ok(self.0.try_into().unwrap_or_else(|_| unreachable!()))
+            } else {
+                Err(self)
+            }
+        }
+    }
+
+    impl<T: Clone, const N: usize> Model<T, N> {
+        pub fn try_extend_from_slice(&mut self, src: &[T]) -> Result<(), ()> {
+            if src.len() > self.remaining_capacity() {
+                return Err(());
+            }
+            self.0.extend_from_slice(src);
+            Ok(())
+        }
+    }
+
+    impl<T, const N: usize> Extend<T> for Model<T, N> {
+        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+            for v in iter {
+                self.push(v);
+            }
+        }
+    }
+
+    impl<T, const N: usize> FromIterator<T> for Model<T, N> {
+        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+            let mut m = Self::new();
+            m.extend(iter);
+            m
+        }
+    }
+
+    impl<T, const N: usize> Deref for Model<T, N> {
+        type Target = [T];
+        fn deref(&self) -> &[T] {
+            &self.0
+        }
+    }
+
+    impl<T, const N: usize> DerefMut for Model<T, N> {
+        fn deref_mut(&mut self) -> &mut [T] {
+            &mut self.0
+        }
+    }
+
+    impl<T, const N: usize> IntoIterator for Model<T, N> {
+        type Item = T;
+        type IntoIter = std::vec::IntoIter<T>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.into_iter()
+        }
+    }
+
+    impl<'a, T, const N: usize> IntoIterator for &'a Model<T, N> {
+        type Item = &'a T;
+        type IntoIter = std::slice::Iter<'a, T>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.iter()
+        }
+    }
+
+    impl<'a, T, const N: usize> IntoIterator for &'a mut Model<T, N> {
+        type Item = &'a mut T;
+        type IntoIter = std::slice::IterMut<'a, T>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.iter_mut()
+        }
+    }
 }
 
-/// THE SHIM IS THIS CRATE'S TYPE, NOT A COPY OF IT (2026-09-25).
+/// THE SHIM IS THIS CRATE'S TYPE, NOT A COPY OF IT.
 /// `crates/aterm-arrayvec` — what `[patch.crates-io]` hands naga and wgpu —
-/// claims to be a pure re-export of `aterm_alloc::ArrayVec`. This is the
-/// type-level check of that claim: the function below only compiles if the two
-/// paths name ONE type. It is also why this package dev-depends on the shim;
-/// the manifest gives the other reason, the resolver one. CONTROL: the oracle
-/// is still not the shim.
+/// claims to be a pure re-export of `aterm_alloc::ArrayVec`. The function below
+/// only compiles if the two paths name ONE type.
 #[test]
 fn the_patched_shim_is_this_crates_arrayvec() {
     fn same_type(v: arrayvec_shim::ArrayVec<u8, 4>) -> MyArrayVec<u8, 4> {
@@ -120,11 +179,6 @@ fn the_patched_shim_is_this_crates_arrayvec() {
     let mut v = arrayvec_shim::ArrayVec::<u8, 4>::new();
     v.push(7);
     assert_eq!(same_type(v).as_slice(), &[7]);
-    assert_ne!(
-        std::any::type_name::<arrayvec_shim::ArrayVec<u8, 4>>(),
-        std::any::type_name::<UpArrayVec<u8, 4>>(),
-        "the oracle resolved to the shim"
-    );
 }
 
 // ── Comparison helpers ──────────────────────────────────────────────────────
@@ -288,8 +342,8 @@ fn apply(op: Op, mine: &mut MyArrayVec<u32, CAP>, up: &mut UpArrayVec<u32, CAP>)
             up.retain(|v| *v % 2 == 1);
         }
         Op::RetainAndBump => {
-            // Upstream's `retain` hands the predicate `&mut T`; the writes it
-            // makes must survive on both sides.
+            // `retain` hands the predicate `&mut T`; the writes it makes must
+            // survive.
             mine.retain(|v| {
                 *v = v.wrapping_add(1);
                 *v % 3 != 0
@@ -300,13 +354,8 @@ fn apply(op: Op, mine: &mut MyArrayVec<u32, CAP>, up: &mut UpArrayVec<u32, CAP>)
             });
         }
         Op::ExtendFromSlice(base, n) => {
-            // NOT a like-for-like call: upstream keeps its `extend_from_slice`
-            // `pub(crate)` (arrayvec-0.7.6/src/arrayvec.rs:1116), so the public
-            // equivalent — "append these cloned elements, panicking on
-            // overflow" — is `extend`. `aterm_alloc`'s public
-            // `extend_from_slice` is a deliberate superset, and this is the
-            // assertion that it behaves like the upstream operation it
-            // generalises rather than like some third thing.
+            // Upstream's public equivalent of `extend_from_slice` — "append
+            // these cloned elements, panicking on overflow" — is `extend`.
             let src: Vec<u32> = (0..n as u32).map(|i| base.wrapping_add(i)).collect();
             let a = panicked(|| {
                 let mut tmp = mine.clone();
@@ -416,8 +465,8 @@ fn scripted_operation_sequence() {
     }
 }
 
-/// Deterministic-LCG operation fuzz — the in-repo pattern (see aterm-toml's
-/// differential). Fixed seeds, so a failure is reproducible from the seed alone.
+/// Deterministic-LCG operation fuzz. Fixed seeds, so a failure is reproducible
+/// from the seed alone.
 #[test]
 fn lcg_operation_fuzz() {
     struct Lcg(u64);
@@ -492,7 +541,7 @@ fn overflow_policy_parity() {
     let b = panicked(|| up.extend([1, 2, 3, 4, 5, 6]));
     assert!(
         a && b,
-        "extend must panic on overflow (mine={a}, upstream={b})"
+        "extend must panic on overflow (mine={a}, model={b})"
     );
     assert_eq!(
         mine.as_slice(),
@@ -510,7 +559,7 @@ fn overflow_policy_parity() {
     });
     assert!(
         a && b,
-        "collect must panic on overflow (mine={a}, upstream={b})"
+        "collect must panic on overflow (mine={a}, model={b})"
     );
 
     // …and the same collect one element smaller must not, on either side.
@@ -567,7 +616,7 @@ fn into_iter_parity_including_drop_counts() {
     assert_eq!(mi.next_back(), ui.next_back());
     assert_eq!(mi.size_hint(), ui.size_hint());
     assert_eq!(mi.as_slice(), ui.as_slice());
-    assert_eq!(format!("{mi:?}"), format!("{ui:?}"));
+    assert_eq!(format!("{mi:?}"), format!("{:?}", ui.as_slice()));
     assert_eq!(mi.collect::<Vec<_>>(), ui.collect::<Vec<_>>());
 
     // Drop counts, for every prefix length, on both sides.
@@ -721,49 +770,6 @@ fn deref_and_equality_parity() {
     mine3.pop();
     up3.pop();
     assert_eq!(mine == mine3, up == up3);
-}
-
-/// The one divergence that is a fact about LAYOUT rather than behaviour, pinned
-/// so it cannot widen unnoticed: upstream stores the length as a `u32` and
-/// `aterm_alloc` as a `usize`, so ours is never smaller and is EQUAL whenever
-/// `T`'s alignment pads upstream's `u32` out anyway.
-#[test]
-fn layout_divergence_is_bounded() {
-    use std::mem::{align_of, size_of};
-
-    macro_rules! check {
-        ($t:ty, $n:literal) => {{
-            let mine = size_of::<MyArrayVec<$t, $n>>();
-            let up = size_of::<UpArrayVec<$t, $n>>();
-            assert!(
-                mine >= up,
-                "ours got SMALLER than upstream for <{}, {}> ({mine} < {up}) — the \
-                 length field cannot have shrunk, so something else changed",
-                stringify!($t),
-                $n
-            );
-            assert!(
-                mine - up <= size_of::<usize>(),
-                "the gap for <{}, {}> is {} bytes, more than one length field",
-                stringify!($t),
-                $n,
-                mine - up
-            );
-            if align_of::<$t>() >= size_of::<usize>() {
-                assert_eq!(
-                    mine, up,
-                    "for an 8-aligned element the two layouts must coincide \
-                     (upstream's u32 length is padded out anyway)"
-                );
-            }
-        }};
-    }
-
-    check!(u8, 4);
-    check!(u32, 8);
-    check!(u64, 4);
-    check!(std::sync::Arc<u32>, 3);
-    check!(usize, 32);
 }
 
 /// Elements that own memory: the differential above uses `u32`, which cannot

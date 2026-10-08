@@ -1,42 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE SOUND-CUE POLICY** — how the cues the cursor family and the word
-//! engine record become synth events: the trail-sound gain law (REAL focus ×
-//! the music master × volume), the sing-along riff's and the curse bonk's
-//! laws beside it, and the two drains that map cues onto
+//! The sound-cue policy: how the cues the cursor family and the word engine
+//! record become synth events. The trail-sound gain law (real focus × the
+//! music master × volume), the sing-along riff's and the curse bonk's laws
+//! beside it, and the two drains that map cues onto
 //! [`crate::trail_sound::SoundEvent`]s with the policy stamped on each.
 //!
-//! Engine-side since the host-boundary Phase 4 move of 2026-09-27
-//! (`docs/DESIGN-host-boundary-2026-08-30.md` §3.1, "typing sound cues"):
-//! the policy is a pure function of the host's knobs and the engines' cues,
-//! so every host shares ONE author for it. The SINK stays the host's — the
-//! native app's `TrailAudio` (AudioToolbox) queue; a web page drops the
-//! events — and so does the host input clock each event is stamped with.
+//! The policy is a pure function of the host's knobs and the engines' cues,
+//! so every host shares it (`docs/DESIGN-host-boundary-2026-08-30.md` §3.1).
+//! The sink stays the host's (the native app's `TrailAudio` queue; a web
+//! page drops the events), as does the input clock each event is stamped with.
 
-/// Resolve trail-audio policy from REAL window focus, never the synthetic
+/// Resolve trail-audio policy from real window focus, never the synthetic
 /// `motion_focus` bit that recordings use to keep visual effects moving. A
 /// background recording may animate; it must never make the Mac speak.
 pub fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Option<f32> {
     (raw_focused && configured && volume > 0.0).then_some(volume)
 }
 
-/// Resolve SING-ALONG RIFF audio policy: the trail-sound law verbatim
-/// ([`trail_sound_gain`]) AND the riff's own switch.
+/// Resolve sing-along riff audio policy: the trail-sound law
+/// ([`trail_sound_gain`]) and the riff's own switch.
 ///
-/// `trail_sound_riff` (owner ask, Sound menu audit; default ON) exists because
-/// the held-key riff is the LOUDEST voice the engine emits and until now the
-/// only ways to quiet it were the master `trail_sounds` (which also kills the
-/// keystroke palette the owner wants to keep) or `trail_sound_volume` (which
-/// turns the keystrokes down with it). It is a SOUND gate only — the
-/// celebration's ribbon saturation, star shower, dancing cat and singing face
-/// are a MOTION contract and keep running, which is why this resolves a GAIN
-/// rather than suppressing the celebration.
-///
-/// ONE author for that law across BOTH riff seams (the single-pane present and
-/// the split-pane compose) — the same reason `trail_sound_gain` and
-/// `bonk_sound_gain` are functions: a split pane must never sing a song a
-/// single pane suppresses.
+/// `trail_sound_riff` (default on) quiets the held-key riff, the loudest
+/// voice the engine emits, without muting the keystroke palette. It gates
+/// sound only: the celebration's ribbon saturation, star shower, dancing cat
+/// and singing face are a motion contract and keep running, so this resolves
+/// a gain rather than suppressing the celebration. Both riff seams (the
+/// single-pane present and the split-pane compose) use it, so a split pane
+/// never sings a song a single pane suppresses.
 pub fn sing_riff_gain(
     raw_focused: bool,
     trail_sounds: bool,
@@ -46,27 +38,22 @@ pub fn sing_riff_gain(
     trail_sound_gain(raw_focused, trail_sounds && riff, volume)
 }
 
-/// Whether the person asked for any aurora at all: the RESOLVED brightness
+/// Whether the person asked for any aurora at all: the resolved brightness
 /// knob (`cursor_trail_intensity`, or a style pack that resolves to zero),
-/// read BEFORE any policy fold. Zero is their explicit off (binding decision
-/// C) — it silences the key seam, and it is what the verb must call
-/// `trail-off` rather than `engine-silent`.
+/// read before any policy fold. Zero is their explicit off: it silences the
+/// key seam, and the verb calls it `trail-off` rather than `engine-silent`.
 pub fn user_lit(resolved: &crate::cursor_glow::GlowConfig) -> bool {
     resolved.intensity > 0.0
 }
 
-/// THE HOST'S SPLIT of one resolved config into its light half and its audio
-/// half, for one window's tick — the ONE place a host's cursor tick decides both.
+/// The host's split of one resolved config into its light half and its
+/// audio half for one window's tick.
 ///
 /// The light takes both motion policies (the accessibility stage's amplitude
-/// and the load-shed envelope); the key seam takes NEITHER: `audible` is
+/// and the load-shed envelope); the key seam takes neither: `audible` is
 /// whose window the key landed in and whether the person asked for any
-/// aurora at all. Before 2026-09-22 a shed frame or a `Reduce Motion`
-/// session zeroed `intensity`, the engine read that as "dark ⇒ silent", and
-/// every keystroke went quiet while `aterm ctl tone` still said `audio=live`.
-///
-/// A function rather than three inline lines so the `TrailSoundSeam`
-/// conformance drives THIS fold instead of a transcription of it.
+/// aurora at all, so a shed frame or Reduce Motion never silences keystrokes.
+/// The `TrailSoundSeam` conformance drives this function directly.
 pub fn fold_window_audibility(
     cfg: &mut crate::cursor_glow::GlowConfig,
     motion_amplitude: f32,
@@ -84,11 +71,10 @@ pub fn fold_window_audibility(
 mod sing_riff_gain_tests {
     use super::sing_riff_gain;
 
-    /// The riff's own switch is INDEPENDENT of the trail-sound master: with the
-    /// master on, the window focused and the volume up — the shipped default
-    /// posture, asserted here as this test's own precondition so the `None`
-    /// cases below cannot pass vacuously — flipping `trail_sound_riff` off is
-    /// the single change that silences the song.
+    /// The riff's own switch is independent of the trail-sound master: with
+    /// the master on, the window focused and the volume up (asserted as a
+    /// precondition so the `None` cases cannot pass vacuously), flipping
+    /// `trail_sound_riff` off is the single change that silences the song.
     #[test]
     fn the_riff_switch_alone_silences_the_song_under_shipped_defaults() {
         assert_eq!(
@@ -103,9 +89,9 @@ mod sing_riff_gain_tests {
         );
     }
 
-    /// Every OTHER term of the trail-sound law still applies to the riff, so
-    /// the new switch cannot be read as a bypass. Each case flips exactly one
-    /// term away from the singing precondition above.
+    /// Every other term of the trail-sound law still applies to the riff, so
+    /// the switch is not a bypass. Each case flips exactly one term away from
+    /// the singing precondition.
     #[test]
     fn the_riff_stays_subordinate_to_focus_master_and_volume() {
         assert_eq!(sing_riff_gain(false, true, true, 0.4), None, "raw focus");
@@ -114,9 +100,8 @@ mod sing_riff_gain_tests {
     }
 }
 
-/// The per-event trail-audio POLICY the host resolves once per drain and
-/// stamps on every emitted [`SoundEvent`] — the knobs ride together so the
-/// synth stays policy-free.
+/// The per-event trail-audio policy the host resolves once per drain and
+/// stamps on every emitted [`SoundEvent`], so the synth stays policy-free.
 pub struct TrailSoundPolicy {
     /// The `trail_sound_style` override (default `Style` = follow the visual
     /// trail style).
@@ -124,26 +109,19 @@ pub struct TrailSoundPolicy {
     /// Resolved gain (`None` = muted: focus/knob/volume law — see
     /// [`trail_sound_gain`]).
     pub gain: Option<f32>,
-    /// The window's cached tone-of-typing verdict (`tone_infer`). The host
-    /// resolves it (knob off ⇒ the neutral `Technical` identity) exactly
-    /// like it resolves gain.
+    /// The window's cached tone-of-typing verdict (`tone_infer`), resolved
+    /// by the host like gain (knob off ⇒ the neutral `Technical` identity).
     pub tone: crate::tone::Tone,
-    /// The `trail_sound_bed` knob (default ON since the owner's 2026-09-09
-    /// ruling): with it off no event ever feeds the synth's bed layer, so
-    /// the ambient texture contributes exactly zero samples while the notes
-    /// keep playing.
+    /// The `trail_sound_bed` knob (default on): off, no event feeds the
+    /// synth's bed layer, so the ambient texture contributes zero samples
+    /// while the notes keep playing (owner, 2026-09-09).
     pub bed: bool,
 }
 
-/// Map ONE drained cue onto its synth event: the pan normalization, the gesture
-/// namespacing, and the policy stamp.
-///
-/// Extracted so the KEY-TIME typing click (`app_input`, which hands its cue
-/// straight to the synth instead of waiting for the next drain) is built by the
-/// exact same code as the frame drain. Two constructions of "a trail cue as a
-/// sound event" would drift — a differently-normalized pan or a dropped `bed`
-/// flag would make the same keystroke sound like two different instruments
-/// depending on which seam carried it.
+/// Map one drained cue onto its synth event: the pan normalization, the
+/// gesture namespacing, and the policy stamp. The key-time typing click
+/// (`app_input`) and the frame drain both build events here, so the same
+/// keystroke sounds the same whichever seam carries it.
 pub fn trail_sound_event(
     cue: &crate::cursor_glow::SoundCue,
     style: crate::cursor_glow::GlowStyle,
@@ -166,9 +144,9 @@ pub fn trail_sound_event(
         gain,
         tone: policy.tone,
         bed: policy.bed,
-        // Rides the CUE, so the key-time seam and the frame drain agree by
-        // construction: only `cue_keystroke_shifted` can set it, and every
-        // echo-born cue carries `false`.
+        // Rides the cue, so the key-time seam and the frame drain agree:
+        // only `cue_keystroke_shifted` sets it; every echo-born cue carries
+        // `false`.
         shifted: cue.shifted,
     }
 }
@@ -195,31 +173,17 @@ pub fn drain_trail_sound_cues(
     emitted
 }
 
-/// Resolve curse-BONK policy — the MASTER music switch (`trail_sounds`), the
-/// profanity `bonk` knob, RAW window focus (the trail-sound law verbatim: a
-/// background recording may animate, it must never make the Mac speak), the
-/// motion policy (a Reduced window pushes no events, matching the glow
-/// engine's intensity-0 silence), and the shared `trail_sound_volume`.
-/// Per-class/master SPARKLE gates need no re-check: the engine records cues
-/// only for words it is actually decorating.
+/// Resolve curse-bonk policy: the music master (`trail_sounds`), the
+/// profanity `bonk` knob, raw window focus (a background recording may
+/// animate, never speak), the motion policy (a Reduced window pushes no
+/// events, matching the glow engine's intensity-0 silence), and the shared
+/// `trail_sound_volume`. Per-class and master sparkle gates need no
+/// re-check: the engine records cues only for words it decorates.
 ///
-/// THE MASTER TERM IS THE FIX FOR A LIE THE UI WAS TELLING. The Sound box's
-/// consequence copy (`prefs::group_footnote`, "Sound") promises that *"Music
-/// effects in Top Settings is the master switch for the synth voices"*, and
-/// the bonk IS a synth voice — it is pushed into the same
-/// `TrailAudio` host host, as a
-/// [`crate::trail_sound::WordGesture::Bonk`], and it is already scaled
-/// by the same `trail_sound_volume`. Until this parameter existed the function
-/// took no `trail_sounds` input at all and both render paths passed only the
-/// profanity toggle, so muting Music effects and typing profanity still bonked
-/// — the one voice that escaped the switch the menu names. The honest law is
-/// the one the UI already promises: the master gates EVERY synth voice, and
-/// the terminal bell (an OS alert sound emitted from `lib.rs::on_bell`, which
-/// reads neither key) remains the single stated exception.
-///
-/// Delegating the focus/master/volume terms to [`trail_sound_gain`] keeps that
-/// law authored ONCE — the same reason [`sing_riff_gain`] delegates — so the
-/// bonk cannot drift away from the riff and the keystroke palette again.
+/// The bonk is a synth voice, so the master gates it as the Sound box's
+/// footnote (`prefs::group_footnote`, "Sound") promises; the terminal bell
+/// (`lib.rs::on_bell`) is the one stated exception. The focus, master and
+/// volume terms delegate to [`trail_sound_gain`], as [`sing_riff_gain`] does.
 pub fn bonk_sound_gain(
     raw_focused: bool,
     trail_sounds: bool,
@@ -235,12 +199,7 @@ pub fn bonk_sound_gain(
     trail_sound_gain(raw_focused, trail_sounds && enabled, volume)
 }
 
-/// Drain every curse-BONK cue the word-decoration tick recorded and emit the
-/// enabled ones as namespaced [`WordGesture::Bonk`] gestures — the
-/// sparkle-words twin of [`drain_trail_sound_cues`], one seam for glass and
-/// capture alike so a disabled knob never leaves a backlog. `detonations`
-/// separately gates the on-screen [`CurseCueKind::Detonated`] kind (typed
-/// provenance stays typed-only unless the user opted the blast edge in).
+/// What [`drain_curse_bonk_cues`] reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CurseDrain {
     /// Bonk events handed to the sink this drain (0 while muted).
@@ -251,6 +210,11 @@ pub struct CurseDrain {
     pub wince_hits: u8,
 }
 
+/// Drain every curse-bonk cue the word-decoration tick recorded and emit the
+/// enabled ones as namespaced [`crate::trail_sound::WordGesture::Bonk`]
+/// gestures; the sparkle-words twin of [`drain_trail_sound_cues`], so a
+/// disabled knob never leaves a backlog. `detonations` gates the
+/// [`crate::word_decorations::CurseCueKind::Detonated`] kind.
 pub fn drain_curse_bonk_cues(
     decos: &mut crate::word_decorations::WordDecorations,
     style: crate::cursor_glow::GlowStyle,
@@ -282,9 +246,9 @@ pub fn drain_curse_bonk_cues(
             continue;
         }
         emit(crate::trail_sound::SoundEvent {
-            // The active trail style keys the bonk's clash REGISTER (its
-            // palette anchor) so the wrong note is wrong against the melody
-            // actually playing; the gesture itself is style-agnostic.
+            // The active trail style keys the bonk's clash register (its
+            // palette anchor), so the wrong note is wrong against the melody
+            // playing; the gesture itself is style-agnostic.
             style,
             voice,
             kind: crate::trail_sound::SoundGesture::Words(crate::trail_sound::WordGesture::Bonk),
@@ -297,13 +261,11 @@ pub fn drain_curse_bonk_cues(
             heat: 0.0,
             hue: 0.0,
             gain,
-            // The bonk is tone-BLIND by contract (the wrong note is wrong in
-            // every mood, and its path is byte-pinned): always the neutral
-            // identity, never the window's inferred tone.
+            // The bonk is tone-blind (the wrong note is wrong in every mood,
+            // and its path is byte-pinned): always the neutral identity.
             tone: crate::tone::Tone::Technical,
-            // Words gestures never feed the bed (punctuation must not swell
-            // the ambience) — carried OFF so the event states the policy it
-            // actually gets, independent of the `trail_sound_bed` knob.
+            // Word gestures never feed the bed (punctuation must not swell
+            // the ambience); carried off so the event states the policy it gets.
             bed: false,
             shifted: false, // a bonk is punctuation over the text, not a typed glyph
         });
@@ -316,11 +278,11 @@ pub fn drain_curse_bonk_cues(
 mod bonk_gain_tests {
     use super::bonk_sound_gain;
 
-    /// The policy resolver: the MASTER music switch, raw focus, the bonk knob,
-    /// the reduced-motion demotion, and the shared volume each silence
+    /// The policy resolver: the music master, raw focus, the bonk knob, the
+    /// reduced-motion demotion and the shared volume each silence
     /// independently; the survivor passes the volume through as the event
-    /// gain. Every `None` case below flips exactly ONE term away from the
-    /// audible precondition, so none of them can pass vacuously.
+    /// gain. Every `None` case flips exactly one term away from the audible
+    /// precondition.
     #[test]
     fn bonk_gain_policy_gates_master_focus_knob_motion_and_volume() {
         assert_eq!(
@@ -333,11 +295,8 @@ mod bonk_gain_tests {
             None,
             "raw focus"
         );
-        // THE MENU'S OWN PROMISE, as a law rather than as prose: *"Music effects in
-        // Top Settings is the master switch for the synth voices"*
-        // (`prefs::group_footnote`, "Sound"). `bonk_sound_gain` once had no master
-        // input at all, so the bonk was audible with Music effects off; the knob
-        // stays ON here so nothing ELSE can be what muted it.
+        // The master switch gates the bonk, as `prefs::group_footnote`
+        // ("Sound") promises; the bonk knob stays on so nothing else mutes it.
         assert_eq!(
             bonk_sound_gain(true, false, true, false, 0.4),
             None,

@@ -2,20 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kani proofs for scroll operations (scroll.rs).
-//!
-//! Verifies the documented REQUIRES/ENSURES contracts for scroll
-//! functions in `Grid`. Uses `Grid::kani_mock` and `Grid::kani_stub`
-//! with bounded dimensions to keep verification tractable.
-//!
-//! Part of #376 (terminal module proof coverage gap).
+//! Kani proofs for scroll operations (scroll.rs): the REQUIRES/ENSURES
+//! contracts of `Grid`'s scroll functions, on `Grid::kani_mock` and
+//! `Grid::kani_stub` with bounded dimensions.
 
 use super::*;
 use crate::Cell;
 
-// =============================================================================
 // scroll_display — display offset bounds
-// =============================================================================
 
 /// `scroll_display` keeps display_offset within scrollback bounds.
 ///
@@ -57,9 +51,7 @@ fn scroll_display_positive_no_scrollback() {
     );
 }
 
-// =============================================================================
 // scroll_to_top / scroll_to_bottom
-// =============================================================================
 
 /// `scroll_to_top` sets display_offset to scrollback_lines() regardless of prior scroll state.
 ///
@@ -129,9 +121,7 @@ fn scroll_top_bottom_roundtrip() {
     );
 }
 
-// =============================================================================
 // clamp_display_offset
-// =============================================================================
 
 /// `clamp_display_offset` ensures display_offset <= scrollback_lines().
 ///
@@ -153,20 +143,13 @@ fn clamp_display_offset_bounded() {
     );
 }
 
-// =============================================================================
 // scroll_to_absolute_row
-// =============================================================================
 
-/// `scroll_to_absolute_row` keeps display_offset within scrollback bounds for ANY
-/// absolute row, including rows that no longer exist in either direction — a target
-/// at or below the live top saturates to offset 0, one older than the oldest retained
-/// line clamps to the top of history.
-///
-/// This is the viewport mutator `Grid::resize_with_reflow_mode` calls to re-anchor a
-/// scrolled-back reader across a rows-only resize, where the anchor is captured under
-/// the OLD `visible_rows` and applied under the new one — so the demanded offset can
-/// legitimately exceed what the resized grid can give, and the clamp is load-bearing
-/// rather than defensive.
+/// `scroll_to_absolute_row` keeps display_offset within scrollback bounds for
+/// any absolute row: a target at or below the live top saturates to offset 0,
+/// one older than the oldest retained line clamps to the top of history. A
+/// rows-only resize re-anchors with an offset captured under the old
+/// `visible_rows`, so the clamp is load-bearing.
 ///
 /// ENSURES: display_offset <= scrollback_lines()
 #[kani::proof]
@@ -185,9 +168,7 @@ fn scroll_to_absolute_row_bounded() {
     );
 }
 
-// =============================================================================
 // set_scroll_region / reset_scroll_region
-// =============================================================================
 
 /// `set_scroll_region` with valid params sets the region correctly.
 /// With invalid params, resets to full screen.
@@ -247,9 +228,7 @@ fn reset_scroll_region_restores_full() {
     );
 }
 
-// =============================================================================
 // scroll_region_down — content shift within region
-// =============================================================================
 
 /// `scroll_region_down` with n=0 is a no-op (no damage) regardless of scroll region.
 // INTENTIONALLY_CONCRETE: tests zero/empty edge case (n=0)
@@ -293,9 +272,7 @@ fn scroll_region_down_marks_damage() {
     );
 }
 
-// =============================================================================
 // scroll_region_up — content shift within region
-// =============================================================================
 
 /// `scroll_region_up` with n=0 is a no-op regardless of scroll region.
 // INTENTIONALLY_CONCRETE: tests zero/empty edge case (n=0)
@@ -338,13 +315,10 @@ fn scroll_region_up_marks_damage() {
     );
 }
 
-// =============================================================================
 // scroll_up — ring buffer growth invariant
-// =============================================================================
 
-/// `scroll_up` maintains the ring buffer size invariant.
-///
-/// Uses kani_stub (not kani_mock) because scroll_up may add rows.
+/// `scroll_up` maintains the ring buffer size invariant (on kani_stub, since
+/// scroll_up may add rows).
 ///
 /// ENSURES: rows.len() <= visible_rows + max_scrollback
 #[kani::proof]
@@ -399,10 +373,10 @@ fn scroll_up_zero_noop() {
 // and symbolic `(top, bottom, n)`, every row slice present before the shift is
 // present exactly once after it — none lost, none aliased by two rows. The mock
 // rows borrow a local backing array, so no page store is involved and no
-// allocation can occur on this path at all. Its `trust-mc-driver` discharge is
-// not yet re-measured: this crate's build scripts stopped the managed bundle's
-// lane until `scripts/verify-kani-proofs.sh` gave host units a host sysroot
-// (2026-09-28; no repack is owed).
+// allocation can occur on this path at all. On trust-mc 20065 both build and
+// come back INCONCLUSIVE (measured 2026-09-30; unsupported constructs: slices of
+// references, `Cell` reads) — PROOF_CARRYING_PERFORMANCE.md A3; the script's
+// explicit lane runs them by name.
 
 /// `shift_visible_rows_up` permutes the ring's row slices.
 #[kani::proof]

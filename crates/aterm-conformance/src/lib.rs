@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Conformance + integration test harness, founded on the engine's **read API**.
+//! Conformance + integration test harness, built on the engine's read API.
 //!
-//! The whole point of aterm is reliable screen reading; this makes testing easy:
-//! a test is just **feed input → read the screen → assert**. The same machinery
-//! the introspection API exposes (`visible_content` / `row_text` / `cursor`) is
-//! the test oracle. When the frontend lands, the *same* feed→read→assert pattern
-//! extends to `read_image` (pixels) and the rendered UI chrome (search box,
-//! scrollbar) — see ATERM_DESIGN §6.5 (the self-proving harness).
+//! A test is feed input → read the screen → assert, using the same machinery
+//! the introspection API exposes (`visible_content` / `row_text` / `cursor`)
+//! as the oracle (ATERM_DESIGN §6.5, the self-proving harness).
 
 use aterm_core::grid::cell_flags::CellFlags;
 use aterm_core::terminal::Terminal;
@@ -71,7 +68,7 @@ impl Screen {
     ///
     /// Read-only accessor for per-cell attribute assertions (DECCARA/DECFRA/
     /// DECSERA rect-op tests). Mirrors the resolution path used by the GUI
-    /// control channel (`cell_attrs` in aterm-gui/src/control.rs): inline
+    /// control channel (`cell_attrs` in aterm-gui/src/control_query.rs): inline
     /// flags are returned directly; cells whose style is interned in the
     /// grid's `StyleTable` (`USES_STYLE_ID`) are rehydrated from the table —
     /// the same path `Terminal::render_row` uses for colors. Out-of-range or
@@ -81,11 +78,10 @@ impl Screen {
         let Some(cell) = grid.cell(r, c) else {
             return 0;
         };
-        // DEAD-BRANCH PROBE: nothing in production sets `USES_STYLE_ID` (every
-        // writer of the bit is test-gated) and the SGR path no longer interns a
-        // `StyleId` at all, so the rehydration below is unreachable here. The
-        // oracle keeps it for encoding completeness; the assert makes the
-        // conformance suite prove the premise instead of assuming it.
+        // Nothing in production sets `USES_STYLE_ID` (every writer is
+        // test-gated) and the SGR path interns no `StyleId`, so the
+        // rehydration below is unreachable; the assert makes the suite prove
+        // that premise.
         debug_assert!(
             !cell.uses_style_id(),
             "cell_flags_bits: a live cell carries USES_STYLE_ID, but nothing interns styles"
@@ -104,7 +100,7 @@ impl Screen {
     ///
     /// OSC 8 oracle: a URI is only observable here if it survived the
     /// scheme allowlist + length/control-char/BiDi guards in the OSC 8
-    /// handler AND a glyph was printed while the link was open (the URI
+    /// handler and a glyph was printed while the link was open (the URI
     /// is attached per-cell at write time). Rejected URIs leave no trace.
     pub fn hyperlink_at(&self, r: u16, c: u16) -> Option<String> {
         self.term.hyperlink_at(r, c).map(str::to_string)
@@ -132,7 +128,7 @@ impl Screen {
     /// `(col, ImageRef)` pairs in column order.
     ///
     /// The image observability oracle: an inline image (iTerm2 OSC 1337 `File=`
-    /// or a decoded sixel) lives in per-cell image extras, NOT in glyph cells,
+    /// or a decoded sixel) lives in per-cell image extras, not in glyph cells,
     /// so `row()`/`screen()` stay empty for it. This surfaces the same
     /// `ImageRef`s the renderer blits, exposing `ImageData.{format, bytes, cols,
     /// rows}` for placement + pixel assertions.

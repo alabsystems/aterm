@@ -1,47 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A TORN READ OF A FRAME THAT ALSO ERASES IS STILL NOT A CLEARED LINE**
-//! (2026-09-22). The owner's report is `torn_read_gaps.rs`'s: *"There is a
-//! rainbow trail gap in 0.89. I'm not sure what is causing it but it seems
-//! like some kind of back cursor movement bug."* The review round reached
-//! the same class through the back cursor movement the owner actually
-//! named — a Backspace, a ⌃W — and found the first cut did not close it.
+//! A torn read of a frame that also erases is still not a cleared line.
 //!
-//! A Backspace's repaint arrives in two reads with a present between them.
-//! The walk releases `boundary..end` as ONE part, and that part contains
-//! the cell of the glyph the key really erased. On the complete present the
-//! standing text is back exactly, but that one column stays blank — and the
-//! part's lift demanded that NO cell of it be under a blank, so the part was
-//! never lifted: every standing letter right of the boundary retracted while
-//! its glyph stood (38 cells dark 160 ms after the key), and the next keys
-//! landed past a dark stretch (a 29-cell hole for ~1 s, 85 frames with real
-//! 1024-byte reads under the spinner). A column still blank when the part is
-//! lifted is text that really went, and the walk that runs on that same
-//! sample names it on its own — which is exactly what it is for.
+//! A Backspace's repaint can arrive in two reads with a present between. The
+//! walk releases `boundary..end` as one part, which contains the cell of the
+//! glyph the key really erased; on the complete present the standing text is
+//! back but that column stays blank. The part is lifted anyway: a column still
+//! blank when lifted is text that really went, and the walk on that same
+//! sample names it on its own. Otherwise every standing letter right of the
+//! boundary would retract and the next keys land past a dark stretch.
 //!
-//! The seam is `review_regression.rs`'s, kept: every take drives a real
-//! `aterm_core` [`Terminal`], samples it exactly as `app_render.rs`'s frame hold
-//! does (the caret's row probe, then every ribbon row, whatever the caret's
+//! The seam is `review_regression.rs`'s: every take drives a real
+//! `aterm_core` [`Terminal`], samples it as `app_render.rs`'s frame hold does
+//! (the caret's row probe, then every ribbon row, whatever the caret's
 //! visibility), reads the content-scroll clock as `sync_cursor_effect_scroll`
-//! does, and ticks [`CursorGlow`] on a 16 ms train. The census is the PLAN's
-//! coverage per row: a HOLE is a dark column strictly between two lit ones.
+//! does, and ticks [`CursorGlow`] on a 16 ms train. The census is the plan's
+//! coverage per row: a hole is a dark column strictly between two lit ones.
 //! `RR_CELLS=1` adds every watched row's cells to a failure's dump.
 //!
-//! WHAT IS NOT PINNED HERE, all of it pre-existing and measured identical on
-//! `e05d7860e`, none of it a gap under a typing hand: a torn ⌃K leaves the
-//! killed suffix lit over blank cells to +1.6 s because the kill's own
-//! retract, not the release, owns those cells; a mid-line Backspace run
-//! blinks one cell at the edit column, 1 frame untorn and 9 torn; and a
-//! Claude Code Enter's exit fade carries a one-cell hole on 1 frame of 31
-//! takes after a torn spinner present.
+//! Not pinned here (none is a gap under a typing hand): a torn ⌃K leaves the
+//! killed suffix lit over blank cells for up to 1.6 s (the kill's own retract
+//! owns those cells); a mid-line Backspace run blinks one cell at the edit
+//! column; and a Claude Code Enter's exit fade can carry a one-cell hole for a
+//! frame after a torn spinner present.
 
+use crate::common::{
+    LIT_COV, caret_sample, class_of, coverage, holes_of, is_arrow, is_key, note_blink,
+    observe_caret_row, observe_ribbon_rows, rainbow_cfg, sync_scroll, unhex,
+};
 use aterm_core::render::GlowQuad;
-use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::rainbow_kitty::TypedClass;
+use aterm_core::terminal::{ContentScrollState, Terminal};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::ribbon::SWOOSH_TOTAL_S;
-use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
 const CW: usize = 8;
@@ -52,7 +43,6 @@ const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
 const SPINNER_MS: u64 = 100;
 const PTY_READ: usize = 1024;
-const LIT_COV: u8 = 20;
 
 const LINE: &str = "zoom out. first of all, STOP LANDING BRANCHES AND PATCHES! YOU NEED TO FUCKING MERGE ALL BEST WORK INTO MAIN!!!!";
 
@@ -77,63 +67,6 @@ enum Split {
     TextCol(usize),
     /// A present after every 1024-byte chunk of the frame.
     Chunks,
-}
-
-fn cfg() -> GlowConfig {
-    GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
-    }
-}
-
-fn class_of(ch: char) -> (bool, TypedClass) {
-    match ch {
-        ' ' => (false, TypedClass::Space),
-        '!' => (true, TypedClass::Bang),
-        c if c.is_uppercase() => (true, TypedClass::Capital),
-        _ => (false, TypedClass::Glyph),
-    }
-}
-
-fn holes_of(cov: &[u8]) -> Vec<(usize, usize)> {
-    let lit: Vec<usize> = (0..cov.len()).filter(|&i| cov[i] >= LIT_COV).collect();
-    let mut holes = Vec::new();
-    if lit.len() < 2 {
-        return holes;
-    }
-    let mut start = None;
-    for (i, &v) in cov
-        .iter()
-        .enumerate()
-        .take(lit[lit.len() - 1] + 1)
-        .skip(lit[0])
-    {
-        if v >= LIT_COV {
-            if let Some(s) = start.take() {
-                holes.push((s, i - s));
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    holes
 }
 
 fn sgr_pad(n: usize) -> String {
@@ -213,7 +146,7 @@ impl Host {
         let mut h = Self {
             term,
             glow,
-            cfg: cfg(),
+            cfg: rainbow_cfg(),
             cols,
             w: cols - 6,
             t0: now,
@@ -245,17 +178,7 @@ impl Host {
     }
 
     fn geom(&self) -> Geom {
-        Geom {
-            cw: CW,
-            ch: CH,
-            rows: ROWS,
-            cols: self.cols,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: (self.cols * CW) as u16,
-            win_h: (ROWS * CH) as u16,
-            head: 0,
-        }
+        crate::common::geom(ROWS, self.cols, CW, CH)
     }
 
     fn ms(&self) -> u64 {
@@ -263,41 +186,12 @@ impl Host {
     }
 
     fn frame(&mut self) {
-        let scroll = self.term.content_scroll_state();
-        match ContentScrollState::delta_since(self.scroll, scroll) {
-            ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged => {}
-            ContentScrollDelta::Translate(rows) => {
-                self.glow.note_scroll(rows);
-                self.glow.drop_row_probe();
-            }
-            ContentScrollDelta::Bands { first_seq, count } => {
-                for i in 0..u64::from(count) {
-                    let m = scroll.band(first_seq + i);
-                    self.glow.note_band_move(m.top, m.bottom, m.delta);
-                }
-                self.glow.drop_row_probe();
-            }
-            ContentScrollDelta::Invalidate => self.glow.curtain(self.now),
-        }
-        self.scroll = Some(scroll);
-        let c = self.term.cursor();
-        let cur = self.term.cursor_visible().then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink {
-            self.blink = epoch;
-            self.glow.note_repaint_blink(self.now);
-        }
+        sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
+        let (c, cur) = caret_sample(&self.term);
+        note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
         self.glow.note_context(self.term.is_alternate_screen());
-        self.term
-            .row_cols_into(usize::from(c.row), &mut self.row_buf);
-        self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            self.glow.observe_ribbon_row(r, &self.row_buf);
-        }
+        observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+        observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         let g = self.geom();
         let fp = self.glow.tick(cur, self.now, &self.cfg, g, &mut self.out);
         self.record(fp);
@@ -778,20 +672,28 @@ fn assert_no_melt(h: &Host, rows: &[u16], what: &str) {
 }
 
 /// Run every take, collecting failures instead of stopping at the first.
-fn run_takes<T>(takes: Vec<(String, T)>, f: impl Fn(&str, T)) {
-    let mut failed = Vec::new();
+///
+/// Each take builds its own host on its own clock, so the takes run on the
+/// binary's threads ([`crate::common::par_map`]) and their failures are
+/// listed in the takes' order, as one after another. WHY (2026-10-05): one
+/// after another, a law's 5 to 16 takes were 0.9 to 2.6 s alone on one thread
+/// and up to 10.1 s in a full-suite run at load 12 on 14 cores.
+fn run_takes<T: Copy + Sync>(takes: Vec<(String, T)>, f: impl Fn(&str, T) + Sync) {
     let n = takes.len();
-    for (what, t) in takes {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&what, t)));
-        if let Err(e) = r {
+    let failed: Vec<String> = crate::common::par_map(&takes, |(what, t)| {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(what, *t)));
+        r.err().map(|e| {
             let msg = e
                 .downcast_ref::<String>()
                 .cloned()
                 .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
                 .unwrap_or_default();
-            failed.push(format!("{what}: {}", msg.lines().next().unwrap_or("")));
-        }
-    }
+            format!("{what}: {}", msg.lines().next().unwrap_or(""))
+        })
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     assert!(
         failed.is_empty(),
         "{} of {n} takes failed:\n  {}",
@@ -815,24 +717,8 @@ mod codex {
     const END_MS: u64 = 9_500;
     const FIXTURE: &str = include_str!("fixtures/codex-particles-2026-09-16.ptylog");
 
-    fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len() / 2)
-            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex"))
-            .collect()
-    }
-
     fn g() -> Geom {
-        Geom {
-            cw: C_CW,
-            ch: C_CH,
-            rows: C_ROWS,
-            cols: C_COLS,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: (C_COLS * C_CW) as u16,
-            win_h: (C_ROWS * C_CH) as u16,
-            head: 0,
-        }
+        crate::common::geom(C_ROWS, C_COLS, C_CW, C_CH)
     }
 
     struct C {
@@ -854,57 +740,15 @@ mod codex {
 
     impl C {
         fn frame(&mut self) {
-            let scroll = self.term.content_scroll_state();
-            match ContentScrollState::delta_since(self.scroll, scroll) {
-                ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged => {}
-                ContentScrollDelta::Translate(rows) => {
-                    self.glow.note_scroll(rows);
-                    self.glow.drop_row_probe();
-                }
-                ContentScrollDelta::Bands { first_seq, count } => {
-                    for i in 0..u64::from(count) {
-                        let m = scroll.band(first_seq + i);
-                        self.glow.note_band_move(m.top, m.bottom, m.delta);
-                    }
-                    self.glow.drop_row_probe();
-                }
-                ContentScrollDelta::Invalidate => self.glow.curtain(self.now),
-            }
-            self.scroll = Some(scroll);
-            let c = self.term.cursor();
-            let cur = self.term.cursor_visible().then_some((c.row, c.col));
-            let epoch = self.term.repaint_blink_epoch();
-            if epoch != self.blink {
-                self.blink = epoch;
-                self.glow.note_repaint_blink(self.now);
-            }
+            sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
+            let (c, cur) = caret_sample(&self.term);
+            note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
             self.glow.note_context(self.term.is_alternate_screen());
-            self.term
-                .row_cols_into(usize::from(c.row), &mut self.row_buf);
-            self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-            self.glow.observe_ribbon_row(c.row, &self.row_buf);
-            let mut rows = [0u16; WITNESS_ROWS];
-            let n = self.glow.ribbon_rows(&mut rows);
-            for &r in &rows[..n] {
-                self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-                self.glow.observe_ribbon_row(r, &self.row_buf);
-            }
+            observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+            observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
             self.glow.tick(cur, self.now, &self.cfg, g(), &mut self.out);
             let Some(row) = self.composer_row else { return };
-            let mut cov = [0u8; C_COLS];
-            let rib = self.glow.v2_ribbon().expect("rk");
-            for sg in rib.plan_segments() {
-                let r = ((sg.spine / C_CH as f32) - 0.5).floor();
-                let col = (sg.x / C_CW as f32).floor();
-                if r >= 0.0
-                    && col >= 0.0
-                    && r as usize == usize::from(row)
-                    && (col as usize) < C_COLS
-                {
-                    let i = col as usize;
-                    cov[i] = cov[i].max(sg.cov);
-                }
-            }
+            let cov = coverage(&self.glow, g(), row);
             self.lit_max = self
                 .lit_max
                 .max(cov.iter().filter(|&&v| v >= LIT_COV).count());
@@ -956,7 +800,7 @@ mod codex {
             cfg: GlowConfig {
                 intensity: 1.0,
                 audible: true,
-                ..cfg()
+                ..rainbow_cfg()
             },
             t0: now,
             now,
@@ -995,18 +839,14 @@ mod codex {
                     }
                 }
                 "I" => match bytes.as_slice() {
-                    [b] if (0x20..0x7f).contains(b) => {
+                    b if is_key(b) => {
                         if h.composer_row.is_none() {
                             h.composer_row = Some(h.term.cursor().row);
                         }
                         h.glow.note_typed_cells(h.now, 1);
                     }
                     [0x7f] => h.glow.note_backspace_erasing(h.now, Some(1)),
-                    b if b.starts_with(b"\x1b[")
-                        && matches!(b.last(), Some(b'A' | b'B' | b'C' | b'D')) =>
-                    {
-                        h.glow.note_motion(h.now);
-                    }
+                    b if is_arrow(b) => h.glow.note_motion(h.now),
                     _ => {}
                 },
                 k => panic!("bad kind {k}"),
@@ -1019,8 +859,15 @@ mod codex {
 
 #[test]
 fn codex_particle_replay_stays_one_run_whole_and_torn_in_half_under_the_capped_sync_hold() {
-    for (torn, honor) in [(false, true), (true, true)] {
-        let (broken, lit_max) = codex::replay(torn, honor);
+    // The two replays run side by side (`par_map`) and are judged in order:
+    // each is caught in its pool thread, so the torn replay's panic, if any,
+    // is raised only after the whole replay's laws are asserted.
+    let pairs = [(false, true), (true, true)];
+    let replays = crate::common::par_map(&pairs, |&(torn, honor)| {
+        std::panic::catch_unwind(|| codex::replay(torn, honor))
+    });
+    for ((torn, honor), replay) in pairs.into_iter().zip(replays) {
+        let (broken, lit_max) = replay.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         assert!(
             lit_max >= 9,
             "torn={torn} sync={honor}: band laid ({lit_max})"
@@ -1036,7 +883,7 @@ fn codex_particle_replay_stays_one_run_whole_and_torn_in_half_under_the_capped_s
 }
 
 // ---------------------------------------------------------------------------
-// (2) A torn read inside a WRAPPED two-row composer.
+// (2) A torn read inside a wrapped two-row composer.
 // ---------------------------------------------------------------------------
 
 /// Fixed two-row box (70 columns, 64-cell text rows): the owner's line wraps
@@ -1118,11 +965,7 @@ fn a_growing_composer_torn_at_its_wrap_keeps_the_band_whole() {
 }
 
 // ---------------------------------------------------------------------------
-// (3) Enter clears the composer.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// (4) A torn read on EVERY key for 3 s at 12 cps, the boundary fixed.
+// (3) A torn read on every key for 3 s at 12 cps, the boundary fixed.
 // ---------------------------------------------------------------------------
 
 /// The lit count on the row at frame `i`.
@@ -1255,14 +1098,11 @@ fn a_backspace_run_under_torn_reads_keeps_the_band_whole() {
     });
 }
 
-/// **REPRO — A TORN BACKSPACE FRAME.** One Backspace at the end of a typed
-/// line whose repaint reaches the glass in two reads, a present between them
-/// after text index `j`: the walk releases `j..end` as ONE part, and that
-/// part includes the ERASED glyph's cell, which never comes back. The part
-/// is lifted only once none of its glyphs is under a blank, so it is never
-/// lifted: every cell of the standing text right of the boundary retracts
-/// while the text stands, and the hand typing on lays its keys past a dark
-/// stretch.
+/// A torn Backspace frame: one Backspace at the end of a typed line whose
+/// repaint arrives in two reads, a present after text index `j`. The released
+/// part `j..end` includes the erased glyph's cell, which never comes back;
+/// the standing text right of the boundary must stay lit and keys typed on
+/// must join it.
 #[test]
 fn a_torn_backspace_frame_keeps_the_standing_text_lit() {
     let typed = &LINE[..60];
@@ -1387,7 +1227,7 @@ fn a_torn_word_kill_frame_keeps_the_standing_text_lit() {
 }
 
 // ---------------------------------------------------------------------------
-// (5) Ctrl-K mid-line.
+// (4) Ctrl-K mid-line.
 // ---------------------------------------------------------------------------
 
 fn kill_take(split: Split) -> (Host, usize, u16, usize, usize) {
@@ -1474,7 +1314,9 @@ fn ctrl_k_then_typing_on_with_every_frame_torn_keeps_one_run() {
 /// whatever the parts did, the engine still goes to zero.
 #[test]
 fn a_torn_backspace_then_typing_on_still_goes_idle_to_zero() {
-    for spinner in [false, true] {
+    // The two takes run side by side (`par_map`); the first failing one in
+    // this order raises its own panic.
+    crate::common::par_map(&[false, true], |&spinner| {
         let mut h = Host::new(140, 1, spinner, 0);
         let row = h.text_row0();
         h.watch = vec![row];
@@ -1488,5 +1330,5 @@ fn a_torn_backspace_then_typing_on_still_goes_idle_to_zero() {
         h.repaint(Split::TextCol(20));
         h.type_str(" and on");
         h.assert_idle_to_zero(&format!("torn backspace then typing, spinner {spinner}"));
-    }
+    });
 }

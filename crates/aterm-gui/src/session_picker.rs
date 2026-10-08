@@ -28,11 +28,12 @@
 use aterm_render::Theme;
 use aterm_session::SessionId;
 
-use crate::palette::fuzzy_subsequence;
-use crate::settings::{Roles, SettingsGeom, fit, text_w};
-use crate::tray_raster::row_baseline;
+#[cfg(a11y_tree)]
+use crate::palette::{a11y_epoch_from, a11y_slot_for, list_overlay_a11y};
+use crate::palette::{finish_overlay_card, fuzzy_subsequence, overlay_card_frame, row_text_writer};
+use crate::settings::{Roles, SettingsGeom, text_w};
 use crate::type_scale::TypeStep;
-use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
+use crate::widget::{DrawPrim, TrayInput, rgba};
 
 /// The most session rows shown at once; beyond this the filtered list scrolls.
 const MAX_ROWS: usize = 12;
@@ -210,7 +211,9 @@ impl SessionPickerState {
                 if title.is_empty() {
                     title = "(untitled)".to_string();
                 }
-                let connected = if row.connected {
+                // Only the Connect picker mixes peers with strangers; the
+                // Configure and Disconnect pickers list connections alone.
+                let connected = if row.connected && self.intent == PickerIntent::Connect {
                     " \u{00b7} connected"
                 } else {
                     ""
@@ -222,10 +225,20 @@ impl SessionPickerState {
                 1 => format!("{name}  \u{00b7} 1 session"),
                 n => format!("{name}  \u{00b7} {n} sessions"),
             },
-            PickerRow::NewIdentity => match self.new_identity_name() {
-                Some(name) => format!("+ New identity \u{201c}{name}\u{201d}"),
-                None => "+ New identity\u{2026} (type its name)".to_string(),
-            },
+            PickerRow::NewIdentity => {
+                let query = self.query.trim();
+                match crate::agent_identity::parse_name(query) {
+                    _ if query.is_empty() => "+ New identity\u{2026} (type its name)".to_string(),
+                    Err(why) => format!(
+                        "+ New identity: {}",
+                        why.strip_prefix("identity: ").unwrap_or(&why)
+                    ),
+                    Ok(name) if self.new_identity_name().is_none() => {
+                        format!("+ New identity: \u{201c}{name}\u{201d} exists, choose it above")
+                    }
+                    Ok(name) => format!("+ New identity \u{201c}{name}\u{201d}"),
+                }
+            }
         }
     }
 
@@ -266,7 +279,9 @@ impl SessionPickerState {
     }
 
     fn filtered_indices(&self) -> impl Iterator<Item = usize> + '_ {
-        let q = self.query.to_ascii_lowercase();
+        // Trimmed, as the new-identity row reads it: " work" still finds the
+        // `work` row that row tells the person to choose.
+        let q = self.query.trim().to_ascii_lowercase();
         (0..self.rows.len()).filter(move |&i| {
             // Opening the picker shows every session. No display-string formatting
             // or title sanitization is needed to answer an empty filter.
@@ -484,22 +499,13 @@ impl SessionPickerState {
         for i in self.filtered() {
             self.rows[i].key().hash(&mut h);
         }
-        let epoch = h.finish() as u32;
-        if epoch == u32::MAX {
-            u32::MAX - 1
-        } else {
-            epoch
-        }
+        a11y_epoch_from(h.finish())
     }
 
     /// Decode a node minted by the CURRENT epoch to its filtered index.
     #[cfg(a11y_tree)]
     pub(crate) fn a11y_filtered_index(&self, node: accesskit::NodeId) -> Option<usize> {
-        let slot = usize::try_from(node.0 & u64::from(u32::MAX))
-            .ok()?
-            .checked_sub(1)?;
-        (a11y_node_id_for(self.a11y_epoch(), slot) == node && slot < self.filtered_count())
-            .then_some(slot)
+        a11y_slot_for(self.a11y_epoch(), node, self.filtered_count())
     }
 }
 
@@ -578,65 +584,9 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let vis = state.filtered();
     let layout = picker_layout_for_count(vis.len(), g);
-    let (card_x, card_y, card_w, card_h) = layout.card;
-    let radius = (ch * 0.6).min(14.0);
-    let mut prims: Vec<DrawPrim> = vec![
-        DrawPrim::Panel {
-            x: card_x - 3.0,
-            y: card_y + 2.0,
-            w: card_w + 6.0,
-            h: card_h + 6.0,
-            radius: radius + 3.0,
-            fill: rgba([0, 0, 0], 0x2A),
-        },
-        DrawPrim::Panel {
-            x: card_x - 1.0,
-            y: card_y + 2.0,
-            w: card_w + 2.0,
-            h: card_h + 3.0,
-            radius: radius + 1.0,
-            fill: rgba([0, 0, 0], 0x30),
-        },
-        DrawPrim::Panel {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-            radius,
-            fill: rgba(r.surface, 0xFF),
-        },
-        DrawPrim::Stroke {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-            radius,
-            width: 1.0,
-            color: rgba(r.separator, 0xE0),
-        },
-        DrawPrim::ClipPush {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-        },
-    ];
-
-    let text_at = |prims: &mut Vec<DrawPrim>, x: f32, y0: f32, step: TypeStep, s: String, color| {
-        if s.is_empty() {
-            return;
-        }
-        let size = step.px(px);
-        prims.push(text_prim(
-            x,
-            row_baseline(y0, ch, size.get()),
-            s,
-            size,
-            TextWeight::Regular,
-            TextFace::Mono,
-            color,
-        ));
-    };
+    let (card_x, card_y, card_w, _) = layout.card;
+    let mut prims = overlay_card_frame(layout.card, ch, &r, true);
+    let text_at = row_text_writer(px, ch);
 
     // Title row: the intent + the subject it acts from (identity intents act
     // from no session, so they carry the intent alone).
@@ -762,76 +712,36 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
     }
 
     // Key-hint footer.
-    let hint = "\u{2191}\u{2193} move   \u{23ce} choose   esc close";
-    let fsize = TypeStep::Caption.px(px);
-    let hint_w = text_w(hint, fsize.get());
-    let fx = card_x + fit((card_w - hint_w) * 0.5, cw, card_w - hint_w - cw);
-    text_at(
-        &mut prims,
-        fx,
-        card_y + layout.card_rows.saturating_sub(1) as f32 * ch,
-        TypeStep::Caption,
-        hint.to_string(),
-        rgba(r.text_tertiary, 0xFF),
-    );
-    prims.push(DrawPrim::ClipPop);
-
-    TrayInput {
+    finish_overlay_card(
         prims,
-        card: layout.card,
-    }
+        "\u{2191}\u{2193} move   \u{23ce} choose   esc close",
+        layout.card,
+        layout.card_rows,
+        g,
+        &r,
+    )
 }
 
 /// The picker's accessibility tree — the palette scheme verbatim: a ListBox of
 /// the FILTERED rows, epoch-guarded ids, focus follows the cursor.
 #[cfg(a11y_tree)]
 pub(crate) fn picker_a11y(state: &SessionPickerState) -> accesskit::TreeUpdate {
-    use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
+    use accesskit::{Action, Node, Role};
 
-    const LIST: NodeId = NodeId(u64::MAX);
-    let root_id = NodeId(0);
     let vis = state.filtered();
-    let epoch = state.a11y_epoch();
-
-    let mut nodes: Vec<(NodeId, Node)> = Vec::with_capacity(vis.len() + 2);
-    let mut items: Vec<NodeId> = Vec::with_capacity(vis.len());
-    for (slot, &i) in vis.iter().enumerate() {
-        let id = a11y_node_id_for(epoch, slot);
+    let rows = vis.iter().map(|&i| {
         let mut node = Node::new(Role::MenuItem);
         node.set_label(state.row_line(&state.rows[i]));
         node.add_action(Action::Focus);
         node.add_action(Action::Click);
-        nodes.push((id, node));
-        items.push(id);
-    }
-
-    let mut list = Node::new(Role::ListBox);
-    list.set_children(items);
-    nodes.push((LIST, list));
-
-    let mut root = Node::new(Role::Window);
-    root.set_label(state.intent.title());
-    root.set_children(vec![LIST]);
-    nodes.push((root_id, root));
-
-    let focus = if vis.is_empty() {
-        root_id
-    } else {
-        a11y_node_id_for(epoch, state.selected.min(vis.len() - 1))
-    };
-
-    TreeUpdate {
-        nodes,
-        tree: Some(Tree::new(root_id)),
-        tree_id: TreeId::ROOT,
-        focus,
-    }
-}
-
-/// Mint a row node id (epoch high half, `slot + 1` low — the palette scheme).
-#[cfg(a11y_tree)]
-fn a11y_node_id_for(epoch: u32, slot: usize) -> accesskit::NodeId {
-    accesskit::NodeId((u64::from(epoch) << 32) | (slot as u64 + 1))
+        node
+    });
+    list_overlay_a11y(
+        state.intent.title(),
+        state.a11y_epoch(),
+        state.selected,
+        rows,
+    )
 }
 
 #[cfg(test)]
@@ -965,6 +875,64 @@ mod tests {
             ),
             "the intent titles the card"
         );
+    }
+
+    /// The Configure and Disconnect pickers list connections only, so no row
+    /// repeats ` · connected`; the Connect picker keeps it (the test above).
+    #[test]
+    fn only_the_connect_picker_marks_connected_rows() {
+        let p = SessionPickerState::new(
+            crate::WindowId(0),
+            Some(SessionId::new("s-self")),
+            "me".to_string(),
+            PickerIntent::Configure,
+            rows(),
+        );
+        let lines: Vec<String> = p.rows.iter().map(|r| p.row_line(r)).collect();
+        assert!(lines.iter().all(|l| !l.contains("connected")), "{lines:?}");
+    }
+
+    /// The new-identity row says why Enter does nothing: no name yet, a name
+    /// `parse_name` refuses (its reason), or a name already listed.
+    #[test]
+    fn the_new_identity_row_says_why_it_cannot_create() {
+        let mut p = SessionPickerState::new(
+            crate::WindowId(0),
+            None,
+            String::new(),
+            PickerIntent::NewTabWithIdentity,
+            vec![
+                PickerRow::Identity {
+                    name: "work".to_string(),
+                    sessions: 0,
+                },
+                PickerRow::NewIdentity,
+            ],
+        );
+        let line = |p: &SessionPickerState| p.row_line(&PickerRow::NewIdentity);
+        assert_eq!(line(&p), "+ New identity\u{2026} (type its name)");
+        for c in "my work".chars() {
+            p.push_char(c);
+        }
+        assert_eq!(
+            line(&p),
+            "+ New identity: ' ' is not allowed in a name (letters, digits, `.`, `_`, `-`)"
+        );
+        p.query = "Work".to_string();
+        assert_eq!(
+            line(&p),
+            "+ New identity: \u{201c}work\u{201d} exists, choose it above"
+        );
+        assert_eq!(p.new_identity_name(), None);
+        // A stray leading space: the row it points at is still shown.
+        p.query = " work".to_string();
+        assert_eq!(
+            line(&p),
+            "+ New identity: \u{201c}work\u{201d} exists, choose it above"
+        );
+        assert_eq!(p.filtered_indices().collect::<Vec<_>>(), [0, 1]);
+        p.query = "play".to_string();
+        assert_eq!(line(&p), "+ New identity \u{201c}play\u{201d}");
     }
 
     /// `controls session-picker` mirrors the painted rows + live cursor.

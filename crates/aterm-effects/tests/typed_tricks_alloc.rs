@@ -3,19 +3,18 @@
 
 //! Exact allocation regression for the kitty-command listener.
 //!
-//! `TrickListener` sits on the typing path: every printed key, every
-//! Backspace, every Enter in every window goes through it, feature on or off.
-//! Its law is ONE inline push per letter and one fold + one hash probe per
-//! closed token — and, once the vocabulary's fold scratch has grown to the
-//! widest token the window can hold, NO allocation at all: not for a fire, not
-//! for the word an event borrows, not for the boundary snapshot, not for a
-//! held address word, a parked fire, an IME commit or a session switch.
+//! `TrickListener` sits on the typing path: every printed key, Backspace and
+//! Enter in every window goes through it, feature on or off. Its law is one
+//! inline push per letter and one fold + one hash probe per closed token, and,
+//! once the fold scratch has grown to the widest token the window can hold, no
+//! allocation at all (not for a fire, a borrowed event word, the boundary
+//! snapshot, a held address word, a parked fire, an IME commit or a session
+//! switch).
 //!
-//! ONE `#[test]` IN ITS OWN BINARY, like `aterm-lexicon`'s
-//! `tricks_alloc.rs`: the counter is a process-global allocator switched by a
-//! global flag, so a second test running in parallel would bleed its
-//! allocations into the count and make the pin flaky. Do not add tests to
-//! this file.
+//! One `#[test]` in its own binary: the counter is a process-global allocator
+//! switched by a global flag, so a parallel test would bleed into the count.
+//! Do not add tests to this file. (`aterm-lexicon`'s `lexicon_alloc` binary
+//! can hold two pins because its allocator counts per thread.)
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},

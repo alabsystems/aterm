@@ -20,12 +20,11 @@ impl Row {
         self.flags = RowFlags::DIRTY;
     }
 
-    /// Erase with BCE fill cell, preserving DEC line attributes (#7522).
+    /// Erase with BCE fill cell, preserving DEC line attributes.
     ///
-    /// Like `erase()` but fills cells with `fill` instead of `Cell::EMPTY`,
-    /// supporting BCE (Background Color Erase) per VT420/xterm spec. Partial
-    /// erases and EL only: a complete-row ED uses `reset_with()`, which is this
-    /// same pass with the line attributes dropped.
+    /// Like `erase()` but fills cells with `fill` instead of `Cell::EMPTY`
+    /// (BCE per VT420/xterm). For partial erases and EL; a complete-row ED
+    /// uses `reset_with()`, the same pass with line attributes dropped.
     #[inline]
     pub fn erase_with(&mut self, fill: Cell) {
         self.cells.fill(fill);
@@ -42,13 +41,11 @@ impl Row {
 
     /// Fully reset the row with a BCE fill cell in a single pass.
     ///
-    /// Semantically identical to `clear()` followed by `erase_with(fill)`
-    /// (cells = `fill`, len per BCE rule, flags = DIRTY with line attributes
-    /// dropped) but writes each cell exactly once. Used by the scroll path
-    /// when recycling ring-buffer rows, where the old content and line
-    /// attributes are always discarded, and by the ED paths that erase a
-    /// COMPLETE row — xterm's `ClearBufRows`, "clearing the whole row resets
-    /// the doublesize characters".
+    /// Equivalent to `clear()` then `erase_with(fill)` (cells = `fill`, len per
+    /// the BCE rule, flags = DIRTY with line attributes dropped) but writes
+    /// each cell once. Used when the scroll path recycles ring rows and by the
+    /// ED paths erasing a complete row (xterm's `ClearBufRows`: "clearing the
+    /// whole row resets the doublesize characters").
     #[inline]
     pub fn reset_with(&mut self, fill: Cell) {
         self.cells.fill(fill);
@@ -69,14 +66,11 @@ impl Row {
         if start_usize < self.cells.len() {
             let old_len = self.len as usize;
 
-            // Wide character fixup: if cells[start-1] is a WIDE base, its
-            // continuation (at start) is about to be cleared, orphaning the base.
-            // Key on the LEFT NEIGHBOR being WIDE (bit 9, unaliased), NOT on
-            // WIDE_CONTINUATION of cells[start] — bit 10 is shared with PROTECTED, so
-            // the raw check misfires on a DECSCA-protected cell at start and corrupts
-            // cells[start-1], which is OUTSIDE the cleared range (round-5 DECCRA fix,
-            // generalized). A WIDE base's continuation is always the next cell, so
-            // checking the neighbor is exactly equivalent for genuine orphans.
+            // Wide fixup: if cells[start-1] is a WIDE base, clearing its
+            // continuation at start would orphan it. Key on the left neighbour's
+            // WIDE bit (bit 9, unaliased), not WIDE_CONTINUATION at start: bit 10
+            // is shared with PROTECTED, so the raw check would misfire on a
+            // protected cell and corrupt cells[start-1], outside the range.
             if start_usize > 0
                 && self.cells[start_usize - 1]
                     .flags()
@@ -93,14 +87,13 @@ impl Row {
         }
     }
 
-    /// Clear cells from start to `end` (exclusive) with a BCE fill cell (#7522).
+    /// Clear cells from start to `end` (exclusive) with a BCE fill cell.
     ///
-    /// Fills with `fill` and blanks any orphaned wide half at the two
-    /// boundaries to `Cell::EMPTY` (`fill = Cell::EMPTY` is the plain clear).
-    /// That is the RECTANGLE-OP rule (DECERA/DECFRA); the erases that follow
-    /// xterm's `ClearRight` want the orphan to carry the BCE blank instead and
-    /// call [`Row::clear_range_with_orphan`] directly. See its docs for why the
-    /// two differ.
+    /// Fills with `fill` and blanks any orphaned wide half at either boundary
+    /// to `Cell::EMPTY` (`fill = Cell::EMPTY` is the plain clear). That is the
+    /// rectangle-op rule (DECERA/DECFRA); erases following xterm's `ClearRight`
+    /// give the orphan the BCE blank via [`Row::clear_range_with_orphan`]. See
+    /// its docs for why the two differ.
     #[inline]
     pub(crate) fn clear_range_with(&mut self, start: u16, end: u16, fill: Cell) {
         let _ = self.clear_range_with_orphan(start, end, fill, Cell::EMPTY);
@@ -109,56 +102,36 @@ impl Row {
     /// Clear cells from start to `end` (exclusive) with `fill`, giving an
     /// orphaned wide half at either boundary the cell `orphan`.
     ///
-    /// Returns the column range actually WRITTEN — `[start, end)` widened by one
-    /// on each side where a wide pair was bisected and its orphan rewritten. The
-    /// caller needs that to keep the out-of-line truecolor side tables in step
-    /// with the cells (see `Grid::fill_bce_rgb_range`).
+    /// Returns the column range actually written: `[start, end)` widened by one
+    /// on each side where a wide pair was bisected and its orphan rewritten, so
+    /// callers can keep the truecolor side tables in step (see
+    /// `Grid::fill_bce_rgb_range`). "Written", not "holding `fill`": with
+    /// `orphan = Cell::EMPTY` the widened columns are blank and outside the
+    /// rectangle.
     ///
-    /// "Written", NOT "carrying `fill`": the widening happens whenever an orphan
-    /// was rewritten at all, `orphan = Cell::EMPTY` included. A caller that reads
-    /// the range as the span now holding the fill will over-paint its side table
-    /// by one column on each bisected edge — under the rectangle-op rule that
-    /// column is deliberately blank and OUTSIDE the rect (#7522).
+    /// # Why the orphan cell is a parameter
     ///
-    /// # Why the orphan cell is a parameter (xterm has TWO rules)
+    /// xterm rewrites a bisected pair's surviving half differently by operation:
     ///
-    /// An erase bisects a wide pair, and xterm rewrites the surviving half. WHAT
-    /// it writes there depends on which operation is erasing:
+    /// - EL / ED reach `util.c` `ClearRight`, whose wide fixup sends both orphan
+    ///   spans through `ClearInLine2` -> `ClearCells` (`screen.c`), like the
+    ///   erased span: `' '` with `ld->color[col] = xtermColorPair(xw)`, i.e.
+    ///   the BCE background. These callers pass `orphan = fill`. (ECH follows the
+    ///   same rule, but `Grid::erase_chars` uses `Row::erase_chars_with`, which
+    ///   writes `fill` into both orphans itself.)
+    /// - DECERA / DECFRA reach `screen.c` `ScrnFillRectangle`, whose fixup is
+    ///   `Clear1Cell(ld, left - 1)` / `Clear1Cell(ld, right + 1)`: a bare clear
+    ///   without fill character or colour. The orphan is outside the rectangle,
+    ///   and a DECFRA fill glyph there would bleed past the rect. These callers
+    ///   pass `orphan = Cell::EMPTY`, as plain `clear_range_with` does.
     ///
-    /// - **EL / ED** reach `util.c` `ClearRight`, whose wide fixup sends
-    ///   both orphan spans through `ClearInLine2` -> `ClearCells` (`screen.c`),
-    ///   the same function the erased span itself goes through. `ClearCells`
-    ///   writes `' '`, `FillIAttr(..., flags | TERM_COLOR_FLAGS(xw), ...)` and
-    ///   `ld->color[col] = xtermColorPair(xw)` — so the orphan gets the CURRENT
-    ///   colour pair, i.e. the BCE background, exactly like the erased span. The
-    ///   only difference between the orphan call and the main call is the
-    ///   `CHARDRAWN` bit in `flags`, which carries no colour. Such callers pass
-    ///   `orphan = fill`. ECH reaches the same `ClearRight` in xterm
-    ///   (`do_erase_char` is a protected-mode wrapper around it), but in aterm
-    ///   it does NOT reach this helper: `Grid::erase_chars` goes through
-    ///   `Row::erase_chars_with`, which already writes `fill` into both orphans
-    ///   itself. The rule is the same; the code path is not.
-    /// - **DECERA / DECFRA** reach `screen.c` `ScrnFillRectangle`, whose wide
-    ///   fixup is `Clear1Cell(ld, left - 1)` / `Clear1Cell(ld, right + 1)` — a
-    ///   bare cell clear that never touches the fill character or the colour
-    ///   pair. The orphan sits OUTSIDE the rectangle, and for DECFRA the fill
-    ///   cell carries a GLYPH: writing it there bled the fill one column past
-    ///   the rect (#7522). Such callers pass `orphan = Cell::EMPTY`, which is
-    ///   what plain `clear_range_with` does.
+    /// The selective erases (DECSEL / DECSED) use `selective_clear_range`, which
+    /// never reaches here and writes `Cell::EMPTY` orphans without BCE, unlike
+    /// xterm (whose `ClearInLine2` clears each unprotected segment through
+    /// `ClearCells`).
     ///
-    /// The SELECTIVE erases (DECSEL / DECSED) are NOT in the first bullet: they
-    /// take aterm's `selective_clear_range` path, which never reaches this
-    /// helper and writes `Cell::EMPTY` orphans with no BCE at all. xterm makes no
-    /// such distinction — `charproc.c:4001` (EL, `OFF_PROTECT`) and
-    /// `charproc.c:5156` (DECSEL, `DEC_PROTECT`) both call `do_erase_line`, and
-    /// `ClearInLine2` splits the run around protected cells but still clears each
-    /// unprotected segment through `ClearCells`. That divergence predates this
-    /// helper and is out of its scope; the list above is the rule for the callers
-    /// that DO reach here, not a claim about every erase aterm implements.
-    ///
-    /// `orphan` is therefore either `Cell::EMPTY` or `fill`; nothing else has an
-    /// xterm analogue, and the `len` bookkeeping below relies on it (a blank
-    /// fill implies a blank orphan).
+    /// `orphan` is therefore `Cell::EMPTY` or `fill`; the `len` bookkeeping
+    /// below relies on that (a blank fill implies a blank orphan).
     #[inline]
     pub(crate) fn clear_range_with_orphan(
         &mut self,
@@ -182,16 +155,13 @@ impl Row {
         let mut written_start = start;
         let mut written_end = end;
 
-        // Left-boundary wide fixup, with the orphan cell:
-        // key on the left neighbor being WIDE (bit 9), NOT WIDE_CONTINUATION of
-        // cells[start] — bit 10 aliases PROTECTED, so the raw check corrupts the
-        // out-of-range cells[start-1] for a DECSCA-protected cell (round-5 DECCRA
-        // fix, generalized to this DECERA/DECFRA/EL/ED-backing helper).
+        // Left-boundary wide fixup: key on the left neighbour's WIDE bit (bit 9),
+        // not WIDE_CONTINUATION at start (bit 10 aliases PROTECTED, so the raw
+        // check would corrupt cells[start-1] next to a protected cell).
         if start > 0 && self.cells[start - 1].flags().contains(CellFlags::WIDE) {
-            // The orphaned WIDE head at start-1 is OUTSIDE the written range, so
-            // it gets `orphan`, never `fill`: EMPTY for the rect ops (writing the
-            // DECFRA glyph there bled the fill one column left, #7522), the BCE
-            // blank for the erases that follow ClearRight.
+            // The orphaned WIDE head at start-1 is outside the written range, so
+            // it gets `orphan`, never `fill`: EMPTY for the rect ops (a DECFRA
+            // glyph there would bleed left), the BCE blank for ClearRight erases.
             self.cells[start - 1] = orphan;
             written_start = start - 1;
         }
@@ -211,22 +181,17 @@ impl Row {
         // blank carries a visible background; it is not when it is Cell::EMPTY.
         let right_orphan_is_content = cleared_right_orphan && !orphan.is_empty();
         if !fill.is_empty() {
-            // Visible fill — a BCE background, a DECFRA fill character,
-            // or attribute flags: len must cover the filled range so the
-            // read path (row_text/render_row) does not drop it (a DECFRA
-            // fill with default colors is still content, per VT420/VT520
-            // DECFRA the filled characters are displayed).
+            // Visible fill (a BCE background, a DECFRA fill character, or
+            // attribute flags): len must cover the filled range so row_text /
+            // render_row keep it (DECFRA characters are displayed per VT420/VT520
+            // even with default colors).
             //
-            // The visible fill guarantees content through end-1, so len >= end;
-            // pre-existing content past the rect extends len to old_len. The one
-            // exception: when the ONLY cell past the fill was the wide-continuation
-            // orphan we just cleared to EMPTY (old_len == end + 1), that cell is no
-            // longer content, so len is exactly `end`. Without this, the row keeps a
-            // bogus trailing cell in its logical length — row_text and scrollback
-            // materialization slice through self.len, so it would surface as a stale
-            // trailing space one column past the rect (#7522). When the orphan
-            // instead received the VISIBLE BCE blank it is content in its own
-            // right, and len has to stretch one column further to cover it.
+            // The fill guarantees content through end-1, so len >= end; content
+            // past the rect extends len to old_len. Exception: when the only cell
+            // past the fill was the wide-continuation orphan just cleared to EMPTY
+            // (old_len == end + 1), len is exactly `end`, or a stale trailing
+            // space would appear one column past the rect. When the orphan got
+            // the visible BCE blank instead, it is content, and len covers it.
             let new_end = if right_orphan_is_content {
                 (end + 1).max(old_len)
             } else if cleared_right_orphan && old_len == end + 1 {
@@ -238,16 +203,14 @@ impl Row {
         } else if start < old_len
             && (end >= old_len || (cleared_right_orphan && old_len == end + 1))
         {
-            // Recalc when the fill reached the old content end, OR when the
-            // right wide-orphan we cleared at index `end` was the row's last
-            // content cell (old_len == end + 1). In both cases [start, old_len)
-            // is now fully empty, so recalculate_len_up_to(start) yields the
-            // tight len. Mirrors the visible-fill orphan case above; without the
-            // second term an EL/DECERA that erases a trailing wide char left len
-            // stale-high and surfaced phantom trailing spaces (#7522).
+            // Recalculate when the fill reached the old content end, or when the
+            // right wide orphan cleared at `end` was the row's last content cell
+            // (old_len == end + 1): [start, old_len) is then empty, so
+            // recalculate_len_up_to(start) gives the tight len. Otherwise an
+            // EL/DECERA erasing a trailing wide char would leave len stale-high.
             //
             // A blank `fill` implies a blank `orphan` (see the debug_assert), so
-            // there is no visible-orphan case to handle in this branch.
+            // there is no visible-orphan case here.
             self.recalculate_len_up_to(start);
         }
         super::u16_from_usize(written_start)..super::u16_from_usize(written_end)
@@ -256,32 +219,28 @@ impl Row {
     /// Fix orphaned wide character halves at rectangular operation boundaries.
     ///
     /// After copying/clearing cells within columns [left, right], wide
-    /// character pairs that span the boundary may have been bisected.
-    /// Clears the orphaned half of any such pair (#7500).
+    /// character pairs spanning the boundary may have been bisected; clear the
+    /// orphaned half of any such pair.
     ///
     /// `left` and `right` are inclusive column indices. `cols` is the total
     /// number of columns in the row.
     ///
-    /// `clear_orphan_spacers` controls the two AMBIGUOUS branches (an apparent
-    /// orphaned continuation whose WIDE head is *not* to its left). Because
-    /// PROTECTED aliases WIDE_CONTINUATION (bit 10) and both a real continuation
-    /// spacer and a DECSCA-protected space carry char ' ', those branches cannot
-    /// tell a genuine orphaned spacer from a protected space by inspecting the cell
-    /// alone. Callers that have ALREADY cleaned genuine boundary orphans
-    /// authoritatively (the DECLRMM column shifts — DECIC/DECDC/SL/SR/DECBI/DECFI —
-    /// run `insert/delete_chars_bounded_fill`, which fixes the margins via the
-    /// context-aware `is_cell_wide_continuation`) pass `false`: for them any
-    /// remaining bit-10 cell at the boundary can only be a protected space, so
-    /// clearing it would corrupt content OUTSIDE the operated region (codex round-7
-    /// finding — SL blanked a protected space one column past the right margin).
-    /// Whole-row rect copies/clears (vertical scroll, IL/DL) pass `true`: they have
-    /// no per-cell authoritative signal, so they keep the char==' ' heuristic
-    /// (residual: a protected SPACE bisected by a vertical rect scroll is still
-    /// cleared — fully closing that needs the shared bit to be un-aliased).
+    /// `clear_orphan_spacers` controls the two ambiguous branches (an apparent
+    /// orphaned continuation whose WIDE head is not to its left). PROTECTED
+    /// aliases WIDE_CONTINUATION (bit 10) and both a real spacer and a
+    /// protected space hold ' ', so the cell alone cannot tell them apart.
+    /// Callers that already fixed genuine boundary orphans (the DECLRMM column
+    /// shifts DECIC/DECDC/SL/SR/DECBI/DECFI, via
+    /// `insert/delete_chars_bounded_fill` and `is_cell_wide_continuation`)
+    /// pass `false`: any remaining bit-10 boundary cell is a protected space,
+    /// and clearing it would corrupt content outside the region. Whole-row rect
+    /// copies/clears (vertical scroll, IL/DL) have no such signal and pass
+    /// `true`, keeping the char==' ' heuristic (a protected space bisected by a
+    /// vertical rect scroll is still cleared).
     ///
-    /// The two UNAMBIGUOUS branches (a dangling WIDE head whose continuation is
-    /// gone) always run: they key on the neighbor's WIDE bit (bit 9, unaliased) and
-    /// clear the WIDE head, never a protected cell.
+    /// The two unambiguous branches (a WIDE head whose continuation is gone)
+    /// always run: they key on the WIDE bit (bit 9, unaliased) and clear the
+    /// head, never a protected cell.
     #[inline]
     pub(crate) fn fixup_wide_boundary(
         &mut self,
@@ -305,8 +264,8 @@ impl Row {
             }
         }
         // Right boundary: fix orphaned pairs at right/right+1. The
-        // `next_cont && !cur_wide` branch has the same bit-10 aliasing hazard AND
-        // targets cells[right+1] which is OUTSIDE the operated region [left,right].
+        // `next_cont && !cur_wide` branch has the same bit-10 aliasing hazard and
+        // targets cells[right+1], outside the region [left, right].
         if right < self.cells.len() && right + 1 < cols && right + 1 < self.cells.len() {
             let cur_wide = self.cells[right].flags().contains(CellFlags::WIDE);
             let next_cont = self.cells[right + 1]
@@ -365,7 +324,7 @@ impl Row {
     /// continuation spacer always immediately follows its `WIDE` main cell;
     /// a bit-10 cell without that neighbor is a DECSCA-protected cell.
     #[inline]
-    pub(crate) fn is_cell_wide_continuation(&self, col: u16) -> bool {
+    pub fn is_cell_wide_continuation(&self, col: u16) -> bool {
         let col = col as usize;
         if col >= self.cells.len() {
             return false;
@@ -405,10 +364,9 @@ impl Row {
             let old_len = self.len as usize;
             let mut any_erased = false;
 
-            // Left boundary fixup: if the first cell in the range is a
-            // WIDE_CONTINUATION of an unprotected WIDE cell outside the
-            // range, clearing the continuation creates an orphaned WIDE
-            // cell. Clear the WIDE cell too (#7462).
+            // Left boundary fixup: if the first cell is the continuation of an
+            // unprotected WIDE cell outside the range, clear the WIDE cell too
+            // so it is not orphaned.
             if start_usize > 0
                 && self.cells[start_usize]
                     .flags()
@@ -419,10 +377,10 @@ impl Row {
                 && !self.is_cell_protected((start_usize - 1) as u16)
             {
                 self.cells[start_usize - 1] = Cell::EMPTY;
-                // Clearing the lead's WIDE flag would make the in-range
-                // continuation at `start_usize` read as a standalone PROTECTED
-                // cell (WIDE_CONTINUATION and PROTECTED share bit 10), so the
-                // loop below would skip it and orphan the spacer. Clear it here.
+                // Clearing the lead's WIDE flag would make the continuation at
+                // `start_usize` read as a standalone PROTECTED cell (shared bit
+                // 10), so the loop would skip it and orphan the spacer; clear it
+                // here.
                 self.cells[start_usize] = Cell::EMPTY;
                 any_erased = true;
             }
@@ -443,13 +401,12 @@ impl Row {
             }
             if any_erased {
                 self.flags |= RowFlags::DIRTY;
-                // Do NOT gate on `end_usize >= old_len`: the WIDE-head co-clear
+                // Not gated on `end_usize >= old_len`: the WIDE-head co-clear
                 // above wipes cells[col+1], which for col == end-1 is cells[end],
-                // ONE column past the range. When that was the tail content
-                // (old_len == end + 1), `end_usize >= old_len` is false and len
-                // would be left stale-high. recalculate_len_up_to(old_len) rescans
-                // the whole prefix and never over-shrinks, so keying only on the
-                // old tail now being empty is correct (matches selective_clear).
+                // one past the range; when that was the tail content
+                // (old_len == end + 1), that gate would leave len stale-high.
+                // recalculate_len_up_to(old_len) rescans the prefix and never
+                // over-shrinks.
                 if start_usize < old_len && self.cells[old_len - 1].is_empty() {
                     self.recalculate_len_up_to(old_len);
                 }
@@ -463,22 +420,19 @@ impl Row {
     /// Per VT520 (EK-VT520-RM, DECSERA): erased positions become spaces, but
     /// "DECSERA does not change: visual attributes set by the select graphic
     /// rendition (SGR) function; protection attributes set by DECSCA; line
-    /// attributes." xterm matches (ScrnWipeRectangle writes ' ' into
-    /// charData without touching the attribute/color arrays). Contrast with
-    /// [`Row::selective_clear_range`], which DECSED/DECSEL use and which
-    /// resets the cells entirely (xterm ClearCells).
+    /// attributes." xterm matches (ScrnWipeRectangle writes ' ' into charData
+    /// only). Contrast [`Row::selective_clear_range`] (DECSED/DECSEL), which
+    /// resets cells entirely (xterm ClearCells).
     ///
-    /// Cells protected by DECSCA are skipped. Uses the context-aware
-    /// protection check to correctly handle wide characters; a wiped wide
-    /// character becomes two plain-width spaces (`set_char` clears the
-    /// COMPLEX/WIDE/WIDE_CONTINUATION structural flags but leaves SGR
-    /// flags, colors, and any interned style id intact).
+    /// Protected cells are skipped, using the context-aware protection check;
+    /// a wiped wide character becomes two narrow spaces (`set_char` clears
+    /// COMPLEX/WIDE/WIDE_CONTINUATION but keeps SGR flags, colors and any
+    /// interned style id).
     ///
-    /// Each column actually wiped (including the wide left-boundary fixup and
-    /// the WIDE-continuation co-wipe) is pushed onto `wiped`. The row has no
-    /// access to the grid-level extras map, so the caller uses this set to
-    /// scrub stale combining marks / orphaned complex-char strings from the
-    /// wiped cells while preserving their out-of-line truecolor (DECSERA).
+    /// Each wiped column (including the wide left-boundary fixup and the
+    /// continuation co-wipe) is pushed onto `wiped`, so the caller can scrub
+    /// stale combining marks / complex-char strings from the grid extras while
+    /// keeping their truecolor.
     #[inline]
     pub(crate) fn selective_wipe_range(&mut self, start: u16, end: u16, wiped: &mut Vec<u16>) {
         debug_assert!(
@@ -493,9 +447,9 @@ impl Row {
             let old_len = self.len as usize;
             let mut any_erased = false;
 
-            // Left boundary fixup: wiping the WIDE_CONTINUATION of an
-            // unprotected WIDE cell outside the range would orphan the WIDE
-            // cell — wipe it too (mirrors selective_clear_range, #7462).
+            // Left boundary fixup: wiping the continuation of an unprotected WIDE
+            // cell outside the range would orphan it, so wipe it too (as
+            // selective_clear_range does).
             if start_usize > 0
                 && self.cells[start_usize]
                     .flags()
@@ -507,14 +461,11 @@ impl Row {
             {
                 self.cells[start_usize - 1].set_char(' ');
                 wiped.push((start_usize - 1) as u16);
-                // `set_char` above cleared the lead's WIDE flag. Because
-                // WIDE_CONTINUATION and PROTECTED share bit 10, the in-range
-                // continuation at `start_usize` would now be misread as a
-                // standalone PROTECTED cell by `is_cell_protected` (its WIDE
-                // parent is gone), so the loop below would SKIP it and leave an
-                // orphaned continuation spacer. Clear its bit 10 here (without
-                // pushing — the loop records it normally once it is no longer
-                // seen as protected).
+                // `set_char` above cleared the lead's WIDE flag, so the
+                // continuation at `start_usize` would now read as a standalone
+                // PROTECTED cell (shared bit 10) and be skipped, leaving an
+                // orphaned spacer. Clear its bit 10 here; the loop records it
+                // once it no longer reads as protected.
                 self.cells[start_usize].set_char(' ');
                 any_erased = true;
             }
@@ -536,12 +487,10 @@ impl Row {
             }
             if any_erased {
                 self.flags |= RowFlags::DIRTY;
-                // Same off-by-one as selective_clear_range: the WIDE-head co-wipe
-                // touches cells[end], one column past the range, so gating on
-                // `end_usize >= old_len` misses the case where that was the tail
-                // content (old_len == end + 1). recalculate_len_up_to(old_len)
-                // rescans the prefix and never over-shrinks; a wiped cell that kept
-                // a non-default background is not is_empty(), so len still counts it.
+                // As in selective_clear_range: the WIDE-head co-wipe touches
+                // cells[end], so gating on `end_usize >= old_len` would miss that
+                // tail case. recalculate_len_up_to(old_len) never over-shrinks,
+                // and a wiped cell with a non-default background still counts.
                 if start_usize < old_len && self.cells[old_len - 1].is_empty() {
                     self.recalculate_len_up_to(old_len);
                 }

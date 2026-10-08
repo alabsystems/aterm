@@ -1,23 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BAKED CATALOG inside a Claude Code build
-//! (`docs/DESIGN-claude-live-upgrade-models-2026-09-24.md`).
+//! The baked model catalog inside a Claude Code build.
 //!
-//! Every 2.1.28x build carries a hand-maintained model catalog as a JavaScript
-//! object literal (READ, strings L312348): one `{id:"claude-…",family:"…",
-//! display_name:"…",…,context:{window:…,native_1m:!0,…},…,capabilities:[…]}`
-//! per model and, after them, `latest_per_family:{fable:"claude-fable-5-1",
-//! opus:"claude-opus-5-5",…}` — the build's own statement of the newest model
-//! of each family. That literal is how a NEW build recommends a new model
-//! without any network call, and the model entries are how the harness knows
-//! whether a model id is one the build understands (a full id the build does
-//! not know runs with no capabilities, default pricing and a 200k window).
+//! Every 2.1.28x build carries a model catalog as a JavaScript object literal:
+//! one `{id:"claude-…",family:"…",display_name:"…",…,context:{…},…,
+//! capabilities:[…]}` per model and, after them,
+//! `latest_per_family:{fable:"claude-fable-5-1",opus:"claude-opus-5-5",…}`,
+//! the build's own statement of the newest model of each family. That is how a
+//! new build recommends a new model without a network call, and how the
+//! harness knows whether a model id is one the build understands.
 //!
-//! The scan reads the binary in bounded chunks (a 217 MB file is never held
-//! whole), finds `latest_per_family:{`, and parses the entries in the window
-//! before it. It runs once per build: the result is cached by the caller,
-//! keyed on the build's path, size and mtime.
+//! The scan reads the binary in bounded chunks, finds `latest_per_family:{`,
+//! and parses the entries before it. The caller caches the result per build
+//! path, size and mtime.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -179,10 +175,9 @@ pub fn parse_window(text: &str) -> Option<Baked> {
 pub struct BuildFacts {
     /// The baked catalog, when the marker was found.
     pub baked: Option<Baked>,
-    /// The version the build reports: the MOST FREQUENT `VERSION:"x.y.z"`
-    /// literal, seen at least twice — the bundle's build-info object appears
-    /// 264 times in 2.1.280 and a bundled dependency's `VERSION:"2.0.0"`
-    /// once (MEASURED).
+    /// The version the build reports: the most frequent `VERSION:"x.y.z"`
+    /// literal, seen at least twice (the build-info object repeats hundreds of
+    /// times; a bundled dependency's `VERSION` appears once).
     pub version: Option<String>,
 }
 
@@ -201,7 +196,7 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Scan a Claude Code binary ONCE for its catalog and its version, reading
+/// Scan a Claude Code binary once for its catalog and its version, reading
 /// in bounded chunks (a 217 MB file is never held whole). The result is
 /// cached by the caller per (path, size, mtime), in memory and on disk, so a
 /// build is read once in its life.
@@ -379,7 +374,7 @@ pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-/// The baked catalog of `binary`, scanned ONCE per build in its life: cached on
+/// The baked catalog of `binary`, scanned once per build in its life: cached on
 /// disk under `cache_dir`, keyed by path, size and mtime (the sweep runs every
 /// minute; a 217 MB scan must not).
 #[must_use]
@@ -392,11 +387,7 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
         .map_or(0, |d| d.as_secs());
     // FNV-1a over the key: a file name, not a secret.
     let key = format!("{}|{}|{mtime}", binary.display(), m.len());
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in key.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
+    let h = aterm_hash::fnv1a_64(key.as_bytes());
     let file = cache_dir.join(format!("{h:016x}.json"));
     if let Some(facts) = std::fs::read_to_string(&file)
         .ok()

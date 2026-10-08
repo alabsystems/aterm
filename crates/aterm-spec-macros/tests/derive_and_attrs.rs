@@ -301,11 +301,10 @@ fn the_record_reports_its_size_rather_than_only_its_contents() {
 /// THE COST CONTRACT, asserted behaviourally rather than promised in a comment.
 ///
 /// The probe is injected into ~190 bodies tree-wide, including `Terminal::write_char`
-/// — the per-character path for every non-ASCII, styled, insert-mode and VT52 write —
-/// and including bodies inside `aterm-gui`'s `frame_latency` criterion benchmark's
-/// measured region. So an UN-ARMED probe must do nothing at all beyond one
-/// thread-local `bool` load: no `RefCell` borrow, no `BTreeSet` insert, no string
-/// comparisons down a tree that grows with every anchor a conformance has entered.
+/// — the per-character path for every non-ASCII, styled, insert-mode and VT52 write.
+/// So an UN-ARMED probe must do nothing at all beyond one thread-local `bool` load:
+/// no `RefCell` borrow, no `BTreeSet` insert, no string comparisons down a tree
+/// that grows with every anchor a conformance has entered.
 ///
 /// "Does nothing" is observable exactly as "records nothing", which is what this
 /// asserts. Only `reset_entered_anchors` arms, and `disarm_entered_anchors` closes the

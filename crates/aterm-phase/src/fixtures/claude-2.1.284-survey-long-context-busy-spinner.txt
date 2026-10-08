@@ -1,0 +1,10 @@
+# claude-code 2.1.284 · HAND-BUILT 2026-09-28 (no live capture yet): the card's rows are synthesized from the 2.1.284 render code (VM, the plugin and memory cards, Cle) and checked against the store binary's literals; the framing rows are the real captures' (survey-open.txt, wait_bg6.out)
+⏺ Running 1 shell command…
+✽ Ebbing… (3m 2s · ↓ 10.8k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+● How well is Claude following the instructions you gave earlier in this conversation? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents                                                      /rc active

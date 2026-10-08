@@ -95,8 +95,8 @@ declare_class! {
             r * 100.0 + g * 10.0 + b
         }
 
-        /// The exact signature of `aterm-gui/src/toolbar.rs:3990`,
-        /// `-(BOOL)control:textView:doCommandBySelector:` — three arguments of
+        /// The exact signature of `aterm-gui/src/toolbar.rs`'s
+        /// `-(BOOL)control:textView:doCommandBySelector:` override — three arguments of
         /// three different encodings and a `BOOL` return, which is one of the
         /// two real sites D1 blocked.
         @sel(control:textView:doCommandBySelector:)
@@ -104,7 +104,7 @@ declare_class! {
             Bool::new(command == sel!(insertNewline:))
         }
 
-        /// The exact signature of `aterm-gui/src/toolbar.rs:3379`,
+        /// The exact signature of `aterm-gui/src/toolbar.rs`'s
         /// `-(NSToolbarItem *)toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:`:
         /// the other site D1 blocked, and the one that ALSO needs D5. It
         /// returns a brand-new object, so it owes its caller +0 — hence

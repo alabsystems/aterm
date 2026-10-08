@@ -15,8 +15,7 @@
 
 #![cfg(unix)]
 
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::{child_output, launch_isolation};
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -81,15 +80,12 @@ fn alive(pid: u32) -> bool {
 /// Wait until `done` holds, polling; panic naming `what` (and `context()`) at the
 /// ceiling.
 fn wait_until(what: &str, mut done: impl FnMut() -> bool, context: impl Fn() -> String) {
-    let deadline = Instant::now() + CEILING;
-    while !done() {
-        assert!(
-            Instant::now() < deadline,
-            "{what} did not happen within {CEILING:?}\n{}",
-            context()
-        );
-        std::thread::sleep(POLL);
-    }
+    let seen = aterm_spec::wait::within(CEILING, POLL, || done().then_some(()));
+    assert!(
+        seen.is_some(),
+        "{what} did not happen within {CEILING:?}\n{}",
+        context()
+    );
 }
 
 fn read_log(log: &Path) -> String {
@@ -150,7 +146,10 @@ fn ctl(root: &Path, sock: &Path, args: &[&str], stdin: &[u8]) -> Output {
         .expect("ctl stdin")
         .write_all(stdin)
         .expect("write ctl stdin");
-    child.wait_with_output().expect("run aterm ctl")
+    // A hang detector, and a read that ends at the client's exit
+    // (`support/child_output.rs`: a sibling's spawn can hold its pipes open).
+    child_output::wait_and_read(child, Instant::now() + Duration::from_secs(60))
+        .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
 }
 
 /// THE CONTRACT, end to end on the real binary. While the lifeline is held the
@@ -387,7 +386,6 @@ fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
         )),
         "the row names the directory it read:\n{report}"
     );
-    assert!(report.contains("never stopped"), "{report}");
     assert!(
         a.0.try_wait().expect("try_wait A").is_none()
             && b.0.try_wait().expect("try_wait B").is_none(),

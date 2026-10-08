@@ -2,23 +2,13 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exhaustive cursor invariant proofs for reflow (#3975).
-//!
-//! Verifies that after any reflow (shrink or grow), the cursor is within
-//! bounds: `cursor.row < visible_rows && cursor.col < cols`. Tests exercise
-//! the symmetric initialization fix (commit 927d232) where both
-//! `reflow_shrink_columns` and `reflow_grow_columns` now use
-//! `(cursor_row, cursor_col)` as the fallback cursor position.
+//! Exhaustive cursor invariant tests for reflow: after any shrink or grow,
+//! `cursor.row < visible_rows && cursor.col < cols`.
 
 use super::super::super::*;
 
-/// Exhaustive grid: all (rows, old_cols, new_cols) triples in [1..max],
-/// cursor at every valid (row, col) position. Verifies `assert_invariants()`
-/// passes after resize.
-///
-/// This is the core proof that the cursor invariant holds for ALL resize
-/// dimensions, not just sampled ones. The max is kept small (8) so the test
-/// runs in under 1 second despite O(max^5) iterations.
+/// Every (rows, old_cols, new_cols) triple in [1..8] with the cursor at every
+/// position passes `assert_invariants()` after resize (O(max^5), kept small).
 #[test]
 fn cursor_invariant_exhaustive_small_grids() {
     let max: u16 = 8;
@@ -70,10 +60,8 @@ fn cursor_invariant_exhaustive_small_grids() {
     );
 }
 
-/// Cursor on an empty row (no content) during shrink: the cursor tracking
-/// in `reflow_shrink_columns` takes the `content_len == 0` branch which
-/// maps `(i == cursor_row)` → `(new_rows.len(), clamped_col)`. Verify this
-/// produces a valid cursor for all grid sizes.
+/// A cursor on an empty row during shrink (the `content_len == 0` branch)
+/// stays valid for all grid sizes.
 #[test]
 fn cursor_on_empty_row_shrink() {
     for rows in 1..=12u16 {
@@ -124,9 +112,7 @@ fn cursor_on_empty_row_grow() {
     }
 }
 
-/// Multiple resize cycles: shrink → grow → shrink → grow. Each step must
-/// leave the cursor in bounds. Exercises the round-trip path with the
-/// symmetric initialization fix.
+/// Shrink → grow → shrink → grow keeps the cursor in bounds at every step.
 #[test]
 fn cursor_invariant_multi_resize_cycle() {
     let dimensions: &[(u16, u16)] = &[
@@ -204,10 +190,8 @@ fn cursor_invariant_single_row_terminal() {
     }
 }
 
-/// Cursor on the last row with content that will expand during shrink.
-/// The shrink path produces more output rows than source rows, but
-/// `finalize_reflow` truncates to `target_rows`. The cursor must still
-/// be within bounds after truncation.
+/// A cursor on the last row whose content expands during shrink stays in
+/// bounds after `finalize_reflow` truncates to `target_rows`.
 #[test]
 fn cursor_on_last_row_with_expanding_content_shrink() {
     let rows: u16 = 4;
@@ -238,9 +222,7 @@ fn cursor_on_last_row_with_expanding_content_shrink() {
     grid.assert_invariants();
 }
 
-/// Scrollback + reflow: cursor survives shrink/grow with scrollback active.
-/// The presence of scrollback changes the ring buffer state but should not
-/// affect cursor validity after reflow.
+/// The cursor stays valid across shrink/grow with scrollback active.
 #[test]
 fn cursor_invariant_with_scrollback() {
     let rows: u16 = 5;

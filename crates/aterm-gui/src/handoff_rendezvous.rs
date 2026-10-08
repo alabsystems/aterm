@@ -83,25 +83,104 @@
 //! whoever connected first got the single accept, so any same-uid process could
 //! end an update by dialing before the successor did, for the price of one
 //! `connect(2)`. The wait now resumes after a refusal and only the deadline ends
-//! it, under the two bounds [`Rendezvous::accept_claim`] documents.
+//! it, under the two bounds [`Rendezvous::accept_claim_observed`] documents.
 //!
 //! This is still deliberately the opposite posture from the control socket,
 //! which is a long-lived token-authenticated verb dispatcher — a handoff verb
 //! there would outlive the attempt and be reachable by every same-uid process
 //! for as long as the terminal ran.
 //!
-//! # Two independent gates on the peer
+//! # Three gates on the peer, and which one keeps a stranger out
 //!
 //! * THE CLAIM SECRET — 32 CSPRNG bytes, published only in the successor's
 //!   launch environment, compared in constant time. It binds the connection to
-//!   THIS attempt.
-//! * THE KERNEL-ATTESTED PEER PID — `LOCAL_PEERPID`, cross-checked against the
-//!   pid LaunchServices reported for the instance it started. It binds the
-//!   connection to THIS launch, and it is the half a peer cannot assert for
-//!   itself — which is exactly what an environment-published secret lacks, since
-//!   anything that could read our environment could also copy the secret.
+//!   THIS attempt. It is NOT secret from this uid: a process's initial
+//!   environment stays readable to every same-uid process for the process's
+//!   whole life (`KERN_PROCARGS2`, what `ps eww` prints; clearing `environ`
+//!   does not touch that copy), and the successor's boot re-exec carries the
+//!   claim into its new image's too. So the secret proves a dialer is about this
+//!   attempt, never that it is the successor.
+//! * THE KERNEL-ATTESTED PEER PID — `LOCAL_PEERPID`, compared with the pid
+//!   LaunchServices reports for the instance it started. A peer cannot assert
+//!   it, but LaunchServices answers only when the launched app checks in, and a
+//!   successor checks in after its grant (it dials before its `NSApplication`
+//!   exists), so on the launched lane the pid cannot gate the grant: it
+//!   corroborates after the dial, and a mismatch — or LaunchServices' word that
+//!   the process it launched has exited while the dialer lives — refuses before
+//!   Commit.
+//! * THE DIALER'S CODE ([`DialerCode`], round eight of the update audit, U36) —
+//!   the kernel's audit token for the connection (`LOCAL_PEERTOKEN`) names the
+//!   dialing process, and Security.framework checks the code it runs against
+//!   the requirement the successor's code meets: for every successor that runs
+//!   an update candidate under a pinned team — a fresh cached pass, a worker
+//!   that verifies again, an installed activation — an aterm release's own
+//!   requirement (identifier `com.aterm.aterm` and a Developer ID of the team
+//!   every candidate was verified against); only for the same-image QA seam, or
+//!   with no team pinned, the designated requirement of the code the launch
+//!   named. It is checked BEFORE any descriptor leaves, and it is what keeps
+//!   out a same-uid process that copied the secret and dials with its own code.
+//!   Until 2026-10-02 the launched lane had only the secret before the grant,
+//!   and any same-uid process that read it could take every PTY master and both
+//!   pipes. A check macOS's code-signing service (`trustd`) does not answer is
+//!   neither a pass nor a refusal: the connection is held and checked again
+//!   until the dial deadline ([`Rendezvous::accept_claim_observed`]), and a
+//!   refusal reaches the caller typed ([`CodeRefusal`]), so the attempt is
+//!   filed by its cause.
 //!
-//! Both must pass; neither is redundant.
+//! WHOM THE CODE GATE JUDGES (U36's second review). The audit token is the
+//! kernel's answer AT THE MOMENT IT IS READ, for the process on the other end
+//! as it is then — and on Darwin that is the process that last USED the
+//! connection, not the one that `connect(2)`ed. Measured 2026-10-03 (round
+//! eight's U0 review): `LOCAL_PEERTOKEN` and `LOCAL_PEERPID` both name whichever
+//! process last wrote on the connection, and change at each use
+//! (`aterm_uds::peer`'s `the_peer_is_the_connections_last_user_read_live`), and
+//! an `exec` at that pid moves the token's pid version while the pid stays
+//! (`a_grant_is_not_sent_once_the_dialers_image_changed`). So the gate never
+//! reads it twice as if it were one fact: it reads it ONCE, right after the
+//! claim; requires it to name the kernel-attested dialer pid; checks the code of
+//! exactly that token at the first check and at every recheck of a held dialer
+//! (a later image at the pid carries another pid version, and its lookup fails,
+//! `Unchecked`); and, just before the `sendmsg` that carries the first
+//! descriptor, reads it again and sends nothing unless the kernel still answers
+//! that same token, word for word ([`ClaimedPeer::transfer`], both grants). The
+//! pid the parent registers, watches and kills as its candidate is the pid that
+//! token names.
+//!
+//! What the code gate leaves, stated plainly:
+//!
+//! * A same-uid process that runs GENUINE aterm code with the copied secret
+//!   passes it — and then holds the sessions inside an aterm, as the PTY
+//!   keeper's floor (its design §5.7) accepts, since same-uid code can already
+//!   drive every session through the control socket's token and the hardened
+//!   runtime keeps it out of aterm's process. The pid corroboration still
+//!   refuses that dialer before Commit when LaunchServices answers in time.
+//! * The token names who used the connection LAST when it was read; it does not
+//!   say who will READ the grant, and it does not say who presented the claim.
+//!   A connection whose descriptor another process also holds, and which that
+//!   process does not use between the checks, reads the same before the
+//!   `sendmsg` as at the gate, and the grant goes to whichever process reads it.
+//!   Reaching that state takes NO cooperation from code that passed the gate
+//!   (an earlier version of this paragraph said it did): a same-uid process
+//!   can dial and claim, keep a copy of the connection in a second process that
+//!   never touches it, and replace its own image with a genuine aterm (any
+//!   invocation that stays up) before the gate reads the token — and it can
+//!   hold this process still across that `exec` (`SIGSTOP`, which any process
+//!   of the uid may send). The gate then judges a genuine aterm at the attested
+//!   pid, the check before the send finds it unchanged, and the copy reads every
+//!   descriptor. Derived from the measured semantics above, not run end to
+//!   end. The pid corroboration still refuses such a dialer before Commit when
+//!   LaunchServices answers in time, but after the descriptors left
+//!   (`TransferPartial`: the attested candidate is killed and proven dead, and
+//!   the copy keeps what it read). Closing it needs a binding to the process
+//!   that PRESENTED the claim that no later use of the connection can move —
+//!   a sender credential captured when the claim is sent (a Mach message's
+//!   audit trailer), or a per-attempt secret only aterm's signed code can read
+//!   — which is a change of this transport, left to a design decision (round
+//!   eight of the update audit, U36: fixed in part).
+//! * The PTY keeper's check of its peers is the same machinery, reading the
+//!   same token ONCE, at accept, and serving the connection after — orphaned
+//!   masters included — so it is open the same way (`aterm_keeper::identity`'s
+//!   module docs record it). The pending decision covers both consumers.
 //!
 //! # Why the adoption proof's fd-number term cannot come along
 //!
@@ -345,6 +424,13 @@ fn grant_chunk_sizes(sessions: usize) -> Vec<usize> {
     sizes
 }
 
+/// How often a connection held for a code check `trustd` did not answer is
+/// checked again ([`Rendezvous::accept_claim_observed`]). While an earlier check is
+/// overdue the process's `trustd` gate refuses a new one at once, so a check
+/// costs nothing until `trustd` answers again; this only bounds how late the
+/// hold notices that it has.
+const CODE_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
+
 /// How long one `poll` slice waits before the accept loop re-checks the caller's
 /// abort predicate and the deadline. Short enough that a cancel poke during a
 /// long successor boot is noticed promptly, long enough that the loop is not a
@@ -367,7 +453,7 @@ const CLAIM_FRAME_BUDGET: Duration = Duration::from_secs(2);
 /// How many connections may be refused before the attempt gives up.
 ///
 /// Refusing and continuing is what stops one wrong dialer from denying the
-/// update (see [`Rendezvous::accept_claim`]), but "keep accepting" must not
+/// update (see [`Rendezvous::accept_claim_observed`]), but "keep accepting" must not
 /// become "can be kept busy for free": a peer that connects and resets in a
 /// tight loop would otherwise spin this thread for the rest of the deadline.
 /// The cap is far above anything a real machine produces — the path is
@@ -423,6 +509,11 @@ pub(crate) enum RendezvousError {
     PeerPid { expected: i32, actual: i32 },
     /// The kernel would not attest the peer at all.
     PeerUnattested(String),
+    /// The dialer (the kernel-attested `pid`) presented the secret and its code
+    /// was not admitted ([`DialerCode`]): refused, or not checked, and which,
+    /// typed ([`CodeRefusal`]), so the attempt is filed by its cause. Either way
+    /// no descriptor goes to it.
+    PeerCode { pid: i32, refusal: CodeRefusal },
     /// The transfer failed BEFORE the one descriptor-carrying `sendmsg`
     /// succeeded — an unencodable grant, a socket the write timeout would not
     /// take, or the `sendmsg` itself. No descriptor of ours left this process,
@@ -514,6 +605,12 @@ impl std::fmt::Display for RendezvousError {
             ),
             Self::PeerUnattested(error) => {
                 write!(f, "the kernel would not attest the dialer: {error}")
+            }
+            Self::PeerCode { pid, refusal } => {
+                write!(
+                    f,
+                    "the dialer (pid {pid}) presented the claim, and {refusal}"
+                )
             }
             Self::GrantDeadline => f.write_str(
                 "the handoff's proof deadline passed before the grant was sent (the successor \
@@ -743,7 +840,9 @@ fn sweep_dead_rendezvous(dir: &Path) {
         let Some(rest) = name.strip_prefix("seamless-") else {
             continue;
         };
-        if !name.ends_with(".sock") {
+        // A dead attempt's launch stamp goes with its node.
+        let node = name.strip_suffix(LAUNCH_STAMP_SUFFIX).unwrap_or(&name);
+        if !node.ends_with(".sock") {
             continue;
         }
         let Some((pid, _)) = rest.split_once('-') else {
@@ -783,6 +882,414 @@ pub(crate) fn rendezvous_path_fits() -> bool {
     rendezvous_path(&dir, &"0".repeat(32))
         .to_str()
         .is_some_and(crate::control_auth::sun_path_ok)
+}
+
+/// The signing identifier every aterm release is cut with: the bundle's
+/// `CFBundleIdentifier` (`apps/aterm-mac/Info.plist`; `aterm-release`'s cut
+/// stamps `com.aterm.aterm`), which `codesign` gives the main executable, and
+/// the identifier the installed app's own designated requirement names (the PTY
+/// keeper's floor checks its peers against exactly that requirement,
+/// `DESIGN-pty-keeper` §11.1).
+pub(crate) const RELEASE_SIGNING_IDENTIFIER: &str = "com.aterm.aterm";
+
+/// THE CODE A DIALER MUST RUN TO TAKE THE GRANT — the gate on the launched
+/// lane that a same-uid process cannot assert for itself (round eight of the
+/// update audit, U36; see the module docs' "Three gates").
+///
+/// Checked by [`Rendezvous::accept_claim_observed`] on every connection that presented
+/// the secret, through the connection's audit token, read once at the claim and
+/// required to name the attested pid (never a pid that may have been recycled,
+/// and never a second read; the module docs' "Whom the code gate judges" says
+/// what that leaves): `aterm_keeper::identity`, the same Security.framework check
+/// the PTY keeper makes of its peers. A connection whose code is refused is
+/// closed, and the wait goes on for the successor, exactly as for a wrong
+/// secret. A connection whose check `trustd` did not answer is HELD and checked
+/// again ([`CodeRefusal::TrustdSilent`]): never a pass, and never a refusal of a
+/// successor for the machine's moment.
+///
+/// Which code that is, is the launch's to say ([`Self::release`],
+/// [`Self::code_at`]); this type only checks it.
+pub(crate) struct DialerCode {
+    rule: DialerCodeRule,
+}
+
+enum DialerCodeRule {
+    /// A requirement fixed before the launch.
+    Stated(aterm_keeper::identity::Identity),
+    /// The designated requirement of the code at this path, read when a dialer
+    /// has presented the secret: by then the successor's boot swap has put its
+    /// own build there, so an ad-hoc build's cdhash requirement names the code
+    /// the successor runs, not the code this process was started from.
+    CodeAt(PathBuf),
+}
+
+/// Why [`DialerCode`] did not admit a dialer that presented this attempt's
+/// secret — typed, because the three are filed differently (round eight of
+/// the update audit, U36's review): only the first is a verdict on the code
+/// that dialled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodeRefusal {
+    /// Checked and refused: the code the dialer runs does not meet the rule.
+    Refused(String),
+    /// Not checked: macOS's code-signing service (`trustd`) did not answer, at
+    /// the check's hang detector or at once because an earlier check in this
+    /// process is overdue (`aterm_uds::deadline::TRUST`). The machine's moment:
+    /// the same dialer may pass once `trustd` answers, so the gate holds it and
+    /// checks again rather than closing it.
+    TrustdSilent(String),
+    /// Not checked for another reason: the kernel would not name the dialer, its
+    /// code could not be looked up (it exited, or the file it was started from
+    /// was replaced under it — a sibling launch's swap of the same build, round
+    /// eight #75), or the code at the launched bundle had no requirement to read.
+    Unchecked(String),
+}
+
+impl CodeRefusal {
+    /// Whether this is a verdict on the code that dialled
+    /// ([`Self::Refused`]), rather than a check that did not happen.
+    #[must_use]
+    pub(crate) fn is_verdict(&self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+}
+
+impl std::fmt::Display for CodeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) => {
+                write!(
+                    f,
+                    "its code does not meet the successor's requirement ({why})"
+                )
+            }
+            Self::TrustdSilent(why) => write!(f, "its code could not be checked: {why}"),
+            Self::Unchecked(why) => write!(f, "its code could not be checked ({why})"),
+        }
+    }
+}
+
+impl DialerCode {
+    /// Code signed as an aterm release: identifier
+    /// [`RELEASE_SIGNING_IDENTIFIER`] and a Developer ID of `team` — the
+    /// installed app's own designated requirement (measured 2026-10-02 on the
+    /// owner's Mac: the running installed v0.100.0 window met it as a PROCESS,
+    /// `codesign --verify -R <requirement> <pid>`, in 0.5 s, and the same
+    /// requirement naming `com.aterm.aterm.dev`, or another team's OU, did not).
+    /// Every update candidate passed the Developer ID half before this lane was
+    /// chosen for it (`codesign --verify -R`, `aterm_update_core::codesign`), and
+    /// the launching worker reads the candidate's identifier before it launches
+    /// anything: a candidate signed otherwise takes the fork lane, whose gate
+    /// does not ask (`app_update_handoff::launched_dialer_code`). So every
+    /// successor this rule gates was cut with it, whatever its build — and so
+    /// is one whose boot swap was deferred and which still runs the outgoing
+    /// image, when that image is a release too.
+    ///
+    /// # Errors
+    /// A team that is no team, or a requirement Security.framework refuses.
+    pub(crate) fn release(team: &str) -> Result<Self, String> {
+        let source = aterm_update_core::codesign::developer_id_requirement(team)
+            .map_err(|error| error.to_string())?;
+        // `codesign -R` reads requirement text after an `=`; Security.framework
+        // reads the text itself.
+        let developer_id = source.strip_prefix('=').unwrap_or(&source);
+        let text = format!("identifier \"{RELEASE_SIGNING_IDENTIFIER}\" and {developer_id}");
+        Ok(Self {
+            rule: DialerCodeRule::Stated(aterm_keeper::identity::Identity::for_requirement(&text)?),
+        })
+    }
+
+    /// The code at `path` (the bundle LaunchServices launches), by its own
+    /// designated requirement, read at each check. For a successor no team pins
+    /// and for the same-image seam, whose successor re-runs this image.
+    pub(crate) fn code_at(path: PathBuf) -> Self {
+        Self {
+            rule: DialerCodeRule::CodeAt(path),
+        }
+    }
+
+    /// This process's own code: the dialer of a test that dials from inside
+    /// the test binary.
+    #[cfg(test)]
+    pub(crate) fn this_process() -> Self {
+        Self {
+            rule: DialerCodeRule::Stated(
+                aterm_keeper::identity::Identity::for_self(
+                    aterm_keeper::identity::IdentityPolicy::Designated,
+                )
+                .expect("this test binary has a designated requirement"),
+            ),
+        }
+    }
+
+    /// No code requirement at all — the same-uid floor, which every dialer of
+    /// the `0600` socket already meets. The launched lane's gate before
+    /// 2026-10-02, kept only as the Tier-1's negative control.
+    #[cfg(test)]
+    pub(crate) fn same_uid_floor_for_test() -> Self {
+        Self {
+            rule: DialerCodeRule::Stated(aterm_keeper::identity::Identity::same_uid()),
+        }
+    }
+
+    /// One line for the log: what a dialer's code is checked against.
+    pub(crate) fn describe(&self) -> String {
+        match &self.rule {
+            DialerCodeRule::Stated(identity) => identity.describe().to_string(),
+            DialerCodeRule::CodeAt(path) => {
+                format!(
+                    "the designated requirement of the code at {}",
+                    path.display()
+                )
+            }
+        }
+    }
+
+    /// Whether the process `token` names — the dialer on `stream` as the gate
+    /// read it once, at its claim ([`Rendezvous::gate_one`]) — runs code this
+    /// rule admits. The token must name the kernel-attested dialer pid
+    /// `attested`, or nothing is checked ([`CodeRefusal::Unchecked`]); and it is
+    /// the SAME token at every recheck of a held dialer, so a later image at
+    /// that pid fails the code lookup instead of being judged in its place.
+    /// Bounded: a `trustd` that does not answer is [`CodeRefusal::TrustdSilent`]
+    /// at the keeper's peer-check hang detector (at once while an earlier check
+    /// is overdue), never a pass.
+    fn admit(
+        &self,
+        stream: &CtlStream,
+        attested: i32,
+        token: Option<aterm_uds::peer::AuditToken>,
+    ) -> Result<(), CodeRefusal> {
+        if let Some(named) = token
+            && u32::try_from(attested).ok() != Some(named.pid())
+        {
+            return Err(CodeRefusal::Unchecked(format!(
+                "the kernel's audit token names pid {}, not the attested dialer",
+                named.pid()
+            )));
+        }
+        let read;
+        let identity = match &self.rule {
+            DialerCodeRule::Stated(identity) => identity,
+            DialerCodeRule::CodeAt(path) => {
+                read = aterm_keeper::identity::Identity::for_code_at(path).map_err(|why| {
+                    CodeRefusal::Unchecked(format!(
+                        "the code at {} has no requirement to check it against: {why}",
+                        path.display()
+                    ))
+                })?;
+                &read
+            }
+        };
+        identity
+            .check_named(stream, token, Duration::ZERO)
+            .map_err(|error| match error {
+                aterm_keeper::identity::CheckError::Refused(why) => CodeRefusal::Refused(why),
+                aterm_keeper::identity::CheckError::Unanswered(why) => {
+                    CodeRefusal::TrustdSilent(why)
+                }
+                aterm_keeper::identity::CheckError::Unchecked(why) => CodeRefusal::Unchecked(why),
+            })
+    }
+}
+
+/// A dialer that presented this attempt's secret and was not admitted by its
+/// code, as [`Rendezvous::accept_claim_observed`] reports it — while its
+/// connection is still open, so the caller can witness the process alive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeRefusedDialer {
+    /// The kernel-attested pid (`LOCAL_PEERPID`).
+    pub(crate) pid: i32,
+    pub(crate) refusal: CodeRefusal,
+    /// How the connection ended.
+    pub(crate) end: CodeRefusedEnd,
+}
+
+/// How a connection [`CodeRefusedDialer`] names ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodeRefusedEnd {
+    /// This process closed it on the refusal; the dialer was alive, and a
+    /// successor that reads that end of file exits by its own rule (a failed
+    /// claim exits before any window).
+    Closed,
+    /// It was held for a check `trustd` did not answer, and the dialer hung up
+    /// while held: it left on its own, before any refusal of ours.
+    LeftWhileHeld,
+}
+
+/// A connection [`Rendezvous::gate_one`] admitted, as it judged it.
+struct Admitted {
+    /// The kernel-attested dialer pid (`LOCAL_PEERPID`).
+    pid: i32,
+    /// The dialer claimed with `ATRZ2C`.
+    chunks: bool,
+    /// The dialer's audit token as the gate read it, once, and checked.
+    token: Option<aterm_uds::peer::AuditToken>,
+}
+
+/// How [`Rendezvous::gate_one`] did not admit its connection.
+enum Gated {
+    /// This connection is refused, and the wait goes on.
+    Refused(RendezvousError),
+    /// The wait itself ended — `end` is [`RendezvousError::Cancelled`] or
+    /// [`RendezvousError::Deadline`] — while this connection was held for a
+    /// code check `trustd` did not answer; `held` is that refusal.
+    WaitEnded {
+        end: RendezvousError,
+        held: RendezvousError,
+    },
+}
+
+/// The code gate over one connection that presented the secret ([`DialerCode`]),
+/// HOLDING it while `trustd` does not answer: re-checked every
+/// [`CODE_RECHECK_INTERVAL`], the dialer watched for a hangup and the wait's
+/// abort and deadline between checks (see [`Rendezvous::accept_claim_observed`]).
+/// Every check, the first and each recheck, judges the process `token` named
+/// when the gate read it once, at the claim; never a fresh read.
+/// `refused` hears of every way this connection ends unadmitted except the
+/// wait's own end with the dialer still there, which the caller learns from
+/// [`Gated::WaitEnded`].
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "native_update_rendezvous_admission",
+        action = "DeadlineWhileHeld",
+        project = "aterm_gui::app_update_handoff::launched_dialer_admission_conformance::project"
+    )
+)]
+fn admit_code(
+    stream: &CtlStream,
+    pid: i32,
+    token: Option<aterm_uds::peer::AuditToken>,
+    code: &DialerCode,
+    deadline: Instant,
+    abort: &dyn Fn() -> bool,
+    refused: &dyn Fn(&CodeRefusedDialer),
+) -> Result<(), Gated> {
+    let mut held_since: Option<Instant> = None;
+    loop {
+        let silent = match code.admit(stream, pid, token) {
+            Ok(()) => {
+                if let Some(since) = held_since {
+                    aterm_log::info!(
+                        "overlap handoff: macOS's code-signing service answered; admitted the \
+                         rendezvous dialer (pid {pid}) after holding it {} ms",
+                        since.elapsed().as_millis()
+                    );
+                }
+                return Ok(());
+            }
+            Err(CodeRefusal::TrustdSilent(why)) => why,
+            Err(refusal) => {
+                // A dialer that died while held makes its own lookup fail: that
+                // is its leaving, not our refusal of a live process.
+                let end = if held_since.is_some() && dialer_left(stream, Duration::ZERO) {
+                    CodeRefusedEnd::LeftWhileHeld
+                } else {
+                    CodeRefusedEnd::Closed
+                };
+                refused(&CodeRefusedDialer {
+                    pid,
+                    refusal: refusal.clone(),
+                    end,
+                });
+                return Err(Gated::Refused(RendezvousError::PeerCode { pid, refusal }));
+            }
+        };
+        let held = || RendezvousError::PeerCode {
+            pid,
+            refusal: CodeRefusal::TrustdSilent(silent.clone()),
+        };
+        if held_since.is_none() {
+            held_since = Some(Instant::now());
+            aterm_log::warn!(
+                "overlap handoff: holding the rendezvous dialer (pid {pid}) whose code could not \
+                 be checked ({silent}); checking again every {} ms until it is admitted, refused \
+                 or gone, or the dial deadline",
+                CODE_RECHECK_INTERVAL.as_millis()
+            );
+        }
+        let recheck_at = Instant::now() + CODE_RECHECK_INTERVAL;
+        loop {
+            if abort() {
+                if dialer_left(stream, Duration::ZERO) {
+                    refused(&CodeRefusedDialer {
+                        pid,
+                        refusal: CodeRefusal::TrustdSilent(silent.clone()),
+                        end: CodeRefusedEnd::LeftWhileHeld,
+                    });
+                }
+                return Err(Gated::WaitEnded {
+                    end: RendezvousError::Cancelled,
+                    held: held(),
+                });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Gated::WaitEnded {
+                    end: RendezvousError::Deadline,
+                    held: held(),
+                });
+            }
+            if now >= recheck_at {
+                break;
+            }
+            let slice = recheck_at
+                .min(deadline)
+                .saturating_duration_since(now)
+                .min(ACCEPT_POLL_SLICE);
+            if dialer_left(stream, slice) {
+                refused(&CodeRefusedDialer {
+                    pid,
+                    refusal: CodeRefusal::TrustdSilent(silent.clone()),
+                    end: CodeRefusedEnd::LeftWhileHeld,
+                });
+                return Err(Gated::Refused(held()));
+            }
+        }
+    }
+}
+
+/// Whether the dialer on a held connection has gone, waiting up to `wait` for
+/// it to: a hangup, an error, or end of file. Bytes it sends instead are no
+/// hangup (a successor sends nothing more before its grant) and are left
+/// unread; the slice is slept out then, so a chatty peer cannot make the hold
+/// spin.
+fn dialer_left(stream: &CtlStream, wait: Duration) -> bool {
+    let mut fds = [libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    }];
+    // SAFETY: `fds` is one initialised pollfd naming a descriptor `stream` owns,
+    // valid for the call; the timeout is a bounded slice.
+    let ready = unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            1,
+            i32::try_from(wait.as_millis()).unwrap_or(i32::MAX),
+        )
+    };
+    if ready <= 0 {
+        return false;
+    }
+    if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+    let mut byte = 0u8;
+    // SAFETY: a one-byte peek into a live local; `MSG_DONTWAIT` never blocks.
+    let peeked = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&raw mut byte).cast::<libc::c_void>(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if peeked == 0 {
+        return true;
+    }
+    std::thread::sleep(wait);
+    false
 }
 
 /// A bound, single-use rendezvous listener plus the secret that admits exactly
@@ -867,18 +1374,24 @@ impl Rendezvous {
         &self.claim
     }
 
-    /// Wait for the successor, check both gates, and hand back the connection.
+    /// Wait for the successor, check the gates, and hand back the connection.
     ///
     /// `expected_pid` is what LaunchServices reported for the instance it
-    /// started. `abort` is polled between slices so a cancel poke does not have
-    /// to wait out the whole deadline.
+    /// started, and `code` the code the successor runs ([`DialerCode`]). `abort`
+    /// is polled between slices so a cancel poke does not have to wait out the
+    /// whole deadline. `refused` hears of every dialer that presented the secret
+    /// and was not admitted by its code, the moment its connection ends and
+    /// before it is closed, so the caller can witness the dialer while it is
+    /// still alive: the launched lane's wait files a successor that then exits
+    /// by that refusal's cause, never as a death it cannot explain (round eight
+    /// of the update audit, U36's review).
     ///
-    /// A CONNECTION THAT FAILS EITHER GATE IS REFUSED; THE ATTEMPT IS NOT. Only
+    /// A CONNECTION THAT FAILS ANY GATE IS REFUSED; THE ATTEMPT IS NOT. Only
     /// the deadline, the abort predicate and a successful claim end the wait.
     /// The earlier shape ended it on the first bad connection, which read as
     /// prudence and was not: the socket is `0600` inside a `0700` directory, so a
-    /// wrong dialer is already known to be same-uid, and the claim secret is what
-    /// stops it TAKING the handoff. Letting it also END the handoff handed every
+    /// wrong dialer is already known to be same-uid, and the gates are what stop
+    /// it TAKING the handoff. Letting it also END the handoff handed every
     /// same-uid process a denial of UPDATE costing one `connect(2)` — a strictly
     /// worse trade than closing that connection and going back to waiting. "This
     /// connection is not our successor" and "this attempt is over" are different
@@ -904,18 +1417,36 @@ impl Rendezvous {
     /// on to dial. Refusing that dial for want of a pid to compare it against
     /// would throw away a live, correct successor.
     ///
-    /// Dropping the comparison costs nothing that matters. The claim secret is
-    /// the authenticator — 32 bytes a stranger cannot guess, checked first — and
-    /// the socket is a `0700` node inside a `0700` directory, so a dialer is
-    /// already same-uid. The pid is DEFENCE IN DEPTH against our own confusion
-    /// (two attempts overlapping), not the thing keeping strangers out. When it
-    /// is available it is still compared; when it is not, the attested pid is
-    /// returned to the caller either way.
-    pub(crate) fn accept_claim(
+    /// What keeps a stranger out is then `code`, not the secret (round eight of
+    /// the update audit, U36). This doc used to call the secret the
+    /// authenticator, "32 bytes a stranger cannot guess" — but no same-uid
+    /// stranger has to guess it: the successor's launch environment is readable
+    /// to every process of this uid (`KERN_PROCARGS2`) for as long as it runs,
+    /// and with `None` here nothing else stood between such a process and every
+    /// master. The code check runs after the secret (an unknown dialer costs
+    /// one compare, not a code lookup) and after the pid, on every connection
+    /// that presents the secret; when the pid is available it is still compared,
+    /// and the attested pid is returned to the caller either way.
+    ///
+    /// A CODE CHECK `trustd` DID NOT ANSWER HOLDS ITS CONNECTION (U36's review).
+    /// The check waits on macOS's code-signing service, which can stop answering
+    /// (measured 2026-10-01: an installed build's check parked for as long as
+    /// anyone waited), and closing the successor's connection then would end the
+    /// attempt for the machine's moment — the successor reads end of file and
+    /// exits. So the connection is kept, its dialer watched for a hangup, and
+    /// its code checked again every [`CODE_RECHECK_INTERVAL`] until it is
+    /// admitted, refused, gone, or the wait itself ends (the abort, or the
+    /// deadline, which then answers with that refusal). The successor holds its
+    /// claim far longer than any dial deadline, so a `trustd` blip becomes a
+    /// delay, never a failure; other dialers wait in the backlog meanwhile,
+    /// which costs nothing, since `trustd` would answer none of them either.
+    pub(crate) fn accept_claim_observed(
         &self,
         expected_pid: Option<i32>,
+        code: &DialerCode,
         deadline: Instant,
         abort: &dyn Fn() -> bool,
+        refused: &dyn Fn(&CodeRefusedDialer),
     ) -> Result<ClaimedPeer, RendezvousError> {
         let mut refusals = 0usize;
         let mut last_refusal: Option<RendezvousError> = None;
@@ -927,44 +1458,83 @@ impl Rendezvous {
                 }
                 Err(error) => return Err(error),
             };
-            match self.gate_one(&stream, expected_pid, deadline) {
-                Ok((pid, chunks)) => {
+            let refusal = match self.gate_one(&stream, expected_pid, code, deadline, abort, refused)
+            {
+                Ok(Admitted { pid, chunks, token }) => {
                     return Ok(ClaimedPeer {
                         stream,
                         pid,
                         chunks,
+                        token,
                     });
                 }
-                Err(refusal) => {
-                    refusals += 1;
-                    aterm_log::warn!(
-                        "overlap handoff: refused rendezvous dialer #{refusals} ({refusal}); the \
-                         rendezvous stays open for the successor until the deadline"
-                    );
-                    if refusals >= MAX_REFUSED_DIALS {
-                        return Err(refusal);
-                    }
-                    last_refusal = Some(refusal);
-                    // Dropping `stream` here — before the next accept — is what
-                    // tells the refused dialer it was refused, and it is why a
-                    // flood cannot accumulate connections we are still holding.
+                Err(Gated::Refused(refusal)) => refusal,
+                // The wait ended while this connection was held for its code
+                // check: the deadline answers with that refusal, as with any last
+                // refusal; the abort keeps its own name.
+                Err(Gated::WaitEnded { end, held }) => {
+                    return Err(match end {
+                        RendezvousError::Deadline => held,
+                        other => other,
+                    });
                 }
+            };
+            refusals += 1;
+            aterm_log::warn!(
+                "overlap handoff: refused rendezvous dialer #{refusals} ({refusal}); the \
+                 rendezvous stays open for the successor until the deadline"
+            );
+            if refusals >= MAX_REFUSED_DIALS {
+                return Err(refusal);
             }
+            last_refusal = Some(refusal);
+            // Dropping `stream` here — before the next accept — is what tells the
+            // refused dialer it was refused, and it is why a flood cannot
+            // accumulate connections we are still holding.
         }
     }
 
-    /// Both gates over ONE accepted connection, answering the attested peer pid.
+    /// [`Self::accept_claim_observed`] with no one to tell of a code refusal:
+    /// the tests' spelling.
+    #[cfg(test)]
+    pub(crate) fn accept_claim(
+        &self,
+        expected_pid: Option<i32>,
+        code: &DialerCode,
+        deadline: Instant,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<ClaimedPeer, RendezvousError> {
+        self.accept_claim_observed(expected_pid, code, deadline, abort, &|_| {})
+    }
+
+    /// The gates over ONE accepted connection, answering the attested peer pid.
     ///
-    /// Every error is a refusal of THIS CONNECTION. Nothing here may end the
-    /// attempt, which is why the frame read is bounded by its own slice as well
-    /// as by the attempt deadline: an expiry inside this function must mean "that
-    /// peer took too long", not "the handoff is over".
+    /// Every [`Gated::Refused`] is a refusal of THIS CONNECTION, and nothing
+    /// else here ends the attempt, which is why the frame read is bounded by its
+    /// own slice as well as by the attempt deadline: an expiry inside this
+    /// function must mean "that peer took too long", not "the handoff is over".
+    /// The one exception is a connection held for a code check `trustd` did not
+    /// answer ([`CodeRefusal::TrustdSilent`]): it is held for as long as the
+    /// wait itself runs, so the abort and the deadline end it there
+    /// ([`Gated::WaitEnded`]). Each check is bounded by its own hang detector
+    /// (`aterm_keeper::identity::PEER_CHECK_HANG`).
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "native_update_rendezvous_admission",
+            action = "Grant",
+            project = "aterm_gui::app_update_handoff::launched_dialer_admission_conformance::project"
+        )
+    )]
     fn gate_one(
         &self,
         stream: &CtlStream,
         expected_pid: Option<i32>,
+        code: &DialerCode,
         deadline: Instant,
-    ) -> Result<(i32, bool), RendezvousError> {
+        abort: &dyn Fn() -> bool,
+        refused: &dyn Fn(&CodeRefusedDialer),
+    ) -> Result<Admitted, Gated> {
         // The TIGHTER of the two bounds wins. A peer that has not yet presented
         // the secret is an unknown same-uid process, and one of those must not be
         // able to spend the attempt's whole budget by connecting and saying
@@ -973,36 +1543,51 @@ impl Rendezvous {
         let mut frame = [0u8; CLAIM_FRAME_LEN];
         read_frame_by_deadline(stream, &mut frame, frame_deadline, &|error| {
             RendezvousError::Accept(error.to_string())
-        })?;
+        })
+        .map_err(Gated::Refused)?;
         let Some(chunks) = claim_frame_kind(&frame, &self.claim) else {
-            return Err(RendezvousError::Claim);
+            return Err(Gated::Refused(RendezvousError::Claim));
         };
         // Identity SECOND, and only once the secret has proven this is our
         // attempt's dialer. `peer_pid` is a cheap `getsockopt`, but ordering the
         // unforgeable check after the unguessable one means a stranger learns
         // nothing about which pid we were expecting.
         let attested = fdpass::peer_pid(stream)
-            .map_err(|error| RendezvousError::PeerUnattested(error.to_string()))?;
-        let attested = i32::try_from(attested).map_err(|_| RendezvousError::PeerPid {
-            expected: expected_pid.unwrap_or(-1),
-            actual: -1,
+            .map_err(|error| Gated::Refused(RendezvousError::PeerUnattested(error.to_string())))?;
+        let attested = i32::try_from(attested).map_err(|_| {
+            Gated::Refused(RendezvousError::PeerPid {
+                expected: expected_pid.unwrap_or(-1),
+                actual: -1,
+            })
         })?;
         if let Some(expected) = expected_pid
             && attested != expected
         {
-            return Err(RendezvousError::PeerPid {
+            return Err(Gated::Refused(RendezvousError::PeerPid {
                 expected,
                 actual: attested,
-            });
+            }));
         }
+        // Code LAST, and only for a dialer that presented the secret (U36). The
+        // audit token is read ONCE, here, and that one token is what every check
+        // of this dialer judges and what the grant is sent against
+        // ([`ClaimedPeer::transfer`]): the kernel answers it at each read, for
+        // the process on the other end as it is then, so a second read is a
+        // second question (U36's second review). It must name the attested pid.
+        let token = aterm_uds::peer::peer_audit_token(stream);
+        admit_code(stream, attested, token, code, deadline, abort, refused)?;
         // The claimed connection leaves here with a write bound already on it.
         // `transfer` refreshes it against the same deadline immediately before
         // the one `sendmsg`; this is the belt that makes "a socket this module
         // hands out can never block forever on a write" true by construction.
         stream
-            .set_write_timeout(Some(remaining_io_budget(deadline)?))
-            .map_err(|error| RendezvousError::Accept(error.to_string()))?;
-        Ok((attested, chunks))
+            .set_write_timeout(Some(remaining_io_budget(deadline).map_err(Gated::Refused)?))
+            .map_err(|error| Gated::Refused(RendezvousError::Accept(error.to_string())))?;
+        Ok(Admitted {
+            pid: attested,
+            chunks,
+            token,
+        })
     }
 
     /// One `accept`, bounded by the deadline and the abort predicate.
@@ -1069,6 +1654,13 @@ impl Rendezvous {
                     // signal. Neither is this attempt's dialer arriving.
                     continue;
                 }
+                // Anything else ends the wait — including an accept short of a
+                // descriptor, which is NOT worth waiting out (round eight of the
+                // update audit, #3): Darwin has already dequeued that dial and
+                // closed it rather than put it back, so the dialer is told at
+                // once and nothing queued is left for a retry to find. Room is
+                // made before the rendezvous instead
+                // ([`raise_descriptor_limit_for_park`]).
                 Err(error) => return Err(RendezvousError::Accept(error.to_string())),
             }
         }
@@ -1082,16 +1674,61 @@ impl Drop for Rendezvous {
         // path is prefix-bound to this process's pid and this attempt's nonce,
         // so this can never remove anything another attempt owns.
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(launch_stamp_path(&self.path));
     }
 }
 
-/// A connection that passed both gates: it presented this attempt's secret and
-/// the kernel says it is the launched successor.
+/// What [`launch_stamp_path`] appends to the rendezvous path.
+const LAUNCH_STAMP_SUFFIX: &str = ".launch";
+
+/// Where the successor of the attempt bound at `rendezvous` stamps the name its
+/// boot-trial launch counts under ([`stamp_this_launch`]): beside the node, in the
+/// same private directory.
+#[must_use]
+pub(crate) fn launch_stamp_path(rendezvous: &Path) -> PathBuf {
+    let mut stamp = rendezvous.as_os_str().to_os_string();
+    stamp.push(LAUNCH_STAMP_SUFFIX);
+    PathBuf::from(stamp)
+}
+
+/// THE LAUNCHED SUCCESSOR NAMES ITSELF BEFORE ITS BOOT APPLY CAN COUNT A TRIAL
+/// LAUNCH (2026-09-30, round four). LaunchServices reports a successor that dies
+/// before it checks in with no pid (`PreDialDeath::TerminatedBeforeCheckIn`), and
+/// every successor dials before it checks in, so for that death its parent has no
+/// name to give the counted launch back by. So this launch writes its own —
+/// the name the sentinel counts it under — beside the rendezvous its launch
+/// names ([`aterm_update::stamp_trial_launch`]), and the parent gives back exactly
+/// that launch ([`aterm_update::forgive_stamped_trial_launch`]). Nothing on the
+/// fork lane, whose parent names its child. Best effort: a stamp not written
+/// leaves any launch this process counts on the trial, which keeps the crash
+/// signal.
+pub(crate) fn stamp_this_launch(env: &crate::handoff_env::HandoffEnv) {
+    let Some(rendezvous) = env.os(ENV_RENDEZVOUS) else {
+        return;
+    };
+    if let Err(error) = aterm_update::stamp_trial_launch(&launch_stamp_path(Path::new(rendezvous)))
+    {
+        aterm_log::warn!(
+            "overlap handoff: could not stamp this launch beside the rendezvous ({error}); a \
+             boot-trial launch it counts stays counted if it dies before its dial"
+        );
+    }
+}
+
+/// A connection that passed the gates: it presented this attempt's secret, the
+/// kernel attested its pid (and, where LaunchServices had answered, that pid is
+/// the launched successor's), and the code of the process its audit token named,
+/// read once at the claim and naming that pid, is the successor's
+/// ([`DialerCode`]).
 pub(crate) struct ClaimedPeer {
     stream: CtlStream,
     pid: i32,
     /// The dialer claimed with `ATRZ2C`: it reads the chunked grant.
     chunks: bool,
+    /// The dialer's audit token as the gate read and checked it. The grant
+    /// leaves only while the kernel still answers this same token
+    /// ([`Self::transfer`]).
+    token: Option<aterm_uds::peer::AuditToken>,
 }
 
 impl ClaimedPeer {
@@ -1130,6 +1767,28 @@ impl ClaimedPeer {
     #[must_use]
     pub(crate) fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// Whether the kernel still names, on this connection, the very process
+    /// the gate checked: a fresh audit token, compared word for word with the
+    /// one the gate read and judged ([`Rendezvous::gate_one`]). Asked
+    /// immediately before the `sendmsg` that carries the first descriptor, so a
+    /// connection whose other end is no longer that process (another process
+    /// using it, or a new image at the pid, whose pid version differs) gets
+    /// [`RendezvousError::TransferNotSent`] and nothing (U36's second review).
+    /// What it cannot see is stated in the module docs ("Whom the code gate
+    /// judges", and what the code gate leaves).
+    fn dialer_unchanged(&self) -> Result<(), RendezvousError> {
+        let now = aterm_uds::peer::peer_audit_token(&self.stream);
+        if now == self.token {
+            return Ok(());
+        }
+        Err(RendezvousError::TransferNotSent(format!(
+            "the dialer's audit token changed since its code was checked (pid {} then, {} now)",
+            self.token
+                .map_or_else(|| "unnamed".to_string(), |token| token.pid().to_string()),
+            now.map_or_else(|| "unnamed".to_string(), |token| token.pid().to_string())
+        )))
     }
 
     /// The most sessions [`Self::transfer`] can hand THIS dialer: what its
@@ -1194,6 +1853,7 @@ impl ClaimedPeer {
         descriptors.extend(sessions.iter().map(|(_, _, master)| *master));
         descriptors.push(ready);
         descriptors.push(commit);
+        self.dialer_unchanged()?;
         let sent = fdpass::send_with_fds(&self.stream, &header, &descriptors)
             .map_err(|error| RendezvousError::TransferNotSent(error.to_string()))?;
         // FROM HERE THE DESCRIPTORS ARE THE PEER'S TOO: every failure below is a
@@ -1247,6 +1907,7 @@ impl ClaimedPeer {
         self.stream
             .set_write_timeout(Some(remaining))
             .map_err(|error| RendezvousError::TransferNotSent(error.to_string()))?;
+        self.dialer_unchanged()?;
         let sent = fdpass::send_with_fds(&self.stream, &header, chunks[0])
             .map_err(|error| RendezvousError::TransferNotSent(error.to_string()))?;
         // FROM HERE THE FIRST CHUNK IS THE PEER'S: every failure below, in a
@@ -1278,16 +1939,51 @@ impl ClaimedPeer {
     }
 }
 
-/// The claim frame a successor presents.
 /// A test's dialer: connect to `path` and present `secret`, keeping the stream
 /// so the accepted claim can be HELD by the listener (the late park's shape)
-/// and closed from that side. The production dialer is `dial_and_claim`.
+/// and closed from that side. The production dialer is `dial_and_claim`. The
+/// frame is built first, so the connect and the write run back to back: the
+/// listener's read of it is bounded from its accept ([`CLAIM_FRAME_BUDGET`]).
 #[cfg(test)]
 pub(crate) fn dial_for_test(path: &Path, secret: &str) -> std::io::Result<CtlStream> {
+    let frame = claim_frame(secret);
     let stream = CtlStream::connect(path)?;
-    (&stream).write_all(&claim_frame(secret))?;
+    (&stream).write_all(&frame)?;
     (&stream).flush()?;
     Ok(stream)
+}
+
+/// What a test says when the gate HELD its dialer because the process's one
+/// `trustd` gate (`aterm_uds::deadline::TRUST`) was overdue: shared with every
+/// code and TLS check in this test process, so a slow check elsewhere can hold
+/// this one. Not a pass, and not a verdict on the code either way.
+#[cfg(test)]
+pub(crate) const TRUSTD_SILENT: &str =
+    "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
+
+/// Whether the gate ended on a dialer it held for a code check `trustd` did not
+/// answer.
+#[cfg(test)]
+pub(crate) fn held_for_trustd(error: &RendezvousError) -> bool {
+    matches!(
+        error,
+        RendezvousError::PeerCode {
+            refusal: CodeRefusal::TrustdSilent(_),
+            ..
+        }
+    )
+}
+
+/// A test's accepted claim (the peer, or what was built on it), or a panic that
+/// names its cause: a dialer held for `trustd` is [`TRUSTD_SILENT`], never a
+/// failure of `what`.
+#[cfg(test)]
+pub(crate) fn admitted<T>(accepted: Result<T, RendezvousError>, what: &str) -> T {
+    match accepted {
+        Ok(peer) => peer,
+        Err(error) if held_for_trustd(&error) => panic!("{TRUSTD_SILENT}: {error}"),
+        Err(error) => panic!("{what}: {error}"),
+    }
 }
 
 /// The cross-version guard's door onto this build's SUCCESSOR side
@@ -1411,7 +2107,7 @@ fn grant_continuation(index: usize) -> Option<[u8; GRANT_CONTINUATION_LEN]> {
 /// pair a received descriptor with a session, and nothing that names a
 /// descriptor.
 fn encode_grant_body(nonce: &str, sessions: &[(u64, i32, BorrowedFd<'_>)]) -> Option<String> {
-    if nonce.len() != 32 || !nonce.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+    if !aterm_codec::hex::is_hex(nonce, 32) {
         return None;
     }
     let entries = sessions
@@ -1616,6 +2312,104 @@ pub(crate) fn parse_proof_term(value: &str) -> Option<bool> {
     }
 }
 
+/// How a launched successor dies at the [`debug_die_before_dial`] seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DebugDeathBeforeDial {
+    /// `_exit` with [`DEBUG_DEATH_EXIT_CODE`], as a diagnosed launch-fatal does
+    /// (the containment-deny fatal inside the warm prologue is one).
+    Exit,
+    /// `SIGKILL` itself, as the machine ends a starved candidate (jetsam).
+    Kill,
+    /// CHECK IN WITH LAUNCHSERVICES FIRST (create `NSApplication`), then
+    /// `_exit` as [`Self::Exit`] does: the shape of a successor that
+    /// LaunchServices has already answered with a pid and that dies before
+    /// its dial — today only after LaunchServices' own ~30 s check-in
+    /// timeout, and the normal order once the successor checks in before it
+    /// dials (warm successor P4). Measured on stand-in bundles (2026-09-29):
+    /// LaunchServices answers a checked-in process with its pid, not
+    /// terminated, during `+sharedApplication` itself, and answers nothing
+    /// more when it dies afterwards.
+    ExitAfterCheckIn,
+    /// [`Self::ExitAfterCheckIn`]'s check-in, then `SIGKILL` as [`Self::Kill`].
+    KillAfterCheckIn,
+}
+
+impl DebugDeathBeforeDial {
+    /// Does this death check in with LaunchServices before it dies?
+    #[must_use]
+    pub(crate) fn checks_in_first(self) -> bool {
+        matches!(self, Self::ExitAfterCheckIn | Self::KillAfterCheckIn)
+    }
+
+    /// Does it end by `SIGKILL` (rather than `_exit`)?
+    #[must_use]
+    pub(crate) fn kills(self) -> bool {
+        matches!(self, Self::Kill | Self::KillAfterCheckIn)
+    }
+}
+
+/// The status the [`DebugDeathBeforeDial::Exit`] seam exits with:
+/// `EX_SOFTWARE`, a crash's shape — never `seamless::EXIT_SUCCESSOR_PASSING`
+/// (75), which a successor uses to say its refusal was a passing moment.
+pub(crate) const DEBUG_DEATH_EXIT_CODE: i32 = 70;
+
+/// A DEVELOPMENT SEAM (`aterm_types::dev_seam!`, 2026-09-29): a launched
+/// successor that DIES BEFORE ITS DIAL, on demand — the shape of a
+/// containment-deny fatal inside the warm prologue, a boot crash, or a boot
+/// apply whose re-exec was refused. `main_entry` reads it on the launched lane
+/// only (a launch that carries a rendezvous), immediately before the dial, so
+/// the parent's side of it — how soon the outgoing process stops waiting for a
+/// dial that will never come (`app_update_handoff::await_launched_dial`) — can
+/// be driven on a private instance. The launching process's environment MERGES
+/// into the successor's (`app_launch_successor`'s module docs), so an instance
+/// started with it set launches successors that die; the instance itself, a
+/// cold launch, never reads it. It stops at the hop to a child shell
+/// (`aterm_types::domain::ENV_DENY_VARS`), so an aterm launched from one
+/// of the instance's shells applies its own updates unharmed.
+///
+/// `kill` SIGKILLs; `checked-in` checks in with LaunchServices first and then
+/// exits, `checked-in-kill` checks in and then SIGKILLs
+/// ([`DebugDeathBeforeDial::ExitAfterCheckIn`]); any other engaged value (not
+/// unset, empty or `0`) exits with [`DEBUG_DEATH_EXIT_CODE`]. A shipped
+/// binary reads `None`.
+#[must_use]
+pub(crate) fn debug_die_before_dial() -> Option<DebugDeathBeforeDial> {
+    parse_debug_die_before_dial(aterm_types::dev_seam!("ATERM_DEBUG_DIE_BEFORE_DIAL").as_deref())
+}
+
+/// [`debug_die_before_dial`]'s reading of one value, pure.
+#[must_use]
+fn parse_debug_die_before_dial(value: Option<&std::ffi::OsStr>) -> Option<DebugDeathBeforeDial> {
+    let value = value?.to_str()?;
+    match value {
+        "kill" => return Some(DebugDeathBeforeDial::Kill),
+        "checked-in" => return Some(DebugDeathBeforeDial::ExitAfterCheckIn),
+        "checked-in-kill" => return Some(DebugDeathBeforeDial::KillAfterCheckIn),
+        _ => {}
+    }
+    aterm_types::control_socket::env_flag_engaged(Some(value)).then_some(DebugDeathBeforeDial::Exit)
+}
+
+/// The [`DebugDeathBeforeDial::checks_in_first`] half of the seam: create
+/// this process's `NSApplication`, which checks it in with LaunchServices —
+/// the moment LaunchServices answers the launch with this process's pid.
+/// Main thread only (`+sharedApplication` is main-thread AppKit), and
+/// `main_entry` calls it there, on the launched lane, just before it dies.
+/// `false` off the main thread or when AppKit answers nil.
+pub(crate) fn debug_check_in_with_launch_services() -> bool {
+    use aterm_objc::{class, sel};
+
+    let Some(_main_thread) = crate::appkit::MainThread::new() else {
+        return false;
+    };
+    // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit
+    // singleton (`_main_thread` is the witness); it creates the application
+    // object on first use and returns it, never an owned reference.
+    let app =
+        unsafe { crate::appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
+    !app.is_null()
+}
+
 /// Dial the rendezvous named in this launch's handoff snapshot, present the
 /// claim, and take delivery of every descriptor.
 ///
@@ -1662,25 +2456,36 @@ pub(crate) fn claim_incoming(
     // item 39): see `raise_descriptor_limit_for_claim`. A failure is said and
     // the claim goes ahead — it fails exactly as it would have.
     match raise_descriptor_limit_for_claim() {
-        Ok(Some((from, to))) => aterm_log::info!(
-            "overlap handoff: raised this successor's soft descriptor limit from {from} to {to} \
-             for the grant and the sessions it adopts"
-        ),
-        Ok(None) => {}
+        Ok(Some((from, to))) => {
+            forget_park_raise();
+            aterm_log::info!(
+                "overlap handoff: raised this successor's soft descriptor limit from {from} to \
+                 {to} for the grant and the sessions it adopts"
+            );
+        }
+        Ok(None) => forget_park_raise(),
         Err(error) => aterm_log::warn!(
             "overlap handoff: could not raise this successor's soft descriptor limit ({error}); \
              a large grant may not fit it"
         ),
     }
     let claimed = dial_and_claim(&path, &secret, expected_nonce, deadlines, parent, chunks)
-        .map_err(|error| match error {
-            RendezvousError::Deadline => RendezvousError::ClaimDeadline,
-            other => other,
-        });
+        .map_err(claim_side);
     if claimed.is_ok() {
         let _ = std::fs::remove_file(&path);
     }
     claimed
+}
+
+/// A dial's error as the SUCCESSOR says it: [`RendezvousError::Deadline`]'s
+/// "no successor dialed" is the parent's sentence, and from this side the
+/// same expiry is this successor's own budget running out before the grant
+/// ([`RendezvousError::ClaimDeadline`], round six item 48).
+fn claim_side(error: RendezvousError) -> RendezvousError {
+    match error {
+        RendezvousError::Deadline => RendezvousError::ClaimDeadline,
+        other => other,
+    }
 }
 
 /// The soft `RLIMIT_NOFILE` a launched successor raises itself to before it
@@ -1688,8 +2493,9 @@ pub(crate) fn claim_incoming(
 ///
 /// A LaunchServices-launched app runs at launchd's soft limit, 256 — not the
 /// parent's, which a forked successor inherits. A grant of up to
-/// [`MAX_CHUNKED_SESSIONS`] masters, and then a wake pipe per adopted session,
-/// needs about three descriptors a session: at 256 the later chunks'
+/// [`MAX_CHUNKED_SESSIONS`] masters, and then a wake pipe and an exit
+/// witness's `kqueue` (round seven, finding 26) per adopted session, needs
+/// about four descriptors a session: at 256 the later chunks'
 /// descriptors could not be received at all (the kernel discards rights past
 /// the limit and the receive fails `EMSGSIZE`), and at a few dozen sessions
 /// fewer every later open failed `EMFILE` (round six of the update audit,
@@ -1705,15 +2511,18 @@ fn raised_soft_limit(soft: u64, hard: u64) -> Option<u64> {
 }
 
 /// The soft `RLIMIT_NOFILE` this process was LAUNCHED with, recorded by the
-/// first [`raise_descriptor_limit_for_claim`] that moved it; unset when the
-/// limit was never raised (a forked successor, a Dock launch, a limit that
-/// already had room).
+/// first [`raise_descriptor_limit_for_claim`] that moved it — a claim's, a
+/// park's or a recovery's — or adopted from a predecessor that carried it
+/// ([`adopt_carried_launcher_limit`]); unset when the limit was never raised
+/// (a Dock launch that has not yet attempted an update, a limit that already
+/// had room).
 static LAUNCHER_SOFT_NOFILE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// The soft descriptor limit a shell this process spawns must be handed back
 /// (round six of the update audit, item 39, review round two): `Some(soft)`
-/// when the claim raised this process's own limit from `soft`, `None` when it
-/// never did and the process's limit is still the launcher's.
+/// when a claim, a park or a recovery raised this process's own limit from
+/// `soft` (or a predecessor carried it), `None` when none did and the
+/// process's limit is still the launcher's.
 ///
 /// The raise is the SUCCESSOR's need — room for the grant and the sessions it
 /// adopts — never its shells'. A terminal hands its shell the launcher's soft
@@ -1725,6 +2534,41 @@ pub(crate) fn launcher_soft_descriptor_limit() -> Option<u64> {
     LAUNCHER_SOFT_NOFILE.get().copied()
 }
 
+/// The soft `RLIMIT_NOFILE` this process would hold had no PARK raised it
+/// (round eight's second review of #3); 0 when it holds no park's raise.
+///
+/// Only [`raise_descriptor_limit_for_park`] is new in round eight: a claim's
+/// raise (round six, item 39) and a recovery's (round seven, finding 26)
+/// were made before it, so a successor of a process they raised always
+/// inherited the raise. A park's raise is the one nothing before it made, and
+/// so the one an OLDER successor must not be started at
+/// ([`OlderImageLimit`]): set by the park's raise that moved the limit, or
+/// adopted from a predecessor that held one ([`ENV_PARK_RAISED_FROM`]), and
+/// cleared by a claim's or a recovery's, after which the raise is one the
+/// process would have held anyway.
+static PARK_RAISED_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`PARK_RAISED_FROM`]: `Some(soft)` while this process holds a raise
+/// only a park made.
+pub(crate) fn park_raised_from() -> Option<u64> {
+    Some(PARK_RAISED_FROM.load(std::sync::atomic::Ordering::Relaxed)).filter(|from| *from > 0)
+}
+
+/// The raise this process now holds is one a claim or a recovery makes
+/// whatever a park did before it (see [`PARK_RAISED_FROM`]).
+fn forget_park_raise() {
+    PARK_RAISED_FROM.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The launch variable in which a predecessor tells its successor the soft
+/// descriptor limit it held before a PARK raised it (round eight's second
+/// review of #3), beside [`ENV_LAUNCHER_NOFILE`] and for the same two lanes
+/// ([`carry_launcher_limit`]): a successor that inherits a park's raise is
+/// told so, and hands an older successor of its own what it would have held
+/// without it. Read by [`adopt_carried_launcher_limit`]; a successor that
+/// predates it ignores it.
+pub(crate) const ENV_PARK_RAISED_FROM: &str = "ATERM_HANDOFF_PARK_RAISED_FROM";
+
 /// The launch variable in which a FORK-LANE parent tells its successor the
 /// soft descriptor limit its shells are owed (round seven, item 107): the
 /// launcher's, when [`launcher_soft_descriptor_limit`] knows it. A forked
@@ -1733,12 +2577,28 @@ pub(crate) fn launcher_soft_descriptor_limit() -> Option<u64> {
 /// for one hop only. Read by [`adopt_carried_launcher_limit`].
 pub(crate) const ENV_LAUNCHER_NOFILE: &str = "ATERM_HANDOFF_LAUNCHER_NOFILE";
 
-/// What a fork-lane parent names on its successor's command for
-/// [`ENV_LAUNCHER_NOFILE`]: `None` when this process never raised its limit,
-/// so its shells already get what it runs at.
-#[must_use]
-pub(crate) fn launcher_limit_env() -> Option<(&'static str, String)> {
-    launcher_soft_descriptor_limit().map(|soft| (ENV_LAUNCHER_NOFILE, soft.to_string()))
+/// Name [`ENV_LAUNCHER_NOFILE`] on a successor's `command` whose image keeps
+/// this process's soft descriptor limit — the fork lane's child and the cold
+/// lane's `exec` alike. Nothing when this process never raised its limit, so
+/// its shells already get what it runs at.
+///
+/// THE COLD LANE OWES IT TOO (round eight of the update audit, #81): `execve`
+/// keeps the raised soft limit exactly as a fork does, and the new image's
+/// record starts empty, so a cold-lane update after a launched-lane one (or
+/// after any attempt that raised the limit for its park) handed every later
+/// tab 4096 instead of the launcher's 256 — the leak item 107 closed for the
+/// fork-lane hop only.
+///
+/// A PARK'S RAISE IS NAMED BESIDE IT (round eight's second review of #3,
+/// [`ENV_PARK_RAISED_FROM`]): the successor keeps that raise too, and must
+/// know it is one no successor inherited before round eight.
+pub(crate) fn carry_launcher_limit(command: &mut std::process::Command) {
+    if let Some(soft) = launcher_soft_descriptor_limit() {
+        command.env(ENV_LAUNCHER_NOFILE, soft.to_string());
+    }
+    if let Some(from) = park_raised_from() {
+        command.env(ENV_PARK_RAISED_FROM, from.to_string());
+    }
 }
 
 /// A carried launcher limit this process may adopt: a number, and never above
@@ -1755,7 +2615,8 @@ fn carried_launcher_limit(carried: Option<&str>, soft: u64) -> Option<u64> {
 /// ([`ENV_LAUNCHER_NOFILE`]) as this process's own
 /// [`launcher_soft_descriptor_limit`], before any shell is spawned. Read, not
 /// consumed: a boot re-exec carries the snapshot on, and the final image reads
-/// it again. `Some(limit)` when it was adopted.
+/// it again. `Some(limit)` when it was adopted. A park's raise carried beside
+/// it ([`ENV_PARK_RAISED_FROM`]) is adopted as [`park_raised_from`] here too.
 pub(crate) fn adopt_carried_launcher_limit(env: &crate::handoff_env::HandoffEnv) -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -1765,6 +2626,14 @@ pub(crate) fn adopt_carried_launcher_limit(env: &crate::handoff_env::HandoffEnv)
     // out-parameter for the one call.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
         return None;
+    }
+    // A park's raise the predecessor held, and this process inherited with
+    // its limit (round eight's second review of #3): the same bounds, since it
+    // too only ever names less than this process runs at.
+    if let Some(from) =
+        carried_launcher_limit(env.string(ENV_PARK_RAISED_FROM).as_deref(), limit.rlim_cur)
+    {
+        PARK_RAISED_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
     }
     let carried =
         carried_launcher_limit(env.string(ENV_LAUNCHER_NOFILE).as_deref(), limit.rlim_cur)?;
@@ -1803,6 +2672,308 @@ fn raise_descriptor_limit_for_claim() -> std::io::Result<Option<(u64, u64)>> {
     // limit is at the floor or the hard limit now), and would not be it.
     let _ = LAUNCHER_SOFT_NOFILE.set(soft);
     Ok(Some((soft, target)))
+}
+
+/// THE KEEPER'S RECOVERY needs the same room (round seven of the update
+/// audit, finding 26's review): a cold launch with `[keeper] enabled` takes
+/// every master a crashed window left in the keeper's custody at its boot
+/// HELLO and adopts each — a master, a wake pipe and an exit witness's
+/// `kqueue` apiece — at launchd's soft 256, where only a handoff's claim
+/// raised it before. Raised before the HELLO, as the claim raises before it
+/// dials; a shell spawned afterwards is still handed the launcher's limit
+/// ([`launcher_soft_descriptor_limit`]). A failure is said, and the recovery
+/// goes ahead as it would have.
+pub(crate) fn raise_descriptor_limit_for_recovery() {
+    // Either way the limit held now is one the recovery makes whatever a
+    // park did before it ([`PARK_RAISED_FROM`]).
+    match raise_descriptor_limit_for_claim() {
+        Ok(Some((from, to))) => {
+            forget_park_raise();
+            aterm_log::info!(
+                "keeper: raised the soft descriptor limit from {from} to {to} for the sessions \
+                 the boot recovery adopts"
+            );
+        }
+        Ok(None) => forget_park_raise(),
+        Err(error) => aterm_log::warn!(
+            "keeper: could not raise the soft descriptor limit ({error}); a large recovery may \
+             not fit it"
+        ),
+    }
+}
+
+/// THE OUTGOING PROCESS needs the same room at its park (round eight of the
+/// update audit, #3). A window started from the Dock, Finder or a login item
+/// runs at launchd's soft 256, and each of its sessions already holds three
+/// descriptors (the master and both ends of the reader's wake pipe); both
+/// lanes then duplicate every master before the park, and the attempt adds
+/// its pipes, the rendezvous and the accepted dial. From about 60 sessions
+/// that no longer fits — every attempt failed `EMFILE` at the duplicate and
+/// was retried on the transient schedule for the same fixed cause, and the
+/// desks the chunked grant exists for could never park. Raised when an
+/// attempt takes the seamless lane, before either lane reserves anything; a
+/// forked successor inherits the room and is told the launcher's limit
+/// ([`carry_launcher_limit`]), and a shell spawned afterwards is still
+/// handed the launcher's ([`launcher_soft_descriptor_limit`]). A failure is
+/// said, and the attempt goes ahead as it would have.
+///
+/// NOT TOWARD AN OLDER TARGET, AND NOT INTO ONE (round eight's two reviews
+/// of #3). An attempt whose `target_build` is older than this `build` — an
+/// installed activation of an older bundle put back in /Applications, a
+/// channel switch — makes no raise: a successor built before 06b06e74e (every
+/// release up to v0.99.0) never reads [`ENV_LAUNCHER_NOFILE`], and would hand
+/// every one of its shells a raise it inherited, where a Dock-launched
+/// window's older successor always handed them launchd's 256. But nothing
+/// lowers this process's limit again, so the raise an EARLIER attempt made
+/// toward a same-or-newer build — one that stood down after it, as automatic
+/// attempts often do — is still held when a later one targets an older
+/// build. So the raise is recorded as a park's ([`park_raised_from`]), and
+/// both lanes that can start an older successor start it at the limit this
+/// process held before the raise ([`OlderImageLimit`]). A successor this
+/// build knows reads the told limit, so the raise costs its shells nothing.
+pub(crate) fn raise_descriptor_limit_for_park(target_build: u64, build: u64) {
+    if target_build < build {
+        aterm_log::info!(
+            "update apply: the soft descriptor limit is left as it is for the park — target build \
+             {target_build} is older than this build {build} and may not read the launcher's \
+             limit it would be told, so its shells would inherit the raise"
+        );
+        return;
+    }
+    match raise_descriptor_limit_for_claim() {
+        Ok(Some((from, to))) => {
+            PARK_RAISED_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
+            aterm_log::info!(
+                "update apply: raised this process's soft descriptor limit from {from} to {to} \
+                 for the park (each session's duplicate master, the rendezvous and the grant); \
+                 new shells keep the launcher's {from}"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => aterm_log::warn!(
+            "update apply: could not raise this process's soft descriptor limit ({error}); a \
+             large desk may not fit the park"
+        ),
+    }
+}
+
+/// THE LIMIT AN OLDER SUCCESSOR IS STARTED AT (round eight's second review
+/// of #3). A park's raise ([`raise_descriptor_limit_for_park`]) is made once
+/// and kept, and a successor inherits it across a fork and across an `exec`
+/// alike; one built before 06b06e74e never reads the launcher's limit it is
+/// told, so every shell it opened got the raise — where, before round eight,
+/// a Dock-launched window's older successor inherited the launcher's limit
+/// and handed its shells that. So toward a target OLDER than this build, both
+/// lanes that can reach one (the fork lane, the only seamless lane toward it,
+/// and the cold lane's `exec`) start its image at the limit this process held
+/// before the park's raise ([`park_raised_from`]). A limit a claim or a
+/// recovery raised is left as it always was: a successor inherited that one
+/// before round eight too.
+///
+/// ONLY WHERE THE IMAGE FITS UNDER IT. An older image's shell strip reaches
+/// only the numbers below the soft limit (its `inherited_fd_ceiling`; this
+/// build's strip reaches the kernel's maximum instead), so no descriptor the
+/// image keeps across its `exec` may sit at or above the limit it is started
+/// at. A desk that fits
+/// under the launcher's limit normally hands it nothing up there (a
+/// duplicate takes the lowest free number). One that needed the park's raise
+/// to duplicate its masters — a desk an older target could not be parked
+/// with before round eight, when the duplicate failed `EMFILE` — hands the
+/// successor duplicates above it, and that successor keeps the raise it
+/// inherits, as the log says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OlderImageLimit {
+    /// The soft limit the image is started at: this process's before the
+    /// park's raise.
+    soft: u64,
+    /// The limits this process runs at, the hard one kept as it is.
+    raised: (u64, u64),
+    /// One past the highest descriptor number this process can hold
+    /// ([`aterm_uds::spawnfd::descriptor_bound`]), read with the limits.
+    table: libc::c_int,
+}
+
+/// The soft limit an image of `target_build`, started by a process of `build`
+/// that runs at `soft`, is started at — `None` to leave it the limit it
+/// inherits: only an older target, and only under a park's raise.
+fn older_image_soft_limit(
+    target_build: u64,
+    build: u64,
+    park_raised_from: Option<u64>,
+    soft: u64,
+) -> Option<u64> {
+    if target_build >= build {
+        return None;
+    }
+    park_raised_from.filter(|from| *from < soft)
+}
+
+impl OlderImageLimit {
+    /// What an image of `target_build` is started at by this process of
+    /// `build` ([`older_image_soft_limit`] over this process's limits).
+    fn toward(target_build: u64, build: u64) -> Option<Self> {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid resource id and an exclusively borrowed, writable
+        // out-parameter for the one call.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+            return None;
+        }
+        let soft = older_image_soft_limit(target_build, build, park_raised_from(), limit.rlim_cur)?;
+        Some(Self {
+            soft,
+            raised: (limit.rlim_cur, limit.rlim_max),
+            table: aterm_uds::spawnfd::descriptor_bound(),
+        })
+    }
+
+    /// The first descriptor at or above [`Self::soft`] that an `exec` keeps:
+    /// open, and not close-on-exec. The scan ends at the kernel's per-process
+    /// maximum, not at the soft limit or a cap: Darwin hands out numbers up to
+    /// `kern.maxfilesperproc` whenever the soft limit is higher, and the old
+    /// 65 536 cap missed every one above it. `fcntl` and arithmetic only —
+    /// async-signal-safe, so a forked child may ask between its fork and its
+    /// `exec`.
+    fn inheritable_at_or_above(&self) -> Option<libc::c_int> {
+        let floor = libc::c_int::try_from(self.soft).unwrap_or(libc::c_int::MAX);
+        (floor..self.table).find(|fd| {
+            // SAFETY: `F_GETFD` only reads one number's flags; a number that
+            // is not open answers -1.
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            flags >= 0 && flags & libc::FD_CLOEXEC == 0
+        })
+    }
+
+    /// Set this process's soft limit to `soft`, the hard one as it is. A
+    /// bare `setrlimit` — async-signal-safe, as the PTY's own post-fork child
+    /// relies on.
+    fn set_soft(&self, soft: u64) -> std::io::Result<()> {
+        let limit = libc::rlimit {
+            rlim_cur: soft,
+            rlim_max: self.raised.1,
+        };
+        // SAFETY: a valid resource id and a fully initialised rlimit that
+        // keeps the hard limit as it was.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Start the FORK LANE's successor `command` at [`OlderImageLimit`] when its
+/// `target_build` is older than this `build`. Register it after every other
+/// pre-exec hook of the command: the lane's own clears close-on-exec on the
+/// descriptors the child is handed (`inherited`), and the child's last check
+/// must see them as its image will.
+///
+/// A descriptor the child would keep at or above the limit — one in
+/// `inherited`, or one of this process's own that is not close-on-exec —
+/// leaves the child the raise it inherits, and says so here; the child looks
+/// at its own table again just before its `exec`, and lowers nothing over a
+/// descriptor that appeared since.
+pub(crate) fn start_older_image_at_its_limit(
+    command: &mut std::process::Command,
+    target_build: u64,
+    build: u64,
+    inherited: &[std::os::fd::RawFd],
+) {
+    use std::os::unix::process::CommandExt as _;
+    let Some(limit) = OlderImageLimit::toward(target_build, build) else {
+        return;
+    };
+    let soft = limit.soft;
+    if let Some(fd) = inherited
+        .iter()
+        .copied()
+        .filter(|fd| u64::try_from(*fd).is_ok_and(|fd| fd >= soft))
+        .max()
+        .or_else(|| limit.inheritable_at_or_above())
+    {
+        aterm_log::warn!(
+            "update apply: target build {target_build} is older than this build {build}, and its \
+             successor keeps this process's raised soft descriptor limit {}: it would keep \
+             descriptor {fd}, at or above the {soft} this process held before the park's raise, \
+             so its shells get the raise",
+            limit.raised.0
+        );
+        return;
+    }
+    aterm_log::info!(
+        "update apply: target build {target_build} is older than this build {build}; its \
+         successor is started at the soft descriptor limit {soft} this process held before the \
+         park's raise"
+    );
+    // SAFETY: the closure runs between fork and exec and calls only `fcntl`
+    // and `setrlimit` over integers it owns — no allocation, no lock.
+    unsafe {
+        command.pre_exec(move || {
+            // A descriptor the image would keep at or above the limit, or a
+            // refused `setrlimit` (lowering a soft limit needs no privilege):
+            // the child keeps the limit it inherited, and the spawn goes on.
+            if limit.inheritable_at_or_above().is_none() {
+                let _ = limit.set_soft(limit.soft);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// [`OlderImageLimit`] for the COLD LANE's `exec`, which replaces THIS
+/// process: lowered here, immediately before the `exec`, and raised back when
+/// the guard drops (the `exec` returned). Only when no descriptor the `exec`
+/// keeps sits at or above the new limit, so the older image, whose strip
+/// reaches only the numbers below its soft limit, is handed none above it
+/// (this build's strips no longer read the soft limit at all); the cold lane
+/// runs with no session open, so its table sits far below launchd's 256. Said
+/// either way.
+pub(crate) fn lower_for_older_image(target_build: u64, build: u64) -> Option<LoweredForOlderImage> {
+    let limit = OlderImageLimit::toward(target_build, build)?;
+    let soft = limit.soft;
+    if let Some(fd) = limit.inheritable_at_or_above() {
+        aterm_log::warn!(
+            "update apply: target build {target_build} is older than this build {build}, and the \
+             new image keeps this process's raised soft descriptor limit {}: descriptor {fd}, \
+             which the exec keeps, is at or above the {soft} this process held before the \
+             park's raise",
+            limit.raised.0
+        );
+        return None;
+    }
+    if let Err(error) = limit.set_soft(soft) {
+        aterm_log::warn!(
+            "update apply: target build {target_build} is older than this build {build}, and the \
+             soft descriptor limit could not be lowered to {soft} for its exec ({error})"
+        );
+        return None;
+    }
+    aterm_log::info!(
+        "update apply: target build {target_build} is older than this build {build}; its image \
+         is started at the soft descriptor limit {soft} this process held before the park's \
+         raise"
+    );
+    Some(LoweredForOlderImage { limit })
+}
+
+/// See [`lower_for_older_image`]: dropped only when the `exec` returned.
+pub(crate) struct LoweredForOlderImage {
+    limit: OlderImageLimit,
+}
+
+impl Drop for LoweredForOlderImage {
+    fn drop(&mut self) {
+        let raised = self.limit.raised.0;
+        // Raising a soft limit back up to where it was, under the hard one,
+        // needs no privilege.
+        if let Err(error) = self.limit.set_soft(raised) {
+            aterm_log::warn!(
+                "update apply: the exec returned, and the soft descriptor limit could not be \
+                 raised back to {raised} ({error})"
+            );
+        }
+    }
 }
 
 /// Whether the parent's [`ENV_GRANT_CAPS`] offers the chunked grant: its
@@ -1848,7 +3019,7 @@ fn rendezvous_env(
     let secret = secret
         .into_string()
         .map_err(|_| RendezvousError::Env(ENV_CLAIM))?;
-    if secret.len() != CLAIM_HEX_LEN || !secret.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+    if !aterm_codec::hex::is_hex(&secret, CLAIM_HEX_LEN) {
         return Err(RendezvousError::Env(ENV_CLAIM));
     }
     Ok((PathBuf::from(path), secret))
@@ -1968,10 +3139,16 @@ fn dial_and_claim(
     // The read bound is RECOMPUTED here rather than inherited from the one set
     // above: a socket timeout is spent per syscall, so the write and this receive
     // would otherwise be allowed the full budget each.
+    //
+    // And it is the GRANT DEADLINE that ends this wait, never the socket
+    // timeout (round eight of the update audit, #80): this is the successor's
+    // long wait — up to the parent's hold budget — and a bare receive handed
+    // its expiry back as `WouldBlock`, which read as a malformed grant rather
+    // than as the deadline `claim_incoming` says as `ClaimDeadline`. The same
+    // loop the continuations use re-arms after a timeout or a signal and lets
+    // only the deadline decide.
     let mut header = [0u8; GRANT_HEADER_LEN];
-    arm_read_timeout(&stream, remaining_io_budget(deadlines.grant)?).map_err(grant_failed)?;
-    let received = fdpass::recv_with_fds(&stream, &mut header, fdpass::MAX_FDS)
-        .map_err(|error| RendezvousError::Grant(error.to_string()))?;
+    let received = recv_fds_by_deadline(&stream, &mut header, deadlines.grant)?;
     let mut fds = received.fds;
     if received.bytes == 0 && fds.is_empty() {
         return Err(RendezvousError::Grant(
@@ -2209,10 +3386,6 @@ fn read_frame_by_deadline(
     Ok(())
 }
 
-/// The socket timeout to spend on the next framed exchange, or the deadline
-/// error when there is none left. Clamped away from zero because std refuses a
-/// zero-duration timeout, and an expired deadline has to read as an expired
-/// deadline rather than as `InvalidInput` from a socket option.
 /// [`remaining_io_budget`] for the parent's grant, before its first `sendmsg`:
 /// the deadline running out THERE is this process's own lateness after a dial,
 /// never "no successor dialed" ([`RendezvousError::GrantDeadline`]).
@@ -2220,6 +3393,10 @@ fn grant_budget(deadline: Instant) -> Result<Duration, RendezvousError> {
     remaining_io_budget(deadline).map_err(|_| RendezvousError::GrantDeadline)
 }
 
+/// The socket timeout to spend on the next framed exchange, or the deadline
+/// error when there is none left. Clamped away from zero because std refuses a
+/// zero-duration timeout, and an expired deadline has to read as an expired
+/// deadline rather than as `InvalidInput` from a socket option.
 fn remaining_io_budget(deadline: Instant) -> Result<Duration, RendezvousError> {
     let now = Instant::now();
     if now >= deadline {
@@ -2251,14 +3428,42 @@ mod tests {
         parent
     }
 
-    /// THE BUDGET THAT DECIDES THE LANE. `fdpass` carries 64 descriptors and
-    /// this transport spends two on the pipes, so the protocol's own 256-session
-    /// ceiling is not the binding one — and a lane check testing the wrong
-    /// ceiling would discover the truth at `sendmsg` time, with the terminal
-    /// already parked.
+    /// The pre-dial death seam reads the shared flag rule — unset, empty and
+    /// `0` leave the successor alone — and `kill` is the one other spelling.
     #[test]
-    fn the_session_ceiling_is_the_message_ceiling_minus_the_two_pipes() {
-        assert_eq!(MAX_RENDEZVOUS_SESSIONS, fdpass::MAX_FDS - 2);
+    fn the_die_before_dial_seam_reads_the_flag_rule() {
+        use std::ffi::OsStr;
+        for quiet in [None, Some(""), Some("0")] {
+            assert_eq!(
+                parse_debug_die_before_dial(quiet.map(OsStr::new)),
+                None,
+                "{quiet:?}"
+            );
+        }
+        for exit in ["1", "exit", "yes"] {
+            assert_eq!(
+                parse_debug_die_before_dial(Some(OsStr::new(exit))),
+                Some(DebugDeathBeforeDial::Exit),
+                "{exit}"
+            );
+        }
+        assert_eq!(
+            parse_debug_die_before_dial(Some(OsStr::new("kill"))),
+            Some(DebugDeathBeforeDial::Kill)
+        );
+        assert_eq!(
+            parse_debug_die_before_dial(Some(OsStr::new("checked-in"))),
+            Some(DebugDeathBeforeDial::ExitAfterCheckIn)
+        );
+        assert_eq!(
+            parse_debug_die_before_dial(Some(OsStr::new("checked-in-kill"))),
+            Some(DebugDeathBeforeDial::KillAfterCheckIn)
+        );
+        assert_ne!(
+            DEBUG_DEATH_EXIT_CODE,
+            crate::seamless::EXIT_SUCCESSOR_PASSING,
+            "the seam's exit reads as a crash, never as a passing refusal"
+        );
     }
 
     #[test]
@@ -2453,19 +3658,21 @@ mod tests {
                 &path,
                 &claim,
                 TEST_NONCE,
-                deadlines_in(10),
+                deadlines_in(120),
                 own_parent(),
                 false,
             )
         });
 
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
-                Instant::now() + Duration::from_secs(10),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                 &|| false,
-            )
-            .expect("the dialer presents the claim and is this very process");
+            ),
+            "the dialer presents the claim and is this very process",
+        );
         assert_eq!(peer.pid(), own_pid(), "LOCAL_PEERPID names the dialer");
         // SAFETY: a descriptor this test owns for the length of the call.
         let borrowed = unsafe { BorrowedFd::borrow_raw(master) };
@@ -2474,7 +3681,7 @@ mod tests {
             &[(11, 4242, borrowed)],
             ready_wr.as_fd(),
             commit_rd.as_fd(),
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
         )
         .expect("transfer");
 
@@ -2500,6 +3707,359 @@ mod tests {
         drop((ready_rd, ready_wr, commit_rd, commit_wr));
         aterm_pty::close_fd(master);
         aterm_pty::close_fd(slave);
+    }
+
+    /// THE CODE CHECK JUDGES THE TOKEN THE GATE READ, AND ONLY IF IT NAMES THE
+    /// ATTESTED DIALER (round eight of the update audit, U36's second review).
+    /// The token read from the connection, naming the attested pid, is checked
+    /// and passes. NEGATIVE CONTROLS: the same token against another attested
+    /// pid is not checked at all, and a token for a later image at the same pid
+    /// (its pid version moved on) fails the lookup, where a fresh read at a
+    /// recheck would have judged whatever ran there then. Neither is a verdict,
+    /// and neither is a pass.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_code_check_judges_the_token_read_at_the_claim_and_only_for_its_pid() {
+        let (a, _b) = CtlStream::pair().expect("pair");
+        let token = aterm_uds::peer::peer_audit_token(&a).expect("the kernel names the peer");
+        let code = DialerCode::this_process();
+        match code.admit(&a, own_pid(), Some(token)) {
+            Ok(()) => {}
+            Err(CodeRefusal::TrustdSilent(why)) => panic!("{TRUSTD_SILENT}: {why}"),
+            Err(refusal) => {
+                panic!("the token names the attested dialer, which runs this code: {refusal:?}")
+            }
+        }
+        let elsewhere = code.admit(&a, own_pid() + 1, Some(token));
+        assert!(
+            matches!(&elsewhere, Err(CodeRefusal::Unchecked(why)) if why.contains("not the attested dialer")),
+            "a token naming another pid was checked for the attested dialer: {elsewhere:?}"
+        );
+        let mut later = token;
+        later.0[7] = later.0[7].wrapping_add(1);
+        let stale = code.admit(&a, own_pid(), Some(later));
+        if let Err(CodeRefusal::TrustdSilent(why)) = &stale {
+            panic!("{TRUSTD_SILENT}: {why}");
+        }
+        assert!(
+            matches!(stale, Err(CodeRefusal::Unchecked(_))),
+            "a token for another image at the pid was judged as the live one: {stale:?}"
+        );
+    }
+
+    /// A dialer that claims — under `ATRZ2C` when `chunks` — and then only
+    /// COUNTS: every descriptor any frame brings it until the parent's close,
+    /// one message or chunked, so a test reads what really reached the other
+    /// end rather than whether a well-formed grant did.
+    fn dial_and_count(
+        path: PathBuf,
+        claim: String,
+        chunks: bool,
+    ) -> std::thread::JoinHandle<usize> {
+        std::thread::spawn(move || {
+            let stream = CtlStream::connect(&path).expect("dial the rendezvous");
+            (&stream)
+                .write_all(&claim_frame_with(&claim, chunks))
+                .expect("present the claim");
+            // Darwin refuses the option (`EINVAL`) on a connection the other end
+            // has already shut; the reads below then answer end of file at once.
+            let _ = stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN));
+            let mut received = 0;
+            let mut buf = [0u8; 4096];
+            while let Ok(got) =
+                aterm_uds::fdpass::recv_with_fds(&stream, &mut buf, aterm_uds::fdpass::MAX_FDS)
+            {
+                if got.bytes == 0 && got.fds.is_empty() {
+                    break;
+                }
+                received += got.fds.len();
+            }
+            received
+        })
+    }
+
+    /// THE GRANT LEAVES ONLY WHILE THE KERNEL STILL NAMES THE PROCESS THE GATE
+    /// CHECKED (U36's second review), FOR BOTH GRANTS. Positive control:
+    /// `a_claimed_rendezvous_carries_every_descriptor_to_the_dialer` and
+    /// `a_grant_of_100_sessions_crosses_in_chunks` grant a dialer whose token
+    /// never changed, through the same check. Here the token the gate checked
+    /// is replaced by one for a later image at the same pid — what the gate
+    /// would hold had the dialer's image changed after its check (a real
+    /// change of image is `a_grant_is_not_sent_once_the_dialers_image_changed`)
+    /// — and `transfer` sends nothing: `TransferNotSent`, naming the change,
+    /// and the dialer receives no descriptor before the end of file. Once for
+    /// the one-message grant (one session, an `ATRZ1C` claim) and once for the
+    /// CHUNKED grant (a hundred sessions, an `ATRZ2C` claim), whose own check
+    /// before its first `sendmsg` nothing else tests (round eight's U0 review:
+    /// with it deleted, every test still passed).
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_grant_is_not_sent_when_the_dialers_token_is_not_the_one_checked() {
+        for (chunks, sessions) in [(false, 1_usize), (true, 100)] {
+            let Some(rendezvous) = bind_for_test() else {
+                return;
+            };
+            let (reads, writes) = pipes_for_test(sessions);
+            let (ready_rd, ready_wr) = pipe_for_test();
+            let (commit_rd, commit_wr) = pipe_for_test();
+            let dialer = dial_and_count(
+                rendezvous.path().to_path_buf(),
+                rendezvous.claim().to_string(),
+                chunks,
+            );
+            let mut peer = admitted(
+                rendezvous.accept_claim(
+                    Some(own_pid()),
+                    &crate::handoff_rendezvous::DialerCode::this_process(),
+                    Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                    &|| false,
+                ),
+                "the dialer presents the claim and is this very process",
+            );
+            assert_eq!(peer.chunks, chunks, "the claim the dialer presented");
+            let mut later = peer.token.expect("the gate read the dialer's token");
+            assert_eq!(
+                later.pid(),
+                std::process::id(),
+                "the token the gate kept names the attested dialer"
+            );
+            later.0[7] = later.0[7].wrapping_add(1);
+            peer.token = Some(later);
+            let granted = writes
+                .iter()
+                .enumerate()
+                .map(|(id, write)| (id as u64, 5000 + id as i32, write.as_fd()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                grant_shape(chunks, sessions).expect("a grant this claim takes"),
+                if chunks {
+                    GrantShape::Chunked
+                } else {
+                    GrantShape::OneMessage
+                },
+                "PRECONDITION: {sessions} session(s) take the grant under test"
+            );
+            let refused = peer.transfer(
+                TEST_NONCE,
+                &granted,
+                ready_wr.as_fd(),
+                commit_rd.as_fd(),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            );
+            assert!(
+                matches!(&refused, Err(RendezvousError::TransferNotSent(why)) if why.contains("audit token changed")),
+                "{sessions} session(s): a grant left for a token other than the one checked: \
+                 {refused:?}"
+            );
+            drop((peer, rendezvous));
+            assert_eq!(
+                dialer.join().expect("dialer thread"),
+                0,
+                "{sessions} session(s): the dialer received a descriptor the gate refused to send"
+            );
+            drop((reads, writes, ready_rd, ready_wr, commit_rd, commit_wr));
+        }
+    }
+
+    /// The exec stand-in's role, in its own environment: the rendezvous it
+    /// dials, the claim it presents, the file whose appearance tells it to
+    /// replace its image (absent with [`EXEC_DIALER_STAYS`]), and the file its
+    /// new image creates once it runs.
+    #[cfg(target_vendor = "apple")]
+    const EXEC_DIALER_PATH: &str = "ATERM_TEST_EXEC_DIALER_RENDEZVOUS";
+    #[cfg(target_vendor = "apple")]
+    const EXEC_DIALER_CLAIM: &str = "ATERM_TEST_EXEC_DIALER_CLAIM";
+    #[cfg(target_vendor = "apple")]
+    const EXEC_DIALER_GO: &str = "ATERM_TEST_EXEC_DIALER_GO";
+    #[cfg(target_vendor = "apple")]
+    const EXEC_DIALER_EXECD: &str = "ATERM_TEST_EXEC_DIALER_EXECD";
+    /// Set: the stand-in waits for the grant in the image that claimed (the
+    /// positive control), never replacing it.
+    #[cfg(target_vendor = "apple")]
+    const EXEC_DIALER_STAYS: &str = "ATERM_TEST_EXEC_DIALER_STAYS";
+    /// Set only in the NEW image: the claimed connection's descriptor number,
+    /// inherited across the `exec`.
+    #[cfg(target_vendor = "apple")]
+    const EXEC_DIALER_FD: &str = "ATERM_TEST_EXEC_DIALER_FD";
+    /// What the stand-in prints, with how many descriptors reached it.
+    #[cfg(target_vendor = "apple")]
+    const EXEC_DIALER_RECEIVED: &str = "EXEC DIALER RECEIVED";
+
+    /// Read `stream` to its end of file and count the descriptors that came.
+    #[cfg(target_vendor = "apple")]
+    fn count_until_closed(stream: &CtlStream) -> usize {
+        let _ = stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN));
+        let mut received = 0;
+        let mut buf = [0u8; 4096];
+        while let Ok(got) =
+            aterm_uds::fdpass::recv_with_fds(stream, &mut buf, aterm_uds::fdpass::MAX_FDS)
+        {
+            if got.bytes == 0 && got.fds.is_empty() {
+                break;
+            }
+            received += got.fds.len();
+        }
+        received
+    }
+
+    /// STAND-IN: a successor-shaped dialer of THIS test binary's code — it
+    /// dials, presents the claim, and waits for the parent's go. Then, unless
+    /// told to stay, it REPLACES ITS IMAGE with this binary again, keeping the
+    /// claimed connection open across the `exec` (its close-on-exec flag
+    /// cleared), and the new image counts what reaches it on that connection.
+    /// A no-op in the ordinary run.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn exec_dialer_stand_in() {
+        use std::os::unix::process::CommandExt as _;
+        if let Some(fd) = std::env::var(EXEC_DIALER_FD)
+            .ok()
+            .and_then(|fd| fd.parse::<i32>().ok())
+        {
+            // SAFETY: the image before this one cleared FD_CLOEXEC on exactly
+            // this descriptor, its claimed connection, and exec'd; nothing else
+            // in this process owns it.
+            let stream = unsafe { CtlStream::from_raw_fd(fd) };
+            let execd = std::env::var_os(EXEC_DIALER_EXECD).expect("the marker's path");
+            std::fs::write(execd, b"").expect("say the new image runs");
+            println!(
+                "{EXEC_DIALER_RECEIVED} {} DESCRIPTORS",
+                count_until_closed(&stream)
+            );
+            return;
+        }
+        let (Some(path), Ok(claim), Some(go)) = (
+            std::env::var_os(EXEC_DIALER_PATH),
+            std::env::var(EXEC_DIALER_CLAIM),
+            std::env::var_os(EXEC_DIALER_GO),
+        ) else {
+            return;
+        };
+        let stream = dial_for_test(Path::new(&path), &claim).expect("dial and claim");
+        let go = PathBuf::from(go);
+        let told = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(5),
+            || go.exists().then_some(()),
+        );
+        assert!(told.is_some(), "the parent never said go");
+        if std::env::var_os(EXEC_DIALER_STAYS).is_some() {
+            println!(
+                "{EXEC_DIALER_RECEIVED} {} DESCRIPTORS",
+                count_until_closed(&stream)
+            );
+            return;
+        }
+        let fd = stream.into_raw_fd();
+        // SAFETY: plain fcntl on the descriptor this process just took from its
+        // stream; clearing FD_CLOEXEC is what keeps it open across the exec.
+        let kept = unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == 0
+        };
+        assert!(kept, "clear the claimed connection's close-on-exec flag");
+        let error = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args(std::env::args_os().skip(1))
+            .env(EXEC_DIALER_FD, fd.to_string())
+            .exec();
+        panic!("exec the new image: {error}");
+    }
+
+    /// A GRANT IS NOT SENT ONCE THE DIALER'S IMAGE CHANGED (round eight's U0
+    /// review), on the real kernel. The stand-in — another process, running this
+    /// binary's code, so it passes the code gate as the attested dialer — claims,
+    /// and once the gate has read and checked its audit token it `exec`s a new
+    /// image at the same pid, the claimed connection kept open across it. The
+    /// grant is then refused before any descriptor leaves (`TransferNotSent`,
+    /// "audit token changed"), and the new image, reading that connection,
+    /// receives nothing before the end of file.
+    ///
+    /// WHAT IT MEASURES: the kernel answers `LOCAL_PEERTOKEN` live, and an
+    /// `exec` moves the token's pid version while the pid stays — so the check
+    /// before the send can fire on a live connection, not only on the synthetic
+    /// token of `a_grant_is_not_sent_when_the_dialers_token_is_not_the_one_checked`.
+    /// Were the token fixed at `connect(2)`, the grant would go out here.
+    ///
+    /// POSITIVE CONTROL: the same stand-in told to stay in the image that
+    /// claimed is granted, and receives every descriptor — so the refusal is the
+    /// exec's, not a cross-process comparison that never matches.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_grant_is_not_sent_once_the_dialers_image_changed() {
+        for stays in [true, false] {
+            let Some(rendezvous) = bind_for_test() else {
+                return;
+            };
+            let scratch = aterm_tempfile::TempDir::new().expect("a scratch dir");
+            let (go, execd) = (scratch.path().join("go"), scratch.path().join("execd"));
+            let mut stand_in =
+                crate::test_alone::StandIn::helper(module_path!(), "exec_dialer_stand_in");
+            stand_in
+                .command()
+                .env(EXEC_DIALER_PATH, rendezvous.path())
+                .env(EXEC_DIALER_CLAIM, rendezvous.claim())
+                .env(EXEC_DIALER_GO, &go)
+                .env(EXEC_DIALER_EXECD, &execd);
+            if stays {
+                stand_in.command().env(EXEC_DIALER_STAYS, "1");
+            }
+            let mut stand_ins = [stand_in.spawn()];
+            let pid = i32::try_from(stand_ins[0].id()).expect("a pid fits pid_t");
+            let peer = admitted(
+                rendezvous.accept_claim(
+                    Some(pid),
+                    &crate::handoff_rendezvous::DialerCode::this_process(),
+                    Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                    &|| false,
+                ),
+                "the stand-in runs this binary's code and is the attested dialer",
+            );
+            assert_eq!(peer.pid(), pid, "LOCAL_PEERPID names the stand-in");
+            std::fs::write(&go, b"").expect("say go");
+            if !stays {
+                crate::test_alone::until_or_ended(
+                    "the stand-in's new image runs",
+                    &mut stand_ins,
+                    || execd.exists(),
+                );
+            }
+            let (reads, writes) = pipes_for_test(1);
+            let (ready_rd, ready_wr) = pipe_for_test();
+            let (commit_rd, commit_wr) = pipe_for_test();
+            let granted = peer.transfer(
+                TEST_NONCE,
+                &[(11, 4242, writes[0].as_fd())],
+                ready_wr.as_fd(),
+                commit_rd.as_fd(),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            );
+            if stays {
+                granted.expect("the dialer the gate checked, unchanged, is granted");
+            } else {
+                assert!(
+                    matches!(&granted, Err(RendezvousError::TransferNotSent(why)) if why.contains("audit token changed")),
+                    "a grant left for an image the gate never checked: {granted:?}"
+                );
+            }
+            drop((peer, rendezvous));
+            let [stand_in] = stand_ins;
+            let ran = stand_in.passed();
+            let received = ran
+                .stdout
+                .lines()
+                .find_map(|line| line.split(EXEC_DIALER_RECEIVED).nth(1))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|count| count.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    panic!("the stand-in never said what it received:\n{}", ran.stdout)
+                });
+            assert_eq!(
+                received,
+                if stays { 1 + RENDEZVOUS_CHANNEL_FDS } else { 0 },
+                "stays={stays}: what reached the dialer"
+            );
+            drop((reads, writes, ready_rd, ready_wr, commit_rd, commit_wr));
+        }
     }
 
     /// THE PARENT HANGS UP RIGHT AFTER THE GRANT, AND THE CLAIM STILL LANDS
@@ -2532,18 +4092,20 @@ mod tests {
                     &path,
                     &claim,
                     TEST_NONCE,
-                    deadlines_in(10),
+                    deadlines_in(120),
                     own_parent(),
                     false,
                 )
             });
-            let peer = rendezvous
-                .accept_claim(
+            let peer = admitted(
+                rendezvous.accept_claim(
                     Some(own_pid()),
-                    Instant::now() + Duration::from_secs(10),
+                    &crate::handoff_rendezvous::DialerCode::this_process(),
+                    Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                     &|| false,
-                )
-                .expect("the dialer presents the claim");
+                ),
+                "the dialer presents the claim",
+            );
             // SAFETY: a descriptor this test owns for the length of the call.
             let borrowed = unsafe { BorrowedFd::borrow_raw(master) };
             peer.transfer(
@@ -2551,7 +4113,7 @@ mod tests {
                 &[(11, 4242, borrowed)],
                 ready_wr.as_fd(),
                 commit_rd.as_fd(),
-                Instant::now() + Duration::from_secs(10),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             )
             .expect("transfer");
             // The outgoing process's order: the connection goes the moment
@@ -2586,8 +4148,6 @@ mod tests {
     #[test]
     fn a_successor_process_claims_from_the_real_outgoing_listener() {
         const CHILD: &str = "RZ_CROSS_PROCESS_SUCCESSOR";
-        const EXACT: &str =
-            "handoff_rendezvous::tests::a_successor_process_claims_from_the_real_outgoing_listener";
         if let Some(spec) = std::env::var_os(CHILD) {
             // THE SUCCESSOR: `<path>\n<claim>\n<parent pid>\n<device term>`.
             let spec = spec.into_string().expect("the child spec is UTF-8");
@@ -2602,7 +4162,7 @@ mod tests {
                 "the outgoing process attests by its birth record"
             );
             let claimed =
-                dial_and_claim(&path, &claim, TEST_NONCE, deadlines_in(10), parent, false)
+                dial_and_claim(&path, &claim, TEST_NONCE, deadlines_in(120), parent, false)
                     .expect("the successor's identity gate admits the real outgoing listener");
             assert_eq!(claimed.session_count(), 1);
             assert_eq!(
@@ -2626,22 +4186,41 @@ mod tests {
             rendezvous.claim(),
             own_pid()
         );
-        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", EXACT, "--nocapture", "--test-threads=1"])
-            .env(CHILD, spec)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn the successor process");
-        let successor = i32::try_from(child.id()).expect("a pid fits pid_t");
+        // The successor: this very test as a stand-in, which must run exactly
+        // this test and pass it.
+        let mut child = crate::test_alone::StandIn::this_test();
+        child.command().env(CHILD, spec);
+        let child = std::cell::RefCell::new(child.spawn());
+        let successor = i32::try_from(child.borrow().id()).expect("a pid fits pid_t");
 
-        let peer = rendezvous
-            .accept_claim(
-                Some(successor),
-                Instant::now() + Duration::from_secs(20),
-                &|| false,
-            )
-            .expect("the successor process presents the claim");
+        // A hang detector for a process start, cut short by the successor's
+        // own end: one that ended first is judged by its run. The successor's
+        // claim deadline is past this one, so this is the one hang detector,
+        // and a successor HELD for `trustd` (the held refusal, or one that
+        // left while held) is the machine's, named before the child's run is.
+        let turned_away = std::cell::RefCell::new(Vec::new());
+        let claimed = rendezvous.accept_claim_observed(
+            Some(successor),
+            &crate::handoff_rendezvous::DialerCode::this_process(),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &|| child.borrow_mut().exited(),
+            &|dialer| turned_away.borrow_mut().push(dialer.clone()),
+        );
+        let peer = match claimed {
+            Ok(peer) => peer,
+            Err(error) => {
+                let turned_away = turned_away.into_inner();
+                if held_for_trustd(&error)
+                    || turned_away
+                        .iter()
+                        .any(|dialer| matches!(dialer.refusal, CodeRefusal::TrustdSilent(_)))
+                {
+                    panic!("{TRUSTD_SILENT}: {error}: {turned_away:?}");
+                }
+                child.into_inner().passed();
+                panic!("the successor process passed without presenting its claim: {error}");
+            }
+        };
         assert_eq!(
             peer.pid(),
             successor,
@@ -2654,17 +4233,11 @@ mod tests {
             &[(11, 4242, borrowed)],
             ready_wr.as_fd(),
             commit_rd.as_fd(),
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
         )
         .expect("transfer");
 
-        let output = child.wait_with_output().expect("the successor exits");
-        assert!(
-            output.status.success(),
-            "the successor process failed its claim\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        child.into_inner().passed();
         drop((ready_rd, ready_wr, commit_rd, commit_wr));
         aterm_pty::close_fd(master);
         aterm_pty::close_fd(slave);
@@ -2704,13 +4277,15 @@ mod tests {
             drop(stream);
             closed_tx.send(()).expect("signal");
         });
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
-                Instant::now() + Duration::from_secs(10),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                 &|| false,
-            )
-            .expect("the claim was presented");
+            ),
+            "the claim was presented",
+        );
         close_tx.send(()).expect("tell the dialer to close");
         closed_rx.recv().expect("the dialer closed");
         dialer.join().expect("dialer thread");
@@ -2726,7 +4301,7 @@ mod tests {
                 &[(11, 4242, borrowed)],
                 ready_wr.as_fd(),
                 commit_rd.as_fd(),
-                Instant::now() + Duration::from_secs(5),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             )
             .expect_err("a closed peer cannot take the descriptors");
         assert!(
@@ -2757,19 +4332,21 @@ mod tests {
             drop(stream);
             count
         });
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
-                Instant::now() + Duration::from_secs(10),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                 &|| false,
-            )
-            .expect("claimed");
+            ),
+            "claimed",
+        );
         let outcome = peer.transfer(
             TEST_NONCE,
             &[(11, 4242, fake_master_rd.as_fd())],
             ready_wr.as_fd(),
             commit_rd.as_fd(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
         );
         let received = dialer.join().expect("dialer thread");
         assert_eq!(received, 3, "the master and both pipes reached the peer");
@@ -2793,21 +4370,24 @@ mod tests {
         let Some(rendezvous) = bind_for_test() else {
             return;
         };
-        let path = rendezvous.path().to_path_buf();
-        let dialer = std::thread::spawn(move || {
-            let stream = CtlStream::connect(&path).expect("connect");
-            let _ = (&stream).write_all(&claim_frame(&"f".repeat(CLAIM_HEX_LEN)));
-            // Hold the connection open, so the refusal is provably about the
-            // claim and not about a peer that vanished.
-            std::thread::sleep(Duration::from_millis(200));
-        });
+        // Connected and fully spoken inline, before the accept's deadline starts,
+        // so no scheduling delay of a dialer thread can turn the refusal into a
+        // bare deadline.
+        let stream = CtlStream::connect(rendezvous.path()).expect("connect");
+        (&stream)
+            .write_all(&claim_frame(&"f".repeat(CLAIM_HEX_LEN)))
+            .and_then(|()| (&stream).flush())
+            .expect("the dialer presents a wrong secret");
         let refused = rendezvous.accept_claim(
             Some(own_pid()),
+            &crate::handoff_rendezvous::DialerCode::this_process(),
             Instant::now() + Duration::from_millis(400),
             &|| false,
         );
         assert_eq!(refused.err(), Some(RendezvousError::Claim));
-        dialer.join().expect("dialer thread");
+        // Held open until now, so the refusal is provably about the claim and
+        // not about a peer that vanished.
+        drop(stream);
     }
 
     /// A WRONG DIALER COSTS ITS OWN CONNECTION, NOT THE UPDATE. The path is
@@ -2835,7 +4415,7 @@ mod tests {
             .and_then(|()| (&bogus).flush())
             .expect("the wrong dialer presents a wrong secret");
         bogus
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
             .expect("bound the wrong dialer's own read");
 
         let successor = std::thread::spawn(move || {
@@ -2843,18 +4423,20 @@ mod tests {
                 &path,
                 &claim,
                 TEST_NONCE,
-                deadlines_in(10),
+                deadlines_in(120),
                 own_parent(),
                 false,
             )
         });
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
-                Instant::now() + Duration::from_secs(10),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                 &|| false,
-            )
-            .expect("the wrong dialer is refused and the wait resumes for the real successor");
+            ),
+            "the wrong dialer is refused and the wait resumes for the real successor",
+        );
         // SAFETY: a descriptor this test owns for the length of the call.
         let borrowed = unsafe { BorrowedFd::borrow_raw(master) };
         peer.transfer(
@@ -2862,7 +4444,7 @@ mod tests {
             &[(11, 4242, borrowed)],
             ready_wr.as_fd(),
             commit_rd.as_fd(),
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
         )
         .expect("transfer");
         let claimed = successor
@@ -2915,6 +4497,7 @@ mod tests {
         let started = Instant::now();
         let refused = rendezvous.accept_claim(
             Some(own_pid()),
+            &crate::handoff_rendezvous::DialerCode::this_process(),
             Instant::now() + Duration::from_secs(120),
             &|| false,
         );
@@ -2942,6 +4525,11 @@ mod tests {
         // The RIGHT secret, delivered too slowly: what is being tested is the
         // budget, so the frame must be one that would otherwise be accepted.
         let claim = rendezvous.claim().to_string();
+        // This binary's code requirement is read BEFORE the dribble starts and
+        // the clock runs: it asks Security.framework, which no deadline under
+        // test bounds. Read inside the timed window, the full suite at load 40
+        // (2026-10-02) measured 21 s there, the frame long arrived whole.
+        let code = crate::handoff_rendezvous::DialerCode::this_process();
         // Connected inline, before the wait starts, so the accept finds it at
         // once and the refusal is always the frame read's: a dial left to a
         // thread that a loaded machine starts late would end the wait on the
@@ -2951,6 +4539,7 @@ mod tests {
         let dribbler = {
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
+                let mut wrote = 0usize;
                 for byte in claim_frame(&claim) {
                     if stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
@@ -2958,36 +4547,38 @@ mod tests {
                     if (&stream).write_all(&[byte]).is_err() {
                         break;
                     }
+                    wrote += 1;
                     let _ = (&stream).flush();
-                    std::thread::sleep(Duration::from_millis(40));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
+                wrote
             })
         };
 
         let budget = Duration::from_millis(300);
-        let started = Instant::now();
-        let refused = rendezvous.accept_claim(Some(own_pid()), Instant::now() + budget, &|| false);
-        let waited = started.elapsed();
+        let refused =
+            rendezvous.accept_claim(Some(own_pid()), &code, Instant::now() + budget, &|| false);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
         assert!(
             refused.is_err(),
             "a frame that does not arrive inside the deadline is refused, not awaited"
         );
-        // The budget is the subject, and it sits between the two outcomes: a
-        // frame read bounded by the attempt's deadline is refused at `budget`
-        // (300 ms), while one bounded only by its own `CLAIM_FRAME_BUDGET` is
-        // refused a whole frame budget (2 s) after the accept, and one that
-        // restarts a per-read timeout reads all 70 bytes (2.8 s) before anything
-        // looks at the deadline. A correct tree fails this only if held off the
-        // CPU for 1.7 s.
+        // The refusal alone cannot tell the reads apart: `gate_one` checks the
+        // deadline again after the frame, so a read that ignored it is refused
+        // too, with the same error. How much of the frame was CONSUMED can: 70
+        // bytes 10 ms apart take at least 690 ms, past the attempt's 300 ms
+        // deadline and inside the frame's own `CLAIM_FRAME_BUDGET` (2 s). A read
+        // bounded by the deadline gives up at about 30 bytes and drops the
+        // stream; one bounded only by the frame budget, or restarting a per-read
+        // timeout, returns only after all 70. Load only slows the dribbler, so
+        // it cannot fail a correct tree.
+        let wrote = dribbler.join().expect("dribbler thread");
         assert!(
-            waited < CLAIM_FRAME_BUDGET,
-            "the WHOLE frame is bounded by the attempt's deadline, not by the frame's own \
-             {CLAIM_FRAME_BUDGET:?}; 70 bytes at 40 ms each would be 2.8 s, and this waited \
-             {waited:?}"
+            wrote < CLAIM_FRAME_LEN,
+            "the frame read waited past the attempt's deadline for the whole \
+             {CLAIM_FRAME_LEN}-byte frame"
         );
-        dribbler.join().expect("dribbler thread");
     }
 
     /// HALF A RENDEZVOUS REPORTS ITSELF AS HALF. `rendezvous_present` answers yes
@@ -3059,6 +4650,7 @@ mod tests {
         assert!(path.exists(), "the listener is on disk while it is bound");
         let expired = rendezvous.accept_claim(
             Some(own_pid()),
+            &crate::handoff_rendezvous::DialerCode::this_process(),
             Instant::now() + Duration::from_millis(50),
             &|| false,
         );
@@ -3087,6 +4679,7 @@ mod tests {
         let started = Instant::now();
         let cancelled = rendezvous.accept_claim(
             Some(own_pid()),
+            &crate::handoff_rendezvous::DialerCode::this_process(),
             Instant::now() + Duration::from_secs(120),
             &|| true,
         );
@@ -3137,20 +4730,23 @@ mod tests {
         // spent — which is the property — and only the grant budget can govern it.
         const PAST_THE_DIAL: Duration = Duration::from_millis(250);
         let dial = Instant::now() + Duration::from_secs(2);
+        // The grant budget is a hang detector, never a latency budget.
         let deadlines = ClaimDeadlines {
             dial,
-            grant: dial + Duration::from_secs(30),
+            grant: dial + 2 * aterm_spec::wait::MUST_HAPPEN,
         };
         let dialer = std::thread::spawn(move || {
             dial_and_claim(&path, &claim, TEST_NONCE, deadlines, own_parent(), false)
         });
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
-                Instant::now() + Duration::from_secs(10),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                 &|| false,
-            )
-            .expect("claimed");
+            ),
+            "claimed",
+        );
         assert!(!peer.poll_hangup(), "a held, idle dialer is not a hangup");
         std::thread::sleep(dial.saturating_duration_since(Instant::now()) + PAST_THE_DIAL);
         assert!(Instant::now() > dial, "the hold outlasted the dial budget");
@@ -3165,7 +4761,7 @@ mod tests {
             &[(11, 4242, borrowed)],
             ready_wr.as_fd(),
             commit_rd.as_fd(),
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
         )
         .expect("transfer after the hold");
         let claimed = dialer
@@ -3193,7 +4789,6 @@ mod tests {
         // EOF as the end would wait the budget out and fail `Deadline` two
         // minutes on. The minute is a hang detector, not a latency budget.
         let dialer = std::thread::spawn(move || {
-            let started = Instant::now();
             let outcome = dial_and_claim(
                 &path,
                 &claim,
@@ -3202,19 +4797,25 @@ mod tests {
                 own_parent(),
                 false,
             );
-            (outcome, started.elapsed())
+            (outcome, Instant::now())
         });
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
                 Instant::now() + Duration::from_secs(60),
                 &|| false,
-            )
-            .expect("claimed");
+            ),
+            "claimed",
+        );
         std::thread::sleep(Duration::from_millis(100));
+        // Timed from the drop: a code check held for `trustd` before the
+        // admission is the machine's wait, not the dialer's.
+        let dropped = Instant::now();
         drop(peer);
         drop(rendezvous);
-        let (outcome, elapsed) = dialer.join().expect("dialer thread");
+        let (outcome, ended) = dialer.join().expect("dialer thread");
+        let elapsed = ended.saturating_duration_since(dropped);
         match outcome {
             Err(RendezvousError::Grant(reason)) => {
                 assert_eq!(reason, "the parent closed the rendezvous");
@@ -3226,6 +4827,170 @@ mod tests {
             elapsed < Duration::from_secs(60),
             "EOF ends the wait at once, not at the grant budget: {elapsed:?}"
         );
+    }
+
+    /// AN ACCEPT SHORT OF A DESCRIPTOR HAS ALREADY LOST ITS DIAL (round eight
+    /// of the update audit, #3's accept half). Pinned because it is why
+    /// `accept_one` ends the wait on such an error instead of waiting for room:
+    /// Darwin dequeues the connection BEFORE it allocates the descriptor, and
+    /// when the allocation fails it closes the connection rather than putting
+    /// it back. So the dialer this process could not accept is told at once —
+    /// its claim reads the end of the rendezvous and it exits before any
+    /// window — and no dial is left queued for a retry to find: a wait for
+    /// room would only hold the attempt to its deadline over a successor that
+    /// is already gone. The cure for the exhaustion is room before the
+    /// rendezvous (`raise_descriptor_limit_for_park`), not a longer wait.
+    ///
+    /// Run in a child of the test binary, whose table this test fills.
+    #[test]
+    fn an_accept_short_of_a_descriptor_ends_the_wait_because_the_kernel_dropped_the_dial() {
+        if !crate::control_auth::enter_low_nofile_test_child(64) {
+            return;
+        }
+        let Some(rendezvous) = bind_for_test() else {
+            return;
+        };
+        let claim = rendezvous.claim().to_string();
+        let path = rendezvous.path().to_path_buf();
+        let parent = own_parent();
+        // Settled before the table fills: reading the requirement opens this binary.
+        let code = crate::handoff_rendezvous::DialerCode::this_process();
+        // Fill the table, then give back exactly one slot: the dialer's socket.
+        let mut filler = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => filler.push(file),
+                Err(error) if error.raw_os_error() == Some(libc::EMFILE) => break,
+                Err(error) => panic!("filling the table: {error}"),
+            }
+        }
+        drop(filler.pop());
+        // Both sides' budgets are THREE MINUTES, and both "at once" checks below a
+        // minute's hang detector: an end that waited for its budget instead
+        // cannot pass on a loaded machine's luck, nor fail a correct tree on it.
+        // Three, not more: this body runs in `test_alone`'s child, which is
+        // SIGKILLed at five, and a regression here must fail with its own message.
+        let dialer = std::thread::spawn(move || {
+            let started = Instant::now();
+            let outcome =
+                dial_and_claim(&path, &claim, TEST_NONCE, deadlines_in(180), parent, false);
+            (outcome, started.elapsed())
+        });
+        // The dial is queued once the listener reads ready.
+        let queued_by = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd: rendezvous.listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one initialized pollfd naming the open listener.
+            if unsafe { libc::poll(&mut pollfd, 1, 50) } > 0 {
+                break;
+            }
+            assert!(Instant::now() < queued_by, "the dial never queued");
+        }
+
+        let started = Instant::now();
+        let starved = rendezvous.accept_claim(
+            Some(own_pid()),
+            &code,
+            Instant::now() + Duration::from_secs(180),
+            &|| false,
+        );
+        match starved {
+            Err(RendezvousError::Accept(detail)) => assert!(
+                detail.contains(&std::io::Error::from_raw_os_error(libc::EMFILE).to_string()),
+                "the attempt says what ended it: {detail}"
+            ),
+            Err(other) => panic!("expected the accept's own error, got {other}"),
+            Ok(_) => panic!("PRECONDITION: the table was full"),
+        }
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "ended at once, not at the deadline: {:?}",
+            started.elapsed()
+        );
+        // The rendezvous is still held here, so the end the dialer reads is
+        // the kernel's close of its dropped connection: the end of the
+        // rendezvous if its claim was written first, else its own socket
+        // refusing the rest of the dial (Darwin's `SO_RCVTIMEO` on a socket
+        // shut both ways is `EINVAL`, see `arm_read_timeout`).
+        let (outcome, elapsed) = dialer.join().expect("dialer thread");
+        match outcome {
+            Err(RendezvousError::Grant(reason)) => {
+                assert_eq!(reason, "the parent closed the rendezvous");
+            }
+            Err(RendezvousError::Dial(_)) => {}
+            Err(other) => panic!("expected the dropped dial's end, got {other}"),
+            Ok(_) => panic!("expected the dropped dial's end, got a grant"),
+        }
+        assert!(
+            elapsed < aterm_spec::wait::MUST_HAPPEN,
+            "the dialer is told at once, not at its grant budget: {elapsed:?}"
+        );
+        drop(filler);
+        drop(rendezvous);
+    }
+
+    /// A GRANT THAT NEVER COMES ENDS AS THE SUCCESSOR'S OWN DEADLINE (round
+    /// eight of the update audit, #80). The parent accepts the dial and then
+    /// neither grants nor closes — stopped, in a debugger, its worker stuck on
+    /// a hung disk — for the whole of the successor's grant budget. The one
+    /// line the successor leaves behind must say its deadline passed
+    /// (`ClaimDeadline`, round six item 48), not that the grant was malformed.
+    ///
+    /// RED before the fix: the header was a bare receive under one socket
+    /// timeout, so its expiry came back as `Grant("Resource temporarily
+    /// unavailable (os error 35)")` — "the rendezvous grant is malformed".
+    #[test]
+    fn a_grant_that_never_arrives_ends_as_the_claim_deadline() {
+        let Some(rendezvous) = bind_for_test() else {
+            return;
+        };
+        let claim = rendezvous.claim().to_string();
+        let path = rendezvous.path().to_path_buf();
+        let deadlines = ClaimDeadlines {
+            dial: Instant::now() + Duration::from_secs(60),
+            grant: Instant::now() + Duration::from_millis(300),
+        };
+        let dialer = std::thread::spawn(move || {
+            dial_and_claim(&path, &claim, TEST_NONCE, deadlines, own_parent(), false)
+        });
+        // Held, never granted, never dropped, until the dialer has answered.
+        //
+        // HELD BY THE BARE ACCEPT, NOT THE GATED CLAIM (the load-sensitive
+        // test audit of 2026-09-27, applied by round eight's review of this
+        // test). The grant budget above is stamped before the dialer exists
+        // and is short on purpose, so on a loaded machine the dialer may end —
+        // correctly, `Deadline` — and close its socket before this thread is
+        // scheduled. `accept_claim`'s gate would then ask the closed
+        // connection for its peer (`LOCAL_PEERPID`), Darwin answers
+        // `ENOTCONN`, the dial is refused `PeerUnattested`, and the claim
+        // waits out its minute and fails a correct tree. The property is the
+        // DIALER's: its own grant budget ends its wait as `Deadline`. That
+        // needs the connection held open and unanswered, which `accept_one`
+        // does whether or not the dialer is still connected, and nothing from
+        // the parent's gates. The minute is a hang detector.
+        let held = rendezvous
+            .accept_one(Instant::now() + Duration::from_secs(60), &|| false)
+            .expect("accepted");
+        let outcome = dialer.join().expect("dialer thread");
+        assert!(
+            Instant::now() >= deadlines.grant,
+            "the wait lasted the grant budget"
+        );
+        match outcome {
+            Err(RendezvousError::Deadline) => {}
+            Err(other) => panic!("expected the grant budget's deadline, got {other}"),
+            Ok(_) => panic!("expected the grant budget's deadline, got a grant"),
+        }
+        assert_eq!(
+            claim_side(RendezvousError::Deadline),
+            RendezvousError::ClaimDeadline,
+            "which the claim says as this successor's own deadline"
+        );
+        drop(held);
     }
 
     /// A dialer that dies during the hold is seen by the parent's `poll_hangup`
@@ -3257,13 +5022,15 @@ mod tests {
             let _ = hold.recv();
             drop(stream);
         });
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
-                Instant::now() + Duration::from_secs(10),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                 &|| false,
-            )
-            .expect("claimed");
+            ),
+            "claimed",
+        );
         assert!(!peer.poll_hangup(), "alive while it holds the stream");
         let _ = seen_alive.send(());
         dialer.join().expect("dialer thread");
@@ -3276,18 +5043,17 @@ mod tests {
     /// is: a child another test in this binary is forking holds one until it
     /// execs, longer on a loaded machine, and a descriptor made close-on-exec
     /// non-atomically (macOS `socket` + `FIOCLEX`) can ride through the exec
-    /// itself. So a hang-up is waited for, not expected at once: 10 s, where it
-    /// was ~0.5 s of polls, or none — the fd-copy sweep of 2026-09-27, the class
-    /// `claude_lights`' gesture tests failed a gate on.
+    /// itself. So a hang-up is waited for, not expected at once: a hang
+    /// detector's minute, where it was ~0.5 s of polls, or none — the fd-copy
+    /// sweep of 2026-09-27, the class `claude_lights`' gesture tests failed a
+    /// gate on.
     fn wait_for_hangup(hung_up: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !hung_up() {
-            assert!(
-                Instant::now() < deadline,
-                "the closed dialer never read as a hangup"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let seen = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(10),
+            || hung_up().then_some(()),
+        );
+        assert!(seen.is_some(), "the closed dialer never read as a hangup");
     }
 
     fn bind_for_test() -> Option<Rendezvous> {
@@ -3369,20 +5135,10 @@ mod tests {
         }
     }
 
+    /// A PTY pair, both ends close-on-exec from birth: no child another test
+    /// spawns meanwhile holds either end past its exec.
     fn open_pty() -> (i32, i32) {
-        let (mut master, mut slave) = (0i32, 0i32);
-        // SAFETY: valid out-params; openpty fills them on success.
-        let opened = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(opened, 0, "openpty");
-        (master, slave)
+        aterm_pty::open_pty_pair().expect("open_pty_pair")
     }
 
     fn pipe_for_test() -> (OwnedFd, OwnedFd) {
@@ -3559,7 +5315,7 @@ mod tests {
         );
         let src = include_str!("app_update_handoff.rs");
         assert!(
-            src.contains("crate::handoff_rendezvous::launcher_limit_env()"),
+            src.contains("crate::handoff_rendezvous::carry_launcher_limit(&mut job.command);"),
             "the fork lane names it"
         );
         let main = include_str!("lib.rs");
@@ -3567,6 +5323,356 @@ mod tests {
             main.contains("handoff_rendezvous::adopt_carried_launcher_limit(&handoff_env)"),
             "main_entry adopts it"
         );
+    }
+
+    /// THE LAUNCHER'S LIMIT OUTLIVES A COLD-LANE EXEC TOO (round eight of the
+    /// update audit, #81). A process that raised its soft descriptor limit — a
+    /// launched successor's claim, or any attempt's park — later updates with
+    /// no terminal open, so the cold lane `exec`s. `execve` keeps the raised
+    /// limit, and the new image's record starts empty: unless the exec names
+    /// the launcher's limit, every tab the new image opens gets the raise.
+    ///
+    /// Two halves: the cold lane's arm names it before its `exec`, and — end
+    /// to end, in children of the test binary — a raised process's command
+    /// carries it into a new image that runs at the raised limit, adopts the
+    /// carried one through the production intake (`HandoffEnv::capture`, then
+    /// `adopt_carried_launcher_limit`), and hands a shell the launcher's.
+    ///
+    /// RED before the fix: the cold lane's `Command` named only its argv and
+    /// `ATERM_UPDATED_FROM`, and the new image's shells read 4096.
+    #[test]
+    fn a_cold_lane_exec_carries_the_launchers_limit_to_the_new_images_shells() {
+        const NEW_IMAGE: &str = "ATERM_TEST_COLD_EXEC_NEW_IMAGE";
+        if std::env::var_os(NEW_IMAGE).is_some() {
+            let env = crate::handoff_env::HandoffEnv::capture();
+            let carried =
+                adopt_carried_launcher_limit(&env).expect("the new image adopts the carried limit");
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: a valid resource id and a writable out-parameter.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+                0
+            );
+            assert!(
+                carried < limit.rlim_cur,
+                "the raise crossed the exec: {carried} < {}",
+                limit.rlim_cur
+            );
+            a_shell_spawned_after_the_raise_gets_the_launchers_limit(carried, limit.rlim_cur);
+            return;
+        }
+
+        let src = include_str!("app_update_handoff.rs");
+        let cold = &src[src
+            .find("ApplyLane::Cold,\n            ) => {")
+            .expect("the cold lane's arm")..];
+        let cold = &cold[..cold
+            .find("ApplyLane::Seamless,")
+            .expect("the arm ends where the seamless lane begins")];
+        let carry = cold
+            .find("crate::handoff_rendezvous::carry_launcher_limit(&mut command);")
+            .expect("the cold lane names the launcher's limit on its exec");
+        let exec = cold
+            .find("aterm_update::exec_keeping_sigpipe(&mut command)")
+            .expect("the cold lane's exec");
+        assert!(carry < exec, "named before the exec");
+
+        if !crate::control_auth::enter_low_nofile_test_child(64) {
+            return;
+        }
+        let (from, _) = raise_descriptor_limit_for_claim()
+            .expect("the raise is permitted")
+            .expect("a 64-spare limit is below the floor");
+        // The new image is this test again, as a stand-in: it passes only by
+        // running exactly this test (its shells got the launcher's limit).
+        let mut image = crate::test_alone::StandIn::this_test();
+        image.command().env(NEW_IMAGE, "1");
+        carry_launcher_limit(image.command());
+        assert!(
+            image
+                .command()
+                .get_envs()
+                .any(|(key, value)| key == ENV_LAUNCHER_NOFILE
+                    && value == Some(std::ffi::OsStr::new(&from.to_string()))),
+            "the command names the launcher's {from}"
+        );
+        image.spawn().passed();
+    }
+
+    /// This process's soft descriptor limit.
+    fn soft_nofile() -> u64 {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid resource id and a writable out-parameter.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+            0
+        );
+        limit.rlim_cur
+    }
+
+    /// Mark every descriptor at or above `floor` close-on-exec: what a busy
+    /// test run leaked into a child of the test binary there is not the
+    /// desk's, and a window at that limit could hold none. Up to the kernel's
+    /// per-process maximum, not this process's limit: a child of the test
+    /// binary inherits the leak at the numbers it had in the parent, above the
+    /// limit the child was then given.
+    fn mark_close_on_exec_at_or_above(floor: u64) {
+        let floor = i32::try_from(floor).expect("a descriptor number");
+        for fd in floor..aterm_uds::spawnfd::descriptor_bound() {
+            // SAFETY: F_GETFD/F_SETFD on any number only reads or sets its
+            // close-on-exec flag; a number that is not open answers -1.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+    }
+
+    /// The soft descriptor limit a fork-lane successor of `target_build`,
+    /// started by this process of `build` and handed `inherited`, runs at —
+    /// read by a stand-in's own `ulimit -n`, through the lane's own hook
+    /// ([`start_older_image_at_its_limit`]).
+    fn successor_soft_nofile(
+        target_build: u64,
+        build: u64,
+        inherited: &[std::os::fd::RawFd],
+    ) -> u64 {
+        // std's Command on purpose: the shipped `start_older_image_at_its_limit` hook takes std's and adds a `pre_exec`.
+        let mut successor = std::process::Command::new("/bin/sh");
+        successor.args(["-c", "ulimit -n"]);
+        start_older_image_at_its_limit(&mut successor, target_build, build, inherited);
+        let out = successor.output().expect("run the successor's stand-in");
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("a limit")
+    }
+
+    /// AN OLDER SUCCESSOR STARTS AT THE LIMIT HELD BEFORE A PARK'S RAISE
+    /// (round eight's second review of #3). A Dock-launched window, at
+    /// launchd's soft limit, begins an attempt toward this build (or a newer
+    /// one) that raises its limit for the park and then stands down — the
+    /// activity re-check, a recording, a launched-lane hold. Nothing lowers
+    /// that raise again. Later the person puts an older bundle back, or
+    /// switches channel, and an attempt targets an OLDER build: no raise is
+    /// made for it, but the one already made is still held — and a successor
+    /// built before 06b06e74e never reads the launcher's limit it is told, so
+    /// every shell it opened got the raise, where before round eight it
+    /// inherited launchd's limit. Driven in a child of the test binary whose
+    /// limit is launchd's in miniature: the fork lane's hook starts the older
+    /// successor at the launchd limit (its stand-in's `ulimit -n` reads it),
+    /// the cold lane's lowers it for the `exec` and raises it back when the
+    /// `exec` returns, and a successor started at the raise is told of it and
+    /// does the same for an older successor of its own. NEGATIVE CONTROLS: a
+    /// same-or-newer target inherits the room; a descriptor the image would
+    /// keep at or above the launchd limit leaves the raise (its strip would
+    /// not reach it); and a raise a recovery or a claim made — one every
+    /// successor inherited before round eight — is left as it was.
+    ///
+    /// RED before the fix: the older successor's stand-in read the raise.
+    #[test]
+    fn an_older_successor_starts_at_the_limit_held_before_a_parks_raise() {
+        const NEW_IMAGE: &str = "ATERM_TEST_PARK_RAISE_NEW_IMAGE";
+        const BUILD: u64 = 7;
+
+        // THE DECISION: only an older target, only under a park's raise.
+        assert_eq!(older_image_soft_limit(6, 7, Some(256), 4096), Some(256));
+        assert_eq!(
+            older_image_soft_limit(7, 7, Some(256), 4096),
+            None,
+            "the same build reads the told limit"
+        );
+        assert_eq!(
+            older_image_soft_limit(8, 7, Some(256), 4096),
+            None,
+            "a newer one does too"
+        );
+        assert_eq!(
+            older_image_soft_limit(6, 7, None, 4096),
+            None,
+            "no park's raise: inherited as before round eight"
+        );
+        assert_eq!(
+            older_image_soft_limit(6, 7, Some(4096), 4096),
+            None,
+            "nothing to lower"
+        );
+
+        if std::env::var_os(NEW_IMAGE).is_some() {
+            // A SUCCESSOR STARTED AT THE RAISE, told of it through the
+            // production intake…
+            let env = crate::handoff_env::HandoffEnv::capture();
+            let launcher =
+                adopt_carried_launcher_limit(&env).expect("the launcher's limit is carried");
+            assert_eq!(
+                park_raised_from(),
+                Some(launcher),
+                "the park's raise is adopted"
+            );
+            assert!(launcher < soft_nofile(), "the raise crossed");
+            mark_close_on_exec_at_or_above(launcher);
+            // …starts an older successor of its own at the launcher's limit.
+            assert_eq!(successor_soft_nofile(BUILD - 1, BUILD, &[]), launcher);
+            return;
+        }
+
+        // THE WIRING. The fork lane registers its hook after the one that
+        // hands the child its descriptors, and before the spawn; the cold lane
+        // lowers after the lifeline is made inheritable, and before the exec.
+        let src = include_str!("app_update_handoff.rs");
+        let worker = &src[src.find("fn run_handoff_worker(").expect("the worker")..];
+        let handed = worker
+            .find("fork_lane_child_holds(strip, &child_inherit)")
+            .expect("the hook that hands the child its descriptors");
+        let older = worker
+            .find(
+                "crate::handoff_rendezvous::start_older_image_at_its_limit(\n        &mut \
+                 job.command,\n        job.target_build,\n        job.current_build,\n        \
+                 &handed,",
+            )
+            .expect("the fork lane starts an older target at its limit, told the pairing");
+        let spawn = worker
+            .find("job.command.spawn()")
+            .expect("the fork lane's spawn");
+        assert!(
+            handed < older && older < spawn,
+            "after the hook, before the spawn"
+        );
+        let cold = &src[src
+            .find("ApplyLane::Cold,\n            ) => {")
+            .expect("the cold lane's arm")..];
+        let cold = &cold[..cold
+            .find("ApplyLane::Seamless,")
+            .expect("the arm ends where the seamless lane begins")];
+        let lifeline = cold
+            .find("cold_exec_hand_over()")
+            .expect("the lifeline crosses the exec");
+        let lower = cold
+            .find("crate::handoff_rendezvous::lower_for_older_image(target_build, build)")
+            .expect("the cold lane starts an older target at its limit");
+        let exec = cold
+            .find("aterm_update::exec_keeping_sigpipe(&mut command)")
+            .expect("the cold lane's exec");
+        assert!(
+            lifeline < lower && lower < exec,
+            "lowered last, before the exec"
+        );
+        assert!(
+            crate::handoff_env::HANDOFF_ENV_KEYS.contains(&ENV_PARK_RAISED_FROM),
+            "a successor captures the park's raise"
+        );
+
+        if !crate::control_auth::enter_low_nofile_test_child(64) {
+            return;
+        }
+        let launchd = soft_nofile();
+        mark_close_on_exec_at_or_above(launchd);
+        // CONTROL: nothing raised, nothing lowered.
+        assert_eq!(OlderImageLimit::toward(BUILD - 1, BUILD), None);
+        assert_eq!(successor_soft_nofile(BUILD - 1, BUILD, &[]), launchd);
+        // An attempt toward an older build makes no raise; one toward this
+        // build does, and stands down — the raise is kept.
+        raise_descriptor_limit_for_park(BUILD - 1, BUILD);
+        assert_eq!(soft_nofile(), launchd, "no raise toward an older target");
+        raise_descriptor_limit_for_park(BUILD, BUILD);
+        let raised = soft_nofile();
+        assert!(raised > launchd, "the park's raise is made: {raised}");
+        assert_eq!(
+            park_raised_from(),
+            Some(launchd),
+            "…and recorded as a park's"
+        );
+
+        // THE REVIEW'S SCENARIO: a later attempt toward an older build.
+        assert_eq!(
+            successor_soft_nofile(BUILD - 1, BUILD, &[]),
+            launchd,
+            "the fork lane starts the older successor at launchd's limit, not {raised}"
+        );
+        assert_eq!(
+            successor_soft_nofile(BUILD, BUILD, &[]),
+            raised,
+            "a same-or-newer successor inherits the room, and reads the told limit"
+        );
+
+        // A DESCRIPTOR THE IMAGE WOULD KEEP AT OR ABOVE launchd's limit — one
+        // it is handed, or a stray of this process's — leaves the raise: its
+        // shells' strip would not reach it.
+        let (read, _write) = pipe_for_test();
+        let launchd_fd = i32::try_from(launchd).expect("a descriptor number");
+        // SAFETY: F_DUPFD duplicates a live descriptor at the first free
+        // number at or above `launchd_fd`, with close-on-exec clear.
+        let high = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD, launchd_fd) };
+        assert!(
+            high >= launchd_fd,
+            "PRECONDITION: room above launchd's limit"
+        );
+        // SAFETY: a fresh duplicate, owned here from now on.
+        let high = unsafe { OwnedFd::from_raw_fd(high) };
+        assert_eq!(
+            successor_soft_nofile(BUILD - 1, BUILD, &[high.as_raw_fd()]),
+            raised,
+            "handed above the limit"
+        );
+        assert_eq!(
+            successor_soft_nofile(BUILD - 1, BUILD, &[]),
+            raised,
+            "a stray the exec would keep"
+        );
+        assert!(
+            lower_for_older_image(BUILD - 1, BUILD).is_none(),
+            "the cold lane's exec would keep it too"
+        );
+        assert_eq!(soft_nofile(), raised);
+        drop(high);
+
+        // THE COLD LANE: lowered for the exec, raised back if it returns.
+        let lowered = lower_for_older_image(BUILD - 1, BUILD).expect("lowered for the exec");
+        assert_eq!(
+            soft_nofile(),
+            launchd,
+            "the older image starts at launchd's limit"
+        );
+        drop(lowered);
+        assert_eq!(soft_nofile(), raised, "raised back when the exec returned");
+        assert!(
+            lower_for_older_image(BUILD, BUILD).is_none(),
+            "never toward this build"
+        );
+
+        // ACROSS A HOP: a successor started at the raise is told it is a
+        // park's, beside the launcher's limit, on both lanes' commands.
+        // The successor is this test again, as a stand-in: it passes only by
+        // running exactly this test (it started its older successor at
+        // launchd's limit).
+        let mut image = crate::test_alone::StandIn::this_test();
+        image.command().env(NEW_IMAGE, "1");
+        carry_launcher_limit(image.command());
+        assert!(
+            image
+                .command()
+                .get_envs()
+                .any(|(key, value)| key == ENV_PARK_RAISED_FROM
+                    && value == Some(std::ffi::OsStr::new(&launchd.to_string()))),
+            "the command names the park's raise from {launchd}"
+        );
+        image.spawn().passed();
+
+        // A RECOVERY'S RAISE (a claim's alike) is one a successor inherited
+        // before round eight: after it, an older successor inherits the
+        // raise, as it always did.
+        raise_descriptor_limit_for_recovery();
+        assert_eq!(park_raised_from(), None, "the raise is a recovery's now");
+        assert_eq!(successor_soft_nofile(BUILD - 1, BUILD, &[]), raised);
     }
 
     /// A LAUNCHED SUCCESSOR MAKES ROOM FOR ITS GRANT BEFORE IT DIALS (round six
@@ -3584,11 +5690,7 @@ mod tests {
         assert_eq!(raised_soft_limit(256, 1024), Some(1024));
         assert_eq!(raised_soft_limit(10_240, u64::MAX), None, "never lowered");
         assert_eq!(raised_soft_limit(1024, 1024), None, "at the hard limit");
-        if !crate::control_auth::enter_low_nofile_test_child(
-            "ATERM_TEST_RENDEZVOUS_LOW_NOFILE_CHILD",
-            "handoff_rendezvous::tests::a_successor_raises_its_descriptor_limit_before_claiming",
-            64,
-        ) {
+        if !crate::control_auth::enter_low_nofile_test_child(64) {
             return;
         }
         let raised = raise_descriptor_limit_for_claim().expect("the raise is permitted");
@@ -3629,6 +5731,7 @@ mod tests {
         // SAFETY: test-only root authority, used for this one child's cap.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        // std's Command on purpose: the child applies `Limits` in a `pre_exec`, as the PTY's child does.
         let mut shell = std::process::Command::new("/bin/sh");
         shell.args(["-c", "ulimit -n"]);
         // SAFETY: `apply` is a bare `getrlimit`/`setrlimit` loop with a valid
@@ -3672,18 +5775,20 @@ mod tests {
                     &path,
                     &claim,
                     TEST_NONCE,
-                    deadlines_in(60),
+                    deadlines_in(120),
                     own_parent(),
                     chunks,
                 )
             });
-            let peer = rendezvous
-                .accept_claim(
+            let peer = admitted(
+                rendezvous.accept_claim(
                     Some(own_pid()),
+                    &crate::handoff_rendezvous::DialerCode::this_process(),
                     Instant::now() + Duration::from_secs(60),
                     &|| false,
-                )
-                .expect("the claim is this attempt's");
+                ),
+                "the claim is this attempt's",
+            );
             let handed = writes
                 .iter()
                 .enumerate()
@@ -3737,18 +5842,20 @@ mod tests {
                 &path,
                 &claim,
                 TEST_NONCE,
-                deadlines_in(60),
+                deadlines_in(120),
                 own_parent(),
                 true,
             )
         });
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
                 Instant::now() + Duration::from_secs(60),
                 &|| false,
-            )
-            .expect("the chunked claim is this attempt's");
+            ),
+            "the chunked claim is this attempt's",
+        );
         assert!(peer.chunks, "the dialer claimed the chunked grant");
         let sessions = writes
             .iter()
@@ -3827,18 +5934,20 @@ mod tests {
                 &path,
                 &claim,
                 TEST_NONCE,
-                deadlines_in(60),
+                deadlines_in(120),
                 own_parent(),
                 false,
             )
         });
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
                 Instant::now() + Duration::from_secs(60),
                 &|| false,
-            )
-            .expect("the one-message claim is this attempt's");
+            ),
+            "the one-message claim is this attempt's",
+        );
         assert!(!peer.chunks);
         let sessions = writes
             .iter()
@@ -3880,13 +5989,15 @@ mod tests {
         (&dialer)
             .write_all(&claim_frame_with(rendezvous.claim(), true))
             .expect("claim");
-        let peer = rendezvous
-            .accept_claim(
+        let peer = admitted(
+            rendezvous.accept_claim(
                 Some(own_pid()),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
                 Instant::now() + Duration::from_secs(60),
                 &|| false,
-            )
-            .expect("the chunked claim is this attempt's");
+            ),
+            "the chunked claim is this attempt's",
+        );
         // SAFETY: a descriptor this test owns for the length of the call.
         let borrowed = unsafe { BorrowedFd::borrow_raw(master) };
         let sessions = [
@@ -4234,7 +6345,7 @@ mod claim_presentation_conformance {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     /// What the dialer learned about the listener it reached, in the model's terms.
     #[derive(Clone, Copy, Debug)]
@@ -4392,11 +6503,8 @@ mod claim_presentation_conformance {
             // so the name carries a per-process sequence number as well.
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-                % 1_000_000_000;
+            let unique =
+                aterm_time::since_epoch().expect("system clock").as_nanos() % 1_000_000_000;
             let dir = std::env::temp_dir()
                 .join(format!("aterm-rzl-{}-{seq}-{unique}", std::process::id()));
             std::fs::create_dir(&dir).expect("create the listener's scratch dir");
@@ -4418,18 +6526,10 @@ mod claim_presentation_conformance {
             let mut report = [0i32; 2];
             // SAFETY: `pipe` fills two descriptor numbers into the array.
             assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0, "report pipe");
-            // The descriptor table's size, read BEFORE the fork (the child only
-            // closes up to it), and capped so the child's close sweep stays quick.
-            let mut limit = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            // SAFETY: `getrlimit` fills the live local it is handed.
-            let table = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-                i32::try_from(limit.rlim_cur.min(1 << 16)).unwrap_or(1 << 16)
-            } else {
-                1 << 16
-            };
+            // The descriptor table's bound, read BEFORE the fork (the child only
+            // closes up to it): the kernel's per-process maximum, which no
+            // thread can raise in between.
+            let table = aterm_uds::spawnfd::descriptor_bound();
 
             // SAFETY: fork from a multi-threaded harness, with a child that
             // performs async-signal-safe calls only — see the type's doc.
@@ -4552,7 +6652,7 @@ mod claim_presentation_conformance {
     }
 
     fn deadlines() -> ClaimDeadlines {
-        let at = Instant::now() + Duration::from_secs(10);
+        let at = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         ClaimDeadlines {
             dial: at,
             grant: at,

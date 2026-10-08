@@ -8,7 +8,7 @@ use super::Model;
 /// A rejected mint cannot publish a replacement or reach broker supervision.
 /// Three grants bound the exhaustive model; Tier-1 runs the same counter with
 /// eight grants against the effect trace of the REAL command, in
-/// `crates/aterm-link/tests/fabric_on.rs`
+/// `crates/aterm-link/tests/world/fabric_on.rs`
 /// (`a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model`) —
 /// that is the crate whose integration tests can run the binary. Existing
 /// capability bytes and temporary-file cleanup are checked there too, at every

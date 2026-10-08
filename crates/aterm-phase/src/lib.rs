@@ -10,8 +10,10 @@
 //!   the transcript above it;
 //! * [`phase::context_left`] — the `<n>% until auto-compact` indicator, when
 //!   Claude Code shows it;
-//! * [`phase::survey_open`], [`phase::transcript_end`], [`phase::last_said_row`]
-//!   — the rest of the live-zone geometry the supervisor's report views use;
+//! * [`phase::survey_open`], [`survey::survey_block`], [`phase::transcript_end`],
+//!   [`phase::last_said_row`] — the rest of the live-zone geometry the supervisor's report views use,
+//!   and [`phase::busy_zone_start`], the row its waits on a busy row start
+//!   at;
 //! * [`prompt::parse_prompt`] — the approval box, parsed; [`prompt::parse_prompt_v2`]
 //!   — the same box with its title, command rows, option roles and focus, how
 //!   an option is chosen and what cancelling does; its kind named by its title
@@ -35,20 +37,22 @@
 //!   PROGRAM (Claude Code, Codex, anything else), and one screen read whole;
 //!   [`reader::Program::supervisable`] — the programs the supervisor hosts;
 //! * [`codex`] — Codex's grammar, measured on codex 0.156.1;
+//! * [`panel`] — Claude Code's Settings panel (`/usage`'s dialog): whether
+//!   it is what the screen shows, by which renderer, and what a row under
+//!   its header says of the Usage tab;
+//! * [`reset`] — Claude Code's limit reset: the grant row of the usage-limit
+//!   dialog by its exact label, the confirmation it opens read exactly or
+//!   refused, the name it draws each limit type by, the two pending lines,
+//!   and the line the vendor answers with;
 //! * [`anchors::ANCHORS`] — the literal strings other crates guard on.
 //!
 //! ## Why a crate of its own
 //!
-//! Until round 13 this reader lived in `aterm-agent` (`supervise/phase.rs`),
-//! where `aterm drive phase` reads it. aterm's server now classifies every
-//! agent session's screen and publishes the verdict (`status agent=`, the
-//! `EVENT <sid> agent …` push), which the fabric bridge (`aterm-link`)
-//! relays as `phase=` without reading a screen — and the design's rule is
-//! ONE reader for every face: a verdict the server computed differently
-//! from the one `aterm drive phase` prints would be two answers to one
-//! question. So the reader lives here, with no dependencies; the server
-//! (`aterm-gui`) and `aterm-agent` link it, and `aterm-agent` re-exports it
-//! under its old paths so nothing above it moved.
+//! ONE reader for every face: the server (`aterm-gui`) classifies each agent
+//! session's screen and publishes the verdict (`status agent=`, the `EVENT
+//! <sid> agent …` push, relayed by `aterm-link` as `phase=`), and `aterm drive
+//! phase` must print the same answer, so both link this dependency-free
+//! crate. `aterm-agent` re-exports it under its `supervise::phase` paths.
 //!
 //! Every rule in it was paid for by a misclassification in a real session
 //! (the measurements are in the doc comments and the tests); the fixtures
@@ -57,31 +61,44 @@
 
 pub mod anchors;
 pub mod codex;
+pub mod panel;
 pub mod phase;
 pub mod prompt;
 pub mod question;
 pub mod reader;
+pub mod reset;
+pub mod survey;
+mod text;
 pub mod turn;
 pub mod wall;
 
 pub use anchors::{ANCHORS, Anchor, AnchorKind, CODEX_ANCHORS, anchor, anchor_text};
+pub use panel::{
+    PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
+};
 pub use phase::{
-    Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, notice_reset,
-    survey_open, transcript_end, worker_phase,
+    Busy, Phase, Zone, background_only, busy_signal, busy_zone_start, context_left, is_placeholder,
+    limit_notice, notice_reset, survey_open, transcript_end, worker_phase,
 };
 pub use prompt::{
     Cancel, CancelEffect, Header, Opt, Origin, OwnerReview, Prompt, PromptKind, PromptV2,
-    ReviewKind, RmBreaker, RmBreakerKind, RmCommand, Role, Select, parse_header, parse_prompt,
-    parse_prompt_v2, prompt_box_first_row, prompt_box_span, rm_breaker_of,
+    ReviewKind, RmBreaker, RmBreakerKind, RmCommand, Role, Select, footer_keys, parse_header,
+    parse_prompt, parse_prompt_v2, prompt_box_first_row, prompt_box_span, rm_breaker_of,
 };
 pub use question::{
     ButtonRow, ChatRow, FreeText, QuestionDialog, QuestionFocus, QuestionForm, QuestionOption,
     QuestionTab, QuestionText, Recommended, ReviewRow,
 };
 pub use reader::{
-    AGENT_RUNTIMES, ClaudeReader, CodexReader, GenericReader, Program, Reading, ScreenReader,
-    identify, live_zone_start, may_host_agent, program_of, read, read_at,
+    AGENT_RUNTIMES, BLANK_GAP, ClaudeReader, CodexReader, GenericReader, Program, Reading,
+    ScreenReader, identify, live_zone_reaches_above, live_zone_start, may_host_agent, program_of,
+    read, read_at,
 };
+pub use reset::{
+    ConfirmRead, ResetConfirm, ResetLine, ResetPending, ResetRow, reset_confirm, reset_limit_name,
+    reset_line, reset_pending, reset_row, spends_reset,
+};
+pub use survey::{SurveyBlock, SurveyKind, ask_card, drafts_card, survey_block};
 pub use turn::{
     LaunchCard, Progress, continuation_suggestion, goal_active, interrupted, launch_card,
     said_tail, status_row_progress, status_row_stall,

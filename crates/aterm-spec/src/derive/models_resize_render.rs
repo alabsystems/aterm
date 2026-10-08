@@ -4,7 +4,7 @@
 //! The resize ledger's render verdict: a WRITER/READER contract between the
 //! engine's resize journal and the host's ledger.
 
-use super::Model;
+use super::{Liveness, Model};
 
 /// Whether an application has drawn over content a resize displaced, judged
 /// the way `aterm-gui`'s resize ledger judges it (`status render=`, the
@@ -140,7 +140,7 @@ use super::Model;
 /// intact screen) and, drawn on, an `unverified` one (`Demote, Evaluate, Grow,
 /// Draw, Evaluate` breaks `NoFalseVerdict`). Over the whole space it also
 /// breaks `RiskIsFlagged` and `DisplacedIsShown` — four invariants, and only
-/// those (`each_named_mutant_breaks_exactly_its_claims` asserts the set).
+/// those (`each_named_mutant_breaks_exactly_its_claims_*` assert the set).
 ///
 /// `Buggy = 4` is the design with a net-zero risk downgraded to `unverified`:
 /// `Demote, Output, Grow, Step, Evaluate` (a flap output split, the app's
@@ -157,6 +157,42 @@ use super::Model;
 /// Evaluate, Grow, Demote, Draw, Grow, Step, Evaluate`). It breaks
 /// `RiskIsFlagged` alone. The Tier-0 test replays `Buggy = 2` to `5` by name
 /// and checks each breaks its claims and no other over the whole space.
+///
+/// THE EPOCH JUDGE (2026-09-29), the ledger's second judge, read from the
+/// ENGINE'S DEBT instead of from the shape of a run. The run judge above cannot
+/// see a flap an app frame splits (two net-changed runs), and cannot see an
+/// undrawn residual at all. The engine counts what it owes
+/// (`Terminal::render_debt`, exact however far the journal is overrun) and the
+/// ledger judges it as one epoch:
+///
+/// * `debt`: the engine counter, in rows the content sits above where the
+///   program painted it. A shrink that demotes adds one; a grow the undo serves
+///   gives back `st`; a changed-size read (the full clear) zeroes it. It is
+///   the report sums, not the screen, so `DebtIsTheDisplacement` (`debt == disp`)
+///   is the writer/reader bind between the two.
+/// * `eg`: the geometry BEFORE the first resize that made the debt (0 while none
+///   is owed): where the program's handler last laid the frame out.
+/// * `judged`: the presence classifier reads Claude Code, or this session has
+///   shown it clears its screen when resized (`Classify`, once).
+/// * `ev`: the epoch's word a second later — 0 ok, 1 `desync-risk`, 2
+///   `unjudged`: rows are owed AND the geometry is back at `eg` (the handler can
+///   only read an unchanged size), accused only when `judged`. While the
+///   geometry differs from `eg` the handler is still to read a change and
+///   repaints, so nothing is said.
+///
+/// The claims: a residual at a settled geometry is never answered ok
+/// (`EpochFlagsTheResidual`), nothing is said when nothing is owed
+/// (`EpochNoFalseAlarm`), an unlearned program is never accused
+/// (`OnlyAJudgedProgramIsAccused`: a program that repaints with cursor
+/// addressing and no ED 2 is indistinguishable from one that missed), and the
+/// counter is the displacement (`DebtIsTheDisplacement`).
+///
+/// `Buggy = 1` adds the historical epoch to the historical judge: the debt is a
+/// counter that no full clear resets, and the word is the size-difference one
+/// (`geom` differs from `app_geom`), which ignores the debt and the class.
+/// `Buggy = 6` accuses an unlearned program, `7` forgets the residual, `8`
+/// answers whenever the geometry is at `eg` whether or not anything is owed;
+/// each breaks its one claim and no other.
 ///
 /// ASSUMED, NOT MODELED: the app's changed-size repaint starts with ED 2 (the
 /// `Step` action heals). An app that repaints every row WITHOUT clearing is
@@ -211,6 +247,10 @@ pub fn resize_render_model() -> Model {
             var d0 = 0;
             var bot = 0;
             var out = 0;
+            var debt = 0;
+            var eg = 0;
+            var judged = 0;
+            var ev = 0;
 
             // Alt-screen shrink with a non-blank bottom row: the top row is
             // demoted and leaves the screen (the undo keeps it), so everything
@@ -227,6 +267,8 @@ pub fn resize_render_model() -> Model {
                 disp = disp + 1;
                 st = st + 1;
                 late = 0;
+                eg = if (debt <= 0) { geom } else { eg };
+                debt = if (debt <= Cap - 1) { debt + 1 } else { debt };
                 evaluated = 0;
             }
             // Alt-screen shrink with a blank bottom row: the trailing blank is
@@ -240,6 +282,7 @@ pub fn resize_render_model() -> Model {
                 ro = 1;
                 geom = 1;
                 late = 0;
+                eg = if (debt <= 0) { 0 } else { eg };
                 evaluated = 0;
             }
             // Alt-screen grow: the undo hands its demoted rows back to the top,
@@ -266,6 +309,12 @@ pub fn resize_render_model() -> Model {
                 } else {
                     if (disp - st <= 0) { 0 } else { blind }
                 };
+                eg = if (Buggy == 1) {
+                    if (debt <= 0) { geom } else { eg }
+                } else {
+                    if (debt - st <= 0) { 0 } else { if (debt <= 0) { geom } else { eg } }
+                };
+                debt = if (Buggy == 1) { debt } else { debt - st };
                 st = 0;
                 late = 0;
                 evaluated = 0;
@@ -280,7 +329,7 @@ pub fn resize_render_model() -> Model {
                 app_geom = geom;
                 disp = if (geom == app_geom) { disp } else { 0 };
                 led = if (geom == app_geom) {
-                    if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { led } else {
+                    if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { led } else {
                         if (ro == 1 && geom == rs && 1 <= rd) { led + rd } else { led }
                     }
                 } else {
@@ -288,7 +337,7 @@ pub fn resize_render_model() -> Model {
                 };
                 lr = if (geom == app_geom) {
                     if (1 <= led) { 1 } else {
-                        if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { lr } else {
+                        if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { lr } else {
                             if (ro == 1 && geom == rs && (1 <= rd || rd <= 0 - 1)) { 1 } else { lr }
                         }
                     }
@@ -296,7 +345,7 @@ pub fn resize_render_model() -> Model {
                     0
                 };
                 lb = if (geom == app_geom) {
-                    if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { lb } else {
+                    if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { lb } else {
                         if (ro == 1 && geom + rs == 1 && 1 <= rd) { 1 } else { lb }
                     }
                 } else {
@@ -304,7 +353,7 @@ pub fn resize_render_model() -> Model {
                 };
                 br = if (geom == app_geom) {
                     if (lb == 1) { 1 } else {
-                        if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { br } else {
+                        if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { br } else {
                             if (ro == 1 && geom + rs == 1 && 1 <= rd) { 1 } else { br }
                         }
                     }
@@ -317,13 +366,15 @@ pub fn resize_render_model() -> Model {
                 } else {
                     0
                 };
-                rw = if (geom == app_geom && (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1))) { 1 } else { 0 };
+                rw = if (geom == app_geom && ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1))) { 1 } else { 0 };
                 out = if (geom == app_geom && ro == 1) { 1 } else { out };
-                ro = if (geom == app_geom && (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1))) { ro } else { 0 };
-                rs = if (geom == app_geom && (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1))) { rs } else { 0 };
-                rd = if (geom == app_geom && (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1))) { rd } else { 0 };
+                ro = if (geom == app_geom && ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1))) { ro } else { 0 };
+                rs = if (geom == app_geom && ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1))) { rs } else { 0 };
+                rd = if (geom == app_geom && ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1))) { rd } else { 0 };
                 late = 0;
                 ls = 0;
+                debt = if (geom == app_geom) { debt } else { if (Buggy == 1) { debt } else { 0 } };
+                eg = if (geom == app_geom) { eg } else { 0 };
                 st = 0;
                 bot = 0;
                 evaluated = 0;
@@ -339,28 +390,28 @@ pub fn resize_render_model() -> Model {
             // `br`), and a booked one is now drawn on. Any output drops the
             // engine's resize undo.
             action Draw {
-                led = if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { led } else {
+                led = if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { led } else {
                     if (ro == 1 && geom == rs && 1 <= rd) { led + rd } else { led }
                 };
                 lr = if (1 <= led) { 1 } else {
-                    if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { lr } else {
+                    if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { lr } else {
                         if (ro == 1 && geom == rs && (1 <= rd || rd <= 0 - 1)) { 1 } else { lr }
                     }
                 };
-                lb = if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { lb } else {
+                lb = if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { lb } else {
                     if (ro == 1 && geom + rs == 1 && 1 <= rd) { 1 } else { lb }
                 };
                 br = if (lb == 1) { 1 } else {
-                    if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { br } else {
+                    if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { br } else {
                         if (ro == 1 && geom + rs == 1 && 1 <= rd) { 1 } else { br }
                     }
                 };
                 drew = if (1 <= disp) { 1 } else { drew };
-                rw = if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { 1 } else { 0 };
+                rw = if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { 1 } else { 0 };
                 out = if (ro == 1) { 1 } else { out };
-                ro = if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { ro } else { 0 };
-                rs = if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { rs } else { 0 };
-                rd = if (Buggy <= 4 && late == 0 && (1 <= rd || rd <= 0 - 1)) { rd } else { 0 };
+                ro = if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { ro } else { 0 };
+                rs = if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { rs } else { 0 };
+                rd = if ((Buggy <= 4 || 6 <= Buggy) && late == 0 && (1 <= rd || rd <= 0 - 1)) { rd } else { 0 };
                 late = 0;
                 ls = 0;
                 st = 0;
@@ -386,6 +437,19 @@ pub fn resize_render_model() -> Model {
             // nothing was drawn.
             action Evaluate {
                 evaluated = 1;
+                ev = if (Buggy == 1) {
+                    if (geom + app_geom == 1) { 1 } else { 0 }
+                } else {
+                    if (Buggy == 7) {
+                        0
+                    } else {
+                        if (geom == eg && (1 <= debt || Buggy == 8)) {
+                            if (judged == 1 || Buggy == 6) { 1 } else { 2 }
+                        } else {
+                            0
+                        }
+                    }
+                };
                 verdict = if (Buggy == 1) {
                     if (geom == app_geom) { 0 } else { 1 }
                 } else {
@@ -431,6 +495,13 @@ pub fn resize_render_model() -> Model {
                 rw = 0;
             }
 
+            // The class becomes known: the presence classifier reads Claude Code,
+            // or the session clears its screen when resized. Once; the environment.
+            action Classify when (judged == 0) {
+                judged = 1;
+                evaluated = 0;
+            }
+
             // Excused only by the blind spot: a flap inside the run gap is
             // flagged whatever was drawn between its halves.
             invariant RiskIsFlagged: evaluated == 0 || disp <= 0 || drew == 0 || blind == 1 || verdict == 1;
@@ -444,7 +515,274 @@ pub fn resize_render_model() -> Model {
             // with no output inside it, left the content exactly where the
             // run found it.
             invariant QuietFlapIsIdentity: ro == 0 || rs == 1 || geom == 1 || out == 1 || disp == d0;
-            invariant Bounded: disp <= Cap && led <= Cap && rd <= Cap && st <= Cap;
+            // The epoch judge. A residual whose geometry is back at the epoch's
+            // start (`geom + eg == 1` is "differs": both are 0 or 1) is never
+            // answered ok, whether or not the program has drawn.
+            invariant EpochFlagsTheResidual: evaluated == 0 || disp <= 0 || geom + eg == 1 || 1 <= ev;
+            invariant EpochNoFalseAlarm: evaluated == 0 || ev == 0 || 1 <= disp;
+            invariant OnlyAJudgedProgramIsAccused: evaluated == 0 || judged == 1 || ev == 0 || 2 <= ev;
+            invariant DebtIsTheDisplacement: debt == disp;
+            invariant Bounded: disp <= Cap && led <= Cap && rd <= Cap && st <= Cap && debt <= Cap;
         }
+    }
+}
+
+/// THE REPAINT NUDGE (G2 spike, 2026-09-28): the host's closed-loop repair of a
+/// tab whose application will not repaint by itself.
+///
+/// An application that repaints only when its SIGWINCH handler READS a changed
+/// size can be left on a screen it no longer believes in (a flap whose halves
+/// it missed). The one natural, input-free way to make it repaint is the
+/// resize protocol itself, done so that its handler reads EACH size: hold the
+/// session one row short, wait for the app's answer, release, wait for the
+/// second answer. Back-to-back (the adoption pulse) it reads one size and
+/// repaints nothing (measured); on a timer it guesses the app's longest
+/// blocking read. The driver never guesses: the answer is the evidence, and a
+/// missing answer is a bounded wait, not a wedge.
+///
+/// * `phase`: 0 idle, 1 armed (debt seen; waiting for a quiet moment), 2 short
+///   (the hold is on), 3 restoring (the hold is off; the true size is back),
+///   4 at rest (healed or given up, said in the log).
+/// * `held`: the session's target is one row short. THE safety property: it is
+///   only ever set in phase 2, or after the driver was lost (`orphan`) and
+///   never for longer than `Cap` ticks (the hard deadline).
+/// * `halt`: a standing hold (`hold=1`): nothing is started, a running hold is
+///   lifted (`Release`) and the attempt judged by its answers like any other.
+/// * `safe`: the moment is quiet (no output burst, no DEC 2026 frame open).
+/// * `ack1`/`ack2`: the app answered the short / the true size.
+/// * `moved`: a real resize left the engine somewhere the hold did not find
+///   it. A flap during the hold (`Flap`) is not one: its passes put the PTY at
+///   the engine's size and the engine back where it was, so an app that read
+///   neither half saw nothing change (2026-10-02: the driver had read every
+///   write by someone else as a real resize and dropped the attempt, its one
+///   try spent and nothing said - `DropOnFlap`). It comes back (`Return`) when
+///   that resize did not last.
+/// * `superseded`: the attempt ended superseded (`Supersede`) and the epoch
+///   judge watches its epoch: while the resize stands the app has a size of its
+///   own, and once the engine is back where the hold found it the window owes
+///   the end (`Report`: the give-up while rows are owed). 2026-10-03: nothing
+///   watched it, so a resize that came back after the wait left the tab
+///   displaced, its try spent, nothing said - `ReturnUnwatched`.
+/// * `lost`: the driver's record was lost (`DriverVanishes`).
+/// * `gaveup`: the owner hears of the end (the digest line). Only `debt`
+///   decides it, never the answers counted: a spent wait on a tab that owes
+///   nothing ends in silence (2026-10-02: two answers that landed before one
+///   step read as one, and the line flashed for a repaired tab). The Tier-1
+///   binds it to the code's `Act::GaveUp`.
+///
+/// The environment (`Debt`, `Quiet`, `Busy`, `App1`, `App2`, `AltLeft`,
+/// `Flap`, `Resize`, `Return`) is never fair. The driver waits for a quiet
+/// moment only `Lim` ticks and for each answer only `Lim` ticks, so it ends
+/// with the app silent forever.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn repaint_nudge_model() -> Model {
+    crate::ty_model! {
+        RepaintNudge {
+            const Buggy = 0;
+            const Lim = 2;
+            const MaxTries = 1;
+            const Cap = 2;
+            var phase = 0;
+            var held = 0;
+            var engine = 0;
+            var debt = 0;
+            var safe = 0;
+            var ack1 = 0;
+            var ack2 = 0;
+            var tries = 0;
+            var tick = 0;
+            var healed = 0;
+            var gaveup = 0;
+            var halt = 0;
+            var age = 0;
+            var orphan = 0;
+            var moved = 0;
+            var superseded = 0;
+            var lost = 0;
+
+            // THE ENVIRONMENT.
+            action Debt when (phase == 0 && debt == 0) { debt = 1; }
+            action Quiet when (safe == 0) { safe = 1; }
+            action Busy when (safe == 1) { safe = 0; }
+            action App1 when (phase == 2 && ack1 == 0) { ack1 = 1; }
+            action App2 when (phase == 3 && ack2 == 0) { ack2 = 1; }
+            // The alternate screen left, or a full repaint landed by itself.
+            action AltLeft when (debt == 1) { debt = 0; }
+            // A halt (`hold=1`) stands or lifts.
+            action Halt when (halt == 0) { halt = 1; }
+            action Lift when (halt == 1) { halt = 0; }
+            // Someone else sets the PTY while it is held: the passes of a flap
+            // (the engine ends where the hold found it) or a cell-box sync.
+            action Flap when (phase == 2 && held == 1) { held = 0; }
+            // A real resize that lasts: the engine, and the PTY with it, ends
+            // somewhere the hold did not find it.
+            action Resize when (2 <= phase && phase <= 3 && moved == 0) { held = 0; moved = 1; }
+            // That resize did not last: after the attempt it superseded, the
+            // engine is back where the hold found it.
+            action Return when (superseded == 1 && moved == 1) { moved = 0; }
+
+            // THE DRIVER.
+            action Arm when (phase == 0 && debt == 1) { phase = 1; tick = 0; }
+            // Never blocks on the world: past Lim ticks it goes anyway.
+            action Hold when (phase == 1 && halt == 0 && (safe == 1 || tick > Lim - 1)) {
+                phase = if (debt == 1) { 2 } else { 4 };
+                held = if (debt == 1) { 1 } else { 0 };
+                tries = if (debt == 1) { if (tries > MaxTries) { tries } else { tries + 1 } } else { tries };
+                tick = 0;
+                age = 0;
+                ack1 = 0;
+                ack2 = 0;
+            }
+            action Release when (phase == 2 && (ack1 == 1 || tick > Lim - 1 || debt == 0 || halt == 1)) {
+                phase = 3;
+                held = 0;
+                age = 0;
+                tick = 0;
+            }
+            // The PTY is not the one the hold set: the hold is over with no
+            // write (the PTY is the layout's), and the answer is waited for as
+            // after a release.
+            action Forget when (phase == 2 && held == 0) {
+                phase = 3;
+                age = 0;
+                tick = 0;
+            }
+            action Finish when (phase == 3 && ack1 == 1 && ack2 == 1) {
+                phase = 4;
+                healed = 1;
+                debt = 0;
+            }
+            action GiveUp when (phase == 3 && tick > Lim - 1 && (ack1 == 0 || ack2 == 0)
+                                && (debt == 0 || MaxTries <= tries) && moved == 0) {
+                phase = 4;
+                gaveup = if (debt == 1) { 1 } else { 0 };
+            }
+            // Unanswered with the engine moved: the app was given a size it reads
+            // as changed, and what it draws for it is the epoch judge's, which
+            // watches the epoch.
+            action Supersede when (phase == 3 && tick > Lim - 1 && (ack1 == 0 || ack2 == 0)
+                                   && moved == 1) {
+                phase = 4;
+                superseded = 1;
+            }
+            // THE WINDOW. The epoch judge finds a superseded attempt's epoch back
+            // where the hold found it: rows still owed are the give-up the same
+            // attempt is when the resize comes back inside its wait; none, and
+            // the end is silent.
+            action Report when (superseded == 1 && moved == 0) {
+                superseded = 0;
+                gaveup = if (debt == 1) { 1 } else { gaveup };
+            }
+            action Tick when (1 <= phase && phase <= 3 && tick <= Lim - 1) { tick = tick + 1; }
+
+            // THE RELEASE CANNOT BE LOST. The driver's record is lost while the PTY
+            // is short (a panic in the tick, a teardown race): the App's own map of
+            // held sessions (`orphan`) still stands, and its hard deadline lets the
+            // PTY go whether or not any driver is left to do it.
+            action DriverVanishes when (phase == 2) { phase = 4; orphan = 1; lost = 1; }
+            action Age when (held == 1 && age <= Cap - 1) { age = age + 1; }
+            action ReleaseByDeadline when (held == 1 && age > Cap - 1) {
+                held = 0;
+                age = 0;
+                orphan = 0;
+                phase = if (phase == 2) { 3 } else { phase };
+            }
+
+            // BUGGY: an exit path that forgets to lift the hold (a timeout that only
+            // stops the machine): the tab is left one row short.
+            action LoseTheHold when (Buggy == 1 && phase == 2) { phase = 4; }
+            // BUGGY: healed on the first answer (the app has read one size only).
+            action HealOnFirstAnswer when (Buggy == 1 && phase == 2 && ack1 == 1) {
+                phase = 4;
+                held = 0;
+                healed = 1;
+                debt = 0;
+            }
+            // BUGGY (the first draft's design): the hold resizes the ENGINE, not just the PTY.
+            action HoldTheEngine when (Buggy == 1 && phase == 1 && debt == 1) {
+                phase = 2;
+                held = 1;
+                engine = 1;
+                tries = if (tries > MaxTries) { tries } else { tries + 1 };
+                tick = 0;
+                ack1 = 0;
+                ack2 = 0;
+            }
+            // BUGGY: no hard deadline (a hold nobody lifts stays for as long as the
+            // process lives).
+            action NoCap when (Buggy == 1 && held == 1 && age == Cap) { age = Cap + 1; }
+            // BUGGY: retried without a budget (an app that never answers is nudged
+            // forever).
+            action RetryForever when (Buggy == 1 && phase == 3 && tick > Lim - 1
+                                      && (ack1 == 0 || ack2 == 0) && debt == 1) {
+                phase = 1;
+                tick = 0;
+            }
+            // BUGGY (shipped until 2026-10-02): any write by someone else read as
+            // a real resize, so a flap the app never saw ended the attempt at
+            // once: the epoch's one try spent, the tab still owing, nothing said.
+            action DropOnFlap when (Buggy == 1 && phase == 2 && held == 0 && moved == 0) {
+                phase = 4;
+            }
+            // BUGGY (shipped until 2026-10-03): nothing watched a superseded
+            // attempt's epoch, so a resize that came back after the wait left the
+            // tab displaced, its one try spent, nothing said.
+            action ReturnUnwatched when (Buggy == 1 && superseded == 1 && moved == 1) {
+                moved = 0;
+                superseded = 0;
+            }
+
+            invariant HeldOnlyWhileShort: held == 0 || phase == 2 || orphan == 1;
+            invariant AHeldPtyIsReleasedByTheDeadline: held == 0 || age <= Cap;
+            invariant HealedNeedsBothAnswers: healed == 0 || (ack1 == 1 && ack2 == 1);
+            invariant OneTryPerEpoch: tries <= MaxTries;
+            invariant NudgeNeverTouchesTheEngine: engine == 0;
+            // An attempt that ends on a tab still owing rows says so (a give-up,
+            // the owner's digest line), unless the driver itself was lost or a
+            // real resize superseded it and the epoch judge still watches its
+            // epoch: the resize stands, or it came back and the judge owes the
+            // give-up, which `TheNudgeEnds` holds it to (`Report`, weakly fair).
+            // A moved engine alone excuses nothing.
+            invariant AnUnrepairedEndIsReported: phase <= 3 || debt == 0 || healed == 1
+                || gaveup == 1 || superseded == 1 || lost == 1;
+        }
+    }
+}
+
+/// The nudge ends, and its end is said: `[]<>(at rest with nothing owed to the
+/// owner \/ nothing to repair)`, under weak fairness of the driver's and the
+/// window's own steps and NO fairness for the app. At rest with nothing owed:
+/// no superseded attempt whose resize came back is left unreported (`Report`).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn repaint_nudge_liveness() -> Liveness {
+    use super::{and_, eq, int, or_, var};
+    Liveness {
+        name: "TheNudgeEnds",
+        goal: or_(
+            and_(
+                eq(var("phase"), int(4)),
+                or_(eq(var("superseded"), int(0)), eq(var("moved"), int(1))),
+            ),
+            or_(
+                and_(eq(var("phase"), int(0)), eq(var("debt"), int(0))),
+                eq(var("halt"), int(1)),
+            ),
+        ),
+        // `Forget` needs none: a hold someone else ended is also let go by
+        // `Release` once its wait is spent.
+        weak: vec![
+            "Arm",
+            "Hold",
+            "Release",
+            "Finish",
+            "GiveUp",
+            "Supersede",
+            "Report",
+            "Tick",
+        ],
+        strong: vec![],
+        mutants: vec!["RetryForever"],
     }
 }

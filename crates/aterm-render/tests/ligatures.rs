@@ -13,99 +13,68 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
-// Layout-independent ligature font discovery. Order: (a) $ATERM_LIGATURE_TEST_FONT
-// if set and readable; (b) the committed repo fixture (sibling of this test,
-// present in both canonical and vendored layouts). Returns None -> the test SKIPs
-// cleanly rather than panicking, so a host without the fixture never breaks the
-// suite.
+// The ligature test font: $ATERM_LIGATURE_TEST_FONT if set and readable, else the
+// committed JetBrains Mono fixture (compiled in, so it cannot go missing).
 //
-// THE OVERRIDE IS A DEDICATED VAR, NOT $ATERM_FONT. This helper used to read
-// $ATERM_FONT, which was not a test knob at all: it was a PRODUCTION setting that
-// outranked `font_family` in config (deleted 2026-09-24). So a developer
-// who simply names their preferred terminal font in their shell profile silently
-// displaced the committed fixture, and six tests in this file — which hard-assert
-// that `=>` ligates, that `zero` is present, that a fixture-specific shape
-// appears — went RED on correct code. Measured 2026-09-15 with
-// `ATERM_FONT=/System/Library/Fonts/Monaco.ttf`: 13 passed, 6 failed, among them
-// `fixture_font_has_ligature_features_and_still_ligates`, whose whole subject is
-// the fixture the env had just replaced. A test must not bet on the developer's
-// environment; the committed fixture is the point of committing it.
-fn ligature_test_font() -> Option<Vec<u8>> {
+// The override is a dedicated test var, never a general font setting a
+// developer might export: several tests here assert fixture-specific shapes
+// (`=>` ligates, `zero` is present) and go red on any other face.
+fn ligature_test_font() -> Vec<u8> {
     if let Ok(path) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         && let Ok(bytes) = std::fs::read(&path)
     {
-        return Some(bytes);
+        return bytes;
     }
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/jetbrains-mono.ttf"
-    );
-    std::fs::read(FIXTURE).ok()
+    include_bytes!("fixtures/jetbrains-mono.ttf").to_vec()
 }
 
-fn renderer(mode: LigatureMode) -> Option<Renderer> {
-    let bytes = ligature_test_font()?;
-    let mut r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).ok()?;
+fn renderer(mode: LigatureMode) -> Renderer {
+    let mut r = Renderer::from_bytes(&ligature_test_font(), 18.0, Theme::default())
+        .expect("the ligature test font parses");
     r.set_text_shaping(TextShapingConfig {
         ligature_mode: mode,
         ..Default::default()
     });
-    Some(r)
+    r
 }
 
-fn render(mode: LigatureMode, text: &[u8]) -> Option<aterm_render::Frame> {
-    let mut r = renderer(mode)?;
+fn render(mode: LigatureMode, text: &[u8]) -> aterm_render::Frame {
+    let mut r = renderer(mode);
     let (rows, cols) = (1usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     // Hide the cursor so the cursor overlay never perturbs the comparison.
     term.process(b"\x1b[?25l");
     term.process(text);
     let input = term.cell_frame(rows, cols);
-    Some(r.render_input(&input))
+    r.render_input(&input)
 }
 
-/// PRE-CHECK (documents the shaping mechanism): a standalone rustybuzz shape of
-/// "=>" with liga+calt yields the SAME glyph COUNT as input chars for this
-/// monospace-preserving font (it uses empty placeholder glyphs, not collapsing),
-/// but the glyph IDS differ from the plain cmap glyphs — i.e. a ligature exists.
+/// PRE-CHECK (documents the shaping mechanism): the row plan for "=>" with
+/// liga+calt keeps one slot per input cell for this monospace-preserving font
+/// (it uses empty placeholder glyphs, not collapsing), but at least one slot's
+/// glyph id differs from the plain cmap glyph — i.e. a ligature exists.
 #[test]
-fn rustybuzz_shapes_arrow_ligature() {
-    let Some(bytes) = ligature_test_font() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
-    let features = aterm_render::ligature_shaping::build_feature_list(&[], true);
-    let shaped = aterm_render::ligature_shaping::shape_ligature_run(
-        &bytes,
-        0,
-        "=>",
-        &['=', '>'],
-        true,
-        false,
-        &features,
-        &[],
+fn arrow_ligature_plans_one_to_one() {
+    use aterm_render::ColumnGlyph;
+    let mut r = renderer(LigatureMode::Enabled);
+    let mut term = Terminal::new(1, 4);
+    term.process(b"=>");
+    let input = term.cell_frame(1, 4);
+    let mut plan = Vec::new();
+    r.row_glyph_plan(&input, 0, &[], &mut plan);
+    // JetBrains Mono uses the 1:1 spacer convention -> per-column slots, NOT a
+    // collapse into slices of one wide glyph.
+    assert!(
+        !plan[..2]
+            .iter()
+            .any(|g| matches!(g, ColumnGlyph::LigatedSlice { .. })),
+        "JetBrains Mono `=>` must shape 1:1, not collapse: {plan:?}"
     );
     assert!(
-        shaped.is_some(),
-        "=> must shape to a ligature (glyph ids differ from plain cmap)"
-    );
-    // JetBrains Mono uses the 1:1 spacer convention -> a PerColumn plan (one slot
-    // per input cell), NOT a collapse.
-    let aterm_render::ShapedRun::PerColumn(gids) = shaped.unwrap() else {
-        panic!("JetBrains Mono `=>` must shape 1:1 (PerColumn), not collapse");
-    };
-    assert_eq!(
-        gids.len(),
-        2,
-        "monospace-preserving font keeps one slot per cell"
-    );
-    // Per-column plan: at least one cell of the `=>` ligature CHANGED (the wide
-    // ligature glyph / its placeholder), so it is `Some(gid)` rather than per-cell.
-    assert!(
-        gids.iter().any(Option::is_some),
-        "shaped per-column plan {gids:?} must mark at least one ligated cell"
+        plan[..2]
+            .iter()
+            .any(|g| matches!(g, ColumnGlyph::Ligated(_))),
+        "the `=>` plan {plan:?} must mark at least one ligated cell"
     );
 }
 
@@ -115,15 +84,10 @@ fn rustybuzz_shapes_arrow_ligature() {
 #[test]
 fn ligated_render_differs_from_unligated() {
     let text = b"a => b != c";
-    let (Some(on), Some(off)) = (
+    let (on, off) = (
         render(LigatureMode::Enabled, text),
         render(LigatureMode::Disabled, text),
-    ) else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    );
     assert_eq!(
         (on.width, on.height),
         (off.width, off.height),
@@ -142,15 +106,10 @@ fn ligated_render_differs_from_unligated() {
 #[test]
 fn spaced_operators_render_identically() {
     let text = b"a = > b";
-    let (Some(on), Some(off)) = (
+    let (on, off) = (
         render(LigatureMode::Enabled, text),
         render(LigatureMode::Disabled, text),
-    ) else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    );
     assert_eq!(
         on.pixels, off.pixels,
         "spaced operators 'a = > b' must render identically on/off — no run should ligate"
@@ -158,8 +117,7 @@ fn spaced_operators_render_identically() {
 }
 
 /// Render `text` under ligature `mode`, after applying a Simple selection over
-/// columns `[sel_start, sel_end]` inclusive on the (only) live row. Returns the
-/// frame, or None if the fixture font is absent (SKIP). The selection is driven
+/// columns `[sel_start, sel_end]` inclusive on the (only) live row. The selection is driven
 /// through the public selection API the way the GUI does, then snapshotted via
 /// `cell_frame` so it lands in `RenderInput.selection`.
 fn render_with_selection(
@@ -167,8 +125,8 @@ fn render_with_selection(
     text: &[u8],
     sel_start: u16,
     sel_end: u16,
-) -> Option<aterm_render::Frame> {
-    let mut r = renderer(mode)?;
+) -> aterm_render::Frame {
+    let mut r = renderer(mode);
     let (rows, cols) = (1usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
@@ -180,7 +138,7 @@ fn render_with_selection(
     sel.update_selection(0, sel_end, SelectionSide::Right);
     sel.complete_selection();
     let input = term.cell_frame(rows, cols);
-    Some(r.render_input(&input))
+    r.render_input(&input)
 }
 
 /// The pixels of column `c`'s vertical band (the whole cell height) in a 1-row,
@@ -206,16 +164,11 @@ fn column_band(frame: &aterm_render::Frame, c: usize, cols: usize) -> Vec<u32> {
 fn ligature_breaks_on_selection_boundary() {
     // "a=>b": '=' at col 1, '>' at col 2 form the arrow run; select only col 1.
     let text = b"a=>b";
-    let (Some(no_sel), Some(sel_on), Some(sel_off)) = (
+    let (no_sel, sel_on, sel_off) = (
         render(LigatureMode::Enabled, text),
         render_with_selection(LigatureMode::Enabled, text, 1, 1),
         render_with_selection(LigatureMode::Disabled, text, 1, 1),
-    ) else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    );
     assert_eq!(
         (no_sel.width, no_sel.height),
         (sel_on.width, sel_on.height),
@@ -256,16 +209,11 @@ fn ligature_breaks_on_selection_boundary() {
 #[test]
 fn ligature_breaks_on_style_change() {
     // Uniform plain "=>", uniform bold "=>", and a SPLIT "=>" ('=' plain, '>' bold).
-    let (Some(plain), Some(bold), Some(split)) = (
+    let (plain, bold, split) = (
         render(LigatureMode::Enabled, b"a\x1b[0m=>"),
         render(LigatureMode::Enabled, b"a\x1b[1m=>\x1b[0m"),
         render(LigatureMode::Enabled, b"a\x1b[0m=\x1b[1m>\x1b[0m"),
-    ) else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    );
     // Bold weight differs from plain (synthetic embolden widens strokes).
     assert_ne!(
         plain.pixels, bold.pixels,
@@ -295,15 +243,10 @@ fn ligature_breaks_on_style_change() {
 /// `ligature_breaks_on_style_change`; this adds the italic axis.)
 #[test]
 fn italic_ligature_differs_from_regular() {
-    let (Some(regular), Some(italic)) = (
+    let (regular, italic) = (
         render(LigatureMode::Enabled, b"a\x1b[0m=>"),
         render(LigatureMode::Enabled, b"a\x1b[3m=>\x1b[0m"),
-    ) else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    );
     assert_eq!(
         (regular.width, regular.height),
         (italic.width, italic.height),
@@ -326,15 +269,10 @@ fn italic_ligature_differs_from_regular() {
 #[test]
 fn ligature_breaks_on_wide_cell() {
     let text = "=>🚀".as_bytes();
-    let (Some(on), Some(off)) = (
+    let (on, off) = (
         render(LigatureMode::Enabled, text),
         render(LigatureMode::Disabled, text),
-    ) else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    );
     // The leading '=>' still ligates (wide emoji breaks the run after it, not the
     // arrow before it), so on != off: if the emoji had poisoned the run the arrow
     // would not ligate and the frames would match.
@@ -410,12 +348,7 @@ fn strip_gsub(bytes: &[u8]) -> Option<Vec<u8>> {
 /// (hence the per-cell glyphs) is identical to the ligating control.
 #[test]
 fn no_ligature_font_skips_shaping_and_is_identical() {
-    let Some(bytes) = ligature_test_font() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let bytes = ligature_test_font();
     let Some(stripped) = strip_gsub(&bytes) else {
         eprintln!("SKIP: fixture is not a directory-style sfnt with a GSUB table");
         return;
@@ -459,25 +392,17 @@ fn no_ligature_font_skips_shaping_and_is_identical() {
 /// This guards against the short-circuit ever wrongly firing on a ligature font.
 #[test]
 fn fixture_font_has_ligature_features_and_still_ligates() {
-    let Some(bytes) = ligature_test_font() else {
-        eprintln!(
-            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
-        );
-        return;
-    };
+    let bytes = ligature_test_font();
     let r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).unwrap();
     assert!(
         r.has_ligature_features(),
         "JetBrains Mono must report has_ligature_features() == true"
     );
     // And the gated path still produces a real ligature.
-    let (Some(on), Some(off)) = (
+    let (on, off) = (
         render(LigatureMode::Enabled, b"a => b"),
         render(LigatureMode::Disabled, b"a => b"),
-    ) else {
-        eprintln!("SKIP: no ligature test font");
-        return;
-    };
+    );
     assert_ne!(
         on.pixels, off.pixels,
         "the fixture must still ligate with the GSUB-gated fast-path in place"
@@ -599,10 +524,7 @@ fn renderer_applies_config_font_features() {
 #[test]
 fn user_feature_reaches_plan_with_ligatures_off() {
     use aterm_render::ColumnGlyph;
-    let Some(bytes) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font");
-        return;
-    };
+    let bytes = ligature_test_font();
     let mut term = Terminal::new(2, 8);
     term.process(b"a => b"); // "=>" occupies cols 2..=3; spaces break the run elsewhere
     let input = term.cell_frame(2, 8);
@@ -674,10 +596,7 @@ fn unsupported_user_feature_tags_reports_only_missing() {
 #[test]
 fn feature_does_not_drag_box_drawing_into_primary_face() {
     use aterm_render::ColumnGlyph;
-    let Some(bytes) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font");
-        return;
-    };
+    let bytes = ligature_test_font();
     let mut term = Terminal::new(2, 6);
     term.process("│0│0".as_bytes()); // box-drawing U+2502 interleaved with zeros
     let input = term.cell_frame(2, 6);
@@ -724,23 +643,17 @@ fn feature_does_not_drag_box_drawing_into_primary_face() {
 // ---------------------------------------------------------------------------
 
 /// A font whose `fi` (and usually `ffi`) collapses N:1, plus the collapse it
-/// produces for `fi`. Order: $ATERM_MERGED_FONT, then well-known macOS faces
-/// carrying Latin `f`-ligatures. `None` -> the caller SKIPs.
+/// produces for `fi` (the wide gid and the cell count), read off a standalone
+/// rustybuzz shape with the renderer's base feature list. Order:
+/// $ATERM_MERGED_FONT, then well-known macOS faces carrying Latin `f`-ligatures.
+/// `None` -> the caller SKIPs.
 fn merged_ligature_font() -> Option<(Vec<u8>, u16, u16)> {
     let feats = aterm_render::ligature_shaping::build_feature_list(&[], true);
     let collapse = |bytes: &[u8]| -> Option<(u16, u16)> {
-        match aterm_render::ligature_shaping::shape_ligature_run(
-            bytes,
-            0,
-            "fi",
-            &['f', 'i'],
-            true,
-            true,
-            &feats,
-            &[],
-        )? {
-            aterm_render::ShapedRun::Collapsed { gid, n } => Some((gid, n)),
-            aterm_render::ShapedRun::PerColumn(_) => None,
+        rustybuzz::Face::from_slice(bytes, 0)?;
+        match shape_gids(bytes, "fi", &feats)[..] {
+            [gid] => Some((u16::try_from(gid).ok()?, 2)),
+            _ => None,
         }
     };
     let mut candidates: Vec<String> = Vec::new();
@@ -1006,10 +919,7 @@ fn merged_ligature_block_cursor_recolours_only_its_cell() {
 /// only ever ADDS the Cascadia branch; it cannot perturb a 1:1 font.
 #[test]
 fn admit_collapsed_is_byte_identical_on_one_to_one_font() {
-    let Some(bytes) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font");
-        return;
-    };
+    let bytes = ligature_test_font();
     let mut on = merged_renderer(&bytes, true);
     let mut off = merged_renderer(&bytes, false);
     let f_on = frame(&mut on, b"a => b != c == d", 1, 16);

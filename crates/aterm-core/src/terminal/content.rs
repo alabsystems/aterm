@@ -7,24 +7,31 @@
 //! Methods for extracting text content from the terminal grid and
 //! performing smart selection (URLs, paths, etc.) for triggers and UI.
 
-use crate::grid::{Grid, row_u16};
+use crate::grid::{Grid, Row, row_u16};
 
 use super::Terminal;
 
 pub(super) fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
-    // LIVE-frame (screen-row) reads throughout: the extras lookups below are
-    // keyed by the live visible row, and callers pass terminal-relative rows
-    // (the renderer's selection contract, `sel_row = viewport_row -
-    // display_offset`). The display-mapped `Grid::cell` here paired scrolled
-    // cells with live extras and double-shifted `display_row_text` /
-    // selection copies whenever the viewport straddled the history boundary.
-    let Some(cell) = grid.row_at_screen(row).and_then(|r| r.get(col)) else {
+    // Live-frame (screen-row) reads: the extras lookups are keyed by the live
+    // visible row, and callers pass terminal-relative rows (the renderer's
+    // `sel_row = viewport_row - display_offset`). Display-mapped cells would
+    // pair scrolled cells with live extras.
+    if let Some(cells) = grid.row_at_screen(row) {
+        push_row_cell_text(grid, row, cells, col, out);
+    }
+}
+
+/// [`push_cell_text`] with the screen row already resolved: `cells` is
+/// `grid.row_at_screen(row)`. A row-text walk resolves it once instead of
+/// twice per cell.
+fn push_row_cell_text(grid: &Grid, row: u16, cells: &Row, col: u16, out: &mut String) {
+    let Some(cell) = cells.get(col) else {
         return;
     };
-    // Context-aware check: Cell::is_wide_continuation() would false-positive
-    // on DECSCA-protected cells (PROTECTED shares bit 10), hiding protected
-    // text from the read API.
-    if grid.is_wide_continuation_at_screen(row, col) {
+    // Context-aware check: Cell::is_wide_continuation() would misread
+    // DECSCA-protected cells (PROTECTED shares bit 10). The same test as
+    // `Grid::is_wide_continuation_at_screen`, on the row it resolves.
+    if cells.is_cell_wide_continuation(col) {
         return;
     }
     if cell.is_complex() {
@@ -38,11 +45,9 @@ pub(super) fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) 
         let ch = cell.char();
         out.push(if ch == '\0' { ' ' } else { ch });
     }
-    // Combining marks from CellExtra — gate on has_extras() so cells
-    // without extras skip the HashMap probe. Stale entries from
-    // overwritten cells are removed at the grid write path since #7456
-    // was fixed (grid/write.rs `remove_stale_extras*`); the flag check
-    // remains as the fast path and as defense in depth.
+    // Combining marks from CellExtra, gated on has_extras() so cells without
+    // extras skip the map probe (the write path removes stale entries; the
+    // flag check is the fast path).
     if cell.has_extras() {
         if let Some(extra) = grid.cell_extra(row, col) {
             for &combining in extra.combining() {
@@ -52,7 +57,7 @@ pub(super) fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) 
     }
 }
 
-/// Extract LIVE-frame (screen-row, display_offset-independent) row text for an
+/// Extract live-frame (screen-row, display_offset-independent) row text for an
 /// inclusive column range.
 #[must_use]
 pub(crate) fn visible_row_bounds_to_string(
@@ -61,24 +66,17 @@ pub(crate) fn visible_row_bounds_to_string(
     start_col: u16,
     end_col: u16,
 ) -> String {
-    // Clamp end_col to actual grid width. `side_adjusted_bounds` uses
-    // u16::MAX as a sentinel for "entire row" when the end retreats to the
-    // previous row; iterating up to 65535 wastes ~65K no-op cell lookups.
+    // Clamp end_col to the grid width: `side_adjusted_bounds` uses u16::MAX as
+    // an "entire row" sentinel.
     let last_col = grid.cols().saturating_sub(1);
     let end_col = end_col.min(last_col);
 
-    // Both edges widen over a double-width glyph through the SAME authority the
-    // highlight predicate uses — `glyph_cell_span`: a CJK/emoji glyph is one
-    // indivisible unit, selected whole whenever either of its cells is. An edge
-    // that landed mid-glyph would otherwise make the copy and the paint describe
-    // different runs of cells (#7526): a start on the continuation would drop the
-    // lead's text under a painted highlight, and an end on the lead would take a
-    // character whose right half was never highlighted.
-    //
-    // Context-aware continuation checks so DECSCA-protected cells are not
-    // mistaken for continuations (shared bit 10). Screen-row keyed, like
-    // `push_cell_text`. A cell one past `last_col` cannot be a continuation, so
-    // an end already at the row's edge stays there.
+    // Both edges widen over a double-width glyph through `glyph_cell_span`, the
+    // rule the highlight predicate uses: a CJK/emoji glyph is selected whole
+    // whenever either cell is, so the copy and the paint cover the same cells.
+    // Continuation checks are context-aware (DECSCA shares bit 10) and
+    // screen-row keyed like `push_cell_text`. A cell one past `last_col` is not
+    // a continuation, so an end at the row's edge stays there.
     let is_continuation =
         |col: u16| col <= last_col && grid.is_wide_continuation_at_screen(row, col);
     let (effective_start, _) = aterm_types::selection::glyph_cell_span(
@@ -86,10 +84,9 @@ pub(crate) fn visible_row_bounds_to_string(
         is_continuation(start_col.saturating_add(1)),
         is_continuation(start_col),
     );
-    // Extending the end onto a continuation adds no TEXT — the cluster lives on
-    // the lead and `push_cell_text` yields nothing for the right half. It earns
-    // its place as a seam, not as output: ONE rule governs both edges instead of
-    // two that agree by coincidence, and the loop's span stays the painted span.
+    // Extending the end onto a continuation adds no text (the cluster lives on
+    // the lead); it keeps one rule for both edges and the loop's span equal to
+    // the painted span.
     let (_, effective_end) = aterm_types::selection::glyph_cell_span(
         end_col,
         is_continuation(end_col.saturating_add(1)),
@@ -97,17 +94,16 @@ pub(crate) fn visible_row_bounds_to_string(
     );
     let end_col = effective_end.min(last_col);
 
-    // One byte per column is the exact ASCII size and a tight lower bound
-    // otherwise, so a plain row lands in a single allocation instead of growing
-    // by doubling from zero (~ceil(log2(bytes)) realloc+memcpy cycles per
-    // extracted row). Both bounds are already inside `0..=last_col`, so this can
-    // never exceed one row's width. Mirrors `Grid::row_text_screen_into`, which
-    // reserves the same way before its identical per-column push loop.
+    // One byte per column is exact for ASCII and a lower bound otherwise, so a
+    // plain row takes one allocation. Bounded by one row's width. Mirrors
+    // `Grid::row_text_screen_into`.
     let mut line = String::with_capacity(
         usize::from(end_col.saturating_sub(effective_start)).saturating_add(1),
     );
-    for col in effective_start..=end_col {
-        push_cell_text(grid, row, col, &mut line);
+    if let Some(cells) = grid.row_at_screen(row) {
+        for col in effective_start..=end_col {
+            push_row_cell_text(grid, row, cells, col, &mut line);
+        }
     }
 
     let trimmed_len = line.trim_end().len();
@@ -126,10 +122,8 @@ impl Terminal {
         self.grid.visible_content()
     }
 
-    /// Get the text content of a specific visible row.
-    ///
-    /// Row 0 is the top visible row. Returns `None` if row is out of bounds.
-    /// Useful for trigger evaluation on specific lines.
+    /// The text of visible row `row` (0 is the top), or `None` if out of
+    /// bounds.
     #[must_use]
     pub fn row_text(&self, row: usize) -> Option<String> {
         let rows = usize::from(self.grid.rows());
@@ -140,15 +134,10 @@ impl Terminal {
     }
 
     /// Append visible row `row`'s text into `out`, reusing its capacity, and
-    /// report whether the row was in bounds.
-    ///
-    /// Bounds-checked, non-allocating counterpart of [`row_text`](Self::row_text):
-    /// clears `out` then appends exactly what `row_text` would return for an
-    /// in-bounds row (returning `true`); for an out-of-range row it leaves `out`
-    /// cleared and returns `false`. The Observation Kernel's per-batch row scan
-    /// (`observe_at`) refills a persistent scratch buffer through this so a
-    /// `RowMatches` watcher does not heap-allocate one `String` per visible row
-    /// on every processed batch.
+    /// report whether the row was in bounds: the non-allocating counterpart of
+    /// [`row_text`](Self::row_text). `out` is cleared first; an out-of-range row
+    /// leaves it empty and returns `false`. Used by the observation kernel's
+    /// per-batch row scan.
     #[must_use]
     pub fn row_text_into(&self, row: usize, out: &mut String) -> bool {
         let rows = usize::from(self.grid.rows());
@@ -159,16 +148,14 @@ impl Terminal {
         self.grid.row_text_into(row_u16(row), out)
     }
 
-    /// Fill `out` with visible row `row`'s content as PER-COLUMN chars and
-    /// return the row's FILL (one past the last non-blank column; `0` for an
-    /// empty or out-of-range row).
+    /// Fill `out` with visible row `row` as per-column chars and return the
+    /// row's fill (one past the last non-blank column; `0` for an empty or
+    /// out-of-range row).
     ///
-    /// The column-indexed sibling of [`row_text_into`](Self::row_text_into),
-    /// for per-frame row DIFFING (the GUI's erase-poof probe): one `char` per
-    /// grid column — the resolved lead char at its column, `'\0'` at wide
-    /// continuations, `' '` for blanks — so span math survives CJK/emoji.
-    /// Clear-then-extend into the caller's buffer (zero steady-state
-    /// allocation on the probe path).
+    /// The column-indexed sibling of [`row_text_into`](Self::row_text_into), for
+    /// per-frame row diffing: one `char` per grid column (the lead char at its
+    /// column, `'\0'` at wide continuations, `' '` for blanks), so span math
+    /// survives CJK/emoji. Clears and extends the caller's buffer.
     pub fn row_cols_into(&self, row: usize, out: &mut Vec<char>) -> u16 {
         let rows = usize::from(self.grid.rows());
         if row >= rows {
@@ -178,38 +165,28 @@ impl Terminal {
         self.grid.row_cols_into(row_u16(row), out)
     }
 
-    /// Get the combining-aware grapheme text of a single VISIBLE cell.
+    /// The combining-aware grapheme text of visible cell `(row, col)`: the base
+    /// character plus any complex-cluster string and combining marks, the same
+    /// content the selection and `row_text`/`get_line_text` produce (NFD
+    /// accents and ZWJ clusters included).
     ///
-    /// Returns the resolved base character plus any complex-cluster string and
-    /// trailing combining marks for visible-grid cell `(row, col)` — the SAME
-    /// content the selection and `row_text`/`get_line_text` paths produce, so an
-    /// introspecting reader of one cell never silently drops an NFD accent
-    /// (`e`+U+0301) or a ZWJ emoji cluster (👨‍👩‍👧) the pixels and selection show.
-    ///
-    /// A wide-continuation cell (the blank right half of a CJK/emoji glyph)
-    /// returns the empty string; its glyph belongs to the lead cell. Returns
-    /// `None` only for an out-of-range row/col (so the caller can report a
-    /// distinct "out of range"), and `Some("")` for a genuinely blank cell.
+    /// A wide-continuation cell returns the empty string (its glyph belongs to
+    /// the lead cell). `None` only for out-of-range coordinates; `Some("")`
+    /// for a blank cell.
     #[must_use]
     pub fn cell_grapheme(&self, row: usize, col: usize) -> Option<String> {
         let mut out = String::new();
         self.cell_grapheme_into(row, col, &mut out).then_some(out)
     }
 
-    /// The buffer-REUSING twin of [`cell_grapheme`](Self::cell_grapheme): the
-    /// same bytes APPENDED to a caller-owned `String`, returning whether the
-    /// coordinates were in range — the `Some`/`None` of the allocating form. An
-    /// out-of-range cell appends nothing and returns `false`; every in-range
-    /// cell returns `true`, including the blank one that appends a single space
-    /// and the wide-continuation that appends nothing.
+    /// The buffer-reusing twin of [`cell_grapheme`](Self::cell_grapheme): the
+    /// same bytes appended to `out`, returning whether the coordinates were in
+    /// range. Out of range appends nothing and returns `false`; a blank cell
+    /// appends a space and a wide continuation nothing, both returning `true`.
     ///
-    /// Both forms route through the SAME `push_cell_text`, so byte-identity is
-    /// by construction rather than by argument. This one exists for the rows ×
-    /// cols sweeps: the agent-facing styled frame (`aterm ctl screen` /
-    /// `subscribe … cells`) built a fresh `String` PER CELL — 1,920 heap
-    /// allocations for a 24x80 screen, 10,000 for 50x200, all under the terminal
-    /// lock and repeated on every poll. Appending into one per-row buffer makes
-    /// that one allocation per row.
+    /// Both forms share `push_cell_text`. This one serves rows × cols sweeps
+    /// (`aterm ctl screen`, `subscribe … cells`) with one allocation per row
+    /// instead of per cell.
     pub fn cell_grapheme_into(&self, row: usize, col: usize, out: &mut String) -> bool {
         let (Ok(r), Ok(c)) = (u16::try_from(row), u16::try_from(col)) else {
             return false;
@@ -223,20 +200,16 @@ impl Terminal {
         true
     }
 
-    /// Get the combining-aware grapheme text of a single DISPLAY cell,
-    /// accounting for `display_offset` (scroll position into history).
+    /// The combining-aware grapheme text of a display cell, accounting for
+    /// `display_offset`: the per-cell counterpart of
+    /// [`display_row_text`](Self::display_row_text), where row 0 is the top of
+    /// the current viewport (a scrollback line when scrolled back). Cells and
+    /// extras are resolved together through [`Grid::visible_row_view`], so a
+    /// history row's clusters and marks stay paired with their cells. Equal to
+    /// [`cell_grapheme`](Self::cell_grapheme) at `display_offset == 0`.
     ///
-    /// The display-relative sibling of [`cell_grapheme`](Self::cell_grapheme)
-    /// — the per-cell counterpart of [`display_row_text`](Self::display_row_text):
-    /// row 0 is the TOP of the CURRENT viewport, which maps to a scrollback
-    /// line while the user is scrolled back. Cells and extras are resolved
-    /// together through the unified [`Grid::visible_row_view`] resolver, so a
-    /// history row's complex clusters / combining marks stay paired with their
-    /// cells across every scrollback tier. At `display_offset == 0` it is
-    /// byte-identical to `cell_grapheme`.
-    ///
-    /// A wide-continuation cell returns the empty string (its glyph belongs to
-    /// the lead cell); `None` only for an out-of-range row/col.
+    /// A wide-continuation cell returns the empty string; `None` only for
+    /// out-of-range coordinates.
     #[must_use]
     pub fn display_cell_grapheme(&self, row: usize, col: usize) -> Option<String> {
         let r = u16::try_from(row).ok()?;
@@ -257,19 +230,15 @@ impl Terminal {
         Some(out)
     }
 
-    /// Every DISPLAY column of `row` resolved ONCE — `(grapheme, is_wide)` per
-    /// column — through a single [`Grid::visible_row_view`].
+    /// Every display column of `row` resolved once, as `(grapheme, is_wide)`,
+    /// through a single [`Grid::visible_row_view`].
     ///
-    /// The batched form of [`display_cell_grapheme`](Self::display_cell_grapheme)
-    /// plus a per-cell wide read: a scrolled-back row is a HISTORY row that
-    /// `visible_row_view` materializes from scrollback, so resolving it per cell
-    /// re-materializes the whole row on every access (O(cols²) for a host that
-    /// walks the row cell-by-cell, e.g. the buffer facade's non-ASCII
-    /// `translateToString`). This materializes the row ONCE (the `VisibleRowView`
-    /// holds the materialized row) and reads each column O(1), so a host caches
-    /// this and serves its per-cell reads from it. `grapheme` is empty for a
-    /// blank or wide-continuation cell; `is_wide` is the lead cell's double-width
-    /// flag. `None` only for an out-of-range row.
+    /// The batched form of [`display_cell_grapheme`](Self::display_cell_grapheme):
+    /// a scrolled-back row is materialized from scrollback, so per-cell reads
+    /// would re-materialize it each time (O(cols²)). Hosts cache this and serve
+    /// per-cell reads from it. `grapheme` is empty for a blank or
+    /// wide-continuation cell; `is_wide` is the lead cell's flag. `None` only
+    /// for an out-of-range row.
     #[must_use]
     pub fn display_row_grapheme_cells(&self, row: usize) -> Option<Vec<(String, bool)>> {
         let r = u16::try_from(row).ok()?;
@@ -292,15 +261,10 @@ impl Terminal {
         Some(out)
     }
 
-    /// Get the text content of a display-relative row, accounting for
-    /// `display_offset` (scroll position into history).
-    ///
-    /// When `display_offset > 0`, display row 0 maps to a scrollback line,
-    /// not live grid row 0. This method converts display-relative coordinates
-    /// to terminal-relative coordinates and reads from the correct source
-    /// (scrollback for negative terminal rows, live grid for non-negative).
-    ///
-    /// Returns `None` if the row is out of bounds.
+    /// The text of a display-relative row, accounting for `display_offset`:
+    /// display row 0 is a scrollback line while scrolled back. Converts to a
+    /// terminal-relative row and reads scrollback (negative) or the live grid.
+    /// `None` if out of bounds.
     #[must_use]
     pub fn display_row_text(&self, display_row: usize) -> Option<String> {
         let offset = self.grid.display_offset();
@@ -309,9 +273,7 @@ impl Terminal {
             return self.row_text(display_row);
         }
 
-        // Convert display-relative row to terminal-relative (i32).
-        // terminal_row = display_row - display_offset
-        // Negative terminal_row = scrollback line.
+        // terminal_row = display_row - display_offset; negative is scrollback.
         let visible_rows = usize::from(self.grid.rows());
         if display_row >= visible_rows {
             return None;
@@ -335,13 +297,11 @@ impl Terminal {
     // Smart Selection API
     // ========================================================================
 
-    /// Text of an ABSOLUTE terminal row (the search index's native coordinate),
-    /// reconstructed from the SAME sources `build_search_index` indexes so a
-    /// snippet equals the line the match was found in: history rows via the
-    /// bounded `get_history_line` read, visible rows via `get_line_text`.
-    /// `None` when `abs` is below the oldest retained row (evicted) or past the
-    /// live viewport. Feeds `search_summary`'s snippet field (fed E-1) without
-    /// depending on the index's soon-to-be-dropped String cache (E-4).
+    /// Text of an absolute terminal row (the search index's coordinate), read
+    /// from the same sources `build_search_index` indexes, so a snippet equals
+    /// the line the match came from: history via the bounded
+    /// `get_history_line`, visible rows via `get_line_text`. `None` when `abs`
+    /// is evicted or past the live viewport. Feeds `search_summary`'s snippet.
     #[must_use]
     pub fn abs_row_text(&self, abs: u64) -> Option<String> {
         use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
@@ -365,40 +325,13 @@ impl Terminal {
         self.get_line_text(r, None)
     }
 
-    /// Get smart word boundaries at a position on a display-relative row.
+    /// Smart word boundaries at a position on a display-relative row.
     ///
-    /// This uses context-aware selection rules to identify semantic text units
-    /// like URLs, file paths, email addresses, git hashes, quoted strings, etc.
-    /// Falls back to basic word boundaries for plain text.
-    ///
-    /// When the terminal is scrolled into history (`display_offset > 0`),
-    /// display row 0 corresponds to a scrollback line, not live grid row 0.
-    /// This method correctly reads from scrollback when needed.
-    ///
-    /// # Arguments
-    ///
-    /// * `row` - The display-relative row index (0 is top of viewport)
-    /// * `col` - The column position
-    /// * `smart` - The smart selection engine with configured rules
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some((start_col, end_col))` if a word/semantic unit is found,
-    /// `None` if the position is on whitespace or out of bounds.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use aterm_core::terminal::Terminal;
-    /// use aterm_core::selection::SmartSelection;
-    ///
-    /// let terminal = Terminal::new(24, 80);
-    /// let smart = SmartSelection::with_builtin_rules();
-    /// let (row, col) = (5, 10);
-    /// if let Some((start, end)) = terminal.smart_word_at(row, col, &smart) {
-    ///     // Select from start to end column
-    /// }
-    /// ```
+    /// Context-aware rules find semantic units (URLs, file paths, email
+    /// addresses, git hashes, quoted strings), falling back to plain word
+    /// boundaries. Reads scrollback when the viewport is scrolled back. `row`
+    /// is display-relative (0 is the viewport's top). Returns `(start_col,
+    /// end_col)`, or `None` on whitespace or out of bounds.
     #[must_use]
     pub fn smart_word_at(
         &self,
@@ -415,12 +348,11 @@ impl Terminal {
 mod tests {
     use crate::terminal::Terminal;
 
-    // ---- Stale CellExtras cleanup on overwrite (#7456) ----------------------
+    // ---- Stale CellExtras cleanup on overwrite ------------------------------
     //
-    // End-to-end proof through the VT byte stream: extras-bearing cells
-    // (hyperlink, combining marks) overwritten by plain text must leave NO
-    // entry in the extras map (memory leak) and NO stale data reachable by
-    // a later styled write on the same coordinate.
+    // Through the VT byte stream: extras-bearing cells (hyperlink, combining
+    // marks) overwritten by plain text leave no entry in the extras map and no
+    // stale data for a later styled write on the same coordinate.
 
     #[test]
     fn plain_overwrite_removes_stale_hyperlink_extras_entries() {
@@ -469,9 +401,8 @@ mod tests {
 
     #[test]
     fn styled_overwrite_does_not_resurrect_stale_hyperlink() {
-        // The resurrection case: an RGB-styled write landing on an old
-        // hyperlink cell used to `get_or_create` the stale entry and
-        // attach the OLD hyperlink to the NEW character.
+        // An RGB-styled write on an old hyperlink cell must not pick up the
+        // stale entry's hyperlink.
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b]8;;https://example.com\x1b\\L\x1b]8;;\x1b\\");
         assert!(term.hyperlink_at(0, 0).is_some());
@@ -488,10 +419,9 @@ mod tests {
 
     // ---- display_row_text across the history/live boundary ------------------
 
-    /// display_row_text must return exactly what each DISPLAY row shows when
-    /// the viewport STRADDLES the history/live boundary. Pre-fix, the live
-    /// rows of a straddling viewport re-applied display_offset (get_line_text's
-    /// positive arm read display-mapped cells), repeating the top history rows.
+    /// display_row_text returns exactly what each display row shows when the
+    /// viewport straddles the history/live boundary (live rows are not
+    /// shifted again by display_offset).
     #[test]
     fn display_row_text_straddling_viewport_reads_each_displayed_row() {
         let mut term = Terminal::new(5, 20);
@@ -531,10 +461,8 @@ mod tests {
         }
     }
 
-    /// A straddling read must keep live-frame extras (combining marks) PAIRED
-    /// with their base cells: pre-fix the cells came from the display-mapped
-    /// row while the extras stayed live-keyed, so the accent row read as a
-    /// different row's text.
+    /// A straddling read keeps live-frame extras (combining marks) paired with
+    /// their base cells.
     #[test]
     fn display_row_text_straddling_keeps_combining_marks_paired() {
         let mut term = Terminal::new(5, 20);
@@ -556,9 +484,8 @@ mod tests {
 
     // ---- display_cell_grapheme (display-relative single-cell reads) ---------
 
-    /// The DISPLAY-relative cell reader must track the scroll position exactly
-    /// like display_row_text: row 0 reads the top DISPLAYED row (a scrollback
-    /// line when scrolled), not live screen row 0 — and it is byte-identical to
+    /// The display-relative cell reader tracks the scroll position like
+    /// display_row_text (row 0 is the top displayed row), and equals
     /// cell_grapheme at display_offset == 0.
     #[test]
     fn display_cell_grapheme_reads_the_displayed_row() {
@@ -577,7 +504,7 @@ mod tests {
             }
         }
 
-        // Fully in history: display row 0 must spell the OLDEST line.
+        // Fully in history: display row 0 must spell the oldest line.
         term.scroll_to_top();
         let spelled: String = (0..5)
             .map(|c| term.display_cell_grapheme(0, c).unwrap())

@@ -10,6 +10,7 @@ fn completed_checks_joins_and_lock_release_prove_and_catch() {
         native_update_check_wait_model(),
         native_update_boot_health_lock_model(),
         native_update_two_process_apply_model(),
+        native_update_trial_give_back_model(),
     ] {
         aterm_spec::verify::prove_and_catch_scalar(&model, "update check coordination");
     }

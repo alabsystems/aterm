@@ -2,38 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OSC color handlers for the terminal.
-//!
-//! This module contains handlers for color-related OSC sequences:
-//! - OSC 4: Color palette manipulation
-//! - OSC 10/11/12: Default foreground/background/cursor colors
-//! - OSC 19: Selection foreground color
-//! - OSC 21: Extended color queries (kitty protocol)
-//! - OSC 104: Reset indexed colors
-//! - OSC 30001/30101: Kitty color stack push/pop
+//! OSC color handlers: OSC 4 (palette), 10/11/12 (default fg/bg/cursor),
+//! 17/19 (selection bg/fg), 21 (kitty extended color queries), 104 (reset
+//! indexed colors) and 30001/30101 (kitty color stack push/pop).
 
 use super::handler::TerminalHandler;
 use aterm_types::{ColorPalette, Rgb};
 
-/// Fallback per-sequence response cap for OSC palette queries (#7883) used
-/// when no [`PolicyEngine`][pe] is installed.
+/// Per-sequence response cap for OSC palette queries when no
+/// [`PolicyEngine`][pe] is installed.
 ///
-/// A single OSC 4 / OSC 21 sequence can embed many `;idx;?` pairs (up to 256
-/// for OSC 4). Without a per-sequence bound, one sequence can emit ~5 KiB of
-/// back-pressure on the PTY writer — a cheap amplification vector. The
-/// response rate limiter bounds *total* output rate, but only a per-sequence
-/// cap bounds single-sequence amplification.
-///
-/// When this cap is hit the remaining query pairs are silently dropped,
-/// matching the rate-limiter drop policy. 16 is generous enough for any
-/// legitimate palette inspector (debuggers typically query <= 16 well-known
-/// indices) while bounding a malicious 256-index query to ~320 bytes of
-/// response bytes.
-///
-/// When a policy engine is installed (#7995), the cap and cross-sequence
-/// throttle are sourced from `engine.rate_limit_config("palette")`. This
-/// constant is the fallback used by legacy hosts that have not installed a
-/// policy.
+/// One OSC 4 / OSC 21 sequence can embed many `;idx;?` pairs, and the response
+/// rate limiter bounds only total output, so this caps single-sequence
+/// amplification. Pairs past the cap are dropped silently. 16 covers
+/// legitimate palette inspectors while bounding a 256-index query to ~320
+/// bytes. With a policy engine installed, the cap and cross-sequence throttle
+/// come from `engine.rate_limit_config("palette")`.
 ///
 /// [pe]: aterm_policy::engine::PolicyEngine
 pub(super) const LEGACY_PALETTE_PER_SEQUENCE_MAX: usize = 16;
@@ -91,16 +75,23 @@ enum Osc21QueryValue {
     Unknown,
 }
 
+/// Longest unknown OSC 21 key echoed back; kitty's longest is 30 bytes.
+const MAX_OSC21_ECHO_KEY_BYTES: usize = 64;
+
+/// Whether an unrecognised OSC 21 key may be echoed in a `key=?` reply: only
+/// the spelling kitty's key names use (ASCII letters, digits, `_`, `-`), short.
+fn osc_21_key_is_echoable(key: &str) -> bool {
+    key.len() <= MAX_OSC21_ECHO_KEY_BYTES
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 impl TerminalHandler<'_> {
-    /// Resolve the per-sequence OSC palette-query response cap (#7995).
-    ///
-    /// Returns the `per_sequence_max` from the active policy engine's
-    /// `"palette"` rate-limit entry when one is installed, falling back to
-    /// [`LEGACY_PALETTE_PER_SEQUENCE_MAX`] otherwise. A policy entry with
-    /// `per_sequence_max = 0` (meaning "disabled" in the policy schema) also
-    /// falls back to the legacy constant so a handler never receives a
-    /// non-cap; the fail-closed policy posture applies to response gating,
-    /// not to the per-sequence amplification bound.
+    /// The per-sequence OSC palette-query response cap: the active policy
+    /// engine's `"palette"` `per_sequence_max`, or
+    /// [`LEGACY_PALETTE_PER_SEQUENCE_MAX`] without an engine. A policy value of
+    /// 0 ("disabled") also falls back, so the handler always has a cap.
     pub(super) fn palette_per_sequence_cap(&self) -> usize {
         if let Some(cfg) = self.policy.rate_limit_config("palette")
             && cfg.per_sequence_max > 0
@@ -110,13 +101,9 @@ impl TerminalHandler<'_> {
         LEGACY_PALETTE_PER_SEQUENCE_MAX
     }
 
-    /// Debit the active policy engine's `"palette"` bucket by one response
-    /// pair (#7995). Returns `true` when the response is permitted.
-    ///
-    /// When no policy engine is installed the per-sequence cap enforced by
-    /// [`Self::palette_per_sequence_cap`] is the only bound; this helper
-    /// returns `true` so the legacy behavior (no cross-sequence throttle)
-    /// is preserved.
+    /// Debit the policy engine's `"palette"` bucket by one response pair;
+    /// `true` when permitted. Without an engine this returns `true` and the
+    /// per-sequence cap is the only bound.
     fn palette_rate_limit_consume_one(&mut self) -> bool {
         let clock = aterm_policy::limits::SystemClock;
         self.policy
@@ -138,15 +125,9 @@ impl TerminalHandler<'_> {
             return; // Need at least: 4, index, spec
         }
 
-        // Process pairs: index, spec, index, spec, ...
-        //
-        // Per-sequence response cap (#7883, now sourced from the
-        // `"palette"` policy entry in #7995): track query responses emitted
-        // from THIS sequence so a 256-index `;idx;?` query cannot amplify
-        // into ~5 KiB of PTY back-pressure. Set operations are unaffected.
-        // The cap comes from `palette_per_sequence_cap()` — the active
-        // policy engine's bucket config, or the legacy constant when no
-        // engine is installed.
+        // Process pairs: index, spec, index, spec, ... Query responses from this
+        // sequence are capped (`palette_per_sequence_cap()`) so a 256-index query
+        // cannot amplify; set operations are unaffected.
         let per_seq_cap = self.palette_per_sequence_cap();
         let mut i = 1;
         let mut responses_emitted: usize = 0;
@@ -167,22 +148,19 @@ impl TerminalHandler<'_> {
             };
 
             if spec == "?" {
-                // Per-sequence cap: silently drop queries past the limit
-                // (#7883). Continue scanning so later set operations in the
-                // same sequence still apply.
+                // Drop queries past the per-sequence cap, but keep scanning so
+                // later set operations still apply.
                 if responses_emitted >= per_seq_cap {
                     i += 2;
                     continue;
                 }
-                // Cross-sequence rate limit: consult the policy engine's
-                // `"palette"` bucket (#7995). A denial here silently drops
-                // this pair — same contract as the per-sequence cap.
+                // Cross-sequence rate limit via the policy engine's `"palette"`
+                // bucket; a denial drops this pair like the per-sequence cap.
                 if !self.palette_rate_limit_consume_one() {
                     i += 2;
                     continue;
                 }
-                // Query: respond with current color.
-                // Match request terminator (BEL vs ST) per xterm behavior (#7548).
+                // Answer with the request's terminator (BEL vs ST), as xterm does.
                 let color = self.color.palette.get(index);
                 let st = if self.transient.last_osc_bel_terminated {
                     "\x07"
@@ -198,13 +176,9 @@ impl TerminalHandler<'_> {
                 self.send_response(cap, response.as_bytes());
                 responses_emitted += 1;
             } else {
-                // Set: parse the color spec and update palette.
-                //
-                // #7937 F01-3: SET is gated by `modes.allow_palette_reconfigure`
-                // (fail-closed). Hosts that ship a themeable palette opt in
-                // explicitly; by default a program cannot recolor the
-                // 256-entry index over the wire. Query branch above remains
-                // ungated — queries only echo what the terminal reports.
+                // Set: gated by `modes.allow_palette_reconfigure` (default off),
+                // so by default a program cannot recolor the 256-entry palette.
+                // Queries above stay ungated.
                 if self.modes.allow_palette_reconfigure
                     && let Some(color) = ColorPalette::parse_color_spec(spec)
                 {
@@ -223,17 +197,16 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 10/11/12 - foreground, background, and cursor colors.
+    /// Handle OSC 10/11/12: foreground, background and cursor colors.
     ///
-    /// These OSC sequences support cascading: when OSC 10 is received with multiple
-    /// color specifications, the first sets foreground, second sets background,
-    /// third sets cursor. OSC 11 with multiple specs sets background and cursor.
+    /// Multiple specs cascade: OSC 10 with several sets foreground, then
+    /// background, then cursor; OSC 11 sets background, then cursor.
     ///
-    /// - `start_at = 0`: Start with foreground (OSC 10)
-    /// - `start_at = 1`: Start with background (OSC 11)
-    /// - `start_at = 2`: Start with cursor (OSC 12)
+    /// - `start_at = 0`: start with foreground (OSC 10)
+    /// - `start_at = 1`: start with background (OSC 11)
+    /// - `start_at = 2`: start with cursor (OSC 12)
     ///
-    /// Query format: `OSC N ; ? ST` responds with `OSC N ; rgb:RRRR/GGGG/BBBB ST`
+    /// A query `OSC N ; ? ST` answers `OSC N ; rgb:RRRR/GGGG/BBBB ST`.
     pub(super) fn handle_osc_10_11_12(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -244,8 +217,6 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Process color specifications starting at the given index
-        // params[0] is the OSC code, params[1..] are the color specs
         let mut color_index = start_at;
         for spec_bytes in &params[1..] {
             let Some(slot) = DynamicColorSlot::from_index(color_index) else {
@@ -266,7 +237,7 @@ impl TerminalHandler<'_> {
                     .and_then(|cb| cb(slot.color_target()))
                     .unwrap_or(palette_color);
                 let osc_code = 10 + color_index;
-                // Match request terminator (BEL vs ST) per xterm behavior (#7548).
+                // Match request terminator (BEL vs ST) per xterm behavior.
                 let st = if self.transient.last_osc_bel_terminated {
                     "\x07"
                 } else {
@@ -350,10 +321,7 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Per-sequence response-pair cap (#7883, sourced from policy in #7995):
-        // bound response size so a 256-pair query cannot amplify into ~5 KiB
-        // of PTY back-pressure. See `palette_per_sequence_cap` for the
-        // policy/legacy fallback.
+        // Per-sequence response-pair cap (see `palette_per_sequence_cap`).
         let per_seq_cap = self.palette_per_sequence_cap();
         let mut query_pairs: Vec<String> = Vec::new();
 
@@ -379,9 +347,8 @@ impl TerminalHandler<'_> {
                 if query_pairs.len() >= per_seq_cap {
                     continue;
                 }
-                // Cross-sequence rate limit via the policy engine's
-                // `"palette"` bucket (#7995). A denial silently drops this
-                // pair — same contract as the per-sequence cap.
+                // Cross-sequence rate limit via the policy engine's `"palette"`
+                // bucket; a denial drops this pair.
                 if !self.palette_rate_limit_consume_one() {
                     continue;
                 }
@@ -391,7 +358,15 @@ impl TerminalHandler<'_> {
                         query_pairs.push(format!("{key}={spec}"));
                     }
                     Osc21QueryValue::Undefined => query_pairs.push(format!("{key}=")),
-                    Osc21QueryValue::Unknown => query_pairs.push(format!("{key}=?")),
+                    // Kitty's protocol answers an unknown key with `key=?`,
+                    // and that echo is the one reply here that carries bytes
+                    // the terminal did not produce: echo only a key spelled
+                    // like a real one, so DEL, spaces or punctuation never
+                    // reach the shell's input.
+                    Osc21QueryValue::Unknown if osc_21_key_is_echoable(key) => {
+                        query_pairs.push(format!("{key}=?"));
+                    }
+                    Osc21QueryValue::Unknown => {}
                 }
                 continue;
             }
@@ -407,7 +382,7 @@ impl TerminalHandler<'_> {
         }
 
         if !query_pairs.is_empty() {
-            // Match request terminator (BEL vs ST) per xterm behavior (#7548).
+            // Match request terminator (BEL vs ST) per xterm behavior.
             let st = if self.transient.last_osc_bel_terminated {
                 "\x07"
             } else {
@@ -523,16 +498,14 @@ impl TerminalHandler<'_> {
 
     fn osc_21_set_color(&mut self, key: &str, color: Rgb) {
         if let Some(slot) = DynamicColorSlot::from_name(key) {
-            // Named dynamic-color slots (foreground, background, cursor)
-            // are NOT gated — they route through the host's
-            // set_dynamic_color callback, not the indexed palette.
+            // Named dynamic-color slots are not gated: they go through the
+            // host's set_dynamic_color callback, not the indexed palette.
             self.set_dynamic_color(slot, color);
             return;
         }
         if key.eq_ignore_ascii_case("selection_background") {
-            // Selection background is tracked separately from the 256 palette
-            // indices and is part of the theme-surface, not the indexed
-            // palette. Keep it ungated for parity with dynamic colors.
+            // Selection background is theme surface, not the indexed palette:
+            // ungated like the dynamic colors.
             self.color.selection_background = Some(color);
             self.fire_color_change_callback(
                 super::ColorTarget::SelectionBackground,
@@ -552,7 +525,7 @@ impl TerminalHandler<'_> {
         }
         if let Ok(index) = key.parse::<u8>() {
             // Numeric index: this is a reconfigure of a palette slot.
-            // #7937 F01-3: gated by allow_palette_reconfigure (fail-closed).
+            // Gated by allow_palette_reconfigure (fail-closed).
             if !self.modes.allow_palette_reconfigure {
                 return;
             }
@@ -565,41 +538,31 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 104 - Reset indexed color(s) to theme-configured defaults.
-    ///
-    /// Format: `OSC 104 [; index [; index ...]] ST`
-    ///
-    /// If no indices are specified, reset all 256 colors.
-    /// If indices are specified, reset only those colors.
-    ///
-    /// When a theme-configured palette exists (set via `apply_config`),
-    /// colors reset to those theme values rather than hardcoded xterm
-    /// defaults. This matches the OSC 110/111 pattern where foreground
-    /// and background reset to `configured_foreground`/`configured_background`.
+    /// Handle OSC 104: reset indexed colors (`OSC 104 [; index ...] ST`), all
+    /// 256 when no index is given. Colors reset to the theme palette from
+    /// `apply_config` when one exists, like OSC 110/111's
+    /// `configured_foreground`/`configured_background`.
     pub(super) fn handle_osc_104(&mut self, params: &[&[u8]]) {
         if params.len() <= 1 {
-            // No indices - reset all colors to theme-configured palette
-            // (or xterm defaults if no theme palette is configured).
+            // No indices: reset all to the theme palette, else xterm defaults.
             if let Some(ref configured) = self.color.configured_palette {
                 self.color.palette = configured.clone();
             } else {
                 self.color.palette.reset();
             }
         } else {
-            // Reset specific colors — only fire callback if at least one was valid.
+            // The callback fires only if at least one index was valid.
             let mut any_reset = false;
             for param in &params[1..] {
-                if let Ok(index_str) = std::str::from_utf8(param) {
-                    if let Ok(index) = index_str.parse::<u8>() {
-                        // Reset to theme-configured color if available,
-                        // otherwise to xterm default.
-                        if let Some(ref configured) = self.color.configured_palette {
-                            self.color.palette.set(index, configured.get(index));
-                        } else {
-                            self.color.palette.reset_color(index);
-                        }
-                        any_reset = true;
+                if let Ok(index_str) = std::str::from_utf8(param)
+                    && let Ok(index) = index_str.parse::<u8>()
+                {
+                    if let Some(ref configured) = self.color.configured_palette {
+                        self.color.palette.set(index, configured.get(index));
+                    } else {
+                        self.color.palette.reset_color(index);
                     }
+                    any_reset = true;
                 }
             }
             if !any_reset {
@@ -614,24 +577,17 @@ impl TerminalHandler<'_> {
         );
     }
 
-    /// Handle OSC 30001 - Push color stack (Kitty protocol).
-    ///
-    /// Pushes the current color state onto the stack. The stack has a
-    /// maximum depth of 16 entries; if full, the oldest entry is discarded.
-    ///
-    /// Per the Kitty protocol, all dynamic colors are saved: the 256-color
-    /// palette, default foreground/background, cursor, selection background,
-    /// and selection foreground.
+    /// Handle OSC 30001: push the color state (256-color palette, default
+    /// fg/bg, cursor, selection bg/fg) onto the kitty color stack, max depth
+    /// 16, dropping the oldest entry when full.
     pub(super) fn handle_osc_30001(&mut self) {
         use super::callbacks::COLOR_STACK_MAX_DEPTH;
         use super::grouped_state::ColorStackEntry;
 
-        // If stack is at max depth, evict oldest entry (O(1) with VecDeque)
         if self.color.stack.len() >= COLOR_STACK_MAX_DEPTH {
             self.color.stack.pop_front();
         }
 
-        // Push full color state onto stack
         self.color.stack.push_back(ColorStackEntry {
             palette: self.color.palette.clone(),
             default_foreground: self.color.default_foreground,
@@ -642,12 +598,8 @@ impl TerminalHandler<'_> {
         });
     }
 
-    /// Handle OSC 30101 - Pop color stack (Kitty protocol).
-    ///
-    /// Pops the most recently pushed color state from the stack and restores
-    /// all dynamic colors: palette, default foreground/background, cursor,
-    /// selection background, and selection foreground. If the stack is empty,
-    /// does nothing (no-op).
+    /// Handle OSC 30101: pop the kitty color stack and restore all dynamic
+    /// colors; a no-op when empty.
     pub(super) fn handle_osc_30101(&mut self) {
         if let Some(entry) = self.color.stack.pop_back() {
             self.color.palette = entry.palette;
@@ -674,10 +626,9 @@ impl TerminalHandler<'_> {
                 entry.default_background,
                 super::ColorChangeOp::Set,
             );
-            // Notify UI that cursor color was restored (#7469). Preserve the
-            // distinction between an explicit cursor and the saved dynamic
-            // state: reporting a dynamic cursor as `Set(foreground)` freezes
-            // callback-driven renderers on that transient foreground.
+            // Notify the UI of the restored cursor color, keeping the explicit
+            // vs dynamic distinction: reporting a dynamic cursor as
+            // `Set(foreground)` would freeze renderers on that foreground.
             if let Some(cursor_color) = entry.cursor_color {
                 self.fire_color_change_callback(
                     super::ColorTarget::Cursor,
@@ -691,9 +642,8 @@ impl TerminalHandler<'_> {
                     super::ColorChangeOp::Dynamic,
                 );
             }
-            // Notify UI that selection background was restored (#7469).
-            // A saved None is dynamic—not a reset to today's configured
-            // baseline—so callback consumers can keep following live colors.
+            // Notify the UI of the restored selection background; a saved None
+            // is dynamic, not a reset to the configured baseline.
             if let Some(sel_bg) = entry.selection_background {
                 self.fire_color_change_callback(
                     super::ColorTarget::SelectionBackground,
@@ -726,14 +676,9 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 17 — highlight (selection) background color.
-    ///
-    /// Set format: `OSC 17 ; color-spec ST`
-    /// Query format: `OSC 17 ; ? ST` — responds with current selection background.
-    ///
-    /// Part of the xterm dynamic color family (OSC 10-19). Used by
-    /// applications like vim and tmux to customize selection appearance.
-    /// (#7555)
+    /// Handle OSC 17: highlight (selection) background color. Set with
+    /// `OSC 17 ; color-spec ST`, query with `OSC 17 ; ? ST`. Part of xterm's
+    /// dynamic color family (OSC 10-19).
     pub(super) fn handle_osc_17(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -746,13 +691,11 @@ impl TerminalHandler<'_> {
             return;
         };
         if spec == "?" {
-            // Query: respond with current selection background.
-            // Fall back to the default background if no selection color is set.
             let color = self
                 .color
                 .selection_background
                 .unwrap_or(self.color.default_background);
-            // Match request terminator (BEL vs ST) per xterm behavior (#7548).
+            // Match request terminator (BEL vs ST) per xterm behavior.
             let st = if self.transient.last_osc_bel_terminated {
                 "\x07"
             } else {
@@ -770,10 +713,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Reset the selection (highlight) background color (OSC 117).
-    ///
-    /// Clears the custom selection background, reverting to the terminal's
-    /// default selection appearance. (#7555)
+    /// Reset the selection background color (OSC 117) to the default
+    /// selection appearance.
     pub(super) fn reset_selection_background(&mut self) {
         self.color.selection_background = self.color.configured_selection_background;
         let color = self
@@ -787,10 +728,8 @@ impl TerminalHandler<'_> {
         );
     }
 
-    /// Reset the custom selection foreground color (OSC 119).
-    ///
-    /// Clears the custom selection foreground, reverting to the terminal's
-    /// default selection appearance.
+    /// Reset the selection foreground color (OSC 119) to the default selection
+    /// appearance.
     pub(super) fn reset_selection_foreground(&mut self) {
         self.color.selection_foreground = self.color.configured_selection_foreground;
         let color = self
@@ -833,11 +772,8 @@ impl TerminalHandler<'_> {
         self.fire_color_change_callback(slot.color_target(), color, super::ColorChangeOp::Set);
     }
 
-    /// Reset a dynamic color to its theme-configured default and fire the
-    /// change callback.
-    ///
-    /// Uses the `configured_*` baselines (set by `apply_config`) instead of
-    /// hardcoded constants, so OSC 110/111/112 resets honor the active theme.
+    /// Reset a dynamic color to its theme-configured default (`configured_*`,
+    /// set by `apply_config`) and fire the change callback.
     fn reset_dynamic_color_slot(&mut self, slot: DynamicColorSlot) {
         let color = match slot {
             DynamicColorSlot::Foreground => {
@@ -867,12 +803,10 @@ impl TerminalHandler<'_> {
         color: Rgb,
         op: super::ColorChangeOp,
     ) {
-        // Crossing an OSC color mutation/reset boundary makes the affected
-        // terminal color authoritative for owned render snapshots. Before any
-        // host configuration or OSC mutation, `Terminal::new` deliberately
-        // leaves these channels unset so a standalone renderer can retain its
-        // historical theme fallback. Cursor-dynamic policy is independent of
-        // `cursor_color.is_some()`, hence its own flag.
+        // After an OSC color mutation or reset the affected terminal color is
+        // authoritative for owned render snapshots; `Terminal::new` leaves these
+        // channels unset so a standalone renderer can use its own theme. The
+        // cursor-dynamic policy has its own flag.
         match target {
             super::ColorTarget::Foreground => {
                 self.color.frame_foreground_authoritative = true;
@@ -885,15 +819,10 @@ impl TerminalHandler<'_> {
             }
             _ => {}
         }
-        // Any color SET/RESET (default fg/bg/cursor, an ANSI palette index, the
-        // selection bg, an OSC 104 reset) recolors already-painted cells WITHOUT
-        // changing their content — so mark full grid damage, exactly like DECSCNM
-        // (`set_reverse_video`). This advances `damage_epoch`, so a recolor that
-        // arrives with NO accompanying grid write still bumps the frontend's redraw
-        // key and is presented (otherwise the D-1 early-out swallows it and the
-        // screen keeps the old colors until the next grid write). This helper is
-        // called ONLY on real mutations — color QUERIES emit a PTY response and never
-        // reach here — so it never over-damages on a query.
+        // A color set or reset recolors painted cells without changing content,
+        // so mark full grid damage (like DECSCNM). This advances `damage_epoch`,
+        // so a recolor with no grid write is still presented. Queries never
+        // reach here.
         self.grid.damage_mut().mark_full();
         if let Some(ref mut cb) = self.color.change_callback {
             cb(target, color, op);
@@ -903,20 +832,13 @@ impl TerminalHandler<'_> {
 
 #[cfg(test)]
 mod osc_color_response_cap_tests {
-    //! Regression tests for the per-sequence response cap on OSC palette
-    //! queries (#7883). A single crafted sequence like
-    //! `ESC]4;0;?;1;?;...;255;?ST` could trigger one response write per
-    //! query pair — at 256 queries that is ~5 KiB of PTY back-pressure.
-    //! The cap bounds handler-level single-sequence amplification while
-    //! leaving legitimate small batches untouched.
+    //! The per-sequence response cap on OSC palette queries: a sequence like
+    //! `ESC]4;0;?;1;?;...;255;?ST` must not emit one response per pair, while
+    //! small legitimate batches are untouched.
     //!
-    //! Note: the VT parser itself already truncates OSC sequences at 16
-    //! params (`MAX_OSC_PARAMS`, see `aterm-parser/src/lib.rs`), so the
-    //! worst end-to-end input via `Terminal::process` is ~7 query pairs
-    //! per sequence. These tests therefore exercise the handler directly
-    //! via `split_for_process` so they can feed >16 params and exercise
-    //! the cap. This models defense-in-depth if the parser's `MAX_OSC_PARAMS`
-    //! is ever raised, or if a future OSC carrier delivers more params.
+    //! The parser already truncates OSC sequences at 16 params
+    //! (`MAX_OSC_PARAMS`), so these tests call the handler directly via
+    //! `split_for_process` to feed more params and exercise the cap.
     use super::LEGACY_PALETTE_PER_SEQUENCE_MAX;
     use crate::terminal::Terminal;
     use crate::terminal::response_capability::ResponseCapability;
@@ -938,9 +860,8 @@ mod osc_color_response_cap_tests {
         count
     }
 
-    /// Build params slice-of-slices for OSC 4 with `n` query pairs.
-    /// Returns a pair of owning Vec<String> (backing storage) so callers
-    /// can borrow as `&[&[u8]]` without lifetime issues.
+    /// Build OSC 4 params with `n` query pairs, as owned byte vectors callers
+    /// borrow as `&[&[u8]]`.
     fn build_osc_4_query_params(n: usize) -> Vec<Vec<u8>> {
         let mut params: Vec<Vec<u8>> = Vec::with_capacity(1 + n * 2);
         params.push(b"4".to_vec());
@@ -951,11 +872,9 @@ mod osc_color_response_cap_tests {
         params
     }
 
-    /// A 256-pair OSC 4 query must emit at most `LEGACY_PALETTE_PER_SEQUENCE_MAX`
-    /// response frames; the remainder are silently dropped (#7883).
-    ///
-    /// Bypasses the parser to feed 256 params directly to `handle_osc_4`,
-    /// which is the handler-level defense being tested.
+    /// A 256-pair OSC 4 query emits at most `LEGACY_PALETTE_PER_SEQUENCE_MAX`
+    /// response frames. Calls `handle_osc_4` directly to bypass the parser's
+    /// param limit.
     #[test]
     fn osc_4_query_256_pairs_capped_at_per_sequence_limit() {
         let mut term = Terminal::new(24, 80);
@@ -973,15 +892,13 @@ mod osc_color_response_cap_tests {
         let frames = count_osc_frames(&response);
         assert_eq!(
             frames, LEGACY_PALETTE_PER_SEQUENCE_MAX,
-            "256-pair OSC 4 query must emit exactly {} response frames, got {} (#7883). \
+            "256-pair OSC 4 query must emit exactly {} response frames, got {}. \
              Without the cap this would be 256.",
             LEGACY_PALETTE_PER_SEQUENCE_MAX, frames,
         );
     }
 
-    /// An 8-pair OSC 4 query (below the cap) must emit all 8 responses.
-    /// Guards against an over-broad cap that would break legitimate batches.
-    /// Uses direct handler invocation for consistency with the 256-pair test.
+    /// An 8-pair OSC 4 query (below the cap) emits all 8 responses.
     #[test]
     fn osc_4_query_8_pairs_all_emit_below_cap() {
         let mut term = Terminal::new(24, 80);
@@ -1000,14 +917,12 @@ mod osc_color_response_cap_tests {
         assert_eq!(
             frames, 8,
             "8-pair OSC 4 query (below cap of {}) must emit all 8 response \
-             frames, got {} (#7883)",
+             frames, got {}",
             LEGACY_PALETTE_PER_SEQUENCE_MAX, frames,
         );
     }
 
-    /// A single-query OSC 4 via the real parser must emit exactly one
-    /// response frame. Sanity check that the cap scaffolding does not
-    /// regress the common case end-to-end.
+    /// A single OSC 4 query through the real parser emits exactly one frame.
     #[test]
     fn osc_4_query_single_pair_emits_one_frame() {
         let mut term = Terminal::new(24, 80);
@@ -1021,15 +936,12 @@ mod osc_color_response_cap_tests {
         assert_eq!(frames, 1, "single OSC 4 query must emit exactly 1 frame");
     }
 
-    /// Mixed set+query OSC 4 sequence: once the query cap is hit, remaining
-    /// queries drop silently but later SET operations in the same sequence
-    /// must still apply. Guards against an over-broad cap that would break
-    /// palette mutation batched with queries (#7883).
+    /// Mixed set+query OSC 4: once the query cap is hit, later queries drop but
+    /// later set operations in the same sequence still apply.
     #[test]
     fn osc_4_set_operations_unaffected_by_query_cap() {
         let mut term = Terminal::new(24, 80);
-        // #7937 F01-3: OSC 4 SET is fail-closed by default. This test
-        // exercises the #7883 query-cap/SET interaction, so we must opt in.
+        // OSC 4 set is fail-closed by default; opt in to exercise the query cap.
         term.modes_mut().allow_palette_reconfigure = true;
 
         // Build params: `4`, then LEGACY_PALETTE_PER_SEQUENCE_MAX + 1 query
@@ -1054,23 +966,20 @@ mod osc_color_response_cap_tests {
         assert_eq!(
             frames, LEGACY_PALETTE_PER_SEQUENCE_MAX,
             "query responses must be capped at {} even when mixed with set \
-             operations (#7883)",
+             operations",
             LEGACY_PALETTE_PER_SEQUENCE_MAX,
         );
-        // Verify the SET at the end still applied.
         let (r, g, b) = term.palette_color_components(200);
         assert_eq!(
             (r, g, b),
             (0xff, 0x00, 0x00),
-            "SET operation after the query cap must still apply (#7883)",
+            "SET operation after the query cap must still apply",
         );
     }
 
-    /// OSC 21 with > LEGACY_PALETTE_PER_SEQUENCE_MAX query pairs must bound the
-    /// number of response pairs in the single reply frame (#7883). OSC 21
-    /// emits one response *write*, but the size grows with the number of
-    /// pairs — the cap bounds that size. Invoked via the handler directly
-    /// to exceed the parser's 16-param OSC truncation.
+    /// OSC 21 with more than LEGACY_PALETTE_PER_SEQUENCE_MAX query pairs bounds
+    /// the pairs in its single reply. Calls the handler directly to exceed the
+    /// parser's param limit.
     #[test]
     fn osc_21_query_pairs_capped_at_per_sequence_limit() {
         let mut term = Terminal::new(24, 80);
@@ -1095,16 +1004,13 @@ mod osc_color_response_cap_tests {
         let pair_count = response.iter().filter(|b| **b == b'=').count();
         assert_eq!(
             pair_count, LEGACY_PALETTE_PER_SEQUENCE_MAX,
-            "OSC 21 response must contain exactly {} pairs (cap), got {} (#7883)",
+            "OSC 21 response must contain exactly {} pairs (cap), got {}",
             LEGACY_PALETTE_PER_SEQUENCE_MAX, pair_count,
         );
     }
 
-    /// REGRESSION (integration audit): a bare OSC recolor with NO glyph written
-    /// must mark grid damage so `damage_epoch` advances — otherwise the frontend's
-    /// D-1 redraw early-out (keyed on `damage_epoch`) swallows the recolor and the
-    /// screen keeps the old colors until the next grid write. A color SET/RESET
-    /// recolors already-painted cells, so it is full-screen damage (like DECSCNM).
+    /// A bare OSC recolor with no glyph written marks full grid damage, so
+    /// `damage_epoch` advances and the recolor is presented.
     #[test]
     fn osc_recolor_with_no_glyph_marks_damage_and_advances_epoch() {
         let mut term = Terminal::new(24, 80);
@@ -1117,7 +1023,7 @@ mod osc_color_response_cap_tests {
             "damage consumed by the simulated present"
         );
 
-        // A bare OSC 11 (set default background) with NO accompanying grid write.
+        // A bare OSC 11 (set default background) with no accompanying grid write.
         term.process(b"\x1b]11;rgb:0000/0000/8080\x1b\\");
         assert!(
             term.has_damage(),
@@ -1130,56 +1036,17 @@ mod osc_color_response_cap_tests {
         );
     }
 
-    /// REGRESSION (integration audit): sibling of the recolor swallow — a bare
-    /// cursor visibility (DECTCEM) or shape (DECSCUSR) change with NO grid write must
-    /// mark grid damage so `damage_epoch` advances; otherwise the frontend's D-1
-    /// redraw early-out (whose key carries no engine cursor-visible/shape term)
-    /// swallows it and the cursor's appearance is stale until the next grid write.
-    #[test]
-    fn cursor_visibility_and_shape_changes_mark_damage() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"X");
-        term.take_damage();
-        let e0 = term.damage_epoch();
-        assert!(!term.has_damage());
-
-        // DECTCEM hide (CSI ?25l) — cursor was visible, no glyph written.
-        term.process(b"\x1b[?25l");
-        assert!(term.has_damage(), "DECTCEM hide must mark grid damage");
-        assert_eq!(term.damage_epoch(), e0 + 1, "hide advances damage_epoch");
-
-        // DECSCUSR: set steady block, consume, then steady bar — a real shape change.
-        term.process(b"\x1b[2 q");
-        term.take_damage();
-        let e1 = term.damage_epoch();
-        term.process(b"\x1b[6 q");
-        assert!(
-            term.has_damage(),
-            "DECSCUSR shape change must mark grid damage"
-        );
-        assert_eq!(
-            term.damage_epoch(),
-            e1 + 1,
-            "shape change advances damage_epoch"
-        );
-    }
-
-    /// The cursor-state escapes mark CURSOR-SCOPED damage, never the whole grid.
+    /// Cursor-state escapes mark cursor-scoped damage, never the whole grid.
     ///
-    /// DECTCEM (`ESC[?25l` / `ESC[?25h`), DECSCUSR and DEC mode 12 change only the
-    /// cursor's appearance. They must still advance `damage_epoch` — the frontend's
-    /// redraw early-out is keyed on it and a bare DECTCEM writes no cell — but
-    /// marking the WHOLE grid re-stamps every `row_rev`, and the renderer's stamped
-    /// dirty gate trusts a changed stamp without comparing content, so one cursor
-    /// escape cost a whole-screen raster with no changed cell. Measured on the
-    /// owner's 50-row daily driver: 92% of every full refill. `TERM=xterm-256color`
-    /// spells `cnorm` as `\E[?12l\E[?25h`, so each ncurses `curs_set()` that re-showed
-    /// the cursor paid a whole-screen raster.
+    /// DECTCEM, DECSCUSR and DEC mode 12 change only the cursor's appearance.
+    /// They must advance `damage_epoch` (a bare DECTCEM writes no cell), but
+    /// marking the whole grid would re-stamp every `row_rev` and force a
+    /// whole-screen raster (ncurses `curs_set()` sends `\E[?12l\E[?25h` under
+    /// `xterm-256color`).
     ///
-    /// The VACATED row is deliberately not this layer's job: `aterm-render`'s cursor
-    /// diff marks both `prev_input.cursor_row` and `input.cursor_row` off its own
-    /// `prev_shown != cur_shown` / `prev_style != cur_style` arms, which is what
-    /// makes scoping safe ACROSS A MOVE — the case this test pins.
+    /// The vacated row is `aterm-render`'s job: its cursor diff marks both the
+    /// previous and current cursor rows, which keeps scoping safe across a
+    /// move, the case pinned here.
     #[test]
     fn cursor_state_escapes_damage_the_cursor_cell_not_the_whole_grid() {
         let mut term = Terminal::new(24, 80);
@@ -1196,8 +1063,8 @@ mod osc_color_response_cap_tests {
             "DECTCEM hide must NOT mark the whole grid"
         );
 
-        // A cursor MOVE combined with a visibility change: the mark lands on the
-        // NEW position and is still scoped. CUP is 1-indexed, so this is row 10.
+        // A cursor move combined with a visibility change: the mark lands on the
+        // new position and is still scoped. CUP is 1-indexed, so this is row 10.
         term.take_damage();
         term.process(b"\x1b[11;41H");
         term.take_damage();
@@ -1227,7 +1094,7 @@ mod osc_color_response_cap_tests {
             "DECSCUSR must NOT mark the whole grid"
         );
 
-        // DEC mode 12, the other half of terminfo's `cnorm`. The cursor is a STEADY
+        // DEC mode 12, the other half of terminfo's `cnorm`. The cursor is a steady
         // bar here, so enabling blink is a real style change and must mark damage.
         term.take_damage();
         let e3 = term.damage_epoch();
@@ -1318,6 +1185,26 @@ mod osc_color_response_cap_tests {
                     .to_vec()
             ),
         );
+    }
+
+    /// An unknown key is echoed only when it is spelled like a key: one
+    /// carrying DEL, a space or punctuation, or an over-long one, gets no
+    /// reply pair at all, so OSC 21 cannot type chosen text into the shell.
+    #[test]
+    fn osc_21_unknown_key_is_echoed_only_when_well_formed() {
+        let mut term = Terminal::new(4, 8);
+        let long = "k".repeat(super::MAX_OSC21_ECHO_KEY_BYTES + 1);
+        let seq = format!(
+            "\x1b]21;rm\x7f-rf=?;echo pwned=?;a/b=?;{long}=?;transparent_background_color1=?\x1b\\"
+        );
+        term.process(seq.as_bytes());
+        assert_eq!(
+            term.take_response(),
+            Some(b"\x1b]21;transparent_background_color1=?\x1b\\".to_vec()),
+        );
+
+        term.process(b"\x1b]21;bad key=?;x\x7f=?\x1b\\");
+        assert_eq!(term.take_response(), None, "nothing echoable, no reply");
     }
 
     /// A host query callback remains authoritative even when the core cursor

@@ -1,0 +1,2737 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use super::*;
+
+fn ro(cmd: &str) -> bool {
+    classify_command(cmd).read_only
+}
+
+/// The corpus from the session that shaped the rules: each line was a real
+/// worker prompt, each verdict the one the manager gave.
+#[test]
+fn the_session_corpus_classifies_as_the_manager_did() {
+    let corpus: &[(&str, bool)] = &[
+        (
+            "git status --short --branch && git pull 2>&1 | tail -20",
+            false,
+        ),
+        (
+            "git show --stat --format='%h %ad %s' d48f | head -60; echo ----; git log --oneline --all --grep='handoff' -i | head -20",
+            true,
+        ),
+        (
+            "echo \"== x ==\"; for f in /tmp/a b; do if [ -e \"$f\" ]; then echo \"PRESENT $f ($(stat -f '%Sm' \"$f\"))\"; else echo MISSING; fi; done; uptime; df -h ~ | tail -1",
+            true,
+        ),
+        (
+            "timeout 120 python3 scripts/sat2026_standing.py 2>&1 | tail -40",
+            // A script is not a read by default (DEFAULT_PYTHON_ALLOW is
+            // empty); `the_python_allowlist_is_opt_in` pins it opted in.
+            false,
+        ),
+        (
+            "find ~ -maxdepth 5 -name 'x.sh' -not -path '*/Library/*' 2>/dev/null | head",
+            true,
+        ),
+        ("find ~ -name '*.stage' -delete", false),
+        ("rm -rf ~/x/*.stage", false),
+        ("ls ~/x | xargs rm", false),
+        ("cat a.txt > b.txt", false),
+        ("git log -3 && git push origin main", false),
+        ("targo --unverified build --release", false),
+        ("python3 -c 'import os; os.remove(\"x\")'", false),
+        ("git stash list; git branch -a", true),
+        ("sed -i '' 's/a/b/' file", false),
+        (
+            "cd ~/ay && grep -rn 'x' reports/H.md | head -3; git -C ~/veripb-alab log -3 --format='%h' 2>/dev/null || ls -d ~/*veripb* 2>/dev/null",
+            true,
+        ),
+        (
+            "ps -Ao pid=,etime=,args= | grep -iE 'bank' | grep -v grep | head; ls /Volumes",
+            true,
+        ),
+        (
+            "git log -1 --format='%h %an <%ae> %ad%n%(trailers)' --date=iso 2769; ls ~/ay/proofs | wc -l",
+            true,
+        ),
+        (
+            "perl -e 'alarm 110; exec @ARGV' find / -xdev \\( -name 'a.json' -o -name 'b.tsv' \\) -not -path '/System/*' 2>/dev/null; echo \"find-exit=$?\"",
+            true,
+        ),
+        (
+            "find benchmarks/sat -type f \\( -name '*.cnf' -o -name '*.cnf.xz' \\) -exec du -k {} + | sort -rn | head -40",
+            true,
+        ),
+        (
+            "wc -l $(grep -rl 'x' crates --include='*.rs' | head -3) 2>/dev/null | tail -4",
+            true,
+        ),
+        (
+            "tmutil listlocalsnapshots / | head; tmutil destinationinfo | head -8",
+            true,
+        ),
+        ("python3 - <<'EOF'\nimport json\nEOF", false),
+    ];
+    for (cmd, want) in corpus {
+        let v = classify_command(cmd);
+        assert_eq!(
+            v.read_only, *want,
+            "{cmd:?}: expected read_only={want}, got {v:?}"
+        );
+    }
+}
+
+/// The reason names the rule, so a notes file explains each hand-off.
+#[test]
+fn reasons_name_the_deciding_rule() {
+    assert_eq!(
+        classify_command("git log -3 && git push origin main").reason,
+        "git push"
+    );
+    assert_eq!(
+        classify_command("cat a.txt > b.txt").reason,
+        "redirect > b.txt"
+    );
+    assert_eq!(classify_command("ls ~/x | xargs rm").reason, "xargs rm");
+    assert_eq!(
+        classify_command("find ~ -name '*.stage' -delete").reason,
+        "find -delete"
+    );
+    assert_eq!(classify_command("sed -i '' 's/a/b/' file").reason, "sed -i");
+    assert_eq!(classify_command("python3 -c 'x'").reason, "python3 -c");
+    assert_eq!(
+        classify_command("python3 - <<'EOF'\nx\nEOF").reason,
+        "python3 heredoc"
+    );
+    assert_eq!(
+        classify_command("find . -exec rm {} \\;").reason,
+        "find -exec rm"
+    );
+    assert_eq!(
+        classify_command("./run.sh").reason,
+        "./run.sh (a program named by path)"
+    );
+    assert_eq!(classify_command("run.sh").reason, "run.sh");
+    assert_eq!(classify_command("git").reason, "git without a subcommand");
+    assert_eq!(classify_command("git stash").reason, "git stash");
+    assert_eq!(
+        classify_command("git worktree add ../x").reason,
+        "git worktree add"
+    );
+    assert!(classify_command("ls").reason.contains("read-only"));
+}
+
+/// (b): a `>` inside a quoted string is data; a redirect to /dev/null and a
+/// descriptor dup are not writes; an unquoted `>` is.
+#[test]
+fn quotes_hide_redirect_glyphs_but_not_substitutions() {
+    assert!(ro("git log --format='%h <%ae> -> %s' | head"));
+    assert!(ro("grep x file 2>/dev/null; ls >/dev/null 2>&1"));
+    assert!(!ro("ls >> log.txt"));
+    assert!(!ro("ls 2> err.txt"));
+    assert!(!ro("ls &> all.txt"));
+    // A substitution inside double quotes still runs, so it is still judged.
+    assert!(!ro("echo \"now: $(rm -rf x)\""));
+    assert!(ro("echo \"now: $(date)\""));
+    // A quoted danger word is data.
+    assert!(ro("grep -n 'rm -rf' notes.md"));
+    assert!(ro("echo \"git push later\""));
+}
+
+/// (a): the alarm wrapper is stripped, with either quote; any other `perl -e`
+/// is inline code and refused.
+#[test]
+fn the_alarm_idiom_is_a_wrapper_not_a_program() {
+    assert!(ro("perl -e \"alarm 30; exec @ARGV\" ls -la"));
+    assert!(ro("perl -e 'alarm 30; exec @ARGV' git status"));
+    assert!(!ro("perl -e 'alarm 30; exec @ARGV' rm -rf x"));
+    assert!(!ro("perl -e 'unlink \"x\"'"));
+    assert_eq!(classify_command("perl -e 'print 1'").reason, "perl -e");
+}
+
+/// (c): danger tokens anywhere, including behind a path and behind a shell
+/// keyword, and the inline-code interpreters.
+#[test]
+fn danger_tokens_anywhere_fail_the_line() {
+    assert!(!ro("ls | xargs /bin/rm"));
+    assert!(!ro("for f in *; do rm $f; done"));
+    assert!(!ro("if true; then cp a b; fi"));
+    assert!(!ro("bash -c 'ls'"));
+    assert!(!ro("sh -c ls"));
+    assert!(!ro("zsh -c 'echo hi'"));
+    assert!(!ro("eval ls"));
+    assert!(!ro("source ~/.zshrc"));
+    assert!(!ro(". ~/.zshrc"));
+    assert!(!ro("sudo ls"));
+    assert!(!ro("kill -9 123"));
+    assert!(!ro("open ."));
+    assert!(!ro("curl https://x.y"));
+    assert!(!ro("tee out.txt"));
+    assert!(!ro("nohup ls &"));
+    assert!(!ro("git -C ~/x commit -m x"));
+    assert!(!ro("git -c core.pager=cat fetch origin"));
+    assert!(!ro("git worktree prune"));
+    assert!(!ro("git worktree remove x"));
+    assert!(!ro("find . -execdir mv {} /tmp \\;"));
+    assert!(!ro("find . -ok rm {} \\;"));
+    assert!(!ro("sed -Ei 's/a/b/' f"));
+    assert!(!ro("sed --in-place 's/a/b/' f"));
+}
+
+/// (d): an unknown head is not read-only even with no danger token;
+/// keyword laundering (`do <cmd>`) is seen through; git needs a read
+/// subcommand; read subcommands' write forms are refused.
+#[test]
+fn segment_heads_must_be_known_reads() {
+    assert!(!ro("./deploy.sh"));
+    assert!(!ro("for f in *; do ./x.sh $f; done"));
+    assert!(!ro("if true; then exec claude; fi"));
+    assert!(ro("for f in *; do ls $f; done"));
+    assert!(ro("VAR=1 OTHER=2 ls"));
+    assert!(ro("timeout 5 ls; timeout -k 1 5 git status"));
+    assert!(ro("git -C ~/x --no-pager log -1"));
+    assert!(!ro("git --git-dir=.git status"));
+    assert!(ro("git worktree list; git stash list"));
+    assert!(!ro("git worktree"));
+    assert!(!ro("git branch -D old"));
+    assert!(!ro("git branch -m new"));
+    assert!(!ro("git tag v1.0"));
+    assert!(!ro("git tag -d v1.0"));
+    assert!(ro("git tag -l 'v*'"));
+    assert!(ro("git tag --contains abc"));
+    assert!(!ro("git remote add x url"));
+    assert!(ro("git remote -v; git remote show origin"));
+    assert!(!ro("git config user.name Bob"));
+    assert!(!ro("git config --unset user.name"));
+    assert!(ro("git config --get user.name; git config --list"));
+    assert!(!ro("tmutil deletelocalsnapshots 2026-01-01"));
+    assert!(!ro("tmutil"));
+    assert!(!ro("python3 scripts/wipe.py"));
+    assert!(!ro("python3 scripts/sat_score_table.py"));
+    assert!(!ro("python3 -m http.server"));
+    assert!(!ro("python3"));
+    // The caller's allowlist replaces the default.
+    let allow = ["tools/*.py".to_string()];
+    assert!(classify_command_with("python3 tools/audit.py", &allow).read_only);
+    assert!(!classify_command_with("python3 scripts/sat2026_standing.py", &allow).read_only);
+    assert!(!ro("echo hi; ruby -e 'puts 1'"));
+    assert!(ro("[ -d x ] && echo yes || echo no"));
+    assert!(ro("[[ -d x ]] && true"));
+    assert!(ro("test -f x && cat x"));
+    assert!(ro("which rg; type -a git; env | sort"));
+    assert!(ro("ls\ncat x"));
+    assert!(!ro("ls\nmake"));
+    assert!(!ro("ls `rm x`"));
+    assert!(!ro(""));
+    assert_eq!(classify_command("   ").reason, "empty command");
+}
+
+/// Write forms an adversarial pass found classified read-only, each refused
+/// with its deciding rule, and the neighbours that must stay reads.
+#[test]
+fn a_wrapper_cannot_launder_the_program_it_runs() {
+    assert_eq!(classify_command("ls | xargs touch").reason, "touch");
+    assert_eq!(
+        classify_command("find . -name '*.log' | xargs -n1 ./deploy.sh").reason,
+        "./deploy.sh (a program named by path)"
+    );
+    assert!(!ro("echo x | xargs python3 evil.py"));
+    assert!(!ro("ls | xargs -I {} sh -c 'cat {}'"));
+    assert!(ro("ls | xargs -n1 wc -l"));
+    assert!(ro("ls | xargs -0 -I {} cat {}"));
+    assert!(ro("ls | xargs"));
+    assert_eq!(
+        classify_command("env FOO=1 ./deploy.sh").reason,
+        "./deploy.sh (a program named by path)"
+    );
+    assert_eq!(classify_command("env touch /tmp/x").reason, "touch");
+    assert!(!ro("env -S 'rm x'"));
+    assert!(!ro("/usr/bin/env python3 wipe.py"));
+    assert!(ro("env FOO=1 ls; env -i PATH=/bin ls; env -u HOME ls"));
+    assert!(ro("env | sort"));
+    assert!(ro("timeout 5 env FOO=1 git status"));
+    assert!(!ro("timeout 5 xargs ./x.sh"));
+    // `env -P` picks the program from a directory: a system one is the
+    // named program, any other is the line's choice.
+    assert!(ro("env -P /usr/bin git status"));
+    for line in [
+        "env -P /tmp/evil git status",
+        "env -P/tmp/evil git status",
+        "env -iP /tmp/evil ls",
+        "env -P /bin:/tmp/evil ls",
+    ] {
+        assert!(!ro(line), "{line}");
+        assert!(classify_command(line).reason.contains("env -P"), "{line}");
+    }
+    // Short options cluster as getopt reads them: `-iC..` is `-i -C ..`,
+    // and a capital S inside a value is no `-S`.
+    assert!(ro("env -iC.. git status"));
+    assert!(ro("env -iC .. git status"));
+    assert!(ro("env -uSOME ls"));
+    assert!(!ro("env -iS 'rm x'"));
+    assert!(!ro("env --split-string='rm x'"));
+}
+
+#[test]
+fn a_backgrounded_command_is_a_head_and_a_redirect_ampersand_is_not() {
+    assert_eq!(
+        classify_command("ls & ./deploy.sh").reason,
+        "./deploy.sh (a program named by path)"
+    );
+    assert_eq!(classify_command("ls & touch /tmp/x").reason, "touch");
+    assert!(ro("ls & wc -l x"));
+    assert!(ro("ls >/dev/null 2>&1 & echo done"));
+    assert!(ro("ls &> /dev/null"));
+    assert!(!ro("ls &> all.txt"));
+    assert!(ro("cat <&3 2>&1"));
+}
+
+#[test]
+fn a_backtick_inside_double_quotes_still_runs() {
+    assert_eq!(classify_command("echo \"now: `rm -rf x`\"").reason, "rm");
+    assert!(ro("echo \"now: `date`\""));
+    assert_eq!(
+        strip_quotes("echo \"a `date` b\""),
+        format!("echo \"\"{QUOTE_SUB_MARK}`date`")
+    );
+}
+
+#[test]
+fn the_alarm_idiom_is_exactly_alarm_then_exec() {
+    assert!(!ro(
+        "perl -e 'alarm 5; system(\"rm -rf x\"); exec @ARGV' ls"
+    ));
+    assert_eq!(
+        classify_command("perl -e 'alarm 5; unlink \"x\"; exec @ARGV' ls").reason,
+        "perl -e"
+    );
+    assert!(ro("perl -e 'alarm 5 ; exec @ARGV;' ls"));
+    assert!(ro("perl -e \"alarm 110;exec @ARGV\" git status"));
+    assert!(is_alarm_body("alarm 30; exec @ARGV"));
+    assert!(is_alarm_body(" alarm 30 ; exec @ARGV ; "));
+    assert!(!is_alarm_body("alarm 30; exec @ARGV; print 1"));
+    assert!(!is_alarm_body("alarm; exec @ARGV"));
+    assert!(!is_alarm_body("alarm 5; system('x'); exec @ARGV"));
+}
+
+#[test]
+fn git_branch_creation_and_remote_set_branches_are_writes() {
+    assert!(!ro("git branch feature-x"));
+    assert!(!ro("git branch -f main HEAD~3"));
+    assert!(!ro("git branch --force main HEAD~3"));
+    assert!(!ro("git branch --track x origin/x"));
+    assert!(!ro("git branch -t x origin/x"));
+    assert!(!ro("git branch --set-upstream-to=origin/x"));
+    assert!(!ro("git branch -u origin/x"));
+    assert!(!ro("git branch --create-reflog x"));
+    assert_eq!(
+        classify_command("git branch feature-x").reason,
+        "git branch (write form)"
+    );
+    assert!(ro("git branch"));
+    assert!(ro(
+        "git branch -a; git branch -r; git branch -avv; git branch -vv"
+    ));
+    assert!(ro("git branch --list 'feat/*'; git branch -l"));
+    assert!(ro("git branch --contains abc; git branch --merged main"));
+    assert!(ro("git branch --show-current; git branch --points-at HEAD"));
+    assert!(ro("git branch --format='%(refname:short)'"));
+    assert!(!ro("git remote set-branches origin main"));
+    assert!(!ro("git remote set-branches --add origin main"));
+    assert!(ro("git remote get-url origin"));
+}
+
+/// Shell arithmetic expands an array subscript held in a variable's value
+/// and runs its substitution from behind an opaque quote. Every form
+/// evaluating arithmetic on a non-literal is refused; literal forms stay
+/// reads (negative controls).
+#[test]
+fn arithmetic_that_can_expand_a_subscript_is_not_a_read() {
+    for line in [
+        "let 'x=a[$(touch M)]'",
+        "local -i x=1",
+        "[[ 'a[$(touch M)]' -eq 1 ]]",
+        "x='a[$(touch M)]'; [[ $x -lt 1 ]]",
+        "if [[ $n -ge 2 ]]; then echo big; fi",
+        "[[ -v a[x] ]]",
+        "[ -v 'a[$(touch M)]' ]",
+        "test -v 'a[$(touch M)]'",
+        "x='a[$(touch M)]'; echo ${a[x]}",
+        "x='a[$(touch M)]'; echo ${#a[x]}",
+        "x='a[$(touch M)]'; echo \"${a[$x]}\"",
+        "x='a[$(touch M)]'; echo ${y:x}",
+        "x='a[$(touch M)]'; echo ${y:0:x}",
+        "x='a[$(touch M)]'; echo ${a[@]:x}",
+        "x='a[$(touch M)]'; echo $[x]",
+        "x='a[$(touch M)]'; echo \"$[x]\"",
+        "x='a[$(touch M)]'; a=(1 2); echo $a[x]",
+        "echo ${(e)x}",
+        "cat <<EOF\n${a[x]}\nEOF",
+        "cat <<EOF\n$a[x]\nEOF",
+    ] {
+        let v = classify_command(line);
+        assert!(!v.read_only, "{line:?} read-only ({})", v.reason);
+    }
+    // Negative controls: literal subscripts and offsets, the default
+    // forms, the pattern forms, `[`/`test` comparing integers, `[[`
+    // comparing strings, and a quoted here-document body.
+    for line in [
+        "echo ${PIPESTATUS[0]} ${X[@]} ${#X[*]} ${a[-1]}",
+        "echo ${y:1} ${y: -2} ${y:1:3} ${a[@]:1:2}",
+        "echo ${X:-default} ${X:+set} ${X:?unset} ${#X} ${#} ${!}",
+        "echo ${f%.rs} ${f##*/} ${f/a/b} ${!pre*}",
+        "[ \"$n\" -eq 1 ] && echo one; test \"$n\" -gt 2",
+        "[[ $a == b* ]] && echo match",
+        "cat <<'EOF'\n${a[x]} $[x]\nEOF",
+        "cat <<EOF\n${HOME} and $USER\nEOF",
+        "echo 'a[$x]' \"$HOME\"",
+    ] {
+        let v = classify_command(line);
+        assert!(v.read_only, "{line:?} refused: {}", v.reason);
+    }
+}
+
+/// Repository-config hazards (`core.fsmonitor`, `diff.external`, textconv)
+/// are checked on the machine (`policy::git_config`), not here. Refused
+/// here: a repository named on the line (`--git-dir`, `--work-tree`) and
+/// flags that run filter and textconv drivers on purpose. `-C` stays a read.
+#[test]
+fn git_reads_of_a_chosen_repository_or_through_its_drivers_are_refused() {
+    for line in [
+        "git --git-dir=/tmp/evil status",
+        "git --git-dir /tmp/evil log",
+        "git --work-tree=/tmp/x diff",
+        "git cat-file --filters HEAD:x",
+        "git cat-file --textconv HEAD:x",
+        "git log -p --textconv -1",
+    ] {
+        assert!(!ro(line), "{line}");
+    }
+    assert!(ro("git -C /tmp/x status"));
+    assert!(ro("git cat-file -p HEAD:x; git log -p -1"));
+}
+
+/// Read tools' write forms: `git branch -v <name>` creates, `sysctl` sets
+/// with `=`/`-w`, `hostname` sets with an operand or `-F`, `file -C` writes
+/// `magic.mgc`, `tree -R` writes `00Tree.html`, and `<>` opens read-write.
+#[test]
+fn the_write_forms_of_system_reads_are_refused() {
+    for line in [
+        "git branch -v newb1",
+        "git branch --verbose newb2",
+        "git branch -vv nb6",
+        "sysctl kern.maxfiles=1",
+        "sysctl -w kern.maxfiles=1",
+        "hostname evil",
+        "hostname -F /tmp/name",
+        "file -C -m /tmp/magic",
+        "file -bC x",
+        "tree -R -H . -L 1",
+        "cat <>new.txt",
+        "exec 3<>/tmp/x",
+    ] {
+        assert!(!ro(line), "{line}");
+    }
+    // Negative controls: the list and query forms.
+    for line in [
+        "git branch -v; git branch -vv; git branch -av; git branch -v --list 'f*'",
+        "sysctl -n hw.ncpu; sysctl kern.maxfiles",
+        "hostname; hostname -s 2>/dev/null",
+        "file -b x; file --mime-type x",
+        "tree -L 2 -a",
+        "cat < in.txt",
+    ] {
+        let v = classify_command(line);
+        assert!(v.read_only, "{line} refused: {}", v.reason);
+    }
+}
+
+#[test]
+fn output_file_flags_of_the_read_tools_are_writes() {
+    assert_eq!(
+        classify_command("sort -o /etc/hosts /etc/hosts").reason,
+        "sort -o"
+    );
+    assert!(!ro("sort --output=x f"));
+    assert!(!ro("sort --output x f"));
+    assert!(!ro("sort -ro out.txt f"));
+    assert!(ro("sort -rn f | head; sort -t: -k2 f; sort -u f"));
+    assert_eq!(
+        classify_command("uniq in.txt out.txt").reason,
+        "uniq <output file>"
+    );
+    assert!(ro(
+        "uniq -c in.txt; sort x | uniq -c | sort -rn; uniq -f 1 in.txt"
+    ));
+    assert!(!ro("uniq -f 1 in.txt out.txt"));
+    assert_eq!(classify_command("tree -o /tmp/out.txt").reason, "tree -o");
+    assert!(ro("tree -L 2 -a"));
+    assert_eq!(
+        classify_command("find . -newer x -fprint /tmp/out").reason,
+        "find -fprint"
+    );
+    assert!(!ro("find . -fprintf /tmp/o '%p\\n'"));
+    assert!(!ro("find . -fls /tmp/o"));
+    assert!(!ro("find . -fprint0 /tmp/o"));
+    assert!(ro("find . -name '*.rs' -print0 | xargs -0 wc -l"));
+}
+
+#[test]
+fn a_python_path_cannot_step_out_of_the_allowlist() {
+    assert!(!ro("python3 scripts/../../tmp/evil_score.py"));
+    assert!(
+        classify_command("python3 scripts/../../tmp/evil_score.py")
+            .reason
+            .contains("`..`")
+    );
+    let allow: Vec<String> = ["scripts/*score*.py", "scripts/*report*.py"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let ro_with = |cmd: &str| classify_command_with(cmd, &allow).read_only;
+    assert!(!ro_with("python3 scripts/../../tmp/evil_score.py"));
+    assert!(!ro_with("python3 scripts/x/../wipe_report.py"));
+    assert!(ro_with("python3 scripts/sat_score_table.py"));
+    assert!(ro_with("python3 scripts/sub/report_x.py"));
+}
+
+/// The awk program and the sed script are read from the raw words: what
+/// the quote-stripped scan cannot see.
+#[test]
+fn awk_programs_and_sed_scripts_are_read_not_dropped() {
+    assert!(!ro("awk 'BEGIN{system(\"rm -rf x\")}'"));
+    assert!(!ro("awk '{print > \"out\"}' f"));
+    assert!(!ro("awk '{print $1 > out}' f"));
+    assert!(!ro("awk '{print >> \"out\"}' f"));
+    assert!(!ro("awk '{print | \"sh\"}' f"));
+    assert!(!ro("awk '{print |& \"sh\"}' f"));
+    assert!(!ro("awk -f prog.awk f"));
+    assert!(!ro("ls | xargs awk 'BEGIN{system(\"rm x\")}'"));
+    assert!(!ro("echo \"$(awk 'BEGIN{system(\"rm x\")}')\""));
+    assert!(ro("awk -F: '{print $1}' /etc/passwd"));
+    assert!(ro("awk '$3 > 100 {print $1}' f"));
+    assert!(ro("awk '$1 > $2' f; awk 'NR>1' f; awk '$3 >= 4' f"));
+    assert!(ro("awk '/foo|bar/' f; awk '/a/ || /b/ {print}' f"));
+    // A `>` against a variable could be `print > out`: refused on purpose
+    // (a read handed over costs a glance; a write approved does not).
+    assert!(!ro("awk -v n=3 'NR > n' f"));
+    assert!(ro("awk '{print \"a>b|c\"}' f"));
+    assert!(ro("awk '{ s += $1 } END { print s / NR }' f"));
+
+    assert!(!ro("sed 's/a/b/w /tmp/out' file"));
+    assert!(!ro("sed -n '/x/w out' f"));
+    assert!(!ro("sed 's/a/b/e' f"));
+    assert!(!ro("sed '1e date' f"));
+    assert!(!ro("sed -f script.sed f"));
+    assert!(!ro("sed -e 's/a/b/' -e 'w out' f"));
+    assert!(!ro("sed -ne 's/a/b/w out' f"));
+    assert!(!ro("sed --expression='w out' f"));
+    assert_eq!(
+        classify_command("sed 's/a/b/w /tmp/out' file").reason,
+        "sed s///w (writes a file)"
+    );
+    assert!(ro("sed -n 's/new/old/p' f"));
+    assert!(ro("sed -e 's/a/b/g' -e '/^$/d' f"));
+    assert!(ro("sed '1,10p;$!d' f; sed -n '5,$p' f; sed '/^#/d' f"));
+    assert!(ro("sed -E 's/(a|b)+/x/' f; sed 's|/usr|/opt|' f"));
+    assert!(ro("sed 's/w/e/; s/e/w/g' f"));
+    assert!(ro("sed -n '/start/,/end/{p}' f; sed 'y/abc/xyz/' f"));
+    assert!(ro("sed '$!N;P;D' f; sed -n '$=' f; sed 2q f"));
+    assert!(ro("sed -e '1i\\header' f"));
+    assert_eq!(sed_script_writes("s/a/b/"), None);
+    assert_eq!(
+        sed_script_writes("/x/w out").as_deref(),
+        Some("sed w (writes a file)")
+    );
+    assert!(
+        sed_script_writes("s/a/b").is_some(),
+        "unterminated is unparsed"
+    );
+    assert!(
+        sed_script_writes("1,3").is_some(),
+        "an address without a command is unparsed"
+    );
+    assert!(
+        sed_script_writes("k").is_some(),
+        "an unknown command is unparsed"
+    );
+}
+
+/// A substitution is a word of its command here too, its body's words a
+/// segment of their own, first; a parameter is a substitution too.
+#[test]
+fn program_words_resolve_quotes_and_split_where_the_segments_do() {
+    assert_eq!(
+        program_words("awk 'a b' \"c $x\" d\\ e | grep x; echo `date`"),
+        vec![
+            vec!["awk", "a b", "c $…", "d e"],
+            vec!["grep", "x"],
+            vec!["date"],
+            vec!["echo", SUBSTITUTION],
+        ]
+    );
+    assert_eq!(
+        program_words("echo \"x $(stat -f '%m' \"$f\") y\""),
+        vec![vec!["stat", "-f", "%m", "$…"], vec!["echo", "x $… y"]]
+    );
+    assert_eq!(
+        program_words("awk \"$(cat p.awk)\" f; a$(b)c"),
+        vec![
+            vec!["cat", "p.awk"],
+            vec!["awk", SUBSTITUTION, "f"],
+            vec!["b"],
+            vec!["a$…c"],
+        ]
+    );
+    assert_eq!(
+        program_words("echo \"a \\\" b\" 'c\\d' '$x' \\$y"),
+        vec![vec!["echo", "a \" b", "c\\d", "$x", "$y"]]
+    );
+}
+
+/// Lines that must not classify read-only, each a write or a program of
+/// the line's choosing. `⏎` is a newline here.
+#[test]
+fn the_measured_bypasses_are_not_read_only() {
+    let bypasses = [
+        "git log --oneline -3 # what's new\ngit push --force",
+        "ls # don't worry\nmv a b",
+        "ls # don't\nrm -rf \"$S/x\"",
+        "ls # it's\nrm -rf / # '",
+        "cat <<EOF\necho '\nEOF\nrm -rf /",
+        "echo $'a\\'b'\nrm -rf /\necho '",
+        "rm>/dev/null -rf /",
+        "ls >&out.txt",
+        "git diff --output=/Users/_owner/.zshrc",
+        "git log --output=/tmp/x",
+        "git -c core.fsmonitor='touch /tmp/pwn' status",
+        "git -c core.pager='sh -c \"rm -rf ~\"' log",
+        "git -C ~/x -c core.pager=cat log",
+        "git grep -O\"touch /tmp/x\" foo",
+        "git diff --ext-diff",
+        "rg --pre ./x.sh foo",
+        "rg --pre=./x.sh foo",
+        "sort --compress-program=./x.sh f",
+        "/tmp/evil/ls",
+        "./ls",
+        "env -i PATH=/tmp/evil ls",
+        "printf -v PATH /evil",
+        "export PATH=/tmp/evil:$PATH; ls",
+        "PATH=/tmp/evil ls",
+        "GIT_EXTERNAL_DIFF=./x.sh git diff",
+        "HOME=/tmp/evil git log",
+        "less +!touch\\ x file",
+        "less -o copy.txt file",
+        "date -s 12:00",
+        "date 0101120026",
+        "python3 scripts/purge_report.py --delete-all",
+        "ls $'x\\ny'",
+        "echo ${x:-$(rm -rf y)}",
+        "echo \"unterminated",
+        "cat <<EOF\n$(rm -rf x)\nEOF",
+        "cat <<EOF",
+        "awk>/dev/null 'BEGIN{system(\"rm x\")}'",
+    ];
+    for cmd in bypasses {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+}
+
+/// `git grep -O`/`--open-files-in-pager` runs the pager without a terminal,
+/// in any cluster or abbreviation; `git <sub> --help`, `git --help <sub>`
+/// and `git -h <sub>` run the configured viewer. Negative controls: an `O`
+/// that is a pattern or value, and other long options, stay reads.
+#[test]
+fn git_grep_pager_spellings_and_git_help_are_not_read_only() {
+    for cmd in [
+        "git grep -nO hello",
+        "git grep -iO hello",
+        "git grep -iOless hello",
+        "git grep -3O hello",
+        "git grep --open hello",
+        "git grep --op hello",
+        "git grep --open-files hello",
+        "git grep --o hello",
+        "git grep --open=less hello",
+        "git log --help",
+        "git status --help",
+        "git grep --help",
+        "git stash --help",
+        "git --help log",
+        "git -h log",
+        "git -C . log --help",
+        "git --no-pager log --help",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in [
+        "git grep -eOops x",
+        "git grep -A1 -n hello",
+        "git grep -n hello",
+        "git grep --only-matching hello",
+        "git grep --or -e a -e b",
+        "git log -h",
+        "git log --oneline",
+    ] {
+        assert!(ro(cmd), "{cmd:?} stays a read: {:?}", classify_command(cmd));
+    }
+}
+
+/// Negative controls for the pre-pass: shapes it reads rather than refuses
+/// stay reads.
+#[test]
+fn comments_heredocs_and_quoting_that_only_read_stay_reads() {
+    assert!(ro("git log --oneline -3 # what's new"));
+    assert!(ro("ls # don't worry\ncat x"));
+    assert!(ro("cat <<'EOF'\n$(this is data)\nEOF"));
+    assert!(ro("cat <<EOF\nplain body with 'quote\nEOF\nls"));
+    assert!(ro("grep -c x <<-EOF\n\tbody\n\tEOF"));
+    assert!(ro("cat <<< 'here string'"));
+    assert!(ro("echo $'plain'; echo $\"x\""));
+    assert!(ro("echo ${HOME} ${x:-y} ${#x}"));
+    assert!(ro("echo \"#not a comment\" x#y $#"));
+    assert!(ro("ls >&2; ls 2>&1; ls >&-"));
+    assert!(ro("ls>/dev/null"));
+    // A body under a quoted terminator is never expanded.
+    assert_eq!(
+        prelex("cat <<'EOF'\n$(rm x)\nEOF\nls").as_deref(),
+        Ok("cat <<'EOF'\nls")
+    );
+    assert_eq!(prelex("ls # a 'b\ncat").as_deref(), Ok("ls \ncat"));
+    assert!(prelex("cat <<EOF\n$(rm x)\nEOF").is_err());
+    // A here-document still feeds an interpreter its program.
+    assert!(!ro("python3 <<'EOF'\nprint(1)\nEOF"));
+    assert!(!ro("bash <<'EOF'\nls\nEOF"));
+}
+
+/// A program word is judged where it runs: as an argument it is data; at a
+/// head (also behind a wrapper, keyword or substitution) it is the program.
+#[test]
+fn a_program_word_is_judged_only_at_a_head() {
+    assert!(ro("grep -rn open src"));
+    assert!(ro("rg -n make Cargo.toml"));
+    assert!(ro("grep -c kill crates"));
+    assert!(ro("git log --author make"));
+    assert!(ro("echo rm; grep 'rm -rf' notes.md"));
+    assert!(!ro("open src"));
+    assert!(!ro("ls; make"));
+    assert!(!ro("ls | xargs kill"));
+    assert!(!ro("timeout 5 rm x"));
+    assert!(!ro("env rm x"));
+    assert!(!ro("for f in *; do make; done"));
+    assert!(!ro("echo $(make)"));
+    assert!(!ro("ls & open ."));
+    assert_eq!(classify_command("ls; make").reason, "make");
+}
+
+#[test]
+fn the_added_reads_are_reads_and_their_neighbours_are_not() {
+    assert!(ro(
+        "pgrep -f aterm; sleep 5; strings /bin/ls | head; lsof -p 1"
+    ));
+    assert!(ro("uname -a; whoami; id; sw_vers; fold -w 80 f"));
+    assert!(ro("trustc -vV; rustc --version; trustc --print sysroot"));
+    assert!(!ro("trustc x.rs"));
+    assert!(!ro("trustc -vV x.rs"));
+    assert!(!ro("trustc"));
+    assert!(!ro("pkill aterm"));
+    assert!(ro("env -i PATH=/bin:/usr/bin ls"));
+    assert!(ro(
+        "date +%s; date -u; date -r 1700000000; date -j -f %s 1 +%Y"
+    ));
+    assert!(ro("less -R f; more f; printf '%s\\n' x"));
+    assert!(ro("git log -3 --format=%h; git -C ~/x --no-pager log -1"));
+    assert!(ro("rg --pre-glob '*.gz' x; sort -rn f"));
+    assert!(ro("/bin/ls; /usr/bin/wc -l f"));
+    assert!(!ro("/bin/x/ls"));
+    assert!(ro("FOO=1 ls; LC_ALL=C sort f"));
+    assert!(ro("date 2>/dev/null; date +%s 2> /dev/null"));
+    assert!(!ro("date 2>/dev/null 0101120026"));
+    // `time` is seen through like `timeout`, and an assignment after a
+    // keyword is an assignment.
+    assert!(ro("time ls; time -p git status"));
+    assert!(!ro("time rm x"));
+    assert!(ro("for d in *; do n=$(ls $d | wc -l); echo $n; done"));
+    assert!(!ro("for d in *; do n=$(rm $d); done"));
+}
+
+/// `aterm ctl` is read-only by verb AND form: `meta` reads and `meta set`
+/// writes the owner's badge; `inbox` reads and `inbox seen` writes.
+#[test]
+fn aterm_forms_are_judged_by_their_full_subform() {
+    for read in [
+        "aterm ctl status",
+        "aterm ctl @s-1 status",
+        "aterm ctl --sock /tmp/a.sock @s-1 text",
+        "aterm ctl ls",
+        "aterm ctl windows",
+        "aterm ctl help",
+        "aterm ctl @s-1 meta",
+        "aterm ctl @s-1 inbox",
+        "aterm ctl @s-1 inbox get 3",
+        "aterm ctl @s-1 resizes 20 since=4",
+        "aterm ctl turn --help",
+        "aterm-ctl status",
+        "aterm --version",
+        "aterm help introspection",
+        "aterm pkg list",
+        "aterm pkg which claude",
+        "aterm pkg doctor",
+        "aterm drive phase",
+        "aterm drive classify -- 'ls'",
+    ] {
+        assert!(ro(read), "{read:?}: {:?}", classify_command(read));
+    }
+    for write in [
+        "aterm ctl @s-1 meta set attention hi",
+        "aterm ctl @s-1 meta unset attention",
+        "aterm ctl @s-1 inbox seen 3 handled",
+        "aterm ctl @s-1 key 1",
+        "aterm ctl @s-1 send x",
+        "aterm ctl @s-1 turn 'go'",
+        "aterm ctl @s-1 image /tmp/x.png",
+        "aterm ctl @s-1 post to=@s-2 kind=note hi",
+        "aterm ctl",
+        "aterm pkg install x",
+        "aterm pkg repair",
+        "aterm drive watch",
+        "aterm",
+        "aterm ctl status > /tmp/out",
+    ] {
+        assert!(!ro(write), "{write:?} must not be read-only");
+    }
+}
+
+#[test]
+fn the_python_allowlist_is_opt_in() {
+    assert!(DEFAULT_PYTHON_ALLOW.is_empty());
+    assert!(!ro("python3 scripts/x_report.py"));
+    let allow = ["scripts/*standing*.py".to_string()];
+    assert!(
+        classify_command_with(
+            "timeout 120 python3 scripts/sat2026_standing.py 2>&1 | tail -40",
+            &allow
+        )
+        .read_only
+    );
+}
+
+#[test]
+fn glob_matches_like_fnmatch() {
+    assert!(glob_match(
+        "scripts/*standing*.py",
+        "scripts/sat2026_standing.py"
+    ));
+    assert!(glob_match("scripts/*report*.py", "scripts/a/b/report_x.py"));
+    assert!(!glob_match("scripts/*standing*.py", "scripts/standing.txt"));
+    assert!(glob_match("?.py", "a.py"));
+    assert!(!glob_match("?.py", "ab.py"));
+    assert!(glob_match("*", ""));
+    assert!(!glob_match("a", ""));
+    assert!(glob_match("a*b*c", "aXXbYYc"));
+    assert!(!glob_match("a*b*c", "aXXbYY"));
+}
+
+#[test]
+fn strip_quotes_keeps_shape() {
+    assert_eq!(strip_quotes("echo 'a b' \"c\""), "echo \"\" \"\"");
+    assert_eq!(
+        strip_quotes("find \\( -name 'x' \\)"),
+        "find ( -name \"\" )"
+    );
+    assert_eq!(
+        strip_quotes("echo \"x $(stat -f '%m' \"$f\")\""),
+        format!("echo \"\"{QUOTE_SUB_MARK}$(stat -f \"\" \"\"{QUOTED_PARAMETER})")
+    );
+    assert_eq!(strip_quotes("find . \\;"), "find . \\;");
+    assert_eq!(strip_quotes("echo 'unterminated"), "echo \"\"");
+}
+
+/// A substitution is no separator: it is a word of the segment around
+/// it, and its body's segments come first.
+#[test]
+fn split_segments_sees_every_separator() {
+    let segs = split_segments("a; b && c || d | e $(f) (g) x `h`\ni \\; j & k 2>&1 &>l m&>n");
+    let heads: Vec<&str> = segs.iter().map(|s| s[0].as_str()).collect();
+    assert_eq!(
+        heads,
+        ["a", "b", "c", "d", "f", "e", "g", "h", "x", "i", "k"]
+    );
+    assert_eq!(segs[5], ["e", SUBSTITUTION]);
+    assert_eq!(segs[8], ["x", SUBSTITUTION]);
+    assert_eq!(segs[9], ["i", "\\;", "j"]);
+    assert_eq!(segs[10], ["k", "2>&1", "&>l", "m", "&>n"]);
+    assert_eq!(
+        split_segments("git tag $(date +%s); x=\"\"$(y $(z))w"),
+        [
+            vec!["date", "+%s"],
+            vec!["git", "tag", SUBSTITUTION],
+            vec!["z"],
+            vec!["y", SUBSTITUTION],
+            vec!["x=\"\"$…w"],
+        ]
+    );
+}
+
+/// A command substitution is a word of the command around it and its body a
+/// command line of its own; a command whose name is unreadable cannot be
+/// cleared (`R=rm; $R -rf /usr`). Every line of
+/// [`MEASURED_SUBSTITUTION_BYPASSES`] was once classified read-only, because
+/// the splitter cut lines at each `$(` and backtick.
+#[test]
+fn a_substitution_is_a_word_of_the_command_around_it() {
+    for (cmd, reason) in MEASURED_SUBSTITUTION_BYPASSES {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert_eq!(v.reason, *reason, "{cmd:?}");
+    }
+    // The peer's own lines: each was refused on main too, and now each
+    // says why in the law's words.
+    for (cmd, name) in [
+        ("R=rm; $R -rf /usr", "$R"),
+        ("R=rm; ${R} -rf $HOME", "${R}"),
+        ("P=/bin/rm; $P -rf /usr", "$P"),
+        ("P=rm; $P -rf /usr", "$P"),
+        ("/bin/$R -rf /usr", "/bin/$R"),
+        ("\"$(printf 'r''m')\" -rf /usr", "\"\"$(…)"),
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?}");
+        assert_eq!(
+            v.reason,
+            format!("a command whose name this check cannot read ({name})"),
+            "{cmd:?}"
+        );
+    }
+    // Words a program's own text is read from: an awk program, a sed
+    // script, a python script's path, an `export` operand.
+    for (cmd, reason) in [
+        (
+            "awk \"$(cat prog.awk)\" f",
+            "awk: a program this check cannot read ($(…))",
+        ),
+        (
+            "sed -n \"$(cat script.sed)\" f",
+            "sed: a script this check cannot read ($(…))",
+        ),
+        (
+            "export $(printf 'PA''TH=/tmp/evil'); ls",
+            "export $(…) (an assignment this check cannot read)",
+        ),
+        (
+            "export \"PATH=/tmp/evil\"; ls",
+            "export \"\" (an assignment this check cannot read)",
+        ),
+        (
+            "export $X; ls",
+            "export $X (an assignment this check cannot read)",
+        ),
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert_eq!(v.reason, reason, "{cmd:?}");
+    }
+    let allow = ["scripts/*standing*.py".to_string()];
+    for (cmd, path) in [
+        (
+            "python3 scripts/$(echo x)_standing.py",
+            "scripts/$(…)_standing.py",
+        ),
+        (
+            "python3 scripts/${X}_standing.py",
+            "scripts/${X}_standing.py",
+        ),
+    ] {
+        let v = classify_command_with(cmd, &allow);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert_eq!(
+            v.reason,
+            format!("python3 {path}: a script path this check cannot read"),
+            "{cmd:?}"
+        );
+    }
+    assert!(classify_command_with("python3 scripts/sat2026_standing.py", &allow).read_only);
+    // An unreadable argument may be the flag by which a read tool writes
+    // or runs a program (`sort -o`, `printf -v`, `rg --pre`).
+    for (cmd, reason) in [
+        (
+            "sort $(echo -o /etc/hosts) /etc/hosts",
+            "sort $(…) (a word this check cannot read may be a flag)",
+        ),
+        (
+            "printf $(echo -v PATH) /tmp/evil; ls",
+            "printf $(…) (a word this check cannot read may be a flag)",
+        ),
+        (
+            "rg foo $(echo --pre=./x.sh)",
+            "rg $(…) (a word this check cannot read may be a flag)",
+        ),
+        (
+            "sort f $(echo -o /etc/hosts)",
+            "sort $(…) (a word this check cannot read may be a flag)",
+        ),
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert_eq!(v.reason, reason, "{cmd:?}");
+    }
+    // The negative control: a substitution as an argument of a read is
+    // still a read, so nothing above is refusing every `$(`.
+    for cmd in [
+        "echo $(date)",
+        "echo \"now: $(date)\"",
+        "ls `pwd`",
+        "ls $(git rev-parse --show-toplevel)",
+        "cat $(find . -name x.txt)",
+        "wc -l $(git ls-files) | tail -1",
+        "grep -n foo $(git ls-files '*.rs') | head",
+        "cd $(git rev-parse --show-toplevel) && ls",
+        "x=$(date); echo $x",
+        "for f in $(ls); do wc -l $f; done",
+        "echo $(echo $(echo $(date)))",
+        // A substitution inside double quotes is part of its word:
+        // `x="$(…)"` assigns, and names no command.
+        "x=\"$(git rev-parse HEAD)\"; echo $x",
+        "export X=\"$(date)\"; echo $X",
+        "export FOO=1 BAR 2>/dev/null; export -p",
+        "cat \"$(git rev-parse --show-toplevel)/README.md\"",
+        "printf '%s\\n' $(git ls-files) | head",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+    // A backtick substitution nested in another by `\``: its body is a
+    // command line no reader here sees.
+    for cmd in [
+        "echo `echo \\`rm -rf /usr\\``",
+        "echo `echo \"\\`rm -rf /usr\\`\"`",
+        "echo `echo $(echo \\`rm -rf /usr\\`)`",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert_eq!(
+            v.reason, "a backtick substitution nested in another (\\`)",
+            "{cmd:?}"
+        );
+    }
+    assert!(ro("echo \\` `date`; echo \"a \\` b\""));
+    // Nesting past the bound is not read; the bound itself is.
+    let nest = |n: usize| format!("{}date{}", "echo $(".repeat(n), ")".repeat(n));
+    assert!(ro(&nest(MAX_SUBSTITUTION_DEPTH)), "the bound is read");
+    let v = classify_command(&nest(MAX_SUBSTITUTION_DEPTH + 1));
+    assert!(!v.read_only);
+    assert_eq!(
+        v.reason,
+        format!("command substitutions nested deeper than {MAX_SUBSTITUTION_DEPTH}")
+    );
+}
+
+/// A redirect may precede a command's name or be glued to it by `&>`, and
+/// zsh runs `- cmd` as `cmd`: `2>/dev/null touch M`, `touch&>/dev/null M`
+/// and `- touch M` all run `touch`. The name after them is the head; a
+/// segment that is only a redirect, or a group's tail, is still no command.
+#[test]
+fn a_redirect_or_a_dash_before_the_name_does_not_hide_it() {
+    for (cmd, reason) in [
+        ("- rm -rf /usr", "rm"),
+        ("- touch /tmp/x", "touch"),
+        ("rm&>/dev/null -rf /usr", "rm"),
+        ("/bin/rm&>/dev/null -rf /usr", "rm"),
+        ("2>/dev/null rm -rf /usr", "rm"),
+        (">/dev/null rm -rf /usr", "rm"),
+        ("</dev/null rm -rf /usr", "rm"),
+        ("< /dev/null rm -rf /usr", "rm"),
+        ("2> /dev/null rm -rf /usr", "rm"),
+        ("2>&1 rm -rf /usr", "rm"),
+        ("ls; 2>/dev/null touch /tmp/x", "touch"),
+        ("if 2>/dev/null rm -rf /usr; then echo; fi", "rm"),
+        ("timeout 5 2>/dev/null rm -rf /usr", "rm"),
+        ("ls | xargs 2>/dev/null rm -rf", "rm"),
+        (
+            "2>/dev/null test -v 'a[$(touch M)]'",
+            "test -v (evaluates arithmetic)",
+        ),
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert_eq!(v.reason, reason, "{cmd:?}");
+    }
+    for cmd in [
+        "2>/dev/null ls -la",
+        ">/dev/null 2>&1 git status",
+        "</dev/null wc -l",
+        "find . \\( -name a -o -name b \\) 2>/dev/null | head",
+        "(ls) 2>/dev/null && echo ok",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// An awk program or sed script supplied by a parameter is refused like one
+/// supplied by a substitution ([`program_words`] marks every expansion).
+/// Negative controls: single-quoted `$1`/`$x` are awk's and sed's own
+/// language and stay reads.
+#[test]
+fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
+    for (cmd, reason) in [
+        (
+            "awk \"$x\" f",
+            "awk: a program this check cannot read ($(…))",
+        ),
+        (
+            "awk \"${prog}\" f",
+            "awk: a program this check cannot read ($(…))",
+        ),
+        (
+            "awk $prog f",
+            "awk: a program this check cannot read ($(…))",
+        ),
+        (
+            "ls | xargs awk \"$AWK\"",
+            "awk: a program this check cannot read ($(…))",
+        ),
+        (
+            "sed \"$s\" f",
+            "sed: a script this check cannot read ($(…))",
+        ),
+        (
+            "sed -n \"${script}\" f",
+            "sed: a script this check cannot read ($(…))",
+        ),
+        ("sed $s f", "sed: a script this check cannot read ($(…))"),
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert_eq!(v.reason, reason, "{cmd:?}");
+    }
+    // Negative controls: single-quoted `$1`/`$x` are awk's or sed's own
+    // language, and a double-quoted awk program with no expansion stays a
+    // read.
+    for cmd in [
+        "awk '{print $1}' f",
+        "awk -F: '$3 > 100 {print $1}' /etc/passwd",
+        "sed 's/$x/y/' f",
+        "sed -n '/$/p' f",
+        "awk \"{print}\" f",
+        "echo \"$x\"; awk '{print $2}' f",
+        // A lone `$` with no name after it is literal to the shell.
+        "sed \"s/ *$//\" f",
+        "sed \"/^$/d\" f",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+    assert_eq!(
+        program_words("cat \"$S/x\""),
+        vec![vec!["cat".to_string(), format!("{SUBSTITUTION}/x")]]
+    );
+}
+
+/// A double-quoted `"$(…)"` or `"$X"` cannot split, but its value can start
+/// with `-`, so where a tool reads options it can be the write or run flag
+/// (`sort "$X" f`, `rg x "$(echo --pre=./x.sh)"`). After `--` every word is
+/// an operand; `test`/`[` go by argument count, where a string or file
+/// test's operand is no option slot.
+#[test]
+fn an_expansion_in_an_option_slot_is_refused_quoted_or_not() {
+    for cmd in [
+        "sort \"$(echo -o/tmp/x)\" f",
+        "sort \"$X\" f",
+        "sort $X f",
+        "sort $(echo -o /etc/hosts) f",
+        "rg foo \"$(echo --pre=./x.sh)\"",
+        "rg pat \"$DIR\"",
+        "rg pat $DIR",
+        "uniq \"$(echo a.txt)\"",
+        "find \"$(git rev-parse --show-toplevel)\" -name '*.rs' | head",
+        "find \"$d\" -name x",
+        "date -r \"$(stat -f %m f)\"",
+        "sed -n '1,20p' \"$(echo f)\"",
+        "file \"$(echo f)\"",
+        "printf \"$fmt\" x",
+        // test/[: an unquoted expansion (it can split into `-v name`), or
+        // four or more words.
+        "[ $n -gt 2 ] && echo big",
+        "test $n -gt 2",
+        "[ $x ]",
+        "test $(echo -v) 'a[$(touch M)]'",
+        "[ \"$a\" = x -o \"$b\" = y ]",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(
+            v.reason.contains("may be a flag"),
+            "{cmd:?} is refused for its unreadable word: {v:?}"
+        );
+    }
+    // `-v` names a variable whose subscript is evaluated: refused by its
+    // own rule, whatever the word.
+    assert!(!ro("[ -v \"$x\" ]"));
+    // Operands: after `--`, and quoted test operands by argument count,
+    // numeric tests included (`[`/`test` do not evaluate them).
+    for cmd in [
+        "[ \"$(grep -c ready log)\" -gt 5 ]",
+        "test \"$(wc -l < f)\" -gt 0",
+        "[ \"$n\" -eq 1 ] && echo one",
+        "sort -- \"$f\"",
+        "rg -e pat -- \"$dir\"",
+        "[ -z \"$x\" ]",
+        "[ -n \"$(git status --porcelain)\" ] && echo dirty",
+        "[ \"$(uname)\" = Darwin ]",
+        "[ ! -f \"$f\" ]",
+        "test -d \"$dir\"",
+        "[ \"$a\" != \"$b\" ]",
+        "[ \"$x\" ]",
+        // A single-quoted `$` is literal: sed's own last-line address.
+        "sed -n '$p' f",
+        "sed -n '1,$p' f",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// zsh arithmetic runs substitutions in array subscripts, and evaluates
+/// `printf` arguments under a numeric format, `-t`'s operand in `test`, `[`
+/// and `[[`, `export -i`/`-E`/`-F` values and integer-variable assignments,
+/// from quoted words, named variables, `"$A"` or globbed names. Negative
+/// controls: the same text under `%s` or plain `export`, numbers, `-t` on a
+/// descriptor.
+#[test]
+fn zsh_arithmetic_that_can_run_a_command_is_not_a_read() {
+    for cmd in [
+        "printf %d 'path[$(print -u2 X)]'",
+        "printf -- %d 'path[$(print -u2 X)]'",
+        "printf -%d 'path[$(print -u2 X)]'",
+        "printf '%s %d\\n' x 'path[`print -u2 X`]'",
+        "printf '%*s' 'path[$(print -u2 X)]' x",
+        "printf '%d' \"path[\\$(print -u2 X)]\"",
+        "A='path[$(print -u2 X)]'; printf %d A",
+        "A='path[$(print -u2 X)]'; printf %d \"$A\"",
+        "printf %d *",
+        "printf '%d\\n' \"$(cat f)\"",
+        "[ -t 'path[$(print -u2 X)]' ]",
+        "test -t 'path[$(print -u2 X)]'",
+        "test ! -t 'path[$(print -u2 X)]'",
+        "A='path[$(print -u2 X)]'; [ -t \"$A\" ]",
+        "A='path[$(print -u2 X)]'; [ -t A ]",
+        "[[ -t 'path[$(print -u2 X)]' ]]",
+        "A='path[$(print -u2 X)]'; [ {-t,A} ]",
+        "[ * ]",
+        "test -t S=[5]",
+        "export -i N='path[$(print -u2 X)]'",
+        "export -F N=1",
+        "SECONDS='path[$(print -u2 X)]'",
+        "A='path[$(print -u2 X)]'; COLUMNS=A ls",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(
+            v.reason.contains("arithmetic") || v.reason.contains("into `-t`"),
+            "{cmd:?}: {v:?}"
+        );
+    }
+    for cmd in [
+        "printf '%s\\n' 'path[$(print -u2 X)]'",
+        "printf '%d files\\n' 3",
+        "printf '%d\\n' 16#ff 0x1f 1e2 -3 ''",
+        "printf '%s\\n' \"$A\"",
+        "printf %d",
+        "[ -t 1 ] && echo tty",
+        "test -t 0",
+        "[[ -t 2 ]]",
+        "[ -t ]",
+        "export N='path[$(print -u2 X)]'",
+        "COLUMNS=200 ls",
+        "[ -e /tmp/w/*.log ] && echo y",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+    let v = classify_except_rm(
+        "printf %d 'path[$(print -u2 X)]'; rm -rf /private/tmp/claude-502/w/x",
+        DEFAULT_PYTHON_ALLOW,
+    );
+    assert!(!v.read_only, "{v:?}");
+}
+
+/// bash brace-expands `printf {-vS,%s} /etc`, `printf -{vS,-} /etc` and
+/// `printf -v{S,} /etc` into `printf -vS …`, as a glob `-v?` does beside a
+/// file `-vS`; so an unquoted `{` or glob up to the format is refused.
+/// Negative controls: a quoted brace, brace-expanded data after the format.
+#[test]
+fn a_brace_or_glob_word_before_printfs_format_may_be_its_v_option() {
+    for cmd in [
+        "printf {-vS,%s} /etc",
+        "printf -{vS,-} /etc",
+        "printf -{vT,vS} /etc",
+        "printf -v{S,} /etc",
+        "printf -* /etc",
+        "printf -v? /etc",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(v.reason.contains("may be a flag"), "{cmd:?}: {v:?}");
+    }
+    for cmd in [
+        "printf '{%s}\\n' x",
+        "printf \"{-vS,%s}\" x",
+        "printf '%s\\n' {a,b}",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// An unreadable git argument is refused anywhere before `--`: it may be
+/// the verb (`remote "$(echo add)"`), change the arity (`config` get vs
+/// set) or be a flag (`diff "$(echo --output=f)"`). After `--` every word
+/// is a path.
+#[test]
+fn a_git_argument_this_check_cannot_read_is_refused_before_the_double_dash() {
+    for cmd in [
+        "git config $(echo user.name value)",
+        "git config user.name $(printf v)",
+        "git config --get $(echo core.editor)",
+        "git config --get \"$(echo core.editor)\"",
+        "git config \"$(echo --edit)\"",
+        "git remote $(echo add r url)",
+        "git remote \"$(echo add)\" r url",
+        "git branch --contains $(git rev-parse HEAD)",
+        "git branch --contains \"$(git rev-parse HEAD)\"",
+        "git branch $(echo -D old)",
+        "git tag -l $(echo 'v*')",
+        "git tag $(date +%s)",
+        "git diff $(echo --output=f)",
+        "git diff \"$(echo --output=f)\"",
+        "git diff $(git merge-base HEAD origin/main)",
+        "git log $(git rev-parse HEAD) -1",
+        "git log \"$X\"..HEAD",
+        "git show \"$(git rev-parse HEAD)\":Cargo.toml",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(
+            v.reason.contains("may be a flag or a verb"),
+            "{cmd:?} is refused for its unreadable word: {v:?}"
+        );
+    }
+    for cmd in [
+        "git log --oneline -- \"$f\"",
+        "git diff --stat -- \"$(git ls-files | head -1)\"",
+        "git config --get user.name; git config --list",
+        "git remote -v; git remote show origin",
+        "git log --oneline -5",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// A `for` loop assigning [`ZSH_ARITHMETIC_VARS`] evaluates each word as
+/// arithmetic (`for SECONDS in 'path[$(…)]'`). Negative controls: numbers,
+/// a variable zsh does not evaluate, a globbed loop.
+#[test]
+fn a_for_loop_over_a_zsh_arithmetic_variable_is_not_a_read() {
+    for cmd in [
+        "for SECONDS in 'path[$(print -u2 X)]'; do echo; done",
+        "A='path[$(print -u2 X)]'; for COLUMNS in A; do echo; done",
+        "for x SECONDS in 1 'path[$(print -u2 X)]'; do echo; done",
+        "for ERRNO in 'path[$(print -u2 X)]'; do echo; done",
+        "for SECONDS in 'path[$(print -u2 X)]'; echo",
+        "if true; then for LINES in A; do :; done; fi",
+        "for SECONDS; do echo; done",
+        "for PATH in /tmp/x; do ls; done",
+        "[[ a =~ a ]]; for MEND in 'path[$(print -u2 X)]'; do :; done",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(v.reason.starts_with("for "), "{cmd:?}: {v:?}");
+    }
+    for cmd in [
+        "[[ a =~ a ]]; MBEGIN='path[$(print -u2 X)]'",
+        "ZLE_RPROMPT_INDENT='path[$(print -u2 X)]' ls",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(v.reason.contains("arithmetic"), "{cmd:?}: {v:?}");
+    }
+    for cmd in [
+        "for SECONDS in 1 2; do echo; done",
+        "for x in 'path[$(print -u2 X)]'; do echo; done",
+        "for f in *.log; do echo \"$f\"; done",
+        "for i in {1..3}; do echo $i; done",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// Names zshparam(1) documents that `zsh -f` leaves unset (absent from
+/// `${(k)parameters}`), also assigned by the measurements below.
+#[cfg(unix)]
+const ZSHPARAM_UNSET: &[&str] = &[
+    "ARGV0",
+    "BAUD",
+    "CORRECT_IGNORE",
+    "CORRECT_IGNORE_FILE",
+    "DIRSTACKSIZE",
+    "ENV",
+    "ERRNO",
+    "FCEDIT",
+    "HISTFILE",
+    "HISTORY_IGNORE",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "MAIL",
+    "MATCH",
+    "MBEGIN",
+    "MEND",
+    "POSTEDIT",
+    "PROMPT_EOL_MARK",
+    "REPLY",
+    "REPORTMEMORY",
+    "REPORTTIME",
+    "RPROMPT",
+    "RPROMPT2",
+    "RPS1",
+    "RPS2",
+    "STTY",
+    "TERMINFO",
+    "TERMINFO_DIRS",
+    "TMOUT",
+    "TMPSUFFIX",
+    "ZBEEP",
+    "ZDOTDIR",
+    "ZLE_LINE_ABORTED",
+    "ZLE_REMOVE_SUFFIX_CHARS",
+    "ZLE_RPROMPT_INDENT",
+    "ZLE_SPACE_SUFFIX_CHARS",
+    "ZSH_SCRIPT",
+    "match",
+    "mbegin",
+    "mend",
+    "reply",
+    "zle_bracketed_paste",
+    "zle_highlight",
+];
+
+/// Re-measures [`ZSH_ARITHMETIC_VARS`] where zsh is installed: every name
+/// `zsh -f` declares, every documented name it leaves unset, and the list
+/// itself, each assigned a marker-printing subscript (as `NAME=v`, `NAME=v
+/// :`, `for NAME in v`, and before a `cd` and a forked program) in its own
+/// subshell, after a matching `[[ a =~ a ]]`, in one [`zsh_walk`]. The
+/// names that print the marker are exactly the list.
+#[cfg(unix)]
+#[test]
+fn zsh_arithmetic_vars_are_the_measured_ones() {
+    let extra: Vec<&str> = ZSHPARAM_UNSET
+        .iter()
+        .chain(ZSH_ARITHMETIC_VARS)
+        .copied()
+        .collect();
+    let dir = crate::supervise::test_scratch_path("classify", "zsh-arith");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the test's dir");
+    let list = zsh_declared_then(&extra);
+    let experiment = "v=\"'path[\\$(print -u2 RAN_\\$((6*7)))]'\"; \
+        out=$( ( eval \"$n=$v\" ) 2>&1; ( eval \"$n=$v :\" ) 2>&1; \
+               ( eval \"for $n in $v; do :; done\" ) 2>&1; \
+               ( eval \"$n=$v; cd .; /usr/bin/true; :\" ) 2>&1; \
+               ( eval \"echo \\${$n:=$v} >/dev/null; cd .; /usr/bin/true; :\" ) 2>&1 ); \
+        [[ $out == *RAN_42* ]] && hit=1";
+    let prelude = format!("{ZSH_WALK_WARM}[[ a =~ a ]]; ");
+    let out = zsh_walk(&dir, &prelude, &list, 101, experiment);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(out) = out else {
+        return;
+    };
+    let mut measured = out.unwrap_or_else(|why| panic!("{why}"));
+    measured.sort();
+    measured.dedup();
+    let mut want: Vec<String> = ZSH_ARITHMETIC_VARS.iter().map(|n| n.to_string()).collect();
+    want.sort();
+    assert_eq!(measured, want, "zsh's arithmetic variables, measured");
+}
+
+/// zsh's `~` flag makes a value a pattern and an unquoted `(` in a word is
+/// a glob qualifier; `(e:…:)` and `(+cmd)` run commands during expansion
+/// (`N='/(e:print -u2 X:)'; echo $~N`). Negative controls: a subshell, a
+/// group, `$((…))`, a process substitution, a leading `~`.
+#[test]
+fn a_glob_qualifier_that_can_run_a_command_is_not_a_read() {
+    for cmd in [
+        "N='/(e:print -u2 X:)'; echo $~N",
+        "N='/(e:print -u2 X:)'; ls -d $~N",
+        "N='/(e:print -u2 X:)'; echo $^~N",
+        "N='/(e:print -u2 X:)'; echo $~^N",
+        "N='/(e:print -u2 X:)'; echo $=~N",
+        "N='/(e:print -u2 X:)'; echo x$~N",
+        "N='/(e:print -u2 X:)'; [ -e $~N ]",
+        "N='/(e:print -u2 X:)'; for f in $~N; do :; done",
+        "N='/(e:print -u2 X:)'; echo ${~N}",
+        "N='/(e:print -u2 X:)'; echo ${(~)N}",
+        "N='/(e:print -u2 X:)'; echo ${${~N}}",
+        "ls -d /(e:'print -u2 X':)",
+        "echo \"/\"(e:'print -u2 X':)",
+        "echo $(print /)(e:'print -u2 X':)",
+        "X=/; echo $X(e:'print -u2 X':)",
+        "echo {/,/}(e:'print -u2 X':)",
+        "echo ~(e:'print -u2 X':)",
+        "echo x=(e:'print -u2 X':)",
+        "echo <->(e:'print -u2 X':)",
+        "ls -d /(+print)",
+        "ls *(e:ls:)",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for (cmd, why) in [
+        ("N='/(e:print -u2 X:)'; echo $~N", GLOB_SUBST_RUNS),
+        ("N=x; echo $^~N", GLOB_SUBST_RUNS),
+        ("echo \"/\"(e:'print -u2 X':)", GLOB_QUALIFIER_RUNS),
+        ("echo $(print /)(e:'print -u2 X':)", GLOB_QUALIFIER_RUNS),
+    ] {
+        assert_eq!(classify_command(cmd).reason, why, "{cmd:?}");
+    }
+    for cmd in [
+        "(cd /tmp && ls)",
+        "diff <(ls a) <(ls b)",
+        "ls ~/x; echo ~",
+        "find . \\( -name a -o -name b \\)",
+        "echo \"$HOME\" $HOME",
+        "echo '(e:x:)' \"(e:x:)\"",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// Under `EXTENDED_GLOB` `^`, `#` and `~` glob too: beside files `-t`,
+/// `-vS` and `S=5`, `[ ^-vS ]` is `[ -t S=5 ]`, and `printf %d 8#A` beside a
+/// file `A` reads `A` as arithmetic. Negative controls: a leading `~`, an
+/// absolute word, a base-16 number.
+#[test]
+fn an_extended_glob_word_may_become_a_flag_or_a_name() {
+    for cmd in [
+        "[ ^-vS ]",
+        "test ^x",
+        "[ x~y ]",
+        "[ 1#-t S=5 ]",
+        "printf ^-vS /etc",
+        "printf %d 8#A",
+        "A='path[$(print -u2 X)]'; printf %d 1#A",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in [
+        "[ -d ~/x ] && echo y",
+        "[ -e /tmp/w/^x ] && echo y",
+        "printf '%d\\n' 16#ff 2#101",
+        "printf '%s\\n' ^x",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// The line [`zsh_probe`] appends to every script: a probe whose output
+/// lacks it did not run to its end, whatever it printed first.
+#[cfg(unix)]
+const ZSH_PROBE_DONE: &str = "__ZSH_PROBE_DONE__";
+
+/// The perl that runs a probe under a HANG detector, never a budget on its
+/// run: perl copies the probe's stdout through as it comes and kills the
+/// probe once it has printed nothing for `secs` seconds, so only its
+/// longest SILENCE is bounded. A second counts per one-second wait that
+/// saw no output, however late that wait returned, so a starved runner or
+/// a sleeping machine adds none. The probe leads its own process group and
+/// the WHOLE group is killed, when hung and after a normal end, so no
+/// grandchild (a `sleep`, a `$( … )`) outlives it; a zsh that exits while
+/// a grandchild holds the pipe ends the probe within a second. A hung
+/// probe makes perl print why (`hang detector: …`) and die by SIGALRM,
+/// which [`zsh_probe`] reports; otherwise perl exits as the probe did.
+#[cfg(unix)]
+const ZSH_PROBE_RUNNER: &str = r#"use POSIX ':sys_wait_h'; $| = 1;
+        my $secs = shift; my ($late, $st) = (0, undef);
+        pipe(my $r, my $w) or die "pipe: $!";
+        defined(my $p = fork) or die "fork: $!";
+        if (!$p) { setpgrp(0, 0); open(STDOUT, '>&', $w) or die "dup: $!";
+            exec @ARGV or die "exec: $!"; }
+        close $w; setpgrp($p, $p);
+        my ($rin, $open, $idle) = ('', 1, 0); vec($rin, fileno($r), 1) = 1;
+        while (1) {
+            if ($open) {
+                my $rout; my $n = select($rout = $rin, undef, undef, 1);
+                if ($n < 0) { next if $!{EINTR}; die "select: $!"; }
+                if ($n > 0) {
+                    my $got = sysread($r, my $buf, 65536);
+                    if (!defined $got) { next if $!{EINTR}; die "read: $!"; }
+                    if ($got) { $idle = 0; print $buf; } else { $open = 0; }
+                    next; }
+                if (waitpid($p, WNOHANG) == $p) { $st = $?; last; }
+            } else {
+                my $got = 0;
+                for (1 .. 100) { $got = waitpid($p, WNOHANG); last if $got == $p;
+                    select(undef, undef, undef, 0.01); }
+                if ($got == $p) { $st = $?; last; } }
+            next if ++$idle < $secs;
+            if (waitpid($p, WNOHANG) == $p) { $st = $?; } else { $late = 1; }
+            last; }
+        kill 'KILL', -$p;
+        if ($late) { waitpid($p, 0); print STDERR "hang detector: it printed nothing for $secs s\n";
+            $SIG{ALRM} = 'DEFAULT'; kill 'ALRM', $$; }
+        while ($open) { my $got = sysread($r, my $buf, 65536);
+            if (!defined $got) { next if $!{EINTR}; die "read: $!"; }
+            if ($got) { print $buf; } else { $open = 0; } }
+        if ($st & 127) { kill $st & 127, $$; }
+        exit($st >> 8);"#;
+
+/// `zsh -f -c script` run from `dir`, stdin closed, under
+/// [`ZSH_PROBE_RUNNER`]'s hang detector with `secs`: `None` without zsh or
+/// perl; `Some(Err)` when the probe did not run to its end (hung, killed
+/// by another signal, or its closing line missing); else
+/// `Some(Ok(stdout))` without the closing line.
+#[cfg(unix)]
+fn zsh_probe(dir: &std::path::Path, script: &str, secs: u32) -> Option<Result<String, String>> {
+    use std::os::unix::process::ExitStatusExt;
+    /// SIGALRM, 14 on every unix this test runs on (macOS, Linux).
+    const SIGALRM: i32 = 14;
+    let (zsh, perl) = ("/bin/zsh", "/usr/bin/perl");
+    if !std::path::Path::new(zsh).exists() || !std::path::Path::new(perl).exists() {
+        return None;
+    }
+    let secs_arg = secs.to_string();
+    let script = format!("{script}\nprint -r -- {ZSH_PROBE_DONE}");
+    let out = std::process::Command::new(perl)
+        .args(["-e", ZSH_PROBE_RUNNER, &secs_arg, zsh, "-f", "-c", &script])
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("zsh runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let printed = stdout.lines().count();
+    match out.status.signal() {
+        Some(SIGALRM) => {
+            let last = stdout.lines().last().unwrap_or("");
+            let why = stderr
+                .lines()
+                .rev()
+                .find_map(|l| l.strip_prefix("hang detector: "))
+                .unwrap_or("its runner died by SIGALRM");
+            return Some(Err(format!(
+                "zsh probe hung: {why} (killed by its hang detector) having printed \
+                 {printed} lines, the last {last:?}; its output is incomplete"
+            )));
+        }
+        Some(sig) => {
+            return Some(Err(format!(
+                "zsh probe killed by signal {sig} having printed {printed} lines; \
+                 stderr: {stderr}"
+            )));
+        }
+        None => {}
+    }
+    let done = format!("{ZSH_PROBE_DONE}\n");
+    match stdout.strip_suffix(&done) {
+        Some(body) => Some(Ok(body.to_string())),
+        None => Some(Err(format!(
+            "zsh probe did not run to its end ({}, no closing line) having \
+             printed {printed} lines; stderr: {stderr}",
+            out.status
+        ))),
+    }
+}
+
+/// [`zsh_probe`] for a test: its stdout, `None` without zsh or perl, and
+/// a PANIC naming why when the probe did not run to its end.
+#[cfg(unix)]
+fn zsh_in(dir: &std::path::Path, script: &str, secs: u32) -> Option<String> {
+    zsh_probe(dir, script, secs).map(|r| r.unwrap_or_else(|why| panic!("{why}")))
+}
+
+/// THE HANG DETECTOR of a [`zsh_walk`] ([`ZSH_PROBE_RUNNER`]): half an
+/// hour in which the walk printed nothing. The walk prints after every
+/// experiment, so this bounds one experiment's silence, never the walk's
+/// run, and it is ten times the longest silence measured (2026-09-30, at
+/// the merge gate's `nice -n 19` and a load of 95–155): 14 s for an
+/// experiment, 164 s for a first read of `$userdirs`, which walks the user
+/// database (`getpwent`, an XPC round trip to opendirectoryd) as slowly as
+/// the machine is busy while none of the walk's processes runs, so not
+/// even "a minute in which nothing could run" is a hang. The wall-clock
+/// alarm this replaced bounded a 16-name probe's WHOLE run, ~1,100
+/// processes, which a loaded gate starved past 120 s ("having printed 0
+/// lines": a group with no hit prints nothing).
+#[cfg(unix)]
+const ZSH_HANG_S: u32 = 1800;
+
+/// Run before a walk's first experiment: a read of `$userdirs`. The first
+/// read in a shell walks the user database (`getpwent`, an XPC round trip
+/// to opendirectoryd; see [`ZSH_HANG_S`] for what that costs a loaded
+/// machine) and records that it did, and a shell forked from it never
+/// asks again. A non-interactive zsh keeps no entry of the answer, so an
+/// experiment's `${userdirs:=v}` finds the same empty table either way
+/// and only the round trips go: one per value the experiment tries (five
+/// a test run), now one per walk.
+#[cfg(unix)]
+const ZSH_WALK_WARM: &str = ": ${#userdirs}; ";
+
+/// ONE probe over zsh's parameter names, under [`ZSH_HANG_S`]: `prelude`
+/// runs first, then `list`, which appends the names to walk to the array
+/// `names`; each name listed is walked ONCE, in the order of its first
+/// listing, running `experiment` with it as `$n`, which sets `hit=1` when
+/// the name measured positive and may print `.` lines as progress. The
+/// walk prints `names LISTED WALKED`, then `hit NAME` or `miss NAME` per
+/// name walked. `Some(Ok(hits))` only when `list` listed at least
+/// `at_least` names, a name listed twice counted twice (a zsh that
+/// declared nothing walks nothing), and every name walked has exactly one
+/// verdict; `None` without zsh or perl; `Some(Err)` names what went wrong,
+/// so the caller can clean up before failing. One `zsh -f` pays one
+/// `$userdirs` round trip and walks a name listed twice once; over every
+/// name a runs walk is ~15,900 processes and ~24 s of CPU, ~4,500 and
+/// ~6 s with [`ZSH_READ_SHIMS`] (measured 2026-09-30), and CPU is what a
+/// loaded gate lacks.
+#[cfg(unix)]
+fn zsh_walk(
+    dir: &std::path::Path,
+    prelude: &str,
+    list: &str,
+    at_least: usize,
+    experiment: &str,
+) -> Option<Result<Vec<String>, String>> {
+    let script = format!(
+        "{prelude}{list}\
+         listed=${{#names}}; names=(${{(u)names}}); \
+         print -r -- \"names $listed ${{#names}}\"; \
+         for n in $names; do \
+           hit=0; {experiment}; \
+           if (( hit )); then print -r -- \"hit $n\"; else print -r -- \"miss $n\"; fi; \
+         done",
+    );
+    let out = match zsh_probe(dir, &script, ZSH_HANG_S)? {
+        Ok(out) => out,
+        Err(why) => return Some(Err(why)),
+    };
+    let mut lines = out.lines().filter(|l| *l != ".");
+    let counts = lines
+        .next()
+        .and_then(|l| l.strip_prefix("names "))
+        .and_then(|c| c.split_once(' '))
+        .and_then(|(l, w)| Some((l.parse::<usize>().ok()?, w.parse::<usize>().ok()?)));
+    let Some((listed, count)) = counts else {
+        let head: String = out.chars().take(200).collect();
+        return Some(Err(format!("the zsh walk printed no name count: {head:?}")));
+    };
+    if listed < at_least {
+        return Some(Err(format!(
+            "zsh lists {listed} names, fewer than the {at_least} it must"
+        )));
+    }
+    let (mut hits, mut judged) = (Vec::new(), std::collections::BTreeSet::new());
+    for line in lines {
+        let (verdict, name) = match line.split_once(' ') {
+            Some(("hit", name)) => (true, name),
+            Some(("miss", name)) => (false, name),
+            _ => return Some(Err(format!("the zsh walk printed {line:?}"))),
+        };
+        if !judged.insert(name) {
+            return Some(Err(format!("the zsh walk judged {name} twice")));
+        }
+        if verdict {
+            hits.push(name.to_string());
+        }
+    }
+    if judged.len() != count {
+        return Some(Err(format!(
+            "the zsh walk judged {} of its {count} names",
+            judged.len()
+        )));
+    }
+    Some(Ok(hits))
+}
+
+/// A [`zsh_walk`]'s `list` over every name `zsh -f` declares, then
+/// `extra`: each word that is a name, in that order.
+#[cfg(unix)]
+fn zsh_declared_then(extra: &[&str]) -> String {
+    format!(
+        "for n in ${{(ou)${{(k)parameters}}}} {}; do \
+           [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] && names+=($n); \
+         done; ",
+        extra.join(" ")
+    )
+}
+
+/// [`zsh_walk`] judges every name once — the declared ones and `extra`,
+/// a name in both, or twice in `extra`, walked once — and returns the
+/// experiment's hits in walk order; its floor counts every name listed,
+/// a name listed twice twice. Negative controls: a walk that ends early,
+/// one that skips a verdict, one that prints a line of its own, one that
+/// prints a second verdict for a name (an experiment's own `hit NAME`
+/// line) and a list shorter than its floor are errors, never a shorter
+/// list.
+#[cfg(unix)]
+#[test]
+fn a_zsh_walk_judges_every_name_once() {
+    let dir = std::path::Path::new("/");
+    let extra = ["PATH", "ZZ_NOT_DECLARED", "ZZ_NOT_DECLARED", "not-a-name"];
+    let list = zsh_declared_then(&extra);
+    let hit = "print .; [[ $n == (PATH|ZZ_NOT_DECLARED) ]] && hit=1";
+    let Some(hits) = zsh_walk(dir, "", &list, 100, hit) else {
+        return;
+    };
+    assert_eq!(
+        hits,
+        Ok(vec!["PATH".to_string(), "ZZ_NOT_DECLARED".to_string()])
+    );
+    let twice = "names+=(a b b); ";
+    let thrice = zsh_walk(dir, "", twice, 3, "[[ $n == b ]] && hit=1").expect("zsh");
+    assert_eq!(thrice, Ok(vec!["b".to_string()]));
+    for (list, at_least, experiment, why) in [
+        (
+            &*list,
+            100,
+            "[[ $n == PATH ]] && exit 0",
+            "did not run to its end",
+        ),
+        (
+            &*list,
+            100,
+            "[[ $n == PATH ]] && continue",
+            "the zsh walk judged ",
+        ),
+        (
+            &*list,
+            100,
+            "[[ $n == PATH ]] && print stray",
+            "the zsh walk printed \"stray\"",
+        ),
+        (
+            &*list,
+            100,
+            "[[ $n == PATH ]] && print -r -- \"hit $n\"",
+            "the zsh walk judged PATH twice",
+        ),
+        (twice, 4, ":", "zsh lists 3 names, fewer than the 4 it must"),
+    ] {
+        let got = zsh_walk(dir, "", list, at_least, experiment).expect("zsh");
+        let err = got.expect_err(experiment);
+        assert!(err.contains(why), "{experiment}: {err}");
+    }
+}
+
+/// A probe the hang detector kills is reported as hung, never as the
+/// partial output it printed; one that exits early without its closing
+/// line is reported too. Negative controls: the same probe with time to
+/// finish returns exactly what it printed, one whose zsh exits while a
+/// grandchild holds the pipe ends with zsh, and a probe that prints now
+/// and then for longer than the detector's window, its silences adding
+/// up to more than the window, is never cut short: the window bounds each
+/// silence, never the probe's whole run nor the sum of its silences.
+#[cfg(unix)]
+#[test]
+fn a_zsh_probe_killed_by_its_alarm_is_a_timeout() {
+    let dir = std::path::Path::new("/");
+    // `sleep` is a child of zsh holding the stdout pipe: the detector
+    // must kill it too, or the wait lasts its five minutes, not the
+    // window's 1 s. The bound is a minute's hang detector (AGENTS.md),
+    // which only that wait reaches.
+    let started = std::time::Instant::now();
+    let Some(cut) = zsh_probe(dir, "print partial; sleep 300", 1) else {
+        return;
+    };
+    let waited = started.elapsed();
+    let why = cut.expect_err("a hung probe is no measurement");
+    let hung = "zsh probe hung: it printed nothing for 1 s (killed by its hang detector) \
+                having printed 1 lines, the last \"partial\"";
+    assert!(why.contains(hung), "{why}");
+    assert!(
+        waited < aterm_spec::wait::MUST_HAPPEN,
+        "the detector bounds the wait, grandchildren included: {waited:?}"
+    );
+    // The probes that run to their end get a minute's window: a hang
+    // detector (AGENTS.md), never a latency budget.
+    let early = zsh_probe(dir, "print partial; exit 0", 60).expect("zsh");
+    let why = early.expect_err("a probe that exits early is no measurement");
+    assert!(why.contains("did not run to its end"), "{why}");
+    let whole = zsh_probe(dir, "print partial; sleep 0.1", 60).expect("zsh");
+    assert_eq!(whole.as_deref(), Ok("partial\n"));
+    // zsh exits while a `sleep` it put in the background still holds the
+    // stdout pipe: the probe ends with zsh, everything it printed read
+    // and the `sleep` killed, never when the 120 s window runs out.
+    let started = std::time::Instant::now();
+    let held = zsh_probe(dir, "print partial; sleep 600 &", 120).expect("zsh");
+    assert_eq!(held.as_deref(), Ok("partial\n"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "zsh's exit ends the probe, a grandchild holding the pipe or not"
+    );
+    // 5 lines 1.5 s apart, 7.5 s in all, under a 4 s window: each silence
+    // is 1.5 s (one silent second counted), so the hang detector lets it
+    // run to its end; a budget on the whole run would cut it short, and so
+    // would a count of silent seconds that output does not start again (5
+    // in all). `zselect` waits inside zsh; no process is started.
+    let gaps = "zmodload zsh/zselect; repeat 5 { print tick; zselect -t 150 }";
+    let started = std::time::Instant::now();
+    let slow = zsh_probe(dir, gaps, 4).expect("zsh");
+    assert_eq!(slow.as_deref(), Ok("tick\n".repeat(5).as_str()));
+    assert!(
+        started.elapsed() > std::time::Duration::from_secs(4),
+        "the probe outlasted the window it was not killed in"
+    );
+}
+
+/// zsh ties arrays to scalars, so `path=DIR ls`, `for path in DIR; do ls`
+/// run `DIR/ls` and `module_path=DIR; echo $terminfo` loads from `DIR`.
+/// Negative controls: a tied array of system directories, a pair whose
+/// scalar is harmless, a name only starting like one.
+#[test]
+fn a_tied_array_is_assigned_as_its_scalar() {
+    for cmd in [
+        "path=/tmp/x ls",
+        "path=/tmp/x; ls",
+        "for path in /tmp/x; do ls; done",
+        "for x path in 1 /tmp/x; do ls; done",
+        "path=/bin:/tmp/x ls",
+        "module_path=/tmp/x; echo $terminfo",
+        "for module_path in /tmp/x; do echo $terminfo; done",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    assert_eq!(
+        classify_command("path=/tmp/x ls").reason,
+        "path= (changes which program a name runs)"
+    );
+    for cmd in [
+        "path=/bin ls",
+        "path=/bin:/usr/bin ls",
+        "cdpath=/tmp/x; cd x",
+        "for p in /tmp/x; do ls; done",
+        "paths=/tmp/x; ls",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// [`ZSH_TIED`] is every pair `zsh -f` ties, re-measured where zsh is
+/// installed: the names typed tied, and assigning each array `(/m1 /m2)`
+/// makes its scalar `/m1:/m2`.
+#[cfg(unix)]
+#[test]
+fn zsh_tied_arrays_are_the_measured_ones() {
+    let pairs: Vec<String> = ZSH_TIED.iter().map(|(a, s)| format!("{a}:{s}")).collect();
+    let probe = format!(
+        "for k in ${{(ok)parameters}}; do \
+           [[ $parameters[$k] == *-tied-* ]] && print -r -- \"tied $k\"; \
+         done; \
+         for p in {}; do \
+           a=${{p%%:*}}; s=${{p#*:}}; \
+           ( eval \"$a=(/m1 /m2)\" 2>/dev/null && print -r -- \"$a ${{(P)s}}\" ); \
+         done",
+        pairs.join(" ")
+    );
+    let Some(out) = zsh_in(std::path::Path::new("/"), &probe, 60) else {
+        return;
+    };
+    let mut tied: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("tied "))
+        .collect();
+    tied.sort_unstable();
+    let mut want: Vec<&str> = ZSH_TIED.iter().flat_map(|(a, s)| [*a, *s]).collect();
+    want.sort_unstable();
+    assert_eq!(tied, want, "zsh's tied parameters, measured");
+    for (array, _) in ZSH_TIED.iter().filter(|(a, _)| *a != "zsh_eval_context") {
+        assert!(
+            out.lines().any(|l| l == format!("{array} /m1:/m2")),
+            "{array} is tied to its scalar: {out}"
+        );
+    }
+}
+
+/// Parameters whose value zsh runs or loads during reads
+/// ([`ZSH_RUNS_A_VALUE`]) and `STTY`: `READNULLCMD=DIR/x; < f` and
+/// `NULLCMD=DIR/x; > /dev/null` run `DIR/x`. Beside an rm, assignment-only
+/// segments are judged too ([`classify_except_rm`]). Negative controls: the
+/// same reads without the assignment.
+#[test]
+fn a_parameter_zsh_runs_is_a_hazard() {
+    for cmd in [
+        "READNULLCMD=/tmp/x; < f",
+        "NULLCMD=/tmp/x; > /dev/null",
+        "READNULLCMD=/tmp/x < f",
+        "for NULLCMD in /tmp/x; do > /dev/null; done",
+        "MODULE_PATH=/tmp/x; echo $terminfo",
+        "STTY='; cmd' ls",
+        "export READNULLCMD=/tmp/x; < f",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for name in ZSH_RUNS_A_VALUE {
+        assert!(
+            assignment_hazard(&format!("{name}=/tmp/x")).is_some(),
+            "{name}"
+        );
+    }
+    for cmd in [
+        "REPORTTIME=A; cat f | cat; rm -rf /tmp/w/x",
+        "DIRSTACKSIZE=A; cd .; rm -rf /tmp/w/x",
+        "PAGER=/tmp/x; git log; rm -rf /tmp/w/x",
+        "READNULLCMD=/tmp/x; < f; rm -rf /tmp/w/x",
+        "path=/tmp/x; ls; rm -rf /tmp/w/x",
+        "PATH=/tmp/x rm -rf /tmp/w/x",
+        "PATH=/tmp/x mktemp -d",
+    ] {
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in ["cat f", "> /dev/null", "echo $terminfo", "ls"] {
+        assert!(classify_command(cmd).read_only, "{cmd:?}");
+    }
+    for cmd in [
+        "S=/tmp/w; rm -rf \"$S/x\"",
+        "D=$(mktemp -d) && rm -rf \"$D\"",
+        "REPORTTIME=5; S=/tmp/w; rm -rf \"$S/x\"",
+    ] {
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// The walk behind [`ZSH_RUNS_A_VALUE`]: every `stride`th name `zsh -f`
+/// declares (1 is every name), plus `extra`, each assigned a path to a
+/// program that prints a marker, a function's name, a command line and a
+/// directory (as `NAME=v`, `for NAME in v` and `echo ${NAME:=v}`) before
+/// a line of reads, in one [`zsh_walk`]; `shimmed`, the reads' programs
+/// run through [`ZSH_READ_SHIMS`]. The sorted names after which the
+/// marker prints, or zsh loads a module from the directory; `None`
+/// without zsh or perl.
+#[cfg(unix)]
+fn zsh_names_that_run_a_value(stride: usize, extra: &[&str], shimmed: bool) -> Option<Vec<String>> {
+    let dir = crate::supervise::test_scratch_path("classify", "zsh-runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the test's dir");
+    let program = "#!/bin/sh\necho RAN_$((6*7)) >&2\n";
+    for name in ["x", "ls"] {
+        let path = dir.join(name);
+        std::fs::write(&path, program).expect("a program");
+        let mut perms = std::fs::metadata(&path).expect("it").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+    }
+    std::fs::write(dir.join("f"), "f\n").expect("a file");
+    let d = dir.to_string_lossy().trim_end_matches('/').to_string();
+    let shims = if shimmed { ZSH_READ_SHIMS } else { "" };
+    let prelude = format!(
+        "{shims}{ZSH_WALK_WARM}d='{d}'; f() {{ print -u2 RAN_$((6*7)); }}; \
+         reads='ls >/dev/null; < f; > /dev/null; print ok >/dev/null; \
+           echo $terminfo[colors] >/dev/null; true | cat >/dev/null; \
+           cat <<< x >/dev/null; cd . >/dev/null'; \
+         vals=(\"$d/x\" f 'print -u2 RAN_$((6*7))' \"$d\"); "
+    );
+    // A value's three forms, each in a subshell of its own, read
+    // together; a `.` after each value is the walk's progress.
+    let experiment = "for v in $vals; do \
+          out=$( ( eval \"$n=\\$v; $reads\" ) 2>&1; \
+                 ( eval \"for $n in \\\"\\$v\\\"; do $reads; done\" ) 2>&1; \
+                 ( eval \"echo \\${$n:=\\$v} >/dev/null; $reads\" ) 2>&1 ); \
+          print .; \
+          if [[ $out == *RAN_42* || $out == *$d/zsh/* ]]; then hit=1; break; fi; \
+        done";
+    // Every `stride`th declared name, then all of `extra` (which the
+    // stride never skips). `(( i++ % 1 ))` is always 0, so a stride of 1
+    // keeps every name. `i` is set before zsh's names are read, so it is
+    // one of them, and unset after, so no experiment sees it.
+    let emit = "[[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] && names+=($n)";
+    let list = format!(
+        "i=0; for n in ${{(ou)${{(k)parameters}}}}; do \
+           (( i++ % {stride} )) && continue; {emit}; \
+         done; unset i; for n in {}; do {emit}; done; ",
+        extra.join(" ")
+    );
+    // A zsh that declared no parameters still lists `extra`, so the
+    // floor counts the declared share on top of it: a hundred names in
+    // the full walk, that hundredth part in a sample.
+    let at_least = extra.len() + 100 / stride;
+    let out = zsh_walk(&dir, &prelude, &list, at_least, experiment);
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut measured = out?.unwrap_or_else(|why| panic!("{why}"));
+    measured.sort_unstable();
+    measured.dedup();
+    Some(measured)
+}
+
+/// zshmisc(1)'s hook arrays, and `PERIOD`: each runs a function a line
+/// of reads may trigger, so each is walked beside [`ZSH_RUNS_A_VALUE`].
+#[cfg(unix)]
+const ZSH_HOOKS: [&str; 7] = [
+    "chpwd_functions",
+    "precmd_functions",
+    "preexec_functions",
+    "periodic_functions",
+    "zshexit_functions",
+    "zshaddhistory_functions",
+    "PERIOD",
+];
+
+/// [`ZSH_RUNS_A_VALUE`] is a MEASUREMENT, taken again here where zsh is
+/// installed, over a SAMPLE of the names the full walk
+/// ([`every_zsh_parameter_that_runs_a_value_is_measured`]) covers: every
+/// name the classifier's OTHER hand-kept lists hold ([`HAZARD_VARS`], the
+/// [`ZSH_TIED`] pairs, zshmisc(1)'s hook arrays, the list itself), so a
+/// name dropped from this list while zsh still runs it is measured and
+/// reds, and each of the six must be measured as running, which proves
+/// the probe still reaches zsh's loader and its run; plus every 24th name
+/// `zsh -f` declares, a rolling slice of zsh's own set. Exact: the walked
+/// names that run or load from the directory are the list, no more and no
+/// fewer. A name outside the sample, such as one a newer zsh began to
+/// declare, is the full walk's, as is what zsh does only around a
+/// program it starts: the sample's reads run through [`ZSH_READ_SHIMS`].
+#[cfg(unix)]
+#[test]
+fn zsh_parameters_it_runs_are_the_measured_ones() {
+    let names: std::collections::BTreeSet<&str> = ZSH_RUNS_A_VALUE
+        .iter()
+        .chain(HAZARD_VARS)
+        .chain(&ZSH_HOOKS)
+        .copied()
+        .chain(
+            ZSH_TIED
+                .iter()
+                .flat_map(|(array, scalar)| [*array, *scalar]),
+        )
+        .collect();
+    let names: Vec<&str> = names.into_iter().collect();
+    let Some(measured) = zsh_names_that_run_a_value(24, &names, true) else {
+        return;
+    };
+    let mut want: Vec<&str> = ZSH_RUNS_A_VALUE.to_vec();
+    want.sort_unstable();
+    assert_eq!(measured, want, "the sampled parameters zsh runs or loads");
+}
+
+/// The same measurement over EVERY name `zsh -f` declares, every name
+/// zshparam(1) documents that it leaves unset, the hook arrays and the
+/// hazard lists: the audit that finds a parameter a NEWER zsh began to
+/// run. Its reads run their real programs, never [`ZSH_READ_SHIMS`]:
+/// what a newer zsh does around a program it starts is part of what it
+/// audits. IGNORED BY DEFAULT: it measures a vendor tool (macOS's
+/// `/bin/zsh`), not aterm. It was 47 s alone, 465 s niced at load 22-45
+/// (35955c219) and 960 s at load 90 when [`zsh_walk`] ran a probe per 16
+/// names one by one; as one probe it is ~15,900 processes and ~24 s of
+/// CPU (35 s at a load of 30, measured 2026-09-30). The sample above runs
+/// every time; run this one whenever zsh itself changes (a macOS update)
+/// and before editing the hazard lists above:
+/// `targo --unverified test -p aterm-agent --lib -- --ignored every_zsh_parameter`.
+#[cfg(unix)]
+#[test]
+#[ignore = "measures the vendor's /bin/zsh over every parameter name (~200 names, ~15,900 processes in one zsh probe); a vendor-tool measurement; run it when zsh changes"]
+fn every_zsh_parameter_that_runs_a_value_is_measured() {
+    let extra: Vec<&str> = ZSHPARAM_UNSET
+        .iter()
+        .chain(HAZARD_VARS)
+        .chain(ZSH_RUNS_A_VALUE)
+        .chain(&ZSH_HOOKS)
+        .copied()
+        .collect();
+    let Some(measured) = zsh_names_that_run_a_value(1, &extra, false) else {
+        return;
+    };
+    let mut want: Vec<&str> = ZSH_RUNS_A_VALUE.to_vec();
+    want.sort_unstable();
+    assert_eq!(measured, want, "the parameters zsh runs or loads, measured");
+}
+
+/// The programs of the runs walk's line of reads, as functions: `ls`,
+/// `cat` and `more` (`more` and `cat` also as zsh's `READNULLCMD` and
+/// `NULLCMD`). Each returns at once when zsh would run the very program
+/// it runs with no assignment — the path zsh's own lookup finds (the
+/// command table's entry, else `hash`'s search, as zsh does before it
+/// runs a command) is the one found before the walk — in the very
+/// environment — every exported parameter, its type and its value, as
+/// before — and otherwise runs the program (`command`), whatever made
+/// the difference. A program run unchanged prints no marker, so no
+/// program that could print one is skipped. A skip does drop zsh's own
+/// work around a program it starts, which no exported parameter decides:
+/// zsh 5.9 reads a non-exported `REPORTTIME` when an external job ends
+/// (`REPORTTIME='path[$(cmd)]'; /usr/bin/true` runs `cmd`, a function
+/// runs nothing). The reads still fork a job (`true | cat`), so the
+/// sample meets that work too, and the full walk
+/// ([`every_zsh_parameter_that_runs_a_value_is_measured`]) runs without
+/// the shims. The walk's ~2,400 subshells each ran five of these
+/// programs, two thirds of its processes and three quarters of its CPU
+/// (measured alone 2026-09-30: 23.9 s of CPU in ~15,900 processes, then
+/// 6.4 s in ~4,500, the 197 names' verdicts identical). An anonymous
+/// function defines them, so no parameter is left to walk, and looks the
+/// paths up in a `$( … )`, so the walk's own command table stays as it
+/// was; `NO_HASH_LIST_ALL` keeps a lookup from filling a subshell's.
+#[cfg(unix)]
+const ZSH_READ_SHIMS: &str = r##"() {
+        local w k p e=${#${(k)parameters[(R)*export*]}} ks=${(k)parameters[(R)*export*]}
+        for k in ${=ks}; do e+=$'\0'$k:${parameters[$k]}=${(P)k}; done
+        for w in ls cat more; do
+            p=$(hash $w 2>/dev/null && print -r -- $commands[$w])
+            functions[$w]="setopt localoptions nohashlistall
+                local k e=\${#\${(k)parameters[(R)*export*]}}
+                for k in $ks; do e+=\$'\\0'\$k:\${parameters[\$k]}=\${(P)k}; done
+                [[ -n \$commands[$w] ]] || hash $w 2>/dev/null
+                [[ -n ${(qqqq)p} && \$commands[$w] == ${(qqqq)p} && \$e == ${(qqqq)e} ]] && return 0
+                command $w \"\$@\""
+        done
+    }
+    "##;
+
+/// [`ZSH_READ_SHIMS`] skips a program only when zsh would run it
+/// unchanged: with nothing assigned `cat <<< x` prints nothing, but once
+/// an exported parameter differs (`PWD=/`) the real `cat` runs, and
+/// after `PATH=DIR`, `path=(DIR)` or `hash ls=DIR/ls` `ls` runs
+/// `DIR/ls`. And the shims leave the parameters a walk reads as they
+/// were.
+#[cfg(unix)]
+#[test]
+fn the_read_shims_skip_only_a_program_zsh_runs_unchanged() {
+    let dir = crate::supervise::test_scratch_path("classify", "zsh-shims");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the test's dir");
+    let ls = dir.join("ls");
+    std::fs::write(&ls, "#!/bin/sh\necho RAN_LS\n").expect("a program");
+    let mut perms = std::fs::metadata(&ls).expect("it").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&ls, perms).expect("chmod");
+    let d = dir.to_string_lossy().trim_end_matches('/').to_string();
+    let probe = format!(
+        "print -r -- ${{#${{(k)parameters}}}}; {ZSH_READ_SHIMS}\
+         print -r -- ${{#${{(k)parameters}}}}; \
+         cat <<< skipped; ( ls ); ( PWD=/; cat <<< ran ); \
+         ( PATH='{d}'; ls ); ( path=('{d}'); ls ); ( hash ls='{d}/ls'; ls )"
+    );
+    let out = zsh_in(&dir, &probe, ZSH_HANG_S);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(out) = out else {
+        return;
+    };
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines.len() > 2 && lines[0] == lines[1], "{out}");
+    assert_eq!(lines[2..], ["ran", "RAN_LS", "RAN_LS", "RAN_LS"], "{out}");
+}
+
+/// Inside a `${…}` operand a `$` form expands as it does bare, so the bare
+/// refusals apply there (`${x:-$path[A]}`, `${x:-$~N}`), as do subscripts
+/// behind zsh's flags (`$=A[A]`). Negative controls: plain, positional and
+/// special parameters, a lone `$`.
+#[test]
+fn a_dollar_form_inside_a_braced_operand_is_refused_as_it_is_bare() {
+    for cmd in [
+        "A='path[$(cmd)]'; echo ${x:-$path[A]}",
+        "A='path[$(cmd)]'; echo \"${x:-$path[A]}\"",
+        "A='path[$(cmd)]'; echo ${x:-$[A]}",
+        "A='path[$(cmd)]'; echo \"${x:-$[A]}\"",
+        "A='path[$(cmd)]'; echo ${x:-$A[A]}",
+        "A='path[$(cmd)]'; echo ${x-$A[A]}",
+        "A='path[$(cmd)]'; echo ${x:=$[A]}",
+        "A='path[$(cmd)]'; echo ${x#$A[A]}",
+        "A='path[$(cmd)]'; echo ${x/$A[A]/y}",
+        "A='path[$(cmd)]'; echo ${x:-a$A[A]}",
+        "A='path[$(cmd)]'; echo ${x:-$=A[A]}",
+        "A='path[$(cmd)]'; echo \"${x:-$#A[A]}\"",
+        "N='/(e:cmd:)'; echo ${x:-$~N}",
+        "N='/(e:cmd:)'; echo \"${x:-$~N}\"",
+        "N='/(e:cmd:)'; echo ${x:-$^~N}",
+        "N='/(e:cmd:)'; echo ${x:-$=~N}",
+        "A='path[$(cmd)]'; echo $=A[A]",
+        "A='path[$(cmd)]'; echo $^A[A]",
+        "A='path[$(cmd)]'; echo $#A[A]",
+        "A='path[$(cmd)]'; echo \"$+A[A]\"",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in [
+        "echo ${x:-$HOME} ${x:-$1} \"${x:-$HOME/y}\" ${x:-$#} ${x:-$=y}",
+        "echo ${x:-$} ${x:-a$} \"${HOME:-$PWD}\"",
+        "echo ${x:-$y} \"${x:+$y}\" $#x $=x",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// zsh subscripts special parameters as it does names (`$*[A]`, `$@[A]`,
+/// `$#[A]`… with `A='path[$(cmd)]'`), bare, in `${…}` operands and in
+/// unquoted here-document bodies. Negative controls: special parameters
+/// without a subscript, a glob after a name, `$#` at a `${…}`'s end.
+#[test]
+fn a_subscript_on_a_special_parameter_is_refused() {
+    for sub in [
+        "$*[A]",
+        "$@[A]",
+        "\"$@[A]\"",
+        "$-[A]",
+        "$?[A]",
+        "$![A]",
+        "$#[A]",
+        "$$[A]",
+        "$=*[A]",
+        "$#*[A]",
+        "$^*[A]",
+        "$##[A]",
+        "$1[A]",
+        "${x:-$*[A]}",
+        "\"${x:-$@[A]}\"",
+        "${x:-$-[A]}",
+        "${x:-$#[A]}",
+        "${x-$?[A]}",
+    ] {
+        let cmd = format!("A='path[$(cmd)]'; echo {sub}");
+        let v = classify_command(&cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        let body = format!("cat <<EOF\n{}\nEOF", sub.trim_matches('"'));
+        let v = classify_command(&body);
+        assert!(!v.read_only, "{body:?} must not be read-only: {v:?}");
+    }
+    let v = classify_except_rm(
+        "A=S=0; S=/tmp/w; echo \"$#[A]\"; rm -rf \"$S/x\"",
+        &[] as &[&str],
+    );
+    assert!(!v.read_only, "{v:?}");
+    for cmd in [
+        "echo $# $? \"$@\" $* $- $! $$ \"$#\" ${x:-$#} ${x:-$?}",
+        "echo $x-[ab] $x*[ab] \"$1\"[x] ${#}",
+        "ls $HOME/*[0-9]",
+        "cat <<EOF\n$# $? $@ $x-[ab]\nEOF",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// `${NAME:=v}` and `${NAME=v}` assign like `NAME=v`: `${REPORTTIME:=A}`
+/// before a pipe, `${DIRSTACKSIZE:=A}` before a `cd`, `${ERRNO:=A}` alone
+/// run a subscript, and `${NULLCMD:=DIR/x}` acts like `NULLCMD=DIR/x`; also
+/// in here-document bodies. Negative controls: a plain number, a harmless
+/// name, the other default forms.
+#[test]
+fn a_default_assignment_is_judged_as_an_assignment() {
+    for cmd in [
+        "A='path[$(cmd)]'; echo ${REPORTTIME:=A}; cat f | cat",
+        "A='path[$(cmd)]'; echo \"${REPORTTIME:=A}\"; cat f | cat",
+        "A='path[$(cmd)]'; echo ${REPORTTIME=A}; cat f | cat",
+        "A='path[$(cmd)]'; echo ${REPORTMEMORY:=A}; cat f | cat",
+        "A='path[$(cmd)]'; echo ${DIRSTACKSIZE:=A}; cd .",
+        "A='path[$(cmd)]'; echo ${ZLE_RPROMPT_INDENT:=A}",
+        "A='path[$(cmd)]'; echo ${ERRNO:=A}",
+        "A='path[$(cmd)]'; echo ${#ERRNO:=A}",
+        "A='path[$(cmd)]'; echo ${ERRNO[1]=A}",
+        "echo ${READNULLCMD:=/tmp/x}; < f",
+        "echo ${NULLCMD=/tmp/x}; > /dev/null",
+        "echo ${PATH:=/tmp/x}; ls",
+        "echo ${path=/tmp/x}; ls",
+        "echo ${PAGER:=$x}; git log",
+        "A='path[$(cmd)]'; cat <<EOF\n${REPORTTIME:=A}\nEOF\ncat f | cat",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in [
+        "echo ${x:=1} ${y=a} \"${z:=$HOME}\"",
+        "echo ${REPORTTIME:=5} ${COLUMNS:=80} ${PATH:=/usr/bin:/bin}",
+        "echo ${REPORTTIME:-A} ${REPORTTIME:+A} ${REPORTTIME:?A}",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// [`classify_except_rm`] still judges redirects on the skipped `rm` and
+/// `mktemp` segments: `mktemp > ~/.zshrc; rm -rf /tmp/w/x` (and `>>`, `2>`,
+/// `&>`, `1<>`, quoted targets) truncates a file. Negative controls:
+/// `/dev/null`, a descriptor, an input redirect.
+#[test]
+fn a_redirect_on_a_left_out_segment_is_judged() {
+    for cmd in [
+        "mktemp > /Users/_owner/.zshrc; rm -rf /tmp/w/x",
+        "mktemp >> /Users/_owner/.zshrc; rm -rf /tmp/w/x",
+        "mktemp 2> /Users/_owner/.zshrc; rm -rf /tmp/w/x",
+        "mktemp &> /Users/_owner/.zshrc; rm -rf /tmp/w/x",
+        "mktemp 3>/Users/_owner/.zshrc; rm -rf /tmp/w/x",
+        "mktemp -d 1<>/Users/_owner/f; rm -rf /tmp/w/x",
+        "mktemp >\"$HOME/.zshrc\"; rm -rf /tmp/w/x",
+        "mktemp -d > ~/.zshrc && rm -rf /tmp/w/x",
+        "rm -rf /tmp/w/x 2>/dev/null; mktemp > .git/HEAD",
+        "rm -rf /tmp/w/x > /Users/_owner/f",
+    ] {
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(v.reason.starts_with("redirect "), "{cmd:?}: {v:?}");
+    }
+    for cmd in [
+        "mktemp -d > /dev/null; rm -rf /tmp/w/x",
+        "mktemp -d >&2; rm -rf /tmp/w/x",
+        "mktemp -d 2>&1; rm -rf /tmp/w/x",
+        "mktemp -d < /dev/null; rm -rf /tmp/w/x",
+        "rm -rf /tmp/w/x 2>/dev/null",
+        "D=$(mktemp -d) && rm -rf \"$D\"",
+    ] {
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// zsh's `printf` decodes Unicode escapes in its format first, so `%d`
+/// is `%d` and runs a subscript; [`numeric_format`] (shared with the rm
+/// rule) must see it. Negative controls: octal and `x` escapes of `%`, and
+/// plain formats.
+#[test]
+fn a_unicode_escape_in_a_printf_format_may_be_a_conversion() {
+    for format in [
+        "BSu0025d",
+        "BSU00000025d",
+        "%sBSu0025",
+        "%BSu0064",
+        "BSu0025BSu0064",
+        "BSu0025*s",
+        "%BSu002ad",
+        "BSu005c%d",
+        "BSu",
+        "BSuzz%s",
+        "BSUffffffff%s",
+    ] {
+        let format = format.replace("BS", "\\");
+        assert!(numeric_format(&format), "{format:?}");
+    }
+    // These decode to no numeric conversion and evaluate nothing.
+    for format in [
+        "%s\\n",
+        "BS045d",
+        "BSx25d",
+        "%sBSn",
+        "BSe%s",
+        "BSu0025s",
+        "BSu0025.1s",
+        "%BSu0073",
+        "BSu2713 %sBSn",
+        "BSU0001F600 %s",
+        "BSu25d",
+        "BSU25d",
+        "BSu00025d",
+        "BSu005cu0025d",
+        "BSBSu0025d",
+    ] {
+        let format = format.replace("BS", "\\");
+        assert!(!numeric_format(&format), "{format:?}");
+    }
+    for cmd in [
+        "printf 'BSu0025d' 'path[$(cmd)]'",
+        "A='path[$(cmd)]'; printf 'BSu0025d' A",
+        "printf 'BSU00000025d' 'path[$(cmd)]'",
+        "printf \"BSu0025d\" 'path[$(cmd)]'",
+    ] {
+        let cmd = cmd.replace("BS", "\\");
+        let v = classify_command(&cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in [
+        "printf 'BS045d' 'path[$(cmd)]'",
+        "printf '%sBSn' \"$x\"",
+        "printf 'BSu2713 %sBSn' done",
+    ] {
+        let cmd = cmd.replace("BS", "\\");
+        let v = classify_command(&cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// macOS sed edits in place under `-I` as under `-i`, alone or clustered.
+/// Negative controls: `-n`, `-E`, and an `I` flag inside the script.
+#[test]
+fn sed_capital_i_edits_in_place() {
+    for cmd in [
+        "sed -I '' s/a/b/ f",
+        "sed -I.bak s/a/b/ f",
+        "sed -nI '' p f",
+        "sed -E -I '' s/a/b/ f",
+        "/usr/bin/sed -I '' s/a/b/ f",
+        "env sed -I '' s/a/b/ f",
+        "git ls-files | xargs sed -I '' s/a/b/",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert_eq!(v.reason, "sed -i", "{cmd:?}");
+    }
+    let v = classify_except_rm("sed -I '' s/a/b/ f; rm -rf /tmp/a/x", &[] as &[&str]);
+    assert!(!v.read_only, "{v:?}");
+    for cmd in ["sed -n p f", "sed -E 's/a/b/I' f", "sed -n '/x/Ip' f"] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+    let v = classify_except_rm("sed -n p f; rm -rf /tmp/a/x", &[] as &[&str]);
+    assert!(v.read_only, "{v:?}");
+}
+
+/// bash's `${!NAME}` expands the variable named by NAME's value, evaluating
+/// its subscript (`A='a[$(…)]'; echo "${!A}"`); refused, in here-documents
+/// too. The listings `${!A[@]}`, `${!A[*]}`, `${!A@}`, `${!A*}`, and `${!}`
+/// and `${#A}`, stay reads. `${A@P}` is refused.
+#[test]
+fn a_bash_indirection_is_not_literal() {
+    for cmd in [
+        "A='a[$(echo X >&2)]'; echo \"${!A}\"",
+        "A='a[$(echo X >&2)]'; echo ${!A:-x}",
+        "A='a[$(echo X >&2)]'; echo \"${!A#x}\"",
+        "A='a[$(echo X >&2)]'; echo ${!A[0]}",
+        "A='a[$(echo X >&2)]'; [ -n \"${!A}\" ]",
+        "A='a[$(echo X >&2)]'; ls \"${!A}\"",
+        "echo \"${!1}\"",
+        "echo ${!A=v}",
+        "A='a[$(echo X >&2)]'; cat <<EOF\n${!A}\nEOF",
+        "echo \"${A@P}\"",
+        "echo ${A[0]@Q}",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    let v = classify_except_rm("echo \"${!A}\"; rm -rf /tmp/a/x", &[] as &[&str]);
+    assert!(!v.read_only, "{v:?}");
+    for cmd in [
+        "echo ${!A[@]} \"${!A[*]}\" ${!A@} ${!A*}",
+        "echo ${!} ${#} ${#A} \"${A:-x}\" ${A#x}",
+        "echo {a,b}",
+        "printf '%s\\n' \"$x\"",
+        "[ -n \"$x\" ]",
+        "cat <<EOF\n${!A[@]} ${HOME}\nEOF",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// zsh runs a command written after a closing `}` or `]]` in the same list
+/// (`{ ls } always { ./p/x }`, `if [[ -n a ]] ./p/x`), which the reader took
+/// as an argument. Negative controls: a closing word ending its segment,
+/// nested closings, a quoted `}`.
+#[test]
+fn a_word_after_a_closing_brace_is_a_command() {
+    for cmd in [
+        "{ ls } always { ./p/x }",
+        "{ ls } always { ./p/x } && ls",
+        "{ echo } always { ./p/x }",
+        "{ ls } always { touch x }",
+        "if ls; then ls; fi; { ls } always { touch ~/.zshrc }",
+        "if [[ -n a ]] ./p/x",
+        "while [[ -z $d ]] ./p/x",
+        "if { ls } ./p/x",
+        "if [[ -z a ]] { ls } else { ./p/x }",
+        "if [[ -n a ]] then ./p/x; fi",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(
+            !v.read_only,
+            "{cmd:?} must not be read-only beside an rm: {v:?}"
+        );
+    }
+    for cmd in [
+        "{ ls }",
+        "{ { ls } }",
+        "[[ -n $x ]] && ls",
+        "if [[ -n $x ]]; then ls; fi",
+        "echo '}' x",
+        "awk '{print $1}' f",
+        "find . -name x -exec ls {} +",
+        "echo {a,b}",
+        "ls *.log",
+        "grep -n foo *.rs",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// Fail-safe regressions of the tests above: a redirect after a closing word
+/// is the compound's own (`{ ls; echo } 2>&1 | head`) and its target is still
+/// judged; a `}` or `]]` with no opener closes nothing; `${!#}` is the last
+/// positional, not an indirection. `${!1}` and `${!A[@]:-x}` stay refused.
+#[test]
+fn a_closing_word_redirect_and_an_unopened_close_stay_reads() {
+    for cmd in [
+        "{ ls } 2>/dev/null",
+        "{ ls; echo } 2>&1 | head",
+        "{ ls } >/dev/null 2>&1",
+        "{ ls } &>/dev/null",
+        "[[ -f x ]] 2>/dev/null",
+        "[[ -f x ]] 2>/dev/null && cat x",
+        "if [[ -f x ]] 2>/dev/null; then cat x; fi",
+        "echo } x",
+        "echo ]] x",
+        "echo \"${!#}\"",
+        "cat <<EOF\n${!#}\nEOF",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must be read-only: {v:?}");
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(v.read_only, "{cmd:?} must be read-only beside an rm: {v:?}");
+    }
+    for cmd in [
+        "{ ls } 2>/dev/null ./p/x",
+        "{ ls; } 2>&1 ./p/x",
+        "{ ls } < /dev/null ./p/x",
+        "[[ -f x ]] 2>/dev/null ./p/x",
+        "{ ls } > out",
+        "{ echo } ./p/x }",
+        "echo } ./p/x; { ls; }",
+        "if [[ -n a ]] ./p/x",
+        "echo \"${!1}\"",
+        "echo \"${!A[@]:-x}\" ${!A[*]:-x}",
+        "echo \"${!#[0]}\"",
+        "echo ${!#:-x}",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(
+            !v.read_only,
+            "{cmd:?} must not be read-only beside an rm: {v:?}"
+        );
+    }
+}
+
+/// zsh closes a `{` group at a `}` glued to a word's end, unless the word's
+/// own braces balance: `{ echo a} always { cmd }` and `{ echo ${HOME}}
+/// always { cmd }` run `cmd`. Negative controls: balanced braces (`{a,b}`,
+/// `${HOME}`, `{}`), an escaped `}`, and a glued close ending its segment.
+#[test]
+fn a_brace_glued_to_a_word_closes_the_group() {
+    for cmd in [
+        "{ ls a} always { ./p/x}",
+        "{ ls a} always { ./p/x }",
+        "if { ls a} ./p/x",
+        "while { ls a} ./p/x",
+        "{ ls ${HOME}} always { ./p/x }",
+        "{ ls x{a,b}} always { ./p/x }",
+        "{ ls \"a\"} always { ./p/x }",
+        "{ ls 'a'} always { ./p/x }",
+        "{ ls a}} always { ./p/x }",
+        "{ ls a} 2>/dev/null ./p/x",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(
+            !v.read_only,
+            "{cmd:?} must not be read-only beside an rm: {v:?}"
+        );
+    }
+    for cmd in [
+        "{ ls a}",
+        "{ ls a} 2>/dev/null",
+        "{ ls a}; ls b",
+        "{ echo {a,b} x }",
+        "{ echo ${HOME} x }",
+        "{ find . -exec ls {} + }",
+        "{ echo a\\} x }",
+        "echo a} x",
+        "find . -name x -exec ls {} +",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// THE PLAIN GRAMMAR (decided 2026-09-30): the reads a worker writes
+/// every hour are plain, and every form the zsh sweeps found — each one a
+/// command zsh ran while a check called the line a read — is not, by the
+/// character that opens it rather than by a rule of its own. So is any
+/// expansion at all, which is the point: a form nobody has measured
+/// needs one of these characters too.
+#[test]
+fn a_plain_line_expands_nothing() {
+    for line in [
+        "ls",
+        "ls -la ~/x ~ /tmp",
+        "cat < f.txt | head -3",
+        "git log --format='%h $x `y` \\z' -3",
+        "x 2>/dev/null; y &>/dev/null && z 2>&1 | head || w >&2",
+        "x > /dev/null",
+        "2>/dev/null ls; </dev/null ls for; < f cat",
+        "# $(rm -rf /) is a comment\nls",
+        "ls a#b",
+        "find . -name '*.rs' -type f",
+        "sort -t= -k2 f --key=1",
+        "grep -rn \"TODO: fix {x}!\" src",
+        "echo 'it''s' \"a\"'b'",
+        "wc -l café.txt [ab]*.md",
+        "grep -n for src | grep if; echo 'while' done",
+    ] {
+        assert_eq!(plain_zsh_line(line), Ok(()), "{line:?}");
+    }
+    for line in [
+        // The sweeps' forms (audit §5): tied arrays, arithmetic,
+        // modifiers, process substitution, glob qualifiers, `=cmd`.
+        "path=/x ls",
+        "path=/x; ls",
+        "for path in /x; do ls; done",
+        "ls; select path in /x; do ls; done",
+        "repeat 3 ls",
+        // A leading redirect leaves the next word a command's first.
+        "2>/dev/null for path in /x; ls",
+        "2>&1 repeat 2 ls",
+        "</dev/null for path in /x; ls",
+        "< f export -u PATH; ls",
+        "ls && ! ls",
+        "if ls; then ls; fi",
+        "time ls",
+        "export PATH",
+        "printf %d \"path[$(id)]\"",
+        "ls $=S",
+        "echo \"$S:h\"",
+        "diff =(ls) <(ls)",
+        "ls *(e:'id':)",
+        "=ls",
+        "ls ~[x]",
+        "ls ~root",
+        // Any expansion, quote escape or compound.
+        "ls \"$HOME\"",
+        "echo ${HOME}",
+        "echo `id`",
+        "ls $'\\x41'",
+        "echo \"\\$x\"",
+        "\\ls",
+        "ls \\\nx",
+        "wc -l src/{a,b}.rs",
+        "(ls)",
+        "{ ls }",
+        "[[ -t 1 ]] && ls",
+        "a=1 ls",
+        "ls x=y",
+        // Redirects that write, duplicate or read otherwise.
+        "ls > out",
+        "ls >> /dev/null",
+        "ls >| /dev/null",
+        "ls 2>/dev/nullx",
+        "ls >&-",
+        "cat <<EOF\nx\nEOF",
+        "cat <<< x",
+        "cat <> f",
+        "ls a<1-5>",
+        "ls \u{1b}[2J",
+        "ls 'open",
+        "ls \"open",
+    ] {
+        assert!(plain_zsh_line(line).is_err(), "{line:?} must not be plain");
+    }
+}

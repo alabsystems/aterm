@@ -2,14 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Scroll region and unscroll-from-scrollback tests.
-//!
-//! Split into focused submodules to keep each test group discoverable:
-//! - `band_moves`: the numbered row-band record behind `coordinates_invalidated`
-//! - `region_ops`: IL/DL/SU/SD behavior within scroll regions
-//! - `hyperlink_regressions`: CellExtras/hyperlink regression coverage
-//! - `unscroll`: tiered scrollback unscroll behavior and attribute restoration
-//! - `unscroll_region_scroll`: unscroll metadata/damage verification for cache reuse
+//! Scroll region and unscroll-from-scrollback tests:
+//! - `band_moves`: the row-band record behind `coordinates_invalidated`
+//! - `region_ops`: IL/DL/SU/SD within scroll regions
+//! - `hyperlink_regressions`: CellExtras/hyperlink coverage
+//! - `unscroll`: tiered scrollback unscroll and attribute restoration
+//! - `unscroll_region_scroll`: unscroll metadata/damage for cache reuse
 
 use super::super::*;
 

@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The harness core: the PURE judgments behind the aterm wrapper
-//! (`docs/DESIGN-aterm-wrapper-2026-09-17.md`), and the read verbs over them.
-//! Nothing here types into a session or answers a hook; the one engine that
-//! ACTS is [`crate::supervise`]. (The hook-era `rm_policy` went 2026-09-25:
-//! the supervisor's rm breaker, `supervise::policy::rm_breaker`, keeps the
-//! two tables it reused.)
+//! The harness core: the pure judgments behind the aterm wrapper
+//! (`docs/DESIGN-aterm-wrapper-2026-09-17.md`) and the read verbs over them.
+//! Nothing here types into a session; the one engine that acts is
+//! [`crate::supervise`].
 //!
 //! * [`source`] — WHERE DID THIS FACT COME FROM, once: the one [`source::Source`]
 //!   vocabulary [`usage`] and `harness limits` print.
@@ -37,14 +35,15 @@
 //!   from its own transcript and its subagents' (live), and the limit wall
 //!   Claude Code wrote into its transcript when it hit one, while its reset
 //!   is ahead. Nothing of it is read off the screen.
-//! * [`lights`] — the lights at the footer's end (the permission mode, fast
-//!   mode), drawn only while one differs from what the owner expects: read
-//!   from what Claude Code draws, toggled through its own inputs, read back
-//!   after every toggle — Claude's own answer to `/fast` included.
+//! * [`lights`] — the light at the footer's end (the permission mode), drawn
+//!   only while it differs from what the owner expects: read from Claude
+//!   Code's mode pill, toggled through its own shift+tab, read back after
+//!   every press. Fast mode has no light of aterm's: Claude draws its own `↯`.
 //! * [`cli`] — THE COMMAND: `aterm harness usage|limits|disk|ledger`, the
-//!   read views, `upgrade` (one hand-run pass of the live upgrade) and
-//!   `upgrade models` (its model priority list), plus the retired hook-bridge
-//!   verbs answered as tombstones.
+//!   read views, `accounts` (the roster's report and its `add`, `login`,
+//!   `check` and `use`, over [`accounts`]), `upgrade` (one hand-run pass of
+//!   the live upgrade) and `upgrade models` (its model priority list), plus
+//!   the retired hook-bridge verbs answered as tombstones.
 //! * [`upgrade`], [`upgrade_drive`], [`upgrade_wake`] — THE LIVE UPGRADE of a
 //!   running Claude Code or Codex onto a newer build: the pure plan, its steps
 //!   over one tab or every session, and atpkg's activation notice as a push.
@@ -81,6 +80,14 @@
 //!   measure and schedule while a supervised session waits at a wall the
 //!   network answers (the window's host carries it out: aterm-gui
 //!   `harness_netprobe`).
+//! * [`accounts`] — CLAUDE CODE ACCOUNTS, the pure core
+//!   (`docs/DESIGN-claude-accounts-2026-10-01.md`): the roster the owner
+//!   wrote (`accounts.toml`), what this machine has seen of each account,
+//!   the condition that follows, the advice a session gets at a turn end
+//!   (`Stay | Probe | Move | Wait`), and the store for its state and ledger.
+//!   It touches no session and reads no credential. (The module of this
+//!   name deleted on 2026-09-23, below, chose a Claude home per account;
+//!   this one chooses a login and leaves the home alone.)
 //!
 //! # What was deleted, 2026-09-23
 //!
@@ -97,7 +104,7 @@
 //! and it duplicated the engine in [`crate::supervise`], which is the one
 //! supervisor now. Design §0.4 is the record.
 //!
-//! STATUS (docs/README.md honesty ratchet): unit-tested; FIFTEEN bounded
+//! STATUS (docs/README.md honesty ratchet): unit-tested; these bounded
 //! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
 //! real code — `harness_capture_worker_lifecycle_model` ([`align`]'s runner,
 //! in its tests), `harness_upgrade_notice_owner_model` (a READY acted on only
@@ -138,8 +145,9 @@
 //! `harness_model_ladder_model` (WHEN a due model move is taken —
 //! [`upgrade_models::model_moves_now`] over every reachable state, in
 //! `aterm-agent/tests/conformance_upgrade_models/ladder.rs`),
-//! `harness_model_switch_model` (the model rule, ladder, announcement and
-//! settle step: one visit's whole read, [`upgrade_models::model_read_step`],
+//! `harness_model_switch_model` (the model rule, ladder, announcement, the
+//! ride's guard and the settle step: one visit's whole read,
+//! [`upgrade_models::model_read_step`],
 //! then [`upgrade_models::model_to`], and a relaunch's
 //! [`upgrade_models::ModelRecord::asked`] and
 //! [`upgrade_models::live_model_at`], over every reachable state, in
@@ -184,6 +192,7 @@ macro_rules! harness_mark {
     };
 }
 
+pub mod accounts;
 pub mod align;
 pub mod cli;
 pub mod disk;
@@ -195,7 +204,7 @@ pub mod relaunch;
 pub mod resume;
 pub mod session_usage;
 pub mod source;
-mod transcript;
+pub(crate) mod transcript;
 pub mod upgrade;
 pub mod upgrade_catalog;
 pub mod upgrade_codex;
@@ -223,21 +232,33 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
     s.get(..end).unwrap_or("")
 }
 
-/// A caller's text as ONE bounded line: cut to `max` bytes on a character
-/// boundary, then folded through the SHIPPED reader
-/// ([`crate::supervise::limit::one_line`]) — every line break and control
-/// character a space, runs of spaces one, the ends trimmed.
-///
-/// One copy, because the fold is the part that is easy to get wrong: a
-/// hand-rolled `char::is_control()` sweep is Cc-only and lets `U+2028` LINE
-/// SEPARATOR through, and this text is quoted from screens, banners and
-/// vendor stdout into status fields, ledger rows and lines typed inside
-/// someone else's transcript. Three modules here each had their own wrapper
-/// around the shipped reader; this is the wrapper.
+/// A caller's text as one bounded line: cut to `max` bytes on a character
+/// boundary, then folded through [`crate::supervise::limit::one_line`] (every
+/// line break and control character, `U+2028` included, a space; runs of
+/// spaces one; the ends trimmed).
 pub(crate) fn one_line(text: &str, max: usize) -> String {
+    if text.len() <= max && is_one_line_already(text) {
+        return text.to_owned();
+    }
     crate::supervise::limit::one_line(truncate_bytes(text, max))
         .trim()
         .to_string()
+}
+
+/// Whether [`one_line`] would hand `text` back as it is: printable ASCII
+/// (nothing a fold turns into a space, nothing `trim` takes), no space at
+/// either end and no two together. A roster label, a session id or a
+/// window's name is such a word, and the roster folds each one every time it
+/// is read or written.
+fn is_one_line_already(text: &str) -> bool {
+    let mut spaced = true;
+    for &b in text.as_bytes() {
+        if !(b' '..=b'~').contains(&b) || (b == b' ' && spaced) {
+            return false;
+        }
+        spaced = b == b' ';
+    }
+    !spaced || text.is_empty()
 }
 
 #[cfg(test)]
@@ -248,9 +269,8 @@ mod tests {
     fn one_line_folds_what_a_hand_rolled_control_sweep_misses() {
         assert_eq!(one_line("  a \n b  ", 99), "a b");
         assert_eq!(one_line("with\ta tab", 99), "with a tab");
-        // NEGATIVE CONTROL for the whole reason this is shared: `U+2028` is
-        // Zl, not Cc, so `char::is_control()` is false for it and a local
-        // sweep would pass it through into a "one line" payload.
+        // Negative control: `U+2028` is Zl, not Cc, so `char::is_control()` is
+        // false for it and a local sweep would pass it through.
         assert!(!'\u{2028}'.is_control());
         assert_eq!(one_line("a\u{2028}b", 99), "a b");
         assert_eq!(one_line("a\u{2029}b", 99), "a b");
@@ -259,6 +279,28 @@ mod tests {
         assert_eq!(one_line("abcdef", 3), "abc");
         assert_eq!(one_line("é😀", 2), "é");
         assert_eq!(one_line("", 0), "");
+        // A word handed back as it is reads exactly as the fold reads it, and
+        // every near miss (a space at an end, two together, a control, a
+        // non-ASCII space, a cut) takes the fold.
+        for (text, max) in [
+            ("work", 80),
+            ("a@b.example", 80),
+            ("five hours left", 80),
+            ("(x) ~y_z-1:2", 80),
+            (" lead", 80),
+            ("trail ", 80),
+            ("two  spaces", 80),
+            ("tab\there", 80),
+            ("nb\u{a0}sp", 80),
+            ("\u{3000}ideo", 80),
+            ("cut here", 3),
+            ("", 80),
+        ] {
+            let folded = crate::supervise::limit::one_line(truncate_bytes(text, max))
+                .trim()
+                .to_string();
+            assert_eq!(one_line(text, max), folded, "{text:?} at {max}");
+        }
     }
 
     #[test]
@@ -267,7 +309,7 @@ mod tests {
         assert_eq!(truncate_bytes("abc", 3), "abc");
         assert_eq!(truncate_bytes("abc", 2), "ab");
         assert_eq!(truncate_bytes("abc", 0), "");
-        // NEGATIVE CASES: a cut that lands inside a multi-byte character
+        // Negative cases: a cut that lands inside a multi-byte character
         // walks back, and a cut inside a four-byte one walks back three.
         assert_eq!(truncate_bytes("é", 1), "", "a two-byte character, cut at 1");
         assert_eq!(truncate_bytes("aé", 2), "a");
@@ -276,7 +318,7 @@ mod tests {
         }
         assert_eq!(truncate_bytes("😀", 4), "😀");
         // Every prefix of a mixed string is valid UTF-8 and no longer than
-        // asked for — the property the three deleted copies each claimed.
+        // asked for.
         let mixed = "a😀é b\u{2028}ω";
         for max in 0..=mixed.len() + 2 {
             let cut = truncate_bytes(mixed, max);

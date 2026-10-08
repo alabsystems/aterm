@@ -1,29 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A DESTRUCTOR THAT PANICS MUST NOT CAUSE A DOUBLE DROP.
+//! A destructor that panics must not cause a double drop.
 //!
-//! This file exists because the differential oracle beside it could not see the
-//! one class of behaviour where the two implementations actually differed. It
-//! drives both through `clear` and `truncate` and counts drops with `Bomb` and
-//! `Tracked` — but every `Drop` impl in it is INFALLIBLE, and the divergence
-//! only appears when a destructor unwinds.
-//!
-//! The bug it missed: `clear`/`truncate` dropped their elements and only then
-//! updated `len`. A panic partway through the loop unwound into
-//! `Drop for ArrayVec`, which calls `clear` again over a `len` that still
-//! described the ALREADY-DROPPED prefix, and dropped it a second time. Measured
-//! before the fix, the drop log read `[0, 1, 0, 1, 2]` for `clear` and
-//! `[2, 0, 1, 2, 3]` for `truncate`; upstream logs each index exactly once.
-//!
-//! The rule this encodes, for the next data structure written here: an oracle
-//! that only ever exercises the happy path proves the happy path. If a type
-//! manages raw memory, at least one test must make a destructor FAIL.
+//! The differential oracle's `Drop` impls are all infallible, so it cannot see
+//! this. `clear`/`truncate` must lower `len` before dropping: otherwise a panic
+//! mid-loop unwinds into `Drop for ArrayVec` (or `SmallVec`), which clears again
+//! over the already-dropped prefix. Any type here that manages raw memory needs at least
+//! one test whose destructor fails.
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use aterm_alloc::ArrayVec;
+use aterm_alloc::{ArrayVec, SmallVec};
 
 thread_local! {
     static DROPS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
@@ -135,15 +124,46 @@ fn truncate_does_not_double_drop_when_a_destructor_panics() {
         seen.len(),
         "every element must be dropped AT MOST once; got {log:?}"
     );
-    // Element 0 IS expected here, exactly once: `truncate` set `len = 1` before
-    // it dropped anything, so when the panic unwinds into `Drop for ArrayVec`
-    // the retained prefix is still live and is dropped then. That is the fix
-    // working, not a leak — the assertion that matters is the no-duplicates one
-    // above. (This comment exists because the first version of this test
-    // asserted `!log.contains(&0)` and failed on correct behaviour.)
+    // Element 0 is expected exactly once: `truncate` set `len = 1` before
+    // dropping, so the retained prefix is still live when the panic unwinds
+    // into `Drop for ArrayVec`, and is dropped there.
     assert!(
         log.contains(&0),
         "the retained element must still be dropped once, by the vector's own \
          Drop during unwinding; got {log:?}"
+    );
+}
+
+#[test]
+fn small_vec_inline_clear_does_not_double_drop_when_a_destructor_panics() {
+    let _ = drain_log();
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        let mut v: SmallVec<Recorder, 8> = SmallVec::new();
+        for index in 0..5 {
+            v.push(Recorder {
+                index,
+                boom: index == 2,
+            });
+        }
+        assert!(v.is_inline());
+        v.clear();
+    }));
+    assert!(
+        caught.is_err(),
+        "the panicking destructor must unwind out of clear"
+    );
+
+    let log = drain_log();
+    assert!(
+        log.contains(&2),
+        "the panicking element was dropped; got {log:?}"
+    );
+    let mut seen = log.clone();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        log.len(),
+        seen.len(),
+        "every element must be dropped AT MOST once; got {log:?}"
     );
 }

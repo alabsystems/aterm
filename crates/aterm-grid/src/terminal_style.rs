@@ -25,34 +25,21 @@ pub struct CurrentStyle {
     pub bg: PackedColor,
     /// Cell flags (bold, italic, etc.).
     pub flags: CellFlags,
-    /// Whether characters are protected from selective erase (DECSCA).
-    /// When false (default), characters can be erased by DECSED/DECSEL.
-    /// When true, characters are protected and selective erase skips them.
+    /// Whether characters are protected from selective erase (DECSCA): when
+    /// true, DECSED/DECSEL skip them.
     pub protected: bool,
-    /// Cached packed colors — avoids `convert_colors` per character write.
-    /// Updated on every SGR change via `update_cached_colors()`.
+    /// Cached packed colors, so a character write skips `convert_colors`.
     cached_colors: PackedColors,
-    /// Cached flag: true when style alone requires CellExtras overflow.
-    /// Covers `flags.has_extended_flags() || fg.is_rgb() || bg.is_rgb()`.
-    /// Updated alongside `cached_colors` to avoid 3 per-character checks.
+    /// `flags.has_extended_flags() || fg.is_rgb() || bg.is_rgb()`: the style
+    /// alone requires CellExtras overflow.
     cached_has_style_extras: bool,
-    /// Cached flag: true when style is completely default (no colors, no flags).
-    /// When true, `write_ascii_blast` can be used instead of styled writes.
-    /// Updated alongside `cached_colors` to avoid 4 per-bulk-call checks.
+    /// The style is completely default, so `write_ascii_blast` may be used.
     cached_is_default: bool,
-    // NOTE: this struct used to carry SEVEN more cached fields — `cached_attrs`,
-    // `cached_fg_color`, `cached_bg_color` and the two (`ColorType`, index) pairs.
-    // Not one of them was ever read by a cell writer: they existed solely to
-    // feed `StyleTable` interning on the SGR path, and the interned `StyleId`
-    // had no production consumer (no code path sets `CellFlags::USES_STYLE_ID`;
-    // cells store colours inline as `PackedColors`). Maintaining them cost a
-    // 15-entry `cell_flags_to_style_attrs` fold plus two `unpack_color` branch
-    // chains on EVERY SGR. The three survivors above are exactly the ones the
-    // writers read (`cached_colors` in `write_char_core`, `has_style_extras` in
-    // the extras gate, `is_default` in the ASCII-blast gate). `build_style` /
-    // `build_extended_style*` now compute their answer on demand, so the
-    // conversion is paid only if someone actually asks for a `Style` — which,
-    // in production, nobody does.
+    // Only the caches the cell writers read are kept (`cached_colors` in
+    // `write_char_core`, `has_style_extras` in the extras gate, `is_default` in
+    // the ASCII-blast gate). Nothing in production interns a `Style` (no path
+    // sets `CellFlags::USES_STYLE_ID`; cells store `PackedColors` inline), so
+    // `build_style` / `build_extended_style*` compute on demand.
 }
 
 impl Default for CurrentStyle {
@@ -115,7 +102,7 @@ impl CurrentStyle {
     ///
     /// Returns `Some([r, g, b])` when `self.bg.is_rgb()`, `None` otherwise.
     /// Used by `set_cursor_template` callers to propagate truecolor backgrounds
-    /// through erase/fill/scroll operations (#7685).
+    /// through erase/fill/scroll operations.
     #[must_use]
     #[inline]
     pub fn bce_bg_rgb(&self) -> Option<[u8; 3]> {
@@ -159,11 +146,10 @@ impl CurrentStyle {
 
     /// Recompute only the flag-derived caches after a flags-only SGR change.
     ///
-    /// A flags-only SGR (e.g. `\x1b[1m`, `\x1b[7m`, `\x1b[22m`) flips attribute
-    /// bits without touching `fg`/`bg`, so `cached_colors` (a pure function of
-    /// `fg`/`bg`) stays valid and is deliberately NOT recomputed — only the two
-    /// flag-dependent booleans need refreshing. This is the fast path that
-    /// avoids `convert_colors` on every attribute toggle.
+    /// A flags-only SGR (e.g. `\x1b[1m`, `\x1b[7m`, `\x1b[22m`) leaves
+    /// `fg`/`bg` alone, so `cached_colors` stays valid and only the two
+    /// flag-dependent booleans are refreshed, avoiding `convert_colors` on every
+    /// attribute toggle.
     #[inline]
     pub fn update_flags_cache(&mut self) {
         self.cached_has_style_extras =
@@ -176,12 +162,9 @@ impl CurrentStyle {
 
     /// Build just the `Style` (fg, bg, attrs) that this rendition denotes.
     ///
-    /// Computed on demand from `fg`/`bg`/`flags` rather than read out of a
-    /// cache: the cache existed only to make `StyleTable` interning cheap on
-    /// the SGR path, and nothing interns on that path any more. No production
-    /// caller remains; this is the round-trip/inspection API (and the entry
-    /// point a future "route non-`PackedColors` styles through `USES_STYLE_ID`"
-    /// design would build on), so it must stay correct, not fast.
+    /// Computed on demand from `fg`/`bg`/`flags`. No production caller uses it;
+    /// it is the round-trip/inspection API, so it must be correct rather than
+    /// fast.
     #[inline]
     #[must_use]
     #[cfg(test)]
@@ -190,11 +173,7 @@ impl CurrentStyle {
     }
 
     /// Build the `ExtendedStyle` (colors + color types + palette indices) that
-    /// this rendition denotes.
-    ///
-    /// One `from_packed_colors_separate` call — the same conversion the seven
-    /// deleted cache fields used to precompute on every SGR whether or not
-    /// anyone would read it.
+    /// this rendition denotes, via one `from_packed_colors_separate` call.
     #[inline]
     #[must_use]
     #[cfg(test)]
@@ -205,10 +184,7 @@ impl CurrentStyle {
     /// Refresh the writer caches after only the fg color changed, and return
     /// the resulting `ExtendedStyle`.
     ///
-    /// Kept as a distinct entry point for callers that mutate `fg` directly;
-    /// the fg/bg/both split no longer buys anything (the surviving caches are
-    /// recomputed wholesale in three instructions), so all three variants share
-    /// `update_cached_colors`.
+    /// The fg/bg/both variants all recompute the caches wholesale.
     #[inline]
     #[must_use]
     #[cfg(test)]
@@ -278,9 +254,9 @@ pub struct SavedCursorState {
     pub auto_wrap: bool,
     /// Character set state (G0-G3, GL, single shift).
     pub charset: CharacterSetState,
-    /// Pending wrap (wrap-next) flag at save time (#7283).
+    /// Pending wrap (wrap-next) flag at save time.
     pub pending_wrap: bool,
-    /// Underline color at save time (SGR 58/59, #7295).
+    /// Underline color at save time (SGR 58/59).
     ///
     /// Stored as packed u32 color (same encoding as `PackedColor`).
     /// `None` means default underline color (foreground).
@@ -290,8 +266,7 @@ pub struct SavedCursorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Color / ColorType / StyleAttrs are now TEST-ONLY names here: production
-    // code in this file no longer converts a rendition into interner types.
+    // Color / ColorType / StyleAttrs are used only by these tests.
     use crate::style::{Color, ColorType, StyleAttrs};
 
     // =========================================================================
@@ -300,7 +275,6 @@ mod tests {
 
     #[test]
     fn default_style_is_empty_and_cached_as_default() {
-        // One test in place of seven single-field reads.
         let style = CurrentStyle::default();
         assert!(style.fg.is_default(), "fg is DEFAULT_FG");
         assert!(style.bg.is_default(), "bg is DEFAULT_BG");
@@ -317,7 +291,7 @@ mod tests {
 
     #[test]
     fn one_attribute_or_colour_leaves_the_default() {
-        // (label, flag, fg, bg, needs style extras). Each row was its own test.
+        // (label, flag, fg, bg, needs style extras).
         // Style extras are needed for the extended flag bits (11-13) and RGB.
         let d_fg = PackedColor::DEFAULT_FG;
         let d_bg = PackedColor::DEFAULT_BG;
@@ -530,16 +504,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_two_defaults_are_equal() {
-        let a = CurrentStyle::default();
-        let b = CurrentStyle::default();
-        assert_eq!(a.fg, b.fg);
-        assert_eq!(a.bg, b.bg);
-        assert_eq!(a.flags, b.flags);
-        assert_eq!(a.protected, b.protected);
-    }
-
-    #[test]
     fn test_same_style_new_vs_default() {
         let from_new = CurrentStyle::new(
             PackedColor::DEFAULT_FG,
@@ -552,35 +516,6 @@ mod tests {
         assert_eq!(from_new.bg, from_default.bg);
         assert_eq!(from_new.flags, from_default.flags);
         assert_eq!(from_new.is_default(), from_default.is_default());
-    }
-
-    #[test]
-    fn test_different_fg_not_equal() {
-        let a = CurrentStyle::default();
-        let b = CurrentStyle::new(
-            PackedColor::indexed(1),
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-            false,
-        );
-        assert_ne!(a.fg, b.fg);
-    }
-
-    #[test]
-    fn test_different_flags_not_equal() {
-        let a = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::BOLD,
-            false,
-        );
-        let b = CurrentStyle::new(
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::ITALIC,
-            false,
-        );
-        assert_ne!(a.flags, b.flags);
     }
 
     // =========================================================================

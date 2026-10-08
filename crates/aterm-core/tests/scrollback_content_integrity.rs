@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! End-to-end scrollback CONTENT integrity under load.
-//!
-//! The scrollback unit tests cover error propagation (`None` on a corrupt/failed
-//! backend) and the lz4 layer has its own round-trip + fuzz tests, but nothing
-//! drove the full engine path — emit many lines → scroll them off into history
-//! (through the hot ring and, past its capacity, the lz4 cold tier) → read them
-//! back BY INDEX — and asserted the exact text survived. This pins that: a
-//! corruption or off-by-one in the ring / materialization / cold-tier round-trip
-//! (a class that has produced real bugs here) now fails a test instead of
-//! silently mangling a user's history.
+//! End-to-end scrollback content integrity under load: emit many lines,
+//! scroll them into history (hot ring, then the lz4 cold tier), read them back
+//! by index and assert the exact text survived.
 
 use aterm_core::terminal::Terminal;
 
@@ -37,9 +30,8 @@ fn logical_history_lines(term: &Terminal) -> Vec<String> {
 
 #[test]
 fn resize_preserves_scrollback_logical_lines_both_directions() {
-    // 190 distinct near-full-width lines so they occupy scrollback and each is
-    // self-identifying. At 38x184 this is the exact shape of the reported bug:
-    // a resize collapsed scrollback and dropped early lines (#7906).
+    // 190 distinct near-full-width lines at 38x184: a resize must not collapse
+    // scrollback or drop early lines.
     let mut term = Terminal::new(38, 184);
     let mut input = Vec::new();
     for i in 0..190u32 {
@@ -60,8 +52,8 @@ fn resize_preserves_scrollback_logical_lines_both_directions() {
     );
     let before_count = before.len();
 
-    // Shrink: wide logical lines rewrap into MORE physical scrollback rows, so
-    // scrollback_lines() must GROW, but no logical line may be lost.
+    // Shrink: wide logical lines rewrap into more physical scrollback rows, so
+    // scrollback_lines() must grow, but no logical line may be lost.
     term.resize(38, 140);
     let after_narrow = logical_history_lines(&term);
     assert!(
@@ -88,9 +80,8 @@ fn resize_preserves_scrollback_logical_lines_both_directions() {
 
 #[test]
 fn resize_round_trip_restores_known_early_line() {
-    // The exact 184 -> 140 -> 184 round-trip from the bug report: a known early
-    // line ("ROW30") must survive both legs, and the round-trip must restore the
-    // scrollback row count to its original value (rewrap is reversible).
+    // A 184 -> 140 -> 184 round-trip: an early line ("ROW30") survives both legs
+    // and the scrollback row count is restored (rewrap is reversible).
     let mut term = Terminal::new(38, 184);
     let mut input = Vec::new();
     for i in 0..190u32 {
@@ -200,12 +191,9 @@ fn scrollback_preserves_line_content_in_order() {
 
 #[test]
 fn synchronized_update_scrolls_nonblank_lines_into_scrollback() {
-    // Box-table repro: a tall batch emitted INSIDE a DEC-2026 synchronized-update
-    // frame (CSI ?2026h … CSI ?2026l) must scroll the exact same non-blank lines
-    // into scrollback as the un-synchronized path. Mode 2026 is a render-deferral
-    // ONLY; it must never gate scroll_up / drop history. (An ad-hoc host probe once
-    // mis-read off-screen rows as blank and suspected an engine bug here — this
-    // pins that the engine is correct, so a real regression fails loudly.)
+    // A tall batch emitted inside a DEC-2026 synchronized-update frame scrolls
+    // the same lines into scrollback as the unsynchronized path: mode 2026
+    // defers rendering only and never gates scroll_up.
     let scrolled = |sync: bool| {
         let mut term = Terminal::new(24, 80);
         let mut input = Vec::new();

@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FLIP's one cfg alias: `wgpu_arm` — "the wgpu renderer arm is compiled
-//! into this build". True on every non-macOS target (where wgpu remains the
-//! production backend) and on macOS ONLY under the `wgpu-oracle` feature
-//! (test/bench builds, activated by the manifest's self-dev-dependency), so
-//! the differential ladder keeps both arms while the shipped macOS closure
-//! carries none of it. A build script rather than a spelled-out
-//! `cfg(any(...))` at ~200 sites because the predicate mixes a target test
-//! with a feature test and has exactly one correct spelling; first-party
-//! build scripts do not move the forge `build_scripts` ratchet (it counts
-//! third-party packages only — budget.rs `ScopeDetail`).
+//! Defines the `wgpu_arm` cfg: the wgpu renderer arm is compiled into this
+//! build. True on every non-macOS target (where wgpu is the production
+//! backend) and on macOS only under the `wgpu-oracle` feature (test builds,
+//! via the manifest's self-dev-dependency), so the differential tests keep
+//! both arms while the shipped macOS build carries none of wgpu. A build
+//! script gives the mixed target/feature predicate one spelling instead of a
+//! `cfg(any(...))` at ~200 sites.
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(wgpu_arm)");

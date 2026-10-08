@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-drive` — the AI-friendly "sugar" CLI over the core `await`/`send`/`key`/
+//! `aterm-drive`: the agent-friendly CLI over the core `await`/`send`/`key`/
 //! `text` primitives. It teaches itself through `--help` and emits actionable
-//! errors, so an AI agent builds correct intuition for the kernel without docs.
-//! All real work uses the core control verbs: a configured prompt reuses one
-//! [`RelayClient`] connection, while discovery and the other commands retain the
-//! std-only `aterm-ctl` client.
+//! errors. A configured prompt reuses one [`RelayClient`] connection;
+//! discovery and the other commands use the std-only `aterm-ctl` client.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,8 +22,8 @@ use crate::supervise::{
 use crate::{ControlClient, CtlClient, DRIVE_HELP, RelayClient, SelfGovernor, Turn, TurnError};
 
 /// Resolve the `aterm-ctl` binary: the alias beside this binary (the bundle's
-/// argv0 alias onto the one binary, or a cargo build's sibling), else bare
-/// `aterm-ctl` on `PATH`. No environment variable repoints it (2026-09-24).
+/// argv0 alias, or a cargo build's sibling), else bare `aterm-ctl` on `PATH`.
+/// No environment variable repoints it.
 fn resolve_ctl() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -33,10 +31,10 @@ fn resolve_ctl() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("aterm-ctl"))
 }
 
-/// The `aterm-ctl` beside the binary at `exe`, looked up from its RESOLVED path. On
-/// macOS `current_exe()` is the path the process was started by, so an `aterm` run
-/// through `~/.local/bin/aterm` would otherwise take `~/.local/bin/aterm-ctl` — where
-/// a copy from an old install sits — over the bundle's own alias.
+/// The `aterm-ctl` beside the binary at `exe`, looked up from its resolved
+/// path: on macOS `current_exe()` is the launch path, so `~/.local/bin/aterm`
+/// would otherwise find an old install's `~/.local/bin/aterm-ctl` before the
+/// bundle's alias.
 pub(crate) fn sibling_ctl(exe: &std::path::Path) -> Option<PathBuf> {
     let exe = exe.canonicalize().ok()?;
     let sib = exe.parent()?.join("aterm-ctl");
@@ -56,15 +54,10 @@ struct Opts {
     cmd: Vec<String>,
 }
 
-/// Resolve the prompt-ready pattern: `--ready`, else the built-in default. The
-/// flag is the one spelling: `$ATERM_DRIVE_READY` was retired (no environment
-/// alternatives in a shipped binary, `aterm-update-core/tests/env_reads.rs`).
-///
-/// The default ([`crate::claude_prompt_ready_pattern`]) matches a Claude input
-/// caret, which is only correct when the driven session IS Claude. Driving any
-/// other REPL/agent needs its own prompt, and driving a plain shell wants no
-/// pattern at all — so this is a knob, not a constant. It stays a BEST-EFFORT
-/// extra settle either way: a non-matching pattern costs a bounded wait, never
+/// Resolve the prompt-ready pattern: `--ready`, else the built-in default
+/// ([`crate::claude_prompt_ready_pattern`], a Claude input caret). Other
+/// REPLs need their own prompt, and a plain shell wants none (empty). It is a
+/// best-effort extra settle: a non-matching pattern costs a bounded wait, never
 /// a failed turn.
 fn resolve_ready(flag: Option<String>) -> String {
     flag.unwrap_or_else(|| crate::claude_prompt_ready_pattern().to_string())
@@ -112,18 +105,10 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
             _ => {
                 cmd.push(a);
                 cmd.extend(it.by_ref());
-                // A VERB FOLLOWED BY `-h`/`--help` ASKS FOR HELP, for every verb.
-                // Only the leading position used to catch it: after a verb word
-                // the loop takes the rest verbatim, so `prompt --help` TYPED
-                // "--help" into the ACTIVE tab and pressed Enter (measured
-                // 2026-09-27 — the active tab was a peer's Claude Code, busy, so
-                // the prompt-ready wait kept it out; an idle one takes it as a
-                // user turn), `read --help` printed that tab's screen, and nine
-                // verbs answered `unknown option '--help'` at exit 1 while telling
-                // the reader to run `aterm drive --help`. Probing help is the
-                // first thing an agent does with a verb; it may never act. Only
-                // an argument that IS the flag counts: `prompt 'what does --help
-                // show'` is one argument and is still text.
+                // A verb followed by `-h`/`--help` asks for help and never acts
+                // (otherwise `prompt --help` would type "--help" into the active
+                // tab). Only an argument that is exactly the flag counts:
+                // `prompt 'what does --help show'` is still text.
                 if matches!(cmd.get(1).map(String::as_str), Some("-h" | "--help")) {
                     cmd = vec!["help".to_string()];
                 }
@@ -141,68 +126,65 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
     })
 }
 
-/// Resolve an explicitly configured LOCAL control endpoint. `Ok(None)` means
-/// `--socket` did not select one, so a local prompt must retain the existing
-/// `aterm-ctl` discovery path. Once a socket IS selected, a missing token is an
-/// error rather than permission to silently drive some other discovered
-/// instance.
+/// Resolve an explicitly configured local control endpoint: the socket
+/// `--socket` names, once the token beside it reads. `Ok(None)` means
+/// `--socket` did not select one, so a local prompt keeps the `aterm-ctl`
+/// discovery path. Once a socket is selected, a missing token is an error.
+///
+/// The token read here only picks the route and is never presented: the
+/// connection presents the token beside the socket read after connecting
+/// ([`RelayClient::connect_local_beside`]), because an update's successor can
+/// take the socket in between with a token of its own.
 fn resolve_configured_local_endpoint_with(
     flag_socket: Option<String>,
     read_token: impl FnOnce(&std::path::Path) -> std::io::Result<String>,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<String>, String> {
     let Some(sock) = flag_socket.filter(|s| !s.is_empty() && s != "0" && s != "off") else {
         return Ok(None);
     };
-    // The SHARED convention, not a hand-rolled one: an instance socket
-    // (`aterm-<pid>.sock`) pairs with `aterm-<pid>.token`, and an explicit
-    // `--control-sock` path with a token named after that socket, resolved in
-    // the socket's own directory and through the `latest` alias. This used to
-    // derive `<stem>.token`, which the server never wrote, so `--dial` silently
-    // failed to authenticate where `aterm ctl` worked; deriving it here AGAIN is
-    // how that came back.
+    // The shared convention: an instance socket (`aterm-<pid>.sock`) pairs with
+    // `aterm-<pid>.token`, and an explicit `--control-sock` path with a token
+    // named after that socket, in the socket's own directory and through the
+    // `latest` alias. Never re-derive it here.
     let tok_path = aterm_uds::latest::token_path_for_sock(&sock).ok_or_else(|| {
         "could not resolve the LOCAL control token: --socket names no file".to_string()
     })?;
-    let token = read_token(&tok_path)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| {
-            format!(
-                "could not resolve the LOCAL control token: {}: {e}",
-                tok_path.display()
-            )
-        })?;
-    Ok(Some((sock, token)))
+    read_token(&tok_path).map_err(|e| {
+        format!(
+            "could not resolve the LOCAL control token: {}: {e}",
+            tok_path.display()
+        )
+    })?;
+    Ok(Some(sock))
 }
 
-/// Resolve the LOCAL host's control socket + capability token when `--socket`
-/// selected one. The token is the sibling token file located by the SHARED
-/// convention (`aterm_uds::latest::token_path_for_sock`) — `aterm-<pid>.token`
-/// for an instance socket, and a token named after any explicit socket. The
-/// legacy shared `aterm.token` is accepted only when the per-socket file is absent.
-/// No environment variable names the socket or the token (2026-09-24).
-fn resolve_configured_local_endpoint(opts: &Opts) -> Result<Option<(String, String)>, String> {
+/// Resolve the local host's control socket when `--socket` selected one whose
+/// token reads, located by `aterm_uds::latest::token_path_for_sock` (the shared
+/// `aterm.token` only when the per-socket file is absent). No environment
+/// variable names the socket or token.
+fn resolve_configured_local_endpoint(opts: &Opts) -> Result<Option<String>, String> {
     resolve_configured_local_endpoint_with(opts.socket.clone(), aterm_ctl::read_control_token_file)
 }
 
 /// `--dial` always needs an explicit LOCAL endpoint; it has no discovery
 /// fallback because the local host is the authority that resolves the saved name.
-fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
+fn resolve_local_endpoint(opts: &Opts) -> Result<String, String> {
     resolve_configured_local_endpoint(opts)?
         .ok_or_else(|| "--dial needs the LOCAL host socket: pass --socket <PATH>".to_string())
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum LocalPromptRoute {
-    Persistent { socket: String, token: String },
+    Persistent { socket: String },
     ShellDiscovery,
 }
 
 /// A missing/unreadable token keeps the pre-existing shell client in charge: it
 /// has its own discovery and classified authentication diagnostics. Only a fully
 /// resolved endpoint opts into the persistent protocol path.
-fn local_prompt_route(endpoint: Result<Option<(String, String)>, String>) -> LocalPromptRoute {
+fn local_prompt_route(endpoint: Result<Option<String>, String>) -> LocalPromptRoute {
     match endpoint {
-        Ok(Some((socket, token))) => LocalPromptRoute::Persistent { socket, token },
+        Ok(Some(socket)) => LocalPromptRoute::Persistent { socket },
         Ok(None) | Err(_) => LocalPromptRoute::ShellDiscovery,
     }
 }
@@ -233,20 +215,60 @@ fn prompt_turn<C: ControlClient>(
     turn.run(client, &mut gov, text.as_bytes())
 }
 
-/// [`run_prompt_turn`] over one persistent connection to `peer`. A connection
-/// that broke mid-turn says it was the connection to `peer`: the socket's own
-/// error (`Broken pipe (os error 32)`) names nothing.
+/// Why a prompt turn over one persistent connection did not finish.
+#[derive(Debug, PartialEq, Eq)]
+enum Unfinished {
+    /// The command failed, in these words: exit 1.
+    Failed(String),
+    /// The connection to its server broke during the turn — an update's
+    /// Commit, a crash, a quit — after which the prompt may already have been
+    /// typed: this note, and exit [`aterm_ctl::EXIT_REPLACED`].
+    Cut(String),
+}
+
+impl Unfinished {
+    /// What `run` makes of it: a failure is its error (exit 1); a cut turn
+    /// prints its note and exits 75 with nothing on stdout, as `watch` and
+    /// `task` print as they go and return only their code.
+    fn into_reply(self) -> Result<Reply, String> {
+        match self {
+            Unfinished::Failed(words) => Err(words),
+            Unfinished::Cut(note) => {
+                eprintln!("aterm-drive: {note}");
+                Ok(Reply {
+                    text: String::new(),
+                    code: aterm_ctl::EXIT_REPLACED,
+                })
+            }
+        }
+    }
+}
+
+/// [`run_prompt_turn`] over one persistent connection to `peer`.
+///
+/// A CONNECTION THAT BROKE MID-TURN IS A CUT TURN (round eight of the update
+/// audit, finding 49): the server went away under it — an update's Commit
+/// `_exit`s it while the turn waits for the reply, after the prompt was typed
+/// and submitted — and nothing follows its successor on this connection. It
+/// exited 1 ("broke"), the code a caller retries, so the prompt was typed a
+/// second time: the failure `aterm ctl turn` exits 75 for (round seven,
+/// finding 17). Now [`Unfinished::Cut`], exit 75, saying whose connection
+/// broke (the socket's own `Broken pipe (os error 32)` names nothing) and not
+/// to send the prompt again blind.
 fn run_relay_prompt_turn<S: std::io::Read + std::io::Write>(
     opts: &Opts,
     client: &mut RelayClient<S>,
     text: &str,
     peer: &str,
-) -> Result<String, String> {
+) -> Result<String, Unfinished> {
     prompt_turn(opts, client, text).map_err(|e| match e {
-        TurnError::Transport(e) if connection_broke(&e) => {
-            format!("the connection to {peer} broke: {e}")
-        }
-        e => e.to_string(),
+        TurnError::Transport(e) if connection_broke(&e) => Unfinished::Cut(format!(
+            "the connection to {peer} broke during the prompt: {e}; the prompt may already \
+             have been typed, and submitted — read the session's screen before sending it \
+             again; never retry it blind (exit {})",
+            aterm_ctl::EXIT_REPLACED
+        )),
+        e => Unfinished::Failed(e.to_string()),
     })
 }
 
@@ -265,32 +287,29 @@ fn connection_broke(e: &std::io::Error) -> bool {
 }
 
 /// Run the configured-endpoint prompt fast path when `route` selected it.
-/// Keeping route resolution outside this seam makes the protocol test
-/// independent of ambient process environment while production still uses the
-/// exact same connection/Turn body.
+/// Route resolution stays outside this seam so the protocol test needs no
+/// ambient environment.
 fn run_persistent_local_prompt(
     opts: &Opts,
     route: LocalPromptRoute,
-) -> Option<Result<String, String>> {
+) -> Option<Result<String, Unfinished>> {
     if opts.cmd.first().map(String::as_str) != Some("prompt") {
         return None;
     }
-    let LocalPromptRoute::Persistent {
-        socket: sock,
-        token,
-    } = route
-    else {
+    let LocalPromptRoute::Persistent { socket: sock } = route else {
         return None;
     };
     let text = opts.cmd[1..].join(" ");
     if text.is_empty() {
-        return Some(Err(
-            "prompt needs text, e.g. `aterm-drive prompt 'say hi'`".to_string()
-        ));
+        return Some(Err(Unfinished::Failed(
+            "prompt needs text, e.g. `aterm drive prompt 'say hi'`".to_string(),
+        )));
     }
     Some(
-        RelayClient::connect_local(&sock, &token)
-            .map_err(|e| format!("cannot connect to the aterm at '{sock}': {e}"))
+        RelayClient::connect_local_beside(&sock)
+            .map_err(|e| {
+                Unfinished::Failed(format!("cannot connect to the aterm at '{sock}': {e}"))
+            })
             .and_then(|mut client| {
                 let peer = format!("the aterm at '{sock}'");
                 run_relay_prompt_turn(opts, &mut client, &text, &peer)
@@ -318,12 +337,16 @@ struct SubArgs {
     sid: Option<String>,
     timeout_ms: Option<u64>,
     /// `watch` / `supervise --approve safe|none`: answer at most what that
-    /// level answers (the flags only LIMIT the owner's `[harness]`).
+    /// level answers (the flags only limit the owner's `[harness]`).
     approve: Option<Approve>,
     /// `--no-continue`: type no continuation at a turn's end.
     no_continue: bool,
     /// `--no-answer`: answer no question for a person; hand it over.
     no_answer: bool,
+    /// `watch` / `supervise --question-priority <word>`: how a question is
+    /// answered (`recommended`, `long-term`, `short-term`), the policy's
+    /// `question_priority`. It never turns answering back on.
+    question_priority: Option<supervise::QuestionPriority>,
     /// `answer --box TOKEN`: the question dialog's token the answer was
     /// decided on (`drive phase`'s `box` line).
     box_token: Option<String>,
@@ -406,8 +429,8 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
             "--timeout" => {
                 out.timeout_ms = Some(int("--timeout", "a millisecond integer", it.next())?)
             }
-            // The loops' LIMITS on the owner's `[harness]`: each takes power
-            // away, none grants it.
+            // Limits on the owner's `[harness]`: each takes power away, none
+            // grants it.
             "--approve" | "--no-continue" | "--no-answer"
                 if !matches!(verb, "watch" | "supervise") =>
             {
@@ -427,6 +450,23 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
             }
             "--no-continue" => out.no_continue = true,
             "--no-answer" => out.no_answer = true,
+            // How the loops answer a question: the policy's `question_priority`
+            // (one resolver for the flag and the window's key). It turns no
+            // answering on.
+            "--question-priority" => {
+                if !matches!(verb, "watch" | "supervise") {
+                    return Err(format!(
+                        "{verb}: --question-priority is watch's and supervise's (the loops that \
+                         answer the worker)"
+                    ));
+                }
+                let what = format!("one of {}", supervise::QuestionPriority::WORDS.join(", "));
+                let word = need("--question-priority", &what, it.next())?;
+                out.question_priority =
+                    Some(supervise::QuestionPriority::parse(&word).ok_or_else(|| {
+                        format!("{verb}: --question-priority needs {what}, not {word:?}")
+                    })?);
+            }
             "--max-s" => out.max_s = Some(int("--max-s", "a seconds integer", it.next())?),
             "--reconnect-s" => {
                 out.reconnect_s = Some(int("--reconnect-s", "a seconds integer", it.next())?)
@@ -610,7 +650,7 @@ fn classify_verb(args: &[String]) -> Result<Reply, String> {
     let cmd = sub.rest.join(" ");
     if cmd.trim().is_empty() {
         return Err(
-            "classify needs a shell command line, e.g. `aterm-drive classify 'git status && git pull'`"
+            "classify needs a shell command line, e.g. `aterm drive classify 'git status && git pull'`"
                 .to_string(),
         );
     }
@@ -649,13 +689,13 @@ fn no_positionals(verb: &str, sub: &SubArgs) -> Result<(), String> {
 }
 
 /// The whole drive CLI as a callable: `argv[1..]` in, exit code out. Served
-/// in-process by the ONE `aterm` binary (`aterm drive …` / argv0 alias) and
-/// by the thin standalone bin.
+/// in-process by the `aterm` binary (`aterm drive …` / argv0 alias) and by the
+/// thin standalone bin.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     let opts = match parse(argv) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("aterm-drive: {e}");
+            eprintln!("aterm drive: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -665,15 +705,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
             ExitCode::from(code)
         }
         Err(e) => {
-            eprintln!("aterm-drive: {e}");
+            eprintln!("aterm drive: {e}");
             if let Some(line) = watch_exit_line(&opts.cmd, &e) {
-                // The journal gets this EXIT too. `watch --journal FILE` says
-                // it appends one record for EVERY line it prints, and a replay
-                // reads that file alone — so a run that died BEFORE the loop
-                // (no host to reach, a flag it cannot parse) has to leave the
-                // reason there, not only on a stdout nobody kept. The loop's
-                // own `Journal::open` is never reached on this path, so the
-                // file is opened here, from the argv as typed.
+                // `watch --journal FILE` records every line it prints, so a run
+                // that dies before the loop (no host, an unparsable flag) writes
+                // its EXIT line there too; the loop's `Journal::open` is never
+                // reached on this path, so the file is opened here from argv.
                 let mut warn = std::io::stderr();
                 let mut journal = supervise::Journal::open(
                     journal_arg(&opts.cmd).as_deref(),
@@ -688,9 +725,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     }
 }
 
-/// The `--journal FILE` of a command line, read straight from the argv rather
-/// than from [`parse_sub`] — a failure BEFORE the loop may BE a sub-flag that
-/// would not parse, and the journal still has to record why the run ended.
+/// The `--journal FILE` of a command line, read straight from argv rather than
+/// [`parse_sub`]: a pre-loop failure may be a sub-flag that does not parse.
 fn journal_arg(cmd: &[String]) -> Option<PathBuf> {
     cmd.windows(2)
         .find(|w| w[0] == "--journal")
@@ -706,10 +742,9 @@ fn watch_sid_arg(cmd: &[String]) -> Option<&str> {
         .find(|a| a.starts_with('@'))
 }
 
-/// The `EXIT <reason>` line `watch` ends on when it fails before its loop
-/// runs — a flag of its own it cannot parse, no host to reach — so a harness
-/// that reads its stdout line by line learns why from the last line, as it
-/// does when the loop fails: the error's first line.
+/// The `EXIT <reason>` line `watch` ends on when it fails before its loop (an
+/// unparsable flag, no host), so a line-by-line reader learns why from the last
+/// line, as when the loop fails.
 fn watch_exit_line(cmd: &[String], err: &str) -> Option<String> {
     (cmd.first().map(String::as_str) == Some("watch"))
         .then(|| format!("EXIT {}", exit_reason(err.lines().next().unwrap_or(err))))
@@ -717,8 +752,7 @@ fn watch_exit_line(cmd: &[String], err: &str) -> Option<String> {
 
 /// What `phase` and `await-turn` print for a turn: the phase and its detail,
 /// then `survey 0` while the session survey is open and `context <n>%` while
-/// Claude Code's context indicator is up ([`render_phase_and_survey`]) —
-/// `await-turn` prints its turn exactly like `phase` — and exit 124 for a
+/// the context indicator is up ([`render_phase_and_survey`]); exit 124 for a
 /// turn the timeout cut short.
 fn phase_reply(turn: &supervise::Turn, allow: &[String]) -> Reply {
     Reply {
@@ -735,15 +769,13 @@ fn run(opts: &Opts) -> Result<Reply, String> {
     if verb == "classify" {
         return classify_verb(&opts.cmd[1..]);
     }
-    // `--dial <name>`: drive a REMOTE aterm over the local host's `dial` relay. A
-    // persistent `RelayClient` speaks the SAME verbs as the local path, so the Turn
-    // is byte-identical — predicates run on the authoritative remote host. Supports
-    // the `prompt` drive loop (the remote use case); other verbs stay local.
+    // `--dial <name>`: drive a remote aterm over the local host's `dial` relay.
+    // A persistent `RelayClient` speaks the same verbs as the local path, so the
+    // Turn is identical and predicates run on the remote host. Only `prompt` is
+    // supported remotely.
     //
-    // ITS REFUSAL RUNS BEFORE `ledger`. The ledger needs no preflight and so
-    // used to be dispatched above this guard — and `--dial box ledger @sid`
-    // then read the LOCAL host in silence and printed a report of the wrong
-    // machine under a remote name, at exit 0, while every other verb said so.
+    // This refusal runs before `ledger`, so `--dial box ledger @sid` never reads
+    // the local host under a remote name.
     if let Some(name) = &opts.dial {
         if verb != "prompt" {
             return Err(
@@ -754,14 +786,17 @@ fn run(opts: &Opts) -> Result<Reply, String> {
         let text = opts.cmd[1..].join(" ");
         if text.is_empty() {
             return Err(
-                "prompt needs text, e.g. `aterm-drive --dial work prompt 'say hi'`".to_string(),
+                "prompt needs text, e.g. `aterm drive --socket PATH --dial work prompt 'say hi'`"
+                    .to_string(),
             );
         }
-        let (sock, token) = resolve_local_endpoint(opts)?;
-        let mut client = RelayClient::dial_via_local(&sock, &token, name)
+        let sock = resolve_local_endpoint(opts)?;
+        let mut client = RelayClient::dial_via_local_beside(&sock, name)
             .map_err(|e| format!("cannot dial '{name}' through the aterm at '{sock}': {e}"))?;
         let peer = format!("'{name}' through the aterm at '{sock}'");
-        return run_relay_prompt_turn(opts, &mut client, &text, &peer).map(Reply::text);
+        return run_relay_prompt_turn(opts, &mut client, &text, &peer)
+            .map(Reply::text)
+            .or_else(Unfinished::into_reply);
     }
 
     // The ledger reads whatever answers and says what did not: a session that
@@ -770,16 +805,14 @@ fn run(opts: &Opts) -> Result<Reply, String> {
         return ledger_verb(opts, &opts.cmd[1..]);
     }
 
-    // A configured local endpoint already gives us everything the control CLI
-    // would rediscover on every verb. Keep one authenticated connection for the
-    // entire prompt turn (send/key/await/text), and let the connect itself replace
-    // the subprocess `cursor` preflight. Other commands deliberately retain the
-    // shell client because this fast path is scoped to the Turn flow.
+    // A configured local endpoint: keep one authenticated connection for the
+    // whole prompt turn (send/key/await/text), replacing the subprocess `cursor`
+    // preflight. Other commands keep the shell client.
     if let Some(result) = run_persistent_local_prompt(
         opts,
         local_prompt_route(resolve_configured_local_endpoint(opts)),
     ) {
-        return result.map(Reply::text);
+        return result.map(Reply::text).or_else(Unfinished::into_reply);
     }
 
     let ctl = resolve_ctl();
@@ -794,7 +827,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
         "prompt" => {
             let text = opts.cmd[1..].join(" ");
             if text.is_empty() {
-                return Err("prompt needs text, e.g. `aterm-drive prompt 'say hi'`".to_string());
+                return Err("prompt needs text, e.g. `aterm drive prompt 'say hi'`".to_string());
             }
             run_prompt_turn(opts, &mut client, &text).map(Reply::text)
         }
@@ -868,10 +901,9 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let sopts = supervise_opts(verb, &sub, harness_policy());
             mail_needs_sid(verb, &sub)?;
             let reconnect = sub.reconnect_s;
-            // The loop's client is one persistent connection where it can be
-            // opened (`aterm-ctl` per request otherwise); `--mail`'s lane is
-            // a client of its own: it parks on YOUR inbox while the loop's
-            // client watches the worker.
+            // The loop's client is one persistent connection where possible
+            // (`aterm-ctl` per request otherwise); `--mail` has its own client,
+            // parked on your inbox while the loop's watches the worker.
             let mut client = supervise_transport(opts, &ctl);
             let mut lane = sopts
                 .mail
@@ -900,7 +932,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
                 .is_some()
                 .then(|| supervise_transport(opts, &ctl));
             // The story lane: the worker's window is told each decision as
-            // `aterm ctl @sid story …` (round 19), through a client of its own.
+            // `aterm ctl @sid story …`, through a client of its own.
             let mut teller = supervise_transport(opts, &ctl);
             let ledger = approvals::default_path(sub.sid.as_deref());
             let mut session = Session::new(&mut client, sub.sid);
@@ -923,7 +955,10 @@ fn run(opts: &Opts) -> Result<Reply, String> {
         // The task goes by mail; the PTY gets at most the one-line nudge.
         "task" => {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
-            let topts = task_opts(opts, &sub)?;
+            let topts = TaskOpts {
+                escape: std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                ..task_opts(opts, &sub)?
+            };
             let code = supervise::task(&mut client, &topts, &mut std::io::stdout())?;
             Ok(Reply {
                 text: String::new(),
@@ -944,7 +979,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             if opts.cmd.len() < 2 {
                 return Err(
                     "await needs a condition: idle <ms> | match <regex> | gone <regex> | seq | block\n  \
-                     e.g. `aterm-drive await match BUILD.SUCCESSFUL` or `aterm-drive await gone \
+                     e.g. `aterm drive await match BUILD.SUCCESSFUL` or `aterm drive await gone \
                      esc.to.interrupt` (a regex is ONE whitespace-free token: the wire never quotes)"
                         .to_string(),
                 );
@@ -1047,11 +1082,9 @@ fn journal_sid(path: Option<&std::path::Path>) -> Option<String> {
 }
 
 /// Where the aterm process hosting `sid` started the clock its `history`,
-/// `inbox` and `timeline` stamps count from: the BIRTH TIME of its control
-/// socket, which it binds as it starts (measured on 2026-09-14: within 0.12 s
-/// of the fabric bus's own wall-clock stamps on the same three messages,
-/// where the process's start time — `ps -o lstart=` — was 5.3 s early,
-/// because the clock is pinned lazily, at the first thing that asks for it).
+/// `inbox` and `timeline` stamps count from: the birth time of its control
+/// socket, bound at startup. (The process start time is seconds early, because
+/// the clock is pinned lazily at first use.)
 fn clock_anchor(sid: &str) -> Result<ClockAnchor, String> {
     let sessions = aterm_ctl::fleet_sessions().map_err(|e| format!("`ls` found nothing: {e}"))?;
     let pid = sessions
@@ -1083,11 +1116,9 @@ fn clock_anchor(sid: &str) -> Result<ClockAnchor, String> {
 }
 
 /// `supervise`'s default budget: the longest its one look leaves a worker
-/// before the manager it returns to is told (30 min — the rate-limit wait
-/// the owner chose). `watch` has none by default: it supervises for as long
-/// as it runs, as the window's host does (the philosophy review of
-/// 2026-09-25: a 30-minute stop was the default and unbounded supervision
-/// the opt-in), and `--max-s` limits it.
+/// before the manager is told (30 min, the rate-limit wait). `watch` has no
+/// default limit (it supervises as long as it runs, like the window's host);
+/// `--max-s` limits it.
 const DEFAULT_MAX_S: u64 = 1800;
 
 /// `supervise`'s and `watch`'s default `--context-warn`: the worker's context
@@ -1104,11 +1135,10 @@ fn set_reconnect<C: supervise::Ctl>(session: &mut Session<'_, C>, reconnect_s: O
     }
 }
 
-/// The client `supervise` and `watch` run on: ONE persistent connection to
-/// the socket `--socket` names (else the one `aterm-ctl` would resolve for
-/// this terminal's session, re-resolved at every redial), authenticated with
-/// the token beside the socket; where that cannot be opened, `aterm-ctl` per
-/// request, with its own discovery and errors.
+/// The client `supervise` and `watch` run on: one persistent connection to the
+/// socket `--socket` names (else the one `aterm-ctl` would resolve for this
+/// terminal's session, re-resolved at every redial), authenticated with the
+/// token beside it; where that fails, `aterm-ctl` per request.
 fn supervise_transport(opts: &Opts, ctl: &std::path::Path) -> Transport {
     let endpoint = match &opts.socket {
         Some(sock) => Endpoint::Socket(sock.clone()),
@@ -1136,31 +1166,33 @@ fn max_budget(verb: &str, max_s: Option<u64>) -> Duration {
     }
 }
 
-/// The owner's `[harness]` policy, read by its one reader
-/// ([`SupervisorConfig::from_path`]) out of the aterm.toml the window reads
-/// ([`crate::harness::cli::default_config_path`]), each note it has on
-/// stderr: `supervise` and `watch` run under the same policy as the window's
-/// host, and their flags may only limit it.
+/// The owner's `[harness]` policy, read by [`SupervisorConfig::from_path`] from
+/// the window's aterm.toml ([`crate::harness::cli::default_config_path`]),
+/// notes on stderr. `supervise` and `watch` run under the window host's policy;
+/// their flags only limit it.
 fn harness_policy() -> SupervisorConfig {
     let (policy, notes) =
         SupervisorConfig::from_path(crate::harness::cli::default_config_path().as_deref());
     for note in notes {
-        eprintln!("aterm-drive: {note}");
+        eprintln!("aterm drive: {note}");
     }
     policy
 }
 
-/// `supervise`'s and `watch`'s options under `policy` ([`harness_policy`]),
-/// fully automatic unless the owner limited it — and every flag only LIMITS
-/// it further: `--approve safe|none` answers at most what that level does,
-/// `--no-continue` and `--no-answer` switch the continuation and the answers
-/// off. No flag turns back on what the policy turned off.
+/// `supervise`'s and `watch`'s options under `policy` ([`harness_policy`]).
+/// Every flag only limits it: `--approve safe|none` answers at most that
+/// level, `--no-continue` and `--no-answer` switch continuation and answers
+/// off. `--question-priority <word>` says how a question is answered (the
+/// policy's `question_priority`) and grants nothing.
 fn supervise_opts(verb: &str, sub: &SubArgs, mut policy: SupervisorConfig) -> SuperviseOpts {
     if let Some(cap) = sub.approve {
         policy.approve = policy.approve.at_most(cap);
     }
     policy.continue_policy &= !sub.no_continue;
     policy.answer_questions &= !sub.no_answer;
+    if let Some(priority) = sub.question_priority {
+        policy.question_priority = priority;
+    }
     // A limit this loop was given is no session's to lift: its `questions`
     // word does not answer over `--no-answer`.
     policy.session_questions &= !sub.no_answer;
@@ -1216,7 +1248,7 @@ fn mail_needs_sid(verb: &str, sub: &SubArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// `task @sid [--deadline S] [--wait] [--inbox @sid] <text>`.
+/// `task @sid [--deadline S] [--wait] [--inbox @sid] [--reconnect-s S] <text>`.
 fn task_opts(opts: &Opts, sub: &SubArgs) -> Result<TaskOpts, String> {
     let worker = sub
         .sid
@@ -1241,6 +1273,11 @@ fn task_opts(opts: &Opts, sub: &SubArgs) -> Result<TaskOpts, String> {
         wait: sub
             .wait
             .then(|| deadline.unwrap_or(Duration::from_millis(opts.timeout_ms))),
+        reconnect: sub
+            .reconnect_s
+            .map_or(supervise::run::DEFAULT_RECONNECT, Duration::from_secs),
+        // The caller's: whether its stdout is a terminal.
+        escape: false,
     })
 }
 
@@ -1296,9 +1333,8 @@ mod tests {
     }
 
     /// `classify <cmd>`: the command is the positional text (joined), the
-    /// verdict is the exit code, `--allow-python` REPLACES the python globs
-    /// (`python_allow` falls back to the defaults only when none is given), and
-    /// no command is a usage error.
+    /// verdict is the exit code, `--allow-python` replaces the python globs,
+    /// and no command is a usage error.
     #[test]
     fn classify_parses_the_command_and_exits_on_the_verdict() {
         let r = classify_verb(&args(&["git status --short && git pull | tail"])).expect("ok");
@@ -1406,6 +1442,7 @@ mod tests {
                 approve: Some(Approve::None),
                 no_continue: false,
                 no_answer: false,
+                question_priority: None,
                 box_token: None,
                 max_s: Some(600),
                 reconnect_s: None,
@@ -1465,8 +1502,7 @@ mod tests {
         assert_eq!(o.context_warn, 10);
         assert_eq!(o.policy, SupervisorConfig::default());
         assert!(!o.yield_when_held && o.idle_host.is_none());
-        // The loop runs under the policy it is handed — the owner's
-        // `[harness]`, as the window's host does — whole: no flag grants
+        // The loop runs under the policy it is handed, whole: no flag grants
         // what it limited. Negative control: a limited policy stays limited.
         let (limited, _) =
             SupervisorConfig::from_aterm_toml("[harness]\ncontinue = false\napprove = \"none\"\n");
@@ -1478,9 +1514,8 @@ mod tests {
         assert_eq!(opts_of("watch", &sub).max, supervise::UNBOUNDED);
         let sub = parse_sub("watch", &args(&["@s-1", "--report"])).expect("parses");
         assert!(opts_of("watch", &sub).report, "watch --report");
-        // Unset, `watch` supervises for as long as it runs (the philosophy
-        // review of 2026-09-25: 30 minutes was the default stop); the one
-        // look of `supervise` keeps its 30-minute budget.
+        // Unset, `watch` supervises as long as it runs; `supervise`'s one look
+        // keeps its 30-minute budget.
         let sub = parse_sub("watch", &args(&[])).expect("parses");
         assert_eq!(opts_of("watch", &sub).max, supervise::UNBOUNDED);
         assert_eq!(
@@ -1520,10 +1555,9 @@ mod tests {
         assert_eq!(watch_exit_line(&args(&["supervise"]), &err), None);
     }
 
-    /// `--mail` and its knobs are watch's and supervise's, into the same
-    /// option (`None` unless given, so nothing changes without the flag);
-    /// the loop needs the worker's @sid to fold only its reports; `--inbox`
-    /// is theirs and task's, and must be a `@sid`.
+    /// `--mail` and its knobs are watch's and supervise's (`None` unless
+    /// given); the loop needs the worker's @sid to fold only its reports;
+    /// `--inbox` is theirs and task's, and must be a `@sid`.
     #[test]
     fn mail_flags_are_the_loops_and_need_the_worker() {
         let sub = parse_sub(
@@ -1593,9 +1627,8 @@ mod tests {
     }
 
     /// The escalation mail's address is `--inbox`, else this terminal's own
-    /// session. (`--resume [RULES]` is gone: a usage limit is resumed unless
-    /// the owner's `[harness] resume_limits` says not, and the standing rules
-    /// are its `rules_file`.)
+    /// session. (A usage limit is resumed unless `[harness] resume_limits` says
+    /// not; the standing rules are its `rules_file`.)
     #[test]
     fn the_manager_is_the_inbox_else_this_terminals_session() {
         let err = parse_sub("watch", &args(&["@s-1", "--resume"])).expect_err("gone");
@@ -1615,9 +1648,10 @@ mod tests {
         );
     }
 
-    /// `task @sid [--deadline S] [--wait] [--inbox @sid] <text>`: the text is
-    /// the positionals, the deadline rides on the post and bounds `--wait`
-    /// (else the global `--timeout` does); its flags are refused everywhere
+    /// `task @sid [--deadline S] [--wait] [--inbox @sid] [--reconnect-s S]
+    /// <text>`: the text is the positionals, the deadline rides on the post
+    /// and bounds `--wait` (else the global `--timeout` does), `--reconnect-s`
+    /// bounds the wait's outages; its flags are refused everywhere
     /// else, and `--no-nudge` is no flag at all — the typed nudge is the verb.
     #[test]
     fn task_parses_the_worker_its_flags_and_the_text() {
@@ -1635,6 +1669,8 @@ mod tests {
                 text: "run it now".to_string(),
                 deadline: Some(Duration::from_secs(600)),
                 wait: Some(Duration::from_secs(600)),
+                reconnect: supervise::run::DEFAULT_RECONNECT,
+                escape: false,
             }
         );
         let sub =
@@ -1646,6 +1682,16 @@ mod tests {
         );
         let sub = parse_sub("task", &args(&["@s-1", "x"])).expect("parses");
         assert_eq!(task_opts(&opts, &sub).expect("a task").wait, None);
+        // `--reconnect-s` bounds the wait's outages, as it does the loops'.
+        let sub = parse_sub(
+            "task",
+            &args(&["@s-1", "--wait", "--reconnect-s", "30", "x"]),
+        )
+        .expect("parses");
+        assert_eq!(
+            task_opts(&opts, &sub).expect("a task").reconnect,
+            Duration::from_secs(30)
+        );
         let sub = parse_sub("task", &args(&["x"])).expect("parses");
         let err = task_opts(&opts, &sub).expect_err("no worker");
         assert!(err.starts_with("task needs the worker"), "{err}");
@@ -1670,54 +1716,11 @@ mod tests {
         );
     }
 
-    /// `await-turn` prints its turn exactly like `phase` — the `survey 0`
-    /// line included while the session survey is open — and exits 124 on a
-    /// turn the timeout cut short; with no survey the text is the phase's
-    /// alone.
-    #[test]
-    fn await_turn_prints_like_phase_the_survey_line_included() {
-        let rule = "─".repeat(120);
-        let body = [
-            "⏺ Done.",
-            "",
-            "✻ Cogitated for 4s · done 2:41 PM",
-            "",
-            "● How is Claude doing this session? (optional)",
-            "  1: Bad    2: Fine   3: Good   0: Dismiss",
-            &rule,
-            "❯",
-            &rule,
-            "  ? for shortcuts",
-        ];
-        let turn = |rows: Vec<String>, timed_out| supervise::Turn {
-            phase: worker_phase(&rows),
-            screen: supervise::screen::Screen {
-                rows,
-                ..supervise::screen::Screen::default()
-            },
-            timed_out,
-        };
-        let rows: Vec<String> = body.iter().map(|r| r.to_string()).collect();
-        let r = phase_reply(&turn(rows.clone(), false), &[]);
-        assert_eq!((r.text.as_str(), r.code), ("idle\nsurvey 0\n", 0));
-        let r = phase_reply(&turn(rows.clone(), true), &[]);
-        assert_eq!(
-            (r.text.as_str(), r.code),
-            ("idle\nsurvey 0\n", EXIT_TIMEOUT)
-        );
-        let plain: Vec<String> = rows
-            .into_iter()
-            .filter(|r| !r.contains("How is Claude doing") && !r.contains("0: Dismiss"))
-            .collect();
-        assert_eq!(phase_reply(&turn(plain, false), &[]).text, "idle\n");
-    }
-
-    /// The loops' flags only LIMIT the owner's `[harness]`: `--approve
-    /// safe|none` lowers what a box may be answered with (never raises it:
-    /// under `approve = "none"`, `--approve safe` is still none), and
-    /// `--no-continue` / `--no-answer` switch those off. The opt-in flags
-    /// they replaced (`--auto-reads`, `--dismiss-surveys`) are gone, and
-    /// every other verb refuses the limits rather than take them silently.
+    /// The loops' flags only limit the owner's `[harness]`: `--approve
+    /// safe|none` lowers what a box may be answered with (under
+    /// `approve = "none"`, `--approve safe` is still none), and `--no-continue`
+    /// / `--no-answer` switch those off. Removed opt-in flags are refused, and
+    /// every other verb refuses the limits.
     #[test]
     fn the_loops_flags_only_limit_the_policy() {
         for verb in ["watch", "supervise"] {
@@ -1759,9 +1762,7 @@ mod tests {
             );
             let err = parse_sub(verb, &args(&["--approve", "all"])).expect_err("not a limit");
             assert!(err.contains("--approve needs safe or none"), "{err}");
-            // A flag only limits: none turns a power on (`--approve-all` and
-            // `--answer-questions`, upstream's opt-ins of 2026-09-24 and
-            // 2026-09-25, are the default here).
+            // No flag turns a power on: these are not flags.
             for gone in [
                 "--auto-reads",
                 "--dismiss-surveys",
@@ -1781,10 +1782,81 @@ mod tests {
         }
     }
 
-    /// `--context-warn <pct>` is watch's and supervise's — the loops that see
-    /// the worker's context run low and compact — a percentage from 0 (off)
-    /// to 100, 10 unless given. It needs a value; anything else, or a verb
-    /// that is not a loop, is refused rather than taken silently.
+    /// `--question-priority <word>` (watch and supervise) sets the policy's
+    /// `question_priority` and turns no answering on: under `--no-answer` or
+    /// `answer_questions = false` a question is still handed over. An unknown
+    /// word, or none, is refused by the flag's name. Negative controls: without
+    /// it the priority is the policy's (`recommended` by default); every other
+    /// verb refuses it.
+    #[test]
+    fn question_priority_is_watchs_and_supervises_and_answers_nothing_the_policy_does_not() {
+        for verb in ["watch", "supervise"] {
+            for (word, want) in [
+                ("long-term", supervise::QuestionPriority::LongTerm),
+                ("short-term", supervise::QuestionPriority::ShortTerm),
+                ("recommended", supervise::QuestionPriority::Recommended),
+            ] {
+                let sub =
+                    parse_sub(verb, &args(&["@s-1", "--question-priority", word])).expect("parses");
+                assert!(no_positionals(verb, &sub).is_ok());
+                let o = opts_of(verb, &sub);
+                assert!(o.policy.answer_questions, "{verb}");
+                assert_eq!(o.policy.question_priority, want, "{verb} {word}");
+                // Nothing else moved.
+                let rest = SupervisorConfig {
+                    question_priority: supervise::QuestionPriority::Recommended,
+                    ..o.policy
+                };
+                assert_eq!(rest, SupervisorConfig::default(), "{verb} {word}");
+                // It answers nothing the policy does not.
+                let sub = parse_sub(
+                    verb,
+                    &args(&["@s-1", "--question-priority", word, "--no-answer"]),
+                )
+                .expect("parses");
+                let p = opts_of(verb, &sub).policy;
+                assert!(!p.answer_questions && !p.session_questions, "{verb} {word}");
+                assert_eq!(p.question_priority, want);
+                let (owner, _) =
+                    SupervisorConfig::from_aterm_toml("[harness]\nanswer_questions = false\n");
+                let sub = parse_sub(verb, &args(&["--question-priority", word])).expect("parses");
+                assert!(!supervise_opts(verb, &sub, owner).policy.answer_questions);
+            }
+            for bad in [
+                vec!["--question-priority", "long_term"],
+                vec!["--question-priority"],
+            ] {
+                let err = parse_sub(verb, &args(&bad)).expect_err(verb);
+                assert!(
+                    err.starts_with(&format!("{verb}: --question-priority needs one of "))
+                        && err.contains("recommended, long-term, short-term"),
+                    "{err}"
+                );
+            }
+            // The owner's priority stands where no flag says otherwise.
+            let (owner, _) = SupervisorConfig::from_aterm_toml(
+                "[harness]\nquestion_priority = \"short-term\"\n",
+            );
+            let sub = parse_sub(verb, &args(&["@s-1"])).expect("parses");
+            assert_eq!(
+                supervise_opts(verb, &sub, owner).policy.question_priority,
+                supervise::QuestionPriority::ShortTerm
+            );
+        }
+        for verb in ["phase", "await-turn", "report", "classify"] {
+            let err =
+                parse_sub(verb, &args(&["--question-priority", "long-term"])).expect_err(verb);
+            assert!(
+                err.starts_with(&format!(
+                    "{verb}: --question-priority is watch's and supervise's"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// `--context-warn <pct>` (watch and supervise): 0 (off) to 100, 10 unless
+    /// given. It needs a value; anything else, or a non-loop verb, is refused.
     #[test]
     fn context_warn_is_watchs_and_supervises_a_percentage() {
         // What a value that is not one is told, after the verb.
@@ -1821,10 +1893,9 @@ mod tests {
         }
     }
 
-    /// `phase` and `await-turn` end with `context <n>%` while Claude Code's
-    /// context indicator is up above the composer — after the `survey 0`
-    /// line when the survey is open too — and a timed-out turn still exits
-    /// 124; without the indicator the text is as before.
+    /// `phase` and `await-turn` end with `context <n>%` while the context
+    /// indicator is up (after `survey 0` when the survey is open too), and a
+    /// timed-out turn still exits 124.
     #[test]
     fn phase_and_await_turn_end_with_the_context_left() {
         let rule = "─".repeat(120);
@@ -1956,9 +2027,8 @@ mod tests {
         (dir.join("control.sock"), dir)
     }
 
-    /// The prompt-ready pattern must be a KNOB, not a constant: the default only
-    /// matches a Claude input caret, so driving any other REPL — or a plain
-    /// shell, which wants no confirm at all — needs an override.
+    /// The prompt-ready pattern is a knob: the default only matches a Claude
+    /// input caret, so other REPLs, or a plain shell (no confirm), override it.
     #[test]
     fn ready_pattern_is_the_flag_else_the_default() {
         let dflt = crate::claude_prompt_ready_pattern();
@@ -1966,21 +2036,17 @@ mod tests {
         // The flag wins outright.
         assert_eq!(resolve_ready(Some(r"^\$ ".to_string())), r"^\$ ");
 
-        // An EMPTY flag is meaningful — idle-only — and must NOT fall through
-        // to the default. This is the branch a naive `filter(|s| !s.is_empty())`
-        // would silently break.
+        // An empty flag means idle-only and must not fall through to the
+        // default (a naive `filter(|s| !s.is_empty())` would break this).
         assert_eq!(resolve_ready(Some(String::new())), "");
 
-        // No flag -> the built-in default, whatever the environment holds: the
-        // retired `$ATERM_DRIVE_READY` is read by nothing.
+        // No flag -> the built-in default, whatever the environment holds.
         assert_eq!(resolve_ready(None), dflt);
     }
 
-    /// `<verb> --help` is a request for help and never an action. `prompt --help`
-    /// used to type "--help" into the active tab and press Enter; `read --help`
-    /// dumped that tab's screen; the other verbs refused the flag at exit 1. Every
-    /// verb, both spellings, lands on the side-effect-free `help` path — and a
-    /// prompt that merely MENTIONS the flag is still the text to send.
+    /// `<verb> --help` is a request for help and never an action: every verb,
+    /// both spellings, lands on the side-effect-free `help` path, and a prompt
+    /// that merely mentions the flag is still text to send.
     #[test]
     fn a_verb_followed_by_help_asks_for_help_and_never_acts() {
         let os = |v: &[&str]| -> Vec<std::ffi::OsString> {
@@ -2032,7 +2098,7 @@ mod tests {
             Ok(r) => r.text,
             Err(e) => panic!("help must not fail: {e}"),
         };
-        assert!(text.contains("aterm-drive"), "{text}");
+        assert!(text.contains("aterm drive"), "{text}");
     }
 
     /// `--ready` takes its value verbatim, including an empty string, and a
@@ -2054,21 +2120,15 @@ mod tests {
         assert!(err.contains("--ready needs a REGEX"), "actionable: {err}");
     }
 
-    /// Regression: the drive CLI must not re-derive the token path itself. The
-    /// shared helper is the single source of truth for the convention.
-    ///
-    /// This used to pin the RESULT (`…/aterm.token`) rather than the agreement,
-    /// which made it a second statement of the convention — and it went red the
-    /// day the convention moved: an explicit socket now pairs with a token named
-    /// after ITSELF, because one shared `aterm.token` per directory meant two
-    /// private instances there overwrote each other's credential (F9). The guard
-    /// that actually holds is the one asserted here — whatever the rule says, the
-    /// drive CLI says the same thing, because it asks the same function.
+    /// The drive CLI asks the shared helper for the token path rather than
+    /// re-deriving it, so it agrees with the convention whatever that is (an
+    /// explicit socket pairs with a token named after itself, so two private
+    /// instances in one directory keep separate credentials).
     #[test]
     fn token_path_uses_the_shared_convention_not_a_stem_swap() {
         for sock in ["/tmp/run/c.sock", "/tmp/run/aterm-42.sock", "/tmp/run/ctl"] {
             let resolved = aterm_uds::latest::token_path_for_sock(sock).expect("resolves");
-            // Named through the SAME mirror the CLI itself calls, so this crate
+            // Named through the same mirror the CLI itself calls, so this crate
             // gains no dependency to state the rule twice.
             let expected = std::path::Path::new(sock)
                 .parent()
@@ -2106,15 +2166,18 @@ mod tests {
             local_prompt_route(Ok(endpoint)),
             LocalPromptRoute::Persistent {
                 socket: "/run/flag.sock".to_string(),
-                token: "capability".to_string(),
             },
-            "the prompt fast path receives the exact explicit endpoint and token"
+            "the prompt fast path receives the exact explicit endpoint"
         );
     }
 
     #[test]
     fn configured_prompt_uses_one_connection_and_no_cursor_preflight() {
         use std::io::{BufRead, BufReader, Write};
+        /// How long the client's next line may take before it is read as a
+        /// hang (AGENTS.md: a hang detector is a minute, never a latency
+        /// budget).
+        const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
         let (socket, dir) = unique_endpoint();
         let socket_text = socket.to_string_lossy().into_owned();
@@ -2125,10 +2188,10 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("one persistent connection");
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(HANG_DETECTOR))
                 .expect("read timeout");
             stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
+                .set_write_timeout(Some(HANG_DETECTOR))
                 .expect("write timeout");
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut writer = stream;
@@ -2153,7 +2216,6 @@ mod tests {
             &prompt_opts(socket_text.clone()),
             LocalPromptRoute::Persistent {
                 socket: socket_text,
-                token: "capability".to_string(),
             },
         )
         .expect("persistent route selected")
@@ -2178,9 +2240,119 @@ mod tests {
         std::fs::remove_dir(dir).expect("remove endpoint directory");
     }
 
+    /// On `aterm drive --socket`, the token read that picks the persistent route
+    /// happens before connecting, and an update's successor can take the socket
+    /// in between (token file rewritten, then the path bound). The connection
+    /// presents the token beside the socket once connected, the successor's;
+    /// the one the route was picked by is refused `ERR auth`.
+    #[test]
+    fn a_listener_replaced_after_the_route_is_picked_is_sent_its_own_token() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let (socket, dir) = unique_endpoint();
+        let socket_text = socket.to_string_lossy().into_owned();
+        let token_path = aterm_uds::latest::token_path_for_sock(&socket_text).expect("token path");
+        std::fs::write(&token_path, "deadbeef\n").expect("the predecessor's token");
+        let opts = prompt_opts(socket_text);
+        let route = local_prompt_route(resolve_configured_local_endpoint(&opts));
+
+        std::fs::remove_file(&token_path).expect("unlink the old token");
+        std::fs::write(&token_path, "cafef00d\n").expect("the successor's token");
+        let successor = aterm_uds::CtlListener::bind(&socket).expect("the successor binds");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = successor.accept().expect("the prompt's connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut writer = stream;
+            let mut auth = String::new();
+            reader.read_line(&mut auth).expect("the AUTH line");
+            if auth != "AUTH cafef00d\n" {
+                writer.write_all(b"ERR auth\n").expect("refusal");
+                return auth;
+            }
+            for reply in [
+                &b"OK\n"[..],
+                b"OK\n",
+                b"OK idle 1\n",
+                b"OK 2\nsettled\n> \n",
+            ] {
+                let mut request = String::new();
+                reader.read_line(&mut request).expect("request line");
+                writer.write_all(reply).expect("reply");
+            }
+            auth
+        });
+
+        let out = run_persistent_local_prompt(&opts, route).expect("persistent route selected");
+        // The turn first: a client that never connected leaves the server
+        // parked in `accept`, so its join comes after a turn that went through.
+        assert_eq!(out.as_deref(), Ok("settled\n> \n"));
+        let auth = server.join().expect("server completes");
+        assert_eq!(
+            auth, "AUTH cafef00d\n",
+            "the successor was sent the token the route was picked by"
+        );
+
+        std::fs::remove_file(&socket).expect("remove socket");
+        std::fs::remove_file(&token_path).expect("remove token");
+        std::fs::remove_dir(dir).expect("remove endpoint directory");
+    }
+
+    /// A PROMPT CUT BY ITS SERVER GOING AWAY IS EXIT 75, NEVER A RETRYABLE 1
+    /// (round eight of the update audit, finding 49). `aterm drive --socket <S>
+    /// prompt` runs its whole turn over one connection; an update that
+    /// Commits while it waits for the reply `_exit`s the server after the
+    /// prompt was typed and submitted. It exited 1 with "the connection …
+    /// broke", the code a caller retries — typing the prompt a second time,
+    /// the failure `aterm ctl turn` was fixed for (round seven, finding 17).
+    /// It now exits 75 (`aterm-ctl`'s code for an exchange its server went
+    /// away under) with nothing on stdout. FAILS WITHOUT THE FIX: `Err`, exit 1.
+    #[test]
+    fn a_prompt_cut_by_its_servers_exit_is_75_never_a_retryable_1() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let (socket, dir) = unique_endpoint();
+        let socket_text = socket.to_string_lossy().into_owned();
+        let token_path = aterm_uds::latest::token_path_for_sock(&socket_text).expect("token path");
+        std::fs::write(&token_path, "capability\n").expect("write token");
+        let listener = aterm_uds::CtlListener::bind(&socket).expect("bind endpoint");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("one persistent connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut writer = stream;
+            // AUTH (no reply), then the typed prompt and its Enter, answered;
+            // then the update's Commit: the wait for the reply is cut.
+            for reply in [&b""[..], b"OK\n", b"OK\n"] {
+                let mut request = String::new();
+                reader.read_line(&mut request).expect("request line");
+                writer.write_all(reply).expect("reply");
+            }
+            let mut wait = String::new();
+            reader.read_line(&mut wait).expect("the wait");
+            wait
+        });
+        let reply = run(&prompt_opts(socket_text));
+        assert!(
+            server.join().expect("server").starts_with("await idle 7"),
+            "the cut came while the turn waited"
+        );
+        assert_eq!(
+            reply,
+            Ok(Reply {
+                text: String::new(),
+                // The number itself: the contract callers (and the
+                // supervisor's loss classifier) read.
+                code: 75,
+            }),
+            "exit 75, nothing on stdout"
+        );
+        std::fs::remove_file(&socket).expect("remove socket");
+        std::fs::remove_file(&token_path).expect("remove token");
+        std::fs::remove_dir(dir).expect("remove endpoint directory");
+    }
+
     /// A persistent connection that breaks mid-turn says whose connection
-    /// broke; the socket's own `Broken pipe` names nothing. NEGATIVE CONTROL: a
-    /// server's `ERR` over a live connection reads as itself.
+    /// broke. Negative control: a server's `ERR` over a live connection reads
+    /// as itself.
     #[test]
     fn a_broken_relay_connection_names_its_peer() {
         struct Wire {
@@ -2213,11 +2385,17 @@ mod tests {
             reply: b"",
             write: Some(std::io::ErrorKind::BrokenPipe),
         });
-        let err = run_relay_prompt_turn(&opts, &mut broken, "hello", peer)
-            .expect_err("a broken pipe fails the turn");
+        let Err(Unfinished::Cut(note)) = run_relay_prompt_turn(&opts, &mut broken, "hello", peer)
+        else {
+            panic!("a broken pipe cuts the turn");
+        };
         assert!(
-            err.starts_with("the connection to the aterm at '/s.sock' broke: "),
-            "{err}"
+            note.starts_with("the connection to the aterm at '/s.sock' broke during the prompt: "),
+            "{note}"
+        );
+        assert!(
+            note.contains("never retry it blind (exit 75)"),
+            "a cut turn says not to type it again blind: {note}"
         );
 
         let mut refused = RelayClient::new(Wire {
@@ -2226,7 +2404,7 @@ mod tests {
         });
         assert_eq!(
             run_relay_prompt_turn(&opts, &mut refused, "hello", peer),
-            Err("ERR denied".to_string())
+            Err(Unfinished::Failed("ERR denied".to_string()))
         );
     }
 
@@ -2264,13 +2442,7 @@ mod tests {
         )
         .expect("flag endpoint resolves");
 
-        assert_eq!(
-            endpoint,
-            Some((
-                "/tmp/run/custom.sock".to_string(),
-                "file-capability".to_string()
-            ))
-        );
+        assert_eq!(endpoint, Some("/tmp/run/custom.sock".to_string()));
     }
 
     #[test]
@@ -2311,10 +2483,10 @@ mod tests {
         std::fs::remove_dir(dir).expect("remove endpoint directory");
     }
 
-    /// The round-11 flags belong to their verbs: `--journal` to the loops
-    /// that write one and to the ledger that reads it back, `--final` and
-    /// `--messages` to `report`, `--format` and `--out` to `ledger`, whose
-    /// `--since` is a TIME where every other verb's is an archive mark.
+    /// Flags belong to their verbs: `--journal` to the loops that write one and
+    /// the ledger that reads it, `--final` and `--messages` to `report`,
+    /// `--format` and `--out` to `ledger`, whose `--since` is a time where every
+    /// other verb's is an archive mark.
     #[test]
     fn the_round_11_flags_belong_to_their_verbs() {
         for verb in ["watch", "supervise"] {
@@ -2436,13 +2608,8 @@ mod tests {
         }
     }
 
-    /// **`--dial` IS REFUSED FOR `ledger`, not silently ignored.**
-    ///
-    /// The ledger needs no control-socket preflight, so it was dispatched
-    /// ABOVE the `--dial` guard — and `aterm drive --dial nonexistent-box
-    /// ledger @sid` read the LOCAL host and printed a full report of the wrong
-    /// machine under a remote name, at exit 0, while `--dial ... report @sid`
-    /// on the same machine said that `--dial` drives only `prompt`.
+    /// `--dial` is refused for `ledger` rather than reading the local host
+    /// under a remote name.
     #[test]
     fn dial_is_refused_for_ledger_like_every_other_non_prompt_verb() {
         for verb in ["ledger", "report", "watch", "read"] {
@@ -2462,13 +2629,9 @@ mod tests {
         }
     }
 
-    /// **THE `EXIT` LINE OF A PRE-LOOP FAILURE REACHES THE JOURNAL.**
-    ///
-    /// `watch --journal FILE` promises one record for EVERY line it prints. A
-    /// run that dies before the loop — no host to reach, a flag it cannot
-    /// parse — prints `EXIT <reason>` from `main_entry`, but `Journal::open`
-    /// lived inside `watch_to`, so the file was never even created and a
-    /// replay saw no record that the watch had run or why it ended.
+    /// A pre-loop failure's `EXIT` line reaches the journal: `watch --journal
+    /// FILE` records every line it prints, including one printed by
+    /// `main_entry` before the loop opens the journal.
     #[test]
     fn a_watch_that_dies_before_its_loop_still_journals_its_exit() {
         let dir = std::env::temp_dir().join(format!(

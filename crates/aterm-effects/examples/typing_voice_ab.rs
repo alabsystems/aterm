@@ -1,53 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TYPING-VOICE A/B — the bench for the KEYSTROKE voice, the way
-//! `mix_meter` is the bench for the ladder. That one cannot answer "does the
-//! typing still read as a phrase": `mix_meter` reports one isolated event's
-//! peak.
+//! Typing-voice A/B: the bench for the keystroke voice, as `mix_meter` is for
+//! the ladder (which reports only one isolated event's peak and cannot say
+//! whether typing reads as a phrase).
 //!
-//! Renders ONE typing script through the real synth in several states of the
+//! Renders one typing script through the real synth in several states of the
 //! borrowed song key ([`TrailSynth`]'s `song_key`, latched by a riff bar) and
 //! measures each: note density, per-note pitch, the interval histogram,
 //! interval-sequence autocorrelation (phrase vs scatter), 15-30 Hz roughness,
-//! spectral centroid, energy above 2 kHz, and level. Deterministic — fixed
-//! seed, fixed script, hand-rolled FFT, no dependency.
+//! spectral centroid, energy above 2 kHz, and level. Deterministic: fixed seed,
+//! fixed script, hand-rolled FFT.
 //!
 //!   cargo run -p aterm-effects --example typing_voice_ab [-- <out_dir>] [--voice <name>] [--all]
 //!   afplay target/typing-voice-ab/a-neutral.wav
 //!
-//! `--voice <name>` renders every scenario in that TYPING-SOUND VOICE
-//! (`SoundVoice::parse`: the picker's canonical spellings or a documented
-//! alias; default `auto` = the rainbow-kitty look's own palette). `--all`
-//! instead renders the `a-neutral` script ONCE PER VOICE of the picker roster
-//! into `<out_dir>/<voice>.wav` (spaces → `-`) and prints one comparable
-//! metrics row per voice — the owner's audition corpus, and the comfort
-//! figures each `palette_trim` comment quotes.
+//! `--voice <name>` renders every scenario in that typing-sound voice
+//! (`SoundVoice::parse`: the picker's canonical spellings or an alias; default
+//! `auto`, the rainbow-kitty palette). `--all` renders the `a-neutral` script
+//! once per voice of the picker roster into `<out_dir>/<voice>.wav` (spaces →
+//! `-`) and prints one comparable metrics row per voice, the figures each
+//! `palette_trim` comment quotes.
 //!
-//! It also benches the GESTURE FAMILY (`trail_sound`'s `gesture_shape` law):
-//! each of Typed / Space / Backspace / Glide± / Sweep± is rendered in
-//! ISOLATION from the same melody state and reported by first-note pitch,
-//! travel in semitones, note count, timbre (centroid, energy over 2 kHz) and
-//! CREST — so "a word motion is a character motion at scale" is a measurement
-//! rather than an intention, and so is "the erase sits ABOVE the keystroke"
-//! (read the Backspace row's CENTROID: the poof is unpitched, so its pitch
-//! columns are a noise-band centre, not a note). (The note COUNT
-//! on a word run reads ±1: its notes overlap heavily, and the beat between a
-//! pulse and its own sub-octave can clear the refractory. TRAVEL is the exact
-//! scale measurement; the note count is a sanity check.)
+//! It also benches the gesture family (`trail_sound`'s `gesture_shape` law):
+//! Typed / Space / Backspace / Glide± / Sweep± each rendered alone from the
+//! same melody state and reported by first-note pitch, travel in semitones,
+//! note count, timbre (centroid, energy over 2 kHz) and crest, so "a word
+//! motion is a character motion at scale" and "the erase sits above the
+//! keystroke" are measured. (Backspace is an unpitched poof, so read its
+//! centroid, not its pitch columns. A word run's note count reads ±1 since its
+//! notes overlap; travel is the exact measure.)
 //!
 //! Scenarios:
-//! - `a-neutral`     — no celebration: the untransposed typed melody.
-//! - `f-family`      — a word typed, corrected, and word-motioned over: the
-//!   whole edit vocabulary in one audible pass.
-//! - `b-after-song-` — a song, then SILENCE, then typing: the key is handed
-//!   back by `is_quiet()`, so this must equal `a-neutral` note for note.
-//! - `d-leak-`       — a song, then typing at 6-8 cps: the gaps between
-//!   keystrokes still reach `is_quiet()`, so the key is handed back.
-//! - `e-leak-fast-`  — a song, then typing at 15 cps: the notes overlap, the
-//!   synth is never quiet, and the borrowed key OUTLIVES the song. The pitch
-//!   spread across held characters is the measurement.
-//! - `c-during-song-` — typing under the live riff (mix, not isolated).
+//! - `a-neutral`: no celebration, the untransposed typed melody.
+//! - `f-family`: a word typed, corrected and word-motioned over, the whole edit
+//!   vocabulary in one pass.
+//! - `b-after-song-`: a song, then silence, then typing; the key is handed back
+//!   by `is_quiet()`, so this must equal `a-neutral` note for note.
+//! - `d-leak-`: a song, then typing at 6-8 cps; the gaps still reach
+//!   `is_quiet()`, so the key is handed back.
+//! - `e-leak-fast-`: a song, then typing at 15 cps; the synth is never quiet and
+//!   the borrowed key outlives the song. The pitch spread is the measurement.
+//! - `c-during-song-`: typing under the live riff (mix, not isolated).
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -65,18 +59,10 @@ const SEED: u32 = 0xBEDA_0D10;
 /// One scripted cue: (time s, gesture, pan, heat).
 type Cue = (f32, SoundGesture, f32, f32);
 
-/// The TYPING script every scenario shares, offset by `t0`: three paragraphs
-/// of 5-8 cps with pauses, an Enter, and a backspace correction.
-///
-/// EVERY SIXTH CHARACTER IS A SPACE (2026-08-28). Until then this script cued
-/// Typed / Jump / Backspace and nothing else, so the SPACE — a per-character
-/// TIER-1 gesture with a voice of its own, and the one the owner named when
-/// they asked for "a more musical space bar" — was invisible to every
-/// measurement this bench prints. English words run ~5 characters, so a space
-/// every sixth is the real word cadence rather than a decoration. (The
-/// dedicated bench for that request is `keyboard_song_ab`, which types actual
-/// prose; this one keeps its own shape so its scenarios stay comparable
-/// with its earlier runs.)
+/// The typing script every scenario shares, offset by `t0`: three paragraphs at
+/// 5-8 cps with pauses, an Enter, and a backspace correction. Every sixth
+/// character is a space (English word cadence), so the space gesture's voice is
+/// measured too. (`keyboard_song_ab` is the dedicated bench that types prose.)
 fn typing_script(t0: f32) -> Vec<Cue> {
     let mut cues: Vec<Cue> = Vec::new();
     let typing = |from: f32, to: f32, cps: f32, heat: f32, cues: &mut Vec<Cue>| {
@@ -120,15 +106,13 @@ struct Scenario {
     cues: Vec<Cue>,
     window: (f32, f32),
     seconds: f32,
-    /// Subtract a riff-ONLY render of the same script, isolating the typed
-    /// layer (the two renders share seed and cue order, so the riff's rng
-    /// draws and voices cancel to the soft-clip residual).
+    /// Subtract a riff-only render of the same script to isolate the typed layer
+    /// (both share seed and cue order, so the riff cancels to the soft-clip
+    /// residual).
     isolate_typing: bool,
 }
 
-/// PRE — no celebration ever fires: `song_key` is structurally 0. This is the
-/// keystroke voice every build shipped before the latch reached the canonical
-/// `RiffBarSig` payload (2026-08-09, `e2efacaf`).
+/// No celebration ever fires: `song_key` is structurally 0.
 fn scenario_neutral() -> Scenario {
     Scenario {
         voice: SoundVoice::Style,
@@ -140,9 +124,8 @@ fn scenario_neutral() -> Scenario {
     }
 }
 
-/// POST — the cat sang eight bars on `ch`, the song ENDED, and the typing
-/// continues. `song_key` is released only by `is_quiet()`, which continuous
-/// typing never reaches, so the whole rest of the session is transposed.
+/// The cat sang eight bars on `ch`, the song ended, and typing continues.
+/// `song_key` is released only by `is_quiet()`.
 fn scenario_after_song(ch: char) -> Scenario {
     let sig = song_signature(ch);
     let mut cues: Vec<Cue> = Vec::new();
@@ -154,8 +137,8 @@ fn scenario_after_song(ch: char) -> Scenario {
             1.0,
         ));
     }
-    // The song ends; 3 s of gap lets every riff voice die and the sing duck
-    // hand back, so what follows is TYPING ALONE — in the borrowed key.
+    // The song ends; 3 s of gap lets every riff voice die and the sing duck hand
+    // back, so what follows is typing alone.
     let t0 = 8.0 * BAR_S + 3.0;
     cues.extend(typing_script(t0));
     Scenario {
@@ -168,12 +151,10 @@ fn scenario_after_song(ch: char) -> Scenario {
     }
 }
 
-/// THE LEAK. Identical to [`scenario_after_song`] except the typing starts
-/// while the last bar is still ringing, so the synth NEVER reaches
-/// `is_quiet()` — the only place `song_key` is released. The measurement
-/// window opens 3 s after the last bar, by which time every riff voice is
-/// dead and the sing duck has handed back: what is scored is TYPING ALONE,
-/// still transposed by a song that stopped.
+/// Like [`scenario_after_song`] but typing starts while the last bar still
+/// rings, so the synth may never reach `is_quiet()`, the only place `song_key`
+/// is released. The window opens 3 s after the last bar (riff voices dead, sing
+/// duck handed back), scoring typing alone.
 fn scenario_leak(ch: char) -> Scenario {
     let sig = song_signature(ch);
     let mut cues: Vec<Cue> = Vec::new();
@@ -201,10 +182,9 @@ fn scenario_leak(ch: char) -> Scenario {
     }
 }
 
-/// THE LEAK, at a cadence that never lets the synth fall silent: 15 cps
-/// (~180 wpm) with a 105 ms note is a continuous voice, so `is_quiet()` —
-/// the ONLY place `song_key` is released — never fires and the borrowed key
-/// outlives the song. Scored over the last 2 s, long after the riff is dead.
+/// The leak at a cadence that never falls silent: 15 cps (~180 wpm) with a
+/// 105 ms note is a continuous voice, so `is_quiet()` never fires and the
+/// borrowed key outlives the song. Scored over the last 2 s.
 fn scenario_leak_fast(ch: char) -> Scenario {
     let sig = song_signature(ch);
     let mut cues: Vec<Cue> = Vec::new();
@@ -232,9 +212,8 @@ fn scenario_leak_fast(ch: char) -> Scenario {
     }
 }
 
-/// The same key held, typing UNDER the live song — the case the feature was
-/// written for. Scored over the riff window; the riff itself is in the mix,
-/// which is the point (roughness is a two-layer property).
+/// Typing under the live song with the same key held. Scored over the riff
+/// window with the riff in the mix (roughness is a two-layer property).
 fn scenario_during_song(ch: char) -> Scenario {
     let sig = song_signature(ch);
     let mut cues: Vec<Cue> = Vec::new();
@@ -258,10 +237,9 @@ fn scenario_during_song(ch: char) -> Scenario {
     }
 }
 
-/// THE EDIT VOCABULARY in one pass: type a word, walk back over it with word
-/// motions, correct it with backspaces, type again. This is the scenario the
-/// one-family rule exists for — the four gestures are heard against each other
-/// rather than one at a time.
+/// The edit vocabulary in one pass: type a word, walk back over it with word
+/// motions, correct it with backspaces, type again, so the gestures are heard
+/// against each other.
 fn scenario_family() -> Scenario {
     let mut cues: Vec<Cue> = Vec::new();
     let mut t = 0.5f32;
@@ -379,7 +357,7 @@ fn render_one(sc: &Scenario) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// FFT (radix-2 DIT, hand-rolled — no dependency)
+// FFT (radix-2 DIT, hand-rolled)
 // ---------------------------------------------------------------------------
 
 fn fft(re: &mut [f32], im: &mut [f32]) {
@@ -444,10 +422,9 @@ fn mag_at(x: &[f32], start: usize, w: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// THE CHIRP WINDOW: 2 ms past the onset (under the attack, past nothing),
-/// where a pitch bend is still in flight. The settled anchor ([`SETTLE`])
-/// deliberately measures the note a gesture LANDS on — which made an audible
-/// upward scoop invisible to this bench. `sweep_st` closes that blind spot.
+/// The chirp window: 2 ms past the onset, where a pitch bend is still in
+/// flight. [`SETTLE`] measures the note a gesture lands on; `sweep_st` compares
+/// the two to catch an upward scoop.
 const EARLY_OFF: usize = SR as usize * 2 / 1000;
 /// The early window's length: 1024 samples (~21 ms), zero-padded into the
 /// shared [`FFT_N`] transform so both windows read the same bin grid.
@@ -469,8 +446,8 @@ fn mag_early(x: &[f32], start: usize) -> Vec<f32> {
 }
 
 /// Dominant partial (Hz) in `lo..hi`, parabolically interpolated. The
-/// RainbowKitty doop is a 25 % pulse whose FUNDAMENTAL is the loudest
-/// partial by design, so the peak IS the note.
+/// RainbowKitty doop is a 25% pulse whose fundamental is the loudest partial,
+/// so the peak is the note.
 fn peak_hz(mag: &[f32], lo: f32, hi: f32) -> f32 {
     let hz_per_bin = SR as f32 / FFT_N as f32;
     let k0 = (lo / hz_per_bin) as usize;
@@ -603,9 +580,8 @@ struct Report {
     interval_hist: Vec<(i32, usize)>,
     unison_pct: f64,
     interval_autocorr: f64,
-    /// Median per-note pitch sweep, semitones: settled-window pitch over
-    /// early-window pitch (`12·log2(late/early)`). Positive = the note rises
-    /// into its anchor — the chirp/squeak artifact, measured.
+    /// Median per-note pitch sweep in semitones, settled over early window
+    /// (`12·log2(late/early)`). Positive means the note rises into its anchor.
     sweep_st: f64,
     roughness: f64,
     centroid_hz: f64,
@@ -645,12 +621,10 @@ fn analyze(name: &str, x: &[f32], window: (f32, f32)) -> Report {
         *hist.entry(iv.round() as i32).or_default() += 1;
     }
     let unison = hist.get(&0).copied().unwrap_or(0) as f64 / intervals.len().max(1) as f64 * 100.0;
-    // THE PITCH SWEEP per note: the settled anchor (SETTLE past onset, the
-    // note the gesture lands on) against the early window (EARLY_OFF past
-    // onset, the note it arrives through). The early peak is searched within
-    // ±4.5 st of the settled pitch so a fixed-pitch tink or an octave error
-    // can never masquerade as a bend; the median across notes is robust to
-    // the occasional onset the fast-typing overlap smears.
+    // Per-note pitch sweep: the settled anchor (SETTLE past onset) against the
+    // early window (EARLY_OFF past onset). The early peak is searched within
+    // ±4.5 st of the settled pitch so a fixed-pitch tink or octave error is not
+    // read as a bend; the median is robust to onsets smeared by overlap.
     let mut sweeps: Vec<f64> = ons
         .iter()
         .filter(|&&s| s + SETTLE + FFT_N < to)
@@ -721,12 +695,11 @@ fn analyze(name: &str, x: &[f32], window: (f32, f32)) -> Report {
 }
 
 // ---------------------------------------------------------------------------
-// THE GESTURE-FAMILY PROBE — each gesture alone, from one melody state
+// Gesture-family probe: each gesture alone, from one melody state
 // ---------------------------------------------------------------------------
 
-/// Render ONE gesture in isolation after a single settling keystroke, so every
-/// probe starts from the same melody state (same phrase, same degree) and the
-/// pitches are directly comparable.
+/// Render one gesture alone after a single settling keystroke, so every probe
+/// starts from the same melody state (phrase, degree) and pitches compare.
 fn probe(kind: SoundGesture, voice: SoundVoice) -> Vec<f32> {
     let mut synth = TrailSynth::new(SR as f32, SEED);
     let ev = |kind| SoundEvent {
@@ -743,9 +716,8 @@ fn probe(kind: SoundGesture, voice: SoundVoice) -> Vec<f32> {
     };
     // One keystroke settles the phrase generator out of its opening cadence.
     synth.push(ev(SoundGesture::Trail(SoundKind::Typed)));
-    // ~340 ms — long enough for the settling note to die completely (so its
-    // tail is not read as the probe's first onset) and short enough to stay
-    // inside `PHRASE_PAUSE_S`, so every probe plays in the same phrase.
+    // ~340 ms: long enough for the settling note to die (so its tail is not the
+    // probe's first onset), short enough to stay inside `PHRASE_PAUSE_S`.
     let mut warm = vec![0.0f32; 16_384 * CHANNELS];
     synth.render(&mut warm);
     synth.push(ev(kind));
@@ -773,22 +745,19 @@ struct FamilyRow {
     crest_db: f64,
 }
 
-/// Notes inside a gesture are never closer than [`CURSOR_SWEEP_STEP_S`]
-/// (55 ms), so a 50 ms refractory turns the envelope-ripple of a pulse wave
-/// beating against its own sub-octave into the single onset it really is.
+/// Notes inside a gesture are at least [`CURSOR_SWEEP_STEP_S`] (55 ms) apart, so
+/// a 50 ms refractory turns a pulse beating against its sub-octave into the
+/// single onset it is.
 const REFRACTORY: usize = SR as usize / 20;
 
-/// The family's contour BEND settles over ~12 ms; anchoring the pitch window
-/// 25 ms past the onset measures the note the gesture LANDS on rather than the
-/// scoop it arrives through.
+/// The contour bend settles over ~12 ms; anchoring the pitch window 25 ms past
+/// the onset measures the note the gesture lands on.
 const SETTLE: usize = SR as usize / 40;
 
-/// Onsets of the NOTES inside one gesture. `onsets` uses a 1.3 ms max-envelope,
-/// which is the right resolution for a 6-8 cps typing stream but reads the
-/// ~200 Hz beat between a pulse and its own sub-octave as a stream of false
-/// attacks inside a single note. Here the envelope is a 5.3 ms RMS (the beat
-/// averages out) with a 40 ms refractory — still well under the
-/// `CURSOR_SWEEP_STEP_S` spacing that separates a run's real notes.
+/// Onsets of the notes inside one gesture. `onsets` uses a 1.3 ms max-envelope
+/// (right for a typing stream, but it reads the ~200 Hz pulse/sub-octave beat as
+/// false attacks); here the envelope is a 5.3 ms RMS with a 40 ms refractory,
+/// under the `CURSOR_SWEEP_STEP_S` spacing of a run's notes.
 fn note_onsets(x: &[f32]) -> Vec<usize> {
     const W: usize = 256;
     let env: Vec<f32> = x
@@ -796,17 +765,16 @@ fn note_onsets(x: &[f32]) -> Vec<usize> {
         .map(|c| (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt())
         .collect();
     let peak = env.iter().fold(0.0f32, |m, &v| m.max(v));
-    // RISE detection, not threshold crossing: the notes of a word-scale run
-    // are 55 ms apart under a 180 ms decay, so they never fall back to a floor
-    // between attacks — only the derivative separates them.
+    // Rise detection, not threshold crossing: a word run's notes are 55 ms apart
+    // under a 180 ms decay and never fall back to a floor between attacks.
     let mut out: Vec<usize> = Vec::new();
     for i in 0..env.len() {
         if env[i] <= peak * 0.15 {
             continue;
         }
-        // The FIRST audible window is an onset by definition (its attack is
-        // shorter than one window, so there is no rise to see); after that a
-        // note announces itself by a rise over the decay it lands on.
+        // The first audible window is an onset by definition (its attack is
+        // shorter than a window); after that a note shows as a rise over the
+        // decay it lands on.
         let rise = i == 0 || env[i] > env[i - 1] * 1.3;
         if !rise {
             continue;
@@ -829,9 +797,9 @@ fn family_row(name: &str, x: &[f32], reference_hz: f64) -> FamilyRow {
         .collect();
     let first = hzs.first().copied().unwrap_or(0.0);
     let last = hzs.last().copied().unwrap_or(0.0);
-    // Score the gesture's OWN BODY — first onset to 200 ms past the last, so a
-    // four-note run and a single note are each measured over themselves and
-    // the crest figure isn't inflated by trailing silence.
+    // Score the gesture's own body, first onset to 200 ms past the last, so a
+    // run and a single note are each measured over themselves and crest is not
+    // inflated by trailing silence.
     let from = ons.first().copied().unwrap_or(0);
     let to = (ons.last().copied().unwrap_or(0) + SR as usize / 5).min(x.len());
     let seg = &x[from..to];
@@ -943,11 +911,10 @@ fn parse_args() -> Args {
     }
 }
 
-/// `--all`: the `a-neutral` script once per voice of the picker roster, one
-/// WAV each, one metrics row each — the audition corpus. Levels are the
-/// window's (3.0–12.5 s of typing) RMS/peak; `typed dBFS` is the isolated
-/// keystroke peak on `mix_meter`'s exact stance (gain 0.4, heat 0.5, pan 0,
-/// bed off), the quantity every `palette_trim` is fitted on.
+/// `--all`: the `a-neutral` script once per picker voice, one WAV and one metrics
+/// row each. Levels are the window's (3.0–12.5 s of typing) RMS/peak; `typed
+/// dBFS` is the isolated keystroke peak at `mix_meter`'s stance (gain 0.4, heat
+/// 0.5, pan 0, bed off), the quantity every `palette_trim` is fitted on.
 fn render_all_voices(out: &std::path::Path) {
     println!(
         "{:<12} {:>10} {:>8} {:>8} {:>8} {:>8} {:>7} {:>8} {:>8}  file",
@@ -1103,7 +1070,7 @@ fn main() {
         );
     }
 
-    // THE GESTURE FAMILY, each gesture alone from one melody state.
+    // The gesture family, each gesture alone from one melody state.
     println!(
         "\nGESTURE FAMILY — one rule (gesture_shape: dir signs the offset+bend, \
          scale sets the notes), measured\n{:<12} {:>5} {:>9} {:>9} {:>9} {:>9} \
@@ -1121,13 +1088,10 @@ fn main() {
     );
     let typed_probe = probe(SoundGesture::Trail(SoundKind::Typed), voice);
     let reference = family_row("Typed", &typed_probe, 0.0).first_hz;
-    // The SPACE joins the family table (2026-08-28): it is a per-character
-    // TIER-1 gesture with a voice of its own, and comparing it against the
-    // keystroke is the only way to see whether the downbeat sits under the
-    // letters. The Backspace row now reads as the erase POOF — unpitched, so
-    // its "first_hz"/"travel"/"offset" columns are a noise-band centre rather
-    // than a note; CENTROID and HI>2K are the columns that mean something for
-    // it, and they are what "poofy higher" is measured in.
+    // The space is a per-character gesture with its own voice; comparing it with
+    // the keystroke shows whether the downbeat sits under the letters. The
+    // Backspace row is the unpitched erase poof: its first_hz/travel/offset
+    // columns are a noise-band centre; read its centroid and HI>2K.
     let family: [(&str, SoundGesture); 7] = [
         ("Typed", SoundGesture::Trail(SoundKind::Typed)),
         ("Space", SoundGesture::Trail(SoundKind::Space)),

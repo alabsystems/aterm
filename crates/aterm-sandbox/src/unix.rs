@@ -2,18 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! POSIX actuator for [`crate::Limits::apply`]: the best-effort per-limit
-//! `setrlimit` loop, moved verbatim from the pre-split `lib.rs`. The capability
-//! gate stays in `lib.rs` (platform-shared); only the OS actuation lives here.
+//! `setrlimit` loop. The capability gate is in `lib.rs`.
 
 use std::io;
 
 use crate::Limits;
 
-/// Apply every requested limit BEST-EFFORT: a limit the OS refuses (e.g. a
-/// 16 GiB `RLIMIT_AS` on macOS, below what every process already maps) must NOT
-/// prevent the limits that DO work (`RLIMIT_NOFILE`) from being installed. Every
-/// limit is attempted; the first per-limit error is returned only after all have
-/// been tried, so one refused limit can never silently leave the child unconfined.
+/// Attempt every requested limit, so one the OS refuses (a 16 GiB `RLIMIT_AS`
+/// on macOS) cannot keep the others from installing; return the first error
+/// after all were tried.
 pub(crate) fn apply_limits(limits: &Limits) -> io::Result<()> {
     let mut first_err: Option<io::Error> = None;
     for (resource, value) in [
@@ -32,11 +29,9 @@ pub(crate) fn apply_limits(limits: &Limits) -> io::Result<()> {
     }
 }
 
-/// The type of a `RLIMIT_*` resource selector, which differs by platform: glibc
-/// Linux types `setrlimit`'s first argument (and its `RLIMIT_*` constants) as
-/// `__rlimit_resource_t` (a `u32`), while macOS/BSD and musl use `c_int`. Aliasing
-/// it keeps [`set_limit`] portable — the `RLIMIT_*` constants already have this
-/// per-platform type, so they pass through without a cast.
+/// The type of a `RLIMIT_*` selector: `__rlimit_resource_t` (`u32`) on glibc
+/// Linux, `c_int` on macOS/BSD and musl. The constants already have it, so they
+/// pass without a cast.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(crate) type RlimitResource = libc::__rlimit_resource_t;
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -45,23 +40,17 @@ pub(crate) type RlimitResource = libc::c_int;
 /// Set the SOFT `resource` limit to `value` while PRESERVING the inherited hard
 /// ceiling (no-op when `value` is `None`).
 ///
-/// We deliberately do NOT lower the hard limit. The spawned `$SHELL` (User mode
-/// runs it transparently) must stay able to RAISE its own soft limit from its rc
-/// — e.g. a `.zshrc` line `ulimit -n 65536` — exactly as under any other
-/// terminal. Clamping the hard limit to the requested value broke that: a soft
-/// request above the (also-lowered) hard limit aborts shell startup with
-/// `ulimit: value exceeds hard limit`. Treating the value as a soft default the
-/// child can raise up to the inherited hard ceiling is the correct semantics for
-/// the non-actuated User sandbox. The soft value is clamped to the hard ceiling
-/// so `setrlimit` can never `EINVAL` on `rlim_cur > rlim_max`.
+/// The hard limit is never lowered: the `$SHELL` must stay able to raise its
+/// soft limit from its rc (a `.zshrc` `ulimit -n 65536`), which a lowered hard
+/// limit turns into `ulimit: value exceeds hard limit` at startup. The soft
+/// value is clamped to the hard ceiling so `setrlimit` cannot `EINVAL` on
+/// `rlim_cur > rlim_max`.
 pub(crate) fn set_limit(resource: RlimitResource, value: Option<u64>) -> io::Result<()> {
     let Some(v) = value else {
         return Ok(());
     };
-    // Read the inherited limits so the hard ceiling is preserved. This is a bare
-    // `getrlimit` syscall (no allocation), so it stays async-signal-safe in the
-    // post-fork child where `apply` runs. If the read fails, fall back to the old
-    // behavior (set both) rather than leaving the limit unconfined.
+    // A bare syscall, no allocation: async-signal-safe in the post-fork child.
+    // If the read fails, set soft and hard to `v` rather than leave it unconfined.
     let mut cur = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

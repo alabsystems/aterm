@@ -1,54 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// PHOSPHOR digital-rain (`rain_quads` + `rain_atlas` + `rain_add`) CPU/GPU
-// parity — the cat_parity method applied to a GENUINE `MatrixRain` emission
-// (aterm-effects, deterministic seed), not hand-built quads. Rain is the same
-// NEAREST 1:1 sprite regime as the cat (bake == dest size, shared RGBA texels,
-// CPU integer src-over vs GPU ALPHA_BLENDING on the sRGB view), so it inherits
-// the pinned effect-only bar — target <= 1, hard <= 2 — but it additionally
-// exercises the one path cat parity leaves trivial: TINT. The rain ramp makes
-// `SpriteQuad::tint` load-bearing (CPU quantizes the multiply to 8 bits via
-// `(c*f+127)/255`; the GPU multiplies in f32 in `fs_sprite_over`), and the
-// tests here assert the emission carries non-trivial tints so the pin can
-// never go vacuous (design §9).
+// Phosphor rain (`rain_quads` + `rain_atlas` + `rain_add`) CPU/GPU parity on a
+// genuine `MatrixRain` emission (deterministic seed). Rain is the same NEAREST
+// 1:1 sprite regime as the cat (bar: target <= 1, hard <= 2) but also
+// exercises tint: the CPU quantizes the multiply to 8 bits via
+// `(c*f+127)/255`, the GPU multiplies in f32 in `fs_sprite_over`, and the
+// tests assert non-trivial tints so the check is never vacuous.
 //
 // Covered:
-//   * base frames WITHOUT rain are byte-exact CPU==GPU (delta 0), so the
-//     measured rain delta is effect-only;
-//   * a genuine rain frame's sprite delta is <= 2 hard (<= 1 target), with
-//     non-trivial, multi-level ramp tints asserted;
-//   * `rain_add` bright-head halos over the background are BYTE-EXACT
-//     (premultiplied One/One == CPU `add_sat`), the glow_parity contract;
-//   * the combined frame (sprites + halos) stays within the sprite bar;
-//   * empty rain channels are byte-identical on the GPU — atlas with no
-//     quads, and a populated input after `clear_overlays` (the
-//     rain_disabled_bytes_identical pin, GPU side) — the rain row of
-//     `tests/empty_channels_gpu.rs`.
+//   * base frames without rain are byte-exact, so the delta is effect-only;
+//   * a rain frame's sprite delta is within the bar, with multi-level tints;
+//   * `rain_add` head halos over the background are byte-exact
+//     (premultiplied One/One == CPU `add_sat`);
+//   * sprites + halos combined stay within the sprite bar;
+//   * empty rain channels (atlas with no quads, or after `clear_overlays`)
+//     are byte-identical on the GPU.
 //
-// Gated: no GPU or no font -> the tests no-op (return), like the other
-// parity gates. Byte-exact additive gates additionally skip on downlevel
-// (sRGB-offscreen) adapters via `additive_is_byte_exact`, the glow idiom.
+// No GPU or no font: no-op. Byte-exact additive checks also skip on downlevel
+// (sRGB-offscreen) adapters via `additive_is_byte_exact`.
 
-mod rain_common;
-
+use crate::common;
+use crate::rain_common::RainScene;
 use aterm_core::terminal::Terminal;
 use aterm_render::{Theme, WindowCpu};
-use rain_common::RainScene;
 
-mod common;
-use common::{backends, max_channel_delta};
+use crate::common::{backends, max_channel_delta};
 
-/// THE rain parity pin (design §9/§10). The base frame is procedural
-/// full-block glyphs + background — byte-exact CPU==GPU (delta 0) — so every
-/// measured delta below is the rain's alone. A real engine is driven to a
-/// rich frame (tinted trail levels + bright-head halos), then each channel is
-/// pinned in isolation and combined:
+/// Rain parity. The base frame is byte-exact, so every delta below is the
+/// rain's. A real engine is driven to a rich frame (tinted trail levels +
+/// head halos), then each channel is checked alone and combined:
 ///   (a) base without rain: delta == 0;
-///   (b) sprites only: delta <= 2 hard (target <= 1), tints non-trivial and
-///       multi-level so the CPU `mul8` vs GPU f32 tint path is exercised;
-///   (c) halos only: BYTE-EXACT over the background (One/One == add_sat);
-///   (d) sprites + halos combined: still within the sprite bar.
+///   (b) sprites only: delta <= 2 hard (target <= 1), tints multi-level so the
+///       CPU `mul8` vs GPU f32 path is exercised;
+///   (c) halos only: byte-exact over the background;
+///   (d) sprites + halos: within the sprite bar.
 #[test]
 fn rain_effect_only_parity_pinned_over_bg_and_text() {
     let theme = Theme::default();
@@ -114,9 +100,8 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
          (target <= 1) — the tinted NEAREST-1:1 path diverged"
     );
 
-    // (c) Halos only: premultiplied additive light over the (byte-exact) base
-    // must be BYTE-EXACT — GPU One/One == CPU add_sat. Downlevel adapters
-    // fold the add into linear (accepted divergence), so gate like glow.
+    // (c) Halos only: premultiplied additive light over the byte-exact base
+    // must be byte-exact. Downlevel adapters add in linear, so gate like glow.
     let mut add_in = term.cell_frame(rows, cols);
     add_in.rain_add = scene.add.clone();
     let cpu_a = cpu.render_input(&add_in);
@@ -139,9 +124,8 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
         eprintln!("SKIP byte-exact rain_add gate: downlevel sRGB offscreen (linear add)");
     }
 
-    // (d) The full frame (sprites + halos), the shape the gui host actually
-    // sends: still within the sprite bar (the additive layer adds no error
-    // where the add is byte-exact).
+    // (d) The full frame (sprites + halos), as the gui sends it: within the
+    // sprite bar.
     if gpu.additive_is_byte_exact() {
         let mut full_in = term.cell_frame(rows, cols);
         scene.apply(&mut full_in);
@@ -156,22 +140,16 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
     }
 }
 
-/// SCISSORED-PATH pin for the GPU rain ROW FILTER (round-3 deferral closed):
-/// with a steady rain field and a ONE-ROW text change, the SCISSORED present
-/// path (`present_input_readback` → `encode_present_frame` → `RepaintScope::
-/// Dirty`) builds + uploads ONLY the `row_active` rain instances. The filter
-/// is pixel-exact because the scissor-band fill in `compute_dirty_rows` marks
-/// every band row a rain quad overlaps — an admitted quad is always on a
-/// fully rebuilt row, a dropped quad is always scissor-clipped.
+/// The GPU rain row filter on the scissored path: with steady rain and a
+/// one-row text change, `present_input_readback` (`RepaintScope::Dirty`)
+/// uploads only `row_active` rain instances. This is pixel-exact because
+/// `compute_dirty_rows` marks every band row a rain quad overlaps, so an
+/// admitted quad is on a fully rebuilt row and a dropped one is clipped.
 ///
-/// Non-vacuity is constructed, not hoped for: the text change lands on a row
-/// that CARRIES rain quads (a wrong DROP there paints a hole the byte-compare
-/// catches), rows past the band carry quads too (so the drop branch actually
-/// executes), and `scissor_taken()` must tick (the frame really took the
-/// Dirty scope — a Full fallback would pass trivially, per codex round-4).
-/// The check needs no cross-backend tolerance: the scissored frame must be
-/// BYTE-IDENTICAL to a fresh full render by an independent renderer. CPU-vs-
-/// GPU stays within the pinned sprite bar on top.
+/// Non-vacuity: the changed row carries rain quads, rows past the band carry
+/// quads too (so the drop branch runs), and `scissor_taken()` must tick. The
+/// scissored frame must equal a fresh full render by an independent renderer;
+/// CPU-vs-GPU stays within the sprite bar.
 #[test]
 fn scissored_path_rain_row_filter_matches_full_render() {
     let theme = Theme::default();
@@ -195,9 +173,8 @@ fn scissored_path_rain_row_filter_matches_full_render() {
         scene.quads.len(),
         qrows.len()
     );
-    // The damaged row: a QUAD-BEARING row with quad rows strictly above AND
-    // below it — the band ends here, so the rows below hold the quads the
-    // filter must DROP while this row's quads must be KEPT and repainted.
+    // The damaged row carries quads, with quad rows above and below it: the
+    // band ends here, so quads below must be dropped and this row's kept.
     let hit_row = qrows[1];
     assert!(
         qrows.first() < Some(&hit_row) && qrows.last() > Some(&hit_row),

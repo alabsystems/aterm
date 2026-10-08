@@ -2,11 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The two checksums PNG carries: CRC-32 (ISO-HDLC) over every chunk, and
-//! Adler-32 over the zlib stream the IDAT chunks concatenate into.
-//!
-//! Both are table-free-to-describe and small enough that a dependency for them
-//! would be absurd; both are also load-bearing, because a chunk whose CRC does
-//! not match is corruption a decoder must not act on.
+//! Adler-32 over the zlib stream the IDAT chunks concatenate into. A chunk
+//! whose CRC does not match is corruption a decoder must not act on.
 
 /// CRC-32/ISO-HDLC (the polynomial PNG specifies, reflected form `0xEDB8_8320`).
 ///
@@ -21,12 +18,9 @@ const SLICE: usize = 8;
 
 /// Reflected CRC-32 tables, filled from the polynomial once per process.
 ///
-/// `T[0]` is the classic byte-at-a-time table, and it is still the entire
-/// definition: the other seven are DERIVED from it, each folding one more zero
-/// byte through the first — `T[k][i] = (T[k-1][i] >> 8) ^ T[0][T[k-1][i] & 0xFF]`.
-/// That keeps the property the module opens with. The polynomial is written
-/// once, the generator is the specification, and nothing here is a
-/// transcription that could be silently wrong.
+/// `T[0]` is the classic byte-at-a-time table; the other seven are DERIVED
+/// from it, each folding one more zero byte through the first:
+/// `T[k][i] = (T[k-1][i] >> 8) ^ T[0][T[k-1][i] & 0xFF]`.
 fn tables() -> &'static [[u32; 256]; SLICE] {
     use std::sync::OnceLock;
     static TABLES: OnceLock<[[u32; 256]; SLICE]> = OnceLock::new();
@@ -69,20 +63,12 @@ impl Crc32 {
         Self(0xFFFF_FFFF)
     }
 
-    /// Fold `bytes` into the running CRC, eight at a time.
+    /// Fold `bytes` into the running CRC, eight at a time (slice-by-8).
     ///
-    /// The byte-at-a-time loop this replaces was not slow because a table
-    /// lookup is slow. It was slow because every iteration's lookup ADDRESS
-    /// depends on the previous iteration's result, so the whole scan is one
-    /// serial chain of load-use latency, one byte deep, and the machine's
-    /// load ports sit idle waiting on it.
-    ///
-    /// Slice-by-8 breaks the chain. Eight bytes are consumed per round and all
-    /// eight lookups are independent — four indices come out of the running CRC
-    /// after the leading four bytes are folded in, four come straight from the
-    /// input — so the loads issue together and only their XOR reduction is
-    /// ordered. Same polynomial, same answer, byte for byte; `tests/oracle.rs`
-    /// proves it against the `png` crate over the whole corpus.
+    /// A byte-at-a-time loop is one serial chain of load-use latency: each
+    /// lookup's address depends on the previous result. Here the eight lookups
+    /// per round are independent, so they issue together and only their XOR
+    /// reduction is ordered.
     pub(crate) fn update(&mut self, bytes: &[u8]) {
         let tables = tables();
         let mut c = self.0;
@@ -101,9 +87,7 @@ impl Crc32 {
                 ^ tables[0][usize::from(head[7])];
             rest = tail;
         }
-        // The tail, and every input shorter than a round, take the original
-        // one-byte step — which is `T[0]` alone, and so is also the check that
-        // the derived tables agree with the table they were derived from.
+        // The tail takes the one-byte step (`T[0]` alone).
         for &b in rest {
             c = tables[0][usize::from((c as u8) ^ b)] ^ (c >> 8);
         }
@@ -115,7 +99,7 @@ impl Crc32 {
         self.0 ^ 0xFFFF_FFFF
     }
 
-    /// CRC of one contiguous run — the whole of what a chunk needs.
+    /// CRC of `parts` folded in order.
     pub(crate) fn of(parts: &[&[u8]]) -> u32 {
         let mut crc = Self::new();
         for part in parts {
@@ -169,15 +153,8 @@ mod tests {
         }
     }
 
-    /// Slice-by-8 against the definition it replaces, at EVERY length from 0 to
-    /// 64 and so at every residue mod 8.
-    ///
-    /// This is the test the change needs and the old suite did not have. The
-    /// split points above are `[0, 1, 7, 64, 499, 999, 1000]`, which never
-    /// leaves a tail of 2, 3, 4, 5 or 6 bytes — and the tail length is exactly
-    /// the variable a sliced implementation gets wrong. The reference here is
-    /// the one-byte step written out longhand from the polynomial, so it shares
-    /// nothing with the derived tables it is checking.
+    /// Slice-by-8 against the bitwise definition at every length 0..=64, so at
+    /// every tail length mod 8. The reference shares nothing with the tables.
     #[test]
     fn slicing_agrees_with_the_byte_at_a_time_definition_at_every_alignment() {
         fn reference(bytes: &[u8]) -> u32 {

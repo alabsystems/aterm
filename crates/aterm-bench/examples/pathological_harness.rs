@@ -1,29 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// PATHOLOGICAL-BENCH (EXCEED_GHOSTTY_PLAN Cluster G / FASTER_THAN_GHOSTTY_PLAN
-// §4 STYLE-1): wall-clock throughput floors under HOSTILE input, the lane the
-// mixed-workload `perf_harness` deliberately does not cover. Same measurement
-// discipline (release subprocess, deterministic corpora, warmup + median-of-N,
-// one flat JSON line on stdout), one floor PER CORPUS so a regression names the
-// workload class that caused it.
+// Pathological-input harness: wall-clock throughput floors under hostile
+// input, which the mixed-workload `perf_harness` does not cover. Release
+// subprocess, deterministic corpora, warmup + median-of-N, one JSON line, and
+// one floor per corpus so a regression names its workload class.
 //
-//   cargo run --release -q -p aterm-bench --example pathological_harness
+//   targo --unverified run --release -q -p aterm-bench --example pathological_harness
 //   -> {"yes_flood_median_mbps":...,...,"n":7,"warmup":2,"corpus_bytes":16777216}
 //
-// The five corpora and why each is here:
-//   yes_flood     `y\r\n` forever — the classic `yes(1)` flood: maximal
-//                 line/scroll rate, minimal payload; the scroll path IS the cost.
-//   escape_storm  cursor-motion-dense short CSIs (~85% escape bytes) — the
-//                 vtebench cursor-motion class; escape-dense TUIs.
-//   style_churn   a distinct truecolor fg+bg per cell — the DOOM-fire class
-//                 (ghostty optimizes for ~16-64 unique styles BY DESIGN; our
-//                 style-interning table must not degrade here).
-//   long_escapes  ~1 KiB OSC payloads (hyperlinks, titles) — long-escape
-//                 throughput, a publicly-admitted ghostty weak spot; exercises
-//                 our bulk OSC scan + the 8 MiB cap discipline.
-//   wide_unicode  CJK + ZWJ-emoji + combining marks — the multibyte decode,
-//                 width, and grapheme paths under maximal pressure.
+// Corpora:
+//   yes_flood     `y\r\n` forever: maximal line/scroll rate, minimal payload.
+//   escape_storm  cursor-motion-dense short CSIs (~85% escape bytes).
+//   style_churn   a distinct truecolor fg+bg per cell (the style-interning
+//                 table must not degrade).
+//   long_escapes  ~1 KiB OSC payloads (hyperlinks, titles): bulk OSC scan and
+//                 the 8 MiB cap.
+//   wide_unicode  CJK + ZWJ emoji + combining marks: multibyte decode, width
+//                 and grapheme paths.
 
 use std::fmt::Write as _;
 use std::time::Instant;
@@ -151,8 +145,8 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 fn main() {
-    // NOTE: the corpus NAME LIST is mirrored by `xtask::perf::PATHOLOGICAL_CORPORA`
-    // (the gate reads `<name>_median_mbps` for each) — keep the two in sync.
+    // The corpus name list is mirrored by `xtask::perf::PATHOLOGICAL_LANE`'s keys
+    // (the gate reads `<name>_median_mbps` for each); keep the two in sync.
     let corpora: [(&str, Vec<u8>); 5] = [
         ("yes_flood", yes_flood()),
         ("escape_storm", escape_storm()),

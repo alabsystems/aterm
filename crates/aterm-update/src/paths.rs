@@ -133,25 +133,51 @@ impl Staging {
     /// rather than through [`Self::resolve`] + `$ATERM_UPDATE_ROOT`, because
     /// `std::env::set_var` is `unsafe` in edition 2024 and a data race under a
     /// multi-threaded test runner — and because a test must never be able to touch
-    /// the real per-user ledgers. The caller removes `root` when done.
+    /// the real per-user ledgers. The root goes when the returned [`ScratchStaging`]
+    /// does, so a test that panics, or forgets, leaves nothing in `$TMPDIR`.
     #[cfg(test)]
-    pub(crate) fn scratch(label: &str) -> Self {
-        static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "aterm-update-{label}-{}-{sequence}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    pub(crate) fn scratch(label: &str) -> ScratchStaging {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-update-{label}-"))
+            .tempdir()
+            .expect("scratch staging root");
+        let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("download")).expect("scratch staging root");
-        Self {
-            apply_lock: root.join("apply.lock"),
-            stage_lock: root.join("stage.lock"),
-            download: root.join("download"),
-            staged_app: root.join("staged").join("aterm.app"),
-            ready: root.join("ready.toml"),
-            status: root.join("status.toml"),
-            root,
+        ScratchStaging {
+            staging: Self {
+                apply_lock: root.join("apply.lock"),
+                stage_lock: root.join("stage.lock"),
+                download: root.join("download"),
+                staged_app: root.join("staged").join("aterm.app"),
+                ready: root.join("ready.toml"),
+                status: root.join("status.toml"),
+                root,
+            },
+            _dir: dir,
         }
+    }
+}
+
+/// [`Staging::scratch`]'s layout, which dereferences to the [`Staging`] and removes
+/// its root on drop.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ScratchStaging {
+    staging: Staging,
+    _dir: aterm_tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for ScratchStaging {
+    type Target = Staging;
+    fn deref(&self) -> &Staging {
+        &self.staging
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for ScratchStaging {
+    fn deref_mut(&mut self) -> &mut Staging {
+        &mut self.staging
     }
 }

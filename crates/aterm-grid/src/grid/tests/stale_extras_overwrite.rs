@@ -2,15 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stale `CellExtras` entry cleanup on overwrite (#7456).
-//!
-//! Overwriting an extras-bearing cell (hyperlink, combining marks, RGB)
-//! used to leave its HashMap entry behind: invisible to readers (gated on
-//! the cell's HAS_EXTRAS flag) but leaking memory and resurfacing when a
-//! later styled write's `get_or_create` landed on the same coordinate.
-//! These tests pin the fix across every grid write path: after the
-//! overwrite, the map entry is GONE (`extras().len()`), and the new cell
-//! content is correct.
+//! Overwriting an extras-bearing cell (hyperlink, combining marks, RGB) removes
+//! its `CellExtras` entry on every grid write path, so no stale entry leaks or
+//! merges into a later styled write at the same coordinate.
 
 use super::*;
 use std::sync::Arc;
@@ -159,12 +153,9 @@ fn write_wide_run_autowrap_clears_stale_extras_entries() {
 
 #[test]
 fn wide_run_autowrap_clears_orphaned_wide_half_at_run_start() {
-    // REGRESSION (wide-orphan fixup): the bulk wide-run write uses a no-fixup
-    // fast path. If the cursor was positioned (e.g. via CUP) onto the SECOND
-    // half of a pre-existing wide char, the no-fixup write overwrites that
-    // continuation while leaving the WIDE base in the previous column orphaned.
-    // The run must run the wide-orphan fixup once before the bulk write so no
-    // dangling WIDE base survives.
+    // The bulk wide-run write runs the wide-orphan fixup once before its
+    // no-fixup fast path, so a run starting on a continuation half leaves no
+    // dangling WIDE base.
     let mut grid = Grid::new(5, 10);
     // Plant a wide char at cols 0-1: col0 = WIDE base, col1 = WIDE_CONTINUATION.
     grid.set_cursor(0, 0);
@@ -177,9 +168,8 @@ fn wide_run_autowrap_clears_orphaned_wide_half_at_run_start() {
             .contains(CellFlags::WIDE_CONTINUATION)
     );
 
-    // CUP onto the continuation half (col 1), then write a wide run through the
-    // bulk path. The first char lands at col 1, overwriting the continuation;
-    // col 0's WIDE base must be cleaned up, not left orphaned.
+    // CUP onto the continuation half (col 1), then a bulk wide run: col 0's WIDE
+    // base is cleaned up.
     grid.set_cursor(0, 1);
     grid.write_mixed_wide_run_autowrap(
         &['🚀', '🚀'],
@@ -196,9 +186,8 @@ fn wide_run_autowrap_clears_orphaned_wide_half_at_run_start() {
 
 #[test]
 fn write_ascii_run_with_extras_does_not_merge_stale_hyperlink() {
-    // The resurrection case: a NEW extras-bearing write landing on an OLD
-    // hyperlink cell used to `get_or_create` the stale entry and merge the
-    // old hyperlink into the new text.
+    // A new extras-bearing write on an old hyperlink cell does not inherit the
+    // stale hyperlink.
     let mut grid = Grid::new(5, 10);
     plant_hyperlink(&mut grid, 0, 0);
 
@@ -244,19 +233,10 @@ fn failed_wide_write_does_not_drop_live_extras() {
     );
 }
 
-/// THE #7522 LEN CLASS, on the bulk wide-RUN lane.
-///
-/// A wide run whose first glyph lands on the WIDE_CONTINUATION half of an
-/// existing wide char orphans that char's base, and the run's own tail can
-/// orphan the continuation of the wide char just past its end. When that
-/// orphan WAS the row's last content, `len` must tighten — otherwise
-/// `row_text`, search and scrollback all report a phantom trailing space.
-///
-/// The single-glyph writer closes this in its else arm
-/// (`write_wide_char_packed_shrinks_len_on_tail_wide_orphan`), and
-/// `fill_cell_run` closes it too. This pins the run lane to the same contract,
-/// because `Row::update_len` is grow-only and a run lane that reaches for it
-/// alone reopens the class.
+/// The bulk wide-run lane tightens `len` like the single-glyph writer and
+/// `fill_cell_run`: a run starting on a continuation orphans that char's base,
+/// and its tail can orphan the continuation just past its end; when that orphan
+/// was the row's last content, `len` shrinks (`Row::update_len` only grows).
 #[test]
 fn wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
     let mut grid = Grid::new(2, 80);
@@ -268,9 +248,9 @@ fn wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
         "three wide chars occupy cols 0..6"
     );
 
-    // Cursor onto col 1 — the CONTINUATION half of `日` — then a two-glyph run.
-    // It orphans `日`'s base at col 0, and its own end orphans `語`'s
-    // continuation at col 5, which is the row's last content.
+    // Cursor on col 1 (the continuation of `日`), then a two-glyph run: it
+    // orphans `日`'s base at col 0 and `語`'s continuation at col 5, the last
+    // content.
     grid.set_cursor(0, 1);
     grid.write_wide_run_autowrap(&['あ', 'い'], PackedColors::new(), CellFlags::empty());
 
@@ -289,14 +269,9 @@ fn wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
     );
 }
 
-/// The SAME obligation on the EMOJI run lane, which has always used the bulk
-/// no-fixup path.
-///
-/// Asserted on the TRAILING SPACE rather than on the glyphs: a non-BMP
-/// codepoint lives in the complex-char ring, so a bare `Grid` renders these as
-/// U+FFFD. The replacement chars are beside the point — whether `len` was left
-/// stale-high is the point, and a stale-high `len` shows up as exactly one
-/// trailing blank.
+/// The same obligation on the emoji run lane. Asserted on the trailing space:
+/// non-BMP glyphs render as U+FFFD on a bare `Grid`, and a stale `len` shows
+/// as exactly one trailing blank.
 #[test]
 fn emoji_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
     let mut grid = Grid::new(2, 80);
@@ -309,9 +284,8 @@ fn emoji_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
     let three = grid.row_text(0).expect("row 0 exists");
     assert_eq!(three.chars().count(), 3, "three emoji occupy cols 0..6");
 
-    // Cursor onto col 1 — the continuation half of the first emoji — then a
-    // two-glyph run whose end orphans the third emoji's continuation at col 5,
-    // which is the row's last content.
+    // Cursor on the first emoji's continuation (col 1), then a two-glyph run
+    // whose end orphans the third emoji's continuation at col 5, the last content.
     grid.set_cursor(0, 1);
     grid.write_emoji_run_autowrap(
         &['\u{1F603}', '\u{1F604}'],

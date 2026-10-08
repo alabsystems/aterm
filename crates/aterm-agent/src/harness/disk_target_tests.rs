@@ -6,7 +6,7 @@
 //! every one of cargo's locks — nothing else).
 //!
 //! Every fixture is laid out as cargo lays a build directory out (the disk
-//! tests' [`lay_target`]: locks in each profile, NONE at the root), extended
+//! tests' [`lay_target`]: locks in each profile, none at the root), extended
 //! with what a real one also holds and must keep: an uplifted binary (a hard
 //! link of its `deps/` twin), a `*.d` file, `examples/`, a criterion baseline,
 //! `doc/`, a nested build directory's own profiles. Each tree lives in its own
@@ -77,7 +77,7 @@ fn held(lock: &Path) -> bool {
     !matches!(HeldLock::try_take(f), Ok(Some(_)))
 }
 
-/// A child FORKED FROM ANOTHER THREAD and kept short of its exec, holding a
+/// A child forked from another thread and kept short of its exec, holding a
 /// copy of every descriptor this process had open at the fork — as every
 /// child any thread spawns does until its exec (the host spawns `df`, `ps`
 /// and `lsof`; a loaded machine stretches the window to tens of
@@ -152,7 +152,7 @@ impl Parked {
 }
 
 /// A build directory with everything a real one also holds and must keep:
-/// the uplifted binary `debug/lay` (a HARD LINK of its `deps/` twin, as cargo
+/// the uplifted binary `debug/lay` (a hard link of its `deps/` twin, as cargo
 /// uplifts), `debug/lay.d`, `debug/examples/ex`, a criterion baseline, a
 /// `doc/` page, and a symlink an uplift left (`debug/lay.dSYM`).
 fn furnished(tmp: &Tmp, name: &str) -> PathBuf {
@@ -213,10 +213,10 @@ fn in_incremental(rel: &Path) -> bool {
         .any(|c| c.as_os_str() == std::ffi::OsStr::new(INCREMENTAL))
 }
 
-/// THE ONLY THING THAT GOES IS AN IDLE PROFILE'S `incremental/`. On a build
+/// The only thing that goes is an idle profile's `incremental/`. On a build
 /// directory laid out as cargo lays one — locks in the profile, none at the
-/// root — the profile is found, its idle cache is reclaimed, and EVERY OTHER
-/// ENTRY of the tree is byte-identical afterwards: the tag, the locks,
+/// root — the profile is found, its idle cache is reclaimed, and every other
+/// entry of the tree is byte-identical afterwards: the tag, the locks,
 /// `deps/`, `build/`, `.fingerprint/`, the uplifted binary and its `.d`,
 /// `examples/`, the dSYM link, the criterion baseline, `doc/`. The bytes
 /// counted are the blocks the query cache released.
@@ -267,11 +267,10 @@ fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_
     assert!(err.to_string().contains("nothing reclaimed"), "{err}");
 }
 
-/// PROFILES ARE FOUND AT ANY DEPTH AND EACH IS JUDGED ALONE:
-/// `<t>/debug`, `<t>/<triple>/release`, a custom profile directory nested
-/// one level further (`<t>/conformance-release/release`, as this machine's
-/// own build directory has), each found by its own locks. A profile written
-/// into inside the window keeps its `incremental/` while the idle ones lose
+/// Profiles are found at any depth and each is judged alone: `<t>/debug`,
+/// `<t>/<triple>/release`, and a custom profile nested one level further
+/// (`<t>/conformance-release/release`), each found by its own locks. A profile
+/// written inside the window keeps its `incremental/` while idle ones lose
 /// theirs.
 #[test]
 fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
@@ -319,7 +318,7 @@ fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
     );
 }
 
-/// A WALK CUT SHORT MAKES THE WHOLE DIRECTORY NOT A CANDIDATE: past its
+/// A walk cut short makes the whole directory not a candidate: past its
 /// entry budget or its depth, the report says so and has no row, however
 /// idle the profiles it did see.
 #[test]
@@ -350,8 +349,8 @@ fn a_walk_cut_short_makes_the_whole_directory_not_a_candidate() {
     assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
 }
 
-/// THE IDLE CLOCK IS THE CACHE DIRECTORIES', NEVER A LOCK'S OR THE
-/// PROFILE'S OWN. A lock file keeps its creation time, so an ancient lock
+/// The idle clock is the cache directories', never a lock's or the
+/// profile's own. A lock file keeps its creation time, so an ancient lock
 /// beside a fresh `deps/` is a profile in use; a freshly touched lock or
 /// profile directory beside old caches is still idle; and a build of
 /// examples alone (`examples/` fresh) keeps it too.
@@ -385,7 +384,7 @@ fn the_idle_clock_is_the_cache_directories_only() {
     assert!(target_witness(&assessed(&t, now), now, STALE).is_err());
 }
 
-/// A BUILD HOLDING ANY ONE OF CARGO'S LOCKS KEEPS ITS PROFILE — in the
+/// A build holding any one of cargo's locks keeps its profile — in the
 /// report (not a candidate, and the reason is the held lock) and in the
 /// reclaim itself, which re-takes the locks: the held profile keeps its
 /// cache byte for byte, while an idle sibling profile in the same build
@@ -435,7 +434,7 @@ fn a_build_holding_any_lock_keeps_its_profile() {
     }
 }
 
-/// THE LOCKS ARE HELD FOR THE WHOLE DELETE AND RELEASED AFTER IT: when the
+/// The locks are held for the whole delete and released after it: when the
 /// delete starts every one of the profile's locks is held (a build that
 /// starts now waits), and once the reclaim is done every one is free.
 #[test]
@@ -461,19 +460,13 @@ fn every_lock_is_held_for_the_whole_delete_and_released_after() {
     );
 }
 
-/// A LOCK IS RELEASED WHILE A CHILD FORKED UNDER IT HAS YET TO EXEC. Every
-/// child any thread of this process spawns holds a copy of every descriptor
-/// until its exec. The reclaim releases each lock by `LOCK_UN`
-/// ([`HeldLock`]), so once it is done every lock is free, the child's copies
-/// notwithstanding. The child here is forked from ANOTHER thread while the
-/// locks are held and kept short of its exec until every stage has been
-/// read ([`Parked`]).
-///
-/// NEGATIVE CONTROL: with [`HeldLock`]'s drop reduced to the close alone (the
-/// reclaim's release before 2026-09-28) this test read every lock held at
-/// `Released` in 5 of 5 runs, and passed 5 of 5 as written. By the same
-/// window a sibling test's `ps` spawn failed this module's tests in full
-/// `aterm-agent` runs under load.
+/// A lock is released while a child forked under it has yet to exec: every
+/// child holds a copy of every descriptor until its exec, and the reclaim
+/// releases each lock by `LOCK_UN` ([`HeldLock`]), so once it is done every
+/// lock is free regardless. The child is forked from another thread while the
+/// locks are held and kept short of its exec until every stage is read
+/// ([`Parked`]). Negative control: with [`HeldLock`]'s drop reduced to a plain
+/// close, every lock reads held at `Released`.
 #[test]
 fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
     let tmp = Tmp::new("fork-window");
@@ -505,21 +498,14 @@ fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
     assert!(!debug.join(INCREMENTAL).exists());
 }
 
-/// THE REPORT'S PROBE RELEASES EACH LOCK WHILE A CHILD FORKED UNDER THE
-/// PROBE HAS YET TO EXEC. The probe ([`locks_held`]) takes each of cargo's
-/// locks for an instant to learn whether a build holds it; a child forked
-/// ([`Parked`]) while it holds each one keeps a copy of that descriptor
-/// until its exec. Released by `LOCK_UN`, every lock is free the moment the
-/// probe returns, the children's copies notwithstanding — so the next
-/// survey reads no build, and the reclaim takes the profile, while every
-/// child is still parked.
-///
-/// NEGATIVE CONTROL: with the probe's release reduced to the close alone
-/// (its own `try_lock`, the file dropped — the variant that passed every
-/// other test) each lock read held after the probe, the next probe answered
-/// "a build holds …/.cargo-lock", and the reclaim failed "nothing reclaimed
-/// — …/debug: a build holds …" — the failure full runs had shown under
-/// load.
+/// The report's probe releases each lock while a child forked under the probe
+/// has yet to exec. The probe ([`locks_held`]) takes each of cargo's locks for
+/// an instant; a child forked ([`Parked`]) while it holds each keeps a copy of
+/// that descriptor until its exec. Released by `LOCK_UN`, every lock is free
+/// when the probe returns, so the next survey reads no build and the reclaim
+/// takes the profile while every child is still parked. Negative control: with
+/// the probe releasing by close alone, each lock reads held after the probe
+/// and the reclaim fails with "a build holds …/.cargo-lock".
 #[test]
 fn a_probed_lock_is_released_while_a_child_forked_under_the_probe_has_yet_to_exec() {
     let tmp = Tmp::new("probe-fork-window");
@@ -560,8 +546,8 @@ fn a_probed_lock_is_released_while_a_child_forked_under_the_probe_has_yet_to_exe
     assert_eq!(done.units, vec![debug.join(INCREMENTAL)], "{done:?}");
 }
 
-/// A COMPILE SINCE THE SURVEY KEEPS THE PROFILE: the verdict is derived
-/// again UNDER the locks, and a cache written into since then is no longer
+/// A compile since the survey keeps the profile: the verdict is derived
+/// again under the locks, and a cache written into since then is no longer
 /// idle — nothing is deleted.
 #[test]
 fn a_compile_since_the_survey_keeps_the_profile() {
@@ -579,8 +565,49 @@ fn a_compile_since_the_survey_keeps_the_profile() {
     assert!(debug.join(INCREMENTAL).exists());
 }
 
-/// A MISSING LOCK IS CREATED ONLY WHEN THE REMOVAL PROCEEDS, AND ONE THAT
-/// CANNOT BE CREATED SKIPS THE PROFILE. A profile an older cargo built holds
+/// An unread clock is said as one: re-derived under the locks, a profile
+/// whose caches' clock could not be read is refused by both passes with that
+/// reason, never dated "written into 0d ago" (a time nobody measured). A
+/// profile written into since the threshold is still dated in days, and one
+/// inside the last ten minutes names the rule that keeps it.
+#[test]
+fn an_unread_clock_is_said_never_dated_zero_days() {
+    let now = 2_000_000_000;
+    let unread = "its caches' clock could not be read";
+    let idle = Select::Idle { leave: &[] };
+    assert_eq!(idle.refuses(None, &judge(now)).as_deref(), Some(unread));
+    let lru = Select::Lru {
+        profile: Path::new("target/debug"),
+        seen: now,
+    };
+    assert_eq!(lru.refuses(None, &judge(now)).as_deref(), Some(unread));
+    // The dated arms stand as they were: past the window it is idle, inside
+    // it the days are said, and at a 0-day window the ten minutes are.
+    assert_eq!(
+        idle.refuses(Some(now - (STALE + 1) * DAY), &judge(now)),
+        None
+    );
+    let recent = idle
+        .refuses(Some(inside_window(now)), &judge(now))
+        .expect("inside the window");
+    assert_eq!(
+        recent,
+        format!("no longer idle: written into 0d ago, under the {STALE}d threshold")
+    );
+    let zero = Judge {
+        threshold_days: 0,
+        ..judge(now)
+    };
+    assert_eq!(
+        idle.refuses(Some(now - 5 * 60), &zero).as_deref(),
+        Some(
+            "no longer idle: written into 5 min ago; no reclaim takes a profile built in the last 10 min"
+        )
+    );
+}
+
+/// A missing lock is created only when the removal proceeds, and one that
+/// cannot be created skips the profile. A profile an older cargo built holds
 /// only `.cargo-lock`: the report creates nothing; the reclaim creates the
 /// other two and holds them. With `.cargo-lock` held, nothing is created. And
 /// when creating one fails — a full disk (ENOSPC) or a read-only profile —
@@ -646,14 +673,14 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
     assert_eq!(only(&t), 1);
 }
 
-/// NOTHING IS REACHED THROUGH A SYMLINK:
+/// Nothing is reached through a symlink:
 /// * a component of the build directory's path swapped for a link after
 ///   the survey refuses the whole reclaim, and the link's target is
 ///   untouched;
 /// * a profile's `incremental` that is a link is not followed (and not a
 ///   candidate);
 /// * a link inside `incremental/` is unlinked, its target kept;
-/// * a profile directory swapped for a link WHILE its locks are held
+/// * a profile directory swapped for a link while its locks are held
 ///   redirects nothing: the work continues on the handle that was checked.
 #[test]
 fn nothing_is_reached_through_a_symlink() {
@@ -725,7 +752,7 @@ fn nothing_is_reached_through_a_symlink() {
     );
 }
 
-/// THE DELETE NEVER ENTERS ANOTHER DEVICE: a directory inside
+/// The delete never enters another device: a directory inside
 /// `incremental/` on "another device" (the device check told so) is not
 /// entered — it stays, reported, and uncounted — while everything else in
 /// the cache goes.
@@ -765,7 +792,7 @@ fn the_delete_never_enters_another_device() {
     assert!(t.join("debug").join(INCREMENTAL).exists());
 }
 
-/// WHAT IS COUNTED IS WHAT THE UNLINKS RELEASED: a file hard-linked into
+/// What is counted is what the unlinks released: a file hard-linked into
 /// `deps/` (rustc links incremental objects there) frees nothing and is not
 /// counted — the `deps/` name keeps the data — and a sparse file counts the
 /// blocks it holds, not its length. The report's estimate and the reclaim's
@@ -796,7 +823,7 @@ fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
     );
 }
 
-/// AN UNDELETABLE ENTRY IS REPORTED AND THE REST STILL GOES: a read-only
+/// An undeletable entry is reported and the rest still goes: a read-only
 /// directory inside the cache keeps its file; every sibling is deleted and
 /// counted; the stuck file is reported and not counted; and
 /// `incremental/` itself, not empty, is not claimed as gone.
@@ -834,7 +861,7 @@ fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
     );
 }
 
-/// A SOURCE TREE IS NEVER A CANDIDATE: a directory holding a `Cargo.toml`
+/// A source tree is never a candidate: a directory holding a `Cargo.toml`
 /// or `src/` at its root is not build output, whatever it holds.
 #[test]
 fn a_directory_holding_source_is_never_a_candidate() {
@@ -849,7 +876,7 @@ fn a_directory_holding_source_is_never_a_candidate() {
     assert!(t.join("debug").join(INCREMENTAL).exists());
 }
 
-/// A RECLAIM CUT SHORT DOES NOT RESET THE IDLE CLOCK. Unlinking a child
+/// A reclaim cut short does not reset the idle clock. Unlinking a child
 /// writes its parent's mtime, so a delete that keeps one entry of
 /// `incremental/` (an entry it cannot delete, a mount, a quit mid-pass)
 /// leaves `incremental/` written "now". The clock is `deps/`,
@@ -896,7 +923,7 @@ fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
     assert!(!inc.exists());
 }
 
-/// A LOCK THE RECLAIM CREATES IS THE FILE CARGO WOULD HAVE CREATED: its
+/// A lock the reclaim creates is the file cargo would have created: its
 /// mode is `0666` under the umask, as cargo's `OpenOptions` gives it, never
 /// a private `0600` a build by another member of a shared build directory's
 /// group could not open.
@@ -930,7 +957,7 @@ fn a_created_lock_takes_the_mode_cargo_gives_it() {
     }
 }
 
-/// AN EMPTY `incremental/` IS NOTHING TO RECLAIM: an idle profile whose
+/// An empty `incremental/` is nothing to reclaim: an idle profile whose
 /// cache holds nothing (every release profile, every `CARGO_INCREMENTAL=0`
 /// build) is not a candidate — no row counts it, the reclaim takes no lock
 /// in it and creates none, and its empty directory stays — while an idle
@@ -978,9 +1005,9 @@ fn an_empty_incremental_is_not_a_candidate_and_gets_no_lock() {
     assert!(!release.join(".cargo-artifact-lock").exists());
 }
 
-/// THE DEVICE A PATH NAMES IS THE ONE IT RESOLVES TO: `dev_of` follows a
+/// The device a path names is the one it resolves to: `dev_of` follows a
 /// link, as the free-space figure and the volume filter do, so a home that
-/// is a link to another volume fences the reclaim to THAT volume rather than
+/// is a link to another volume fences the reclaim to that volume rather than
 /// to the link's own. The fixture links to `/dev` (devfs: a volume of its
 /// own) from the scratch directory.
 #[test]
@@ -998,7 +1025,7 @@ fn the_device_of_a_link_is_the_one_it_resolves_to() {
     assert_eq!(dev_of(&link), Some(devfs));
 }
 
-/// Date `profile` LAST USED at `at`: what a compile writes, written then.
+/// Date `profile` last used at `at`: what a compile writes, written then.
 fn last_used(profile: &Path, at: i64) {
     for c in CLOCK_DIRS {
         let d = profile.join(c);
@@ -1008,7 +1035,7 @@ fn last_used(profile: &Path, at: i64) {
     }
 }
 
-/// UNDER PRESSURE ONE NAMED PROFILE GOES, UNDER ALL OF ITS LOCKS. Both
+/// Under pressure one named profile goes, under all of its locks. Both
 /// profiles are recent (inside the one-day window, so the idle reclaim takes
 /// neither); [`reclaim_lru`] takes the one it is named — its
 /// `incremental/` alone, every one of its locks held from before the delete
@@ -1056,7 +1083,7 @@ fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
     );
 }
 
-/// UNDER THE LOCKS THE PRESSURE PICK IS DERIVED AGAIN, AND REFUSED WHEN:
+/// Under the locks the pressure pick is derived again, and refused when:
 /// a compile wrote into it since the survey (a build is using it — it is no
 /// longer the least recently used); it was written into within
 /// [`PRESSURE_MIN_IDLE_S`]; it is not one of the build directory's
@@ -1083,12 +1110,13 @@ fn reclaim_lru_refuses_a_profile_used_since_the_survey_or_just_built() {
     let err = reclaim_lru(&t, &debug, &judge(now), then).expect_err("used since");
     assert!(err.to_string().contains("since the survey"), "{err}");
 
-    // Built five minutes ago: inside the minutes every build keeps.
+    // Built five minutes ago: no reclaim takes a profile that recent.
     last_used(&debug, now - 5 * 60);
     let err = reclaim_lru(&t, &debug, &judge(now), now - 5 * 60).expect_err("just built");
     assert!(
-        err.to_string()
-            .contains("written into 5 min ago, inside the 10 min"),
+        err.to_string().contains(
+            "written into 5 min ago; no reclaim takes a profile built in the last 10 min"
+        ),
         "{err}"
     );
     assert!(debug.join(INCREMENTAL).exists());
@@ -1101,4 +1129,76 @@ fn reclaim_lru_refuses_a_profile_used_since_the_survey_or_just_built() {
         "{err}"
     );
     assert!(debug.join(INCREMENTAL).exists());
+}
+
+/// A WHOLE REMOVAL TAKES NO PROFILE IT DID NOT LOCK, AND DELETES ONLY
+/// THROUGH THE HANDLE IT PINNED (review 13). A profile made after the first
+/// walk (a new target triple's build) holds a lock the reclaim never took:
+/// found again under the locks, it refuses the whole directory, nothing
+/// deleted. And a directory SWAPPED in under the build directory's name
+/// after the identity check is never entered: the pinned directory's
+/// contents go through its handle, the newcomer keeps its file, and the row
+/// says the name now names another directory. NEGATIVE CONTROL: left alone,
+/// the directory goes whole.
+#[test]
+fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_handle() {
+    let now = now_after_write(2);
+    let ok = &mut || Ok(());
+
+    let tmp = Tmp::new("whole-new-profile");
+    let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
+    let err = reclaim_whole_with(&t, &judge(now), now, DAY, ok, &mut |stage, _| {
+        if stage == Stage::Locked {
+            lay_profile(&t.join("aarch64-apple-darwin/debug"));
+        }
+    })
+    .expect_err("a profile it never locked");
+    assert!(err.to_string().contains("profiles changed"), "{err}");
+    assert!(t.join("debug/deps/liblay.rlib").exists());
+
+    let tmp = Tmp::new("whole-swap");
+    let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
+    let moved = tmp.path().join("target.moved");
+    let done = reclaim_whole_with(&t, &judge(now), now, DAY, ok, &mut |stage, _| {
+        if stage == Stage::Deleting {
+            std::fs::rename(&t, &moved).expect("swap out");
+            std::fs::create_dir(&t).expect("swap in");
+            std::fs::write(t.join("keep.txt"), b"not a build's").expect("newcomer");
+        }
+    })
+    .expect("the pinned directory's contents went");
+    assert!(t.join("keep.txt").exists(), "the newcomer is never entered");
+    assert!(
+        !moved.join("debug").exists(),
+        "the pinned directory was emptied through its handle"
+    );
+    assert!(done.units.is_empty(), "{done:?}");
+    assert!(
+        done.trouble
+            .iter()
+            .any(|t| t.contains("names another directory")),
+        "{done:?}"
+    );
+
+    let tmp = Tmp::new("whole-alone");
+    let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
+    let done =
+        reclaim_whole_with(&t, &judge(now), now, DAY, ok, &mut |_, _| {}).expect("goes whole");
+    assert_eq!(done.units, std::slice::from_ref(&t));
+    assert!(!t.exists());
+
+    // The caller's check, under the locks, refuses with its own reason.
+    let tmp = Tmp::new("whole-check");
+    let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
+    let err = reclaim_whole_with(
+        &t,
+        &judge(now),
+        now,
+        DAY,
+        &mut || Err("its session resumed".to_owned()),
+        &mut |_, _| {},
+    )
+    .expect_err("the check refuses");
+    assert!(err.to_string().contains("its session resumed"), "{err}");
+    assert!(t.join("debug/deps/liblay.rlib").exists());
 }

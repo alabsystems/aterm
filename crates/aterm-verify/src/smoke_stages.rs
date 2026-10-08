@@ -11,12 +11,14 @@
 //!    - `cursor` must answer `OK <row> <col> <visible> <style>`: it is the
 //!      preflight every `aterm drive` verb sends first, and no suite sends it;
 //!    - `wake_heals` must stay 0 over a burst of at least half its keys
-//!      delivered. A heal is a `Wake::Output` that went unhandled past the latch
-//!      expiry — the 2026-07-05 incident class, which the self-expiring latch
-//!      now turns from a permanent 5 fps into a 100 ms hiccup per lost wake. A
-//!      burst whose every wake is lost and healed at the expiry can still clear
-//!      a window's frames floor and its 250 ms input→present ceiling, so this
-//!      counter is the one reading that sees the class.
+//!      delivered. A heal is a `Wake::Output` whose latch is still armed after a
+//!      user-event drain that began after its post — the 2026-07-05 incident
+//!      class, which the watchdog now turns from a permanent 5 fps into one
+//!      hiccup per lost wake (healed one expiry after the loop turn that saw
+//!      the arm, so a frame or two plus 100 ms, never a flat 100 ms). A burst
+//!      whose every wake is lost and healed can still clear a window's frames
+//!      floor and its 250 ms input→present ceiling, so this counter is the one
+//!      reading that sees the class.
 //!
 //!    What it no longer checks (2026-09-28) was never measured here:
 //!    `sync_rel_timeout` and `perf_reduced` are booked only on a window's
@@ -35,7 +37,7 @@
 //!    only a real window can measure pacing. The 2026-07-05 incident build
 //!    presented at ~5/s with 190-530 ms input→present; a healthy build does 30+/s
 //!    under 15 ms. Skips automatically without a WindowServer session (CI/SSH), or
-//!    with `--skip-gui-smoke`.
+//!    under `--no-windows` (`plan::WINDOWED`, decided before this stage runs).
 //!
 //!    ONE BURST PER LANE (2026-09-28): a hardware burst (`ctl hwkey`) that posts
 //!    real NSEvents into the app's own queue, so the keys take winit's
@@ -274,12 +276,56 @@ pub fn lane_comparison(readings: &[(&str, LaneReadings)]) -> String {
 const BURST_KEYS: usize = 30;
 const BURST_GAP: Duration = Duration::from_millis(50);
 const SETTLE: Duration = Duration::from_secs(1);
+/// The pause before the headless burst's first key, so the reader/event-loop
+/// lane reaches its ordinary idle wait first (see `headless_typing_burst`).
+const PRE_BURST: Duration = Duration::from_millis(250);
+
+/// How the smokes pace their bursts: [`Pacing::PRODUCTION`] on every real run
+/// (the only value [`Ctx::new`] ever produces), [`Pacing::INSTANT`] for the
+/// gate's own fixture ladders (2026-09-28).
+///
+/// In a fixture the `aterm-ctl` the headless smoke drives is a stub that
+/// answers canned metrics, so its 250 ms pre-burst pause, 30 x 50 ms key gaps
+/// and 1 s settle (~2.75 s on every fixture ladder of `environment_contract`
+/// and `gate_contract` that reaches the smoke) measured nothing. The fixtures
+/// keep every one of the 30 driven sends — so the `(n/30 accepted)` count, the
+/// `SEND_ACCEPTED_FLOOR` refusal and the `wake_heals` read are still
+/// exercised — and drop only the sleeps. The GUI smoke's settle follows the
+/// same pacing (a fixture skips the GUI smoke, so only a real run reaches it,
+/// at [`Pacing::PRODUCTION`]); `hwkey`'s `interval=` argument is the real
+/// burst's pacing, handed to a real window, and stays `BURST_GAP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pacing {
+    /// Between two driven keys.
+    pub burst_gap: Duration,
+    /// After a burst, before its counters are read.
+    pub settle: Duration,
+    /// Before the headless burst's first key.
+    pub pre_burst: Duration,
+}
+
+impl Pacing {
+    /// The measured pacing: ~20 keys/s, a second to settle, a quarter second
+    /// before the headless burst.
+    pub const PRODUCTION: Self = Self {
+        burst_gap: BURST_GAP,
+        settle: SETTLE,
+        pre_burst: PRE_BURST,
+    };
+    /// No pauses at all — for fixtures whose driven binary is a stub.
+    pub const INSTANT: Self = Self {
+        burst_gap: Duration::ZERO,
+        settle: Duration::ZERO,
+        pre_burst: Duration::ZERO,
+    };
+}
 /// Keys the headless burst must deliver (`send` answered `OK`) before its
 /// `wake_heals=0` means anything: half the burst, the GUI floors' ratio. A heal
-/// is booked only when a LATER output chunk finds a lost wake's latch older than
-/// the 100 ms expiry (aterm-gui's `gated_output_wake`), and each delivered key is
-/// one echo, so one key — or a few inside 100 ms — cannot register a lost wake
-/// whatever the tree does.
+/// is booked only when the GUI's lost-wake watchdog proves a wake lost — a
+/// user-event drain began after its post and no handler cleared its latch
+/// (aterm-gui's `judge_output_wake`) — and each delivered key is one echo and
+/// one wake, so a burst that delivered only a few keys gave a lost wake only a
+/// few chances to happen, whatever the tree does.
 const SEND_ACCEPTED_FLOOR: usize = BURST_KEYS / 2;
 
 /// The input->present ceiling, on the true maximum (`>=` fails) and on the
@@ -361,8 +407,12 @@ const ACQUIRE_P99_CEILING_MS: u64 = 50;
 const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
 /// The socket-listen budget: how many times a smoke looks at its instance's
 /// control socket, [`POLL_GAP`] apart, before `control socket never started
-/// listening` ([`wait_to_listen`]) — ten seconds of sleeps, plus what each
-/// look (a `try_wait`, a stat and a connect) costs on the machine of the day.
+/// listening` ([`wait_to_listen`]) — a minute of sleeps, plus what each look (a
+/// `try_wait`, a stat and a connect) costs on the machine of the day. A hang
+/// detector, never a latency budget: an instance that listens ends the wait at
+/// that look. It was ten seconds until 2026-10-02, when the first run on a cold
+/// shared snapshot exec'd a freshly built aterm-gui on a loaded machine and the
+/// smoke read a slow first exec as `never started listening`.
 ///
 /// COUNTED IN LOOKS, NEVER TIMED BY THE CLOCK (the review of 2026-09-28).
 /// f6921d3de timed it at "exactly 10 s", which can only be shorter than the
@@ -371,7 +421,7 @@ const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
 /// smoke before, red. The gate's own fixtures wait the same: the stand-in
 /// instance their build writes is run once by that build, so its first exec
 /// is paid there.
-pub const SOCKET_POLLS: usize = 100;
+pub const SOCKET_POLLS: usize = 600;
 /// The pause between two looks of a smoke's waits.
 pub const POLL_GAP: Duration = Duration::from_millis(100);
 
@@ -555,6 +605,10 @@ fn bring_up(
         ));
         return Ready::Stopped;
     }
+    // The build above put a NEW file at `gui` (cargo copies on every run), so
+    // its first exec is paid here, unclocked, and not inside the listen wait
+    // below ([`crate::first_exec`]).
+    crate::first_exec::warm_first_exec(ctx, r, &gui, crate::first_exec::ATERM_GUI_FLAG);
 
     let log = match std::fs::File::create(&sb.gui_log) {
         Ok(f) => f,
@@ -614,7 +668,7 @@ fn bring_up(
     // Up means LISTENING, not bound: the file appears at bind(2), before
     // listen(2), and a first ctl call in that gap is refused.
     let up = || is_socket_or_symlink(&sock) && socket_listening(&sock);
-    match wait_to_listen(|| child_exited(sb), up) {
+    match wait_to_listen(POLL_GAP, || child_exited(sb), up) {
         Listen::Up => return Ready::Up { ctl },
         Listen::Exited => r.fail(format!("{tag}: aterm-gui exited early")),
         Listen::Never => r.fail(format!("{tag}: control socket never started listening")),
@@ -634,10 +688,15 @@ enum Listen {
     Never,
 }
 
-/// THE LISTEN WAIT: [`SOCKET_POLLS`] looks at `exited` and then `up`,
-/// [`POLL_GAP`] apart, and one last look at `up` after them. However long a
-/// look takes, every one is taken: the wait is never shorter than its sleeps.
-fn wait_to_listen(mut exited: impl FnMut() -> bool, mut up: impl FnMut() -> bool) -> Listen {
+/// THE LISTEN WAIT: [`SOCKET_POLLS`] looks at `exited` and then `up`, `gap`
+/// apart ([`POLL_GAP`] in a real run), and one last look at `up` after them.
+/// However long a look takes, every one is taken: the wait is never shorter
+/// than its sleeps.
+fn wait_to_listen(
+    gap: Duration,
+    mut exited: impl FnMut() -> bool,
+    mut up: impl FnMut() -> bool,
+) -> Listen {
     for _ in 0..SOCKET_POLLS {
         if exited() {
             return Listen::Exited;
@@ -645,7 +704,7 @@ fn wait_to_listen(mut exited: impl FnMut() -> bool, mut up: impl FnMut() -> bool
         if up() {
             return Listen::Up;
         }
-        std::thread::sleep(POLL_GAP);
+        std::thread::sleep(gap);
     }
     if up() { Listen::Up } else { Listen::Never }
 }
@@ -744,7 +803,7 @@ fn headless_typing_burst(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path
     // Let the reader/event-loop lane reach its ordinary idle wait before the
     // first byte, or the first startup-edge repair is miscounted as a
     // typing-burst lost-wake heal.
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::sleep(ctx.smoke_pacing.pre_burst);
     // COUNT WHAT THE ENGINE ACCEPTED. `wake_heals=0` is satisfied A FORTIORI by
     // a burst that typed too little for a heal to register
     // ([`SEND_ACCEPTED_FLOOR`]), so a dead client, a rejected verb or a wedged
@@ -757,9 +816,9 @@ fn headless_typing_burst(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path
         if ctl(ctx, sb, ctl_bin, &["send", "x"]).starts_with("OK") {
             accepted += 1;
         }
-        std::thread::sleep(BURST_GAP);
+        std::thread::sleep(ctx.smoke_pacing.burst_gap);
     }
-    std::thread::sleep(SETTLE);
+    std::thread::sleep(ctx.smoke_pacing.settle);
     if accepted < SEND_ACCEPTED_FLOOR {
         r.fail(format!(
             "smoke: only {accepted}/{BURST_KEYS} keys accepted (< {SEND_ACCEPTED_FLOOR}), \
@@ -827,9 +886,11 @@ fn effect_lane_burst(
         return None;
     };
     if !crate::smoke::activate_macos_gui_pid(pid) {
-        r.skip(format!(
-            "gui smoke [{name}] (could not make the test window frontmost)"
-        ));
+        r.skip(if crate::smoke::screen_locked() {
+            format!("gui smoke [{name}] (the screen is locked: unlock it and run again)")
+        } else {
+            format!("gui smoke [{name}] (could not make the test window frontmost)")
+        });
         r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
         return None;
     }
@@ -888,7 +949,7 @@ fn effect_lane_burst(
         ));
         return None;
     };
-    std::thread::sleep(SETTLE);
+    std::thread::sleep(ctx.smoke_pacing.settle);
     let summary = ctl(ctx, sb, ctl_bin, &["metrics"]);
     let percentiles = ctl(ctx, sb, ctl_bin, &["metrics", "percentiles"]);
     match effect_lane_verdict(lane, &summary) {
@@ -905,9 +966,6 @@ fn effect_lane_burst(
 /// Every honest reason this stage cannot measure anything, in the script's order.
 /// Each is a SKIP: the machine cannot present, which says nothing about the code.
 fn gui_smoke_unavailable(ctx: &Ctx) -> Option<String> {
-    if ctx.skip_gui_smoke {
-        return Some("gui smoke (--skip-gui-smoke)".into());
-    }
     if std::env::consts::OS != "macos" {
         return Some("gui smoke (macOS only)".into());
     }
@@ -1161,6 +1219,29 @@ mod tests {
         )
     }
 
+    /// A REAL RUN PACES AS MEASURED (2026-09-28). The fixture ladders drop the
+    /// headless smoke's sleeps, and the only way that could leak into a real
+    /// gate is a context that starts anywhere but the production constants.
+    #[test]
+    fn a_real_context_paces_the_smokes_at_the_measured_constants() {
+        assert_eq!(ctx().smoke_pacing, Pacing::PRODUCTION);
+        assert_eq!(
+            Pacing::PRODUCTION,
+            Pacing {
+                burst_gap: Duration::from_millis(50),
+                settle: Duration::from_secs(1),
+                pre_burst: Duration::from_millis(250),
+            }
+        );
+        // The hardware burst's own pacing is an argv to a real window, and
+        // never follows the fixture override.
+        assert!(hwkey_burst_args().contains(&"interval=50".to_string()));
+        assert_eq!(
+            ctx().with_smoke_pacing(Pacing::INSTANT).smoke_pacing,
+            Pacing::INSTANT
+        );
+    }
+
     /// A REAL RUN'S LISTEN WAIT IS [`SOCKET_POLLS`] LOOKS, WHATEVER EACH COSTS
     /// (the review of 2026-09-28). The wait was a hundred polls, each a
     /// `try_wait`, a stat and a connect before its 100 ms sleep, so it stood
@@ -1169,34 +1250,41 @@ mod tests {
     /// be shorter: the review measured 0.26-0.40 s less under load 4.5-7, and
     /// an instance listening 10.15-10.3 s after its spawn passed the old smoke
     /// and was red in the new one — the slow-first-exec exposure the change
-    /// was for, in a real run. A look here costs 15 ms: every poll is still
-    /// taken, and the last look after them. Cheap controls: an instance that
+    /// was for, in a real run. Counted here with no gap: every poll is still
+    /// taken, and the last look after them, where a clock-timed wait would
+    /// look for as long as its clock allowed. Cheap controls: an instance that
     /// listens, or exits, ends the wait at that look.
     #[test]
     fn a_real_runs_listen_wait_takes_every_poll_whatever_each_costs() {
         let looks = std::cell::Cell::new(0usize);
-        let costly = || {
+        let never = || {
             looks.set(looks.get() + 1);
-            std::thread::sleep(Duration::from_millis(15));
             false
         };
-        let started = std::time::Instant::now();
-        assert_eq!(wait_to_listen(|| false, costly), Listen::Never);
+        assert_eq!(
+            wait_to_listen(Duration::ZERO, || false, never),
+            Listen::Never
+        );
         assert_eq!(
             looks.get(),
             SOCKET_POLLS + 1,
             "every poll, and the last look"
         );
-        assert!(started.elapsed() >= Duration::from_secs(10));
 
         let third = std::cell::Cell::new(0usize);
         let up_at_third = || {
             third.set(third.get() + 1);
             third.get() == 3
         };
-        assert_eq!(wait_to_listen(|| false, up_at_third), Listen::Up);
+        assert_eq!(
+            wait_to_listen(Duration::ZERO, || false, up_at_third),
+            Listen::Up
+        );
         assert_eq!(third.get(), 3);
-        assert_eq!(wait_to_listen(|| true, || false), Listen::Exited);
+        assert_eq!(
+            wait_to_listen(Duration::ZERO, || true, || false),
+            Listen::Exited
+        );
     }
 
     #[test]
@@ -1836,23 +1924,6 @@ mod tests {
     }
 
     #[test]
-    fn the_gui_smoke_skips_honestly_when_the_machine_cannot_present() {
-        let mut c = ctx();
-        c.skip_gui_smoke = true;
-        assert_eq!(
-            gui_smoke_unavailable(&c).as_deref(),
-            Some("gui smoke (--skip-gui-smoke)")
-        );
-
-        // …and without the flag it is not the opt-out.
-        c.skip_gui_smoke = false;
-        assert_ne!(
-            gui_smoke_unavailable(&c).as_deref(),
-            Some("gui smoke (--skip-gui-smoke)")
-        );
-    }
-
-    #[test]
     fn an_ssh_session_cannot_present_and_says_so() {
         let mut c = ctx();
         c.env.ssh_connection = Some("10.0.0.1 22 10.0.0.2 22".into());
@@ -1909,7 +1980,7 @@ mod tests {
         let pid = sb.child.as_ref().expect("child").id();
         assert!(
             crate::smoke::exited_on_its_own(pid),
-            "`exit 7` never exited within 30 s"
+            "`exit 7` never exited within a minute"
         );
         let mut r = Report::new("t");
         sb.teardown(&mut r);

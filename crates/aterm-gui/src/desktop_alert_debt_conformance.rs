@@ -162,9 +162,9 @@ fn desktop_alert_debt_conforms_to_real_herald_and_config_transitions() {
     }
     assert_eq!(visited, BTreeSet::from(actions));
 
-    // Historical policy order: the herald ran enabled, then its caller
-    // suppressed the returned notice. The fourth session was rate-limited,
-    // so no returned notice existed to suppress; a retry was still owed.
+    // Negative control: the herald runs enabled and its caller suppresses the
+    // returned notice. The rate-limited fourth session returns no notice to
+    // suppress, so a retry stays owed.
     let now = Instant::now();
     let mut old_order = Herald::default();
     let mut fixed = Herald::default();
@@ -198,8 +198,7 @@ fn desktop_alert_debt_conforms_to_real_herald_and_config_transitions() {
     for action in ["Enable", "ObserveNewLimited"] {
         rig.step(action);
     }
-    // An atomic-only config update was the other historical defect. Keep
-    // the genuine owed notice and reproduce that old edge as a mutant.
+    // Mutant: an atomic-only config update leaves the owed notice in place.
     rig.app.config.desktop_alerts = Some(false);
     rig.app
         .notify_own_alerts

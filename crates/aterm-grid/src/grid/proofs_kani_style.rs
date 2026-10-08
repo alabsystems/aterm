@@ -2,26 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kani proofs for StyleTable ref-count safety.
-//!
-//! Verifies the key invariants of StyleTable's reference counting:
-//! 1. Default style (index 0) is never decremented below 1
-//! 2. release() cannot underflow ref counts
-//! 3. add_ref uses saturating arithmetic (no overflow)
-//! 4. intern deduplicates correctly (same style → same ID)
-//!
-//! Part of extreme-performance theme: StyleTable ref-count safety.
+//! Kani proofs for StyleTable ref-count safety:
+//! 1. The default style (index 0) never drops below 1.
+//! 2. release() cannot underflow.
+//! 3. add_ref saturates (no overflow).
+//! 4. intern deduplicates (same style, same ID).
 
 use crate::{Color, Style, StyleAttrs, StyleId, StyleTable};
 
-// =============================================================================
 // Default style protection
-// =============================================================================
 
-/// Default style ref count never drops below 1, regardless of release calls.
-///
-/// The default style at index 0 has a permanent reference. release() guards
-/// against idx == 0, so calling release(StyleId::new(0)) should be a no-op.
+/// The default style's ref count never drops below 1: release() of index 0 is
+/// a no-op.
 ///
 /// ENSURES: ref_count(StyleId::new(0)) >= 1 after any number of release calls
 #[kani::proof]
@@ -50,17 +42,12 @@ fn default_style_ref_count_permanent() {
     );
 }
 
-// =============================================================================
 // Release never underflows
-// =============================================================================
 
-/// Releasing a style more times than it was interned never causes underflow.
+/// Releasing a style more times than it was interned never wraps: once the
+/// count reaches 0, further releases are no-ops.
 ///
-/// The release() guard checks ref_counts[idx] > 0 before decrementing.
-/// After ref count reaches 0, further releases are no-ops.
-///
-/// ENSURES: ref_count >= 0 (u32 cannot be negative, but we verify
-///          the guard prevents wrapping from 0 to u32::MAX)
+/// ENSURES: ref_count >= 0 (the guard prevents wrapping from 0 to u32::MAX)
 #[kani::proof]
 #[kani::unwind(6)]
 fn release_never_underflows_on_valid_id() {
@@ -117,14 +104,9 @@ fn release_out_of_bounds_is_noop() {
     kani::assert(table.len() == 1, "release of bogus ID changed table length");
 }
 
-// =============================================================================
 // Add_ref saturating safety
-// =============================================================================
 
-/// add_ref uses saturating arithmetic: ref count never wraps past u32::MAX.
-///
-/// Tests with a symbolic style (not just DEFAULT) to verify the property
-/// holds for any interned style.
+/// add_ref saturates at u32::MAX, for any symbolic interned style.
 #[kani::proof]
 fn add_ref_saturates_at_max() {
     let mut table = StyleTable::kani_stub();
@@ -170,9 +152,7 @@ fn add_ref_out_of_bounds_is_noop() {
     );
 }
 
-// =============================================================================
 // Intern deduplication
-// =============================================================================
 
 /// Interning the same style twice returns the same ID for any symbolic style.
 ///
@@ -249,9 +229,7 @@ fn intern_different_styles_returns_different_ids() {
     kani::assert(table.len() == 3, "table should have 3 symbolic styles");
 }
 
-// =============================================================================
 // Ref count conservation
-// =============================================================================
 
 /// add_ref and release are inverse operations: N add_refs followed by
 /// N releases returns to the original ref count.
@@ -288,13 +266,10 @@ fn add_ref_release_inverse() {
     );
 }
 
-// =============================================================================
 // Table length consistency
-// =============================================================================
 
-/// StyleTable length equals the number of entries (styles, ref_counts, extended
-/// are always kept in sync), verified with symbolic style colors and a symbolic
-/// out-of-bounds index.
+/// StyleTable length equals its entry count (styles, ref_counts and extended
+/// stay in sync), with symbolic colours and a symbolic out-of-bounds index.
 #[kani::proof]
 fn table_vecs_always_in_sync() {
     let mut table = StyleTable::kani_stub();

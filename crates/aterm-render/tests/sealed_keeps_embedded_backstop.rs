@@ -47,6 +47,7 @@ fn dejavu() -> Vec<u8> {
 /// Nerd Font covers it; DejaVu Sans Mono does not — verified against both
 /// assets' cmaps — so with a `from_bytes` primary and no system chain, ONLY the
 /// embedded backstop can serve it.
+#[cfg(feature = "embedded-symbols")]
 const NERD_PUA: char = '\u{E0A0}';
 
 /// A noncharacter: no font anywhere covers it, so it is the honest `.notdef`
@@ -71,6 +72,7 @@ fn fingerprint(r: &mut Renderer, ch: char) -> (FaceId, usize, usize, usize) {
     )
 }
 
+#[cfg(feature = "embedded-symbols")]
 #[test]
 fn sealed_generation_still_reaches_the_bundled_symbol_face() {
     let mut r = renderer();
@@ -118,6 +120,7 @@ fn sealed_generation_still_reports_a_real_miss() {
 /// never differ is WHETHER it resolved at all. (An earlier draft of this test
 /// asserted raster equality and failed on exactly that distinction: unsealed
 /// picked a 22x20 system face, sealed the 11x20 bundled one. Both are correct.)
+#[cfg(feature = "embedded-symbols")]
 #[test]
 fn sealing_never_downgrades_a_resolved_code_point_to_notdef() {
     let mut unsealed = renderer();
@@ -177,10 +180,8 @@ const EMOJI: char = '\u{1F680}';
 #[test]
 fn sealing_a_system_generation_keeps_the_colour_emoji_face() {
     let theme = Theme::default();
-    let Some(mut unsealed) = Renderer::from_system(18.0, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut unsealed = Renderer::from_system(18.0, theme)
+        .expect("no font: build with aterm-render's default embedded-font feature");
     // Settle the async lazy loads first: emoji dispatch is decided only after
     // every mono face has had its chance to miss.
     unsealed.debug_block_on_lazy_fallbacks();
@@ -214,6 +215,7 @@ fn sealing_a_system_generation_keeps_the_colour_emoji_face() {
 /// A sealed generation is the only kind `rebuild_from_admitted` accepts (zoom /
 /// theme flip). The rebuilt renderer must keep the backstop too — otherwise the
 /// tofu returns on the first font-size change.
+#[cfg(feature = "embedded-symbols")]
 #[test]
 fn rebuilt_generation_keeps_the_bundled_symbol_face() {
     let mut r = renderer();

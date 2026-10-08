@@ -1,39 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// THE NO-OP LAW on the GPU, one row per effect channel: an EMPTY channel — as
-// built, or an atlas with nothing drawn from it — renders the bare frame byte
-// for byte; a populated channel PAINTS (so a silently-dropped stream cannot
-// make the drain look clean); and `clear_overlays` (the introspection-capture
-// `image plain` contract) strips it back to the bare frame. Rows with a
-// `drain` also clear the channel's own Vec on a renderer that has RENDERED the
-// populated input and must land back on the bare bytes — the residue a
-// persistent per-frame instance stream could otherwise carry.
+// Empty-channel no-op on the GPU, one row per effect channel: an empty channel
+// (as built, or an atlas with nothing drawn) renders the bare frame exactly; a
+// populated channel paints (so a dropped stream cannot look clean); and
+// `clear_overlays` (the `image plain` capture contract) restores the bare
+// frame. Rows with a `drain` also clear the channel's Vec on a renderer that
+// rendered the populated input and must land on the bare bytes, catching
+// residue in persistent per-frame instance streams.
 //
-// These were seven copy-pasted tests, one per parity suite (`cat_parity`,
-// `fire_patch_parity`, `glow_halo_parity`, `glow_parity`, `glow_under_parity`,
-// `nova_parity`, `rain_parity` — the rain row is the design §10
-// `rain_disabled_bytes_identical` pin, GPU side). Each row keeps its own grid,
-// text, backend pair and payload; the aurora and nova rows also run every leg
-// on the CPU, as their suites did. The CPU table is aterm-render's
+// Each row keeps its own grid, text, backend pair and payload; the aurora and
+// nova rows also run every leg on the CPU. The CPU table is aterm-render's
 // `tests/empty_channels.rs`.
 //
-// Gated: no GPU or no font -> the test no-ops (returns).
-
-mod rain_common;
+// No GPU or no font: no-op.
 
 use std::sync::Arc;
 
+use crate::rain_common::RainScene;
 use aterm_core::render::{CharFg, RenderInput};
 use aterm_core::terminal::Terminal;
 use aterm_render::{
     FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, Renderer, SceneAtlas, SpriteQuad, Theme,
     premul_rgb,
 };
-use rain_common::RainScene;
 
-mod common;
-use common::{backends, backends_fontdue, max_channel_delta};
+use crate::common::{backends, backends_fontdue, max_channel_delta};
 
 /// The grid and cell a row's setters build against.
 struct Ctx {
@@ -317,8 +309,8 @@ const CHANNELS: &[Channel] = &[
 ];
 
 /// Run every leg of `c` through one renderer. `exact` compares whole pixels
-/// (transmittance byte included); otherwise the RGB channels must agree to
-/// the byte (`max_channel_delta == 0`), as the aurora and nova suites held it.
+/// (transmittance byte included); otherwise RGB must match exactly
+/// (`max_channel_delta == 0`).
 fn legs(
     c: &Channel,
     backend: &str,

@@ -8,14 +8,11 @@
 //! [`aterm_objc::strip_method_offsets`] is the normaliser every
 //! encoding-shaped instrument in this repository runs its inputs through: the
 //! winit seam census, `objc_live_class_audit`'s A and B parts, `toolbar_drive`,
-//! and — since W12 — `SwizzleSite::install`'s refusal. If it LAUNDERS a
-//! difference, every one of those instruments agrees about two encodings that
-//! are not the same type, and each of them reports a pass.
+//! and `SwizzleSite::install`'s refusal. If it LAUNDERS a difference, every one
+//! of those instruments agrees about two encodings that are not the same type.
 //!
-//! Its rule used to be a LIST: *"strip every digit, except the ones between
-//! `[` and `]`, because those are array counts."* A list of exceptions is armed
-//! at the spellings whoever wrote it thought of, and W15 measured the two it
-//! did not:
+//! A rule written as a list of exceptions ("strip every digit except array
+//! counts") misses spellings nobody thought of. Two real AppKit rows:
 //!
 //! ```text
 //! -[NSPrinter _getNodeForKey:inTable:]   ^{?=b4b1b24(?=*^{?}^{__CFDictionary})}32@0:8@16@24
@@ -24,18 +21,10 @@
 //!                                           stripped  v@:{CATransformD=dddddddddddddddd}
 //! ```
 //!
-//! Three bitfields of 4, 1 and 24 bits became three indistinguishable `b`s —
-//! so a `b1b1b1` triple and a `b4b1b24` triple are one string — and
-//! `CATransform3D` became `CATransformD`, a type that does not exist and that
-//! every `CATransform<digit>D` would also become. Both rows are in the method
-//! tables of any process that has loaded AppKit, which is every process these
-//! instruments run in.
-//!
-//! So this file does not test the fix against the two rows that found it. It
-//! tests it against **every instance-method row in the process**, with a
-//! property that is computed from the input rather than transcribed from it:
-//! *stripping may delete offsets and nothing else.* The old implementation
-//! fails it; the corpus is the runtime's, so it grows when Apple's does.
+//! Bitfield widths and digits inside type names are not offsets. So this file
+//! tests **every instance-method row in the process** against a property
+//! computed from the input: *stripping may delete offsets and nothing else.*
+//! The corpus is the runtime's, so it grows when Apple's does.
 
 #![cfg(target_os = "macos")]
 

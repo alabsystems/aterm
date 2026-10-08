@@ -4,7 +4,7 @@
 //! Has the TOOLCHAIN package manager (atpkg) ever completed an update check on this
 //! machine, did its last one reach the signed index, and how did it end — read off its
 //! `status.toml` alone, so an edge that must not link atpkg's internals (the `aterm` session
-//! lane, the window) can decide on it (R3, 2026-09-10).
+//! lane, the window) can decide on it.
 //!
 //! THE RECORD a full `update` pass writes at its end, and nothing else writes (atpkg's
 //! recorded pass is its one writer; the derived models `AtpkgPassStamps` and
@@ -12,25 +12,23 @@
 //!
 //! * `last_success_at` — a pass that REACHED the signed index: it verified an index the
 //!   channel served THIS pass, not the §14 cache's, and ran to its end. A pass served from
-//!   the cache after a refusal, offline, or whose resolve failed stamps no success: until
-//!   2026-09-23 a cache-served pass did (audit PK-3), and a sibling's failure ladder read it
-//!   as healed with nothing reached. "Never checked" is: the file is absent, or it carries no
+//!   the cache after a refusal, offline, or whose resolve failed stamps no success, or a
+//!   sibling's failure ladder would read it as healed with nothing reached. "Never checked"
+//!   is: the file is absent, or it carries no
 //!   `last_success_at`, or that value is empty.
 //! * `last_pass` / `last_pass_at` — how the pass ENDED ([`PassOutcome`]): `ok` when it stamped
 //!   that success (or had nothing to check), `offline` when no host answered, else `failed`.
 //!   The schedulers read that, never `updated_at`: every write moves `updated_at` — a vendor
-//!   door, a typed verb, a row — so "written after the last success" read as a FAILED pass and
-//!   held the session's pass up to six hours from the write (audit PK-4, and the reconcile of
-//!   2026-09-23).
+//!   door, a typed verb, a row — so "written after the last success" would read as a FAILED
+//!   pass and hold the session's pass up to six hours from the write.
 //! * `last_pass_attempted_index_build` / `last_pass_attempted_at` — the index the pass was
 //!   launched for or resolved, bound to its end in the same write, so a newer published index
 //!   is told apart from a sibling's attempt at the SAME one.
 //!
-//! DATA, never a line: until Phase 2 (2026-09-22) every console edge printed "never checked"
-//! on stderr; now nothing prints into a shell the user did not ask to update, and `aterm pkg
-//! doctor` reports it.
+//! DATA, never a line: nothing prints into a shell the user did not ask to update; `aterm
+//! pkg doctor` reports it.
 //!
-//! THE MACHINE-WIDE PASS RULE lives here too (Phase 3, 2026-09-23), read by both lanes
+//! THE MACHINE-WIDE PASS RULE lives here too, read by both lanes
 //! that schedule a full pass on their own — the terminal session's one-shot
 //! ([`full_pass_owed`]) and, for its interval, the window's walk ([`full_pass_due_in`]): a
 //! full `update` pass is owed when none has ever succeeded or the last success is
@@ -38,18 +36,17 @@
 //! [`PASS_SPACING_SECS`] of the last full pass ATTEMPTED anywhere on the machine, so
 //! several aterm processes never run the same pass back to back, never within the interval
 //! of one that FAILED, so a pass that keeps failing is retried once per interval by this
-//! rule, not once per tab (the 2026-09-10 rule; the window retries its OWN failed pass on
-//! its failure ladder, and stands down once a later pass [`healed`] it). What was published
-//! reaches the machine sooner through the window's hints — atpkg's next-index probe and the
-//! vendor head watch — never through this rule. It replaced the two lanes' separate
-//! interval readers and their `ATPKG_UPDATE_INTERVAL_SECS` knob, both deleted. There is no
+//! rule, not once per tab (the window retries its OWN failed pass on its failure ladder,
+//! and stands down once a later pass [`healed`] it). What was published reaches the
+//! machine sooner through the window's hints — atpkg's next-index probe and the vendor
+//! head watch — never through this rule. There is no
 //! rate-limit hold: the pass makes no metered request (owner ruling R3), and the download
 //! host's 429 is an ordinary failure on the ladder.
 
 use std::ffi::OsString;
 use std::path::Path;
 
-/// The exit code of an atpkg update pass that reached NOTHING (Phase 3, 2026-09-22): no
+/// The exit code of an atpkg update pass that reached NOTHING: no
 /// host answered its index discovery — the link itself failed (DNS, connect, timeout, TLS);
 /// a host that answered with something else (a rate limit, a 5xx, a portal's page) is a
 /// failure, exit 1 — no vendor's release channel answered, and every member it lost was
@@ -414,8 +411,8 @@ mod tests {
     /// The stamps a scheduler reads: the success, the attempt (the end the last full pass
     /// recorded, or the success when that is later), the pass's own outcome and the index
     /// build — absent, empty and unparseable all read as none. `updated_at` is read by nothing
-    /// here: until 2026-09-23 it was the attempt, and any write after the last success (a
-    /// vendor head-watch pass, a typed verb) read as a failed pass (audit PK-4).
+    /// here: any write after the last success (a vendor head-watch pass, a typed verb) would
+    /// read as a failed pass.
     #[test]
     fn the_stamps_are_read_off_the_record() {
         let p = scratch("stamps");
@@ -796,15 +793,16 @@ mod tests {
         let held = crate::FileLock::acquire(&stamp.with_extension("lock")).unwrap();
         let started = std::time::Instant::now();
         assert!(!claim(&stamp, 1_790_000_000, PASS_SPACING_SECS));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the claim blocked past its wait"
+        );
         drop(held);
         assert!(claim(&stamp, 1_790_000_000, PASS_SPACING_SECS));
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    /// The strict date shape. (Until Phase 2, 2026-09-22, this test also pinned the
-    /// never-checked stderr line every console edge printed; no edge prints it now, and
-    /// the constant is gone.)
+    /// The strict date shape.
     #[test]
     fn the_stamp_parser_is_pinned() {
         assert_eq!(rfc3339_to_unix("1970-01-02T00:00:00Z"), Some(86_400));

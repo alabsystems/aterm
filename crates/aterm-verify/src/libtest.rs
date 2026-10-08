@@ -153,6 +153,61 @@ pub fn ran_no_test(log: &str) -> bool {
     log.lines().any(|l| header(l).is_some()) && !log.lines().any(|l| l.starts_with("test result: "))
 }
 
+/// The line a test binary prints, once, when macOS's `trustd` did not answer
+/// and its code-signing and TLS tests returned without asserting anything
+/// (`aterm_uds::deadline::SKIPPED`). Included from aterm-uds's own file, not
+/// copied and not a dependency: this crate takes none (its Cargo.toml).
+pub(crate) mod trustd {
+    include!("../../aterm-uds/src/deadline/skipped.rs");
+}
+
+/// The head of the test stage's skip row for binaries that skipped because
+/// `trustd` did not answer ([`trustd_skip`]).
+pub const TRUSTD_SKIPPED: &str = "tests: trustd did not answer — ";
+
+/// The binaries of a `targo test` log that printed aterm-uds's `SKIPPED`
+/// line: each by its crate and target, in log order, once. Matched anywhere
+/// in a line: on one test thread libtest has already written `test x ... `
+/// when the notice lands, and on many another thread's line can follow it
+/// before its newline.
+#[must_use]
+pub fn trustd_skipped(log: &str) -> Vec<String> {
+    if log.contains('\x1b') {
+        return trustd_skipped(&strip_ansi(log));
+    }
+    let mut at: Option<String> = None;
+    let mut found: Vec<String> = Vec::new();
+    for line in log.lines() {
+        if let Some(h) = header(line) {
+            at = Some(short_binary(&h));
+        } else if line.contains(trustd::SKIPPED) {
+            let name = at.clone().unwrap_or_else(|| "a test binary".to_string());
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
+/// The test stage's ONE skip row when any binary skipped because `trustd` did
+/// not answer ([`trustd_skipped`]): what ran stays decided, and this names
+/// what did not and what clears it. `None` when none did.
+#[must_use]
+pub fn trustd_skip(log: &str) -> Option<String> {
+    let bins = trustd_skipped(log);
+    let n = bins.len();
+    (n > 0).then(|| {
+        format!(
+            "{TRUSTD_SKIPPED}{n} test binar{} skipped {} code-signing and TLS checks ({}); \
+             rebooting the Mac clears a wedged trustd",
+            if n == 1 { "y" } else { "ies" },
+            if n == 1 { "its" } else { "their" },
+            bins.join(", ")
+        )
+    })
+}
+
 /// `running N test(s)` — the count.
 fn declared_in(line: &str) -> Option<usize> {
     let (n, rest) = line.strip_prefix("running ")?.split_once(' ')?;
@@ -363,6 +418,120 @@ pub fn scan(log: &str) -> Option<Unfinished> {
     })
 }
 
+/// One timed verdict: `test <name> ... <word> <1.234s>`, the shape libtest
+/// prints under `-Zunstable-options --report-time` (the test run's arguments
+/// since 2026-09-28, `stages::LIBTEST_REPORT_TIME`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Timed {
+    /// Wall seconds libtest measured for the test.
+    pub secs: f64,
+    /// cargo's header for the binary it ran in, without the verb, or `None`
+    /// before any header.
+    pub binary: Option<String>,
+    /// The bare name (mode suffix stripped).
+    pub name: String,
+}
+
+/// The `<1.234s>` right after a verdict word, if there is one.
+fn time_after_word(after_sep: &str) -> Option<f64> {
+    let word = VERDICT_WORDS.iter().find(|w| after_sep.starts_with(*w))?;
+    let rest = after_sep[word.len()..].strip_prefix(" <")?;
+    let secs = rest.split_once("s>")?.0;
+    secs.parse()
+        .ok()
+        .filter(|s: &f64| s.is_finite() && *s >= 0.0)
+}
+
+/// Every timed verdict in a log, in log order, each credited to the last
+/// cargo `Running` header before it. A torn verdict — the word on a later line
+/// than its `test <name> ... ` prefix — carries no name on its own line and is
+/// not counted, the same rule [`verdicts_in`] keeps.
+#[must_use]
+pub fn timed_verdicts(log: &str) -> Vec<Timed> {
+    if log.contains('\x1b') {
+        return timed_verdicts(&strip_ansi(log));
+    }
+    let mut out = Vec::new();
+    let mut binary: Option<String> = None;
+    for line in log.lines() {
+        if let Some(h) = header(line) {
+            binary = Some(h);
+            continue;
+        }
+        let mut from = 0;
+        while let Some(i) = line[from..].find(SEP) {
+            let at = from + i;
+            if let Some(secs) = time_after_word(&line[at + SEP.len()..])
+                && let Some(t) = line[..at].rfind(TEST)
+            {
+                let name = bare(&line[t + TEST.len()..at]);
+                if !name.is_empty() {
+                    out.push(Timed {
+                        secs,
+                        binary: binary.clone(),
+                        name: name.to_string(),
+                    });
+                }
+            }
+            from = at + SEP.len();
+        }
+    }
+    out
+}
+
+/// The `n` slowest tests of a `--report-time` log, as indented ladder lines —
+/// the per-test long poles inside each binary, which a binary's `finished in`
+/// cannot show. A name timed more than once in one binary (a re-exec child of
+/// it re-running the same test) is listed once, at its longest. `None` when
+/// the log has no timed verdict at all (a run without `--report-time`, or one
+/// that ran nothing).
+#[must_use]
+pub fn slowest(log: &str, n: usize) -> Option<String> {
+    let all = timed_verdicts(log);
+    if all.is_empty() {
+        return None;
+    }
+    let total = all.len();
+    let mut best: BTreeMap<(Option<String>, String), f64> = BTreeMap::new();
+    for t in all {
+        let e = best.entry((t.binary, t.name)).or_insert(t.secs);
+        if t.secs > *e {
+            *e = t.secs;
+        }
+    }
+    let mut rows: Vec<((Option<String>, String), f64)> = best.into_iter().collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut s = format!(
+        "  slowest tests (libtest --report-time; {} of {total} timed verdicts):\n",
+        n.min(rows.len())
+    );
+    for ((binary, name), secs) in rows.into_iter().take(n) {
+        s.push_str(&format!(
+            "  {secs:>9.3}s  {name}   [{}]\n",
+            binary
+                .as_deref()
+                .map_or_else(|| "?".to_string(), short_binary)
+        ));
+    }
+    Some(s)
+}
+
+/// `unittests src/lib.rs (target/debug/deps/aterm_gui-66ca…)` ->
+/// `aterm_gui unittests src/lib.rs`: the crate (the binary's file name less its
+/// hash) and the target, which is what a reader looks for in a table.
+fn short_binary(header: &str) -> String {
+    let Some((target, _)) = header.split_once(" (") else {
+        return header.to_string();
+    };
+    let stem = binary_path(header)
+        .and_then(|p| p.rsplit('/').next())
+        .map(|f| f.rsplit_once('-').map_or(f, |(s, _)| s));
+    match stem {
+        Some(stem) => format!("{stem} {target}"),
+        None => target.to_string(),
+    }
+}
+
 /// The path in a `Running <target> (<path>)` header — the binary to re-run.
 pub(crate) fn binary_path(header: &str) -> Option<&str> {
     header.rsplit_once(" (")?.1.strip_suffix(')')
@@ -555,7 +724,7 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedTest {
     /// cargo's re-run spec for the binary that failed it — `-p atpkg --test
-    /// index_probe`, `-p aterm-gui --lib`, `-p x --doc` — the text between the
+    /// atpkg_suite`, `-p aterm-gui --lib`, `-p x --doc` — the text between the
     /// backticks of its `error: test failed, to rerun pass` line. It names the
     /// package and the target, which a `Running` header does not
     /// (`tests/paint.rs` exists in more than one crate).
@@ -748,6 +917,102 @@ mod tests {
 
     fn hung_names(u: &Unfinished) -> Vec<&str> {
         u.hung.iter().map(|h| h.name.as_str()).collect()
+    }
+
+    /// A silent `trustd` (2026-10-06: nine binaries printed aterm-uds's line
+    /// and the run still claimed the merge contract): each binary that printed
+    /// it is named once, by crate and target, and a log without it names none.
+    #[test]
+    fn a_binary_that_printed_the_trustd_line_is_named_once() {
+        let log = format!(
+            "     Running unittests src/lib.rs (target/debug/deps/aterm_uds-1f2e)\n\
+             {s}\nrunning 2 tests\n{s}\ntest result: ok. 2 passed\n\
+             \x20    Running unittests src/lib.rs (target/debug/deps/aterm_grid-9a)\n\
+             running 1 test\ntest result: ok. 1 passed\n\
+             \x20    Running tests/contract.rs (target/debug/deps/contract-77)\n\
+             {s}\ntest result: ok. 4 passed\n\
+             \x20    Running tests/signs.rs (target/debug/deps/signs-5c)\n\
+             running 1 test\ntest t::signs ... {s}\nok\ntest result: ok. 1 passed\n",
+            s = trustd::SKIPPED
+        );
+        assert_eq!(
+            trustd_skipped(&log),
+            [
+                "aterm_uds unittests src/lib.rs",
+                "contract tests/contract.rs",
+                "signs tests/signs.rs"
+            ]
+        );
+        assert_eq!(
+            trustd_skip(&log).as_deref(),
+            Some(
+                "tests: trustd did not answer — 3 test binaries skipped their code-signing and \
+                 TLS checks (aterm_uds unittests src/lib.rs, contract tests/contract.rs, signs \
+                 tests/signs.rs); rebooting the Mac clears a wedged trustd"
+            )
+        );
+        let clean = "     Running unittests src/lib.rs (target/debug/deps/x-abc)\n\
+                     test result: ok. 1 passed\n";
+        assert!(trustd_skipped(clean).is_empty());
+        assert_eq!(trustd_skip(clean), None);
+    }
+
+    /// THE `--report-time` SUFFIX (2026-09-28): a verdict still reads as a
+    /// verdict with `<1.234s>` after its word, and the time is read off it —
+    /// credited to the binary whose header came last, a mode suffix stripped,
+    /// a torn verdict (its word on a later line) not counted, and a re-exec
+    /// child's second timing of the same name kept at the longest.
+    #[test]
+    fn a_report_time_suffix_is_a_verdict_and_a_duration() {
+        let log = "     Running unittests src/lib.rs (target/debug/deps/aterm_gui-66ca)\n\
+                   running 3 tests\n\
+                   test a::fast ... ok <0.001s>\n\
+                   test a::slow - should panic ... ok <12.500s>\n\
+                   test a::torn ... \n\
+                   ok <9.000s>\n\
+                   test a::slow ... ok <3.000s>\n\
+                   \x20    Running tests/paint.rs (target/debug/deps/paint-99)\n\
+                   test b::take ... FAILED <40.250s>\n\
+                   test b::skip ... ignored, flaky <0.000s>\n";
+        let t = timed_verdicts(log);
+        let got: Vec<(&str, f64)> = t.iter().map(|x| (x.name.as_str(), x.secs)).collect();
+        assert_eq!(
+            got,
+            [
+                ("a::fast", 0.001),
+                ("a::slow", 12.5),
+                ("a::slow", 3.0),
+                ("b::take", 40.25)
+            ]
+        );
+        assert_eq!(
+            t[3].binary.as_deref(),
+            Some("tests/paint.rs (target/debug/deps/paint-99)")
+        );
+        // The hung-test reader is unmoved by the suffix.
+        assert_eq!(verdicts_in("test a::fast ... ok <0.001s>"), ["a::fast"]);
+        let table = slowest(log, 2).expect("timed verdicts");
+        assert_eq!(
+            table,
+            "  slowest tests (libtest --report-time; 2 of 4 timed verdicts):\n\
+             \x20    40.250s  b::take   [paint tests/paint.rs]\n\
+             \x20    12.500s  a::slow   [aterm_gui unittests src/lib.rs]\n"
+        );
+        assert_eq!(
+            slowest("test a ... ok\n", 5),
+            None,
+            "no --report-time, no table"
+        );
+        // The failed-test reader never reads a verdict line, so a timed
+        // `FAILED <…s>` changes nothing it accounts for.
+        let failed = "     Running tests/x.rs (target/debug/deps/x-1)\n\nrunning 1 test\n\
+                      test t::broke ... FAILED <0.500s>\n\nfailures:\n\n---- t::broke stdout \
+                      ----\nboom\n\nfailures:\n    t::broke\n\ntest result: FAILED. 0 passed; 1 \
+                      failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s\n\n\
+                      error: test failed, to rerun pass `-p x --test x`\n";
+        let tests = failed_tests(failed).expect("accounted for");
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].name, "t::broke");
     }
 
     #[test]

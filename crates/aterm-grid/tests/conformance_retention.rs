@@ -1,29 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Unified total retention limit (audit E1): derived TLA+ spec + Tier-1 binding
-//! to the REAL `Grid`.
+//! Unified total retention limit: derived spec plus Tier-1 binding to the real
+//! `Grid`.
 //!
-//! Three layers, per `docs/RFC-ty-embed-derived-tla.md` (one Rust `ty_model!`
-//! source feeds all of them, `include!`d from `retention_limit_spec.rs` — the
-//! SAME file the COMPILE-TIME gate in `build.rs` checks, so no layer can check
-//! a different spec):
+//! The `ty_model!` source is `include!`d from `retention_limit_spec.rs`, the
+//! same file `build.rs` checks at compile time.
 //!
-//!   Tier 0 (also enforced at COMPILE TIME by build.rs): `TotalBounded`
-//!     (ring + store <= the ONE limit) proves at `Buggy=0` and is CAUGHT at
-//!     `Buggy=1` — the pre-unification store-cap-equals-limit split.
-//!
-//!   Tier 1 (THIS file's heart): every bounded Scroll trace is driven against a
-//!     real tiered `Grid` — real `line_feed` scroll-off, real lazy-buffer
-//!     drain, real store truncation — in LOCKSTEP with the model, with the
-//!     REAL measured (ring, store) substituted into each transition so the
-//!     spec judges the machine, not the model echoing itself.
-//!
-//!   Negative controls: a forged observation must be REJECTED, and the
-//!     RESURRECTED pre-unification configuration (store capped at the full
-//!     limit, ring riding on top) must be rejected by the `Buggy=0` spec when
-//!     driven on the real grid — so a green run is never vacuous and the bug
-//!     the unification fixed stays expressible + caught.
+//! - Tier 0: `TotalBounded` (ring + store <= the one limit) proves at `Buggy=0`
+//!   and is caught at `Buggy=1` (store capped at the limit, ring on top).
+//! - Tier 1: every bounded Scroll trace runs on a real tiered `Grid` (line_feed
+//!   scroll-off, lazy-buffer drain, store truncation) in lockstep with the
+//!   model, with the measured (ring, store) substituted into each transition.
+//! - Negative controls: a forged observation is rejected, and the split
+//!   configuration driven on the real grid is rejected by the `Buggy=0` spec.
 
 use aterm_scrollback::{Scrollback, ScrollbackStorage};
 use aterm_spec::derive::Model;
@@ -46,9 +36,7 @@ const MAX_PRODUCED: usize = 7; // the model's run bound is `produced <= 6` + 1 f
 const ROWS: u16 = 3;
 const COLS: u16 = 20;
 
-// ---------------------------------------------------------------------------
-// Real-Grid driver: the LITERAL objects under test.
-// ---------------------------------------------------------------------------
+// Real-Grid driver
 
 fn feed_line(g: &mut Grid, s: &str) {
     g.set_cursor(ROWS - 1, 0);
@@ -73,10 +61,9 @@ fn real_unified_grid() -> Grid {
     g
 }
 
-/// Project the REAL grid onto the model's variables at a quiescent point
-/// (lazy buffer drained): `ring` = ring-buffer scrollback, `store` = tiered
-/// store line count. Draining is part of the projection, not a perturbation —
-/// the model's Scroll is the quiescent-state transition.
+/// Project the real grid onto the model at a quiescent point (lazy buffer
+/// drained): `ring` = ring scrollback, `store` = tiered store line count. The
+/// model's Scroll is the quiescent-state transition.
 fn project(g: &mut Grid) -> (i64, i64) {
     let store = g
         .scrollback_mut() // drains the lazy buffer first
@@ -87,7 +74,7 @@ fn project(g: &mut Grid) -> (i64, i64) {
 /// TIERED per-transition conformance (see [`verify::validate_transition_tiered`]):
 /// the interpreter's `Next`-admission check always runs; `ty trace validate`
 /// additionally validates the two-step trace wherever installed (verdicts must
-/// agree). Cfg pins `Init` to `prev` with the real regime consts.
+/// agree). The trace's step 0 is `prev`; the cfg carries the real regime consts.
 fn validate_transition(
     m: &Model,
     prev: &BTreeMap<&'static str, i64>,
@@ -103,9 +90,8 @@ fn validate_transition(
     )
 }
 
-/// Drive `n` Scrolls on the REAL grid in lockstep with the model; return the
-/// per-step (prev, next) pairs with the REAL measured (ring, store)
-/// substituted into every `next`.
+/// Drive `n` Scrolls on the real grid in lockstep with the model; returns the
+/// per-step (prev, next) pairs with the measured (ring, store) in every `next`.
 #[allow(clippy::type_complexity)]
 fn run_lockstep(n: usize) -> Vec<(BTreeMap<&'static str, i64>, BTreeMap<&'static str, i64>)> {
     let m = retention_limit_model();
@@ -119,15 +105,15 @@ fn run_lockstep(n: usize) -> Vec<(BTreeMap<&'static str, i64>, BTreeMap<&'static
         assert!(ok, "model guard rejects Scroll at step {i}");
         feed_line(&mut g, &format!("L{i}"));
 
-        // Substitute the REAL measured outcome so ty judges the real grid.
+        // Substitute the real measured outcome so ty judges the grid.
         let (real_ring, real_store) = project(&mut g);
         let mut next = st.clone();
         next.insert("ring", real_ring);
         next.insert("store", real_store);
         st = next.clone(); // carry the real measurement forward
 
-        // The invariant-bearing REAL observable: total retention never
-        // exceeds the ONE limit at a quiescent point.
+        // The invariant-bearing real observable: total retention never
+        // exceeds the one limit at a quiescent point.
         assert!(
             g.scrollback_lines() as i64 <= LIMIT,
             "unified limit violated on the REAL grid at step {i}: {} > {LIMIT}",
@@ -139,9 +125,7 @@ fn run_lockstep(n: usize) -> Vec<(BTreeMap<&'static str, i64>, BTreeMap<&'static
     steps
 }
 
-// ---------------------------------------------------------------------------
-// The tests.
-// ---------------------------------------------------------------------------
+// Tests
 
 /// Tier 0 backstop (the build.rs gate runs the same check at compile time; this
 /// duplicates it in the test suite so `cargo test` alone also proves it).
@@ -150,9 +134,8 @@ fn retention_limit_spec_model_checked_in_trust() {
     verify::prove_and_catch_scalar(&retention_limit_model(), "unified retention limit spec");
 }
 
-/// Tier 1: every bounded Scroll run (0..=MAX_PRODUCED steps), driven on the
-/// REAL Grid in lockstep with the model, every transition's real measurement
-/// judged against the spec's Next.
+/// Tier 1: every bounded Scroll run (0..=MAX_PRODUCED steps) on the real Grid,
+/// each transition judged against the spec's `Next`.
 #[test]
 fn real_grid_retention_conforms_to_spec() {
     let m = retention_limit_model();
@@ -167,8 +150,8 @@ fn real_grid_retention_conforms_to_spec() {
         }
     }
 
-    // NEGATIVE CONTROL 1: a forged observation must be REJECTED — claim one
-    // MORE retained store line than the real grid measured.
+    // Negative control 1: claiming one more store line than measured is
+    // rejected.
     let steps = run_lockstep(MAX_PRODUCED);
     let (prev, next) = steps.last().expect("non-empty run").clone();
     let mut forged = next.clone();
@@ -180,17 +163,15 @@ fn real_grid_retention_conforms_to_spec() {
     );
 }
 
-/// NEGATIVE CONTROL 2 — the resurrected PRE-UNIFICATION configuration is
-/// caught on the REAL grid: cap the store at the FULL limit (the old
-/// store-cap-equals-limit split) via the raw store API, ride the ring on top,
-/// and the real machine retains `limit + ring` lines — which the `Buggy=0`
-/// spec must reject and the unified invariant assertion must flag.
+/// Negative control 2: capping the store at the full limit via the raw store
+/// API, with the ring on top, retains `limit + ring` lines on the real grid;
+/// the `Buggy=0` spec rejects it and the unified invariant flags it.
 #[test]
 fn resurrected_pre_unification_split_is_rejected() {
     let m = retention_limit_model();
     let sb: ScrollbackStorage = Scrollback::new(4, 8, 8_000_000).into();
     let mut g = Grid::with_tiered_scrollback(ROWS, COLS, RING_CAP as usize, sb);
-    // The OLD semantics: the store alone is capped at the user's limit; the
+    // The old semantics: the store alone is capped at the user's limit; the
     // ring keeps retaining its full cap on top (double retention).
     g.scrollback_mut()
         .expect("store attached")

@@ -2,12 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Grid-local facade for pin and generation tracking helpers extracted to
-//! `aterm-grid`.
-//!
-//! Normal runtime builds only need `GenerationTracker`. The concrete `Pin` and
-//! `PinnedRange` helpers remain test/Kani-only at this layer until a production
-//! caller needs them across the crate boundary.
+//! Grid-local facade for the pin and generation tracking helpers. Runtime
+//! builds use only `GenerationTracker`; `Pin` and `PinnedRange` are
+//! test/Kani-only here.
 
 #[cfg(kani)]
 use crate::Generation;
@@ -16,9 +13,7 @@ use crate::GenerationTracker;
 #[cfg(kani)]
 use crate::{Pin, PinnedRange};
 
-// ============================================================================
 // Grid impl for pin operations
-// ============================================================================
 
 use super::Grid;
 
@@ -30,20 +25,47 @@ impl Grid {
         self.storage.absolute_row_counter
     }
 
-    /// Continue another grid's absolute row numbering: a checkpoint restore
-    /// builds a fresh grid, which numbers its rows from `rows + carried
-    /// history`, and this raises the counter to the one the source grid had,
-    /// so an absolute row a shell mark or a pin recorded before the handoff
-    /// names the same line after it. Only for a grid nothing has observed yet.
+    /// Continue another grid's absolute row numbering after a checkpoint
+    /// restore, so an absolute row recorded before the handoff (a shell mark,
+    /// a pin) names the same line after it. Only for a grid nothing has
+    /// observed yet.
     ///
-    /// Bounded both ways: never below what this grid already holds (`oldest
-    /// absolute row` stays non-negative), and never within `2^16` rows of
-    /// `u64::MAX`, so a forged counter cannot make a later scroll overflow.
+    /// Clamped: never below what this grid already holds, and never within
+    /// `2^16` rows of `u64::MAX`, so a forged counter cannot overflow a scroll.
     pub fn continue_absolute_numbering(&mut self, counter: u64) {
         const CEILING: u64 = u64::MAX >> 16;
         let floor =
             u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
         self.storage.absolute_row_counter = counter.min(CEILING).max(floor);
+    }
+
+    /// EVERY RETAINED ROW KEEPS A KEY AT OR ABOVE 0: raise the counter to the
+    /// retained total (`visible_rows + scrollback_lines()`) where a resize left
+    /// it below — the floor [`Self::continue_absolute_numbering`] keeps for a
+    /// restore, kept for every resize.
+    ///
+    /// The two maps of an absolute row agree only above that floor: a mark is
+    /// RECORDED through [`Self::visible_to_absolute`] (`counter − visible + r`)
+    /// and read back through [`Self::oldest_absolute_row`] (`counter − visible −
+    /// scrollback`, saturating at 0) plus the history count. Below it the read
+    /// map saturates and the write map does not, so every OSC 133 mark a shell
+    /// records from then on reads back as a row above its prompt (`line`,
+    /// `blocks`; tab #1, 2026-10-01), for good — output moves the counter and
+    /// the history together. A rows-only resize no longer gets here (its bottom
+    /// arms move the counter with their rows); a WIDTH rewrap can, since it
+    /// changes how many rows the same lines take (synchronously, or at the
+    /// re-attach of an offloaded one). Raising the counter moves the write map
+    /// onto the read map — the keys every read already used — and is reported
+    /// as the renumbering it is to the write side.
+    pub(crate) fn cover_retained_rows(&mut self) {
+        let retained =
+            u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
+        if self.storage.absolute_row_counter < retained {
+            self.storage.absolute_row_counter = retained;
+            self.storage.history_renumber_epoch =
+                self.storage.history_renumber_epoch.saturating_add(1);
+            self.invalidate_host_coordinates();
+        }
     }
 
     /// Convert visible coordinates to absolute row number.
@@ -56,15 +78,10 @@ impl Grid {
             .saturating_add(u64::from(visible_row))
     }
 
-    /// The absolute row number of the OLDEST line still retained.
-    ///
-    /// History index 0 (the oldest retained scrollback line) corresponds to this
-    /// absolute row. Lines with an absolute row `< oldest_absolute_row()` have
-    /// been EVICTED from scrollback and can no longer be read.
+    /// The absolute row number of the oldest retained line (history index 0).
+    /// Rows below it have been evicted.
     ///
     /// Formula: `absolute_row_counter - visible_rows - scrollback_lines()`.
-    /// The top visible row is at absolute `absolute_row_counter - visible_rows`;
-    /// the oldest scrollback line sits `scrollback_lines()` rows above it.
     #[must_use]
     pub fn oldest_absolute_row(&self) -> u64 {
         self.storage
@@ -73,27 +90,20 @@ impl Grid {
             .saturating_sub(self.scrollback_lines() as u64)
     }
 
-    /// Monotonic epoch of row RENUMBERINGS that are invisible to the
-    /// `(content_gen, absolute_row_revision)` pair — see
-    /// `GridStorage::history_renumber_epoch`. An advance means absolute row
-    /// keys may have shifted wholesale: a WIDTH reflow rewrapped the same
-    /// lines into a different number of rows (live screen included, whether or
-    /// not any history row was spliced), or a Kitty CSI +T unscroll removed the
-    /// newest scrollback lines. Absolute-row-keyed incremental caches must
-    /// REBUILD rather than refresh, and anything holding a CACHED absolute row
-    /// — a search hit, a parked find anchor — must refuse to re-anchor it
-    /// until it is recomputed.
+    /// Epoch of row renumberings invisible to `(content_gen,
+    /// absolute_row_revision)` (see `GridStorage::history_renumber_epoch`): a
+    /// width reflow or a Kitty CSI +T unscroll. On an advance, absolute-row-keyed
+    /// caches rebuild and cached absolute rows (search hits, find anchors) are
+    /// recomputed before use.
     #[must_use]
     #[inline]
     pub fn history_renumber_epoch(&self) -> u64 {
         self.storage.history_renumber_epoch
     }
 
-    /// The absolute row number currently shown at the TOP of the viewport,
-    /// accounting for the scrollback `display_offset`. At the live bottom this is
-    /// `absolute_row_counter - visible_rows`; scrolled up by `display_offset` it
-    /// is that many rows earlier. The reference point for prompt-to-prompt
-    /// navigation (which mark is "above" vs "below" the current view).
+    /// The absolute row shown at the top of the viewport:
+    /// `absolute_row_counter - visible_rows - display_offset`. The reference
+    /// point for prompt-to-prompt navigation.
     #[must_use]
     pub fn top_visible_absolute_row(&self) -> u64 {
         self.storage
@@ -102,22 +112,17 @@ impl Grid {
             .saturating_sub(self.storage.display_offset as u64)
     }
 
-    /// Absolute row index of the live/last line (xterm `buffer.active.baseY`).
-    ///
-    /// Equals `oldest_absolute_row() + scrollback_lines()` — the absolute row of
-    /// the top visible line when NOT scrolled into history. Returned as `usize`
-    /// so the wasm bridge maps it to a plain JS number (not BigInt).
+    /// Absolute row of the top visible line at the live bottom (xterm
+    /// `buffer.active.baseY`): `oldest_absolute_row() + scrollback_lines()`.
+    /// `usize` so wasm maps it to a plain JS number.
     #[must_use]
     #[inline]
     pub fn base_y(&self) -> usize {
         self.oldest_absolute_row() as usize + self.scrollback_lines()
     }
 
-    /// Absolute row index of the TOP visible line for the current viewport.
-    ///
-    /// `base_y()` minus the scroll-back `display_offset`; equals `base_y()` when
-    /// not scrolled. Used as the search/link origin so a hit's absolute row can
-    /// be mapped back to a display row.
+    /// Absolute row of the top visible line for the current viewport:
+    /// `base_y() - display_offset`. The search/link origin.
     #[must_use]
     #[inline]
     pub fn display_origin_absolute(&self) -> usize {

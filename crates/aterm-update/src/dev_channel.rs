@@ -1,34 +1,25 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A DEV BUILD'S STANDING AGAINST THE CHANNEL (gap #30, 2026-09-26).
+//! A DEV BUILD'S STANDING AGAINST THE CHANNEL (gap #30).
 //!
-//! A dev-marked bundle (`ATermDevBuild`, stamped by `tools/dev-app.sh`) is left alone by
-//! the updater on purpose ([`crate::running_is_dev_marked`]; `bundle::resolve` refuses
-//! it), so no check thread ever runs in it and nothing ever said how far behind the
-//! channel it had fallen. Measured on the owner's Mac: a 0.91 `aterm (dev).app`, weeks
-//! old, launched from the Dock and ran old code while the release it sits beside kept
-//! updating — with nothing on screen or in `aterm update status` saying so.
+//! The updater leaves a dev-marked bundle (`ATermDevBuild`) alone
+//! ([`crate::running_is_dev_marked`]), so without this nothing says how far behind
+//! the channel it has fallen.
 //!
-//! This module is the one thing a dev build now asks the channel: ONE anonymous,
-//! read-only `HEAD` of the PUBLIC channel's evergreen appcast URL — the very request the
-//! updater's own check opens with ([`aterm_update_core::pointer`]), on the compiled-in
-//! channel ([`crate::DEFAULT_OWNER`]/[`crate::DEFAULT_REPO`]) whatever `[update]
-//! owner/repo` a development build was repointed at, so it never reads a staging repo.
-//! Redirects are refused, so the one request is the whole conversation: the `302`'s
-//! `Location` names the newest release's tag and nothing is fetched from it. No GET, no
-//! download, no ledger or staging write, nothing applied — this module writes NO file.
+//! The one request: an anonymous `HEAD` of the PUBLIC channel's evergreen appcast URL
+//! ([`aterm_update_core::pointer`]), on the compiled-in channel
+//! ([`crate::DEFAULT_OWNER`]/[`crate::DEFAULT_REPO`]) whatever `[update] owner/repo`
+//! says, so it never reads a staging repo. Redirects are refused: the `302`'s
+//! `Location` names the newest tag and nothing is fetched. This module writes NO file.
 //!
-//! What it answers is a [`DevLag`]: behind, at, or ahead of that release, by VERSION.
-//! The running version is compared for display only — it never reaches an update
-//! decision, which stays the build number's (`build_info`'s contract). The count of
-//! releases between them is a MINOR-version count: the channel publishes one app release
-//! per minor (measured 2026-09-26 with `gh release list -R alabsystems/aterm`: v0.86.0
-//! through v0.93.0, contiguous), and a count across a MAJOR bump is not claimed at all.
+//! The answer is a [`DevLag`] by VERSION, for display only — update decisions stay
+//! the build number's (`build_info`). The count is a MINOR-version count (the channel
+//! publishes one app release per minor; v0.86.0 through v0.93.0 were contiguous); a
+//! count across a MAJOR bump is not claimed.
 //!
-//! An unreachable channel says nothing: a transport failure, a 404, a 429/5xx or a
-//! refused redirect is `None`, never an error and never a row — offline is weather, and a
-//! dev build's standing is not worth a failure the person must act on.
+//! An unreachable channel (transport failure, 404, 429/5xx, refused redirect) is
+//! `None`, never an error or a row: offline is weather.
 //!
 //! WHEN it asks: at the window's start and then daily ([`RECHECK_EVERY`], on the wall
 //! clock), only in a dev-marked copy and only while "Check for updates automatically"
@@ -45,9 +36,8 @@ use aterm_update_core::{HeadAnswer, HttpError};
 /// (`github::APPCAST_ASSET` is this constant).
 pub(crate) const APPCAST_ASSET: &str = "aterm-appcast.toml";
 
-/// How often a running dev build asks again: daily. A dev build falls behind by
-/// releases, which the channel publishes about once a day (v0.86.0 on 2026-09-15 to
-/// v0.93.0 on 2026-09-25); the updater's ten-minute cadence buys a dev build nothing.
+/// How often a running dev build asks again: daily, the channel's release cadence;
+/// the updater's ten-minute cadence buys a dev build nothing.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where a dev build stands against the newest release on the public channel.
@@ -145,13 +135,6 @@ pub fn classify(running_version: &str, latest_tag: &str) -> Option<DevLag> {
         std::cmp::Ordering::Equal => DevLag::Current { latest: tag },
         std::cmp::Ordering::Greater => DevLag::Ahead { latest: tag },
     })
-}
-
-/// The one URL this module ever requests: the public channel's evergreen appcast URL
-/// (`https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml`).
-#[must_use]
-pub fn channel_url() -> Option<String> {
-    pointer::latest_download_url(crate::DEFAULT_OWNER, crate::DEFAULT_REPO, APPCAST_ASSET)
 }
 
 /// ONE `HEAD` of the public channel through `head` (the redirect-refusing transport),
@@ -301,7 +284,8 @@ mod tests {
 
     /// The public channel's evergreen URL — the one string any fetch below may see.
     fn evergreen() -> String {
-        channel_url().expect("the compiled channel is URL-safe")
+        pointer::latest_download_url(crate::DEFAULT_OWNER, crate::DEFAULT_REPO, APPCAST_ASSET)
+            .expect("the compiled channel is URL-safe")
     }
 
     /// A HEAD transport that answers the channel head `tag` with the 302 GitHub serves

@@ -19,16 +19,17 @@ use std::process::{Command, Stdio};
 
 /// A temp `HOME` with nothing in it: no config, no store, no build directories.
 struct Fixture {
-    root: std::path::PathBuf,
+    root: aterm_tempfile::TempDir,
     home: std::path::PathBuf,
 }
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-machine-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-machine-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
         std::fs::create_dir_all(&home).expect("fixture home");
         Self { root, home }
     }
@@ -37,7 +38,7 @@ impl Fixture {
         let out = Command::new(env!("CARGO_BIN_EXE_atpkg"))
             .args(args)
             .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -51,12 +52,6 @@ impl Fixture {
                 .collect(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -135,7 +130,7 @@ fn the_apply_refuses_a_synthetic_home_and_writes_nothing() {
 #[test]
 fn an_unparseable_config_refuses_on_both_spellings() {
     let fx = Fixture::new("badconfig");
-    let config_dir = fx.root.join("config").join("aterm");
+    let config_dir = fx.root.path().join("config").join("aterm");
     std::fs::create_dir_all(&config_dir).expect("config dir");
     std::fs::write(config_dir.join("aterm.toml"), b"[machine\nnot = toml\n").expect("write");
     for args in [&["machine"][..], &["machine", "apply"][..]] {

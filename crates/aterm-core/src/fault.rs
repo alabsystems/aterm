@@ -2,16 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Deterministic fault injection (M7 FAULT-INJECT).
+//! Deterministic fault injection.
 //!
-//! A thread-local registry of armed fault points so tests can force the rare
-//! error / cleanup branches that normal input cannot reach — an allocation that
-//! fails, an I/O write that errors — and assert the fail-closed path actually
-//! fails closed (degrades gracefully, never panics or corrupts state).
+//! A thread-local registry of armed fault points, so tests can force rare
+//! error branches (a failed allocation, an I/O error) and assert the path fails
+//! closed without panicking or corrupting state.
 //!
-//! Production builds pay ZERO: [`triggered`] is a `#[inline]` `const false` the
-//! optimizer folds away at every call site. The registry + `arm`/`disarm` exist
-//! only under `cfg(test)` or the opt-in `fault-injection` feature.
+//! Production builds pay nothing: [`triggered`] is an `#[inline]` `const
+//! false`. The registry and `arm`/`disarm` exist only under `cfg(test)` or the
+//! `fault-injection` feature.
 //!
 //! Usage at a fail-closed seam:
 //! ```ignore

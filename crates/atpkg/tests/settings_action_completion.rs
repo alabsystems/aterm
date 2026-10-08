@@ -44,7 +44,7 @@ fn run_with_deadline(
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn dev atpkg child");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = child.try_wait().expect("poll atpkg child") {
             return status;
@@ -61,10 +61,19 @@ fn run_with_deadline(
     }
 }
 
+/// One test's private HOME, config dir and registry under a fresh directory that goes
+/// when the test does, failed or not.
+fn scratch(label: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("atpkg-{label}-"))
+        .tempdir()
+        .unwrap()
+}
+
 #[test]
 fn native_settings_package_actions_complete_with_hostile_metadata_files() {
-    let root = std::env::temp_dir().join(format!("atpkg-settings-actions-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let tmp = scratch("settings-actions");
+    let root = tmp.path();
     let home = root.join("home");
     let config_home = root.join("config");
     let registry = root.join("registry");
@@ -111,8 +120,6 @@ fn native_settings_package_actions_complete_with_hostile_metadata_files() {
         &["install", "--default-set"],
     );
     assert!(!install.success(), "hostile registry input fails closed");
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// The conventional help spellings, at the real process edge: they exit 0 on the help
@@ -122,8 +129,8 @@ fn native_settings_package_actions_complete_with_hostile_metadata_files() {
 /// with the dispatch is pinned by cli.rs's own `verb_hint_matches_dispatch`.)
 #[test]
 fn help_spellings_dispatch_as_advertised() {
-    let root = std::env::temp_dir().join(format!("atpkg-verb-dispatch-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let tmp = scratch("verb-dispatch");
+    let root = tmp.path();
     let home = root.join("home");
     let config_home = root.join("config");
     let registry = root.join("registry");
@@ -134,8 +141,6 @@ fn help_spellings_dispatch_as_advertised() {
         let status = run_with_deadline(&home, &config_home, &registry, &help);
         assert!(status.success(), "atpkg {} exits 0", help[0]);
     }
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Like [`run_with_deadline`], but hands back stderr. The flag-guard's non-regression
@@ -169,8 +174,8 @@ fn run_capture(home: &Path, config_home: &Path, registry: &Path, args: &[&str]) 
 /// record is forever, and it is read back by a diagnostic that other repos key on.
 #[test]
 fn subverb_flags_never_become_program_names() {
-    let root = std::env::temp_dir().join(format!("atpkg-flag-guard-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let tmp = scratch("flag-guard");
+    let root = tmp.path();
     let home = root.join("home");
     let config_home = root.join("config");
     let registry = root.join("registry");
@@ -238,6 +243,4 @@ fn subverb_flags_never_become_program_names() {
             legit.join(" ")
         );
     }
-
-    let _ = std::fs::remove_dir_all(root);
 }

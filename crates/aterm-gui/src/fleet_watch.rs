@@ -243,8 +243,10 @@ fn arm(stream: &aterm_uds::CtlStream, deadline: Instant) -> Option<()> {
 /// didn't reach.
 fn summarize_peer(pid: u32, sock: &str) -> Option<InstanceRow> {
     let deadline = Instant::now() + PEER_BUDGET;
-    let token = crate::proxy::read_sibling_token(sock)?;
-    let stream = aterm_uds::CtlStream::connect(sock).ok()?;
+    // The sibling's token, read once the connect succeeded: the listener's
+    // that took it, never one its update's successor refuses.
+    let (stream, token) = aterm_ctl::connect_then_read_token(sock).ok()?;
+    let token = token.ok()?;
     arm(&stream, deadline)?;
     (&stream)
         .write_all(format!("AUTH {token}\nsessions\n").as_bytes())
@@ -424,10 +426,12 @@ mod tests {
     #[test]
     fn summarize_peer_reads_a_scripted_sibling() {
         use std::io::{BufRead, BufReader, Write};
-        let dir = std::env::temp_dir().join(format!("aterm-fleet-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-fleet-test-")
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path();
         let sock = dir.join("peer.sock");
-        let _ = std::fs::remove_file(&sock);
         // The sibling token read beside the socket (non-pid name ⇒ aterm.token).
         std::fs::write(dir.join("aterm.token"), "feedbeef\n").unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();

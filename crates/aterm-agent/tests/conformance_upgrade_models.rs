@@ -5,18 +5,15 @@
 //! ladder and its model switch (`harness::upgrade_models`, specs
 //! `HarnessModelPriority`, `HarnessModelLadder` and `HarnessModelSwitch`).
 //!
-//! A `ty`-green model on its own is a statement about the DESCRIPTION of the
-//! code. These tests make it a statement about the code that compiled: they
-//! drive the real `Priority::admit`, `render`/`parse` and
-//! `upgrade_models::target_allowed` (the list), `model_moves_now` (the
-//! ladder), and `model_read_step`, `model_due`, `model_to`,
+//! These tests drive the real `Priority::admit`, `render`/`parse` and
+//! `upgrade_models::list_target` over `offered` (the list), `model_moves_now`
+//! (the ladder), and `model_read_step`, `model_due`, `model_to`,
 //! `ModelRecord::settle`/`due_clock`/`asked` and `live_model_at` (the switch)
-//! over every reachable state of the derived models, project what those
-//! produce onto the models' variables, and check
-//! every observed transition against the same model checked at Tier 0 — by
-//! the in-process interpreter always, and additionally by `ty trace validate`
-//! wherever that binary is installed. FORGED successors the model must refuse
-//! keep a green bind from being vacuous.
+//! over every reachable state of the derived models, project the results onto
+//! the models' variables, and check every observed transition against the
+//! model on the in-process interpreter and, where installed, `ty trace
+//! validate`. Forged successors the model must refuse keep a green bind from
+//! being vacuous.
 
 use std::collections::BTreeMap;
 
@@ -49,8 +46,8 @@ fn assert_transition(model: &Model, before: &Vars, after: &Vars, action: &str, l
     );
 }
 
-/// A successor the real code did NOT produce must be refused as `action`:
-/// `base` is what the real code DID produce, the forgery is `base` with
+/// A successor the real code did not produce must be refused as `action`:
+/// `base` is what the real code did produce, the forgery is `base` with
 /// `changes` applied, offered as a successor of `before`.
 fn assert_forged_rejected(
     model: &Model,

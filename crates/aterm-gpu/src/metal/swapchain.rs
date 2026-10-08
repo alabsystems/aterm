@@ -1,168 +1,84 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SWAPCHAIN — `CAMetalLayer`, reached by class name through the runtime.
-//!
-//! This closes the first of the two gaps `mod.rs` declared: everything below
-//! is the present-path surface the offscreen FFI deliberately did not own.
-//! `ffi.rs` keeps its "no swapchain here" promise — the QuartzCore link and
-//! every drawable selector live in THIS file, next to the code that needs
-//! them, which is where `ffi.rs`'s header said they would land.
+//! The swapchain: `CAMetalLayer`, reached by class name through the runtime.
+//! The QuartzCore link and every drawable selector live here; `ffi.rs` owns no
+//! swapchain surface.
 //!
 //! # What one Swapchain is
 //!
-//! A `CAMetalLayer` configured the way the SHIPPED wgpu path configures its
-//! surface, either STANDALONE (headless: a `CAMetalLayer` with a `device` and
-//! a `drawableSize` vends drawables and renders offscreen without any window
-//! or layer tree — which is what every test here uses) or attached as a
-//! sublayer of an existing `CALayer` parent. Attach NEVER touches the
-//! parent's existing sublayers: after wgpu teardown, wgpu's own
-//! `CAMetalLayer` STAYS parented on the view —
-//! `raw-window-metal-1.1.0/src/observer.rs:49-62` (`Drop for ObserverLayer`)
-//! deregisters its two KV observers and nothing else; `removeFromSuperlayer`
-//! appears only in that file's own test (`:242`) — so a first-party layer
-//! must tolerate a sibling wgpu layer existing, and the CPU-fallback stacking
-//! was audited on exactly that basis.
+//! A `CAMetalLayer` configured like the wgpu surface it replaces, either
+//! standalone (a layer with a `device` and `drawableSize` vends drawables with
+//! no window; every test here uses this) or attached as a sublayer of an
+//! existing `CALayer`. Attach never touches the parent's other sublayers, so a
+//! sibling wgpu layer (which wgpu teardown leaves parented) is tolerated.
 //!
-//! # Every configured axis, against wgpu-hal-29.0.3's `metal/surface.rs`
+//! # Configured axes (compared with wgpu-hal's `metal/surface.rs`)
 //!
-//! | axis | this module | wgpu-hal | why |
-//! |---|---|---|---|
-//! | `device` | the [`Device`] handed in | `surface.rs:88` | drawable textures come off this device |
-//! | `pixelFormat` | [`SwapchainConfig::format`], the table's Present-role format ([`super::pipelines::metal_format`]) | `surface.rs:89` | `Bgra8Unorm` (SDR) / `Rgba16Float` (EDR) — see the format note below |
-//! | `drawableSize` | explicit `width`x`height` | `surface.rs:79,100` | never derived from bounds; a standalone layer has none |
-//! | `framebufferOnly` | config; `true` in `SwapchainConfig::aterm_present` | `surface.rs:73` (`usage == COLOR_TARGET`) | production usage is `RENDER_ATTACHMENT`-only (`renderer.rs:7352-7356`), so wgpu runs `YES`; the video-tap reconcile flips it on demand, and readback tests need `false` |
-//! | `displaySyncEnabled` | config; `false` in `aterm_present` | `surface.rs:74-78,106` | the shipped present mode on macOS is `Immediate` when offered (`renderer.rs:7446-7451`), which wgpu-hal maps to `NO` |
-//! | `maximumDrawableCount` | config; `3` in `aterm_present` | `surface.rs:99` (`maximum_frame_latency + 1`) | `desired_frame_latency()` is 2 on macOS (`renderer.rs:7460-7469`: at latency 1 a typing-hot repaint storm exhausted the 2-drawable pool and parked the event loop, ~84ms of queued keyDowns measured), so the shipped count is 3. `CAMetalLayer.h:104-108`: legal range is `[2, 3]`, anything else throws — validated in Rust instead |
-//! | `opaque` | config; `true` in `aterm_present` | `surface.rs:81-85` | `PostMultiplied` (the translucent present, `renderer.rs::caps_support_post_multiplied`) maps to `NO` |
-//! | `wantsExtendedDynamicRangeContent` | derived: `format == Rgba16Float` | `surface.rs:93-96` derives identically | the EDR crown's f16 present |
-//! | `colorspace` | SDR: untouched (the sRGB space `setPixelFormat:` installs — measured); EDR: `kCGColorSpaceExtendedLinearSRGB` | NOT SET — `surface.rs:61-110` contains no `setColorspace` call | see the colorspace note below |
-//! | `allowsNextDrawableTimeout` | `YES`, explicitly | `surface.rs:102-104` sets `NO` | THE DELIBERATE DIVERGENCE — see the bounded-wait note below |
+//! | axis | this module | why |
+//! |---|---|---|
+//! | `device` | the [`Device`] handed in | drawables come off this device |
+//! | `pixelFormat` | [`SwapchainConfig::format`] ([`super::pipelines::metal_format`]) | `Bgra8Unorm` (SDR) or `Rgba16Float` (EDR) |
+//! | `drawableSize` | explicit `width`x`height` | never derived from bounds |
+//! | `framebufferOnly` | config; `true` in `aterm_present` | production usage is `RENDER_ATTACHMENT`-only; the video tap flips it on demand; readback tests need `false` |
+//! | `displaySyncEnabled` | config; `false` in `aterm_present` | the macOS present mode is `Immediate` |
+//! | `maximumDrawableCount` | config; `3` in `aterm_present` | frame latency 2 + 1 (see `renderer.rs` `frame_latency_for`); the legal range `[2, 3]` is validated in Rust |
+//! | `opaque` | config; `true` in `aterm_present` | `NO` for the translucent present |
+//! | `wantsExtendedDynamicRangeContent` | `format == Rgba16Float` | the HDR present |
+//! | `colorspace` | SDR `kCGColorSpaceSRGB`, EDR `kCGColorSpaceExtendedLinearSRGB` | see below |
+//! | `allowsNextDrawableTimeout` | `YES`, explicitly | wgpu-hal sets `NO`; see below |
 //!
-//! **The format note.** `pick_surface_format` (`renderer.rs:7496-7513`)
-//! prefers `Bgra8Unorm` and falls back to `Rgba8Unorm` — but the fallback is
-//! for OTHER backends: `CAMetalLayer` does not accept `Rgba8Unorm` as a layer
-//! `pixelFormat` (Apple documents the BGRA8/f16/XR set), and on Metal the
-//! `Bgra8Unorm` arm is always taken. So [`SwapchainConfig`] admits exactly
-//! `Bgra8Unorm` and `Rgba16Float` and rejects the rest in Rust, where the
-//! error can say why, rather than letting the layer throw.
+//! **Format.** `CAMetalLayer` does not accept `Rgba8Unorm`, so
+//! [`SwapchainConfig`] admits exactly `Bgra8Unorm` and `Rgba16Float` and
+//! rejects the rest in Rust rather than letting the layer throw.
 //!
-//! **The colorspace note.** `CAMetalLayer.h:118-122` documents a nil default
-//! ("no colormatching") — and that documentation is not the whole truth.
-//! MEASURED on this OS (Darwin 25.5, M5 Max): a fresh layer's colorspace is
-//! nil after `init` and still nil after `setDevice:`, and the moment
-//! `setPixelFormat:` runs it is NON-nil — `CGColorSpaceGetName` says
-//! `kCGColorSpaceSRGB`. wgpu-hal sets `pixelFormat` (`surface.rs:89`) and
-//! never touches `colorspace`. This module originally left the SDR arm to
-//! that implicit install for wgpu parity; the RECONFIGURE measurement ended
-//! that (2026-08-31): on a LIVE layer already carrying the explicit scRGB
-//! space, flipping the format back to `Bgra8Unorm` LEAVES the extended
-//! space in place — `setPixelFormat:`'s implicit install is a fresh-layer
-//! behaviour only — so `configure` now names BOTH arms' spaces explicitly
-//! (`kCGColorSpaceSRGB` / `kCGColorSpaceExtendedLinearSRGB`), the S1/S2
-//! readbacks pin the names, and the reconfigure storm pins them across
-//! every flip. On a fresh SDR layer the explicit write produces the byte
-//! the implicit install already produced, which is why S1 was green on
-//! both spellings. The EDR arm remains the deliberate divergence from
-//! wgpu's touch-nothing configure: `renderer.rs::tag_swapchain_scrgb`
-//! returns `true` on macOS — the shipped f16 present DECLARES its content
-//! scRGB. (The prior arming table recorded skip-the-EDR-setter as NOT
-//! CAUGHT because the OS supplied the same space implicitly; the storm's
-//! flip assertions retire that record — skipping either arm's setter is
-//! now RED.) Honestly: the headless tests pin the PROPERTY on the layer;
-//! no test here can referee how the WindowServer interprets it, because
-//! that requires a composited window.
+//! **Colorspace.** `setPixelFormat:` installs sRGB on a fresh layer, but on a
+//! live layer flipping from f16 back to `Bgra8Unorm` leaves the extended space
+//! in place, so `configure` names both arms' spaces explicitly. The EDR arm
+//! declares scRGB (`renderer.rs::tag_swapchain_scrgb` returns `true` on
+//! macOS). Headless tests pin the property on the layer; how WindowServer
+//! interprets it needs a composited window.
 //!
-//! **The bounded-wait note.** `CAMetalLayer.h:95-101,147-152`: `nextDrawable`
-//! blocks until a drawable is free; with `allowsNextDrawableTimeout = YES`
-//! (the OS default) it gives up after ~1 second and returns nil, with `NO` it
-//! blocks FOREVER. wgpu-hal chooses forever (`surface.rs:102-104`) — and that
-//! unbounded wait is precisely the failure `renderer.rs:7460-7478` measured:
-//! a parked event loop with keystrokes queued behind `nextDrawable()`. A
-//! first-party present path wants the failure OBSERVABLE, so this module
-//! keeps the timeout ON (set explicitly, so a wgpu-copying refactor shows up
-//! in the diff and in the readback test) and [`Swapchain::acquire`] maps nil
-//! to a bounded `Err` instead of a hang.
+//! **Bounded wait.** With `allowsNextDrawableTimeout = YES`, `nextDrawable`
+//! returns nil after about a second instead of blocking forever, so
+//! [`Swapchain::acquire`] maps nil to a bounded `Err` rather than parking the
+//! event loop. An unparented layer's pool never exhausts, so headless tests
+//! reach the nil arm only with a layer that cannot vend at all (a deviceless
+//! layer); the 1 s bound itself rides the pinned timeout readback.
 //!
-//! What headless tests CAN and CANNOT reach here, measured rather than
-//! assumed: an UNPARENTED layer's pool never exhausts on this OS — with
-//! `maximumDrawableCount = 2`, six consecutive `nextDrawable`s all vend
-//! (distinct drawable objects, < 10ms each) whether the previous six are
-//! held un-presented, presented-and-waited, or presented with the command
-//! buffer never waited on (re-measured 2026-08-31: five held un-presented
-//! on max=2 all vend, and six presented-unwaited cycles all vend — the
-//! held-un-presented arm is now pinned as a test, not just this note), and
-//! even a 300000x300000 or 0x0 `drawableSize` still vends — so the
-//! ~1s-timeout arm is REAL only for
-//! a layer whose presentation is paced by a compositor, which is exactly the
-//! on-screen scenario `renderer.rs:7460-7478` measured (~84ms of queued
-//! keystrokes behind a parked `nextDrawable`). The nil arm a headless test
-//! CAN reach deterministically is a layer that cannot vend at all (measured:
-//! a deviceless layer returns nil in 0.000s), and that is what the
-//! bounded-failure test drives through `acquire`'s Err path. The 1s bound
-//! itself rides the pinned `allowsNextDrawableTimeout == YES` readback.
+//! # Drawable ownership
 //!
-//! # Drawable ownership — the +0/+1 story
+//! `-nextDrawable` returns an autoreleased (+0) drawable. [`Swapchain::acquire`]
+//! pushes a pool, calls, retains the drawable and its `texture` to +1 [`Obj`]s,
+//! and pops the pool, so they outlive the call.
 //!
-//! `-nextDrawable` returns an AUTORELEASED `id<CAMetalDrawable>` (+0, owned by
-//! the innermost pool; `CAMetalLayer.h:102` is a plain `-` method with no
-//! `new`/`copy` in the name, and wgpu-hal treats it the same way —
-//! `surface.rs:160-164` calls it inside `autoreleasepool` and immediately
-//! retains both the drawable and its texture). [`Swapchain::acquire`] does the
-//! identical dance: push a pool, call, RETAIN the drawable and its `texture`
-//! property (also +0, `CAMetalLayer.h:38`) to +1 [`Obj`]s, pop the pool. The
-//! retains are not optional: the acquire's pool dies at the end of `acquire`,
-//! and the drawable must survive until the caller presents it later in the
-//! frame.
+//! # The frame boundary as a type
 //!
-//! # The frame boundary, as a type
+//! [`Frame`] holds `&mut Swapchain`, so only one drawable is live at a time.
+//! [`Frame::present`] consumes it (present plus commit); dropping it discards
+//! the drawable back to the pool. `mem::forget` or never resolving a frame is
+//! not prevented by the type; the exhaustion test shows it costs a bounded,
+//! named error rather than a hang.
 //!
-//! [`Frame`] holds `&mut Swapchain` — while a `Frame` is live, `acquire`
-//! cannot be called again, so "one drawable at a time, never held across a
-//! frame boundary" is compile-time shape, not convention. The frame ends in
-//! exactly one of two ways: [`Frame::present`] consumes it (presentDrawable +
-//! commit), or dropping it DISCARDS — the two `Obj` releases return the
-//! drawable to the pool, which is all wgpu-hal's `discard_texture`
-//! (`surface.rs:194`) amounts to as well. What the type cannot forbid is
-//! `mem::forget` or stashing the `Frame` somewhere and never resolving it;
-//! that invariant is stated here, and the exhaustion test shows its violation
-//! costs a bounded, named error — not a hang.
+//! # The loss latch
 //!
-//! # The loss latch is wired in, not merely adjacent
+//! Every swapchain holds the process `Arc<`[`loss::LossLatch`]`>`:
 //!
-//! Every swapchain holds an `Arc<`[`loss::LossLatch`]`>` handed in at
-//! construction (one per process in production, exactly like the `AtomicBool`
-//! behind the wgpu downgrade path). Three obligations, each armed:
-//!
-//! * [`Swapchain::acquire`] REFUSES FAST once the latch is lost — the check
-//!   precedes every FFI call, so a dead device costs an `Err` naming the
-//!   first loss's reason in microseconds, never a `nextDrawable` against a
-//!   dead queue (which is a ~1s timeout per frame at best).
+//! * [`Swapchain::acquire`] refuses fast once the latch is lost, before any
+//!   FFI call.
 //! * [`Frame::present`] refuses the same way for a frame acquired before the
-//!   loss landed — the consumed frame drops, which discards the drawable
-//!   back to the pool, the only sane place for it once the device is gone.
-//! * [`PresentTicket::wait_outcome`] FEEDS the latch itself (through
-//!   [`PresentTicket::settle`], which is also the injection seam the
-//!   end-to-end test drives a `PageFault` through) — "the caller remembered
-//!   to record the outcome" is not a failure mode this module offers.
-//!   `Retryable` outcomes pass through without latching, by `LossLatch`'s
-//!   own contract.
+//!   loss; the dropped frame discards its drawable.
+//! * [`PresentTicket::wait_outcome`] feeds the latch itself (via
+//!   [`PresentTicket::settle`], also the test injection seam). `Retryable`
+//!   outcomes do not latch.
 //!
-//! # Present ordering, and what is out of scope
+//! # Present ordering
 //!
-//! [`Frame::present`] follows wgpu-hal's shape exactly
-//! (`wgpu-hal-29.0.3/src/metal/mod.rs:599-622`): a FRESH command buffer from
-//! the caller's queue, `presentDrawable:` registered BEFORE `commit`. That
-//! ordering is what avoids the present-before-scheduled hazard:
-//! `presentDrawable:` is sugar for a scheduled-handler, so presentation
-//! cannot fire before the command buffer is scheduled behind the frame's
-//! rendering on the same queue — and calling it on an already-committed
-//! buffer is an exception, not a race. Out of scope, stated rather than
-//! half-built: the `presentsWithTransaction` arm (wgpu-hal `mod.rs:616-620`:
-//! `waitUntilScheduled` + `drawable.present`; the property stays at its
-//! default `NO` here) and `presentDrawable:afterMinimumDuration:` — the
-//! paced-present variant is a policy decision for the renderer phase, and
-//! nothing in this foundation should pre-commit it.
+//! [`Frame::present`] follows wgpu-hal: a fresh command buffer from the
+//! caller's queue with `presentDrawable:` registered before `commit`, so
+//! presentation cannot fire before the frame's rendering is scheduled. Not
+//! implemented: `presentsWithTransaction` and
+//! `presentDrawable:afterMinimumDuration:`.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -172,21 +88,17 @@ use aterm_objc::Bool as ObjcBool;
 use super::ffi::{AutoreleasePool, ClassPtr, Device, Id, Obj, PixelFormat, Sel, class, msg, sel};
 use super::{encoder, loss};
 
-// The QuartzCore linkage lives HERE, beside the only code that resolves
-// QuartzCore classes — `ffi.rs` removed an empty, unreferenced link block on
-// the grounds that a linkage is only checkable next to code that needs it,
-// and promised the present phase would add it back in its own file. This
-// block is that promise kept, and `CACurrentMediaTime` keeps it non-empty and
-// honest: the exhaustion test uses it to MEASURE the acquire bound.
+// QuartzCore linkage, beside the only code that resolves QuartzCore classes.
+// `CACurrentMediaTime` is used by the exhaustion test to measure the acquire
+// bound.
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {
     /// Mach absolute time in seconds — the clock CoreAnimation itself uses.
     fn CACurrentMediaTime() -> f64;
 }
 
-// The EDR colorspace: created once per configure, released after the layer
-// retains it. CoreGraphics exports these as plain C, matching the flat-C
-// house style for every Apple framework that offers one.
+// The EDR colorspace, created per configure and released after the layer
+// retains it.
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     /// +1: the caller owns the result and must `CGColorSpaceRelease` it.
@@ -195,23 +107,17 @@ unsafe extern "C" {
     #[cfg(test)]
     fn CGColorSpaceGetName(space: *mut c_void) -> *const c_void;
     fn CGColorSpaceRelease(space: *mut c_void);
-    /// `kCGColorSpaceExtendedLinearSRGB` — scRGB: linear transfer, sRGB
-    /// primaries, components unclamped beyond [0,1]. The space
-    /// `renderer.rs::tag_swapchain_scrgb` declares the macOS f16 present to
-    /// carry.
+    /// `kCGColorSpaceExtendedLinearSRGB` (scRGB): linear transfer, sRGB
+    /// primaries, unclamped components. The macOS f16 present's space.
     static kCGColorSpaceExtendedLinearSRGB: *const c_void;
-    /// `kCGColorSpaceSRGB` — the SDR present's space. Named explicitly since
-    /// the reconfigure measurement (see [`Swapchain::reconfigure`]): an
-    /// EDR→SDR flip on a LIVE layer does NOT get sRGB back from
-    /// `setPixelFormat:` alone, so the SDR arm now declares it.
+    /// `kCGColorSpaceSRGB`, the SDR present's space. Set explicitly because an
+    /// EDR-to-SDR flip on a live layer does not restore it (see
+    /// [`Swapchain::reconfigure`]).
     static kCGColorSpaceSRGB: *const c_void;
 }
 
-/// `CGSize` — two `double`s, a homogeneous floating-point aggregate passed
-/// and returned in `v0`/`v1` on `aarch64-apple-darwin`, exactly like
-/// [`super::ffi::ClearColor`]. `repr(C)` reproduces the ABI on both
-/// directions (`setDrawableSize:` takes it by value; `drawableSize` returns
-/// it by value).
+/// `CGSize`: two `double`s, passed and returned in `v0`/`v1` on
+/// `aarch64-apple-darwin` like [`super::ffi::ClearColor`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct CgSize {
@@ -219,17 +125,12 @@ struct CgSize {
     height: f64,
 }
 
-/// `CGPoint`/`CGRect` — the `setFrame:` argument, two and four `double`s.
+/// `CGPoint`/`CGRect`, the `setFrame:` argument.
 ///
-/// Sound as an ARGUMENT through this module's single bare `objc_msgSend` on
-/// both arches aterm ships: an HFA in `v0`-`v3` on `aarch64`, and a by-memory
-/// aggregate that `extern "C"` already lays out correctly on `x86_64`. A
-/// CGRect *return* would NOT be — SysV routes an over-16-byte return through
-/// `objc_msgSend_stret`, which the `ffi` header deliberately does not declare.
-/// That asymmetry is why [`Swapchain::sync_layer_geometry`] reads only the
-/// scalar `contentsScale` and DERIVES the frame, instead of reading the
-/// parent's `bounds` the way the CPU presenter (which has objc2 to hide the
-/// stret split) can afford to.
+/// Sound as an argument through plain `objc_msgSend` on both arm64 and x86_64.
+/// A `CGRect` return would need `objc_msgSend_stret` on x86_64, which `ffi`
+/// does not declare, so [`Swapchain::sync_layer_geometry`] reads only the
+/// scalar `contentsScale` and derives the frame.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct CgPoint {
@@ -244,22 +145,19 @@ struct CgRect {
     size: CgSize,
 }
 
-/// Everything one swapchain configure sets — the module header's table, as
-/// data. Built by `Self::aterm_present` for the shipped values; tests build
-/// non-default values by hand to prove every setter is live.
+/// Everything one swapchain configure sets. `Self::aterm_present` builds the
+/// production values; tests build others to prove every setter is live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SwapchainConfig {
-    /// The layer `pixelFormat`: [`PixelFormat::Bgra8Unorm`] (the SDR present)
-    /// or [`PixelFormat::Rgba16Float`] (EDR). Everything else is rejected —
-    /// see the module header's format note.
+    /// The layer `pixelFormat`: [`PixelFormat::Bgra8Unorm`] (SDR) or
+    /// [`PixelFormat::Rgba16Float`] (EDR); anything else is rejected.
     pub(crate) format: PixelFormat,
     /// `drawableSize`, in pixels. Explicit, never derived from layer bounds.
     pub(crate) width: usize,
     pub(crate) height: usize,
-    /// `framebufferOnly`. `true` forfeits sampling/blit access to the
-    /// drawable's texture in exchange for lossless drawable compression;
-    /// the readback tests run `false`, production runs `true` until a video
-    /// tap arms (`renderer.rs::surface_usage`).
+    /// `framebufferOnly`: `true` gives lossless drawable compression but no
+    /// sampling or blit access. Production runs `true` until a video tap arms
+    /// (`renderer.rs::surface_usage`); readback tests run `false`.
     pub(crate) framebuffer_only: bool,
     /// `displaySyncEnabled`. `false` is wgpu's `Immediate`, the shipped macOS
     /// choice; `true` is `Fifo` (`wgpu-hal surface.rs:74-78`).
@@ -273,9 +171,8 @@ pub(crate) struct SwapchainConfig {
 }
 
 impl SwapchainConfig {
-    /// The values the SHIPPED wgpu configure produces on macOS, each cited in
-    /// the module header's table: `framebufferOnly` on, display sync off
-    /// (Immediate), 3 drawables (frame latency 2 + 1), opaque.
+    /// The production macOS values: `framebufferOnly` on, display sync off
+    /// (Immediate), 3 drawables, opaque.
     #[cfg(test)]
     pub(crate) const fn aterm_present(format: PixelFormat, width: usize, height: usize) -> Self {
         Self {
@@ -319,37 +216,30 @@ impl SwapchainConfig {
     }
 }
 
-/// One configured `CAMetalLayer` and the two facts about it every acquire
-/// needs. Raw-pointer holder: thread-pinned, no `unsafe impl Send/Sync`, per
-/// the module convention.
+/// One configured `CAMetalLayer` and what every acquire needs. Thread-pinned
+/// raw-pointer holder; not `Send`/`Sync`.
 #[derive(Debug)]
 pub(crate) struct Swapchain {
     /// The +1 layer. Owned; released on drop.
     layer: Obj,
-    /// Keep the attachment parent alive through deferred retirement, even when
-    /// NSView releases its layer during close. This is a lifetime guarantee,
-    /// not a promise that AppKit cannot explicitly change the hierarchy.
+    /// Keeps the attachment parent alive through deferred retirement, even when
+    /// NSView releases its layer during close.
     parent: Option<Obj>,
     /// Whether [`Self::attached`] parented the layer, and drop must unparent.
     is_attached: bool,
-    /// Change gate for [`Self::sync_layer_geometry`]: the
-    /// `(contentsScale, width, height)` the layer's geometry was last written
-    /// from, or `None` before the first sync (and forever on the standalone
-    /// shape, which has no parent to read a scale from).
+    /// Change gate for [`Self::sync_layer_geometry`]: the `(contentsScale,
+    /// width, height)` last written, or `None` before the first sync (always
+    /// on the standalone shape).
     applied_geometry: Option<(f64, usize, usize)>,
     format: PixelFormat,
     width: usize,
     height: usize,
-    /// The process device-loss latch this swapchain answers to — see the
-    /// module header's loss section. `loss` still owns the type; this is a
-    /// handle, shared with every other submitter in the process.
+    /// The process device-loss latch, shared with every other submitter.
     latch: Arc<loss::LossLatch>,
 }
 
 impl Swapchain {
-    /// A standalone (headless) swapchain: no window, no layer tree. This is
-    /// the shape every test here uses — a `CAMetalLayer` with a device and a
-    /// `drawableSize` vends drawables and renders offscreen on its own.
+    /// A standalone (headless) swapchain with no window or layer tree.
     #[cfg(test)]
     pub(crate) fn standalone(
         device: &Device,
@@ -370,11 +260,9 @@ impl Swapchain {
         })
     }
 
-    /// A swapchain parented under `parent` (any `CALayer`). Adds ONE sublayer
-    /// and never touches the ones already there — the sibling-wgpu-layer
-    /// tolerance the module header describes. Dropping the `Swapchain`
-    /// unparents its own layer (and only its own), which is one step tidier
-    /// than the wgpu teardown this must coexist with.
+    /// A swapchain parented under `parent` (any `CALayer`). Adds one sublayer
+    /// and never touches existing ones. Dropping the `Swapchain` unparents its
+    /// own layer only.
     pub(crate) fn attached(
         device: &Device,
         parent: &Obj,
@@ -383,9 +271,8 @@ impl Swapchain {
     ) -> Result<Self, String> {
         let layer = Self::new_layer()?;
         Self::configure(&layer, device, config)?;
-        // SAFETY: `addSublayer:` is a plain void message on the live parent;
-        // it RETAINS the sublayer (CALayer owns its children), which is fine —
-        // our +1 stays ours and drop still balances it after unparenting.
+        // SAFETY: `addSublayer:` is a void message on the live parent; it
+        // retains the sublayer, and our +1 stays ours for drop to balance.
         unsafe {
             let add: unsafe extern "C" fn(Id, Sel, Id) = msg();
             add(parent.id(), sel(c"addSublayer:"), layer.id());
@@ -404,50 +291,25 @@ impl Swapchain {
         Ok(sc)
     }
 
-    /// Adopt the PARENT layer's `contentsScale`, so a device pixel in the
-    /// drawable is a device pixel on the display.
+    /// Adopt the parent layer's `contentsScale`, so a device pixel in the
+    /// drawable is a device pixel on the display. A fresh `CAMetalLayer`
+    /// defaults to 1.0, which on a 2x display draws the grid at twice its size
+    /// and soft. `drawableSize` stays explicit (already device pixels).
     ///
-    /// **This is the one responsibility `raw-window-metal` used to carry.**
-    /// While wgpu owned the layer, that crate ran a KVO observer over the root
-    /// layer which — as `aterm-gui/src/platform.rs`'s anchor note records —
-    /// "syncs only `bounds` and `contentsScale`", and gravity is computed on
-    /// the LOGICAL size (`physical / contentsScale`). The flip to the
-    /// first-party arm (v0.69.0) took the layer and left the observer behind.
-    /// A freshly `init`ed `CAMetalLayer` defaults to `contentsScale = 1.0`, so
-    /// on a 2x display CoreAnimation read every device pixel of the drawable
-    /// as a POINT: the grid drew at twice its intended size — anchored at the
-    /// top-left corner, spilling off the right and bottom of the window — and
-    /// the compositor resampled the 1x-backed surface onto a Retina panel, so
-    /// the text went soft as well. One missing property, both symptoms.
-    ///
-    /// `drawableSize` is NOT touched here and stays explicit (the module
-    /// header's table): the drawable is already in device pixels and was
-    /// always correct. `contentsScale` is the term that tells CoreAnimation
-    /// how to read it.
-    ///
-    /// Called at attach AND from every per-present reconcile, which is what
-    /// makes this equivalent to the observer it replaces: dragging a window
-    /// between a Retina and a non-Retina display changes the parent's
-    /// `contentsScale` with NO resize and no reconfigure, so only a poll on
-    /// the present path can see it. Change-gated, so a steady present costs
-    /// one property read and nothing else.
-    ///
-    /// The standalone (headless) shape has no parent — the module header's
-    /// table — and is deliberately left alone, which is also precisely why no
-    /// test in this file could ever have caught the regression: they all build
-    /// standalone layers, where an unset `contentsScale` is invisible.
+    /// Called at attach and from every per-present reconcile, since moving a
+    /// window between displays changes the parent's scale with no resize.
+    /// Change-gated: a steady present costs one property read. The standalone
+    /// shape has no parent and is left alone, so standalone tests cannot catch
+    /// a missing scale.
     pub(crate) fn sync_layer_geometry(&mut self) {
         if !self.is_attached {
             return;
         }
         let _pool = AutoreleasePool::new();
-        // SAFETY: `superlayer` returns a BORROWED (autoreleased) `CALayer` or
-        // nil — never released here, per the module header's autoreleased-
-        // return rule. `contentsScale` returns `CGFloat` (a `double` in `d0`)
-        // and `setContentsScale:` takes one by value: both are scalar on every
-        // arch aterm ships, so neither needs the `objc_msgSend_stret` path the
-        // `ffi` header deliberately does not declare. Prototypes are written
-        // out per selector, per that same convention.
+        // SAFETY: `superlayer` returns a borrowed (autoreleased) `CALayer` or
+        // nil, never released here. `contentsScale` returns a `CGFloat` and
+        // `setContentsScale:` takes one by value; both are scalar on every
+        // target, so no `objc_msgSend_stret` is needed.
         unsafe {
             let superlayer: unsafe extern "C" fn(Id, Sel) -> Id = msg();
             let parent = superlayer(self.layer.id(), sel(c"superlayer"));
@@ -456,15 +318,11 @@ impl Swapchain {
             }
             let get_scale: unsafe extern "C" fn(Id, Sel) -> f64 = msg();
             let scale = get_scale(parent, sel(c"contentsScale"));
-            // Positive-only, which also rejects NaN: a zero or negative scale
-            // would divide the contents to nothing, and keeping whatever the
-            // layer already holds beats blanking the window.
+            // Positive only (also rejects NaN): a zero or negative scale would
+            // blank the window, so keep the layer's current value instead.
             if scale > 0.0 && self.applied_geometry != Some((scale, self.width, self.height)) {
-                // Both properties carry implicit animations; an action-free
-                // transaction is what keeps a scale change from animating the
-                // terminal's surface into place, exactly as
-                // `MacCpuPresenter::sync_layer_geometry` requires of its
-                // caller on the CPU floor.
+                // An action-free transaction keeps the scale change from
+                // animating (as `MacCpuPresenter::sync_layer_geometry` requires).
                 let txn = class(c"CATransaction");
                 let cls_void: unsafe extern "C" fn(ClassPtr, Sel) = msg();
                 let cls_bool: unsafe extern "C" fn(ClassPtr, Sel, ObjcBool) = msg();
@@ -472,26 +330,17 @@ impl Swapchain {
                 cls_bool(txn, sel(c"setDisableActions:"), true.into());
                 let set_scale: unsafe extern "C" fn(Id, Sel, f64) = msg();
                 set_scale(self.layer.id(), sel(c"setContentsScale:"), scale);
-                // …and give the layer the bounds its contents actually
-                // occupy. Measured on the shipped v0.69.0: the attached layer
-                // is left at `CGRectZero` for the window's life. It renders
-                // anyway — `masksToBounds` defaults NO and the gravity anchor
-                // is the origin corner — so this is not what broke the
-                // window, and it is deliberately a SEPARATE write from the
-                // scale above. It is here because a zero-bounds layer is a
-                // trap for everything that legitimately consults bounds
-                // (hit-testing, a future `masksToBounds`, any resizing
-                // gravity), and because it makes the module's real invariant
-                // — `bounds x contentsScale == drawableSize` — hold by
-                // construction rather than by luck.
+                // Give the layer the bounds its contents occupy; an attached
+                // layer is otherwise left at `CGRectZero`, a trap for anything
+                // that consults bounds. Keeps
+                // `bounds x contentsScale == drawableSize` by construction.
                 let set_frame: unsafe extern "C" fn(Id, Sel, CgRect) = msg();
                 set_frame(
                     self.layer.id(),
                     sel(c"setFrame:"),
                     CgRect {
-                        // The origin corner is where the gravity anchor
-                        // already puts the contents, so growing the rect from
-                        // zero to its true size moves nothing on glass.
+                        // The origin corner is where gravity already anchors the
+                        // contents, so nothing moves on glass.
                         origin: CgPoint { x: 0.0, y: 0.0 },
                         size: CgSize {
                             #[expect(
@@ -510,9 +359,8 @@ impl Swapchain {
         }
     }
 
-    /// The `contentsScale` this layer currently holds, read back off the live
-    /// `CAMetalLayer` — never echoed from [`Self::applied_geometry`]. The gate
-    /// asks the layer itself, exactly as [`Self::layer_state`]'s siblings do.
+    /// The `contentsScale` read back off the live layer, not echoed from
+    /// [`Self::applied_geometry`].
     #[cfg(test)]
     pub(crate) fn contents_scale(&self) -> f64 {
         let _pool = AutoreleasePool::new();
@@ -549,29 +397,22 @@ impl Swapchain {
     fn configure(layer: &Obj, device: &Device, config: &SwapchainConfig) -> Result<(), String> {
         config.validate()?;
         let _pool = AutoreleasePool::new();
-        // SAFETY: every send below is a documented property setter on the live
-        // layer, with the prototype written out per selector: object, usize
-        // (NSUInteger), `ObjcBool` (BOOL — `signed char` on x86_64, see its
-        // docs), CGSize by value (HFA in v0/v1), and CGColorSpaceRef. The
-        // colorspace is created at +1 and released after `setColorspace:` —
-        // the property retains it (CAMetalLayer.h:122).
+        // SAFETY: every send is a documented property setter on the live layer
+        // with its prototype written out (object, NSUInteger, `ObjcBool`,
+        // `CGSize` by value, `CGColorSpaceRef`). The colorspace is created at
+        // +1 and released after `setColorspace:`, which retains it.
         unsafe {
             let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
             let set_usize: unsafe extern "C" fn(Id, Sel, usize) = msg();
             let set_bool: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
             let set_size: unsafe extern "C" fn(Id, Sel, CgSize) = msg();
 
-            // The EDR arm, derived from the format exactly as wgpu-hal derives
-            // it (surface.rs:93-96) — plus the colorspace wgpu never names.
-            // Both are decided off `config` alone, so the colorspace object
-            // is CREATED here, ahead of the first layer write: with
-            // `validate` above, that makes every failure point of this
-            // function precede its first setter, and a refused configure
-            // leaves the layer exactly as it was (`reconcile` then keeps its
-            // retained config too — the property `upgrade_surface_for_screen`
-            // rests its revert on). The SET stays last, below: on a fresh
-            // layer `setPixelFormat:` installs sRGB implicitly, so an explicit
-            // space written before it would be overwritten.
+            // EDR iff the format is f16, as in wgpu-hal. The colorspace object
+            // is created here, before the first layer write, so every failure
+            // point precedes any setter and a refused configure leaves the layer
+            // untouched (`reconcile` and `upgrade_surface_for_screen` rely on
+            // this). The set itself comes after `setPixelFormat:`, which would
+            // otherwise overwrite it on a fresh layer.
             let wants_edr = config.format == PixelFormat::Rgba16Float;
             let space_name = if wants_edr {
                 kCGColorSpaceExtendedLinearSRGB
@@ -614,9 +455,8 @@ impl Swapchain {
                 config.maximum_drawables,
             );
             set_bool(layer.id(), sel(c"setOpaque:"), config.opaque.into());
-            // Explicit although it is the OS default: this is the bounded-wait
-            // contract, and the module header records it as a deliberate
-            // divergence from wgpu-hal's block-forever NO (surface.rs:102-104).
+            // Explicit although it is the OS default: the bounded-wait
+            // contract (wgpu-hal sets `NO`).
             set_bool(
                 layer.id(),
                 sel(c"setAllowsNextDrawableTimeout:"),
@@ -629,22 +469,9 @@ impl Swapchain {
                 sel(c"setWantsExtendedDynamicRangeContent:"),
                 wants_edr.into(),
             );
-            // BOTH arms now name their colorspace explicitly. The EDR set was
-            // always deliberate; the SDR set became LOAD-BEARING with the
-            // reconfigure verb, on a new measurement (2026-08-31, Darwin 25.5,
-            // M5 Max): on a FRESH layer `setPixelFormat:` installs
-            // kCGColorSpaceSRGB implicitly (the module header's original
-            // note), but on a LIVE layer that already carries the explicit
-            // scRGB space, flipping the format back to `Bgra8Unorm` LEAVES
-            // the extended space in place — measured: after EDR→SDR
-            // `configure`, `colorspace_name` stayed
-            // "kCGColorSpaceExtendedLinearSRGB", and a bare
-            // `setPixelFormat:(BGRA8)` from the EDR state also left it. An
-            // SDR present tagged scRGB is every frame misread by the
-            // compositor, so the SDR arm declares sRGB instead of trusting
-            // the setter's fresh-layer side effect. On a fresh layer this
-            // writes the value the implicit install already produced, which
-            // is why S1's readback was green both before and after.
+            // Both arms name their colorspace: on a live layer holding scRGB,
+            // flipping back to `Bgra8Unorm` keeps the extended space, and an SDR
+            // present tagged scRGB is misread by the compositor.
             let set_space: unsafe extern "C" fn(Id, Sel, *mut c_void) = msg();
             set_space(layer.id(), sel(c"setColorspace:"), space);
             CGColorSpaceRelease(space);
@@ -652,36 +479,21 @@ impl Swapchain {
         Ok(())
     }
 
-    /// W1 ITEM 5 — THE LIVE RECONFIGURE VERB: size, format
-    /// (`Bgra8Unorm`↔`Rgba16Float`), `opaque`, `framebufferOnly`,
-    /// `displaySyncEnabled` and `maximumDrawableCount`, applied to the LIVE
-    /// layer. The renderer's per-present reconcile (alpha-mode/usage drift),
-    /// resize, EDR flip and COPY_SRC arming all land here instead of on a
-    /// full `Swapchain` rebuild.
+    /// Apply a new config to the live layer: size, format
+    /// (`Bgra8Unorm`/`Rgba16Float`), `opaque`, `framebufferOnly`,
+    /// `displaySyncEnabled` and `maximumDrawableCount`. The renderer's
+    /// per-present reconcile, resize, HDR flip and `COPY_SRC` arming use this
+    /// instead of rebuilding the `Swapchain`.
     ///
-    /// **Which axes Metal permits live, from measurement (the storm test) and
-    /// not the header alone:** ALL of them, on one `CAMetalLayer` — no layer
-    /// rebuild is ever needed. What IS rebuilt is the DRAWABLE POOL, and the
-    /// layer does that itself: drawables vended before the reconfigure keep
-    /// their old extent/format until they die, and every drawable vended
-    /// after carries the new config — the storm acquires after every step and
-    /// pins extent and raw pixel format off the live texture. The one axis
-    /// that does NOT follow the property write on its own is the COLORSPACE
-    /// on an EDR→SDR flip (`setPixelFormat:` installs sRGB only over a fresh
-    /// layer, measured in [`Self::configure`]'s note), which is why
-    /// `configure` names both arms' spaces explicitly and the storm pins the
-    /// name after every flip.
+    /// Metal permits every axis live on one layer. The layer rebuilds its
+    /// drawable pool itself: drawables vended before keep the old config,
+    /// those after carry the new one (the storm test pins extent and format).
+    /// The colorspace is the exception (see [`Self::configure`]).
     ///
-    /// **In-flight frames cannot present onto a stale config — by TYPE, not
-    /// by check:** [`Frame`] holds `&mut Swapchain`, so while any frame is
-    /// unresolved this method does not compile at the call site (E0499), the
-    /// same shape that already makes double-acquire inexpressible. A check
-    /// would have to pick a behaviour for the caught frame (present anyway?
-    /// discard silently?); the borrow makes the question unaskable, which is
-    /// why type was chosen over check.
+    /// Unresolved frames cannot present onto a stale config: [`Frame`] holds
+    /// `&mut Swapchain`, so this cannot be called while one is live.
     ///
-    /// Refuses when the loss latch is set, before touching the layer — the
-    /// acquire/present/begin refusal pattern, fourth face.
+    /// Refuses when the loss latch is set, before touching the layer.
     pub(crate) fn reconfigure(
         &mut self,
         device: &Device,
@@ -700,17 +512,11 @@ impl Swapchain {
         Ok(())
     }
 
-    /// Acquire the next drawable as a [`Frame`], or fail BOUNDED.
+    /// Acquire the next drawable as a [`Frame`], or fail within a bound.
     ///
-    /// `&mut self` is the frame boundary: a second acquire cannot compile
-    /// until the returned `Frame` is presented or dropped. Nil from
-    /// `nextDrawable` — pool exhausted past the ~1s timeout, or an invalid
-    /// property combination — comes back as `Err` naming the measured wait,
-    /// never as a parked thread.
-    ///
-    /// Once the process latch is LOST this refuses before any FFI: the
-    /// downgrade path wants its CPU frame now, not after a ~1s `nextDrawable`
-    /// timeout against a dead queue — see the module header's loss section.
+    /// `&mut self` is the frame boundary. Nil from `nextDrawable` (pool
+    /// exhausted past the ~1 s timeout, or invalid properties) returns `Err`
+    /// naming the wait. Refuses before any FFI once the loss latch is set.
     pub(crate) fn acquire(&mut self) -> Result<Frame<'_>, String> {
         if let Some(reason) = self.latch.reason() {
             return Err(format!(
@@ -741,11 +547,8 @@ impl Swapchain {
     }
 
     /// The raw acquire: `nextDrawable` under a pool, both objects retained to
-    /// +1 so they outlive it (the ownership story in the module header).
-    ///
-    /// Private and `&self` — [`Self::acquire`] is the only public path, and
-    /// the exhaustion test uses this directly BECAUSE the public type shape
-    /// makes holding two drawables inexpressible.
+    /// +1. Private; the exhaustion test uses it because the public shape cannot
+    /// hold two drawables.
     fn raw_next_drawable(&self) -> Option<(Obj, Obj)> {
         acquire_drawable(&self.layer).map(OwnedDrawable::into_parts)
     }
@@ -773,9 +576,8 @@ impl Swapchain {
     }
 
     // -- readback getters ---------------------------------------------------
-    // One per configured axis, each through the property's own getter
-    // selector, so the configure test pins the layer's actual state against
-    // constants IT spells — never against `configure`'s own mapping.
+    // One per configured axis via the property's own getter, so tests compare
+    // the layer's actual state against their own constants.
 
     /// The raw `MTLPixelFormat` off the layer.
     #[cfg(test)]
@@ -797,6 +599,7 @@ impl Swapchain {
         (s.width, s.height)
     }
 
+    #[cfg(test)]
     pub(crate) fn framebuffer_only(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
@@ -805,6 +608,7 @@ impl Swapchain {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn display_sync_enabled(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
@@ -821,6 +625,7 @@ impl Swapchain {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn wants_extended_dynamic_range(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
@@ -857,16 +662,12 @@ impl Swapchain {
         }
     }
 
-    /// The layer colorspace's CoreGraphics name — `None` when the colorspace
-    /// is nil (never observed after `configure`: `setPixelFormat:` installs
-    /// one, see the module header) or unnamed.
+    /// The layer colorspace's CoreGraphics name, or `None` when nil or unnamed.
     #[cfg(test)]
     pub(crate) fn colorspace_name(&self) -> Option<String> {
-        // SAFETY: `colorspace` returns a +0 CGColorSpaceRef (or NULL);
-        // `CGColorSpaceGetName` borrows a CFString off it, which is toll-free
-        // bridged to NSString, so `UTF8String` reads it; the bytes are copied
-        // into an owned String before anything is released (nothing here is
-        // retained or released at all).
+        // SAFETY: `colorspace` returns a +0 `CGColorSpaceRef` or NULL;
+        // `CGColorSpaceGetName` borrows a toll-free-bridged CFString, copied
+        // into an owned `String`. Nothing is retained or released.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel) -> *mut c_void = msg();
             let space = f(self.layer.id(), sel(c"colorspace"));
@@ -916,10 +717,9 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         if self.is_attached {
-            // SAFETY: `removeFromSuperlayer` is a plain void message; safe on
-            // a layer whose parent already released it (it no-ops). The
-            // parent's retain from `addSublayer:` is dropped here; our own +1
-            // is dropped by `Obj` right after.
+            // SAFETY: `removeFromSuperlayer` is a void message and no-ops on a
+            // layer already released by its parent. The parent's retain drops
+            // here; our +1 drops with `Obj`.
             unsafe {
                 let f: unsafe extern "C" fn(Id, Sel) = msg();
                 f(self.layer.id(), sel(c"removeFromSuperlayer"));
@@ -932,16 +732,15 @@ impl Drop for Swapchain {
     }
 }
 
-/// A retained CAMetalLayer used ONLY for nextDrawable. The owner defers every
-/// layer setter, geometry synchronization, and unparent until this request has
-/// completed. No NSView/NSWindow or mutable Swapchain crosses threads.
+/// A retained `CAMetalLayer` used only for `nextDrawable`. The owner defers
+/// every layer setter, geometry sync and unparent until the request completes.
 pub(crate) struct LayerAcquire {
     layer: Option<Obj>,
 }
 
-// SAFETY: this is specifically a retained CAMetalLayer, whose nextDrawable may
-// run on a rendering thread. Single request admission excludes another acquire
-// or layer mutation. Obj and Swapchain themselves remain !Send/!Sync.
+// SAFETY: a retained `CAMetalLayer`, whose `nextDrawable` may run on another
+// thread. Single-request admission excludes concurrent acquires and layer
+// mutation. `Obj` and `Swapchain` stay !Send/!Sync.
 unsafe impl Send for LayerAcquire {}
 
 impl LayerAcquire {
@@ -994,9 +793,9 @@ fn acquire_drawable(layer: &Obj) -> Option<OwnedDrawable> {
     let _pool = AutoreleasePool::new();
     #[cfg(test)]
     encoder::queue_ffi_census::note();
-    // SAFETY: layer is a retained CAMetalLayer. Retain both +0 returns before
-    // the pool drains; nil safely refuses acquisition. The caller serializes
-    // this call with layer mutations and other acquisitions.
+    // SAFETY: `layer` is a retained `CAMetalLayer`. Both +0 returns are retained
+    // before the pool drains; nil refuses. The caller serializes this with
+    // layer mutation and other acquisitions.
     unsafe {
         let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
         let drawable = Obj::retain(get(layer.id(), sel(c"nextDrawable")))?;
@@ -1008,13 +807,10 @@ fn acquire_drawable(layer: &Obj) -> Option<OwnedDrawable> {
     }
 }
 
-/// One acquired drawable: the frame, from acquire to present-or-discard.
+/// One acquired drawable, from acquire to present or discard.
 ///
-/// Holds `&mut Swapchain`, so the swapchain cannot acquire again while this
-/// frame is unresolved — the type-shaped half of "a drawable is never held
-/// across a frame boundary". Ends by [`Self::present`] (consuming) or by drop
-/// (discard: the releases return the drawable to the pool, exactly wgpu-hal's
-/// `discard_texture`).
+/// Holds `&mut Swapchain`, so no second acquire while unresolved. Ends with
+/// [`Self::present`] (consuming) or drop (returns the drawable to the pool).
 #[derive(Debug)]
 pub(crate) struct Frame<'sc> {
     /// +1 on the `CAMetalDrawable` (retained out of the acquire pool).
@@ -1033,12 +829,10 @@ impl Frame<'_> {
         &self.texture
     }
 
-    /// The drawable's texture as a SEALED render target, stamped with this
-    /// swapchain's loss domain — the ONLY form the encoder's write verbs
-    /// (`render_pass`, the copies) accept. A session wired to a different
-    /// latch is refused there by pointer identity, which is what closed the
-    /// W1 judge's two-latch residual (W3). Read-only uses (extent/format
-    /// getters, the blocking one-shot helpers) keep [`Self::texture`].
+    /// The drawable's texture as a sealed render target stamped with this
+    /// swapchain's loss domain, the only form the encoder's write verbs
+    /// accept; a session on a different latch is refused there. Read-only uses
+    /// use [`Self::texture`].
     pub(crate) fn render_target(&self) -> super::resources::SealedTexture {
         // SAFETY: retaining a live +1 texture; the sealed handle releases its
         // own +1 on drop, independently of this frame's.
@@ -1053,11 +847,8 @@ impl Frame<'_> {
         self.swapchain
     }
 
-    /// `-[CAMetalDrawable layer]` — the layer this drawable actually came
-    /// from, for pointer-identity checks. The stacking test pins it against
-    /// [`Swapchain::layer_ptr`] with a live foreign `CAMetalLayer` on the
-    /// same parent, so a mis-wired attach that vends off the wrong layer is
-    /// a pointer diff, not a silent misdraw.
+    /// `-[CAMetalDrawable layer]`, the layer this drawable came from; the
+    /// stacking test compares it with [`Swapchain::layer_ptr`].
     #[cfg(test)]
     pub(crate) fn drawable_layer_ptr(&self) -> Id {
         // SAFETY: object getter (+0 borrow, compared by pointer only).
@@ -1067,67 +858,30 @@ impl Frame<'_> {
         }
     }
 
-    /// THE TWO-LATCH RESIDUAL IS CLOSED (W3): render targets are minted
-    /// sealed (`metal::resources` — the device layer's mint stamps each
-    /// texture with its loss-domain latch, `Frame::render_target` stamps the
-    /// drawable with this swapchain's, and alias views inherit), and the
-    /// encoder's write verbs refuse a stamp that is not the encoding
-    /// session's by `Arc::ptr_eq`. So "render a frame's texture on session 2"
-    /// now dies at `render_pass`/the copies — the earliest API crossing —
-    /// and this method's latch cross-check below closes the presenting half.
-    /// Armed by `swapchain::tests::
-    /// the_two_latch_cross_wired_present_has_no_remaining_shape` (the W1
-    /// judge's exact probe).
+    /// Present the frame: a fresh command buffer from the session's queue with
+    /// `presentDrawable:` registered before `commit` (wgpu-hal's shape), so
+    /// presentation cannot fire before the drawable's rendering is scheduled.
     ///
-    /// THE SAME-QUEUE PRECONDITION, now STRUCTURAL (port map risk 2): the
-    /// ordering argument this method rests on — presentation cannot fire
-    /// before the drawable's rendering is scheduled — holds ONLY because
-    /// command buffers on ONE queue schedule in commit order. It used to be
-    /// prose ("nothing about the types enforces it yet"); as of W1 the method
-    /// takes the [`encoder::EncodeSession`] that OWNS the process's render
-    /// queue, so every encode command buffer and this present's command
-    /// buffer are minted by the same object and a second queue is
-    /// unconstructible at any call site of the encode path. The one-latch
-    /// residual — a second `EncodeSession` on the SAME latch, which a
-    /// 2026-08-31 probe drove through every runtime check — is sealed at
-    /// construction (`EncodeSession::new` binds the latch and refuses a latch
-    /// already bound); the two-latch residual is sealed on the resources (see
-    /// above); and the latch cross-check below refuses a session wired to a
-    /// different loss domain, so no session that reaches this method can
-    /// carry a queue other than the one the rendering used. Still carried
-    /// forward for the plumbing phase: `MTLCommandBuffer.h:316-318` notes the
-    /// submission thread is lock-stepped with the present call being serviced
-    /// by the window server — a real throttling behavior the frame pacing
-    /// must expect.
+    /// That ordering needs one queue; taking the [`encoder::EncodeSession`]
+    /// that owns it makes a second queue unconstructible on the encode path.
+    /// `EncodeSession::new` refuses a latch already bound, render targets are
+    /// sealed to their loss domain, and the latch check below refuses a
+    /// session from another domain. Submission is lock-stepped with the window
+    /// server servicing the present, which frame pacing must expect.
     ///
-    /// Present: fresh command buffer off the session's own queue,
-    /// `presentDrawable:` BEFORE `commit` — wgpu-hal's own shape
-    /// (`metal/mod.rs:604-615`) and the ordering that avoids the
-    /// present-before-scheduled hazard (see the module header).
-    ///
-    /// Consumes the frame: after this the drawable belongs to CoreAnimation,
-    /// and our +1 is released as `self` drops at the end of this function —
-    /// AFTER the present is registered, which is the only ordering that
-    /// matters for the handoff.
-    ///
-    /// The returned [`PresentTicket`] is the frame's command-buffer handle:
-    /// production would hang a completion path off it; the tests wait on it
-    /// and feed the outcome to a [`loss::LossLatch`].
+    /// Consumes the frame; our +1 is released after the present is registered.
+    /// The returned [`PresentTicket`] is the frame's command-buffer handle.
     pub(crate) fn present(self, session: &encoder::EncodeSession) -> Result<PresentTicket, String> {
-        // A frame can be acquired healthy and see the loss land mid-frame
-        // (another submission latched). Refuse before touching the queue;
-        // `self` drops on return, which DISCARDS — the drawable goes back to
-        // the pool instead of onto a dead device's command stream.
+        // The loss may land between acquire and present. Refuse before touching
+        // the queue; dropping `self` discards the drawable.
         if let Some(reason) = self.swapchain.latch.reason() {
             return Err(format!(
                 "present refused: the device-loss latch is set ({reason}); \
                  the frame is discarded, not committed to the dead queue"
             ));
         }
-        // One process, one loss domain: a session whose latch is not this
-        // swapchain's latch is a wiring bug — its submissions would latch a
-        // DIFFERENT latch than the one acquire consults, and the refusals
-        // above would go blind. Refused loudly rather than debug-asserted.
+        // A session on a different latch would record outcomes acquire never
+        // sees; refuse it.
         if !Arc::ptr_eq(session.latch(), &self.swapchain.latch) {
             return Err(
                 "present refused: the encode session's loss latch is not this \
@@ -1138,18 +892,16 @@ impl Frame<'_> {
         #[cfg(test)]
         encoder::queue_ffi_census::note();
         let _pool = AutoreleasePool::new();
-        // SAFETY: `commandBuffer` returns a +0 command buffer owned by the
-        // pool; it is retained into the ticket so callers can wait on it after
-        // the pool pops. `presentDrawable:` and `commit` are void messages on
-        // it, in the order the module header pins.
+        // SAFETY: `commandBuffer` returns a +0 buffer, retained into the ticket
+        // so callers can wait after the pool pops. `presentDrawable:` then
+        // `commit`, in that order.
         unsafe {
             let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
             let raw = get(session.one_shot_queue().id(), sel(c"commandBuffer"));
             let cb = Obj::retain(raw)
                 .ok_or_else(|| "commandBuffer returned nil for the present".to_owned())?;
-            // PRESENT → GLASS (`crate::present_glass`): a presented handler
-            // must be added before the drawable is presented, so it goes on
-            // here, ahead of `presentDrawable:`. Only when a sink listens.
+            // Present-to-glass reporting (`crate::present_glass`): the handler
+            // must be added before presenting. Only when a sink listens.
             if crate::present_glass::sink_installed() {
                 register_presented_handler(self.drawable.id());
             }
@@ -1167,23 +919,19 @@ impl Frame<'_> {
 }
 
 /// Hang `addPresentedHandler:` on `drawable`, reporting `presentDrawable:`
-/// registration → `-[MTLDrawable presentedTime]` through
-/// [`crate::present_glass::deliver_report`], with the registration's serial and
-/// pacing tag. The registration instant is read here on `CACurrentMediaTime`,
-/// the clock `presentedTime` is stated in — and the clock the tag's "within one
-/// refresh of the previous registration" is decided on.
+/// registration to `-[MTLDrawable presentedTime]` via
+/// [`crate::present_glass::deliver_report`] with the registration's serial and
+/// pacing tag. The registration instant is read on `CACurrentMediaTime`, the
+/// clock `presentedTime` uses.
 ///
 /// # Safety
 ///
-/// `drawable` must be a live `id<MTLDrawable>` that has not been presented yet
-/// (Metal accepts presented handlers only before presentation).
+/// `drawable` must be a live `id<MTLDrawable>` not yet presented.
 unsafe fn register_presented_handler(drawable: Id) {
     // SAFETY: a pure clock read.
     let registered_s = unsafe { CACurrentMediaTime() };
-    // This registration's serial and its pacing tag, decided HERE from the
-    // facts the presenting thread armed (`present_glass::arm_present`) and this
-    // registration instant, so the handler reports the present it belongs to
-    // whatever registers after it.
+    // Serial and pacing tag for this registration, decided now so the handler
+    // reports its own present.
     let (serial, tag) = crate::present_glass::registration_begin(registered_s);
     // The handler itself, defined OUTSIDE any `unsafe` block so its one real
     // unsafe operation — the `presentedTime` message — carries its own scope.
@@ -1208,9 +956,8 @@ unsafe fn register_presented_handler(drawable: Id) {
     // forbids blocking or unwinding.
     let block = unsafe { aterm_objc::RcBlock::new1(handler) };
     let Some(block) = block else { return };
-    // SAFETY: `addPresentedHandler:` takes one block argument and copies it
-    // (a retain on this heap block), so our reference is released
-    // independently when `block` drops at the end of scope.
+    // SAFETY: `addPresentedHandler:` copies (retains) the block, so ours is
+    // released independently when `block` drops.
     unsafe {
         let add: unsafe extern "C" fn(Id, Sel, aterm_objc::BlockPtr) = msg();
         add(drawable, sel(c"addPresentedHandler:"), block.as_block_ptr());
@@ -1218,31 +965,23 @@ unsafe fn register_presented_handler(drawable: Id) {
 }
 
 /// The committed present's command buffer, retained so its status can be
-/// awaited and classified after the fact — plus the latch handle, so the
-/// classification cannot fail to reach the latch.
+/// awaited and classified, plus the latch handle so the classification always
+/// reaches the latch.
 #[derive(Debug)]
 pub(crate) struct PresentTicket {
     cb: Obj,
     latch: Arc<loss::LossLatch>,
-    /// The classified terminal outcome, once one exists — the ONCE-FEED
-    /// cache, mirroring [`encoder::Submitted`]'s field of the same name:
-    /// the first terminal wait/poll feeds the latch and fills this; every
-    /// later wait/poll answers from it and feeds nothing.
+    /// The classified terminal outcome once one exists: the first terminal
+    /// wait or poll feeds the latch and fills this; later ones answer from it
+    /// (as in [`encoder::Submitted`]).
     settled: std::cell::Cell<Option<loss::CbOutcome>>,
 }
 
 impl PresentTicket {
-    /// Block until the present's command buffer completes, then classify it
-    /// through [`loss::outcome_of`] and FEED THE LATCH — the swapchain's
-    /// whole feed into device-loss handling, with no "caller forgot to
-    /// record" arm left to exist.
-    ///
-    /// Arming honesty: the one line here that CANNOT be armed is the
-    /// `settle` call itself — a healthy GPU only ever hands this method a
-    /// `Completed`, whose record is a no-op (planted skip, full suite green,
-    /// restored). Everything under `settle` IS armed: the injected-loss test
-    /// drives a `PageFault` through it on a real ticket, and skipping the
-    /// record there is RED. This line is pinned by review, not by a test.
+    /// Block until the present's command buffer completes, classify it via
+    /// [`loss::outcome_of`] and feed the latch. On a healthy GPU the outcome is
+    /// always `Completed`, whose record is a no-op; the injected-loss test
+    /// exercises `settle` with a `PageFault`.
     pub(crate) fn wait_outcome(&self) -> loss::CbOutcome {
         if let Some(done) = self.settled.get() {
             return done;
@@ -1256,14 +995,10 @@ impl PresentTicket {
         self.settle_terminal(loss::outcome_of(self.cb.id()))
     }
 
-    /// Poll: `None` while the present's command buffer is still in flight,
-    /// `Some(outcome)` once terminal — and the FIRST terminal answer FEEDS
-    /// THE LATCH exactly as [`Self::wait_outcome`]'s does (the same contract
-    /// as [`super::encoder::Submitted::try_outcome`], because the frame
-    /// pacing that wants present timing without a park is the same caller
-    /// that must not be able to forget a loss). Later calls answer from the
-    /// settled cache and feed NOTHING — one feed per present, however wait
-    /// and poll are mixed. Armed by the same debug feed counter.
+    /// Poll: `None` while in flight, `Some(outcome)` once terminal. The first
+    /// terminal answer feeds the latch like [`Self::wait_outcome`] (same
+    /// contract as [`super::encoder::Submitted::try_outcome`]); later calls
+    /// answer from the cache and feed nothing.
     pub(crate) fn try_outcome(&self) -> Option<loss::CbOutcome> {
         if let Some(done) = self.settled.get() {
             return Some(done);
@@ -1280,16 +1015,10 @@ impl PresentTicket {
         self.settle(outcome)
     }
 
-    /// Record one classified outcome on the process latch and hand it back.
-    ///
-    /// This one line is the status paths' entire post-processing, split
-    /// out because it is also the INJECTION SEAM (and deliberately UNCACHED —
-    /// injection drives the latch every call and does not rewrite what the
-    /// command buffer really reported): a real `Lost` cannot be
-    /// produced on a healthy GPU (the honesty note in `loss`), so the
-    /// end-to-end test drives an injected `PageFault` through THIS method on
-    /// a ticket from a REAL present, and the refusals that follow are the
-    /// production code paths, not test doubles.
+    /// Record one classified outcome on the process latch and return it. Also
+    /// the injection seam, deliberately uncached: a real `Lost` cannot be
+    /// produced on a healthy GPU, so the end-to-end test drives a `PageFault`
+    /// through this on a real present's ticket.
     pub(crate) fn settle(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.latch.record(&outcome);
         outcome
@@ -1300,44 +1029,9 @@ impl PresentTicket {
 mod tests {
     use super::*;
     use crate::metal::ffi;
-
-    /// Every test here needs a GPU; a machine without one SKIPs loudly.
-    fn device() -> Option<Device> {
-        let d = Device::preferred();
-        if d.is_none() {
-            crate::stderr_line!("SKIP: no Metal device on this machine");
-        }
-        d
-    }
-
-    /// A bare `CALayer` (+1) — the stand-in for an NSView's root layer, and
-    /// for the sibling test also for wgpu's leftover CAMetalLayer.
-    fn plain_calayer() -> Obj {
-        let _pool = AutoreleasePool::new();
-        // SAFETY: alloc/init, +1, exactly as `Swapchain::new_layer`.
-        unsafe {
-            let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
-            let raw = alloc(class(c"CALayer"), sel(c"alloc"));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            Obj::from_owned(init(raw, sel(c"init"))).expect("CALayer init")
-        }
-    }
-
-    /// `-[CALayer sublayers].count` (0 when the property is nil).
-    fn sublayer_count(layer: &Obj) -> usize {
-        let _pool = AutoreleasePool::new();
-        // SAFETY: `sublayers` returns a +0 NSArray (or nil) owned by the
-        // pool; `count` is an NSUInteger getter on it.
-        unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            let arr = get(layer.id(), sel(c"sublayers"));
-            if arr.is_null() {
-                return 0;
-            }
-            let count: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-            count(arr, sel(c"count"))
-        }
-    }
+    use crate::metal::test_support::{
+        CellUniforms, as_bytes, device, plain_calayer, sublayer_count,
+    };
 
     /// PURE: the config refuses exactly what CAMetalLayer would throw on (or
     /// silently never vend a drawable for), with the reason in the message.
@@ -1369,18 +1063,11 @@ mod tests {
         assert!(bad.validate().is_err());
     }
 
-    /// S1 — EVERY AXIS THE SHIPPED CONFIGURE SETS, READ BACK off the live
-    /// layer through each property's own getter, against constants THIS TEST
-    /// spells. Every value is chosen NON-DEFAULT where the OS has a default
-    /// (`framebufferOnly` defaults YES → false here; `displaySyncEnabled`
-    /// defaults YES → false; `maximumDrawableCount` defaults 3 → 2;
-    /// `CALayer.opaque` defaults NO → true; `drawableSize` defaults 0x0 →
-    /// 16x16), so a silently-dropped setter reads back as the default and
-    /// FAILS rather than passing by coincidence. The two axes whose
-    /// production value EQUALS the default — `pixelFormat` (BGRA8 is the
-    /// layer default) and `allowsNextDrawableTimeout` (YES) — are pinned here
-    /// and armed elsewhere: the format by the EDR test's 115, the timeout by
-    /// the exhaustion test that would HANG forever without it.
+    /// Every configured axis read back off the live layer via its own getter,
+    /// against constants the test spells. Values are non-default where the OS
+    /// has a default, so a dropped setter fails. `pixelFormat` and
+    /// `allowsNextDrawableTimeout` equal their defaults and are also covered by
+    /// the EDR test and the exhaustion test.
     #[test]
     fn the_swapchain_states_every_axis_the_wgpu_configure_sets() {
         let Some(dev) = device() else { return };
@@ -1432,14 +1119,9 @@ mod tests {
         assert_eq!(sc.superlayer_ptr(), std::ptr::null_mut(), "standalone");
     }
 
-    /// S2 — THE EDR ARM: `Rgba16Float` derives the extended-range opt-in
-    /// exactly as wgpu-hal does (surface.rs:93-96) AND carries the scRGB
-    /// colorspace. On a FRESH layer this assert pins the outcome the OS's
-    /// implicit install also supplies; the setter's load-bearing case is the
-    /// LIVE flip, where the implicit install does not happen at all — the
-    /// reconfigure storm (S10) is the test that distinguishes the setter
-    /// from the OS default, both directions. The compositor's interpretation
-    /// is out of headless reach and documented as such.
+    /// The EDR arm: `Rgba16Float` sets the extended-range opt-in and the scRGB
+    /// colorspace. The reconfigure storm distinguishes the setter from the
+    /// OS's fresh-layer default.
     #[test]
     fn the_edr_arm_opts_into_extended_range_and_names_its_colorspace() {
         let Some(dev) = device() else { return };
@@ -1464,20 +1146,12 @@ mod tests {
         assert_eq!(sc.maximum_drawable_count(), 3);
     }
 
-    /// S3 — A LEFTOVER wgpu LAYER SURVIVES ATTACH, and the swapchain still
-    /// vends drawables beside it. After wgpu teardown its `CAMetalLayer`
-    /// stays parented (`raw-window-metal-1.1.0/src/observer.rs:49-62`
-    /// removes only KV observers on Drop), so attach must ADD, never replace.
-    /// Teardown symmetry too: dropping the Swapchain unparents its own layer
-    /// and leaves the sibling alone.
+    /// A leftover wgpu layer survives attach and the swapchain still vends
+    /// beside it; dropping the swapchain unparents only its own layer.
     #[test]
     fn a_leftover_wgpu_layer_survives_attach_and_detach() {
         let Some(dev) = device() else { return };
-        // The caller obligation `ffi::Obj::drop` documents: dropping Metal
-        // objects autoreleases into this frame, so the test owns a pool
-        // (measured: without it this test logs 5 unpooled autoreleases under
-        // OBJC_DEBUG_MISSING_POOLS=YES; with it, only CA's own internal
-        // threads remain, which no caller-side pool can cover).
+        // Dropping Metal objects autoreleases, so the test owns a pool.
         let _test_pool = AutoreleasePool::new();
         let parent = plain_calayer();
         // The stand-in for wgpu's abandoned layer: parented FIRST.
@@ -1526,10 +1200,8 @@ mod tests {
             "Swapchain::drop removes its own layer and only its own"
         );
     }
-    /// Force a `CALayer`'s `contentsScale` — the ONE knob a headless test
-    /// needs to stand in for a Retina display. `contentsScale` is a plain
-    /// layer property with no compositor in the loop: a parented sublayer
-    /// either adopts it or it does not, and that is decidable offscreen.
+    /// Force a `CALayer`'s `contentsScale`, standing in for a Retina display
+    /// headlessly.
     fn set_contents_scale(layer: &Obj, scale: f64) {
         let _pool = AutoreleasePool::new();
         // SAFETY: scalar `CGFloat` setter on a live +1 `CALayer`.
@@ -1539,31 +1211,16 @@ mod tests {
         }
     }
 
-    /// S5 — THE RETINA GATE. The v0.69.0 regression in one assertion: the
-    /// flip to the first-party Metal arm took the `CAMetalLayer` from wgpu
-    /// and left `raw-window-metal`'s KVO observer — the thing that adopted
-    /// the root layer's `contentsScale` — behind. A fresh `CAMetalLayer`
-    /// defaults to `contentsScale = 1.0`, so on a 2x display CoreAnimation
-    /// read every DEVICE PIXEL of the drawable as a POINT: the grid drew 2x
-    /// oversized, anchored top-left and spilling off the right edge, and the
-    /// surface was resampled onto the panel, so the text went soft too.
-    ///
-    /// Why this test can see what every other test in this file cannot: the
-    /// rest drive STANDALONE layers, which have no parent to inherit from,
-    /// so an unset `contentsScale` is invisible by construction — and the
-    /// one attach test that does exist parented onto a `[[CALayer alloc]
-    /// init]` whose own scale is the same 1.0 default, which cannot tell
-    /// "adopted" from "never set". Setting the parent to a NON-1.0 scale is
-    /// the whole difference, and it needs no window, no compositor and no
-    /// display: `contentsScale` is a property, and adoption is a property
-    /// read.
+    /// An attached layer adopts its parent's non-1.0 `contentsScale`, and
+    /// follows it when it changes with no resize (a display drag). A fresh
+    /// `CAMetalLayer` defaults to 1.0, which on a 2x display draws the grid
+    /// oversized and soft.
     #[test]
     fn attach_adopts_the_parents_contents_scale_and_follows_it() {
         let Some(dev) = device() else { return };
         let _test_pool = AutoreleasePool::new();
         let parent = plain_calayer();
-        // A Retina parent, which is what the winit view's backing layer is
-        // on the display this regression shipped against.
+        // A Retina parent.
         set_contents_scale(&parent, 2.0);
 
         let config = SwapchainConfig {
@@ -1585,10 +1242,8 @@ mod tests {
             sc.contents_scale()
         );
 
-        // THE DISPLAY DRAG. Moving a window between a Retina and a
-        // non-Retina screen changes the parent's scale with NO resize and no
-        // reconfigure, so nothing in the drift set moves — only the poll can
-        // see it. A fix applied at attach alone would fail from here down.
+        // A display drag changes the parent's scale with no resize or
+        // reconfigure; only the poll sees it.
         set_contents_scale(&parent, 1.0);
         sc.sync_layer_geometry();
         assert!(
@@ -1604,9 +1259,7 @@ mod tests {
             sc.contents_scale()
         );
 
-        // A non-positive parent scale is refused, not adopted: dividing the
-        // contents by zero would blank the window, and keeping the last good
-        // scale is strictly better.
+        // A non-positive parent scale is refused; the last good scale stays.
         set_contents_scale(&parent, 0.0);
         sc.sync_layer_geometry();
         assert!(
@@ -1617,10 +1270,8 @@ mod tests {
         );
     }
 
-    /// S5b — the standalone shape has no parent, so the sync is a no-op and
-    /// must not touch (or crash on) a layer with a nil `superlayer`. This is
-    /// the arm the headless tests all exercise, pinned so the poll added on
-    /// the present path stays free for them.
+    /// The standalone shape has no parent, so the sync is a no-op and must not
+    /// crash on a nil `superlayer`.
     #[test]
     fn a_standalone_swapchain_has_no_parent_to_adopt_a_scale_from() {
         let Some(dev) = device() else { return };
@@ -1644,17 +1295,11 @@ mod tests {
         assert!(sc.acquire().is_ok(), "and still vends after the no-op sync");
     }
 
-    /// S4 — THE BOUNDED FAILURE MODE, driven through the one nil arm a
-    /// headless test can reach deterministically. The module header records
-    /// the measurement: an UNPARENTED layer's pool never exhausts on this OS
-    /// (six acquires on a `maximumDrawableCount = 2` layer all vend, held or
-    /// presented; oversized and zero drawableSizes vend too), so the ~1s
-    /// timeout arm is real only under a compositor and is guarded here by
-    /// the `allowsNextDrawableTimeout == YES` readback in S1 plus this test
-    /// of the SAME `Err` path: a layer that cannot vend (its device stripped
-    /// — measured nil in 0.000s) must produce a bounded, named error from
-    /// `acquire`, never a hang — and restoring the device must make the very
-    /// next acquire succeed, which is the recovery half of the contract.
+    /// Bounded failure: a layer that cannot vend (device stripped) makes
+    /// `acquire` return a named `Err` rather than hang, and restoring the device
+    /// makes the next acquire succeed. This is the nil arm reachable headless;
+    /// the ~1 s timeout arm needs a compositor and is covered by the
+    /// `allowsNextDrawableTimeout == YES` readback.
     #[test]
     fn acquire_fails_bounded_and_named_when_the_layer_cannot_vend() {
         let Some(dev) = device() else { return };
@@ -1675,10 +1320,8 @@ mod tests {
         // A healthy layer vends.
         drop(sc.acquire().expect("a configured layer vends a drawable"));
 
-        // Strip the device — the deterministic stand-in for "the pool cannot
-        // serve this acquire" (CAMetalLayer.h:95-97 condition 1).
-        // SAFETY: `setDevice:` accepts nil (the property is nullable,
-        // CAMetalLayer.h:66); the layer stays live.
+        // Strip the device so the pool cannot serve this acquire.
+        // SAFETY: `setDevice:` accepts nil; the layer stays live.
         unsafe {
             let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
             set_obj(sc.layer.id(), sel(c"setDevice:"), std::ptr::null_mut());
@@ -1694,9 +1337,8 @@ mod tests {
             err.contains("nextDrawable returned nil"),
             "the failure is named, not swallowed: {err}"
         );
-        // A hang detector: the deviceless nil arm returns in microseconds and a
-        // parked thread never returns at all, so a minute separates them as
-        // well as 8 s did without reading a descheduled test as a hang.
+        // Hang detector: the nil arm returns in microseconds; a parked thread
+        // never returns.
         assert!(
             waited < 60.0,
             "the failure is BOUNDED — {waited:.2}s is not a parked thread \
@@ -1715,20 +1357,9 @@ mod tests {
         drop(frame);
     }
 
-    /// `cell.metal`'s 16-byte `Uniforms` block — the P4 harness's spelling.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CellUniforms {
-        screen: [f32; 2],
-        text_blend: f32,
-        pad: f32,
-    }
-
-    /// The 112-byte `Blit` uniform (`shaders/blit.metal`'s `struct Blit`), restated
-    /// `repr(C)` — every member naturally aligned, so the MSL `constant`
-    /// layout and this struct agree offset for offset; the size is asserted
-    /// against [`crate::metal::blit::MetalBlit::UNIFORM_BYTES`] at the fill
-    /// site.
+    /// The 112-byte `Blit` uniform (`shaders/blit.metal`'s `struct Blit`) as
+    /// `repr(C)`; size checked against
+    /// [`crate::metal::blit::MetalBlit::UNIFORM_BYTES`] at the fill site.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct BlitUniformBytes {
@@ -1753,63 +1384,17 @@ mod tests {
         chrome_pad: [f32; 3],
     }
 
-    /// # Safety
-    /// `T` must be `repr(C)` and free of padding-sensitive invariants; the
-    /// bytes are copied straight into a GPU-visible buffer.
-    unsafe fn as_bytes<T: Copy>(v: &T) -> &[u8] {
-        // SAFETY: `T: Copy` + `repr(C)`; read-only, lives only for the copy.
-        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), size_of::<T>()) }
-    }
-
-    /// T3 — THE FRAME CYCLE: acquire -> render the bg row into the offscreen
-    /// (the P4 harness pieces: the same table row, the same instance packing,
-    /// the same [`ffi::draw_and_read`]) -> blit the offscreen into the
-    /// DRAWABLE'S OWN TEXTURE through the production present row
-    /// (`Pipeline::Blit`, exact-fit passthrough) -> read the drawable back
-    /// and hold every byte -> present -> wait -> feed the loss latch -> next
-    /// frame. SIX frames on a 3-drawable pool, so drawables demonstrably
-    /// recycle through more than one full pool rotation.
+    /// The frame cycle, six frames on a 3-drawable pool: acquire, render the bg
+    /// row into the offscreen, blit it into the drawable's texture through
+    /// `Pipeline::Blit`, read the drawable back, present, wait, feed the latch.
     ///
-    /// The bg row cannot attach to the drawable directly — its table target
-    /// is the offscreen's sRGB view (THE FORMAT LAW), and `CAMetalLayer`
-    /// vends `Bgra8Unorm` — so the cycle runs the REAL production shape:
-    /// bg -> offscreen (sRGB view of an `Rgba8Unorm` texture, via
-    /// [`ffi::texture_view`]), blit reads the UNORM view of that same
-    /// storage and writes the swapchain. Byte expectations follow: the
-    /// offscreen holds the instances' own sRGB bytes (+-1 LSB for the
-    /// f32 encode round trip, exactly as the P4 differential tolerates), the
-    /// passthrough blit preserves them, and the `Bgra8Unorm` store swizzles
-    /// memory order to B,G,R,A.
+    /// The bg row targets the offscreen's sRGB view and the layer vends
+    /// `Bgra8Unorm`, so this runs the production shape: bg into the sRGB view
+    /// of an `Rgba8Unorm` texture, blit from its Unorm view to the swapchain.
+    /// Expected bytes are the instances' sRGB bytes (±1 LSB), swizzled to BGRA.
     ///
-    /// THE COLOURS CHANGE EVERY FRAME. A recycled drawable arrives holding
-    /// the bytes of the frame that used it two rotations ago, so a cycle
-    /// that stopped rendering (or stopped uploading the stream) would replay
-    /// a STALE frame — with static colours that replay is invisible, with
-    /// per-frame colours it is a byte diff on the exact frame that went
-    /// stale.
-    ///
-    /// Leak accounting, measured under `OBJC_DEBUG_MISSING_POOLS=YES` on an
-    /// M5 Max (a test cannot read its own stderr, so the numbers live here):
-    /// a pure test in this binary logs **0** unpooled autoreleases; this test
-    /// WITHOUT its body pool logs **56**, of which 28 are `AGXG17CDevice` on
-    /// the test's own thread — the driver-dealloc autoreleases `ffi`'s
-    /// `Obj::drop` doc predicts, one per buffer/texture released; WITH the
-    /// [`AutoreleasePool`] below those 28 vanish and **28** remain, every one
-    /// on one of three CoreAnimation-INTERNAL threads (12 `CAMetalLayer`,
-    /// 13 `__NSArrayI_Transfer`, 3 `__NSDictionaryM`) that vend and present
-    /// drawables — threads Apple owns, which no caller-side pool can cover
-    /// and which a wgpu present exercises identically. This module's own
-    /// thread contribution with the documented pool discipline: ZERO.
-    ///
-    /// Armed (each planted, RED, restored): commit-before-presentDrawable
-    /// dies by NSInvalidArgumentException (SIGABRT — the hazard is an
-    /// exception, not a race); an unwaited `wait_outcome` reports
-    /// non-`Completed`; a frame-0-only stream upload replays a stale
-    /// drawable and diffs on frame 1; a blit sourced from the sRGB view
-    /// shifts every mid-range byte. Recorded NOT CAUGHT: `mem::forget`-ing
-    /// the drawable at present — an unparented layer's pool never exhausts
-    /// on this OS (module header), so the leak's cost (pool starvation) is
-    /// compositor-only and unreachable headless.
+    /// Colours change every frame, so a recycled drawable replaying a stale
+    /// frame shows as a byte diff.
     #[test]
     fn six_frames_render_present_and_recycle_through_the_pool() {
         use crate::metal::loss::{CbOutcome, LossLatch};
@@ -1823,9 +1408,7 @@ mod tests {
         const FRAMES: usize = 6;
 
         let latch = Arc::new(LossLatch::new());
-        // THE session: present now takes it instead of a raw queue (risk 2's
-        // structural retirement), and the one-shot draws borrow ITS queue so
-        // the whole cycle runs on one queue by construction.
+        // One session owns the queue, so the whole cycle runs on one queue.
         let session = encoder::EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
         let queue = session.one_shot_queue();
         let mut sc = Swapchain::standalone(
@@ -1834,9 +1417,7 @@ mod tests {
                 format: PixelFormat::Bgra8Unorm,
                 width: W,
                 height: H,
-                // The one non-production knob: readback needs blit access to
-                // the drawable's texture (production runs `true` until a
-                // video tap arms — the same flip `surface_usage` documents).
+                // Readback needs blit access to the drawable's texture.
                 framebuffer_only: false,
                 display_sync: false,
                 maximum_drawables: 3,
@@ -1846,7 +1427,7 @@ mod tests {
         )
         .expect("swapchain");
 
-        // The two table rows of the cycle, built off THE PIPELINE TABLE.
+        // The cycle's two table rows.
         let bg_spec = Pipeline::Bg.spec();
         let bg_lib = crate::metal::pipelines::compile(&dev, bg_spec).expect("cell.metal");
         let bg_pso =
@@ -1999,7 +1580,7 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("frame {frame}: bg draw failed: {e}"));
 
-            // blit: offscreen's UNORM view -> THE DRAWABLE'S TEXTURE.
+            // blit: offscreen's Unorm view -> the drawable's texture.
             ffi::draw_and_read(
                 queue,
                 &ffi::Pass {
@@ -2053,13 +1634,8 @@ mod tests {
             let ticket = frame_obj
                 .present(&session)
                 .unwrap_or_else(|e| panic!("frame {frame}: present failed: {e}"));
-            // THE SETTLE LINE, ARMED AT LAST: a judge proved the `settle`
-            // call inside `wait_outcome` was the one unarmed line in the loss
-            // wiring — on a healthy GPU every outcome is Completed, whose
-            // record is a no-op, so a planted skip stayed green and only a
-            // REAL device loss would have caught the regression. The debug
-            // feed counter makes the feed itself observable: every ticket
-            // waited on must bump it by exactly one, Completed or not.
+            // Every waited ticket must bump the debug feed counter by one, so a
+            // skipped `settle` is caught even though Completed records nothing.
             #[cfg(debug_assertions)]
             let fed_before = latch.fed_count();
             let outcome = ticket.wait_outcome();
@@ -2092,22 +1668,13 @@ mod tests {
         );
     }
 
-    /// S5 — DELIBERATE EXHAUSTION, wall-clocked. `maximumDrawableCount = 2`,
-    /// then FIVE raw acquires (max + 3) held un-presented, every call timed.
-    /// This pins, as a failing test rather than a doc claim, the module
-    /// header's measurement: an unparented layer's pool NEVER exhausts on
-    /// this OS — every over-budget acquire vends a live drawable in
-    /// milliseconds — so the ~1s-timeout arm is compositor-only, and the
-    /// deterministic bounded-failure arm stays the deviceless layer in S4.
-    /// If an OS update starts pacing headless layers, this fails loudly and
-    /// the header's measurement paragraph is what needs rewriting.
+    /// Deliberate exhaustion: `maximumDrawableCount = 2`, then five raw acquires
+    /// held un-presented, each timed. An unparented layer's pool never
+    /// exhausts, so every acquire vends quickly; if an OS update starts pacing
+    /// headless layers this fails and the module header needs updating.
     ///
-    /// The wall-clock assert is the task's bound: exhaustion must cost
-    /// bounded time (vend or named error), never a parked thread. The public
-    /// type shape cannot even express this test — two live [`Frame`]s are
-    /// E0499 (verified: a second `sc.acquire()` while one frame lives does
-    /// not compile) — which is WHY it drives [`Swapchain::raw_next_drawable`]
-    /// directly.
+    /// Uses [`Swapchain::raw_next_drawable`] because two live [`Frame`]s do not
+    /// compile.
     #[test]
     fn deliberate_exhaustion_stays_bounded_and_headless_pools_never_starve() {
         let Some(dev) = device() else { return };
@@ -2140,9 +1707,8 @@ mod tests {
             let pair = got.unwrap_or_else(|| {
                 panic!(
                     "acquire {i} returned nil after {waited:.2}s on a healthy \
-                     unparented layer — the module header's measured \
-                     never-exhausts claim no longer holds on this OS; \
-                     re-measure and rewrite the header"
+                     unparented layer; the module header's never-exhausts \
+                     claim fails on this OS: re-measure and rewrite the header"
                 )
             });
             assert!(
@@ -2160,28 +1726,15 @@ mod tests {
         );
     }
 
-    /// S6 — THE INJECTED-LOSS PATH, END TO END, through production plumbing
-    /// only: a REAL present's ticket, an injected `PageFault` through
-    /// [`PresentTicket::settle`] (the seam that exists because a real `Lost`
-    /// cannot be produced on a healthy GPU — `loss`'s honesty note), and
-    /// then the two refusals, each held to touching nothing:
+    /// Injected loss end to end through production plumbing: a real present's
+    /// ticket, an injected `PageFault` via [`PresentTicket::settle`], then:
     ///
-    /// * RETRYABLE first, and it must NOT latch — the next acquire vends;
-    /// * the `Lost` latches, and a frame acquired BEFORE the loss refuses to
-    ///   present — discarded, never committed to the dead queue;
-    /// * every later acquire refuses in MICROSECONDS, naming the first
-    ///   loss's reason, instead of eating a ~1s `nextDrawable` timeout per
-    ///   frame against a dead device.
+    /// * a retryable outcome does not latch, and the next acquire vends;
+    /// * the `Lost` latches, and a frame acquired before it refuses to present;
+    /// * every later acquire refuses, naming the first loss's reason.
     ///
-    /// "Touching nothing" is COUNTED ([`encoder::queue_ffi_census`]: the
-    /// `nextDrawable` in `acquire_drawable` and the `commandBuffer` mint in
-    /// `Frame::present`, the FFI these refusals would reach), not timed (the
-    /// load-sensitive test audit of 2026-09-27). The old `< 0.05 s`
-    /// stopwatches failed whenever a loaded gate descheduled the test for
-    /// 50 ms, and on this healthy device could not see the regression they
-    /// named anyway: a refusal that called `nextDrawable` first gets a
-    /// drawable back in microseconds. The census fails on that one call and
-    /// on nothing the scheduler does, so it replaces them.
+    /// "Touching nothing" is counted by [`encoder::queue_ffi_census`]
+    /// (`nextDrawable` and the present's `commandBuffer` mint), not timed.
     #[test]
     fn an_injected_loss_latches_and_every_later_acquire_and_present_refuses_fast() {
         use crate::metal::loss::{
@@ -2203,10 +1756,8 @@ mod tests {
         };
         let mut sc = Swapchain::standalone(&dev, &config, Arc::clone(&latch)).expect("swapchain");
 
-        // A healthy frame: wait_outcome feeds the latch ITSELF (Completed is
-        // a no-op on it), no manual record anywhere. The census sees its
-        // `nextDrawable` and its `commandBuffer`, so a census that stopped
-        // counting cannot pass the refusals below.
+        // A healthy frame: `wait_outcome` feeds the latch itself. The census
+        // sees its `nextDrawable` and `commandBuffer`, proving it counts.
         let calls = encoder::queue_ffi_census::calls();
         let ticket = sc
             .acquire()
@@ -2221,12 +1772,7 @@ mod tests {
         assert_eq!(ticket.wait_outcome(), CbOutcome::Completed);
         assert!(!latch.is_lost(), "a completed present must not latch");
 
-        // The polled twin: a terminal ticket answers try_outcome with the
-        // same classification, from the settled cache, and feeds NOTHING —
-        // the wait above already fed the one feed this ticket owes (the
-        // once-feed contract; the poll-FIRST feed is armed in
-        // `a_present_ticket_feeds_the_latch_exactly_once_however_asked` and
-        // the encoder's once-feed twin).
+        // The polled twin answers from the settled cache and feeds nothing.
         #[cfg(debug_assertions)]
         let fed = latch.fed_count();
         assert_eq!(
@@ -2302,44 +1848,15 @@ mod tests {
         }
     }
 
-    /// S10 — THE RECONFIGURE STORM (proof (c) from the port map's list, and
-    /// risk 4's retiring measurement): one LIVE layer driven through every
-    /// axis the renderer reconfigures — sizes, both present formats
-    /// (`Bgra8Unorm`↔`Rgba16Float`, the EDR flip), `opaque` (the
-    /// translucency crossing), `framebufferOnly` (the COPY_SRC arm),
-    /// `displaySyncEnabled` and `maximumDrawableCount` — TWICE over, 12
-    /// reconfigures, with an acquire + present after every step.
+    /// Reconfigure storm: one live layer driven through every axis the renderer
+    /// reconfigures (sizes, both formats, `opaque`, `framebufferOnly`,
+    /// `displaySyncEnabled`, `maximumDrawableCount`) twice, 12 reconfigures,
+    /// with an acquire and present after each.
     ///
-    /// Per step, read back off live objects (never off this module's own
-    /// bookkeeping): every layer axis through its own getter, the COLORSPACE
-    /// NAME (the sticky-space regression the reconfigure measurement found —
-    /// an EDR→SDR flip must come back to `kCGColorSpaceSRGB`, which the OS
-    /// does NOT do on its own), and the acquired drawable's own texture
-    /// extent and raw pixel format — the drawable-pool-rebuild proof: every
-    /// drawable vended after a reconfigure carries the new config.
-    ///
-    /// The stale-config-present question is answered by TYPE, not in this
-    /// test: `Frame` holds `&mut Swapchain`, so a frame held across
-    /// `reconfigure` is E0499 at compile time (the reconfigure doc names it;
-    /// the double-acquire twin of the same shape is pinned by S5's note).
-    ///
-    /// Leak audit, measured under the full validation env
-    /// (`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 METAL_DEVICE_WRAPPER_TYPE=1
-    /// OBJC_DEBUG_MISSING_POOLS=YES`, M5 Max, 2026-08-31, test-threads=1;
-    /// a test cannot read its own stderr, so the numbers live here): GREEN
-    /// under the validation layer, and WITH the body pool below every
-    /// remaining unpooled autorelease — 291: 227 `AGXG17CDevice` (the
-    /// driver's dealloc traffic for 12 drawable-pool rebuilds, running on
-    /// the threads CoreAnimation releases presented drawables from), 24
-    /// `CAMetalLayer`, 25 `__NSArrayI_Transfer`, 12 `__NSArrayM`, 3
-    /// `__NSDictionaryM` — sits on exactly THREE Metal/CA-internal threads,
-    /// none of them this test's. Removing the body pool is the control: the
-    /// complaint set grows to 351 across SIX threads including the main
-    /// thread — the +60 delta is the test-thread contribution `Obj::drop`
-    /// documents, absorbed entirely by the pool. Attributable-to-this-module
-    /// count with the documented pool discipline: ZERO, the same accounting
-    /// T3 pinned. And 12 reconfigures do not starve the pool: the acquire
-    /// after every step vends within the wall-clock bound.
+    /// Each step reads back every axis via its getter, the colorspace name (an
+    /// EDR-to-SDR flip must return to `kCGColorSpaceSRGB`), and the acquired
+    /// drawable's extent and pixel format, proving the pool follows the config.
+    /// The body pool absorbs this thread's autoreleases.
     #[test]
     fn a_reconfigure_storm_lands_every_axis_live_and_the_pool_follows() {
         use crate::metal::encoder::EncodeSession;
@@ -2435,9 +1952,8 @@ mod tests {
                     wants_edr,
                     "cycle {cycle} step {i}: wantsEDR"
                 );
-                // THE STICKY-SPACE REGRESSION, pinned both directions: the OS
-                // does NOT restore sRGB on an EDR->SDR flip; configure's
-                // explicit SDR arm does, and skipping either arm is RED here.
+                // The OS does not restore sRGB on an EDR-to-SDR flip; the
+                // explicit SDR arm does.
                 assert_eq!(
                     sc.colorspace_name().as_deref(),
                     Some(if wants_edr {
@@ -2448,7 +1964,7 @@ mod tests {
                     "cycle {cycle} step {i}: colorspace after the flip"
                 );
 
-                // THE POOL FOLLOWS: the next drawable carries the new config.
+                // The next drawable carries the new config.
                 // SAFETY: reading a monotonic clock.
                 let t0 = unsafe { CACurrentMediaTime() };
                 let frame = sc
@@ -2499,30 +2015,18 @@ mod tests {
         );
     }
 
-    /// T4 — THE TWO-SUBMIT FRAME (proof (d) from the port map's list): the
-    /// renderer's REAL per-frame shape, six times through a 3-drawable pool.
-    /// Per frame, on the session's ONE queue:
+    /// The two-submit frame, six times through a 3-drawable pool, on one queue:
     ///
-    /// * **Submit A — frame encode**: a [`encoder::CommandBuffer`] renders
-    ///   the bg row into the offscreen's sRGB view, commits, and is NOT
-    ///   waited on — the thread keeps working, exactly as `encode_frame`'s
-    ///   submit at renderer.rs:15315 precedes the present path.
-    /// * **Submit B — present compose**: a second command buffer blits the
-    ///   offscreen (Unorm view) onto THE DRAWABLE'S TEXTURE through the
-    ///   production `Pipeline::Blit` row, appends the tap-shaped
-    ///   `copy_texture_to_buffer`, commits, and is waited on. One queue
-    ///   commits in order, so B completing PROVES A completed — asserted via
-    ///   [`encoder::Submitted::try_outcome`], the polled harvest.
-    /// * **Present**: `Frame::present(&session)` — the third, tiny command
-    ///   buffer registering `presentDrawable:`, behind A and B on the same
-    ///   queue by construction (the structural retirement of risk 2; with a
-    ///   raw-queue present this test could have committed B on a second queue
-    ///   and raced the present — that call shape no longer exists).
+    /// * Submit A renders the bg row into the offscreen's sRGB view, commits and
+    ///   is not waited on.
+    /// * Submit B blits the offscreen onto the drawable's texture through
+    ///   `Pipeline::Blit`, appends the tap copy, commits and is waited on; B
+    ///   completing proves A completed (checked via
+    ///   [`encoder::Submitted::try_outcome`]).
+    /// * `Frame::present(&session)` registers the present behind both.
     ///
-    /// Byte-verified per frame against per-frame colours (the T3 stale-
-    /// drawable armor), and the latch feed counter is asserted per submit:
-    /// A's polled harvest, B's wait and the ticket's wait each feed exactly
-    /// once — no manual `record` anywhere.
+    /// Bytes are checked per frame, and A's poll, B's wait and the ticket's
+    /// wait each feed the latch exactly once.
     #[test]
     fn six_two_submit_frames_encode_compose_present_and_verify() {
         use crate::metal::encoder::{
@@ -2566,8 +2070,8 @@ mod tests {
             crate::metal::pipelines::build(&dev, &blit_lib, blit_spec, PixelFormat::Bgra8Unorm)
                 .expect("blit row");
 
-        // Minted SEALED (W3): the offscreen carries the session's loss
-        // domain, which is what lets the encoder's write verbs accept it.
+        // Minted sealed: the offscreen carries the session's loss domain,
+        // which lets the encoder's write verbs accept it.
         let mint = crate::metal::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
         let offscreen = mint
             .texture_2d(
@@ -2784,11 +2288,8 @@ mod tests {
         );
     }
 
-    /// S9 — ONE LOSS DOMAIN PER PRESENT PATH: a session wired to a DIFFERENT
-    /// latch than the swapchain's is a wiring bug (its submissions would latch
-    /// a latch acquire never consults), and present refuses it loudly instead
-    /// of silently splitting the loss domain. The healthy same-latch path is
-    /// every other present test in this file; this is the refusal arm.
+    /// A session on a different latch than the swapchain's is refused at
+    /// present.
     #[test]
     fn present_refuses_a_session_wired_to_a_different_loss_latch() {
         use crate::metal::loss::LossLatch;
@@ -2828,21 +2329,14 @@ mod tests {
         );
     }
 
-    /// THE W1 JUDGE'S EXACT PROBE, armed (W3): a SECOND latch + a SECOND
-    /// session + the cross-wired present. Before the structural seal this
-    /// arrangement drove a present for work committed on a queue the present
-    /// never ordered against, with every runtime check green. Now every
-    /// crossing is a NAMED refusal at the earliest API boundary:
+    /// A second latch and session cross-wired with the first are refused at
+    /// every crossing:
     ///
-    /// * rendering the frame's texture on session 2 dies at `render_pass`
-    ///   (the target's stamp is the swapchain's latch, not session 2's);
-    /// * smuggling session-2-rendered bytes onto the drawable via a copy
-    ///   dies at the copy verbs (either side foreign refuses);
-    /// * presenting on the foreign session dies at `present` (the W1 check).
+    /// * rendering the frame's texture on session 2 dies at `render_pass`;
+    /// * copying session-2 bytes onto the drawable dies at the copy verbs;
+    /// * presenting on the foreign session dies at `present`.
     ///
-    /// The same-latch controls in the middle prove the refusals are the
-    /// SEAL's, not general brokenness: identical calls with matching stamps
-    /// succeed.
+    /// Same-latch controls prove the refusals come from the seal.
     #[test]
     fn the_two_latch_cross_wired_present_has_no_remaining_shape() {
         use crate::metal::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -2888,7 +2382,7 @@ mod tests {
         let frame = sc.acquire().expect("acquire");
         let frame_rt = frame.render_target();
 
-        // CROSS-WIRE 1: render the frame's texture on session 2.
+        // Cross-wire 1: render the frame's texture on session 2.
         let mut cb2 = session2.begin().expect("cb on session 2");
         let err = cb2
             .render_pass(&RenderPassDesc {
@@ -2909,9 +2403,8 @@ mod tests {
             "the refusal names the loss domain: {err}"
         );
 
-        // CROSS-WIRE 2: copy the rogue's rendering onto the drawable via
-        // session 1 (the smuggling shape), and read the drawable back via
-        // session 2 — both sides refuse.
+        // Cross-wire 2: copy onto the drawable via session 1 and read it back
+        // via session 2; both refuse.
         let mut cb1 = session1.begin().expect("cb on session 1");
         let err = cb1
             .copy_texture_to_texture(&rogue_offscreen, &frame_rt)
@@ -2923,8 +2416,7 @@ mod tests {
             .expect_err("a foreign-domain readback source must refuse");
         assert!(err.contains("loss domain"), "got: {err}");
 
-        // SAME-LATCH CONTROLS: the identical calls succeed with matching
-        // stamps, so the refusals above are the seal's, not brokenness.
+        // Same-latch controls: identical calls with matching stamps succeed.
         let control = mint1
             .texture_2d(
                 PixelFormat::Bgra8Unorm,
@@ -2954,8 +2446,7 @@ mod tests {
             "the control encode completes"
         );
 
-        // CROSS-WIRE 3: the present itself, on the rogue session — the W1
-        // check, still standing behind the new seals.
+        // Cross-wire 3: present on the foreign session.
         let err = frame
             .present(&session2)
             .expect_err("the cross-wired present must refuse");
@@ -2975,9 +2466,8 @@ mod tests {
         );
     }
 
-    /// A raw, foreign `CAMetalLayer` — the wgpu leftover: device set,
-    /// drawableSize set, NOT owned by any [`Swapchain`]. `framebufferOnly`
-    /// is off so the test can render into and read back its drawable.
+    /// A raw foreign `CAMetalLayer` (the wgpu leftover) with device and
+    /// `drawableSize` set and `framebufferOnly` off.
     fn foreign_metal_layer(dev: &Device, w: usize, h: usize) -> Obj {
         let _pool = AutoreleasePool::new();
         // SAFETY: alloc/init is +1; the setters are documented property
@@ -3008,19 +2498,13 @@ mod tests {
         }
     }
 
-    /// S7 — STACKING, LIVE: our swapchain and a FOREIGN, functioning
-    /// `CAMetalLayer` (the wgpu leftover, not a stand-in `CALayer`) side by
-    /// side under one parent, both vending drawables in flight at once.
-    /// Rendering and present must target OUR layer only:
+    /// Stacking: our swapchain and a live foreign `CAMetalLayer` under one
+    /// parent, both with drawables in flight:
     ///
-    /// * the acquired drawable's own `-layer` back-pointer is OUR layer, not
-    ///   the sibling and not the parent;
-    /// * our rendered bytes land in our drawable (verified to the byte);
-    /// * the sibling's in-flight drawable still holds ITS bytes after our
-    ///   render + present completed;
-    /// * teardown symmetry: dropping the swapchain unparents only its own
-    ///   layer, leaving the leftover parented — the S3 contract, now proven
-    ///   with a live sibling.
+    /// * our drawable's `-layer` is our layer;
+    /// * our bytes land in our drawable;
+    /// * the sibling's drawable keeps its bytes after our present;
+    /// * dropping the swapchain unparents only its own layer.
     #[test]
     fn a_present_beside_a_live_foreign_metal_layer_touches_only_its_own_layer() {
         use crate::pipeline_table::Pipeline;
@@ -3106,10 +2590,10 @@ mod tests {
         let row = W * PixelFormat::Bgra8Unorm.bytes_per_texel();
         let readback = dev.new_buffer(row * H).expect("readback");
 
-        // The foreign layer's IN-FLIGHT frame: vend its drawable raw and
-        // render its colour into it, wgpu-style, before our swapchain exists.
+        // The foreign layer's in-flight frame, rendered before our swapchain
+        // exists.
         // SAFETY: `nextDrawable`/`texture` are +0 under the pool, retained to
-        // +1 exactly as `raw_next_drawable` does.
+        // +1 as `raw_next_drawable` does.
         let (foreign_drawable, foreign_tex) = unsafe {
             let _pool = AutoreleasePool::new();
             let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
@@ -3264,21 +2748,13 @@ mod tests {
         }
     }
 
-    /// S8 — THE EDR FRAME, rendered: `Rgba16Float` + wantsEDR, the bg row
-    /// through the offscreen pair, the production `Pipeline::Blit` row into
-    /// the f16 drawable, every channel decoded from half floats and checked,
-    /// then present -> wait -> latch clean.
+    /// An EDR frame: `Rgba16Float` with wantsEDR, the bg row through the
+    /// offscreen pair and `Pipeline::Blit` into the f16 drawable, every channel
+    /// decoded and checked, then present, wait, clean latch.
     ///
-    /// THE FORMAT COUPLING IS THE POINT: the blit row's attachment format is
-    /// `metal_format(TargetRole::Present, sc.format())` — resolved through
-    /// the P2 axis, never spelled here — and the test pins that resolution
-    /// EQUAL to the pixel format the layer actually carries
-    /// (`raw_pixel_format`, the property readback). A swapchain that
-    /// hardcoded its layer format, or a `metal_format` whose Present arm
-    /// stopped following the live swapchain format, is a failed assert or a
-    /// validation-layer abort here (armed: both were planted). The Edr role
-    /// is pinned to the same f16 the layer opts into EDR with — the EDR
-    /// offscreen and the EDR present carry one format by construction.
+    /// The blit's attachment format comes from
+    /// `metal_format(TargetRole::Present, sc.format())` and is checked equal to
+    /// the layer's actual pixel format; the Edr role is the same f16.
     #[test]
     fn an_edr_frame_renders_through_the_table_formats_and_presents() {
         use crate::metal::loss::{CbOutcome, LossLatch};
@@ -3308,8 +2784,8 @@ mod tests {
         .expect("EDR swapchain");
         assert!(sc.wants_extended_dynamic_range());
 
-        // THE COUPLING: the table's Present arm resolves to the layer's own
-        // format, and the Edr role rides the same f16.
+        // The table's Present arm resolves to the layer's own format, and the
+        // Edr role uses the same f16.
         let blit_spec = Pipeline::Blit.spec();
         let present_format = crate::metal::pipelines::metal_format(blit_spec.target, sc.format());
         assert_eq!(
@@ -3323,8 +2799,7 @@ mod tests {
             "the Edr offscreen and the EDR present share the f16 format"
         );
 
-        // The bg row still writes the offscreen sRGB view — THE FORMAT LAW
-        // does not bend for EDR.
+        // The bg row still writes the offscreen sRGB view, EDR or not.
         let bg_spec = Pipeline::Bg.spec();
         assert_eq!(
             crate::metal::pipelines::metal_format(bg_spec.target, sc.format()),
@@ -3476,8 +2951,8 @@ mod tests {
         )
         .expect("blit -> the f16 drawable");
 
-        // Every texel, decoded from binary16: the blit passthrough writes the
-        // offscreen's raw byte values as b/255 into the linear f16 target.
+        // Every texel decoded from binary16: the passthrough blit writes the
+        // offscreen's bytes as b/255.
         // SAFETY: shared storage, written before draw_and_read returned.
         let got = unsafe { ffi::buffer_bytes(&readback, f16_row * H) };
         let halves: Vec<u16> = got
@@ -3510,10 +2985,9 @@ mod tests {
         assert_eq!(outcome, CbOutcome::Completed, "the f16 present completes");
         assert!(!latch.is_lost());
     }
-    /// THE ONCE-FEED CONTRACT on the present side, twin of the encoder's
-    /// `terminal_outcomes_feed_the_latch_exactly_once_across_wait_and_poll`:
-    /// one present ticket feeds the latch exactly once through wait/poll,
-    /// however they are mixed, and the injection seam stays uncached.
+    /// One present ticket feeds the latch exactly once across wait and poll,
+    /// however mixed; the injection seam stays uncached. Twin of the encoder's
+    /// test.
     #[test]
     fn a_present_ticket_feeds_the_latch_exactly_once_however_asked() {
         use crate::metal::loss::{CbOutcome, LossLatch};
@@ -3567,12 +3041,8 @@ mod tests {
         assert!(!latch.is_lost());
     }
 
-    /// PRESENT → GLASS: with a sink installed, a present hangs a presented
-    /// handler and Metal delivers one sample per present — on glass or
-    /// skipped (this unparented standalone layer never reaches a display, so a
-    /// headless run may read `Skipped`; both arms count). Before the handler
-    /// existed nothing observed the drawable after `commit`, and `delivered`
-    /// never moved.
+    /// With a sink installed, each present delivers one presented-handler
+    /// sample (on glass or skipped; an unparented layer may read `Skipped`).
     #[test]
     fn a_present_delivers_a_glass_sample_once_a_sink_listens() {
         use crate::metal::loss::{CbOutcome, LossLatch};
@@ -3677,9 +3147,8 @@ mod tests {
         assert!(Arc::ptr_eq(frame.swapchain().latch(), &latch));
         drop(frame);
 
-        // Equal size, format and device must not disguise a foreign origin.
-        // Check both shared and distinct loss domains: pointer identity is the
-        // boundary, not geometry equality or an accidentally shared latch.
+        // Equal size, format and device must not hide a foreign origin, with
+        // shared or distinct loss domains.
         for share_latch in [true, false] {
             let origin_latch = if share_latch {
                 Arc::clone(&latch)

@@ -90,6 +90,203 @@ fn a_hooked_dcs_is_not_carried() {
     assert_eq!(parser.carry(), None);
 }
 
+/// Everything a sink saw except the hooked string's own DCS calls (`dcs_hook`,
+/// `dcs_put`, `dcs_unhook`), which go to a handler that keeps nothing when the
+/// carry is taken: what the screen is made of.
+fn outside_the_hook(sink: &RecordingSink) -> String {
+    format!(
+        "prints={:?} executes={:?} csi={:?} csi_sub={:?} esc={:?} osc={:?} apc=({}, {:?}, {})",
+        sink.prints,
+        sink.executes,
+        sink.csi_dispatches,
+        sink.csi_dispatches_with_subparams,
+        sink.esc_dispatches,
+        sink.osc_dispatches,
+        sink.apc_starts,
+        sink.apc_data,
+        sink.apc_ends
+    )
+}
+
+/// A parser with C1-control interpretation on or off.
+fn parser_c1(c1: bool) -> Parser {
+    if c1 {
+        Parser::with_c1_controls()
+    } else {
+        Parser::new()
+    }
+}
+
+/// `carry_unhooking` carries a hooked DCS string as one to IGNORE (round eight
+/// of the update audit, finding 57): the successor swallows the rest of its
+/// payload to the terminator — never printing it, never hooking a handler it
+/// did not start — and then reads what follows exactly as the live parser
+/// does. That includes a tmux passthrough wrapper's doubled ESC, which breaks
+/// out of the string into the inner sequence in both, UTF-8 in the payload (a
+/// tmux control-mode line, a kitty command's JSON) and an 8-bit ST, in either
+/// C1 mode. Everywhere else it is `carry` itself.
+///
+/// RED with the first carried form, `DcsIgnore`: the tmux control-mode tail
+/// printed `\u{fffd} \u{276f} ls` and `%end` before `after`, the kitty tail
+/// `\u{fffd}llo"}`, and the sixel ended by `0x9C` swallowed `after` (the review
+/// of round eight's fix).
+#[test]
+fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
+    let cases: [(&[u8], &[u8]); 6] = [
+        (b"\x1bPq#0;2;0;0;0", b"#0!10~-\x1b\\after"),
+        (b"\x1bPtmu", b"x;\x1b\x1b]2;inner\x07\x1b\\after"),
+        // tmux control mode (`DCS 1000 p`): UTF-8 in its lines.
+        (
+            b"\x1bP1000p%begin 1 1 0\n",
+            "%output %1 caf\u{e9} \u{276f} ls\n%end\x1b\\after".as_bytes(),
+        ),
+        // A kitty remote-control command: UTF-8 in its JSON.
+        (
+            b"\x1bP@kitty-cmd{\"t\":\"",
+            "h\u{e9}llo \u{672c}\"}\x1b\\after".as_bytes(),
+        ),
+        // A sixel ended by the 8-bit ST.
+        (b"\x1bPq#0;2;0;0;0", b"#0!10~-\x9cafter"),
+        // An unknown string ended by the 8-bit ST after a character that
+        // holds 0x9C itself (U+672C is E6 9C AC): with C1 off that byte is
+        // the character's and the string ends at the ST after it; with C1 on
+        // it ends the string early, in both.
+        (b"\x1bP@x", b"y\xe6\x9c\xac\x9cafter"),
+    ];
+    for c1 in [false, true] {
+        for (head, tail) in cases {
+            let mut outgoing = parser_c1(c1);
+            outgoing.advance_fast(head, &mut RecordingSink::default());
+            assert_eq!(outgoing.state(), State::DcsPassthrough, "{head:?}");
+            assert_eq!(outgoing.carry(), None, "control: `carry` holds none");
+            let carry = outgoing.carry_unhooking();
+            assert_eq!(carry.state, HOOKED_STRING_CARRY, "{head:?}");
+            assert_eq!(
+                carry,
+                ParserCarry {
+                    state: HOOKED_STRING_CARRY,
+                    ..ParserCarry::default()
+                },
+                "nothing but the state"
+            );
+            let mut successor = parser_c1(c1);
+            successor.restore_carry(&carry).expect("restores");
+            let mut sink = RecordingSink::default();
+            successor.advance_fast(tail, &mut sink);
+            let mut live = RecordingSink::default();
+            outgoing.advance_fast(tail, &mut live);
+            assert_eq!(
+                outside_the_hook(&sink),
+                outside_the_hook(&live),
+                "c1={c1} {:?}: the same screen after it",
+                String::from_utf8_lossy(head)
+            );
+            assert!(
+                sink.prints.iter().collect::<String>().ends_with("after"),
+                "c1={c1} {head:?}: {:?}",
+                sink.prints
+            );
+            assert!(sink.dcs_hooks.is_empty() && sink.dcs_puts.is_empty());
+            assert!(sink.apc_starts == 0 && sink.apc_data.is_empty() && sink.apc_ends == 0);
+        }
+    }
+    // The tmux tail's whole text is swallowed, the 8-bit-ST sixel's too: only
+    // `after` prints (the live parser's answer, which the loop compares).
+    let mut successor = Parser::new();
+    successor
+        .restore_carry(&ParserCarry {
+            state: HOOKED_STRING_CARRY,
+            ..ParserCarry::default()
+        })
+        .expect("restores");
+    let mut sink = RecordingSink::default();
+    successor.advance_fast(
+        "%output %1 caf\u{e9}\n%end\x1b\\after".as_bytes(),
+        &mut sink,
+    );
+    assert_eq!(sink.prints.iter().collect::<String>(), "after");
+
+    let mut ground = Parser::new();
+    ground.advance_fast(b"\x1b[1;", &mut RecordingSink::default());
+    assert_eq!(Some(ground.carry_unhooking()), ground.carry());
+}
+
+/// THE HOOKED STRING'S CARRY READS EVERY BYTE AS THE HOOKED STRING DOES
+/// ([`HOOKED_STRING_CARRY`]; round eight of the update audit, finding 57). The
+/// table, entry by entry: for every byte the carried state stays in itself
+/// exactly where `DcsPassthrough` stays in itself, and where either leaves,
+/// both go to the same state by the same action. Then the parsers: a hooked
+/// live parser and a successor restored from its `carry_unhooking`, fed every
+/// one- and two-byte tail (65,792 of them), with C1 controls off and on,
+/// through both the byte path and the fast path, agree on everything outside
+/// the hook and end in corresponding states — and, once out of the string,
+/// in the same one.
+#[test]
+fn the_hooked_string_carry_reads_every_byte_as_the_hooked_string() {
+    for byte in 0..=u8::MAX {
+        let live = TRANSITIONS[State::DcsPassthrough as usize][usize::from(byte)];
+        let carried = TRANSITIONS[HOOKED_STRING_CARRY as usize][usize::from(byte)];
+        let stays = |transition: crate::table::Transition, from: State| {
+            (transition.next_state == from)
+                .then_some(())
+                .ok_or((transition.next_state, transition.action as u8))
+        };
+        assert_eq!(
+            stays(live, State::DcsPassthrough),
+            stays(carried, HOOKED_STRING_CARRY),
+            "byte {byte:#04x}"
+        );
+    }
+
+    let mut tails: Vec<Vec<u8>> = (0..=u8::MAX).map(|b| vec![b]).collect();
+    for a in 0..=u8::MAX {
+        for b in 0..=u8::MAX {
+            tails.push(vec![a, b]);
+        }
+    }
+    for c1 in [false, true] {
+        let mut hooked = parser_c1(c1);
+        hooked.advance(b"\x1bP1000p%", &mut RecordingSink::default());
+        assert_eq!(hooked.state(), State::DcsPassthrough);
+        let mut restored = parser_c1(c1);
+        restored
+            .restore_carry(&hooked.carry_unhooking())
+            .expect("restores");
+        for fast in [false, true] {
+            for tail in &tails {
+                let (mut live, mut successor) = (hooked.clone(), restored.clone());
+                let (mut live_sink, mut successor_sink) =
+                    (RecordingSink::default(), RecordingSink::default());
+                if fast {
+                    live.advance_fast(tail, &mut live_sink);
+                    successor.advance_fast(tail, &mut successor_sink);
+                } else {
+                    live.advance(tail, &mut live_sink);
+                    successor.advance(tail, &mut successor_sink);
+                }
+                assert_eq!(
+                    outside_the_hook(&successor_sink),
+                    outside_the_hook(&live_sink),
+                    "c1={c1} fast={fast} tail={tail:02x?}"
+                );
+                if live.state() == State::DcsPassthrough {
+                    assert_eq!(
+                        successor.state(),
+                        HOOKED_STRING_CARRY,
+                        "c1={c1} fast={fast} tail={tail:02x?}: still in the string"
+                    );
+                } else {
+                    assert_eq!(
+                        (successor.state(), successor.carry()),
+                        (live.state(), live.carry()),
+                        "c1={c1} fast={fast} tail={tail:02x?}: out of it alike"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// An unhooked DCS, and an SOS/PM/APC string, are carried as strings to
 /// IGNORE: the rest of the payload is swallowed up to its terminator (never
 /// printed, never handed to a consumer the successor did not start), and the
@@ -377,6 +574,51 @@ fn restore_carry_refuses_every_invalid_carry() {
             CarryRefusal::Utf8Tail,
         ),
         (
+            "a lead past U+10FFFF",
+            ParserCarry {
+                utf8_tail: vec![0xF5],
+                utf8_expected: 4,
+                ..ParserCarry::default()
+            },
+            CarryRefusal::Utf8Tail,
+        ),
+        (
+            "an overlong two-byte lead",
+            ParserCarry {
+                utf8_tail: vec![0xC0],
+                utf8_expected: 2,
+                ..ParserCarry::default()
+            },
+            CarryRefusal::Utf8Tail,
+        ),
+        (
+            "an overlong three-byte prefix",
+            ParserCarry {
+                utf8_tail: vec![0xE0, 0x9F],
+                utf8_expected: 3,
+                ..ParserCarry::default()
+            },
+            CarryRefusal::Utf8Tail,
+        ),
+        (
+            "a surrogate prefix",
+            ParserCarry {
+                utf8_tail: vec![0xED, 0xA0],
+                utf8_expected: 3,
+                ..ParserCarry::default()
+            },
+            CarryRefusal::Utf8Tail,
+        ),
+        (
+            "a prefix past U+10FFFF",
+            ParserCarry {
+                utf8_tail: vec![0xF4, 0x90],
+                utf8_expected: 4,
+                ..ParserCarry::default()
+            },
+            CarryRefusal::Utf8Tail,
+        ),
+        (
             "a length the lead does not name",
             ParserCarry {
                 utf8_tail: vec![0xE6],
@@ -464,14 +706,32 @@ fn restore_carry_accepts_the_edge_of_every_bound() {
             osc_overflowed: true,
             ..ParserCarry::default()
         },
+        // The highest and lowest well-formed prefixes (U+10FFFF's head, the
+        // first non-overlong two-byte lead) and the edges of the lead-specific
+        // second-byte ranges.
         ParserCarry {
-            utf8_tail: vec![0xF7, 0xBF, 0xBF],
+            utf8_tail: vec![0xF4, 0x8F, 0xBF],
             utf8_expected: 4,
             ..ParserCarry::default()
         },
         ParserCarry {
-            utf8_tail: vec![0xC0],
+            utf8_tail: vec![0xC2],
             utf8_expected: 2,
+            ..ParserCarry::default()
+        },
+        ParserCarry {
+            utf8_tail: vec![0xE0, 0xA0],
+            utf8_expected: 3,
+            ..ParserCarry::default()
+        },
+        ParserCarry {
+            utf8_tail: vec![0xED, 0x9F],
+            utf8_expected: 3,
+            ..ParserCarry::default()
+        },
+        ParserCarry {
+            utf8_tail: vec![0xF0, 0x90, 0x80],
+            utf8_expected: 4,
             ..ParserCarry::default()
         },
         ParserCarry {
@@ -522,26 +782,67 @@ fn carry_swallows_sequence_names_the_lossy_carries_only() {
     };
     let mut big_osc = b"\x1b]52;c;".to_vec();
     big_osc.extend(std::iter::repeat_n(b'A', OSC_CARRY_CAP + 1));
-    for (bytes, swallowed) in [
-        (&big_osc[..], true),
-        (&b"\x1bP1;2"[..], true),
-        (&b"\x1bP"[..], true),
-        (&b"\x1bP1$"[..], true),
-        (&b"\x1b_Ga=T,f=100;"[..], true),
-        (&b"\x1b]0;a short title"[..], false),
-        (&b"\x1b^a privacy message"[..], false),
-        (&b"\x1bX a start of string"[..], false),
-        (&b"\x1b[38;5;19"[..], false),
-        (&b"\xe6\xbc"[..], false),
-        (&b"plain text"[..], false),
+    let mut big_image = b"\x1b]1337;File=inline=1:".to_vec();
+    big_image.extend(std::iter::repeat_n(b'A', OSC_CARRY_CAP + 1));
+    // (bytes, swallowed, a picture the next frame replaces — round eight of
+    // the update audit, finding 57)
+    for (bytes, swallowed, picture) in [
+        (&big_osc[..], true, false),
+        (&big_image[..], true, true),
+        (&b"\x1bP1;2"[..], true, false),
+        (&b"\x1bP"[..], true, false),
+        (&b"\x1bP1$"[..], true, false),
+        (&b"\x1b_Ga=T,f=100;"[..], true, true),
+        (&b"\x1b]1337;File=inline=1:AAAA"[..], false, false),
+        (&b"\x1b]0;a short title"[..], false, false),
+        (&b"\x1b^a privacy message"[..], false, false),
+        (&b"\x1bX a start of string"[..], false, false),
+        (&b"\x1b[38;5;19"[..], false, false),
+        (&b"\xe6\xbc"[..], false, false),
+        (&b"plain text"[..], false, false),
     ] {
         let parser = at(bytes);
-        assert_eq!(
-            parser.carry_swallows_sequence(),
-            swallowed,
+        let at = format!(
             "{:?} in {:?}",
             String::from_utf8_lossy(&bytes[..bytes.len().min(24)]),
             parser.state()
         );
+        assert_eq!(parser.carry_swallows_sequence(), swallowed, "{at}");
+        assert_eq!(parser.carry_swallows_picture(), picture, "{at}");
+    }
+}
+
+/// A STRING'S CARRY CONTINUES A UTF-8 CHARACTER SPLIT AT THE HANDOFF. Whether
+/// a `0x9C` in a DCS or APC payload is ST or the next byte of a character
+/// depends on the bytes before it
+/// (`tests::c1::a_0x9c_inside_a_utf8_character_does_not_end_the_string`), so
+/// a carry taken between the two holds the character's head: split the string
+/// at every byte of a payload whose characters hold `0x9C` as their second,
+/// third and fourth byte, carry the head, and the successor swallows the rest
+/// of the string as the live parser does and prints only what follows it.
+#[test]
+fn a_string_carry_continues_a_split_utf8_character() {
+    let payload = "\u{71c}\u{672c}\u{d71c}\u{1f71c}\u{1c71c}x";
+    for head in [&b"\x1bP1000p"[..], b"\x1bP1:", b"\x1b_", b"\x1bX"] {
+        for st in [&b"\x1b\\"[..], b"\x9c"] {
+            let stream = [head, payload.as_bytes(), st, b"after"].concat();
+            for split in head.len()..=head.len() + payload.len() {
+                let (before, after) = stream.split_at(split);
+                let mut outgoing = Parser::new();
+                outgoing.advance_fast(before, &mut RecordingSink::default());
+                let carry = outgoing.carry_unhooking();
+                let mut successor = Parser::new();
+                successor.restore_carry(&carry).expect("restores");
+                let mut sink = RecordingSink::default();
+                successor.advance_fast(after, &mut sink);
+                assert_eq!(
+                    sink.prints.iter().collect::<String>(),
+                    "after",
+                    "{:?} st={st:02x?} split at {}",
+                    String::from_utf8_lossy(head),
+                    split - head.len()
+                );
+            }
+        }
     }
 }

@@ -11,6 +11,9 @@ description = "Proc macros for aterm TLA+ refinement mapping"
 
 [lib]
 proc-macro = true
+# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
+# gate while still being linked and executed. Doctests are a separate switch.
+test = false
 
 [dependencies]
 syn = { version = "2", features = ["full", "extra-traits"] }

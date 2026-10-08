@@ -1,0 +1,10 @@
+# claude-code 2.1.283 · MEASURED 2026-09-28 20:41 PDT on the owner's tab 1 (a private headless aterm replayed the tab's own PTY recording at 140 columns): the session-limit banner Claude Code draws in its FOOTER while the turn is still WRAPPING UP (`clau.de/wrap-up`), over the status row `✻ Waiting for 1 dynamic workflow to finish`, with the bypass footer's `· 1 shell, 1 monitor ·`, the update hint run into the goal indicator and Claude's dim next-step suggestion in the composer (its words replaced). The worker's prose is replaced by neutral text; every vendor row is byte for byte. The turn had NOT ended: it ended 41 minutes later (the sibling fixture `…-goal-checkin-shell-measured.txt`).
+⏺ The cleanup agent is freeing space; I will stop the low-disk watcher once the workflows finish.
+
+✻ Waiting for 1 dynamic workflow to finish
+                                                                                 ✔ Update installed · Restart to update◎ /goal active (1d)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xhigh ─
+❯ commit and align with main, then continue
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Usage limit reached · limit resets 9:50pm · clau.de/wrap-up · /upgrade to keep using Claude Code
+  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← for agents · ↓ to manage

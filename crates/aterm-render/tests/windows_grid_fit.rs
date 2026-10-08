@@ -11,9 +11,10 @@
 //! The seam itself (`font_hinting` full ⇄ off actually changes coverage while
 //! never moving the cell box) is bound cross-platform in
 //! `font_hinting_config.rs`. THIS file binds the half that is Windows-specific
-//! and that a static test font cannot reach: the platform default face,
-//! `C:\Windows\Fonts\CascadiaMono.ttf`, is a VARIABLE font with no separate
-//! Bold file, so
+//! and that a static test font cannot reach: Windows 11's own Cascadia Mono,
+//! `C:\Windows\Fonts\CascadiaMono.ttf` — what `font_family = "Cascadia Mono"`
+//! names; the unconfigured default is the bundled STATIC Cascadia Mono PL — is
+//! a VARIABLE font with no separate Bold file, so
 //!
 //! * the regular cut is an `fvar` instance, and
 //! * bold is the `wght`≈700 instance of the SAME bytes (W9),
@@ -34,8 +35,8 @@
 
 use aterm_render::{Renderer, StyleBits, Theme};
 
-/// Locate a VARIABLE system face to instantiate: Cascadia Mono first (it is
-/// the platform default the shipping candidate list picks), then any other
+/// Locate a VARIABLE system face to instantiate: Cascadia Mono first (Windows
+/// 11 ships it, and `font_family = "Cascadia Mono"` names it), then any other
 /// `%WINDIR%\Fonts` face whose `wght` axis reaches a real bold cut — the
 /// precondition W9's `vf_bold_coords` needs before bold is an INSTANCE rather
 /// than synthetic dilation, which is what these tests are about.
@@ -116,8 +117,9 @@ fn renderer(bytes: &[u8], px: f32, mode: &str) -> Renderer {
     r
 }
 
-/// The headline: on the platform default VARIABLE face, at the desktop
-/// 12px, grid fitting concentrates the stem — more whole-ink texels, fewer
+/// The headline: on Windows 11's VARIABLE Cascadia Mono (what
+/// `font_family = "Cascadia Mono"` names), at the desktop 12px, grid fitting
+/// concentrates the stem — more whole-ink texels, fewer
 /// mid-grey ones — instead of the raw outline fill Windows used to ship.
 #[test]
 fn variable_primary_is_grid_fitted_at_12px() {

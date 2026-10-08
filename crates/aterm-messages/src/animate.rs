@@ -5,7 +5,7 @@
 //! with main's full-width meter): what a row's indicator looks like at one
 //! frame instant, as data the host paints — never as time folded into the
 //! layout. The [`crate::glass::Presentation`] stays TIME-FREE and
-//! fingerprinted as before; a [`BandMotion`] overlays only the row's
+//! fingerprinted; a [`BandMotion`] overlays only the row's
 //! SURFACE, the time slots, the glyph cell and an echo's fade, so an
 //! animation never re-runs the width law and NEVER RE-GRIDS.
 //!
@@ -37,8 +37,8 @@
 //!   the square of its length into a hot head, and a soft leading edge — that
 //!   enters through the window's left edge and leaves through its right, one
 //!   breathing crossing per [`COMET_PERIOD`], the next entering as it leaves
-//!   (the glyph cell keeps the row's own glyph: the comet already moves, so
-//!   the braille spinner went — ruling 251). The bar for work with a fill: its edge at the
+//!   (the glyph cell keeps the row's own glyph, since the comet already
+//!   moves — ruling 251). The bar for work with a fill: its edge at the
 //!   data (sub-cell coverage), a data glide and a travelling glint (dimmed,
 //!   the glint parked, while the bytes are stalled). The echo's fill, glow
 //!   and fade on completion, over the whole row.
@@ -137,9 +137,8 @@ impl Tone {
     };
     /// A determinate fill whose bytes have STALLED: a dim slate of the fill
     /// ink that reads as DORMANT, the glint parked — the yellow `stalled`
-    /// word beside it carries the warning. (Mixing warn into the fill gave
-    /// sage green, the success hue, right beside that word: review round 2,
-    /// 2026-09-23.)
+    /// word beside it carries the warning. (Mixing warn into the fill gives
+    /// sage green, the success hue, right beside that word.)
     pub const STALLED: Tone = Tone {
         fill: 120,
         lift: 0,
@@ -262,7 +261,7 @@ impl Surface {
     /// in whole cells (main's `lit.clamp(1, cols − 1)`): the span that starts
     /// at the left edge takes the tone AT that edge, so any started fill
     /// lights it, and the span that ends at the right edge takes the tone
-    /// just inside it, so only a whole fill does (review 2026-09-24: with
+    /// just inside it, so only a whole fill does (with
     /// the gutters in the edge columns, their centres left 1 ‰ an empty
     /// track and lit the whole window at 99 %). A span that is the whole row
     /// takes its centre. The centre is read as its left limit, so a span
@@ -813,7 +812,7 @@ pub fn bar_at(edge: i64, glint: Option<Duration>, graded: bool, cols: usize) -> 
 
 /// The bar of a download whose bytes have STALLED: the fill dimmed
 /// ([`Tone::STALLED`]) with no glint — the travelling sheen said "working"
-/// while the words said "stalled" (review 2026-09-23). Flat looks keep the
+/// while the words said "stalled". Flat looks keep the
 /// full ink: High Contrast discards gradation, and its words carry the
 /// stall.
 #[must_use]
@@ -1185,8 +1184,8 @@ mod tests {
         // …and the ENDS keep ruling 55's honest ends in whole cells (main's
         // `lit.clamp(1, cols − 1)`), over the host's columns, whose first
         // and last carry the gutters out to the window's edges: any started
-        // fill lights the first, only a whole one the last (review
-        // 2026-09-24 — the centres left 1 ‰ an empty track and lit the whole
+        // fill lights the first, only a whole one the last (the
+        // centres left 1 ‰ an empty track and lit the whole
         // window at 99.x %).
         let column = |s: &Surface, i: u64| {
             let x0 = if i == 0 { 0 } else { lo + i * cw };

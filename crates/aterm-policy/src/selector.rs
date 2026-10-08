@@ -26,7 +26,7 @@
 //! ```
 //!
 //! Named aliases like `"OSC 52 set"` and `"response any"` are expanded first
-//! (see [`expand_alias`]). Aliases always resolve to a canonical selector
+//! (see the [`aliases`] table). Aliases always resolve to a canonical selector
 //! form so the matcher does not have to know about them.
 //!
 //! # Matching
@@ -38,10 +38,8 @@
 //! selector only matches the prefix — this gives `"OSC 4"` (no params) the
 //! "match any OSC 4" semantics from §3.3.
 //!
-//! Empty selectors and `*` are the universal matcher. `response any` matches
-//! any response-producing sequence; at the data-model level this is the
-//! same as `*` — the distinction is carried in the alias table for
-//! documentation.
+//! `*` is the universal matcher. `response any` parses to the same selector;
+//! the distinction is documentation only (see the alias table).
 
 use core::fmt;
 
@@ -94,9 +92,8 @@ impl fmt::Display for FunctionKind {
 
 /// One parameter position in a [`SequenceSelector`].
 ///
-/// The variant choice is small on purpose: we want the match decision to be
-/// trivially side-effect-free and total. Complex matchers (regex, range) are
-/// explicitly out of scope for v1 — the §3.3 table is the full grammar.
+/// Kept small so matching stays trivially total; the §3.3 table is the full
+/// grammar (no regex or range matchers).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SelectorParam {
     /// Match any non-empty parameter at this position.
@@ -133,17 +130,14 @@ impl SelectorParam {
 
 /// A compiled pattern matched against a [`DispatchedSequence`].
 ///
-/// Selectors are produced by [`SequenceSelector::parse`] at policy-load time;
-/// the `String` form stored in [`crate::Rule::sequence`] is left untouched so
-/// the TOML round-trip test continues to pass. Compilation is a pure
-/// transformation — a rebuild from the string always produces the same
-/// selector.
+/// Produced by [`SequenceSelector::parse`] when the engine is built; the
+/// string in [`crate::Rule::sequence`] is kept as written so a policy
+/// round-trips through TOML losslessly. Parsing is pure.
 ///
 /// # Canonical forms
 ///
 /// * `"*"` → `SequenceSelector::catch_all()`
-/// * `"response any"` → `SequenceSelector::catch_all_with_tag("response any")`
-///   (functionally identical to `*`)
+/// * `"response any"` → `SequenceSelector::catch_all()`
 /// * `"OSC 4"` → function=Osc, major=Some(4), params=[]
 /// * `"OSC 4;*;?"` → function=Osc, major=Some(4), params=[Wildcard, Query]
 /// * `"CSI 20 t"` → function=Csi, major=Some(20), suffix=Some("t"), params=[]
@@ -186,12 +180,10 @@ impl SequenceSelector {
     /// # Errors
     ///
     /// Returns [`SelectorParseError`] if the input cannot be classified as
-    /// a catch-all or a function-major selector. The error variant is
-    /// informational — at policy-load time the caller falls back to the
-    /// Hardened profile (§4.4), so per-rule parse failures never surface.
+    /// a catch-all or a function-major selector. The engine keeps such a rule
+    /// but never matches it.
     pub fn parse(src: &str) -> Result<Self, SelectorParseError> {
-        let expanded = expand_alias(src);
-        parse_compiled(expanded.as_ref())
+        parse_compiled(expand_alias(src))
     }
 
     /// Returns `true` if this selector matches `seq`.
@@ -260,9 +252,8 @@ impl SequenceSelector {
 /// decimal string form). The `suffix` field carries CSI final bytes and DCS
 /// intermediate strings.
 ///
-/// This is the unit the engine consumes. It deliberately holds `String`s
-/// (and a borrowed sub-construction helper — [`DispatchedSequence::osc`])
-/// rather than raw bytes so selectors can match via string equality.
+/// Holds `String`s rather than raw bytes so selectors match by string
+/// equality.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchedSequence {
     /// Function family.
@@ -342,8 +333,7 @@ pub struct BucketKey {
 // Parsing
 // ---------------------------------------------------------------------------
 
-/// Selector parser error. The variants are informational — a load-time
-/// parse failure is always converted to the fallback Hardened profile.
+/// Selector parser error. A rule whose selector fails to parse never matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SelectorParseError {
@@ -374,29 +364,20 @@ impl std::error::Error for SelectorParseError {}
 /// translates the human-readable form to the concrete selector syntax the
 /// parser recognizes. Unknown aliases pass through unchanged so the caller's
 /// parser sees the original string.
-pub(crate) fn expand_alias(src: &str) -> std::borrow::Cow<'_, str> {
-    use std::borrow::Cow;
+pub(crate) fn expand_alias(src: &str) -> &str {
     let trimmed = src.trim();
     match trimmed {
-        "OSC 52 set" => Cow::Borrowed("OSC 52;*;<not-question>"),
-        "OSC 52 query" => Cow::Borrowed("OSC 52;*;?"),
-        "OSC 4 query" => Cow::Borrowed("OSC 4;*;?"),
-        "OSC 4 set" => Cow::Borrowed("OSC 4;*;<not-question>"),
-        "OSC 21 set named" => Cow::Borrowed("OSC 21;<named>"),
-        "OSC 21 set indexed" => Cow::Borrowed("OSC 21;<indexed>"),
-        "response any" | "*" => Cow::Borrowed("*"),
-        _ => {
-            // If the table grows we still want to round-trip aliases not
-            // known at compile time — defer to the runtime table.
-            if aliases::lookup(trimmed).is_some() {
-                // Known alias with no inline translation — treat as catch-all
-                // for forward-compat (fail-open here is safe because the
-                // engine fails closed at the default).
-                Cow::Borrowed("*")
-            } else {
-                Cow::Borrowed(src)
-            }
-        }
+        "OSC 52 set" => "OSC 52;*;<not-question>",
+        "OSC 52 query" => "OSC 52;*;?",
+        "OSC 4 query" => "OSC 4;*;?",
+        "OSC 4 set" => "OSC 4;*;<not-question>",
+        "OSC 21 set named" => "OSC 21;<named>",
+        "OSC 21 set indexed" => "OSC 21;<indexed>",
+        "response any" | "*" => "*",
+        // A table alias with no translation above parses as the catch-all;
+        // the rule's own origin gate and response still apply.
+        _ if aliases::lookup(trimmed).is_some() => "*",
+        _ => src,
     }
 }
 
@@ -568,7 +549,7 @@ fn non_empty_string(s: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (unit-level; see §3.3 of the design for the full table).
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

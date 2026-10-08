@@ -39,9 +39,10 @@
 //! trapezoid split when it does not, the accumulator's cross-row carry: every
 //! one of those computes EXACT analytic per-cell area, where two independent
 //! implementations agree to the bit because there is only one right answer.
-//! `tests/rasterizer_oracle.rs` feeds both rasterizers the same flattened
-//! polyline — `draw_line` calls only — and demands identical bits over tens of
-//! thousands of real glyph rasters. That equality is also the only expression
+//! Fed the same flattened polyline — `draw_line` calls only — this fill and the
+//! retired crate's agreed to the bit over tens of thousands of real glyph
+//! rasters; the golden grids in this module's tests pin it. That equality is
+//! also the only expression
 //! of cross-machine determinism this crate has, and the GPU/CPU parity suites
 //! lean on it. Reordering an expression in the fill can break it.
 //!
@@ -67,8 +68,8 @@
 //! For every outline that stays inside the grid — which is every outline this
 //! crate feeds it, because [`crate::variation::RASTER_PAD`] guarantees it —
 //! the clamps are unreachable and the FILL is bit-for-bit the retired crate's.
-//! `tests/rasterizer_oracle.rs` proves that over tens of thousands of real
-//! glyph rasters, over the shared polyline described above.
+//! That held over tens of thousands of real glyph rasters, over the shared
+//! polyline described above.
 //!
 //! For an outline that ESCAPES the grid, the two rasterizers deliberately
 //! DIFFER, and it is worth being exact about how. The retired crate's write
@@ -504,9 +505,8 @@ mod tests {
         }
     }
 
-    /// Compare against a pinned grid at f32 bit-equality — the same standard
-    /// `tests/rasterizer_oracle.rs` holds the two implementations to, because
-    /// antialiased coverage is where "close enough" hides a visible bug.
+    /// Compare against a pinned grid at f32 bit-equality, because antialiased
+    /// coverage is where "close enough" hides a visible bug.
     #[track_caller]
     fn assert_grid(actual: &[f32], expected: &[f32], w: usize, what: &str) {
         assert_eq!(actual.len(), expected.len(), "{what}: grid size");
@@ -523,9 +523,8 @@ mod tests {
     // -----------------------------------------------------------------------
     // GOLDEN GRIDS, held IN TREE
     //
-    // `tests/rasterizer_oracle.rs` proves equality against the retired crate,
-    // but only for as long as that dev-dependency is there. These four grids
-    // are the evidence that outlives it, in the same shape `crates/aterm-hash`
+    // These four grids, verified against the retired crate, are the evidence
+    // that outlives it, in the same shape `crates/aterm-hash`
     // pins vectors for the hash it replaced.
     //
     // The TWO LINE-ONLY grids are not invented: the oracle's

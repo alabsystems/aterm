@@ -44,17 +44,13 @@ pub struct ApronScratch {
     /// and frame facts are unchanged (a glide INSIDE one engine row: ~119 of
     /// every 120 trackpad frames) rasters nothing and keeps the band.
     key: Option<ApronKey>,
-    /// The apron row the band was rastered from, compared IN PLACE so a key
-    /// hit allocates nothing; refilled field-wise (capacity kept) on a raster.
-    /// It lived inside [`ApronKey`] until 2026-09-24, which cloned the row on
-    /// every sub-row frame only to compare and drop it.
-    key_row: aterm_core::render::ApronRow,
     /// Bumped on every REAL raster; the GPU arms key their strip pack on it.
     generation: u64,
 }
 
 /// The inputs a rastered apron band is a pure function of, besides the row
-/// itself ([`ApronScratch::key_row`], compared in place): the frame facts the
+/// itself (compared in place against row 0 of the one-row input the last
+/// raster ran over, [`ApronScratch::input`]): the frame facts the
 /// one-row input copies, the renderer geometry the row→px law reads, and the
 /// RENDERER state the raster reads that no input field carries. Appearance
 /// changes no term here sees (text blending, minimum contrast, font thicken,
@@ -159,7 +155,17 @@ impl Renderer {
             cursor_blink_phase: ap.cursor_col.is_some() && self.cursor_blink_phase,
             renderer_cursor_style_override: ap.cursor_col.and(self.cursor_style_override),
         };
-        if scratch.w != 0 && scratch.key == Some(key) && scratch.key_row == *ap {
+        // The row itself: the one-row input still holds exactly what the last
+        // raster ran over (only the refill below writes it), so compare in place.
+        let mi = &scratch.input;
+        if scratch.w != 0
+            && scratch.key == Some(key)
+            && mi.cells[0] == ap.cells
+            && mi.clusters[0] == ap.clusters
+            && mi.combining[0] == ap.combining
+            && mi.line_sizes[0] == ap.line_size
+            && mi.cursor_visible.then_some(mi.cursor_col) == ap.cursor_col
+        {
             return true;
         }
         // Refill the one-row input IN PLACE (the per-row Vecs keep capacity).
@@ -217,15 +223,6 @@ impl Renderer {
         scratch.w = w;
         scratch.band = grid_top * w..h * w;
         scratch.key = Some(key);
-        // Field-wise: the derived `ApronRow::clone_from` is `*self = clone()`
-        // and would reallocate on every miss.
-        let kr = &mut scratch.key_row;
-        kr.present = ap.present;
-        kr.cells.clone_from(&ap.cells);
-        kr.clusters.clone_from(&ap.clusters);
-        kr.combining.clone_from(&ap.combining);
-        kr.line_size = ap.line_size;
-        kr.cursor_col = ap.cursor_col;
         scratch.generation = scratch.generation.wrapping_add(1);
         true
     }
@@ -262,11 +259,10 @@ mod tests {
         input
     }
 
-    /// THE KEY SEES WHAT THE RASTER READS (audit, 2026-09-24). The resident
-    /// raster keyed only the row, its geometry and the frame colours, so a
-    /// landed fallback face (a `font_epoch` bump) and every appearance change
-    /// the hosts answer with a cache invalidation (blending, contrast, font
-    /// knobs) left the strip on a stale raster. A hit still rasters nothing;
+    /// THE KEY SEES WHAT THE RASTER READS: a landed fallback face (a
+    /// `font_epoch` bump) and every appearance change the hosts answer with a
+    /// cache invalidation (blending, contrast, font knobs) must re-raster the
+    /// strip. A hit still rasters nothing;
     /// an epoch bump, a direct invalidation and the CPU window's own
     /// `invalidate` each force exactly one re-raster; and the caret-only terms
     /// (blink phase) cannot churn a row that carries no caret.

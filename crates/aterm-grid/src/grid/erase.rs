@@ -4,7 +4,6 @@
 
 //! Grid erase operations.
 //!
-//! This module contains all erase-related operations for the terminal grid:
 //! - Line erase (EL): erase parts of or entire lines
 //! - Screen erase (ED): erase parts of or entire screen
 //! - Scrollback erase: clear history buffer
@@ -13,12 +12,12 @@
 //!
 //! # The deferred wrap (`pending_wrap`) follows xterm
 //!
-//! A printable written to the last column parks the cursor ON that column and
+//! A printable written to the last column parks the cursor on that column and
 //! arms a deferred wrap (xterm `charproc.c` `dotext`: `do_wrap` is set while
 //! `cur_col` stays on the last column). Which erases cancel it is read off
 //! xterm's `util.c`, where `ResetWrap(screen)` clears `do_wrap`:
 //! - ED 0/1/2, EL 0/1/2 and DECALN always reset it. EL 0 and ED 0 go through
-//!   `ClearRight`, which clears from `cur_col` INCLUSIVE (the parked glyph) and
+//!   `ClearRight`, which clears from `cur_col` inclusive (the parked glyph) and
 //!   ends with `ResetWrap`; EL 1, EL 2 and ED 1 reach `ClearInLine2`'s
 //!   `ResetWrap`; ED 2 is `ClearScreen`, which calls `ResetWrap`; DECALN is
 //!   `charproc.c` `CASE_DECALN`.
@@ -27,7 +26,7 @@
 //!   pending wrap reaches only on a line one character wide: there
 //!   `do_erase_display` case 0 reduces to case 2, so DECSED 0 acts as DECSED 2
 //!   and the all-protected exception below applies. DECSEL 1/2 and DECSED 1/2
-//!   reset it unless EVERY cell of xterm's span is protected: `ClearInLine2`
+//!   reset it unless every cell of xterm's span is protected: `ClearInLine2`
 //!   returns before its `ResetWrap` when its protected-segment loop leaves no
 //!   unprotected cell.
 //! - ECH resets it (`do_erase_char` -> `ClearRight`; see `line_ops.rs`).
@@ -37,36 +36,24 @@
 //!   `ScrnMarkRectangle`, `ScrnCopyRectangle`) never calls `ResetWrap` or
 //!   writes `do_wrap`.
 //!
-//! An earlier rule here kept the parked glyph and the wrap on every erase. It
-//! was modelled on xterm.js, which stores a pending wrap as `x == cols` and so
-//! erases the empty range `[cols, cols)`; real xterm (and Ghostty) do not.
+//! xterm.js differs (it stores a pending wrap as `x == cols` and erases the
+//! empty range `[cols, cols)`); real xterm and Ghostty match the rules above.
 //!
-//! # DECSLRM horizontal margins do NOT bound an erase
+//! # DECSLRM horizontal margins do not bound an erase
 //!
-//! VT510 splits the control functions into two classes with one sentence each,
-//! and the split is the whole rule:
-//! - erase IN PLACE — EL, ECH and ED each carry "works inside or outside the
+//! VT510 splits the control functions into two classes:
+//! - erase in place — EL, ECH and ED each "work inside or outside the
 //!   scrolling margins";
-//! - SHIFT data sideways — ICH and DCH each carry "has no effect outside the
+//! - shift data sideways — ICH and DCH each "have no effect outside the
 //!   scrolling margins".
 //!
-//! DECSLRM's own page ties the two together ("sets the left and right margins
-//! to define the scrolling region"), so those sentences are about exactly these
-//! margins. Every implementation reads it the same way, and each shows the split
-//! inside one file: xterm's `ClearRight` / `ClearLeft` / `ClearLine` (util.c)
-//! bound by `MaxCols` / column 0 and never call `ScrnLeftMargin`, while
-//! `ScrnInsertChar` / `ScrnDeleteChar` (screen.c) open with both margins; the
-//! same contrast holds in Ghostty (`eraseLine` / `eraseChars` use `self.cols`,
-//! `insertBlanks` / `deleteChars` return early outside `scrolling_region`),
-//! iTerm2 (`eraseLineBeforeCursor:afterCursor:decProtect:` uses
-//! `size.width`, `-[VT100Grid insertChar:...]` honours the margins) and WezTerm.
-//!
-//! aterm used to clamp EL 0/1/2, DECSEL 0/1/2 and ECH to the margins, and the
-//! comment on ECH cited "VT420/VT510 spec" for a claim the VT510 ECH page
-//! contradicts in so many words. The clamp was never chosen by any commit here —
-//! it arrived whole in the bootstrap import — and no test pinned it. ED and
-//! DECSED were already correct. aterm's own DECSLRM-bound operations (ICH, DCH,
-//! DECIC, DECDC, autowrap) keep their margins: see `line_ops.rs`.
+//! DECSLRM's own page says those margins define the scrolling region, and
+//! every implementation follows the split: xterm's `ClearRight` / `ClearLeft` /
+//! `ClearLine` (util.c) bound by `MaxCols` / column 0 while `ScrnInsertChar` /
+//! `ScrnDeleteChar` (screen.c) honour both margins; likewise Ghostty
+//! (`eraseLine` / `eraseChars` vs `insertBlanks` / `deleteChars`), iTerm2 and
+//! WezTerm. aterm's DECSLRM-bound operations (ICH, DCH, DECIC, DECDC, autowrap)
+//! keep their margins: see `line_ops.rs`.
 
 use super::{Cursor, Grid, ScrollRegion};
 use crate::PageStore;
@@ -80,7 +67,7 @@ type RingCapture = (u16, u16, Option<[u8; 3]>, Option<[u8; 3]>, Option<char>);
 
 impl Grid {
     // ========================================================================
-    // BCE RGB fill helpers (#7685)
+    // BCE RGB fill helpers
     // ========================================================================
 
     /// Write BCE truecolor background into `RgbColorRing` for a column range.
@@ -103,24 +90,11 @@ impl Grid {
         }
     }
 
-    /// Write BCE truecolor background for an entire row.
-    ///
-    /// No-op when `cursor_template_bg_rgb` is `None`.
-    pub(in crate::grid) fn fill_bce_rgb_row(&mut self, row: u16) {
-        if self.storage.cursor_template_bg_rgb.is_some() {
-            self.fill_bce_rgb_range(row, 0, self.storage.cols);
-        }
-    }
-
     /// Write BCE truecolor background for a range of full rows.
     ///
     /// No-op when `cursor_template_bg_rgb` is `None`.
     pub(in crate::grid) fn fill_bce_rgb_rows(&mut self, range: core::ops::Range<u16>) {
-        if self.storage.cursor_template_bg_rgb.is_some() {
-            for row in range {
-                self.fill_bce_rgb_range(row, 0, self.storage.cols);
-            }
-        }
+        self.fill_bce_rgb_rect(range, 0..self.storage.cols);
     }
 
     /// Write BCE truecolor background for a rectangular area.
@@ -147,10 +121,8 @@ impl Grid {
     /// When `selective`, only unprotected cells are cleared and extras are
     /// preserved. Non-selective erase uses the BCE cursor template for fill.
     fn erase_to_end_of_line_impl(&mut self, selective: bool) {
-        // SELECTION CUSTODY Phase 4 — the INVERSE hole, now closed. EL recorded
-        // NOTHING before, so a `\r` + EL progress bar or spinner rewrote the row
-        // under a live highlight and left it painted: a copy then returned text the
-        // user never selected. One row of damage, the cursor's.
+        // Record selection damage for the cursor row: a `\r` + EL progress bar
+        // rewriting the row must not leave a stale highlight over new text.
         let cursor_row = self.storage.cursor.row;
         self.damage_selection_visible_rows(cursor_row, cursor_row);
         self.erase_to_end_of_line_core(selective);
@@ -158,10 +130,9 @@ impl Grid {
 
     /// Core implementation for erase-to-end-of-line.
     ///
-    /// The span ends at the ROW's own edge. DECLRMM's right margin does not move
-    /// it — xterm's `ClearRight` bounds by `MaxCols(screen)` — see the module
-    /// note on the erase/shift split. Shared with ED/DECSED, which differ only in
-    /// owning their own selection damage, so this is the one span for all of them.
+    /// The span ends at the row's own edge; DECLRMM's right margin does not move
+    /// it (xterm's `ClearRight` bounds by `MaxCols(screen)`; see the module
+    /// note). Shared with ED/DECSED, which record their own selection damage.
     fn erase_to_end_of_line_core(&mut self, selective: bool) {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
@@ -186,10 +157,8 @@ impl Grid {
                 self.storage
                     .extras
                     .clear_range(cursor_row, cursor_col, right_bound);
-                // A truecolor BCE cell holds only an RGB *marker*; the bytes live in
-                // the dense ring. The orphan column now carries that marker too, so
-                // the ring has to reach it or the renderer resolves a stale/absent
-                // background there.
+                // A truecolor BCE cell holds only an RGB marker; the bytes live in
+                // the dense ring, so the ring must also cover the orphan column.
                 self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
             }
             self.storage.mark_content_row(cursor_row);
@@ -197,24 +166,17 @@ impl Grid {
         self.clear_wrap_into_next_row(cursor_row);
     }
 
-    /// xterm `ClearRight` ends with `LineClrWrapped(ld)` — "with the right part
-    /// cleared, we can't be wrapping" — unconditionally, whatever the column,
-    /// the margins or the protection: after EL 0 / ED 0 / DECSEL 0 / DECSED 0
-    /// (and an ECH that reaches the same last column, see `erase_chars`) the
-    /// cursor row no longer continues into the row below. xterm keeps that
-    /// flag on the row that wraps; this grid keeps it on the continuation, so
-    /// the link to break is the NEXT row's `WRAPPED`.
+    /// xterm `ClearRight` ends with `LineClrWrapped(ld)` ("with the right part
+    /// cleared, we can't be wrapping") unconditionally, whatever the column,
+    /// margins or protection: after EL 0 / ED 0 / DECSEL 0 / DECSED 0 (and an
+    /// ECH reaching the same last column, see `erase_chars`) the cursor row no
+    /// longer continues into the row below. xterm keeps the flag on the row that
+    /// wraps; this grid keeps it on the continuation, so the link to break is
+    /// the next row's `WRAPPED`.
     ///
-    /// Left set, the link outlives the text it described. Measured on Windows
-    /// (aterm 0.95.0, pwsh under ConPTY): every prompt on an 80-column tab
-    /// wraps, conhost's `cls` erases the screen as `CSI K` row by row, and the
-    /// next output written over those rows by CR LF inherited the stale
-    /// continuation — `col-test 02`'s own first row read as a continuation of
-    /// `col-test 01`'s tail. Invisible at 80 columns; a widen to 120 then
-    /// rewrapped the pair as one line into a staircase (40 blanks, then
-    /// `col-test 02`), and a narrow to 60 pushed `pad 13` into history as
-    /// `pad 12`'s tail while conhost repainted it at row 0 — the stray,
-    /// shifted duplicate row.
+    /// A stale link would join unrelated lines later: e.g. conhost's `cls`
+    /// erases row by row with `CSI K`, and output written over those rows would
+    /// otherwise rewrap on resize as one line with its predecessor.
     pub(in crate::grid) fn clear_wrap_into_next_row(&mut self, row: u16) {
         let next = row.saturating_add(1);
         if next >= self.storage.visible_rows {
@@ -224,9 +186,9 @@ impl Grid {
             && below.is_wrapped()
         {
             below.set_wrapped(false);
-            // The row's cells are unchanged but its logical line split in two,
-            // which is a content change to every reader that joins
-            // continuations (search, copy, the rewrap).
+            // The cells are unchanged but the logical line split in two, a
+            // content change for every reader that joins continuations (search,
+            // copy, rewrap).
             self.storage.mark_content_row(next);
         }
     }
@@ -236,10 +198,8 @@ impl Grid {
     /// When `selective`, only unprotected cells are cleared and extras are
     /// preserved. Non-selective erase uses the BCE cursor template for fill.
     fn erase_from_start_of_line_impl(&mut self, selective: bool) {
-        // SELECTION CUSTODY Phase 4 — the INVERSE hole, now closed. EL recorded
-        // NOTHING before, so a `\r` + EL progress bar or spinner rewrote the row
-        // under a live highlight and left it painted: a copy then returned text the
-        // user never selected. One row of damage, the cursor's.
+        // Record selection damage for the cursor row: a `\r` + EL progress bar
+        // rewriting the row must not leave a stale highlight over new text.
         let cursor_row = self.storage.cursor.row;
         self.damage_selection_visible_rows(cursor_row, cursor_row);
         self.erase_from_start_of_line_core(selective);
@@ -247,9 +207,9 @@ impl Grid {
 
     /// Core implementation for erase-from-start-of-line.
     ///
-    /// The span starts at COLUMN 0. DECLRMM's left margin does not move it —
-    /// xterm's `ClearLeft` opens at column 0 and Ghostty's EL 1 span is
-    /// `{0, x + 1}` — see the module note on the erase/shift split.
+    /// The span starts at column 0; DECLRMM's left margin does not move it
+    /// (xterm's `ClearLeft` opens at column 0, Ghostty's EL 1 span is
+    /// `{0, x + 1}`; see the module note).
     fn erase_from_start_of_line_core(&mut self, selective: bool) {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
@@ -277,37 +237,33 @@ impl Grid {
 
     /// Erase entire line at cursor.
     ///
-    /// The WHOLE row, margins or not — xterm's `ClearLine` bounds by `MaxCols`;
-    /// see the module note on the erase/shift split. When `selective`, only
-    /// unprotected cells are cleared and extras are preserved. Non-selective
-    /// erase uses the BCE cursor template for fill.
+    /// The whole row, margins or not (xterm's `ClearLine` bounds by `MaxCols`;
+    /// see the module note). When `selective`, only unprotected cells are
+    /// cleared and extras are preserved. Non-selective erase uses the BCE
+    /// cursor template for fill.
     fn erase_line_impl(&mut self, selective: bool) {
         let cursor_row = self.storage.cursor.row;
-        // SELECTION CUSTODY Phase 4 — the INVERSE hole, now closed. EL recorded
-        // NOTHING before, so a `\r` + EL progress bar or spinner rewrote the row
-        // under a live highlight and left it painted: a copy then returned text the
-        // user never selected. One row of damage, the cursor's.
+        // Record selection damage for the cursor row: a `\r` + EL progress bar
+        // rewriting the row must not leave a stale highlight over new text.
         self.damage_selection_visible_rows(cursor_row, cursor_row);
         let fill = self.storage.cursor_template;
         if let Some(row) = self.row_mut(cursor_row) {
             if selective {
                 row.selective_clear();
             } else {
-                // Use erase_with() to preserve DECDWL/DECDHL line attributes (#7497)
-                // while applying BCE background (#7522).
+                // `erase_with()` keeps DECDWL/DECDHL line attributes while
+                // applying the BCE background.
                 //
-                // EL KEEPS THE ATTRIBUTE where ED 2 drops it, and that asymmetry is
-                // xterm's, not an oversight: `do_erase_line` case 2 -> `ClearLine`
-                // -> `ClearInLine` -> `ClearInLine2` never calls `ClearBufRows` and
-                // never writes `DblCS`, and the VT510 EL page carries none of the
-                // "they become single-height, single-width lines" language the ED
-                // page does. A DECDWL row erased by `ESC[2K` is still a DECDWL row.
+                // EL keeps the attribute where ED 2 drops it, as in xterm:
+                // `do_erase_line` case 2 -> `ClearLine` -> `ClearInLine` ->
+                // `ClearInLine2` never calls `ClearBufRows` or writes `DblCS`, and
+                // the VT510 EL page lacks the ED page's single-height language.
                 row.erase_with(fill);
             }
         }
         if !selective {
             self.storage.extras.clear_row(cursor_row);
-            self.fill_bce_rgb_row(cursor_row);
+            self.fill_bce_rgb_range(cursor_row, 0, self.storage.cols);
         }
         self.storage.mark_content_row(cursor_row);
     }
@@ -318,8 +274,8 @@ impl Grid {
     /// Non-selective erase uses the BCE cursor template for fill.
     /// Uses batch `clear_rows()` on extras for O(E) instead of O(R * E).
     ///
-    /// This is xterm's `ClearBufRows`, and it carries that function's line-attribute
-    /// reset: see `erase_screen`'s note for the law and the measurement.
+    /// This is xterm's `ClearBufRows`, including its line-attribute reset (see
+    /// `erase_screen`).
     fn clear_rows(&mut self, range: core::ops::Range<u16>, selective: bool) {
         let fill = self.storage.cursor_template;
         for row in range.clone() {
@@ -327,20 +283,17 @@ impl Grid {
                 if selective {
                     r.selective_clear();
                 } else {
-                    // A COMPLETE row erased by a plain ED comes back single-width
-                    // and single-height. These are exactly the whole rows xterm
-                    // hands to `ClearBufRows` — `ClearBelow` (ED 0) passes
-                    // `cur_row + 1 .. max_row`, `ClearAbove` (ED 1) passes
-                    // `0 .. cur_row - 1` — and `ClearBufRows` states the law in its
-                    // own comment, "clearing the whole row resets the doublesize
-                    // characters", immediately before `SetLineDblCS(ld, CSET_SWL)`.
-                    // `reset_with()` is `erase_with()` with that reset folded into
-                    // the same single pass, BCE fill intact (#7522).
+                    // A complete row erased by a plain ED comes back single-width
+                    // and single-height. These are the whole rows xterm hands to
+                    // `ClearBufRows` (`ClearBelow` for ED 0, `ClearAbove` for ED 1),
+                    // whose comment says "clearing the whole row resets the
+                    // doublesize characters" before `SetLineDblCS(ld, CSET_SWL)`.
+                    // `reset_with()` is `erase_with()` plus that reset, BCE fill
+                    // intact.
                     //
-                    // A DECSED (`selective`) must NOT do it: xterm's
-                    // `protected_mode != OFF_PROTECT` branch of `ClearAbove` /
-                    // `ClearBelow` loops over `ClearInLine` and never reaches
-                    // `ClearBufRows`.
+                    // DECSED (`selective`) must not reset: xterm's protected branch
+                    // of `ClearAbove` / `ClearBelow` loops over `ClearInLine` and
+                    // never reaches `ClearBufRows`.
                     r.reset_with(fill);
                 }
             }
@@ -348,21 +301,19 @@ impl Grid {
         if !selective {
             self.storage.extras.clear_rows(range.clone());
             self.fill_bce_rgb_rows(range);
-            // ED 0 and ED 1 leave the CURSOR row's attribute alone — that row is a
-            // partial erase, and xterm's `ClearRight` / `ClearLeft` never touch
-            // `DblCS` — so the grid-level flag can only be rescanned here, never
-            // assumed false.
+            // ED 0 and ED 1 leave the cursor row's attribute alone (a partial
+            // erase; `ClearRight` / `ClearLeft` never touch `DblCS`), so the
+            // grid-level flag must be rescanned, not assumed false.
             self.resync_any_double_width();
         }
     }
 
     /// Recompute the `any_double_width` fast path from the visible rows.
     ///
-    /// The flag is an optimization, and it is asymmetric: left `true` with no
-    /// double row remaining it only costs the cursor ops a per-row `line_size()`
-    /// lookup, but left `false` while a row IS double it deletes the half-width
-    /// column clamp, which is a correctness bug. So it is only ever lowered by a
-    /// rescan, and a rescan is only worth running when it is currently raised.
+    /// The flag is asymmetric: left `true` with no double row it only costs a
+    /// per-row `line_size()` lookup, but left `false` while a row is double it
+    /// drops the half-width column clamp (a correctness bug). So it is only
+    /// lowered by a rescan, run only when it is raised.
     fn resync_any_double_width(&mut self) {
         if !self.storage.any_double_width {
             return;
@@ -380,15 +331,12 @@ impl Grid {
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     #[inline]
     pub fn erase_to_end_of_line(&mut self) {
-        // xterm path: charproc.c `CASE_EL` -> util.c `do_erase_line` case 0 ->
-        // util.c `ClearRight(xw, -1)`. ClearRight clears from `cur_col` INCLUSIVE,
-        // and while a wrap is pending `cur_col` is the parked last column, so the
-        // parked glyph is erased (a wide glyph parked on its continuation loses its
-        // head too, through `clear_range_with`'s left-boundary fixup). ClearRight
-        // then ends with `ResetWrap` unconditionally ("with the right part cleared,
-        // we can't be wrapping"), even when nothing was cleared. The reset lives
-        // here rather than in a handler so both callers get it: CSI K and VT52
-        // ESC K (VTPrsTbl.c maps VT52 'K' to `CASE_EL`).
+        // xterm: charproc.c `CASE_EL` -> util.c `do_erase_line` case 0 ->
+        // `ClearRight(xw, -1)`, which clears from `cur_col` inclusive (the parked
+        // last column during a pending wrap; a wide glyph parked on its
+        // continuation loses its head via `clear_range_with`'s fixup) and ends
+        // with an unconditional `ResetWrap`. The reset lives here so CSI K and
+        // VT52 ESC K (VTPrsTbl.c maps VT52 'K' to `CASE_EL`) both get it.
         self.erase_to_end_of_line_impl(false);
         self.storage.clear_pending_wrap();
     }
@@ -398,11 +346,10 @@ impl Grid {
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     #[inline]
     pub fn erase_from_start_of_line(&mut self) {
-        // xterm path: charproc.c `CASE_EL` -> util.c `do_erase_line` case 1 ->
-        // util.c `ClearLeft` -> `ClearInLine` over `[0, cur_col]` ->
-        // `ClearInLine2`, which calls `ResetWrap` before painting. The cells already
-        // matched; the deferred wrap now resets as well, so a later glyph
-        // overwrites the last column instead of wrapping.
+        // xterm: charproc.c `CASE_EL` -> util.c `do_erase_line` case 1 ->
+        // `ClearLeft` -> `ClearInLine` over `[0, cur_col]` -> `ClearInLine2`,
+        // which calls `ResetWrap` before painting, so a later glyph overwrites
+        // the last column instead of wrapping.
         self.erase_from_start_of_line_impl(false);
         self.storage.clear_pending_wrap();
     }
@@ -413,10 +360,10 @@ impl Grid {
     #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
     pub fn erase_line(&mut self) {
-        // xterm path: charproc.c `CASE_EL` -> util.c `do_erase_line` case 2 ->
-        // util.c `ClearLine` -> `ClearInLine` over the whole row -> `ClearInLine2`,
-        // which calls `ResetWrap`. The span is the whole row: `ClearLine` bounds
-        // by `MaxCols`, and DECLRMM does not narrow it (module note).
+        // xterm: charproc.c `CASE_EL` -> util.c `do_erase_line` case 2 ->
+        // `ClearLine` -> `ClearInLine` over the whole row -> `ClearInLine2`,
+        // which calls `ResetWrap`. `ClearLine` bounds by `MaxCols`; DECLRMM does
+        // not narrow it (module note).
         self.erase_line_impl(false);
         self.storage.clear_pending_wrap();
     }
@@ -431,41 +378,14 @@ impl Grid {
     #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
     pub fn erase_to_end_of_screen(&mut self) {
-        // xterm path: charproc.c `CASE_ED` -> util.c `do_erase_display` case 0.
-        // Away from the origin that is util.c `ClearBelow`, which starts with
-        // `ClearRight(xw, -1)`: the cursor row is cleared from `cur_col` INCLUSIVE
-        // (the parked glyph of a pending wrap included) and ClearRight ends with
-        // `ResetWrap`. At the origin xterm reduces to `do_erase_display(2)` ->
-        // `ClearScreen`, which also resets; a wrap pending at (0,0) needs a
-        // one-column line, where clearing from (0,0) already IS the whole screen,
-        // so no separate branch is needed. `do_cd_xtra_scroll` cannot change the
-        // wrap (xtermScroll saves and restores `do_wrap`). VT52 ESC J shares this
-        // path (VTPrsTbl.c maps VT52 'J' to `CASE_ED`).
-        // `_core` rather than `_impl`: ED records its own selection damage for
-        // the whole band below, so the single-row mark `_impl` adds would be
-        // redundant. The SPAN is identical — no erase is bounded by DECLRMM.
-        self.erase_to_end_of_line_core(false);
-        let cursor_row = self.storage.cursor.row;
-        let visible_rows = self.storage.visible_rows;
-        self.clear_rows(cursor_row.saturating_add(1)..visible_rows, false);
-        // The blanks below the cursor are genuine now — an in-flight offloaded
-        // reflow must not deficit-fill them from pre-erase history (fixwave5).
-        self.invalidate_pending_fill_target();
-        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
-        // touch history, so a selection anchored in scrollback survives it — the
-        // sentinel used to kill that too.
-        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
-        // column c names the same cell before and after, so nothing a host cached
-        // about grid coordinates went stale (the rule is stated on the parameter
-        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
-        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
-        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
-        // zsh prompt redraw emits. Pinned by
-        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
-        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), false);
-        // cursor row already marked by erase_to_end_of_line_impl; mark remaining rows.
-        self.storage
-            .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
+        // xterm: charproc.c `CASE_ED` -> util.c `do_erase_display` case 0. Away
+        // from the origin that is `ClearBelow`, starting with `ClearRight(xw,
+        // -1)`: the cursor row is cleared from `cur_col` inclusive and the wrap
+        // resets. At the origin xterm reduces to `ClearScreen`, which also
+        // resets; a wrap pending at (0,0) needs a one-column line, where this is
+        // the whole screen anyway. `do_cd_xtra_scroll` cannot change the wrap
+        // (xtermScroll saves and restores `do_wrap`). VT52 ESC J shares this path.
+        self.erase_below_cursor(false);
         self.storage.clear_pending_wrap();
     }
 
@@ -473,49 +393,66 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     pub fn erase_from_start_of_screen(&mut self) {
-        // xterm path: charproc.c `CASE_ED` -> util.c `do_erase_display` case 1.
-        // With the cursor on the bottom-right cell (where a glyph printed into the
-        // last cell parks it) xterm reduces to `do_erase_display(2)` ->
-        // `ClearScreen`, which calls `ResetWrap`; anywhere else util.c `ClearAbove`
-        // clears the rows above and ends with `ClearLeft` -> `ClearInLine` ->
-        // `ClearInLine2`, which calls `ResetWrap`. Both clear the rows above plus
-        // `[0, cursor_col]` of the cursor row, so only the wrap reset is new.
-        let cursor_row = self.storage.cursor.row;
-        self.clear_rows(0..cursor_row, false);
-        // `_core` rather than `_impl`: ED owns the whole-band selection damage
-        // recorded below (see `erase_to_end_of_screen`).
-        self.erase_from_start_of_line_core(false);
-        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
-        // touch history, so a selection anchored in scrollback survives it — the
-        // sentinel used to kill that too.
-        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
-        // column c names the same cell before and after, so nothing a host cached
-        // about grid coordinates went stale (the rule is stated on the parameter
-        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
-        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
-        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
-        // zsh prompt redraw emits. Pinned by
-        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
-        self.damage_selection_visible_rows_ext(0, cursor_row, false);
-        // cursor row already marked by erase_from_start_of_line_impl; mark rows above.
-        self.storage.mark_content_rows(0, cursor_row);
+        // xterm: charproc.c `CASE_ED` -> util.c `do_erase_display` case 1. On the
+        // bottom-right cell xterm reduces to `ClearScreen` (`ResetWrap`);
+        // elsewhere `ClearAbove` clears the rows above and ends with `ClearLeft`
+        // -> `ClearInLine2` (`ResetWrap`). Both clear the rows above plus
+        // `[0, cursor_col]` of the cursor row.
+        self.erase_above_cursor(false);
         self.storage.clear_pending_wrap();
+    }
+
+    /// ED 0 / DECSED 0 without the wrap reset: the cursor row from the cursor
+    /// on, then every row below it.
+    fn erase_below_cursor(&mut self, selective: bool) {
+        // `_core` rather than `_impl`: ED records selection damage for the whole
+        // band below itself. The span is identical; no erase is bounded by
+        // DECLRMM.
+        self.erase_to_end_of_line_core(selective);
+        let cursor_row = self.storage.cursor.row;
+        let visible_rows = self.storage.visible_rows;
+        self.clear_rows(cursor_row.saturating_add(1)..visible_rows, selective);
+        // The blanks below the cursor are genuine now — an in-flight offloaded
+        // reflow must not deficit-fill them from pre-erase history.
+        self.invalidate_pending_fill_target();
+        // An ED/DECSED erases visible rows only, so a selection anchored in
+        // scrollback survives. `moves_coordinates = false`: an erase rewrites
+        // cells in place, so no host-cached grid coordinate goes stale (nor are
+        // the GUI's cursor effects, keyed on `invalidation_epoch`, reset by every
+        // prompt redraw's `ESC[J`). Pinned by
+        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
+        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), false);
+        // cursor row already marked by erase_to_end_of_line_core; mark remaining rows.
+        self.storage
+            .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
+    }
+
+    /// ED 1 / DECSED 1 without the wrap reset: every row above the cursor, then
+    /// the cursor row up to and including the cursor.
+    fn erase_above_cursor(&mut self, selective: bool) {
+        let cursor_row = self.storage.cursor.row;
+        self.clear_rows(0..cursor_row, selective);
+        // `_core` rather than `_impl`: ED owns the whole-band selection damage
+        // recorded below (see `erase_below_cursor`, which also explains
+        // `moves_coordinates = false`).
+        self.erase_from_start_of_line_core(selective);
+        self.damage_selection_visible_rows_ext(0, cursor_row, false);
+        // cursor row already marked by erase_from_start_of_line_core; mark rows above.
+        self.storage.mark_content_rows(0, cursor_row);
     }
 
     /// Erase entire screen.
     ///
     /// Uses the BCE cursor template for fill, so erased cells inherit the
-    /// current SGR background color per VT420/xterm spec (#7522).
+    /// current SGR background color per VT420/xterm.
     /// Resets display_offset to 0 so the viewport snaps to the live terminal.
     pub fn erase_screen(&mut self) {
-        // xterm path: charproc.c `CASE_ED` -> util.c `do_erase_display` case 2
-        // (DEC protection is lowered for plain ED) -> util.c `ClearScreen`, which
-        // calls `ResetWrap` unconditionally. Every caller inherits the reset, as in
-        // xterm where each of them runs `ClearScreen`: CSI 2 J; the 1047 exit
-        // (charproc.c `srm_OPT_ALTBUF` reset clears before `FromAlternate`, so the
-        // main screen comes back with no pending wrap); the 1049 enter
-        // (`CursorSave; ToAlternate; ClearScreen`); DECCOLM and RIS, which home the
-        // cursor afterwards anyway.
+        // xterm: charproc.c `CASE_ED` -> util.c `do_erase_display` case 2 (DEC
+        // protection lowered for plain ED) -> `ClearScreen`, which calls
+        // `ResetWrap` unconditionally. Every caller inherits the reset, as each
+        // runs `ClearScreen` in xterm: CSI 2 J; the 1047 exit (main screen comes
+        // back with no pending wrap); the 1049 enter (`CursorSave; ToAlternate;
+        // ClearScreen`); DECCOLM and RIS.
         self.storage.clear_pending_wrap();
         // Snap viewport to live terminal — ED 2 should show the freshly
         // erased screen, not stale scrollback position.
@@ -523,55 +460,33 @@ impl Grid {
         let fill = self.storage.cursor_template;
         for row in 0..self.storage.visible_rows {
             if let Some(r) = self.row_mut(row) {
-                // ED 2 ERASES COMPLETE LINES, so every row comes back
-                // single-width and single-height. VT510 Programmer Information,
-                // Erase in Display: "When you erase complete lines, they become
-                // single-height, single-width lines, with all visual character
-                // attributes cleared." xterm does it in `ClearBufRows`, which
-                // `ClearScreen` calls unconditionally over `0 .. max_row`:
-                // "clearing the whole row resets the doublesize characters",
-                // then `SetLineDblCS(ld, CSET_SWL)`.
+                // ED 2 erases complete lines, so every row comes back
+                // single-width and single-height. VT510 Erase in Display: "When
+                // you erase complete lines, they become single-height,
+                // single-width lines, with all visual character attributes
+                // cleared." xterm's `ClearScreen` -> `ClearBufRows` does
+                // `SetLineDblCS(ld, CSET_SWL)`. Otherwise a stray `ESC#6` would
+                // leave a row that only RIS or `ESC#5` could restore.
+                // `reset_with()` is `erase_with()` plus that reset, BCE fill
+                // intact.
                 //
-                // This used to call `erase_with()`, which keeps the DECDWL/DECDHL
-                // bits (#7497). Measured on glass at 40x200, cell 9x17: a bare
-                // `ESC#6` anywhere on row 0, then `ESC[2J ESC[H`, then the same
-                // ten characters, drew 180 inked device columns where the
-                // un-poisoned row drew 90 — byte-identical grid text at exactly
-                // 2x, with half the row's 200 columns no longer reachable. No
-                // erase, no `clear`, no DECSTR and no resize recovered it; only
-                // RIS or an explicit `ESC#5` did. `reset_with()` is `erase_with()`
-                // with the attribute reset folded into the same single pass, BCE
-                // fill intact (#7522).
-                //
-                // A PARTIAL erase still keeps the attribute — EL, ECH, DECERA and
-                // the ED cursor row all match xterm, whose `ClearInLine` /
-                // `ClearRight` / `ClearLeft` never touch `DblCS` — and so does a
-                // DECSED, whose protected branch never reaches `ClearBufRows`.
+                // Partial erases keep the attribute (EL, ECH, DECERA and the ED
+                // cursor row, as xterm's `ClearInLine` / `ClearRight` /
+                // `ClearLeft` never touch `DblCS`), and so does DECSED.
                 r.reset_with(fill);
             }
         }
         self.storage.extras.clear();
         self.fill_bce_rgb_rows(0..self.storage.visible_rows);
-        // Per-row HAS_STYLE_ID flags are cleared implicitly by `reset_with`
-        // above, which resets row flags to DIRTY alone (#7872).
-        // Every visible row is single-width again, so the grid-level fast-path
-        // flag goes with them; no rescan is needed when the loop covered them all.
+        // `reset_with` above also reset each row's HAS_STYLE_ID flag. Every
+        // visible row is single-width again, so the grid-level flag drops
+        // without a rescan.
         self.storage.any_double_width = false;
-        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
-        // touch history, so a selection anchored in scrollback survives it — the
-        // sentinel used to kill that too.
-        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
-        // column c names the same cell before and after, so nothing a host cached
-        // about grid coordinates went stale (the rule is stated on the parameter
-        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
-        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
-        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
-        // zsh prompt redraw emits. Pinned by
-        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
+        // Visible rows only, `moves_coordinates = false`: see `erase_below_cursor`.
         let last = self.storage.visible_rows.saturating_sub(1);
         self.damage_selection_visible_rows_ext(0, last, false);
         // ED 2's blanks are genuine — an in-flight offloaded reflow must not
-        // deficit-fill the cleared screen from pre-erase history (fixwave5).
+        // deficit-fill the cleared screen from pre-erase history.
         self.invalidate_pending_fill_target();
         self.storage.mark_content_full();
     }
@@ -579,11 +494,9 @@ impl Grid {
     /// Clear all DEC line attributes (DECDWL/DECDHL) on every visible row.
     ///
     /// Used by RIS and DECCOLM toggle, which owe the reset by their own spec
-    /// text rather than by borrowing it from whatever erase they route through.
-    /// ED 2 now resets the rows it erases (see `erase_screen`), so for a caller
-    /// that has just run one this is a no-op that costs a 40-row scan; it stays
-    /// because a PARTIAL erase still preserves the attributes (#7497) and a
-    /// full reset must not depend on which erase it happened to call.
+    /// text. ED 2 already resets the rows it erases, but a full reset must not
+    /// depend on which erase a caller happened to route through, since partial
+    /// erases preserve the attributes.
     pub fn clear_line_attributes(&mut self) {
         for row_idx in 0..self.storage.visible_rows {
             if let Some(r) = self.row_mut(row_idx) {
@@ -602,10 +515,10 @@ impl Grid {
     /// ENSURES: self.storage.display_offset == 0
     /// ENSURES: self.storage.total_lines == self.storage.visible_rows as usize
     pub fn erase_scrollback(&mut self) {
-        // Bump UNCONDITIONALLY (even when the store is currently detached for an
-        // off-thread reflow, where the clears below are no-ops): an in-flight
-        // reflow captured the pre-erase generation and will drop its stale store
-        // on re-attach rather than resurrecting history the user erased (audit bug C).
+        // Bump unconditionally, even while the store is detached for an
+        // off-thread reflow: the in-flight reflow captured the pre-erase
+        // generation and drops its stale store on re-attach instead of
+        // resurrecting erased history.
         self.storage.scrollback_clear_gen = self.storage.scrollback_clear_gen.wrapping_add(1);
         let scrollback = self
             .storage
@@ -622,12 +535,10 @@ impl Grid {
             self.storage.ring_extras.clear();
             self.storage.display_offset = 0;
             self.storage.mark_content_full();
-            // SELECTION CUSTODY Phase 4: ED 3 discards history wholesale, so no
-            // band can describe it and `All` is the honest answer. It does NOT
-            // move a live coordinate — the visible rows are preserved in place
-            // and `absolute_row_counter` never moves — so it must not bump
-            // `invalidation_epoch` (2026-09-10, the `clear` command's residual;
-            // see `discard_history_selection` and
+            // ED 3 discards history wholesale, so the selection damage is `All`.
+            // Visible rows stay in place and `absolute_row_counter` does not
+            // move, so `invalidation_epoch` is not bumped (see
+            // `discard_history_selection` and
             // `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`).
             self.discard_history_selection();
             // ED 3 touches only scrollback, not the active line, so the deferred
@@ -671,9 +582,8 @@ impl Grid {
         // Note: extras are keyed by visible row, so we don't need to clear them here
         // as scrollback rows don't have extras (they're saved as Line objects)
         self.storage.mark_content_full();
-        // SELECTION CUSTODY Phase 4: as above — ED 3 discards history wholesale, so
-        // the damage is `All`, not a band. And as above, evicting history moves no
-        // live coordinate: see `discard_history_selection`.
+        // As above: ED 3 discards history wholesale (damage `All`) and moves no
+        // live coordinate; see `discard_history_selection`.
         self.discard_history_selection();
         // ED 3 touches only scrollback, not the active line, so the deferred
         // wrap survives: xterm util.c `do_erase_display` case 3 only drops the
@@ -707,12 +617,11 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     pub fn selective_erase_from_start_of_line(&mut self) {
-        // xterm path: charproc.c `CASE_DECSEL` -> util.c `do_erase_line` case 1
-        // with DEC_PROTECT -> util.c `ClearLeft` -> `ClearInLine` over
-        // `[0, cur_col]` -> `ClearInLine2`, which resets the wrap only if that span
-        // holds an unprotected cell (see `reset_wrap_unless_span_protected`). The
-        // cleared span and the wrap-reset span are now the same one: both ignore
-        // DECLRMM, as xterm's do.
+        // xterm: charproc.c `CASE_DECSEL` -> util.c `do_erase_line` case 1 with
+        // DEC_PROTECT -> `ClearLeft` -> `ClearInLine` over `[0, cur_col]` ->
+        // `ClearInLine2`, which resets the wrap only if the span holds an
+        // unprotected cell (see `reset_wrap_unless_span_protected`). Cleared
+        // span and wrap-reset span are the same and ignore DECLRMM.
         self.erase_from_start_of_line_impl(true);
         let cursor_row = self.storage.cursor.row;
         let span_end = self.storage.cursor.col.saturating_add(1);
@@ -748,31 +657,9 @@ impl Grid {
         // `do_erase_display(2, DEC_PROTECT)`, the per-row `ClearInLine` loop, which
         // resets only if some visible cell is unprotected.
         let at_origin = self.storage.cursor.row == 0 && self.storage.cursor.col == 0;
-        // `_core`: DECSED owns the whole-band damage recorded below.
-        self.erase_to_end_of_line_core(true);
-        let cursor_row = self.storage.cursor.row;
-        let visible_rows = self.storage.visible_rows;
-        self.clear_rows(cursor_row.saturating_add(1)..visible_rows, true);
-        // Same debt invalidation as ED 0: the band below the cursor is a
-        // genuine erase now, not reflow padding (fixwave5).
-        self.invalidate_pending_fill_target();
-        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
-        // touch history, so a selection anchored in scrollback survives it — the
-        // sentinel used to kill that too.
-        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
-        // column c names the same cell before and after, so nothing a host cached
-        // about grid coordinates went stale (the rule is stated on the parameter
-        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
-        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
-        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
-        // zsh prompt redraw emits. Pinned by
-        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
-        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), false);
-        // cursor row already marked by erase_to_end_of_line_impl; mark remaining rows.
-        self.storage
-            .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
+        self.erase_below_cursor(true);
         if at_origin {
-            self.reset_wrap_unless_span_protected(0..visible_rows, None);
+            self.reset_wrap_unless_span_protected(0..self.storage.visible_rows, None);
         } else {
             self.storage.clear_pending_wrap();
         }
@@ -794,23 +681,7 @@ impl Grid {
         // of the cursor row.
         let cursor_row = self.storage.cursor.row;
         let span_end = self.storage.cursor.col.saturating_add(1);
-        self.clear_rows(0..cursor_row, true);
-        // `_core`: DECSED owns the whole-band damage recorded below.
-        self.erase_from_start_of_line_core(true);
-        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
-        // touch history, so a selection anchored in scrollback survives it — the
-        // sentinel used to kill that too.
-        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
-        // column c names the same cell before and after, so nothing a host cached
-        // about grid coordinates went stale (the rule is stated on the parameter
-        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
-        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
-        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
-        // zsh prompt redraw emits. Pinned by
-        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
-        self.damage_selection_visible_rows_ext(0, cursor_row, false);
-        // cursor row already marked by erase_from_start_of_line_impl; mark rows above.
-        self.storage.mark_content_rows(0, cursor_row);
+        self.erase_above_cursor(true);
         self.reset_wrap_unless_span_protected(0..cursor_row, Some((cursor_row, span_end)));
     }
 
@@ -827,19 +698,9 @@ impl Grid {
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(0..self.storage.visible_rows, true);
         // Same debt invalidation as ED 2: the cleared screen's blanks are
-        // genuine, never deficit-fill them from pre-erase history (fixwave5).
+        // genuine, never deficit-fill them from pre-erase history.
         self.invalidate_pending_fill_target();
-        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
-        // touch history, so a selection anchored in scrollback survives it — the
-        // sentinel used to kill that too.
-        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
-        // column c names the same cell before and after, so nothing a host cached
-        // about grid coordinates went stale (the rule is stated on the parameter
-        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
-        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
-        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
-        // zsh prompt redraw emits. Pinned by
-        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
+        // Visible rows only, `moves_coordinates = false`: see `erase_below_cursor`.
         let last = self.storage.visible_rows.saturating_sub(1);
         self.damage_selection_visible_rows_ext(0, last, false);
         self.storage.mark_content_full();
@@ -849,15 +710,12 @@ impl Grid {
     /// Reset the deferred wrap the way xterm's protected erase does: only when
     /// some cell of the erase's span is unprotected.
     ///
-    /// xterm path: util.c `ClearInLine2`, protected branch. Each unprotected run
-    /// is cleared by a recursive `ClearInLine` that reaches `ResetWrap`, and a
-    /// span whose cells are all protected returns before `ResetWrap`. The span
-    /// is every column of `full_rows` plus, when given, columns `[0, end)` of
-    /// row `partial.0`. Columns run to the full width and ignore DECLRMM, like
-    /// xterm's `ClearLeft` / `ClearLine` / `ClearScreen` spans — and like the
-    /// cell clear itself now does. A selective clear
-    /// never changes a protection flag, so asking after the clear gives the same
-    /// answer as asking before it.
+    /// xterm: util.c `ClearInLine2`, protected branch. Each unprotected run is
+    /// cleared by a recursive `ClearInLine` that reaches `ResetWrap`; a fully
+    /// protected span returns first. The span is every column of `full_rows`
+    /// plus, when given, columns `[0, end)` of row `partial.0`, at full width
+    /// ignoring DECLRMM like xterm's spans and the cell clear. A selective clear
+    /// never changes protection, so asking after the clear is equivalent.
     fn reset_wrap_unless_span_protected(
         &mut self,
         full_rows: core::ops::Range<u16>,
@@ -883,10 +741,7 @@ impl Grid {
         }
     }
 
-    /// Fill screen with 'E' for alignment test (DECALN - ESC # 8).
-    ///
-    /// This is used to test screen alignment by filling the entire screen
-    /// with the character 'E'. It also resets scroll margins to full screen.
+    /// DECALN (`ESC # 8`): fill the screen with 'E' and reset all margins.
     ///
     /// ENSURES: self.storage.cursor.row == 0
     /// ENSURES: self.storage.cursor.col == 0
@@ -900,10 +755,8 @@ impl Grid {
 
         let cols = self.storage.cols;
 
-        // Fill all visible cells with 'E' using default attributes.
-        // clear() resets each cell to Cell::EMPTY (space, default colors, no flags),
-        // then write_char sets the character to 'E'. This ensures stale colors/flags
-        // from previous content are not preserved.
+        // clear() resets each cell to Cell::EMPTY (dropping stale colors/flags),
+        // then write_char sets 'E'.
         for row in 0..self.storage.visible_rows {
             if let Some(r) = self.row_mut(row) {
                 r.clear();
@@ -913,26 +766,19 @@ impl Grid {
             }
         }
 
-        // Clear overflow extras (RGB colors, hyperlinks, complex chars).
-        // Without this, stale CellExtra entries from pre-DECALN content persist
-        // as orphaned HashMap entries, leaking memory and risking stale data
-        // if the same coordinates later need new extras.
+        // Clear overflow extras (RGB colors, hyperlinks, complex chars), which
+        // would otherwise persist as orphaned entries.
         self.storage.extras.clear();
 
-        // Clear the any_double_width optimization flag — r.clear() above reset
-        // each row's LINE_ATTRIBUTES to single-width, so the grid-level flag
-        // must also be cleared. Without this, cursor ops unnecessarily check
-        // for double-width column clamping on every movement.
+        // r.clear() above reset each row to single-width, so the grid-level flag
+        // drops too.
         self.storage.any_double_width = false;
 
-        // Move cursor to home position
         self.storage.cursor = Cursor::default();
 
-        // SELECTION CUSTODY Phase 4: DECALN replaces every VISIBLE cell; history is
-        // untouched, so a scrollback selection survives.
-        // `moves_coordinates = false` for the same reason the ED family carries
-        // it: replacing every cell's CONTENT moves no row, so no host coordinate
-        // cache went stale.
+        // DECALN replaces every visible cell; history is untouched, so a
+        // scrollback selection survives. `moves_coordinates = false`: no row
+        // moves.
         let last = self.storage.visible_rows.saturating_sub(1);
         self.damage_selection_visible_rows_ext(0, last, false);
         self.storage.mark_content_full();
@@ -950,7 +796,7 @@ impl Grid {
     /// Erases all cells in the rectangular area defined by top-left (top, left)
     /// and bottom-right (bottom, right) coordinates. All coordinates are 0-indexed.
     ///
-    /// Cells are cleared to spaces with default attributes.
+    /// Cells become the BCE blank (the cursor template).
     /// Does not affect cursor position.
     ///
     /// REQUIRES: self.storage.visible_rows > 0
@@ -959,55 +805,29 @@ impl Grid {
         // The deferred wrap survives: xterm charproc.c `CASE_DECERA` -> screen.c
         // `ScrnFillRectangle`, and screen.c never calls `ResetWrap` or writes
         // `do_wrap`.
-        // Clamp to visible area
-        let top = top.min(self.storage.visible_rows.saturating_sub(1));
-        let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
-        let left = left.min(self.storage.cols.saturating_sub(1));
-        let right = right.min(self.storage.cols.saturating_sub(1));
-
-        // Validate rectangle
-        if top > bottom || left > right {
-            return;
-        }
-
-        // SELECTION CUSTODY Phase 4 — the rest of the INVERSE hole. DECERA / DECFRA /
-        // DECSERA replace cells in place and recorded NOTHING before, so a highlight
-        // over the rectangle survived as a lie: a copy returned text the user never
-        // selected. Row-granular, so the band is the rect's rows — wider than the
-        // rectangle in the column direction, which fails SAFE.
-        self.damage_selection_visible_rows(top, bottom);
-
-        let end_col = right.saturating_add(1);
-        let fill = self.storage.cursor_template;
-
-        // Erase each row in the rectangle with BCE fill (#7522).
-        for row_idx in top..=bottom {
-            if let Some(row) = self.row_mut(row_idx) {
-                row.clear_range_with(left, end_col, fill);
-            }
-            self.storage.mark_content_row(row_idx);
-        }
-        self.storage
-            .extras
-            .clear_rect(top..bottom.saturating_add(1), left..end_col);
-        self.fill_bce_rgb_rect(top..bottom.saturating_add(1), left..end_col);
+        // DECERA is DECFRA with the BCE blank: the cursor template, plus its
+        // truecolor background when that lives in the ring.
+        self.fill_rect(
+            self.storage.cursor_template,
+            top,
+            left,
+            bottom,
+            right,
+            None,
+            self.storage.cursor_template_bg_rgb,
+        );
     }
 
     /// Fill rectangular area with a cell template (DECFRA - VT420+).
     ///
-    /// Fills all cells in the rectangular area defined by top-left (top, left)
-    /// and bottom-right (bottom, right) coordinates with the given cell template.
-    /// The template carries both the fill character and current SGR attributes
-    /// (colors + flags), per VT420 spec. All coordinates are 0-indexed.
-    ///
+    /// Fills the rectangle (top, left)-(bottom, right) (0-indexed) with `fill`,
+    /// which carries the character and current SGR attributes, per VT420.
     /// Does not affect cursor position.
     ///
-    /// `fg_rgb`/`bg_rgb` carry the resolved truecolor bytes when the `fill`
-    /// cell's colors are RGB. Truecolor is stored out-of-line (the cell only
-    /// holds the RGB *marker*), so they are written back into the dense RGB
-    /// ring after the rect's stale ring entries are cleared — mirroring the
-    /// DECERA/BCE repopulation. Both `None` for indexed/default fills (those
-    /// colors are inline in the cell), leaving that path byte-identical.
+    /// `fg_rgb`/`bg_rgb` carry resolved truecolor bytes when `fill`'s colors are
+    /// RGB (the cell holds only the RGB marker); they are written back into the
+    /// dense RGB ring after the rect's stale entries are cleared. Both `None`
+    /// for indexed/default fills.
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// REQUIRES: self.storage.cols > 0
@@ -1029,22 +849,18 @@ impl Grid {
         // The deferred wrap survives: xterm charproc.c `CASE_DECFRA` -> screen.c
         // `ScrnFillRectangle`, and screen.c never calls `ResetWrap` or writes
         // `do_wrap`.
-        // Clamp to visible area
         let top = top.min(self.storage.visible_rows.saturating_sub(1));
         let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
         let left = left.min(self.storage.cols.saturating_sub(1));
         let right = right.min(self.storage.cols.saturating_sub(1));
 
-        // Validate rectangle
         if top > bottom || left > right {
             return;
         }
 
-        // SELECTION CUSTODY Phase 4 — the rest of the INVERSE hole. DECERA / DECFRA /
-        // DECSERA replace cells in place and recorded NOTHING before, so a highlight
-        // over the rectangle survived as a lie: a copy returned text the user never
-        // selected. Row-granular, so the band is the rect's rows — wider than the
-        // rectangle in the column direction, which fails SAFE.
+        // DECERA / DECFRA / DECSERA replace cells in place, so a highlight over
+        // the rectangle is damaged. Row-granular: the band is the rect's rows,
+        // wider than the rectangle, which is the safe direction.
         self.damage_selection_visible_rows(top, bottom);
 
         let end_col = right.saturating_add(1);
@@ -1061,10 +877,8 @@ impl Grid {
             .extras
             .clear_rect(top..bottom.saturating_add(1), left..end_col);
 
-        // The cell carries only RGB markers; clear_rect just wiped the actual
-        // bytes from the ring. Repopulate it so fg_rgb_at()/bg_rgb_at() and the
-        // renderer resolve the intended truecolor (DECFRA). No-op when both are
-        // None; set_rgb_ring_range ignores a None axis, so fg/bg are independent.
+        // The cell carries only RGB markers and clear_rect wiped the ring, so
+        // repopulate it. set_rgb_ring_range ignores a None axis.
         if fg_rgb.is_some() || bg_rgb.is_some() {
             let visible_rows = self.storage.visible_rows;
             let cols = self.storage.cols;
@@ -1101,39 +915,31 @@ impl Grid {
         // The deferred wrap survives: xterm charproc.c `CASE_DECSERA` -> screen.c
         // `ScrnWipeRectangle`, and screen.c never calls `ResetWrap` or writes
         // `do_wrap`.
-        // Clamp to visible area
         let top = top.min(self.storage.visible_rows.saturating_sub(1));
         let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
         let left = left.min(self.storage.cols.saturating_sub(1));
         let right = right.min(self.storage.cols.saturating_sub(1));
 
-        // Validate rectangle
         if top > bottom || left > right {
             return;
         }
 
-        // SELECTION CUSTODY Phase 4 — the rest of the INVERSE hole. DECERA / DECFRA /
-        // DECSERA replace cells in place and recorded NOTHING before, so a highlight
-        // over the rectangle survived as a lie: a copy returned text the user never
-        // selected. Row-granular, so the band is the rect's rows — wider than the
-        // rectangle in the column direction, which fails SAFE.
+        // DECERA / DECFRA / DECSERA replace cells in place, so a highlight over
+        // the rectangle is damaged. Row-granular: the band is the rect's rows,
+        // wider than the rectangle, which is the safe direction.
         self.damage_selection_visible_rows(top, bottom);
 
         let end_col = right.saturating_add(1);
 
-        // Selectively erase each row in the rectangle, preserving the SGR
-        // visual attributes of the wiped positions (VT520 DECSERA).
+        // Selectively erase each row, keeping the SGR attributes of wiped
+        // positions (VT520 DECSERA).
         //
-        // `set_char` turns each unprotected cell into a space but deliberately
-        // keeps HAS_EXTRAS and the cell's CellExtra so out-of-line SGR colors
-        // (truecolor/underline-color) survive. That also preserves any
-        // combining marks / orphaned complex-char string on the cell, which
-        // would otherwise leak a stray accent into the wiped space across
-        // copy/selection/search and render. For exactly the cells wiped
-        // (protected cells are skipped and never collected), scrub those
-        // character-bearing extra fields, dropping the entry and clearing
-        // HAS_EXTRAS when nothing color-bearing remains. Note: extras are NOT
-        // bulk-cleared here — protected cells' extras must be preserved.
+        // `set_char` turns an unprotected cell into a space but keeps HAS_EXTRAS
+        // and the CellExtra so out-of-line SGR colors survive; that would also
+        // keep combining marks / complex-char strings, leaking a stray accent.
+        // For exactly the wiped cells, scrub those character fields, dropping
+        // the entry and HAS_EXTRAS when nothing color-bearing remains. Extras are
+        // not bulk-cleared: protected cells keep theirs.
         let scrub_extras = !self.storage.extras.is_empty();
         let mut wiped_cols: Vec<u16> = Vec::new();
         for row_idx in top..=bottom {
@@ -1154,83 +960,33 @@ impl Grid {
         }
     }
 
-    /// Rewrite the attribute flags of every cell in a rectangle through `edit`.
+    /// Rewrite the attribute flags of every cell in a rectangle, or with
+    /// `stream` (DECSACE stream mode) a character stream, through `edit`.
     ///
-    /// The one place a rectangular attribute op walks its cells, so the DECCARA
-    /// (set/clear) and DECRARA (reverse) entry points below cannot drift apart
-    /// on the clamping, the empty-rectangle guard, the `len` maintenance these
-    /// `get_mut` flag writes bypass, or the damage marking — the last two of
-    /// which no screen-text assertion would catch.
+    /// The single walk behind DECCARA and DECRARA: clamping, the empty-rect
+    /// guard, `len` maintenance (the `get_mut` writes bypass it) and damage
+    /// marking. Stream extent: the first row starts at `left`, middle rows span
+    /// the full width, and the last row ends at `right`.
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// REQUIRES: self.storage.cols > 0
-    fn edit_attrs_rect(
+    fn edit_attrs(
         &mut self,
         top: u16,
         left: u16,
         bottom: u16,
         right: u16,
+        stream: bool,
         edit: impl Fn(super::CellFlags) -> super::CellFlags,
     ) {
         // Attribute changes don't move the cursor — deferred wrap survives (xterm).
-        // Clamp to visible area
         let top = top.min(self.storage.visible_rows.saturating_sub(1));
         let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
         let left = left.min(self.storage.cols.saturating_sub(1));
         let right = right.min(self.storage.cols.saturating_sub(1));
 
-        // Validate rectangle
-        if top > bottom || left > right {
-            return;
-        }
-
-        let end_col = right.saturating_add(1);
-
-        for row_idx in top..=bottom {
-            if let Some(row) = self.row_mut(row_idx) {
-                for col in left..end_col {
-                    if let Some(cell) = row.get_mut(col) {
-                        let flags = edit(cell.flags());
-                        cell.set_flags(flags);
-                    }
-                }
-                // These get_mut flag writes bypass len maintenance. Setting an
-                // attribute flag on a blank cell makes it non-empty (is_empty
-                // requires flags==0), so len must grow to include a styled tail;
-                // clearing the last flag can empty the tail, so len must shrink.
-                // recompute_len corrects both directions and never over-shrinks
-                // (#7522 — DECCARA/DECRARA attribute-rect ops).
-                row.recompute_len();
-            }
-            self.storage.mark_content_row(row_idx);
-        }
-    }
-
-    /// Rewrite the attribute flags of every cell in a character stream through
-    /// `edit` (DECSACE stream mode).
-    ///
-    /// Stream sibling of [`Self::edit_attrs_rect`], and the one place the stream
-    /// extent rule lives: the first row starts at `left`, middle rows span the
-    /// full width (0..cols-1), and the last row ends at `right`.
-    ///
-    /// REQUIRES: self.storage.visible_rows > 0
-    /// REQUIRES: self.storage.cols > 0
-    fn edit_attrs_stream(
-        &mut self,
-        top: u16,
-        left: u16,
-        bottom: u16,
-        right: u16,
-        edit: impl Fn(super::CellFlags) -> super::CellFlags,
-    ) {
-        // Attribute changes don't move the cursor — deferred wrap survives (xterm).
-        // Clamp to visible area
-        let top = top.min(self.storage.visible_rows.saturating_sub(1));
-        let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
-        let left = left.min(self.storage.cols.saturating_sub(1));
-        let right = right.min(self.storage.cols.saturating_sub(1));
-
-        if top > bottom {
+        // A stream's `left > right` is legal across rows.
+        if top > bottom || (!stream && left > right) {
             return;
         }
 
@@ -1238,9 +994,14 @@ impl Grid {
 
         for row_idx in top..=bottom {
             // Stream extent: first row starts at `left`, last row ends at
-            // `right`, middle rows span 0..max_col.
-            let start = if row_idx == top { left } else { 0 };
-            let end = if row_idx == bottom { right } else { max_col };
+            // `right`, middle rows span 0..max_col. A rect is `[left, right]`
+            // on every row.
+            let start = if stream && row_idx != top { 0 } else { left };
+            let end = if stream && row_idx != bottom {
+                max_col
+            } else {
+                right
+            };
 
             if start > end {
                 continue;
@@ -1253,9 +1014,10 @@ impl Grid {
                         cell.set_flags(flags);
                     }
                 }
-                // Same len maintenance as edit_attrs_rect: get_mut flag writes
-                // can make the tail non-empty (attr set) or empty (attr cleared),
-                // which len must reflect (#7522 — DECCARA/DECRARA stream mode).
+                // `get_mut` flag writes bypass len maintenance: setting a flag on
+                // a blank cell makes it non-empty (len must grow), clearing the
+                // last flag can empty the tail (len must shrink). recompute_len
+                // handles both and never over-shrinks.
                 row.recompute_len();
             }
             self.storage.mark_content_row(row_idx);
@@ -1265,24 +1027,19 @@ impl Grid {
     /// Reverse one cell's attribute flags for DECRARA.
     ///
     /// `toggle` holds only single-bit attributes (bold, blink, inverse, hidden),
-    /// which reverse by XOR. Underline is deliberately NOT among them: the style
-    /// is a three-bit family (`UNDERLINE`, `DOUBLE_UNDERLINE`, `CURLY_UNDERLINE`,
-    /// whose combinations also spell dotted and dashed), so XOR-ing the
-    /// `UNDERLINE` bit alone would silently turn a curly underline into a dotted
-    /// one — a style the application never named. "Reverse mode 4" therefore
-    /// means any-underline → none and none → single, the only reading that stays
-    /// inside the set of styles the SGR 4 that DECRARA names can itself produce.
+    /// which reverse by XOR. Underline is a three-bit family (`UNDERLINE`,
+    /// `DOUBLE_UNDERLINE`, `CURLY_UNDERLINE`, also spelling dotted and dashed),
+    /// so XOR-ing `UNDERLINE` alone could turn curly into dotted. Reverse mode 4
+    /// therefore maps any underline to none and none to single.
     #[inline]
     fn reverse_cell_attrs(
         flags: super::CellFlags,
         toggle: super::CellFlags,
         toggle_underline: bool,
     ) -> super::CellFlags {
-        // Every bit any underline style can occupy. Spelled out here rather than
-        // reached for as `CellFlags::ALL_UNDERLINES`, which exists only under the
-        // `alacritty-compat` feature: this module compiles without it (aterm-grid's
-        // own test build), so naming the alias would make the crate's tests fail to
-        // build while its dependents kept compiling.
+        // Every bit any underline style can occupy, spelled out because
+        // `CellFlags::ALL_UNDERLINES` exists only under the `alacritty-compat`
+        // feature, which this crate's own test build lacks.
         const UNDERLINE_BITS: super::CellFlags = super::CellFlags::from_bits(
             super::CellFlags::UNDERLINE.bits()
                 | super::CellFlags::DOUBLE_UNDERLINE.bits()
@@ -1302,23 +1059,15 @@ impl Grid {
 
     /// Change attributes in rectangular area (DECCARA - VT420+).
     ///
-    /// Applies SGR attribute flags to all cells in the rectangular area defined
-    /// by top-left (top, left) and bottom-right (bottom, right) coordinates.
-    /// All coordinates are 0-indexed.
-    ///
-    /// `flags_to_set` are ORed into each cell's flags.
-    /// `flags_to_clear` are ANDed out of each cell's flags.
+    /// Applies SGR attribute flags to the rectangle (top, left)-(bottom, right),
+    /// 0-indexed: `flags_to_set` are ORed in, `flags_to_clear` ANDed out.
     /// Does not affect cursor position.
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// REQUIRES: self.storage.cols > 0
-    /// SELECTION CUSTODY Phase 4 — deliberately records NO selection damage.
     ///
-    /// DECCARA changes ATTRIBUTES (bold, underline, reverse) over a rectangle; the
-    /// characters are untouched. A selection over those cells still names exactly the
-    /// text it named before, and a copy returns the same string — so clearing the
-    /// highlight would destroy something for a change the user cannot even copy. The
-    /// sibling rect ops above replace CONTENT and do damage.
+    /// Records no selection damage: only attributes change, so a selection
+    /// still names the same text and a copy returns the same string.
     pub fn change_attrs_rect(
         &mut self,
         top: u16,
@@ -1329,7 +1078,7 @@ impl Grid {
         flags_to_clear: super::CellFlags,
     ) {
         // Clear first, then set (so set takes priority)
-        self.edit_attrs_rect(top, left, bottom, right, |flags| {
+        self.edit_attrs(top, left, bottom, right, false, |flags| {
             flags.difference(flags_to_clear).union(flags_to_set)
         });
     }
@@ -1350,27 +1099,24 @@ impl Grid {
         flags_to_set: super::CellFlags,
         flags_to_clear: super::CellFlags,
     ) {
-        self.edit_attrs_stream(top, left, bottom, right, |flags| {
+        self.edit_attrs(top, left, bottom, right, true, |flags| {
             flags.difference(flags_to_clear).union(flags_to_set)
         });
     }
 
     /// Reverse attributes in rectangular area (DECRARA - VT400+).
     ///
-    /// Sibling of [`Self::change_attrs_rect`] over the same rectangle: each named
-    /// attribute is REVERSED per cell rather than set or cleared uniformly, so
-    /// the result depends on what each cell already carried (xterm ctlseqs,
-    /// `CSI Pt ; Pl ; Pb ; Pr ; Pm $ t`: "Pm denotes the attributes to reverse").
+    /// Like [`Self::change_attrs_rect`], but each named attribute is reversed
+    /// per cell (xterm ctlseqs, `CSI Pt ; Pl ; Pb ; Pr ; Pm $ t`: "Pm denotes
+    /// the attributes to reverse").
     ///
     /// `toggle` is XOR-ed into each cell's flags; `toggle_underline` reverses the
-    /// underline family as a whole — see [`Self::reverse_cell_attrs`].
+    /// underline family as a whole; see [`Self::reverse_cell_attrs`].
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// REQUIRES: self.storage.cols > 0
-    /// SELECTION CUSTODY Phase 4 — records NO selection damage, for the reason
-    /// spelled out on [`Self::change_attrs_rect`]: the characters are untouched,
-    /// so a selection over these cells still names exactly the text it named
-    /// before.
+    ///
+    /// Records no selection damage, as for [`Self::change_attrs_rect`].
     pub fn reverse_attrs_rect(
         &mut self,
         top: u16,
@@ -1380,7 +1126,7 @@ impl Grid {
         toggle: super::CellFlags,
         toggle_underline: bool,
     ) {
-        self.edit_attrs_rect(top, left, bottom, right, |flags| {
+        self.edit_attrs(top, left, bottom, right, false, |flags| {
             Self::reverse_cell_attrs(flags, toggle, toggle_underline)
         });
     }
@@ -1400,7 +1146,7 @@ impl Grid {
         toggle: super::CellFlags,
         toggle_underline: bool,
     ) {
-        self.edit_attrs_stream(top, left, bottom, right, |flags| {
+        self.edit_attrs(top, left, bottom, right, true, |flags| {
             Self::reverse_cell_attrs(flags, toggle, toggle_underline)
         });
     }
@@ -1426,7 +1172,6 @@ impl Grid {
         dst_left: u16,
     ) {
         // DECCRA copies cells without moving the cursor — deferred wrap survives.
-        // Clamp source to visible area
         let max_row = self.storage.visible_rows.saturating_sub(1);
         let max_col = self.storage.cols.saturating_sub(1);
         let src_top = src_top.min(max_row);
@@ -1434,7 +1179,6 @@ impl Grid {
         let src_left = src_left.min(max_col);
         let src_right = src_right.min(max_col);
 
-        // Validate source rectangle
         if src_top > src_bottom || src_left > src_right {
             return;
         }
@@ -1442,13 +1186,11 @@ impl Grid {
         let rect_height = src_bottom - src_top + 1;
         let rect_width = src_right - src_left + 1;
 
-        // Clamp destination start
         let dst_top = dst_top.min(max_row);
         let dst_left = dst_left.min(max_col);
 
-        // Copy source cells into a temporary buffer (handles overlap).
-        // Wide-char fixup at source boundaries (#7316): if the source rect
-        // cuts a wide character pair, replace the orphaned half with a space.
+        // Copy source cells into a temporary buffer (handles overlap). If the
+        // source rect cuts a wide pair, the orphaned half becomes a space.
         let mut buf: Vec<Vec<super::Cell>> = Vec::with_capacity(rect_height as usize);
         for row_offset in 0..rect_height {
             let src_row = src_top + row_offset;
@@ -1461,15 +1203,10 @@ impl Grid {
                     .unwrap_or(super::Cell::EMPTY);
                 row_cells.push(cell);
             }
-            // Left boundary: blank an ORPHANED wide continuation (whose WIDE base sits
-            // at src_left-1, outside the rect). Use the neighbor-aware check on the
-            // SOURCE row, NOT the raw bit-10 flag: WIDE_CONTINUATION shares bit 10 with
-            // PROTECTED, so `flags().contains(WIDE_CONTINUATION)` also matches a
-            // DECSCA-protected non-wide cell (and a protected WIDE head) at src_left and
-            // would wrongly blank it — data loss, since DECCRA copies verbatim with no
-            // protection semantics. `is_cell_wide_continuation` returns true only when
-            // cells[src_left-1] is genuinely WIDE, so a protected cell (base not WIDE,
-            // or src_left==0) is preserved while a real orphan is still cleared.
+            // Left boundary: blank an orphaned wide continuation whose base sits at
+            // src_left-1, outside the rect. Use the neighbor-aware check on the
+            // source row, not the raw bit: WIDE_CONTINUATION shares bit 10 with
+            // PROTECTED, and DECCRA copies protected cells verbatim.
             if self
                 .row(src_row)
                 .is_some_and(|r| r.is_cell_wide_continuation(src_left))
@@ -1486,11 +1223,17 @@ impl Grid {
             buf.push(row_cells);
         }
 
-        // Collect source extras into a temporary buffer (handles overlap).
+        // Snapshot the source's HashMap extras and its ring-resident truecolor
+        // (rgb_ring) and complex codepoints (complex_ring) before any destination
+        // write, so overlap stays correct. The cell copy in `buf` carries only
+        // RGB/COMPLEX markers; the bytes live in the rings. Blanked wide halves
+        // carry no markers and are skipped. Every `buf` row holds `rect_width`
+        // cells, so this walks the source rect row-major.
         let mut extras_buf: Vec<(u16, u16, super::CellExtra)> = Vec::new();
-        for row_offset in 0..rect_height {
+        let mut ring_buf: Vec<RingCapture> = Vec::new();
+        for (row_cells, row_offset) in buf.iter().zip(0u16..) {
             let src_row = src_top + row_offset;
-            for col_offset in 0..rect_width {
+            for (cell, col_offset) in row_cells.iter().zip(0u16..) {
                 let src_col = src_left + col_offset;
                 let coord = crate::CellCoord {
                     row: src_row,
@@ -1499,32 +1242,6 @@ impl Grid {
                 if let Some(extra) = self.storage.extras.get(coord) {
                     extras_buf.push((row_offset, col_offset, extra.clone()));
                 }
-            }
-        }
-
-        // Snapshot resolved ring-resident truecolor (rgb_ring) and complex
-        // codepoints (complex_ring) from the SOURCE, before any destination
-        // write/clear so overlap stays correct (#7977). The Cell copy in `buf`
-        // carries only the RGB/COMPLEX *markers*; the authoritative bytes for
-        // the main/bulk write paths live in the dense rings, which neither the
-        // cell copy nor the HashMap snapshot above captures. Orphaned wide
-        // halves were already blanked to EMPTY in `buf`, so they carry no
-        // markers and are skipped here.
-        let mut ring_buf: Vec<RingCapture> = Vec::new();
-        for (row_offset, row_cells) in buf.iter().enumerate() {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "row_offset bounded by rect_height which is u16"
-            )]
-            let row_offset = row_offset as u16;
-            let src_row = src_top + row_offset;
-            for (col_offset, cell) in row_cells.iter().enumerate() {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "col_offset bounded by rect_width which is u16"
-                )]
-                let col_offset = col_offset as u16;
-                let src_col = src_left + col_offset;
                 let fg = if cell.fg_needs_overflow() && !cell.uses_style_id() {
                     self.storage.extras.fg_rgb_for(src_row, src_col)
                 } else {
@@ -1535,11 +1252,9 @@ impl Grid {
                 } else {
                     None
                 };
-                // Only ring-resident complex codepoints need ring repopulation.
-                // Multi-codepoint Arc<str> clusters ride along in the HashMap
-                // snapshot above; the cleared dst ring lets them resolve through
-                // the HashMap rather than being shadowed by a single truncated
-                // codepoint, so they are deliberately not captured here.
+                // Only ring-resident complex codepoints need ring repopulation;
+                // multi-codepoint Arc<str> clusters ride in `extras_buf` and
+                // resolve through the HashMap once the dst ring is cleared.
                 let cx = if cell.is_complex()
                     && self
                         .storage
@@ -1557,45 +1272,28 @@ impl Grid {
             }
         }
 
-        // Write buffered cells to destination.
-        // Destination wide-char fixup (#7316): before overwriting, clear orphaned
-        // halves of existing wide characters at the destination boundaries.
-        for (row_offset, row_cells) in buf.iter().enumerate() {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "row_offset bounded by rect_height which is u16"
-            )]
-            let dst_row = dst_top.saturating_add(row_offset as u16);
+        // Write buffered cells to destination, first clearing orphaned halves
+        // of existing wide characters at the destination boundaries.
+        for (row_cells, row_offset) in buf.iter().zip(0u16..) {
+            let dst_row = dst_top.saturating_add(row_offset);
             if dst_row > max_row {
                 break;
             }
             let actual_width = row_cells.len().min((max_col - dst_left + 1) as usize);
-            if actual_width > 0
-                && let Some(row) = self.row_mut(dst_row)
-            {
-                row.fixup_wide_chars_in_range(dst_left, actual_width as u16);
-            }
-            for (col_offset, &cell) in row_cells.iter().enumerate() {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "col_offset bounded by rect_width which is u16"
-                )]
-                let dst_col = dst_left.saturating_add(col_offset as u16);
-                if dst_col > max_col {
-                    break;
+            if let Some(row) = self.row_mut(dst_row) {
+                if actual_width > 0 {
+                    row.fixup_wide_chars_in_range(dst_left, actual_width as u16);
                 }
-                if let Some(row) = self.row_mut(dst_row) {
+                for (&cell, col_offset) in row_cells.iter().zip(0u16..) {
+                    let dst_col = dst_left.saturating_add(col_offset);
+                    if dst_col > max_col {
+                        break;
+                    }
                     row.set(dst_col, cell);
                 }
-            }
-            // Row::set only GROWS len, so copied blanks (verbatim source blanks or
-            // the wide-orphan halves blanked into `buf` above) that overwrite the
-            // dst row's tail content would leave len stale-high — phantom trailing
-            // spaces through row_text/search/scrollback (#7522). copy_rect is the
-            // only rect writer using bare set() rather than a len-maintaining
-            // clear/erase primitive; recompute the true tail once per written row.
-            // recompute_len never over-shrinks and DECCRA is off the hot path.
-            if let Some(row) = self.row_mut(dst_row) {
+                // Row::set only grows len, so copied blanks overwriting the dst
+                // row's tail would leave len stale-high (phantom trailing spaces
+                // in row_text/search/scrollback). Recompute once per written row.
                 row.recompute_len();
             }
             self.storage.mark_content_row(dst_row);
@@ -1605,10 +1303,8 @@ impl Grid {
         let dst_bottom_eff = dst_top
             .saturating_add(rect_height.saturating_sub(1))
             .min(max_row);
-        // SELECTION CUSTODY Phase 4: DECCRA replaces the DESTINATION cells (the source
-        // is only read), so the destination rows are the damage. Like its DECERA /
-        // DECFRA / DECSERA siblings this recorded nothing before, leaving a highlight
-        // over overwritten text.
+        // DECCRA replaces the destination cells (the source is only read), so
+        // the destination rows are the selection damage.
         self.damage_selection_visible_rows(dst_top, dst_bottom_eff);
         let dst_right_eff = dst_left
             .saturating_add(rect_width.saturating_sub(1))
@@ -1629,13 +1325,10 @@ impl Grid {
             }
         }
 
-        // Repopulate the destination dense rings for cells whose authoritative
-        // truecolor/complex data lived in the SOURCE rings (#7977). clear_rect
-        // above wiped both dst rings and the cell copy carries only the
-        // markers, so without this a copied truecolor cell would resolve to the
-        // default color and a copied complex cell to a wrong/missing grapheme.
-        // Only cells inside the dst bounds were actually written, matching the
-        // HashMap-restore guard above.
+        // Repopulate the destination rings for cells whose truecolor/complex
+        // data lived in the source rings: clear_rect wiped both dst rings and
+        // the cell copy carries only markers. Only cells inside the dst bounds
+        // were written, matching the HashMap-restore guard above.
         if !ring_buf.is_empty() {
             let visible_rows = self.storage.visible_rows;
             let cols = self.storage.cols;
@@ -1674,6 +1367,7 @@ impl Grid {
 mod tests {
     use super::Grid;
     use crate::cell_flags::CellFlags;
+    use crate::grid::test_support::wrapped_pair;
 
     /// Helper: write ASCII text at the current cursor position.
     fn write_text(grid: &mut Grid, text: &str) {
@@ -1716,9 +1410,9 @@ mod tests {
         }
     }
 
-    /// Helper: arm a REAL deferred wrap — print row `row` to its last column with
-    /// deferred autowrap, exactly as a printable filling a line does. The cursor
-    /// ends parked ON the last column with `pending_wrap` set.
+    /// Arm a real deferred wrap: print row `row` to its last column with
+    /// deferred autowrap. The cursor ends parked on the last column with
+    /// `pending_wrap` set.
     fn arm_wrap_on_row(grid: &mut Grid, row: u16, cols: u16) {
         grid.move_cursor_to(row, 0);
         for col in 0..cols {
@@ -1812,9 +1506,8 @@ mod tests {
 
     #[test]
     fn test_el0_at_pending_wrap_clears_parked_glyph_and_wrap() {
-        // xterm util.c `ClearRight` clears from `cur_col` INCLUSIVE — the parked
-        // last column — and ends with `ResetWrap`. (This test used to assert the
-        // xterm.js rule: nothing erased, wrap kept.)
+        // xterm util.c `ClearRight` clears from `cur_col` inclusive (the parked
+        // last column) and ends with `ResetWrap`.
         let mut grid = Grid::new(4, 5);
         arm_wrap_on_row(&mut grid, 0, 5);
         grid.erase_to_end_of_line();
@@ -1882,19 +1575,6 @@ mod tests {
                 "row 1 col {col} should be preserved"
             );
         }
-    }
-
-    /// Row 0 `ABCDE` autowrapped into row 1 `FG` (a continuation) on a 5-col grid.
-    fn wrapped_pair() -> Grid {
-        let mut grid = Grid::new(4, 5);
-        for c in "ABCDEFG".chars() {
-            grid.write_char_wrap(c);
-        }
-        assert!(
-            grid.row(1).is_some_and(|r| r.is_wrapped()),
-            "precondition: row 1 continues row 0"
-        );
-        grid
     }
 
     #[test]
@@ -1996,7 +1676,7 @@ mod tests {
     #[test]
     fn test_el1_clears_pending_wrap() {
         // xterm util.c `ClearLeft` -> `ClearInLine` -> `ClearInLine2`, which calls
-        // `ResetWrap`. (This test used to assert the wrap was kept.)
+        // `ResetWrap`.
         let mut grid = Grid::new(4, 5);
         arm_wrap_on_row(&mut grid, 0, 5);
         grid.erase_from_start_of_line();
@@ -2048,7 +1728,7 @@ mod tests {
     #[test]
     fn test_el2_clears_pending_wrap() {
         // xterm util.c `ClearLine` -> `ClearInLine` -> `ClearInLine2`, which calls
-        // `ResetWrap`. (This test used to assert the wrap was kept.)
+        // `ResetWrap`.
         let mut grid = Grid::new(4, 5);
         arm_wrap_on_row(&mut grid, 0, 5);
         grid.erase_line();
@@ -2158,7 +1838,6 @@ mod tests {
     fn test_ed0_at_pending_wrap_clears_parked_glyph_and_wrap() {
         // xterm util.c `ClearBelow` starts with `ClearRight(xw, -1)`: the cursor
         // row is cleared from the parked column inclusive, and the wrap resets.
-        // (This test used to assert the xterm.js rule: parked glyph and wrap kept.)
         let mut grid = Grid::new(4, 5);
         fill_row(&mut grid, 1, 5);
         arm_wrap_on_row(&mut grid, 0, 5);
@@ -2267,7 +1946,7 @@ mod tests {
     #[test]
     fn test_ed1_clears_pending_wrap() {
         // xterm util.c `ClearAbove` ends with `ClearLeft` -> `ClearInLine2`
-        // `ResetWrap`. (This test used to assert the wrap was kept.)
+        // `ResetWrap`.
         let mut grid = Grid::new(4, 5);
         fill_row(&mut grid, 0, 5);
         fill_row(&mut grid, 2, 5);
@@ -2327,15 +2006,20 @@ mod tests {
     #[test]
     fn test_ed2_resets_display_offset() {
         let mut grid = Grid::new(4, 10);
-        // Artificially check that display_offset is 0 after erase_screen.
+        grid.scroll_up(3);
+        grid.scroll_display(2);
+        assert_eq!(
+            grid.display_offset(),
+            2,
+            "precondition: viewport in history"
+        );
         grid.erase_screen();
         assert_eq!(grid.display_offset(), 0);
     }
 
     #[test]
     fn test_ed2_clears_pending_wrap() {
-        // xterm util.c `ClearScreen` calls `ResetWrap`. (This test used to assert
-        // the wrap was kept.)
+        // xterm util.c `ClearScreen` calls `ResetWrap`.
         let mut grid = Grid::new(4, 5);
         fill_row(&mut grid, 3, 5);
         arm_wrap_on_row(&mut grid, 1, 5);
@@ -2434,7 +2118,6 @@ mod tests {
     #[test]
     fn test_sel0_clears_pending_wrap() {
         // xterm `CASE_DECSEL` -> util.c `ClearRight`, which ends with `ResetWrap`.
-        // (This test used to assert the wrap was kept.)
         let mut grid = Grid::new(4, 5);
         arm_wrap_on_row(&mut grid, 0, 5);
         grid.selective_erase_to_end_of_line();
@@ -2493,8 +2176,7 @@ mod tests {
     #[test]
     fn test_sel1_clears_pending_wrap() {
         // xterm `CASE_DECSEL` -> util.c `ClearLeft` -> `ClearInLine2` reaches
-        // `ResetWrap` over an unprotected span. (This test used to assert the wrap
-        // was kept.)
+        // `ResetWrap` over an unprotected span.
         let mut grid = Grid::new(4, 5);
         arm_wrap_on_row(&mut grid, 0, 5);
         grid.selective_erase_from_start_of_line();
@@ -2569,8 +2251,7 @@ mod tests {
     #[test]
     fn test_sel2_clears_pending_wrap() {
         // xterm `CASE_DECSEL` -> util.c `ClearLine` -> `ClearInLine2` reaches
-        // `ResetWrap` over an unprotected row. (This test used to assert the wrap
-        // was kept.)
+        // `ResetWrap` over an unprotected row.
         let mut grid = Grid::new(4, 5);
         arm_wrap_on_row(&mut grid, 0, 5);
         protect_cell(&mut grid, 0, 4);
@@ -2632,8 +2313,7 @@ mod tests {
     #[test]
     fn test_decsed0_clears_pending_wrap() {
         // xterm `CASE_DECSED` -> util.c `ClearBelow` -> `ClearRight`, whose
-        // trailing `ResetWrap` is unconditional. (This test used to assert the
-        // wrap was kept.)
+        // trailing `ResetWrap` is unconditional.
         let mut grid = Grid::new(4, 5);
         fill_row(&mut grid, 2, 5);
         arm_wrap_on_row(&mut grid, 1, 5);
@@ -2737,8 +2417,7 @@ mod tests {
     #[test]
     fn test_decsed1_clears_pending_wrap() {
         // xterm `CASE_DECSED` -> util.c `ClearAbove` (protected branch) ->
-        // `ClearInLine2` reaches `ResetWrap` over unprotected spans. (This test
-        // used to assert the wrap was kept.)
+        // `ClearInLine2` reaches `ResetWrap` over unprotected spans.
         let mut grid = Grid::new(4, 5);
         fill_row(&mut grid, 0, 5);
         arm_wrap_on_row(&mut grid, 1, 5);
@@ -2815,8 +2494,7 @@ mod tests {
     #[test]
     fn test_decsed2_clears_pending_wrap() {
         // xterm `CASE_DECSED` -> util.c `do_erase_display` case 2: the protected
-        // `ClearInLine` loop reaches `ResetWrap` on any unprotected row. (This test
-        // used to assert the wrap was kept.)
+        // `ClearInLine` loop reaches `ResetWrap` on any unprotected row.
         let mut grid = Grid::new(4, 5);
         arm_wrap_on_row(&mut grid, 1, 5);
         protect_cell(&mut grid, 1, 4);
@@ -2916,9 +2594,8 @@ mod tests {
         assert!(cell.flags().is_empty(), "DECALN cells should have no flags");
     }
 
-    /// DECALN must clear the `any_double_width` optimization flag after
-    /// resetting all rows to single-width via `clear()`.  Without this,
-    /// cursor ops unnecessarily check for double-width column clamping.
+    /// DECALN clears the `any_double_width` flag after resetting all rows to
+    /// single-width.
     #[test]
     fn test_decaln_clears_any_double_width_flag() {
         let mut grid = Grid::new(5, 40);
@@ -3162,12 +2839,10 @@ mod tests {
 
     #[test]
     fn test_selective_erase_rect_wide_cell_leaves_no_orphan_continuation() {
-        // DECSERA over the CONTINUATION column of an unprotected wide glyph must
-        // not orphan the spacer. The left-boundary fixup wipes the lead (which
-        // clears its WIDE flag); because WIDE_CONTINUATION and PROTECTED share
-        // bit 10, the in-range continuation would then be misread as a standalone
-        // PROTECTED cell and skipped by the loop, leaving a stale continuation
-        // whose lead is now a plain space.
+        // DECSERA over the continuation column of an unprotected wide glyph must
+        // not orphan the spacer: after the left-boundary fixup wipes the lead,
+        // the continuation (bit 10, shared with PROTECTED) must not be misread
+        // as a protected cell and skipped.
         let mut grid = Grid::new(2, 10);
         grid.move_cursor_to(0, 0);
         grid.write_wide_char_styled(
@@ -3298,11 +2973,9 @@ mod tests {
 
     #[test]
     fn copy_rect_preserves_protected_cell_at_source_left_edge() {
-        // Regression: DECCRA copies cells VERBATIM and has no protection semantics.
-        // The left-boundary orphan fixup used a raw `contains(WIDE_CONTINUATION)`
-        // check, but WIDE_CONTINUATION and PROTECTED share bit 10 — so a DECSCA-
-        // protected non-wide cell at src_left was misread as an orphaned continuation
-        // and blanked, losing data the copy must reproduce.
+        // DECCRA copies cells verbatim with no protection semantics: a protected
+        // non-wide cell at src_left (bit 10 shared with WIDE_CONTINUATION) must
+        // not be mistaken for an orphaned continuation and blanked.
         let mut grid = Grid::new(3, 10);
         grid.move_cursor_to(0, 0);
         for ch in ['A', 'B', 'C'] {
@@ -3335,12 +3008,9 @@ mod tests {
 
     #[test]
     fn copy_rect_shrinks_dst_len_when_copied_blanks_empty_the_tail() {
-        // Regression (round 17): copy_rect (DECCRA) writes via Row::set, whose len
-        // update is grow-only. Copying blank source cells over the destination
-        // row's tail content must still shrink len — otherwise the emptied tail
-        // cells stay inside len and surface as phantom trailing spaces in
-        // row_text/search/scrollback (#7522 stale-high). copy_rect is the only rect
-        // writer using bare set() instead of a len-maintaining primitive.
+        // copy_rect writes via Row::set (grow-only len). Copying blank source
+        // cells over the destination's tail must still shrink len, or emptied
+        // cells surface as phantom trailing spaces.
         let mut grid = Grid::new(3, 10);
         grid.move_cursor_to(0, 0);
         for ch in ['h', 'e', 'l', 'l', 'o'] {
@@ -3376,11 +3046,9 @@ mod tests {
 
     #[test]
     fn change_attrs_rect_maintains_len_both_directions() {
-        // Regression (codex round-18 review): DECCARA/DECRARA change cell flags via
-        // row.get_mut with no len update. Setting an attribute on blank trailing
-        // cells makes them non-empty (is_empty requires flags==0), so len must grow
-        // to include the styled tail (stale-low); clearing the last attribute empties
-        // them again, so len must shrink (stale-high). #7522 both directions.
+        // DECCARA/DECRARA change flags via row.get_mut with no len update:
+        // setting an attribute on blank trailing cells must grow len, and
+        // clearing the last attribute must shrink it.
         let mut grid = Grid::new(3, 10);
         assert_eq!(grid.row_len(0), Some(0), "precondition: row 0 blank");
 
@@ -3403,11 +3071,9 @@ mod tests {
 
     #[test]
     fn reverse_attrs_rect_maintains_len_both_directions() {
-        // The same #7522 obligation on the DECRARA path: reversing an attribute
-        // onto blank trailing cells makes them non-empty and reversing it back
-        // empties them, so len must move in both directions. Both paths walk
-        // through `edit_attrs_rect`, and this is what would break first if a
-        // future reverse path grew its own walk.
+        // The same len obligation on the DECRARA path: reversing an attribute
+        // onto blank trailing cells and back must move len both ways (both paths
+        // walk through `edit_attrs`).
         let mut grid = Grid::new(3, 10);
         assert_eq!(grid.row_len(0), Some(0), "precondition: row 0 blank");
 
@@ -3467,10 +3133,9 @@ mod tests {
 
     #[test]
     fn copy_rect_still_blanks_genuine_orphaned_wide_continuation_at_left_edge() {
-        // The neighbor-aware check must NOT regress #7316: a wide glyph whose WIDE
-        // base sits at src_left-1 (OUTSIDE the copied rect) leaves only its
-        // continuation half at src_left, which must still be blanked so no stale
-        // spacer-without-a-lead is copied.
+        // A wide glyph whose base sits at src_left-1 (outside the copied rect)
+        // leaves only its continuation at src_left, which must still be blanked
+        // so no spacer without a lead is copied.
         let mut grid = Grid::new(3, 10);
         grid.move_cursor_to(0, 0);
         grid.write_wide_char_styled(
@@ -3509,12 +3174,11 @@ mod tests {
 
     #[test]
     fn erase_rect_preserves_protected_cell_left_of_the_region() {
-        // Regression (round-6): DECERA erase_rect routes through Row::clear_range_with,
-        // whose left-boundary wide fixup used a raw WIDE_CONTINUATION (bit-10) check.
-        // Because bit 10 aliases PROTECTED, a DECSCA-protected cell at the region's
-        // left column misfired the fixup and blanked the cell immediately LEFT of the
-        // region — OUTSIDE the operated rectangle. (Same class as the round-5 DECCRA
-        // fix, in the shared clear helper that also backs DECFRA/EL/ED.)
+        // DECERA routes through Row::clear_range_with, whose left-boundary wide
+        // fixup must not treat a protected cell (bit 10 aliases
+        // WIDE_CONTINUATION) at the region's left column as a continuation and
+        // blank the cell outside the rectangle. The same helper backs
+        // DECFRA/EL/ED.
         let mut grid = Grid::new(3, 10);
         fill_row(&mut grid, 0, 10); // 'A','B','C',… — all narrow, no wide pairs
         protect_cell(&mut grid, 0, 1); // protect the region's left-edge cell (col 1)
@@ -3545,15 +3209,12 @@ mod tests {
     // Wide-orphan colour: the BCE erases vs the rectangle ops
     // =========================================================================
 
-    /// EL 0 that bisects a wide pair must hand the orphaned half the BCE
+    /// EL 0 that bisects a wide pair gives the orphaned half the BCE
     /// background, not default colours.
     ///
-    /// xterm `util.c` `ClearRight` runs its wide fixup through the SAME
+    /// xterm `util.c` `ClearRight` runs its wide fixup through the same
     /// `ClearInLine2` -> `ClearCells` (`screen.c`) as the erased span, and
     /// `ClearCells` writes `' '` plus `ld->color[col] = xtermColorPair(xw)`.
-    /// The only difference between the orphan call and the main call is the
-    /// `CHARDRAWN` flag bit, which carries no colour. aterm wrote `Cell::EMPTY`
-    /// there, leaving a default-coloured hole one column left of the erase.
     #[test]
     fn erase_to_end_of_line_gives_the_wide_orphan_the_bce_background() {
         use crate::{Cell, PackedColors};
@@ -3593,10 +3254,8 @@ mod tests {
         );
     }
 
-    /// The truecolor half of the same fix: a BCE cell holds only an RGB
-    /// *marker*, the bytes live in the dense ring. `fill_bce_rgb_range` covered
-    /// the erased span only, so an orphan that now carries the marker had no
-    /// ring entry and resolved to a stale/absent background.
+    /// The truecolor half: a BCE cell holds only an RGB marker, so the ring
+    /// must extend to the orphan that now carries the marker.
     #[test]
     fn erase_to_end_of_line_extends_the_bce_truecolor_ring_to_the_wide_orphan() {
         use crate::{Cell, PackedColor};
@@ -3669,10 +3328,8 @@ mod tests {
 
     /// The truecolor half of EL 1, mirroring
     /// `erase_to_end_of_line_extends_the_bce_truecolor_ring_to_the_wide_orphan`
-    /// on the RIGHT boundary: the orphaned continuation sits one column PAST the
-    /// erased range, so `fill_bce_rgb_range` has to run to `span.end`, not to
-    /// `end`. With the narrow span the orphan keeps the dead glyph's ring entry
-    /// and resolves its colour under a BCE marker that says otherwise.
+    /// on the right boundary: the orphaned continuation sits one column past the
+    /// erased range, so `fill_bce_rgb_range` runs to `span.end`.
     #[test]
     fn erase_from_start_of_line_extends_the_bce_truecolor_ring_to_the_wide_orphan() {
         use crate::{Cell, PackedColor};
@@ -3720,10 +3377,8 @@ mod tests {
         );
     }
 
-    /// EL 2's DECLRMM-margin branch (`erase_line_impl`) is a third erase site
-    /// with the same two halves, and it is the one a margin-using full-screen
-    /// app hits: the orphan just past the RIGHT margin takes the BCE blank, and
-    /// the ring has to follow it there.
+    /// EL 2 over a DECLRMM-margin row: the orphan just past the right margin
+    /// takes the BCE blank, and the ring follows it.
     #[test]
     fn erase_line_within_margins_gives_the_wide_orphan_the_bce_background_and_ring() {
         use crate::{Cell, PackedColor};
@@ -3782,11 +3437,9 @@ mod tests {
         );
     }
 
-    /// #7522, at the operation level: DECERA must NOT give the orphan the BCE
-    /// background. xterm routes DECERA through `screen.c` `ScrnFillRectangle`,
-    /// whose wide fixup is `Clear1Cell(ld, left - 1)` — a bare cell clear that
-    /// never touches the fill or the colour pair. The orphan is OUTSIDE the
-    /// rectangle, so colouring it would paint one column past the rect.
+    /// DECERA does not give the orphan the BCE background: xterm's
+    /// `ScrnFillRectangle` fixup is `Clear1Cell(ld, left - 1)`, a bare clear
+    /// without the colour pair. The orphan is outside the rectangle.
     #[test]
     fn erase_rect_keeps_the_wide_orphan_empty_under_a_bce_background() {
         use crate::{Cell, PackedColors};
@@ -3813,7 +3466,7 @@ mod tests {
         );
     }
 
-    /// #7522's original shape: DECFRA's fill carries a GLYPH, and writing it
+    /// The original shape: DECFRA's fill carries a GLYPH, and writing it
     /// into the orphan bled that glyph one column outside the rectangle.
     #[test]
     fn fill_rect_keeps_the_wide_orphan_empty() {
@@ -4044,10 +3697,8 @@ mod tests {
 
     #[test]
     fn test_fill_rect_repopulates_truecolor_ring() {
-        // DECFRA with truecolor SGR: the cell carries only the RGB *marker*,
-        // so fill_rect must write the resolved bytes back into the RGB ring.
-        // Before the fix the markers said RGB but fg_rgb_at()/bg_rgb_at()
-        // returned None (clear_rect wiped the ring and nothing repopulated it).
+        // DECFRA with truecolor SGR: the cell carries only the RGB marker, so
+        // fill_rect must write the resolved bytes back into the RGB ring.
         use crate::{Cell, PackedColors};
         let mut grid = Grid::new(4, 10);
         let colors = PackedColors::new().with_rgb_fg().with_rgb_bg();
@@ -4085,11 +3736,9 @@ mod tests {
 
     #[test]
     fn test_copy_rect_repopulates_truecolor_and_complex_rings() {
-        // DECCRA must carry ring-resident truecolor (rgb_ring) and complex
-        // codepoints (complex_ring) to the destination (#7977). The Cell copy
-        // holds only the RGB/COMPLEX *markers*; before the fix copy_rect read
-        // only the cell and the HashMap layer, so the destination markers
-        // resolved to None/stale (sibling of the DECFRA/DECSERA truecolor fix).
+        // DECCRA carries ring-resident truecolor (rgb_ring) and complex
+        // codepoints (complex_ring) to the destination; the cell copy holds only
+        // the markers.
         use crate::{Cell, CellCoord, PackedColors};
         let mut grid = Grid::new(4, 10);
         let rows = grid.rows();
@@ -4161,10 +3810,9 @@ mod tests {
 
     #[test]
     fn test_copy_rect_clears_stale_dst_complex_ring() {
-        // clear_rect must wipe the destination complex ring (#7977): copying a
-        // PLAIN cell over a destination that previously held a complex char
-        // must not leave the old codepoint readable through the (now plain)
-        // cell — reads consult the ring first regardless of the COMPLEX flag.
+        // clear_rect wipes the destination complex ring: copying a plain cell
+        // over a former complex char must not leave the old codepoint readable
+        // (reads consult the ring first regardless of the COMPLEX flag).
         use crate::Cell;
         let mut grid = Grid::new(4, 10);
         let rows = grid.rows();
@@ -4201,18 +3849,12 @@ mod tests {
     }
 
     // ========================================================================
-    // ED erases COMPLETE lines back to single-width (DECDWL/DECDHL)
+    // ED erases complete lines back to single-width (DECDWL/DECDHL)
     //
-    // VT510 Programmer Information, Erase in Display: "When you erase complete
-    // lines, they become single-height, single-width lines, with all visual
-    // character attributes cleared." xterm's `ClearBufRows` — reached from
-    // `ClearScreen` (ED 2), `ClearBelow` (ED 0) and `ClearAbove` (ED 1) — says
-    // the same in its own comment before `SetLineDblCS(ld, CSET_SWL)`.
-    //
-    // Before this, a single stray `ESC#6` poisoned a screen row that no erase,
-    // no `clear`, no soft reset and no resize could recover: measured on glass
-    // at 40x200 with a 9x17 cell, ten characters drew 180 inked device columns
-    // after the trigger against 90 before, byte-identical grid text.
+    // VT510 Erase in Display: "When you erase complete lines, they become
+    // single-height, single-width lines, with all visual character attributes
+    // cleared." xterm's `ClearBufRows`, reached from `ClearScreen` (ED 2),
+    // `ClearBelow` (ED 0) and `ClearAbove` (ED 1), does the same.
     // ========================================================================
 
     /// Set a row's DEC line attribute the way `ESC#3` / `ESC#4` / `ESC#6` does:
@@ -4253,9 +3895,8 @@ mod tests {
 
     #[test]
     fn ed2_gives_back_the_columns_a_double_width_row_had_halved() {
-        // The user-visible sting: on a poisoned row only half the columns are
-        // reachable, so the prompt and the next command's output run out of
-        // room. After ED 2 the whole row is addressable again.
+        // On a double-width row only half the columns are reachable; after
+        // ED 2 the whole row is addressable again.
         let mut grid = Grid::new(4, 20);
         poison_row(&mut grid, 0, crate::LineSize::DoubleWidth);
         grid.set_cursor(0, 19);
@@ -4343,10 +3984,8 @@ mod tests {
 
     #[test]
     fn an_ed0_that_clears_the_last_double_row_lowers_the_fast_path_flag() {
-        // The flag may only be lowered by a rescan: ED 0 resets a SUBSET of the
-        // rows, so clearing it outright would be wrong wherever a double row
-        // survives above the cursor (pinned by the ED 0 test above), and leaving
-        // it raised forever is the stale-flag cost the reflow rescan exists for.
+        // The flag may only be lowered by a rescan: ED 0 resets a subset of
+        // rows, so a double row surviving above the cursor keeps it raised.
         let mut grid = Grid::new(4, 20);
         poison_row(&mut grid, 3, crate::LineSize::DoubleWidth);
         grid.set_cursor(0, 0);

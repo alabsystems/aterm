@@ -157,14 +157,28 @@ pub fn native_updater_model() -> Model {
 /// also TRUSTS A POST'S OWN ANSWER in the three places the shipping code refuses
 /// to: the draft converges, its assets are journaled against it, and an asset
 /// converges, each on the strength of a landed POST rather than the re-listed
-/// object. `step_draft` binds (and journals) the release ID the POST answered
-/// FIRST, but reports the draft converged — returns `Ok`, so the step is
+/// object. `bind_channel_release` binds (and journals) the release ID the POST
+/// answered FIRST, but reports the draft converged — returns `Ok`, so the step is
 /// journaled done and the upload may begin — only after `release_object_by_id`
-/// re-reads that ID and `validate_release_object_capability` accepts it; and
-/// `upload_release_asset_by_id` returns only after
+/// re-reads that ID and `validate_channel_release_capability` accepts it; and
+/// `upload_channel_asset` returns only after
 /// `release_asset_identity_for_release_id_optional` sees the asset — "returned
 /// success but no asset is visible" is its own refusal. The mutants are that
 /// re-read skipped.
+///
+/// THE UPLOAD INTENT IS SPENT ONLY ON A POST THAT PROVABLY CREATED NOTHING. A POST the
+/// process cannot classify (a success, a 5xx, a timeout, a reset) may have landed, so
+/// `IssueUploadPost` says it did, and its intent stands. A POST curl never sent or the
+/// server answered with a 4xx (`IssueRefusedUploadPost`, and `post_outcome`'s
+/// `NeverSent`/`Refused`) created nothing: `RetractUploadIntent` spends its intent and
+/// returns the one-shot budget, so the resume may post that asset once more instead of
+/// waiting forever for an object that was never stored — the v0.86.0 wedge, on the
+/// upload leg. The refusal is knowledge only the process that saw the answer has, so a
+/// crash erases it (`upload_refusal_seen`) and the resume waits like any other.
+/// `Buggy=1` retracts on a POST it cannot classify — a landed object with no intent
+/// naming it, which `--abandon` could not withdraw — and lets a resumed process retract
+/// on an answer it never saw. Tier-1 (`durable_post_intent_model.rs`) binds the real
+/// `CutCtx::settle_upload_intent` to these decisions, curl outcome by curl outcome.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_durable_post_intent_model() -> Model {
@@ -173,6 +187,7 @@ pub fn release_durable_post_intent_model() -> Model {
             const Buggy = 0;
             const MaxPosts = 2;
             const MaxCrashes = 2;
+            const MaxRefusals = 1;
             var attached = 1;
             var create_intent = 0;
             var create_post_authority = 0;
@@ -184,6 +199,9 @@ pub fn release_durable_post_intent_model() -> Model {
             var upload_post_authority = 0;
             var upload_permit_lost = 0;
             var upload_posts = 0;
+            var upload_landed = 0;
+            var upload_refusal_seen = 0;
+            var upload_refusals = 0;
             var upload_visible = 0;
             var upload_converged = 0;
             var crashes = 0;
@@ -228,9 +246,29 @@ pub fn release_durable_post_intent_model() -> Model {
             ) {
                 upload_posts = upload_posts + 1;
                 upload_post_authority = 0;
+                upload_landed = 1;
+            }
+            action IssueRefusedUploadPost when (
+                attached == 1 && create_converged == 1 && upload_visible == 0 &&
+                upload_posts <= 0 && upload_post_authority == 1 &&
+                upload_refusals <= MaxRefusals - 1
+            ) {
+                upload_posts = upload_posts + 1;
+                upload_post_authority = 0;
+                upload_refusal_seen = 1;
+            }
+            action RetractUploadIntent when (
+                attached == 1 && upload_posts == 1 && upload_visible == 0 &&
+                upload_refusals <= MaxRefusals - 1 &&
+                (upload_refusal_seen == 1 || Buggy == 1)
+            ) {
+                upload_intent = 0;
+                upload_posts = 0;
+                upload_refusal_seen = 0;
+                upload_refusals = upload_refusals + 1;
             }
             action RevealUploadedAsset when (
-                upload_posts > 0 && upload_visible == 0
+                upload_posts > 0 && upload_landed == 1 && upload_visible == 0
             ) {
                 upload_visible = 1;
             }
@@ -257,6 +295,7 @@ pub fn release_durable_post_intent_model() -> Model {
                 };
                 create_post_authority = 0;
                 upload_post_authority = 0;
+                upload_refusal_seen = if Buggy == 1 { upload_refusal_seen } else { 0 };
                 crashes = crashes + 1;
             }
             action Resume when (attached == 0) {
@@ -287,6 +326,14 @@ pub fn release_durable_post_intent_model() -> Model {
             invariant UploadPostIsOneShot: upload_posts <= 1;
             invariant LostUploadPermitCannotPost:
                 if upload_permit_lost == 1 { upload_posts == 0 } else { upload_posts <= 1 };
+            invariant LandedUploadStaysNamed:
+                if upload_landed == 1 { upload_intent == 1 } else { upload_intent <= 1 };
+            invariant UploadRefusalIsProcessLocal:
+                if upload_refusal_seen == 1 {
+                    attached == 1 && upload_posts == 1 && upload_landed == 0
+                } else {
+                    upload_refusal_seen <= 1
+                };
             invariant UploadRequiresConvergedDraft:
                 if upload_intent + upload_posts + upload_visible + upload_converged > 0 {
                     create_converged == 1
@@ -301,8 +348,9 @@ pub fn release_durable_post_intent_model() -> Model {
                 create_posts <= MaxPosts && create_visible <= 1 &&
                 create_converged <= 1 && upload_intent <= 1 && upload_post_authority <= 1 &&
                 upload_permit_lost <= 1 &&
-                upload_posts <= MaxPosts && upload_visible <= 1 &&
-                upload_converged <= 1 && crashes <= MaxCrashes;
+                upload_posts <= MaxPosts && upload_landed <= 1 &&
+                upload_refusal_seen <= 1 && upload_refusals <= MaxRefusals &&
+                upload_visible <= 1 && upload_converged <= 1 && crashes <= MaxCrashes;
         }
     }
 }
@@ -1476,14 +1524,16 @@ pub fn release_publisher_fence_model() -> Model {
 /// uploads, tags, or flips the retired version.
 ///
 /// A LOST JOURNAL IS ANSWERED IN TWO WAYS (728af7315), both modeled: a visible
-/// draft whose target is the recovery claim's commit (`draft_bound`, the shipping
-/// `claim_bound`) is provably this claim's, so the remote's binding stands for
+/// draft bound to the claim by its assets (`draft_bound`, the shipping
+/// `claim_bound_draft` = `channel::binds_to_version`: it carries nothing but assets
+/// this version publishes) is provably this claim's, so the remote's binding stands for
 /// issued intent (`LearnIssuedIntentFromClaimBinding`, knowledge 2); and with
 /// nothing visible, the operator's `--no-draft-was-posted` stands for a no-POST
 /// journal (`AbandonOnOperatorNoPostAnswer`). A journal that proves a POST was
-/// issued is never overridable. Every delete also needs the draft bound to the
-/// claim: `delete_owned_draft_release` runs `validate_release_object_capability`
-/// against the claim commit before it deletes, whatever the journal said.
+/// issued is never overridable. With no journal a delete needs the draft bound to
+/// the claim (`draft_cleanup_decision`), and every delete goes through
+/// `delete_release_object_by_id_with_guard`, which re-validates the exact object
+/// snapshot immediately before the DELETE.
 ///
 /// `Buggy=1` exposes seven independent prohibited controls: publishing during
 /// recovery, accepting the current key for a signed retired-epoch release,

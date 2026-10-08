@@ -11,27 +11,18 @@ use crate::{ledger, publish};
 use aterm_spec::derive::{
     Model, release_publisher_fence_model, release_yank_successor_first_model,
 };
-use ledger::{GitCli, Result};
+use ledger::Result;
+use ledger::testing::Git;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 struct BareFixture {
     repo: PathBuf,
     owner: String,
-    root: PathBuf,
-}
-
-impl Drop for BareFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
+    _root: aterm_tempfile::TempDir,
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = ledger::testing::git()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -46,39 +37,44 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn identity(repo: &Path) {
+    ledger::testing::config(
+        repo,
+        &[
+            ("user.name", "Publisher Fence Model"),
+            ("user.email", "publisher-fence-model@example.invalid"),
+        ],
+    );
+}
+
 fn bare_fixture(name: &str) -> BareFixture {
-    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("publisher-fence-model")
-        .join(format!("{name}-{}-{sequence}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
+    let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("publisher-fence-model");
+    std::fs::create_dir_all(&parent).unwrap();
+    let dir = aterm_tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir_in(parent)
+        .unwrap();
+    let root = dir.path();
     let remote = root.join("origin.git");
     let seed = root.join("seed");
     assert!(
-        Command::new("git")
+        ledger::testing::git()
             .args(["init", "--bare"])
             .arg(&remote)
             .status()
             .unwrap()
             .success()
     );
+    ledger::testing::config(&remote, &[]);
     assert!(
-        Command::new("git")
+        ledger::testing::git()
             .args(["init", "-b", "main"])
             .arg(&seed)
             .status()
             .unwrap()
             .success()
     );
-    git(&seed, &["config", "user.name", "Publisher Fence Model"]);
-    git(
-        &seed,
-        &[
-            "config",
-            "user.email",
-            "publisher-fence-model@example.invalid",
-        ],
-    );
+    identity(&seed);
     std::fs::write(seed.join("claim"), "release claim\n").unwrap();
     git(&seed, &["add", "claim"]);
     git(&seed, &["commit", "-m", "release claim"]);
@@ -95,7 +91,7 @@ fn bare_fixture(name: &str) -> BareFixture {
     git(&seed, &["push", "origin", "main"]);
     let repo = root.join("publisher");
     assert!(
-        Command::new("git")
+        ledger::testing::git()
             .args(["clone", "--branch", "main"])
             .arg(&remote)
             .arg(&repo)
@@ -103,16 +99,12 @@ fn bare_fixture(name: &str) -> BareFixture {
             .unwrap()
             .success()
     );
-    git(&repo, &["config", "user.name", "Publisher Fence Model"]);
-    git(
-        &repo,
-        &[
-            "config",
-            "user.email",
-            "publisher-fence-model@example.invalid",
-        ],
-    );
-    BareFixture { repo, owner, root }
+    identity(&repo);
+    BareFixture {
+        repo,
+        owner,
+        _root: dir,
+    }
 }
 
 fn transition(
@@ -135,7 +127,7 @@ fn transition(
 }
 
 fn assert_session(
-    git: &GitCli,
+    git: &Git,
     lease: &publish::ReleaseLeaseGuard,
     guard: &publish::PublisherFenceGuard,
 ) -> Result<()> {
@@ -145,7 +137,7 @@ fn assert_session(
 #[test]
 fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
     let fixture = bare_fixture("rotation");
-    let git = GitCli::new(&fixture.repo);
+    let git = Git::new(&fixture.repo);
     let lease = publish::acquire_release_lease(&git, &fixture.owner).unwrap();
 
     let model = release_publisher_fence_model();
@@ -254,7 +246,7 @@ fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
 #[test]
 fn real_final_unlock_atomically_deletes_owner_and_fence() {
     let fixture = bare_fixture("atomic-final");
-    let git = GitCli::new(&fixture.repo);
+    let git = Git::new(&fixture.repo);
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     let fence = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
 
@@ -286,7 +278,7 @@ fn real_final_unlock_atomically_deletes_owner_and_fence() {
 #[test]
 fn ordinary_reentry_cannot_reuse_an_old_stopped_process_proof() {
     let fixture = bare_fixture("fresh-stop-proof");
-    let git = GitCli::new(&fixture.repo);
+    let git = Git::new(&fixture.repo);
     let lease = publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     let first = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
 
@@ -367,7 +359,7 @@ fn ordinary_reentry_cannot_reuse_an_old_stopped_process_proof() {
 #[test]
 fn yank_cleanup_refines_real_session_guards_and_atomic_unlock() {
     let fixture = bare_fixture("yank-cleanup");
-    let git = GitCli::new(&fixture.repo);
+    let git = Git::new(&fixture.repo);
     let model = release_yank_successor_first_model();
     let mut state = transition(
         &model,
@@ -436,7 +428,7 @@ fn yank_cleanup_refines_real_session_guards_and_atomic_unlock() {
 #[test]
 fn yank_cleanup_lease_loss_refuses_and_mutant_is_non_vacuous() {
     let fixture = bare_fixture("yank-lease-loss");
-    let repo_git = GitCli::new(&fixture.repo);
+    let repo_git = Git::new(&fixture.repo);
     let lease = publish::acquire_release_lease(&repo_git, &fixture.owner).unwrap();
     let fence = publish::acquire_publisher_fence(&repo_git, &fixture.owner).unwrap();
 

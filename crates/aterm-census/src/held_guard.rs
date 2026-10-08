@@ -2,45 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OB-22 — NO UNBOUNDED WORK UNDER A HELD `term` GUARD, anywhere in the GUI's
-//! shipped source: the per-SITE half of the L0 whole-Mac-freeze class, beside
-//! OB-5's per-PATH half.
+//! No unbounded work under a held `term` guard in the GUI's shipped source:
+//! the per-site half of the L0 freeze class, beside the main-loop census's
+//! per-path half.
 //!
-//! OB-5 asks whether a main-thread ROOT reaches `.resize(` on a `term_lock`
-//! guard. This asks, of every line of shipped `crates/aterm-gui/src` and
-//! `crates/aterm-control/src`, whether blocklisted O(history) work —
-//! `.resize(` `.reflow(` `.rewrap(` `.take_scrollback(` `.decompress(`
-//! `.hydrate(` `.rebuild_index(`, or the `zstd` cold tier — runs while a guard
-//! is held, whoever calls it. The safe offload (`resize_offloading_scrollback`
-//! under the lock, `pending.reflow()` off it, `finish_resize_offload` under a
-//! second brief lock) names no blocklisted method on a held guard, so it stays
-//! green; the tokens are METHOD-CALL-anchored for exactly that reason.
+//! For every shipped line of `crates/aterm-gui/src` and
+//! `crates/aterm-control/src`, this flags blocklisted O(history) work
+//! (`.resize(` `.reflow(` `.rewrap(` `.take_scrollback(` `.decompress(`
+//! `.hydrate(` `.rebuild_index(`, or the `zstd` cold tier) run while a guard
+//! is held. Tokens are method-call anchored, so the safe offload
+//! (`resize_offloading_scrollback` under the lock, `pending.reflow()` off it,
+//! `finish_resize_offload` under a second brief lock) stays green.
 //!
-//! What counts as HELD, each shape pinned by a `must_fire` unit case below:
+//! What counts as held (each shape pinned by a `must_fire` case below):
 //!
-//! * a line that acquires (`term_lock(`, `term_lock_ui(`, and aterm-control's
-//!   `with_terminal(` / `with_terminal_mut(`, whose closure the host runs
-//!   under the guard) holds it while the acquiring call's parens stay open —
-//!   across a whole multi-line closure body;
-//! * a `let` whose right-hand side IS the guard (only `&`/`mut`/`*`/`(` ahead of
-//!   the acquire, nothing chained after its closing paren) binds every
-//!   identifier its pattern binds (typed and destructuring binds included)
-//!   until its block closes, it is `drop`ped, or it is shadowed;
-//! * an explicit reborrow of a bound guard (`&mut *t`, `t.deref_mut()`) is the
-//!   guard too; a plain accessor (`let alt = t.is_alternate_screen()`) reads a
-//!   VALUE out and is not;
-//! * the receiver may be paren-dereffed or reached through zero-arg accessor
-//!   hops, and survives the line break rustfmt puts in a long chain.
+//! * an acquiring call (`term_lock(`, `term_lock_ui(`, aterm-control's
+//!   `with_terminal(` / `with_terminal_mut(`) holds the guard while its parens
+//!   stay open, across a multi-line closure body;
+//! * a `let` whose right-hand side is the guard (only `&`/`mut`/`*`/`(` ahead,
+//!   nothing chained after) binds every identifier in its pattern until its
+//!   block closes, it is `drop`ped, or it is shadowed;
+//! * an explicit reborrow (`&mut *t`, `t.deref_mut()`) is the guard too; a
+//!   plain accessor (`let alt = t.is_alternate_screen()`) reads a value out;
+//! * the receiver may be paren-dereffed, reached through zero-arg accessor hops,
+//!   or split across lines by rustfmt.
 //!
-//! Out of reach for a line walk, and not faked: an acquire hidden in a macro,
-//! an acquire whose own call spans lines, and a deferred `let t; t = …`.
+//! Not detected: an acquire inside a macro, an acquire whose own call spans
+//! lines, and a deferred `let t; t = …`.
 //!
-//! Code is read through a lexer that blanks comments and every string, raw
-//! string and char literal in place, across lines, and THEN the shared
-//! unshipped-item mask (`#[cfg(test)]` and its conjunctive kin) — so prose and
-//! log text naming `.resize(` are never work, a `)` in a literal or trailing
-//! comment cannot close a region early, and a `}` in a literal cannot end a
-//! masked item early (the order is load-bearing: see [`blank_non_code`]).
+//! Source is lexed with comments and literals blanked in place, then the
+//! unshipped-item mask (`#[cfg(test)]` and kin) is applied; see
+//! [`blank_non_code`] for why that order matters.
 
 use std::path::Path;
 
@@ -114,10 +106,10 @@ pub(crate) fn scan_tree(root: &Path) -> Result<HeldGuardScan, String> {
     Ok(scan)
 }
 
-/// The 1-based lines of one file's SHIPPED code that do blocklisted work under
+/// The 1-based lines of one file's shipped code that do blocklisted work under
 /// a held guard, and how many lines acquire one.
 pub(crate) fn scan_source(text: &str) -> (Vec<usize>, usize) {
-    // Lex FIRST, then mask: see `blank_non_code` for why the order is load-bearing.
+    // Lex first, then mask: see `blank_non_code` for why the order is load-bearing.
     let code = crate::mask_unshipped_items(&blank_non_code(text));
     let mut walk = Walk::default();
     let mut hits = Vec::new();
@@ -138,9 +130,7 @@ pub(crate) fn scan_source(text: &str) -> (Vec<usize>, usize) {
     (hits, acquires)
 }
 
-// ---------------------------------------------------------------------------
-// The lexer: comments and literal contents blanked in place, BEFORE the mask
-// ---------------------------------------------------------------------------
+// The lexer: comments and literal contents blanked in place, before the mask.
 
 fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
@@ -150,24 +140,17 @@ fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// The whole file with every comment and every string, raw string and char
-/// literal (its `b`/`c`/`r` prefix and `#`s included) blanked to spaces IN
-/// PLACE, tracked ACROSS lines: the line count and every column stay put, and
-/// each line's trailing whitespace is dropped, so a gate with a trailing comment
-/// still reads as the gate. A string that opens and closes on one line keeps
-/// its two `"`, so `#[cfg(all(test, feature = "x"))]` stays a parseable gate; a
-/// string that spans lines loses them, because a quote left alone on a line is
-/// what the item mask's per-line literal masker would re-read as an OPENER
-/// (blanking, say, the `;` that ends a `const X: &str = r#"…"#;` item).
+/// The file with every comment and string, raw string and char literal
+/// (prefix and `#`s included) blanked to spaces in place, tracked across lines:
+/// line and column positions are preserved and trailing whitespace is dropped.
+/// A single-line string keeps its two `"`, so `#[cfg(all(test, feature = "x"))]`
+/// still parses as a gate; a multi-line string loses them, so the item mask's
+/// per-line literal masker cannot read a stray quote as an opener.
 ///
-/// This runs BEFORE the unshipped-item mask, never after it. The mask reads one
-/// line at a time and ends an item at its first `<indent>}` line, so on raw
-/// text a `}` inside a test module's raw string (`aterm-gui/src/app_native.rs`
-/// has one) ended the module there and left the string's closer `"#;` visible,
-/// and a lexer run over the masked text then read that `"` as an opener: every
-/// later line of the file, shipped code included, became string contents.
-/// Blanked first, a literal can hold no `}` to end an item and no `#[cfg(test)]`
-/// to start one, and the mask can never strand half of it.
+/// This runs before the unshipped-item mask: the mask ends an item at its first
+/// `<indent>}` line, so on raw text a `}` inside a test module's raw string
+/// would end the module early and strand the literal's closer, turning the rest
+/// of the file into string contents.
 pub(crate) fn blank_non_code(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = chars.clone();
@@ -330,9 +313,7 @@ fn block_comment(chars: &[char], i: usize) -> Literal {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The walk: which lines do blocklisted work while a guard is held
-// ---------------------------------------------------------------------------
+// The walk: which lines do blocklisted work while a guard is held.
 
 /// A guard bound by a `let`: the name, the brace depth it was bound at, and
 /// the line that bound it.
@@ -361,7 +342,7 @@ impl Walk {
     /// Advance over one line of code; `true` when it is a finding.
     fn step(&mut self, bal: &str, line: usize) -> bool {
         let mut hit = false;
-        // Bind BEFORE the hit test so a same-line alias-then-call still counts.
+        // Bind before the hit test so a same-line alias-then-call still counts.
         if let Some((lhs, rhs)) = split_let(bal) {
             let ids = bind_guard(lhs, rhs).or_else(|| self.bind_alias(lhs, rhs));
             for name in ids.unwrap_or_default() {
@@ -414,10 +395,9 @@ impl Walk {
         hit
     }
 
-    /// The identifiers a line binds to a REBORROW of a tracked guard: `&`/`*` in
-    /// front with at most zero-arg hops after, or a spelled-out
-    /// `.deref()`/`.deref_mut()`. An accessor alone reads a VALUE out, and
-    /// treating those as guards once cascaded onto 100+ plain locals.
+    /// Identifiers a line binds to a reborrow of a tracked guard: `&`/`*` in
+    /// front with at most zero-arg hops after, or `.deref()`/`.deref_mut()`.
+    /// A bare accessor reads a value out and is not a guard.
     fn bind_alias(&self, lhs: &str, rhs: &str) -> Option<Vec<String>> {
         let rest = rhs.trim_start();
         let borrow = rest.starts_with(['&', '*']);
@@ -550,7 +530,7 @@ fn receives_work(bal: &str, id: &str) -> bool {
     false
 }
 
-/// A line that is ONLY a receiver and zero-arg hops (`t.grid_mut()`): its first
+/// A line that is only a receiver and zero-arg hops (`t.grid_mut()`): its first
 /// identifier, for a chain that continues on the next line.
 fn bare_receiver_line(bal: &str) -> Option<&str> {
     let t = bal.trim();
@@ -604,10 +584,9 @@ fn strip_prefixes(mut s: &str, parens: bool) -> &str {
     }
 }
 
-/// The identifiers a line binds to the GUARD ITSELF: a right-hand side whose top
-/// is the acquire (a path to it allowed) and whose acquire call closes on this
-/// line with nothing chained after it — a chain reads a VALUE out, which is
-/// what lets the detached `let pending = term_lock(t).resize_offloading_…` go.
+/// Identifiers a line binds to the guard itself: the right-hand side's top is
+/// the acquire, closing on this line with nothing chained after. A chain reads
+/// a value out (e.g. `let pending = term_lock(t).resize_offloading_…`).
 fn bind_guard(lhs: &str, rhs: &str) -> Option<Vec<String>> {
     let mut rest = strip_prefixes(rhs, true);
     while let Some(id) = leading_ident(rest)
@@ -657,7 +636,7 @@ fn strip_type(lhs: &str) -> &str {
     lhs
 }
 
-/// The identifiers a pattern BINDS: not `let`/`mut`/`ref`/`_`, and not a path
+/// The identifiers a pattern binds: not `let`/`mut`/`ref`/`_`, and not a path
 /// or constructor (an identifier followed by `(`, `[`, `{` or `::`).
 fn pattern_idents(lhs: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -711,9 +690,7 @@ fn shadows(bal: &str, id: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Every shape that has walked through this class, plus the ones closed
-    /// since: each must draw AT LEAST ONE finding. A shape that stops firing is
-    /// a whole-Mac freeze shipped green.
+    /// Shapes the detector must flag, each with at least one finding.
     const MUST_FIRE: &[(&str, &str)] = &[
         (
             "the original un-fixed cross_resize: the whole reflow on the held guard",
@@ -932,9 +909,7 @@ fn cross_resize(term: &Mutex<Terminal>, rows: usize, cols: usize) {
         ),
     ];
 
-    /// The documented-safe shapes a careless widening eats first: each must
-    /// draw NO finding. A detector that cries wolf gets ignored until it
-    /// protects nothing.
+    /// Documented-safe shapes that must draw no finding.
     const MUST_SILENT: &[(&str, &str)] = &[
         (
             "balanced single-line reads open no region",

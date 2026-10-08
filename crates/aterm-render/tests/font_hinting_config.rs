@@ -2,11 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! TYPOGRAPHY R2: the `font_hinting` config key's renderer seam
-//! ([`Renderer::set_font_hinting`]) — the one way to change the hint mode
-//! (W13; the construction-time `ATERM_FONT_HINTING` read was deleted 2026-09-24).
+//! ([`Renderer::set_font_hinting`]) — the one way to change the hint mode.
 //!
-//! Laws under test, on the native hint seam (Linux and — since the grid-fit
-//! wave — Windows):
+//! Laws under test, on the native hint seam (Linux and Windows):
 //! * the DEFAULT is `full` and the getter round-trips every canonical spelling;
 //! * a same-value set is a free `false` (no atlas invalidation), a real change
 //!   is `true`;
@@ -17,10 +15,9 @@
 //! * an unrecognized spelling resolves to the default (`full`).
 //!
 //! On targets without the seam (macOS CoreText, wasm fontdue) the setter is
-//! inert `false` and the getter reports `"off"` — HONESTLY, rather than the
-//! `"full"` it used to claim on every platform whether or not a single glyph
-//! was grid-fitted. Asserted here too, so the cross-platform contract is
-//! machine-checked everywhere the suite runs.
+//! inert `false` and the getter reports `"off"`, since no glyph is
+//! grid-fitted. Asserted here too, so the contract is checked on every
+//! platform the suite runs on.
 
 #![cfg(feature = "embedded-font")]
 

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of the PTY keeper's two machines (P2 of
-//! `docs/DESIGN-pty-keeper-2026-09-26.md` §6.4; the design names
-//! `tests/conformance_custody.rs` — it is a unit-test module instead, as P1's
-//! `crash_journal_conformance.rs` is, so the `#[refines]` anchors it checks
-//! are compiled in: `cfg(test)` turns them on, an integration test's build of
-//! the library does not): the REAL `KeeperCore` and
+//! Tier-1 of the PTY keeper's two machines
+//! (`docs/DESIGN-pty-keeper-2026-09-26.md` §6.4; a unit-test module, not an
+//! integration test, so the `#[refines]` anchors it checks are compiled in:
+//! `cfg(test)` turns them on, an integration test's build of the library does
+//! not): the REAL `KeeperCore` and
 //! `RelaunchBrake` against `PtyKeeperCustody` and `KeeperRelaunchBrake`
 //! (`aterm_spec::derive`), and the §5.4 classifier over real wait statuses.
 //!
@@ -25,10 +24,26 @@
 //! invariant. Wherever the model FORBIDS a relaunch or an offer, the real
 //! core made none; wherever it ALLOWS one after a tick, the core made it.
 //!
+//! The window's `LinkDrops` is driven both as the reconnect that registers
+//! again everything the window holds, and with a tab closed while the link is
+//! down (`LinkDrops` then `CloseTabA`/`B`): the reconnect registers only the
+//! open tabs, and the closed tab's RELEASE arrives on a connection that never
+//! claimed it, whose record only the dropped link of the same process claims.
+//!
+//! The update's successor is driven both ways the model's one `Commit` covers:
+//! one that registers at its Commit, and one that takes no part in the keeper
+//! (its keeper off, a build before the keeper), which never says HELLO, so its
+//! quit reaches the keeper only as its `exit(0)`. The window names its crash
+//! marker in every HELLO, as the product's does, and it is gone after the
+//! window's `exit(0)`: the Commit `_exit(0)`s through `clean_exit_now`, so a
+//! successor that crashed first (`SuccessorCrashesFirst`) leaves the keeper a
+//! Commit that reads, to §5.4 row 3's cross-check alone, as a quit.
+//!
 //! NEGATIVE CONTROL: the same real steps against `Buggy = 1` are rejected at
 //! the mutants' sites — a release the buggy keeper forgets, an update's exit
 //! the buggy keeper orphans, an offer that moves the copy, a BYE read as a
-//! crash.
+//! crash, a successor's quit read as one, a Commit read as a quit when its
+//! successor died first.
 //!
 //! BRAKE. Every schedule of `KeeperRelaunchBrake` is replayed on the real
 //! `RelaunchBrake`; the buggy model rejects the real decisions at its mutants.
@@ -112,6 +127,24 @@ impl KeeperEnv for World<'_> {
             .iter()
             .any(|(who, p)| *p == pid && self.st[format!("{who}_live").as_str()] == 1)
     }
+    /// The window's crash marker, named in each of its HELLOs: held by the
+    /// live window, gone once it ended through its exit path — the Commit's
+    /// `clean_exit_now` and the quit alike (a crash's status says otherwise).
+    fn marker(&mut self, pid: u32, _marker: &MarkerRef) -> MarkerEvidence {
+        match (pid == self.pids.w, self.st["w_live"] == 1) {
+            (false, _) => MarkerEvidence::Unknown,
+            (true, true) => MarkerEvidence::Held,
+            (true, false) => MarkerEvidence::Released,
+        }
+    }
+}
+
+/// The marker the window names at HELLO.
+fn window_marker() -> MarkerRef {
+    MarkerRef {
+        nanos: 1,
+        dir: b"/logs".to_vec(),
+    }
 }
 
 /// The runner: the real core (None while the keeper is down), the model state
@@ -129,7 +162,26 @@ struct Rig {
     /// be delivered (`KeeperHonoursBye`).
     quit_pending: bool,
     next_pid: u32,
+    /// The committed successor takes no part in the keeper (its keeper off, a
+    /// build before the keeper): it never says HELLO, registers nothing and
+    /// releases nothing. The model's `Commit` and `SuccessorQuits` are the
+    /// same steps for it as for one that registers; the runner drives both
+    /// (`CommitQuiet`, [`QUIET_COMMIT`]).
+    s_quiet: bool,
 }
+
+/// The runner's own move for a Commit to a successor that takes no part in
+/// the keeper: the model's `Commit`.
+const QUIET_COMMIT: &str = "CommitQuiet";
+
+/// The runner's own moves for a tab the window closes while its link is down:
+/// the model's `LinkDrops`, then its `CloseTabA` (`B`). The keeper reads the
+/// link's EOF while the window lives; the window closes the tab; its link
+/// reconnects and registers again only what the window still holds, then
+/// sends the closed tab's RELEASE — on a connection that never claimed that
+/// master, whose record only the DROPPED link of the same process claims.
+const LINK_DROPS_CLOSE_TAB_A: &str = "LinkDropsCloseTabA";
+const LINK_DROPS_CLOSE_TAB_B: &str = "LinkDropsCloseTabB";
 
 impl Rig {
     fn new(model: &Model) -> Self {
@@ -146,6 +198,7 @@ impl Rig {
             conn: BTreeMap::new(),
             quit_pending: false,
             next_pid: 7_001,
+            s_quiet: false,
         };
         let st = rig.st.clone();
         rig.connect("w", 0, &st);
@@ -165,6 +218,12 @@ impl Rig {
             st: env_st,
             pids: &self.pids,
         };
+        if role == "w" {
+            assert!(
+                core.name_marker(id, window_marker(), &mut env),
+                "the live window's marker is held"
+            );
+        }
         core.hello(id, PeerClass::App, CAP_SENDS_BYE | caps, self.now, &mut env)
     }
 
@@ -256,13 +315,31 @@ impl Rig {
             })
             .collect();
         format!(
-            "{recs:?} {:?} {} {} {:?} {}",
+            "{recs:?} {:?} {} {} {:?} {} {}",
             std::mem::discriminant(&core.relaunch_state()),
             core.brake().streak(),
             core.brake().held(),
-            core.pending_successor().map(|p| p.pid),
-            self.quit_pending
+            core.pending_successors()
+                .iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+            self.quit_pending,
+            self.s_quiet
         )
+    }
+
+    /// Whether `action` is one a committed successor that takes no part in the
+    /// keeper never makes while it lives: a REGISTER (the only one the model
+    /// enables then is the successor's), a RELEASE on its tab close — and the
+    /// outgoing window's late RELEASE beside it, which is then the last claim,
+    /// a case the model states only beside a successor that registered.
+    fn quiet_never(&self, action: &str) -> bool {
+        self.s_quiet
+            && self.st["s_live"] == 1
+            && matches!(
+                action,
+                "RegisterA" | "RegisterB" | "SuccessorClosesTabA" | "OutgoingReleasesA"
+            )
     }
 }
 
@@ -287,6 +364,8 @@ const ENV_MOVES: &[&str] = &[
     "Rollback",
     "SuccessorFailStops",
     "SuccessorCrashes",
+    "SuccessorCrashesFirst",
+    "SuccessorQuits",
     "AdoptA",
     "AdoptB",
     "RelaunchedLinkDrops",
@@ -296,13 +375,84 @@ const ENV_MOVES: &[&str] = &[
     "KeeperRestarts",
 ];
 
+/// [`LINK_DROPS_CLOSE_TAB_A`] (`B`): two model steps, `LinkDrops` then the
+/// tab's close, each checked on the real core.
+fn link_drops_close_tab(model: &Model, rig: &mut Rig, close: &'static str) -> Vec<Step> {
+    let rdev = if close == "CloseTabA" { A } else { B };
+    let before = rig.st.clone();
+    let mut dropped = before.clone();
+    assert!(
+        model.fire("LinkDrops", &mut dropped),
+        "LinkDrops was enabled"
+    );
+    let mut closed = dropped.clone();
+    assert!(model.fire(close, &mut closed), "{close} was enabled");
+    let now = rig.now;
+    let pids = rig.pids.clone();
+    let mut held = Vec::new();
+    if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.remove("w")) {
+        let mut env = World {
+            st: &dropped,
+            pids: &pids,
+        };
+        assert!(
+            core.eof(conn, now, &mut env).is_empty(),
+            "an EOF alone decides nothing"
+        );
+        held = [A, B]
+            .into_iter()
+            .filter(|r| {
+                core.records()
+                    .get(r)
+                    .is_some_and(|rec| rec.claimants.contains(&conn))
+            })
+            .collect();
+    }
+    if rig.core.is_some() {
+        let outs = rig.connect("w", CAP_LINK, &closed);
+        assert_eq!(
+            outs,
+            vec![Out::Welcome {
+                conn: rig.conn["w"],
+                offers: 0
+            }]
+        );
+        // The reconnect registers what the window still holds — not the
+        // closed tab — then sends that tab's RELEASE.
+        for r in held.iter().copied().filter(|r| *r != rdev) {
+            let outs = rig.register("w", r, &closed);
+            assert_eq!(outs, vec![Out::DropDuplicate(r)], "the claim moves");
+        }
+    }
+    let mid = rig.project(&dropped);
+    if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("w").copied()) {
+        let outs = core.release(conn, rdev);
+        if held.contains(&rdev) {
+            assert_eq!(
+                outs,
+                vec![Out::Close(rdev)],
+                "the RELEASE on the reconnected link closes what its dropped link claimed"
+            );
+        }
+    }
+    let after = rig.project(&closed);
+    rig.st = after.clone();
+    vec![(before, "LinkDrops", mid.clone()), (mid, close, after)]
+}
+
 /// Apply one environment move to the rig; returns the model steps it made.
-fn env_move(model: &Model, rig: &mut Rig, action: &'static str) -> Vec<Step> {
+fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
+    match mv {
+        LINK_DROPS_CLOSE_TAB_A => return link_drops_close_tab(model, rig, "CloseTabA"),
+        LINK_DROPS_CLOSE_TAB_B => return link_drops_close_tab(model, rig, "CloseTabB"),
+        _ => {}
+    }
+    let action = if mv == QUIET_COMMIT { "Commit" } else { mv };
     let before = rig.st.clone();
     let mut next = before.clone();
     assert!(model.fire(action, &mut next), "{action} was enabled");
     let k_live = rig.core.is_some();
-    match action {
+    match mv {
         "RegisterA" | "RegisterB" => {
             let (rdev, x) = if action == "RegisterA" {
                 (A, "a")
@@ -396,15 +546,17 @@ fn env_move(model: &Model, rig: &mut Rig, action: &'static str) -> Vec<Step> {
                 assert_eq!(core.pending(conn, s, now, None), vec![Out::WatchPid(s)]);
             }
         }
-        "Commit" => {
+        "Commit" | QUIET_COMMIT => {
             // The successor says HELLO and registers what the keeper holds
             // (beside its Commit); the outgoing window `_exit`s, but its
             // stream — late frames, EOF, exit status — is read later
-            // (`OutgoingDrained`), so until then it is a second claimant.
+            // (`OutgoingDrained`), so until then it is a second claimant. A
+            // successor that takes no part in the keeper says nothing.
             if let Some(conn) = rig.conn.remove("w") {
                 rig.conn.insert("o", conn);
             }
-            if k_live {
+            rig.s_quiet = mv == QUIET_COMMIT;
+            if k_live && !rig.s_quiet {
                 rig.connect("s", 0, &next);
                 for (rdev, x) in [(A, "a"), (B, "b")] {
                     let held = rig
@@ -456,6 +608,14 @@ fn env_move(model: &Model, rig: &mut Rig, action: &'static str) -> Vec<Step> {
                 core.peer_exit(s, 9, now, &mut env);
             }
         }
+        "SuccessorCrashesFirst" => {
+            // The successor crashes within the Commit's milliseconds: the
+            // keeper reads its end, then the outgoing window's EOF and
+            // `_exit(0)` — its marker gone, no BYE. (The other order, the
+            // successor's end still on its way, is `core`'s unit test.)
+            rig.die("s", 9, &next);
+            rig.die("o", 0, &next);
+        }
         "SuccessorFailStops" => {
             let now = rig.now;
             let s = rig.pids.s;
@@ -470,6 +630,14 @@ fn env_move(model: &Model, rig: &mut Rig, action: &'static str) -> Vec<Step> {
         }
         "SuccessorCrashes" => {
             rig.die("s", 9, &next);
+        }
+        "SuccessorQuits" => {
+            // BYE on the successor's link, when it has one, then its EOF and
+            // `exit(0)`; one that takes no part ends with `exit(0)` alone.
+            if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("s").copied()) {
+                core.bye(conn);
+            }
+            rig.die("s", 0, &next);
         }
         "AdoptA" | "AdoptB" => {
             // The relaunched window adopts and REGISTERs (the claim moves).
@@ -492,8 +660,8 @@ fn env_move(model: &Model, rig: &mut Rig, action: &'static str) -> Vec<Step> {
         "RelaunchedLinkDrops" => {
             // The relaunched window's link reads EOF before it registered its
             // offers, and reconnects (CAP_LINK). Every record offered on the
-            // dropped link is an orphan again, its leader watched again
-            // (round seven's finding 65); the reconnected link is offered
+            // dropped link is an orphan again, its leader watched again;
+            // the reconnected link is offered
             // nothing, since the window still holds each descriptor.
             let now = rig.now;
             let pids = rig.pids.clone();
@@ -566,7 +734,7 @@ fn env_move(model: &Model, rig: &mut Rig, action: &'static str) -> Vec<Step> {
             for role in ["w", "s", "r"] {
                 let live = next[format!("{role}_live").as_str()] == 1;
                 let connected = match role {
-                    "s" => next["committed"] == 1,
+                    "s" => next["committed"] == 1 && !rig.s_quiet,
                     _ => true,
                 };
                 if live && connected {
@@ -691,7 +859,24 @@ fn explore(
         .copied()
         .filter(|a| model.action_enabled(a, &rig.st))
         .filter(|a| *a != "KeeperHonoursBye" || rig.quit_pending)
+        .filter(|a| !rig.quiet_never(a))
         .collect();
+    if moves.contains(&"Commit") {
+        moves.push(QUIET_COMMIT);
+    }
+    if moves.contains(&"LinkDrops") {
+        let mut dropped = rig.st.clone();
+        assert!(model.fire("LinkDrops", &mut dropped));
+        for (mv, x) in [(LINK_DROPS_CLOSE_TAB_A, "a"), (LINK_DROPS_CLOSE_TAB_B, "b")] {
+            // The window's own close (not the relaunched window's).
+            if dropped[format!("w_reads_{x}").as_str()] == 1
+                && dropped["pending"] == 0
+                && dropped[format!("closed_{x}").as_str()] == 0
+            {
+                moves.push(mv);
+            }
+        }
+    }
     moves.push("Tick");
     for mv in moves {
         let mut next = rig.clone();
@@ -806,6 +991,8 @@ fn the_real_keeper_conforms_to_the_custody_model() {
         "KeeperHonoursBye",
         "RelaunchedLinkDrops",
         "RelaunchedWindowQuits",
+        "SuccessorQuits",
+        "SuccessorCrashesFirst",
     ] {
         assert!(
             rejected.get(site).copied().unwrap_or(0) > 0,

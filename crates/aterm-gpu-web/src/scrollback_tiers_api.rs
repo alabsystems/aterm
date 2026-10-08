@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! Tiered-scrollback attachment + byte budgets for the GPU wasm engine
-//! (audit E1) — the GPU sibling of `aterm-wasm/src/scrollback_tiers_api.rs`,
-//! which carries the full design rationale (frame-boundary compression per
-//! SCROLL-1, the glue drain contract for render-throttled panes, the
-//! equal-share global budget policy, build-truth capabilities). Kept
-//! behavior-identical: the two web crates are separate wasm modules, so each
-//! carries its own thin glue over the SHARED engine policy in
-//! `aterm_core::terminal::scrollback_shared_budget` +
+//! Tiered-scrollback attachment and byte budgets for the GPU wasm engine: the
+//! counterpart of `aterm-wasm/src/scrollback_tiers_api.rs`, which documents
+//! the design (frame-boundary compression, the drain contract for throttled
+//! panes, the equal-share global budget). Each wasm module carries its own
+//! thin glue over the shared policy in
+//! `aterm_core::terminal::scrollback_shared_budget` and
 //! `TerminalBuilder::tiered_scrollback_defaults`.
 
 #[cfg(target_arch = "wasm32")]
@@ -21,13 +19,12 @@ use aterm_core::terminal::{Terminal, TerminalBuilder};
 
 use crate::AtermGpuTerminal;
 
-/// Staged lines promoted (LZ4) into the store per rendered frame — same
-/// sizing rationale as the CPU sibling (~120k lines/s at 60 fps, ~2k-line
-/// bounded per-frame spike).
+/// Staged lines promoted (LZ4) into the store per rendered frame: ~120k
+/// lines/s at 60 fps with a bounded per-frame spike.
 pub(crate) const RENDER_DRAIN_BATCH_LINES: usize = 2_048;
 
-/// Build the wasm engine's terminal: the ENGINE-DEFAULT tiered store behind
-/// the default hot ring, ingest-path compression handed to the frame boundary.
+/// Build the wasm engine's terminal: the engine-default tiered store behind
+/// the default hot ring, with compression deferred to the frame boundary.
 pub(crate) fn tiered_terminal(rows: u16, cols: u16) -> Terminal {
     let mut term = TerminalBuilder::new()
         .size(rows, cols)
@@ -57,9 +54,8 @@ impl AtermGpuTerminal {
             let _ = self.term.set_memory_budget(bytes);
         }
         if self.term.lazy_backlog_len() > 0 {
-            // A trickle OPPORTUNITY, as in the CPU sibling: skipped while a
-            // flood is cutting and still outrunning a batch per frame, so one
-            // flood leaves one marker.
+            // A trickle opportunity, skipped while a flood is cutting and
+            // outrunning a batch per frame, so one flood leaves one marker.
             self.term.trickle_lazy_bounded(RENDER_DRAIN_BATCH_LINES);
         }
     }
@@ -77,7 +73,7 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Set the MODULE-GLOBAL scrollback budget shared by every pane of this
+    /// Set the module-global scrollback budget shared by every pane of this
     /// wasm module/worker (`0` = unlimited, the default).
     pub fn set_scrollback_global_budget(bytes: u32) {
         set_global_scrollback_budget(bytes as usize);
@@ -100,9 +96,8 @@ impl AtermGpuTerminal {
     }
 
     /// Promote up to `max_lines` staged lines into the compressed store
-    /// (`0` = the render-frame batch size). Returns the lines STILL staged.
-    /// For hosts draining a pane whose render is throttled; a trickle
-    /// opportunity like the frame drain (see the aterm-wasm twin).
+    /// (`0` = the render-frame batch size). Returns the lines still staged.
+    /// For hosts draining a pane whose render is throttled.
     pub fn drain_scrollback_backlog(&mut self, max_lines: u32) -> u32 {
         if let Some(bytes) = self.budget_share.pending_effective() {
             let _ = self.term.set_memory_budget(bytes);
@@ -120,16 +115,15 @@ impl AtermGpuTerminal {
         u32::try_from(self.term.lazy_backlog_len()).unwrap_or(u32::MAX)
     }
 
-    /// Monotonic count of history lines LOST to non-user-requested truncation
-    /// (audit E10a, out of band; a flood cut is also marked in content by one
-    /// dim row, store-pressure evictions are not). See the aterm-wasm twin
-    /// for the full contract.
+    /// Monotonic count of history lines lost to truncation the user did not
+    /// request. A flood cut is also marked in content by one dim row;
+    /// store-pressure evictions are not.
     pub fn scrollback_truncated_lines(&self) -> f64 {
         self.term.scrollback_truncated_lines() as f64
     }
 
     /// Current scrollback memory-pressure watermark: 0 green / 1 yellow /
-    /// 2 red (audit E10a co-land — pressure observable before loss begins).
+    /// 2 red, observable before loss begins.
     pub fn scrollback_pressure(&self) -> u8 {
         match self.term.scrollback_pressure_level() {
             aterm_core::scrollback::WatermarkLevel::Green => 0,
@@ -145,9 +139,8 @@ impl AtermGpuTerminal {
     }
 }
 
-/// The pure JSON rendering, split out of the exported method so the WIRE SHAPE
-/// can be pinned for every capability combination rather than only the one this
-/// build happens to select. Not exported, so the wasm ABI is unchanged.
+/// The pure JSON rendering, split out so the wire shape can be pinned for
+/// every capability combination. Not exported.
 fn render_tier_capabilities_json(caps: aterm_core::scrollback::TierCapabilities) -> String {
     let codec = match caps.cold_codec {
         aterm_core::scrollback::ColdTierCodec::Lz4 => "lz4",
@@ -196,21 +189,13 @@ mod tests {
     }
 
     /// The JSON wire contract the host glue parses: exact keys, lowercase codec
-    /// tokens, JSON-lowercase booleans.
+    /// tokens, JSON booleans.
     ///
-    /// This is a NATIVE test binary, and cargo unifies features per build — under
-    /// `cargo test --workspace` the members that take `aterm-core` default-featured
-    /// pull `disk-tier` (hence `zstd`) onto the single `aterm-scrollback` unit, so
-    /// `TierCapabilities::current()` legitimately reads zstd/true here and lz4/false
-    /// under `-p aterm-gpu-web`. A hard-coded literal therefore pinned the
-    /// INVOCATION, not the contract, and had to be wrong for one of them.
-    ///
-    /// So pin every combination against the pure renderer — no arm can go dead —
-    /// and separately assert the exported method reports THIS build faithfully. The
-    /// shipped module's lz4/no-spill shape is enforced structurally instead: the
-    /// wasm builds are `-p`-scoped (the wasm cells, `tools/wasm-bench/run.sh`) and
-    /// `disk-tier` drags in libc mmap + zstd-sys C, which cannot target
-    /// wasm32-unknown-unknown — so it fails to BUILD long before any assertion.
+    /// Feature unification means `TierCapabilities::current()` differs between
+    /// `--workspace` and `-p` test builds, so every combination is pinned
+    /// against the pure renderer, and the exported method is only checked to
+    /// report this build. The shipped lz4/no-spill shape holds structurally:
+    /// `disk-tier` cannot build for wasm32-unknown-unknown.
     #[test]
     fn tier_capabilities_json_pins_the_wire_contract() {
         use aterm_core::scrollback::{ColdTierCodec, TierCapabilities};

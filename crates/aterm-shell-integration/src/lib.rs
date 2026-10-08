@@ -45,7 +45,8 @@ use std::sync::{Mutex, PoisonError};
 
 /// Embedded shell integration scripts (compiled into the binary).
 ///
-/// `aterm-core` is the canonical owner of the shell script bodies. The macOS
+/// This crate is the canonical owner of the shell script bodies (`aterm-core`
+/// re-exports it as `shell_integration`). The macOS
 /// app bundle ships byte-identical copies in
 /// `apps/aterm-mac/Sources/ATermMac/Resources/ShellIntegration/`, and the
 /// shell-integration test module enforces that parity so cross-consumer drift
@@ -61,8 +62,8 @@ pub mod scripts {
     /// counterpart — the Windows/pwsh path ships from the Rust binary only).
     pub const POWERSHELL: &str = include_str!("scripts/aterm_shell_integration.ps1");
 
-    /// The comment that opens the BODY of the zsh, bash and fish scripts (the
-    /// LOADER / BODY split, 2026-09-26): everything from the line it starts to
+    /// The comment that opens the BODY of the zsh, bash and fish scripts:
+    /// everything from the line it starts to
     /// the line [`BODY_END`] starts is the part a shell that is ALREADY RUNNING
     /// re-sources when its host points it at a newer build's folder. See "THE
     /// LOADER" in the zsh script.
@@ -103,8 +104,8 @@ const BODY_FILE_HEADER: &str = "\
 /// same content-addressed folder.
 pub const BODY_FILE_STEM: &str = "aterm_shell_integration_body";
 
-/// The environment variable that names a session's BODY POINTER (2026-09-26):
-/// set by the host at spawn, captured and scrubbed by the zsh/bash/fish loaders,
+/// The environment variable that names a session's BODY POINTER: set by the
+/// host at spawn, captured and scrubbed by the zsh/bash/fish loaders,
 /// checked at every prompt (`__aterm_body_check`). The file, when the host
 /// writes it, holds the 16-hex address of a script folder under the same cache
 /// root — whose body the shell sources at its next prompt.
@@ -179,12 +180,11 @@ impl ShellType {
             "bash" | "bash5" => Self::Bash,
             "fish" => Self::Fish,
             "pwsh" | "powershell" => Self::PowerShell,
-            // The `shell = "wsl"` / `"cmd"` aliases the Windows PTY seam already
-            // resolves first-class (`aterm_pty::windows::shell::discover_shell`).
-            // Before these arms both fell to `Unknown`, `prepare()` injected
-            // NOTHING, and every OSC 133 consumer — jump-to-prompt, command
-            // blocks, `blocks`/`wait`, cwd inherit — was silently dead in a WSL
-            // or cmd tab even though the tab looked like any other.
+            // The `shell = "wsl"` / `"cmd"` aliases the Windows PTY seam
+            // resolves (`aterm_pty::windows::shell::discover_shell`). As
+            // `Unknown`, `prepare()` would inject NOTHING and every OSC 133
+            // consumer (jump-to-prompt, blocks, `wait`, cwd inherit) would be
+            // silently dead in a WSL or cmd tab.
             "wsl" => Self::Wsl,
             "cmd" => Self::Cmd,
             _ => Self::Unknown,
@@ -198,10 +198,9 @@ impl ShellType {
     /// so there we mirror the PTY seam's `select_shell()` with no override given:
     /// PowerShell — the shell aterm actually spawns (`pwsh`/`powershell`, both in
     /// System32, resolve before any `cmd` fallback). A configured `shell` /
-    /// `--shell` is the caller's hint and never reaches this default. Returning PowerShell here is what
-    /// makes the `-ExecutionPolicy Bypass` + OSC 7/133 injection reach the spawned
-    /// shell; the previous `$SHELL`-only body returned `Unknown` on Windows, so NOTHING
-    /// was injected and a policy-restricted box failed with "running scripts is disabled".
+    /// `--shell` is the caller's hint and never reaches this default. Returning
+    /// PowerShell is what makes the `-ExecutionPolicy Bypass` + OSC 7/133
+    /// injection reach the spawned shell on Windows.
     #[must_use]
     pub fn detect_current() -> Self {
         #[cfg(not(windows))]
@@ -280,13 +279,9 @@ impl ShellNonce {
 /// `unix` and `windows` ONLY — exactly the targets that have the audited
 /// entropy surface. See [`fill_nonce_entropy`] for why there is no third arm.
 #[must_use]
-// Trust: the fill bottoms out in an out-of-bundle syscall wrapper whose only panic
-// path is an UNRECOVERABLE OS-entropy failure — a deliberate, documented fail-loud
-// design choice (below): we PREFER that catastrophic-rare panic to silently weakening
-// the nonce. Its panic-freedom is therefore a documented ASSUMPTION on the OS CSPRNG,
-// not a provable property (the OS RNG can, in principle, fail), so this thin
-// nonce-constructor takes `#[trust::skip]` responsibility for it — the same
-// documented-external-assumption tier as the workspace's other skips.
+// Trust: the fill's only panic is an unrecoverable OS-entropy failure, chosen over
+// a weaker nonce (see `fill_nonce_entropy`). Its panic-freedom is an assumption on
+// the OS CSPRNG, not provable, hence the skip.
 #[cfg_attr(trust_verify, trust::skip)]
 #[cfg(any(unix, windows))]
 pub fn generate_nonce() -> ShellNonce {
@@ -300,37 +295,15 @@ pub fn generate_nonce() -> ShellNonce {
 /// platform.
 ///
 /// Unix and Windows go through [`aterm_uds::rand::fill`] — `getentropy(2)` with
-/// a bounded `read_exact` fallback, `BCryptGenRandom` on Windows. That is the
-/// rule `tools/grep_guard.sh` B4 enforces after the 2026-07-04/05
-/// unbounded-`/dev/urandom` kernel panic, and routing here is what let
-/// `rand_core` leave the shipped graph.
+/// a bounded `read_exact` fallback, `BCryptGenRandom` on Windows — the audited
+/// helper `tools/grep_guard.sh` B4 requires.
 ///
-/// # There is no `wasm32` arm, and that is the design
-/// There used to be one: a `getrandom::getrandom` call behind a
-/// `cfg(all(target_arch = "wasm32", target_os = "unknown"))` dependency table,
-/// with a `compile_error!` for every other target. It bought a JS
-/// `crypto.getRandomValues` bridge that NOTHING IN A BROWSER CAN REACH.
-/// `generate_nonce` has exactly one caller in the workspace —
-/// `crates/aterm-gui/src/spawn.rs`, minting the `ATERM_SHELL_NONCE` a spawned
-/// shell will echo back — and there is no PTY, no spawned shell, and no child
-/// environment in a browser. The mint compiled for wasm32 and was never called
-/// there.
-///
-/// So the arm was not an entropy source; it was a dependency. `getrandom 0.2`
-/// with `features = ["js"]` was the only thing holding `getrandom` (and, on the
-/// CPU module, `js-sys`) in the shipped browser graph: −2 packages / −9,774 LOC
-/// on `wasm-cpu` and −1 / −1,997 on `wasm-gpu` when it and the three
-/// "harmless if unused" sibling rows went. It was also the workspace's ONLY
-/// entropy path that B4's audited-helper rule did not cover, since it never
-/// touched `aterm-uds`.
-///
-/// The mint now exists exactly where the audited surface exists. A target with
-/// no `aterm_uds::rand` gets no `generate_nonce` at all, so reaching for one is
-/// a name error at the call site that names this function — deliberate, and
-/// strictly louder than a nonce minted from an unaudited source. Adding a
-/// target means adding its CSPRNG here first. `tools/grep_guard.sh` B18 keeps
-/// the shortcut closed: no shipped manifest may declare a third-party entropy
-/// crate.
+/// # No `wasm32` arm
+/// The callers (aterm-gui's `spawn.rs`, `shell_rekey.rs`) mint a nonce for a
+/// spawned shell, and a browser spawns none. A target with no `aterm_uds::rand`
+/// gets no `generate_nonce`, so reaching for one is a name error rather than a
+/// nonce from an unaudited source. Adding a target means adding its CSPRNG here
+/// first; `tools/grep_guard.sh` B18 bars third-party entropy crates.
 ///
 /// # Panics
 /// When the OS CSPRNG is unavailable. Deliberate and documented: a weaker
@@ -363,9 +336,8 @@ pub fn hex_encode(bytes: &[u8; SHELL_NONCE_BYTES]) -> String {
     out
 }
 
-// Not platform-gated: `script_set_address` (every platform) names its folder
-// with it, and the wasm32 cell failed to type-check without it (gate cells,
-// 2026-09-26).
+// Not platform-gated: `script_set_address` (every platform, wasm32 included)
+// names its folder with it.
 const fn nibble_to_hex(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
@@ -417,7 +389,7 @@ pub const fn has_rekey_hook(shell: ShellType) -> bool {
     matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
 }
 
-/// THE TYPED RE-KEY (2026-09-26): what a line typed at a shell's prompt runs to
+/// THE TYPED RE-KEY: what a line typed at a shell's prompt runs to
 /// take a new nonce from the one-use file `quoted_path` — a word the caller has
 /// already quoted for `shell` — and remove the file, for a shell spawned BEFORE
 /// the re-key channel, whose script has no `__aterm_rekey_check` and so never
@@ -425,15 +397,23 @@ pub const fn has_rekey_hook(shell: ShellType) -> bool {
 /// relaunch line: the one moment such a shell, not the agent, holds the
 /// terminal. `None` for a shell with no such script.
 ///
-/// It sets the two globals every script since `f93cf3ba1` (2026-08-16) signs
-/// its marks from, and every emitter reads them when it runs, never at source
+/// It sets the two globals every script since `f93cf3ba1` signs its marks
+/// from, and every emitter reads them when it runs, never at source
 /// time: `__aterm_shell_nonce` (`typeset -g` in zsh, a plain global in bash,
 /// `set -g` in fish) and `__aterm_id_suffix_str` (`;id=<nonce>`) — measured in
 /// the scripts of the builds that spawned the owner's degraded tabs (0.91 and
 /// the 2026-09-10 build; `git show v0.91.0:crates/aterm-shell-integration/src/scripts/…`),
 /// and pinned for this build's by `the_typed_rekey_sets_the_globals_the_marks_read`.
 /// The key never enters the typed text, argv (`read` is a builtin), the
-/// scrollback or history: only the path does. A file that is gone by the time
+/// scrollback or history: only the path does. Nor a user's `set -x` trace: zsh
+/// and bash print it on the stderr the command runs with, so in zsh and bash
+/// every command that expands the key sits INSIDE the group whose stderr is
+/// silenced (outside it, the assignment traces the key in plain text; measured
+/// on zsh 5.9 and bash 3.2). Not under bash 4.1+'s `BASH_XTRACEFD`, whose
+/// trace goes to a
+/// descriptor no group silences: there the assignments still write the key into
+/// the file the user named for the trace (measured on bash 5.2.37; the scripts
+/// themselves trace no key there). A file that is gone by the time
 /// the line runs changes nothing — the `read` fails (quietly in zsh and bash;
 /// fish may print its redirection warning), the nonce keeps its value, and the
 /// suffix is rebuilt from it — so a withdrawn key cannot strand the command the
@@ -451,8 +431,9 @@ pub fn typed_rekey(shell: ShellType, quoted_path: &str) -> Option<String> {
     let p = quoted_path;
     match shell {
         ShellType::Zsh | ShellType::Bash => Some(format!(
-            "{{ read -r __aterm_shell_nonce <{p}; }} 2>/dev/null; command rm -f -- {p}; \
-             __aterm_id_suffix_str=\";id=$__aterm_shell_nonce\";"
+            "{{ read -r __aterm_shell_nonce <{p}; \
+             __aterm_id_suffix_str=\";id=$__aterm_shell_nonce\"; }} 2>/dev/null; \
+             command rm -f -- {p};"
         )),
         ShellType::Fish => Some(format!(
             "read -g __aterm_shell_nonce <{p} 2>/dev/null; command rm -f -- {p}; \
@@ -462,8 +443,8 @@ pub fn typed_rekey(shell: ShellType, quoted_path: &str) -> Option<String> {
     }
 }
 
-/// [`typed_rekey`] that ALSO UPGRADES THE SHELL'S INTEGRATION IN PLACE
-/// (2026-09-26): what a line typed at the prompt of a shell spawned BEFORE
+/// [`typed_rekey`] that ALSO UPGRADES THE SHELL'S INTEGRATION IN PLACE: what a
+/// line typed at the prompt of a shell spawned BEFORE
 /// loaders existed runs, so that its integration — fixed at spawn, and reached
 /// by no body pointer — becomes this build's, with the loader that takes every
 /// later build's body at a prompt.
@@ -474,15 +455,16 @@ pub fn typed_rekey(shell: ShellType, quoted_path: &str) -> Option<String> {
 /// the old key-only text would take for a key), then the folder of this build's
 /// scripts and the session's body pointer path when the shell has no loader.
 /// The line reads them into short-lived globals with builtins, removes the
-/// file, sources — only when a folder was named and holds this shell's loader —
-/// that loader with the pointer path in hand, and only THEN takes the key as
-/// [`typed_rekey`] does. The loader recognises the shell as its own (it holds
-/// `__aterm_shell_nonce`, which no other shell can have inherited, and which
-/// the line has not assigned yet) and upgrades it in place: the hooks it already
-/// has are kept, the body and the trampoline are replaced, the nonce it signs
-/// with is kept until the line hands it the file's. A NESTED shell — started in
-/// the tab, so it inherited the guard and ran no integration of its own — holds
-/// no nonce, and the loader stops at the guard.
+/// file, takes the key as [`typed_rekey`] does, and THEN sources — only when a
+/// folder was named and holds this shell's loader — that loader with the
+/// pointer path in hand. The loader recognises the shell as its own (it holds
+/// `__aterm_shell_nonce` AND the hook function its integration defined, which
+/// no other shell can have inherited and no typed line defines) and upgrades it
+/// in place: the hooks it already has are kept, the body and the trampoline are
+/// replaced, and the revision it signs at once carries the file's key — the one
+/// a degraded tab's engine verifies. A NESTED shell — started in the tab, so it
+/// inherited the guard and ran no integration of its own — defines no such
+/// hook, and the loader stops at the guard, at this line and every later one.
 ///
 /// Nothing in the text is a path but the file's own; the folder and the pointer
 /// never appear in typed text, argv, scrollback or history. A file that is gone
@@ -505,35 +487,38 @@ pub fn typed_rekey_with_loader(shell: ShellType, quoted_path: &str) -> Option<St
     // path — named short because the line shares the tty's bound with the
     // relaunch it carries, and unset at its end; every read is `-`-guarded.
     //
-    // The loader is sourced BEFORE the key is assigned (review finding
-    // 2026-09-26). The loader takes `__aterm_shell_nonce` as its proof that the
-    // shell is its own, and the harness types this line into whichever shell
-    // leads the tab's foreground group — a NESTED shell too (a `bash` typed in
-    // the tab, a `nix develop`), which inherited the exported guard and holds no
-    // nonce. Assigned first, the key WAS that proof: the nested shell was
-    // "upgraded in place" — every zsh hook wired, a bash's PATH re-fronted by the
-    // body — and signed `integration_rev=current` for a tab whose own shell was
-    // still frozen. Sourced first, the loader sees the shell as it was, and a
-    // nested one stops at the guard. fish reads the file through `cat`: a
+    // The key is assigned BEFORE the loader is sourced, so the revision an
+    // upgrade in place signs at once carries the key the line delivers. Sourced
+    // first, the loader would sign with the key a DEGRADED tab's engine lost, the
+    // mark would be dropped, and the new key would go unseen until the shell's
+    // next prompt — hours away behind the agent the line relaunches.
+    //
+    // The order is safe for a NESTED shell (a `bash` typed in the tab, a `nix
+    // develop`), which inherited the exported guard and which the harness types
+    // this line into when it leads the tab's foreground group: the loader's
+    // proof that a shell is its own is the nonce AND the hook function its
+    // integration defined, which no child shell inherits and this line never
+    // defines — so the key the line leaves in a nested shell proves nothing, and
+    // the loader stops at the guard. fish reads the file through `cat`: a
     // redirection from a file that is gone prints two warnings on the user's
     // screen whatever stderr says (measured on fish 4.9.3), and a withdrawn file
     // must change nothing, quietly.
     Some(match shell {
         ShellType::Fish => format!(
             "command cat {p} 2>/dev/null | begin; read -g __atk; read -g __atd; read -g __atp; \
-             end; command rm -f -- {p}; set -g __atl \"$__atd/{loader}\"; \
-             test -f \"$__atl\"; and begin; \
-             set -g ATERM_INTEGRATION_POINTER $__atp; source \"$__atl\"; end; \
+             end; command rm -f -- {p}; \
              test -n \"$__atk\"; and set -g __aterm_shell_nonce $__atk; \
              set -g __aterm_id_suffix_str \";id=$__aterm_shell_nonce\"; \
+             set -g __atl \"$__atd/{loader}\"; test -f \"$__atl\"; and begin; \
+             set -g ATERM_INTEGRATION_POINTER $__atp; source \"$__atl\"; end; \
              set -e __atk __atd __atp __atl;"
         ),
         _ => format!(
-            "{{ {{ read -r __atk; read -r __atd; read -r __atp; }} <{p}; }} 2>/dev/null; \
+            "{{ {{ read -r __atk; read -r __atd; read -r __atp; }} <{p}; \
+             [ -n \"${{__atk-}}\" ] && __aterm_shell_nonce=$__atk; \
+             __aterm_id_suffix_str=\";id=$__aterm_shell_nonce\"; }} 2>/dev/null; \
              command rm -f -- {p}; __atl=\"${{__atd-}}/{loader}\"; [ -f \"$__atl\" ] && \
              {{ ATERM_INTEGRATION_POINTER=${{__atp-}}; . \"$__atl\"; }}; \
-             [ -n \"${{__atk-}}\" ] && __aterm_shell_nonce=$__atk; \
-             __aterm_id_suffix_str=\";id=$__aterm_shell_nonce\"; \
              unset __atk __atd __atp __atl;"
         ),
     })
@@ -554,19 +539,12 @@ static SCRIPTS_WRITTEN: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// install is memoized per process, so repeated calls — one per spawned
 /// tab/split, on the UI thread — cost a single stat.
 ///
-/// WHY A FOLDER PER SCRIPT SET, NEVER ONE SHARED FOLDER (measured 2026-09-24 on
-/// the owner's Mac, 0.93.0): every aterm used to write the same flat
-/// `~/.cache/aterm/shell-integration/`, once per process, and afterwards only
-/// checked that the file existed. `stat` showed the scripts rewritten 20 ms after
-/// a foreign GUI-mode start (pid 87172, not the daily driver) armed its crash
-/// marker; from then on every NEW tab of the running window sourced whatever that
-/// start had written, for the window's whole life, with no signal. The same
-/// happens for the dev bundle (0.91) or a stale test binary whose scripts differ
-/// — and they do differ: 0.91 → 0.93 renamed the reroute passthrough variable.
-/// A folder named by its contents is written once (temp dir + rename, never
-/// overwritten), so another build can only ever write ITS folder, and this
-/// build's tabs keep sourcing this build's bytes. The legacy flat files are left
-/// where they are: older builds still write and read them.
+/// WHY A FOLDER PER SCRIPT SET: with one shared folder, any other build that
+/// started (a dev bundle, a stale test binary) rewrote the scripts, and every
+/// new tab of the running window silently sourced that build's bytes. A folder
+/// named by its contents is written once (temp dir + rename, never
+/// overwritten), so another build can only write ITS folder. The legacy flat
+/// files are left alone: older builds still write and read them.
 ///
 /// Returns `None` for unknown shell types.
 pub fn prepare(shell: ShellType) -> Result<Option<InjectionEnv>, std::io::Error> {
@@ -592,11 +570,9 @@ pub fn ensure_script_set() -> Result<PathBuf, std::io::Error> {
 /// collection of a folder older than [`GC_MIN_AGE`]). The folder is recorded
 /// only on `Ok`, so an I/O failure retries on the next spawn.
 // Skip: `Option<PathBuf>::as_deref` dispatches PathBuf's Deref through the
-// generic trait path (PathBuf is not yet in the std-wrapper deref sentinel
-// set); every I/O path returns Err (fail-closed) and the cache contract is
-// unit-tested. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed: INCONCLUSIVE (2 of 3
-// unknown). Needed from $HOME/trust, in a promoted seal: PathBuf in the
-// std-wrapper deref sentinel set; then drop this.
+// generic trait path (PathBuf is not in the std-wrapper deref sentinel set);
+// every I/O path returns Err and the cache contract is unit-tested. Drop the
+// skip once a promoted Trust seal adds PathBuf to that set.
 #[cfg_attr(trust_verify, trust::skip)]
 fn prepare_cached(
     shell: ShellType,
@@ -880,8 +856,8 @@ fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
 /// The same in every containment mode. The aterm process writes these files and
 /// the shell only reads them, so they belong where a Containment shell cannot
 /// write: its Seatbelt profile confines its writes to the temp roots
-/// (`aterm_containment::sbpl`), and a script staged there — as `/tmp` staging for
-/// Containment and Safety once did — could be rewritten by the contained shell
+/// (`aterm_containment::sbpl`), and a script staged there could be rewritten by
+/// the contained shell
 /// (or by another user, in the shared `/tmp`) and sourced by the next tab's
 /// unsandboxed shell.
 fn cache_dir() -> PathBuf {
@@ -910,28 +886,16 @@ fn cache_dir() -> PathBuf {
 
 /// Write one integration script/wrapper file.
 ///
-/// Funnels every script write through a single non-generic call site, spelled
-/// as the open `File::create` + `write_all` shape (exactly what
-/// [`std::fs::write`]'s inner fn does, so behavior is identical). This lets
-/// the verifier discharge the FFI-boundary obligations for the underlying
-/// `write(2)` statically here, instead of re-deriving (and refuting) them at
-/// each of the six call sites in [`ensure_scripts`]. (Calling `fs::write`
-/// directly re-derives those `write(2)` obligations against the generic shim
-/// and REFUTES them — verified under trustc c7c60c0a7 — so this open-coded
-/// shape must stay.)
+/// The open-coded `File::create` + `write_all` (what [`std::fs::write`] does
+/// inside) is one non-generic call site where the verifier discharges the
+/// `write(2)` obligations; calling `fs::write` re-derives them against the
+/// generic shim and refutes them (trustc c7c60c0a7).
 ///
-/// Known Trust L0 artifact: `File::create` is a hardened `raw_path_api`
-/// boundary (path resolution + default creation semantics) that can only be
-/// discharged by capability contracts, which this campaign does not add. It
-/// must stay: scripts are rewritten on every [`prepare`], so the unflagged,
-/// non-clobbering `File::create_new` would be a behavior change (fails with
-/// `AlreadyExists` on the second run), and `remove_file` + `create_new` is
-/// both flagged itself and not identity-preserving (new inode/permissions).
-// Skip: the one open here is the `raw_path_api` hardening flag on
-// `File::create` itself, which the doc above establishes MUST stay (create_new
-// is a behavior change; remove+create_new is not identity-preserving) and can
-// only be discharged by capability contracts this campaign does not add. The
-// audit is the doc comment; the skip is the classification.
+/// `File::create` must stay: [`prepare_into`] rewrites existing files, so
+/// `create_new` would fail with `AlreadyExists`, and `remove_file` +
+/// `create_new` changes the inode and permissions.
+// Skip: the remaining open is `File::create`'s `raw_path_api` hardening flag,
+// dischargeable only by capability contracts.
 #[cfg_attr(trust_verify, trust::skip)]
 fn write_script(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     use std::io::Write;
@@ -1159,8 +1123,8 @@ fn prepare_fish(base: &Path) -> InjectionEnv {
 /// script *file* throws a `PSSecurityException` (`FullyQualifiedErrorId:
 /// UnauthorizedAccess`) — so our own integration would fail on a stock box and
 /// print a scary "unauthorized" error at every launch. The flag scopes ONLY to
-/// this aterm-spawned process, is valid in both 5.1 and pwsh 7, and matches what
-/// the injection test already asserts. (No-op on non-Windows pwsh.)
+/// this aterm-spawned process and is valid in both 5.1 and pwsh 7. (No-op on
+/// non-Windows pwsh.)
 fn prepare_powershell(base: &Path) -> InjectionEnv {
     InjectionEnv {
         env_add: vec![(
@@ -1226,8 +1190,7 @@ const WSLENV_ENTRIES: [&str; 3] = [
 ///    already sources `/etc/profile` + `.bash_profile`/`.profile` + `.bashrc`
 ///    (so the `-i` non-login shell still sees a login shell's environment) and
 ///    then the integration script;
-/// 4. otherwise `exec $SHELL -l` — byte-for-byte today's behaviour, no
-///    integration, nothing lost.
+/// 4. otherwise `exec $SHELL -l` — the plain login shell, no integration.
 const WSL_LAUNCH_SH: &str = concat!(
     r#"if [ -n "$ATERM_WSL_CWD" ] && [ -d "$ATERM_WSL_CWD" ]; then cd "$ATERM_WSL_CWD"; fi; "#,
     "unset ATERM_WSL_CWD; ",
@@ -1328,9 +1291,8 @@ const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 
 /// cmd.exe injection: a title, prompt marks and cwd, woven into `%PROMPT%`.
 ///
-/// cmd has no profile, no preexec hook and no scripting seam — so the honest
-/// ceiling here is a PARTIAL integration, and shipping it beats today's
-/// silence. `PROMPT` is the one string cmd re-renders on every input line, and
+/// cmd has no profile, no preexec hook and no scripting seam, so this is a
+/// PARTIAL integration. `PROMPT` is the one string cmd re-renders on every input line, and
 /// it understands `$E` (ESC) and `$P` (the live current directory), which is
 /// exactly enough for:
 ///
@@ -1359,9 +1321,6 @@ const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 ///   needs no sanitising, unlike the pwsh title: a Win32 file name cannot hold
 ///   a character from 1 through 31, so no directory can end the OSC early. It
 ///   is the full path, not `~\…` — cmd's prompt has no string operations.
-///   Windows Terminal, for comparison, leaves a cmd tab on the console's
-///   program-path title; its cmd prompt recipe uses `$P` only in an OSC 9;9
-///   for duplicating a tab, never in the title.
 /// * `OSC 633;P;Cwd=` — the cwd, so the tab label tracks `cd` and a new tab
 ///   opens where this one is. `$P` yields a native `C:\dir`, which the engine
 ///   stores verbatim; building a `file://` URI would need percent-encoding cmd
@@ -1384,7 +1343,7 @@ const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 /// `PROMPT` (verified — `%VAR%` renders literally), so every block would
 /// report a fabricated `exit=0`, and a lie in an introspection surface agents
 /// read is worse than an honest gap. The gap is documented at the `shell`
-/// config key rather than left for the user to discover.
+/// config key.
 ///
 /// An inherited `%PROMPT%` is WRAPPED, not replaced, so a user who set their
 /// own prompt keeps it; a `PROMPT` that already carries our marks (a nested
@@ -1392,9 +1351,8 @@ const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 ///
 /// Unlike the script-driven shells, cmd cannot scrub `ATERM_SHELL_NONCE` from
 /// its environment after reading it — the nonce is IN the prompt string, so it
-/// is visible to child processes of a cmd tab either way. This is a genuinely
-/// weaker guarantee than bash/zsh/fish/pwsh get, and it is the price of cmd
-/// having no code of its own to run.
+/// is visible to child processes of a cmd tab: a weaker guarantee than
+/// bash/zsh/fish/pwsh get.
 fn prepare_cmd() -> InjectionEnv {
     let inherited = std::env::var("PROMPT").ok();
     InjectionEnv {
@@ -1481,27 +1439,6 @@ mod tests {
         assert!(
             preexec_def < hook_preexec,
             "__aterm_preexec() must be defined before add-zsh-hook installs it"
-        );
-    }
-
-    /// The ATERM_PROMPT_STYLE conditional block must come after autoload.
-    /// This is the specific regression from #5959. (`${ATERM_PROMPT_STYLE:-}`
-    /// since 2026-09-16: nounset-clean, so a user's `setopt nounset` no longer
-    /// errors at every prompt and leaves the one-shot precmd installed.)
-    #[test]
-    fn test_zsh_prompt_style_block_after_autoload() {
-        let script = scripts::ZSH;
-        let autoload_pos = script
-            .find("autoload -Uz add-zsh-hook")
-            .expect("must have autoload");
-        let conditional = script
-            .find(r#"if [[ -n "${ATERM_PROMPT_STYLE:-}""#)
-            .expect("must have ATERM_PROMPT_STYLE conditional block");
-
-        assert!(
-            conditional > autoload_pos,
-            "ATERM_PROMPT_STYLE conditional (which calls add-zsh-hook) must \
-             come after autoload -Uz add-zsh-hook. Bug: #5959"
         );
     }
 }

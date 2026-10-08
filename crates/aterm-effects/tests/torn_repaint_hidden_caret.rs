@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A TORN FULL-SCREEN REPAINT MUST NOT SPEND THE HAND'S KEYS (2026-09-28).
+//! A torn full-screen repaint must not spend the hand's keys.
 //!
-//! The owner, on the installed v0.98.0, typing into Claude Code 2.1.284's
-//! FULLSCREEN composer (alt screen, caret drawn) while an Opus turn streamed
-//! (`Moonwalking… · thinking with xhigh effort`, machine load ~75): the line
-//! `❯ how is it that there was a bug in ay? did you fix▮` carried the band
-//! under `how is it that there was a`, then ONE DARK CELL — the space — and
-//! then a SECOND band, its hue restarted, from `bug` on.
-//!
-//! The owner's session cast (tab 2, `aterm ctl @s-8177… cast`, events
-//! 13199–13206) holds the bytes, and the mechanism is in them:
+//! Typing into Claude Code's fullscreen composer (alt screen, caret drawn)
+//! while a turn streams: a transcript repaint can hold one synchronized
+//! bracket open across several PTY reads while keys are typed:
 //!
 //! ```text
 //! 21244.848  SYNC_ON HIDE CUP 41;28 SHOW SYNC_OFF        the space before `a`
@@ -25,32 +19,23 @@
 //! ```
 //!
 //! The host's frame hold releases a bracket open past `SYNC_HOLD_CAP`
-//! (150 ms) and presents the terminal as it stands: the caret HIDDEN and
-//! parked wherever Ink's partial write stopped — rows above the composer,
-//! in the transcript. The single-pane present hands a hidden caret to the
-//! glow engine as `cur` (`app_render.rs`, "A HIDDEN CURSOR IS STILL A
-//! CARET", b473a0197 — for the pet), and only the minibuffer gate reads
-//! `observe_caret_drawn`. So the seam judges Ink's WRITE CURSOR as the
-//! caret: `(40,28) -> (18,57)` and `-> (29,0)` are licensed by the typed
-//! keys in flight, cross-row, and `-> (40,31)` returns — the space the keys
-//! paid for is laid by nobody and the band restarts. Replayed from those
-//! bytes into a private headless aterm the ring reads exactly
-//! `licensed key (40,28)->(18,57)`, `(18,57)->(29,0)`, `(29,0)->(40,32)`.
+//! (150 ms) and presents the terminal as it stands: the caret hidden and
+//! parked wherever Ink's partial write stopped, in the transcript. The
+//! single-pane present hands a hidden caret to the glow engine as `cur`
+//! (for the pet), so if the seam judged Ink's write cursor as the caret,
+//! the typed keys in flight would license cross-row moves, the space the
+//! keys paid for would be laid by nobody and the band would restart.
 //!
-//! Every other harness in this directory hands a hidden caret over as
-//! `None` (`visible.then_some(..)`), which is the composed/headless paths'
-//! contract and not the single-pane present's — so `phrase_pause_gaps.rs`'s
-//! mid-turn Claude Code takes, which DO sample open brackets past the cap,
-//! could not see this. This harness takes the host's contract as a dial.
-//!
-//! THE FIX: the single-pane present reads the motion engines' caret through
+//! The single-pane present reads the motion engines' caret through
 //! `aterm_effects::host::motion_caret`, which withholds a hidden cursor on a
 //! frame the program has not finished (`Terminal::sync_frame_unfinished`:
-//! its bracket still open by its own account, and written into), and the
-//! pet keeps the unfiltered caret. [`Contract::SinglePane`] is that shipping
-//! contract, and [`Contract::HandedOver`] is the one before it. Under the old
-//! contract the take still reproduces the gap, so the fixed take cannot pass
-//! vacuously.
+//! its bracket still open by its own account, and written into) — or on an
+//! empty row (`hidden_caret_withheld`). The pet reads the unfinished-frame
+//! fact as `TerminalFacts::frame_unfinished`
+//! (`pet_holds_through_a_torn_frame.rs`). [`Contract::SinglePane`] is that
+//! shipping contract, and [`Contract::HandedOver`] is the one before it.
+//! Under the old contract the take still reproduces the gap, so the fixed
+//! take cannot pass vacuously.
 //!
 //! REVIEW ROUND 1: the first fix fed `motion_caret` the MODE level
 //! (`synchronized_output()`), which the terminal force-clears when a bracket
@@ -63,7 +48,7 @@
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::cursor_glow::{AdmissionPhase, CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::host::motion_caret;
+use aterm_effects::host::{hidden_caret_withheld, motion_caret};
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::fmt::Write as _;
@@ -157,15 +142,15 @@ enum Contract {
     /// The composed, focus and headless paths and `EffectsPipeline`: a
     /// hidden caret is `None`.
     Withheld,
-    /// The single-pane present from b473a0197 until this fix: a hidden
-    /// caret is always handed over, `observe_caret_drawn(false)` says so.
+    /// A hidden caret is always handed over; `observe_caret_drawn(false)`
+    /// says so.
     HandedOver,
     /// The shipping single-pane present: the hidden caret handed over
     /// through `motion_caret` with the program's account of its frame, so
     /// an unfinished frame withholds it.
     SinglePane,
-    /// The first fix (review round 1's finding): `motion_caret` fed the
-    /// mode level, which the terminal's timeout force-clears mid-frame.
+    /// `motion_caret` fed the mode level, which the terminal's timeout
+    /// force-clears mid-frame.
     ModeLevel,
 }
 
@@ -239,7 +224,7 @@ impl Host {
         let cur = match self.contract {
             Contract::Withheld => caret.filter(|_| visible),
             Contract::HandedOver => caret,
-            Contract::SinglePane => motion_caret(caret, visible, self.term.sync_frame_unfinished()),
+            Contract::SinglePane => motion_caret(caret, visible, hidden_caret_withheld(&self.term)),
             Contract::ModeLevel => {
                 motion_caret(caret, visible, self.term.modes().synchronized_output())
             }
@@ -393,11 +378,11 @@ fn transcript_row(row: u16, text: &str) -> String {
     format!("\x1b[H\r\x1b[{row}B{text}\x1b[K")
 }
 
-/// The owner's gesture: `was a` typed and echoed, then ` bu` typed while a
-/// transcript repaint's bracket stays open ~280 ms — presented torn at the
-/// cap with Ink's write cursor parked in the transcript — and echoed after
-/// it closes, the space folded into a spinner frame and `bu` into the next.
-/// Returns the host after the settle.
+/// `was a` typed and echoed, then ` bu` typed while a transcript repaint's
+/// bracket stays open ~280 ms (presented torn at the cap with Ink's write
+/// cursor parked in the transcript) and echoed after it closes, the space
+/// folded into a spinner frame and `bu` into the next. Returns the host
+/// after the settle.
 fn take(contract: Contract, open_ms: u64) -> Host {
     let gap = ((open_ms - 20) / 3).min(100);
     take_shaped(
@@ -535,10 +520,9 @@ fn cross_row_licences(h: &Host) -> Vec<String> {
         .collect()
 }
 
-/// CONTROL: the same bytes and keys with the bracket closing inside the
-/// cap — no torn present — light every cell under both single-pane
-/// contracts, so a hole in the takes below is the torn present's and not
-/// the gesture's.
+/// Control: the same bytes and keys with the bracket closing inside the
+/// cap (no torn present) light every cell under both single-pane
+/// contracts, so a hole in the takes below is the torn present's.
 #[test]
 fn a_repaint_closing_inside_the_cap_keeps_the_boundary_space_lit() {
     for contract in [Contract::HandedOver, Contract::SinglePane] {
@@ -552,9 +536,8 @@ fn a_repaint_closing_inside_the_cap_keeps_the_boundary_space_lit() {
     }
 }
 
-/// CONTROL: a host that hands a hidden caret over as `None` (every other
-/// harness here, the composed and headless paths) keeps the line whole
-/// through the same torn present.
+/// Control: a host that hands a hidden caret over as `None` (the composed
+/// and headless paths) keeps the line whole through the same torn present.
 #[test]
 fn a_torn_repaint_with_the_hidden_caret_withheld_keeps_the_boundary_space_lit() {
     let h = take(Contract::Withheld, 280);
@@ -563,11 +546,10 @@ fn a_torn_repaint_with_the_hidden_caret_withheld_keeps_the_boundary_space_lit() 
     assert!(dark.is_empty(), "withheld-caret control: {rep}");
 }
 
-/// NEGATIVE CONTROL, the owner's gap: under the contract the single-pane
-/// present shipped with until this fix, the torn present's hidden write
-/// cursor is judged as the caret. The keys in flight license the
-/// cross-row moves and the boundary cells go dark. If this stops
-/// reproducing, the fixed take below proves nothing.
+/// Negative control: with the hidden caret always handed over, the torn
+/// present's write cursor is judged as the caret, the keys in flight
+/// license the cross-row moves and the boundary cells go dark. If this
+/// stops reproducing, the fixed take below proves nothing.
 #[test]
 fn the_pre_fix_contract_spends_the_keys_on_the_write_cursor() {
     let h = take(Contract::HandedOver, 280);
@@ -580,9 +562,9 @@ fn the_pre_fix_contract_spends_the_keys_on_the_write_cursor() {
     );
 }
 
-/// THE OWNER'S SHAPE, the shipping single-pane contract: the torn
-/// present's hidden write cursor is not judged as the caret, no licence
-/// leaves the composer row, and the line stays one band.
+/// The shipping single-pane contract: the torn present's hidden write
+/// cursor is not judged as the caret, no licence leaves the composer row,
+/// and the line stays one band.
 #[test]
 fn a_torn_full_screen_repaint_keeps_the_boundary_space_lit() {
     let h = take(Contract::SinglePane, 280);
@@ -596,11 +578,10 @@ fn a_torn_full_screen_repaint_keeps_the_boundary_space_lit() {
     );
 }
 
-/// A bracket the terminal times out mid-frame (review round 1): open
-/// 1.3 s, the middle read landing at +1.06 s — past the terminal's 1 s
-/// `sync_timeout_ms`, which force-clears the MODE with Ink's hidden write
-/// cursor still parked in the transcript — and ` bu` typed late in it, at
-/// +0.9..1.02 s.
+/// A bracket the terminal times out mid-frame: open 1.3 s, the middle read
+/// landing at +1.06 s (past the 1 s `sync_timeout_ms`, which force-clears
+/// the mode with Ink's hidden write cursor still in the transcript), and
+/// ` bu` typed late in it, at +0.9..1.02 s.
 fn outliving_the_timeout() -> Shape {
     Shape {
         open_ms: 1_260,
@@ -609,13 +590,12 @@ fn outliving_the_timeout() -> Shape {
     }
 }
 
-/// THE OWNER'S SHAPE, HELD PAST THE TERMINAL'S TIMEOUT (review round 1):
-/// the program's frame is still unfinished after the terminal clears the
-/// mode, its hidden write cursor is still no caret, and the line stays one
-/// band. CONTROL: the withheld contract keeps it whole too. NEGATIVE
-/// CONTROL: the first fix's mode-level reading hands the write cursor over
-/// once the mode is cleared, and the gap comes back — so this take does
-/// reach the case it is written for.
+/// Held past the terminal's timeout: the program's frame is still
+/// unfinished after the terminal clears the mode, its hidden write cursor
+/// is still no caret, and the line stays one band. Control: the withheld
+/// contract keeps it whole too. Negative control: the mode-level reading
+/// hands the write cursor over once the mode is cleared, and the gap
+/// comes back.
 #[test]
 fn a_torn_repaint_outliving_the_terminal_timeout_keeps_the_line_whole() {
     let withheld = take_shaped(Contract::Withheld, outliving_the_timeout());
@@ -644,11 +624,9 @@ fn a_torn_repaint_outliving_the_terminal_timeout_keeps_the_line_whole() {
     );
 }
 
-/// The bracket-length sweep the review ran against the first fix (which
-/// darkened the whole band at 2.5 s): from inside the hold cap to well past
-/// the terminal's timeout, with the keys typed early and late, the
-/// shipping contract keeps the line whole wherever the withheld contract
-/// does.
+/// Bracket-length sweep from inside the hold cap to well past the
+/// terminal's timeout, keys typed early and late: the shipping contract
+/// keeps the line whole wherever the withheld contract does.
 #[test]
 fn every_bracket_length_keeps_the_line_whole_under_the_shipping_contract() {
     for open_ms in [200_u64, 500, 900, 1_100, 1_500, 2_500] {

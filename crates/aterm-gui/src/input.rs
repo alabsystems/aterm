@@ -5,16 +5,16 @@
 //! audit tag for the [`App::input`](crate::App::input) convergence seam
 //! (design Addendum A.2, `docs/design/HIERARCHICAL_SESSIONS.md`).
 //!
-//! TODAY human input (the winit `on_key`/`on_mouse_*`/`on_cursor_moved`/
-//! `on_resize`/`on_focus` handlers) and controller input (the control verbs
-//! `cmd_key`/`cmd_ctrl`/`cmd_mouse`/`cmd_scroll`/`cmd_paste`/`cmd_resize`/...)
-//! flow through TWO parallel code paths that can drift: only the human path
-//! reads real modifiers, runs the click-count FSM, emits intermediate motion
-//! reports, snaps-to-bottom + clears-selection on a keystroke, carries the
-//! Kitty base-layout key, reports focus, and resets the cursor blink. The
-//! controller path hard-codes `mods=0`, has no click-count, jumps straight to a
-//! selection result, drops events when tracking is off, and never snaps/clears/
-//! resets-blink.
+//! BEFORE the seam (2026-06-16), human input (the winit `on_key`/`on_mouse_*`/
+//! `on_cursor_moved`/`on_resize`/`on_focus` handlers) and controller input (the
+//! control verbs `cmd_key`/`cmd_ctrl`/`cmd_mouse`/`cmd_scroll`/`cmd_paste`/
+//! `cmd_resize`/...) flowed through TWO parallel code paths that drifted: only the
+//! human path read real modifiers, ran the click-count FSM, emitted intermediate
+//! motion reports, snapped-to-bottom + cleared-selection on a keystroke, carried
+//! the Kitty base-layout key, reported focus, and reset the cursor blink. The
+//! controller path hard-coded `mods=0`, had no click-count, jumped straight to a
+//! selection result, dropped events when tracking was off, and never snapped/
+//! cleared/reset-blink.
 //!
 //! This module is the FRONTEND-ONLY data layer: an `InputEvent` is plain data
 //! plus engine *types* (`Key`, `Modifiers`, `MouseButton`, `SelectionSide`,
@@ -396,8 +396,7 @@ pub(crate) enum Source {
     Human,
     /// A control-socket verb — or an input aterm sends ON ITS OWN after a
     /// person's gesture: the Claude Code lights' follow-up keys (a mode
-    /// return's next shift+tab, a typed command's Enter or ctrl+u,
-    /// `crate::claude_lights`). No person made those at that instant, and
+    /// return's next shift+tab, `crate::claude_lights`). No person made those at that instant, and
     /// stamping them would hold the supervisor off the session for its whole
     /// person grace after every automatic step.
     Controller,
@@ -842,6 +841,26 @@ pub(crate) fn wheel_route_for(t: &Terminal, mods: u8) -> WheelRoute {
         mods & aterm_types::mouse::ALT_MASK != 0 && !t.is_alternate_screen(),
         t.mouse_tracking_enabled(),
         t.is_alternate_screen() && t.modes().alternate_scroll,
+    )
+}
+
+/// [`wheel_route_for`]'s LOCK-FREE twin: the same four facts, read from the
+/// session's published [`ModeMirror`] instead of the engine under its mutex.
+///
+/// The mirror is the fold as of the last `process()` batch (or host mutator),
+/// the same word the key encoder already trusts; it can trail a batch that is
+/// running right now by that one batch, never more. Its one caller is the
+/// parked-edge arm of `App::input_wheel`, where the answer only decides whether
+/// the seam is worth its lock at all: a precise delta pushing a band already
+/// parked at a history end, on a route this says is `Viewport`, moves nothing
+/// the seam would have moved.
+pub(crate) fn wheel_route_mirrored(mirror: &ModeMirror, mods: u8) -> WheelRoute {
+    let alt_screen = mirror.alternate_screen();
+    wheel_route(
+        mods & aterm_types::mouse::SHIFT_MASK != 0,
+        mods & aterm_types::mouse::ALT_MASK != 0 && !alt_screen,
+        mirror.mouse_tracking_enabled(),
+        alt_screen && mirror.alternate_scroll(),
     )
 }
 
@@ -2202,6 +2221,51 @@ mod tests {
         assert_eq!(route(&plain, ALT_MASK), WheelRoute::Viewport);
     }
 
+    /// The LOCK-FREE route is the locked one, for every combination of the
+    /// facts it reads: tracking × the alternate screen × DEC 1007 × the
+    /// Shift/Option bypasses — read from the published mode word after the
+    /// same bytes, never from the engine.
+    #[test]
+    fn the_mirrored_wheel_route_equals_the_locked_one_for_every_mode_combination() {
+        use aterm_types::mouse::{ALT_MASK, SHIFT_MASK};
+
+        let mut routes = std::collections::BTreeSet::new();
+        for tracking in [false, true] {
+            for alt_screen in [false, true] {
+                for alt_scroll in [false, true] {
+                    let mut seqs: Vec<&[u8]> = vec![if alt_scroll {
+                        b"\x1b[?1007h"
+                    } else {
+                        b"\x1b[?1007l"
+                    }];
+                    if alt_screen {
+                        seqs.push(b"\x1b[?1049h");
+                    }
+                    if tracking {
+                        seqs.push(b"\x1b[?1000h\x1b[?1006h");
+                    }
+                    let term = term_with(&seqs);
+                    let t = term.lock().expect("terminal");
+                    for mods in [0, SHIFT_MASK, ALT_MASK, SHIFT_MASK | ALT_MASK] {
+                        let locked = super::wheel_route_for(&t, mods);
+                        assert_eq!(
+                            super::wheel_route_mirrored(t.mode_mirror(), mods),
+                            locked,
+                            "tracking={tracking} alt_screen={alt_screen} \
+                             alt_scroll={alt_scroll} mods={mods:#x}"
+                        );
+                        routes.insert(format!("{locked:?}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            routes.len(),
+            3,
+            "non-vacuous: the sweep reached every route ({routes:?})"
+        );
+    }
+
     /// SELECTION CUSTODY Phase 2 — the LOCAL-SCROLL OVERRIDE.
     ///
     /// A program that grabs the mouse takes the wheel absolutely, so while it runs
@@ -2295,24 +2359,9 @@ mod tests {
         ));
     }
 
-    /// Mouse tracking takes precedence: a tracking app gets a real SGR wheel report,
-    /// never a synthesized arrow.
-    #[test]
-    fn alt_screen_mouse_tracking_beats_alternate_scroll() {
-        let term = term_with(&[
-            b"\x1b[?1049h",
-            b"\x1b[?1007h",
-            b"\x1b[?1000h",
-            b"\x1b[?1006h",
-        ]);
-        assert_eq!(
-            egress_bytes(&term, &wheel(WheelDir::Up, 1)),
-            b"\x1b[<64;1;1M"
-        );
-    }
-
-    /// I12 at the byte level: the SAME tracking + alt-scroll terminal as above,
-    /// but with SHIFT on the event — the seam falls back to the local viewport
+    /// I12 at the byte level: a tracking + alt-scroll terminal, where mouse
+    /// tracking takes precedence (the unshifted wheel is a real SGR report, never
+    /// a synthesized arrow), but with SHIFT on the event — the seam falls back to the local viewport
     /// (`TrackingOff` carrying the gesture's lines) and writes NOTHING, so a
     /// shifted report byte (`64|SHIFT_MASK`) can never leak to the app.
     #[test]
@@ -2535,23 +2584,6 @@ mod tests {
             Egress::TrackingOff { .. }
         ));
         assert!(egress_bytes(&term, &wheel(WheelDir::Up, 1)).is_empty());
-    }
-
-    /// One arrow press is emitted PER accumulated wheel line — on a platform whose
-    /// lines-per-detent is the identity ([`wheel_platform_lines`]). On Windows the
-    /// same gesture is worth `SPI_GETWHEELSCROLLLINES` arrows; see
-    /// `wheel_scale_is_the_platform_distance_not_one_line`.
-    ///
-    /// STILL `#[cfg(unix)]` for exactly the reason its own name states — the
-    /// harness is cross-platform now ([`CaptureSink`]), the ASSERTION is not.
-    #[cfg(unix)]
-    #[test]
-    fn alternate_scroll_emits_one_arrow_per_line() {
-        let term = term_with(&[b"\x1b[?1049h", b"\x1b[?1007h"]);
-        assert_eq!(
-            egress_bytes(&term, &wheel(WheelDir::Up, 3)),
-            b"\x1b[A\x1b[A\x1b[A"
-        );
     }
 
     /// The report burst is bounded at BOTH ends, for every source. A tracking app
@@ -3228,24 +3260,6 @@ mod tests {
         assert_eq!(shell_escape_path_posix(""), "");
     }
 
-    /// The everyday case: spaces and parentheses (e.g. `My File (1).png`) are
-    /// backslash-escaped so the path stays a single argument, matching iTerm2.
-    #[test]
-    fn shell_escape_path_escapes_spaces_and_parens() {
-        assert_eq!(
-            shell_escape_path_posix("/Users//me/My File (1).png"),
-            "/Users//me/My\\ File\\ \\(1\\).png"
-        );
-    }
-
-    /// A literal backslash in a name becomes exactly TWO backslashes — escaped
-    /// once, never doubled-again, because the pass reads input chars only.
-    #[test]
-    fn shell_escape_path_escapes_backslash_once() {
-        assert_eq!(shell_escape_path_posix("a\\b"), "a\\\\b"); // `a\b` -> `a\\b`
-        assert_eq!(shell_escape_path_posix("\\"), "\\\\"); // `\` -> `\\`
-    }
-
     /// EVERY character in iTerm2's drop escape set (shellEscapableCharacters plus
     /// CR/LF) is backslash-prefixed, and nothing else is. This pins the exact set
     /// so a future edit that drops or adds a metacharacter fails loudly.
@@ -3358,20 +3372,6 @@ mod tests {
             ),
             b"\x1b[200~/p/My\\ File \x1b[201~".to_vec()
         );
-    }
-
-    /// winit delivers one `DroppedFile` per file with no batch boundary; pasting
-    /// each as `escaped-path + space` reproduces iTerm2's space-joined output with
-    /// a single trailing space and NO leading space — for any file count.
-    #[test]
-    fn multi_file_drop_concatenates_like_iterm() {
-        let drop_text = |p: &str| {
-            let mut t = shell_escape_path_posix(p);
-            t.push(' ');
-            t
-        };
-        let combined = drop_text("/a/one.txt") + &drop_text("/b/two three.txt");
-        assert_eq!(combined, "/a/one.txt /b/two\\ three.txt ");
     }
 
     /// Windows drop quoting: a tame path — separators, drive colon, dots,

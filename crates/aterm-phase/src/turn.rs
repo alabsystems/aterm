@@ -10,23 +10,22 @@ use crate::phase::{
     composer_frame, composer_text, is_against_right_edge, is_done_row, is_placeholder,
     is_tool_call, last_said_index, leading_spaces, status_block, status_row, transcript_end,
 };
+use crate::prompt::parse_prompt;
 
 /// No turn yet: Claude Code's launch card (`Claude Code v<version>`, anchor
 /// `launch.banner`) above the composer and, between it and the composer's
 /// frame, no user message (`❯`) and nothing said (`⏺`, `●`) — the screen
 /// `claude` draws before anyone typed. A session resumed on a conversation
 /// shows its messages under the card, and one past its first screen has
-/// scrolled the card away: neither is fresh. The live E2E of 2026-09-25: the
-/// supervisor read a brand-new session's first idle point as a worker that
-/// stopped short and typed `keep going` into it two minutes later, and the
-/// first real question then waited twice as long, its streak begun by a
-/// turn nobody took.
+/// scrolled the card away: neither is fresh. Without this a supervisor reads a
+/// brand-new session's first idle point as a worker that stopped short and
+/// types `keep going` into it.
 #[must_use]
 pub fn fresh(rows: &[String]) -> bool {
     let Some(frame) = composer_frame(rows) else {
         return false;
     };
-    let banner = crate::anchor("launch.banner");
+    let banner = const { crate::anchors::anchor_text("launch.banner") };
     let Some(card) = rows[..frame.top].iter().rposition(|r| r.contains(banner)) else {
         return false;
     };
@@ -70,7 +69,7 @@ pub struct LaunchCard {
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
     let frame = composer_frame(rows)?;
-    let banner = crate::anchor("launch.banner");
+    let banner = const { crate::anchors::anchor_text("launch.banner") };
     let card = rows.iter().rposition(|r| r.contains(banner))?;
     if card >= frame.top || rows[card + 1..frame.top].iter().any(|r| r.starts_with('❯')) {
         return None;
@@ -106,14 +105,13 @@ pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
         }
         _ => (model, None),
     };
-    let model = model.trim();
+    let model = crate::text::trim(model);
     (!model.is_empty()).then(|| LaunchCard {
         version,
         model: model.to_owned(),
         effort,
     })
 }
-use crate::prompt::parse_prompt;
 
 /// Claude Code's own suggestion for the next message: the DIM placeholder
 /// in an empty composer ([`is_placeholder`]: the caret row reads `❯ keep
@@ -143,12 +141,15 @@ pub fn goal_active(rows: &[String]) -> bool {
     let Some(frame) = composer_frame(rows) else {
         return false;
     };
-    let width = rows[frame.bottom].trim_end().chars().count();
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     let from = status_block(rows, frame.top).from;
     rows[from..frame.top]
         .iter()
         .chain(&rows[frame.bottom + 1..])
-        .any(|r| r.trim_start().starts_with("◎ /goal active") && is_against_right_edge(r, width))
+        .any(|r| {
+            crate::text::trim_start(r).starts_with("◎ /goal active")
+                && is_against_right_edge(r, width)
+        })
 }
 
 /// The worker's last words: the `⏺` message that holds the last thing said
@@ -162,14 +163,14 @@ pub fn goal_active(rows: &[String]) -> bool {
 /// visible row above the last said is indented (the message's continuation
 /// column). Its tail is then the visible rows from the top — what the
 /// worker ended on — never `None`, which a policy would read as "nothing
-/// asked" (the safety review of 2026-09-24: `Should I drop the prod
-/// table…?` under 30 rows of summary was continued).
+/// asked" and continue past `Should I drop the prod table…?` under 30 rows
+/// of summary.
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
     let last = last_said_index(rows)?;
     let head = (0..=last).rev().find(|&i| {
         let r = &rows[i];
-        !r.trim().is_empty() && leading_spaces(r) == 0
+        !crate::text::trim(r).is_empty() && leading_spaces(r) == 0
     });
     let (head, headless) = match head {
         Some(h) => (h, false),
@@ -183,7 +184,7 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     let mut out: Vec<&str> = Vec::new();
     let mut in_gutter = false;
     for (i, r) in rows.iter().enumerate().take(last + 1).skip(head) {
-        let t = r.trim();
+        let t = crate::text::trim(r);
         if t.is_empty() {
             in_gutter = false;
             continue;
@@ -211,17 +212,16 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
 /// the transcript's last block — the last `⏺` message or tool row, with
 /// no user `❯` row after it — above the live zone. A turn stopped so is a
 /// stop, never a point to continue: the person is at the keyboard and the
-/// next message is theirs (the safety review of 2026-09-24 measured a
-/// `keep going` typed into exactly this screen). Negative: the same words
+/// next message is theirs, never a `keep going`. Negative: the same words
 /// in a message, or an interrupt a new user message has answered.
 ///
 /// A question dialog a person declined — Esc on it, or `2. Cancel` on its
 /// review tab — is the same stop: the last block is `⏺ User declined to
 /// answer questions` (anchor `question.declined`; measured 2026-09-25, S7
 /// and S8), no `Interrupted ·` row under it, and the tool result tells the
-/// model to STOP and wait for the person (the critique of 2026-09-25, R12:
-/// read as no interrupt, a turn-end policy would type `keep going` over
-/// the person's refusal). Negative: the words inside a longer message row.
+/// model to STOP and wait for the person: read as no interrupt, a turn-end
+/// policy would type `keep going` over the person's refusal. Negative: the
+/// words inside a longer message row.
 #[must_use]
 pub fn interrupted(rows: &[String]) -> bool {
     let end = transcript_end(rows).min(rows.len());
@@ -233,15 +233,15 @@ pub fn interrupted(rows: &[String]) -> bool {
     };
     let said = rows[block].trim_start_matches(['⏺', '●']).trim();
     if rows[block].starts_with(['⏺', '●'])
-        && said == crate::anchors::anchor_text("question.declined")
+        && said == const { crate::anchors::anchor_text("question.declined") }
     {
         return true;
     }
-    let text = crate::anchors::anchor_text("turn.interrupted");
+    let text = const { crate::anchors::anchor_text("turn.interrupted") };
     rows[block..end].iter().any(|r| {
-        r.trim_start()
+        crate::text::trim_start(r)
             .strip_prefix('⎿')
-            .is_some_and(|rest| rest.trim_start().starts_with(text))
+            .is_some_and(|rest| crate::text::trim_start(rest).starts_with(text))
     })
 }
 
@@ -409,7 +409,7 @@ mod tests {
 
     /// A message taller than the screen: its `⏺` row scrolled off, every
     /// visible row indented. The tail is the visible rows — the question the
-    /// worker ended on is read (the safety review of 2026-09-24). The
+    /// worker ended on is read. The
     /// measured goal fixture (row 0 `  with zero hooks installed…`) reads
     /// its last words too. Negative control: a column-0 user row above
     /// still ends the message there.

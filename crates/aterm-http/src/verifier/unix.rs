@@ -25,9 +25,8 @@
 //! Reproducing `rustls-native-certs` 0.8.4, which is what
 //! `rustls-platform-verifier` calls underneath.
 //!
-//! THE ENVIRONMENT IS EXCLUSIVE, NOT ADDITIVE, and an earlier version of this
-//! header claimed the opposite. `rustls_native_certs::load_native_certs`
-//! (lib.rs:118-125) reads:
+//! THE ENVIRONMENT IS EXCLUSIVE, NOT ADDITIVE.
+//! `rustls_native_certs::load_native_certs` (lib.rs:118-125) reads:
 //!
 //! ```text
 //! let paths = CertPaths::from_env();
@@ -43,14 +42,14 @@
 //! an operator who points `$SSL_CERT_FILE` at a single pinned CA would silently
 //! get that CA *plus* the entire system store, and a stale variable pointing at
 //! a deleted file would silently restore the full store instead of failing.
-//! Measured on this host before the fix: 129 roots where the incumbent loads 1.
 //!
 //! * **Neither variable set** — the bundle file is the FIRST existing path of
 //!   [`CERTIFICATE_FILES`], plus every existing path of [`CERTIFICATE_DIRS`].
 //! * **Either variable set** — ONLY `$SSL_CERT_FILE` and/or `$SSL_CERT_DIR`.
-//!   A configured path that does not exist contributes nothing, which can leave
-//!   an empty store; that is a hard error at [`Verifier::new`], and failing
-//!   closed is the intended outcome.
+//!   `$SSL_CERT_DIR` is a `:`-separated LIST of directories, as OpenSSL and the
+//!   incumbent read it. A configured path that does not exist contributes
+//!   nothing, which can leave an empty store; that is a hard error at
+//!   [`Verifier::new`], and failing closed is the intended outcome.
 //! * Directories are read non-recursively. Symlinks are resolved through
 //!   `fs::metadata` (this is what `openssl rehash` creates) and a dangling one
 //!   is skipped in silence.
@@ -75,15 +74,12 @@
 //! HTTPS connection loudly at configuration time instead of quietly trusting
 //! nothing — or, far worse, quietly trusting anything.
 //!
-//! # Revocation: none, here, exactly as before
+//! # Revocation: none
 //!
-//! This arm performs NO revocation checking. Neither did
-//! `rustls-platform-verifier`'s: its Unix arm is this same
-//! `WebPkiServerVerifier`, which ignores a stapled OCSP response unless it was
-//! built with CRLs, and it was not. macOS and Windows DO check end-entity
-//! revocation. That platform split is pre-existing and preserved — it is
-//! written down here so the next reader does not file it as a hole this
-//! reimplementation introduced.
+//! This arm performs NO revocation checking, like `rustls-platform-verifier`'s
+//! Unix arm: `WebPkiServerVerifier` ignores a stapled OCSP response unless it
+//! was built with CRLs, and it is not. macOS and Windows DO check end-entity
+//! revocation.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,12 +94,9 @@ use super::eku_rejected;
 /// Bundle files, in the order OpenSSL looks for them. The FIRST that exists
 /// wins; the search does not continue past it.
 ///
-/// PER-TARGET, NOT A UNION, and that matters. An earlier version of this file
-/// applied one cross-OS union of every distro's paths on EVERY Unix, so aterm
-/// scanned a strictly larger set than the platform verifier did — a trust
-/// widening in the DEFAULT configuration, with no environment variable
-/// involved. These lists are `openssl-probe` 0.2.1's own `#[cfg]` arms
-/// (src/lib.rs:137-210) reproduced verbatim, which is what
+/// PER-TARGET, NOT A UNION: one cross-OS union of every distro's paths would
+/// widen trust in the DEFAULT configuration. These lists are `openssl-probe`
+/// 0.2.1's own `#[cfg]` arms (src/lib.rs:137-210) reproduced verbatim, which is what
 /// `rustls-native-certs` -> `rustls-platform-verifier` actually consulted.
 #[cfg(target_os = "linux")]
 const CERTIFICATE_FILES: &[&str] = &[
@@ -187,11 +180,14 @@ fn bundle_file(configured: Option<PathBuf>) -> Option<PathBuf> {
 
 /// Every hash directory to scan. `configured` is `$SSL_CERT_DIR`, and it
 /// REPLACES the built-in list rather than adding to it — see the module header.
+///
+/// It is a LIST, separated like `$PATH` (`:`), as OpenSSL's hash-directory
+/// lookup and the incumbent (`CertPaths::from_env`, `env::split_paths`) read
+/// it; an empty or missing entry contributes nothing.
 fn bundle_dirs(configured: Option<PathBuf>) -> Vec<PathBuf> {
-    if configured.is_some() {
-        return configured
-            .filter(|path| path.exists())
-            .into_iter()
+    if let Some(configured) = configured {
+        return std::env::split_paths(&configured)
+            .filter(|path| !path.as_os_str().is_empty() && path.exists())
             .collect();
     }
     CERTIFICATE_DIRS
@@ -243,15 +239,20 @@ fn collect_ders(file: Option<&Path>, dirs: &[PathBuf]) -> Vec<Vec<u8>> {
 /// Everything the system trust store offers on this machine.
 fn system_root_ders() -> Vec<Vec<u8>> {
     let env_file = std::env::var_os("SSL_CERT_FILE").map(PathBuf::from);
-    let env_dir = std::env::var_os("SSL_CERT_DIR").map(PathBuf::from);
+    // A `$SSL_CERT_DIR` that lists nothing (`""`, `":"`) is not a configured
+    // directory: the incumbent tests the SPLIT list for emptiness.
+    let env_dir = std::env::var_os("SSL_CERT_DIR")
+        .map(PathBuf::from)
+        .filter(|dirs| std::env::split_paths(dirs).any(|dir| !dir.as_os_str().is_empty()));
     // EITHER variable suppresses BOTH built-in lists — that is what the
     // incumbent's single `CertPaths::from_env()` / `platform::load_native_certs()`
     // branch does. Passing them independently would let `$SSL_CERT_FILE` alone
-    // still pull in every built-in hash DIRECTORY.
+    // still pull in every built-in hash DIRECTORY. The configured values go
+    // through the SAME two helpers the tests drive, never a copy of them.
     let (file, dirs) = if env_file.is_some() || env_dir.is_some() {
         (
-            env_file.filter(|p| p.exists()),
-            env_dir.filter(|p| p.exists()).into_iter().collect(),
+            env_file.and_then(|file| bundle_file(Some(file))),
+            env_dir.map_or_else(Vec::new, |dirs| bundle_dirs(Some(dirs))),
         )
     } else {
         (bundle_file(None), bundle_dirs(None))
@@ -470,14 +471,10 @@ mod tests {
     }
 
     /// THE ENVIRONMENT REPLACES THE BUILT-IN SEARCH; IT DOES NOT ADD TO IT.
-    ///
-    /// This test asserted the opposite until 2026-08-29, and it was green — it
-    /// certified a trust-store WIDENING as correct, and its name and comment
-    /// would have taught the next reader that the widening was deliberate. The
-    /// incumbent (`rustls_native_certs::load_native_certs`, lib.rs:118-125)
-    /// consults `CertPaths::from_env()` FIRST and reaches the platform search
-    /// only when neither variable is set. An operator pinning one CA must get
-    /// exactly that CA.
+    /// `rustls_native_certs::load_native_certs` (lib.rs:118-125) consults
+    /// `CertPaths::from_env()` FIRST and reaches the platform search only when
+    /// neither variable is set: an operator pinning one CA must get exactly
+    /// that CA.
     #[test]
     fn a_configured_path_replaces_the_built_in_search() {
         // A configured path that does not exist yields NOTHING — it must not
@@ -498,5 +495,25 @@ mod tests {
             "the fixture must be where the test says it is"
         );
         assert_eq!(bundle_file(Some(real.clone())), Some(real));
+    }
+
+    /// `$SSL_CERT_DIR` IS A LIST, separated like `$PATH`. OpenSSL's hash-directory
+    /// lookup reads it so, and so does the incumbent this arm reproduces
+    /// (`rustls-native-certs` 0.8.4, `CertPaths::from_env`, via
+    /// `env::split_paths`). Read as ONE path, `/etc/ssl/certs:/usr/local/share/certs`
+    /// names nothing: the store comes up empty and every HTTPS connection fails.
+    #[test]
+    fn a_configured_cert_dir_is_a_list_of_directories() {
+        let a = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata");
+        let b = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/tls");
+        let both = vec![PathBuf::from(a), PathBuf::from(b)];
+        assert_eq!(bundle_dirs(Some(PathBuf::from(format!("{a}:{b}")))), both);
+        // An entry that does not exist contributes nothing; the others still count.
+        assert_eq!(
+            bundle_dirs(Some(PathBuf::from(format!(
+                "{a}:/nonexistent/aterm/certs::{b}"
+            )))),
+            both
+        );
     }
 }

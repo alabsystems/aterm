@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ladder: `ok` / `FAIL` / `skip`, one line per decision, grouped under a
+//! The ladder: `ok` / `FAIL` / `NOT RUN` / `skip`, one line per decision, under a
 //! `=== stage ===` header so a whole run is scannable in one screenful.
 //!
 //! The vocabulary is not decoration. Every reviewer instruction, every process
-//! doc and every agent prompt in this repo teaches the same three words, and a
+//! doc and every agent prompt in this repo teaches the same words, and a
 //! skip is an honest "tool absent" — NEVER a silent pass. A run that skipped a
 //! gating stage has not discharged the merge contract, so skips are counted AND
 //! NAMED here, and [`crate::verdict`] downgrades the claim accordingly.
@@ -17,7 +17,7 @@ use crate::exec::Run;
 /// is judged by, one `fail` line in the receipt each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
-    /// What failed: a test (`-p atpkg --test index_probe -- <name>`, from
+    /// What failed: a test (`-p atpkg --test atpkg_suite -- <name>`, from
     /// cargo's re-run spec and libtest's name) or, when the row cannot be
     /// itemized, the ladder row's own label. Never normalized: two rows that
     /// differ only in a number are two findings.
@@ -41,12 +41,6 @@ pub struct Finding {
     /// never inherited from main, whose same words cannot be told from a new
     /// hang or a slower run's ([`crate::differential::judge`]).
     pub timing: Option<&'static str>,
-    /// The crate a FAILED TEST belongs to, from its re-run spec's `-p
-    /// <crate>` ([`crate::nearest::package_of`]); `None` for every whole-row
-    /// finding, and for a test whose spec names no package. Read only by the
-    /// opt-in nearest base ([`crate::nearest`]), which never inherits a
-    /// finding without one.
-    pub package: Option<String>,
 }
 
 /// THE MACHINE'S LOAD AROUND ONE STAGE (2026-09-26): the one-minute load
@@ -71,9 +65,10 @@ impl StageLoad {
     /// were read.
     #[must_use]
     pub fn of(start: Option<f64>, end: Option<f64>, cores: u32) -> Option<Self> {
-        // Through the two-decimal text the reading came from, so no float is
-        // ever cast: a load is a small non-negative number, and anything else
-        // is no reading.
+        // Through a two-decimal rendering of the reading (the in-process
+        // `getloadavg` answer is an unrounded float), so no float is ever
+        // cast: a load is a small non-negative number, and anything else is
+        // no reading.
         let centi = |l: f64| -> Option<u32> {
             if !(l.is_finite() && (0.0..1e7).contains(&l)) {
                 return None;
@@ -125,9 +120,10 @@ impl StageLoad {
 pub enum Severity {
     /// A real finding about the tree: a lint, a test, a guard, a proof.
     GateFailed,
-    /// Nothing was decided: no driver, no helper script, no temp dir. The ladder
-    /// still says `FAIL` (fail-closed), but the exit code says COULD NOT RUN so a
-    /// caller cannot confuse a broken machine with a broken change.
+    /// Nothing was decided: no driver, no helper script, no temp dir, too little
+    /// disk. Fail-closed all the same (exit 3, never green), and the row says
+    /// `NOT RUN`, never `FAIL`: it decided nothing. Usually that is the machine,
+    /// but a probe that could not launch can be a crash in the change.
     CouldNotRun,
 }
 
@@ -140,14 +136,15 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The exact eight-column prefix of `tools/verify.sh`: `'  ok    '`,
-    /// `'  skip  '`, `'  FAIL  '`.
+    /// The row's prefix: `'  ok    '`, `'  skip  '`, `'  FAIL  '` for a finding
+    /// and `'  NOT RUN '` for a stage that could not execute.
     #[must_use]
     pub fn tag(self) -> &'static str {
         match self {
             Outcome::Ok => "  ok    ",
             Outcome::Skip => "  skip  ",
-            Outcome::Fail(_) => "  FAIL  ",
+            Outcome::Fail(Severity::GateFailed) => "  FAIL  ",
+            Outcome::Fail(Severity::CouldNotRun) => "  NOT RUN ",
         }
     }
 }
@@ -240,8 +237,8 @@ impl Report {
         });
     }
 
-    /// The stage could not execute. Still a `FAIL` line: fail-closed is the rule,
-    /// and a missing tool that a stage NEEDED is not an honest skip.
+    /// The stage could not execute: a `NOT RUN` row and exit 3. Fail-closed is
+    /// the rule, and a missing tool that a stage NEEDED is not an honest skip.
     pub fn cannot_run(&mut self, label: impl Into<String>) {
         self.entries.push(Entry::Ladder {
             outcome: Outcome::Fail(Severity::CouldNotRun),
@@ -360,10 +357,7 @@ impl Report {
     pub fn decide_test_child(&mut self, run: &Run, label: impl Into<String>) {
         let label = label.into();
         if run.ok && crate::libtest::ran_no_test(&run.output) {
-            self.cannot_run(format!(
-                "{label} — could not run: {}",
-                crate::libtest::RAN_NO_TEST
-            ));
+            self.cannot_run(format!("{label} — {}", crate::libtest::RAN_NO_TEST));
         } else if run.ok {
             self.pass(label);
         } else {
@@ -387,7 +381,7 @@ impl Report {
     pub fn child_could_not_run(&mut self, run: &Run, label: &str) -> bool {
         match run.environment_failure() {
             Some(why) => {
-                self.cannot_run(format!("{label} — could not run: {why}"));
+                self.cannot_run(format!("{label} — {why}"));
                 true
             }
             None => false,
@@ -638,15 +632,16 @@ mod tests {
              \x20 ok    targo test --workspace --no-run\n\
              \x20 skip  tippy lint (no tippy)\n\
              \x20 FAIL  license_check.sh\n\
-             \x20 FAIL  targo not found\n"
+             \x20 NOT RUN targo not found\n"
         );
     }
 
     #[test]
-    fn a_could_not_run_still_prints_fail_never_skip() {
-        // Fail-closed: the only difference between the two failure severities is
-        // the exit code, never the word on the ladder.
-        assert_eq!(
+    fn a_could_not_run_prints_not_run_never_fail_or_skip() {
+        // A machine that refused the work is neither a finding nor an honest
+        // skip: its own word, and exit 3 (fail-closed) in the verdict.
+        assert_eq!(Outcome::Fail(Severity::CouldNotRun).tag(), "  NOT RUN ");
+        assert_ne!(
             Outcome::Fail(Severity::CouldNotRun).tag(),
             Outcome::Fail(Severity::GateFailed).tag()
         );
@@ -700,8 +695,7 @@ mod tests {
 
     /// THE ROW A DYING CHILD LEAVES. A child that ran and failed is a finding
     /// (`FAIL`, exit 1); one that never spawned or ran out of disk is COULD NOT
-    /// RUN — the same `FAIL` word on the ladder, the other severity in the
-    /// tally, and so `verdict COULD-NOT-RUN` in the receipt rather than a
+    /// RUN — a `NOT RUN` row, the other severity in the tally, and so `verdict COULD-NOT-RUN` in the receipt rather than a
     /// judgement of the tree.
     #[test]
     fn a_child_that_died_of_the_machine_is_could_not_run_and_one_that_failed_is_a_finding() {
@@ -742,9 +736,9 @@ mod tests {
         assert_eq!(
             t.could_not_run,
             [
-                "never spawned — could not run: No space left on device (os error 28)",
-                "starved — could not run: the child ran out of disk (No space left on device)",
-                "gate cells — could not run: the child ran out of disk (No space left on device)",
+                "never spawned — No space left on device (os error 28)",
+                "starved — the child ran out of disk (No space left on device)",
+                "gate cells — the child ran out of disk (No space left on device)",
             ]
         );
         assert_eq!(t.skipped(), 0);
@@ -782,7 +776,7 @@ mod tests {
         assert_eq!(t.gate_failures, ["found"]);
         assert_eq!(t.could_not_run.len(), 1, "{t:?}");
         assert!(
-            t.could_not_run[0].starts_with("refused — could not run: every failing test refused")
+            t.could_not_run[0].starts_with("refused — every failing test refused")
                 && t.could_not_run[0].contains("(a, b)"),
             "{t:?}"
         );

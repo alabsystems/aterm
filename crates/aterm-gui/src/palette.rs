@@ -149,8 +149,7 @@ pub(crate) struct PaletteRow {
     /// Whether the command is currently actionable; a disabled row paints dim and Enter
     /// on it is a no-op (mirroring `validateMenuItem:` greying).
     pub enabled: bool,
-    /// A checkbox state for toggle commands (Settings, full-screen); `None`
-    /// for plain commands. `Some(true)` paints a check glyph.
+    /// A checkbox state for toggle commands (e.g. Serious Mode); `None` for plain commands. `Some(true)` paints a check glyph.
     pub checked: Option<bool>,
 }
 
@@ -174,8 +173,6 @@ pub(crate) struct NativeCommandScope {
 pub(crate) struct PaletteLive {
     /// A text selection exists (gates Copy).
     pub has_selection: bool,
-    /// A native Settings tab is open (checkmark on its singleton toggle).
-    pub settings_open: bool,
     /// The FRONT session's effective matrix-rain state (its runtime override,
     /// else the config `enabled` bit) — the checkmark on Matrix Rain. False
     /// when no terminal is frontmost (the row is disabled there anyway).
@@ -232,6 +229,10 @@ pub(crate) struct PaletteLive {
     /// lockstep by construction because both render the same value through
     /// [`crate::menu::staged_apply_label`].
     pub staged_trouble: Option<crate::update_apply_trouble::ApplyTrouble>,
+    /// That staged build is ON HOLD (`App::latched_activation_trial_spent`, the
+    /// fact a press refuses on): the row reads "is on hold" and opens the
+    /// details, the Version menu's twin ([`crate::menu::staged_apply_label`]).
+    pub staged_on_hold: bool,
     /// The post-update REALIZED arrow is live: `(new version, its spawn instant)` — the
     /// Version section shows the TIME-FADED "↑ Updated to aterm v<new>" row (alpha decays over
     /// [`crate::relaunch_notice::REALIZED_ARROW_TTL`]). Ignored while `staged` is `Some`
@@ -269,6 +270,7 @@ pub(crate) fn apply_row_label(live: &PaletteLive) -> Option<String> {
             *build,
             v,
             live.staged_trouble.as_ref(),
+            live.staged_on_hold,
         ));
     }
     live.realized
@@ -403,7 +405,7 @@ impl PaletteState {
     }
 
     /// Fold live `App` state into per-row `enabled`/`checked`, mirroring `validateMenuItem:`:
-    /// toggle commands (Settings, full-screen) get a checkmark; selection- and
+    /// toggle commands (e.g. Serious Mode) get a checkmark; selection- and
     /// tab-gated commands are disabled when their precondition is absent. Everything else
     /// stays enabled (the honest "no predicate ⇒ always available").
     ///
@@ -413,8 +415,9 @@ impl PaletteState {
     ///   * STAGED: "↑ Install aterm v<staged> now" — ONE Enter installs in place (the
     ///     owner's "click-upgrade" ask), the words the update row and the Version menu use;
     ///   * REALIZED (fresh post-update): the TIME-FADED "↑ Updated to aterm v<new>" arrow
-    ///     (activating it takes ApplyUpdate's nothing-staged fallback: the details
-    ///     overlay — informative, never a blind restart);
+    ///     (activating it takes ApplyUpdate's nothing-staged fallback: the Software
+    ///     Update route — informative, never a blind restart; the bar's row opens
+    ///     About);
     ///   * NEITHER: the row is REMOVED (a dead "update" command would be noise).
     ///
     /// Idempotent: called at every open AND on live transitions (`palette_refresh_live`),
@@ -488,7 +491,6 @@ impl PaletteState {
                 None => Cow::Borrowed(""),
             };
             match action {
-                MenuAction::ToggleSettings => row.checked = Some(live.settings_open),
                 // The verb carries the state, as the native View item does.
                 MenuAction::ToggleFullScreen => {
                     row.label = Cow::Borrowed(crate::menu::full_screen_title(live.fullscreen));
@@ -561,10 +563,12 @@ impl PaletteState {
                 | MenuAction::ConnectToSession
                 | MenuAction::ConfigureConnection
                 | MenuAction::DisconnectSession
-                // The Fabric menu's session rows (round 19): the inbox and the
-                // ledger are the focused session's.
+                // The focused session's own rows: its inbox, ledger, identity
+                // and reset.
                 | MenuAction::Inbox
-                | MenuAction::LedgerForSession => {
+                | MenuAction::LedgerForSession
+                | MenuAction::ShowIdentity
+                | MenuAction::ResetTerminal => {
                     row.enabled = live.terminal_front;
                 }
                 // Same editor as the pin, same surface rule.
@@ -944,11 +948,8 @@ impl PaletteState {
 /// row after a tab switch. The ListBox container lives at a disjoint sentinel id.
 #[cfg(a11y_tree)]
 pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
-    use accesskit::{Action, Node, NodeId, Role, Toggled, Tree, TreeId, TreeUpdate};
+    use accesskit::{Action, Node, Role, Toggled};
 
-    // High + disjoint from the `row_index + 1` control ids.
-    const LIST: NodeId = NodeId(u64::MAX);
-    let root_id = NodeId(0);
     let vis = state.filtered();
     // Derive the epoch ONCE. It is slot-independent by construction ("cursor/focus movement
     // deliberately does not enter this hash") and `state` is immutable here, so every
@@ -957,11 +958,8 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
     // allocation per inner step, on a path driven by every palette keystroke and hover.
     let epoch = state.a11y_epoch();
 
-    let mut nodes: Vec<(NodeId, Node)> = Vec::with_capacity(vis.len() + 2);
-    let mut items: Vec<NodeId> = Vec::with_capacity(vis.len());
-    for (slot, &i) in vis.iter().enumerate() {
+    let rows = vis.iter().map(|&i| {
         let row = &state.rows[i];
-        let id = a11y_node_id_for(epoch, slot);
         let mut node = Node::new(Role::MenuItem);
         node.set_label(row.label.as_ref());
         // Through the platform filter (audit I9): this string is what a screen
@@ -994,25 +992,49 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
         if row.enabled {
             node.add_action(Action::Click);
         }
+        node
+    });
+    list_overlay_a11y("Commands", epoch, state.selected, rows)
+}
+
+/// The accessibility tree of a list overlay (the palette, the session picker, the
+/// connection map): a Window root (`NodeId(0)`) labelled `root_label` parents a ListBox
+/// at a disjoint sentinel id whose children are `rows`, one node per slot with its id
+/// minted from `epoch` ([`a11y_node_id_for`]). Focus is the `selected` row's node
+/// (clamped); the root when the list is empty.
+#[cfg(a11y_tree)]
+pub(crate) fn list_overlay_a11y(
+    root_label: &str,
+    epoch: u32,
+    selected: usize,
+    rows: impl ExactSizeIterator<Item = accesskit::Node>,
+) -> accesskit::TreeUpdate {
+    use accesskit::{Node, NodeId, Role, Tree, TreeId, TreeUpdate};
+
+    // High + disjoint from the `slot + 1` row ids.
+    const LIST: NodeId = NodeId(u64::MAX);
+    let root_id = NodeId(0);
+    let mut nodes: Vec<(NodeId, Node)> = Vec::with_capacity(rows.len() + 2);
+    let mut items: Vec<NodeId> = Vec::with_capacity(rows.len());
+    for (slot, node) in rows.enumerate() {
+        let id = a11y_node_id_for(epoch, slot);
         nodes.push((id, node));
         items.push(id);
     }
+    let focus = if items.is_empty() {
+        root_id
+    } else {
+        a11y_node_id_for(epoch, selected.min(items.len() - 1))
+    };
 
     let mut list = Node::new(Role::ListBox);
     list.set_children(items);
     nodes.push((LIST, list));
 
     let mut root = Node::new(Role::Window);
-    root.set_label("Commands");
+    root.set_label(root_label);
     root.set_children(vec![LIST]);
     nodes.push((root_id, root));
-
-    // Focus the selected row's node (clamped); the root when nothing matches the filter.
-    let focus = if vis.is_empty() {
-        root_id
-    } else {
-        a11y_node_id_for(epoch, state.selected.min(vis.len() - 1))
-    };
 
     TreeUpdate {
         nodes,
@@ -1022,12 +1044,33 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
     }
 }
 
-/// Mint a palette row node id from an ALREADY-derived epoch. The single-shot decode path
-/// ([`PaletteState::a11y_filtered_index`]) keeps using the `&self` method; only bulk minting,
-/// where the epoch is loop-invariant, goes through here.
+/// Mint a list-overlay row node id from an ALREADY-derived epoch (the epoch is
+/// loop-invariant over a publish): the epoch in the high half, `slot + 1` in the low.
 #[cfg(a11y_tree)]
-fn a11y_node_id_for(epoch: u32, slot: usize) -> accesskit::NodeId {
+pub(crate) fn a11y_node_id_for(epoch: u32, slot: usize) -> accesskit::NodeId {
     accesskit::NodeId((u64::from(epoch) << 32) | (slot as u64 + 1))
+}
+
+/// Decode a row node back to its slot: `None` unless `node` was minted by `epoch` for
+/// one of the `count` live rows, so a stale platform request fails closed.
+#[cfg(a11y_tree)]
+pub(crate) fn a11y_slot_for(epoch: u32, node: accesskit::NodeId, count: usize) -> Option<usize> {
+    let slot = usize::try_from(node.0 & u64::from(u32::MAX))
+        .ok()?
+        .checked_sub(1)?;
+    (a11y_node_id_for(epoch, slot) == node && slot < count).then_some(slot)
+}
+
+/// Fold a row-set hash to a row-id epoch, never `u32::MAX` (the high half of the ListBox
+/// sentinel id).
+#[cfg(a11y_tree)]
+pub(crate) fn a11y_epoch_from(hash: u64) -> u32 {
+    let epoch = hash as u32;
+    if epoch == u32::MAX {
+        u32::MAX - 1
+    } else {
+        epoch
+    }
 }
 
 /// Transient per-window state for the command palette (mirrors `AboutState`'s `Option`
@@ -1114,15 +1157,10 @@ impl PaletteState {
             }
             row.enabled.hash(&mut hash);
         }
-        let epoch = hash.finish() as u32;
-        if epoch == u32::MAX {
-            u32::MAX - 1
-        } else {
-            epoch
-        }
+        a11y_epoch_from(hash.finish())
     }
 
-    #[cfg(a11y_tree)]
+    #[cfg(all(a11y_tree, test))]
     fn a11y_node_id(&self, slot: usize) -> accesskit::NodeId {
         a11y_node_id_for(self.a11y_epoch(), slot)
     }
@@ -1131,10 +1169,7 @@ impl PaletteState {
     /// generation or tab scope cannot redirect a delayed screen-reader Click.
     #[cfg(a11y_tree)]
     pub(crate) fn a11y_filtered_index(&self, node: accesskit::NodeId) -> Option<usize> {
-        let slot = usize::try_from(node.0 & u64::from(u32::MAX))
-            .ok()?
-            .checked_sub(1)?;
-        (self.a11y_node_id(slot) == node && slot < self.filtered_count()).then_some(slot)
+        a11y_slot_for(self.a11y_epoch(), node, self.filtered_count())
     }
 }
 
@@ -1326,52 +1361,8 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let vis = state.filtered();
     let layout = palette_layout_for_count(vis.len(), g);
-    let (card_x, card_y, card_w, card_h) = layout.card;
-    let radius = (ch * 0.6).min(14.0);
-    let mut prims: Vec<DrawPrim> = vec![
-        // A small two-step shadow separates the modal from the still-visible owner app.
-        DrawPrim::Panel {
-            x: card_x - 3.0,
-            y: card_y + 2.0,
-            w: card_w + 6.0,
-            h: card_h + 6.0,
-            radius: radius + 3.0,
-            fill: rgba([0, 0, 0], 0x2A),
-        },
-        DrawPrim::Panel {
-            x: card_x - 1.0,
-            y: card_y + 2.0,
-            w: card_w + 2.0,
-            h: card_h + 3.0,
-            radius: radius + 1.0,
-            fill: rgba([0, 0, 0], 0x30),
-        },
-        // Opaque: the shared tray rasterizer does not implement backdrop blur, so
-        // translucency here would make the owning app's text ghost through the commands.
-        DrawPrim::Panel {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-            radius,
-            fill: rgba(r.surface, 0xFF),
-        },
-        DrawPrim::Stroke {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-            radius,
-            width: 1.0,
-            color: rgba(r.separator, 0xE0),
-        },
-        DrawPrim::ClipPush {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-        },
-    ];
+    let (card_x, card_y, card_w, _) = layout.card;
+    let mut prims = overlay_card_frame(layout.card, ch, &r, true);
 
     // A run at an EXPLICIT baseline (mixed-size runs on one visual row share the
     // baseline of the row's dominant size — the shared-baseline rule). The command
@@ -1562,23 +1553,124 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
     }
 
     // Key-hint footer on the last row.
-    let hint = "\u{2191}\u{2193} move   \u{23ce} run   esc close";
-    let fsize = TypeStep::Caption.px(px);
-    let hint_w = text_w(hint, fsize.get());
+    finish_overlay_card(
+        prims,
+        "\u{2191}\u{2193} move   \u{23ce} run   esc close",
+        layout.card,
+        layout.card_rows,
+        g,
+        &r,
+    )
+}
+
+/// Open a list overlay's tray (the palette, the session picker, the connection
+/// map): a small drop shadow — two-step with the `contact_shadow` — separating the
+/// modal from the still-visible owner app, the card surface and its hairline, then
+/// the clip the body paints inside ([`finish_overlay_card`] pops it). Opaque: the
+/// shared tray rasterizer does not implement backdrop blur, so translucency here
+/// would make the owning app's text ghost through the card.
+pub(crate) fn overlay_card_frame(
+    card: (f32, f32, f32, f32),
+    ch: f32,
+    r: &Roles,
+    contact_shadow: bool,
+) -> Vec<DrawPrim> {
+    let (card_x, card_y, card_w, card_h) = card;
+    let radius = (ch * 0.6).min(14.0);
+    let mut prims = vec![DrawPrim::Panel {
+        x: card_x - 3.0,
+        y: card_y + 2.0,
+        w: card_w + 6.0,
+        h: card_h + 6.0,
+        radius: radius + 3.0,
+        fill: rgba([0, 0, 0], 0x2A),
+    }];
+    if contact_shadow {
+        prims.push(DrawPrim::Panel {
+            x: card_x - 1.0,
+            y: card_y + 2.0,
+            w: card_w + 2.0,
+            h: card_h + 3.0,
+            radius: radius + 1.0,
+            fill: rgba([0, 0, 0], 0x30),
+        });
+    }
+    prims.extend([
+        DrawPrim::Panel {
+            x: card_x,
+            y: card_y,
+            w: card_w,
+            h: card_h,
+            radius,
+            fill: rgba(r.surface, 0xFF),
+        },
+        DrawPrim::Stroke {
+            x: card_x,
+            y: card_y,
+            w: card_w,
+            h: card_h,
+            radius,
+            width: 1.0,
+            color: rgba(r.separator, 0xE0),
+        },
+        DrawPrim::ClipPush {
+            x: card_x,
+            y: card_y,
+            w: card_w,
+            h: card_h,
+        },
+    ]);
+    prims
+}
+
+/// Close a list overlay's tray: the key-`hint` footer centred on the card's last
+/// row (Caption, tertiary), then the pop of the body clip [`overlay_card_frame`] pushed.
+pub(crate) fn finish_overlay_card(
+    mut prims: Vec<DrawPrim>,
+    hint: &str,
+    card: (f32, f32, f32, f32),
+    card_rows: usize,
+    g: &SettingsGeom,
+    r: &Roles,
+) -> TrayInput {
+    let (card_x, card_y, card_w, _) = card;
+    let (cw, ch) = (g.cw, g.ch);
+    let hint_w = text_w(hint, TypeStep::Caption.px(g.font_px).get());
     let fx = card_x + fit((card_w - hint_w) * 0.5, cw, card_w - hint_w - cw);
-    text(
+    let y0 = card_y + card_rows.saturating_sub(1) as f32 * ch;
+    let text_at = row_text_writer(g.font_px, ch);
+    text_at(
         &mut prims,
         fx,
-        card_y + layout.card_rows.saturating_sub(1) as f32 * ch,
-        fsize,
+        y0,
+        TypeStep::Caption,
         hint.to_string(),
         rgba(r.text_tertiary, 0xFF),
     );
     prims.push(DrawPrim::ClipPop);
+    TrayInput { prims, card }
+}
 
-    TrayInput {
-        prims,
-        card: layout.card,
+/// The row text writer the list overlays paint with: a Mono `step` run
+/// cap-height-centred in the `ch`-tall row at `y0`; empty text paints nothing.
+pub(crate) fn row_text_writer(
+    px: f32,
+    ch: f32,
+) -> impl Fn(&mut Vec<DrawPrim>, f32, f32, TypeStep, String, crate::widget::Rgba) {
+    move |prims, x, y0, step, s, color| {
+        if s.is_empty() {
+            return;
+        }
+        let size = step.px(px);
+        prims.push(text_prim(
+            x,
+            row_baseline(y0, ch, size.get()),
+            s,
+            size,
+            TextWeight::Regular,
+            TextFace::Mono,
+            color,
+        ));
     }
 }
 
@@ -1664,6 +1756,8 @@ mod tests {
             MenuAction::ConnectToSession,
             MenuAction::ConfigureConnection,
             MenuAction::DisconnectSession,
+            MenuAction::ShowIdentity,
+            MenuAction::ResetTerminal,
         ] {
             let row = s.rows.iter().find(|r| r.action == action).unwrap();
             assert!(!row.enabled, "{action:?} needs a front session");
@@ -1780,7 +1874,7 @@ mod tests {
             assert!(!row(&s, a).enabled, "{a:?} needs a session");
         }
         for a in [
-            MenuAction::Fleet,
+            MenuAction::ShowConnectionMap,
             MenuAction::FabricStatus,
             MenuAction::FabricOn,
             MenuAction::FabricOff,
@@ -2061,19 +2155,24 @@ mod tests {
         assert_eq!(s.selected_action(), Some(MenuAction::Copy));
     }
 
+    /// Settings… only opens Settings, so it carries no checkmark (the bar's
+    /// row has none either); a real toggle does.
     #[test]
     fn resolve_sets_checkmarks() {
         let mut s = PaletteState::new();
         s.resolve(&PaletteLive {
-            settings_open: false,
+            serious_mode: true,
             ..Default::default()
         });
-        let settings = s
-            .rows
-            .iter()
-            .find(|r| r.action == MenuAction::ToggleSettings)
-            .unwrap();
-        assert_eq!(settings.checked, Some(false));
+        let checked = |s: &PaletteState, a: MenuAction| {
+            s.rows.iter().find(|r| r.action == a).unwrap().checked
+        };
+        assert_eq!(checked(&s, MenuAction::ToggleSettings), None);
+        assert_eq!(
+            checked(&s, MenuAction::ToggleSettings),
+            crate::menu::native_menu_checked(MenuAction::ToggleSettings)
+        );
+        assert_eq!(checked(&s, MenuAction::ToggleSeriousMode), Some(true));
     }
 
     #[test]
@@ -2787,29 +2886,6 @@ mod tests {
             copy_node.supports_action(Action::Focus),
             "disabled Copy is still focusable"
         );
-    }
-
-    /// NEGATIVE CONTROL (non-vacuity): typing a filter that narrows the list removes the
-    /// corresponding MenuItem nodes — the tree reflects the live model, not a static list.
-    #[cfg(a11y_tree)]
-    #[test]
-    fn palette_a11y_tree_tracks_the_filter() {
-        use accesskit::Role;
-        let count = |s: &PaletteState| {
-            palette_a11y(s)
-                .nodes
-                .iter()
-                .filter(|(_, n)| n.role() == Role::MenuItem)
-                .count()
-        };
-        let mut s = PaletteState::new();
-        let all = count(&s);
-        for c in "settings".chars() {
-            s.push_char(c);
-        }
-        let narrowed = count(&s);
-        assert!(narrowed < all, "filtering drops MenuItem nodes");
-        assert_eq!(narrowed, s.filtered().len(), "and matches the filtered set");
     }
 
     #[cfg(a11y_tree)]

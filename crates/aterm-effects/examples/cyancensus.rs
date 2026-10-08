@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CYAN ROUND'S CENSUS — one instrument, BOTH tables, four questions.
+//! Cyan census: one instrument over both rainbow tables, four questions.
 //!
-//! BEFORE is the shipped v0.86.0 table and its `CROSS_PACE` walk, transcribed
-//! below from `HEAD` so that both arcs are measured by the same code and the
-//! same two inks. AFTER is whatever this build links.
+//! BEFORE is the v0.86.0 table and its `CROSS_PACE` walk, transcribed below so
+//! both arcs are measured by the same code and the same two inks. AFTER is
+//! whatever this build links.
 //!
-//! 1. per-entry S and V across each leg — does the pale zone still exist?
-//! 2. per-leg step for BOTH inks (the composited bed under the letters on
+//! 1. per-entry S and V across each leg: does the pale zone still exist?
+//! 2. per-leg step for both inks (the composited bed under the letters on
 //!    Nord, and the vivid rail below the row): median, p90 and worst CIE-Lab
 //!    step a cell is asked to carry, over 1000 walk phases x 16 cells;
-//! 3. anchor residency — the share of phases with a cell within ten entries
+//! 3. anchor residency: the share of phases with a cell within ten entries
 //!    of each named anchor;
-//! 4. yellow's share of a pass — cells of 16 whose rail reads yellow.
+//! 4. yellow's share of a pass: cells of 16 whose rail reads yellow.
 use aterm_effects::rainbow_kitty::meteor::tri;
 use aterm_effects::rainbow_kitty::ribbon::{
     UNDER_COV_CAP, bed_ink, bed_luma_budget, rail_ink, walk_arc, walk_t,
@@ -40,7 +40,7 @@ const LEGS: [&str; 6] = [
 ];
 
 // ===========================================================================
-// THE SHIPPED (v0.86.0) TABLE AND WALK, transcribed from HEAD.
+// The v0.86.0 table and walk (BEFORE).
 // ===========================================================================
 const OLD_LUT: [u32; 511] = [
     0x00FF_0000,
@@ -699,9 +699,8 @@ fn census(arc: &Arc) {
         hue_share(45.0, 75.0),
         hue_share(165.0, 200.0)
     );
-    // THE NEAREST-ANCHOR REGIONS, in midpoint arithmetic over the 510 steps —
-    // the share of the arc that is NEAREST each name, which is the unit the
-    // owner's yellow ruling is argued in.
+    // Nearest-anchor regions, in midpoint arithmetic over the 510 steps: the
+    // share of the arc nearest each named anchor.
     let mid = |i: usize| 0.5 * (arc.anchor_at[i] + arc.anchor_at[i + 1]) as f32;
     println!(
         "  REGIONS (nearest anchor, of 510): yellow {:.1} entries {:.1}%, R+O+Y {:.1} entries {:.1}%, green+blue {:.1} entries {:.1}%",
@@ -746,8 +745,8 @@ fn census(arc: &Arc) {
         let mut yellow = 0usize;
         let mut hlone = 0usize;
         let mut ylone = 0usize;
-        // THE WALK'S FIRST FULL PASS: seventeen cells at phase zero, and which
-        // of them the eye would name yellow (the nearest of the seven anchors).
+        // The walk's first full pass: seventeen cells at phase zero, and which
+        // of them read as yellow (nearest of the seven anchors).
         let name_of = |a: f32| {
             let x = a.clamp(0.0, 1.0) * 510.0;
             let mut best = 0usize;

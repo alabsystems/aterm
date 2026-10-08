@@ -121,12 +121,10 @@ fn laser_jump_strikes_lightning() {
     assert!(glow.bolts.is_empty(), "every bolt decays to nothing");
 }
 
-/// LIGHTNING TRAIL: with a long configured fade, a hot typing run leaves a
-/// lingering CHARGED trail — still lit well past where the old generic
-/// wake (~0.25s ceiling) died — whose aged cells bleed down to a dim
-/// residual instead of holding full beam power over the text, and whose
-/// crackle arcs root along the trail, not only at the write head. The
-/// charge still drains to exactly empty.
+/// Lightning trail: with a long configured fade, a hot typing run leaves a
+/// lingering charged trail whose aged cells bleed to a dim residual rather
+/// than holding full beam power over the text, and whose crackle arcs root
+/// along the trail, not only at the write head. The charge drains to empty.
 #[test]
 fn laser_typing_leaves_a_charged_crackling_trail() {
     let g = geom();
@@ -135,10 +133,9 @@ fn laser_typing_leaves_a_charged_crackling_trail() {
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
-    // A hot run: 14 keys at 50 ms cadence along one row. Watch each tick
-    // for a crackle arc FORGED THIS KEY (born == t) rooted ≥1.5 cells
-    // behind the current head — the trail-rooting tell (the old code
-    // rooted every arc exactly at the head cell).
+    // A hot run: 14 keys at 50 ms along one row. Watch each tick for a
+    // crackle arc forged this key (born == t) rooted ≥1.5 cells behind the
+    // current head.
     let mut trail_rooted = false;
     let mut t = t0;
     glow.tick(Some((2, 0)), t, &c, g, &mut out);
@@ -193,10 +190,9 @@ fn laser_typing_leaves_a_charged_crackling_trail() {
     assert_eq!(fp, 0, "the trail decays to exactly empty");
 }
 
-/// Laser must stay in its own hue — with a pure-green config no emitted quad
-/// may approach white (the old look flashed to R=G=B at the head, crown and
-/// ring). The shared hot-core layer's subtle highlight (≤70% white on the
-/// thin core only) is the permitted ceiling.
+/// Laser stays in its own hue: with a pure-green config no emitted quad
+/// approaches white. The shared hot-core highlight (≤70% white on the thin
+/// core only) is the permitted ceiling.
 #[test]
 fn laser_is_monochrome() {
     let g = geom();
@@ -283,13 +279,12 @@ fn laser_navigation_forges_no_strike() {
     );
 }
 
-/// Sparkle bursts SPREAD; Laser divides its punch. Sparkle births jitter
-/// across the cell via the already-drawn (previously unused) r2/r4
-/// randoms — no RNG stream shifts for any style — and a jump strews the
-/// burst along the leap vector like Fire/Comet/Beam. Laser keeps its
-/// exact-point cutting-torch births but scales each spark's birth
-/// coverage by 1/√burst, so a 30-spark landing stacks to the beam hue
-/// instead of clamping the impact point to a flat white blob.
+/// Sparkle bursts spread; Laser divides its punch. Sparkle births jitter
+/// across the cell using the r2/r4 randoms (no RNG stream shifts for any
+/// style), and a jump strews the burst along the leap vector like
+/// Fire/Comet/Beam. Laser keeps exact-point births but scales each spark's
+/// birth coverage by 1/√burst, so a 30-spark landing stacks to the beam hue
+/// instead of clamping to white.
 #[test]
 fn sparkle_and_laser_bursts_never_stack_one_point() {
     let g = geom();

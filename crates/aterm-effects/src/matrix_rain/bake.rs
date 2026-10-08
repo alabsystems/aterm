@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PHOSPHOR `RainBaker` — box-filters the 24×48 1-bit glyph master down to
-//! live-cell-metric tiles in ONE [`SceneAtlas`] (matrix-rain design §2): an
-//! 8×8 tile grid of `(cell_w, cell_h)` white-RGB straight-alpha tiles, baked
-//! progressively (≤ [`MAX_RAIN_BAKES_PER_TICK`] tiles per engine tick),
-//! version-bumped on every rebake, wholesale-restarted on a cell-metric
-//! change. Coverage is integer fixed-point ONLY (denominator `24·48` — exact
-//! area weighting, no floats), so the atlas bytes are deterministic.
+//! Phosphor `RainBaker`: box-filters the 24x48 1-bit glyph master down to
+//! live-cell-metric tiles in one [`SceneAtlas`] (`docs/matrix-rain-design.md`
+//! §2). The atlas is an 8x8 grid of `(cell_w, cell_h)` white-RGB
+//! straight-alpha tiles, baked progressively (at most
+//! [`MAX_RAIN_BAKES_PER_TICK`] per engine tick), version-bumped on every
+//! rebake and restarted on a cell-metric change. Coverage is integer
+//! fixed-point (denominator `24*48`, exact area weighting), so the atlas bytes
+//! are deterministic.
 
 use std::sync::Arc;
 
@@ -21,35 +22,31 @@ pub const RAIN_TILE_GRID: usize = 8;
 /// cell-metric change never spikes one frame with a 64-tile bake.
 pub const MAX_RAIN_BAKES_PER_TICK: usize = 8;
 
-/// Progressive master → cell-metric tile baker. Resident; the only transient
-/// allocation is the published [`SceneAtlas`] snapshot after a bake tick
-/// (steady state — atlas complete — is allocation-free).
+/// Progressive master -> cell-metric tile baker. Resident; the only transient
+/// allocation is the published [`SceneAtlas`] snapshot after a bake tick, so
+/// a complete atlas is allocation-free.
 #[derive(Default)]
 pub struct RainBaker {
     cell_w: u16,
     cell_h: u16,
     /// Straight-alpha RGBA8 texels, `(8·cell_w) × (8·cell_h)`.
     rgba: Vec<u8>,
-    /// Monotonic; bumped on EVERY rebake batch and every restart, so a
-    /// partially-baked atlas re-uploads progressively and the repaint key
-    /// sees each batch. PER-INSTANCE on purpose: the engine fingerprint folds
-    /// this version, and cross-engine determinism (two engines fed identical
-    /// inputs emit identical fingerprints) is a pinned contract — so the
-    /// sequence must be a pure function of this baker's history, never a
-    /// process-global counter. The GPU texture cache therefore must NOT key
-    /// on `(version, w, h)` alone (a REBUILT engine deterministically replays
-    /// the same sequence and would alias its predecessor's stale texels): it
-    /// keys on the published snapshot's Arc IDENTITY, which is unique per
-    /// publish by construction (split-pane audit).
+    /// Monotonic; bumped on every rebake batch and every restart, so a
+    /// partially-baked atlas re-uploads progressively and the repaint key sees
+    /// each batch. Per-instance, because the engine fingerprint folds it and
+    /// two engines fed identical inputs must emit identical fingerprints. A
+    /// rebuilt engine therefore replays the same sequence, so the GPU texture
+    /// cache keys on the published snapshot's `Arc` identity, not on
+    /// `(version, w, h)`.
     version: u64,
     /// Next tile index to bake; `>= ROM_GLYPHS` ⇒ complete.
     next_tile: usize,
     published: Option<Arc<SceneAtlas>>,
     dirty: bool,
-    /// Reused y-invariant per-dest-column source geometry: the ascending
-    /// `(mx, wx)` box-filter segments for every dest column, flat. Depends
-    /// only on `x` and `cell_w`, so it is built once per bake and shared
-    /// across all 64 tiles (rebuilt only when `cell_w` changes).
+    /// Per-dest-column source geometry: the ascending `(mx, wx)` box-filter
+    /// segments for every dest column, flattened. Depends only on `x` and
+    /// `cell_w`, so it is shared by all 64 tiles and rebuilt only when
+    /// `cell_w` changes.
     col_seg: Vec<(u32, u32)>,
     /// Per-dest-column offsets into `col_seg` (length `cell_w + 1`).
     col_off: Vec<u32>,
@@ -87,8 +84,8 @@ impl RainBaker {
     }
 
     /// Bake up to [`MAX_RAIN_BAKES_PER_TICK`] pending tiles. Returns whether
-    /// any tile was baked (each batch bumps the version — a rebake must
-    /// repaint AND re-upload).
+    /// any tile was baked (each batch bumps the version, so a rebake repaints
+    /// and re-uploads).
     pub fn bake_tiles(&mut self, rom: &RomMaster) -> bool {
         if self.complete() {
             return false;
@@ -103,30 +100,25 @@ impl RainBaker {
         true
     }
 
-    /// Whether a SELECTIVE re-bake is sound right now: a live cell metric and a
-    /// complete atlas, i.e. every tile currently holds exactly the texels a full
-    /// bake of the current master would produce for it. Before the first
-    /// geometry `complete()` is vacuously true (`cell_w == 0`) but there is no
-    /// buffer to patch, so that case is excluded here.
+    /// Whether a selective re-bake is sound: a live cell metric and a complete
+    /// atlas, so every tile holds exactly what a full bake of the current
+    /// master would produce. Before the first geometry `complete()` is
+    /// vacuously true (`cell_w == 0`) but there is no buffer to patch, so that
+    /// case is excluded.
     #[must_use]
     pub fn can_rebake(&self) -> bool {
         self.cell_w != 0 && self.cell_h != 0 && self.next_tile >= ROM_GLYPHS
     }
 
-    /// Re-bake ONLY the tiles named by `mask` (bit `i` ⇒ tile `i`) into the
-    /// finished atlas. The tiles left alone keep the texels they already hold,
-    /// which are the texels a full bake would produce for them as long as their
-    /// master glyphs did not change — the caller owns that half of the
-    /// invariant by re-authoring precisely the slots it lists here. The
-    /// published atlas bytes are therefore identical to a `restart()` + full
-    /// bake of the same master.
+    /// Re-bake only the tiles named by `mask` (bit `i` = tile `i`) into the
+    /// finished atlas. Untouched tiles keep their texels, which match a full
+    /// bake as long as their master glyphs did not change; the caller
+    /// guarantees that by listing exactly the slots it re-authored. The
+    /// published bytes equal a `restart()` plus full bake of the same master.
     ///
-    /// VERSION ACCOUNTING IS DELIBERATE. The version is folded into the engine's
-    /// frame fingerprint, which is a pinned byte-identity contract, so this path
-    /// advances it by exactly what the wholesale path advanced it by — one
-    /// restart plus one bump per progressive batch — even though it physically
-    /// bakes fewer tiles. Monotonic, still changes whenever the bytes change,
-    /// and the fingerprint sequence is unmoved.
+    /// The version advances exactly as the wholesale path would (one restart
+    /// plus one bump per progressive batch), even though fewer tiles are
+    /// baked, so the frame fingerprint sequence is identical.
     pub fn rebake_tiles(&mut self, rom: &RomMaster, mask: u64) -> bool {
         if !self.can_rebake() || mask == 0 {
             return false;
@@ -176,11 +168,11 @@ impl RainBaker {
         )
     }
 
-    /// Box-filter one glyph's 24×48 master into its `(cell_w, cell_h)` tile:
-    /// exact integer area weighting. Destination pixel `x` covers master
-    /// x-range `[x·24/cw, (x+1)·24/cw)`; scaling both axes by `(cw, ch)`
-    /// keeps every overlap an integer, and the per-pixel denominator is the
-    /// constant `24·48` (the full source extent of one destination pixel).
+    /// Box-filter one glyph's 24x48 master into its `(cell_w, cell_h)` tile
+    /// with exact integer area weighting. Dest pixel `x` covers master x-range
+    /// `[x*24/cw, (x+1)*24/cw)`; scaling both axes by `(cw, ch)` keeps every
+    /// overlap an integer, and the per-pixel denominator is the constant
+    /// `24*48`.
     fn bake_tile(&mut self, rom: &RomMaster, tile: usize) {
         let (cw, ch) = (usize::from(self.cell_w), usize::from(self.cell_h));
         if cw == 0 || ch == 0 {
@@ -190,13 +182,11 @@ impl RainBaker {
         let (ox, oy) = ((tile % RAIN_TILE_GRID) * cw, (tile / RAIN_TILE_GRID) * ch);
         const DEN: u32 = (MASTER_W * MASTER_H) as u32;
 
-        // y-invariant per-dest-column source geometry: `(c/cw, (d-1)/cw)` and
-        // the per-source-column horizontal weight `wx` depend only on `x` and
-        // `cw`, never `y`, so build the ascending `(mx, wx)` segments once per
-        // bake (shared across all 64 tiles; `cw` fixes both the length and the
-        // contents). `mx1 = ((x+1)·MW - 1)/cw <= MW-1` always, so the old
-        // `.min(MASTER_W-1)` bound was a no-op and is dropped. Iterating the
-        // segments ascending keeps the `num` accumulation order byte-identical.
+        // The per-dest-column source range and horizontal weights `wx` depend
+        // only on `x` and `cw`, so the ascending `(mx, wx)` segments are built
+        // once per `cw` and shared across all 64 tiles. `mx1 = ((x+1)*MW -
+        // 1)/cw <= MW-1` always, so no clamp is needed. Iterating ascending
+        // keeps the `num` accumulation order fixed.
         if self.col_off.len() != cw + 1 {
             self.col_seg.clear();
             self.col_off.clear();
@@ -212,10 +202,9 @@ impl RainBaker {
             }
         }
 
-        // Per-dest-row source scratch `(wy, row_bits)`, indexed by `my`.
-        // `my` and `wy`/`row` depend only on `(y, my)`, not `x`, so compute
-        // them once per dest row instead of once per dest pixel. Only the
-        // written range `my0..=my_end` is read below, so no per-row zeroing.
+        // Per-dest-row source scratch `(wy, row_bits)`, indexed by `my`; it
+        // depends only on `(y, my)`, so it is computed once per dest row. Only
+        // `my0..=my_end` is read, so no per-row zeroing.
         let mut src: [(u32, u32); MASTER_H] = [(0, 0); MASTER_H];
         for y in 0..ch {
             // Master rows overlapping dest row `y`, with overlaps in 1/ch units.
@@ -238,10 +227,9 @@ impl RainBaker {
                         }
                     }
                 }
-                // num <= DEN always: a dest pixel's scaled extent is exactly
-                // MASTER_W×MASTER_H, so Σwx·Σwy = 24·48 = DEN at full coverage
-                // and only set bits contribute ⇒ (num·255 + DEN/2)/DEN <= 255
-                // exactly. The old `.min(255)` was provably dead; dropped.
+                // num <= DEN: a dest pixel's scaled extent is exactly
+                // MASTER_W*MASTER_H = DEN at full coverage, so the rounded
+                // alpha is at most 255 without a clamp.
                 let alpha = ((num * 255 + DEN / 2) / DEN) as u8;
                 let idx = ((oy + y) * atlas_w + ox + x) * 4;
                 self.rgba[idx] = 255;
@@ -305,8 +293,8 @@ mod tests {
         assert_eq!(a.atlas().unwrap().rgba, b.atlas().unwrap().rgba);
     }
 
-    /// Progressive discipline: ≤ 8 tiles per bake tick (8 ticks to finish),
-    /// with a version bump on every batch and on the metric-change restart.
+    /// Progressive bake: at most 8 tiles per tick (8 ticks to finish), with a
+    /// version bump on every batch and on the metric-change restart.
     #[test]
     fn progressive_bake_and_version_bumps() {
         let rom = rasterize_master();
@@ -335,12 +323,9 @@ mod tests {
         );
     }
 
-    /// SPLIT-PANE AUDIT: versions are deterministic PER INSTANCE (the engine
-    /// fingerprint contract), so a rebuilt baker REPLAYS its predecessor's
-    /// version sequence — which is exactly why the GPU texture cache must key
-    /// on the published snapshot's Arc IDENTITY, never `(version, w, h)`
-    /// alone. Pin both halves: the sequences collide, and every publish is a
-    /// fresh allocation (per-publish-unique identity).
+    /// Versions are deterministic per instance, so a rebuilt baker replays
+    /// its predecessor's sequence; every publish is still a fresh allocation,
+    /// so the GPU cache's `Arc`-identity key never aliases.
     #[test]
     fn rebuilt_bakers_replay_versions_but_publish_fresh_arcs() {
         let rom = rasterize_master();

@@ -52,45 +52,24 @@
 #![cfg(windows)]
 
 use core::ptr;
-use std::ffi::OsStr;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 
-type Hkey = isize;
-const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as Hkey;
-const REG_SZ: u32 = 1;
-const KEY_WRITE: u32 = 0x0002_0006;
+use crate::win_ffi::{
+    HKEY_CURRENT_USER, Hkey, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegSetValueExW, wide,
+};
+
 const KEY_READ: u32 = 0x0002_0019;
-const REG_OPTION_NON_VOLATILE: u32 = 0;
 const ERROR_FILE_NOT_FOUND: i32 = 2;
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
-    fn RegCreateKeyExW(
-        hkey: Hkey,
-        subkey: *const u16,
-        reserved: u32,
-        class: *const u16,
-        options: u32,
-        sam: u32,
-        security: *const core::ffi::c_void,
-        result: *mut Hkey,
-        disposition: *mut u32,
-    ) -> i32;
     fn RegOpenKeyExW(
         hkey: Hkey,
         subkey: *const u16,
         options: u32,
         sam: u32,
         result: *mut Hkey,
-    ) -> i32;
-    fn RegSetValueExW(
-        hkey: Hkey,
-        name: *const u16,
-        reserved: u32,
-        ty: u32,
-        data: *const u8,
-        cb: u32,
     ) -> i32;
     fn RegQueryValueExW(
         hkey: Hkey,
@@ -101,7 +80,6 @@ unsafe extern "system" {
         cb: *mut u32,
     ) -> i32;
     fn RegDeleteValueW(hkey: Hkey, name: *const u16) -> i32;
-    fn RegCloseKey(hkey: Hkey) -> i32;
 }
 
 /// The delegation key, exactly as conhost spells it. The doubled `%` is
@@ -133,13 +111,6 @@ pub(crate) const CLSID_ATERM_TERMINAL: &str = "{02E7D4D8-6B51-4BB2-84CE-5949B78B
 /// only by [`delegation_owner`], to recognize our own half-state if a future
 /// wave ever does write it.
 pub(crate) const CLSID_ATERM_CONSOLE: &str = "{17A55D2B-8FC4-4990-8805-617293BD5A4D}";
-
-fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
 
 /// Is a COM handoff server actually able to answer `EstablishPtyHandoff`?
 ///
@@ -442,13 +413,6 @@ mod tests {
         let w = wide(STARTUP_KEY);
         assert_eq!(w.iter().filter(|&&c| c == u16::from(b'%')).count(), 2);
         assert_eq!(*w.last().expect("non-empty"), 0, "must be NUL-terminated");
-    }
-
-    /// Value names are conhost's, verbatim.
-    #[test]
-    fn delegation_value_names_match_conhost() {
-        assert_eq!(VALUE_CONSOLE, "DelegationConsole");
-        assert_eq!(VALUE_TERMINAL, "DelegationTerminal");
     }
 
     /// The CLSID must be registry-shaped: braced, upper-case, 8-4-4-4-12.

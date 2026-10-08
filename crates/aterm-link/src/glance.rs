@@ -1,89 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PRESENCE ROW, READ ONCE FOR THE WHOLE CRATE — `Last{/f/<F>/pub/*/*/presence}`
-//! parsed into rows that `aterm fabric status`, `aterm link ls`, `notify --on
-//! attention` and the bridge's own roster all read the bus through.
+//! The crate's one reader of a presence row: `Last{/f/<F>/pub/*/*/presence}`
+//! parsed into rows. `aterm fabric status` reads through [`read`] and
+//! [`Row::parse`], `notify --on attention` through [`Row::parse`].
 //!
-//! IT WAS `glance.json` UNTIL ROUND 21, and the file is what went. This module
-//! shipped a WRITER — one `Last` round trip, an atomic write of
-//! `<state>/fabric/glance.json`, a JSON emitter and a hand-rolled JSON parser to
-//! read it back — so that the macOS menu bar could show `ls`'s rows without
-//! holding a capability or blocking a UI thread on a broker round trip (§9.3).
-//! Its own header said, from the day it was written, **NO SUCH READER IS
-//! BUILT**: `status_item.rs` had no `FabricGlance`, no mention of the file and
-//! no read of any fabric state, and none appeared. A format with no reader is a
-//! format nobody is holding to anything, so the writer, the emitter, the parser
-//! and the `aterm link glance` subcommand are gone.
+//! ## A row IS the `Last` answer, not a summary of it
 //!
-//! WHAT WAS NEVER CRUFT is everything below: [`Row::parse`], [`read`],
-//! [`ABSENT`], [`ATTENTION_CAP`] and [`json_string`] are the crate's ONE reader
-//! of a presence row, and `fabric.rs`, `notify.rs`, `bridge.rs`, `cli.rs` and
-//! `presence.rs` all call into them. The §5 audit row that named this file
-//! 960 lines of cruft was reading the header's own "not built" and stopping
-//! there; the writer was 350 of those lines and the reader is the rest.
+//! Every `key=value` token of the body is carried verbatim under its own name,
+//! with the subject and offset it was read at; a token this build has never
+//! heard of survives, so two readers of one fleet cannot disagree.
+//! [`Row::fields`] is therefore a map, not a struct.
 //!
-//! ## The one property this module has to keep
+//! Four exceptions, all cap-forced: the [`RESERVED`] names `subject`, `offset`,
+//! `node` and `owner` come from the subject the broker handed back, and a body
+//! token of one of them is dropped ([`fields_of`]) — otherwise a node could
+//! publish itself as somebody else's session on somebody else's host.
 //!
-//! **A row IS the `Last{/f/<F>/pub/*/*/presence}` answer, not a summary of it.**
-//! Every `key=value` token of the presence body is carried through verbatim,
-//! under its own name, together with the subject it came from and the offset it
-//! was read at. Nothing is renamed, nothing is computed, and a token this build
-//! has never heard of survives to the reader — because the alternative is two
-//! readers of the same fleet disagreeing about it with no way to tell which one
-//! is lying. [`Row::fields`] is therefore a map, not a struct.
+//! `attention=` (why a session wants a human) and `fabric=` (whether its node is
+//! reachable) are always present; a missing one reads `-`, as `ls` renders it.
 //!
-//! **WITH EXACTLY FOUR EXCEPTIONS, AND THEY ARE THE CAP-FORCED ONES.** The four
-//! names in [`RESERVED`] — `subject`, `offset`, `node` and `owner` — are read
-//! from the SUBJECT the broker handed back, and a body token of one of those
-//! names is DROPPED rather than carried ([`fields_of`]). A body is whatever a
-//! node holding `rw,p=<n>:/f/<F>/pub/<n>/>` chose to write, so a carried
-//! `owner=` or `node=` would let a node publish itself as somebody else's
-//! session on somebody else's host. Four names of a publisher's is the price of
-//! the other three facts being true.
+//! ## Bounds
 //!
-//! The drop mattered twice over while the JSON writer existed: the same token
-//! spliced into the emitted object produced a SECOND key of that name, and
-//! every mainstream reader is last-wins, so the publisher's value beat the
-//! broker's. Round 21 cut the writer; the drop stays, because it is what makes
-//! `Row::node` and `Row::owner` mean what every caller reads them to mean.
-//!
-//! Two fields are guaranteed present even when the publisher omitted them, and
-//! they are the two the human actually reads: `attention=` (why a session wants
-//! a human) and `fabric=` (whether that session's node can still be reached). A
-//! missing one reads `-`, exactly as `ls` renders a missing token — the reader
-//! never has to distinguish "absent" from "unknown".
-//!
-//! ## Bounds, because one roster read serves every caller and a fleet is not bounded
-//!
-//! * At most [`MAX_ROWS`] rows. A `Last` answer is one row per SUBJECT, so a
-//!   fleet that has ever hosted a million sessions has a million-row answer, and
-//!   a reader that took it whole at every wake would be the fleet's biggest
-//!   cost. When the answer is cut, [`Glance::truncated`] says so rather than
-//!   leaving a short list to be read as a complete one.
-//! * **EVERY key and EVERY value is capped, not just `attention=`.** Each is cut
-//!   to [`FIELD_CAP`] bytes and a row keeps at most [`FIELDS_MAX`] of them, so
-//!   one row costs a bounded number of bytes and a read as a whole is bounded
-//!   by [`MAX_ROWS`] times that. `attention=` is capped at [`ATTENTION_CAP`],
-//!   which is the same number and is also the cap aterm applies to its own
-//!   (§4.1's presence row) — ONE number, so the two sides cannot disagree.
-//!
-//!   This section used to justify capping `attention=` alone with "every other
-//!   one is a bounded token". Nothing bounded them. [`fields_of`] keeps whatever
-//!   the first line of the body holds, [`Row::parse`] validates only the
-//!   SUBJECT, and a record is 16 MiB at the broker — so a hostile node's
-//!   `detail=` was a multi-megabyte value per row handed to every reader. A
-//!   bound the code does not keep is worse than no bound, because it is what the
-//!   next reader budgets against.
-//!
-//!   A CUT VALUE IS MARKED with a trailing `…`, and the mark is INSIDE the cap:
-//!   [`truncate`] answers at most `cap` bytes including the ellipsis, so a
-//!   reader sizing a buffer from [`ATTENTION_CAP`] is not handed `cap + 3`.
-//! * A value is kept verbatim — still pct-encoded, exactly as it crossed the
-//!   bus. `detail=`, `host=` and `title=` are pct-encoded at the publisher
-//!   (§4.1), and decoding them here would put a caller-chosen byte sequence
-//!   (a newline, an ESC) into every string a caller renders. The reader
-//!   decodes what it is about to show, at the moment it shows it.
+//! * At most [`MAX_ROWS`] rows: a `Last` answer is one row per subject ever
+//!   hosted. A cut answer sets [`Glance::truncated`] rather than passing as
+//!   complete.
+//! * Every key and value is cut to [`FIELD_CAP`] bytes (the `…` mark inside
+//!   the cap) and a row keeps at most [`FIELDS_MAX`] tokens: a record is
+//!   16 MiB at the broker, and a hostile node's `detail=` must not reach every
+//!   reader. [`ATTENTION_CAP`] is the same number as aterm's own (§4.1).
+//! * Values stay pct-encoded as they crossed the bus; decoding here would put a
+//!   publisher-chosen newline or ESC into every rendered string. The reader
+//!   decodes at the moment it shows a value.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -91,20 +39,14 @@ use std::io;
 use crate::transport::Conn;
 
 /// The most rows one roster read may hold. See the module note on bounds.
-///
-/// It bounded `glance.json`'s size until round 21 cut that writer; it still
-/// bounds [`read`], which is what every caller now goes through.
 pub const MAX_ROWS: usize = 4096;
 
-/// The byte cap on ANY one key or value this file carries, INCLUDING the `…`
+/// The byte cap on ANY one key or value a row carries, INCLUDING the `…`
 /// that marks a cut.
 ///
-/// ONE NUMBER FOR EVERY FIELD, deliberately. The alternative — a cap per
-/// interesting field — is three components with three implicit limits for one
-/// value, which is the shape this project's worst defects have taken. 256 bytes
-/// holds every token the publisher actually writes (`bridge.rs`'s presence body:
-/// numbers, principals, a pct-encoded hostname, and `attention=` at exactly this
-/// cap) with room to spare, and a longer one is a claim, not a fact.
+/// One number for every field, so no two components hold different implicit
+/// limits for one value. 256 bytes holds every token `bridge.rs`'s presence
+/// body writes (`attention=` at exactly this cap).
 pub const FIELD_CAP: usize = 256;
 
 /// The byte cap on `attention=`, matching aterm's own (§4.1) — and the same
@@ -113,36 +55,22 @@ pub const ATTENTION_CAP: usize = FIELD_CAP;
 
 /// The most `key=value` tokens one row's fields map keeps.
 ///
-/// A row is a presence body's FIRST LINE split on whitespace, so its token count
-/// is bounded by nothing the publisher does not choose. `bridge.rs` writes nine;
-/// 64 leaves room for every field a later rung adds and still bounds one row at
-/// [`FIELDS_MAX`] × 2 × [`FIELD_CAP`] bytes, and the file at [`MAX_ROWS`] times
-/// that. Tokens past the bound are DROPPED — the row is still written, because a
-/// node that pads its presence row must not be able to erase itself from a human
-/// operator's view of the fleet.
+/// The publisher chooses the token count; `bridge.rs` writes nine. 64 bounds a
+/// row at [`FIELDS_MAX`] × 2 × [`FIELD_CAP`] bytes. Tokens past it are dropped
+/// but the row is kept: a node that pads its row must not erase itself from an
+/// operator's view.
 pub const FIELDS_MAX: usize = 64;
 
 /// The two tokens every row carries whether or not the publisher wrote them.
 const GUARANTEED: [&str; 2] = ["attention", "fabric"];
 
-/// The row keys [`Glance::to_json`] writes from the SUBJECT, which no body token
-/// may shadow. See the module note on the four exceptions.
-///
-/// ONE LIST, READ BY BOTH SIDES: [`fields_of`] refuses these names on the way in
-/// and [`Glance::to_json`] refuses them again at the splice, so a `Row` built by
-/// any route — parsed, read back, or assembled by a test — still emits each of
-/// them exactly once. A fifth subject-derived key added to the writer without a
-/// line here is the same defect again, which is what
-/// [`tests::no_body_token_can_shadow_a_cap_forced_row_fact`] fails on.
+/// The row keys [`Row::parse`] fills from the cap-forced SUBJECT; [`fields_of`]
+/// drops a body token of any of these names. See the module note on the four
+/// exceptions, and `tests::no_body_token_can_shadow_a_cap_forced_row_fact`.
 pub const RESERVED: [&str; 4] = ["subject", "offset", "node", "owner"];
 
 /// The value a missing token reads as — the same dash `ls` prints.
 pub const ABSENT: &str = "-";
-
-/// How many rows one `Last` page asks for. The broker clamps this to
-/// `LAST_PAGE_MAX`; asking for more is not an error, and asking for fewer only
-/// costs round trips.
-const PAGE: u32 = 512;
 
 /// One presence row, as read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,12 +97,9 @@ impl Row {
 
     /// Parse one `Last` record into a row, or refuse it.
     ///
-    /// REFUSAL IS THE POINT of returning an `Option`: the filter the reader
-    /// sends is `/f/<F>/pub/*/*/presence`, and `*` is exactly one segment, so
-    /// the broker cannot hand back anything else — but a file that is written
-    /// once and read by a UI forever is the wrong place to trust a filter. The
-    /// shape is re-checked here, by position from the left, the way every other
-    /// subject in this crate is (`subject::parse_in`).
+    /// The broker's filter should admit nothing else, but a rendered row is the
+    /// wrong place to trust a filter: the shape is re-checked by position from
+    /// the left, as `subject::parse_in` does.
     #[must_use]
     pub fn parse(fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Row> {
         let segs: Vec<&str> = subject.split('/').collect();
@@ -205,11 +130,9 @@ impl Row {
 /// Every `key=value` token of a presence body's first line, verbatim — except a
 /// token whose key is [`RESERVED`].
 ///
-/// TOTAL over arbitrary bytes, like [`crate::body::Body::decode`]: the body is
-/// read lossily as UTF-8, only the first line is considered (a presence row has
-/// no `len=` tail, and a body that grew one must not smuggle a second row), a
-/// token without `=` is skipped, and a repeated key keeps the LAST occurrence —
-/// which is what a `k=v` line means everywhere else in this crate.
+/// Total over arbitrary bytes, like [`crate::body::Body::decode`]: lossy UTF-8,
+/// first line only (a body must not smuggle a second row), a token without `=`
+/// skipped, and a repeated key keeps the last occurrence.
 fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
     let line = String::from_utf8_lossy(body);
     let line = line.split('\n').next().unwrap_or("");
@@ -221,26 +144,15 @@ fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
         if k.is_empty() {
             continue;
         }
-        // EVERY key and EVERY value, not just `attention=`: see the module note
-        // on bounds for the claim this used to rest on and the code that did not
-        // keep it.
         let key = truncate(k, FIELD_CAP);
-        // A BODY DOES NOT GET TO NAME A FACT THE SUBJECT ALREADY NAMES. These
-        // four are written from the cap-forced subject; a body token of the same
-        // name became a SECOND key of that name in the row object, which a
-        // last-wins reader resolves in the publisher's favour, and `offset=`
-        // became a string where the parser needs a number and took the whole
-        // file down with it. Dropped here rather than renamed: a `node` field
-        // under some other name is a second thing for a reader to get wrong.
+        // A body may not name a fact the subject names. Dropped, not renamed:
+        // a renamed `node` is a second thing for a reader to get wrong.
         if RESERVED.contains(&key.as_str()) {
             continue;
         }
-        // THE COUNT IS A BOUND TOO. A cap on each field bounds a field; the
-        // NUMBER of them is the publisher's choice, and this file is durable.
-        // The two [`GUARANTEED`] tokens are admitted past the bound, so a node
-        // cannot pad its own row until the fields a human reads fall off it, and
-        // a key already in the map is never refused — that would drop the LAST
-        // occurrence, which is what a `k=v` line means everywhere in this crate.
+        // The count is bounded too. [`GUARANTEED`] tokens pass the bound so
+        // padding cannot push them off, and a key already in the map is never
+        // refused (last occurrence wins).
         if out.len() >= FIELDS_MAX && !GUARANTEED.contains(&key.as_str()) && !out.contains_key(&key)
         {
             continue;
@@ -257,16 +169,8 @@ fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
 /// Truncate `v` to at most `cap` BYTES, on a char boundary, marking a cut with a
 /// trailing `…`.
 ///
-/// **THE `…` IS INSIDE THE CAP.** It used to be appended to a `cap`-byte cut, so
-/// the answer was up to `cap + 3` bytes — three more than the module header
-/// promises and three more than the publisher it calls "the same cap" can hold
-/// (`bridge.rs`'s `attention_of` cuts hard at [`ATTENTION_CAP`] with no mark).
-/// A caller sizing a buffer from the constant was handed more than it asked for
-/// by exactly the amount that made the two caps different numbers.
-///
-/// A cap that silently produced invalid UTF-8 would be a cap that broke the file
-/// it was protecting, so the cut is on a char boundary; and a `cap` too small to
-/// hold the mark cuts without one rather than overrunning to carry it.
+/// The `…` is inside the cap, so a caller sizing from the constant gets at most
+/// `cap` bytes; a `cap` too small for the mark cuts without one.
 fn truncate(v: &str, cap: usize) -> String {
     if v.len() <= cap {
         return v.to_string();
@@ -297,37 +201,30 @@ pub struct Glance {
 
 /// Read every presence row of `fleet` through one connection.
 ///
-/// PAGES ON `resume`, NOT ON ROW COUNT. §5.2: the broker clamps `max` and cuts
-/// each index scan after a fixed number of entries VISITED, so a page shorter
-/// than `max` — an EMPTY one included — is not the end of the answer. Only an
-/// empty `resume` cursor is. A reader that stopped at the first short page would
-/// silently lose the tail of a large fleet, and would lose it in exactly the
-/// case a large fleet is hardest to notice in.
+/// The walk is astream's [`astream_broker::Client::last_walk`], which pages on
+/// the `resume` cursor (§5.2: a short page, an empty one included, is not the
+/// end of the answer) and bounds how many pages it asks for.
+/// [`Glance::truncated`] is set only when a further row exists past
+/// [`MAX_ROWS`].
 ///
 /// # Errors
 ///
-/// Any broker or transport failure.
+/// Any broker or transport failure, or a walk that did not end within
+/// [`astream_broker::LAST_WALK_PAGES_MAX`] pages.
 pub fn read(conn: &mut Conn, fleet: &str) -> io::Result<Glance> {
     let filter = format!("/f/{fleet}/pub/*/*/presence");
-    let mut after = String::new();
     let mut rows = Vec::new();
     let mut truncated = false;
-    loop {
-        let (page, _, resume) = conn.last_page(&filter, &after, PAGE)?;
-        for (offset, subject, body) in &page {
-            if rows.len() >= MAX_ROWS {
-                truncated = true;
-                break;
-            }
-            if let Some(row) = Row::parse(fleet, *offset, subject, body) {
-                rows.push(row);
-            }
+    conn.last_walk(&filter, "", u32::MAX, |(offset, subject, body)| {
+        if rows.len() >= MAX_ROWS {
+            truncated = true;
+            return Ok(astream_broker::Walk::Stop);
         }
-        if truncated || resume.is_empty() {
-            break;
+        if let Some(row) = Row::parse(fleet, offset, &subject, &body) {
+            rows.push(row);
         }
-        after = resume;
-    }
+        Ok(astream_broker::Walk::Continue)
+    })?;
     Ok(Glance {
         fleet: fleet.to_string(),
         rows,
@@ -366,10 +263,8 @@ mod tests {
         Row::parse("f1", 7, subject, body.as_bytes()).expect("a presence row")
     }
 
-    /// EVERY TOKEN SURVIVES, including one this build has never heard of, and
-    /// the two the human reads are present even when the publisher omitted
-    /// them. A row that quietly dropped `attention=` would be a menu bar that
-    /// never shows an escalation.
+    /// Every token survives, unknown ones included, and the two guaranteed
+    /// tokens are present even when the publisher omitted them.
     #[test]
     fn a_row_carries_every_token_and_always_the_two_that_matter() {
         let r = row(
@@ -407,16 +302,12 @@ mod tests {
         }
     }
 
-    /// `attention=` is capped — and the cap must not corrupt the file it
-    /// protects, nor exceed the number the module header hands to a reader.
+    /// `attention=` is capped on a char boundary, mark included.
     #[test]
     fn attention_is_capped_on_a_char_boundary() {
         let long = format!("attention={}", "é".repeat(400));
         let r = row("/f/f1/pub/n-a/node/presence", &long);
         let got = r.field("attention");
-        // AT MOST THE CAP, MARK INCLUDED. The `…` used to be three bytes ON TOP
-        // of it, so the "same cap" the header shares with `bridge.rs` was three
-        // bytes bigger here than there.
         assert!(got.len() <= ATTENTION_CAP, "{}", got.len());
         assert!(got.ends_with('…'));
         // Not capped, not marked: a value that fits is untouched.
@@ -424,10 +315,7 @@ mod tests {
         assert_eq!(short.field("attention"), "needs%20you");
     }
 
-    /// **EVERY FIELD IS BOUNDED, NOT ONLY `attention=`.** The header's bounds
-    /// section justified capping one token with "every other one is a bounded
-    /// token"; nothing bounded them, and this file is durable, written from a
-    /// remote publisher's 16 MiB record, and meant to be read at every wake.
+    /// Every key, value and the token count are bounded.
     #[test]
     fn no_publisher_chooses_how_big_a_row_is() {
         let huge = "z".repeat(100_000);
@@ -441,8 +329,7 @@ mod tests {
         assert_eq!(r.field("state"), "live", "a short value is untouched");
         assert!(r.field("detail").ends_with('…'), "a cut is marked");
 
-        // AND THE NUMBER OF THEM. One line of a million distinct keys is one
-        // row's fields map, and the row is durable.
+        // And the number of them.
         let many: String = (0..5000).map(|i| format!("k{i}=v{i} ")).collect();
         let r = row("/f/f1/pub/n-a/node/presence", &many);
         assert!(
@@ -458,22 +345,7 @@ mod tests {
         assert_eq!(r.field("fabric"), ABSENT);
     }
 
-    /// **A BODY TOKEN CANNOT SHADOW A CAP-FORCED ROW FACT.**
-    ///
-    /// `subject`, `offset`, `node` and `owner` are read from the subject the
-    /// broker handed back — `node` and `owner` cap-forced, the other two the
-    /// reader's own — and a body token of one of those names is DROPPED rather
-    /// than carried. A body is whatever a node holding its own `pub/<n>/` grant
-    /// chose to write, so without the drop a node could publish itself as
-    /// somebody else's session on somebody else's host.
-    ///
-    /// ROUND 21 CUT THE OTHER HALF OF THIS TEST WITH THE WRITER IT GUARDED. The
-    /// `glance.json` emitter spliced these fields into the same JSON object,
-    /// where a surviving body token became a SECOND key of that name after the
-    /// honest one — and every mainstream reader is last-wins. There is no
-    /// emitter now; what remains is the parser's own drop, which is the half
-    /// that was always load-bearing for `fabric status`, `notify --on
-    /// attention` and `ls`.
+    /// A body token cannot shadow a cap-forced row fact ([`RESERVED`]).
     #[test]
     fn no_body_token_can_shadow_a_cap_forced_row_fact() {
         let r = row(

@@ -11,9 +11,6 @@
 //!
 //! These settings flow from UI → FFI → rendering pipeline, affecting both
 //! text shaping and grapheme width calculation.
-//!
-//! Extracted from `aterm-core::text_shaping_config` to break cross-crate
-//! dependency chains (Part of #2584).
 
 /// Ambiguous-width character handling.
 #[non_exhaustive]
@@ -211,15 +208,30 @@ mod tests {
     }
 }
 
-/// Property-based verification of the feature parser: the structural invariants
-/// the rest of the shaping pipeline relies on must hold for ARBITRARY input, not
-/// just the hand-picked cases above. (proptest is the right tool here rather than
-/// Kani — the input is an unbounded UTF-8 string; the bounded numeric/width
-/// invariants that ARE Kani-tractable live in `aterm-grapheme`'s `config_proofs`.)
+/// The feature parser over generated input (fixed-seed xorshift): the
+/// structural invariants the rest of the shaping pipeline relies on must hold
+/// for ARBITRARY input, not just the hand-picked cases above.
 #[cfg(test)]
-mod prop_tests {
+mod generated_tests {
     use super::*;
-    use proptest::prelude::*;
+
+    use aterm_spec::rng::XorShift;
+
+    /// Up to `max` characters drawn from `alphabet`.
+    fn string(rng: &mut XorShift, alphabet: &[char], max: usize) -> String {
+        (0..rng.index(max + 1))
+            .map(|_| *rng.pick(alphabet))
+            .collect()
+    }
+
+    const ALNUM: &[char] = &['a', 'k', 'z', 'A', 'L', 'Z', '0', '5', '9'];
+    /// The realistic config alphabet (tags, affixes, `=`, spaces).
+    const SOUP: &[char] = &['a', 'l', 'z', 'L', '0', '1', '9', ' ', '+', '-', '='];
+    /// Anything: whitespace of every kind, controls, multi-byte scalars.
+    const ANY: &[char] = &[
+        'a', 'Z', '0', ' ', '\t', '\n', '\u{a0}', '\u{3000}', '+', '-', '=', ',', '\0', '\u{7f}',
+        'é', '世', '🎉', '\u{200b}',
+    ];
 
     /// Every `FontFeature` the parser emits is WELL-FORMED: the 4-byte tag is all
     /// ASCII, right-padded with spaces (`<1..=4 chars><spaces>`), and never empty —
@@ -244,47 +256,52 @@ mod prop_tests {
         );
     }
 
-    proptest! {
-        /// PANIC-FREEDOM + well-formedness over ANY input string, and never more
-        /// features than whitespace-separated tokens (each token yields ≤1 feature).
-        #[test]
-        fn parse_never_panics_and_is_well_formed(s in ".*") {
+    /// PANIC-FREEDOM + well-formedness over any input, and never more features
+    /// than whitespace-separated tokens (each token yields ≤1 feature).
+    #[test]
+    fn parse_never_panics_and_is_well_formed() {
+        let mut rng = XorShift::new(0xF047_FEA7);
+        for i in 0..1024 {
+            let s = string(&mut rng, if i % 2 == 0 { ANY } else { SOUP }, 48);
             let out = parse_font_features(&s);
-            prop_assert!(out.len() <= s.split_whitespace().count());
+            assert!(out.len() <= s.split_whitespace().count(), "{s:?}");
             for f in &out {
                 assert_well_formed(f);
             }
         }
+    }
 
-        /// The realistic config alphabet (tags, affixes, `=`, spaces) — adversarial
-        /// soup must still only ever produce well-formed features.
-        #[test]
-        fn token_soup_stays_well_formed(s in "[a-zA-Z0-9 +\\-=]{0,48}") {
-            for f in &parse_font_features(&s) {
-                assert_well_formed(f);
+    /// Affix semantics: a bare tag enables (value 1), `+tag` is identical, and
+    /// `-tag` flips to 0 with the same tag bytes; `tag=value` carries the exact
+    /// value for any u32.
+    #[test]
+    fn affixes_and_explicit_values() {
+        let mut rng = XorShift::new(0xAF_F1CE5);
+        for _ in 0..256 {
+            let tag = {
+                let mut t = string(&mut rng, ALNUM, 3);
+                t.push(*rng.pick(ALNUM));
+                t
+            };
+            let bare = parse_font_features(&tag);
+            assert_eq!(bare.len(), 1, "{tag:?}");
+            assert_eq!(bare[0].value, 1);
+            assert_eq!(parse_font_features(&format!("+{tag}")), bare);
+            let minus = parse_font_features(&format!("-{tag}"));
+            assert_eq!(minus.len(), 1);
+            assert_eq!(minus[0].value, 0);
+            assert_eq!(minus[0].tag, bare[0].tag);
+
+            let alpha: String = tag.chars().filter(char::is_ascii_alphabetic).collect();
+            if !alpha.is_empty() {
+                let v = rng.below(u64::from(u32::MAX) + 1) as u32;
+                let out = parse_font_features(&format!("{alpha}={v}"));
+                assert_eq!(out.len(), 1, "{alpha}={v}");
+                assert_eq!(out[0].value, v);
             }
         }
-
-        /// Affix semantics: a bare tag enables (value 1), `+tag` is identical, and
-        /// `-tag` flips to 0 with the same tag bytes — for any 1–4 char alnum tag.
-        #[test]
-        fn affixes_set_value(tag in "[a-zA-Z0-9]{1,4}") {
-            let bare = parse_font_features(&tag);
-            prop_assert_eq!(bare.len(), 1);
-            prop_assert_eq!(bare[0].value, 1);
-            prop_assert_eq!(parse_font_features(&format!("+{tag}")), bare.clone());
-            let minus = parse_font_features(&format!("-{tag}"));
-            prop_assert_eq!(minus.len(), 1);
-            prop_assert_eq!(minus[0].value, 0);
-            prop_assert_eq!(minus[0].tag, bare[0].tag);
-        }
-
-        /// `tag=value` carries the exact parsed value for ANY u32.
-        #[test]
-        fn explicit_value_roundtrips(tag in "[a-zA-Z]{1,4}", v in any::<u32>()) {
-            let out = parse_font_features(&format!("{tag}={v}"));
-            prop_assert_eq!(out.len(), 1);
-            prop_assert_eq!(out[0].value, v);
+        for v in [0, 1, u32::MAX] {
+            assert_eq!(parse_font_features(&format!("liga={v}"))[0].value, v);
         }
     }
 }

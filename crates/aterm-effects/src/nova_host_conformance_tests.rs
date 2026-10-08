@@ -2,39 +2,33 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 bind for `NovaPhase` (`aterm_spec::derive::nova_phase_model`) on the
-//! HOST: the real `WordDecorations` engine, over a real terminal holding a
-//! profanity word in the classic nova style, ticked at 1 ms through three whole
-//! arms and everything between them.
+//! host: the real `WordDecorations` engine over a real terminal holding a
+//! profanity word in the classic nova style, ticked at 1 ms through three arms
+//! and everything between them.
 //!
-//! The model's defect lives in `Rearm`, and a re-arm is something only the host
-//! does — its ignition grant (`nova_start`, handed out by the flash limiter),
-//! its spent mark (`nova_done`), `hard_reset`, the suspend time-shift in
-//! `thaw`, and the grace/rebirth rules that decide when a word may NOT ignite
-//! again. So every one of those runs here, and both model variables come from
-//! the host:
+//! The model's defect lives in `Rearm`, and only the host re-arms: the ignition
+//! grant (`nova_start`, from the flash limiter), the spent mark (`nova_done`),
+//! `hard_reset`, the suspend time-shift in `thaw`, and the grace/rebirth rules
+//! that decide when a word may not ignite again. All of them run here, and both
+//! model variables come from the host:
 //!
-//! * `phase` is read off the episode the host keeps for the word: `Armed` until
-//!   the host grants an ignition, then the `(now − nova_start, D)` window the
-//!   emitter draws from (`D` from the word's own genome), and `Settled` for an
-//!   episode the host has marked spent without a grant (born done). The host's
-//!   own spent mark is checked against it on every frame: `nova_done` exactly
-//!   when the window has run out.
-//! * `flashes` counts the frames on which the host's nova stream goes from
-//!   dark to lit, per phase window. The model counts a flash exactly when the
-//!   walk enters `Flash`, so light that blooms in any other window, twice, or
-//!   not at all is a step the model rejects.
+//! * `phase`: `Armed` until the host grants an ignition, then the
+//!   `(now − nova_start, D)` window the emitter draws from (`D` from the word's
+//!   genome), and `Settled` for an episode marked spent without a grant (born
+//!   done). Each frame also checks `nova_done` is set exactly when the window
+//!   has run out.
+//! * `flashes`: frames on which the host's nova stream goes from dark to lit,
+//!   per phase window. The model counts a flash only on entering `Flash`.
 //!
-//! Every window boundary is validated as the model's `Step`, every
-//! `hard_reset` + rescan as its `Rearm` (the new episode must be `Armed` with no
-//! crown yet), and every host transition that is neither — a grace re-hit, an
-//! identity death and rebirth — must not move the projection at all. Three arms
-//! spend the model's whole `MaxSteps` budget on real steps; the second is
-//! frozen mid-crown and thawed two seconds later, and must resume where it
-//! stopped.
+//! Each window boundary is validated as a `Step`, each `hard_reset` + rescan as
+//! a `Rearm` (new episode `Armed`, no crown yet), and every other host
+//! transition (a grace re-hit, an identity death and rebirth) must leave the
+//! projection unchanged. Three arms spend the model's `MaxSteps` budget; the
+//! second is frozen mid-crown for two seconds and must resume where it stopped.
 //!
-//! NEGATIVE CONTROL: from the real settled state, a re-arm that re-enters
-//! `Flash` and counts a second crown (the model's `Buggy = 1` `Rearm`) is
-//! rejected by the committed model and admitted by `Buggy = 1`.
+//! Negative control: from the real settled state, a re-arm that re-enters
+//! `Flash` and counts a second crown is rejected by the committed model and
+//! admitted by `Buggy = 1`.
 
 use std::collections::BTreeMap;
 
@@ -338,7 +332,7 @@ fn the_real_host_conforms_to_nova_phase_model() {
     );
 }
 
-/// The modelled defect on the REAL settled host state: a re-arm that lands in
+/// The modelled defect on the real settled host state: a re-arm that lands in
 /// `Flash` and counts a second crown.
 #[test]
 fn a_rearm_into_flash_is_the_buggy_step_the_host_bind_rejects() {

@@ -5,9 +5,8 @@
 
 use super::*;
 
-/// FLARE LAW: a real cursor jump slams Fire's flare to full (the white-hot
-/// payoff), and the flare cools on its own tau — visibly gone within about a
-/// second — so the burst reads as an event, not a new steady state.
+/// Flare law: a real cursor jump slams Fire's flare to full, and it cools on its
+/// own tau, gone within about a second, so the burst reads as an event.
 #[test]
 fn fire_jump_flares_and_cools() {
     let g = geom();
@@ -18,8 +17,8 @@ fn fire_jump_flares_and_cools() {
     glow.tick(Some((3, 2)), t0, &c, g, &mut out); // seed
     glow.note_synthetic_move(t0);
     glow.tick(Some((3, 30)), t0, &c, g, &mut out); // a real jump
-    // ARRIVAL-TIME FLARE (P2): launch flies a meteor, the eruption fires
-    // when its head STRIKES the landing — not at launch.
+    // Arrival-time flare: launch flies a meteor, and the eruption fires when
+    // its head strikes the landing, not at launch.
     assert!(glow.flare < 0.5, "launch does not erupt ({})", glow.flare);
     assert_eq!(glow.fire_meteors.len(), 1, "the jump flies one meteor");
     assert!(!out.is_empty(), "the meteor emits light in flight");
@@ -48,14 +47,12 @@ fn fire_jump_flares_and_cools() {
     );
 }
 
-/// THE AUDITED NEWLINE BEHAVIOR, PINNED (P2): a move down one row anchors NO
-/// cell-anchored fire (sparks) beyond the single wake spark at the landing, and the
-/// landing row stays completely quiet RIGHT of the landing column (the old Bresenham
-/// sweep parked a fire bar on the new row's columns 1..8 — cells the cursor never
-/// visited). A TYPING WRAP (from the last column) is continued typing, so it flies
-/// NO inter-line meteor: a meteor there sweeps the whole line on every wrapped line
-/// during fast typing, painting the prompt and other untyped cells. A DELIBERATE
-/// Enter/jump from a short column still flies its meteor (the positive control below).
+/// Newline behaviour: a move down one row anchors no fire beyond the single wake
+/// spark at the landing, and the landing row stays quiet right of the landing
+/// column. A typing wrap (from the last column) is continued typing and flies no
+/// inter-line meteor, which would sweep the whole line on every wrap. A
+/// deliberate Enter/jump from a short column still flies one (the positive
+/// control).
 #[test]
 fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     let g = geom(); // rows:6 cols:40 → the last column is 39
@@ -63,7 +60,7 @@ fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     let t0 = Instant::now();
     let mut out = Vec::new();
 
-    // A TYPING WRAP: last column → next row's start. No meteor, no smear.
+    // A typing wrap: last column to the next row's start. No meteor, no smear.
     let mut wrapper = CursorGlow::default();
     wrapper.tick(Some((4, 39)), t0, &c, g, &mut out); // typing at the last column
     wrapper.note_synthetic_typed(t0, 1);
@@ -100,9 +97,9 @@ fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     assert_eq!(right_lum, 0, "landing row right of the cursor is quiet");
     assert_invariants(&out, g);
 
-    // POSITIVE CONTROL for the morphology: an explicitly scripted jump
-    // from a short column still flies its inter-line meteor. A raw Enter
-    // timestamp is deliberately not movement provenance.
+    // Positive control: an explicitly scripted jump from a short column still
+    // flies its inter-line meteor. A raw Enter timestamp is not movement
+    // provenance.
     let mut enterer = CursorGlow::default();
     enterer.tick(Some((2, 5)), t0, &c, g, &mut out); // cursor mid-line
     enterer.note_synthetic_move(t0);
@@ -118,14 +115,11 @@ fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     );
 }
 
-/// ONE-SHOT CAUSALITY: a scripted jump may fly one meteor, and an
-/// UNLICENSED second repaint hop neither retargets it nor mints a second
-/// one — but it does not KILL it either. The meteor is a pixel-space
-/// streak the first, licensed move earned along its own vector; it does
-/// not follow the caret, so a program hop 20 ms later has nothing to
-/// strand and no standing to destroy it (`move_licensed`, and
-/// `docs/design/EFFECTS-LICENSE-REDESIGN.md`: earned light is never
-/// destroyed by someone else's output).
+/// One-shot causality: a scripted jump may fly one meteor, and an unlicensed
+/// second repaint hop neither retargets it, mints a second, nor kills it. The
+/// meteor is a pixel-space streak along the licensed move's vector and does not
+/// follow the caret (`move_licensed`; earned light is never destroyed by
+/// someone else's output, `docs/design/EFFECTS-LICENSE-REDESIGN.md`).
 #[test]
 fn fire_meteor_survives_an_unlicensed_second_hop_without_retargeting() {
     let g = geom();
@@ -176,9 +170,9 @@ fn fire_meteor_survives_an_unlicensed_second_hop_without_retargeting() {
     );
 }
 
-/// SUSPENSE ARC: the same single-cell advance emits far more fire light
-/// mid-blaze than from a cold keyboard — the smolder→blaze build-up (taller
-/// tongues, brighter head, an ember column instead of a lone mote).
+/// Suspense arc: the same single-cell advance emits far more fire light
+/// mid-blaze than from a cold keyboard (taller tongues, brighter head, an ember
+/// column instead of a lone mote).
 #[test]
 fn fire_smolders_cold_and_blazes_hot() {
     let g = geom();
@@ -217,12 +211,11 @@ fn fire_smolders_cold_and_blazes_hot() {
     );
 }
 
-/// WINDOW-SPACE EFFECTS LAYER: with a real head band (origin_y = pad 8 +
-/// head 40 = 48) a row-0 blaze climbs ABOVE the grid into the chrome band —
-/// patches with `y < origin_y` exist, tagged with damage-hint row 0 — while
-/// the flame keeps its NATURAL cell-top root (`base_y == origin_y + 2`; the
-/// origin_y==0 `.max(ch)` clamp is a no-op here) and the engulf gate keeps
-/// every charred key a real grid row (no u16 wrap from a negative band).
+/// Window-space effects layer: with a real head band (origin_y = pad 8 + head 40
+/// = 48) a row-0 blaze climbs above the grid into the chrome band (patches with
+/// `y < origin_y`, tagged damage row 0) while the flame keeps its natural
+/// cell-top root (`base_y == origin_y + 2`), and the engulf gate keeps every
+/// charred key a real grid row (no u16 wrap from a negative band).
 #[test]
 fn fire_rises_into_the_chrome_band() {
     let g = Geom {
@@ -272,9 +265,8 @@ fn fire_rises_into_the_chrome_band() {
         glow.charred().iter().all(|cf| (cf.row as usize) < g.rows),
         "the engulf gate never keys a wrapped/above-grid charred row"
     );
-    // The engulf gate now materializes through the CONTRAST-HALO stream
-    // (charred stays empty under the no-recolor law) — same grid-row law,
-    // non-vacuously.
+    // The engulf gate materializes through the contrast-halo stream (charred
+    // stays empty under the no-recolour law), same grid-row law.
     assert!(
         !glow.halo_cells().is_empty(),
         "a row-0 blaze emits contrast-halo cells"
@@ -285,14 +277,11 @@ fn fire_rises_into_the_chrome_band() {
     );
 }
 
-/// THE IDENTITY LAW at a REAL host origin (adversarial review): with a
-/// nonzero origin but `head == 0` — the GUI's layout when no chrome band
-/// exists (Linux, `ATERM_NO_FULLSIZE_CONTENT`, fullscreen) — the fire must
-/// reproduce the historical pad-relative behavior EXACTLY, translated by
-/// origin: the row-0 root stays forced one cell down (`origin_y + ch`), and
-/// no patch pixel ever rises above the grid top (`y >= origin_y`). The
-/// window-clamped clamps this pins against rooted 12px high and painted the
-/// pad strip.
+/// The identity law at a real host origin: with a nonzero origin but `head == 0`
+/// (no chrome band: Linux, `ATERM_NO_FULLSIZE_CONTENT`, fullscreen) the fire
+/// reproduces the pad-relative behaviour translated by origin: the row-0 root is
+/// forced one cell down (`origin_y + ch`) and no patch pixel rises above the
+/// grid top (`y >= origin_y`).
 #[test]
 fn fire_identity_at_origin_without_head() {
     let g = Geom {
@@ -332,10 +321,9 @@ fn fire_identity_at_origin_without_head() {
 
 // ---- EMBERFORGE thermal laws (P1) -------------------------------------
 
-/// The bounded thermal-tier machine (COLD/WARM/HOT/SMOKING as tiers
-/// 0..=3): stoking climbs one tier at a time, quenching and cooling only
-/// descend. `Buggy=1` plants the audited defect shape — a quench that
-/// HEATS — which the invariant must catch (prove-and-catch non-vacuity).
+/// The bounded thermal-tier machine (COLD/WARM/HOT/SMOKING as tiers 0..=3):
+/// stoking climbs one tier at a time; quenching and cooling only descend.
+/// `Buggy=1` plants a quench that heats, which the invariant must catch.
 fn emberforge_thermal_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -358,11 +346,10 @@ fn emberforge_thermal_model_proves_and_catches_heating_quench() {
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 }
 
-/// Tier-1 conformance: drive the REAL fire integrators frame by frame
-/// (16 ms ticks — the animation cadence) through a stoke burst and a
-/// backspace quench run, project `disp_t` onto the model's tier, and check
-/// every observed tier transition against the derived machine. Includes
-/// the negative control: no single frame may ever climb two tiers.
+/// Tier-1 conformance: drive the real fire integrators at 16 ms ticks through a
+/// stoke burst and a backspace quench run, project `disp_t` onto the model's
+/// tier, and check every observed transition against the derived machine.
+/// Negative control: no frame climbs two tiers.
 #[test]
 fn emberforge_real_thermal_conforms_to_model() {
     let model = emberforge_thermal_model();
@@ -433,9 +420,9 @@ fn emberforge_real_thermal_conforms_to_model() {
     assert_eq!(glow.disp_t, 0.0, "display temperature snaps to exactly 0");
 }
 
-/// MOMENTUM IS EARNED: a short fast burst stays well under full blaze
-/// (today's 7-keys-to-inferno is the audited bug), a sustained run climbs
-/// high, and a lone keystroke leaves the engine essentially cold.
+/// Momentum is earned: a short fast burst stays well under full blaze, a
+/// sustained run climbs high, and a lone keystroke leaves the engine nearly
+/// cold.
 #[test]
 fn fire_momentum_is_earned_not_instant() {
     let g = geom();
@@ -472,9 +459,8 @@ fn fire_momentum_is_earned_not_instant() {
     );
 }
 
-/// HUMAN CADENCE KEEPS A LIVE EMBER FLOOR: relaxed 320 ms/key writing must
-/// hold a visible standing temperature (the coal bed) — the audit found
-/// today's fire perceptually absent at exactly this cadence.
+/// Human cadence keeps a live ember floor: relaxed 320 ms/key writing holds a
+/// visible standing temperature (the coal bed).
 #[test]
 fn fire_human_cadence_keeps_a_live_ember_floor() {
     let g = geom();
@@ -506,9 +492,9 @@ fn fire_human_cadence_keeps_a_live_ember_floor() {
     assert!(!out.is_empty());
 }
 
-/// BACKSPACE QUENCHES, NEVER STOKES: a delete run monotonically cools the
-/// display temperature, the quench meter escalates with consecutive
-/// deletes, and arrow-left navigation (no key-hint) earns no heat at all.
+/// Backspace quenches, never stokes: a delete run monotonically cools the
+/// display temperature, the quench meter escalates with consecutive deletes,
+/// and arrow-left navigation (no key hint) earns no heat.
 #[test]
 fn fire_backspace_quenches_and_navigation_never_heats() {
     let g = geom();
@@ -571,10 +557,9 @@ fn fire_backspace_quenches_and_navigation_never_heats() {
     assert!(nav.disp_t < 0.05, "backward navigation stays cold");
 }
 
-/// THE FORGE CURSOR: metal heats under sustained blaze, holds its heat
-/// longer than the flames (hysteresis), yields a black-body fill (red
-/// dominant), and cools back to the DULL REST EMBER + inactive (idle-zero law;
-/// the fire cursor is never the theme green — owner v0.31).
+/// The forge cursor: metal heats under sustained blaze, holds heat longer than
+/// the flames (hysteresis), yields a black-body fill (red dominant), and cools
+/// back to the dull rest ember and inactive (never the theme's cursor colour).
 #[test]
 fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
     let g = geom();
@@ -584,7 +569,7 @@ fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
     let mut glow = CursorGlow::default();
     let mut t = t0;
     glow.tick(Some((2, 0)), t, &c, g, &mut out);
-    // The fire cursor is a DULL EMBER at rest (never the theme green) —
+    // At rest the fire cursor is a dull ember, never the theme colour:
     // warm-ordered (R ≥ G ≥ B) and dim (low red).
     let cold_fill = glow.forge_fill().expect("fire cursor is always warm metal");
     let (cr, cg, cb) = (
@@ -618,9 +603,9 @@ fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
         r >= g_ && g_ >= b,
         "black-body fill: R ≥ G ≥ B ({fill:06x})"
     );
-    // After stopping, the metal first SOAKS residual heat (temp lags the
-    // display temperature), then cools — by 2.5 s cooling dominates, yet
-    // real heat remains (far slower than the flames' sub-second decay).
+    // After stopping the metal first soaks residual heat (temp lags the
+    // display temperature), then cools; at 2.5 s cooling dominates but real
+    // heat remains (slower than the flames' sub-second decay).
     glow.tick(
         Some((2, col)),
         t + Duration::from_millis(2500),
@@ -642,9 +627,9 @@ fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
         glow.is_active(),
         "a visibly hot cursor keeps the timer armed"
     );
-    // Long idle: the metal cools to exactly 0 and the fill returns to the
-    // dull rest ember (== the cold fill above); the timer disarms and the
-    // idle fingerprint returns to 0 (the constant rest ember is NOT folded).
+    // Long idle: the metal cools to exactly 0 and the fill returns to the dull
+    // rest ember (the cold fill above); the timer disarms and the idle
+    // fingerprint returns to 0 (the constant rest ember is not folded).
     let fp = glow.tick(Some((2, col)), t + Duration::from_secs(40), &c, g, &mut out);
     assert_eq!(glow.cursor_temp, 0.0, "metal cools to exactly 0");
     assert_eq!(
@@ -659,9 +644,9 @@ fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
     assert!(!glow.is_active(), "the animation timer disarms");
 }
 
-/// P4 DETERMINISM LAW: the flame field is a pure function of injected
-/// clocks — two engines driven with identical synthetic instants emit
-/// identical quads (same fp), frame after frame.
+/// Determinism: the flame field is a pure function of injected clocks; two
+/// engines driven with identical instants emit identical quads (same fp), frame
+/// after frame.
 #[test]
 fn fire_field_is_deterministic() {
     let g = geom();
@@ -719,9 +704,9 @@ fn fire_field_full_blaze_respects_quad_budget() {
     assert_invariants(&out, g);
 }
 
-/// The BUDGET LAW again, on a WINDOW-SPACE layout (a real head band +
-/// padding): full blaze + the monster jump still stays under MAX_QUADS
-/// with `origin > 0` and window extents wider than the grid.
+/// The budget law on a window-space layout (a real head band and padding): full
+/// blaze plus the monster jump stays under MAX_QUADS with `origin > 0` and
+/// window extents wider than the grid.
 #[test]
 fn fire_field_full_blaze_respects_quad_budget_with_head_band() {
     let g = Geom {
@@ -762,10 +747,9 @@ fn fire_field_full_blaze_respects_quad_budget_with_head_band() {
     }
 }
 
-/// P3 ROUND LIGHT: fire's embers, crown, and impact flash are RADIAL
-/// halos — round by construction — and the halo stream obeys the same
-/// invariants as the quads (per-row bands, grid-interior, radii ≥ 1,
-/// decays to empty, folded into the fingerprint).
+/// Round light: fire's embers, crown and impact flash are radial halos, and the
+/// halo stream obeys the quads' invariants (per-row bands, grid-interior, radii
+/// ≥ 1, decays to empty, folded into the fingerprint).
 #[test]
 fn fire_light_is_radial_halos_not_squares() {
     let g = geom();
@@ -871,9 +855,9 @@ fn frame_fingerprint_preserves_private_stream_identity_and_idle_zero() {
 
     assert_eq!(FrameFingerprint::default().finish(), 0, "empty is idle");
 
-    // This one-record stream is the exact FNV-1a preimage of zero after
-    // the CharFg tag and length. A live stream must still never borrow the
-    // scheduler's reserved `0 == idle` value.
+    // This one-record stream is the exact FNV-1a preimage of zero after the
+    // CharFg tag and length; a live stream must never produce the scheduler's
+    // reserved `0 == idle` value.
     let mut zero_preimage = FrameFingerprint::default();
     zero_preimage.chars(&[CharFg {
         row: 0xb73a,
@@ -974,9 +958,9 @@ fn frame_fingerprint_preserves_private_stream_identity_and_idle_zero() {
     assert_ne!(forge_a.finish(), forge_b.finish(), "forge fill");
 }
 
-/// P5 STEAM LAW: deleting douses with steam that ESCALATES over a run —
-/// more consecutive backspaces, more (and stronger) pale vapor — and the
-/// vapor decays to exactly empty.
+/// Steam law: deleting douses with steam that escalates over a run (more
+/// consecutive backspaces, more and stronger pale vapor), and the vapor decays
+/// to exactly empty.
 #[test]
 fn backspace_steam_escalates_and_decays() {
     let g = geom();
@@ -1022,9 +1006,9 @@ fn backspace_steam_escalates_and_decays() {
     let _ = fp;
 }
 
-/// P5 SMOKE LAW: a cursor forged hot SMOKES — wisps shed continuously
-/// while the metal is above the smoking point — and the smoke ceases
-/// (vapor drains, timer disarms) once it cools.
+/// Smoke law: a cursor forged hot sheds smoke wisps continuously while the metal
+/// is above the smoking point, and the smoke stops (vapor drains, timer
+/// disarms) once it cools.
 #[test]
 fn hot_cursor_smokes_and_cool_cursor_stops() {
     let g = geom();
@@ -1066,18 +1050,14 @@ fn hot_cursor_smokes_and_cool_cursor_stops() {
     assert!(!glow.is_active(), "idle returns to zero work");
 }
 
-/// P6 DARK-CORE LAW (campaign 2): at a towering blaze the flame BODY is
-/// emitted as per-pixel [`FirePatch`]es (drawn at the under-ink seam), the
-/// cells it saturates get charred ink darker than warm char (the
-/// silhouette source), and everything decays back to exactly empty.
+/// Dark-core law: at a towering blaze the flame body is emitted as per-pixel
+/// [`FirePatch`]es (drawn at the under-ink seam), and everything decays back to
+/// exactly empty.
 #[test]
 fn towering_blaze_chars_the_engulfed_rows_and_decays() {
-    // Renamed contract, kept name (git archaeology): a towering blaze must
-    // NOT recolor any ink at all — the owner vetoed charring twice on the
-    // live terminal (v0.41 near-black char read as invisible letters;
-    // v0.42's medium char read as "characters getting lagged"). Plain ink
-    // under the amber-capped flame is the law; the ceiling on ember-glow
-    // stacking (not ink tricks) carries legibility.
+    // The name is kept, but a towering blaze must not recolour any ink: plain
+    // ink under the amber-capped flame, with the ember-glow stacking ceiling
+    // carrying legibility.
     let g = geom();
     let c = cfg(GlowStyle::Fire, true);
     let t0 = Instant::now();
@@ -1111,8 +1091,8 @@ fn towering_blaze_chars_the_engulfed_rows_and_decays() {
         glow.halos().iter().all(|h| h.mode == HaloMode::Add),
         "no Over-mode veils ride the fire (the cool-pocket experiment is retired)"
     );
-    // What the engulfment DOES drive is the colour-free CONTRAST-HALO
-    // stream — legibility without touching a single ink byte.
+    // The engulfment drives the colour-free contrast-halo stream instead,
+    // without touching an ink byte.
     assert!(
         !glow.halo_cells().is_empty(),
         "a towering blaze emits contrast-halo strengths for its engulfed cells"
@@ -1124,15 +1104,11 @@ fn towering_blaze_chars_the_engulfed_rows_and_decays() {
     assert_eq!(fp, 0);
 }
 
-/// THE CONTRAST-HALO LAW (the owner's "I can't read the white text over
-/// the very bright flame"): a hot blaze emits colour-free halo STRENGTHS
-/// for the cells the flame engulfs — rising toward the head, where the
-/// fire is brightest — while the ink itself is NEVER recoloured (no
-/// charred entries; the no-recolor law). Row 0 included: the halo
-/// protects text everywhere the flame covers, so the v0.42
-/// cursor-row/freshness gates deliberately do NOT apply — the halo does
-/// not recolor, so there is nothing to read as lag. The stream honours the
-/// renderer's walk invariant: per-(row, col) sorted, unique cells.
+/// The contrast-halo law: a hot blaze emits colour-free halo strengths for the
+/// cells the flame engulfs, rising toward the head where the fire is brightest,
+/// while ink is never recoloured (no charred entries). Row 0 is included: the
+/// halo does not recolour, so no cursor-row or freshness gate applies. The
+/// stream is per-(row, col) sorted with unique cells, as the renderer walks it.
 #[test]
 fn hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors() {
     let g = geom();
@@ -1143,9 +1119,8 @@ fn hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors() {
     // the top row — no cursor-row gate — earns its halo cells.
     let mut t = Instant::now();
     glow.tick(Some((0, 0)), t, &c, g, &mut out);
-    // Key-repeat cadence, LONG sustain: the v0.45 feel dials slowed the
-    // attack (DISP_ATTACK_S 0.34 — the blaze is EARNED), so reaching a
-    // multi-cell engulfment takes a real run, exactly as on glass.
+    // Key-repeat cadence with a long sustain: the attack is slow
+    // (DISP_ATTACK_S 0.34), so a multi-cell engulfment takes a real run.
     for i in 1..=34u16 {
         t += Duration::from_millis(33);
         glow.note_synthetic_typed(t, 1);
@@ -1165,9 +1140,8 @@ fn hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors() {
             .all(|w| (w[0].row, w[0].col) < (w[1].row, w[1].col)),
         "halo cells are per-(row, col) sorted with unique cells: {cells:?}"
     );
-    // Strength RISES toward the head: the freshly-typed cells burn hotter
-    // (steep head→tail spark falloff), so on the typed row the head-most
-    // engulfed cell out-rims the tail-most one.
+    // Strength rises toward the head: fresh cells burn hotter (steep head→tail
+    // spark falloff), so the head-most engulfed cell out-rims the tail-most.
     let row0: Vec<_> = cells.iter().filter(|c| c.row == 0).collect();
     assert!(
         row0.len() >= 2,
@@ -1212,10 +1186,9 @@ fn light_theme_fire_is_ink_over_mode() {
     );
 }
 
-/// RE-JUDGE (fire head, dark AND light): the OCCUPIED-CELL discipline pins
-/// the empty-cursor-cell punch above the glyph-cell ceiling, so the freshest
-/// letters keep contrast THROUGH the flame while the light still visibly
-/// leaves the cursor.
+/// Fire head, dark and light: the occupied-cell discipline pins the empty cursor
+/// cell's punch above the glyph-cell ceiling, so the freshest letters keep
+/// contrast through the flame while the light still leaves the cursor.
 #[test]
 #[allow(
     clippy::assertions_on_constants,
@@ -1228,13 +1201,11 @@ fn fire_streak_caps_are_ordered_for_the_head_bridge() {
     );
 }
 
-/// RE-JUDGE (finding 1/4): FIRE embers obey the occupied-cell discipline at
-/// the head. The dense pile of freshly-born near-white ember halos that
-/// clusters over the freshest typed glyph cells was THE head white-out; an
-/// ember whose centre sits over a cell the row probe shows as a GLYPH dims
-/// hard so the letters read THROUGH the flame, while blank cells (the cursor
-/// cell, gaps, the risen airspace) keep full punch. Same injected clock ⇒ the
-/// TWO runs spawn identical embers, so the only delta is the glyph dimming.
+/// Fire embers obey the occupied-cell discipline at the head: an ember centred
+/// over a cell the row probe shows as a glyph dims hard so the letters read
+/// through the flame, while blank cells (the cursor cell, gaps, the airspace)
+/// keep full punch. Both runs spawn identical embers from the same clock, so the
+/// only delta is the glyph dimming.
 #[test]
 fn fire_embers_dim_over_probed_glyph_cells() {
     let g = geom();
@@ -1283,12 +1254,11 @@ fn fire_embers_dim_over_probed_glyph_cells() {
     );
 }
 
-/// RE-JUDGE (finding 4): FIRE drops its ADDITIVE "mouth of fire" crown on a
-/// LIGHT theme — the broad hot heart reached left over the just-typed row
-/// and, being additive, lifted the trailing glyphs toward the white ground.
-/// The tell is the crown-sized Add halo (rx spanning multiple cells, far
-/// wider than any ember): present on dark, gone on light, where the flame
-/// body + the streak's source-over veil rails carry the look.
+/// Fire drops its additive "mouth of fire" crown on a light theme, where it
+/// would lift trailing glyphs toward the white ground. The tell is the
+/// crown-sized Add halo (rx spanning several cells, wider than any ember):
+/// present on dark, gone on light, where the flame body and the streak's
+/// source-over veil carry the look.
 #[test]
 fn fire_light_drops_the_additive_crown() {
     let g = geom();
@@ -1320,9 +1290,8 @@ fn fire_light_drops_the_additive_crown() {
     );
 }
 
-/// The residual trail of TYPED text is snuffed by a line change: type hot
-/// on one row (long chained spark lives), press Enter, and within a beat
-/// the old row emits nothing — the fire follows the cursor to its line.
+/// A line change snuffs the typed trail: type hot on one row (long chained spark
+/// lives), press Enter, and within a beat the old row emits nothing.
 #[test]
 fn fire_row_change_snuffs_the_old_lines_trail() {
     let g = geom();
@@ -1353,9 +1322,9 @@ fn fire_row_change_snuffs_the_old_lines_trail() {
         glow.sparks.iter().all(|s| s.row == 3),
         "the old line's trail is snuffed after a line change"
     );
-    // The landing cell's own curtain may tower into the band above it —
-    // that's the fire's height, not a lingering trail — so only columns
-    // away from the landing neighbourhood must be dark on the old row.
+    // The landing cell's curtain may tower into the band above it (the fire's
+    // height, not a trail), so only columns away from the landing must be dark
+    // on the old row.
     assert!(
         out.iter().all(|q| q.row != 2 || (q.x as usize) < 8 * g.cw),
         "the old row is dark away from the landing after a line change"

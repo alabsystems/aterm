@@ -4,26 +4,22 @@
 //! The shared vocabulary: a package identity, a resolved graph, a target cell,
 //! and the per-package facts every verb reports on.
 //!
-//! Two rules are encoded in these types rather than in prose, because both were
-//! measured mistakes in the design phase:
+//! Two rules are encoded in these types:
 //!
-//!   1. A package is `(name, version)` and NEVER a bare name. `cargo pkgid -p
-//!      winnow` errors "specification `winnow` is ambiguous" the moment a second
-//!      major version enters the graph — and winnow did exactly that here, at
-//!      0.7.15 (forked in `vendor/` until 2026-08-27) beside an unpatched
-//!      registry 1.0.3 that is still in the Linux graph today.
-//!   2. Cost is a DOMINATOR, not a subtree. Measured: `softbuffer`'s subtree is
-//!      39–45 packages in isolation and 8 in the real Linux graph, because winit
-//!      already shares wayland-client and x11rb. [`crate::dominator`] is the only
-//!      sanctioned way to answer "what does this edge cost".
+//!   1. A package is `(name, version)`, never a bare name: `cargo pkgid -p
+//!      <name>` errors as ambiguous once a second major version is in the
+//!      graph.
+//!   2. Cost is a dominator, not a subtree, since subtrees double-bill shared
+//!      dependencies. [`crate::dominator`] is the only sanctioned way to answer
+//!      "what does this edge cost".
 
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A resolved package identity. Ordering is (name, version) so reports are
 /// stable and two versions of one crate sort adjacently.
 ///
-/// `Default` is derived only so [`Graph`] can derive it — an empty `PkgId` is
-/// never a legal package and must never be reported as one.
+/// `Default` is derived only so [`Graph`] can derive it; an empty `PkgId` is
+/// never a legal package.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PkgId {
     pub name: String,
@@ -52,10 +48,9 @@ impl std::fmt::Display for PkgId {
 
 /// One (triple, root package) measurement cell.
 ///
-/// RESOLVE cells are mandatory and offline — resolution needs no toolchain
-/// (measured: `cargo metadata --filter-platform x86_64-pc-windows-msvc` exits 0
-/// on a host with no Windows std installed). BUILD cells are best-effort: a
-/// missing std is an HONEST SKIP, counted and named, never a silent pass.
+/// Resolve cells are mandatory and offline (resolution needs no installed
+/// std). Build cells are best-effort: a missing std is a skip, counted and
+/// named, never a pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     /// Short handle used in reports and policy (`mac-arm`, `linux`, …).
@@ -107,14 +102,11 @@ pub struct PkgFacts {
     /// Physical lines across every `*.rs` under the package root
     /// (`loc_method = "rs-physical-all-files-v1"`).
     pub loc: u64,
-    /// `\bunsafe\b` TOKENS, not `unsafe {` blocks. The objc2 crates emit nearly
-    /// all their unsafe from `extern_methods!`/`extern_class!`, so a block count
-    /// reads 0 for an 83k-line crate.
+    /// `\bunsafe\b` tokens, not `unsafe {` blocks: macro-generated FFI emits
+    /// `unsafe` without blocks.
     pub unsafe_tokens: u64,
-    /// A build script is arbitrary code executed by the compiler, and
-    /// `targo trust` marks every one `-Ztrust-verify=off` unconditionally. It is
-    /// worth more to the opt-out than thousands of lines of leaf data code, so
-    /// it is a first-class budget row rather than a footnote.
+    /// A build script is code the compiler executes, and `targo trust` marks
+    /// every one `-Ztrust-verify=off`, so it is a first-class budget row.
     pub has_build_rs: bool,
     pub is_proc_macro: bool,
     pub license: String,
@@ -160,9 +152,8 @@ impl CellSurvey {
             .count()
     }
 
-    /// Names appearing at two or more versions in this cell — the dedup
-    /// opportunity, reported separately from removals because collapsing a
-    /// duplicate is NOT the same as deleting a dependency.
+    /// Names appearing at two or more versions in this cell: the dedup
+    /// opportunity, reported apart from removals.
     pub fn duplicate_names(&self) -> BTreeMap<String, Vec<String>> {
         let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for p in self.third_party() {

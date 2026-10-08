@@ -1,15 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE GOAL PAUSE THROUGH THE LANE'S OWN DRIVER (the owner's decision of
-//! 2026-09-28): the stand-in instance and kernel of the Codex lane's tests,
-//! with a goal on the tab's Codex ([`GoalWorld`]) — its footer moved by the
-//! `/goal pause` and `/goal resume` the lane types, the relaunched Codex
-//! opening on its `Resume paused goal?` box — and the tab's goal record
-//! (`goal_hold`) under the aterm state root. Every visit here is a fresh
-//! call over what the files hold, as a host that restarted between two of
-//! them would make it: what the lane owes is read from the record, never
-//! remembered.
+//! The goal pause through the lane's own driver: the Codex lane's stand-in
+//! instance and kernel with a goal on the tab's Codex ([`GoalWorld`]), its
+//! footer moved by the `/goal pause` and `/goal resume` the lane types and the
+//! relaunched Codex opening on its `Resume paused goal?` box, and the tab's
+//! goal record (`goal_hold`) under the aterm state root. Every visit is a
+//! fresh call over the files, as a restarted host would make it.
 
 use super::*;
 use crate::harness::goal_hold::{self, Hold, How, Owner, Stage};
@@ -116,18 +113,13 @@ fn keys_pressed(rig: &Rig) -> Vec<String> {
         .collect()
 }
 
-/// THE WHOLE MOVE, A GOAL PAUSED FOR IT: an embedded Codex whose goal's
-/// turn runs (its rollout's last turn event `task_started`), three hours
-/// behind — the Land rung. The first look PAUSES the goal (`/goal pause`,
-/// its record claimed first, the footer showing it paused); while the goal's
-/// last turn runs the look HOLDS (`wait:goal-held`, nothing typed); once it
-/// ends, the ordinary step asks for the stopping point (the notice) — no
-/// goal turn follows; at the READY answer the `/exit` and the relaunch, and
-/// the relaunched Codex, opening on its paused goal's box, has it answered
-/// with ONE guarded Enter on its focused `Resume goal` — the goal resumed,
-/// which is the carry-on: no continuation typed over it (`done:goal`).
-/// Each visit is a fresh call over the files: a host restarted between any
-/// two resumes from the record.
+/// The whole move, a goal paused for it: an embedded Codex whose goal's turn
+/// runs, three hours behind (the Land rung). The first look pauses the goal
+/// (record claimed first); while the last turn runs the look holds
+/// (`wait:goal-held`); once it ends the notice goes; at the READY the `/exit`
+/// and relaunch, and the relaunched Codex's paused-goal box is answered with
+/// one guarded Enter on `Resume goal` (`done:goal`, no continuation typed).
+/// A host restarted between any two visits resumes from the record.
 #[test]
 fn an_embedded_goal_is_paused_at_land_moved_and_resumed_once() {
     let (rig, goal) = goal_rig("goal-move", true);
@@ -199,11 +191,10 @@ fn an_embedded_goal_is_paused_at_land_moved_and_resumed_once() {
     }
 }
 
-/// A PERSON'S HAND IN BETWEEN: the goal aterm paused is resumed by the
-/// person before the move — the next look finds it pursued with no resume of
-/// aterm's, and RELEASES it (the goal is theirs: aterm never resumes it, and
-/// pauses it again only after the rest); the goal holds the tab again as a
-/// running turn does. NEGATIVE CONTROL: no `/goal resume` is ever typed.
+/// A person's hand in between: the goal aterm paused is resumed by the
+/// person before the move, and the next look finds it pursued and releases it
+/// (aterm never resumes it, and pauses it again only after the rest).
+/// Negative control: no `/goal resume` is ever typed.
 #[test]
 fn a_person_resuming_the_paused_goal_takes_it_from_aterm() {
     let (rig, goal) = goal_rig("goal-person", true);
@@ -226,13 +217,12 @@ fn a_person_resuming_the_paused_goal_takes_it_from_aterm() {
     assert!(keys_pressed(&rig).is_empty());
 }
 
-/// A HOST RESTARTED BETWEEN THE RESUME AND ITS SHOWING: the record says
-/// `Resuming` (written before the key). The Codex current in the tab (the
-/// move made): where its footer shows the goal pursued, the next look marks
-/// it resumed and types nothing; where it still shows it paused, it waits
-/// out the resume's take window, then types `/goal resume` ONCE more — never
-/// twice at one look. NEGATIVE CONTROL: a record with nothing owed
-/// (resumed) over a paused footer types nothing.
+/// A host restarted between the resume and its showing: the record says
+/// `Resuming`. Where the footer shows the goal pursued, the next look marks it
+/// resumed and types nothing; where it still shows paused, it waits out the
+/// take window, then types `/goal resume` once more, never twice at one look.
+/// Negative control: a record with nothing owed over a paused footer types
+/// nothing.
 #[test]
 fn a_resume_made_before_a_restart_is_never_made_twice() {
     let (mut rig, goal) = goal_rig("goal-restart", true);
@@ -290,11 +280,10 @@ fn a_resume_made_before_a_restart_is_never_made_twice() {
     assert_eq!(lines(&rig), ["/goal resume"]);
 }
 
-/// AN OPEN SAVE-THEN-WAIT SWITCH KEEPS THE PAUSE OFF: the tab's loop ledger
-/// holds an open wind-down — the session is the switch's — so the look at
-/// Land pauses nothing and waits on the goal as before. And a hold the
-/// SWITCH has on the goal record refuses the upgrade's claim. NEGATIVE
-/// CONTROL: the switch's wind-down closed (`phase=done`), the pause is made.
+/// An open save-then-wait switch keeps the pause off: with an open wind-down
+/// in the loop ledger the look at Land pauses nothing, and a switch's hold on
+/// the goal record refuses the upgrade's claim. Negative control: the
+/// wind-down closed (`phase=done`), the pause is made.
 #[test]
 fn an_open_save_then_wait_switch_keeps_the_pause_off() {
     let (rig, _goal) = goal_rig("goal-switch", true);
@@ -322,19 +311,13 @@ fn an_open_save_then_wait_switch_keeps_the_pause_off() {
     assert_eq!(lines(&rig), ["/goal pause"]);
 }
 
-/// THE ESC AT A TURN'S HEAD, the fallback for a typed pause that never shows
-/// (a build that would not take `/goal pause` mid-turn): past the take
-/// window, with the goal thread's rollout at a turn's HEAD — `task_started`,
-/// its context, the goal's message and the `world_state` 0.158.0 writes
-/// there (measured read-only in the owner's rollouts, 2026-09-28: between a
-/// turn's opening messages and its `turn_context`), nothing of its own work
-/// — and the screen as a head draws it, the turn's STATUS ROW up (`•
-/// Working (0s • esc to interrupt)`: the goal-pause review of 2026-09-28
-/// found the Esc weighed on a composer "free" of that row, which a head
-/// always shows, so it could never be pressed) — ONE Esc, fenced and
-/// guarded on the footer's goal row, the record naming it first; the goal
-/// shows paused. NEGATIVE CONTROL: the turn past its head (a tool call in
-/// its rollout) — no Esc, whatever the wait.
+/// The Esc at a turn's head, the fallback for a typed pause that never shows:
+/// past the take window, with the goal thread's rollout at a turn's head
+/// (`task_started`, its context, the goal's message and `world_state`, none of
+/// its own work) and the screen showing the turn's status row, one Esc,
+/// fenced and guarded on the footer's goal row, the record naming it first;
+/// the goal shows paused. Negative control: a turn past its head (a tool call
+/// in its rollout) gets no Esc.
 #[test]
 fn the_esc_is_pressed_only_at_a_goal_turns_head() {
     let (rig, goal) = goal_rig("goal-esc", false);
@@ -395,16 +378,11 @@ fn the_esc_is_pressed_only_at_a_goal_turns_head() {
     assert_eq!(goal.lock().expect("goal").seen, ["pause", "esc"]);
 }
 
-/// THE RELAUNCH'S BOX IS ANSWERED THOUGH ITS STARTUP FRAME COMES FIRST (the
-/// goal-pause review of 2026-09-28, measured live on 0.158.0: `codex resume
-/// <thread>` over a paused goal draws its startup composer, footerless,
-/// about 200 ms BEFORE the `Resume paused goal?` box): the whole move, the
-/// relaunched Codex showing that frame at its first reads. The upgrade waits
-/// for the box — or a footer that names the goal — never the composer
-/// alone, and answers the box itself with ONE guarded Enter: the goal
-/// resumed, the carry-on its own. Until that day the wait ended on the
-/// startup frame, decided a wait there (no footer), and no later look of the
-/// upgrade's ever pressed the box.
+/// The relaunch's box is answered though its startup frame comes first:
+/// `codex resume <thread>` over a paused goal draws a footerless startup
+/// composer about 200 ms before the `Resume paused goal?` box. The upgrade
+/// waits for the box (or a footer naming the goal), never the composer alone,
+/// and answers it with one guarded Enter.
 #[test]
 fn the_relaunchs_box_is_answered_though_its_startup_frame_comes_first() {
     let (rig, goal) = goal_rig("goal-startup", true);
@@ -436,15 +414,11 @@ fn the_relaunchs_box_is_answered_though_its_startup_frame_comes_first() {
     );
 }
 
-/// THE RELAUNCH'S BOX STILL STANDING AT A LATER LOOK is the upgrade's to
-/// answer too (the goal-pause review of 2026-09-28: past the relaunch's
-/// first moments no look of the upgrade's pressed it — `goal_look` read no
-/// footer under the box and waited — and the resume hung on the approval
-/// policy's full power alone). The move made (the Codex current in the tab
-/// is aterm's relaunch), the goal paused, its box up: ONE guarded Enter on
-/// its focused resume, the record `Resumed` (`moved`) and naming the
-/// relaunch. NEGATIVE CONTROL: the box left to a person (`BOX_THEIRS`) —
-/// nothing pressed, the resume waited on.
+/// The relaunch's box still standing at a later look is the upgrade's to
+/// answer too: the move made, the goal paused, its box up, one guarded Enter
+/// on its focused resume, the record `Resumed` (`moved`) naming the relaunch.
+/// Negative control: the box left to a person (`BOX_THEIRS`), nothing
+/// pressed.
 #[test]
 fn the_relaunchs_box_standing_at_a_later_look_is_answered() {
     for theirs in [false, true] {
@@ -496,14 +470,66 @@ fn the_relaunchs_box_standing_at_a_later_look_is_answered() {
     }
 }
 
-/// A GOAL IS NEVER RESUMED WITHOUT ITS MOVE INSIDE A SANDBOX (the goal-pause
-/// review of 2026-09-28; the owner: "not continue work in a sandbox"): the
-/// goal paused, its hold past its hour with no move, and its thread's last
-/// turn run in `workspace-write` while the Codex's launch bypassed the
-/// sandbox (Codex's own records, the switch's reader): nothing is typed —
-/// the goal stays paused (`wait:goal-sandboxed`), said ONCE with the fix (a
-/// relaunch with the launch's flags). NEGATIVE CONTROL: the thread outside
-/// the sandbox (`danger-full-access`) — resumed at its bound, as before.
+/// The lane's own `/goal resume` left unsent is a person's hold, never a silent
+/// stall: with the resume's Enter missed and the words in the composer, the
+/// next look says `wait:left-typed:unsent` (owning no turn end), pressing and
+/// typing nothing, the resume still owed; likewise for any other whole line
+/// the lane types (`/exit`, `/goal pause`). Negative control: the composer
+/// empty, the resume typed once (`goal-resumed:moved`).
+#[test]
+fn a_goal_resume_left_unsent_is_a_persons_hold_never_a_silent_stall() {
+    for (n, left) in [Some(GOAL_RESUME), Some(CODEX_EXIT), Some(GOAL_PAUSE), None]
+        .into_iter()
+        .enumerate()
+    {
+        let (mut rig, goal) = goal_rig(&format!("goal-resume-left-{n}"), true);
+        rig.tui.version = v("0.157.1");
+        rig.tui.pid = NEW;
+        save(
+            &rig.opts,
+            &key(TAB),
+            &St {
+                phase: Phase::Done,
+                relaunched_pid: NEW,
+                resumed_pid: NEW,
+                ..rig.state()
+            },
+        );
+        let now = now_s();
+        write_hold(
+            &rig,
+            &Hold {
+                stage: Stage::Paused,
+                took_at: now - 600,
+                ..Hold::pausing(Owner::Upgrade, How::Typed, TUI, "0.157.1", now - 900)
+            },
+        );
+        goal.lock().expect("goal").paused = true;
+        if let Some(line) = left {
+            *rig.left.lock().expect("left") = Some(line.to_string());
+        }
+        let r = rig.visit(None);
+        if left.is_some() {
+            assert_eq!(r.step, "wait:left-typed:unsent", "{r:?}");
+            assert!(
+                !crate::harness::upgrade_drive::owns_turn_ends(&r.step, 0, 120),
+                "a person's hold owns no turn end"
+            );
+            assert!(keys_pressed(&rig).is_empty(), "{:#?}", keys_pressed(&rig));
+            assert!(lines(&rig).is_empty(), "nothing typed: {:#?}", lines(&rig));
+            assert_eq!(hold(&rig).expect("kept").stage, Stage::Paused, "still owed");
+        } else {
+            assert_eq!(r.step, "goal-resumed:moved", "{r:?}");
+            assert_eq!(lines(&rig), vec!["/goal resume"]);
+        }
+    }
+}
+
+/// A goal is never resumed without its move inside a sandbox: paused past its
+/// hour with no move, its thread's last turn in `workspace-write` while the
+/// launch bypassed the sandbox, nothing is typed (`wait:goal-sandboxed`), said
+/// once with the fix. Negative control: the thread outside the sandbox is
+/// resumed at its bound.
 #[test]
 fn a_goal_is_never_resumed_without_its_move_inside_a_sandbox() {
     for (sandbox, withheld) in [("workspace-write", true), ("danger-full-access", false)] {

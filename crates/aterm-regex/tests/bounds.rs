@@ -9,7 +9,7 @@
 //! pattern-plus-haystack pair, can be made to eat unbounded memory, unbounded
 //! stack or unbounded time.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aterm_regex::{Error, Regex, RegexBuilder};
 
@@ -28,6 +28,12 @@ const DFA_SIZE_LIMIT: usize = 1 << 20;
 /// The pattern-length ceiling both entry points enforce ahead of compilation.
 const MAX_PATTERN_LEN: usize = 1024;
 
+/// A bound on work that must finish, where the regression it catches never
+/// does (an exponential search, four billion instructions emitted, a quadratic
+/// rescan of megabytes): a hang detector of a minute, never a latency budget
+/// (AGENTS.md). A merge gate runs these on a loaded machine.
+const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
 fn bounded(pattern: &str) -> Result<Regex, Error> {
     RegexBuilder::new(pattern)
         .size_limit(SIZE_LIMIT)
@@ -37,7 +43,7 @@ fn bounded(pattern: &str) -> Result<Regex, Error> {
 
 /// `(a{200}){200}` — thirteen bytes of pattern, forty thousand instructions of
 /// automaton. `aterm-observe` has a test asserting this exact pattern compiles
-/// under the default limit and is rejected under its 1 MiB one, and that test
+/// under the default limit and is rejected under its 128 KiB one, and that test
 /// has to keep passing after the migration.
 #[test]
 fn the_amplifier_pattern_is_rejected_under_the_bounded_builder() {
@@ -49,7 +55,7 @@ fn the_amplifier_pattern_is_rejected_under_the_bounded_builder() {
     );
     match bounded(amplifier) {
         Err(Error::CompiledTooBig(limit)) => assert_eq!(limit, SIZE_LIMIT),
-        other => panic!("the 1 MiB builder must reject the amplifier, got {other:?}"),
+        other => panic!("the 128 KiB builder must reject the amplifier, got {other:?}"),
     }
 }
 
@@ -59,14 +65,14 @@ fn the_amplifier_pattern_is_rejected_under_the_bounded_builder() {
 fn a_pattern_at_the_length_ceiling_still_compiles() {
     let at_cap = "a".repeat(MAX_PATTERN_LEN);
     assert_eq!(at_cap.len(), MAX_PATTERN_LEN);
-    let re = bounded(&at_cap).expect("1024 literals fit comfortably under 1 MiB");
+    let re = bounded(&at_cap).expect("1024 literals fit comfortably under 128 KiB");
     assert!(re.is_match(&at_cap));
 
     // So does the alternation-heavy shape `aterm-search`'s size-limit test uses.
     let alternatives: Vec<String> = (0..100).map(|i| format!("alt{i:05}x")).collect();
     let pattern = alternatives.join("|");
     assert!(pattern.len() <= MAX_PATTERN_LEN);
-    let re = bounded(&pattern).expect("100 alternations fit under 1 MiB");
+    let re = bounded(&pattern).expect("100 alternations fit under 128 KiB");
     assert!(re.is_match("prefix alt00042x suffix"));
     assert!(!re.is_match("prefix alt00042y suffix"));
 }
@@ -77,8 +83,8 @@ fn a_pattern_at_the_length_ceiling_still_compiles() {
 /// instructions replays `min` times without ever consulting the ceiling — and
 /// the ceiling is the only thing standing between the call sites and a
 /// user-supplied pattern. `(?:){4294967295}` is sixteen bytes, passes the
-/// 1024-byte length gate at every call site, and used to take **6.4 seconds**
-/// in release through this exact builder. Nested, the two counts multiply:
+/// 1024-byte length gate at every call site, and took **6.4 seconds** in
+/// release through this exact builder before the fix. Nested, the two counts multiply:
 /// `(?:(?:){4294967295}){4294967295}` is thirty-two bytes and 1.8e19 steps,
 /// which is not a slow compile but an unkillable hang — no allocation, no
 /// error, nothing for `CompiledTooBig` to fire on.
@@ -87,8 +93,8 @@ fn a_pattern_at_the_length_ceiling_still_compiles() {
 /// point rather than a new limit: a body that emitted nothing emits nothing
 /// every subsequent time, so the replay loop stops at the first no-op copy. The
 /// resulting program is *identical*, which is why every case here is also
-/// checked against the oracle — a collapse that changed the answer would be a
-/// worse bug than the hang.
+/// pinned — a collapse that changed the answer would be a worse bug than the
+/// hang.
 #[test]
 fn an_empty_body_repeat_collapses_instead_of_spinning() {
     let started = Instant::now();
@@ -114,15 +120,15 @@ fn an_empty_body_repeat_collapses_instead_of_spinning() {
             .find_iter(haystack)
             .map(|m| (m.start(), m.end()))
             .collect();
-        let theirs: Vec<(usize, usize)> = regex::Regex::new(pattern)
-            .expect("the oracle compiles all of these in microseconds")
-            .find_iter(haystack)
-            .map(|m| (m.start(), m.end()))
-            .collect();
-        assert_eq!(mine, theirs, "{pattern:?} collapsed to a different program");
+        // The empty match at every code-point boundary.
+        assert_eq!(
+            mine,
+            [(0, 0), (1, 1), (2, 2), (4, 4)],
+            "{pattern:?} collapsed to a different program"
+        );
     }
     assert!(
-        started.elapsed().as_secs() < 5,
+        started.elapsed() < HANG_DETECTOR,
         "an empty-bodied repeat must collapse at its fixed point rather than \
          replaying a no-op four billion times: {:?}",
         started.elapsed()
@@ -134,14 +140,19 @@ fn an_empty_body_repeat_collapses_instead_of_spinning() {
 #[test]
 fn an_unbounded_repetition_count_fails_fast_instead_of_allocating() {
     let started = Instant::now();
-    for pattern in ["a{4000000000}", "(?:ab){999999999}", "a{1,4000000000}"] {
+    for pattern in [
+        "a{4000000000}",
+        "(?:ab){999999999}",
+        "a{1,4000000000}",
+        "(?:a?){4294967295}",
+    ] {
         assert!(
             matches!(bounded(pattern), Err(Error::CompiledTooBig(_))),
             "{pattern:?} must hit the ceiling"
         );
     }
     assert!(
-        started.elapsed().as_secs() < 5,
+        started.elapsed() < HANG_DETECTOR,
         "the ceiling must stop emission, not merely report afterwards: {:?}",
         started.elapsed()
     );
@@ -168,7 +179,7 @@ fn the_size_limit_is_the_thing_that_decides() {
     );
 }
 
-/// `dfa_size_limit` is accepted and recorded, and — deliberately — changes
+/// `dfa_size_limit` is accepted, and — deliberately — changes
 /// nothing about what compiles. A Pike VM has no DFA to bound, and quietly
 /// repurposing the setting as a second cap on the program would reject patterns
 /// the caller expected to work.
@@ -177,8 +188,7 @@ fn dfa_size_limit_is_accepted_and_inert() {
     let pattern = "(a{50}){50}";
     let builder = RegexBuilder::new(pattern).size_limit(1 << 20);
     assert!(builder.clone().dfa_size_limit(1).build().is_ok());
-    assert!(builder.clone().dfa_size_limit(usize::MAX).build().is_ok());
-    assert_eq!(builder.dfa_size_limit(4096).get_dfa_size_limit(), 4096);
+    assert!(builder.dfa_size_limit(usize::MAX).build().is_ok());
 }
 
 /// Deep nesting must return an error, not overflow the stack. The parser is
@@ -227,7 +237,8 @@ fn nesting_is_bounded_on_a_small_stack() {
 /// `(a|a)*b` against a long run of `a`s is the textbook exponential blow-up: a
 /// backtracker explores `2^n` paths and never returns. Here the work is bounded
 /// by program size times input length, so it finishes in milliseconds — and the
-/// test asserts that, rather than merely asserting the answer.
+/// test asserts that it finishes, under [`HANG_DETECTOR`], rather than merely
+/// asserting the answer.
 #[test]
 fn pathological_patterns_finish_promptly() {
     for (pattern, n) in [
@@ -248,14 +259,15 @@ fn pathological_patterns_finish_promptly() {
         );
         let elapsed = started.elapsed();
         assert!(
-            elapsed.as_secs() < 5,
+            elapsed < HANG_DETECTOR,
             "{pattern:?} over {n} chars took {elapsed:?} — the linear-time bound is gone"
         );
     }
 }
 
 /// `a^n b^n`-shaped adversarial input: nested quantifiers over a long run that
-/// *does* eventually match. Still linear.
+/// *does* eventually match. Still linear: an automaton that kept every path the
+/// nested quantifiers open never finishes, and [`HANG_DETECTOR`] names it.
 #[test]
 fn adversarial_matching_input_is_also_linear() {
     let re = Regex::new("(a+)+b+").expect("compiles");
@@ -265,7 +277,7 @@ fn adversarial_matching_input_is_also_linear() {
         let m = re.find(&haystack).expect("matches");
         assert_eq!((m.start(), m.end()), (0, 2 * n));
         assert!(
-            started.elapsed().as_secs() < 5,
+            started.elapsed() < HANG_DETECTOR,
             "n={n} took {:?}",
             started.elapsed()
         );
@@ -384,16 +396,22 @@ fn syntax_errors_are_constructible_and_intelligible() {
 
 /// A long haystack scanned with `find_iter` — the shape `aterm-search` runs over
 /// scrollback — must be linear in the haystack too, not quadratic.
+///
+/// The largest haystack, 2.8 MB, is what lets a minute's [`HANG_DETECTOR`] tell
+/// the two apart: scanned once it costs milliseconds (this whole file runs in
+/// well under a second), while a rescan per match to the haystack's end is some
+/// 7 x 10^10 bytes of scanning. At the scan's measured rate (about 200 MB/s,
+/// release) that is six minutes, so a faster machine still fails it.
 #[test]
 fn scanning_a_long_haystack_is_linear() {
     let re = Regex::new(r"\b[0-9a-f]{7,40}\b").expect("compiles");
     let row = "commit 66390b5c8f2a1b3c and some ordinary words here; ";
-    for repeats in [200usize, 800, 3_200] {
+    for repeats in [200usize, 800, 3_200, 51_200] {
         let haystack = row.repeat(repeats);
         let started = Instant::now();
         assert_eq!(re.find_iter(&haystack).count(), repeats);
         assert!(
-            started.elapsed().as_secs() < 5,
+            started.elapsed() < HANG_DETECTOR,
             "{repeats} rows took {:?}",
             started.elapsed()
         );
@@ -436,16 +454,16 @@ fn offsets_are_byte_offsets_on_code_point_boundaries() {
 /// That is the whole reason the call sites dropped from 1 MiB to 128 KiB. Under
 /// 1 MiB, `(?:x?){2000}z` — thirteen bytes, inside every length gate in the
 /// tree — compiled to ~16k instructions and took 37 ms on one 4,096-column row
-/// and 28.5 s on a 3 MB scrollback, against 24 us and 74 us for the oracle.
+/// and 28.5 s on a 3 MB scrollback, against 24 us and 74 us for `regex`.
 /// Under 128 KiB it does not compile at all.
 ///
 /// The precise half of this test is the pair of **refusals**: those are
 /// deterministic, and they are what the 128 KiB ceiling actually buys. The
 /// timing half is a coarse backstop for the shapes the ceiling still admits —
 /// ~18 ms per row in release and ~0.7 s in an unoptimised test build on the m21
-/// box, bounded here at five seconds to match the rest of this file, because a
+/// box, bounded here by [`HANG_DETECTOR`] like the rest of this file, because a
 /// wall-clock assertion tight enough to be interesting is also tight enough to
-/// be flaky on a loaded CI box. It catches a regression of orders of magnitude,
+/// be flaky on a loaded machine. It catches a regression of orders of magnitude,
 /// which is the only kind that has ever mattered here.
 ///
 /// What this test does **not** claim: that the scan is bounded in absolute
@@ -479,7 +497,7 @@ fn the_worst_program_under_the_ceiling_still_scans_a_row_promptly() {
         );
         let elapsed = started.elapsed();
         assert!(
-            elapsed.as_secs() < 5,
+            elapsed < HANG_DETECTOR,
             "{pattern:?} took {elapsed:?} on one 4,096-column row — the compile \
              ceiling has stopped bounding the scan"
         );

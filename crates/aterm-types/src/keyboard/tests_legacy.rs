@@ -35,8 +35,7 @@ fn legacy_character_encodings() {
     ]);
 }
 
-/// Regression (owner, 2026-07-28: "does control-_ work as undo like in emacs
-/// now? it doesn't seem to work"): Ctrl-`_` must emit US (0x1F), the byte
+/// Regression: Ctrl-`_` must emit US (0x1F), the byte
 /// readline and emacs bind to `undo`.
 ///
 /// `Key::Character` carries the UNSHIFTED base, so the chord arrives as

@@ -3,20 +3,11 @@
 
 //! Built-in policy profiles.
 //!
-//! Each profile is a complete [`Policy`](crate::Policy) document that ships
-//! inside the crate. Hosts load one at startup.
-//!
-//! The three profiles form a refinement chain `Hardened ⊆ Standard ⊆
-//! Permissive`. The test-only `refinement::response_rank` helper in this module
-//! provides the numeric ordering the refinement tests assert the chain with —
-//! the rank is *not* authoritative policy semantics.
-//!
-//! ## Builder helpers
-//!
-//! The three public constructors are `permissive`, `standard`, `hardened`.
-//! Each is `pub fn -> Policy` and is the only supported way to obtain a
-//! profile in Phase 0. Tests and external callers should clone the returned
-//! value rather than mutating it in place.
+//! Each of [`permissive`], [`standard`] and [`hardened`] returns a complete,
+//! freshly built [`Policy`]. Together they form the refinement
+//! chain `Hardened ⊆ Standard ⊆ Permissive`; the test-only
+//! `refinement::response_rank` orders responses for the tests that check it
+//! and is not policy semantics.
 
 use crate::{Defaults, OriginTag, Policy, Profile, RateLimit, Response, Rule, SCHEMA_VERSION};
 
@@ -59,13 +50,10 @@ fn notifications_limit() -> RateLimit {
 }
 
 fn palette_limit() -> RateLimit {
-    // Mirrors the pre-#7995 hardcoded `MAX_RESPONSES_PER_SEQUENCE = 16` from
-    // `handler_osc_color.rs` (#7883). Tokens represent response *pairs*
-    // emitted by an OSC 4 / OSC 21 query (not bytes). `per_sequence_max = 16`
-    // is the single-sequence cap that prevents a 256-index query from
-    // amplifying into ~5 KiB of PTY back-pressure; `capacity_bytes = 64` /
-    // `refill_per_second = 16` keep a modest cross-sequence throttle so a
-    // loop of well-formed 16-pair queries cannot saturate the PTY either.
+    // Tokens are response *pairs* emitted by an OSC 4 / OSC 21 query, not
+    // bytes. `per_sequence_max = 16` stops a 256-index query amplifying into
+    // ~5 KiB of PTY back-pressure; `capacity_bytes = 64` /
+    // `refill_per_second = 16` throttle a loop of 16-pair queries.
     RateLimit {
         id: "palette".to_owned(),
         capacity_bytes: 64,
@@ -75,23 +63,13 @@ fn palette_limit() -> RateLimit {
 }
 
 fn response_limit() -> RateLimit {
-    // Mirrors the `ResponseRateLimiter` defaults: 100 KiB/s refill, and a burst
-    // sized on the WIRE form of the largest legitimate response. Tokens are
-    // *bytes* written via `send_response`.
-    //
-    // The old comment here read "a single legitimate response never exceeds
-    // `capacity_bytes` by construction because `MAX_OSC52_QUERY_RESPONSE_BYTES
-    // = 64 KiB` in the handler", and it was false in a way that cost real
-    // answers: that cap is on the DECODED clipboard, and the response is
-    // base64, which expands 3 bytes to 4. So a clipboard of 49,145..65,536
-    // bytes passed the handler's cap, produced a >64 KiB wire response, and was
-    // dropped here without a byte being sent — `try_consume` refuses anything
-    // larger than capacity outright, however full the bucket is. The capacity
-    // now holds base64(64 KiB) plus framing.
-    //
-    // `aterm-core`'s `osc52_query_answers_every_clipboard_it_admits` pins the
-    // relationship from the other side of this crate boundary, so the two
-    // numbers cannot drift apart again in silence.
+    // Tokens are *bytes* written via `send_response`; 100 KiB/s refill. The
+    // burst must hold the WIRE form of the largest legitimate response:
+    // `MAX_OSC52_QUERY_RESPONSE_BYTES` (64 KiB) caps the DECODED clipboard, and
+    // its base64 answer is 4/3 that plus framing. `try_consume` refuses any
+    // amount above capacity outright, so a smaller burst silently drops large
+    // clipboard answers. `aterm-core`'s
+    // `osc52_query_answers_every_clipboard_it_admits` pins this from its side.
     RateLimit {
         id: "response".to_owned(),
         capacity_bytes: 96 * 1024,
@@ -139,7 +117,11 @@ pub fn permissive() -> Policy {
 
 /// Default for interactive sessions (§7.2).
 ///
-/// - Clipboard set: `Ask` (host prompt).
+/// - Clipboard set: `Ask` for `User`-or-higher origins only. Program output
+///   arrives at `Pty`, matches no rule, and so defers to the host's own
+///   clipboard-write authorization: aterm's GUI grants it to every tab, so an
+///   OSC 52 write from a program reaches the system clipboard unprompted
+///   (kitty / WezTerm parity). No host prompt exists for it.
 /// - Clipboard query: `Drop`.
 /// - Notifications: `Warn` + rate limited.
 /// - Palette reconfigure: `Execute` from `Ai` or higher; `Drop` from `Pty`.
@@ -232,10 +214,7 @@ pub fn standard() -> Policy {
 
 /// Maximum restriction (§7.3). Everything that could reach host state from
 /// `Pty` is dropped; clipboard, modal protocols, and notifications are all
-/// denied. Only essential responses (DA1, CPR) pass.
-///
-/// The Hardened profile is the **fail-closed fallback** loaded when a TOML
-/// policy fails to parse (§4.4); tests in this crate exercise that path.
+/// denied.
 #[must_use]
 pub fn hardened() -> Policy {
     Policy {
@@ -273,10 +252,7 @@ pub fn hardened() -> Policy {
             // Modal protocols: Host only.
             rule("DCS 2000p", OriginTag::Host, Response::Execute, None, None),
             rule("DCS 1000p", OriginTag::Host, Response::Execute, None, None),
-            // Essential responses only (DA1/CPR); everything else drops via
-            // `defaults.unmatched`. The `response any` rule below still fires
-            // but with a Host-only origin gate, so Pty-origin response writes
-            // fall through to the unmatched-drop default.
+            // Host only; every other origin falls through to the Drop default.
             rule(
                 "response any",
                 OriginTag::Host,

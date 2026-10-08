@@ -19,10 +19,8 @@ fn main() -> ExitCode {
         }
     };
 
-    // ABSOLUTE, ALWAYS. A relative `--root` is used twice downstream — as the
-    // child `current_dir` AND inside `--manifest-path <root>/Cargo.toml` — and
-    // the two compose into a path one level too high. Resolving it here means
-    // every verb reports the same root and no verb needs its own workaround.
+    // Absolute always: a relative root would be applied twice downstream (as
+    // `current_dir` and inside `--manifest-path`).
     let root = match inv.root.clone().map_or_else(discover_root, canonical_root) {
         Ok(r) => r,
         Err(msg) => {
@@ -46,18 +44,6 @@ fn main() -> ExitCode {
         } => aterm_forge::budget::run(&root, update, allow_regress.as_deref()),
         cli::Cmd::Attest => aterm_forge::attest::run(&root),
         cli::Cmd::Check { cells } => aterm_forge::check::run(&root, &cells),
-        cli::Cmd::MirrorEmit { out } => aterm_forge::mirror::run_emit(&root, &out),
-        cli::Cmd::MirrorVerify { dir } => aterm_forge::mirror::run_verify(&root, &dir),
-        cli::Cmd::MirrorBundle { dir, out } => {
-            aterm_forge::mirror_bundle::run_bundle(&root, &dir, &out)
-        }
-        cli::Cmd::MirrorUnbundle { file, out, force } => {
-            aterm_forge::mirror_bundle::run_unbundle(&root, &file, &out, force)
-        }
-        cli::Cmd::MirrorCheckBundle { file } => {
-            aterm_forge::mirror_bundle::run_check_bundle(&root, &file)
-        }
-        cli::Cmd::MirrorConfig { write } => aterm_forge::mirror_config::run_config(&root, write),
     };
 
     match out {
@@ -87,11 +73,9 @@ fn canonical_root(given: PathBuf) -> Result<PathBuf, String> {
     Ok(aterm_forge::resolve::strip_verbatim_prefix(abs))
 }
 
-/// Walk up from CWD to the directory holding the workspace `Cargo.toml`.
-/// Identified by `[workspace]`, so a vendored crate's own manifest (which
-/// carries an empty `[workspace]` stub) never wins over the real root: the
-/// stub-bearing manifests all sit UNDER the root, so the first match walking
-/// up from a vendor directory would be wrong. Require the members glob too.
+/// Walk up from CWD to the directory holding the workspace `Cargo.toml`,
+/// identified by `[workspace]` plus the members glob, since vendored crates
+/// carry an empty `[workspace]` stub below the root.
 fn discover_root() -> Result<PathBuf, String> {
     let mut dir: &Path =
         &std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;

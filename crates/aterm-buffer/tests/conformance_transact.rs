@@ -1,33 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Conformance: the real `transact()` obeys the DERIVED no-lost-update discipline.
+//! Conformance: the real `transact()` obeys the derived no-lost-update discipline.
 //!
-//! `aterm_spec::derive::transact_model()` is the drift-free model of optimistic
-//! concurrency: a transaction commits its edits atomically ONLY if no concurrent
-//! write intervened since it read the head (`seq == tbase`); otherwise it aborts,
-//! never clobbering the concurrent write (a lost update). The model encodes this
-//! as `CommitClean` (guard `seq = tbase`) vs `Abort` (guard `seq > tbase`), and
-//! `ty` proves `NoLostUpdate` (Buggy=1 → counterexample) in
-//! `aterm-spec/tests/derived_ring_ty.rs`.
-//!
-//! This binds that model to the code that runs — `Surface::transact`, which
-//! returns `Conflict` when `self.seq() != base` and otherwise applies all edits.
-//! Each real outcome is checked against the model's OWN guard
-//! (`Model::action_enabled`), and the conflict case asserts the no-lost-update
-//! safety directly: a conflicted transaction applies nothing. Pure Rust + real
-//! code, so it always runs.
+//! `aterm_spec::derive::transact_model()`: a transaction commits only if no
+//! write intervened since it read the head (`CommitClean`, `seq = tbase`);
+//! otherwise it aborts (`Abort`, `seq > tbase`) without clobbering the concurrent
+//! write. Each real `Surface::transact` outcome is checked against the model's
+//! own guard (`Model::action_enabled`), and a conflicted transaction must apply
+//! nothing. Pure Rust, so it always runs.
 
+use crate::support::write_cap;
 use aterm_buffer::{Edit, Surface, TxnOutcome};
-mod support;
 use aterm_spec::derive::transact_model;
 use std::collections::BTreeMap;
-use support::write_cap;
 
-/// Project the optimistic-CC state the model reasons about, for a txn attempting
-/// to commit (`active = 1`) against base version `tbase`, with no loss yet.
-/// (Heads are kept small so the model's exhaustive-bound guard `seq <= MaxSeq - K`
-/// does not interfere — the discipline under test is `seq == tbase`.)
+/// Project the state of a transaction attempting to commit (`active = 1`)
+/// against `tbase`, with no loss yet. Heads stay small so the model's
+/// `seq <= MaxSeq - K` bound does not interfere.
 fn attempting(seq: u64, tbase: u64) -> BTreeMap<&'static str, i64> {
     [
         ("seq", seq as i64),
@@ -86,8 +76,7 @@ fn real_transact_conflict_aborts_no_lost_update() {
         matches!(outcome, TxnOutcome::Conflict),
         "real transact must CONFLICT under a concurrent write, not commit against a stale base"
     );
-    // The no-lost-update safety, observed directly: a conflicted transaction
-    // applied NOTHING, so the concurrent write is not clobbered.
+    // A conflicted transaction applied nothing, so the concurrent write survives.
     assert_eq!(
         s.seq().0,
         head_before,

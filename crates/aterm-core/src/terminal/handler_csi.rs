@@ -2,16 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! CSI dispatch helpers for terminal escape sequence handling.
-//!
-//! This module routes all CSI sequences through a z4-verified minimal
-//! perfect hash table (`csi_dispatch_table`). The table maps
-//! `(intermediate_encoding, final_byte)` pairs to `CsiHandler` variants
-//! using a collision-free hash function verified by the z4 SMT solver.
-//!
-//! Both standard CSI sequences (no intermediates) and extended sequences
-//! (DEC private, xterm, kitty, etc.) are dispatched through the same
-//! table for uniform O(1) routing.
+//! CSI dispatch helpers. Every CSI sequence, with or without intermediates,
+//! is routed through the minimal perfect hash table in `csi_dispatch_table`,
+//! which maps `(intermediate_encoding, final_byte)` to a `CsiHandler` variant
+//! with a collision-free hash (checked by the z4 SMT solver).
 
 use super::super::csi_dispatch_table::{CsiHandler, lookup_csi_handler};
 use super::super::sgr_color_u8;
@@ -61,22 +55,13 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Dispatch the CSI sequences the z4 dispatch table does not carry.
+    /// Dispatch the CSI sequences the dispatch table does not carry.
     ///
-    /// `csi_dispatch_table.rs` is EDITED BY HAND. This comment claimed a live
-    /// `tools/csi-hash-gen` generator until 2026-08-31, when
-    /// `git log --all -- tools/csi-hash-gen` was measured empty — no such
-    /// generator is or ever was in this repository, whatever produced the table
-    /// originally. Its hash parameters are frozen at a solution proven
-    /// collision-free by that file's own `test_no_collisions`, so a sequence
-    /// recognized after that solution was fixed lands here instead of forcing a
-    /// re-solve — which is why having no generator costs nothing.
-    ///
-    /// This is the ONE fallback both dispatch paths share, so a sequence added
-    /// for the intermediate form cannot go missing from the no-intermediate
-    /// form (or the reverse).
-    ///
-    /// Only reached when the table misses, so it costs the hot path nothing.
+    /// `csi_dispatch_table.rs` is maintained by hand; its hash parameters are
+    /// fixed at a solution `test_no_collisions` checks, so sequences recognized
+    /// later land here instead of forcing a re-solve. Both dispatch paths share
+    /// this fallback, so a sequence cannot be missing from one form only. Only
+    /// reached on a table miss.
     ///
     /// Returns `true` if the sequence was consumed.
     fn csi_dispatch_untabled(
@@ -108,21 +93,17 @@ impl TerminalHandler<'_> {
                 self.cursor_state().handle_sr(params);
                 true
             }
-            // DECRARA — Reverse Attributes in Rectangular Area
-            // (CSI Pt ; Pl ; Pb ; Pr ; Pm $ t), VT400 and up. The reverse half
-            // of the pair whose set half is `$ r` (DECCARA); every other member
-            // of the rectangular-editing family DA1 advertises as code 28
+            // DECRARA, Reverse Attributes in Rectangular Area
+            // (CSI Pt ; Pl ; Pb ; Pr ; Pm $ t), VT400 and up: the reverse half of
+            // DECCARA (`$ r`). The rest of the DA1 code-28 rectangular family
             // (`$ v`, `$ x`, `$ z`, `$ {`) is in the table.
             (b"$", b't') => {
                 self.handle_decrara(params);
                 true
             }
-            // XTPUSHSGR / XTPOPSGR spelled `# p` / `# q`. xterm ctlseqs documents
-            // both as aliases of `CSI # {` / `CSI # }` — the same operation under
-            // finals an emitter that cannot express braces can produce ("used to
-            // work around language limitations of C#"). The brace spellings are
-            // in the table; a program that picked the alias must not silently get
-            // an unbalanced attribute stack.
+            // XTPUSHSGR / XTPOPSGR spelled `# p` / `# q`: xterm documents them as
+            // aliases of `CSI # {` / `CSI # }` for emitters that cannot produce
+            // braces. The brace spellings are in the table.
             (b"#", b'p') => {
                 self.handle_xtpushsgr(params);
                 true
@@ -131,13 +112,9 @@ impl TerminalHandler<'_> {
                 self.handle_xtpopsgr();
                 true
             }
-            // SD — Scroll Down, ECMA-48 spelling (CSI Ps ^). xterm ctlseqs:
-            // "Scroll down Ps lines (default = 1) (SD), ECMA-48. This was a
-            // publication error in the original ECMA-48 5th edition (1991)
-            // corrected in 2003." The VT420 `CSI Ps T` spelling is the one in
-            // the table, and both name the same operation, so they route to the
-            // same handler rather than to two implementations that could differ
-            // on margins, BCE or the default count.
+            // SD, Scroll Down, in the ECMA-48 spelling (CSI Ps ^; xterm notes the
+            // original 5th edition's publication error, corrected in 2003). Routed
+            // to the same handler as the table's `CSI Ps T`.
             (b"", b'^') => {
                 self.cursor_state().handle_scroll(params, b'T');
                 true
@@ -146,11 +123,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Unified dispatch for all 73 CSI handler variants via z4-verified table.
-    ///
-    /// Each `CsiHandler` variant maps to exactly one handler method call.
-    /// The handler methods themselves are unchanged — only the routing is
-    /// table-driven instead of match-chain-driven.
+    /// Dispatch all 73 CSI handler variants from the table, one handler method
+    /// call per `CsiHandler` variant.
     #[allow(clippy::too_many_lines, reason = "dispatch table with 73 handler arms")]
     fn dispatch_csi_handler(
         &mut self,
@@ -220,10 +194,9 @@ impl TerminalHandler<'_> {
 
             // --- Erase ---
             CsiHandler::EraseDisplay | CsiHandler::EraseLine => {
-                // A FULL clear (ED 2, or ED 0 from home) is the app repainting
-                // from scratch — counted for the resize journal's readers (ED 3
-                // erases only the history behind the screen). The cursor is
-                // read where the ED was issued; an ED moves none.
+                // A full clear (ED 2, or ED 0 from home) is the app repainting from
+                // scratch; counted for the resize journal (ED 3 erases only
+                // history). The cursor is read where the ED was issued.
                 let full_clear = final_byte == b'J' && {
                     let cursor = self.grid.cursor();
                     super::super::resize_journal::is_full_clear(
@@ -235,12 +208,12 @@ impl TerminalHandler<'_> {
                 self.cursor_state().handle_erase(params, final_byte);
                 if full_clear {
                     self.transient.full_clears = self.transient.full_clears.wrapping_add(1);
+                    self.transient.render_debt = (0, 0);
                 }
                 if final_byte == b'J' {
                     let mode = params.first().copied().unwrap_or(0);
-                    // ED 3 (CSI 3 J) erases scrollback — clear shell integration
-                    // marks and annotations that contain absolute row numbers,
-                    // which become dangling references after erase (#7667).
+                    // ED 3 erases scrollback: clear shell integration marks and
+                    // annotations holding absolute row numbers.
                     if mode == 3 {
                         self.shell.command_marks.clear();
                         self.shell.output_blocks.clear();
@@ -271,37 +244,29 @@ impl TerminalHandler<'_> {
             }
 
             CsiHandler::EraseChars => {
-                // ECH - Erase Character
-                // CSI Ps X - Erase Ps characters starting at cursor, without shifting
-                // Set BCE template so erased cells inherit SGR background (#7522).
+                // ECH, Erase Character (CSI Ps X): erase Ps characters from the
+                // cursor without shifting; erased cells take the SGR background.
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
                 );
-                // ECH is a non-selective erase: it does NOT check DECSCA character
-                // protection. Per VT420/VT510, only DECSED (CSI ? J) and DECSEL
-                // (CSI ? K) are selective operations that skip protected cells.
-                // Reverts incorrect selective dispatch from #7523.
+                // ECH is non-selective: it ignores DECSCA protection. Only DECSED
+                // (CSI ? J) and DECSEL (CSI ? K) skip protected cells (VT420/VT510).
                 let n = params.first().copied().unwrap_or(1).max(1);
                 self.grid.erase_chars(n);
             }
 
             CsiHandler::RepeatChar => {
-                // REP - Repeat Preceding Graphic Character
-                // CSI Ps b - Repeat the preceding graphic character Ps times
-                // The stored char is RAW: per xterm CASE_REP it is re-translated
-                // through the GL charset current at repeat time
-                // (dotext(xw, screen->gsets[curgl], lastchar)), so the repeats
-                // go through write_char's normal translation path.
-                // Clear ZWJ state: REP repeats the last *graphic* char as a new
-                // cell; it must not combine with a preceding ZWJ (#7548).
+                // REP, Repeat Preceding Graphic Character (CSI Ps b). The stored
+                // char is raw and re-translated through the current GL charset,
+                // as xterm does, via write_char's normal path. Clear ZWJ state: a
+                // repeat is a new cell and must not join a preceding ZWJ.
                 self.transient.last_combining_was_zwj = false;
                 let count = params.first().copied().unwrap_or(1).max(1);
                 if let Some(c) = self.transient.last_graphic_char {
-                    // FAST PATH: For printable ASCII with simple style (no RGB,
-                    // hyperlinks, extras) and a passthrough GL charset (the
-                    // bytes ARE the glyphs), use bulk cell fill instead of
-                    // per-char.
+                    // Fast path: printable ASCII with simple style (no RGB,
+                    // hyperlinks, extras) and a passthrough GL charset uses a bulk
+                    // cell fill.
                     let cp = c as u32;
                     let is_ascii = (0x20..0x7F).contains(&cp);
                     let has_extras =
@@ -322,10 +287,9 @@ impl TerminalHandler<'_> {
                         // is_ascii guard above ensures cp is in 0x20..0x7F
                         #[allow(clippy::cast_possible_truncation)]
                         let ascii_byte = cp as u8;
-                        // SELECTION CUSTODY — REP's bulk arm is the one printing path
-                        // that reaches the grid without going through `write_char`,
-                        // so it needs its own output-damage bracket; the else-arm
-                        // below is covered by `write_char`'s.
+                        // REP's bulk arm reaches the grid without `write_char`, so it
+                        // needs its own output-damage bracket; the else-arm uses
+                        // `write_char`'s.
                         let origin = self.grid.output_damage_origin();
                         self.grid.write_cell_run(
                             ascii_byte,
@@ -337,7 +301,7 @@ impl TerminalHandler<'_> {
                         self.grid.damage_selection_output(origin);
                     } else {
                         for _ in 0..count {
-                            // Re-translate through the CURRENT GL charset
+                            // Re-translate through the current GL charset
                             // (xterm CASE_REP semantics).
                             self.write_char(c);
                         }
@@ -346,14 +310,9 @@ impl TerminalHandler<'_> {
             }
 
             CsiHandler::BackwardTab => {
-                // CBT - Cursor Backward Tabulation
-                // CSI Ps Z - Move cursor backward Ps tab stops (default 1)
-                //
-                // The left margin binds a back tab only under ORIGIN MODE — the
-                // composition of VT510's CBT page ("the active position stays at
-                // column one") with its DECOM page ("the cursor cannot move
-                // outside of the margins"), and the gate xterm and Ghostty both
-                // implement. See `Grid::back_tab_margin`.
+                // CBT, Cursor Backward Tabulation (CSI Ps Z). The left margin
+                // binds a back tab only under origin mode (VT510's CBT and DECOM
+                // pages; xterm and Ghostty agree). See `Grid::back_tab_margin`.
                 let n = params.first().copied().unwrap_or(1).max(1);
                 self.grid.back_tab_n_margin(
                     n,
@@ -374,10 +333,8 @@ impl TerminalHandler<'_> {
                 // When DECLRMM (mode 69) is enabled, CSI s is DECSLRM.
                 // Otherwise, it's SCOSC (save cursor).
                 if self.modes.left_right_margin_mode {
-                    // DECSLRM - Set Left and Right Margins (VT420+)
-                    // CSI Pl ; Pr s - Set left and right margins
-                    // Params are 1-indexed; convert to 0-indexed
-                    // Per VT420 spec, parameter 0 means "use default"
+                    // DECSLRM, Set Left and Right Margins (CSI Pl ; Pr s, VT420+).
+                    // Params are 1-indexed; 0 means default.
                     let left = params
                         .first()
                         .copied()
@@ -390,15 +347,9 @@ impl TerminalHandler<'_> {
                         .map(|p| if p == 0 { self.grid.cols() } else { p })
                         .unwrap_or(self.grid.cols())
                         .saturating_sub(1);
-                    // Per xterm CASE_DECSLRM: an INVALID margin set
-                    // (left >= right after defaulting/clamping to the
-                    // screen) is ignored ENTIRELY — both set_lr_margins
-                    // and the CursorSet(home) are guarded behind
-                    // `if (left < right)`, mirroring the DECSTBM sibling
-                    // below. This keeps a previously-set valid margin and
-                    // the cursor untouched on a stray/invalid sequence,
-                    // instead of letting set_horizontal_margins reset to
-                    // full width and homing the cursor.
+                    // As in xterm CASE_DECSLRM, an invalid margin set (left >= right
+                    // after defaulting and clamping) is ignored entirely, keeping the
+                    // previous margins and the cursor, like DECSTBM below.
                     let max_right = self.grid.cols().saturating_sub(1);
                     if left < right.min(max_right) {
                         self.grid.set_horizontal_margins(left, right.min(max_right));
@@ -425,10 +376,8 @@ impl TerminalHandler<'_> {
             }
 
             CsiHandler::SetScrollRegion => {
-                // Set scrolling region (DECSTBM)
-                // CSI Ps ; Ps r - Set top and bottom margins
-                // Params are 1-indexed; convert to 0-indexed.
-                // Per VT510 spec, param 0 means "use default" (same as DECSLRM).
+                // DECSTBM, Set scrolling region (CSI Ps ; Ps r). Params are
+                // 1-indexed; 0 means default.
                 let top = params
                     .first()
                     .copied()
@@ -441,11 +390,9 @@ impl TerminalHandler<'_> {
                     .map(|p| if p == 0 { self.grid.rows() } else { p })
                     .unwrap_or(self.grid.rows())
                     .saturating_sub(1);
-                // Per xterm CASE_DECSTBM: an INVALID region (bottom <= top
-                // after defaulting and clamping to the screen, e.g.
-                // CSI 10;10r or CSI 28r) is ignored ENTIRELY — both
-                // set_tb_margins and the CursorSet(0,0) home are guarded
-                // behind `if (bot > top)`, so margins AND cursor stay put.
+                // As in xterm CASE_DECSTBM, an invalid region (bottom <= top after
+                // defaulting and clamping, e.g. CSI 10;10r) is ignored entirely:
+                // margins and cursor stay put.
                 let max_bottom = self.grid.rows().saturating_sub(1);
                 if top < bottom.min(max_bottom) {
                     self.grid.set_scroll_region(top, bottom);
@@ -513,23 +460,20 @@ impl TerminalHandler<'_> {
                 self.cursor_state().handle_selective_erase_line(params);
             }
             CsiHandler::KittyKeyboardQuery => {
-                // Capability off: NO reply (an unsupporting terminal ignores the
-                // query), so apps fall back to legacy encoding — never a `?0u` ack.
-                // The answer is the kitty flag word alone: ConPTY win32-input-mode
-                // (DEC 9001) lives in `modes`, never in it. aterm-gui turns the
-                // capability off for every ConPTY-backed session
-                // (`spawn::apply_pty_keyboard_posture`: conhost drops CSI-u key
-                // reports), so an app under conhost gets no reply at all.
+                // Capability off: no reply (as an unsupporting terminal), so apps
+                // use legacy encoding. The answer is the kitty flag word alone;
+                // ConPTY win32-input-mode (DEC 9001) lives in `modes`. aterm-gui
+                // turns the capability off for ConPTY sessions
+                // (`spawn::apply_pty_keyboard_posture`), since conhost drops CSI-u
+                // key reports.
                 if self.modes.kitty_keyboard_enabled {
                     self.handle_kitty_keyboard_query(cap);
                 }
             }
             CsiHandler::XtermModkeysQuery => {
-                // xterm XTMODKEYS query: CSI ? Pp m
-                // We track Pp=4 (modifyOtherKeys). For Pp=0..3 (modifyCursorKeys,
-                // modifyFunctionKeys, modifyKeyboard, modifyStringKeys), we respond
-                // with the default indicator `CSI > Pp m` (no value = disabled)
-                // to prevent programs from hanging on a missing response (#7696).
+                // XTMODKEYS query (CSI ? Pp m). Pp=4 (modifyOtherKeys) is tracked;
+                // Pp=0..3 answer the default `CSI > Pp m` (disabled) so programs do
+                // not wait for a missing response.
                 let pp = params.first().copied().unwrap_or(0);
                 if pp == 4 {
                     let response = self.xterm_keyboard.query_modify_other_keys_response();
@@ -542,7 +486,7 @@ impl TerminalHandler<'_> {
             }
             CsiHandler::XtermFmtkeysQuery => {
                 // xterm XTFMTKEYS query: CSI ? Pp g
-                // Same pattern: Pp=4 is tracked, others get default response (#7696).
+                // Same pattern: Pp=4 is tracked, others get default response.
                 let pp = params.first().copied().unwrap_or(0);
                 if pp == 4 {
                     let response = self.xterm_keyboard.query_format_other_keys_response();
@@ -557,7 +501,7 @@ impl TerminalHandler<'_> {
             CsiHandler::Xtsave => self.handle_xtsave(params),
             CsiHandler::Xtrestore => self.handle_xtrestore(params),
             CsiHandler::Decst8c => {
-                // DECST8C: Set tab stops at every 8 columns (#7553).
+                // DECST8C: Set tab stops at every 8 columns.
                 if params.first().copied() == Some(5) {
                     self.grid.reset_tab_stops();
                 }
@@ -574,7 +518,9 @@ impl TerminalHandler<'_> {
                 }
             }
             CsiHandler::XtmodkeysSet => {
-                // XTMODKEYS: CSI > Pp ; Pv m (set) or CSI > Pp m (reset)
+                // XTMODKEYS: CSI > Pp ; Pv m (set) or CSI > Pp m (reset). An
+                // empty Pv (`CSI > 4 ; m`, vim's t_TE) arrives as 0, which is
+                // the value the reset restores.
                 let pp = params.first().copied().unwrap_or(0);
                 if pp == 4 {
                     if let Some(&pv) = params.get(1) {
@@ -596,7 +542,8 @@ impl TerminalHandler<'_> {
                 }
             }
             CsiHandler::XtfmtkeysSet => {
-                // XTFMTKEYS: CSI > Pp ; Pv f (set) or CSI > Pp f (reset)
+                // XTFMTKEYS: CSI > Pp ; Pv f (set) or CSI > Pp f (reset); an
+                // empty Pv arrives as 0, the reset value, as for XTMODKEYS.
                 let pp = params.first().copied().unwrap_or(0);
                 if pp == 4 {
                     if let Some(&pv) = params.get(1) {
@@ -621,16 +568,13 @@ impl TerminalHandler<'_> {
             }
 
             // --- Kitty keyboard (>, =, < intermediates) ---
-            // With the capability toggled off (host policy: the platform consumes
-            // kitty sequences itself), push/set/pop are consumed-and-ignored — no
-            // state change, nothing forwarded — exactly how an unrecognized CSI
-            // is treated ("silently ignored per VT spec", see module doc).
+            // With the capability off (the platform consumes kitty sequences
+            // itself), push/set/pop are consumed and ignored like an unrecognized
+            // CSI.
             CsiHandler::KittyKeyboardPush => {
-                // CSI > flags u: push current flags, set new. Per Kitty
-                // spec, if flags omitted default to zero (#7475). Undefined
-                // high bits are MASKED, never saturated: kitty computes
-                // `val & 0x7f`, so `CSI > 256 u` means flags 0 — the
-                // sgr_color_u8 saturation turned it into "all enhancements".
+                // CSI > flags u: push current flags, set new; omitted flags are 0.
+                // Undefined high bits are masked (`val & 0x7f`, as kitty does), not
+                // saturated, so `CSI > 256 u` means flags 0.
                 if self.modes.kitty_keyboard_enabled {
                     let flags = if params.is_empty() {
                         0
@@ -647,9 +591,8 @@ impl TerminalHandler<'_> {
             }
             CsiHandler::KittyKeyboardSet => {
                 if self.modes.kitty_keyboard_enabled {
-                    // Same mask-don't-saturate rule for the flags; the mode
-                    // param keeps saturation (every value >= 4 is equally
-                    // undefined and `apply` no-ops it uniformly).
+                    // Flags are masked, not saturated; the mode param saturates
+                    // (every value >= 4 is undefined and `apply` ignores it).
                     let flags = (params.first().copied().unwrap_or(0) & 0b1_1111) as u8;
                     let mode = sgr_color_u8(params.get(1).copied().unwrap_or(1));
                     self.kitty_keyboard.set_flags(flags, mode);
@@ -695,10 +638,9 @@ impl TerminalHandler<'_> {
                 self.grid.unscroll_from_scrollback(n);
             }
             CsiHandler::Decic => {
-                // DECIC operates within the horizontal margins; with DECLRMM
-                // (mode 69) off the margins are the full width, so it still
-                // applies (matches xterm + DEC STD 070). insert_columns enforces
-                // the cursor-in-margins bound internally.
+                // DECIC operates within the horizontal margins, which are the full
+                // width with DECLRMM (mode 69) off, so it always applies (xterm, DEC
+                // STD 070). insert_columns enforces the cursor-in-margins bound.
                 self.cursor_state().handle_decic(params);
             }
             CsiHandler::Decdc => {
@@ -709,17 +651,15 @@ impl TerminalHandler<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: verify z4-verified dispatch table routes every sequence correctly
+// Tests: the dispatch table routes every sequence correctly
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verify all 73 z4 table entries resolve to the expected `CsiHandler`.
-    ///
-    /// This ensures the z4 dispatch table in `csi_dispatch_table.rs` is
-    /// correctly wired into the handler dispatch path.
+    /// All 73 table entries resolve to the expected `CsiHandler`, so the table
+    /// is wired into handler dispatch.
     #[test]
     fn test_z4_table_all_standard_sequences_resolve() {
         // Standard CSI sequences (no intermediates)
@@ -846,13 +786,9 @@ mod tests {
         assert_eq!(lookup_csi_handler(&[b'>', b'$'], b'p'), None);
     }
 
-    /// The sequences `csi_dispatch_untabled` claims are absent from the table.
-    ///
-    /// This is the premise the fallback rests on: each of these reaches a
-    /// handler only because `lookup_csi_handler` misses. If a table regen ever
-    /// folds one in, this fires — and the matching arm in
-    /// `csi_dispatch_untabled` becomes dead code that must be deleted rather
-    /// than left to shadow a live table entry.
+    /// The sequences `csi_dispatch_untabled` handles are absent from the table.
+    /// If the table ever gains one, the matching fallback arm becomes dead code
+    /// to delete.
     #[test]
     fn untabled_fallback_sequences_are_absent_from_the_z4_table() {
         for (intermediates, final_byte, name) in [
@@ -876,8 +812,7 @@ mod tests {
     #[test]
     fn test_z4_table_total_handler_count() {
         // 35 standard (no intermediates) + 38 with intermediates = 73 total
-        // Verified by the csi_dispatch_table::tests::test_entry_count test.
-        // Here we just verify both paths resolve the expected count.
+        // (see csi_dispatch_table::tests::test_entry_count).
         let standard_count = [
             b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H', b'I', b'J', b'K', b'L', b'M', b'P',
             b'S', b'T', b'X', b'Z', b'@', b'`', b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h',
@@ -889,18 +824,14 @@ mod tests {
         assert_eq!(standard_count, 35, "expected 35 standard CSI handlers");
     }
 
-    /// Regression: an INVALID DECSLRM (left >= right) must be a complete no-op,
-    /// mirroring the DECSTBM validity guard. Previously the handler called
-    /// `set_horizontal_margins(40, 30)` unconditionally — which resets margins to
-    /// FULL WIDTH when `left >= right` — and then homed the cursor, silently
-    /// destroying a previously-set valid margin region and repositioning the
-    /// cursor on a stray/invalid sequence (xterm CASE_DECSLRM ignores it).
+    /// An invalid DECSLRM (left >= right) is a complete no-op, as in xterm and
+    /// like DECSTBM: an existing valid margin region and the cursor are kept.
     #[test]
     fn decslrm_invalid_left_ge_right_is_noop() {
         use crate::terminal::Terminal;
 
         let mut term = Terminal::new(24, 80);
-        // DECLRMM on (mode 69) so `CSI s` is DECSLRM, then set a VALID region
+        // DECLRMM on (mode 69) so `CSI s` is DECSLRM, then set a valid region
         // [10, 50] (1-indexed 11;51) — this also homes the cursor.
         term.process(b"\x1b[?69h\x1b[11;51s");
         assert_eq!(
@@ -919,7 +850,7 @@ mod tests {
         // Invalid DECSLRM: left=40, right=30 (1-indexed 41;31), left >= right.
         term.process(b"\x1b[41;31s");
 
-        // Must be a COMPLETE no-op: margins and cursor both preserved.
+        // Must be a complete no-op: margins and cursor both preserved.
         assert_eq!(
             term.grid().horizontal_margins(),
             aterm_grid::HorizontalMargins {

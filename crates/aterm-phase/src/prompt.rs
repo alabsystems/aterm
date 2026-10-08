@@ -27,7 +27,9 @@
 //! already armed), `extra-usage` (`Switch to usage credits`, `Add funds to
 //! continue with …`, `Ask your admin for more usage`), `upgrade` (`Upgrade
 //! your plan`), and the offer rows (`low-priority`, `limit-wall-promo`,
-//! `juniper-tide`, `cedar-ember`: reset claims and promotions). Seen
+//! `juniper-tide`, `cedar-ember`: reset claims and promotions; the two reset
+//! rows are read by [`crate::reset`], by their labels, and get no role
+//! here). Seen
 //! 2026-09-24 on the owner's Mac: a weekly limit (the vendor's
 //! `autoContinueAtUsageLimit` arms the wait WITHOUT this dialog only when
 //! the reset is under 24 h away) left it up for ~14 h, read as `other`. It
@@ -136,9 +138,7 @@
 //! a permission request's accept/reject feedback hook draws), no question
 //! row, a title the header grammar reads, and y5n()'s options (one `Yes`, a
 //! `No`, and only a durable grant or a mode switch beside them). Anything
-//! else no title names stays [`PromptKind::Other`] (harness round-1
-//! review, 2026-09-24: read as `other`, every card-mode box was escalated
-//! as "a setup or config dialog").
+//! else no title names stays [`PromptKind::Other`].
 //!
 //! **THE HEADER'S GRAMMAR** ([`Header`], [`PromptV2::header`]). The title
 //! row is `<base>[ (unsandboxed)| (runs on <machine>)][ · <origin>]`, the
@@ -148,7 +148,9 @@
 //! ([`Origin`]). A kind added from the 2.1.282 render code is read from the
 //! BASE exactly (`Monitor details` is no Monitor box); the measured kinds
 //! keep their prefix reading, and a decider checks [`PromptV2::header`] for
-//! a suffix the grammar does not know.
+//! a suffix the grammar does not know. The frame also counts the asks that
+//! stack up (2.1.286, `2 of 5`): dim, right-aligned on the title row where it
+//! fits, so [`without_position`] takes it off before the row is read.
 //!
 //! **A FOOTERLESS BOX** ([`footerless_box`]). WebFetch's box, the network
 //! box and Chrome's draw no key-hint footer, and neither do the plan,
@@ -156,23 +158,35 @@
 //! `idle`, authoritative, and the session stalled with nothing approved or
 //! escalated (the vendor auto-denies on 2.1.281+). One is read when its
 //! option block is the last thing on the screen (blank rows under it, so no
-//! composer), sound, under a full-width rule and a title at column one that
-//! is one of theirs, with no transcript row inside it; its cancel is the
+//! composer), sound, under a full-width rule and a title that is one of
+//! theirs at column one (or two: the Pane pads the proposed goal two
+//! columns, MEASURED on 2.1.292), with no transcript row inside it; its cancel is the
 //! option marked ` (esc)`. A copy under a `⎿` gutter is indented past the
 //! rule and the title column, and a box that scrolled into the transcript
 //! has the composer under it: neither is read. Any OTHER title in that
 //! place is a setup dialog drawn the same way — a bare Ei() frame and an
 //! He() select (the auto-mode-default nudge, the Chrome upsell and setup,
 //! Remote Control, `Session paused`) — and is read as kind `other`, so it
-//! escalates rather than reading idle (the harness round-2 review of
-//! 2026-09-24, major); a title of a kind that always draws its footer is
-//! never read as that kind. Claude Code's own composer block — its `❯`
-//! caret row between the frame's two rules, holding a placeholder or a
-//! draft — is never such a dialog's options, and a title with a column-0
-//! row other than a rule between it and the options (a shell's line, the
-//! launch banner) is not theirs (the round-3 review of the same day,
-//! major: a table's row in the scrollback over the composer read as a
-//! dialog, and an idle or busy screen escalated).
+//! escalates rather than reading idle; a title of a kind that always draws
+//! its footer is never read as that kind. Claude Code's own composer block
+//! — its `❯` caret row between the frame's two rules, holding a placeholder
+//! or a draft — is never such a dialog's options, and a title with a
+//! column-0 row other than a rule between it and the options (a shell's
+//! line, the launch banner, a table row in the scrollback) is not theirs,
+//! or an idle or busy screen escalates.
+//!
+//! **A FOOTED BOX IN THE FULLSCREEN PANEL** ([`panel_box`]). Under the
+//! fullscreen renderer a Dialog drawn in the bottom panel has no `─` rule of
+//! its own: the panel's `▔` rule ([`is_panel_rule`], a toast may sit in it)
+//! is the rule over it, and its title, options and footer are padded three
+//! columns (2.1.287's `Po` under `Xa()`). The walk below does not stop at a
+//! `▔` row, so such a box read with its head off the screen, its first row
+//! the panel's rule: the usage-limit dialog was escalated five times on
+//! 2026-09-27 as `nothing that waits` with its dated wait row on the screen
+//! ([`fixtures::LIMIT_OPTIONS_PANEL`]). A footed box is read under the
+//! nearest panel rule above its footer when the row right under the rule is
+//! at column three, no row down to the footer sits left of it, and no
+//! composer is under the footer; that row is its title.
 //!
 //! **A BOX WHOSE HEAD IS OFF SCREEN** ([`PromptV2::head_off_screen`]). A
 //! box taller than the pane — a Bash heredoc, a large Edit diff, the
@@ -183,21 +197,18 @@
 //! rule, no said row and no shell line, and no composer is under the
 //! footer, the rule over its title is not on the rows read, so its first
 //! visible row is never taken for its title — even one that names a kind
-//! (the final review r2 of the same day, blocking: a Bash box drawn in a
-//! proposed goal's text, its forged title on row 0, was pressed) — and the
-//! box is read with its head off screen: kind
+//! (a Bash box drawn in a proposed goal's text, its forged title on row 0,
+//! was pressed) — and the box is read with its head off screen: kind
 //! [`PromptKind::Question`] when its footer or options say so, else
 //! [`PromptKind::Other`], never a kind read from a body row — and a decider
-//! escalates it. The round-2 rule that a title sits at column one had read
-//! every such box as authoritative idle, and the session stalled silently
-//! (the harness round-3 review of 2026-09-24, blocking). A FOOTERLESS box
+//! escalates it. Requiring the title at column one would read every such
+//! box as authoritative idle, a silent stall. A FOOTERLESS box
 //! is read the same way ([`footerless_head_cut`]): with no titled row above
 //! its sound option block, a walk up to the screen's top that meets no
 //! rule, said row or shell line, no transcript row and no composer frame on
 //! the screen, it is read with its head off screen — a network or Chrome
 //! box, a held message, in a short pane or behind a 40-row `tail=` read,
-//! had read as authoritative idle (the harness final review of the same
-//! day, major). And a footed box with an option block under its footer is
+//! would otherwise read as authoritative idle. And a footed box with an option block under its footer is
 //! no live box ([`find_box`]): a live dialog's options are the last on the
 //! screen, so the footer is words drawn in that dialog's text.
 //!
@@ -215,6 +226,95 @@
 //! `HOME=/tmp rm -rf ~/work` passes it, so the row stays in
 //! [`PromptV2::command_rows`] either way; a bare row under the bars is the
 //! description as before.
+//!
+//! **THE BRACKETED BOX** (MEASURED on 2.1.287, 2026-10-01, and again on
+//! 2.1.292, against the real binary by `tools/real-claude-lab`'s `tool` mode;
+//! the fixtures `claude-2.1.287-box-*.txt`). Claude Code draws a tool's own
+//! content between two dashed rules, `╌` (U+254C) from column ZERO — the Edit
+//! box did since 2.1.280, and the Bash and Fetch boxes do from 2.1.285 or
+//! 2.1.286 (2.1.284 still draws the old layout; the measured 2.1.280 to 2.1.284
+//! Bash boxes have none, and neither have the hand-built 2.1.282 Fetch,
+//! runs-on and subagent fixtures). Top to bottom: the title; the dialog's
+//! subtitle (`Tip: auto mode handles these prompts for you …`, drawn when
+//! auto mode is on offer and the box is neither an ask rule's nor a hook's);
+//! the model's description (`Run shell command` when it gave none); the
+//! first dashed rule; the command — or Fetch's `url:` and `prompt:` rows — at
+//! column ONE, each row led by `│` when the command has a newline in it, and
+//! sometimes when it has not (the rm breaker's); the second rule; the
+//! EXPLANATION BLOCK on consecutive rows at column one: the decision's reason
+//! (`Permission rule <rule> requires confirmation for this command.` over
+//! `/permissions to update rules`; `Hook PreToolUse:Bash requires
+//! confirmation for this command:` over the hook's reason and `settings.json
+//! to update hooks`; `Auto mode classifier requires confirmation for this
+//! command.`, the classifier's fallback after three blocks in a row; the rm
+//! breaker's note), then a matched ask rule's, the classifier's streak and
+//! the auto-deny countdown; a blank row; the question.
+//!
+//! Read by the column of its first row, as 2.1.282's box was (below), that
+//! layout is one block: the description over the command, and the reasons
+//! joined into the description. `owner_review` found nothing, so the harness
+//! pressed boxes the owner's ask rules and hooks had sent to a person — the
+//! tool ran each time — and the dashes themselves were the "vendor note" that
+//! kept `approve = "safe"` from approving any Bash box. A box with a dashed
+//! rule at column zero twice is read by them now ([`dashed_bracket`]: the
+//! first and the LAST, so nothing the model writes between them can end the
+//! command early; the model's rows start at column one, and a dash row of its
+//! own is one more command row). Over the first: the description, never the
+//! command. Between: [`PromptV2::command_rows`], alone, and
+//! [`PromptV2::description_rows`] is 0. Under the last: the notes, a block to
+//! each of the owner's reasons ([`opens_owner_reason`]). The Fetch box has no
+//! footer, so [`footerless_box`] lets the dashes stand where it bars every
+//! other column-zero row from a box's head, and its subject is the first row
+//! inside the rules; every other box's reasons ([`PromptV2::reason_rows`])
+//! are read under its last rule, never from the diff, the url or the prompt
+//! over it. A box with no such rules (2.1.282 and before) is read by the
+//! columns, as below.
+//!
+//! NOT DRAWN: the Write box shows no reason for a hook (measured: a PreToolUse
+//! hook answering `ask` over a Write in accept-edits mode forced the box, `1.
+//! Yes` / `2. No`, and drew nothing else; the Edit box was not driven under
+//! one), so a person's review of a file box cannot be read off the screen.
+//! Nor does a Read box draw one (measured 2.1.292: a Read under `ask:
+//! ["Read"]` is the box an unruled one outside the project is); the one tell
+//! is Claude Code's own: it draws a folder grant (`Yes, allow reading from
+//! <dir> during this session`) on EVERY Read box for a folder outside its
+//! working set, so a Read box with none stands inside it, where Claude Code
+//! asks about nothing, and is the owner's rule (the approval policy's
+//! `forced_read`).
+//!
+//! **A READ BOX'S CALL** (MEASURED on 2.1.284, 2.1.287, 2.1.291 and 2.1.292,
+//! 2026-10-06; fixtures `claude-2.1.284-box-read-outside.txt` and
+//! `claude-2.1.292-box-read-outside.txt`). The Read tool's box has no
+//! description row: its content is the CALL, `Read(<path>)`, alone at column
+//! two under the title on 2.1.284 and between the two dashed rules from
+//! 2.1.287. The reader took the call (2.1.284) or the first rule (2.1.287) for
+//! the path, so a rule that goes by the path (`approve = "safe"`) judged what
+//! was no path and held every Read. The path is the text of the call, a
+//! wrapped call's rows joined with nothing between (a path wraps mid-token,
+//! and a space at the wrap is lost). The view the model asked for stands
+//! INSIDE the parentheses (`Read(/etc/ssl/cert.pem · lines 1-5)`, `· from line
+//! 3`, `· pages 1-3`) and the screen cannot tell a path with a view from a name
+//! that ends like one: [`PromptV2::path`] is the whole text, and a decider
+//! judges every path it can mean. A title that wrapped over the first rule is
+//! a box this reader does not know whole: NO PATH, which nothing presses.
+//! 2.1.282's bare path row (hand-built, never measured) is read as any file
+//! box.
+//!
+//! **A SUBAGENT'S BOX** (MEASURED on 2.1.291 and 2.1.292, 2026-10-06,
+//! by `tools/real-claude-lab`'s `tool` mode with a call of a subagent's own;
+//! fixture `claude-2.1.292-box-bash-background-agent.txt`). A box a subagent
+//! or a workflow's agent raised — the vendor draws it for an async agent, and
+//! every subagent the lab started did, `run_in_background` true, absent or
+//! false — draws one more item on its footer, last:
+//! `Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background
+//! agents` ([`agents_note`]; `again` once the first press is in). The footer
+//! reader took an item for `<key> to <verb>` with a key of at most three words
+//! and sixteen characters, so the row was no footer, the box no box and the
+//! screen `idle`, the agent waiting on it: under `approve = "all"` nothing was
+//! pressed and the tool never ran, where 2.1.287 on the same script was
+//! pressed within a second. The note is drawn `wrap="truncate"`, so in a pane
+//! narrower than the row its last item ends in `…`: a cut item is left out of
+//! the footer ([`is_hint_footer`]), not a reason to refuse the row.
 //!
 //! **READING THE COMMAND** ([`PromptV2::readings`]). The command's rows are
 //! the rows at its own column (its first row's; notes sit left of it, at
@@ -245,22 +345,16 @@
 //! approval` of the earlier build. `Tip:` rows are never notes, and
 //! neither is 2.1.281's auto-deny countdown (`⚠ Claude Code will
 //! automatically deny this request in 1:59, …`, [`PromptV2::auto_deny`]),
-//! which it draws right under the note — joined into it, the rm breaker's
-//! warning no longer read as one (the live E2E of 2026-09-24, D3) — nor
-//! are the rows it wraps onto in a grid narrower than its ~113 cells (the
-//! round-2 review of the same day). An
-//! Edit/Write/Read box's later blocks are its diff or its contents, not
+//! which it draws right under the note (joined into it, the rm breaker's
+//! warning would not read as one), nor the rows it wraps onto in a grid
+//! narrower than its ~113 cells. An Edit/Write/Read box's later blocks are its diff or its contents, not
 //! notes, so `notes` is empty there.
 //!
 //! **A BOX IN THE TRANSCRIPT IS NOT A PROMPT** ([`find_box`]). A
 //! manager's screen shows its workers' boxes: a Monitor event or a tool's
 //! output that prints a worker's screen puts ` Esc to cancel · Tab to amend`
-//! in the MANAGER's transcript, and the whole-screen search this parser used
-//! to do read that manager as `prompt`. (Observed live on 0.86.0, 2026-09-15:
-//! a manager's own presence row read `phase=prompt`. That screen was not
-//! kept; its footer — `bypass permissions on · 1 monitor` over the artifact
-//! bar — reads busy or idle, never `prompt`.)
-//! Three things mark a copy, and each is a fact of Claude Code's layout
+//! in the MANAGER's transcript, and a whole-screen search reads that manager
+//! as `prompt`. Three things mark a copy, and each is a fact of Claude Code's layout
 //! rather than a guess about the words: the row hangs under the `⎿` gutter
 //! of an output block; every row from a `⏺` row down to the footer sits in
 //! the message's continuation column (two or more) — a live box's title,
@@ -277,12 +371,12 @@
 //! footer: its tab bar, its question, each option's label, description,
 //! focus, checkbox and `(Recommended)` mark, the free-text and chat rows by
 //! their position, the multi-select button, the preview form beside its
-//! pane, and the Submit (review) tab, which draws no footer. Before, the
-//! walk up from its footer stopped at the rule over `N. Chat about this`, so
-//! the box read was three rows with no question and no option, and the
-//! preview form, the review tab and a focused chat row were no box at all:
-//! authoritative idle, a silent stall (the incident of 2026-09-25). A
-//! question footer is never newly left with no box: a live one (no composer
+//! pane, and the Submit (review) tab, which draws no footer. (The generic
+//! walk up from its footer stops at the rule over `N. Chat about this`: read
+//! that way the box is three rows with no question and no option, and the
+//! preview form, the review tab and a focused chat row are no box at all —
+//! authoritative idle, a silent stall.) A question footer is never newly
+//! left with no box: a live one (no composer
 //! under it, nothing under it but blank rows and the rows the dialog's host
 //! draws there) whose rows are none of the shapes read is a question with
 //! its head off the screen ([`footer_box`]), and a dialog Claude Code
@@ -358,7 +452,8 @@ pub enum PromptKind {
     /// ` Held message from another session` — a cross-session delivery
     /// decision; NO footer.
     HeldMessage,
-    /// ` Claude proposes a goal`; NO footer.
+    /// `  Claude proposes a goal` (column two in the Pane, MEASURED on
+    /// 2.1.292); NO footer.
     GoalProposal,
     /// ` Computer Use wants to control these apps` — its only grant is for
     /// the session.
@@ -485,7 +580,7 @@ impl PromptKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     /// `from the "<name>" workflow` / `from a workflow` — a workflow's
-    /// subagent (the 2026-09-24 incident box).
+    /// subagent.
     Workflow { name: Option<String> },
     /// `from the <name> agent` / `from a subagent`.
     Subagent { name: Option<String> },
@@ -535,36 +630,70 @@ pub struct Header {
     pub origin: Option<Origin>,
 }
 
+/// A title row less its POSITION LABEL: `<n> of <m>` (`1 <= n <= m`, `m >= 2`)
+/// closing the row. The permission frame counts the asks that stack up (2.1.286:
+/// `positionLabel` of the tally, the title component's `aside`) and draws the
+/// count dim and right-aligned on the title row when it fits, so the title of
+/// the first of two Bash boxes is `Bash command            1 of 2`. Read whole,
+/// that is not a Bash header (the supervisor escalated every such box), the
+/// fetch, monitor, PowerShell, tool, held-message, goal and plan-entry boxes
+/// named no kind at all (a dialog of no kind aterm names is declined), and a
+/// box with an origin had no header.
+fn without_position(title: &str) -> &str {
+    fn last_word(s: &str) -> Option<(&str, &str)> {
+        crate::text::trim_end(s).rsplit_once(' ')
+    }
+    fn number(w: &str) -> Option<u16> {
+        w.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| w.parse().ok())
+            .flatten()
+    }
+    let t = crate::text::trim_end(title);
+    // A label closes the row on a digit: no other title is read further.
+    if !t.as_bytes().last().is_some_and(u8::is_ascii_digit) {
+        return t;
+    }
+    let stripped = (|| {
+        let (head, total) = last_word(t)?;
+        let (head, of) = last_word(head)?;
+        let (head, at) = last_word(head)?;
+        let (at, total) = (number(at)?, number(total)?);
+        (of == "of" && (1..=total).contains(&at) && total >= 2).then(|| crate::text::trim_end(head))
+    })();
+    stripped.filter(|head| !head.is_empty()).unwrap_or(t)
+}
+
 /// Read a title row by its grammar; `None` when it has a ` · ` suffix that
 /// is none of the seven origins — a header aterm does not know, which a
 /// decider must not read as its base's kind.
 #[must_use]
 pub fn parse_header(title: &str) -> Option<Header> {
     use crate::anchors::anchor_text;
-    let t = title.trim();
+    let t = without_position(crate::text::trim(title));
     let (head, origin) = match t.split_once(" · ") {
         Some((head, rest)) => (head, Some(origin_of(rest)?)),
         None => (t, None),
     };
     let runs_on = head
-        .rfind(anchor_text("header.runs_on"))
+        .rfind(const { anchor_text("header.runs_on") })
         .filter(|_| head.ends_with(')'))
         .map(|at| {
             (
                 &head[..at],
-                &head[at + anchor_text("header.runs_on").len()..head.len() - 1],
+                &head[at + const { anchor_text("header.runs_on") }.len()..head.len() - 1],
             )
         })
-        .filter(|(_, m)| !m.trim().is_empty());
+        .filter(|(_, m)| !crate::text::trim(m).is_empty());
     let (base, runs_on, unsandboxed) = match runs_on {
         Some((base, machine)) => (base, Some(machine.to_string()), false),
-        None => match head.strip_suffix(anchor_text("header.unsandboxed")) {
+        None => match head.strip_suffix(const { anchor_text("header.unsandboxed") }) {
             Some(base) => (base, None, true),
             None => (head, None, false),
         },
     };
     Some(Header {
-        base: base.trim().to_string(),
+        base: crate::text::trim(base).to_string(),
         runs_on,
         unsandboxed,
         origin,
@@ -574,18 +703,19 @@ pub fn parse_header(title: &str) -> Option<Header> {
 /// One of y7()'s origin forms (what follows ` · ` in the header).
 fn origin_of(rest: &str) -> Option<Origin> {
     use crate::anchors::anchor_text;
-    let rest = rest.trim();
-    let named = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
-    if rest == anchor_text("origin.workflow") {
+    let rest = crate::text::trim(rest);
+    let named =
+        |s: &str| (!crate::text::trim(s).is_empty()).then(|| crate::text::trim(s).to_string());
+    if rest == const { anchor_text("origin.workflow") } {
         return Some(Origin::Workflow { name: None });
     }
-    if rest == anchor_text("origin.subagent") {
+    if rest == const { anchor_text("origin.subagent") } {
         return Some(Origin::Subagent { name: None });
     }
-    if rest == anchor_text("origin.remote") {
+    if rest == const { anchor_text("origin.remote") } {
         return Some(Origin::RemoteAgent);
     }
-    if rest == anchor_text("origin.plugin") {
+    if rest == const { anchor_text("origin.plugin") } {
         return Some(Origin::Plugin { name: None });
     }
     // The named forms (`from the "<name>" workflow`, `from the <name>
@@ -636,8 +766,11 @@ pub enum Role {
     /// Allow calls like it for the rest of the session (`Yes, and allow
     /// reading from ~/.ssh during this session`).
     Session,
-    /// A durable grant (`Yes, and don't ask again for: git log *`, `Yes, and
-    /// always allow access to <dir> from this project`).
+    /// An answer KEPT for every later ask of its kind ([`settles_later`]): a
+    /// durable grant (`Yes, and don't ask again for: git log *`, `Yes, and
+    /// always allow access to <dir> from this project`), or a refusal that
+    /// settles them (`No, and block reads outside the working directories
+    /// from now on`). Never pressed by a rule.
     Persist,
     /// Switch the session's permission mode (`Yes, and switch to auto mode`,
     /// `… accept edits …`, anything marked `(shift+tab)`).
@@ -706,13 +839,13 @@ impl Opt {
     pub fn recommended(&self) -> bool {
         self.label
             .trim_end()
-            .ends_with(crate::anchors::anchor_text("codex.question.recommended"))
+            .ends_with(const { crate::anchors::anchor_text("codex.question.recommended") })
     }
 
     /// The label says yes: `Yes`, `Yes, proceed`, `Yes, auto-accept edits`.
     #[must_use]
     pub fn affirms(&self) -> bool {
-        let l = self.label.trim_start();
+        let l = crate::text::trim_start(&self.label);
         l == "Yes" || l.starts_with("Yes,") || l.starts_with("Yes ")
     }
 }
@@ -766,13 +899,16 @@ pub struct PromptV2 {
     /// every `│` row at the command's column; without bars, every row at the
     /// command's column, the model-written description included, because
     /// the screen cannot tell a wrapped command's tail from a description
-    /// (Claude Code trims the trailing spaces a wrap may hide). Bash and
-    /// PowerShell only.
+    /// (Claude Code trims the trailing spaces a wrap may hide). In a
+    /// bracketed box (2.1.287; module header, "THE BRACKETED BOX"): exactly
+    /// the rows between the dashed rules, the description not among them.
+    /// Bash and PowerShell only.
     /// A decider classifies [`Self::readings`], never a subset it chose.
     pub command_rows: Vec<String>,
     /// How many of the LAST [`Self::command_rows`] the parser SHOWS as the
     /// description ([`Self::description`]) — a guess for display, never a
-    /// licence to leave them out of a safety decision.
+    /// licence to leave them out of a safety decision. 0 in a bracketed box,
+    /// whose description is over the dashed rules and in no command row.
     pub description_rows: usize,
     /// Whether the command was drawn with `│` bars (Claude Code draws them
     /// for a command with a newline in it). Without bars the command is one
@@ -795,7 +931,7 @@ pub struct PromptV2 {
     /// on an unattended session`; 2.1.281): the box will be DENIED when it
     /// runs out. Never a note (module header, "NOTE ROWS"), and neither is
     /// a row it wrapped onto under a narrow grid: those are joined into it
-    /// with one space ([`auto_deny_block`]; round-2 review, 2026-09-24).
+    /// with one space ([`auto_deny_block`]).
     pub auto_deny: Option<String>,
     /// The file an Edit/Write/Overwrite/Read box names (its first body row;
     /// for `Edit notebook` and the IDE diff, which draw none that is sure,
@@ -961,7 +1097,8 @@ impl PromptV2 {
     #[must_use]
     pub fn tool_card(&self) -> bool {
         self.kind == PromptKind::Tool
-            && self.base_title().as_deref() != Some(crate::anchors::anchor_text("box.tool"))
+            && self.base_title().as_deref()
+                != Some(const { crate::anchors::anchor_text("box.tool") })
     }
 
     /// The vendor's rm/rmdir circuit breaker this box is ([`rm_breaker_of`]
@@ -994,10 +1131,11 @@ impl PromptV2 {
     #[must_use]
     pub fn foot_note(&self, rows: &[String]) -> Option<String> {
         let q = self.question.filter(|&q| {
-            rows.get(q).map(|r| r.trim()) == Some(crate::anchors::anchor_text("prompt.proceed"))
+            rows.get(q).map(|r| crate::text::trim(r))
+                == Some(const { crate::anchors::anchor_text("prompt.proceed") })
         })?;
         let over_blanks = |mut at: usize| {
-            while at > 0 && rows[at - 1].trim().is_empty() {
+            while at > 0 && crate::text::trim(&rows[at - 1]).is_empty() {
                 at -= 1;
             }
             at
@@ -1008,7 +1146,7 @@ impl PromptV2 {
         // reads from that row ends exactly here.
         let mut top = end;
         while top > 0 {
-            let t = rows[top - 1].trim();
+            let t = crate::text::trim(&rows[top - 1]);
             if t.is_empty() || t.starts_with('│') {
                 break;
             }
@@ -1027,7 +1165,7 @@ impl PromptV2 {
         (start < end).then(|| {
             rows[start..end]
                 .iter()
-                .map(|r| r.trim().trim_start_matches('│').trim())
+                .map(|r| crate::text::trim(r).trim_start_matches('│').trim())
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -1094,7 +1232,7 @@ pub struct RmBreaker {
 #[must_use]
 pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
     use crate::anchors::anchor_text;
-    let note = note.trim();
+    let note = crate::text::trim(note);
     if note.matches("Dangerous").count() != 1 {
         return None;
     }
@@ -1150,12 +1288,12 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
             // `— too many command substitutions to analyze (65)`.
             let n = rest
                 .strip_prefix("— ")?
-                .strip_prefix(anchor_text("box.rm_breaker.too_many"))?
+                .strip_prefix(const { anchor_text("box.rm_breaker.too_many") })?
                 .strip_suffix(')')?;
             (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
                 .then_some((RmBreakerKind::TooManySubstitutions, n))
         })?;
-    let target = target.trim();
+    let target = crate::text::trim(target);
     (!target.is_empty()).then(|| RmBreaker {
         command,
         kind,
@@ -1200,8 +1338,28 @@ struct Found {
 }
 
 fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
-    let b = find_box(rows)?;
-    let title = rows[b.title].trim();
+    let mut b = find_box(rows)?;
+    let title = without_position(crate::text::trim(&rows[b.title]));
+    // A shell box draws its command between TWO dashed rules at column zero, or
+    // between none (module header, "THE BRACKETED BOX"). The model's own rows sit
+    // at column one, where a command wrapped at a narrow pane's width can start a
+    // row with a frame edge and the next with a title (`╰────╯`, `Bash command`):
+    // the box finder takes that for the box's top and the real first rule lies
+    // above it, out of the box. Any other number of rules is a box read from a
+    // wrong top: it is read as a box whose head is off the screen, which nothing
+    // presses at any level.
+    if !b.head_off_screen
+        && header_kind(title).is_some_and(PromptKind::is_shell)
+        && !matches!(
+            rows[b.title + 1..b.last.max(b.title + 1).min(rows.len())]
+                .iter()
+                .filter(|r| is_dashed_rule(r))
+                .count(),
+            0 | 2
+        )
+    {
+        b.head_off_screen = true;
+    }
     let footer = b.footer.map(|f| rows[f].as_str());
     // A box whose head is off the screen is named by nothing: its first
     // visible row is a body row, whatever it reads.
@@ -1310,17 +1468,21 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         span: (b.title, b.last),
         head_off_screen: b.head_off_screen,
         question_dialog,
-        reason_rows: if kind.is_shell() || kind == PromptKind::Question {
+        reason_rows: if kind == PromptKind::Question {
             Vec::new()
+        } else if kind.is_shell() {
+            loose_reasons(body)
         } else {
-            reason_rows_of(body)
+            let mut r = reason_rows_of(body);
+            r.extend(loose_reasons(body));
+            r
         },
     };
     match kind {
         PromptKind::Workflow => {
             let description = body
                 .iter()
-                .map(|r| r.trim())
+                .map(|r| crate::text::trim(r))
                 .filter_map(|r| r.strip_prefix('│'))
                 .map(str::trim)
                 .collect::<Vec<_>>()
@@ -1424,7 +1586,7 @@ fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
             .map(|o| opt(Some(o.n), &o.label, o.focused, o.row))
             .collect()
     };
-    let chat = anchor_text("question.chat");
+    let chat = const { anchor_text("question.chat") };
     match &d.form {
         QuestionForm::Single {
             options: o,
@@ -1455,7 +1617,7 @@ fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
         QuestionForm::Review { submit, cancel, .. } => vec![
             opt(
                 Some(1),
-                anchor_text("question.review_submit"),
+                const { anchor_text("question.review_submit") },
                 submit.focused,
                 submit.row,
             ),
@@ -1474,16 +1636,16 @@ fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
 /// notebook`, `Opened changes in <IDE> ⧉`).
 fn names_file_in_question(title: &str) -> bool {
     use crate::anchors::anchor_text;
-    let base = parse_header(title).map_or_else(|| title.trim().to_string(), |h| h.base);
-    base == anchor_text("box.edit_notebook") || is_ide_diff(&base)
+    let base = parse_header(title).map_or_else(|| crate::text::trim(title).to_string(), |h| h.base);
+    base == const { anchor_text("box.edit_notebook") } || is_ide_diff(&base)
 }
 
 /// `Opened changes in <IDE> ⧉`.
 fn is_ide_diff(base: &str) -> bool {
     use crate::anchors::anchor_text;
-    base.strip_prefix(anchor_text("box.ide_diff"))
-        .and_then(|rest| rest.strip_suffix(anchor_text("box.ide_diff.mark")))
-        .is_some_and(|ide| !ide.trim().is_empty())
+    base.strip_prefix(const { anchor_text("box.ide_diff") })
+        .and_then(|rest| rest.strip_suffix(const { anchor_text("box.ide_diff.mark") }))
+        .is_some_and(|ide| !crate::text::trim(ide).is_empty())
 }
 
 /// The file a file box's question names: `x.rs` of `Do you want to make this
@@ -1516,13 +1678,20 @@ fn subject_of(kind: PromptKind, title: &str, body: &[String]) -> String {
     if kind == PromptKind::Skill {
         return title
             .trim()
-            .strip_prefix(anchor_text("box.skill"))
+            .strip_prefix(const { anchor_text("box.skill") })
             .and_then(|t| t.strip_suffix("\"?"))
             .unwrap_or_default()
             .to_string();
     }
-    body.iter()
-        .map(|r| r.trim())
+    // 2.1.287: the box's own content is bracketed by dashed rules, and the row
+    // above them is the dialog's subtitle (`Claude wants to fetch content
+    // from <host>`), prose; the subject is the first row inside.
+    let own = match dashed_bracket(body) {
+        Some((open, close)) => &body[open + 1..close],
+        None => body,
+    };
+    own.iter()
+        .map(|r| crate::text::trim(r))
         .map(|t| t.strip_prefix('│').map_or(t, str::trim))
         .find(|t| !t.is_empty() && !t.starts_with("Tip:"))
         .unwrap_or_default()
@@ -1541,9 +1710,9 @@ fn is_question(footer: Option<&str>, options: &[Opt]) -> bool {
     });
     footer_says
         || options.iter().any(|o| {
-            let l = o.label.trim();
-            l.strip_suffix('.').unwrap_or(l) == anchor_text("question.other")
-                || l == anchor_text("question.chat")
+            let l = crate::text::trim(&o.label);
+            l.strip_suffix('.').unwrap_or(l) == const { anchor_text("question.other") }
+                || l == const { anchor_text("question.chat") }
         })
 }
 
@@ -1558,8 +1727,8 @@ fn is_question(footer: Option<&str>, options: &[Opt]) -> bool {
 /// them. The title is no row another box draws UNDER its own title — a `Do
 /// you want …` question, an option — so a box whose walk up stopped below
 /// its real title (at a body row led by `⎿`) is not a card whose title is
-/// `Do you want to proceed?` (the harness round-3 review of 2026-09-24: it
-/// was pressed under the generic question row, its command unaudited).
+/// `Do you want to proceed?` (read as one, it is pressed under the generic
+/// question row, its command unaudited).
 fn is_tool_card(
     title: &str,
     footer: Option<&str>,
@@ -1567,13 +1736,17 @@ fn is_tool_card(
     options: &[Opt],
 ) -> bool {
     use crate::anchors::anchor_text;
-    let t = title.trim();
+    let t = crate::text::trim(title);
     if t.starts_with("Do you want") || option_row(t, ARROW).is_some() || pointer_row(t, ARROW) {
         return false;
     }
     let permission_footer = footer.is_some_and(|f| {
-        let items: Vec<&str> = f.trim().split(" · ").collect();
-        items == [anchor_text("prompt.cancel"), anchor_text("prompt.amend")]
+        let items: Vec<&str> = crate::text::trim(f).split(" · ").collect();
+        items
+            == [
+                const { anchor_text("prompt.cancel") },
+                const { anchor_text("prompt.amend") },
+            ]
     });
     let once: Vec<&Opt> = options.iter().filter(|o| o.role == Role::Once).collect();
     permission_footer
@@ -1592,8 +1765,8 @@ fn is_tool_card(
 /// The auto-deny countdown's text when `row` is that row (`⚠` and the
 /// surrounding whitespace stripped), `None` otherwise.
 fn auto_deny_of(row: &str) -> Option<String> {
-    let t = row.trim().trim_start_matches('⚠').trim();
-    t.starts_with(crate::anchors::anchor_text("box.auto_deny"))
+    let t = crate::text::trim(row).trim_start_matches('⚠').trim();
+    t.starts_with(const { crate::anchors::anchor_text("box.auto_deny") })
         .then(|| t.to_string())
 }
 
@@ -1601,8 +1774,8 @@ fn auto_deny_of(row: &str) -> Option<String> {
 /// row (`⚠` stripped) and the rows Ink wrapped it onto, joined with one
 /// space — and the body rows it spans. The row is ~113 cells, so a grid
 /// narrower than that (the 110-column headless default among them) wraps
-/// it, its tail at the note column (the harness round-2 review of
-/// 2026-09-24, major: `unattended session` read as a second note). The rows
+/// it, its tail at the note column, where it would read as a second note.
+/// The rows
 /// under it are its own up to its blank row (the vendor's Tt() draws it
 /// with marginBottom 1), save a `│`-led row, a `⚠` row or a `Tip:`, which
 /// are a note's or the box's own, and a row as deep as the command column
@@ -1616,7 +1789,7 @@ fn auto_deny_block(body: &[String], col: usize) -> Option<(String, std::ops::Ran
     let col = (col > leading_spaces(&body[at])).then_some(col);
     let mut end = at + 1;
     while let Some(r) = body.get(end) {
-        let t = r.trim();
+        let t = crate::text::trim(r);
         if t.is_empty()
             || t.starts_with(['│', '⚠'])
             || t.starts_with("Tip:")
@@ -1635,12 +1808,13 @@ fn auto_deny_block(body: &[String], col: usize) -> Option<(String, std::ops::Ran
 /// `Tip:` (module header, "READING THE COMMAND"); 0 with none.
 fn command_col(body: &[String]) -> usize {
     body.iter()
-        .find(|r| !r.trim().is_empty() && !r.trim().starts_with("Tip:"))
+        .find(|r| !crate::text::trim(r).is_empty() && !crate::text::trim(r).starts_with("Tip:"))
         .map_or(0, |r| crate::phase::leading_spaces(r))
 }
 
 /// A tool box's content, read from the rows between its title and its
 /// question (or its options).
+#[derive(Default)]
 struct Content {
     command_rows: Vec<String>,
     description_rows: usize,
@@ -1650,24 +1824,144 @@ struct Content {
     note_blocks: Vec<String>,
 }
 
+/// A dashed rule, Claude Code's own chrome around a tool's content: a row at
+/// column ZERO of ten or more `╌` (U+254C) and nothing else. The model's text
+/// (a command, a description, a prompt) is drawn at column one or deeper, so
+/// it cannot make one.
+fn is_dashed_rule(row: &str) -> bool {
+    row.starts_with('╌') && {
+        let t = crate::text::trim_end(row);
+        t.chars().all(|c| c == '╌') && t.chars().count() >= 10
+    }
+}
+
+/// The dashed rules that bracket a box's own content (2.1.287; module header,
+/// "THE BRACKETED BOX"): the first and the LAST dashed rule among `body`'s
+/// rows. The last, not the second: whatever the model writes between the two
+/// real rules — a row of dashes in a command, say — stays inside the bracket,
+/// where it is read as the command it is.
+fn dashed_bracket(body: &[String]) -> Option<(usize, usize)> {
+    let open = body.iter().position(|r| is_dashed_rule(r))?;
+    let close = body.iter().rposition(|r| is_dashed_rule(r))?;
+    (open < close).then_some((open, close))
+}
+
+/// A shell box drawn in 2.1.287's bracketed layout (module header, "THE
+/// BRACKETED BOX"): over the dashed rules the dialog's subtitle (`Tip: …`,
+/// never read) and the model's description, between them the command — a `│`
+/// bar led each of its rows when it has a newline in it, and sometimes when it
+/// has not — and under them the explanation block: the reasons Claude Code
+/// gives for asking (an ask rule, a hook, the classifier, the rm breaker),
+/// their config row, the auto-deny countdown. The command is told from the
+/// description by the rules, so no row of one is read as the other; and the
+/// reasons are told from the command the same way, so no reason is lost into
+/// it.
+fn bracketed_content(body: &[String], open: usize, close: usize) -> Content {
+    let description = body[..open]
+        .iter()
+        .map(|r| unbarred(r))
+        .filter(|t| !t.is_empty() && !t.starts_with("Tip:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let inside = &body[open + 1..close];
+    let command_rows: Vec<String> = inside
+        .iter()
+        .map(|r| unbarred(r))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    let gutter = inside
+        .iter()
+        .any(|r| crate::text::trim_start(r).starts_with('│'));
+    let countdown = auto_deny_block(&body[close + 1..], 0).map(|(_, rows)| rows);
+    let mut note_rows: Vec<String> = Vec::new();
+    let mut note_blocks: Vec<String> = Vec::new();
+    let mut in_note = false;
+    for (i, r) in body[close + 1..].iter().enumerate() {
+        let note = unbarred(r);
+        if note.is_empty() || countdown.as_ref().is_some_and(|c| c.contains(&i)) {
+            in_note = false;
+            continue;
+        }
+        note_rows.push(note.to_string());
+        match note_blocks.last_mut() {
+            Some(last) if in_note && !opens_owner_reason(note) => {
+                last.push(' ');
+                last.push_str(note);
+            }
+            _ => note_blocks.push(note.to_string()),
+        }
+        in_note = true;
+    }
+    Content {
+        command_rows,
+        description_rows: 0,
+        gutter,
+        description,
+        note_rows,
+        note_blocks,
+    }
+}
+
 fn content_of(body: &[String], kind: PromptKind) -> Content {
     use crate::phase::leading_spaces;
-    let is_tip = |r: &String| r.trim().starts_with("Tip:");
+    let is_tip = |r: &String| crate::text::trim(r).starts_with("Tip:");
     if !kind.is_shell() {
+        // A Read box draws its call, `Read(<path>)` (2.1.284: alone at column
+        // two; 2.1.287: between two dashed rules, module header, "THE
+        // BRACKETED BOX"), and a long call wraps, so its rows are one token.
+        // A box that draws the bare path (2.1.282) is read as any file box.
+        if matches!(kind, PromptKind::Read) {
+            let bare = |t: &str| t.is_empty() || t.starts_with("Tip:");
+            // Over the first rule only the dialog's own `Tip:` may stand: a
+            // title that wrapped there is a box this reader does not know whole.
+            let (call, known_head): (String, bool) = match dashed_bracket(body) {
+                Some((open, close)) => (
+                    body[open + 1..close]
+                        .iter()
+                        .map(|r| crate::text::trim(r))
+                        .collect(),
+                    body[..open].iter().all(|r| bare(crate::text::trim(r))),
+                ),
+                None => (
+                    body.iter()
+                        .map(|r| crate::text::trim(r))
+                        .skip_while(|t| bare(t))
+                        .take_while(|t| !t.is_empty())
+                        .collect(),
+                    true,
+                ),
+            };
+            if let Some(arg) = call
+                .strip_prefix(crate::anchors::anchor_text("box.read_call"))
+                .and_then(|c| c.strip_suffix(')'))
+            {
+                // The whole text between the parentheses: the view the model
+                // asked for (` · lines 1-5`) rides inside it, and the screen
+                // cannot tell a path with a view from a name that ends like one,
+                // so a decider reads both ([`PromptV2::path`]).
+                let path = Some(arg).filter(|p| known_head && !p.is_empty());
+                return Content {
+                    command_rows: path.map(str::to_string).into_iter().collect(),
+                    ..Content::default()
+                };
+            }
+        }
         // A file box: its path is its first row; the rest is a diff or the
         // file's contents.
         let path = body
             .iter()
-            .find(|r| !r.trim().is_empty() && !is_tip(r))
-            .map(|r| r.trim().to_string());
+            .find(|r| !crate::text::trim(r).is_empty() && !is_tip(r))
+            .map(|r| crate::text::trim(r).to_string());
         return Content {
             command_rows: path.into_iter().collect(),
-            description_rows: 0,
-            gutter: false,
-            description: String::new(),
-            note_rows: Vec::new(),
-            note_blocks: Vec::new(),
+            ..Content::default()
         };
+    }
+    // 2.1.287 brackets the command in dashed rules (module header, "THE
+    // BRACKETED BOX"): the rows are told apart by those rules, not by a column.
+    if let Some((open, close)) = dashed_bracket(body) {
+        return bracketed_content(body, open, close);
     }
     // The command's column is its first row's (module header, "READING THE
     // COMMAND"); every row at it or deeper is the command or its
@@ -1680,7 +1974,7 @@ fn content_of(body: &[String], kind: PromptKind) -> Content {
     let mut note_blocks: Vec<String> = Vec::new();
     let mut in_note = false;
     for (i, r) in body.iter().enumerate() {
-        let t = r.trim();
+        let t = crate::text::trim(r);
         if t.is_empty() {
             in_note = false;
             continue;
@@ -1700,7 +1994,7 @@ fn content_of(body: &[String], kind: PromptKind) -> Content {
         let note = t.strip_prefix('│').map_or(t, str::trim);
         note_rows.push(note.to_string());
         match note_blocks.last_mut() {
-            Some(last) if in_note => {
+            Some(last) if in_note && !opens_owner_reason(note) => {
                 last.push(' ');
                 last.push_str(note);
             }
@@ -1756,13 +2050,13 @@ fn content_of(body: &[String], kind: PromptKind) -> Content {
 /// grid is measured; a narrower grid wraps it).
 fn trust_path(body: &[String]) -> Option<String> {
     let at = body.iter().position(|r| {
-        let t = r.trim();
+        let t = crate::text::trim(r);
         t.starts_with('/') || t.starts_with('~')
     })?;
     Some(
         body[at..]
             .iter()
-            .map(|r| r.trim())
+            .map(|r| crate::text::trim(r))
             .take_while(|t| !t.is_empty())
             .collect(),
     )
@@ -1775,7 +2069,7 @@ fn trust_path(body: &[String]) -> Option<String> {
 fn prose_of(body: &[String], cur: &[char]) -> String {
     let mut out: Vec<&str> = Vec::new();
     let mut in_path = false;
-    for t in body.iter().map(|r| r.trim()) {
+    for t in body.iter().map(|r| crate::text::trim(r)) {
         if t.is_empty() {
             in_path = false;
             continue;
@@ -1811,9 +2105,9 @@ pub fn prompt_box_span(rows: &[String]) -> Option<(usize, usize)> {
 }
 
 /// The box's OWN first row — its title, the first row [`find_box`] reads as
-/// the box's — never a transcript row above it, however tall the transcript
-/// (round-25 review, 2026-09-23: a supervisor's badge quoted `⏺ transcript
-/// row 19 done` from a fixed 30-row window). `None` without a live box.
+/// the box's — never a transcript row above it, however tall the
+/// transcript (a fixed window quotes transcript rows). `None` without a
+/// live box.
 pub fn prompt_box_first_row(rows: &[String]) -> Option<usize> {
     find_box(rows).map(|b| b.title)
 }
@@ -1827,8 +2121,7 @@ pub fn prompt_box_first_row(rows: &[String]) -> Option<usize> {
 /// the screen's last, outside Claude's composer) is no live box: a live
 /// dialog's options are the last on the screen, so that footer is the
 /// model's words drawn in the dialog's text — a Bash box in a proposed
-/// goal (the harness final review r2 of 2026-09-24, blocking: approve-all
-/// and the read-only rule pressed `1` into the goal dialog). When no
+/// goal, where pressing `1` answers the goal dialog. When no
 /// footerless box is read there either, the box is read with its head off
 /// the screen — escalated, never pressed and never idle.
 ///
@@ -1882,12 +2175,10 @@ fn drawn_box(rows: &[String]) -> Option<Found> {
 /// column-0 rule, the question dialog's divided tail, under no composer —
 /// so a quote in a
 /// message's continuation column (two or more) is no box even where
-/// [`box_top`] was stopped above it (the harness round-2 review of
-/// 2026-09-24, blocking) — when the composer is under the footer, as it is
-/// under every copy. With no composer under it (a live box replaces it),
-/// such a stop is inside a live box's body, and the box is read with its
-/// head off the screen: escalated, never pressed, never idle (the final
-/// review r3, blocking).
+/// [`box_top`] was stopped above it — when the composer is under the
+/// footer, as it is under every copy. With no composer under it (a live box
+/// replaces it), such a stop is inside a live box's body, and the box is
+/// read with its head off the screen: escalated, never pressed, never idle.
 ///
 /// Where the walk reached the screen's top ([`Top::ScreenTop`]) with no
 /// composer under the footer (a live box replaces it: every MEASURED
@@ -1895,14 +2186,11 @@ fn drawn_box(rows: &[String]) -> Option<Found> {
 /// its first visible row is never taken for its title: the box's head is
 /// off the screen ([`PromptV2::head_off_screen`]) — read, so it is
 /// escalated and a `tail=` read is taken again whole, as a footerless box's
-/// is ([`footerless_head_cut`]). The round-2 column rule read such a box as
-/// authoritative idle and the session stalled silently on a 60-row heredoc,
-/// a large Edit diff or the incident's own box in a short pane (the harness
-/// round-3 review of 2026-09-24, blocking); round 3 still took a first row
-/// that named a kind for the title, and a Bash box drawn in a proposed
-/// goal's text, its forged title on row 0, was pressed (the final review r2,
-/// blocking) — so a genuine box whose title lands on row 0 of the whole
-/// grid is escalated too. With a composer under it, a first row at column
+/// is ([`footerless_head_cut`]). Read by the column rule, a 60-row heredoc
+/// or a large Edit diff in a short pane is authoritative idle, a silent
+/// stall; a first row that names a kind is never the title either (a Bash
+/// box drawn in a proposed goal's text forges one on row 0), so a genuine
+/// box whose title lands on row 0 of the whole grid is escalated too. With a composer under it, a first row at column
 /// one is still read as the title (a hand-built box over a composer), and
 /// any other is no box.
 ///
@@ -1929,7 +2217,7 @@ fn question_footed(rows: &[String], footer: usize) -> Option<Found> {
     let preview = rows[footer]
         .trim()
         .split(" · ")
-        .any(|item| item == anchor_text("question.add_notes"));
+        .any(|item| item == const { anchor_text("question.add_notes") });
     crate::question::footed(rows, footer, preview).map(|s| question_found(s, Some(footer)))
 }
 
@@ -1958,14 +2246,12 @@ fn question_found(shape: QShape, footer: Option<usize>) -> Found {
 /// A question footer none of whose shapes [`question_footed`] reads and
 /// over which [`walked_box`] finds no box — a focused or unnumbered chat row
 /// the walk stopped at, a shape 2.1.283 may draw — is never newly no box
-/// (the incident of 2026-09-25: the preview form and a focused chat row
-/// read authoritative idle): when it is LIVE — no composer under it, and
+/// (that reads authoritative idle): when it is LIVE — no composer under it, and
 /// nothing under it but blank rows and the rows the dialog's host draws
 /// there ([`crate::question::trailers`]) — it is read from its first
 /// non-blank row above the footer's blank rows down to the footer, its head
 /// off the screen, form unknown: escalated, never idle. A question footer
-/// quoted in the transcript has the composer under it and stays no box (the
-/// critique of 2026-09-25, R7).
+/// quoted in the transcript has the composer under it and stays no box.
 fn question_fallback(rows: &[String], footer: usize) -> Option<Found> {
     use crate::question::{screen_width, trailers};
     let bare = crate::phase::composer_top(rows).is_none_or(|t| t < footer);
@@ -1974,7 +2260,7 @@ fn question_fallback(rows: &[String], footer: usize) -> Option<Found> {
     }
     let first = (0..footer)
         .rev()
-        .find(|&i| !rows[i].trim().is_empty())
+        .find(|&i| !crate::text::trim(&rows[i]).is_empty())
         .unwrap_or(footer);
     Some(question_found(
         QShape::fallback(first, footer),
@@ -1992,8 +2278,8 @@ fn is_question_footer(row: &str) -> bool {
 /// A footer's question items: whether it has `Enter to select`, and an item
 /// whose verb is `navigate` (the key words are the bindings').
 fn question_items(footer: &str) -> (bool, bool) {
-    let select = crate::anchors::anchor_text("question.select");
-    let items: Vec<&str> = footer.trim().split(" · ").collect();
+    let select = const { crate::anchors::anchor_text("question.select") };
+    let items: Vec<&str> = crate::text::trim(footer).split(" · ").collect();
     (
         items.contains(&select),
         items
@@ -2003,24 +2289,26 @@ fn question_items(footer: &str) -> (bool, bool) {
 }
 
 /// [`footer_box`]'s walk up from a footer that is no question dialog read
-/// whole ([`box_top`]).
+/// whole ([`panel_box`], else [`box_top`]).
 fn walked_box(rows: &[String], footer: usize) -> Option<Found> {
     use crate::phase::{composer_top, leading_spaces};
+    if let Some(found) = panel_box(rows, footer) {
+        return Some(found);
+    }
     let top = box_top(rows, footer)?;
     let from = match top {
         Top::Under(i) => i,
         Top::ScreenTop => 0,
     };
-    let first = (from..footer).find(|&i| !rows[i].trim().is_empty())?;
+    let first = (from..footer).find(|&i| !crate::text::trim(&rows[i]).is_empty())?;
     // No composer under the footer: a live box replaces it, and every copy
     // in the transcript has it under the copy.
     let bare = composer_top(rows).is_none_or(|t| t < footer);
     // The question dialog's `4. Chat about this` under the rule that
-    // divides its options (the live E2E of 2026-09-24, D7) is the one box
-    // [`box_top`] starts at an option row, right under a column-0 rule no
-    // message can draw — a LIVE one, no composer under it: a copy of the
-    // dialog over the composer is the transcript's (the question dialog
-    // read whole, 2026-09-25, [`question_footed`], has the same rule).
+    // divides its options is the one box [`box_top`] starts at an option
+    // row, right under a column-0 rule no message can draw — a LIVE one, no
+    // composer under it: a copy of the dialog over the composer is the
+    // transcript's ([`question_footed`] has the same rule).
     let divided = bare
         && first
             .checked_sub(1)
@@ -2035,14 +2323,12 @@ fn walked_box(rows: &[String], footer: usize) -> Option<Found> {
         // Stopped inside a live box's body by a row [`box_top`] took for
         // the end of the box above — no composer under it, its first row
         // there no title: the box is read with its head off the screen, so
-        // it is escalated and never pressed, never read idle (the harness
-        // final review r3 of 2026-09-24, blocking: a heredoc's `⎿` row over
-        // a blank row stalled the session silently, and the mail nudge's
-        // Enter landed in the box).
+        // it is escalated and never pressed, never read idle (a heredoc's
+        // `⎿` row over a blank row is such a stop).
         (Top::Under(_), true, false) => true,
     };
     // The cursors its title lets it draw (module header, "THE CURSOR").
-    let cur = cursors(rows[first].trim());
+    let cur = cursors(crate::text::trim(&rows[first]));
     rows[first..footer]
         .iter()
         .any(|r| option_row(r, cur).is_some() || pointer_row(r, cur))
@@ -2059,19 +2345,58 @@ fn walked_box(rows: &[String], footer: usize) -> Option<Found> {
         })
 }
 
+/// A FOOTED box in the fullscreen renderer's bottom panel (module header, "A
+/// FOOTED BOX IN THE FULLSCREEN PANEL"): the nearest panel rule above the
+/// footer ([`is_panel_rule`]), the row right under it at column three — the
+/// Dialog's `Po` pads three columns there and draws no `─` rule of its own
+/// (2.1.287 source; the model-switch box measured the column) — and every
+/// row from it down to the footer blank or at column three or further in,
+/// with no composer under the footer (the panel replaces it). That row is
+/// the box's title. Anything else is left to [`box_top`]'s walk, which does
+/// not stop at a `▔` row and so reads such a box with its head off the
+/// screen.
+fn panel_box(rows: &[String], footer: usize) -> Option<Found> {
+    use crate::phase::{composer_top, leading_spaces};
+    if composer_top(rows).is_some_and(|t| t > footer) {
+        return None;
+    }
+    let rule = (0..footer).rev().find(|&i| is_panel_rule(&rows[i]))?;
+    let title = rule + 1;
+    if title >= footer
+        || leading_spaces(&rows[title]) != 3
+        || rows[title..=footer]
+            .iter()
+            .any(|r| !crate::text::trim(r).is_empty() && leading_spaces(r) < 3)
+    {
+        return None;
+    }
+    let cur = cursors(crate::text::trim(&rows[title]));
+    rows[title + 1..footer]
+        .iter()
+        .any(|r| option_row(r, cur).is_some() || pointer_row(r, cur))
+        .then_some(Found {
+            footer: Some(footer),
+            title,
+            options_from: title + 1,
+            options_end: footer,
+            last: footer,
+            head_off_screen: false,
+            question: None,
+        })
+}
+
 /// A box drawn with NO key-hint footer (module header, "A FOOTERLESS BOX"):
 /// its option block is the last block on the screen — only blank rows under
 /// it, save the plan dialog's own `ctrl+g to edit in <editor> · <plan
 /// path>` row ([`is_key_hint_row`]) — so no composer frame sits below it;
 /// the block holds an option (numbered, or unnumbered under the `❯`) and
 /// its options are SOUND; above it, anywhere on the screen (no 60-row
-/// window since the harness final review of 2026-09-24), the nearest
+/// window), the nearest
 /// title of a kind that may be footerless ([`PromptKind::may_be_footerless`])
 /// sits at column one right under a full-width rule — or, when none does,
 /// the nearest such titled row is no option and no kind aterm-phase knows,
-/// and the box is a setup dialog of kind [`PromptKind::Other`] (round-2
-/// review, 2026-09-24: those read authoritative idle, a silent stall, and
-/// D4 names them as detected and escalated); and no row from the
+/// and the box is a setup dialog of kind [`PromptKind::Other`], escalated
+/// rather than read as authoritative idle; and no row from the
 /// title down is the transcript's (a `⏺` row, `⎿` output) or hangs under a
 /// `⎿` gutter. A copy quoted under a gutter is indented past the rule and
 /// the title column, and a box that scrolled into the transcript has the
@@ -2088,17 +2413,29 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
     } = bottom_block(rows)?;
     // The title may sit in the block itself (a box with no body row between
     // its title and its options), never under its first option — and
-    // anywhere above it on the screen: a 60-row window lost the title of a
-    // held message taller than that (the harness final review of 2026-09-24,
-    // major), as it had a footed box's.
-    let titled = |i: usize| leading_spaces(&rows[i]) == 1 && is_rule(&rows[i - 1]);
+    // anywhere above it on the screen: a 60-row window loses the title of a
+    // held message taller than that.
+    //
+    // A frame pads its title one column (the permission frame: `Fetch`, `Held
+    // message …`) or two (the Pane, which the proposed goal is drawn in:
+    // MEASURED on 2.1.292, `  Claude proposes a goal` under the same
+    // full-width `─` rule, its dashed brackets and its options at column two):
+    // a title of a kind that may be footerless is read at either, any other
+    // only at column one.
+    let titled = |i: usize| {
+        is_rule(&rows[i - 1])
+            && match leading_spaces(&rows[i]) {
+                1 => true,
+                2 => header_kind(&rows[i]).is_some_and(PromptKind::may_be_footerless),
+                _ => false,
+            }
+    };
     let Some(nearest) = (1..first_option).rev().find(|&i| titled(i)) else {
         // No titled row: the box's head may be off the screen.
         return footerless_head_cut(rows, block_top, first_option, end, last);
     };
-    // The box is the NEAREST titled row's (the harness final review r2 of
-    // 2026-09-24, minor: a setup dialog under an older network box's title
-    // was read with that box's pressable kind). A kind that may be
+    // The box is the NEAREST titled row's (a setup dialog under an older
+    // network box's title must not take that box's pressable kind). A kind that may be
     // footerless is that kind; any other titled dialog is a setup dialog,
     // kind `other` — unless its title is a kind that always draws its footer
     // (a Bash box whose footer is not drawn yet is not read as something
@@ -2106,8 +2443,7 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
     // title is the plan dialog (its second rule, then `Claude has written up
     // a plan …`, anchor `plan.proceed`): that row is the plan's own, titled
     // by the `Ready to code?` above it when that is on the rows read, and by
-    // itself when the plan is taller than them (the harness final review r3
-    // of 2026-09-24, minor: a 40-row tail read it as a setup dialog). An
+    // itself when the plan is taller than them (a 40-row tail). An
     // unknown titled row reads as the plan's too when the next titled row up
     // is `Ready to code?`, whose kind is never pressed.
     let plan_above = || {
@@ -2118,7 +2454,8 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
     };
     let (title, kind) = match header_kind(&rows[nearest]) {
         Some(PromptKind::PlanExit)
-            if rows[nearest].trim() == crate::anchors::anchor_text("plan.proceed") =>
+            if crate::text::trim(&rows[nearest])
+                == const { crate::anchors::anchor_text("plan.proceed") } =>
         {
             (plan_above().unwrap_or(nearest), PromptKind::PlanExit)
         }
@@ -2139,15 +2476,26 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
     }
     // The title belongs to the box, as [`box_top`] requires of a footed box:
     // no column-0 row but a rule — a shell's `% claude`, the banner's
-    // `▝▜██████▀` — between it and the first option (round-3 review: a
-    // table's row in the scrollback was taken for a dialog's title).
-    if rows[title + 1..first_option]
-        .iter()
-        .any(|r| leading_spaces(r) == 0 && !r.trim().is_empty() && !is_rule(r))
-    {
+    // `▝▜██████▀` — between it and the first option (a table's row in the
+    // scrollback is no dialog's title).
+    //
+    // A dialog may bracket its content in dashed `╌` rules at column zero (the
+    // held message's preview, from 2.1.287): Claude Code's own chrome, never a
+    // row of the scrollback, and what the box asks sits under the last of them
+    // — the label and the preview over it are not options.
+    if rows[title + 1..first_option].iter().any(|r| {
+        leading_spaces(r) == 0
+            && !crate::text::trim(r).is_empty()
+            && !is_rule(r)
+            && !is_dashed_rule(r)
+    }) {
         return None;
     }
-    let options_from = block_top.max(title + 1);
+    let bracket_end = rows[title + 1..first_option]
+        .iter()
+        .rposition(|r| is_dashed_rule(r))
+        .map_or(0, |at| title + 2 + at);
+    let options_from = block_top.max(title + 1).max(bracket_end);
     options_of(rows, options_from, end + 1, kind, ARROW)
         .sound
         .then_some(Found {
@@ -2161,8 +2509,7 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
         })
 }
 
-/// 2.1.281'S PLAN APPROVAL (module header; measured — the server read it
-/// `agent=idle` until 2026-09-24, so a supervisor waited on it forever):
+/// 2.1.281'S PLAN APPROVAL (module header; measured):
 /// plan mode's approval drawn two columns in (`Claude has written up a plan
 /// …`, anchor `plan.proceed`, under its own `─` rule), which
 /// [`footerless_box`]'s column-one title does not reach. It replaces the
@@ -2177,19 +2524,19 @@ fn plan_approval(rows: &[String]) -> Option<Found> {
     if has_composer_frame(rows) {
         return None;
     }
-    let proceed = crate::anchor("plan.proceed");
-    let q = rows.iter().rposition(|r| r.trim() == proceed)?;
-    if under_gutter(rows, q) || rows[q].trim_start().starts_with('⎿') {
+    let proceed = const { crate::anchors::anchor_text("plan.proceed") };
+    let q = rows.iter().rposition(|r| crate::text::trim(r) == proceed)?;
+    if under_gutter(rows, q) || crate::text::trim_start(&rows[q]).starts_with('⎿') {
         return None;
     }
-    let first = (q + 1..rows.len()).find(|&i| !rows[i].trim().is_empty())?;
+    let first = (q + 1..rows.len()).find(|&i| !crate::text::trim(&rows[i]).is_empty())?;
     if option_row(&rows[first], ARROW).map(|(n, _)| n) != Some(1) {
         return None;
     }
     let mut last = first;
     let mut hint: Option<usize> = None;
     for (i, r) in rows.iter().enumerate().skip(first + 1) {
-        let t = r.trim();
+        let t = crate::text::trim(r);
         if t.is_empty() {
             continue;
         }
@@ -2203,8 +2550,10 @@ fn plan_approval(rows: &[String]) -> Option<Found> {
             return None;
         }
     }
-    let above = rows[..q].iter().rposition(|r| !r.trim().is_empty())?;
-    let rule = rows[above].trim();
+    let above = rows[..q]
+        .iter()
+        .rposition(|r| !crate::text::trim(r).is_empty())?;
+    let rule = crate::text::trim(&rows[above]);
     (rule.chars().count() >= 10 && rule.chars().all(|c| c == '─')).then_some(())?;
     Some(Found {
         footer: None,
@@ -2251,7 +2600,7 @@ fn model_switch_box(rows: &[String]) -> Option<Found> {
         || header_kind(&rows[title]) != Some(PromptKind::ModelSwitch)
         || rows[title..=last]
             .iter()
-            .any(|r| !r.trim().is_empty() && leading_spaces(r) < col)
+            .any(|r| !crate::text::trim(r).is_empty() && leading_spaces(r) < col)
     {
         return None;
     }
@@ -2274,9 +2623,10 @@ fn model_switch_box(rows: &[String]) -> Option<Found> {
 /// model?`): a full-width row of `▔` (U+2594) from column zero, where a
 /// permission box's rule is `─` — a current notification drawn inside it
 /// (`▔▔▔ <toast> ▔`, 2.1.283's `Xa()`), as [`crate::phase::is_rule`] allows a
-/// label.
-fn is_panel_rule(row: &str) -> bool {
-    let t = row.trim_end();
+/// label. The Settings panel is drawn under the same rule
+/// ([`crate::panel::settings_panel`]).
+pub(crate) fn is_panel_rule(row: &str) -> bool {
+    let t = crate::text::trim_end(row);
     t.starts_with('▔') && t.ends_with('▔') && t.chars().filter(|&c| c == '▔').count() >= 10
 }
 
@@ -2289,11 +2639,8 @@ fn is_panel_rule(row: &str) -> bool {
 /// nowhere on it (a live dialog replaces the composer). Its first visible
 /// row stands for its title, and it is read as kind [`PromptKind::Other`]
 /// (or a question), never a card, so a decider escalates it and a `tail=`
-/// read is taken again whole. Before the harness final review of
-/// 2026-09-24 (major) such a box — a network or Chrome box, a held message
-/// in a short pane or behind a 40-row tail — read as authoritative idle
-/// and the session stalled with no escalation, as a footed one had in
-/// round 3.
+/// read is taken again whole, never authoritative idle (a network or
+/// Chrome box, a held message in a short pane or behind a 40-row tail).
 fn footerless_head_cut(
     rows: &[String],
     block_top: usize,
@@ -2308,7 +2655,7 @@ fn footerless_head_cut(
     {
         return None;
     }
-    let first = (0..=last).find(|&i| !rows[i].trim().is_empty())?;
+    let first = (0..=last).find(|&i| !crate::text::trim(&rows[i]).is_empty())?;
     options_of(rows, block_top, end + 1, PromptKind::Other, ARROW)
         .sound
         .then_some(Found {
@@ -2341,26 +2688,28 @@ struct Block {
 /// <editor> · <plan path>` row ([`is_key_hint_row`]) — and is no part of
 /// Claude's composer: a block whose `❯` row is the composer's caret row,
 /// between the frame's two rules (a placeholder, a suggestion, a typed-ahead
-/// draft), is Claude's own prompt input, not a dialog (the harness round-3
-/// review of 2026-09-24, major: it read an idle or busy screen as a setup
-/// dialog); nor is a block with a full-width rule at or under its first
-/// option, the composer's bottom half whose top rule is not on the rows
-/// read (the final review r2, minor: a draft filling a short pane read as a
-/// box with its head off the screen, a false escalation). No dialog draws a
+/// draft), is Claude's own prompt input, not a dialog; nor is a block with
+/// a full-width rule at or under its first option, the composer's bottom
+/// half whose top rule is not on the rows read (a draft filling a short
+/// pane). No dialog draws a
 /// rule among or under its options.
 fn bottom_block(rows: &[String]) -> Option<Block> {
     use crate::phase::is_rule;
-    let last = rows.iter().rposition(|r| !r.trim().is_empty())?;
+    let last = rows
+        .iter()
+        .rposition(|r| !crate::text::trim(r).is_empty())?;
     let mut end = last;
     if option_row(&rows[end], ARROW).is_none()
         && !pointer_row(&rows[end], ARROW)
         && is_key_hint_row(&rows[end])
     {
-        end = (0..end).rev().find(|&i| !rows[i].trim().is_empty())?;
+        end = (0..end)
+            .rev()
+            .find(|&i| !crate::text::trim(&rows[i]).is_empty())?;
     }
     let top = (0..=end)
         .rev()
-        .take_while(|&i| !rows[i].trim().is_empty())
+        .take_while(|&i| !crate::text::trim(&rows[i]).is_empty())
         .last()?;
     let first_option = (top..=end)
         .find(|&i| option_row(&rows[i], ARROW).is_some() || pointer_row(&rows[i], ARROW))?;
@@ -2390,7 +2739,11 @@ pub(crate) fn footed(rows: &[String], prompt: &PromptV2) -> bool {
 fn is_key_hint_row(row: &str) -> bool {
     crate::phase::leading_spaces(row) <= 3
         && !is_hint_footer(row)
-        && row.trim().split(" · ").next().and_then(hint_item).is_some()
+        && crate::text::trim(row)
+            .split(" · ")
+            .next()
+            .and_then(hint_item)
+            .is_some()
 }
 
 /// A box's footer: the whole row, trimmed, is key hints (`<key> to <verb>`)
@@ -2402,34 +2755,92 @@ fn is_key_hint_row(row: &str) -> bool {
 /// to cancel it …`, a bullet `- Esc to cancel the run`, a grep hit quoting
 /// the words, the busy footer's lowercase `esc to interrupt` and the limit
 /// banner's `· esc to cancel` are not footers.
+///
+/// A subagent's box (2.1.291) ends its footer in a note of its own
+/// ([`agents_note`]), `Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to
+/// stop background agents`, drawn `wrap="truncate"`: in a pane narrower than
+/// the row its last item is cut with a `…`, and that item is left out — the
+/// rest is the footer. Read without either, the box was no box: `idle`, no
+/// answer, the agent waiting on the screen (MEASURED on 2.1.291 and 2.1.292).
 fn is_hint_footer(row: &str) -> bool {
     use crate::phase::leading_spaces;
-    let t = row.trim();
-    if t.is_empty() || leading_spaces(row) > 3 {
+    // An item keyed `Esc` opens `Esc to ` (`hint_item`): a row without those
+    // bytes is no footer, refused before it is split and each item parsed.
+    if leading_spaces(row) > 3 || !crate::text::contains(row, "Esc to ") {
         return false;
     }
-    let items: Vec<Option<(&str, &str)>> = t.split(" · ").map(hint_item).collect();
+    let t = crate::text::trim(row);
+    if t.is_empty() {
+        return false;
+    }
+    let items: Vec<Option<(&str, &str)>> = footer_items(t).into_iter().map(hint_item).collect();
     items.iter().all(Option::is_some) && items.iter().flatten().any(|(key, _)| *key == "Esc")
+}
+
+/// The items of a footer row `t` (trimmed): split on ` · `, the last one left
+/// out when the pane cut it short (it ends in `…`: [`is_hint_footer`]).
+fn footer_items(t: &str) -> Vec<&str> {
+    let mut items: Vec<&str> = t.split(" · ").collect();
+    if items.len() > 1 && items.last().is_some_and(|i| i.ends_with('…')) {
+        items.pop();
+    }
+    items
+}
+
+/// The keys a box's OWN footer offers — `["Esc to cancel", "Tab to amend"]` —
+/// for a caller that decides by what the footer says (`Esc to cancel` alone
+/// is the amend input open): its items less the cut one and the vendor's note
+/// about background agents ([`agents_note`]), which is no key of the box.
+#[must_use]
+pub fn footer_keys(footer: &str) -> Vec<&str> {
+    let mut items = footer_items(crate::text::trim(footer));
+    items.retain(|i| agents_note(i).is_none());
+    items
 }
 
 /// `<key> to <verb>` → `(key, verb)`: a key of one to three words (at most
 /// sixteen characters, each word led by a letter, a digit or an arrow:
 /// `Esc`, `↑/↓`, `ctrl+g`, `Tab/Arrow keys`, `Any key`) and a lowercase verb
-/// of at most six words (`edit in <editor>`).
+/// of at most six words (`edit in <editor>`); or the background agents' note
+/// ([`agents_note`]).
 fn hint_item(item: &str) -> Option<(&str, &str)> {
+    if let Some(note) = agents_note(item) {
+        return Some(note);
+    }
     let (key, verb) = item.split_once(" to ")?;
-    let words = key.split(' ').collect::<Vec<_>>();
-    let key_ok = !key.is_empty()
-        && key.chars().count() <= 16
-        && words.len() <= 3
-        && words.iter().all(|w| {
+    let verb_ok =
+        verb.starts_with(|c: char| c.is_lowercase()) && verb.split_whitespace().count() <= 6;
+    (key_ok(key, 16, 3) && verb_ok).then_some((key, verb))
+}
+
+/// Whether `key` is a hint's key: at most `chars` characters in at most
+/// `words` words, each word led by a letter, a digit or an arrow.
+fn key_ok(key: &str, chars: usize, words: usize) -> bool {
+    !key.is_empty()
+        && key.chars().count() <= chars
+        && key.split(' ').count() <= words
+        && key.split(' ').all(|w| {
             w.chars()
                 .next()
                 .is_some_and(|c| c.is_alphanumeric() || "↑↓←→".contains(c))
-        });
-    let verb_ok =
-        verb.starts_with(|c: char| c.is_lowercase()) && verb.split_whitespace().count() <= 6;
-    (key_ok && verb_ok).then_some((key, verb))
+        })
+}
+
+/// The note 2.1.291 draws last on the footer of a subagent's or a workflow
+/// agent's box (anchors `hint.agents_twice` and `hint.agents_again`): the
+/// user's kill-agents chord and the action joined by ONE SPACE, the vendor's
+/// `terse` form, where every other hint says ` to ` — `ctrl+x ctrl+k twice to
+/// stop background agents`. Read as `(chord, action)`. The vendor's words after
+/// the chord are what names it, so the chord is read loosely: any binding of
+/// up to four words.
+fn agents_note(item: &str) -> Option<(&str, &str)> {
+    use crate::anchors::anchor_text as a;
+    [a("hint.agents_twice"), a("hint.agents_again")]
+        .into_iter()
+        .find_map(|action| {
+            let chord = item.strip_suffix(action)?.strip_suffix(' ')?;
+            key_ok(chord, 40, 4).then_some((chord, action))
+        })
 }
 
 /// Where [`box_top`] found the top of the box above a footer.
@@ -2448,9 +2859,8 @@ enum Top {
 /// (Claude Code 2.1.280 draws one over every box), or under the nearest row
 /// in column 0 — a shell's line, a transcript row — anywhere above it
 /// ([`Top::Under`]); [`Top::ScreenTop`] when there is neither. The walk is
-/// not bounded by a box height since the harness round-3 review of
-/// 2026-09-24 (blocking): a 60-row window stopped inside a tall box's body
-/// and lost the title on screen above it. A box's own rows are
+/// not bounded by a box height: a fixed window stops inside a tall box's
+/// body and loses the title on screen above it. A box's own rows are
 /// indented (its title and options at column one, its content further).
 /// `None` under a `⏺` row, a `⎿` row at Claude's gutter ([`gutter_row`])
 /// or a column-0 `❯` row — the user's
@@ -2461,16 +2871,14 @@ enum Top {
 /// said row's OWN continuation (the rows right under it in column two or
 /// further: a wrapped message, a tool's second output row), so a box under
 /// a blank row below a multi-row `⎿` output is still a box. The user's row
-/// is one of them since the harness round-1 review of 2026-09-24 (blocking):
-/// a manager's task pasting an escalated box quotes it in the user's
+/// is one of them: a manager's task pasting an escalated box quotes it in the user's
 /// continuation column with no rule line, and with only a spinner between
 /// it and the composer for the first seconds of the turn, that quote read
 /// as a live box — which approve-all would press. A frame edge and a
 /// spinner row stop the walk only at column zero or one, where the chrome
-/// draws them, since the round-2 review of the same day (blocking): a
-/// markdown table's `  └──┴──┘`, a `  ╭──╮`, a `  ✻ Cogitating…` or a
-/// `  * …` bullet in the message's own column had ended the walk before the
-/// said row was reached, and the quote under it read as live.
+/// draws them: a markdown table's `  └──┴──┘`, a `  ╭──╮`, a `  ✻
+/// Cogitating…` or a `  * …` bullet in the message's own column would end
+/// the walk before the said row, and the quote under it would read as live.
 fn box_top(rows: &[String], footer: usize) -> Option<Top> {
     use crate::phase::{is_rule, leading_spaces};
     for i in (0..footer).rev() {
@@ -2485,23 +2893,24 @@ fn box_top(rows: &[String], footer: usize) -> Option<Top> {
         }
         // A `⎿` output row is a said row only at Claude's own gutter
         // ([`gutter_row`]); anywhere else it is a box's own row — a proposed
-        // goal's text at column one (the final review r2 of 2026-09-24,
-        // blocking: it started a forged box below the goal's title, and
-        // approve-all pressed it), a heredoc's, a skill's or an option's
-        // description at column three or more (the final review r3,
-        // blocking: the walk stopped inside the box's body and the live box
-        // read as authoritative idle) — and the walk goes on to the box's
-        // rule.
+        // goal's text at column one (else it starts a forged box below the
+        // goal's title), a heredoc's, a skill's or an option's description
+        // at column three or more (else the walk stops inside the box's
+        // body) — and the walk goes on to the box's rule.
         let said = r.starts_with(['⏺', '●', '❯']) || gutter_row(rows, i);
         if said {
             let mut end = i + 1;
-            while end < footer && !rows[end].trim().is_empty() && leading_spaces(&rows[end]) >= 2 {
+            while end < footer
+                && !crate::text::trim(&rows[end]).is_empty()
+                && leading_spaces(&rows[end]) >= 2
+            {
                 end += 1;
             }
             let own_column = rows[end..=footer]
                 .iter()
-                .any(|r| !r.trim().is_empty() && leading_spaces(r) < 2);
-            return (rows[end].trim().is_empty() && own_column).then_some(Top::Under(end));
+                .any(|r| !crate::text::trim(r).is_empty() && leading_spaces(r) < 2);
+            return (crate::text::trim(&rows[end]).is_empty() && own_column)
+                .then_some(Top::Under(end));
         }
         if r.starts_with(|c: char| c.is_alphanumeric() || matches!(c, '$' | '%' | '>')) {
             return Some(Top::Under(i + 1));
@@ -2517,18 +2926,17 @@ fn box_top(rows: &[String], footer: usize) -> Option<Top> {
 /// row scrolled off) is non-blank and indented two or more. A `⎿` a box
 /// draws in its body — a heredoc writing a transcript, a skill's or an
 /// option's description, a proposed goal's text — is at another column or
-/// under a blank row, and is no said row (the harness final review r3 of
-/// 2026-09-24, blocking).
+/// under a blank row, and is no said row.
 fn gutter_row(rows: &[String], i: usize) -> bool {
     use crate::phase::leading_spaces;
-    if leading_spaces(&rows[i]) != 2 || !rows[i].trim_start().starts_with('⎿') {
+    if leading_spaces(&rows[i]) != 2 || !crate::text::trim_start(&rows[i]).starts_with('⎿') {
         return false;
     }
     for r in rows[..i].iter().rev() {
         if r.starts_with(['⏺', '●', '❯']) {
             return true;
         }
-        if r.trim().is_empty() || leading_spaces(r) < 2 {
+        if crate::text::trim(r).is_empty() || leading_spaces(r) < 2 {
             return false;
         }
     }
@@ -2538,10 +2946,10 @@ fn gutter_row(rows: &[String], i: usize) -> bool {
 /// A closed frame's top or bottom edge above a box (`╭───╮`, `╰───╯`): only
 /// box-drawing characters, led by a corner. Never the indented `────`
 /// separator inside a question dialog, which is the box's own row, and never
-/// a bare `│` continuation row. Upstream's round-25 test pins it: a box under
-/// a closed frame starts below the frame's edge, not on it.
+/// a bare `│` continuation row. A box under a closed frame starts below the
+/// frame's edge, not on it.
 fn is_frame_edge(row: &str) -> bool {
-    let t = row.trim();
+    let t = crate::text::trim(row);
     t.starts_with(['╭', '╰', '┌', '└'])
         && t.chars()
             .all(|c| ('\u{2500}'..='\u{257F}').contains(&c) || c == ' ')
@@ -2555,14 +2963,14 @@ fn is_frame_edge(row: &str) -> bool {
 /// indented five or more reaches a `⎿` row.
 fn under_gutter(rows: &[String], footer: usize) -> bool {
     use crate::phase::leading_spaces;
-    if rows[footer].trim_start().starts_with('⎿') {
+    if crate::text::trim_start(&rows[footer]).starts_with('⎿') {
         return true;
     }
     if leading_spaces(&rows[footer]) < 5 {
         return false;
     }
     for row in rows[..footer].iter().rev() {
-        let t = row.trim_start();
+        let t = crate::text::trim_start(row);
         if t.starts_with('⎿') {
             return true;
         }
@@ -2597,7 +3005,7 @@ fn said_under(rows: &[String], footer: usize) -> bool {
 /// title with a suffix the grammar does not know is no box aterm names.
 fn header_kind(row: &str) -> Option<PromptKind> {
     use crate::anchors::anchor_text as a;
-    let t = row.trim();
+    let t = without_position(crate::text::trim(row));
     if t.starts_with(a("box.bash")) {
         return Some(PromptKind::Bash);
     } else if t.starts_with(a("box.edit")) {
@@ -2658,26 +3066,32 @@ fn header_kind(row: &str) -> Option<PromptKind> {
 /// `❯ 1. Yes` / `  2. No` → `(1, "Yes")`, the cursor one of `cur`
 /// ([`cursors`]).
 fn option_row(row: &str, cur: &[char]) -> Option<(u8, String)> {
-    let t = row.trim_start();
-    let t = strip_cursor(t, cur).map(str::trim_start).unwrap_or(t);
-    let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() || digits.len() > 2 {
+    let t = crate::text::trim_start(row);
+    let t = strip_cursor(t, cur)
+        .map(crate::text::trim_start)
+        .unwrap_or(t);
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || digits > 2 {
         return None;
     }
-    let rest = t[digits.len()..].strip_prefix('.')?;
+    let rest = t[digits..].strip_prefix('.')?;
     if !rest.starts_with(' ') {
         return None;
     }
-    Some((digits.parse().ok()?, rest.trim().to_string()))
+    Some((
+        t[..digits].parse().ok()?,
+        crate::text::trim(rest).to_string(),
+    ))
 }
 
 /// An unnumbered option under the cursor: `❯ No, exit` at the box's own
 /// column (the trust dialog, 2.1.280), the cursor one of `cur`.
 fn pointer_row(row: &str, cur: &[char]) -> bool {
     use crate::phase::leading_spaces;
-    let t = row.trim_start();
+    let t = crate::text::trim_start(row);
     leading_spaces(row) <= 3
-        && strip_cursor(t, cur).is_some_and(|rest| rest.starts_with(' ') && !rest.trim().is_empty())
+        && strip_cursor(t, cur)
+            .is_some_and(|rest| rest.starts_with(' ') && !crate::text::trim(rest).is_empty())
 }
 
 /// The cursor every measured box draws, `❯` ([`cursors`] of any title but
@@ -2688,7 +3102,7 @@ const ARROW: &[char] = &['❯'];
 /// CURSOR"): `❯`, the vendor's `X.pointer`, on every box; `›` as well only
 /// in a box titled the usage-limit dialog's question.
 fn cursors(title: &str) -> &'static [char] {
-    if title == crate::anchors::anchor_text("limit.title") {
+    if title == const { crate::anchors::anchor_text("limit.title") } {
         &['❯', '›']
     } else {
         ARROW
@@ -2698,7 +3112,46 @@ fn cursors(title: &str) -> &'static [char] {
 /// `t` after the selection cursor it starts with, one of `cur`
 /// ([`cursors`]); `None` when it starts with none of them.
 fn strip_cursor<'a>(t: &'a str, cur: &[char]) -> Option<&'a str> {
-    t.strip_prefix(cur)
+    // `t.strip_prefix(cur)`: one char stripped when it is any of `cur`, each
+    // tried as a single char rather than through a char-set searcher.
+    cur.iter().find_map(|&c| t.strip_prefix(c))
+}
+
+/// The words by which an answer says it is KEPT — it settles every later ask
+/// of its kind, not this one — lowercased, `’` read as `'`. Read in the
+/// 2.1.287 bundle and the measured boxes: `don't ask` (`Yes, and don't ask
+/// again for: git log *`, the upsells' `Don't ask again`, the resume picker's
+/// `Don't ask me again`), `keep allowing` and `from now on` (the read-outside
+/// dialog's `Yes, and keep allowing any reads …` and `No, and block reads …
+/// from now on`; 2.1.282's `Yes, keep allowing reads …`), `always allow`
+/// (`Yes, and always allow access to <dir> from this project`), `from this
+/// project` (2.1.287's read box: `Yes, allow reading from <dir> from this
+/// project`, a grant that stays with the project), `remember
+/// this` (`Yes, and remember this directory`), `without asking` (the model
+/// switch's `Continue on <m> now, and switch without asking from now on`),
+/// `never show` (Codex's `Keep current model (never show again)`). `next
+/// time` is no such word: `No, and ask again next time` settles nothing.
+const KEPT: &[&str] = &[
+    "don't ask",
+    "do not ask",
+    "never ask",
+    "keep allowing",
+    "always allow",
+    "from now on",
+    "remember this",
+    "without asking",
+    "never show",
+    "from this project",
+];
+
+/// Whether `text` — an option's label, or a question option's label and
+/// description — says its answer is kept for every later ask ([`KEPT`]): a
+/// standing grant, or a standing refusal. No automatic press chooses one: it
+/// would rewrite the agent's own settings, which no one asked for.
+#[must_use]
+pub fn settles_later(text: &str) -> bool {
+    let t = text.replace('’', "'").to_lowercase();
+    KEPT.iter().any(|w| t.contains(w))
 }
 
 /// Whether `label` is the usage-limit dialog's wait row, in any of the three
@@ -2711,7 +3164,7 @@ fn strip_cursor<'a>(t: &'a str, cur: &[char]) -> Option<&'a str> {
 pub fn is_wait_label(label: &str) -> bool {
     let Some(rest) = label
         .trim()
-        .strip_prefix(crate::anchors::anchor_text("limit.wait"))
+        .strip_prefix(const { crate::anchors::anchor_text("limit.wait") })
     else {
         return false;
     };
@@ -2719,7 +3172,7 @@ pub fn is_wait_label(label: &str) -> bool {
         || rest == " when the limit resets"
         || rest
             .strip_prefix(" at ")
-            .is_some_and(|time| !time.trim().is_empty())
+            .is_some_and(|time| !crate::text::trim(time).is_empty())
 }
 
 /// Whether a row label is one only the usage-limit menu draws (module
@@ -2731,16 +3184,16 @@ pub fn is_wait_label(label: &str) -> bool {
 /// trial-expired dialog offers `Upgrade to Max` and `Add funds to continue
 /// with usage credits`), and `Stop` alone is any dialog's word.
 fn is_limit_menu_label(label: &str) -> bool {
-    let l = label.trim().replace('’', "'");
+    let l = crate::text::trim(label).replace('’', "'");
     is_wait_label(&l)
-        || l == crate::anchors::anchor_text("limit.stop")
+        || l == const { crate::anchors::anchor_text("limit.stop") }
         || l == "Don't continue automatically"
 }
 
 /// Whether a box titled `title` with `options` is the usage-limit dialog:
 /// the title is its question and an option is one only its menu draws.
 fn usage_limit_menu(title: &str, options: &[Opt]) -> bool {
-    title == crate::anchors::anchor_text("limit.title")
+    title == const { crate::anchors::anchor_text("limit.title") }
         && options.iter().any(|o| is_limit_menu_label(&o.label))
 }
 
@@ -2756,13 +3209,21 @@ fn question_row(row: &str, kind: PromptKind) -> bool {
     } else {
         2
     };
-    crate::phase::leading_spaces(row) <= most && row.trim_start().starts_with("Do you want")
+    crate::phase::leading_spaces(row) <= most && asks(row)
+}
+
+/// Whether `row` opens with a box question's head (`Do you want …`), at any
+/// column: the words every tool box asks in, for a caller that checks a
+/// box's rows itself.
+#[must_use]
+pub fn asks(row: &str) -> bool {
+    crate::text::trim_start(row).starts_with("Do you want")
 }
 
 /// A divider drawn among a dialog's options (the question dialog draws one
 /// over `Chat about this`, per the 2.1.280 binary): `─` and nothing else.
 fn divider_row(row: &str) -> bool {
-    let t = row.trim();
+    let t = crate::text::trim(row);
     t.chars().count() >= 3 && t.chars().all(|c| c == '─')
 }
 
@@ -2792,13 +3253,13 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[
                 n: Some(n),
                 label,
                 role: Role::Other,
-                focused: strip_cursor(r.trim_start(), cur).is_some(),
+                focused: strip_cursor(crate::text::trim_start(r), cur).is_some(),
                 row: i,
             });
             number_col = r.chars().position(|c| c.is_ascii_digit());
             continue;
         }
-        let t = r.trim();
+        let t = crate::text::trim(r);
         match (number_col, out.last_mut()) {
             // A question dialog's answer and a plan approval's option carry
             // a description on the rows under them (and a multi-select
@@ -2827,8 +3288,8 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[
         // Unnumbered: the last block above the footer, if it holds the cursor.
         let block: Vec<usize> = (start..to)
             .rev()
-            .skip_while(|&i| rows[i].trim().is_empty())
-            .take_while(|&i| !rows[i].trim().is_empty())
+            .skip_while(|&i| crate::text::trim(&rows[i]).is_empty())
+            .take_while(|&i| !crate::text::trim(&rows[i]).is_empty())
             .collect();
         match block.last() {
             Some(&top) if block.iter().any(|&j| pointer_row(&rows[j], cur)) => {
@@ -2837,7 +3298,7 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[
                     .rev()
                     .filter(|&&i| !divider_row(&rows[i]))
                     .map(|&i| {
-                        let t = rows[i].trim();
+                        let t = crate::text::trim(&rows[i]);
                         Opt {
                             n: None,
                             label: strip_cursor(t, cur).unwrap_or(t).trim().to_string(),
@@ -2886,9 +3347,13 @@ struct Options {
 /// now`, `Never mind`); `Allow … for this session` / `Allow for this session
 /// (…)` are session grants, and a bare `Allow` is the one-shot allow of
 /// Chrome's box ONLY; a `Yes` that enters plan mode, keeps edits manual or
-/// clears the context switches the mode; `Yes, keep allowing reads outside
-/// the working directories` settles a setting for good. A label the table
-/// does not know is [`Role::Other`].
+/// clears the context switches the mode. An answer kept for every later ask
+/// ([`settles_later`], or the word `always`) is a [`Role::Persist`], yes or
+/// no: 2.1.287's read-outside dialog offers `Yes, and keep allowing any reads
+/// outside the working directories` and `No, and block reads outside the
+/// working directories from now on` beside `No, and ask again next time` (a
+/// refusal) and `Yes, but ask again next time` (its one-shot allow). A label
+/// the table does not know is [`Role::Other`].
 fn role_of(label: &str, kind: PromptKind) -> Role {
     if kind == PromptKind::UsageLimit {
         // The wait row, and nothing else: the stop row stops, and every
@@ -2901,21 +3366,26 @@ fn role_of(label: &str, kind: PromptKind) -> Role {
     }
     let l = label.replace('’', "'").to_lowercase();
     let l = l
-        .strip_suffix(crate::anchors::anchor_text("option.esc"))
+        .strip_suffix(const { crate::anchors::anchor_text("option.esc") })
         .unwrap_or(&l)
         .trim_end();
     let no = l == "no" || l.starts_with("no,") || l.starts_with("no ");
     // A dialog's dismissal that settles nothing: `Not now` (a proposed goal,
     // the Chrome upsell), `Never mind` (Remote Control).
     let dismiss = l == "not now" || l == "never mind";
+    let always = l
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == "always");
     if l.starts_with("no, exit") || l == "exit" || l == "quit" {
         Role::Exit
+    } else if settles_later(l) || always {
+        Role::Persist
     } else if no || dismiss || l.starts_with("deny") {
         Role::Deny
     } else if kind == PromptKind::Trust && l.starts_with("yes, i trust this folder") {
         Role::Trust
     } else if kind == PromptKind::ModelSwitch
-        && l.starts_with(&crate::anchors::anchor_text("model_switch.yes").to_lowercase())
+        && l.starts_with(&const { crate::anchors::anchor_text("model_switch.yes") }.to_lowercase())
     {
         // `Yes, switch to Sonnet 5` confirms the one change the person typed:
         // no permission mode and no tool grant — not the mode switch its
@@ -2946,14 +3416,13 @@ fn role_of(label: &str, kind: PromptKind) -> Role {
     .any(|k| l.contains(k))
     {
         Role::ModeSwitch
-    } else if l.contains("don't ask again")
-        || l.contains("always allow")
-        || l.starts_with("yes, keep allowing")
-    {
-        Role::Persist
     } else if l.contains("this session") {
         Role::Session
-    } else if l == "yes" || l == "yes, proceed" || l == "yes, run it" {
+    } else if l == "yes"
+        || l == "yes, proceed"
+        || l == "yes, run it"
+        || l == "yes, but ask again next time"
+    {
         Role::Once
     } else {
         Role::Other
@@ -2977,7 +3446,7 @@ fn cancel_of(footer: &str, kind: PromptKind, options: &[Opt]) -> Option<Cancel> 
     let v = verb.to_lowercase();
     let backstop = options
         .iter()
-        .any(|o| o.label == crate::anchors::anchor_text("trust.no_backstop"));
+        .any(|o| o.label == const { crate::anchors::anchor_text("trust.no_backstop") });
     let effect = if kind == PromptKind::Trust {
         if backstop {
             CancelEffect::Reject
@@ -3006,10 +3475,12 @@ fn cancel_of(footer: &str, kind: PromptKind, options: &[Opt]) -> Option<Cancel> 
 /// the effect — a refusal ([`Role::Deny`]) rejects, [`Role::Exit`] exits,
 /// anything else (unsound options included) backs out. `None` without one.
 fn esc_cancel(options: &[Opt]) -> Option<Cancel> {
-    let marker = crate::anchors::anchor_text("option.esc");
-    let (opt, verb) = options
-        .iter()
-        .find_map(|o| o.label.strip_suffix(marker).map(|v| (o, v.trim_end())))?;
+    let marker = const { crate::anchors::anchor_text("option.esc") };
+    let (opt, verb) = options.iter().find_map(|o| {
+        o.label
+            .strip_suffix(marker)
+            .map(|v| (o, crate::text::trim_end(v)))
+    })?;
     Some(Cancel {
         key: "Esc".to_string(),
         verb: verb.to_string(),
@@ -3087,6 +3558,41 @@ pub mod fixtures {
     /// the hidden cursor on row 17 — above them.
     pub const TRUST_FRESH_PANE_TAIL40: &str =
         include_str!("fixtures/claude-2.1.283-trust-fresh-pane-tail40.out");
+    /// Claude Code 2.1.283, LIVE (2026-09-27, a private headless aterm at
+    /// 150x50, main 9d1ce4862): `/exit` of an idle session, then a fresh
+    /// `claude` at the returned prompt with no `clear`. The DEAD process's
+    /// last frame — its `/exit` spinner (`· Flibbertigibbeting…`), a `⎿
+    /// Tip:`, its composer frame and its `esc to interrupt` footer — stands
+    /// above the new launch card and idle composer; `status` published
+    /// `agent=busy` (`reason status row: spinner`) for 2+ minutes.
+    pub const EXIT_RELAUNCH_STALE_FOOTER: &str =
+        include_str!("fixtures/claude-2.1.283-exit-relaunch-stale-footer.txt");
+    /// The session of [`EXIT_RELAUNCH_STALE_FOOTER`] asked for a question
+    /// dialog: live at the foot, the dead footer's `esc to interrupt` still
+    /// on the screen above the new launch card.
+    pub const EXIT_RELAUNCH_STALE_FOOTER_QUESTION: &str =
+        include_str!("fixtures/claude-2.1.283-exit-relaunch-stale-question.txt");
+    /// Claude Code 2.1.283, LIVE (2026-09-27, the same relaunch run again):
+    /// the new session two seconds into its first turn — its own spinner,
+    /// frame and `esc to interrupt` footer at the foot, and the DEAD
+    /// process's `esc to interrupt` footer still above the new launch card.
+    /// Two busy footers on one screen; only the lower is a running turn's.
+    pub const EXIT_RELAUNCH_STALE_FOOTER_BUSY: &str =
+        include_str!("fixtures/claude-2.1.283-exit-relaunch-stale-busy.txt");
+    /// The turn of [`EXIT_RELAUNCH_STALE_FOOTER_BUSY`] three seconds on: an
+    /// AskUserQuestion dialog of two questions where the live frame was, the
+    /// dead footer still above the new launch card. The hosted loop keyed its
+    /// first tab ~40 s after it was drawn, each later tab ~22 s apart: its
+    /// whole-screen `await gone esc.to.interrupt` waited on the dead footer.
+    pub const EXIT_RELAUNCH_STALE_FOOTER_QUESTION2: &str =
+        include_str!("fixtures/claude-2.1.283-exit-relaunch-stale-question2.txt");
+    /// Claude Code 2.1.283, LIVE (2026-09-27, the same pane): a session whose
+    /// last turn ended on a question, left by Ctrl-C twice, then a fresh
+    /// `claude` with no `clear`. The dead done row and idle frame stand
+    /// above the new launch card; `status` published `agent=question` — the
+    /// dead session's last words — for the brand-new idle session.
+    pub const CTRLC_RELAUNCH_STALE_QUESTION: &str =
+        include_str!("fixtures/claude-2.1.283-ctrlc-relaunch-stale-question.txt");
     /// Claude Code 2.1.283, LIVE (2026-09-26, the same 149x62 pane): a
     /// `general-purpose` subagent's Bash box with the rm circuit breaker's
     /// possibly-empty-variable note, on rows 22-40 of 62 — inside a 40-row
@@ -3104,6 +3610,16 @@ pub mod fixtures {
     /// draws (`ge`/`Do`, its provenance line).
     pub const LIMIT_OPTIONS_DIALOG: &str =
         include_str!("fixtures/claude-2.1.282-usage-limit-dialog.txt");
+    /// HAND-BUILT from the window supervisor's ledger of 2026-09-27 (Claude
+    /// Code 2.1.287's frame, its provenance line): the usage-limit options
+    /// dialog in the FULLSCREEN renderer's bottom panel — under the panel's
+    /// `▔` rule (here carrying the `You've used 96% of your weekly limit`
+    /// toast), its title three columns in, `❯ 1. Stop and wait for limit to
+    /// reset`, `2. Wait here, then continue automatically at Oct 2 at 5am`,
+    /// `3. Switch to usage credits`. Escalated five times as `nothing that
+    /// waits`, its head read as off the screen.
+    pub const LIMIT_OPTIONS_PANEL: &str =
+        include_str!("fixtures/claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt");
     /// codex 0.156.1: its folder-trust gate (Codex's screens are
     /// [`crate::codex::fixtures`]).
     pub use crate::codex::fixtures::TRUST as CODEX_TRUST;
@@ -3130,11 +3646,25 @@ pub mod fixtures {
     pub const API_ERROR_ENOTFOUND_MEASURED: &str =
         include_str!("fixtures/claude-2.1.283-api-error-enotfound-measured.txt");
     /// MEASURED on Claude Code 2.1.284 (2026-09-28): a SHORT transcript in a
-    /// TALL pane. The error is on row 8 and the composer pinned on rows
-    /// 45-47 with 36 blank rows between, so the error lies more than 40 rows
-    /// above the last drawn row — outside the live zone as it was cut then.
+    /// TALL pane. The error is on row 8, the turn's done row on row 10 and
+    /// the composer pinned on rows 46-48 (its footer on row 49) with 35 blank
+    /// rows between, so the error lies 41 rows above the last drawn row —
+    /// outside the live zone as it was cut then.
     pub const API_ERROR_TALL_PANE_MEASURED: &str =
         include_str!("fixtures/claude-2.1.284-api-error-tall-pane-measured.txt");
+    /// MEASURED on Claude Code 2.1.286 (2026-10-01): the session-survey card
+    /// after a first turn, in a 144x53 pane (the rows end at the last drawn
+    /// row; the 35 blank rows under them are not saved). The card is on rows
+    /// 11-12 and the composer's top rule on row 14, so a 40-row tail of the
+    /// pane starts at row 13: the composer in it, the card above it.
+    pub const SURVEY_CARD_ABOVE_THE_TAIL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-survey-card-above-the-tail-144x53.txt");
+    /// MEASURED on Claude Code 2.1.286 (2026-10-01): what a rating card leaves when
+    /// a person's key lands in the ~0.44 s the harness's `0` spends pending in the
+    /// composer. The card is gone — abandoned by the key, not dismissed — and the
+    /// `0` heads the person's text (`❯ 0hello`).
+    pub const SURVEY_RACE_0HELLO_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-survey-race-0hello-measured.txt");
     /// MEASURED on 2.1.284 (2026-09-28): the first idle frame on a fresh
     /// config, auto mode. The mode row carries `◐ medium · /effort`
     /// right-aligned beside the pill (gone after the first turn) — the tail
@@ -3142,16 +3672,9 @@ pub mod fixtures {
     /// drift canary reads it.
     pub const FOOTER_AUTO_EFFORT_HINT_MEASURED: &str =
         include_str!("fixtures/claude-2.1.284-footer-auto-effort-hint-measured.txt");
-    /// MEASURED on 2.1.284 (2026-09-28): `/fast on` submitted MID-RETRY at
-    /// 144 columns, the composer directly under a short transcript. The
-    /// refusal is a notification on the row BELOW the mode row (under the
-    /// composer), right-aligned — where the 80-column capture
-    /// ([`FAST_REFUSED_BUSY_80_MEASURED`]) had it above the composer's top
-    /// rule. `fast_answers` reads both.
-    pub const FAST_REFUSED_BUSY_UNDER_COMPOSER_MEASURED: &str =
-        include_str!("fixtures/claude-2.1.284-fast-refused-busy-under-composer-measured.txt");
-    /// The same screen after `resize 50 80`: `(ENOTFOUND)` wrapped onto a
-    /// second row at column 2, as [`API_ERROR_ENOTFOUND_80`] assumed.
+    /// [`API_ERROR_ENOTFOUND_MEASURED`]'s screen after `resize 50 80`:
+    /// `(ENOTFOUND)` wrapped onto a second row at column 2, as
+    /// [`API_ERROR_ENOTFOUND_80`] assumed.
     pub const API_ERROR_ENOTFOUND_80_MEASURED: &str =
         include_str!("fixtures/claude-2.1.283-api-error-enotfound-80col-measured.txt");
     /// MID-RETRY (the default ten retries): no `⏺` row yet — the spinner row
@@ -3187,32 +3710,74 @@ pub mod fixtures {
     /// the last the turn's end (`✻ Worked for 3m 2s · done <time>`).
     pub const API_ERROR_TWICE_MEASURED: &str =
         include_str!("fixtures/claude-2.1.283-api-error-twice-measured.txt");
-    /// Claude Code 2.1.283's answer to `/fast on` at idle, MEASURED on the
-    /// same scratch session (2026-09-27): the echo `❯ /fast on` and the
-    /// refusal on the `⎿` row right under it, no blank row between —
-    /// `Fast mode unavailable: Fast mode unavailable due to network
-    /// connectivity issues`, the vendor's prefix over its own reason.
-    pub const FAST_REFUSED_IDLE_MEASURED: &str =
-        include_str!("fixtures/claude-2.1.283-fast-refused-idle-measured.txt");
-    /// The idle refusal at 80 columns: `issues` wrapped onto a row at column 5.
-    pub const FAST_REFUSED_IDLE_80_MEASURED: &str =
-        include_str!("fixtures/claude-2.1.283-fast-refused-idle-80col-measured.txt");
-    /// The same `/fast on` submitted MID-TURN (mid-retry): no echo — the
-    /// refusal is a notification on the row directly ABOVE the composer's top
-    /// rule (not under the composer), for about 8 s. THIS capture was read
-    /// after it had gone: the control, no notice up.
-    pub const FAST_REFUSED_BUSY_MEASURED: &str =
-        include_str!("fixtures/claude-2.1.283-fast-refused-busy-measured.txt");
-    /// The mid-turn notification at 80 columns: from column 2, cut to fit
-    /// (`… network connectivity is…`).
-    pub const FAST_REFUSED_BUSY_80_MEASURED: &str =
-        include_str!("fixtures/claude-2.1.283-fast-refused-busy-80col-measured.txt");
-    /// Plan mode (`⏸ plan mode on (shift+tab to cycle) · ← for agents`),
-    /// idle, on an API-key account at medium effort: no effort tag on the
-    /// composer's top rule. A footer screen, so the lights' drift canary
-    /// reads it with the rest of the corpus.
-    pub const FOOTER_PLAN_API_KEY_MEASURED: &str =
-        include_str!("fixtures/claude-2.1.283-footer-plan-api-key-measured.txt");
+
+    // Claude Code 2.1.286 and a full context, MEASURED 2026-10-01 (`aterm ctl
+    // text` of a private headless aterm against a local stub of the API; each
+    // file's line 1 names its capture). A `/compact` that FAILS leaves a `⎿`
+    // row of its own under its `❯ /compact` echo and no done row: the full
+    // context's row is history above the echo, and a few failures later it
+    // has scrolled off a short pane.
+
+    /// A turn the stub answered with `prompt is too long`: the wall's row
+    /// under the `❯` echo's gutter (a no-break space after `⎿ `), the done
+    /// row under it.
+    pub const CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-wall-context-too-long-turn.txt");
+    /// The first `/compact` after it failed: `⎿  Compaction failed ·
+    /// conversation could not be reduced below the context limit`.
+    pub const COMPACT_FAILED_FIRST_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-compact-failed-first.txt");
+    /// A wall in a session that had one successful `/compact` already — the
+    /// start of a series of failed ones typed by hand under it, nothing
+    /// between them ([`COMPACT_FAILED_1_MEASURED`] and the two after it).
+    pub const CONTEXT_WALL_AFTER_COMPACT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-wall-context-after-compact-succeeded.txt");
+    /// [`CONTEXT_WALL_AFTER_COMPACT_MEASURED`] after its first failed `/compact`.
+    pub const COMPACT_FAILED_1_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-manual-compact-failed-x1.txt");
+    /// The same after its second failed `/compact`.
+    pub const COMPACT_FAILED_2_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-manual-compact-failed-x2.txt");
+    /// The same after its third (the capture went on to six).
+    pub const COMPACT_FAILED_3_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-manual-compact-failed-x3.txt");
+    /// A `/compact` that worked: `⎿  Compacted (ctrl+o to see full summary)`,
+    /// no done row after it.
+    pub const COMPACT_SUCCEEDED_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-compact-succeeded.txt");
+    /// A `/compact` whose request is in flight: `❯ /compact` over `✳ Compacting
+    /// conversation… (0s)`, `esc to interrupt` in the footer — read busy, and no
+    /// wall (the full context's row is history above).
+    pub const COMPACT_RUNNING_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-compact-running.txt");
+    /// A `/compact` whose own request failed with a 500: `⎿  Error during
+    /// compaction: API Error: 500 …`, wrapped onto a second row.
+    pub const COMPACT_ERROR_500_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-compact-error-during-500.txt");
+    /// A person's `/compact` on a chat with nothing to summarise: `⎿  Not
+    /// enough messages to compact.` — no wall.
+    pub const COMPACT_NOT_ENOUGH_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.286-compact-not-enough-messages.txt");
+    /// MEASURED on Claude Code 2.1.292 (2026-10-06): the full-context wall the
+    /// moment after the loop typed `/compact`. In 2.1.291 and 2.1.292 the slash menu
+    /// opens under the composer's bottom rule and its highlighted entry carries
+    /// the Select's pointer — `  ❯ /compact …` over `    /autocompact …`, every
+    /// entry indented (2.1.287 drew them with no pointer). That row is the
+    /// screen's last `❯` row: it was read as the composer, the frame was gone
+    /// with it, and so was the wall (`agent=unknown`).
+    pub const CONTEXT_WALL_COMPACT_MENU_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.292-wall-context-compact-menu.txt");
+    /// MEASURED on 2.1.292: `/mod` typed and the menu's pointer moved down
+    /// twice, onto the third entry, under two whose descriptions wrap.
+    pub const SLASH_MENU_POINTER_DOWN_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.292-slash-menu-pointer-down.txt");
+    /// MEASURED on 2.1.292 (2026-10-06): auto mode's CLASSIFIER-BILLING NOTICE
+    /// behind a gateway — four paragraphs and `Enter to continue · Esc to
+    /// cancel` under ONE rule, over the pending `⏺ Bash(…)` row: no options and
+    /// no composer frame, so it reads `idle` without evidence (`agent=unknown`)
+    /// and no reader names it. What the loop's dialog canary stands on.
+    pub const AUTO_CLASSIFIER_BILLING_NOTICE_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.292-auto-classifier-billing-notice.txt");
     /// HAND-BUILT: the same turn ending on the session limit.
     pub const END_SESSION_LIMIT: &str =
         include_str!("fixtures/hand-built-session-limit-end-of-turn.txt");
@@ -3302,6 +3867,125 @@ pub mod fixtures {
     /// The generic tool box in CARD mode: titled by its card's question
     /// (` Create an issue in alabsystems/aterm?`), no `Do you want …` row.
     pub const BOX_TOOL_CARD: &str = include_str!("fixtures/claude-2.1.282-box-tool-card.txt");
+    // MEASURED on Claude Code 2.1.287 (2026-10-01; tools/real-claude-lab's
+    // `tool` mode drives each box on the real binary). 2.1.287 draws a tool's
+    // own content between two dashed `╌` rules (module header, "THE BRACKETED
+    // BOX"): over them the dialog's subtitle (`Tip: …`) and the description,
+    // between them the command at column ONE, under them the explanation
+    // block (the reason the box asks), then the question.
+
+    /// An ordinary Bash box in manual mode: `Tip: auto mode …`, the model's
+    /// description `ls`, and under the dashed rules the command it is NOT:
+    /// `rm -rf ./lab-doomed`.
+    pub const BOX_BASH_2_1_287: &str = include_str!("fixtures/claude-2.1.287-box-bash-default.txt");
+    /// A Bash box a BACKGROUND subagent raised, MEASURED on 2.1.292 (module
+    /// header, "A SUBAGENT'S BOX"): the box of [`BOX_BASH_2_1_287`]'s
+    /// shape, its title `Bash command · from the general-purpose agent`, and on
+    /// its footer the note `ctrl+x ctrl+k twice to stop background agents`.
+    pub const BOX_BASH_BACKGROUND_AGENT_2_1_292: &str =
+        include_str!("fixtures/claude-2.1.292-box-bash-background-agent.txt");
+    /// Two background subagents' boxes stacked (`1 of 2` on the title row) in a
+    /// 72-column pane, MEASURED on 2.1.292: the note on the footer is cut by the
+    /// pane, `… · ctrl+x ctrl+k twice to stop background…`.
+    pub const BOX_BASH_BACKGROUND_AGENT_STACKED_2_1_292: &str =
+        include_str!("fixtures/claude-2.1.292-box-bash-background-agent-stacked-72col.txt");
+    /// The owner's 2026-09-26 subagent rm box re-driven on 2.1.292 (a
+    /// background agent's `SP=<dir>; rm -f $SP/cast0.txt $SP/*.log`): 2.1.285
+    /// said `Dangerous rm operation on possibly-empty variable path`, 2.1.292
+    /// `Glob patterns are not allowed in write operations. …`.
+    pub const BOX_BASH_RM_GLOB_SUBAGENT_2_1_292: &str =
+        include_str!("fixtures/claude-2.1.292-box-bash-rm-glob-subagent.txt");
+    /// The same agent's rm of an unset variable, no glob, on 2.1.292: `A
+    /// variable in this command can't be checked before it runs`.
+    pub const BOX_BASH_RM_EMPTY_VAR_SUBAGENT_2_1_292: &str =
+        include_str!("fixtures/claude-2.1.292-box-bash-rm-empty-var-subagent.txt");
+    /// A ` Read file` box for a path outside the project, MEASURED on 2.1.292:
+    /// no description row, the call `Read(/etc/hosts)` between two dashed
+    /// rules, and option 2 allowing reads of `/etc` for the session.
+    pub const BOX_READ_OUTSIDE_2_1_292: &str =
+        include_str!("fixtures/claude-2.1.292-box-read-outside.txt");
+    /// The same box on 2.1.284, MEASURED: no dashed rules, the call alone at
+    /// column two between blank rows.
+    pub const BOX_READ_OUTSIDE_2_1_284: &str =
+        include_str!("fixtures/claude-2.1.284-box-read-outside.txt");
+    /// A Read of a file INSIDE the project that the owner's ask rule forces,
+    /// MEASURED on 2.1.292 in default mode: no reason drawn, and no folder
+    /// grant (`Yes, allow reading from …`, which Claude Code draws on every
+    /// Read box for a folder outside its working set): option 2 is the
+    /// accept-edits switch.
+    pub const BOX_READ_FORCED_2_1_292: &str =
+        include_str!("fixtures/claude-2.1.292-box-read-inproject-ask-rule.txt");
+    /// The same box in accept-edits mode, MEASURED: `Yes` / `No`.
+    pub const BOX_READ_FORCED_ACCEPT_EDITS_2_1_292: &str =
+        include_str!("fixtures/claude-2.1.292-box-read-inproject-ask-rule-acceptedits.txt");
+    /// The same box on 2.1.284, MEASURED, default mode.
+    pub const BOX_READ_FORCED_2_1_284: &str =
+        include_str!("fixtures/claude-2.1.284-box-read-inproject-ask-rule.txt");
+    /// A box for a read-only command Claude Code still asks about (`wc -l
+    /// /etc/hosts`, outside the project): its option 2 allows reads of the
+    /// directory.
+    pub const BOX_BASH_READ_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-bash-read.txt");
+    /// Three command rows (a newline in the command), each led by `│`.
+    pub const BOX_BASH_MULTILINE_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-bash-multiline.txt");
+    /// The rm circuit breaker: the command row is barred though it has no
+    /// newline, the note (`│`, wrapped) under the dashed rules.
+    pub const BOX_RM_BREAKER_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-bash-rm-breaker.txt");
+    /// An ask rule `Bash(touch:*)`: `Permission rule … requires confirmation
+    /// for this command.` and `/permissions to update rules` under the rules.
+    pub const BOX_BASH_ASK_RULE_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-bash-ask-rule.txt");
+    /// A PreToolUse hook answering `ask`: `Hook PreToolUse:Bash requires
+    /// confirmation for this command:`, the hook's reason, `settings.json to
+    /// update hooks`.
+    pub const BOX_BASH_HOOK_ASK_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-bash-hook-ask.txt");
+    /// Auto mode, the same ask rule: `Ask rule Bash(touch:*) overrides auto
+    /// mode for this command.` over `/permissions to let auto mode decide`.
+    pub const BOX_BASH_ASK_RULE_AUTO_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-bash-ask-rule-auto.txt");
+    /// [`BOX_BASH_HOOK_ASK_2_1_287`] for a hook that answers `ask` with no
+    /// reason (MEASURED the same way): `Hook PreToolUse:Bash requires
+    /// confirmation for this command.` over `settings.json to update hooks`,
+    /// the reason's rows and the `│` bars gone.
+    #[must_use]
+    pub fn box_bash_hook_ask_noreason_2_1_287() -> String {
+        let reasoned = BOX_BASH_HOOK_ASK_2_1_287.replace(
+            " │ Hook PreToolUse:Bash requires confirmation for this command:\n │ owner review\n",
+            " Hook PreToolUse:Bash requires confirmation for this command.\n",
+        );
+        assert_ne!(
+            reasoned, BOX_BASH_HOOK_ASK_2_1_287,
+            "the surgery found its rows"
+        );
+        reasoned
+    }
+    /// A 60-row command under an ask rule in a 50-row pane: the title, the
+    /// description, the first dashed rule and the first 20 command rows are
+    /// above the screen, the reason under the second rule is on it.
+    pub const BOX_BASH_TALL_ASK_RULE_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-bash-tall-ask-rule.txt");
+    /// A Write a PreToolUse hook forced (accept-edits mode would have let it
+    /// run): `1. Yes` / `2. No`, and NO reason drawn.
+    pub const BOX_WRITE_HOOK_ASK_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-write-hook-ask.txt");
+    /// Auto mode after three consecutive classifier blocks: `Auto mode
+    /// classifier requires confirmation for this command.` — Claude Code's own
+    /// fallback, not the owner's configuration.
+    pub const BOX_CLASSIFIER_FALLBACK_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-classifier-denial-fallback.txt");
+    /// ` Fetch`, footerless: the subtitle `Claude wants to fetch content from
+    /// <host>`, then `url:` and `prompt:` between the dashed rules.
+    pub const BOX_FETCH_2_1_287: &str = include_str!("fixtures/claude-2.1.287-box-fetch.txt");
+    /// The same Fetch box under an ask rule `WebFetch(domain:…)`.
+    pub const BOX_FETCH_ASK_RULE_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-fetch-ask-rule.txt");
+    /// ` Create file`: the path, the new file's rows between the dashed rules.
+    pub const BOX_WRITE_CREATE_2_1_287: &str =
+        include_str!("fixtures/claude-2.1.287-box-write-create.txt");
+
     /// The folder-trust dialog's gated-grants backstop: `❯ No, continue
     /// without these permissions` / `Yes, I trust this folder`.
     pub const TRUST_BACKSTOP: &str = include_str!("fixtures/claude-2.1.282-trust-backstop.txt");
@@ -3311,8 +3995,21 @@ pub mod fixtures {
     /// ` Read outside the working directories`: a persistent setting.
     pub const READ_OUTSIDE_SETTING: &str =
         include_str!("fixtures/claude-2.1.282-read-outside-setting.txt");
+    /// MEASURED on Claude Code 2.1.287: the same dialog, auto mode's first read
+    /// outside the working directories, its four answers a standing allow, a
+    /// standing block, a refusal and a one-shot allow.
+    pub const READ_OUTSIDE_SETTING_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.287-read-outside-setting-measured.txt");
+    /// MEASURED: [`READ_OUTSIDE_SETTING_MEASURED`] in an 80x18 pane, taller
+    /// than it, its title off the screen.
+    pub const READ_OUTSIDE_SETTING_HEAD_OFF_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.287-read-outside-setting-head-off-80x18-measured.txt");
     /// ` Held message from another session`: FOOTERLESS, unnumbered.
     pub const HELD_MESSAGE: &str = include_str!("fixtures/claude-2.1.282-held-message.txt");
+    /// The same dialog as 2.1.287 draws it: the preview between dashed rules at
+    /// column zero, the options right under them. HAND-BUILT from the render
+    /// code.
+    pub const HELD_MESSAGE_2_1_287: &str = include_str!("fixtures/claude-2.1.287-held-message.txt");
     /// ` Enter plan mode?`: FOOTERLESS, unnumbered.
     pub const PLAN_ENTER: &str = include_str!("fixtures/claude-2.1.282-plan-enter.txt");
     /// ` Switch model?`, MEASURED on 2.1.283: three columns in under a `▔`
@@ -3330,11 +4027,48 @@ pub mod fixtures {
     /// subtitle replaces the cost warning), hand-built on the measured geometry.
     pub const MODEL_SWITCH_HOOK: &str =
         include_str!("fixtures/claude-2.1.283-model-switch-hook.txt");
+    // THE SETTINGS PANEL ON ITS USAGE TAB (`/usage`), every one MEASURED on
+    // Claude Code 2.1.287, 2026-10-01, by the accounts probe's live check
+    // ([`crate::panel`]; each file's line 1 says the grid and the instant).
+    // No row of any names the login: the Status tab was never opened.
+    /// 150x50, 255 ms after the Enter: the last-known windows with
+    /// `Refreshing…` above the cancel hint. NOT SETTLED.
+    pub const USAGE_REFRESHING: &str = include_str!("fixtures/claude-2.1.287-usage-refreshing.txt");
+    /// The same run a quarter second later: the fetched windows, the
+    /// contributing block still scanning, the cancel hint last. SETTLED.
+    pub const USAGE_SETTLED: &str = include_str!("fixtures/claude-2.1.287-usage-settled.txt");
+    /// The same run at 2 s: the contributing block filled in, the last row
+    /// ending in the vendor's `↓`, the cancel hint under the FOLD.
+    pub const USAGE_FOLD: &str = include_str!("fixtures/claude-2.1.287-usage-fold.txt");
+    /// 150x80: the whole tab on a tall grid, the scan done, the cancel hint
+    /// last. SETTLED.
+    pub const USAGE_WHOLE: &str = include_str!("fixtures/claude-2.1.287-usage-whole.txt");
+    /// 60x50: the NARROW layout (a window's reset on its title row), settled
+    /// and whole.
+    pub const USAGE_NARROW: &str = include_str!("fixtures/claude-2.1.287-usage-narrow.txt");
+    /// 110x32: a short grid, the tail under the fold from the first read,
+    /// the last row the vendor's `↓` alone.
+    pub const USAGE_SHORT: &str = include_str!("fixtures/claude-2.1.287-usage-short.txt");
+    /// The INLINE renderer (`CLAUDE_CODE_NO_FLICKER=0`), 150x50: the panel
+    /// under a full-width `─` rule, two columns in, `❯ /usage` left in the
+    /// transcript above it. The capture's first six rows are not kept.
+    pub const USAGE_INLINE: &str = include_str!("fixtures/claude-2.1.287-usage-inline.txt");
+    /// The same inline run once the panel grew: the main screen scrolled,
+    /// its rule and header off the grid.
+    pub const USAGE_INLINE_SCROLLED: &str =
+        include_str!("fixtures/claude-2.1.287-usage-inline-scrolled.txt");
     /// ` Ready to code?`: the plan (its own `1.` step), a second rule, the
     /// options, and only `ctrl+g to edit in VS Code · <plan>` under them.
     pub const PLAN_READY: &str = include_str!("fixtures/claude-2.1.282-plan-ready.txt");
-    /// ` Claude proposes a goal`: FOOTERLESS, `❯ Not now` first.
+    /// ` Claude proposes a goal`: FOOTERLESS, `❯ Not now` first. HAND-BUILT
+    /// from the 2.1.282 render code at column one; the real 2.1.292 draws it at
+    /// column two ([`GOAL_PROPOSAL_2_1_292`]).
     pub const GOAL_PROPOSAL: &str = include_str!("fixtures/claude-2.1.282-goal-proposal.txt");
+    /// The same dialog as 2.1.292 draws it, MEASURED: in the Pane, its title,
+    /// dashed brackets and options at column TWO (the permission frame's are at
+    /// one), the condition inside the brackets, a paragraph over `❯ Not now`.
+    pub const GOAL_PROPOSAL_2_1_292: &str =
+        include_str!("fixtures/claude-2.1.292-goal-proposal.txt");
     /// The question dialog asking `Should I run the migration now?` with the
     /// model's options `Yes` / `No`.
     pub const QUESTION_YES_NO: &str = include_str!("fixtures/claude-2.1.282-question-yes-no.txt");
@@ -3393,6 +4127,11 @@ pub mod fixtures {
     /// S3-16: a single-select tab with no option marked.
     pub const QUESTION_NO_RECOMMENDATION: &str =
         include_str!("fixtures/claude-2.1.282-question-no-recommendation.txt");
+    /// MEASURED on 2.1.287: the model-switch preference Claude Code asks
+    /// itself, unmarked, its `1. Switch automatically` described `… switch
+    /// without asking from now on`.
+    pub const QUESTION_MODEL_SWITCH_PREFERENCE: &str =
+        include_str!("fixtures/claude-2.1.287-question-model-switch-preference.txt");
     /// S4-01: the preview form, its pane `┌` at column 34, an unnumbered chat row.
     pub const QUESTION_PREVIEW: &str = include_str!("fixtures/claude-2.1.282-question-preview.txt");
     /// S5-01 (80 columns): option 1's 93-character label wrapped, its `(Recommended)` on its second row.
@@ -3451,10 +4190,197 @@ pub mod fixtures {
     pub const QUESTION_OVER_DRAFT_AFTER: &str =
         include_str!("fixtures/claude-2.1.282-question-over-draft-after.txt");
 
+    // The question dialog as Claude Code 2.1.283 draws it with a policy text
+    // typed into its free-text row, MEASURED 2026-09-25 (`aterm ctl text` of
+    // a private headless aterm at origin/main 63323e4a4, 120x44; each file's
+    // line 1 names its capture, `c1-04` …). The text typed is the FIRST
+    // wording ([`MEASURED_LONG_TERM_2_1_283`], [`MEASURED_SHORT_TERM_2_1_283`]),
+    // not the one the harness types: [`rewrap_free_text`] draws that one.
+
+    /// c1-03: one single-select question (` ☐ Colour`), the focus on the
+    /// pristine `❯ 3. Type something.` row.
+    pub const QUESTION_283_FREE_TEXT_FOCUSED: &str =
+        include_str!("fixtures/claude-2.1.283-question-free-text-focused.txt");
+    /// c1-04: the long-term text typed there — three rows at the label
+    /// column, the focus kept, the chip still `☐`.
+    pub const QUESTION_283_TYPED_LONG_TERM: &str =
+        include_str!("fixtures/claude-2.1.283-question-typed-long-term.txt");
+    /// c8-02: the short-term text typed into the same row (another question).
+    pub const QUESTION_283_TYPED_SHORT_TERM: &str =
+        include_str!("fixtures/claude-2.1.283-question-typed-short-term.txt");
+    /// c2-04: a person's `go with blue` typed there.
+    pub const QUESTION_283_TYPED_PERSON: &str =
+        include_str!("fixtures/claude-2.1.283-question-typed-person.txt");
+    /// c3-04: ONE multi-select question (`←  ☐ Toppings  ✔ Submit  →`), the
+    /// focus on the pristine `❯ 4. [ ] Type something` row, `Submit` under it.
+    pub const QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED: &str =
+        include_str!("fixtures/claude-2.1.283-question-multiselect-free-text-focused.txt");
+    /// c3-05: the long-term text typed there — the row ticks itself `[✔]`,
+    /// the chip `☒`, three rows at column 9.
+    pub const QUESTION_283_MULTISELECT_TYPED_LONG_TERM: &str =
+        include_str!("fixtures/claude-2.1.283-question-multiselect-typed-long-term.txt");
+    /// c3-06: `down` from there — the focus on `❯    Submit`, the text
+    /// REFLOWED one cell wider (its second row now ends `(Answered`).
+    pub const QUESTION_283_MULTISELECT_TYPED_BUTTON: &str =
+        include_str!("fixtures/claude-2.1.283-question-multiselect-typed-button.txt");
+    /// c3-07: `enter` on the button — the review tab, the answer quoted.
+    pub const QUESTION_283_MULTISELECT_REVIEW: &str =
+        include_str!("fixtures/claude-2.1.283-question-multiselect-review.txt");
+    /// c3b-03: a person's `go with olives` typed into the multi-select row.
+    pub const QUESTION_283_MULTISELECT_TYPED_PERSON: &str =
+        include_str!("fixtures/claude-2.1.283-question-multiselect-typed-person.txt");
+    /// c3c-03: `enter` with the focus in that typed row UNTICKS it (`❯ 4. [
+    /// ] go with olives`, the chip back to `☐`).
+    pub const QUESTION_283_MULTISELECT_UNTICKED: &str =
+        include_str!("fixtures/claude-2.1.283-question-multiselect-unticked.txt");
+    /// c4-01: two questions (`←  ☐ Colour  ☐ Toppings  ✔ Submit  →`), the
+    /// single-select tab first, the focus on option 1.
+    pub const QUESTION_283_TABS_FIRST: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-first.txt");
+    /// c4-02: `down` once, the focus on option 2.
+    pub const QUESTION_283_TABS_FIRST_DOWN: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-first-down.txt");
+    /// c4-03: `down` again, the focus on the pristine free-text row.
+    pub const QUESTION_283_TABS_FIRST_FREE_TEXT_FOCUSED: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-first-free-text-focused.txt");
+    /// c4-04: the long-term text typed there.
+    pub const QUESTION_283_TABS_FIRST_TYPED_LONG_TERM: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-first-typed-long-term.txt");
+    /// c4-05: `enter` there — the multi-select tab, `☒ Colour`, the focus on
+    /// option 1.
+    pub const QUESTION_283_TABS_SECOND: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-second.txt");
+    /// c4-06: `down` once.
+    pub const QUESTION_283_TABS_SECOND_DOWN: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-second-down.txt");
+    /// c4-07: `down` twice.
+    pub const QUESTION_283_TABS_SECOND_DOWN_TWICE: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-second-down-twice.txt");
+    /// c4-08: `down` three times, the focus on the pristine free-text row.
+    pub const QUESTION_283_TABS_SECOND_FREE_TEXT_FOCUSED: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-second-free-text-focused.txt");
+    /// c4-09: the long-term text typed there, ticked, both chips `☒`.
+    pub const QUESTION_283_TABS_SECOND_TYPED_LONG_TERM: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-second-typed-long-term.txt");
+    /// c4-10: `down` to `❯    Submit`, the text reflowed.
+    pub const QUESTION_283_TABS_SECOND_TYPED_BUTTON: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-second-typed-button.txt");
+    /// c4-11: `enter` on the button — the review tab, both answers long.
+    pub const QUESTION_283_TABS_REVIEW: &str =
+        include_str!("fixtures/claude-2.1.283-question-tabs-review.txt");
+    /// c11-01: the preview form, the focus on option 1.
+    pub const QUESTION_283_PREVIEW: &str =
+        include_str!("fixtures/claude-2.1.283-question-preview.txt");
+    /// c5-03: `down` twice on the preview form — `❯` on the chat row AND
+    /// still on option 2.
+    pub const QUESTION_283_PREVIEW_CHAT_FOCUSED: &str =
+        include_str!("fixtures/claude-2.1.283-question-preview-chat-focused.txt");
+    /// c5-06: `n` on the preview form — `Notes: Add notes on this design…`.
+    pub const QUESTION_283_PREVIEW_NOTES_OPEN: &str =
+        include_str!("fixtures/claude-2.1.283-question-preview-notes-open.txt");
+
+    /// The long-term text the 2.1.283 captures were MEASURED with (typed
+    /// into c1-04, c3-05, c4-04 and c4-09), exactly as the session's JSONL
+    /// recorded Claude receiving it (c1's `answers` map).
+    pub const MEASURED_LONG_TERM_2_1_283: &str = "Decide yourself: choose the option that best serves long-term correctness and total value, even at the cost of short-term deliverables. Say which you chose and why in one line, then continue without asking again. (Answered by the aterm harness by policy; the user was not asked.)";
+    /// The short-term text typed into c8-02, as c8's `answers` map recorded it.
+    pub const MEASURED_SHORT_TERM_2_1_283: &str = "Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line, then continue without asking again. (Answered by the aterm harness by policy; the user was not asked.)";
+
+    /// A 2.1.283 single- or multi-select tab (`capture`) redrawn `width`
+    /// cells wide with `text` in its free-text row. SYNTHETIC: the rows
+    /// from the tab's top rule down (the transcript above it is dropped),
+    /// both rules `width` cells, and the free-text row's text replaced by
+    /// `text` wrapped as 2.1.283 was MEASURED to wrap it — `question_tests`
+    /// holds this helper to every measured wrap exactly (c1-04, c3-05,
+    /// c3-06, c4-04, c4-09, c4-10, c8-02): greedily at single spaces, every
+    /// row of it at the label column (5, or 9 behind the multi-select
+    /// checkbox, drawn `[✔]`: the row ticks itself when typed into), a row
+    /// running to cell `width - 1` while the row has the focus and to cell
+    /// `width` once it has not. Every other row is left as captured, the
+    /// tab bar too — so take a capture whose free-text row was typed into
+    /// (a multi-select chip ticks with it). Panics on a text no measured
+    /// wrap covers (not printable ASCII, a double or edge space, a word
+    /// wider than a row) and on a dialog row wider than `width`.
+    #[must_use]
+    pub fn rewrap_free_text(capture: &str, text: &str, width: usize) -> Vec<String> {
+        let rows = screen(capture);
+        let is_rule = |r: &str| !r.is_empty() && r.chars().all(|c| c == '─');
+        let rules: Vec<usize> = (0..rows.len()).filter(|&i| is_rule(&rows[i])).collect();
+        let [.., top, divider] = rules[..] else {
+            panic!("a select tab has its top rule and its divider")
+        };
+        // A numbered row (`❯ 3. …`, `  3. …`) as its focus and the column
+        // its text starts at.
+        let numbered = |r: &str| -> Option<(bool, usize)> {
+            let rest = r.strip_prefix(['❯', ' '])?.strip_prefix(' ')?;
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            (digits > 0 && rest[digits..].starts_with(". "))
+                .then_some((r.starts_with('❯'), 2 + digits + 2))
+        };
+        let free = (top..divider)
+            .rev()
+            .find(|&i| numbered(&rows[i]).is_some())
+            .expect("the free-text row");
+        let (focused, text_col) = numbered(&rows[free]).expect("numbered");
+        let head: String = rows[free].chars().take(text_col).collect();
+        let tail: String = rows[free].chars().skip(text_col).collect();
+        let multi = tail.starts_with("[ ] ") || tail.starts_with("[✔] ");
+        let lead = if multi { format!("{head}[✔] ") } else { head };
+        let label_col = lead.chars().count();
+        // The field's rows end at the multi-select button (one word at column
+        // 5, `❯` in the pointer column when focused), or at the divider.
+        let end = if multi { divider - 1 } else { divider };
+        let button = rows[end].strip_prefix('❯').unwrap_or(&rows[end]);
+        assert!(
+            !multi || (button.starts_with("    ") && button.split_whitespace().count() == 1),
+            "no button row over the divider: {:?}",
+            rows[end]
+        );
+        assert!(
+            text.bytes().all(|b| (b' '..=b'~').contains(&b)),
+            "not printable ASCII: {text:?}"
+        );
+        let room = (if focused { width - 1 } else { width }) - label_col;
+        let mut lines: Vec<String> = vec![String::new()];
+        for word in text.split(' ') {
+            assert!(
+                !word.is_empty() && word.len() <= room,
+                "no measured wrap covers {word:?} in {room} cells"
+            );
+            let line = lines.last_mut().expect("a line");
+            if line.is_empty() {
+                line.push_str(word);
+            } else if line.len() + 1 + word.len() <= room {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                lines.push(word.to_string());
+            }
+        }
+        let redraw = |r: &String| {
+            if is_rule(r) {
+                "─".repeat(width)
+            } else {
+                assert!(r.chars().count() <= width, "wider than {width}: {r:?}");
+                r.clone()
+            }
+        };
+        let mut out: Vec<String> = rows[top..free].iter().map(redraw).collect();
+        for (k, line) in lines.iter().enumerate() {
+            let at = if k == 0 {
+                lead.clone()
+            } else {
+                " ".repeat(label_col)
+            };
+            out.push(format!("{at}{line}"));
+        }
+        out.extend(rows[end..].iter().map(redraw));
+        out
+    }
+
     /// Setup dialogs 2.1.282 draws as a bare Ei() frame and an He() select
-    /// with NO footer — read as kind `other` by the general footerless reader
-    /// (the harness round-2 review of 2026-09-24): ` Make auto mode your
-    /// default permission mode?` (Dde(), unnumbered).
+    /// with NO footer — read as kind `other` by the general footerless
+    /// reader: ` Make auto mode your default permission mode?` (Dde(), unnumbered).
     pub const SETUP_AUTO_MODE_DEFAULT: &str =
         include_str!("fixtures/claude-2.1.282-setup-auto-mode-default.txt");
     /// ` Claude wants to use your browser` (lpe(), unnumbered, `❯ Not now`).
@@ -3513,8 +4439,8 @@ pub mod fixtures {
     pub const INLINE_REPL_READY: &str =
         include_str!("fixtures/claude-2.1.283-inline-repl-ready.txt");
 
-    /// The inline renderer RELAUNCHED IN THE SAME TAB (2.1.283, the review of
-    /// 2026-09-26 and a repeat on 2026-09-27, 150x50): the previous run
+    /// The inline renderer RELAUNCHED IN THE SAME TAB (2.1.283, measured
+    /// 2026-09-26 and 2026-09-27, 150x50): the previous run
     /// exited with two Ctrl-C and left its prompt box on the main grid (its
     /// footer `Press Ctrl-C again to exit`); then `cd` into a new folder and
     /// the launch line. This is the frame the server published `agent=idle`
@@ -3572,6 +4498,40 @@ pub mod fixtures {
         for (k, label) in labels.iter().enumerate() {
             let cursor = if k == focus { '›' } else { ' ' };
             out.push(format!(" {cursor} {}. {label}", k + 1));
+        }
+        out.extend(
+            rows[first..]
+                .iter()
+                .skip_while(|r| !r.trim().is_empty())
+                .cloned(),
+        );
+        out
+    }
+
+    /// [`LIMIT_OPTIONS_PANEL`] with its option rows replaced by `labels`,
+    /// numbered from 1 in the Select's columns (`   ❯ 1. ` focused, `     2. `
+    /// not), the `❯` on option `focus` (0-based); `toast` false draws the
+    /// panel's rule bare, as on the four later escalations of 2026-09-27.
+    #[must_use]
+    pub fn limit_options_panel(labels: &[&str], focus: usize, toast: bool) -> Vec<String> {
+        let rows = screen(LIMIT_OPTIONS_PANEL);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with("   ❯ 1. "))
+            .expect("the fixture's first option row");
+        let mut out: Vec<String> = rows[..first]
+            .iter()
+            .map(|r| {
+                if !toast && r.starts_with('▔') {
+                    "▔".repeat(r.chars().count())
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        for (k, label) in labels.iter().enumerate() {
+            let cursor = if k == focus { "❯ " } else { "  " };
+            out.push(format!("   {cursor}{}. {label}", k + 1));
         }
         out.extend(
             rows[first..]
@@ -3656,8 +4616,8 @@ pub mod fixtures {
     /// A multi-row Bash box from a workflow on Claude Code 2.1.278 (measured
     /// 2026-09-21 in a live aterm tab; the command rows are shortened): the
     /// description row is led by `│` like the command rows, and a `│`-led
-    /// note block (the critical-path removal warning) sits between the block
-    /// and the question. Bypass mode: two options.
+    /// note block (the possibly-empty-variable removal warning) sits between
+    /// the block and the question. Bypass mode: two options.
     #[must_use]
     pub fn bash_multi_row_with_note() -> Vec<String> {
         let mut r = rows(&[
@@ -3748,8 +4708,7 @@ pub mod fixtures {
     /// box whose barred command — a heredoc writing a file — has `lines`
     /// rows, under a `⏺` row and the box's own rule, and no composer under
     /// it. With `lines` past 60, its title sits further above its footer
-    /// than the old 60-row window reached (the harness
-    /// round-3 review of 2026-09-24, blocking).
+    /// than a 60-row window reaches.
     #[must_use]
     pub fn tall_bash_box(lines: usize) -> Vec<String> {
         let mut r = rows(&[
@@ -3776,8 +4735,7 @@ pub mod fixtures {
     /// A footerless box fixture ([`BOX_NETWORK`], [`HELD_MESSAGE`], …)
     /// stretched: `extra` more body rows at its first body row's column,
     /// right under that row, so its title sits further above its options
-    /// than a 40-row `tail=` read reaches (the harness final review of
-    /// 2026-09-24, major).
+    /// than a 40-row `tail=` read reaches.
     #[must_use]
     pub fn tall_footerless(text: &str, extra: usize) -> Vec<String> {
         let mut r = screen(text);
@@ -3820,8 +4778,7 @@ pub mod fixtures {
         r
     }
 
-    /// HAND-BUILT from [`GOAL_PROPOSAL`] (the harness final review r2 of
-    /// 2026-09-24, blocking): a proposed goal whose column-1 goal text — the
+    /// HAND-BUILT from [`GOAL_PROPOSAL`]: a proposed goal whose column-1 goal text — the
     /// model's words — is laid out as a footed Bash box, above the live
     /// dialog's own ` Approving sets this …` row and `❯ Not now` options.
     /// `lead` goal rows come before the forged box and `after` goal rows
@@ -3856,8 +4813,7 @@ pub mod fixtures {
         r
     }
 
-    /// HAND-BUILT (the harness round-3 review of 2026-09-24, major): Claude
-    /// Code 2.1.282's launch screen under a shell's `tokei` table in the
+    /// HAND-BUILT: Claude Code 2.1.282's launch screen under a shell's `tokei` table in the
     /// scrollback — a column-1 row right under a column-0 `─` rule — with
     /// the composer holding `composer_row` (its dim `Try "…"` placeholder,
     /// or a typed-ahead draft) over `footer`. No live box.
@@ -3971,13 +4927,32 @@ fn review_kind_of(row: &str) -> Option<ReviewKind> {
         Some(ReviewKind::AutoModeRule)
     } else if t.starts_with(a("box.reason_rule")) && t.contains(a("box.reason_confirm")) {
         Some(ReviewKind::Rule)
-    } else if t.starts_with(a("box.reason_remote_hook"))
+    } else if (t.starts_with(a("box.reason_remote_hook"))
+        && t.contains(a("box.reason_remote_confirm")))
         || (t.starts_with(a("box.reason_hook")) && t.contains(a("box.reason_confirm")))
     {
         Some(ReviewKind::Hook)
     } else {
         None
     }
+}
+
+/// Whether a row opens one of the OWNER's reasons ([`review_kind_of`]'s
+/// heads). 2.1.287's explanation block stacks the decision's reason, the
+/// classifier's streak and a matched ask rule on consecutive rows (`Tb`), so
+/// the owner's may be the second: a row that opens one starts its own block,
+/// whatever block runs up to it. Only a row that OPENS with the head does —
+/// not a diff row that carries the words after its line number.
+fn opens_owner_reason(row: &str) -> bool {
+    use crate::anchors::anchor_text as a;
+    let t = unbarred(row);
+    [
+        a("box.reason_rule"),
+        a("box.reason_hook"),
+        a("box.reason_remote_hook"),
+    ]
+    .iter()
+    .any(|head| t.starts_with(head))
 }
 
 /// A non-shell box's reason blocks at its own column (one). Join wrapped
@@ -3987,6 +4962,13 @@ fn review_kind_of(row: &str) -> Option<ReviewKind> {
 fn reason_rows_of(body: &[String]) -> Vec<String> {
     let mut blocks: Vec<String> = Vec::new();
     let mut in_block = false;
+    // 2.1.287 draws the reasons under the box's last dashed rule, and what is
+    // over it is the tool's own content — a diff, a url, a prompt the model
+    // wrote (module header, "THE BRACKETED BOX").
+    let body = body
+        .iter()
+        .rposition(|r| is_dashed_rule(r))
+        .map_or(body, |at| &body[at + 1..]);
     for row in body {
         let text = unbarred(row);
         if crate::phase::leading_spaces(row) != 1 || text.is_empty() {
@@ -3994,7 +4976,7 @@ fn reason_rows_of(body: &[String]) -> Vec<String> {
             continue;
         }
         match blocks.last_mut() {
-            Some(block) if in_block => {
+            Some(block) if in_block && !opens_owner_reason(text) => {
                 block.push(' ');
                 block.push_str(text);
             }
@@ -4003,6 +4985,44 @@ fn reason_rows_of(body: &[String]) -> Vec<String> {
         in_block = true;
     }
     blocks
+}
+
+/// The OWNER's reasons found by their own words, whatever the structure around
+/// them: every row at the box's own columns (zero or one) where one opens — a row
+/// that starts with one of their heads, or names an ask rule that overrides auto
+/// mode — under whatever rules or bars, with the same-indent rows after it joined
+/// (a wrapped reason). The structural reading (the rules, the columns) can be
+/// led astray by what the model wrote or by a layout it does not know, and a
+/// reason lost to it is a box a person owns, pressed: found this way a reason
+/// the model forged only escalates, and a real one is never lost (the rules drawn
+/// another way, shorter than ten cells, indented, or only one of them in sight;
+/// measured on the real 2.1.292 with a command wrapped at 40 columns).
+fn loose_reasons(body: &[String]) -> Vec<String> {
+    use crate::anchors::anchor_text as a;
+    let mut out = Vec::new();
+    for (i, row) in body.iter().enumerate() {
+        let t = unbarred(row);
+        if t.is_empty()
+            || crate::phase::leading_spaces(row) > 1
+            || !(opens_owner_reason(t) || t.contains(a("box.reason_auto_rule")))
+        {
+            continue;
+        }
+        let mut text = t.to_string();
+        for next in body[i + 1..].iter().take(6) {
+            let n = unbarred(next);
+            if n.is_empty()
+                || opens_owner_reason(n)
+                || crate::phase::leading_spaces(next) != crate::phase::leading_spaces(row)
+            {
+                break;
+            }
+            text.push(' ');
+            text.push_str(n);
+        }
+        out.push(text);
+    }
+    out
 }
 
 /// `row` trimmed, a leading `│` bar and the space after it stripped.
@@ -4018,7 +5038,7 @@ mod tests {
 
     /// The box's own first row: the header where there is one, and for a headerless
     /// box the first row under whatever above it is not the box's — never a transcript
-    /// row, however tall the transcript (round-25 review, 2026-09-23).
+    /// row, however tall the transcript.
     #[test]
     fn a_boxs_first_row_is_its_own_never_a_transcript_row() {
         assert_eq!(prompt_box_first_row(&bash_one_row()), Some(2));
@@ -4311,211 +5331,6 @@ mod tests {
         assert!(rows[37].starts_with(" ❯ 1. Yes"), "{:?}", rows[37]);
     }
 
-    /// Every fixture file this crate added names its program and version on
-    /// its first line, and says HAND-BUILT when its rows were assembled.
-    #[test]
-    fn every_new_fixture_names_its_program_and_version_on_line_one() {
-        for (text, want) in [
-            (BOX_BASH_TOUCH, "claude-code 2.1.280 · MEASURED"),
-            (BOX_BASH_TOUCH_BLINK, "claude-code 2.1.280 · MEASURED"),
-            (BOX_EDIT, "claude-code 2.1.280 · MEASURED"),
-            (BOX_RM, "claude-code 2.1.280 · MEASURED"),
-            (
-                BOX_RM_UNRESOLVABLE_WORKFLOW,
-                "claude-code 2.1.280 · MEASURED",
-            ),
-            (BOX_RM_WORKFLOW, "claude-code 2.1.28x · LIVE"),
-            (TRUST, "claude-code 2.1.280 · MEASURED"),
-            (
-                TRUST_FRESH_PANE,
-                "claude-code 2.1.283 · MEASURED 2026-09-26",
-            ),
-            (
-                BOX_RM_SUBAGENT_FRESH_PANE,
-                "claude-code 2.1.283 · MEASURED 2026-09-26",
-            ),
-            (TRUST_AFTER_RESUMES, "claude-code 2.1.280 · MEASURED"),
-            (CODEX_TRUST, "codex 0.156.1 · MEASURED"),
-            (END_529, "claude-code (unrecorded) · HAND-BUILT"),
-            (API_ERROR_ENOTFOUND, "claude-code 2.1.283 · SYNTHETIC"),
-            (API_ERROR_ENOTFOUND_80, "claude-code 2.1.283 · SYNTHETIC"),
-            (API_ERROR_SLEEP, "claude-code 2.1.283 · SYNTHETIC"),
-            (API_ERROR_529, "claude-code 2.1.283 · SYNTHETIC"),
-            (END_SESSION_LIMIT, "claude-code (unrecorded) · HAND-BUILT"),
-            (END_OFFER, "claude-code (unrecorded) · HAND-BUILT"),
-            (LIMIT_OPTIONS_DIALOG, "claude-code 2.1.282 · HAND-BUILT"),
-            (LOGIN_EXPIRED, "claude-code 2.1.281 · HAND-BUILT 2026-09-27"),
-            (
-                GOAL_ACTIVE_SUGGESTION,
-                "claude-code (version unrecorded) · MEASURED",
-            ),
-            (MEMORY_BANNER_BUSY, "claude-code (unrecorded) · HAND-BUILT"),
-            (MEMORY_BANNER_IDLE, "claude-code (unrecorded) · HAND-BUILT"),
-        ] {
-            let line = provenance(text).expect("a provenance line");
-            assert!(line.starts_with(want), "{line}");
-            assert!(!screen(text)[0].starts_with("# "), "{line}");
-        }
-        // The 2.1.282 screens are HAND-BUILT, and each names the render
-        // function it was synthesized from.
-        for text in HAND_BUILT_2_1_282 {
-            let line = provenance(text).expect("a provenance line");
-            assert!(
-                line.starts_with("claude-code 2.1.282 · HAND-BUILT 2026-09-24")
-                    && line.contains("synthesized from the 2.1.282 render code"),
-                "{line}"
-            );
-            assert!(!screen(text)[0].starts_with("# "), "{line}");
-        }
-    }
-
-    /// The question dialog's live captures (2026-09-25) and the shapes
-    /// hand-built from them: each names its program, its version and how it
-    /// was taken on line 1 — a measured one the headless aterm it was read
-    /// under and the equal-length redaction, a hand-built one the capture
-    /// and the render code it was synthesized from.
-    #[test]
-    fn every_question_fixture_names_its_provenance() {
-        for text in LIVE_2_1_282 {
-            let line = provenance(text).expect("a provenance line");
-            assert!(
-                line.starts_with(
-                    "claude-code 2.1.282 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm 0.93.0 ("
-                ) && line.ends_with("· user and scratch-path UUID redacted at equal length"),
-                "{line}"
-            );
-            assert!(!screen(text)[0].starts_with("# "), "{line}");
-            // The banner's scratch path, redacted at equal length.
-            assert!(
-                text.contains("/00000000-0000-0000-0000-000000000000/"),
-                "{line}"
-            );
-        }
-        for text in HAND_BUILT_2026_09_25 {
-            let line = provenance(text).expect("a provenance line");
-            assert!(
-                line.starts_with("claude-code 2.1.282 · HAND-BUILT 2026-09-25 (no live capture): rows synthesized from ")
-                    && line.contains("render code"),
-                "{line}"
-            );
-            assert!(!screen(text)[0].starts_with("# "), "{line}");
-        }
-    }
-
-    /// The API-error, retry, `/fast` and footer screens measured on 2.1.283
-    /// (2026-09-27): each names the headless aterm it was read under, the
-    /// launch (a scratch Claude config, a dummy key, an unresolvable base
-    /// URL) and the equal-length redaction on line 1, and is a whole
-    /// 50-row screen with the banner's scratch path redacted.
-    #[test]
-    fn every_2026_09_27_measured_fixture_names_its_provenance() {
-        for text in MEASURED_2026_09_27 {
-            let line = provenance(text).expect("a provenance line");
-            assert!(
-                line.starts_with(
-                    "claude-code 2.1.283 · MEASURED 2026-09-27, `aterm ctl text` of a private headless aterm 0.96.0 ("
-                ) && line.contains("`ANTHROPIC_BASE_URL=https://api.invalid`")
-                    && line.ends_with("· user, host and scratch-path UUID redacted at equal length"),
-                "{line}"
-            );
-            let rows = screen(text);
-            assert_eq!(rows.len(), 50, "{line}");
-            assert!(!rows[0].starts_with("# "), "{line}");
-            assert!(
-                text.contains("-Users-user000-aterm/00000000-0000-0000-0000-000000000000/")
-                    || text.contains("/…/00000000-0000-0000-0000-000000000000/"),
-                "{line}"
-            );
-        }
-    }
-
-    /// Every screen measured on 2.1.283 on 2026-09-27.
-    const MEASURED_2026_09_27: [&str; 14] = [
-        API_ERROR_ENOTFOUND_MEASURED,
-        API_ERROR_ENOTFOUND_80_MEASURED,
-        API_RETRYING_MEASURED,
-        API_RETRYING_DRAFT_MEASURED,
-        API_RETRYING_QUEUED_MEASURED,
-        API_RETRYING_QUEUED_80_MEASURED,
-        API_RETRYING_QUEUED_DRAFT_MEASURED,
-        API_ERROR_QUEUED_SENT_MEASURED,
-        API_ERROR_TWICE_MEASURED,
-        FAST_REFUSED_IDLE_MEASURED,
-        FAST_REFUSED_IDLE_80_MEASURED,
-        FAST_REFUSED_BUSY_MEASURED,
-        FAST_REFUSED_BUSY_80_MEASURED,
-        FOOTER_PLAN_API_KEY_MEASURED,
-    ];
-
-    /// Every screen measured on 2.1.284 on 2026-09-28.
-    const MEASURED_2026_09_28: [&str; 3] = [
-        API_ERROR_TALL_PANE_MEASURED,
-        FAST_REFUSED_BUSY_UNDER_COMPOSER_MEASURED,
-        FOOTER_AUTO_EFFORT_HINT_MEASURED,
-    ];
-
-    /// The 2.1.284 captures name their provenance and are whole 50-row
-    /// screens (2026-09-28).
-    #[test]
-    fn every_2026_09_28_measured_fixture_names_its_provenance() {
-        for text in MEASURED_2026_09_28 {
-            let line = provenance(text).expect("a provenance line");
-            assert!(
-                line.starts_with("claude-code 2.1.284 · MEASURED 2026-09-28, `aterm ctl text` of a private headless aterm (144x50)")
-                    && line.contains("`ANTHROPIC_BASE_URL=https://api.invalid`")
-                    && line.ends_with("· user, host and scratch path redacted"),
-                "{line}"
-            );
-            assert_eq!(screen(text).len(), 50, "{line}");
-            assert!(
-                !text.contains("cutefox") && !text.contains("Isabella"),
-                "{line}"
-            );
-        }
-    }
-
-    /// Every question dialog captured live on 2.1.282 (2026-09-25).
-    const LIVE_2_1_282: [&str; 23] = [
-        QUESTION_TABS_INCIDENT,
-        QUESTION_TABS_SECOND,
-        QUESTION_TABS_THIRD,
-        QUESTION_TABS_FOURTH,
-        QUESTION_REVIEW,
-        QUESTION_REVIEW_UNANSWERED,
-        QUESTION_ONE,
-        QUESTION_RECOMMENDED_SECOND,
-        QUESTION_FREE_TEXT_FOCUSED,
-        QUESTION_FREE_TEXT_TYPED,
-        QUESTION_FREE_TEXT_TYPED_AWAY,
-        QUESTION_MULTISELECT,
-        QUESTION_MULTISELECT_CHECKED,
-        QUESTION_MULTISELECT_NEXT,
-        QUESTION_MULTISELECT_TYPED,
-        QUESTION_NO_RECOMMENDATION,
-        QUESTION_PREVIEW,
-        QUESTION_LONG_LABEL_80COL,
-        QUESTION_LONG_LABEL_180COL,
-        QUESTION_DECLINED_CANCEL,
-        QUESTION_DECLINED_ESC,
-        QUESTION_OVER_DRAFT,
-        QUESTION_OVER_DRAFT_AFTER,
-    ];
-
-    /// Every question shape hand-built on 2026-09-25 from those captures and
-    /// the render code.
-    const HAND_BUILT_2026_09_25: [&str; 10] = [
-        QUESTION_CHAT_FOCUSED,
-        QUESTION_AFK,
-        QUESTION_PLUGIN_NOTICE,
-        QUESTION_PANEL_WAITING,
-        QUESTION_DO_YOU_WANT_LIVE,
-        QUESTION_MULTISELECT_ALONE,
-        QUESTION_SCROLLED,
-        QUESTION_PREVIEW_LONG_LABEL,
-        QUESTION_PREVIEW_REVISITED,
-        QUESTION_DEFERRED,
-    ];
-
     /// Every 2.1.282 screen synthesized from the render code.
     const HAND_BUILT_2_1_282: [&str; 26] = [
         BOX_BASH_SUBAGENT,
@@ -4706,12 +5521,11 @@ mod tests {
         );
     }
 
-    /// The harness round-2 review (2026-09-24, major): the countdown row is
-    /// ~113 cells, so under a narrower grid (the 110-column headless default
-    /// among them) Ink wraps it, and its tail (`unattended session`) sat at
-    /// the note column and was read as a SECOND note — the rm breaker then
-    /// went unrecognised (one note is its rule) and a read-only box escalated
-    /// as "a vendor note". The rows it wrapped onto are the countdown's, up
+    /// The countdown row is ~113 cells, so under a narrower grid (the
+    /// 110-column headless default among them) Ink wraps it, and its tail
+    /// (`unattended session`) sits at the note column — read as a SECOND
+    /// note, the rm breaker goes unrecognised (one note is its rule) and a
+    /// read-only box escalates as "a vendor note". The rows it wrapped onto are the countdown's, up
     /// to its own blank row. The measured rm box with only its countdown row
     /// split at two points: one note, the breaker's kind, the countdown
     /// whole. Negative controls: a real note after the countdown's blank row
@@ -5225,6 +6039,80 @@ mod tests {
         ));
     }
 
+    /// THE INCIDENT OF 2026-09-27 ([`LIMIT_OPTIONS_PANEL`]): the usage-limit
+    /// dialog in the fullscreen renderer's panel — its `▔` rule over a title
+    /// three columns in, no `─` rule of its own — had its first row, the `▔`
+    /// rule, read as a body row of a box whose head was off the screen: kind
+    /// `other`, no role on the dated wait row, and the window supervisor
+    /// escalated it five times as `nothing that waits`. Read under the rule,
+    /// it is the dialog, with or without the toast in the rule; the controls:
+    /// the same panel over a composer, or with a body row left of the title's
+    /// column, is not read by the panel.
+    #[test]
+    fn the_limit_dialog_in_the_fullscreen_panel_reads_its_dated_wait_row() {
+        const WAIT: &str = "Wait here, then continue automatically at Oct 2 at 5am";
+        let labels = [
+            "Stop and wait for limit to reset",
+            WAIT,
+            "Switch to usage credits",
+        ];
+        let r = screen(LIMIT_OPTIONS_PANEL);
+        assert_eq!(limit_options_panel(&labels, 0, true), r);
+        for rows in [r.clone(), limit_options_panel(&labels, 0, false)] {
+            assert_eq!(
+                crate::phase::worker_phase(&rows),
+                crate::phase::Phase::Prompt
+            );
+            let p = parse_prompt_v2(&rows).expect("the dialog");
+            assert_eq!(p.kind, PromptKind::UsageLimit, "{rows:#?}");
+            assert!(!p.head_off_screen);
+            assert_eq!(p.title, "What do you want to do?");
+            assert_eq!(p.select, Select::Digits);
+            let read: Vec<(&str, Role)> = p
+                .options
+                .iter()
+                .map(|o| (o.label.as_str(), o.role))
+                .collect();
+            assert_eq!(
+                read,
+                [
+                    (labels[0], Role::Other),
+                    (WAIT, Role::AutoResume),
+                    (labels[2], Role::Other)
+                ]
+            );
+            assert_eq!(p.focused().map(|o| o.label.as_str()), Some(labels[0]));
+            assert_eq!(p.command, WAIT);
+        }
+        // The focus moved onto the wait row, as the supervisor's `down` leaves it.
+        let p = parse_prompt_v2(&limit_options_panel(&labels, 1, false)).expect("the dialog");
+        assert_eq!(p.focused().map(|o| o.label.as_str()), Some(WAIT));
+
+        // Controls: a body row left of the title's column, and the composer
+        // under the footer, are no panel box.
+        let mut left = r.clone();
+        left.insert(4, "  a row the panel does not draw".to_string());
+        assert!(
+            parse_prompt_v2(&left).is_none_or(|p| p.kind != PromptKind::UsageLimit),
+            "{left:#?}"
+        );
+        let mut composed = r;
+        composed.extend(
+            [
+                "─".repeat(131),
+                "❯ ".to_string(),
+                "─".repeat(131),
+                "  ⏵⏵ auto mode on (shift+tab to cycle)".to_string(),
+            ]
+            .iter()
+            .cloned(),
+        );
+        assert!(
+            parse_prompt_v2(&composed).is_none_or(|p| p.kind != PromptKind::UsageLimit),
+            "{composed:#?}"
+        );
+    }
+
     /// NOT A BOX: a worker's message that says `press Esc to cancel`, a
     /// bullet quoting it, a zsh screen after `grep 'Esc to cancel'`, and a
     /// box quoted straight on under a `⏺` row. The control: the same footer
@@ -5359,6 +6247,10 @@ mod tests {
                 Role::Persist,
             ),
             (
+                "Yes, allow reading from /private/etc from this project",
+                Role::Persist,
+            ),
+            (
                 "Yes, and allow reading from ~/.ssh during this session",
                 Role::Session,
             ),
@@ -5416,6 +6308,21 @@ mod tests {
                 "Yes, keep allowing reads outside the working directories",
                 Role::Persist,
             ),
+            // An answer kept for every later ask, yes or no (2.1.287's
+            // read-outside dialog, its add-dir and upsell dialogs); the ones
+            // that ask again next time settle nothing.
+            (
+                "Yes, and keep allowing any reads outside the working directories",
+                Role::Persist,
+            ),
+            (
+                "No, and block reads outside the working directories from now on",
+                Role::Persist,
+            ),
+            ("No, and ask again next time", Role::Deny),
+            ("Yes, but ask again next time", Role::Once),
+            ("Yes, and remember this directory", Role::Persist),
+            ("Don’t ask again", Role::Persist),
             ("No, continue without these permissions", Role::Deny),
             // A dismissal that settles nothing refuses (a goal's, the
             // Chrome upsell's, Remote Control's).
@@ -5869,7 +6776,7 @@ mod tests {
         }
     }
 
-    /// The harness round-2 review (2026-09-24, blocking): a row the MESSAGE
+    /// A row the MESSAGE
     /// draws in its own continuation column — a markdown table's bottom edge
     /// (`  └──┴──┘`, in nearly every table Claude Code renders), a frame
     /// edge, a spinner-shaped line or a `*` bullet — does not end the walk up
@@ -6262,7 +7169,7 @@ mod tests {
                 title: "Read outside the working directories",
                 command: "",
                 path: None,
-                roles: &[Persist, Deny, Deny],
+                roles: &[Persist, Persist, Deny],
                 select: Select::Digits,
                 cancel: Some(Reject),
                 footer: true,
@@ -6333,7 +7240,7 @@ mod tests {
                 cancel: Some(Reject),
                 footer: true,
             },
-            // The footerless setup dialogs (round-2 review): kind `other`.
+            // The footerless setup dialogs: kind `other`.
             Want {
                 text: SETUP_AUTO_MODE_DEFAULT,
                 kind: PromptKind::Other,
@@ -6351,7 +7258,7 @@ mod tests {
                 title: "Claude wants to use your browser",
                 command: "",
                 path: None,
-                roles: &[Other, Deny, Other],
+                roles: &[Other, Deny, Persist],
                 select: Select::ArrowsEnter,
                 cancel: None,
                 footer: false,
@@ -6497,6 +7404,25 @@ mod tests {
             Some(Origin::Plugin { name: None })
         );
         assert_eq!(o("Bash command"), None);
+        // 2.1.286's POSITION LABEL (`2 of 5`) is no part of the title, wherever
+        // the frame put it: the header reads as it does without.
+        let x = h("Bash command · from the \"verify\" workflow                    2 of 5");
+        assert_eq!(
+            (x.base.as_str(), x.origin),
+            (
+                "Bash command",
+                Some(Origin::Workflow {
+                    name: some("verify")
+                })
+            )
+        );
+        assert_eq!(
+            h("Bash command (runs on m3)          1 of 2")
+                .runs_on
+                .as_deref(),
+            Some("m3")
+        );
+        assert_eq!(h("Read file(s) 3 of 3").base, "Read file(s)");
         let x = h("Bash command (unsandboxed) · from a subagent");
         assert_eq!(
             (x.base.as_str(), x.unsandboxed, x.runs_on.as_deref()),
@@ -6604,14 +7530,70 @@ mod tests {
             // The measured kinds keep their prefix reading.
             ("Bash command · from somewhere", Some(PromptKind::Bash)),
             ("Read file(s)", Some(PromptKind::Read)),
+            // A position label (`n of m`, 1 <= n <= m, m >= 2) closes the row of
+            // a box that is one of several; it names no other kind. NEGATIVE
+            // CONTROLS: a count that is no position (`3 of 2`, `1 of 1`, a word
+            // for a number) is part of the title it ends.
+            (
+                "Tool use                          1 of 2",
+                Some(PromptKind::Tool),
+            ),
+            ("Fetch    2 of 5", Some(PromptKind::Fetch)),
+            (
+                "PowerShell command (unsandboxed)      12 of 14",
+                Some(PromptKind::PowerShell),
+            ),
+            (
+                "Held message from another session     1 of 2",
+                Some(PromptKind::HeldMessage),
+            ),
+            (
+                "Claude proposes a goal     2 of 3",
+                Some(PromptKind::GoalProposal),
+            ),
+            ("Enter plan mode?   2 of 3", Some(PromptKind::PlanEnter)),
+            ("Tool use   3 of 2", None),
+            ("Tool use   1 of 1", None),
+            ("Tool use   one of two", None),
+            ("Tool usage   1 of 2", None),
+            ("Monitor details   1 of 2", None),
         ] {
             assert_eq!(header_kind(title), kind, "{title}");
+        }
+        // The whole box, its title row labelled the way the frame draws it
+        // (right-aligned to the rule's width): the same kind, title, header and
+        // options as the box alone.
+        for text in [
+            BOX_BASH_SUBAGENT,
+            BOX_EDIT,
+            BOX_TOOL,
+            BOX_FETCH,
+            BOX_MONITOR,
+            HELD_MESSAGE,
+            GOAL_PROPOSAL,
+        ] {
+            let plain = screen(text);
+            let mut labelled = plain.clone();
+            let rule = labelled.iter().position(|r| r.starts_with('─')).unwrap();
+            let width = labelled[rule].chars().count();
+            let title = labelled[rule + 1].trim_end().to_string();
+            let gap = width - title.chars().count() - " 2 of 5 ".len();
+            labelled[rule + 1] = format!("{title}{} 2 of 5 ", " ".repeat(gap));
+            let (a, b) = (
+                parse_prompt_v2(&plain).expect("the box"),
+                parse_prompt_v2(&labelled).expect("the labelled box"),
+            );
+            assert_eq!(
+                (a.kind, &a.title, a.header(), &a.options),
+                (b.kind, &b.title, b.header(), &b.options),
+                "{title}"
+            );
         }
     }
 
     /// A FOOTERLESS BOX is read at the live bottom, and only there. Each
     /// footerless fixture reads — the setup dialogs too, as kind `other`
-    /// (round-2 review, 2026-09-24: they read authoritative idle before);
+    /// (never authoritative idle);
     /// NEGATIVE CONTROLS on every one: quoted in a tool's output under the
     /// `⎿` gutter; scrolled into the transcript (the composer under it, or
     /// the worker's next row); without the rule over its title; with a title
@@ -6625,9 +7607,12 @@ mod tests {
             BOX_NETWORK,
             BOX_BROWSER,
             HELD_MESSAGE,
+            HELD_MESSAGE_2_1_287,
             PLAN_ENTER,
             PLAN_READY,
             GOAL_PROPOSAL,
+            // MEASURED on 2.1.292: the Pane draws the title at column TWO.
+            GOAL_PROPOSAL_2_1_292,
             SETUP_AUTO_MODE_DEFAULT,
             SETUP_CHROME_UPSELL,
             SETUP_REMOTE_CONTROL,
@@ -6670,11 +7655,10 @@ mod tests {
                 .collect();
             assert_eq!(parse_prompt_v2(&ruleless), None, "{name} without its rule");
 
-            // A title no kind has is a setup dialog (round-2 review): kind
-            // `other`, never the kind it was — and a title of a kind that
-            // always draws its footer is never read as that kind (no box).
-            // The plan dialog's own second titled row names it by itself
-            // (the final review r3, minor): retitled either way, it is
+            // A title no kind has is a setup dialog: kind `other`, never the
+            // kind it was — and a title of a kind that always draws its footer
+            // is never read as that kind (no box). The plan dialog's own
+            // second titled row names it by itself: retitled either way, it is
             // still the plan's approval, titled by that row.
             let mut retitled = r.clone();
             retitled[p.span.0] = " Something else entirely".to_string();
@@ -6733,6 +7717,24 @@ mod tests {
         let p = parse_prompt_v2(&screen(PLAN_READY)).expect("the box");
         assert_eq!(p.options.len(), 3);
         assert_eq!(p.options[0].label, "Yes, and use auto mode");
+        // 2.1.287's held message: its preview is bracketed by dashed rules and the
+        // options sit right under them, so the options are the two under the last
+        // rule — not the label, the dashes and the preview over it.
+        let p = parse_prompt_v2(&screen(HELD_MESSAGE_2_1_287)).expect("the box");
+        assert_eq!(p.kind, PromptKind::HeldMessage);
+        assert_eq!(
+            p.options
+                .iter()
+                .map(|o| (o.role, o.label.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Role::Deny,
+                    "Deny — drop it and tell the sender it was declined"
+                ),
+                (Role::Other, "Deliver this message to Claude"),
+            ]
+        );
         // The cancel of a footerless box is its `(esc)` option.
         let p = parse_prompt_v2(&screen(BOX_BROWSER)).expect("the box");
         let c = p.cancel.expect("the (esc) option");
@@ -6856,7 +7858,7 @@ mod tests {
         assert_eq!(p.kind, PromptKind::Other);
     }
 
-    /// A CARD-MODE TOOL BOX (harness round-1 review, 2026-09-24): y5n()
+    /// A CARD-MODE TOOL BOX: y5n()
     /// titles it by the card's question, or by the tool's name when the box
     /// has an origin (or the question does not fit), never `Tool use` — read
     /// by its shape as [`PromptKind::Tool`], [`PromptV2::tool_card`], each
@@ -6930,31 +7932,10 @@ mod tests {
         assert_eq!(q.kind, PromptKind::Question);
     }
 
-    /// The trust dialog's gated-grants backstop: `No, continue without these
-    /// permissions` refuses (the folder's grants) and so does its Esc — it
-    /// goes on, it does not exit. The control: the first-launch dialog's
-    /// cancel still exits.
-    #[test]
-    fn the_trust_backstop_cancel_declines_the_grants() {
-        let p = parse_prompt_v2(&screen(TRUST_BACKSTOP)).expect("the dialog");
-        assert_eq!(p.options[0].label, "No, continue without these permissions");
-        assert!(p.options[0].focused);
-        assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Reject));
-        assert!(
-            p.description
-                .contains("This folder pre-approves 3 tool permissions"),
-            "{}",
-            p.description
-        );
-        let p = parse_prompt_v2(&screen(TRUST)).expect("the control");
-        assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Exit));
-    }
-
-    /// The harness round-3 review (2026-09-24, blocking): a live box taller
-    /// than the pane, whose title row is off the screen, is a box — its head
-    /// off screen, kind `other` (or `question` where its footer says so),
-    /// prompt phase — never authoritative idle, which stalled the session
-    /// silently with nothing pressed or escalated: the incident's own box in
+    /// A live box taller than the pane, whose title row is off the screen,
+    /// is a box — its head off screen, kind `other` (or `question` where its
+    /// footer says so), prompt phase — never authoritative idle, a silent
+    /// stall with nothing pressed or escalated: the incident's own box in
     /// a 14-row pane, a 60-line heredoc in a 49-row pane, an 80-row Edit
     /// diff (whose first visible row may be a `╌` edge at column 0 or a
     /// right-aligned line number at column three), a question whose top is
@@ -6982,7 +7963,7 @@ mod tests {
         let cut = [
             ("incident, 14 rows", tail(&incident, 14), PromptKind::Other),
             // Its title on row 0, its rule cut: the first visible row is
-            // never taken for the title (the final review r2, blocking).
+            // never taken for the title.
             ("incident, 17 rows", tail(&incident, 17), PromptKind::Other),
             ("heredoc, 49 rows", tail(&heredoc, 49), PromptKind::Other),
             ("edit, 49 rows", tail(&edit, 49), PromptKind::Other),
@@ -7110,7 +8091,7 @@ mod tests {
         assert_eq!(whole.kind, PromptKind::Bash);
     }
 
-    /// The harness round-3 review (2026-09-24, minor): a box whose walk up
+    /// A box whose walk up
     /// stopped at its `Do you want …` row — under a body row led by `⎿`,
     /// which [`box_top`] takes for a said row — is no card-mode tool box
     /// titled `Do you want to proceed?`: its kind stays `other` (it is
@@ -7120,8 +8101,8 @@ mod tests {
     fn a_box_cut_at_its_question_is_no_tool_card() {
         // Claude's own `⎿` output row at the screen's top ([`gutter_row`]),
         // the rest of the box under it: the walk stops at the question row.
-        // A `⎿` at column three inside the box's body stops nothing since
-        // the final review r3 (its own test).
+        // A `⎿` at column three inside the box's body stops nothing (its
+        // own test).
         let r = rows(&[
             "  ⎿  (tool output)",
             "   Print it",
@@ -7151,7 +8132,7 @@ mod tests {
         );
     }
 
-    /// The harness round-3 review (2026-09-24, major): Claude Code's own
+    /// Claude Code's own
     /// composer block is no footerless dialog. At launch (its `Try "…"`
     /// placeholder, a bypass footer) and in the first turn before the first
     /// `⏺` (a typed-ahead draft, numbered or not), under a table in the
@@ -7284,7 +8265,7 @@ mod tests {
             .position(|r| r.starts_with('\u{2594}'))
             .expect("the panel rule");
         let title = rule + 1;
-        // The review of 2026-09-26. Read FIRST: with nothing of the transcript
+        // Read FIRST: with nothing of the transcript
         // left above it (turn duration off, the reply scrolled away) no other
         // reading claims it as a box with its head off the screen.
         let mut bare = rows.clone();
@@ -7343,7 +8324,7 @@ mod tests {
         }
     }
 
-    /// The harness final review (2026-09-24, major): a FOOTERLESS box whose
+    /// A FOOTERLESS box whose
     /// title row — or the rule right above it — is not on the rows read is a
     /// box with its head off the screen, never authoritative idle: every
     /// tail of the network, Chrome, held-message, goal, plan-enter, setup and
@@ -7446,7 +8427,7 @@ mod tests {
         }
     }
 
-    /// The harness final review r2 (2026-09-24, blocking): a footed box drawn
+    /// A footed box drawn
     /// in a proposed goal's column-1 text — the model's words — is never
     /// read as the live box, whatever part of the screen the read holds. (a)
     /// Whole, the box is the goal, with the goal's own options. (b) With the
@@ -7537,7 +8518,7 @@ mod tests {
         assert_eq!(p.kind, PromptKind::Bash, "{gutter:#?}");
     }
 
-    /// The harness final review r2 (2026-09-24, minor): a footerless option
+    /// A footerless option
     /// block is the box of the NEAREST titled row above it. A setup dialog
     /// with an older network or Chrome box's rule and title above it (an
     /// Ink stale frame) is the setup dialog — kind `other`, its own title —
@@ -7584,12 +8565,10 @@ mod tests {
         assert_eq!(plan.kind, PromptKind::PlanExit);
     }
 
-    /// The harness final review r2 (2026-09-24, minor, a regression from the
-    /// final review's footerless head cut): Claude Code's composer whose top
-    /// rule is cut — a pane as short as its draft plus two rows — is no box
-    /// with its head off the screen: the last three rows of the survey
-    /// capture and of `wait_bg12` read idle and busy, as before the head
-    /// cut, and a one- or three-line draft over its bottom rule and footer
+    /// Claude Code's composer whose top rule is cut — a pane as short as its
+    /// draft plus two rows — is no box with its head off the screen: the last
+    /// three rows of the survey capture and of `wait_bg12` read idle and
+    /// busy, and a one- or three-line draft over its bottom rule and footer
     /// reads idle. The control: a real footerless box cut the same way (its
     /// own test) is still a box.
     #[test]
@@ -7634,7 +8613,7 @@ mod tests {
         }
     }
 
-    /// The harness final review r3 of 2026-09-24 (blocking): a live box
+    /// A live box
     /// whose body holds a row led by `⎿` at column three or more — a Bash
     /// heredoc writing a Claude transcript, a skill's description, an
     /// AskUserQuestion option's description — followed by a blank row read
@@ -7797,7 +8776,7 @@ mod tests {
         }
     }
 
-    /// The harness final review r3 of 2026-09-24 (minor): a `Ready to
+    /// A `Ready to
     /// code?` plan taller than the window's 40-row tail keeps only its
     /// second titled row (`Claude has written up a plan …`, anchor
     /// `plan.proceed`) on the rows read — and read as a setup dialog of kind
@@ -7849,11 +8828,6 @@ mod tests {
     /// `No` the refusal. NEGATIVE CONTROL: a header naming no tool is no box.
     #[test]
     fn a_workflow_subagents_bash_box_is_a_bash_box() {
-        assert!(
-            provenance(BOX_RM_WORKFLOW)
-                .is_some_and(|l| l.starts_with("claude-code 2.1.28x · LIVE")),
-            "line 1 says what it is"
-        );
         let r = screen(BOX_RM_WORKFLOW);
         let p = parse_prompt_v2(&r).expect("the box");
         assert_eq!(p.kind, PromptKind::Bash);
@@ -7893,12 +8867,6 @@ mod tests {
         );
     }
 
-    /// 2.1.281's plan approval, drawn two columns in with no Esc hint, is a
-    /// box (its question row the box's first). NEGATIVE CONTROLS: the same
-    /// rows with the composer frame under them (a transcript quoting them),
-    /// and with a row of the worker's words under the options, are no box —
-    /// nor is the question dialog's review under either (its reading is
-    /// `crate::question`'s, `question_tests.rs`).
     /// THE OWNER'S OWN REVIEW (owner directive, 2026-09-25): a box whose
     /// reason block names an ask rule or a hook is read as the owner's
     /// configuration sending it to a person — the measured ask-rule box, and
@@ -7964,10 +8932,363 @@ mod tests {
             ("rm auto-deny", BOX_RM_AUTO_DENY),
             ("question", QUESTION_TABS_INCIDENT),
             ("review", QUESTION_REVIEW),
+            // 2.1.287's boxes (module header, "THE BRACKETED BOX"): no reason
+            // block, the rm breaker, and the classifier's own fallback, which
+            // is Claude Code's and not the owner's.
+            ("bash 2.1.287", BOX_BASH_2_1_287),
+            ("read 2.1.287", BOX_BASH_READ_2_1_287),
+            ("multiline", BOX_BASH_MULTILINE_2_1_287),
+            ("rm breaker 2.1.287", BOX_RM_BREAKER_2_1_287),
+            ("classifier fallback", BOX_CLASSIFIER_FALLBACK_2_1_287),
+            ("fetch 2.1.287", BOX_FETCH_2_1_287),
+            ("write 2.1.287", BOX_WRITE_CREATE_2_1_287),
+            // NOT DRAWN: a Write a hook forced shows no reason, so there is
+            // nothing to read (module header, "THE BRACKETED BOX").
+            ("write under a hook", BOX_WRITE_HOOK_ASK_2_1_287),
         ] {
             let p = parse_prompt_v2(&screen(text)).expect("the box");
             assert_eq!(p.owner_review(), None, "{name}: {p:?}");
         }
+
+        // MEASURED on 2.1.287, which draws the reason UNDER the dashed rules at
+        // the command's own column: read off the box, the command and the
+        // description kept out of it. (The 2.1.287 reader read the reason as
+        // the command's description, and the harness pressed these boxes.)
+        let hook_noreason = box_bash_hook_ask_noreason_2_1_287();
+        for (name, text, kind, says) in [
+            (
+                "bash ask rule",
+                BOX_BASH_ASK_RULE_2_1_287,
+                ReviewKind::Rule,
+                "Permission rule Bash(touch:*) requires confirmation for this command.",
+            ),
+            (
+                "bash hook",
+                BOX_BASH_HOOK_ASK_2_1_287,
+                ReviewKind::Hook,
+                "Hook PreToolUse:Bash requires confirmation for this command: owner review",
+            ),
+            (
+                "fetch ask rule",
+                BOX_FETCH_ASK_RULE_2_1_287,
+                ReviewKind::Rule,
+                "Permission rule WebFetch(domain:127.0.0.1) requires confirmation for this tool.",
+            ),
+            (
+                "bash ask rule over auto mode",
+                BOX_BASH_ASK_RULE_AUTO_2_1_287,
+                ReviewKind::AutoModeRule,
+                "Ask rule Bash(touch:*) overrides auto mode for this command.",
+            ),
+            (
+                "bash hook, no reason",
+                hook_noreason.as_str(),
+                ReviewKind::Hook,
+                "Hook PreToolUse:Bash requires confirmation for this command.",
+            ),
+            // A box taller than the pane: its head is off the screen, the
+            // reason under the second rule is not.
+            (
+                "tall bash ask rule",
+                BOX_BASH_TALL_ASK_RULE_2_1_287,
+                ReviewKind::Rule,
+                "Permission rule Bash(touch:*) requires confirmation for this command.",
+            ),
+        ] {
+            let p = parse_prompt_v2(&screen(text)).expect(name);
+            assert_eq!(p.head_off_screen, name.starts_with("tall"), "{name}");
+            let r = p.owner_review().unwrap_or_else(|| panic!("{name}: {p:?}"));
+            assert_eq!(r.kind, kind, "{name}");
+            assert!(r.text.starts_with(says), "{name}: {r:?}");
+        }
+
+        // Tb stacks up to three reasons on consecutive rows: the owner's may
+        // come second, behind the classifier's own.
+        let mut stacked = screen(BOX_CLASSIFIER_FALLBACK_2_1_287);
+        let blank = stacked
+            .iter()
+            .rposition(|r| r.trim() == "Do you want to proceed?")
+            .expect("the question")
+            - 1;
+        assert!(stacked[blank].trim().is_empty());
+        stacked.splice(
+            blank..blank,
+            [
+                " Permission rule Bash(touch:*) requires confirmation for this command.",
+                " /permissions to update rules",
+            ]
+            .map(str::to_string),
+        );
+        let r = parse_prompt_v2(&stacked)
+            .and_then(|p| p.owner_review())
+            .expect("the owner's review behind the classifier's");
+        assert_eq!(r.kind, ReviewKind::Rule);
+    }
+
+    /// THE BRACKETED BOX (module header; MEASURED on 2.1.287, 2026-10-01): a
+    /// tool's own content sits between two dashed rules at column ZERO, the
+    /// description and the dialog's `Tip:` subtitle over them, the reasons
+    /// for asking under them. The command is what is between the rules —
+    /// never the description over them (the box of `rm -rf ./lab-doomed`
+    /// described `ls`: joined, `ls rm -rf ./lab-doomed` reads as a listing),
+    /// never the reason under them. The Fetch box, which has no footer, is a
+    /// box at all only with the dashes allowed in its head. NEGATIVE
+    /// CONTROLS: a row of dashes the MODEL writes sits at column one or in a
+    /// `│` bar, so it ends nothing; the 2.1.282 layout has no dashes and is
+    /// read as before (the fixtures above).
+    #[test]
+    fn a_bracketed_box_is_read_by_its_dashes_not_by_a_column() {
+        let bash = |text: &str| {
+            let p = parse_prompt_v2(&screen(text)).expect("the box");
+            assert_eq!(p.kind, PromptKind::Bash);
+            assert_eq!(crate::worker_phase(&screen(text)), crate::Phase::Prompt);
+            assert!(p.notes.iter().all(|n| !n.contains('╌')), "{:?}", p.notes);
+            p
+        };
+        // (fixture, command rows, description, barred)
+        for (text, command, description, gutter) in [
+            (BOX_BASH_2_1_287, &["rm -rf ./lab-doomed"][..], "ls", false),
+            (
+                BOX_BASH_READ_2_1_287,
+                &["wc -l /etc/hosts"],
+                "Count the lines of the hosts file",
+                false,
+            ),
+            (
+                BOX_BASH_MULTILINE_2_1_287,
+                &["touch lab-m1.txt", "touch lab-m2.txt", "# a comment line"],
+                "Create two witness files",
+                true,
+            ),
+            (
+                BOX_BASH_ASK_RULE_2_1_287,
+                &["touch lab-witness-b.txt"],
+                "Create a witness file",
+                false,
+            ),
+            (
+                BOX_BASH_HOOK_ASK_2_1_287,
+                &["touch lab-witness-c.txt"],
+                "Create a witness file",
+                false,
+            ),
+            (
+                BOX_CLASSIFIER_FALLBACK_2_1_287,
+                &["python3 -c \"print(2)\""],
+                "Print two",
+                false,
+            ),
+            // A subagent's box (2.1.291): its footer has a third item.
+            (
+                BOX_BASH_BACKGROUND_AGENT_2_1_292,
+                &["touch sub-x"],
+                "Create sub-x",
+                false,
+            ),
+        ] {
+            let p = bash(text);
+            assert_eq!(p.command_rows, command, "{text:.60}");
+            assert_eq!(p.description, description);
+            assert_eq!((p.description_rows, p.gutter), (0, gutter));
+            // Every reading a decider judges is the command alone.
+            assert_eq!(p.readings()[0], command.join(" "));
+        }
+        // A subagent's footer (module header, "A SUBAGENT'S BOX"): the box is
+        // read whole under the note, under its `again` form and, cut by a
+        // narrow pane (`wrap="truncate"`), wherever the cut falls past the
+        // first two items — and its `Esc` is still the box's cancel.
+        // CONTROLS: a row that is no footer stays none (the note alone, a row
+        // with an item that is no hint, a chord of five words).
+        let note = "ctrl+x ctrl+k twice to stop background agents";
+        let mut footers = vec![
+            format!(" Esc to cancel · Tab to amend · {note}"),
+            format!(
+                " Esc to cancel · Tab to amend · {}",
+                note.replace("twice", "again")
+            ),
+            format!(" Esc to cancel · {note}"),
+        ];
+        let whole = format!(" Esc to cancel · Tab to amend · {note}");
+        footers.extend(
+            (31..whole.chars().count())
+                .map(|n| format!("{}…", whole.chars().take(n).collect::<String>())),
+        );
+        for footer in &footers {
+            let mut rows = screen(BOX_BASH_BACKGROUND_AGENT_2_1_292);
+            *rows.last_mut().expect("the footer") = footer.clone();
+            let p = bash(&rows.join("\n"));
+            assert_eq!(
+                crate::worker_phase(&rows),
+                crate::Phase::Prompt,
+                "{footer:?}"
+            );
+            assert_eq!(p.command_rows, ["touch sub-x"], "{footer:?}");
+            assert_eq!(
+                p.cancel.as_ref().map(|c| c.effect),
+                Some(CancelEffect::Reject),
+                "{footer:?}"
+            );
+        }
+        // The same box stacked with another (`1 of 2`) in a 72-column pane,
+        // MEASURED: the Tip row and two options wrap, the note is cut.
+        let p = bash(BOX_BASH_BACKGROUND_AGENT_STACKED_2_1_292);
+        assert_eq!(p.command_rows, ["touch sub-a"]);
+        assert_eq!(
+            p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
+            [Role::Once, Role::Persist, Role::ModeSwitch, Role::Deny]
+        );
+        assert_eq!(p.base_title().as_deref(), Some("Bash command"));
+        for not in [
+            format!(" {note}"),
+            " Esc to cancel · whatever the vendor draws · ctrl+x ctrl+k twice to stop background agents"
+                .to_string(),
+            " Esc to cancel · Tab to amend · ctrl+x ctrl+k ctrl+j ctrl+l ctrl+o twice to stop background agents"
+                .to_string(),
+        ] {
+            assert!(!is_hint_footer(&not), "{not:?}");
+        }
+        // The note blocks are the reasons, whole.
+        let p = bash(BOX_BASH_ASK_RULE_2_1_287);
+        assert_eq!(
+            p.notes,
+            [
+                "Permission rule Bash(touch:*) requires confirmation for this command. /permissions to update rules"
+            ]
+        );
+        let p = bash(BOX_RM_BREAKER_2_1_287);
+        assert!(p.command_rows[0].starts_with("S=/private/tmp/at-nonexistent-lab;"));
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+        assert!(p.rm_breaker().is_some(), "{:?}", p.notes);
+
+        // The Fetch box: read at all, its subject the url row.
+        for text in [BOX_FETCH_2_1_287, BOX_FETCH_ASK_RULE_2_1_287] {
+            let r = screen(text);
+            assert_eq!(crate::worker_phase(&r), crate::Phase::Prompt);
+            let p = parse_prompt_v2(&r).expect("the fetch box");
+            assert_eq!(p.kind, PromptKind::Fetch);
+            assert!(
+                p.command.starts_with("url: http://127.0.0.1:"),
+                "{}",
+                p.command
+            );
+            assert_eq!(p.select, Select::Digits);
+            assert_eq!(
+                p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
+                [Role::Once, Role::Persist, Role::Deny]
+            );
+            assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Reject));
+        }
+
+        // Without the Tip row (which only masks it: its first word is no
+        // command) the description is still no part of the command: `ls` over
+        // `rm -rf ./lab-doomed` is two things, not a listing.
+        let mut bare = screen(BOX_BASH_2_1_287);
+        bare.retain(|r| !r.trim().starts_with("Tip:"));
+        assert_eq!(bash_of(&bare).readings(), ["rm -rf ./lab-doomed"]);
+
+        // A dash row of the model's own ends nothing: at column one, inside the
+        // bracket, it is one more command row.
+        let mut forged = screen(BOX_BASH_2_1_287);
+        let at = forged
+            .iter()
+            .position(|r| r.trim() == "rm -rf ./lab-doomed")
+            .expect("the command");
+        forged.insert(at, format!(" {}", "╌".repeat(40)));
+        let p = bash_of(&forged);
+        assert_eq!(p.command_rows.len(), 2, "{:?}", p.command_rows);
+        assert!(
+            p.readings()
+                .iter()
+                .all(|r| r.contains("rm -rf ./lab-doomed"))
+        );
+    }
+
+    /// MEASURED: a Read box draws its call, `Read(<path>)` — alone under the
+    /// title on 2.1.284, between two dashed rules on 2.1.292. The reader took
+    /// the call (or the first rule) for the path, so no rule that goes by the
+    /// path (`approve = "safe"`) could judge a Read. The view the model asked
+    /// for stands INSIDE the parentheses (2.1.292: `Read(/etc/hosts · lines
+    /// 1-5)`, `· from line 3`, `· pages 1-3`): the path is the whole text, and
+    /// the decider reads the readings it can mean.
+    #[test]
+    fn a_read_boxs_call_names_its_path() {
+        for (text, call) in [
+            (BOX_READ_OUTSIDE_2_1_292, " Read(/etc/hosts)"),
+            (BOX_READ_OUTSIDE_2_1_284, "  Read(/etc/hosts)"),
+        ] {
+            let p = parse_prompt_v2(&screen(text)).expect("the box");
+            assert_eq!(p.kind, PromptKind::Read);
+            assert_eq!(p.path.as_deref(), Some("/etc/hosts"), "{call}");
+            assert_eq!(p.owner_review(), None, "{p:?}");
+            assert_eq!(
+                p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
+                [Role::Once, Role::Session, Role::Deny]
+            );
+            // A long call wraps in a narrow pane: its rows are one path.
+            let mut rows = screen(text);
+            let at = rows.iter().position(|r| r == call).expect("the call");
+            rows.splice(at..=at, [" Read(/etc/ho".to_string(), " sts)".to_string()]);
+            let p = parse_prompt_v2(&rows).expect("the wrapped box");
+            assert_eq!(p.path.as_deref(), Some("/etc/hosts"), "{p:?}");
+            // The view rides inside the call, whole.
+            for arg in [
+                "/etc/hosts · lines 1-5",
+                "/etc/hosts · pages  1 - 3 ",
+                "a · b",
+            ] {
+                let mut rows = screen(text);
+                let at = rows.iter().position(|r| r == call).expect("the call");
+                rows[at] = format!("  Read({arg})");
+                let p = parse_prompt_v2(&rows).expect("the decorated box");
+                assert_eq!(p.path.as_deref(), Some(arg), "{arg}");
+            }
+        }
+        // A title that wrapped over the first rule is a box this reader does
+        // not know whole: no path.
+        let mut rows = screen(BOX_READ_OUTSIDE_2_1_292);
+        let at = rows
+            .iter()
+            .position(|r| r == " Read file")
+            .expect("the title");
+        rows.insert(at + 1, " (runs on m3)".to_string());
+        let p = parse_prompt_v2(&rows).expect("the box");
+        assert_eq!(p.path, None, "{p:?}");
+    }
+
+    #[test]
+    fn a_narrow_panes_wrapped_command_cannot_forge_a_box_title() {
+        for text in [
+            include_str!("fixtures/claude-2.1.292-box-bash-forge-w40-ask-forged-title.txt"),
+            include_str!("fixtures/claude-2.1.292-box-bash-forge-w40-hook-forged-title.txt"),
+            include_str!("fixtures/claude-2.1.292-box-bash-forge-w52-ask-forged-title.txt"),
+        ] {
+            let p = parse_prompt_v2(&screen(text)).expect("the box");
+            assert!(
+                p.owner_review().is_some(),
+                "the owner's reason sits under the last dashed rule and the model's own wrapped rows must not hide it: {p:?}"
+            );
+            // And the box read from the model's forged top is no box read whole:
+            // one dashed rule is left in it, and nothing presses it at any level.
+            assert!(p.head_off_screen, "{p:?}");
+        }
+    }
+
+    /// MEASURED on 2.1.284 (2026-10-06, boxrev-safety): a command the vendor cannot check, under the owner's bare
+    /// `Bash` ask rule, draws `This command requires approval` right over the rule's own row. The old layout's
+    /// note rows are joined into ONE block, which then does not open with `Permission rule `.
+    #[test]
+    fn a_vendor_reason_stacked_over_the_owners_rule_does_not_hide_it_in_the_old_layout() {
+        let rows = screen(include_str!(
+            "fixtures/claude-2.1.284-box-bash-ask-rule-stacked-reasons.txt"
+        ));
+        let p = parse_prompt_v2(&rows).expect("the box");
+        assert!(p.owner_review().is_some(), "{p:?}");
+    }
+
+    fn bash_of(rows: &[String]) -> PromptV2 {
+        let p = parse_prompt_v2(rows).expect("the box");
+        assert_eq!(p.kind, PromptKind::Bash);
+        p
     }
 
     /// Narrow non-shell dialogs retain the owner's review when its anchors
@@ -8004,6 +9325,14 @@ mod tests {
                 ReviewKind::Hook,
                 [
                     " │ A hook configured in the remote workspace",
+                    " │ requires confirmation: owner review",
+                ],
+            ),
+            // 2.1.287's wording of the same reason.
+            (
+                ReviewKind::Hook,
+                [
+                    " │ A hook run for this remote session",
                     " │ requires confirmation: owner review",
                 ],
             ),
@@ -8065,6 +9394,12 @@ mod tests {
         );
     }
 
+    /// 2.1.281's plan approval, drawn two columns in with no Esc hint, is a
+    /// box (its question row the box's first). NEGATIVE CONTROLS: the same
+    /// rows with the composer frame under them (a transcript quoting them),
+    /// and with a row of the worker's words under the options, are no box —
+    /// nor is the question dialog's review under either (its reading is
+    /// `crate::question`'s, `question_tests.rs`).
     #[test]
     fn the_plan_approval_is_a_box_without_a_footer() {
         let r = screen(PLAN_APPROVAL);
@@ -8094,6 +9429,52 @@ mod tests {
             let mut said = screen(dialog);
             said.push("⏺ Done.".to_string());
             assert_eq!(parse_prompt_v2(&said), None, "words under it");
+        }
+    }
+
+    /// The row readings rewritten on bytes read every fixture row, whole and
+    /// cut to a few widths, as the char readings they replaced did.
+    #[test]
+    fn the_byte_row_readings_are_the_char_readings() {
+        fn option_row_by_chars(row: &str, cur: &[char]) -> Option<(u8, String)> {
+            let t = row.trim_start();
+            let t = t.strip_prefix(cur).map(str::trim_start).unwrap_or(t);
+            let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() || digits.len() > 2 {
+                return None;
+            }
+            let rest = t[digits.len()..].strip_prefix('.')?;
+            if !rest.starts_with(' ') {
+                return None;
+            }
+            Some((digits.parse().ok()?, rest.trim().to_string()))
+        }
+        fn is_hint_footer_by_chars(row: &str) -> bool {
+            let t = row.trim();
+            if t.is_empty() || crate::phase::leading_spaces(row) > 3 {
+                return false;
+            }
+            let mut parts: Vec<&str> = t.split(" · ").collect();
+            if parts.len() > 1 && parts.last().is_some_and(|p| p.ends_with('…')) {
+                parts.pop();
+            }
+            let items: Vec<Option<(&str, &str)>> = parts.into_iter().map(hint_item).collect();
+            items.iter().all(Option::is_some)
+                && items.iter().flatten().any(|(key, _)| *key == "Esc")
+        }
+        for screen in crate::text::fixture_screens() {
+            for width in [usize::MAX, 1, 2, 3, 6, 12, 40] {
+                for r in screen
+                    .iter()
+                    .map(|r| r.chars().take(width).collect::<String>())
+                {
+                    for cur in [ARROW, cursors(crate::anchor("limit.title"))] {
+                        assert_eq!(option_row(&r, cur), option_row_by_chars(&r, cur), "{r:?}");
+                        assert_eq!(strip_cursor(&r, cur), r.strip_prefix(cur), "{r:?}");
+                    }
+                    assert_eq!(is_hint_footer(&r), is_hint_footer_by_chars(&r), "{r:?}");
+                }
+            }
         }
     }
 }

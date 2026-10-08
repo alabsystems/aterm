@@ -431,6 +431,41 @@ fn corrupt_warm_block_quarantines_only_on_final_eviction_attempt() {
     }
 }
 
+/// A block quarantined with older history beside it in cold keeps its rows,
+/// blank, and counts its lines as lost (SB1,
+/// docs/AUDIT-persisted-state-2026-10-07.md): dropping them from the middle
+/// would hand every older line the index of the line five newer.
+#[test]
+fn quarantine_mid_history_keeps_rows_and_counts_the_loss() {
+    let mut sb = Scrollback::with_block_size(5, 5, 10_000_000, 5);
+    for i in 0..15 {
+        sb.push_str(&format!("Line {i}"));
+    }
+    assert_eq!(sb.cold_line_count(), 5, "older history sits in cold");
+    sb.warm.corrupt_oldest_block();
+    let corrupt = 5..10;
+
+    let mut pushed = 15;
+    for _ in 0..crate::tier::QUARANTINE_THRESHOLD {
+        for _ in 0..5 {
+            sb.push_str(&format!("Line {pushed}"));
+            pushed += 1;
+        }
+    }
+
+    assert_eq!(sb.line_count(), pushed, "every row keeps its index");
+    assert_eq!(sb.pressure_evicted_lines(), 5, "the lost text is counted");
+    for i in 0..pushed {
+        let line = sb.get_line(i).expect("decodes").expect("in range");
+        let expected = if corrupt.contains(&i) {
+            String::new()
+        } else {
+            format!("Line {i}")
+        };
+        assert_eq!(line.to_string(), expected, "line {i}");
+    }
+}
+
 /// Iterator skips quarantined warm block lines without redundant decompression.
 /// Before the fix, each line in a corrupt block triggered a separate decompress
 /// attempt, causing O(B) wasted work per iteration pass.

@@ -38,9 +38,8 @@ struct Receipt {
     /// `github::app_build_in_flight`), and how many consecutive completed checks of
     /// this source, machine-wide and WHATEVER BUILD made them, have found that same
     /// head so. Absent otherwise. Not keyed on the build: after an update the old
-    /// build's session processes and the new build's window both check, and a count
-    /// each reset to 1 on the other's receipt kept both on the 2-minute rung for as
-    /// long as the head stayed in flight (audit F5, 2026-09-24).
+    /// build's session processes and the new build's window both check, and a
+    /// per-build count would keep both on the 2-minute rung.
     #[serde(skip_serializing_if = "Option::is_none")]
     head_in_flight: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,7 +220,7 @@ mod tests {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(staging.root);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 
     /// A deferral recorded by a completed check survives every later apply/status
@@ -252,13 +251,13 @@ mod tests {
         )
         .unwrap();
         assert!(crate::checker_skip_for(&staging, 42, &source, base, now).is_none());
-        let _ = std::fs::remove_dir_all(staging.root);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 
     /// THE DEDUP WINDOW MAY NOT OUTLAST THE QUICK LADDER. A completed check 100 s
-    /// ago skips every checker on the 10-minute base (the 7-minute window — the
-    /// negative control: sized on the base, the checker's own 2-minute re-check read
-    /// its own stamp as a sibling's and waited out the window). The same receipt
+    /// ago skips every checker on the 10-minute base (the 7-minute window; the
+    /// negative control: sized on the base, the checker's own 2-minute re-check would
+    /// read its own stamp as a sibling's and wait out the window). The same receipt
     /// carrying a head in flight sizes the window on the rung its count names (84 s
     /// for the 2-minute rung, 168 s for the 4-minute one, 336 s for the 8-minute
     /// one), and once the rungs are spent, or on a deferral, the ordinary window
@@ -307,17 +306,13 @@ mod tests {
         )
         .unwrap();
         assert!(skip().is_some(), "a deferral holds its own window");
-        let _ = std::fs::remove_dir_all(staging.root);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// TWO BUILDS CHECKING WALK ONE LADDER (audit F5, 2026-09-24). After an update
-    /// the old build's session processes and the new build's window both check;
-    /// keyed on the build, each reset the other's count to 1, so both stayed on the
-    /// 2-minute rung all night. The count is the source's and the head's: the
-    /// interleaved checks of builds 42 and 41 count 1, 2, 3, 4, and the fourth has
-    /// spent the quick rungs. Negative controls: a different source's receipt, a
-    /// different head, and a completed check that found none each start the run
-    /// over.
+    /// TWO BUILDS CHECKING WALK ONE LADDER. The count is the source's and the
+    /// head's: interleaved checks of builds 42 and 41 count 1, 2, 3, 4, and the
+    /// fourth has spent the quick rungs. Negative controls: a different source, a
+    /// different head, and a completed check that found none each restart the run.
     #[test]
     fn two_builds_checking_one_head_in_flight_share_one_ladder() {
         let _guard = crate::STRANDED_TEST_LOCK
@@ -352,6 +347,6 @@ mod tests {
             1,
             "a check that found none ended the run"
         );
-        let _ = std::fs::remove_dir_all(staging.root);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 }

@@ -29,8 +29,7 @@ pub struct Encoder<W: Write> {
 }
 
 impl<W: Write> Encoder<W> {
-    /// Start a `width` x `height` PNG. Defaults to 8-bit grayscale, as the
-    /// retired crate did; every consumer sets both explicitly.
+    /// Start a `width` x `height` PNG. Defaults to 8-bit grayscale.
     pub fn new(sink: W, width: u32, height: u32) -> Self {
         Self {
             sink,
@@ -81,9 +80,7 @@ impl<W: Write> Encoder<W> {
             return Err(EncodingError::Parameter("zero image dimension"));
         }
         if self.bit_depth != BitDepth::Eight {
-            return Err(EncodingError::Parameter(
-                "only 8-bit output is supported (nothing in aterm writes 1/2/4/16-bit PNGs)",
-            ));
+            return Err(EncodingError::Parameter("only 8-bit output is supported"));
         }
         if self.color_type == ColorType::Indexed && self.palette.is_none() {
             return Err(EncodingError::Parameter("indexed PNG with no palette"));
@@ -197,11 +194,8 @@ impl<W: Write> Writer<W> {
                 got: data.len(),
             });
         }
-        // An index past the palette is not a legal indexed PNG, and writing one
-        // would leave this crate's encoder and its own decoder disagreeing about
-        // what it produces. Output is 8-bit only, so one byte is one index and
-        // the check is a single scan of a buffer that is about to be copied
-        // anyway.
+        // An index past the palette is not a legal PNG. Output is 8-bit, so
+        // one byte is one index.
         if let Some(entries) = self.palette_entries
             && let Some(&worst) = data.iter().max()
             && usize::from(worst) >= entries
@@ -238,10 +232,8 @@ impl<W: Write> Writer<W> {
 
 impl<W: Write> Drop for Writer<W> {
     fn drop(&mut self) {
-        // Closing the file on drop is what the retired crate did, and a dozen
-        // call sites rely on it: they build an encoder in a block and let it
-        // fall out of scope. A failure here cannot be reported, but a truncated
-        // file is strictly better than one that is silently missing its IEND.
+        // Call sites rely on drop closing the file. A failure here cannot be
+        // reported; a best-effort IEND beats a file silently missing one.
         if let Some(mut sink) = self.sink.take() {
             let _ = write_chunk(&mut sink, b"IEND", &[]);
             let _ = sink.flush();

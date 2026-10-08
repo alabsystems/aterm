@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ledger::GitCli;
+use ledger::testing::Git;
 use publish::{
     FenceIdentity, FenceLiveness, FenceReclaim, GroupState, LocalProbe, PUBLISHER_FENCE_REF,
     PidState, PublisherProbe,
@@ -34,21 +34,15 @@ use publish::{
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 struct BareFixture {
-    root: PathBuf,
+    _root: aterm_tempfile::TempDir,
     repo_a: PathBuf,
     repo_b: PathBuf,
     owner: String,
     other_owner: String,
 }
 
-impl Drop for BareFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
 fn command(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = ledger::testing::git()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -63,35 +57,44 @@ fn command(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn config_identity(repo: &Path) {
+    ledger::testing::config(
+        repo,
+        &[
+            ("user.name", "Fence Liveness Test"),
+            ("user.email", "fence-liveness@example.invalid"),
+        ],
+    );
+}
+
 fn bare_fixture(name: &str) -> BareFixture {
-    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("publisher-fence-liveness")
-        .join(format!("{name}-{}-{sequence}", std::process::id()));
-    std::fs::create_dir_all(&root).expect("create fixture root");
+    let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("publisher-fence-liveness");
+    std::fs::create_dir_all(&parent).expect("create fixture root");
+    let dir = aterm_tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir_in(parent)
+        .expect("create fixture root");
+    let root = dir.path();
     let remote = root.join("origin.git");
     let seed = root.join("seed");
     assert!(
-        Command::new("git")
+        ledger::testing::git()
             .args(["init", "--bare"])
             .arg(&remote)
             .status()
             .expect("git init bare")
             .success()
     );
+    ledger::testing::config(&remote, &[]);
     assert!(
-        Command::new("git")
+        ledger::testing::git()
             .args(["init", "-b", "main"])
             .arg(&seed)
             .status()
             .expect("git init seed")
             .success()
     );
-    command(&seed, &["config", "user.name", "Fence Liveness Test"]);
-    command(
-        &seed,
-        &["config", "user.email", "fence-liveness@example.invalid"],
-    );
+    config_identity(&seed);
     std::fs::write(seed.join("claim"), "first\n").expect("write claim");
     command(&seed, &["add", "claim"]);
     command(&seed, &["commit", "-m", "first claim"]);
@@ -113,7 +116,7 @@ fn bare_fixture(name: &str) -> BareFixture {
     let clone = |name: &str| {
         let path = root.join(name);
         assert!(
-            Command::new("git")
+            ledger::testing::git()
                 .args(["clone", "--branch", "main"])
                 .arg(&remote)
                 .arg(&path)
@@ -121,11 +124,7 @@ fn bare_fixture(name: &str) -> BareFixture {
                 .expect("git clone")
                 .success()
         );
-        command(&path, &["config", "user.name", "Fence Liveness Test"]);
-        command(
-            &path,
-            &["config", "user.email", "fence-liveness@example.invalid"],
-        );
+        config_identity(&path);
         path
     };
     BareFixture {
@@ -133,7 +132,7 @@ fn bare_fixture(name: &str) -> BareFixture {
         repo_b: clone("publisher-b"),
         owner,
         other_owner,
-        root,
+        _root: dir,
     }
 }
 
@@ -557,8 +556,8 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
 #[test]
 fn a_fence_this_binary_writes_is_readable_from_another_clone() {
     let fixture = bare_fixture("round-trip");
-    let git_a = GitCli::new(&fixture.repo_a);
-    let git_b = GitCli::new(&fixture.repo_b);
+    let git_a = Git::new(&fixture.repo_a);
+    let git_b = Git::new(&fixture.repo_b);
     this_invocation_publishes();
     publish::acquire_release_lease(&git_a, &fixture.owner).unwrap();
     let guard = publish::acquire_publisher_fence(&git_a, &fixture.owner).unwrap();
@@ -590,7 +589,7 @@ fn a_fence_this_binary_writes_is_readable_from_another_clone() {
 #[test]
 fn a_live_publisher_still_refuses_and_is_never_reclaimed() {
     let fixture = bare_fixture("live-refuses");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     // THIS test process is the recorded publisher, and it is demonstrably alive.
@@ -632,7 +631,7 @@ fn a_live_publisher_still_refuses_and_is_never_reclaimed() {
 #[test]
 fn a_resume_reclaims_a_fence_whose_publisher_is_provably_dead() {
     let fixture = bare_fixture("dead-reclaimed");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     let (dead, dead_group) = reaped_pid();
@@ -677,7 +676,7 @@ fn a_resume_reclaims_a_fence_whose_publisher_is_provably_dead() {
 #[test]
 fn a_reused_pid_is_proof_of_death_end_to_end() {
     let fixture = bare_fixture("reused-pid");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     // A live pid — this very process — recorded against an executable it is
@@ -713,7 +712,7 @@ fn a_reused_pid_is_proof_of_death_end_to_end() {
 #[test]
 fn a_spawned_request_that_outlives_the_publisher_keeps_the_fence_end_to_end() {
     let fixture = bare_fixture("orphaned-child");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     // A process group of its own, led by the survivor …
@@ -770,7 +769,7 @@ fn a_spawned_request_that_outlives_the_publisher_keeps_the_fence_end_to_end() {
 #[test]
 fn a_fence_from_another_host_refuses_and_is_kept() {
     let fixture = bare_fixture("other-host");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     let token = forge_fence(
@@ -808,7 +807,7 @@ fn a_fence_from_another_host_refuses_and_is_kept() {
 #[test]
 fn a_fence_from_another_boot_session_refuses_and_is_kept() {
     let fixture = bare_fixture("other-boot");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     let (dead, dead_group) = reaped_pid();
@@ -848,7 +847,7 @@ fn a_fence_from_another_boot_session_refuses_and_is_kept() {
 #[test]
 fn a_fence_written_by_an_older_binary_refuses_instead_of_crashing() {
     let fixture = bare_fixture("legacy-fence");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     // Byte-for-byte the message every aterm-release before this one wrote.
@@ -892,7 +891,7 @@ fn a_fence_written_by_an_older_binary_refuses_instead_of_crashing() {
 #[test]
 fn the_refusal_carries_a_runnable_recover_command_for_the_real_cut() {
     let fixture = bare_fixture("recover-command");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     // The refusing process is cutting something ELSE (0.87.0): the command must
     // name the FENCE's version, which is the WEDGED cut's, not this one's.
     this_invocation_publishes();
@@ -942,7 +941,7 @@ fn the_refusal_carries_a_runnable_recover_command_for_the_real_cut() {
 #[test]
 fn a_fence_for_another_claim_is_never_reclaimed() {
     let fixture = bare_fixture("foreign-claim");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     let (dead, dead_group) = reaped_pid();
@@ -982,7 +981,7 @@ fn a_fence_for_another_claim_is_never_reclaimed() {
 #[test]
 fn an_unreadable_fence_body_refuses_rather_than_crashing() {
     let fixture = bare_fixture("unreadable-body");
-    let git = GitCli::new(&fixture.repo_a);
+    let git = Git::new(&fixture.repo_a);
     // No such object anywhere, and the remote cannot supply it.
     let identity = publish::publisher_fence_identity(&git, &"0".repeat(40));
     assert!(identity.unreadable.is_some(), "{identity:?}");

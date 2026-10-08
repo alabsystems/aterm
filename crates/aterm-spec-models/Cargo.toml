@@ -13,10 +13,15 @@ description = "TLA+ models of aterm's kernel/security/concurrency invariants (RO
 # `ty` TLA+ checker over the specs in `specs/`. The .tla/.cfg files ARE the crate.
 
 [dev-dependencies]
-# Test-only: the single shared verification-gate policy (batteries-on — the test
-# gate is unconditional, so an absent Trust `ty` FAILS rather than skips). Test-only
-# so the production crate stays dep-free — the .tla/.cfg files remain the whole crate.
+# Test-only: the single shared verification-gate policy (the `ty` escalation tier —
+# absent, a NOT RUN notice names it and the test returns). Test-only so the
+# production crate stays dep-free — the .tla/.cfg files remain the whole crate.
 aterm-spec = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
+# gate while still being linked and executed. Doctests are a separate switch.
+test = false

@@ -4,9 +4,6 @@
 
 //! xterm keyboard modifier/format options (XTMODKEYS/XTFMTKEYS).
 //!
-//! Extracted from `aterm-core::terminal::xterm_keyboard` to break circular
-//! dependencies (Part of #5663, #2341).
-//!
 //! This module implements xterm's keyboard encoding mode control sequences:
 //!
 //! - **XTMODKEYS** (`CSI > Pp ; Pv m`): Controls modifier key encoding

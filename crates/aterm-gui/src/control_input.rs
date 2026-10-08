@@ -379,84 +379,85 @@ fn take_inline_mods(body: &str) -> (aterm_types::keyboard::Modifiers, &str) {
     (m, rest)
 }
 
-/// Whether a well-formed `key` verb body is a PLAIN TYPED GLYPH press —
-/// a Character/Space press with no Ctrl/Alt/Super — i.e. the same class the
-/// input seams' mash exception leaves alone. Used by the control dispatcher to
-/// skip the pre-parse licence fence for exactly this class: the injected key
-/// stamps its own typed licence a moment later, and pre-clearing on every key
-/// wiped the banked stamps of keys whose echoes were still in flight — the
-/// flood-typing black gap, alive on the control path after the physical press
-/// paths were fixed. Anything malformed, modified, named (Enter/Tab/nav), or a
-/// release answers `false` and keeps the fence.
-pub(crate) fn key_is_plain_typed_glyph(rest: &str) -> bool {
-    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
-    match parse_key(rest) {
-        Some(InputEvent::Key {
-            key,
-            mods,
-            event_type: KeyEventType::Press,
-            ..
-        }) => {
-            !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-                && match key {
-                    Key::Character(c) => aterm_grapheme::char_width(c) > 0,
-                    Key::Named(NamedKey::Space) => true,
-                    _ => false,
-                }
-        }
-        _ => false,
+/// Every AUTHORIZED control attempt that can inject bytes, signal the
+/// child, or mutate its cursor coordinate space — the verbs whose attempt
+/// is a newer input boundary for the glow's and the trail's move licence
+/// ([`control_fence`]).
+pub(crate) fn control_attempt_closes_cursor_license(verb: &str) -> bool {
+    matches!(
+        verb,
+        "send"
+            | "key"
+            | "ctrl"
+            | "feed"
+            | "signal"
+            | "mouse"
+            | "paste"
+            | "focus"
+            | "turn"
+            | "resize"
+            | "scroll"
+    )
+}
+
+/// The event a fencing verb's body delivers through the input seam, parsed
+/// with that verb's OWN parser — `key`'s [`parse_key`], `ctrl`'s
+/// [`parse_ctrl`], `paste`'s [`paste_event`] — so the control fence
+/// classifies exactly what the verb sends. `None` for a malformed body, and
+/// for every verb whose body the fence does not read.
+pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
+    match verb {
+        "key" => parse_key(rest),
+        "ctrl" => parse_ctrl(rest),
+        "paste" => Some(paste_event(rest)),
+        _ => None,
     }
 }
 
-/// Whether a well-formed `key` verb body ARMS ITS OWN LICENSE CLASS when it
-/// dispatches through the `Wake::Input` seam — the fence-exemption predicate
-/// (2026-08-30). A plain typed glyph always did ([`key_is_plain_typed_glyph`]);
-/// plain Enter, Tab and Backspace now do too (`note_return` /
-/// `note_user_gesture` / `note_backspace` at the input boundary), so
-/// pre-clearing for them wiped the banked stamps of keys whose echoes were
-/// still in flight AND destroyed the very license the dispatched key was about
-/// to arm — every control-driven `key enter` deterministically manufactured a
-/// no-fresh-hint decline. A bare Ctrl-V arms too — the delivered-insert class
-/// beside the gesture class, bank-preserving like Tab — and is the ONE modified
-/// chord that does. Anything malformed, any OTHER modified chord
-/// (Ctrl/Alt/Super), other named keys (nav arms via a different host path with
-/// its own pre-clear semantics), or a release answers `false` and keeps the
-/// fence.
-pub(crate) fn key_arms_own_license(rest: &str) -> bool {
-    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
-    if key_is_plain_typed_glyph(rest) {
-        return true;
+/// THE CONTROL SOCKET'S LICENCE FENCE for one authorized attempt: `None`
+/// is no fence; `Some(keep_hand)` closes the move-licence cohort ahead of
+/// the verb, keeping the glow's hand on its row or taking it off.
+///
+/// Every attempt [`control_attempt_closes_cursor_license`] names is a newer
+/// input boundary — even a malformed one, which fences before its refusal
+/// so a swallowed key's licence cannot survive an ignored attempt, and
+/// takes the hand off its row (it delivers nothing a fence could keep the
+/// hand for). A body its verb's own parser reads ([`control_press`]) is
+/// fenced exactly as [`crate::app_input::press_fence`] fences that event at
+/// the seam's entry and ahead of a physical key: `ctrl w` and `key ctrl+w`
+/// are one Ctrl-W, a line edit that keeps the hand; a release and a bare
+/// modifier are not fenced at all, as a physical one never is; a plain
+/// typed glyph, plain Enter, a Tab and a bare ⌃V arm their own licence class
+/// at the seam, where pre-clearing them wiped the banked stamps of keys
+/// whose echoes were still in flight — every control-driven `key enter`
+/// manufactured a no-fresh-hint decline — so they pass unfenced; a paste
+/// keeps the hand. A FENCED write (`if=`, `if-gen=`, `if-fp=`, `if-human=`)
+/// is delivered on the control thread, past the seam that would arm its
+/// class (see [`input_if_fenced`]), so it always fences, keeping the hand
+/// only for what keeps it.
+pub(crate) fn control_fence(verb: &str, rest: &str, fenced_write: bool) -> Option<bool> {
+    if !control_attempt_closes_cursor_license(verb) {
+        return None;
     }
-    match parse_key(rest) {
-        Some(InputEvent::Key {
-            key,
-            mods,
-            event_type: KeyEventType::Press,
-            ..
-        }) => {
-            (!mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-                && matches!(
-                    key,
-                    Key::Named(NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace)
-                ))
-                // A bare ⌃V arms the delivered-insert class beside the
-                // gesture class (2026-09-10), bank-preserving like Tab.
-                || (mods.contains(Modifiers::CTRL)
-                    && !mods.intersects(Modifiers::ALT | Modifiers::SUPER)
-                    && matches!(key, Key::Character('v')))
-        }
-        _ => false,
+    let Some(ev) = control_press(verb, rest) else {
+        return Some(false);
+    };
+    let fence = crate::app_input::press_fence(&ev);
+    if fenced_write {
+        Some(fence == Some(true))
+    } else {
+        fence
     }
 }
 
 /// The usage line every malformed `key` body answers. One string, so the
-/// grammar — the two leading options and the key names — is stated in exactly
+/// grammar — the leading options and the key names — is stated in exactly
 /// one place (the plain, the guarded and both cross-session arms answer it).
 pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
-                                    [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [unread=ok] \
-                                    <name> — enter tab esc space backspace delete up down \
-                                    left right home end pageup pagedown f1..f12 (opt +mods, \
-                                    e.g. ctrl+c)\n";
+                                    [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] \
+                                    [unread=ok] <name> — enter tab esc space backspace delete \
+                                    up down left right home end pageup pagedown f1..f12 (opt \
+                                    +mods, e.g. ctrl+c)\n";
 
 /// `key <name> [mods=<list>]` -> build an [`InputEvent::Key`] and post it to the
 /// seam (the plain verb's encoder caller, under the CURRENT keyboard mode). See
@@ -506,7 +507,8 @@ pub(crate) struct LeadingInputOptions {
     pub if_human: Option<u64>,
     /// `unread=ok`: write even though the program has left earlier input
     /// unread — the one override of the unread-input gate
-    /// (`crate::input_stall::refusal`), for a driver that means to queue.
+    /// (`crate::input_stall::admission`: its refusal, and its warning), for a
+    /// driver that means to queue.
     pub unread_ok: bool,
     /// A leading option that was recognized but malformed (a guard with no
     /// pattern, an option given twice). Carried rather than answered here so the
@@ -540,7 +542,7 @@ pub(crate) struct LeadingInputOptions {
 /// an unsound fence and never the option typed as `send` text.
 ///
 /// `unread=ok` rides the same two verbs and composes the same way: it lifts the
-/// unread-input gate (`crate::input_stall::refusal`) for this one write, so a
+/// unread-input gate (`crate::input_stall::admission`) for this one write, so a
 /// driver that means to queue behind input the program has not read can. `ok`
 /// is its only value; any other, or a second `unread=`, is a carried refusal.
 ///
@@ -742,7 +744,11 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
 ///   — the one thing the screen fences cannot see: a person's key already
 ///   written to the PTY and not yet read by the program moves no screen.
 ///   Refused `OK skipped reason=person` (2026-09-27, R3b of the question
-///   answer's critique).
+///   answer's critique). Not atomic with the person's own write, which takes
+///   no terminal lock: a gesture counted after this check and written before
+///   this write, inside the one lock hold, still lands first (the module
+///   header of [`crate::human_input`] says why). A controller's own write —
+///   this one included — never counts.
 ///
 /// This is the operator delivery fence's shape (`operator_input_if_epoch`:
 /// compare the screen generation, then write, under one lock) offered to any
@@ -789,8 +795,7 @@ impl InputFence<'_> {
             return Some(GuardedInput::Changed);
         }
         if let Some(fp) = self.fp {
-            let now =
-                crate::turn_ledger::fnv1a_64(crate::control::screen_text(terminal).as_bytes());
+            let now = aterm_hash::fnv1a_64(crate::control::screen_text(terminal).as_bytes());
             if now != fp {
                 return Some(GuardedInput::Changed);
             }
@@ -961,9 +966,10 @@ pub(crate) fn cmd_key_guarded(
     )
 }
 
-/// `key [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] <name>`: the fenced press —
-/// [`cmd_key_guarded`] with every [`InputFence`] condition. A moved screen
-/// answers `OK skipped reason=changed` and writes nothing.
+/// `key [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] <name>`:
+/// the fenced press — [`cmd_key_guarded`] with every [`InputFence`]
+/// condition. A moved screen answers `OK skipped reason=changed`, a person
+/// who keyed since the read `OK skipped reason=person`; either writes nothing.
 pub(crate) fn cmd_key_fenced(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -997,7 +1003,8 @@ pub(crate) fn cmd_send_guarded(
     )
 }
 
-/// `send [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] <text>`: the fenced raw write.
+/// `send [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] <text>`: the
+/// fenced raw write.
 pub(crate) fn cmd_send_fenced(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -1100,19 +1107,7 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
     if !hex.len().is_multiple_of(2) {
         return Err("ERR bad hex (odd length)\n");
     }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let h = hex.as_bytes();
-    let mut i = 0;
-    while i < h.len() {
-        let hi = (h[i] as char).to_digit(16);
-        let lo = (h[i + 1] as char).to_digit(16);
-        let (Some(hi), Some(lo)) = (hi, lo) else {
-            return Err("ERR bad hex\n");
-        };
-        bytes.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    Ok(bytes)
+    aterm_codec::hex::decode_vec(hex.as_bytes()).ok_or("ERR bad hex\n")
 }
 
 /// `signal <name> [pid=<n>]` -> deliver a job-control signal to the PTY's
@@ -1573,13 +1568,14 @@ pub(crate) fn cmd_paste(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     // The seam runs `format_paste` (bracketing + sanitize) under the lock and the
     // snap-to-bottom, converging with the human Cmd-V path. Reply-bearing so OK
     // means the paste reached the PTY (no window ⇒ ERR, not a false OK).
-    input_reply_to_str(post_input_reply(
-        proxy,
-        vec![InputEvent::Paste(
-            paste_text(rest),
-            crate::input::PasteFraming::AtDrain,
-        )],
-    ))
+    input_reply_to_str(post_input_reply(proxy, vec![paste_event(rest)]))
+}
+
+/// The `paste` verb's event: its text ([`paste_text`]), framed at the drain.
+/// One builder for the verb and the fence that classifies it
+/// ([`control_press`]).
+pub(crate) fn paste_event(rest: &str) -> InputEvent {
+    InputEvent::Paste(paste_text(rest), crate::input::PasteFraming::AtDrain)
 }
 
 /// The `paste` verb's text transform: a literal trailing `\n` (backslash + n)
@@ -1996,7 +1992,9 @@ pub(crate) fn parse_resize(rest: &str) -> Result<(u16, u16), String> {
         return Err("ERR bad args\n".to_string());
     };
     if !(1..=MAX_GRID_ROWS).contains(&r) || !(1..=MAX_GRID_COLS).contains(&c) {
-        return Err("ERR out of range\n".to_string());
+        return Err(format!(
+            "ERR out of range: rows 1-{MAX_GRID_ROWS}, cols 1-{MAX_GRID_COLS}\n"
+        ));
     }
     Ok((r, c))
 }
@@ -2214,39 +2212,115 @@ mod tests {
         assert_eq!(parse_tab("close 2"), Some(TabAction::Close(Some(2))));
     }
 
-    /// GATE (lane-license, deliverable 2): the control fence exempts exactly
-    /// the `key` bodies that arm their own license class at the input seam —
-    /// plain glyphs (as before) plus plain Enter/Tab/Backspace — and keeps
-    /// fencing everything else.
+    /// GATE (the control fence, 2026-09-29): a verb body is fenced exactly as
+    /// the event its own parser reads is fenced at the seam and ahead of a
+    /// physical key (`app_input::press_fence`). No fence for a body that arms
+    /// its own licence class at the seam — plain glyphs, plain Enter, any Tab
+    /// (lane-license, deliverable 2: pre-clearing a `key enter` wiped the
+    /// bank and declined its response), a bare ⌃V — nor for a release or a
+    /// bare modifier, as a physical one gets none; a fence keeping the
+    /// glow's hand on its row for a line edit — Backspace, the arrows,
+    /// Home/End, Delete, the emacs motions, the kills — and a paste; a fence
+    /// taking it off for everything else, a malformed body included. `ctrl
+    /// <c>` is `key ctrl+<c>`. A fenced write always fences, keeping the hand
+    /// only for what keeps it; a read verb never does.
     ///
-    /// RED-PROOF (2026-08-30): with `key_arms_own_license` collapsed back to
-    /// `key_is_plain_typed_glyph` (the pre-fix dispatcher predicate), the
-    /// first loop fails at `"enter"` — the shape whose pre-clear made every
-    /// control-driven `key enter` wipe the bank and decline its response.
+    /// RED-PROOF (the fence as it was — `key` alone parsed, every other verb
+    /// fenced taking the hand off): `ctrl w` fenced `Some(false)` against
+    /// `key ctrl+w`'s `Some(true)`, `ctrl v` fenced against `key ctrl+v`'s
+    /// none, `key shiftleft` and `key left type=release` fenced `Some(false)`,
+    /// and `paste hello` fenced `Some(false)`.
     #[test]
-    fn license_fence_exempts_keys_that_arm_their_own_class() {
-        for body in ["enter", "tab", "backspace", "a", "space", "shift+tab"] {
-            assert!(
-                key_arms_own_license(body),
-                "`key {body}` arms its own license and must skip the fence"
+    fn the_control_fence_is_the_seam_s_fence_of_the_parsed_body() {
+        let key = |body: &str| control_fence("key", body, false);
+        for body in [
+            "enter",
+            "tab",
+            "shift+tab",
+            "alt+tab",
+            "a",
+            "space",
+            "ctrl+v",
+        ] {
+            assert_eq!(key(body), None, "`key {body}` arms its own licence class");
+        }
+        for body in [
+            "shiftleft",
+            "altright",
+            "left type=release",
+            "a type=release",
+        ] {
+            assert_eq!(
+                key(body),
+                None,
+                "`key {body}` is fenced no more than a physical one"
             );
         }
         for body in [
-            "esc",
-            "up",
+            "backspace",
             "left",
+            "right",
+            "up",
+            "down",
             "home",
+            "end",
+            "delete",
+            "ctrl+a",
+            "ctrl+e",
+            "ctrl+w",
+            "ctrl+u",
+            "ctrl+k",
+            "alt+b",
+            "alt+d",
+            "left type=repeat",
+        ] {
+            assert_eq!(key(body), Some(true), "`key {body}` edits the line");
+        }
+        for body in [
+            "ctrl+r",
+            "ctrl+s",
+            "esc",
             "f1",
+            "f5",
             "ctrl+enter",
-            "alt+tab",
+            "shift+enter",
             "ctrl+c",
+            "alt+x",
+            "super+left",
+            "super+home",
             "",
             "notakey",
+            "shift",
         ] {
-            assert!(
-                !key_arms_own_license(body),
-                "`key {body}` arms no license of its own and must keep the fence"
+            assert_eq!(
+                key(body),
+                Some(false),
+                "`key {body}` takes the hand off its row"
             );
+        }
+        // `ctrl <c>` is `key ctrl+<c>`, whatever the letter.
+        for c in ["w", "u", "a", "e", "b", "k", "r", "c", "v", "x"] {
+            assert_eq!(
+                control_fence("ctrl", c, false),
+                key(&format!("ctrl+{c}")),
+                "`ctrl {c}` and `key ctrl+{c}` are one press"
+            );
+        }
+        assert_eq!(control_fence("ctrl", "ww", false), Some(false), "malformed");
+        assert_eq!(control_fence("paste", "hello", false), Some(true));
+        // A fenced write fences whatever it is, keeping the hand for a line edit.
+        assert_eq!(control_fence("key", "a", true), Some(false));
+        assert_eq!(control_fence("key", "enter", true), Some(false));
+        assert_eq!(control_fence("key", "left", true), Some(true));
+        assert_eq!(control_fence("send", "ls", true), Some(false));
+        // The other writers fence taking the hand off; the readers never fence.
+        for verb in [
+            "send", "feed", "signal", "mouse", "focus", "turn", "resize", "scroll",
+        ] {
+            assert_eq!(control_fence(verb, "", false), Some(false), "{verb}");
+        }
+        for verb in ["text", "screen", "cursor", "image", "metrics"] {
+            assert_eq!(control_fence(verb, "left", false), None, "{verb}");
         }
     }
 
@@ -2456,29 +2530,14 @@ mod tests {
     fn typeahead_after_restart(remedy: Remedy, typed: Typed) -> (bool, Option<String>) {
         use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
-        use std::time::{Duration, Instant};
-        // The two hazard tests run on parallel threads, and `openpty` from
-        // parallel threads fails now and then (measured in aterm-session's
-        // input_backlog_pty.rs, 2026-09-25): one at a time.
-        static OPENPTY: Mutex<()> = Mutex::new(());
-        let one = OPENPTY.lock().unwrap_or_else(|p| p.into_inner());
-        let (mut master, mut slave) = (-1i32, -1i32);
-        // SAFETY: `openpty` fills the two out-params; the optional pointers
-        // are null.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        drop(one);
-        assert_eq!(rc, 0, "openpty");
+        use std::time::Duration;
+        // Both ends are close-on-exec from birth, so the shell holds its
+        // terminal and never a copy of its master.
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
         // SAFETY: `slave` is a fresh fd this function alone owns.
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
+        // std's Command on purpose: the PTY child needs `pre_exec` (setsid + TIOCSCTTY), which spawnfd lacks.
         let mut shell = std::process::Command::new("/bin/zsh");
         shell
             .args(["-f", "-i"])
@@ -2533,16 +2592,19 @@ mod tests {
             let seen = seen.lock().expect("seen");
             seen.windows(needle.len()).any(|w| w == needle.as_bytes())
         };
+        // What the shell draws MUST come: a hang detector, never a 10 s budget
+        // an interactive shell's start overruns on a loaded machine.
         let wait_for = |what: &str, done: &dyn Fn() -> bool| {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !done() {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for {what}: {:?}",
-                    String::from_utf8_lossy(&seen.lock().expect("seen"))
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            let drawn = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                Duration::from_millis(10),
+                || done().then_some(()),
+            );
+            assert!(
+                drawn.is_some(),
+                "timed out waiting for {what}: {:?}",
+                String::from_utf8_lossy(&seen.lock().expect("seen"))
+            );
         };
         let type_in = |bytes: &[u8]| {
             // SAFETY: a bounded write of a live slice to the live master.
@@ -2764,6 +2826,16 @@ mod tests {
             take_leading_options("send", "hello if-human=1").1,
             "hello if-human=1"
         );
+        // The fence alone routes to the fenced arm, and the usage line every
+        // malformed `key` answers names it beside the other leading options.
+        assert!(
+            InputFence {
+                human: Some(1),
+                ..InputFence::default()
+            }
+            .is_armed()
+        );
+        assert!(KEY_USAGE.contains("[if-human=<n>]"), "{KEY_USAGE}");
     }
 
     /// `if-gen=<epoch>.<seq>` parses to the screen generation `status gen=`

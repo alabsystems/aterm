@@ -1,48 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! STRAIN HOST — the GUI's glue for explaining very heavy system use on the
-//! band (design §10.14, rulings 206–212).
+//! The GUI's glue for explaining very heavy system use on the message band.
 //!
 //! The policy is `aterm_messages::strain` (pure, clockless, platform-free) and
-//! the samplers are `aterm-sysprobe` (every platform `cfg`). This module only
-//! plumbs them into the loop, and adds no platform `cfg` of its own:
+//! the samplers are `aterm-sysprobe` (every platform `cfg`). This module plumbs
+//! them into the loop and has no platform `cfg` of its own:
 //!
-//! * **Samples.** `metrics::record_present` hands back a HARDWARE key's
-//!   closed, untainted input→present slice ([`App::note_strain_key`]): one ring
-//!   write on a frame that is drawn anyway. A control `send`/`feed`/`key`
-//!   never arms a hardware stamp, and a key typed into a REMOTE program
-//!   ([`REMOTE_PROGRAMS`] — a slow network is not a slow Mac) is dropped here.
-//!   The watchdog's turn census hands over every turn of at least `FREEZE_MS`
-//!   ([`crate::watchdog::take_freeze`]); one that ends within
-//!   `TYPING_HOT_TAIL` of a hardware key is a hitch.
+//! * **Samples.** `metrics::record_present` hands back a hardware key's closed,
+//!   untainted input→present slice ([`App::note_strain_key`]): one ring write
+//!   on a frame drawn anyway. A control `send`/`feed`/`key` never arms a
+//!   hardware stamp, and a key typed into a remote program
+//!   ([`REMOTE_PROGRAMS`]) is dropped. The watchdog's turn census hands over
+//!   every turn of at least `FREEZE_MS` ([`crate::watchdog::take_freeze`]);
+//!   one ending within `TYPING_HOT_TAIL` of a hardware key is a hitch.
 //! * **Readings.** The `aterm-strain-probe` thread starts lazily at the first
-//!   reading an episode asks for, runs at QoS utility and BLOCKS on its
-//!   channel: it never wakes itself. It answers each request with one
-//!   `Wake::StrainReading`.
-//! * **The deadline.** `DeadlineOwner::SystemStrain` (slot 40), folded after
-//!   the band's motion: `Some` only while the engine is Suspect or Open, the
+//!   reading an episode asks for, runs at QoS utility and blocks on its
+//!   channel, answering each request with one `Wake::StrainReading`.
+//! * **The deadline.** `DeadlineOwner::SystemStrain`, folded after the band's
+//!   motion: `Some` only while the engine is Suspect or Open, the
 //!   `explain_heavy_load` switch is on, a focused window's band is on screen
 //!   ([`App::strain_gate`]) and no reading is in flight.
-//! * **The idle law.** Calm arms nothing. An unfocused, occluded, minimized or
+//! * **Idle rule.** Calm arms nothing. An unfocused, occluded, minimized or
 //!   headless window takes no samples and arms nothing, so an episode falls
 //!   back to calm by itself. A fold leaves nothing armed. The switch off parks
 //!   the engine, withdraws the row and drops the thread.
 //!
 //! # Dev seam
 //!
-//! `ATERM_DEBUG_STRAIN=cpu|memory|heat` (read once, through `dev_seam!`: a
-//! shipped binary never reads it) fakes a saturated reading
-//! of that kind on the probe thread and reads every hardware key as slow, so
-//! an episode opens under a finger — for captures and demos, never a user
-//! setting. The live gate drives real keys with `aterm ctl hwkey`, whose
-//! `NSEvent` takes the same `KeyboardInput` arm a physical key does; no test
-//! seam makes a control `send` count. Under the same seam, and only there,
-//! a window with no focused window in the app counts as the one typed into
-//! once a hardware key lands in it (`StrainHost::focus_seam`, ruling 272):
-//! macOS refuses key status to an isolated instance launched in the
-//! background, and `hwkey` reaches its window all the same. A shipped build
-//! never samples an unfocused window's keys.
+//! `ATERM_DEBUG_STRAIN=cpu|memory|heat` (read once through `dev_seam!`, so
+//! never in a shipped binary) fakes a saturated reading of that kind on the
+//! probe thread and reads every hardware key as slow, for captures and demos.
+//! Real keys are driven with `aterm ctl hwkey`, whose `NSEvent` takes the same
+//! `KeyboardInput` arm a physical key does. Under this seam only, while no
+//! window is focused, the window a hardware key lands in counts as the one
+//! typed into (`StrainHost::focus_seam`): macOS refuses key status to an
+//! isolated instance launched in the background.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -59,7 +52,7 @@ use crate::messages_host::{band_on_screen, restatement_of};
 use crate::{App, Wake, WindowId, tab_model};
 
 /// Foreground programs whose keys are never strain samples: their echo rides
-/// a network, and a slow network is not a slow machine (ruling 206).
+/// a network, and a slow network is not a slow machine.
 pub(crate) const REMOTE_PROGRAMS: [&str; 6] =
     ["ssh", "mosh-client", "et", "telnet", "kubectl", "docker"];
 
@@ -104,8 +97,8 @@ pub(crate) fn reset_metrics() {
     SCAN_US_MAX.store(0, Ordering::Relaxed);
 }
 
-/// The strain fields of the `metrics` summary, text form (one fragment, the
-/// `turn_census_fields_text` discipline).
+/// The strain fields of the `metrics` summary, text form (one fragment, like
+/// `turn_census_fields_text`).
 #[must_use]
 pub(crate) fn metrics_fields_text() -> String {
     format!(
@@ -199,9 +192,9 @@ impl Saturate {
 
 /// The strain engine, its probe thread and its one row.
 pub(crate) struct StrainHost {
-    /// The engine. Crate-visible for the one push only a platform arm can hear
-    /// (macOS memory pressure, `Wake::MemoryPressure`), so that trigger lives
-    /// beside its platform and this file stays `cfg`-free (ruling 210).
+    /// The engine. Crate-visible for the one push only a platform arm hears
+    /// (macOS memory pressure, `Wake::MemoryPressure`), so this file stays
+    /// `cfg`-free.
     pub(crate) engine: StrainTracker,
     /// `explain_heavy_load`.
     enabled: bool,
@@ -219,10 +212,10 @@ pub(crate) struct StrainHost {
     last_hw_key: Option<Instant>,
     /// Freezes waiting for a hardware key near their end: `(end, ms, owner)`.
     freezes: Vec<(Instant, u32, &'static str)>,
-    /// The dev seam is on (`ATERM_DEBUG_STRAIN`, read through `dev_seam!`:
-    /// always `false` in a shipped build): while no window is focused, the
-    /// window the last hardware key landed in stands in for the focused one
-    /// ([`App::strain_typing_window`], ruling 272).
+    /// The dev seam is on (`ATERM_DEBUG_STRAIN`, always `false` in a shipped
+    /// build): while no window is focused, the window the last hardware key
+    /// landed in stands in for the focused one
+    /// ([`App::strain_typing_window`]).
     focus_seam: bool,
     /// That window, recorded only while `focus_seam` is on.
     seam_window: Option<WindowId>,
@@ -259,8 +252,8 @@ impl StrainHost {
     }
 
     /// What the engine is told once: the platform's services noun
-    /// (`aterm-sysprobe` owns the `cfg`), rows on the glass (ruling 208 — the
-    /// records are written either way), and aterm's own pid.
+    /// (`aterm-sysprobe` owns the `cfg`), whether rows go on the glass (records
+    /// are written either way), and aterm's own pid.
     fn config() -> StrainConfig {
         StrainConfig {
             services_noun: aterm_sysprobe::SERVICES_NOUN,
@@ -334,10 +327,9 @@ impl StrainHost {
     }
 
     /// Hand every waiting freeze within [`FREEZE_NEAR_KEY`] of the last
-    /// hardware key to the engine — a key typed during the freeze counts
-    /// (the turn that was slow may be that key's own dispatch; measured live,
-    /// a starved window's 3 s turns began with the key they held) — and drop
-    /// the ones no later key can reach.
+    /// hardware key to the engine (a key typed during the freeze counts: the
+    /// slow turn may be that key's own dispatch) and drop the ones no later
+    /// key can reach.
     fn match_freezes(&mut self) {
         let Some(key) = self.last_hw_key else {
             return;
@@ -376,7 +368,7 @@ impl StrainHost {
     }
 
     /// The next reading's instant under `gate`, or `None` (see the module
-    /// header's idle law).
+    /// docs' idle rule).
     fn deadline(&self, now: Instant, gate: Gate) -> Option<Instant> {
         if !self.may_read() {
             return None;
@@ -491,9 +483,8 @@ impl App {
     }
 
     /// The window the person types into, for the sampler and the sweep: the
-    /// focused one. With no focused window, and only under the dev seam
-    /// (`focus_seam`, never in a shipped build), the window the last hardware
-    /// key landed in (ruling 272).
+    /// focused one. With no focused window, and only under the dev seam, the
+    /// window the last hardware key landed in.
     fn strain_typing_window(&self) -> Option<WindowId> {
         self.windows
             .iter()
@@ -515,9 +506,8 @@ impl App {
 
     /// The loop's turn (`about_to_wait`, before the fold): take the watchdog's
     /// freeze, forget a lost reading, end an episode no reading has reached
-    /// for `STALE_STRAIN` (the gate closed: it ends where sampling stopped,
-    /// and the engine is calm again — riding whatever woke the loop, arming
-    /// nothing), and ask for a reading that fell due.
+    /// for `STALE_STRAIN` (the gate closed, so it ends where sampling stopped
+    /// without arming anything), and ask for a reading that fell due.
     pub(crate) fn strain_tick(&mut self, now: Instant) {
         self.strain.drain_freeze(now);
         self.strain.heal_lost(now);
@@ -527,9 +517,8 @@ impl App {
                 self.perform_strain(out);
             }
         }
-        // Whether other work is MEASURABLY slowed (typing felt slow): only
-        // then does a row's own load say its words — a download's `network
-        // busy` explains nothing the title does not (ruling 246).
+        // Only when typing felt slow does a row's own load say its words: a
+        // download's `network busy` explains nothing the title does not.
         let slowing = self.strain.enabled() && self.strain.engine.felt(now);
         if slowing != self.messages.slowing() {
             self.messages.set_slowing(slowing);
@@ -563,8 +552,8 @@ impl App {
     /// One hardware key's closed, untainted input→present slice in window
     /// `wid`: a sample only when that window is focused with its band on
     /// screen and its focused session is not running a remote program. Under
-    /// the dev seam only, a key into an unfocused window while NO window is
-    /// focused counts too, and makes that window the stand-in (ruling 272).
+    /// the dev seam only, a key into an unfocused window while no window is
+    /// focused counts too, and makes that window the stand-in.
     pub(crate) fn note_strain_key(&mut self, wid: WindowId, slice_ns: u64) {
         if !self.strain.enabled() {
             return;
@@ -654,10 +643,9 @@ impl App {
 
     /// aterm's own jobs the engine is told about: each registered child
     /// ([`crate::own_jobs`]) whose job has a live row, with that row's id and
-    /// current title. Only the job's WORK row on the band counts, as
-    /// `apply_toolchain_snapshot` reads it: a held row on the key (a first
-    /// run's failure row, a carried one) is an outcome, and a row still in
-    /// its reveal grace is one nobody sees — neither explains the load.
+    /// current title. Only the job's work row on the band counts, as
+    /// `apply_toolchain_snapshot` reads it; a held row (a first run's failure
+    /// row, a carried one) or a row still in its reveal grace explains nothing.
     pub(crate) fn strain_own_jobs(&self) -> Vec<(u32, MessageId, String)> {
         crate::own_jobs::with_rows(&crate::own_jobs::snapshot(), |key| {
             self.messages
@@ -680,9 +668,9 @@ impl App {
         }
         if let Some(rows) = rows {
             let sessions = self.strain_sessions();
-            // aterm's own jobs that have a live row: their processes are that
-            // row's work — `explained by <title>` on the record, never a
-            // strain row beside it, and never `aterm itself` (ruling 214).
+            // aterm's own jobs with a live row: their processes are that row's
+            // work (`explained by <title>` on the record), never a strain row
+            // beside it and never `aterm itself`.
             let jobs = self.strain_own_jobs();
             let own: Vec<JobRef<'_>> = jobs
                 .iter()
@@ -716,11 +704,10 @@ impl App {
     }
 
     /// Do what the engine said. A fold withdraws the row (a Vanish, never ✓)
-    /// and its log entry BECOMES the episode's record (`withdraw_as`: one
-    /// entry per episode on Settings ▸ Messages, not the withdrawn row beside
-    /// a record repeating it). A record with no live row to become (the row
-    /// faded, or never showed) is posted as its own; never under a live row's
-    /// key, which it would supersede silently.
+    /// and its log entry becomes the episode's record (`withdraw_as`: one
+    /// entry per episode on Settings ▸ Messages). A record with no live row
+    /// (it faded or never showed) is posted as its own, never under a live
+    /// row's key, which it would silently supersede.
     pub(crate) fn perform_strain(&mut self, out: StrainOut) {
         match out {
             StrainOut::None => {}
@@ -784,7 +771,7 @@ mod tests {
 
     const WID: WindowId = WindowId(0);
 
-    /// A headless App whose first window is focused and ON SCREEN (the test
+    /// A headless App whose first window is focused and on screen (the test
     /// seam for a real, unoccluded OS window).
     fn on_screen_app() -> App {
         let mut app = App::headless_for_test();
@@ -806,18 +793,17 @@ mod tests {
         timeline.set_program(4242, Some(program.to_string()));
     }
 
-    /// Twelve hardware keys, each 120 ms from arrival to its echo — FELT.
+    /// Twelve hardware keys, each 120 ms from arrival to its echo: felt.
     fn slow_keys(app: &mut App) {
         for _ in 0..12 {
             app.note_strain_key(WID, 120_000_000);
         }
     }
 
-    /// Only a HARDWARE key's slice is a sample (ruling 206): a control key
-    /// through the same input seam arms a stamp that is not one, and a key
-    /// typed into a remote program (ssh, mosh, et, telnet, kubectl, docker)
-    /// is dropped by the host, however slow — a slow network is not a slow
-    /// Mac. The same keys into a local program open a Suspect.
+    /// Only a hardware key's slice is a sample: a control key through the same
+    /// input seam arms a stamp that is not one, and a key typed into a remote
+    /// program (ssh, mosh, et, telnet, kubectl, docker) is dropped however
+    /// slow. The same keys into a local program open a Suspect.
     #[test]
     fn ctl_send_and_remote_sessions_are_not_samples() {
         let mut app = on_screen_app();
@@ -858,10 +844,10 @@ mod tests {
         );
     }
 
-    /// THE IDLE LAW at the host: calm arms nothing; a Suspect samples only
-    /// while a focused window's band is on screen — occluded (minimized,
-    /// covered), headless and unfocused windows arm nothing — and nothing is
-    /// armed while a reading is in flight or where no probe can run.
+    /// Idle rule at the host: calm arms nothing; a Suspect samples only while
+    /// a focused window's band is on screen (occluded, headless and unfocused
+    /// windows arm nothing), and nothing is armed while a reading is in flight
+    /// or where no probe can run.
     #[test]
     fn an_occluded_window_arms_no_system_strain() {
         let mut app = on_screen_app();
@@ -973,11 +959,10 @@ mod tests {
         strain_entries(app)
     }
 
-    /// OWN JOB (design ruling 214): a heavy pass of aterm's OWN `atpkg`
-    /// child, while its row is live, is that row's work — no strain row
-    /// doubles it, and the episode's record says `explained by <title>`,
-    /// never `aterm itself`. The same load with no row to explain it (a
-    /// silent routine pass) reads as aterm's own.
+    /// A heavy pass of aterm's own `atpkg` child, while its row is live, is
+    /// that row's work: no strain row doubles it, and the episode's record
+    /// says `explained by <title>`, never `aterm itself`. The same load with no
+    /// row to explain it (a silent routine pass) reads as aterm's own.
     #[test]
     fn an_own_job_with_a_live_row_explains_the_load() {
         let job = 3_900_001;
@@ -1027,9 +1012,9 @@ mod tests {
             "NEGATIVE CONTROL: the same load reads as aterm's: {records:?}"
         );
 
-        // A live row on the key that is NOT the job's work (review
-        // 2026-09-24): a first run's failure row, and a heavy routine row
-        // still in its reveal grace. Neither explains the load.
+        // A live row on the key that is not the job's work: a first run's
+        // failure row, and a heavy routine row still in its reveal grace.
+        // Neither explains the load.
         let mut failed = on_screen_app();
         failed.post_message(crate::toolchain_words::first_run_short(
             crate::toolchain_words::FirstRunShort::Failed,
@@ -1140,8 +1125,7 @@ mod tests {
         );
         assert_eq!(app.strain.row, None);
         assert_ne!(app.strain.engine.state_word(), "open");
-        // ONE log entry for the episode: the withdrawn row became its record
-        // (never the row beside a record repeating it).
+        // One log entry for the episode: the withdrawn row became its record.
         let entries: Vec<_> = strain_entries(&app);
         assert_eq!(entries.len(), 1, "{entries:?}");
         let (title, detail, how) = &entries[0];
@@ -1172,11 +1156,10 @@ mod tests {
             .collect()
     }
 
-    /// The window loses focus with a row open: nothing is armed (the idle
-    /// law), and once no reading has come for `STALE_STRAIN` the loop's next
-    /// turn — whatever woke it — ends the episode WHERE SAMPLING STOPPED: the
-    /// engine is calm, the row is gone, and the record never counts the time
-    /// away as time on the glass.
+    /// The window loses focus with a row open: nothing is armed, and once no
+    /// reading has come for `STALE_STRAIN` the loop's next turn ends the
+    /// episode where sampling stopped: the engine is calm, the row is gone,
+    /// and the record never counts the time away as time on the glass.
     #[test]
     fn an_unfocused_episode_ends_where_sampling_stopped() {
         let mut app = on_screen_app();
@@ -1202,11 +1185,10 @@ mod tests {
         assert!(glass.ends_with(" s"), "seconds, not the hour away: {glass}");
     }
 
-    /// SHIPPED BEHAVIOUR (ruling 272): without the dev seam a person's keys
-    /// to an unfocused window are never samples — even when NO window of the
-    /// app is focused, which is exactly the case the seam changes — and no
-    /// stand-in window is ever recorded, so the gate and the sweep's
-    /// receiving session follow focus alone.
+    /// Without the dev seam, keys to an unfocused window are never samples,
+    /// even when no window of the app is focused, and no stand-in window is
+    /// recorded, so the gate and the sweep's receiving session follow focus
+    /// alone.
     #[test]
     fn without_the_seam_an_unfocused_window_is_never_typed_into() {
         let mut app = on_screen_app();
@@ -1219,13 +1201,12 @@ mod tests {
         assert!(!app.strain_gate().focused_on_screen);
     }
 
-    /// THE SEAM'S ARM (ruling 272): under `ATERM_DEBUG_STRAIN` a hardware key
-    /// into an unfocused on-screen window, while no window is focused, is a
-    /// sample and makes that window the one typed into — for the gate and the
-    /// sweep's receiving session — so `ctl hwkey` drives an episode in an
-    /// isolated instance macOS will not make key. It stays inside the idle
-    /// law's other halves: an occluded window takes no sample, and a stand-in
-    /// that no longer exists (or a focused window) wins nothing.
+    /// Under `ATERM_DEBUG_STRAIN` a hardware key into an unfocused on-screen
+    /// window, while no window is focused, is a sample and makes that window
+    /// the one typed into (for the gate and the sweep), so `ctl hwkey` drives
+    /// an episode in an isolated instance macOS will not make key. An occluded
+    /// window still takes no sample, and a stand-in that no longer exists (or
+    /// a focused window) wins nothing.
     #[test]
     fn the_seam_lets_an_unfocused_window_take_hardware_keys() {
         let mut app = on_screen_app();
@@ -1278,7 +1259,7 @@ mod tests {
         host.note_hw_key(t0 + Duration::from_secs(2));
         assert!(host.freezes.is_empty(), "a key past the window drops it");
         assert_eq!(host.engine.state_word(), "calm");
-        // Two freezes each right before a key: two hitches, FELT.
+        // Two freezes each right before a key: two hitches, felt.
         for k in 0..2u64 {
             let end = t0 + Duration::from_secs(3 + k);
             host.freezes.push((end, 600, "window_event"));
@@ -1286,9 +1267,9 @@ mod tests {
         }
         assert_eq!(host.engine.state_word(), "suspect");
 
-        // A key dispatched INSIDE a long turn (the turn is that key's own
-        // slow dispatch): the freeze ends 3 s after the key, and still
-        // counts. Two of them are FELT.
+        // A key dispatched inside a long turn (the turn is that key's own slow
+        // dispatch): the freeze ends 3 s after the key and still counts. Two of
+        // them are felt.
         let mut host = super::StrainHost::new(true);
         for k in 0..2u64 {
             let key = t0 + Duration::from_secs(1 + 4 * k);

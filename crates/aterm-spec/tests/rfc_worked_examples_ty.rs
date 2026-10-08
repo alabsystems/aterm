@@ -17,7 +17,7 @@
 //!     counter `h` capped at `Cap`; the `Buggy` flip inflates the growth step so the
 //!     cap is overrun — exactly the unbounded pack the rollback guards against.
 //!
-//!   * **ReloadFrame (Bug 4)** — `aterm-gui/src/main.rs::reload_config`: on a HiDPI
+//!   * **ReloadFrame (Bug 4)** — `aterm-gui/src/app_config.rs::reload_config`: on a HiDPI
 //!     display the AUTO default font is `round(FONT_PX · scale)`; editing an
 //!     UNRELATED config key must re-derive that SCALED default, never shrink the
 //!     font back to the 16px `FONT_PX` base. Modelled WITHOUT multiplication — the
@@ -33,8 +33,8 @@
 //!
 //! Each model is checked by `assert_proves_and_catches` (the same harness shape as
 //! `tests/derived_ring_ty.rs`): clean at `Buggy = 0`, counterexample at `Buggy = 1`.
-//! Verification is always required (batteries-on): an absent `ty` FAILS the test with
-//! a build hint, so a green run here proves `ty` actually model-checked all six configs.
+//! TIERED (VERIFY-1): the in-process interpreter always discharges all six configs, and
+//! Trust `ty` re-checks them where installed (the two must agree).
 
 use aterm_spec::derive::Model;
 use aterm_spec::ty_model;

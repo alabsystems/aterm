@@ -1,10 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! WHO WATCHES THE HEADS (gap #28, 2026-09-26). The head watch used to run only in the
-//! window's package thread, so a Mac with no aterm window found a new Claude Code or Codex
-//! release at the index cadence of hours. It now runs in whichever aterm host is up — the
-//! window, or, with no window open, ONE terminal session — and never in both kinds at once.
+//! WHO WATCHES THE HEADS. The head watch runs in whichever aterm host is up — the window,
+//! or, with no window open, ONE terminal session — and never in both kinds at once.
 //! Two store-scoped lock files are the rendezvous; neither carries any authority (the
 //! per-vendor `.watch` files still decide whose GET a minute is, and the pass still
 //! re-verifies everything):
@@ -23,12 +21,13 @@
 //! rendezvous watches as it always did, and a session that cannot stands by and says so
 //! once (a window, or the next update pass, still finds the release).
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{BUSY_RETRY, CADENCE};
+use crate::index_probe::open_private;
 use crate::lock::Flock;
 use crate::store::Layout;
 
@@ -136,7 +135,7 @@ impl HostClaim {
         if self.hosts.is_some() {
             return Admit::Yes;
         }
-        let Some(file) = open_rendezvous(&self.prefix.join(HOSTS_FILE), true) else {
+        let Some(file) = open_private(&self.prefix.join(HOSTS_FILE), true) else {
             return Admit::Yes;
         };
         match Flock::try_lock_shared(file) {
@@ -157,7 +156,7 @@ impl HostClaim {
             return (Admit::Yes, Standing::Watching);
         }
         if self.seat.is_none() {
-            let Some(file) = open_rendezvous(&self.prefix.join(SEAT_FILE), true) else {
+            let Some(file) = open_private(&self.prefix.join(SEAT_FILE), true) else {
                 return (Admit::Later(CADENCE), Standing::Unavailable);
             };
             match Flock::try_lock(file) {
@@ -174,7 +173,7 @@ impl HostClaim {
                 }
             }
         }
-        let Some(file) = open_rendezvous(&self.prefix.join(HOSTS_FILE), true) else {
+        let Some(file) = open_private(&self.prefix.join(HOSTS_FILE), true) else {
             return (Admit::Later(CADENCE), Standing::Unavailable);
         };
         match Flock::try_lock(file) {
@@ -235,37 +234,9 @@ fn standing_note(standing: Standing) -> String {
         ),
         Standing::Unavailable => String::from(
             "vendor head watch: this terminal session could not open the store's watch \
-             rendezvous, so it cannot tell whether a window watches and stands by \u{2014} \
-             an aterm window or the next update pass finds a new release",
+             rendezvous \u{2014} standing by; the next update pass still finds new releases",
         ),
     }
-}
-
-/// Open a rendezvous file without following a link, read-write and created when `create`
-/// (a host), read-only and never created otherwise (a report). `None`: not openable, or
-/// not a plain file.
-fn open_rendezvous(path: &Path, create: bool) -> Option<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    if create {
-        options.write(true).create(true).truncate(false);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    (metadata.file_type().is_file() && !crate::platform::is_reparse(&metadata)).then_some(file)
 }
 
 fn write_pid(file: &mut File) -> std::io::Result<()> {
@@ -313,7 +284,7 @@ pub fn watcher(layout: &Layout) -> Watcher {
     let seat_path = layout.prefix.join(SEAT_FILE);
     match probe(&seat_path) {
         Ok(Probe::Exclusive) => Watcher::Session(
-            open_rendezvous(&seat_path, false).and_then(|mut file| read_pid(&mut file)),
+            open_private(&seat_path, false).and_then(|mut file| read_pid(&mut file)),
         ),
         // A round holds the rendezvous only from the seat; the seat being free between
         // the two probes is a session that just exited.
@@ -335,7 +306,7 @@ enum Probe {
 }
 
 fn probe(path: &Path) -> Result<Probe, String> {
-    let open = || open_rendezvous(path, false);
+    let open = || open_private(path, false);
     if std::fs::symlink_metadata(path).is_err() {
         return Ok(Probe::Free);
     }
@@ -376,11 +347,8 @@ pub(crate) fn claimed(layout: &Layout, host: Host) -> Box<dyn std::any::Any + Se
 mod tests {
     use super::*;
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-hosts-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-hosts-{label}-"))
     }
 
     /// THE RENDEZVOUS, CLAIM BY CLAIM (gap #28): a window's shared hold keeps every session

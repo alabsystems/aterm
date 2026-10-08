@@ -5,18 +5,12 @@
 
 use super::*;
 
-// =======================================================================
-// THE REVIEW: four findings on the tree above, each with
-// the host test.
-// =======================================================================
+// Credit and park laws for the in-flight press pool, each driven by a host
+// shape.
 
-/// H1 — A TYPED RE-ANCHOR SPENDS THE CREDIT OF THE STAMP IT CONSUMES.
-/// The box-growth wrap lights its landing on the key's stamp and, before
-/// this, spent nothing: with the one-press arm the leftover credit
-/// licensed the next KEYLESS +1 on the row inside the patience as
-/// `inflight` — light no keystroke asked for. Now the re-anchor spends
-/// one credit with the stamp, so the keyless +1 that follows finds an
-/// empty pool: refused, nothing laid, the mirror where the wrap left it.
+/// A typed re-anchor spends the credit of the stamp it consumes, so a keyless
+/// +1 on the row afterwards finds an empty pool: refused, nothing laid, the
+/// mirror where the wrap left it.
 #[test]
 fn a_typed_reanchor_spends_its_credit_so_a_keyless_plus_one_after_it_is_refused() {
     let g = geom();
@@ -41,10 +35,8 @@ fn a_typed_reanchor_spends_its_credit_so_a_keyless_plus_one_after_it_is_refused(
         0,
         "the re-anchor spent the stamp's credit"
     );
-    // THE RE-ANCHOR'S OWN LANDING is laid by the seam's one-cell sweep
-    // — "lays exactly ONE cell, the landing", made true where the park
-    // had deferred the mirror the key's own
-    // `Typed` replay folds back from.
+    // The re-anchor lays exactly one cell, its landing, via the seam's
+    // one-cell sweep.
     assert!(
         v2_cols(&glow, 5).contains(&2),
         "the re-anchor lays the landing it spent the credit on"
@@ -62,11 +54,9 @@ fn a_typed_reanchor_spends_its_credit_so_a_keyless_plus_one_after_it_is_refused(
         0,
         "…and never licensed as inflight"
     );
-    // "Lays nothing" is read AT THE LANDING the keyless +1 would have
-    // lit, not as a cell census: since the re-anchor lays its own
-    // landing (above) the pool also carries that cell's exit-swoosh
-    // reach, which grows BACKWARD from it on a later frame and is not
-    // this move's light.
+    // "Lays nothing" is read at the landing the keyless +1 would light, not as
+    // a cell census: the re-anchor's own landing later grows an exit-swoosh
+    // backward that is not this move's light.
     let after = v2_cols(&glow, 5);
     assert!(
         !after.contains(&3) && !after.contains(&4),
@@ -79,14 +69,11 @@ fn a_typed_reanchor_spends_its_credit_so_a_keyless_plus_one_after_it_is_refused(
     );
 }
 
-/// M1 — A HELD PARK SURVIVES A HIDDEN-CARET BOUNDARY IN THE GAP BEFORE
-/// ITS RETURN. Ink brackets the park and the rewrite in DECTCEM hides,
-/// and a frame can sample the hidden caret between them; the completed
-/// boundary flushed the park (S6b through the hide: judged as the
-/// re-anchor, the return refused, the credit stranded). The boundary now
-/// spares a fresh park like the typed bank: the return is one +1 from
-/// the origin, no cell dark, nothing flushed. Control: a park past its
-/// window is judged before the boundary completes, as at any tick.
+/// A held park survives a hidden-caret boundary in the gap before its return.
+/// Ink brackets the park and rewrite in DECTCEM hides and a frame can sample
+/// the hidden caret between them; the boundary spares a fresh park, so the
+/// return is one +1 from the origin with nothing dark or flushed. Control: a
+/// park past its window is judged before the boundary completes.
 #[test]
 fn a_park_survives_a_hidden_caret_boundary_in_the_gap_before_its_return() {
     let g = wide_geom();
@@ -160,17 +147,12 @@ fn a_park_survives_a_hidden_caret_boundary_in_the_gap_before_its_return() {
     );
 }
 
-/// M2 — THE COALESCED FOLD ON THE POOL. Three keys typed into a stall at
-/// the row's end, the drain crossing the wrap WIDER than the tight fold:
-/// `(11,99) → (12,2)`. Before: refused `no-fresh-hint` (the tight arm
-/// stops at column 1; the coalesced arm wanted a typing rhythm the stall
-/// aged out) AND forgotten as a cross-row refusal — every cell of the
-/// drain dark on both rows. Now: licensed by the pool alone with EXACT
-/// payment, the last column and the new row's first two cells lit, the
-/// presses spent, nothing forgotten, the mirror on the new row.
-/// Controls: a pool that OVERPAYS the shape (four presses for three
-/// cells) does not describe the hop — refused and forgotten; an empty
-/// pool is program output.
+/// The coalesced fold on the pool: three keys typed into a stall at the row's
+/// end drain across the wrap wider than the tight fold, `(11,99) → (12,2)`.
+/// The pool alone licenses it with exact payment: the last column and the new
+/// row's first two cells lit, presses spent, nothing forgotten. Controls: a
+/// pool that overpays the shape is refused and forgotten; an empty pool is
+/// program output.
 #[test]
 fn a_stalled_batch_draining_across_the_wrap_wider_than_the_tight_fold_is_paid_exactly() {
     let g = wide_geom();
@@ -254,28 +236,15 @@ fn a_stalled_batch_draining_across_the_wrap_wider_than_the_tight_fold_is_paid_ex
     assert!(v2_cols(&cold, 12).is_empty());
 }
 
-/// P1 — THE SPINNER CROSSING INSIDE A HIDDEN PARK GAP. Ink parks the
-/// caret at col 2 under a
-/// DECTCEM hide it leaves on across the ~40 ms gap, then rewrites the
-/// row and shows the caret one cell on — so every echo is judged on the
-/// VISIBLE lane (a hide-bridged `+1`), and `last_anchor_sweep`, which
-/// only a licensed ANCHORED echo writes, is never set. Inside key 7's
-/// gap the status row's counter crosses a digit width `(9)` → `(10)`:
-/// row 9's FIRST advance, brandless, the key's stamp fresh, the caret
-/// hidden. The anchored lane's spoken-for hold read `last_anchor_sweep`
-/// alone, so the crossing was licensed `key`, the stamp AND the credit
-/// spent on it, and key 7's real echo `11,8 → 11,9` was refused
-/// `no-fresh-hint` — col 8 exact ground for good (the installed build
-/// refused the crossing `program-row` only because its timing branded
-/// row 9 first). The hold now reads the last LICENSED row on EITHER
-/// lane (`last_licensed_row`): while a different row's licensed echo is
-/// younger than the stamp window, no other row may spend a stamp on the
-/// anchored lane. A program row never spends a typed stamp.
-///
-/// RED-PROOF (before the `last_licensed_row` conjunct): the
-/// zero-spinner-spends assert fails with one `licensed key` row at
-/// `(9,19) → (9,20)`, and key 7's echo row reads `declined
-/// no-fresh-hint`.
+/// A spinner crossing inside a hidden park gap. Ink parks the caret hidden for
+/// ~40 ms, then rewrites the row and shows it one cell on, so every echo is
+/// judged on the visible lane and `last_anchor_sweep` is never set. Inside a
+/// key's gap the status counter crosses a digit width `(9)` → `(10)`: a
+/// brandless first advance on another row with the stamp fresh. The anchored
+/// lane's hold reads the last licensed row on either lane
+/// (`last_licensed_row`), so while another row's licensed echo is younger than
+/// the stamp window no other row spends a stamp there: the spinner spends
+/// nothing and the key's real echo is licensed.
 #[test]
 fn a_spinner_crossing_inside_a_hidden_park_gap_cannot_steal_the_keys_stamp() {
     let g = wide_geom();
@@ -292,10 +261,9 @@ fn a_spinner_crossing_inside_a_hidden_park_gap_cannot_steal_the_keys_stamp() {
     glow.tick(Some((11, 2)), t0 + ms(16), &c, g, &mut out);
     let mut seq = 1u64;
     let mut t = t0 + ms(16);
-    // Six keys at 120 ms, each echoed Ink's way: bracket A parks the
-    // caret hidden (nothing printed; the spinner repaints at its
-    // constant width meanwhile), bracket B rewrites the row and shows
-    // the caret one cell on — the visible lane bridges the hide.
+    // Six keys at 120 ms, echoed Ink's way: bracket A parks the caret hidden
+    // (the spinner repaints at constant width), bracket B rewrites the row and
+    // shows the caret one cell on.
     for i in 0..6u16 {
         t += ms(120);
         // The frame before the key sees the caret where the last
@@ -382,18 +350,12 @@ fn a_spinner_crossing_inside_a_hidden_park_gap_cannot_steal_the_keys_stamp() {
     );
 }
 
-/// P2 — THE COALESCED FOLD ON THE ALT SCREEN. A flat `!ctx_alt` on the
-/// coalesced arm meant that on the alt screen — where Claude Code and
-/// every measured shape run — a stalled
-/// batch draining across the wrap wider than the tight fold was licensed
-/// as a typed re-anchor laying only the landing (a 350 ms stall, the
-/// credits stranded) or refused and forgotten (1 s). The arm now takes
-/// the alt screen's own discriminator, exactly as `rainbow_coalesce`
-/// does — `(!ctx_alt || blink_fresh)`: the drain's own repaint bracket
-/// (a DECTCEM hide inside DEC 2026) arms the blink in the frame that
-/// judges it, and a blinkless cross-row hop on the alt screen stays the
-/// relocation it always was (vim's `w` across the wrap keeps its
-/// owner-mandated drama).
+/// The coalesced fold on the alt screen: the arm uses the alt screen's own
+/// discriminator, `(!ctx_alt || blink_fresh)`, as `rainbow_coalesce` does. A
+/// stalled batch draining across the wrap arms the blink with its own repaint
+/// bracket (a DECTCEM hide inside DEC 2026) and is licensed; a blinkless
+/// cross-row hop on the alt screen stays a relocation (vim's `w` across the
+/// wrap).
 #[test]
 fn the_coalesced_fold_on_the_alt_screen_is_admitted_under_a_fresh_blink() {
     let g = wide_geom();
@@ -436,10 +398,8 @@ fn the_coalesced_fold_on_the_alt_screen_is_admitted_under_a_fresh_blink() {
     assert_eq!(glow.in_flight_tally().forgotten, 0, "nothing forgotten");
     assert_eq!(glow.v2.caret_mirror(), (12, 2));
 
-    // CONTROL: the alt screen with NO blink and no rhythm — the shape is
-    // not the fold there, so the cross-row hop is refused
-    // `no-fresh-hint` and, as every cross-row refusal, the pool is
-    // forgotten: the law for a blinkless relocation on the alt screen.
+    // Control: alt screen with no blink and no rhythm is not the fold; the hop
+    // is refused `no-fresh-hint` and the pool forgotten.
     let mut blinkless = CursorGlow::default();
     blinkless.note_context(true);
     let pre = roll_to(&mut blinkless, 11, 99, t0, &c, g);
@@ -465,14 +425,11 @@ fn the_coalesced_fold_on_the_alt_screen_is_admitted_under_a_fresh_blink() {
     assert!(v2_cols(&blinkless, 12).is_empty());
 }
 
-/// L1 — A KEYED MOTION PAIR IS NOT A RETURN. vim's `b` (a printable key
-/// the host stamps as typed; it cannot see the mode) parks the caret
-/// back a word, and `$` a beat later lands two cells past the origin.
-/// Judged as `origin → target` the return painted the two cells past
-/// the origin, which vim never echoed. The return is funded only by the
-/// presses banked at or before the park: `b`'s one press cannot pay two
-/// cells, so the park flushes as `b`'s own re-anchor and `$`'s hop is
-/// judged from the landing — the origin cell stays dark.
+/// A keyed motion pair is not a return. vim's `b` (stamped as typed) parks the
+/// caret back a word and `$` lands two cells past the origin. The return is
+/// funded only by presses banked at or before the park; one press cannot pay
+/// two cells, so the park flushes as `b`'s re-anchor and the origin cell stays
+/// dark.
 #[test]
 fn a_keyed_motion_pair_is_not_a_park_return() {
     let g = wide_geom();
@@ -520,9 +477,8 @@ fn a_keyed_motion_pair_is_not_a_park_return() {
     );
 }
 
-/// THE BOUND: a stall longer than the in-flight patience is refused
-/// exactly as before — the patience is a bound, not a licence.
-/// (Green today and after; it pins the number.)
+/// A stall longer than the in-flight patience is refused: the patience is a
+/// bound, not a licence.
 #[test]
 fn a_stall_longer_than_the_patience_is_refused_as_before() {
     let g = wide_geom();
@@ -542,14 +498,10 @@ fn a_stall_longer_than_the_patience_is_refused_as_before() {
     assert_eq!(dark_in(&glow, 27, 5..9).len(), 4, "and stays dark");
 }
 
-/// A SWALLOWED BATCH CANNOT FUND A PROGRAM HOP AFTER AN UNEXPLAINED MOVE.
-/// Three keys never echoed; a keyless BACKWARD hop (the ctrl+c clear of
-/// the matrix, a modal's repaint) is refused and FORGETS them; a keyless
-/// forward hop of three on the same row half a second later finds an
-/// empty pool.
-///
-/// RED on 81dea89c8: the three credits are still alive at 1.5 s and
-/// license the forward hop as a coalesce.
+/// A swallowed batch cannot fund a program hop after an unexplained move: three
+/// unechoed keys, a keyless backward hop (a clear, a modal repaint) that is
+/// refused and forgets them, then a keyless forward hop of three on the same
+/// row finds an empty pool.
 #[test]
 fn a_swallowed_batch_cannot_fund_a_program_hop_after_an_unexplained_move() {
     let g = wide_geom();
@@ -559,11 +511,9 @@ fn a_swallowed_batch_cannot_fund_a_program_hop_after_an_unexplained_move() {
     let t0 = Instant::now();
     glow.tick(Some((3, 12)), t0, &c, g, &mut out);
     let last = stalled_keys(&mut glow, 3, t0);
-    // The unexplained edge: back to col 2, keyless. Held as a park
-    // candidate for one stamp window (the Ink rewrite's park-and-return),
-    // then judged exactly as before on the next tick past
-    // it: refused, and the presses forgotten — the forget is DEFERRED
-    // past `TYPE_HINT_FRESH` (`past_park_window()`).
+    // The unexplained edge: back to col 2, keyless. Held as a park candidate
+    // for one stamp window, then refused on the next tick past it; the forget
+    // is deferred past `TYPE_HINT_FRESH` (`past_park_window()`).
     let edge = last + Duration::from_millis(1000);
     glow.tick(Some((3, 2)), edge, &c, g, &mut out);
     glow.tick(Some((3, 2)), edge + past_park_window(), &c, g, &mut out);
@@ -593,17 +543,12 @@ fn a_swallowed_batch_cannot_fund_a_program_hop_after_an_unexplained_move() {
     );
 }
 
-/// A PRESS THE TTY WILL NOT ECHO BANKS NOTHING — the `read -s` half of
-/// the same-row swallowed-press residual. The host reads
-/// canonical no-echo off the pty at the key and calls
-/// [`CursorGlow::note_typed_swallowed_no_echo`] instead of the typed
-/// hint. The shape with NO edge: three presses, then a same-row forward
-/// program hop of exactly three cells one second later (`read -s`'s
-/// caller printing on the prompt row) — refused, dark, and the tally
-/// says why. The positive control is the same three presses BANKED (a
-/// tty whose mode the host could not read, or a raw-mode program): the
-/// hop is licensed by the in-flight pool — the residual as admitted,
-/// which is what makes the withheld half non-vacuous.
+/// A press the tty will not echo banks nothing: the host reads canonical
+/// no-echo off the pty and calls
+/// [`CursorGlow::note_typed_swallowed_no_echo`] instead of the typed hint.
+/// Three such presses, then a same-row forward program hop of three cells
+/// (`read -s`'s caller printing) is refused, and the tally says why. Positive
+/// control: the same presses banked license the hop.
 #[test]
 fn a_press_the_tty_will_not_echo_banks_nothing_for_a_same_row_program_hop() {
     let g = wide_geom();
@@ -655,7 +600,7 @@ fn a_press_the_tty_will_not_echo_banks_nothing_for_a_same_row_program_hop() {
         "`trail status` names the three withheld presses and an empty pool"
     );
 
-    // POSITIVE CONTROL: the same presses banked license the same hop.
+    // Positive control: the same presses banked license the same hop.
     let mut banked = CursorGlow::default();
     banked.tick(Some((3, 4)), t0, &c, g, &mut out);
     let last = stalled_keys(&mut banked, 3, t0);
@@ -674,12 +619,9 @@ fn a_press_the_tty_will_not_echo_banks_nothing_for_a_same_row_program_hop() {
     assert_eq!(banked.in_flight_tally().swallowed_no_echo, 0);
 }
 
-/// A RETURN-LICENSED MOVE AND A ROW CHANGE FORGET THE IN-FLIGHT CREDITS.
-/// Five keys never echoed (a password), Return, the prompt's move to the
-/// next row licensed by the Return: the five presses are gone, and a
-/// keyless forward hop on the new row is refused.
-///
-/// RED on 81dea89c8: the five credits fund the hop.
+/// A Return-licensed move and a row change forget the in-flight credits: five
+/// unechoed keys (a password), Return, the prompt's row move; a keyless forward
+/// hop on the new row is refused.
 #[test]
 fn a_return_licensed_move_and_a_row_change_forget_the_in_flight_credits() {
     let g = wide_geom();
@@ -719,20 +661,11 @@ fn a_return_licensed_move_and_a_row_change_forget_the_in_flight_credits() {
     assert!(!v2_cols(&glow, 4).contains(&2) && !v2_cols(&glow, 4).contains(&5));
 }
 
-/// A GLYPH'S ECHO DOES NOT SPEND THE ENTER PRESSED BEHIND IT: a
-/// same-row FORWARD hop with a typed pair is a glyph's echo and never
-/// the Return's move, so it neither takes the Return (nor the composer
-/// newline) nor forgets; the Return stays for its own row change and is
-/// spent there — §17.3's law, "the in-flight echoes that precede a
-/// Return's own move are still licensed by their credits", by
-/// construction. Shape: `gi⏎` typed inside a quarter second with `g`'s
-/// echo still in flight (Claude Code's own measured input p99 is
-/// 268 ms; an SSH round trip makes it ordinary) — a dark cell for the
-/// second letter of every short reply followed by Enter.
-///
-/// RED before the fix: frame 1 `forgotten=1` (the `+1` taken
-/// class-blind as the Return's, the forget edge dropping `i`'s credit),
-/// frame 2 `("no-fresh-hint","none",(3,3),(3,4))` with cell 3 dark.
+/// A glyph's echo does not spend the Enter pressed behind it: a same-row
+/// forward hop with a typed pair is a glyph's echo, so it neither takes the
+/// Return (or composer newline) nor forgets, and the Return is spent on its own
+/// row change. Shape: `gi⏎` inside a quarter second with `g`'s echo in flight
+/// (ordinary over SSH).
 #[test]
 fn a_glyph_echo_does_not_spend_the_enter_pressed_behind_it() {
     let g = wide_geom();
@@ -824,53 +757,19 @@ fn a_glyph_echo_does_not_spend_the_enter_pressed_behind_it() {
     );
 }
 
-/// A NAVIGATION LICENCE AND A KILL FORGET THE IN-FLIGHT PRESSES. The
-/// arrow's own licensed move forgets at the MOVE (an arrow pressed into
-/// the stall is judged by its hop's shape, so a batch that still echoes
-/// forward keeps its light); a kill forgets at the KEY (the line's
-/// content is gone).
+/// A KILL FORGETS THE IN-FLIGHT PRESSES AT THE KEY (the line's content
+/// is gone). The arrow's twin — its own licensed move forgets at the
+/// MOVE — is the CONTROL in `seam_laws.rs`'s
+/// `a_glyph_echo_landing_after_an_arrow_is_the_glyphs_not_the_arrows`.
 ///
-/// RED on 81dea89c8: four credits fund the keyless hop in both halves.
+/// RED on 81dea89c8: four credits fund the keyless hop.
 #[test]
-fn a_navigation_licence_and_a_kill_forget_the_in_flight_presses() {
+fn a_kill_forgets_the_in_flight_presses_at_the_key() {
     let g = wide_geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
     let mut out = Vec::new();
-    // The arrow: four keys in flight, Home, the caret's licensed jump to
-    // col 2, then a keyless forward hop of four.
-    let mut glow = CursorGlow::default();
-    let t0 = Instant::now();
-    glow.tick(Some((3, 9)), t0, &c, g, &mut out);
-    let last = stalled_keys(&mut glow, 4, t0);
-    let nav = last + Duration::from_millis(100);
-    glow.note_navigation(nav);
-    glow.tick(
-        Some((3, 2)),
-        nav + Duration::from_millis(10),
-        &c,
-        g,
-        &mut out,
-    );
-    assert_eq!(
-        glow.admission_tally().licensed,
-        1,
-        "the arrow's move is licensed"
-    );
-    glow.tick(
-        Some((3, 6)),
-        nav + Duration::from_millis(500),
-        &c,
-        g,
-        &mut out,
-    );
-    let tally = glow.admission_tally();
-    assert_eq!(
-        (tally.licensed, tally.last_decline_reason),
-        (1, Some(CursorGlow::DECLINE_NO_FRESH_HINT)),
-        "after the arrow's move the pool is empty"
-    );
-    // The kill: four keys in flight, ^U at the key, then a keyless
-    // forward hop of four half a second later.
+    // Four keys in flight, ^U at the key, then a keyless forward hop of
+    // four half a second later.
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     glow.tick(Some((3, 2)), t0, &c, g, &mut out);
@@ -891,17 +790,11 @@ fn a_navigation_licence_and_a_kill_forget_the_in_flight_presses() {
     assert!(v2_cols(&glow, 3).is_empty());
 }
 
-/// A SCROLL — OR A ROW-BAND MOVE — KEEPS THE POOL. Three keys in flight
-/// on row 11, the grid scrolls one row (the box grew before the batch
-/// echoed), the caret is seen on row 10 at the same column, and the batch
-/// echoes there two seconds later as a +3: the presses were never
-/// forgotten (`forgotten == 0`, `credits == 3` after the scroll) and the
-/// echo is licensed by the pool alone (`licence=inflight`).
-/// `translate_scroll_state` moves the anchors and never touches the ring;
-/// the engine's own ledger clears on a scroll, and this pins that the
-/// host pool does not. The band row restates it for `note_band_move`:
-/// rows `0..=20` move down one, the caret is seen on row 12, the batch
-/// echoes there as a +3 on the pool.
+/// A scroll or row-band move keeps the pool. Three keys in flight on row 11,
+/// the grid scrolls one row, and the batch echoes on row 10 two seconds later
+/// as a +3 licensed by the pool (`licence=inflight`, nothing forgotten).
+/// `translate_scroll_state` moves anchors but not the ring. The band case does
+/// the same through `note_band_move`.
 #[test]
 fn a_scroll_or_a_band_move_keeps_the_in_flight_pool() {
     /// The seam, the move, and the row the caret is seen on after it.
@@ -947,16 +840,9 @@ fn a_scroll_or_a_band_move_keeps_the_in_flight_pool() {
     }
 }
 
-/// A FORGET EDGE THAT FINDS ONLY DEAD PRESSES COUNTS NOTHING. One press,
-/// then the whole in-flight patience of silent ticks on a VISIBLE caret
-/// (no hidden boundary, so nothing physically retires the slot), then a
-/// kill: every life-filtered reader already reported the pool empty
-/// (`credits=0`), so `inflight_forgotten=` must not rise — the tally's
-/// doc and the `trail` help both say it counts edges that dropped a
-/// non-empty pool.
-///
-/// RED before the fix: `forget_typed_credits` judged "non-empty" by the
-/// slots alone and ticked the tally for a press the clock had retired.
+/// A forget edge that finds only dead presses counts nothing: one press, the
+/// whole patience of silent ticks on a visible caret, then a kill. The pool
+/// already reads empty, so `inflight_forgotten=` must not rise.
 #[test]
 fn a_forget_edge_that_finds_only_dead_presses_counts_nothing() {
     let g = wide_geom();
@@ -990,12 +876,9 @@ fn a_forget_edge_that_finds_only_dead_presses_counts_nothing() {
     assert_eq!(glow.in_flight_tally().forgotten, 1);
 }
 
-/// A BACKSPACE RETIRES ONLY THE NEWEST IN-FLIGHT PRESS. `abc⌫d` typed
-/// into a stall echoes as three cells against the credits of `a`, `b`
-/// and `d` — 2.5 s after the first key.
-///
-/// RED on 81dea89c8: the 2 s life refuses the echo (`no-fresh-hint`),
-/// and the ring holds three credits after the Backspace, not two.
+/// A Backspace retires only the newest in-flight press: `abc⌫d` typed into a
+/// stall echoes as three cells against `a`, `b` and `d`, 2.5 s after the first
+/// key.
 #[test]
 fn a_backspace_retires_only_the_newest_in_flight_press() {
     let g = wide_geom();
@@ -1027,19 +910,10 @@ fn a_backspace_retires_only_the_newest_in_flight_press() {
     assert!(dark.is_empty(), "dark: {dark:?}");
 }
 
-/// A BACKSPACE'S ECHO IS A RETREAT; IT CAN NEVER EXPLAIN A FORWARD HOP.
-/// `abc` typed into a stall, `⌫` (the pool
-/// holds `a` and `b`), and the app catches up 60 ms later echoing the
-/// two survivors as one `+2` — inside the Backspace's quench window.
-/// The batch is the two presses' echo exactly as it would be 260 ms
-/// later: coalesced, both credits spent, both cells lit, and a keyless
-/// `+1` on the row afterwards finds an empty pool and is refused.
-///
-/// RED before the fix: `bs_pair` vetoed every same-row forward typed
-/// arm (`rainbow_coalesce`, `credit_starved`, `lays_typed_cells`), so
-/// the hop was licensed `inflight` yet laid nothing, spent nothing and
-/// swept nothing — cell 5 dark, two phantom credits banked for the
-/// whole patience, and the keyless `+1` lit cell 7 as `inflight`.
+/// A Backspace's echo is a retreat and never explains a forward hop: `abc`
+/// into a stall, `⌫`, and the app echoes the two survivors as one `+2` inside
+/// the Backspace's quench window. The batch is coalesced, both credits spent,
+/// both cells lit, and a keyless `+1` afterwards is refused.
 #[test]
 fn a_batch_draining_inside_the_backspaces_quench_window_is_the_survivors_echo() {
     let g = wide_geom();
@@ -1071,14 +945,10 @@ fn a_batch_draining_inside_the_backspaces_quench_window_is_the_survivors_echo() 
         0,
         "the drain spent both presses"
     );
-    // A keyless program `+1` INSIDE the quench window: the drain
-    // consumed the Backspace's one-shot — the
-    // retreat it was armed for is in the drained row — so no press
-    // and no hint license it. Before that the hint was left standing
-    // for a forward hop, and licensed every keyless `+1` on the row
-    // until it expired (a spinner advancing one cell at a time lit
-    // every step). Then one once the window has closed: no press in
-    // flight, refused.
+    // A keyless `+1` inside the quench window: the drain consumed the
+    // Backspace's one-shot, so nothing licenses it (a spinner must not light
+    // each step). Then one after the window closes: no press in flight,
+    // refused.
     for (label, later, target) in [
         ("inside the window", echo + ms(100), 8u16),
         ("past the window", echo + ms(400), 9),
@@ -1098,14 +968,9 @@ fn a_batch_draining_inside_the_backspaces_quench_window_is_the_survivors_echo() 
     }
 }
 
-/// The same drain three cells wide (`abcde⌫`, four survivors) is a
-/// coalesce, not a Backspace re-anchor: no `FoldReverse` cat pulse is
-/// minted for a forward hop, every survivor's cell is lit and the pool
-/// is spent.
-///
-/// RED before the fix: with the typed arms vetoed the +4 fell to the
-/// `deletion` re-anchor, which minted the FoldReverse pulse for a move
-/// that went forward.
+/// The same drain three cells wide (`abcde⌫`) is a coalesce, not a Backspace
+/// re-anchor: no `FoldReverse` cat pulse for a forward hop, every survivor's
+/// cell lit, the pool spent.
 #[test]
 fn a_wide_drain_inside_the_quench_window_is_not_a_backspace_fold() {
     let g = wide_geom();
@@ -1133,9 +998,8 @@ fn a_wide_drain_inside_the_quench_window_is_not_a_backspace_fold() {
     assert_eq!(glow.admission_tally().declined, 0);
 }
 
-/// The non-stall twin: `ab⌫c` inside one frame gap, echoed as one `+2`.
-/// The two cells the survivors occupy are lit and nothing is left in
-/// the pool.
+/// The non-stall case: `ab⌫c` inside one frame gap, echoed as one `+2`; both
+/// cells lit, pool empty.
 #[test]
 fn a_fast_correction_inside_one_frame_gap_lays_its_survivors() {
     let g = wide_geom();
@@ -1160,10 +1024,10 @@ fn a_fast_correction_inside_one_frame_gap_lays_its_survivors() {
     assert_eq!(glow.typed_credits_within(echo), 0, "both survivors spent");
 }
 
-/// Pre-roll `2..5` visible with the print anchor fed, then `n_hidden`
-/// keys echoed through the anchored lane under a HIDDEN caret (Claude
-/// Code's per-keystroke bracket). Returns the next anchor sequence and
-/// the row's end column.
+/// Pre-roll `2..5` visible with the print anchor fed, then `n_hidden` keys
+/// echoed through the anchored lane under a hidden caret (Claude Code's
+/// per-keystroke bracket). Returns the next anchor sequence and the row's end
+/// column.
 fn anchored_hidden_run(
     glow: &mut CursorGlow,
     t0: Instant,
@@ -1208,27 +1072,12 @@ fn anchored_hidden_run(
     (seq, end)
 }
 
-/// THE REAPPEARANCE OVER AN ANCHORED RUN KEEPS THE PRESSES IN FLIGHT.
-/// While the caret is hidden across
-/// per-keystroke brackets, the anchored lane licenses each echo and
-/// moves the mirror, but `last_visible` stayed at the pre-hide cell —
-/// so when the caret was shown where the anchor already put it, with
-/// two presses in flight, the hide-bridge's in-flight arm re-judged the
-/// WHOLE run `last_visible -> cur` as one hop: the share rule refused
-/// it (`no-credits`), one press was spent on the landing, the other
-/// forgotten, and the two keys' real echo was refused `no-fresh-hint`
-/// — permanent dark cells, and the ledger could not bridge them either.
-/// A licensed anchored echo under a hidden caret now moves the
-/// hide-bridge source to its landing (where the mirror already sits),
-/// so the reappearance is judged as the hop from THAT cell — a
-/// same-cell reappearance keeps the pool and the fresh stamps, and the
-/// stalled keys echo licensed.
-///
-/// RED before the fix: `forgotten=1 dark=[8, 9]`, ring after the show
-/// `("no-credits","none",(3,5),(3,8))`, then `("no-fresh-hint","none",
-/// (3,8),(3,10))`. Four shapes: two presses in flight at the show, one,
-/// none (a new key after the show), and the show landing with the
-/// stalled echo already in.
+/// The reappearance over an anchored run keeps the presses in flight. A
+/// licensed anchored echo under a hidden caret moves the hide-bridge source to
+/// its landing (where the mirror is), so a later show is judged from there: a
+/// same-cell reappearance keeps the pool and fresh stamps, and stalled keys
+/// echo licensed. Four shapes: two presses in flight at the show, one, none (a
+/// new key after the show), and the show landing with the stalled echo in.
 #[test]
 fn a_reappearance_over_an_anchored_run_keeps_the_in_flight_presses() {
     let g = wide_geom();
@@ -1303,12 +1152,10 @@ fn a_reappearance_over_an_anchored_run_keeps_the_in_flight_presses() {
     assert_eq!(glow.in_flight_tally().forgotten, 0);
 }
 
-/// The S8e pre-roll on `row` of a 100-column grid: `k1` echoes
-/// `97 -> 98`, `k2` `98 -> 99` (visible, the anchor fed), and `k3` —
-/// the glyph at the pane's LAST column — prints with no caret move (the
-/// xterm pending wrap: the anchor one past the caret parked at 99),
-/// licensed by the anchored lane's `wrap_parked` arm. Returns the clock
-/// after `k3`'s echo with every press paid.
+/// Pre-roll on `row` of a 100-column grid: `k1` echoes `97 -> 98`, `k2`
+/// `98 -> 99` (visible, anchor fed), and `k3` prints at the last column with no
+/// caret move (xterm pending wrap), licensed by the anchored lane's
+/// `wrap_parked` arm. Returns the clock after `k3`'s echo, every press paid.
 fn pending_wrap_paid(
     glow: &mut CursorGlow,
     row: u16,
@@ -1339,30 +1186,14 @@ fn pending_wrap_paid(
     k3 + ms(3)
 }
 
-/// A FOLD AFTER A PAID PENDING-WRAP GLYPH DOES NOT CHARGE THE LAST
-/// COLUMN TWICE. `fold_shape` priced
-/// `99 -> (r+1, 1)` at two cells — the origin row's tail plus the
-/// landing head — which was right when the last-column print produced
-/// no observed move and nothing else paid for it. Since the anchored
-/// lane's `wrap_parked` arm licenses that print and spends
-/// its credit, the fold that follows asked the pool for two (tight) or
-/// exactly the sum (coalesced) when only the new row's glyph was
-/// unpaid: a stalled key after the last-column glyph was refused
-/// `no-fresh-hint` and forgotten, its cell on the new row dark; two
-/// stalled keys had the fold spend both and the second's `+1` starve.
-/// The row whose edge glyph the anchored lane paid is remembered
-/// (`wrap_paid_row`, consumed by the next observed caret move, riding
-/// its row across a scroll or band move), and the fold from that
-/// column prices the landing head alone.
-///
-/// RED before the fix: `row 12 lit: {}; declined=1 reason=Some("no-
-/// fresh-hint") forgotten=1`. Shapes: one stalled key; two (the fold
-/// then a `+1`); the grid's bottom row (the wrap scrolls before the
-/// fold is observed, so the witness must ride its row rather than sit
-/// in the anchor memory the scroll wipes). Controls that must keep
-/// paying two: the last-column glyph arriving WITH the fold, and the
-/// pending-wrap glyph arriving in the same tick as a caret move (the
-/// visible lane owns that tick, nothing paid the edge cell).
+/// A fold after a paid pending-wrap glyph does not charge the last column
+/// twice. The row whose edge glyph the anchored lane paid is remembered
+/// (`wrap_paid_row`, consumed by the next observed caret move, carried across
+/// a scroll or band move), and the fold `99 -> (r+1, 1)` from it prices only
+/// the landing head. Shapes: one stalled key; two (the fold then a `+1`); the
+/// bottom row (the wrap scrolls before the fold). Controls that still pay two:
+/// the last-column glyph arriving with the fold, and the pending-wrap glyph in
+/// the same tick as a caret move.
 #[test]
 fn a_fold_after_a_paid_pending_wrap_glyph_does_not_charge_the_last_column_twice() {
     let g = wide_geom();
@@ -1463,10 +1294,9 @@ fn a_fold_after_a_paid_pending_wrap_glyph_does_not_charge_the_last_column_twice(
         0,
         "both presses spent by the fold"
     );
-    // CONTROL: the pending-wrap glyph arrives in the SAME tick as a
-    // caret move (k2's `98 -> 99` with the anchor already at the edge):
-    // the visible lane owns that tick and nothing paid cell 99, so the
-    // fold still lays both cells from two presses.
+    // Control: the pending-wrap glyph in the same tick as a caret move
+    // (`98 -> 99`): the visible lane owns the tick and nothing paid cell 99, so
+    // the fold lays both cells from two presses.
     let mut glow = CursorGlow::default();
     glow.tick(Some((11, 97)), t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((11, 97, 1)));
@@ -1498,22 +1328,11 @@ fn a_fold_after_a_paid_pending_wrap_glyph_does_not_charge_the_last_column_twice(
     assert_eq!(glow.typed_credits_within(echo), 0);
 }
 
-/// THE PENDING-WRAP PRINT UNDER A HIDDEN CARET (shape a). The
-/// hide-bridge relocation moves the hide-bridge source
-/// to the anchored echo's landing `(ar, ac)` — and at the pane's edge
-/// `ac == pane_col1` is OFF-GRID (the print anchor counts the deferred
-/// wrap) while the DEC caret is shown parked at `pane_col1 - 1`. The
-/// show frame then bridged `(11,100) -> (11,99)`: a same-row BACKWARD
-/// hop, refused `no-fresh-hint` with the pool forgotten, and the tick's
-/// `cur != last_visible` consumption cleared `wrap_paid_row`, so the
-/// fold `99 -> (12,1)` that followed priced two cells against one
-/// press — refused, forgotten, the new row's head dark. The source is
-/// clamped to the last on-grid column, so the show is a same-cell
-/// completed boundary and the paid edge cell's witness survives it.
-///
-/// RED before the fix: `declined=1` (`no-fresh-hint (11,100)->(11,99)`)
-/// at the show, `wrap_paid_row=None`, then the fold refused and
-/// `forgotten=1`, row 12 empty.
+/// The pending-wrap print under a hidden caret. At the pane's edge the anchored
+/// landing `ac == pane_col1` is off-grid while the caret shows at
+/// `pane_col1 - 1`, so the hide-bridge source is clamped to the last on-grid
+/// column: the show is a same-cell boundary, `wrap_paid_row` survives, and the
+/// following fold lights the new row's head.
 #[test]
 fn a_pending_wrap_print_under_a_hidden_caret_is_shown_on_the_pane_edge() {
     let g = wide_geom();
@@ -1588,27 +1407,11 @@ fn a_pending_wrap_print_under_a_hidden_caret_is_shown_on_the_pane_edge() {
     assert_eq!(glow.typed_credits_within(k4 + ms(350)), 0);
 }
 
-/// MID-LINE TYPING UNDER A HIDDEN CARET (shape b). Ink re-lays the
-/// row's tail on every key, so the print
-/// anchor lands at the row's END while the caret is shown mid-row, one
-/// past the glyph typed. Relocated to the anchor, the hide-bridge
-/// source sat at the row's end and the show frame bridged back to the
-/// caret: a same-row BACKWARD hop — held as a park when a press was in
-/// flight (released on the anchored lane by the next echo, which then
-/// relocated the source again), refused `no-fresh-hint` with the pool
-/// forgotten when the stamp was fresh and nothing was in flight, and
-/// past the bridge's reach a DECLINED hidden relocation whose silent
-/// wipe dropped the pool uncounted. (Before the relocation the show
-/// was a refused FORWARD `+1`, the pool kept.) A caret last shown LEFT
-/// of the row's remembered end now advances by the echo's width, so
-/// every show is a same-cell boundary: nothing refused, held, spent or
-/// forgotten, and the stalled keys' echoes through the hidden bracket
-/// are the pool's to pay as ever.
-///
-/// RED before the fix: the first show held a park `(5,11)->(5,6)` on
-/// the second key's credit (`park_returns=1` once its echo released
-/// it), and the last show wiped that key's successor from the pool
-/// (`credits=0` with the third key unechoed).
+/// Mid-line typing under a hidden caret. Ink re-lays the row's tail on each
+/// key, so the print anchor lands at the row's end while the caret shows
+/// mid-row. A caret last shown left of the row's remembered end advances by
+/// the echo's width, so every show is a same-cell boundary: nothing refused,
+/// held, spent or forgotten, and stalled keys' echoes are paid by the pool.
 #[test]
 fn mid_line_typing_under_a_hidden_caret_is_shown_where_the_glyph_put_the_caret() {
     let g = wide_geom();
@@ -1645,9 +1448,9 @@ fn mid_line_typing_under_a_hidden_caret_is_shown_where_the_glyph_put_the_caret()
         1,
         "the second key still in flight"
     );
-    // The second key stalls with a third; they echo together (+2) under
-    // the hide, the caret shown at 8; then a fourth key's own +1, shown
-    // at 9. No park, no refusal, nothing forgotten.
+    // The second key stalls with a third; they echo together (+2) under the
+    // hide, caret shown at 8; then a fourth key's +1, shown at 9. No park, no
+    // refusal, nothing forgotten.
     let k3 = t0 + ms(215);
     glow.note_typed(k3);
     glow.observe_print_anchor(Some((5, 13, 3)));
@@ -1693,13 +1496,8 @@ fn mid_line_typing_under_a_hidden_caret_is_shown_where_the_glyph_put_the_caret()
     );
     assert_eq!(glow.typed_credits_within(t0 + ms(1140)), 0);
 
-    // THE ESTIMATE'S WITNESS: a caret shown exactly where it was last
-    // observed, left of the relocated source, is no move at all — the
-    // relocation was a guess and the caret never left. Not a park, not
-    // a refusal, not the declined relocation's silent wipe; the pool
-    // kept: an advance at the row's end inside the stamp window that
-    // was not the caret's must not turn the caret's own reappearance
-    // into a forget.
+    // A caret shown exactly where last observed, left of the relocated source,
+    // is no move: not a park, refusal or wipe, and the pool is kept.
     let mut glow = CursorGlow::default();
     glow.tick(Some((5, 5)), t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((5, 10, 1)));
@@ -1729,24 +1527,12 @@ fn mid_line_typing_under_a_hidden_caret_is_shown_where_the_glyph_put_the_caret()
     assert_eq!(glow.in_flight_tally().forgotten, 0);
 }
 
-/// A BACKSPACE INTO A COMMITTED IME RUN RETIRES ONE GLYPH'S CREDIT, NOT
-/// THE RUN'S. The host banks an IME commit as ONE press priced at its
-/// summed width (three CJK glyphs: one slot, six cells), and a Backspace
-/// erases one glyph of it. The host prices that glyph (two cells,
-/// [`CursorGlow::note_backspace_erasing`]) and the slot keeps the other
-/// four, so when the stalled prompt catches up and echoes the surviving
-/// two glyphs as a +4, the pool pays for it. An erase the host could
-/// not price (`None`) still retires the whole newest press — a plain
-/// key laid one glyph, however wide. A PRICED ZERO (`Some(0)`, a
-/// zero-width cluster inside the run) retires nothing: not the run's
-/// slot, and not the press before the run once the run is paid out.
-///
-/// RED before the fix: `retire_newest` dropped the whole slot at the
-/// Backspace (0 credits) and the +4 was refused `no-fresh-hint` — four
-/// dark cells for two glyphs the hand never erased. RED again before
-/// the priced zero: `0` was the unpriced value, so the
-/// zero-width erase below took the key before the run (left 0,
-/// right 1).
+/// A Backspace into a committed IME run retires one glyph's credit, not the
+/// run's. An IME commit banks as one press priced at its summed width (three
+/// CJK glyphs: six cells); [`CursorGlow::note_backspace_erasing`] prices the
+/// erased glyph (two cells) and the slot keeps four, so the survivors' +4 echo
+/// is paid. An unpriced erase (`None`) retires the whole newest press; a priced
+/// zero (`Some(0)`) retires nothing.
 #[test]
 fn a_backspace_into_an_ime_run_retires_one_glyphs_credit() {
     let g = wide_geom();
@@ -1786,14 +1572,10 @@ fn a_backspace_into_an_ime_run_retires_one_glyphs_credit() {
     glow.note_typed_cells(echo + ms(340), 1);
     glow.note_backspace_erasing(echo + ms(425), Some(2));
     assert_eq!(glow.typed_credits_within(echo + ms(425)), 1);
-    // A PRICED ZERO retires nothing. A plain key (`x`, one cell) and
-    // then a run whose first cluster is a base-less combining mark
-    // (`\u{0301}日本`: widths 0, 2, 2 — one press, four cells): erasing
-    // `本` and `日` pays the run out, and erasing the mark gives back
-    // its zero WITHOUT taking `x`, the newest press left — that key
-    // was never erased and its echo is still the pool's to pay. Only
-    // an unpriced erase takes it. (The pool is emptied first: the
-    // older of the two one-cell presses above is still banked.)
+    // A priced zero retires nothing: a key `x`, then a run starting with a
+    // baseless combining mark (`\u{0301}日本`: widths 0, 2, 2). Erasing `本`
+    // and `日` pays the run out; erasing the mark does not take `x`. Only an
+    // unpriced erase does. (The pool is emptied of the older press first.)
     glow.note_backspace_erasing(echo + ms(510), None);
     assert_eq!(glow.typed_credits_within(echo + ms(510)), 0);
     let key = echo + ms(595);
@@ -1821,12 +1603,9 @@ fn a_backspace_into_an_ime_run_retires_one_glyphs_credit() {
     );
 }
 
-/// AN UNPAID CREDIT SURVIVES A HIDDEN BOUNDARY FOR THE WHOLE PATIENCE.
-/// Eight keys in flight, a repaint bracket's hidden→visible boundary at
-/// the same cell three seconds in, the echo 100 ms later: licensed.
-///
-/// RED on 81dea89c8: `retire_hidden_movement_provenance` retired the
-/// credits at the 2 s life.
+/// An unpaid credit survives a hidden boundary for the whole patience: eight
+/// keys in flight, a same-cell hidden→visible boundary at 3 s, the echo 100 ms
+/// later is licensed.
 #[test]
 fn an_unpaid_credit_survives_a_hidden_boundary_for_the_whole_patience() {
     let g = wide_geom();
@@ -1863,15 +1642,10 @@ fn an_unpaid_credit_survives_a_hidden_boundary_for_the_whole_patience() {
     assert!(dark_in(&glow, 3, 5..13).is_empty());
 }
 
-/// A HIDDEN CARET REAPPEARING AT THE END OF A STALLED BATCH IS THE
-/// BATCH'S ECHO. A frame catches the merged repaint's bracket hidden;
-/// the next sees the caret thirty cells on. The hide bridge's reach is
-/// two cells (eight under a fresh stamp), so the reappearance was a
-/// DECLINED relocation that wiped the whole bank. Under Rainbow Kitty a
-/// same-row forward reappearance the in-flight credits pay for is the
-/// echo shape, and is judged as one.
-///
-/// RED on 81dea89c8: `retire_all_movement_provenance`, nothing spawned.
+/// A hidden caret reappearing at the end of a stalled batch is the batch's
+/// echo: the caret reappears thirty cells on, beyond the hide bridge's reach.
+/// Under Rainbow Kitty a same-row forward reappearance the credits pay for is
+/// judged as the echo, not a relocation that wipes the bank.
 #[test]
 fn a_hidden_caret_reappearing_at_the_end_of_a_stalled_batch_is_the_batch_echo() {
     let g = wide_geom();
@@ -1899,18 +1673,10 @@ fn a_hidden_caret_reappearing_at_the_end_of_a_stalled_batch_is_the_batch_echo() 
     assert!(dark.is_empty(), "dark: {dark:?}");
 }
 
-/// A KEY TYPED AS THE STALLED FRAME LANDS KEEPS ITS OWN ECHO. Thirty keys
-/// into the stall; the 31st is pressed between the merged frame's
-/// arrival and the tick that judges it, so its stamp is the one fresh
-/// stamp beside thirty stale ones. The batch is the thirty older
-/// presses' — dated at the oldest of them, spending only them — and the
-/// fresh stamp stays in the bank for its own key's echo, which lands a
-/// frame later and is licensed per key.
-///
-/// RED on 81dea89c8: the batch pops the fresh stamp, dates its sweep at
-/// that key, the ledger forfeits the key's press, and the key's own
-/// echo is refused `no-fresh-hint` — one dark cell after the recovery,
-/// never relit.
+/// A key typed as the stalled frame lands keeps its own echo: thirty keys into
+/// the stall, the 31st pressed between the merged frame's arrival and its tick.
+/// The batch spends only the thirty older presses, dated at the oldest, and the
+/// fresh stamp stays for its own echo a frame later.
 #[test]
 fn a_key_typed_as_the_stalled_frame_lands_keeps_its_own_echo() {
     let g = wide_geom();
@@ -1957,14 +1723,9 @@ fn a_key_typed_as_the_stalled_frame_lands_keeps_its_own_echo() {
     );
 }
 
-/// A STALLED BATCH DRAINED ACROSS TWO FRAMES KEEPS ITS TAIL ON THE
-/// LEDGER. Thirty keys; the first frame echoes twenty-nine, the second
-/// the thirtieth alone — ONE press still in flight, licensed for its own
-/// +1 by the one-press arm and lit at once: the batch sweep
-/// on the OLDEST press's clock let the ring SPEND the twenty-nine and
-/// keep the one, and the kept one pays for its cell.
-///
-/// RED on 81dea89c8: the whole batch is refused at the first frame.
+/// A stalled batch drained across two frames keeps its tail: thirty keys, the
+/// first frame echoes twenty-nine, the second the last alone, licensed by the
+/// one-press arm and lit at once.
 #[test]
 fn a_stalled_batch_drained_across_two_frames_keeps_its_tail_on_the_ledger() {
     let g = wide_geom();
@@ -2022,16 +1783,10 @@ fn a_stalled_batch_drained_across_two_frames_keeps_its_tail_on_the_ledger() {
     );
 }
 
-/// A HIDDEN-CARET TUI'S BATCH AFTER A STALL IS LAID FROM THE PRINT ANCHOR
-/// AND DOES NOT BRAND THE ROW. fc_hidden's shape: the caret hidden across
-/// frames, the input row's identity proven by one licensed anchored echo,
-/// then twelve keys into a stall and the row's end advancing twelve cells
-/// three seconds later. Licensed through the anchored lane, lit, and the
-/// row is still the echo row afterwards (a later per-key hidden echo on
-/// it is licensed, not refused `program-row`).
-///
-/// RED on 81dea89c8: the correlation gate needs a fresh stamp — the
-/// batch is refused silently, and the advance brands the row.
+/// A hidden-caret TUI's batch after a stall is laid from the print anchor and
+/// does not brand the row: the input row proven by one anchored echo, twelve
+/// keys into a stall, the row's end advancing twelve cells 3 s later. Licensed
+/// on the anchored lane, and a later hidden echo on the row is still licensed.
 #[test]
 fn a_hidden_caret_tui_batch_after_a_stall_is_laid_from_the_print_anchor_and_does_not_brand_the_row()
 {
@@ -2075,18 +1830,11 @@ fn a_hidden_caret_tui_batch_after_a_stall_is_laid_from_the_print_anchor_and_does
     );
 }
 
-/// A PROGRAM ROW ADVANCING WHILE PRESSES ARE IN FLIGHT IS NOT THE ECHO.
-/// The refute round's fixture shape with the stall added: the input
-/// row's identity proven by k1's anchored echo; k2 and k3 unpaid (the
-/// app slow); the status row's end advances 555 ms after the last input
-/// echo — outside the spoken-for hold, inside the in-flight pool. It is
-/// NOT the echo (the unpaid presses carry no row identity; only the
-/// established echo row may spend them), it spends nothing, and k2/k3's
-/// real echo on the input row is then licensed in full.
-///
-/// RED on 81dea89c8 at the last assert (the batch is refused); the
-/// status-row assert is the negative control the in-flight licence must
-/// keep green.
+/// A program row advancing while presses are in flight is not the echo: the
+/// input row proven by k1's anchored echo, k2 and k3 unpaid, and the status
+/// row's end advances 555 ms later (outside the spoken-for hold, inside the
+/// pool). Only the established echo row may spend unpaid presses, so the
+/// status advance spends nothing and k2/k3's echo is then licensed in full.
 #[test]
 fn a_program_row_advancing_while_presses_are_in_flight_is_not_the_echo() {
     let g = wide_geom();
@@ -2135,14 +1883,10 @@ fn a_program_row_advancing_while_presses_are_in_flight_is_not_the_echo() {
     assert!(dark_in(&glow, 11, 2..5).is_empty());
 }
 
-/// AN INSERT DELIVERED INTO A STALL LAYS THE KEYS BEHIND IT ONCE. Four
-/// keys typed into the stall, a paste delivered into it, the row echoing
-/// both as ONE hop: the insert arm pays the surplus from the in-flight
-/// credits (which are still there at 3.5 s), lays one sweep under
-/// `licence=insert`, and the typed path never runs for the span.
-///
-/// RED on 81dea89c8: `insert_reach` = 10 + 0 stale credits < 14, the
-/// hop is refused `no-fresh-hint`.
+/// An insert delivered into a stall lays the keys behind it once: four keys
+/// then a paste, echoed as one hop. The insert arm pays the surplus from the
+/// in-flight credits (still live at 3.5 s) and lays one sweep under
+/// `licence=insert`; the typed path does not run for the span.
 #[test]
 fn an_insert_delivered_into_a_stall_lays_the_keys_behind_it_once() {
     let g = wide_geom();

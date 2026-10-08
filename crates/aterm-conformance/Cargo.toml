@@ -8,6 +8,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm VT conformance + integration tests, founded on the engine read API (feed -> read screen -> assert). The screen-reading oracle IS the introspection API."
+# Every tests/*.rs is either a `mod` of the `vt` suite (tests/vt.rs) or one of
+# the explicit [[test]] targets below; with autotests off, a file that is
+# neither silently never compiles.
+autotests = false
 
 [dependencies]
 # Enable the `sixel` feature so the conformance binary compiles the decode +
@@ -18,7 +22,30 @@ aterm-core = { workspace = true, features = ["sixel"] }
 
 [dev-dependencies]
 aterm-types = { workspace = true }
-proptest = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
+# gate while still being linked and executed. Doctests are a separate switch.
+test = false
+
+# The engine-read conformance files, one binary: pure feed -> read -> assert
+# cases that share a process safely (see the header of tests/vt.rs).
+[[test]]
+name = "vt"
+path = "tests/vt.rs"
+
+# Isolated: launches the RELEASE binary headless and pixel-checks timed takes
+# behind its own serial lock; the MEASURE tier's `measuring tests` stage
+# (tools/verify.sh --measure) runs it.
+[[test]]
+name = "paint"
+path = "tests/paint.rs"
+
+# Isolated: measures an idle instance's event loop over a timed window;
+# the MEASURE tier's `measuring tests` stage runs it.
+[[test]]
+name = "spin"
+path = "tests/spin.rs"

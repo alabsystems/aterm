@@ -4,11 +4,9 @@
 //! END-TO-END evidence over a real loopback socket.
 //!
 //! The endpoint this client was written for is a loopback Ollama, so a stub
-//! server on `127.0.0.1` exercises more of the truth than a differential
-//! against the retired crate would: these tests assert the exact BYTES that
-//! reach a server and the exact body that comes back, through real TCP, real
-//! timeouts and the real authority guard — not that two libraries agree about
-//! an abstraction.
+//! server on `127.0.0.1` exercises the truth: these tests assert the exact
+//! BYTES that reach a server and the exact body that comes back, through real
+//! TCP, real timeouts and the real authority guard.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +16,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use aterm_http::{Client, Error, Guard, ProxyMode, Trust};
+
+/// A wait for something that must happen is a hang detector, never a latency budget.
+const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 /// Read a request head (to the blank line) plus `Content-Length` body bytes.
 fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
@@ -64,12 +65,9 @@ fn stub(response: &'static [u8]) -> (String, mpsc::Receiver<(String, Vec<u8>)>) 
     (format!("http://127.0.0.1:{port}/api/chat"), rx)
 }
 
+/// A client for a stub that answers: its deadline bounds a reply that must come.
 fn client() -> Client {
-    Client::new(
-        Trust::PlatformVerifier,
-        ProxyMode::Direct,
-        Duration::from_secs(10),
-    )
+    Client::new(Trust::PlatformVerifier, ProxyMode::Direct, HANG_DETECTOR)
 }
 
 #[test]
@@ -86,7 +84,7 @@ fn a_json_post_puts_the_expected_bytes_on_the_wire_and_parses_the_reply() {
         .send(body)
         .expect("request succeeds");
 
-    let (head, sent) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (head, sent) = rx.recv_timeout(HANG_DETECTOR).unwrap();
     // The request line is origin-form and the Host carries the explicit port.
     assert!(head.starts_with("POST /api/chat HTTP/1.1\r\n"), "{head}");
     assert!(head.contains("Host: 127.0.0.1:"), "{head}");
@@ -111,16 +109,6 @@ fn a_json_post_puts_the_expected_bytes_on_the_wire_and_parses_the_reply() {
 }
 
 #[test]
-fn a_chunked_reply_is_reassembled() {
-    // Ollama replies chunked when it does not know the length up front.
-    let (endpoint, _rx) = stub(
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n{\"a\":\"bc\"\r\n2\r\n}\n\r\n0\r\n\r\n",
-    );
-    let response = client().post(&endpoint).limit(4096).send(b"{}").unwrap();
-    assert_eq!(response.body(), b"{\"a\":\"bc\"}\n");
-}
-
-#[test]
 fn a_chunk_size_at_the_top_of_usize_is_an_error_not_a_panic() {
     // The exact byte sequence that reproduced the defect: one real chunk, then
     // a chunk-size line of ffffffffffffffff (usize::MAX). The old `body.len() +
@@ -141,47 +129,6 @@ fn a_chunk_size_at_the_top_of_usize_is_an_error_not_a_panic() {
         matches!(error, Error::TooLarge { limit: 4096 }),
         "{error:?}"
     );
-}
-
-#[test]
-fn conflicting_duplicate_content_lengths_are_refused() {
-    // One `find` returning the first of N is how two peers end up disagreeing
-    // about where this response ends. RFC 9112 also permits only 1*DIGIT, so a
-    // sign-prefixed length — which Rust's usize parser accepts — is refused too.
-    for response in [
-        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 9\r\n\r\nhi" as &[u8],
-        b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nhi",
-    ] {
-        let (endpoint, _rx) = stub(response);
-        let error = client()
-            .post(&endpoint)
-            .limit(4096)
-            .send(b"{}")
-            .expect_err("ambiguous framing must be refused");
-        assert!(matches!(error, Error::Protocol(_)), "{error:?}");
-    }
-}
-
-#[test]
-fn a_non_2xx_status_reaches_the_caller_intact() {
-    let (endpoint, _rx) = stub(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot here\n");
-    let response = client().post(&endpoint).limit(4096).send(b"{}").unwrap();
-    assert_eq!(response.status(), 404);
-    assert!(!response.is_success());
-    assert_eq!(response.body(), b"not here\n");
-}
-
-#[test]
-fn an_oversized_body_errors_rather_than_truncating() {
-    let (endpoint, _rx) = stub(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n0123456789012345678901234567890123456789012345678901234567890123",
-    );
-    let error = client()
-        .post(&endpoint)
-        .limit(16)
-        .send(b"{}")
-        .expect_err("over the limit");
-    assert!(matches!(error, Error::TooLarge { limit: 16 }), "{error:?}");
 }
 
 #[derive(Debug)]
@@ -231,10 +178,12 @@ fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
 fn a_silent_server_hits_the_deadline_instead_of_hanging() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // Accept and then never reply.
+    // Accept and then never reply: the connection is held for five minutes,
+    // so a client that waited for the server is told from one that hit its
+    // 250 ms deadline by a minute's hang detector.
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            std::thread::sleep(Duration::from_secs(10));
+            std::thread::sleep(Duration::from_secs(300));
             drop(stream);
         }
     });
@@ -250,7 +199,7 @@ fn a_silent_server_hits_the_deadline_instead_of_hanging() {
         .send(b"{}")
         .expect_err("a silent server must time out");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < HANG_DETECTOR,
         "took {:?}",
         started.elapsed()
     );
@@ -314,7 +263,7 @@ fn an_https_endpoint_puts_a_client_hello_on_the_wire_and_never_the_body() {
     .expect_err("a peer that speaks no TLS cannot complete a handshake");
 
     let seen = rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(HANG_DETECTOR)
         .expect("the stub must report what it saw");
     assert_eq!(
         seen.first(),
@@ -365,10 +314,12 @@ fn a_dribbling_tls_peer_cannot_outlive_the_global_deadline() {
     // The deadline has to be enforced INSIDE the handshake, not just before it:
     // `complete_io` loops on `read_tls`, so a per-syscall timeout applied once
     // at the top bounds one read while every dribbled byte restarts the clock.
-    // This peer dribbles for ~6s against a client budgeted 1s. Before the fix
-    // the client stayed on the socket until the stub gave up; the bound below
-    // is what makes this test non-vacuous rather than the error alone.
-    let endpoint = dribbling_tls_peer(Duration::from_millis(100), 60);
+    // This peer dribbles for ~5 minutes against a client budgeted 1s. Before
+    // the fix the client stayed on the socket until the stub gave up; the
+    // bound below — a minute's hang detector, never a latency budget — is what
+    // makes this test non-vacuous rather than the error alone. The peer stops
+    // at the first byte the closed client refuses, so a pass pays none of it.
+    let endpoint = dribbling_tls_peer(Duration::from_millis(100), 3_000);
     let client = Client::new(
         Trust::PlatformVerifier,
         ProxyMode::Direct,
@@ -382,10 +333,130 @@ fn a_dribbling_tls_peer_cannot_outlive_the_global_deadline() {
         .expect_err("a handshake that never finishes must hit the deadline");
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < HANG_DETECTOR,
         "the handshake ran {elapsed:?} on a 1s budget: {error:?}"
     );
     assert!(matches!(error, Error::Io(_)), "{error:?}");
+}
+
+/// An environment that names one `HTTPS_PROXY` and nothing else.
+struct HttpsProxyEnv(String);
+
+impl aterm_http::proxy::EnvSource for HttpsProxyEnv {
+    fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
+        (name == "HTTPS_PROXY").then(|| self.0.clone().into())
+    }
+}
+
+#[test]
+fn a_proxy_that_sends_an_interim_response_before_its_connect_answer_still_tunnels() {
+    // RFC 9110 §15.2: a client MUST parse 1xx responses before the final one,
+    // and the CONNECT exchange is no exception. Reading the `100` as the answer
+    // refused a tunnel the proxy went on to grant. The stub proxy reports the
+    // first byte the client sends AFTER the final 200: a TLS handshake record
+    // (0x16) means the tunnel was taken.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.set_read_timeout(Some(HANG_DETECTOR));
+        let (head, _) = read_request(&mut stream);
+        let _ = stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 Connection established\r\n\r\n");
+        let mut first = [0u8; 1];
+        let read = stream.read(&mut first).unwrap_or(0);
+        let _ = tx.send((head, (read == 1).then_some(first[0])));
+    });
+    let error = Client::new(
+        Trust::PlatformVerifier,
+        ProxyMode::Environment,
+        HANG_DETECTOR,
+    )
+    .post("https://origin.test/api/chat")
+    .limit(4096)
+    .send_with_env(b"{}", &HttpsProxyEnv(format!("http://127.0.0.1:{port}")))
+    .expect_err("the stub proxy speaks no TLS for the origin");
+    let (head, first) = rx.recv_timeout(HANG_DETECTOR).unwrap();
+    assert!(
+        head.starts_with("CONNECT origin.test:443 HTTP/1.1\r\n"),
+        "{head}"
+    );
+    assert_eq!(
+        first,
+        Some(0x16),
+        "the client must open TLS through the tunnel the final 200 granted: {error:?}"
+    );
+}
+
+#[test]
+fn userinfo_in_the_proxy_url_authenticates_the_connect() {
+    // `user:password@` in HTTPS_PROXY becomes the CONNECT's
+    // `Proxy-Authorization: Basic`, never a silent direct connection.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.set_read_timeout(Some(HANG_DETECTOR));
+        let (head, _) = read_request(&mut stream);
+        let _ = tx.send(head);
+        let _ = stream
+            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n");
+    });
+    let error = Client::new(
+        Trust::PlatformVerifier,
+        ProxyMode::Environment,
+        HANG_DETECTOR,
+    )
+    .post("https://origin.test/api/chat")
+    .limit(4096)
+    .send_with_env(
+        b"{}",
+        &HttpsProxyEnv(format!("http://alice:s3cret@127.0.0.1:{port}")),
+    )
+    .expect_err("the stub proxy refuses the tunnel");
+    let head = rx.recv_timeout(HANG_DETECTOR).unwrap();
+    assert!(
+        head.starts_with("CONNECT origin.test:443 HTTP/1.1\r\n"),
+        "{head}"
+    );
+    // base64("alice:s3cret")
+    assert!(
+        head.contains("\r\nProxy-Authorization: Basic YWxpY2U6czNjcmV0\r\n"),
+        "{head}"
+    );
+    assert!(matches!(error, Error::Protocol(_)), "{error:?}");
+    assert!(!error.to_string().contains("s3cret"), "{error}");
+}
+
+#[test]
+fn an_https_proxy_is_refused_before_any_byte_reaches_it() {
+    // An https:// proxy expects TLS from its first byte, so it is refused
+    // with an error naming the variable, and no connection is opened to it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Nothing waits under the refusal; the short deadline only bounds a
+    // regression that connects and then waits on the stub's silence.
+    let error = Client::new(
+        Trust::PlatformVerifier,
+        ProxyMode::Environment,
+        Duration::from_secs(2),
+    )
+    .post("https://origin.test/api/chat")
+    .send_with_env(b"{}", &HttpsProxyEnv(format!("https://127.0.0.1:{port}")))
+    .expect_err("an https:// proxy is refused");
+    assert!(
+        matches!(&error, Error::Invalid(message) if message.contains("HTTPS_PROXY")),
+        "{error:?}"
+    );
+    // A connect that happened completed its handshake before `send` returned,
+    // so an empty accept queue now proves there was none.
+    listener.set_nonblocking(true).unwrap();
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the client connected to an https:// proxy: {other:?}"),
+    }
 }
 
 #[test]

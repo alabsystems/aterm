@@ -70,16 +70,10 @@ fn row_len_is_logical_length() {
 
 #[test]
 fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
-    // P1: after a width-shrink reflow overflows wrapped rows into TIERED
-    // history, a scrolled-back HISTORY row (past the ring base, where
-    // Grid::row is None) returned correct row_text — which routes through the
-    // tier-aware visible_row_view — but pre-fix row_len/row_is_wrapped resolved
-    // straight through Grid::row and so reported None for the same rows.
-    //
-    // (This used to build the past-ring-base state on a ring-only grid, whose
-    // reflow overflow was stranded in the lazy buffer; since fixwave5 that
-    // overflow is absorbed into the ring — where Grid::row CAN resolve it — so
-    // the tiered store is now the way history lands beyond the ring base.)
+    // After a width-shrink reflow overflows wrapped rows into tiered history, a
+    // scrolled-back history row past the ring base (where Grid::row is None)
+    // reports row_len/row_is_wrapped through the tier-aware view, as row_text
+    // does.
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 40, 2, scrollback);
     // Three 30-char lines fill the 3 visible rows without wrapping at 40 cols;
@@ -92,14 +86,13 @@ fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
             grid.line_feed();
         }
     }
-    // Width shrink to 20: each 30-char line rewraps to a 20-col head + a 10-col
-    // WRAPPED continuation, overflowing the 3-row window; the top rows spill to
-    // the lazy buffer (the only place ring-only reflow overflow lands).
+    // Width shrink to 20: each 30-char line rewraps to a 20-col head plus a
+    // wrapped 10-col continuation, overflowing the 3-row window into history.
     grid.resize(3, 20);
     grid.scroll_to_top();
     assert!(grid.display_offset() > 0, "scrolled into history");
 
-    // The two oldest viewport rows are HISTORY rows: Grid::row is None there.
+    // The two oldest viewport rows are history rows: Grid::row is None there.
     assert!(
         grid.row(0).is_none(),
         "row 0 is past the ring base (history)"

@@ -38,26 +38,51 @@
 //! (2026-08-29) — and on m3 a `$HOME/trust/first-party/trust-ir` 0.2.0 from 2026-08-17
 //! was shadowing the store's 0.14.0 on every spec-link run. A developer who wants
 //! their own build points the shim at it: `aterm pkg link <tool> <checkout>`. The
-//! home directory (`$HOME`, or `%USERPROFILE%` on Windows), `%LOCALAPPDATA%`
-//! (Windows) and `PATH` are the only environment access.
+//! store is looked for under this ACCOUNT's home (`getpwuid_r`, never `$HOME`,
+//! which a test process moves — `home_dirs` says what that cost); `PATH`, and on
+//! Windows `%HOME%`/`%USERPROFILE%` and `%LOCALAPPDATA%`, are the only
+//! environment access.
 //!
 //! ## The tier names the binary it ran
 //!
 //! Which binary answered used to be invisible: a passing check named no binary,
-//! and the path reached output only inside a failure panic. The first discovery
-//! of each tool in a process now writes one line straight to stderr (not through
-//! `eprintln!`, which libtest swallows for a passing test):
+//! and the path reached output only inside a failure panic. Discovery now writes
+//! one line straight to stderr (not through `eprintln!`, which libtest swallows
+//! for a passing test) the first time it resolves each tool in a process, and
+//! AGAIN whenever the build it resolves to changes mid-process:
 //!
 //! ```text
-//! VERIFY ESCALATION TIER: ty = ~/Library/Application Support/aterm/pkg/store/ty/3007/bin/ty [atpkg managed store; ty 0.15.0; built 2026-09-24] — the managed store also holds store/trust/9192/bin/ty (built 2026-09-19)
+//! VERIFY ESCALATION TIER: ty = ~/Library/Application Support/aterm/pkg/store/ty/3007/bin/ty [atpkg managed store; ty 0.15.0; built 2026-09-24T17:02:11Z; 157309456 bytes] — the managed store also holds store/trust/9192/bin/ty (built 2026-09-19); caps=none
 //! ```
 //!
-//! (A `built` date is the file's mtime in UTC — a reinstall moves it — because
-//! `--version` does not change between builds of one package version.)
+//! (`built` is the file's mtime in UTC and `bytes` its length — a reinstall or a
+//! rebuild moves them — because `--version` does not change between builds of
+//! one package version. `caps=` is what `ty capabilities --json` advertised, so
+//! the line names the protocol that answered.)
 //!
-//! It costs one `--version` spawn per tool per process (bounded at five
-//! seconds), a few `stat`s and a 256-byte head read per candidate; store
-//! copies are described from the filesystem alone, never by running them. [`locate_ty`]/[`locate_ay`]/[`locate_trust_ir`] return the same
+//! **The line names the build actually used.** "The build it resolves to" is
+//! the chosen path plus its identity (`BinaryIdentity`): length, mtime, device, inode
+//! and ctime, followed through a wrapper script to the file it `exec`s. So a
+//! discovery that sees an `aterm pkg` update repoint the store shim, a tool
+//! rebuilt in place, a yank, or a PATH wrapper whose target alone was replaced
+//! prints a fresh line, ending `changed mid-process (was …)`. Until 2026-10-01
+//! the line was printed once per tool per process: after a mid-process change
+//! every later check ran another build while the only line in the log still
+//! named the first. A wrapper whose exec target does not read statically
+//! (computed from `$0` or a variable, conditional, through `env`) is the limit:
+//! its line says so, and its `built`/`bytes` are the script's own.
+//!
+//! Every discovery, [`find_ty`] included, resolves afresh on every call, so
+//! the first call after a change is the one that prints its line. The `ty`
+//! verdicts follow the same identity (`memoized_verdict`): a step is answered
+//! by the build the last line names, never replayed from, or asked of the live
+//! co-process of, another.
+//!
+//! It costs one `--version` spawn per printed line (and, for `ty`, one
+//! `capabilities` spawn per build; each bounded by `PROBE_HANG`), and per
+//! discovery a few `stat`s and a 256-byte head read per candidate plus a
+//! two-byte read of the chosen file; store copies are described from the
+//! filesystem alone, never by running them. [`locate_ty`]/[`locate_ay`]/[`locate_trust_ir`] return the same
 //! answer as a [`Located`] for a caller that wants the tier programmatically.
 //!
 //! ## Caller idioms
@@ -93,13 +118,28 @@ use crate::derive::{Liveness, Model};
 use crate::interp;
 
 /// Discover the Trust `ty` model-checker: the atpkg-managed store's shim, then
-/// `ty` on `PATH` (see [`locate_ty`] for which tier answered). The home directory,
-/// `PATH` and (Windows) `%LOCALAPPDATA%` are the only environment access.
+/// `ty` on `PATH` (see [`locate_ty`] for which tier answered). The store is
+/// this account's (its home from the account database, not `$HOME`); `PATH` and
+/// (Windows) the home variables and `%LOCALAPPDATA%` are the only environment
+/// access.
 ///
-/// The first discovery of each tool in a process prints ONE
-/// `VERIFY ESCALATION TIER: ty = …` line straight to stderr naming the binary,
-/// the tier it came from, its `--version` and build date, and every managed
-/// store copy it shadowed (the module doc, "The tier names the binary it ran").
+/// The first discovery of each tool in a process, and every later one that
+/// resolves to a different build, prints ONE `VERIFY ESCALATION TIER: ty = …`
+/// line straight to stderr naming the binary, the tier it came from, its
+/// `--version`, build time and size, and every managed store copy it shadowed
+/// (the module doc, "The tier names the binary it ran").
+///
+/// Discovered afresh on every call, never cached: the answer is the build the
+/// store's shim forwards to NOW. The store tier answers the RESOLVED build
+/// (`store/ty/<build>/bin/ty`), and an `aterm pkg` update, link or yank rewrites
+/// only the shim and leaves the old build on disk, so the per-process cache this
+/// replaced (re-checked with `exists()` alone) kept a superseded build, and
+/// after a yank a yanked one, for the rest of the process (reproduced on main
+/// 2026-10-01: a shim repointed at a REJECTING build was never asked, and the
+/// old build's accept hid the TIER DISAGREEMENT). A call is a few `stat`s, a
+/// shim read and a PATH walk, about 65 µs (2026-09-29), beside the `ty` run that
+/// follows. Every call also takes the answer's [`BinaryIdentity`], so the call
+/// that first sees another build is the one that prints its line.
 #[must_use]
 pub fn find_ty() -> Option<PathBuf> {
     locate_ty().map(|l| l.path)
@@ -167,16 +207,29 @@ pub struct Located {
     pub origin: TrustBinOrigin,
 }
 
-/// The real-environment discovery + the once-per-process provenance report.
+/// The real-environment discovery + the provenance report.
+// Skip: thin wrapper over `discover_identified`. Build-tooling discovery.
+#[cfg_attr(trust_verify, trust::skip)]
+fn discover(bin: &'static str) -> Option<Located> {
+    discover_identified(bin).map(|(located, _)| located)
+}
+
+/// [`discover`], plus the [`BinaryIdentity`] of what it found — the one the
+/// provenance line was judged by — printing the line whenever what discovery
+/// resolves to differs from the last line printed for `bin`
+/// ([`report_provenance_on_change`]).
 // Skip: environment + filesystem discovery and a stderr report.
 // Build-tooling discovery; every miss returns None (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
-fn discover(bin: &'static str) -> Option<Located> {
+fn discover_identified(bin: &'static str) -> Option<(Located, Option<BinaryIdentity>)> {
     let homes = home_dirs();
     let store_bin = atpkg_store_bin_dir();
     let path_var = std::env::var_os("PATH");
-    let found = find_trust_bin(bin, store_bin.as_deref(), path_var.as_deref());
-    report_provenance_once(bin, found.as_ref(), &homes, store_bin.as_deref());
+    let found = find_trust_bin(bin, store_bin.as_deref(), path_var.as_deref()).map(|located| {
+        let identity = binary_identity(&located.path);
+        (located, identity)
+    });
+    report_provenance_on_change(bin, found.as_ref(), &homes, store_bin.as_deref());
     found
 }
 
@@ -214,7 +267,9 @@ fn find_trust_bin(
 /// on macOS, `%LOCALAPPDATA%\aterm\pkg` on Windows) — kept as a PATH MIRROR, not
 /// a dependency edge, so the spec crate never drags the package manager (ring,
 /// tar, zstd) into every conformance consumer; if atpkg ever moves its prefix,
-/// update both sites (each carries this cross-reference).
+/// update both sites (each carries this cross-reference). The `~` is the
+/// account's home on Unix ([`home_dirs`]), so every thread of a process asks
+/// the same store.
 // Skip: environment reads; every miss returns None (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 fn atpkg_store_bin_dir() -> Option<PathBuf> {
@@ -331,10 +386,30 @@ fn exe_name(bin: &str) -> String {
     format!("{bin}{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// Candidate home directories: `$HOME`, then (Windows) `%USERPROFILE%`. Native
-/// Windows shells set only `USERPROFILE`; Git Bash sets `HOME`, sometimes as a
-/// POSIX-style `/c/…` path that Win32 file APIs cannot resolve — normalize it.
+/// Candidate home directories, the one discovery uses first.
+///
+/// On Unix that is THIS ACCOUNT's home ([`account_home`]), never the process's
+/// `$HOME`. A test process moves its `$HOME`: aterm-gui's handoff fixtures
+/// point it at a scratch directory while they live, so discovery that read it
+/// looked for the store under the scratch, missed, and took whatever `PATH`
+/// offered — or nothing (measured 2026-10-01 under load: beside `seamless`,
+/// `spec_xref`'s first discovery took `ty` and `trust-ir` off `PATH` in every
+/// run, where alone it took the store's; with the tools only in the store,
+/// `ty` was NOT FOUND in every run, and the escalation tests that needed it
+/// passed without running). The account's home is the same answer for every
+/// thread for the life of the process, and it is where the account's atpkg
+/// laid its store — so a process STARTED with a synthetic `$HOME` finds that
+/// store too, where it used to fall through to `PATH`. `$HOME` answers only
+/// when the account cannot be resolved.
+///
+/// Windows: `%HOME%`, then `%USERPROFILE%`. Native Windows shells set only
+/// `USERPROFILE`; Git Bash sets `HOME`, sometimes as a POSIX-style `/c/…` path
+/// that Win32 file APIs cannot resolve — normalize it.
 fn home_dirs() -> Vec<PathBuf> {
+    #[cfg(unix)]
+    if let Some(home) = account_home() {
+        return vec![home];
+    }
     let mut homes = Vec::new();
     for var in ["HOME", "USERPROFILE"] {
         if let Ok(dir) = std::env::var(var)
@@ -344,6 +419,65 @@ fn home_dirs() -> Vec<PathBuf> {
         }
     }
     homes
+}
+
+/// This account's home directory as the OS knows it —
+/// `getpwuid_r(getuid())->pw_dir`, which a process cannot move by setting
+/// `$HOME` — resolved once per process. A mirror of
+/// `atpkg::platform::unix::account_home` (a mirror, not a dependency edge, for
+/// the reason [`atpkg_store_bin_dir`] gives). `None` when the lookup fails or
+/// names no absolute directory; a failure is not remembered, so a later call
+/// asks again.
+// Skip: a process-wide cache of one libc answer. Build-tooling discovery.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn account_home() -> Option<PathBuf> {
+    if let Some(home) = ACCOUNT_HOME.get() {
+        return Some(home.clone());
+    }
+    let home = lookup_account_home().filter(|home| home.is_absolute())?;
+    Some(ACCOUNT_HOME.get_or_init(|| home).clone())
+}
+
+/// [`account_home`]'s answer, once resolved. Module-level so a test's child
+/// process can seat a scratch home before its first discovery (the store-update
+/// test lays its own store there); nothing else writes it.
+#[cfg(unix)]
+static ACCOUNT_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// One `getpwuid_r` lookup of this uid's `pw_dir`, with a buffer sized for any
+/// real passwd record (an `ERANGE` answers `None`, as any failure does).
+// Skip: one libc call through raw out-pointers. Build-tooling discovery; every
+// failure returns None (the caller falls back to `$HOME`).
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn lookup_account_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    // SAFETY: `passwd` is plain integers and pointers, for which all-zero is a
+    // valid value; it is only an out-param here.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = [0u8; 4096];
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `pw` is a valid, writable passwd out-param; `buf` is a valid
+    // writable buffer of the stated length that outlives every read of `pw`'s
+    // string fields, which point INTO it on success; `out` is a valid
+    // out-pointer. getpwuid_r writes nothing past buflen. `pw_dir` is read only
+    // when `out` is non-null (success), and is then a NUL-terminated C string
+    // inside `buf`, copied out before `buf` goes out of scope.
+    unsafe {
+        let rc = libc::getpwuid_r(
+            libc::getuid(),
+            &raw mut pw,
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+            &raw mut out,
+        );
+        if rc != 0 || out.is_null() || pw.pw_dir.is_null() {
+            return None;
+        }
+        let bytes = std::ffi::CStr::from_ptr(pw.pw_dir).to_bytes();
+        (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
 }
 
 /// On Windows, rewrite a POSIX-style `/c/Users/…` home to `C:/Users/…`; otherwise
@@ -374,9 +508,10 @@ fn path_search_in(exe: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathB
 // on m3, before discovery lost its developer-tree tiers: every derived-model
 // check ran a bootstrap `$HOME/trust/build/host/stage1/bin/ty` and every spec-link
 // a first-party trust-ir 0.2.0 while the managed store held 0.14.0 — a stale
-// override nothing reported. The first discovery of each tool in a process
-// prints one line naming the binary, its tier, its `--version`, its build date,
-// and every other managed-store copy.
+// override nothing reported. Discovery prints one line naming the binary, its
+// tier, its `--version`, its build time and size, and every other managed-store
+// copy — the first time it resolves each tool in a process, and again whenever
+// the [`BinaryIdentity`] it resolves to changes.
 // ---------------------------------------------------------------------------
 
 /// A copy of a tool in the atpkg store: `<prefix>/store/<program>/current/bin/<exe>`.
@@ -453,6 +588,308 @@ fn exec_stub_target(p: &Path) -> Option<PathBuf> {
     parse_exec_stub_target(&std::fs::read_to_string(p).ok()?)
 }
 
+/// What replacing a file changes even when its path does not. The ctime is the
+/// part no writer can set: an in-place rewrite to the same length whose mtime
+/// is then put back (`cp -p`, `touch -r`, `rsync --inplace -t`, a tar extract)
+/// leaves the other four equal. Device, inode and ctime are 0 off unix.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    dev: u64,
+    ino: u64,
+    ctime: (i64, i64),
+}
+
+impl FileIdentity {
+    /// The identity in `meta` (one `metadata` call, symlinks followed).
+    // Skip: fs metadata accessors (absent std bodies). Verification tooling.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (dev, ino, ctime) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (meta.dev(), meta.ino(), (meta.ctime(), meta.ctime_nsec()))
+        };
+        #[cfg(not(unix))]
+        let (dev, ino, ctime) = (0, 0, (0, 0));
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            dev,
+            ino,
+            ctime,
+        }
+    }
+}
+
+/// How a wrapper script hands over to the next file in its exec chain.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum ExecForm {
+    /// atpkg's own shim (its second line starts [`ATPKG_SHIM_HEADER`]),
+    /// `exec '<path>' "$@"` — read by [`parse_exec_stub_target`], the rule the
+    /// store probe and atpkg itself use.
+    AtpkgShim,
+    /// A hand-written forwarder whose only command is one `exec <literal
+    /// absolute path> ["$@"]` (see [`literal_exec_target`]).
+    LiteralExec,
+}
+
+/// One file in a [`BinaryIdentity`] chain.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct ChainLink {
+    /// The path as the previous link (or discovery) named it.
+    path: PathBuf,
+    /// What the file there is now.
+    file: FileIdentity,
+    /// How this file execs the next link; `None` for the last.
+    execs: Option<ExecForm>,
+}
+
+/// Where a [`BinaryIdentity`] chain stopped.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum ChainEnd {
+    /// The last link is not a `#!` script: the binary that runs.
+    Binary,
+    /// The last link is a `#!` script whose exec target cannot be read
+    /// statically. THE LIMIT of this scheme: a wrapper that computes its target
+    /// (`"$(dirname "$0")/ty"`, `$HOME/…`, a bare name looked up on `PATH`),
+    /// `exec`s conditionally or more than once, runs any other command, launches
+    /// through `env`/an interpreter, or passes arguments of its own is identified
+    /// by its OWN bytes only — replacing the binary behind it changes nothing
+    /// here. (So is a script that runs no other program at all: a scripted
+    /// test `ty` reads the same way, since nothing static can tell the two
+    /// apart.) The provenance line says so.
+    ///
+    /// Not followed either: a shebang-less script (the kernel refuses it; `sh`
+    /// runs it) reads as [`ChainEnd::Binary`] — atpkg never writes one — and on
+    /// Windows a `.cmd` forwarder is a binary too.
+    OpaqueScript,
+    /// The last link execs this path, which cannot be stat'ed.
+    Dangling(PathBuf),
+    /// More than [`MAX_EXEC_HOPS`] links, or a link that execs an earlier one.
+    TooDeep,
+}
+
+/// The identity of what running a path executes: the file itself and, while
+/// it is a wrapper script whose exec target reads statically, each file down
+/// that chain to the binary at its end. Two discoveries that answer the same
+/// path name the same build only if their identities are equal — a wrapper
+/// that keeps its own bytes while the binary it execs is replaced (a PATH `ty`
+/// that forwards into a store build an update moved, a linked checkout
+/// rebuilt) is a different identity.
+///
+/// It keys the provenance line (re-printed when it changes), [`ty_caps`], and
+/// the `ty` verdict memo and `--cases` pool ([`TyChecker`]), so the line, the
+/// protocol the caller speaks and the verdicts it replays can never name
+/// different builds.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct BinaryIdentity {
+    /// From the path asked about, in exec order; never empty.
+    links: Vec<ChainLink>,
+    /// Why the chain stopped.
+    end: ChainEnd,
+}
+
+impl BinaryIdentity {
+    /// The last file reached: the binary itself when [`ChainEnd::Binary`].
+    /// (`binary_identity` never builds an empty chain.)
+    fn last(&self) -> Option<&ChainLink> {
+        self.links.last()
+    }
+}
+
+/// How many wrapper hops [`binary_identity`] follows before it gives up.
+const MAX_EXEC_HOPS: usize = 8;
+
+/// The [`BinaryIdentity`] of `path`; `None` when `path` itself cannot be
+/// stat'ed. Per link: one `metadata` call and a two-byte read (only a `#!`
+/// file of at most atpkg's 64 KiB shim bound is read further), so the big
+/// binary at the end costs a `stat` and an open.
+// Skip: fs metadata + bounded reads (absent std bodies). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn binary_identity(path: &Path) -> Option<BinaryIdentity> {
+    let mut links: Vec<ChainLink> = Vec::new();
+    let mut at = path.to_path_buf();
+    loop {
+        let meta = match std::fs::metadata(&at) {
+            Ok(meta) => meta,
+            Err(_) if links.is_empty() => return None,
+            Err(_) => {
+                return Some(BinaryIdentity {
+                    links,
+                    end: ChainEnd::Dangling(at),
+                });
+            }
+        };
+        let file = FileIdentity::of(&meta);
+        if links.len() == MAX_EXEC_HOPS || links.iter().any(|l| l.file == file) {
+            return Some(BinaryIdentity {
+                links,
+                end: ChainEnd::TooDeep,
+            });
+        }
+        let hop = if meta.is_file() {
+            script_exec_target(&at, meta.len())
+        } else {
+            Hop::Binary
+        };
+        let (execs, next) = match hop {
+            Hop::Execs(target, form) => (Some(form), Ok(target)),
+            Hop::Binary => (None, Err(ChainEnd::Binary)),
+            Hop::Opaque => (None, Err(ChainEnd::OpaqueScript)),
+        };
+        links.push(ChainLink {
+            path: at,
+            file,
+            execs,
+        });
+        match next {
+            Ok(target) => at = target,
+            Err(end) => return Some(BinaryIdentity { links, end }),
+        }
+    }
+}
+
+/// What a file is, as an exec chain sees it: where the chain goes next.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Hop {
+    /// Not a `#!` script (or unreadable): the binary, the end of the chain.
+    Binary,
+    /// A `#!` script whose exec target does not read statically.
+    Opaque,
+    /// A `#!` script that execs this absolute path.
+    Execs(PathBuf, ExecForm),
+}
+
+/// Classify the file at `p` (of length `len`) for [`binary_identity`]. Only
+/// the first two bytes of a non-script are read.
+// Skip: bounded file reads (absent std bodies). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn script_exec_target(p: &Path, len: u64) -> Hop {
+    use std::io::Read as _;
+    let Ok(mut file) = std::fs::File::open(p) else {
+        return Hop::Binary;
+    };
+    let mut magic = [0u8; 2];
+    if file.read_exact(&mut magic).is_err() || magic != *b"#!" {
+        return Hop::Binary;
+    }
+    let mut text = String::from("#!");
+    if len > MAX_STORE_SHIM_BYTES
+        || file
+            .take(MAX_STORE_SHIM_BYTES)
+            .read_to_string(&mut text)
+            .is_err()
+    {
+        return Hop::Opaque;
+    }
+    let atpkg = text
+        .lines()
+        .nth(1)
+        .is_some_and(|l| l.starts_with(ATPKG_SHIM_HEADER));
+    let (target, form) = if atpkg {
+        (parse_exec_stub_target(&text), ExecForm::AtpkgShim)
+    } else {
+        (literal_exec_target(&text), ExecForm::LiteralExec)
+    };
+    match target {
+        Some(t) if t.is_absolute() => Hop::Execs(t, form),
+        _ => Hop::Opaque,
+    }
+}
+
+/// How the second line of every `sh` shim atpkg writes begins (the full line is
+/// `# atpkg shim — exec so the tool authenticates at its real path.`, from
+/// `atpkg::platform::sh_shim_body` — a mirror, like [`parse_exec_stub_target`];
+/// if atpkg ever changes its header, update both sites). Only a file that
+/// carries it is read by atpkg's own target rule: that rule takes the first
+/// `exec '<path>' "$@"` line ANYWHERE in the file, which is right for atpkg's
+/// shapes (an `export` block, a route guard ahead of the store `exec`) and wrong
+/// for a hand-written script that might run something else before it. Without
+/// the header a script is held to [`literal_exec_target`].
+const ATPKG_SHIM_HEADER: &str = "# atpkg shim";
+
+/// The one file a hand-written forwarder script `exec`s, when the WHOLE script
+/// reads statically: after the `#!` line every line is blank, a comment, or a
+/// `set` of shell options (`set -e`, `set -euo pipefail`), except the last such
+/// line, which is `exec <path>` or `exec <path> "$@"` with `<path>` a literal
+/// absolute path — bare (no shell metacharacters), in `'…'`, or in `"…"` with
+/// nothing to expand. Anything else — any other command (it could run another
+/// program first), a second or conditional `exec`, a computed target,
+/// `exec env …`, extra arguments — is `None`: the script is opaque (see
+/// [`ChainEnd::OpaqueScript`]).
+fn literal_exec_target(text: &str) -> Option<PathBuf> {
+    let mut exec_line = None;
+    for line in text.lines().skip(1).map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if exec_line.is_some() {
+            return None;
+        }
+        if !is_shell_option_line(line) {
+            exec_line = Some(line);
+        }
+    }
+    let rest = exec_line?.strip_prefix("exec")?;
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let (target, after) = shell_literal_word(rest.trim_start())?;
+    matches!(after.trim(), "" | "\"$@\"").then(|| PathBuf::from(target))
+}
+
+/// `set` with nothing but option words (`-e`, `+x`, `-o`, `pipefail`): it changes
+/// how the shell runs the script, never which program the script runs.
+fn is_shell_option_line(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    words.next() == Some("set")
+        && words.all(|w| {
+            let name = w.strip_prefix(['-', '+']).unwrap_or(w);
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic())
+        })
+}
+
+/// The leading shell word of `s` when it is a literal — `'…'`, `"…"` with no
+/// `$`, `` ` `` or `\`, or bare with no shell metacharacter — and what follows
+/// it; `None` for anything the shell would expand.
+///
+/// No byte offsets: `split_once`/`strip_suffix` leave no slice bound and no
+/// `+ 1` for the Trust lane to discharge (an offset-based first draft added
+/// six refuted obligations to aterm-spec's advisory lane).
+fn shell_literal_word(s: &str) -> Option<(&str, &str)> {
+    let quoted = |q: char, forbidden: &str| {
+        let (word, after) = s.strip_prefix(q)?.split_once(q)?;
+        let glued = after.chars().next().is_some_and(|c| !c.is_whitespace());
+        (!word.chars().any(|c| forbidden.contains(c)) && !glued).then_some((word, after))
+    };
+    match s.chars().next()? {
+        '\'' => quoted('\'', ""),
+        '"' => quoted('"', "$`\\"),
+        _ => {
+            let after = s.trim_start_matches(|c: char| !c.is_whitespace());
+            let word = s.strip_suffix(after)?;
+            let meta = "$`\\\"'*?[]{}~;&|<>()";
+            (!word.chars().any(|c| meta.contains(c))).then_some((word, after))
+        }
+    }
+}
+
+/// `t` as a UTC `YYYY-MM-DDTHH:MM:SSZ` — a build time precise enough to tell
+/// two builds of one day apart.
+fn utc_timestamp(t: std::time::SystemTime) -> Option<String> {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let (y, m, d) = civil_from_unix_days(i64::try_from(secs / 86_400).ok()?);
+    let s = secs % 86_400;
+    Some(format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        s / 3600,
+        s / 60 % 60,
+        s % 60
+    ))
+}
+
 /// A file's mtime as a UTC `YYYY-MM-DD` — the build date a developer can act
 /// on (`--version` does not move between builds of one package version).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -488,28 +925,48 @@ fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
-/// The first line `<bin> --version` prints, or `None` if it fails, prints
-/// nothing, or does not answer within five seconds (it is then killed — a
-/// wedged probe must never wedge the suite). Called at most ONCE per tool per
-/// process, from [`report_provenance_once`].
+/// How long a once-per-process probe may take before it is called wedged: a
+/// HANG DETECTOR, not a latency budget. The answer is cached for the rest of
+/// the process (an empty [`ty_caps`] set sends every case to a process of its
+/// own), so a bound a loaded machine can exceed turns one slow first exec
+/// into a permanent loss. Measured 2026-10-02: the first exec of a fresh
+/// script on macOS took over five seconds at load 80-100, and two pool tests
+/// of the gate's baseline run failed on exactly that.
+const PROBE_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `<bin> <args>`'s output, or `None` if it cannot start or does not finish
+/// within [`PROBE_HANG`] (it is then killed — a wedged probe must never wedge
+/// the suite for good). The one bound both once-per-process probes share.
 // Skip: spawns a subprocess and polls it. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
-fn probe_version(bin: &Path) -> Option<String> {
+fn probe_output(bin: &Path, args: &[&str]) -> Option<std::process::Output> {
+    probe_output_within(bin, args, PROBE_HANG)
+}
+
+/// [`probe_output`] with its bound given: the seam the tests hold the kill
+/// and the wait to without waiting a minute.
+// Skip: spawns a subprocess and polls it. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn probe_output_within(
+    bin: &Path,
+    args: &[&str],
+    bound: std::time::Duration,
+) -> Option<std::process::Output> {
     use std::process::Stdio;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let mut child = Command::new(bin)
-        .arg("--version")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + bound;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             _ => {
                 let _ = child.kill();
@@ -518,7 +975,16 @@ fn probe_version(bin: &Path) -> Option<String> {
             }
         }
     }
-    let out = child.wait_with_output().ok()?;
+    child.wait_with_output().ok()
+}
+
+/// The first line `<bin> --version` prints, or `None` if it fails, prints
+/// nothing, or does not answer within [`probe_output`]'s bound. Called once per
+/// printed line, from [`report_provenance_on_change`].
+// Skip: spawns a subprocess. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn probe_version(bin: &Path) -> Option<String> {
+    let out = probe_output(bin, &["--version"])?;
     if !out.status.success() {
         return None;
     }
@@ -530,6 +996,94 @@ fn probe_version(bin: &Path) -> Option<String> {
             .map(|l| l.chars().take(160).collect::<String>())
     };
     first(&out.stdout).or_else(|| first(&out.stderr))
+}
+
+/// `ty` speaks the `--cases` co-process protocol (A10 below).
+const CAP_TRACE_CASES: &str = "trace-cases-v1";
+/// `ty`'s automatic memory budget is its own, not divided by the live process
+/// count — the precondition for keeping idle co-processes alive (ty withdraws
+/// `trace-cases-v1` with it).
+const CAP_BUDGET_SELF: &str = "check-budget-self-v1";
+
+/// What the `ty` at `ty` says it guarantees (`ty capabilities --json`), probed
+/// ONCE per build per process and cached.
+///
+/// WHY (2026-10-01, docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md
+/// A8): store builds of one `ty` release share a version string, so a protocol
+/// is detected by the capability the build advertises, never by `--version`.
+/// A `ty` older than the command answers `unrecognized subcommand` with exit 2,
+/// which is the empty set — and so is every other failure to answer: an empty
+/// set is the per-process behaviour every `ty` supports. Keyed by the path AND
+/// its [`BinaryIdentity`], not a single value: [`find_ty`] re-resolves on every
+/// call (an `aterm pkg` update moves it to another build mid-run), and neither
+/// a build at another path nor a `ty` rebuilt in place (or behind an unchanged
+/// wrapper) may inherit its predecessor's answer — the `caps=` its provenance
+/// line prints is this answer, so a stale one would name another build's
+/// protocol. (Until 2026-10-01 the key was the path alone, and a `ty` rebuilt
+/// in place kept the first answer for the rest of the process.)
+// Skip: a cached subprocess probe. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ty_caps(ty: &Path) -> Vec<String> {
+    static CAPS: CapsByBuild = Mutex::new(BTreeMap::new());
+    caps_cached(&CAPS, ty, |ty| {
+        probe_output(ty, &["capabilities", "--json"])
+            .map(|out| caps_from(out.status.code(), &out.stdout))
+            .unwrap_or_default()
+    })
+}
+
+/// [`ty_caps`]'s cache: one answer per (path, [`BinaryIdentity`]).
+type CapsByBuild = Mutex<BTreeMap<(PathBuf, Option<BinaryIdentity>), Vec<String>>>;
+
+/// [`ty_caps`] over an explicit cache and probe: the cached answer for this
+/// build of `ty`, else `probe`'s, remembered.
+// Skip: a Mutex-guarded cache plus fs metadata (absent std bodies). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn caps_cached(
+    cache: &CapsByBuild,
+    ty: &Path,
+    probe: impl FnOnce(&Path) -> Vec<String>,
+) -> Vec<String> {
+    let build = (ty.to_path_buf(), binary_identity(ty));
+    let mut caps = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(known) = caps.get(&build) {
+        return known.clone();
+    }
+    let probed = probe(ty);
+    caps.insert(build, probed.clone());
+    probed
+}
+
+/// The capability list in a `ty capabilities --json` reply
+/// (`{"ty":"0.15.0","capabilities":[...]}`), in `ty`'s order. Anything but
+/// exit 0 with that document — exit 2 from a `ty` without the command, a
+/// malformed reply — is the empty set.
+fn caps_from(code: Option<i32>, stdout: &[u8]) -> Vec<String> {
+    if code != Some(0) {
+        return Vec::new();
+    }
+    let Ok(doc) = aterm_json::from_slice::<aterm_json::Value>(stdout.trim_ascii()) else {
+        return Vec::new();
+    };
+    doc.get("capabilities")
+        .and_then(aterm_json::Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The provenance line's protocol clause: `; caps=<a,b,…>` or `; caps=none`.
+fn caps_clause(caps: &[String]) -> String {
+    if caps.is_empty() {
+        "; caps=none".to_string()
+    } else {
+        format!("; caps={}", caps.join(","))
+    }
 }
 
 /// `p` with the home directory written as `~`, for a line a human reads.
@@ -566,13 +1120,18 @@ fn classify_store_shim(shim: &Path) -> StoreShim {
 
 /// The one-line provenance report — PURE, so the wording is testable without a
 /// spawn. `found` is what discovery chose (`None` = nothing on any tier);
-/// `version`/`built` describe it; `shadowed` are the store copies OTHER than
-/// the chosen binary; `shim` explains a miss.
+/// `identity` is what running it executes (see [`BinaryIdentity`]) and
+/// `version` its `--version`; `shadowed` are the store copies OTHER than the
+/// chosen binary; `shim` explains a miss.
+///
+/// The build the line names — `built` (mtime, UTC, to the second) and `bytes`
+/// — is the LAST file of the identity's exec chain: the binary a wrapper
+/// forwards to, not the wrapper.
 fn render_provenance(
     bin: &str,
     found: Option<&Located>,
+    identity: Option<&BinaryIdentity>,
     version: Option<&str>,
-    built: Option<&str>,
     shadowed: &[StoreCopy],
     shim: &StoreShim,
     home: Option<&Path>,
@@ -604,19 +1163,21 @@ fn render_provenance(
         }
         return line;
     };
-    let shim_note = if found.origin == TrustBinOrigin::Path {
-        exec_stub_target(&found.path)
-            .map(|t| format!(" (atpkg shim → {})", tilde(&t, home)))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let last = identity.and_then(BinaryIdentity::last);
+    let built = last
+        .and_then(|l| l.file.modified)
+        .and_then(utc_timestamp)
+        .unwrap_or_else(|| "date unknown".to_owned());
+    let bytes = last.map_or_else(
+        || "size unknown".to_owned(),
+        |l| format!("{} bytes", l.file.len),
+    );
     let mut line = format!(
-        "VERIFY ESCALATION TIER: {bin} = {} [{}{shim_note}; {}; built {}]",
+        "VERIFY ESCALATION TIER: {bin} = {} [{}{}; {}; built {built}; {bytes}]",
         tilde(&found.path, home),
         found.origin.label(),
+        identity.map_or_else(String::new, |id| describe_exec_chain(id, home)),
         version.unwrap_or("version unknown"),
-        built.unwrap_or("date unknown"),
     );
     if !shadowed.is_empty() {
         line.push_str(&format!(" — the managed store also holds {copies}"));
@@ -624,14 +1185,51 @@ fn render_provenance(
     line
 }
 
-/// Everything the provenance line needs except the one spawn (`version`),
-/// over an explicit environment: the store copies other than the chosen
-/// binary, what the store's own shim is, the chosen binary's build date.
+/// How the chosen path reaches the binary it runs, as a ` (…)` note for the
+/// provenance line — empty when the chosen path IS that binary.
+fn describe_exec_chain(id: &BinaryIdentity, home: Option<&Path>) -> String {
+    let mut note = String::new();
+    if let Some(form) = id.links.first().and_then(|l| l.execs) {
+        note.push_str(match form {
+            ExecForm::AtpkgShim => "atpkg shim",
+            ExecForm::LiteralExec => "wrapper",
+        });
+        for link in id.links.iter().skip(1) {
+            note.push_str(&format!(" → {}", tilde(&link.path, home)));
+        }
+    }
+    match &id.end {
+        ChainEnd::Binary => {}
+        ChainEnd::OpaqueScript => {
+            if !note.is_empty() {
+                note.push_str("; ");
+            }
+            note.push_str(
+                "script whose exec target does not read statically: built/bytes are the \
+                 script's own",
+            );
+        }
+        ChainEnd::Dangling(p) => note.push_str(&format!(" → {} (missing)", tilde(p, home))),
+        ChainEnd::TooDeep => {
+            note.push_str(&format!(" → … (over {MAX_EXEC_HOPS} hops, or a loop)"));
+        }
+    }
+    if note.is_empty() {
+        note
+    } else {
+        format!(" ({note})")
+    }
+}
+
+/// Everything the provenance line needs except the spawns (`version`), over an
+/// explicit environment: the store copies other than the binary the chosen
+/// path runs, and what the store's own shim is.
 // Skip: fs probes + formatting. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 fn provenance_line(
     bin: &str,
     found: Option<&Located>,
+    identity: Option<&BinaryIdentity>,
     version: Option<&str>,
     homes: &[PathBuf],
     store_bin: Option<&Path>,
@@ -641,59 +1239,182 @@ fn provenance_line(
         .and_then(Path::parent)
         .map(|prefix| store_copies_in(&prefix.join("store"), &exe))
         .unwrap_or_default();
-    // The chosen binary's real file (through an exec-stub shim when discovery
-    // took one off PATH), so the store copy it IS is not listed as shadowed.
-    let chosen = found.and_then(|f| {
-        let real = exec_stub_target(&f.path).unwrap_or_else(|| f.path.clone());
-        std::fs::canonicalize(real).ok()
-    });
+    // The file the chosen path runs (through every wrapper the identity
+    // followed), so the store copy it IS is not listed as shadowed.
+    let chosen = identity
+        .and_then(BinaryIdentity::last)
+        .and_then(|l| std::fs::canonicalize(&l.path).ok());
     let shadowed: Vec<StoreCopy> = copies
         .into_iter()
         .filter(|c| std::fs::canonicalize(&c.path).ok() != chosen)
         .collect();
     let shim = store_bin.map_or(StoreShim::Absent, |d| classify_store_shim(&d.join(&exe)));
-    let built = found.and_then(|f| build_date(&f.path));
     render_provenance(
         bin,
         found,
+        identity,
         version,
-        built.as_deref(),
         &shadowed,
         &shim,
         homes.first().map(PathBuf::as_path),
     )
 }
 
-/// First-report-per-tool bookkeeping: `true` exactly once per `bin` per `set`.
-fn claim_first_report(set: &Mutex<BTreeSet<&'static str>>, bin: &'static str) -> bool {
-    set.lock().unwrap_or_else(|e| e.into_inner()).insert(bin)
+/// What one provenance line describes: what discovery chose, and the identity
+/// of what it runs (`None` inside when it could not be stat'ed). `None` = NOT
+/// FOUND.
+type ProvenanceKey = Option<(Located, Option<BinaryIdentity>)>;
+
+/// The last line printed for ONE tool, by its [`ProvenanceKey`]; `None` until
+/// the first.
+type LastLine = Mutex<Option<ProvenanceKey>>;
+
+/// Per tool, its own [`LastLine`]: a line holds only its own tool's lock while
+/// its probes run, so a slow first exec of one tool's new build never holds up
+/// another tool's discovery.
+type LastReported = Mutex<BTreeMap<&'static str, std::sync::Arc<LastLine>>>;
+
+/// What [`claim_report`] decided for one discovery.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Claim {
+    /// The last line printed for this tool describes exactly this: stay silent.
+    Unchanged,
+    /// No line for this tool yet in this process.
+    First,
+    /// The tool now resolves to something else; the key of the line it replaces.
+    Changed(ProvenanceKey),
 }
 
-/// Print the provenance line for `bin`, ONCE per process (the first discovery
-/// wins; the ~hundreds of later `find_ty` calls in a suite stay silent and
-/// spawn nothing).
+/// The bookkeeping behind "print when it changes": `last` holds one tool's key
+/// of the last line printed. A discovery equal to it is silent; any other
+/// becomes the new last line.
+fn claim_report(last: &mut Option<ProvenanceKey>, now: &ProvenanceKey) -> Claim {
+    if last.as_ref() == Some(now) {
+        return Claim::Unchanged;
+    }
+    match last.replace(now.clone()) {
+        None => Claim::First,
+        Some(prev) => Claim::Changed(prev),
+    }
+}
+
+/// What a repeated line says it replaced when the path is the same: a file
+/// the path runs (it, or a file down its exec chain) was rewritten or replaced
+/// — or only had its metadata changed (a `chmod`, a new hard link), which
+/// moves the ctime the identity needs to see a same-length rewrite whose mtime
+/// was put back. It never claims the bytes changed.
+const SAME_PATH_CHANGED: &str =
+    "this same path; a file it runs was since rewritten, replaced or had its metadata changed";
+
+/// The suffix a REPEATED line carries: it replaces an earlier line of this
+/// process, and says what that line named.
+fn change_note(prev: &ProvenanceKey, now: Option<&Located>, home: Option<&Path>) -> String {
+    let was = match (prev, now) {
+        (None, _) => "NOT FOUND".to_owned(),
+        (Some((p, _)), Some(n)) if p.path == n.path => SAME_PATH_CHANGED.to_owned(),
+        (Some((p, _)), _) => tilde(&p.path, home),
+    };
+    format!(" — changed mid-process (was {was})")
+}
+
+/// Print the provenance line for `bin` when what discovery resolved differs
+/// from the last line printed for `bin` in this process: the first discovery,
+/// and then every store update, yank, in-place rebuild or wrapper retarget
+/// that changes the [`ProvenanceKey`]. The hundreds of other discoveries in a
+/// suite stay silent and spawn nothing.
+///
+/// Until 2026-10-01 this printed ONCE per tool per process, so a run that
+/// crossed an `aterm pkg` update or a rebuild logged only the first build
+/// while every later check ran another (found by the spec-performance wave-3
+/// review).
 ///
 /// Written straight to the process's stderr handle rather than via
 /// `eprintln!`: libtest captures the print macros for a PASSING test and
 /// throws the text away, which is exactly why the success lines never told
 /// anyone which `ty` ran. A direct handle write is not captured, so the line
 /// reaches the developer's terminal and the gate's stage log on a green run.
-// Skip: fs probes, one subprocess, a stderr write. Verification tooling.
+// Skip: fs probes, subprocesses, a stderr write. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
-fn report_provenance_once(
+fn report_provenance_on_change(
     bin: &'static str,
-    found: Option<&Located>,
+    found: Option<&(Located, Option<BinaryIdentity>)>,
     homes: &[PathBuf],
     store_bin: Option<&Path>,
 ) {
     use std::io::Write;
-    static REPORTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
-    if !claim_first_report(&REPORTED, bin) {
-        return;
+    static LAST: LastReported = Mutex::new(BTreeMap::new());
+    report_on_change(
+        &LAST,
+        bin,
+        found,
+        homes,
+        store_bin,
+        |path| {
+            // A8 (2026-10-01): the protocol that will answer, so every
+            // transcript and receipt names it (per-process for `caps=none`,
+            // `--cases` for a `ty` advertising `trace-cases-v1`).
+            let caps = if bin == "ty" {
+                caps_clause(&ty_caps(path))
+            } else {
+                String::new()
+            };
+            (probe_version(path), caps)
+        },
+        |line| {
+            let _ = writeln!(std::io::stderr().lock(), "{line}");
+        },
+    );
+}
+
+/// [`report_provenance_on_change`] over explicit state: `last` is the
+/// bookkeeping, `probe` answers the chosen path's `--version` and the text the
+/// line ends with (`ty`'s `caps=` clause), `write` takes a line to print.
+///
+/// The tool's [`LastLine`] stays locked until the line is written, so a tool's
+/// lines are written in the order their keys were claimed: with two threads
+/// racing across a change, the last line written for a tool is always the one
+/// its [`LastLine`] holds. Only a claimed line holds it for long (its probes,
+/// each bounded by [`PROBE_HANG`]), and only for that tool: the map of tools
+/// is released before the claim.
+// Skip: fs probes, caller-supplied probes and writer. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn report_on_change(
+    last: &LastReported,
+    bin: &'static str,
+    found: Option<&(Located, Option<BinaryIdentity>)>,
+    homes: &[PathBuf],
+    store_bin: Option<&Path>,
+    probe: impl FnOnce(&Path) -> (Option<String>, String),
+    write: impl FnOnce(&str),
+) {
+    let now: ProvenanceKey = found.cloned();
+    let mut tools = last
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slot = std::sync::Arc::clone(tools.entry(bin).or_default());
+    drop(tools);
+    let mut last = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = match claim_report(&mut last, &now) {
+        Claim::Unchanged => return,
+        Claim::First => None,
+        Claim::Changed(prev) => Some(prev),
+    };
+    let located = now.as_ref().map(|(l, _)| l);
+    let identity = now.as_ref().and_then(|(_, id)| id.as_ref());
+    let (version, ending) = located.map(|l| probe(&l.path)).unwrap_or_default();
+    let mut line = provenance_line(bin, located, identity, version.as_deref(), homes, store_bin);
+    line.push_str(&ending);
+    if let Some(prev) = &prev {
+        line.push_str(&change_note(
+            prev,
+            located,
+            homes.first().map(PathBuf::as_path),
+        ));
     }
-    let version = found.and_then(|f| probe_version(&f.path));
-    let line = provenance_line(bin, found, version.as_deref(), homes, store_bin);
-    let _ = writeln!(std::io::stderr().lock(), "{line}");
+    write(&line);
+    drop(last);
 }
 
 /// For a NOT RUN notice: the managed-store copies of `bin` that exist but that
@@ -805,23 +1526,53 @@ fn require(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> 
 // the tiered interpreter/ty paths below.
 // ---------------------------------------------------------------------------
 
+/// Write one notice line straight to the process's stderr handle. libtest
+/// captures `eprintln!` for a PASSING test and discards it (see
+/// [`report_provenance_on_change`]), and a NOT RUN notice must reach the
+/// gate's log precisely when the test reports `ok`.
+#[cfg_attr(trust_verify, trust::skip)]
+fn notice(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// What a missing `bin` needs: the install command when the store holds no
+/// copy, else the store note and the repair, since installing again would not
+/// make an unreached copy reachable.
+fn missing_tool_tail(bin: &str) -> (&'static str, String) {
+    let store_note = unreached_store_note(bin);
+    if store_note.is_empty() {
+        (
+            "is not installed",
+            format!(" Install: aterm pkg install {bin}"),
+        )
+    } else {
+        (
+            "was not found",
+            format!("{store_note} Repair: aterm pkg doctor, then aterm pkg repair"),
+        )
+    }
+}
+
+/// The NOT RUN notice for a function-valued model on a machine where no `ty`
+/// was found.
+fn function_valued_not_run(label: &str, model: &str) {
+    let (_, tail) = missing_tool_tail("ty");
+    notice(&format!(
+        "NOT RUN (not a pass): `{label}` ({model}) is function-valued, and no Trust `ty` \
+         was found, so it was not checked.{tail}"
+    ));
+}
+
 /// Shared escalation report + early-return decision.
-fn escalation(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> Option<PathBuf> {
+fn escalation(bin: &str, found: Option<PathBuf>, label: &str) -> Option<PathBuf> {
     if found.is_none() {
         // "Not installed" is only true when the store holds no copy either; a
         // copy discovery cannot reach is named, never reported as absent.
-        let store_note = unreached_store_note(bin);
-        let state = if store_note.is_empty() {
-            "is not installed"
-        } else {
-            "was not found by discovery"
-        };
-        eprintln!(
-            "VERIFY ESCALATION TIER NOT RUN: Trust `{bin}` {state}, so `{label}` \
-             (an external-tool-analysis obligation) did not run on this machine. The \
-             applicable in-process derived-model checks still ran. Enable the \
-             escalation tier once: {build_hint}.{store_note}"
-        );
+        let (state, tail) = missing_tool_tail(bin);
+        notice(&format!(
+            "NOT RUN (not a pass): `{label}` needs Trust `{bin}`, which {state}.{tail}"
+        ));
     }
     found
 }
@@ -832,12 +1583,7 @@ fn escalation(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) 
 /// `--strict-vacuity` verdicts, `ty trace` overclaim controls.
 #[must_use]
 pub fn ty_escalation(label: &str) -> Option<PathBuf> {
-    escalation(
-        "ty",
-        "aterm pkg install ty   (or `aterm pkg install --default-set`)",
-        find_ty(),
-        label,
-    )
+    escalation("ty", find_ty(), label)
 }
 
 /// The `trust-ir` (`spec-link`) escalation tier. aterm's current emitted artifact is
@@ -845,23 +1591,13 @@ pub fn ty_escalation(label: &str) -> Option<PathBuf> {
 /// Ob.3 certification. See [`ty_escalation`] for discovery/notice behavior.
 #[must_use]
 pub fn trust_ir_escalation(label: &str) -> Option<PathBuf> {
-    escalation(
-        "trust-ir",
-        "aterm pkg install trust-ir   (or `aterm pkg install --default-set`)",
-        find_trust_ir(),
-        label,
-    )
+    escalation("trust-ir", find_trust_ir(), label)
 }
 
 /// The `ay` (SMT/CHC certificate) escalation tier. See [`ty_escalation`].
 #[must_use]
 pub fn ay_escalation(label: &str) -> Option<PathBuf> {
-    escalation(
-        "ay",
-        "aterm pkg install ay   (or `aterm pkg install --default-set`)",
-        find_ay(),
-        label,
-    )
+    escalation("ay", find_ay(), label)
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +1650,7 @@ pub struct NotRun {
 /// because the panic carried neither the binary path nor its output; the
 /// culprit turned out to be transient toolchain drift, not the model).
 fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, String) {
-    let dir = std::env::temp_dir().join(format!("aterm-tier-{}-{}", m.name, std::process::id()));
+    let dir = scratch_dir("aterm-tier", m.name);
     std::fs::create_dir_all(&dir).expect("mk tempdir");
     let spec = dir.join(format!("{}.tla", m.name));
     let cfgp = dir.join(format!("{}.cfg", m.name));
@@ -934,6 +1670,29 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
         String::from_utf8_lossy(&out.stderr),
     );
     (out.status.success(), evidence)
+}
+
+/// A fresh scratch directory for ONE checker call:
+/// `<temp>/<kind>-<model>-<pid>-<n>`, `n` unique per call in this process.
+///
+/// Per CALL, not per `(model, pid)`: every test in one process that checks the
+/// same model at once would otherwise share the directory, and each writes its
+/// spec and cfg, runs its own `ty` and removes the directory afterwards — so
+/// one test's cfg (a `Buggy = 0` prove arm, say) could be read by the other's
+/// `ty` (a `Buggy = 1` catch arm), or deleted under it. A real torn-cfg
+/// incident first fixed this for `validate_transition_tiered`; one binary per
+/// test file made the rest rare, and a suite binary that runs a whole crate's
+/// files in one process makes it ordinary.
+// Skip: formats a path from the process id and a counter (absent std format
+// bodies). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn scratch_dir(kind: &str, model: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "{kind}-{model}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
 }
 
 /// The flags EVERY `ty check` of a derived model carries.
@@ -1008,9 +1767,10 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 ///
 /// It buys less on the suite than that ratio suggests — 266s to 228s — and the
 /// reason is worth writing down so nobody re-measures it hoping for more. With
-/// the spawns serialised, suite wall-clock is ~390 runs times the PER-PROCESS
-/// cost, and what dominated that was a fixed ~0.55s floor no backend choice can
-/// touch. **That floor was mis-attributed here for a month** — this doc used to
+/// the spawns serialised (as they were until 2026-10-01), suite wall-clock was
+/// ~390 runs times the PER-PROCESS cost, and what dominated that was a fixed
+/// ~0.55s floor no backend choice can touch. **That floor was mis-attributed
+/// here for a month** — this doc used to
 /// blame "`ty`'s own startup: ~0.5s before it reads the spec" and concluded
 /// "only spawning `ty` fewer times could" fix it. Both halves are false, and
 /// measurement says so: `ty --version` returns in under 10ms, and the SAME spec
@@ -1110,6 +1870,14 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 // Skip: argument plumbing for a subprocess. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
+    // ONE WORKER (2026-09-30): `ty` defaults to eight on these models, whose
+    // spaces are small; at one it also skips the pilot's second walk. The
+    // parallelism that pays is the test binary's own threads, each running a
+    // `ty` of its own ([`ty_output`] serialises nothing since 2026-10-01). Every
+    // check `derived_ring_ty` and `derived_harness_upgrade_progress` run, 559 of
+    // them replayed one by one at `--workers 1`: 57.1 s -> 40.1 s (the harness
+    // ladder's liveness 2.81 s -> 1.57 s), with the same exit status, `States
+    // found` and violation lines on all 559.
     cmd.arg("--no-auto-por")
         .arg("--no-auto-symmetry")
         .arg("--initial-capacity")
@@ -1117,35 +1885,153 @@ pub fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
         .arg("--backend")
         .arg("interpreter")
         .arg("--bfs-only")
+        .arg("--workers")
+        .arg("1")
         .arg("--force")
 }
 
-/// Run a `ty` subprocess — ONE AT A TIME, across the whole test binary.
+/// Run a `ty` subprocess, and FAIL CLOSED on a search that stopped early: a
+/// run `ty` cut short is an `Err` naming INCOMPLETE, never an `Output` a
+/// caller could read as a verdict.
 ///
-/// Not a fairness or disk-contention measure, a CORRECTNESS one. `ty` sizes its
-/// memory budget as host RAM divided by the number of live `ty`/`cargo`/`rustc`
-/// processes, so concurrent checks shrink each other's budget until one is
-/// stopped mid-search — and a stopped search still prints "no errors" and still
-/// exits 0. That makes the verdict a function of how busy the machine was, which
-/// is not a property a proof is allowed to have. `cargo test`'s own parallelism
-/// is exactly the load that triggers it, so the tests discharging these
-/// obligations were racing the thing they were discharging.
+/// **The hazard** (measured on store `ty` 0.13.0 for
+/// `docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md` §1). `ty` sizes
+/// its automatic memory budget as 0.9 x host RAM divided by the number of live
+/// `ty`/`cargo`/`rustc` processes, counted once at the start of the run, and a
+/// search that budget stops EXITS 0 — under a header, printed before the walk
+/// began, that still says `Search completeness: exhaustive`, and with
+/// `--require-exhaustive` checked only before the run. With 120 idle fake
+/// `rustc` processes alive the budget fell to 271 MB, and an eight-worker check
+/// stopped at 74,553 of 1,367,631 states and exited 0. An exit-status verdict
+/// books that as a proof.
 ///
-/// The lock is around the SUBPROCESS, not the test: the interpreter tier — the
-/// expensive half — still runs fully parallel. Measured cost on the
-/// 194-obligation ring suite: ~55s, against a `--test-threads=1` upper bound of
-/// 70s.
+/// **The guard** is the classification below: exit code 5 (`ty`'s INCOMPLETE,
+/// once the store build carries it) or a stdout line starting
+/// `Model checking stopped:` — the line every limit-reached path prints — is an
+/// `Err`. No driver in this workspace passes `--max-states`, `--max-depth`,
+/// `--allow-incomplete`, `--memory-limit` or `--output` (only the test that
+/// pins this guard, to provoke a stop), so every stop line is a truncation
+/// nobody asked for. Converting it HERE, not in each caller, is
+/// load-bearing: a `Buggy = 1` catch arm accepts any non-success exit, so a raw
+/// exit 5 would book a vacuous catch, and every caller already fails on an
+/// `Err` from this function (the tests panic; `examples/trust_models.rs` reports
+/// it `Unknown`). `a_stopped_search_is_an_err_never_a_pass` pins the
+/// classifier on a real stopped search.
 ///
-/// Poisoning is recovered rather than propagated: a model that panics while
-/// holding this lock has already failed its own obligation loudly, and turning
-/// every LATER model into a "poisoned lock" panic would bury that one real
-/// diagnostic under a hundred fake ones.
-// Skip: spawns a subprocess under a lock. Verification tooling.
+/// **No lock** (removed 2026-10-01). From 2026-09-23 every spawn here took an
+/// in-process mutex and a per-user `flock` on `<temp_dir>/aterm-ty-serial.lock`,
+/// so that no two `ty` runs could shrink each other's budget: about 95-100 s of
+/// serialised `ty` per gate, every test binary queued behind every other. It
+/// never covered the `cargo` and `rustc` that count in the same divisor, and
+/// with the guard it has no correctness role left: an armed check peaks at about
+/// 10 MB, so on 36 GiB the divisor alone needs roughly 2,800 live heavy
+/// processes to stop one, and if it ever does the result is a loud red, never a
+/// false green.
+///
+/// PUBLIC because the rule binds every `ty` driver in the workspace, not only
+/// the ones in this file: a driver that calls `Command::output()` itself is
+/// invisible to the classification (`tests/ty_drivers_are_armed.rs` enforces
+/// the routing).
+// Skip: spawns a subprocess and classifies its transcript. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
-fn ty_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
-    static TY_SERIAL: Mutex<()> = Mutex::new(());
-    let _serial = TY_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    cmd.output()
+pub fn ty_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    with_scratch_ty_home(cmd);
+    let out = cmd.output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if out.status.code() == Some(5)
+        || stdout
+            .lines()
+            .any(|l| l.starts_with("Model checking stopped:"))
+    {
+        return Err(std::io::Error::other(format!(
+            "ty INCOMPLETE: the search was stopped by a resource limit — nothing was proved\n\
+             {}{cmd:?} ({:?})\n--- ty stdout ---\n{stdout}\n--- ty stderr ---\n{}",
+            ty_evidence_header(Path::new(cmd.get_program())),
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        )));
+    }
+    Ok(out)
+}
+
+/// Spawn a long-lived `ty` co-process — the `--cases` pool's one door — with
+/// [`ty_output`]'s scratch HOME ([`scratch_ty_env`]), stdin and stdout piped,
+/// built by aterm-uds's `spawnfd::command`: it outlives the call, so it must
+/// inherit its stdio and nothing else (a plain `Command` hands it whatever
+/// another thread holds without close-on-exec at that instant). The caller sends
+/// stderr to a FILE, never a pipe: nobody drains a pipe between cases, and a
+/// `ty` blocked on a full stderr pipe answers nothing.
+///
+/// A co-process is no run-to-exit transcript, so [`ty_output`]'s classification
+/// has nothing to read; the client protocol in [`cases_verdict`] fails closed
+/// instead (a request with no verdict line is never an accept).
+/// `tests/ty_drivers_are_armed.rs` accepts this name as routed.
+// Skip: spawns a subprocess. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn ty_child(
+    cmd: &mut aterm_uds::spawnfd::Command,
+) -> std::io::Result<aterm_uds::spawnfd::Child> {
+    use aterm_uds::spawnfd::Stdio;
+    for (key, value) in scratch_ty_env() {
+        cmd.env(key, value);
+    }
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+}
+
+/// Run `ty` with a HOME of its own, whose check cache starts empty, and
+/// nothing taken from this process's `HOME`.
+///
+/// EVERY `ty` CHILD GETS IT, a capable one too (2026-10-01). A `ty` with
+/// `check-no-cache-v1` reads and writes no check cache under `--force`, but
+/// its compiled-artifact cache, and whatever else it keeps under HOME, would
+/// still follow a test process's moving `HOME` (below), so the capability
+/// does not make the scratch HOME optional.
+///
+/// WHY (measured 2026-09-30). `ty` keeps a check cache at `$HOME/.ty/cache.json`,
+/// keyed by spec path, and reads and rewrites the whole file on every run, even
+/// under `--force`. Every spec here is written to a per-process temp dir, so no
+/// entry is ever read back, and the file only grows: 18.7 MB and 12,625 entries
+/// after one day of gates, and a three-state spec took 57.5 ms under it against
+/// 12.6 ms with an empty one — 45 ms per run, paid by every `ty` check on the
+/// box (`derived_ring_ty`'s 552 of them: 48 s against 32 s, then under the lock
+/// [`ty_output`] no longer takes).
+///
+/// The compiled-artifact cache lives in that HOME too, named explicitly by
+/// `TY_CACHE_DIR` unless the caller already named one (the child inherits
+/// it). It used to be the process `HOME`'s, read at every spawn, and a test
+/// process moves its `HOME`: aterm-gui's handoff tests point it at a scratch
+/// directory and then remove it, so a `ty` another test thread started
+/// meanwhile put its cache under — and re-created — that scratch (2026-10-01).
+/// Nothing a verdict depends on is in that cache, and starting it cold costs
+/// nothing measurable (measured 2026-10-01 on two specs: 0.04 s and 0.18 s
+/// cold against 0.03 s and 0.21 s warm).
+///
+/// Concurrent runs share the one HOME and can tear its `cache.json`. That costs
+/// nothing a verdict depends on: `ty` warns on stderr and starts from an empty
+/// cache when the load fails, a failed save only warns, and `--force` means no
+/// entry is ever read back (`ty`'s `cmd_check` load and save paths, read
+/// 2026-10-01).
+// Skip: environment plumbing for a subprocess. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn with_scratch_ty_home(cmd: &mut Command) {
+    for (key, value) in scratch_ty_env() {
+        cmd.env(key, value);
+    }
+}
+
+/// The environment [`with_scratch_ty_home`] sets, for a `ty` built by another
+/// `Command` (the pooled co-process's).
+fn scratch_ty_env() -> Vec<(&'static str, std::path::PathBuf)> {
+    let home = std::env::temp_dir().join("aterm-ty-home");
+    // A run that loses this race to another `ty` finds at most the one entry
+    // that run wrote, for that run's own temp path.
+    let _ = std::fs::remove_file(home.join(".ty/cache.json"));
+    let mut env = Vec::with_capacity(2);
+    if std::env::var_os("TY_CACHE_DIR").is_none() {
+        env.push(("TY_CACHE_DIR", home.join(".cache/ty/compiled")));
+    }
+    env.push(("HOME", home));
+    env
 }
 
 /// The checker binary's AGE, for the evidence transcript.
@@ -1198,18 +2084,28 @@ pub fn ay_evidence_header(ay: &Path) -> String {
     format!("ay binary: {} [{}]\n", ay.display(), ty_build_stamp(ay))
 }
 
+/// The build `ty` runs, for an evidence header: the mtime of the LAST file of
+/// its exec chain ([`binary_identity`]) — so a wrapper on `PATH` is stamped
+/// with the binary it forwards to, which is then named — or `mtime unknown`.
+// Skip: fs metadata + bounded reads + formatting. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
 fn ty_build_stamp(ty: &Path) -> String {
-    std::fs::metadata(ty)
-        .and_then(|md| md.modified())
-        .map_or_else(
-            |_| "mtime unknown".to_string(),
-            |t| {
-                let secs = t
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                format!("mtime {secs} (unix)")
-            },
-        )
+    let identity = binary_identity(ty);
+    let Some((last, modified)) = identity
+        .as_ref()
+        .and_then(BinaryIdentity::last)
+        .and_then(|l| Some((l, l.file.modified?)))
+    else {
+        return "mtime unknown".to_string();
+    };
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if identity.as_ref().is_some_and(|id| id.links.len() > 1) {
+        format!("mtime {secs} (unix) of {}", last.path.display())
+    } else {
+        format!("mtime {secs} (unix)")
+    }
 }
 
 /// The number of distinct states `ty` reports having explored, read from the
@@ -1332,12 +2228,7 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
         }
         None if interp_ran => Ok(Covered::Interpreter),
         None => {
-            eprintln!(
-                "VERIFY ESCALATION TIER NOT RUN: `{label}` ({}) is a FUNCTION-VALUED model \
-                 the interpreter cannot evaluate and Trust `ty` is not installed — this \
-                 obligation did not run. Install ty once: aterm pkg install ty.",
-                m.name
-            );
+            function_valued_not_run(label, m.name);
             Err(NotRun { model: m.name })
         }
     }
@@ -1355,22 +2246,12 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
     // `prove_and_catch` proves the `Buggy = 0` arm and catches the `Buggy = 1`
-    // one; re-walking the committed arm here is what gives the `ty` tier its
-    // yardstick (see `assert_same_space_explored`). It is a second BFS over a
-    // space `prove_and_catch` just proved terminates and holds, so it cannot
-    // fail — but it is matched anyway rather than unwrapped, because a silent
-    // `Err` here would be the interpreter contradicting itself.
+    // one, and hands back the state count of the committed arm it just proved —
+    // the `ty` tier's yardstick (see `assert_same_space_explored`). This used to
+    // be a second, identical `bmc` of the same arm; the walk is deterministic,
+    // so the count it produced was always this one.
     let interp_states = if m.fn_vars.is_empty() {
-        interp::prove_and_catch(m);
-        match interp::bmc(&interp::with_buggy(m, 0)) {
-            Ok(n) => Some(n),
-            Err((st, inv)) => panic!(
-                "{label}: {} invariant `{inv}` VIOLATED at {st:?} on the Buggy=0 re-walk, after \
-                 `prove_and_catch` proved the same arm clean — the interpreter tier is \
-                 self-inconsistent",
-                m.name
-            ),
-        }
+        Some(interp::prove_and_catch(m))
     } else {
         None
     };
@@ -1421,12 +2302,7 @@ pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun>
         }
         None if interp_ran => Ok(Covered::Interpreter),
         None => {
-            eprintln!(
-                "VERIFY ESCALATION TIER NOT RUN: `{label}` ({}) is a FUNCTION-VALUED model \
-                 the interpreter cannot evaluate and Trust `ty` is not installed — this \
-                 obligation did not run. Install ty once: aterm pkg install ty.",
-                m.name
-            );
+            function_valued_not_run(label, m.name);
             Err(NotRun { model: m.name })
         }
     }
@@ -1869,8 +2745,7 @@ pub fn deadlock_free_and_catches_tiered(
     );
     match find_ty() {
         Some(ty) => {
-            let dir =
-                std::env::temp_dir().join(format!("aterm-dl-{}-{}", m.name, std::process::id()));
+            let dir = scratch_dir("aterm-dl", m.name);
             std::fs::create_dir_all(&dir).expect("mk tempdir");
             let spec = dir.join(format!("{}.tla", m.name));
             std::fs::write(&spec, m.to_tla()).expect("write spec");
@@ -1952,6 +2827,15 @@ pub fn deadlock_free_and_catches_tiered(
 // model clones and deliberate audit-failure strings). Not shipping code.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
+    liveness_preflight(m, live)?;
+    audit_liveness_on(m, live, &interp::Space::of(&interp::with_buggy(m, 0)))
+}
+
+/// The checks of [`audit_liveness`] that need no walk, so a model the
+/// interpreter cannot walk is refused before anything tries to.
+// Skip: BTreeSet/format machinery of the audit driver above.
+#[cfg_attr(trust_verify, trust::skip)]
+fn liveness_preflight(m: &Model, live: &Liveness) -> Result<(), String> {
     let label = format!("{} liveness `{}`", m.name, live.name);
     if !m.fn_vars.is_empty() {
         return Err(format!(
@@ -1983,8 +2867,24 @@ pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
             ));
         }
     }
-    let committed = interp::with_buggy(m, 0);
-    let fired = interp::fired_actions(&committed);
+    Ok(())
+}
+
+/// [`audit_liveness`] after its preflight, over `committed`: `m`'s space at
+/// `Buggy = 0`, walked by the caller. What fires, the committed verdict and each
+/// fairness dropped are all read off that one walk, and a caller that needs more
+/// of the same space (the tiered driver's state count and mutant isolation)
+/// shares it rather than walking it again.
+// Skip: BTreeSet/format machinery of the audit driver above.
+#[cfg_attr(trust_verify, trust::skip)]
+fn audit_liveness_on(
+    m: &Model,
+    live: &Liveness,
+    committed: &interp::Space,
+) -> Result<usize, String> {
+    let label = format!("{} liveness `{}`", m.name, live.name);
+    let declared: BTreeSet<&str> = m.actions.iter().map(|a| a.name as &str).collect();
+    let fired = committed.fired();
     for name in live.weak.iter().chain(&live.strong) {
         if !declared.contains(name) {
             return Err(format!(
@@ -2011,7 +2911,7 @@ pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
             ));
         }
     }
-    if let Some(cycle) = interp::nonprogress_under(&committed, live) {
+    if let Some(cycle) = committed.nonprogress_under(live) {
         return Err(format!(
             "{label}: VIOLATED at the committed config (Buggy=0) — a fair behaviour \
              leaves the goal for good:\n{cycle}"
@@ -2026,7 +2926,7 @@ pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
         let mut without = live.clone();
         without.weak.retain(|a| a != name);
         without.strong.retain(|a| a != name);
-        if interp::nonprogress_under(&committed, &without).is_none() {
+        if committed.nonprogress_under(&without).is_none() {
             return Err(format!(
                 "{label}: the {kind} fairness of `{name}` is not needed — the property holds \
                  without it. Drop it, so the verdict does not claim to rest on it"
@@ -2034,7 +2934,7 @@ pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
         }
         if kind == "strong" {
             without.weak.push(name);
-            if interp::nonprogress_under(&committed, &without).is_none() {
+            if committed.nonprogress_under(&without).is_none() {
                 return Err(format!(
                     "{label}: `{name}` needs only WEAK fairness — the property holds with it; \
                      state the weaker assumption"
@@ -2051,7 +2951,7 @@ pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
         ));
     }
     for mutant in &live.mutants {
-        if interp::nonprogress_under(&buggy_baseline_with(m, mutant), live).is_none() {
+        if interp::nonprogress_under(&isolate_mutant(m, fired, mutant), live).is_none() {
             return Err(format!(
                 "{label}: mutant `{mutant}`, alone on the Buggy=1 baseline, does not break \
                  it — the property cannot see the defect that mutant is"
@@ -2071,7 +2971,14 @@ pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
 // Skip: model clone + BTreeSet filter (absent std bodies). Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn buggy_baseline_with(m: &Model, mutant: &str) -> Model {
-    let fired = interp::fired_actions(&interp::with_buggy(m, 0));
+    isolate_mutant(m, &interp::fired_actions(&interp::with_buggy(m, 0)), mutant)
+}
+
+/// [`buggy_baseline_with`] for a caller that already holds the actions firing at
+/// the committed config, so the space is not walked again to learn them.
+// Skip: model clone + BTreeSet filter (absent std bodies). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn isolate_mutant(m: &Model, fired: &BTreeSet<&'static str>, mutant: &str) -> Model {
     let mut isolated = interp::with_buggy(m, 1);
     isolated
         .actions
@@ -2080,9 +2987,9 @@ pub fn buggy_baseline_with(m: &Model, mutant: &str) -> Model {
 }
 
 /// Run `ty check` on a liveness module (`Liveness::to_tla`) with its cfg, in a
-/// directory of its own per run: the same model's invariant check
-/// (`ty_check_derived`) may be writing `aterm-tier-<model>-<pid>` from a
-/// parallel test at the same moment, and the file must be named after its module.
+/// directory of its own per call ([`scratch_dir`]): the same model's invariant
+/// or liveness check may be writing its own spec from a parallel test at the
+/// same moment, and the file must be named after its module.
 // Skip: shells out to `ty` and renders its output (absent std format/io bodies).
 // Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -2094,11 +3001,7 @@ fn ty_check_liveness(
     tag: &str,
     label: &str,
 ) -> (bool, String) {
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-live-{}-{tag}-{}",
-        m.name,
-        std::process::id()
-    ));
+    let dir = scratch_dir(&format!("aterm-live-{tag}"), m.name);
     std::fs::create_dir_all(&dir).expect("mk tempdir");
     let spec = dir.join(format!("{}.tla", m.name));
     let cfgp = dir.join(format!("{}.cfg", m.name));
@@ -2133,27 +3036,70 @@ fn ty_check_liveness(
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn liveness_proves_and_catches_tiered(m: &Model, live: &Liveness, label: &str) -> Covered {
     assert_scalar(m, label, "liveness_proves_and_catches_tiered");
-    let caught = match audit_liveness(m, live) {
-        Ok(n) => n,
-        Err(why) => panic!("{label}: {why}"),
-    };
-    eprintln!(
-        "{label}: {} `{}` proven under its fairness (Buggy=0) and broken by {caught} \
-         mutant(s) alone (interpreter).",
-        m.name, live.name
-    );
-    let Some(ty) = find_ty() else {
+    // The committed config's space is walked once, for the audit and for what
+    // the `ty` comparison below needs of it.
+    let committed = interp::with_buggy(m, 0);
+    let ty = find_ty();
+    // Every `ty` check here is a single-worker process of its own (see
+    // [`arm_whole_space_check`]) and none reads another's result, so they run
+    // side by side: the committed one beside the interpreter's audit, each
+    // mutant's beside the others once the audit has named the dead actions.
+    // Their verdicts are then judged in the order they always were.
+    let (space, committed_check, mutant_checks) = std::thread::scope(|scope| {
+        let committed_check = ty.as_deref().map(|ty| {
+            let (module, cfg) = (
+                live.to_tla(&committed),
+                live.to_cfg_with(m, &[("Buggy", 0)]),
+            );
+            scope.spawn(move || ty_check_liveness(ty, m, &module, &cfg, "committed", label))
+        });
+        let (caught, space) = match liveness_preflight(m, live).and_then(|()| {
+            let space = interp::Space::of(&committed);
+            audit_liveness_on(m, live, &space).map(|caught| (caught, space))
+        }) {
+            Ok(audited) => audited,
+            Err(why) => panic!("{label}: {why}"),
+        };
+        eprintln!(
+            "{label}: {} `{}` proven under its fairness (Buggy=0) and broken by {caught} \
+             mutant(s) alone (interpreter).",
+            m.name, live.name
+        );
+        let mutant_checks: Vec<_> = match ty.as_deref() {
+            Some(ty) => live
+                .mutants
+                .iter()
+                .map(|mutant| {
+                    let isolated = isolate_mutant(m, space.fired(), mutant);
+                    let (module, cfg) =
+                        (live.to_tla(&isolated), live.to_cfg_with(m, &[("Buggy", 1)]));
+                    let check =
+                        scope.spawn(move || ty_check_liveness(ty, m, &module, &cfg, mutant, label));
+                    (mutant, check)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let join = |check: std::thread::ScopedJoinHandle<'_, (bool, String)>| {
+            check
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        };
+        (
+            space,
+            committed_check.map(join),
+            // A mutant's panic is held, not raised here: the committed
+            // verdict below is judged first, as it was before the checks ran
+            // side by side.
+            mutant_checks
+                .into_iter()
+                .map(|(mutant, check)| (mutant, check.join()))
+                .collect::<Vec<_>>(),
+        )
+    });
+    let Some((ok, evidence)) = committed_check else {
         return Covered::Interpreter;
     };
-    let committed = interp::with_buggy(m, 0);
-    let (ok, evidence) = ty_check_liveness(
-        &ty,
-        m,
-        &live.to_tla(&committed),
-        &live.to_cfg_with(m, &[("Buggy", 0)]),
-        "committed",
-        label,
-    );
     assert!(
         ok,
         "{label}: ty says {} `{}` FAILS at Buggy=0 — TIER DISAGREEMENT (the interpreter \
@@ -2162,25 +3108,10 @@ pub fn liveness_proves_and_catches_tiered(m: &Model, live: &Liveness, label: &st
         live.name,
         live.to_tla(&committed)
     );
-    let mut space = committed.clone();
-    space.invariants.clear();
-    let reachable = match interp::bmc(&space) {
-        Ok(n) => n,
-        Err((state, invariant)) => {
-            unreachable!("{label}: no invariants, yet `{invariant}` failed at {state:?}")
-        }
-    };
+    let reachable = space.states();
     assert_same_space_explored(m, reachable, &evidence, label);
-    for mutant in &live.mutants {
-        let isolated = buggy_baseline_with(m, mutant);
-        let (held, evidence) = ty_check_liveness(
-            &ty,
-            m,
-            &live.to_tla(&isolated),
-            &live.to_cfg_with(m, &[("Buggy", 1)]),
-            mutant,
-            label,
-        );
+    for (mutant, check) in mutant_checks {
+        let (held, evidence) = check.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         assert!(
             !held,
             "{label}: ty found NO violation of {} `{}` with mutant `{mutant}` alone — TIER \
@@ -2207,8 +3138,11 @@ pub fn liveness_proves_and_catches_tiered(m: &Model, live: &Liveness, label: &st
 /// does the model's `Next` admit the real `prev -> next` step?
 ///
 /// The interpreter tier ALWAYS answers ([`interp::admits`]); the `ty` tier
-/// additionally validates a two-step JSON trace against `transition_spec()`
-/// wherever installed, and the verdicts MUST agree (disagreement panics).
+/// additionally validates a two-step JSON trace `[prev, next]` against
+/// `transition_spec()` wherever installed, and the verdicts MUST agree
+/// (disagreement panics). That spec's `Init` is open (`TRUE`), so step 0 is
+/// whatever `prev` says and the verdict is `Next`'s alone on `prev -> next`;
+/// its cfg depends only on the model and `overrides`, never on `prev`.
 /// Returns `(conforms, diagnostics)` so callers keep their positive AND
 /// negative-control assertions unchanged. `overrides` are the cfg constant
 /// overrides the real-code regime needs (e.g. a production `Cap`); `action`
@@ -2246,49 +3180,11 @@ pub fn validate_transition_tiered(
         return (interp_ok, interp_why);
     };
 
-    // ty tier: two-step trace against the parameterized-Init transition spec.
-    // The dir is unique PER CALL (atomic counter), not per (model, pid): two
-    // tests in one process validating the same model run concurrently, and a
-    // shared dir gets torn spec/cfg writes (a real corrupted-cfg incident).
-    static CONF_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-conf-{}-{}-{}",
-        m.name,
-        std::process::id(),
-        CONF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("mk tempdir");
-    let spec = dir.join(format!("{}.tla", m.name));
-    let cfg = dir.join(format!("{}.cfg", m.name));
-    let trace = dir.join("t.json");
-    std::fs::write(&spec, m.transition_spec()).expect("write spec");
-    std::fs::write(&cfg, m.transition_cfg(prev, overrides)).expect("write cfg");
-    std::fs::write(
-        &trace,
-        transition_trace_json(m, prev, next, action.or(admitted)),
-    )
-    .expect("write trace");
-    // Serialised like every other `ty` spawn (see `ty_output`). `trace validate`
-    // walks a two-state trace, not a state space, so it takes none of the
-    // whole-space arming — but it is still a `ty` process, and while it lives it
-    // is one more divisor in every CONCURRENT checker's memory budget.
-    let mut cmd = Command::new(&ty);
-    cmd.arg("trace")
-        .arg("validate")
-        .arg(&trace)
-        .arg("--spec")
-        .arg(&spec)
-        .arg("--config")
-        .arg(&cfg);
-    let out =
-        ty_output(&mut cmd).unwrap_or_else(|e| panic!("run ty trace validate for {label}: {e}"));
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    let ty_ok = out.status.success();
+    // ty tier: two-step trace against the open-Init transition spec.
+    let spec_text = m.transition_spec();
+    let cfg_text = m.transition_cfg(overrides);
+    let trace_text = transition_trace_json(m, prev, next, action.or(admitted));
+    let (ty_ok, combined) = ty_trace_verdict(&ty, m.name, spec_text, cfg_text, trace_text, label);
     assert!(
         ty_ok == interp_ok,
         "{label}: TIER DISAGREEMENT on {} transition {prev:?} -> {next:?}: \
@@ -2299,9 +3195,542 @@ pub fn validate_transition_tiered(
     (ty_ok, combined)
 }
 
+/// `ty trace validate`'s verdict on these exact three files, asked once per
+/// process of each `ty` binary. `ty` is deterministic, so one checker given the
+/// same spec, cfg and trace always gives the same answer — and an exhaustive
+/// Tier-1 walk that replays each path from its start hands it the same
+/// transition over and over. Measured 2026-09-29 on aterm-agent's
+/// conformance_footer_model: 466 s with `ty` installed, 50 s without, the
+/// difference a serialised `ty` process per transition. Every distinct
+/// transition is still validated by `ty`; the caller still asserts the two
+/// tiers agree on every call. Asked of the `--cases` co-process where `ty` has
+/// one ([`cases_verdict`]), else of one `ty` process ([`ty_trace_per_process`]).
+/// The memo and the pool are both keyed on the checker ([`memoized_verdict`]).
+// Skip: shells out to `ty`; verification tooling, not shipping runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ty_trace_verdict(
+    ty: &Path,
+    model: &str,
+    spec_text: String,
+    cfg_text: String,
+    trace_text: String,
+    label: &str,
+) -> (bool, String) {
+    memoized_verdict(
+        ty,
+        spec_text,
+        cfg_text,
+        trace_text,
+        |checker, spec, cfg, trace| {
+            // A10 (2026-10-01): a `ty` advertising `trace-cases-v1` answers from one
+            // co-process per (checker, spec, cfg); anything that co-process fails to
+            // answer is answered here by one process for this case, exactly as before.
+            checker
+                .and_then(|checker| cases_verdict(checker, model, spec, cfg, trace, label))
+                .unwrap_or_else(|| ty_trace_per_process(ty, model, spec, cfg, trace, label))
+        },
+    )
+}
+
+/// The `ty` that answers: the path [`find_ty`] gave and the [`BinaryIdentity`]
+/// of what running it executes — the file itself and, through a wrapper script
+/// whose exec target reads statically, the binary at the end of that chain. So
+/// a PATH wrapper whose target alone was rebuilt or replaced is another
+/// checker, as a binary rewritten in place is. (Until 2026-10-02 the identity
+/// was the named file's alone, and such a wrapper kept its old verdicts and
+/// its old `--cases` co-process.)
+type TyChecker = (PathBuf, BinaryIdentity);
+
+/// [`ty_trace_verdict`]'s memo: a verdict is replayed only for the same
+/// rendered bytes (never the model name, so a `Buggy` twin or a re-bounded copy
+/// that shares a name cannot borrow one) asked of THE SAME CHECKER — the path
+/// `ty` and the identity of what it runs ([`TyChecker`]). `run` answers anything else; it is handed the
+/// checker (`None` when `ty` cannot be stat'ed) so the co-process pool keys on
+/// the same one.
+///
+/// WHY the checker (review of 2026-09-29, reproduced on main 2026-10-01): an
+/// `aterm pkg` update, link or yank moves [`find_ty`] to another path, and a
+/// `ty` rebuilt or reinstalled in place keeps its path but not its identity. A
+/// key without the checker replayed one build's verdict for a step that should
+/// have been asked of the next: a shim repointed at a REJECTING build was never
+/// asked, so the TIER DISAGREEMENT it should have raised never fired. A binary
+/// that cannot be stat'ed, or whose identity moved while `run` ran, is answered
+/// but never memoized: which build gave that answer is not known.
+// Skip: a Mutex-guarded map plus fs metadata (absent std bodies). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn memoized_verdict(
+    ty: &Path,
+    spec_text: String,
+    cfg_text: String,
+    trace_text: String,
+    run: impl FnOnce(Option<&TyChecker>, &str, &str, &str) -> (bool, String),
+) -> (bool, String) {
+    type Verdicts = BTreeMap<(TyChecker, String), BTreeMap<(String, String), (bool, String)>>;
+    static SEEN: Mutex<Verdicts> = Mutex::new(BTreeMap::new());
+    let Some(identity) = binary_identity(ty) else {
+        return run(None, &spec_text, &cfg_text, &trace_text);
+    };
+    let question = ((ty.to_path_buf(), identity), spec_text);
+    let step = (cfg_text, trace_text);
+    let seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&question)
+        .and_then(|by_step| by_step.get(&step).cloned());
+    if let Some(verdict) = seen {
+        return verdict;
+    }
+    let verdict = run(Some(&question.0), &question.1, &step.0, &step.1);
+    if binary_identity(ty).as_ref() == Some(&question.0.1) {
+        SEEN.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(question)
+            .or_default()
+            .insert(step, verdict.clone());
+    }
+    verdict
+}
+
+/// One `ty trace validate` process for one case: the path every `ty` takes,
+/// and the co-process pool's fallback for any case it did not answer.
+// Skip: shells out to `ty`; verification tooling, not shipping runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ty_trace_per_process(
+    ty: &Path,
+    model: &str,
+    spec_text: &str,
+    cfg_text: &str,
+    trace_text: &str,
+    label: &str,
+) -> (bool, String) {
+    // Unique PER CALL (see `scratch_dir`): two tests in one process validating
+    // the same model run concurrently.
+    let dir = scratch_dir("aterm-conf", model);
+    std::fs::create_dir_all(&dir).expect("mk tempdir");
+    let spec = dir.join(format!("{model}.tla"));
+    let cfg = dir.join(format!("{model}.cfg"));
+    let trace = dir.join("t.json");
+    std::fs::write(&spec, spec_text).expect("write spec");
+    std::fs::write(&cfg, cfg_text).expect("write cfg");
+    std::fs::write(&trace, trace_text).expect("write trace");
+    // Routed like every other `ty` spawn (see `ty_output`). `trace validate`
+    // walks a two-state trace, not a state space, so it takes none of the
+    // whole-space arming; the routing keeps one place deciding what a `ty`
+    // transcript may be credited as.
+    let mut cmd = Command::new(ty);
+    cmd.arg("trace")
+        .arg("validate")
+        .arg(&trace)
+        .arg("--spec")
+        .arg(&spec)
+        .arg("--config")
+        .arg(&cfg);
+    let out =
+        ty_output(&mut cmd).unwrap_or_else(|e| panic!("run ty trace validate for {label}: {e}"));
+    let verdict = (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    verdict
+}
+
+/// How long a `--cases` co-process may take to write its header or one
+/// verdict: a hang detector, not a latency budget (a case takes well under a
+/// millisecond).
+const CASES_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Live co-processes at once; the least recently used is dropped first.
+const CASES_POOL_CAP: usize = 16;
+
+/// Co-process failures one (checker, spec, cfg) may have — the first spawn and
+/// one respawn — before it is answered per process for the rest of the process.
+const CASES_TRIES: u8 = 2;
+
+/// A pool slot: `None` until its child is spawned, and again once it is retired.
+type CasesSlot = std::sync::Arc<Mutex<Option<CasesChild>>>;
+
+/// The `--cases` co-process's verdict on one two-step trace, or `None` — and
+/// the caller answers this case with one `ty` process of its own.
+///
+/// WHY (2026-10-01, A10 of docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md):
+/// one `ty trace validate` process costs ~6 ms of spawn and setup for
+/// microseconds of work, and the footer suite asks for 8,064 of them.
+/// `ty trace validate --spec S --config C --cases -` loads the spec and cfg
+/// once, then answers one request line with one verdict line, each case in a
+/// fresh evaluation context; ty's own differential test holds it equal to one
+/// process per case, and the caller's per-call TIER DISAGREEMENT assert still
+/// holds every verdict against the interpreter.
+///
+/// Used only when `ty` advertises `trace-cases-v1` AND `check-budget-self-v1`
+/// (an idle co-process must not shrink a running check's memory budget). It
+/// fails CLOSED: any failure — no spawn, a missing or foreign header, EOF, a
+/// malformed or out-of-order line, a timeout — kills the child (SIGKILL),
+/// drops it, prints one notice with its stderr tail and returns `None`; after
+/// [`CASES_TRIES`] failures the (checker, spec, cfg) stays per-process. A verdict
+/// marked `end` (ty's first-seen-table tripwire fired) is a valid answer whose
+/// child is then retired, not a failure. A request with no verdict line is
+/// NEVER an accept.
+///
+/// A child answers only for the checker it was spawned from: the pool and the
+/// failure counts are keyed on it as well as on (spec, cfg), so after an
+/// `aterm pkg` update, or a `ty` rebuilt in place, the next case spawns a child
+/// of the new build instead of asking the old build's live one. The old child
+/// idles until it is evicted.
+// Skip: drives a co-process; verification tooling, not shipping runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+fn cases_verdict(
+    checker: &TyChecker,
+    model: &str,
+    spec: &str,
+    cfg: &str,
+    trace: &str,
+    label: &str,
+) -> Option<(bool, String)> {
+    use std::sync::PoisonError;
+    type Failures = BTreeMap<TyChecker, BTreeMap<String, BTreeMap<String, u8>>>;
+    static POOL: Mutex<Vec<(TyChecker, String, String, CasesSlot)>> = Mutex::new(Vec::new());
+    static FAILED: Mutex<Failures> = Mutex::new(BTreeMap::new());
+    let ty = checker.0.as_path();
+    let failures = || {
+        FAILED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(checker)
+            .and_then(|by_spec| by_spec.get(spec))
+            .and_then(|by_cfg| by_cfg.get(cfg).copied())
+            .unwrap_or(0)
+    };
+    let caps = ty_caps(ty);
+    let has = |cap: &str| caps.iter().any(|c| c == cap);
+    // One request is one line; `transition_trace_json` writes no newline.
+    if !(has(CAP_TRACE_CASES) && has(CAP_BUDGET_SELF))
+        || trace.contains('\n')
+        || failures() >= CASES_TRIES
+    {
+        return None;
+    }
+    let slot = {
+        let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = pool
+            .iter()
+            .position(|(k, s, c, _)| k == checker && s == spec && c == cfg);
+        let entry = match at {
+            Some(at) => pool.remove(at),
+            None => {
+                if pool.len() >= CASES_POOL_CAP {
+                    // Its child is killed once no case holds it any more.
+                    pool.remove(0);
+                }
+                (
+                    checker.clone(),
+                    spec.to_string(),
+                    cfg.to_string(),
+                    CasesSlot::default(),
+                )
+            }
+        };
+        let slot = std::sync::Arc::clone(&entry.3);
+        pool.push(entry);
+        slot
+    };
+    let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    let answer = match held.as_mut() {
+        Some(child) => child.case(trace),
+        // A thread that held this slot first may have spent the last try.
+        None if failures() >= CASES_TRIES => return None,
+        None => CasesChild::start(ty, model, spec, cfg, trace)
+            .and_then(|child| held.insert(child).case(trace)),
+    };
+    match answer {
+        Ok(answer) => {
+            if answer.end {
+                *held = None;
+            }
+            drop(held);
+            // A12 (2026-10-01): `class: "error"` says the question could not be
+            // answered as asked (an evaluation failed, a label names no
+            // action) — not that `Next` refutes the step. Read as a refusal it
+            // would agree with an interpreter that refuses and pass. Enabled
+            // after the qualification run: 0 of 8,928 co-process verdicts
+            // (aterm-agent's suite, aterm-gui's lib) were errors.
+            assert!(
+                !answer.unevaluated,
+                "{label}: ty COULD NOT EVALUATE this `{model}` transition — an evaluation \
+                 error is not a refutation, so neither tier's verdict stands\n{}",
+                answer.evidence
+            );
+            Some((answer.ok, answer.evidence))
+        }
+        Err(why) => {
+            *held = None;
+            drop(held);
+            let tries = {
+                let mut failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+                let n = failed
+                    .entry(checker.clone())
+                    .or_default()
+                    .entry(spec.to_string())
+                    .or_default()
+                    .entry(cfg.to_string())
+                    .or_default();
+                *n += 1;
+                *n
+            };
+            let then = if tries >= CASES_TRIES {
+                "so is every later case of this spec and cfg in this process"
+            } else {
+                "the next case respawns the co-process once"
+            };
+            eprintln!(
+                "{label}: ty --cases co-process for `{model}` failed, so this case is answered by \
+                 one `ty` process of its own and {then}: {why}"
+            );
+            None
+        }
+    }
+}
+
+/// One verdict line, read.
+struct CasesAnswer {
+    ok: bool,
+    /// `ty (cases) <exe> [<build stamp>] pid N` and what the verdict says.
+    evidence: String,
+    /// ty's last verdict (`"end"`): the child exits after it.
+    end: bool,
+    /// `class: "error"`: not answered as asked (A12).
+    unevaluated: bool,
+}
+
+/// One live `ty trace validate --cases -` co-process for one (spec, cfg).
+struct CasesChild {
+    child: aterm_uds::spawnfd::Child,
+    stdin: std::process::ChildStdin,
+    /// The child's stdout lines, forwarded by its reader thread.
+    lines: std::sync::mpsc::Receiver<String>,
+    /// A read handle on the child's stderr FILE (its path is removed once the
+    /// header is in), for a failure notice's tail.
+    stderr: std::fs::File,
+    /// `ty (cases) <exe> [<build stamp>] pid N`.
+    who: String,
+    next_id: u64,
+}
+
+impl CasesChild {
+    /// Spawn the co-process and read its header, which must name `model` and
+    /// the variables `trace` observes; `Err` describes any failure, the child
+    /// already killed.
+    // Skip: spawns a subprocess. Verification tooling.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn start(ty: &Path, model: &str, spec: &str, cfg: &str, trace: &str) -> Result<Self, String> {
+        let dir = scratch_dir("aterm-cases", model);
+        let started = Self::spawn(ty, model, spec, cfg, &dir).and_then(|mut child| {
+            match child.expect_header(model, trace) {
+                Ok(()) => Ok(child),
+                Err(why) => Err(child.failure(&why)),
+            }
+        });
+        // The header is written once setup has loaded the spec and cfg; the
+        // stderr file stays readable through the handle.
+        let _ = std::fs::remove_dir_all(&dir);
+        started
+    }
+
+    // Skip: spawns a subprocess and its reader thread. Verification tooling.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn spawn(ty: &Path, model: &str, spec: &str, cfg: &str, dir: &Path) -> Result<Self, String> {
+        let io = |e: std::io::Error| format!("ty (cases) {}: {e}", ty.display());
+        std::fs::create_dir_all(dir).map_err(io)?;
+        let spec_path = dir.join(format!("{model}.tla"));
+        let cfg_path = dir.join(format!("{model}.cfg"));
+        let stderr_path = dir.join("stderr");
+        std::fs::write(&spec_path, spec).map_err(io)?;
+        std::fs::write(&cfg_path, cfg).map_err(io)?;
+        let stderr = std::fs::File::create(&stderr_path).map_err(io)?;
+        let stderr_reader = std::fs::File::open(&stderr_path).map_err(io)?;
+        let mut cmd = aterm_uds::spawnfd::command(ty);
+        cmd.arg("trace")
+            .arg("validate")
+            .arg("--spec")
+            .arg(&spec_path)
+            .arg("--config")
+            .arg(&cfg_path)
+            .arg("--cases")
+            .arg("-")
+            .stderr(stderr);
+        let mut child = ty_child(&mut cmd).map_err(io)?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("ty (cases) {}: no stdio pipes", ty.display()));
+        };
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            who: format!(
+                "ty (cases) {} [{}] pid {}",
+                ty.display(),
+                ty_build_stamp(ty),
+                child.id()
+            ),
+            child,
+            stdin,
+            lines,
+            stderr: stderr_reader,
+            next_id: 0,
+        })
+    }
+
+    /// The next stdout line, within [`CASES_HANG`].
+    fn recv(&self, what: &str) -> Result<String, String> {
+        use std::sync::mpsc::RecvTimeoutError;
+        self.lines.recv_timeout(CASES_HANG).map_err(|e| match e {
+            RecvTimeoutError::Timeout => format!("no {what} within {} s", CASES_HANG.as_secs()),
+            RecvTimeoutError::Disconnected => format!("stdout closed before {what}"),
+        })
+    }
+
+    // Skip: JSON field reads over another tool's output. Verification tooling.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn expect_header(&self, model: &str, trace: &str) -> Result<(), String> {
+        use aterm_json::Value;
+        let line = self.recv("its header")?;
+        let names = |doc: &Value| -> Option<Vec<String>> {
+            let mut names = doc
+                .get("variables")?
+                .as_array()?
+                .iter()
+                .map(|n| n.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?;
+            names.sort();
+            Some(names)
+        };
+        let want = aterm_json::from_str::<Value>(trace)
+            .ok()
+            .and_then(|t| names(&t));
+        let fits = aterm_json::from_str::<Value>(&line).is_ok_and(|h| {
+            h.get("ty_trace_cases").and_then(Value::as_u64) == Some(1)
+                && h.get("module").and_then(Value::as_str) == Some(model)
+                && h.get("action_label_mode").and_then(Value::as_str) == Some("error")
+                && want.is_some()
+                && names(&h) == want
+        });
+        if fits {
+            Ok(())
+        } else {
+            Err(format!("a header that is not `{model}`'s: {line}"))
+        }
+    }
+
+    /// One request, one verdict line, read strictly: the id must echo the
+    /// request's, and `ok` must be a boolean.
+    // Skip: pipe I/O and JSON field reads. Verification tooling.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn case(&mut self, trace: &str) -> Result<CasesAnswer, String> {
+        use aterm_json::Value;
+        use std::io::Write as _;
+        let id = self.next_id;
+        self.next_id += 1;
+        writeln!(self.stdin, "{{\"id\":{id},\"trace\":{trace}}}")
+            .and_then(|()| self.stdin.flush())
+            .map_err(|e| self.failure(&format!("request {id} could not be written: {e}")))?;
+        let line = self
+            .recv(&format!("the verdict for request {id}"))
+            .map_err(|why| self.failure(&why))?;
+        let verdict = aterm_json::from_str::<Value>(&line).ok();
+        let field = |key: &str| verdict.as_ref().and_then(|v| v.get(key));
+        let ok = field("ok").and_then(Value::as_bool);
+        let class = field("class").and_then(Value::as_str);
+        let (Some(ok), true) = (ok, field("id").and_then(Value::as_u64) == Some(id)) else {
+            return Err(self.failure(&format!("not the verdict for request {id}: {line}")));
+        };
+        if !ok && !matches!(class, Some("refuted" | "error")) {
+            return Err(self.failure(&format!("a refusal with no class: {line}")));
+        }
+        let text = |key: &str| field(key).and_then(Value::as_str).unwrap_or("?");
+        let mut evidence = if ok {
+            let steps = field("steps").and_then(Value::as_u64).unwrap_or(0);
+            format!("{}\naccepted: {steps} steps", self.who)
+        } else {
+            let step = field("step")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "null".to_string(), |s| s.to_string());
+            format!(
+                "{}\n{} at step {step}: {}",
+                self.who,
+                text("kind"),
+                text("message")
+            )
+        };
+        let warnings = field("warnings").and_then(Value::as_array);
+        for warning in warnings.into_iter().flatten() {
+            evidence.push_str(&format!("\nwarning: {}", warning.as_str().unwrap_or("?")));
+        }
+        Ok(CasesAnswer {
+            ok,
+            evidence,
+            end: field("end").is_some(),
+            unevaluated: class == Some("error"),
+        })
+    }
+
+    /// Kill the child — SIGKILL through `Child::kill`, never a signal that
+    /// writes a crash report (AGENTS.md rule 6), and harmless on one that has
+    /// exited — and describe the failure with its exit status and the tail
+    /// of its stderr.
+    // Skip: process control and a file read. Verification tooling.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn failure(&mut self, why: &str) -> String {
+        use std::io::Read as _;
+        let _ = self.child.kill();
+        let status = self
+            .child
+            .wait()
+            .map_or_else(|e| e.to_string(), |s| s.to_string());
+        let mut stderr = String::new();
+        let _ = self.stderr.read_to_string(&mut stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+        format!(
+            "{}: {why} ({status})\n--- ty stderr (tail) ---\n{tail}",
+            self.who
+        )
+    }
+}
+
+impl Drop for CasesChild {
+    /// A retired, evicted or failed child is killed and reaped, never left a
+    /// zombie. A child still pooled when the test process exits sees EOF on
+    /// its stdin and exits by itself.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// The two-step `ty trace validate` JSON for a derived model: `prev` at index 0,
 /// `next` (+ the admitting action, when known) at index 1. Variables serialize
 /// in the model's declared order.
+///
+/// # Panics
+///
+/// If `prev` or `next` lacks a model variable. A projection that misses one is
+/// a harness bug, and no value invented for it here is a fact about the code:
+/// this used to write 0, and the mismatch surfaced only by accident — when the
+/// cfg's pinned `Init` (gone 2026-10-01) defaulted the same variable to a
+/// declared initial value other than 0.
 // Skip: the field-render chain drives closure bodies + `Extend`/format
 // (absent std bodies). Spec-harness trace emission, not runtime code.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -2316,10 +3745,14 @@ fn transition_trace_json(
         let fields: Vec<String> = vars
             .iter()
             .map(|v| {
-                format!(
-                    "\"{v}\":{{\"type\":\"int\",\"value\":{}}}",
-                    s.get(v).copied().unwrap_or(0)
-                )
+                let Some(value) = s.get(v) else {
+                    panic!(
+                        "{}: the transition state {s:?} has no `{v}` — project every model \
+                         variable",
+                        m.name
+                    )
+                };
+                format!("\"{v}\":{{\"type\":\"int\",\"value\":{value}}}")
             })
             .collect();
         format!("{{{}}}", fields.join(","))
@@ -2365,866 +3798,22 @@ fn transition_trace_json(
 /// uninterpretable model must be VISIBLE to the caller, never quietly reported
 /// as carrying no ghosts — which is the same silence this whole check exists to
 /// refuse.
+///
+/// **One walk, not one per invariant.** "Checked alone" is computed by
+/// [`interp::violated_invariants`], a single BFS of the `Buggy = 1` space that
+/// returns exactly the set per-invariant isolated `bmc` runs would, panics
+/// included (its doc carries the argument; the per-invariant form survives as
+/// the test oracle it is compared against).
 #[must_use]
 pub fn uncaught_invariants(m: &Model) -> Vec<&'static str> {
-    let buggy = interp::with_buggy(m, 1);
+    let violated = interp::violated_invariants(&interp::with_buggy(m, 1));
     m.invariants
         .iter()
-        .filter(|inv| {
-            let mut alone = buggy.clone();
-            alone.invariants.retain(|other| other.name == inv.name);
-            interp::bmc(&alone).is_ok()
-        })
         .map(|inv| inv.name)
+        .filter(|name| !violated.contains(name))
         .collect()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::is_pending_stub;
-
-    /// A pending-program stub on PATH is NOT the tool: discovery must skip it,
-    /// or a harness runs the placeholder and reads its refusal as tool output
-    /// (the spec-xref gate hard-failed exactly that way once a pending
-    /// `trust-ir` stub reached PATH).
-    #[test]
-    fn a_pending_stub_is_not_the_tool() {
-        let dir = std::env::temp_dir().join(format!("aterm_stub_probe_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mk probe dir");
-        let stub = dir.join("trust-ir-probe");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\n# atpkg pending-program stub v1\n# Replaced by the real shim when the program installs.\nexit 127\n",
-        )
-        .expect("write stub");
-        assert!(is_pending_stub(&stub), "the stub names itself");
-
-        let real = dir.join("trust-ir-real");
-        std::fs::write(&real, b"\x7fELF fake binary bytes").expect("write real");
-        assert!(!is_pending_stub(&real), "a real binary is not a stub");
-
-        let missing = dir.join("nope");
-        assert!(
-            !is_pending_stub(&missing),
-            "unreadable candidates stay eligible — a false pending would hide an installed tool"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The stub check reads the HEAD of a candidate and nothing more: a real
-    /// tool is ~160 MB, and every store copy of it is checked. Proved with a
-    /// FIFO whose writer sends a stub's head and then holds the pipe OPEN — a
-    /// whole-file read never sees EOF and blocks, a bounded one answers.
-    #[cfg(unix)]
-    #[test]
-    fn the_pending_stub_check_reads_only_the_head() {
-        let dir = std::env::temp_dir().join(format!("aterm_stub_head_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mk probe dir");
-        let fifo = dir.join("endless");
-        let made = std::process::Command::new("/usr/bin/mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("run mkfifo");
-        assert!(made.success(), "mkfifo");
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let writer_path = fifo.clone();
-        let writer = std::thread::spawn(move || {
-            use std::io::Write as _;
-            let mut w = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&writer_path)
-                .expect("open fifo for write");
-            let mut head = b"#!/bin/sh\n# atpkg pending-program stub v1\n".to_vec();
-            // Longer than the bound, so a bounded read stops inside it.
-            head.resize(320, b'#');
-            assert!(head.len() as u64 > super::PENDING_STUB_HEAD);
-            let _ = w.write_all(&head);
-            // Hold the pipe open: no EOF until the check has answered. The
-            // cap outlasts the answer's wait below, or a whole-file read
-            // would see EOF inside it and pass.
-            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(120));
-        });
-        let (tx, rx) = std::sync::mpsc::channel();
-        let reader_path = fifo.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(is_pending_stub(&reader_path));
-        });
-        // A hang detector: the bounded read answers at once; a whole-file one
-        // never does while the writer holds the pipe.
-        let answer = rx.recv_timeout(std::time::Duration::from_secs(60));
-        let _ = release_tx.send(());
-        let _ = writer.join();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(
-            answer,
-            Ok(true),
-            "the check must answer from the head while the writer holds the pipe open — \
-             a whole-file read blocks here waiting for an EOF that never comes"
-        );
-    }
-
-    use super::*;
-    use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
-    use crate::ty_model;
-
-    /// The arming is a LIST, and every entry on it is load-bearing for a
-    /// different reason — so the list is pinned exactly, not merely "contains".
-    ///
-    /// `ty_drivers_are_armed` proves every driver CALLS this function. Nothing
-    /// proved what the function then emits, which is the half that actually
-    /// arms anything: the 2026-08-06 red gate was a driver that emitted four
-    /// of these five flags. An `assert!(contains)` per flag would let the list
-    /// be quietly reordered or extended; an exact match makes any edit to the
-    /// arming a deliberate, reviewed act.
-    ///
-    /// It is also this file's REACH GUARD for the fast lane. `--bfs-only` is
-    /// what makes each spawn 0.03s instead of 0.58s, and it is invisible
-    /// everywhere else: drop it and every verdict in the workspace stays
-    /// green while `tools/verify.sh` silently grows ~3.5 minutes back. The
-    /// only place that regression can be caught is here.
-    #[test]
-    fn the_arming_emits_exactly_the_flags_it_documents() {
-        let mut cmd = Command::new("ty");
-        arm_whole_space_check(&mut cmd);
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            args,
-            [
-                // Reduction OFF, both halves — the whole-space obligation, and
-                // the only reason `assert_same_space_explored` can be written.
-                "--no-auto-por",
-                "--no-auto-symmetry",
-                // Footprint hint: 4x the largest model, so it bounds nothing.
-                "--initial-capacity",
-                "8192",
-                // The oracle engine, not the native codegen lane.
-                "--backend",
-                "interpreter",
-                // The fused CDEMC symbolic lane OFF: 0.55s per spawn to report
-                // `Winner: BFS` on every model in the tree. Removing this is a
-                // ~3.5 minute regression on every `tools/verify.sh` run.
-                "--bfs-only",
-                // No cached verdicts. The cache is path-keyed, and the
-                // hand-written ISOLATION specs live at a stable path, so
-                // without this a repeat run replays a security PASS it never
-                // re-derived.
-                "--force",
-            ],
-            "the `ty` arming changed — every flag here is load-bearing; see the \
-             doc on `arm_whole_space_check` before editing this list"
-        );
-    }
-
-    /// The atpkg-store prefix mirror must keep matching
-    /// `atpkg::platform::default_prefix` + `/bin` (the deliberate
-    /// no-dependency duplication both sites cross-reference).
-    #[test]
-    fn store_bin_dir_mirrors_the_atpkg_default_prefix() {
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            unix_store_bin_dir(Path::new("/Users//x")),
-            Path::new("/Users//x/Library/Application Support/aterm/pkg/bin")
-        );
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(
-            unix_store_bin_dir(Path::new("/home/x")),
-            Path::new("/home/x/.local/share/aterm/pkg/bin")
-        );
-    }
-
-    /// A dangling store shim never satisfies discovery; a live one — a symlink an
-    /// older atpkg laid, or today's exec stub — resolves to the real store target
-    /// (what the caller will execute), not the shim.
-    #[cfg(unix)]
-    #[test]
-    fn store_shim_resolution_is_fail_closed() {
-        let d = std::env::temp_dir().join(format!("aterm-spec-shim-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let shim = d.join("ty");
-        // Absent → None.
-        assert_eq!(resolve_store_shim(&shim), None);
-        // Dangling symlink → None (a GC'd store build must not satisfy).
-        std::os::unix::fs::symlink(d.join("store/gone/ty"), &shim).unwrap();
-        assert_eq!(resolve_store_shim(&shim), None);
-        // A TOMBSTONE (regular-file refusal script atpkg writes for a yanked
-        // build) must read as ABSENT — else a revoked build would shadow a
-        // working tool on PATH, since this probe runs first.
-        std::fs::remove_file(&shim).unwrap();
-        std::fs::write(&shim, b"#!/bin/sh\necho revoked >&2\nexit 1\n").unwrap();
-        assert_eq!(
-            resolve_store_shim(&shim),
-            None,
-            "a tombstone shim must never satisfy discovery"
-        );
-        // Live shim → the RESOLVED store path.
-        std::fs::remove_file(&shim).unwrap();
-        let target = d.join("real-ty");
-        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
-        std::os::unix::fs::symlink(&target, &shim).unwrap();
-        let got = resolve_store_shim(&shim).expect("live shim resolves");
-        assert_eq!(got, std::fs::canonicalize(&target).unwrap());
-        // THE SHAPE ATPKG LAYS TODAY: a `#!/bin/sh` exec stub, never a symlink. Its first
-        // `exec '<path>' "$@"` line is the target — including a path with a quote in it.
-        std::fs::remove_file(&shim).unwrap();
-        let quoted = d.join("store/it's/ty");
-        std::fs::create_dir_all(quoted.parent().unwrap()).unwrap();
-        std::fs::write(&quoted, b"#!/bin/sh\n").unwrap();
-        let stub = |target: &str| {
-            let _ = std::fs::remove_file(&shim);
-            std::fs::write(
-                &shim,
-                format!(
-                    "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n\
-                     exec '{target}' \"$@\"\n"
-                ),
-            )
-            .unwrap();
-        };
-        stub(&quoted.to_string_lossy().replace('\'', "'\\''"));
-        assert_eq!(
-            resolve_store_shim(&shim),
-            Some(std::fs::canonicalize(&quoted).unwrap()),
-            "an exec stub resolves to the file it execs"
-        );
-        // A stub whose build was reclaimed never satisfies discovery, and neither does one
-        // naming a RELATIVE path — which would resolve against the cwd: `Cargo.toml` is a
-        // real file relative to a `targo test` run's cwd, so only the absolute-path rule
-        // refuses it.
-        stub(&d.join("store/gone/ty").to_string_lossy());
-        assert_eq!(
-            resolve_store_shim(&shim),
-            None,
-            "a reclaimed build is absent"
-        );
-        assert!(
-            Path::new("Cargo.toml").is_file(),
-            "fixture: the relative file exists"
-        );
-        stub("Cargo.toml");
-        assert_eq!(
-            resolve_store_shim(&shim),
-            None,
-            "a relative target is absent"
-        );
-        // atpkg's pending-program stub execs `"$ATPKG"`, never a quoted literal path.
-        std::fs::remove_file(&shim).unwrap();
-        std::fs::write(
-            &shim,
-            b"#!/bin/sh\n# atpkg pending-program stub v1\nATPKG='/a/atpkg'\n\
-              if [ -x \"$ATPKG\" ]; then\n  exec \"$ATPKG\" __pending 'ty' \"$@\"\nfi\nexit 127\n",
-        )
-        .unwrap();
-        assert_eq!(resolve_store_shim(&shim), None, "a pending stub is absent");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    // -----------------------------------------------------------------------
-    // PROVENANCE — the escalation tier names the binary it ran. Every test
-    // below runs over a TEMP home + store prefix through the explicit-env
-    // resolver, so nothing reads or mutates the process environment and no
-    // test depends on what this machine has installed.
-    // -----------------------------------------------------------------------
-
-    /// A scratch HOME and atpkg prefix for one test.
-    struct Scratch {
-        root: PathBuf,
-    }
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("aterm-spec-prov-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("home")).unwrap();
-            std::fs::create_dir_all(root.join("prefix/bin")).unwrap();
-            // Canonical, so `~` shortening matches the paths discovery returns
-            // (macOS temp_dir is itself behind the /var -> /private/var link).
-            let root = std::fs::canonicalize(&root).unwrap();
-            Self { root }
-        }
-        fn home(&self) -> PathBuf {
-            self.root.join("home")
-        }
-        fn store_bin(&self) -> PathBuf {
-            self.root.join("prefix/bin")
-        }
-        fn file(&self, rel: &str) -> PathBuf {
-            let p = self.root.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, b"\x7fELF not really\n").unwrap();
-            p
-        }
-        /// `prefix/store/<program>/<build>/bin/<exe>` + `current -> <build>`.
-        #[cfg(unix)]
-        fn store_copy(&self, program: &str, build: &str, exe: &str) -> PathBuf {
-            let p = self.file(&format!("prefix/store/{program}/{build}/bin/{exe}"));
-            let dir = self.root.join(format!("prefix/store/{program}"));
-            std::os::unix::fs::symlink(dir.join(build), dir.join("current")).unwrap();
-            p
-        }
-        fn locate(&self, bin: &str, path_var: Option<&std::ffi::OsStr>) -> Option<Located> {
-            find_trust_bin(bin, Some(&self.store_bin()), path_var)
-        }
-        fn line(&self, bin: &str, found: Option<&Located>) -> String {
-            provenance_line(
-                bin,
-                found,
-                Some("ty 9.9.9"),
-                &[self.home()],
-                Some(&self.store_bin()),
-            )
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
-    /// Store PRESENT, PATH empty. With no usable
-    /// `ty` shim (m3's store lost its own-name `ty`/`ay` shims to a trust
-    /// rollback, measured 2026-09-23) nothing is found, and the line names the
-    /// store copy and WHY discovery missed it instead of implying the tool is
-    /// not installed. With a live shim — today's exec stub, or an older
-    /// symlink — the store tier answers and the line says so.
-    #[cfg(unix)]
-    #[test]
-    fn provenance_store_present_names_the_unreached_copy() {
-        let s = Scratch::new("nobs-st");
-        s.store_copy("ty", "3007", "ty");
-        let shim = s.store_bin().join("ty");
-        let unreached = |why: &str| {
-            assert_eq!(s.locate("ty", None), None, "{why}");
-            let line = s.line("ty", None);
-            assert!(
-                line.starts_with("VERIFY ESCALATION TIER: ty = NOT FOUND"),
-                "{line}"
-            );
-            assert!(
-                line.contains("the managed store holds store/ty/3007/bin/ty (built 2")
-                    && line.ends_with(&format!("but discovery does not reach it: {why}")),
-                "{line}"
-            );
-        };
-        unreached("no `ty` shim in the store's bin/ exposes it");
-
-        std::fs::write(&shim, "#!/bin/sh\necho revoked >&2\nexit 1\n").unwrap();
-        unreached("the store's `ty` shim is a refusal script (tombstone or pending stub)");
-
-        let stub = |target: &Path| {
-            std::fs::write(
-                &shim,
-                format!(
-                    "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n\
-                     exec '{}' \"$@\"\n",
-                    target.display()
-                ),
-            )
-            .unwrap();
-        };
-        stub(&s.root.join("prefix/store/ty/2999/bin/ty"));
-        unreached("the store's `ty` shim does not resolve to a file (a reclaimed build?)");
-
-        // atpkg's CURRENT shim form, live: the store tier answers, and the copy
-        // it resolves to is not listed as shadowing itself.
-        let target = s.root.join("prefix/store/ty/3007/bin/ty");
-        stub(&target);
-        let found = s
-            .locate("ty", None)
-            .expect("a live exec stub is the store tier");
-        assert_eq!(
-            (found.origin, found.path.clone()),
-            (TrustBinOrigin::Store, target.clone())
-        );
-        let line = s.line("ty", Some(&found));
-        assert!(
-            line.starts_with(&format!(
-                "VERIFY ESCALATION TIER: ty = {} [atpkg managed store; ty 9.9.9; built 2",
-                target.display()
-            )),
-            "{line}"
-        );
-        assert!(
-            !line.contains(" — "),
-            "the chosen copy is not its own shadow: {line}"
-        );
-
-        // An older atpkg's symlink shim is the store tier too.
-        std::fs::remove_file(&shim).unwrap();
-        std::os::unix::fs::symlink(&target, &shim).unwrap();
-        let found = s
-            .locate("ty", None)
-            .expect("a symlink shim is the store tier");
-        assert_eq!(found.origin, TrustBinOrigin::Store);
-    }
-
-    /// Nothing installed: not found, and the plain notice with no store clause.
-    #[test]
-    fn provenance_nothing_installed_is_a_plain_not_found() {
-        let s = Scratch::new("none");
-        assert_eq!(s.locate("ty", None), None);
-        assert_eq!(
-            s.line("ty", None),
-            "VERIFY ESCALATION TIER: ty = NOT FOUND (probed the atpkg store shim, PATH)"
-        );
-    }
-
-    /// THE order, pinned: the store shim beats PATH, and a developer tree under home
-    /// — a first-party cargo build, a bootstrap stage, a standalone `~/ay` — is never
-    /// a candidate (m3's stale first-party trust-ir 0.2.0 shadowed store 1123 until
-    /// 2026-09-24). Another copy in the store is named beside the chosen one.
-    #[cfg(unix)]
-    #[test]
-    fn discovery_order_is_store_then_path_and_no_developer_tree() {
-        let s = Scratch::new("order");
-        s.file("home/trust/first-party/trust-ir/target/release/trust-ir");
-        s.file("home/trust/build/host/stage1/bin/trust-ir");
-        s.file("home/ay/target/release/ay");
-        assert_eq!(
-            s.locate("trust-ir", None),
-            None,
-            "no developer tree is probed"
-        );
-        assert_eq!(s.locate("ay", None), None, "no standalone ~/ay either");
-
-        let on_path = s.file("pathdir/trust-ir");
-        let path_var = std::ffi::OsString::from(on_path.parent().unwrap());
-        let got = s.locate("trust-ir", Some(&path_var)).unwrap();
-        assert_eq!((got.origin, got.path), (TrustBinOrigin::Path, on_path));
-
-        let store = s.store_copy("trust-ir", "1123", "trust-ir");
-        s.store_copy("trust", "9192", "trust-ir");
-        std::os::unix::fs::symlink(&store, s.store_bin().join("trust-ir")).unwrap();
-        let got = s.locate("trust-ir", Some(&path_var)).unwrap();
-        assert_eq!(
-            (got.origin, got.path.clone()),
-            (TrustBinOrigin::Store, store)
-        );
-        let line = s.line("trust-ir", Some(&got));
-        assert!(
-            line.contains("[atpkg managed store; ")
-                && line.contains(" — the managed store also holds store/trust/9192/bin/trust-ir"),
-            "{line}"
-        );
-    }
-
-    /// A PATH hit that is an atpkg exec stub (a shim dir on PATH other than
-    /// this prefix's `bin/`) names the store file it execs, and that store copy
-    /// is not listed as shadowed (it is the one that ran).
-    #[cfg(unix)]
-    #[test]
-    fn a_path_exec_stub_names_its_target() {
-        let s = Scratch::new("pathstub");
-        let target = s.store_copy("trust-ir", "1123", "trust-ir");
-        let shim = s.root.join("pathbin/trust-ir");
-        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
-        std::fs::write(
-            &shim,
-            format!(
-                "#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n",
-                target.display()
-            ),
-        )
-        .unwrap();
-        let path_var = std::ffi::OsString::from(shim.parent().unwrap());
-        let found = s.locate("trust-ir", Some(&path_var)).unwrap();
-        assert_eq!(found.origin, TrustBinOrigin::Path);
-        let line = s.line("trust-ir", Some(&found));
-        let want = format!("[PATH (atpkg shim → {}); ", target.display());
-        assert!(line.contains(&want), "{line}");
-        assert!(!line.contains(" — "), "{line}");
-    }
-
-    /// The exec-stub reader mirrors `atpkg::platform::parse_sh_shim_target`.
-    #[test]
-    fn exec_stub_target_reads_atpkg_shims_and_rejects_refusals() {
-        let s = Scratch::new("stubparse");
-        let shim = s.root.join("shim");
-        std::fs::write(
-            &shim,
-            "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\nexec '/a/it'\\''s/ty' \"$@\"\n",
-        )
-        .unwrap();
-        assert_eq!(exec_stub_target(&shim), Some(PathBuf::from("/a/it's/ty")));
-        std::fs::write(&shim, "#!/bin/sh\necho revoked >&2\nexit 1\n").unwrap();
-        assert_eq!(exec_stub_target(&shim), None, "a tombstone has no target");
-        assert_eq!(classify_store_shim(&shim), StoreShim::Refusal);
-        assert_eq!(classify_store_shim(&s.root.join("nope")), StoreShim::Absent);
-    }
-
-    /// The report is once per tool per process: the first claim wins, every
-    /// later one (the hundreds of `find_ty` calls in a suite) is silent and
-    /// spawns nothing.
-    #[test]
-    fn provenance_is_claimed_once_per_tool() {
-        let set = Mutex::new(BTreeSet::new());
-        assert!(claim_first_report(&set, "ty"));
-        assert!(!claim_first_report(&set, "ty"));
-        assert!(claim_first_report(&set, "ay"));
-        assert!(!claim_first_report(&set, "ay"));
-    }
-
-    #[test]
-    fn build_dates_are_utc_civil_dates() {
-        assert_eq!(civil_from_unix_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_unix_days(-1), (1969, 12, 31));
-        assert_eq!(civil_from_unix_days(19_723), (2024, 1, 1));
-        assert_eq!(civil_from_unix_days(20_719), (2026, 9, 23));
-        let s = Scratch::new("date");
-        let d = build_date(&s.file("x")).expect("a fresh file has an mtime");
-        assert_eq!((d.len(), &d[4..5], &d[7..8]), (10, "-", "-"), "{d}");
-    }
-
-    /// The one spawn: `--version`'s first non-empty line. `/bin/echo` echoes
-    /// its argument on the BSD userland and names itself on GNU — either way a
-    /// line, from a binary that is not freshly written (a fresh file can stall
-    /// in exec assessment under load, measured on this host).
-    #[cfg(unix)]
-    #[test]
-    fn the_version_probe_returns_the_first_line() {
-        let v = probe_version(Path::new("/bin/echo")).expect("echo answers");
-        assert!(!v.is_empty() && !v.contains('\n'), "{v:?}");
-        assert_eq!(probe_version(Path::new("/nonexistent/ty")), None);
-    }
-
-    /// A SCALAR model can never report [`NotRun`] — that is the fact
-    /// [`prove_and_catch_scalar`] converts into an unconditional
-    /// `Covered`, and the reason ~21 call sites are allowed to ignore the
-    /// toolchain's presence. Pinned here rather than reasoned about: if the
-    /// interpreter tier ever grew a bail-out, this goes red instead of those
-    /// sites quietly returning coverage they no longer have.
-    #[test]
-    fn a_scalar_model_can_never_report_not_run() {
-        let m = ring_model();
-        assert!(m.fn_vars.is_empty(), "the probe model must be scalar");
-        let d = check_model_tiered(&m, "scalar-discharge probe");
-        assert!(
-            matches!(d, Ok(Covered::Interpreter | Covered::InterpreterAndTy)),
-            "{d:?}"
-        );
-    }
-
-    /// The five committed-dead `ConfigCatalogSnapshot` mutants are verified
-    /// negative controls: dial present, fire at Buggy=1, caught at Buggy=1.
-    #[test]
-    fn audit_accepts_config_catalog_snapshot_mutants() {
-        let m = config_catalog_snapshot_model();
-        assert_eq!(
-            audit_dead_negative_controls(
-                &m,
-                &[
-                    "AdmitStaleTrail",
-                    "AdmitStaleKitty",
-                    "AdmitStaleTheme",
-                    "AdmitStaleSparkle",
-                    "PublishLiveUnadmitted",
-                ],
-            ),
-            Ok(5)
-        );
-    }
-
-    /// Transact's `BuggyCommit` — the original hand-audited exception — now
-    /// passes the machine-verified criterion instead.
-    #[test]
-    fn audit_accepts_transact_buggy_commit() {
-        assert_eq!(
-            audit_dead_negative_controls(&transact_model(), &["BuggyCommit"]),
-            Ok(1)
-        );
-    }
-
-    /// A strictly non-vacuous model audits clean with an empty reported set.
-    #[test]
-    fn audit_accepts_strictly_nonvacuous_model() {
-        assert_eq!(audit_dead_negative_controls(&ring_model(), &[]), Ok(0));
-    }
-
-    /// Tier agreement is required in BOTH directions: an empty ty report while
-    /// the interpreter finds dead actions fails (this is the fail-open guard —
-    /// a ty output-format drift cannot silently grant the relaxation), and an
-    /// action ty names that the model does not declare fails.
-    #[test]
-    fn audit_rejects_tier_disagreement_and_unknown_actions() {
-        let m = config_catalog_snapshot_model();
-        let under_reported = audit_dead_negative_controls(&m, &[]);
-        assert!(
-            under_reported
-                .as_ref()
-                .is_err_and(|e| e.contains("TIER DISAGREEMENT")),
-            "{under_reported:?}"
-        );
-        let unknown = audit_dead_negative_controls(&m, &["NoSuchAction"]);
-        assert!(
-            unknown
-                .as_ref()
-                .is_err_and(|e| e.contains("does not declare")),
-            "{unknown:?}"
-        );
-    }
-
-    /// A dead action in a model whose `Buggy` is not committed to 0 has no
-    /// catch config — REAL vacuity, rejected.
-    #[test]
-    fn audit_rejects_dead_actions_without_committed_buggy_dial() {
-        let m = interp::with_consts(&config_catalog_snapshot_model(), &[("Buggy", 2)]);
-        let r = audit_dead_negative_controls(
-            &m,
-            &[
-                "AdmitStaleTrail",
-                "AdmitStaleKitty",
-                "AdmitStaleTheme",
-                "AdmitStaleSparkle",
-                "PublishLiveUnadmitted",
-            ],
-        );
-        assert!(
-            r.as_ref()
-                .is_err_and(|e| e.contains("no committed `Buggy = 0` dial")),
-            "{r:?}"
-        );
-    }
-
-    /// An action dead at BOTH configs (a typo'd guard, not a mutant) is a REAL
-    /// vacuity, and a Buggy=1 space no invariant catches proves nothing — both
-    /// rejected.
-    #[test]
-    fn audit_rejects_never_firing_and_uncaught_mutants() {
-        // `Stuck` cannot fire at any config: its guard needs count > Cap while
-        // count never exceeds Cap.
-        let never = ty_model! {
-            NeverFires {
-                const Buggy = 0;
-                const Cap = 2;
-                var count = 0;
-                action Step when (count <= Cap - 1) { count = count + 1; }
-                action Stuck when (Buggy == 1 && count == Cap + 1) { count = 0; }
-                invariant Bounded: count <= Cap;
-            }
-        };
-        let r = audit_dead_negative_controls(&never, &["Stuck"]);
-        assert!(
-            r.as_ref()
-                .is_err_and(|e| e.contains("never fires at Buggy=1")),
-            "{r:?}"
-        );
-
-        // `Harmless` fires at Buggy=1 but violates nothing there — the "mutant"
-        // is caught by no invariant, so it proves nothing.
-        let uncaught = ty_model! {
-            UncaughtMutant {
-                const Buggy = 0;
-                const Cap = 2;
-                var count = 0;
-                action Step when (count <= Cap - 1) { count = count + 1; }
-                action Harmless when (Buggy == 1 && count == 0) { count = 1; }
-                invariant Bounded: count <= Cap;
-            }
-        };
-        let r = audit_dead_negative_controls(&uncaught, &["Harmless"]);
-        assert!(
-            r.as_ref().is_err_and(|e| e.contains("caught by nothing")),
-            "{r:?}"
-        );
-    }
-
-    /// One caught mutant must not launder a second harmless mutant through a
-    /// shared Buggy=1 counterexample. Each committed-dead action earns the
-    /// strict-vacuity relaxation only when it independently turns the safe
-    /// all-live baseline into an invariant violation.
-    #[test]
-    fn audit_rejects_two_mutants_when_only_one_is_independently_caught() {
-        let partly_vacuous = ty_model! {
-            PartlyVacuousMutants {
-                const Buggy = 0;
-                const Cap = 1;
-                var count = 0;
-                action Step when (count <= Cap - 1) { count = count + 1; }
-                action Reset when (count == Cap) { count = 0; }
-                action Caught when (Buggy == 1 && count == 0) { count = Cap + 1; }
-                action Harmless when (Buggy == 1 && count == 0) { count = Cap; }
-                invariant Bounded: count <= Cap;
-            }
-        };
-        let r = audit_dead_negative_controls(&partly_vacuous, &["Caught", "Harmless"]);
-        assert!(
-            r.as_ref().is_err_and(|e| {
-                e.contains("Harmless") && e.contains("independently caught by nothing")
-            }),
-            "{r:?}"
-        );
-    }
-
-    /// The state count is read from `ty`'s real statistics block, and ONLY from
-    /// it. `None` on drift is the whole point: the caller turns `None` into a
-    /// failure, so a `ty` whose output format moves takes the gate RED rather
-    /// than silently retiring the explored-space obligation.
-    #[test]
-    fn ty_state_count_is_parsed_or_refused() {
-        let real = "Model checking complete: No errors found (exhaustive).\n\n\
-                    Statistics:\n  States found: 128\n  Initial states: 1\n  Transitions: 587\n";
-        assert_eq!(ty_states_explored(real), Some(128));
-        assert_eq!(
-            ty_states_explored("Statistics:\n  States found: 1\n"),
-            Some(1)
-        );
-        // Drift / no statistics block / non-numeric — all refusals, not zeros.
-        assert_eq!(ty_states_explored("No errors found (exhaustive)."), None);
-        assert_eq!(ty_states_explored("  States explored: 128\n"), None);
-        assert_eq!(ty_states_explored("  States found: many\n"), None);
-    }
-
-    /// REGRESSION (2026-07-30 FALSE PROOF): `ty` reported "No errors found
-    /// (exhaustive)" for `RainbowJumpBurstLifecycle` after exploring ONE of its 128
-    /// reachable states — its partial-order reduction formed a singleton ample
-    /// set out of the model's stutter action, whose only successor is the
-    /// expanding state, and the C3 cycle proviso failed to reject it. The
-    /// verdicts agreed; the work behind them did not.
-    ///
-    /// This pins the CONSEQUENCE rather than the cause: a smaller `ty` count is
-    /// a false proof and must panic. The cause is fixed in `ty` itself, and this
-    /// stays green either way — reduction is off for this driver, so a `ty`
-    /// whose reduction regresses again cannot reach the gate through this door.
-    /// REGRESSION (2026-08-06 RED GATE): `spec_xref_closure` hand-rolled its own
-    /// `ty` flag list and omitted `--no-auto-por`, so it ran the whole registry
-    /// with partial-order reduction ON. On `RainbowJumpBurstLifecycle` that was
-    /// `POR: 1/1 states reduced (100.0%)` — 128 reachable states explored as 1 —
-    /// and four of its six actions therefore "never fired". `--strict-vacuity`
-    /// duly called them dead, and the tier comparison blew up on a dead set that
-    /// was an artifact of the reduction.
-    ///
-    /// The arming is now shared ([`arm_whole_space_check`]) so no driver can
-    /// omit it, and this is the second lock: a dead set carries no record of the
-    /// space it was measured on, so the transcript must be shown to have covered
-    /// the whole thing before anything in it is believed.
-    /// The guard must not fail OPEN on the one input that matters most: a clean
-    /// `ty` verdict over a model the interpreter knows is violated.
-    ///
-    /// This looks like a case the caller already reports — it is not. The
-    /// caller's report is `ty`'s exit status, and the whole premise of this guard
-    /// is that the discovered `ty` returns clean/exit-0 on spaces it never
-    /// entered. Returning early here would let exactly that combination through.
-    #[test]
-    fn a_clean_ty_verdict_over_a_violated_model_is_a_false_proof_not_a_coverage_gap() {
-        // The guard forces `Buggy = 0` itself, so the violation has to come from
-        // somewhere it does not override. `LenBounded` is `seq - lo + 1 <= Cap`,
-        // and the ring starts at `seq = 0, lo = 1` — so `Cap = -1` is violated in
-        // the INITIAL state, which is as committed as a config gets.
-        let m = interp::with_consts(&ring_model(), &[("Cap", -1)]);
-        assert!(
-            interp::bmc(&interp::with_buggy(&m, 0)).is_err(),
-            "fixture must be a model whose committed config is violated"
-        );
-        let panicked = std::panic::catch_unwind(|| {
-            assert_ty_saw_whole_space(
-                &m,
-                "Model checking complete: No errors found (exhaustive).\n\
-                 Statistics:\n  States found: 1\n",
-                "false-proof guard",
-            );
-        });
-        assert!(
-            panicked.is_err(),
-            "a clean ty verdict over a violated committed config must never pass silently"
-        );
-    }
-
-    /// The checker-identity header rides along with the transcript, so it must be
-    /// invisible to everything that reads one.
-    #[test]
-    fn the_ty_evidence_header_is_invisible_to_the_transcript_parsers() {
-        let body = "Model checking complete: No errors found (exhaustive).\n\
-                    WARNING: 2 dead action(s) (never fired): Alpha, Beta\n\
-                    Statistics:\n  States found: 128\n";
-        let header = ty_evidence_header(Path::new("/some/where/ty"));
-        assert!(header.contains("/some/where/ty"), "names the binary");
-        assert!(header.ends_with('\n'), "must not run into the first line");
-        let with = format!("{header}{body}");
-        assert_eq!(
-            ty_states_explored(&with),
-            ty_states_explored(body),
-            "the header must not disturb the state count"
-        );
-        assert_eq!(ty_states_explored(&with), Some(128));
-        // And the dead-action marker still resolves to the same first match.
-        const MARKER: &str = "dead action(s) (never fired): ";
-        let pick = |t: &str| -> Option<String> {
-            t.lines()
-                .find_map(|l| l.find(MARKER).map(|i| l[i + MARKER.len()..].to_string()))
-        };
-        assert_eq!(pick(&with), pick(body));
-        assert_eq!(pick(&with).as_deref(), Some("Alpha, Beta"));
-    }
-
-    #[test]
-    fn a_dead_set_from_a_reduced_run_is_refused_by_the_space_guard() {
-        let m = ring_model();
-        let full = interp::bmc(&interp::with_buggy(&m, 0)).expect("committed config is clean");
-        // The honest transcript passes.
-        assert_ty_saw_whole_space(
-            &m,
-            &format!(
-                "Model checking complete: No errors found (exhaustive).\n\
-                 Statistics:\n  States found: {full}\n"
-            ),
-            "whole-space guard",
-        );
-        // The reduced one — ty's real shape when POR collapses the space — does not.
-        let reduced = std::panic::catch_unwind(|| {
-            assert_ty_saw_whole_space(
-                &m,
-                "POR: 1/1 states reduced (100.0%), 1 actions skipped\n\
-                 Model checking complete: No errors found (exhaustive).\n\
-                 Statistics:\n  States found: 1\n",
-                "whole-space guard",
-            );
-        });
-        assert!(
-            reduced.is_err(),
-            "a dead set measured on a 1-state reduction of a {full}-state model must be refused"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "TIER DISAGREEMENT ON THE EXPLORED SPACE")]
-    fn a_ty_verdict_from_a_smaller_space_is_not_a_proof() {
-        let m = ring_model();
-        assert_same_space_explored(
-            &m,
-            128,
-            "--- ty stdout ---\nModel checking complete: No errors found (exhaustive).\n\
-             Statistics:\n  States found: 1\n",
-            "explored-space regression",
-        );
-    }
-
-    /// The other direction is a failure too, and for a different reason: a `ty`
-    /// count LARGER than the interpreter's means the emitted TLA+ admits states
-    /// the model does not, so the two tiers are not checking the same machine.
-    /// Neither direction may be waved through as "close enough".
-    #[test]
-    #[should_panic(expected = "TIER DISAGREEMENT ON THE EXPLORED SPACE")]
-    fn a_ty_verdict_from_a_larger_space_is_not_a_proof_either() {
-        let m = ring_model();
-        assert_same_space_explored(
-            &m,
-            128,
-            "Statistics:\n  States found: 200\n",
-            "explored-space regression",
-        );
-    }
-
-    /// A clean verdict on an unparseable transcript credits nothing.
-    #[test]
-    #[should_panic(expected = "no evidence it explored anything")]
-    fn a_clean_verdict_without_a_state_count_credits_nothing() {
-        let m = ring_model();
-        assert_same_space_explored(&m, 128, "No errors found.", "explored-space regression");
-    }
-}
+#[path = "verify_tests.rs"]
+mod tests;

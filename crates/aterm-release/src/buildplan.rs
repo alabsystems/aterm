@@ -9,27 +9,22 @@
 //! caveat — plus UUID match), `strip -x` on shipped copies, and the dSYM zip.
 //!
 //! TWO compiler lanes and no third (owner decision, 2026-07): the native aarch64
-//! slice on Trust (the repo's rust-toolchain.toml pin plus .cargo/config.toml's
-//! documented verification opt-out) and the x86_64-apple-darwin compat slice on
+//! slice on Trust (the repo's rust-toolchain.toml pin, built on targo's explicit
+//! `--unverified` lane) and the x86_64-apple-darwin compat slice on
 //! upstream stable. Both architectures build from one read-only source take and one
-//! lock-checksummed, offline dependency bundle; only their compiler differs — which
-//! is why "ONE compiler lane", as this paragraph used to open, described the opposite
-//! of the sentence that followed it. The ONLY toolchain override is
+//! lock-checksummed, offline dependency bundle; only their compiler differs. The ONLY
+//! toolchain override is
 //! `RUSTUP_TOOLCHAIN=stable` on the compat slice, set in `run_cargo` AFTER inherited
 //! RUSTC / RUSTC_BOOTSTRAP / RUSTFLAGS / RUSTUP_TOOLCHAIN are scrubbed on both lanes:
 //! no `RUSTC=…` pin, no RUSTFLAGS surgery, no `--no-trust` flag. The native binary
 //! must still self-report `+t` (see [`run`]).
 //!
-//! The ONE exception: the x86_64-apple-darwin compat slice of the universal
-//! binary rides upstream stable via `RUSTUP_TOOLCHAIN=stable`. STOCK EXCEPTION
-//! (Trust lacks an x86_64-apple-darwin std in the aarch64 sysroot this lane
-//! builds with; measured 2026-09-28 on store build 9192: `targo --unverified
-//! check --target x86_64-apple-darwin -p aterm` → error[E0463] can't find crate
-//! for `std`, and the sysroot's lib/rustlib holds only aarch64-apple-darwin).
-//! This comment used to say Trust "has one"; that is not what the pinned sysroot
-//! measures. Whether a native x86_64-host Trust build could produce the slice
-//! instead was not measured. That pin lives HERE and nowhere else, and the lane
-//! scrubs inherited RUSTC/RUSTFLAGS state so stale shell exports cannot steer it.
+//! The ONE exception: the x86_64-apple-darwin compat slice of the universal binary rides upstream
+//! stable via `RUSTUP_TOOLCHAIN=stable`. STOCK EXCEPTION (Trust lacks an x86_64-apple-darwin std in
+//! the aarch64 sysroot this lane builds with; MEASURED: `targo --unverified check --target
+//! x86_64-apple-darwin -p aterm` → error[E0463] can't find crate for `std`). That pin lives HERE
+//! and nowhere else, and the lane scrubs inherited RUSTC/RUSTFLAGS state so stale shell exports
+//! cannot steer it.
 //!
 //! Preserved semantics:
 //!   * `SOURCE_DATE_EPOCH` inherited by every cargo child so the binary's
@@ -364,8 +359,8 @@ const NOINDEX_TARGET_TWIN: &str = "target.noindex";
 /// verified-product hard link all live beneath it. A link pointing outside this
 /// checkout would aim `remove_dir_all` and the artifact paths wherever the link says.
 /// So the root must be a real directory owned by this uid and not group/other-writable
-/// (`open_release_directory`) — with ONE accepted link shape, measured 2026-09-12 to stop
-/// every cut on a machine running the doctor's Spotlight remedy:
+/// (`open_release_directory`) — with ONE accepted link shape, the one the doctor's
+/// Spotlight remedy makes:
 ///
 /// `<repo>/target -> target.noindex`, where the referent is EXACTLY the twin name
 /// (relative, as `noindex apply` writes it, or the same path spelled absolute), the twin
@@ -386,7 +381,7 @@ fn resolve_release_target_root(repo_root: &Path, expected_uid: u32) -> Result<Pa
     // the umask: a root this lane creates is judged by the guard below, and under
     // the user-private-group default of a Linux host (umask 002) a bare create_dir
     // answers 775 — group-writable — and the lane refused the directory it had
-    // just made (measured on m17-tower, 2026-09-14). A root that already exists is
+    // just made (MEASURED on a Linux host). A root that already exists is
     // judged as found, umask and all.
     let mut builder = std::fs::DirBuilder::new();
     {
@@ -559,11 +554,7 @@ impl SealedCargoTake {
         )?;
         let fingerprint =
             one_output_line(&fingerprint_output, "release source fingerprint")?.to_owned();
-        if fingerprint.len() != 64
-            || !fingerprint
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
+        if !aterm_codec::hex::is_lower(&fingerprint, 64) {
             return Err("release source fingerprint is not canonical SHA-256".into());
         }
         let lease_pid = std::process::id();
@@ -745,8 +736,11 @@ fn cleanup_release_target_residue_with_uid(
             .ok_or("release target residue has a non-UTF-8 name")?;
         let parts = name.split('-').collect::<Vec<_>>();
         let (pid, token) = match parts.as_slice() {
-            [take, pid] if is_lower_hex(take, 64) => (pid.parse::<u32>().ok(), None),
-            [take, pid, token] if is_lower_hex(take, 64) && is_lower_hex(token, 64) => {
+            [take, pid] if aterm_codec::hex::is_lower(take, 64) => (pid.parse::<u32>().ok(), None),
+            [take, pid, token]
+                if aterm_codec::hex::is_lower(take, 64)
+                    && aterm_codec::hex::is_lower(token, 64) =>
+            {
                 (pid.parse::<u32>().ok(), Some(*token))
             }
             _ => continue,
@@ -844,7 +838,7 @@ fn write_release_target_owner(
             .map_err(|error| format!("make release target owner private: {error}"))?;
     }
     write!(file, "version=1\npid={pid}\nstart={start}\ntoken={token}\n")
-        .and_then(|()| file.sync_all())
+        .and_then(|()| crate::durable::sync_all(&file))
         .map_err(|error| format!("persist release target owner: {error}"))?;
     drop(file);
     std::fs::rename(&temporary, &owner)
@@ -855,8 +849,7 @@ fn write_release_target_owner(
         0o600,
         "release target owner",
     )?);
-    File::open(target)
-        .and_then(|directory| directory.sync_all())
+    crate::durable::sync_dir(target)
         .map_err(|error| format!("persist release target owner directory: {error}"))
 }
 
@@ -896,7 +889,7 @@ fn read_release_target_owner(
         .ok_or_else(|| format!("malformed release target owner start: {}", path.display()))?;
     let token = lines[3]
         .strip_prefix("token=")
-        .filter(|value| is_lower_hex(value, 64))
+        .filter(|value| aterm_codec::hex::is_lower(value, 64))
         .ok_or_else(|| format!("malformed release target owner token: {}", path.display()))?;
     Ok((pid, start.to_owned(), token.to_owned()))
 }
@@ -970,13 +963,6 @@ fn process_start_identity(pid: u32) -> Result<Option<String>, String> {
             diagnostic.trim()
         ))
     }
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn fresh_lease_token() -> Result<String, String> {
@@ -1164,10 +1150,7 @@ fn validate_release_rustup_shim_dir(
 /// `tools/artifact_source_fingerprint.py` and `tools/proof_snapshot.py` need a
 /// cargo-COMPATIBLE driver for `metadata` and `config get`: the Trust stage2's `targo`,
 /// in [`crate::gates::trust_stage2_bin`]'s one resolution order and pinned once per
-/// process there, so the proof steps and the build cannot land on two seals. (A
-/// rustup-shim fallback lane stood here until 2026-09-24; the rustup `trust` toolchain
-/// is a candidate in that order now, so the lane was a second route to the same
-/// compiler and was deleted.)
+/// process there, so the proof steps and the build cannot land on two seals.
 #[derive(Debug, PartialEq, Eq)]
 struct ReleaseProofDriver {
     /// Put FIRST on the scripts' PATH, so every bare-name lookup they make (`rustc`
@@ -1177,8 +1160,7 @@ struct ReleaseProofDriver {
     tool_dir: PathBuf,
     /// The `--cargo` argv handed to the scripts. Query commands only, so never
     /// `--unverified`: targo refuses that flag outside a compilation command
-    /// ("`--unverified` is valid only for a Targo compilation command", exit 101 —
-    /// measured 2026-09-18, targo 1.99.0-dev 321aaeda7).
+    /// ("`--unverified` is valid only for a Targo compilation command", exit 101).
     cargo: PathBuf,
 }
 
@@ -1219,8 +1201,8 @@ fn release_proof_python_with(
     home: &std::ffi::OsStr,
     driver: &ReleaseProofDriver,
 ) -> Result<Command, String> {
-    // targo's registry home is `~/.cargo` (measured 2026-09-18: `~/.cargo/registry`
-    // holds the locked crates on a Trust-only Mac, `~/.cargo/bin` is empty).
+    // targo's registry home is `~/.cargo` (MEASURED: `~/.cargo/registry` holds the
+    // locked crates on a Trust-only Mac, `~/.cargo/bin` is empty).
     let cargo_home = std::env::var_os("CARGO_HOME")
         .unwrap_or_else(|| Path::new(home).join(".cargo").into_os_string());
     let path = release_tool_path(&driver.tool_dir)?;
@@ -1255,10 +1237,10 @@ fn release_proof_python_with(
 }
 
 /// Rustup's home for the compat lane: a non-empty `$RUSTUP_HOME`, else
-/// `<home>/.rustup` — atpkg's one rule ([`atpkg::seam::rustup_home_with`]), which
-/// [`crate::gates`] resolves the rustup `trust` entry through as well, and which
-/// `aterm_verify::toolchain::rustup_home` mirrors for the gate (aterm-cli's tests
-/// hold the two to one table). A set-but-empty variable is the default, not a
+/// `<home>/.rustup` — atpkg's one rule ([`atpkg::seam::rustup_home_with`], which
+/// calls `atpkg::toolchain::rustup_home`, the file aterm-verify compiles by
+/// `#[path]` for the gate), which [`crate::gates`] resolves the rustup `trust`
+/// entry through as well. A set-but-empty variable is the default, not a
 /// relative path to refuse.
 fn release_rustup_home(home: &std::ffi::OsStr) -> Result<OsString, String> {
     let value = atpkg::seam::rustup_home_with(
@@ -1363,10 +1345,10 @@ fn publish_verified_binary(
     lease_token: &str,
     expected_uid: u32,
 ) -> Result<PathBuf, String> {
-    if !is_lower_hex(take_identity, 64) {
+    if !aterm_codec::hex::is_lower(take_identity, 64) {
         return Err("release source take identity is not canonical SHA-256".into());
     }
-    if lease_pid == 0 || !is_lower_hex(lease_token, 64) {
+    if lease_pid == 0 || !aterm_codec::hex::is_lower(lease_token, 64) {
         return Err("release product lease identity is malformed".into());
     }
 
@@ -1403,8 +1385,7 @@ fn publish_verified_binary(
             0o500,
             "verified staged release binary",
         )?;
-        staged_file
-            .sync_all()
+        crate::durable::sync_all(&staged_file)
             .map_err(|error| format!("persist verified staged release binary: {error}"))?;
 
         let published = product.join("aterm");
@@ -1433,14 +1414,11 @@ fn publish_verified_binary(
                 return Err("published release binary is not the verified staged inode".to_owned());
             }
         }
-        published_file
-            .sync_all()
+        crate::durable::sync_all(&published_file)
             .map_err(|error| format!("persist published release binary: {error}"))?;
-        File::open(&product)
-            .and_then(|directory| directory.sync_all())
+        crate::durable::sync_dir(&product)
             .map_err(|error| format!("persist release product directory: {error}"))?;
-        File::open(&parent)
-            .and_then(|directory| directory.sync_all())
+        crate::durable::sync_dir(&parent)
             .map_err(|error| format!("persist release product parent: {error}"))?;
         Ok(published)
     })();
@@ -1823,19 +1801,12 @@ const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 
 /// The build driver's `Command`, at UTILITY QoS where macOS has `taskpolicy`.
 ///
-/// WHY (2026-09-15). This is the longest compile anything in this repo
-/// launches — the whole workspace, once per architecture slice, for minutes —
-/// and it started at the DEFAULT scheduling band. That is the band a person's
-/// shell and its programs run in: a `trustc` and the editor being typed into
-/// both read `pri 31` in `ps`, so the cutter's compiles competed with the
-/// foreground program as equals. The verify gate measured the cost on
-/// 2026-09-15 (`aterm_verify::exec::Cmd::demoted`): while its children ran at
-/// the inherited tier, a program's own share of a keystroke — write to first
-/// byte back — stretched to `echo_p95_ms=75.69 echo_p99_ms=150.04
-/// echo_max_ms=367.85` over 499 samples. The gate demoted its compile-only
-/// children then; the cutter's builds were left at the default band. Measured:
-/// under `taskpolicy -c utility` a child reads `pri 20`, against `31`
-/// inherited.
+/// WHY. This is the longest compile anything in this repo launches — the whole
+/// workspace, once per architecture slice, for minutes. At the DEFAULT band
+/// (`pri 31`, the same as the editor being typed into) it competes with the
+/// foreground as an equal: the verify gate MEASURED a keystroke's echo stretching
+/// to p99 150 ms while its compiles ran there (`aterm_verify::exec::Cmd::demoted`).
+/// Under `taskpolicy -c utility` a child reads `pri 20`.
 ///
 /// Utility, not background (`-b`, `pri 4`): background also throttles disk I/O
 /// hard, and a release build is already the longest step of the cut.
@@ -1910,8 +1881,8 @@ fn build_one(
         }
     }
     // The build driver, per lane. Native slice: `targo` from the Trust stage2
-    // tool dir — never a PATH `cargo`, which since the stock-name purge is a
-    // rustup shim the repo's toolchain pin can no longer satisfy. Compat
+    // tool dir — never a PATH `cargo`, a rustup shim the repo's toolchain pin
+    // cannot satisfy. Compat
     // slice: upstream stable's `cargo` via the rustup shim — the ONE stock
     // lane, a STOCK EXCEPTION (the pinned Trust sysroot has no
     // x86_64-apple-darwin std: E0463; see the module docs).
@@ -1987,15 +1958,14 @@ fn build_one(
     cmd.env("CARGO_PROFILE_RELEASE_DEBUG", "1");
     cmd.env("CARGO_PROFILE_RELEASE_STRIP", "false");
 
-    // NO trust anchors are injected into the child build. They used to arrive here
-    // from ~/.aterm/release.conf so `option_env!` could bake them in, which made what
-    // a binary trusts a property of the shell that compiled it. They are committed
-    // constants now (`aterm_update_core::pins`) and the child compiles them in
-    // directly; exporting them would recreate a second, disagreeing source.
+    // NO trust anchors are injected into the child build: they are committed
+    // constants (`aterm_update_core::pins`), and exporting them would make what a
+    // binary trusts a property of the shell that compiled it.
 
     // Lane env. Native slice: NOTHING beyond the driver itself — the resolved
-    // targo supplies trustc and .cargo/config.toml (which targo reads, same
-    // discovery as cargo) the verification opt-out; adding env here would
+    // targo supplies trustc, its `--unverified` lane the verification opt-out,
+    // and .cargo/config.toml (which targo reads, same discovery as cargo) the
+    // Trust-lane cfg; adding env here would
     // create a second, undocumented lane. Compat slice: RUSTUP_TOOLCHAIN=stable
     // overrides the toolchain file (a deliberate stock lane, not a Trust
     // limitation — see the module docs), and inherited
@@ -2087,10 +2057,7 @@ const UPDATE_PIN_SECTION: &[u8] = b"__aterm_upin";
 const UPDATE_PIN_RECORD_LEN: u64 = 64;
 
 fn canonical_sha256(value: &str) -> bool {
-    value.len() == UPDATE_PIN_RECORD_LEN as usize
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    aterm_codec::hex::is_lower(value, UPDATE_PIN_RECORD_LEN as usize)
 }
 
 fn le_u32(bytes: &[u8]) -> u32 {
@@ -2710,7 +2677,9 @@ fn private_x86_64_scratch() -> Result<PathBuf, String> {
 /// appears, one `aterm ctl turn` — the slice's own client, also translated — types
 /// [`X86_64_TURN_TEXT`] and settles on a row reading `x86_64`. `spawn` and `run` are
 /// injected so every refusal is testable without Rosetta. The instance is killed and
-/// reaped on every path.
+/// reaped on every path, and it holds the cutter's LIFELINE (`aterm_uds::lifeline`,
+/// its FIFO in `scratch`): a cut killed before its `Drop` runs — a SIGKILL, a second
+/// Ctrl-C — takes the translated instance and its shell with it (gap #36).
 fn x86_64_slice_drives_a_session(
     universal: &Path,
     scratch: &Path,
@@ -2759,6 +2728,15 @@ fn x86_64_slice_drives_a_session(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     hermetic(&mut instance);
+    // Held until this function returns, and bound BEFORE the `Reap` so it drops
+    // after it: the instance is killed and reaped first, then the lifeline is cut.
+    let _lifeline =
+        aterm_uds::lifeline::Lifeline::arm(&mut instance, scratch).map_err(|error| {
+            format!(
+                "arm the x86_64 slice's lifeline in {}: {error}",
+                scratch.display()
+            )
+        })?;
     let mut instance = Reap(
         spawn(&mut instance)
             .map_err(|error| format!("start the x86_64 slice headless under Rosetta: {error}"))?,
@@ -2999,15 +2977,15 @@ mod tests {
         BuildOutput, LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, PrivateSliceDir,
         RELEASE_PROOF_PYTHON_FLAGS, RELEASE_SYSTEM_PATH, ReleaseProofDriver, SECTION_64_LEN,
         SEGMENT_COMMAND_64_LEN, cargo_build_args, cleanup_release_target_residue_with,
-        create_private_release_directory, current_release_uid, fresh_lease_token, is_lower_hex,
-        make_executable, parse_thin_macho_update_pin, prepare_release_target_parent,
-        publish_verified_binary, publish_verified_symbols, release_build_command,
-        release_proof_driver, release_proof_python_with, release_tool_path,
-        resolve_release_rustup_shim_dir, validate_app_version_reports, validate_cli_app_version,
-        validate_embedded_update_pin, validate_final_slice_records, validate_lipo_architectures,
-        validate_named_cli_app_version, validate_slice_update_pin_reports,
-        write_release_target_owner, x86_64_probe_asset_name, x86_64_probe_transcript,
-        x86_64_slice_drives_a_session, x86_64_slice_runs, x86_64_turn_verdict,
+        create_private_release_directory, current_release_uid, fresh_lease_token, make_executable,
+        parse_thin_macho_update_pin, prepare_release_target_parent, publish_verified_binary,
+        publish_verified_symbols, release_build_command, release_proof_driver,
+        release_proof_python_with, release_tool_path, resolve_release_rustup_shim_dir,
+        validate_app_version_reports, validate_cli_app_version, validate_embedded_update_pin,
+        validate_final_slice_records, validate_lipo_architectures, validate_named_cli_app_version,
+        validate_slice_update_pin_reports, write_release_target_owner, x86_64_probe_asset_name,
+        x86_64_probe_transcript, x86_64_slice_drives_a_session, x86_64_slice_runs,
+        x86_64_turn_verdict,
     };
 
     /// §3.1 of DESIGN-intel-just-works: a universal cut RUNS its x86_64 slice. A builder
@@ -3147,6 +3125,10 @@ mod tests {
             for flag in ["--headless", "--cpu", "--no-reroute"] {
                 assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
             }
+            assert!(
+                args.windows(2).any(|w| w == ["--lifeline-fd", "0"]),
+                "the translated instance holds the cutter's lifeline: {args:?}"
+            );
             let rendered = format!("{command:?}");
             assert!(rendered.contains("env -i "), "{rendered}");
             let sock = &args[args.iter().position(|a| a == "--control-sock").unwrap() + 1];
@@ -3572,7 +3554,7 @@ mod tests {
         );
     }
 
-    /// THE CUTTER NEVER COMPILES A DEVELOPMENT SEAM (2026-09-23). Every
+    /// THE CUTTER NEVER COMPILES A DEVELOPMENT SEAM. Every
     /// `aterm_types::dev_seam!` read — `ATPKG_REGISTRY`, `ATERM_UPDATE_ROOT`, the
     /// handoff deadlines, the `ATERM_DEBUG_*` seams — and every development setting
     /// (`[update]` owner/repo/require_team_id, `[packages]` prefix/account/repo links)
@@ -3702,7 +3684,7 @@ mod tests {
             "the seam feature is declared by every crate that reads a seam; found {forwarders}"
         );
 
-        // DEBUG ASSERTIONS TURN THE SEAMS ON TOO (2026-09-23 review): `dev_seam!` compiles
+        // DEBUG ASSERTIONS TURN THE SEAMS ON TOO: `dev_seam!` compiles
         // under `cfg(any(debug_assertions, feature = "dev-seams"))`, so a
         // `debug-assertions = true` in the release profile — added for overflow checks,
         // say — or a `-C debug-assertions` / `--cfg feature="dev-seams"` in the config the
@@ -3778,8 +3760,8 @@ mod tests {
     fn release_take_tokens_are_unique_canonical_hex() {
         let first = fresh_lease_token().unwrap();
         let second = fresh_lease_token().unwrap();
-        assert!(is_lower_hex(&first, 64));
-        assert!(is_lower_hex(&second, 64));
+        assert!(aterm_codec::hex::is_lower(&first, 64));
+        assert!(aterm_codec::hex::is_lower(&second, 64));
         assert_ne!(first, second);
     }
 

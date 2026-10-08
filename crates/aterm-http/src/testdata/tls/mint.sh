@@ -7,10 +7,9 @@
 #
 # Requires OpenSSL 3.x for `-not_before`/`-not_after` (used to mint certificates
 # whose validity window is in the past or the future). /usr/bin/openssl on macOS
-# is LibreSSL 3.3.6 and has NEITHER flag, so it CANNOT mint this corpus; on m21
-# the working binary is /opt/homebrew/bin/openssl (3.6.3).
+# is LibreSSL and has NEITHER flag; use Homebrew's /opt/homebrew/bin/openssl.
 #
-# TWO RULES THIS CORPUS MUST KEEP, both learned the hard way:
+# TWO RULES THIS CORPUS MUST KEEP:
 #
 #  1. NO leaf may exceed ~398 days of validity. Apple rejects a longer-lived TLS
 #     server certificate outright (errSecCertificateValidityPeriodTooLong,
@@ -99,7 +98,7 @@ printf '\x30\x82\x00\x05\xde\xad\xbe\xef\x00' > malformed.der
 
 rm -f *.pem *.csr *.ext *.key
 
-# --- the captured real chains (gh-*.der, cl-*.der) --------------------------
+# --- the captured real chain (gh-*.der) ---------------------------------------
 # NOT minted here. Captured ONCE, on 2026-08-29, with the single command below,
 # then split into the three DERs. It is the ONLY fixture whose acceptance
 # depends on the machine's real system trust store, and the only reason the
@@ -110,15 +109,3 @@ rm -f *.pem *.csr *.ext *.key
 #     </dev/null > gh.txt   # then DER-encode each PEM block in order
 # github.com is the deliberate choice: `aterm-update-core` fetches from
 # github.com / api.github.com, so this control tracks a host aterm really uses.
-#
-# There is a SECOND capture, cl-*.der, taken the same day and the same way from
-# downloads.claude.ai (allow-listed at crates/atpkg/src/vendor.rs:59):
-#   openssl s_client -connect downloads.claude.ai:443 \
-#     -servername downloads.claude.ai -showcerts </dev/null > cl.txt
-# Its anchor is Google Trust Services' GTS Root R1 (RSA, cross-signed by
-# GlobalSign Root CA) rather than Sectigo's ECC root, and that independence is
-# the entire point: these two chains are the ONLY inputs in the whole corpus a
-# real system anchor validates, so they are the only thing that can catch a
-# verifier which rejects everything. One root leaving the platform trust store
-# must not be able to disarm the suite. See README.md for the recapture
-# procedure and what to do about the pinned instant afterwards.

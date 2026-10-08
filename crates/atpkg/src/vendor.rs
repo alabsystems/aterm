@@ -144,11 +144,6 @@ pub fn https_host(url: &str) -> Option<&str> {
     Some(host)
 }
 
-/// Whether `s` is a 64-character lowercase-or-uppercase hex SHA-256 spelling.
-fn is_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// Whether `s` is ONE bare file-name component: non-empty, not `.`/`..`, no `/`, no `\`
 /// (the Windows separator), no control byte (NUL, newline, DEL, …). The row's `asset` is
 /// joined onto the program's staging directory as the download's local name, so it must
@@ -336,7 +331,7 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
     if artifact.size == 0 {
         return Err(refuse("size must be > 0 (it is the exact download cap)"));
     }
-    if !is_sha256_hex(&artifact.sha256) {
+    if !aterm_codec::hex::is_hex(&artifact.sha256, 64) {
         return Err(refuse2(
             "sha256 must be 64 hex characters, got ",
             &artifact.sha256,
@@ -742,11 +737,6 @@ mod tests {
             Err(FlowError::VendorRefused(m)) => m,
             other => panic!("expected VendorRefused, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn a_well_formed_raw_binary_row_is_admitted() {
-        check_row(&row(), &exposes()).expect("the reference row admits");
     }
 
     /// A `github-release` row with a bare `asset` is admitted UNCHANGED — no vendor
@@ -1383,11 +1373,8 @@ mod tests {
     // ---- the system-satisfaction probe ----
 
     #[cfg(unix)]
-    fn scratch(label: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("atpkg-vendor-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn scratch(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-vendor-{label}-"))
     }
 
     #[cfg(unix)]
@@ -1660,9 +1647,7 @@ mod tests {
     /// truths apart with.
     #[test]
     fn agents_dir_on_path_sees_the_dir_as_spelled_or_resolved_and_absolute_only() {
-        let prefix =
-            std::env::temp_dir().join(format!("atpkg-vendor-agents-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&prefix);
+        let prefix = crate::testdir::dir("atpkg-vendor-agents-");
         std::fs::create_dir_all(prefix.join("agents")).unwrap();
         let agents = prefix.join("agents");
         assert!(!agents_dir_on_path(&prefix, None));

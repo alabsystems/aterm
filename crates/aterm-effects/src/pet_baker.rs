@@ -1,297 +1,184 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The rainbow-kitty **pet**'s bake path: one authored full-body pose glyph
-//! ([`crate::pet_glyphs_gen::PET_GLYPHS`]) rasterized into one EXACT-SIZE
+//! The rainbow-kitty pet's bake path: one authored full-body pose glyph
+//! ([`crate::pet_glyphs_gen::PET_GLYPHS`]) rasterized into one exact-size
 //! straight-alpha RGBA8 tile, cached in a small LRU, and handed to the shared
 //! cat atlas through
 //! [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
 //!
-//! This is the decision twin of the cat path in [`crate::cat_baker`] — same
-//! rasterizer ([`fill_path_fixed`]), same fill resolution ([`resolve_layer`]
-//! over [`ResolvedFills`]), same structural budgets — with exactly three
-//! deliberate differences, all of which delete work rather than add it:
+//! It mirrors the cat path in [`crate::cat_baker`] (same rasterizer
+//! [`fill_path_fixed`], same fill resolution [`resolve_layer`] over
+//! [`ResolvedFills`], same structural budgets) with three differences:
 //!
-//! * **No patch strip.** A cat tile is baked `w + PATCH_STRIP` texels wide so
-//!   the live gaze stage has somewhere to sample a pupil + catch-light from
-//!   while the body quad samples only `[0, w)`. The pet has **no live gaze
-//!   quads**: its eyes are authored into each pose (a crouch stares at the
-//!   landing, a groom shuts them, a startle blows them wide), so the reserved
-//!   strip would be four columns of transparent texels carried through every
-//!   blit, every atlas upload, and every LRU byte budget for nothing. A pet
-//!   tile is therefore exactly `w · h · 4` bytes with the art filling all of
-//!   it — which is also precisely the shape `host_tile` wants.
-//! * **No [`EyesFrame`](crate::cat_baker::EyesFrame) axis.** The cat's blink /
-//!   squint is a bake-time squash of the eye family toward a shared eye line,
-//!   because ONE authored head has to cover every mood. The pet roster instead
-//!   *authors* its eye state per pose — the pose IS the expression — so an
-//!   `eyes` key axis would multiply the cache by three while every one of those
-//!   tiles fought the pose's own authored intent (a squashed startle is not a
-//!   blink, it is a broken startle). Blinking is a POSE choice made upstream in
-//!   [`crate::kitty_pet`], not a bake parameter here.
-//! * **A size-aware face LOD.** The cat bakes at reveal/gallery sizes where
-//!   the whole authored face survives; the pet ships at a couple of text rows,
-//!   where it measurably does not. Below [`FACE_DETAIL_MIN_H`] the bake culls
-//!   the sub-pixel charm ink (whiskers, the authored catch-light, blush, tabby
-//!   pattern) and collapses the eye stack to one strong dot per eye. Open eyes
-//!   then get a size-aware glossy reflection painted into that dot: a bright
-//!   upper glint, plus a tiny lower echo only when the footprint can afford it.
-//!   This keeps the eyes dark and legible without making the shipping pet look
-//!   flat; below
-//!   [`MOUTH_DETAIL_MIN_H`] the mouth goes too. Size is already a cache-key
-//!   axis (`w`/`h`), so LOD needs no new key — one size never serves another
-//!   size's tile. See the LOD const block for the design-review numbers.
+//! * No patch strip. Cat tiles carry `PATCH_STRIP` extra columns for the live
+//!   gaze stage; the pet has no live gaze quads (its eyes are authored per
+//!   pose), so a pet tile is exactly `w · h · 4` bytes, the shape `host_tile`
+//!   wants.
+//! * No [`EyesFrame`](crate::cat_baker::EyesFrame) axis. The pose is the
+//!   expression, eyes included; blinking is a pose choice in
+//!   [`crate::kitty_pet`], not a bake parameter.
+//! * A size-aware face LOD. The pet ships at a couple of text rows, where the
+//!   full authored face does not survive. Below [`FACE_DETAIL_MIN_H`] the bake
+//!   culls sub-pixel charm ink (whiskers, authored catch-light, blush, tabby
+//!   pattern) and collapses each eye to one strong dot; open eyes then get a
+//!   size-aware glossy reflection. Below [`MOUTH_DETAIL_MIN_H`] the mouth goes
+//!   too. Size is already a cache-key axis, so LOD needs no new key.
 //!
-//! ## Budgets (all structural, none assumed)
+//! ## Budgets
 //!
-//! * [`MAX_SLOTS`] resident tiles — reused verbatim from the cat baker. The pet
-//!   roster is ~2 dozen poses and only ONE identity (coat/iris) and ONE size are
-//!   live at a time, so 32 slots hold a whole gait cycle plus its idle and
-//!   startle branches without ever thrashing.
-//! * [`MAX_ATLAS_BYTES`] of resident texels — the same 2 MiB ceiling the cat
-//!   atlas is sized against, applied here as a *residency* bound so a large cell
-//!   metric cannot turn 32 slots into 32 huge tiles. Whichever of the two bounds
-//!   binds first wins; a single tile larger than the whole budget is refused
-//!   outright rather than draining the cache to admit it.
-//! * [`MAX_BAKES_PER_FRAME`] cold bakes per presented frame. A pet that just
-//!   changed gait fills its new frames over a few ticks; the caller simply
-//!   re-draws its last resolved pose until the tile lands (the same tolerance
-//!   the cat entrance has).
-//! * A wholesale [`PetBaker::clear`] on cell-metric change. The pixel size is
-//!   already IN the key, so a stale tile can never be *mis-sampled* — but it
-//!   would occupy a slot no live key can ever hit again, so it is dropped
-//!   eagerly rather than waiting to age out.
+//! * [`MAX_SLOTS`] resident tiles (the cat baker's value). The roster is about
+//!   two dozen poses with one identity and one size live at a time, so 32
+//!   slots hold a gait cycle plus its idle and startle branches.
+//! * [`MAX_ATLAS_BYTES`] of resident texels (2 MiB), so a large cell metric
+//!   cannot turn 32 slots into 32 huge tiles. A single tile larger than the
+//!   whole budget is refused outright.
+//! * [`MAX_BAKES_PER_FRAME`] cold bakes per presented frame; the caller keeps
+//!   drawing its last resolved pose until the new tile lands.
+//! * [`PetBaker::clear`] on a cell-metric change: pixel size is in the key, so
+//!   stale tiles cannot be mis-sampled, but they would occupy dead slots.
 
 use aterm_scene::vector::{FIXED_ONE, PathSeg};
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
 use crate::cat_baker::{
     CatColorKey, MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS, ResolvedFills,
-    paint_dark_masked_disc, resolve_layer,
+    paint_dark_masked_disc, paint_outline_halo, path_bounds, resolve_layer,
 };
 use crate::cat_glyphs_gen::{GlyphRole, Layer};
 use crate::pet_glyphs_gen::{PET_GLYPHS, PetGlyphId};
 
-// ── Size-aware face LOD (design-review #4, resolution C1's second half) ─────
+// ── Size-aware face LOD ─────────────────────────────────────────────────────
 //
-// The chibi rig pass grew the AUTHORED face; these thresholds make the BAKE
-// stop painting detail the canvas cannot hold. At ship size (cell_h 14 ⇒ a
-// ~40×24 px tile at 1×, ~59×36 at 1.5× HiDPI) a whisker, the AUTHORED
-// catch-light, a blush oval, a tabby stripe or the iris ring each cover well
-// under one device pixel, and the 4×4-supersampled filler dutifully AVERAGES
-// them into whatever they cross. The review measured what that does to the face's one
-// load-bearing feature: a single-pixel eye of rgb(144,144,135) on a
-// rgb(223,199,132) coat — the eye grayed out of existence by its own charm.
-// Below these heights the face is drawn FOR the size: the authored charm stack
-// is culled and the eye collapses to a strong dot of the authored eye ink. A
-// new reflection is then built in DEVICE pixels inside each open dot, after
-// growth: it is large enough to survive the rasterizer, clipped by construction
-// to the eye footprint, and never added to a happy/closed lid.
+// At ship size (cell_h 14 ⇒ a ~40×24 px tile at 1×, ~59×36 at 1.5×) a
+// whisker, the authored catch-light, a blush oval, a tabby stripe or the iris
+// ring each cover well under one device pixel, and 4×4 supersampling averages
+// them into the eye, greying it out. Below these heights the face is drawn for
+// the size: the charm stack is culled and each eye collapses to a strong dot of
+// the eye ink. A reflection is then built in device pixels inside each open
+// dot, clipped to the eye and never added to a happy or closed lid.
 //
-// Both thresholds are tile HEIGHTS in px — the axis the emitter derives from
-// `cell_h`, and (the roster sharing one viewbox) the axis every facial
-// feature's device coverage is proportional to.
+// Both thresholds are tile heights in px, the axis every facial feature's
+// device coverage is proportional to.
 
 /// Tile heights below this bake the LOD face; from here up the full authored
-/// face returns, because its finest strokes finally clear a device pixel. The
-/// review bracketed the crossover at 56–64 px; it is pinned at the LOW end so
-/// the first tile granted the full drawing is one that can actually afford
-/// it, while a 2× HiDPI tile at the common cell_h 14 (h = 48) still gets the
-/// LOD it visibly needs.
+/// face returns, because its finest strokes clear a device pixel. Set at the
+/// low end of the 56–64 px crossover, so a 2× tile at cell_h 14 (h = 48)
+/// still gets the LOD.
 pub const FACE_DETAIL_MIN_H: u32 = 56;
 
-/// Below this tile height the mouth is dropped. The review allowed either
-/// "drop" or "thicken ~1.8× if kept", and keeping it was tried first: the
-/// authored W-smile hangs exactly between and below the grown eye dots, in the
-/// SAME dark ink, so at 24–36 px the thickened stroke bridges the pair and the
-/// whole lower face fuses into one mask (walk/sit), while the purr's smile
-/// smudges over its happy arcs. Dropped, the LOD face keeps the chibi grammar
-/// that survives these sizes — two dark eyes, pink nose, pale muzzle — and the
-/// mouth returns with the rest of the fine strokes as soon as the canvas can
-/// carry it as a STROKE rather than a bridge.
+/// Below this tile height the mouth is dropped. A thickened mouth in the same
+/// dark ink bridges the grown eye dots at 24–36 px and fuses the lower face
+/// into a mask; without it the LOD face keeps two dark eyes, pink nose and pale
+/// muzzle. The mouth returns once it can be a stroke rather than a bridge.
 pub const MOUTH_DETAIL_MIN_H: u32 = 40;
 
-/// The vertical size, in DEVICE pixels, a collapsed OPEN eye dot grows
-/// toward — the legibility floor, not an aesthetic size.
+/// The vertical size, in device pixels, a collapsed open eye dot grows toward:
+/// a legibility floor, not an aesthetic size.
 ///
-/// This constant is where the owner's "the kitty eyes are too big" bug
-/// lived. The first size-aware law aimed every dot at 7 px — the number
-/// that made the purr's thin arc pass the dark-core bar at the 36 px
-/// acceptance bake — and open eyes rode the same target. On a 1× Linux
-/// desktop the default cell (cell_h 14) bakes the pet 24 px tall, where the
-/// authored open eye is 3.0 px — 12.4% of body height — and the 7 px target
-/// drove it to the 2.2× ceiling: a 6.5 px dot, 27% of the body, twice the
-/// artist's proportion. Every Retina mac dodged the bug by geometry (its 2×
-/// device-pixel bake lands at h ≈ 72, above [`FACE_DETAIL_MIN_H`], where no
-/// LOD runs at all), so the inflated face WAS the everyday kitty precisely
-/// and only on 1× displays.
-///
-/// The corrected law grows an open eye only far enough to HOST its
-/// guaranteed dark core: [`EYE_DASH_CORE_PX`] (3.4 px — two full rows and
-/// columns at every raster phase) plus headroom for the authored curve to
-/// peek around the plug. At the Linux default bake the eye lands at 4 px —
-/// 16.7% of body height against the authored 12.4% — and from h ≈ 28 up the
-/// authored eye already clears the target and the growth is IDENTITY: a 36
-/// or 48 px bake now paints the open eyes exactly as drawn. Measured on the
-/// probe sweep (stand/sit/walk rosters, both grounds): before, 27% of body
-/// height at h = 24 and 19.4% at h = 36; after, 16.7% and the authored
-/// 12.3–12.4%.
+/// An open eye grows only far enough to host its guaranteed dark core
+/// ([`EYE_DASH_CORE_PX`], 3.4 px) plus a little headroom for the authored curve.
+/// At the 1× default bake (h = 24) the eye lands at 4 px, 16.7% of body height
+/// against the authored 12.4%; from h ≈ 28 the authored eye already clears the
+/// target and growth is the identity.
 pub const EYE_DOT_TARGET_H_PX: f32 = 4.0;
 
-/// The vertical target for SHALLOW eye subpaths — the happy arcs and closed
-/// lids. Deliberately EQUAL to [`EYE_DASH_CORE_PX`]: an arc is a thin band
-/// whose dark rows the raster grid rations, and the band needs to grow
-/// exactly until the guaranteed core plug fits inside it — any further and
-/// the lid stops reading as a lid. The old 7 px target pushed every arc to
-/// its 2.8× ceiling at every LOD size, painting the purr's 2.0 px squint
-/// 5.7 px tall at a 36 px bake; at this target the same squint carries 3.4 px
-/// — two guaranteed dark rows with the chevron's wings still showing — and
-/// the sleeping faces keep their lids readable as LIDS, clearly shorter than
-/// the 4 px open dot beside a purr's smile.
+/// The vertical target for shallow eye subpaths (happy arcs, closed lids),
+/// equal to [`EYE_DASH_CORE_PX`]: an arc is a thin band that grows only until
+/// the guaranteed core fits inside it; further and the lid stops reading as a
+/// lid. Lids stay shorter than the 4 px open dot.
 pub const EYE_DOT_TARGET_H_PX_ARC: f32 = 3.4;
 
-/// Ceiling on a shallow subpath's HORIZONTAL growth. The old law grew arcs
-/// uniformly, and the width is where the sunglasses came from: at the 2.8×
-/// vertical ceiling the purr's pair painted 9.3 + 8.2 px of dark band across
-/// a 24 px cat — the whole muzzle top fused into one mask, and the sleeper
-/// "wearing sunglasses" was the owner-visible symptom. An arc's WIDTH already
-/// carries its expression at the authored proportion (13.8% of body width,
-/// the widest feature on the face); what rasterization starves is only its
-/// interior rows, which the vertical target and the core plug restore. 1.6×
-/// is enough spare width that the plug plus wings read as one dash while the
-/// dash stays clearly WIDER than the open dot it must never be confused with
-/// (a lid that reads as an open eye is a sleeping cat that reads awake — the
-/// `sleep_0` bug of the first LOD pass).
+/// Ceiling on a shallow subpath's horizontal growth. An arc's width already
+/// carries its expression at the authored proportion; rasterization starves
+/// only its interior rows, which the vertical target and core plug restore.
+/// Growing width too fuses a pair into a sunglasses band. 1.6× keeps the dash
+/// clearly wider than an open dot (a lid that reads as an open eye makes a
+/// sleeping cat look awake).
 pub const EYE_DOT_ARC_KX_MAX: f32 = 1.6;
 
-/// Ceiling on the size-aware growth of an open eye. With the target at
-/// [`EYE_DOT_TARGET_H_PX`] this only binds below h ≈ 15 — cells no live
-/// metric produces — but it stays: uncapped, a degenerate 1 px feature would
-/// grow 4× and paint an eye the size of the muzzle, so the LOD accepts a
-/// sub-bar core at absurd sizes rather than inventing a new face.
+/// Ceiling on an open eye's growth. With the target at [`EYE_DOT_TARGET_H_PX`]
+/// it only binds below h ≈ 15, but keeps a degenerate 1 px feature from
+/// growing into an eye the size of the muzzle.
 pub const EYE_DOT_SCALE_MAX: f32 = 2.2;
 
-/// The growth ceiling for SHALLOW eye subpaths. A round eye is solid ink, so
-/// growth only widens an already-solid core; an arc is a thin BAND, and what
-/// survives rasterization is the band's interior rows — the roster's 1.2 px
-/// arcs at the Linux-default 24 px bake need 2.8× to reach the
-/// [`EYE_DOT_TARGET_H_PX_ARC`] band, where a round eye never needs more than
-/// ~1.5×. Growth alone cannot make the band's dark rows a guarantee, though:
-/// the chevron's wings SLOPE, so away from the centre column the
-/// fully-covered rows thin out and a 2×2 core stays phase-dependent at any
-/// sane ceiling — which is what [`EYE_DASH_CORE_PX`] is for.
+/// Growth ceiling for shallow eye subpaths. An arc is a thin band whose
+/// interior rows are what survive rasterization, and the roster's 1.2 px arcs
+/// at the 24 px bake need 2.8× to reach [`EYE_DOT_TARGET_H_PX_ARC`] (a round eye
+/// never needs more than ~1.5×). The chevron's wings slope, so growth alone
+/// cannot guarantee a 2×2 core; that is [`EYE_DASH_CORE_PX`]'s job.
 pub const EYE_DOT_SCALE_MAX_SHALLOW: f32 = 2.8;
 
-/// Side, in device pixels, of the solid CORE PLUG every LOD eye gets: a
-/// small square of the eye ink filled at the subpath's centre, clamped to
-/// the grown dot's own footprint. 3.4 px covers two full pixel rows and two
-/// full columns at every sub-pixel phase (2 px for the bar, plus one
-/// boundary crossing, plus anti-aliasing slack).
-///
-/// Originally the plug patched only the shallow arcs and the compressed far
-/// cores, because the open eyes' 7 px growth target made their cores huge by
-/// brute force. With open growth pulled back to the authored proportion
-/// (see [`EYE_DOT_TARGET_H_PX`]) the plug is the guarantee for EVERY eye:
-/// a 4 px solid ellipse's fully-covered pixels are phase-dependent, a 3.4 px
-/// solid square's are not. Inside a 4 px round dot the square's corners poke
-/// ~0.3 px past the curve — under half an anti-aliased pixel, invisible —
-/// and inside anything larger it vanishes entirely. Two clamps keep it
-/// honest: the footprint clamp (the plug may not exceed the grown dot, so a
-/// degenerate size gets a sub-bar core rather than a square eye) and the
-/// pair-daylight clamp (the plug may not close the [`EYE_DOT_GAP_PX`] gap
-/// its own ellipse was throttled to keep — plugs painted at authored centres
-/// would otherwise fuse exactly the close-set pairs the guard exists for).
+/// Side, in device pixels, of the solid core plug every LOD eye gets: a square
+/// of eye ink at the subpath's centre, clamped to the grown dot's footprint.
+/// 3.4 px covers two full rows and columns at every sub-pixel phase (2 px plus
+/// one boundary crossing plus anti-aliasing slack), where a 4 px ellipse's
+/// fully covered pixels depend on phase. Inside a 4 px round dot the square's
+/// corners poke ~0.3 px past the curve (invisible); in anything larger it
+/// vanishes. Clamped to the grown dot (a degenerate size gets a sub-bar core,
+/// not a square eye) and to the pair daylight ([`EYE_DOT_GAP_PX`]), so plugs
+/// at authored centres cannot fuse close-set pairs.
 pub const EYE_DASH_CORE_PX: f32 = 3.4;
 
-/// Aspect (bbox height ÷ width, measured in DEVICE pixels — the frame where
-/// the artist's proportions hold; see the shallowness note in
-/// [`paint_eye_dots`]) below which an eye subpath counts as shallow: the
-/// roster's arcs and lids sit at 0.38–0.52, the open/wide ellipses at
-/// 0.95–1.25 — 0.6 splits the populations with margin on both sides.
+/// Aspect (bbox height ÷ width, in device pixels, where the artist's
+/// proportions hold; see [`paint_eye_dots`]) below which an eye subpath is
+/// shallow: arcs and lids sit at 0.38–0.52, open/wide ellipses at 0.95–1.25.
 pub const EYE_DOT_SHALLOW_ASPECT: f32 = 0.6;
 
-/// The 3/4 far-eye's LOD fate — COMPRESSED, not culled: below
-/// [`FACE_DETAIL_MIN_H`], an eye subpath authored narrower than this fraction
-/// of its widest sibling is painted as a compressed core (vertically full,
-/// horizontally held near its authored foreshortened width and floored at
-/// [`EYE_DOT_FAR_CORE_MIN_W_FRAC`]) instead of being grown like the near eye.
+/// The 3/4 far eye's LOD treatment: below [`FACE_DETAIL_MIN_H`], an eye
+/// subpath authored narrower than this fraction of its widest sibling is
+/// painted as a compressed core (full vertical growth, width held near its
+/// authored foreshortened width and floored at
+/// [`EYE_DOT_FAR_CORE_MIN_W_FRAC`]) rather than grown like the near eye.
 ///
-/// The first LOD pass CULLED these eyes outright, on the theory that one dot
-/// plus the yaw's offset muzzle is how a turned head reads at sprite size.
-/// The owner ruled on the shipped pixels: it reads as a ONE-EYED cat —
-/// "that's not cute that's creepy" — so every pose that authors two eyes now
-/// renders two eye cores at every size. The compression is what the cull was
-/// actually protecting against: growing BOTH eyes toward the device target
-/// left two near-equal dark dots a device pixel apart, and the pair read as
-/// one ink smear. A full near dot beside a deliberately narrow far core keeps
-/// the turned-head asymmetry without deleting the second eye.
+/// Every pose that authors two eyes renders two (a one-eyed cat is not the
+/// intent). Growing both eyes fully would leave two near-equal dots a pixel
+/// apart that read as one smear; a full near dot beside a narrow far core
+/// keeps the turned-head asymmetry.
 ///
-/// Keyed on the AUTHORED width ratio. The roster's populations: the
-/// frontal/rest pairs at 0.88–1.0 (grown whole), the full-yaw locomotion
-/// pairs at 0.62 and the peek's deep-3/4 pair at 0.67 (compressed). 0.70
-/// splits the populations with ~0.03 of margin below and ~0.18 above — never
-/// a quantization coin flip (authored ratios quantize within ~0.002).
+/// Keyed on the authored width ratio: frontal/rest pairs sit at 0.88–1.0,
+/// full-yaw locomotion pairs at 0.62, the peek's deep-3/4 pair at 0.67. 0.70
+/// splits them with margin (authored ratios quantize within ~0.002).
 pub const EYE_DOT_FAR_COMPRESS_RATIO: f32 = 0.70;
 
-/// The only ratio that still culls: an eye subpath authored narrower than
-/// this fraction of its widest sibling is treated as GENUINELY OCCLUDED — a
-/// sliver the rig leaves while an eye passes behind the head's profile — and
-/// paints nothing at LOD sizes. Deliberately far below every live ratio (the
-/// roster's minimum is 0.62, see the populations above): no shipped pose
-/// loses an eye to this gate, and per the owner's one-eyed-is-creepy ruling
-/// none may. It exists so future art CAN author a true behind-the-profile
-/// pass without the baker inventing a floating dot for the leftover sliver.
+/// The only ratio that culls: an eye subpath narrower than this fraction of
+/// its widest sibling is treated as occluded (a sliver while the eye passes
+/// behind the head's profile) and paints nothing at LOD sizes. Far below every
+/// live ratio (minimum 0.62), so no shipped pose loses an eye; it lets future
+/// art author a behind-the-profile pass without a floating dot.
 pub const EYE_DOT_FAR_OCCLUDED_RATIO: f32 = 0.40;
 
-/// Width floor for the compressed far-eye core, as a fraction of the tile
-/// HEIGHT (the axis every facial feature's device coverage is proportional
-/// to): 2 device px at the 1× ship tile (cell_h 14 ⇒ h = 24), scaling with
-/// the DPR so every HiDPI rendering of the same cell keeps the same face. At
-/// the 36 px acceptance size it floors the painted core at 3 px — the width
-/// at which the core's [`EYE_DASH_CORE_PX`]-style plug always spans two full
-/// pixel columns (⌊x+3⌋−⌈x⌉ ≥ 2 at every sub-pixel phase), which is what
-/// makes the far eye's ≥2×2 dark-core bar a GUARANTEE rather than a bet on
-/// where the head lands on the pixel grid. The floor may exceed what the
-/// [`EYE_DOT_GAP_PX`] daylight guard would allow, which is why the compressed
-/// core grows about its INNER edge, away from the near eye (see
-/// [`paint_eye_dots`]) — the floor and the daylight guarantee never fight.
+/// Width floor for the compressed far-eye core, as a fraction of tile height:
+/// 2 device px at the 1× ship tile (h = 24), scaling with DPR. At 36 px it
+/// floors the core at 3 px, the width at which its plug spans two full pixel
+/// columns at every phase, so the far eye's ≥2×2 dark core is guaranteed. The
+/// floor may exceed what the [`EYE_DOT_GAP_PX`] guard allows, so the compressed
+/// core grows about its inner edge, away from the near eye (see
+/// [`paint_eye_dots`]).
 pub const EYE_DOT_FAR_CORE_MIN_W_FRAC: f32 = 2.0 / 24.0;
 
-/// Horizontal daylight, in DEVICE pixels, an eye dot must keep from each
-/// sibling dot. The chibi pass authored the pair nearly touching (≈6.5 art
-/// units — barely one device pixel at ship size), so unguarded growth would
-/// fuse the eyes into one dark mask: strictly worse than the gray it
-/// replaces, two eyes that read as none. Device pixels rather than a frame
-/// fraction because fusion is a raster phenomenon — the same authored gap is
-/// generous at 96 px and gone at 40.
+/// Horizontal daylight, in device pixels, each eye dot keeps from its
+/// siblings. The chibi pair is authored nearly touching (about one device pixel
+/// at ship size), so unguarded growth would fuse the eyes into one mask.
+/// Device pixels because fusion is a raster effect.
 ///
-/// The guard cuts BELOW authored width when it must. At the Linux-default
-/// 24 px bake the frontal pairs' authored gap is itself sub-pixel (0.9 px),
-/// so even zero growth leaves the pair bridged by each other's anti-aliasing
-/// — daylight outranks authored width there, and each dot narrows a little
-/// (floored at [`EYE_DOT_FAR_CORE_MIN_W_FRAC`], so an eye can thin but never
-/// thin AWAY) until the full gap opens. Two slightly-narrow eyes with a
-/// clear coat column between them read as a face; two authored-width eyes
-/// sharing one smudged bridge pixel read as a mask.
+/// The guard may cut below authored width: at the 24 px bake the frontal
+/// pairs' authored gap is sub-pixel, so each dot narrows a little (floored at
+/// [`EYE_DOT_FAR_CORE_MIN_W_FRAC`]) until the gap opens. Two slightly narrow
+/// eyes with coat between them read as a face; two sharing a smudged bridge
+/// pixel read as a mask.
 pub const EYE_DOT_GAP_PX: f32 = 1.3;
 
-/// Ceiling on how far an OPEN eye's painted height may outrun its painted
-/// width — grown h ≤ this × grown w. The daylight guard narrows a close-set
-/// pair while the vertical target still wants its device pixels, and without
-/// a coupling the Linux-default frontal faces painted 2.3 × 4.0 px eyes:
-/// tall bars, the startled-mask look again by another route. An open eye is
-/// authored round (bbox aspects 0.95–1.25); this cap lets rasterization win
-/// a little height (a 2-wide dot may still be 2.8 tall) but keeps the dot
-/// recognizably a DOT, trading guaranteed-core rows for roundness only where
-/// the daylight guard has already judged width the scarcer resource. Arcs
-/// and compressed far cores are exempt: their whole point is a non-round
-/// aspect.
+/// Ceiling on an open eye's painted height over its painted width. When the
+/// daylight guard narrows a close-set pair, height follows width down, so the
+/// dot stays round (authored aspects 0.95–1.25) rather than becoming a tall
+/// bar; a 2-wide dot may still be 2.8 tall. Arcs and compressed far cores are
+/// exempt.
 pub const EYE_DOT_ROUND_ASPECT_MAX: f32 = 1.4;
 
-/// Smallest grown open-eye diameter that can carry a reflection without the
-/// reflection becoming the eye. At the 34–36 px shipping bake the compressed
-/// far eye is about 3 px wide and clears this floor; truly tiny 1× footprints
-/// keep the strong dark dot instead of receiving a gray anti-aliased speck.
+/// Smallest grown open-eye diameter that carries a reflection. The compressed
+/// far eye at the 34–36 px bake (~3 px) clears it; tiny 1× footprints keep the
+/// plain dark dot.
 pub const EYE_REFLECTION_MIN_PX: f32 = 2.4;
 
 /// Primary glossy catch-light radius as a fraction of the grown eye's smaller
@@ -309,36 +196,6 @@ pub const EYE_REFLECTION_ECHO_FRAC: f32 = 0.08;
 pub const EYE_REFLECTION_ECHO_MIN_RADIUS_PX: f32 = 0.35;
 pub const EYE_REFLECTION_ECHO_MAX_RADIUS_PX: f32 = 0.52;
 
-/// Bounding box of one fixed-point subpath in the glyph's normalized 0..1
-/// frame, `(x0, y0, x1, y1)` — control points included, the same generous
-/// reading the cat baker's eye-line probe uses (a Bézier never escapes its
-/// control hull, so the box can only err wide, never lie small). `None` for a
-/// subpath with no coordinates.
-fn subpath_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
-    let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0u16, 0u16);
-    let mut seen = false;
-    let mut take = |x: u16, y: u16| {
-        x0 = x0.min(x);
-        y0 = y0.min(y);
-        x1 = x1.max(x);
-        y1 = y1.max(y);
-        seen = true;
-    };
-    for seg in path {
-        match *seg {
-            PathSeg::Move(x, y) | PathSeg::Line(x, y) => take(x, y),
-            PathSeg::Cubic(ax, ay, bx, by, x, y) => {
-                take(ax, ay);
-                take(bx, by);
-                take(x, y);
-            }
-            PathSeg::Close => {}
-        }
-    }
-    let norm = |v: u16| f32::from(v) / f32::from(FIXED_ONE);
-    seen.then(|| (norm(x0), norm(y0), norm(x1), norm(y1)))
-}
-
 /// `xform` with an extra `(kx, ky)` zoom about the normalized-frame point
 /// `(cx, cy)`: that point maps to the same device pixel before and after, so
 /// a feature grows in place instead of sliding across the face.
@@ -351,17 +208,15 @@ fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) -> PathT
     }
 }
 
-/// Paint the resolution-aware glossy finish for one grown, OPEN LOD eye.
+/// Paint the glossy finish for one grown, open LOD eye.
 ///
-/// Coordinates and dimensions are already in device pixels. The offsets and
-/// radii are deliberately fractions of the final grown footprint, rather than
-/// the authored pre-LOD eye: the compressed far eye and the full near eye each
-/// receive a glint that fits what was actually painted. With the primary at
-/// `(-0.22w, -0.23h)` and radius at most `0.13·min(w,h)`, its circle stays
-/// inside an elliptical eye (normalized centre distance ≈0.64 plus normalized
-/// radius ≤0.26). The lower echo has still more clearance. That geometric
-/// containment matters: a catch-light which leaks onto the coat reads as a
-/// random white trail fleck, worse than the flat dot this replaces.
+/// Coordinates are device pixels, and offsets and radii are fractions of the
+/// final grown footprint, so the compressed far eye and the full near eye
+/// each get a glint that fits. With the primary at `(-0.22w, -0.23h)` and
+/// radius at most `0.13·min(w,h)` the circle stays inside an elliptical eye
+/// (normalized centre distance ≈0.64 plus radius ≤0.26); the lower echo has
+/// more clearance. A catch-light leaking onto the coat would read as a stray
+/// white fleck.
 fn paint_eye_reflections(tile: &mut Tile, eye_mask: &Tile, cx: f32, cy: f32, w: f32, h: f32) {
     let minor = w.min(h);
     if minor < EYE_REFLECTION_MIN_PX {
@@ -398,32 +253,25 @@ fn paint_eye_reflections(tile: &mut Tile, eye_mask: &Tile, cx: f32, cy: f32, w: 
     }
 }
 
-/// The LOD eye pass: each subpath of the `Eye` layer — one authored eye — is
-/// refilled solid as its own dot, grown about its own centre ([`zoom_about`],
-/// so neither eye drifts) toward the legibility target for its SHAPE:
-/// [`EYE_DOT_TARGET_H_PX`] of device height for an open round eye (capped at
-/// [`EYE_DOT_SCALE_MAX`]) or [`EYE_DOT_TARGET_H_PX_ARC`] for a shallow
-/// arc/lid dash (capped at [`EYE_DOT_SCALE_MAX_SHALLOW`] vertically and
-/// [`EYE_DOT_ARC_KX_MAX`] horizontally — the dash thickens but never widens
-/// into a mask). Horizontal growth is clamped per neighbouring dot so the
-/// pair keeps [`EYE_DOT_GAP_PX`] of daylight — cutting below authored width
-/// when the authored gap is itself sub-pixel — and an open eye's height is
-/// then held within [`EYE_DOT_ROUND_ASPECT_MAX`] of whatever width survived,
-/// so the dot stays a dot. A foreshortened 3/4 far eye (see
-/// [`EYE_DOT_FAR_COMPRESS_RATIO`]) keeps the full vertical growth but is
-/// painted as a NARROW core — the near-eye horizontal treatment scaled down
-/// by the pose's own foreshortening ratio, floored at
-/// [`EYE_DOT_FAR_CORE_MIN_W_FRAC`] of the tile height, and anchored at its
-/// inner edge so the floor grows the core AWAY from the near eye instead of
-/// into the pair's daylight. EVERY dot then gets its guaranteed core: a
-/// solid [`EYE_DASH_CORE_PX`] plug at its centre, clamped inside its own
-/// footprint and outside the pair's daylight, so the ≥2×2 dark core is a
-/// guarantee instead of a phase accident. Painted with the layer's own
-/// resolved ink, this preserves the small, dark dot-per-eye treatment and its
-/// authored proportions. Finally, a non-shallow (open) dot receives the
-/// device-sized glossy treatment from [`paint_eye_reflections`]. Happy arcs,
-/// lids, and closed eyes stay pure ink so their expression cannot turn into a
-/// pair of floating white flecks.
+/// The LOD eye pass: each subpath of the `Eye` layer (one authored eye) is
+/// refilled solid as its own dot, grown about its own centre ([`zoom_about`])
+/// toward its shape's target: [`EYE_DOT_TARGET_H_PX`] for an open round eye
+/// (capped at [`EYE_DOT_SCALE_MAX`]) or [`EYE_DOT_TARGET_H_PX_ARC`] for a
+/// shallow arc/lid (capped at [`EYE_DOT_SCALE_MAX_SHALLOW`] vertically and
+/// [`EYE_DOT_ARC_KX_MAX`] horizontally).
+///
+/// Horizontal growth is clamped per neighbour to keep [`EYE_DOT_GAP_PX`] of
+/// daylight (cutting below authored width if needed), and an open eye's height
+/// is held within [`EYE_DOT_ROUND_ASPECT_MAX`] of the surviving width. A 3/4
+/// far eye ([`EYE_DOT_FAR_COMPRESS_RATIO`]) gets full vertical growth but a
+/// narrow core, scaled by the pose's foreshortening ratio, floored at
+/// [`EYE_DOT_FAR_CORE_MIN_W_FRAC`] of tile height, and anchored at its inner
+/// edge so the floor grows away from the near eye.
+///
+/// Every dot then gets a solid [`EYE_DASH_CORE_PX`] plug at its centre, clamped
+/// inside its footprint and outside the pair's daylight, guaranteeing a ≥2×2
+/// dark core. Open dots finally get [`paint_eye_reflections`]; arcs, lids and
+/// closed eyes stay pure ink.
 fn paint_eye_dots(
     tile: &mut Tile,
     layer: &Layer,
@@ -451,7 +299,7 @@ fn paint_eye_dots_with_mask_observer<F>(
     F: FnMut(bool, &Tile),
 {
     let bounds: Vec<Option<(f32, f32, f32, f32)>> =
-        layer.paths.iter().map(|p| subpath_bounds(p)).collect();
+        layer.paths.iter().map(|p| path_bounds(p)).collect();
     let width = |b: &Option<(f32, f32, f32, f32)>| b.map_or(0.0, |(x0, _, x1, _)| x1 - x0);
     let max_w = bounds.iter().map(width).fold(0.0, f32::max);
     // Authored width against the widest sibling — the head-yaw rig's
@@ -471,27 +319,20 @@ fn paint_eye_dots_with_mask_observer<F>(
         let Some((x0, y0, x1, y1)) = bounds[i] else {
             continue;
         };
-        // A genuinely occluded sliver paints nothing — no live pose authors
-        // one (see [`EYE_DOT_FAR_OCCLUDED_RATIO`]); every VISIBLE authored
-        // eye below renders a core, per the owner's one-eyed-is-creepy call.
+        // An occluded sliver paints nothing (no live pose authors one; see
+        // [`EYE_DOT_FAR_OCCLUDED_RATIO`]); every visible eye renders a core.
         if occluded(&bounds[i]) {
             continue;
         }
         let compressed = ratio(&bounds[i]) < EYE_DOT_FAR_COMPRESS_RATIO;
         let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-        // Size-aware growth: how far this dot must grow for its authored
-        // height to reach its shape's device-pixel target (scale_y IS the
-        // tile height in the normalized fit). A shallow subpath — an arc or
-        // a lid, a thin BAND rather than solid ink — aims at the band target
-        // with the higher ceiling: its dark core lives in the band's
-        // interior rows, and it starts from a fraction of the open eye's
-        // height. Shallowness is judged in DEVICE pixels, deliberately: the
-        // glyph's normalized frame maps each viewbox axis to 0..1
-        // separately, so a normalized aspect is warped by the viewbox's own
-        // shape, while the aspect-preserving tile restores the artist's
-        // proportions — the arcs measure 0.41 there and the open eyes
-        // 0.95+, exactly the populations [`EYE_DOT_SHALLOW_ASPECT`] was
-        // drawn between.
+        // How far this dot must grow for its authored height to reach its
+        // shape's device target (`scale_y` is the tile height in the fit). A
+        // shallow subpath aims at the band target with the higher ceiling.
+        // Shallowness is judged in device pixels: the normalized frame maps
+        // each viewbox axis to 0..1 separately, warping aspects, while the
+        // aspect-preserving tile restores the artist's proportions (arcs 0.41,
+        // open eyes 0.95+).
         let h_px = (y1 - y0) * xform.scale_y;
         let w_px = (x1 - x0) * xform.scale_x;
         let shallow = w_px > 0.0 && h_px < EYE_DOT_SHALLOW_ASPECT * w_px;
@@ -505,10 +346,9 @@ fn paint_eye_dots_with_mask_observer<F>(
         } else {
             1.0
         };
-        // The daylight floor, converted from device px into the normalized
-        // frame this bake maps at (scale_x IS the tile width). Horizontal
-        // growth starts from the vertical factor — capped for an arc, whose
-        // width already carries its expression (see [`EYE_DOT_ARC_KX_MAX`]).
+        // The daylight floor in the normalized frame (`scale_x` is the tile
+        // width). Horizontal growth starts from the vertical factor, capped for
+        // an arc (see [`EYE_DOT_ARC_KX_MAX`]).
         let min_gap = EYE_DOT_GAP_PX / xform.scale_x.max(1.0);
         let mut kx = if shallow {
             ky.min(EYE_DOT_ARC_KX_MAX)
@@ -519,9 +359,9 @@ fn paint_eye_dots_with_mask_observer<F>(
             let Some(&(ox0, _, ox1, _)) = other.as_ref() else {
                 continue;
             };
-            // An occluded sibling paints nothing — it cannot fuse with
-            // anyone, so it must not throttle this dot's growth either. A
-            // COMPRESSED sibling still paints, so it stays in the guard.
+            // An occluded sibling paints nothing, so it cannot fuse and does not
+            // throttle growth; a compressed sibling still paints and stays in
+            // the guard.
             if j == i || occluded(other) {
                 continue;
             }
@@ -538,30 +378,23 @@ fn paint_eye_dots_with_mask_observer<F>(
                 kx = kx.min(1.0 + (gap - min_gap) / closing);
             }
         }
-        // The guard may cut BELOW authored width: at the Linux-default bake
-        // the frontal pairs' authored gap is itself sub-pixel, and daylight
-        // outranks authored width (see [`EYE_DOT_GAP_PX`]). Floored at the
-        // guaranteed-core width so an eye can thin but never thin away.
+        // The guard may cut below authored width (see [`EYE_DOT_GAP_PX`]),
+        // floored at the guaranteed-core width.
         let kx_floor =
             (EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y / w_px.max(f32::EPSILON)).min(1.0);
         let kx = kx.clamp(kx_floor, ky);
-        // A round eye stays round: when the daylight guard has narrowed the
-        // dot, its height follows the width down (see
-        // [`EYE_DOT_ROUND_ASPECT_MAX`]) instead of painting a startled bar.
-        // Never below authored height, and never for the shapes whose whole
-        // point is a non-round aspect.
+        // A round eye stays round: when the daylight guard narrowed the dot,
+        // height follows width down (see [`EYE_DOT_ROUND_ASPECT_MAX`]). Never
+        // below authored height, and not for non-round shapes.
         let ky = if shallow || compressed {
             ky
         } else {
             ky.min((EYE_DOT_ROUND_ASPECT_MAX * w_px * kx / h_px.max(f32::EPSILON)).max(1.0))
         };
-        // The compressed far core: the near-eye horizontal treatment scaled
-        // DOWN by the authored foreshortening ratio (so the turned head keeps
-        // its asymmetry even after `ky` rounds both eyes up), floored at the
-        // guaranteed-core width. The floor may exceed what the daylight guard
-        // above allowed, so the growth is anchored at the eye's INNER edge —
-        // the one facing the near eye — and extends OUTWARD: the authored
-        // daylight between the pair survives whatever the floor asks for.
+        // The compressed far core: the near-eye horizontal treatment scaled by
+        // the authored foreshortening ratio, floored at the guaranteed-core
+        // width, and anchored at the inner edge (facing the near eye) so any
+        // floor growth extends outward and the pair's daylight survives.
         let (kx, anchor_x) = if compressed {
             let floor_k = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y / w_px.max(f32::EPSILON);
             let inner = if near_cx >= cx { x1 } else { x0 };
@@ -579,22 +412,17 @@ fn paint_eye_dots_with_mask_observer<F>(
             1.0,
             dot_xform,
         );
-        // Where the dot's centre landed after the zoom — identical to `cx`
-        // for a centre-anchored dot, shifted outward by the sub-pixel the
-        // floor added for an inner-edge-anchored compressed core. The plug
-        // must sit on the PAINTED dot, not the authored one.
+        // The dot's centre after the zoom: `cx` for a centre-anchored dot,
+        // shifted outward for an inner-edge-anchored core. The plug sits on the
+        // painted dot.
         let gx = anchor_x + (cx - anchor_x) * kx;
-        // Every dot gets its guaranteed core (see [`EYE_DASH_CORE_PX`]): a
-        // solid square of the same ink at the dot's centre, clamped inside
-        // the grown footprint so it reads as stroke weight, never as a
-        // second feature.
+        // Every dot's guaranteed core (see [`EYE_DASH_CORE_PX`]): a solid square
+        // of the same ink at the centre, clamped inside the grown footprint.
         {
-            // The pair-daylight clamp: plugs sit at (nearly) authored
-            // centres, so two full-width plugs on a close-set pair would
-            // meet in the middle and fuse exactly the gap the ellipse
-            // growth above was throttled to keep. Both siblings compute the
-            // same centre distance, so both shrink to the same ceiling and
-            // the [`EYE_DOT_GAP_PX`] daylight survives symmetric.
+            // Pair-daylight clamp: full-width plugs at authored centres would
+            // meet in the middle of a close-set pair. Both siblings compute the
+            // same distance and shrink to the same ceiling, keeping
+            // [`EYE_DOT_GAP_PX`] symmetric.
             let mut allowed_w = f32::MAX;
             for (j, other) in bounds.iter().enumerate() {
                 let Some(&(ox0, _, ox1, _)) = other.as_ref() else {
@@ -610,12 +438,10 @@ fn paint_eye_dots_with_mask_observer<F>(
                 let dist = ((ox0 + ox1) * 0.5 - cx).abs() * xform.scale_x;
                 allowed_w = allowed_w.min((dist - EYE_DOT_GAP_PX).max(0.0));
             }
-            // …floored at the guaranteed-core width, the same precedence the
-            // compressed far core already established: when a pose authors
-            // its pair closer than daylight-plus-two-cores can share (the
-            // land's braced squint), the core outranks the daylight — a
-            // sub-pixel gap on a transient face is recoverable, an invisible
-            // eye is not.
+            // Floored at the guaranteed-core width: when a pose authors its
+            // pair closer than daylight plus two cores (the land's braced
+            // squint), the core wins; a sub-pixel gap on a transient face is
+            // recoverable, an invisible eye is not.
             let allowed_w = allowed_w.max(EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y);
             let plug_w = EYE_DASH_CORE_PX.min(w_px * kx).min(allowed_w);
             let plug_h = EYE_DASH_CORE_PX.min(h_px * ky);
@@ -651,19 +477,14 @@ fn paint_eye_dots_with_mask_observer<F>(
 }
 
 /// Bake-cache key for one pet tile: everything that can change a texel, and
-/// nothing that cannot.
+/// nothing else.
 ///
-/// All-integer by construction — the [`BakeKey`](crate::cat_baker::BakeKeyV4)
-/// discipline. The resolved coat/iris/outline colours are `f32` triples, so
-/// they are re-derived from these ramp INDICES at bake time
-/// ([`PetBakeKey::fills`]) and never stored in a hashed key; a float in an
-/// `Eq`/`Hash` type is how a cache silently stops hitting (or starts colliding)
-/// on a denormal.
+/// All-integer, like [`BakeKey`](crate::cat_baker::BakeKeyV4): the resolved
+/// coat/iris/outline colours are `f32` triples, so they are re-derived from
+/// ramp indices at bake time ([`PetBakeKey::fills`]) rather than hashed.
 ///
-/// Note what is deliberately absent: no `eyes` axis (the pose authors its own
-/// eye state, see the module docs) and no age/scale axis (the exact `w × h`
-/// already encodes every caller-side scaling decision, so a second axis could
-/// only fragment the cache).
+/// No `eyes` axis (the pose authors its eyes) and no age/scale axis (the exact
+/// `w × h` already encodes every scaling decision).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PetBakeKey {
     /// The authored full-body pose (gait frame, idle, startle, …).
@@ -701,62 +522,56 @@ impl PetBakeKey {
 
     /// A stable `u64` identity for
     /// [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile), which
-    /// keys host-authored tiles by an opaque id rather than by a cat key.
-    ///
-    /// FNV-1a over the key's own integer fields, deliberately NOT
-    /// `DefaultHasher`: the atlas slot must stay the same tile across process
-    /// restarts and across std releases, and `DefaultHasher`'s algorithm is
-    /// explicitly not part of std's stable contract. The high bit is set so a
-    /// pet id can never collide with a small hand-assigned host id (the kitty
-    /// cursor's, for instance) in the shared atlas.
+    /// keys host-authored tiles by an opaque id rather than by a cat key:
+    /// `host_tile_id` over the key's own integer fields.
     #[must_use]
     pub fn host_id(&self) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut h = FNV_OFFSET;
-        let mut eat = |b: u64| {
-            h ^= b;
-            h = h.wrapping_mul(FNV_PRIME);
-        };
-        eat(self.pose as u64);
-        eat(u64::from(self.coat));
-        eat(u64::from(self.iris));
-        eat(u64::from(self.colors.accent));
-        eat(u64::from(self.colors.background));
-        eat(u64::from(self.w));
-        eat(u64::from(self.h));
-        h | (1 << 63)
+        host_tile_id(&[
+            self.pose as u64,
+            u64::from(self.coat),
+            u64::from(self.iris),
+            u64::from(self.colors.accent),
+            u64::from(self.colors.background),
+            u64::from(self.w),
+            u64::from(self.h),
+        ])
     }
 }
 
+/// The shared-atlas host-tile id of one exact-size bake key's integer fields.
+///
+/// FNV-1a over `words`, not `DefaultHasher`, whose algorithm is not stable
+/// across std releases. The high bit is set so a roster id never collides with
+/// a small hand-assigned host id (such as the kitty cursor's); non-pet rosters
+/// lead `words` with a namespace salt.
+pub(crate) fn host_tile_id(words: &[u64]) -> u64 {
+    let mut h = aterm_hash::FNV64_OFFSET;
+    for &word in words {
+        h = aterm_hash::fnv_mix_u64(h, word);
+    }
+    h | (1 << 63)
+}
+
 /// Rasterize one authored pose into a fresh `w × h` [`Tile`], painter order =
-/// layer order, each layer's colour resolved by [`resolve_layer`] and its
-/// fixed-point `0..=FIXED_ONE` frame mapped onto the tile by
-/// [`PathTransform::fit`].
+/// layer order, each layer's colour from [`resolve_layer`] and its fixed-point
+/// `0..=FIXED_ONE` frame mapped by [`PathTransform::fit`].
 ///
-/// Deterministic: the const integer drawlist plus the fixed-point filler give
-/// byte-identical output for identical arguments, on any host, forever — which
-/// is what makes the LRU above safe to treat as a pure function of its key.
+/// Deterministic: the const integer drawlist and fixed-point filler give
+/// byte-identical output for identical arguments on any host, so the LRU is a
+/// pure function of its key.
 ///
-/// The one thing painted that is not a plain layer fill is the MIXED-background
-/// halo: when [`ResolvedFills::outline_underlay`] is `Some` (background band 4
-/// — the pet's footprint spans both sides of the light/dark crossover, which a
-/// roaming full-body pet does constantly), the silhouette and whisker layers get
-/// a compact pale keyline painted underneath the dark one. Neither ink alone
-/// clears 3:1 at every luminance a mixed footprint contains; the PAIR does. It
-/// costs four extra fills on a cache miss and nothing at all in steady state.
+/// Mixed-background halo: when [`ResolvedFills::outline_underlay`] is `Some`
+/// (background band 4, a footprint spanning the light/dark crossover), the
+/// silhouette and whisker layers get a pale keyline under the dark one; the
+/// pair clears 3:1 where neither ink alone does. Four extra fills per miss.
 ///
-/// Below [`FACE_DETAIL_MIN_H`] the walk applies the face LOD (see the const
-/// block): the whisker, authored catch-light, blush, pattern, iris and pupil
-/// layers — identified by their authored ROLES, never by drawlist position —
-/// are skipped outright, and each `Eye` subpath is refilled as one strong grown
-/// dot ([`paint_eye_dots`]; the 3/4 rig's foreshortened far eye survives as a
-/// compressed narrow core, see [`EYE_DOT_FAR_COMPRESS_RATIO`] — every pose
-/// that authors two eyes renders two). Open dots then receive the bounded
-/// device-pixel reflections from [`paint_eye_reflections`]. Below
-/// [`MOUTH_DETAIL_MIN_H`] the mouth is culled (see that const for why
-/// thickening lost). All of it is keyed off `h` and `w` alone, both already in
-/// the cache key, so determinism is untouched.
+/// Below [`FACE_DETAIL_MIN_H`] the face LOD applies: whisker, authored
+/// catch-light, blush, pattern, iris and pupil layers (by authored role, not
+/// drawlist position) are skipped, and each `Eye` subpath is refilled as one
+/// grown dot ([`paint_eye_dots`]; the 3/4 far eye survives as a compressed
+/// core), with open dots getting [`paint_eye_reflections`]. Below
+/// [`MOUTH_DETAIL_MIN_H`] the mouth is culled. All keyed off `w`/`h`, already
+/// in the cache key.
 #[must_use]
 pub fn bake_pose(pose: PetGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
     bake_pose_with_reflections(pose, fills, w, h, true)
@@ -776,9 +591,9 @@ fn bake_pose_with_reflections(
     let xform = PathTransform::fit(w, h);
     let face_lod = h < FACE_DETAIL_MIN_H;
     for layer in PET_GLYPHS[pose as usize].layers {
-        // The review's cull list, by authored role: whisker/blush/pattern are
-        // sub-pixel charm at LOD sizes, and iris/authored-catch-light/pupil are
-        // the eye stack the strong dot + device-sized reflection replaces.
+        // The LOD cull list by authored role: whisker/blush/pattern are
+        // sub-pixel charm, and iris/catch-light/pupil are the eye stack the dot
+        // and device-sized reflection replace.
         if face_lod
             && matches!(
                 layer.role,
@@ -800,54 +615,57 @@ fn bake_pose_with_reflections(
         if h < MOUTH_DETAIL_MIN_H && layer.role == GlyphRole::Mouth {
             continue;
         }
-        if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker)
-            && let Some(underlay) = fills.outline_underlay
-        {
-            // Halo radius tracks the tile scale but is clamped to a sub-pixel
-            // band: any wider and the pale ring reads as a second outline
-            // instead of a legibility backstop.
-            let halo = (xform.scale_x.min(xform.scale_y) * 0.04).clamp(0.75, 1.25);
-            for (dx, dy) in [(halo, 0.0), (-halo, 0.0), (0.0, halo), (0.0, -halo)] {
-                fill_path_fixed(
-                    &mut tile,
-                    layer.paths,
-                    underlay,
-                    alpha,
-                    PathTransform {
-                        dx: xform.dx + dx,
-                        dy: xform.dy + dy,
-                        ..xform
-                    },
-                );
-            }
+        if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {
+            paint_outline_halo(&mut tile, layer, fills, alpha, xform);
         }
         fill_path_fixed(&mut tile, layer.paths, col, alpha, xform);
     }
     tile
 }
 
+/// A bake-cache key for an [`ExactTileBaker`]: everything that can change a
+/// texel of one exact-size tile, and nothing that cannot.
+pub trait ExactTileKey: Copy + PartialEq {
+    /// Tile `(w, h)` in px — the tile is EXACTLY this size, no patch strip.
+    fn size(&self) -> (u16, u16);
+    /// Rasterize the tile this key describes (the cache-miss path).
+    fn bake_tile(&self) -> Tile;
+}
+
+impl ExactTileKey for PetBakeKey {
+    fn size(&self) -> (u16, u16) {
+        (self.w, self.h)
+    }
+
+    fn bake_tile(&self) -> Tile {
+        self.bake()
+    }
+}
+
 /// One resident tile: its key, its texels, and the frame it was last touched on.
-struct PetSlot {
-    key: PetBakeKey,
+struct ExactSlot<K> {
+    key: K,
     tile: Tile,
     last_used: u64,
 }
 
-/// Host-side LRU of exact-size pet tiles (see the module docs for the budgets
-/// and for why there is neither a patch strip nor an eyes axis).
+/// Host-side LRU of exact-size tiles (see the module docs for the budgets):
+/// the structure behind every exact-size roster, [`PetBaker`],
+/// [`DogBaker`](crate::dog_baker::DogBaker),
+/// [`RobiBaker`](crate::robi_baker::RobiBaker) and
+/// [`AnimalBaker`](crate::animal_baker::AnimalBaker).
 ///
-/// `Default` is a valid empty baker: the first
-/// [`begin_frame`](PetBaker::begin_frame) adopts the cell metrics.
-#[derive(Default)]
-pub struct PetBaker {
-    slots: Vec<PetSlot>,
+/// `Default` is a valid empty baker; the first
+/// [`begin_frame`](ExactTileBaker::begin_frame) adopts the cell metrics.
+pub struct ExactTileBaker<K> {
+    slots: Vec<ExactSlot<K>>,
     /// Sum of `slots[..].tile.pixels().len()`, kept incrementally so the
     /// [`MAX_ATLAS_BYTES`] residency bound costs O(1) per admission instead of
     /// a walk.
     bytes: usize,
     cell_w: u16,
     cell_h: u16,
-    /// LRU clock, advanced once per [`begin_frame`](PetBaker::begin_frame).
+    /// LRU clock, advanced once per [`begin_frame`](ExactTileBaker::begin_frame).
     clock: u64,
     /// Cold bakes still allowed this frame.
     bakes_left: u32,
@@ -856,7 +674,24 @@ pub struct PetBaker {
     version: u64,
 }
 
-impl PetBaker {
+impl<K> Default for ExactTileBaker<K> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            bytes: 0,
+            cell_w: 0,
+            cell_h: 0,
+            clock: 0,
+            bakes_left: 0,
+            version: 0,
+        }
+    }
+}
+
+/// The pet roster's exact-size tile cache.
+pub type PetBaker = ExactTileBaker<PetBakeKey>;
+
+impl<K: ExactTileKey> ExactTileBaker<K> {
     /// Per-tick prologue: advance the LRU clock, reset the per-frame cold-bake
     /// budget, and wholesale-clear on a cell-metric change.
     ///
@@ -910,41 +745,24 @@ impl PetBaker {
         self.bytes
     }
 
-    /// The authored aspect (width ÷ height) of a pose, from its asset viewbox.
-    ///
-    /// Callers size the destination box from THIS rather than from the cell
-    /// grid: the pet roster's poses are not all the same shape (a stretch is
-    /// long and low, a sit is tall and narrow), and fitting them all into one
-    /// box would squash the art the animator drew. Clamped away from zero so a
-    /// degenerate asset cannot produce a NaN/∞ destination rect.
-    #[must_use]
-    pub fn aspect(pose: PetGlyphId) -> f32 {
-        (f32::from(PET_GLYPHS[pose as usize].aspect_x1000) / 1000.0).max(0.001)
-    }
-
     /// Look `key` up, baking on a miss when the per-frame budget allows.
     ///
-    /// Returns straight-alpha RGBA8, exactly `key.w · key.h · 4` bytes, rows
-    /// top-down — ready to hand straight to
-    /// [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile) with
-    /// [`PetBakeKey::host_id`].
+    /// Returns straight-alpha RGBA8, exactly `w · h · 4` bytes, rows top-down,
+    /// ready for [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile)
+    /// with the key's own `host_id`.
     ///
     /// `None` means "not this frame": the cold-bake budget is spent, or the key
-    /// is degenerate (zero-sized, or a single tile larger than the entire
-    /// residency budget). This is why the return is an `Option<&[u8]>` and not
-    /// the bare `&[u8]` the shape sketch suggested — a deferred bake and an
-    /// all-transparent tile are different facts, and a caller that cannot tell
-    /// them apart will happily blit a hole into the scene and then never retry.
-    /// The correct response to `None` is to keep drawing the previously resolved
-    /// pose and ask again next frame.
-    pub fn tile(&mut self, key: &PetBakeKey) -> Option<&[u8]> {
-        if key.w == 0 || key.h == 0 {
+    /// is degenerate (zero-sized, or one tile larger than the whole residency
+    /// budget). A deferred bake is not an all-transparent tile: keep drawing the
+    /// previously resolved tile and ask again next frame.
+    pub fn tile(&mut self, key: &K) -> Option<&[u8]> {
+        let (w, h) = key.size();
+        if w == 0 || h == 0 {
             return None;
         }
-        let want = usize::from(key.w) * usize::from(key.h) * 4;
+        let want = usize::from(w) * usize::from(h) * 4;
         // A tile that alone exceeds the residency budget is refused rather than
-        // admitted by evicting everything else — otherwise one absurd cell
-        // metric turns the cache into a one-entry miss machine.
+        // admitted by evicting everything else.
         if want > MAX_ATLAS_BYTES {
             return None;
         }
@@ -956,7 +774,7 @@ impl PetBaker {
             return None;
         }
         self.bakes_left -= 1;
-        let tile = key.bake();
+        let tile = key.bake_tile();
         // Make room BEFORE inserting, so the pushed slot's index is final and
         // the tile we are about to hand out can never be the one evicted.
         while !self.slots.is_empty()
@@ -965,7 +783,7 @@ impl PetBaker {
             self.evict_lru();
         }
         self.bytes += tile.pixels().len();
-        self.slots.push(PetSlot {
+        self.slots.push(ExactSlot {
             key: *key,
             tile,
             last_used: self.clock,
@@ -974,9 +792,8 @@ impl PetBaker {
         Some(self.slots[self.slots.len() - 1].tile.pixels())
     }
 
-    /// Drop the least-recently-used slot, lowest index breaking ties — the
-    /// tiebreak is what makes eviction (and therefore the whole cache) a
-    /// deterministic function of the request sequence.
+    /// Drop the least-recently-used slot, lowest index breaking ties, so
+    /// eviction is a deterministic function of the request sequence.
     fn evict_lru(&mut self) {
         let Some(victim) = self
             .slots
@@ -992,26 +809,29 @@ impl PetBaker {
     }
 }
 
+impl PetBaker {
+    /// The authored aspect (width ÷ height) of a pose, from its asset viewbox.
+    /// Callers size the destination box from this, since poses differ in shape
+    /// (a stretch is long and low, a sit tall and narrow). Clamped away from
+    /// zero so a degenerate asset cannot produce a NaN/∞ rect.
+    #[must_use]
+    pub fn aspect(pose: PetGlyphId) -> f32 {
+        (f32::from(PET_GLYPHS[pose as usize].aspect_x1000) / 1000.0).max(0.001)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pet_glyphs_gen::PET_GLYPH_IDS;
 
-    /// Find a pose by a substring of its authored asset id. Tests address the
-    /// roster through the ASSET vocabulary, not through generated variant
-    /// spellings, so a codegen rename cannot silently retarget a test.
-    /// The CAT pose named `needle` — `pose("walk_0")` is `pet_walk_0`.
+    /// The cat pose named `needle`: `pose("walk_0")` is `pet_walk_0`. Tests
+    /// address the roster by asset id, not generated variant names, so a
+    /// codegen rename cannot retarget a test.
     ///
-    /// EXACT, not `contains`, and that is not tidiness. The roster carries two
-    /// species since the dog landed, it is ordered by id, and `pet_dog_walk_0`
-    /// sorts before `pet_walk_0` — so a substring match silently handed every
-    /// one of these tests the DOG. That is a false green in the worst
-    /// direction: `face_lod_culls_charm_ink_at_ship_size` asserts a `Pattern`
-    /// layer exists, dogs have no tabby and therefore no `Pattern`, and the
-    /// test failed with "walk pose authors all three charm layers" — a
-    /// complaint about the cat that was really a lookup finding a dog. Pin the
-    /// species in the id and the question the test asks stays the one it means.
-    /// For a dog pose, ask for one: `pose_id("pet_dog_walk_0")`.
+    /// Exact match, not `contains`: the roster holds cat and dog poses sorted by
+    /// id, and `pet_dog_walk_0` sorts before `pet_walk_0`, so a substring match
+    /// would return the dog. For a dog pose use `pose_id("pet_dog_walk_0")`.
     fn pose(needle: &str) -> PetGlyphId {
         pose_id(&format!("pet_{needle}"))
     }
@@ -1093,8 +913,8 @@ mod tests {
         );
     }
 
-    /// EXACT-SIZE, no patch strip: the tile is `w · h · 4` bytes, full stop.
-    /// (A cat tile of the same art box would be `(w + PATCH_STRIP) · h · 4`.)
+    /// Exact size, no patch strip: the tile is `w · h · 4` bytes (a cat tile of
+    /// the same art box would be `(w + PATCH_STRIP) · h · 4`).
     #[test]
     fn tile_is_exact_size_with_no_patch_strip() {
         let k = key(7);
@@ -1271,21 +1091,14 @@ mod tests {
         );
     }
 
-    /// Review #4's acceptance bar for the face LOD, extended by the owner's
-    /// two-eyes ruling ("this new kitty only has one eye … that's not cute
-    /// that's creepy"): at ship size (cell_h 14 ⇒ a 36 px-tall tile at 1.5×
-    /// HiDPI), for EVERY live pose on BOTH grounds, every authored eye
-    /// subpath must survive as its own ≥2×2 block of DARK, fully-opaque ink
-    /// near its authored centre — the turned heads' compressed far eye
-    /// included (see [`EYE_DOT_FAR_COMPRESS_RATIO`]; nothing in the live
-    /// roster may fall under the occlusion gate). The per-pose CORE COUNT
-    /// equals the authored eye-subpath count, so a one-eyed render of a
-    /// two-eyed pose fails; the cores of a pair authored with daylight must
-    /// stay distinct AND keep at least one non-dark texel between them, so a
-    /// pair fused into one ink mask fails too. Before the LOD the same probe
-    /// found single blended pixels around rgb(144,144,135): the stack's own
-    /// charm had averaged the eye gray. "Dark" is every channel under 64 —
-    /// the authored eye ink is rgb(36,31,41).
+    /// Face LOD acceptance: at ship size (cell_h 14 ⇒ a 36 px tile at 1.5×),
+    /// for every live pose on both grounds, every authored eye subpath survives
+    /// as its own ≥2×2 block of dark, fully opaque ink near its authored centre,
+    /// the turned heads' compressed far eye included (no live pose may hit the
+    /// occlusion gate). The per-pose core count equals the authored eye-subpath
+    /// count, and a pair authored with daylight keeps distinct cores with a
+    /// non-dark texel between them. "Dark" is every channel under 64 (the
+    /// authored eye ink is rgb(36,31,41)).
     #[test]
     fn face_lod_keeps_a_dark_eye_core_at_ship_size() {
         const H: u32 = 36;
@@ -1308,15 +1121,11 @@ mod tests {
                     if layer.role != GlyphRole::Eye {
                         continue;
                     }
-                    let bounds: Vec<(f32, f32, f32, f32)> = layer
-                        .paths
-                        .iter()
-                        .filter_map(|p| subpath_bounds(p))
-                        .collect();
+                    let bounds: Vec<(f32, f32, f32, f32)> =
+                        layer.paths.iter().filter_map(|p| path_bounds(p)).collect();
                     let max_w_n = bounds.iter().map(|b| b.2 - b.0).fold(0.0, f32::max);
-                    // Every authored subpath is a VISIBLE eye that must
-                    // render: the occlusion gate stays unused by the live
-                    // roster, per the owner's ruling.
+                    // Every authored subpath is a visible eye that must render;
+                    // the occlusion gate stays unused by the live roster.
                     for b in &bounds {
                         assert!(
                             (b.2 - b.0) >= EYE_DOT_FAR_OCCLUDED_RATIO * max_w_n,
@@ -1397,12 +1206,11 @@ mod tests {
         );
     }
 
-    /// Differential proof for the shipping reflection pass. An otherwise
-    /// byte-identical no-reflection bake is the negative control; every changed
-    /// texel must have been dark and owned by exactly one per-path grown-eye
-    /// mask, every open authored eye must gain its own visibly pale texel, and shallow
-    /// happy/closed/lidded paths must gain none. The separate dark-core test
-    /// above proves the same reflected output still retains a 2×2 pupil/core.
+    /// Differential check of the reflection pass against an otherwise identical
+    /// no-reflection bake: every changed texel was dark and owned by exactly one
+    /// per-path grown-eye mask, every open eye gains its own pale texel, and
+    /// shallow happy/closed/lidded paths gain none. The dark-core test above
+    /// shows the reflected output keeps a 2×2 core.
     #[test]
     fn face_lod_reflections_are_contained_and_expression_aware() {
         const H: u32 = 36;
@@ -1507,13 +1315,11 @@ mod tests {
         );
     }
 
-    /// The LOD deletes the authored charm stack rather than merely shrinking
-    /// it, then rebuilds only the detail the shipping pixels can carry: at
-    /// 36 px the walk keeps crisp catch-light white from the device-sized eye
-    /// reflections, but contains no fully-covered blush pink or tabby-pattern
-    /// brown. A desk-size bake (above [`FACE_DETAIL_MIN_H`]) keeps the authored
-    /// versions of all three. The iris ring and pupil need no separate probe —
-    /// the core test above proves their dark foundation remains intact.
+    /// The LOD deletes the authored charm stack and rebuilds only what the
+    /// pixels can carry: at 36 px the walk keeps catch-light white from the
+    /// device-sized reflections but has no fully covered blush pink or tabby
+    /// brown. A bake above [`FACE_DETAIL_MIN_H`] keeps the authored versions of
+    /// all three.
     #[test]
     fn face_lod_rebuilds_reflections_but_culls_other_charm_ink() {
         let p = pose("walk_0");
@@ -1569,31 +1375,21 @@ mod tests {
         }
     }
 
-    /// The eye-SIZE law, pinned at the sizes 1× desktops actually bake — the
-    /// owner's "the kitty eyes are too big" bug, measured. The default Linux
-    /// cell (cell_h 14) bakes the pet 24 px tall, and the old 7 px growth
-    /// target painted the authored 3.0 px open eye 6.5 px — 27% of body
-    /// height against the artist's 12.4%, twice the drawn proportion — while
-    /// the arcs' uniform 2.8× growth painted the purr/sleep pair as one
-    /// 17 px sunglasses band. For EVERY live pose on BOTH grounds, at the
-    /// Linux-default 24 px bake and the 1.5×-HiDPI 36 px bake, each authored
-    /// eye's dark ink component must now stay inside its law-derived box:
+    /// The eye-size rule at the sizes 1× desktops bake (24 px at the default
+    /// cell_h 14) and at 1.5× (36 px): for every live pose on both grounds,
+    /// each authored eye's dark ink component stays inside its box:
     ///
-    /// * an OPEN eye: no taller than the larger of its authored height and
-    ///   [`EYE_DOT_TARGET_H_PX`], no wider than the larger of its authored
-    ///   width and [`EYE_DASH_CORE_PX`] (the guaranteed-core plug may pad a
-    ///   narrow eye) — plus 1.5 px of anti-aliasing slack each;
-    /// * a SHALLOW arc/lid: height against [`EYE_DOT_TARGET_H_PX_ARC`],
-    ///   width against [`EYE_DOT_ARC_KX_MAX`] × authored — the dash may
-    ///   thicken but never widen into a mask, and a pair fused across its
-    ///   daylight shows up here as one component twice its lawful width;
+    /// * an open eye: no taller than max(authored height,
+    ///   [`EYE_DOT_TARGET_H_PX`]), no wider than max(authored width,
+    ///   [`EYE_DASH_CORE_PX`]), each plus 1.5 px of anti-aliasing slack;
+    /// * a shallow arc/lid: height against [`EYE_DOT_TARGET_H_PX_ARC`], width
+    ///   against [`EYE_DOT_ARC_KX_MAX`] × authored (a pair fused across its
+    ///   daylight shows as one component twice its allowed width);
     ///
-    /// and must still EXIST — at least a few fully-dark texels per eye, the
-    /// legibility floor the growth exists for. Subpaths whose authored
-    /// x-ranges overlap are one eye drawn in multiple strokes and are
-    /// measured as one. Components are measured by flood fill inside a
-    /// window sized from the bound itself, so an over-grown eye cannot
-    /// escape measurement by outgrowing the probe.
+    /// and still exists (a few fully dark texels per eye). Subpaths with
+    /// overlapping x-ranges are one eye in several strokes and are measured as
+    /// one. Components are flood-filled inside a window sized from the bound,
+    /// so an overgrown eye cannot escape measurement.
     #[test]
     fn lod_eyes_hold_the_artists_proportion_at_desktop_sizes() {
         // The Linux default, derived, not assumed: ART_ROWS · cell_h 14.
@@ -1619,13 +1415,11 @@ mod tests {
                         if layer.role != GlyphRole::Eye {
                             continue;
                         }
-                        // Cluster subpaths that share x-range: the baker's
-                        // own daylight guard treats x-overlap as "one eye,
-                        // nothing to guard" (the roll's tilted face stacks
-                        // its two arcs diagonally), so the test measures the
-                        // same union the law paints unguarded.
+                        // Cluster subpaths sharing x-range, as the baker's
+                        // daylight guard does (the roll's tilted face stacks
+                        // its two arcs diagonally).
                         let mut clusters: Vec<((f32, f32, f32, f32), usize)> = Vec::new();
-                        for b in layer.paths.iter().filter_map(|p| subpath_bounds(p)) {
+                        for b in layer.paths.iter().filter_map(|p| path_bounds(p)) {
                             if let Some((c, n)) =
                                 clusters.iter_mut().find(|(c, _)| b.0 <= c.2 && c.0 <= b.2)
                             {
@@ -1643,12 +1437,9 @@ mod tests {
                             let h_px = (y1 - y0) * h as f32;
                             let shallow = w_px > 0.0 && h_px < EYE_DOT_SHALLOW_ASPECT * w_px;
                             let (w_bound, h_bound) = if members > 1 {
-                                // A multi-stroke union: each member grows by
-                                // at most the global ceilings about its own
-                                // centre inside the union, so the union is
-                                // bounded loosely — tight pinning belongs to
-                                // the single-stroke eyes every everyday face
-                                // is made of.
+                                // A multi-stroke union is bounded loosely (each
+                                // member grows about its own centre); tight
+                                // pinning is for single-stroke eyes.
                                 (
                                     (w_px * EYE_DOT_SCALE_MAX).max(EYE_DASH_CORE_PX) + 1.5,
                                     h_px + EYE_DOT_TARGET_H_PX + 1.5,
@@ -1723,14 +1514,10 @@ mod tests {
                                     format_args!("{w_px:.1}x{h_px:.1}"),
                                 ));
                             }
-                            // The legibility floor scales with what the size
-                            // can guarantee: at 36 the full core plug fits
-                            // every pose (≥2×2 fully dark), at the 24 px
-                            // default the land's sub-pixel braced squint
-                            // (0.8 px authored) carries one fully-dark texel
-                            // with its anti-aliased halo doing the visible
-                            // rest (checked on the capture) — a fleck, never
-                            // nothing.
+                            // The floor scales with what the size guarantees:
+                            // at 36 px the full core plug fits every pose (≥2×2),
+                            // at 24 px the land's sub-pixel braced squint carries
+                            // one fully dark texel plus its anti-aliased halo.
                             let floor = if h >= 36 { 4 } else { 1 };
                             if area < floor {
                                 failures.push(format!(
@@ -1751,13 +1538,11 @@ mod tests {
         );
     }
 
-    /// The Retina identity path, pinned. A 2× mac default (cell_h ≈ 42
-    /// device px ⇒ an ART_ROWS · 42 ≈ 71 px tile) bakes at or above
-    /// [`FACE_DETAIL_MIN_H`], where the LOD never runs and the full authored
-    /// face — charm ink included — is painted verbatim: the eye-size law is
-    /// a 1×/1.5× repair and must not move a single Retina texel. Proven at
-    /// the boundary: the first full-face height keeps the catch-light, one
-    /// pixel below it the LOD culls it.
+    /// The Retina identity path: a 2× default (cell_h ≈ 42 ⇒ a ~71 px tile)
+    /// bakes at or above [`FACE_DETAIL_MIN_H`], where the LOD never runs and the
+    /// full authored face is painted verbatim. At the boundary the first
+    /// full-face height keeps the catch-light and one pixel below it the LOD
+    /// culls it.
     #[test]
     fn retina_scale_bakes_hit_the_identity_path() {
         // The 2× mac default lands above the LOD, structurally.
@@ -1777,10 +1562,9 @@ mod tests {
         let (col, _) = resolve_layer(catch_light, &fills);
         let byte = |c: f32| (c * 255.0 + 0.5) as u8;
         let ink = [byte(col.0), byte(col.1), byte(col.2)];
-        // Disable the replacement LOD gloss for this boundary probe. Its
-        // primary reflection intentionally reuses the authored catch-light's
-        // white ink, so a colour-only search could otherwise mistake the new
-        // small-eye detail for the full-face layer this test is pinning.
+        // Disable the LOD gloss for this probe: its primary reflection reuses
+        // the authored catch-light's white, which a colour search would
+        // otherwise mistake for the full-face layer.
         let has_authored_catch_light = |h: u32| {
             let w = (h as f32 * PetBaker::aspect(p)).round() as u32;
             bake_pose_with_reflections(p, &fills, w, h, false)

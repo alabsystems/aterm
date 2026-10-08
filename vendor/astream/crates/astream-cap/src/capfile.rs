@@ -228,7 +228,7 @@ fn decode_tag(hex: &[u8]) -> Result<[u8; TAG_BYTES], Error> {
         return Err(Error::TagLength(hex.len()));
     }
     let mut tag = [0u8; TAG_BYTES];
-    for (i, (out, pair)) in tag.iter_mut().zip(hex.chunks_exact(2)).enumerate() {
+    for (i, (out, pair)) in tag.iter_mut().zip(hex.as_chunks::<2>().0).enumerate() {
         let hi = nibble(pair[0]).ok_or(Error::TagNotHex(2 * i))?;
         let lo = nibble(pair[1]).ok_or(Error::TagNotHex(2 * i + 1))?;
         *out = (hi << 4) | lo;

@@ -799,13 +799,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-status-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-status-{label}-"))
     }
 
     /// The pass-end stamps: a pass that reached the index stamps its success and ends `ok`;
@@ -815,9 +810,7 @@ mod tests {
     #[test]
     fn the_pass_end_stamps_say_what_the_pass_did() {
         use aterm_update_core::pkg_check::{PassOutcome, Stamps};
-        let dir = std::env::temp_dir().join(format!("atpkg-status-fresh-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::dir("atpkg-status-fresh-");
         let layout = Layout {
             prefix: dir.clone(),
         };
@@ -950,38 +943,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    #[test]
-    fn write_is_atomic_no_temp_left_behind() {
-        let l = layout("atomic");
-        write(
-            &l,
-            &Status {
-                schema: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let leftovers: Vec<_> = std::fs::read_dir(&l.prefix)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "no temp file should remain after rename"
-        );
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// The same promise on the FAILING path (2026-09-16). The temp name carries this
-    /// process's pid, so a write or rename that fails stranded `status.toml.tmp-<pid>`
-    /// in the prefix root — a name nothing has ever swept: neither `gc` nor `doctor`
-    /// scans for it, and the next pass runs under a new pid, so the leftovers do not
-    /// even overwrite each other. A machine whose disk stays full writes status
-    /// several times per pass and left one more file behind on every pass,
-    /// unreclaimable, for as long as the disk stayed full. Staged with the one failure
-    /// a test can force deterministically: a `status.toml` that is a DIRECTORY, so the
-    /// bytes reach the temp and the rename is what refuses.
+    /// No temp is left behind on the FAILING path either (2026-09-16); on the Ok path the
+    /// rename consumes it. The temp name carries this process's pid, so a write or rename
+    /// that fails stranded `status.toml.tmp-<pid>` in the prefix root — a name nothing has
+    /// ever swept: neither `gc` nor `doctor` scans for it, and the next pass runs under a
+    /// new pid, so the leftovers do not even overwrite each other. A machine whose disk
+    /// stays full writes status several times per pass and left one more file behind on
+    /// every pass, unreclaimable, for as long as the disk stayed full. Staged with the one
+    /// failure a test can force deterministically: a `status.toml` that is a DIRECTORY, so
+    /// the bytes reach the temp and the rename is what refuses.
     #[cfg(unix)]
     #[test]
     fn failed_write_reclaims_its_temp() {
@@ -1579,12 +1549,11 @@ pub(crate) mod full_pass_rule_tier1 {
         state: &State,
         records_pass_end: bool,
         now: i64,
-    ) -> (Layout, Option<crate::progress::ProgressSink>) {
-        let p =
-            std::env::temp_dir().join(format!("atpkg-full-pass-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        let layout = Layout { prefix: p };
+    ) -> (
+        crate::testdir::ScratchLayout,
+        Option<crate::progress::ProgressSink>,
+    ) {
+        let layout = crate::testdir::layout(&format!("atpkg-full-pass-{label}-"));
         let at = |ticks: i64| now - AGE_SECS[usize::try_from(ticks).unwrap()];
         let stamp = |unix: i64| aterm_types::rfc3339::format_rfc3339(unix.unsigned_abs());
         let (rec, pass_age) = (state["rec"], state["pass_age"]);

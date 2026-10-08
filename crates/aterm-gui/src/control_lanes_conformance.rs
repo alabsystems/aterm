@@ -27,10 +27,11 @@ use aterm_spec::interp::{State, admits};
 use aterm_uds::CtlStream;
 
 use super::super::{Scope, ServeDisposition};
-use super::{Census, LaneLimits, LaneService, Lanes};
+use super::{Census, LaneLimits, LaneReader, LaneService, Lanes};
 
-/// How long any settle may take before the test calls the lanes wedged.
-const SETTLE: Duration = Duration::from_secs(10);
+/// How long any settle may take before the test calls the lanes wedged: the
+/// house hang detector, never a latency budget.
+const SETTLE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 #[derive(Default)]
 struct Gate {
@@ -46,13 +47,18 @@ struct Gate {
 /// lane and `wait…` (a wait request) blocks wherever it is served, each until
 /// the test releases one of its kind; `claim` binds a claim to the connection;
 /// `who` answers the serving connection's serial; `quit` closes; anything else
-/// is answered at once.
+/// is answered at once. Releasing the claims of a connection named in
+/// `panic_release` panics instead (a defective release, for the parker tests).
 #[derive(Default)]
 struct Stub {
     gate: Mutex<Gate>,
     moved: Condvar,
     released: Mutex<Vec<u64>>,
+    panic_release: Mutex<Vec<u64>>,
 }
+
+/// The busy reply, as the lanes write it.
+const BUSY: &str = aterm_types::control_verbs::CONTROL_BUSY_REPLY;
 
 fn on_wait_lane() -> bool {
     std::thread::current()
@@ -122,7 +128,7 @@ impl LaneService for Stub {
     fn authenticate(
         &self,
         stream: &CtlStream,
-        reader: &mut BufReader<&CtlStream>,
+        reader: &mut LaneReader<'_>,
     ) -> Option<(Scope, Option<String>)> {
         let first = super::super::read_request_line(reader)?;
         if first == "AUTH ok" {
@@ -138,7 +144,7 @@ impl LaneService for Stub {
         line: String,
         _scope: Scope,
         stream: &CtlStream,
-        _reader: &mut BufReader<&CtlStream>,
+        _reader: &mut LaneReader<'_>,
     ) -> Option<ServeDisposition> {
         let reply = match line.as_str() {
             "quit" => return Some(ServeDisposition::Close),
@@ -170,6 +176,14 @@ impl LaneService for Stub {
     }
 
     fn release(&self, id: u64) {
+        let defective = self
+            .panic_release
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&id);
+        if defective {
+            panic!("injected: releasing connection {id}'s claims panics");
+        }
         self.released
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -262,11 +276,15 @@ impl Rig {
 }
 
 /// What the Tier-1 test knows that the lanes do not count: connections
-/// admitted so far, and whether a refusal came while a lane held an idle one.
+/// admitted so far, whether a refusal came while a lane held an idle one,
+/// whether a wait was answered busy, and whether a wait was kept on a request
+/// lane beside a free wait lane.
 #[derive(Clone, Copy, Default)]
 struct Facts {
     arrivals: i64,
     refused_idle: i64,
+    busied: i64,
+    bypassed: i64,
 }
 
 fn count(n: usize) -> i64 {
@@ -275,7 +293,8 @@ fn count(n: usize) -> i64 {
 
 /// Project the genuine lanes onto the model at a QUIESCENT point (no resume in
 /// the queue, no request between lanes). `held` is request-lane work no
-/// request in flight explains: an idle connection kept on its lane.
+/// request in flight explains: an idle connection kept on its lane. A request
+/// lane serving a wait (the lanes' `inline` count) is `inline`, not `working`.
 fn project(census: Census, flight: (usize, usize), facts: Facts) -> State {
     assert_eq!(
         census.waits, flight.1,
@@ -283,14 +302,17 @@ fn project(census: Census, flight: (usize, usize), facts: Facts) -> State {
     );
     let model = control_lane_tenure_model();
     let mut state = model.init_state();
-    state.insert("working", count(flight.0));
+    state.insert("working", count(flight.0) - count(census.inline));
     state.insert("held", count(census.rpc) - count(flight.0));
     state.insert("waiting", count(flight.1));
+    state.insert("inline", count(census.inline));
     state.insert("parked", count(census.parked));
     state.insert("queued", 0);
     state.insert("open", count(census.open));
     state.insert("arrivals", facts.arrivals);
     state.insert("refused_idle", facts.refused_idle);
+    state.insert("busied", facts.busied);
+    state.insert("bypassed", facts.bypassed);
     state
 }
 
@@ -332,7 +354,8 @@ fn model_limits() -> LaneLimits {
     LaneLimits {
         rpc: 2,
         wait: 1,
-        open: 2,
+        inline: 1,
+        open: 3,
     }
 }
 
@@ -350,10 +373,15 @@ fn shipping_lanes_conform_to_the_lane_tenure_model() {
             let census = rig.settle(what, |c, f| want(c, f) && c.rpc == f.0 && c.waits == f.1);
             project(census, rig.stub.in_flight(), facts)
         };
-    let s0 = observe(&rig, facts, "empty", &|c, _| c == Census::default());
+    let s0 = observe(&rig, facts, "empty", &|c, _| {
+        c == Census {
+            parking: true,
+            ..Census::default()
+        }
+    });
     assert_eq!(s0, model.init_state());
 
-    // Two drivers, served once and left idle: each parks.
+    // Three drivers, served once and left idle: each parks.
     let mut a = rig.idle().expect("A admitted");
     facts.arrivals += 1;
     let s1 = observe(&rig, facts, "A parked", &|c, _| c.parked == 1 && c.rpc == 0);
@@ -362,92 +390,155 @@ fn shipping_lanes_conform_to_the_lane_tenure_model() {
     facts.arrivals += 1;
     let s2 = observe(&rig, facts, "B parked", &|c, _| c.parked == 2 && c.rpc == 0);
     assert_path(&model, &s1, &["Admit", "Finish"], &s2);
+    let mut third = rig.idle().expect("C admitted");
+    facts.arrivals += 1;
+    let s3 = observe(&rig, facts, "C parked", &|c, _| c.parked == 3 && c.rpc == 0);
+    assert_path(&model, &s2, &["Admit", "Finish"], &s3);
 
     // Every request lane is free, but the open-connection bound is reached: a
-    // third client is refused, and not for an idle driver.
+    // fourth client is refused, and not for an idle driver.
     assert!(rig.dial().is_none(), "the open-connection bound refuses");
-    assert!(model.successors("Admit", &s2).is_empty());
-    assert_path(&model, &s2, &["Refuse"], &s2);
+    assert!(model.successors("Admit", &s3).is_empty());
+    assert_path(&model, &s3, &["Refuse"], &s3);
 
     // A asks for work: woken, taken back by a request lane.
     a.send("work\n");
-    let s3 = observe(&rig, facts, "A working", &|c, f| {
-        f == (1, 0) && c.parked == 1
+    let s4 = observe(&rig, facts, "A working", &|c, f| {
+        f == (1, 0) && c.parked == 2
     });
-    assert_path(&model, &s2, &["Wake", "Pick"], &s3);
+    assert_path(&model, &s3, &["Wake", "Pick"], &s4);
     // B asks for a wait: woken, taken back, moved to the wait lane.
     b.send("wait\n");
-    let s4 = observe(&rig, facts, "B waiting", &|c, f| {
-        f == (1, 1) && c.parked == 0 && c.rpc == 1
+    let s5 = observe(&rig, facts, "B waiting", &|c, f| {
+        f == (1, 1) && c.parked == 1 && c.rpc == 1
     });
-    assert_path(&model, &s3, &["Wake", "Pick", "Defer"], &s4);
+    assert_path(&model, &s4, &["Wake", "Pick", "Defer"], &s5);
 
     // Each finishes and parks: the request lane's and the wait lane's finish.
     rig.stub.let_finish(false);
     assert_eq!(a.line(), "OK work");
-    let s5 = observe(&rig, facts, "A parked again", &|c, f| {
-        f == (0, 1) && c.parked == 1 && c.rpc == 0
+    let s6 = observe(&rig, facts, "A parked again", &|c, f| {
+        f == (0, 1) && c.parked == 2 && c.rpc == 0
     });
-    assert_path(&model, &s4, &["Finish"], &s5);
+    assert_path(&model, &s5, &["Finish"], &s6);
     rig.stub.let_finish(true);
     assert_eq!(b.line(), "OK wait");
-    let s6 = observe(&rig, facts, "B parked again", &|c, f| {
-        f == (0, 0) && c.parked == 2
+    let s7 = observe(&rig, facts, "B parked again", &|c, f| {
+        f == (0, 0) && c.parked == 3
     });
-    assert_path(&model, &s5, &["WaitFinish"], &s6);
+    assert_path(&model, &s6, &["WaitFinish"], &s7);
 
     // A binds a claim to its connection and quits: the close ends the tenure,
     // and the claim with it.
     assert_eq!(a.request("claim"), "OK claim");
     let who = a.request("who");
     let a_id: u64 = who.trim_start_matches("OK ").parse().expect("a serial");
-    let s7 = observe(&rig, facts, "A parked after claim", &|c, _| {
-        c.parked == 2 && c.rpc == 0
+    let s8 = observe(&rig, facts, "A parked after claim", &|c, _| {
+        c.parked == 3 && c.rpc == 0
     });
-    assert_path(&model, &s6, &["Wake", "Pick", "Finish"], &s7);
+    assert_path(&model, &s7, &["Wake", "Pick", "Finish"], &s8);
     a.send("quit\n");
     assert_eq!(a.line(), "<EOF>");
-    let s8 = observe(&rig, facts, "A closed", &|c, _| {
-        c.open == 1 && c.parked == 1
+    let s9 = observe(&rig, facts, "A closed", &|c, _| {
+        c.open == 2 && c.parked == 2
     });
-    assert_path(&model, &s7, &["Wake", "Pick", "Close"], &s8);
+    assert_path(&model, &s8, &["Wake", "Pick", "Close"], &s9);
     assert_eq!(rig.stub.released(), vec![a_id], "A's claim ended with it");
 
-    // B's peer hangs up while parked: the parker closes it.
-    drop(b);
-    let s9 = observe(&rig, facts, "B closed", &|c, _| {
-        c.open == 0 && c.parked == 0
-    });
-    assert_path(&model, &s8, &["ParkedClose"], &s9);
-
-    // Two more: D's wait takes the one wait lane; E's wait finds it taken and
-    // is served on its request lane.
+    // WAITS PAST THE WAIT LANES. D's wait takes the one wait lane, with the
+    // request pipelined behind it (all three lines are one read): it moves
+    // along, and is answered there after the wait.
     let mut d = rig.dial().expect("D admitted");
     facts.arrivals += 1;
-    d.send("AUTH ok\nwait\n");
+    d.send("AUTH ok\nwait\nlane\n");
     let s10 = observe(&rig, facts, "D waiting", &|c, f| f == (0, 1) && c.rpc == 0);
     assert_path(&model, &s9, &["Admit", "Defer"], &s10);
-    let mut e = rig.dial().expect("E admitted");
-    facts.arrivals += 1;
-    e.send("AUTH ok\nwait\n");
-    let s11 = observe(&rig, facts, "E waiting inline", &|c, f| {
-        f == (1, 1) && c.rpc == 1
+    // B's wait finds it taken and is served on its request lane: the budget's
+    // one place.
+    b.send("wait\n");
+    let s11 = observe(&rig, facts, "B waiting inline", &|c, f| {
+        f == (1, 1) && c.rpc == 1 && c.inline == 1 && c.parked == 1
     });
-    assert_path(&model, &s10, &["Admit"], &s11);
-    // D's client says `quit` while its wait runs; the wait lane serves it next.
+    assert_path(&model, &s10, &["Wake", "Pick", "InlineWait"], &s11);
+    // C's wait finds the wait lane taken AND the budget spent: the busy reply,
+    // on a connection that stays open and parks again — the other request lane
+    // is still free. "Without waiting" is an ORDER, not a stopwatch: a wait
+    // that were held would answer only once `let_finish` below lets it.
+    third.send("wait\n");
+    assert_eq!(third.line(), BUSY, "a wait past every lane it may take");
+    facts.busied = 1;
+    let s12 = observe(&rig, facts, "C parked after its busy wait", &|c, f| {
+        f == (1, 1) && c.rpc == 1 && c.inline == 1 && c.parked == 1
+    });
+    assert_path(&model, &s11, &["Wake", "Pick", "BusyWait"], &s12);
+    // D's client says `quit` while its wait runs; the wait lane serves the
+    // carried `lane`, then the `quit`.
     d.send("quit\n");
     rig.stub.let_finish(true);
     assert_eq!(d.line(), "OK wait");
+    assert_eq!(
+        d.line(),
+        "OK wait",
+        "the carried request, served where it landed"
+    );
     assert_eq!(d.line(), "<EOF>");
-    let s12 = observe(&rig, facts, "D closed", &|c, f| f == (1, 0) && c.open == 1);
-    assert_path(&model, &s11, &["WaitClose"], &s12);
+    let s13 = observe(&rig, facts, "D closed", &|c, f| f == (1, 0) && c.open == 2);
+    assert_path(&model, &s12, &["WaitClose"], &s13);
+    // B's wait ends on its request lane, and B parks.
+    rig.stub.let_finish(false);
+    assert_eq!(b.line(), "OK wait");
+    let s14 = observe(&rig, facts, "B parked", &|c, f| {
+        f == (0, 0) && c.parked == 2 && c.inline == 0
+    });
+    assert_path(&model, &s13, &["InlineFinish"], &s14);
+    // C, still connected after its busy reply, is served as ever.
+    assert_eq!(third.request("ping"), "OK ping");
+    let s15 = observe(&rig, facts, "C parked again", &|c, f| {
+        f == (0, 0) && c.parked == 2
+    });
+    assert_path(&model, &s14, &["Wake", "Pick", "Finish"], &s15);
+
+    // B's peer hangs up while parked: the parker closes it.
+    drop(b);
+    let s16 = observe(&rig, facts, "B closed", &|c, _| {
+        c.open == 1 && c.parked == 1
+    });
+    assert_path(&model, &s15, &["ParkedClose"], &s16);
+    drop(third);
+}
+
+/// A wait served on its request lane ends with its connection: the lane's
+/// `InlineClose` (the client said `quit` behind it).
+#[test]
+fn an_inline_wait_whose_client_quits_closes_there() {
+    let model = control_lane_tenure_model();
+    let rig = Rig::new(model_limits());
+    let mut facts = Facts::default();
+    let mut d = rig.dial().expect("D admitted");
+    facts.arrivals += 1;
+    d.send("AUTH ok\nwait\n");
+    let census = rig.settle("D waiting", |c, f| f == (0, 1) && c.rpc == 0);
+    let s1 = project(census, rig.stub.in_flight(), facts);
+    // `wait` with `quit` pipelined behind it: the one wait lane is D's, so it
+    // is served where it is, within the budget.
+    let mut e = rig.dial().expect("E admitted");
+    facts.arrivals += 1;
+    e.send("AUTH ok\nwait\nquit\n");
+    let census = rig.settle("E waiting inline", |c, f| {
+        f == (1, 1) && c.rpc == 1 && c.inline == 1
+    });
+    let s2 = project(census, rig.stub.in_flight(), facts);
+    assert_path(&model, &s1, &["Admit", "InlineWait"], &s2);
     rig.stub.let_finish(false);
     assert_eq!(e.line(), "OK wait");
-    let s13 = observe(&rig, facts, "E parked", &|c, f| {
-        f == (0, 0) && c.parked == 1
+    assert_eq!(e.line(), "<EOF>");
+    let census = rig.settle("E closed", |c, f| {
+        f == (0, 1) && c.rpc == 0 && c.inline == 0 && c.open == 1
     });
-    assert_path(&model, &s12, &["Finish"], &s13);
-    drop(e);
+    let s3 = project(census, rig.stub.in_flight(), facts);
+    assert_path(&model, &s2, &["InlineClose"], &s3);
+    rig.stub.let_finish(true);
+    assert_eq!(d.line(), "OK wait");
 }
 
 /// THE NEGATIVE CONTROL: the old design, run for real. Without a parker the
@@ -460,6 +551,7 @@ fn the_old_lane_held_design_is_rejected_by_the_model() {
     let rig = Rig::new(LaneLimits {
         rpc: 2,
         wait: 1,
+        inline: 2,
         open: 0,
     });
     let s0 = project(rig.lanes.census(), rig.stub.in_flight(), Facts::default());
@@ -504,6 +596,7 @@ fn idle_drivers_do_not_starve_a_fresh_client() {
     let rig = Rig::new(LaneLimits {
         rpc: 2,
         wait: 1,
+        inline: 1,
         open: 64,
     });
     // Each is served, and parked before the next dials: a lane is busy until
@@ -538,6 +631,7 @@ fn idle_drivers_do_not_starve_a_fresh_client() {
     let old = Rig::new(LaneLimits {
         rpc: 2,
         wait: 1,
+        inline: 2,
         open: 0,
     });
     let _held: Vec<Client> = (0..2).map(|_| old.idle().expect("two fit")).collect();
@@ -548,14 +642,15 @@ fn idle_drivers_do_not_starve_a_fresh_client() {
     );
 }
 
-/// Drivers parked in waits move off the request lanes; with no wait lanes (the
-/// old design) the same waits take the request lanes and refuse a fresh
-/// client.
+/// Drivers parked in waits move off the request lanes; with no wait lanes and
+/// no bound on the waits a request lane serves (the old design) the same waits
+/// take the request lanes and refuse a fresh client.
 #[test]
 fn waiting_drivers_do_not_starve_a_fresh_client() {
     let rig = Rig::new(LaneLimits {
         rpc: 2,
         wait: 8,
+        inline: 1,
         open: 64,
     });
     let mut waiting = Vec::new();
@@ -578,6 +673,7 @@ fn waiting_drivers_do_not_starve_a_fresh_client() {
     let old = Rig::new(LaneLimits {
         rpc: 2,
         wait: 0,
+        inline: 2,
         open: 64,
     });
     let mut held = Vec::new();
@@ -609,6 +705,7 @@ fn a_pool_saturated_with_work_still_refuses_promptly() {
     let rig = Rig::new(LaneLimits {
         rpc: 2,
         wait: 1,
+        inline: 1,
         open: 64,
     });
     let mut workers = Vec::new();
@@ -635,7 +732,7 @@ fn a_pool_saturated_with_work_still_refuses_promptly() {
         let _ = answer_tx.send(lanes.admit(server).is_ok());
     });
     let admitted = answer_rx
-        .recv_timeout(SETTLE * 6)
+        .recv_timeout(SETTLE)
         .expect("the saturated lanes parked the admission instead of refusing it");
     assert!(!admitted, "saturated with work: refused");
     assert_eq!(
@@ -663,6 +760,7 @@ fn claims_follow_the_connection_across_lanes_and_end_with_it() {
     let rig = Rig::new(LaneLimits {
         rpc: 2,
         wait: 2,
+        inline: 1,
         open: 8,
     });
     let mut driver = rig.idle().expect("admitted");
@@ -703,6 +801,7 @@ fn pipelined_requests_answer_in_order() {
     let rig = Rig::new(LaneLimits {
         rpc: 2,
         wait: 2,
+        inline: 1,
         open: 8,
     });
     let mut driver = rig.idle().expect("admitted");
@@ -726,4 +825,462 @@ fn pipelined_requests_answer_in_order() {
         c.parked == 1 && c.rpc == 0 && c.waits == 0 && f == (0, 0)
     });
     assert_eq!(driver.request("lane"), "OK rpc");
+}
+
+/// How long the negative controls watch a request that must NOT be answered
+/// (starved behind the waits) before calling it starved. Only an ABSENCE is
+/// judged by it — a request that must be answered is read within [`SETTLE`],
+/// since nothing here frees a lane before the test lets a wait finish.
+const STARVED: Duration = Duration::from_millis(500);
+
+/// Read one line within `within`, or say that none came. (macOS refuses a
+/// read timeout on a socket its peer has already closed; a read there cannot
+/// block anyway, so the refusal is ignored.)
+fn line_within(client: &mut Client, within: Duration) -> Option<String> {
+    let _ = client.stream.set_read_timeout(Some(within));
+    let mut reply = String::new();
+    let read = client.reader.read_line(&mut reply);
+    let _ = client.stream.set_read_timeout(Some(SETTLE));
+    match read {
+        Ok(0) => Some("<EOF>".to_string()),
+        Ok(_) => Some(reply.trim_end().to_string()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            None
+        }
+        Err(error) => Some(format!("<{error}>")),
+    }
+}
+
+/// WAITS PAST THE WAIT LANES (the review of 2026-09-27): with every wait lane
+/// taken, a wait is served on a request lane only within the budget, and the
+/// one past it is answered busy at once — so a parked driver's next request,
+/// and a fresh client, are still served while every wait runs. The negative
+/// control is the fallback as first shipped (a budget of every request lane):
+/// the same waits take both lanes, and the parked driver's request waits
+/// behind them — never refused, never answered — until a wait ends.
+#[test]
+fn waits_past_every_wait_lane_leave_a_request_lane_for_requests() {
+    let model = control_lane_tenure_model();
+    for (inline, shipping) in [(1, true), (2, false)] {
+        let rig = Rig::new(LaneLimits {
+            rpc: 2,
+            wait: 1,
+            inline,
+            open: 8,
+        });
+        let mut parked = rig.idle().expect("the parked driver admitted");
+        rig.settle("the driver parked", |c, _| c.parked == 1 && c.rpc == 0);
+        let mut waits = Vec::new();
+        for index in 0..2 {
+            let mut wait = rig.dial().expect("a wait admitted");
+            wait.send("AUTH ok\nwait\n");
+            waits.push(wait);
+            // The first takes the wait lane, the second a request lane.
+            rig.settle("placed", |c, f| {
+                f == (index, 1) && c.inline == index && c.rpc == index
+            });
+        }
+        // A third wait: no wait lane is free, and the one request lane a wait
+        // may take is taken.
+        let mut third = rig.dial().expect("the third wait admitted");
+        third.send("AUTH ok\nwait\n");
+        if shipping {
+            assert_eq!(
+                line_within(&mut third, SETTLE).as_deref(),
+                Some(BUSY),
+                "the wait past the budget is answered busy, with no wait ending"
+            );
+            assert_eq!(third.request("ping"), "OK ping", "and its connection kept");
+            let census = rig.settle("the third parked", |c, f| {
+                f == (1, 1) && c.rpc == 1 && c.parked == 2
+            });
+            let facts = Facts {
+                arrivals: 4,
+                busied: 1,
+                ..Facts::default()
+            };
+            let state = project(census, rig.stub.in_flight(), facts);
+            assert!(
+                model.check_invariant("RequestLaneLeftForRequests", &state),
+                "{state:?}"
+            );
+            // The parked driver's next request, and a fresh client, are served
+            // at once on the lane the waits leave.
+            parked.send("lane\n");
+            assert_eq!(
+                line_within(&mut parked, SETTLE).as_deref(),
+                Some("OK rpc"),
+                "the parked driver's request, beside every wait"
+            );
+            // (A lane is busy until its connection is placed again.)
+            rig.settle("the driver parked again", |c, f| {
+                f == (1, 1) && c.rpc == 1 && c.parked == 2
+            });
+            let mut fresh = rig
+                .dial()
+                .expect("a fresh client admitted beside every wait");
+            fresh.send("AUTH ok\nping\n");
+            assert_eq!(line_within(&mut fresh, SETTLE).as_deref(), Some("OK ping"));
+        } else {
+            let census = rig.settle("the third on the other request lane", |c, f| {
+                f == (2, 1) && c.rpc == 2 && c.inline == 2
+            });
+            let facts = Facts {
+                arrivals: 4,
+                ..Facts::default()
+            };
+            let state = project(census, rig.stub.in_flight(), facts);
+            assert!(
+                !model.check_invariant("RequestLaneLeftForRequests", &state),
+                "negative control: the model rejects waits on every request lane: {state:?}"
+            );
+            assert!(
+                rig.dial().is_none(),
+                "negative control: waits on every request lane refuse a fresh client"
+            );
+            parked.send("lane\n");
+            assert_eq!(
+                line_within(&mut parked, STARVED),
+                None,
+                "negative control: the parked driver's request is starved behind the waits"
+            );
+            // It is served only when a wait ends and frees its lane.
+            rig.stub.let_finish(false);
+            assert_eq!(parked.line(), "OK rpc");
+            rig.stub.let_finish(false);
+            assert_eq!(third.line(), "OK wait");
+        }
+        rig.stub.let_finish(true);
+        if shipping {
+            rig.stub.let_finish(false);
+        }
+        for wait in &mut waits {
+            assert_eq!(wait.line(), "OK wait");
+        }
+    }
+}
+
+/// A WAIT WITH A REQUEST PIPELINED BEHIND IT (the review of the budget,
+/// 2026-09-27) — `RelayClient::dial_via_local`'s shape, `dial <name>` then
+/// `version` written back to back, one `aterm drive --dial` relay each — moves
+/// to a wait lane like any other, carrying the requests behind it: more such
+/// waits than the request lanes and their budget are all held, none is answered
+/// busy, a fresh client is served beside them, and each connection's pipelined
+/// requests are answered after its wait, in order, on the wait lane it moved
+/// to. The negative control is the rule before the carry (a wait with anything
+/// buffered behind it stays on its request lane): the first takes the budget's
+/// one place and every later one is answered busy with seven wait lanes free —
+/// the fifth relay turned away — which the model rejects (`WaitLaneTakenFirst`).
+#[test]
+fn pipelined_waits_move_with_the_requests_behind_them() {
+    const WAITS: usize = 5;
+    let model = control_lane_tenure_model();
+    for shipping in [true, false] {
+        let rig = Rig::new(LaneLimits {
+            rpc: 2,
+            wait: 8,
+            inline: 1,
+            open: 16,
+        });
+        if !shipping {
+            rig.lanes.keep_pipelined_waits();
+        }
+        let mut relays = Vec::new();
+        for index in 0..WAITS {
+            let mut relay = rig.dial().expect("a relay admitted");
+            // One write, so the lane's first read takes every line: the wait is
+            // read with the rest already buffered behind it.
+            relay.send(&format!("AUTH ok\nwait relay {index}\nversion\nlane\n"));
+            if shipping {
+                rig.settle("on a wait lane", |c, f| {
+                    f == (0, index + 1) && c.waits == index + 1 && c.rpc == 0 && c.inline == 0
+                });
+            } else if index == 0 {
+                rig.settle("kept on its request lane", |c, f| {
+                    f == (1, 0) && c.inline == 1 && c.waits == 0
+                });
+            } else {
+                assert_eq!(
+                    line_within(&mut relay, SETTLE).as_deref(),
+                    Some(BUSY),
+                    "negative control: relay {index} is turned away beside free wait lanes"
+                );
+                assert_eq!(relay.line(), "OK version");
+                assert_eq!(relay.line(), "OK rpc");
+                // (A lane is busy until its connection is placed again.)
+                rig.settle("turned away, then parked", |c, _| {
+                    c.parked == index && c.rpc == 1
+                });
+            }
+            relays.push(relay);
+        }
+        let census = rig.settle("every relay placed", |c, f| {
+            if shipping {
+                f == (0, WAITS) && c.rpc == 0 && c.waits == WAITS
+            } else {
+                f == (1, 0) && c.rpc == 1 && c.inline == 1 && c.parked == WAITS - 1
+            }
+        });
+        let facts = Facts {
+            arrivals: count(WAITS),
+            busied: i64::from(!shipping),
+            bypassed: i64::from(!shipping),
+            ..Facts::default()
+        };
+        let state = project(census, rig.stub.in_flight(), facts);
+        if shipping {
+            assert_eq!(
+                (census.waits, census.inline),
+                (WAITS, 0),
+                "every relay held on a wait lane"
+            );
+            assert!(
+                model.check_invariant("WaitLaneTakenFirst", &state),
+                "{state:?}"
+            );
+            let mut fresh = rig.dial().expect("a fresh client beside every relay");
+            fresh.send("AUTH ok\nlane\n");
+            assert_eq!(line_within(&mut fresh, SETTLE).as_deref(), Some("OK rpc"));
+            for _ in 0..WAITS {
+                rig.stub.let_finish(true);
+            }
+            for (index, relay) in relays.iter_mut().enumerate() {
+                assert_eq!(
+                    relay.line(),
+                    format!("OK wait relay {index}"),
+                    "relay {index} held, never answered busy"
+                );
+                assert_eq!(relay.line(), "OK version", "then the request behind it");
+                assert_eq!(
+                    relay.line(),
+                    "OK wait",
+                    "served on the wait lane it moved to"
+                );
+            }
+            rig.settle("every relay parked", |c, f| {
+                f == (0, 0) && c.parked == WAITS + 1 && c.waits == 0
+            });
+        } else {
+            assert_eq!(
+                census.waits, 0,
+                "negative control: no relay reached a wait lane"
+            );
+            assert!(
+                !model.check_invariant("WaitLaneTakenFirst", &state),
+                "negative control: the model rejects a wait kept beside a free wait lane: \
+                 {state:?}"
+            );
+            rig.stub.let_finish(false);
+            assert_eq!(relays[0].line(), "OK wait relay 0");
+            assert_eq!(relays[0].line(), "OK version");
+            assert_eq!(relays[0].line(), "OK rpc");
+        }
+    }
+}
+
+/// A panic while ONE parked connection wakes — here the release of its claims,
+/// run when its peer hangs up while parked — costs that connection alone. The
+/// parker goes on, and every other parked connection is still served. (Before,
+/// the panic ended the parker's thread: every parked connection was stranded,
+/// its next request never read, and every connection parked after it too.)
+/// Three such wakes come in a row here, and none counts toward the parker's
+/// stop (`PARKER_PANICS_IN_A_ROW`): a parker that let them reach its restart
+/// would stop on the third and hang up the connection kept beside them.
+#[test]
+fn a_panic_as_one_parked_connection_wakes_costs_that_connection_alone() {
+    const DOOMED: usize = 3;
+    let rig = Rig::new(LaneLimits {
+        rpc: 2,
+        wait: 1,
+        inline: 1,
+        open: 8,
+    });
+    let mut doomed = Vec::new();
+    let mut doomed_ids = Vec::new();
+    for index in 0..DOOMED {
+        let mut conn = rig.idle().expect("admitted");
+        assert_eq!(conn.request("claim"), "OK claim");
+        let id: u64 = conn
+            .request("who")
+            .trim_start_matches("OK ")
+            .parse()
+            .expect("a serial");
+        rig.settle("parked", |c, _| c.parked == index + 1 && c.rpc == 0);
+        doomed.push(conn);
+        doomed_ids.push(id);
+    }
+    let mut kept = rig.idle().expect("admitted");
+    rig.settle("all parked", |c, _| c.parked == DOOMED + 1 && c.rpc == 0);
+    *rig.stub
+        .panic_release
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = doomed_ids;
+    // Their peers hang up while parked: the parker closes each, and each
+    // release panics there, one after another.
+    drop(doomed);
+    rig.settle("the doomed ones closed", |c, _| {
+        c.open == 1 && c.parked == 1
+    });
+    assert!(
+        rig.lanes.census().parking,
+        "{DOOMED} wake panics in a row must not stop the parker"
+    );
+    kept.send("ping\n");
+    assert_eq!(
+        line_within(&mut kept, SETTLE).as_deref(),
+        Some("OK ping"),
+        "a connection parked across the panics is still served"
+    );
+    // (A lane is busy until its connection is placed again.)
+    rig.settle("parked again, the parker running", |c, _| {
+        c.parking && c.parked == 1 && c.rpc == 0
+    });
+    let mut later = rig.idle().expect("a connection parked after the panics");
+    rig.settle("parked after the panics", |c, _| {
+        c.parked == 2 && c.rpc == 0
+    });
+    assert_eq!(later.request("ping"), "OK ping");
+}
+
+/// A panic in the parker's loop itself (injected, one pass) restarts the loop
+/// over the SAME parked set: the connection whose readiness it was handling
+/// when it panicked, a connection parked beside it, and one parked after it
+/// are all served. (Before, the thread died with every parked connection in
+/// it.)
+#[test]
+fn a_parker_panic_restarts_it_with_every_parked_connection() {
+    let rig = Rig::new(LaneLimits {
+        rpc: 2,
+        wait: 1,
+        inline: 1,
+        open: 8,
+    });
+    let mut first = rig.idle().expect("admitted");
+    let mut beside = rig.idle().expect("admitted");
+    rig.settle("both parked", |c, _| c.parked == 2 && c.rpc == 0);
+    rig.lanes.inject_parker_panics(1);
+    first.send("ping\n");
+    assert_eq!(
+        line_within(&mut first, SETTLE).as_deref(),
+        Some("OK ping"),
+        "the connection that woke the panicking pass is served after the restart"
+    );
+    assert_eq!(
+        beside.request("ping"),
+        "OK ping",
+        "its neighbour kept its place"
+    );
+    // (A lane is busy until its connection is placed again.)
+    rig.settle("both parked again, the parker running", |c, _| {
+        c.parking && c.parked == 2 && c.rpc == 0
+    });
+    let mut later = rig.idle().expect("a connection parked after the restart");
+    rig.settle("three parked", |c, _| c.parked == 3 && c.rpc == 0);
+    assert_eq!(later.request("ping"), "OK ping");
+    assert_eq!(first.request("again"), "OK again");
+}
+
+/// A parker that cannot go on — its loop panicking pass after pass — STOPS
+/// safely: every connection it held is closed (a hang-up its client rides
+/// out, never a request left unread for ever), their claims end with them,
+/// and the lanes serve on as without a parker: a fresh client is admitted and
+/// answered, and keeps its lane while idle.
+#[test]
+fn a_parker_that_cannot_go_on_closes_what_it_holds_and_the_lanes_serve_on() {
+    let rig = Rig::new(LaneLimits {
+        rpc: 2,
+        wait: 1,
+        inline: 1,
+        open: 8,
+    });
+    let mut claimed = rig.idle().expect("admitted");
+    assert_eq!(claimed.request("claim"), "OK claim");
+    let claimed_id: u64 = claimed
+        .request("who")
+        .trim_start_matches("OK ")
+        .parse()
+        .expect("a serial");
+    let mut idle = rig.idle().expect("admitted");
+    rig.settle("both parked", |c, _| c.parked == 2 && c.rpc == 0);
+    rig.lanes.inject_parker_panics(usize::MAX);
+    claimed.send("ping\n");
+    assert_eq!(
+        line_within(&mut claimed, SETTLE).as_deref(),
+        Some("<EOF>"),
+        "a stopped parker hangs its connections up rather than strand them"
+    );
+    assert_eq!(line_within(&mut idle, SETTLE).as_deref(), Some("<EOF>"));
+    rig.settle("stopped: nothing parked, nothing open", |c, _| {
+        !c.parking && c.parked == 0 && c.open == 0
+    });
+    assert_eq!(
+        rig.stub.released(),
+        vec![claimed_id],
+        "its claim ended with it"
+    );
+    // The lanes run as without a parker: served, and kept on its lane when
+    // idle (never handed to the parker that is gone). A lane places a
+    // connection in microseconds; for a quarter of a second it must stay there.
+    let mut fresh = rig.idle().expect("a fresh client after the stop");
+    let kept_until = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < kept_until {
+        let census = rig.lanes.census();
+        assert!(
+            census.rpc == 1 && census.parked == 0,
+            "an idle connection after the stop must keep its lane: {census:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(fresh.request("again"), "OK again");
+}
+
+/// A CLIENT THAT HALF-CLOSED AFTER ITS REQUEST (`printf … | nc -U`) reads its
+/// answer and then END-OF-FILE when its lane closes the connection, though a
+/// copy of the server end survives — the copy any thread's fork holds until it
+/// execs (a `try_clone` here: one more descriptor on the same socket, which is
+/// all the kernel counts). The claim's release is the fact that the lane has
+/// closed it ([`super::Conn::close`] hangs up, then the tenure drops), so one
+/// non-blocking read after it is the verdict.
+///
+/// NEGATIVE CONTROL (run by restoring the both-ways `shutdown`): Darwin refused
+/// it for a socket whose read half the client's half-close had shut
+/// (`ENOTCONN`) and shut nothing, so the client read `WouldBlock` after its
+/// answer, not its end-of-file, for as long as the copy lived.
+#[test]
+fn a_half_closed_client_reads_eof_when_its_lane_closes_though_a_copy_survives() {
+    use std::io::Read as _;
+
+    let rig = Rig::new(model_limits());
+    let (client, server) = CtlStream::pair().expect("real control socket pair");
+    let forked_copy = server
+        .try_clone()
+        .expect("a surviving copy of the server end");
+    assert!(rig.lanes.admit(server).is_ok(), "admitted");
+    (&client)
+        .write_all(b"AUTH ok\nclaim\n")
+        .expect("the request");
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("the client half-closes after its request");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the lane to close the half-closed connection",
+        || (!rig.stub.released().is_empty()).then_some(()),
+    );
+
+    client.set_nonblocking(true).expect("non-blocking");
+    let mut answer = Vec::new();
+    let end = (&client).read_to_end(&mut answer).map_err(|e| e.kind());
+    assert_eq!(String::from_utf8_lossy(&answer), "OK claim\n");
+    assert!(
+        end.is_ok(),
+        "the client read no end-of-file from a lane that closed while a copy of its end \
+         lived: {end:?}"
+    );
+    drop(forked_copy);
 }

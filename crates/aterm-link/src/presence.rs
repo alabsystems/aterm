@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PRESENCE WITH MEANING — the fields the bridge writes on every hosted
-//! session's presence row so a manager reads WHAT A SESSION IS DOING off the
-//! bus instead of off its screen (round 13 C):
+//! Presence with meaning: the fields the bridge writes on every hosted
+//! session's presence row, so a manager reads what a session is doing off the
+//! bus instead of off its screen:
 //!
 //! ```text
 //! role=<meta role> detail=<the running program, as `ls` prints it>
@@ -19,25 +19,16 @@
 //! is the sanitized running command aterm's `status`/`sessions` report
 //! (`claude`, `targo test`, `-` at a prompt).
 //!
-//! Until 2026-09-23 this module read the screen ITSELF (the last 40 rows,
-//! through `aterm-phase`) on the argument that one reader for both faces —
-//! the bus and `aterm drive phase` — could not disagree. The server now
-//! publishes that verdict once, for every client, and a second reader in the
-//! fabric is exactly the duplication the argument was against, plus vendor
-//! screen knowledge in a crate that is meant to know none (the harness
-//! audit's law 3). `context=<n>%` went with it: the server publishes no
-//! context figure, so a row carries none (`aterm link ls` still prints the
-//! column, `-`, for rows an older bridge wrote).
+//! The fabric reads no screen itself: vendor screen knowledge stays in the
+//! server (the harness audit's law 3). The server publishes no context figure,
+//! so a row carries no `context=` (`aterm link ls` prints `-` for it).
 //!
 //! `title=` IS `meta user_title=` — the name the owner gave the session with
 //! `meta set title` — AND NOTHING ELSE. The terminal title (`meta title=`,
 //! the OSC 0/2 string the PROGRAM last wrote) is never published, and that
-//! is a privacy rule, not a preference: Claude Code writes a summary of the
-//! conversation there (measured 2026-09-14 on the live worker: `◑ SAT-COMP
-//! campaign docs handoff`, with no user title), and a `preexec`-titling shell
-//! writes the whole command line with its arguments — the very text
-//! `detail=` is sanitized to keep off the wire. A session with no user title
-//! publishes `title=-`.
+//! is a privacy rule: Claude Code writes a summary of the conversation there,
+//! and a `preexec`-titling shell writes the whole command line — the text
+//! `detail=` is sanitized to keep off the wire. No user title: `title=-`.
 //!
 //! ## The three rules, and where each is enforced
 //!
@@ -47,10 +38,8 @@
 //!   `meta` / the program name aterm derived. No screen is read at all.
 //! * **ON CHANGE ONLY, AND AT MOST ONCE PER [`REPUBLISH_MIN`].** Presence is a
 //!   last-value face on an append-forever log (DESIGN §7 forbids a heartbeat
-//!   storm): [`Slot::due`] answers `true` only when the fields differ from the
-//!   row on the bus AND that row is at least [`REPUBLISH_MIN`] old. A verdict
-//!   that flips twice inside the window costs one record, carrying the later
-//!   state.
+//!   storm): [`Slot::due`] is owed only when the row would differ from the
+//!   one on the bus AND that row is at least [`REPUBLISH_MIN`] old.
 //! * **PUSHED, NOT SAMPLED.** `phase=` arrives with the `EVENT … agent` push
 //!   and `role=`/`title=`/`attention=` are re-read on the `EVENT … meta`
 //!   push, which marks that session's `meta` read stale first; the roster
@@ -89,10 +78,8 @@ pub const ATTENTION_CAP: usize = crate::glance::ATTENTION_CAP;
 /// "idle"). A WALL is carried as `wall:<kind>` ([`is_wall`]).
 pub const PHASES: [&str; 6] = ["busy", "idle", "prompt", "question", "survey", "unknown"];
 
-/// The word an OLDER server sent for an agent at a limit, before the walls
-/// were named: still carried, so a bridge newer than its instance loses
-/// nothing. A current server never sends it (`limited` lives on only as
-/// `level=limited`, the severity of any wall).
+/// The word an older server sent for an agent at a limit, before walls were
+/// named; still carried so a bridge newer than its instance loses nothing.
 pub const LEGACY_PHASES: [&str; 1] = ["limited"];
 
 /// `wall:<kind>` with `<kind>` of 1..=32 bytes of `[a-z0-9_-]` — the shape
@@ -116,7 +103,7 @@ pub enum Mode {
     /// The default: `role= detail= phase= title=` beside `attention=`.
     #[default]
     Meta,
-    /// Today's fields only — `attention=`.
+    /// `attention=` alone.
     Minimal,
 }
 
@@ -176,17 +163,11 @@ impl Fields {
     /// (`OK title= user_title= description= icon= role= attention= cwd=
     /// state=`, every value pct-encoded, `-` unset).
     pub fn read_meta(&mut self, header: &str) {
-        let kv = |key: &str| {
-            header
-                .split_whitespace()
-                .find_map(|t| t.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
-        };
+        let kv = |key: &str| crate::fabric::kv(header, key);
         self.attention = token(kv("attention").unwrap_or(ABSENT), ATTENTION_CAP);
         self.role = token(kv("role").unwrap_or(ABSENT), ROLE_CAP);
-        // THE USER'S TITLE AND ONLY THAT: `meta set title` is a deliberate
-        // name for the session (`worker-satcomp`). The terminal title is
-        // whatever the program last wrote, and for Claude Code that is a
-        // transcript-derived summary (module doc) — it does not fall back.
+        // The user's title only; never falls back to the terminal title
+        // (module doc).
         let user = kv("user_title").filter(|v| *v != ABSENT && !v.is_empty());
         self.title = token(user.unwrap_or(ABSENT), TITLE_CAP);
     }
@@ -209,8 +190,7 @@ impl Fields {
     }
 
     /// The tokens for the presence body, each led by a space, in the order
-    /// the readers print them. `minimal` writes `attention=` alone — the row
-    /// exactly as it was before this module.
+    /// the readers print them. `minimal` writes `attention=` alone.
     #[must_use]
     pub fn tokens(&self, mode: Mode) -> String {
         let mut out = format!(" attention={}", self.attention);
@@ -232,9 +212,22 @@ impl Fields {
 /// `-` that is a value is `%2D`) or a stranger's bytes; either way what
 /// leaves is one whitespace-free token of graphic ASCII that decodes to a
 /// prefix of the original. A cut that would split an escape trims past it,
-/// the rule every other clamp in this crate keeps (`halt_reason_token`).
+/// the rule every clamp in this crate keeps (`clamp_pct`).
 #[must_use]
 pub fn token(raw: &str, cap: usize) -> String {
+    let out = clamp_pct(raw, cap);
+    if out.is_empty() {
+        return ABSENT.to_string();
+    }
+    out
+}
+
+/// The one escape-boundary clamp: the ASCII graphic bytes of `raw`, at most
+/// `cap` of them, with a trailing `%` or `%X` that the cap split off its escape
+/// trimmed away. Empty when nothing is left; each caller names its own default
+/// ([`token`]'s [`ABSENT`], the bridge's halt reason, `cli.rs`'s column).
+#[must_use]
+pub(crate) fn clamp_pct(raw: &str, cap: usize) -> String {
     let mut out = String::with_capacity(cap.min(raw.len()));
     for byte in raw.bytes() {
         if out.len() == cap {
@@ -246,9 +239,6 @@ pub fn token(raw: &str, cap: usize) -> String {
     }
     while out.ends_with('%') || (out.len() >= 2 && out.as_bytes()[out.len() - 2] == b'%') {
         out.pop();
-    }
-    if out.is_empty() {
-        return ABSENT.to_string();
     }
     out
 }
@@ -265,12 +255,8 @@ pub struct Slot {
     /// push may have been coalesced away), which makes the next round re-read.
     pub sampled: bool,
     /// The tokens on the bus — [`Fields::tokens`] for the mode the row was
-    /// published in — and when they were published. THE TOKENS, NOT THE
-    /// FIELDS: what decides whether a row is owed is whether the ROW would
-    /// differ, and a `minimal` row carries `attention=` alone. Comparing the
-    /// whole struct republished a `minimal` bridge on every field it never
-    /// writes (measured 2026-09-14: four terminal-title changes, four
-    /// `attention=-` rows that differed in `t=` alone).
+    /// published in — and when. Tokens, not fields: a row is owed only when
+    /// the ROW would differ, and a `minimal` row carries `attention=` alone.
     published: Option<(String, Instant)>,
 }
 
@@ -320,12 +306,8 @@ impl Slot {
 mod tests {
     use super::*;
 
-    /// **THE SERVER'S WORDS, AND NOTHING ELSE.** `phase=` is the server's
-    /// verdict relayed — the six words, a named wall (`wall:overloaded`, the
-    /// verdict a 529 publishes since the per-program reader), and an older
-    /// server's `limited`; a word outside that set — a hostile one, a
-    /// fragment of screen text, text riding on a wall — is `-`, never carried
-    /// through.
+    /// `phase=` carries the six words, a named wall and the legacy `limited`;
+    /// any other word — hostile, screen text, text riding on a wall — is `-`.
     #[test]
     fn phase_is_the_servers_word_from_the_closed_set_or_absent() {
         let mut f = Fields::default();
@@ -358,8 +340,7 @@ mod tests {
         }
     }
 
-    /// **NO CONTEXT TOKEN.** The server publishes no context figure and the
-    /// fabric reads no screen, so no row carries `context=` in either mode.
+    /// No row carries `context=`, in either mode.
     #[test]
     fn a_row_carries_no_context_token() {
         let mut f = Fields::default();
@@ -373,7 +354,7 @@ mod tests {
         );
     }
 
-    /// **`minimal` IS TODAY'S ROW**: `attention=` alone, whatever was read.
+    /// `minimal` writes `attention=` alone, whatever was read.
     #[test]
     fn minimal_writes_attention_alone() {
         let mut f = Fields::default();
@@ -387,12 +368,8 @@ mod tests {
         );
     }
 
-    /// **THE USER'S TITLE IS THE TITLE, THE TERMINAL'S NEVER IS, AND EVERY
-    /// FIELD IS CAPPED ON AN ESCAPE BOUNDARY.**
-    ///
-    /// The terminal title is the program's: Claude Code writes a summary of
-    /// the conversation there, and a `preexec` shell the command line with
-    /// its arguments. Neither reaches the bus, whatever `user_title=` says.
+    /// Only the user's title is published, never the terminal's, and every
+    /// field is capped on an escape boundary.
     #[test]
     fn meta_fields_are_read_capped_and_only_the_user_title_is_published() {
         let mut f = Fields::default();
@@ -403,9 +380,8 @@ mod tests {
         );
         assert_eq!(f.role, ABSENT);
         assert_eq!(f.attention, ABSENT);
-        // The measured shape (2026-09-14): a program title that carries a
-        // secret, no user title. NOT ONE BYTE of it is published, in either
-        // mode.
+        // A program title carrying a secret, no user title: not one byte of
+        // it is published, in either mode.
         f.read_meta("OK title=Rotating%20the%20sk-live-OSCSECRET42%20key%20for%20acme user_title=- description=- icon=- role=- attention=- cwd=- state=alive");
         assert_eq!(f.title, ABSENT);
         for mode in [Mode::Meta, Mode::Minimal] {
@@ -446,7 +422,7 @@ mod tests {
         assert_eq!(token("ab%2", 8), "ab");
     }
 
-    /// **CHANGE ONLY, AND AT MOST ONCE PER [`REPUBLISH_MIN`].**
+    /// Change only, and at most once per [`REPUBLISH_MIN`].
     #[test]
     fn the_writer_publishes_on_change_only_and_at_most_once_per_window() {
         let t0 = Instant::now();
@@ -471,10 +447,7 @@ mod tests {
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
     }
 
-    /// **A `minimal` ROW IS OWED ONLY WHEN `attention=` MOVED.** The review
-    /// of 2026-09-14 measured a `minimal` bridge republishing `attention=-`
-    /// on every terminal-title change — a field its row never carries — so
-    /// what is compared is the ROW, in the mode it is published in.
+    /// A `minimal` row is owed only when `attention=` moved.
     #[test]
     fn a_minimal_row_is_not_owed_for_a_field_it_never_writes() {
         let t0 = Instant::now();
@@ -501,11 +474,8 @@ mod tests {
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
     }
 
-    /// **LAW 3: THE FABRIC LINKS NO VENDOR READER.** Every per-vendor screen
-    /// rule lives in `aterm-phase`, which the SERVER runs; this crate relays
-    /// what the server published. The manifest is the whole claim, so it is
-    /// what is checked: a dependency line naming the reader (in any table)
-    /// fails here before the first line of it is used.
+    /// Law 3: the fabric links no vendor screen reader (`aterm-phase` runs in
+    /// the server). Checked on the manifest, in any table.
     #[test]
     fn the_fabric_crate_links_no_vendor_screen_reader() {
         let manifest = include_str!("../Cargo.toml");
@@ -518,93 +488,6 @@ mod tests {
         // The check can see a dependency line at all: this crate's own
         // manifest names its real ones the same way.
         assert!(manifest.lines().any(|l| l.starts_with("aterm-ctl = ")));
-    }
-
-    /// What a TEXT that teaches this row gets wrong about it: each claim the
-    /// row stopped being true of when the fabric stopped reading a screen
-    /// (2026-09-23), and each fact a reader needs to use it.
-    fn row_text_faults(text: &str) -> Vec<String> {
-        let mut faults = Vec::new();
-        let lower = text.to_ascii_lowercase();
-        for stale in [
-            "context=",
-            "same reader",
-            "revision=",
-            "8.1 s",
-            "phase=idle",
-        ] {
-            if lower.contains(stale) {
-                faults.push(format!("claims `{stale}`"));
-            }
-        }
-        for word in PHASES {
-            if !text.contains(word) {
-                faults.push(format!("omits the phase word `{word}`"));
-            }
-        }
-        for needed in ["phase=-", "status agent=", "wall:<kind>"] {
-            if !text.contains(needed) {
-                faults.push(format!("omits `{needed}`"));
-            }
-        }
-        faults
-    }
-
-    /// `text[from..to]`, where `from`/`to` are the first lines starting with
-    /// those heads — the one section of a longer document about this row.
-    fn section<'a>(text: &'a str, from: &str, to: &str) -> &'a str {
-        let a = text.find(from).unwrap_or_else(|| panic!("no `{from}`"));
-        let b = a + text[a..].find(to).unwrap_or_else(|| panic!("no `{to}`"));
-        &text[a..b]
-    }
-
-    /// **THE TEXTS THAT TEACH THE ROW DESCRIBE THIS ROW.** Every agent is
-    /// primed with the fabric brief and told to read `phase=` before it
-    /// `post`s work, and `aterm help fabric` is the human's copy. Both said,
-    /// after the row changed, that `phase=` came from the same screen reader
-    /// as `aterm drive phase`, that the row carried `context=<n>%`, that a
-    /// non-Claude session read `phase=idle`, and that a turn's end reached the
-    /// bus 8.1 s after a revision-gated read — none of it true since the
-    /// fabric relays the server's `status agent=` verdict.
-    #[test]
-    fn the_texts_that_teach_the_row_describe_this_row() {
-        let brief = section(
-            include_str!("../../aterm-primer/assets/aterm-fabric-body.md"),
-            "## Who is doing what",
-            "## Reading mail",
-        );
-        let manual = section(
-            include_str!("../../aterm-cli/src/manual.rs"),
-            "WHO IS DOING WHAT — PRESENCE WITH MEANING",
-            "IN THE WINDOW (the FABRIC menu",
-        );
-        for (name, text) in [
-            ("the primer's fabric brief", brief),
-            ("`aterm help fabric`", manual),
-        ] {
-            assert_eq!(
-                row_text_faults(text),
-                Vec::<String>::new(),
-                "{name}:\n{text}"
-            );
-        }
-        // NEGATIVE CONTROL: the brief's sentence as it stood before the fix
-        // is caught, so the pass above is not a check that sees nothing.
-        let before = "`phase=` (`busy | idle | prompt | question | limited | survey` — the \
-            words `aterm drive phase` prints, from the same reader), `context=<n>%` when \
-            Claude Code shows its indicator; a session running something other than \
-            Claude Code reads `phase=idle`";
-        let caught = row_text_faults(before);
-        for fault in [
-            "claims `context=`",
-            "claims `same reader`",
-            "claims `phase=idle`",
-        ] {
-            assert!(
-                caught.iter().any(|f| f == fault),
-                "{fault} not caught: {caught:?}"
-            );
-        }
     }
 
     /// The config spelling, and no other.

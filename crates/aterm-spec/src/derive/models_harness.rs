@@ -4,12 +4,14 @@
 //! Bounded models for the aterm wrapper's harness core
 //! (`docs/DESIGN-aterm-wrapper-2026-09-17.md` §11 item 7).
 //!
-//! One scalar projection of a machine that ships in `aterm_agent::harness`: the
-//! bounded child runner's worker lifecycle (`harness::align::capture_bounded`).
-//! As everywhere in this crate the model is hand-written Rust DESCRIBING that
-//! code, not extracted from it: Tier 0 here says the description holds over its
-//! whole bounded space, and only the Tier-1 bind in `align`'s own tests makes it
-//! a statement about the program that compiled.
+//! Scalar projections of machines that ship in `aterm_agent::harness`: the
+//! bounded child runner's worker lifecycle (`align::capture_bounded`), the
+//! Claude/Codex upgrade ladder and its notice/drain/limit/work-end laws, the
+//! login wall, and the model priority/ladder/switch. As everywhere in this crate
+//! each model is hand-written Rust DESCRIBING that code, not extracted from it:
+//! Tier 0 here says the description holds over its whole bounded space, and only
+//! a Tier-1 bind in the code's own tests (`align`'s, for the worker lifecycle)
+//! makes it a statement about the program that compiled.
 //!
 //! The ledger ring (`HarnessLedgerRing`, §11 item 5) and the grid spine's turn
 //! machine (`HarnessTurnObservation`, §4.2/§5.8.1) were modelled here too.
@@ -2628,23 +2630,38 @@ pub fn harness_model_ladder_model() -> Model {
 ///   return when no
 ///   model can be run and none is pending, then what the transcript says runs
 ///   (`live_model_at`), THE SETTLE STEP (`ModelRecord::settle`), THE MODEL
-///   RULE (`model_due`) over the settled record, the cache's coldness
+///   RULE (`model_due`) over the settled record, THE RIDE'S GUARD
+///   (`ride_bar`) over the model a notice carried, the cache's coldness
 ///   (`last_answer_at` against `CACHE_COLD_S`) and THE DUE CLOCK
 ///   (`ModelRecord::due_clock`), in that order; then `model_to`, with THE
 ///   MODEL LADDER (`model_moves_now`) inside it.
-/// * `Relaunch`, `RelaunchRunsOther`, `Refused`, `Ride` — the ask recorded
-///   before the one act (`ModelRecord::asked`) and what the new process then
-///   runs (`live_model_at`: its launch flag until it answers).
+/// * `Relaunch`, `RelaunchRunsOther`, `Refused`, `Ride`, `Restart` — the ask
+///   recorded before the one act (`ModelRecord::asked`), taken back when that
+///   act is never sent (`ModelRecord::take_back`, `Refused`), the model the
+///   line asks for (`upgrade_models::line_model`: the site's own, else none
+///   kept of a `--model` the record marks FAILED, since 2026-10-01), and what
+///   the new process then runs (`live_model_at`: its launch flag until it
+///   answers).
 ///
 /// TRANSCRIBED, not driven (a change there passes the bind): `model_judge`'s
 /// and `model_read_kept`'s I/O (loading and saving the record, reading the
 /// transcript, the ledger rows); the offer itself (`upgrade_models::offered`
-/// over the build's catalog, the list and `availableModels`); `visit_models`' derivation of the announced model (the upgrade's
-/// `model_list` while `Phase::Announced`) and of `build_restart` (a newer
-/// build is due); the cheap pre-filter `model_wants_a_look`; `Announce`
+/// over the build's catalog, the list and `availableModels`); `visit_models`'
+/// derivation of the carried model (the upgrade's `model_list` while
+/// `Phase::Announced` or gave up, `St::carried_model`), of the announced one
+/// (`St::promised_model`, none once the read bars the ride) and of
+/// `build_restart` (a newer build is due); the drop of a barred ride from the
+/// record (`ride_dropped`) and the release of an announced round it leaves
+/// with nothing to restart for (`St::release_unridden`: the model keeps it
+/// announced with no model, and nothing it then does asks for one); the cheap
+/// pre-filter
+/// `model_wants_a_look`; `Announce`
 /// (`St::for_target` and the notice carrying `model_to` as `model_list`);
-/// `GiveUp` (`St::give_up`); `restart`'s ask of `st.model_list` and the
-/// relaunch line (`relaunch::with_model`); `Refused`'s `St::unsent`; and
+/// `GiveUp` (`St::give_up`); the relaunch's ask of `st.model_list`, written
+/// right before its line is typed and taken back when the line is not
+/// (`relaunch::relaunch`, since 2026-10-02: no restart writes it before its
+/// signal), and the line itself (`relaunch::with_model`); `Refused`'s
+/// `St::unsent`; and
 /// which view (managed or native) `visit_models` and `riding_model_in` judge
 /// the session by, and the pre-filter's keep rule over two views — the model
 /// has one view.
@@ -2665,46 +2682,58 @@ pub fn harness_model_ladder_model() -> Model {
 /// `CACHE_COLD_S`. `hum` = the remembered `/model` (`ModelRecord::human`) is
 /// `claude-fable-5-1` — the only memory that can protect anything here, as
 /// the only live model outside the target's family that the rule may move.
-/// `flag` = the process was relaunched by this harness with `--model
-/// claude-opus-5-5`; `PersonFlag` = before that it was launched with a
+/// `flag` = what this harness's relaunches left on the process's line: `0`
+/// nothing (the launch's own flags), `1` its `--model claude-opus-5-5`, `2` no
+/// `--model` at all — a relaunch asking none dropped that ask once the record
+/// marked it FAILED (2026-10-01), the person's flag long replaced;
+/// `PersonFlag` = before that it was launched with a
 /// person's own `--model`: `1` an id (`claude-fable-5-1` in the model), `2` a
 /// family ALIAS (`fable`, `opus`: `model-alias`, see above); `DefaultFable` =
 /// the settings' default is Fable, `Build` = a newer build is due all along. `phase` = the
 /// upgrade is `0` not announced, `1` announced (`Phase::Announced`), `2` gave
 /// up (`Phase::Failed(GAVE_UP)`: it stops asking, and a late READY still
 /// restarts it — with the `model_list` the notice carried, `ann`); `ann` =
-/// the notice carried the model. `fresh`/`mto` = the state is the one a visit
+/// the notice carried the model and the round still does (a visit that bars
+/// the ride clears it). `fresh`/`mto` = the state is the one a visit
 /// just left, and that visit's `model_to`: the laws are about THAT decision,
 /// read against the inputs it was made on.
 ///
 /// Laws, one invariant each, and `Buggy = 1` arms at least one mutant per law
-/// (two for `SettleRecordsWhatRan` and for `NeverOntoAppliedOrFailed`) — each
+/// (two for each of the first three and for `SettleRecordsWhatRan`) — each
 /// an action whose healthy branch changes nothing, firing once from a state
 /// where the defect shows, after which nothing else moves (so the `Buggy = 1`
 /// space stays the healthy one plus the forged states). The first three are
-/// stated over BOTH the rule's verdict (`due`) and the visit's decision
-/// (`mto`), and the decision is EXEMPT while an announced model rides (`phase
-/// == 1 && ann == 1`, `AnnouncedModelRides`):
+/// stated over the rule's verdict (`due`), the visit's decision (`mto`) and
+/// THE RIDE — the model a restart of the round asks for, announced or after a
+/// give-up (`phase > 0 && ann == 1`), held to them since 2026-10-01 over what
+/// the visit could read (its target fixed by the notice, so the offer is not
+/// re-read; a model the visit could not read bars nothing the record does
+/// not). Each law carries a `Judge*` mutant (the rule) and a `Ride*` one (the
+/// ride unguarded, the code before 2026-10-01):
 ///
-/// * `UpTheListOnly` — the verdict, and a decision outside a ride, go only UP
-///   the list: never down, never sideways, never off a model the list does not
-///   name. Mutant `JudgeMovesOffList`: an off-list model's missing rank read
+/// * `UpTheListOnly` — the verdict, the decision and the ride go only UP the
+///   list: never down, never sideways, never off a model the list does not
+///   name. Mutants `JudgeMovesOffList`: an off-list model's missing rank read
 ///   as below everything (`rank(..).unwrap_or(usize::MAX)`), which moves a
-///   person's own pick.
+///   person's own pick; `RideMovesOffList`: gap (c), a ride from
+///   `claude-sonnet-5`.
 /// * `PersonsChoiceStaysInFamily` — a person's choice (a launch `--model` not
 ///   the harness's, a `/model`, now or remembered, the settings' default by
-///   family) is moved, by the verdict or by a decision outside a ride, only
-///   within its family. Mutant `JudgeForgetsTheRememberedChoice`: the rule
-///   before `18090b6ae`, which read a person's choice only off the launch flag
-///   and a `/model` newer than the last answer — so an answered `/model
-///   claude-fable-5-1` was moved to Opus.
-/// * `NeverOntoAppliedOrFailed` — neither the verdict nor a decision outside a
+///   family) is moved, by the verdict, the decision or the ride, only within
+///   its family. Mutants `JudgeForgetsTheRememberedChoice`: the rule before
+///   `18090b6ae`, which read a person's choice only off the launch flag and a
+///   `/model` newer than the last answer — so an answered `/model
+///   claude-fable-5-1` was moved to Opus; `RideOverridesAPersonsChoice`: gap
+///   (b), that `/model` typed after the notice, and the ride moving it.
+/// * `NeverOntoAppliedOrFailed` — neither the verdict, the decision nor the
 ///   ride is ever onto a model already applied to the conversation, or after
 ///   it failed. Mutants `JudgeRetriesAFailedModel` (the verdict: the failed
 ///   record not read, so a model the relaunch did not take is asked for again
-///   every time it is due — a restart loop) and `JudgeReadsAStaleAnnouncement`
-///   (the decision: a gave-up upgrade's `model_list` read as if still
-///   announced, which carries a model recorded FAILED).
+///   every time it is due — a restart loop) and `RideCarriesAFailedModel`
+///   (gap (a): the ride kept past the visit that records it FAILED — an
+///   announced one, or a gave-up upgrade's `model_list`, which a late READY
+///   asks for; it replaces `JudgeReadsAStaleAnnouncement`, whose state the
+///   guard now makes unreachable).
 /// * `MovesExactlyWhenTheLadderSays` — a due move is taken exactly when THE
 ///   MODEL LADDER says (a cold cache, a restart happening anyway, or the warm
 ///   wait over). Mutant `LadderWaitsForCold`: the rule before `2d4656f32`,
@@ -2724,22 +2753,47 @@ pub fn harness_model_ladder_model() -> Model {
 ///   2026-09-27, whose failed arm did not read `applied`, so a person's later
 ///   `/model` turned a verified ask into a `model-failed` one and the
 ///   harness's own `--model` then read as a person's.
+/// * `AskedOnlyByARelaunch` — an ask on the record is one a relaunch's line
+///   carried (the harness's `--model`, `flag`). Mutant `RefusedKeepsTheAsk`:
+///   the refusal before 2026-10-01 (review of the ride's guard), which kept
+///   the ask written before a signal that was never sent, so it settled as
+///   FAILED though no relaunch ran — the model barred for good, and from the
+///   round whose READY the refusal left standing. (The restart in place's
+///   refusal and a line never typed after a signal kept it too, until
+///   2026-10-02: the ask is now the line's own.)
+/// * `NeverRelaunchedOntoAFailedModel` — a model recorded FAILED is never what
+///   a relaunch starts the conversation on: here `live` reads
+///   `claude-opus-5-5` only off a line that names it. Mutant
+///   `RelaunchKeepsAFailedFlag`: the line before 2026-10-01, which, asking no
+///   model of its own (the upgrade's build restart, a restart in place or on
+///   exit with nothing riding), kept the launch's `--model` verbatim
+///   (`relaunch::with_model` with `None`) — this harness's own ask the record
+///   had marked FAILED included, so the relaunch asked for it again.
 ///
-/// OPEN — the ride's exemption is a gap in the CODE, not a convenience of the
-/// model: an announced model rides whatever this visit decides, and a
-/// gave-up upgrade's late READY relaunches with the `model_list` its notice
-/// carried, so the relaunch asks for `claude-opus-5-5` (a) after it was
-/// recorded FAILED, (b) over a person's `/model claude-fable-5-1` typed after
-/// the notice (across families), and (c) off a model the list does not name.
-/// `aterm-spec`'s `derived_harness_model_switch_open_ride_gaps_are_reachable`
-/// pins each as reachable here; a fix re-takes those three laws inside the
-/// ride too, and flips that test.
+/// FIXED 2026-10-01 — the ride's exemption was a gap in the CODE (skeptic
+/// review, 2026-09-27): an announced model rode whatever the visit decided,
+/// and a gave-up upgrade's late READY relaunched with the `model_list` its
+/// notice carried, so the relaunch asked for `claude-opus-5-5` (a) after it
+/// was recorded FAILED, (b) over a person's `/model claude-fable-5-1` typed
+/// after the notice (across families), and (c) off a model the list does not
+/// name. The ride is now guarded by the three laws (`ride_bar`, and here the
+/// `Visit`'s ride branch), and `aterm-spec`'s
+/// `derived_harness_model_switch_ride_keeps_the_move_laws` proves none of
+/// (a)–(c) reachable, each still reached through its `Ride*` mutant. Gap (a)
+/// had a second road, THE LINE (review of 2026-10-01): a relaunch asking no
+/// model kept the launch's `--model`, so a harness ask recorded FAILED rode
+/// every later restart of the process it started on (the `Relaunch`'s and,
+/// added for it, `Restart`'s effect, `flag == 1` running it). Closed by
+/// `upgrade_models::line_model` on every relaunch line: such a flag is
+/// dropped (`flag = 2`), the person's saved default running instead.
 ///
 /// What this does NOT cover is listed in the Tier-1 file's header; the
 /// largest omissions are a second family member above the person's (the
 /// target is always Opus), a person's own relaunch, the owner's `--now`
 /// re-arming a gave-up upgrade, a restart made for another reason while an
-/// upgrade is announced, and clock skew.
+/// upgrade is announced, a `/model` a person chose since the launch that a
+/// line asking no model carries in place of the launch's `--model`
+/// (`hand_model_in`: here such a line keeps the launch flag), and clock skew.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_model_switch_model() -> Model {
@@ -2817,13 +2871,22 @@ pub fn harness_model_switch_model() -> Model {
             // -- the harness -------------------------------------------------
 
             // `model_read_step` + `model_to`, as one visit. The settle step's
-            // failed arm fires only on an ask never applied.
+            // failed arm fires only on an ask never applied. A notice's model
+            // the round carries (`phase > 0 && ann == 1`) is read even on an
+            // empty offer, and RIDES only while THE RIDE'S GUARD
+            // (`ride_bar`, over the settled record) says the rule's three
+            // move laws still hold for it: not applied or failed, a person's
+            // choice of Fable not moved across (nor a launch alias at all),
+            // and up the list only — from Opus 5, a Fable nobody chose, or a
+            // model this visit could not read. Barred, the round forgets it
+            // (`ann = 0`; `ride_dropped` clears `St::model_list`) and the
+            // decision is the rule's own.
             action Visit when (forged == 0) {
                 ap = if set == 1 && live == 1 { 1 } else { ap };
                 fl = if set == 1 && (live <= 0 || live > 1) && sage == 1 && ap == 0 { 1 } else { fl };
                 set = if set == 1 && (live <= 0 || live > 1) && sage == 1 && ap == 0 { 0 } else { set };
                 sage = if set == 1 && (live <= 0 || live > 1) && sage == 1 && ap == 0 { 0 } else { sage };
-                hum = if (tgt > 0 || set == 1) && cmd == 1 {
+                hum = if (tgt > 0 || set == 1 || (phase > 0 && ann == 1)) && cmd == 1 {
                     if live == 2 { 1 } else { 0 }
                 } else {
                     hum
@@ -2866,7 +2929,26 @@ pub fn harness_model_switch_model() -> Model {
                 } else {
                     0
                 };
-                mto = if phase == 1 && ann == 1 {
+                ann = if phase > 0 && ann == 1 && (if ap == 0 && fl == 0 &&
+                    (set == 0 || ((live <= 0 || live > 1) && sage == 0)) &&
+                    (flag == 1 || PersonFlag <= 1) &&
+                    (live <= 0 || live == 3 || (live == 2 &&
+                        (if (flag == 0 && PersonFlag == 1) || (flag == 1 && set == 0) ||
+                            cmd == 1 || hum == 1 || DefaultFable == 1 { 0 } else { 1 }) == 1)) {
+                    0
+                } else {
+                    1
+                }) == 1 {
+                    0
+                } else {
+                    ann
+                };
+                mto = if phase == 1 && ann == 1 && ap == 0 && fl == 0 &&
+                    (set == 0 || ((live <= 0 || live > 1) && sage == 0)) &&
+                    (flag == 1 || PersonFlag <= 1) &&
+                    (live <= 0 || live == 3 || (live == 2 &&
+                        (if (flag == 0 && PersonFlag == 1) || (flag == 1 && set == 0) ||
+                            cmd == 1 || hum == 1 || DefaultFable == 1 { 0 } else { 1 }) == 1)) {
                     1
                 } else if (if tgt == 1 && ap == 0 && fl == 0 && (set == 0 || sage == 0) &&
                     (flag == 1 || PersonFlag <= 1) {
@@ -2904,14 +2986,26 @@ pub fn harness_model_switch_model() -> Model {
             // READY — to a standing notice, or a late one after the upgrade
             // gave up: the ask recorded, the agent ended, the relaunch runs
             // what its line asks — the notice's model, else the launch flag it
-            // kept, else what the transcript last named. There is a restart
-            // to make only while a build is due or this visit moves the model.
+            // kept (never the harness's own ask recorded FAILED, which it
+            // drops: `line_model`, 2026-10-01), else what the transcript last
+            // named. There is a restart to make only while a build is due or
+            // this visit moves the model.
             action Relaunch when (forged == 0 && fresh == 1 && phase > 0 && (Build == 1 || mto == 1)) {
                 set = if ann == 1 { 1 } else { set };
                 sage = if ann == 1 { 0 } else { sage };
-                flag = if ann == 1 { 1 } else { flag };
-                live = if ann == 1 || flag == 1 { 1 } else if PersonFlag == 1 { 2 } else { live };
-                cmd = if ann == 1 || flag == 1 || PersonFlag == 1 { 0 } else { cmd };
+                flag = if ann == 1 { 1 } else if flag == 1 && fl == 1 { 2 } else { flag };
+                live = if ann == 1 || (flag == 1 && fl == 0) {
+                    1
+                } else if flag == 0 && PersonFlag == 1 {
+                    2
+                } else {
+                    live
+                };
+                cmd = if ann == 1 || (flag == 1 && fl == 0) || (flag == 0 && PersonFlag == 1) {
+                    0
+                } else {
+                    cmd
+                };
                 phase = 0;
                 ann = 0;
                 fresh = 0;
@@ -2931,13 +3025,14 @@ pub fn harness_model_switch_model() -> Model {
                 fresh = 0;
                 mto = 0;
             }
-            // The ask recorded, the signal refused: nothing relaunched, the
-            // phase as it was (`St::unsent`).
+            // The signal refused: nothing relaunched, the phase as it was
+            // (`St::unsent`), and no ask stands — an ask is written only
+            // right before the relaunch line that carries it is typed, and
+            // TAKEN BACK when that line is not (`ModelRecord::take_back`,
+            // 2026-10-01; the line's own since 2026-10-02).
             action Refused when (
                 forged == 0 && fresh == 1 && phase > 0 && ann == 1 && (Build == 1 || mto == 1)
             ) {
-                set = 1;
-                sage = 0;
                 fresh = 0;
                 mto = 0;
             }
@@ -2955,6 +3050,17 @@ pub fn harness_model_switch_model() -> Model {
                 flag = 1;
                 live = 1;
                 cmd = 0;
+                fresh = 0;
+                mto = 0;
+            }
+            // ... and with nothing riding (the memory banner's restart in
+            // place, an exit's relaunch) its line asks no model: it keeps the
+            // launch flag, as `Relaunch` does with no notice's model —
+            // dropping the harness's own ask recorded FAILED.
+            action Restart when (forged == 0 && fresh == 1 && phase == 0 && (due == 0 || live <= 0)) {
+                flag = if flag == 1 && fl == 1 { 2 } else { flag };
+                live = if flag == 1 && fl == 0 { 1 } else if flag == 0 && PersonFlag == 1 { 2 } else { live };
+                cmd = if (flag == 1 && fl == 0) || (flag == 0 && PersonFlag == 1) { 0 } else { cmd };
                 fresh = 0;
                 mto = 0;
             }
@@ -3003,13 +3109,48 @@ pub fn harness_model_switch_model() -> Model {
                 fresh = if Buggy == 1 { 1 } else { fresh };
                 forged = if Buggy == 1 { 1 } else { forged };
             }
-            // The decision, not the verdict: the verdict is right (nothing is
-            // due — the model failed), and a gave-up upgrade's `model_list` is
-            // carried as if the notice still stood.
-            action JudgeReadsAStaleAnnouncement when (
-                forged == 0 && phase == 2 && ann == 1 && fl == 1 && due == 0 && live > 0
+            // THE RIDE UNGUARDED, one law at a time (the code before
+            // 2026-10-01, which carried a notice's model whatever the visit
+            // decided): the visit from a state where the guard bars the ride,
+            // its every other effect the healthy one's, the ride kept — the
+            // announced round's decision (`mto`) and the round's model
+            // (`ann`) a late READY after a give-up still asks for.
+            // (a) The record not read: a model this very visit records
+            // FAILED still rides.
+            action RideCarriesAFailedModel when (
+                forged == 0 && phase > 0 && ann == 1 && live == 3 && cmd == 0 &&
+                set == 1 && sage == 1 && ap == 0
             ) {
-                mto = if Buggy == 1 { 1 } else { mto };
+                fl = if Buggy == 1 { 1 } else { fl };
+                set = if Buggy == 1 { 0 } else { set };
+                sage = if Buggy == 1 { 0 } else { sage };
+                due = if Buggy == 1 { 0 } else { due };
+                dover = if Buggy == 1 { 0 } else { dover };
+                mto = if Buggy == 1 { if phase == 1 { 1 } else { 0 } } else { mto };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            // (b) A person's choice not read: their `/model claude-fable-5-1`,
+            // typed since the notice, moved across to Opus.
+            action RideOverridesAPersonsChoice when (
+                forged == 0 && phase > 0 && ann == 1 && live == 2 && cmd == 1 &&
+                ap == 0 && fl == 0 && (set == 0 || sage == 0)
+            ) {
+                hum = if Buggy == 1 { 1 } else { hum };
+                due = if Buggy == 1 { 0 } else { due };
+                dover = if Buggy == 1 { 0 } else { dover };
+                mto = if Buggy == 1 { if phase == 1 { 1 } else { 0 } } else { mto };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            // (c) The list not read: a model it does not name moved up to Opus.
+            action RideMovesOffList when (
+                forged == 0 && phase > 0 && ann == 1 && live == 4 && cmd == 0 &&
+                ap == 0 && fl == 0 && (set == 0 || sage == 0)
+            ) {
+                due = if Buggy == 1 { 0 } else { due };
+                dover = if Buggy == 1 { 0 } else { dover };
+                mto = if Buggy == 1 { if phase == 1 { 1 } else { 0 } } else { mto };
                 fresh = if Buggy == 1 { 1 } else { fresh };
                 forged = if Buggy == 1 { 1 } else { forged };
             }
@@ -3054,6 +3195,36 @@ pub fn harness_model_switch_model() -> Model {
                 fresh = if Buggy == 1 { 1 } else { fresh };
                 forged = if Buggy == 1 { 1 } else { forged };
             }
+            // The refusal before 2026-10-01: the ask written before the
+            // signal kept though the signal was never sent, from a process no
+            // relaunch of this harness's ever asked anything of.
+            action RefusedKeepsTheAsk when (
+                forged == 0 && fresh == 1 && phase > 0 && ann == 1 && (Build == 1 || mto == 1) &&
+                flag == 0
+            ) {
+                set = if Buggy == 1 { 1 } else { set };
+                sage = if Buggy == 1 { 0 } else { sage };
+                fresh = if Buggy == 1 { 0 } else { fresh };
+                mto = if Buggy == 1 { 0 } else { mto };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            // THE LINE before 2026-10-01: a relaunch asking no model of its
+            // own — the upgrade's build restart, a restart with nothing
+            // riding — kept the launch's `--model` verbatim, this harness's
+            // own ask recorded FAILED included, and runs it again.
+            action RelaunchKeepsAFailedFlag when (
+                forged == 0 && fresh == 1 && flag == 1 && fl == 1 && (
+                    (phase == 0 && (due == 0 || live <= 0)) ||
+                    (phase > 0 && ann == 0 && (Build == 1 || mto == 1))
+                )
+            ) {
+                live = if Buggy == 1 { 1 } else { live };
+                cmd = if Buggy == 1 { 0 } else { cmd };
+                phase = if Buggy == 1 { 0 } else { phase };
+                fresh = if Buggy == 1 { 0 } else { fresh };
+                mto = if Buggy == 1 { 0 } else { mto };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
             // The failed arm without its `applied` test: an ask that ran, and
             // a person has since moved off, recorded failed and cleared.
             action SettleFailsAnAskThatRan when (
@@ -3071,24 +3242,34 @@ pub fn harness_model_switch_model() -> Model {
             // A visit's verdict is DUE exactly when it leaves the clock running
             // on a model it could read (`model-unknown` leaves the clock as it
             // was): `fresh == 1 && due == 1 && live > 0`. Its decision is
-            // `mto`, exempt from the first three laws only while an announced
-            // model rides (`phase == 1 && ann == 1`: OPEN, see above).
+            // `mto`; an announced round's decision while its model rides
+            // (`phase == 1 && ann == 1`) is that ride, and the RIDE — the
+            // model a round's restart asks for, announced or after a give-up
+            // (`phase > 0 && ann == 1`) — is held to the first three laws as
+            // well (2026-10-01), over what the visit could read: never onto
+            // anything applied or failed, and from a model it read only as
+            // the rule would move it (the target fixed by the notice, the
+            // offer not re-read).
 
             // Up the list only: the move is onto the target, a listed model
-            // ranked above the live one, and the live one is on the list.
+            // ranked above the live one, and the live one is on the list —
+            // the ride's from Opus 5 or Fable 5.1 (the notice fixed the target).
             invariant UpTheListOnly:
-                fresh == 0 || (tgt == 1 && live > 1 && live <= 3) ||
-                ((due == 0 || live <= 0) && (mto == 0 || (phase == 1 && ann == 1)));
+                fresh == 0 ||
+                (((tgt == 1 && live > 1 && live <= 3) ||
+                    ((due == 0 || live <= 0) && (mto == 0 || (phase == 1 && ann == 1)))) &&
+                 (phase <= 0 || ann == 0 || live <= 0 || (live > 1 && live <= 3)));
             // A person's choice moves only within its family (the target's is
-            // Opus: `1` and `3`).
+            // Opus: `1` and `3`) — by the verdict, the decision, or the ride.
             invariant PersonsChoiceStaysInFamily:
                 fresh == 0 || live == 1 || live == 3 ||
                 (if (flag == 0 && PersonFlag > 0) || (flag == 1 && set == 0) || cmd == 1 ||
                     (live == 2 && (hum == 1 || DefaultFable == 1)) { 0 } else { 1 }) == 1 ||
-                ((due == 0 || live <= 0) && (mto == 0 || (phase == 1 && ann == 1)));
+                ((due == 0 || live <= 0) && (mto == 0 || (phase == 1 && ann == 1)) &&
+                 (phase <= 0 || ann == 0 || live <= 0));
             invariant NeverOntoAppliedOrFailed:
                 fresh == 0 || (ap == 0 && fl == 0) ||
-                ((due == 0 || live <= 0) && (mto == 0 || (phase == 1 && ann == 1)));
+                ((due == 0 || live <= 0) && mto == 0 && (phase <= 0 || ann == 0));
             // Outside an announcement, the visit's `model_to` is the due move
             // exactly when the ladder takes it.
             invariant MovesExactlyWhenTheLadderSays:
@@ -3101,6 +3282,16 @@ pub fn harness_model_switch_model() -> Model {
                 ((live <= 0 || live > 1) && (ap == 1 || sage == 0));
             invariant AppliedAskStands:
                 ap == 0 || set == 1;
+            // An ask on the record is one a relaunch's line carried: the
+            // harness's `--model` on the process (`flag`; dropped from the
+            // line only once that ask is recorded FAILED and cleared).
+            invariant AskedOnlyByARelaunch:
+                set == 0 || flag == 1;
+            // A model recorded FAILED is never what a relaunch starts the
+            // conversation on: `live` reads it only off a line naming it, so
+            // this is the line never carrying it (2026-10-01).
+            invariant NeverRelaunchedOntoAFailedModel:
+                fl == 0 || live <= 0 || live > 1;
         }
     }
 }

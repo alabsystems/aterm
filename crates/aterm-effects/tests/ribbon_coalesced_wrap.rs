@@ -160,14 +160,11 @@ fn the_space_class_is_required_to_relocate_the_word() {
     assert!(plain.contains(&3), "the new key itself still lights");
 }
 
-/// **THE OLD ROW FLOWS INTO THE LAST CELL THE WRAP KEPT** (2026-09-25, the
-/// review of the drift). On the tick after the wrap the old row — carried
-/// up a row by the scroll — freezes its fold edge while the moved Space and
-/// glyph are still leaving in its own cohort, and the edge is the last
-/// prefix cell (`76 − width`), not the vacated columns' end at 77
-/// (`Ribbon::flow_target`): a drift toward 77 would slide light over
-/// columns the text has left. RED with `!c.leaving()` removed from its
-/// filter.
+/// The old row flows into the last cell the wrap kept: on the tick after the
+/// wrap the old row (carried up by the scroll) freezes its fold edge while the
+/// moved Space and glyph are still leaving in its cohort, and the edge is the
+/// last prefix cell (`76 − width`), not the vacated columns' end at 77
+/// (`Ribbon::flow_target`), so no light slides over columns the text left.
 #[test]
 fn the_old_row_flows_into_the_last_cell_the_wrap_kept() {
     for (coalesced, width) in [(false, 1u16), (true, 1), (true, 2)] {

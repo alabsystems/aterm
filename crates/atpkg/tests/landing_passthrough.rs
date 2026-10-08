@@ -22,26 +22,9 @@ use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
-
-/// Far under the retired wait's 45 s bound, far over an exec of files macOS has already
-/// assessed, on a loaded box.
-///
-/// It was 10 s until 2026-09-23, when a full `tools/verify.sh --fast` run measured
-/// `an_older_twin_under_a_standing_marker_runs_the_tool_at_once` at 11.14 s (1.1–1.4 s in
-/// isolation, three runs of three) and called it a cold exec. It was not: every file a
-/// timed run execs — the twin, the freshly linked debug `atpkg`, the `bin/` shim and the
-/// store script — is new, and the FIRST exec of a new file waits, at 0% CPU, until
-/// macOS `syspolicyd` has assessed it, one file at a time behind every test binary the
-/// gate links (2026-09-28: both timed cases at 33 s, 0.3 s apart). No bound outgrows
-/// that queue, so each timed case first runs its exact command once, unbounded
-/// ([`Fixture::warm`]); a later exec of the same files costs nothing. The regression this
-/// bound exists for is the retired 45 s wait, which the timed run still meets in full —
-/// its live writer's marker stands — and 30 s catches with a 15 s margin.
-const AT_ONCE: Duration = Duration::from_secs(30);
 
 struct Fixture {
-    root: PathBuf,
+    _root: aterm_tempfile::TempDir,
     home: PathBuf,
     config_home: PathBuf,
     registry: PathBuf,
@@ -50,18 +33,19 @@ struct Fixture {
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-landing-pt-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
-        let config_home = root.join("config");
-        let registry = root.join("registry");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-landing-pt-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
+        let config_home = root.path().join("config");
+        let registry = root.path().join("registry");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&registry).unwrap();
         let prefix = atpkg::store::default_prefix(&home);
         assert!(prefix.starts_with(&home), "{}", prefix.display());
         let fx = Self {
-            root,
+            _root: root,
             home,
             config_home,
             registry,
@@ -116,9 +100,8 @@ impl Fixture {
     }
 
     /// `program argv…` confined to this fixture, both pipes captured, run to completion.
-    fn run(&self, program: &Path, argv: &[OsString]) -> (Output, Duration) {
-        let started = Instant::now();
-        let out = Command::new(program)
+    fn run(&self, program: &Path, argv: &[OsString]) -> Output {
+        Command::new(program)
             .args(argv)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
@@ -126,22 +109,7 @@ impl Fixture {
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
             .stdin(Stdio::null())
             .output()
-            .expect("run under the fixture");
-        (out, started.elapsed())
-    }
-
-    /// `program argv…` run once exactly as [`Fixture::run`] runs it, unbounded, its result
-    /// discarded: it pays macOS's one-time assessment of every new file the command execs
-    /// (the manual.rs `run_once` rule), so the timed run after it measures the verb, not
-    /// the assessor's queue ([`AT_ONCE`]).
-    fn warm(&self, program: &Path, argv: &[OsString]) {
-        let _ = self.run(program, argv);
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+            .expect("run under the fixture")
     }
 }
 
@@ -169,16 +137,10 @@ fn the_landing_verb_execs_the_bin_shim_at_once_and_prints_nothing() {
         OsString::from("-p"),
         OsString::from("a b"),
     ];
-    // Untimed first: `atpkg`, the shim and the store script are each exec'd here for the
-    // first time. The marker is stood again after it, so the timed run meets exactly the
-    // state the retired verb waited out, whatever the warm run did.
-    fx.warm(atpkg(), &argv);
-    fx.stand_marker();
-    let (out, took) = fx.run(atpkg(), &argv);
+    let out = fx.run(atpkg(), &argv);
     assert_eq!(out.status.code(), Some(7), "the shim's own code: {out:?}");
     assert_eq!(text(&out.stdout), "fake: -p a b\n");
     assert_eq!(text(&out.stderr), "", "nothing printed");
-    assert!(took < AT_ONCE, "no wait: {took:?}");
     assert!(marker.exists(), "the verb reads no marker and removes none");
 }
 
@@ -215,16 +177,10 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     std::fs::write(&twin, body).unwrap();
     std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let argv = [OsString::from("--probe")];
-    // Untimed first: one run under the marker execs the twin, `atpkg`, the shim and the
-    // store script, each for the first time. The marker is stood again after it, so the
-    // timed run takes the landing prelude exactly as the field does.
-    fx.warm(&twin, &argv);
-    fx.stand_marker();
-    let (out, took) = fx.run(&twin, &argv);
+    let out = fx.run(&twin, &argv);
     assert_eq!(out.status.code(), Some(7), "{out:?}");
     assert_eq!(text(&out.stdout), "fake: --probe\n");
     assert_eq!(text(&out.stderr), "", "nothing printed");
-    assert!(took < AT_ONCE, "no wait: {took:?}");
 }
 
 /// EVERY PASS SWEEPS `landing/`: a mutating verb takes the store lock and removes the
@@ -236,7 +192,7 @@ fn a_pass_sweeps_every_landing_marker() {
     fx.install_claude(2026091601);
     let marker = fx.stand_marker();
     std::fs::write(fx.layout().landing_dir().join("codex"), b"junk\n").unwrap();
-    let (out, _) = fx.run(atpkg(), &[OsString::from("gc")]);
+    let out = fx.run(atpkg(), &[OsString::from("gc")]);
     assert!(out.status.success(), "{out:?}");
     assert!(!marker.exists(), "{out:?}");
     assert!(

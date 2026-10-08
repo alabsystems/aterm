@@ -595,8 +595,8 @@ fn the_comet_never_flips_a_words_ink() {
     }
 }
 
-/// THE TIME SLOT'S WORDS WEAR THEIR MEANING'S INK (review round 3,
-/// 2026-09-24): a determinate row whose estimate is hidden shows its
+/// THE TIME SLOT'S WORDS WEAR THEIR MEANING'S INK: a determinate row whose estimate is hidden shows
+/// its
 /// elapsed CLOCK in the ETA slot in the label ink, a latched estimate
 /// (`… left`) in the value ink, and its Complete echo says `done` in the
 /// ink its ✓ wears — the accent's family, never warn (`stalled` and
@@ -1037,8 +1037,7 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
 /// THE BAND'S REPAINT KEY KEEPS ITS VALUES (ruling 328): the key moved into
 /// the engine with its arithmetic — [`Geometry`]'s derived `Hash` and the std
 /// hasher's fixed keys — so a key is the number the host's copy computed.
-/// Pinned from the host's copy before the move (round 25's oracle held all
-/// 772,500 of its keys equal across the move).
+/// The values below were pinned from the host's copy before the move.
 #[test]
 fn band_fp_keeps_the_hosts_values() {
     let fp = 0x1234_5678;

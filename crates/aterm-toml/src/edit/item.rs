@@ -250,6 +250,18 @@ impl KeyMap {
         Some(&mut self.entries[i].1)
     }
 
+    /// Where `key` sits among the entries. A position stays valid until an
+    /// entry is REMOVED; inserting never moves one, which is what lets the
+    /// parser keep a header's path as positions while it appends beneath it.
+    pub(crate) fn position(&self, key: &str) -> Option<usize> {
+        self.index.get(key).copied()
+    }
+
+    /// The entry at a position [`Self::position`] returned.
+    pub(crate) fn get_at_mut(&mut self, position: usize) -> Option<&mut Item> {
+        self.entries.get_mut(position).map(|(_, item)| item)
+    }
+
     pub(crate) fn get_key_value(&self, key: &str) -> Option<(&Key, &Item)> {
         self.index.get(key).map(|&i| {
             let (k, v) = &self.entries[i];
@@ -272,18 +284,28 @@ impl KeyMap {
     }
 
     pub(crate) fn remove(&mut self, key: &str) -> Option<Item> {
+        self.remove_entry(key).map(|(_, item)| item)
+    }
+
+    /// Delete `key`, handing back the key too: its authored formatting.
+    pub(crate) fn remove_entry(&mut self, key: &str) -> Option<(Key, Item)> {
         let i = self.index.remove(key)?;
-        let (_, item) = self.entries.remove(i);
+        let entry = self.entries.remove(i);
         for slot in self.index.values_mut() {
             if *slot > i {
                 *slot -= 1;
             }
         }
-        Some(item)
+        Some(entry)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&Key, &Item)> {
         self.entries.iter().map(|(k, v)| (k, v))
+    }
+
+    /// The entries by value, in order.
+    pub(crate) fn into_entries(self) -> impl Iterator<Item = (Key, Item)> {
+        self.entries.into_iter()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -326,6 +348,13 @@ pub struct Table {
     /// worked example — so the parser reads this flag when a header path ENDS
     /// here, and ignores it when the path merely walks through.
     pub(crate) closed: bool,
+    /// Comment and blank lines printed after this table's key-value lines: the
+    /// ones a removed LAST line was written under (see
+    /// [`super::DocumentMut::remove_path`]). The parser never fills it — in
+    /// parsed text that run belongs to the next header or the document's end —
+    /// and keeping it here, not on whichever header prints next, holds it under
+    /// this table even when the same edit adds a table that prints between.
+    pub(crate) trailing: super::RawString,
 }
 
 impl Table {
@@ -384,9 +413,37 @@ impl Table {
         self.items.insert(key, item)
     }
 
-    /// Delete `key`.
+    /// Delete `key`, with everything its line holds — the comment lines written
+    /// above it included. [`super::DocumentMut::remove_path`] keeps those.
     pub fn remove(&mut self, key: &str) -> Option<Item> {
         self.items.remove(key)
+    }
+
+    /// Keep the comment and blank lines the removed line `removed` was written
+    /// under where they were: on the head of the next line this table prints,
+    /// else after its last one. The parser filed them at the front of that
+    /// line's head; the rest of the head — the line's indentation and dotted
+    /// path — went with the line.
+    pub(crate) fn keep_lines_above(&mut self, removed: &Key) {
+        let Some(repr) = &removed.path_repr else {
+            return;
+        };
+        let Some(end) = repr.head.as_str().rfind('\n') else {
+            return;
+        };
+        let lines = &repr.head.as_str()[..=end];
+        let mut keys = Vec::new();
+        line_keys_mut(&mut self.items, &mut keys);
+        // A built key (order `usize::MAX`) prints after every authored line and
+        // has no authored head to extend, so the lines go after the table's.
+        let next = keys
+            .into_iter()
+            .filter(|key| key.order > removed.order)
+            .min_by_key(|key| key.order);
+        match next.and_then(|key| key.path_repr.as_mut()) {
+            Some(next) => next.head = format!("{lines}{}", next.head).into(),
+            None => self.trailing = format!("{lines}{}", self.trailing).into(),
+        }
     }
 
     /// Every scalar/array/inline-table leaf reachable WITHOUT crossing a header
@@ -425,6 +482,18 @@ pub(crate) fn append_values<'a>(
             Item::Table(t) if t.dotted => append_values(&t.items, &path, out),
             Item::Value(Value::InlineTable(t)) if t.dotted => append_values(&t.items, &path, out),
             Item::Value(v) => out.push((path, v)),
+            _ => {}
+        }
+    }
+}
+
+/// The leaf key of every line [`append_values`] lists, for writing.
+fn line_keys_mut<'a>(items: &'a mut KeyMap, out: &mut Vec<&'a mut Key>) {
+    for (key, item) in &mut items.entries {
+        match item {
+            Item::Table(t) if t.dotted => line_keys_mut(&mut t.items, out),
+            Item::Value(Value::InlineTable(t)) if t.dotted => line_keys_mut(&mut t.items, out),
+            Item::Value(_) => out.push(key),
             _ => {}
         }
     }
@@ -493,7 +562,8 @@ pub trait TableLike {
     fn contains_key(&self, key: &str) -> bool;
     /// Set `key`, keeping an existing entry's position.
     fn insert(&mut self, key: &str, item: Item) -> Option<Item>;
-    /// Delete `key`.
+    /// Delete `key`, with everything its line holds — the comment lines written
+    /// above it included. [`super::DocumentMut::remove_path`] keeps those.
     fn remove(&mut self, key: &str) -> Option<Item>;
     /// Number of direct entries.
     fn len(&self) -> usize;
@@ -501,10 +571,6 @@ pub trait TableLike {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Did this table come from a dotted key?
-    fn is_dotted(&self) -> bool;
-    /// Declare this table printed inline in its parent's key line.
-    fn set_dotted(&mut self, dotted: bool);
     /// Formatting around the table.
     fn decor(&self) -> &Decor;
     /// Mutable formatting around the table.
@@ -539,12 +605,6 @@ impl TableLike for Table {
     }
     fn len(&self) -> usize {
         self.items.len()
-    }
-    fn is_dotted(&self) -> bool {
-        self.dotted
-    }
-    fn set_dotted(&mut self, dotted: bool) {
-        self.dotted = dotted;
     }
     fn decor(&self) -> &Decor {
         &self.decor

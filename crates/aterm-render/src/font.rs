@@ -13,8 +13,7 @@
 //! ttf-parser-outline → [`crate::raster`] signed-area coverage fill the
 //! variation and `sbix` paths already used, which is why retiring fontdue added
 //! no rasterizer: the rasterizer was already here and already proven, glyph for
-//! glyph, against `ab_glyph_rasterizer` at f32 bit equality
-//! (`tests/rasterizer_oracle.rs`).
+//! glyph, against `ab_glyph_rasterizer` at f32 bit equality.
 //!
 //! The API is deliberately the SEVEN methods the workspace actually called on
 //! `fontdue::Font` — [`Font::from_bytes`], [`Font::rasterize`],
@@ -67,7 +66,7 @@
 //!   A declared box can be LOOSER than the outline it declares, so this box is
 //!   sometimes bigger than fontdue's — and it is bigger in the SAFE direction:
 //!   it can cost atlas space, never a clipped glyph.
-//!   `tests/first_party_face_vs_fontdue.rs` proves that over 109 704
+//!   Measured over 109 704
 //!   (glyph, size) pairs of the embedded faces: 102 425 boxes are identical to
 //!   fontdue's and every other one CONTAINS it — so no ink is lost and nothing
 //!   moves. The worst slack is 9 px (a Nerd Font icon at 32 px whose declared
@@ -109,7 +108,7 @@
 //!
 //! Parsing is the cmap walk plus one `hmtx` read per glyph plus the `kern`
 //! header — no outline is touched. MEASURED against fontdue on the same bytes at
-//! opt-level 3 (`tests/face_parse_cost.rs`), live heap and wall time:
+//! opt-level 3, live heap and wall time:
 //!
 //! ```text
 //!                                     adopting   copying    fontdue        ours     fontdue
@@ -613,10 +612,9 @@ impl Font {
     pub fn horizontal_kern_indexed(&self, left: u16, right: u16, px: f32) -> Option<f32> {
         let table = ttf_parser::kern::Table::parse(self.kern.as_deref()?)?;
         let (l, r) = (ttf_parser::GlyphId(left), ttf_parser::GlyphId(right));
-        // First horizontal, non-variable subtable that has an opinion wins —
-        // the same "take the first usable horizontal subtable" rule fontdue
-        // applied, widened only in that a subtable with no entry for THIS pair
-        // no longer ends the search.
+        // First horizontal, non-variable subtable with an entry for THIS pair
+        // wins (fontdue's "first usable horizontal subtable" rule, widened so
+        // a subtable without the pair does not end the search).
         let value = table
             .subtables
             .into_iter()

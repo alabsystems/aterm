@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seamless update's HISTORY CARRY, terminal half (2026-09-26): the grid
-//! primitives of `aterm_grid::grid::history_carry`, aimed at the grid that
-//! HOLDS this terminal's history — [`Terminal::main_grid`], which is the saved
-//! primary while the alternate screen is up. The screen carry never carried
-//! that grid's history at all (the inactive blob is pinned to its visible
-//! rows), so a tab running a full-screen program lost every line above its
-//! shell prompt at every update; through this seam it crosses like any other.
+//! The seamless update's history carry, terminal half: the grid primitives of
+//! `aterm_grid::grid::history_carry`, aimed at the grid holding this terminal's
+//! history ([`Terminal::main_grid`], the saved primary while the alternate
+//! screen is up), so a tab running a full-screen program keeps the lines above
+//! its shell prompt across an update.
 
 use aterm_grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
@@ -55,13 +53,10 @@ impl Terminal {
     }
 
     /// Reserve absolute-row keys below the oldest history line for `lines`
-    /// that will be imported later ([`Grid::reserve_older_history_keys`]).
-    /// Only right after [`Self::restore_checkpoint`], before anything but the
-    /// restore has read an absolute row — the adopt path, ahead of the
-    /// session's reader. The restore continues the source's numbering, so the
-    /// imported lines' own keys are already free below the oldest row and the
-    /// reserve moves nothing: the shell marks the restore installed keep
-    /// naming their lines.
+    /// imported later ([`Grid::reserve_older_history_keys`]). Call only right
+    /// after [`Self::restore_checkpoint`], before anything else reads an
+    /// absolute row. The restore continues the source's numbering, so the
+    /// reserve moves nothing and restored shell marks keep naming their lines.
     /// Returns the claim the import presents ([`OlderHistoryClaim`]).
     #[must_use]
     pub fn reserve_older_history_keys(&mut self, lines: u64) -> OlderHistoryClaim {
@@ -77,13 +72,10 @@ impl Terminal {
     }
 
     /// Place `older` before the oldest history line
-    /// ([`Grid::attach_older_history`]) — refused, and the history handed
-    /// back, once the scrollback was cleared since `claim` was minted — and
-    /// drop the caches that assumed the
-    /// oldest row only moves forward: the cached search index is released
-    /// (the next search rebuilds it) and consumers of absolute coordinates
-    /// see one fail-closed epoch edge, as after any other wholesale history
-    /// change. Returns how many imported lines the terminal retained.
+    /// ([`Grid::attach_older_history`]); refused, and the history handed back,
+    /// if the scrollback was cleared since `claim` was minted. Releases the
+    /// cached search index and advances the absolute-coordinate epoch. Returns
+    /// how many imported lines the terminal retained.
     pub fn attach_older_history(
         &mut self,
         older: OlderHistory,
@@ -150,10 +142,8 @@ mod tests {
     }
 
     /// An ED3 the adopted shell sends after Commit, before the import lands,
-    /// is the user's word: the import is refused and nothing comes back
-    /// (2026-09-26 review — before the claim, all 46 lines did). A RIS says
-    /// the same. NEGATIVE CONTROL: an ED2 (the screen, not the scrollback)
-    /// leaves the claim standing.
+    /// refuses the import; so does a RIS. Negative control: an ED2 leaves the
+    /// claim standing.
     #[test]
     fn a_scrollback_the_shell_clears_before_the_import_stays_cleared() {
         let mut source = Terminal::new(5, 30);

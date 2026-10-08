@@ -20,7 +20,7 @@ use crate::model::{
     ActionIndex, Amount, Glyph, Hold, Intent, Load, Message, MessageId, Meter, Origin, Restatement,
     Severity, Tag, Unit, WallStamp, tags,
 };
-use crate::text::{clip, glass_title_fault};
+use crate::text::{clip, glass_title_fault, is_stripped};
 use crate::{
     DETAIL_LINE_CAP, DETAIL_LINES_CAP, Duration, Instant, LOG_CAP, MAX_ACTIONS, PROGRESS_GRACE,
     STALE_WIRE, STATS_CAP, TITLE_CAP, WIRE_BYTES_PER_WINDOW, WIRE_KEY_MAX, WIRE_KEY_PREFIX,
@@ -33,9 +33,9 @@ pub(crate) const READ_USAGE: &str =
     "usage: messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]";
 /// The `notice post` usage line.
 pub(crate) const POST_USAGE: &str =
-    "usage: notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..3600>] <title>[ -- <detail>]";
+    "usage: notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..120>] <title>[ -- <detail>]";
 /// The longest `hold=` a wire post may ask for, in seconds.
-pub(crate) const MAX_WIRE_HOLD_SECS: u32 = 3600;
+pub(crate) const MAX_WIRE_HOLD_SECS: u32 = 120;
 /// The most detail bytes a wire post carries.
 pub(crate) const WIRE_DETAIL_BYTES: usize = 2048;
 /// The default page of a `messages` read.
@@ -55,6 +55,8 @@ pub struct ReadQuery {
     pub min_severity: Option<Severity>,
     /// Only unretired rows.
     pub live_only: bool,
+    /// Only exceptions (`need=later`): the digest's entries, open and filed.
+    pub later_only: bool,
 }
 
 impl ReadQuery {
@@ -74,19 +76,29 @@ impl ReadQuery {
     /// page is the NEWEST ones (the tail of the log); with it, the OLDEST
     /// ones above the id, so a reader paging with the last id it saw never
     /// skips a record, however many arrived between two reads (design
-    /// ruling 198 — the `exits since=` idiom).
+    /// ruling 198 — the `exits since=` idiom). BY ID, not by the ring's order:
+    /// a record a replay loaded under a fresh id (a collision, ruling 270) or
+    /// one moved off a carried number keeps its place in the ring under a
+    /// higher id, and a page cut in ring order would skip the records between
+    /// (ruling 415 (e)).
     #[must_use]
     pub(crate) fn select<'a>(&self, log: &'a MessageLog) -> Vec<&'a LogRecord> {
-        let picked = log
+        let mut picked: Vec<&LogRecord> = log
             .records()
             .filter(|r| self.since.is_none_or(|s| r.id > s))
             .filter(|r| self.tag.as_ref().is_none_or(|t| r.tag == *t))
             .filter(|r| self.min_severity.is_none_or(|s| r.severity >= s))
-            .filter(|r| !self.live_only || r.is_live());
+            // `live` is what is on or queued for the band: an open exception
+            // is in the log as unretired but is never on the glass, so plain
+            // `live` leaves it out (`need=later live` asks for exactly those).
+            .filter(|r| !self.live_only || (r.is_live() && (!r.later || self.later_only)))
+            .filter(|r| !self.later_only || r.later)
+            .collect();
+        picked.sort_by_key(|r| r.id);
         if self.since.is_some() {
-            return picked.take(self.page()).collect();
+            picked.truncate(self.page());
+            return picked;
         }
-        let picked: Vec<&LogRecord> = picked.collect();
         let skip = picked.len().saturating_sub(self.page());
         picked.into_iter().skip(skip).collect()
     }
@@ -102,22 +114,21 @@ pub fn parse_read_args(rest: &str) -> Result<ReadQuery, &'static str> {
     for word in rest.split_whitespace() {
         if word == "live" {
             q.live_only = true;
-        } else if let Ok(n) = word.parse::<usize>() {
+        } else if let Some(n) = digits::<usize>(word) {
+            // Plain digits, as everywhere on the wire (design ruling 182):
+            // `+5` is a usage error, not five (ruling 415 (p)).
             if n == 0 {
                 return Err(READ_USAGE);
             }
             q.n = Some(n.min(LOG_CAP));
         } else if let Some(v) = word.strip_prefix("since=") {
-            q.since = Some(
-                v.parse()
-                    .ok()
-                    .and_then(MessageId::from_raw)
-                    .ok_or(READ_USAGE)?,
-            );
+            q.since = Some(wire_id(v).ok_or(READ_USAGE)?);
         } else if let Some(v) = word.strip_prefix("tag=") {
             q.tag = Some(Tag::try_new(v).map_err(|_| READ_USAGE)?);
         } else if let Some(v) = word.strip_prefix("sev=") {
             q.min_severity = Some(Severity::parse(v).ok_or(READ_USAGE)?);
+        } else if word == "need=later" {
+            q.later_only = true;
         } else {
             return Err(READ_USAGE);
         }
@@ -150,6 +161,8 @@ pub fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
             }
         }
         (None, Some(how)) => how.as_word(),
+        // An open exception: in the digest, on no glass.
+        (None, None) if rec.later => "review",
         (None, None) => "live",
     }
 }
@@ -245,6 +258,24 @@ pub(crate) fn message_row(
                 .to_string(),
         );
     }
+    // The message's CLASS, when it has one ([`crate::need`]): a live typed
+    // row says `now`, `working` or `notice`; an exception, open or filed,
+    // says `later`. An unclassified row says nothing (the word would be on
+    // every row until the reporters are classified).
+    let class = match live {
+        // A row adopted from an older parent (or lent to a fixture) has no
+        // class of its own to report.
+        Some(l) => match l.msg.need() {
+            crate::need::Need::Now(ask) if ask.is_adopted() => crate::need::Class::Unclassified,
+            need => need.class(),
+        },
+        None if rec.later => crate::need::Class::Later,
+        None => crate::need::Class::Unclassified,
+    };
+    if class != crate::need::Class::Unclassified {
+        row.push_str(" need=");
+        row.push_str(class.as_str());
+    }
     row
 }
 
@@ -264,6 +295,20 @@ pub fn message_rows(
         .into_iter()
         .map(|rec| {
             let live = center.live(rec.id);
+            // An open exception reads its CURRENT words (a restatement is
+            // never logged, so the record holds the words it was posted with).
+            if live.is_none()
+                && rec.later
+                && rec.is_live()
+                && let Some(e) = center.digest_entry(rec.id)
+            {
+                let mut now_words = rec.clone();
+                now_words.title = e.title;
+                now_words.detail = e.detail;
+                now_words.actions = e.actions;
+                now_words.repeats = e.repeats;
+                return message_row(&now_words, None, None, now_unix_ms, enc);
+            }
             let glass = live.and_then(|_| center.glass_position(rec.id));
             message_row(rec, live, glass, now_unix_ms, enc)
         })
@@ -351,28 +396,31 @@ pub(crate) const PROGRESS_USAGE: &str = "usage: notice progress <key> [tag=<tag>
 /// The `notice done` usage line.
 pub(crate) const DONE_USAGE: &str = "usage: notice done <key> [ok|warn|withdraw] [<words>]";
 /// The `notice dismiss` usage line.
-pub(crate) const DISMISS_USAGE: &str = "usage: notice dismiss <id>";
+pub(crate) const DISMISS_USAGE: &str = "usage: notice dismiss <id|review>";
 /// The `notice act` usage line.
 pub(crate) const ACT_USAGE: &str = "usage: notice act <id> <label|index|details>";
 /// A key outside the wire's rule (design ruling 167).
 pub(crate) const KEY_REFUSAL: &str =
     "notice: keys are 1-40 of a-z 0-9 . _ - (they live as wire.<key>)";
-/// A tag of aterm's own lanes (design ruling 171).
-pub(crate) const LANE_REFUSAL: &str =
-    "notice: the toolchain, update and harness tags are aterm's own";
+/// A tag of aterm's own families (design rulings 171 and 433).
+pub(crate) const OWN_TAG_REFUSAL: &str =
+    "notice: that tag is aterm's own; post under script or a tag of your own";
 /// [`apply`] handed an `act`: a press is the HOST's to perform
 /// ([`press_target`], then its own press path).
 pub(crate) const ACT_IS_THE_HOSTS: &str = "ERR notice: act is pressed by the host";
 
-/// The tags `notice` refuses: `appstatus` is what aterm has been doing on its
-/// own initiative, so a script can never appear there as aterm's install or
-/// update (design ruling 171).
-const LANE_TAGS: [&str; 3] = ["toolchain", "update", "harness"];
+/// Whether `notice` refuses `tag`: every family aterm reports under
+/// ([`tags::ALL`]) but `script`, the scripts' own. A script's `crash` or
+/// `session` row would otherwise count, filter and read as aterm's on the
+/// page, which cannot tell the two apart (design rulings 171, 390 and 433).
+fn aterms_own(tag: &Tag) -> bool {
+    *tag != tags::SCRIPT && tags::ALL.contains(&tag)
+}
 
 /// The refusal for a glass title fault: `notice: <fault>`, one static string
 /// per fault [`glass_title_fault`] names, in the script author's words: what
 /// is wrong with the title and where the rest goes (` -- `), never the band's
-/// internal name (audit 2026-09-24, design ruling 213).
+/// internal name (design ruling 213).
 fn title_refusal(fault: &'static str, tail: bool) -> &'static str {
     match (fault, tail) {
         ("a glass title over six words", true) => {
@@ -413,11 +461,11 @@ fn wire_key(word: &str) -> Result<String, &'static str> {
     }
 }
 
-/// The tag rule: any [`Tag::try_new`] word but aterm's own lanes.
+/// The tag rule: any [`Tag::try_new`] word but aterm's own families.
 fn wire_tag(word: &str, usage: &'static str) -> Result<Tag, &'static str> {
     let tag = Tag::try_new(word).map_err(|_| usage)?;
-    if LANE_TAGS.contains(&tag.as_str()) {
-        return Err(LANE_REFUSAL);
+    if aterms_own(&tag) {
+        return Err(OWN_TAG_REFUSAL);
     }
     Ok(tag)
 }
@@ -441,17 +489,31 @@ fn wire_id(s: &str) -> Option<MessageId> {
 }
 
 /// `<title>[ -- <tail>]`, both trimmed; a line that opens with `--` has no
-/// title.
+/// title, and one that ENDS with its separator has no tail — `Deploy failed
+/// -- ` (a script's `"$TITLE -- $DETAIL"` with nothing in `$DETAIL`) is the
+/// title `Deploy failed`, never `Deploy failed --` (ruling 415 (o)).
 fn split_title(rest: &str) -> (&str, &str) {
-    let rest = rest.trim();
-    if rest == "--" {
+    let rest = rest.trim_start();
+    if rest.trim_end() == "--" {
         return ("", "");
     }
     if let Some(tail) = rest.strip_prefix("-- ") {
         return ("", tail.trim());
     }
-    let (title, tail) = rest.split_once(" -- ").unwrap_or((rest, ""));
+    let (title, tail) = rest
+        .split_once(" -- ")
+        .or_else(|| rest.trim_end().strip_suffix(" --").map(|t| (t, "")))
+        .unwrap_or((rest, ""));
     (title.trim(), tail.trim())
+}
+
+/// A wire title, detail line, stats or `done`'s words: STRIPPED, then
+/// trimmed, then capped. The strip runs first, so an invisible character
+/// after a space never keeps the space, and a trailing period before it,
+/// out of the title form's sight (rulings 164, 196; ruling 415
+/// (m)): `Build failed. ` + U+2060 is `Build failed.`, refused.
+fn clip_words(s: &str, cap: usize) -> String {
+    clip(clip(s, usize::MAX).trim(), cap)
 }
 
 /// Options come in any order after the fixed words until the first word
@@ -472,17 +534,19 @@ fn options(
     }
 }
 
-/// `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..3600>] <title>[ -- <detail>]`.
+/// `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..120>] <title>[ -- <detail>]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostRequest {
-    /// Any tag but aterm's own lanes (design ruling 171).
+    /// `script` or any tag of the script's own (design ruling 433).
     pub tag: Tag,
     /// Defaults to `info`.
     pub severity: Severity,
     /// The FULL key, `wire.<key>` (design ruling 167).
     pub key: Option<String>,
-    /// Seconds, 1..=3600; the severity's hold when absent. A record has no
-    /// hold, so on `success`/`info` it is accepted and ignored.
+    /// Seconds, 1..=120 (a script cannot say why the owner is needed, so it
+    /// cannot hold a row longer than a glance: decision D3); the severity's
+    /// hold when absent. A record has no hold, so on `success`/`info` it is
+    /// accepted and ignored.
     pub hold_secs: Option<u32>,
     /// ≤ [`TITLE_CAP`] chars; a `warn`/`error` title obeys the glass title
     /// form ([`glass_title_fault`]).
@@ -497,7 +561,7 @@ impl PostRequest {
     ///
     /// # Errors
     /// [`POST_USAGE`] for a missing or invalid tag, an unknown severity, a
-    /// hold outside `1..=3600`, or an empty title; [`LANE_REFUSAL`] for
+    /// hold outside `1..=120`, or an empty title; [`OWN_TAG_REFUSAL`] for
     /// aterm's own tags; [`KEY_REFUSAL`] for a key outside the rule; and
     /// `notice: <fault>` for a `warn`/`error` title the glass refuses.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
@@ -526,7 +590,7 @@ impl PostRequest {
             Ok(true)
         })?;
         let (title, detail) = split_title(rest);
-        let title = clip(title, TITLE_CAP);
+        let title = clip_words(title, TITLE_CAP);
         if title.is_empty() {
             return Err(POST_USAGE);
         }
@@ -539,7 +603,7 @@ impl PostRequest {
         }
         let detail: Vec<String> = detail[..end]
             .split("\\n")
-            .map(|l| clip(l.trim(), DETAIL_LINE_CAP))
+            .map(|l| clip_words(l, DETAIL_LINE_CAP))
             .filter(|l| !l.is_empty())
             .take(DETAIL_LINES_CAP)
             .collect();
@@ -630,7 +694,7 @@ fn parse_done(v: &str) -> Option<(u64, u64)> {
 pub struct ProgressRequest {
     /// The FULL key, `wire.<key>`.
     pub key: String,
-    /// `script` by default (ruling 265); never aterm's own lanes.
+    /// `script` by default (ruling 265); never aterm's own families.
     pub tag: Tag,
     /// The fill, the amount, or busy.
     pub indicator: WireIndicator,
@@ -648,7 +712,7 @@ impl ProgressRequest {
     /// # Errors
     /// [`PROGRESS_USAGE`] for a missing key, a bad option, two indicators,
     /// `unit=` without `done=`, or an empty title; [`KEY_REFUSAL`],
-    /// [`LANE_REFUSAL`], and `notice: <fault>` for a title out of form.
+    /// [`OWN_TAG_REFUSAL`], and `notice: <fault>` for a title out of form.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         let (key, rest) = first_word(rest);
         if key.is_empty() {
@@ -696,7 +760,7 @@ impl ProgressRequest {
             (_, Some(_)) => return Err(PROGRESS_USAGE),
         };
         let (title, stats) = split_title(rest);
-        let title = clip(title, TITLE_CAP);
+        let title = clip_words(title, TITLE_CAP);
         if title.is_empty() {
             return Err(PROGRESS_USAGE);
         }
@@ -707,7 +771,7 @@ impl ProgressRequest {
             indicator,
             load,
             title,
-            stats: clip(stats, STATS_CAP),
+            stats: clip_words(stats, STATS_CAP),
         })
     }
 
@@ -844,7 +908,7 @@ impl DoneRequest {
             "withdraw" => DoneHow::Withdraw,
             _ => return Err(DONE_USAGE),
         };
-        let words = clip(words.trim(), TITLE_CAP);
+        let words = clip_words(words, TITLE_CAP);
         if !words.is_empty() {
             title_form(&words, false)?;
         }
@@ -878,6 +942,8 @@ pub enum NoticeRequest {
     Done(DoneRequest),
     /// Take a row down as a person could.
     Dismiss(MessageId),
+    /// File every open exception into the log (`notice dismiss review`).
+    DismissReview,
     /// Press a row's capsule as a person would.
     Act {
         /// The row.
@@ -897,13 +963,14 @@ impl NoticeRequest {
     /// own refusals ([`PostRequest::parse`], [`ProgressRequest::parse`],
     /// [`DoneRequest::parse`], [`DISMISS_USAGE`], [`ACT_USAGE`]).
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
-        // A tab (or any whitespace control) on the line is a space: the strip
-        // below would otherwise glue `Deploy\tfailed` into `Deployfailed`, and
-        // a `\t--\t` would never split the detail off (design ruling 189).
+        // A tab (or any whitespace the strip removes: a control, U+2028,
+        // U+2029) on the line is a space: the strip below would otherwise glue
+        // `Deploy\tfailed` into `Deployfailed`, and a `\t--\t` would never
+        // split the detail off (design ruling 189; ruling 415 (n)).
         let spaced: String = rest
             .chars()
             .map(|c| {
-                if c.is_whitespace() && c.is_control() {
+                if c.is_whitespace() && is_stripped(c) {
                     ' '
                 } else {
                     c
@@ -915,6 +982,7 @@ impl NoticeRequest {
             "post" => PostRequest::parse(rest).map(Self::Post),
             "progress" => ProgressRequest::parse(rest).map(Self::Progress),
             "done" => DoneRequest::parse(rest).map(Self::Done),
+            "dismiss" if rest.trim() == "review" => Ok(Self::DismissReview),
             "dismiss" => {
                 let mut words = rest.split_whitespace();
                 let id = words.next().and_then(wire_id).ok_or(DISMISS_USAGE)?;
@@ -1111,7 +1179,8 @@ fn later(t: Instant, d: Duration) -> Instant {
 }
 
 /// A row the wire owns: minted by it, or keyed in its namespace (a carried
-/// wire row's origin is `Carried`, its key is still the wire's).
+/// keyed wire row's origin is `Carried`, its key is still the wire's; a
+/// carried keyless one keeps `Wire`, ruling 415 (h)).
 fn is_wire(row: &Live) -> bool {
     row.msg.origin == Origin::Wire
         || row
@@ -1195,7 +1264,11 @@ pub fn apply(
         NoticeRequest::Post(p) => apply_post(center, gate, p, stamp, now),
         NoticeRequest::Progress(p) => apply_progress(center, gate, &p, stamp, now),
         NoticeRequest::Done(d) => apply_done(center, gate, d, now),
-        NoticeRequest::Dismiss(id) => apply_dismiss(center, gate, id, now),
+        NoticeRequest::Dismiss(id) => apply_dismiss(center, gate, id, stamp, now),
+        NoticeRequest::DismissReview => {
+            let n = center.file_digest(stamp, now);
+            Applied::quiet(format!("OK dismissed=review filed={n}"))
+        }
         NoticeRequest::Act { .. } => Applied::quiet(ACT_IS_THE_HOSTS.to_string()),
     }
 }
@@ -1349,8 +1422,13 @@ fn apply_dismiss(
     center: &mut MessageCenter,
     gate: &mut WireGate,
     id: MessageId,
+    stamp: WallStamp,
     now: Instant,
 ) -> Applied {
+    // An exception in the digest: a person can file it (the wire is theirs).
+    if center.file_digest_one(id, stamp, now) {
+        return Applied::quiet(format!("OK dismissed={id}"));
+    }
     let Some(row) = center.live(id) else {
         return Applied::quiet(no_live_reply(id));
     };
@@ -1364,7 +1442,7 @@ fn apply_dismiss(
                     "ERR notice: message {id} asks; answer it with notice act"
                 ));
             }
-            Hold::Default | Hold::For(_) | Hold::Standing | Hold::LogOnly => {}
+            Hold::Default | Hold::For(_) | Hold::Standing(_) | Hold::LogOnly => {}
         }
     }
     center.dismiss(id, now);
@@ -1406,7 +1484,7 @@ pub const SWITCHING_RETRY: Duration = Duration::from_secs(1);
 
 /// `ERR busy notice: aterm is switching to its new version retry_ms=<ms>` —
 /// the host's answer to every `notice` while a seamless update has parked this
-/// process (round-seven update audit, finding 32): the rows crossed to the new
+/// process: the rows crossed to the new
 /// version at the park, so a row posted, dismissed, re-worded or pressed now
 /// would be lost at Commit. The transient class drivers already back off on.
 #[must_use]
@@ -1484,23 +1562,9 @@ mod tests {
     use crate::model::{Meter, WallStamp, tags};
     use crate::text::char_width;
     use crate::{Duration, HOLD_WARN, Instant};
-
-    /// The host's `pct_encode` (aterm-control/src/wire.rs:28), copied so the
-    /// pinned strings are the bytes the socket carries.
-    fn pct_encode(s: &str) -> String {
-        const HEX: &[u8; 16] = b"0123456789ABCDEF";
-        let mut out = String::with_capacity(s.len());
-        for b in s.bytes() {
-            if b.is_ascii_graphic() && b != b'%' {
-                out.push(b as char);
-            } else {
-                out.push('%');
-                out.push(HEX[usize::from(b >> 4)] as char);
-                out.push(HEX[usize::from(b & 0x0f)] as char);
-            }
-        }
-        out
-    }
+    // The encoder every host injects (`aterm_control::wire::pct_encode`
+    // re-exports it), so the pinned strings are the bytes the socket carries.
+    use aterm_codec::pct::encode as pct_encode;
 
     fn t0() -> Instant {
         Instant::now()
@@ -1761,9 +1825,7 @@ mod tests {
                     decision: crate::model::Decision::FileAccess,
                 })
                 .key("privacy.fda")
-                .hold(Hold::Ask {
-                    for_: Duration::from_secs(600),
-                }),
+                .hold(Hold::asking(Duration::from_secs(600))),
             stamp(5_000),
             now,
         );
@@ -1819,7 +1881,7 @@ mod tests {
         }
     }
 
-    /// Review (2026-09-24, design ruling 198): paging with the last id seen
+    /// Ruling 198: paging with the last id seen
     /// never skips a record. 100 records: `since=10` under `n=64` is 11..=74,
     /// then `since=74` is 75..=100; a bare read is still the newest 64, and
     /// `since=` with no count is everything above the id.
@@ -1854,10 +1916,10 @@ mod tests {
     #[test]
     fn notice_post_parses_the_grammar_and_never_authors_an_action() {
         let req = PostRequest::parse(
-            "system sev=warn key=k.1 hold=90 Something happened -- line one\\nline two",
+            "script sev=warn key=k.1 hold=90 Something happened -- line one\\nline two",
         )
         .unwrap();
-        assert_eq!(req.tag, tags::SYSTEM);
+        assert_eq!(req.tag, tags::SCRIPT);
         assert_eq!(req.severity, Severity::Warn);
         assert_eq!(req.key.as_deref(), Some("wire.k.1"));
         assert_eq!(req.hold_secs, Some(90));
@@ -1868,7 +1930,7 @@ mod tests {
         assert!(msg.actions.is_empty());
         assert_eq!(msg.hold, Hold::For(Duration::from_secs(90)));
         assert_eq!(msg.glyph, Severity::Warn.default_glyph());
-        let plain = PostRequest::parse("fabric  just a title").unwrap();
+        let plain = PostRequest::parse("peers  just a title").unwrap();
         assert_eq!(plain.severity, Severity::Info);
         assert_eq!(plain.title, "just a title");
         assert!(plain.detail.is_empty());
@@ -1879,20 +1941,21 @@ mod tests {
         );
         for junk in [
             "",
-            "system",
+            "script",
             "Bad title",
-            "system sev=loud t",
-            "system hold=0 t",
-            "system hold=3601 t",
-            "system hold=x t",
+            "script sev=loud t",
+            "script hold=0 t",
+            "script hold=121 t",
+            "script hold=3600 t",
+            "script hold=x t",
         ] {
             assert_eq!(PostRequest::parse(junk), Err(POST_USAGE), "{junk:?}");
         }
-        let long = format!("system t -- {}", "é".repeat(WIRE_DETAIL_BYTES));
+        let long = format!("script t -- {}", "é".repeat(WIRE_DETAIL_BYTES));
         let req = PostRequest::parse(&long).unwrap();
         assert!(req.detail[0].len() <= WIRE_DETAIL_BYTES);
         let many = format!(
-            "system t -- {}",
+            "script t -- {}",
             (0..40)
                 .map(|i| i.to_string())
                 .collect::<Vec<_>>()
@@ -1933,6 +1996,21 @@ mod tests {
         apply(c, g, req, stamp(1_000), now)
     }
 
+    /// A wire post under `tag`, which `notice` itself may refuse (ruling
+    /// 433): what an older build's post, carried or logged, puts in front of
+    /// the center.
+    fn wire_row(
+        c: &mut MessageCenter,
+        g: &mut WireGate,
+        tag: Tag,
+        rest: &str,
+        now: Instant,
+    ) -> Applied {
+        let mut req = PostRequest::parse(&format!("script {rest}")).expect("a post");
+        req.tag = tag;
+        apply(c, g, NoticeRequest::Post(req), stamp(1_000), now)
+    }
+
     /// The id an `OK message=<id>` reply names.
     fn id_of(a: &Applied) -> MessageId {
         let raw = a
@@ -1951,10 +2029,39 @@ mod tests {
         c.commit_rows(now, 3);
     }
 
+    /// Ruling 433: a script posts under `script` or a tag of its own, never
+    /// under a family aterm reports under — the page could not tell its
+    /// `crash` row from aterm's own.
+    #[test]
+    fn a_script_may_not_post_under_any_of_aterms_families() {
+        for own in tags::ALL.iter().filter(|t| ***t != tags::SCRIPT) {
+            let own = own.as_str();
+            for line in [
+                format!("post {own} sev=warn Worker crashed"),
+                format!("post {own} a note"),
+                format!("progress k tag={own} Building aterm"),
+            ] {
+                assert_eq!(
+                    NoticeRequest::parse(&line).err(),
+                    Some(OWN_TAG_REFUSAL),
+                    "{line}"
+                );
+            }
+        }
+        for line in [
+            "post script sev=warn Worker crashed",
+            "post crashes a note",
+            "progress k tag=script Building aterm",
+            "progress k tag=deploy Building aterm",
+        ] {
+            assert!(NoticeRequest::parse(line).is_ok(), "{line}");
+        }
+    }
+
     #[test]
     fn notice_parses_every_form_and_refuses_junk() {
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
-            "post system sev=warn key=deploy hold=90 Deploy failed -- connection refused",
+            "post script sev=warn key=deploy hold=90 Deploy failed -- connection refused",
         ) else {
             panic!()
         };
@@ -1965,7 +2072,7 @@ mod tests {
             ("Deploy failed", vec!["connection refused".to_string()])
         );
         let Ok(NoticeRequest::Progress(p)) = NoticeRequest::parse(
-            "progress build pct=42.5 load=disk tag=packages Building aterm -- 3 of 10",
+            "progress build pct=42.5 load=disk tag=deploy Building aterm -- 3 of 10",
         ) else {
             panic!()
         };
@@ -1973,7 +2080,7 @@ mod tests {
             p,
             ProgressRequest {
                 key: "wire.build".into(),
-                tag: tags::PACKAGES,
+                tag: Tag::try_new("deploy").unwrap(),
                 indicator: WireIndicator::Fill(425),
                 load: Some(Load::Disk),
                 title: "Building aterm".into(),
@@ -2062,15 +2169,15 @@ mod tests {
             ("shout hello", NOTICE_USAGE),
             ("Post system t", NOTICE_USAGE),
             ("post", POST_USAGE),
-            ("post system", POST_USAGE),
-            ("post system key=Bad t", KEY_REFUSAL),
-            ("post system key= t", KEY_REFUSAL),
-            ("post system key=wire/x t", KEY_REFUSAL),
-            ("post update t", LANE_REFUSAL),
-            ("post harness t", LANE_REFUSAL),
-            ("post toolchain sev=warn t", LANE_REFUSAL),
-            ("post system hold=+5 t", POST_USAGE),
-            ("post system -- only a detail", POST_USAGE),
+            ("post script", POST_USAGE),
+            ("post script key=Bad t", KEY_REFUSAL),
+            ("post script key= t", KEY_REFUSAL),
+            ("post script key=wire/x t", KEY_REFUSAL),
+            ("post update t", OWN_TAG_REFUSAL),
+            ("post harness t", OWN_TAG_REFUSAL),
+            ("post toolchain sev=warn t", OWN_TAG_REFUSAL),
+            ("post script hold=+5 t", POST_USAGE),
+            ("post script -- only a detail", POST_USAGE),
             ("progress", PROGRESS_USAGE),
             ("progress k", PROGRESS_USAGE),
             ("progress k -- stats only", PROGRESS_USAGE),
@@ -2098,7 +2205,7 @@ mod tests {
             ("progress k busy busy t", PROGRESS_USAGE),
             ("progress k load=gpu t", PROGRESS_USAGE),
             ("progress k tag=Bad t", PROGRESS_USAGE),
-            ("progress k tag=update t", LANE_REFUSAL),
+            ("progress k tag=update t", OWN_TAG_REFUSAL),
             ("done", DONE_USAGE),
             ("done K", KEY_REFUSAL),
             ("done k maybe", DONE_USAGE),
@@ -2155,7 +2262,7 @@ mod tests {
         let a = notice(
             &mut c,
             &mut g,
-            "post system hold=90 hello from a script",
+            "post script hold=90 hello from a script",
             now,
         );
         assert_eq!(
@@ -2170,12 +2277,12 @@ mod tests {
         assert_eq!(rec.retired(), Some(&Retired::Recorded));
         assert_eq!(rec.origin, Origin::Wire);
         assert_eq!(c.live_rows().count(), 0, "a record is never a row");
-        let s = notice(&mut c, &mut g, "post system sev=success Deployed", now);
+        let s = notice(&mut c, &mut g, "post script sev=success Deployed", now);
         assert_eq!(s.reply, "OK recorded message=2");
         let w = notice(
             &mut c,
             &mut g,
-            "post system sev=warn Deploy failed -- connection refused",
+            "post script sev=warn Deploy failed -- connection refused",
             now,
         );
         assert_eq!(
@@ -2187,7 +2294,7 @@ mod tests {
         let e = notice(
             &mut c,
             &mut g,
-            "post system sev=error hold=90 Disk full",
+            "post script sev=error hold=90 Disk full",
             now,
         );
         assert_eq!(
@@ -2200,7 +2307,7 @@ mod tests {
         let fixed = notice(
             &mut c,
             &mut g,
-            "post system key=deploy Deploy fixed",
+            "post script key=deploy Deploy fixed",
             now + ms(10),
         );
         assert_eq!(fixed.paint, Paint::Now);
@@ -2223,9 +2330,9 @@ mod tests {
         let now = t0();
         let (mut c, mut g) = fresh(now);
         for line in [
-            "post system Just so you know",
-            "post fabric sev=success All good -- details here",
-            "post crash sev=error key=a Worker crashed -- exit 3",
+            "post script Just so you know",
+            "post peers sev=success All good -- details here",
+            "post worker sev=error key=a Worker crashed -- exit 3",
             "progress b Building aterm",
             "progress c pct=10 load=cpu Verifying the payload",
             // Past the three-row cap (ruling 197): the error row goes first.
@@ -2271,11 +2378,11 @@ mod tests {
     fn a_glass_title_from_the_wire_obeys_the_title_form() {
         for (line, want) in [
             (
-                "post system sev=warn one two three four five six seven",
+                "post script sev=warn one two three four five six seven",
                 "notice: title over 6 words; put the rest after --",
             ),
             (
-                "post system sev=error Deploy failed: connection refused",
+                "post script sev=error Deploy failed: connection refused",
                 "notice: title has a clause (\u{2014}, ;, :); put it after --",
             ),
             (
@@ -2302,17 +2409,17 @@ mod tests {
             assert_eq!(NoticeRequest::parse(line), Err(want), "{line}");
         }
         // A record never reaches the glass: it keeps the 120-character cap.
-        let long = format!("post system {}", "word ".repeat(20));
+        let long = format!("post script {}", "word ".repeat(20));
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(&long) else {
             panic!()
         };
         assert_eq!(p.title.chars().count(), 99);
-        let over = format!("post system {}", "x".repeat(200));
+        let over = format!("post script {}", "x".repeat(200));
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(&over) else {
             panic!()
         };
         assert_eq!(p.title.chars().count(), TITLE_CAP);
-        assert!(NoticeRequest::parse("post system Build: done. Next; step").is_ok());
+        assert!(NoticeRequest::parse("post script Build: done. Next; step").is_ok());
     }
 
     /// Sanitising: control and invisible format characters never reach a
@@ -2321,7 +2428,7 @@ mod tests {
     #[test]
     fn the_wire_strips_what_could_forge_a_row() {
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
-            "post system sev=warn Deploy\u{1b}[31m \u{202e}failed -- a\u{7}b\\n\u{200b}\\nc",
+            "post script sev=warn Deploy\u{1b}[31m \u{202e}failed -- a\u{7}b\\n\u{200b}\\nc",
         ) else {
             panic!()
         };
@@ -2335,38 +2442,38 @@ mod tests {
         assert_eq!(p.stats.chars().count(), STATS_CAP);
         assert!(p.stats.chars().all(|c| !c.is_control()));
         assert_eq!(
-            NoticeRequest::parse("post system \u{200b}\u{202e}"),
+            NoticeRequest::parse("post script \u{200b}\u{202e}"),
             Err(POST_USAGE)
         );
         assert_eq!(
             NoticeRequest::parse("progress k \u{7}\u{7}"),
             Err(PROGRESS_USAGE)
         );
-        // Review (2026-09-24, ruling 196): an invisible character cannot
+        // Ruling 196: an invisible character cannot
         // hide a seam or a trailing period from the title form, and no bidi
         // mark, tag character or noncharacter survives into a row.
         assert_eq!(
-            NoticeRequest::parse("post system sev=warn Build:\u{2060} failed"),
+            NoticeRequest::parse("post script sev=warn Build:\u{2060} failed"),
             Err("notice: title has a clause (\u{2014}, ;, :); put it after --")
         );
         assert_eq!(
-            NoticeRequest::parse("post system sev=warn Build failed.\u{2060}"),
+            NoticeRequest::parse("post script sev=warn Build failed.\u{2060}"),
             Err("notice: title ends with a period")
         );
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
-            "post system sev=warn De\u{061c}ploy\u{00ad} fa\u{e0041}il\u{fdd0}ed\u{ffff}\u{1fffe}\u{206a}\u{fff9}",
+            "post script sev=warn De\u{061c}ploy\u{00ad} fa\u{e0041}il\u{fdd0}ed\u{ffff}\u{1fffe}\u{206a}\u{fff9}",
         ) else {
             panic!()
         };
         assert_eq!(p.title, "Deploy failed");
     }
 
-    /// Found on the live socket (2026-09-24): `Tab\there` was stored as
-    /// `Tabhere`. A whitespace control is a space before the strip.
+    /// A whitespace control is a space before the strip: `Tab\there` is
+    /// never stored as `Tabhere`.
     #[test]
     fn a_tab_on_the_wire_is_a_space() {
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
-            "post\tsystem\tsev=warn\tDeploy\tfailed\t--\tconnection\x0brefused",
+            "post\tscript\tsev=warn\tDeploy\tfailed\t--\tconnection\x0brefused",
         ) else {
             panic!()
         };
@@ -2380,7 +2487,7 @@ mod tests {
         };
         assert_eq!(p.title, "Fetching sources");
         assert_eq!(
-            NoticeRequest::parse("post system sev=warn one\ttwo\tthree\tfour\tfive\tsix\tseven"),
+            NoticeRequest::parse("post script sev=warn one\ttwo\tthree\tfour\tfive\tsix\tseven"),
             Err("notice: title over 6 words; put the rest after --"),
             "a tab is a word gap to the title form too"
         );
@@ -2418,7 +2525,7 @@ mod tests {
             "wire.update.progress is the wire's own, a new row"
         );
         assert_eq!(c.live(update.id), before.iter().find(|l| l.id == update.id));
-        notice(&mut c, &mut g, "post system key=k Fixed", now);
+        notice(&mut c, &mut g, "post script key=k Fixed", now);
         assert!(c.live(host_k.id).is_some(), "a record resolves wire.k only");
         assert!(c.live(id_of(&p)).is_none());
         let again = notice(&mut c, &mut g, "progress k Working", now);
@@ -2458,7 +2565,7 @@ mod tests {
         let b = notice(
             &mut c,
             &mut g,
-            "progress build pct=42.5 tag=packages Building aterm -- 3 of 10",
+            "progress build pct=42.5 tag=deploy Building aterm -- 3 of 10",
             now + ms(100),
         );
         assert_eq!((b.reply.as_str(), b.note), ("OK message=1", false));
@@ -2501,7 +2608,7 @@ mod tests {
         let f = notice(
             &mut c,
             &mut g,
-            "post system sev=warn key=fetch Fetch failed",
+            "post script sev=warn key=fetch Fetch failed",
             t,
         );
         assert!(c.live(id_of(&h)).is_none());
@@ -2519,14 +2626,14 @@ mod tests {
                 .count(),
             1
         );
-        // Review (2026-09-24, ruling 193): the SAME words take each other's
+        // Ruling 193: the SAME words take each other's
         // place too — a change of severity or hold kind is news, never a
         // repeat of the row it replaces.
         let work = id_of(&notice(&mut c, &mut g, "progress same Building aterm", t));
         let fail = notice(
             &mut c,
             &mut g,
-            "post system sev=error key=same Building aterm",
+            "post script sev=error key=same Building aterm",
             t,
         );
         assert_ne!(
@@ -2715,7 +2822,7 @@ mod tests {
         let p = id_of(&notice(
             &mut c,
             &mut g,
-            "post system sev=warn key=db Database down",
+            "post script sev=warn key=db Database down",
             on,
         ));
         assert_eq!(
@@ -2739,7 +2846,7 @@ mod tests {
         let logged = c.log().len();
         let cap =
             format!("ERR notice: {WIRE_LIVE_CAP} wire messages are live; end one with notice done");
-        for line in ["progress k5 Working", "post system sev=warn Deploy failed"] {
+        for line in ["progress k5 Working", "post script sev=warn Deploy failed"] {
             let a = notice(&mut c, &mut g, line, now);
             assert_eq!(
                 a,
@@ -2763,12 +2870,12 @@ mod tests {
                 .starts_with("OK")
         );
         assert!(
-            notice(&mut c, &mut g, "post system sev=warn key=k2 K2 failed", now)
+            notice(&mut c, &mut g, "post script sev=warn key=k2 K2 failed", now)
                 .reply
                 .starts_with("OK message=")
         );
         assert!(
-            notice(&mut c, &mut g, "post system a note", now)
+            notice(&mut c, &mut g, "post script a note", now)
                 .reply
                 .starts_with("OK recorded")
         );
@@ -2793,13 +2900,13 @@ mod tests {
             let a = notice(
                 &mut c,
                 &mut g,
-                &format!("post system note {i}"),
+                &format!("post script note {i}"),
                 now + ms(i),
             );
             assert!(a.reply.starts_with("OK recorded"), "{}", a.reply);
         }
         let logged = c.log().len();
-        let busy = notice(&mut c, &mut g, "post system one too many", now + ms(100));
+        let busy = notice(&mut c, &mut g, "post script one too many", now + ms(100));
         assert_eq!(
             busy,
             Applied {
@@ -2819,35 +2926,35 @@ mod tests {
         // The oldest mint leaves the window at 60 s: one more fits.
         let later = now + Duration::from_secs(60);
         assert!(
-            notice(&mut c, &mut g, "post system again", later)
+            notice(&mut c, &mut g, "post script again", later)
                 .reply
                 .starts_with("OK")
         );
         assert!(
-            notice(&mut c, &mut g, "post system again 2", later)
+            notice(&mut c, &mut g, "post script again 2", later)
                 .reply
                 .starts_with("ERR busy"),
             "the second mint of 1 ms leaves at 60 s + 1 ms"
         );
         assert!(
-            notice(&mut c, &mut g, "post system again 2", later + ms(1))
+            notice(&mut c, &mut g, "post script again 2", later + ms(1))
                 .reply
                 .starts_with("OK")
         );
         assert_eq!(
-            notice(&mut c, &mut g, "post system again 3", later + ms(1)).reply,
+            notice(&mut c, &mut g, "post script again 3", later + ms(1)).reply,
             "ERR busy notice: 60 new messages a minute retry_ms=1"
         );
         // A duplicate mints nothing: a hundred repeats of one failure cost
         // one mint, bump the count, log and note nothing.
         let (mut c, mut g) = fresh(now);
-        let w = notice(&mut c, &mut g, "post system sev=warn Deploy failed", now);
+        let w = notice(&mut c, &mut g, "post script sev=warn Deploy failed", now);
         let logged = c.log().len();
         for i in 1..=100 {
             let d = notice(
                 &mut c,
                 &mut g,
-                "post system sev=warn Deploy failed",
+                "post script sev=warn Deploy failed",
                 now + ms(i),
             );
             assert_eq!(d.reply, w.reply);
@@ -2860,13 +2967,13 @@ mod tests {
             let a = notice(
                 &mut c,
                 &mut g,
-                &format!("post system note {i}"),
+                &format!("post script note {i}"),
                 now + ms(200),
             );
             assert!(a.reply.starts_with("OK recorded"), "{i}: {}", a.reply);
         }
         assert!(
-            notice(&mut c, &mut g, "post system the 61st", now + ms(200))
+            notice(&mut c, &mut g, "post script the 61st", now + ms(200))
                 .reply
                 .starts_with("ERR busy")
         );
@@ -2891,7 +2998,7 @@ mod tests {
             .id;
         let standing = c
             .post(
-                Message::new(tags::RENDER, Severity::Error, "GPU lost").hold(Hold::Standing),
+                Message::new(tags::RENDER, Severity::Error, "GPU lost").hold(Hold::STANDING),
                 stamp(1),
                 now,
             )
@@ -2913,9 +3020,7 @@ mod tests {
                     .action(Intent::NotNow {
                         decision: Decision::FileAccess,
                     })
-                    .hold(Hold::Ask {
-                        for_: Duration::from_secs(600),
-                    }),
+                    .hold(Hold::asking(Duration::from_secs(600))),
                 stamp(1),
                 now,
             )
@@ -2971,9 +3076,7 @@ mod tests {
                     .action(Intent::NotNow {
                         decision: Decision::FileAccess,
                     })
-                    .hold(Hold::Ask {
-                        for_: Duration::from_secs(600),
-                    }),
+                    .hold(Hold::asking(Duration::from_secs(600))),
                 stamp(1),
                 now,
             )
@@ -3048,7 +3151,7 @@ mod tests {
         assert!(c.live(id).is_some());
     }
 
-    /// Review (2026-09-24, design ruling 195): a loop of `act <id> details`
+    /// Ruling 195: a loop of `act <id> details`
     /// on a row that stays live gets the budget's presses and then `ERR
     /// busy`, never a repaint, a window and a log line per line. A refused
     /// press (no row, no capsule) spends nothing.
@@ -3090,7 +3193,7 @@ mod tests {
         assert_eq!(no_live_reply(gone), "ERR notice: no live message 999");
     }
 
-    /// Review (2026-09-24, design ruling 192): a wire post never folds into
+    /// Ruling 192: a wire post never folds into
     /// a host row, and a host post never into a wire row, whatever their
     /// words — the wire can never restate a host row (ruling 167).
     #[test]
@@ -3107,10 +3210,11 @@ mod tests {
         onto_glass(&mut c, now);
         let before = c.live(host).unwrap().clone();
         let later = now + Duration::from_secs(5);
-        let w = notice(
+        let w = wire_row(
             &mut c,
             &mut g,
-            "post session sev=error Keystrokes dropped",
+            tags::SESSION,
+            "sev=error Keystrokes dropped",
             later,
         );
         assert_ne!(id_of(&w), host, "a new wire row, not the host's");
@@ -3121,10 +3225,11 @@ mod tests {
         // The reverse: a script plants the words first, then aterm's own
         // report arrives — it is a host row, never counted as the script's.
         let (mut c, mut g) = fresh(now);
-        let planted = id_of(&notice(
+        let planted = id_of(&wire_row(
             &mut c,
             &mut g,
-            "post privacy sev=warn Allow file access",
+            tags::PRIVACY,
+            "sev=warn Allow file access",
             now,
         ));
         let real = c.post(
@@ -3136,16 +3241,17 @@ mod tests {
         assert_eq!(c.live(real.id).unwrap().msg.origin, Origin::Host);
         assert_eq!(c.live(planted).unwrap().repeats, 1);
         // Two wire posts of the same words still fold.
-        let again = notice(
+        let again = wire_row(
             &mut c,
             &mut g,
-            "post privacy sev=warn Allow file access",
+            tags::PRIVACY,
+            "sev=warn Allow file access",
             now,
         );
         assert_eq!(id_of(&again), planted);
     }
 
-    /// Review (2026-09-24, design ruling 194): the mints' title and detail
+    /// Ruling 194: the mints' title and detail
     /// bytes are budgeted, so full-detail records cannot rotate
     /// `messages.log` over aterm's own lines in minutes.
     #[test]
@@ -3153,7 +3259,7 @@ mod tests {
         let now = t0();
         let (mut c, mut g) = fresh(now);
         let detail = vec!["x".repeat(200); 10].join("\\n");
-        let line = |i: u64| format!("post system note {i:02} -- {detail}");
+        let line = |i: u64| format!("post script note {i:02} -- {detail}");
         let each = words_bytes(
             &PostRequest::parse(&line(0)["post ".len()..])
                 .unwrap()
@@ -3177,7 +3283,7 @@ mod tests {
         assert_eq!(c.log().len(), logged, "a refusal writes nothing");
         // A short line still fits where the room is.
         assert!(
-            notice(&mut c, &mut g, "post system ok", now + ms(100))
+            notice(&mut c, &mut g, "post script ok", now + ms(100))
                 .reply
                 .starts_with("OK recorded")
         );
@@ -3202,7 +3308,7 @@ mod tests {
         let rec = id_of(&notice(
             &mut c,
             &mut g,
-            "post fabric peer said hi -- line",
+            "post peers peer said hi -- line",
             now,
         ));
         let on = now + PROGRESS_GRACE;
@@ -3218,7 +3324,7 @@ mod tests {
                     "message {fill} at=1000 ago_ms=2000 tag=script sev=info origin=wire state=live glass=1 rep=1 key=wire.build title=Building%20aterm detail= actions=- progress=42/100"
                 ),
                 format!(
-                    "message {rec} at=1000 ago_ms=2000 tag=fabric sev=info origin=wire state=recorded glass=- rep=1 key=- title=peer%20said%20hi detail=line actions=- since_ms=2000"
+                    "message {rec} at=1000 ago_ms=2000 tag=peers sev=info origin=wire state=recorded glass=- rep=1 key=- title=peer%20said%20hi detail=line actions=- since_ms=2000"
                 ),
             ]
         );
@@ -3252,7 +3358,7 @@ mod tests {
             "{withdrawn:?}"
         );
         // The query: live keeps unretired rows; sev= is a floor; tag= filters.
-        notice(&mut c, &mut g, "post system sev=warn Deploy failed", shown);
+        notice(&mut c, &mut g, "post script sev=warn Deploy failed", shown);
         let live = message_rows(&c, &parse_read_args("live").unwrap(), 9_000, &pct_encode);
         assert_eq!(live.len(), 2, "{live:?}");
         let warn = message_rows(
@@ -3267,13 +3373,13 @@ mod tests {
             "{}",
             warn[0]
         );
-        let fabric = message_rows(
+        let peers = message_rows(
             &c,
-            &parse_read_args("tag=fabric").unwrap(),
+            &parse_read_args("tag=peers").unwrap(),
             9_000,
             &pct_encode,
         );
-        assert_eq!(fabric.len(), 1);
+        assert_eq!(peers.len(), 1);
         let newest = message_rows(&c, &parse_read_args("1").unwrap(), 9_000, &pct_encode);
         assert!(newest[0].contains("title=Deploy%20failed"), "{newest:?}");
     }
@@ -3281,8 +3387,8 @@ mod tests {
     #[test]
     fn no_capsule_is_ever_authored_from_the_wire() {
         for line in [
-            "post system Not now",
-            "post system sev=warn key=a Install now",
+            "post script Not now",
+            "post script sev=warn key=a Install now",
             "progress k Open Settings",
             "progress k pct=5 load=cpu Install now -- Not now",
         ] {

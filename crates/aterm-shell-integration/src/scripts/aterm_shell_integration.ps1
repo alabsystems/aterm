@@ -22,6 +22,25 @@
 if ($env:ATERM_SHELL_INTEGRATION_INSTALLED) { return }
 $env:ATERM_SHELL_INTEGRATION_INSTALLED = '1'
 
+# UTF-8 both ways between pwsh and native programs, in an aterm tab on Windows.
+# pwsh decodes a native program's piped output with the console output code page
+# (437 by default), so the UTF-8 that aterm's own CLI, git and most tools write
+# came back as mojibake from `aterm help | Select-String`. The code page is the
+# console's, so it stays UTF-8 for the rest of the tab, after pwsh exits too, and
+# a legacy program that writes OEM-code-page bytes is the one misread there. The
+# decision and the options it rejected: apps/aterm-win/README.md, "Known
+# limitations".
+if (($env:ATERM_CHILD -or $env:ATERM_SESSION_ID) -and
+    ([System.Environment]::OSVersion.Platform -eq 'Win32NT')) {
+    try {
+        $__aterm_utf8 = New-Object System.Text.UTF8Encoding $false
+        $Global:OutputEncoding = $__aterm_utf8
+        # Throws where no console is attached; there is no code page to fix.
+        [Console]::OutputEncoding = $__aterm_utf8
+    }
+    catch { }
+}
+
 # Package bin directory
 if ($HOME) {
     $__aterm_bin = Join-Path $HOME '.aterm/bin'

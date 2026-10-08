@@ -312,12 +312,10 @@ fn consumer_source_root(root: &Path, name: &str) -> PathBuf {
         if !tail.starts_with(|c: char| c.is_ascii_digit()) || hits.contains(&dir.to_path_buf()) {
             continue;
         }
-        // …AND it must be a copy that actually depends on `core_maths`. The
-        // graph carries TWO `ttf-parser`s: 0.25.1 in the shipped cells, and
-        // 0.21.1 under `fontdue`, which aterm-render keeps as a DEV-ONLY
-        // differential oracle for its first-party face. The old one predates
-        // the `core_maths` dependency entirely, so selecting by name alone
-        // found two directories and could have read the wrong one.
+        // …AND it must be a copy that actually depends on `core_maths`: a
+        // second, older same-name package (as fontdue's ttf-parser 0.21 was
+        // until its retirement) predates that dependency, and selecting by
+        // name alone would find two directories and could read the wrong one.
         if std::fs::read_to_string(manifest).is_ok_and(|m| m.contains("core_maths")) {
             hits.push(dir.to_path_buf());
         }

@@ -3,31 +3,22 @@
 
 //! Tests for the disk report and the one apply path (design §5.5).
 //!
-//! Nothing here reads the wall clock: `now` is a literal in every test, and
-//! the two tests that touch a real directory move `now` FORWARD past the
-//! files they just wrote rather than back-dating the files — the threshold is
-//! a comparison, so moving either side of it proves the same thing and only
-//! one of them needs a syscall this crate does not have.
+//! Nothing here reads the wall clock: `now` is a literal in every test, and the
+//! two tests that touch a real directory move `now` forward past the files
+//! they wrote rather than back-dating the files.
 //!
-//! Every build-directory fixture is laid out AS CARGO LAYS ONE OUT
-//! ([`lay_target`]): the build locks inside each profile and NONE at the
-//! root (cargo never writes one there — none of this machine's build
-//! directories has one), `.fingerprint/`, `deps/`, `build/` and
-//! `incremental/` in the profile. A fixture that planted a root
-//! `.cargo-lock` is what let the old witness pass here while it could never
-//! pass on a real build directory.
+//! Every build-directory fixture is laid out as cargo lays one out
+//! ([`lay_target`]): build locks inside each profile and none at the root.
 //!
-//! The negative controls are the point of most of these: a build directory
-//! with no marker is not a candidate however old it is; a fresh profile is
-//! not idle; a profile a build holds locked is not a candidate; an
-//! unresolvable live symlink turns the whole version class
-//! blocked rather than guessing; a delegated class removes nothing even with
-//! `disk.apply` on; and apply with no class named removes nothing and never
-//! calls the remover at all.
+//! Negative controls: a build directory with no marker is not a candidate
+//! however old; a fresh profile is not idle; a locked profile is not a
+//! candidate; an unresolvable live symlink blocks the whole version class; a
+//! delegated class removes nothing even with `disk.apply` on; and apply with
+//! no class named never calls the remover.
 
 use super::*;
 
-/// 2026-09-21T00:00:00Z. Fixed; never `SystemTime::now()`.
+/// A fixed instant; never `SystemTime::now()`.
 const NOW: i64 = 1_789_603_200;
 
 /// A fresh directory under the system temp dir, removed on drop.
@@ -39,10 +30,7 @@ impl Tmp {
         dir.push(format!(
             "aterm-harness-disk-{tag}-{}-{:?}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         Tmp(dir)
@@ -80,19 +68,15 @@ impl Drop for Tmp {
 /// the threshold. The files carry the real wall clock, so the only honest
 /// reading is "the survey happened later".
 pub(crate) fn now_after_write(days: i64) -> i64 {
-    let real = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
+    let real = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     real + days * 86_400
 }
 
-/// A build directory AS CARGO LAYS ONE OUT, at `dir`: the two root markers
-/// (`CACHEDIR.TAG` with its signature, `.rustc_info.json`) and NO root lock;
+/// A build directory as cargo lays one out, at `dir`: the two root markers
+/// (`CACHEDIR.TAG` with its signature, `.rustc_info.json`) and no root lock;
 /// one profile, `debug/`, holding all three build locks, `.fingerprint/`,
-/// `deps/` (an rlib), `build/` and `incremental/` (a session's query cache,
-/// 8 KiB). Written for real, because the marker check reads bytes and the
-/// reclaim takes real locks.
+/// `deps/` (an rlib), `build/` and `incremental/` (8 KiB). Written for real,
+/// because the marker check reads bytes and the reclaim takes real locks.
 pub(crate) fn lay_target(dir: &Path) -> PathBuf {
     lay_profile(&dir.join("debug"));
     std::fs::write(
@@ -166,7 +150,7 @@ pub(crate) fn no_pressure() -> Option<u64> {
     panic!("free space was measured again, but this pass has no pressure row")
 }
 
-/// A config with apply ON, for the tests that mean to remove something.
+/// A config with apply on, for the tests that mean to remove something.
 fn applying() -> Config {
     Config {
         apply: true,
@@ -229,7 +213,7 @@ fn a_synthetic_stale_target_is_reported_and_then_removed_with_its_witness_in_the
         row.witness
     );
 
-    // NOW RECLAIM IT, through the real primitive.
+    // Now reclaim it, through the real primitive.
     let done = apply(
         &rep,
         survey.transcripts_root.as_deref(),
@@ -251,7 +235,7 @@ fn a_synthetic_stale_target_is_reported_and_then_removed_with_its_witness_in_the
         "deps/ is never touched"
     );
 
-    // THE ROW CARRIES THE WITNESS. A record of what went without why it was
+    // The row carries the witness: a record of what went without why it was
     // safe is a receipt, not a record.
     let (row, removed) = &done.removed[0];
     let line = removal_row(now, "sid-1", row, removed);
@@ -457,8 +441,8 @@ fn free_space_warns_only_on_a_figure_it_actually_has() {
     survey.free_bytes = Some(100 * GIB);
     assert!(!report(&survey, Config::default()).warn);
 
-    // NEGATIVE: a failed query FAILS OPEN — no warning on a number we do not
-    // have, and the headline says `unknown` rather than 0.
+    // Negative: a failed query fails open, with no warning on a number we do
+    // not have, and the headline says `unknown` rather than 0.
     survey.free_bytes = None;
     let rep = report(&survey, Config::default());
     assert!(!rep.warn);
@@ -596,7 +580,7 @@ fn a_path_outside_the_list_is_refused_with_a_denial_row() {
         "not-anchored"
     );
 
-    // The path that IS on the report passes the same fence.
+    // The path that is on the report passes the same fence.
     guard(
         &rep,
         None,
@@ -689,7 +673,7 @@ fn a_removal_that_fails_is_a_denial_row_and_does_not_abandon_the_rest() {
         },
     );
     assert_eq!(done.removed.len(), 1, "the other row still went");
-    // Each removal's intent is told BEFORE it, its outcome after.
+    // Each removal's intent is told before it, its outcome after.
     let kinds: Vec<&str> = steps
         .iter()
         .map(|l| {
@@ -765,12 +749,11 @@ fn age_days_never_reads_a_future_mtime_as_old() {
     assert_eq!(age_days(NOW, NOW + 999 * 86_400), 0);
 }
 
-/// The shipped idle window is ONE day (2026-09-28; it was 14, sized for the
-/// whole-directory removal): what it guards is an idle profile's
+/// The shipped idle window is one day: what it guards is an idle profile's
 /// `incremental/` alone, taken automatically only below the floor. The
-/// settings help serves the same figure, and a negative setting falls back
-/// to it. A profile written into under 24 hours ago is never idle at it; one
-/// a full day old is.
+/// settings help serves the same figure, and a negative setting falls back to
+/// it. A profile written into under 24 hours ago is never idle at it; one a
+/// full day old is.
 #[test]
 fn the_idle_window_defaults_to_one_day() {
     assert_eq!(DEFAULT_TARGET_STALE_DAYS, 1);
@@ -859,8 +842,8 @@ fn the_df_reading_is_anchored_on_capacity_and_never_on_a_field_count() {
                  /dev/disk3s5 971350180 120000000 700000000      15%    /System/Volumes/Data\n";
     assert_eq!(parse_df_kb(plain), Some(700_000_000 * 1024));
 
-    // THE CASE A FIELD COUNT GETS WRONG: macOS autofs names the source
-    // `map auto_home`, so the row has seven fields and the fourth is `Used`.
+    // The case a field count gets wrong: macOS autofs names the source `map
+    // auto_home`, so the row has seven fields and the fourth is `Used`.
     let autofs = "Filesystem    1024-blocks Used Available Capacity  Mounted on\n\
                   map auto_home           0    0         0   100%    /System/Volumes/Data/home\n";
     assert_eq!(parse_df_kb(autofs), Some(0));
@@ -935,11 +918,10 @@ fn scan_reads_the_versions_dir_and_resolves_the_live_link() {
     let _ = &versions;
 }
 
-/// ONE BUILD DIRECTORY IS ONE ROW, HOWEVER IT WAS NAMED: a `target` link and
-/// the `target.noindex` it names (or two agents' cwds that differ by a
-/// linked component) canonicalize to one directory, which the survey holds
-/// once — so the report does not count its bytes twice and an apply does not
-/// reclaim it and then fail on it a second time.
+/// One build directory is one row, however it was named: a `target` link and
+/// the `target.noindex` it names canonicalize to one directory, which the
+/// survey holds once, so the report does not count its bytes twice and an
+/// apply does not reclaim it twice.
 #[cfg(unix)]
 #[test]
 fn a_build_directory_named_twice_is_one_row() {
@@ -968,28 +950,18 @@ fn a_build_directory_named_twice_is_one_row() {
     assert!(done.denials.is_empty(), "{done:?}");
 }
 
-/// ONE VERDICT PER PROFILE IN THE IDLE PASS TOO, THE INNERMOST BUILD
-/// DIRECTORY'S. A build directory named inside another (`o/target` holding
-/// `o/target/nested/target`) is surveyed twice, one survey after the other,
-/// and each probes the nested profile's locks: a build holding one at only
-/// one of the two surveys is read free by one and held by the other. The
-/// idle rows are per build directory, so until 2026-09-28 the OUTER row
-/// counted the nested profile as well: held at the inner survey, a
-/// removable outer row counting it beside "cargo-targets: …/nested/target —
-/// a build holds …"; held at the outer survey with the outer directory's
-/// own profile recent, the outer directory's note that "a build holds" it
-/// beside the inner row counting it; held at neither, the profile counted by
-/// both rows, and an apply that took it through the outer row and then
-/// failed on it as a denial. Now only the inner directory's survey decides
-/// that profile — its row, or its note keeping it — and the outer row
-/// neither counts it nor, applied, takes it.
+/// One verdict per profile in the idle pass too, the innermost build
+/// directory's. A build directory named inside another (`o/target` holding
+/// `o/target/nested/target`) is surveyed twice, and a build holding a nested
+/// lock at only one survey is read free by one and held by the other. Only the
+/// inner directory's survey decides that profile (its row, or its note keeping
+/// it); the outer row neither counts it nor, applied, takes it.
 ///
-/// Both ways the outer directory's own profile can stand: idle (a row of
-/// its own either way) and recent (no row of its own). No clock decides
-/// which survey sees the build: the surveys run one after the other and
-/// the lock is held around exactly one ([`target::Build`]).
+/// Both ways the outer directory's own profile can stand: idle (a row of its
+/// own) and recent (no row of its own). The lock is held around exactly one
+/// survey ([`target::Build`]), with no clock involved.
 ///
-/// NEGATIVE CONTROL: held at neither, each idle profile is counted once, by
+/// Negative control: held at neither, each idle profile is counted once, by
 /// its own directory's row, and an apply takes each once, with no denial.
 #[cfg(unix)]
 #[test]
@@ -1169,12 +1141,10 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
 
 // -- the automatic floor --------------------------------------------------------
 
-/// THE AUTOMATIC GRANT: below `auto_free_gib` the idle build cache goes —
-/// with `disk.apply` OFF, since the floor is its own grant — and nothing of
-/// another class does; at the floor, above it, or on an unknown free figure,
-/// nothing is planned and the remover is never called. Before the floor
-/// existed nothing removed anything until a person named a class (the
-/// 21.8 h full-disk stall of the harness audit).
+/// The automatic grant: below `auto_free_gib` the idle build cache goes, with
+/// `disk.apply` off, since the floor is its own grant, and nothing of another
+/// class does; at or above the floor, or on an unknown free figure, nothing is
+/// planned and the remover is never called.
 #[test]
 fn below_the_floor_the_stale_target_goes_and_nothing_else_does() {
     let tmp = Tmp::new("auto-floor");

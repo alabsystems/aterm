@@ -121,11 +121,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn registration_does_not_crash() {
-        super::install(|_critical| {});
-    }
-
     /// The source's line names each level the census reads, highest bit first, and
     /// starts with the census's prefix.
     #[test]

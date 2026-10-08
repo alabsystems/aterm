@@ -1,54 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RESUME COMMAND A PERSON IS TOLD TO RUN: `claude --resume <id>`, where
-//! `<id>` is the conversation THIS process holds, read from Claude Code's own
-//! record of it (`<claude dir>/sessions/<pid>.json`) — never `claude
-//! --continue`.
+//! The resume command a person is told to run: `claude --resume <id>`, where
+//! `<id>` is the conversation this process holds, read from Claude Code's own
+//! record (`<claude dir>/sessions/<pid>.json`). Never `claude --continue`,
+//! which resumes the directory's newest conversation, a sibling tab's when
+//! several Claude Codes share a directory.
 //!
-//! WHY (robustness backlog item 2, 2026-09-26). Every remedy aterm printed for
-//! a frozen Claude Code — the server's stall attention and the menu row
-//! (`aterm-gui`'s `input_stall::attention_text`), the supervisor's frozen mail
-//! (`supervise::stall::frozen_mail_text`), the memory wall's escalation, and
-//! the manual — ended `then claude --continue`, one fixed string per program
-//! (`aterm_phase::resume_hint`, now gone). `--continue` resumes the NEWEST
-//! conversation filed under the working directory, which is not this tab's
-//! whenever another Claude Code works in the same directory: measured that
-//! day on the owner's Mac, four live Claude Code processes shared
-//! `/Users//example/aterm`, each with its own `sessionId`
-//! (`~/.claude/sessions/{32072,46976,88956,89092}.json`). A person restarting
-//! a frozen tab by the letter of the remedy would have resumed a SIBLING
-//! tab's live conversation — two processes writing one transcript — and the
-//! frozen tab's own work would have been left behind. The relaunch the
-//! harness makes itself ([`super::relaunch`]) never had this defect: it has
-//! always typed `--resume <id>` with the launch's flags carried
-//! ([`super::upgrade::rewrite_argv`]). This module gives the printed remedy
-//! the same two facts.
-//!
-//! * [`command`] — PURE: the line, from the process's argv and its
-//!   conversation id. The flags are carried exactly as the relaunch carries
-//!   them; a flag the rewrite does not know leaves the bare `claude --resume
-//!   <id>` (the conversation is what matters), and a launch the rewrite
-//!   refuses as not resumable in place (`--worktree`, `--print`, …) gets no
-//!   command at all — a person told to run one would be sent to the wrong
-//!   place.
-//! * [`of_entry`] — the line for one live process, from the registry entry
-//!   the window's footer read names ([`super::footer::read_pid`]: one read
-//!   of the record feeds the model, the usage and this line), with the
-//!   pid-reuse guard the line needs: the record names the same pid it is
-//!   filed under and, when the caller knows the process's kernel start, its
-//!   `procStart` names the same second — a record with no `procStart` then
-//!   proves nothing and gets no command. `None` — no command — whenever the
-//!   record is missing or another process's.
-//! * [`bare`] — the same line without its carried flags, for a caller whose
-//!   byte budget cannot hold them (the server's keyed attention is 200 bytes):
-//!   a shorter command, never a cut one — a cut id would name no
-//!   conversation, or worse, another.
+//! * [`command`]: pure, the line from the process's argv and conversation id,
+//!   flags carried as the relaunch carries them
+//!   ([`super::upgrade::rewrite_argv`]); an unknown flag leaves the bare line,
+//!   and a launch not resumable in place (`--worktree`, `--print`, …) gets
+//!   none.
+//! * [`of_entry`]: the line for one live process from the footer's registry
+//!   entry ([`super::footer::read_pid`]), guarded against pid reuse; `None`
+//!   when the record is missing or another process's.
+//! * [`shorter`]: the forms a caller whose byte budget cannot hold the line
+//!   steps down through — its permission mode alone, then [`bare`], the line
+//!   without carried flags: a shorter command, never a cut one (a cut id names
+//!   no conversation, or another's).
 //!
 //! The command names `claude`, as a person types it, whatever path the
 //! process ran from; and it does not `cd`: `--resume` finds a conversation
 //! under the directory it was started in, which is the tab's own shell's
-//! directory in every launch a person makes from that shell.
+//! directory in every launch a person makes from that shell. Nor does it
+//! carry the LOGIN a relaunch chose for the session: a remedy says in one
+//! clause which login the command runs under instead
+//! ([`SHELL_LOGIN_CLAUSE`], with the reasons).
 
 use std::path::Path;
 
@@ -63,12 +41,10 @@ pub enum AfterRestart {
     Unknown,
     /// A person runs this line ([`command`]) once the restart has ended it.
     Command(String),
-    /// The window's host relaunches it on its own conversation itself once
-    /// the restart has ended it (`[harness] relaunch`, U1): nothing for a
-    /// person to type ([`RELAUNCH_WORDS`]). Said only where that relaunch
-    /// WOULD come — the host holds the session unheld, and its plan for the
-    /// launch would be made ([`super::relaunch::resumes_on_exit`]) — because
-    /// it replaces the command (resume-hint review, 2026-09-26).
+    /// The window's host relaunches it on its own conversation once the
+    /// restart has ended it (`[harness] relaunch`): nothing for a person to
+    /// type ([`RELAUNCH_WORDS`]). Said only where that relaunch would come
+    /// ([`super::relaunch::resumes_on_exit`]), since it replaces the command.
     Relaunch,
 }
 
@@ -76,29 +52,53 @@ pub enum AfterRestart {
 /// agent itself ([`AfterRestart::Relaunch`]).
 pub const RELAUNCH_WORDS: &str = "aterm relaunches it on its conversation";
 
+/// WHICH LOGIN A RESUME TYPED BY HAND RUNS UNDER, for a session the harness
+/// relaunched under a login of its choosing (an account move,
+/// `docs/DESIGN-claude-accounts-2026-10-01.md` §6): the clause a remedy adds
+/// to the sentence that hands a person [`command`]. The command itself
+/// carries NO environment, by decision (2026-10-01):
+///
+/// * every surface that prints it has a hard budget — the tab's mark is 200
+///   bytes, a remedy's sentence 90 characters — and steps down
+///   ([`shorter`]) rather than cut ([`never_cut`]). A login directory is
+///   some hundred bytes (up to `accounts::DIR_MAX`), so the variable would be
+///   the first thing dropped, silently, exactly where it mattered;
+/// * the label is the only name an account has in anything aterm prints,
+///   and the variable's value is a directory under the person's home;
+/// * landing on the shell's login is no failure. The conversation resumes
+///   (the Claude home did not move), and a Claude started by hand is
+///   decided again at its first turn end like any other session.
+///
+/// So the one true sentence is said instead: typed at a prompt, the command
+/// runs under THAT SHELL's login — whatever variable that shell exports, or
+/// the default one — which need not be the login the session last ran under.
+pub const SHELL_LOGIN_CLAUSE: &str = ", under that shell's own Claude login";
+
+/// [`SHELL_LOGIN_CLAUSE`] for a process whose own exec environment named a
+/// login (`login`: the raw `CLAUDE_SECURESTORAGE_CONFIG_DIR`, as
+/// `relaunch::Snapshot::login` keeps it — set, empty or not), else nothing:
+/// a process that had no such variable ran under its shell's login already,
+/// and its resume line needs no word about it.
+#[must_use]
+pub fn login_clause(login: Option<&str>) -> &'static str {
+    match login {
+        Some(_) => SHELL_LOGIN_CLAUSE,
+        None => "",
+    }
+}
+
 /// How a reason names the resume line after a restart:
 /// `<…>, then resume with <line><…>` — the memory wall's escalation
 /// (`supervise::policy::turn_end`'s `memory_restart`). [`never_cut`] finds
 /// the line by it.
 pub const THEN_RESUME_WITH: &str = ", then resume with ";
 
-/// `render(text)` — a renderer that may CUT its input to fit a cap (the
-/// supervisor's escalation: the reason clipped to 120 cells, then to what
-/// the 200-byte keyed attention leaves beside its label) — with the resume
-/// line `text` names after [`THEN_RESUME_WITH`] kept WHOLE or not at all:
-/// the first of `text`, `text` with the line's bare form ([`bare_of`]), and
-/// `text` without the clause, whose rendering still holds its line whole.
-/// Text naming no such line is rendered as it is.
-///
-/// WHY (resume-hint review, 2026-09-26): the memory wall's escalation put
-/// the full flagged line into its reason with no budget, and the render cut
-/// it — measured on a `claude --dangerously-skip-permissions` launch with
-/// relaunch off, the stored `meta attention=` ended `…then resume with
-/// claude --dangerously-skip-permissions --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a…`,
-/// and a failed restart's `the restart could not be made (<step>): ` prefix
-/// cut even the bare form. A cut id names no conversation — or another's.
-/// The window's own remedy (`aterm-gui`'s `input_stall::attention_text`)
-/// already stepped down so; this is the same ladder for any renderer.
+/// `render(text)`, a renderer that may cut its input to fit a cap, with the
+/// resume line `text` names after [`THEN_RESUME_WITH`] kept whole or not at
+/// all: the first of `text`, `text` with each of the line's shorter forms
+/// ([`shorter`]), and `text` without the clause, whose rendering still holds
+/// its line whole. Text naming no such line is rendered as it is. A cut id
+/// names no conversation, or another's.
 #[must_use]
 pub fn never_cut(text: &str, render: impl Fn(&str) -> String) -> String {
     let Some((clause, line)) = named_line(text) else {
@@ -111,9 +111,9 @@ pub fn never_cut(text: &str, render: impl Fn(&str) -> String) -> String {
     if let Some(out) = whole(text, line) {
         return out;
     }
-    if let Some(bare) = bare_of(line).filter(|bare| bare != line) {
-        let candidate = text.replacen(line, &bare, 1);
-        if let Some(out) = whole(&candidate, &bare) {
+    for step in shorter(line) {
+        let candidate = text.replacen(line, &step, 1);
+        if let Some(out) = whole(&candidate, &step) {
             return out;
         }
     }
@@ -191,36 +191,67 @@ pub fn bare_of(line: &str) -> Option<String> {
     bare(id)
 }
 
-/// The resume line ([`command`]) for the LIVE Claude Code process whose
-/// registry `entry` (`<claude dir>/sessions/<pid>.json`) the window's footer
-/// read parsed ([`super::footer::read_pid`], through
-/// [`super::footer::session_of_pid`]: filed under the pid and naming it),
-/// and `argv` — the process's own, as the kernel holds it.
+/// The PERMISSION MODE form of a line [`command`] made: the line with only
+/// the flags that set its permission mode ([`upgrade::permission_argv`]).
+/// `None` for any other text, and for a line whose launch set no permission
+/// mode (its bare form, [`bare_of`], is that). The line's words are read
+/// back as [`upgrade::quote`] wrote them, so a flag's value that only looks
+/// like a permission flag is none.
+#[must_use]
+pub fn mode_of(line: &str) -> Option<String> {
+    let (_, id) = line.rsplit_once(" --resume ")?;
+    let words = super::upgrade_drive::last_command(line);
+    if words.first().map(String::as_str) != Some("claude") {
+        return None;
+    }
+    command(&upgrade::permission_argv(&words), id).filter(|mode| bare(id).as_ref() != Some(mode))
+}
+
+/// THE SHORTER FORMS OF A LINE [`command`] MADE, in the order a surface
+/// whose budget cannot hold it whole steps down through them, never cutting
+/// it (a cut id names no conversation, or another's): its permission mode
+/// alone ([`mode_of`]), then the conversation alone ([`bare_of`]) — each
+/// only where it is shorter than the one before; none for any other text.
+/// The permission mode is the last flag a line gives up (round three of the
+/// joint audit of 2026-10-01): stepping straight down to the bare line
+/// dropped `--dangerously-skip-permissions` with every other flag, and an
+/// orchestrator was told a line that brings it back in another permission
+/// mode — one started in `--permission-mode plan`, out of it.
+#[must_use]
+pub fn shorter(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for step in mode_of(line).into_iter().chain(bare_of(line)) {
+        if step.len() < out.last().map_or(line.len(), String::len) {
+            out.push(step);
+        }
+    }
+    out
+}
+
+/// The resume line for the live Claude Code process whose registry `entry`
+/// (`<claude dir>/sessions/<pid>.json`) the footer read parsed
+/// ([`super::footer::read_pid`], through
+/// [`super::footer::session_of_pid`]), and `argv`, the process's own: the
+/// line every place tells a person to run
+/// ([`super::upgrade_drive::resume_command_kept`], over the harness's state
+/// root `state`).
 ///
-/// THE RECORD MUST BE THIS PROCESS'S: when `started` (the process's kernel
+/// The record must be this process's: when `started` (the process's kernel
 /// start, unix seconds) is known, the entry's `procStart` must name that same
-/// second ([`super::footer::lstart_utc`]). A record a dead process left
-/// behind under a reused pid fails that — and so does a record with NO
-/// `procStart`, which proves nothing: the footer shows such a record's facts
-/// (a wrong model is seen), but a wrong line here is TYPED, and resumes
-/// another conversation. Then `None`, and the caller prints no command
-/// rather than a guess. This is the rule `of_pid` held until 2026-09-28,
-/// when the one-registry-read port (main's 5bebdcf36) moved the line onto
-/// the footer's entry, whose own guard skips the start check for a record
-/// without `procStart` (the review of that day); `of_pid`'s second read of
-/// the file went with it. Its other refusal — a record missing any of the
-/// fields the upgrade's full parse wants (`status`, `kind`, …) — guarded no
-/// process identity, and is not kept.
+/// second ([`super::footer::lstart_utc`]); a record left under a reused pid,
+/// or one with no `procStart`, fails. A wrong line here would be typed and
+/// resume another conversation, so the caller then prints no command.
 #[must_use]
 pub fn of_entry(
     argv: &[String],
     entry: &super::footer::SessionEntry,
     started: Option<u64>,
+    state: Option<&Path>,
 ) -> Option<String> {
     if started.is_some_and(|started| entry.proc_start != Some(started)) {
         return None;
     }
-    command(argv, &entry.session_id)
+    super::upgrade_drive::resume_command_kept(state, argv, &entry.session_id)
 }
 
 /// `argv` from the program on: the script of a script launch

@@ -37,6 +37,8 @@
 //! [`pastel_edge`]) — Catppuccin Latte's rosewater, which the floor made a
 //! brick bar.
 
+use crate::ink::contrast;
+
 /// A cursor at an `OkLCh` chroma under this is NEAR-GREY (ruling 250): its bar
 /// borrows the theme's blue or cyan. The middle of the widest gap in the
 /// built-in schemes' cursor chromas (0.057 → 0.104).
@@ -224,23 +226,11 @@ pub fn oklch(c: [u8; 3]) -> (f64, f64, f64) {
     (big_l, a.hypot(bb), h)
 }
 
-/// The WCAG contrast ratio of two sRGB colours — the FUSED variant, kept for
-/// [`MeterHue::pick`] and [`pastel_edge`]; the band's floors use
-/// [`crate::ink::contrast`] (ruling 324).
-#[must_use]
-pub fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
-    let (la, lb) = (luminance(a), luminance(b));
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-}
-
 /// The WCAG relative luminance of an sRGB colour, with a FUSED weighted sum.
 ///
-/// [`contrast`] above is the fused variant of the WCAG ratio, kept for
-/// [`MeterHue::pick`] and [`pastel_edge`]; the band's floors read
-/// [`crate::ink::contrast`], `aterm_types::Rgb`'s unfused arithmetic, which
-/// differs from it by one ulp on about a third of all pairs (ruling 324).
 /// The band's SIDE decisions (which end of the scale a word or a fill sits
-/// toward) read this luminance, as they always have.
+/// toward) read this luminance, as they always have. Every contrast RATIO is
+/// [`contrast`], `aterm_types::Rgb`'s unfused arithmetic (ruling 438).
 #[must_use]
 pub fn luminance(c: [u8; 3]) -> f64 {
     let [r, g, b] = c.map(lin);

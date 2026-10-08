@@ -2,46 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Policy-engine bridge helper for the capability-module mint paths (#7994).
+//! Policy-engine bridge for the capability-module mint paths.
 //!
-//! # Why this module exists
+//! A [`PolicyEngine`] on [`super::Terminal`] evaluates policy-bearing
+//! dispatches alongside the `TerminalModes::allow_*` booleans. Every capability
+//! module (`response_capability`, `clipboard_auth`, `window_auth`,
+//! `shell_integration_auth`) uses the same decision tree, factored into
+//! [`engine_decision`]:
 //!
-//! The OSC / escape-sequence policy adds a single [`PolicyEngine`] to
-//! [`super::Terminal`] that evaluates every policy-bearing dispatch against a
-//! rule set. The engine and the legacy `TerminalModes::allow_*` booleans
-//! co-exist:
+//! * no engine: [`BridgeDecision::Fallback`] (the `allow_*` bool decides);
+//! * a matching rule with [`Response::Execute`]: [`BridgeDecision::Allow`];
+//! * a matching rule with any other response (`Drop`, `Warn`, `Ask`,
+//!   `Rewrite`): [`BridgeDecision::Deny`], whatever the bool says;
+//! * no matching rule (`defaults.unmatched`): [`BridgeDecision::Fallback`].
 //!
-//! * When the operator's policy has an explicit rule for a sequence, the
-//!   engine's response is authoritative.
-//! * When the policy has no matching rule (the engine falls through to
-//!   `defaults.unmatched`), the legacy `allow_*` boolean is authoritative.
-//!
-//! The capability modules that implement this bridge are
-//! `response_capability`, `clipboard_auth` (write + query), `window_auth`
-//! and `shell_integration_auth`. Every one follows the same three-step
-//! decision tree, so the logic is factored into [`engine_decision`] here
-//! to keep the sites auditable. Deny-by-default sinks that must not be
-//! reopened by a broad wildcard allow use
-//! [`engine_decision_deny_by_default_capability`] instead.
-//!
-//! # Fail-closed posture preserved
-//!
-//! The bridge never relaxes the legacy posture:
-//!
-//! * Engine absent (`None`) → fall through to the legacy bool, exactly as
-//!   before #7994.
-//! * Engine matches and says [`Response::Execute`] → mint allowed (the
-//!   operator explicitly opted in to this sequence from this origin).
-//! * Engine matches and says anything else (`Drop`, `Warn`, `Ask`,
-//!   `Rewrite`) → mint denied, regardless of the legacy bool. This is
-//!   the design-§6.3 "operator can only restrict, never expand" rule.
-//! * Engine falls through to `defaults.unmatched` → **engine-matched is
-//!   `None`**; fall back to the legacy bool (the Release N
-//!   backward-compat guarantee in §6.2).
-//!
-//! The [`BridgeDecision::Allow`] / [`BridgeDecision::Deny`] /
-//! [`BridgeDecision::Fallback`] return values let callers implement any
-//! of the three outcomes without re-deriving the logic.
+//! Deny-by-default sinks that a broad wildcard allow must not reopen use
+//! [`engine_decision_deny_by_default_capability`].
 
 use aterm_policy::{OriginTag, Response, engine::PolicyEngine, selector::DispatchedSequence};
 
@@ -79,20 +55,9 @@ impl BridgeDecision {
     }
 }
 
-/// Consult the installed [`PolicyEngine`] (if any) for the given
-/// dispatched sequence and origin, returning the bridge decision.
-///
-/// See the module-level docs for the full semantic model. This function
-/// is the **only** way the capability modules consult the engine — any
-/// future site that needs to add a new capability should call it too so
-/// the fail-closed posture stays centralized.
-///
-/// # Totality
-///
-/// Never panics, never allocates (the [`PolicyEngine::evaluate`] hot
-/// path is allocation-free). Returns
-/// [`BridgeDecision::Fallback`] when `engine` is `None` so the caller's
-/// legacy path is unchanged pre-policy-install.
+/// Consult the installed [`PolicyEngine`] (if any) for `sequence` at `origin`
+/// and return the bridge decision; the one way capability modules consult the
+/// engine. Never panics or allocates; `Fallback` when `engine` is `None`.
 #[inline]
 #[must_use]
 pub(super) fn engine_decision(
@@ -103,16 +68,11 @@ pub(super) fn engine_decision(
     engine_decision_with_wildcard_execute_fallback(engine, sequence, origin, false)
 }
 
-/// Variant of [`engine_decision`] for deny-by-default capability gates such as
-/// OSC 52 clipboard access, XTWINOPS window operations, and Kitty external
-/// file/shared-memory transmission.
-///
-/// These surfaces are only meant to open on an explicit sequence-specific
-/// allow. A broad `response any = Execute` rule is therefore treated as
-/// [`BridgeDecision::Fallback`] so the legacy authorization bit remains
-/// authoritative; wildcard non-`Execute` rules still return
-/// [`BridgeDecision::Deny`] so operators can use broad deny rules to tighten
-/// the posture further.
+/// [`engine_decision`] for deny-by-default gates (OSC 52 clipboard, XTWINOPS,
+/// Kitty external file/shared-memory transmission): a broad
+/// `response any = Execute` rule yields [`BridgeDecision::Fallback`], so the
+/// host's authorization bit still decides; wildcard non-`Execute` rules still
+/// return [`BridgeDecision::Deny`].
 #[inline]
 #[must_use]
 pub(super) fn engine_decision_deny_by_default_capability(
@@ -123,20 +83,10 @@ pub(super) fn engine_decision_deny_by_default_capability(
     engine_decision_with_wildcard_execute_fallback(engine, sequence, origin, true)
 }
 
-// AMB-1..4 AS A COUNT (test-only). Every fixed capability gate used to REACH
-// this function once per dispatched sequence: build a compile-time-constant
-// probe, then walk the rule set, to reach a verdict that can only change when a
-// policy is installed or swapped. The fix compiles those verdicts ONCE per
-// policy generation into `PolicyGates`, and the dispatch sites now read a byte.
-//
-// Nothing about the VERDICTS changed, which is why the compiled-vs-live
-// equivalence tests next door cannot see a giveback: a gate that went back to
-// evaluating per dispatch would agree with the table on every input and pass
-// every one of them. What moves is how OFTEN this function is entered, so that
-// is what is counted. Entry, not `evaluate`, because the probe construction the
-// caller pays to get here is part of the cost that was removed — and because
-// `clipboard_auth` never had an `is_none()` early-out, so an embedder with NO
-// engine was paying for the constant probe too.
+// Test-only count of entries into the engine bridge. Fixed capability gates
+// read verdicts compiled once per policy into `PolicyGates`; the compiled
+// and live verdicts agree on every input, so only this count can show a gate
+// that evaluates per dispatch again.
 #[cfg(test)]
 thread_local! {
     static ENGINE_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -166,8 +116,7 @@ fn engine_decision_with_wildcard_execute_fallback(
     };
     let decision = engine.evaluate(sequence, origin);
     let Some(rule_idx) = decision.matched_rule else {
-        // Fell through to `defaults.unmatched` — Release N backward-compat
-        // says the legacy bool wins here.
+        // Fell through to `defaults.unmatched`: the legacy bool decides.
         return BridgeDecision::Fallback;
     };
     if decision.response == Response::Execute {
@@ -204,28 +153,41 @@ fn is_universal_wildcard_rule(sequence: &str) -> bool {
         && second.eq_ignore_ascii_case("any")
 }
 
+/// Test fixture: a Standard-profile policy holding one rule, `sequence` →
+/// `response` at `origin_min`, with `unmatched` as the default response.
+#[cfg(test)]
+pub(crate) fn one_rule_policy(
+    sequence: &str,
+    response: Response,
+    origin_min: OriginTag,
+    unmatched: Response,
+) -> aterm_policy::Policy {
+    use aterm_policy::{Defaults, Policy, Profile, Rule, SCHEMA_VERSION};
+    Policy {
+        schema_version: SCHEMA_VERSION,
+        profile: Profile::Standard,
+        defaults: Defaults {
+            unmatched,
+            shell_integration_require_nonce: false,
+        },
+        rules: vec![Rule {
+            sequence: sequence.to_owned(),
+            origin_min,
+            response,
+            rate_limit: None,
+            prompt_id: None,
+        }],
+        rate_limits: vec![],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_policy::{Defaults, Policy, Profile, Rule, SCHEMA_VERSION, profiles};
+    use aterm_policy::{Defaults, Policy, Profile, SCHEMA_VERSION, profiles};
 
     fn policy_with_rule(sequence: &str, response: Response, origin_min: OriginTag) -> Policy {
-        Policy {
-            schema_version: SCHEMA_VERSION,
-            profile: Profile::Standard,
-            defaults: Defaults {
-                unmatched: Response::Drop,
-                shell_integration_require_nonce: false,
-            },
-            rules: vec![Rule {
-                sequence: sequence.to_owned(),
-                origin_min,
-                response,
-                rate_limit: None,
-                prompt_id: None,
-            }],
-            rate_limits: vec![],
-        }
+        one_rule_policy(sequence, response, origin_min, Response::Drop)
     }
 
     #[test]
@@ -358,7 +320,7 @@ mod tests {
         assert!(!BridgeDecision::Fallback.resolve(false));
     }
 
-    // --- P4: response-injection suppression at the single `send_response` sink ---
+    // --- Response-injection suppression at the single `send_response` sink ---
 
     /// A host installing `response any = Drop` suppresses every PTY-origin reply
     /// (DA1/DSR/DECRQSS/...) at the one sink, via the engine-consulting mint gate.
@@ -378,8 +340,7 @@ mod tests {
         );
     }
 
-    /// With no policy engine the reply is emitted unchanged (default-allow): the
-    /// P4 gate must not regress pre-policy behavior.
+    /// With no policy engine the reply is emitted unchanged (default-allow).
     #[test]
     fn no_engine_still_replies() {
         use crate::terminal::Terminal;
@@ -391,10 +352,9 @@ mod tests {
         );
     }
 
-    /// The Kitty `a=q` support-probe reply must flow through the same
-    /// `send_response` sink as every other PTY reply, so `response any = Drop`
-    /// suppresses it. Before the fix it wrote straight to `response_buffer`,
-    /// bypassing the policy / rate / buffer-cap gates entirely.
+    /// The Kitty `a=q` support-probe reply flows through the same
+    /// `send_response` sink as every other PTY reply (policy, rate and
+    /// buffer-cap gates), so `response any = Drop` suppresses it.
     #[test]
     fn drop_policy_suppresses_kitty_query_reply() {
         use crate::terminal::Terminal;

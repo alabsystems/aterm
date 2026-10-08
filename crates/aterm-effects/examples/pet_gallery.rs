@@ -1,15 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `pet_gallery` — full-body pet contact sheets, the roster-as-one-animal twin
-//! of `kitty_gallery` (which covers the head/cat-art roster).
+//! `pet_gallery`: full-body pet contact sheets, the twin of `kitty_gallery`
+//! (which covers the head/cat-art roster).
 //!
-//! Bakes every authored pose in [`PET_GLYPH_IDS`] through the REAL bake path
-//! ([`PetBakeKey::bake`] — the same fill resolver and face LOD
-//! `PetBaker::tile` uses) at the SHIP size (the ~1.7-row body on a 20 px
-//! cell) and at 2×, side by side, on a light AND a dark ground. This is the
-//! sheet a "does the cat look right?" review actually needs: every pose, the
-//! size users see, both grounds, one page.
+//! Bakes every authored pose in [`PET_GLYPH_IDS`] through the real bake path
+//! ([`PetBakeKey::bake`], the same fill resolver and face LOD `PetBaker::tile`
+//! uses) at ship size (the ~1.7-row body on a 20 px cell) and at 2×, side by
+//! side, on a light and a dark ground: every pose, at the size users see, on
+//! one page.
 //!
 //! ```text
 //! targo --unverified run -q -p aterm-effects --example pet_gallery -- [out_dir] [--contact]

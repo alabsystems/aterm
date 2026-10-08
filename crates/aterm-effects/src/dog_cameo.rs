@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typed-word DOG cameo — the canine twin of the typed-"kitty" summon.
+//! The typed-word dog cameo, the canine twin of the typed-"kitty" summon.
 //!
-//! Typing a canine word (`dog`, `puppy`, `perro`, `chiot`, `子犬`, …) after the
-//! window has TYPED A LOT (the detector's keystroke gate, see
-//! `aterm-gui`'s `kitty_summon` module) pops a dog up next to the cursor. Where
-//! the kitty cameo is the cursor companion saying hello — one persistent
-//! identity, never re-rolled — the dog cameo is a VISITOR: every summon rolls a
-//! fresh breed from the whole authored roster
-//! ([`crate::dog_glyphs_gen::DOG_HEADS`]) and a fresh coat, so repeated
-//! summons show off the wide selection. A re-summon while a dog is still on
-//! screen always rolls a DIFFERENT breed — "dog dog dog" is a parade, not a
-//! stutter.
+//! Typing a canine word (`dog`, `puppy`, `perro`, `chiot`, `子犬`, …) once the
+//! window has passed the detector's keystroke gate (`aterm-gui`'s
+//! `kitty_summon`) pops a dog up next to the cursor. Unlike the kitty cameo (one
+//! persistent identity), each summon rolls a fresh breed from
+//! [`crate::dog_glyphs_gen::DOG_HEADS`] and a fresh coat; a re-summon while a
+//! dog is on screen always rolls a different breed.
 //!
 //! This module is the pure lifecycle state machine: the envelope (fade in →
-//! hold → fade out), the deterministic breed/coat roll, and the happy entry
-//! bounce. It draws nothing — the host resolves `alpha`/`bob`/`look` each
-//! frame and hands them to `word_decorations::dog_cameo`, which bakes the
-//! breed through [`crate::dog_baker::DogBaker`] and stamps the sprite. Like
-//! every input-path effect it is Source-agnostic and clockless-deterministic:
-//! all decisions derive from the summon seed and the host's `now`.
+//! hold → fade out), the deterministic breed/coat roll, and the entry bounce.
+//! It draws nothing: the host resolves `alpha`/`bob`/`look` each frame and
+//! hands them to `word_decorations::dog_cameo`, which bakes the breed through
+//! [`crate::dog_baker::DogBaker`]. Every decision derives from the summon seed
+//! and the host's `now`.
 
 use std::time::Duration;
 
@@ -29,28 +24,26 @@ use aterm_time::Instant;
 use crate::dog_glyphs_gen::{DOG_HEADS, DogGlyphId};
 use crate::genome::mix;
 
-/// Entry fade — quick enough to read as "popped up".
+/// Entry fade.
 const FADE_IN: Duration = Duration::from_millis(140);
 /// How long the dog stays at full presence after its entry.
 const HOLD: Duration = Duration::from_millis(2600);
-/// Exit fade — a soft dissolve, mirroring the kitty hello's departure scale.
+/// Exit fade.
 const FADE_OUT: Duration = Duration::from_millis(420);
 
-/// Entry-bounce spec: two happy hops, each shorter and lower than the last,
-/// finished well inside the hold so the dog SETTLES while fully visible.
+/// Entry bounce: two hops, each shorter and lower than the last, finished well
+/// inside the hold.
 const HOP_MS: u64 = 420;
 const HOPS: u64 = 2;
 /// First hop's peak lift, as a fraction of a cell (negative = up at draw time).
 const HOP_LIFT: f32 = 0.22;
 
-/// Seed salts for the two independent rolls. Distinct constants so the breed
-/// and coat draws can never correlate through a shared `mix` input.
+/// Distinct seed salts so the breed and coat rolls are independent.
 const BREED_SALT: u64 = 0x646f_6721_6272_6564; // b"dog!bred"
 const COAT_SALT: u64 = 0x646f_6721_636f_6174; // b"dog!coat"
 
-/// Reduce a mixed seed onto `[0, upper)` with multiply-high — constant-time,
-/// rejection-free, discrepancy ≤ one ticket in 2^64 (the genome's head-spill
-/// idiom at full width).
+/// Reduce a mixed seed onto `[0, upper)` with multiply-high (constant-time,
+/// rejection-free, bias at most one part in 2^64).
 fn scale(entropy: u64, upper: usize) -> usize {
     ((u128::from(entropy) * upper as u128) >> 64) as usize
 }
@@ -65,23 +58,21 @@ pub struct DogLook {
     pub coat: u8,
 }
 
-/// Per-window dog-cameo lifecycle state. `Default` is "no dog, never
-/// summoned"; the state machine is driven entirely by
-/// [`on_summon`](Self::on_summon) and read by the per-frame accessors.
+/// Per-window dog-cameo lifecycle state. `Default` is "never summoned"; driven
+/// by [`on_summon`](Self::on_summon) and read by the per-frame accessors.
 #[derive(Default)]
 pub struct DogCameo {
     /// The current visit's entry instant; `None` once the visit expires (the
-    /// accessors self-expire — no per-frame host bookkeeping).
+    /// accessors self-expire).
     since: Option<Instant>,
     /// The current visit's rolled identity.
     look: Option<DogLook>,
 }
 
 impl DogCameo {
-    /// Summon a dog: roll a breed + coat from `seed` and (re)start the
-    /// envelope. While a dog is still visible, the roll EXCLUDES the resident
-    /// breed, so back-to-back summons always parade distinct dogs. A no-op on
-    /// an empty roster (a placeholder build cannot panic here).
+    /// Summon a dog: roll a breed + coat from `seed` and restart the envelope.
+    /// While a dog is visible the roll excludes the resident breed. A no-op on
+    /// an empty roster.
     pub fn on_summon(&mut self, now: Instant, seed: u64) {
         if DOG_HEADS.is_empty() {
             return;
@@ -130,9 +121,8 @@ impl DogCameo {
         }
     }
 
-    /// The entry bounce at `now`, in cell fractions (`<= 0`: up). Two damped
-    /// hops, then flat for the rest of the visit. The host passes `0.0`
-    /// straight through under reduced motion by simply not calling this.
+    /// The entry bounce at `now`, in cell fractions (`<= 0`: up): two damped
+    /// hops, then flat. Under reduced motion the host does not call this.
     #[must_use]
     pub fn bob(&self, now: Instant) -> f32 {
         let Some(at) = self.since else {
@@ -150,8 +140,7 @@ impl DogCameo {
     }
 
     /// The current visit's rolled identity (`None` before the first summon).
-    /// Stays resolvable through the fade-out so a mid-fade frame never loses
-    /// its sprite.
+    /// Stays set through the fade-out so a mid-fade frame keeps its sprite.
     #[must_use]
     pub fn look(&self) -> Option<DogLook> {
         self.look
@@ -188,7 +177,7 @@ mod tests {
     }
 
     /// Every summon rolls inside the roster, and the roll is a pure function
-    /// of the seed (clockless determinism).
+    /// of the seed.
     #[test]
     fn rolls_are_deterministic_and_in_range() {
         let t = t0();
@@ -204,8 +193,8 @@ mod tests {
         }
     }
 
-    /// A re-summon while the dog is visible parades a DIFFERENT breed; the
-    /// wide selection is reachable (many seeds hit many breeds).
+    /// A re-summon while the dog is visible rolls a different breed, and many
+    /// seeds reach many breeds.
     #[test]
     fn resummons_parade_distinct_breeds() {
         let t = t0();

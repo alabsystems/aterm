@@ -1,20 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `mix_meter` — INTROSPECTION for the trail-sound loudness ladder.
+//! `mix_meter`: measures the trail-sound loudness ladder.
 //!
-//! The ladder in `trail_sound.rs` is a design document written in dBFS: TIER 1
-//! (a keystroke) is the floor at −21.0 dBFS and every other gesture is placed
-//! against it. But `palette_trim` — the per-style constant that lands each
-//! palette ON that floor — is a FITTED number, and nothing in the test suite
-//! measures it. Change a partial level, a lowpass corner or a spawn gain and
-//! the ladder silently drifts; the byte-pin oracle keeps passing, because it
-//! only proves the two copies of the DSP agree with each other.
-//!
-//! This tool closes that loop. It renders real events through the real
-//! `TrailSynth` and reports the delivered peak of each one, so the ladder can
-//! be READ rather than assumed — and so a retune can be fitted against a
-//! measurement instead of a guess.
+//! The ladder in `trail_sound.rs` is written in dBFS: tier 1 (a keystroke) is
+//! the floor at −21.0 dBFS and every other gesture is placed against it.
+//! `palette_trim`, the per-style constant that lands each palette on that
+//! floor, is fitted, and the byte-pin oracle only proves the two DSP copies
+//! agree. This tool renders real events through the real `TrailSynth` and
+//! reports each one's delivered peak, so a retune can be fitted against a
+//! measurement.
 //!
 //! ```text
 //! cargo run -q -p aterm-effects --example mix_meter
@@ -23,15 +18,13 @@
 //! cargo run -q -p aterm-effects --example mix_meter -- --voice droplet lumen
 //! ```
 //!
-//! `--voice <name>` selects the TYPING-SOUND VOICE (`SoundVoice::parse`: the
-//! picker's canonical spellings or a documented alias; default `auto`); the
-//! bare style argument still selects the LOOK the events ride, which only
-//! matters under `auto`. This is the bench every `palette_trim` fit is read
-//! on, so a sound-only voice must be meterable without an edit.
+//! `--voice <name>` selects the typing-sound voice (`SoundVoice::parse`;
+//! default `auto`); the bare style argument selects the look the events ride,
+//! which matters only under `auto`.
 //!
-//! Levels are reported at the host's DEFAULT `trail_sound_volume` (0.4) and,
-//! separately, normalized to `gain = 1.0` so the palette's own trim can be
-//! judged independently of the user's volume knob.
+//! Levels are reported at the host's default `trail_sound_volume` (0.4) and
+//! normalized to `gain = 1.0`, so the palette's trim can be judged
+//! independently of the volume knob.
 
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::tone::Tone;

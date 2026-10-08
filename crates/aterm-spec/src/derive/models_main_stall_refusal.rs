@@ -6,8 +6,8 @@
 
 use super::Model;
 
-/// The writer/reader contract behind `ERR main thread stalled <N>s since
-/// <root>; retry`. The WRITER is the watchdog's beat (`beat_into`), which
+/// The writer/reader contract behind `ERR main thread stalled <N>s; retry`.
+/// The WRITER is the watchdog's beat (`beat_into`), which
 /// stamps the heartbeat's time on every root entry. The READER is
 /// `main_stall`, which a control worker asks before it posts a hop to the main
 /// thread. The hop count `call_main` keeps (`control_media::Hops`) and the

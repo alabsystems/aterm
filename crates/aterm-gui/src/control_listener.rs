@@ -42,10 +42,31 @@
 //!   `aterm ctl`'s connect deadline names that failure within seconds.
 //!
 //! The health of all of this is published on `metrics` ([`fields_text`]).
+//!
+//! **Retired before a cold `exec`** ([`Endpoint`], measured 2026-09-29). An
+//! `exec` from a multi-threaded process completes on macOS only once every
+//! other thread has been scheduled and terminated, and close-on-exec
+//! descriptors close only at its end. UTILITY and BACKGROUND threads — mostly
+//! libdispatch workqueue threads — must each get CPU to die, and a saturated
+//! machine starves them for seconds (up to 2.36 s measured at load 78–176,
+//! 11.6 s under a build; unbounded). Throughout, the listening socket and
+//! every connection it accepted stayed open with no thread left to serve them:
+//! a client connected into a queue nothing would accept and waited out `aterm
+//! ctl`'s 10 s connect probe, and a client holding a connection waited for an
+//! answer that could not come. The cold update lane now retires the endpoint
+//! right before the `exec` — a fresh connect is refused and a held connection
+//! reads EOF at once — and reopens it at the same path, with the same token,
+//! if the `exec` returns.
 
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, RawFd};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::{Condvar, Mutex, PoisonError};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
@@ -332,6 +353,359 @@ impl Watch {
 #[cfg(unix)]
 type Serve = Arc<dyn Fn(CtlStream) + Send + Sync>;
 
+/// The way a supervisor mints a replacement listening socket at its path
+/// ([`rebind_socket`] behind the caller's own bookkeeping).
+#[cfg(unix)]
+type Rebind = Box<dyn FnMut() -> Option<CtlListener> + Send>;
+
+/// THE CONTROL ENDPOINT'S RETIRE HANDLE: what the cold update lane closes right
+/// before its `exec`, and opens again if the `exec` returns (module doc). The
+/// App keeps one beside `sock_bound`; the supervisor serving the socket holds
+/// the other end. One that no supervisor ever served retires nothing.
+#[derive(Clone, Default)]
+pub(crate) struct Endpoint {
+    #[cfg(unix)]
+    shared: Arc<EndpointShared>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct EndpointShared {
+    endpoint_state: Mutex<EndpointState>,
+    /// Rung when [`Endpoint::reopen`] hands the watchdog a listener to serve.
+    handed_over: Condvar,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct EndpointState {
+    /// The serving generation's listening descriptor. Its accept thread owns
+    /// it and closes it only once retired, and a generation is retired only
+    /// under this lock ([`Endpoint::install`]), so while it is here it names
+    /// that listening socket.
+    serving: Option<RawFd>,
+    /// Every name a generation's listening socket was bound at — the published
+    /// path, a rebind's temporary name: the local address every connection it
+    /// accepted carries.
+    names: Vec<PathBuf>,
+    /// [`Endpoint::retire`] ran, and no [`Endpoint::reopen`] since: nothing
+    /// serves and nothing is rebound.
+    retired: bool,
+    /// A listener [`Endpoint::reopen`] bound, not yet taken by the watchdog.
+    handed: Option<CtlListener>,
+    /// The supervisor's rebind, shared with [`Endpoint::reopen`].
+    mint_listener: Option<Rebind>,
+}
+
+/// What [`Endpoint::retire`] closed.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Retired {
+    /// The serving listening socket.
+    pub(crate) listener: bool,
+    /// Accepted connections, shut down both ways.
+    pub(crate) connections: usize,
+}
+
+#[cfg(unix)]
+impl Endpoint {
+    /// Stop answering, at once, without waiting on any other thread: close
+    /// the serving listening socket — every connection still queued on it is
+    /// reset and a new connect is refused — and shut down, both ways, every
+    /// connection it accepted, wherever it is held, so its client reads EOF
+    /// now rather than when the process is finally replaced. The token and
+    /// the socket file stay where they are, for [`Self::reopen`] or the
+    /// process that replaces this one.
+    pub(crate) fn retire(&self) -> Retired {
+        let (listener, names) = {
+            let mut endpoint = self
+                .shared
+                .endpoint_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            endpoint.retired = true;
+            endpoint.handed = None;
+            let listener = match endpoint.serving {
+                Some(fd) if close_listening(fd) => {
+                    endpoint.serving = None;
+                    true
+                }
+                _ => false,
+            };
+            (listener, endpoint.names.clone())
+        };
+        Retired {
+            listener,
+            connections: shutdown_accepted(&names),
+        }
+    }
+
+    /// Serve again after [`Self::retire`] (a cold `exec` that returned): a
+    /// fresh listening socket at the same path, with the same token, bound
+    /// here — a client that connects once this returns is queued on it — and
+    /// handed to the watchdog, which serves it as it serves a rebind.
+    /// `false` when none could be bound; the watchdog then judges the
+    /// endpoint dead and rebinds on its own.
+    pub(crate) fn reopen(&self) -> bool {
+        let mut endpoint = self
+            .shared
+            .endpoint_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !endpoint.retired {
+            return true;
+        }
+        endpoint.retired = false;
+        // No supervisor yet: it serves its own listener when it starts.
+        let Some(mint_listener) = endpoint.mint_listener.as_mut() else {
+            return true;
+        };
+        let Some(fresh) = mint_listener() else {
+            return false;
+        };
+        endpoint.handed = Some(fresh);
+        self.shared.handed_over.notify_all();
+        true
+    }
+
+    fn is_retired(&self) -> bool {
+        self.shared
+            .endpoint_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retired
+    }
+
+    fn adopt(&self, mint_listener: Rebind) {
+        self.shared
+            .endpoint_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .mint_listener = Some(mint_listener);
+    }
+
+    /// Make `listener` the serving generation `generation` — which retires
+    /// every earlier one — unless the endpoint is retired: then it is closed
+    /// here and `None` comes back.
+    fn install(
+        &self,
+        listener: CtlListener,
+        generation: u64,
+        current: &AtomicU64,
+    ) -> Option<CtlListener> {
+        let mut endpoint = self
+            .shared
+            .endpoint_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if endpoint.retired {
+            return None;
+        }
+        current.store(generation, Ordering::Release);
+        endpoint.serving = Some(listener.as_raw_fd());
+        if let Some(name) = bound_name(&listener)
+            && !endpoint.names.contains(&name)
+        {
+            endpoint.names.push(name);
+        }
+        Some(listener)
+    }
+
+    /// An installed listener whose accept thread never started is about to
+    /// close: stop naming it.
+    fn forget(&self, listener: &CtlListener) {
+        let mut endpoint = self
+            .shared
+            .endpoint_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if endpoint.serving == Some(listener.as_raw_fd()) {
+            endpoint.serving = None;
+        }
+    }
+
+    /// Wait out one watchdog tick, cut short by a listener [`Self::reopen`]
+    /// hands over, which comes back.
+    fn tick(&self, tick: Duration) -> Option<CtlListener> {
+        let endpoint = self
+            .shared
+            .endpoint_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (mut endpoint, _) = self
+            .shared
+            .handed_over
+            .wait_timeout_while(endpoint, tick, |endpoint| endpoint.handed.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        endpoint.handed.take()
+    }
+
+    /// The watchdog's replacement for a wedged socket; none while retired.
+    fn replacement(&self) -> Option<CtlListener> {
+        let mut endpoint = self
+            .shared
+            .endpoint_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if endpoint.retired {
+            return None;
+        }
+        endpoint
+            .mint_listener
+            .as_mut()
+            .and_then(|mint_listener| mint_listener())
+    }
+
+    /// The supervisor stopped (tests): retire every accept thread, and name
+    /// no listener any more.
+    fn stop(&self, current: &AtomicU64) {
+        let mut endpoint = self
+            .shared
+            .endpoint_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        endpoint.serving = None;
+        current.store(u64::MAX, Ordering::Release);
+    }
+}
+
+/// The name a listening socket was bound at, if it has one.
+#[cfg(unix)]
+fn bound_name(listener: &CtlListener) -> Option<PathBuf> {
+    listener
+        .local_addr()
+        .ok()?
+        .as_pathname()
+        .map(Path::to_path_buf)
+}
+
+/// Close the listening socket `fd` names without freeing the descriptor
+/// number: /dev/null is duplicated over it. Its accept thread owns `fd` and
+/// closes it when that thread ends, so the number must stay allocated until
+/// then — after a plain `close` the process could reuse it under a thread that
+/// still polls it, and that thread's own close would then close the reuser's.
+/// The socket closes with its last descriptor: every connection still queued
+/// on it is reset, and a new connect is refused. The accept thread finds
+/// /dev/null under the number (`accept` fails ENOTSOCK) and ends. `dup2` does
+/// not wait for that thread. On macOS a `poll` holds no reference to the
+/// socket, so it closes at the `dup2`. Linux's `poll` holds a reference until
+/// it returns (up to a [`TICK`]), so the socket is shut down first. On Linux
+/// that refuses every new connect at once and wakes the `poll`. On macOS it
+/// fails with ENOTCONN and changes nothing (measured 2026-09-30), and the
+/// `dup2` does the work — unless a child another thread forked has not exec'd
+/// yet: it holds a copy of the descriptor, and the socket listens until that
+/// exec (26.6 drops `FD_CLOFORK`, so there is no opting out; measured).
+#[cfg(unix)]
+fn close_listening(fd: RawFd) -> bool {
+    let Ok(null) = std::fs::File::open("/dev/null") else {
+        aterm_log::warn!(
+            "control endpoint: /dev/null could not be opened; the listener stays open"
+        );
+        return false;
+    };
+    // SAFETY: `fd` is open, for the reason the `dup2` below states, and
+    // `shutdown` reads and writes no memory.
+    let _ = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+    loop {
+        // SAFETY: both descriptors are open for the whole call: `null` is
+        // borrowed across it, and `fd` is the serving generation's listener,
+        // which its accept thread closes only once retired — never while
+        // `EndpointState::serving` names it, under the lock the caller holds.
+        let duplicated = unsafe { libc::dup2(null.as_raw_fd(), fd) };
+        if duplicated == fd {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            aterm_log::warn!("control endpoint: the listener could not be closed: {error}");
+            return false;
+        }
+    }
+    // `dup2` clears close-on-exec on the copy; the `exec` this precedes must
+    // not carry it into the successor.
+    // SAFETY: `fd` is open (it names /dev/null now), and F_SETFD reads no memory.
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    true
+}
+
+/// Shut down, both ways, every connected socket in this process whose local
+/// address is one of `names`: the connections a listening socket bound at one
+/// of them accepted, wherever each is held — a request or wait lane, the
+/// parker, a subscription, a relay — so no path that holds one keeps any
+/// bookkeeping for this. A retired generation's listening socket carries one
+/// of the names too; it refuses the shutdown (ENOTCONN) and is not counted.
+///
+/// Each half is shut on its own ([`aterm_uds::hangup::hang_up`]). A client
+/// that half-closed after its request (`printf … | nc -U`, parked in a verb)
+/// has shut its connection's read half here, and Darwin refuses a both-ways
+/// `shutdown` of it — ENOTCONN, as for a listening socket — and shuts NOTHING:
+/// such a client read its EOF only when the process was replaced, and was not
+/// counted.
+#[cfg(unix)]
+fn shutdown_accepted(names: &[PathBuf]) -> usize {
+    if names.is_empty() {
+        return 0;
+    }
+    let Ok(listing) = std::fs::read_dir("/dev/fd") else {
+        return 0;
+    };
+    let descriptors: Vec<RawFd> = listing
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    descriptors
+        .into_iter()
+        .filter(|&fd| shutdown_if_accepted_at(fd, names))
+        .count()
+}
+
+/// [`shutdown_accepted`] for one descriptor number, which another thread owns
+/// and may close — and the process reuse — at any moment. So the socket is
+/// read and shut down through a duplicate, which names the socket that was
+/// inspected whatever happens to the number. And only a SOCKET is ever
+/// duplicated: closing any descriptor of a file drops every POSIX record lock
+/// this process holds on it, so a duplicate that turns out to name something
+/// else (the number was reused between the two calls) is leaked rather than
+/// closed — close-on-exec, it goes with the `exec`.
+#[cfg(unix)]
+fn shutdown_if_accepted_at(fd: RawFd, names: &[PathBuf]) -> bool {
+    use std::os::fd::FromRawFd as _;
+    if !is_socket(fd) {
+        return false;
+    }
+    // SAFETY: F_DUPFD_CLOEXEC reads no memory; a number that names no open
+    // descriptor fails with EBADF.
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return false;
+    }
+    if !is_socket(copy) {
+        // The number was reused under us: leak the duplicate (above).
+        return false;
+    }
+    // SAFETY: `copy` was just created by this call, nothing else owns it, and
+    // it names a socket, so closing it releases no lock.
+    let copy = CtlStream::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) });
+    copy.local_addr()
+        .ok()
+        .and_then(|address| address.as_pathname().map(Path::to_path_buf))
+        .is_some_and(|name| names.contains(&name))
+        && aterm_uds::hangup::hang_up(&copy)
+}
+
+/// Whether `fd` names a socket; `false` for a number that names nothing.
+#[cfg(unix)]
+fn is_socket(fd: RawFd) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fstat` writes exactly one `struct stat` through the pointer and
+    // reads nothing else; the descriptor is inspected, never consumed.
+    if unsafe { libc::fstat(fd, info.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `fstat` returned 0, so it initialized the structure.
+    let info = unsafe { info.assume_init() };
+    info.st_mode & libc::S_IFMT == libc::S_IFSOCK
+}
+
 /// THE TEST SEAMS, shared with every generation's accept thread. Each holds a
 /// generation number (or `u64::MAX` for none) that the seam applies to.
 #[cfg(all(unix, test))]
@@ -340,6 +714,12 @@ struct Seams {
     /// While it names a thread's generation, that thread's accept path consumes
     /// nothing but keeps turning — the queue stands still.
     withhold: Arc<AtomicU64>,
+    /// The generation that has SEEN `withhold` name it (`u64::MAX` for none).
+    /// Like `park`, `withhold` takes effect at a thread's next check, not when it
+    /// is stored: a thread already past the check, still draining the queue, can
+    /// serve a client that connects before this names it (measured 2026-09-29
+    /// under load: "the wedged socket served a peer it was withholding").
+    withholding: Arc<AtomicU64>,
     /// While it names a thread's generation, that thread blocks INSIDE its
     /// accept step and does not return — the incident's thread, parked in
     /// `accept(2)` with connections queued.
@@ -355,7 +735,11 @@ struct Seams {
 #[cfg(all(unix, test))]
 impl Seams {
     fn withheld(&self, generation: u64) -> bool {
-        self.withhold.load(Ordering::Acquire) == generation
+        let withheld = self.withhold.load(Ordering::Acquire) == generation;
+        if withheld {
+            self.withholding.store(generation, Ordering::Release);
+        }
+        withheld
     }
 
     fn park_while_named(&self, generation: u64) {
@@ -380,19 +764,21 @@ impl Seams {
 /// The stuck thread and its socket are abandoned (retired: if the call ever
 /// returns, the thread serves what its socket still yields and exits).
 #[cfg(unix)]
-pub(crate) struct Supervisor<R: FnMut() -> Option<CtlListener>> {
+pub(crate) struct Supervisor<R: FnMut() -> Option<CtlListener> + Send + 'static> {
     listener: CtlListener,
     rebind: R,
+    endpoint: Endpoint,
     #[cfg(test)]
     seams: Option<Seams>,
 }
 
 #[cfg(unix)]
-impl<R: FnMut() -> Option<CtlListener>> Supervisor<R> {
+impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
     /// Take over `listener` (switched to non-blocking here) with `rebind` as the
     /// way to mint its replacement: a fresh listener already published at the
-    /// same path, or `None` when that could not be done.
-    pub(crate) fn new(listener: CtlListener, rebind: R) -> Self {
+    /// same path, or `None` when that could not be done. `endpoint` is the
+    /// handle the cold update lane retires it by.
+    pub(crate) fn new(listener: CtlListener, rebind: R, endpoint: Endpoint) -> Self {
         if let Err(error) = listener.set_nonblocking(true) {
             // Still served: a blocking listener only loses the tick while idle,
             // which is the loop this replaced.
@@ -402,6 +788,7 @@ impl<R: FnMut() -> Option<CtlListener>> Supervisor<R> {
         Self {
             listener,
             rebind,
+            endpoint,
             #[cfg(test)]
             seams: None,
         }
@@ -410,6 +797,8 @@ impl<R: FnMut() -> Option<CtlListener>> Supervisor<R> {
     /// Serve until `stop()` (production: never). Each accepted stream is back
     /// in blocking mode (Darwin's `accept` inherits `O_NONBLOCK` from the
     /// listener) before `serve` sees it. The calling thread is the watchdog.
+    /// While the endpoint is retired it judges nothing; a listener
+    /// [`Endpoint::reopen`] hands over is served as a rebind is.
     pub(crate) fn run(
         self,
         serve: impl Fn(CtlStream) + Send + Sync + 'static,
@@ -417,50 +806,71 @@ impl<R: FnMut() -> Option<CtlListener>> Supervisor<R> {
     ) {
         let Self {
             listener,
-            mut rebind,
+            rebind,
+            endpoint,
             #[cfg(test)]
             seams,
         } = self;
+        endpoint.adopt(Box::new(rebind));
         let serve: Serve = Arc::new(serve);
         // The generation being served; a thread whose generation it no longer
         // names is retired.
         let current = Arc::new(AtomicU64::new(0));
         let mut generation = 0;
-        let mut beat = match AcceptThread::spawn(
-            listener,
-            generation,
-            &current,
-            &serve,
-            #[cfg(test)]
-            seams.clone(),
-        ) {
-            Ok(beat) => beat,
-            // No thread to supervise: serve here, unsupervised — exactly the
-            // loop this replaced, never nothing.
-            Err(accept) => return accept.run(),
+        let mut beat = match endpoint.install(listener, generation, &current) {
+            // Retired before it served: nothing to watch until it reopens.
+            None => Arc::new(Beat::default()),
+            Some(listener) => match AcceptThread::spawn(
+                listener,
+                generation,
+                &current,
+                &serve,
+                #[cfg(test)]
+                seams.clone(),
+            ) {
+                Ok(beat) => beat,
+                // No thread to supervise: serve here, unsupervised — exactly
+                // the loop this replaced, never nothing.
+                Err(accept) => return accept.run(),
+            },
         };
         let mut watch = Watch::new(Instant::now());
         while !stop() {
-            std::thread::sleep(TICK);
+            let handed = endpoint.tick(TICK);
             let now = Instant::now();
-            let Some(wedge) = watch.observe(beat.read(), now) else {
-                continue;
-            };
-            match wedge {
-                Wedge::Stuck { for_ms } => aterm_log::warn!(
-                    "control listener wedged: its accept thread has not returned for {for_ms} ms \
-                     (generation {generation}); rebinding the control socket"
-                ),
-                Wedge::Stalled { queued, for_ms } => aterm_log::warn!(
-                    "control listener wedged: {queued} connection(s) queued and none accepted \
-                     for {for_ms} ms (generation {generation}); rebinding the control socket"
-                ),
-            }
-            watch.attempted(now);
-            let Some(fresh) = rebind() else {
-                HEALTH.rebind_failures.fetch_add(1, Ordering::Relaxed);
-                aterm_log::warn!("control listener rebind failed; keeping the wedged socket");
-                continue;
+            let reopened = handed.is_some();
+            let fresh = match handed {
+                Some(fresh) => fresh,
+                None => {
+                    if endpoint.is_retired() {
+                        continue;
+                    }
+                    let Some(wedge) = watch.observe(beat.read(), now) else {
+                        continue;
+                    };
+                    match wedge {
+                        Wedge::Stuck { for_ms } => aterm_log::warn!(
+                            "control listener wedged: its accept thread has not returned for \
+                             {for_ms} ms (generation {generation}); rebinding the control socket"
+                        ),
+                        Wedge::Stalled { queued, for_ms } => aterm_log::warn!(
+                            "control listener wedged: {queued} connection(s) queued and none \
+                             accepted for {for_ms} ms (generation {generation}); rebinding the \
+                             control socket"
+                        ),
+                    }
+                    watch.attempted(now);
+                    let Some(fresh) = endpoint.replacement() else {
+                        if !endpoint.is_retired() {
+                            HEALTH.rebind_failures.fetch_add(1, Ordering::Relaxed);
+                            aterm_log::warn!(
+                                "control listener rebind failed; keeping the wedged socket"
+                            );
+                        }
+                        continue;
+                    };
+                    fresh
+                }
             };
             if let Err(error) = fresh.set_nonblocking(true) {
                 HEALTH.rebind_failures.fetch_add(1, Ordering::Relaxed);
@@ -468,9 +878,12 @@ impl<R: FnMut() -> Option<CtlListener>> Supervisor<R> {
                 continue;
             }
             generation += 1;
-            // Retire the old thread first: if its call ever returns, it serves
-            // what the old socket still yields and exits.
-            current.store(generation, Ordering::Release);
+            // Retire the old thread first (inside `install`): if its call ever
+            // returns, it serves what the old socket still yields and exits.
+            // Retired meanwhile, the fresh socket closes there instead.
+            let Some(fresh) = endpoint.install(fresh, generation, &current) else {
+                continue;
+            };
             beat = match AcceptThread::spawn(
                 fresh,
                 generation,
@@ -480,23 +893,32 @@ impl<R: FnMut() -> Option<CtlListener>> Supervisor<R> {
                 seams.clone(),
             ) {
                 Ok(beat) => beat,
-                Err(_unstarted) => {
-                    // The fresh socket closed with its thread. A beat that
+                Err(unstarted) => {
+                    // The fresh socket closes with its thread. A beat that
                     // never moves reads as stuck, so the next judgement
                     // rebinds again rather than leaving the path dead.
+                    endpoint.forget(&unstarted.listener);
+                    drop(unstarted);
                     HEALTH.rebind_failures.fetch_add(1, Ordering::Relaxed);
                     aterm_log::warn!("control listener rebind: no accept thread could start");
                     Arc::new(Beat::default())
                 }
             };
             watch.rebound(now);
-            HEALTH.rebinds.fetch_add(1, Ordering::Relaxed);
-            aterm_log::info!(
-                "control listener rebound (generation {generation}); queued clients reconnect"
-            );
+            if reopened {
+                aterm_log::info!(
+                    "control listener reopened (generation {generation}) after a cold exec \
+                     that did not happen"
+                );
+            } else {
+                HEALTH.rebinds.fetch_add(1, Ordering::Relaxed);
+                aterm_log::info!(
+                    "control listener rebound (generation {generation}); queued clients reconnect"
+                );
+            }
         }
         // Stopped (tests): retire every accept thread.
-        current.store(u64::MAX, Ordering::Release);
+        endpoint.stop(&current);
     }
 }
 
@@ -614,7 +1036,13 @@ impl AcceptThread {
             let accepted = if self.withheld() {
                 0
             } else {
-                drain(&self.listener, &serve, &mut backoff)
+                let Some(accepted) = drain(&self.listener, &serve, &mut backoff) else {
+                    // The descriptor names no socket any more: the endpoint
+                    // closed it under this thread (`Endpoint::retire`), and
+                    // there is nothing left to accept.
+                    return;
+                };
+                accepted
             };
             let pending = queue_pending(&self.listener);
             self.beat.accepts.fetch_add(
@@ -634,7 +1062,7 @@ impl AcceptThread {
         // dropped; what it will not yield is reset when it closes, and the
         // client retries.
         if !self.withheld() {
-            drain(&self.listener, &serve, &mut backoff);
+            let _ = drain(&self.listener, &serve, &mut backoff);
         }
     }
 }
@@ -643,27 +1071,41 @@ impl AcceptThread {
 /// included) just end the wait: the caller drains and re-judges either way.
 #[cfg(unix)]
 fn wait_readable(listener: &CtlListener, timeout: Duration) {
-    use std::os::fd::AsRawFd;
-    let mut fd = libc::pollfd {
-        fd: listener.as_raw_fd(),
+    let _ = poll_readable(listener.as_raw_fd(), timeout);
+}
+
+/// Park until `fd` reports an event or `timeout` passes: `Ok(true)` on any
+/// event (`POLLIN`, or the `POLLHUP`/`POLLERR`/`POLLNVAL` poll always reports,
+/// after which a read returns at once), `Ok(false)` on the timeout, and
+/// `poll`'s own error otherwise, `EINTR` included, for the caller to re-judge.
+/// The caller keeps `fd` open for the call.
+#[cfg(unix)]
+pub(crate) fn poll_readable(fd: RawFd, timeout: Duration) -> std::io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
         events: libc::POLLIN,
         revents: 0,
     };
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    // SAFETY: one initialized pollfd for a descriptor `listener` keeps open for
-    // the whole call.
-    let _ = unsafe { libc::poll(&mut fd, 1, ms) };
+    // SAFETY: one initialized pollfd for a descriptor the caller keeps open
+    // for the whole call.
+    match unsafe { libc::poll(&mut pfd, 1, ms) } {
+        n if n > 0 => Ok(pfd.revents != 0),
+        0 => Ok(false),
+        _ => Err(std::io::Error::last_os_error()),
+    }
 }
 
 /// Accept until the queue reports empty (or [`DRAIN_MAX`]). Returns how many
-/// connections were handed to `serve`. `backoff` is the current accept-error
-/// streak's pause, cleared by a successful accept.
+/// connections were handed to `serve`, or `None` once the descriptor names no
+/// socket at all (a retired endpoint's, [`close_listening`]). `backoff` is the
+/// current accept-error streak's pause, cleared by a successful accept.
 #[cfg(unix)]
 fn drain(
     listener: &CtlListener,
     serve: &impl Fn(CtlStream),
     backoff: &mut Option<Duration>,
-) -> usize {
+) -> Option<usize> {
     let mut accepted = 0;
     while accepted < DRAIN_MAX {
         match listener.accept() {
@@ -677,6 +1119,7 @@ fn drain(
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.raw_os_error() == Some(libc::ENOTSOCK) => return None,
             Err(error) => {
                 // ECONNABORTED (a peer gone before it was taken), EMFILE…: the
                 // next tick retries, and a queue this cannot drain is exactly
@@ -701,7 +1144,7 @@ fn drain(
             }
         }
     }
-    accepted
+    Some(accepted)
 }
 
 /// The listening socket's completed-connection queue length — the kernel's own
@@ -806,8 +1249,8 @@ pub(crate) fn socket_file_id(path: &str) -> Option<(u64, u64)> {
 /// rename it over `path` — but only while `path` still names the socket this
 /// process published (`*expected`), so a rebind can never take over an
 /// endpoint something else now owns. On success `*expected` moves to the new
-/// file. The temporary name is at most as long as an `aterm-<pid>.sock` name,
-/// so it fits wherever the published path fit.
+/// file, as bound here. The temporary name is at most as long as an
+/// `aterm-<pid>.sock` name, so it fits wherever the published path fit.
 #[cfg(unix)]
 pub(crate) fn rebind_socket(path: &str, expected: &mut Option<(u64, u64)>) -> Option<CtlListener> {
     let target = std::path::Path::new(path);
@@ -833,10 +1276,15 @@ pub(crate) fn rebind_socket(path: &str, expected: &mut Option<(u64, u64)>) -> Op
     if expected.is_none() || current != *expected {
         return give_up("the path no longer names the socket this instance published");
     }
+    // The fresh socket's identity, read at its temporary name: the rename
+    // keeps it, and once renamed the path could already name another's.
+    let Some(fresh_id) = temp.to_str().and_then(socket_file_id) else {
+        return give_up("the fresh socket is gone from its temporary name");
+    };
     if let Err(error) = std::fs::rename(&temp, target) {
         return give_up(&format!("rename over the published path failed: {error}"));
     }
-    *expected = socket_file_id(path);
+    *expected = Some(fresh_id);
     Some(fresh)
 }
 
@@ -885,10 +1333,14 @@ mod tests {
         let published = path.to_str().expect("utf8").to_string();
         let mut expected = socket_file_id(&published);
         let rebind_path = published.clone();
-        let mut supervisor =
-            Supervisor::new(listener, move || rebind_socket(&rebind_path, &mut expected));
+        let mut supervisor = Supervisor::new(
+            listener,
+            move || rebind_socket(&rebind_path, &mut expected),
+            Endpoint::default(),
+        );
         let seams = Seams {
             withhold: Arc::new(AtomicU64::new(u64::MAX)),
+            withholding: Arc::new(AtomicU64::new(u64::MAX)),
             park: Arc::new(AtomicU64::new(u64::MAX)),
             parked: Arc::new(AtomicU64::new(u64::MAX)),
         };
@@ -906,25 +1358,62 @@ mod tests {
         (stop, seams, thread)
     }
 
+    /// Bound `stream`'s reads by `patience`. A supervisor that accepted,
+    /// answered and closed the connection before this runs — a client thread
+    /// descheduled after its `connect` on a loaded host — leaves a socket
+    /// Darwin refuses every option on (`EINVAL`, measured on macOS 26.6 once
+    /// the peer's last descriptor closed), though its answer is still queued
+    /// and no read on it can block any more. That is how the healthy `ask`
+    /// failed once at load ~100 ("healthy ask: EINVAL"). So, as `aterm ctl`
+    /// does (`open_accepted`), the read goes ahead unarmed. Only an OS error
+    /// counts: std refuses a zero timeout with no errno.
+    fn arm(stream: &CtlStream, patience: Duration) -> std::io::Result<()> {
+        match stream.set_read_timeout(Some(patience)) {
+            Err(error)
+                if cfg!(target_vendor = "apple")
+                    && error.kind() == std::io::ErrorKind::InvalidInput
+                    && error.raw_os_error().is_some() =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    /// The one line a fresh client on `path` is answered — `OK served` — or
+    /// "" when the connection ends with none. A LINE, not the stream to its
+    /// end: the end is read only once every descriptor of the supervisor's
+    /// side has closed, and a sibling test's fork holds a copy of one until
+    /// its child execs, past `patience` under load.
     fn ask(path: &std::path::Path, patience: Duration) -> std::io::Result<String> {
-        let mut stream = CtlStream::connect(path)?;
-        stream.set_read_timeout(Some(patience))?;
+        let stream = CtlStream::connect(path)?;
+        arm(&stream, patience)?;
+        read_reply(&stream)
+    }
+
+    fn read_reply(stream: &CtlStream) -> std::io::Result<String> {
+        use std::io::BufRead as _;
         let mut reply = String::new();
-        stream.read_to_string(&mut reply)?;
+        std::io::BufReader::new(stream).read_line(&mut reply)?;
         Ok(reply)
     }
 
-    /// A new client on `path` is served within `within` (retrying through the
-    /// moment of the swap).
-    fn served_within(path: &std::path::Path, within: Duration) -> String {
-        let deadline = Instant::now() + within;
-        loop {
-            match ask(path, Duration::from_secs(2)) {
-                Ok(reply) if !reply.is_empty() => return reply,
-                _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-                other => panic!("no client was served after the rebind: {other:?}"),
-            }
-        }
+    /// The one line a new client on `path` is answered once the watchdog has
+    /// rebound it — two facts, each waited for with a hang detector
+    /// ([`aterm_spec::wait::MUST_HAPPEN`]), never a clock: the path names a
+    /// socket other than `before` (the rename is the rebind's last step, and
+    /// the fresh socket listens from before it, so a client connecting now is
+    /// queued on it), and then that client is answered. No client is sent
+    /// into the retiring queue, which a sibling test's fork can hold open
+    /// past its close.
+    fn served_after_rebind(path: &std::path::Path, before: Option<(u64, u64)>) -> String {
+        let published = path.to_str().expect("utf8");
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the watchdog to rebind the published path",
+            || (socket_file_id(published) != before).then_some(()),
+        );
+        ask(path, aterm_spec::wait::MUST_HAPPEN).expect("the fresh socket answers")
     }
 
     fn assert_rebound_owner_only(path: &std::path::Path, before: Option<(u64, u64)>) {
@@ -954,35 +1443,33 @@ mod tests {
         let rebinds_before = HEALTH.rebinds.load(Ordering::Relaxed);
 
         assert_eq!(
-            ask(&path, Duration::from_secs(5)).expect("healthy ask"),
+            ask(&path, aterm_spec::wait::MUST_HAPPEN).expect("healthy ask"),
             "OK served\n",
             "a healthy listener serves"
         );
 
-        // Wedge generation 0: connections now sit in the kernel queue.
+        // Wedge generation 0: connections now sit in the kernel queue — once
+        // its thread has seen the wedge (see `Seams::withholding`).
         seams.withhold.store(0, Ordering::Release);
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the accept thread to reach its withhold check",
+            || (seams.withholding.load(Ordering::Acquire) == 0).then_some(()),
+        );
         let inode_before = socket_file_id(path.to_str().expect("utf8"));
-        let wedged_at = Instant::now();
         let queued = CtlStream::connect(&path).expect("connect into the wedged queue");
-        queued
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("deadline");
+        arm(&queued, aterm_spec::wait::MUST_HAPPEN).expect("deadline");
 
         // The queued client is released when the retired socket closes (reset
         // or EOF) — not served, and not left for 900 s.
         let mut sink = String::new();
         let released = (&queued).read_to_string(&mut sink);
-        let waited = wedged_at.elapsed();
         assert!(
             released.is_err() || sink.is_empty(),
             "the wedged socket served a peer it was withholding: {sink:?}"
         );
-        assert!(
-            waited < WEDGE_AFTER + TICK * 4,
-            "the wedge took {waited:?} to be repaired"
-        );
 
-        assert_eq!(served_within(&path, Duration::from_secs(10)), "OK served\n");
+        assert_eq!(served_after_rebind(&path, inode_before), "OK served\n");
         assert_rebound_owner_only(&path, inode_before);
         assert!(HEALTH.rebinds.load(Ordering::Relaxed) > rebinds_before);
 
@@ -1004,7 +1491,7 @@ mod tests {
         let (stop, seams, thread) = supervised(&path);
         let rebinds_before = HEALTH.rebinds.load(Ordering::Relaxed);
         assert_eq!(
-            ask(&path, Duration::from_secs(5)).expect("healthy ask"),
+            ask(&path, aterm_spec::wait::MUST_HAPPEN).expect("healthy ask"),
             "OK served\n",
             "a healthy listener serves"
         );
@@ -1014,37 +1501,29 @@ mod tests {
         // connected: a thread already past its park check would drain the
         // queue and serve it (see `Seams::parked`).
         seams.park.store(0, Ordering::Release);
-        let parked_by = Instant::now() + Duration::from_secs(10);
-        while seams.parked.load(Ordering::Acquire) != 0 {
-            assert!(
-                Instant::now() < parked_by,
-                "generation 0 never reached its park"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let inode_before = socket_file_id(path.to_str().expect("utf8"));
-        let wedged_at = Instant::now();
-        let queued = CtlStream::connect(&path).expect("connect into the stuck queue");
-
-        assert_eq!(served_within(&path, Duration::from_secs(12)), "OK served\n");
-        let repaired = wedged_at.elapsed();
-        eprintln!("a stuck accept thread was replaced after {repaired:?}");
-        assert!(
-            repaired < WEDGE_AFTER + TICK * 5,
-            "the stuck listener took {repaired:?} to be replaced"
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "generation 0 to reach its park",
+            || (seams.parked.load(Ordering::Acquire) == 0).then_some(()),
         );
+        let inode_before = socket_file_id(path.to_str().expect("utf8"));
+        let queued = CtlStream::connect(&path).expect("connect into the stuck queue");
+        // Armed while nothing can serve it: once the park is released below,
+        // the retired thread may answer and close before an arm made then.
+        arm(&queued, aterm_spec::wait::MUST_HAPPEN).expect("deadline");
+
+        assert_eq!(served_after_rebind(&path, inode_before), "OK served\n");
         assert_rebound_owner_only(&path, inode_before);
         assert!(HEALTH.rebinds.load(Ordering::Relaxed) > rebinds_before);
 
         // The stuck call returns at last: the retired thread serves the client
         // its socket held rather than dropping it.
         seams.park.store(u64::MAX, Ordering::Release);
-        queued
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("deadline");
-        let mut reply = String::new();
-        let _ = (&queued).read_to_string(&mut reply);
-        assert_eq!(reply, "OK served\n", "the retired thread served its queue");
+        assert_eq!(
+            read_reply(&queued).expect("the retired thread's answer"),
+            "OK served\n",
+            "the retired thread served its queue"
+        );
 
         stop.store(true, Ordering::Release);
         thread.join().expect("supervisor thread");
@@ -1115,6 +1594,53 @@ mod tests {
             watch.observe(reading(16, 0, Some(5)), at(16)),
             Some(Wedge::Stalled { .. })
         ));
+    }
+
+    /// A RETIRE REACHES A CLIENT THAT HALF-CLOSED after its request (`printf …
+    /// | nc -U`, parked in a verb) and counts it, beside one that did not. The
+    /// accepted ends stay held, as a lane holds them, so only the shutdown can
+    /// end either connection; the listener is gone first, as `retire` closes
+    /// it before this runs.
+    ///
+    /// NEGATIVE CONTROL (run by restoring the both-ways `shutdown`): Darwin
+    /// refused it for the half-closed connection, whose read half the client's
+    /// half-close had shut (ENOTCONN, as for a listening socket), and shut
+    /// nothing — that client read `WouldBlock`, not its end-of-file, and the
+    /// count was 1.
+    #[test]
+    fn shutting_accepted_connections_down_reaches_a_client_that_half_closed() {
+        let dir = scratch();
+        let path = dir.path().join("h.sock");
+        let listener = CtlListener::bind(&path).expect("bind");
+        let open = CtlStream::connect(&path).expect("connect");
+        let (open_held, _) = listener.accept().expect("accept");
+        let half_closed = CtlStream::connect(&path).expect("connect");
+        let (half_closed_held, _) = listener.accept().expect("accept");
+        (&half_closed)
+            .write_all(b"AUTH ok\nawait idle\n")
+            .expect("the request");
+        half_closed
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the client half-closes after its request");
+        drop(listener);
+
+        assert_eq!(
+            shutdown_accepted(&[path]),
+            2,
+            "both accepted connections are shut down"
+        );
+        for (client, what) in [
+            (&open, "the open client"),
+            (&half_closed, "the half-closed client"),
+        ] {
+            client.set_nonblocking(true).expect("non-blocking");
+            assert_eq!(
+                (&*client).read(&mut [0u8; 16]).map_err(|e| e.kind()),
+                Ok(0),
+                "{what} reads its end-of-file"
+            );
+        }
+        drop((open_held, half_closed_held));
     }
 
     /// A rebind never takes over an endpoint this process no longer owns: when

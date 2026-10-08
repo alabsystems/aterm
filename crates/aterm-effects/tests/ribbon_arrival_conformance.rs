@@ -1,27 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE REAL WITNESS WRITES THE ARRIVAL EVIDENCE ITS MODEL STATES**
-//! (2026-09-26). Tier-1 for `aterm-spec`'s `ribbon_arrival_evidence_model`
-//! (`RibbonArrivalEvidence`): the writer half of the follow pass. The
-//! reader (`tests/ribbon_follow_conformance.rs`) decides a follow from
-//! whether each record's glyph ARRIVED at the target; this binds what the
-//! witness has WRITTEN by the time it asks — through the arm and every walk
-//! of the record's life, the target row seen holding the record's glyph,
-//! something else, or not sampled, at frames one or two time units apart.
+//! The real witness writes the arrival evidence its model states: Tier-1 for
+//! `aterm-spec`'s `ribbon_arrival_evidence_model` (`RibbonArrivalEvidence`),
+//! the writer half of the follow pass. The reader
+//! (`tests/ribbon_follow_conformance.rs`) decides a follow from whether each
+//! record's glyph arrived at the target; this binds what the witness has
+//! written by then, through the arm and every walk of the record's life (the
+//! target row seen holding the glyph, something else, or not sampled, at
+//! frames one or two time units apart).
 //!
-//! Every trace of the model up to its bound (`T = 5` units of 20 ms,
-//! `TWIN_MIN` being 40 ms) is replayed on the REAL witness: a three-glyph
-//! run armed on row 5 with row 4 sampled per the trace's arm, walked at each
-//! frame's wall time with row 4 per the frame, then the run's own row
-//! blanked and its text standing on row 4 — the move, or the erase under a
-//! copy. The follow pass must name the run exactly where the model's writer
-//! says the glyphs ARRIVED (`clear == 1 && twin == 0`), and every invariant
-//! must hold on the model's state. The negative control replays the fzf
-//! false follow the 2026-09-23 writer made (`Buggy = 1`): on the traces
-//! where a copy landed beside the standing line and stood 40 ms, that
-//! writer says ARRIVED where the real witness refuses — the bind is not
-//! vacuous, and it would have caught the defect.
+//! Every model trace up to its bound (`T = 5` units of 20 ms, `TWIN_MIN`
+//! being 40 ms) is replayed on the real witness: a three-glyph run armed on
+//! row 5 with row 4 sampled per the trace's arm, walked at each frame's wall
+//! time with row 4 per the frame, then the run's own row blanked and its text
+//! standing on row 4 (the move, or the erase under a copy). The follow pass
+//! must name the run exactly where the model says the glyphs arrived
+//! (`clear == 1 && twin == 0`), and every invariant must hold. The negative
+//! control (`Buggy = 1`, a twin recorded only at arm) says arrived where the
+//! real witness refuses, for a copy that landed beside the standing line and
+//! stood 40 ms (fzf's list under its query).
 
 use std::time::{Duration, Instant};
 
@@ -214,11 +212,10 @@ fn the_real_witness_writes_the_arrival_evidence_on_every_trace() {
     );
 }
 
-/// **THE NEGATIVE CONTROL**: the 2026-09-23 writer (`Buggy = 1`, a twin only
-/// at arm) disagrees with the real witness on the traces where a copy
-/// appeared beside the standing line and stood `TWIN_MIN` — fzf's list
-/// landing under the query — and on no trace where the copy was there at
-/// arm: the real witness is the contract, not the old writer.
+/// Negative control: the arm-only twin writer (`Buggy = 1`) disagrees with the
+/// real witness on traces where a copy appeared beside the standing line and
+/// stood `TWIN_MIN` (fzf's list landing under the query), and on no trace
+/// where the copy was there at arm.
 #[test]
 fn the_2026_09_23_writer_is_caught_on_the_copies_that_stood() {
     let model = ribbon_arrival_evidence_model();

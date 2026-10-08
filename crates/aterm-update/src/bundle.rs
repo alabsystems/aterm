@@ -19,28 +19,21 @@ pub struct Bundle {
 /// replace. `<string>true</string>`; any other value, or absence, is a normal
 /// install. Stamped by `tools/dev-app.sh` (its `--no-pin` omits it).
 ///
-/// Layout alone cannot tell a dev build from a release: [`resolve_from`] checks only
-/// the `.app` path shape, so a locally built binary installed to `/Applications` is
-/// indistinguishable from a cut one. The gap is not theoretical — the update gate is
-/// a BUILD NUMBER comparison (`github.rs`), and a dev build's number is HEAD's
-/// committer epoch, so a build from an older commit sits below the channel head and
-/// the next background check silently replaces the build you are testing, with no
-/// prompt. This key is the explicit signal.
+/// Layout alone cannot tell a dev build from a release, and the update gate is a
+/// BUILD NUMBER comparison (`github.rs`) against a dev build's HEAD-committer-epoch
+/// number, so without this mark a background check would silently replace an older
+/// commit's build under test.
 ///
 /// It lives in `Info.plist` because that file is codesign-sealed: editing it to fake
-/// or strip the mark invalidates the signature (verified: `codesign --verify` then
-/// reports "invalid Info.plist (plist or signature have been modified)"), so the
-/// mark is tamper-evident rather than advisory.
+/// or strip the mark invalidates the signature, so the mark is tamper-evident.
 pub const DEV_BUILD_KEY: &str = "<key>ATermDevBuild</key>";
 
 /// Whether an `Info.plist`'s text marks a dev build. Pure, so the contract is
 /// unit-testable without a bundle on disk.
 ///
 /// Fails **open** (not a dev build) on anything unclear — absent key, empty or
-/// non-`true` value, binary/unreadable plist. The mark only ever ADDS inertness to a
-/// bundle that explicitly carries it; a corrupt plist must never silently switch a
-/// normal install's updates off, which is the silent-stranding failure class this
-/// crate exists to avoid.
+/// non-`true` value, binary/unreadable plist: a corrupt plist must never silently
+/// switch a normal install's updates off.
 #[must_use]
 pub fn plist_marks_dev_build(text: &str) -> bool {
     crate::manifest::xml_plist_string(text, DEV_BUILD_KEY)
@@ -48,10 +41,8 @@ pub fn plist_marks_dev_build(text: &str) -> bool {
 }
 
 /// Read the dev mark off a bundle on disk. Unreadable ⇒ false (see
-/// [`plist_marks_dev_build`] for why the failure direction is open). Bounded like
-/// every other small file the updater consults (`read_ledger_text`): a plist over
-/// the cap is "unreadable", never unbounded work — the S12 `which_copy` report asks
-/// this of the running bundle on every `--version` and About open.
+/// [`plist_marks_dev_build`] for why the failure direction is open). Bounded
+/// (`read_ledger_text`): `which_copy` asks this on every `--version` and About open.
 pub(crate) fn is_dev_marked(app_root: &Path) -> bool {
     crate::read_ledger_text(&app_root.join("Contents/Info.plist"))
         .is_some_and(|text| plist_marks_dev_build(&text))
@@ -62,12 +53,11 @@ pub(crate) fn is_dev_marked(app_root: &Path) -> bool {
 /// descriptors of more sessions than one `SCM_RIGHTS` message carries, sent over
 /// several. Its value is the capability's token, [`HANDOFF_GRANT_CHUNKS_TOKEN`].
 ///
-/// A DECLARED CAPABILITY, NOT A POLICY KNOB. An outgoing build reads it from a
-/// candidate only after that candidate's signature, sealed identity and
-/// authorization have all been verified (the handoff pre-verify), so it is
-/// codesign-sealed evidence of what the candidate's code does — never a way to
-/// relax a check. Absent, empty, any other value or an unreadable plist all read
-/// as "not declared", which leaves the handoff exactly as it was.
+/// A DECLARED CAPABILITY, NOT A POLICY KNOB: read only after the candidate's
+/// signature, sealed identity and authorization verified (the handoff pre-verify),
+/// so it is sealed evidence of what the candidate's code does, never a way to relax
+/// a check. Anything but the exact token reads as "not declared"; a read the system
+/// refused FOR NOW is no answer at all ([`declares_grant_chunks`]).
 pub const HANDOFF_GRANT_CHUNKS_KEY: &str = "<key>ATermHandoffGrantChunks</key>";
 
 /// The value [`HANDOFF_GRANT_CHUNKS_KEY`] carries in a bundle that reads chunked
@@ -83,11 +73,36 @@ pub fn plist_declares_grant_chunks(text: &str) -> bool {
         .is_some_and(|value| value == HANDOFF_GRANT_CHUNKS_TOKEN)
 }
 
-/// Read the chunked-grant declaration off a bundle on disk. Unreadable ⇒ false.
-/// Called only on a bundle whose signature has just been verified.
-pub(crate) fn declares_grant_chunks(app_root: &Path) -> bool {
-    crate::read_ledger_text(&app_root.join("Contents/Info.plist"))
-        .is_some_and(|text| plist_declares_grant_chunks(&text))
+/// Read the chunked-grant declaration off a bundle on disk. Called only on a
+/// bundle whose signature has just been verified.
+///
+/// `Err` is a read the system refused FOR NOW ([`grant_chunks_judged`]): the
+/// caller refuses the pre-verification as a passing condition rather than cache
+/// "not declared" with the candidate's pass.
+pub(crate) fn declares_grant_chunks(app_root: &Path) -> Result<bool, String> {
+    let path = app_root.join("Contents/Info.plist");
+    grant_chunks_judged(&path, crate::read_ledger_text_checked(&path))
+}
+
+/// What the read of the `Info.plist` at `path` says about the chunked grant.
+///
+/// A MOMENT IS NOT A VERDICT: a read the system refused just then (`EMFILE`, `EIO`,
+/// `ENOMEM`: [`aterm_update_core::handoff_policy::is_momentary_read_error`]) never
+/// reached the bytes, and caching it as "not declared" with the pass would deny a
+/// capable candidate the chunked grant for the cache's life. `Err` names it; an
+/// error the same file would give again (`EACCES`, a FIFO, over the cap, not UTF-8)
+/// stays "not declared".
+pub(crate) fn grant_chunks_judged(
+    path: &Path,
+    read: std::io::Result<Option<String>>,
+) -> Result<bool, String> {
+    match read {
+        Ok(text) => Ok(text.is_some_and(|text| plist_declares_grant_chunks(&text))),
+        Err(error) if aterm_update_core::handoff_policy::is_momentary_read_error(&error) => {
+            Err(format!("{}: unreadable: {error}", path.display()))
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 /// Resolve the installed bundle the updater **may replace**, or `None` when it must
@@ -126,9 +141,8 @@ pub fn resolve() -> Option<Bundle> {
 ///
 /// Anything that STAGES or APPLIES goes through [`resolve`].
 pub fn resolve_layout() -> Option<Bundle> {
-    // Canonicalization here is deliberate symlink-shim resolution (a
-    // `/usr/local/bin/aterm` launcher resolves to the real bundle executable),
-    // not an identity comparison.
+    // Deliberate symlink-shim resolution (a `/usr/local/bin/aterm` launcher names
+    // the real bundle executable), not an identity comparison.
     let exe = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
     resolve_from(&exe)
 }
@@ -199,27 +213,146 @@ pub(crate) fn layout_of(exe: &Path) -> Option<Bundle> {
     })
 }
 
+/// What probing the bundle's PARENT for a write answered ([`probe_parent_write`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParentWrite {
+    /// An entry was created there: the swap's renames can land.
+    Writable,
+    /// This user may not write there — `EACCES`/`EPERM` (an admin-owned or
+    /// MDM-managed `/Applications`), `EROFS` (a read-only volume) — or the error
+    /// is one that answers the same way every time. A person's to clear.
+    NotWritable(String),
+    /// The folder may well be writable, but the write failed for a reason of this
+    /// MOMENT: a full disk (`ENOSPC`), a quota (`EDQUOT`), an I/O error (`EIO`), an
+    /// interrupted call, or leftover probe names past every fresh one tried.
+    /// Retried, never a person's.
+    Passing(String),
+}
+
+/// How many fresh probe names [`probe_parent_write`] tries past a name that is
+/// already taken (a probe a killed process left behind, a sibling mid-probe).
+const PROBE_NAMES: u32 = 8;
+
 /// Whether we can replace the bundle in place: the swap operates in the bundle's
 /// **parent** directory, so that parent must be writable. Probe it directly by
 /// creating + removing a temp entry (more accurate than an `access()` mode guess,
 /// which misreads ACL- and MDM-managed `/Applications`).
-pub fn parent_writable(app_root: &Path) -> bool {
+///
+/// ONLY A REFUSED WRITE IS "NOT WRITABLE": otherwise the pre-park gate would tell a
+/// person to move the app over a full disk or a leftover probe. A taken name is
+/// probed again under a fresh one; error kinds are split by [`classify_probe_error`].
+pub fn probe_parent_write(app_root: &Path) -> ParentWrite {
     let Some(parent) = app_root.parent() else {
-        return false;
+        return ParentWrite::NotWritable(format!("{} has no parent folder", app_root.display()));
     };
-    let probe = parent.join(format!(".aterm-update-probe-{}", std::process::id()));
-    match std::fs::create_dir(&probe) {
-        Ok(()) => {
-            let _ = std::fs::remove_dir(&probe);
-            true
+    let pid = std::process::id();
+    let mut last_taken = None;
+    for attempt in 0..=PROBE_NAMES {
+        let name = if attempt == 0 {
+            format!(".aterm-update-probe-{pid}")
+        } else {
+            format!(".aterm-update-probe-{pid}-{attempt}")
+        };
+        let probe = parent.join(name);
+        match std::fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&probe);
+                return ParentWrite::Writable;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_taken = Some(probe);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return classify_probe_error(parent, &error),
         }
-        Err(_) => false,
+    }
+    ParentWrite::Passing(format!(
+        "every probe name in {} was already taken (last {})",
+        parent.display(),
+        last_taken.map_or_else(String::new, |probe| probe.display().to_string())
+    ))
+}
+
+/// The verdict a failed probe `create_dir` in `parent` carries. A PERMISSION
+/// answer (`EACCES`, `EPERM`, `EROFS`) is the person's; a MOMENT (`ENOSPC`,
+/// `EDQUOT`, `EIO`, `EINTR`, and the process-table/descriptor/memory moments
+/// [`crate::verify::io_error_is_passing`] names) is passing. Anything else is not
+/// writable, since it answers the same way on every try.
+pub(crate) fn classify_probe_error(parent: &Path, error: &std::io::Error) -> ParentWrite {
+    let message = format!("create a probe in {}: {error}", parent.display());
+    let passing = matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSPC | libc::EDQUOT | libc::EIO | libc::EINTR)
+    ) || crate::verify::io_error_is_passing(error);
+    if passing {
+        ParentWrite::Passing(message)
+    } else {
+        ParentWrite::NotWritable(message)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a refused write is the person's; a full disk, a quota or an I/O error
+    /// is a moment.
+    #[test]
+    fn a_probe_error_is_the_person_s_only_when_the_write_was_refused() {
+        let parent = Path::new("/Applications");
+        for errno in [libc::EACCES, libc::EPERM, libc::EROFS] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                matches!(
+                    classify_probe_error(parent, &error),
+                    ParentWrite::NotWritable(_)
+                ),
+                "{error}"
+            );
+        }
+        for errno in [
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EIO,
+            libc::EINTR,
+            libc::EMFILE,
+        ] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                matches!(
+                    classify_probe_error(parent, &error),
+                    ParentWrite::Passing(_)
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    /// A probe a killed launch left behind is not "not writable": the probe takes
+    /// a fresh name. And a folder this user cannot write still says so.
+    #[test]
+    fn a_leftover_probe_name_is_probed_again_under_a_fresh_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "aterm-update-probe-parent-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let app = root.join("aterm.app");
+        std::fs::create_dir_all(&app).unwrap();
+        let leftover = root.join(format!(".aterm-update-probe-{}", std::process::id()));
+        std::fs::create_dir(&leftover).unwrap();
+        assert_eq!(probe_parent_write(&app), ParentWrite::Writable);
+        assert!(leftover.is_dir(), "the leftover is not ours to remove");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let refused = probe_parent_write(&app);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(refused, ParentWrite::NotWritable(_)),
+            "{refused:?}"
+        );
+    }
 
     #[test]
     fn resolves_canonical_app_layout() {
@@ -387,6 +520,14 @@ mod tests {
         assert!(
             resolve_from(Path::new(
                 "/Volumes/aterm 0.2.0/aterm.app/Contents/MacOS/aterm"
+            ))
+            .is_none()
+        );
+        // An install on an external disk is refused too, which keeps an ejected
+        // volume out of the boot trial's ownership rule.
+        assert!(
+            resolve_from(Path::new(
+                "/Volumes/Ext/Applications/aterm.app/Contents/MacOS/aterm"
             ))
             .is_none()
         );

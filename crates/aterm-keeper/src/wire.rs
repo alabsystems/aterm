@@ -20,6 +20,8 @@
 //! REGISTER or an OFFER carries travels beside the header (`fdpass`), and the
 //! codec only says which kinds may carry one ([`Kind::carries_fd`]).
 
+use crate::identity::IdentityPolicy;
+
 /// The magic every frame opens with.
 pub const MAGIC: [u8; 4] = *b"AKP1";
 /// The header's size.
@@ -250,6 +252,23 @@ impl PeerClass {
     }
 }
 
+/// A WELCOME's policy byte. Numbers are the wire's and never change.
+fn policy_byte(policy: IdentityPolicy) -> u8 {
+    match policy {
+        IdentityPolicy::SameUid => 1,
+        IdentityPolicy::Designated => 2,
+    }
+}
+
+/// The policy a WELCOME's byte names; `None` for one this build does not know.
+fn policy_from_byte(b: u8) -> Option<IdentityPolicy> {
+    match b {
+        1 => Some(IdentityPolicy::SameUid),
+        2 => Some(IdentityPolicy::Designated),
+        _ => None,
+    }
+}
+
 /// A decoded frame body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
@@ -258,14 +277,21 @@ pub enum Frame {
         class: PeerClass,
         caps: u8,
         build: String,
-        /// The window's crash marker (grown after P3: an older window's HELLO
-        /// ends before it, and an older keeper ignores it).
+        /// The window's crash marker (appended: an older window's HELLO ends
+        /// before it, and an older keeper ignores it).
         marker: Option<MarkerRef>,
     },
     Welcome {
         proto: u16,
         offers: u16,
         version: String,
+        /// The identity the keeper requires of its peers (grown after 0.101:
+        /// an older keeper's WELCOME ends before it, and is `None`, as is a
+        /// policy byte this build does not know). A window that checks code
+        /// registers nothing with a keeper that does not state `Designated`
+        /// (§5.7): a keeper at the same-uid floor offers a crashed window's
+        /// masters to any same-uid process.
+        identity: Option<IdentityPolicy>,
     },
     Register {
         header: MasterHeader,
@@ -384,10 +410,14 @@ impl Frame {
                 proto,
                 offers,
                 version,
+                identity,
             } => {
                 body.extend_from_slice(&proto.to_be_bytes());
                 body.extend_from_slice(&offers.to_be_bytes());
                 put_short(&mut body, version.as_bytes(), MAX_LABEL, kind)?;
+                if let Some(policy) = identity {
+                    body.push(policy_byte(*policy));
+                }
             }
             Frame::Register { header, tag } => {
                 put_header(&mut body, header);
@@ -460,6 +490,13 @@ impl Frame {
                 proto: r.u16()?,
                 offers: r.u16()?,
                 version: r.short_str(MAX_LABEL)?,
+                // The growth rule: a WELCOME that ends here is an older
+                // keeper's, which states no policy.
+                identity: if r.at < body.len() {
+                    policy_from_byte(r.u8()?)
+                } else {
+                    None
+                },
             },
             Kind::Register => Frame::Register {
                 header: r.master_header()?,
@@ -639,6 +676,20 @@ mod tests {
             proto: PROTO,
             offers: 3,
             version: "0.98.0".into(),
+            identity: Some(IdentityPolicy::Designated),
+        });
+        round(Frame::Welcome {
+            proto: PROTO,
+            offers: 0,
+            version: "0.98.0".into(),
+            identity: Some(IdentityPolicy::SameUid),
+        });
+        // An older keeper's WELCOME: no policy byte.
+        round(Frame::Welcome {
+            proto: PROTO,
+            offers: 0,
+            version: "0.98.0".into(),
+            identity: None,
         });
         round(Frame::Register {
             header: header(),
@@ -754,7 +805,7 @@ mod tests {
         .encode()
         .expect("encode");
         let body = &old[HEADER_LEN..];
-        // Exactly the P3 layout: proto, class, caps, build.
+        // Exactly the pre-marker layout: proto, class, caps, build.
         assert_eq!(body.len(), 2 + 1 + 1 + 1 + "0.97.0".len());
         let mut h = [0u8; HEADER_LEN];
         h.copy_from_slice(&old[..HEADER_LEN]);

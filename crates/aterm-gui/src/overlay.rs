@@ -7,7 +7,7 @@
 //! `WindowState` (whose mutual exclusion had to be enforced by hand, and whose on_key gate
 //! ordering was a latent "hidden overlay swallows keys" bug), they collapse into one
 //! [`Overlay`] enum. Mutual exclusion is now STRUCTURAL — one slot can only hold one
-//! variant. Settings exists here only under `cfg(test)`; shipping Settings is a native tab.
+//! variant. Settings is not one of them: shipping Settings is a native tab.
 //!
 //! Each variant's model fans out to the SAME paint/lifecycle observers through the
 //! [`OverlayModel`] trait: pixels ([`OverlayModel::tray`]), the repaint fingerprint
@@ -22,9 +22,7 @@ use crate::conn_card::ConnCardState;
 use crate::connection_map::ConnectionMapState;
 use crate::palette::PaletteState;
 use crate::session_picker::SessionPickerState;
-#[cfg(test)]
-use crate::settings::SettingsState;
-use crate::settings::{PreviewCtx, SettingsGeom};
+use crate::settings::SettingsGeom;
 use crate::widget::TrayInput;
 
 /// The paint/lifecycle contract shared by every overlay surface. `tray` and
@@ -41,11 +39,9 @@ pub(crate) trait OverlayModel {
 
     /// Paint the surface as a [`TrayInput`] card of pure [`crate::widget::DrawPrim`]s
     /// — the PIXELS, captured WYSIWYG through the SACRED `composite_tray` path.
-    /// (Settings/Palette paint a frosted top band; a floating card returns its own rect
+    /// (Palette paints a frosted top band; a floating card returns its own rect
     /// in the `TrayInput`, which tells the splice where.)
-    /// `ctx` carries App-tracked host facts the pure painters cannot know: Settings
-    /// reads the OS appearance; Palette ignores it.
-    fn tray(&self, geom: &SettingsGeom, theme: Theme, ctx: PreviewCtx) -> TrayInput;
+    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput;
 
     /// The `controls front` truncation signal: `(scroll, total, visible)` — rows scrolled
     /// past the top, the full model row count, and rows actually shown on the card. Read
@@ -61,32 +57,6 @@ pub(crate) trait OverlayModel {
     fn a11y(&self) -> accesskit::TreeUpdate;
 }
 
-/// The retired Settings card: an overlay that occupies its rows and consumes input but
-/// paints, scrolls and publishes nothing. It exists only because `cfg(test)` code still
-/// opens [`Overlay::Settings`] as a generic modal.
-#[cfg(test)]
-impl OverlayModel for SettingsState {
-    fn fingerprint(&self) -> u64 {
-        1
-    }
-    fn wanted_rows(&self, avail: usize) -> usize {
-        crate::settings::wanted_rows(&self.fields).min(avail)
-    }
-    fn tray(&self, _geom: &SettingsGeom, _theme: Theme, _ctx: PreviewCtx) -> TrayInput {
-        TrayInput {
-            prims: Vec::new(),
-            card: (0.0, 0.0, 0.0, 0.0),
-        }
-    }
-    fn scroll_extent(&self) -> (usize, usize, usize) {
-        (0, 0, 0)
-    }
-    #[cfg(a11y_tree)]
-    fn a11y(&self) -> accesskit::TreeUpdate {
-        crate::accesskit_tree::empty_tree()
-    }
-}
-
 impl OverlayModel for PaletteState {
     fn fingerprint(&self) -> u64 {
         PaletteState::fingerprint(self)
@@ -96,7 +66,7 @@ impl OverlayModel for PaletteState {
         // viewport. `palette_layout` retains the natural command-row height.
         avail
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
+    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput {
         crate::palette::palette_tray(self, geom, theme)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
@@ -116,7 +86,7 @@ impl OverlayModel for ConnCardState {
         // Anchored like the tab menu — `conn_card_layout` sizes the card.
         ConnCardState::wanted_rows(self, avail)
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
+    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput {
         crate::conn_card::conn_card_tray(self, geom, theme)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
@@ -137,7 +107,7 @@ impl OverlayModel for ConnectionMapState {
         // and `map_layout` content-sizes the card within it.
         avail
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
+    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput {
         crate::connection_map::map_tray(self, geom, theme)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
@@ -158,7 +128,7 @@ impl OverlayModel for SessionPickerState {
         // and `picker_layout` content-sizes the card within it.
         avail
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
+    fn tray(&self, geom: &SettingsGeom, theme: Theme) -> TrayInput {
         crate::session_picker::picker_tray(self, geom, theme)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
@@ -174,8 +144,6 @@ impl OverlayModel for SessionPickerState {
 /// `settings_card` cache key (so two surfaces never share a cache line).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OverlayKind {
-    #[cfg(test)]
-    Settings,
     Palette,
     /// The anchored connection confirm/configure card (design §3.3 + §2.5).
     ConnCard,
@@ -193,8 +161,6 @@ impl OverlayKind {
     /// -> `controls <kind>`. Palette maps to `"menu"` (its `AuxTarget`).
     pub(crate) fn keyword(self) -> &'static str {
         match self {
-            #[cfg(test)]
-            OverlayKind::Settings => "settings",
             OverlayKind::Palette => "menu",
             OverlayKind::ConnCard => "conn-card",
             OverlayKind::SessionPicker => "session-picker",
@@ -207,10 +173,6 @@ impl OverlayKind {
 /// mutual exclusion is structural (a slot holds one value), replacing the old
 /// hand-maintained "clear the other two" dance.
 pub(crate) enum Overlay {
-    /// Retired Settings-card representation, retained only for the legacy model and
-    /// input regression tests. Shipping Settings is always a native tab app.
-    #[cfg(test)]
-    Settings(SettingsState),
     Palette(PaletteState),
     /// The connection confirm/configure card (design §3.3 + §2.5) — ONE shared
     /// component behind the drop popover and the Configure… sheet, anchored
@@ -236,8 +198,6 @@ impl Overlay {
         // wrapper folds in the variant tag + forces non-zero.
         let inner = self.model().fingerprint();
         let tag: u64 = match self {
-            #[cfg(test)]
-            Overlay::Settings(_) => 1,
             Overlay::Palette(_) => 3,
             Overlay::ConnCard(_) => 5,
             Overlay::SessionPicker(_) => 6,
@@ -250,8 +210,6 @@ impl Overlay {
     /// and repaint fingerprint fan out from.
     pub(crate) fn model(&self) -> &dyn OverlayModel {
         match self {
-            #[cfg(test)]
-            Overlay::Settings(s) => s,
             Overlay::Palette(p) => p,
             Overlay::ConnCard(c) => c,
             Overlay::SessionPicker(p) => p,
@@ -262,8 +220,6 @@ impl Overlay {
     /// Which surface this slot holds.
     pub(crate) fn kind(&self) -> OverlayKind {
         match self {
-            #[cfg(test)]
-            Overlay::Settings(_) => OverlayKind::Settings,
             Overlay::Palette(_) => OverlayKind::Palette,
             Overlay::ConnCard(_) => OverlayKind::ConnCard,
             Overlay::SessionPicker(_) => OverlayKind::SessionPicker,

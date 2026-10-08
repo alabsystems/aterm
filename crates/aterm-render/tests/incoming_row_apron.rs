@@ -164,11 +164,10 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
         rows_of(&oracle, y1 - ch, n),
         "the gate-hit re-present paints the incoming row's top {n} px"
     );
-    // THE PRESENTER READS WHAT THE RENDER HANDED BACK (audit, 2026-09-24): the
-    // CPU window ends the exclusive render borrow and re-borrows the pixels, and
-    // it re-borrowed the untranslated CACHE — throwing the band shift and this
-    // strip away, so the CPU backend scrolled in whole-row jumps. The shared
-    // re-borrow is the translated frame, and it says it is one.
+    // THE PRESENTER READS WHAT THE RENDER HANDED BACK: the CPU window ends the
+    // exclusive render borrow and re-borrows the pixels; re-borrowing the
+    // untranslated cache would drop the band shift and this strip (whole-row
+    // scroll jumps). The shared re-borrow is the translated frame, and says so.
     assert!(
         wc.last_translated(),
         "a sub-row frame is a translated frame"

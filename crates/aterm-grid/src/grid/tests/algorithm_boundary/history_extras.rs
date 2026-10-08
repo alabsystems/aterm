@@ -63,9 +63,7 @@ fn history_line_api_covers_tiered_scrollback_ordering() {
     assert!(grid.history_line_rev(3).is_none());
 }
 
-// ========================================================================
 // Complex char overflow and cell extras
-// ========================================================================
 
 #[test]
 fn set_cell_complex_char_stores_overflow_string() {
@@ -109,8 +107,7 @@ fn cell_extra_mut_creates_and_updates_extra_data() {
     assert_eq!(stored.underline_color(), Some([0x12, 0x34, 0x56]));
 }
 
-// Algorithm audit: CellExtras shift_region boundary conditions
-// ========================================================================
+// CellExtras shift_region boundary conditions
 
 /// shift_region_up on a single-row region (top == bottom) should delete the row's extras
 /// and not move anything (there's nothing below to shift up).

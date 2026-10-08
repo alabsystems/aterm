@@ -58,13 +58,13 @@ pub struct Published {
     pub text: String,
 }
 
-/// Scan the channel's release metadata via the API (≤10 pages of 100 — the client's
-/// own caps) before downloading any manifest. `stop_early` is the exact updater
-/// replay: only a published (non-draft, non-prerelease) release carrying
-/// `aterm-appcast.toml` is eligible, the greatest canonical numeric
-/// `vMAJOR.MINOR.PATCH` tag is authoritative independent of REST row order (retired
-/// two-component tags are skipped, exactly as the client skips them), and exactly
-/// that one manifest is fetched. `stop_early: false` is the operator/history view:
+/// Scan the channel's release metadata via the API (≤10 pages of 100, a safety cap)
+/// before downloading any manifest. `stop_early` picks one: only a published
+/// (non-draft, non-prerelease) release carrying `aterm-appcast.toml` is eligible, the
+/// greatest canonical numeric `vMAJOR.MINOR.PATCH` tag is authoritative independent of
+/// REST row order (retired two-component tags are skipped), and exactly that one
+/// manifest is fetched. The client itself lists nothing: it reads only the
+/// `releases/latest` pointer, which the cut owns. `stop_early: false` is the operator/history view:
 /// every published release's appcast, the complete build set for status/yank.
 ///
 /// Every row is bound to its immutable release ID, the listing row to the snapshot,
@@ -273,8 +273,7 @@ fn release_identity_listing(
 /// `release.draft` guard, so `ship status`/`yank` succeed today. Handing the
 /// whole page to the strict parser would turn that unrelated release into a
 /// hard failure of a read-only command, so the strict parse is restricted to
-/// the rows the scan actually captured — precisely the set the per-ID re-reads
-/// this batch replaced used to touch.
+/// the rows the scan actually captured.
 ///
 /// Restricting the batch never loosens the check. For a captured ID the parse
 /// stays exactly as strict as the per-ID read was; a row whose own ID field is
@@ -309,10 +308,9 @@ struct ReleaseMetadata<'a> {
     release_id: Option<u64>,
     tag: &'a str,
     draft: bool,
-    /// A prerelease is published but is never the channel head: GitHub's `latest`
-    /// cannot name one and the deployed client skips it, so neither replay here
-    /// counts it. It matters since 2026-09-23: aterm's source release is created as
-    /// a prerelease and carries this cut's appcast for the moments between that
+    /// A prerelease is published but is never the channel head: GitHub's `latest` cannot name one
+    /// and the deployed client skips it, so neither replay here counts it. aterm's source release
+    /// is created as a prerelease and carries this cut's appcast for the moments between that
     /// upload and the cut's head PATCH.
     prerelease: bool,
     exact_count: usize,
@@ -646,7 +644,8 @@ pub fn derive_cut_mode(s: &RemoteState) -> Result<CutMode> {
             "v{version} is already published, and it is the version the newest published \
              source declares — publish the next one first: `pub bump aterm --minor --write` \
              on main (the next release is v{}), commit and push, then `pub stage aterm` and \
-             `pub publish aterm`, then cut; or retire a bad build with `{} yank <build>`",
+             `pub publish aterm`, then cut; or retire a bad build with `{} yank <build> \
+             --release-credentials <profile.toml> --mac-only|--linux-artifacts DIRECTORY`",
             publish::bump_minor_release(&version)?,
             publish::SHIP_COMMAND
         )));
@@ -932,8 +931,8 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
 /// `targo --unverified ship status` — version, ledger tail, dangling claims (ledger vs the
 /// channel) and latest published build (spec §5).
 /// `ship status`'s statement of what the next cut builds: the commit `pub publish`
-/// recorded, and the version IT declares — not this checkout's, which a cut no
-/// longer builds (2026-09-23). Informational: an unreadable ledger or commit is
+/// recorded, and the version IT declares — not this checkout's, which a cut does
+/// not build. Informational: an unreadable ledger or commit is
 /// said, never an error.
 fn next_cut_line(
     repo: &Path,
@@ -1438,21 +1437,17 @@ fn demote_yank_release_convergently(
 ///
 /// A yank's first act is a real, published cut — [`run_yank`] publishes the
 /// ratcheted successor before it deletes one byte — so it is held to every rule
-/// a cut is held to. It needed no inputs at all for as long as an unarmed tree
-/// signed from an ambient key and asked nobody anything. Arming the paper
-/// master (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`, 2026-08-15) changed
-/// what a publish requires:
+/// a cut is held to. With the paper master armed
+/// (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`),
 /// `publish::channel_signature_policy` refuses pre-claim when no signing material
 /// resolves at all, and the only material that resolves without the flag — the bare
 /// `~/.aterm/machine.key` fallback in `sign::ReleaseCredentials::resolve` — names no
 /// notarytool credential, so with `pins::APPLE_TEAM_ID` pinned
 /// `sign::resolve_apple_tier` refuses that machine's artifact anyway. Either way the
-/// profile has to be nameable. `yank` had no way to be told it, so the one command
-/// whose whole purpose is to retire a bad published build could not run at all on the
-/// armed tree: it refused inside its own successor cut, having published nothing and
-/// deleted nothing.
+/// profile has to be nameable, or the successor cut refuses and the yank cannot run.
 ///
-/// The remaining cut flags are deliberately absent rather than merely
+/// The Linux flags are forwarded too: the successor declares Linux as any cut
+/// must. The remaining cut flags are deliberately absent rather than merely
 /// unforwarded: `--dry-run`/`--rehearse` would leave no published successor to
 /// prove, `--resume` belongs to the journal (and [`run_yank`] already refuses an
 /// unfinished journaled cut outright), and `--min-build` is the yank's own
@@ -1464,10 +1459,17 @@ pub struct YankOptions {
     /// machine's provisioned identity — so an unarmed or single-machine tree
     /// still needs no flag.
     pub release_credentials: Option<PathBuf>,
+    /// The successor cut's Linux declaration, forwarded verbatim: the cut's
+    /// `--linux-artifacts DIRECTORY [--linux-target ARCH]... [--linux-worker
+    /// ARCH=HOST:REPO]...` or `--mac-only`. A yank must make one, as a cut must.
+    pub linux_artifacts: Option<PathBuf>,
+    pub linux_targets: Vec<String>,
+    pub linux_workers: Vec<String>,
+    pub mac_only: bool,
 }
 
 /// The successor cut a yank of a bad build must publish: the ratcheted floor
-/// plus the operator's signing inputs, and nothing else.
+/// plus the operator's signing inputs and Linux declaration, and nothing else.
 ///
 /// Pure, and split out of [`run_yank`], because the defect it fixes was a
 /// silently DROPPED field — a `..Default::default()` that quietly answered the
@@ -1477,6 +1479,10 @@ fn successor_cut_options(required_floor: u64, opts: &YankOptions) -> publish::Cu
     publish::CutOptions {
         min_build: Some(required_floor),
         release_credentials: opts.release_credentials.clone(),
+        linux_artifacts: opts.linux_artifacts.clone(),
+        linux_targets: opts.linux_targets.clone(),
+        linux_workers: opts.linux_workers.clone(),
+        mac_only: opts.mac_only,
         ..Default::default()
     }
 }
@@ -1486,10 +1492,8 @@ fn successor_cut_options(required_floor: u64, opts: &YankOptions) -> publish::Cu
 /// bound to the origin its Cargo.toml names. Cleanup-only yank resumes can mutate
 /// tags and releases without calling the fresh-cut ladder, so they need these too.
 ///
-/// NO BRANCH RULE (2026-09-23). Yank used to refuse off `main` because its successor
-/// cut was cut from the checkout; the successor now builds the published commit in
-/// the cut tree whatever this checkout holds, and the checkout never moves — so the
-/// rule protected nothing and refused a yank run from a detached or topic checkout.
+/// NO BRANCH RULE: the successor builds the published commit in the cut tree
+/// whatever this checkout holds, and the checkout never moves.
 fn yank_local_gates(
     git: &dyn ledger::GitRunner,
     slug: &str,
@@ -1736,7 +1740,8 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
             "{tag} is the channel's PUBLISHED app release — this cut's head PATCH landed, so \
              it is finished, not abandoned: `{} --resume` re-sends only that PATCH, proves \
              what a stranger sees and completes the journal (a bad build is then retired \
-             with `{} yank <build>`)",
+             with `{} yank <build> --release-credentials <profile.toml> --mac-only|--linux-artifacts \
+             DIRECTORY`)",
             publish::CUT_COMMAND,
             publish::SHIP_COMMAND
         )));
@@ -1818,11 +1823,12 @@ mod tests {
     /// `ship status`/`yank` succeed with it in the repo. Feeding the whole page
     /// to the strict identity parser would have made that unrelated release
     /// abort the batched recheck of the releases the scan DID capture.
+    ///
     /// A PRERELEASE is never the channel head — GitHub's `latest` cannot name one and
-    /// the deployed client skips it — and since 2026-09-23 aterm's source release is
-    /// one, carrying this cut's appcast between that upload and the cut's head PATCH.
-    /// Both replays skip it on the production five-field row; the negative control is
-    /// the same row published, which the client replay elects.
+    /// the deployed client skips it — and aterm's source release is one, carrying this
+    /// cut's appcast between that upload and the cut's head PATCH. Both replays skip it
+    /// on the production five-field row; the negative control is the same row
+    /// published, which the client replay elects.
     #[test]
     fn a_prerelease_carrying_an_appcast_is_never_the_head() {
         let appcast = |version: &str, build: u64| -> Result<Vec<u8>> {
@@ -1907,18 +1913,18 @@ mod tests {
         );
     }
 
-    /// The successor a yank publishes is a real cut, and since the paper master
-    /// was armed a real cut refuses pre-claim unless it is told WHICH profile
-    /// signs. That answer used to be dropped on the floor here, which made `cargo
-    /// ship yank` unable to publish anything at all on the armed tree. Nothing else
-    /// may leak in either: a yank's successor is always a real, published,
-    /// floor-ratcheted cut, never a dry run, a rehearsal, or a resume.
+    /// The successor a yank publishes is a real cut, and with the paper master armed
+    /// a real cut refuses pre-claim unless it is told WHICH profile signs, so the
+    /// answer must reach it. Nothing else may leak in either: a yank's successor is
+    /// always a real, published, floor-ratcheted cut, never a dry run, a rehearsal,
+    /// or a resume.
     #[test]
     fn the_successor_cut_carries_the_operators_signing_inputs_and_stays_a_real_cut() {
         let cut = successor_cut_options(
             1_783_918_102,
             &YankOptions {
                 release_credentials: Some(PathBuf::from("/keys/m3.toml")),
+                ..Default::default()
             },
         );
         assert_eq!(cut.min_build, Some(1_783_918_102));
@@ -1929,9 +1935,8 @@ mod tests {
         assert!(!cut.dry_run && !cut.resume && !cut.gate && !cut.arm64_only);
         assert!(cut.rehearse.is_none());
 
-        // A flagless yank must still ask for exactly the cut it always asked
-        // for, so an unarmed tree (and every fork with no master pinned) sees no
-        // behaviour change from the fix.
+        // A flagless yank asks for the plain real cut, so an unarmed tree (and every
+        // fork with no master pinned) needs no flag.
         assert_eq!(
             successor_cut_options(7, &YankOptions::default()),
             publish::CutOptions {
@@ -1942,16 +1947,31 @@ mod tests {
     }
 
     /// When the successor is handed to the published commit's own cutter, that
-    /// cutter is asked for a CUT carrying the yank's floor and signing inputs —
-    /// the handed-over argv parses back to exactly the successor's options.
+    /// cutter is asked for a CUT carrying the yank's floor, signing inputs and
+    /// Linux declaration — the handed-over argv parses back to exactly the
+    /// successor's options.
     #[test]
     fn a_handed_off_successor_is_a_cut_with_the_yanks_options_never_a_yank() {
         let successor = successor_cut_options(
             1_783_918_102,
             &YankOptions {
                 release_credentials: Some(PathBuf::from("/keys/m3.toml")),
+                linux_artifacts: Some(PathBuf::from("/handoff")),
+                linux_targets: vec!["aarch64-unknown-linux-gnu".into()],
+                linux_workers: vec!["aarch64=builder@buildhost:~/aterm".into()],
+                mac_only: false,
             },
         );
+        assert_eq!(
+            successor.linux_artifacts.as_deref(),
+            Some(Path::new("/handoff"))
+        );
+        // A Mac-only yank forwards that too: its successor is Mac-only on purpose.
+        let mac_only = YankOptions {
+            mac_only: true,
+            ..Default::default()
+        };
+        assert!(successor_cut_options(7, &mac_only).mac_only);
         let argv: Vec<String> = publish::cut_args(&successor)
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
@@ -1965,7 +1985,7 @@ mod tests {
         }
         // NEGATIVE CONTROL: the process's own argv — what the first handoff
         // re-ran — is the YANK, which would start the whole yank over.
-        let process_argv = ["yank".to_string(), "1783918101".to_string()];
+        let process_argv = ["yank", "1783918101", "--mac-only"].map(String::from);
         assert!(matches!(
             crate::cli::parse(&process_argv).unwrap(),
             crate::cli::Cmd::Yank { .. }
@@ -1986,16 +2006,20 @@ mod yank_local_gate_tests {
             std::env::temp_dir().join(format!("aterm-yank-gates-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        ledger::testing::init(
+            &root,
+            &[
+                ("user.name", "t"),
+                ("user.email", "t@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ],
+        );
         for args in [
-            &["init", "-q", "-b", "main"][..],
-            &["config", "user.name", "t"],
-            &["config", "user.email", "t@example.invalid"],
-            &["config", "commit.gpgsign", "false"],
-            &["commit", "-q", "--allow-empty", "-m", "one"],
+            &["commit", "-q", "--allow-empty", "-m", "one"][..],
             &["commit", "-q", "--allow-empty", "-m", "two"],
             &["remote", "add", "origin", "https://github.com/o/r.git"],
         ] {
-            let out = Command::new("git")
+            let out = ledger::testing::git()
                 .arg("-C")
                 .arg(&root)
                 .args(args)
@@ -2009,7 +2033,7 @@ mod yank_local_gate_tests {
     #[test]
     fn a_detached_checkout_may_yank_and_a_dirty_one_may_not() {
         let root = scratch_repo("detached");
-        let git = ledger::GitCli::new(&root);
+        let git = ledger::testing::Git::new(&root);
         ledger::git_ok(&git, &["checkout", "-q", "--detach", "HEAD~1"]).unwrap();
         // The input really is off every branch — the case the retired rule refused.
         let branch = ledger::git_ok(&git, &["rev-parse", "--abbrev-ref", "HEAD"])
@@ -2024,7 +2048,7 @@ mod yank_local_gate_tests {
         let error = yank_local_gates(&git, "o/r", &ours)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("dirty"), "{error}");
+        assert!(error.contains("uncommitted changes"), "{error}");
         fs::remove_file(root.join("stray")).unwrap();
         let stale = |_: &dyn ledger::GitRunner| -> Result<()> { Err(Error::new("stale cutter")) };
         assert!(yank_local_gates(&git, "o/r", &stale).is_err());
@@ -2036,7 +2060,7 @@ mod yank_local_gate_tests {
 #[cfg(test)]
 mod next_cut_tests {
     //! `ship status` names what the next cut builds — the published commit and the
-    //! version it declares — since a cut no longer builds the checkout.
+    //! version it declares — since a cut does not build the checkout.
 
     use super::*;
 
@@ -2046,7 +2070,7 @@ mod next_cut_tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let git = |args: &[&str]| {
-            let out = Command::new("git")
+            let out = ledger::testing::git()
                 .arg("-C")
                 .arg(&root)
                 .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])

@@ -4,8 +4,7 @@
 
 //! Minimal grapheme helpers needed by search indexing.
 
-use aterm_grapheme::GraphemeClusters;
-use aterm_grapheme::grapheme_grid_columns;
+use aterm_grapheme::grid_graphemes;
 
 /// Greek small letter final sigma (U+03C2).
 const FINAL_SIGMA: char = '\u{03C2}';
@@ -51,9 +50,8 @@ pub(crate) enum LowerNeed {
     Unicode,
 }
 
-/// Classify `text` for the lowered trigram pass. Exactly the two arms of the
-/// `!text.is_ascii() || text.bytes().any(|b| b.is_ascii_uppercase())` predicate
-/// the index used to spell three times.
+/// Classify `text` for the lowered trigram pass: the two arms of
+/// `!text.is_ascii() || text.bytes().any(|b| b.is_ascii_uppercase())`.
 pub(crate) fn lower_need(text: &str) -> LowerNeed {
     if !text.is_ascii() {
         LowerNeed::Unicode
@@ -92,21 +90,22 @@ pub(crate) fn lower_fold(s: &str) -> String {
     out
 }
 
-/// Convert a byte offset to a display column (O(G) per call).
+/// Convert a byte offset to a display column (O(G) per call): the cursor
+/// column after the clusters that start before `byte_offset`.
 ///
 /// Reference implementation retained for equivalence testing against
-/// [`ColumnMap::byte_to_column`]. Production code uses `ColumnMap` for
+/// [`ColumnMap::end_column`]. Production code uses `ColumnMap` for
 /// O(log G) lookups (#5672).
 #[cfg(any(test, kani))]
 #[must_use]
 pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
     let mut column: usize = 0;
 
-    for (offset, grapheme) in s.grapheme_indices() {
-        if offset >= byte_offset {
+    for g in grid_graphemes(s) {
+        if g.byte_offset >= byte_offset {
             return column;
         }
-        column = column.saturating_add(grapheme_grid_columns(grapheme));
+        column = g.end_col;
     }
 
     column
@@ -135,12 +134,9 @@ pub fn display_columns(text: &str) -> usize {
         if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
             return text.len();
         }
-        // Width-only callers need no byte-offset lookups. Count with the
-        // map's same grid-width rule and saturation, without allocating a
-        // coordinate entry for every grapheme only to discard the map.
-        text.graphemes().fold(0usize, |col, grapheme| {
-            col.saturating_add(grapheme_grid_columns(grapheme))
-        })
+        // Width-only callers need no byte-offset lookups: the map's same
+        // grid walk, without a coordinate entry for every grapheme.
+        aterm_grapheme::str_grid_columns(text)
     }
 }
 
@@ -182,12 +178,25 @@ pub(crate) fn map_lower_byte_to_original(original: &str, lower_byte: usize) -> u
 #[derive(Debug)]
 pub(crate) struct ColumnMap {
     /// `None` when the source text is pure ASCII (byte_offset == column).
-    /// `Some(entries)` for non-ASCII text, with (byte_offset, column) pairs
-    /// sorted by byte_offset including a sentinel at the end.
-    entries: Option<Vec<(usize, usize)>>,
+    /// `Some(entries)` for non-ASCII text, one per grapheme sorted by byte
+    /// offset, with a sentinel at the end.
+    entries: Option<Vec<ClusterColumns>>,
     /// Length of the source text in bytes. Used for ASCII identity mapping
     /// to clamp lookups at the text boundary.
     text_len: usize,
+}
+
+/// Where one grapheme sits on the grid (see [`aterm_grapheme::GridGrapheme`]).
+#[derive(Clone, Copy, Debug)]
+struct ClusterColumns {
+    /// The grapheme's byte offset.
+    offset: usize,
+    /// The first column it is drawn in: a match starting here starts here.
+    start: usize,
+    /// The cursor column before it: a match ending here ends here. Larger
+    /// than `start` when the grapheme joins the cell before it (the `ය` of
+    /// Sinhala `ක්‍ය`, which the grid draws in `ක`'s cell).
+    before: usize,
 }
 
 impl ColumnMap {
@@ -225,33 +234,62 @@ impl ColumnMap {
         }
 
         let mut entries = Vec::new();
-        let mut col: usize = 0;
-        for (offset, grapheme) in text.grapheme_indices() {
-            entries.push((offset, col));
-            // THE GRID'S OWN RULE, not a second model. `str_width(g).min(2)`
-            // charged a Devanagari conjunct 2 where the grid paints 3, and a
-            // keycap 1 where the grid paints 2 — so every later column on the
-            // row named a cell to the LEFT of the text, and the find bar tinted
-            // a blank cell while dropping the match's last character.
-            col = col.saturating_add(grapheme_grid_columns(grapheme));
+        let mut before: usize = 0;
+        // THE GRID'S OWN WALK, not a second model, and over the whole line:
+        // charging each grapheme on its own charged a Devanagari conjunct 2
+        // where the grid paints 3, a keycap 1 where it paints 2, and the `ය`
+        // the grid folds into the cell before it a cell of its own, so every
+        // later column on the row named a cell beside the text.
+        for g in grid_graphemes(text) {
+            entries.push(ClusterColumns {
+                offset: g.byte_offset,
+                start: g.start_col,
+                before,
+            });
+            before = g.end_col;
         }
         // Sentinel so lookups at text.len() return total width.
-        entries.push((text.len(), col));
+        entries.push(ClusterColumns {
+            offset: text.len(),
+            start: before,
+            before,
+        });
         Self {
             entries: Some(entries),
             text_len: text.len(),
         }
     }
 
-    /// Look up the display column for a byte offset.
+    /// The columns a match over bytes `start..end` is drawn in, as
+    /// `(start_col, end_col)` with `end_col` exclusive.
     ///
-    /// O(1) for ASCII text (identity mapping), O(log G) for non-ASCII.
-    ///
-    /// Semantics match `byte_to_column`: returns the cumulative display width
-    /// of all graphemes whose byte offset is strictly less than `byte_offset`.
+    /// O(1) for ASCII text (identity mapping), O(log G) for non-ASCII. A byte
+    /// offset inside a grapheme maps to the grapheme boundary after it.
     #[must_use]
     #[inline]
-    pub fn byte_to_column(&self, byte_offset: usize) -> usize {
+    pub fn span(&self, start: usize, end: usize) -> (usize, usize) {
+        (self.start_column(start), self.end_column(end))
+    }
+
+    /// The column a match starting at `byte_offset` starts in: the first
+    /// column of the grapheme there, which is the cell before it when the
+    /// grid folds the grapheme into that cell.
+    #[must_use]
+    #[inline]
+    fn start_column(&self, byte_offset: usize) -> usize {
+        self.lookup(byte_offset, |e| e.start)
+    }
+
+    /// The column a match ending at `byte_offset` ends at (exclusive): the
+    /// cursor column after every grapheme that starts before it.
+    #[must_use]
+    #[inline]
+    fn end_column(&self, byte_offset: usize) -> usize {
+        self.lookup(byte_offset, |e| e.before)
+    }
+
+    #[inline]
+    fn lookup(&self, byte_offset: usize, column: fn(&ClusterColumns) -> usize) -> usize {
         let entries = match self.entries {
             // ASCII fast path: byte offset == column, clamped to text length.
             None => return byte_offset.min(self.text_len),
@@ -259,13 +297,13 @@ impl ColumnMap {
         };
         // `total` is the past-sentinel column, reused as a provably-dead fallback
         // for the in-bounds arms so indexing is `get` (panic-free), never `[]`.
-        let total = entries.last().map_or(0, |&(_, col)| col);
-        match entries.binary_search_by_key(&byte_offset, |&(off, _)| off) {
+        let total = entries.last().map_or(0, |e| e.before);
+        match entries.binary_search_by_key(&byte_offset, |e| e.offset) {
             // Exact grapheme boundary — return its column directly.
-            Ok(idx) => entries.get(idx).map_or(total, |&(_, col)| col),
+            Ok(idx) => entries.get(idx).map_or(total, column),
             // Between two boundaries — the column of the next grapheme whose
             // offset >= byte_offset, which is entries[idx] (idx < len, guarded).
-            Err(idx) if idx < entries.len() => entries.get(idx).map_or(total, |&(_, col)| col),
+            Err(idx) if idx < entries.len() => entries.get(idx).map_or(total, column),
             // Past the sentinel — return total width.
             Err(_) => total,
         }
@@ -355,7 +393,7 @@ mod tests {
                 let text = format!("{left}{right}");
                 assert_eq!(
                     display_columns(&text),
-                    ColumnMap::new(&text).byte_to_column(text.len()),
+                    ColumnMap::new(&text).end_column(text.len()),
                     "text={text:?}"
                 );
             }
@@ -376,7 +414,7 @@ mod tests {
         let map = ColumnMap::new(text);
         for offset in 0..=text.len() {
             assert_eq!(
-                map.byte_to_column(offset),
+                map.end_column(offset),
                 byte_to_column(text, offset),
                 "mismatch at offset {offset}"
             );
@@ -390,7 +428,7 @@ mod tests {
         let map = ColumnMap::new(text);
         for offset in 0..=text.len() {
             assert_eq!(
-                map.byte_to_column(offset),
+                map.end_column(offset),
                 byte_to_column(text, offset),
                 "mismatch at offset {offset}"
             );
@@ -401,7 +439,7 @@ mod tests {
     #[test]
     fn column_map_empty_string() {
         let map = ColumnMap::new("");
-        assert_eq!(map.byte_to_column(0), 0);
+        assert_eq!(map.span(0, 0), (0, 0));
     }
 
     /// ColumnMap equivalence across mixed-width Unicode: combining characters,
@@ -419,7 +457,7 @@ mod tests {
             let map = ColumnMap::new(text);
             for offset in 0..=text.len() {
                 assert_eq!(
-                    map.byte_to_column(offset),
+                    map.end_column(offset),
                     byte_to_column(text, offset),
                     "mismatch in {text:?} at offset {offset}"
                 );
@@ -437,7 +475,7 @@ mod tests {
         let map = ColumnMap::new(&text);
         for offset in 0..=text.len() {
             assert_eq!(
-                map.byte_to_column(offset),
+                map.end_column(offset),
                 byte_to_column(&text, offset),
                 "mismatch at byte offset {offset} in {}-byte CJK line",
                 text.len()

@@ -192,7 +192,7 @@ fn the_projection_is_newest_first_in_the_chips_order_with_the_hosts_facts() {
                 .action(Intent::NotNow {
                     decision: Decision::FileAccess,
                 })
-                .hold(Hold::Ask { for_: HOLD_ASK }),
+                .hold(Hold::asking(HOLD_ASK)),
             stamp(NOW - 60_000),
             now,
         )
@@ -317,7 +317,7 @@ fn install_now_follows_the_hosts_staged_build_and_the_sentence_is_the_hosts() {
                 .action(Intent::OpenSettings {
                     route: "/updates".into(),
                 })
-                .hold(Hold::Standing),
+                .hold(Hold::STANDING),
             stamp(NOW - 60_000),
             now,
         )
@@ -361,7 +361,7 @@ fn install_now_follows_the_hosts_staged_build_and_the_sentence_is_the_hosts() {
                 .action(Intent::NotNow {
                     decision: Decision::FileAccess,
                 })
-                .hold(Hold::Ask { for_: HOLD_ASK }),
+                .hold(Hold::asking(HOLD_ASK)),
             stamp(NOW - 30_000),
             now,
         )
@@ -399,7 +399,7 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
             )
             .action(upgrade("s-1", "2.1.282", UpgradeWord::Now))
             .action(upgrade("s-1", "2.1.282", UpgradeWord::NotToday))
-            .hold(Hold::Standing),
+            .hold(Hold::STANDING),
             stamp(NOW - 60_000),
             now,
         )
@@ -418,7 +418,7 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
                     ("s-2".into(), "2.1.282".into()),
                 ],
             })
-            .hold(Hold::Standing),
+            .hold(Hold::STANDING),
             stamp(NOW - 30_000),
             now,
         )
@@ -521,7 +521,7 @@ fn a_navigation_is_pressable_only_where_the_host_performs_one() {
                 .action(Intent::OpenSystemPane {
                     pane: "Privacy_AllFiles".into(),
                 })
-                .hold(Hold::Ask { for_: HOLD_ASK }),
+                .hold(Hold::asking(HOLD_ASK)),
             stamp(NOW - 30_000),
             now,
         )
@@ -685,7 +685,7 @@ fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
     let mut log = MessageLog::empty();
     log.replay(LogLine::Posted(dead));
     let replayed = log.records().next().expect("replayed");
-    let view = MessageView::of(replayed, None, None, &Desk::default());
+    let view = MessageView::of(replayed, None, None, None, &Desk::default());
     assert_eq!(view.state, "stale");
     assert_eq!(view.state_words(), "still open when aterm stopped");
     assert_eq!(view.glyph, '\u{2139}', "the replayed open record's mark");
@@ -703,7 +703,7 @@ fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
     let mut silent = replayed.clone();
     silent.retired_unix_ms = Some(61_000);
     assert_eq!(
-        MessageView::of(&silent, None, None, &Desk::default()).state_words(),
+        MessageView::of(&silent, None, None, None, &Desk::default()).state_words(),
         "stopped reporting after 1 min"
     );
     // Quit through the center: the percent it reached, the severity's mark.
@@ -750,7 +750,7 @@ fn every_state_is_said_in_plain_words() {
     };
     let at = base.at_unix_ms;
     let later = Some(at + 40_000);
-    let cases: [(MessageView, &str); 20] = [
+    let cases: [(MessageView, &str); 21] = [
         (with("live", "info", None), "waiting to show"),
         (
             MessageView {
@@ -772,6 +772,7 @@ fn every_state_is_said_in_plain_words() {
             with("unseen", "info", later),
             "not shown \u{2014} too many at once",
         ),
+        (with("aged", "info", later), "aged out after 40 s"),
         (with("superseded", "info", later), "replaced"),
         (with("resolved-ok", "success", later), "took 40 s"),
         (with("resolved-ok", "info", later), "lasted 40 s"),
@@ -933,6 +934,69 @@ fn a_stamp_from_tomorrow_is_todays() {
         clock.sections(&refs),
         Some(vec![today, today, today - 3]),
         "tomorrow's stamp is in today's section"
+    );
+}
+
+/// AN OLD OPEN EXCEPTION KEEPS ITS OWN DAY: it is listed first whatever its
+/// age, and the log under it starts again from today — before, a running
+/// minimum filed every newer record under the exception's day, with no
+/// `Today` header anywhere. A log record from the exception's day files
+/// under that day again, below `Today`: the open run and the log each give
+/// a day one header, so `Yesterday` can appear twice. NEGATIVE CONTROL: the
+/// same rows with no open exception keep the plain running minimum (one
+/// header a day).
+#[test]
+fn an_old_open_exception_keeps_its_own_day_header() {
+    const DAY: u64 = 86_400_000;
+    let today = words::local_day(NOW, 0);
+    let exception = MessageView {
+        state: "review",
+        ..entry_at(1, NOW - DAY)
+    };
+    let record = entry_at(2, NOW - 60_000);
+    let refs = [&exception, &record];
+    let clock = MessagesClock::of(&refs, NOW, 0);
+    assert!(clock.headed);
+    assert_eq!(clock.sections(&refs), Some(vec![today - 1, today]));
+    let page = MessagesState {
+        revision: 1,
+        now_unix_ms: NOW,
+        entries: vec![exception.clone(), record.clone()],
+        tags: vec![("config".to_string(), 2)],
+        log_folder: None,
+        saved: false,
+        utc_offset_s: 0,
+    };
+    let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
+    let days: Vec<(String, Vec<(String, String)>)> = lines
+        .iter()
+        .map(|l| read_page_line(l))
+        .filter(|(k, _)| k == "day")
+        .collect();
+    let words: Vec<&str> = days
+        .iter()
+        .filter_map(|(_, f)| f.iter().find(|(k, _)| k == "words"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(words, ["Yesterday", "Today"], "{lines:?}");
+
+    let older = entry_at(3, NOW - DAY - 60_000);
+    let refs = [&exception, &record, &older];
+    assert_eq!(
+        MessagesClock::of(&refs, NOW, 0).sections(&refs),
+        Some(vec![today - 1, today, today - 1]),
+        "the log under the open run heads its own Yesterday"
+    );
+
+    let plain = MessageView {
+        state: "folded",
+        ..exception.clone()
+    };
+    let refs = [&plain, &record];
+    assert_eq!(
+        MessagesClock::of(&refs, NOW, 0).sections(&refs),
+        Some(vec![today - 1, today - 1]),
+        "out-of-order plain records keep one header a day"
     );
 }
 
@@ -1130,7 +1194,7 @@ fn page_lines_fixture() -> (MessageCenter, Desk) {
             .key("two.lines")
             .action(upgrade("s-1", "2.1.282", UpgradeWord::Now))
             .action(upgrade("s-1", "2.1.282", UpgradeWord::NotToday))
-            .hold(Hold::Standing),
+            .hold(Hold::STANDING),
             NOW - 60_000,
         ),
     ] {
@@ -1192,7 +1256,7 @@ fn the_page_as_lines_says_every_word_in_one_grammar() {
         ),
         "day\tday=20349\twords=Thursday\tshort=Thursday".to_string(),
         format!(
-            "entry\tid=1\tat={}\twhen=3:53 PM\tlocal=Thursday 3:53:20 PM\ttag=toolchain\ttag_words=ALab tools\tsev=warn\tsev_words=Warning\tmark=\u{26a0}\ttitle=ALab tools could not update\tstate=recorded\tstate_words=recorded\trep=1\tdescription=Warning, ALab tools, 2025-09-18\tsentence=the index could not be reached; it tries again in an hour\ttechnical=GET /index.toml: 503\tmeta=Thursday 3:53:20 PM \u{00b7} recorded\tcopy=ALab tools could not update\\n2025-09-18 15:53:20 UTC \u{00b7} toolchain \u{00b7} warn\\nthe index could not be reached; it tries again in an hour\\nGET /index.toml: 503",
+            "entry\tid=1\tat={}\twhen=3:53 PM\tlocal=Thursday 3:53:20 PM\ttag=toolchain\ttag_words=ALab tools\tsev=warn\tsev_words=Warning\tmark=\u{26a0}\ttitle=ALab tools could not update\tstate=recorded\tstate_words=recorded\trep=1\tdescription=Warning, ALab tools, 3 days ago\tsentence=the index could not be reached; it tries again in an hour\ttechnical=GET /index.toml: 503\tmeta=Thursday 3:53:20 PM \u{00b7} recorded\tcopy=ALab tools could not update\\n2025-09-18 15:53:20 UTC \u{00b7} toolchain \u{00b7} warn\\nthe index could not be reached; it tries again in an hour\\nGET /index.toml: 503",
             NOW - 3 * 86_400_000
         ),
     ];
@@ -1707,6 +1771,147 @@ fn the_pages_chrome_words_are_the_engines() {
     );
 }
 
+/// THE PAGE PUTS AN OPEN EXCEPTION AWAY (owner rule 2026-09-28: one batched item
+/// "that I can dismiss"): every open entry carries a view-time `Dismiss` after its
+/// own capsules, the first of two or more also `Dismiss all`; the indices are past
+/// any authored capsule, and a filed entry, a live row and a plain record carry
+/// neither.
+#[test]
+fn an_open_exception_offers_dismiss_and_the_first_of_several_dismiss_all() {
+    use crate::exceptions::{Entry, Family};
+    use crate::need::{Reason, Then, Why};
+    use crate::page::{DISMISS_ACTION, DISMISS_ALL_ACTION};
+    let now = Instant::now();
+    let mut c = center(now);
+    let entry = |cause: &str| {
+        Entry::new(
+            Family::Upgrade,
+            "",
+            cause,
+            &format!("Claude is behind ({cause})"),
+            Why::OnlyYou(Reason::new("its own work holds the move")),
+            Then::step("End that job in the tab"),
+        )
+        .show(Intent::ShowTab { tab: 1, window: 1 })
+        .message()
+        .expect("the entry passes the rule")
+    };
+    c.post(
+        Message::new(tags::UPDATE, Severity::Info, "Checked for updates").hold(Hold::LogOnly),
+        stamp(NOW),
+        now,
+    );
+    c.sync_digest(
+        &Family::Upgrade.prefix(),
+        vec![entry("own-work")],
+        stamp(NOW + 1_000),
+        now,
+    );
+    let one = MessagesState::of(&c, &Desk::default());
+    let open: Vec<&MessageView> = one.entries.iter().filter(|e| e.state == "review").collect();
+    assert_eq!(open.len(), 1);
+    let indices = |e: &MessageView| e.actions.iter().map(|a| a.index).collect::<Vec<_>>();
+    assert_eq!(
+        indices(open[0]),
+        vec![0, DISMISS_ACTION],
+        "own capsule, then Dismiss"
+    );
+    assert!(DISMISS_ACTION >= 200 && DISMISS_ALL_ACTION > DISMISS_ACTION);
+    let plain = one.entries.iter().find(|e| e.state != "review").unwrap();
+    assert!(plain.actions.iter().all(|a| a.index < DISMISS_ACTION));
+
+    c.sync_digest(
+        &Family::Upgrade.prefix(),
+        vec![entry("own-work"), entry("typed-draft")],
+        stamp(NOW + 2_000),
+        now,
+    );
+    let two = MessagesState::of(&c, &Desk::default());
+    let open: Vec<&MessageView> = two.entries.iter().filter(|e| e.state == "review").collect();
+    assert_eq!(open.len(), 2);
+    assert_eq!(
+        indices(open[0]),
+        vec![0, DISMISS_ACTION, DISMISS_ALL_ACTION]
+    );
+    assert_eq!(indices(open[1]), vec![0, DISMISS_ACTION]);
+    let labels: Vec<&str> = open[0].actions.iter().map(|a| a.label).collect();
+    assert_eq!(labels[1..], ["Dismiss", "Dismiss all"]);
+
+    // Filed: no dismiss button on the record.
+    c.file_digest(stamp(NOW + 3_000), now);
+    let after = MessagesState::of(&c, &Desk::default());
+    assert!(after.entries.iter().all(|e| e.state != "review"));
+    assert!(
+        after
+            .entries
+            .iter()
+            .all(|e| e.actions.iter().all(|a| a.index < DISMISS_ACTION)),
+        "a filed entry offers neither"
+    );
+}
+
+/// THE DIGEST STANDS FIRST on the page, in its CURRENT words (owner rule
+/// 2026-09-28; review 2026-09-29 issue 12): an open exception is placed above
+/// every other record whatever its age, reads the entry's words (a
+/// restatement is never logged, so the record still holds the first ones),
+/// offers its buttons, and moves the projection's revision without moving the
+/// band's.
+#[test]
+fn an_open_exception_stands_first_in_its_current_words() {
+    use crate::exceptions::{Entry, Family};
+    use crate::need::{Reason, Then, Why};
+    let now = Instant::now();
+    let mut c = center(now);
+    let entry = |what: &str| {
+        Entry::new(
+            Family::Upgrade,
+            "",
+            "own-work",
+            what,
+            Why::OnlyYou(Reason::new("its own work holds the move")),
+            Then::step("End that job in the tab"),
+        )
+        .show(Intent::ShowTab { tab: 1, window: 1 })
+        .message()
+        .expect("the entry passes the rule")
+    };
+    let prefix = Family::Upgrade.prefix();
+    let s = c.sync_digest(
+        &prefix,
+        vec![entry("Claude in tab 1 is behind")],
+        stamp(NOW),
+        now,
+    );
+    assert_eq!(s.posted, 1);
+    // A NEWER plain record: the exception still stands above it.
+    c.post(
+        Message::new(tags::UPDATE, Severity::Info, "Checked for updates").hold(Hold::LogOnly),
+        stamp(NOW + 1_000),
+        now,
+    );
+    let before = MessagesState::of(&c, &Desk::default());
+    assert_eq!(before.entries[0].state, "review");
+    assert_eq!(before.entries[0].title, "Claude in tab 1 is behind");
+    assert_eq!(before.entries[0].state_words(), "here and in the menu bar");
+    assert!(
+        before.entries[0].actions.iter().all(|a| a.still_actionable),
+        "an open exception's buttons are offered"
+    );
+    assert!(before.entries[1..].iter().all(|e| e.state != "review"));
+    // A restatement changes the entry's words, never the record's: the page
+    // must read the entry's, and the projection's revision moves.
+    let s = c.sync_digest(
+        &prefix,
+        vec![entry("Claude in tab 1 is still behind")],
+        stamp(NOW + 2_000),
+        now + crate::need::RESTATE_QUIET,
+    );
+    assert_eq!(s.restated, 1);
+    let after = MessagesState::of(&c, &Desk::default());
+    assert_eq!(after.entries[0].title, "Claude in tab 1 is still behind");
+    assert!(after.revision > before.revision);
+}
+
 /// THE PAGE'S PRIMARY IS THE ENGINE'S (ruling 407; the rule of rulings 265, 401
 /// and 403, which the macOS page applied itself until then): the first offered
 /// intent while a press can perform it — a pressable first decline keeps it —
@@ -1892,7 +2097,7 @@ fn the_action_lines_carry_the_primary_after_every_older_key() {
 }
 
 /// `primary=` MARKS A POSITION IN THE OFFERED INTENTS, NOT AN `ActionIndex`
-/// (the round-39 review; ruling 408). [`crate::page::primary_index`] answers a
+/// (ruling 408). [`crate::page::primary_index`] answers a
 /// position in `entry.actions`, while each line's `index=` keeps the intent's
 /// own `ActionIndex`: an intent whose moment passed is not offered (ruling
 /// 265: `Not now` on an answered ask), so the offered indices can start past

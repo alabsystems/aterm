@@ -92,12 +92,9 @@ impl State {
 
     /// The state's name, as a static string (identical to its `Debug` form).
     ///
-    /// Exists so a caller that must REPORT a state — the seamless-update
-    /// capture naming the partial sequence it abandoned when a session's parser
-    /// was left mid-sequence (the 2026-09-22/23 update audit: an unterminated
-    /// `ESC ] 0 ; x` refused every in-session update) — can log it without
-    /// allocating, and without an exhaustive match it could not write from
-    /// outside this crate (`State` is `#[non_exhaustive]`).
+    /// Lets a caller outside this crate (`State` is `#[non_exhaustive]`) report
+    /// a state without allocating, e.g. the seamless-update capture naming the
+    /// partial sequence it abandoned.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {

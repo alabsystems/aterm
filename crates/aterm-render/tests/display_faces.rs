@@ -96,6 +96,7 @@ fn the_monospaced_display_face_is_left_exactly_alone() {
 /// A face that is NOT bundled never gets re-fitted: the policy keys off the
 /// registry bytes, so a user's own proportional font keeps the historical
 /// `M`-advance cell and their existing config keeps rendering as it did.
+#[cfg(feature = "embedded-font")]
 #[test]
 fn a_non_bundled_face_is_never_fitted() {
     let dejavu = aterm_render::embedded_font();
@@ -511,7 +512,7 @@ fn the_fit_survives_a_rebuild_and_a_copy_of_the_bytes() {
 #[test]
 fn a_variation_change_keeps_the_fit_and_the_pure_read_agrees() {
     let mut renderer =
-        Renderer::from_configured_font_family("display:engraved", 16.0, Theme::default())
+        Renderer::from_system_with_family(Some("display:engraved"), 16.0, Theme::default())
             .expect("the display scheme resolves");
     // A heavier instance than the constructor resolved, so the coords really
     // differ and `refresh_variations` runs past its early-out.
@@ -554,6 +555,7 @@ fn a_variation_change_keeps_the_fit_and_the_pure_read_agrees() {
 /// policy exists to prevent. The comparison is against a renderer CONSTRUCTED
 /// from the same bytes, which is the definition of right here — a swap must land
 /// exactly where a fresh construction would.
+#[cfg(feature = "embedded-font")]
 #[test]
 fn a_primary_swap_reprobes_the_fit_for_the_new_face() {
     let engraved = display_face_bytes("engraved").expect("registry id resolves");

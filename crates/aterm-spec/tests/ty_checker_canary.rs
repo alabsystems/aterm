@@ -140,13 +140,9 @@ fn discovered_ty_finds_a_counterexample_under_its_own_reductions() {
     // ty-driver-unarmed: this driver's SUBJECT is the checker's own default
     // reduction behaviour, so arming it would test nothing. The sole exemption
     // `ty_drivers_are_armed` permits, and that gate pins it to this file.
-    let out = Command::new(&ty)
-        .arg("check")
-        .arg(&tla)
-        .arg("--config")
-        .arg(&cfg)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {ty:?}: {e}"));
+    let mut cmd = Command::new(&ty);
+    cmd.arg("check").arg(&tla).arg("--config").arg(&cfg);
+    let out = verify::ty_output(&mut cmd).unwrap_or_else(|e| panic!("failed to run {ty:?}: {e}"));
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

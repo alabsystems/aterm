@@ -2,13 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Asserting gate: runs the adversarial determinism corpora (machine-generated
-//! by a hazard sweep that targeted real bulk-vs-single write-path divergences)
-//! and asserts that, under the fixed clock, the screen state is a PURE FUNCTION
-//! of the output-byte log — every corpus folds to the identical checkpoint
-//! whether fed per original record, all at once, or one byte at a time. Two of
-//! these corpora (`wide_wrap_tail`, `zwj_emoji_join`) reproduced genuine engine
-//! bugs that are now fixed; this gate locks the fixes in.
+//! Runs the adversarial determinism corpora and asserts that, under a fixed
+//! clock, the screen state is a pure function of the output-byte log: every
+//! corpus folds to the same checkpoint whether fed per record, all at once, or
+//! one byte at a time.
 
 use aterm_core::terminal::{ClockReading, Terminal};
 
@@ -46,9 +43,8 @@ fn every_corpus_folds_chunk_independently() {
         // (no rng / hashmap-iteration-order / global-state leak into output).
         let by_record_again = fold(records, c).checkpoint();
 
-        // Near-exhaustive differential check: EVERY single cut point [..k][k..]
-        // must also fold to the reference. This is the metamorphic guard that
-        // catches the bulk-vs-single lane divergence class for this byte log.
+        // Every single cut point [..k][k..] must also fold to the reference
+        // (catches bulk-vs-single write-lane divergence).
         let all_cuts_ok =
             (1..flat.len()).all(|k| fold(&[&flat[..k], &flat[k..]], c).checkpoint() == by_record);
 
@@ -75,28 +71,18 @@ fn every_corpus_folds_chunk_independently() {
 }
 
 /// Tier-1 bind of `aterm_spec::derive::coalesce_model()`: the two write lanes,
-/// driven for real and compared after every parser-ground prefix rather than
-/// only at the end.
+/// compared after every parser-ground prefix rather than only at the end.
 ///
-/// The single lane feeds one byte per `process_at`, so every decoded glyph goes
-/// through the per-glyph writer; the bulk lane feeds each record whole, so runs
-/// go through the batched writers. An ELEMENT of the model is a run of records
-/// ending where the parser is back at ground (a checkpoint is only defined
-/// there, and several corpora split an escape or a UTF-8 sequence across
-/// records on purpose). After each element both lanes have consumed the same
-/// bytes, and `diverged` is projected from their real `checkpoint()`s. Every
-/// element must be the model's `Emit` at the committed `Buggy = 0` — which keeps
-/// `diverged` at 0 — so a lane divergence at ANY grounded prefix is a step the
-/// model rejects, including one a later record would overwrite before the
-/// end-state comparisons above could see it. (On the committed corpora every
-/// divergence a batching mutant causes at a record boundary also survives to
-/// the end, so today the two tests fail together; what this adds is that the
-/// state a mid-stream capture would carry is checked, element by element, as
-/// the model states it.)
+/// The single lane feeds one byte per `process_at` (the per-glyph writer); the
+/// bulk lane feeds each record whole (the batched writers). A model element is
+/// a run of records ending at parser ground, where a checkpoint is defined.
+/// After each element `diverged` is projected from both lanes' real
+/// `checkpoint()`s and every element must be the model's `Emit` at `Buggy = 0`,
+/// so a divergence at any grounded prefix is rejected, even one a later record
+/// would overwrite.
 ///
-/// NEGATIVE CONTROL: a diverging record, projected from a real prefix, is
-/// rejected by the committed model and admitted by `Buggy = 1` at `SKIPAT` —
-/// the skipped-fixup class the model was written for.
+/// Negative control: a diverging record, projected from a real prefix, is
+/// rejected by the committed model and admitted by `Buggy = 1` at `SKIPAT`.
 #[test]
 fn every_corpus_record_conforms_to_coalesce_model() {
     use aterm_spec::derive::coalesce_model;
@@ -160,7 +146,7 @@ fn every_corpus_record_conforms_to_coalesce_model() {
         "the corpora were checked at intermediate prefixes, not only at their ends"
     );
 
-    // NEGATIVE CONTROL from a real prefix of the first corpus.
+    // Negative control from a real prefix of the first corpus.
     let (_, records) = CORPORA[0];
     let prev = st(1, false);
     let diverging = st(2, true);

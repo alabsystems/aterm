@@ -50,46 +50,92 @@ pub fn harness_restored_first_attempt_model() -> Model {
 /// whose agent it had already ended (a shell tab no worker looks at).
 ///
 /// `queued` — `A` is still owed by the outgoing instance's queue; `acting` —
-/// its step is running (it stays queued meanwhile); `paused` — a handoff
-/// parked the readers; `carried` — `A` is on the handoff layout the park
-/// froze; `committed` — the successor took over (the outgoing instance and
-/// any step it was running end there); `succ` — the successor's own queue
-/// owes `A`; `resolved` — `A` was relaunched or said; `late` — a step that
-/// STARTED while parked; `restart` — `R`'s record is in flight; `swept` —
+/// its step is running (it stays queued meanwhile); `typed` — a step of `A`
+/// typed its line and waits for its agent (`wait:resume`): its relaunch is
+/// in flight on the conversation's record, and every later step — here or
+/// the successor's — carries that on, never typing a second line; `ran` —
+/// an agent ran in `A`'s tab since it was queued (the world's fact, a
+/// ghost); `overtaken` — the host knows it, of an `A` that typed nothing
+/// (round twelve: kept for good once seen); `paused` — a handoff parked the
+/// readers; `captured` — what the park's pending layout carried for `A`;
+/// `capture` — how a layout reads the queue (0 live, as it is; 1 dropping
+/// it, 2 the copy the park froze: the mutants); `committed` — the successor
+/// took over (the outgoing instance and any step it was running end there);
+/// `succ` — the successor's own queue owes `A`; `resolved` — `A` was
+/// relaunched or said; `late` — a step that STARTED while parked; `over` — a
+/// relaunch of `A` that could type its line (none typed yet) stepped after
+/// an agent ran in its tab; `restart` — `R`'s record is in flight; `swept` —
 /// the successor's Commit owes `R` a carry-on step.
 ///
-/// * `StepStart`, `StepRetries`, `StepResolves` — the outgoing worker's step
-///   and its two ends (a word that is not possible yet keeps `A` queued);
-///   no step STARTS while parked.
-/// * `Park` freezes the queue AS IT STANDS, the step in flight included;
-///   `Rollback` resumes it.
-/// * `Commit` hands `carried` to the successor's queue and owes every
-///   restart record still in flight a carry-on.
+/// * `StepStart`, `StepRetries`, `StepTypes`, `StepResolves` — the outgoing
+///   worker's step and its ends (a word that is not possible yet, typed
+///   nothing, keeps `A` queued; one that typed its line and waits keeps it
+///   queued, typed); no step STARTS while parked or once an agent is known
+///   to have run in the tab of an `A` that typed nothing, and the step in
+///   flight ends while parked too.
+/// * `AgentRuns` — a person (anyone) starts an agent in `A`'s tab, parked or
+///   not, during a step or between steps, and the host's roster names it —
+///   which overtakes an `A` that typed nothing, and no `A` that typed: the
+///   agent in its tab is then its own (`RestoredAttempt::typed`, an agent
+///   seen during the step that typed included); `Overtaken` — the queue
+///   takes `A` off without a step (never while parked: its worker waits on
+///   the park).
+/// * `Park` captures the pending layout from the queue AS IT IS (`A` while
+///   queued and not overtaken); `Rollback` resumes the queue.
+/// * `Commit` re-captures the layout the same way and goes ahead only where
+///   the two captures agree — a step that landed or an agent that ran in
+///   between refuses it, as activity — handing what they carry to the
+///   successor's queue and owing every restart record still in flight a
+///   carry-on.
 /// * `SuccRelaunches`, `SweepCarriesOn` — the successor's steps (each the
 ///   same idempotent step the outgoing instance would have taken, so a
 ///   relaunch it already typed is carried on, never typed twice).
 /// * `RestartFinishes` — the outgoing instance's own act finished `R` before
 ///   the Commit.
 ///
-/// * `NoSilentLoss` — past the Commit `A` is resolved or the successor owes
-///   it: the reopened layout's row said it resumes;
+/// A TYPED `A` CROSSES A HANDOFF UNTYPED (the review of round twelve): the
+/// successor queues what the leaf carried as a fresh attempt, so an agent
+/// its roster names in the tab — the one the outgoing instance's line
+/// started — overtakes it there, and its queue takes it off with no row.
+/// What it typed is the conversation's record in flight, which the
+/// successor's Commit sweeps on every adopted tab (`R`'s carry-on, the same
+/// step): carried on, or said in the restored agents' row. So the
+/// successor's `SuccRelaunches` here is that one step, whichever of the two
+/// takes it.
+///
+/// * `NoSilentLoss` — past the Commit `A` is resolved, the successor owes
+///   it, or an agent ran in its tab: the reopened layout's row said it
+///   resumes;
 /// * `NoStepWhileParked` — the worker takes no new step while the terminal is
 ///   parked;
+/// * `NoRelaunchOverAgent` — no relaunch of `A` is stepped, here or by the
+///   successor, once an agent ran in its tab having typed nothing;
 /// * `NoStrandedRestart` — past the Commit a restart record in flight is owed
 ///   a carry-on.
 ///
-/// `Buggy=1` is what shipped until round four, each alone: `ParkDropsQueue`
-/// (the queue was the worker's local and the handoff leaf never named an
-/// agent — `NoSilentLoss`), `StepStartWhileParked` (a worker the park does
-/// not stop — `NoStepWhileParked`) and `CommitWithoutSweep` (the successor
-/// resumed its host for agent tabs only — `NoStrandedRestart`). The bounded
-/// hold that keeps an AUTOMATIC update from parking while `A` is queued is
-/// the ladder's (`native_update_apply_ladder_model`'s `warmup`); this machine
-/// is what an explicit update, and one past the hold's bound, relies on.
-/// Tier-1 (`aterm-gui`'s `harness_host` test
+/// `Buggy=1` is what shipped, each mutant caught alone: `ParkDropsQueue`
+/// (until round four the queue was the worker's local and the handoff leaf
+/// never named an agent — `NoSilentLoss`), `StepStartWhileParked` (a worker
+/// the park does not stop — `NoStepWhileParked`), `CommitWithoutSweep` (the
+/// successor resumed its host for agent tabs only — `NoStrandedRestart`),
+/// `ParkFreezes` (rounds four to ten froze the queue at the park for both
+/// captures, which then always agreed — `NoRelaunchOverAgent`: the successor
+/// typed its relaunch beside the agent a person started there the moment it
+/// gave the shell its prompt back), `StepStartOvertaken` (before round eleven
+/// the queue never asked the tab before a step — `NoRelaunchOverAgent`) and
+/// `AgentStopsForgotten` (round eleven asked whether an agent runs at the
+/// instant of a capture or a step, which a ctrl-z or its exit clears —
+/// `NoRelaunchOverAgent`). The bounded hold that keeps an AUTOMATIC update
+/// from parking while `A` is queued is the ladder's
+/// (`native_update_apply_ladder_model`'s `warmup`); this machine is what an
+/// explicit update, and one past the hold's bound, relies on. Tier-1
+/// (`aterm-gui`'s `harness_host` test
 /// `the_real_restored_carry_conforms_to_its_model`) drives the real host's
-/// queue through a park mid-step, a successor's relaunch of what it carried
-/// and the Commit's sweep, projecting each observed state onto the model's.
+/// queue through a park mid-step, a step that lands while parked, an agent
+/// that runs and stops in the tab, a successor's relaunch of what it carried
+/// and the Commit's sweep, and an agent in the tab of a relaunch that typed
+/// its line (still stepped, still carried), projecting each observed state
+/// onto the model's.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_restored_carry_model() -> Model {
@@ -98,57 +144,112 @@ pub fn harness_restored_carry_model() -> Model {
             const Buggy = 0;
             var queued = 1;
             var acting = 0;
+            var typed = 0;
+            var ran = 0;
+            var overtaken = 0;
             var paused = 0;
-            var carried = 0;
+            var captured = 0;
+            var capture = 0;
             var committed = 0;
             var succ = 0;
             var resolved = 0;
             var late = 0;
+            var over = 0;
             var restart = 1;
             var swept = 0;
 
-            action StepStart when (queued == 1 && acting == 0 && paused == 0 && committed == 0) {
+            action StepStart when (
+                queued == 1 && acting == 0 && overtaken == 0 && paused == 0 && committed == 0
+            ) {
                 acting = 1;
+                over = if (ran == 1 && typed == 0) { 1 } else { over };
             }
             action StepStartWhileParked when (
-                Buggy == 1 && queued == 1 && acting == 0 && paused == 1 && committed == 0
+                Buggy == 1 && queued == 1 && acting == 0 && overtaken == 0 && paused == 1
+                    && committed == 0
             ) {
                 acting = 1;
                 late = 1;
             }
+            action StepStartOvertaken when (
+                Buggy == 1 && queued == 1 && acting == 0 && overtaken == 1 && paused == 0
+                    && committed == 0
+            ) {
+                acting = 1;
+                over = 1;
+            }
             action StepRetries when (acting == 1 && committed == 0) {
                 acting = 0;
+            }
+            action StepTypes when (acting == 1 && committed == 0) {
+                acting = 0;
+                typed = 1;
+                overtaken = 0;
             }
             action StepResolves when (acting == 1 && committed == 0) {
                 acting = 0;
                 queued = 0;
                 resolved = 1;
             }
+            action AgentRuns when (queued == 1 && overtaken == 0 && committed == 0) {
+                ran = 1;
+                overtaken = if (typed == 1) { 0 } else { 1 };
+            }
+            action AgentStopsForgotten when (Buggy == 1 && overtaken == 1 && committed == 0) {
+                overtaken = 0;
+            }
+            action Overtaken when (
+                queued == 1 && acting == 0 && overtaken == 1 && paused == 0 && committed == 0
+            ) {
+                queued = 0;
+            }
             action RestartFinishes when (restart == 1 && committed == 0) {
                 restart = 0;
             }
             action Park when (paused == 0 && committed == 0) {
                 paused = 1;
-                carried = queued;
+                captured = if (queued == 1 && overtaken == 0) { 1 } else { 0 };
+                capture = 0;
             }
             action ParkDropsQueue when (Buggy == 1 && paused == 0 && committed == 0) {
                 paused = 1;
-                carried = 0;
+                captured = 0;
+                capture = 1;
+            }
+            action ParkFreezes when (Buggy == 1 && paused == 0 && committed == 0) {
+                paused = 1;
+                captured = queued;
+                capture = 2;
             }
             action Rollback when (paused == 1 && committed == 0) {
                 paused = 0;
-                carried = 0;
+                captured = 0;
+                capture = 0;
             }
-            action Commit when (paused == 1 && committed == 0) {
+            action Commit when (
+                paused == 1 && committed == 0
+                    && (capture == 2
+                        || (capture == 1 && captured == 0)
+                        || (capture == 0
+                            && ((captured == 1 && queued == 1 && overtaken == 0)
+                                || (captured == 0 && (queued == 0 || overtaken == 1)))))
+            ) {
                 committed = 1;
-                succ = carried;
+                succ = captured;
                 queued = 0;
                 acting = 0;
                 swept = restart;
             }
-            action CommitWithoutSweep when (Buggy == 1 && paused == 1 && committed == 0) {
+            action CommitWithoutSweep when (
+                Buggy == 1 && paused == 1 && committed == 0
+                    && (capture == 2
+                        || (capture == 1 && captured == 0)
+                        || (capture == 0
+                            && ((captured == 1 && queued == 1 && overtaken == 0)
+                                || (captured == 0 && (queued == 0 || overtaken == 1)))))
+            ) {
                 committed = 1;
-                succ = carried;
+                succ = captured;
                 queued = 0;
                 acting = 0;
                 swept = 0;
@@ -156,15 +257,299 @@ pub fn harness_restored_carry_model() -> Model {
             action SuccRelaunches when (committed == 1 && succ == 1) {
                 succ = 0;
                 resolved = 1;
+                over = if (ran == 1 && typed == 0) { 1 } else { over };
             }
             action SweepCarriesOn when (committed == 1 && swept == 1) {
                 swept = 0;
                 restart = 0;
             }
 
-            invariant NoSilentLoss: committed == 0 || resolved == 1 || succ == 1;
+            invariant NoSilentLoss: committed == 0 || resolved == 1 || succ == 1 || ran == 1;
             invariant NoStepWhileParked: late == 0;
+            invariant NoRelaunchOverAgent: over == 0;
             invariant NoStrandedRestart: committed == 0 || restart == 0 || swept == 1;
+        }
+    }
+}
+
+/// A CRASHED AGENT'S RELAUNCH THROUGH A PARK'S COMMIT THAT FAILS (round six's
+/// F13, rounds eleven to fourteen). `aterm-gui`'s `harness_host` for ONE
+/// session: its agent, its worker, the mark a Commit leaves on the session
+/// (`Kept::commit`), the mark of an exit no worker was handed
+/// (`Kept::unwatched`), through one Commit that fails and rolls back, then
+/// the next park.
+///
+/// `agent` — 1 runs in its tab, 0 crashed (relaunched once read); `worker` —
+/// 0 none, 1 supervising (no exit handed), 2 handed the exit (`left`) and
+/// not read it yet, 3 read it: the relaunch owed on its back-off; `stop` —
+/// that worker's stop is set: the Commit's, or a hand-over's; `handover` —
+/// a changed policy handed that worker over to a successor
+/// (`Worker::hand_over`); `commit` — 0 `No`, 1 `Stopped`, 2 `Stranded`, 3
+/// `TakenUp`; `unwatched` — a worker the Commit stopped, or one handed over,
+/// ended handed nothing, or the host read an agent back in the tab of a
+/// worker handed its exit (the agent's own worker not started yet); `phase`
+/// — 0 before the Commit, 1 the Commit holds the
+/// host (suspended: no pass hands an exit), 2 the Commit failed (the host
+/// supervises again), 3 rolled back (`relaunch_stranded`), 4 the next park,
+/// 5 its Commit went ahead; `done` — a worker relaunched the agent; `queued` — its relaunch is on the
+/// restored queue; `stale` — an overtaken cold-restore relaunch of the same
+/// tab is still queued (an agent a person started there is the one that
+/// crashed); `captured` — what the next park's layout carries for the tab;
+/// `succ` — that Commit handed the successor the relaunch; `dropped` — it went
+/// ahead with a relaunch queued for the tab that its layout did not carry;
+/// `blind` — the exit the host's mark holds is one a worker handed it cannot
+/// decide: of an agent a landing started that nothing read, its own start
+/// having swept the record the exit before it left and the host's follow
+/// having forgotten the snapshot as it held the tab (only `SettleGone`
+/// marks one).
+///
+/// * `Crash` — the agent crashes, whatever the phase, while a worker or the
+///   host's mark holds it; `Back` — an agent runs in the tab again (the
+///   relaunch's own, or one someone started) and the host reads it: in the
+///   tab of a worker handed its exit, and no stop since, it is the host's
+///   until its own worker starts (`Worker::back` marks it); `Settle` — that
+///   worker reads the agent back, or its relaunch landed (an agent the host
+///   read, or one at a Commit's stop, which marks it), and ends — the agent
+///   running as it reads it; `Rearm` — it reads the agent back gone again
+///   first, in its back-off or at the landing that started it (round two of
+///   the joint audit of 2026-10-01): no stop came, so the exit is its own
+///   relaunch's again, the mark taken back (a stop's is `Decide`'s).
+/// * `Hand` — the host's pass hands the exit to a worker not stopped (never
+///   while suspended); `Read` — the worker reads it, stopped or not (round
+///   twelve: `left_at_commit`); `Relaunch` — its back-off lands, never while
+///   parked (phases 1, 2 and 4); `HandOver` — a changed `[harness]` policy
+///   stops a worker whose agent the pass found in the tab, for a successor
+///   the next pass starts (`Start`): its stop is set before any Commit's.
+/// * `Suspend` — the Commit's stop: every live worker stopped and marked;
+///   `Decide` — a stopped worker owing the relaunch decides on the mark,
+///   however late (round eleven): `Stopped` leaves it stranded, `TakenUp`
+///   queues it; `EndUnhanded` — a stopped worker handed nothing ends, leaving
+///   the exit to the host: one the Commit stopped (round thirteen), or one
+///   handed over (round fourteen), which the Commit's stop does not mark.
+/// * `Resume`, `Rollback` — the Commit failed: the host supervises again, then
+///   a stranded relaunch is queued and a mark not decided becomes `TakenUp`;
+///   `HandUnwatched` — a host supervising (never while suspended) hands an
+///   exit no worker was handed to a worker that reads it alone; `Start` — a
+///   worker for an agent in the tab (both reset the marks); `QueueSteps` —
+///   the queue relaunches it.
+/// * `Overtook` — the cold restore's relaunch of the tab, overtaken by the
+///   agent a person started there, still waits for its retry; `Park` — the
+///   next park captures the queue for the tab; `Commit` — its Commit
+///   re-captures it and goes ahead only where the two captures agree (a
+///   relaunch queued in between refuses it, as activity).
+///
+/// * `NoOwedRelaunchLost` — past the rollback a crashed agent is relaunched,
+///   queued, carried, or held by someone who will: a live worker, the
+///   rollback's stranded mark or the host's unwatched one. Past the next
+///   Commit (phase 5) a worker or a mark still holding it is
+///   `HostHandle::pending_restored_for`'s stated residual — a crash read
+///   after the Commit's re-capture is on neither layout — not this model's
+///   claim, whose next park carries the restored queue alone;
+/// * `NoQueuedRelaunchDropped` — no Commit goes ahead past a relaunch the
+///   queue owes the tab that its layout does not carry.
+///
+/// `Buggy=1` is what shipped, each mutant caught alone: `DecideByPark`
+/// (round ten read a Commit's stop as `Switches::parked`, which the
+/// rollback lifts — a worker deciding after it settled), `StopEndsUnread`
+/// (round eleven read the exit from `left`, which the Commit's stop clears
+/// — a crash handed before the stop was never read), `EndUnhandedForgotten`
+/// (round twelve: a worker the Commit stopped before any exit was handed
+/// ended, and no pass hands an exit to a stopped worker) — each
+/// `NoOwedRelaunchLost` — `EndHandedOverForgotten` (round thirteen marked
+/// only a worker the Commit had marked: one a policy change handed over just
+/// before the Commit's stop was not, and the crash during the hold was read
+/// by nobody — `NoOwedRelaunchLost`), `GoneReadAsStop` (until the joint audit
+/// of 2026-10-01 one flag, `left`, said both "the agent is back" and "a
+/// stop": the host marked nothing as it read the agent back, and a worker
+/// that then read it gone again took the cleared flag for a stop for good —
+/// or its relaunch landed — and ended, settled, with nothing holding the
+/// exit — `NoOwedRelaunchLost`; the model missed it while `Back` settled the
+/// worker at once and no crash came while a worker still held the agent),
+/// `SettleGone` (until round two of that audit a relaunch that landed ended
+/// its worker whatever became of the agent it started: one the host read
+/// back, or one a Commit's stop came for, gone before the worker read it,
+/// left its exit to a worker the host handed it, which could not decide it —
+/// `nothing-recorded`, or the record swept and read as a graceful exit —
+/// `NoOwedRelaunchLost`; the model encoded that path as a landing's `Settle`
+/// while its Tier-1's seams answered a follow of another process `Agent`
+/// and read a snapshot at a bare shell, as no live seam does)
+/// and `ParkFirstFound` (round twelve's
+/// captures read the first relaunch queued for the tab, the overtaken one —
+/// ONE reader, so the mutant sets `firstfound` and the Commit's re-capture,
+/// the same code, reads that way too: both carried nothing, agreed, and the
+/// Commit went ahead — `NoQueuedRelaunchDropped`). One mutant, not a park
+/// mutant and a Commit mutant: either capture alone reading first-found
+/// disagrees with the other and refuses the Commit, so neither alone is a
+/// defect a checker could catch (`ty --strict-vacuity`). Tier-1 (`aterm-gui`'s
+/// `harness_host` tests `the_real_commit_owed_relaunch_conforms_to_its_model`,
+/// `a_crash_after_a_hand_over_conforms_to_the_commit_owed_model` and
+/// `an_agent_back_and_gone_again_conforms_to_the_commit_owed_model`) drives
+/// the real host through both losses of round twelve, the control of the
+/// first (the agent alive across the failed Commit), the hand-over's loss of
+/// round thirteen with a Commit and without, and a relaunch's agent back and
+/// gone again — read in the wait, landed, and across a failed Commit — or
+/// landed in a Commit's hold and gone there, projecting each observed state
+/// onto the model's.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_commit_owed_model() -> Model {
+    crate::ty_model! {
+        HarnessCommitOwed {
+            const Buggy = 0;
+            var agent = 1;
+            var worker = 1;
+            var stop = 0;
+            var handover = 0;
+            var commit = 0;
+            var unwatched = 0;
+            var phase = 0;
+            var done = 0;
+            var queued = 0;
+            var stale = 0;
+            var captured = 0;
+            var succ = 0;
+            var dropped = 0;
+            var firstfound = 0;
+            var blind = 0;
+
+            action Crash when (
+                agent == 1 && (worker > 0 || unwatched == 1) && done == 0 && queued == 0
+            ) {
+                agent = 0;
+            }
+            action Back when (agent == 0) {
+                agent = 1;
+                unwatched = if (worker > 1 && stop == 0) { 1 } else { unwatched };
+            }
+            action Settle when (worker > 1 && agent == 1) {
+                worker = 0;
+                unwatched = if (stop == 1 && (commit == 1 || commit == 3)) { 1 } else { unwatched };
+                commit = 0;
+            }
+            action SettleGone when (
+                Buggy == 1 && worker > 1 && agent == 0 && (unwatched == 1 || stop == 1)
+            ) {
+                worker = 0;
+                unwatched = if (stop == 1 && (commit == 1 || commit == 3)) { 1 } else { unwatched };
+                blind = if (stop == 1 && (commit == 1 || commit == 3)) { 1 } else { unwatched };
+                commit = 0;
+            }
+            action Rearm when (worker > 1 && agent == 0 && unwatched == 1) {
+                unwatched = 0;
+            }
+            action GoneReadAsStop when (
+                Buggy == 1 && worker > 1 && agent == 0 && unwatched == 1 && stop == 0
+            ) {
+                worker = 0;
+                commit = 0;
+                unwatched = 0;
+            }
+            action Hand when (agent == 0 && worker == 1 && stop == 0 && (phase == 0 || phase > 1)) {
+                worker = 2;
+            }
+            action Read when (worker == 2) {
+                worker = 3;
+            }
+            action StopEndsUnread when (Buggy == 1 && worker == 2 && stop == 1) {
+                worker = 0;
+            }
+            action Relaunch when (worker == 3 && stop == 0 && (phase == 0 || phase == 3)) {
+                worker = 0;
+                agent = 1;
+                done = 1;
+            }
+            action HandOver when (agent == 1 && worker == 1 && stop == 0) {
+                stop = 1;
+                handover = 1;
+            }
+            action Suspend when (phase == 0) {
+                phase = 1;
+                stop = if (worker > 0) { 1 } else { stop };
+                commit = if (worker > 0 && stop == 0) { 1 } else { commit };
+            }
+            action Decide when (worker == 3 && stop == 1) {
+                worker = 0;
+                commit = if (commit == 1) { 2 } else { 0 };
+                queued = if (commit == 3) { 1 } else { queued };
+            }
+            action DecideByPark when (Buggy == 1 && worker == 3 && stop == 1 && phase == 3) {
+                worker = 0;
+                commit = 0;
+            }
+            action EndUnhanded when (worker == 1 && stop == 1) {
+                worker = 0;
+                handover = 0;
+                unwatched = if (commit == 1 || commit == 3 || handover == 1) { 1 } else { unwatched };
+            }
+            action EndUnhandedForgotten when (Buggy == 1 && worker == 1 && stop == 1) {
+                worker = 0;
+                handover = 0;
+            }
+            action EndHandedOverForgotten when (
+                Buggy == 1 && worker == 1 && stop == 1 && handover == 1
+            ) {
+                worker = 0;
+                handover = 0;
+                unwatched = if (commit == 1 || commit == 3) { 1 } else { unwatched };
+            }
+            action Resume when (phase == 1) {
+                phase = 2;
+            }
+            action Rollback when (phase == 2) {
+                phase = 3;
+                commit = if (commit == 1) { 3 } else { if (commit == 2) { 0 } else { commit } };
+                queued = if (commit == 2) { 1 } else { queued };
+            }
+            action HandUnwatched when (
+                worker == 0 && agent == 0 && unwatched == 1 && (phase == 0 || phase > 1)
+            ) {
+                worker = if (blind == 1) { 0 } else { 2 };
+                stop = 0;
+                handover = 0;
+                commit = 0;
+                unwatched = 0;
+                blind = 0;
+            }
+            action Start when (worker == 0 && agent == 1 && (phase == 0 || phase > 1)) {
+                worker = 1;
+                stop = 0;
+                handover = 0;
+                commit = 0;
+                unwatched = 0;
+                blind = 0;
+            }
+            action QueueSteps when (queued == 1 && phase == 3) {
+                queued = 0;
+                agent = 1;
+                done = 1;
+            }
+            action Overtook when (phase == 0 && stale == 0) {
+                stale = 1;
+            }
+            action Park when (phase == 3) {
+                phase = 4;
+                captured = queued;
+            }
+            action ParkFirstFound when (Buggy == 1 && phase == 3) {
+                phase = 4;
+                captured = if (stale == 1) { 0 } else { queued };
+                firstfound = 1;
+            }
+            action Commit when (
+                phase == 4
+                    && ((firstfound == 0 && captured == queued)
+                        || (firstfound == 1 && stale == 1 && captured == 0)
+                        || (firstfound == 1 && stale == 0 && captured == queued))
+            ) {
+                phase = 5;
+                succ = captured;
+                dropped = if (queued == 1 && captured == 0) { 1 } else { 0 };
+                queued = 0;
+            }
+
+            invariant NoOwedRelaunchLost: phase <= 2 || agent == 1 || done == 1 || queued == 1
+                || succ == 1 || worker > 0 || unwatched == 1 || commit == 2;
+            invariant NoQueuedRelaunchDropped: dropped == 0;
         }
     }
 }
@@ -197,7 +582,12 @@ pub fn harness_restored_carry_model() -> Model {
 ///   2026-09-25 the next failure past the budget turned the supervisor
 ///   OFF until someone edited `[harness]`: a give-up that waited on a
 ///   person.)
-/// * `Restart` — the pause ends: the next run starts, and the badge goes.
+/// * `Restart` — the failure is told steady: `faulted` is the window's claim that
+///   the supervisor keeps failing (it was a tab badge until 2026-09-28), and it
+///   is withdrawn when a run has outlived its failure
+///   (`HostNote::SupervisorSteady`), not when the next run merely starts — a
+///   restart after the pause leaves it told. `Exit` and `Hold` withdraw it too:
+///   the worker's end steadies it.
 /// * `Age` — the oldest failure leaves the hour's window.
 /// * `Hold` — the claim was refused: the worker ends, its badge with it;
 ///   `Release` — a claim was released or lapsed somewhere, so a held
@@ -212,8 +602,8 @@ pub fn harness_restored_carry_model() -> Model {
 /// (`HeldIsOff`), it counts failures past the window's cap (`FaultBudget`),
 /// and it GIVES UP on a supervisor failing past the budget — the worker
 /// ended with the badge up, nobody supervising and nothing to restart it
-/// (`NeverGivesUp`: a badged session is still supervised, or its badged
-/// worker is on its way out). The shipped
+/// (`NeverGivesUp`: a session whose failure the window was told of is
+/// still supervised, or its worker is on its way out). The shipped
 /// guard on `Fail` is `cur == 1` alone — `faults` never passes `Budget + 1`
 /// there — and the `faults <= Budget + 1` half only bounds the buggy host's
 /// space. Tier-1 (`aterm-gui`'s `harness_host` conformance)
@@ -832,23 +1222,43 @@ pub fn harness_exit_record_model() -> Model {
 ///
 /// For ONE exit of ONE embedded Codex: `exit` 0 it runs, 1 it crashed, 2 its
 /// own `/exit`, 3 someone's signal; `lock` its thread lock is on disk;
-/// `word` the shell has drawn the status; `seen` the look has decided and
-/// `kept` what it found (1 a crash, 2 no crash, 3 no word within its wait);
-/// `decided` 0 no attempt yet, 1 relaunched, 2 left.
+/// `word` the shell has drawn the status; `later` a command run at the
+/// prompt since has finished, its block the newest (a crash's status, the
+/// worst a read of the newest block could take for the TUI's); `seen` the
+/// look has decided and `kept` what it found (1 a crash, 2 no crash, 3 no
+/// word within its wait); `decided` 0 no attempt yet, 1 relaunched, 2 left;
+/// `readable` the TUI's own word could be read when it decided.
+///
+/// Every read is of the block the TUI RAN IN (its snapshot's `block`):
+/// `Look` reads its word while it is the newest finished block, and once a
+/// later command's has taken its place (`blocks 2` holds the last two) it
+/// reads none. The attempt (`Decide`) reads that word again where the look
+/// found none (round three of the joint audit of 2026-10-01: the word comes
+/// through the window's parser, which a seamless update's park stops, and
+/// a prompt can come back later than the look waits).
 ///
 /// `TheirsIsLeft`: an own exit or someone's signal is never relaunched.
-/// `AToldCrashIsRelaunched`: a crash is left only when no word came.
+/// `AToldCrashIsRelaunched`: a crash is left only when its word could not be
+/// read at the attempt either.
 ///
-/// `Buggy = 1` adds two looks, each dead at `Buggy = 0` and caught alone:
-/// the first cut's, which read the lock whenever the shell had not drawn
-/// its word yet (`LookAtLock`: `Signal`, `LookAtLock`, `Decide` relaunches
-/// a person's `kill` — `TheirsIsLeft`), and Claude Code's rule inherited,
-/// silence read at once as a graceful exit (`LookAsClaude`: `Crash`,
-/// `LookAsClaude`, `Decide` leaves a crash — `AToldCrashIsRelaunched`).
-/// Tier-1 (aterm-agent `harness/upgrade_codex_drive_tests.rs`,
+/// `Buggy = 1` adds two looks and two attempts, each dead at `Buggy = 0`
+/// and caught alone: the first cut's look, which read the lock whenever the
+/// shell had not drawn its word yet (`LookAtLock`: `Signal`, `LookAtLock`,
+/// `Decide` relaunches a person's `kill` — `TheirsIsLeft`); Claude Code's
+/// rule inherited, silence read at once as a graceful exit (`LookAsClaude`:
+/// `Crash`, `LookAsClaude`, `Decide` leaves a crash —
+/// `AToldCrashIsRelaunched`); the attempt that decided on the look alone
+/// until round three (`DecideOnLook`: `Crash`, `LookGone`, `ShellWord`,
+/// `DecideOnLook` leaves a crash whose word was there to read —
+/// `AToldCrashIsRelaunched`); and an attempt that reads the newest block
+/// whatever ran it (`DecideOnNewest`: `Signal`, `LookGone`, `ShellWord`,
+/// `Later`, `DecideOnNewest` relaunches a person's `kill` on another
+/// command's failure — `TheirsIsLeft`). Tier-1 (aterm-agent
+/// `harness/upgrade_codex_drive_tests.rs`,
 /// `tier1_the_real_codex_exit_read_conforms_to_the_model`) replays every
-/// look of the model through the real `look_at_exit`, `exit_record` and
-/// `after_exit` over a stand-in tab, the lock on disk as the model has it.
+/// look and every attempt of the model through the real `look_at_exit`,
+/// `exit_record` and `after_exit` over a stand-in tab, the lock on disk and
+/// the blocks drawn as the model has them.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_codex_exit_witness_model() -> Model {
@@ -858,9 +1268,11 @@ pub fn harness_codex_exit_witness_model() -> Model {
             var exit = 0;
             var lock = 1;
             var word = 0;
+            var later = 0;
             var seen = 0;
             var kept = 0;
             var decided = 0;
+            var readable = 0;
 
             action Crash when (exit == 0) {
                 exit = 1;
@@ -875,11 +1287,14 @@ pub fn harness_codex_exit_witness_model() -> Model {
             action ShellWord when (exit > 0 && word == 0) {
                 word = 1;
             }
-            action Look when (exit > 0 && seen == 0 && word == 1) {
+            action Later when (word == 1 && later == 0) {
+                later = 1;
+            }
+            action Look when (exit > 0 && seen == 0 && word == 1 && later == 0) {
                 seen = 1;
                 kept = if exit == 1 { 1 } else { 2 };
             }
-            action LookGone when (exit > 0 && seen == 0 && word == 0) {
+            action LookGone when (exit > 0 && seen == 0 && (word == 0 || later == 1)) {
                 seen = 1;
                 kept = 3;
             }
@@ -892,11 +1307,25 @@ pub fn harness_codex_exit_witness_model() -> Model {
                 kept = 2;
             }
             action Decide when (seen == 1 && decided == 0) {
+                readable = if (kept <= 2 || (word == 1 && later == 0)) { 1 } else { 0 };
+                decided = if (kept == 1 || (kept == 3 && word == 1 && later == 0 && exit == 1)) {
+                    1
+                } else {
+                    2
+                };
+            }
+            action DecideOnLook when (Buggy == 1 && seen == 1 && decided == 0) {
+                readable = if (kept <= 2 || (word == 1 && later == 0)) { 1 } else { 0 };
                 decided = if kept == 1 { 1 } else { 2 };
+            }
+            action DecideOnNewest when (Buggy == 1 && seen == 1 && decided == 0 && kept == 3) {
+                readable = if (word == 1 && later == 0) { 1 } else { 0 };
+                decided = if (later == 1 || (word == 1 && exit == 1)) { 1 } else { 2 };
             }
 
             invariant TheirsIsLeft: exit <= 1 || decided == 0 || decided == 2;
-            invariant AToldCrashIsRelaunched: exit == 0 || exit > 1 || decided <= 1 || kept == 3;
+            invariant AToldCrashIsRelaunched:
+                exit == 0 || exit > 1 || decided <= 1 || readable == 0;
         }
     }
 }
@@ -1004,6 +1433,76 @@ pub fn harness_upgrade_look_model() -> Model {
 
             invariant NeverDropped: done == 1 || due == 0 || looks == 1;
             invariant BehindFromTheAttach: noted == 0 || aged == 1;
+        }
+    }
+}
+
+/// AN AGE BELONGS TO ONE PROCESS (the owner's tab of 2026-09-28, s-3e79…): a
+/// `Pending(to=2.1.283)` record minted 2026-09-25 for the 2.1.274 process
+/// outlived the owner's own restart onto 2.1.283, and when 2.1.284 came the
+/// retarget carried its three-day-old age onto a process that had run the
+/// newest build for a day — "behind for 2 days", a warn row, 11 s after the
+/// build appeared. For ONE conversation: `proc` the process that holds it
+/// (0 the one the record was minted behind, 1 after the owner's restart by
+/// hand); `rec` the record (0 none, 1 counts process 0's age, 2 process 1's);
+/// `behind` the holder runs a build older than the newest one; `aged` the
+/// record's age is past the judging bound (`STALLED_AFTER_S` today); `alarm` a
+/// judgment by that age was made (the row, the tab's mark — whatever reads it).
+/// The session starts behind, its record minted for process 0.
+///
+/// * `Time` — the bound passes on the record.
+/// * `HandRestart` — the owner restarts the agent by hand onto the newest
+///   build: a new process, no longer behind; the record is the old process's.
+/// * `Visit` — the next step finds the session with nothing to move
+///   (`current`): a record for a build it now runs is closed
+///   (`forget_settled_pending`).
+/// * `NewBuild` — a newer build lands: the holder is behind, and the record —
+///   or, none standing, the one the next step mints — counts an age carried
+///   only while it counts THIS process (`St::for_target`).
+/// * `Judge` — something reads the age of a behind session's record, and
+///   raises an alarm when it is past the bound.
+///
+/// `AgeIsThisProcess`: no judgment by an age that is not the holder's.
+/// `Buggy=1` is the build that shipped: the record survives the hand
+/// restart (`Visit` closes nothing), and the retarget carries whatever age
+/// stands. Tier-1: `aterm-agent`'s `the_real_age_conforms_to_the_age_model`
+/// drives the real `St::for_target`, `forget_settled_pending` and the owner's
+/// view over every reachable state.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_upgrade_age_model() -> Model {
+    crate::ty_model! {
+        HarnessUpgradeAge {
+            const Buggy = 0;
+            var proc = 0;
+            var rec = 1;
+            var behind = 1;
+            var aged = 0;
+            var alarm = 0;
+
+            action Time when (aged == 0 && rec > 0) {
+                aged = 1;
+            }
+            action HandRestart when (proc == 0) {
+                proc = 1;
+                behind = 0;
+                alarm = 0;
+            }
+            action Visit when (behind == 0 && rec > 0 && Buggy == 0) {
+                rec = 0;
+                aged = 0;
+                alarm = 0;
+            }
+            action NewBuild when (behind == 0) {
+                behind = 1;
+                rec = if (rec > 0 && (Buggy == 1 || rec == proc + 1)) { rec } else { proc + 1 };
+                aged = if (rec > 0 && (Buggy == 1 || rec == proc + 1)) { aged } else { 0 };
+            }
+            action Judge when (behind == 1 && aged == 1 && alarm == 0) {
+                alarm = 1;
+            }
+
+            invariant AgeIsThisProcess: alarm == 0 || rec == proc + 1;
         }
     }
 }

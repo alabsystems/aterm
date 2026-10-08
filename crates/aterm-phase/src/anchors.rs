@@ -14,11 +14,17 @@
 //! Codex's strings are their own table, [`CODEX_ANCHORS`] (ids `codex.…`);
 //! [`anchor`] and [`anchor_text`] read both.
 //!
-//! The ignored tests `every_literal_anchor_is_in_the_store_claude` and
+//! The tests `every_literal_anchor_is_in_the_store_claude` and
 //! `every_literal_codex_anchor_is_in_the_store_codex` grep the store's
 //! binaries for every [`AnchorKind::Literal`] row (the Codex one for every
-//! [`crate::codex::WALLS`] phrase too) and print the misses — the drift
-//! canaries to run when a pinned build moves.
+//! [`crate::codex::WALLS`] phrase too) and name the misses — the drift
+//! canaries. Both RUN in the suite (the merge gate's included) wherever a
+//! store binary is found (`$ATERM_CLAUDE_BIN` / `$ATERM_CODEX_BIN`, else
+//! `aterm pkg which <program>`), so a new build the vendor's auto-updater or
+//! `aterm pkg update` brought is judged by the next gate run, and say so
+//! loudly and return where there is none — a canary that could not look has
+//! not passed, and is not counted as having. Neither is `#[ignore]`d: an
+//! ignored test is run by nobody.
 
 /// How an anchor's text reaches the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,9 +107,15 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.282",
     ),
     lit("box.reason_hook", "Hook ", "2.1.282"),
+    // A remote session's hook, as the head and the tail every build shares:
+    // 2.1.282 wrote `A hook configured in the remote workspace requires
+    // confirmation: <reason>`, 2.1.287 `A hook run for this remote session
+    // requires confirmation: <reason>` (read from both binaries' strings).
+    // The old sentence whole matched no 2.1.287 box.
+    lit("box.reason_remote_hook", "A hook ", "2.1.282"),
     lit(
-        "box.reason_remote_hook",
-        "A hook configured in the remote workspace requires confirmation: ",
+        "box.reason_remote_confirm",
+        "requires confirmation: ",
         "2.1.282",
     ),
     // The Bash box's `No` under Tab: an input whose placeholder this is,
@@ -116,12 +128,39 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.280",
     ),
     hint("prompt.confirm", "Enter to confirm", "2.1.280"),
+    // The note 2.1.291 appends to the FOOTER of a permission box a SUBAGENT or a
+    // workflow's agent raised (`ZTe()`, for an async agent: every subagent the lab
+    // started drew it, `run_in_background` true, absent or false): the kill-agents
+    // chord and an action joined by one space, where every other hint says ` to `
+    // (`terse`) — `Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop
+    // background agents`, `again` once the first press is in. The chord is the
+    // user's binding (`chat:killAgents`). MEASURED on 2.1.291 and 2.1.292
+    // (`claude-2.1.292-box-bash-background-agent.txt`): before it the footer was
+    // read as no footer at all, and the box as no box.
+    lit(
+        "hint.agents_twice",
+        "twice to stop background agents",
+        "2.1.291",
+    ),
+    lit(
+        "hint.agents_again",
+        "again to stop background agents",
+        "2.1.291",
+    ),
     lit("box.bash", "Bash command", "2.1.267"),
     lit("box.edit", "Edit file", "2.1.267"),
     lit("box.write", "Write file", "2.1.267"),
     lit("box.create", "Create file", "2.1.267"),
     lit("box.overwrite", "Overwrite file", "2.1.280"),
     lit("box.read", "Read file", "2.1.267"),
+    // The folder grant on a Read box for a folder OUTSIDE Claude Code's working
+    // set (`Yes, allow reading from /etc and /private/etc during this session`;
+    // 2.1.287: `… from this project`): none on a box for a path inside it.
+    lit("box.read_grant", "allow reading from ", "2.1.282"),
+    // A Read box's call, `Read(<path>)` (the tool's name and its argument,
+    // joined at draw time): alone under the title in 2.1.284, between two
+    // dashed rules from 2.1.287.
+    composed("box.read_call", "Read(", "2.1.284"),
     lit("box.workflow", "Run a dynamic workflow?", "2.1.267"),
     // The rest of the permission boxes' titles (the `title` each dialog hands
     // its Ei() box, read from the 2.1.282 render code and present in the
@@ -281,7 +320,7 @@ pub const ANCHORS: &[Anchor] = &[
     // The tool result's row when a person pressed Esc on the dialog or
     // `2. Cancel` on its review tab (measured 2026-09-25, S7 and S8): the
     // model is told to STOP, so the turn it ends is a person's stop
-    // (`crate::turn::interrupted`), never one to continue (R12).
+    // (`crate::turn::interrupted`), never one to continue.
     lit(
         "question.declined",
         "User declined to answer questions",
@@ -397,6 +436,17 @@ pub const ANCHORS: &[Anchor] = &[
     // (`aterm_agent::harness::footer::live_repl_row`).
     lit("footer.shortcuts", "? for shortcuts", "2.1.283"),
     hint("footer.clear", "esc to clear", "2.1.283"),
+    // The permission-mode pill on that row: a glyph, the mode's indicator and
+    // ` on`, joined at run time (`⏵⏵ bypass permissions on`, `⏸ manual mode
+    // on`), then the cycle key's hint (`(shift+tab to cycle)`). The footer and
+    // the mode light read the mode from it (`aterm_agent::harness::footer`).
+    composed("mode.bypass", "bypass permissions on", "2.1.283"),
+    composed("mode.auto", "auto mode on", "2.1.283"),
+    composed("mode.accept_edits", "accept edits on", "2.1.283"),
+    composed("mode.dont_ask", "don't ask on", "2.1.283"),
+    composed("mode.plan", "plan mode on", "2.1.283"),
+    composed("mode.manual", "manual mode on", "2.1.283"),
+    hint("mode.cycle", "to cycle", "2.1.283"),
     // A turn a person stopped with Esc: the vendor's row under the last
     // message or tool row (`  ⎿  Interrupted · What should Claude do
     // instead?`, measured 2026-09-23 on the lane probe's worker).
@@ -410,10 +460,71 @@ pub const ANCHORS: &[Anchor] = &[
         "How is Claude doing this session",
         "2.1.267",
     ),
+    // The rest of the rating cards, drawn by the same component as the session
+    // survey (`VM` in 2.1.284) in the same slot above the composer, each with the
+    // options row `1: Bad … 0: Dismiss` under its question. Read from the render
+    // code and present in the 2.1.284 store binary; HAND-BUILT in the fixtures until
+    // a capture replaces them (only the session survey has one). `survey.plugin` is
+    // the head both of its spellings share (`How helpful has the <plugin> plugin
+    // been?`, `How helpful has this plugin been?`); the memory card is either of the
+    // two heads, the recollection row being its last message row.
+    lit(
+        "survey.long_context",
+        "How well is Claude following the instructions you gave earlier in this conversation",
+        "2.1.284",
+    ),
+    lit("survey.plugin", "How helpful has", "2.1.284"),
+    lit("survey.memory", "Claude recalled a memory:", "2.1.284"),
+    lit(
+        "survey.memory_plain",
+        "How well did Claude use its memory?",
+        "2.1.284",
+    ),
+    lit(
+        "survey.memory_recollection",
+        "How was Claude's recollection?",
+        "2.1.284",
+    ),
+    // The rating's own aftermath, drawn in the card's slot after a person's `1`/`2`/`3`
+    // (`t1e` and `o1e` in 2.1.286, MEASURED on it 2026-10-01): for 3 s `Feedback: <Bad |
+    // Fine | Good | Unsure> · Esc to undo` (the key word is the user's `escape` binding),
+    // then for 5 s `Thanks for the feedback!` over `(Optional) Press [1] to tell us what
+    // went wrong · /feedback` — or, where the follow-up is off, `Use /feedback to share
+    // detailed feedback anytime.` (the render code's other branch, not captured).
+    lit("survey.pending", "Feedback: ", "2.1.286"),
+    hint("survey.pending_undo", "Esc to undo", "2.1.286"),
+    lit("survey.thanks", "Thanks for the feedback!", "2.1.286"),
+    lit("survey.optional_press", "(Optional) Press [", "2.1.286"),
+    lit(
+        "survey.feedback_anytime",
+        "Use /feedback to share detailed feedback anytime.",
+        "2.1.286",
+    ),
+    // The Claude-drafted-feedback card (`SendFeedback`, on for accounts whose flag
+    // is): parked in the same slot, NOT a survey — the readers step over it and
+    // nothing presses it. Its head is `<glyph> <Label> drafted: <title>`; its hint
+    // row is composed from key hints.
+    lit("card.drafted", "drafted:", "2.1.284"),
+    hint(
+        "card.drafts_hint",
+        "1 to review · 2 to send · 0 to dismiss",
+        "2.1.284",
+    ),
+    // The `Don't ask again` choice the transcript-share ask (`y: Yes    n: No     d:
+    // Don't ask again`, `Ele` in 2.1.284) and the web-setup offer share: the label
+    // that tells those prompts from a rating card, whose options row ends `0: Dismiss`.
+    // Read from the render code and present in the 2.1.284 store binary; never pressed.
+    lit("card.dont_ask", "Don't ask again", "2.1.284"),
     lit("context.indicator", "until auto-compact", "2.1.267"),
     // The launch card's name row (`▐▛███▜▌   Claude Code v2.1.282`): a
     // session with no turn yet (`turn::fresh`).
     lit("launch.banner", "Claude Code v", "2.1.267"),
+    // What an EXITING Claude Code prints under its last frame, alone on its
+    // row in column 0 (`\nResume this session with:\nclaude --resume <id>`,
+    // the 2.1.283 binary's resume hint; measured after `/exit` and after
+    // Ctrl-C twice, 2026-09-27): every row above it was drawn by a process
+    // that has exited (`phase::busy_zone_start`).
+    lit("exit.resume", "Resume this session with:", "2.1.283"),
     lit("goal.active", "/goal active", "2.1.278"),
     // The model-refusal pause (`refusal_fallback_prompt`, read from the
     // 2.1.282 render code; both strings in the 2.1.283 binary): its title,
@@ -443,6 +554,89 @@ pub const ANCHORS: &[Anchor] = &[
     lit("effort.auto", "Effort level set to auto", "2.1.283"),
     lit("fast.on", "Fast mode ON", "2.1.283"),
     lit("fast.model_set", "model set to ", "2.1.283"),
+    // The Usage tab of the Settings panel (`/usage`), for the accounts probe
+    // (`crate::panel`, `docs/SPEC-claude-accounts-probe-2026-10-01.md`). READ
+    // in the 2.1.287 bundle's plan-limits component: the loading line and
+    // the refresh line (each `…`-ended on the screen; the bundle spells the
+    // `…` as an escape, so the rows carry the words without it), the four
+    // enrich-error lines' heads, the failed load's reason (drawn after
+    // `Error: `), and the result the panel closes with on Escape. MEASURED
+    // on a 2.1.287 screen, 2026-10-01: `Refreshing…` above the cancel hint
+    // (`prompt::fixtures::USAGE_REFRESHING`), and `⎿  Settings dialog
+    // dismissed` under `❯ /usage` after the Escape under the INLINE renderer
+    // (the fullscreen one leaves no row); the rest were not seen.
+    // `usage.refreshing` is one word: a matcher that spells it spells it
+    // quoted, which is what `grep_guard`'s V1 fences.
+    lit("usage.refreshing", "Refreshing", "2.1.287"),
+    lit("usage.loading", "Loading usage data", "2.1.287"),
+    lit("usage.last_known", "Showing last-known usage", "2.1.287"),
+    lit(
+        "usage.could_not_refresh",
+        "Could not refresh usage data",
+        "2.1.287",
+    ),
+    lit("usage.partial", "Partial usage data", "2.1.287"),
+    lit(
+        "usage.per_model",
+        "Per-model breakdown unavailable",
+        "2.1.287",
+    ),
+    lit("usage.load_failed", "Failed to load usage data", "2.1.287"),
+    lit("usage.dismissed", "Settings dialog dismissed", "2.1.287"),
+    // The limit reset (`crate::reset`,
+    // `docs/SPEC-claude-accounts-resets-2026-10-02.md`). EVERY ROW IS READ
+    // in the 2.1.287 bundle and NONE WAS SEEN on a screen or in a
+    // transcript: the offer's texts are one table there (`lg`), the pending
+    // lines and the answers their own literals, and the server's flag
+    // payload may replace any text of the table. The rows are the words the
+    // readers match by, never a whole template: the grant row's head and the
+    // words between its count and its day (`Use your reset now ({left} left,
+    // until {date})`); the weekly session reset's row, which the vendor
+    // draws in the grant row's slot; the confirmation's title, the head of
+    // its body, the two joins of body and detail (`Refills your {limits} now
+    // · your weekly reset day stays {week}`, `{resets} left · use by
+    // {deadline}`), its yes and its no, and the tail both early lines share
+    // (`… — use your reset anyway?`); the two pending lines, each `…`-ended
+    // on the screen (an escape in the bundle, so the rows carry the words
+    // without it); and of the answers the four a reader tells apart — the
+    // spent line's head, the two lifted lines, the kept line's head, the
+    // login line's — with the ending the vendor adds where it queued no
+    // continuation of its own. The other answers are no rows on purpose: a
+    // line no row names is a failure.
+    lit("reset.row", "Use your reset now", "2.1.287"),
+    lit("reset.row.until", "left, until", "2.1.287"),
+    lit(
+        "reset.weekly_row",
+        "Reset your session limit now",
+        "2.1.287",
+    ),
+    lit("reset.confirm.title", "Use your reset?", "2.1.287"),
+    lit("reset.confirm.refills", "Refills your", "2.1.287"),
+    lit(
+        "reset.confirm.stays",
+        "now · your weekly reset day stays",
+        "2.1.287",
+    ),
+    lit("reset.confirm.use_by", "left · use by", "2.1.287"),
+    lit("reset.yes", "Yes, use my reset", "2.1.287"),
+    lit("reset.no", "No, keep it", "2.1.287"),
+    lit("reset.early", "use your reset anyway?", "2.1.287"),
+    lit("reset.checking", "Checking for a reset", "2.1.287"),
+    lit("reset.resetting", "Resetting your limits", "2.1.287"),
+    lit("reset.done", "Limits reset", "2.1.287"),
+    lit(
+        "reset.lifted",
+        "Your limit had already reset on its own · nothing was used",
+        "2.1.287",
+    ),
+    lit("reset.clear", "Your limits are clear", "2.1.287"),
+    lit("reset.kept", "Reset kept", "2.1.287"),
+    lit(
+        "reset.login",
+        "Couldn't reset your limits with this login",
+        "2.1.287",
+    ),
+    lit("reset.continue", "send a message to continue", "2.1.287"),
     // The walls (see `wall::PHRASES` for the whole classification table).
     lit("wall.fable", "You've reached your Fable limit", "2.1.267"),
     lit("wall.auto_continue", "continuing automatically", "2.1.268"),
@@ -457,6 +651,21 @@ pub const ANCHORS: &[Anchor] = &[
     // The vendor's API-error message row opens with it (`phase::error_row_notice`).
     lit("wall.api_error", "API Error", "2.1.283"),
     lit("wall.goal_paused", "Goal paused", "2.1.280"),
+    // The other /goal echoes, and the cause the loop reads through them.
+    lit("wall.goal_still", "Goal still active", "2.1.283"),
+    lit(
+        "wall.goal_cleared",
+        "Goal cleared after an unrecoverable error",
+        "2.1.283",
+    ),
+    lit(
+        "wall.goal_auto",
+        "continues automatically when it resets",
+        "2.1.283",
+    ),
+    // The head of the vendor's word that a `/compact` could not lower the context (`Compaction failed · conversation
+    // could not be reduced below the context limit`); the wall table reads the same row (`wall::PHRASES`).
+    lit("wall.compaction_failed", "Compaction failed", "2.1.286"),
     // Claude Code's critical-memory banner, right-aligned on its own row
     // between the spinner and the composer's top rule (`<anchor> (140.4GB) —
     // restart and resume with claude --continue`, measured 2026-09-24 on the
@@ -517,9 +726,12 @@ pub const CODEX_ANCHORS: &[Anchor] = &[
         "0.156.1",
     ),
     lit("codex.turn.worked", "Worked for", "0.156.1"),
+    // The head of the Esc row, which is all 0.156.1 and 0.159.0 share: the
+    // first went on `tell the model what to do differently.`, the second
+    // (its binary's strings) on `use /feedback if something went wrong`.
     lit(
         "codex.turn.interrupted",
-        "Conversation interrupted - tell the model what to do differently.",
+        "Conversation interrupted - ",
         "0.156.1",
     ),
     lit("codex.context.left", "% context left", "0.156.1"),
@@ -667,9 +879,195 @@ pub fn guard_regex(text: &str) -> String {
     out
 }
 
+/// Whether `bytes` are a build of a program rather than a stub: a Mach-O or
+/// ELF header, or at least [`MIN_BUILD_BYTES`]. A reroute stub
+/// (`<prefix>/reroute/<program>`, a few lines of shell) answers `aterm pkg
+/// which` on a box whose resolved token is the stub itself; it holds none of
+/// the anchors, so "missing" would be the stub's, not the build's.
+#[cfg(test)]
+pub(crate) fn looks_like_a_build(bytes: &[u8]) -> bool {
+    const MAGICS: [[u8; 4]; 6] = [
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xcf, 0xfa, 0xed, 0xfe],
+        [0xca, 0xfe, 0xba, 0xbe],
+        [0x7f, b'E', b'L', b'F'],
+    ];
+    bytes.len() >= MIN_BUILD_BYTES
+        || bytes
+            .get(..4)
+            .is_some_and(|head| MAGICS.iter().any(|magic| magic == head))
+}
+
+/// Below this, a file that is no native executable is a stub script.
+#[cfg(test)]
+const MIN_BUILD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Whether `needle` occurs in `hay` (Boyer-Moore-Horspool: a 225 MB binary
+/// is scanned in a fraction of a second per needle, where a window-by-
+/// window compare took most of a minute for the table).
+#[cfg(test)]
+pub(crate) fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    let n = needle.len();
+    if n == 0 {
+        return true;
+    }
+    if hay.len() < n {
+        return false;
+    }
+    let mut skip = [n; 256];
+    for (i, &b) in needle[..n - 1].iter().enumerate() {
+        skip[usize::from(b)] = n - 1 - i;
+    }
+    let mut at = 0;
+    while at + n <= hay.len() {
+        if &hay[at..at + n] == needle {
+            return true;
+        }
+        at += skip[usize::from(hay[at + n - 1])];
+    }
+    false
+}
+
+/// Where the store keeps managed programs under `home`: MIRRORS
+/// `atpkg::platform::default_prefix` (this crate has no dependencies, and a
+/// moved prefix makes a canary say `CANARY NOT RUN`, never pass).
+#[cfg(test)]
+fn canary_prefix(home: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("aterm")
+            .join("pkg")
+    } else {
+        home.join(".local").join("share").join("aterm").join("pkg")
+    }
+}
+
+/// The path the drift canaries read a program's build at, from the first line
+/// `aterm pkg which <program>` prints. Its head ends in the copy that runs in
+/// the shell that asked, and that is the MANAGED build only when it lies in
+/// the store (`claude → <shim> → … → <prefix>/store/claude/<build>/bin/claude
+/// — managed 2.1.286 — …`). Any other — a system copy, one SHADOWED by a copy
+/// ahead on PATH, or a managed program whose row says `not what runs outside
+/// aterm: … this shell's own copy` (atpkg's outside-aterm rows, `state.rs`) —
+/// names a copy aterm does not manage (an old brew build judged against the
+/// managed build's anchors turns the gate red). The managed copy is then read
+/// where the store keeps it
+/// (`<prefix>/store/<program>/current/bin/<program>`), and `None` where that
+/// is not there either.
+#[cfg(test)]
+pub(crate) fn canary_path(
+    which_line: &str,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let (head, said) = which_line
+        .split_once(" \u{2014} ")
+        .unwrap_or((which_line, ""));
+    let program = head.split(" \u{2192} ").next()?.trim();
+    if said.starts_with("managed")
+        && let Some(end) = head
+            .rsplit(" \u{2192} ")
+            .next()
+            .map(str::trim)
+            .filter(|end| in_store(end, program))
+    {
+        return Some(end.into());
+    }
+    let current = canary_prefix(home?)
+        .join("store")
+        .join(program)
+        .join("current")
+        .join("bin")
+        .join(program);
+    current.exists().then_some(current)
+}
+
+/// Whether `path` lies in a store's tree for `program` (`…/store/<program>/…`),
+/// the layout [`canary_path`]'s fallback reads.
+#[cfg(test)]
+fn in_store(path: &str, program: &str) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = std::path::Path::new(path)
+        .components()
+        .map(|c| c.as_os_str())
+        .collect();
+    parts.windows(2).any(|w| w[0] == "store" && w[1] == program)
+}
+
+/// [`canary_path`] for `program`: `$<env>` first, else what `aterm pkg which`
+/// says (`None` where it says nothing).
+#[cfg(test)]
+pub(crate) fn canary_binary(program: &str, env: &str) -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os(env) {
+        return Some(path.into());
+    }
+    let out = std::process::Command::new("aterm")
+        .args(["pkg", "which", program])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    canary_path(text.lines().next()?, home.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE CANARIES READ THE MANAGED BUILD, whatever copy stands ahead on
+    /// PATH: the first line of `aterm pkg which` names the store's binary only
+    /// when it says `managed` AND its head ends in the store. Behind a brew
+    /// cask's `claude` it says SHADOWED and names THAT copy; in a shell outside
+    /// aterm whose reroute stub passes through (or that has none) it says
+    /// `managed …` and then `not what runs outside aterm`, its head the shell's
+    /// own copy. NEGATIVE
+    /// CONTROLS: with no managed copy where the store keeps one, a shadowed,
+    /// outside-aterm or system line names nothing to read.
+    #[test]
+    fn the_canaries_read_the_managed_build_whatever_stands_ahead_on_path() {
+        let managed = "claude \u{2192} /p/reroute/claude \u{2192} /p/agents/claude \u{2192} \
+                       /p/store/claude/1000002000001000286/bin/claude \u{2014} managed 2.1.286 \
+                       \u{2014} Anthropic latest";
+        let shadowed = "claude \u{2192} /opt/homebrew/bin/claude \u{2014} managed 2.1.286 \u{2014} \
+                        SHADOWED in this shell by /opt/homebrew/bin/claude: its PATH has /p/agents \
+                        behind /opt/homebrew/bin";
+        let system =
+            "claude \u{2192} /usr/local/bin/claude \u{2014} system copy (not managed by aterm)";
+        // atpkg `state.rs` agent_passed_through / agent_own_copy_outside_aterm.
+        let passed_through = "claude \u{2192} /opt/homebrew/bin/claude \u{2014} managed 2.1.286 \
+                              \u{2014} not what runs outside aterm: /p/reroute/claude passes \
+                              through to /opt/homebrew/bin/claude, this shell's own copy (the \
+                              managed copy leads inside aterm only; aterm help reroute)";
+        let own_copy = "claude \u{2192} /opt/homebrew/bin/claude \u{2014} managed 2.1.286 \
+                        \u{2014} not what runs outside aterm: /opt/homebrew/bin/claude runs \
+                        here, this shell's own copy (the managed copy leads inside aterm only; \
+                        aterm help reroute)";
+        assert_eq!(
+            canary_path(managed, None),
+            Some("/p/store/claude/1000002000001000286/bin/claude".into()),
+            "a managed line ends in the store's binary"
+        );
+        let home = std::env::temp_dir().join(format!("aterm-phase-canary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let current = canary_prefix(&home).join("store/claude/current/bin");
+        std::fs::create_dir_all(&current).expect("a store directory");
+        std::fs::write(current.join("claude"), b"a build").expect("a binary");
+        for line in [shadowed, passed_through, own_copy, system] {
+            assert_eq!(
+                canary_path(line, Some(&home)),
+                Some(current.join("claude")),
+                "{line}"
+            );
+            assert_eq!(
+                canary_path(line, Some(&home.join("nowhere"))),
+                None,
+                "{line}"
+            );
+            assert_eq!(canary_path(line, None), None, "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn ids_are_unique_and_every_text_is_non_empty() {
@@ -736,34 +1134,62 @@ mod tests {
         );
     }
 
-    /// The drift canaries (run by hand when a pinned build moves:
-    /// `targo --unverified test -p aterm-phase -- --ignored --nocapture`).
-    /// Each reads `$<env>`, else asks `aterm pkg which <program>` for the
-    /// store path, and FAILS naming every literal anchor the binary no
-    /// longer has — and when it finds no binary, since a canary that cannot
-    /// look has not passed. A `·` in an anchor is drawn from a `\xB7`
-    /// escape, so each side of it is looked for on its own.
-    fn store_binary(program: &str, env: &str) -> (String, Vec<u8>) {
-        let path = std::env::var(env).ok().or_else(|| {
-            let out = std::process::Command::new("aterm")
-                .args(["pkg", "which", program])
-                .output()
-                .ok()?;
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            // `<program> → <shim> → … → <store path> — managed …`
-            let first = text.lines().next()?;
-            let head = first.split(" — ").next().unwrap_or(first);
-            head.rsplit(" → ").next().map(|s| s.trim().to_string())
-        });
-        let Some(path) = path else {
-            panic!("no {program} binary found: set {env}");
+    /// The drift canaries (they run in the suite; `--nocapture` shows which
+    /// binary answered). Each reads `$<env>`, else asks `aterm pkg which
+    /// <program>` for the store path, and FAILS naming every literal anchor
+    /// the binary no longer has; where it finds no build it says `CANARY
+    /// NOT RUN` and returns, for a canary that could not look has not
+    /// passed. A `·` in an anchor is drawn from a `\xB7` escape, so each
+    /// side of it is looked for on its own.
+    fn store_binary(program: &str, env: &str) -> Option<(String, Vec<u8>)> {
+        let path = super::canary_binary(program, env)?
+            .to_string_lossy()
+            .into_owned();
+        let bytes = std::fs::read(&path).ok()?;
+        if !super::looks_like_a_build(&bytes) {
+            eprintln!("{path} is a script of a few lines, not a build: skipped");
+            return None;
+        }
+        Some((path, bytes))
+    }
+
+    /// The dotted version `<path> --version` prints (`2.1.286 (Claude Code)`,
+    /// `codex-cli 0.130.0`), or `None` when it cannot be read.
+    fn build_version(path: &str) -> Option<String> {
+        let out = std::process::Command::new(path)
+            .arg("--version")
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .find(|w| {
+                w.split('.').count() >= 2
+                    && w.split('.')
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .map(str::to_string)
+    }
+
+    /// Whether dotted version `a` is newer than `b`, numerically part by part.
+    fn newer_than(a: &str, b: &str) -> bool {
+        let parts = |v: &str| {
+            v.split('.')
+                .map(|p| p.parse::<u64>().unwrap_or(0))
+                .collect::<Vec<_>>()
         };
-        let bytes = std::fs::read(&path).expect("read the binary");
-        (path, bytes)
+        parts(a) > parts(b)
+    }
+
+    #[test]
+    fn an_anchor_newer_than_the_build_is_not_owed_and_versions_compare_by_number() {
+        assert!(newer_than("2.1.291", "2.1.286"));
+        assert!(!newer_than("2.1.286", "2.1.286"));
+        assert!(!newer_than("2.1.9", "2.1.10"), "by number, not by text");
+        assert!(newer_than("0.130.0", "0.99.0"));
     }
 
     fn contains(bytes: &[u8], needle: &str) -> bool {
-        bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+        super::contains_bytes(bytes, needle.as_bytes())
     }
 
     /// The literal anchors of `table` missing from `bytes`, and the
@@ -788,6 +1214,52 @@ mod tests {
         out
     }
 
+    /// The scan finds a needle wherever it stands — first bytes, last bytes,
+    /// after a near miss — and not one that is absent.
+    #[test]
+    fn the_scan_finds_a_needle_wherever_it_stands() {
+        let hay = b"xxabcabdabcabcxx";
+        for needle in [&b"abcabc"[..], b"xx", b"abd", b"cxx", b"x"] {
+            assert!(
+                super::contains_bytes(hay, needle),
+                "{}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        for needle in [&b"abcabx"[..], b"xxx", b"dabd", b"abcabcxxx"] {
+            assert!(
+                !super::contains_bytes(hay, needle),
+                "{}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        assert!(
+            super::contains_bytes(b"a", b"a")
+                && !super::contains_bytes(b"", b"a")
+                && super::contains_bytes(b"", b"")
+        );
+    }
+
+    /// A reroute stub is no build: the canaries skip it (`CANARY NOT RUN`)
+    /// instead of naming every anchor missing from a few lines of shell.
+    /// NEGATIVE CONTROLS: a Mach-O or ELF header, and a file of several
+    /// megabytes, are builds.
+    #[test]
+    fn a_stub_script_is_no_build() {
+        assert!(!super::looks_like_a_build(
+            b"#!/bin/sh\nexec aterm pkg run claude \"$@\"\n"
+        ));
+        assert!(!super::looks_like_a_build(b""));
+        assert!(super::looks_like_a_build(&[
+            0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1
+        ]));
+        assert!(super::looks_like_a_build(b"\x7fELF\x02\x01\x01"));
+        assert!(super::looks_like_a_build(&vec![
+            b'#';
+            super::MIN_BUILD_BYTES
+        ]));
+    }
+
     /// The canary's matcher on a stand-in binary. NEGATIVE CONTROL: a wall
     /// phrase or an anchor the bytes lack is named.
     #[test]
@@ -807,8 +1279,31 @@ mod tests {
     }
 
     fn literal_anchors_are_in_the_store(program: &str, env: &str, table: &[Anchor], walls: bool) {
-        let (path, bytes) = store_binary(program, env);
-        let missing = missing(&bytes, table, walls);
+        let Some((path, bytes)) = store_binary(program, env) else {
+            eprintln!(
+                "CANARY NOT RUN: no {program} binary (set {env} or `aterm pkg install \
+                 {program}`); anchors not checked"
+            );
+            return;
+        };
+        // AN ANCHOR IS OWED ONLY BY THE BUILDS IT WAS WRITTEN FOR: each carries
+        // the version it was measured on (`since`), and a store holding an older
+        // build is not a build that lost it. A version that cannot be read owes
+        // every anchor.
+        let version = build_version(&path);
+        let (owed, newer): (Vec<Anchor>, Vec<Anchor>) = table
+            .iter()
+            .copied()
+            .partition(|a| version.as_deref().is_none_or(|v| !newer_than(a.since, v)));
+        if !newer.is_empty() {
+            eprintln!(
+                "{path}: {} anchor(s) are for builds newer than {}, not checked: {:?}",
+                newer.len(),
+                version.as_deref().unwrap_or("?"),
+                newer.iter().map(|a| a.id).collect::<Vec<_>>()
+            );
+        }
+        let missing = missing(&bytes, &owed, walls);
         assert!(
             missing.is_empty(),
             "{path}: {} literal anchors or wall phrases missing: {missing:?}",
@@ -818,13 +1313,131 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reads the installed claude binary"]
     fn every_literal_anchor_is_in_the_store_claude() {
         literal_anchors_are_in_the_store("claude", "ATERM_CLAUDE_BIN", ANCHORS, false);
     }
 
+    /// THE LIMIT RESET'S TEMPLATES, WHOLE, as the bundle spells them — a `·`
+    /// as its `\xB7` escape, a value as its `{placeholder}` — each built
+    /// from the rows the readers match by (`crate::reset`) and named by the
+    /// row it stands for: the grant row, the confirmation's body and its
+    /// detail, and the opening of each answer a reader tells apart.
+    ///
+    /// [`missing`] looks for each side of a `·` on its own, and the sides of
+    /// the confirmation's two joins are `now`, `left` and `use by`: words a
+    /// build that rewords the confirmation still carries elsewhere. A
+    /// template is ONE literal of the vendor's table, so a reworded one is
+    /// missing — and what a rewording costs is every confirmation read
+    /// inexact and Escaped, the wall's one attempt with it.
+    fn reset_templates() -> Vec<(&'static str, String)> {
+        let escaped = |id: &str| anchor(id).replace('·', "\\xB7");
+        let led = |id: &str| format!("{} \\xB7 ", anchor(id));
+        vec![
+            (
+                "reset.row.until",
+                format!(
+                    "{} ({{left}} {} {{date}})",
+                    anchor("reset.row"),
+                    anchor("reset.row.until")
+                ),
+            ),
+            (
+                "reset.confirm.stays",
+                format!(
+                    "{} {{limits}} {} {{week}}",
+                    anchor("reset.confirm.refills"),
+                    escaped("reset.confirm.stays")
+                ),
+            ),
+            (
+                "reset.confirm.use_by",
+                format!(
+                    "{{resets}} {} {{deadline}}",
+                    escaped("reset.confirm.use_by")
+                ),
+            ),
+            ("reset.done", led("reset.done")),
+            ("reset.kept", led("reset.kept")),
+            ("reset.lifted", escaped("reset.lifted")),
+            ("reset.login", led("reset.login")),
+        ]
+    }
+
+    /// The rows whose template `bytes` do not hold whole.
+    fn missing_templates(bytes: &[u8]) -> Vec<&'static str> {
+        reset_templates()
+            .iter()
+            .filter(|(_, template)| !contains(bytes, template))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// The templates' matcher on a stand-in binary: one that carries each is
+    /// missing none. NEGATIVE CONTROL, and why the templates are looked for
+    /// whole: with the confirmation's detail reworded and the footer
+    /// notice's `{resets} left \xB7 use by {date}` still there, the table's
+    /// own canary finds every side of every reset row and names nothing,
+    /// and this one names the row.
     #[test]
-    #[ignore = "reads the installed codex binary"]
+    fn a_reworded_reset_template_is_named_though_its_sides_remain() {
+        let table: Vec<Anchor> = ANCHORS
+            .iter()
+            .filter(|a| a.id.starts_with("reset."))
+            .copied()
+            .collect();
+        let notice = "/limit-reset to refill your limits \\xB7 {resets} left \\xB7 use by {date}";
+        let every = table
+            .iter()
+            .map(|a| a.text.to_string())
+            .chain(reset_templates().into_iter().map(|(_, template)| template))
+            .chain([notice.to_string()])
+            .collect::<Vec<_>>()
+            .join("\0");
+        assert!(missing(every.as_bytes(), &table, false).is_empty());
+        assert_eq!(missing_templates(every.as_bytes()), Vec::<&str>::new());
+        let reworded = every.replace(
+            "{resets} left \\xB7 use by {deadline}",
+            "{resets} remaining \\xB7 expires {deadline}",
+        );
+        assert_ne!(reworded, every);
+        assert!(missing(reworded.as_bytes(), &table, false).is_empty());
+        assert_eq!(
+            missing_templates(reworded.as_bytes()),
+            vec!["reset.confirm.use_by"]
+        );
+        let reworded = every.replace(
+            "now \\xB7 your weekly reset day stays {week}",
+            "today \\xB7 your weekly reset day stays {week}",
+        );
+        assert!(missing(reworded.as_bytes(), &table, false).is_empty());
+        assert_eq!(
+            missing_templates(reworded.as_bytes()),
+            vec!["reset.confirm.stays"]
+        );
+    }
+
+    /// The drift canary for [`reset_templates`], run and skipped as the
+    /// table's own is ([`store_binary`]).
+    #[test]
+    fn every_reset_template_is_whole_in_the_store_claude() {
+        let Some((path, bytes)) = store_binary("claude", "ATERM_CLAUDE_BIN") else {
+            eprintln!(
+                "CANARY NOT RUN: no claude binary found (set ATERM_CLAUDE_BIN, or install one: \
+                 `aterm pkg install claude`) — the reset's templates are NOT checked against a \
+                 build"
+            );
+            return;
+        };
+        let missing = missing_templates(&bytes);
+        assert!(
+            missing.is_empty(),
+            "{path}: {} reset templates not whole: {missing:?}",
+            missing.len()
+        );
+        eprintln!("{path}: every reset template is whole");
+    }
+
+    #[test]
     fn every_literal_codex_anchor_is_in_the_store_codex() {
         literal_anchors_are_in_the_store("codex", "ATERM_CODEX_BIN", CODEX_ANCHORS, true);
     }

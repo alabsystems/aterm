@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     config_home: PathBuf,
     registry: PathBuf,
@@ -61,12 +61,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-selfupdate-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
-        let config_home = root.join("config");
-        let registry = root.join("registry");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-selfupdate-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
+        let config_home = root.path().join("config");
+        let registry = root.path().join("registry");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&registry).unwrap();
         let prefix = atpkg::store::default_prefix(&home);
@@ -189,12 +190,6 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -309,8 +304,9 @@ impl Streamed {
 const UNREACHABLE_LINE: &str =
     "atpkg: claude — Anthropic's release channel is unreachable; keeping build 2026091601";
 
-/// Generous for a loaded CI box; the grace itself is 2 s.
-const ANNOUNCE_WITHIN: Duration = Duration::from_secs(15);
+/// A hang detector, not a latency budget: the grace itself is 2 s, and the first exec
+/// of a freshly linked binary has been measured at 26 s under a loaded gate.
+const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 
 /// The stdout lines a pass may carry that are not the wait lane's markers: what the
 /// `[machine]` settings, applied at the dispatch edge ABOVE the lock and refused here
@@ -351,7 +347,7 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     }
     let fx = Fixture::new("held-then-released");
     fx.install_claude(2026091601);
-    let missing = fx.root.join("no-such-registry");
+    let missing = fx.root.path().join("no-such-registry");
     let guard = atpkg::lock::try_lock_store(&fx.layout()).expect("the fixture holds the lock");
     let registry = format!("dir:{}", missing.display());
     let mut child = stream(fx.command(
@@ -371,16 +367,14 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     );
     // The holder lets go, a few seconds in.
     drop(guard);
-    let (status, elapsed, stdout, stderr) = child.finish(Duration::from_secs(30));
+    // The wait ends with the holder, not with the 1800 s bound: a child still
+    // waiting fails `finish`'s minute.
+    let (status, _, stdout, stderr) = child.finish(Duration::from_secs(60));
     let shown = format!("status {status:?}\nstdout:\n{stdout:?}\nstderr:\n{stderr}");
     assert_eq!(
         status.code(),
         Some(1),
         "the check ran and failed on its own line: {shown}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(25),
-        "the wait ended with the holder, not with the bound: {elapsed:?}\n{shown}"
     );
     let lock = fx.layout().store_lock().display().to_string();
     assert_eq!(
@@ -446,7 +440,7 @@ fn an_unreachable_registry_answers_1_with_the_childs_line_then_the_incomplete_li
     }
     let fx = Fixture::new("unreachable");
     fx.install_claude(2026091601);
-    let missing = fx.root.join("no-such-registry");
+    let missing = fx.root.path().join("no-such-registry");
     let out = fx.selfupdate(
         "claude",
         &["install", "latest"],
@@ -478,6 +472,15 @@ fn an_unreachable_registry_answers_1_with_the_childs_line_then_the_incomplete_li
 /// HELP FORWARDS: `update --help` prints the one note on stderr and execs the `bin/`
 /// shim with the arguments verbatim — its stdout, its exit code (7) — and no store lock
 /// ever comes into being.
+///
+/// AND THE MANAGED NAME ITSELF ANSWERS (audit 2026-10-02): outside an aterm session the rc
+/// hook puts `bin/` on PATH and not `agents/`, so there `claude` IS `bin/claude`, and the
+/// activation lays it with the twin's block. Run through `/bin/sh` with this dev binary as
+/// the embedded atpkg — named by a twin an older client laid, the field's shape — `bin/claude
+/// update --help` is handed to the verb (the note), whose forward re-enters `bin/claude`;
+/// the block lets that re-entry through to the store build, once. Before the fix the
+/// vendor's verb ran with no note; without the re-entry guard every forward handed over
+/// again, forever (a minute's hang detector).
 #[test]
 fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
     let fx = Fixture::new("help");
@@ -490,6 +493,48 @@ fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
         text(&out.stderr),
         format!("{}\n", atpkg::selfupdate::help_line(Fixture::row())),
         "{shown}"
+    );
+    assert!(!fx.lock_held(), "help takes no lock");
+
+    fx.install_claude(2026091601);
+    let layout = fx.layout();
+    let claude = atpkg::store::ToolName::new("claude").unwrap();
+    let store = layout.build_dir("claude", 2026091601).join("bin/claude");
+    let q = |p: &Path| format!("'{}'", p.display());
+    std::fs::write(
+        layout.agent_shim(&claude),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  update|upgrade|install)\n    __atpkg={atpkg}\n    \
+             if [ -x \"$__atpkg\" ]; then exec \"$__atpkg\" __selfupdate 'claude' {prefix} -- \
+             \"$@\"; fi\n    ;;\nesac\nexec {store} \"$@\"\n",
+            atpkg = q(Path::new(env!("CARGO_BIN_EXE_atpkg"))),
+            prefix = q(&fx.prefix),
+            store = q(&store),
+        ),
+    )
+    .unwrap();
+    atpkg::activate::reconcile_agents(&layout);
+    let mut managed = Command::new(layout.shim(&claude));
+    managed
+        .args(["update", "--help"])
+        .env("HOME", &fx.home)
+        .env("XDG_CONFIG_HOME", &fx.config_home)
+        .env("ATPKG_REGISTRY", format!("dir:{}", fx.registry.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (status, _, stdout, stderr) = stream(managed).finish(ANNOUNCE_WITHIN);
+    let shown = format!("status {status:?}\nstdout:\n{stdout:?}\nstderr:\n{stderr}");
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "the store build's own code: {shown}"
+    );
+    assert_eq!(stdout, ["fake: update --help"], "{shown}");
+    assert_eq!(
+        stderr,
+        format!("{}\n", atpkg::selfupdate::help_line(Fixture::row())),
+        "handed to the verb once, by the managed name: {shown}"
     );
     assert!(!fx.lock_held(), "help takes no lock");
 }
@@ -591,7 +636,7 @@ fn an_environment_variable_does_not_disable_the_intercept() {
 fn a_prefix_the_environment_does_not_resolve_is_refused_with_both_named() {
     let fx = Fixture::new("prefix");
     fx.fake_shim("claude");
-    let elsewhere = fx.root.join("elsewhere");
+    let elsewhere = fx.root.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
     cmd.arg(atpkg::selfupdate::HIDDEN_VERB)

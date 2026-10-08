@@ -424,9 +424,8 @@ pub(crate) fn build_key_input(
     ))
 }
 
-/// Fallback for [`build_key_input`] on platforms WITHOUT
-/// `KeyEventExtModifierSupplement` (web/…) — and DELIBERATELY on Windows, where
-/// the extension exists but must not be used for the ENCODE path: the Windows
+/// [`build_key_input`] on Windows, where `KeyEventExtModifierSupplement` exists
+/// but must not be used for the ENCODE path: the Windows
 /// backend filters Ctrl/Alt out of `ModifiersState` while AltGr is held, so
 /// `key_without_modifiers()` would encode the layout BASE key ('q') with no
 /// modifiers instead of the AltGr-composed glyph ('@' on de-DE) the app expects.
@@ -436,7 +435,7 @@ pub(crate) fn build_key_input(
 /// into nothing, which [`windows_key_input`] documents. The keypad is asked
 /// first here too, ahead of that rescue: a keypad key is never AltGr-composed,
 /// so the strip and the Ctrl+Alt fallback never see one.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
 #[must_use]
 pub(crate) fn build_key_input(
     ev: &KeyEvent,
@@ -466,18 +465,11 @@ pub(crate) fn build_key_input(
 
 /// The layout-BASE key of a press, for the Ctrl+Alt rescue in
 /// [`windows_key_input`]. Windows implements `KeyEventExtModifierSupplement`
-/// (macOS and the Linux backends use it as their whole encode path); the
-/// remaining `not(macos/linux)` targets — web — do not, and there the rescue
-/// simply has no second key to try.
+/// (macOS and the Linux backends use it as their whole encode path).
 #[cfg(windows)]
 fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
     ev.key_without_modifiers()
-}
-
-#[cfg(all(not(windows), not(any(target_os = "macos", target_os = "linux"))))]
-fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
-    ev.logical_key.clone()
 }
 
 /// `VkKeyScanExW`'s shift-state bits for "this character needs Ctrl AND Alt" —
@@ -611,12 +603,6 @@ fn layout_shift_state(c: char) -> Option<u8> {
         return None;
     }
     u8::try_from((scan >> 8) & 0xff).ok()
-}
-
-/// No layout to ask off Windows (web): nothing is AltGr-composed there.
-#[cfg(all(not(windows), not(any(target_os = "macos", target_os = "linux"))))]
-fn layout_shift_state(_c: char) -> Option<u8> {
-    None
 }
 
 #[cfg(test)]

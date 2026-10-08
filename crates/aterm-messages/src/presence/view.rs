@@ -56,8 +56,10 @@ pub struct View {
     /// with no words (`band=""`, `sentence=""`), which is what the human sees.
     /// `None` when no fold is pending; a want that returns clears it.
     pub fold_since: Option<Instant>,
-    /// The pending fold is a person's READ (the fold law's keystroke, or a
-    /// switch to a tab whose session wants no row): it does not wait out
+    /// The pending fold is a person's READ (the fold law's keystroke; a
+    /// switch to a tab whose session wants no row is NOT one — the switch
+    /// back would re-bear the row on the same call, a net-zero re-grid of
+    /// every pane): it does not wait out
     /// [`FOLD_QUIET`](super::FOLD_QUIET) from the want's drop, only the row's
     /// own minimum life from its birth ([`Self::born_at`]). Sticky until the
     /// fold commits or the want returns, so a read under a hold folds as the
@@ -69,9 +71,6 @@ pub struct View {
     /// is born, and their next key would otherwise fold it milliseconds later
     /// — the incident's net-zero pair, with the key's echo between.
     pub born_at: Option<Instant>,
-    /// The session this window's front tab showed at the last projection: a
-    /// different one now is a tab switch, a person's act ([`Self::fold_read`]).
-    pub front: Option<u64>,
 }
 
 impl Default for View {
@@ -89,7 +88,6 @@ impl Default for View {
             fold_since: None,
             fold_read: false,
             born_at: None,
-            front: None,
         }
     }
 }
@@ -148,7 +146,10 @@ impl View {
         if elapsed >= RIPPLE {
             return None;
         }
-        let step = elapsed.as_millis() * u128::from(RIPPLE_STEPS) / RIPPLE.as_millis();
+        // To the nanosecond, as the deadline below is: whole milliseconds
+        // left the step behind the instant `ripple_deadline` named for it
+        // (round 43, ruling 415 (u)).
+        let step = elapsed.as_nanos() * u128::from(RIPPLE_STEPS) / RIPPLE.as_nanos();
         // `elapsed < RIPPLE`, so `step < RIPPLE_STEPS`: the conversion is exact.
         Some(u32::try_from(step).map_or(RIPPLE_STEPS - 1, |s| s.min(RIPPLE_STEPS - 1)))
     }
@@ -180,7 +181,11 @@ impl View {
             return Some(now);
         }
         let step = self.ripple_step(now).unwrap_or(0);
-        Some((t0 + RIPPLE * (step + 1) / RIPPLE_STEPS).min(end))
+        // The first nanosecond of the next step, rounded UP: the step has
+        // moved there, and it is after `now` (round 43, ruling 415 (u)).
+        let next = (u128::from(step + 1) * RIPPLE.as_nanos()).div_ceil(u128::from(RIPPLE_STEPS));
+        let next = Duration::from_nanos(u64::try_from(next).unwrap_or(u64::MAX));
+        Some((t0 + next).min(end))
     }
 
     /// The rim at `now` as the frame path draws it — plain field reads and

@@ -1,19 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! DECDWL/DECDHL reflow tests — double-width/height lines must NOT be reflowed.
-//!
-//! Per VT spec, DECDWL lines are logically half-width (40 usable columns on an
-//! 80-column terminal). They must be resized in place during reflow, not split
-//! or merged with adjacent lines like single-width content.
-//!
-//! Regression tests for #7524.
+//! DECDWL/DECDHL reflow tests: double-width/height lines (half the usable
+//! columns) are resized in place, never split or merged with adjacent lines.
 
 use crate::{CellFlags, Grid, LineSize, StyleId};
 
 #[test]
 fn decdwl_row_preserved_on_shrink() {
-    // An 80-col DECDWL row with content in cols 0-9 should NOT be split
+    // An 80-col DECDWL row with content in cols 0-9 should not be split
     // when the terminal shrinks to 40 columns.
     let mut grid = Grid::new(5, 80);
     for i in 0..10u16 {
@@ -220,7 +215,7 @@ fn decdwl_mixed_with_normal_rows_on_shrink() {
         .unwrap()
         .set_line_size(LineSize::DoubleWidth);
 
-    // Row 1: normal with "1234567890" (10 chars)
+    // Row 1: "1234567890".
     grid.set_cursor(1, 0);
     for c in "1234567890".chars() {
         grid.write_char(c);
@@ -246,11 +241,9 @@ fn decdwl_mixed_with_normal_rows_on_shrink() {
 
 #[test]
 fn decdwl_continuation_row_survives_shrink_merge() {
-    // A DECDWL row that is ITSELF a wrap continuation (autowrap onto it, then
-    // ESC # 6) must not be consumed by the shrink merge — it resizes in place,
-    // keeping BOTH its wrapped flag and its DoubleWidth attribute (fixwave5
-    // review, bug 4: the merge loop consumed any wrapped successor and the
-    // output chunk inherited only the FIRST source row's line_size).
+    // A DECDWL row that is itself a wrap continuation (autowrap onto it, then
+    // ESC # 6) is not consumed by the shrink merge: it resizes in place,
+    // keeping its wrapped flag and DoubleWidth attribute.
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJKL".chars() {
         grid.write_char_wrap(c);
@@ -313,16 +306,10 @@ fn decdwl_continuation_row_not_merged_on_grow() {
 
 #[test]
 fn decdwl_shrink_blanks_a_wide_char_cut_at_the_new_edge() {
-    // The in-place DECDWL resize truncates rather than reflows, so a wide
-    // char whose head lands in the new last column loses its continuation.
-    // Found by the aterm-core no-panic fuzzer once it asserted
-    // WideCharConsistent: the head must be blanked (as `Row::resize` does),
-    // never left dangling in the last column.
-    //
-    // The row is 100 wide, so marking it DECDWL clears only `cells[50..]`
-    // and the pair at 39/40 is INTACT going into the resize — the state the
-    // real bytes reach (`ESC # 6` on a row, then a wide char near its middle).
-    // Resized to 40, the truncation cuts exactly that pair.
+    // The in-place DECDWL resize truncates, so a wide char whose head lands in
+    // the new last column is blanked (as `Row::resize` does), never left
+    // dangling. The row is 100 wide, so DECDWL clears only `cells[50..]` and
+    // the pair at 39/40 is intact until the resize to 40 cuts it.
     let mut grid = Grid::new(3, 100);
     grid.row_mut(0)
         .unwrap()

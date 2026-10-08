@@ -38,8 +38,9 @@ fn count_eq(px: &[u32], color: u32) -> usize {
     px.iter().filter(|&&p| p == color).count()
 }
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// "hello" / "world" on a 4x10 grid with row 0 cols 1..=3 selected.
@@ -55,10 +56,7 @@ fn selected_term() -> Terminal {
 
 #[test]
 fn selected_cells_get_selection_background() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = selected_term();
     let f = rend.render_input(&term.cell_frame(4, 10));
@@ -86,10 +84,7 @@ fn selected_cells_get_selection_background() {
 
 #[test]
 fn osc_selection_background_and_foreground_reach_selected_pixels() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = selected_term();
     term.process(b"\x1b]17;rgb:12/34/56\x07\x1b]19;rgb:fe/cd/32\x07");
@@ -118,10 +113,7 @@ fn osc_selection_background_and_foreground_reach_selected_pixels() {
 
 #[test]
 fn selected_sparse_tail_paints_implicit_blanks_and_covers_deepest_image() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (2usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -148,6 +140,7 @@ fn selected_sparse_tail_paints_implicit_blanks_and_covers_deepest_image() {
         rows: 1,
         z_index: aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD - 1,
         band_lift_px: 0,
+        cell_offset_px: (0, 0),
         scaling: aterm_core::grid::extra::ImageScaling::Fit,
         source_rect: None,
     });
@@ -190,10 +183,7 @@ fn selected_sparse_tail_paints_implicit_blanks_and_covers_deepest_image() {
 
 #[test]
 fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (3usize, 9usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -229,10 +219,7 @@ fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
 
 #[test]
 fn unselected_cells_keep_their_background() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = selected_term();
     let f = rend.render_input(&term.cell_frame(4, 10));
@@ -271,10 +258,7 @@ fn unselected_cells_keep_their_background() {
 
 #[test]
 fn wide_char_block_selection_highlights_both_halves() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(2, 6);
     term.process("日x".as_bytes()); // 日 occupies cols 0-1, 'x' col 2
@@ -302,10 +286,7 @@ fn wide_char_block_selection_highlights_both_halves() {
 
 #[test]
 fn scrolled_viewport_maps_selection_rows() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     // 3 visible rows + scrollback; 4 lines pushes "aa" off the live screen.
     let mut term = TerminalBuilder::new()
@@ -368,10 +349,7 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
     use aterm_core::render::{COLOR_UNSET, PaneSelection};
 
     let theme = Theme::default();
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
 
     let (rows, cols) = (2usize, 17usize);

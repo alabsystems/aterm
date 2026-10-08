@@ -5,11 +5,9 @@
 
 /// A scratch RGBA8 tile (straight alpha) drawn into during baking.
 ///
-/// Public so other host-side bakers (the sparkle-words v2 `CatBaker` in
-/// `aterm-gui`, design §5.5) reuse THIS rasterizer — the same 4×4-supersampled
-/// coverage, the same straight-alpha src-over — instead of growing a drifting
-/// look-alike. The primitive set (disc / ellipse / fill) is
-/// exactly what the in-crate sprites bake with.
+/// Public so host-side bakers (e.g. `CatBaker` in `aterm-gui`) share this
+/// 4×4-supersampled coverage and straight-alpha src-over instead of a drifting
+/// look-alike.
 pub struct Tile {
     w: u32,
     h: u32,
@@ -53,12 +51,9 @@ impl Tile {
     }
 
     /// Source-over one pixel (straight alpha). `rgb` channels and `a` are in `[0,1]`.
-    // Native lowering gap: typed-TrustIr does not complete on this body — the
-    // trust-vc native memory verifier reports every `self.px[..]` BoundsCheck as
-    // Unsupported ("bundle contains no TrustVc requests"), regardless of how the
-    // index bound is re-established, while the arithmetic obligations do prove.
-    // The access is safe by the Tile invariant (px.len() == w*h*4, enforced in
-    // `new`) plus the leading x/y range guard.
+    // Skipped: the native memory verifier reports every `self.px[..]` BoundsCheck as
+    // Unsupported however the bound is re-established. Safe by the Tile invariant
+    // (px.len() == w*h*4, set in `new`) plus the leading x/y range guard.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn over(&mut self, x: i32, y: i32, rgb: (f32, f32, f32), a: f32) {
         if x < 0 || y < 0 || x as u32 >= self.w || y as u32 >= self.h || a <= 0.0 {
@@ -141,10 +136,8 @@ impl Tile {
     /// `inside(px, py)` (sample coords are pixel centers in tile space).
     // A raw bbox + colour + alpha parameter list reads better at the dozens of tiny
     // call sites than a packed struct would.
-    // Invokes the caller-supplied `inside: F` closure (an indirect callee whose body
-    // is absent from the lowered bundle, so its panic-freedom can't be discharged)
-    // inside a 4×4 supersampling loop, and calls the `trust::skip`'d `over`; the full
-    // verifier times out on the body. Idiom-3 skip (generic-`Fn` / absent callee).
+    // Skipped: the generic `inside` closure is absent from the lowered bundle and
+    // `over` is itself skipped; the verifier times out on the body.
     #[cfg_attr(trust_verify, trust::skip)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fill<F: Fn(f32, f32) -> bool>(

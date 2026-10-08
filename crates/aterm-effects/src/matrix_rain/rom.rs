@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PHOSPHOR glyph ROM — 64 glyphs on a 24×48 1-bit master grid
-//! (matrix-rain design §2). The cold ROM contains ~40 katakana-like forms,
-//! digits, symbols, and kanji-like blocks. When output material is enabled,
-//! [`rasterize_material_master`] replaces its first slots with the LITERAL
-//! characters sampled from the terminal, using small public-domain bitmap
-//! faces. The resulting master still feeds the same fixed-size atlas on native
-//! and embedded/wasm hosts.
+//! Phosphor glyph ROM: 64 glyphs on a 24×48 1-bit master grid (matrix-rain
+//! design §2): katakana-like forms, digits, symbols and kanji-like blocks. With
+//! output material enabled, [`rasterize_material_master`] replaces the first
+//! slots with literal characters sampled from the terminal, drawn from small
+//! public-domain bitmap faces. The master feeds the same fixed-size atlas on
+//! every host.
 //!
-//! Recipes are const data (line segments + dots); an integer rasterizer
-//! (Bresenham strokes at ~4 px thickness) produces the 1-bit master ONCE at
-//! first bake. Deterministic, no floats. The bar is RECOGNIZABILITY, not
-//! typographic beauty — the mirrored film texture comes from `flip_x` at
-//! render time, not from authoring mirrored art.
+//! Recipes are const data (line segments + dots); an integer Bresenham
+//! rasterizer (~4 px strokes) produces the 1-bit master deterministically. The
+//! mirrored film texture comes from `flip_x` at render time.
 
 use std::sync::OnceLock;
 
@@ -249,8 +246,8 @@ const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
 /// The rasterized 1-bit master: 64 glyphs × 48 scanlines, one `u32` of
 /// 24 valid bits per scanline (bit `x` set ⇒ pixel `(x, y)` inked).
 ///
-/// `Clone` is a plain `Vec<u32>` copy (~12 KB) — how the material path forks
-/// the memoized decorative master (see [`decorative_master`]).
+/// `Clone` is a plain ~12 KB `Vec<u32>` copy; the material path forks
+/// [`decorative_master`] this way.
 #[derive(Clone)]
 pub struct RomMaster {
     rows: Vec<u32>,
@@ -264,9 +261,8 @@ impl RomMaster {
     }
 }
 
-/// Rasterize the whole ROM (the master is ~12 KB); pure integer math, so the
-/// bit pattern is identical on every host. Engines take it through
-/// [`decorative_master`], which rasterizes at most once per process.
+/// Rasterize the whole ROM (~12 KB) with integer math, identical on every
+/// host. Engines use [`decorative_master`], which caches it.
 #[must_use]
 pub fn rasterize_master() -> RomMaster {
     let mut rows = vec![0u32; ROM_GLYPHS * MASTER_H];
@@ -282,23 +278,13 @@ pub fn rasterize_master() -> RomMaster {
     RomMaster { rows }
 }
 
-/// The decorative master, rasterized AT MOST ONCE per process.
+/// The decorative master, rasterized at most once per process.
 ///
-/// [`rasterize_master`] is a pure function of the const recipe table, but it is
-/// not cheap: ~3.4k Bresenham steps × a 4×4 stamp ≈ 55k bounds-checked plots
-/// plus a 12 KB zeroed `Vec`. The material path below rebuilds that same
-/// constant on EVERY charset change (a fresh sample whenever the visible
-/// 128-char set turns over, i.e. routinely while output streams), so the ROM
-/// is memoized here and forked with a 12 KB `memcpy` instead. Every bit of the
-/// master is identical either way, so atlas texels, baker versions, and emit
-/// fingerprints are unchanged.
-///
-/// Process-wide rather than a per-engine resident field: `RomMaster` is
-/// `Vec<u32>` only (so `Send + Sync`, sound on native and wasm alike), and 12 KB
-/// is paid once for the whole process instead of once per engine — aterm builds
-/// a rain engine per WINDOW (both `MatrixRain::new` sites in `app_render.rs`
-/// are `ws.matrix_rain.get_or_insert_with`) and the wasm pipeline one per
-/// surface, so several can be resident at once.
+/// The material path needs a copy on every charset change (routinely while
+/// output streams), so it forks this memoized master with a 12 KB copy instead
+/// of re-rasterizing ~55k plots. Process-wide rather than per engine because
+/// each `EffectsPipeline` builds its own rain engine; `RomMaster` is
+/// `Send + Sync`.
 pub(crate) fn decorative_master() -> &'static RomMaster {
     static DECORATIVE: OnceLock<RomMaster> = OnceLock::new();
     DECORATIVE.get_or_init(rasterize_master)
@@ -312,24 +298,21 @@ pub(crate) fn decorative_master() -> &'static RomMaster {
 ///
 /// One binary search over [`super::bitmap_font`], the in-tree public-domain
 /// glyph table, where this used to walk a seven-table fallback chain through a
-/// third-party trait. Same answer for every code point in Unicode, held there
-/// by `tests/font8x8_oracle.rs`.
+/// third-party trait. Same answer for every code point in Unicode.
 #[must_use]
 pub fn material_bitmap(c: char) -> Option<[u8; 8]> {
     super::bitmap_font::bitmap(c)
 }
 
-/// Author a hybrid 64-slot master whose prefix is the exact `chars` supplied
-/// by the output-material bank and whose unused tail remains the classic ROM.
-/// Each 8×8 source pixel expands to 2×5 pixels, centered in the 24×48 master.
-/// The four-pixel breathing room on every side prevents chunky letterforms from
-/// touching adjacent terminal cells after the integer box filter. Conversion
-/// remains integer-only and byte-identical on every backend.
+/// Author a hybrid 64-slot master: the prefix is the exact `chars` from the
+/// output-material bank, the unused tail stays the classic ROM. Each 8×8
+/// source pixel expands to 2×5 pixels, centered in the 24×48 master; the
+/// four-pixel margin keeps letterforms off adjacent cells after the integer
+/// box filter. Integer-only, identical on every backend.
 #[must_use]
 pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
-    // The decorative tail (slots `chars.len()..64`) is the classic ROM verbatim,
-    // so fork the memoized copy rather than re-rasterizing the constant on every
-    // charset change — byte-identical master, one 12 KB memcpy.
+    // The decorative tail (slots `chars.len()..64`) is the classic ROM, so
+    // fork the memoized copy instead of re-rasterizing.
     let mut master = decorative_master().clone();
     for (glyph_index, &ch) in chars.iter().take(ROM_GLYPHS).enumerate() {
         author_material_glyph(&mut master, glyph_index, ch);
@@ -337,10 +320,8 @@ pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
     master
 }
 
-/// Author ONE material slot over the decorative glyph already resident in it.
-/// An unsupported code point leaves that decorative glyph untouched — the
-/// whole-master loop's `continue`, and the reason literal mode never
-/// substitutes a different-looking character.
+/// Author one material slot over the decorative glyph already in it. An
+/// unsupported code point leaves the decorative glyph untouched.
 fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) {
     let Some(bitmap) = material_bitmap(ch) else {
         return;
@@ -361,13 +342,11 @@ fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) {
     }
 }
 
-/// Re-author ONE slot of an ALREADY AUTHORED master IN PLACE: restore the
-/// decorative glyph every slot of [`rasterize_material_master`] starts from,
-/// then author `ch` over it (or leave the decorative glyph when the slot is now
-/// unused). The resulting slot is byte-identical to the same slot of
-/// `rasterize_material_master(new_chars)`; the difference is that the slots
-/// whose character did NOT change are not rewritten, and the 12 KB fork of the
-/// decorative master is not paid at all.
+/// Re-author one slot of an already authored master in place: restore the
+/// decorative glyph, then author `ch` over it (or leave the decorative glyph
+/// when the slot is now unused). The slot ends byte-identical to the same slot
+/// of `rasterize_material_master(new_chars)`, without rewriting unchanged
+/// slots or forking the decorative master.
 pub fn reauthor_material_glyph(master: &mut RomMaster, slot: usize, ch: Option<char>) {
     if slot >= ROM_GLYPHS {
         return;
@@ -458,8 +437,7 @@ mod tests {
         }
     }
 
-    /// Glyphs are distinct as bit patterns (64 distinguishable forms — the
-    /// recognizability floor).
+    /// Glyphs are distinct as bit patterns.
     #[test]
     fn glyphs_are_pairwise_distinct() {
         let m = rasterize_master();

@@ -28,12 +28,9 @@
 //! * **wasm32**, 10 — the seven plus `console_error_panic_hook 0.1.7`,
 //!   `wasm-bindgen 0.2.108` and `wasm-bindgen-futures 0.4.58`.
 //!
-//! A patch also redirects DEV and BUILD edges, so `cargo test` additionally
-//! compiles `cfg_if!` call sites in `crc32fast 1.5.0`, `filetime 0.2.29`,
-//! `getrandom 0.4.2`, `nix 0.29.0`, `polling 3.11.0` and `sha2 0.10.9` —
-//! twenty-three packages and 258 invocation sites in total. `sha2` is worth
-//! naming twice: it is `aterm-digest`'s differential oracle, so a `cfg_if!`
-//! that mis-expands there breaks a *proof* rather than a build.
+//! A patch also redirects DEV and BUILD edges, so `cargo test` compiles more
+//! `cfg_if!` call sites than the census above (`-e normal,build,dev` lists
+//! them).
 //!
 //! # Why this replacement is safe
 //!
@@ -92,13 +89,8 @@
 //! cargo test -p cfg-if
 //! ```
 //!
-//! That runs three independent proofs:
+//! That runs two independent proofs:
 //!
-//! * **`tests/consumer_forms.rs`** — every distinct invocation SHAPE the
-//!   twenty-three consumers write, copied verbatim with a comment naming the
-//!   crate, file and line it came from. Most of those crates cannot be built on
-//!   this macOS box, so compiling this file is what stands in for compiling
-//!   them.
 //! * **`tests/differential.rs`** — every chain answered twice: once by this
 //!   macro, once by a hand-written `cfg!()` cascade over the identical
 //!   predicates, asserting the two agree. `cfg!()` is rustc evaluating the same
@@ -112,16 +104,14 @@
 //!   macro and a deliberately un-grouped one, shows each produces a *different*
 //!   answer on the same input, and only then asserts this macro's answer.
 //!
-//!   The reference is `cfg!()` and NOT a dev-dependency on the upstream crate
-//!   — which is what this wave's other shims do — for a measured reason:
+//!   The reference is `cfg!()` and NOT a dev-dependency on the upstream crate,
+//!   for a measured reason:
 //!   `[patch.crates-io]` rewrites dev edges too, so a `cfg-if` dev-dependency
 //!   resolves back to THIS crate and the differential silently compares the
 //!   shim to itself. The manifest records the `cargo metadata` output that
 //!   showed it.
 //! * **The doctests below**, including a `compile_fail` control that proves
-//!   `compile_error!` really does fire when it lands in a SELECTED arm — so
-//!   "the `compile_error!`s in `tests/consumer_forms.rs` never fired" is
-//!   evidence rather than a tautology.
+//!   `compile_error!` really does fire when it lands in a SELECTED arm.
 //!
 //! # Where this is NOT the crates.io crate
 //!
@@ -155,12 +145,6 @@
 //!   another `macro_rules!` with `$f16c:expr` substituted into an arm body, and
 //!   an opaque expression fragment matches `tt` but matches neither `item` nor
 //!   `stmt` nor `block`.
-//!
-//! # If a consumer ever bumps past what this accepts
-//!
-//! Paste the new invocation into `tests/consumer_forms.rs` first and watch it
-//! fail to compile. That file is the specification; this one is the
-//! implementation.
 
 #![no_std]
 #![deny(missing_docs)]
@@ -180,9 +164,8 @@
 /// # fn main() {}
 /// ```
 ///
-/// The `else` is optional, and so is the whole chain: when no predicate holds
-/// the macro expands to nothing at all, which is what lets it sit in statement
-/// position without changing the value of the block it is in.
+/// The `else` is optional; when no predicate holds the macro expands to
+/// nothing, so it can sit in statement position.
 ///
 /// ```
 /// fn f() -> Result<(), ()> {
@@ -196,9 +179,8 @@
 /// assert!(f().is_ok());
 /// ```
 ///
-/// Arms that are not selected are never expanded — `#[cfg]` prevents expansion
-/// rather than discarding output afterwards — which is what makes a
-/// `compile_error!` usable as an unsupported-platform guard:
+/// Arms that are not selected are never expanded, so `compile_error!` works as
+/// an unsupported-platform guard:
 ///
 /// ```
 /// cfg_if::cfg_if! {
@@ -211,9 +193,7 @@
 /// assert!(supported());
 /// ```
 ///
-/// THE CONTROL FOR THAT CLAIM. The same `compile_error!` in the arm that IS
-/// selected does fail the build, so the test above is evidence and not a
-/// tautology:
+/// Control: the same `compile_error!` in the selected arm fails the build.
 ///
 /// ```compile_fail
 /// cfg_if::cfg_if! {
@@ -224,11 +204,9 @@
 /// ```
 #[macro_export]
 macro_rules! cfg_if {
-    // THE ONLY PUBLIC RULE. `tt` on both the predicate and the body, not
-    // `meta`/`item`/`stmt`: the predicate has to survive being re-emitted
-    // verbatim (some consumers write build-script cfgs the macro must treat as
-    // opaque), and the body has to accept an opaque `expr` fragment
-    // substituted in by a caller's own `macro_rules!` — see `half`.
+    // The only public rule. `tt` for predicate and body: predicates are
+    // re-emitted verbatim, and bodies may be opaque `expr` fragments
+    // substituted by a caller's own `macro_rules!` (see `half`).
     (
         if #[cfg( $($i_meta:tt)+ )] { $( $i_tokens:tt )* }
         $(
@@ -238,9 +216,8 @@ macro_rules! cfg_if {
             else { $( $e_tokens:tt )* }
         )?
     ) => {
-        // Normalize the chain into a flat list of `((predicate) (body))` pairs,
-        // the `else` arm carrying an EMPTY predicate, and hand it to the
-        // recursion with an empty list of already-seen predicates.
+        // Normalize into `((predicate) (body))` pairs, the `else` arm with an
+        // empty predicate, and recurse with no predicates seen yet.
         $crate::cfg_if! {
             @__arms () ;
             (( $($i_meta)+ ) ( $( $i_tokens )* )),
@@ -253,8 +230,7 @@ macro_rules! cfg_if {
         }
     };
 
-    // Recursion base: every arm consumed. Expands to LITERALLY NOTHING, which
-    // is load-bearing — see the "terminal arm" paragraph in the crate docs.
+    // Recursion base: expands to nothing (see the crate docs).
     (@__arms ( $( ($($_seen:tt)*) , )* ) ; ) => {};
 
     // Recursion step: emit one arm, then recurse with that arm's predicate
@@ -264,22 +240,14 @@ macro_rules! cfg_if {
         (( $( $($yes:tt)+ )? ) ( $( $tokens:tt )* )),
         $( $rest:tt , )*
     ) => {
-        // FIRST-MATCH-WINS lives on this one line: require this arm's own
-        // predicate AND the negation of every predicate before it. Negating the
-        // FOLLOWING arms instead would compile just as green and select the
-        // LAST match — the failure this crate's differential test exists to
-        // catch. The `else` arm contributes no `$yes`, so it reduces to
-        // `not(any(everything before it))`.
+        // First match wins: this arm's predicate and the negation of every
+        // earlier one. The `else` arm reduces to `not(any(earlier))`.
         #[cfg(all(
             $( $($yes)+ , )?
             not(any( $( $($no)+ ),* ))
         ))]
-        // ONE macro call, not `$( $tokens )*` directly: an attribute in front
-        // of a token sequence binds to the first item only, so a multi-item arm
-        // would leak its second item and onward into an unconditional
-        // compilation. Wrapping the arm in a call gives the attribute a single
-        // node to include or exclude; if it is included, the call expands right
-        // back to the arm's tokens, unchanged and in the caller's context.
+        // One macro call so the attribute covers the whole multi-item arm; the
+        // call expands back to the arm's tokens in the caller's context.
         $crate::cfg_if! { @__group $( $tokens )* }
 
         $crate::cfg_if! {
@@ -288,10 +256,8 @@ macro_rules! cfg_if {
         }
     };
 
-    // The grouping indirection from the step above. Costs one recursion level
-    // per arm, which matters: `getrandom`'s backend chain is 27 arms deep and
-    // sets no `#![recursion_limit]`, so an implementation spending four or five
-    // levels per arm would work everywhere except there.
+    // One recursion level per arm: `getrandom`'s 27-arm chain sets no
+    // `#![recursion_limit]`.
     (@__group $( $tokens:tt )* ) => {
         $( $tokens )*
     };

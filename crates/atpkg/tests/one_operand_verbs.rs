@@ -24,17 +24,18 @@ use std::process::{Command, Output, Stdio};
 const BUILD: u64 = 2_026_092_401;
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     layout: atpkg::store::Layout,
 }
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-one-operand-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-one-operand-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let layout = atpkg::store::Layout {
             prefix: atpkg::store::default_prefix(&home),
@@ -79,10 +80,10 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_atpkg"))
             .args(args)
             .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env(
                 "ATPKG_REGISTRY",
-                format!("dir:{}", self.root.join("registry").display()),
+                format!("dir:{}", self.root.path().join("registry").display()),
             )
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
             .stdin(Stdio::null())
@@ -90,12 +91,6 @@ impl Fixture {
             .stderr(Stdio::piped())
             .output()
             .expect("run atpkg")
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -120,9 +115,9 @@ fn uninstall_of_two_names_refuses_both_and_removes_neither() {
     assert_eq!(out.status.code(), Some(2), "the usage exit:\n{all}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("atpkg uninstall: one operand at a time (got 2: \"ta\" \"tb\")")
-            && stderr.contains("nothing was done"),
-        "the refusal names the verb, the count and every name:\n{all}"
+        stderr.contains("atpkg uninstall: one name at a time \u{2014} nothing was done")
+            && stderr.contains("usage: aterm pkg uninstall"),
+        "the refusal names the verb, says nothing was done, and shows the usage:\n{all}"
     );
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("uninstalled"),
@@ -171,8 +166,9 @@ fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
         let all = text(&out);
         assert_eq!(out.status.code(), Some(2), "`{verb} ta tb`:\n{all}");
         assert!(
-            String::from_utf8_lossy(&out.stderr)
-                .contains(&format!("atpkg {verb}: one operand at a time (got 2")),
+            String::from_utf8_lossy(&out.stderr).contains(&format!(
+                "atpkg {verb}: one name at a time \u{2014} nothing was done"
+            )),
             "`{verb} ta tb` names its own verb:\n{all}"
         );
     }

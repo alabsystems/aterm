@@ -488,51 +488,190 @@ pub fn watcher_latch_model() -> Model {
     }
 }
 
+/// Which historical defect a wake-latch model's `Buggy = 1` replays (see
+/// [`damage_to_present_model`] and [`wake_heal_evidence_model`]: one machine,
+/// held to three laws, each with the mutant that breaks it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WakeLatchMutant {
+    /// The shipped pre-2026-07-05 ONE-SHOT latch: no heal, no watchdog
+    /// deadline and no re-post, so a lost wake starves its session's presents.
+    OneShot,
+    /// The pre-2026-09-29 AGE-ONLY heal: a latch older than `Expiry` is
+    /// presumed lost whether or not its event is still queued behind a long
+    /// frame — the false heal (a redraw of every window plus a duplicate wake).
+    AgeOnly,
+}
+
 /// DAMAGE→PRESENT BOUNDED RESPONSE (the 2026-07-05 five-fps incident, proven
-/// and caught). Abstract twin of the `Wake::Output` delivery spine: PTY damage
+/// and caught). Abstract twin of the `Wake::Output` delivery spine, with the
+/// event loop's TURN made explicit so a long frame is representable: PTY damage
 /// arrives (`Damage*`), the coalescing latch (`spawn::gated_output_wake`) posts
-/// at most one in-flight wake (`inflight`), the handler pass presents and
-/// clears (`Present` — `main.rs`'s `Wake::Output` arm + `redraw_window`), and a
-/// wake can be LOST without a handler pass (`Lose` — the event dropped around
-/// startup; bounded by `LostBudget`, losses are rare events). Time (`Tick`)
-/// follows the house convention: it cannot pass a DUE heal (the enabled-action-
-/// fires-before-the-deadline encoding that keeps liveness checkable as safety).
+/// at most one in-flight wake (`inflight`); a loop turn DRAINS the queued user
+/// events (`TurnBegin` — a wake in flight is handled: the latch clears and the
+/// damage presents) and may then stay BUSY for any number of ticks (a long
+/// frame); it ends in `about_to_wait` (`TurnEnd`), where the lost-wake WATCHDOG
+/// judges the latch, marks an armed one `seen`, and folds a `recheck` deadline
+/// for it. A wake can be LOST without a handler pass (`Lose`; bounded by
+/// `LostBudget`). Time (`Tick`) runs freely through a busy turn; an idle loop
+/// turns at once for a queued wake and at a due recheck — and ONLY a `TurnEnd`
+/// that saw the arm folds one (the house guarded-Tick encoding: time cannot
+/// pass a due turn). The loop's first turn (winit's `Init`) is running at the
+/// initial state.
 ///
-/// The invariant `DamageBounded` is the property the incident violated:
-/// pending damage is presented within `Expiry + 1` ticks — never the
-/// process-lifetime starvation (presents pinned to the 5 Hz focus timers) the
-/// user saw.
+/// A wake posted while the loop is IDLE and lost together with its wake-up is
+/// seen by no `TurnEnd`, so no recheck exists for it: it is STRANDED. The
+/// reader re-posts it (`DamageRepost`, `spawn::wake_stranded`) at the first
+/// damage after its expiry, and never re-sends a wake a turn has passed or one
+/// that may still be queued (`DamageCoalesced`).
 ///
-/// `Buggy = 0` (committed): the latch SELF-EXPIRES via TWO code paths that
-/// together make the state-enabled `DamageHeals` faithful — the next output
-/// burst re-arms a stale arm (`spawn::gated_output_wake`, streaming case), and
-/// the `about_to_wait` WATCHDOG heals a stale arm at its expiry instant even
-/// with no further output (final-burst case; it folds the expiry into the
-/// event-loop wait, which is what licenses this model's Tick being blocked at
-/// a due heal). Both use exactly `WAKE_LATCH_EXPIRY_NS`. `ty` PROVES the bound
-/// (tight: the worst case reaches exactly `Expiry + 1`); the guard algebra is
-/// Tier-1-bound to the real latch by
-/// `spawn::latch_conforms_to_damage_to_present_model` (with a one-shot
-/// negative control). `Buggy = 1`: the original
-/// one-shot latch — a stale arm coalesces FOREVER (`DamageCoalesced`'s
-/// `Buggy = 1` disjunct), no heal exists, and `ty` finds the counterexample:
-/// Damage → Lose → Tick* → pending damage older than the bound, i.e. the
-/// shipped defect.
+/// The invariant `DamageBounded` is the property the incident violated: damage
+/// waits at most `Expiry + 1` IDLE ticks for its present (`waited` counts only
+/// ticks the main thread spent idle — its own long frames are its own latency,
+/// not the latch's — and NOT a stranded wake's ticks, which end at the
+/// session's next output after the expiry: if the program falls silent, at the
+/// loop's next unrelated turn, a bound this model does not claim) — never the
+/// process-lifetime starvation the user saw. `StrandedReposted`: no damage
+/// arriving on a stranded wake past its expiry is swallowed without a re-post.
+///
+/// `Buggy = 0` (committed): the watchdog heals ON EVIDENCE — the latch is
+/// still armed and a previous `TurnEnd` already saw it (`seen`: in the code,
+/// its SENT stamp is older than the previous pass's), so the drain since must
+/// have delivered it (`spawn::judge_output_wake`); the recheck it folds is one
+/// expiry after the pass that saw it. `ty` PROVES both laws (the bound tight:
+/// the worst case reaches exactly `Expiry + 1`); Tier-1-bound to the real
+/// latch and watchdog by `spawn::latch_conforms_to_damage_to_present_model`
+/// and `spawn::watchdog_conforms_to_damage_to_present_model`. `Buggy = 1`: the
+/// original one-shot latch — no heal, no recheck, no re-post — and `ty` finds
+/// Damage → Lose → TurnEnd → Tick* past the bound, the shipped defect, and a
+/// stranded wake swallowing damage past its expiry.
+///
+/// Below the model's grain, stated: the model posts atomically with the arm.
+/// The code arms, posts, then re-stamps the latch SENT with a clock read after
+/// the post; an unsent arm is never judged lost nor re-posted
+/// (`spawn::judge_output_wake`, `spawn::wake_stranded`, unit-tested by
+/// `an_unsent_arm_is_never_presumed_lost`), which is what makes `seen` a
+/// property of the code's stamps and not only of this model.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn damage_to_present_model() -> Model {
-    // now - latch > Expiry, with the latch armed and no wake in flight: the
-    // stale-arm state the self-expiry heals and the one-shot latch never leaves.
-    let stale = and_(
-        neq(var("latch"), int(0)),
-        and_(
-            eq(var("inflight"), int(0)),
-            gt(sub(var("now"), var("latch")), cst("Expiry")),
+    wake_latch_model(WakeLatchMutant::OneShot)
+}
+
+/// NO FALSE HEAL (2026-09-29): the same machine as [`damage_to_present_model`],
+/// held to the other half of the contract — the watchdog never heals a wake
+/// that is merely LATE (still queued behind the main thread's turn). Measured
+/// in the owner's live window before the fix: 163 "healed a lost output wake"
+/// WARNs at 100–783 ms, each coinciding with a slow present of the same length
+/// (`deadline=wake_heal`), at load ~150 — every one a wake still in the queue,
+/// answered with a redraw of every window and a duplicate wake on a main thread
+/// that was already behind. `falseHeal` latches a heal fired while its wake was
+/// `inflight`. PROVES `NoFalseHeal` at `Buggy = 0` (the evidence rule: a
+/// `TurnEnd` saw the arm, so the drain since delivered anything in flight),
+/// CATCHES the age-only heal at `Buggy = 1` (Damage in the first turn, a busy
+/// frame of `Expiry + 1` ticks, TurnEnd — the exact live trace).
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn wake_heal_evidence_model() -> Model {
+    wake_latch_model(WakeLatchMutant::AgeOnly)
+}
+
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor.
+#[cfg_attr(trust_verify, trust::skip)]
+fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
+    let armed = neq(var("latch"), int(0));
+    let fixed = eq(cst("Buggy"), int(0));
+    let mutated = eq(cst("Buggy"), int(1));
+    let idle = eq(var("busy"), int(0));
+    // The committed heal: armed, and a previous turn's `about_to_wait` saw it.
+    let proven_lost = and_(armed.clone(), eq(var("seen"), int(1)));
+    // The age-only heal: armed, and older than the expiry.
+    let aged = gt(sub(var("now"), var("latch")), cst("Expiry"));
+    // A stranded wake past its expiry: armed, posted while the loop was idle
+    // with no `TurnEnd` since (unseen, still idle), older than the expiry —
+    // what the reader re-posts (`spawn::wake_stranded`).
+    let stranded_due = and_(
+        armed.clone(),
+        and_(idle.clone(), and_(eq(var("seen"), int(0)), aged.clone())),
+    );
+    // Its complement on an armed latch: busy, or seen, or within the expiry.
+    let not_stranded_due = or_(
+        eq(var("busy"), int(1)),
+        or_(
+            eq(var("seen"), int(1)),
+            le(sub(var("now"), var("latch")), cst("Expiry")),
         ),
     );
+    // What each mutant keeps of the committed rules.
+    let (heal, recheck_on, repost_guard, coalesce_guard) = match mutant {
+        // Buggy=1: no heal, no watchdog deadline, no re-post.
+        WakeLatchMutant::OneShot => (
+            and_(fixed.clone(), proven_lost),
+            fixed.clone(),
+            and_(fixed, stranded_due.clone()),
+            and_(armed.clone(), or_(mutated.clone(), not_stranded_due)),
+        ),
+        // Buggy=1: heal on age.
+        WakeLatchMutant::AgeOnly => (
+            or_(
+                and_(fixed, proven_lost),
+                and_(mutated, and_(armed.clone(), aged)),
+            ),
+            bool_lit(true),
+            stranded_due.clone(),
+            and_(armed.clone(), not_stranded_due),
+        ),
+    };
+    // Keep the OLDEST unpresented damage's clock running: pending damage
+    // arriving on pending damage does not restart `waited`.
+    let damage = Update {
+        var: "pending",
+        expr: int(1),
+    };
+    let clear_if = |cond: Expr, v: &'static str| Update {
+        var: v,
+        expr: if_(cond, int(0), var(v)),
+    };
+    let set = |v: &'static str, e: Expr| Update { var: v, expr: e };
+    let wake_queued = eq(var("inflight"), int(1));
+    // A stranded wake: armed, unseen, not in flight, the loop idle.
+    let stranded = and_(
+        armed.clone(),
+        and_(
+            eq(var("seen"), int(0)),
+            and_(eq(var("inflight"), int(0)), idle.clone()),
+        ),
+    );
+    let (name, invariants) = match mutant {
+        WakeLatchMutant::OneShot => (
+            "DamageToPresent",
+            vec![
+                Invariant {
+                    // Pending damage waits at most Expiry+1 idle ticks — the
+                    // bounded response the 5 fps incident violated (its bound
+                    // was ∞).
+                    name: "DamageBounded",
+                    expr: le(var("waited"), add(cst("Expiry"), int(1))),
+                },
+                Invariant {
+                    // A stranded wake never swallows damage past its expiry.
+                    name: "StrandedReposted",
+                    expr: eq(var("missedRepost"), int(0)),
+                },
+            ],
+        ),
+        WakeLatchMutant::AgeOnly => (
+            "WakeHealOnlyWhenLost",
+            vec![Invariant {
+                // No heal ever fires on a wake still in the queue.
+                name: "NoFalseHeal",
+                expr: eq(var("falseHeal"), int(0)),
+            }],
+        ),
+    };
+    let var0 = |name: &'static str| StateVar { name, init: 0 };
     Model {
-        name: "DamageToPresent",
+        name,
         consts: vec![
             ("MaxTime", 8),
             ("Expiry", 3),
@@ -544,186 +683,168 @@ pub fn damage_to_present_model() -> Model {
                 name: "now",
                 init: 1,
             },
+            var0("pending"),
+            var0("waited"),
+            var0("latch"),
+            var0("inflight"),
+            var0("lost"),
+            // The loop's first turn (`Init`) is running.
             StateVar {
-                name: "pending",
-                init: 0,
+                name: "busy",
+                init: 1,
             },
-            StateVar {
-                name: "damageAt",
-                init: 0,
-            },
-            StateVar {
-                name: "latch",
-                init: 0,
-            },
-            StateVar {
-                name: "inflight",
-                init: 0,
-            },
-            StateVar {
-                name: "lost",
-                init: 0,
-            },
+            var0("seen"),
+            // The last `TurnEnd`'s instant: the code's pass stamp, which is also
+            // what the readers see of an idle loop (`spawn::LoopIdle`).
+            var0("drained"),
+            var0("recheck"),
+            var0("falseHeal"),
+            var0("missedRepost"),
         ],
         fn_vars: vec![],
         actions: vec![
             Action {
-                // First damage of an episode: arm the latch, wake in flight.
+                // First damage of an episode: arm the latch, post the wake.
                 name: "DamageFresh",
                 guard: Some(eq(var("latch"), int(0))),
                 updates: vec![
-                    Update {
-                        var: "pending",
-                        expr: int(1),
-                    },
-                    Update {
-                        var: "damageAt",
-                        // Keep the OLDEST unpresented damage (the honest bound).
-                        expr: if_(eq(var("pending"), int(1)), var("damageAt"), var("now")),
-                    },
-                    Update {
-                        var: "latch",
-                        expr: var("now"),
-                    },
-                    Update {
-                        var: "inflight",
-                        expr: int(1),
-                    },
+                    damage.clone(),
+                    set("latch", var("now")),
+                    set("inflight", int(1)),
+                    set("seen", int(0)),
                 ],
             },
             Action {
-                // Later damage while armed-and-fresh (or armed-and-in-flight)
-                // coalesces — no new wake. Buggy=1 ALSO coalesces on a stale arm:
-                // the one-shot latch suppressing re-sends forever.
+                // Damage on an armed latch coalesces — a wake a turn has passed
+                // is the watchdog's, and one that may be queued behind a long
+                // frame must not be duplicated (the age re-send was the
+                // duplicate-wake half of the 2026-09-29 false heals) — unless
+                // it is stranded past its expiry. A swallowed stranded one is
+                // booked in `missedRepost`.
                 name: "DamageCoalesced",
-                guard: Some(and_(
-                    neq(var("latch"), int(0)),
-                    or_(
-                        eq(var("inflight"), int(1)),
-                        or_(
-                            le(sub(var("now"), var("latch")), cst("Expiry")),
-                            eq(cst("Buggy"), int(1)),
-                        ),
-                    ),
-                )),
+                guard: Some(coalesce_guard),
                 updates: vec![
-                    Update {
-                        var: "pending",
-                        expr: int(1),
-                    },
-                    Update {
-                        var: "damageAt",
-                        expr: if_(eq(var("pending"), int(1)), var("damageAt"), var("now")),
-                    },
+                    damage.clone(),
+                    set(
+                        "missedRepost",
+                        if_(stranded_due.clone(), int(1), var("missedRepost")),
+                    ),
                 ],
             },
             Action {
-                // THE FIX (Buggy=0 only): a burst arriving on a STALE arm re-arms
-                // and re-sends — `gated_output_wake`'s self-expiry.
-                name: "DamageHeals",
-                guard: Some(and_(eq(cst("Buggy"), int(0)), stale.clone())),
+                // A stranded wake past its expiry is re-posted by the reader
+                // (a fresh post from the stranded arm; not a heal).
+                name: "DamageRepost",
+                guard: Some(repost_guard),
                 updates: vec![
-                    Update {
-                        var: "pending",
-                        expr: int(1),
-                    },
-                    Update {
-                        var: "damageAt",
-                        expr: if_(eq(var("pending"), int(1)), var("damageAt"), var("now")),
-                    },
-                    Update {
-                        var: "latch",
-                        expr: var("now"),
-                    },
-                    Update {
-                        var: "inflight",
-                        expr: int(1),
-                    },
+                    damage,
+                    set("latch", var("now")),
+                    set("inflight", int(1)),
+                    set("seen", int(0)),
                 ],
             },
             Action {
                 // The in-flight wake is DROPPED without a handler pass (the
-                // incident's trigger). The latch stays armed — that is the bug
-                // surface. Rare: bounded by LostBudget.
+                // incident's trigger) — while the loop runs, or while it sleeps
+                // together with its wake-up. The latch stays armed.
                 name: "Lose",
                 guard: Some(and_(
-                    eq(var("inflight"), int(1)),
+                    wake_queued.clone(),
                     le(add(var("lost"), int(1)), cst("LostBudget")),
                 )),
                 updates: vec![
-                    Update {
-                        var: "inflight",
-                        expr: int(0),
-                    },
-                    Update {
-                        var: "lost",
-                        expr: add(var("lost"), int(1)),
-                    },
+                    set("inflight", int(0)),
+                    set("lost", add(var("lost"), int(1))),
                 ],
             },
             Action {
-                // Handler pass: clear the latch, present the accumulated damage.
-                name: "Present",
-                guard: Some(eq(var("inflight"), int(1))),
+                // A loop turn begins and drains the queued user events: a wake in
+                // flight is handled (latch cleared) and its damage presented.
+                // Enabled whenever idle: any event may turn the loop. The recheck
+                // deadline is consumed; the turn's `TurnEnd` folds a new one.
+                name: "TurnBegin",
+                guard: Some(idle.clone()),
                 updates: vec![
-                    Update {
-                        var: "pending",
-                        expr: int(0),
-                    },
-                    Update {
-                        var: "damageAt",
-                        expr: int(0),
-                    },
-                    Update {
-                        var: "latch",
-                        expr: int(0),
-                    },
-                    Update {
-                        var: "inflight",
-                        expr: int(0),
-                    },
+                    set("busy", int(1)),
+                    clear_if(wake_queued.clone(), "pending"),
+                    clear_if(wake_queued.clone(), "waited"),
+                    clear_if(wake_queued.clone(), "latch"),
+                    clear_if(wake_queued.clone(), "inflight"),
+                    clear_if(wake_queued.clone(), "seen"),
+                    set("recheck", int(0)),
                 ],
             },
             Action {
-                // Time passes — but never past a wake in flight (handler passes
-                // are sub-tick) and never past a DUE heal (Buggy=0), the standard
-                // guarded-Tick encoding of "the enabled action fires in time".
-                // Under Buggy=1 no heal exists, so time runs freely past the
-                // stale arm — exposing the starvation to the invariant.
+                // `about_to_wait`: the watchdog judges the latch — heals (clear +
+                // repaint every window) when the heal predicate holds; otherwise
+                // an armed latch is now SEEN and folds a recheck one expiry out
+                // (`now + Expiry + 1` ticks: the code's `now + expiry` ns, never
+                // in the past).
+                name: "TurnEnd",
+                guard: Some(eq(var("busy"), int(1))),
+                updates: vec![
+                    set("busy", int(0)),
+                    set("drained", var("now")),
+                    clear_if(heal.clone(), "pending"),
+                    clear_if(heal.clone(), "waited"),
+                    clear_if(heal.clone(), "latch"),
+                    set(
+                        "seen",
+                        if_(heal.clone(), int(0), if_(armed.clone(), int(1), int(0))),
+                    ),
+                    set(
+                        "recheck",
+                        if_(
+                            heal.clone(),
+                            int(0),
+                            if_(
+                                and_(recheck_on, armed.clone()),
+                                add(var("now"), add(cst("Expiry"), int(1))),
+                                int(0),
+                            ),
+                        ),
+                    ),
+                    set(
+                        "falseHeal",
+                        if_(and_(heal, wake_queued.clone()), int(1), var("falseHeal")),
+                    ),
+                ],
+            },
+            Action {
+                // Time passes: freely through a busy turn (a long frame); an idle
+                // loop turns at once for a queued wake and at a due recheck.
                 name: "Tick",
                 guard: Some(and_(
                     gt(cst("MaxTime"), var("now")),
-                    and_(
-                        eq(var("inflight"), int(0)),
-                        or_(
-                            eq(cst("Buggy"), int(1)),
+                    or_(
+                        eq(var("busy"), int(1)),
+                        and_(
+                            eq(var("inflight"), int(0)),
                             or_(
-                                eq(var("pending"), int(0)),
-                                // ¬stale (under inflight=0): the arm is clear or
-                                // still fresh — a due heal blocks the tick.
-                                or_(
-                                    eq(var("latch"), int(0)),
-                                    le(sub(var("now"), var("latch")), cst("Expiry")),
-                                ),
+                                eq(var("latch"), int(0)),
+                                or_(eq(var("recheck"), int(0)), gt(var("recheck"), var("now"))),
                             ),
                         ),
                     ),
                 )),
-                updates: vec![Update {
-                    var: "now",
-                    expr: add(var("now"), int(1)),
-                }],
+                updates: vec![
+                    set("now", add(var("now"), int(1))),
+                    set(
+                        "waited",
+                        if_(
+                            stranded,
+                            var("waited"),
+                            if_(
+                                and_(idle, eq(var("pending"), int(1))),
+                                add(var("waited"), int(1)),
+                                var("waited"),
+                            ),
+                        ),
+                    ),
+                ],
             },
         ],
-        invariants: vec![Invariant {
-            // Pending damage is presented within Expiry+1 ticks — the bounded
-            // response the 5 fps incident violated (its bound was ∞).
-            name: "DamageBounded",
-            expr: or_(
-                eq(var("pending"), int(0)),
-                le(sub(var("now"), var("damageAt")), add(cst("Expiry"), int(1))),
-            ),
-        }],
+        invariants,
     }
 }
 

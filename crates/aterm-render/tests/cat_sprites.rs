@@ -25,8 +25,9 @@ use aterm_render::{
     DirtyDecision, Frame, Renderer, Theme, WindowCpu, compute_dirty_rows, rgb_to_u32,
 };
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u32> {
@@ -103,10 +104,7 @@ fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
 /// backends` in aterm-gpu's cat_parity.rs.)
 #[test]
 fn glyph_draws_over_cat_sprite() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(2, 8);
     term.process("\x1b[?25l█".as_bytes());
@@ -159,10 +157,7 @@ fn glyph_draws_over_cat_sprite() {
 /// pure black/white (any grey would mean the cat regime picked up a filter).
 #[test]
 fn cat_stamp_is_nearest_and_endpoint_exact_at_one_to_one() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (_, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 12);
     term.process(b"\x1b[?25l");
@@ -210,10 +205,7 @@ fn cat_stamp_is_nearest_and_endpoint_exact_at_one_to_one() {
 /// re-stamped by pass 1c inside `render_row` (no post-pass ghost).
 #[test]
 fn damaged_path_no_ghosting_when_cat_moves() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (_, ch) = rend.cell_size();
     // Glyph-free terminal (all background), like the damaged-path glow parity
     // test: a glyph whose AA overhangs its band by 1 px is erased by a
@@ -336,16 +328,14 @@ fn cat_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
 /// it follows the repo's manual-timing idiom:
 ///
 /// ```sh
-/// cargo test -p aterm-render --release --test cat_sprites \
-///   bench_render_row_under_sprites -- --ignored --nocapture
+/// targo --unverified test -p aterm-render --release --test render_suite -- \
+///   cat_sprites::bench_render_row_under_sprites --ignored --nocapture
 /// ```
 #[test]
-#[ignore = "perf gate (design §7.4): run manually in --release with --ignored --nocapture"]
+#[ignore = "perf gate (design §7.4): run manually: --release --test render_suite -- cat_sprites:: --ignored --nocapture"]
 fn bench_render_row_under_sprites() {
     use std::time::Instant;
-    let Some(mut rend) = renderer() else {
-        panic!("bench needs a system monospace font");
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (40usize, 120usize);
     let mut term = Terminal::new(rows as u16, cols as u16);

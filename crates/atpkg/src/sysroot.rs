@@ -25,8 +25,8 @@ use std::path::Path;
 /// When the binary cannot be spawned, or is killed by a signal (e.g. the dynamic
 /// loader aborts on an unresolved library) rather than exiting normally.
 pub fn resolve_check(bin: &Path) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-    let status = Command::new(bin)
+    use aterm_uds::spawnfd::Stdio;
+    let status = aterm_uds::spawnfd::command(bin)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

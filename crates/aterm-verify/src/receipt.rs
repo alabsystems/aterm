@@ -89,10 +89,7 @@
 //! come first and the id last, because an id is free text (a doctest's name
 //! has spaces). A run judged against a base names it (`base <commit>`) and
 //! each failure it judged inherited (`inherited <id>`); a `--baseline` run on
-//! main says so (`baseline yes`); a run judged against a NEAREST base (the
-//! opt-in `--nearest-base`, [`crate::nearest`]) says so too (`base-mode
-//! nearest <commit>`), and a run by the exact rule writes no such line. All
-//! additive: an older reader ignores them,
+//! main says so (`baseline yes`). All additive: an older reader ignores them,
 //! and a receipt with no `failures` line predates the list, so it lists
 //! nothing a run could be judged against — never "main was green".
 //!
@@ -219,8 +216,8 @@ pub struct Receipt {
     /// a run that did not run the tier, and in a receipt an older gate wrote.
     /// What the release cutter requires, under [`measure_key`].
     pub measured: Option<bool>,
-    /// What this run SKIPPED, in the verdict's own words (at most a handful,
-    /// then a count) — never part of the decision, which `merge_contract`
+    /// What this run SKIPPED, every skip in the verdict's own words
+    /// ([`skipped_line`]) — never part of the decision, which `merge_contract`
     /// already carries, but the difference between "the gate refused you" and
     /// "the gate could not present on this machine", which is what an operator
     /// on a headless box needs to read.
@@ -253,13 +250,6 @@ pub struct Receipt {
     /// The commit whose receipt the run was judged against, when it was
     /// ([`crate::differential`]).
     pub base: Option<String>,
-    /// `Some(base)` when that base was a NEAREST one — an ancestor of the
-    /// merge-base, not the merge-base itself — judged by the opt-in
-    /// `--nearest-base` rule ([`crate::nearest`], 2026-09-28): `base-mode
-    /// nearest <commit>`. No line (`None`) under the exact rule, so a
-    /// default run's receipt is what it always was. A record for the reader;
-    /// the release cutter reads such a receipt exactly as any other.
-    pub base_nearest: Option<String>,
     /// The ids of the failures judged INHERITED from that base — red there
     /// with the same failure, inside the age cap. What `merge_contract`
     /// excused, named.
@@ -346,6 +336,20 @@ fn parse_failure(rest: &str) -> Option<Failure> {
     })
 }
 
+/// The receipt's `skipped` value: `none`, or EVERY skip of the run, in the
+/// verdict's words, on one line. Until 2026-10-01 it named four and counted the
+/// rest, so a fifth skip — the trust lane's `NARROWED BY MEMORY`, say: a library
+/// this host's verifier ceiling could not verify — was a number in the receipt,
+/// never its name.
+#[must_use]
+pub fn skipped_line(skips: &[String]) -> String {
+    if skips.is_empty() {
+        return "none".to_string();
+    }
+    // One line, always: a newline here would forge a second key.
+    skips.join(", ").replace('\n', " ")
+}
+
 impl Receipt {
     /// The file a reader reads. One `key value` per line, so `grep` is enough and
     /// no reader needs a parser.
@@ -414,9 +418,6 @@ impl Receipt {
         }
         if let Some(base) = &self.base {
             let _ = writeln!(s, "base {}", one_line(base));
-        }
-        if let Some(nearest) = &self.base_nearest {
-            let _ = writeln!(s, "base-mode nearest {}", one_line(nearest));
         }
         for id in &self.inherited {
             let _ = writeln!(s, "inherited {}", one_line(id));
@@ -494,10 +495,6 @@ impl Receipt {
             build_config: get.get("build-config").cloned(),
             failures,
             base: get.get("base").cloned(),
-            base_nearest: get
-                .get("base-mode")
-                .and_then(|v| v.strip_prefix("nearest "))
-                .map(str::to_string),
             inherited,
             baseline: get.get("baseline").is_some_and(|v| v == "yes"),
             hidden,
@@ -621,7 +618,7 @@ pub fn write(root: &Path, r: &Receipt) -> std::io::Result<Written> {
         .truncate(false)
         .write(true)
         .open(dir.with_extension("lock"))?;
-    lock.lock()?;
+    let _held = StoreLock::take(lock)?;
     prune(&dir);
     let keys = |family: fn(&str) -> String| {
         std::iter::once(family(&r.head)).chain(r.tree.as_deref().map(|t| family(&tree_key(t))))
@@ -645,6 +642,31 @@ pub fn write(root: &Path, r: &Receipt) -> std::io::Result<Written> {
             r.mode
         ))
     })
+}
+
+/// The receipt store's lock, held for one [`write`] and released by `LOCK_UN`
+/// when it drops, on every return — not by the close alone. The take WAITS, and
+/// a child the gate's other threads fork while it is held (every stage, every
+/// `git`) keeps a copy of its open file description until it execs: a lock let
+/// go by the close stayed held in that copy, and the next run's write sat
+/// waiting for that exec, not for a writer.
+struct StoreLock(std::fs::File);
+
+impl StoreLock {
+    fn take(file: std::fs::File) -> std::io::Result<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        file.lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Write `r` as `dir/name` unless a stronger receipt (by `rank`) stands
@@ -946,6 +968,40 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {args:?}");
+    }
+
+    /// The store's lock is free for another open file description the moment a
+    /// write lets go of it, even while a copy of the writer's description lives —
+    /// the copy a child forked meanwhile holds until it execs. `try_clone` is
+    /// `dup`: the same description, as a fork's copy is.
+    #[test]
+    fn a_released_store_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let tmp = crate::mktemp_dir("receipt-lock").expect("mktemp");
+        let path = tmp.join("store.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .expect("the lock file")
+        };
+        let held = StoreLock::take(open()).expect("a free store lock");
+        let copy = held.0.try_clone().expect("dup the store lock's descriptor");
+        drop(held);
+        let probe = open();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a probe of a fresh description, let go by unlock() below"
+        )]
+        let free = probe.try_lock().is_ok();
+        let _ = probe.unlock();
+        assert!(
+            free,
+            "a released store lock must be free while a copy of its descriptor lives"
+        );
+        drop(copy);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A scratch repository with one commit: `(scratch dir, checkout)`.

@@ -1,30 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FABRIC MENU'S APP SIDE (round 19, SPEC19 §9: "the menu, reworked to
-//! align"). The bar rows live in [`crate::menu`] (`FABRIC_MENU`, the View
-//! presence checkables, Window ▸ Set Role…); the dispatch arm in
-//! `app_input.rs` hands each one here. Nothing in this module is a second
-//! mechanism: every row is the menu-bar face of something the wire already
-//! does —
+//! The Fabric menu's App side. The bar rows live in [`crate::menu`]
+//! (`FABRIC_MENU`, the View presence checkables, Window ▸ Set Role…); the
+//! dispatch arm in `app_input.rs` hands each one here. Every row is the menu-bar
+//! face of something the wire already does:
 //!
 //! * **Inbox** is `inbox --peek --meta` on the focused session, rendered as a
-//!   Markdown tab. METADATA ONLY, by construction: the `--meta` form prints no
-//!   body, and the file is written `0600`.
+//!   Markdown tab. Metadata only: `--meta` prints no body, and the file is
+//!   written `0600`.
 //! * **Hold This Session / Lift Hold** are the `hold` verb with
-//!   [`crate::fabric::HoldIssuer::Owner`] — the LOCAL origin, the only one the
-//!   Owner may name — so a FLEET hold is exactly as untouchable from the menu
-//!   as from `aterm ctl hold`: the rows grey with the fleet's reason and a
-//!   click that slipped past the grey is answered `ERR denied` and shown.
+//!   [`crate::fabric::HoldIssuer::Owner`] (the local origin), so a fleet hold is
+//!   as untouchable from the menu as from `aterm ctl hold`: the rows grey with
+//!   the fleet's reason, and a click past the grey is answered `ERR denied`.
 //! * **Fabric Status / Turn Fabric On… / Turn Fabric Off…** run `aterm fabric
-//!   [on|off]` as a CHILD of this process — the round-13 verb, untouched — on
-//!   a thread, pointed at THIS instance's control socket, and open what it
-//!   printed as a tab. `on`/`off` ask first (the platform's confirm sheet).
+//!   [on|off]` as a child process on a thread and open its output as a tab.
+//!   `on`/`off` ask first (the platform's confirm sheet).
 //! * **Presence Band / Presence Rim** flip the live bit at the click and queue
-//!   the `[presence]` leaf's durable write through the one serialized config
-//!   lane (`App::queue_presence_write`), the way Serious Mode persists.
+//!   the `[presence]` leaf's durable write through the serialized config lane
+//!   (`App::queue_presence_write`), as Serious Mode persists.
 //!
-//! Headless (no OS window, the test harness) every row COMPOSES and writes
+//! Headless (no OS window, the test harness) every row composes and writes
 //! nothing outside the process: the fabric plan is kept on the App, no child
 //! runs, no sheet is shown.
 
@@ -48,7 +44,7 @@ pub(crate) fn presence_key_label(key: &str) -> &'static str {
     }
 }
 
-/// A presence leaf key's RESOLVED bit in `config` (absent ⇒ on).
+/// A presence leaf key's resolved bit in `config` (absent ⇒ on).
 pub(crate) fn presence_key_resolve(key: &str, config: &crate::app_config::Config) -> bool {
     if key == PRESENCE_RIM_KEY {
         config.presence_rim_enabled()
@@ -168,9 +164,7 @@ pub(crate) struct FabricCliOutcome {
 /// earlier one is never rewritten under it. `sid` is filtered to its safe
 /// characters, the ledger key's rule.
 pub(crate) fn menu_document_path(kind: &str, sid: &str) -> PathBuf {
-    let unix_s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let unix_s = aterm_time::unix_secs().unwrap_or(0);
     let safe: String = sid
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -198,10 +192,9 @@ pub(crate) fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     file.write_all(text.as_bytes())
 }
 
-/// The Inbox tab's text: a heading, what the listing is (and is not), then
-/// the `inbox --peek --meta` reply verbatim in a fenced block. The reply's
-/// rows carry id, offset, time, sender, kind, trust and the flags — the
-/// `--meta` form prints no body, which is the whole point of this surface.
+/// The Inbox tab's text: a heading, what the listing is, then the
+/// `inbox --peek --meta` reply verbatim in a fenced block (id, offset, time,
+/// sender, kind, trust and flags; no body).
 pub(crate) fn inbox_markdown(sid: &str, listing: &str) -> String {
     let mut s = String::with_capacity(listing.len() + 256);
     s.push_str(&format!("# Inbox \u{2014} {sid}\n\n"));
@@ -319,7 +312,7 @@ impl App {
         self.refresh_presence_all_windows();
     }
 
-    /// Set one presence bit LIVE: publish it, re-project every window, and
+    /// Set one presence bit live: publish it, re-project every window, and
     /// re-resolve any open palette's checkmark.
     pub(crate) fn set_presence_bit(&mut self, key: &str, on: bool) {
         if key == PRESENCE_RIM_KEY {
@@ -379,14 +372,23 @@ impl App {
     }
 
     /// Hold This Session (`on`) / Lift Hold (`off`) for `wid`'s focused
-    /// session: the `hold` verb as the Owner, LOCAL origin. The session's own
-    /// fabric leaf changes under the same guard and records the same timeline
-    /// event a wire `hold` does; the presence band is re-projected here
-    /// directly (the fabric wake also arrives, and the refresh is
-    /// change-gated). A refusal — a fleet hold stands — is shown, never
-    /// silent.
+    /// session: the `hold` verb as the Owner, local origin. The fabric leaf
+    /// changes under the same guard and records the same timeline event a wire
+    /// `hold` does; the presence band is re-projected here (the fabric wake also
+    /// arrives; the refresh is change-gated). A refusal under a fleet hold is
+    /// shown.
+    ///
+    /// NEVER A WAIT ON A COMMITTING UPDATE (the review of round eight's #18).
+    /// The Commit's fence ([`crate::fabric::SessionFabric::fence_hold`]) is
+    /// raised and lifted by this thread alone (`App::finish_proven_handoff`),
+    /// and a Commit that holds its claim through one more input-dispatch fence
+    /// (`HeldCommit`) keeps it raised across turns of this run loop — the
+    /// turns that dispatch this very press. A wait here could only end at its
+    /// bound, the window frozen with nothing said and the update's own drain
+    /// deadline spent meanwhile. So the press is answered at once: `ERR busy`
+    /// ([`crate::fabric::HOLD_BUSY`]), nothing moved, said on the band.
     pub(crate) fn menu_hold(&mut self, wid: WindowId, on: bool) {
-        use crate::fabric::{HOLD_DENIED, HoldIssuer, cmd_hold};
+        use crate::fabric::{HOLD_BUSY, HOLD_DENIED, HoldIssuer, cmd_hold_within};
         let Some(session) = self.focused_session_id(wid) else {
             return;
         };
@@ -402,20 +404,29 @@ impl App {
         } else {
             format!("{sid} off")
         };
-        let reply = cmd_hold(&self.store, &rest, HoldIssuer::Owner);
+        let reply = cmd_hold_within(
+            &self.store,
+            &rest,
+            HoldIssuer::Owner,
+            std::time::Duration::ZERO,
+        );
         self.refresh_presence_session(session, false);
         self.publish_front_hold(wid);
         self.palette_refresh_live();
-        // A hold the menu could not place (design R10): a standing fleet hold
-        // makes a Hold press a record (the session is held, as asked) and a
-        // Release press a failure on the band; the bridge's refusal is a
-        // failure either way.
+        // Under a standing fleet hold a Hold press is a record (the session is
+        // held, as asked) and a Release press is a failure on the band; the
+        // bridge's refusal is a failure either way.
         let refused = if reply == HOLD_DENIED {
             Some(crate::message_reporters::fleet_hold(on))
+        } else if reply == HOLD_BUSY {
+            Some(crate::message_reporters::hold_refused(
+                on,
+                "aterm is switching to its new version right now; nothing changed",
+            ))
         } else {
             reply
                 .strip_prefix("ERR ")
-                .map(|err| crate::message_reporters::hold_refused(err.trim_end()))
+                .map(|err| crate::message_reporters::hold_refused(on, err.trim_end()))
         };
         match refused {
             Some(msg) if msg.hold == aterm_messages::Hold::LogOnly => {
@@ -451,10 +462,10 @@ impl App {
         }
     }
 
-    /// Window ▸ Show Identity: the focused session's agent identity, READ-ONLY,
-    /// as a Markdown tab — the `identities <name>` reply (its row and agents)
-    /// when the session wears one, a sentence saying it runs under the user's
-    /// own agent configuration when it does not.
+    /// Window ▸ Show Identity: the focused session's agent identity, read-only,
+    /// as a Markdown tab: the `identities <name>` reply when the session wears
+    /// one, else a sentence saying it runs under the user's own agent
+    /// configuration.
     pub(crate) fn open_session_identity_tab(&mut self, wid: WindowId) {
         let Some(session) = self.focused_session_id(wid) else {
             return;
@@ -508,9 +519,8 @@ impl App {
         }
     }
 
-    /// A fabric menu item that could not do its thing: a terse failure and
-    /// its cause (then the path) behind it on the band (design R11, §10.3
-    /// C19), keyed by `verb`.
+    /// A fabric menu item that could not do its thing: a terse failure and its
+    /// cause (then the path) on the band, keyed by `verb`.
     fn menu_failure(&mut self, verb: &str, title: &str, lines: &[&str]) {
         self.post_message(crate::message_reporters::fabric_failure(verb, title, lines));
     }
@@ -558,8 +568,10 @@ impl App {
                 let cli = crate::ledger_key::aterm_cli();
                 // `aterm fabric` reads every local instance itself (the
                 // rendezvous walk `aterm ctl instances` makes), so the child is
-                // handed no socket.
-                let mut cmd = std::process::Command::new(&cli);
+                // handed no socket. `aterm.exe` is a CONSOLE image: on Windows
+                // `spawnfd::command` gives it a windowless console, where a bare
+                // child opened a visible one for its whole run (`ledger_key::launch`).
+                let mut cmd = aterm_uds::spawnfd::command(&cli);
                 cmd.args(&plan.argv);
                 let (status, stdout, stderr) = match cmd.output() {
                     Ok(out) => (
@@ -589,19 +601,16 @@ impl App {
         }
     }
 
-    /// The child ended (`Wake::FabricCli`): say how on the band (a clean exit
-    /// is a success row, anything else a warning — design R11), and open its
-    /// output as a tab on the window that asked — or on the front window if
-    /// that one is gone.
+    /// The child ended (`Wake::FabricCli`): report it on the band (a clean exit
+    /// is a success row, anything else a warning) and open its output as a tab
+    /// on the window that asked, or the front window if that one is gone.
     pub(crate) fn complete_fabric_cli(&mut self, outcome: FabricCliOutcome) {
         let verb = outcome.plan.verb;
         let ok = matches!(outcome.status, Ok(Some(0)));
-        // A clean exit is a record in the words it always had (the output tab
-        // opens anyway); anything else is the person's command failing: a
-        // terse title, the reason, and where the output is (design §10.3 C20).
-        // The record's title is a title (`Fabric On finished`), never the
-        // command's transcript line (`aterm fabric on: done.`, audit
-        // 2026-09-24); that line stays the output tab's own.
+        // A clean exit is a record (the output tab opens anyway); anything else
+        // is a failure: a terse title, the reason, and where the output is. The
+        // title is `Fabric On finished`, never the command's transcript line
+        // (`aterm fabric on: done.`), which stays in the output tab.
         let (title, reason) = if ok {
             (format!("{} finished", verb.title()), String::new())
         } else {
@@ -630,11 +639,11 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    //! SPEC19 §9's tests for the Fabric menu's App side: Hold/Lift greyed with
-    //! the fleet reason under a fleet hold (and live in the right order
-    //! otherwise), Inbox opening a metadata-only tab, Set Role… writing the
-    //! role, the presence toggles gating the projection and queueing their
-    //! durable write, and the fabric commands composing without running.
+    //! Tests for the Fabric menu's App side: Hold/Lift greyed with the fleet
+    //! reason under a fleet hold (and live in the right order otherwise), Inbox
+    //! opening a metadata-only tab, Set Role… writing the role, the presence
+    //! toggles gating the projection and queueing their durable write, and the
+    //! fabric commands composing without running.
 
     use super::*;
     use crate::menu::MenuAction;
@@ -661,12 +670,10 @@ mod tests {
             .unwrap_or_else(|| panic!("{a:?} has a row"))
     }
 
-    /// THE HEADLESS HOLD TEST (SPEC19 §9): under a FLEET hold both halt rows
-    /// are disabled — on the palette mirror AND on the native validate's
-    /// projection — and carry the fleet's reason; a menu click that reaches
-    /// `menu_hold` anyway is refused and the hold stands. Under no hold, Hold
-    /// is live and a click holds LOCALLY (the band says so); then Lift is the
-    /// live one and a click lifts.
+    /// Under a fleet hold both halt rows are disabled (palette mirror and native
+    /// validate) with the fleet's reason, and a click reaching `menu_hold` is
+    /// refused. Under no hold, Hold is live and holds locally; then Lift is live
+    /// and lifts.
     #[test]
     fn hold_and_lift_are_disabled_with_the_fleet_reason_under_a_fleet_hold() {
         let _statics = crate::menu::MENU_STATICS
@@ -735,7 +742,7 @@ mod tests {
             .expect("the refusal row");
         assert!(app.resolve_message(refusal, aterm_messages::Outcome::Ok));
 
-        // Hold This Session: a LOCAL hold, the band's stop rim, Lift now live.
+        // Hold This Session: a local hold, the band's stop rim, Lift now live.
         app.menu_hold(wid, true);
         let hold = ctx.fabric.hold().expect("held");
         assert_eq!(
@@ -770,10 +777,62 @@ mod tests {
         let _ = sid;
     }
 
-    /// Show Identity: a session with no identity opens a tab SAYING so (it runs
-    /// under the user's own agent configuration), read-only, owner-private; the
-    /// markdown for a session that wears one fences the `identities <name>`
-    /// reply verbatim.
+    /// THE MENU'S HOLD NEVER WAITS ON A COMMITTING UPDATE (the review of round
+    /// eight's #18). A seamless update's Commit fences every session's hold
+    /// ([`crate::fabric::SessionFabric::fence_hold`]) from this thread, and lifts
+    /// it from this thread; a Commit that holds its claim through one more
+    /// input-dispatch fence keeps it raised across turns of the run loop — the
+    /// turns that dispatch a Hold This Session or Lift Hold press. The press is
+    /// answered at once, nothing moved, and the refusal said; it used to wait
+    /// the verb's whole bound ([`crate::fabric::HOLD_FENCE_WAIT`], 10 s) on a
+    /// fence only this thread could lift, the window frozen with nothing said.
+    /// CONTROL: the fence lifted, the same press holds the session.
+    #[test]
+    fn a_menu_hold_under_a_committing_update_answers_at_once() {
+        let _statics = crate::menu::MENU_STATICS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (mut app, wid, _sid, ctx) = app_with_stub();
+        let _ = ctx.fabric.fence_hold(true);
+        let pressed = std::time::Instant::now();
+        app.menu_hold(wid, true);
+        assert!(
+            pressed.elapsed() < crate::fabric::HOLD_FENCE_WAIT,
+            "the press waited on a fence only this thread lifts"
+        );
+        assert!(ctx.fabric.hold().is_none(), "nothing moved");
+        assert!(
+            app.has_live_message("Couldn't hold the session"),
+            "the refusal is said"
+        );
+        ctx.fabric.lift_hold_fence();
+        app.menu_hold(wid, true);
+        assert!(
+            ctx.fabric
+                .hold()
+                .is_some_and(|hold| hold.origin == "local" && hold.reason == "menu"),
+            "control: unfenced, the press holds the session"
+        );
+
+        // Lift Hold under the fence: answered at once, titled for a lift.
+        let _ = ctx.fabric.fence_hold(true);
+        let pressed = std::time::Instant::now();
+        app.menu_hold(wid, false);
+        assert!(
+            pressed.elapsed() < crate::fabric::HOLD_FENCE_WAIT,
+            "the lift waited on a fence only this thread lifts"
+        );
+        assert!(ctx.fabric.hold().is_some(), "nothing moved");
+        assert!(
+            app.has_live_message("Couldn't lift the hold"),
+            "the lift refusal is titled for a lift"
+        );
+        ctx.fabric.lift_hold_fence();
+    }
+
+    /// Show Identity: a session with no identity opens a read-only, owner-private
+    /// tab saying so; for a session that wears one, the markdown fences the
+    /// `identities <name>` reply verbatim.
     #[test]
     fn show_identity_opens_a_read_only_tab_for_the_focused_session() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
@@ -810,9 +869,8 @@ mod tests {
         ));
     }
 
-    /// Inbox: a delivered task appears in the tab's file by id, sender, kind
-    /// and trust — and its TEXT does not. The tab is a Markdown document on
-    /// the window; the row is greyed with no session.
+    /// Inbox: a delivered task appears in the tab's file by id, sender, kind and
+    /// trust, and its text does not. The row is greyed with no session.
     #[test]
     fn inbox_opens_a_metadata_only_tab_and_never_a_body() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
@@ -922,9 +980,9 @@ mod tests {
             row(&app, wid, MenuAction::TogglePresenceBand).checked,
             Some(false)
         );
-        // (The native checkmark's static is asserted in `menu.rs`'s own test:
-        // every App in this test binary publishes through it, so it cannot be
-        // read back reliably from here while the others run.)
+        // The native checkmark's static is asserted in `menu.rs`'s own test:
+        // every App in this binary publishes through it, so it cannot be read
+        // back reliably here.
 
         // Rim off: none painted; the a11y level still says hold.
         app.user_toggle_presence(MenuAction::TogglePresenceRim);

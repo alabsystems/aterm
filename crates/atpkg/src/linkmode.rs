@@ -96,8 +96,12 @@ pub enum LinkError {
     BadName(String),
     /// The checkout directory does not exist.
     NoCheckout(PathBuf),
-    /// No linkable bin was found (all missing or refused).
-    NoBins,
+    /// Nothing was linked: each rel-bin was not there (`missing`, the paths looked
+    /// for) or its name is a protected command name (`refused`).
+    NoBins {
+        missing: Vec<PathBuf>,
+        refused: Vec<String>,
+    },
     /// The program is not currently dev-linked.
     NotLinked(String),
     /// An underlying IO failure.
@@ -109,7 +113,28 @@ impl fmt::Display for LinkError {
         match self {
             LinkError::BadName(n) => write!(f, "{n:?} is not a safe program name"),
             LinkError::NoCheckout(p) => write!(f, "checkout {} is not a directory", p.display()),
-            LinkError::NoBins => write!(f, "no linkable bin found (all missing or refused)"),
+            LinkError::NoBins { missing, refused } => {
+                if missing.is_empty() && refused.is_empty() {
+                    return write!(f, "nothing to link");
+                }
+                if !missing.is_empty() {
+                    let paths: Vec<String> =
+                        missing.iter().map(|p| p.display().to_string()).collect();
+                    let verb = if missing.len() == 1 { "is" } else { "are" };
+                    write!(f, "{} {verb} not there", paths.join(", "))?;
+                    if !refused.is_empty() {
+                        write!(f, "; ")?;
+                    }
+                }
+                if !refused.is_empty() {
+                    write!(
+                        f,
+                        "{} refused (protected command names)",
+                        refused.join(", ")
+                    )?;
+                }
+                Ok(())
+            }
             LinkError::NotLinked(p) => write!(f, "{p} is not dev-linked"),
             LinkError::Io(e) => write!(f, "io: {e}"),
         }
@@ -349,6 +374,7 @@ pub fn link(
 
     let mut linked = Vec::new();
     let mut refused = Vec::new();
+    let mut missing = Vec::new();
     // Every shim this call mutates, paired with what stood there first, for the rollback
     // below. A name that already stood is somebody else's (a store shim, a hand-made file),
     // so undoing our own failure restores it and never deletes it.
@@ -365,7 +391,9 @@ pub fn link(
         };
         let src = checkout.join(rel);
         if !src.is_file() {
-            continue; // a not-yet-built bin is simply skipped (refresh picks it up later)
+            // A not-yet-built bin is simply skipped (refresh picks it up later).
+            missing.push(src);
+            continue;
         }
         let shim = layout.shim(&tool);
         // Captured before the overwrite — once the dev shim is laid, the store shim's own
@@ -388,7 +416,7 @@ pub fn link(
     }
     if linked.is_empty() {
         roll_back(&replaced);
-        return Err(LinkError::NoBins);
+        return Err(LinkError::NoBins { missing, refused });
     }
 
     // The marker is what makes a dev link tracked. Letting a failed marker write propagate
@@ -703,7 +731,7 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
     // by the Packages screen — one nobody linked and no `unlink` could remove. Born `0600`
     // through `create_new` because `fs::write` creates at the umask default.
     let _ = fs::remove_file(&tmp);
-    let staged = create_marker_temp(&tmp)
+    let staged = crate::platform::create_private_new(&tmp)
         .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
         .and_then(|()| crate::platform::harden_file(&tmp));
     if let Err(e) = staged {
@@ -715,40 +743,14 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
     })
 }
 
-/// Create the link marker's temp exclusively and, on Unix, born `0600`.
-#[cfg(unix)]
-fn create_marker_temp(tmp: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(tmp)
-}
-
-#[cfg(not(unix))]
-fn create_marker_temp(tmp: &Path) -> std::io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::fs::Permissions;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-link-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&p, Permissions::from_mode(0o700)).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-link-{label}-"))
     }
 
     /// `bin/<name>` for a name the test knows is admissible.
@@ -757,9 +759,8 @@ mod tests {
     }
 
     /// A fake checkout with `target/release/<bins>`.
-    fn checkout(label: &str, bins: &[&str]) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("atpkg-checkout-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+    fn checkout(label: &str, bins: &[&str]) -> crate::testdir::Dir {
+        let d = crate::testdir::dir(&format!("atpkg-checkout-{label}-"));
         fs::create_dir_all(d.join("target/release")).unwrap();
         for b in bins {
             fs::write(d.join("target/release").join(b), b"#!/bin/true\n").unwrap();
@@ -791,6 +792,33 @@ mod tests {
         assert_eq!(strip_exe_suffix(".exe", ".exe"), ".exe");
         // And the derivation `link`/`unlink` share still agrees on a real bin path.
         assert_eq!(bin_tool_name(Path::new("target/release/ay")), Some("ay"));
+    }
+
+    /// A link with nothing to lay names the path it looked for and any name it refused,
+    /// and lays nothing.
+    #[test]
+    fn nothing_to_link_names_the_unbuilt_path_and_the_refused_name() {
+        let l = layout("nobins");
+        let co = checkout("nobins", &[]);
+        let bins = [
+            PathBuf::from("target/release/ay"),
+            PathBuf::from("target/release/sudo"),
+        ];
+        let err = link(&l, "ay", &co, &bins).unwrap_err();
+        let want = co.join("target/release/ay");
+        assert!(
+            matches!(&err, LinkError::NoBins { missing, refused }
+                if *missing == [want.clone()] && *refused == ["sudo".to_string()]),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} is not there; sudo refused (protected command names)",
+                want.display()
+            )
+        );
+        assert!(!shim_of(&l, "ay").exists());
     }
     /// A marker that cannot be written leaves no dev shim and no temp.
     ///

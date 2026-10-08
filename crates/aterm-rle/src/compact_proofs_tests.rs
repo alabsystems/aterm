@@ -4,22 +4,12 @@
 
 //! Kani proofs for RLE compact and compact_around correctness.
 //!
-//! The 19 existing proofs in `proofs.rs` exercise compact indirectly through
-//! set/set_range, but 10/19 fail (killed/timeout/OOM) because CBMC struggles
-//! with the combined splice + compact paths.
+//! The proofs in `proofs.rs` exercise compact only indirectly, through
+//! set/set_range, where CBMC struggles with the combined splice + compact paths.
 //!
 //! These proofs verify compact and compact_around in ISOLATION by constructing
 //! Rle instances with deliberately uncompacted runs (adjacent duplicates) and
 //! verifying the merge logic directly.
-//!
-//! ## Wiring
-//!
-//! Add to `lib.rs`:
-//! ```ignore
-//! #[cfg(kani)]
-//! #[path = "compact_proofs_tests.rs"]
-//! mod proofs_compact;
-//! ```
 
 use super::*;
 
@@ -73,7 +63,7 @@ fn symbolic_three_run_rle() -> (Rle<u8>, u32) {
 /// After compact, the sum of all run lengths must equal the original sum.
 ///
 /// Proves: compact never loses or gains cells during merge.
-/// Source: lib.rs:584 `fn compact(&mut self)`
+/// Source: mutations.rs `fn compact(&mut self)`
 #[kani::proof]
 #[kani::unwind(6)]
 fn compact_preserves_total_length() {
@@ -91,7 +81,7 @@ fn compact_preserves_total_length() {
 /// distinct values. Violation would mean compact failed to merge.
 ///
 /// Proves: the core RLE structural invariant holds post-compact.
-/// Source: lib.rs:592 value comparison in compact loop
+/// Source: mutations.rs `compact`: value comparison in compact loop
 #[kani::proof]
 #[kani::unwind(6)]
 fn compact_no_adjacent_duplicates() {
@@ -135,7 +125,7 @@ fn compact_no_zero_length_runs() {
 /// must have <= the number of input runs.
 ///
 /// Proves: compact reduces redundancy monotonically.
-/// Source: lib.rs:597-600 write pointer only advances on value change
+/// Source: mutations.rs `compact`: write pointer only advances on value change
 #[kani::proof]
 #[kani::unwind(6)]
 fn compact_run_count_non_increasing() {
@@ -161,7 +151,7 @@ fn compact_run_count_non_increasing() {
 /// idempotency: compact(compact(x)) == compact(x) for all x.
 ///
 /// Proves: compact reaches a fixed point in one pass.
-/// Source: lib.rs two-pointer algorithm — write pointer advances on
+/// Source: mutations.rs `compact` two-pointer algorithm — write pointer advances on
 ///         value change, so distinct-valued adjacent runs are untouched.
 #[kani::proof]
 #[kani::unwind(6)]
@@ -213,7 +203,7 @@ fn compact_idempotent() {
 /// compact_around(1) performs a local merge; total length must be preserved.
 ///
 /// Proves: compact_around never loses cells during targeted merge.
-/// Source: lib.rs:607-631 `fn compact_around(&mut self, idx: usize)`
+/// Source: mutations.rs `fn compact_around(&mut self, idx: usize)`
 #[kani::proof]
 #[kani::unwind(6)]
 fn compact_around_preserves_total_length() {
@@ -231,7 +221,7 @@ fn compact_around_preserves_total_length() {
 /// must not have an equal-valued neighbor.
 ///
 /// Proves: compact_around fully resolves the local adjacency at idx.
-/// Source: lib.rs:609-630 merge-with-previous and merge-with-next paths
+/// Source: mutations.rs `compact_around`: merge-with-previous and merge-with-next paths
 #[kani::proof]
 #[kani::unwind(6)]
 fn compact_around_resolves_adjacency() {

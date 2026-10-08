@@ -33,11 +33,13 @@
 //! after a thread exists) and the model admits it only as the `Buggy`
 //! `PublishToEnv`.
 //!
-//! P2 (the warm prologue before the dial) adds three binds: the REAL order
+//! P2 (the warm prologue before the dial) adds four binds: the REAL order
 //! decision (`warm_order`) is the model's `SpawnWarm` guard over the socket
 //! shapes, relative included; the REAL miss decision (`warm_miss_px`, over
 //! the real `launch_font_for_zoom`/`successor_font_px` and the real hint
-//! parser) is its `Reshape`/`RealPresent` guards; and the real intake, run with
+//! parser) is its `Reshape`/`RealPresent` guards; the REAL re-warm decision
+//! (`warm_config_moved`, over real config reads around an edit made during the
+//! hold) is its `Rewarm`/`RealPresent` guards; and the real intake, run with
 //! a stale and a hostile hint in the snapshot, proves exactly the parent's
 //! expectation — the hint never reaches the adoption proof (`HintNotInProof`),
 //! with a hint-folding replay as the caught negative control.
@@ -48,11 +50,14 @@
 //! `control_socket_identity`'s own suites) and Prove/Commit (bound by
 //! `NativeUpdateSeamlessHandoffOwnership`'s Tier-1).
 
-use super::tests::{ENV_LOCK, RestoreVar, StagedHandoff, pipe_pair, stage_outgoing_handoff};
+#[cfg(target_os = "macos")]
+use super::tests::StagedHandoff;
+use super::tests::{ENV_LOCK, RestoreVar, pipe_pair, stage_outgoing_handoff};
 use super::*;
 use crate::handoff_env::{HANDOFF_ENV_KEYS, HandoffEnv};
 use aterm_spec::derive::{Model, native_update_successor_warm_before_claim_model};
 use aterm_spec::interp::{self, State};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::PoisonError;
 
 #[cfg(target_os = "macos")]
@@ -80,6 +85,9 @@ pub(crate) struct Observed {
     relative_socket: bool,
     /// P2: the backend was built at a size the carry contradicts.
     stale_build: bool,
+    /// P2: the outgoing process parked under a config edit the early warm
+    /// never read.
+    stale_config: bool,
 }
 
 /// Project an observation onto the model's state. The window, the warm
@@ -95,6 +103,7 @@ pub(crate) fn project(model: &Model, seen: Observed) -> State {
     state.insert("warm_done", i64::from(seen.warm_done));
     state.insert("relative_socket", i64::from(seen.relative_socket));
     state.insert("build_size_ok", i64::from(!seen.stale_build));
+    state.insert("config_current", i64::from(!seen.stale_config));
     state
 }
 
@@ -103,18 +112,7 @@ pub(crate) fn project(model: &Model, seen: Observed) -> State {
 #[cfg(target_os = "macos")]
 fn step(model: &Model, prev: Observed, next: Observed, action: &str) {
     let (from, to) = (project(model, prev), project(model, next));
-    assert_eq!(
-        interp::admits(model, &from, &to),
-        Some(action),
-        "the model admits the real step {from:?} -> {to:?} as {action}"
-    );
-    for invariant in &model.invariants {
-        assert!(
-            model.check_invariant(invariant.name, &to),
-            "{} holds after the real {action}: {to:?}",
-            invariant.name
-        );
-    }
+    crate::conformance_support::assert_transition(model, &from, &to, action);
 }
 
 /// No handoff name is left in the process environment.
@@ -164,9 +162,22 @@ fn spawn_warm_thread() -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<
 
 fn this_build() -> String {
     encode_target_identity(
-        crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-        crate::build_info::GIT_COMMIT,
+        crate::build_info::build_number()
+            .parse::<u64>()
+            .unwrap_or(0),
+        crate::build_info::git_commit(),
     )
+}
+
+/// [`pipe_pair`] with both ends owned. The fork-lane intake ADOPTS the ends it
+/// is handed (`ReadySignal` the ready write end, the `CommitReceiver` the
+/// commit read end) and closes them when dropped, so a test publishes those
+/// with `into_raw_fd()` and drops the others: each number has one closer.
+fn owned_pipe(label: &str) -> (OwnedFd, OwnedFd) {
+    let (read, write) = pipe_pair(label);
+    // SAFETY: pipe(2) just returned both numbers to this thread; nothing else
+    // holds them.
+    unsafe { (OwnedFd::from_raw_fd(read), OwnedFd::from_raw_fd(write)) }
 }
 
 /// THE LAUNCHED LANE, end to end over the snapshot: capture, a thread, the real
@@ -192,7 +203,7 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
     let parent = AttestedParent::attest_live_for_test(own).expect("this process attests");
 
     // THE LAUNCH ENVIRONMENT a LaunchServices successor is started with: the
-    // out-of-band shape (no descriptor numbers), as `launch_successor` writes it.
+    // out-of-band shape (no descriptor numbers), as `app_launch_successor::begin_launch` writes it.
     for key in HANDOFF_ENV_KEYS {
         aterm_log::env::unset(key);
     }
@@ -245,12 +256,15 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
         "the proof term is read from the snapshot"
     );
     let nonce = env.string(ENV_NONCE).expect("the nonce is in the snapshot");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let claimed = std::thread::scope(|scope| {
         let outgoing = scope.spawn(|| {
-            let peer = rendezvous
-                .accept_claim(Some(own), deadline, &|| false)
-                .expect("the successor presents its claim");
+            let peer = rendezvous.accept_claim(
+                Some(own),
+                &crate::handoff_rendezvous::DialerCode::this_process(),
+                deadline,
+                &|| false,
+            )?;
             // SAFETY: descriptors this test owns for the length of the call.
             let sessions = entries
                 .iter()
@@ -269,18 +283,25 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
             // everything"; that ordering is pinned by handoff_rendezvous's
             // `a_grant_whose_connection_closes_at_once_is_still_claimed`.)
             let granted = peer.transfer(&staged.nonce, &sessions, ready, commit, deadline);
-            (peer, granted)
+            Ok::<_, crate::handoff_rendezvous::RendezvousError>((peer, granted))
         });
         let claimed = crate::handoff_rendezvous::claim_incoming(
             &mut env,
             &nonce,
             crate::handoff_rendezvous::ClaimDeadlines {
                 dial: deadline,
-                grant: deadline,
+                // Past the accept's deadline: the gate side's is the one hang
+                // detector.
+                grant: deadline + aterm_spec::wait::MUST_HAPPEN,
             },
             Some(parent),
         );
-        let (peer, granted) = outgoing.join().expect("the outgoing half");
+        // The outgoing half's accept is judged first: a successor HELD for
+        // `trustd` is the machine's, before its claim's end is judged.
+        let (peer, granted) = crate::handoff_rendezvous::admitted(
+            outgoing.join().expect("the outgoing half"),
+            "the successor presents its claim",
+        );
         assert!(granted.is_ok(), "the grant: {granted:?}");
         drop(peer);
         claimed.expect("the claim is granted")
@@ -482,12 +503,16 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _restore = restore_all();
     let staged = stage_outgoing_handoff("p1-fork", 3, None);
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = owned_pipe("ready");
+    let (commit_read, commit_write) = owned_pipe("commit");
     for key in HANDOFF_ENV_KEYS {
         aterm_log::env::unset(key);
     }
-    staged.publish_env(ready_write, commit_read, Some(this_build()));
+    staged.publish_env(
+        ready_write.into_raw_fd(),
+        commit_read.into_raw_fd(),
+        Some(this_build()),
+    );
 
     let mut env = HandoffEnv::capture();
     assert!(env_is_clear(), "capture leaves no handoff name behind");
@@ -547,12 +572,10 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
         "no process-environment access after the spawn"
     );
 
-    drop((ready, commit, incoming));
+    // `ready` and `commit` own the two published ends (see `owned_pipe`).
+    drop((ready, commit, incoming, ready_read, commit_write));
     let _ = stop.send(());
     warm.join().expect("the warm thread");
-    for fd in [ready_read, commit_read, commit_write] {
-        aterm_pty::close_fd(fd);
-    }
     staged.teardown();
 }
 
@@ -692,6 +715,8 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
         cols: 100,
         outer_x: None,
         outer_y: None,
+        inner_px: None,
+        presence_row: false,
         status_bar_rows: 0,
         messages: Default::default(),
         next_message_id: Default::default(),
@@ -699,6 +724,7 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
         font_px_milli: zoom.map(|(px, _)| px),
         font_reset_px_milli: zoom.map(|(_, reset)| reset),
         update_health_said: Default::default(),
+        messages_captured_unix_ms: None,
     };
     // (hint on the wire, the carry the park then writes, a miss expected)
     let cases = [
@@ -770,6 +796,133 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
     }
 }
 
+/// A CONFIG EDIT DURING THE HOLD IS WARMED AGAIN BEFORE ANY CARRIED PRESENT:
+/// the read `main_entry` takes before the early warm, the warm's own config
+/// read (`VersionedConfigService::load_path`), what the outgoing process does
+/// to `aterm.toml` while this successor holds its dial — nothing, a Settings
+/// save of the same bytes, a Settings font change (a new file renamed over the
+/// old, as a Settings save lands) — and the real re-warm decision after the
+/// intake (`warm_config_moved`). The decision is exactly "the early warm's
+/// config is not the one the outgoing process parked under", and it is the
+/// model's `Rewarm`/`RealPresent` guards. NEGATIVE CONTROL: presenting the
+/// carried screens under the early warm's config anyway (P2 as first built) is
+/// only the model's `Buggy` `PresentUnderStaleConfig`, and breaks
+/// `CarriedPresentUnderCurrentConfig`.
+#[test]
+fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
+    use crate::native_config_service::VersionedConfigService;
+    let model = native_update_successor_warm_before_claim_model();
+    let buggy = interp::with_buggy(&model, 1);
+    let dir = aterm_tempfile::tempdir().expect("scratch dir");
+    let path = dir.path().join("aterm.toml");
+    let save = |text: &str| {
+        let staged = dir.path().join(".aterm.toml.save");
+        std::fs::write(&staged, text).expect("stage the save");
+        std::fs::rename(&staged, &path).expect("rename it over aterm.toml");
+    };
+    let font_px = |service: &VersionedConfigService| service.snapshot().config.font_px;
+    // (what the hold did to the file, the font the outgoing process parked under)
+    let holds = [
+        ("an idle hold", None, 14.0),
+        ("the same bytes saved again", Some("font_px = 14.0\n"), 14.0),
+        ("a Settings font change", Some("font_px = 16.0\n"), 16.0),
+    ];
+    for (hold, edit, parked_px) in holds {
+        save("font_px = 14.0\n");
+        // Before the dial: the read, then the early warm's own.
+        let read = crate::WarmConfigRead::take(Some(&path));
+        assert!(read.text.is_some(), "{hold}: the file reads");
+        let warmed = VersionedConfigService::load_path(&path).expect("the warm's read");
+        if let Some(text) = edit {
+            save(text);
+        }
+        // After the intake.
+        let moved = crate::warm_config_moved(&read, Some(&path));
+        assert_eq!(
+            moved,
+            font_px(&warmed) != Some(parked_px),
+            "{hold}: a re-warm exactly when the early warm read another config"
+        );
+        if moved {
+            // The re-warm reads the file as it stands: the parked config.
+            let rewarmed = VersionedConfigService::load_path(&path).expect("the re-warm's read");
+            assert_eq!(font_px(&rewarmed), Some(parked_px), "{hold}");
+        }
+        let adopted = project(
+            &model,
+            Observed {
+                phase: 4,
+                captured: true,
+                threads_spawned: true,
+                owned_taken: true,
+                claim_ok: true,
+                warm_done: true,
+                stale_config: moved,
+                ..Observed::default()
+            },
+        );
+        assert_eq!(model.action_enabled("Rewarm", &adopted), moved, "{hold}");
+        assert_eq!(
+            model.action_enabled("RealPresent", &adopted),
+            !moved,
+            "{hold}: no carried present under the early warm's config"
+        );
+        if moved {
+            let mut stale = adopted.clone();
+            assert!(buggy.fire("PresentUnderStaleConfig", &mut stale));
+            assert!(!model.check_invariant("CarriedPresentUnderCurrentConfig", &stale));
+        }
+    }
+}
+
+/// A THEME-FILE EDIT DURING THE HOLD IS WARMED AGAIN TOO, though `aterm.toml`
+/// never moves: the file names a user theme, and the outgoing process applies
+/// an edit to that theme's file (saved as an editor saves, renamed over it)
+/// while this successor holds its dial. The real read before the early warm
+/// (`WarmConfigRead::take`), the real early warm (`warm_config`, headless), the
+/// edit, and the real decision after the intake (`warm_config_moved`): a
+/// re-warm, and it presents the edited theme. Control: an idle hold keeps the
+/// early warm.
+#[test]
+fn a_theme_file_edit_during_the_hold_is_warmed_again() {
+    let dir = aterm_tempfile::tempdir().expect("scratch dir");
+    let themes = dir.path().join("aterm").join("themes");
+    std::fs::create_dir_all(&themes).expect("the theme dir");
+    let path = dir.path().join("aterm").join("aterm.toml");
+    std::fs::write(&path, "theme = \"hold-theme\"\n").expect("the config");
+    let save_theme = |background: &str| {
+        let staged = themes.join(".hold-theme.conf.save");
+        std::fs::write(
+            &staged,
+            format!("foreground = #d0d0d0\nbackground = {background}\n"),
+        )
+        .expect("stage the theme");
+        std::fs::rename(&staged, themes.join("hold-theme.conf")).expect("save the theme");
+    };
+    save_theme("#102030");
+    crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
+        let read = crate::WarmConfigRead::take(Some(&path));
+        let early = crate::warm_config(true, (None, None));
+        assert_eq!(
+            early.theme.bg, 0x10_2030,
+            "the early warm read the theme file"
+        );
+        assert!(
+            !crate::warm_config_moved(&read, Some(&path)),
+            "an idle hold keeps the early warm"
+        );
+        save_theme("#405060");
+        assert!(
+            crate::warm_config_moved(&read, Some(&path)),
+            "the theme the outgoing process parked under is not the one the early warm read"
+        );
+        let late = crate::warm_config(true, (None, None));
+        assert_eq!(late.theme.bg, 0x40_5060, "the re-warm reads the edit");
+        let _ = early.backend_handle.join().expect("the early worker");
+        let _ = late.backend_handle.join().expect("the re-warm's worker");
+    });
+}
+
 /// THE HINT NEVER REACHES THE PROOF: the real intake, run over a snapshot that
 /// carries no hint, a stale one and a hostile one, computes the adoption proof
 /// the outgoing process expects, byte for byte, every time. NEGATIVE CONTROL: a
@@ -793,12 +946,16 @@ fn the_hint_never_reaches_the_adoption_proof() {
         ),
     ] {
         let staged = stage_outgoing_handoff(&format!("p2-hint-{label}"), 2, None);
-        let (ready_read, ready_write) = pipe_pair("ready");
-        let (commit_read, commit_write) = pipe_pair("commit");
+        let (ready_read, ready_write) = owned_pipe("ready");
+        let (commit_read, commit_write) = owned_pipe("commit");
         for key in HANDOFF_ENV_KEYS {
             aterm_log::env::unset(key);
         }
-        staged.publish_env(ready_write, commit_read, Some(this_build()));
+        staged.publish_env(
+            ready_write.into_raw_fd(),
+            commit_read.into_raw_fd(),
+            Some(this_build()),
+        );
         if let Some(hint) = hint {
             aterm_log::env::set(hint_key, hint);
         }
@@ -844,7 +1001,7 @@ fn the_hint_never_reaches_the_adoption_proof() {
                     &screen,
                     &identities,
                 ),
-                Some(staged.expected),
+                Ok(staged.expected),
                 "{label}: a hint folded into the digest proves something else"
             );
         }
@@ -870,10 +1027,8 @@ fn the_hint_never_reaches_the_adoption_proof() {
             prearmed.parent_pid(),
         );
         assert!(commit.is_some(), "{label}");
-        drop((ready, commit, incoming));
-        for fd in [ready_read, commit_read, commit_write] {
-            aterm_pty::close_fd(fd);
-        }
+        // `ready` and `commit` own the two published ends (see `owned_pipe`).
+        drop((ready, commit, incoming, ready_read, commit_write));
         staged.teardown();
     }
     // In the model: the fold is admitted only as the mutant, and breaks

@@ -61,7 +61,7 @@ pub fn write_in_process(file: &Executable) -> io::Result<()> {
         let mut f = opts.open(&tmp)?;
         use std::io::Write as _;
         f.write_all(&file.body)?;
-        f.sync_all()?;
+        crate::platform::sync_durable(&f)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -89,11 +89,8 @@ pub fn write_in_process(file: &Executable) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn tmp(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("atpkg-lay-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-lay-{label}-"))
     }
 
     /// The in-process writer: mode 0755, the exact bytes, an existing file replaced, no

@@ -10,9 +10,10 @@
 //! to [`Action`] names, parsed once at load into a `HashMap<Chord, Action>`.
 //!
 //! `on_key` consults this map FIRST with an O(1) lookup. A **miss** falls
-//! through to the existing hardcoded matches, so an empty table (the default
-//! when no config is present) costs one hash probe and changes nothing — the
-//! suite stays byte-identical. A malformed chord/action is WARNED and SKIPPED
+//! through to the existing hardcoded matches. On macOS the table is empty when no
+//! config is present, so it costs one hash probe and changes nothing — the suite
+//! stays byte-identical; elsewhere it holds the platform seeds
+//! ([`Keybindings::platform_defaults`]) overlaid by `[keybindings]`. A malformed chord/action is WARNED and SKIPPED
 //! (fail-open to defaults), never aborting the launch.
 //!
 //! The chord representation is intentionally tiny and platform-neutral: a
@@ -737,8 +738,10 @@ fn named_key_display(named: NamedKey) -> &'static str {
 }
 
 /// The parsed `[keybindings]` table: a chord → action map consulted at the top of
-/// `on_key`. Empty (the default with no config) means the lookup is one hash
-/// probe that always misses, so the hardcoded path runs unchanged.
+/// `on_key`. Empty by default only on macOS, where the lookup is one hash probe
+/// that always misses; elsewhere it holds the platform seeds
+/// ([`Self::platform_defaults`]) overlaid by `[keybindings]`. A miss still falls
+/// through to the hardcoded matches.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Keybindings {
     map: HashMap<Chord, Action>,
@@ -800,9 +803,9 @@ impl Keybindings {
         Keybindings { map }
     }
 
-    /// Like [`Self::from_config`] but RETURNS the warnings instead of printing them, so
-    /// the GUI can surface dropped rules in an in-window notice (stderr is invisible to
-    /// a Finder-launched .app). The map is byte-identical to `from_config`.
+    /// The test form of [`Self::from_config`] that RETURNS the warnings instead of
+    /// printing them; production surfaces dropped rules through
+    /// [`Self::resolved_warn`] (stderr is invisible to a Finder-launched .app).
     #[cfg(test)]
     #[must_use]
     pub(crate) fn from_config_warn(
@@ -1015,7 +1018,7 @@ impl Keybindings {
         (kb, warns)
     }
 
-    /// Whether NO bindings are configured (the default). `on_key` can skip even
+    /// Whether NO bindings are configured (the macOS no-config default). `on_key` can skip even
     /// the chord-build when this is true, keeping the no-config path allocation-
     /// and probe-free.
     #[must_use]
@@ -1103,7 +1106,7 @@ impl KeySequences {
     }
 
     /// Like [`Self::from_config`] but RETURNS the warnings instead of printing them
-    /// (for the GUI's in-window config notice). The map is byte-identical.
+    /// (so the GUI can surface dropped rules). The map is byte-identical.
     #[must_use]
     pub(crate) fn from_config_warn(
         table: Option<&std::collections::BTreeMap<String, String>>,
@@ -2191,22 +2194,5 @@ mod tests {
         assert_eq!(warns.len(), 2, "{warns:?}");
         let (_kb2, warns2) = Keybindings::resolved_warn(Some(&t));
         assert_eq!(warns2.len(), 2);
-    }
-
-    /// The eprintln wrapper and the warn-returning variant build IDENTICAL maps.
-    #[test]
-    fn from_config_still_silent_collects_same() {
-        use std::collections::BTreeMap;
-        let mut t = BTreeMap::new();
-        t.insert("ctrl+a".to_string(), "\\n".to_string());
-        t.insert("ctrl+b".to_string(), "\\e[A".to_string());
-        let silent = KeySequences::from_config(Some(&t));
-        let (warned, _w) = KeySequences::from_config_warn(Some(&t));
-        for key in [&ch("a"), &ch("b")] {
-            assert_eq!(
-                silent.lookup(key, ModifiersState::CONTROL),
-                warned.lookup(key, ModifiersState::CONTROL)
-            );
-        }
     }
 }

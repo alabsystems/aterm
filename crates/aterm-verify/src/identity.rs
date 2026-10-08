@@ -297,66 +297,16 @@ impl TreeState {
     /// SUBMODULES ARE PART OF THE TREE. Every gitlink the index records is
     /// either populated — and then its own state is captured the same way,
     /// recursively, each of its dirty paths entered as `<gitlink>/<path>`,
-    /// and the gitlink itself entered as [`PathState::Gitlink`] whenever git
-    /// lists it as differing from HEAD (another commit checked out, or dirty
-    /// content) — or it is [`PathState::Unpopulated`]. A populated submodule
+    /// and the gitlink itself entered as [`PathState::Gitlink`] whenever it
+    /// differs from HEAD (another commit checked out, or any dirty path beneath
+    /// it) — or it is [`PathState::Unpopulated`]. A populated submodule
     /// exactly at its gitlink with nothing dirty adds nothing, so a clean
     /// checkout with submodules still has no dirty state at all.
     #[must_use]
     pub fn capture(root: &Path, path_env: &OsStr) -> Option<Self> {
         let head = head_of(root, path_env);
-        // Tracked paths whose working tree differs from HEAD — staged or not,
-        // which is the point: the compiler reads the working tree.
-        let tracked = if head == "(unborn)" {
-            stdout_bytes(git(root, path_env).args(["ls-files", "-z"]))?
-        } else {
-            stdout_bytes(git(root, path_env).args([
-                "diff",
-                "HEAD",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                "--no-ext-diff",
-                "--ignore-submodules=none",
-            ]))?
-        };
-        let untracked = untracked_paths(root, path_env)?;
-        let index = index_entries(root, path_env)?;
-        let hidden = hidden_among(root, path_env, &index)?;
-        let paths: Vec<String> = split_z(&tracked)
-            .into_iter()
-            .chain(untracked)
-            .chain(hidden)
-            .filter(|p| !is_gate_state(p))
-            .collect();
-        let mut dirty = path_states(root, path_env, &paths)?;
-        for link in gitlinks_among(&index) {
-            if is_gate_state(&link) {
-                continue;
-            }
-            let full = root.join(&link);
-            match std::fs::symlink_metadata(&full) {
-                // Missing: git's diff lists it as deleted, which is the same
-                // fact from the other side — the source is not there.
-                Err(_) => {
-                    dirty.insert(link, PathState::Unpopulated);
-                }
-                Ok(m) if m.is_dir() => {
-                    if !is_git_toplevel(&full, path_env) {
-                        dirty.insert(link, PathState::Unpopulated);
-                        continue;
-                    }
-                    let sub = Self::capture(&full, path_env)?;
-                    for (p, s) in sub.dirty {
-                        dirty.insert(format!("{link}/{p}"), s);
-                    }
-                }
-                // A file or link where a submodule belongs is already listed by
-                // the diff, as what it is. Never followed: a link to an
-                // ancestor would recurse forever.
-                Ok(_) => {}
-            }
-        }
+        let base = (head != "(unborn)").then_some("HEAD");
+        let dirty = dirty_against(root, path_env, base)?;
         Some(Self { head, dirty })
     }
 
@@ -440,6 +390,107 @@ fn split_z(bytes: &[u8]) -> Vec<String> {
         .filter(|p| !p.is_empty())
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect()
+}
+
+/// Every path whose working tree differs from commit `base` — what a change
+/// since `base` touched, by [`dirty_against`]. `None` when git cannot answer.
+#[must_use]
+pub fn changes_since(root: &Path, path_env: &OsStr, base: &str) -> Option<Vec<String>> {
+    Some(
+        dirty_against(root, path_env, Some(base))?
+            .into_keys()
+            .collect(),
+    )
+}
+
+/// Every path of `root` whose working tree differs from commit `base` (`None`:
+/// an unborn HEAD, from which every tracked path differs), with its state —
+/// tracked changes staged or not (the compiler reads the working tree),
+/// untracked non-ignored files, the edits an index flag hides, and beneath every
+/// gitlink the submodule's own, as [`TreeState::capture`] says — never the
+/// gate's own state. `None` when git cannot answer.
+///
+/// THE ONE LISTING (2026-10-02). The gate decides WHAT TREE it measured by it
+/// ([`TreeState::capture`]: the identity, the sync's proof, the tripwire) and
+/// WHAT A CHANGE TOUCHED by it ([`changes_since`]: `--changed` and the Trust
+/// lane's selection), so neither reads the caller's git config. A bare `git
+/// diff --name-only` did: rename detection printed a moved file at its new path
+/// alone, so the crate it left was never selected; `submodule.<name>.ignore` or
+/// `diff.ignoreSubmodules = all` printed nothing for a gitlink that moved, so
+/// the Trust lane selected no fork; `core.quotePath` printed a non-ASCII path
+/// quoted, which no crate owns. `-z`, `--no-renames` and
+/// `--ignore-submodules=none` pin all three; `ls-files --others` never reads
+/// `status.showUntrackedFiles`; an index flag hides an edit from every listing
+/// ([`flag_hidden_edits`]); and a submodule's own config and flags hide its
+/// edits from the superproject's, so its state is read inside it — and its
+/// gitlink is dirty whenever anything beneath it is. Git's diff left the
+/// gitlink out for an edit under the submodule's own skip-worktree flag, or an
+/// untracked file under its own `status.showUntrackedFiles=no`, while the
+/// snapshot (which carries both as plain dirt) listed it: every sync's proof
+/// failed ("the checkout is changing faster than it can be copied"), and the
+/// Trust lane took no fork for such an edit outside a fork's directory.
+/// tools/trust-gate-all.sh's `tree_clean` is this rule's shell mirror.
+fn dirty_against(
+    root: &Path,
+    path_env: &OsStr,
+    base: Option<&str>,
+) -> Option<BTreeMap<String, PathState>> {
+    let index = index_entries(root, path_env)?;
+    let tracked = match base {
+        None => stdout_bytes(git(root, path_env).args(["ls-files", "-z"]))?,
+        Some(base) => stdout_bytes(git(root, path_env).args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--ignore-submodules=none",
+            base,
+            "--",
+        ]))?,
+    };
+    let paths: Vec<String> = split_z(&tracked)
+        .into_iter()
+        .chain(untracked_paths(root, path_env)?)
+        .chain(hidden_among(root, path_env, &index)?)
+        .filter(|p| !is_gate_state(p))
+        .collect();
+    let mut dirty = path_states(root, path_env, &paths)?;
+    for link in gitlinks_among(&index) {
+        if is_gate_state(&link) {
+            continue;
+        }
+        let full = root.join(&link);
+        match std::fs::symlink_metadata(&full) {
+            // Missing: git's diff lists it as deleted, which is the same
+            // fact from the other side — the source is not there.
+            Err(_) => {
+                dirty.insert(link, PathState::Unpopulated);
+            }
+            Ok(m) if m.is_dir() => {
+                if !is_git_toplevel(&full, path_env) {
+                    dirty.insert(link, PathState::Unpopulated);
+                    continue;
+                }
+                let sub = TreeState::capture(&full, path_env)?;
+                // Dirt beneath makes the gitlink dirty, whatever the
+                // submodule's own flags and config let the diff above see.
+                if !sub.dirty.is_empty() {
+                    dirty
+                        .entry(link.clone())
+                        .or_insert(PathState::Gitlink { head: sub.head });
+                }
+                for (p, s) in sub.dirty {
+                    dirty.insert(format!("{link}/{p}"), s);
+                }
+            }
+            // A file or link where a submodule belongs is already listed by
+            // the diff, as what it is. Never followed: a link to an ancestor
+            // would recurse forever.
+            Ok(_) => {}
+        }
+    }
+    Some(dirty)
 }
 
 /// Tracked paths an index flag hides — assume-unchanged (a lowercase `ls-files
@@ -810,7 +861,7 @@ impl FileStamp {
 }
 
 /// The compiler a run uses, and the checkers its tests run. Built by
-/// [`crate::Toolchain::identity`]; [`crate::run`] adds the checkers.
+/// [`ToolchainIdentity::of`]; [`crate::run`] adds the checkers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolchainIdentity {
     /// Each tool's path and its stamp (`None` = absent at capture).
@@ -823,6 +874,53 @@ pub struct ToolchainIdentity {
 }
 
 impl ToolchainIdentity {
+    /// The compiler `tc` resolves to, for the mid-run tripwire ([`Tripwire`])
+    /// and the snapshot lanes' stamps: `(dev, ino, len, mtime)` of `targo`,
+    /// `trustc`, `trustdoc` and `tippy` (an atpkg update or a promote rewrites
+    /// them in place), plus the commit `trustc -vV` names. The version query
+    /// runs under a one-minute ceiling in `scratch`, so a wedged driver costs
+    /// the commit hash, never the run.
+    #[must_use]
+    pub fn of(tc: &crate::Toolchain, path_env: &OsStr, scratch: &Path) -> Self {
+        let trustc = tc.stage2_dir.join("trustc");
+        let tippy = tc
+            .tippy
+            .clone()
+            .unwrap_or_else(|| tc.stage2_dir.join("tippy"));
+        let files = [&tc.targo, &trustc, &tc.trustdoc, &tippy]
+            .into_iter()
+            .map(|p| (p.clone(), FileStamp::of(p)))
+            .collect();
+        let commit = if crate::is_executable_file(&trustc) {
+            let log = scratch.join(format!("trustc-vV.{}.log", std::process::id()));
+            let _ = std::fs::remove_file(&log);
+            let run = crate::exec::run(
+                &crate::exec::Cmd::new(&trustc)
+                    .arg("-vV")
+                    .capture(crate::exec::Capture::Append(log.clone())),
+                crate::exec::ExecEnv {
+                    cwd: scratch,
+                    path: path_env,
+                    scratch,
+                    child_ceiling: Some(Duration::from_secs(60)),
+                    remove_env: &[],
+                    add_env: &[],
+                    compile_qos: crate::exec::CompileQos::Utility,
+                },
+            );
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            run.ok.then(|| commit_hash_in(&text)).flatten()
+        } else {
+            None
+        };
+        Self {
+            files,
+            commit,
+            checkers: None,
+        }
+    }
+
     /// Every tool whose stamp changed since capture, and every checker that
     /// moved ([`crate::checkers::Checkers::moved`]), in words.
     ///

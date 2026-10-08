@@ -76,17 +76,14 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 
+use crate::win_ffi::{
+    COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize, Com, Guid, IUnknownRepr, StepError,
+    check, co_create, wide,
+};
+
 // ---------------------------------------------------------------------------
 // GUIDs (from shobjidl_core.h / propsys.h / propkey.h)
 // ---------------------------------------------------------------------------
-
-#[repr(C)]
-struct Guid {
-    data1: u32,
-    data2: u16,
-    data3: u16,
-    data4: [u8; 8],
-}
 
 /// `CLSID_DestinationList` {77F10CF0-3DB5-4966-B520-B7C54FD35ED6}.
 const CLSID_DESTINATION_LIST: Guid = Guid {
@@ -199,21 +196,6 @@ struct PropVariant {
 // Vtables, in COM inheritance order. Slots before a called one are declared
 // with their real shapes and never invoked — their OFFSETS are load-bearing.
 // ---------------------------------------------------------------------------
-
-/// The 3-slot `IUnknown` prefix every COM vtable begins with; any interface
-/// pointer can be viewed through it for `QueryInterface`/`Release` without
-/// caring which concrete interface it is.
-#[repr(C)]
-struct IUnknownVtbl {
-    query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
-    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
-    release: unsafe extern "system" fn(*mut c_void) -> u32,
-}
-
-#[repr(C)]
-struct IUnknownRepr {
-    vtbl: *const IUnknownVtbl,
-}
 
 /// `ICustomDestinationList` (shobjidl_core.h).
 #[repr(C)]
@@ -334,43 +316,11 @@ struct IPropertyStore {
     vtbl: *const IPropertyStoreVtbl,
 }
 
-const CLSCTX_INPROC_SERVER: u32 = 0x1;
-const COINIT_APARTMENTTHREADED: u32 = 0x2;
-
-#[link(name = "ole32")]
-unsafe extern "system" {
-    fn CoInitializeEx(reserved: *mut c_void, co_init: u32) -> i32;
-    fn CoUninitialize();
-    fn CoCreateInstance(
-        rclsid: *const Guid,
-        outer: *mut c_void,
-        cls_ctx: u32,
-        riid: *const Guid,
-        ppv: *mut *mut c_void,
-    ) -> i32;
-}
-
 // ---------------------------------------------------------------------------
-// Tiny RAII so error paths cannot leak COM references
+// Tiny RAII so error paths cannot leak COM references ([`Com`]) or the apartment.
+// [`build`] has too many fallible steps for the linear manual-release style of
+// the `taskbar` module.
 // ---------------------------------------------------------------------------
-
-/// An owned COM interface pointer (any interface — released through the
-/// `IUnknown` prefix every vtable shares). Exists so `?`-style early returns in
-/// [`build`] cannot leak a reference; the linear manual-release style of the
-/// `taskbar` module does not survive this many fallible steps.
-struct Com(*mut c_void);
-
-impl Drop for Com {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is a live interface pointer obtained from
-        // CoCreateInstance/QueryInterface on this thread; every COM vtable
-        // begins with the IUnknown triple, so the prefix view is sound.
-        unsafe {
-            let unk = self.0.cast::<IUnknownRepr>();
-            ((*(*unk).vtbl).release)(self.0);
-        }
-    }
-}
 
 /// Balances a successful `CoInitializeEx` when [`build`] returns by any path.
 struct CoUninitGuard;
@@ -381,38 +331,6 @@ impl Drop for CoUninitGuard {
         // thread, so the pairing rule is upheld.
         unsafe { CoUninitialize() };
     }
-}
-
-/// A failed step: which call, and its HRESULT — the whole error surface of this
-/// module (one warn line; jump-list absence must never be louder than that).
-type StepError = (&'static str, i32);
-
-fn check(hr: i32, step: &'static str) -> Result<(), StepError> {
-    if hr < 0 { Err((step, hr)) } else { Ok(()) }
-}
-
-/// NUL-terminated UTF-16, the PCWSTR shape every call below takes.
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-unsafe fn co_create(clsid: &Guid, iid: &Guid, step: &'static str) -> Result<Com, StepError> {
-    let mut ppv: *mut c_void = std::ptr::null_mut();
-    // SAFETY: standard object creation; `ppv` receives the interface pointer
-    // only on success, and a success with a null pointer is rejected.
-    let hr = unsafe {
-        CoCreateInstance(
-            clsid,
-            std::ptr::null_mut(),
-            CLSCTX_INPROC_SERVER,
-            iid,
-            &mut ppv,
-        )
-    };
-    if hr < 0 || ppv.is_null() {
-        return Err((step, hr));
-    }
-    Ok(Com(ppv))
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +349,16 @@ unsafe fn co_create(clsid: &Guid, iid: &Guid, step: &'static str) -> Result<Com,
 /// taskbar menu at shell defaults — identical to today's behaviour, never a
 /// startup failure.
 pub(crate) fn install() {
+    // Only a window in the WINDOWED image owns the taskbar menu, the rule OS
+    // restart registration follows (`registers_for_os_restart`). The list is
+    // per-user, keyed on the AUMID, not per-process: any process that presents
+    // a frame rewrites it, and on 2026-09-30 aterm-gui's own test binaries
+    // (console-subsystem `target\debug\deps\aterm_gui-<hash>.exe`) repointed the
+    // owner's "New Window" row at a cargo test exe in a since-deleted worktree.
+    if crate::win32::running_image() != crate::ImageSubsystem::Windowed {
+        aterm_log::debug!("taskbar jump list skipped (not the windowed image)");
+        return;
+    }
     let current = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {

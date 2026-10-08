@@ -4,10 +4,9 @@
 
 //! Equivalence tests for `DeferredLine` lazy scrollback promotion.
 //!
-//! Verifies that `DeferredLine::to_line()` and `DeferredLine::into_line()`
-//! produce identical `Line` output as the eager `row_to_line_with_stored_extras()`
-//! for all cell/extras combinations: empty rows, ASCII rows, complex chars,
-//! combining marks, hyperlinks, RGB colors, wrapped rows, and mixed content.
+//! `DeferredLine::to_line()` and `into_line()` produce the same `Line` as the
+//! eager `row_to_line_with_stored_extras()` for empty, ASCII, complex, combining,
+//! hyperlinked, RGB, wrapped and mixed rows.
 
 use std::sync::Arc;
 
@@ -77,9 +76,7 @@ impl RowBuilder {
     }
 }
 
-// =============================================================================
 // Equivalence: Empty rows
-// =============================================================================
 
 #[test]
 fn deferred_line_empty_row_equivalence() {
@@ -111,9 +108,7 @@ fn deferred_line_empty_row_wrapped_equivalence() {
     assert_lines_equivalent(&eager, &lazy, "empty wrapped row");
 }
 
-// =============================================================================
 // Equivalence: ASCII rows
-// =============================================================================
 
 #[test]
 fn deferred_line_ascii_row_equivalence() {
@@ -159,9 +154,7 @@ fn deferred_line_styled_ascii_row_equivalence() {
     assert_eq!(eager.to_string(), "Styled");
 }
 
-// =============================================================================
 // Equivalence: Wrapped rows
-// =============================================================================
 
 #[test]
 fn deferred_line_wrapped_row_equivalence() {
@@ -181,9 +174,7 @@ fn deferred_line_wrapped_row_equivalence() {
     assert!(lazy.is_wrapped(), "lazy line should be wrapped");
 }
 
-// =============================================================================
 // Equivalence: Complex characters (non-BMP / overflow)
-// =============================================================================
 
 #[test]
 fn deferred_line_complex_chars_equivalence() {
@@ -206,9 +197,7 @@ fn deferred_line_complex_chars_equivalence() {
     assert_lines_equivalent(&eager, &lazy, "complex chars row");
 }
 
-// =============================================================================
 // Equivalence: Combining marks
-// =============================================================================
 
 #[test]
 fn deferred_line_combining_marks_equivalence() {
@@ -235,9 +224,7 @@ fn deferred_line_combining_marks_equivalence() {
     );
 }
 
-// =============================================================================
 // Equivalence: Hyperlinks
-// =============================================================================
 
 #[test]
 fn deferred_line_hyperlinks_equivalence() {
@@ -305,9 +292,7 @@ fn deferred_line_multiple_hyperlinks_equivalence() {
     assert_eq!(lazy.hyperlink_count(), 2);
 }
 
-// =============================================================================
 // Equivalence: RGB colors
-// =============================================================================
 
 #[test]
 fn deferred_line_rgb_colors_equivalence() {
@@ -335,9 +320,7 @@ fn deferred_line_rgb_colors_equivalence() {
     assert_lines_equivalent(&eager, &lazy, "RGB colors row");
 }
 
-// =============================================================================
 // Equivalence: Mixed content (the stress test)
-// =============================================================================
 
 #[test]
 fn deferred_line_mixed_content_equivalence() {
@@ -400,9 +383,7 @@ fn deferred_line_mixed_content_equivalence() {
     );
 }
 
-// =============================================================================
 // Equivalence: Full-width / wide character rows
-// =============================================================================
 
 #[test]
 fn deferred_line_wide_chars_equivalence() {
@@ -439,9 +420,7 @@ fn deferred_line_wide_chars_equivalence() {
     assert_lines_equivalent(&eager, &lazy, "wide chars row");
 }
 
-// =============================================================================
 // Lazy buffer integration: drain produces equivalent lines
-// =============================================================================
 
 #[test]
 fn lazy_buffer_drain_produces_equivalent_lines() {
@@ -485,16 +464,10 @@ fn lazy_buffer_drain_produces_equivalent_lines() {
     assert_lines_equivalent(&eager2, &drained[1], "lazy buffer drain line 2");
 }
 
-// =============================================================================
-// Cell-body recycling (the per-newline malloc the pool removes)
-//
-// Every row that scrolls off the ring becomes a `DeferredLine` whose cell
-// snapshot used to be a fresh `to_vec()` — one malloc per newline, INSIDE the
-// PTY reader's `term_lock` hold (~800 of them for a 64 KiB batch at 80 cols),
-// i.e. on the hold the UI thread's keystroke-echo present waits behind. These
-// pin the two properties that make recycling safe: a reused body carries no
-// state from its previous line, and the free-list cannot grow without bound.
-// =============================================================================
+// Cell-body recycling: every row scrolling off the ring becomes a
+// `DeferredLine` whose cell snapshot reuses a pooled body instead of a malloc
+// per newline under the PTY reader's lock. A reused body carries no state from
+// its previous line, and the free list is bounded.
 
 #[test]
 fn recycled_cell_body_carries_no_state_from_the_previous_line() {
@@ -516,10 +489,8 @@ fn recycled_cell_body_carries_no_state_from_the_previous_line() {
         "a materialized line must hand its cell body back"
     );
 
-    // Now a SHORTER, differently-styled, WRAPPED line reuses that body. If the
-    // reuse leaked the old length or old cells, this line would come back with
-    // trailing 'a'..'z' garbage — the failure mode `clear` + `extend_from_slice`
-    // (rather than a bare truncate/overwrite) rules out.
+    // A shorter, differently styled, wrapped line reuses that body; a leaked old
+    // length or cells would show as trailing 'a'..'z'.
     let fg = PackedColor::rgb(255, 128, 0);
     let bg = PackedColor::rgb(0, 64, 128);
     let short_cells: Vec<Cell> = b"hi"
@@ -587,9 +558,8 @@ fn lazy_buffer_recycles_bodies_across_a_drain() {
 fn flood_backpressure_drop_recycles_bodies() {
     use crate::grid::scroll_convert::LazyBuffer;
 
-    // `drop_oldest` is the THRU-5 backpressure path: it runs precisely when the
-    // reader is allocating a body per newline under its lock, so dropping those
-    // bodies to the allocator would leave the pool dry when it matters most.
+    // `drop_oldest` is the backpressure path, which runs while the reader
+    // allocates bodies under its lock; its bodies go back to the pool.
     let mut rb = RowBuilder::new();
     let mut buf = LazyBuffer::new();
     let cells: Vec<Cell> = b"dropped under flood"
@@ -695,7 +665,7 @@ fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
         "free-list depth must be capped (POOL_MAX_BUFFERS), got {depth}"
     );
 
-    // CELL budget: the depth cap alone is a PER-WIDTH bound (512 × cols × 8 B),
+    // Cell budget: the depth cap alone is a per-width bound (512 × cols × 8 B),
     // which a very wide window would turn into megabytes of idle free-list.
     let mut buf = LazyBuffer::new();
     let wide: Vec<Cell> = (0..900u16).map(|_| Cell::from_ascii_fast(b'w')).collect();
@@ -722,9 +692,8 @@ fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
 fn width_change_drops_recycled_bodies_and_history_survives() {
     use aterm_scrollback::Scrollback;
 
-    // Old-width bodies are useless after a resize (dead capacity when the width
-    // shrinks, a guaranteed realloc when it grows) — and the content must be
-    // unaffected either way, since a body is cleared and refilled from the row.
+    // Old-width bodies are dropped after a resize; content is unaffected since a
+    // body is cleared and refilled from the row.
     let scrollback = Scrollback::new(100, 1000, 100_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     for i in 0..40usize {
@@ -768,9 +737,8 @@ fn width_change_drops_recycled_bodies_and_history_survives() {
 fn recycling_preserves_flooded_scrollback_content() {
     use aterm_scrollback::Scrollback;
 
-    // End-to-end: enough newlines to cycle bodies through the pool many times
-    // (push → drain → push on the recycled body), asserting the history is
-    // still exactly L0..L299 in order.
+    // Cycle bodies through the pool many times; history stays exactly
+    // L0..L299 in order.
     let scrollback = Scrollback::new(400, 1000, 100_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     for i in 0..300usize {
@@ -802,18 +770,11 @@ fn recycling_preserves_flooded_scrollback_content() {
     );
 }
 
-// =============================================================================
-// Attribute-run SHAPE: what `Line::from_parts` keeps vs discards
-// =============================================================================
-//
-// Materialization builds the attribute runs in two locals and only spills into
-// a real `Rle` once a SECOND distinct `CellAttrs` appears, so an all-default
-// line allocates nothing. These four tests pin the boundary of that rule — in
-// particular the case a naive "single run => hand from_parts None" would get
-// WRONG: a wholly-coloured line (a red error line, a highlighted grep hit) is
-// ONE run and must still be stored.
+// Attribute-run shape: materialization spills into an `Rle` only once a
+// second distinct `CellAttrs` appears, so an all-default line allocates
+// nothing, while a wholly coloured line is one run and is still stored.
 
-/// A line of plain cells stores NO attrs Rle (the all-default run is dropped).
+/// A line of plain cells stores no attrs Rle (the all-default run is dropped).
 #[test]
 fn materialized_all_default_line_stores_no_attrs() {
     let cells: Vec<Cell> = b"plain text"
@@ -835,9 +796,7 @@ fn materialized_all_default_line_stores_no_attrs() {
     assert_lines_equivalent(&eager, &lazy, "all-default line");
 }
 
-/// A line that is ENTIRELY one non-default style is a SINGLE run and must be
-/// KEPT — dropping it would silently lose the colour of every uniformly styled
-/// line in history.
+/// A line entirely in one non-default style is a single run and is kept.
 #[test]
 fn materialized_single_nondefault_run_is_kept() {
     let fg = PackedColor::indexed(1);
@@ -867,7 +826,7 @@ fn materialized_single_nondefault_run_is_kept() {
     assert_lines_equivalent(&eager, &lazy, "single non-default run");
 }
 
-/// Several styles: every run is emitted, in order, and the LAST one being
+/// Several styles: every run is emitted, in order, and the last one being
 /// default must not cause the earlier ones to be dropped.
 #[test]
 fn materialized_multi_run_keeps_every_run_including_default_tail() {
@@ -900,7 +859,7 @@ fn materialized_multi_run_keeps_every_run_including_default_tail() {
 }
 
 /// The reverse order: default prefix, styled tail. The spill happens at the
-/// boundary, so the FIRST (default) run must be flushed rather than dropped.
+/// boundary, so the first (default) run must be flushed rather than dropped.
 #[test]
 fn materialized_default_prefix_then_styled_tail_keeps_both() {
     let fg = PackedColor::indexed(3);

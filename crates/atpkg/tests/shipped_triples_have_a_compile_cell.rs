@@ -10,12 +10,11 @@
 //! front of you is not. Nothing makes the two lists agree, so a shipped triple in no cell is
 //! compiled by no gate anywhere and a break visible only there reads green.
 //!
-//! One-directional, like its neighbour `shipped_triples_have_an_abi_cell.rs`: a cell for a
-//! triple nothing ships (`wasm32-unknown-unknown`, the browser modules) is no violation. It
-//! lives here because `xtask` does not depend on `atpkg` and the shipped roster is atpkg's to
-//! own. A string law over committed text, not a compile — `xtask gate cells` stays the
-//! authority on whether a cell's graph type-checks; a `default_cells()` body this file cannot
-//! parse is an error, never a silent pass.
+//! One-directional: a cell for a triple nothing ships (`wasm32-unknown-unknown`, the browser
+//! modules) is no violation. It lives here because `xtask` does not depend on `atpkg` and the
+//! shipped roster is atpkg's to own. A string law over committed text, not a compile —
+//! `xtask gate cells` stays the authority on whether a cell's graph type-checks; a
+//! `default_cells()` body this file cannot parse is an error, never a silent pass.
 //! `tools/cross-cell-gate.tsv`'s business and the gate's.
 
 use std::path::{Path, PathBuf};

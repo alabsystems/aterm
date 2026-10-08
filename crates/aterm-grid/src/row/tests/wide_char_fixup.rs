@@ -162,8 +162,8 @@ fn cells_mut_with_fixup_ignores_out_of_bounds_start_without_overflow() {
     assert_eq!(row.len(), 0);
 }
 
-/// Regression test for #7669: `fixup_wide_boundary` must clear an orphaned
-/// WIDE_CONTINUATION at `left` when `left-1` is NOT a WIDE cell.
+/// `fixup_wide_boundary` clears an orphaned WIDE_CONTINUATION at `left` when
+/// `left-1` is not a WIDE cell.
 #[test]
 fn fixup_wide_boundary_clears_orphaned_continuation_at_left() {
     use crate::{CellFlags, PackedColor};
@@ -184,9 +184,7 @@ fn fixup_wide_boundary_clears_orphaned_continuation_at_left() {
     assert!(!row.get(2).unwrap().is_wide());
     assert!(row.get(3).unwrap().is_wide_continuation());
 
-    // Call fixup_wide_boundary with left=3 (the orphaned continuation).
-    // Before the fix for #7669, this was a no-op: the left boundary only
-    // checked (prev_wide && !cur_cont), not (cur_cont && !prev_wide).
+    // left=3 is the orphaned continuation (cur_cont && !prev_wide).
     row.fixup_wide_boundary(3, 6, 10, true);
 
     // The orphaned WIDE_CONTINUATION at col 3 should now be cleared.
@@ -201,10 +199,8 @@ fn fixup_wide_boundary_clears_orphaned_continuation_at_left() {
     );
 }
 
-/// Regression for #7522: `clear_range_with` (DECFRA/DECERA/BCE fill backing)
-/// must clear an orphaned WIDE head just LEFT of the fill rect to `Cell::EMPTY`,
-/// NOT paint it with the fill glyph/attributes. cells[start-1] is outside the
-/// rect, so bleeding the fill one column left is a rendering bug.
+/// `clear_range_with` (DECFRA/DECERA/BCE fill) clears an orphaned WIDE head just
+/// left of the rect to `Cell::EMPTY` instead of painting it with the fill.
 #[test]
 fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor, StyleId};
@@ -217,7 +213,7 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
     row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(row.get(0).unwrap().is_wide());
 
-    // A visible fill (distinct glyph) so we can tell EMPTY from fill.
+    // A visible fill (distinct glyph) so we can tell empty from fill.
     let fill = Cell::with_style_id('X', StyleId::DEFAULT, CellFlags::empty());
     assert!(
         !fill.is_empty(),
@@ -225,7 +221,7 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
     );
 
     // Fill [1, 5): overwrites the continuation at col 1, orphaning the WIDE
-    // head at col 0 (which sits OUTSIDE the rect).
+    // head at col 0 (which sits outside the rect).
     row.clear_range_with(1, 5, fill);
 
     // In-rect cells carry the fill.
@@ -234,7 +230,7 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
         'X',
         "in-rect cell should hold the fill"
     );
-    // The orphaned WIDE head at col 0 must be cleared to EMPTY, not painted 'X'.
+    // The orphaned WIDE head at col 0 must be cleared to empty, not painted 'X'.
     assert!(
         !row.get(0).unwrap().is_wide(),
         "orphaned WIDE head must be cleared"
@@ -250,9 +246,8 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
     );
 }
 
-/// Regression for #7522, right boundary: an orphaned WIDE continuation just
-/// RIGHT of the fill rect must be cleared to `Cell::EMPTY`, not painted with
-/// the fill.
+/// Right boundary: an orphaned WIDE continuation just right of the fill rect is
+/// cleared to `Cell::EMPTY`, not painted with the fill.
 #[test]
 fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor, StyleId};
@@ -268,7 +263,7 @@ fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
     let fill = Cell::with_style_id('X', StyleId::DEFAULT, CellFlags::empty());
 
     // Fill [2, 7): overwrites the WIDE head at col 6, orphaning the
-    // continuation at col 7 (which sits OUTSIDE the rect).
+    // continuation at col 7 (which sits outside the rect).
     row.clear_range_with(2, 7, fill);
 
     assert_eq!(
@@ -289,9 +284,8 @@ fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
         row.get(7).unwrap().is_empty(),
         "right-of-rect orphan must not inherit fill attributes"
     );
-    // The cleared orphan at col 7 was the row's last content cell (old_len == 8),
-    // so the logical length must shrink to 7. A stale len of 8 would surface the
-    // now-empty cell 7 as a trailing space via row_text / scrollback materialization.
+    // The cleared orphan at col 7 was the last content cell (old_len == 8), so
+    // len shrinks to 7; otherwise row_text would show a trailing space.
     assert_eq!(
         row.len(),
         7,
@@ -299,11 +293,9 @@ fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
     );
 }
 
-/// Regression (round 12): DECLRMM-bounded insert that bisects a wide pair must
-/// clear BOTH halves, so the continuation's bit-10 (WIDE_CONTINUATION, aliasing
-/// PROTECTED) is not shifted right into a phantom protected spacer. Mirrors the
-/// non-bounded insert_chars_fill. Found independently by an audit finder and a
-/// sibling session.
+/// A DECLRMM-bounded insert that bisects a wide pair clears both halves, so the
+/// continuation's bit 10 (WIDE_CONTINUATION, aliasing PROTECTED) is not shifted
+/// into a phantom protected spacer. Mirrors insert_chars_fill.
 #[test]
 fn insert_chars_bounded_fill_clears_phantom_continuation() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -325,9 +317,8 @@ fn insert_chars_bounded_fill_clears_phantom_continuation() {
         !row.get(4).unwrap().is_wide(),
         "orphaned WIDE head at 4 must be cleared"
     );
-    // cells[6] received the shifted continuation. It must NOT carry a stale bit-10:
-    // its left neighbor (cell 5) is a fill, not WIDE, so a raw bit-10 there reads
-    // as DECSCA-protected and would survive a later selective erase.
+    // cells[6] holds the shifted continuation; its left neighbour is a fill, so
+    // a stale bit 10 would read as DECSCA-protected.
     assert!(
         !row.get(6)
             .unwrap()
@@ -346,11 +337,9 @@ fn insert_chars_bounded_fill_clears_phantom_continuation() {
     );
 }
 
-/// Regression (round 12): selective_erase_chars whose range starts on the
-/// continuation of an UNprotected wide char must clear both halves. Clearing only
-/// the head at col-1 leaves cells[col]'s bit-10 reading as PROTECTED (its head is
-/// now a non-WIDE fill), so the erase loop would skip it — a phantom protected
-/// orphan. Mirrors selective_clear_range / selective_wipe_range (bit-10 class).
+/// selective_erase_chars starting on the continuation of an unprotected wide
+/// char clears both halves; otherwise cells[col]'s bit 10 reads as PROTECTED and
+/// the erase skips it.
 #[test]
 fn selective_erase_chars_clears_left_boundary_continuation() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -388,12 +377,10 @@ fn selective_erase_chars_clears_left_boundary_continuation() {
     );
 }
 
-/// xterm `util.c` `ClearRight`: the wide half orphaned by an EL/ED/ECH erase goes
-/// through the same `ClearInLine2` -> `ClearCells` as the erased span, so it gets
-/// `' '` with `xtermColorPair(xw)` — the BCE background. aterm handed it
-/// `Cell::EMPTY` (default colours) and left a default-coloured hole one column
-/// LEFT of the erase. `clear_range_with_orphan` is the seam: the erases pass
-/// `orphan = fill`, the rect ops keep `Cell::EMPTY` (#7522).
+/// Like xterm's `ClearRight`, the wide half orphaned by an EL/ED/ECH erase gets
+/// the erase fill (`' '` with the BCE background), not `Cell::EMPTY`.
+/// `clear_range_with_orphan` is the seam: erases pass `orphan = fill`, rect ops
+/// keep `Cell::EMPTY`.
 #[test]
 fn clear_range_with_orphan_paints_left_wide_orphan_with_the_bce_blank() {
     use crate::{Cell, CellFlags, PackedColor, PackedColors};
@@ -429,9 +416,8 @@ fn clear_range_with_orphan_paints_left_wide_orphan_with_the_bce_blank() {
     );
 }
 
-/// Right-boundary twin of the test above, plus the `len` consequence: the orphan
-/// at index `end` now carries a VISIBLE blank, so it is content and `len` must
-/// stretch to cover it instead of shrinking past it.
+/// Right-boundary twin: the orphan at index `end` now holds a visible blank, so
+/// `len` stretches to cover it.
 #[test]
 fn clear_range_with_orphan_paints_right_wide_orphan_with_the_bce_blank() {
     use crate::{Cell, CellFlags, PackedColor, PackedColors};
@@ -472,9 +458,8 @@ fn clear_range_with_orphan_paints_right_wide_orphan_with_the_bce_blank() {
     );
 }
 
-/// The #7522 direction, asserted on the delegating helper itself: a rect op
-/// (`clear_range_with`) still blanks BOTH orphans to `Cell::EMPTY` even when the
-/// fill carries a visible background, and still reports the widened span.
+/// A rect op (`clear_range_with`) blanks both orphans to `Cell::EMPTY` even with
+/// a visible fill background, and reports the widened span.
 #[test]
 fn clear_range_with_keeps_rect_orphans_empty_under_a_visible_fill() {
     use crate::{Cell, CellFlags, PackedColor, PackedColors};
@@ -501,10 +486,8 @@ fn clear_range_with_keeps_rect_orphans_empty_under_a_visible_fill() {
     assert_eq!(written, 2..8, "the widened span is reported either way");
 }
 
-/// Regression (round 13): clear_range_with with an EMPTY fill (EL/DECERA with
-/// default SGR) that erases a trailing wide char must shrink len — the right
-/// wide-orphan is cleared at index `end` (one past the range), and when it was
-/// the tail (old_len == end + 1) the len-recalc must still fire.
+/// clear_range_with with an empty fill that erases a trailing wide char shrinks
+/// len: the continuation at `end` (one past the range) was the tail.
 #[test]
 fn clear_range_with_empty_fill_shrinks_len_on_tail_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -535,9 +518,8 @@ fn clear_range_with_empty_fill_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-/// Regression (round 13): selective_clear_range (DECSEL/DECSED) whose WIDE-head
-/// co-clear wipes the continuation at index `end` (one past the range) must
-/// shrink len when that continuation was the tail content.
+/// selective_clear_range (DECSEL/DECSED) whose wide-head co-clear wipes the
+/// tail continuation at `end` shrinks len.
 #[test]
 fn selective_clear_range_shrinks_len_on_tail_wide_orphan() {
     use crate::{CellFlags, PackedColor};
@@ -566,9 +548,8 @@ fn selective_clear_range_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-/// Regression (round 13): selective_wipe_range (DECSERA) shares the same
-/// off-by-one; a default-colored wiped continuation at index `end` that was the
-/// tail must shrink len.
+/// selective_wipe_range (DECSERA): a wiped tail continuation at `end` shrinks
+/// len.
 #[test]
 fn selective_wipe_range_shrinks_len_on_tail_wide_orphan() {
     use crate::{CellFlags, PackedColor};
@@ -599,9 +580,8 @@ fn selective_wipe_range_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-/// Regression (round 14): clear_range (the 2-arg EMPTY sibling of
-/// clear_range_with) had the same un-relaxed len guard; a trailing wide char
-/// whose continuation is cleared at index `end` must still shrink len.
+/// clear_range: a trailing wide char whose continuation is cleared at `end`
+/// shrinks len.
 #[test]
 fn clear_range_shrinks_len_on_tail_wide_orphan() {
     use crate::{CellFlags, PackedColor};
@@ -630,9 +610,8 @@ fn clear_range_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-/// Regression (round 14): selective_erase_chars had the same un-relaxed len
-/// guard as its siblings; the WIDE-head co-clear touches cells[end] (one past
-/// the range), so when that was the tail content, len must still shrink.
+/// selective_erase_chars: the wide-head co-clear at cells[end], when it was the
+/// tail, shrinks len.
 #[test]
 fn selective_erase_chars_shrinks_len_on_tail_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -670,18 +649,12 @@ fn selective_erase_chars_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-// ── Round 15: the #7522 len class on the WRITE/FILL paths ────────────────
-//
-// The clear/erase family (clear_range, selective_*, erase_chars) was hardened
-// so a wide-orphan clear one column past the operation range tightens len when
-// that orphan was the row's tail content. The write paths (write_char*,
-// write_wide_char*, fill_cell_run) grew len monotonically and never recalced,
-// so the identical off-by-one left len stale-high — a phantom trailing space in
-// row_text/search/scrollback (all slice through self.len). These lock the fix.
+// Write/fill paths: a wide-orphan clear one column past the written range
+// tightens len when that orphan was the row's tail, so row_text, search and
+// scrollback (which slice through len) show no phantom trailing space.
 
-/// write_char: a single-width write over a WIDE head at the tail clears the
-/// continuation at col+1; when that pair was the row's last content
-/// (old_len == col+2) len must tighten, not stay stale-high.
+/// write_char: a single-width write over a tail WIDE head clears the
+/// continuation at col+1 and tightens len (old_len == col+2).
 #[test]
 fn write_char_shrinks_len_on_tail_wide_head_overwrite() {
     use crate::{CellFlags, PackedColor};
@@ -736,9 +709,8 @@ fn write_char_packed_shrinks_len_on_tail_wide_head_overwrite() {
     );
 }
 
-/// write_wide_char_packed: a new wide char whose second half overwrites an
-/// existing wide head orphans that char's continuation at col+2; when it was the
-/// tail (old_len == col+3) len must tighten.
+/// write_wide_char_packed: a wide char whose second half overwrites a wide head
+/// orphans that char's continuation at col+2; as the tail, len tightens.
 #[test]
 fn write_wide_char_packed_shrinks_len_on_tail_wide_orphan() {
     use crate::{CellFlags, PackedColors};
@@ -763,9 +735,8 @@ fn write_wide_char_packed_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-/// fill_cell_run (REP/padding fast path): the fixup clears a wide continuation at
-/// index `end` (one column past the fill); when that orphan was the tail content
-/// (old_len == end+1) the grow-only len update misses it and len must tighten.
+/// fill_cell_run (REP/padding): the fixup clears a continuation at `end`; as the
+/// tail (old_len == end+1), len tightens.
 #[test]
 fn fill_cell_run_shrinks_len_on_tail_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -800,11 +771,8 @@ fn fill_cell_run_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-/// Regression (codex round-15 review): cells_mut_with_fixup is the bulk-write
-/// primitive; its fixup clears a wide continuation one column PAST the returned
-/// slice, but bulk callers (grid/write.rs, write_split.rs) only GROW len via
-/// update_len(). When that orphan was the tail content, the primitive itself
-/// must tighten len — the caller can't see the past-range clear.
+/// cells_mut_with_fixup tightens len itself when its fixup clears a tail
+/// continuation one column past the slice: bulk callers only grow len.
 #[test]
 fn cells_mut_with_fixup_shrinks_len_on_tail_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -846,9 +814,8 @@ fn cells_mut_with_fixup_shrinks_len_on_tail_wide_orphan() {
     );
 }
 
-/// Regression (codex round-15 review): write_wide_char_with_style_id must set
-/// HAS_WIDE_CHARS so a later HAS_WIDE_CHARS-gated production fixup (write_char)
-/// still runs — otherwise the orphaned continuation survives and len stays high.
+/// write_wide_char_with_style_id sets HAS_WIDE_CHARS so a later gated fixup
+/// (write_char) still runs.
 #[test]
 fn style_id_wide_write_sets_has_wide_chars_for_later_narrow_overwrite() {
     use crate::{CellFlags, RowFlags, StyleId};
@@ -871,10 +838,8 @@ fn style_id_wide_write_sets_has_wide_chars_for_later_narrow_overwrite() {
     assert_eq!(row.len(), 9, "len must tighten to 9");
 }
 
-/// Regression (round 16): delete_chars_fill (plain DCH, EMPTY fill) — the
-/// right-boundary wide fixup clears the deleted WIDE head's orphaned continuation
-/// at col+count; when that was the tail (old_len == col+count+1) the shift moves
-/// the emptied cell into the tail, so `len = old_len - count` is stale-high by one.
+/// delete_chars_fill (plain DCH): clearing the deleted head's continuation at
+/// col+count, when it was the tail, leaves len at old_len - count - 1.
 #[test]
 fn delete_chars_fill_shrinks_len_on_deleted_wide_head_at_tail() {
     use crate::{Cell, CellFlags, PackedColor};

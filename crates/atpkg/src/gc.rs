@@ -8,7 +8,10 @@
 //! while it is the live build or the rollback target (reclaiming the latter resurrects the
 //! cryptic *"Reading release bundle rust-toolchain-version: No such file or directory"*
 //! failure `scripts/verify-kani-proofs.sh` guards against), so [`reclaimable`] keeps the live build and the
-//! single most-recent build below it; everything else is safe to delete.
+//! single most-recent build below it that `aterm pkg rollback` may land on — the verb's own
+//! predicate ([`crate::flow::rollback_lands_on`]), under the channel the caller verified, or
+//! for a vendor program its lane's ([`crate::vendor_direct::lane::rollback_lands_on`]), under
+//! the latched vendor yanks; everything else is safe to delete.
 //!
 //! **The live build is a WITNESS, not an inference — that distinction is the whole module.**
 //! GC used to ask [`crate::ops::active_builds`] which build was current. That function folds
@@ -65,6 +68,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::manifest::Channel;
 use crate::store::Layout;
 
 /// EVIDENCE that `build` is the live build of `program`.
@@ -348,22 +352,36 @@ fn live_from_claims(
     set
 }
 
-/// The store builds (of one program) that may be reclaimed, given all `installed` builds and
-/// the program's live witness.
+/// The store builds (of one program) that may be reclaimed, given all `installed` builds,
+/// the program's live witness, and whether a rollback may land on a build (`lands_on`:
+/// [`crate::flow::rollback_lands_on`], or a vendor program's
+/// [`crate::vendor_direct::lane::rollback_lands_on`] — the predicate `aterm pkg rollback`
+/// selects by).
 ///
-/// Kept: the live build and the highest installed build **below** it (the rollback target).
-/// Returned (reclaimable): everything else, ascending — including any build ABOVE the live
-/// one, which is a staged-but-never-activated tree.
+/// Kept: the live build and the highest installed build **below** it that `lands_on` admits
+/// (the rollback target — the build the verb lands on). Returned (reclaimable): everything
+/// else, ascending — including any build ABOVE the live one, which is a
+/// staged-but-never-activated tree, and a revoked one below it, which no rollback can run.
 ///
 /// Taking `&LiveBuild` rather than `current: u64` is the point: the old signature accepted
 /// any number a caller happened to have, and the number the caller happened to have came
 /// from a `read_dir` fold.
 #[must_use]
-pub fn reclaimable(installed: &[u64], live: &LiveBuild) -> Vec<u64> {
+pub fn reclaimable(
+    installed: &[u64],
+    live: &LiveBuild,
+    lands_on: &dyn Fn(u64) -> bool,
+) -> Vec<u64> {
     let mut keep: BTreeSet<u64> = BTreeSet::new();
     keep.insert(live.build);
-    // The rollback target is the most-recent build the live one superseded.
-    if let Some(rollback) = installed.iter().copied().filter(|&b| b < live.build).max() {
+    // The rollback target is the most-recent build the live one superseded that a rollback
+    // may land on.
+    if let Some(rollback) = installed
+        .iter()
+        .copied()
+        .filter(|&b| b < live.build && lands_on(b))
+        .max()
+    {
         keep.insert(rollback);
     }
     let mut out: Vec<u64> = installed
@@ -610,7 +628,7 @@ fn interrupted_debris(
 }
 
 /// What a GC pass did: what it reclaimed, what it swept, and what it refused to touch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GcReport {
     /// `(program, discarded builds ascending)` for every program that had reclaimable builds.
     pub reclaimed: Vec<(String, Vec<u64>)>,
@@ -673,14 +691,19 @@ pub struct GcReport {
 /// gating it on a witness would leak precisely the case it exists for. Its guard is the claim
 /// union rather than the witness; see the module docs.
 ///
+/// `channel` is the signed channel the caller VERIFIED (`None`: it holds none), whose
+/// revocations decide each program's rollback target: the build kept below the live one is
+/// the build `aterm pkg rollback` would land on ([`reclaimable`]), never a yanked or floored
+/// one the verb refuses while the build it would land on is reclaimed.
+///
 /// This standalone form spares NO staging partials — the user asked for the disk back, and
 /// with no resolved index in hand there is no honest way to tell a live pinned `.part` from
 /// a superseded one. An install/update pass, which DOES hold that knowledge, ends with
 /// [`run_keeping_pinned_partials`] instead so a failed member's resume state survives to the
 /// next pass.
 #[must_use]
-pub fn run(layout: &Layout) -> GcReport {
-    run_keeping_pinned_partials(layout, &|_| None)
+pub fn run(layout: &Layout, channel: Option<&Channel>) -> GcReport {
+    run_keeping_pinned_partials(layout, channel, &|_| None)
 }
 
 /// [`run`], with the staging sweep sparing — per program — the `.part` AND the complete
@@ -717,9 +740,10 @@ pub fn run(layout: &Layout) -> GcReport {
 #[must_use]
 pub fn run_keeping_pinned_partials(
     layout: &Layout,
+    channel: Option<&Channel>,
     pinned_asset: &dyn Fn(&str) -> Option<String>,
 ) -> GcReport {
-    run_with(layout, pinned_asset, &running_executables)
+    run_in(layout, None, channel, pinned_asset, &running_executables)
 }
 
 /// [`run_keeping_pinned_partials`] confined to `programs`: only their superseded builds
@@ -728,7 +752,8 @@ pub fn run_keeping_pinned_partials(
 /// program's builds, `.part` resume state and carried archive are left exactly as they
 /// are, and so are the exec roots (the trust toolchain's). A lane that resolved only
 /// some programs — the vendor lane's doors, which know nothing of the index lane's
-/// pins — ends with this form, never the whole-prefix one.
+/// pins — ends with this form, never the whole-prefix one. It holds no channel: a vendor
+/// program's rollback target is its own lane's, never the index's (see [`run_in`]).
 #[must_use]
 pub fn run_for_programs(
     layout: &Layout,
@@ -738,27 +763,31 @@ pub fn run_for_programs(
     run_in(
         layout,
         Some(&|p: &str| programs.contains(p)),
+        None,
         pinned_asset,
         &running_executables,
     )
 }
 
-/// [`run_keeping_pinned_partials`] with the process enumeration injected: `running`
-/// answers the executable paths of the processes alive now, or `None` when they cannot be
-/// enumerated ([`InUse`]).
+/// [`run_keeping_pinned_partials`] with no channel and the process enumeration injected:
+/// `running` answers the executable paths of the processes alive now, or `None` when they
+/// cannot be enumerated ([`InUse`]).
+#[cfg(test)]
 fn run_with(
     layout: &Layout,
     pinned_asset: &dyn Fn(&str) -> Option<String>,
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
 ) -> GcReport {
-    run_in(layout, None, pinned_asset, running)
+    run_in(layout, None, None, pinned_asset, running)
 }
 
-/// [`run_with`] over the programs `scope` admits (`None`: the whole prefix, exec roots
-/// included).
+/// The whole pass over the programs `scope` admits (`None`: the whole prefix, exec roots
+/// included), each program's rollback target read under `channel`
+/// ([`run_keeping_pinned_partials`]) and the process enumeration injected ([`InUse`]).
 fn run_in(
     layout: &Layout,
     scope: Option<&dyn Fn(&str) -> bool>,
+    channel: Option<&Channel>,
     pinned_asset: &dyn Fn(&str) -> Option<String>,
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
 ) -> GcReport {
@@ -804,8 +833,21 @@ fn run_in(
         let Some(witness) = live.get(&program) else {
             continue;
         };
+        // The build kept below the live one is the build `aterm pkg rollback` lands on: the
+        // verb's own predicate. An index program's under the channel the caller verified; a
+        // vendor program's is its lane's (`vendor_direct::lane::roll_back_by_hand`), which no
+        // index channel speaks for, under the latched vendor yanks that verb reads
+        // (`cmd_rollback_vendor`).
+        let vendor_yanks = crate::vendor_direct::is_vendor(&program)
+            .then(|| crate::vendor_direct::policy::Policy::current(layout, None));
+        let lands_on = |b: u64| match &vendor_yanks {
+            Some(policy) => {
+                crate::vendor_direct::lane::rollback_lands_on(layout, policy, &program, b)
+            }
+            None => crate::flow::rollback_lands_on(layout, channel, &program, b),
+        };
         let mut gone = Vec::new();
-        for b in reclaimable(&installed, witness) {
+        for b in reclaimable(&installed, witness, &lands_on) {
             // A LEASED build is a run's toolchain between two of its stages: kept, and said.
             // The guard holds the subject's gate across the delete, so no run can lease it
             // after this read and before it is gone ([`crate::lease`]).
@@ -817,8 +859,14 @@ fn run_in(
             }
             // `Retained::IsLive` cannot fire here — `reclaimable` never yields the witness's
             // own build — but it is honoured rather than unwrapped so that a future change to
-            // the retention rule loses a reclaim, not the user's toolchain.
-            if discard_superseded(layout, witness, b).is_ok() {
+            // the retention rule loses a reclaim, not the user's toolchain. And a reclaim is
+            // reported only once its tree is gone ([`is_gone`]), the partial and scratch
+            // arms' contract: a tree `discard_build` could not remove (root-owned after a
+            // `sudo aterm pkg …`, an immutable flag, EROFS) was said "reclaimed" with every
+            // byte still on disk.
+            if discard_superseded(layout, witness, b).is_ok()
+                && is_gone(&layout.build_dir(&program, b))
+            {
                 gone.push(b);
             }
         }
@@ -848,7 +896,7 @@ fn run_in(
         // existence afterwards is the only signal there is; without this check an
         // EACCES/EROFS/EBUSY on the tree prints "swept" on every pass, forever, over a
         // directory that is still there.
-        if !path.exists() {
+        if is_gone(&path) {
             swept_partial.entry(program).or_default().push(build);
         }
     }
@@ -971,6 +1019,13 @@ fn run_in(
     }
 }
 
+/// Whether `tree` is gone from disk — all a reclaim or sweep line may claim of it. Only
+/// `NotFound` says so: a stat that fails any other way (no search bit on `store/<program>/`,
+/// an EIO) is a tree nobody could look at, not one that went.
+fn is_gone(tree: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(tree), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// The lease verdict on reclaiming `program`'s `build`: `Some` when no run holds it,
 /// carrying the reclaim guard to hold until the tree is gone ([`crate::lease::reclaim`]) —
 /// `Some(None)` for a program name no lease can carry, which no run could have leased — or
@@ -1086,8 +1141,8 @@ pub(crate) fn running_from_table(dir: &Path, running: &[PathBuf]) -> Option<Path
 /// The live process table ([`running_executables`]) under one ungated name, for another
 /// module to hand to [`running_from`]. The three platform declarations below cover every
 /// target between them, but only as a three-way split, and a `crate::`-qualified reference
-/// is held to a declaration that survives wherever the reference does
-/// (`tests/platform_cfg_parity.rs`).
+/// must name a declaration that survives wherever the reference does: the foreign compile
+/// cells (`xtask gate cells-foreign`) type-check it off this host.
 pub(crate) fn process_table() -> Option<Vec<PathBuf>> {
     running_executables()
 }
@@ -1290,7 +1345,7 @@ mod tests {
             ),
         ];
         for (installed, reclaimed, why) in rows {
-            let got = reclaimable(installed, &live("ay", 19));
+            let got = reclaimable(installed, &live("ay", 19), &|_| true);
             assert_eq!(got, reclaimed, "{why}");
             assert!(
                 !got.contains(&19),
@@ -1302,20 +1357,13 @@ mod tests {
     // --- the imperative executor -------------------------------------------------------
 
     use crate::activate::{activate_build, install_shims};
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     fn tool(name: &str) -> crate::store::ToolName {
         crate::store::ToolName::new(name).unwrap()
     }
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-gc-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-gc-{label}-"))
     }
 
     /// Lay down a COMPLETE (marker-written) build dir with `bin/<program>`. `shim` also
@@ -1377,7 +1425,7 @@ mod tests {
             seed(&l, "ay", b, false);
         }
         seed(&l, "ay", 19, true); // ay@19 is live
-        let report = run(&l);
+        let report = run(&l, None);
         // Keep 19 (live) and 18 (the rollback target, highest below live).
         assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![16u64, 17])]);
         assert!(report.diverged.is_empty(), "the two views agree");
@@ -1386,6 +1434,27 @@ mod tests {
         }
         for keep in [18u64, 19] {
             assert!(l.build_dir("ay", keep).exists(), "{keep} survives");
+        }
+        // …and a reclaim is said only of a tree that went. One this user cannot remove (no
+        // write bit on it or its `bin/`: the shape a root-owned tree a `sudo aterm pkg …`
+        // left has) is still on disk, so nothing was reclaimed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let stuck = seed(&l, "ay", 15, false);
+            let mode = |m| {
+                for d in [stuck.join("bin"), stuck.clone()] {
+                    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(m)).unwrap();
+                }
+            };
+            mode(0o555);
+            let report = run(&l, None);
+            mode(0o755);
+            assert!(
+                stuck.join("bin").join(tool("ay").exe_file()).exists(),
+                "the fixture's payload could not be removed"
+            );
+            assert!(report.reclaimed.is_empty(), "{:?}", report.reclaimed);
         }
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
@@ -1398,7 +1467,7 @@ mod tests {
         // never-activated program, not a disagreement).
         seed(&l, "ay", 17, false);
         seed(&l, "ay", 18, false);
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             report.reclaimed.is_empty(),
             "no witness => nothing reclaimed"
@@ -1429,7 +1498,7 @@ mod tests {
         crate::platform::install_shim(&l.build_dir("ay", 18).join("bin"), &ay, &l.shim(&ay))
             .unwrap();
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             report.reclaimed.is_empty(),
             "a contested program is never reclaimed"
@@ -1465,7 +1534,7 @@ mod tests {
         let aylint = tool("aylint");
         crate::platform::install_shim(&b18.join("bin"), &aylint, &l.shim(&aylint)).unwrap();
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(report.reclaimed.is_empty());
         assert!(l.build_dir("ay", 18).exists() && l.build_dir("ay", 19).exists());
         assert_eq!(
@@ -1496,7 +1565,7 @@ mod tests {
         for link in &links {
             crate::activate::atomic_symlink(&l.build_dir("ay", 77), link).unwrap();
         }
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             report.reclaimed.is_empty(),
             "a dangling authority reclaims nothing"
@@ -1516,13 +1585,16 @@ mod tests {
             crate::activate::atomic_symlink(&outside, link).unwrap();
         }
         assert!(
-            run(&l).reclaimed.is_empty(),
+            run(&l, None).reclaimed.is_empty(),
             "an out-of-store authority proves nothing"
         );
 
         // 3. The link does not exist at all.
         std::fs::remove_file(l.program_current("ay")).unwrap();
-        assert!(run(&l).reclaimed.is_empty(), "no links => no witnesses");
+        assert!(
+            run(&l, None).reclaimed.is_empty(),
+            "no links => no witnesses"
+        );
 
         for b in [17u64, 18, 19] {
             assert!(l.build_dir("ay", b).exists(), "{b} must survive all three");
@@ -1540,7 +1612,7 @@ mod tests {
         let b18 = seed(&l, "ay", 18, false);
         install_shims(&l, &b18, &["ay".to_string()], crate::activate::Aliases::Off).unwrap(); // shims, but no activate
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             report.reclaimed.is_empty(),
             "no witness => nothing reclaimed"
@@ -1574,7 +1646,7 @@ mod tests {
         seed(&l, "ny", 6, false);
         seed(&l, "ny", 7, true); // … then ny@7
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert_eq!(
             report.reclaimed,
             vec![("ay".to_string(), vec![16u64, 17])],
@@ -1626,7 +1698,7 @@ mod tests {
         std::fs::create_dir_all(&legacy).unwrap();
         crate::activate::atomic_symlink(&b19, &legacy.join("current")).unwrap(); // … its link
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             report.reclaimed.is_empty(),
             "the retired link is not an authority: {:?}",
@@ -1651,7 +1723,10 @@ mod tests {
         }
         // The next activation writes the program's own link, and the witness is back.
         activate_build(&l, &b19).unwrap();
-        assert_eq!(run(&l).reclaimed, vec![("ay".to_string(), vec![17u64])]);
+        assert_eq!(
+            run(&l, None).reclaimed,
+            vec![("ay".to_string(), vec![17u64])]
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1698,7 +1773,7 @@ mod tests {
         let aydev = tool("aydev");
         std::os::unix::fs::symlink(checkout.join("aydev"), l.shim(&aydev)).unwrap();
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert_eq!(
             report.reclaimed,
             vec![("ay".to_string(), vec![17u64])],
@@ -1728,7 +1803,7 @@ mod tests {
         // no link or shim into it because activation never ran.
         let partial = seed_partial(&l, "ay", 20);
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(!partial.exists(), "the interrupted tree must be reclaimed");
         assert_eq!(report.swept_partial, vec![("ay".to_string(), vec![20u64])]);
         assert_eq!(
@@ -1752,7 +1827,7 @@ mod tests {
         let l = layout("sweep-fresh");
         let partial = seed_partial(&l, "ny", 7);
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             !partial.exists(),
             "a never-activated program leaks disk too"
@@ -1779,7 +1854,7 @@ mod tests {
         crate::store::clear_build_ready(&b19).unwrap();
         assert!(!crate::store::build_is_complete(&b19));
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             report.swept_partial.is_empty(),
             "a claimed tree is not debris: {:?}",
@@ -1807,7 +1882,7 @@ mod tests {
         crate::platform::install_shim(&b18.join("bin"), &ay, &l.shim(&ay)).unwrap();
         crate::store::clear_build_ready(&b18).unwrap();
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             report.swept_partial.is_empty(),
             "the shims' claim is a claim: {:?}",
@@ -1830,7 +1905,7 @@ mod tests {
         let incoming = seed_scratch(&l, "ay", "20.incoming-4242");
         let superseded = seed_scratch(&l, "ay", "19.superseded-4242");
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(!incoming.exists() && !superseded.exists(), "scratch swept");
         assert_eq!(
             report.swept_scratch,
@@ -1902,7 +1977,7 @@ mod tests {
         let plus_build = seed_scratch(&l, "ay", "+21");
         let ours = seed_scratch(&l, "ay", "20.incoming-4242");
 
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(!ours.exists(), "our own scratch is still swept");
         assert!(theirs.exists(), "a user directory is not ours to delete");
         assert!(
@@ -1945,7 +2020,7 @@ mod tests {
             "the fixture must look every bit as complete as a real build, or it proves nothing"
         );
 
-        let report = run(&l);
+        let report = run(&l, None);
 
         assert!(
             real_rollback.exists(),
@@ -1998,7 +2073,7 @@ mod tests {
             "PRECONDITION: this slice reads it as not-complete and re-stages it"
         );
 
-        let report = run(&l);
+        let report = run(&l, None);
 
         assert!(
             l.build_dir("ay", 18).join("bin").exists(),
@@ -2012,7 +2087,7 @@ mod tests {
 
         // Non-vacuity: a tree with no marker at all, claimed by nothing, is still swept.
         let partial = seed_partial(&l, "ay", 17);
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(
             !partial.exists(),
             "a real interrupted install is still reclaimed"
@@ -2032,7 +2107,7 @@ mod tests {
         seed(&l, "ay", 19, true);
         let (build19, parked) = seed_killed_mid_swap(&l, "ay", 19);
 
-        let report = run(&l);
+        let report = run(&l, None);
 
         assert!(
             build19.is_dir(),
@@ -2074,7 +2149,7 @@ mod tests {
         seed(&l, "ny", 7, false);
         let (build7, parked) = seed_killed_mid_swap(&l, "ny", 7);
 
-        let report = run(&l);
+        let report = run(&l, None);
 
         assert!(!parked.exists(), "the scratch name is released either way");
         assert!(!build7.exists(), "an unclaimed orphan is still reclaimed");
@@ -2105,7 +2180,7 @@ mod tests {
         // Non-vacuity: an unverified half-extract is nobody's only copy.
         let incoming = seed_scratch(&l, "ay", "19.incoming-4242");
 
-        let report = run(&l);
+        let report = run(&l, None);
 
         assert!(
             !build19.exists(),
@@ -2203,7 +2278,7 @@ mod tests {
             vec![(String::from("claude"), vec![String::from("claude-5.part")])]
         );
         // The whole-prefix form still reclaims what the scoped one left.
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(!resume.exists() && !l.build_dir("ay", 16).exists());
         assert!(!other_partial.exists());
         assert!(report.reclaimed.contains(&(String::from("ay"), vec![16])));
@@ -2233,7 +2308,7 @@ mod tests {
             std::fs::write(p, b"x").unwrap();
         }
 
-        let report = run_keeping_pinned_partials(&l, &|program| {
+        let report = run_keeping_pinned_partials(&l, None, &|program| {
             (program == "ay").then(|| "ay-18.tar.zst".to_string())
         });
 
@@ -2273,7 +2348,7 @@ mod tests {
         // The standalone verb keeps its full-sweep meaning: the user asked for the disk
         // back, and everything spared above remains reclaimable — a killed download
         // never permanently strands bytes.
-        let _ = run(&l);
+        let _ = run(&l, None);
         assert!(
             !pinned.exists(),
             "a plain `gc` still reclaims the spared partial"
@@ -2314,7 +2389,7 @@ mod tests {
             },
         ));
         // An install of another program: its resolved assets name nothing of trust's.
-        let report = run_keeping_pinned_partials(&l, &|program| {
+        let report = run_keeping_pinned_partials(&l, None, &|program| {
             (program == "ay").then(|| "ay-18.tar.zst".to_string())
         });
         assert!(held.exists(), "an install's sweep keeps the held archive");
@@ -2325,7 +2400,7 @@ mod tests {
             "and says what it kept"
         );
         // A person's `atpkg gc` too — the flip that follows needs no network.
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(held.exists(), "a plain gc keeps the held archive");
         assert_eq!(report.held_staging.len(), 1);
         // A record that outlived every build it moves off waits for nothing — which is what
@@ -2334,14 +2409,14 @@ mod tests {
         // with it — the disk the owner asked back (review, 2026-09-26).
         crate::ops::uninstall(&l, "trust").unwrap();
         assert!(!l.build_dir("trust", 9192).exists());
-        let report = run(&l);
+        let report = run(&l, None);
         assert!(!held.exists(), "a stale record keeps nothing");
         assert!(report.held_staging.is_empty());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
     /// `codex` live at 20 with 18 and 19 below it: under the plain rule 18 goes.
-    fn codex_with_a_reclaimable_build(label: &str) -> Layout {
+    fn codex_with_a_reclaimable_build(label: &str) -> crate::testdir::ScratchLayout {
         let l = layout(label);
         seed(&l, "codex", 18, false);
         seed(&l, "codex", 19, false);
@@ -2561,7 +2636,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn runs_from_sees_a_symlinked_launch_and_not_a_prefix_sibling() {
-        let root = layout("runs-from").prefix;
+        // Re-signing a copy of an Apple binary waits on trustd.
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
+        let scratch = layout("runs-from");
+        let root = scratch.prefix.clone();
         let app = root.join("A.app");
         let macos = app.join("Contents/MacOS");
         std::fs::create_dir_all(&macos).expect("layout");
@@ -2573,22 +2653,18 @@ mod tests {
         // test passed only when its first poll beat that kill, and every run wrote a
         // `sleepy` crash report (measured 2026-09-27: alive at +260 ms, killed by
         // +1.3 s). Signed ad hoc, the copy sleeps for as long as it is told to.
-        let signed = std::process::Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&sleepy)
-            .status()
-            .expect("run codesign");
-        assert!(signed.success(), "sign the sleeper ad hoc");
+        aterm_uds::deadline::sign_ad_hoc(&sleepy);
         let link = root.join("via-link");
         std::os::unix::fs::symlink(&sleepy, &link).expect("symlink");
         std::fs::create_dir_all(root.join("A.app.rollback")).expect("sibling");
 
         assert_eq!(runs_from(&app), Some(false), "nothing runs from it yet");
+        // It outlives the minute's hang detector below; it is killed once seen.
         let mut child = std::process::Command::new(&link)
-            .arg("30")
+            .arg("120")
             .spawn()
             .expect("spawn through the symlink");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while runs_from(&app) != Some(true) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }

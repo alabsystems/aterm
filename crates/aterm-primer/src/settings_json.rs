@@ -2,11 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! A minimal JSON value — parser and pretty-printer — for the ONE JSON document
-//! this crate edits: an agent vendor's settings file, from which the pass takes
-//! the hook entries an earlier aterm wrote ([`crate::remove_aterm_hooks`]).
+//! this crate edits: an agent vendor's settings file. Its writers are hook
+//! removal ([`crate::remove_aterm_hooks`]: takes the hook entries an earlier
+//! aterm wrote, and restores a `statusLine` the harness took), and the
+//! defaults fill ([`crate::add_claude_defaults`]: adds only keys that are
+//! unset); other readers look at keys a person set by hand.
 //!
 //! What that needs is small — read a document, keep every key it does not
-//! own, drop the entries it does, write it back — and every part of that is
+//! own, add or drop the ones it does, write it back — and every part of that is
 //! here, with nothing clever: a recursive-descent parser with a depth bound,
 //! and a printer that emits the two-space form the vendor's own writer uses.
 //! `aterm-json` is not used because its objects are sorted maps.
@@ -14,10 +17,19 @@
 //! **Keys keep their order and numbers keep their text.** An object is a
 //! `Vec<(String, Json)>`, not a map, so a rewritten file reads back in the
 //! order its owner wrote it; a number is the literal that was parsed, so `1.0`
-//! does not come back as `1` and `1e3` does not come back as `1000`. The
-//! rewrite touches one key (`hooks`) and must be able to say, of every other
-//! byte of meaning in the file, that it is still there.
+//! does not come back as `1` and `1e3` does not come back as `1000`. A
+//! rewrite touches only the keys its caller owns and must be able to say, of
+//! every other byte of meaning in the file, that it is still there.
+//!
+//! **A key written twice is read as the vendor reads it.** Claude Code reads
+//! its settings with `JSON.parse`, where the LAST value of a duplicated key is
+//! the one in force, kept in the key's FIRST position. The parser reads it so,
+//! at every depth, so each object holds every key once and no caller can edit
+//! (or keep, or delete) a shadowed copy the agent never sees. A rewrite drops
+//! the shadowed copies, as the vendor's own save does; the caller's backup
+//! keeps the bytes.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 /// The most nested a document may be before the parser refuses it. A settings
@@ -35,8 +47,9 @@ pub enum Json {
     Number(String),
     Str(String),
     Array(Vec<Json>),
-    /// Members in source order; a duplicate key is kept as parsed and
-    /// [`Json::get`] answers the FIRST.
+    /// Members in source order. A parsed object holds each key once: a key
+    /// written twice keeps its first position and its last value, as
+    /// `JSON.parse` reads it (see the module docs).
     Object(Vec<(String, Json)>),
 }
 
@@ -354,15 +367,21 @@ impl Parser<'_> {
         }
     }
 
+    /// Four hex DIGITS, nothing else: `u32::from_str_radix` alone also takes a
+    /// leading `+`, which read `\u+041` as U+0041 — a file the vendor refuses
+    /// would have been rewritten as valid JSON with a changed value.
     fn hex4(&mut self) -> Result<u32, String> {
         let end = self.at + 4;
-        let Some(slice) = self.src.get(self.at..end) else {
+        let value = self.src.get(self.at..end).and_then(|digits| {
+            digits
+                .iter()
+                .try_fold(0, |v, &b| Some((v << 4) | char::from(b).to_digit(16)?))
+        });
+        let Some(value) = value else {
             return Err(self.err("four hex digits"));
         };
-        let text = std::str::from_utf8(slice).map_err(|_| self.err("four hex digits"))?;
-        let v = u32::from_str_radix(text, 16).map_err(|_| self.err("four hex digits"))?;
         self.at = end;
-        Ok(v)
+        Ok(value)
     }
 
     fn array(&mut self, depth: usize) -> Result<Json, String> {
@@ -390,7 +409,10 @@ impl Parser<'_> {
 
     fn object(&mut self, depth: usize) -> Result<Json, String> {
         self.eat(b'{')?;
-        let mut members = Vec::new();
+        let mut members: Vec<(String, Json)> = Vec::new();
+        // Where each key sits in `members`, so a key written again replaces its
+        // value in place: `JSON.parse`'s reading (the module docs).
+        let mut slot: HashMap<String, usize> = HashMap::new();
         self.ws();
         if self.peek() == Some(b'}') {
             self.at += 1;
@@ -403,7 +425,13 @@ impl Parser<'_> {
             self.eat(b':')?;
             self.ws();
             let value = self.value(depth + 1)?;
-            members.push((key, value));
+            match slot.get(&key) {
+                Some(&at) => members[at].1 = value,
+                None => {
+                    slot.insert(key.clone(), members.len());
+                    members.push((key, value));
+                }
+            }
             self.ws();
             match self.peek() {
                 Some(b',') => self.at += 1,
@@ -513,6 +541,9 @@ mod tests {
             "tru",
             "{} trailing",
             "\"\\u12\"",
+            // Four hex DIGITS: a sign is none (`\u+041` read as U+0041).
+            "\"\\u+041\"",
+            "\"\\u+0041\"",
         ] {
             assert!(Json::parse(bad).is_err(), "{bad:?} must be refused");
         }
@@ -522,13 +553,16 @@ mod tests {
         assert!(Json::parse(&fine).is_ok());
     }
 
-    /// `get` on a duplicate key answers the first, as the printer keeps both.
+    /// A key written twice reads as `JSON.parse` — the vendor's reader — reads
+    /// it, at every depth: its LAST value, in its FIRST position.
     #[test]
-    fn get_answers_the_first_of_a_duplicate_key() {
-        let mut doc = Json::parse("{\"a\": 1, \"a\": 2}").unwrap();
-        assert_eq!(doc.get("a"), Some(&Json::Number("1".into())));
-        doc.get_mut("a").unwrap().as_array_mut();
-        assert_eq!(doc.render(), "{\n  \"a\": 1,\n  \"a\": 2\n}");
+    fn a_key_written_twice_reads_as_json_parse_reads_it() {
+        let doc = Json::parse(r#"{"a": 1, "b": {"c": 1, "c": 2}, "a": 3}"#).unwrap();
+        assert_eq!(doc.get("a"), Some(&Json::Number("3".into())));
+        assert_eq!(
+            doc.render(),
+            "{\n  \"a\": 3,\n  \"b\": {\n    \"c\": 2\n  }\n}"
+        );
         assert_eq!(Json::Object(vec![]).render(), "{}");
     }
 }

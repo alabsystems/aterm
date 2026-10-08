@@ -398,7 +398,7 @@ pub const HELD_FAILED_PREFIX: &str = "held: last attempt failed with ";
 
 /// `held: last attempt failed with <why>; <how>` — `why` is the stage's own sentence
 /// (the `StageError` Display, digests and all, so the row IS the ledger entry) and `how`
-/// names the retry: the explicit door, and `aterm pkg update --retry`.
+/// names the one retry, `aterm pkg install <p>`.
 ///
 /// The FIRST `; ` of the row is the seam between the two, by construction: a `; ` inside
 /// `why` (a signer's free text can carry one) is written `, `. The pending stub splits

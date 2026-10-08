@@ -1,40 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CLASSIC WAKE — the v0.28 cursor aurora, salvaged.
+//! The classic wake: the original cursor aurora, kept as the `classic` style.
 //!
-//! This is the trail aterm shipped as its DEFAULT at tag `v0.28`
-//! (`8e7fe4f6f`, 2026-07-12): a thin four-layer anti-aliased comet along the
-//! swept cell path under a three-rectangle box-stack bloom crown, with an
-//! expanding square landing ring on a jump. It reads as *restraint* — a fine
-//! spectrum-swept tracer that leads the caret and gets out of the way — and
-//! that is exactly what the grown-up [`crate::cursor_glow`] engine no longer
-//! draws: today's `phaser` is a fat saturated band, and today's shape gates
-//! mint NO geometry at all from a screen-crossing jump (`off-shape`), so the
-//! long diagonal comet that made the old trail feel fast is simply gone.
+//! A thin four-layer anti-aliased comet along the swept cell path under a
+//! three-rectangle box-stack bloom crown, with an expanding square landing ring
+//! on a jump: a fine spectrum-swept tracer that leads the caret and gets out of
+//! the way. Unlike the modern styles it spawns on observed cursor motion, so a
+//! screen-crossing jump draws a long diagonal comet.
 //!
-//! **WHY A SEPARATE ENGINE RATHER THAN A STYLE ARM.** The v0.28 look is not a
-//! parameterization of today's emitter; it is the emitter aterm had before
-//! ~64k lines of momentum, admission, ribbon, scintillation and thermal work
-//! grew around it. Reproducing it by configuring the modern path would mean
-//! defeating each of those in turn. So the salvage keeps its OWN state and its
-//! OWN emit, driven from one branch in [`crate::cursor_glow::CursorGlow::tick`]
-//! — which is also what makes the other ten built-in styles provably untouched
-//! (they never reach this file, and this file reads none of their state).
+//! It is a separate engine rather than a style arm of [`crate::cursor_glow`]
+//! because the modern emitter's momentum, admission, ribbon and thermal layers
+//! would each have to be defeated to reproduce it. It keeps its own state and
+//! emit, driven from one branch in [`crate::cursor_glow::CursorGlow::tick`], so
+//! the other built-in styles never reach this file and it reads none of their
+//! state.
 //!
-//! **WHAT IS FAITHFUL AND WHAT IS ADAPTED.** The laws are v0.28's, constant for
-//! constant: the heat accumulator (gain 0.16, τ 0.9 s, the 0.09→0.40 s cadence
-//! window), the per-spark lifetime with its typing/chaining/jump cases, the
-//! `40 + 175·pos` birth-coverage ramp, the 3-layer crown at 350 ms (typing) /
-//! 200 ms (jump), the 0.18 s ring, and the shared `comet_glow_quads` layer
-//! stack — whose `COMET_LAYERS` values are byte-identical to v0.28's, so the
-//! beam rasterizes exactly as it did. Three things are ADAPTED, because the
-//! surrounding contract changed and fidelity to a dead convention would be a
-//! bug: quads are emitted in WINDOW-ABSOLUTE pixels through
-//! [`push_fx_rect`]/[`Geom::beam_clip`] (v0.28 emitted grid-interior, before
-//! the effects box existed), every quad carries `alpha: 0` (the additive mode
-//! selector [`aterm_render::GlowQuad::alpha`] postdates v0.28), and the clock
-//! is [`aterm_time::Instant`] (the workspace retired `web_time`).
+//! The laws are the original's constant for constant: the heat accumulator
+//! (gain 0.16, τ 0.9 s, the 0.09→0.40 s cadence window), per-spark lifetime
+//! with its typing/chaining/jump cases, the `40 + 175·pos` birth-coverage ramp,
+//! the 3-layer crown at 350 ms (typing) / 200 ms (jump), the 0.18 s ring, and
+//! the shared `comet_glow_quads` layer stack. Adapted to the current contract:
+//! quads are window-absolute via [`push_fx_rect`]/[`Geom::beam_clip`], every quad
+//! carries `alpha: 0` (additive, [`aterm_render::GlowQuad::alpha`]), and the
+//! clock is [`aterm_time::Instant`].
 
 use std::time::Duration;
 
@@ -42,7 +31,7 @@ use aterm_time::Instant;
 
 use aterm_render::{CometSample, GlowQuad, comet_glow_quads, premul_rgb};
 
-use crate::cursor_glow::{Geom, GlowConfig};
+use crate::cursor_glow::{Geom, GlowConfig, hsv2rgb};
 use crate::effect_util::{lerp_rgb, push_fx_rect as push_rect};
 use crate::trail_sweep::line_cells_tail;
 
@@ -55,9 +44,9 @@ struct Spark {
     born_cov: u8,
     /// Position along the comet 0.0 (tail) .. 1.0 (head), for the hue sweep.
     pos: f32,
-    /// Fade lifetime in seconds — short for a lone typing advance, CHAINED to
-    /// the observed inter-key cadence during sustained typing, and the full
-    /// comet `duration` for a real jump.
+    /// Fade lifetime in seconds: short for a lone typing advance, chained to the
+    /// observed inter-key cadence during sustained typing, the full comet
+    /// `duration` for a jump.
     life: f32,
     /// TYPING spark? Typing sparks hold full brightness for 55% of life then
     /// cosine-fade; jump sparks keep the classic linear fade.
@@ -74,9 +63,8 @@ struct Ring {
     life: f32,
 }
 
-/// The v0.28 wake's animation state — self-contained, and touched by no other
-/// style. Every field is v0.28's, minus the ones that served effects this
-/// engine does not draw (particles, the water wake, the nyan ribbon).
+/// The classic wake's animation state, self-contained and touched by no other
+/// style.
 #[derive(Default)]
 pub struct ClassicWake {
     sparks: Vec<Spark>,
@@ -102,23 +90,14 @@ pub struct ClassicWake {
     heat_at: Option<Instant>,
     /// Last TYPING advance, for the inter-key cadence.
     last_type: Option<Instant>,
-    /// Resident run-builder POOL, so the animated comet reuses its nested
-    /// buffers instead of rebuilding them every redraw.
-    ///
-    /// THE POOL IS NEVER `clear`ed AND ITS SLOTS ARE NEVER MOVED OUT, and both
-    /// halves are load-bearing. Clearing a `Vec<Vec<_>>` DROPS every inner
-    /// buffer, and `mem::take`ing a builder hands its buffer away and leaves
-    /// the builder with no capacity — so the previous shape, which did both,
-    /// grew every run from zero on every frame while its own doc said it
-    /// "reuses one nested Vec instead of allocating a fresh one every redraw".
-    /// Measured through a counting allocator on the steady path: 7.25
-    /// allocations and 623 bytes PER FRAME, on 360 of 360 ticks, in a textbook
-    /// doubling ladder (64 → 128 → 256 → 512 → 1024), for as long as
-    /// `cursor_trail_style = "classic"` is typed under.
+    /// Resident run-builder pool, so the comet reuses its nested buffers every
+    /// redraw. The pool is never `clear`ed and its slots are never moved out:
+    /// clearing a `Vec<Vec<_>>` drops every inner buffer and `mem::take` leaves
+    /// a builder with no capacity, either of which reallocates every frame.
     comet_runs: Vec<Vec<CometSample>>,
     /// Index of the run being filled. `comet_live + 1` slots are live once
-    /// anything has been pushed — a split only ever leaves a NON-EMPTY run
-    /// behind it, so no live slot is ever empty.
+    /// anything is pushed; a split only leaves a non-empty run behind, so no
+    /// live slot is empty.
     comet_live: usize,
 }
 
@@ -141,7 +120,7 @@ impl ClassicWake {
     const HEAT_GAP_FULL: f32 = 0.09;
     /// …and the gap beyond which it earns none (relaxed typing stays cool).
     const HEAT_GAP_ZERO: f32 = 0.40;
-    /// TYPING CONTINUITY: at or under this gap the spark's life chains to the
+    /// Typing continuity: at or under this gap the spark's life chains to the
     /// observed cadence, so the streak is continuous at any human rhythm.
     const CHAIN_GAP_MAX: f32 = 0.40;
     /// Chained life = observed gap + this margin…
@@ -149,10 +128,9 @@ impl ClassicWake {
     /// …capped here so the post-stop tail stays crisp.
     const CHAIN_LIFE_MAX: f32 = 0.50;
 
-    /// The wake brightness multiplier for TYPING light at the current heat: cool
-    /// typing is a whisper (~0.28×), sustained fast typing overdrives past the
-    /// configured intensity (~1.2×). Jump comets and rings are navigation
-    /// feedback, not typing, so they stay at 1×.
+    /// Wake brightness multiplier for typing light at the current heat: cool
+    /// typing ~0.28×, sustained fast typing ~1.2×. Jump comets and rings are
+    /// navigation feedback and stay at 1×.
     fn typing_boost(&self) -> f32 {
         0.28 + 0.92 * self.heat
     }
@@ -163,9 +141,9 @@ impl ClassicWake {
         !self.sparks.is_empty() || self.ring.is_some() || self.crown_until.is_some()
     }
 
-    /// Drop all in-flight light and forget the last cursor position — used when
-    /// the cursor's coordinate space changes out from under the animator, so the
-    /// next tick cannot spawn a comet from a stale cross-space position.
+    /// Drop all in-flight light and forget the last cursor position, used when
+    /// the cursor's coordinate space changes, so no comet spawns from a stale
+    /// cross-space position.
     pub fn reset(&mut self) {
         self.sparks.clear();
         self.ring = None;
@@ -179,8 +157,8 @@ impl ClassicWake {
     }
 
     /// Advance one frame: observe the cursor at `cur`, spawn on a move, decay,
-    /// and emit the current light into `out`, returning a fingerprint that
-    /// changes on every visible change (0 when empty).
+    /// and emit the light into `out`. Returns a fingerprint that changes on
+    /// every visible change (0 when empty).
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -189,12 +167,9 @@ impl ClassicWake {
         geom: Geom,
         out: &mut Vec<GlowQuad>,
     ) -> u64 {
-        // v0.28's tick opened by clearing the frame, and so does this one. In
-        // production [`crate::cursor_glow::CursorGlow::tick`] has already
-        // cleared `out` before it reaches the classic branch, so this is a
-        // no-op there — but it is what makes the engine correct when driven
-        // directly (its own tests, a bench, an embedder), which a salvaged
-        // module that is the SINGLE definition of a shipped look ought to be.
+        // `CursorGlow::tick` has already cleared `out` before the classic
+        // branch; clearing here keeps the engine correct when driven directly
+        // (its tests, a bench, an embedder).
         out.clear();
         if !cfg.enabled || cfg.intensity <= 0.0 || geom.cw == 0 || geom.ch == 0 {
             self.sparks.clear();
@@ -299,9 +274,8 @@ impl ClassicWake {
             .abs()
             .max((cc as i32 - pc as i32).abs()) as f32;
         let typing = dist <= 1.0;
-        // Typing cadence → HEAT: each keystroke earns credit by how quickly it
-        // followed the previous one, so only SUSTAINED fast typing ramps the
-        // wake up and the ramp reads as acceleration.
+        // Typing cadence to heat: each keystroke earns credit by how quickly it
+        // followed the previous one, so only sustained fast typing ramps up.
         let gap = if typing {
             let gap = self
                 .last_type
@@ -317,10 +291,10 @@ impl ClassicWake {
             f32::MAX
         };
         let boost = if typing { self.typing_boost() } else { 1.0 };
-        // Typing → a short, tight wake so the cursor reads as LEADING; a real
-        // jump → the full comet duration. Heat stretches the typing wake, and
-        // during a rhythm the life CHAINS to the observed cadence so the streak
-        // is continuous instead of pulsing per key with dark rests.
+        // Typing gets a short, tight wake so the cursor reads as leading; a jump
+        // gets the full comet duration. Heat stretches the typing wake, and in a
+        // rhythm the life chains to the observed cadence so the streak does not
+        // pulse per key.
         let full_life = cfg.duration.as_secs_f32().max(0.001);
         let spark_life = if typing {
             let heat_life = (full_life * 0.38).clamp(0.05, 0.11) * (1.0 + 1.3 * self.heat);
@@ -397,9 +371,9 @@ impl ClassicWake {
         if self.sparks.is_empty() {
             return;
         }
-        // Build the comet as RUNS of ADJACENT swept cells, so a stale older
-        // group never connects across empty space. A fully-faded tail cell
-        // breaks the colour, not the run.
+        // Build the comet as runs of adjacent swept cells, so a stale older
+        // group never connects across empty space. A faded tail cell breaks the
+        // colour, not the run.
         if self.comet_runs.is_empty() {
             self.comet_runs.push(Vec::new());
         }
@@ -409,9 +383,9 @@ impl ClassicWake {
         let mut head_cov = 0u8;
         for s in &self.sparks {
             let age = now.saturating_duration_since(s.born).as_secs_f32();
-            // TYPING sparks hold full brightness for 55% of life then
-            // cosine-fade, so the chained streak stays luminous across the
-            // inter-key gap; jump sparks keep the classic linear fade.
+            // Typing sparks hold full brightness for 55% of life then
+            // cosine-fade, so the chained streak stays lit across the inter-key
+            // gap; jump sparks fade linearly.
             let frac = (age / s.life).clamp(0.0, 1.0);
             let tf = if s.typing {
                 if frac < 0.55 {
@@ -537,9 +511,8 @@ impl ClassicWake {
         let cx = i32::from(geom.origin_x) + cc as i32 * cw;
         let cy = i32::from(geom.origin_y) + cr as i32 * ch;
         let r = (cfg.radius * chf_of(geom)) as i32;
-        // Box-stack bloom: K concentric rectangles, additive overlap brightens
-        // the centre. This is the v0.28 crown — a soft square halo, not the
-        // modern radial one.
+        // Box-stack bloom: K concentric rectangles whose additive overlap
+        // brightens the centre (a soft square halo, not the modern radial one).
         let (k, base_cov, color) = (
             3i32,
             50.0f32,
@@ -549,9 +522,8 @@ impl ClassicWake {
                 hsv2rgb(self.hue, 0.9, 1.0)
             },
         );
-        // The crown follows the TYPING heat: barely-there at rest, full-bright
-        // only under sustained fast typing — a steady-state glow around the
-        // cursor is what reads as "distracting", so it earns its brightness.
+        // The crown follows typing heat: barely visible at rest, full only under
+        // sustained fast typing, so a steady-state glow is not distracting.
         let boost = self.typing_boost();
         for layer in 0..k {
             if out.len() >= Self::MAX_QUADS {
@@ -586,9 +558,9 @@ impl ClassicWake {
             return;
         }
         let premul = premul_rgb(cfg.accent, cov);
-        // Expanding square outline: half-size grows from ~0.6 to ~1.6 cells;
-        // emitted as top/bottom bars + left/right bars (push_rect splits the
-        // verticals into per-row slabs). Thickness ~2px.
+        // Expanding square outline: half-size grows ~0.6 → ~1.6 cells, emitted
+        // as top/bottom and left/right bars (push_rect splits the verticals into
+        // per-row slabs), ~2 px thick.
         let s = ((0.6 + 1.0 * t) * chf_of(geom)) as i32;
         let th = 2i32;
         let cx = ring.cx as i32;
@@ -601,11 +573,10 @@ impl ClassicWake {
 
     /// The comet colour at path position `pos` (0 tail .. 1 head).
     ///
-    /// Two faces, both v0.28's. The default is its PHASER ramp — a rolling
-    /// spectrum that owes nothing to the theme. `classic mono` is its LUMEN
-    /// ramp, a two-tone tracer fading `accent → color`, which is the face that
-    /// follows the theme's cursor colour, `cursor_trail_color`, and live
-    /// OSC 12. Same geometry, same laws; only this closure differs.
+    /// Two faces: the default is a rolling spectrum independent of the theme;
+    /// `classic mono` is a two-tone tracer fading `accent → color`, following the
+    /// theme's cursor colour, `cursor_trail_color` and live OSC 12. Only this
+    /// closure differs.
     fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
         if cfg.classic_mono {
             lerp_rgb(cfg.accent, cfg.color, pos)
@@ -618,27 +589,6 @@ impl ClassicWake {
 #[inline]
 fn chf_of(geom: Geom) -> f32 {
     geom.ch as f32
-}
-
-/// v0.28's HSV→packed-RGB, carried here verbatim so the salvaged palette cannot
-/// drift with the modern engine's colour work.
-fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
-    let h = (h.fract() + 1.0).fract() * 6.0;
-    let i = h.floor() as i32;
-    let f = h - i as f32;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-    let u = |c: f32| ((c.clamp(0.0, 1.0)) * 255.0 + 0.5) as u32;
-    (u(r) << 16) | (u(g) << 8) | u(b)
 }
 
 #[cfg(test)]
@@ -685,10 +635,8 @@ mod tests {
         }
     }
 
-    /// Every emitted quad lands inside the effects box and inside ONE cell-row
-    /// band — the debt every emitter owes the row-scoped damage gate and the
-    /// GPU scissor. A separate engine is exactly the kind that drifts out of
-    /// this unnoticed, so it is asserted here as well as in the shared sweep.
+    /// Every emitted quad lands inside the effects box and inside one cell-row
+    /// band, as the row-scoped damage gate and GPU scissor require.
     fn assert_banded(out: &[GlowQuad], g: Geom) {
         for q in out {
             assert!(
@@ -714,30 +662,17 @@ mod tests {
         }
     }
 
-    /// **THE RUN BUILDER IS RESIDENT, WHICH IS WHAT ITS DOC ALWAYS CLAIMED.**
-    ///
-    /// The previous shape did two things that cancel a pool: it `mem::take`d
-    /// the builder's buffer into the run list (leaving the builder with NO
-    /// capacity) and then `clear`ed that list on the next frame — and clearing
-    /// a `Vec<Vec<_>>` DROPS every inner buffer. So every run was rebuilt from
-    /// zero on every redraw, in a doubling ladder, while the field doc said it
-    /// "reuses one nested Vec instead of allocating a fresh one every redraw".
-    /// Measured through a counting allocator on the steady path before the fix:
-    /// 7.25 allocations and 623 bytes PER FRAME at 120 Hz, on 360 of 360 ticks.
-    ///
-    /// Asserting the CAPACITY rather than the allocation count is deliberate:
-    /// it is the property that actually matters, it needs no global allocator
-    /// in the lib test binary, and it is exactly what the old code destroyed —
-    /// under it the pooled capacity was zero at the top of every frame.
+    /// The run builder is resident: after warm-up the pooled slots keep their
+    /// capacity at the top of every frame. Asserting capacity rather than
+    /// allocation count needs no global allocator in the lib test binary.
     #[test]
     fn the_comet_run_pool_keeps_its_buffers_between_frames() {
         let (g, c) = (geom(), cfg());
         let mut w = ClassicWake::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
-        // A typing run that sweeps a row and is SPLIT by a jump, so more than
-        // one run is live — the builder's worst case and the shape that grew
-        // the ladder.
+        // A typing run across a row split by a jump, so more than one run is
+        // live: the builder's worst case.
         let frame = |w: &mut ClassicWake, out: &mut Vec<GlowQuad>, k: u64| {
             let now = t0 + Duration::from_millis(k * 8);
             // The fixture grid is 6 rows x 40 cols; stay inside it or nothing
@@ -760,13 +695,10 @@ mod tests {
             !w.comet_runs.is_empty(),
             "fixture: the pool holds at least one run buffer"
         );
-        // THE LAW, and the reason it is spelled on `len()` and not on capacity
-        // alone: a pool NEVER SHRINKS. Capacity measured after a frame cannot
-        // tell the two shapes apart — a builder that freed its buffers at the
-        // top of the frame has rebuilt them by the bottom — but the SLOT COUNT
-        // can: under a pool it is the high-water number of runs any frame has
-        // ever needed; under the old clear-and-rebuild it is the number this
-        // frame happened to need, so a frame with fewer runs shrinks it.
+        // Stated on `len()`, not capacity alone: a pool never shrinks, so its
+        // slot count is the high-water number of runs any frame needed, while a
+        // clear-and-rebuild shrinks it on a frame with fewer runs. Capacity after
+        // a frame cannot tell the two apart.
         let mut slots_low = usize::MAX;
         let mut slots_high = 0usize;
         let mut cap_low = usize::MAX;
@@ -790,12 +722,10 @@ mod tests {
         );
     }
 
-    /// THE DEFINING PROPERTY, stated as a test. Every modern style draws
-    /// nothing for a move no keystroke licensed; the salvage draws the comet,
-    /// because v0.28 spawned on observed cursor MOTION and that is what the
-    /// restoration is for. If this ever starts returning an empty frame, the
-    /// classic branch has been routed back through the admission seam and the
-    /// screen-crossing jump comet is gone again.
+    /// The defining property: modern styles draw nothing for a move no keystroke
+    /// licensed, while the classic wake draws the comet for observed cursor
+    /// motion. An empty frame here means the classic branch was routed through
+    /// the admission seam.
     #[test]
     fn the_classic_wake_spawns_on_motion_alone_with_no_license() {
         let (g, c) = (geom(), cfg());
@@ -836,8 +766,8 @@ mod tests {
         assert_banded(&out, g);
     }
 
-    /// IDLE-ZERO. The whole engine must return to EXACTLY empty so the event
-    /// loop can park at 0% — the property that lets the animation timer disarm.
+    /// Idle-zero: the engine returns to exactly empty so the event loop can
+    /// park and the animation timer disarm.
     #[test]
     fn the_wake_decays_to_exactly_empty_and_disarms() {
         let (g, c) = (geom(), cfg());
@@ -859,9 +789,8 @@ mod tests {
         assert!(!w.is_active(), "and the animation timer disarms");
     }
 
-    /// The engine is clockless: the same relative schedule must fold to the
-    /// same frame every run, or the whole-frame golden that pins this style
-    /// against the shipped v0.28 build would be meaningless.
+    /// Clockless: the same relative schedule folds to the same frame every run,
+    /// which the whole-frame golden for this style relies on.
     #[test]
     fn the_same_schedule_folds_identically() {
         let (g, c) = (geom(), cfg());
@@ -922,17 +851,12 @@ mod tests {
         assert!(!w.is_active(), "disabled leaves nothing in flight");
     }
 
-    /// THE TWO FACES. Same engine, same geometry, same quad count — only the
-    /// colour closure differs. The mono face must actually FOLLOW the
-    /// configured colour, which is the thing the spectrum cannot do and the
-    /// whole reason the face is offered.
+    /// The two faces: same engine, geometry and quad count; only the colour
+    /// closure differs, and the mono face follows the configured colour.
     ///
-    /// The spectrum's independence is asserted over a TYPING advance, not a
-    /// jump, and that is not a convenience: v0.28's landing RING is drawn in
-    /// `cfg.accent` for every style, so even the spectrum face's ring follows
-    /// the theme. Faithful, and worth pinning as a fact rather than
-    /// discovering again — the first version of this test claimed the whole
-    /// spectrum frame owed nothing to the theme, and the ring proved it wrong.
+    /// The spectrum's theme-independence is asserted over a typing advance, not
+    /// a jump: the landing ring is drawn in `cfg.accent` for every style, so the
+    /// spectrum face's ring follows the theme too.
     #[test]
     fn the_mono_face_follows_the_configured_colour_and_the_spectrum_does_not() {
         let g = geom();

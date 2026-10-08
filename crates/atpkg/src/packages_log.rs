@@ -205,7 +205,7 @@ pub enum Event<'a> {
         /// The build warmed.
         build: u64,
         /// How it ended: `exit=<code>`, `signal=<n>`, `killed` (at the deadline) or
-        /// `spawn-failed`; or why it did not run: `opted-out`, `never-run`.
+        /// `spawn-failed`; or why it did not run: `opted-out`, `never-run`, `setup-unread`.
         outcome: &'a str,
         /// How long it ran, in milliseconds.
         ms: u64,
@@ -357,7 +357,8 @@ pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
             outcome,
             ms: took,
         } => {
-            build = warmed.to_string();
+            // The version, as the program line beside it names the same build.
+            build = crate::vendor_direct::build_label(warmed);
             ms = took.to_string();
             (
                 kind::WARM,
@@ -931,12 +932,8 @@ fn read_tail_lines(path: &Path, read_bytes: u64) -> io::Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    fn scratch(label: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("atpkg-packages-log-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-packages-log-{label}-"))
     }
 
     fn transition() -> Transition {
@@ -1016,20 +1013,23 @@ mod tests {
         );
         assert!(start.starts_with("-\tpass-start\t"), "{start}");
         assert_eq!(parse_line(&start).unwrap().at, None);
-        // A warm ([`crate::warm`]) reads back too — its outcome keeps its own `=`.
+        // A warm ([`crate::warm`]) reads back too — its outcome keeps its own `=`, and
+        // its build is the version the program line names.
         let warm = render(
             1_790_000_000,
             9,
             &Event::Warm {
                 program: "claude",
-                build: 2_001_280,
+                build: crate::vendor_direct::Version::parse("2.1.280")
+                    .unwrap()
+                    .build_id(),
                 outcome: "exit=0",
                 ms: 10_412,
             },
         );
         assert_eq!(
             warm,
-            "2026-09-21T14:13:20Z\twarm\tpid=9\tprogram=claude\tbuild=2001280\t\
+            "2026-09-21T14:13:20Z\twarm\tpid=9\tprogram=claude\tbuild=2.1.280\t\
              outcome=exit=0\tms=10412\n"
         );
         let entry = parse_line(&warm).unwrap();
@@ -1039,7 +1039,7 @@ mod tests {
             entry.fields,
             [
                 ("program", "claude"),
-                ("build", "2001280"),
+                ("build", "2.1.280"),
                 ("outcome", "exit=0"),
                 ("ms", "10412"),
             ]
@@ -1453,7 +1453,7 @@ mod tests {
         // Written again unchanged: nothing more.
         crate::status::write(&layout, &st).unwrap();
         assert_eq!(read_tail(&dir, 10).len(), 1);
-        for d in [dir, store, other] {
+        for d in [&dir, &store, &other] {
             let _ = std::fs::remove_dir_all(d);
         }
     }

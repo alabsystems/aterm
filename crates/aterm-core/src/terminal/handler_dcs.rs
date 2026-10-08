@@ -2,33 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! DCS dispatch helpers for terminal escape sequence handling.
-//!
-//! This module contains DCS routing and state machine helpers used by
-//! `ActionSink::{dcs_hook, dcs_put, dcs_unhook}`.
+//! DCS routing and state behind `ActionSink::{dcs_hook, dcs_put, dcs_unhook}`.
 
 use super::super::{DcsType, MAX_DCS_GLOBAL_BUDGET};
 use super::TerminalHandler;
 
 impl TerminalHandler<'_> {
-    /// Begin processing a DCS (Device Control String) sequence.
+    /// Begin a DCS sequence (`ESC P <params> <intermediates> <final> <data> ST`):
+    /// identify its type and prepare state for `dcs_put`; `dcs_unhook` ends it.
     ///
-    /// DCS sequences have the format: `ESC P <params> <intermediates> <final_byte> <data> ST`
-    ///
-    /// # Supported DCS Types
-    ///
-    /// - **DECRQSS** (`DCS $ q Pt ST`): Request terminal settings
-    /// - **Sixel** (`DCS Ps q <data> ST`): Sixel graphics data
-    /// - **XTGETTCAP** (`DCS + q Pt ST`): xterm termcap/terminfo query
-    ///
-    /// DECDLD (`{`), tmux control mode (`DCS 1000 p`), tmux passthrough
-    /// (`DCS tmux;`), and SSH conductor (`DCS 2000 p`) are recognized shapes
-    /// whose integrations are permanently compiled out — they are consumed
-    /// and ignored as `Unknown`.
-    ///
-    /// This function identifies the DCS type and prepares state for `dcs_put` calls.
-    /// The sequence is finalized by `dcs_unhook`.
-    pub(super) fn dcs_hook_inner(&mut self, params: &[u16], intermediates: &[u8], final_byte: u8) {
+    /// Handled: DECRQSS (`DCS $ q Pt ST`), Sixel (`DCS Ps q <data> ST`) and
+    /// XTGETTCAP (`DCS + q Pt ST`). Everything else, including DECDLD (`{`),
+    /// tmux control mode (`DCS 1000 p`), tmux passthrough (`DCS tmux;`) and
+    /// SSH conductor (`DCS 2000 p`), is consumed and ignored as `Unknown`.
+    pub(super) fn dcs_hook_inner(&mut self, _params: &[u16], intermediates: &[u8], final_byte: u8) {
         // Release budget from any abandoned prior sequence before starting
         // a new one. If dcs_hook is called without a preceding dcs_unhook
         // (parser reset mid-sequence), the old bytes would leak permanently.
@@ -43,17 +30,14 @@ impl TerminalHandler<'_> {
         #[cfg(feature = "sixel")]
         if matches!(self.dcs.dcs_type, DcsType::Sixel) {
             // Abort the partial image — frees pixel buffer without allocating
-            // a copy (unhook() would allocate up to 64MB just to drop). (#7453)
+            // a copy (unhook() would allocate up to 64MB just to drop).
             self.sixel.decoder.abort();
         }
 
-        // DECRQSS: DCS $ q <Pt> ST
-        // intermediates = [$], final_byte = q
         if intermediates == *b"$" && final_byte == b'q' {
             self.dcs.dcs_type = DcsType::Decrqss;
         } else if intermediates.is_empty() && final_byte == b'q' {
-            // Sixel graphics: DCS Ps1 ; Ps2 ; Ps3 q <sixel-data> ST
-            // No intermediates, final byte is 'q'
+            // Sixel: DCS Ps1 ; Ps2 ; Ps3 q <sixel-data> ST
             #[cfg(feature = "sixel")]
             {
                 self.dcs.dcs_type = DcsType::Sixel;
@@ -63,29 +47,8 @@ impl TerminalHandler<'_> {
             {
                 self.dcs.dcs_type = DcsType::Unknown;
             }
-        } else if intermediates.is_empty() && final_byte == b'{' {
-            // DECDLD: DCS Pfn;Pcn;Pe;Pcmw;Pss;Pt;Pcmh;Pcss { <data> ST
-            // Downloadable Character Set (soft fonts). The DRCS integration
-            // is permanently compiled out; consume and ignore.
-            self.dcs.dcs_type = DcsType::Unknown;
-        } else if intermediates.is_empty() && final_byte == b'p' && params.first() == Some(&1000) {
-            // tmux control mode: DCS 1000 p <64-hex-nonce> ST. The tmux -CC
-            // integration is permanently compiled out; consume and ignore.
-            self.dcs.dcs_type = DcsType::Unknown;
-        } else if intermediates.is_empty() && final_byte == b'p' && params.first() == Some(&2000) {
-            // SSH conductor mode: DCS 2000 p <64-hex-nonce> ST. The SSH
-            // conductor integration is permanently compiled out; consume
-            // and ignore.
-            self.dcs.dcs_type = DcsType::Unknown;
         } else if intermediates == *b"+" && final_byte == b'q' {
-            // XTGETTCAP: DCS + q Pt ST
-            // xterm termcap/terminfo query
             self.dcs.dcs_type = DcsType::Xtgettcap;
-        } else if intermediates.is_empty() && final_byte == b't' && params.is_empty() {
-            // tmux DCS passthrough: ESC P tmux; <escaped-content> ESC \
-            // The tmux integration is permanently compiled out; inner escape
-            // sequences still parse via natural parser breakout.
-            self.dcs.dcs_type = DcsType::Unknown;
         } else {
             self.dcs.dcs_type = DcsType::Unknown;
         }
@@ -102,10 +65,8 @@ impl TerminalHandler<'_> {
     ///
     /// Global memory budget (`MAX_DCS_GLOBAL_BUDGET`) prevents DoS via large sequences.
     pub(super) fn dcs_put_inner(&mut self, byte: u8) {
-        // Accumulate data bytes for the current DCS sequence
-        // Check global budget first to prevent unbounded memory growth
         if self.dcs.total_bytes >= MAX_DCS_GLOBAL_BUDGET {
-            return; // Global budget exceeded, drop data
+            return; // Global budget exceeded: drop the byte.
         }
 
         match self.dcs.dcs_type {
@@ -122,10 +83,10 @@ impl TerminalHandler<'_> {
             }
             #[cfg(feature = "sixel")]
             DcsType::Sixel => {
-                // Always count Sixel bytes against the global DCS budget (#5948).
+                // Always count Sixel bytes against the global DCS budget.
                 self.dcs.total_bytes += 1;
                 self.dcs.sequence_bytes += 1;
-                // Track pixel buffer allocation against DCS budget (#7405).
+                // Track pixel buffer allocation against DCS budget.
                 let alloc_before = self.sixel.decoder.pixel_alloc_bytes();
                 self.sixel.decoder.put(byte);
                 let alloc_after = self.sixel.decoder.pixel_alloc_bytes();
@@ -155,7 +116,7 @@ impl TerminalHandler<'_> {
             DcsType::Unknown | DcsType::None => {
                 // Always count bytes against the budget, even though nothing
                 // keeps them. Otherwise Unknown DCS sequences bypass the global
-                // budget entirely (#7367).
+                // budget entirely.
                 self.dcs.total_bytes += 1;
                 self.dcs.sequence_bytes += 1;
             }
@@ -165,12 +126,12 @@ impl TerminalHandler<'_> {
     /// Bulk equivalent of [`dcs_put_inner`](Self::dcs_put_inner) over a
     /// contiguous run of DCS data bytes: the global-budget accounting, the
     /// per-type data-cap checks, and (for Sixel) the pixel-allocation sampling
-    /// happen ONCE per run instead of once per byte. The parser's
+    /// happen once per run instead of once per byte. The parser's
     /// DcsPassthrough fast path delivers near-whole PTY chunks here, so this
     /// removes several ns of pure accounting from every payload byte of a
     /// multi-megabyte sixel or passthrough stream.
     ///
-    /// MUST stay byte-identical to calling `dcs_put_inner` per byte (see the
+    /// Must stay byte-identical to calling `dcs_put_inner` per byte (see the
     /// `dcs_put_bulk_*_parity` tests):
     ///
     ///  - The per-byte path stops the instant `total_bytes` reaches the global
@@ -180,9 +141,9 @@ impl TerminalHandler<'_> {
     ///  - Of the counted bytes, exactly the leading prefix that fits the
     ///    per-type data cap is pushed to `dcs.data`.
     ///
-    /// One documented deviation: when Sixel PIXEL allocation crosses the
+    /// One documented deviation: when Sixel pixel allocation crosses the
     /// global budget, the per-byte path aborts the decoder at the exact
-    /// offending byte while this path aborts at the END of the run — a
+    /// offending byte while this path aborts at the end of the run — a
     /// transient overshoot bounded by one parser run (under one 8 KiB PTY
     /// chunk of stream bytes) and by the decoder's own internal
     /// pixel/dimension caps. The abort's budget-release arithmetic is
@@ -205,7 +166,7 @@ impl TerminalHandler<'_> {
             DcsType::Decrqss => self.push_dcs_data_capped(data, 256),
             #[cfg(feature = "sixel")]
             DcsType::Sixel => {
-                // Track pixel buffer allocation against the DCS budget (#7405),
+                // Track pixel buffer allocation against the DCS budget,
                 // sampled once around the run instead of per byte.
                 let alloc_before = self.sixel.decoder.pixel_alloc_bytes();
                 for &byte in data {
@@ -227,7 +188,7 @@ impl TerminalHandler<'_> {
             }
             // Accumulate hex-encoded capability names (Pt) up to 1024 bytes.
             DcsType::Xtgettcap => self.push_dcs_data_capped(data, 1024),
-            // Bytes were already counted above (#7367); nothing keeps them.
+            // Bytes were already counted above; nothing keeps them.
             DcsType::Unknown | DcsType::None => {}
         }
     }
@@ -248,26 +209,25 @@ impl TerminalHandler<'_> {
     /// - **Sixel**: Finalizes image and stores for retrieval
     /// - **XTGETTCAP**: Generates termcap capability responses
     ///
-    /// Then resets DCS state and releases the sequence's budget.
+    /// A string CAN/SUB cut short (`canceled`) is discarded: no reply, no
+    /// image. Then resets DCS state and releases the sequence's budget.
     pub(super) fn dcs_unhook_inner(
         &mut self,
         cap: &super::super::response_capability::ResponseCapability,
         canceled: bool,
     ) {
-        // Only the Sixel branch consumes `canceled` (CAN/SUB → discard image);
-        // without that feature there is no consumer, so acknowledge it here.
-        #[cfg(not(feature = "sixel"))]
-        let _ = canceled;
-        // Process the complete DCS sequence
         match self.dcs.dcs_type {
-            DcsType::Decrqss => {
+            // A canceled query is not answered: the handback's own CAN ends
+            // one its holder left torn, and the reply would reach the next
+            // holder (the shell) as typed input.
+            DcsType::Decrqss if !canceled => {
                 self.handle_decrqss(cap);
             }
             #[cfg(feature = "sixel")]
             DcsType::Sixel => {
                 if canceled {
-                    // CAN/SUB aborted the string: drop the half-decoded image
-                    // without allocating a copy, and render NOTHING. (VT500:
+                    // can/SUB aborted the string: drop the half-decoded image
+                    // without allocating a copy, and render nothing. (VT500:
                     // a canceled control string produces no output.)
                     self.sixel.decoder.abort();
                 } else if let Some(image) = self.sixel.decoder.unhook() {
@@ -278,24 +238,44 @@ impl TerminalHandler<'_> {
                     self.sixel.next_id += 1;
                 }
             }
-            DcsType::Xtgettcap => {
+            DcsType::Xtgettcap if !canceled => {
                 self.handle_xtgettcap(cap);
             }
-            DcsType::Unknown | DcsType::None => {
-                // Nothing to do
-            }
+            // A canceled query, or nothing to do.
+            DcsType::Decrqss | DcsType::Xtgettcap | DcsType::Unknown | DcsType::None => {}
         }
 
         // Reset DCS state and release global budget.
         // Use sequence_bytes (not data.len()) because Sixel feeds bytes to the
-        // decoder without accumulating in data — data.len() would under-release (#5948).
+        // decoder without accumulating in data — data.len() would under-release.
         self.dcs.dcs_type = DcsType::None;
         self.dcs.total_bytes = self.dcs.total_bytes.saturating_sub(self.dcs.sequence_bytes);
         self.dcs.sequence_bytes = 0;
         self.dcs.data.clear();
-        // Shrink retained capacity after large sequences (mirrors osc_data shrink_to #7272).
+        // Shrink retained capacity after large sequences (as osc_data does).
         if self.dcs.data.capacity() > 4096 {
             self.dcs.data.shrink_to(128);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::terminal::Terminal;
+
+    /// The handback's `CAN` ends a query its holder left torn. Answering it
+    /// would type the reply into the next holder's input (the shell's).
+    #[test]
+    fn a_handback_does_not_answer_a_torn_query() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b[1m\x1bP$qm");
+        let h = t.foreground_handback_scoped(false).expect("torn DECRQSS");
+        assert_eq!(h.bytes, vec![0x18]);
+        assert_eq!(t.take_response(), None);
+
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1bP+q544E");
+        assert_eq!(t.manual_handback().bytes, vec![0x18]);
+        assert_eq!(t.take_response(), None);
     }
 }

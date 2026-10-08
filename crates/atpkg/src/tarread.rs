@@ -37,7 +37,7 @@
 //! Everything in this section is a rule that only exists because a *second*
 //! reader would answer differently, and a bundle that two readers describe
 //! differently is a bundle whose file list can be substituted after vetting.
-//! Each of these is pinned by a case in `tests/tar_oracle.rs`.
+//! Each of these is pinned by a case in `tests/tar_corpus.rs`.
 //!
 //! * **A PAX `size` record OVERRIDES the header's `size` field.** Without
 //!   that, an `x` header saying `size=4` in front of a ustar header saying
@@ -93,11 +93,10 @@
 //!
 //! # Evidence
 //!
-//! `tests/tar_oracle.rs` keeps the retired `tar` crate as a dev-dependency and
-//! runs both readers over the same bytes — hand-built adversarial headers,
-//! real system-`tar` archives, and tens of thousands of mutated ones —
-//! asserting they AGREE on accept-or-reject and, where both accept, on every
-//! field the extractor reads.
+//! `tests/tar_corpus.rs` pins this reader's answers — accept-or-reject and
+//! every field the extractor reads — over hand-built adversarial headers and
+//! tens of thousands of mutated archives, recorded when every answer matched
+//! the retired `tar` crate.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -371,9 +370,8 @@ impl Header {
     /// weaker acceptance rule on attacker-influenced bytes, bought for the
     /// benefit of writers that predate this project by decades. The retired
     /// reader accepted only the unsigned sum, aterm's bundles are written by
-    /// today's bsdtar and GNU tar, and `tests/tar_oracle.rs` keeps the two
-    /// answers identical — a mutated header that the signed rule would have
-    /// waved through is exactly what found this.
+    /// today's bsdtar and GNU tar — a mutated header that the signed rule would
+    /// have waved through is exactly what found this.
     ///
     /// The sum cannot overflow: 512 bytes of at most 255 is 130 560.
     fn checksum_ok(&self) -> bool {
@@ -678,8 +676,7 @@ impl<'a, R: Read> Entries<'a, R> {
             // bundles are ordinary files written by `tar -c`, a sparse entry is
             // classified `Other`, and `vet_entry` aborts the whole staged group
             // on an `Other` entry anyway. So refusing costs nothing and removes
-            // a parser. `tests/tar_oracle.rs` pins that both readers refuse
-            // every sparse archive it can build.
+            // a parser. `tests/tar_corpus.rs` pins the refusal.
             if flag == b'S' {
                 return Err(bad("GNU sparse entries are not supported"));
             }
@@ -719,8 +716,7 @@ impl<'a, R: Read> Entries<'a, R> {
                     // interior NUL — a different path than the archive
                     // declared, and therefore a different thing for
                     // `vet_entry` to judge than the one that will be written.
-                    // The retired reader dropped only the terminator, and the
-                    // oracle holds this to that.
+                    // The retired `tar` crate dropped only the terminator too.
                     if body.last() == Some(&0) {
                         body.pop();
                     }
@@ -1150,12 +1146,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Golden evidence, held IN TREE
-    //
-    // The differential oracle lives in `tests/tar_oracle.rs` and depends on the
-    // retired crate still being a dev-dependency. These do not: they are the
-    // evidence that survives the day someone drops that dev-dep, in the same
-    // shape `crates/aterm-hash` pins golden vectors for the hash it replaced.
+    // Golden evidence, held IN TREE, in the same shape `crates/aterm-hash`
+    // pins golden vectors for the hash it replaced.
     // -----------------------------------------------------------------------
 
     /// The shapes a real bundle is made of, decoded to exact expected values.
@@ -1433,13 +1425,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deliberate deviations — behaviour the differential oracle CANNOT assert,
-    // because asserting it would mean asserting a disagreement.
+    // Deliberate deviations from the retired `tar` crate.
     // -----------------------------------------------------------------------
 
-    /// The [`MAX_EXTENSION_BODY`] ceiling. The retired crate had no such limit,
-    /// so any input that reaches this refusal is by definition one the oracle
-    /// corpus cannot contain — which is exactly why it is tested here.
+    /// The [`MAX_EXTENSION_BODY`] ceiling. The retired crate had no such limit.
     #[test]
     fn extension_body_ceiling_refuses_an_oversized_long_name() {
         let over = MAX_EXTENSION_BODY + 512;
@@ -1464,20 +1453,6 @@ mod tests {
         let seen = walk(&v).expect("a body under the ceiling must be read");
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].path.len(), usize::try_from(under).expect("fits"));
-    }
-
-    /// GNU sparse (`S`) is refused outright rather than parsed.
-    #[test]
-    fn gnu_sparse_entries_are_refused() {
-        for (magic, version) in [(&b"ustar "[..], &b" \0"[..]), (&b"ustar\0"[..], &b"00"[..])] {
-            let mut v = Vec::new();
-            v.extend_from_slice(&header("good.txt", b'0', 4));
-            v.extend_from_slice(&padded(b"good"));
-            v.extend_from_slice(&header_magic("sparse.bin", b'S', 0, magic, version));
-            v.extend_from_slice(&end());
-            let err = walk(&v).expect_err("a sparse entry must be refused");
-            assert!(err.contains("sparse"), "unexpected error: {err}");
-        }
     }
 
     /// The checksum is the UNSIGNED byte sum and nothing else.
@@ -1579,31 +1554,6 @@ mod tests {
                     flag as char
                 );
             }
-        }
-    }
-
-    /// A second `L`, `K` or `x` before one member is a rejection.
-    #[test]
-    fn duplicate_extension_headers_are_refused() {
-        for flag in *b"LKx" {
-            let body = if flag == b'x' {
-                pax("path", "p.txt")
-            } else {
-                b"n.txt\0".to_vec()
-            };
-            let mut v = Vec::new();
-            for _ in 0..2 {
-                v.extend_from_slice(&header("././@LongLink", flag, body.len() as u64));
-                v.extend_from_slice(&padded(&body));
-            }
-            v.extend_from_slice(&header("decoy.txt", b'0', 0));
-            v.extend_from_slice(&end());
-            let err = walk(&v).expect_err("duplicate extension header");
-            assert!(
-                err.contains("same member"),
-                "{}: unexpected error: {err}",
-                flag as char
-            );
         }
     }
 

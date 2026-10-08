@@ -378,7 +378,7 @@ mod tests {
         refused("https://github.com/alabsystems/aterm/releases/download//aterm-appcast.toml");
         // Tags outside the grammar ON THIS REPOSITORY, for THIS asset — legacy
         // two-component, non-canonical spelling, prerelease suffix, atpkg's tags —
-        // are the one benign case (2026-09-14): `OtherTag`, so the caller records a
+        // are the one benign case: `OtherTag`, so the caller records a
         // head that is not an app release instead of filing a network failure that
         // never escalates. Invariant (d) holds exactly as before:
         // nothing at the location is fetched, and the tag is named, never

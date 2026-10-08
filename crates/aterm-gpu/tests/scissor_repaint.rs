@@ -1,72 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// GPU SCISSORED DIRTY-ROW REPAINT — the byte-identity gate.
+// GPU scissored dirty-row repaint: the byte-identity gate.
 //
-// `GpuRenderer::present_input` re-encodes ONLY the rows that differ from the
-// previous presented frame: LoadOp::Load over the persistent offscreen (which
-// still holds the prior frame), a scissor over the dirty rows' bounding band,
-// and instances built for the dirty rows only. The dirty set is the SHARED
-// `aterm_render::compute_dirty_rows` — the SAME one the CPU damage path uses, so
-// the GPU and CPU cannot diverge. The hard contract: the scissored offscreen
-// must be BYTE-IDENTICAL to a fresh full GPU render of the same input.
+// `GpuRenderer::present_input` re-encodes only rows that differ from the
+// previous presented frame: `LoadOp::Load` over the persistent offscreen, a
+// scissor over the dirty band, instances for dirty rows only. The dirty set is
+// the shared `aterm_render::compute_dirty_rows`, as on the CPU. The scissored
+// offscreen must be byte-identical to a fresh full GPU render.
 //
-// This test drives ONE reused GpuRenderer at FIXED dims through a multi-frame
-// sequence (prompt, single-keystroke typing, blink toggles, cursor moves, wide
-// CJK, combining marks, DECDWL, DECDHL, selection set/clear, scrollback scroll,
-// full-screen TUI repaint). After EACH frame it reads back the scissored
-// offscreen (`present_input_readback`, the exact present-path encode + a
-// readback) and asserts the pixels `==` a FRESH full GPU render of that input on
-// a SEPARATE GpuRenderer (the oracle pattern from `dirty_gate.rs`). It also
-// asserts, via the scissor/full counters, that:
-//   * the scissor path is ACTUALLY taken on the typing/cursor/wide/combining/
-//     DECDWL frames AND on selection set/clear (row-level selection damage —
-//     only rows whose selected span changed repaint), and
-//   * the DECDHL / scroll frames correctly FELL BACK to full repaint (the
-//     conservative always-correct path), so a re-shaded double-height /
-//     scrollback frame can never leak a seam.
+// One reused renderer at fixed dims runs a frame sequence (prompt, typing,
+// blink, cursor moves, wide CJK, combining marks, DECDWL, DECDHL, selection,
+// scrollback, a full-screen TUI repaint). After each frame the scissored
+// offscreen (`present_input_readback`) must equal a fresh full render on a
+// separate renderer, and the counters show the scissor is taken on the
+// typing, cursor, wide, combining, DECDWL and selection frames while DECDHL and
+// scroll-into-history frames fall back to a full repaint.
 //
-// Gated: no GPU or no system font ⇒ the test no-ops (returns).
+// Skips without a GPU or system font.
 
 // PHOSPHOR rain fixture (a real MatrixRain drive) for the animating-rain
 // scissor test below; each consuming binary uses its own subset.
-#[allow(dead_code)]
-mod rain_common;
+use crate::common;
 
+use crate::rain_common::RainScene;
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_effects::matrix_rain::RainVisibility;
 use aterm_gpu::GpuRenderer;
 use aterm_render::{GlowQuad, RenderInput, Theme, premul_rgb};
-use rain_common::RainScene;
 
 const ROWS: usize = 10;
 const COLS: usize = 32;
 
-/// A fresh GpuRenderer (or skip-marker) at the suite's standard px/theme.
-/// Blocks on the lazy fallback parses so the reused renderer and every fresh
-/// oracle rasterize the CJK steps identically (no provisional `.notdef` race).
+/// A fresh renderer (or skip) at the suite's px/theme, blocked on the lazy
+/// fallback parses so reused and oracle renderers rasterize CJK identically.
 fn fresh_gpu() -> Option<GpuRenderer> {
-    match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(mut g) => {
-            g.debug_block_on_lazy_fallbacks();
-            // The heat shimmer (bloom parity class) is wall-clock at present, so
-            // two renders of one input never byte-agree with it on. Disable it
-            // for this suite's byte-identity gates; its own scissor-path
-            // identity is pinned in `heat_shimmer.rs` with a pinned phase.
-            g.set_shimmer(false);
-            Some(g)
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            None
-        }
-    }
+    let mut g = common::gpu_or_skip(18.0, Theme::default())?;
+    g.debug_block_on_lazy_fallbacks();
+    // The heat shimmer (bloom parity class) is wall-clock at present, so two
+    // renders of one input never byte-agree with it on. Disable it for this
+    // suite's byte-identity gates; its own scissor-path identity is pinned in
+    // `heat_shimmer.rs` with a pinned phase.
+    g.set_shimmer(false);
+    Some(g)
 }
 
-/// The ground truth: a brand-new GpuRenderer renders `input` with a FULL repaint
-/// (Clear + every row) and reads it back. No scissor, no prior frame — exactly
-/// the pixels the scissored offscreen must match.
+/// Ground truth: a new renderer renders `input` with a full repaint and reads
+/// it back.
 fn fresh_render(input: &RenderInput, blink: bool, override_: Option<CursorStyle>) -> Vec<u32> {
     let mut g = fresh_gpu().expect("GPU was available a moment ago");
     let mut win = aterm_gpu::WindowGpu::new();
@@ -80,14 +61,12 @@ fn fresh_render(input: &RenderInput, blink: bool, override_: Option<CursorStyle>
 enum Path {
     /// Must take the SCISSORED dirty-row path.
     Scissor,
-    /// Must FALL BACK to a full Clear+all-rows repaint.
+    /// Must fall back to a full repaint.
     Full,
-    /// Must take the E7 WHOLE-ROW SCROLL-BLIT RESCUE: `compute_dirty_rows` says
-    /// `FullRepaint` (display_offset AND the absolute anchor both moved), but
-    /// `scroll_blit_plan` recognises a rigid integer-row slide, so the offscreen's
-    /// grid band is shifted and only the newly-exposed strip re-encodes. Strictly
-    /// stronger than [`Path::Scissor`]: it asserts the scissor AND that the rescue
-    /// — not a lucky small dirty set — is what produced it.
+    /// Must take the whole-row scroll-blit rescue: `compute_dirty_rows` says
+    /// `FullRepaint` but `scroll_blit_plan` sees a rigid integer-row slide, so
+    /// the band is shifted and only the exposed strip re-encodes. Stronger than
+    /// [`Path::Scissor`].
     ScrollRescue,
     /// Don't assert the path (e.g. the first frame, or a blink toggle whose
     /// hit/miss depends on the terminal's DECSCUSR default).
@@ -139,9 +118,8 @@ fn gpu_scissor_repaint_byte_identical() {
         step("type 'a'", |t| t.process(b"a"), true, None, Path::Scissor),
         // 8. Idle after typing — scissor (zero dirty rows).
         step("idle after type", |_| {}, true, None, Path::Scissor),
-        // 9. Blink toggle (no content change). Don't assert path: whether the
-        //    cursor's shown-ness flips depends on the DECSCUSR style. Always
-        //    byte-identical though.
+        // 9. Blink toggle (no content change). The path depends on the DECSCUSR
+        //    style, so only byte identity is checked.
         step("blink off", |_| {}, false, None, Path::Any),
         step("blink on", |_| {}, true, None, Path::Any),
         // 11. Newline then a cursor MOVE without content change (CUP) — the old +
@@ -241,7 +219,7 @@ fn gpu_scissor_repaint_byte_identical() {
         ),
         // 24. Idle WITH a selection — selection unchanged, reusable ⇒ scissor.
         step("idle selected", |_| {}, true, None, Path::Scissor),
-        // 25. Clear selection — only the previously-selected rows dirty ⇒ scissor.
+        // 25. Clear selection: only previously selected rows are dirty (scissor).
         step(
             "clear selection",
             |t| t.text_selection_mut().clear(),
@@ -261,10 +239,9 @@ fn gpu_scissor_repaint_byte_identical() {
             None,
             Path::Any,
         ),
-        // 27. Scroll back into history. The live DECTCEM cursor becomes hidden
-        //     at this coordinate-class boundary, so the retained offscreen is
-        //     not a pure rigid grid band: shifting it would also drag the old
-        //     cursor over history. This transition must repaint fully.
+        // 27. Scroll back into history. The live cursor becomes hidden at this
+        //     boundary, so the retained offscreen is not a rigid band shift;
+        //     this must repaint fully.
         step(
             "scroll back",
             |t| t.scroll_display(3),
@@ -274,10 +251,8 @@ fn gpu_scissor_repaint_byte_identical() {
         ),
         // 28. Idle scrolled — offset unchanged ⇒ scissor.
         step("idle scrolled", |_| {}, true, None, Path::Scissor),
-        // 29-30. Once both endpoints are history viewports, the raw cursor is
-        //        hidden on BOTH sides and these are genuine rigid slides. Pin
-        //        the E7 rescue in both directions without crossing cursor
-        //        visibility classes.
+        // 29-30. Between history viewports the cursor is hidden on both sides,
+        //        so these are rigid slides: the rescue in both directions.
         step(
             "scroll farther back",
             |t| t.scroll_display(2),
@@ -301,9 +276,8 @@ fn gpu_scissor_repaint_byte_identical() {
             None,
             Path::Full,
         ),
-        // 32. Full-screen TUI repaint (clear + redraw): MANY rows change at once.
-        //     Reusable (same dims/offset/selection, no double-height) ⇒ scissor
-        //     over the (large) dirty band — still byte-identical.
+        // 32. Full-screen TUI repaint: many rows change, still reusable, so a
+        //     scissor over a large band, byte-identical.
         step(
             "full tui repaint",
             |t| {
@@ -357,10 +331,8 @@ fn gpu_scissor_repaint_byte_identical() {
             s.desc
         );
 
-        // (a) BYTE-IDENTITY — the cardinal contract. Whether this frame scissored
-        // or fell back, the offscreen pixels MUST equal a fresh full GPU render of
-        // the same input + cursor state. On a scissor this proves the dirty band
-        // is bit-identical AND the untouched rows were preserved verbatim.
+        // (a) Byte identity: scissored or not, the offscreen equals a fresh full
+        // render of the same input and cursor state.
         let oracle = fresh_render(&input, s.blink, s.override_);
         assert_eq!(
             got.len(),
@@ -424,16 +396,14 @@ fn gpu_scissor_repaint_byte_identical() {
         );
     }
 
-    // The optimisation must be EXERCISED (many scissor frames) and the fallback
-    // must be REACHED (DECDHL / selection / scroll).
+    // The scissor must be exercised and the full fallback reached.
     assert!(
         scissor_seen >= 10,
         "scissor path barely fired ({scissor_seen}) — not exercised"
     );
-    // The full-repaint fallback is reached by the first frame, the DECDHL trio,
-    // and the two live↔history cursor-visibility boundaries. History↔history
-    // scrolls remain E7 rescues; `rescue_seen` guards that they did not silently
-    // fall back into this count instead.
+    // Full repaints: the first frame, the DECDHL trio, and the two
+    // live/history cursor-visibility boundaries. History-to-history scrolls stay
+    // rescues (`rescue_seen`).
     assert!(
         full_seen >= 4,
         "full-repaint fallback barely fired ({full_seen}) — not exercised"
@@ -453,10 +423,9 @@ fn gpu_scissor_repaint_byte_identical() {
     );
 }
 
-/// A scissored frame immediately followed by a ONE-CELL change must repaint
-/// correctly: the dirty row is re-encoded over the preserved prior frame and the
-/// result matches a fresh render of the CHANGED input — i.e. the offscreen does
-/// not "stick" on the stale prior pixels, and untouched rows are not corrupted.
+/// A scissored frame followed by a one-cell change repaints correctly: the
+/// result matches a fresh render of the changed input and untouched rows are
+/// not corrupted.
 #[test]
 fn gpu_scissor_one_cell_change_preserves_other_rows() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -490,9 +459,7 @@ fn gpu_scissor_one_cell_change_preserves_other_rows() {
         "scissored one-cell change diverges from a fresh render"
     );
 
-    // Row 1 ("second row") was NOT dirty: prove its pixels survived the scissor
-    // by checking they equal the fresh render's row-1 band exactly (they do, since
-    // the whole frame matched — but assert the band explicitly for clarity).
+    // Row 1 was not dirty; check its band equals the fresh render explicitly.
     let (cw, ch) = gpu.cell_size();
     let w = COLS * cw;
     let band1 = (ch * w)..(2 * ch * w);
@@ -515,10 +482,9 @@ fn gpu_scissor_one_cell_change_preserves_other_rows() {
     );
 }
 
-/// Selection foreground/background changes recolor combining-mark ink without
-/// changing the grid or selection span. The shared damage set must include the
-/// selected row's predecessor because ordinary glyph rasters may overhang
-/// upward into it; otherwise the GPU scissor preserves stale accent pixels.
+/// Selection fg/bg changes recolour combining-mark ink without changing the
+/// grid or selection span. The damage set must include the selected row's
+/// predecessor, since glyphs may overhang upward into it.
 #[test]
 fn gpu_selection_color_scissor_covers_upward_combining_ink() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -562,11 +528,9 @@ fn gpu_selection_color_scissor_covers_upward_combining_ink() {
     );
 }
 
-/// A theme change re-themes the selection band / idle cursor / padding — pixels
-/// that are NOT cell content, so the dirty-row diff alone would leave them stale
-/// on an idle GPU pane. `WindowGpu::invalidate_present` (called by the gpu-web
-/// `set_theme` path) must drop the prior-frame validity so the NEXT present is a
-/// FULL repaint even for a frame that would otherwise scissor (zero dirty rows).
+/// A theme change re-themes non-content pixels (selection band, idle cursor,
+/// padding), so `WindowGpu::invalidate_present` must make the next present a
+/// full repaint even with zero dirty rows.
 #[test]
 fn gpu_invalidate_present_forces_full_repaint() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -590,9 +554,8 @@ fn gpu_invalidate_present_forces_full_repaint() {
         "an unchanged idle frame must scissor without invalidation"
     );
 
-    // Invalidate (the theme-change hook), then present the SAME idle frame: it
-    // MUST fall back to a full repaint despite zero dirty rows, and the pixels
-    // must still equal a fresh full render of that input.
+    // After invalidation the same idle frame repaints fully and matches a fresh
+    // render.
     win.invalidate_present();
     let full_before = gpu.full_repaints();
     let got = gpu.present_input_readback(&mut win, &input).pixels;
@@ -606,16 +569,10 @@ fn gpu_invalidate_present_forces_full_repaint() {
     );
 }
 
-/// The LUMEN aurora with GPU BLOOM enabled (both defaults) must ride the
-/// SCISSORED dirty-row path, not force a full-grid repaint — and stay
-/// byte-identical to a fresh full render. The bloom halo is additive light
-/// composited over the offscreen: on a scissored frame the dirty set is widened
-/// to every row the halo can touch (glow rows ± the blur margin, gap-filled) and
-/// the composite is clipped to the band, so the halo can neither accumulate on
-/// Load-preserved rows nor be clipped visibly (outside the widened band it is
-/// exactly zero). Three present-path frames prove it: glow appears (full — first
-/// frame), glow MOVES + one keystroke (must SCISSOR, bytes == fresh render), glow
-/// FADES to empty (must SCISSOR, the halo fringe fully erased).
+/// The aurora with bloom enabled rides the scissored path and stays
+/// byte-identical to a fresh full render: glow appears (first frame, full),
+/// glow moves plus one keystroke (scissor), glow fades to empty (scissor, halo
+/// fully erased).
 #[test]
 fn bloom_glow_rides_the_scissor_path_byte_identical() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -691,14 +648,9 @@ fn bloom_glow_rides_the_scissor_path_byte_identical() {
     );
 }
 
-/// NO-FLASH LAW (TYPING-2 deferral retired): the present-time bloom halo
-/// composites on EVERY bloom frame — `input_hot` keystroke echoes included. The
-/// old deferral skipped the halo on exactly the echo frame, which was invisible
-/// while bloom was an opt-in rarity but BLINKED the halo off once per keystroke
-/// with bloom default-on (the reported "little flash when I type"). Same content,
-/// one flag: hot and settle frames must now present IDENTICAL pixels — the
-/// per-keystroke luminance dip is structurally impossible. Gated: no GPU/font ⇒
-/// no-op.
+/// The bloom halo composites on every bloom frame, keystroke echoes
+/// (`input_hot`) included: hot and settle frames of the same content present
+/// identical pixels, so the halo never blinks while typing.
 #[test]
 fn input_hot_presents_the_same_halo_as_settle() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -765,15 +717,10 @@ fn input_hot_presents_the_same_halo_as_settle() {
     );
 }
 
-/// LOAD ROBUSTNESS (the point of the change): the GPU comet bloom halo now
-/// composites at PRESENT time over a throwaway copy of the clean offscreen, so a
-/// scissored frame's dirty set is NO LONGER widened by the halo penumbra and
-/// band-FILLED across the whole span it touches. A moving comet near the BOTTOM +
-/// one keystroke at the TOP therefore rebuilds only the few actually-changed rows,
-/// not the ~full-grid band the old in-offscreen bloom forced every aurora tick.
-/// The gate: the scissored encode builds FAR fewer instances than a full-grid
-/// repaint of the same frame (pre-fix they were ~equal — the band-fill spanned the
-/// keystroke row through the comet row). Gated: no GPU/font ⇒ no-op.
+/// The bloom halo composites at present time over a copy of the offscreen, so
+/// it does not widen the dirty set: a comet near the bottom plus a keystroke at
+/// the top rebuilds only the changed rows, far fewer instances than a
+/// full-grid repaint.
 #[test]
 fn bloom_scissor_dirty_band_stays_proportional() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -837,9 +784,8 @@ fn bloom_scissor_dirty_band_stays_proportional() {
     let _ = full.render_input(&mut full_win, &in1, None);
     let full_inst = full.last_instances();
 
-    // ~3 changed rows out of 40 ⇒ the scissored encode builds a small fraction of a
-    // full-grid rebuild. (Pre-fix the bloom band-fill spanned rows 0..=36, so the
-    // scissored count was ~the full count and typing under a live comet was O(grid).)
+    // About 3 of 40 rows changed, so the scissored encode builds a small
+    // fraction of a full rebuild.
     assert!(
         scissored_inst.saturating_mul(4) < full_inst,
         "scissored bloom frame built {scissored_inst} instances vs {full_inst} full — \
@@ -852,14 +798,10 @@ fn bloom_scissor_dirty_band_stays_proportional() {
     );
 }
 
-/// PHOSPHOR rain through the SCISSORED present path (design §10): an
-/// ANIMATING field — genuine `MatrixRain` emissions, tick after tick — must
-/// ride the dirty-row scissor (rain damage is row-scoped: the per-row
-/// merge-diff marks changed rows, the band fill rebuilds every rain quad in
-/// the band, so the incremental frame can never ghost or double-blend) and
-/// stay BYTE-IDENTICAL to a fresh full render on EVERY frame, including a
-/// mid-stream keystroke, the settled (fp-stable) frame, and the drain to
-/// empty (the vacated pixels fully erased).
+/// Animating rain (real `MatrixRain` emissions) rides the scissored path (rain
+/// damage is row-scoped and the band fill rebuilds every quad in the band) and
+/// stays byte-identical to a fresh full render on every frame, including a
+/// keystroke, the settled frame and the drain to empty.
 #[test]
 fn gpu_scissor_animating_rain_byte_identical() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -883,10 +825,8 @@ fn gpu_scissor_animating_rain_byte_identical() {
         "the priming rain frame diverges from a fresh full render"
     );
 
-    // Animating frames: each engine tick moves the field. Every frame must
-    // take the SCISSOR (rain-only damage is reusable) and match a fresh full
-    // render byte-for-byte. Step 4 types a character so a combined
-    // text+rain change rides the same scissored frame.
+    // Each tick moves the field; every frame takes the scissor and matches a
+    // fresh render. Step 4 also types a character.
     let mut prev_quads = in0.rain_quads.clone();
     let mut moved = 0usize;
     let mut haloed = 0usize;

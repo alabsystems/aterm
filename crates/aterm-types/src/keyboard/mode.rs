@@ -65,13 +65,13 @@ bitflags! {
         /// spec #4999). conhost requests it at every ConPTY start, and it is the
         /// ONLY way a key can carry Windows modifiers across the pipe: legacy VT
         /// has no byte for Shift+Enter or Ctrl+Enter, and conhost reads aterm's
-        /// legacy Shift+Enter LF (0x0a) as Ctrl+Enter (measured 2026-09-22:
+        /// legacy Shift+Enter LF (0x0a) as Ctrl+Enter (measured:
         /// `ReadKey` → `KEY=Enter MODS=Control CHAR=0xA`, so PSReadLine ran
         /// InsertLineAbove instead of AddLine). Once conhost has read ONE record
         /// it also stops settling a lone ESC by the end of the read, so the
         /// keys whose legacy bytes are a bare or dangling ESC — Escape, Ctrl+[,
         /// Alt+[, Alt+Backspace, … — go out as records too, or the Escape key
-        /// dies in that tab for good (measured 2026-09-27; the list is
+        /// dies in that tab for good (measured; the list is
         /// `conhost_holds_once_switched` in `encode.rs`).
         ///
         /// A NEGOTIATION BIT WITH THE HOST, NOT A KITTY FLAG. It lives in this
@@ -82,7 +82,7 @@ bitflags! {
         /// outranks a kitty push for the keys it covers: under ConPTY conhost
         /// is the only reader, an application's `CSI > 1 u` reaches this
         /// terminal verbatim through the pipe, and conhost's input parser then
-        /// DROPS the `CSI 13;2 u` written back (measured 2026-09-22: no record
+        /// DROPS the `CSI 13;2 u` written back (measured: no record
         /// reached a `ReadKey` loop) — so the record is the only spelling of
         /// Shift+Enter that ever arrives at the application that asked for
         /// kitty. The kitty flags themselves stay set; every key the record

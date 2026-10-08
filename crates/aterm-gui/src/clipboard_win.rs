@@ -13,10 +13,10 @@
 //! The Win32 clipboard is a contended GLOBAL: `OpenClipboard` fails spuriously
 //! while any other process (a clipboard manager, another copy) holds it, so
 //! both entry points retry on a short bounded loop rather than failing the
-//! user's copy/paste on first contention. Wired into `control_selection`'s
-//! `pbcopy`/`pbpaste`, so the `copy` verb, the GUI shortcuts, copy-on-select,
-//! and OSC 52 all ride it. PRIMARY (`primary_set`/`primary_get`) has no
-//! Windows analogue and stays a no-op in `control_selection`.
+//! user's copy/paste on first contention. Wired in through `crate::clipboard`'s
+//! `pbcopy`/`pbpaste` (re-exported as `crate::control::pbcopy`/`pbpaste`), so the
+//! `copy` verb, the GUI shortcuts, copy-on-select, and OSC 52 all ride it. PRIMARY
+//! has no Windows analogue: `primary_set`/`primary_get` are Linux-only.
 
 #[link(name = "user32")]
 unsafe extern "system" {

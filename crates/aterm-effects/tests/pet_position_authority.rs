@@ -1,30 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ONE WRITER OWNS WHERE THE BODY IS.
+//! One writer owns where the body is.
 //!
-//! The caret's escort is the pet's own locomotion — the chase and the
-//! flight, both continuous, both speed-limited. The console observation
-//! layer is not a second opinion about POSITION. Its remaining contribution
-//! to placement is narrow and it is kept: a body standing on a surface it
-//! may not occupy — a selection, an image, a row with no certified
-//! cell-to-pixel projection — is moved off it, or is not drawn.
+//! The caret's escort is the pet's own locomotion (the chase and the flight,
+//! continuous and speed-limited). The console observation layer's only
+//! placement role is moving a body off a surface it may not occupy (a
+//! selection, an image, a row with no certified cell-to-pixel projection), or
+//! not drawing it. It must never relocate a body for being far from the caret:
+//! a second writer closing that distance in one frame fights the escort, and
+//! the sprite sweeps out and snaps back while output prints.
 //!
-//! What it must never do is relocate a body for being FAR FROM THE CARET.
-//! Distance from the caret is the escort's business, the escort covers it
-//! at a walking pace, and a second writer that closes the same distance in
-//! one frame does not agree with the first — it fights it. Measured on
-//! glass at v0.82.0: the emitted sprite swept right from the caret and
-//! snapped back to exactly `caret + STATION_LEAD + HOME_BREATHING_ROOM`
-//! about eleven times a second, in bursts, for as long as a command was
-//! printing into a screen that was not yet full. That is the owner's "it
-//! keeps jumping out and then looping back".
-//!
-//! THE ORACLE IS THE PET ITSELF, as in `pet_escort_primacy`:
-//! `set_console_presentable(false)` returns every console entry point
-//! early, so a twin brain driven with it off IS the v0.76.0 escort running
-//! the shipped chase law against the same terminal. Streaming output must
-//! not be able to tell the two apart.
+//! The oracle is the pet itself, as in `pet_escort_primacy`:
+//! `set_console_presentable(false)` returns every console entry point early,
+//! so a twin brain with it off is the plain escort. Streaming output must not
+//! tell the two apart.
 
 use std::time::{Duration, Instant};
 
@@ -108,11 +98,10 @@ struct Sample {
     reason: &'static str,
 }
 
-/// A command printing into a screen that is NOT yet full: the caret walks
-/// DOWN through fresh rows, which is the condition the loop was reproduced
-/// on. One 57-column line every 240 ms, with the newline landing on the
-/// following frame exactly as a real `echo` does — so the caret is seen at
-/// the end of the line for one tick and then at column 0 of the row below.
+/// A command printing into a screen not yet full: the caret walks down
+/// through fresh rows. One 57-column line every 240 ms, the newline landing on
+/// the next frame as a real `echo` does, so the caret is seen at the line's
+/// end for one tick and then at column 0 below.
 fn stream_output(presentable: bool, frames: u32) -> Vec<Sample> {
     let mut now = Instant::now();
     let mut scene = Scene::new(presentable, b"\x1b[1;1H");
@@ -163,9 +152,8 @@ fn trace(tag: &str, series: &[Sample], from: usize, to: usize) -> String {
         .collect()
 }
 
-/// THE OWNER'S DEFECT. The body must not be yanked back to a console home
-/// while a command prints. It may walk, it may fly, it may stand still —
-/// but it may not cross the pane in one frame and come back.
+/// The body is not yanked back to a console home while a command prints: it
+/// may walk, fly or stand still, but not cross the pane in one frame and back.
 #[test]
 fn streaming_output_never_teleports_the_body() {
     let live = stream_output(true, 900);
@@ -192,9 +180,9 @@ fn streaming_output_never_teleports_the_body() {
     );
 }
 
-/// THE SAME DEFECT SEEN THROUGH THE REASON STRING. `cursor-home` is the
-/// console layer claiming the escort's body; `pet_escort_primacy` already
-/// refuses it on a typing frame. Output is not a licence either.
+/// The same seen through the reason string: `cursor-home` claims the escort's
+/// body; `pet_escort_primacy` refuses it on a typing frame, and output is not
+/// a licence either.
 #[test]
 fn a_printing_command_is_not_a_licence_to_claim_the_escorts_body() {
     let live = stream_output(true, 900);
@@ -214,13 +202,9 @@ fn a_printing_command_is_not_a_licence_to_claim_the_escorts_body() {
     );
 }
 
-/// A CARET THAT JUMPS IS NOT A REASON TO TELEPORT THE CAT. The escort
-/// closes distance at a walking pace, and that pace IS the feature — the
-/// cat running after the cursor is the whole animal. A second writer that
-/// closes the same distance in one frame does not help the escort, it
-/// overtakes it, and then the escort walks the body back out and is
-/// overtaken again. Measured with no keystroke at all, so nothing but the
-/// placement pass can be moving the body.
+/// A caret that jumps is not a reason to teleport the cat: the escort closes
+/// distance at a walking pace, and that pace is the feature. Measured with no
+/// keystroke, so only the placement pass could move the body.
 #[test]
 fn a_caret_that_jumps_does_not_teleport_the_body() {
     let mut now = Instant::now();
@@ -268,9 +252,8 @@ fn a_caret_that_jumps_does_not_teleport_the_body() {
     );
 }
 
-/// AND THE CORRECTION THE LAYER REALLY OWES IS STILL THERE. A body standing
-/// on a surface it may not occupy still yields — this test exists so the
-/// loop cannot be "fixed" by deleting the protection with it.
+/// The correction the layer does owe remains: a body standing on a surface it
+/// may not occupy still yields.
 #[test]
 fn a_protected_surface_still_moves_or_hides_the_body() {
     let mut now = Instant::now();

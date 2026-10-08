@@ -1,23 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CHECK-CHANNEL AUDIT, 2026-09-14 — failing tests for the cross-process checker
-//! gate (`crate::checker_skip_at`, the "another aterm process completed this
-//! interval's update check" skip).
-//!
-//! Every test here names a wrong behaviour observed on the owner's machine that day
-//! and fails on the tree it was written against. They pin the CONTRACT the gate
-//! promises in its own doc — "whether the shared ledger records a CHECK completed
-//! within the freshness window" — against what it actually reads, which is
-//! `status.toml`'s `updated_at`: a stamp every writer of that one-line file
-//! refreshes, the apply lane included.
-//!
-//! Evidence (~/Library/Logs/aterm/aterm.log, epoch seconds): the in-session apply
-//! at 1789403296 wrote `installed 0.85.0 (build 1789363090); activating now`; the
-//! freshly exec'd process then logged "another aterm process completed this
-//! interval's update check" seventeen times, ~75 s apart, from 1789403300 to
-//! 1789404476, and made its first real check at 1789404557 — exactly 21 min (70 %
-//! of the 30-min web base) after a status write that no check lane made.
+//! The cross-process checker gate (`crate::checker_skip_at`, the "another aterm
+//! process completed this interval's update check" skip). The gate defers only to
+//! a COMPLETED CHECK within the freshness window, read from the check receipt —
+//! never to a status write the apply lane or any other writer made.
 
 use std::time::Duration;
 
@@ -28,10 +15,7 @@ use crate::paths::Staging;
 const BASE: Duration = Duration::from_secs(crate::cadence::INTERVAL_SECS);
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs()
+    aterm_time::unix_secs().expect("clock")
 }
 
 /// A completed-check receipt at `updated_at`, carrying the check result.
@@ -48,7 +32,7 @@ fn write_stamped(s: &Staging, updated_at: u64, outcome: &str) {
     .expect("write ledger");
 }
 
-/// THE 21-MINUTE POST-APPLY STALL. Every sentence below is one the APPLY lane
+/// AN APPLY-LANE STATUS WRITE IS NOT A COMPLETED CHECK. Every sentence below is one the APPLY lane
 /// writes into `status.toml` (`install.rs` `record_activating_status`,
 /// `apply_staged_if_ready`'s refusal/deferral arms; `lib.rs`
 /// `record_apply_refusal` / `record_apply_failure`), through the real writer
@@ -56,9 +40,8 @@ fn write_stamped(s: &Staging, updated_at: u64, outcome: &str) {
 /// is a completed check, so none may make a sibling — or the writer's own
 /// successor process — skip this interval's network check.
 ///
-/// Why it matters beyond the wasted 21 minutes: the apply lane retries a failing
-/// stage on its own clock (600 s, 1800 s stand-downs on 2026-09-14), and each
-/// verdict rewrites this file. While those writes land inside the freshness
+/// The apply lane retries a failing stage on its own clock, and each verdict
+/// rewrites this file. While those writes land inside the freshness
 /// window, EVERY checker on the machine skips, so the newer release that would fix
 /// the failing apply is never fetched — the lane that is broken silences the lane
 /// that could route around it.
@@ -106,8 +89,7 @@ fn check_channel_audit_an_apply_lane_status_write_is_not_a_completed_check() {
 /// But `install.rs` writes `deferred: install location not writable` / `deferred:
 /// staged bundle failed re-verification (discarded)` / `deferred: staged bundle
 /// build-number rebind mismatch (discarded)` for APPLY deferrals that never touched
-/// the network: an admin-owned `/Applications` cost every launch a 42-minute check
-/// holiday. The widening keys on the check receipt's own `outcome = "deferred"`.
+/// the network. The widening keys on the check receipt's own `outcome = "deferred"`.
 #[test]
 fn check_channel_audit_an_apply_lane_deferral_does_not_widen_the_check_window() {
     let s = Staging::scratch("audit-apply-deferral");

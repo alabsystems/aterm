@@ -50,7 +50,7 @@
 //! The requirement is [`Budget::need`]:
 //!
 //! ```text
-//! need = max(cold - lanes credited, warm growth) + reserve
+//! need = max(cold - lanes credited, warm growth) + in flight + reserve
 //! ```
 //!
 //! A build writes its cold footprint less what warm lanes already hold, a warm
@@ -162,18 +162,30 @@ pub const CELLS_WARM_GROWTH_BYTES: u64 = 2 * GIB;
 /// What the Trust verification lane writes while it runs, and removes: 6 GiB,
 /// IN FLIGHT ([`Budget::in_flight`]).
 ///
-/// `targo trust` gives every unit of a run a unique compiler-session flag and
-/// accepts no warm cache as evidence, so nothing it builds is reused: each run
-/// re-checks each selected library's whole dependency graph into scratch slots
-/// under `target-trust/`, which `tools/trust-gate-all.sh` empties before the run
-/// and removes after it. So the lane holds nothing at rest: its bytes are a term
-/// of what a run NEEDS free, never of what the held lanes may grow to — counted
-/// in the cold footprint and the warm growth (as it was for a few hours on
-/// 2026-09-27), it raised [`LANE_CAP_BYTES`] by 12 GiB for lanes that hold none
-/// of it (review, the same day). MEASURED 2026-09-27: one slot peaked at 1.7 GiB
-/// (`du -sh`) checking aterm-gui's whole graph, and the script runs at most
-/// three slots on this machine (`--jobs auto`, one per six cores): 5.1 GiB,
-/// read up to 6.
+/// `targo trust` gives every check a fresh session nonce in the rustflags of
+/// EVERY unit, and cargo's `-C extra-filename` hashes a unit's raw rustflags
+/// (targo `compilation_files.rs`, `unit_id`; on seal 321aaeda7 and on trust
+/// main alike), so nothing one check builds is found by the next: each check
+/// re-builds its library's whole dependency graph under new file names. So the
+/// slots under `target-trust/` are scratch — `tools/trust-gate-all.sh` empties
+/// them before a run and removes them after it. A kept slot only grew: two runs
+/// of aterm-error in one left two `libsyn-<hash>` copies side by side (measured
+/// 2026-09-27), and two checks of aterm-update-core in one compiled 24 units
+/// each and took it from 131 to 244 MB (measured 2026-09-29, when the review
+/// asked the kept slots P0 tried to earn their keep). So the slots hold nothing
+/// at rest: their bytes are a term of what a run NEEDS free, never of what the
+/// held lanes may grow to — counted in the cold footprint and the warm growth
+/// (as it was for a few hours on 2026-09-27), it raised [`LANE_CAP_BYTES`] by
+/// 12 GiB for lanes that hold none of it (review, the same day). The lane's
+/// judge (`target-trust/judge`, one `--profile gate` build of aterm-release) is
+/// kept, and measured with the other lanes ([`measure_lanes`]). MEASURED
+/// 2026-09-27: one slot peaked at 1.7 GiB (`du -sh`) checking aterm-gui's whole
+/// graph, and the script runs at most three slots on this machine (`--jobs
+/// auto`, one per six cores): 5.1 GiB, read up to 6. That is ONE check per slot:
+/// a slot keeps every graph its checks built until the run ends (each under its
+/// own names, above), so what a whole run holds at its peak is more, and is not
+/// yet measured — the next whole-tree run's `du` of its slots is the
+/// measurement this term still owes.
 pub const TRUST_LANE_BYTES: u64 = 6 * GIB;
 
 /// What a run on WARM lanes still adds to them: 16 GiB.
@@ -729,9 +741,8 @@ pub fn remedy(
     if !free_first.is_empty() {
         let total: u64 = free_first.iter().map(|(_, b)| *b).sum();
         s.push_str(&format!(
-            "  FIRST, and it costs nothing: the calling tree holds {} of incremental caches \
-             that no gate run reads (every child compiles with CARGO_INCREMENTAL=0). Removing \
-             them loses one warm dev rebuild, not a contract run:\n",
+            "  FIRST: the calling tree holds {} of incremental caches no gate run reads; \
+             removing them costs one warm dev rebuild:\n",
             gib(total)
         ));
         for (d, b) in &free_first {
@@ -745,17 +756,9 @@ pub fn remedy(
                     does run out of space mid-ladder is COULD NOT RUN, never a verdict about the \
                     tree."
             .to_string(),
-        None => format!(
-            "  or free space elsewhere on the volume. The requirement is what this run writes \
-             plus a reserve: a cold footprint less what its build dirs already hold, but never \
-             less than a warm run still adds to them (cargo deletes no artifact a later build \
-             stops using), plus the {} its trust lane writes and removes again, and a {} reserve \
-             for its own writes outside them. What other writers put on the volume while it \
-             runs is not in it: no preflight can budget that, and a run that runs out of space \
-             ends COULD NOT RUN. --disk-floor <GiB> replaces the estimate for one run.",
-            gib(plan.budget.in_flight),
-            gib(plan.budget.reserve)
-        ),
+        None => "  or free space elsewhere on the volume (the `verify: disk` line above has the \
+                 arithmetic; --disk-floor <GiB> replaces it for one run)."
+            .to_string(),
     });
     s
 }
@@ -946,6 +949,10 @@ pub fn gib(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wait for something that must happen is a hang detector, never a latency budget.
+    #[cfg(unix)]
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
     const MACOS: &str = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n\
                          /dev/disk3s5   971350180 862653008  83991144    92%    /System/Volumes/Data\n";
@@ -1390,12 +1397,14 @@ mod tests {
 
     /// THE BOUND: a child still running at the deadline is killed and reaped,
     /// and the deadline is what is reported — the measurement never holds a
-    /// run for longer than it was given.
+    /// run for longer than it was given. The child would run ten minutes, and
+    /// the return is held to a minute's hang detector, never a latency budget:
+    /// a call that waits the child out takes all ten.
     #[cfg(unix)]
     #[test]
     fn a_child_past_its_deadline_is_killed_and_named() {
         let mut slow = Command::new("sleep");
-        slow.arg("30");
+        slow.arg("600");
         let started = Instant::now();
         let got = output_within(slow, Duration::from_millis(200));
         assert_eq!(
@@ -1403,13 +1412,13 @@ mod tests {
             Err("did not finish within 0.2 s".into())
         );
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < HANG_DETECTOR,
             "the child was not killed at its deadline: {:?}",
             started.elapsed()
         );
         let mut quick = Command::new("/bin/sh");
         quick.args(["-c", "echo out; echo err >&2"]);
-        let out = output_within(quick, Duration::from_secs(30)).expect("ran");
+        let out = output_within(quick, HANG_DETECTOR).expect("ran");
         assert!(out.status.success());
         assert_eq!(out.stdout, b"out\n");
         assert_eq!(out.stderr, b"err\n");
@@ -1566,22 +1575,23 @@ mod tests {
         let free = Reading::Free(GIB);
 
         let text = remedy(&root, &p, &lanes, &free, Some(&caller));
-        let free_at = text.find("costs nothing").expect(&text);
+        let free_at = text
+            .find("incremental caches no gate run reads")
+            .expect(&text);
         let lanes_at = text.find("target-tippy/").expect(&text);
         assert!(free_at < lanes_at, "free bytes must be named first: {text}");
         assert!(text.contains("incremental"), "{text}");
-        assert!(text.contains("CARGO_INCREMENTAL=0"), "{text}");
         assert!(text.contains("Only if that is not enough"), "{text}");
 
         // With no caller named there is no second tree, so nothing is claimed.
         let alone = remedy(&root, &p, &lanes, &free, None);
-        assert!(!alone.contains("costs nothing"), "{alone}");
+        assert!(!alone.contains("incremental caches"), "{alone}");
         assert!(alone.contains("regenerable"), "{alone}");
 
         // A caller with no incremental caches says nothing about them either.
         let bare = crate::mktemp_dir("atv-disk-bare").expect("mktemp");
         let quiet = remedy(&root, &p, &lanes, &free, Some(&bare));
-        assert!(!quiet.contains("costs nothing"), "{quiet}");
+        assert!(!quiet.contains("incremental caches"), "{quiet}");
 
         for d in [caller, root, bare] {
             std::fs::remove_dir_all(&d).ok();

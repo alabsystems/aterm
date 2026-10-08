@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Regression: reading a SCROLLED-BACK row (display_offset > 0) must recover the
-//! row's extras — emoji / CJK-SMP, combining marks, truecolor RGB — not just its
-//! cells. Before the `visible_row_view` fix, `cell_frame` (render) and `row_text`
-//! read the LIVE extras map at the raw visible row, but scrolled-off extras had
-//! moved into ring/lazy/tiered scrollback; so every scrolled emoji became U+FFFD
-//! and marks/colors were dropped. A PARTIAL scroll also misaligned the still-live
-//! bottom rows (cell from `visible_row - display_offset`, extras from raw
-//! `visible_row`). Both are pinned here at the render AND text level.
+//! Reading a scrolled-back row (display_offset > 0) recovers the row's extras
+//! (emoji / CJK-SMP, combining marks, truecolor RGB), not just its cells, at
+//! both the render (`cell_frame`) and text (`row_text`) level: scrolled-off
+//! extras live in ring/lazy/tiered scrollback, not the live extras map. During
+//! a partial scroll the still-live bottom rows read extras at
+//! `visible_row - display_offset`, like their cells.
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
@@ -132,13 +130,13 @@ fn scrollback_render_preserves_zwj_cluster() {
 
 #[test]
 fn partial_scroll_live_row_reads_correct_extras() {
-    // The SECOND bug: during a partial scroll the still-live bottom rows must read
-    // extras at screen_row = visible_row - display_offset, not the raw visible_row.
+    // During a partial scroll the still-live bottom rows read extras at
+    // screen_row = visible_row - display_offset, not the raw visible_row.
     let mut t = Terminal::new(4, 80);
     for line in ["H0", "H1", "H2", "H3"] {
         t.process(format!("{line}\r\n").as_bytes());
     }
-    // L0 carries an emoji; it will be a LIVE bottom row after a 2-line scroll.
+    // L0 carries an emoji; it will be a live bottom row after a 2-line scroll.
     t.process(b"L\xf0\x9f\x98\x80\r\n"); // "L😀"
     for line in ["M1", "M2", "M3"] {
         t.process(format!("{line}\r\n").as_bytes());
@@ -171,7 +169,7 @@ fn scroll_to_top_shows_oldest_line_first() {
 #[test]
 fn live_view_unchanged_at_offset_zero() {
     // display_offset == 0 must be byte-identical to the pre-fix live read: an emoji
-    // on a LIVE row still renders and row_text still resolves it.
+    // on a live row still renders and row_text still resolves it.
     let mut t = Terminal::new(6, 80);
     t.process(b"Q\xf0\x9f\x98\x80Z");
     assert_eq!(t.grid().display_offset(), 0);
@@ -186,7 +184,7 @@ fn live_view_unchanged_at_offset_zero() {
 #[test]
 fn scrollback_render_preserves_flag_pair() {
     // 🇺🇸 = U+1F1FA U+1F1F8. The materialize grapheme segmenter must fold the
-    // regional-indicator PAIR into one cell so it stays one cluster (not two
+    // regional-indicator pair into one cell so it stays one cluster (not two
     // split letters across doubled columns) when scrolled back.
     let flag = "\u{1F1FA}\u{1F1F8}";
     let mut t = Terminal::new(6, 80);
@@ -208,7 +206,7 @@ fn scrollback_render_preserves_flag_pair() {
         "scrolled-back flag must be one cluster"
     );
     // Z must sit at col 3 (flag occupies one wide cell: col 1 lead + col 2 cont),
-    // NOT be pushed out by a split into 4 columns.
+    // not be pushed out by a split into 4 columns.
     assert_eq!(
         frame.cells[r][3].ch, 'Z',
         "flag must occupy one cell, not split columns"
@@ -245,10 +243,10 @@ fn scrollback_render_preserves_skin_tone() {
 
 #[test]
 fn scrollback_wide_nonbase_keeps_skin_tone_split() {
-    // Over-fold guard: a skin-tone modifier after a WIDE but NON-modifier-base char
-    // (中, U+4E2D) must NOT fold. The live writer gates folding on
-    // is_emoji_modifier_base(base), not mere cell width, so it renders two cells;
-    // the materializer must match, or scrolling back would regress a correct split.
+    // Over-fold guard: a skin-tone modifier after a wide but non-modifier-base
+    // char (中, U+4E2D) must not fold. The live writer gates folding on
+    // is_emoji_modifier_base(base), not cell width, so it renders two cells; the
+    // materializer must match.
     let mut t = Terminal::new(6, 80);
     t.process("中\u{1F3FD}Z".as_bytes()); // 中 + skin-tone (Type-4) + Z
     t.process(b"\r\n");
@@ -258,7 +256,7 @@ fn scrollback_wide_nonbase_keeps_skin_tone_split() {
     t.scroll_to_top();
     let frame = t.cell_frame(6, 80);
     let r = render_row(&frame, '中').expect("中 row visible");
-    // 中 wide at col0-1, the orphan skin-tone its OWN wide cell at col2-3, Z at col4.
+    // 中 wide at col0-1, the orphan skin-tone its own wide cell at col2-3, Z at col4.
     assert_eq!(frame.cells[r][0].ch, '中');
     assert_eq!(
         frame.cells[r][2].ch, '\u{1F3FD}',
@@ -274,7 +272,7 @@ fn scrollback_wide_nonbase_keeps_skin_tone_split() {
 fn scrollback_vs16_base_folds_skin_tone() {
     // Under-fold guard: 👋️🏽 = U+1F44B U+FE0F U+1F3FD. The VS16 sits between the
     // emoji base and the skin-tone modifier. Folding must key on the retained unit
-    // BASE (is_emoji_modifier_base(👋)), not the intervening zero-width VS16 — else
+    // base (is_emoji_modifier_base(👋)), not the intervening zero-width VS16 — else
     // the modifier splits off. Live renders one cell; scrolled back must too.
     let seq = "\u{1F44B}\u{FE0F}\u{1F3FD}";
     let mut t = Terminal::new(6, 80);
@@ -304,9 +302,9 @@ fn scrollback_vs16_base_folds_skin_tone() {
 
 #[test]
 fn row_text_screen_ignores_scroll_position() {
-    // Finding 2 guard: the offset-INDEPENDENT accessor (used by block text
-    // extraction) must read the live on-screen row regardless of display_offset,
-    // where the offset-AWARE row_text follows the scroll.
+    // The offset-independent accessor (used by block text extraction) reads the
+    // live on-screen row regardless of display_offset; the offset-aware
+    // row_text follows the scroll.
     let mut t = Terminal::new(4, 80);
     for i in 0..12 {
         t.process(format!("L{i:02}\r\n").as_bytes());
@@ -325,7 +323,7 @@ fn row_text_screen_ignores_scroll_position() {
         "row_text_screen must be display-offset-independent"
     );
     // The offset-AWARE row_text(0) shows the oldest history line after scroll_to_top,
-    // and must DIFFER from the live screen row.
+    // and must differ from the live screen row.
     assert_eq!(t.row_text(0).as_deref().map(str::trim_end), Some("L00"));
     assert_ne!(live0_scrolled.as_deref(), Some("L00"));
 }
@@ -352,8 +350,8 @@ fn render_matches_row_text_across_offsets() {
     assert_eq!(Some(from_render), from_text);
 }
 
-/// The strongest scrollback invariant: a row rendered LIVE (display_offset==0)
-/// must render byte-for-byte IDENTICALLY once it has scrolled into history — the
+/// The strongest scrollback invariant: a row rendered live (display_offset==0)
+/// must render byte-for-byte identically once it has scrolled into history — the
 /// full `RenderCell` (glyph, fg/bg, wide, emoji_presentation, bold/italic,
 /// underline + colour, strike/overline) plus the cluster and combining overlays.
 /// `input` is one line (no newline); `find` is its first char, used to relocate
@@ -363,7 +361,7 @@ fn assert_scrollback_parity(input: &[u8], find: char) {
 }
 
 /// As [`assert_scrollback_parity`] but for a specific grid size — needed to land a
-/// glyph at the LAST column, where the live writer's wide-widen bails.
+/// glyph at the last column, where the live writer's wide-widen bails.
 fn assert_scrollback_parity_dims(rows: u16, cols: u16, input: &[u8], find: char) {
     let mut t = Terminal::new(rows, cols);
     t.process(input);
@@ -403,25 +401,25 @@ fn scrollback_parity_rows() {
         (6, 80, "Q\u{2764}\u{FE0F}Z", 'Q'),
         // 1️⃣ = '1' U+FE0F U+20E3: a keycap is width 2 live; must not collapse.
         (6, 80, "Q1\u{FE0F}\u{20E3}Z", 'Q'),
-        // ☝🏽 with NO VS16: U+261D is a NARROW modifier-base, so the live writer
+        // ☝🏽 with no VS16: U+261D is a narrow modifier-base, so the live writer
         // keeps the skin tone as its own wide cell. The segmenter must not over-fold.
         (6, 80, "\u{261D}\u{1F3FD}Z", '\u{261D}'),
         // ☝️🏽 = U+261D U+FE0F U+1F3FD: VS16 widens the narrow base, so the skin
         // tone folds.
         (6, 80, "Q\u{261D}\u{FE0F}\u{1F3FD}Z", 'Q'),
-        // 😀︎ = U+1F600 U+FE0E: VS15 NARROWS the wide emoji to 1 cell live;
+        // 😀︎ = U+1F600 U+FE0E: VS15 narrows the wide emoji to 1 cell live;
         // materialize must narrow it too, not re-widen from the base char.
         (6, 80, "Q\u{1F600}\u{FE0E}Z", 'Q'),
         // ①️ = U+2460 + VS16. U+2460 is not VS16-emoji-capable, so live does not
         // widen it (VS16 rides as a combining mark, 1 col); materialize must match.
         (6, 80, "Q\u{2460}\u{FE0F}Z", 'Q'),
-        // A VS16-capable base at the LAST column cannot widen, so live keeps it
-        // narrow; materialize must place it narrow, not DROP it: in a 3-col grid
+        // A VS16-capable base at the last column cannot widen, so live keeps it
+        // narrow; materialize must place it narrow, not drop it: in a 3-col grid
         // "ab❤️" puts ❤ at col 2.
         (4, 3, "ab\u{2764}\u{FE0F}", 'a'),
-        // A truecolor-background bar whose last occupied cell is a coloured blank
-        // (a status bar): MaterializedRow::len used to clip the trailing coloured
-        // blanks that the live Row::len keeps, so the bar vanished on scrollback.
+        // A truecolor-background bar whose last occupied cell is a coloured
+        // blank (a status bar): the materialized row keeps the trailing coloured
+        // blanks, as the live row does.
         (6, 80, "Q\x1b[48;2;10;20;30m    \x1b[0m", 'Q'),
         // Regression guard: naturally-wide + combining (😀 é) stay at full parity
         // under the whole-RenderCell check.
@@ -432,7 +430,7 @@ fn scrollback_parity_rows() {
     }
 }
 
-/// SGR 58 underline-colour parity: first assert the LIVE cell at `col` carries
+/// SGR 58 underline-colour parity: first assert the live cell at `col` carries
 /// `expect_color` — so the live==scrolled comparison below can't pass vacuously
 /// with both sides `None` (e.g. if the SGR sequence failed to parse) — then
 /// assert the full-`RenderCell` parity after the row scrolls into history.
@@ -476,7 +474,7 @@ fn scrollback_parity_underline_colour_rows() {
     // row was its own test; the helper pins the live colour first, so no row can
     // pass with both sides None.
     // SGR 58:5:1 resolves against the live palette; scrolled back it must
-    // resolve to the SAME entry (the index is preserved).
+    // resolve to the same entry (the index is preserved).
     let red = Terminal::new(6, 80).color_palette().get(1);
     let rows: &[(&str, usize, [u8; 3])] = &[
         // SGR 58:2 explicit RGB (packed 0x01) + SGR 4; 'U' sits at col 1.
@@ -504,18 +502,14 @@ fn scrollback_parity_underline_colour_rows() {
 
 #[test]
 fn scrollback_parity_inverse_truecolor_wide_char() {
-    // Reverse video over a TRUECOLOR wide char, live vs history. The flags half
-    // of this fix gives the re-derived spacer the lead's INVERSE bit; the swap is
-    // applied per cell by `color_resolve::resolve_both`, so the 24-bit pair it
-    // acts on has to cross the scroll-off boundary with it. That pair does not
-    // fit in a `PackedColor` — it lives in the cell's `CellExtra` — and before
-    // the extras mirror the spacer inherited INVERSE and then swapped a pair it
-    // had not been given: measured live `fg=[0,0,255] bg=[255,0,0]` against
-    // history `fg=[0,0,0] bg=[229,229,229]`, a bright near-white block where the
-    // character's right half belongs, on any `less`/tmux/bat highlight.
+    // Reverse video over a truecolor wide char, live vs history. The spacer
+    // takes the lead's inverse bit, and `color_resolve::resolve_both` swaps per
+    // cell, so the 24-bit pair (in the cell's `CellExtra`, too big for a
+    // `PackedColor`) must cross the scroll-off boundary with it, or the right
+    // half renders as a near-white block.
     let input = "Q\u{1b}[38;2;255;0;0;48;2;0;0;255;7m\u{4E2D}\u{1b}[0mZ".as_bytes();
 
-    // Non-vacuous guard: pin the LIVE spacer's swapped pair first, so the parity
+    // Non-vacuous guard: pin the live spacer's swapped pair first, so the parity
     // assertion below cannot be satisfied by both sides being equally wrong.
     let mut t = Terminal::new(6, 80);
     t.process(input);
@@ -533,12 +527,10 @@ fn scrollback_parity_inverse_truecolor_wide_char() {
 
 #[test]
 fn scrollback_spacer_keeps_lead_underline_colour() {
-    // The flag and the colour it SELECTS must cross the boundary together.
-    // `render_cells` publishes `underline_color` only when the UNDERLINE bit is
-    // set, so `wide_continuation_of` turning that bit on is exactly what makes a
-    // dropped colour visible: green under the character's left half and
-    // default-foreground grey under its right, a two-tone underline under one
-    // character — the very column seam the rules half of this fix closes.
+    // The flag and the colour it selects cross the boundary together:
+    // `render_cells` publishes `underline_color` only when the underline bit is
+    // set, so a dropped colour shows as a two-tone underline under one wide
+    // character.
     let mut t = scrolled_off("Q\u{1b}[4;58:2::0:255:0m\u{4E2D}\u{1b}[0mZ".as_bytes());
     t.scroll_to_top();
     let frame = t.cell_frame(6, 80);
@@ -561,12 +553,12 @@ fn scrollback_spacer_keeps_lead_underline_colour() {
 
 #[test]
 fn scrollback_spacer_underline_index_reresolves_after_palette_change() {
-    // The spacer's copy must be the PACKED form, not a frozen RGB triple.
-    // Redefine palette entry 1 AFTER the row scrolls off: both halves of the one
-    // character must re-resolve to the NEW colour. A mirror reading
+    // The spacer's copy must be the packed form, not a frozen RGB triple.
+    // Redefine palette entry 1 after the row scrolls off: both halves of the one
+    // character must re-resolve to the new colour. A mirror reading
     // `underline_color()` (the RGB-only accessor) would leave the spacer `None`,
     // because storing an index deliberately clears `HAS_UNDERLINE_COLOR`; one
-    // that resolved the index eagerly would pin the spacer to the OLD colour
+    // that resolved the index eagerly would pin the spacer to the old colour
     // while the lead moved.
     let mut t = Terminal::new(6, 80);
     t.process("Q\u{1b}[4;58:5:1m\u{4E2D}\u{1b}[0mZ".as_bytes());
@@ -592,14 +584,11 @@ fn scrollback_spacer_underline_index_reresolves_after_palette_change() {
 
 #[test]
 fn vs16_widened_spacer_carries_the_lead_underline_colour_live() {
-    // The law does not care WHICH widening produced the pair. VS16 promotes a
-    // narrow base to two columns AFTER `apply_cell_extras_preflagged` already ran
-    // with `cols = 1`, so the base's SGR 58 colour sat on its own column alone
-    // and the emoji's right half answered `None` while a CJK char's answered the
-    // colour — one law, two live answers. It is also what keeps
-    // `scrollback_parity_underline_color_emoji` honest: the history mirror copies
-    // the lead unconditionally, so a live spacer left empty here would make
-    // history disagree with the screen.
+    // The law does not care which widening produced the pair. VS16 promotes a
+    // narrow base to two columns after `apply_cell_extras_preflagged` ran with
+    // `cols = 1`; the emoji's right half must still answer the SGR 58 colour,
+    // as a CJK char's does. The history mirror copies the lead unconditionally,
+    // so a live spacer left empty would make history disagree with the screen.
     let mut t = Terminal::new(6, 80);
     t.process("Q\u{1b}[4;58:2::0:0:255m\u{2764}\u{FE0F}\u{1b}[0mZ".as_bytes());
     let live = t.cell_frame(6, 80);
@@ -616,9 +605,9 @@ fn vs16_widened_spacer_carries_the_lead_underline_colour_live() {
 
 #[test]
 fn scrollback_underline_indexed_reresolves_after_palette_change() {
-    // The packed INDEX (not a frozen RGB triple) must survive scrollback: redefine
-    // palette entry 1 AFTER the row scrolls into history, and the materialized
-    // underline must re-resolve to the NEW colour. This fails if scrollback stored
+    // The packed index (not a frozen RGB triple) must survive scrollback: redefine
+    // palette entry 1 after the row scrolls into history, and the materialized
+    // underline must re-resolve to the new colour. This fails if scrollback stored
     // a resolved RGB — the reason underline colour is carried in packed form.
     let mut t = Terminal::new(6, 80);
     t.process(b"Q\x1b[4;58:5:1mU\x1b[0mZ");
@@ -640,9 +629,9 @@ fn scrollback_underline_indexed_reresolves_after_palette_change() {
 
 #[test]
 fn row_ansi_text_screen_ignores_scroll_position() {
-    // serialize()'s viewport paint reads the LIVE screen row via row_ansi_text_screen
-    // (offset-INDEPENDENT), so a scrolled emoji/RGB row is NOT re-emitted from
-    // scrolled history nor stranded as U+FFFD / stripped colour.
+    // serialize()'s viewport paint reads the live screen row via
+    // row_ansi_text_screen (offset-independent), so a scrolled emoji/RGB row is
+    // not re-emitted from history nor stranded as U+FFFD / stripped colour.
     let mut t = Terminal::new(4, 80);
     for i in 0..12 {
         t.process(format!("H{i:02}\r\n").as_bytes());

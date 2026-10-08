@@ -1,0 +1,10 @@
+# claude-code 2.1.283 · HAND-BUILT 2026-09-28: the vendor's own 529 row (claude-2.1.283-api-error-529.txt's words) as the turn's end over a done row that counts a background shell and the `· 1 shell ·` footer · an API wall behind a shell
+⏺ Running the suites in the background.
+
+⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.
+
+✻ Worked for 9m 2s · done 3:15 PM · 1 shell still running
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xhigh ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage

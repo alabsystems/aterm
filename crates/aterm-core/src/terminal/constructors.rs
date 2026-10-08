@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal constructors — `new`, `with_size`, `with_scrollback`, etc.
-//!
-//! Extracted from `mod.rs` to reduce file size (#4553).
+//! Terminal constructors: `new`, `with_size`, `with_scrollback`, etc.
 
 use crate::grid::Grid;
 use crate::parser::Parser;
@@ -20,12 +18,11 @@ use super::transient_state::TransientState;
 use super::types::{CurrentStyle, TerminalModes, TerminalSize};
 use super::{CharacterSetState, KittyKeyboardState, Terminal, XtermKeyboardState};
 
-/// Source of process-unique engine identities (DMG-1 damage carrier). Starts at
-/// 1 so `0` stays the "never engine-filled" sentinel a fresh
-/// [`RenderInput::empty`](crate::render::RenderInput::empty) carries — an
-/// unstamped scratch can therefore NEVER pass the damage-scoped continuity
-/// check by accident. `Relaxed` suffices: uniqueness needs only atomicity of
-/// `fetch_add`, no ordering with other memory.
+/// Source of process-unique engine identities for damage-scoped extraction.
+/// Starts at 1 so `0` stays the "never engine-filled" sentinel of
+/// [`RenderInput::empty`](crate::render::RenderInput::empty): an unstamped
+/// scratch never passes the continuity check. `Relaxed` suffices; only
+/// uniqueness is needed.
 static EXTRACT_IDENTITY_SOURCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Terminal {
@@ -41,10 +38,8 @@ impl Terminal {
         Self::with_grid(Grid::new(size.rows(), size.cols()))
     }
 
-    /// Internal constructor: create terminal with pre-built grid.
-    ///
-    /// All public constructors delegate to this method to avoid field
-    /// initialization duplication. See #1648.
+    /// Internal constructor from a pre-built grid; every public constructor
+    /// delegates here.
     pub(crate) fn with_grid(grid: Grid) -> Self {
         let mut terminal = Self {
             grid,
@@ -100,9 +95,8 @@ impl Terminal {
             damage_epoch_counted: false,
             extract_identity: EXTRACT_IDENTITY_SOURCE
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            // Gen 1 (not 0): a fresh RenderInput's `extract_gen` is 0, so the
-            // very first scoped-extraction attempt on any scratch is forced to
-            // the full-refill arm — the baseline every later scoped fill builds on.
+            // Gen 1, not 0: a fresh RenderInput's `extract_gen` is 0, so the first
+            // scoped extraction on any scratch takes the full-refill arm.
             extract_gen: 1,
             search_index: None,
             search_index_rebuilds: 0,
@@ -115,24 +109,18 @@ impl Terminal {
             resize_journal: super::resize_journal::ResizeJournal::default(),
         };
 
-        terminal.sync_bidi_resolver_from_config();
-
-        // Sync `clipboard_auth` from the `modes.allow_osc52_*` mirror bits
-        // set by `TerminalModes::new()`. Post-#7782 both flags default to
-        // `false` (fail-closed) — the capability gate stays revoked until
-        // the host explicitly calls `authorize_clipboard_access(...)` after
-        // wiring its clipboard callback. Routing the initial mode bit
-        // through `authorize_*` here keeps a single source of truth for
-        // the capability state (#7874, #7878 CF-004/CF-005, #7782).
+        // Sync `clipboard_auth` from the `modes.allow_osc52_*` bits set by
+        // `TerminalModes::new()` (both default to `false`, fail-closed; the host
+        // calls `authorize_clipboard_access` after wiring its clipboard).
+        // Routing through `authorize_*` keeps one source of truth.
         if terminal.modes.allow_osc52_set {
             terminal.clipboard_auth.authorize_write();
         }
         if terminal.modes.allow_osc52_query {
             terminal.clipboard_auth.authorize_query();
         }
-        // The fresh fold is not an empty word (negative flags default ON), so
-        // the mirror must be published from the real state, never left at
-        // `Default`.
+        // The fresh fold is not an empty word (negative flags default on), so
+        // publish the mirror from the real state.
         terminal.refresh_mode_mirror();
 
         terminal

@@ -1,25 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for module-global scrollback budget sharing (audit E1).
+//! Tier-1 conformance for process-wide scrollback budget sharing.
 //!
-//! The spec is `aterm_spec::derive::shared_budget_model` (Tier-0-checked in
-//! `derived_ring_ty.rs`): once every live pane has applied its equal share
-//! `min(configured, global / live_panes)`, the APPLIED budgets sum within the
-//! ONE global cap, and a departed pane holds no share.
+//! The spec is `aterm_spec::derive::shared_budget_model` (Tier-0 in
+//! `derived_ring_ty.rs`): once every live pane applied its share
+//! `min(configured, global / live_panes)`, the applied budgets sum within the
+//! global cap, and a departed pane holds no share.
 //!
-//! This file binds that spec to the REAL objects: every bounded action
-//! sequence over {Join, Leave, Apply1, Apply2} is driven against real
-//! [`ScrollbackBudgetShare`] registrations and real tiered [`Terminal`]s, with
-//! the REAL applied store budget (`ScrollbackStorage::memory_budget` after
-//! `Terminal::set_memory_budget`) substituted into each transition — so the
-//! spec judges the machine, not the model echoing itself. Negative controls: a
-//! forged over-cap observation must be REJECTED, and the real store must
-//! actually EVICT to its applied share (the OOM-class observable the global
-//! budget exists to bound).
+//! Every bounded action sequence over {Join, Leave, Apply1, Apply2} is driven
+//! against real [`ScrollbackBudgetShare`] registrations and tiered
+//! [`Terminal`]s, with the real applied store budget substituted into each
+//! transition. Negative controls: a forged over-cap observation is rejected,
+//! and the real store evicts to its applied share.
 //!
-//! The share registry is process-global; this integration test binary creates
-//! every share it sees, so the arithmetic is exact here (no foreign panes).
+//! The share registry is process-global; this binary creates every share it
+//! sees, so the arithmetic is exact.
 
 use std::collections::BTreeMap;
 
@@ -60,7 +56,7 @@ fn real_pane() -> RealPane {
     }
 }
 
-/// The REAL applied budget, projected to model units: what the pane's store
+/// The real applied budget, projected to model units: what the pane's store
 /// would actually enforce, after this pane's touch-time apply.
 fn applied_units(pane: &RealPane) -> i64 {
     let bytes = pane
@@ -103,10 +99,10 @@ fn validate(
 
 const ACTIONS: [&str; 4] = ["Join", "Leave", "Apply1", "Apply2"];
 
-/// Drive one action sequence on the REAL registry/terminals in lockstep with
-/// the model; validate every transition with the real applied budgets
-/// substituted. Returns the final (prev, next) pair for reuse as a
-/// negative-control base (`None` if the sequence was infeasible).
+/// Drive one action sequence on the real registry and terminals in lockstep
+/// with the model, validating every transition with the real applied budgets.
+/// Returns the final (prev, next) pair as a negative-control base (`None` if
+/// the sequence was infeasible).
 type Step = (BTreeMap<&'static str, i64>, BTreeMap<&'static str, i64>);
 
 fn run_lockstep(m: &Model, seq: &[&str]) -> Option<Step> {
@@ -131,7 +127,7 @@ fn run_lockstep(m: &Model, seq: &[&str]) -> Option<Step> {
             "Apply2" => touch(pane2.as_mut().expect("guard: pane 2 live")),
             _ => unreachable!("bounded action alphabet"),
         }
-        // Substitute the REAL measured applied budgets so the spec judges the
+        // Substitute the real measured applied budgets so the spec judges the
         // real registry + store, then carry the measurement forward.
         let mut next = st.clone();
         next.insert("a1", applied_units(&pane1));
@@ -149,9 +145,8 @@ fn run_lockstep(m: &Model, seq: &[&str]) -> Option<Step> {
     last
 }
 
-/// Every bounded action sequence (guard-pruned) to [`EXHAUSTIVE_STEPS`]
-/// conforms, plus curated longer join/leave-churn sequences (the staleness
-/// windows the equal-share policy is honest about).
+/// Every guard-pruned action sequence up to [`EXHAUSTIVE_STEPS`] conforms,
+/// plus curated longer join/leave churn sequences.
 #[test]
 fn real_share_registry_conforms_to_spec() {
     let _guard = SERIAL.lock().expect("serial");
@@ -183,9 +178,8 @@ fn real_share_registry_conforms_to_spec() {
     }
 }
 
-/// NEGATIVE CONTROL: a forged over-cap observation must be rejected — claim
-/// pane 1 applied its FULL configured budget while pane 2 holds a fresh
-/// share (the global-less mutant's signature).
+/// Negative control: pane 1 claiming its full configured budget while pane 2
+/// holds a fresh share is rejected.
 #[test]
 fn forged_over_cap_share_is_rejected() {
     let _guard = SERIAL.lock().expect("serial");
@@ -201,9 +195,8 @@ fn forged_over_cap_share_is_rejected() {
     );
 }
 
-/// The OOM-class REAL observable: two heavily fed panes under one global
-/// budget end (after their touch-time applies) with their stores' budgets
-/// summing within the global — and the stores really evicted to fit.
+/// Two heavily fed panes under one global budget end with store budgets
+/// summing within the global, and the stores really evicted.
 #[test]
 fn real_stores_evict_to_the_shared_global() {
     let _guard = SERIAL.lock().expect("serial");

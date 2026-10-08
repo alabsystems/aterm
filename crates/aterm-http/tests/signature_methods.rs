@@ -3,15 +3,11 @@
 
 //! THE HANDSHAKE SIGNATURE METHODS HAVE BEHAVIOURAL COVERAGE.
 //!
-//! An adversarial review of the wave that wrote `PlatformVerifier` found that
-//! replacing BOTH `verify_tls12_signature` and `verify_tls13_signature` with
-//! `Ok(HandshakeSignatureValid::assertion())` left the entire suite green — 68
-//! unit + 8 loopback + 17 differential, zero failures. That stub is a TOTAL TLS
+//! Replacing `verify_tls12_signature` and `verify_tls13_signature` with
+//! `Ok(HandshakeSignatureValid::assertion())` is a TOTAL TLS
 //! server-authentication bypass: the peer stops having to prove it holds the
-//! private key for the certificate it presented, so anyone able to replay a
-//! captured certificate can impersonate the server. Chain validation is
-//! irrelevant against it, which is why `verify_server_cert` having a 37-case
-//! differential did not help.
+//! private key for the certificate it presented, and chain validation is
+//! irrelevant against it. These tests are what catches that stub.
 //!
 //! Nothing here needs a VALID signature, and that is the point — minting one
 //! would need a committed private key, which `mint.sh` deliberately does not

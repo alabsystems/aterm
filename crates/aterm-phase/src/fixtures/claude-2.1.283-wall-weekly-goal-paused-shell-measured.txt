@@ -1,0 +1,24 @@
+# claude-code 2.1.283 · MEASURED 2026-09-28 12:19 PDT on the owner's tab 1 (a private headless aterm replayed the tab's own PTY recording at 140 columns; snap 13600): the weekly wall, the /goal echo drawn under it, a done row that still counts `1 shell still running`, the bypass footer's `· 1 shell ·` and Claude's dim next-step suggestion in the composer (its words replaced). The worker's prose above the workflow notice and the workflow's title are replaced by neutral text; every vendor row (the gutter block, the echo, the done row, the update hint with the goal indicator run into it, the rules, the composer, the footer) is byte for byte · a weekly limit hit behind a background shell
+⏺ Two of the four slices cleared their reviews and are being integrated into main.
+
+⏺ Bash(cd ~/example && df -g / | tail -1)
+  ⎿  55 GiB free
+
+⏺ Free space dropped, so a cleanup agent is freeing it. I restarted the low-disk watcher too.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+⏺ Dynamic workflow "an example wave with a title long enough to wrap onto a second and a third row of the
+transcript, as the measured one did" completed · 4h 42m 19s
+  ⎿  You've hit your weekly limit · resets 4pm (America/Los_Angeles)
+     Use your limit reset to reset it now: clau.de/reset
+     /usage-credits to finish what you’re working on.
+
+⏺ Goal paused · usage limit reached · send a message after it resets to continue
+
+✻ Sautéed for 1d 2h 58m · done 12:19 PM · 1 shell still running
+                                                                                 ✔ Update installed · Restart to update◎ /goal active (1d)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xhigh ─
+❯ keep going, then merge when ready
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage

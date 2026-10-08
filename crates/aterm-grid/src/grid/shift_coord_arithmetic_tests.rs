@@ -5,30 +5,15 @@
 //! Kani proofs for CellExtras shift coordinate arithmetic.
 //!
 //! The shift methods (shift_rows_up_by, shift_region_up_by,
-//! shift_region_down_by, shift_cols_right, shift_cols_left) use
-//! drain-rebuild on FxHashMap which is intractable for Kani.
-//!
-//! These proofs verify the COORDINATE ARITHMETIC in isolation,
-//! proving that row/col transformations are correct for all possible
-//! input coordinates and parameters across the full u16 space.
-//!
-//! ## Wiring
-//!
-//! Add to `grid/mod.rs`:
-//! ```ignore
-//! #[cfg(kani)]
-//! #[path = "shift_coord_arithmetic_tests.rs"]
-//! mod proofs_kani_shift_coord;
-//! ```
+//! shift_region_down_by, shift_cols_right, shift_cols_left) drain and rebuild
+//! an FxHashMap, which is intractable for Kani, so these proofs verify the
+//! coordinate arithmetic in isolation over the full u16 space.
 
 /// shift_rows_up_by: shifted row never underflows.
 ///
 /// When coord.row >= start_row + n (and start_row + n fits in u16),
-/// saturating_sub(n) equals row - n (no saturation needed), and
-/// the result is >= start_row.
-///
-/// Proves: extra.rs:528 `coord.row.saturating_sub(n)` is equivalent
-/// to unchecked subtraction for all valid inputs.
+/// saturating_sub(n) equals row - n and the result is >= start_row, so the
+/// saturating subtraction equals unchecked subtraction for all valid inputs.
 #[kani::proof]
 fn shift_up_no_underflow() {
     let row: u16 = kani::any();
@@ -50,11 +35,9 @@ fn shift_up_no_underflow() {
 
 /// shift_rows_up_by: translation preserves strict ordering.
 ///
-/// If row_a < row_b and both are shifted, new_row_a < new_row_b.
-/// This ensures no two distinct source rows collide after shifting.
-///
-/// Proves: the subtraction in extra.rs:528 is an order-preserving
-/// bijection on the shifted coordinate range.
+/// If row_a < row_b and both are shifted, new_row_a < new_row_b, so no two
+/// source rows collide: the subtraction is an order-preserving bijection on
+/// the shifted range.
 #[kani::proof]
 fn shift_up_preserves_order() {
     let row_a: u16 = kani::any();
@@ -69,11 +52,8 @@ fn shift_up_preserves_order() {
 
 /// shift_region_up_by: shifted rows stay within region bounds.
 ///
-/// For rows in (top, bottom] where row >= top + n:
-/// new_row = row - n is in [top, bottom - n].
-///
-/// Proves: extra.rs:558 `coord.row - n` always lands within the
-/// valid target range [top, bottom-n] for the region.
+/// For rows in (top, bottom] where row >= top + n, `row - n` lands in
+/// [top, bottom - n].
 #[kani::proof]
 fn shift_region_up_stays_in_bounds() {
     let row: u16 = kani::any();
@@ -98,11 +78,8 @@ fn shift_region_up_stays_in_bounds() {
 
 /// shift_region_down_by: drop_start partitions region correctly.
 ///
-/// For rows in [top, drop_start), shifting by n yields row + n <= bottom.
-/// This proves saturating_add won't saturate for valid inputs.
-///
-/// Proves: extra.rs:588 `coord.row.saturating_add(n)` is equivalent
-/// to unchecked addition for all valid inputs within the region.
+/// For rows in [top, drop_start), shifting by n yields row + n <= bottom, so
+/// saturating_add equals unchecked addition for valid inputs.
 #[kani::proof]
 fn shift_region_down_stays_in_bounds() {
     let row: u16 = kani::any();
@@ -129,11 +106,8 @@ fn shift_region_down_stays_in_bounds() {
 
 /// shift_region_down_by: drop_start drops exactly n rows.
 ///
-/// drop_start = bottom - (n - 1) means [drop_start, bottom] contains
-/// exactly n rows.
-///
-/// Proves: the drop_start formula at extra.rs:580 correctly identifies
-/// the boundary between shifted and dropped rows.
+/// drop_start = bottom - (n - 1), so [drop_start, bottom] holds exactly n
+/// rows: the boundary between shifted and dropped rows.
 #[kani::proof]
 fn shift_region_down_drop_count() {
     let bottom: u16 = kani::any();
@@ -151,16 +125,13 @@ fn shift_region_down_drop_count() {
 
 /// shift_cols_left: shifted column never underflows (no-overflow case).
 ///
-/// When start_col + count fits in u16 (no overflow), col - count >= start_col.
+/// When start_col + count fits in u16, `col - count >= start_col` under the
+/// guard `coord.col >= shift_start`.
 ///
-/// Proves: extra.rs:785 `coord.col - count` is safe when the guard
-/// `coord.col >= shift_start` holds AND `start_col + count` doesn't overflow.
-///
-/// NOTE: When start_col + count OVERFLOWS u16, saturating_add clips shift_start
-/// to u16::MAX, making the guard too weak — shifted columns can land below
-/// start_col. See comment on production code extra.rs:772.
-/// In practice unreachable (terminal columns < 32768) but the invariant
-/// only holds under the checked_add assumption.
+/// When start_col + count overflows u16, saturating_add clips shift_start to
+/// u16::MAX and the guard is too weak: shifted columns can land below
+/// start_col. Unreachable in practice (columns < 32768), but the invariant
+/// holds only under the checked_add assumption.
 #[kani::proof]
 fn shift_cols_left_no_underflow() {
     let col: u16 = kani::any();
@@ -169,9 +140,9 @@ fn shift_cols_left_no_underflow() {
 
     kani::assume(count > 0);
 
-    // Require start_col + count fits in u16 (the invariant fails on overflow).
-    // Production code uses saturating_add which silently clips — safe only
-    // because real terminal columns are bounded well below u16::MAX.
+    // Require start_col + count to fit in u16 (the invariant fails on
+    // overflow). Production uses saturating_add, safe only because terminal
+    // columns are far below u16::MAX.
     let shift_start = start_col.checked_add(count);
     kani::assume(shift_start.is_some());
     let shift_start = shift_start.unwrap();
@@ -184,12 +155,9 @@ fn shift_cols_left_no_underflow() {
 
 /// shift_cols_right: shifted column preserves ordering and bounds.
 ///
-/// Columns at or after start_col shift right by count. Those that
-/// exceed max_col are correctly dropped. Order is preserved among
-/// surviving columns.
-///
-/// Proves: extra.rs:624-625 `saturating_add(count)` preserves
-/// relative ordering for columns that don't overflow.
+/// Columns at or after start_col shift right by count; those past max_col are
+/// dropped; `saturating_add(count)` preserves order among columns that do not
+/// overflow.
 #[kani::proof]
 fn shift_cols_right_preserves_order() {
     let col_a: u16 = kani::any();
@@ -213,27 +181,23 @@ fn shift_cols_right_preserves_order() {
 }
 
 // =========================================================================
-// Row-offset amortization proofs (#4542)
+// Row-offset amortization proofs
 // =========================================================================
 //
-// W13 added row_offset amortization to CellExtras: full-screen scrolls
-// increment a u16 offset instead of drain-rebuilding FxHashMap.
-// physical_row(logical) = logical + row_offset (unchecked u16 addition).
-// Compaction triggers at ROW_OFFSET_COMPACT_THRESHOLD (256).
-//
-// The HashMap operations are intractable for CBMC. These proofs verify
-// the ARITHMETIC properties: no overflow, correct compaction, equivalence.
+// Full-screen scrolls increment a u16 row_offset instead of rebuilding the
+// FxHashMap: physical_row(logical) = logical + row_offset (unchecked u16
+// addition), with compaction at ROW_OFFSET_COMPACT_THRESHOLD (256). The
+// HashMap operations are intractable for CBMC, so these proofs check the
+// arithmetic: no overflow, correct compaction, equivalence.
 
 /// Compaction threshold from extra.rs.
 const ROW_OFFSET_COMPACT_THRESHOLD: u16 = 256;
 
 /// physical_row: no overflow under real terminal bounds.
 ///
-/// Terminal grids are bounded: max 500 rows (generous upper bound).
-/// row_offset is bounded by ROW_OFFSET_COMPACT_THRESHOLD.
-/// Proves: logical + row_offset fits in u16 for all realistic inputs.
-///
-/// Proves: extra.rs physical_row() won't panic or wrap for valid grids.
+/// With at most 500 rows (a generous bound) and row_offset below
+/// ROW_OFFSET_COMPACT_THRESHOLD, logical + row_offset fits in u16, so
+/// physical_row() never panics or wraps.
 #[kani::proof]
 fn physical_row_no_overflow() {
     let logical: u16 = kani::any();
@@ -285,11 +249,8 @@ fn physical_coord_bijective() {
 
 /// compact_row_offset: re-keying arithmetic is correct.
 ///
-/// After compaction, physical_row = coord.row - offset (for non-stale entries).
-/// This subtraction is safe because non-stale entries have coord.row >= offset.
-///
-/// Proves: extra.rs compact_row_offset() subtraction never underflows
-/// for entries that pass the coord.row >= offset filter.
+/// After compaction, physical_row = coord.row - offset for non-stale entries,
+/// which never underflows because those entries have coord.row >= offset.
 #[kani::proof]
 fn compact_rekey_no_underflow() {
     let coord_row: u16 = kani::any();

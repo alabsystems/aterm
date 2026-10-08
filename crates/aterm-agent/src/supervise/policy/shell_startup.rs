@@ -1,80 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the worker's Bash tool's shell carries in from the person's own shell
-//! startup — read so that the rm rule's proof ([`super::rm_breaker`]) and the
+//! What the worker's Bash tool's shell carries in from the person's shell
+//! startup, read so that the rm rule's proof ([`super::rm_breaker`]) and the
 //! read-only classifier ([`crate::supervise::classify`]), which model zsh 5.9
-//! and bash 3.2 under their DEFAULT options with no user alias or function,
-//! prove nothing where that model does not hold ([`read`],
+//! and bash 3.2 under default options with no user alias or function, prove
+//! nothing where that model does not hold ([`read`],
 //! [`ShellStartup::admits`]).
 //!
-//! **What Claude Code runs** (2.1.284, measured 2026-09-28 by printing only,
-//! off the binary's own source): at session start it writes a SHELL SNAPSHOT,
-//! `<claude dir>/shell-snapshots/snapshot-<zsh|bash>-<ms>-<rand>.sh`, from a
-//! login shell that sourced the person's `~/.zshrc` (or `~/.bashrc`) — its
-//! non-default options (`setopt`'s listing; bash's `shopt -p` and the `set -o`
-//! options that are on), its functions and its aliases — and deletes it at
-//! exit. Every command the Bash tool runs is then `$SHELL -c 'source <snapshot> && …
-//! setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL (bash: shopt -u extglob) && …
-//! eval <command>'`, with no `emulate`, no other reset and no `-f`: an option,
-//! function or alias the snapshot carries is in force for the command (a
-//! `setopt globsubst` makes `N='~'; rm -rf $N` remove the home directory, a
-//! function `rm` runs instead of `/bin/rm`), and so is whatever zsh's
-//! `.zshenv` (every run), bash's `BASH_ENV`, `SHELLOPTS` or `POSIXLY_CORRECT`,
-//! the `CLAUDE_ENV_FILE` and a SessionStart hook's env script (raw shell,
-//! prepended to every command) set. Only `EXTENDED_GLOB`, `BARE_GLOB_QUAL`
-//! and bash's `extglob` are reset: glob qualifiers are dead, the rest is not.
+//! Claude Code writes a shell snapshot at session start
+//! (`<claude dir>/shell-snapshots/snapshot-<zsh|bash>-…sh`: the login shell's
+//! non-default options, functions and aliases) and runs every Bash command as
+//! `$SHELL -c 'source <snapshot> && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL
+//! && eval <command>'`, so what the snapshot carries is in force, as are
+//! `.zshenv`, `BASH_ENV` and similar, `CLAUDE_ENV_FILE` and SessionStart hook
+//! env scripts. Snapshots are not named per session, so every snapshot of the
+//! Bash tool's shell ([`tool_kinds`]) is judged; with none, or one unreadable,
+//! the startup is unknown.
 //!
-//! **Which snapshot is the session's.** 2.1.284 names none by its session
-//! (the `-<session>` suffix is off in the shipped build), so EVERY snapshot of
-//! the shell the Bash tool runs ([`tool_kinds`]) in the worker's Claude Code
-//! directory is judged, and one that fails fails the check: the session's own
-//! is among them, since Claude Code removes a snapshot only when its session
-//! exits. With none there (it may have failed to write, and the Bash tool
-//! then runs a LOGIN shell whose profile files are not read here) the startup
-//! is unknown. So is a snapshot this check cannot read whole or parse.
+//! Fails the check ([`read`]): an option outside the inert lists
+//! ([`ZSH_INERT`], [`BASH_SET_INERT`], [`BASH_SHOPTS`]), which escalates every
+//! line; a function named for a hook `zsh -c` runs or a word of the Bash
+//! tool's own chain ([`ALWAYS_RUN`]); a `.zshenv` that changes options or runs
+//! unseen code ([`zshenv_hazard`]); bash's `BASH_ENV`, `ENV`, `SHELLOPTS`,
+//! `BASHOPTS` or `POSIXLY_CORRECT`; `CLAUDE_CODE_SHELL_PREFIX` or
+//! `CLAUDE_ENV_FILE`; a non-empty hook env script under
+//! `<claude dir>/session-env/`; and any of those variables (or `SHELL`,
+//! `CLAUDE_CODE_SHELL`, `ZDOTDIR`, `HOME`) given to the Bash tool by Claude
+//! Code's settings ([`super::git_config::WorkerEnv::settings_env_where`]).
 //!
-//! **What fails the check** ([`read`], each reason naming it): an option not
-//! in the inert lists ([`ZSH_INERT`], [`BASH_SET_INERT`], [`BASH_SHOPTS`]:
-//! interactive-only, output-only, or options that only make a command stop
-//! sooner) — it escalates EVERY line, not only the forms it changes, the
-//! simplest sound reading; a function named for a hook a `zsh -c` runs
-//! unasked (`chpwd`, `zshexit`, `TRAP…`, `command_not_found_handler`) or for
-//! a word of the Bash tool's own chain (`eval`, `setopt`, …: [`ALWAYS_RUN`]);
-//! a zsh
-//! `.zshenv` (`$ZDOTDIR`'s, else `$HOME`'s, `/etc/zshenv` and
-//! `/etc/zsh/zshenv`) that changes options where the snapshot would not show it (`emulate`, a conditional
-//! `setopt`) or runs code this check cannot see (`source`, `.`, `eval`, a
-//! function) — [`zshenv_hazard`]; bash's `BASH_ENV`, `ENV`, `SHELLOPTS`,
-//! `BASHOPTS` or `POSIXLY_CORRECT`; `CLAUDE_CODE_SHELL_PREFIX` and
-//! `CLAUDE_ENV_FILE` in the worker's environment; a non-empty hook env script
-//! under `<claude dir>/session-env/` (any session's: the file does not say
-//! whose, so every one counts); and any of those variables — or `SHELL`,
-//! `CLAUDE_CODE_SHELL`, `ZDOTDIR`, `HOME` — that Claude Code's settings give
-//! the Bash tool and not the process ([`super::git_config::WorkerEnv::settings_env_where`]).
+//! Aliases and functions fail only the lines that may run them
+//! ([`ShellStartup::admits`]): a function by any word under any quoting
+//! ([`dequotings`]), an alias by a word in command position
+//! ([`command_heads`]), or any word on a line that `eval`s its text. Claude
+//! Code's own shadows (after its `# Check for rg availability` line) are not
+//! read.
 //!
-//! **Aliases and functions** a snapshot defines fail only the lines that may
-//! run them ([`ShellStartup::admits`]). A function: any word of the line
-//! spelled as its name under any quoting of it ([`dequotings`]), since zsh
-//! looks a function up after quote removal (`r\m`, `r""m` and `$'\x72m'`
-//! run a function `rm`) — an over-approximation of "at a command head".
-//! An alias: a word in command position ([`command_heads`], itself an
-//! over-approximation), the only place a plain alias is expanded, and a
-//! quoted word never is — or any word, under any quoting, on a line that
-//! parses its own text again (`eval`). 2.1.284's snapshot demotes a global
-//! alias to a plain one (`alias -g` is not replayed), so oh-my-zsh's `alias
-//! 5='cd -5'` fails `5`, not `tail -n 5`. Claude Code's own shadows
-//! (`find`, `grep`, `pkill`, the `rg` fallback), written after its `# Check
-//! for rg availability` line, are not the person's and are not read.
-//!
-//! **Residuals.** A `.zshenv` that sources nothing and names no option is
-//! taken as setting none; the snapshot's listing already holds what it set
-//! when the snapshot was made. Another live session's snapshot of the same
-//! shell stands in for one this session failed to write. A zsh function
-//! body's here-document is not told from the snapshot's own lines, which
-//! can only fail more lines, never fewer. A function spelled by an
-//! expansion (`f=rm; $f`, `$(echo rm)`) is not seen here: the line models
-//! approve no command named by an expansion.
+//! Residuals: a `.zshenv` that sources nothing and names no option is taken as
+//! setting none; another session's snapshot of the same shell stands in for a
+//! missing one; a function named by an expansion is not seen (the line models
+//! approve no command named by an expansion).
 
 use std::path::{Path, PathBuf};
 
@@ -114,10 +79,12 @@ impl Kind {
 /// What the Bash tool's shell starts with that the line models do not
 /// assume and that fails only some lines: the aliases and functions the
 /// person's startup defines, each with where it was read and whether it is
-/// an alias.
+/// an alias — and whether that shell may be zsh, under which the read-only
+/// rule takes only a plain line ([`Self::may_run_zsh`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellStartup {
     names: Vec<(String, String, bool)>,
+    zsh: bool,
 }
 
 /// Words that make the shell parse text of the line as a command again, so
@@ -125,6 +92,13 @@ pub struct ShellStartup {
 const REPARSE: &[&str] = &["eval", "trap", "emulate", "sched", "fc"];
 
 impl ShellStartup {
+    /// Whether the Bash tool may run the line under zsh: a zsh snapshot was
+    /// read, or zsh is among the shells it may pick ([`tool_kinds`]).
+    #[must_use]
+    pub fn may_run_zsh(&self) -> bool {
+        self.zsh
+    }
+
     /// `Err` naming the alias or function `line` may run: a function whose
     /// name is a word of the line under any quoting of it ([`dequotings`]), an
     /// alias whose name is a word in command position ([`command_heads`]) —
@@ -167,20 +141,13 @@ const MAX_SESSION_ENV_DIRS: usize = 4096;
 const CLAUDE_PART: &str = "# Check for rg availability";
 
 /// zsh options (as `setopt` lists them) that change nothing a
-/// non-interactive `zsh -c` does to a command's words, which command runs,
-/// or where a path points: history, completion, the line editor, prompts
-/// and jobs; `autocd`, `correct` and `banghist` (inert without a terminal,
-/// measured); `interactivecomments` either way (`eval 'print a # b'` prints
-/// `a` in `zsh -c` with it on or off, measured 2026-09-28); options that
-/// only stop a command sooner (`noclobber`, `errexit`, `nounset`,
-/// `pipefail`, `noexec`); tracing; `extendedglob`/`nobareglobqual`, which
-/// Claude Code resets after the snapshot on every command; and the
-/// directory stack's (`autopushd`, `pushdminus`, `pushdtohome`, …: every
-/// Bash tool command starts with an empty stack, so any entry a `cd -1`,
-/// `cd +1` or bare `pushd` reaches is a directory the line itself visited,
-/// which the git rule's `cd` scan already holds, and the rm rule reads no
-/// relative operand and no `$PWD` — oh-my-zsh's `lib/directories.zsh` sets
-/// `autopushd`, `pushdignoredups` and `pushdminus`).
+/// non-interactive `zsh -c` does to a command's words, which command runs, or
+/// where a path points: history, completion, the line editor, prompts and
+/// jobs; `autocd`, `correct`, `banghist` and `interactivecomments` (inert
+/// without a terminal); options that only stop a command sooner; tracing;
+/// `extendedglob`/`nobareglobqual`, which Claude Code resets; and the
+/// directory stack's (every Bash tool command starts with an empty stack, so a
+/// stack entry is a directory the line itself visited).
 pub const ZSH_INERT: &[&str] = &[
     "alwayslastprompt",
     "noalwayslastprompt",
@@ -328,12 +295,10 @@ pub const ZSH_INERT: &[&str] = &[
 ];
 
 /// bash `set -o` options (as the snapshot replays them: only those on) that
-/// change nothing about a command's words or which command runs: the three
-/// on by default, `monitor` and `onecmd` (the snapshot's `grep "on"` turns
-/// them on for everyone; no effect on expansion, measured), the
-/// interactive-only ones, `histexpand` (`!!` stayed literal, measured),
-/// tracing, and those that only stop a command sooner. `allexport`,
-/// `keyword`, `noglob`, `physical` and `posix` are not here.
+/// change nothing about a command's words or which command runs: the defaults,
+/// `monitor` and `onecmd` (the snapshot turns them on), the interactive-only
+/// ones, `histexpand`, tracing, and those that only stop a command sooner.
+/// `allexport`, `keyword`, `noglob`, `physical` and `posix` are not here.
 pub const BASH_SET_INERT: &[&str] = &[
     "braceexpand",
     "emacs",
@@ -359,12 +324,10 @@ pub const BASH_SET_INERT: &[&str] = &[
     "xtrace",
 ];
 
-/// bash 3.2's shopts, each with its default in a `bash -l -c` (measured
-/// 2026-09-28, `/bin/bash` 3.2.57) — `None` where no value changes a
-/// command's words or which command runs (interactive-only, `extglob`, which
-/// Claude Code resets, and `expand_aliases`, which its snapshot turns on for
-/// everyone: an alias is judged by name). A shopt not listed (a newer
-/// bash's) is unknown.
+/// bash 3.2's shopts, each with its default in a `bash -l -c`; `None` where no
+/// value changes a command's words or which command runs (interactive-only,
+/// `extglob`, which Claude Code resets, and `expand_aliases`, which its
+/// snapshot turns on). A shopt not listed is unknown.
 pub const BASH_SHOPTS: &[(&str, Option<bool>)] = &[
     ("cdable_vars", Some(false)),
     ("cdspell", None),
@@ -403,11 +366,9 @@ pub const BASH_SHOPTS: &[(&str, Option<bool>)] = &[
 ];
 
 /// Function names the shell runs whatever the line says: the zsh hooks a
-/// `zsh -c` runs (`chpwd` on a `cd`, `zshexit` at the end — `precmd`,
-/// `preexec`, `periodic` and `zshaddhistory` never fire there, measured
-/// 2026-09-28 with each defined and `PERIOD=1`, so they are ordinary names),
-/// the handlers, and the words of the Bash tool's own chain around the
-/// command (`eval` runs it; a function of that name would run it instead).
+/// `zsh -c` runs (`chpwd`, `zshexit`; `precmd`, `preexec`, `periodic` and
+/// `zshaddhistory` never fire there), the handlers, and the words of the Bash
+/// tool's own chain around the command (`eval` runs it).
 const ALWAYS_RUN: &[&str] = &[
     "chpwd",
     "zshexit",
@@ -481,7 +442,10 @@ pub fn read(worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String> {
     hook_env_scripts(&claude)?;
     let kinds = tool_kinds(worker);
     let snapshots = snapshots(&claude, &kinds)?;
-    let mut state = ShellStartup::default();
+    let mut state = ShellStartup {
+        zsh: kinds.contains(&Kind::Zsh),
+        ..ShellStartup::default()
+    };
     for (kind, path) in &snapshots {
         let text = read_small(path, MAX_FILE_BYTES + 1)
             .ok_or_else(|| format!("{} cannot be read", path.display()))?;
@@ -598,6 +562,7 @@ pub fn parse_snapshot(
     if lines.first().map(|l| l.trim_end()) != Some("# Snapshot file") {
         return Err(format!("{source} is no shell snapshot this check reads"));
     }
+    state.zsh |= kind == Kind::Zsh;
     let end = lines
         .iter()
         .rposition(|l| l.trim_end() == CLAUDE_PART)
@@ -726,12 +691,10 @@ pub fn names_word(line: &str, name: &str) -> bool {
 const MAX_QUOTE_LEVELS: usize = 8;
 
 /// `line` and what it reads as after each level of quote removal the shell
-/// may apply to it — once as a command, once more for each `eval` of it —
-/// each also with every `\`, `'` and `"` dropped: the spellings under which
-/// zsh and bash look a function's name up (measured 2026-09-28, zsh 5.9: a
-/// function `rm` runs for `r\m`, `r""m`, `$'\x72m'`, `r\<newline>m` and
-/// `eval "r\\m"`). `Err` for a line quoted more deeply than
-/// [`MAX_QUOTE_LEVELS`].
+/// may apply (once as a command, once more per `eval`), each also with every
+/// `\`, `'` and `"` dropped: the spellings under which zsh and bash look a
+/// function's name up (`r\m`, `r""m` and `$'\x72m'` all run a function `rm`).
+/// `Err` for a line quoted more deeply than [`MAX_QUOTE_LEVELS`].
 pub fn dequotings(line: &str) -> Result<Vec<String>, String> {
     let strip = |t: &str| t.replace(['\\', '\'', '"'], "");
     let mut out = vec![line.to_string(), strip(line)];
@@ -876,18 +839,12 @@ fn ansi_c(cs: &[char], i: &mut usize, out: &mut String) {
     }
 }
 
-/// Every word of `line` that may stand in command position, where zsh and
-/// bash expand a plain alias (measured 2026-09-28, zsh 5.9 and bash 3.2.57):
-/// the first word, and one after `;`, `&`, `|`, `(`, `)`, `{`, `}`, a
-/// backtick or a newline wherever they stand (quoted too: more words, never
-/// fewer), after a `]]` (zsh's short `if [[ … ]] cmd`; a `((`'s `))` is
-/// already two `)`), and after a word in command position that keeps the next one
-/// there — a reserved word or precommand modifier ([`KEEPS_COMMAND`]), an
-/// assignment (a word holding `=`), a redirection (a `<` or `>`, and its
-/// target when it is not glued on), a count (`repeat 2`) or an option
-/// (`time -p`). The word after an alias whose value ends in a blank is in
-/// command position too, but it follows an alias, which already fails the
-/// line.
+/// Every word of `line` that may stand in command position, where zsh and bash
+/// expand a plain alias (an over-approximation): the first word, one after
+/// `;`, `&`, `|`, `(`, `)`, `{`, `}`, a backtick or a newline wherever they
+/// stand, after a `]]`, and after a word that keeps the next in command
+/// position (a [`KEEPS_COMMAND`] word, an assignment, a redirection and its
+/// target, a count or an option).
 pub fn command_heads(line: &str) -> Vec<&str> {
     let separator = |c: char, prev: Option<char>| {
         matches!(c, ';' | '\n' | '(' | ')' | '{' | '}' | '`')
@@ -945,10 +902,8 @@ pub fn command_heads(line: &str) -> Vec<&str> {
     heads
 }
 
-/// Reserved words and precommand modifiers after which zsh or bash reads
-/// the next word in command position (`noglob`, `command`, `builtin`,
-/// `exec` and `-` expanded no alias after them in zsh 5.9, measured; kept
-/// all the same).
+/// Reserved words and precommand modifiers after which zsh or bash reads the
+/// next word in command position.
 const KEEPS_COMMAND: &[&str] = &[
     "if",
     "then",

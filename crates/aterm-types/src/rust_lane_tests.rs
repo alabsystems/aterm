@@ -19,15 +19,9 @@ fn commands(spellings: &[Spelling]) -> Vec<&str> {
 /// every one of these verdicts is the floor, with ONE named exception
 /// ([`INTERIM_ALLOW_REFUSED_BY_DESIGN`]).
 ///
-/// The first port (2026-09-24) held the 33 cases the script had then. On
-/// 2026-09-25 the script gained its by-path exemption and four PATH-FORM cases
-/// (the first two of each list), the only four that exercise it, and the port
-/// did not follow — so until 2026-09-28 it still said "33, verbatim" while
-/// `aterm pkg lane` refused the trust repository's own
-/// `build/<host>/stage0/bin/rustc -Vv` as stock (review of 2026-09-27). A
-/// path-form case needs a filesystem: [`interim_guard_machine`] answers, for each
-/// directory as the case writes it, what that directory held on the owner's Mac
-/// when measured (2026-09-28).
+/// The four PATH-FORM cases (the first two of each list) exercise the
+/// script's by-path exemption, so they need a filesystem: [`interim_guard_machine`]
+/// answers, for each directory as the case writes it, what it held when measured.
 const INTERIM_BLOCK: &[&str] = &[
     "/usr/local/bin/cargo build",
     "~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc -V",
@@ -76,16 +70,15 @@ const INTERIM_ALLOW: &[&str] = &[
 /// `rustdoc`, `cargo` and `rustfmt` through by path in any directory holding
 /// `trustc` or `targo`; this reader lets through `rustc` and `rustdoc` beside
 /// their own twins ([`COMPAT_TWINS`]) and keeps refusing `cargo` there, spelled
-/// with THAT directory's `targo`. Measured 2026-09-28 on the installed Trust
+/// with THAT directory's `targo`. Measured on the installed Trust
 /// toolchain (`~/toolchains/trust-45040366/bin`): its `cargo` is byte-identical
 /// to its `targo`, yet run as `cargo` it answers `--unverified` with "unexpected
-/// argument" — upstream cargo's surface, which names no lane. A choice put to the
-/// owner with the guard's wiring, not an accident of the port.
+/// argument" — upstream cargo's surface, which names no lane.
 const INTERIM_ALLOW_REFUSED_BY_DESIGN: &str =
     "build/aarch64-apple-darwin/stage0/bin/cargo --version";
 
 /// The directory probe of [`verdict_in`] for the interim cases: what each
-/// directory, AS THE CASE WRITES IT, held on the owner's Mac on 2026-09-28
+/// directory, AS THE CASE WRITES IT, held on the owner's Mac when measured
 /// (`ls`; the relative form is the same directory read under the trust
 /// checkout, where the script's own measurement ran): the trust `stage0/bin`
 /// (no `rustdoc`, no `rustfmt`), rustup's `1.97.1` (no Trust name), and
@@ -177,7 +170,7 @@ fn the_interim_guards_thirty_seven_cases_hold() {
     }
 }
 
-/// A TRUST TOOLCHAIN'S OWN COMPATIBILITY NAMES BY PATH (review of 2026-09-27):
+/// A TRUST TOOLCHAIN'S OWN COMPATIBILITY NAMES BY PATH:
 /// `<dir>/rustc` beside `<dir>/trustc` and `<dir>/rustdoc` beside `<dir>/trustdoc`
 /// are that toolchain's compiler and doc tool — `build/<host>/stage2/bin/rustc -vV`
 /// is how the trust repository reads the compiler under measurement — so they are
@@ -276,22 +269,30 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
     );
     // The refusal says what that binary IS — never "stock Rust" — and names no pin:
     // a path runs no rustup proxy, so a pin moves nothing there.
-    let pin = Some((Path::new("/r/rust-toolchain.toml"), "1.97.1"));
-    let text = refusal(&hit, pin);
+    let file = PinSource::File("/r/rust-toolchain.toml".into());
+    let text = refusal(&hit, Some((&file, "1.97.1")));
     assert!(
         text.starts_with(
-            "`/opt/trust/bin/cargo test` is the compatibility `cargo` of the Trust toolchain in \
-             /opt/trust/bin/: upstream cargo's surface, not targo's"
+            "`/opt/trust/bin/cargo test` is a Trust toolchain's compatibility cargo: upstream \
+             cargo's surface, which names no lane.\nRun that toolchain's targo:\n"
         ),
         "{text}"
     );
     assert!(!text.contains("is stock Rust"), "{text}");
+    assert!(!text.contains("stock Rust is genuinely required"), "{text}");
     assert!(!text.contains("pins stock"), "{text}");
+    assert!(!text.contains("aterm help rust"), "{text}");
     assert!(
         text.contains("\n  /opt/trust/bin/targo trust test -p x "),
         "{text}"
     );
-    assert!(text.contains("ATERM_STOCK_REASON='<why>'"), "{text}");
+    assert!(
+        text.ends_with(
+            "If upstream cargo's surface is genuinely required, put ATERM_STOCK_REASON='<why>' \
+             in front of the command and say why in your reply."
+        ),
+        "{text}"
+    );
     // The escape clears it like any other.
     assert!(matches!(
         verdict_in(
@@ -545,20 +546,37 @@ fn the_refusal_names_the_trust_spelling_the_pin_and_the_escape() {
     assert!(text.contains("ATERM_STOCK_REASON='<why>'"), "{text}");
     assert!(text.contains("aterm help rust"), "{text}");
     assert!(!text.contains("pins stock \""), "no pin was given: {text}");
-    // A stock pin is named; a Trust pin is not a stock pin.
-    let file = Path::new("/r/rust-toolchain.toml");
-    let pinned = refusal(&hit, Some((file, "1.97.1")));
+    // A stock pin is named; a Trust pin is not a stock pin; a channel the command
+    // names outranks any pin, so none is named beside it.
+    let file = PinSource::File("/r/rust-toolchain.toml".into());
+    assert_eq!(refusal(&hit, Some((&file, "1.97.1"))), text);
+    let bare = check("cargo test -p trust-cg-opt").expect("hit");
+    let unpinned = refusal(&bare, None);
+    let pinned = refusal(&bare, Some((&file, "1.97.1")));
     assert!(
-        pinned.contains("This directory pins stock \"1.97.1\" (/r/rust-toolchain.toml)"),
+        pinned.contains(
+            "\nThis directory pins stock \"1.97.1\" (/r/rust-toolchain.toml); build it with the \
+             Trust spelling all the same.\n"
+        ),
         "{pinned}"
     );
-    assert_eq!(refusal(&hit, Some((file, "trust"))), text);
+    assert_eq!(refusal(&bare, Some((&file, "trust"))), unpinned);
+    // `$RUSTUP_TOOLCHAIN` is the environment, not the directory.
+    let env = refusal(&bare, Some((&PinSource::Env, "stable")));
+    assert!(
+        env.contains(
+            "\n$RUSTUP_TOOLCHAIN names stock \"stable\"; build with the Trust spelling all the \
+             same.\n"
+        ),
+        "{env}"
+    );
+    assert!(!env.contains("This directory"), "{env}");
     // A verb targo is not known to have: the spelling is offered as CONDITIONAL,
     // never as the command to run (measured: `targo nextest` is "no such command").
     let ext = refusal(&check("cargo nextest run -p x").expect("hit"), None);
-    assert!(ext.contains("not one targo is known to have"), "{ext}");
+    assert!(ext.contains("targo may not have this verb"), "{ext}");
     assert!(
-        ext.contains("IF targo has it, the Trust spelling is:\n  targo nextest run -p x\n"),
+        ext.contains("IF it does, the Trust spelling is:\n  targo nextest run -p x\n"),
         "{ext}"
     );
     assert!(ext.contains("no Trust spelling yet"), "{ext}");
@@ -566,7 +584,7 @@ fn the_refusal_names_the_trust_spelling_the_pin_and_the_escape() {
         !ext.contains("Run the Trust spelling of the same command"),
         "{ext}"
     );
-    assert!(!text.contains("not one targo is known to have"), "{text}");
+    assert!(!text.contains("targo may not have this verb"), "{text}");
     // One spelling, no lane: the linter.
     let lint = refusal(
         &check("cargo clippy --all-targets -- -D warnings").expect("hit"),
@@ -779,10 +797,8 @@ fn a_pin_is_read_the_way_rustup_reads_it() {
 }
 
 /// Pathological input is bounded, never a hang or a panic.
-/// NESTING PAST THE CAP IS REFUSED, NOT WAVED THROUGH (review of 2026-09-27):
-/// nine or more nested `$( )`, `bash -c` or `eval` levels around `cargo build`
-/// answered `Clean`, and this test pinned that as the design — a guard's own way
-/// past itself. Text past [`MAX_DEPTH`] is still not parsed, but a stock tool's
+/// NESTING PAST THE CAP IS REFUSED, NOT WAVED THROUGH: text past [`MAX_DEPTH`]
+/// is not parsed, but a stock tool's
 /// NAME in it is a hit marked [`Hit::unread`]; the escape in front of the command
 /// that runs it (`bash -c`, `eval`) clears it as it clears any hit inside, and
 /// deep text naming no stock tool stays clean. The cost, pinned too: past the cap
@@ -833,12 +849,13 @@ fn nesting_past_the_cap_is_refused_and_malformed_input_is_bounded() {
         );
     }
     let hit = check(&nest("bash", "cargo build", 12)).expect("refused");
-    let text = refusal(&hit, Some((Path::new("/r/rust-toolchain.toml"), "1.97.1")));
+    let file = PinSource::File("/r/rust-toolchain.toml".into());
+    let text = refusal(&hit, Some((&file, "1.97.1")));
     assert!(
-        text.starts_with("`cargo` appears in text nested more than 8 levels deep"),
+        text.starts_with("`cargo` is nested more than 8 levels deep"),
         "{text}"
     );
-    assert!(text.contains("flatten the command"), "{text}");
+    assert!(text.contains("Flatten the command"), "{text}");
     assert!(text.contains("The Trust tool for it:\n  targo\n"), "{text}");
     assert!(text.contains("ATERM_STOCK_REASON='<why>'"), "{text}");
     assert!(!text.contains("is stock Rust"), "{text}");
@@ -860,7 +877,7 @@ fn nesting_past_the_cap_is_refused_and_malformed_input_is_bounded() {
     assert_eq!(check("echo 'unterminated cargo build"), None);
 }
 
-/// A TRUST TOOLCHAIN CHOSEN BY ITS RUSTUP CHANNEL (review of 2026-09-27): `rustup
+/// A TRUST TOOLCHAIN CHOSEN BY ITS RUSTUP CHANNEL: `rustup
 /// run trust <tool>` is the spelling `aterm help reroute` sanctions, and a Trust
 /// channel's `rustc`/`rustdoc` are that toolchain's trustc/trustdoc — so `rustup
 /// run trust rustc` and `rustc +trust` are not stock, as `<dir>/rustc` beside
@@ -890,6 +907,40 @@ fn a_trust_channels_own_rustc_and_rustdoc_are_not_stock() {
     ] {
         assert!(check(cmd).is_some(), "MISSED {cmd:?}");
     }
+    // A Trust channel's cargo is that toolchain's compatibility cargo, never "stock
+    // Rust"; and a channel the command names outranks the directory's pin.
+    let file = PinSource::File("/r/rust-toolchain.toml".into());
+    for (cmd, first) in [
+        (
+            "cargo +trust build",
+            "`cargo +trust build` is the compatibility cargo of rustup's trust toolchain: \
+             upstream cargo's surface, which names no lane.\n",
+        ),
+        (
+            "rustup run trust-45040366 cargo build",
+            "`rustup run trust-45040366 cargo build` is the compatibility cargo of rustup's \
+             trust-45040366 toolchain: upstream cargo's surface, which names no lane.\n",
+        ),
+    ] {
+        let hit = check(cmd).expect("hit");
+        assert!(hit.compat, "{cmd:?}");
+        let text = refusal(&hit, Some((&file, "1.97.1")));
+        assert!(text.starts_with(first), "{text}");
+        assert!(!text.contains("is stock Rust"), "{text}");
+        assert!(!text.contains("pins stock"), "{text}");
+        assert!(text.contains("\n  targo trust build "), "{text}");
+    }
+    for cmd in ["cargo +stable build", "rustup run 1.97.1 cargo build"] {
+        let hit = check(cmd).expect("hit");
+        assert!(!hit.compat, "{cmd:?}");
+        let text = refusal(&hit, Some((&file, "1.97.1")));
+        assert!(text.contains("is stock Rust"), "{text}");
+        assert!(!text.contains("pins stock"), "{text}");
+    }
+    assert!(
+        !check("rustup run trust rustfmt a.rs").expect("hit").compat,
+        "a Trust toolchain ships no rustfmt"
+    );
 }
 
 fn shell_quote(s: &str) -> String {
@@ -905,9 +956,7 @@ fn shell_quote(s: &str) -> String {
     q
 }
 
-/// THE REVIEWER'S PROBES (2026-09-24, review of tc-engines-a): the interim
-/// `~/.claude/hooks/trust-toolchain-guard.py` passes its own (then 33) cases and let no
-/// allow probe through, but MISSED 13 command shapes — the compound-command
+/// THE REVIEWER'S PROBES: 13 command shapes the interim guard missed — the compound-command
 /// keywords (`if`, `if !`, `while`, `until`), `timeout`, `xargs`, `find -exec`,
 /// wrappers that take options (`nice -n`, `env -u`, `caffeinate -i`, `stdbuf
 /// -oL`, `ionice`) and a leading redirection. Each is a way the shell runs the
@@ -980,9 +1029,7 @@ fn the_reviewers_thirteen_missed_shapes_are_read_and_the_allow_probes_still_pass
     }
 }
 
-/// THE tc-aterm REVIEW'S THREE FALSE POSITIVES AND ITS HEREDOC MISS
-/// (2026-09-24), each measured against the interim script too — which gave the
-/// same verdicts, so they were inherited, not introduced:
+/// THREE FALSE POSITIVES AND A HEREDOC MISS, each shared with the interim script:
 /// * `${DIR}/cargo` — the reader split simple commands on `{`/`}` anywhere, so
 ///   the parameter expansion yielded a segment `/cargo`;
 /// * a multi-line `case` arm `cargo)` — the `)` closing a case PATTERN was read

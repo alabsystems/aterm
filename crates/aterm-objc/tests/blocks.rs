@@ -92,15 +92,12 @@ fn foundation_invokes_an_arity_two_block() {
     // completion handler has.
     let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&lines);
-    // The `stop` out-parameter is `BOOL *`, and it used to be spelled
-    // `*mut bool` here — [`Bool`]'s rule broken through a pointer. On the
-    // x86_64 compat slice Foundation writes a `signed char` into that byte, so
-    // materialising it as a Rust `bool` is undefined behaviour rather than a
-    // wrong answer. The `Encode` bound this pass put on `RcBlock::newN` is what
-    // refuses `*mut bool`; `*mut Bool` is the only spelling that compiles, and
-    // its encoding is `^B` on arm64 and `^c` on x86_64 (measured against
-    // Foundation's own compiled signatures: clang encodes the `BOOL` typedef,
-    // never the `char *` it aliases — see `BOOL_PTR_ENCODING`).
+    // The `stop` out-parameter is `BOOL *`. On the x86_64 compat slice
+    // Foundation writes a `signed char` into that byte, so `*mut bool` would be
+    // undefined behaviour; `RcBlock::newN`'s `Encode` bound refuses it, and
+    // `*mut Bool` is the only spelling that compiles. Its encoding is `^B` on
+    // arm64 and `^c` on x86_64 (clang encodes the `BOOL` typedef, never the
+    // `char *` it aliases — see `BOOL_PTR_ENCODING`).
     // SAFETY: the prototype below is exactly what AppKit documents for
     // `enumerateLinesUsingBlock:`.
     let block = unsafe {
@@ -253,7 +250,9 @@ fn the_runtime_agrees_a_block_is_an_objc_object() {
 unsafe extern "C" {
     fn CFRunLoopGetCurrent() -> *mut c_void;
     fn CFRunLoopPerformBlock(rl: *mut c_void, mode: *const c_void, block: *mut c_void);
-    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: bool) -> i32;
+    // `Boolean` is `unsigned char`: declared as `u8`, like the suite's other
+    // declaration of this symbol (`conformance_wake_timer`), so the two agree.
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
     static kCFRunLoopDefaultMode: *const c_void;
 }
 
@@ -302,7 +301,7 @@ fn cfrunloopperformblock_takes_its_own_reference() {
     );
 
     // SAFETY: draining the default mode for a bounded time on this thread.
-    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false) };
+    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, 0) };
 
     assert_eq!(
         hits.load(Ordering::SeqCst),

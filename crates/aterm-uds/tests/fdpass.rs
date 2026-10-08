@@ -1,29 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `SCM_RIGHTS` descriptor passing against a real kernel — the transport the
-//! seamless handoff needs once the successor is a LaunchServices instance with
-//! its own launchd job instead of a fork child, and therefore inherits no
-//! descriptor table to find PTY masters in.
+//! `SCM_RIGHTS` descriptor passing against a real kernel: the transport the
+//! seamless handoff uses when the successor is not a fork child and inherits
+//! no descriptor table.
 //!
-//! Every assertion here is one of the measured facts `aterm_uds::fdpass` is
-//! built on, run rather than cited:
+//! Each test checks one fact `aterm_uds::fdpass` relies on:
 //!
-//! * descriptors arrive at DIFFERENT numbers naming the SAME open file
-//!   descriptions — asserted via `fstat` identity AND a shared file offset,
-//!   because the offset is a property of the open file description and a
-//!   fresh `open` of the same path would not share it. This is exactly why
-//!   the handoff's adoption proof may not name a descriptor number once the
-//!   masters travel here;
-//! * `FD_CLOEXEC` is FALSE on arrival (Darwin has no `MSG_CMSG_CLOEXEC`), so
-//!   the receiver must set it itself, immediately;
-//! * an over-budget receive is REFUSED and leaks nothing — the descriptors
-//!   the kernel installed before we could refuse are all closed again.
+//! * descriptors arrive at different numbers naming the same open file
+//!   descriptions, asserted via `fstat` identity and a shared file offset (a
+//!   fresh `open` of the same path would not share the offset);
+//! * `FD_CLOEXEC` is clear on arrival (Darwin has no `MSG_CMSG_CLOEXEC`), so
+//!   the receiver must set it itself;
+//! * an over-budget receive is refused and leaks nothing.
 //!
-//! Descriptor-count assertions are process-wide, so every test in this file
-//! takes [`serial`]: cargo runs these in parallel threads of ONE process, and
-//! another test opening a file mid-count would make the leak assertion read
-//! like a leak.
+//! Descriptor counts are process-wide and tests run as threads of one
+//! process, so every test takes [`serial`].
 #![cfg(any(
     target_vendor = "apple",
     all(
@@ -56,8 +48,7 @@ const FD_CLOEXEC: i32 = 1;
 const PROBE_LIMIT: RawFd = 1024;
 
 /// Serialize this file's tests: the descriptor-count probes are process-wide.
-/// Poisoning is deliberately ignored — one failing test must not turn every
-/// other test in the file into a cascade of lock panics.
+/// Poisoning is ignored, so one failing test does not cascade into the rest.
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(PoisonError::into_inner)
@@ -85,9 +76,8 @@ fn seeded_file(dir: &std::path::Path, name: &str, offset: u64) -> File {
     f
 }
 
-/// The `fstat`-derived identity of an open file: what survives a descriptor
-/// transfer, unlike the number. (`st_rdev` is the PTY twin of this — every
-/// `/dev/ptmx` open takes its own minor.)
+/// The `fstat`-derived identity of an open file, which survives a descriptor
+/// transfer, unlike the number.
 fn identity(f: &File) -> (u64, u64) {
     let m = f.metadata().expect("fstat");
     (m.dev(), m.ino())
@@ -102,9 +92,8 @@ fn open_descriptor_count() -> usize {
         .count()
 }
 
-/// How many of this process's descriptors name `(dev, ino)`. Sharper than the
-/// bare count for a leak assertion — it cannot be perturbed by an unrelated
-/// descriptor, only by another copy of the very file that was passed.
+/// How many of this process's descriptors name `(dev, ino)`: unlike the bare
+/// count, only another copy of the passed file can perturb it.
 fn descriptors_naming(want: (u64, u64)) -> usize {
     (0..PROBE_LIMIT)
         .filter(|&fd| {
@@ -125,10 +114,9 @@ fn descriptor_flags(fd: RawFd) -> i32 {
     unsafe { fcntl(fd, F_GETFD) }
 }
 
-/// THE property the handoff buys with this transport: three descriptors ride
-/// one message, and each arrives as the SAME OPEN FILE DESCRIPTION at a
-/// DIFFERENT number. Identity is `fstat`-derived (never the number), and the
-/// shared file offset is the part a re-`open` of the same path could not fake.
+/// Three descriptors ride one message and each arrives as the same open file
+/// description at a different number: `fstat` identity matches and the file
+/// offset is shared (which a re-`open` of the path could not fake).
 #[test]
 fn three_descriptors_arrive_as_the_same_open_file_descriptions() {
     let _guard = serial();
@@ -180,9 +168,9 @@ fn three_descriptors_arrive_as_the_same_open_file_descriptions() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `FD_CLOEXEC` is false on arrival and Darwin has no `MSG_CMSG_CLOEXEC`, so
-/// the receiver sets it itself. The sender's own flag is CLEARED first, which
-/// kills the "it was just inherited" reading of a passing test as well.
+/// `FD_CLOEXEC` is set by the receiver: it is clear on arrival (Darwin has no
+/// `MSG_CMSG_CLOEXEC`), and the sender's own flag is cleared first so the
+/// result cannot be inherited.
 #[test]
 fn received_descriptors_are_close_on_exec_on_arrival() {
     let _guard = serial();
@@ -206,11 +194,10 @@ fn received_descriptors_are_close_on_exec_on_arrival() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The measured trap: a receiver that budgets for fewer descriptors than were
-/// sent still ends up with the extras in its table. So an over-count is
-/// refused, and the refusal closes everything — the process is left exactly as
-/// it was, both in total descriptors and in descriptors naming the passed
-/// file.
+/// A receiver that budgets for fewer descriptors than were sent still gets the
+/// extras installed, so an over-count is refused and the refusal closes
+/// everything: total descriptors and descriptors naming the passed file are
+/// unchanged.
 #[test]
 fn an_over_budget_receive_is_refused_without_leaking_descriptors() {
     let _guard = serial();
@@ -247,10 +234,9 @@ fn an_over_budget_receive_is_refused_without_leaking_descriptors() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The two degenerate shapes the handoff's read loop still has to survive: a
-/// message carrying no descriptors at all (an ordinary write, which must not
-/// read as a truncated control message), and a hung-up peer, which must read
-/// as EOF rather than as an error or an empty success that loops forever.
+/// A message with no descriptors (an ordinary write) does not read as a
+/// truncated control message, and a hung-up peer reads as EOF, not an error
+/// or an empty success that loops forever.
 #[test]
 fn a_plain_message_and_a_hangup_are_ordinary_receives() {
     let _guard = serial();
@@ -269,9 +255,6 @@ fn a_plain_message_and_a_hangup_are_ordinary_receives() {
 }
 
 /// The kernel-attested peer pid over a real bind/connect/accept, on both ends.
-/// Unforgeable identity is the point: it is what lets the handoff trust a
-/// process it did not fork, paired with the birth record that rules out a
-/// recycled pid.
 #[test]
 fn peer_pid_is_the_kernel_attested_peer() {
     let _guard = serial();
@@ -289,9 +272,9 @@ fn peer_pid_is_the_kernel_attested_peer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Caller misuse is refused BEFORE the kernel is asked — proved by the peer
-/// seeing nothing at all afterwards. A zero-length `sendmsg` would otherwise
-/// transfer nothing on Linux while still consuming the descriptors.
+/// Caller misuse is refused before the kernel is asked: the peer sees nothing
+/// afterwards. A zero-length `sendmsg` would transfer nothing on Linux while
+/// consuming the descriptors.
 #[test]
 fn misuse_is_refused_before_the_kernel_is_asked() {
     let _guard = serial();

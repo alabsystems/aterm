@@ -38,7 +38,7 @@
 //!    (`frac_zero_is_identity`). This is the raster-invariance PROVE bullet.
 //! 2. **Chrome invariance.** For ANY `frac`, every pixel with a row index outside
 //!    `[y0, y1)` is byte-identical to the input; only the grid band is rewritten
-//!    (`chrome_pixels_are_invariant`, `only_the_band_is_written`). The abstract
+//!    (`chrome_pixels_are_invariant`). The abstract
 //!    twin is `aterm_spec::derive::grid_translate_model` (a row shifts IFF it is
 //!    in the grid band), proven by the real `ty` at `Buggy=0` and counterexampled
 //!    by a mutant that leaks the shift onto a chrome row (`Buggy=1`).
@@ -126,24 +126,21 @@ pub fn grid_band_px(
 /// * **POSITIVE — shift UP** (the whole-row glide residual: content glides up,
 ///   the row scrolling in from BELOW appears at the bottom). Destination row
 ///   `dy ∈ [y0, y1)` takes source row `dy + |frac|` when that source is still
-///   within the band; the bottom `|frac|` rows are the exposed strip. The copy
-///   walks the band top-DOWN and every source row (`dy + |frac|`) sits strictly
-///   BELOW the destination it feeds, so no source row is read after being
-///   overwritten.
+///   within the band; the bottom `|frac|` rows are the exposed strip.
 /// * **NEGATIVE — shift DOWN** (the elastic overscroll bounce at the history
 ///   TOP, and the snap-to-bottom rubber-band: content sags down, exposing a strip
 ///   at the TOP). Destination row `dy` takes source row `dy - |frac|` when that
 ///   source is still within the band; the TOP `|frac|` rows are the exposed
-///   strip. The copy walks the band bottom-UP so every source row (`dy - |frac|`,
-///   strictly ABOVE the destination) is read before being overwritten.
+///   strip.
 ///
 /// Either way the exposed strip retains the band's own content as a placeholder
 /// — the down-bounce's rubber-band gap, and the up-glide's bottom strip until
 /// [`paint_incoming_strip`] lays the incoming row over it (the same order on
 /// both backends). `|frac| >= band_h` exposes
-/// the whole band (no in-band source survives). Because the in-place walk order
-/// matches the shift direction, the move equals a copy from a pristine snapshot
-/// (proven by `matches_out_of_place`, both signs).
+/// the whole band (no in-band source survives). Each direction's moved rows are
+/// ONE contiguous `copy_within` (memmove), which reads the pristine source even
+/// where source and destination overlap, so the move equals a copy from a
+/// pristine snapshot (proven by `matches_out_of_place`, both signs).
 ///
 /// `frac_px == 0` is a literal no-op (every row copies onto itself, none exposed)
 /// — the identity that makes a whole-row-jump frame byte-identical.
@@ -156,27 +153,17 @@ pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: us
     // The number of destination rows that pull from a still-in-band source; the
     // remaining `min(mag, band_h)` rows at the exposed edge are the placeholder.
     let moved = band_h.saturating_sub(mag);
+    if moved == 0 {
+        return;
+    }
     if frac_px > 0 {
-        // Shift UP: dst pulls from `dst + mag` (below). Walk top-DOWN — every
-        // source sits strictly below its destination, read before overwrite.
-        for i in 0..moved {
-            let dst = y0 + i;
-            let src = dst + mag; // < y1 by construction (i < band_h - mag)
-            debug_assert!(src < y1, "source row must stay inside the band");
-            // Rows are disjoint (dst < src) but `copy_within` tolerates overlap anyway.
-            buf.copy_within(src * w..src * w + w, dst * w);
-        }
-        // The bottom `band_h - moved` rows keep their existing pixels (placeholder).
+        // Shift UP: rows `[y0, y0 + moved)` take `[y0 + mag, y1)` (below) in ONE
+        // memmove. The bottom `band_h - moved` rows keep their pixels (placeholder).
+        buf.copy_within((y0 + mag) * w..y1 * w, y0 * w);
     } else {
-        // Shift DOWN: dst pulls from `dst - mag` (above). Walk bottom-UP — every
-        // source sits strictly above its destination, read before overwrite.
-        for i in 0..moved {
-            let dst = y1 - 1 - i;
-            let src = dst - mag; // >= y0 by construction (i < band_h - mag)
-            debug_assert!(src >= y0, "source row must stay inside the band");
-            buf.copy_within(src * w..src * w + w, dst * w);
-        }
-        // The top `band_h - moved` rows keep their existing pixels (placeholder).
+        // Shift DOWN: rows `[y0 + mag, y1)` take `[y0, y0 + moved)` (above) in ONE
+        // memmove. The top `band_h - moved` rows keep their pixels (placeholder).
+        buf.copy_within(y0 * w..(y0 + moved) * w, (y0 + mag) * w);
     }
 }
 

@@ -14,22 +14,21 @@
 #![cfg(unix)]
 
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     prefix: PathBuf,
 }
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "atpkg-packages-log-lanes-{}-{case}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-packages-log-lanes-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let prefix = atpkg::store::default_prefix(&home);
         let layout = atpkg::store::Layout {
@@ -52,7 +51,7 @@ impl Fixture {
     }
 
     fn state_home(&self) -> PathBuf {
-        self.root.join("aterm-state")
+        self.root.path().join("aterm-state")
     }
 
     fn log_under(&self, state_home: Option<PathBuf>) -> PathBuf {
@@ -60,7 +59,7 @@ impl Fixture {
             state_home,
             aterm_types::dirs::StatePlatform {
                 home: Some(self.home.clone()),
-                xdg_state_home: Some(self.root.join("state")),
+                xdg_state_home: Some(self.root.path().join("state")),
                 local_app_data: None,
             },
         )
@@ -72,8 +71,8 @@ impl Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.args(args)
             .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("ATERM_STATE_HOME", self.state_home())
             .env_remove("ATPKG_DISABLE")
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
@@ -91,12 +90,6 @@ impl Fixture {
         text.lines()
             .map(|l| atpkg::packages_log::parse_line(l).unwrap_or_else(|| panic!("{l:?}")))
             .collect()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -199,6 +192,28 @@ fn concurrent_appender_child() {
     }
 }
 
+/// A child reaped on EVERY path. [`Self::wait`] is the passing one; any other — a later
+/// spawn that failed, a wait that erred, an assertion that fired — kills it (SIGKILL) and
+/// reaps it as this guard drops, which is before the scratch it appends into goes: a child
+/// still appending when the scratch is removed makes its directory again, outside anything
+/// that removes it.
+struct Reaped(Child);
+
+impl Reaped {
+    fn wait(&mut self) -> ExitStatus {
+        self.0.wait().expect("wait for the appender")
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        // Neither does anything to a child `wait` already reaped: `Child` keeps its
+        // status, and `kill` signals no process once it has one.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// TWO PROCESSES APPENDING AT ONCE interleave whole lines, never halves: every line in the
 /// file parses, and each process's count is all there.
 ///
@@ -210,24 +225,32 @@ fn concurrent_appender_child() {
 /// Cargo runs test binaries one after another, so no library test runs beside this one.
 #[test]
 fn two_processes_appending_at_once_interleave_whole_lines() {
-    let dir = std::env::temp_dir().join(format!(
-        "atpkg-packages-log-concurrent-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("atpkg-packages-log-concurrent-")
+        .tempdir()
+        .unwrap();
+    let dir = scratch.path();
     let exe = std::env::current_exe().unwrap();
     let spawn = || {
-        Command::new(&exe)
-            .args(["--exact", "concurrent_appender_child", "--test-threads=1"])
-            .env("ATPKG_TEST_LOG_APPENDER_DIR", &dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap()
+        Reaped(
+            Command::new(&exe)
+                .args(["--exact", "concurrent_appender_child", "--test-threads=1"])
+                .env("ATPKG_TEST_LOG_APPENDER_DIR", dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn an appender"),
+        )
     };
-    let (mut a, mut b) = (spawn(), spawn());
-    assert!(a.wait().unwrap().success() && b.wait().unwrap().success());
+    // Each child is a guard from its spawn on, so `a` is reaped even when `b`'s spawn
+    // fails; and both are reaped before either is judged.
+    let mut a = spawn();
+    let mut b = spawn();
+    let (status_a, status_b) = (a.wait(), b.wait());
+    assert!(
+        status_a.success() && status_b.success(),
+        "{status_a:?} {status_b:?}"
+    );
     let text = std::fs::read_to_string(dir.join(atpkg::packages_log::LOG_NAME)).unwrap();
     let mut per_pid = std::collections::BTreeMap::<u32, usize>::new();
     for line in text.lines() {
@@ -238,5 +261,4 @@ fn two_processes_appending_at_once_interleave_whole_lines() {
     }
     assert_eq!(per_pid.len(), 2, "{per_pid:?}");
     assert!(per_pid.values().all(|n| *n == 400), "{per_pid:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }

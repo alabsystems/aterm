@@ -2,19 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! The Windows console driver for the `aterm` passthrough binary — the ConPTY
-//! twin of `driver_unix.rs` behind the same four-function surface.
+//! twin of `driver_unix.rs` behind the same three-function surface.
 //!
-//! Raw mode is the VT console-mode pair: `ENABLE_VIRTUAL_TERMINAL_INPUT` on
-//! stdin (the console then synthesizes full VT escape sequences as character
-//! streams, so arrows/F-keys arrive as bytes — the same transparency as the
-//! unix byte pipe) and `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout.
+//! Raw mode is `ENABLE_VIRTUAL_TERMINAL_INPUT` on stdin (keys arrive as VT
+//! byte sequences) and `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout.
 //! Keystrokes arrive as `ReadConsoleInputW` records on an input thread, and
-//! `WINDOW_BUFFER_SIZE_EVENT` is the SIGWINCH analogue — it rides the same
-//! single input source the way SIGWINCH rides the unix poll loop: the ConPTY
-//! is resized promptly (it must repaint), exactly as the unix `TIOCSWINSZ` is.
-//! Nothing in this process models the screen.
-//! Direct `unsafe extern "system"` kernel32 FFI only — the approved std-only
-//! pattern; no ConPTY calls live here (those are aterm-pty's seam).
+//! `WINDOW_BUFFER_SIZE_EVENT` (the SIGWINCH analogue) resizes the ConPTY
+//! promptly so it repaints. Nothing here models the screen. Direct kernel32
+//! FFI only; ConPTY calls live in aterm-pty's seam.
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -53,9 +48,8 @@ const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
 const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
 const DISABLE_NEWLINE_AUTO_RETURN: u32 = 0x0008;
 
-/// UTF-8 (`chcp 65001`): ConPTY output is UTF-8 and `WriteFile` to a console
-/// decodes bytes in the OUTPUT codepage, so the session pins it (restored on
-/// drop by [`RawGuard`]).
+/// UTF-8 (`chcp 65001`): ConPTY output is UTF-8 and `WriteFile` decodes in the
+/// output codepage, so the session pins it (restored by [`RawGuard`]).
 const UTF8_CODEPAGE: u32 = 65001;
 
 // Layout-only fields (present so the C struct sizes/offsets are right, never
@@ -96,9 +90,8 @@ struct KeyEventRecord {
     _control_key_state: u32,
 }
 
-/// The `INPUT_RECORD.Event` C union. Only the KEY_EVENT arm is read; the
-/// `pad` arm pins the union to the C size (16 bytes — MOUSE_EVENT_RECORD,
-/// the largest member, ties KEY_EVENT_RECORD at 16).
+/// The `INPUT_RECORD.Event` C union. Only the KEY_EVENT arm is read; `pad`
+/// pins the union to its C size (16 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 union EventUnion {
@@ -131,49 +124,34 @@ pub(crate) fn host_winsize() -> (u16, u16) {
     (24, 80)
 }
 
-/// Whether stdout is a console (`doctor`'s tty check): `GetConsoleMode`
-/// succeeds only on a real console handle — the classic isatty analogue
-/// (redirected pipes/files fail it).
-pub(crate) fn stdout_is_tty() -> bool {
-    // SAFETY: mode query on the process stdout handle with a valid out-param.
-    unsafe {
-        let h = GetStdHandle(STD_OUTPUT_HANDLE);
-        let mut mode = 0u32;
-        h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mut mode) != 0
+/// Whether `path` names a runnable shell. Windows has no `access(X_OK)`;
+/// execute permission is an ACL/PATHEXT question, so the path must only name
+/// a file.
+pub(crate) fn shell_check(path: &str) -> crate::ShellCheck {
+    let path = std::path::Path::new(path);
+    if path.is_file() {
+        crate::ShellCheck::Runs
+    } else if path.exists() {
+        crate::ShellCheck::NotExecutable
+    } else {
+        crate::ShellCheck::Missing
     }
 }
 
-/// Whether `path` names a runnable shell. Windows has no `access(X_OK)`;
-/// execute permission is an ACL/PATHEXT question, so this is the same honest
-/// downgrade aterm-dev uses: the file must exist.
-pub(crate) fn shell_is_executable(path: &str) -> bool {
-    std::path::Path::new(path).is_file()
-}
-
-/// The interactive shell the WINDOW spawns on this machine, and where it came
-/// from — what `aterm doctor` and `show-config` report on Windows.
+/// The interactive shell the window spawns on this machine and where it came
+/// from, as reported by `aterm doctor` and `show-config` on Windows.
 ///
-/// Before 2026-09-22 both reported this PROCESS's `$SHELL`, falling back to
-/// `%COMSPEC%`: measured inside a pwsh 7 tab, `aterm doctor` said
-/// `shell: C:\WINDOWS\system32\cmd.exe (executable)` and from Git Bash it said
-/// `bash.exe` — the shell the CLI was typed into, never the one a tab gets.
-/// `aterm-pty`'s Windows spawn reads neither variable (`%SHELL%` is a POSIX
-/// path in MSYS shells; see its `windows::shell`), so the report is the
-/// spawn's own answer.
-///
-/// INSIDE A TAB that answer is the tab's: the window hands every shell tab the
-/// program it runs ([`aterm_types::domain::ENV_TAB_SHELL`]), so a window
-/// started with `--shell cmd` reports cmd.exe as "this tab's shell". Measured
-/// 2026-09-27 on 0.95.0, before the hand-off: `aterm doctor` in such a tab
-/// named pwsh as "the window's shell" — a window's `--shell` flag is invisible
-/// to a CLI process. OUTSIDE a tab it is what a NEW window would run, from the
-/// spawn's resolver over the one input a CLI process can see: aterm.toml's
-/// `shell`, and with none set the platform default — `pwsh`, then
-/// `powershell`, then `%COMSPEC%`, then `cmd.exe`.
+/// `aterm-pty`'s Windows spawn reads neither `$SHELL` (a POSIX path in MSYS
+/// shells) nor `%COMSPEC%` first, so the report is the spawn's own answer.
+/// Inside a tab it is the tab's shell, handed over by the window
+/// ([`aterm_types::domain::ENV_TAB_SHELL`]), since a window's `--shell` flag is
+/// invisible to a CLI process. Outside a tab it is what a new window would run:
+/// aterm.toml's `shell`, else the platform default (`pwsh`, `powershell`,
+/// `%COMSPEC%`, `cmd.exe`).
 pub(crate) struct WindowShell {
     /// The program `CreateProcessW` is handed: an absolute path when the name
     /// resolved (or was given as one), the bare name verbatim when it did not —
-    /// which [`shell_is_executable`] then reports as missing, exactly as the
+    /// which [`shell_check`] then reports as missing, exactly as the
     /// spawn would fail.
     pub(crate) program: String,
     /// Which input decided it.
@@ -188,9 +166,9 @@ pub(crate) enum ShellSource {
     Tab,
     /// aterm.toml's top-level `shell` key, carrying its value.
     Config(String),
-    /// Nothing named one: the platform default, plus what aterm.toml said —
-    /// [`ConfigShell::Unusable`] is worth a word, because the window then runs
-    /// on defaults after logging a problem the user may not have seen.
+    /// Nothing named one: the platform default, plus what aterm.toml said
+    /// ([`ConfigShell::Unusable`] is reported, since the window then runs on
+    /// defaults).
     Default(aterm_pty::ShellOrigin, ConfigShell),
 }
 
@@ -203,14 +181,10 @@ pub(crate) enum ConfigShell {
     Absent,
     /// `shell = "<name or path>"`.
     Set(String),
-    /// The file exists but the window cannot take it — unreadable, not TOML, or
-    /// `shell` is not a string. The window logs the problem and runs on
-    /// defaults (`app_config::load_config` → `Config::stand_in`), so the default
-    /// is what this reports too. One case it cannot see: a value ANOTHER key's
-    /// type refuses (`tab_title_format = "title_only"` — the window's typed
-    /// `Config` rejects the whole file for it) also sends the window to
-    /// defaults, and only that `Config`, in a crate this one does not link,
-    /// knows every key's type. `aterm --window --validate-config` names it.
+    /// The file exists but the window cannot take it (unreadable, not TOML, or
+    /// `shell` not a string), so the window runs on defaults and so does this
+    /// report. Not detected: another key with the wrong type, which also sends
+    /// the window to defaults; `aterm --window --validate-config` names it.
     Unusable(String),
 }
 
@@ -222,9 +196,8 @@ impl WindowShell {
         Self::from_tab(tab).unwrap_or_else(|| Self::resolve_with(config_shell()))
     }
 
-    /// The tab's own shell, from the value its window handed it — `None` when
-    /// there is none (outside a tab, or in a `-e` session, which is handed
-    /// none) or it is empty.
+    /// The tab's own shell from the value its window handed it; `None` outside
+    /// a tab, in a `-e` session, or when empty.
     pub(crate) fn from_tab(value: Option<String>) -> Option<Self> {
         value
             .filter(|program| !program.is_empty())
@@ -235,7 +208,7 @@ impl WindowShell {
     }
 
     /// The testable half: `config` is what aterm.toml said. Precedence is the
-    /// window's — config, then [`aterm_pty::select_shell_with_origin`]'s
+    /// window's: config, then [`aterm_pty::select_shell_with_origin`]'s
     /// defaults.
     pub(crate) fn resolve_with(config: ConfigShell) -> Self {
         let named: Option<(String, ShellSource)> = match &config {
@@ -263,11 +236,9 @@ impl WindowShell {
         }
     }
 
-    /// `doctor`'s label after the verdict — a sentence naming whose shell it is
-    /// and the input that chose it, so the row reads `shell: <program>
-    /// (executable) — this tab's shell` in a tab and `— a new window's default
-    /// shell, from …` outside one: a window launched with `--shell` runs that
-    /// instead, and only its own tabs can say so.
+    /// `doctor`'s label after the verdict, naming whose shell it is and the
+    /// input that chose it (`— this tab's shell` in a tab, `— a new window's
+    /// default shell, from …` outside).
     pub(crate) fn origin_sentence(&self) -> String {
         match &self.source {
             ShellSource::Tab => "this tab's shell".to_string(),
@@ -282,9 +253,8 @@ impl WindowShell {
                     aterm_pty::ShellOrigin::CmdLiteral => {
                         "cmd.exe verbatim; no pwsh, powershell or %COMSPEC%"
                     }
-                    // Unreachable through `resolve_with` (a named shell never
-                    // reaches the Default arm), spelled so a new variant cannot
-                    // render as nothing.
+                    // Unreachable through `resolve_with`; spelled so a new
+                    // variant cannot render as nothing.
                     aterm_pty::ShellOrigin::Override => "an override",
                 };
                 let why = match config {
@@ -326,10 +296,9 @@ fn config_shell() -> ConfigShell {
     }
 }
 
-/// The pure half of [`config_shell`]: the TOP-LEVEL `shell` key of one
-/// aterm.toml text, through `aterm_toml` — the parser the window loads the file
-/// with, so a duplicate key or a stray table is refused here exactly where the
-/// window refuses it. A key inside a table is not the key.
+/// The pure half of [`config_shell`]: the top-level `shell` key of one
+/// aterm.toml text, parsed with `aterm_toml` as the window does. A key inside
+/// a table does not count.
 pub(crate) fn config_shell_from_text(text: &str) -> ConfigShell {
     let table: aterm_toml::Table = match text.parse() {
         Ok(table) => table,
@@ -345,10 +314,9 @@ pub(crate) fn config_shell_from_text(text: &str) -> ConfigShell {
     }
 }
 
-/// RAII console raw-mode guard: swaps stdin/stdout into the VT passthrough
-/// modes (and the output codepage to UTF-8) and restores the originals on
-/// drop, so a panic or early return never leaves the host console raw —
-/// the analogue of the unix `set_raw`/`restore` termios pair.
+/// RAII console raw-mode guard: switches stdin/stdout to the VT passthrough
+/// modes (and the output codepage to UTF-8) and restores them on drop, the
+/// analogue of the unix termios pair.
 struct RawGuard {
     stdin: isize,
     stdout: isize,
@@ -370,8 +338,7 @@ impl RawGuard {
                 .then_some(mode);
             if let Some(orig) = stdin_orig {
                 // Raw keys + VT input synthesis + resize events; no line
-                // buffering, no echo, no ^C cooking (0x03 flows to the shell,
-                // like cfmakeraw).
+                // buffering, echo or ^C cooking (0x03 flows to the shell).
                 let raw = (orig
                     | ENABLE_VIRTUAL_TERMINAL_INPUT
                     | ENABLE_WINDOW_INPUT
@@ -420,11 +387,10 @@ impl Drop for RawGuard {
     }
 }
 
-/// Write `data` to the stdout HANDLE via `WriteFile`, looping like the unix
-/// `write_all`. Raw bytes on purpose: std's console writer requires each call
-/// to be whole valid UTF-8, which ConPTY read-chunk boundaries cannot
-/// guarantee; with the output codepage pinned to UTF-8 the console decodes
-/// split sequences correctly across calls.
+/// Write `data` to the stdout handle via `WriteFile`, looping like
+/// `write_all`. Raw bytes because std's console writer requires whole valid
+/// UTF-8 per call, which ConPTY read chunks cannot guarantee; with the UTF-8
+/// codepage the console decodes split sequences across calls.
 fn stdout_write_all(handle: isize, mut data: &[u8]) {
     while !data.is_empty() {
         let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
@@ -447,10 +413,9 @@ fn stdout_write_all(handle: isize, mut data: &[u8]) {
     }
 }
 
-/// Append one UTF-16 code unit to `out` as UTF-8, pairing surrogates across
-/// calls: `pending` holds a high surrogate whose low half has not arrived yet
-/// (a pair CAN straddle two `ReadConsoleInputW` batches). Unpaired surrogates
-/// become U+FFFD rather than corrupting the byte stream.
+/// Append one UTF-16 code unit to `out` as UTF-8. `pending` holds a high
+/// surrogate awaiting its low half (a pair can straddle two
+/// `ReadConsoleInputW` batches); unpaired surrogates become U+FFFD.
 fn push_utf16_unit(unit: u16, pending: &mut Option<u16>, out: &mut Vec<u8>) {
     fn push_char(c: char, out: &mut Vec<u8>) {
         let mut buf = [0u8; 4];
@@ -478,9 +443,9 @@ fn push_utf16_unit(unit: u16, pending: &mut Option<u16>, out: &mut Vec<u8>) {
     }
 }
 
-/// Console-input pump (input thread): KEY_EVENT characters → UTF-8 → the PTY
-/// input; WINDOW_BUFFER_SIZE_EVENT → prompt ConPTY resize. Returns when the
-/// console goes away (the shell then runs to its own exit).
+/// Console-input pump (input thread): KEY_EVENT characters → UTF-8 → PTY;
+/// WINDOW_BUFFER_SIZE_EVENT → ConPTY resize. Returns when the console goes
+/// away.
 fn pump_console_input(stdin: isize, master: i32) {
     // SAFETY: zeroed PODs — every field of every record arm is plain data.
     let mut records: [InputRecord; 64] = unsafe { std::mem::zeroed() };
@@ -500,9 +465,8 @@ fn pump_console_input(stdin: isize, master: i32) {
                 KEY_EVENT => {
                     // SAFETY: the record tag says this arm is the key event.
                     let key = unsafe { rec.event.key };
-                    // Key-down records with a character (with VT input enabled
-                    // the console synthesizes escape sequences as char runs;
-                    // pure-modifier presses carry NUL and are skipped).
+                    // Key-down records with a character; pure-modifier
+                    // presses carry NUL and are skipped.
                     if key.key_down != 0 && key.unicode_char != 0 {
                         for _ in 0..key.repeat_count.max(1) {
                             push_utf16_unit(key.unicode_char, &mut pending, &mut bytes);
@@ -510,11 +474,9 @@ fn pump_console_input(stdin: isize, master: i32) {
                     }
                 }
                 WINDOW_BUFFER_SIZE_EVENT => {
-                    // The SIGWINCH analogue. Resize the ConPTY NOW — it must be
-                    // resized promptly so it repaints — reading the live window
-                    // rect (the event payload is the BUFFER size, not the
-                    // window). `aterm_pty::resize` is thread-safe on Windows per
-                    // the seam contract.
+                    // Resize from the live window rect (the event carries the
+                    // buffer size). `aterm_pty::resize` is thread-safe on
+                    // Windows.
                     let (rows, cols) = host_winsize();
                     aterm_pty::resize(master, rows, cols);
                 }
@@ -527,10 +489,8 @@ fn pump_console_input(stdin: isize, master: i32) {
     }
 }
 
-/// Piped-stdin pump (input thread): plain blocking byte passthrough — the
-/// non-tty/protected_spawn case, the direct analogue of the unix
-/// `read(STDIN_FILENO)` arm. EOF just ends the pump; the shell runs to its
-/// own exit (the unix `fds[0].fd = -1` behavior).
+/// Piped-stdin pump (input thread): blocking byte passthrough. EOF ends the
+/// pump; the shell runs to its own exit.
 fn pump_piped_input(master: i32) {
     use std::io::Read as _;
     let mut stdin = std::io::stdin().lock();
@@ -544,22 +504,19 @@ fn pump_piped_input(master: i32) {
 }
 
 /// Raw mode, the passthrough loop, resize forwarding, restore, reap: returns
-/// the shell's exit code (non-exit → 1, mirroring the unix `!WIFEXITED`).
+/// the shell's exit code (non-exit → 1).
 ///
-/// Input runs on a detached thread (it parks in `ReadConsoleInputW`/`read`
-/// with no portable cancellation; process exit reclaims it — the same way the
-/// unix driver's blocked reader ends). Output runs here: blocking ConPTY
-/// reads → host stdout passthrough.
+/// Input runs on a detached thread (it blocks in `ReadConsoleInputW`/`read`
+/// with no cancellation; process exit reclaims it). Output runs here: blocking
+/// ConPTY reads → stdout.
 pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let master = shell.master;
     let guard = RawGuard::install();
     let stdout = guard.stdout;
     let stdin = guard.stdin;
 
-    // Piped/protected_spawn case: a non-CHAR stdin (pipe/file) cannot be
-    // ReadConsoleInputW'd — use plain blocking reads. A CHAR handle that is
-    // not a real console (GetConsoleMode failed, e.g. NUL) takes the same
-    // fallback.
+    // A pipe/file stdin, or a char handle that is not a console (e.g. NUL),
+    // cannot use ReadConsoleInputW, so it takes plain blocking reads.
     // SAFETY: type query on the process stdin handle.
     let stdin_is_console =
         unsafe { GetFileType(stdin) } == FILE_TYPE_CHAR && guard.stdin_orig.is_some();
@@ -588,9 +545,8 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     // Restore the console before anything else prints.
     drop(guard);
 
-    // Reap and read the exit code BEFORE close_master: close_master drops the
-    // session registry entry, after which exit_code/reap can no longer resolve
-    // the pid (same ordering as tests/windows_smoke.rs).
+    // Reap and read the exit code before `close_master`, which drops the
+    // registry entry the pid resolves through.
     aterm_pty::reap(shell.pid);
     let code = aterm_pty::exit_code(shell.pid).unwrap_or(1);
     aterm_pty::close_master(master);
@@ -608,11 +564,9 @@ mod tests {
         program.to_ascii_lowercase().ends_with(exe)
     }
 
-    /// The top-level `shell` key, and nothing that only looks like it: a
-    /// commented-out line, a key inside a table, an empty string (unset to the
-    /// window's resolver). A non-string or a file the window cannot parse is
-    /// UNUSABLE, because the window then runs on defaults — reporting the
-    /// configured name there would name a shell no tab gets.
+    /// Only the top-level `shell` key counts (not a commented line, a key in a
+    /// table, or an empty string). A non-string or unparseable file is
+    /// unusable, since the window then runs on defaults.
     #[test]
     fn config_shell_reads_the_top_level_key_the_window_reads() {
         assert_eq!(config_shell_from_text(""), ConfigShell::Absent);
@@ -660,7 +614,7 @@ mod tests {
     /// The window's precedence, over the spawn's resolver: aterm.toml outranks
     /// the platform default, and the program is what the spawn would run — an
     /// absolute path for a name that resolves, the bare name verbatim (hence
-    /// `not executable or missing`) for one that does not.
+    /// `does not exist`) for one that does not.
     #[test]
     fn window_shell_follows_the_windows_precedence_and_names_its_source() {
         let config = WindowShell::resolve_with(ConfigShell::Set("cmd".to_string()));
@@ -682,9 +636,10 @@ mod tests {
             missing.program, "aterm-no-such-shell-xyz",
             "an unresolved name is reported verbatim, as CreateProcessW receives it"
         );
-        assert!(
-            !shell_is_executable(&missing.program),
-            "…and the executable check then fails, so doctor says FAIL"
+        assert_eq!(
+            shell_check(&missing.program),
+            crate::ShellCheck::Missing,
+            "…and the shell check then fails, so doctor says FAIL"
         );
 
         let unusable =
@@ -731,14 +686,12 @@ mod tests {
         ) {
             assert_eq!(dflt.origin_token(), "default:pwsh");
             assert!(ends_with_exe(&dflt.program, "pwsh.exe"), "{}", dflt.program);
-            assert!(shell_is_executable(&dflt.program));
+            assert_eq!(shell_check(&dflt.program), crate::ShellCheck::Runs);
         }
     }
 
-    /// Inside an aterm tab the report is THAT TAB's shell, as its window handed
-    /// it over — a window started with `--shell cmd` said pwsh, "the window's
-    /// shell", on 0.95.0 (measured 2026-09-27) — and outside one (nothing
-    /// handed, or an empty value) it is a new window's default, as before.
+    /// Inside an aterm tab the report is that tab's shell as handed over;
+    /// outside (nothing handed, or empty) it is a new window's default.
     #[test]
     fn inside_a_tab_the_report_is_the_tabs_own_shell() {
         let cmd = r"C:\Windows\system32\cmd.exe".to_string();

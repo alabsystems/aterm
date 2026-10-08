@@ -13,6 +13,9 @@
 //! * `exit 3` at start: the instance stays up, `text` shows
 //!   `[zsh ended at start: exit 3]`, and `ls` still lists the session;
 //! * a `SIGKILL` at start (no crash report): `[fish ended at start: signal 9]`;
+//! * a shell that asks for the device attributes as it starts (fish and
+//!   powerlevel10k query at startup), reads aterm's answer, then `exit 1`:
+//!   `[fish ended at start: exit 1]` — aterm's reply is not anyone's input;
 //! * NEGATIVE CONTROLS: `exit 0` at start, and `-e false`, still end the
 //!   instance by themselves, as they did before.
 //!
@@ -20,11 +23,7 @@
 
 #![cfg(unix)]
 
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
-
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
+use crate::{child_output, headless_boot, launch_isolation};
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -35,7 +34,22 @@ use std::time::{Duration, Instant};
 const CEILING: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(50);
 
-/// A stub shell called `name` under `root/bin` that runs `body`.
+/// A stub shell called `name` under `root/bin` that runs `body`, already run
+/// once.
+///
+/// THE FIRST EXEC IS PAID HERE (2026-09-30), the repo's rule since bc2918c70
+/// (`aterm-verify`'s `tests/common` `run_once`, `aterm-cli`'s `manual.rs`):
+/// the first exec of a file this process wrote waits on macOS's assessment of
+/// it, one file at a time machine-wide, and later execs do not — 111 ms
+/// against 4.6 ms at load 11.7 here, many seconds with the assessor busy. The
+/// app keeps the pane only when the shell's PTY closed within 2 s of its
+/// spawn (`aterm-gui`'s `app_tabs.rs` `SHELL_START_WINDOW`), so a stub whose
+/// FIRST exec is that spawn spends the window in the assessor's queue: a
+/// whole-tree run of 2026-09-30 failed both kept-pane cases at 2.6 s and
+/// 2.9 s ("the instance ended with its shell"), and main's own two-at-a-time
+/// run of 2026-09-29 passed them at 2.05 s. An installed shell is not a fresh
+/// file, so this is also the faithful case. The run's status is not read:
+/// `exit 3` and `kill -KILL $$` end it as they will end the pane's.
 fn stub_shell(root: &Path, name: &str, body: &str) -> PathBuf {
     let dir = root.join("bin");
     std::fs::create_dir_all(&dir).expect("the stub's directory");
@@ -43,6 +57,11 @@ fn stub_shell(root: &Path, name: &str, body: &str) -> PathBuf {
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the stub shell");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .expect("make the stub shell executable");
+    let _ = Command::new(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     path
 }
 
@@ -55,8 +74,13 @@ fn ctl(inst: &headless_boot::Instance, args: &[&str]) -> Output {
         .arg(&inst.sock)
         .args(args)
         .stdin(Stdio::null())
-        .output()
-        .expect("run aterm ctl")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().expect("spawn aterm ctl");
+    // Read until the client exits (`support/child_output.rs`: a sibling's
+    // spawn can hold its pipes open).
+    child_output::wait_and_read(child, Instant::now() + CEILING)
+        .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
 }
 
 fn stdout(out: &Output) -> String {
@@ -121,6 +145,21 @@ fn a_shell_killed_at_start_keeps_its_pane_with_the_signal() {
         "fish",
         "kill -KILL $$",
         "[fish ended at start: signal 9]",
+    );
+}
+
+/// A shell that queried the terminal and got its answer before its rc
+/// failed: the reply aterm wrote does not count as someone using the shell.
+/// The stub reads the first byte of the reply before it exits, so the reply
+/// was written before the exit is judged.
+#[test]
+fn a_shell_that_queried_the_terminal_then_failed_keeps_its_pane() {
+    kept_with_line(
+        "atsxq",
+        "fish",
+        "printf '\\033[c'\nstty -icanon -echo min 1 time 0\n\
+         dd bs=1 count=1 >/dev/null 2>&1\nexit 1",
+        "[fish ended at start: exit 1]",
     );
 }
 

@@ -9,11 +9,8 @@ use aterm_spec::{derive::metal_drawable_acquire_model, verify};
 #[test]
 fn metal_drawable_acquire_proves_bounds_and_catches_blocking_stale_and_retirement_mutants() {
     let model = metal_drawable_acquire_model();
-    if let Err(verify::NotRun { model }) = verify::prove_and_catch_tiered(&model, model.name) {
-        eprintln!(
-            "TIER-0 SKIPPED (not a pass): `{model}` requires an unavailable external checker"
-        );
-    }
+    // A NotRun has already printed its own NOT RUN line.
+    let _ = verify::prove_and_catch_tiered(&model, model.name);
 }
 
 #[test]

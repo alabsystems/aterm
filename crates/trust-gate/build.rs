@@ -8,9 +8,9 @@
 // on a machine that also has rustup, atpkg maintains ~/.rustup/toolchains/trust
 // -> <prefix>/rustup/trust, its view of the store's current build, so rustup's
 // proxy resolves the same pin;
-// stated 2026-09-18) and .cargo/config.toml's verification opt-out is scoped to
+// stated 2026-09-18) and .cargo/config.toml's Trust-only flags are scoped to
 // that compiler by `[target.'cfg(trust_verify)']`, so an upstream rustc never
-// even sees the `-Z` flag. Before this crate, reaching an upstream rustc — a
+// even sees a `-Z` flag. Before this crate, reaching an upstream rustc — a
 // `RUSTUP_TOOLCHAIN=stable` override, a Homebrew cargo that ignores the pin, a
 // dangling `trust` link after a store swap — failed the build on whichever
 // first-party unit hit Trust-only syntax first: deep in the graph, with an error
@@ -22,7 +22,7 @@
 // not, so `-p <lib>` builds and the dev-only `[[bin]]` conveniences stay
 // ungated (there is no CI to build them — owner decision, docs/PROCESS.md); an
 // upstream compiler there fails, if at all, on genuine Trust-only syntax, never
-// on the opt-out flag.
+// on a Trust-only flag.
 //
 // THE MARKER and the TARGET == HOST rule are documented and unit-tested in
 // src/gate.rs (`is_trust_compiler`, `refusal`). Summary: `rustc -vV` from a
@@ -33,15 +33,14 @@
 // cfg-validation build are CROSS builds on upstream stable by design. An
 // x86_64 host cutting that slice would see TARGET == HOST and be refused, and
 // that is fine: buildplan hardcodes aarch64 as the native Trust slice and lipo
-// cannot join two x86_64 slices, so no release is ever cut there. The gate also
-// reads the tree's own committed pin and stands down only when it explicitly
-// names a non-trust channel (gate::tree_pins_trust — fail-closed on a missing
-// or channelless pin). That stand-down was made for the PUBLIC SNAPSHOT, whose
-// export swapped in a stock pin until 2026-09-29; the export now keeps
-// `channel = "trust"`, so both sanctioned trees enforce.
+// cannot join two x86_64 slices, so no release is ever cut there. Until
+// 2026-09-29 the gate also stood down for a tree whose committed pin named a
+// non-trust channel, for the PUBLIC SNAPSHOT's then-stock pin; the export now
+// keeps `channel = "trust"`, so the stand-down went and every tree enforces.
 //
 // Ends with `cargo:` directives only where they matter: the script re-runs when
-// cargo resolves a different compiler (RUSTC); a toolchain SWAP behind the same
+// cargo resolves a different compiler (RUSTC) or rustup picks another toolchain
+// (RUSTUP_TOOLCHAIN); a toolchain SWAP behind the same
 // path — the store's `current` link moving — re-fingerprints every unit anyway,
 // because cargo keys fingerprints on `rustc -vV`.
 
@@ -54,17 +53,7 @@ mod gate;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RUSTC");
-
-    // The tree's OWN pin decides whether this gate is armed. The dev workspace
-    // and, since 2026-09-29, the public snapshot pin `channel = "trust"` (the
-    // 2026-08-30 standing directive — enforce); only a tree whose committed pin
-    // explicitly names another channel stands it down. Fail-closed:
-    // missing/unreadable pin, or no channel line, still enforces
-    // (gate::tree_pins_trust).
-    let pin_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rust-toolchain.toml");
-    println!("cargo:rerun-if-changed={}", pin_path.display());
-    let pin = std::fs::read_to_string(&pin_path).ok();
+    println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
 
     let host = env::var("HOST").unwrap_or_default();
     let target = env::var("TARGET").unwrap_or_default();
@@ -72,9 +61,11 @@ fn main() {
     if host != target {
         return;
     }
-    // `RUSTC` is the compiler cargo resolved (rustup's proxy hands cargo the
-    // toolchain's absolute path; Homebrew's cargo says a bare `rustc`, which
-    // then resolves on the PATH cargo gave us — the same PATH its units use).
+    // `RUSTC` is the compiler cargo resolved — usually a bare `rustc`, under
+    // rustup's cargo and Homebrew's alike, which then resolves on the PATH cargo
+    // gave us (the same PATH its units use). Which toolchain rustup picked is
+    // `RUSTUP_TOOLCHAIN`, which rustup's proxy sets for cargo and its build
+    // scripts; unset means this cargo is not rustup's.
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     let verbose = match Command::new(&rustc).arg("-vV").output() {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -90,7 +81,7 @@ fn main() {
         &rustc.to_string_lossy(),
         &verbose,
         aterm_on_path(),
-        pin.as_deref(),
+        env::var("RUSTUP_TOOLCHAIN").ok().as_deref(),
     ) else {
         return;
     };
@@ -99,8 +90,8 @@ fn main() {
 }
 
 /// Is an `aterm` executable on this process's PATH? Decides the remedy: a
-/// machine with aterm has atpkg, and `aterm pkg doctor` re-links the toolchain;
-/// one without needs the installer.
+/// machine with aterm has atpkg's Trust toolchain (`targo`, and `aterm pkg
+/// repair` for rustup's `trust` link); one without needs the installer.
 fn aterm_on_path() -> bool {
     let Some(path) = env::var_os("PATH") else {
         return false;

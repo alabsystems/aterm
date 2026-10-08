@@ -9,14 +9,9 @@
 //! as the person meets them. Tier-1 is
 //! `aterm-gui/src/editor_carry_conformance.rs`.
 
-use aterm_spec::derive::{Model, native_update_editor_carry_model};
+use crate::walk::only;
+use aterm_spec::derive::native_update_editor_carry_model;
 use aterm_spec::{interp, verify};
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
 
 #[test]
 fn editor_carry_proves_catches_and_has_no_dead_action() {

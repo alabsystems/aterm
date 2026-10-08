@@ -1,34 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BOUNDED CHILD RUNNER — [`capture_bounded`], and nothing else.
-//!
-//! This module used to be the packaging contract and the alignment verdict
-//! (design `docs/DESIGN-aterm-wrapper-2026-09-17.md` §1.2, §3.1-§3.8):
-//! `harness.toml` admission, the probes, the per-capability verdict and the
-//! signed × local intersection, rendered by `aterm harness align|caps`. No
-//! publisher of a harness tree ever existed, no verdict it computed gated
-//! anything a session did, and the verbs and the row vocabulary in
-//! `atpkg::harness` were deleted with the second harness stack on 2026-09-23
-//! (§0.4 of that design). What stays is the one piece something still runs:
-//! the bounded subprocess [`super::disk`] reads `df` through. The name is
-//! kept because `disk` calls it by this path.
-//!
-//! # No background polling
+//! The bounded child runner, [`capture_bounded`], through which [`super::disk`]
+//! reads `df`.
 //!
 //! [`capture_bounded`] parks on stdout until its deadline, then checks a child
-//! that closed stdout but has not exited at a bounded 20 ms cadence. That
-//! short-lived reap check is what lets the caller keep the child handle and
-//! kill it at the same deadline; there is no resident timer or background
-//! scanner.
-//!
-//! STATUS (docs/README.md honesty ratchet): unit-tested, and the worker
-//! lifecycle is Tier-1 bound to `harness_capture_worker_lifecycle_model` in
-//! `aterm-spec` (the tests in `align_tests.rs` drive the real runner with an
-//! escaped descendant holding each pipe).
+//! that closed stdout but has not exited at a bounded 20 ms cadence, so the
+//! caller can kill it at the same deadline; there is no resident timer. The
+//! worker lifecycle is Tier-1 bound to `harness_capture_worker_lifecycle_model`
+//! in `aterm-spec` (`align_tests.rs`).
 
+use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -58,6 +41,10 @@ struct CaptureLifecycleObservation {
     child_reaped: AtomicBool,
     reader_done: AtomicBool,
     writer_done: AtomicBool,
+    /// Run once the child is spawned and before the deadline is taken: what a
+    /// test's child must have done by then (an escape test's holder, gone to
+    /// a session of its own) happens before the deadline whatever the load.
+    after_spawn: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(all(test, unix))]
@@ -94,22 +81,17 @@ impl Captured {
     }
 }
 
-/// Run one bounded child and hand back its stdout, or the SENTENCE that says why
-/// there is none — the shape a harness subprocess borrows, because a
-/// deadline-free `wait_with_output` is a hang waiting for a stale mount or a
-/// user command that loops.
+/// Run one bounded child and hand back its stdout, or the sentence that says
+/// why there is none: a deadline-free `wait_with_output` would hang on a stale
+/// mount or a looping command.
 ///
-/// The environment is CLEARED and rebuilt from `PATH`, `HOME`, `TMPDIR` plus
-/// whatever the caller already set on `cmd`, so a child cannot be steered by
-/// whatever the session happened to export. One thread reads stdout while
-/// this one blocks in `recv_timeout`; after EOF this thread checks `try_wait`
-/// only until the same absolute deadline. `stdin` is written on a thread of
-/// its own so a child that never reads cannot block the caller on a full pipe.
-/// On Unix both pipe workers use nonblocking descriptors and `poll` with this
-/// same deadline. A descendant that escapes the child's process group cannot
-/// leave a reader or writer thread behind by retaining an inherited pipe.
-/// The child gets a private process group so ordinary descendants are killed
-/// together at timeout.
+/// The environment is cleared and rebuilt from `PATH`, `HOME`, `TMPDIR` plus
+/// what the caller set on `cmd`. One thread reads stdout while this one blocks
+/// in `recv_timeout`, then checks `try_wait` until the same absolute deadline;
+/// `stdin` is written on its own thread. On Unix both pipe workers poll
+/// nonblocking descriptors against the deadline, so a descendant that escapes
+/// the process group with an inherited pipe leaves no thread behind. The child
+/// gets a private process group, killed together at timeout.
 ///
 /// # Errors
 ///
@@ -154,11 +136,19 @@ fn capture_bounded_impl(
         cmd.env(name, value);
     }
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
+    cmd.process_group(0);
     let mut child = cmd.spawn().map_err(|e| format!("it will not run: {e}"))?;
+    #[cfg(all(test, unix))]
+    if let Some(observer) = &observer {
+        let settle = observer
+            .after_spawn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(settle) = settle {
+            settle();
+        }
+    }
     let deadline = Instant::now() + budget;
     let mut writer = CaptureWriter::new(stdin.zip(child.stdin.take()), deadline, observer.clone());
     let Some(stdout) = child.stdout.take() else {
@@ -450,7 +440,7 @@ fn write_capture_pipe(
     Ok(())
 }
 
-/// Stop the child AND descendants that inherited its stdout, then reap the
+/// Stop the child and descendants that inherited its stdout, then reap the
 /// direct child. Killing only the direct child leaves a reader thread parked
 /// when a shell has already spawned a background process holding the pipe.
 fn kill_capture_child(child: &mut Child, observer: &CaptureObserver) {

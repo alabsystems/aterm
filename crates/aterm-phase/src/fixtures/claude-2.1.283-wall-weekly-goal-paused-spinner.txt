@@ -1,0 +1,13 @@
+# claude-code 2.1.283 · HAND-BUILT 2026-09-28 from claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt: the same weekly wall and goal echo, but a NEW turn is running (a spinner status row, `esc to interrupt` on the mode row) over the same `· 1 shell ·` footer — the negative control: a live turn outranks the wall, the screen is BUSY · a wall in the transcript, a live turn under it
+⏺ Dynamic workflow "an example wave" completed · 4h 42m 19s
+  ⎿  You've hit your weekly limit · resets 4pm (America/Los_Angeles)
+     Use your limit reset to reset it now: clau.de/reset
+     /usage-credits to finish what you’re working on.
+
+⏺ Goal paused · usage limit reached · send a message after it resets to continue
+
+✻ Cooking… (12s · ↓ 1.1k tokens · esc to interrupt)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xhigh ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · esc to interrupt · 1 shell · ← for agents

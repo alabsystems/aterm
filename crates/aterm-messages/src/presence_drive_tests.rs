@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
+use crate::chrome::{CHROME_REGROW_SETTLE, RegrowFloor};
 use crate::presence::drive::{self, Desk, Table};
 use crate::presence::{
     FOLD_LOOK_CAP, FOLD_QUIET, Facts, Hand, HoldFact, LeaseMark, Level, Rim, StoryVerb, TOLD_FLASH,
@@ -29,6 +30,9 @@ struct Win {
     key: bool,
     rows: u16,
     windowed: bool,
+    /// The window's chrome regrow floor ([`Desk::chrome_floor`]); a test
+    /// notes another source's rise (a band row) on it by hand.
+    regrow: RegrowFloor,
 }
 
 impl Win {
@@ -41,6 +45,7 @@ impl Win {
             key: true,
             rows: 24,
             windowed: true,
+            regrow: RegrowFloor::default(),
         }
     }
 }
@@ -242,6 +247,17 @@ impl Desk for TestDesk {
 
     fn grid_rows(&self, w: u32) -> Option<(u16, bool)> {
         self.wins.get(&w).map(|x| (x.rows, x.windowed))
+    }
+
+    fn chrome_floor(&self, w: u32) -> Option<Instant> {
+        self.wins.get(&w).and_then(|x| x.regrow.floor())
+    }
+
+    fn chrome_rose(&mut self, w: u32, now: Instant) {
+        if let Some(x) = self.wins.get_mut(&w) {
+            x.regrow.rose(now);
+        }
+        self.note(format!("rose {w}"));
     }
 
     fn herald_deadline(&self, _now: Instant) -> Option<Instant> {
@@ -1004,7 +1020,7 @@ fn want(d: &mut TestDesk, row: bool) {
     drive::refresh_session(d, 1, false);
 }
 
-/// THE FOLD QUIET (ruling 394, proposed): the incident's schedule — a row born
+/// THE FOLD QUIET (ruling 394): the incident's schedule — a row born
 /// and folded inside a millisecond, about once a minute (measured 2026-09-28:
 /// 121x52 -> 51 -> 52 within ~0.8 ms, an alt-screen Claude Code left stale).
 /// The birth is ONE re-grid at once; the fold inside the quiet pays none; a
@@ -1239,31 +1255,145 @@ fn a_keystroke_under_a_hold_folds_as_the_hold_lifts() {
     assert_eq!(d.took("regrid 0"), 2);
 }
 
-/// A TAB SWITCH IS A READ (review of ruling 394, P3): a person bringing a
-/// quiet tab to the front folds the row the other tab had at once (it stood
-/// its quiet), not 1.5 s later under whatever they type into the new tab.
+/// A SWITCH AWAY AND BACK PAYS NO RE-GRID (net-zero chrome audit,
+/// 2026-09-29). Window 0's front tab (session 1) wants the row — a peer's
+/// lease, or a permission prompt a key cannot read away — and its other tab
+/// (session 2) wants none. `aterm ctl tab 1; aterm ctl tab 0` (10-30 ms
+/// apart), a `pane` focus flip or a quick Cmd-Shift-] Cmd-Shift-[ must not
+/// fold the row and re-bear it: every pane of every tab (the background
+/// Claude Code's too) would go N -> N+1 -> N, two `SIGWINCH`es an
+/// alternate-screen program answers by reading an unchanged size. The switch
+/// starts the ordinary fold quiet; the switch back cancels it.
 #[test]
-fn a_switch_to_a_quiet_tab_folds_at_once() {
+fn a_switch_away_and_back_pays_no_regrid() {
+    let attention = || TFacts {
+        agent_seq: 1,
+        attention: Some("permission".into()),
+        ..TFacts::default()
+    };
+    for (label, facts) in [("peer lease", peer_leased()), ("attention", attention())] {
+        let mut d = desk();
+        d.facts.get_mut().insert(1, facts);
+        drive::refresh_session(&mut d, 1, false);
+        drive::refresh_session(&mut d, 2, false);
+        assert_eq!(d.view(0).rows, 1, "{label}: born");
+        assert_eq!(d.took("regrid 0"), 1, "{label}: the birth");
+        // The row has long stood its quiet since its birth.
+        d.now += FOLD_QUIET + Duration::from_secs(1);
+        d.wins.get_mut(&0).unwrap().front = Some(2);
+        drive::refresh_all(&mut d);
+        assert!(
+            d.view(0).words.is_none(),
+            "{label}: the quiet tab shows no words"
+        );
+        assert_eq!(
+            d.view(0).rows,
+            1,
+            "{label}: the switch does not fold at once"
+        );
+        assert_eq!(d.took("regrid 0"), 1, "{label}: no re-grid on the way out");
+        d.now += Duration::from_millis(15);
+        d.wins.get_mut(&0).unwrap().front = Some(1);
+        drive::refresh_all(&mut d);
+        assert!(d.view(0).words.is_some(), "{label}: back");
+        assert_eq!(d.view(0).rows, 1, "{label}: back");
+        assert_eq!(d.view(0).fold_since, None, "{label}: the fold is cancelled");
+        assert_eq!(
+            d.took("regrid 0"),
+            1,
+            "{label}: away and back is no geometry change at all"
+        );
+    }
+}
+
+/// A SWITCH TO A QUIET TAB THAT STAYS FOLDS ON THE PERSON'S FIRST KEY THERE,
+/// or at the quiet (review of ruling 394, P3, kept): the row the other tab
+/// had never stands 1.5 s under what they type into the new tab — the first
+/// key is the fold law's read and folds it in the same event, just after its
+/// bytes are written and before the next frame paints their echo — and a
+/// person who only looks gets the terminal row back at [`FOLD_QUIET`].
+#[test]
+fn a_switch_to_a_quiet_tab_folds_on_the_first_key_or_at_the_quiet() {
     let mut d = desk();
-    d.wins.get_mut(&0).unwrap().tabs.push(2);
+    drive::refresh_session(&mut d, 2, false);
     want(&mut d, true);
     d.now += FOLD_QUIET;
+    let switch = d.now;
     d.wins.get_mut(&0).unwrap().front = Some(2);
     drive::refresh_all(&mut d);
     assert!(d.view(0).words.is_none());
-    assert_eq!(d.view(0).rows, 0, "the switch is the fold");
+    assert_eq!(d.view(0).rows, 1, "pending, blank");
+    assert_eq!(drive::deadline(&d, d.now), Some(switch + FOLD_QUIET));
+    d.now += Duration::from_millis(200);
+    drive::human_acted(&mut d, 0);
+    assert_eq!(d.view(0).rows, 0, "the first key in the new tab folds it");
     assert_eq!(d.took("regrid 0"), 2);
-    // A switch away from a row born milliseconds ago waits for its minimum
-    // life, then folds through the timer.
+    // No key: the quiet folds it through the timer.
+    let mut t = desk();
+    drive::refresh_session(&mut t, 2, false);
+    want(&mut t, true);
+    t.now += FOLD_QUIET;
+    let switch = t.now;
+    t.wins.get_mut(&0).unwrap().front = Some(2);
+    drive::refresh_all(&mut t);
+    assert!(drive::tick(&mut t, switch + Duration::from_millis(1400)).is_empty());
+    assert_eq!(t.view(0).rows, 1);
+    assert_eq!(drive::tick(&mut t, switch + FOLD_QUIET), vec![0]);
+    assert_eq!(t.view(0).rows, 0);
+    assert_eq!(t.took("regrid 0"), 2);
+    // A switch away from a row born milliseconds ago still waits its quiet.
     let mut y = desk();
-    y.wins.get_mut(&0).unwrap().tabs.push(2);
     let born = y.now;
     want(&mut y, true);
     y.now += Duration::from_millis(5);
     y.wins.get_mut(&0).unwrap().front = Some(2);
     drive::refresh_all(&mut y);
     assert_eq!(y.view(0).rows, 1);
-    assert_eq!(drive::deadline(&y, y.now), Some(born + FOLD_QUIET));
+    assert_eq!(
+        drive::deadline(&y, y.now),
+        Some(born + Duration::from_millis(5) + FOLD_QUIET)
+    );
+}
+
+/// A KEY IN A QUIET TAB THAT IS NOT CALM STILL FOLDS THE BLANK ROW.
+/// Session 2 wants no row but is not calm: its permission prompt is already told by the message
+/// band
+/// (`attention_told_elsewhere`), so the window shows it at no level while
+/// the fold law's calm gate refuses it. The switch leaves session 1's row
+/// pending and blank; the person's first key there must fold it — the calm
+/// gate guards reading a STORY away, and the blank row has none — and must
+/// not read session 2's story (its watermark stays put).
+#[test]
+fn a_key_in_a_quiet_tab_that_is_not_calm_folds_the_blank_row() {
+    let mut d = desk();
+    d.facts.get_mut().insert(
+        2,
+        TFacts {
+            agent_seq: 1,
+            attention: Some("permission".into()),
+            attention_told_elsewhere: true,
+            ..TFacts::default()
+        },
+    );
+    drive::refresh_session(&mut d, 2, false);
+    assert!(!d.table().slot(2).unwrap().calm(), "session 2 is not calm");
+    want(&mut d, true);
+    assert_eq!(d.view(0).rows, 1, "born");
+    d.now += FOLD_QUIET;
+    d.wins.get_mut(&0).unwrap().front = Some(2);
+    drive::refresh_all(&mut d);
+    assert!(d.view(0).words.is_none(), "session 2 wants no row");
+    assert_eq!(d.view(0).rows, 1, "pending, blank");
+    let watermark = d.view(0).watermark(2);
+    d.now += Duration::from_millis(200);
+    drive::human_acted(&mut d, 0);
+    assert_eq!(d.view(0).rows, 0, "the key folds the blank row");
+    assert_eq!(d.took("regrid 0"), 2, "the birth and the fold");
+    assert_eq!(
+        d.view(0).watermark(2),
+        watermark,
+        "the key read no story of a session that is not calm"
+    );
 }
 
 /// A DRIVER'S LOOK HOLDS THE FOLD (review of ruling 394, C1): a client handed
@@ -1446,14 +1576,13 @@ fn a_moved_lease_holds_a_due_fold_arms_no_wake_and_its_wake_cancels_the_flap() {
     assert_eq!(n.took("regrid 0"), 3, "born, folded, born again");
 }
 
-/// A BIRTH A LIFTED HOLD LEFT OWED CATCHES UP (review of the integration,
-/// 2026-09-29, finding 1). A background tab's lease holds window 0's row
-/// ([`Desk::driver_may_type`] reads every session the window shows) while the
+/// A BIRTH A LIFTED HOLD LEFT OWED CATCHES UP. A background tab's lease
+/// holds window 0's row ([`Desk::driver_may_type`] reads every session the
+/// window shows) while the
 /// front session's want forms; the tab's lease is let go before either of its
 /// wakes runs, so both read facts identical to its slot and project nothing.
 /// No projection is owed the window, and on a hidden (or headless) band no
-/// words clock runs: before the fix `deadline` answered `None` and the row
-/// never came (measured `rows=0`, on the merge base too). Now the owed birth
+/// words clock runs, so `deadline` must not answer `None`: the owed birth
 /// is due at once, the tick commits it with ONE re-grid, and nothing spins.
 #[test]
 fn a_birth_a_background_tabs_lease_held_is_committed_once_the_lease_is_gone() {
@@ -1503,9 +1632,8 @@ fn a_birth_a_background_tabs_lease_held_is_committed_once_the_lease_is_gone() {
     assert_eq!((c.view(0).rows, c.took("regrid 0")), (0, 0));
 }
 
-/// A KEYSTROKE UNDER A LEASE WHOSE WAKE HAS NOT RUN (review of the
-/// integration, 2026-09-29, finding 3): the fold law judges calm on the LIVE
-/// lease. A lease just taken is not calm, whether or not its wake has run:
+/// A KEYSTROKE UNDER A LEASE WHOSE WAKE HAS NOT RUN: the fold law judges
+/// calm on the LIVE lease. A lease just taken is not calm, whether or not its wake has run:
 /// the key reads nothing in either order. Before, a key that beat the wake
 /// read the stale calm slot — the story read, the watermark moved, the read
 /// dropped by the commit's moved-lease hold — where the same key after the
@@ -1540,4 +1668,223 @@ fn a_keystroke_under_a_just_taken_lease_reads_nothing_in_either_order() {
         assert_eq!(d.view(0).watermark(1), seq);
         assert_eq!(d.view(0).rows, 0, "wake first {wake_first}");
     }
+}
+
+/// `TOLD_FLASH`: the told point stands in the phase slot
+/// for 3 s, "then returns to phase"; `deadline` lists a told point's flash as
+/// a wake the driver acts on. The tick at the flash's end re-projects the
+/// window: its phase is no longer the told point.
+#[test]
+fn the_tick_at_a_told_flashs_end_returns_the_phase() {
+    let mut d = desk();
+    let t0 = d.now;
+    let _ = drive::tell(&mut d, 1, StoryVerb::Approval, "");
+    let told = d
+        .view(0)
+        .words
+        .as_ref()
+        .expect("the told row")
+        .phase
+        .clone();
+    let due = drive::deadline(&d, t0).expect("the flash arms the timer");
+    assert_eq!(due, t0 + TOLD_FLASH);
+    d.now = due;
+    let _ = drive::tick(&mut d, due);
+    let after_tick = d.view(0).words.as_ref().expect("the row").phase.clone();
+    // The control: a projection at the same instant has left the flash.
+    let mut control = desk();
+    control.now = t0;
+    let _ = drive::tell(&mut control, 1, StoryVerb::Approval, "");
+    control.now = due;
+    drive::refresh_window(&mut control, 0);
+    let projected = control
+        .view(0)
+        .words
+        .as_ref()
+        .expect("the row")
+        .phase
+        .clone();
+    assert_ne!(
+        projected, told,
+        "control: the flash is over at {TOLD_FLASH:?}"
+    );
+    assert_eq!(
+        after_tick,
+        projected,
+        "the tick at the flash's end left the told point {told:?} up (next wake {:?} away)",
+        drive::deadline(&d, due).map(|x| x.saturating_duration_since(due))
+    );
+}
+
+/// Rulings 415 (t) and 416 (c): a words tick INSIDE the flash re-arms the words'
+/// clock (`now + words_step`, a minute for a minutes row) and must keep the
+/// flash's end: the tick at the end still returns the phase.
+#[test]
+fn a_words_tick_inside_the_flash_keeps_its_end() {
+    let mut d = desk();
+    let t0 = d.now;
+    let _ = drive::tell(&mut d, 1, StoryVerb::Approval, "");
+    let told = d
+        .view(0)
+        .words
+        .as_ref()
+        .expect("the told row")
+        .phase
+        .clone();
+    let mid = t0 + Duration::from_secs(1);
+    d.wins.get_mut(&0).expect("window 0").view.words_due = Some(mid);
+    d.now = mid;
+    let _ = drive::tick(&mut d, mid);
+    assert_eq!(
+        d.view(0).words.as_ref().expect("the row").phase,
+        told,
+        "premise: the flash still stands at +1 s"
+    );
+    let end = t0 + TOLD_FLASH;
+    d.now = end;
+    let _ = drive::tick(&mut d, end);
+    assert_ne!(
+        d.view(0).words.as_ref().expect("the row").phase,
+        told,
+        "the tick at the flash's end left the told point up (words due {:?} after it)",
+        d.view(0)
+            .words_due
+            .map(|x| x.saturating_duration_since(end))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// THE WINDOW'S CHROME REGROW FLOOR (ruling 414): a quiet fold also
+// waits `CHROME_REGROW_SETTLE` past the last rise of ANY of the window's
+// chrome rows (`Desk::chrome_floor`). Measured 2026-09-29 on main
+// `8b24e99a4` in real windows under a program ticking a spinner: a band row
+// rising 11–13 ms before the presence row's timed fold, and 3–6 ms before a
+// person's key folded a row that had stood its quiet, shifted the alternate
+// screen one row (the resize undo dropped by the tick between the halves).
+
+/// A band row rises (another source) just before the presence row's TIMED
+/// fold falls due: the fold waits the floor, and the deadline names the
+/// floor — not the earlier `fold_due` its commit would decline, which would
+/// spin the tick. NEGATIVE CONTROL: the same schedule with no rise noted
+/// folds at `fold_due`, the measured pair.
+#[test]
+fn a_band_rise_just_before_the_timed_fold_holds_it_to_the_floor() {
+    let mut d = desk();
+    want(&mut d, true);
+    want(&mut d, false);
+    let due = d.now + FOLD_QUIET;
+    let rise = due - Duration::from_millis(12);
+    d.wins.get_mut(&0).unwrap().regrow.rose(rise);
+    let floor = rise + CHROME_REGROW_SETTLE;
+    assert_eq!(
+        drive::deadline(&d, d.now),
+        Some(floor),
+        "the floor, not {due:?}"
+    );
+    assert!(
+        drive::tick(&mut d, due).is_empty(),
+        "declined at its own due"
+    );
+    assert_eq!(d.view(0).rows, 1);
+    // Any other wake that projects the window inside the floor declines too.
+    d.now = due;
+    drive::refresh_all(&mut d);
+    assert_eq!(d.view(0).rows, 1, "a refresh at the fold's own due waits");
+    assert_eq!(d.took("regrid 0"), 1);
+    assert_eq!(drive::deadline(&d, due), Some(floor), "no spin");
+    assert!(drive::tick(&mut d, floor - Duration::from_millis(1)).is_empty());
+    d.now = floor;
+    assert_eq!(drive::tick(&mut d, floor), vec![0]);
+    assert_eq!(d.view(0).rows, 0, "folded at the floor");
+    assert_eq!(d.took("regrid 0"), 2);
+    assert_eq!(
+        d.took("rose 0"),
+        1,
+        "the birth noted its own rise; the fold none"
+    );
+    // NEGATIVE CONTROL: no rise noted (the law before the floor) folds at
+    // the fold's own due, 12 ms after the band's rise.
+    let mut n = desk();
+    want(&mut n, true);
+    want(&mut n, false);
+    let due = n.now + FOLD_QUIET;
+    n.wins.get_mut(&0).unwrap().regrow = RegrowFloor::default();
+    assert_eq!(drive::deadline(&n, n.now), Some(due));
+    assert_eq!(drive::tick(&mut n, due), vec![0]);
+    assert_eq!(n.view(0).rows, 0);
+}
+
+/// A band row rises just before a person's key folds a row that has STOOD its
+/// quiet (the read arm, which otherwise folds at once): the read is kept and
+/// the fold commits at the floor through the timer.
+#[test]
+fn a_band_rise_just_before_a_persons_read_holds_the_read_to_the_floor() {
+    let mut d = desk();
+    let _ = drive::tell(&mut d, 1, StoryVerb::Approval, "");
+    assert_eq!(d.view(0).rows, 1);
+    d.now += Duration::from_secs(2);
+    let rise = d.now;
+    d.wins.get_mut(&0).unwrap().regrow.rose(rise);
+    d.now += Duration::from_millis(3);
+    drive::human_acted(&mut d, 0);
+    assert!(d.view(0).words.is_none(), "the story is read");
+    assert!(d.view(0).fold_read, "and the read is kept");
+    assert_eq!(d.view(0).rows, 1, "3 ms after the band's rise: not yet");
+    let floor = rise + CHROME_REGROW_SETTLE;
+    assert_eq!(drive::deadline(&d, d.now), Some(floor));
+    assert_eq!(drive::tick(&mut d, floor), vec![0]);
+    assert_eq!(d.view(0).rows, 0);
+    assert_eq!(d.took("regrid 0"), 2);
+    // A key after the floor folds at once, as before.
+    let mut k = desk();
+    let _ = drive::tell(&mut k, 1, StoryVerb::Approval, "");
+    k.now += Duration::from_secs(2);
+    k.wins.get_mut(&0).unwrap().regrow.rose(k.now);
+    k.now += CHROME_REGROW_SETTLE;
+    drive::human_acted(&mut k, 0);
+    assert_eq!(k.view(0).rows, 0, "past the floor the read folds at once");
+}
+
+/// The floor holds only the QUIET folds: the window's own (a real window that
+/// can no longer afford the row) and the person's View-menu toggle fold at
+/// once, inside the floor, as they fold inside the quiet.
+#[test]
+fn the_windows_and_the_toggles_folds_ignore_the_floor() {
+    let mut d = desk();
+    want(&mut d, true);
+    d.wins.get_mut(&0).unwrap().regrow.rose(d.now);
+    d.band = false;
+    drive::refresh_all(&mut d);
+    assert_eq!(d.view(0).rows, 0, "the menu's hide folds at once");
+    let mut w = desk();
+    want(&mut w, true);
+    w.wins.get_mut(&0).unwrap().regrow.rose(w.now);
+    w.wins.get_mut(&0).unwrap().rows = 0;
+    drive::refresh_all(&mut w);
+    assert_eq!(w.view(0).rows, 0, "the window takes its row back at once");
+}
+
+/// A BIRTH IS A RISE: the driver notes it on the window it re-grids — once,
+/// at the birth's instant — and a fold notes nothing. The window the session
+/// shows in a background tab is not re-gridded and notes nothing.
+#[test]
+fn a_birth_notes_a_rise_on_its_window_and_a_fold_notes_none() {
+    let mut d = desk();
+    let born = d.now;
+    want(&mut d, true);
+    assert_eq!(d.took("rose 0"), 1);
+    assert_eq!(d.wins[&0].regrow.last_rise(), Some(born));
+    assert_eq!(d.took("rose 1"), 0, "window 1 fronts session 2");
+    d.now += Duration::from_millis(5);
+    want(&mut d, false);
+    d.now += FOLD_QUIET;
+    drive::refresh_all(&mut d);
+    assert_eq!(d.view(0).rows, 0);
+    assert_eq!(d.took("rose 0"), 1, "a fold is no rise");
+    assert_eq!(d.wins[&0].regrow.last_rise(), Some(born));
+    // The row's own birth never binds its own fold: the quiet outlasts it.
+    let mut o = desk();
+    want(&mut o, true);
+    want(&mut o, false);
+    assert_eq!(drive::deadline(&o, o.now), Some(o.now + FOLD_QUIET));
 }

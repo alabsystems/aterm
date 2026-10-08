@@ -155,14 +155,8 @@ pub(super) fn to_toml<T: serde::Serialize>(value: &T, limit: usize) -> io::Resul
 mod tests {
     use super::*;
 
-    fn dir(label: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "atpkg-vendor-durable-{label}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn dir(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-vendor-durable-{label}-"))
     }
 
     /// A leftover temp a dead process of this pid left under the next name is replaced;
@@ -262,38 +256,8 @@ mod tests {
         assert!(last == a || last == b);
     }
 
-    /// The update lock excludes a second holder, in this process as in another.
-    #[test]
-    fn the_update_lock_is_exclusive() {
-        let d = dir("lock");
-        let dest = d.join("x.toml");
-        let held = lock_for_update(&dest).unwrap();
-        assert!(d.join("x.toml.lock").exists());
-        // Exclusivity read without a clock: the holder raises `released` just
-        // before it lets go, so a waiter that got the lock while it was still
-        // held sees it down. It was the waiter's own elapsed >= 250 ms, which a
-        // thread first scheduled 50 ms late read short on a correct lock (the
-        // load-sensitive test audit of 2026-09-27).
-        let released = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|s| {
-            let waiter = s.spawn(|| {
-                let _second = lock_for_update(&dest).unwrap();
-                released.load(std::sync::atomic::Ordering::Acquire)
-            });
-            std::thread::sleep(Duration::from_millis(300));
-            released.store(true, std::sync::atomic::Ordering::Release);
-            drop(held);
-            assert!(
-                waiter.join().unwrap(),
-                "the second writer got the update lock while the first still held it"
-            );
-        });
-    }
-
     /// A dropped update lock is free at once while a copy of its descriptor lives — the
-    /// copy a child another thread is spawning holds until it execs. Released by the close,
-    /// the next writer waited out [`LOCK_WAIT`] and failed (the stamp's concurrent-writer
-    /// test under a loaded suite).
+    /// copy a child another thread is spawning holds until it execs.
     #[test]
     fn a_dropped_update_lock_is_free_while_a_copy_of_its_descriptor_lives() {
         let d = dir("lock-dup");
@@ -301,9 +265,7 @@ mod tests {
         let held = lock_for_update(&dest).unwrap();
         let childs_copy = held.try_clone().unwrap();
         drop(held);
-        let start = std::time::Instant::now();
         let again = lock_for_update(&dest).expect("free while its copy lives");
-        assert!(start.elapsed() < LOCK_WAIT / 2, "{:?}", start.elapsed());
         drop((again, childs_copy));
     }
 

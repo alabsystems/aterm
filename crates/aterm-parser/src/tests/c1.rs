@@ -333,3 +333,202 @@ fn c1_enabled_allows_injection_mid_sequence() {
         "C1 CSI mid-sequence should work when C1 is enabled"
     );
 }
+
+/// AN IGNORED DCS STRING READS EVERY BYTE AS A HOOKED ONE DOES. `DcsIgnore`
+/// (a DCS whose header is malformed: a `:` parameter, a private marker after a
+/// parameter, a parameter byte after an intermediate) is a control string like
+/// `DcsPassthrough`; the DEC parser ignores everything in it up to ST, with
+/// GR bytes (`0xA0..=0xFF`, every UTF-8 lead and most continuations) read as
+/// their GL equivalents. A UTF-8 byte in the payload must not leave the string
+/// (`ESC P 1 : h é llo ❯ ls ESC \ after` must print only `after`), and with C1
+/// controls off `0x9C` must still end it as it ends a hooked DCS.
+///
+/// The table, entry by entry: the ignored string stays in itself exactly where
+/// the hooked one does, and where either leaves, both go to the same state.
+/// Then the parsers, fed every one- and two-byte tail, C1 off and on, through
+/// the byte path and the fast path, agree on everything outside the hook.
+#[test]
+fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
+    for byte in 0..=u8::MAX {
+        let hooked = TRANSITIONS[State::DcsPassthrough as usize][usize::from(byte)];
+        let ignored = TRANSITIONS[State::DcsIgnore as usize][usize::from(byte)];
+        let leaves = |transition: crate::table::Transition, from: State| {
+            (transition.next_state != from).then_some(transition.next_state)
+        };
+        assert_eq!(
+            leaves(hooked, State::DcsPassthrough),
+            leaves(ignored, State::DcsIgnore),
+            "byte {byte:#04x}"
+        );
+    }
+
+    let outside_the_hook = |sink: &RecordingSink| {
+        format!(
+            "prints={:?} executes={:?} csi={:?} csi_sub={:?} esc={:?} osc={:?} apc=({}, {:?}, {})",
+            sink.prints,
+            sink.executes,
+            sink.csi_dispatches,
+            sink.csi_dispatches_with_subparams,
+            sink.esc_dispatches,
+            sink.osc_dispatches,
+            sink.apc_starts,
+            sink.apc_data,
+            sink.apc_ends
+        )
+    };
+    let mut tails: Vec<Vec<u8>> = (0..=u8::MAX).map(|b| vec![b]).collect();
+    for a in 0..=u8::MAX {
+        for b in 0..=u8::MAX {
+            tails.push(vec![a, b]);
+        }
+    }
+    for c1 in [false, true] {
+        let fresh = || {
+            if c1 {
+                Parser::with_c1_controls()
+            } else {
+                Parser::new()
+            }
+        };
+        let mut hooked = fresh();
+        hooked.advance(b"\x1bP1000p%", &mut RecordingSink::default());
+        assert_eq!(hooked.state(), State::DcsPassthrough);
+        let mut ignored = fresh();
+        ignored.advance(b"\x1bP1:%", &mut RecordingSink::default());
+        assert_eq!(ignored.state(), State::DcsIgnore);
+        for fast in [false, true] {
+            for tail in &tails {
+                let (mut live, mut dropped) = (hooked.clone(), ignored.clone());
+                let (mut live_sink, mut dropped_sink) =
+                    (RecordingSink::default(), RecordingSink::default());
+                if fast {
+                    live.advance_fast(tail, &mut live_sink);
+                    dropped.advance_fast(tail, &mut dropped_sink);
+                } else {
+                    live.advance(tail, &mut live_sink);
+                    dropped.advance(tail, &mut dropped_sink);
+                }
+                assert_eq!(
+                    outside_the_hook(&dropped_sink),
+                    outside_the_hook(&live_sink),
+                    "c1={c1} fast={fast} tail={tail:02x?}"
+                );
+                assert_eq!(
+                    dropped.state() == State::DcsIgnore,
+                    live.state() == State::DcsPassthrough,
+                    "c1={c1} fast={fast} tail={tail:02x?}: in the string alike"
+                );
+            }
+        }
+    }
+
+    // The case that motivated it, end to end: a UTF-8 payload and an 8-bit ST.
+    let mut parser = Parser::new();
+    let mut sink = RecordingSink::default();
+    parser.advance_fast(
+        "\x1bP1:h\u{e9}llo \u{276f} ls\x1b\\after".as_bytes(),
+        &mut sink,
+    );
+    parser.advance_fast(b"\x1bP1:x\x9cafter", &mut sink);
+    assert_eq!(sink.prints.iter().collect::<String>(), "afterafter");
+}
+
+/// A `0x9C` INSIDE A UTF-8 CHARACTER DOES NOT END THE STRING. With C1 controls
+/// off, a DCS (hooked or ignored) and an SOS, PM or APC string end at the 8-bit
+/// ST `0x9C` — but `0x9C` is also a UTF-8 continuation byte, about one in 64 of
+/// them: U+672C 本 is `E6 9C AC`. A payload carrying such a character ended
+/// inside it, and the rest of the payload printed and ran as terminal input:
+/// `ESC P 1 : 本 x ESC \ after` printed `\u{fffd}xafter`, and a tmux
+/// control-mode or passthrough line, a kitty command's JSON or an APC payload
+/// did the same. A `0x9C` that extends the well-formed UTF-8 prefix the payload
+/// ends in (Unicode Table 3-7, the Ground decoder's own predicate) is that
+/// character's byte; anywhere else it is ST — after ASCII, after a whole
+/// character, after a lead it cannot follow (`E0`, `F4`), after a broken
+/// prefix. With C1 controls on, a raw `0x9C` is the 8-bit ST wherever it falls.
+///
+/// Every string state, the byte path, the fast path and one byte per read.
+#[test]
+fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
+    // 0x9C as the second, third and fourth byte, after the leads whose second
+    // byte may be 0x9C (`DC`, `E6`, `ED`, `F0`).
+    let payload = "\u{71c}\u{672c}\u{d71c}\u{1f71c}\u{1c71c} x \u{672c}\u{672c}";
+    assert_eq!(payload.bytes().filter(|&b| b == 0x9C).count(), 11);
+    let heads: [(&[u8], &str); 5] = [
+        (b"\x1bP1000p", "hooked DCS"),
+        (b"\x1bP1:", "ignored DCS"),
+        (b"\x1b_", "APC"),
+        (b"\x1bX", "SOS"),
+        (b"\x1b^", "PM"),
+    ];
+    let feeds: [(&str, fn(&mut Parser, &[u8], &mut RecordingSink)); 3] = [
+        ("advance", |p, b, s| p.advance(b, s)),
+        ("advance_fast", |p, b, s| p.advance_fast(b, s)),
+        ("one byte per read", |p, b, s| {
+            for byte in b {
+                p.advance_fast(std::slice::from_ref(byte), s);
+            }
+        }),
+    ];
+    for (head, name) in heads {
+        for st in [&b"\x1b\\"[..], &b"\x9c"[..]] {
+            let input = [head, payload.as_bytes(), st, b"after"].concat();
+            for (how, feed) in feeds {
+                let mut parser = Parser::new();
+                let mut sink = RecordingSink::default();
+                feed(&mut parser, &input, &mut sink);
+                let what = format!("{name} {how} st={st:02x?}");
+                assert_eq!(sink.prints.iter().collect::<String>(), "after", "{what}");
+                assert!(
+                    sink.csi_dispatches.is_empty() && sink.executes.is_empty(),
+                    "{what}"
+                );
+                assert_eq!(parser.state(), State::Ground, "{what}");
+                let delivered = match name {
+                    "hooked DCS" => &sink.dcs_puts,
+                    _ => &sink.apc_data,
+                };
+                let expect: &[u8] = match name {
+                    "hooked DCS" | "APC" => payload.as_bytes(),
+                    _ => b"",
+                };
+                assert_eq!(delivered.as_slice(), expect, "{what}: the whole payload");
+            }
+        }
+
+        // Every other 0x9C is ST: after ASCII, after a whole character, after
+        // a lead it cannot follow, after a broken prefix, after a byte that
+        // begins no sequence.
+        for before in [
+            &b"x"[..],
+            "\u{672c}".as_bytes(),
+            b"\xe0",
+            b"\xf4",
+            b"\xe6x",
+            b"\xf0\x90\x80\x80",
+            b"\xc0",
+            b"\xf5",
+        ] {
+            let input = [head, before, b"\x9cafter"].concat();
+            for (how, feed) in feeds {
+                let mut parser = Parser::new();
+                let mut sink = RecordingSink::default();
+                feed(&mut parser, &input, &mut sink);
+                assert_eq!(
+                    sink.prints.iter().collect::<String>(),
+                    "after",
+                    "{name} {how} {before:02x?}: the 0x9C is ST"
+                );
+            }
+        }
+
+        // With C1 controls on, the raw 0x9C is the 8-bit ST even inside one.
+        let mut parser = Parser::with_c1_controls();
+        let mut sink = RecordingSink::default();
+        parser.advance_fast(&[head, "\u{672c}after".as_bytes()].concat(), &mut sink);
+        assert_eq!(
+            sink.prints.iter().collect::<String>(),
+            "\u{fffd}after",
+            "{name}: C1 on"
+        );
+    }
+}

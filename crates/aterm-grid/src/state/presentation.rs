@@ -29,26 +29,22 @@ pub enum AbsoluteRowUpdate {
     Invalidate,
 }
 
-/// One translation of a band of SCREEN rows: rows `top..=bottom` (0-based, visible
-/// coordinates) moved by `delta` rows, and a row whose new index `r + delta` leaves
-/// the band is GONE — destroyed by the scroll, with nothing landing in its place.
+/// One translation of a band of screen rows: rows `top..=bottom` (0-based,
+/// visible coordinates) moved by `delta` rows; a row whose new index
+/// `r + delta` leaves the band is gone, with nothing landing in its place.
 ///
-/// This is the EXACT shape of every row-moving VT operation that is not a
-/// whole-screen scroll: a DECSTBM region scroll up (`delta < 0`, the region's top
-/// rows leave, its bottom rows are vacated blank), a region scroll down / reverse
-/// index at a region top (`delta > 0`), IL/DL at a cursor row inside the region
-/// (the band is `cursor_row..=region.bottom`), and the top-anchored archival
-/// scroll (the band is `0..=bottom` with `delta = -n`; the rows that leave enter
-/// history, which is still "gone from the screen"). The footer rows below a
-/// Codex-shaped region, and every row above an interior region, are OUTSIDE the
-/// band and did not move.
+/// This covers every row-moving VT operation other than a whole-screen
+/// scroll: a DECSTBM region scroll up (`delta < 0`: the top rows leave, the
+/// bottom rows are vacated blank), a region scroll down / reverse index at a
+/// region top (`delta > 0`), IL/DL (band `cursor_row..=region.bottom`), and
+/// the top-anchored archival scroll (band `0..=bottom`, `delta = -n`, the
+/// leaving rows entering history). Rows outside the band did not move.
 ///
-/// A host that caches screen coordinates (the cursor effects' ribbon, the sparks,
-/// the meteor landing rows) can apply this as a transform instead of discarding
-/// everything: a mark at row `r` inside the band goes to `r + delta` or dies, a
-/// mark outside the band stays. [`AbsoluteRowUpdate::Splice`] cannot say this — it
-/// carries only the history insertion point, which the RI-only phase of an inline
-/// viewport never produces — so the grid records the band itself, with numbers.
+/// A host caching screen coordinates (cursor-effect ribbons, sparks, meteor
+/// landing rows) can apply this as a transform: a mark at row `r` inside the
+/// band goes to `r + delta` or dies, one outside stays.
+/// [`AbsoluteRowUpdate::Splice`] cannot express this (it carries only the
+/// history insertion point), so the grid records the band itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowBandMove {
     /// First screen row of the band that moved (inclusive).
@@ -60,30 +56,25 @@ pub struct RowBandMove {
     pub delta: i16,
 }
 
-/// How many DISTINCT row-band moves one parser batch records before the record
+/// How many distinct row-band moves one parser batch records before the record
 /// degrades to [`RowBandMoves::inexact`].
 ///
-/// EIGHT, and it is a coverage claim over the measured shapes rather than a taste:
-/// the real Codex capture (scratchpad `codex-bytes.bin`, 109 842 B, 781 byte records)
-/// never carries more than ONE band per batch — every streamed line is its own
-/// synchronized-output block, and the five reverse indices of an Enter COMPOSE into
-/// one entry (see [`GridPresentationState::record_row_band_move`]). A tmux pane
-/// repaint that scrolls two panes and a status row in one write is three. Anything
-/// that needs a ninth distinct band in one batch is a full-screen re-layout, where
-/// "discard and rebuild" IS the honest answer, so the overflow does not drop a move
-/// silently: it marks the whole batch inexact and the host falls back to today's
-/// invalidation.
+/// Streamed inline-TUI output records one band per batch (reverse indices at a
+/// region top compose into one entry; see
+/// [`GridPresentationState::record_row_band_move`]); a tmux repaint scrolling
+/// two panes and a status row is three. Needing more than eight is a
+/// full-screen re-layout, so overflow marks the batch inexact and the host
+/// falls back to invalidation rather than losing a move silently.
 pub const ROW_BAND_MOVES_PER_BATCH: usize = 8;
 
 /// The row-band moves one parser batch recorded, in the order they happened.
 ///
-/// Fixed-arity and `Copy` on purpose, like [`BandSet`]: this lives in the grid's
-/// per-batch presentation state and is written from the scroll paths, so it must
-/// never allocate. `inexact` is the fail-closed bit: once set, the moves listed are
-/// NOT a complete description of the batch's row motion (a margined rectangle
-/// scroll, a column op, an alt-screen flip, RIS, a ninth band, a displacement past
-/// `i16`) and a consumer must treat the batch as an invalidation exactly as before
-/// this record existed.
+/// Fixed-arity and `Copy`, like [`BandSet`], because it is written from the
+/// scroll paths and must never allocate. `inexact` is the fail-closed bit:
+/// once set, the listed moves do not fully describe the batch's row motion (a
+/// margined rectangle scroll, a column op, an alt-screen flip, RIS, a ninth
+/// band, a displacement past `i16`) and a consumer must treat the batch as a
+/// plain invalidation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowBandMoves {
     /// The recorded moves; only `moves[..len]` is meaningful.
@@ -103,24 +94,21 @@ impl RowBandMoves {
     }
 }
 
-/// How many DISJOINT damage bands one parser batch keeps before they degrade to
-/// their hull.
+/// How many disjoint damage bands one parser batch keeps before closest bands
+/// are merged.
 ///
-/// FOUR, and the number is a coverage claim rather than a taste: the shapes that
-/// actually produce disjoint bands on the main screen are an inline TUI repainting
-/// its title row and its composer box (two), and a build tool rewriting a spinner
-/// line and a summary line ten rows above it (two). A batch with five or more
-/// genuinely non-adjacent regions is a full-screen repaint, where the hull IS the
-/// honest answer. Contiguous and adjacent rows coalesce (see [`merge_bands`]), so a
-/// 40-row repaint is ONE band, not forty — the set only grows on real gaps.
+/// The main-screen shapes that produce disjoint bands are small (an inline TUI
+/// repainting its title row and composer box; a build tool rewriting a spinner
+/// and a summary line). Contiguous and adjacent rows coalesce (see
+/// [`merge_bands`]), so a 40-row repaint is one band.
 pub const MAX_SELECTION_DAMAGE_BANDS: usize = 8;
 
-/// SELECTION CUSTODY: where a print is about to land, captured before it runs.
+/// Where a print is about to land, captured before it runs.
 ///
-/// `overwrites` is the whole reason ordinary output can be marked at all without
-/// clearing a selection on every frame of live output: text APPENDED past a row's
-/// existing content replaces nothing a selection could be sitting on, and a
-/// history-splice's fill of the blank row it just created is exactly that shape.
+/// `overwrites` is what lets ordinary output be marked without clearing a
+/// selection on every frame of live output: text appended past a row's
+/// existing content replaces nothing, and a history splice's fill of the blank
+/// row it created is exactly that shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputOrigin {
     /// Absolute row the cursor sat on before the print.
@@ -148,12 +136,11 @@ impl BandSet {
     }
 }
 
-/// Sort `bands` ascending by low edge and merge every overlapping or ADJACENT pair,
-/// in place. Returns the surviving count.
+/// Sort `bands` ascending by low edge and merge every overlapping or adjacent
+/// pair, in place. Returns the surviving count.
 ///
-/// ADJACENT (`hi + 1 == lo`) merges as well as overlapping, and that is what keeps a
-/// row-by-row repaint from eating one set slot per row: rows 3, 4, 5 recorded
-/// separately collapse to 3..=5, exactly the band a single 3..=5 record would give.
+/// Adjacent (`hi + 1 == lo`) bands merge too, so a row-by-row repaint does not
+/// use one slot per row: rows 3, 4, 5 collapse to 3..=5.
 fn merge_bands(bands: &mut [(u64, u64)]) -> usize {
     // Insertion sort: `bands` is at most `2 * MAX_SELECTION_DAMAGE_BANDS` long, so a
     // quadratic sort with no call overhead is the cheap choice at this size.
@@ -177,30 +164,21 @@ fn merge_bands(bands: &mut [(u64, u64)]) -> usize {
     out
 }
 
-/// SELECTION CUSTODY Phase 4 — WHERE this batch damaged content, in ABSOLUTE rows.
+/// Where this batch damaged content, in absolute rows.
 ///
-/// The thing it replaces: `content_scroll_delta = i32::MAX`, a sentinel meaning
-/// "some region op happened, kill the selection". It was applied backwards. A status
-/// bar scrolling rows 18-23 destroyed a highlight anchored at row -40 in scrollback,
-/// content it never touched — while a `\r` + EL progress bar rewrote the row UNDER a
-/// live highlight and left it in place, so a copy returned text the user never
-/// selected. Damage is a QUESTION ABOUT OVERLAP, and the sentinel could not express
-/// one.
+/// Damage is a question about overlap: a status bar scrolling rows 18-23 must
+/// not clear a highlight in scrollback, while a `\r` + EL progress bar
+/// rewriting the row under a highlight must.
 ///
-/// Absolute rows are frame-invariant, so bands recorded at different points in one
-/// parser batch compose with no ordering reasoning — that is what makes the
-/// composition sound. The lattice is `None ⊑ Band ⊑ Bands ⊑ All`, and `union` is
-/// monotone in COVERAGE: no union ever un-covers a row that was already covered.
-/// (`damage_selection_output`'s one-compare guard depends on exactly that — a
-/// row recorded once stays covered for the rest of the batch.)
+/// Absolute rows are frame-invariant, so bands recorded at different points in
+/// one batch compose without ordering concerns. The lattice is
+/// `None ⊑ Band ⊑ Bands ⊑ All`, and `union` is monotone in coverage: no union
+/// un-covers a row (`damage_selection_output`'s one-compare guard relies on
+/// this).
 ///
-/// RESIDUAL IMPRECISION, now BOUNDED rather than unconditional: up to
-/// [`MAX_SELECTION_DAMAGE_BANDS`] disjoint bands are kept exactly; a fifth
-/// non-adjacent region degrades the whole set to its hull, over-clearing a selection
-/// sitting in a gap. It hulled from the FIRST disjoint pair until this fix, and that
-/// was reachable: an inline TUI repainting a title row and a composer box in one
-/// batch cleared a selection between them that nothing had rewritten. Degrading
-/// fails SAFE — over-clear, never a stale highlight over changed text.
+/// Up to [`MAX_SELECTION_DAMAGE_BANDS`] disjoint bands are kept exactly; past
+/// that the closest pair merges, which may over-clear a selection in that gap
+/// but never leaves a stale highlight over changed text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SelectionDamage {
     /// Nothing in this batch replaced content a selection could be sitting on.
@@ -208,8 +186,8 @@ pub enum SelectionDamage {
     None,
     /// Absolute rows `lo_abs..=hi_abs` were moved or rewritten.
     Band { lo_abs: u64, hi_abs: u64 },
-    /// Two or more DISJOINT bands were moved or rewritten and the rows between them
-    /// were not. Never holds fewer than two: one band canonicalises to
+    /// Two or more disjoint bands were moved or rewritten and the rows between
+    /// them were not. Never fewer than two: one band canonicalises to
     /// [`SelectionDamage::Band`], so equality has a single spelling.
     Bands(BandSet),
     /// The whole coordinate space is gone (ED 3, `clear_scrollback`, RIS, a Kitty
@@ -252,22 +230,16 @@ impl SelectionDamage {
                 set.bands[..bands.len()].copy_from_slice(bands);
                 Self::Bands(set)
             }
-            // Past the arity bound, ABSORB THE CLOSEST PAIR rather than collapsing to
-            // the hull.
+            // Past the arity bound, absorb the closest pair rather than
+            // collapsing to the hull. Hulling on transient arity would be
+            // order-dependent and needlessly coarse: a box border drawn as two
+            // overlapping pieces and then filled momentarily exceeds the bound
+            // and would lose every gap, even when the final cover fits.
             //
-            // Hulling here degraded on TRANSIENT arity, not final arity, which made
-            // the result order-dependent and needlessly coarse: a box border drawn as
-            // two overlapping pieces and then filled — the commonest TUI shape —
-            // momentarily exceeds the bound and permanently loses every gap, even
-            // when the FINAL cover fits. Folding random band sequences, one in eighty
-            // hulled despite fitting.
-            //
-            // Repeatedly merging the adjacent pair with the SMALLEST GAP keeps the
-            // arity bound while giving up the least possible precision, and depends
-            // only on the sorted set — so the same batch yields the same answer
-            // whatever order its ops recorded in. `bands` is ascending and disjoint,
-            // so the closest pair is always adjacent. Still fails safe: merging only
-            // ever widens, never leaves a stale highlight.
+            // Merging the adjacent pair with the smallest gap keeps the bound
+            // while giving up the least precision. `bands` is ascending and
+            // disjoint, so the closest pair is adjacent. Merging only widens, so
+            // it still fails safe.
             _ => {
                 let mut buf = [(0u64, 0u64); MAX_SELECTION_DAMAGE_BANDS * 2];
                 let mut len = bands.len().min(buf.len());
@@ -315,11 +287,10 @@ impl SelectionDamage {
     }
 
     /// Must a selection be cleared, given `overlaps`, which answers "does the
-    /// selection overlap absolute rows `lo_abs..=hi_abs`?" for ONE band.
+    /// selection overlap absolute rows `lo_abs..=hi_abs`?" for one band.
     ///
-    /// The entry point consumers should use. A caller matching `Band` by hand cannot
-    /// express the gap between two disjoint bands, and would silently clear across
-    /// it — which is precisely the bug this variant exists to fix.
+    /// The entry point consumers should use: matching `Band` by hand cannot
+    /// express the gap between two disjoint bands and would clear across it.
     #[must_use]
     pub fn clears_selection(self, mut overlaps: impl FnMut(u64, u64) -> bool) -> bool {
         match self {
@@ -336,36 +307,31 @@ impl SelectionDamage {
 
 /// What the most recent resize did to this grid's rows, one count per arm of
 /// `Grid::adjust_row_count`: the numbers behind
-/// [`GridPresentationState::last_resize_row_shift`], for EVERY arm rather than
-/// only the one a selection follows.
+/// [`GridPresentationState::last_resize_row_shift`], for every arm.
 ///
-/// Rows-only resizes (every window-height drag, chrome-row change and font zoom
-/// that keeps the width) run the arms in this order. A shrink first TRIMS
-/// trailing blank rows below the cursor, which moves nothing. It then DEMOTES
-/// top rows into ring history, which moves every surviving row UP by that
-/// count. Last comes the BOTTOM-PUSH corner, which rotates bottom rows into
-/// history when the cursor sits too high to demote. A grow REVEALS retained
-/// history at the top, which moves every row DOWN by that count, and APPENDS
-/// blank rows at the bottom for the rest.
+/// Rows-only resizes (height drags, chrome-row changes, font zoom at the same
+/// width) run the arms in order. A shrink first trims trailing blank rows
+/// below the cursor (moving nothing), then demotes top rows into ring history
+/// (moving every surviving row up), then uses the bottom-push corner (bottom
+/// rows into history) when the cursor sits too high to demote. A grow reveals
+/// retained history at the top (moving every row down) and appends blank rows
+/// at the bottom for the rest.
 ///
-/// The counts say what left or entered the VIEWPORT, not what was kept. On a
-/// grid with no retention (the alternate screen is built with
-/// `max_scrollback = 0`), demoted and pushed rows are evicted by the retention
-/// cap in the same call. The grid's resize undo keeps them (`stashed`) while
-/// nothing draws, so a grow back hands them back (`restored_top`, counted in
-/// `revealed`, and `restored_bottom`) and the net-zero flap is an identity, as
-/// it is on a retaining grid. Once anything is drawn between the halves the
-/// undo is gone, the grow finds nothing to reveal and appends blanks, and the
-/// screen stays shifted up by the demote count (the app, having drawn, has
-/// seen the smaller size and repaints).
+/// The counts say what left or entered the viewport, not what was kept. On a
+/// grid with no retention (the alternate screen, `max_scrollback = 0`),
+/// demoted and pushed rows are evicted in the same call; the resize undo keeps
+/// them (`stashed`) while nothing draws, so a grow back hands them back
+/// (`restored_top`, counted in `revealed`, and `restored_bottom`) and the flap
+/// is an identity. Once anything is drawn in between the undo is gone, the grow
+/// appends blanks, and the screen stays shifted up by the demote count.
 ///
-/// Every resize overwrites the whole record. On a WIDTH change `reflowed` says
-/// whether the column rewrap ran, and `pushed`/`revealed`/`appended` then count
-/// rows after that rewrap: the rewrap moves content by itself, so
-/// `revealed - demoted` is a displacement only when `reflowed` is false.
+/// Every resize overwrites the whole record. On a width change `reflowed` says
+/// whether the column rewrap ran, and `pushed`/`revealed`/`appended` count rows
+/// after it, so `revealed - demoted` is a displacement only when `reflowed` is
+/// false.
 ///
-/// `Copy` and allocation-free: written with plain field stores from the resize
-/// arms, drained by the host through `Grid::take_last_resize_shape`.
+/// `Copy` and allocation-free: written by the resize arms, drained through
+/// `Grid::take_last_resize_shape`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResizeShape {
     /// Trailing blank rows below the cursor dropped off the bottom by a shrink.
@@ -375,7 +341,7 @@ pub struct ResizeShape {
     /// surviving row, and the cursor, moved UP by this count.
     pub demoted: u16,
     /// Bottom viewport rows that left the screen with nothing above them moving:
-    /// the rows-only BOTTOM-PUSH corner (rotated into history), or the rows a
+    /// the rows-only bottom-push corner (rotated into history), or the rows a
     /// width-change shrink drained off the bottom.
     pub pushed: u16,
     /// Retained history lines relabelled as the top of the viewport by a grow.
@@ -411,62 +377,55 @@ pub struct GridPresentationState {
     /// Cell extras (hyperlinks, combining chars, underline colors).
     /// Stored separately from cells to keep the common case fast.
     pub extras: CellExtras,
-    /// Style deduplication table (Ghostty pattern).
-    /// Interns unique styles and provides IDs for memory-efficient storage.
-    /// Typical terminals have 50-200 unique styles, providing ~67% memory savings.
+    /// Style deduplication table: interns unique styles and hands out IDs for
+    /// compact storage (terminals typically use 50-200 distinct styles).
     pub styles: StyleTable,
     /// Accumulated content scroll delta since last `take_content_scroll_delta()`.
     /// Used by Terminal to adjust selection coordinates after processing.
     /// Positive = content scrolled up by this many lines.
     /// `i32::MAX` = region scroll (forces selection clear).
     pub content_scroll_delta: i32,
-    /// SELECTION CUSTODY Phase 4: where this batch damaged content, in absolute
-    /// rows. Accumulated by `union` at each grid site, drained once per batch by
+    /// Where this batch damaged content, in absolute rows. Accumulated by
+    /// `union` at each grid site, drained once per batch by
     /// `take_selection_damage()`.
     pub selection_damage: SelectionDamage,
-    /// Absolute row most recently recorded through `damage_selection_output`,
-    /// the ORDINARY-OUTPUT path — the one recording site that runs per printed run
-    /// rather than per control sequence.
+    /// Absolute row most recently recorded through `damage_selection_output`
+    /// (the ordinary-output path, which runs per printed run).
     ///
-    /// It exists only to skip the union while output stays on one row, which is the
-    /// overwhelmingly common shape (a `\r`-redrawn progress bar, a prompt, any line
-    /// of text). Sound because `SelectionDamage::union` is monotone in coverage: a
-    /// row already recorded this batch cannot become un-recorded, so re-recording it
-    /// is a no-op and skipping it changes nothing. Cleared with the damage itself in
-    /// `take_selection_damage`, so it can never speak for a previous batch.
+    /// Lets the union be skipped while output stays on one row (a
+    /// `\r`-redrawn progress bar, a prompt, a line of text). Sound because
+    /// `SelectionDamage::union` is monotone in coverage. Cleared with the
+    /// damage in `take_selection_damage`, so it never speaks for a previous
+    /// batch.
     pub last_output_damage_abs: Option<u64>,
     /// Rows of downward shift the most recent resize applied to the viewport by
-    /// REVEALING retained history (a rows-grow). One-shot; drained by
+    /// revealing retained history (a rows-grow). One-shot; drained by
     /// `Terminal::finalize_resize`.
     ///
-    /// `Grid::resize_with_reflow_mode` already follows this shift for the cursor and
-    /// the saved cursor — "every pre-resize viewport row now sits `revealed` rows
-    /// further down". The SELECTION needs the same compensation, and until Phase 3
-    /// narrowed `finalize_resize` it did not notice: the unconditional clear masked
-    /// it. With the clear gone, uncompensated anchors sit `revealed` rows above their
-    /// content, which is a WRONG-COPY path, not a cosmetic drift.
+    /// `Grid::resize_with_reflow_mode` already shifts the cursor and saved
+    /// cursor by this; the selection needs the same compensation, or its anchors
+    /// sit `revealed` rows above their content and a copy returns the wrong
+    /// text.
     pub last_resize_row_shift: u16,
     /// What the most recent resize did to this grid's rows, every arm counted
     /// (see [`ResizeShape`]). Overwritten by each resize; drained by
-    /// `Terminal`'s resize journal. Kept apart from `last_resize_row_shift`
-    /// so the selection custody that consumes that field is untouched.
+    /// `Terminal`'s resize journal. Separate from `last_resize_row_shift`,
+    /// which the selection consumes.
     pub last_resize_shape: ResizeShape,
-    /// SELECTION CUSTODY Phase 4: whether this batch moved rows in a way that makes a
-    /// HOST's cached grid coordinates untranslatable.
+    /// Whether this batch moved rows in a way that makes a host's cached grid
+    /// coordinates untranslatable.
     ///
-    /// This was the `content_scroll_delta = i32::MAX` sentinel's SECOND job, and it is
-    /// a different question from the selection lattice above. The epoch asks "did
-    /// coordinates MOVE?"; the lattice asks "was CONTENT replaced?". A region scroll
-    /// is both. An EL or a DECERA is only the latter — it rewrites cells without
-    /// moving any row — which is why the two cannot be derived from one another.
+    /// A different question from the selection lattice above: this asks "did
+    /// coordinates move?", the lattice "was content replaced?". A region scroll
+    /// is both; an EL or DECERA only rewrites cells in place, so neither can be
+    /// derived from the other.
     pub coordinates_invalidated: bool,
     /// The row-band moves behind this batch's `coordinates_invalidated`, with
-    /// numbers — see [`RowBandMove`]. Recorded BESIDE the flag, never instead of
-    /// it: every producer still sets `coordinates_invalidated` (or the splice)
-    /// exactly as before, so the epoch contract every host relies on is unchanged,
-    /// and a host that can translate bands reads this as an ADDITIONAL exact
-    /// explanation of that epoch step. Drained once per batch by
-    /// `take_row_band_moves()`.
+    /// numbers; see [`RowBandMove`]. Recorded beside the flag, never instead of
+    /// it: every producer still sets `coordinates_invalidated` (or the splice),
+    /// so the epoch contract is unchanged, and a host that can translate bands
+    /// reads this as an exact explanation of that epoch step. Drained once per
+    /// batch by `take_row_band_moves()`.
     pub row_band_moves: RowBandMoves,
     /// Pending logical-row insertion for durable absolute-row metadata.
     pub pending_absolute_row_update: Option<AbsoluteRowUpdate>,
@@ -474,34 +433,30 @@ pub struct GridPresentationState {
     /// active text selection. Metadata may drain its copy mid-parser to
     /// preserve OSC ordering; selection is adjusted once per complete batch.
     pub pending_selection_row_update: Option<AbsoluteRowUpdate>,
-    /// D-2 PER-ROW CONTENT REVISION: `row_rev[r]` is the value of
-    /// [`row_rev_clock`](Self::row_rev_clock) at the most recent fold that saw
-    /// visible row `r` damaged. One `u64` per VISIBLE row (never per scrollback
-    /// row) — the damage tracker's own coordinate space.
+    /// Per-row content revision: `row_rev[r]` is the
+    /// [`row_rev_clock`](Self::row_rev_clock) value at the most recent fold that
+    /// saw visible row `r` damaged. One `u64` per visible row (never per
+    /// scrollback row), in the damage tracker's coordinate space.
     ///
-    /// The contract consumers rely on, and the ONLY one:
+    /// The contract:
     ///
-    /// > for two folds F1 before F2, `row_rev[r]` differs between them IF row
+    /// > for two folds F1 before F2, `row_rev[r]` differs between them if row
     /// > `r`'s content changed between F1 and F2.
     ///
-    /// The converse does NOT hold and must never be assumed: an unchanged row
-    /// may still be re-stamped (a redundant write, a `Damage::Full` session,
-    /// a foreign consumer's take). Over-reporting costs a repaint;
-    /// under-reporting is a stale frame, so every doubt resolves toward a
-    /// fresh stamp.
+    /// The converse does not hold: an unchanged row may be re-stamped (a
+    /// redundant write, a `Damage::Full` session, a foreign consumer's take).
+    /// Over-reporting costs a repaint; under-reporting is a stale frame.
     ///
-    /// This is the row-identity-STABLE half of the damage fact only. Anything
-    /// that MOVES content between row indices without marking every moved row
-    /// (`mark_scroll_damage` marks only the exposed strip) is invisible here —
-    /// which is why consumers must additionally pin `base_y`,
-    /// `absolute_row_revision`, the alt bit and a zero `display_offset` before
-    /// comparing two snapshots' stamps. See
-    /// `aterm_render::compute_dirty_rows`.
+    /// Content moved between row indices without marking every moved row
+    /// (`mark_scroll_damage` marks only the exposed strip) is invisible here,
+    /// so consumers must also pin `base_y`, `absolute_row_revision`, the alt
+    /// bit and a zero `display_offset` before comparing two snapshots' stamps.
+    /// See `aterm_render::compute_dirty_rows`.
     pub row_rev: Vec<u64>,
     /// Monotone clock the fold stamps [`row_rev`](Self::row_rev) with. Advanced
-    /// once per fold that observes NEW damage, so two folds with nothing between
-    /// them leave every row's revision untouched (an idle frame stays an exact
-    /// gate hit rather than degrading into a whole-screen repaint).
+    /// once per fold that observes new damage, so two folds with nothing
+    /// between them leave every revision untouched (an idle frame stays an
+    /// exact gate hit).
     pub row_rev_clock: u64,
     /// The tracker mark-clock ([`crate::damage::DamageTracker::mark_seq`]) as of
     /// the last fold. The fold is a no-op while this is unchanged, which is what
@@ -532,13 +487,11 @@ fn coalesce_row_splice(
     }
 }
 
-/// Advance the D-2 row-revision clock, SKIPPING zero.
+/// Advance the row-revision clock, skipping zero.
 ///
-/// Zero is the "no stamp / do not trust" sentinel a snapshot carries for a row
-/// no engine fold has ever vouched for, so the clock must never mint it — a
-/// wrapped clock handing out 0 would turn a real revision into "unknown",
-/// which the consumer answers with the brute-force compare (safe), but a
-/// SECOND wrap could then hand 0 to two snapshots and make them compare equal.
+/// Zero is the "no stamp, do not trust" sentinel for a row no fold has
+/// vouched for, so the clock never mints it; otherwise a wrapped clock could
+/// hand 0 to two snapshots and make them compare equal.
 #[inline]
 const fn next_row_rev_clock(clock: u64) -> u64 {
     match clock.wrapping_add(1) {
@@ -569,23 +522,20 @@ impl GridPresentationState {
         }
     }
 
-    /// D-2: fold the CURRENT damage session into the per-row revisions.
+    /// Fold the current damage session into the per-row revisions.
     ///
     /// Idempotent while nothing new has been marked, so the two folds a frame
-    /// performs — the extract's and the following `take_damage`'s — stamp a
-    /// damaged row exactly ONCE between them. Both folds are required:
+    /// performs (the extract's and the following `take_damage`'s) stamp a
+    /// damaged row once between them. Both are required:
     ///
-    /// * the EXTRACT's fold publishes this session's damage to the snapshot
+    /// * the extract's fold publishes this session's damage to the snapshot
     ///   being filled, and
-    /// * the RESET's fold captures damage that a FOREIGN consumer is about to
-    ///   discard (`take_damage` clears the bits for everyone), which no later
-    ///   fold could recover.
+    /// * the reset's fold captures damage a foreign consumer is about to discard
+    ///   (`take_damage` clears the bits for everyone).
     ///
     /// `Damage::Full` re-stamps unconditionally: it keeps no mark clock (see
-    /// [`Damage::mark_seq`]), so "nothing new since the last fold" is not a
-    /// question it can answer, and answering it wrongly is a stale frame. A
-    /// full-damage frame repaints everything anyway, so the cost of the
-    /// unconditional re-stamp lands only on frames that were never cheap.
+    /// [`Damage::mark_seq`]), and a full-damage frame repaints everything
+    /// anyway.
     pub(crate) fn fold_row_revisions(&mut self, visible_rows: u16) {
         let rows = usize::from(visible_rows);
         // A row-count change is a full re-resolve for every consumer (resize
@@ -629,9 +579,9 @@ impl GridPresentationState {
     /// Drain this batch's accumulated selection damage.
     #[inline]
     pub(crate) fn take_selection_damage(&mut self) -> SelectionDamage {
-        // The output guard is an assertion about THIS accumulator's contents, so it
-        // must die with it — otherwise the first print of the next batch, landing on
-        // the same row, would record nothing.
+        // The output guard describes this accumulator, so it is cleared with
+        // it; otherwise the next batch's first print on the same row would
+        // record nothing.
         self.last_output_damage_abs = None;
         std::mem::take(&mut self.selection_damage)
     }
@@ -643,38 +593,32 @@ impl GridPresentationState {
     }
 
     /// Record that screen rows `top..=bottom` moved by `delta` rows (see
-    /// [`RowBandMove`]), COMPOSING with the newest entry when the two moves are
+    /// [`RowBandMove`]), composing with the newest entry when the two moves are
     /// provably one translation.
     ///
-    /// The compose rule: the new move `(top, bottom, delta)` folds into the newest
-    /// entry `(t1, b1, d1)` iff `b1 == bottom`, `d1` and `delta` have the same sign,
-    /// and either `top == t1` or (for DOWNWARD moves only) `top == t1 + d1`. The
-    /// exactness argument, per case, for a mark sitting at original row `r`:
+    /// The new move `(top, bottom, delta)` folds into the newest entry
+    /// `(t1, b1, d1)` iff `b1 == bottom`, `d1` and `delta` have the same sign,
+    /// and either `top == t1` or (downward only) `top == t1 + d1`. For a mark at
+    /// original row `r`:
     ///
     /// * Same band twice (`top == t1`), either sign: the first move sends `r` to
-    ///   `r + d1` or kills it; the second sends the survivor to `r + d1 + delta` or
-    ///   kills it; the rows the first move vacated are blank and hold no mark, so
-    ///   moving them again changes nothing. That is exactly `(t1, b1, d1 + delta)`.
-    ///   This is the Codex Enter (five reverse indices on one region → `+5`) and
-    ///   the pinned phase of its streaming (`(0, 51, -1)` per line).
+    ///   `r + d1` or kills it, the second moves the survivor by `delta` or kills
+    ///   it, and the rows the first vacated are blank. So it equals
+    ///   `(t1, b1, d1 + delta)` (e.g. five reverse indices on one region → `+5`,
+    ///   or `(0, 51, -1)` per streamed line).
     /// * Downward, band narrowed from above by exactly the first displacement
-    ///   (`top == t1 + d1`, `d1 > 0`): the rows the second move excludes,
-    ///   `t1..t1 + d1 - 1`, are precisely the rows the first move vacated — blank, no
-    ///   mark — so excluding them is a no-op on marks and the composite is again
-    ///   `(t1, b1, d1 + delta)`. This is an inline viewport growing one row per
-    ///   line while its top slides down (`(24, 56, +1)` then `(25, 56, +1)`).
-    /// * Upward with `top == t1 + d1` (`d1 < 0`, so `top < t1`) is NOT exact and is
-    ///   refused: the second band is WIDER from above and destroys rows
-    ///   `top..t1 - 1` that the first move never touched, rows that can hold marks
-    ///   the composite `(t1, b1, d1 + delta)` would report as untouched. The only
-    ///   exact upward composition on a shared bottom is the same top.
+    ///   (`top == t1 + d1`, `d1 > 0`): the excluded rows `t1..t1 + d1 - 1` are
+    ///   the ones the first move vacated, so the composite is again
+    ///   `(t1, b1, d1 + delta)` (an inline viewport growing a row per line while
+    ///   its top slides down).
+    /// * Upward with `top == t1 + d1` (`d1 < 0`) is refused: the second band is
+    ///   wider from above and destroys rows `top..t1 - 1` the first move never
+    ///   touched, which the composite would report as untouched.
     ///
-    /// Anything else — a different bottom, mixed signs, any other top — is not one
-    /// viewport slide and is recorded as a SEPARATE entry (the consumer replays them
-    /// in order). When the record is already full (`ROW_BAND_MOVES_PER_BATCH`) or a
-    /// composed displacement would not fit `i16`, the batch is marked `inexact`
-    /// rather than losing a move silently. A zero delta or an inverted band records
-    /// nothing: neither moved a row.
+    /// Anything else is recorded as a separate entry (replayed in order). When
+    /// the record is full (`ROW_BAND_MOVES_PER_BATCH`) or a composed
+    /// displacement would not fit `i16`, the batch is marked `inexact`. A zero
+    /// delta or an inverted band records nothing.
     pub(crate) fn record_row_band_move(&mut self, top: u16, bottom: u16, delta: i16) {
         if delta == 0 || top > bottom {
             return;
@@ -704,7 +648,7 @@ impl GridPresentationState {
         }
     }
 
-    /// Mark this batch's row motion as NOT fully described by its band record —
+    /// Mark this batch's row motion as not fully described by its band record:
     /// the fail-closed bit every non-band coordinate move sets (see
     /// [`RowBandMoves::inexact`]).
     #[inline]
@@ -798,18 +742,16 @@ impl GridPresentationState {
 
     #[inline]
     pub(crate) fn clear_damage(&mut self, visible_rows: u16) {
-        // D-2: capture this session's damage BEFORE discarding it. `reset` is
-        // the one choke point every consumer funnels through, so a foreign
-        // consumer that takes the damage between two of OUR extracts cannot
-        // erase a row change from the revision lane.
+        // Capture this session's damage before discarding it. `reset` is the
+        // choke point every consumer goes through, so a foreign consumer taking
+        // the damage between two of our extracts cannot hide a row change.
         self.fold_row_revisions(visible_rows);
         let was_full = self.damage.is_full();
         self.damage.reset(visible_rows);
         if was_full {
-            // `reset` from `Full` installs a FRESH tracker whose mark clock
-            // restarts at 0. Rewinding the fold's watermark in lockstep keeps
-            // "no mark since the last fold" honest; leaving it high would make
-            // the next real mark compare equal and skip the fold.
+            // `reset` from `Full` installs a fresh tracker whose mark clock
+            // restarts at 0; rewind the fold's watermark in step, or the next
+            // real mark would compare equal and skip the fold.
             self.row_rev_folded_seq = 0;
         }
     }
@@ -819,10 +761,8 @@ impl GridPresentationState {
         if n >= rows {
             self.damage.mark_full();
         } else {
-            // n < rows <= u16::MAX, so (rows - n) and rows both fit in u16.
-            // Equivalent to the previous per-row `mark_row` loop, but a single
-            // range op (the previous `u16::try_from(...).unwrap_or(MAX)` could
-            // never saturate here since i < rows <= u16::MAX).
+            // n < rows <= u16::MAX, so (rows - n) and rows both fit in u16; one
+            // range op marks the exposed rows.
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "rows = u16::from(visible_rows) and n < rows, so both bounds fit in u16"
@@ -840,9 +780,8 @@ mod tests {
         SelectionDamage::Band { lo_abs, hi_abs }
     }
 
-    /// Collect the bands a value names, so a test can state the whole answer. Read
-    /// through `clears_selection`, the consumer-facing spelling: a band the predicate
-    /// is never asked about is a band that cannot clear anything.
+    /// Collect the bands a value names, read through `clears_selection` (the
+    /// consumer-facing spelling), so a test can state the whole answer.
     fn bands_of(damage: SelectionDamage) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
         let cleared = damage.clears_selection(|lo_abs, hi_abs| {
@@ -882,15 +821,10 @@ mod tests {
         assert_eq!(bands_of(forward), vec![(10, 10), (30, 30), (50, 50)]);
     }
 
-    /// Order independence must hold ACROSS THE ARITY BOUND, which is where the first
-    /// implementation failed: it collapsed to the hull on TRANSIENT arity, so a
-    /// sequence that momentarily exceeded the bound lost every gap permanently even
-    /// when its final cover fit. A box border drawn as two overlapping pieces and
-    /// then filled — the commonest TUI shape — does exactly that.
-    ///
-    /// The audit's counterexample, folded both ways. Under the hull degrade the
-    /// forward fold gave `Band { 0, 42 }` — clearing rows 8-20 and 25-31 that nothing
-    /// rewrote — while the reverse fold gave the exact four-band answer.
+    /// Order independence holds across the arity bound: a sequence that
+    /// momentarily exceeds the bound (a box border drawn as two overlapping
+    /// pieces and then filled) keeps its gaps when the final cover fits, folded
+    /// in either order.
     #[test]
     fn union_is_order_independent_past_the_arity_bound() {
         let seq = [
@@ -918,24 +852,16 @@ mod tests {
         assert_eq!(bands_of(forward), vec![(0, 2), (4, 7), (21, 24), (32, 42)]);
     }
 
-    /// Past the bound the set degrades by absorbing a pair, never by collapsing to
-    /// the hull — and whatever it gives up, it still COVERS every damaged row.
+    /// Past the bound the set absorbs a pair, never collapsing to the hull, and
+    /// always covers every damaged row.
     ///
-    /// What is guaranteed here, and what is not, stated exactly:
-    ///
-    /// * GUARANTEED — the result is sorted, disjoint, at most the bound, and covers
-    ///   the union of every recorded band. Coverage is the safety property: the set
-    ///   may over-clear, it can never leave a stale highlight over replaced text.
-    /// * NOT GUARANTEED — WHICH pair absorbs, once the number of bands recorded in
-    ///   one batch exceeds the bound. The accumulator is fixed-capacity, so a batch
-    ///   that transiently overflows absorbs a pair before later bands arrive, and a
-    ///   different arrival order can absorb a different pair. Order independence
-    ///   holds only while the merged count stays within the bound — which is what
-    ///   `union_is_order_independent_past_the_arity_bound` pins, and which covers
-    ///   the real shapes: a box border drawn in pieces then filled, a title row plus
-    ///   a composer box, a status bar plus a viewport repaint. More than eight
-    ///   SEPARATED regions in one batch is a full-screen repaint, where a coarse
-    ///   answer is the honest one.
+    /// * Guaranteed: the result is sorted, disjoint, within the bound, and
+    ///   covers the union of every recorded band (the safety property).
+    /// * Not guaranteed: which pair absorbs once a batch records more bands
+    ///   than the bound, since arrival order can change it. Order independence
+    ///   holds while the merged count fits
+    ///   (`union_is_order_independent_past_the_arity_bound`), which covers the
+    ///   real shapes.
     #[test]
     fn overflow_absorbs_a_pair_and_still_covers_every_damaged_row() {
         let ten = [
@@ -974,15 +900,10 @@ mod tests {
         }
     }
 
-    /// At the bound the set is exact; one past it it gives up a GAP, not the whole
-    /// set. The distinction is the point of the closest-pair rule: a hull degrade
-    /// swallows every gap at once, so one repaint too many cleared a highlight
-    /// nowhere near anything that was rewritten.
-    ///
-    /// What this asserts is deliberately tie-break independent. WHICH pair absorbs
-    /// when several gaps are equally small is not a guarantee the type makes, so
-    /// asserting it would pin an implementation detail; the guarantees are the
-    /// bound, total coverage, and that a row in a LARGE gap survives.
+    /// At the bound the set is exact; one past it gives up a gap, not the whole
+    /// set. Tie-break independent: which of several equally small gaps absorbs
+    /// is not guaranteed, so this checks the bound, total coverage, and that a
+    /// row in a large gap survives.
     #[test]
     fn past_the_arity_bound_one_gap_is_given_up_not_all_of_them() {
         let mut damage = SelectionDamage::None;
@@ -996,9 +917,8 @@ mod tests {
             "at the bound the set is exact, so row 2 sits in a gap"
         );
 
-        // Row 100 is far past the others, so the widest gap by a wide margin is the
-        // one below it. The rule absorbs the SMALLEST gap, so that one never goes —
-        // whatever it does among the equally-spaced bands below.
+        // Row 100 is far past the others, so the widest gap is the one below it;
+        // the rule absorbs the smallest gap, so that one never goes.
         let overflowed = damage.union(band(100, 100));
         let got = bands_of(overflowed);
         assert!(

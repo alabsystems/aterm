@@ -4,26 +4,21 @@
 //! The verb-matrix suite a [`SessionHost`] must pass, and the reference
 //! in-memory host it is proven non-vacuous against.
 //!
-//! Every check drives the verbs THROUGH THE TRAIT and asserts the WIRE shape the
-//! protocol promises — never the host's internals. That is what makes "aterm and
-//! the daemon answer the same protocol" a checkable claim rather than a hope.
+//! Every check drives the verbs through the trait and asserts the wire shape
+//! the protocol promises, never the host's internals, so "aterm and the daemon
+//! answer the same protocol" is checkable.
 //!
-//! LIVE HOSTS: the suite is meant to be pointed at a REAL session, so no check
-//! may leave the user's state altered. The `select`-driving checks snapshot and
-//! restore the selection (`SelectionRestore`); [`run_read_only`] is the subset
-//! that never writes at all.
+//! The suite may run against a live session, so no check leaves state altered:
+//! the `select` checks snapshot and restore the selection (`SelectionRestore`),
+//! and [`run_read_only`] never writes at all.
 //!
-//! A FLOOR, NOT A SHAPE CHECK: passing must mean the host HAS a session, not
-//! merely that it answers about one. Three things carry that. [`check_select`]
-//! ESTABLISHES a selection and reads it back through a later call, which a host
-//! handing out a fresh `Terminal` per accessor cannot survive; [`run_all_declared`]
-//! lets the caller name the capabilities the host is supposed to have, because
-//! every capability-gated check otherwise reads `host.capabilities()` and a host
-//! advertising nothing takes the easy arm of each; and — for the subset that may
-//! not write at all — [`run_read_only_witnessed`] lets the caller name text the
-//! session is holding, because plain [`run_read_only`] carries NO floor and cannot
-//! be given one. See [`check_screen_witness`] for why that is a property of
-//! reading, not a gap someone forgot to close.
+//! Passing must mean the host has a session, not merely that it answers about
+//! one. [`check_select`] establishes a selection and reads it back through a
+//! later call; [`run_all_declared`] lets the caller name the capabilities the
+//! host should have (a host advertising none otherwise takes the easy arm of
+//! each gated check); and [`run_read_only_witnessed`] lets the caller name text
+//! the session holds, since plain [`run_read_only`] cannot carry a floor (see
+//! [`check_screen_witness`]).
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,7 +36,7 @@ use crate::host::{HostCapabilities, Selector, SessionHost};
 use crate::selection;
 
 /// One check's verdict. `failure` is `None` on a pass and carries the observed
-/// bytes on a failure, so a report names WHAT the host answered.
+/// bytes on a failure, so a report names what the host answered.
 #[derive(Debug, Clone)]
 pub struct Outcome {
     /// Stable name of the check (a verb + the property it pins).
@@ -72,13 +67,12 @@ impl Outcome {
     }
 }
 
-/// EVERY check — [`run_read_only`], then [`run_selection_state`], then
-/// [`run_input`] — against `host`'s session `sid`, in order. Never panics: a host
-/// under test reports, it does not abort the harness running it.
+/// Every check ([`run_read_only`], then [`run_selection_state`], then
+/// [`run_input`]) against `host`'s session `sid`, in order. Never panics.
 ///
-/// Safe on a live session: the selection checks put back what they found and the
-/// input check writes a zero-byte frame. Prefer [`run_read_only`] when the session
-/// must not be written at all.
+/// Safe on a live session: the selection checks restore what they found and
+/// the input check writes a zero-byte frame. Use [`run_read_only`] when the
+/// session must not be written at all.
 pub fn run_all<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     let mut outcomes = run_read_only(host, sid);
     outcomes.extend(run_selection_state(host, sid));
@@ -86,18 +80,15 @@ pub fn run_all<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     outcomes
 }
 
-/// [`run_all`] against a host the caller VOUCHES for: `declared` names the
-/// capabilities this host is SUPPOSED to have, and a host that answers as if it
-/// lacks one FAILS — where plain [`run_all`] accepts it.
+/// [`run_all`] against a host whose capabilities the caller vouches for:
+/// `declared` names the capabilities it should have, and a host answering as if
+/// it lacks one fails.
 ///
-/// WHY THE PARAMETER EXISTS. Every capability-gated check reads
-/// `host.capabilities()`, so a host advertising none takes the easy arm of each
-/// (`ERR unsupported` for `copy`, an empty roster, `Some(false)` for a write) and
-/// passes the matrix while serving nothing. Self-declared absence is HONEST for a
-/// host that genuinely lacks a facility and a FREE PASS for one that does not —
-/// only the caller knows which, so the caller says. Use this entry point wherever
-/// the host's shape is known (a shipped host, a gate); [`run_all`] stays the
-/// answer for a host discovered over the wire.
+/// Every gated check reads `host.capabilities()`, so a host advertising none
+/// takes the easy arm of each (`ERR unsupported` for `copy`, an empty roster,
+/// `Some(false)` for a write). Only the caller knows whether that absence is
+/// honest. Use this wherever the host's shape is known (a shipped host, a
+/// gate); [`run_all`] is for a host discovered over the wire.
 pub fn run_all_declared<H: SessionHost>(
     host: &H,
     sid: u64,
@@ -110,21 +101,16 @@ pub fn run_all_declared<H: SessionHost>(
     outcomes
 }
 
-/// The checks that only READ: no selection is touched, no repaint is asked for,
-/// nothing is written to the input sink or the clipboard. ALWAYS safe against a
-/// live session — including one a human is mid-drag in, which restore-and-put-back
-/// cannot claim.
+/// The checks that only read: no selection, repaint request, input or
+/// clipboard write. Always safe against a live session, including one a human
+/// is mid-drag in.
 ///
-/// WHAT PASSING HERE DOES NOT ESTABLISH — read this before using it as a gate.
-/// Every check below is a WIRE-SHAPE check, and a host that serves a fresh empty
-/// `Terminal` from every accessor and advertises no capability at all passes all
-/// six (pinned by `the_unwitnessed_read_only_subset_passes_an_inert_host`). So
-/// this alone is evidence that the host SPEAKS the protocol, never that it has a
-/// session behind it. Two things close that, and both need the caller to say
-/// something the suite cannot find out by reading: name the session's content
-/// ([`run_read_only_witnessed`] — the read-only floor) and name the host's
-/// capabilities ([`run_all_declared`], which writes an empty frame and so is not
-/// in this subset).
+/// These are wire-shape checks only: a host serving a fresh empty `Terminal`
+/// from every accessor with no capabilities passes all six (pinned by
+/// `the_unwitnessed_read_only_subset_passes_an_inert_host`). So this shows the
+/// host speaks the protocol, not that it has a session. For that, name the
+/// session's content ([`run_read_only_witnessed`]) or the host's capabilities
+/// ([`run_all_declared`], which writes an empty frame).
 pub fn run_read_only<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     vec![
         check_blocks(host, sid),
@@ -136,14 +122,10 @@ pub fn run_read_only<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     ]
 }
 
-/// [`run_read_only`] against a session the caller VOUCHES for: `witness` is text
-/// they know session `sid` is holding, and a host that cannot report it FAILS —
-/// where plain [`run_read_only`] accepts it. Still writes nothing, so this remains
-/// the entry point for a session a human is mid-drag in.
-///
-/// Use this wherever the caller knows what is on the session (a gate over a
-/// fixture, a driver that just read the screen); [`run_read_only`] stays the answer
-/// for a session discovered over the wire, with the limits documented on it.
+/// [`run_read_only`] against a session the caller vouches for: `witness` is
+/// text session `sid` is known to hold, and a host that cannot report it fails.
+/// Still writes nothing. Use it wherever the caller knows the session's
+/// content (a gate over a fixture, a driver that just read the screen).
 pub fn run_read_only_witnessed<H: SessionHost>(host: &H, sid: u64, witness: &str) -> Vec<Outcome> {
     // First, so a report reads "the floor was not met" before six shape checks
     // that an empty terminal also satisfies.
@@ -152,9 +134,8 @@ pub fn run_read_only_witnessed<H: SessionHost>(host: &H, sid: u64, witness: &str
     outcomes
 }
 
-/// The checks that must DRIVE the selection to pin their verb's contract. Each
-/// one restores the selection it found, on its failure paths too; see
-/// `SelectionRestore`.
+/// The checks that must drive the selection to pin their verb's contract. Each
+/// restores the selection it found, on failure paths too (`SelectionRestore`).
 pub fn run_selection_state<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     vec![
         check_select(host, sid),
@@ -163,26 +144,22 @@ pub fn run_selection_state<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     ]
 }
 
-/// The checks that reach the INPUT SINK. Separate from [`run_read_only`] because
-/// they call the one method that can move bytes toward a child process — even
-/// though the only frame they write is empty (see [`check_write_input`]).
+/// The checks that reach the input sink, separate from [`run_read_only`]
+/// because they call the one method that can move bytes toward a child process
+/// (though the only frame written is empty; see [`check_write_input`]).
 pub fn run_input<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     vec![check_write_input(host, sid)]
 }
 
-/// Snapshots session `sid`'s selection and puts it back when dropped.
+/// Snapshots session `sid`'s selection and puts it back when dropped, so the
+/// suite can run against a live session with a known selection state.
 ///
-/// Restore rather than an opt-in flag: a suite nobody dares point at a live
-/// session proves nothing about the live host, and the checks below need a KNOWN
-/// selection state to assert anything.
+/// The restore rides `Drop` because every mutating check returns early on the
+/// first mismatch (and a panic takes the same path); a put-back at the end of
+/// the body would be skipped exactly when a check fails.
 ///
-/// The restore rides `Drop` because every mutating check `return`s early on the
-/// first mismatch — a put-back at the end of the body would be skipped by exactly
-/// the runs that matter, leaving a user whose host FAILED the suite with their
-/// selection destroyed as well. A panic in a check takes the same path.
-///
-/// Anchors are live-screen rows, so output scrolling DURING a check ages them by
-/// the scroll delta — the one gap [`run_read_only`] avoids by never writing.
+/// Anchors are live-screen rows, so output scrolling during a check ages them
+/// by the scroll delta.
 struct SelectionRestore<'h, H: SessionHost> {
     host: &'h H,
     sid: u64,
@@ -215,20 +192,18 @@ impl<H: SessionHost> Drop for SelectionRestore<'_, H> {
     }
 }
 
-/// Every capability `declared` names is ADVERTISED by the host AND ANSWERS: a
-/// roster that lists the session under test and resolves it, an input sink that
-/// takes the empty frame. A host may advertise MORE than it was declared with —
-/// this is a floor, not an equality.
+/// Every capability `declared` names is advertised by the host and answers: a
+/// roster listing and resolving the session under test, an input sink taking
+/// the empty frame. A host may advertise more (a floor, not an equality).
 ///
-/// `clipboard` is flag-only ON PURPOSE: probing it means running `copy`, which
-/// over a live selection would write the user's real clipboard; [`check_copy`]'s
-/// empty-selection arm is where that capability is exercised safely.
-/// `frame_source` and `event_loop` are flag-only because neither is observable
-/// through this trait — nothing here can see a pixel or a delivered repaint, which
-/// is what aterm-gui's redraw-conformance binary exists to prove.
+/// `clipboard` is flag-only because probing it would run `copy` and could
+/// write the user's real clipboard ([`check_copy`]'s empty-selection arm
+/// exercises it safely). `frame_source` and `event_loop` are flag-only because
+/// neither is observable through this trait (aterm-gui's redraw-conformance
+/// binary covers them).
 ///
-/// Writes the same EMPTY frame [`check_write_input`] does, so this check belongs
-/// with [`run_input`]'s group rather than [`run_read_only`]'s.
+/// Writes the same empty frame [`check_write_input`] does, so it belongs with
+/// [`run_input`].
 pub fn check_declared_capabilities<H: SessionHost>(
     host: &H,
     sid: u64,
@@ -277,29 +252,21 @@ pub fn check_declared_capabilities<H: SessionHost>(
     Outcome::pass(CHECK)
 }
 
-/// THE READ-ONLY FLOOR: `witness` is text the CALLER knows session `sid` is
-/// holding, and the host must report it. A host manufacturing an EMPTY `Terminal`
-/// per accessor fails, which is what makes a witnessed run mean the host is
-/// answering from the session the caller meant rather than a plausible blank one.
+/// The read-only floor: `witness` is text the caller knows session `sid`
+/// holds, and the host must report it. A host manufacturing an empty
+/// `Terminal` per accessor fails.
 ///
-/// WHY THE CALLER HAS TO SUPPLY IT, rather than the suite deriving a floor.
-/// Every other read-only check is satisfied by a coherent EMPTY terminal — blank
-/// screen, cursor at the origin, no blocks, self-consistent across as many reads
-/// as you like. That is not a defect in the host; it is EXACTLY what a real
-/// session looks like the moment it opens. So any invariant strong enough to
-/// reject the inert host would also reject a legitimate blank live session, and
-/// this subset may not write the state it would need. The knowledge has to come
-/// from outside, and only the caller has it.
+/// The caller must supply it because every other read-only check is satisfied
+/// by a coherent empty terminal, which is also what a real session looks like
+/// the moment it opens; no invariant can reject the inert host without
+/// rejecting that, and this subset may not write.
 ///
-/// SEARCHED on the live screen first, then one screenful of history, because
-/// output landing DURING a run scrolls rows off — otherwise a live gate would fail
-/// at random. The witness must sit within ONE row: nothing here can tell a wrapped
-/// row from two rows.
+/// Searched on the live screen, then one screenful of history (output landing
+/// during a run scrolls rows off). The witness must fit within one row.
 ///
-/// LIMIT: this establishes the host is serving the session's real CONTENT, not
-/// that it RETAINS what a verb writes — no read can tell a live engine from a
-/// fresh one replaying the same bytes. [`check_select`]'s probe is the retention
-/// floor, and it writes.
+/// Limit: this shows the host serves the session's real content, not that it
+/// retains what a verb writes (a fresh engine replaying the same bytes looks
+/// the same). [`check_select`]'s probe is the retention floor, and it writes.
 pub fn check_screen_witness<H: SessionHost>(host: &H, sid: u64, witness: &str) -> Outcome {
     const CHECK: &str = "witness: the text the caller vouches for is on the session";
     if witness.trim().is_empty() {
@@ -316,9 +283,8 @@ pub fn check_screen_witness<H: SessionHost>(host: &H, sid: u64, witness: &str) -
     });
     match found {
         Some(true) => Outcome::pass(CHECK),
-        // A COUNT, not the rows: a report on a live host must not carry the
-        // user's screen off the machine, and blank-vs-populated is the whole
-        // diagnosis anyway.
+        // A count, not the rows: a report must not carry the user's screen off
+        // the machine.
         Some(false) => Outcome::fail(
             CHECK,
             format!(
@@ -344,7 +310,7 @@ fn non_blank_rows<H: SessionHost>(host: &H, sid: u64) -> usize {
     .unwrap_or(0)
 }
 
-/// `blocks` -> `OK <n>\n` then EXACTLY `n` `block …` lines, each carrying the
+/// `blocks` -> `OK <n>\n` then exactly `n` `block …` lines, each carrying the
 /// nine positional/keyed fields in order.
 pub fn check_blocks<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     const CHECK: &str = "blocks: OK <n> header + n `block` lines";
@@ -371,7 +337,7 @@ pub fn check_blocks<H: SessionHost>(host: &H, sid: u64) -> Outcome {
 }
 
 /// `blocks --json` -> the single-line `OK 1\n{json}\n` framing with a `blocks`
-/// ARRAY, so a `--json` client never has to guess whether the body is framed.
+/// array, so a `--json` client never has to guess whether the body is framed.
 pub fn check_blocks_json<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     const CHECK: &str = "blocks --json: OK 1 framing, blocks array";
     let out = selection::cmd_blocks_json(host, sid, "");
@@ -426,14 +392,14 @@ pub fn check_wait<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     }
 }
 
-/// `sessions` -> a NON-EMPTY roster, STRICTLY ascending by sid (the order the wire
-/// lists them), carrying the session under test, and every row spelling an `@<id>`
-/// that [`Selector::parse`] reads back as a stable id — an all-digit `id` would
-/// address some other session's LOCAL sid instead.
+/// `sessions` -> a non-empty roster, strictly ascending by sid, carrying the
+/// session under test, with every row's `@<id>` reading back through
+/// [`Selector::parse`] as a stable id (an all-digit `id` would address another
+/// session's local sid).
 ///
-/// A host that keeps no roster ([`HostCapabilities::roster`] false) must answer
-/// EMPTY. Pinning that arm is the point: it is the only legal empty roster, so a
-/// caller can never read one as "this host has no sessions".
+/// A host keeping no roster ([`HostCapabilities::roster`] false) must answer
+/// empty, the only legal empty roster, so an empty roster never reads as "no
+/// sessions".
 pub fn check_sessions<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     const CHECK: &str = "sessions: ascending non-empty roster, or empty without one";
     let roster = host.sessions();
@@ -476,12 +442,10 @@ pub fn check_sessions<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     Outcome::pass(CHECK)
 }
 
-/// `resolve` -> every roster row round-trips through BOTH selector forms (`@<sid>`
-/// and `@<id>` both answer that row's sid), and a selector NO row carries answers
-/// `None`. The fail-closed half is the load-bearing one: it is what stops an
-/// unknown target quietly becoming whichever session the host happens to hold.
-///
-/// A host with no roster resolves nothing at all — including its own session's sid.
+/// `resolve` -> every roster row round-trips through both selector forms
+/// (`@<sid>` and `@<id>`), and a selector no row carries answers `None`, so an
+/// unknown target never becomes whichever session the host holds. A host with
+/// no roster resolves nothing, including its own sid.
 pub fn check_resolve<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     const CHECK: &str = "resolve: roster rows round-trip, unknown selectors fail closed";
     let roster = host.sessions();
@@ -524,7 +488,7 @@ pub fn check_resolve<H: SessionHost>(host: &H, sid: u64) -> Outcome {
 }
 
 /// A sid no roster row carries, so `resolve`'s fail-closed arm cannot accidentally
-/// name a REAL neighbour session and read its miss as a lie.
+/// name a real neighbour session and read its miss as a lie.
 fn unrostered_sid<H: SessionHost>(host: &H, sid: u64) -> u64 {
     let roster = host.sessions();
     let mut candidate = sid.wrapping_add(1);
@@ -534,17 +498,14 @@ fn unrostered_sid<H: SessionHost>(host: &H, sid: u64) -> u64 {
     candidate
 }
 
-/// A sid this host does not SERVE — a different question from "unrostered", and the
-/// one [`check_write_input`]'s foreign arm actually asks. `with_terminal` is the
-/// read-only oracle, since it and `write_input` are defined by the same "serves
-/// `sid`"; neither the roster nor `sid + 1` can be assumed to answer it.
-///
-/// `None` when nothing probed is foreign: a host answering for sids nobody gave it
-/// cannot demonstrate failing closed at all.
+/// A sid this host does not serve (not the same as "unrostered"), as
+/// [`check_write_input`]'s foreign arm needs. `with_terminal` is the read-only
+/// oracle, since it and `write_input` share the "serves `sid`" definition.
+/// `None` when every probed sid is served.
 fn unserved_sid<H: SessionHost>(host: &H, sid: u64) -> Option<u64> {
     let roster = host.sessions();
     let serves = |c: u64| host.with_terminal(c, |_: &Terminal| ()).is_some();
-    // A rostered SIBLING first: `resolve` hands those out fleet-wide, so it is the
+    // A rostered sibling first: `resolve` hands those out fleet-wide, so it is the
     // misroute a driver can actually make.
     if let Some(sibling) = roster
         .iter()
@@ -553,9 +514,8 @@ fn unserved_sid<H: SessionHost>(host: &H, sid: u64) -> Option<u64> {
     {
         return Some(sibling);
     }
-    // Otherwise past the last rostered sid, so a host serving its WHOLE roster (a
-    // daemon does) still has one to refuse — a scan from `sid` alone finds none.
-    // Bounded so it also ends against a host that answers for every sid.
+    // Then past the last rostered sid, so a host serving its whole roster (a
+    // daemon) still has one to refuse; bounded for a host serving every sid.
     const PROBES: u64 = 64;
     let top = roster.iter().map(|e| e.sid).max().unwrap_or(sid).max(sid);
     (1..=PROBES)
@@ -563,18 +523,15 @@ fn unserved_sid<H: SessionHost>(host: &H, sid: u64) -> Option<u64> {
         .find(|&c| !serves(c))
 }
 
-/// `select` -> `OK\n` for the forms that apply, the EXACT usage / bad-arg strings
-/// for the forms that do not (the error text is wire, not diagnostics), and — the
-/// part no stateless host can fake — a selection ESTABLISHED by one call still
-/// being there for the NEXT one.
+/// `select` -> `OK\n` for the forms that apply, the exact usage / bad-arg
+/// strings for those that do not (the error text is wire), and a selection
+/// established by one call still present for the next.
 ///
-/// THE STATE PROBE is the `extend` pair: `select extend` answers `ERR no
-/// selection` on a cleared selection and `OK` on an established one, so it reads
-/// the session's selection state back THROUGH THE WIRE without needing any text on
-/// the screen (a live session may legitimately be blank). A host that hands out a
-/// fresh `Terminal` per accessor answers `ERR no selection` for both and fails
-/// here — which is what makes passing this suite mean the host HAS a session
-/// rather than merely answers about one.
+/// The state probe is the `extend` pair: `select extend` answers
+/// `ERR no selection` when cleared and `OK` when established, reading the
+/// state back through the wire without needing screen text. A host handing out
+/// a fresh `Terminal` per accessor answers `ERR no selection` for both and
+/// fails.
 ///
 /// Drives the selection; restores the prior one however it exits.
 pub fn check_select<H: SessionHost>(host: &H, sid: u64) -> Outcome {
@@ -596,8 +553,7 @@ pub fn check_select<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     if bad != "ERR bad args\n" {
         return Outcome::fail(CHECK, bad);
     }
-    // Still cleared: the forms above are all rejections, so nothing since the
-    // `clear` selected anything. The arm a stateless host gets right by accident.
+    // Still cleared: every form above was a rejection.
     let unselected = selection::cmd_select(host, sid, "extend 0 1");
     if unselected != "ERR no selection\n" {
         return Outcome::fail(CHECK, format!("extend with nothing selected: {unselected}"));
@@ -616,14 +572,12 @@ pub fn check_select<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     Outcome::pass(CHECK)
 }
 
-/// `selection` -> `OK 0\n` with nothing selected (the same empty framing `text`
-/// uses), checked right after a `select clear` so the state is known — and then
-/// the ROUND TRIP: a row of the session's OWN text, selected and read back as
-/// that text. A host with no session between calls answers `OK 0` here.
+/// `selection` -> `OK 0\n` with nothing selected (checked right after
+/// `select clear`), then the round trip: a row of the session's own text,
+/// selected and read back. A host with no session between calls answers `OK 0`.
 ///
-/// The round trip is conditional on the screen already HOLDING text because the
-/// suite may not write any into a live session; a blank session skips it, and
-/// [`check_select`]'s `extend` probe is the state check that always runs.
+/// The round trip needs text already on screen, since the suite may not write
+/// any; a blank session skips it ([`check_select`]'s probe always runs).
 ///
 /// Drives the selection; restores the prior one however it exits.
 pub fn check_selection<H: SessionHost>(host: &H, sid: u64) -> Outcome {
@@ -645,9 +599,9 @@ pub fn check_selection<H: SessionHost>(host: &H, sid: u64) -> Outcome {
         return Outcome::fail(CHECK, format!("select line {row}: {selected}"));
     }
     let read_back = selection::cmd_selection(host, sid);
-    // A live session can scroll between the read and the select, ageing the row,
-    // so an exact mismatch is only the HOST's when the row still reads the same;
-    // when it moved, a host holding a session still answers a NON-EMPTY selection.
+    // A live session can scroll between the read and the select; an exact
+    // mismatch is the host's only if the row still reads the same, otherwise a
+    // non-empty selection suffices.
     let moved = first_text_row(host, sid).is_none_or(|(r, t)| r != row || t != text);
     if read_back == format!("OK 1\n{text}\n") || (moved && read_back.starts_with("OK 1\n")) {
         Outcome::pass(CHECK)
@@ -659,16 +613,14 @@ pub fn check_selection<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     }
 }
 
-/// The first live-screen row carrying non-blank text, with the text `select
-/// line` will select there. The only content a check can select and read back
-/// WITHOUT writing to the session — hence the round trip above being
-/// conditional rather than assumed.
+/// The first live-screen row with non-blank text, and the text `select line`
+/// selects there: the only content a check can select and read back without
+/// writing.
 ///
-/// LOGICAL line, not physical row: `select line` selects the whole soft-wrapped
-/// run, and the copy joins its rows with NO newline, so the expectation is the
-/// rows of `logical_line_span` concatenated exactly the way
-/// `selection_to_string` concatenates them. Comparing against the clicked row
-/// alone would fail this check on any screen whose first line happens to wrap.
+/// A logical line, not a physical row: `select line` selects the whole
+/// soft-wrapped run and the copy joins its rows with no newline, so the
+/// expectation concatenates `logical_line_span`'s rows as
+/// `selection_to_string` does.
 fn first_text_row<H: SessionHost>(host: &H, sid: u64) -> Option<(i32, String)> {
     host.with_terminal(sid, |t: &Terminal| {
         (0..i32::from(t.rows())).find_map(|row| {
@@ -687,13 +639,11 @@ fn first_text_row<H: SessionHost>(host: &H, sid: u64) -> Option<(i32, String)> {
 }
 
 /// `copy` -> `ERR unsupported` on a host with no clipboard, `OK 0` on one with
-/// a clipboard and nothing selected. This is the capability contract: the host
-/// that cannot do it SAYS so instead of reporting a write that went nowhere.
+/// a clipboard and nothing selected.
 ///
-/// Drives the selection; restores the prior one however it exits. The EMPTY
-/// selection is not incidental — `copy` leaves the clipboard untouched on that
-/// arm, so the suite can never clobber a live system clipboard. Do not "improve"
-/// this check by selecting something first.
+/// Drives the selection; restores the prior one however it exits. The selection
+/// must stay empty: `copy` then leaves the clipboard untouched, so a live
+/// system clipboard is never clobbered.
 pub fn check_copy<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     const CHECK: &str = "copy: ERR unsupported without a clipboard, else OK 0";
     if !host.capabilities().clipboard {
@@ -717,21 +667,18 @@ pub fn check_copy<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     }
 }
 
-/// `write_input` -> the three answers a driver has to be able to trust:
+/// `write_input` -> the three answers a driver must be able to trust:
 ///   * a sid this host does not serve -> `None`, never its own session under a
-///     borrowed number (the misroute [`SessionHost`]'s header warns about);
-///   * its own sid with NO sink -> `Some(false)`, never a false OK;
-///   * its own sid WITH a sink -> `Some(true)`.
+///     borrowed number;
+///   * its own sid with no sink -> `Some(false)`;
+///   * its own sid with a sink -> `Some(true)`.
 ///
-/// Every frame written here is EMPTY, and that is not a gap to "improve": this
-/// suite is meant to run against a session a HUMAN is using, and no non-empty byte
-/// is safe to inject into a live shell. An empty frame still traverses the whole
-/// write path — sid check, then sink — which is where a wrong answer lives. That
-/// bytes actually LAND is proven per host, next to that host's real sink
-/// (`write_input_reaches_the_sink` here, on every platform).
+/// Every frame written is empty, since no byte is safe to inject into a live
+/// shell; an empty frame still traverses the sid check and the sink. That
+/// bytes land is proven per host (`write_input_reaches_the_sink` here).
 ///
-/// The foreign sid is PROBED, not assumed ([`unserved_sid`]), so this arm means the
-/// same thing on a session-scoped host and on a fleet one.
+/// The foreign sid is probed ([`unserved_sid`]), so this works for
+/// session-scoped and fleet hosts alike.
 pub fn check_write_input<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     const CHECK: &str = "write_input: refuses a foreign sid, never a false OK";
     let Some(foreign) = unserved_sid(host, sid) else {
@@ -775,10 +722,9 @@ type ChangeSignal = Arc<(Mutex<u64>, Condvar)>;
 /// no-op, a condvar change signal, a recording input sink and an in-memory
 /// clipboard.
 ///
-/// It exists to keep [`run_all`] honest — a suite only ever run against the host
-/// it was written for proves nothing — and to give a new host implementor
-/// something small to read. Test-only: the downstream hosts the `conformance`
-/// feature serves run the suite against THEMSELVES.
+/// It keeps [`run_all`] honest (a suite run only against the host it was
+/// written for proves nothing) and is small enough for a new implementor to
+/// read. Test-only: downstream hosts run the suite against themselves.
 #[cfg(test)]
 pub struct MemoryHost {
     sid: u64,
@@ -786,9 +732,8 @@ pub struct MemoryHost {
     /// a real session mints, derived from `sid` so a check can predict it.
     id: String,
     term: Arc<Mutex<Terminal>>,
-    /// Everything the verbs have written to the session's input sink, in order.
-    /// A recording sink, NOT a loopback: echoing the bytes back into the engine
-    /// would fake a shell that is not there.
+    /// Everything written to the session's input sink, in order. A recording
+    /// sink, not a loopback (echoing into the engine would fake a shell).
     input: Mutex<Vec<u8>>,
     clipboard: Mutex<Option<String>>,
     capabilities: HostCapabilities,
@@ -798,7 +743,7 @@ pub struct MemoryHost {
 
 #[cfg(test)]
 impl MemoryHost {
-    /// A host owning one 24x80 session numbered `sid`, WITH a clipboard, a roster
+    /// A host owning one 24x80 session numbered `sid`, with a clipboard, a roster
     /// and an input sink.
     #[must_use]
     pub fn new(sid: u64) -> Self {
@@ -829,9 +774,8 @@ impl MemoryHost {
         host
     }
 
-    /// The same host keeping NO roster: `sessions` is empty and `resolve` answers
-    /// nothing. The shape `aterm-gui`'s session-scoped host has, kept here so the
-    /// empty-roster arm of [`check_sessions`] is proven, not assumed.
+    /// The same host keeping no roster (`aterm-gui`'s session-scoped shape), so
+    /// the empty-roster arm of [`check_sessions`] is exercised.
     #[must_use]
     pub fn without_roster(sid: u64) -> Self {
         let mut host = Self::new(sid);
@@ -970,7 +914,7 @@ impl SessionHost for MemoryHost {
     }
 
     fn write_input(&self, sid: u64, bytes: &[u8]) -> Option<bool> {
-        // The sid is checked BEFORE the sink, so a foreign sid can never reach it.
+        // The sid is checked before the sink, so a foreign sid can never reach it.
         (sid == self.sid).then(|| {
             self.capabilities.input_sink && {
                 self.input
@@ -989,24 +933,19 @@ impl SessionHost for MemoryHost {
     }
 
     fn subscribe(&self, sid: u64) -> Box<dyn ChangeWait + '_> {
-        // A foreign sid parks on a signal NOTHING bumps: it times out rather than
+        // A foreign sid parks on a signal nothing bumps: it times out rather than
         // waking on this session's changes.
         let changed = if sid == self.sid {
             Arc::clone(&self.changed)
         } else {
             Arc::new((Mutex::new(0), Condvar::new()))
         };
-        // Bound to a NAME rather than acquired through `changed.0` directly: the
-        // L0 lock-order census resolves a lock's identity from its receiver, and a
-        // tuple field has no name to resolve — the site becomes a per-site UNKNOWN
-        // node, which by construction can never participate in a cycle, so a real
-        // ABBA through this mutex would be invisible to the gate.
-        //
-        // `change_epoch` and not `lock`: identities are keyed by receiver NAME
-        // across the whole scan set, so a generic name merges this counter with
-        // every other `lock` in the workspace. That merge is not hypothetical —
-        // it is half of the false {lock, spill} cycle this crate's extraction
-        // triggered on 2026-08-01.
+        // Bound to a name rather than used through `changed.0`: the L0
+        // lock-order census resolves a lock's identity from its receiver name,
+        // and a tuple field would be an unknown node that can never join a
+        // cycle. `change_epoch`, not `lock`, because identities are keyed by
+        // name across the scan set and a generic name would merge with every
+        // other `lock`.
         let (change_epoch, _) = &*changed;
         let registered_at = *change_epoch.lock().unwrap_or_else(|p| p.into_inner());
         Box::new(MemoryWait {
@@ -1048,7 +987,7 @@ mod tests {
         );
     }
 
-    /// The suite is safe to point at a session someone is USING: every check
+    /// The suite is safe to point at a session someone is using: every check
     /// leaves the selection as it found it, and none of them writes a clipboard.
     #[test]
     fn the_matrix_leaves_a_live_selection_untouched() {
@@ -1072,11 +1011,8 @@ mod tests {
         );
     }
 
-    /// The read-only subset writes NOTHING — not the selection, not the input
-    /// sink, not even a repaint request. That is what makes it unconditionally
-    /// safe, including against a session being dragged in right now. The WITNESSED
-    /// variant is held to the same bar: the floor is worthless if buying it costs
-    /// the property the entry point exists for.
+    /// The read-only subset, witnessed or not, writes nothing: not the
+    /// selection, the input sink, or a repaint request.
     #[test]
     fn the_read_only_subset_writes_nothing() {
         let host = MemoryHost::new(0);
@@ -1096,9 +1032,9 @@ mod tests {
         assert!(host.input().is_empty(), "a read-only check wrote input");
     }
 
-    /// Answers READS from a decoy terminal that always has a selection, so
-    /// `check_selection` fails at its LAST branch — after its `select clear`.
-    /// Writes still land on the real session, which is where the restore shows up.
+    /// Answers reads from a decoy terminal that always has a selection, so
+    /// `check_selection` fails at its last branch, after its `select clear`.
+    /// Writes land on the real session, where the restore shows.
     struct ReadsFromADecoy {
         inner: MemoryHost,
         decoy: Mutex<Terminal>,
@@ -1144,9 +1080,7 @@ mod tests {
         }
     }
 
-    /// A check that FAILS still puts the selection back — the case a restore at
-    /// the end of the body would miss, and the one where the user is already
-    /// having a bad day.
+    /// A failing check still restores the selection.
     #[test]
     fn a_failing_check_still_restores_the_selection() {
         let inner = MemoryHost::new(0);
@@ -1165,7 +1099,7 @@ mod tests {
         assert_eq!(selection::cmd_selection(&host.inner, 0), before);
     }
 
-    /// The restore also survives a PANIC mid-check: `Drop` is the only put-back
+    /// The restore also survives a panic mid-check: `Drop` is the only put-back
     /// no control flow can step around.
     #[test]
     fn the_restore_survives_a_panic() {
@@ -1214,11 +1148,10 @@ mod tests {
         }
     }
 
-    /// `blocks --json` says where the shell's `133;B` put the input's start —
-    /// the column after the prompt — whatever was typed after it: what tells
-    /// a person's typeahead at a returned prompt from the prompt itself (the
-    /// live agent upgrade's relaunch line). NEGATIVE CONTROL: a prompt with
-    /// no `133;B` yet has `"cmdcol":null`.
+    /// `blocks --json` gives where the shell's `133;B` put the input's start
+    /// (the column after the prompt), whatever was typed after it, which tells
+    /// typeahead from the prompt. Negative control: a prompt with no `133;B`
+    /// yet has `"cmdcol":null`.
     #[test]
     fn blocks_json_says_the_column_the_input_starts_at() {
         let host = MemoryHost::new(7);
@@ -1235,9 +1168,9 @@ mod tests {
         assert!(after.contains("\"cmdcol\":9,\"out\":null"), "{after}");
     }
 
-    /// The seam itself refuses the foreign sid — not just the verbs above. The
-    /// dangerous one is `write_input`: a `resolve` on one host followed by a write
-    /// on another must not land keystrokes in the session this host DOES hold.
+    /// The seam itself refuses the foreign sid: a `resolve` on one host
+    /// followed by a `write_input` on another must not land keystrokes in the
+    /// session this host holds.
     #[test]
     fn a_foreign_sid_never_reaches_the_session_the_host_holds() {
         let host = MemoryHost::new(7);
@@ -1257,9 +1190,8 @@ mod tests {
         );
     }
 
-    /// Bytes written for the host's OWN sid reach the sink, and the reply is the
-    /// honest `Some(true)` — the half `check_write_input` cannot assert against a
-    /// live session (see its doc), proven here where the session is ours.
+    /// Bytes written for the host's own sid reach the sink and the reply is
+    /// `Some(true)` (the half `check_write_input` cannot assert live).
     #[test]
     fn write_input_reaches_the_sink() {
         let host = MemoryHost::new(0);
@@ -1288,9 +1220,8 @@ mod tests {
         );
     }
 
-    /// A host that keeps NO roster lists nothing and resolves nothing — and says so
-    /// in its capabilities, which is what keeps its empty `sessions()` from reading
-    /// as "this host has no sessions".
+    /// A host keeping no roster lists and resolves nothing, and says so in its
+    /// capabilities.
     #[test]
     fn a_rosterless_host_lists_nothing_and_resolves_nothing() {
         let host = MemoryHost::without_roster(5);
@@ -1300,16 +1231,15 @@ mod tests {
         assert!(host.sessions().is_empty());
         assert_eq!(host.resolve(Selector::Local(5)), None);
         assert_eq!(host.resolve(Selector::Id(host.id())), None);
-        // The session is still SERVED, which is exactly the distinction: no index,
+        // The session is still served, which is exactly the distinction: no index,
         // not no sessions.
         assert_eq!(selection::cmd_blocks(&host, 5, ""), "OK 0\n");
     }
 
-    /// A host with NO STATE: a fresh `Terminal` per accessor, so nothing a verb
-    /// writes is ever read back; no roster, no clipboard, no sink, no event loop; a
-    /// no-op redraw and a wait that only times out. `seed` is what its throwaway
-    /// engine is fed, so one shape covers both the wholly inert host and one that
-    /// has content on screen and still forgets every selection.
+    /// A host with no state: a fresh `Terminal` per accessor; no roster,
+    /// clipboard, sink or event loop; a no-op redraw and a wait that only times
+    /// out. `seed` feeds its throwaway engine, covering both a wholly inert host
+    /// and one with content that forgets every selection.
     struct ForgetfulHost {
         sid: u64,
         seed: &'static [u8],
@@ -1368,10 +1298,8 @@ mod tests {
         }
     }
 
-    /// THE FLOOR. A host that preserves NO session state — every answer legitimately
-    /// SHAPED, none of it remembered — must fail, or passing the matrix says nothing
-    /// about the host having a session at all. `select`'s state probe is what
-    /// catches it on a blank screen, where no text exists to read back.
+    /// A host preserving no session state must fail the matrix; `select`'s
+    /// state probe catches it even on a blank screen.
     #[test]
     fn a_host_that_keeps_no_session_state_fails_the_matrix() {
         let host = ForgetfulHost { sid: 0, seed: b"" };
@@ -1387,8 +1315,8 @@ mod tests {
         );
     }
 
-    /// MEASURED, so the honest limit on the docs above is not a guess: the
-    /// unwitnessed read-only subset passes a wholly inert host, blank AND seeded.
+    /// The unwitnessed read-only subset passes a wholly inert host, blank and
+    /// seeded (the documented limit).
     #[test]
     fn the_unwitnessed_read_only_subset_passes_an_inert_host() {
         for seed in [b"".as_slice(), b"hello world".as_slice()] {
@@ -1399,14 +1327,11 @@ mod tests {
         }
     }
 
-    /// NON-VACUITY FOR THE ROSTER AND INPUT CHECKS, and the honest limit on them.
-    /// The inert host's empty roster, dead `resolve` and refused write are LEGAL
-    /// while it advertises none of the three — that is exactly the session-scoped
-    /// contract `aterm-gui`'s `GuiHost::new` ships, so no invariant strong enough to
-    /// fail it here could spare that host either. What closes it is the CALLER
-    /// vouching: declare the roster or the sink and the same host fails, naming
-    /// which. (A host that DOES advertise them and answers empty anyway is caught
-    /// with no declaration needed — `each_roster_and_input_arm_goes_red`.)
+    /// The inert host's empty roster, dead `resolve` and refused write are
+    /// legal while it advertises none of them (`aterm-gui`'s `GuiHost::new`
+    /// contract). Declaring the roster or the sink makes the same host fail,
+    /// naming which. A host that advertises them and answers empty is caught
+    /// without a declaration (`each_roster_and_input_arm_goes_red`).
     #[test]
     fn an_inert_host_passes_only_until_the_caller_vouches_for_it() {
         let host = ForgetfulHost { sid: 0, seed: b"" };
@@ -1446,8 +1371,8 @@ mod tests {
         }
     }
 
-    /// With text on the screen the READ-BACK half bites too: the row selects, and
-    /// the next call reads an engine that never saw the selection.
+    /// With text on screen the read-back half fails too: the next call reads an
+    /// engine that never saw the selection.
     #[test]
     fn a_forgetful_host_cannot_read_its_own_selection_back() {
         let host = ForgetfulHost {
@@ -1466,8 +1391,7 @@ mod tests {
         );
     }
 
-    /// THE READ-ONLY FLOOR. The inert host the unwitnessed subset waves through
-    /// FAILS the moment the caller names what the session is supposed to hold.
+    /// The inert host fails once the caller names what the session holds.
     #[test]
     fn an_inert_host_fails_a_witnessed_read_only_run() {
         let host = ForgetfulHost { sid: 0, seed: b"" };
@@ -1486,9 +1410,8 @@ mod tests {
         );
     }
 
-    /// The LIMIT documented on [`check_screen_witness`], MEASURED: a stateless host
-    /// REPLAYING the right bytes satisfies the witness, because no read can tell it
-    /// from a live engine. Retention stays `check_select`'s floor — and still bites.
+    /// The limit on [`check_screen_witness`]: a stateless host replaying the
+    /// right bytes satisfies the witness; `check_select` still catches it.
     #[test]
     fn a_forgetful_host_replaying_the_witness_satisfies_it() {
         let host = ForgetfulHost {
@@ -1507,7 +1430,7 @@ mod tests {
         );
     }
 
-    /// An empty witness is REFUSED. A caller with nothing to vouch for must not get
+    /// An empty witness is refused. A caller with nothing to vouch for must not get
     /// the floor's name on a check that asserted nothing.
     #[test]
     fn an_empty_witness_is_refused() {
@@ -1520,7 +1443,7 @@ mod tests {
     }
 
     /// The reference host, holding real content, passes a witnessed run whole — and
-    /// a sid it does NOT serve fails rather than answering from the session it has.
+    /// a sid it does not serve fails rather than answering from the session it has.
     #[test]
     fn the_reference_host_passes_a_witnessed_run() {
         let host = MemoryHost::new(7);
@@ -1533,7 +1456,7 @@ mod tests {
         assert!(!check_screen_witness(&host, 9, "hello world").passed());
     }
 
-    /// A witness the session has SCROLLED OFF is still found in history: output
+    /// A witness the session has scrolled OFF is still found in history: output
     /// landing mid-run must not fail a live gate.
     #[test]
     fn a_witness_that_scrolled_off_is_found_in_history() {
@@ -1570,10 +1493,8 @@ mod tests {
         input_sink: true,
     };
 
-    /// SELF-DECLARED ABSENCE IS NO LONGER A FREE PASS. Each host below answers
-    /// honestly for what it advertises — so plain `run_all` accepts it, and must —
-    /// but the caller knows it is supposed to have the facility, and saying so
-    /// fails it.
+    /// Each host below answers honestly for what it advertises, so plain
+    /// `run_all` accepts it, but declaring the facility it should have fails it.
     #[test]
     fn a_declared_capability_the_host_answers_as_absent_fails() {
         for (capability, host) in [
@@ -1653,7 +1574,8 @@ mod tests {
             drop(g);
             cv.notify_all();
         });
-        let resp = selection::cmd_wait(&host, 0, "5000");
+        // A hang detector, a minute (AGENTS.md): the completion lands 40 ms in.
+        let resp = selection::cmd_wait(&host, 0, "60000");
         h.join().unwrap();
         assert!(
             resp.starts_with("OK complete ") && resp.contains("exit=0"),
@@ -1661,9 +1583,8 @@ mod tests {
         );
     }
 
-    /// `blocks`/`blocktext` over real OSC-133 content: the shapes `check_blocks`
-    /// asserts are reached with a NON-EMPTY block list, so that check is not
-    /// trivially satisfied by a session with nothing in it.
+    /// `blocks`/`blocktext` over real OSC-133 content, so `check_blocks` sees a
+    /// non-empty block list.
     #[test]
     fn the_block_checks_hold_on_a_populated_session() {
         let host = MemoryHost::new(0);
@@ -1680,11 +1601,10 @@ mod tests {
         }
     }
 
-    /// A block's cwd reaches the wire through [`SessionHost::native_cwd`], in
-    /// BOTH `blocks` forms. The default host prints the engine's RFC 8089 path
-    /// verbatim (right on POSIX, and what every host printed before the seam);
-    /// a host that names paths its own way is what the reader sees — which is
-    /// how the Windows GUI prints `C:\Users\x` for pwsh's `file:///C:/Users//x`.
+    /// A block's cwd reaches the wire through [`SessionHost::native_cwd`] in
+    /// both `blocks` forms: the default prints the engine's RFC 8089 path
+    /// verbatim; a host may name paths its own way (the Windows GUI prints
+    /// `C:\Users\x` for pwsh's `file:///C:/Users//x`).
     #[test]
     fn a_block_cwd_is_printed_through_the_hosts_native_cwd() {
         /// [`MemoryHost`] with only the path naming changed, marked so the
@@ -1745,16 +1665,15 @@ mod tests {
         assert!(json.contains("\"cwd\":\"native:/C:/Users//x\""), "{json}");
     }
 
-    /// ONE contract broken, everything else honest — so every failing arm of the
-    /// roster/resolve/write checks can be WATCHED going red rather than merely
-    /// written. A check nobody has seen fire is decoration.
+    /// One contract broken, everything else honest, so each failing arm of the
+    /// roster/resolve/write checks is seen going red.
     #[derive(Clone, Copy, Debug)]
     enum Deviation {
         /// The control: nothing bent, so a red below is the deviation's doing.
         Honest,
         /// Keeps no roster by its own capabilities, lists anyway.
         ListsWithoutARoster,
-        /// THE PRODUCTION BUG: advertises a roster, answers with an empty one.
+        /// The production BUG: advertises a roster, answers with an empty one.
         RosterDeclaredButEmpty,
         /// Newest first — the wire's ascending order, inverted.
         RosterDescending,
@@ -1859,7 +1778,7 @@ mod tests {
         fn write_input(&self, sid: u64, bytes: &[u8]) -> Option<bool> {
             let honest = self.inner.write_input(sid, bytes);
             match self.deviation {
-                // The lie is the ANSWER to a sid it does not serve, so the served
+                // The lie is the answer to a sid it does not serve, so the served
                 // sid keeps its true reply.
                 Deviation::ServesForeignWrites => Some(honest.unwrap_or(true)),
                 Deviation::SinkDeclaredButDrops => honest.map(|_| false),
@@ -1881,9 +1800,8 @@ mod tests {
         }
     }
 
-    /// EVERY failing arm of `sessions`/`resolve`/`write_input`, watched going RED,
-    /// and the report naming which contract broke — a check that cannot name the
-    /// fault sends its reader hunting.
+    /// Every failing arm of `sessions`/`resolve`/`write_input` goes red, and the
+    /// report names which contract broke.
     #[test]
     fn each_roster_and_input_arm_goes_red() {
         type Check = fn(&DeviantHost, u64) -> Outcome;
@@ -1960,13 +1878,12 @@ mod tests {
         }
     }
 
-    /// A host that ROSTERS one set of sids and SERVES another — the two are not the
-    /// same set, which is the whole fleet-vs-session split. One engine stands in for
-    /// every served session, since only WHICH sids are served is under test here.
+    /// A host that rosters one set of sids and serves another (the
+    /// fleet-vs-session split). One engine stands in for every served session.
     struct ServesTheseSids {
         /// What the per-session methods answer for.
         served: Vec<u64>,
-        /// What `sessions`/`resolve` publish. EMPTY means this host keeps NO roster
+        /// What `sessions`/`resolve` publish. Empty means this host keeps no roster
         /// (`roster: false`) — a different claim from serving nothing.
         rostered: Vec<u64>,
         term: Mutex<Terminal>,
@@ -2046,9 +1963,8 @@ mod tests {
         }
     }
 
-    /// The foreign sid is the SEAM's answer, not the roster's: a host that keeps no
-    /// index must not be failed for serving the sibling a roster-derived guess
-    /// picks.
+    /// The foreign sid is the seam's answer, not the roster's: a host with no
+    /// index is not failed for serving a roster-derived guess.
     #[test]
     fn the_foreign_sid_probe_skips_a_sibling_the_same_host_serves() {
         let host = ServesTheseSids::new([4, 5], []);
@@ -2061,9 +1977,8 @@ mod tests {
         assert!(o.passed(), "{:?}", o.failure);
     }
 
-    /// …and when a ROSTERED sibling is not served, that is the sid to probe with:
-    /// `resolve` hands those out fleet-wide, so refusing one is the misroute a
-    /// driver can actually reach — the shipped `GuiHost`'s shape.
+    /// When a rostered sibling is not served, that is the sid probed: `resolve`
+    /// hands those out fleet-wide (the shipped `GuiHost`'s shape).
     #[test]
     fn the_foreign_sid_probe_prefers_a_rostered_sibling() {
         let host = ServesTheseSids::new([1], 0..=2);
@@ -2072,10 +1987,9 @@ mod tests {
         assert!(o.passed(), "{:?}", o.failure);
     }
 
-    /// A daemon-shaped host SERVES every session it rosters, so the foreign sid has
-    /// to be sought past the roster's end — a fixed scan up from the session under
-    /// test finds only siblings and would fail an honest fleet. The roster checks
-    /// run over the long roster here too.
+    /// A daemon-shaped host serves every session it rosters, so the foreign sid
+    /// is sought past the roster's end. The roster checks run over the long
+    /// roster too.
     #[test]
     fn a_fleet_host_serving_its_whole_roster_still_has_a_foreign_sid() {
         let host = ServesTheseSids::new(0..=99, 0..=99);
@@ -2089,7 +2003,7 @@ mod tests {
         }
     }
 
-    /// The sid check FORGOTTEN: every accessor answers for whatever number it is
+    /// The sid check forgotten: every accessor answers for whatever number it is
     /// handed — the misroute itself.
     struct ServesEverySid(Mutex<Terminal>);
 

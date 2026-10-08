@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Fast non-cryptographic FxHash implementation for aterm (replaces rustc-hash)"
+description = "Fast non-cryptographic hashing for aterm: FxHash (replaces rustc-hash) and the stable FNV-1a/64"
 
 [dependencies]
 # None - zero external dependencies

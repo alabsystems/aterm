@@ -1,104 +1,96 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE QUESTION ANSWER: which key the supervisor presses on an agent's
-//! question dialog — Claude Code's AskUserQuestion as aterm-phase reads it
-//! whole ([`aterm_phase::QuestionDialog`]), and Codex's `Question 1/1` by its
-//! answers' roles — [`answer_question`], ONE rule
-//! [`RULE_ANSWER_RECOMMENDED`], under `[harness] answer_questions`
-//! ([`super::approval::ApprovalCtx::answer_questions`], on by default,
-//! independent of `approve`: a question is no permission).
+//! The question answer: which key the supervisor presses on an agent's
+//! question dialog (Claude Code's AskUserQuestion as
+//! [`aterm_phase::QuestionDialog`] reads it, and Codex's `Question 1/1` by its
+//! answers' roles): [`answer_question`], rule [`RULE_ANSWER_RECOMMENDED`], under
+//! `[harness] answer_questions`
+//! ([`super::approval::ApprovalCtx::answer_questions`], on by default).
 //!
-//! **The ruling it implements** (owner directive of 2026-09-25): "the
-//! harness must not stall on escalating to the user. If this is a Claude
-//! Code setting, set it so these prompts don't happen; otherwise the harness
-//! must choose the recommended option(s) and continue automatically." No
-//! Claude Code setting removes the dialog while leaving the model able to
-//! ask (measured on 2.1.282: the design of 2026-09-25, §A), so the harness
-//! answers it: every option whose LABEL is marked `(Recommended)` — the
-//! tool's own convention, read from the label only, never a description
-//! ([`aterm_phase::Recommended`]) — or option 1 when none is.
+//! No Claude Code setting removes the dialog, so the harness answers it with
+//! every option marked `(Recommended)` ([`aterm_phase::Recommended`]), or
+//! option 1 when none is. Single-select and preview take the lowest marked
+//! option; multi-select toggles every marked option, then `Next`/`Submit`; the
+//! review takes `1. Submit answers`. [`AnswerTarget`] cannot name the
+//! free-text row, the chat row, cancel, Esc or `n`. The focus moves one row at
+//! a time, each move seen landing, and Enter is pressed guarded on the focused
+//! row as drawn ([`Answer::FocusEnter`], never a digit) (owner, 2026-09-25).
 //!
-//! **Which option.** Single-select and the preview form: the lowest-numbered
-//! `Label` option, else the lowest `Wrapped` one (a label whose last row
-//! may be its wrap ends `(Recommended)`, [`aterm_phase::Recommended::Wrapped`]:
-//! pressed, and the journal says so), else option 1. Multi-select: every
-//! `Label` option, else every `Wrapped` one, else option 1 — each toggled
-//! in turn, then the button (`Next`, or `Submit` on the last question). The
-//! review (Submit) tab: `1. Submit answers`. NEVER the free-text row (`Type
-//! something.`, read by its position), the chat row (`Chat about this`),
-//! the review's cancel, Esc or `n` — [`AnswerTarget`] cannot name them.
+//! Codex's question is answered by its `(Recommended)` answer, else the first,
+//! by digit ([`answer_by_role`], [`PromptV2::recommended`]); its Esc is never
+//! pressed.
 //!
-//! **How: Enter on the focused row, never a digit** ([`Answer::FocusEnter`];
-//! the critique of 2026-09-25, R4): the focus is moved to the target one row
-//! at a time, each move seen landing on a fresh read, and Enter is pressed
-//! guarded on the focused row as drawn (`❯ 1. Outlined on meters
-//! (Recommended)`, `❯ 3. [ ] Emoji`) under the screen-generation fence — the
-//! loop's part (`Session::press_question`). The vendor opens every tab with
-//! the focus on option 1 and the review on `1. Submit answers`, and the tool
-//! asks the model to put its recommendation first, so the common answer is
-//! one Enter with no move.
+//! A person's answer is theirs: a selected preview, free text, or a check
+//! outside the recommended set escalates; a moved focus or a skipped review
+//! question is answered only once the person has been quiet for
+//! `human_grace_s`. Escalated, never answered: a form not read whole
+//! ([`QuestionForm::Unknown`]), no visible focus, a question with no
+//! recommendation naming a destructive act
+//! ([`super::turn_end::DESTRUCTIVE_WORDS`]) unless exactly one option refuses
+//! it ([`refuses`]), a focus more than [`MAX_QUESTION_FOCUS_STEPS`] rows
+//! from the target, and an answer whose label or description says it is kept
+//! for every later ask ([`kept`]: Claude Code's own preference questions, the
+//! model switch's `Switch automatically` among them).
 //!
-//! **Codex's question** (measured on 0.156.1) is no dialog read whole: its
-//! reader gives each of the model's answers [`Role::Answer`] (its `None of
-//! the above` row [`Role::Other`]), and the answer is the one marked
-//! `(Recommended)` ([`PromptV2::recommended`]), else the first — by its
-//! DIGIT, which Codex takes at once (measured), guarded on the dialog's
-//! title row ([`answer_by_role`]). Its Esc interrupts the whole turn and is
-//! never pressed.
+//! Under [`QuestionPriority`] `long-term`/`short-term` the supervisor chooses
+//! no option: it writes the word's fixed text ([`LONG_TERM_TEXT`],
+//! [`SHORT_TERM_TEXT`]; [`Answer::Type`]) into a pristine free-text row where
+//! it fits the pane ([`text_fits`]) and presses Enter once a later read shows
+//! exactly that text ([`AnswerTarget::OwnText`]), so the worker decides
+//! ([`choose_text`]). A tab it cannot write on is answered with its
+//! recommended option, and stays so ([`falls_back`]).
 //!
-//! **A person's answer is theirs** (the critique's R2, person evidence):
-//!
-//! * (c) a preview option drawn as selected (` ✔`: a tab a person answered
-//!   and came back to), and (d) text in the free-text row or — multi-select
-//!   — a checked option outside the recommended set, or a checked free-text
-//!   row: ESCALATED, never overwritten. A check INSIDE the recommended set
-//!   that the supervisor did not make, and one it made that a person took
-//!   off, look like its own progress here; the loop, which remembers its
-//!   toggles, hands those over (`approval_loop.rs`).
-//! * (a) the focus where neither the vendor nor the harness put it, and (b)
-//!   the review's `⚠ You have not answered all questions` (only a person's
-//!   Tab or `→` skips a question): answered, but only once the person has
-//!   been quiet — the loop keys no question while the session's person stamp
-//!   (`text --json`'s `"human_ms"`) is younger than `[harness]
-//!   human_grace_s`, for every question key, not only these. The unanswered
-//!   review is submitted (the person's skip stands) and the journal names
-//!   the headers skipped.
-//!
-//! **What is never answered, and escalated** (`a question (AskUserQuestion)
-//! aterm-phase did not read whole: <why>` and its siblings): a form aterm-phase
-//! did not read whole ([`QuestionForm::Unknown`] — a column-1 shape 2.1.282
-//! does not draw, a scrolled list, an opened notes field, a dialog withheld
-//! behind a draft in the composer, a numbering gap); no visible focus (R11:
-//! 2.1.282 always draws one); a question with NO recommended option whose
-//! question, labels or descriptions name a destructive act
-//! ([`super::turn_end::DESTRUCTIVE_WORDS`], R10: option 1 of "Drop the
-//! table?" would be `Yes`) — unless one option, and one only, REFUSES it
-//! ([`refuses`]: `No`, `No, keep it`) and names no act itself: that option
-//! is answered (D2 of the reconciliation of 2026-09-25 — nobody is there to
-//! ask, and the refusal consents to nothing); a multi-select's is never
-//! toggled; and a focus more than
-//! [`MAX_QUESTION_FOCUS_STEPS`] rows from the target. A MARKED recommendation
-//! is answered whatever it says: it is the model's own labelled option, and
-//! what it leads to arrives as its own permission box.
-//!
-//! Pure: the reading and the rows in, a [`Decision`] out. The loop adds what
-//! it alone can know — the person's quiet, the key in flight, the retries
-//! (`approval_loop.rs`).
+//! Pure: the reading and the rows in, a [`Decision`] out; the loop
+//! (`approval_loop.rs`) adds the person's quiet, keys in flight, retries and
+//! its memory of the text it wrote.
 
 use aterm_phase::prompt::{PromptV2, Role};
 use aterm_phase::{
-    QuestionDialog, QuestionFocus, QuestionForm, QuestionOption, QuestionText, Recommended,
+    FreeText, QuestionDialog, QuestionFocus, QuestionForm, QuestionOption, QuestionText,
+    Recommended,
 };
 
-use super::approval::{Answer, AnswerTarget, Choice, Decision};
+use super::approval::{Answer, AnswerTarget, Choice, Decision, QuestionPriority};
 use super::guard::row_guard;
 
 /// The rule id of an answered question (the ledger's, the journal's).
 pub const RULE_ANSWER_RECOMMENDED: &str = "answer-recommended@v1";
 
-/// The most rows the focus is moved before the Enter: the furthest measured
-/// move is option 1 to `Next` in a four-option multi-select, five.
+/// The `long-term` policy text ([`QuestionPriority::LongTerm`]), written into
+/// a question's free-text row. The fixtures' original wording
+/// ([`aterm_phase::prompt::fixtures::MEASURED_LONG_TERM_2_1_283`]) with its
+/// commas, semicolons, hyphens, `then` and quotes removed: a comma in a
+/// multi-select answer reaches Claude CSV-quoted, and every wrapped row must
+/// join back with one space (`the_policy_texts_keep_their_rules`: ASCII, no
+/// digit, no `, ; " - \`, single spaces, words of at most 16 cells, at most 279
+/// bytes, below the paste-placeholder size, no `key `).
+pub const LONG_TERM_TEXT: &str = "Decide yourself: choose the option that best serves long term \
+                                  correctness and total value even at the cost of short term \
+                                  deliverables. Say which you chose and why in one line and \
+                                  continue without asking again. (Answered by the aterm harness \
+                                  by policy. The user was not asked.)";
+
+/// The `short-term` policy text ([`QuestionPriority::ShortTerm`]), under
+/// the same rules as [`LONG_TERM_TEXT`].
+pub const SHORT_TERM_TEXT: &str = "Decide yourself: choose the option that gets the current \
+                                   deliverable done soonest at acceptable risk. Say which you \
+                                   chose and why in one line and continue without asking again. \
+                                   (Answered by the aterm harness by policy. The user was not \
+                                   asked.)";
+
+/// Whether `rule_id` is a question dialog's answer — under any
+/// [`QuestionPriority`] ([`QuestionPriority::rule_id`]). The loop routes a
+/// question's decision by this, never by one rule's id.
+#[must_use]
+pub fn is_question_rule(rule_id: &str) -> bool {
+    QuestionPriority::ALL
+        .into_iter()
+        .any(|p| p.rule_id() == rule_id)
+}
+
+/// The most rows the focus is moved before the Enter: the furthest real move is
+/// option 1 to `Next` in a four-option multi-select, five.
 pub const MAX_QUESTION_FOCUS_STEPS: u32 = 6;
 
 /// How the answer's option was chosen: which the journal's `unproven` says.
@@ -155,7 +147,16 @@ fn recommended(options: &[QuestionOption]) -> (Vec<u8>, Chosen) {
     (vec![1], Chosen::Unmarked)
 }
 
-/// Where `focus` stands in the dialog's FOCUS ORDER, from 0: the options,
+/// The options the window answers a question with, by number
+/// ([`recommended`]'s rule: every `Label` one, else every `Wrapped` one,
+/// else option 1) — for a controller's `recommended` on a multi-select
+/// (`aterm drive answer`), which checks every one of them.
+#[must_use]
+pub fn recommended_set(options: &[QuestionOption]) -> Vec<u8> {
+    recommended(options).0
+}
+
+/// Where `focus` stands in the dialog's focus order, from 0: the options,
 /// then the free-text row, then the multi-select button, then the chat row;
 /// the review's two rows. `None` for no focus, or a row the form has not.
 pub fn focus_position(dialog: &QuestionDialog, focus: QuestionFocus) -> Option<i32> {
@@ -221,11 +222,151 @@ pub fn target_focus(target: AnswerTarget) -> QuestionFocus {
         AnswerTarget::Option(n) => QuestionFocus::Option(n),
         AnswerTarget::Button => QuestionFocus::Button,
         AnswerTarget::ReviewSubmit => QuestionFocus::ReviewSubmit,
+        AnswerTarget::OwnText(_) => QuestionFocus::FreeText,
     }
 }
 
+/// The widest of `rows` in cells (its characters: a question dialog's
+/// rules run the pane's width), for a read that carried no width
+/// ([`super::approval::ApprovalCtx::screen_cols`]).
+#[must_use]
+pub fn widest_row(rows: &[String]) -> u16 {
+    let widest = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+    u16::try_from(widest).unwrap_or(u16::MAX)
+}
+
+/// The pane a question dialog is drawn in, as [`text_fits`] measures it:
+/// its width in cells and its HEIGHT in rows — the pane's (`text --json`'s
+/// `dims`), which the rows a `tail=` read sent are not: the loop reads the
+/// last 40 rows of a taller pane ([`super::approval::ApprovalCtx::screen_rows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pane {
+    /// Its width in cells.
+    pub cols: u16,
+    /// Its height in rows.
+    pub rows: usize,
+}
+
+impl Pane {
+    /// A pane exactly the size of `rows`: as tall as they are, as wide as
+    /// the widest of them — what a read that carried no `dims` says.
+    #[must_use]
+    pub fn of(rows: &[String]) -> Self {
+        Self {
+            cols: widest_row(rows),
+            rows: rows.len(),
+        }
+    }
+}
+
+/// The column a free-text row's text starts at: after its number (`❯ 3. `, the
+/// number at column 2) and, on a multi-select, its checkbox (`[ ] `): 5, or 9
+/// behind the checkbox, for a one-digit number. Every row a typed text wraps
+/// onto starts there.
+#[must_use]
+pub fn label_col(free_text: &FreeText) -> usize {
+    let digits = free_text.n.to_string().len();
+    2 + digits + 2 + if free_text.checked.is_some() { 4 } else { 0 }
+}
+
+/// How many rows `text` wraps onto, greedily at single spaces, in rows `width`
+/// cells wide; `None` when a word is wider than a row.
+#[must_use]
+pub fn wrapped_rows(text: &str, width: usize) -> Option<usize> {
+    let mut rows = 1usize;
+    let mut line = 0usize;
+    for word in text.split(' ') {
+        let w = word.chars().count();
+        if w > width {
+            return None;
+        }
+        if line == 0 {
+            line = w;
+        } else if line + 1 + w <= width {
+            line += 1 + w;
+        } else {
+            rows += 1;
+            line = w;
+        }
+    }
+    Some(rows)
+}
+
+/// How much narrower than the pane, past the label column, a typed text is
+/// estimated to wrap: the focused field wraps one or two cells short of the
+/// pane's edge, so four keeps the estimate at or above the rows drawn.
+const WRAP_MARGIN: usize = 4;
+
+/// Why a tab is answered with its recommended option under a text priority
+/// when [`text_fits`] says the text would not fit its pane.
+const FIT: &str = "the answer would not fit the pane";
+
+/// The same, on a later read of a tab the loop began that way
+/// ([`choose_text`]: a fallback begun is kept to).
+const FIT_KEPT: &str = "the answer would not fit the pane when this tab was begun";
+
+/// Whether `answer`, decided under a TEXT priority on `dialog`, is its
+/// tab's recommended fallback ([`choose_text`]): an Enter on an option of a
+/// single- or multi-select, or on a multi-select's button while its
+/// free-text row holds nothing — keys the text path never decides (it
+/// writes the text, then enters it or the button after it). The loop
+/// latches a question whose tab was decided so, and the decider keeps that
+/// tab on its recommended path ([`answer_question`]'s `fell_back`).
+#[must_use]
+pub fn falls_back(dialog: &QuestionDialog, answer: &Answer) -> bool {
+    match (&dialog.form, answer.enter_target()) {
+        (
+            QuestionForm::Single { .. } | QuestionForm::Multi { .. },
+            Some(AnswerTarget::Option(_)),
+        ) => true,
+        (QuestionForm::Multi { free_text, .. }, Some(AnswerTarget::Button)) => free_text.pristine,
+        _ => false,
+    }
+}
+
+/// Whether `text`, written into the pristine free-text row of the question on
+/// `rows` (`prompt`, drawn in `pane`), is estimated to leave the dialog whole
+/// on screen. The field wraps at `label_col` ([`label_col`]) in rows
+/// `pane.cols − label_col − 4` wide ([`WRAP_MARGIN`]), and the dialog grows by
+/// the rows past the first ([`wrapped_rows`]), upward when it sits at the
+/// pane's foot. It fits when the dialog as drawn (the rule over its tab bar to
+/// the last row under it) plus that growth plus one spare row is no taller than
+/// the pane (`pane.rows`, never the row count of a `tail=` read). A dialog
+/// outgrowing the pane would lose its head, so a tab that does not fit is
+/// answered with its recommended option ([`choose_text`]). Only this tab's
+/// growth is estimated.
+#[must_use]
+pub fn text_fits(
+    prompt: &PromptV2,
+    rows: &[String],
+    pane: Pane,
+    label_col: usize,
+    text: &str,
+) -> bool {
+    let width = usize::from(pane.cols).saturating_sub(label_col + WRAP_MARGIN);
+    let Some(wrapped) = wrapped_rows(text, width) else {
+        return false;
+    };
+    let (title, footer) = prompt.span;
+    let is_rule = |r: &String| {
+        let t = r.trim();
+        !t.is_empty() && t.chars().all(|c| c == '─')
+    };
+    let top = match title.checked_sub(1) {
+        Some(above) if rows.get(above).is_some_and(is_rule) => above,
+        _ => title,
+    };
+    let last = (footer..rows.len())
+        .rev()
+        .find(|&k| !rows[k].trim().is_empty())
+        .unwrap_or(footer);
+    let drawn = last.saturating_sub(top) + 1;
+    // The growth (`wrapped - 1` rows) and one row to spare, in the pane.
+    drawn + wrapped <= pane.rows
+}
+
 /// The destructive word a question with no recommended option names in its
-/// question, its labels or its descriptions (R10), lowercased like the
+/// question, its labels or its descriptions, lowercased like the
 /// turn-end policy's own test.
 fn destructive(question: &QuestionText, options: &[QuestionOption]) -> Option<&'static str> {
     let mut text = question.text.to_lowercase();
@@ -238,7 +379,7 @@ fn destructive(question: &QuestionText, options: &[QuestionOption]) -> Option<&'
     super::turn_end::destructive_word(&text)
 }
 
-/// Whether an option's label REFUSES what its question asks (D2): `No`
+/// Whether an option's label REFUSES what its question asks: `No`
 /// itself, or `No` then a separator (`No, keep it`, `No — leave it`, `No
 /// (skip)`) — never a word that starts with it (`None of these`, `Not
 /// now`, `Now`).
@@ -248,8 +389,8 @@ fn refuses(label: &str) -> bool {
         .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
 }
 
-/// The ONE option that refuses a question that would `w`, naming no act
-/// itself — or why none can answer it (D2).
+/// The one option that refuses a question that would `w`, naming no act
+/// itself, or why none can answer it.
 fn the_refusal<'a, T>(
     w: &str,
     options: &'a [T],
@@ -271,7 +412,29 @@ fn the_refusal<'a, T>(
     }
 }
 
-/// The journal's `unproven` for an answer by the refusing option (D2).
+/// Why the option labelled `label`, described `description`, is no answer
+/// the harness gives: its words say the answer is KEPT for every later ask
+/// ([`aterm_phase::prompt::settles_later`]). Claude Code asks its own
+/// preferences in this dialog, unmarked, its standing answer first:
+/// 2.1.287's model-switch question offers `1. Switch automatically` —
+/// `Continue on <m> now, and switch without asking from now on`, which
+/// writes `switchModelsOnFlag` into the user's settings. A person answers
+/// that.
+fn kept(label: &str, description: &str) -> Option<String> {
+    let said = if description.is_empty() {
+        String::new()
+    } else {
+        format!(" ({description})")
+    };
+    aterm_phase::prompt::settles_later(&format!("{label}\n{description}")).then(|| {
+        format!(
+            "a question whose answer `{label}`{said} is kept for every later ask: a person \
+             answers that"
+        )
+    })
+}
+
+/// The journal's `unproven` for an answer by the refusing option.
 fn refused(w: &str) -> String {
     format!("no option is marked (Recommended) and the question would {w}: its one refusal")
 }
@@ -287,26 +450,44 @@ fn moved_off(focus: QuestionFocus) -> Option<&'static str> {
     }
 }
 
-/// THE DECISION on one question dialog (module header). `prompt` is a box of
+/// The decision on one question dialog (module header). `prompt` is a box of
 /// kind [`aterm_phase::PromptKind::Question`], `rows` the screen it was read
-/// from: the press is guarded on the question's first row as drawn (the
-/// review's `1. Submit answers` row), and the loop guards its Enter on the
-/// focused row as drawn.
+/// from (the press is guarded on the question's first row as drawn, and the
+/// loop guards its Enter on the focused row). `priority` says how
+/// ([`QuestionPriority::Recommended`]: [`choose`] and [`answer_by_role`]; a
+/// text priority: [`choose_text`]), `own` which priority's text the loop
+/// remembers writing into this question's field, `fell_back` whether the loop
+/// already decided this tab on its recommended option ([`falls_back`]), and
+/// `pane` the pane it is drawn in (for [`text_fits`]).
 #[must_use]
-pub fn answer_question(prompt: &PromptV2, rows: &[String]) -> Decision {
+pub fn answer_question(
+    prompt: &PromptV2,
+    rows: &[String],
+    priority: QuestionPriority,
+    own: Option<QuestionPriority>,
+    fell_back: bool,
+    pane: Pane,
+) -> Decision {
     let Some(dialog) = prompt.question_dialog.as_ref() else {
-        return answer_by_role(prompt, rows);
+        let by_role = answer_by_role(prompt, rows);
+        return match priority.text() {
+            None => by_role,
+            // No free-text row the supervisor writes: its recommended answer,
+            // said, under the word's own rule.
+            Some(_) => fall_back_to(
+                by_role,
+                priority,
+                "a question read by its answers' roles has no free-text row the supervisor \
+                 writes",
+            ),
+        };
     };
     if let QuestionForm::Unknown { why } = dialog.form {
-        return Decision::escalate(format!(
-            "a question (AskUserQuestion) aterm-phase did not read whole: {why}"
-        ));
+        return Decision::escalate(format!("a question aterm could not read whole: {why}"));
     }
     let focus = dialog.focus();
     let Some(from) = focus_position(dialog, focus) else {
-        return Decision::escalate(
-            "a question with no visible focus: aterm-phase did not read where the ❯ is",
-        );
+        return Decision::escalate("a question with no visible focus (no ❯ row read)");
     };
     let Some(guard) = dialog
         .guard_row()
@@ -315,7 +496,28 @@ pub fn answer_question(prompt: &PromptV2, rows: &[String]) -> Decision {
     else {
         return Decision::escalate("a question whose question row is not on the rows read");
     };
-    let (target, subject, unproven) = match choose(dialog) {
+    let chosen = match priority.text() {
+        None => choose(dialog).map(|(target, subject, unproven)| TextChosen {
+            target,
+            typed: false,
+            subject,
+            unproven,
+        }),
+        Some(text) => choose_text(
+            prompt,
+            dialog,
+            rows,
+            (priority, text),
+            (own, fell_back),
+            pane,
+        ),
+    };
+    let TextChosen {
+        target,
+        typed,
+        subject,
+        unproven,
+    } = match chosen {
         Ok(chosen) => chosen,
         Err(why) => return Decision::escalate(why),
     };
@@ -330,24 +532,275 @@ pub fn answer_question(prompt: &PromptV2, rows: &[String]) -> Decision {
             steps.unsigned_abs()
         ));
     }
+    // Moved off a row the answer never chooses — which the free-text row is
+    // not, when it is the row a policy text goes to.
     let unproven = match moved_off(focus) {
-        Some(note) if steps != 0 => format!("{unproven}; {note}"),
+        Some(note) if steps != 0 && target_focus(target) != QuestionFocus::FreeText => {
+            format!("{unproven}; {note}")
+        }
         _ => unproven,
     };
+    let answer = if typed {
+        Answer::Type {
+            steps,
+            text: priority,
+        }
+    } else {
+        Answer::FocusEnter { steps, target }
+    };
     Decision::Approve {
-        rule_id: RULE_ANSWER_RECOMMENDED,
-        choice: Choice::Answer(Answer::FocusEnter { steps, target }),
+        rule_id: priority.rule_id(),
+        choice: Choice::Answer(answer),
         guard,
         subject,
         unproven: Some(unproven),
     }
 }
 
+/// The fallback said, spelled once: a tab answered by its recommended option
+/// under text word `word` because `why`: the subject `<subject> (recommended:
+/// <why>)` (what `CHOSE` and the ledger name) and the journal's `policy <word>:
+/// <why>: <how>`, where `subject` and `how` are the recommended path's own.
+fn said_fallback(subject: &str, word: &str, why: &str, how: &str) -> (String, String) {
+    (
+        format!("{subject} (recommended: {why})"),
+        format!("policy {word}: {why}: {how}"),
+    )
+}
+
+/// A recommended-path decision taken under the text priority `priority`
+/// instead, because `why`: ledgered under the word's own rule, the
+/// fallback said as [`choose_text`] says its own ([`said_fallback`]). An
+/// escalation stays one. The one rewrite for [`answer_question`]'s dialog
+/// read by its answers' roles and the loop's window that cannot fence a
+/// typed answer (`Session::decide_box`, decision 12).
+pub(crate) fn fall_back_to(decision: Decision, priority: QuestionPriority, why: &str) -> Decision {
+    match decision {
+        Decision::Approve {
+            choice,
+            guard,
+            subject,
+            unproven,
+            ..
+        } => {
+            let (subject, unproven) = said_fallback(
+                &subject,
+                priority.word(),
+                why,
+                &unproven.unwrap_or_default(),
+            );
+            Decision::Approve {
+                rule_id: priority.rule_id(),
+                choice,
+                guard,
+                subject,
+                unproven: Some(unproven),
+            }
+        }
+        other => other,
+    }
+}
+
+/// What a question's decider chose: the row its keys go to, whether the
+/// policy text is written there (`typed`: [`Answer::Type`]) or Enter is
+/// pressed on it, what the ledger names, and the journal's `unproven`.
+struct TextChosen {
+    target: AnswerTarget,
+    typed: bool,
+    subject: String,
+    unproven: String,
+}
+
+/// The policy text's decision on one tab (module header) under `priority`,
+/// whose fixed text is `text`, the loop remembering `own` in the field:
+///
+/// | form | the tab as read | decision |
+/// |---|---|---|
+/// | single | field pristine, no memory | [`text_fits`]: write the text (the focus moved there first), else its recommended option, said |
+/// | single | field pristine, memory | handed over: the text the supervisor wrote is gone |
+/// | single | field holds exactly the text, memory of this priority | Enter on it ([`AnswerTarget::OwnText`]) |
+/// | single | any other text | a person's: handed over |
+/// | multi | an option checked | handed over: a text answer toggles none |
+/// | multi | field pristine and unchecked, no memory | [`text_fits`]: write the text, else its recommended option, said |
+/// | multi | field holds exactly the text, memory, ticked | Enter on the button (the focus moved off the field first) |
+/// | multi | own text, unticked | handed over |
+/// | multi | anything else | a person's: handed over |
+/// | preview | — | its recommended option, said: no free-text row |
+/// | review | a question skipped | handed over |
+/// | review | every question answered | `1. Submit answers` |
+///
+/// A memory of another priority's text (the word changed after writing) hands
+/// the tab over. A destructive unmarked question is answered as the
+/// recommended path answers it (its one refusal; handed over where none
+/// refuses, and on a multi-select), said as a fallback, since nobody is there
+/// to approve the act. A multi-select tab that
+/// does not fit takes its recommended option whatever it has checked.
+///
+/// A fallback begun is kept to (`fell_back`): once a tab was decided on its
+/// recommended option because the text would not fit, the rest of that tab
+/// stays on that path whatever a later read estimates, so the loop's own toggle
+/// is never read back as a person's check. The loop latches it
+/// ([`falls_back`]); the fit is estimated only while it is not.
+fn choose_text(
+    prompt: &PromptV2,
+    dialog: &QuestionDialog,
+    rows: &[String],
+    (priority, text): (QuestionPriority, &str),
+    (own, fell_back): (Option<QuestionPriority>, bool),
+    pane: Pane,
+) -> Result<TextChosen, String> {
+    let word = priority.word();
+    // The recommended option instead, and the journal says why.
+    let fallback = |why: &str| -> Result<TextChosen, String> {
+        let (target, subject, how) = choose(dialog)?;
+        let (subject, unproven) = said_fallback(&subject, word, why, &how);
+        Ok(TextChosen {
+            target,
+            typed: false,
+            subject,
+            unproven,
+        })
+    };
+    let write = |question: &QuestionText| TextChosen {
+        target: AnswerTarget::OwnText(priority),
+        typed: true,
+        subject: format!("{} → the {word} policy text", question.text),
+        unproven: format!(
+            "policy {word}: the worker decides: its policy text written into the free-text row"
+        ),
+    };
+    let decided = |question: &QuestionText, target: AnswerTarget| TextChosen {
+        target,
+        typed: false,
+        subject: format!("{} → decided by the worker ({word})", question.text),
+        unproven: format!("policy {word}: the worker decides by the policy text in its field"),
+    };
+    // An unmarked question that names a destructive act is never left
+    // to the worker: the recommended path answers it.
+    let destructive_unmarked = |question: &QuestionText, options: &[QuestionOption]| {
+        (recommended(options).1 == Chosen::Unmarked)
+            .then(|| destructive(question, options))
+            .flatten()
+            .map(|w| {
+                format!("a question with no recommended option that would {w} is not the worker's")
+            })
+    };
+    let other_word = own.filter(|o| *o != priority).map(|o| {
+        format!(
+            "the supervisor wrote the {} policy text into this question, and the policy is now \
+             {word}: a person answers it",
+            o.word()
+        )
+    });
+    let own_here = own == Some(priority);
+    let gone = "the policy text the supervisor wrote is gone from its free-text row";
+    let not_written = || begun("text in its free-text row the supervisor did not write");
+    match &dialog.form {
+        QuestionForm::Single {
+            question,
+            options,
+            free_text,
+            ..
+        } => {
+            if let Some(why) = other_word {
+                return Err(why);
+            }
+            if let Some(why) = destructive_unmarked(question, options) {
+                return fallback(&why);
+            }
+            if fell_back {
+                return fallback(FIT_KEPT);
+            }
+            if free_text.pristine {
+                if own_here {
+                    return Err(gone.to_string());
+                }
+                if !text_fits(prompt, rows, pane, label_col(free_text), text) {
+                    return fallback(FIT);
+                }
+                return Ok(write(question));
+            }
+            if own_here && free_text.text == text {
+                return Ok(decided(question, AnswerTarget::OwnText(priority)));
+            }
+            Err(not_written())
+        }
+        QuestionForm::Multi {
+            question,
+            options,
+            free_text,
+            ..
+        } => {
+            if let Some(why) = other_word {
+                return Err(why);
+            }
+            if let Some(why) = destructive_unmarked(question, options) {
+                return fallback(&why);
+            }
+            if fell_back {
+                return fallback(FIT_KEPT);
+            }
+            let checked = options.iter().find(|o| o.checked == Some(true));
+            let text_only = |n: u8| {
+                begun(&format!(
+                    "option {n} is checked, and the {word} policy answers this question with \
+                     text only"
+                ))
+            };
+            if free_text.pristine {
+                if own_here {
+                    return Err(gone.to_string());
+                }
+                if free_text.checked == Some(true) {
+                    return Err(begun("its free-text row is checked"));
+                }
+                if !text_fits(prompt, rows, pane, label_col(free_text), text) {
+                    return fallback(FIT);
+                }
+                if let Some(o) = checked {
+                    return Err(text_only(o.n));
+                }
+                return Ok(write(question));
+            }
+            if own_here && free_text.text == text {
+                if let Some(o) = checked {
+                    return Err(text_only(o.n));
+                }
+                if free_text.checked != Some(true) {
+                    return Err(format!(
+                        "the {word} policy text's row reads unticked: its answer would be none"
+                    ));
+                }
+                return Ok(decided(question, AnswerTarget::Button));
+            }
+            Err(not_written())
+        }
+        QuestionForm::Preview { .. } => fallback("a preview question has no free-text row"),
+        QuestionForm::Review { unanswered, .. } => {
+            if let Some(open) = review_open(dialog, *unanswered) {
+                return Err(format!(
+                    "a review with a question unanswered ({open}): under the {word} policy a \
+                     person submits it"
+                ));
+            }
+            choose(dialog).map(|(target, subject, unproven)| TextChosen {
+                target,
+                typed: false,
+                subject,
+                unproven,
+            })
+        }
+        QuestionForm::Unknown { why } => {
+            Err(format!("a question aterm could not read whole: {why}"))
+        }
+    }
+}
+
 /// A question read by its answers' roles, not as a dialog (module header,
 /// "Codex's question"): the answer marked `(Recommended)`, else the first,
 /// by its digit, guarded on the dialog's title row. An unmarked one that
-/// names a destructive act (R10) is answered by its one refusal, as a
-/// dialog's is (D2), and escalated when it has none. A question whose head
+/// names a destructive act is answered by its one refusal, as a
+/// dialog's is, and escalated when it has none. A question whose head
 /// is off the screen, or with no answer to choose, is escalated.
 fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
     let answers: Vec<&aterm_phase::Opt> = prompt
@@ -357,7 +810,7 @@ fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
         .collect();
     let Some(&first) = answers.first() else {
         return Decision::escalate(
-            "a question aterm-phase did not read whole: no dialog, and no answer to choose",
+            "a question aterm could not read whole: no dialog, and no answer to choose",
         );
     };
     if prompt.head_off_screen {
@@ -389,6 +842,9 @@ fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
             }
         }
     }
+    if let Some(why) = kept(&o.label, "") {
+        return Decision::escalate(why);
+    }
     let Some(n) = o.n else {
         return Decision::escalate(format!("the answer `{}` has no number", o.label));
     };
@@ -404,7 +860,7 @@ fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
     }
 }
 
-/// A person has begun answering: theirs to finish (R2 (d)).
+/// A person has begun answering: theirs to finish.
 pub(crate) fn begun(what: &str) -> String {
     format!("a question a person has begun answering ({what}): theirs to finish")
 }
@@ -412,29 +868,9 @@ pub(crate) fn begun(what: &str) -> String {
 /// The row to press Enter on, what the ledger names, and the journal's
 /// `unproven` — or why the question is the person's.
 fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), String> {
-    let label_of = |options: &[QuestionOption], n: u8| {
-        options
-            .iter()
-            .find(|o| o.n == n)
-            .map(|o| o.label.clone())
-            .unwrap_or_default()
-    };
     let no_mark_that_would = |question: &QuestionText, options: &[QuestionOption]| {
         destructive(question, options).map(|w| {
             format!("a question with no recommended option that would {w}: a person answers that")
-        })
-    };
-    // D2: an unmarked question that would do something destructive, answered
-    // by its one refusal — the option, what the ledger names, `unproven`.
-    let refusal = |question: &QuestionText, options: &[QuestionOption]| {
-        destructive(question, options).map(|w| {
-            the_refusal(w, options, |o| format!("{}\n{}", o.label, o.description)).map(|o| {
-                (
-                    AnswerTarget::Option(o.n),
-                    format!("{} → {}", question.text, o.label),
-                    refused(w),
-                )
-            })
         })
     };
     match &dialog.form {
@@ -447,18 +883,7 @@ fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), Str
             if !free_text.pristine {
                 return Err(begun("text in its free-text row"));
             }
-            let (marked, how) = recommended(options);
-            if how == Chosen::Unmarked
-                && let Some(answer) = refusal(question, options)
-            {
-                return answer;
-            }
-            let n = marked[0];
-            Ok((
-                AnswerTarget::Option(n),
-                format!("{} → {}", question.text, label_of(options, n)),
-                how.unproven(),
-            ))
+            choose_one(question, options)
         }
         QuestionForm::Preview {
             question, options, ..
@@ -469,18 +894,7 @@ fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), Str
                     o.n
                 ));
             }
-            let (marked, how) = recommended(options);
-            if how == Chosen::Unmarked
-                && let Some(answer) = refusal(question, options)
-            {
-                return answer;
-            }
-            let n = marked[0];
-            Ok((
-                AnswerTarget::Option(n),
-                format!("{} → {}", question.text, label_of(options, n)),
-                how.unproven(),
-            ))
+            choose_one(question, options)
         }
         QuestionForm::Multi {
             question,
@@ -495,6 +909,13 @@ fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), Str
             let (marked, how) = recommended(options);
             if how == Chosen::Unmarked
                 && let Some(why) = no_mark_that_would(question, options)
+            {
+                return Err(why);
+            }
+            if let Some(why) = options
+                .iter()
+                .filter(|o| marked.contains(&o.n))
+                .find_map(|o| kept(&o.label, &o.description))
             {
                 return Err(why);
             }
@@ -534,18 +955,7 @@ fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), Str
             ))
         }
         QuestionForm::Review { unanswered, .. } => {
-            let open: Vec<&str> = dialog
-                .tabs
-                .iter()
-                .filter(|t| !t.answered)
-                .map(|t| t.header.as_str())
-                .collect();
-            if *unanswered || !open.is_empty() {
-                let open = if open.is_empty() {
-                    "the headers not read".to_string()
-                } else {
-                    open.join(", ")
-                };
+            if let Some(open) = review_open(dialog, *unanswered) {
                 return Ok((
                     AnswerTarget::ReviewSubmit,
                     format!("submit answers (unanswered: {open})"),
@@ -561,12 +971,70 @@ fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), Str
                 "submitted the answers its review lists".to_string(),
             ))
         }
-        QuestionForm::Unknown { why } => Err(format!(
-            "a question (AskUserQuestion) aterm-phase did not read whole: {why}"
-        )),
+        QuestionForm::Unknown { why } => {
+            Err(format!("a question aterm could not read whole: {why}"))
+        }
     }
+}
+
+/// A single-select or preview question's answer ([`choose`]): its
+/// recommended option (else its first), by number — or, unmarked and
+/// destructive, its one refusal — with what the ledger names and the
+/// journal's `unproven`.
+fn choose_one(
+    question: &QuestionText,
+    options: &[QuestionOption],
+) -> Result<(AnswerTarget, String, String), String> {
+    let (marked, how) = recommended(options);
+    // An unmarked question that would do something destructive, answered
+    // by its one refusal — the option, what the ledger names, `unproven`.
+    let (o, unproven) = match destructive(question, options) {
+        Some(w) if how == Chosen::Unmarked => (
+            the_refusal(w, options, |o| format!("{}\n{}", o.label, o.description))?,
+            refused(w),
+        ),
+        _ => (
+            options
+                .iter()
+                .find(|o| o.n == marked[0])
+                .ok_or_else(|| format!("a question with no option {}", marked[0]))?,
+            how.unproven(),
+        ),
+    };
+    if let Some(why) = kept(&o.label, &o.description) {
+        return Err(why);
+    }
+    Ok((
+        AnswerTarget::Option(o.n),
+        format!("{} → {}", question.text, o.label),
+        unproven,
+    ))
+}
+
+/// A review's questions still unanswered, as its answer names them (their
+/// headers, else `the headers not read`) — `None` when every one is
+/// answered.
+fn review_open(dialog: &QuestionDialog, unanswered: bool) -> Option<String> {
+    let open: Vec<&str> = dialog
+        .tabs
+        .iter()
+        .filter(|t| !t.answered)
+        .map(|t| t.header.as_str())
+        .collect();
+    if !unanswered && open.is_empty() {
+        return None;
+    }
+    Some(if open.is_empty() {
+        "the headers not read".to_string()
+    } else {
+        open.join(", ")
+    })
 }
 
 #[cfg(test)]
 #[path = "question_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "question_text_tests.rs"]
+mod text_tests;

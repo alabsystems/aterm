@@ -188,8 +188,7 @@ impl WarmBlock {
     }
 
     /// Decompress to the SERIALIZED page bytes ready for cold re-compression,
-    /// avoiding the redundant re-serialize `to_cold_compressed` used to do
-    /// (`serialize_lines(&self.decompress()?)`) on every warm→cold eviction. Runs the
+    /// without re-serializing on every warm→cold eviction. Runs the
     /// SAME framing validation + failure bookkeeping as [`Self::decompress`] (the
     /// counter increments on any error; `logical_suffix` resets it + trims on
     /// success), then: with NO front-offset trim (`stored_line_count ==

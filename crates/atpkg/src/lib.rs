@@ -66,7 +66,7 @@
 //! **THIS tree is ARMED** (2026-08-15, `atpkg-keys setup --id m3`):
 //! [`PKG_TRUST_ANCHORS`] carries one master key, so a build from this source installs,
 //! verifies and activates signed toolchains for real — see
-//! `docs/ATPKG-KEY-MANAGEMENT.md`, which says so too. (This paragraph claimed the
+//! `docs/RELEASE-KEYS.md`, which says so too. (This paragraph claimed the
 //! opposite while the same file's [`enabled`] doc, 130 lines down, already said
 //! ARMED; a reviewer who believed it would think running the manager could not
 //! touch the fleet.)
@@ -201,6 +201,12 @@ pub mod sysroot;
 /// The read-only USTAR/PAX/GNU bundle parser the extractor drives (retired the
 /// `tar` crate, and with it `xattr` and `filetime` — aterm never WRITES tar).
 pub mod tarread;
+/// Unit-test scratch directories, removed when the test ends however it ends.
+#[cfg(test)]
+pub(crate) mod testdir;
+/// THE toolchain resolution order (`aterm help rust`, the gates). Std-only:
+/// `aterm-verify` compiles this same file.
+pub mod toolchain;
 pub mod tree;
 /// Per-protocol row admission (`https`: host allow-list + payload shape), the
 /// `system = "<bin>"` satisfaction probe and the PATH-shadow probe — both
@@ -333,14 +339,10 @@ pub fn manager_enabled_with(pinned: &[&str]) -> bool {
 pub fn root_key_fingerprint() -> String {
     /// Separator: a control byte, so it can never appear inside a base64 key.
     const SEP: u8 = 0x1F;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = aterm_hash::Fnv1a64::new();
     for key in PKG_TRUST_ANCHORS {
-        for b in key.as_bytes() {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h ^= u64::from(SEP);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h.write(key.as_bytes());
+        h.write_u8(SEP);
     }
-    format!("{h:016x}")
+    format!("{:016x}", h.finish())
 }

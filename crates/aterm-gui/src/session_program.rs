@@ -432,27 +432,7 @@ pub(crate) fn parent_of(pid: i32) -> Option<i32> {
 
 #[cfg(target_os = "macos")]
 fn platform_parent(pid: i32) -> Option<i32> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-    // SAFETY: `info` points at `size` writable bytes of exactly the structure
-    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if read != size {
-        return None;
-    }
-    // SAFETY: the exact-size success above initialized the whole record.
-    let info = unsafe { info.assume_init() };
-    if u32::try_from(pid).ok()? != info.pbi_pid {
-        return None;
-    }
+    let info = crate::quit_safety::pid_bsdinfo(pid)?;
     i32::try_from(info.pbi_ppid).ok()
 }
 
@@ -904,13 +884,13 @@ fn publish_if_current(
 mod tests {
     use super::*;
 
-    /// How long the resolver queue tests wait for something that MUST happen:
-    /// the worker entering a lookup, a completion wake, the queue draining, a
-    /// panicked worker exiting. A hang detector, never a latency budget: each
-    /// passes in milliseconds alone, and a lost wake or a wedged worker never
-    /// arrives at all, so a minute catches it as surely as 2 s did. The checks
-    /// that something does NOT happen keep their own short windows.
-    const MUST_HAPPEN: std::time::Duration = std::time::Duration::from_secs(60);
+    // How long the resolver queue tests wait for something that MUST happen:
+    // the worker entering a lookup, a completion wake, the queue draining, a
+    // panicked worker exiting. A hang detector, never a latency budget: each
+    // passes in milliseconds alone, and a lost wake or a wedged worker never
+    // arrives at all, so a minute catches it as surely as 2 s did. The checks
+    // that something does NOT happen keep their own short windows.
+    use aterm_spec::wait::MUST_HAPPEN;
 
     /// A [`Lookup`] that names the program only — no copy, no PATH verdict —
     /// for the queue tests, which are about WHICH answer publishes.
@@ -956,7 +936,7 @@ mod tests {
         pid: i32,
         expected: impl Fn(&str, Option<&str>) -> bool,
     ) -> Option<(String, Option<String>)> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         loop {
             let head = argv_head_of(pid);
             let settled = head
@@ -975,17 +955,16 @@ mod tests {
     /// group so [`kill_group`] reaches its descendants too (the shim's
     /// `sleep`).
     #[cfg(unix)]
-    fn quiet_child(cmd: &mut std::process::Command) -> &mut std::process::Command {
-        use std::os::unix::process::CommandExt;
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+    fn quiet_child(cmd: &mut aterm_uds::spawnfd::Command) -> &mut aterm_uds::spawnfd::Command {
+        cmd.stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .process_group(0)
     }
 
     /// Kill a [`quiet_child`]'s whole group, then reap the child.
     #[cfg(unix)]
-    fn kill_group(child: &mut std::process::Child) {
+    fn kill_group(child: &mut aterm_uds::spawnfd::Child) {
         if let Ok(pid) = i32::try_from(child.id()) {
             // SAFETY: plain signal delivery to the group this test created
             // (`process_group(0)` makes the child's pid its pgid, and the
@@ -1007,10 +986,10 @@ mod tests {
     /// The window is only that other child's fork-to-exec, so a retry clears
     /// it.
     #[cfg(unix)]
-    fn spawn_fresh_script(script: &std::path::Path) -> std::process::Child {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    fn spawn_fresh_script(script: &std::path::Path) -> aterm_uds::spawnfd::Child {
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         loop {
-            match quiet_child(&mut std::process::Command::new(script)).spawn() {
+            match quiet_child(&mut aterm_uds::spawnfd::command(script)).spawn() {
                 Err(e)
                     if e.kind() == std::io::ErrorKind::ExecutableFileBusy
                         && std::time::Instant::now() < deadline =>
@@ -1474,7 +1453,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_live_process_is_named_by_its_argv0() {
-        let mut child = quiet_child(std::process::Command::new("sleep").arg("30"))
+        let mut child = quiet_child(aterm_uds::spawnfd::command("sleep").arg("30"))
             .spawn()
             .expect("spawn sleep");
         let pid = i32::try_from(child.id()).expect("pid");
@@ -1497,7 +1476,7 @@ mod tests {
             return;
         }
         let mut child = quiet_child(
-            std::process::Command::new("/bin/bash").args(["-c", "exec -a claude sleep 30"]),
+            aterm_uds::spawnfd::command("/bin/bash").args(["-c", "exec -a claude sleep 30"]),
         )
         .spawn()
         .expect("spawn sh");
@@ -1642,6 +1621,7 @@ mod tests {
 
     /// A `KERN_PROCARGS2` buffer as the kernel lays one out: argc, the exec
     /// path, NUL padding, argv, then the environment.
+    #[cfg(target_os = "macos")] // fed only to atpkg::caller_shell::parse_procargs2, macOS-only
     fn procargs2(exec: &str, argv: &[&str], env: &[&str]) -> Vec<u8> {
         let mut buf = i32::try_from(argv.len()).unwrap().to_ne_bytes().to_vec();
         buf.extend_from_slice(exec.as_bytes());
@@ -1802,39 +1782,46 @@ mod tests {
         );
     }
 
+    /// Names the file that releases [`park_for_a_read`]: set only on that
+    /// stand-in.
+    const PARK: &str = "ATERM_PROGRAM_TEST_PARK";
+
     /// A live child of THIS process (the resolver's own read, not a built
     /// buffer): a non-platform binary with a PATH set is measured when this
-    /// process is named its shell, and not when another pid is.
+    /// process is named its shell, and not when another pid is. The child is
+    /// [`park_for_a_read`] as a stand-in, parked until the read is done and
+    /// then required to have run exactly that test: a renamed helper fails
+    /// here instead of standing in for a moment by accident.
     #[cfg(unix)]
     #[test]
     fn a_live_child_is_measured_against_its_real_parent() {
-        let me = std::env::current_exe().expect("exe");
-        let mut child = std::process::Command::new(&me)
-            .arg("--exact")
-            .arg("session_status::program::tests::park_for_a_read")
-            .env("ATERM_PROGRAM_TEST_PARK", "1")
-            .env("PATH", "/nonexistent/agents:/usr/bin")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the test binary");
-        let pid = i32::try_from(child.id()).expect("pid");
+        let scratch = aterm_tempfile::TempDir::new().expect("a scratch dir");
+        let release = scratch.path().join("read");
+        let mut stand_in = crate::test_alone::StandIn::helper(module_path!(), "park_for_a_read");
+        stand_in
+            .command()
+            .env(PARK, &release)
+            .env("PATH", "/nonexistent/agents:/usr/bin");
+        let mut child = [stand_in.spawn()];
+        let pid = i32::try_from(child[0].id()).expect("pid");
         let parent = i32::try_from(std::process::id()).expect("pid");
         let mut read = None;
-        for _ in 0..200 {
-            read = u32::try_from(pid)
-                .ok()
-                .and_then(atpkg::caller_shell::process_args)
-                .filter(|a| a.env_var("ATERM_PROGRAM_TEST_PARK").is_some());
-            if read.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        crate::test_alone::until_or_ended(
+            "a non-platform child's environment is readable",
+            &mut child,
+            || {
+                read = u32::try_from(pid)
+                    .ok()
+                    .and_then(atpkg::caller_shell::process_args)
+                    .filter(|a| a.env_var(PARK).is_some());
+                read.is_some()
+            },
+        );
         let ppid = parent_of(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-        let args = read.expect("a non-platform child's environment is readable");
+        std::fs::write(&release, b"read").expect("release the stand-in");
+        let [child] = child;
+        child.passed();
+        let args = read.expect("read above");
         assert_eq!(ppid, Some(parent));
         let fake = atpkg::store::Layout {
             prefix: std::path::PathBuf::from("/nonexistent"),
@@ -1845,13 +1832,21 @@ mod tests {
         assert_eq!(facts(parent + 1).path, None, "not this shell's child");
     }
 
-    /// The stand-in child's body: parked briefly when asked, so its
-    /// environment can be read.
+    /// The stand-in [`a_live_child_is_measured_against_its_real_parent`]
+    /// reads: inert unless named the file that releases it, and then parked
+    /// until that file exists — for at most a hang detector's minute.
     #[test]
     fn park_for_a_read() {
-        if std::env::var_os("ATERM_PROGRAM_TEST_PARK").is_some() {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-        }
+        let Some(release) = std::env::var_os(PARK) else {
+            return;
+        };
+        let release = std::path::PathBuf::from(release);
+        let released = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(10),
+            || release.exists().then_some(()),
+        );
+        assert!(released.is_some(), "the parent never finished its read");
     }
 
     #[test]

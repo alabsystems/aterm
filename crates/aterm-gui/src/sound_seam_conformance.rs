@@ -1,62 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 CONFORMANCE of the derived `TrailSoundSeam` machine
+//! Tier-1 conformance of the derived `TrailSoundSeam` machine
 //! (`aterm_spec::derive::trail_sound_seam_model`) to the shipping code.
 //!
-//! The model is hand-written Rust describing the seam; this file is what
-//! makes a proof about it a proof about the program. Every step below runs
-//! REAL code and nothing is re-derived:
+//! Every step runs real code:
 //!
-//! * the host fold — `MotionPolicy::resolve` for the accessibility stage and
-//!   [`super::fold_window_audibility`], the function `tick_cursor_fx` calls;
-//! * the writer — `CursorGlow::tick`, then `CursorGlow::sound_seam_open`;
-//! * reader 1, the key path — `keystroke_click_audible` then
-//!   `CursorGlow::cue_keystroke_shifted`, exactly as the key handler chains
-//!   them;
-//! * reader 2, the verb — [`super::verb_seam_inputs`], the ONE constructor
-//!   `App::tone_status` builds its inputs with, then [`super::sound_seam`].
-//!   The config both readers see comes from the real resolver
-//!   (`resolve_trail_presentation` then `resolve_cursor_glow`), not a
-//!   literal. The verb's CALL SITE — that `tone_status` hands the
-//!   constructor the resolved config and the window's engine — is bound by
-//!   `app_input`'s `tone_status_tests`, which drive the real verb after a
-//!   real frame.
+//! * the host fold: `MotionPolicy::resolve` for the accessibility stage and
+//!   [`super::fold_window_audibility`], which `cursor_frame` calls;
+//! * the writer: `CursorGlow::tick`, then `CursorGlow::sound_seam_open`;
+//! * reader 1, the key path: `keystroke_click_audible` then
+//!   `CursorGlow::cue_keystroke_shifted`, chained as the key handler does;
+//! * reader 2, the verb: [`super::verb_seam_inputs`] (the constructor
+//!   `App::tone_status` uses), then [`super::sound_seam`]. The config both
+//!   readers see comes from the real resolver (`resolve_trail_presentation`
+//!   then `resolve_cursor_glow`). The verb's call site is covered by
+//!   `app_input`'s `tone_status_tests`.
 //!
-//! What is projected from where, stated so the binding is not overclaimed:
-//! `seam`, `key` and `tone` are OBSERVED (the engine's seam, the key
-//! chain's answer, the verb's verdict). `master`, `amplitude` and
-//! `dark_cause` are the INPUT CLASS the model action names — read off the
-//! resolved and folded config the engine was handed, never off the engine,
-//! because the engine's answer is what is under test.
+//! `seam`, `key` and `tone` are observed (the engine's seam, the key chain's
+//! answer, the verb's verdict). `master`, `amplitude` and `dark_cause` are the
+//! input class the model action names, read off the config the engine was
+//! handed, never off the engine under test.
 //!
-//! Each observed step is projected onto the model's variables and must be a
-//! successor of the model action its HOST INPUT class names, and every
-//! invariant must hold on it. The run must also VISIT every state the model
-//! can reach, so the binding is two-way: nothing the code does is outside
-//! the model, and nothing the model allows is unexercised.
+//! Each observed step is projected onto the model and must be a successor of
+//! the action its host input class names, with every invariant holding. The
+//! run must also visit every reachable model state, so the binding is two-way.
+//! Every style is driven (`Classic` and `Custom` with the default pack
+//! included), on a real grid and on the three degenerate ones (no columns, no
+//! rows, no cell).
 //!
-//! Every style is driven — `Classic` (whose tick used to return above
-//! every writer of the seam) and `Custom` (with the default pack) included
-//! — on a real grid and on the three degenerate ones (no columns, no rows,
-//! no cell), which used to close the seam like the master switch.
+//! Negative controls replay the defects this binding catches: a host fold that
+//! reads `audible` off the folded (dark) intensity, a verb that reads
+//! `trail_on` as `GlowConfig::enabled` alone, a classic tick that keeps the
+//! previous seam, and a degenerate grid that closes the seam. Each must be
+//! rejected at the named step while the shipping code passes the same case.
 //!
-//! NEGATIVE CONTROLS, so a pass is never vacuous: the same harness is run
-//! with the PRE-FIX host fold (`audible` read off the folded, dark
-//! intensity — exactly what made the engine's zero-amplitude return close
-//! the seam under load shed and Reduce Motion, D1/D2) and with the PRE-FIX
-//! verb (`trail_on` read as `GlowConfig::enabled` alone, substituted into
-//! the shipping constructor's output), and each must be REJECTED at the
-//! named step while the shipping code passes the same case.
-//!
-//! BEFORE A WINDOW'S FIRST FRAME the engine has resolved no seam: a key is
-//! refused (the model's `Key`-before-any-tick witness) and the verb, with
-//! every named gate open, says `closed:engine-silent`. The model's
-//! `EngineSilentIsUnreachable` is a claim about a window that has run a
-//! frame, and `the_verb_before_the_first_frame_is_read_not_invented` pins
-//! the pre-frame reading instead of substituting one.
+//! Before a window's first frame the engine has resolved no seam: a key is
+//! refused (the model's `Key` before any tick) and the verb, with every gate
+//! open, says `closed:engine-silent`. `EngineSilentIsUnreachable` is a claim
+//! about a window that has run a frame;
+//! `the_verb_before_the_first_frame_is_read_not_invented` pins the pre-frame
+//! reading.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, TrailParams};
@@ -74,7 +60,7 @@ use crate::app_config::{
 use crate::motion::{MotionEffect, MotionMode, MotionPolicy};
 use crate::trail_audio::HostState;
 
-/// EVERY style, each with the spelling the resolver is handed.
+/// Every style, each with the spelling the resolver is handed.
 const STYLES: [GlowStyle; 11] = [
     GlowStyle::Lumen,
     GlowStyle::Phaser,
@@ -113,7 +99,7 @@ struct HostInputs {
     trail_knob: bool,
     /// Serious mode is on (it closes both `CursorGlow` and `TerminalSound`).
     serious: bool,
-    /// The RESOLVED brightness knob, before any policy fold.
+    /// The resolved brightness knob, before any policy fold.
     user_intensity: f32,
     mode: MotionMode,
     system_reduce: bool,
@@ -129,9 +115,8 @@ impl HostInputs {
             .amplitude(MotionEffect::CursorGlow)
     }
 
-    /// The model action this input CLASS names. Classified from the host's
-    /// facts, never from what the engine did — the engine's answer is what
-    /// is under test.
+    /// The model action this input class names, classified from the host's
+    /// facts, never from what the engine did.
     fn action(self) -> &'static str {
         if !self.trail_knob || self.serious {
             "TickMasterOff"
@@ -188,26 +173,25 @@ fn domain() -> Vec<HostInputs> {
 /// Which code the harness runs: what ships, or a replay of a fixed defect.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Fold {
-    /// [`fold_window_audibility`] and the engine's own seam — what ships.
+    /// [`fold_window_audibility`] and the engine's own seam: what ships.
     Shipping,
-    /// NEGATIVE CONTROL: the pre-2026-09-22 host law, `audible` read off the
-    /// FOLDED intensity, so any dark frame closes the seam.
+    /// Negative control: `audible` read off the folded intensity, so any dark
+    /// frame closes the seam.
     PreFixDarkIsSilent,
-    /// NEGATIVE CONTROL: the pre-fix classic wake, which returned above
-    /// every writer of the seam — a classic tick past the master switch
-    /// left whatever seam the tick before it left.
+    /// Negative control: a classic wake that returns above every writer of the
+    /// seam, so a classic tick keeps the previous tick's seam.
     PreFixClassicKeepsSeam,
-    /// NEGATIVE CONTROL: the pre-fix degenerate grid, which closed the seam
-    /// like the master switch.
+    /// Negative control: a degenerate grid closes the seam like the master
+    /// switch.
     PreFixEmptyGridCloses,
 }
 
 /// How the harness builds the verb's `trail_on`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Verb {
-    /// [`trail_on`] — what ships.
+    /// [`trail_on`]: what ships.
     Shipping,
-    /// NEGATIVE CONTROL: the pre-fix `GlowConfig::enabled` alone.
+    /// Negative control: `GlowConfig::enabled` alone.
     PreFixEnabledOnly,
 }
 
@@ -247,10 +231,10 @@ fn geom(grid: Grid) -> Geom {
     }
 }
 
-/// The RESOLVED config for one input and style, through the SHIPPING
+/// The resolved config for one input and style, through the shipping
 /// resolver `App::glow_config_for` calls (`resolve_cursor_glow`, after
 /// `resolve_trail_presentation`). `enabled` is formed as the host forms it:
-/// the master knob AND serious mode's `CursorGlow` permission.
+/// the master knob and serious mode's `CursorGlow` permission.
 fn resolved(i: HostInputs, style: GlowStyle) -> GlowConfig {
     let raw = spelling(style);
     let presentation = if style == GlowStyle::Custom {
@@ -305,10 +289,41 @@ fn folded(i: HostInputs, style: GlowStyle, fold: Fold) -> GlowConfig {
     cfg
 }
 
+/// The states a run of ONE model visited, and what that model already
+/// answered about them.
+///
+/// WHY THE ANSWERS (2026-10-05, gate speed): every script starts from the
+/// model's initial state, so the same few states are asked about again by
+/// script after script, and asking was 17% of
+/// [`the_shipping_seam_conforms_to_the_trail_sound_seam_model`]'s samples
+/// (`successors` 518 and `check_invariant` 1,824 of 13,998): 7.6 CPU-s run
+/// alone, 6.0 with them kept. Both are pure functions of the model, the
+/// action and the state: `successors` keeps exactly what the model returned,
+/// and a state enters `visited` only after every invariant held at it, so
+/// neither answer is ever one asking again could change, and every real step
+/// is still judged by it.
+struct Seen<'m> {
+    model: &'m Model,
+    /// Every projected state the run produced; every invariant holds at each.
+    visited: BTreeSet<Vec<(&'static str, i64)>>,
+    /// The model's successors of each `(state, action)` asked so far.
+    successors: BTreeMap<State, BTreeMap<&'static str, Vec<State>>>,
+}
+
+impl<'m> Seen<'m> {
+    fn new(model: &'m Model) -> Self {
+        Self {
+            model,
+            visited: BTreeSet::new(),
+            successors: BTreeMap::new(),
+        }
+    }
+}
+
 /// The harness: one real engine, the model state it is claimed to refine,
 /// and every projected state it visited.
-struct Harness<'m> {
-    model: &'m Model,
+struct Harness<'s, 'm> {
+    seen: &'s mut Seen<'m>,
     glow: CursorGlow,
     state: State,
     now: Instant,
@@ -318,28 +333,42 @@ struct Harness<'m> {
     grid: Grid,
     fold: Fold,
     verb: Verb,
-    visited: &'m mut BTreeSet<Vec<(&'static str, i64)>>,
 }
 
-impl Harness<'_> {
-    fn check(&mut self, action: &str, observed: State) -> Result<(), String> {
-        if !self
-            .model
-            .successors(action, &self.state)
-            .contains(&observed)
+impl Harness<'_, '_> {
+    fn check(&mut self, action: &'static str, observed: State) -> Result<(), String> {
+        let seen = &mut *self.seen;
+        let model = seen.model;
+        let admitted = if let Some(next) = seen
+            .successors
+            .get(&self.state)
+            .and_then(|by_action| by_action.get(action))
         {
+            next.contains(&observed)
+        } else {
+            let next = model.successors(action, &self.state);
+            let admitted = next.contains(&observed);
+            seen.successors
+                .entry(self.state.clone())
+                .or_default()
+                .insert(action, next);
+            admitted
+        };
+        if !admitted {
             return Err(format!(
                 "`{action}` from {:?} cannot reach the observed {observed:?} (last input {:?})",
                 self.state, self.last
             ));
         }
-        for inv in &self.model.invariants {
-            if !self.model.check_invariant(inv.name, &observed) {
-                return Err(format!("{} violated at {observed:?}", inv.name));
+        let key: Vec<(&'static str, i64)> = observed.iter().map(|(k, v)| (*k, *v)).collect();
+        if !seen.visited.contains(&key) {
+            for inv in &model.invariants {
+                if !model.check_invariant(inv.name, &observed) {
+                    return Err(format!("{} violated at {observed:?}", inv.name));
+                }
             }
+            seen.visited.insert(key);
         }
-        self.visited
-            .insert(observed.iter().map(|(k, v)| (*k, *v)).collect());
         self.state = observed;
         Ok(())
     }
@@ -367,7 +396,7 @@ impl Harness<'_> {
             Fold::PreFixEmptyGridCloses if self.grid != Grid::Real => false,
             _ => self.glow.sound_seam_open(),
         };
-        // The input class (see the module note) and the OBSERVED seam.
+        // The input class (see the module note) and the observed seam.
         let mut observed = self.state.clone();
         observed.insert("master", i64::from(cfg.enabled));
         observed.insert("amplitude", i64::from(cfg.enabled && cfg.intensity > 0.0));
@@ -417,7 +446,7 @@ impl Harness<'_> {
     }
 }
 
-/// The verb's inputs for one input, style and engine: the SHIPPING
+/// The verb's inputs for one input, style and engine: the shipping
 /// constructor over the shipping resolver, with the host's own sound knobs
 /// open (the model's `Tone` is about the engine and the aurora config).
 fn verb_inputs(
@@ -448,24 +477,23 @@ fn verb_inputs(
 /// Drive one script — `(input, style, grid)` ticks, each followed by both
 /// readers in the given order — through a fresh engine.
 fn drive(
-    model: &Model,
     script: &[(HostInputs, GlowStyle, Grid)],
     tone_first: bool,
     fold: Fold,
     verb: Verb,
-    visited: &mut BTreeSet<Vec<(&'static str, i64)>>,
+    seen: &mut Seen<'_>,
 ) -> Result<(), String> {
+    let state = seen.model.init_state();
     let mut h = Harness {
-        model,
+        seen,
         glow: CursorGlow::default(),
-        state: model.init_state(),
+        state,
         now: Instant::now(),
         col: 0,
         last: None,
         grid: Grid::Real,
         fold,
         verb,
-        visited,
     };
     // A host that has never ticked records nothing.
     h.key()?;
@@ -510,28 +538,16 @@ fn reachable(model: &Model) -> BTreeSet<Vec<(&'static str, i64)>> {
 }
 
 /// A shipping run of one script: both reader orders.
-fn conforms(
-    model: &Model,
-    script: &[(HostInputs, GlowStyle, Grid)],
-    visited: &mut BTreeSet<Vec<(&'static str, i64)>>,
-) {
+fn conforms(script: &[(HostInputs, GlowStyle, Grid)], seen: &mut Seen<'_>) {
     for tone_first in [false, true] {
-        drive(
-            model,
-            script,
-            tone_first,
-            Fold::Shipping,
-            Verb::Shipping,
-            visited,
-        )
-        .unwrap_or_else(|e| panic!("{script:?} (tone first: {tone_first}): {e}"));
+        drive(script, tone_first, Fold::Shipping, Verb::Shipping, seen)
+            .unwrap_or_else(|e| panic!("{script:?} (tone first: {tone_first}): {e}"));
     }
 }
 
-/// THE CONFORMANCE: every host input on every style and every grid, every
-/// ordered pair of host inputs on the default style, class pairs across a
-/// style switch and across a grid change — and the run covers the model's
-/// whole reachable space.
+/// Every host input on every style and grid, every ordered pair of inputs on
+/// the default style, and class pairs across a style switch and a grid change
+/// conform, and the run covers the model's whole reachable space.
 #[test]
 fn the_shipping_seam_conforms_to_the_trail_sound_seam_model() {
     let model = trail_sound_seam_model();
@@ -540,11 +556,19 @@ fn the_shipping_seam_conforms_to_the_trail_sound_seam_model() {
     let reps = representatives();
     assert_eq!(reps.len(), 5, "every model tick class has a host input");
 
+    // Each script runs on a fresh engine, so the scripts are independent: they
+    // are listed first and run side by side (22 s run in turn on the 6-core
+    // gate host, 2026-10-05), each exactly once, and the states each thread
+    // visited are united before the two-way check below.
+    // A script, and whether it runs in both reader orders (`conforms`) or
+    // tone-last alone.
+    type Script = (Vec<(HostInputs, GlowStyle, Grid)>, bool);
+    let mut scripts: Vec<Script> = Vec::new();
     // Every input on every style and every grid, from a fresh engine.
     for &style in &STYLES {
         for &grid in &GRIDS {
             for &i in &domain {
-                conforms(&model, &[(i, style, grid)], &mut visited);
+                scripts.push((vec![(i, style, grid)], true));
             }
         }
     }
@@ -553,50 +577,70 @@ fn the_shipping_seam_conforms_to_the_trail_sound_seam_model() {
     // switch) is where a latched seam would show.
     for &a in &domain {
         for &b in &domain {
-            drive(
-                &model,
-                &[
+            scripts.push((
+                vec![
                     (a, GlowStyle::RainbowKitty, Grid::Real),
                     (b, GlowStyle::RainbowKitty, Grid::Real),
                 ],
                 false,
-                Fold::Shipping,
-                Verb::Shipping,
-                &mut visited,
-            )
-            .unwrap_or_else(|e| panic!("{a:?} -> {b:?}: {e}"));
+            ));
         }
     }
-    // Class pairs across a STYLE switch (the crossfade and ramp-in path) —
-    // including INTO and OUT OF the classic wake, whose seam used to be
-    // whatever the style before it left.
+    // Class pairs across a style switch (the crossfade and ramp-in path),
+    // including into and out of the classic wake.
     for &sa in &STYLES {
         for &sb in &STYLES {
             for &a in &reps {
                 for &b in &reps {
-                    conforms(
-                        &model,
-                        &[(a, sa, Grid::Real), (b, sb, Grid::Real)],
-                        &mut visited,
-                    );
+                    scripts.push((vec![(a, sa, Grid::Real), (b, sb, Grid::Real)], true));
                 }
             }
         }
     }
-    // Class pairs across a GRID change, both ways, on every style.
+    // Class pairs across a grid change, both ways, on every style.
     for &style in &STYLES {
         for &ga in &GRIDS {
             for &gb in &GRIDS {
                 for &a in &reps {
                     for &b in &reps {
-                        conforms(&model, &[(a, style, ga), (b, style, gb)], &mut visited);
+                        scripts.push((vec![(a, style, ga), (b, style, gb)], true));
                     }
                 }
             }
         }
     }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                let (model, scripts, next) = (&model, &scripts, &next);
+                scope.spawn(move || {
+                    let mut seen = Seen::new(model);
+                    while let Some((script, both)) =
+                        scripts.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    {
+                        if *both {
+                            conforms(script, &mut seen);
+                        } else {
+                            drive(script, false, Fold::Shipping, Verb::Shipping, &mut seen)
+                                .unwrap_or_else(|e| panic!("{script:?}: {e}"));
+                        }
+                    }
+                    seen.visited
+                })
+            })
+            .collect();
+        for worker in workers {
+            visited.extend(
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+    });
 
-    // TWO-WAY: the code reached every state the model can reach.
+    // Two-way: the code reached every state the model can reach.
     let space = reachable(&model);
     let missing: Vec<_> = space.difference(&visited).collect();
     assert!(
@@ -605,9 +649,8 @@ fn the_shipping_seam_conforms_to_the_trail_sound_seam_model() {
     );
     assert_eq!(visited, space);
 
-    // THE FIX, witnessed on both of its causes: a dark frame from Reduce
-    // Motion and one from the load-shed envelope both occur in the domain
-    // and both are heard (the conformance above already required it).
+    // A dark frame from Reduce Motion and one from the load-shed envelope both
+    // occur in the domain and both are heard.
     let reduce = domain.iter().any(|i| {
         i.action() == "TickDarkMotion"
             && MotionPolicy::resolve(i.mode, i.system_reduce, i.focused) == MotionPolicy::Reduced
@@ -633,13 +676,13 @@ fn lit() -> HostInputs {
     }
 }
 
-/// NEGATIVE CONTROL 1 — D1/D2. The pre-fix fold is REJECTED, at a
-/// `TickDarkMotion` step, for BOTH causes, while the shipping fold passes
-/// the identical script.
+/// Negative control 1: the dark-is-silent fold is rejected at a
+/// `TickDarkMotion` step for both causes, while the shipping fold passes the
+/// identical script.
 #[test]
 fn the_pre_fix_fold_is_rejected_by_the_conformance() {
     let model = trail_sound_seam_model();
-    let mut scratch = BTreeSet::new();
+    let mut scratch = Seen::new(&model);
     let lit = lit();
     let reduce_motion = HostInputs {
         system_reduce: true,
@@ -655,17 +698,9 @@ fn the_pre_fix_fold_is_rejected_by_the_conformance() {
             (lit, GlowStyle::RainbowKitty, Grid::Real),
             (dark, GlowStyle::RainbowKitty, Grid::Real),
         ];
-        drive(
-            &model,
-            &script,
-            false,
-            Fold::Shipping,
-            Verb::Shipping,
-            &mut scratch,
-        )
-        .expect("the shipping fold conforms on this script");
+        drive(&script, false, Fold::Shipping, Verb::Shipping, &mut scratch)
+            .expect("the shipping fold conforms on this script");
         let err = drive(
-            &model,
             &script,
             false,
             Fold::PreFixDarkIsSilent,
@@ -678,11 +713,10 @@ fn the_pre_fix_fold_is_rejected_by_the_conformance() {
             "rejected at the dark tick: {err}"
         );
     }
-    // …and over the whole domain it is rejected EXACTLY on the motion class:
-    // everywhere else the old and new folds agree, so the control is sharp.
+    // …and over the whole domain it is rejected exactly on the motion class;
+    // everywhere else the two folds agree.
     for i in domain() {
         let got = drive(
-            &model,
             &[(i, GlowStyle::RainbowKitty, Grid::Real)],
             false,
             Fold::PreFixDarkIsSilent,
@@ -697,19 +731,17 @@ fn the_pre_fix_fold_is_rejected_by_the_conformance() {
     }
 }
 
-/// NEGATIVE CONTROL 2 — the verb's pre-fix `trail_on`, substituted into the
-/// shipping constructor's output. A user-dimmed aurora read
-/// `closed:engine-silent`; the conformance rejects it at the `Tone` step,
-/// and only there. (That `tone_status` itself calls the constructor, with
-/// the resolved config, is `app_input`'s
-/// `a_dimmed_aurora_reads_trail_off_never_engine_silent`.)
+/// Negative control 2: the enabled-only `trail_on`, substituted into the
+/// shipping constructor's output, reads a user-dimmed aurora as
+/// `closed:engine-silent`; the conformance rejects it at the `Tone` step only.
+/// (`app_input`'s `a_dimmed_aurora_reads_trail_off_never_engine_silent` covers
+/// `tone_status` calling the constructor.)
 #[test]
 fn the_pre_fix_verb_is_rejected_by_the_conformance() {
     let model = trail_sound_seam_model();
-    let mut scratch = BTreeSet::new();
+    let mut scratch = Seen::new(&model);
     for i in domain() {
         let got = drive(
-            &model,
             &[(i, GlowStyle::RainbowKitty, Grid::Real)],
             false,
             Fold::Shipping,
@@ -727,26 +759,25 @@ fn the_pre_fix_verb_is_rejected_by_the_conformance() {
     }
 }
 
-/// NEGATIVE CONTROL 3 — the two engine defects this round fixed, replayed:
-/// the classic wake keeping the previous tick's seam, and a degenerate grid
-/// closing it like the master switch. Each is REJECTED at the tick it
-/// happens on, on exactly the classes it got wrong, while the shipping
+/// Negative control 3: the classic wake keeping the previous tick's seam, and a
+/// degenerate grid closing it like the master switch. Each is rejected at the
+/// tick it happens on, on exactly the classes it gets wrong, while the shipping
 /// engine passes the identical scripts.
 #[test]
 fn the_pre_fix_classic_and_empty_grid_seams_are_rejected() {
     let model = trail_sound_seam_model();
-    let mut scratch = BTreeSet::new();
-    let run = |script: &[(HostInputs, GlowStyle, Grid)], fold: Fold, scratch: &mut BTreeSet<_>| {
-        drive(&model, script, false, fold, Verb::Shipping, scratch)
+    let mut scratch = Seen::new(&model);
+    let run = |script: &[(HostInputs, GlowStyle, Grid)], fold: Fold, scratch: &mut Seen<'_>| {
+        drive(script, false, fold, Verb::Shipping, scratch)
     };
     for i in domain() {
         let heard = matches!(i.action(), "TickLit" | "TickDarkMotion");
-        // A FRESH classic window: pre-fix, nothing ever opened its seam.
+        // A fresh classic window: the defect never opens its seam.
         let fresh = [(i, GlowStyle::Classic, Grid::Real)];
         run(&fresh, Fold::Shipping, &mut scratch).expect("the shipping classic tick conforms");
         let got = run(&fresh, Fold::PreFixClassicKeepsSeam, &mut scratch);
         assert_eq!(got.is_err(), heard, "fresh classic {i:?}: {got:?}");
-        // AN EMPTY GRID: pre-fix, a heard window read a closed seam.
+        // An empty grid: the defect reads a heard window's seam as closed.
         for grid in [Grid::NoColumns, Grid::NoRows, Grid::NoCell] {
             let empty = [(i, GlowStyle::RainbowKitty, grid)];
             run(&empty, Fold::Shipping, &mut scratch).expect("the shipping empty grid conforms");
@@ -754,8 +785,8 @@ fn the_pre_fix_classic_and_empty_grid_seams_are_rejected() {
             assert_eq!(got.is_err(), heard, "{grid:?} {i:?}: {got:?}");
         }
     }
-    // A classic tick after another style left the seam OPEN: pre-fix, an
-    // unfocused classic window kept clicking.
+    // A classic tick after another style left the seam open: with the defect,
+    // an unfocused classic window keeps clicking.
     let unfocused = HostInputs {
         focused: false,
         ..lit()
@@ -770,13 +801,11 @@ fn the_pre_fix_classic_and_empty_grid_seams_are_rejected() {
     assert!(err.contains("`TickDarkUnfocused`"), "{err}");
 }
 
-/// BEFORE THE FIRST FRAME, read — never substituted. The engine has
-/// resolved no seam, so a key is refused (the model's `Key` before any tick
-/// answers the same) and the verb, with every named gate open, says
-/// `closed:engine-silent`: no CONFIG gate explains the silence, the window
-/// has simply not drawn. The model's `EngineSilentIsUnreachable` is a claim
-/// about a window that has run a frame, and this pins what the verb says
-/// before one so the claim is not overread.
+/// Before the first frame the verb's answer is read, never substituted: the
+/// engine has resolved no seam, so a key is refused (as the model's `Key`
+/// before any tick) and the verb, with every gate open, says
+/// `closed:engine-silent`. Pins the pre-frame reading so the model's
+/// `EngineSilentIsUnreachable` is not overread.
 #[test]
 fn the_verb_before_the_first_frame_is_read_not_invented() {
     let fresh = CursorGlow::default();

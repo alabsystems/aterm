@@ -24,12 +24,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `keyAEQuitReason`, `'why?'`.
+/// `keyAEQuitReason`, `'why?'`. The quit reason is read only off macOS's quit
+/// Apple Event (`menu::terminate_is_the_systems`).
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const KEY_QUIT_REASON: u32 = u32::from_be_bytes(*b"why?");
 
 /// The quit reasons that are the system's: `kAELogOut` (`logo`),
 /// `kAEReallyLogOut` (`rlgo`), `kAEShowRestartDialog` (`rrst`), `kAERestart`
 /// (`rest`), `kAEShowShutdownDialog` (`rsdn`), `kAEShutDown` (`shut`).
+#[cfg(any(target_os = "macos", test))]
 const SYSTEM_REASONS: [[u8; 4]; 6] = [*b"logo", *b"rlgo", *b"rrst", *b"rest", *b"rsdn", *b"shut"];
 
 /// The generation of the quit the system asked for, or `0` for none (the
@@ -37,6 +40,7 @@ const SYSTEM_REASONS: [[u8; 4]; 6] = [*b"logo", *b"rlgo", *b"rrst", *b"rest", *b
 static SYSTEM_QUIT: AtomicU64 = AtomicU64::new(0);
 
 /// Whether quit reason `code` is a logout, a restart or a shutdown.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn reason_is_the_systems(code: u32) -> bool {
     SYSTEM_REASONS
         .iter()
@@ -45,7 +49,7 @@ pub(crate) fn reason_is_the_systems(code: u32) -> bool {
 
 /// The system asked this process to quit, through the `terminate:` of
 /// `generation`. Only the macOS `terminate:` relay notes one.
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn note(generation: u64) {
     if generation != 0 {
         SYSTEM_QUIT.store(generation, Ordering::SeqCst);

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `OutputStreakEpisodeDelivery`: drive the shipping visual
-//! engine and synth, then project their observable episode edges onto the
-//! derived model. The negative controls prove the projection would reject each
-//! regression rather than merely replaying a happy script. `RetireVisuals`
-//! binds `OutputStreak::next_change_deadline`; native/web event-loop wiring of
-//! that public deadline remains covered by its separate host-level unit tests.
+//! Tier-1 bind for `OutputStreakEpisodeDelivery`: drive the real visual engine
+//! and synth, project their observable episode edges onto the derived model, and
+//! use negative controls to show the projection rejects each regression.
+//! `RetireVisuals` binds `OutputStreak::next_change_deadline`; host event-loop
+//! wiring of that deadline is covered by host-level unit tests.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -56,14 +55,10 @@ fn assert_transition(model: &Model, action: &str, before: &State, after: &State)
     );
 }
 
-/// **`Lumen`, not `RainbowKitty`.** The human-gap control below is v1's
-/// shared `MIN_GAP` governor, and the rainbow kitty look has been the music
-/// box (`rainbow_kitty_v2`) since §17.3 phase 7 — it forks out of `push_meta`
-/// before `MIN_GAP` is ever consulted. Since 2026-09-08 it may also never
-/// thin a keystroke at all (one keystroke is one melody step, at every typing
-/// speed), so an ordinary key there is admitted BY RULING and the control
-/// stops discriminating. Nothing in `OutputStreakEpisodeDelivery` is about a
-/// palette; the control is, so it runs on the palette that owns the gap.
+/// Uses `Lumen`, not `RainbowKitty`: the human-gap control needs a palette that
+/// goes through the shared `MIN_GAP` governor. The rainbow kitty music box
+/// (`rainbow_kitty_v2`) forks out of `push_meta` before `MIN_GAP` and never
+/// thins a keystroke, so the control would not discriminate there.
 fn sound(kind: SoundGesture) -> SoundEvent {
     SoundEvent {
         style: GlowStyle::Lumen,
@@ -271,8 +266,8 @@ fn real_output_episode_and_synth_refine_delivery_model() {
     );
     assert_transition(&model, "NextHuman", &checked, &next_human);
 
-    // Projection-level negative controls: each former implementation shape
-    // violates the precise invariant the real observations above established.
+    // Projection-level negative controls: each broken shape violates the
+    // invariant the real observations above established.
     let mut thinned = visible.clone();
     thinned.insert("shimmer", 0);
     assert!(!model.check_invariant("OpeningCueSurvivesSharedGap", &thinned));

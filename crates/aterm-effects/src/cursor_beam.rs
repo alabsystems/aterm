@@ -1,37 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The LIGHT-ROD cursor — born as the `beam` style's emitter, now EVERY trail
-//! style's shape-completion seam: the host tints it with the active style's
-//! resolved colour (+ a per-style haze), so each trail owns a coherent cursor
-//! in BOTH shapes — the styles with bespoke BLOCK bodies (droplet, nucleus,
-//! rainbow, emitter, bolt, forge) get their BAR from the rod in their own
-//! light, and the styles without a block body (lumen, sparkle, trail packs)
-//! get the charged-emitter block too. Two treatments, keyed by the live
-//! cursor SHAPE (the host resolves it per frame):
+//! The light-rod cursor: every trail style's shape-completion seam. The host
+//! tints it with the active style's resolved colour and a per-style haze, so
+//! each trail has a coherent cursor in both shapes (styles with bespoke block
+//! bodies get their bar from the rod; styles without one also get the
+//! charged-emitter block). The treatment is keyed by the live cursor shape,
+//! resolved per frame:
 //!
-//! * **the BAR** (DECSCUSR bar / `cursor_style beam` — the style's signature
-//!   home): the thin bar becomes a vertical ROD OF LIGHT — a white-hot photon
-//!   axis inside an indigo NEBULA sleeve ([`BEAM_SPACE_HAZE`], shared with the
-//!   trail so the rod and the beam agree on what space looks like),
-//!   overshooting the cell slightly top and bottom like a charged filament.
-//!   It breathes quietly at rest and flares with the aurora's blaze (typing
-//!   heat / jump flare), so the rod and the trail it lays read as one beam.
-//!   The bar KEEPS ITS SHAPE — vim insert mode and friends keep their
-//!   meaning; the light is purely additive.
-//! * **the BLOCK**: a charged emitter — the block fill locks to the beam's
-//!   hue (whitening as the blaze climbs, contrast-floored by the renderer so
-//!   the glyph stays sharp) inside a soft aura that slides into the nebula
-//!   haze at its rim — the block sits in a little pocket of space.
+//! * **Bar** (DECSCUSR bar / `cursor_style beam`): a vertical rod of light, a
+//!   white-hot axis inside a haze sleeve ([`BEAM_SPACE_HAZE`] for beam, shared
+//!   with the trail), overshooting the cell slightly. It breathes at rest and
+//!   flares with the aurora's blaze. The bar keeps its shape; the light is
+//!   purely additive.
+//! * **Block**: a charged emitter. The fill locks to the style's hue
+//!   (whitening with blaze, contrast-floored by the renderer) inside a soft
+//!   aura that fades into the haze at its rim.
 //!
-//! Text-safe by construction, mirroring [`crate::cursor_rainbow`]: the block
-//! FILL rides the renderer's `floor_cursor_fill` contrast floor, and all rod /
-//! aura light is additive [`GlowQuad`]s with capped coverage — brightest along
-//! the thin axis over the cursor itself, a faint tint where it crosses a
-//! neighbouring glyph. Like its siblings it is a CLOCKLESS pure function of an
-//! injected `now`, settles to inactive when the blaze dies (the resting rod
-//! then rides the blink cadence — no perpetual wakeups), and emits identical
-//! premultiplied quads on the CPU and Metal backends.
+//! Text-safe like [`crate::cursor_rainbow`]: the block fill rides the
+//! renderer's `floor_cursor_fill` contrast floor, and all rod/aura light is
+//! additive [`GlowQuad`]s with capped coverage. A clockless pure function of an
+//! injected `now`; it goes inactive when the blaze dies (the resting rod rides
+//! the blink cadence) and emits identical premultiplied quads on CPU and Metal.
 
 use aterm_time::Instant;
 
@@ -40,9 +30,8 @@ use aterm_render::{GlowQuad, premul_rgb};
 use crate::cursor_glow::Geom;
 use crate::effect_util::push_fx_rect as push_rect;
 
-/// Breathing rate in turns/second: a slow, calm shimmer — steady light, not
-/// fire. The phase only advances when frames render, so a settled rod
-/// breathes at the blink cadence for free.
+/// Breathing rate in turns/second: a slow, calm shimmer. The phase advances
+/// only when frames render, so a settled rod breathes at the blink cadence.
 const BREATHE_IDLE: f32 = 0.55;
 const BREATHE_ACTIVE: f32 = 1.6;
 
@@ -56,15 +45,13 @@ const OVERSHOOT_MAX: f32 = 0.22;
 /// [`COV_CAP`] so the stacked additive light never buries a neighbour glyph.
 const COV_IDLE: f32 = 70.0;
 const COV_MAX: f32 = 150.0;
-/// Per-quad additive coverage ceiling — the same text-safety band as the
-/// fire curtain's tuning. The thin axis saturates here (it sits over the
-/// cursor cell's own column); the wider sleeve quads that actually reach a
-/// neighbouring glyph run at a fraction of it and stay a tint.
+/// Per-quad additive coverage ceiling (the fire curtain's text-safety band).
+/// The thin axis saturates here over the cursor's own column; wider sleeve
+/// quads that reach a neighbouring glyph run at a fraction of it.
 const COV_CAP: f32 = 92.0;
 
-/// The blaze below which the rod is SETTLED — the animator reports itself
-/// inactive so the host stops arming the 60 fps tick and the resting glow
-/// rides the blink cadence.
+/// The blaze below which the rod is settled: the animator reports inactive so
+/// the host stops the 60 fps tick and the resting glow rides the blink cadence.
 const SETTLED_BLAZE: f32 = 0.02;
 
 /// Resolved per-frame inputs (Copy so the host reads it out before borrowing state).
@@ -76,14 +63,12 @@ pub struct BeamRodConfig {
     /// Overall scale `0..1` — the reduced-motion / load-shed amplitude, folded
     /// in by the host exactly like the aurora. 0 ⇒ fully inert.
     pub intensity: f32,
-    /// The style's resolved hue `0x00RRGGBB` (`GlowConfig::color` — the
-    /// style default or the user's explicit trail colour), so the rod, the
-    /// fill, and the trail all belong to one light.
+    /// The style's resolved hue `0x00RRGGBB` (`GlowConfig::color`), so the rod,
+    /// the fill and the trail are one light.
     pub color: u32,
-    /// The SLEEVE colour `0x00RRGGBB` the outer rod layers and aura rim mix
-    /// toward. Beam passes its indigo nebula (`BEAM_SPACE_HAZE`); every other
-    /// style passes a deepened shade of its own hue, so the rod is that
-    /// style's light in that style's shadow.
+    /// The sleeve colour `0x00RRGGBB` the outer rod layers and aura rim mix
+    /// toward: beam's indigo `BEAM_SPACE_HAZE`, otherwise a deepened shade of
+    /// the style's own hue.
     pub haze: u32,
     /// Whether the live cursor is a thin BAR (rod treatment) rather than a
     /// block (emitter treatment).
@@ -93,10 +78,9 @@ pub struct BeamRodConfig {
     pub shimmer: bool,
 }
 
-/// What a tick produced: the emitter block FILL to hand the renderer (`None`
-/// for the bar — bars have no fill-override channel and keep their themed
-/// paint under the additive rod) and a fingerprint that changes on every
-/// visible step (0 when off).
+/// What a tick produced: the emitter block fill for the renderer (`None` for
+/// the bar, which has no fill-override channel) and a fingerprint that changes
+/// on every visible step (0 when off).
 #[derive(Clone, Copy, Debug)]
 pub struct BeamRodFrame {
     /// The emitter block-fill colour `0x00RRGGBB`, or `None` when off / bar.
@@ -118,19 +102,17 @@ pub struct CursorBeamRod {
 
 impl CursorBeamRod {
     /// Whether the host must keep arming the animation tick: only while the
-    /// beam is still CHARGED (typing or a jump flare cooling). Once the blaze
-    /// settles the resting rod rides the blink cadence at no extra idle cost.
+    /// beam is charged (typing or a jump flare cooling).
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.blaze > SETTLED_BLAZE
     }
 
-    /// Advance one frame at `now` with the beam's current `blaze` (`0..1`, the
-    /// host reads [`crate::cursor_glow::CursorGlow::blaze`] after the aurora
-    /// tick), the cursor cell `cur` (`None` ⇒ hidden), grid `geom`, and the
-    /// resolved `cfg`. Appends the additive rod/aura to `out` and returns the
-    /// emitter FILL + a fingerprint. Pure: no wall-clock, unit-testable by
-    /// injecting `now`/`blaze`.
+    /// Advance one frame at `now` with the current `blaze` (`0..1`, read from
+    /// [`crate::cursor_glow::CursorGlow::blaze`] after the aurora tick), cursor
+    /// cell `cur` (`None` ⇒ hidden), grid `geom`, and resolved `cfg`. Appends
+    /// the additive rod/aura to `out` and returns the emitter fill and a
+    /// fingerprint. Pure.
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -141,9 +123,8 @@ impl CursorBeamRod {
         out: &mut Vec<GlowQuad>,
     ) -> BeamRodFrame {
         let e = (blaze.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        // Fully inert — byte-identical to the plain themed cursor — when off,
-        // when the geometry is degenerate, or when the amplitude is zero
-        // (reduced motion / load-shed), mirroring the rainbow block's "0 ⇒ off".
+        // Inert (identical to the plain themed cursor) when off, when the
+        // geometry is degenerate, or at zero amplitude (reduced motion / shed).
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.blaze = 0.0; // inert: report settled so the host disarms the tick
             self.last = Some(now);
@@ -162,15 +143,12 @@ impl CursorBeamRod {
         let rate_mul = if cfg.shimmer { 4.5 } else { 1.0 };
         self.breathe = (self.breathe + dt * (BREATHE_IDLE + BREATHE_ACTIVE * e) * rate_mul).fract();
         let phase = self.breathe * std::f32::consts::TAU;
-        // A single slow sine — steady light breathes; it does not flicker.
-        // (Sparkle's shimmer only speeds the same sine into a glitter
-        // tremble — still a sine, never a strobe.)
+        // A single slow sine: steady light breathes, never strobes.
         let breathe = 0.5 + 0.5 * phase.sin();
 
-        // The emitter BLOCK FILL: the beam's own hue, whitening toward hot as
-        // the blaze climbs (the bolt-fill precedent). Deliberately capped below
-        // pure white so the additive axis stays the brightest thing on screen.
-        // The renderer floors it against the cell bg — the glyph stays sharp.
+        // Block fill: the style's hue, whitening as the blaze climbs, capped
+        // below pure white so the additive axis stays brightest. The renderer
+        // floors it against the cell background.
         let fill = (!cfg.bar).then(|| {
             let k = 0.10 + 0.35 * e;
             let mix = |sh: u32| {
@@ -203,9 +181,9 @@ impl CursorBeamRod {
         BeamRodFrame { fill, fp }
     }
 
-    /// The BAR treatment: a vertical ROD OF LIGHT on the bar's own x — a
+    /// The bar treatment: a vertical rod of light on the bar's own x, a
     /// white-hot axis inside a cool sleeve, overshooting the cell slightly.
-    /// Bounded by construction: 4 layers × ≤3 vertical segments each.
+    /// Bounded: 4 layers × ≤3 vertical segments each.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
@@ -241,14 +219,10 @@ impl CursorBeamRod {
             };
             (m(16) << 16) | (m(8) << 8) | m(0)
         };
-        // (half-width in cell-widths, coverage ×, mix target, mix amount) —
-        // axis-first, so a saturated quad budget sheds sleeve, never the
-        // filament. TWO-TONE like the trail's `beam_glow_quads`: the inner
-        // layers mix toward WHITE (the photon axis), the outer toward the
-        // indigo [`BEAM_SPACE_HAZE`] (the nebula sleeve) — the rod is starship
-        // light through space. The end CAPS (the overshoot above/below the
-        // cell) run only the two inner layers, narrower — a rounded-off
-        // filament tip, not a square post.
+        // (half-width in cell-widths, coverage ×, mix target, mix amount),
+        // axis first so a saturated quad budget sheds sleeve, never filament.
+        // Inner layers mix toward white, outer toward the haze. The end caps
+        // (the overshoot) run only the two inner layers, narrower.
         let layers: [(f32, f32, u32, f32); 4] = [
             (0.045, 1.00, WHITE, 0.55),   // white-hot axis
             (0.13, 0.55, WHITE, 0.12),    // inner sleeve
@@ -286,9 +260,8 @@ impl CursorBeamRod {
         }
     }
 
-    /// The BLOCK treatment: a soft cool AURA hugging the emitter cell —
-    /// concentric rounded slabs, tight (≤ ~0.45 cell-heights of reach) so the
-    /// charged block glows without washing its neighbours.
+    /// The block treatment: a soft aura of concentric rounded slabs hugging
+    /// the emitter cell, reaching at most ~0.45 cell-heights.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
@@ -309,10 +282,8 @@ impl CursorBeamRod {
         let y = i32::from(geom.origin_y) + cr as i32 * ch;
         let reach = ((0.16 + 0.29 * e) * (0.85 + 0.15 * breathe) * geom.ch as f32) as i32;
         let cov_core = (COV_IDLE * 0.7 + (COV_MAX - COV_IDLE) * 0.7 * e) * cfg.intensity;
-        // (reach ×, coverage ×, haze mix): outermost first — additive overlap
-        // builds the radial falloff, and the falloff SLIDES INTO `cfg.haze`
-        // the further from the emitter it reaches (beam: indigo nebula —
-        // a pocket of space; other styles: their own deepened shade).
+        // (reach ×, coverage ×, haze mix), outermost first: additive overlap
+        // builds the radial falloff, sliding into `cfg.haze` with distance.
         let rings: [(f32, f32, f32); 3] =
             [(1.0, 0.22, 0.75), (0.62, 0.42, 0.40), (0.30, 0.70, 0.0)];
         let lerp = |a: u32, b: u32, t: f32| -> u32 {
@@ -449,11 +420,8 @@ mod tests {
         assert!(!out.is_empty(), "the charged emitter glows");
     }
 
-    /// NON-IDENTITY geometry: the rod lands inside the padded window's grid
-    /// box (origin applied), never at the window's top-left. This is the
-    /// padded-window regression the identity geoms above cannot see — the
-    /// original grid-relative math passed every test here while drawing one
-    /// origin too high on a real window.
+    /// Non-identity geometry: the rod lands inside the padded window's grid
+    /// box (origin applied), not at the window's top-left.
     #[test]
     fn rod_lands_at_the_window_origin() {
         for bar in [true, false] {

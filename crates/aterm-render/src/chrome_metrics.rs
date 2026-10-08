@@ -213,6 +213,7 @@ mod tests {
     /// Cap-ratio extraction: the embedded DejaVu Sans Mono carries OS/2
     /// sCapHeight (729/2048 em ≈ 0.7115); the measured-'H' fallback lands within
     /// a few percent of it, and both stay in the sane (0.4, 1.0) band.
+    #[cfg(feature = "embedded-font")]
     #[test]
     fn cap_ratio_from_os2_and_measured_h_agree() {
         let bytes = crate::embedded_font();

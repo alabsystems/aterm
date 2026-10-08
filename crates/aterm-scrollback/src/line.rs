@@ -151,9 +151,11 @@ fn attr_runs(attrs: Option<&Rle<CellAttrs>>) -> &[aterm_rle::Run<CellAttrs>] {
 mod line_codec;
 #[path = "line_codec_block.rs"]
 mod line_codec_block;
+#[cfg(test)]
+pub(crate) use line_codec_block::take_records_walked;
 // Re-exported publicly (B.3.2): the block codec is the on-the-wire form for
 // `TerminalCheckpoint` grid bodies and must be callable from aterm-core.
-pub(crate) use line_codec::{MAX_DECODE_PAGE_LINES, count_page_lines};
+pub(crate) use line_codec::{MAX_DECODE_PAGE_LINES, count_page_lines, serialize_pages};
 pub use line_codec::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,
@@ -263,10 +265,7 @@ aterm_types::bitflags! {
     pub(crate) struct LineFlags: u8 {
         /// Line is wrapped (continuation of previous line).
         const WRAPPED = 1 << 0;
-        /// Line contains search match.
-        const HAS_MATCH = 1 << 1;
-        /// Line has been modified.
-        const DIRTY = 1 << 2;
+        // Bits 1-7 unused.
     }
 }
 
@@ -703,9 +702,8 @@ impl Line {
     }
 
     /// A clone for the rewrap passthrough (RFL-4a): identical content, attrs
-    /// and sidecars, with the line FLAGS reset to the freshly-rebuilt state —
-    /// `WRAPPED` false and the transient `HAS_MATCH`/`DIRTY` render/search
-    /// bits cleared. That is exactly the flag state the rewrap's `build_line`
+    /// and sidecars, with the line FLAGS reset to the freshly-rebuilt state
+    /// (`WRAPPED` false). That is exactly the flag state the rewrap's `build_line`
     /// gives every output line, so a passed-through line is indistinguishable
     /// from a rebuilt one (the flags are `pub(crate)`, which is why this
     /// lives here and not at the call site).
@@ -748,7 +746,7 @@ impl Line {
         // hardened-unsafe check fails closed on the callee internals that
         // direct calls MIR-inline into closures (see `attr_runs`).
         let attrs_mem = if self.attrs.is_some() {
-            // Boxed: the Rle struct now lives on the heap (no longer counted in
+            // Boxed: the Rle struct lives on the heap (not counted in
             // size_of::<Line>), plus the runs Vec it owns. `runs.len()` IS
             // `run_count()` (its exact definition).
             std::mem::size_of::<Rle<CellAttrs>>().saturating_add(
@@ -760,7 +758,7 @@ impl Line {
             0
         };
         let hyperlinks_mem = match self.hyperlinks() {
-            // Boxed: the SmallVec now lives on the heap (no longer counted in
+            // Boxed: the SmallVec lives on the heap (not counted in
             // size_of::<Line>). We additionally count:
             // - Spilled heap allocation (if > 2 spans)
             // - Arc<str> heap allocations for URLs

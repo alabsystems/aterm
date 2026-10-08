@@ -183,11 +183,8 @@ pub(crate) fn demote_foreign_executables(root: &Path) -> Result<bool, StageError
 mod tests {
     use super::*;
 
-    fn tmp(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("atpkg-macho-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-macho-{label}-"))
     }
 
     fn with_tail(head: &[u8]) -> Vec<u8> {

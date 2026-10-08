@@ -1,57 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `tools/forge-budget.tsv` — THE RATCHET. The third-party surface may only
-//! shrink, and every exception is written down in the file forever.
+//! `tools/forge-budget.tsv`: the ratchet. The third-party surface may only
+//! shrink, and every exception is recorded in the file.
 //!
 //! # The file
 //!
-//! Deliberately shaped like `tools/trust-gate-ratchet.tsv`: tab-separated, no
-//! header, one fact per line, so the same `awk -F'\t'` idiom reads both and a
-//! shell script needs no new parser.
+//! Shaped like `tools/trust-gate-ratchet.tsv`: tab-separated, no header, one
+//! fact per line, readable with `awk -F'\t'`.
 //!
 //! ```text
 //! <scope>\t<metric>\t<ceiling>[\t<regress-reason>]
 //! ```
 //!
-//! There are no comments and no blank-line grammar — a `#` line is refused by
-//! line number rather than skipped, because a ratchet whose rows can be
-//! commented out is not a ratchet.
+//! No comments and no blank-line grammar: a `#` line is refused by line number,
+//! so rows cannot be commented out.
 //!
 //! # The rule
 //!
-//! * `live < ceiling` → GREEN with the slack named. `--update` LOWERS the
-//!   ceiling to the live value; that is the only edit forge ever makes on its
-//!   own.
-//! * `live == ceiling` → GREEN, at ceiling.
-//! * `live > ceiling` → RED. Raising needs `--update --allow-regress "<reason>"`
-//!   with at least [`MIN_REASON_CHARS`] characters of actual prose, and the
-//!   accepted reason is written as the 4th column; every run counts the raised
-//!   ceilings and points at the file, so a regression stays on record instead
-//!   of being absorbed by the next `--update`.
+//! * `live < ceiling` → green with the slack named. `--update` lowers the
+//!   ceiling to the live value; the only edit forge makes on its own.
+//! * `live == ceiling` → green, at ceiling.
+//! * `live > ceiling` → red. Raising needs `--update --allow-regress "<reason>"`
+//!   with at least [`MIN_REASON_CHARS`] characters; the reason is written as
+//!   the 4th column, and every run counts raised ceilings and points at the
+//!   file.
 //!
-//! # Why build scripts and proc macros are rows, not decoration
+//! # Build scripts and proc macros are rows
 //!
-//! A build script is arbitrary code the compiler EXECUTES, and `targo trust`
-//! marks every one `-Ztrust-verify=off` unconditionally. While a single
-//! third-party build script remains (10 do in the macOS shipped graph, measured
-//! 2026-09-11; `tools/forge-budget.tsv` carries the ceiling per cell), no
-//! amount of source deletion retires the verification opt-out. Deleting a
-//! 60k-line leaf data crate is worth less to the campaign than deleting one
-//! build script, and a LOC-only budget mis-ranks the whole effort — so both are
-//! first-class rows with their own ceilings.
+//! A build script is code the compiler executes, and `targo trust` marks every
+//! one `-Ztrust-verify=off`. While any third-party build script remains, no
+//! amount of source deletion retires that opt-out, so build scripts and proc
+//! macros have their own ceilings beside LOC.
 //!
-//! # What is deliberately NOT seeded
+//! # Not seeded
 //!
-//! `shipped.<triple> packages` and `lock packages` are SUPPORTED metrics, and
-//! the seeded rows (`--update` into an empty checkout, `seed_shape`) do not
-//! arm them. Both count aterm's own workspace crates, so a new
-//! first-party crate would trip the gate and demand an 80-character
-//! justification for growth that is not third-party surface at all. A ratchet
-//! that fires on the wrong thing trains people to write throwaway reasons, which
-//! is the one failure mode this mechanism cannot survive. The armed rows are the
-//! third-party ones; the totals stay available for anyone who wants to add a row
-//! by hand.
+//! `shipped.<triple> packages` and `lock packages` are supported metrics but
+//! the seeded rows (`--update` into an empty checkout, `seed_shape`) do not arm
+//! them: both count aterm's own crates, so a new first-party crate would demand
+//! a justification for growth that is not third-party surface. They can be
+//! added by hand.
 
 use crate::Outcome;
 use crate::model::{Cell, CellSurvey};
@@ -62,9 +50,8 @@ use std::path::Path;
 /// The ratchet's path, relative to the workspace root.
 pub const BUDGET_PATH: &str = "tools/forge-budget.tsv";
 
-/// The minimum length of a `--allow-regress` reason, in characters. Eighty is
-/// long enough to force a sentence that says what grew, why it had to, and what
-/// would shrink it again — and short enough that a real reason fits.
+/// The minimum length of a `--allow-regress` reason, in characters: enough for
+/// a sentence saying what grew, why, and what would shrink it.
 pub const MIN_REASON_CHARS: usize = 80;
 
 /// Metrics measured per `shipped.<triple>` scope.
@@ -78,20 +65,13 @@ const SHIPPED_METRICS: &[&str] = &[
 ];
 /// Metrics measured for the `lock` scope (the whole `Cargo.lock`, every target).
 const LOCK_METRICS: &[&str] = &["packages", "third_party_packages"];
-/// Metrics measured for the `patch` scope — the VENDORED arm of
+/// Metrics measured for the `patch` scope: the vendored arm of
 /// `[patch.crates-io]`.
 ///
-/// SCOPE, deliberately: a fork is third-party code aterm took over and must
-/// keep reviewing forever, and bounding that is what this ratchet is for. A
-/// patch entry pointing at a first-party workspace member is aterm's own
-/// crate; counting it here would fire the gate on the growth of aterm itself
-/// and demand an 80-character justification for it — the exact failure the
-/// `shipped.<triple> packages` and `lock packages` rows are left unseeded to
-/// avoid (see the module docs above). A first-party replacement is still
-/// checked end to end elsewhere: `targo --unverified forge attest` [OB-1]/[OB-2] and
-/// `targo --unverified forge check` [OB-12] hold it to existing and to being live (a dead
-/// patch fails, one only some cells pull in is a note), and a NOT-LIVE note is
-/// emitted below for every patch entry alike.
+/// A first-party patch target is aterm's own crate and is not counted here
+/// (the same reason `packages` rows are unseeded). It is still held to
+/// existing and being live by `forge attest` [OB-1]/[OB-2] and `forge check`
+/// [OB-12], and a not-live note is emitted below for every patch entry.
 const PATCH_METRICS: &[&str] = &["entries", "live_entries"];
 
 /// One ratchet row.
@@ -120,9 +100,8 @@ impl Row {
 // Reading and writing the file
 // ---------------------------------------------------------------------------
 
-/// Read `<root>/tools/forge-budget.tsv`. An ABSENT file is an empty `Vec`, not
-/// an error — Stage 0 ships before the ratchet is armed. [`run`] is what
-/// refuses to call an unarmed ratchet a pass.
+/// Read `<root>/tools/forge-budget.tsv`. An absent file is an empty `Vec`;
+/// [`run`] refuses to call an unarmed ratchet a pass.
 pub fn load(root: &Path) -> Result<Vec<Row>, String> {
     match std::fs::read_to_string(root.join(BUDGET_PATH)) {
         Ok(text) => parse(&text),
@@ -262,43 +241,21 @@ fn seed_shape(live: &Live) -> Vec<(String, String)> {
 // Measuring the live surface
 // ---------------------------------------------------------------------------
 
-/// Extra per-scope facts used to make a RED row actionable: forge does not
-/// record the package SET a ceiling was taken over, so it cannot name what is
-/// new — but it CAN name what the mass is made of today.
+/// Extra per-scope facts that make a red row actionable: forge cannot name
+/// what is new (it does not record the package set), but it can name what the
+/// mass is made of.
 #[derive(Clone, Debug, Default)]
 struct ScopeDetail {
     duplicates: Vec<String>,
     build_scripts: Vec<String>,
     proc_macros: Vec<String>,
     biggest: Vec<(String, u64)>,
-    /// Third-party packages whose LOC this run read from the in-tree fork under
-    /// `vendor/` — the source that actually compiles — rather than from a
-    /// registry checkout of the same version.
+    /// Third-party packages whose LOC was read from an in-tree fork (the source
+    /// that compiles), with the directory measured.
     ///
-    /// IT NAMES aterm'S OWN EDITS INSIDE A THIRD-PARTY NUMBER. `aterm` builds
-    /// `vendor/winit`, not the registry's winit, so the fork's lines ARE the
-    /// third-party surface this campaign is scored on — but they are lines this
-    /// repository wrote, and a RED `third_party_loc` row that cannot name that
-    /// cause reads as dependency drift and invites `--allow-regress`, which
-    /// would record aterm's own fork edits as third-party growth and keep the
-    /// headroom forever. So the row names the package AND the directory the
-    /// lines were counted in.
-    ///
-    /// IT IS NO LONGER AN INPUT THAT VARIES BY MACHINE, and that history is why
-    /// the list exists. [`crate::loc::package_dir`] USED TO prefer a pristine
-    /// registry checkout of the same version and fall through to the fork only
-    /// when this machine's `CARGO_HOME` held none, so a committed ceiling
-    /// depended on an unversioned local cache: MEASURED 2026-08-30, fork and
-    /// upstream differ by 685 lines for `winit 0.30.13` and 28 for `smol_str
-    /// 0.2.2`, i.e. 713 in every one of the four cells the matrix had that day,
-    /// which was enough to turn four `third_party_loc` rows RED against
-    /// ceilings taken on a machine that had both. (That delta would reach THREE
-    /// of the five cells now: the wasm row was replaced by the two shipped
-    /// browser modules later the same day, and neither `aterm-wasm` nor
-    /// `aterm-gpu-web` pulls `winit` or `smol_str`.) A `[patch.crates-io]`
-    /// target now resolves to the path that COMPILES before the registry is
-    /// consulted at all, so every machine reads the same lines out of the
-    /// repository.
+    /// A red `third_party_loc` row may be caused by aterm's own fork edits;
+    /// naming them keeps that from reading as dependency drift and being
+    /// recorded with `--allow-regress`.
     vendored_measured: Vec<String>,
 }
 
@@ -332,21 +289,14 @@ fn u(n: usize) -> u64 {
 
 /// The ratchet scope one cell's rows live under.
 ///
-/// A scope must name exactly ONE cell, because a scope is this file's primary
-/// key: two cells sharing a scope would overwrite each other's live values and
-/// the ratchet would silently bound only whichever ran last.
+/// A scope names exactly one cell (it is the file's primary key). Native cells
+/// use `shipped.<triple>`. `wasm32-unknown-unknown` carries two cells (two
+/// independent browser modules, see `resolve::default_cells`), so those append
+/// the cell handle: `shipped.wasm32-unknown-unknown.wasm-gpu`.
 ///
-/// The triple was that key for as long as every triple had one cell, and it
-/// still is for the three native cells — `shipped.aarch64-apple-darwin` and its
-/// two siblings are unchanged, reason columns and all. `wasm32-unknown-unknown`
-/// now carries TWO cells, because aterm ships two browser modules and neither is
-/// a build of the other (`resolve::default_cells` records why), so those two
-/// append their cell handle: `shipped.wasm32-unknown-unknown.wasm-gpu`.
-///
-/// Removing one of a shared triple's cells does not silently rename the other:
-/// its ratchet rows would then name a scope nothing measures, and
-/// [`validate_metric`] turns that into a COULD-NOT-RUN naming the file and the
-/// cell, never a pass.
+/// If a shared triple drops to one cell, the other's rows are not renamed:
+/// they name a scope nothing measures, and [`validate_metric`] makes that a
+/// could-not-run.
 fn scope_of(cell: &Cell, cells: &[Cell]) -> String {
     if cells.iter().filter(|c| c.triple == cell.triple).count() > 1 {
         format!("shipped.{}.{}", cell.triple, cell.name)
@@ -382,29 +332,14 @@ fn measure(root: &Path) -> Result<Live, String> {
 
     let lock = crate::policy::lock_entries(root)?;
     let patches = crate::policy::patch_entries(root)?;
-    // A lock entry with no `source` is a PATH package, and there are now THREE
-    // kinds of those, not two.
+    // A lock entry with no `source` is a path package, one of three kinds:
     //
     //   * an ordinary workspace member                     -> aterm's own
     //   * a VENDORED `[patch]` fork under vendor/          -> THIRD-PARTY
     //   * a FIRST-PARTY `[patch]` replacement under crates/ -> aterm's own
     //
-    // A vendored fork is upstream source aterm now maintains and must keep
-    // reviewing, so it counts as third-party here exactly as it does in a
-    // shipped cell. A first-party replacement is a crate aterm WROTE, and
-    // counting it as third-party was the same category error this ratchet's
-    // `patch entries` row was rescoped for on 2026-08-28 (see the reason column
-    // on that row in tools/forge-budget.tsv). It was invisible while `tracing`
-    // was the only such target — 513 was measured WITH it counted — and it
-    // surfaced the moment four more landed: the row read 514 and went RED for a
-    // change that removed four third-party packages from the lock and added
-    // none.
-    //
-    // SCOPE RESTATED, not silently moved, per this file's own protocol: under
-    // the OLD definition the live value is 514 against a ceiling of 513 and the
-    // row is RED; under this one it is 509 and GREEN with slack 4. The ceiling
-    // is deliberately NOT lowered here — `--update` is the only thing that
-    // edits the file, and lowering it is a separate, deliberate act.
+    // A vendored fork is upstream source aterm maintains and reviews, so it
+    // counts as third-party here as in a shipped cell.
     let vendored_patch_names: Vec<&str> = patches
         .iter()
         .filter(|p| p.is_vendored())
@@ -501,14 +436,8 @@ fn detail(root: &Path, s: &CellSurvey) -> ScopeDetail {
                     .as_ref()
                     .is_some_and(|dir| dir.starts_with(&vendor))
             })
-            // THE DIRECTORY THAT WAS MEASURED, not `vendor/<name>`. That
-            // spelling assumed ONE CRATE PER VENDOR DIRECTORY, which held while
-            // every fork was `vendor/winit`-shaped and stopped holding on
-            // 2026-09-10: `vendor/astream` carries four crates at
-            // `vendor/astream/crates/<name>`, so the line printed
-            // `vendor/astream-broker`, a path that does not exist, in a report
-            // whose whole claim is that these lines were measured from the fork
-            // rather than from upstream.
+            // The directory actually measured, not `vendor/<name>`
+            // (`vendor/astream` holds several crates under `crates/<name>`).
             .map(|(p, f)| {
                 let shown = f
                     .root_dir
@@ -686,10 +615,8 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
          name what is NEW. `git diff -- Cargo.lock | grep '^+name'` does, and `targo --unverified forge \
          survey --cell <name>` ranks what it costs by dominator.\n",
     );
-    // RULE OUT THE CACHE BEFORE BELIEVING THE DRIFT. Only `third_party_loc`
-    // can move this way: a fork and its pristine upstream are the SAME package
-    // to every other metric, so counts are unaffected and only the line total
-    // shifts, by exactly what the fork diverges by.
+    // For `third_party_loc`, name the packages measured from in-tree forks:
+    // fork edits move only the line total, never the counts.
     if row.metric == "third_party_loc"
         && let Some(d) = live.detail.get(&row.scope)
         && !d.vendored_measured.is_empty()
@@ -911,9 +838,8 @@ fn unratcheted(rows: &[Row], live: &Live) -> Vec<(String, String, u64)> {
         .collect()
 }
 
-/// A row naming a scope or metric forge does not measure is a broken ledger, not
-/// a policy failure: it comes back as could-not-run so it can never read as a
-/// pass.
+/// A row naming a scope or metric forge does not measure is a broken ledger:
+/// could-not-run, never a pass.
 fn validate_metric(row: &Row, live: &Live) -> Result<(), String> {
     let known: &[&str] = if row.scope == "lock" {
         LOCK_METRICS
@@ -1234,20 +1160,8 @@ mod tests {
         assert!(m.contains("--allow-regress"), "{m}");
     }
 
-    /// THE DIRECTORY THAT WAS MEASURED, and it must exist. `vendor/<name>`
-    /// assumed ONE CRATE PER VENDOR DIRECTORY and printed
-    /// `vendor/astream-broker` — a path that is not in this checkout — inside
-    /// a report whose entire claim is that these lines were read from the
-    /// directory it just named.
-    ///
-    /// Asserted as an invariant over EVERY vendored row rather than against
-    /// one named crate. The incoming version of this test named
-    /// `astream-cap@0.1.0 (vendor/astream/crates/astream-cap)`, which also
-    /// asserts that astream-cap is THIRD-PARTY; it is not
-    /// (`provenance::FIRST_PARTY_VENDORED`), and that is a separate question
-    /// from the one this test exists to answer. The invariant form catches the
-    /// same defect for any nested fork and cannot be invalidated by a
-    /// provenance ruling.
+    /// Every vendored row names the directory actually measured, and it
+    /// exists (nested crates such as `vendor/astream/crates/<name>` included).
     #[test]
     fn the_live_budget_detail_names_a_vendor_directory_that_exists() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1256,7 +1170,7 @@ mod tests {
             .parent()
             .unwrap();
         let cell = crate::resolve::default_cells().remove(0);
-        let survey = crate::loc::survey_cell(root, &cell).expect("mac graph resolves");
+        let survey = crate::loc::real_workspace_survey(&cell).expect("mac graph resolves");
         let facts = detail(root, &survey);
         assert!(
             !facts.vendored_measured.is_empty(),
@@ -1276,7 +1190,7 @@ mod tests {
                 "{row}: `{shown}` is not a directory in this checkout"
             );
         }
-        // The exact fictitious spelling the nested bundle used to produce.
+        // The non-existent flat spelling a nested crate must not produce.
         assert!(
             !facts
                 .vendored_measured

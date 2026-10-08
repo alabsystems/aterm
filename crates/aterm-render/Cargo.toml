@@ -8,6 +8,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm CPU rasterizer: the terminal grid -> an RGBA framebuffer. The renderer core AND the read_image pixel-introspection oracle (headless, testable)."
+# The integration tests are one suite binary plus the files that must own their
+# process, declared as `[[test]]` targets at the end of this file. With
+# autotests off a `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 
 [features]
 default = ["disk-tier", "embedded-font", "embedded-symbols", "bundled-font-stack"]
@@ -22,7 +26,7 @@ spec-anchors = ["dep:aterm-spec"]
 # Disk-backed scrollback cold tier, forwarded through aterm-core. DEFAULT-ON so
 # native builds are byte-identical; a wasm consumer disables it
 # (--no-default-features) to drop libc/zstd-sys.
-disk-tier = ["aterm-core/disk-tier", "aterm-render-api/disk-tier"]
+disk-tier = ["aterm-core/disk-tier"]
 # FONT-EMBED: compile in a bundled last-resort monospace font (DejaVu Sans Mono,
 # ~340KB, Bitstream Vera license — see assets/DejaVuSansMono.LICENSE.txt) so text
 # renders even on a host with NO usable system font (e.g. a stripped Linux box).
@@ -39,7 +43,10 @@ embedded-symbols = []
 # 2.304 (Regular/Bold/Italic/BoldItalic, ~1.1MB, OFL-1.1) becomes the DEFAULT
 # primary when no font is configured, and Noto Sans Symbols 2 + Noto Sans Math
 # (~1.6MB, OFL-1.1) join the symbol tier ahead of the system faces; the embedded
-# DejaVu Sans Mono leads the broad fallback tier. See `src/bundled.rs` and
+# DejaVu Sans Mono leads the broad fallback tier. On WINDOWS the default primary
+# is Cascadia Mono PL 2407.24 instead (static Regular/Bold/Italic/BoldItalic,
+# ~2.4MB, OFL-1.1, compiled in on Windows only; owner request 2026-09-30), with
+# JetBrains Mono still compiled in there and selectable by name. See `src/bundled.rs` and
 # assets/bundled/*.LICENSE.txt. Compiled in on NON-macOS targets only: the macOS
 # default (SF Mono + CoreText system coverage) is unchanged by that decision, and
 # a universal binary would carry the ~2.8MB twice for faces it never selects.
@@ -51,7 +58,6 @@ bundled-font-stack = ["embedded-font"]
 # forcing it on every workspace consumer; disk-tier is re-enabled by default via this
 # crate's own default = ["disk-tier"], so the native closure is unchanged.
 aterm-core = { path = "../aterm-core", default-features = false }
-aterm-render-api = { path = "../aterm-render-api", default-features = false }
 # The Unicode `Emoji_Presentation` gate: a default-text code point (⏺ U+23FA) is
 # never resolved to the colour-emoji face merely because that face covers it.
 aterm-grapheme = { workspace = true }
@@ -114,16 +120,10 @@ skrifa = "0.46.2"
 aterm-core = { path = "../aterm-core", default-features = false, features = [
   "sixel",
 ] }
-# ORACLE ONLY — never in the shipped graph. `src/raster.rs` is the first-party
-# scanline signed-area coverage rasterizer that retired this crate; it is kept
-# here purely so `tests/rasterizer_oracle.rs` can prove the two agree at f32
-# BIT equality over ~48k real glyph rasters from the embedded faces plus random
-# line/quad/cubic contours. Antialiased coverage is where an off-by-one is
-# invisible in a test and obvious on screen, so the evidence has to be an
-# equality against the thing it replaced — and a dev-dep costs the product
-# nothing.
-ab_glyph_rasterizer = "0.1.10"
 libc = { workspace = true }
+# `tests/visual_regression.rs` opens its shell's pty through the workspace's one
+# close-on-exec opener, never `forkpty`'s inheritable master.
+aterm-pty = { workspace = true }
 # The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
 # these parity tests export a font / rasterizer selection to both renderers, and
 # every mutation in the workspace routes through that helper rather than a raw
@@ -131,53 +131,59 @@ libc = { workspace = true }
 aterm-log = { workspace = true }
 # Base64 encoder for the inline-image (OSC 1337) integration tests.
 aterm-codec = { workspace = true }
-# Sparkle-words v2 visual demo (examples/sparkle_v2_demo.rs, design §13): the
-# genome + CatBaker + nova engines now live in the shared aterm-effects
-# library (extracted from aterm-gui). The dev-dep cycle (effects depends on
+# The cursor_glow / cursor_magic demos (examples/) and the rain_render test
+# drive the shared aterm-effects engines. The dev-dep cycle (effects depends on
 # this crate) is fine — cargo permits dev-dependency cycles. Dev-only: the
-# shipped renderer lib gains no effects/lexicon dep.
+# shipped renderer lib gains no effects dep.
 aterm-effects = { workspace = true }
-# `aterm_scene::mix_rgb` (the shared linear-RGB colour mix) for the sparkle demo only —
-# dev-only, so the shipped renderer lib carries no aterm-scene dep.
-aterm-scene = { workspace = true }
-# The genome's context SimHash folds tokens through the lexicon's shared
-# case-folding (demo helpers).
-aterm-lexicon = { workspace = true }
 # Trust/ty derived-model proof of the colour-presentation gate invariant
 # (tests/presentation_gate.rs): a default-text code point never resolves to the
 # colour-emoji face. Same in-process model interpreter the scrollback/session
 # proofs use.
 aterm-spec = { workspace = true }
-# Direct shaping access for the ligature gate (pre-check that "=>" ligates).
-rustybuzz = "0.20.1"
-# ORACLE ONLY, never in the shipped graph — the same bargain `ab_glyph_rasterizer`
-# above strikes. `src/font.rs` RETIRED this crate from the product (2 packages /
-# 31,645 lines, all four cells, plus the duplicate `ttf-parser 0.21` under it);
-# it stays here as the independent second implementation the first-party face is
-# checked against — `tests/first_party_face_vs_fontdue.rs` proves the advance
-# widths bit-identical and the coverage within a derived bound over every glyph
-# of the embedded faces, which is the only evidence that can say the retirement
-# moved no pixels. It is also still the vacuity probe for the W6 styled-face /
-# fallback-chain gates (tests/styled_faces.rs) and the counter-example for the
-# Mac-Roman cmap tests. A dev-dep costs the product nothing.
-fontdue = "0.9"
-# Property test (tests/set_px_rerasterizes.rs): the renderer's DPR re-rasterization
-# guarantee — set_px(newPx) scales cell metrics proportionally AND clears the glyph
-# atlas/caches so a subsequent render re-rasterizes at the new px. The host-side DPR
-# fix in the renderer depends on this engine invariant holding.
-proptest = { workspace = true }
-# IMG-1 pricing bench (benches/image_diff.rs): per-frame dirty-row diff cost
-# when an inline image is RE-TRANSMITTED (fresh Arc, byte-identical payload).
-# Same direct pin as aterm-gpu's benches (criterion is not a workspace dep).
-criterion = "0.5"
-
-[[bench]]
-name = "image_diff"
-harness = false
-
-[[bench]]
-name = "image_blit"
-harness = false
 
 [lints]
 workspace = true
+
+# ---- integration tests (autotests = false above) ----------------------------
+
+[[test]]
+name = "render_suite"
+path = "tests/render_suite.rs"
+
+# Alone: installs a #[global_allocator] and asserts process-wide allocation counts.
+[[test]]
+name = "free_sprite_alloc"
+path = "tests/free_sprite_alloc.rs"
+# Its renderer is built on the embedded face.
+required-features = ["embedded-font"]
+
+# Alone: installs a counting #[global_allocator].
+[[test]]
+name = "snapshot_alloc"
+path = "tests/snapshot_alloc.rs"
+# Its renderer is built on the embedded face.
+required-features = ["embedded-font"]
+
+# Alone: (Windows) installs the heap-attribution #[global_allocator]; its gate
+# and measurements read the whole process's heap.
+[[test]]
+name = "win_heap_attribution"
+path = "tests/win_heap_attribution.rs"
+
+# Alone: asserts on the process's max RSS (`getrusage`).
+[[test]]
+name = "seal_maps_discovered_faces"
+path = "tests/seal_maps_discovered_faces.rs"
+
+# Alone: reads process-global coverage-index counters that any
+# sibling's UNSEALED renderer would bump.
+[[test]]
+name = "sealed_never_consults_coverage_index"
+path = "tests/sealed_never_consults_coverage_index.rs"
+
+# Alone: sets ATERM_NO_PROCEDURAL_GLYPHS for the whole process.
+[[test]]
+name = "no_procedural_glyphs_env"
+path = "tests/no_procedural_glyphs_env.rs"
+

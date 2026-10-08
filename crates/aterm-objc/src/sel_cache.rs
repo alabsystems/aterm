@@ -3,28 +3,16 @@
 
 //! Cached selectors.
 //!
-//! `metal/ffi.rs` resolves every selector with a fresh `sel_registerName` on
-//! every send. That is correct — the runtime interns, so the same pointer comes
-//! back — but it is a call into `libobjc` that hashes a string, and the sites it
-//! guards are per-frame (`super::blit` sends nine selectors per readback; the
-//! W6a rig assembly sends dozens per frame).
+//! `sel_registerName` hashes a string on every call, and many sends are on
+//! per-frame paths. [`crate::sel!`] replaces it with one relaxed atomic load
+//! after first use.
 //!
-//! [`crate::sel!`] replaces the call with one relaxed atomic load after the first use.
-//!
-//! # Why `Relaxed` is enough
-//!
-//! The cached value is a pointer into the runtime's IMMORTAL selector table.
-//! There is no other memory whose visibility depends on it: a thread that reads
-//! the cached pointer needs nothing that was written before the store, because
-//! the pointee was interned by `libobjc` (with its own synchronisation) before
-//! the pointer ever existed. Two threads racing to fill the cache both call
-//! `sel_registerName`, both get the SAME pointer back — interning is idempotent
-//! — and both store it, so the race is benign by value, not merely by ordering.
-//!
-//! This is the one place this crate is deliberately weaker than the obvious
-//! `OnceLock`: a `OnceLock` would add an acquire load plus an initialised-flag
-//! branch to buy a guarantee (happens-before on unrelated memory) that has no
-//! consumer here.
+//! `Relaxed` suffices: the cached value points into the runtime's immortal
+//! selector table, interned by libobjc (with its own synchronisation) before
+//! the pointer existed, and no other memory depends on it. Racing fillers both
+//! get the same pointer (interning is idempotent), so the race is benign by
+//! value. A `OnceLock` would add an acquire load and a flag branch for a
+//! happens-before nothing consumes.
 
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -42,11 +30,9 @@ impl SelCache {
         Self(AtomicPtr::new(std::ptr::null_mut()))
     }
 
-    /// The selector for `name`, resolving it on first use.
-    ///
-    /// `name` must be the SAME literal on every call for a given slot; the
-    /// [`crate::sel!`] macro is what guarantees that, by pairing each slot with the
-    /// literal at one call site.
+    /// The selector for `name`, resolving it on first use. `name` must be the
+    /// same literal on every call for a given slot, which [`crate::sel!`]
+    /// guarantees by pairing each slot with one call site's literal.
     #[inline]
     #[must_use]
     pub fn get(&self, name: &'static CStr) -> Sel {
@@ -87,10 +73,9 @@ impl Default for SelCache {
 /// assert_eq!(a, aterm_objc::sel_uncached(c"length"));
 /// ```
 ///
-/// The name is assembled at COMPILE time (`stringify!` per token, `concat!`,
-/// then a `const` `CStr::from_bytes_with_nul`), so a name that is not a valid
-/// C string cannot be built at all — the same "missing NUL is a compile error"
-/// property `metal/ffi.rs` got from taking a `c"…"` literal.
+/// The name is assembled at compile time (`stringify!` per token, `concat!`,
+/// then a `const` `CStr::from_bytes_with_nul`), so an invalid C string cannot
+/// be built.
 #[macro_export]
 macro_rules! sel {
     ($($tok:tt)+) => {{

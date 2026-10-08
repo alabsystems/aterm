@@ -56,10 +56,8 @@ const SAMPLES: &[(&str, &str)] = &[
 /// claimed it.
 #[test]
 fn every_script_resolves_to_a_face_that_really_contains_it() {
-    let Some(mut r) = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
-    else {
-        return;
-    };
+    let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
     let mut missing: Vec<String> = Vec::new();
     let mut checked = 0usize;
@@ -104,10 +102,8 @@ fn every_script_resolves_to_a_face_that_really_contains_it() {
 /// matrix above quietly over-promising.
 #[test]
 fn complex_script_shaping_is_primary_face_only() {
-    let Some(mut r) = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
-    else {
-        return;
-    };
+    let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
     // Arabic does not live on a programming monospace primary, so every Arabic
     // run resolves off-primary — which is exactly why it is not shaped.

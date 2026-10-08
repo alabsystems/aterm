@@ -37,10 +37,8 @@ fn sound_cues_mirror_licensed_spawn_classification() {
     assert_eq!(cues.len(), 1);
     assert_eq!(cues[0].kind, SoundKind::Backspace);
 
-    // A navigation press LICENSES its own scrub (v0.43.0 law): it cues
-    // the cursor sound its shape earns. What it must never do is heat —
-    // that is the classifier's job, pinned by
-    // `navigation_earns_no_heat_and_no_meteor`.
+    // A navigation press licenses its own scrub and cues the sound its shape
+    // earns; it never heats (`navigation_earns_no_heat_and_no_meteor`).
     glow.note_navigation(t0);
     glow.tick(Some((4, 0)), t0, &c, g, &mut out);
     assert_eq!(glow.heat, 0.0, "a scrub earns no heat, however it sounds");
@@ -53,17 +51,14 @@ fn sound_cues_mirror_licensed_spawn_classification() {
     assert_eq!(glow.drain_sound_cues().count(), 0);
 }
 
-/// THE NEWEST ERASE KEY OWNS THE POOF. A kill whose echo has not arrived
-/// may still be fresh when the user presses an ordinary Backspace. Both
-/// licenses used to remain armed, and `poof_scan` classified the resulting
-/// one-cell shrink as a kill solely because `kill_hint.is_some()` — adding
-/// the clause-scale swoosh on top of the Backspace's own bell.
+/// The newest erase key owns the poof: with an unanswered kill still fresh, a
+/// newer ordinary Backspace's one-cell shrink is a Backspace (its own bell),
+/// not a kill with the clause-scale swoosh.
 ///
-/// The negative control has byte-for-byte identical row/cursor geometry,
-/// but follows the host's actual word-Backspace order: generic Backspace
-/// bookkeeping first, then the stronger kill classification. That final
-/// kill must retain the swoosh. Both class changes keep the banked-typed
-/// contract: all older [`TypedStamps`] are retired, not collapsed or spent.
+/// The negative control has identical geometry but follows the host's
+/// word-Backspace order (generic Backspace bookkeeping, then the kill arm), so
+/// the kill keeps the swoosh. Both class changes retire older [`TypedStamps`]
+/// rather than collapsing or spending them.
 #[test]
 fn newest_erase_key_owns_the_poof_voice() {
     use crate::trail_sound::SoundKind;
@@ -83,7 +78,7 @@ fn newest_erase_key_owns_the_poof_voice() {
             .collect()
     };
 
-    // REGRESSION: an unanswered kill, then a newer ordinary Backspace.
+    // An unanswered kill, then a newer ordinary Backspace.
     let mut backspace = CursorGlow::default();
     let mut out = Vec::new();
     backspace.observe_row(2, 5, &row("hello"), t0);
@@ -114,8 +109,8 @@ fn newest_erase_key_owns_the_poof_voice() {
         "the one-cell Backspace shrink puffs; the older kill cannot lend it a swoosh"
     );
 
-    // NEGATIVE CONTROL: identical geometry, but an actual word-Backspace
-    // ends with the stronger kill arm, exactly as app_input dispatches it.
+    // Negative control: identical geometry, but a word-Backspace ends with the
+    // kill arm, as app_input dispatches it.
     let mut kill = CursorGlow::default();
     let mut out = Vec::new();
     kill.observe_row(2, 5, &row("hello"), t0);
@@ -141,21 +136,15 @@ fn newest_erase_key_owns_the_poof_voice() {
     );
 }
 
-/// THE RESUME-AFTER-PAUSE BLACK GAP (the ordinal-inversion regression
-/// gate). A mid-line thinking pause (1.7-5 s — inside the chain window,
-/// past the spark lifetimes) expires the laid sparks; the resume key then
-/// pushes its head spark and the four-letter guarantee re-mints the three
-/// expired tail cells. When those re-mints were PUSHED (after the head),
-/// the sparks Vec left cell order, the rasterizer's ordinal-derived
-/// spatial coordinate handed `asp = 1.0` — the far feather's exact zero —
-/// to the INTERIOR resume cell, and that one cell printed as pure
-/// background for the rest of its life (measured on-glass 3/3: one full
-/// black cell a few cells behind the caret after every mid-line pause).
-/// Two assertions, both red under the push ordering:
-/// 1. the Vec walks the mark tail→head (the invariant `emit_rainbow`'s
-///    `sp`/`asp` derivation documents), and
-/// 2. the ribbon's lit columns are CONTIGUOUS — the far tail may melt,
-///    but no interior cell may go dark while its neighbours draw.
+/// Resuming after a pause leaves no black gap. A mid-line pause (1.7-5 s:
+/// inside the chain window, past spark lifetimes) expires the sparks; the
+/// resume key pushes its head spark and the four-letter guarantee re-mints the
+/// three expired tail cells. The re-mints must keep cell order (the
+/// rasterizer derives `sp`/`asp` from ordinal), or an interior cell gets the
+/// far feather's zero and prints as background. Two assertions:
+/// 1. the Vec walks the mark tail→head, and
+/// 2. the ribbon's lit columns are contiguous (no interior cell dark between
+///    lit neighbours).
 #[test]
 fn resume_after_pause_lays_no_interior_black_cell() {
     let mut glow = CursorGlow::default();
@@ -173,19 +162,17 @@ fn resume_after_pause_lays_no_interior_black_cell() {
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, k)), t, &c, g, &mut out);
     }
-    // The thinking pause: longer than every live spark's life, shorter
-    // than the chain window (5 s), so the resume key re-mints the expired
-    // tail rather than refreshing live sparks in place.
+    // The pause: longer than every spark's life, shorter than the chain window
+    // (5 s), so the resume key re-mints the expired tail.
     t += Duration::from_millis(4500);
-    // Resume at a quicker cadence so the resume cell (col 10) is still
-    // resident when enough newer keys exist for its ordinal to reach the
-    // far feather's zero under the broken ordering.
+    // Resume at a quicker cadence so the resume cell (col 10) is still resident
+    // when its ordinal could reach the far feather's zero.
     for k in 10..=18u16 {
         t += Duration::from_millis(150);
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, k)), t, &c, g, &mut out);
     }
-    // 1. CELL ORDER IS VEC ORDER.
+    // 1. Cell order is Vec order.
     let cols: Vec<u16> = glow
         .sparks
         .iter()
@@ -199,9 +186,8 @@ fn resume_after_pause_lays_no_interior_black_cell() {
         "the sparks Vec must walk the mark tail→head; a re-mint pushed \
          after the head hands the head the far feather's zero"
     );
-    // 2. NO INTERIOR HOLE. The resume cell is resident (re-armed by the
-    // four-letter chain through col 13) — if the ribbon culled it while
-    // drawing both neighbours, that is exactly the on-glass black gap.
+    // 2. No interior hole: the resume cell is resident (re-armed through col
+    // 13), so it must not be culled while both neighbours draw.
     let mut lit: Vec<u16> = glow
         .under_quads()
         .iter()
@@ -230,16 +216,10 @@ fn resume_after_pause_lays_no_interior_black_cell() {
     }
 }
 
-/// THE FLOOD-TYPING BLACK GAP (the banked-license regression gate). K
-/// presses inside one frame gap used to collapse into ONE license stamp
-/// (1-deep slot + press-path wipe); when the echo then arrived as more
-/// sweeps than stamps, the surplus sweeps were declined at the
-/// no-fresh-hint gate and their cells stayed background-black forever
-/// (measured on-glass: 5-13 declined cells per 100-key flood, dark%
-/// 11.5-13.2 — the owner's-screenshot shape). With [`TypedStamps`], K
-/// keys bank K stamps and each observed sweep spends what it covers — and
-/// the license law's other half still holds: once the sweeps have spent
-/// the stamps, the NEXT program move finds no license.
+/// Flood typing leaves no black gap: K presses inside one frame gap bank K
+/// [`TypedStamps`], and each observed sweep spends what it covers, so an echo
+/// arriving as several sweeps lights every cell. Once the sweeps have spent the
+/// stamps, the next program move finds no licence.
 #[test]
 fn flood_presses_bank_licenses_for_every_echo_sweep() {
     let mut glow = CursorGlow::default();
@@ -288,13 +268,9 @@ fn flood_presses_bank_licenses_for_every_echo_sweep() {
             "col {col} was typed and echoed but laid no light (owned: {owned:?})"
         );
     }
-    // THE BOUND: licensed sweeps can never exceed banked presses. Three
-    // keys paid for three cells: the coalesced `+2` spent two presses
-    // and the `+1` the third. The surviving stamp (the coalesce popped
-    // one of three) licenses nothing on its own — a stamp is a licence
-    // only while a press is unpaid (2026-09-13) — so the very next
-    // observed move finds the ledger empty and is declined: program
-    // output cannot outspend the keyboard.
+    // Licensed sweeps never exceed banked presses: the coalesced `+2` spent two
+    // presses and the `+1` the third. The remaining stamp licenses nothing
+    // without an unpaid press, so the next observed move is declined.
     assert_eq!(glow.typed_credits_within(t0 + Duration::from_millis(46)), 0);
     glow.tick(
         Some((2, 4)),
@@ -315,19 +291,11 @@ fn flood_presses_bank_licenses_for_every_echo_sweep() {
     );
 }
 
-/// A TYPED STAMP IS A LICENCE ONLY WHILE A PRESS IS UNPAID (2026-09-13
-/// audit, R1-2). A three-key burst echoing as ONE coalesced `+3` spends
-/// all three presses but popped only ONE stamp, so the two surviving
-/// stamps stayed fresh for a quarter second with nothing left to pay
-/// for: a keyless program `+1` on the row passed the gate, laid a cell
-/// with zero credits (the host sweep), and a keyless wide hop lit its
-/// landing. Under Rainbow Kitty the stamp bank now licenses light only
-/// while the credit ring still owes a cell; the classic trail's
-/// lockstep contract (`move_licensed`) is untouched.
-///
-/// RED before the fix: `("licensed","key",(3,8),(3,9))` with cell 8 lit
-/// and `stamps still fresh: true`; the wide hop `no-credits` yet cell
-/// 39 lit.
+/// A typed stamp is a licence only while a press is unpaid. A three-key burst
+/// echoing as one `+3` spends all three presses but pops one stamp; under
+/// Rainbow Kitty the two surviving stamps license nothing, so a keyless `+1`
+/// lays no cell and a keyless wide hop lights no landing. The classic trail's
+/// lockstep contract (`move_licensed`) is unchanged.
 #[test]
 fn a_coalesced_echos_surviving_stamps_license_nothing_once_its_presses_are_paid() {
     let g = wide_geom();
@@ -370,30 +338,16 @@ fn a_coalesced_echos_surviving_stamps_license_nothing_once_its_presses_are_paid(
     }
 }
 
-/// A KEYLESS HOP THE IN-FLIGHT POOL CANNOT PAY FOR LIGHTS NO LANDING
-/// (2026-09-13 review of the audit round — the paste harness's case 5,
-/// "a program flood of twelve cells with no key must stay dark", lit its
-/// last cell). The dangling-STAMP half was closed by
-/// [`a_coalesced_echos_surviving_stamps_license_nothing_once_its_presses_are_paid`];
-/// this is the dangling-CREDIT half. A press whose echo the seam never
-/// judged — the harness's shape is a hidden-caret TUI's first key on a
-/// row the anchored lane had never seen, one per case, four by case 5 —
-/// stays on the ring for the whole patience, and two of them open the
-/// IN-FLIGHT licence for any same-row forward hop (`unpaid_typed_echo`:
-/// a batch, judged under the share rule). The share rule refused the
-/// flood (`no-credits`, correctly) and the forget edge dropped the pool
-/// — and between the two, the re-anchor's landing sweep (2f15705bc: "a
-/// typed re-anchor lays exactly ONE cell, the landing", gated on a press
-/// being unpaid) spent one of the dangling credits on the flood's last
-/// cell. The landing is v1's law for a hop a KEY licensed inside the
-/// stamp window (vim's `w`); a hop no stamp licensed and the pool could
-/// not describe is program output and lays nothing.
-///
-/// RED before the fix: `("no-credits","none",(3,4),(3,16))` with cell
-/// 15 lit beside the two echoed keys (the harness read col 17 of its
-/// input row at chroma 53, `ribbon_segments 5 -> 12`, 4/4 runs, on
-/// every tree since 2f15705bc). The control keeps v1's law: the same
-/// hop with a key pressed inside the window still lights its landing.
+/// A keyless hop the in-flight pool cannot pay for lights no landing: the
+/// dangling-credit half of
+/// [`a_coalesced_echos_surviving_stamps_license_nothing_once_its_presses_are_paid`].
+/// Presses whose echoes were never judged (a hidden-caret TUI's first keys on a
+/// row the anchored lane had not seen) stay on the ring for the patience and
+/// open the in-flight licence for a same-row forward hop. A twelve-cell program
+/// flood is refused `no-credits` and the pool forgotten, and the re-anchor's
+/// landing sweep must not spend a dangling credit on its last cell: the landing
+/// is for a hop a key licensed inside the stamp window (vim's `w`). Control:
+/// the same hop with a key pressed inside the window lights its landing.
 #[test]
 fn a_keyless_hop_the_in_flight_pool_cannot_pay_for_lights_no_landing() {
     let g = wide_geom();
@@ -446,9 +400,8 @@ fn a_keyless_hop_the_in_flight_pool_cannot_pay_for_lights_no_landing() {
         "the two echoed keys and nothing else — the flood's landing (15) is program output"
     );
 
-    // CONTROL — v1's landing law is untouched: the same twelve-cell hop
-    // with a key pressed inside the stamp window (vim's `w` after a
-    // press, the box-growth re-anchor) lights exactly its landing cell.
+    // Control: the same twelve-cell hop with a key pressed inside the stamp
+    // window (vim's `w`, the box-growth re-anchor) lights exactly its landing.
     let mut keyed = CursorGlow::default();
     let k0 = Instant::now();
     keyed.tick(Some((3, 4)), k0, &c, g, &mut out);
@@ -471,11 +424,8 @@ fn a_keyless_hop_the_in_flight_pool_cannot_pay_for_lights_no_landing() {
     );
 }
 
-/// THE KEY-TIME CLICK (touch-to-glass audio): the click is born at the
-/// PHYSICAL keypress, and the echo that arrives a round trip later must
-/// NOT click again. The latency this removes is the whole key → PTY →
-/// shell → PTY → parse → next-frame path; the failure mode this pins is
-/// the double-click that naive key-time cueing produces.
+/// The key-time click: the click is born at the physical keypress, and the echo
+/// a round trip later must not click again.
 #[test]
 fn key_time_click_fires_at_the_key_and_mutes_its_own_echo() {
     use crate::trail_sound::SoundKind;
@@ -520,13 +470,10 @@ fn key_time_click_fires_at_the_key_and_mutes_its_own_echo() {
     assert_eq!(cues[0].kind, SoundKind::Typed);
 }
 
-/// RESPONSIVENESS: `take_key_cue` hands the click back to the host so it can
-/// reach the synth ON the key thread instead of on the next render tick —
-/// the last frame of quantization on the audio half of the feedback.
-///
-/// Taking it must change WHO carries the cue and nothing else: the credit
-/// ledger still mutes the echo (one character, one click), and cues recorded
-/// earlier stay queued for the frame drain that owns them.
+/// `take_key_cue` hands the click to the host so it reaches the synth on the key
+/// thread rather than the next render tick. Taking it changes only who carries
+/// the cue: the credit ledger still mutes the echo (one character, one click),
+/// and earlier cues stay queued for the frame drain.
 #[test]
 fn take_key_cue_hands_back_the_click_without_touching_the_ledger() {
     use crate::trail_sound::SoundKind;
@@ -579,17 +526,10 @@ fn take_key_cue_hands_back_the_click_without_touching_the_ledger() {
     );
 }
 
-/// REGRESSION (adversarial review): a printable key whose echo lands as a
-/// JUMP rather than as `typing` must still speak exactly ONCE, and must not
-/// leave its credit behind.
-///
-/// A bare Character arms the key seam regardless of how far its echo moves the
-/// cursor — so vim normal-mode motions (`w b e 0 $ G`), any printable key in
-/// less/htop/fzf, and multi-cell IME commits all echo as a Jump. Debiting the
-/// ledger only on the `typing` arm therefore produced BOTH audible defects at
-/// once: `Typed` at the key plus `Jump` at the echo (which the synth cannot thin,
-/// because Jump bypasses MIN_GAP), and an unspent credit that the next typing
-/// advance — possibly pure output with no key behind it — silently swallowed.
+/// A printable key whose echo lands as a jump (vim motions, keys in
+/// less/htop/fzf, multi-cell IME commits) speaks exactly once and spends its
+/// credit: no `Typed` at the key plus `Jump` at the echo (Jump bypasses
+/// MIN_GAP), and no leftover credit to swallow a later advance.
 #[test]
 fn a_key_whose_echo_jumps_still_clicks_exactly_once() {
     use crate::trail_sound::SoundKind;
@@ -608,10 +548,8 @@ fn a_key_whose_echo_jumps_still_clicks_exactly_once() {
     assert_eq!(cues.len(), 1);
     assert_eq!(cues[0].kind, SoundKind::Typed);
 
-    // Its echo is a multi-cell JUMP (e.g. `w` in vim). The host still arms
-    // the committed printable-key witness even though the geometry is not
-    // typing; that witness admits the move, which must find the credit and
-    // stay silent rather than speak a second time for one keypress.
+    // Its echo is a multi-cell jump (`w` in vim). The host still arms the
+    // printable-key witness; the move must find the credit and stay silent.
     let echo = t0 + Duration::from_millis(40);
     glow.note_synthetic_typed(key, 1);
     glow.tick(Some((6, 9)), echo, &c, g, &mut out);
@@ -630,28 +568,21 @@ fn a_key_whose_echo_jumps_still_clicks_exactly_once() {
     assert_eq!(cues[0].kind, SoundKind::Typed);
 }
 
-/// REGRESSION: every causally admitted spawn arm handles an outstanding
-/// key-time credit without producing a duplicate printable-key click.
+/// Every admitted spawn arm handles an outstanding key-time credit without a
+/// duplicate printable-key click.
 ///
-/// The orphan is reachable: a printable key clicks at the press and arms a
-/// credit, then its echo is swallowed (a start-of-line Backspace erases
-/// nothing, an app eats the glyph) or folds into the NEXT key's echo. That
-/// next echo carries a Backspace or navigation hint, so it takes the
-/// `deletion` / `navigation` arm — and an arm that leaves the credit
-/// standing leaks it. Because the freshness anchor is re-stamped by every
-/// LATER key, a live typing burst keeps the orphan fresh indefinitely, and
-/// it is finally spent muting a genuine click.
-///
-/// Retiring must NOT silence those arms: a Backspace / arrow is a different
-/// key that never clicked at press time, so its own gesture still speaks.
-/// Each row asserts BOTH halves plus the un-muted follow-up click, so the
-/// test cannot be satisfied by simply muting the arm.
+/// A printable key clicks at the press and arms a credit, then its echo is
+/// swallowed or folds into the next key's echo, which may take the `deletion`
+/// or `navigation` arm. An arm that leaves the credit standing leaks it, and a
+/// typing burst keeps it fresh until it mutes a genuine click. Retiring must
+/// not silence those arms (a Backspace or arrow never clicked at press time),
+/// so each row asserts both halves plus the follow-up click.
 #[test]
 fn admitted_spawn_arms_handle_the_key_time_ledger() {
     use crate::trail_sound::SoundKind;
-    // (arm name, hint to arm before the echo, the echo's landing cell, the
-    // gesture that echo must STILL speak — `None` for the arms a printable
-    // key's own echo lands on, which suppress themselves by design.)
+    // (arm name, hint armed before the echo, the echo's landing cell, the
+    // gesture that echo must still speak; `None` for arms a printable key's
+    // own echo lands on, which suppress themselves.)
     type Arm = (
         &'static str,
         fn(&mut CursorGlow, Instant),
@@ -704,8 +635,7 @@ fn admitted_spawn_arms_handle_the_key_time_ledger() {
             ),
         }
         // Only the two arms a printable key's echo can land on settle the
-        // credit. An exact deletion is a different physical key and leaves
-        // the outstanding printable credit standing.
+        // credit; an exact deletion is a different key and leaves it standing.
         let settles = matches!(name, "typing" | "jump");
         assert_eq!(
             glow.keyed_clicks,
@@ -713,9 +643,8 @@ fn admitted_spawn_arms_handle_the_key_time_ledger() {
             "{name}: wrong ledger disposition for this arm"
         );
 
-        // The accepted cost is pinned too: the exact deletion leaves the
-        // printable credit to mute one later admitted typing echo, while the
-        // typing and jump arms already spent it.
+        // The accepted cost: the exact deletion leaves the printable credit to
+        // mute one later typing echo, while typing and jump already spent it.
         let later = echo + Duration::from_millis(120);
         glow.note_synthetic_typed(later, 1);
         let (lr, lc) = land;
@@ -735,19 +664,11 @@ fn admitted_spawn_arms_handle_the_key_time_ledger() {
     }
 }
 
-/// The KEY-TIME CLICK'S TIMBRE must be the timbre of the keystroke it
-/// belongs to, not of the one before it.
-///
-/// `heat` scales the synth's note level (`0.55 + 0.45·heat`) and its ember
-/// layer (`0.1 + 0.28·heat`). The echo-born cue this seam replaced was
-/// recorded AFTER `spawn`'s heat ramp, so it rode the freshly-charged
-/// blaze. Sampling `blaze()` at the key instead put the sound one whole
-/// keystroke behind the light — the same lateness the seam removes from the
-/// TIMING, reintroduced in the TONE. This pins the fix: the key-time cue
-/// carries the charge its own keystroke is about to add, tracking the pure
-/// echo-time engine within a few percent (the residue is only the round-trip
-/// cooling, and the key-time value is the correct one — it is the heat at
-/// the instant the ear actually hears the click).
+/// The key-time click's timbre belongs to its own keystroke. `heat` scales the
+/// synth's note level (`0.55 + 0.45·heat`) and ember layer (`0.1 + 0.28·heat`);
+/// the key-time cue carries the charge its keystroke is about to add, tracking
+/// the echo-time engine within a few percent (the residue is round-trip
+/// cooling, and the key-time value is the heat when the click is heard).
 #[test]
 fn the_key_time_click_carries_its_own_keystrokes_heat() {
     let g = geom();
@@ -755,9 +676,8 @@ fn the_key_time_click_carries_its_own_keystrokes_heat() {
     let t0 = Instant::now();
     let mut out = Vec::new();
 
-    // Two engines, one script: 6 keys at 100 ms (a brisk human cadence,
-    // inside the full-credit ramp) with a 5 ms local echo. `keyed` cues at
-    // the key; `echo_only` is the pre-seam engine and cues at the echo.
+    // Two engines, one script: 6 keys at 100 ms with a 5 ms local echo. `keyed`
+    // cues at the key; `echo_only` cues at the echo.
     let mut keyed = CursorGlow::default();
     let mut echo_only = CursorGlow::default();
     keyed.tick(Some((2, 0)), t0, &c, g, &mut out);
@@ -788,9 +708,8 @@ fn the_key_time_click_carries_its_own_keystrokes_heat() {
         let ref_cue: Vec<_> = echo_only.drain_sound_cues().collect();
         assert_eq!(ref_cue.len(), 1);
 
-        // The first key of a burst earns NO cadence credit (its gap is
-        // unbounded), exactly like its echo — so the prediction is not a
-        // blind constant, and cold-start clicks stay cold.
+        // The first key of a burst earns no cadence credit (unbounded gap), as
+        // its echo would, so cold-start clicks stay cold.
         if i == 1 {
             assert!(
                 (hot - stale).abs() < 1e-6,
@@ -814,11 +733,10 @@ fn the_key_time_click_carries_its_own_keystrokes_heat() {
     assert_eq!(charged, 5, "the ramp legs must actually have run");
 }
 
-/// The A/B twin of the test above, on the identical cursor transition. An
-/// explicit synthetic preview has causal provenance and speaks; a bare
-/// gesture timestamp — a Tab whose completion never echoed, an
-/// UNDELIVERED paste — does not and stays dark and silent (a delivered
-/// insert has its own class, `note_insert_delivered`).
+/// The A/B twin of the test above on the same transition: an explicit synthetic
+/// preview has causal provenance and speaks; a bare gesture timestamp (a Tab
+/// whose completion never echoed, an undelivered paste) stays dark and silent
+/// (a delivered insert has its own class, `note_insert_delivered`).
 #[test]
 fn a_synthetic_gesture_jump_speaks_but_cold_output_is_dark() {
     use crate::trail_sound::SoundKind;
@@ -849,12 +767,10 @@ fn a_synthetic_gesture_jump_speaks_but_cold_output_is_dark() {
     assert!(!frame_has_output(&out, &cold));
 }
 
-/// A PASTE STRUMS UNDER THE MUSIC BOX AND IS SILENT UNDER THE NINE (§28,
-/// the even hand): the rainbow kitty records exactly one `Strum` cue and
-/// banks one echo credit (the paste's own echo spends it and cues
-/// nothing); the same paste under another style records nothing and
-/// banks nothing, so its echo Jump cues exactly as before. Fails before
-/// (`cue_paste` does not exist).
+/// A paste strums under the music box and is silent under the other styles
+/// (§28): rainbow kitty records one `Strum` cue and banks one echo credit
+/// (the paste's echo spends it silently); other styles record and bank
+/// nothing, so their echo Jump cues as usual.
 #[test]
 fn a_paste_strums_under_the_music_box_and_is_silent_under_the_nine() {
     use crate::trail_sound::SoundKind;
@@ -909,10 +825,9 @@ fn a_paste_strums_under_the_music_box_and_is_silent_under_the_nine() {
     }
 }
 
-/// A BATCHED echo run spends ONE credit (one spawn, one cue), and the
-/// unspent remainder cannot mute the stream forever: past the freshness
-/// window the ledger zeroes and output-driven advances click again. This
-/// is the "a key an app SWALLOWED banks silence" failure mode.
+/// A batched echo run spends one credit (one spawn, one cue), and the unspent
+/// remainder cannot mute the stream forever: past the freshness window the
+/// ledger zeroes and output-driven advances click again.
 #[test]
 fn key_time_credits_expire_instead_of_banking_silence() {
     use crate::trail_sound::SoundKind;
@@ -929,17 +844,14 @@ fn key_time_credits_expire_instead_of_banking_silence() {
     }
     assert_eq!(glow.drain_sound_cues().count(), 3);
 
-    // One coalesced 3-cell echo arrives as ONE spawn: it spends one
-    // credit and stays silent. (The other two are still owed against
-    // echoes that were folded into this frame.)
+    // One coalesced 3-cell echo is one spawn: it spends one credit and stays
+    // silent (the other two are owed by echoes folded into this frame).
     let echo = t0 + Duration::from_millis(20);
     glow.note_synthetic_typed(echo, 3);
     glow.tick(Some((2, 3)), echo, &c, g, &mut out);
     assert_eq!(glow.drain_sound_cues().count(), 0);
 
-    // Past the window, the owed credits are abandoned, so the NEXT echo
-    // clicks again instead of being muted forever by a key an app
-    // swallowed.
+    // Past the window the owed credits are abandoned, so the next echo clicks.
     let late = echo + Duration::from_secs_f32(CursorGlow::KEYED_CLICK_FRESH + 0.1);
     glow.note_typed(late);
     glow.tick(Some((2, 4)), late, &c, g, &mut out);
@@ -949,14 +861,10 @@ fn key_time_credits_expire_instead_of_banking_silence() {
     assert_eq!(glow.keyed_clicks, 0, "stale credits are dropped wholesale");
 }
 
-/// DARK ⇒ SILENT for the key seam, for the gates that are ABOUT SOUND.
-/// The spawn edge gets its silence for free (it is unreachable while
-/// dark); a cue born at the KEY does not, so the seam is gated on the
-/// last tick's verdict — master off, and a dark tick (zero amplitude or a
-/// degenerate grid) the host marked INAUDIBLE (unfocus) both close it, as
-/// does never having ticked at all. A dark tick the host marked audible —
-/// a load-shed frame, a `Reduce Motion` session, an empty grid — does
-/// NOT: that case is pinned by
+/// Dark means silent for the key seam, for the gates about sound. A cue born at
+/// the key is gated on the last tick's verdict: master off, a dark tick the host
+/// marked inaudible (unfocus), or no tick yet all close it. A dark tick the host
+/// marked audible (load-shed frame, Reduce Motion, empty grid) does not; see
 /// `a_shed_frame_keeps_the_key_seam_open` in
 /// `tests/shed_frame_is_still_a_heard_key.rs`.
 #[test]
@@ -987,9 +895,8 @@ fn key_time_click_is_silent_wherever_the_sound_gates_close() {
     assert!(glow.cue_keystroke(t0));
     assert_eq!(glow.drain_sound_cues().count(), 1);
 
-    // Zero amplitude WITH the host's inaudible verdict (an unfocused
-    // window) closes it again, and drops the credit banked while it was
-    // open.
+    // Zero amplitude with the host's inaudible verdict (an unfocused window)
+    // closes it and drops the credit banked while open.
     let dark = GlowConfig {
         classic_mono: false,
         intensity: 0.0,
@@ -1003,14 +910,9 @@ fn key_time_click_is_silent_wherever_the_sound_gates_close() {
     assert_eq!(glow.drain_sound_cues().count(), 0);
 }
 
-/// ONE SEAM LAW ON EVERY RETURN PAST THE MASTER SWITCH, including the two
-/// that used to break it. The classic wake returned above every writer
-/// of `sound_live`, so a fresh `classic` session never clicked, and one
-/// switched from another style kept that style's seam, clicking in an
-/// unfocused window. A degenerate grid closed the seam like the master
-/// switch, which `aterm ctl tone` could only call `engine-silent`. Both
-/// now take `settle_key_seam`: heard when the tick drew or the host
-/// marked it audible, silent otherwise.
+/// One seam law on every return past the master switch, the classic wake and a
+/// degenerate grid included: all take `settle_key_seam`, heard when the tick
+/// drew or the host marked it audible, silent otherwise.
 #[test]
 fn the_classic_wake_and_an_empty_grid_obey_the_one_key_seam_law() {
     let g = geom();
@@ -1062,9 +964,9 @@ fn the_classic_wake_and_an_empty_grid_obey_the_one_key_seam_law() {
     assert_eq!(glow.keyed_clicks, 0, "and its credit went with the seam");
     assert!(!glow.cue_keystroke(t0));
 
-    // AN EMPTY GRID in the window the key belongs to: dark and heard, the
-    // banked credit kept (its echo must stay silent when it lands), and
-    // the dark latch NOT set, so a later master-off still wipes.
+    // An empty grid in the key's window: dark and heard, the banked credit kept
+    // (its echo must stay silent), and the dark latch not set, so a later
+    // master-off still wipes.
     for (empty, what) in [
         (Geom { cols: 0, ..g }, "no columns"),
         (Geom { rows: 0, ..g }, "no rows"),
@@ -1102,22 +1004,16 @@ fn the_classic_wake_and_an_empty_grid_obey_the_one_key_seam_law() {
     }
 }
 
-/// THE BRRRRING'S PREVIEW FEED, pinned — the exact cue morphology of rapid
-/// synthetic new lines. A Return timestamp alone is separately pinned dark.
-/// Two shapes exist and BOTH are load-bearing:
+/// The preview feed of rapid synthetic new lines keeps its cue morphology (a
+/// Return timestamp alone is pinned dark elsewhere). Two shapes:
 /// - Enter after a typed command (one row down, column snapped left,
-///   chebyshev > 1, no key hint armed) is the JUMP gesture — and Jumps
-///   bypass the synth's min-gap thinning, so a rapid run stacks
-///   overlapping Jump flourishes. This is the dominant voice of the
-///   owner's beloved "brrrring!".
-/// - a bare held Enter at an empty prompt (one row down, SAME column —
-///   chebyshev exactly 1) is the TYPED gesture: the quick pluck stream
-///   filling the gaps between the flourishes.
+///   chebyshev above 1, no key hint) is the Jump gesture; Jumps bypass the synth's min-gap
+///   thinning, so a rapid run stacks overlapping flourishes;
+/// - a bare held Enter at an empty prompt (one row down, same column, chebyshev
+///   1) is the Typed gesture, plucks filling the gaps.
 ///
-/// The synth half of the pin
-/// (`trail_sound::tests::brrrring_of_rapid_line_feeds_is_pinned`) holds
-/// the flourishes bit-identical to v0.56; this half guarantees the cue
-/// path that feeds them can never silently reclassify.
+/// The synth half is `trail_sound::tests::brrrring_of_rapid_line_feeds_is_pinned`;
+/// this half keeps the cue path from reclassifying them.
 #[test]
 fn rapid_synthetic_line_feeds_cue_jump_and_typed_gestures() {
     use crate::trail_sound::SoundKind;

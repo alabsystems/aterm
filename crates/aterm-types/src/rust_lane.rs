@@ -8,10 +8,8 @@
 //!
 //! # The ruling this module carries
 //!
-//! Owner, 2026-09-23, after an orchestrating agent wrote `cargo +1.97.1` and
-//! "clippy/fmt" into ~45 subagent prompts for two repos whose
-//! `rust-toolchain.toml` pins stock `1.97.1`: on this machine Rust means the
-//! Trust toolchain EVERYWHERE — `targo --unverified <cmd>` / `targo trust <cmd>`
+//! On this machine Rust means the Trust toolchain EVERYWHERE —
+//! `targo --unverified <cmd>` / `targo trust <cmd>`
 //! (never `cargo`, never `cargo +<channel>`), `targo tippy` (never clippy),
 //! `targo fmt` / `trustfmt` (never rustfmt), `trustc`, `trustdoc` — including in
 //! a repo whose `rust-toolchain.toml` pins a stock channel.
@@ -23,32 +21,26 @@
 //! * `atpkg::reroute` — the signpost a session prints when a stock name is typed;
 //! * `aterm pkg lane` (`atpkg::lane`) — this reader over one command line, the
 //!   refusal a guard the owner wires (an agent's `PreToolUse` hook, say) says
-//!   back; aterm installs nothing into an agent (decision "B", 2026-09-23);
+//!   back; aterm installs nothing into an agent;
 //! * `aterm help rust` — the page that measures which toolchain a directory gets.
 //!
-//! # A Trust toolchain's own compatibility names (2026-09-27)
+//! # A Trust toolchain's own compatibility names
 //!
 //! The reader judges a command word by its NAME, except where a caller lets it
 //! look at the directory ([`verdict_in`]): there `<dir>/rustc` beside
 //! `<dir>/trustc` is the Trust compiler and never a hit, and `<dir>/cargo` beside
 //! `<dir>/targo` is refused with that directory's `targo` ([`COMPAT_TWINS`]).
-//! The interim `~/.claude/hooks/trust-toolchain-guard.py` let `rustc`, `rustdoc`,
-//! `cargo` and `rustfmt` through by path in any directory holding `trustc` or
-//! `targo`. This reader carries the `rustc`/`rustdoc` half, each beside its own
-//! twin, and deliberately keeps refusing the rest: `cargo` for the measured
-//! reason on [`COMPAT_TWINS`], and `rustfmt` because a Trust toolchain ships no
-//! compatibility `rustfmt` (measured: the installed one holds `trustfmt` only).
-//! The same binaries chosen by a Trust rustup CHANNEL — `rustup run trust rustc`,
-//! `rustc +trust` — are read the same way, text alone (2026-09-28).
+//! Only `rustc`/`rustdoc` pass by path, each beside its own twin: `cargo` is
+//! refused for the measured reason on [`COMPAT_TWINS`], and `rustfmt` because a
+//! Trust toolchain ships no compatibility `rustfmt` (the installed one holds
+//! `trustfmt` only). The same binaries chosen by a Trust rustup CHANNEL —
+//! `rustup run trust rustc`, `rustc +trust` — are read the same way, text alone.
 //!
 //! Every spelling [`trust_spelling`] renders RESOLVES: the design rule that a
 //! hint may only name a command that runs (docs/DESIGN-agent-toolchain-guidance-
-//! 2026-09-08.md §2). The reroute's signpost used to render `targo trust <verb>`
-//! and `targo --unverified <verb>` for EVERY cargo verb, so `cargo metadata`
-//! printed two commands targo refuses — the shape of ledger item HOST-05
-//! ("`targo --unverified fmt` is rejected").
+//! 2026-09-08.md §2), so `cargo metadata` never renders a lane targo refuses.
 //!
-//! # A stock pin moves only rustup's proxies (measured 2026-09-23)
+//! # A stock pin moves only rustup's proxies (measured)
 //!
 //! In a crate whose `rust-toolchain.toml` pins `channel = "1.97.1"`, with
 //! rustup's proxies FIRST on PATH and no reroute directory at all, on the atpkg
@@ -63,7 +55,7 @@
 //! trustc is an explicit `RUSTC`/`build.rustc` — a different question, which
 //! `aterm help rust` measures.)
 //!
-//! # Which lane a cargo verb takes (measured on the same build, 2026-09-23)
+//! # Which lane a cargo verb takes (measured on the same build)
 //!
 //! | class | verbs | the Trust spelling |
 //! |---|---|---|
@@ -72,7 +64,7 @@
 //! | no lane | `clean` `metadata` `tree` `update` `fetch` `generate-lockfile` `locate-project` `pkgid` `vendor` `add` `remove` `new` `init` `version` `help` `search` `info` `config` `report` `verify-project` `read-manifest` `owner` `fmt` `tippy` | `targo <verb> …` (`--unverified` is refused: "valid only for a Targo compilation command") |
 //! | the linter | `clippy` | `targo tippy …` |
 //!
-//! Re-measured 2026-09-24 on store build 9192 with non-`--help` invocations (a
+//! Measured on store build 9192 with non-`--help` invocations (a
 //! `--help` answers before the lane check, so it proves nothing about a lane):
 //! a BARE `package`, `install` or `publish` is refused like `build` ("refuses to
 //! create an implicitly unverified artifact") while a bare `run`, `doc`,
@@ -468,6 +460,17 @@ pub fn find_pin(start: &Path) -> Option<(PathBuf, String)> {
     None
 }
 
+/// Where a pinned channel was read: a toolchain file rustup would read
+/// ([`find_pin`]), or `$RUSTUP_TOOLCHAIN`, which rustup ranks above any file.
+/// A [`refusal`] names the one it has: the environment is not the directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinSource {
+    /// `$RUSTUP_TOOLCHAIN`.
+    Env,
+    /// A toolchain file.
+    File(PathBuf),
+}
+
 // ── the reader: a stock tool at command position ───────────────────────────
 
 /// A stock Rust tool found at command position.
@@ -484,6 +487,15 @@ pub struct Hit {
     /// written, trailing `/` included. [`Hit::used`] and every spelling then
     /// carry it.
     pub toolchain_dir: Option<String>,
+    /// The rustup channel the command named — `cargo +1.97.1`, `rustup run trust
+    /// cargo` — which rustup ranks above `$RUSTUP_TOOLCHAIN` and any toolchain
+    /// file, so a [`refusal`] names no pin beside it.
+    pub channel: Option<String>,
+    /// Set when the command word is a Trust toolchain's compatibility `cargo`:
+    /// beside its `targo` ([`Hit::toolchain_dir`]) or chosen by a Trust rustup
+    /// channel ([`Hit::channel`]). Upstream cargo's surface, which names no lane —
+    /// never stock Rust.
+    pub compat: bool,
     /// Set when the tool was found in text nested deeper than the reader follows
     /// ([`MAX_DEPTH`]): its NAME appears there, and a guard refuses what it could
     /// not read rather than guess. [`Hit::used`] is then the bare
@@ -530,10 +542,8 @@ fn fold(found: &mut Verdict, next: Verdict) -> bool {
 /// The deepest nesting ([`check`] recursing into `$(…)`, backticks, `bash -c`,
 /// `eval`) that is parsed. Deeper text is not parsed, and it is not waved
 /// through either: a stock tool's NAME anywhere in it is a hit ([`Hit::unread`]).
-/// Until 2026-09-28 such text answered `Clean` — nine nested `$( )`, `bash -c`
-/// or `eval` levels around `cargo build` went through a guard that refuses one
-/// (review of 2026-09-27): a guard that fails open at its own cap is a way past
-/// it, and the escape hatch exists for the command that genuinely needs one.
+/// A guard that fails open at its own cap is a way past it; the escape hatch
+/// exists for the command that genuinely needs one.
 pub const MAX_DEPTH: usize = 8;
 
 /// The first stock Rust tool at COMMAND POSITION in `command` — a shell command
@@ -604,7 +614,7 @@ type Beside<'a> = &'a dyn Fn(&str, &str) -> bool;
 /// The trust repository's CLAUDE.md: a Trust sysroot ships Trust-branded names,
 /// and `cargo`, `rustc` and `rustdoc` are the only compatibility names.
 ///
-/// Measured 2026-09-27 on the installed seal of trust 450403669
+/// Measured on the installed seal of trust 450403669
 /// (`~/toolchains/trust-45040366/bin`): `rustc` is byte-identical to `trustc`
 /// and answers `rustc 1.99.0-dev (450403669 2026-09-24)`; `rustdoc` is
 /// byte-identical to `trustdoc`. Neither is stock, so by path beside its twin
@@ -702,6 +712,8 @@ fn unread(text: &str) -> Verdict {
         used: name.to_string(),
         instead: trust_spelling(name, &[]).unwrap_or_default(),
         toolchain_dir: None,
+        channel: None,
+        compat: false,
         unread: true,
     })
 }
@@ -1325,11 +1337,8 @@ fn tool_verdict(words: &[String], i: usize, depth: usize, beside: Beside<'_>) ->
     // (the spelling `aterm help reroute` sanctions), `rustc +trust` — are that
     // Trust toolchain's trustc and trustdoc: never a hit. Its `cargo` stays one,
     // for the reason on [`COMPAT_TWINS`].
-    if is_trust_alias(head)
-        && run_channel
-            .or_else(|| explicit_toolchain(rest))
-            .is_some_and(is_trust_channel)
-    {
+    let channel = run_channel.or_else(|| explicit_toolchain(rest));
+    if is_trust_alias(head) && channel.is_some_and(is_trust_channel) {
         return Verdict::Clean;
     }
     // A compatibility name BY PATH, its Trust twin beside it: that toolchain's
@@ -1374,7 +1383,10 @@ fn tool_verdict(words: &[String], i: usize, depth: usize, beside: Beside<'_>) ->
     Verdict::Stock(Hit {
         used,
         instead,
+        compat: head == "cargo"
+            && (toolchain_dir.is_some() || channel.is_some_and(is_trust_channel)),
         toolchain_dir: toolchain_dir.map(str::to_string),
+        channel: channel.map(str::to_string),
         unread: false,
     })
 }
@@ -1478,61 +1490,71 @@ fn one_command_line(text: &str) -> String {
 
 /// What a guard says back to the agent whose command it refused: the stock
 /// spelling as used, the Trust spelling of the SAME command with the agent's own
-/// arguments (every lane targo accepts for it, [`trust_spelling`]), the fact the
-/// 2026-09-23 incident turned on — a stock pin moves only rustup's proxies — and
-/// the escape hatch. `pin` is the directory's toolchain file and channel
-/// ([`find_pin`]); a STOCK one is named, since that is the directory an agent
-/// reads as "this repository builds with stock".
+/// arguments (every lane targo accepts for it, [`trust_spelling`]), the fact
+/// that a stock pin moves only rustup's proxies, and
+/// the escape hatch. `pin` is the stock channel in force and where it was read
+/// (`$RUSTUP_TOOLCHAIN`, else [`find_pin`]): named, since that is what an agent reads
+/// as "this repository builds with stock" — unless the command names its own
+/// channel ([`Hit::channel`]), which outranks it, or is a compatibility cargo
+/// ([`Hit::compat`]).
 ///
 /// Bounded: each command is one line of at most [`REFUSAL_COMMAND_CAP`] bytes.
 #[must_use]
-pub fn refusal(hit: &Hit, pin: Option<(&Path, &str)>) -> String {
+pub fn refusal(hit: &Hit, pin: Option<(&PinSource, &str)>) -> String {
+    let used = one_command_line(&hit.used);
     let mut out = if hit.unread {
         format!(
-            "`{}` appears in text nested more than {MAX_DEPTH} levels deep (`$( )`, backticks, \
-             `bash -c`, `eval`), which this reader does not follow, so it is refused rather than \
-             guessed at: flatten the command so the tool stands where it can be read.\n",
-            one_command_line(&hit.used)
+            "`{used}` is nested more than {MAX_DEPTH} levels deep (`$( )`, backticks, `bash -c`, \
+             `eval`), past what this reader follows, so it is refused unread. Flatten the command \
+             so the tool stands where it can be read.\n"
         )
-    } else if let Some(dir) = &hit.toolchain_dir {
-        // A Trust toolchain's own `cargo` by path ([`COMPAT_TWINS`]): not stock,
-        // and saying so would be false — but it names no lane. A path runs no
-        // rustup proxy, so a pin moves nothing here and is not named.
+    } else if hit.toolchain_dir.is_some() {
+        // A Trust toolchain's own `cargo` by path ([`COMPAT_TWINS`]): not stock, but
+        // it names no lane. `used` carries the directory, and so does every spelling.
         format!(
-            "`{}` is the compatibility `cargo` of the Trust toolchain in {}: upstream cargo's \
-             surface, not targo's — it takes no lane (it refuses `--unverified`), so neither the \
-             verified nor the unverified lane is named. On this machine a Rust build names its \
-             lane, with that toolchain's own `targo` beside it.\n",
-            one_command_line(&hit.used),
-            one_command_line(dir)
+            "`{used}` is a Trust toolchain's compatibility cargo: upstream cargo's surface, \
+             which names no lane.\n"
+        )
+    } else if let Some(channel) = hit.channel.as_deref().filter(|_| hit.compat) {
+        format!(
+            "`{used}` is the compatibility cargo of rustup's {} toolchain: upstream cargo's \
+             surface, which names no lane.\n",
+            one_command_line(channel)
         )
     } else {
         format!(
-            "`{}` is stock Rust. On this machine Rust means the Trust toolchain — also in a \
-             repository whose rust-toolchain.toml pins a stock channel: that pin moves only \
-             rustup's proxies (cargo, rustc, rustfmt, cargo-clippy), never targo, tippy, trustfmt \
-             or trustdoc.\n",
-            one_command_line(&hit.used)
+            "`{used}` is stock Rust. Rust here is the Trust toolchain, even under a stock \
+             rust-toolchain.toml pin: that pin moves only rustup's proxies (cargo, rustc, rustfmt, \
+             cargo-clippy), never targo, tippy, trustfmt or trustdoc.\n"
         )
     };
-    if let Some((file, channel)) = pin
+    if let Some((source, channel)) = pin
         .filter(|(_, ch)| !is_trust_channel(ch))
-        .filter(|_| hit.toolchain_dir.is_none() && !hit.unread)
+        .filter(|_| !hit.compat && hit.channel.is_none() && !hit.unread)
     {
-        out.push_str(&format!(
-            "This directory pins stock \"{}\" ({}); build it with the Trust spelling all the same.\n",
-            one_command_line(channel),
-            one_command_line(&file.display().to_string())
-        ));
+        let channel = one_command_line(channel);
+        out.push_str(&match source {
+            PinSource::File(file) => format!(
+                "This directory pins stock \"{channel}\" ({}); build it with the Trust spelling \
+                 all the same.\n",
+                one_command_line(&file.display().to_string())
+            ),
+            PinSource::Env => format!(
+                "$RUSTUP_TOOLCHAIN names stock \"{channel}\"; build with the Trust spelling all \
+                 the same.\n"
+            ),
+        });
     }
     if is_unknown_verb(&hit.instead) {
         // A hint may only name a command that runs: say that this one may not.
         out.push_str(
-            "Its verb is not one targo is known to have (measured: `targo nextest` and `targo deny` \
-             answer \"no such command\"); IF targo has it, the Trust spelling is:\n",
+            "targo may not have this verb (`targo nextest` and `targo deny` answer \"no such \
+             command\"); IF it does, the Trust spelling is:\n",
         );
     } else if hit.unread {
         out.push_str("The Trust tool for it:\n");
+    } else if hit.toolchain_dir.is_some() {
+        out.push_str("Run that toolchain's targo:\n");
     } else {
         out.push_str("Run the Trust spelling of the same command:\n");
     }
@@ -1548,14 +1570,21 @@ pub fn refusal(hit: &Hit, pin: Option<(&Path, &str)>) -> String {
     out.push_str(&render_spellings(&bounded, "  "));
     if is_unknown_verb(&hit.instead) {
         out.push_str(
-            "If it answers \"no such command\", the extension has no Trust spelling yet — the case \
-             the escape below exists for.\n",
+            "If it answers \"no such command\", the extension has no Trust spelling yet: use the \
+             escape below.\n",
         );
     }
-    out.push_str(&format!(
-        "If stock Rust is genuinely required, put {STOCK_REASON}='<why>' in front of the \
-         command and say why in your reply. `aterm help rust` measures what this directory gets."
-    ));
+    if hit.compat {
+        out.push_str(&format!(
+            "If upstream cargo's surface is genuinely required, put {STOCK_REASON}='<why>' in \
+             front of the command and say why in your reply."
+        ));
+    } else {
+        out.push_str(&format!(
+            "If stock Rust is genuinely required, put {STOCK_REASON}='<why>' in front of the \
+             command and say why in your reply. `aterm help rust` measures what this directory gets."
+        ));
+    }
     out
 }
 

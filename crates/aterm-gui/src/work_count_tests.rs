@@ -5,27 +5,23 @@
 //! idle wake (docs/PERF-REGRESSION-DEFENCE.md, W-4 and "If you are the next
 //! person here", item 1).
 //!
-//! Until 2026-09-25 these wins were proved only inside the criterion benches
-//! (`benches/workspace_scaling.rs`, `benches/subscribe_digest.rs`) and by
-//! outcome-parity unit tests that carry no count, so nothing in the merge
-//! contract's test stage failed on their giveback: a pass that went back to
-//! doing the work reaches the same ANSWER, only slower. Each test here reads a
-//! `crate::work_counts` counter placed at the site that does the removed WORK,
-//! with the fixture shapes lifted from those benches (N tabs x M panes staged
-//! through `push_stub_tab` + `split_active_stub_tab`, exactly as
-//! `BenchApp::stage_workspace` does; the digest through the bench's own
-//! `DigestFixture`). Each also shows its counter moving on a control, so a zero
-//! is never a counter nobody increments.
+//! A pass that goes back to doing the work reaches the same ANSWER, only
+//! slower, so outcome-parity tests cannot catch the giveback. Each test here
+//! reads a `crate::work_counts` counter placed at the site that does the
+//! removed WORK (N tabs x M panes staged through `push_stub_tab` +
+//! `split_active_stub_tab`; the digest through `DigestFixture`). Each also
+//! shows its counter moving on a control, so a zero is never a counter nobody
+//! increments.
 
 use super::*;
 use crate::work_counts;
 use std::time::{Duration, Instant};
 
 /// The PTY reader's batch cadence under a flood — the rate the `Wake::Output`
-/// gates run at (`workspace_scaling.rs`' `BURST_DT`).
+/// gates run at.
 const BURST_DT: Duration = Duration::from_micros(333);
 
-/// `BenchApp::stage_workspace(tabs, panes)`: window 0 split to `panes` panes,
+/// Window 0 split to `panes` panes,
 /// then `tabs - 1` more tabs appended, each split as it becomes active. Leaves
 /// the LAST tab active.
 fn workspace(tabs: usize, panes: usize) -> App {
@@ -225,7 +221,7 @@ fn a_steady_title_gate_walks_no_tab() {
 /// three ledgers linearly: ~2,000 records per target per wake.
 #[test]
 fn an_idle_events_wake_touches_no_retained_record() {
-    use crate::subscribe::bench_seam::DigestFixture;
+    use crate::subscribe::digest_fixture::DigestFixture;
     const TARGETS: usize = 4;
     let mut f = DigestFixture::build(TARGETS, 2 * 1000, 2 * crate::turn_ledger::LEDGER_CAP, {
         2 * crate::session_timeline::TIMELINE_CAP

@@ -156,7 +156,7 @@ pub(crate) fn root_of_entry_lines(mut entries: Vec<Vec<u8>>) -> String {
     for e in &entries {
         h.update(e);
     }
-    hex(&h.finalize())
+    aterm_codec::hex::encode_lower(&h.finalize())
 }
 
 /// Build ONE canonical entry line: `<relpath-bytes> 0x00 <octal-perm-bits> 0x00
@@ -179,7 +179,7 @@ pub(crate) const SYMLINK_TAG: &str = "symlink";
 pub(crate) fn symlink_target_sha(target_bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(target_bytes);
-    hex(&h.finalize())
+    aterm_codec::hex::encode_lower(&h.finalize())
 }
 
 /// Build ONE canonical entry line for a symlink: `<relpath-bytes> 0x00 symlink 0x00
@@ -314,17 +314,7 @@ fn file_sha256_with(path: &Path, buf: &mut [u8]) -> io::Result<String> {
         // a nonconforming reader from panicking the slice.
         h.update(&buf[..n.min(buf.len())]);
     }
-    Ok(hex(&h.finalize()))
-}
-
-/// Lowercase-hex encode a digest.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len().saturating_mul(2));
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    Ok(aterm_codec::hex::encode_lower(&h.finalize()))
 }
 
 #[cfg(test)]
@@ -332,7 +322,6 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
 
     /// `tree_root` is a cross-version byte contract (signed manifests embed roots
     /// computed by earlier releases): the mode field is minimal octal of the masked bits.
@@ -344,11 +333,8 @@ mod tests {
         assert_eq!(oct_mode(0o100_644), "644", "file-type bits are masked off");
     }
 
-    fn tmp(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("atpkg-tree-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-tree-{label}-"))
     }
 
     fn write(p: &Path, content: &[u8]) {

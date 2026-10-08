@@ -1,46 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `targo --unverified forge survey` — the inventory report, and the answer to "what are all
-//! the third-party dependencies of aterm?".
+//! `targo --unverified forge survey`: the inventory report of aterm's
+//! third-party dependencies.
 //!
-//! # Every number here is MEASURED, never transcribed
+//! # Every number is measured
 //!
-//! The report is assembled from [`crate::loc::survey_cell`] (graph + per-package
-//! facts) and [`crate::dominator`] (true cost) at run time. Nothing in the
-//! emitted text is a hand-typed count: a number typed into prose rots the moment
-//! the lock file moves, and this program exists precisely to catch that motion.
+//! The report is assembled at run time from [`crate::loc::survey_cell`] (graph
+//! and per-package facts) and [`crate::dominator`] (true cost); no count is
+//! hand-typed.
 //!
-//! # Why the table ranks by DOMINATOR cost
+//! # Ranked by dominator cost
 //!
-//! `dom(C) = reach(root) \ reach(root, block C)` — the packages that disappear
-//! if, and only if, `C` disappears. A SUBTREE size answers a different and
-//! misleading question: it double-counts every dependency some other edge also
-//! reaches. Measured example, recorded in [`crate::model`]: `softbuffer`'s
-//! subtree is 39–45 packages resolved in isolation and **8** in the real Linux
-//! graph, because `winit` already pulls `wayland-client` and `x11rb`. The table
-//! also proves this live — it prints the top row's subtree beside its dominator.
+//! `dom(C) = reach(root) \ reach(root, block C)`: the packages that disappear
+//! if and only if `C` does. A subtree double-counts dependencies other edges
+//! also reach; the table prints the top row's subtree beside its dominator.
 //!
 //! # The partition invariant
 //!
-//! Dominator sets nest (`dom(naga) ⊂ dom(wgpu)`), so the cost column must never
-//! be summed blindly. The sets that do NOT nest inside another third-party
-//! package's set are pairwise DISJOINT (dominators of a node form a chain), and
-//! they cover every third-party node — so their LOC sums to the third-party
-//! total exactly. The report computes that sum and prints the check, which is a
-//! standing cross-check of [`crate::dominator`] against [`crate::loc`].
+//! Dominator sets nest (`dom(naga) ⊂ dom(wgpu)`), so costs must not be summed
+//! blindly. The sets not nested inside another third-party package's set are
+//! pairwise disjoint and cover every third-party node, so their LOC sums to the
+//! third-party total exactly. The report prints that check, cross-checking
+//! [`crate::dominator`] against [`crate::loc`].
 
 use crate::dominator::DomCost;
-use crate::model::{CellSurvey, PkgId};
+use crate::model::{Cell, CellSurvey, PkgId};
 use crate::{Outcome, PRECISION_NOTE, dominator, loc, resolve};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
 /// A third-party package whose dominator is exactly itself and whose source is
-/// under this many lines is a REPLACE-IN-HOUSE candidate: deleting it cascades
-/// to nothing, so it can be carved alone with no graph surgery and no version
-/// negotiation with any other dependant.
+/// under this many lines is a replace-in-house candidate: removing it cascades
+/// to nothing.
 const ZERO_COST_LOC: u64 = 3_000;
 
 const W_LOC: usize = 9;
@@ -53,9 +46,8 @@ const W_LINE: usize = 96;
 
 /// Emit the survey. `cells` empty means every cell; `top` 0 means every row.
 ///
-/// A cell that cannot be resolved is NAMED and the outcome is not `ok` — a
-/// survey that silently measured four of five cells would understate the
-/// surface, which is the exact failure mode this tool exists to prevent.
+/// A cell that cannot be resolved is named and the outcome is not `ok`, so a
+/// partial survey never understates the surface.
 pub fn run(
     root: &Path,
     cells: &[String],
@@ -64,27 +56,13 @@ pub fn run(
 ) -> Result<Outcome, String> {
     let all = resolve::default_cells();
     let chosen = resolve::select(&all, cells)?;
-
-    let mut surveys: Vec<CellSurvey> = Vec::new();
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    for cell in &chosen {
-        match loc::survey_cell(root, cell) {
-            Ok(s) => surveys.push(s),
-            Err(why) => skipped.push((cell.name.clone(), why)),
-        }
-    }
-
-    if surveys.is_empty() {
-        let mut why = String::new();
-        for (c, e) in &skipped {
-            let _ = writeln!(why, "      {c}: {e}");
-        }
-        return Err(format!(
+    let (surveys, skipped) = survey_cells(root, &chosen).map_err(|why| {
+        format!(
             "not one requested cell resolved:\n{why}    Fix: run `targo fetch --locked` once \
              in {} so the offline resolver has an index, then re-run `targo --unverified forge survey`.",
             root.display()
-        ));
-    }
+        )
+    })?;
 
     let mut log = String::new();
     preamble(&mut log, root, &surveys);
@@ -133,6 +111,34 @@ pub fn run(
     })
 }
 
+/// A cell that did not resolve: its name, and why.
+type Skipped = (String, String);
+
+/// Survey each chosen cell: those that resolved, and every one that did not,
+/// named with why. `Err` is that list when none resolved; each caller says what
+/// that stops ([`run`], [`crate::blame::run`]).
+pub(crate) fn survey_cells(
+    root: &Path,
+    chosen: &[Cell],
+) -> Result<(Vec<CellSurvey>, Vec<Skipped>), String> {
+    let mut surveys: Vec<CellSurvey> = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
+    for cell in chosen {
+        match loc::survey_cell(root, cell) {
+            Ok(s) => surveys.push(s),
+            Err(why) => skipped.push((cell.name.clone(), why)),
+        }
+    }
+    if surveys.is_empty() {
+        let mut why = String::new();
+        for (c, e) in &skipped {
+            let _ = writeln!(why, "      {c}: {e}");
+        }
+        return Err(why);
+    }
+    Ok((surveys, skipped))
+}
+
 // ---------------------------------------------------------------- report body
 
 fn preamble(out: &mut String, root: &Path, surveys: &[CellSurvey]) {
@@ -140,11 +146,8 @@ fn preamble(out: &mut String, root: &Path, surveys: &[CellSurvey]) {
     let _ = writeln!(out, "{}", "=".repeat(W_LINE));
     let _ = writeln!(out, "FORGE SURVEY — aterm's third-party surface");
     let _ = writeln!(out, "{}", "=".repeat(W_LINE));
-    // ELIDED FROM THE LEFT, because this report promises every line fits a
-    // 100-column terminal and a checkout path is unbounded. A worktree under
-    // /private/tmp/... already produced a 110-column line, i.e. the contract was
-    // broken by where the repo happened to sit. The tail is the informative
-    // half — the leaf directory names the checkout — so the head is what goes.
+    // Elided from the left: every line fits 100 columns, and the tail (the
+    // leaf directory) is the informative half of a checkout path.
     let root_text = root.display().to_string();
     let root_line = if root_text.chars().count() > 88 {
         let tail: String = root_text
@@ -306,8 +309,8 @@ fn ranked_table(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost)], t
 
 /// Non-nested dominator sets are pairwise disjoint and cover every third-party
 /// node, so their LOC must sum to the third-party total. Printing the identity
-/// makes any disagreement between [`crate::dominator`] and [`crate::loc`] a
-/// visible line rather than a silently wrong ranking.
+/// makes any disagreement between [`crate::dominator`] and [`crate::loc`]
+/// visible.
 fn partition_check(
     out: &mut String,
     s: &CellSurvey,
@@ -559,10 +562,8 @@ pub(crate) fn commas(n: u64) -> String {
     out
 }
 
-/// Word-wrap prose that interpolates measured values. Pre-wrapping in the
-/// source cannot work: one long crate name or a seven-digit count would push
-/// the line past the terminal, and a report nobody can read is a report nobody
-/// reads. Shared with [`crate::blame`] so both verbs wrap identically.
+/// Word-wrap prose that interpolates measured values, whose widths are unknown
+/// at source time. Shared with [`crate::blame`].
 pub(crate) fn wrap(out: &mut String, indent: &str, text: &str, width: usize) {
     for para in text.split('\n') {
         let mut line = String::from(indent);
@@ -597,16 +598,12 @@ pub(crate) fn fit(s: &str, width: usize) -> String {
     out
 }
 
-/// One filesystem path, bounded to `width` CHARACTERS without discarding the
-/// part the reader came for.
+/// One filesystem path, bounded to `width` characters without losing the part
+/// the reader came for.
 ///
-/// [`fit`] cuts the TAIL, which on a path is precisely the package directory
-/// that identifies it — `…/registry/src/index.crates.io-1949cf8…` names
-/// nothing. This drops whole LEADING components instead and marks the cut with
-/// `…/`, so what remains is still a true suffix of the real path: enough to
-/// recognise the package, and honest about being shortened. A single component
-/// too long to fit on its own falls back to [`fit`], since there is nothing
-/// left to drop.
+/// [`fit`] cuts the tail, which on a path is the package directory. This drops
+/// whole leading components instead and marks the cut with `…/`, leaving a true
+/// suffix. A single component too long on its own falls back to [`fit`].
 pub(crate) fn fit_path(path: &str, width: usize) -> String {
     if path.chars().count() <= width {
         return path.to_string();
@@ -890,14 +887,7 @@ fn jstr(o: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn repo_root() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("crates/aterm-forge sits two levels under the workspace root")
-            .to_path_buf()
-    }
+    use crate::test_support::repo_root;
 
     fn cell(name: &str) -> crate::model::Cell {
         resolve::default_cells()
@@ -915,14 +905,8 @@ mod tests {
         assert_eq!(commas(u64::MAX), "18,446,744,073,709,551,615");
     }
 
-    /// A PATH KEEPS ITS NAME WHEN IT IS SHORTENED.
-    ///
-    /// The registry dir blame prints is absolute, and its width is set by
-    /// `$CARGO_HOME`'s depth plus the package's own name — so on THIS machine,
-    /// in a SHORT checkout, `wgpu-core-deps-windows-linux-android` measured 126
-    /// columns against a 100-column budget. Cutting the tail (what [`fit`]
-    /// does) would drop exactly the package directory the line exists to name,
-    /// so `fit_path` drops leading components instead.
+    /// A shortened path keeps its trailing package directory: `fit_path` drops
+    /// leading components.
     #[test]
     fn fit_path_keeps_the_tail_that_names_the_package() {
         let long = "/Users//example/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
@@ -981,126 +965,11 @@ mod tests {
         assert_eq!(o, r#""C:\\Users\\a\\.cargo""#);
     }
 
-    /// A hand-rolled emitter needs a structural reader to answer to, or a
-    /// stray comma ships unnoticed. This is a minimal but complete RFC 8259
-    /// value scanner: it accepts exactly well-formed JSON.
-    fn json_wellformed(s: &str) -> Result<(), String> {
-        let b: Vec<char> = s.chars().collect();
-        let mut i = 0usize;
-        fn ws(b: &[char], i: &mut usize) {
-            while *i < b.len() && matches!(b[*i], ' ' | '\n' | '\t' | '\r') {
-                *i += 1;
-            }
-        }
-        fn value(b: &[char], i: &mut usize) -> Result<(), String> {
-            ws(b, i);
-            let Some(&c) = b.get(*i) else {
-                return Err(format!("value expected at {i}"));
-            };
-            match c {
-                '{' | '[' => {
-                    let close = if c == '{' { '}' } else { ']' };
-                    *i += 1;
-                    ws(b, i);
-                    if b.get(*i) == Some(&close) {
-                        *i += 1;
-                        return Ok(());
-                    }
-                    loop {
-                        ws(b, i);
-                        if close == '}' {
-                            string(b, i)?;
-                            ws(b, i);
-                            if b.get(*i) != Some(&':') {
-                                return Err(format!("`:` expected at {i}"));
-                            }
-                            *i += 1;
-                        }
-                        value(b, i)?;
-                        ws(b, i);
-                        match b.get(*i) {
-                            Some(',') => *i += 1,
-                            Some(&x) if x == close => {
-                                *i += 1;
-                                return Ok(());
-                            }
-                            other => {
-                                return Err(format!("`,`/`{close}` wanted at {i}: {other:?}"));
-                            }
-                        }
-                    }
-                }
-                '"' => string(b, i),
-                't' | 'f' | 'n' => {
-                    let word = if c == 't' {
-                        "true"
-                    } else if c == 'f' {
-                        "false"
-                    } else {
-                        "null"
-                    };
-                    for w in word.chars() {
-                        if b.get(*i) != Some(&w) {
-                            return Err(format!("bad literal at {i}"));
-                        }
-                        *i += 1;
-                    }
-                    Ok(())
-                }
-                c if c == '-' || c.is_ascii_digit() => {
-                    *i += 1;
-                    while b.get(*i).is_some_and(|d| d.is_ascii_digit() || *d == '.') {
-                        *i += 1;
-                    }
-                    Ok(())
-                }
-                other => Err(format!("unexpected `{other}` at {i}")),
-            }
-        }
-        fn string(b: &[char], i: &mut usize) -> Result<(), String> {
-            if b.get(*i) != Some(&'"') {
-                return Err(format!("string expected at {i}"));
-            }
-            *i += 1;
-            loop {
-                match b.get(*i) {
-                    None => return Err("unterminated string".into()),
-                    Some('\\') => {
-                        *i += 2;
-                    }
-                    Some('"') => {
-                        *i += 1;
-                        return Ok(());
-                    }
-                    Some(&c) if (c as u32) < 0x20 => {
-                        return Err(format!("raw control char in string at {i}"));
-                    }
-                    Some(_) => *i += 1,
-                }
-            }
-        }
-        value(&b, &mut i)?;
-        ws(&b, &mut i);
-        if i != b.len() {
-            return Err(format!("trailing bytes at {i}"));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn the_json_validator_rejects_what_it_should() {
-        assert!(json_wellformed(r#"{"a": [1, 2], "b": {"c": true}}"#).is_ok());
-        assert!(json_wellformed(r#"{"a": [1, 2,]}"#).is_err());
-        assert!(json_wellformed(r#"{"a" 1}"#).is_err());
-        assert!(json_wellformed(r#"{"a": "b}"#).is_err());
-    }
-
     /// The invariant the report prints: non-nested dominator sets are disjoint
     /// and cover the surface, so their LOC sums to the third-party total.
     #[test]
     fn non_nested_dominator_sets_partition_the_surface() {
-        let root = repo_root();
-        let s = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves offline");
+        let s = loc::real_workspace_survey(&cell("mac-arm")).expect("mac-arm resolves offline");
         let ranked = dominator::ranked(&s);
         let mut covered: BTreeSet<&PkgId> = BTreeSet::new();
         for (id, cost) in &ranked {
@@ -1182,7 +1051,10 @@ mod tests {
         assert!(out.ok);
         let body = std::fs::read_to_string(&path).expect("the JSON file was written");
         let _ = std::fs::remove_file(&path);
-        json_wellformed(&body).unwrap_or_else(|e| panic!("hand-rolled JSON is malformed: {e}"));
+        // A hand-rolled emitter answers to the workspace's JSON reader, or a
+        // stray comma ships unnoticed.
+        aterm_json::from_str::<aterm_json::Value>(&body)
+            .unwrap_or_else(|e| panic!("hand-rolled JSON is malformed: {e}"));
         let actual = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves");
         assert!(
             body.contains(&format!(
@@ -1254,7 +1126,8 @@ mod tests {
             let mut report = String::new();
             cell_section(&mut report, survey, 1);
             let json = json_report(Path::new("."), std::slice::from_ref(survey), &[]);
-            json_wellformed(&json).expect("synthetic JSON is well formed");
+            aterm_json::from_str::<aterm_json::Value>(&json)
+                .expect("synthetic JSON is well formed");
             let header = format!("  third-party   {loc_text} LOC   ");
             let count_field = format!("\"third_party\": {count},");
             let loc_field = format!("\"third_party_loc\": {loc_number},");

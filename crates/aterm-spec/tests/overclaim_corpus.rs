@@ -27,9 +27,9 @@
 //!     MUST reject, proving the binding is non-vacuous.
 //!
 //! Every fixture shells the SAME armed binaries the gate uses (`trust-ir`, `ty`),
-//! located by [`aterm_spec::verify`]'s discovery. Verification is always required
-//! (batteries-on): an absent Trust `ty`/`trust-ir` FAILS the test with the install
-//! hint (`aterm pkg install ty`).
+//! located by [`aterm_spec::verify`]'s discovery. TIERED (VERIFY-1): each fixture runs
+//! only where Trust `ty`/`trust-ir` is installed; absent, a NOT RUN notice names it (with
+//! the install hint, `aterm pkg install ty`) and the fixture returns.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,7 +41,7 @@ use aterm_spec::verify::{trust_ir_escalation, ty_escalation};
 use aterm_spec::xref::{ProofAnchor, ProofKind, RefinementAnchor, SpecModule};
 
 // ---------------------------------------------------------------------------
-// Tool discovery (the honesty ratchet — batteries-on: present or the test FAILS)
+// Tool discovery (the escalation tier: absent, a NOT RUN notice and an early return)
 // ---------------------------------------------------------------------------
 
 /// Run `trust-ir spec-link <module> [--harness-manifest <m> --require-manifest]`,
@@ -460,7 +460,6 @@ fn red_l3_external_anchor_on_typeok_flags_in_rust_and_artifact() {
 #[test]
 fn red_window_routing_corrupted_close_is_rejected_by_ty() {
     use aterm_spec::derive::window_routing_model;
-    use std::collections::BTreeMap;
 
     // TIERED (VERIFY-1): a `ty trace` overclaim control — external-tool
     // obligation; runs only where the Trust toolchain is installed.
@@ -472,20 +471,12 @@ fn red_window_routing_corrupted_close_is_rejected_by_ty() {
     let spec = dir.join("WindowRouting.tla");
     let cfg = dir.join("WindowRouting.cfg");
     let trace = dir.join("t.json");
+    // `Init` is open: each trace starts wherever its step 0 says, so the verdict
+    // is `Next`'s alone.
     std::fs::write(&spec, m.transition_spec()).expect("write spec");
-
-    // Pin Init to a 2-window state [win_count=2, frontmost=1, next_id=3, exited=0].
-    let init: BTreeMap<&'static str, i64> = [
-        ("win_count", 2),
-        ("frontmost", 1),
-        ("next_id", 3),
-        ("exited", 0),
-    ]
-    .into_iter()
-    .collect();
     std::fs::write(
         &cfg,
-        m.transition_cfg(&init, &[("MaxWin", 1_000_000), ("MaxId", 1_000_000_000)]),
+        m.transition_cfg(&[("MaxWin", 1_000_000), ("MaxId", 1_000_000_000)]),
     )
     .expect("write cfg");
 
@@ -510,40 +501,55 @@ fn red_window_routing_corrupted_close_is_rejected_by_ty() {
             action
         )
     };
-    let validate = |action: &str, prev: [i64; 4], next: [i64; 4]| -> bool {
+    let validate = |action: &str, prev: [i64; 4], next: [i64; 4]| -> (bool, String) {
         std::fs::write(&trace, trace_json(action, prev, next)).expect("write trace");
-        let out = Command::new(&ty)
-            .arg("trace")
+        let mut cmd = Command::new(&ty);
+        cmd.arg("trace")
             .arg("validate")
             .arg(&trace)
             .arg("--spec")
             .arg(&spec)
             .arg("--config")
-            .arg(&cfg)
-            .output()
-            .expect("run ty trace validate");
-        out.status.success()
+            .arg(&cfg);
+        let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty trace validate");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
     };
 
     // GREEN: an HONEST CloseWindow (a non-last window: 2 -> 1, app stays, frontmost
     // re-points to the surviving allocated id 2) conforms.
-    let prev = [2, 1, 3, 0];
+    let (ok, out) = validate("CloseWindow", [2, 1, 3, 0], [1, 2, 3, 0]);
     assert!(
-        validate("CloseWindow", prev, [1, 2, 3, 0]),
-        "honest CloseWindow (2->1, survivor remains) must conform — the binding is real"
+        ok,
+        "honest CloseWindow (2->1, survivor remains) must conform — the binding is real\n{out}"
     );
 
     // RED (made-to-fail): the SAME CloseWindow corrupted to the `Buggy` defect — the
     // LAST window closes (win_count 1->0) but the app does NOT exit (exited stays 0).
-    // `ExitIffEmpty` forbids it; ty MUST reject. If this were accepted, the gate's
-    // window_routing conformance would be vacuous (a corrupted close would sail through).
-    let prev_last = [1, 1, 2, 0];
-    let corrupted = [0, 0, 2, 0]; // emptied but exited=0 — the missed-exit defect
+    // At `Buggy = 0` the action's own update sets `exited' = 1` on the last close, so
+    // `Next` admits no such step and ty MUST reject it — AT STEP 1, the corrupted
+    // transition. Until 2026-10-01 the cfg pinned `Init` to the GREEN case's 2-window
+    // state, so this trace died at step 0 on an `Init` mismatch and the fixture
+    // passed without `Next` ever being asked about the close; a rejection anywhere
+    // but step 1 still proves nothing about the binding.
+    let (ok, out) = validate("CloseWindow", [1, 1, 2, 0], [0, 0, 2, 0]);
     assert!(
-        !validate("CloseWindow", prev_last, corrupted),
+        !ok,
         "RED window_routing fixture: a CloseWindow that empties the window set WITHOUT \
          exiting MUST be ty-REJECTED (the Buggy missed-exit). A pass here is a false \
-         negative — the gate's window_routing conformance would prove nothing."
+         negative — the gate's window_routing conformance would prove nothing.\n{out}"
+    );
+    assert!(
+        out.contains("trace step 1 has no matching spec states"),
+        "RED window_routing fixture: ty must reject the corrupted close AT STEP 1 (no \
+         `Next` successor matches), not on the way in — any other rejection is not this \
+         catch\n{out}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

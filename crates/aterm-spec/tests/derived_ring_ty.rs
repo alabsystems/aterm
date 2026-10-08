@@ -4,10 +4,11 @@
 //! Tier-0 for DERIVED specs: the TLA+ generated from a Rust `Model` (one source)
 //! is exhaustively model-checked by the real `ty` binary.
 //!
-//! This is the derivation half of `docs/RFC-ty-embed-derived-tla.md`: no
-//! hand-written `.tla` — `Model::to_tla()` produces the module and `.to_cfg()` the
-//! config, and `ty check` proves the invariants hold over the whole bounded state
-//! space. Change the model, the spec changes, and this re-checks the new spec.
+//! This is Tier 0 of the `ty_model!` workflow (`aterm_spec::derive`'s module
+//! docs): no hand-written `.tla` — `Model::to_tla()` produces the module and
+//! `.to_cfg()` the config, and `ty check` proves the invariants hold over the
+//! whole bounded state space. Change the model, the spec changes, and this
+//! re-checks the new spec.
 //! Drift is impossible by construction. Both the single-action ring AND the
 //! two-action cursor (which exercises `UNCHANGED` + a disjunctive `Next`) are
 //! checked, so the derivation is shown to generalize.
@@ -98,36 +99,31 @@ use aterm_spec::derive::{
     unknown_insert_orphan_key_model, vf_axis_clamp_model, vf_nudge_gate_model,
     vibrancy_contrast_model, video_batch_publication_durability_model,
     video_recording_lifecycle_model, video_tap_slot_model, visible_pad_crop_model,
-    watcher_failure_recovery_model, watcher_latch_model, wide_center_model, window_routing_model,
+    wake_heal_evidence_model, watcher_failure_recovery_model, watcher_latch_model,
+    wide_center_model, window_routing_model,
 };
 use aterm_spec::verify;
 use std::process::Command;
 
 /// The POLICY this file states for the THREE function-valued models it drives
-/// (EvictFull, TierResidency, Recording): report the miss and keep going. For
+/// (EvictFull, TierResidency, Recording): skip the miss and keep going. For
 /// every other model here — all scalar — the interpreter tier discharges the
 /// obligation unconditionally and this is a no-op, since [`verify::NotRun`] is
 /// only reachable when a function-valued model meets a machine with no Trust
 /// `ty`.
 ///
 /// Skipping rather than failing is deliberate. A hard require would make
-/// `cargo test -p aterm-spec --test derived_ring_ty` — the file you iterate on
+/// `targo --unverified test -p aterm-spec --test spec_suite -- derived_ring_ty::` — the file you iterate on
 /// while editing a model — unrunnable without the Trust toolchain, and it would
 /// buy no coverage: each of the three has a toolchain-free Tier-1 conformance
 /// twin binding it to shipping code (`aterm-buffer`'s `conformance_evict_full`
 /// and `conformance_temporal`, `aterm-core`'s `conformance_recording`). What
-/// must never happen is the miss passing SILENTLY, which is exactly what
-/// dropping the old `Discharge::NotRun` with a bare statement did: now the
-/// `Result` makes stating a policy unskippable, and this line makes the chosen
-/// one visible in the test output.
+/// must never happen is the miss passing SILENTLY: the `_tiered` call has
+/// already written its `NOT RUN (not a pass)` line straight to stderr, where a
+/// passing test's output still reaches the log, so the skip needs no second
+/// line here.
 fn tier0_or_skip(discharge: Result<verify::Covered, verify::NotRun>) {
-    if let Err(verify::NotRun { model }) = discharge {
-        eprintln!(
-            "TIER-0 SKIPPED (this test is NOT a pass for it): `{model}` is function-valued and \
-             Trust `ty` is not installed — see the escalation notice above. Its Tier-1 \
-             conformance twin is unaffected."
-        );
-    }
+    let _skipped_with_its_notice: Option<verify::NotRun> = discharge.err();
 }
 
 /// TIERED Tier-0 check: the interpreter proves every invariant over the whole
@@ -611,19 +607,16 @@ fn assert_proves_and_catches(m: &Model) {
 fn assert_every_invariant_breaks_first(m: &Model, bounds_guards: &[&str]) {
     assert_every_invariant_carries_a_mutant(m, bounds_guards);
     let buggy = aterm_spec::interp::with_buggy(m, 1);
-    let all_hold = |st: &aterm_spec::interp::State| {
-        m.invariants
-            .iter()
-            .all(|inv| buggy.check_invariant(inv.name, st))
-    };
-    let key = |st: &aterm_spec::interp::State| -> Vec<(&'static str, i64)> {
-        st.iter().map(|(k, v)| (*k, *v)).collect()
-    };
+    // Walked resolved (`aterm_spec::interp::Resolved`): the same states and
+    // verdicts as `successors` / `check_invariant` by name, without the
+    // string-keyed map each of those builds per call.
+    let r = aterm_spec::interp::Resolved::new(&buggy).expect("the model resolves");
+    let laws = 0..buggy.invariants.len();
     let mut alone: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
-    let init = buggy.init_state();
-    seen.insert(key(&init));
+    let init = r.init();
+    seen.insert(init.clone());
     queue.push_back(init);
     while let Some(st) = queue.pop_front() {
         assert!(
@@ -631,18 +624,18 @@ fn assert_every_invariant_breaks_first(m: &Model, bounds_guards: &[&str]) {
             "{}: Buggy=1 good space unbounded",
             m.name
         );
-        for action in &buggy.actions {
-            for next in buggy.successors(action.name, &st) {
-                if all_hold(&next) {
-                    if seen.insert(key(&next)) {
+        for a in 0..buggy.actions.len() {
+            for next in r.successors(a, &st) {
+                if laws.clone().all(|i| r.holds(i, &next)) {
+                    if !seen.contains(&next) {
+                        seen.insert(next.clone());
                         queue.push_back(next);
                     }
                 } else {
-                    let broken: Vec<&str> = m
-                        .invariants
-                        .iter()
-                        .filter(|inv| !buggy.check_invariant(inv.name, &next))
-                        .map(|inv| inv.name)
+                    let broken: Vec<&str> = laws
+                        .clone()
+                        .filter(|&i| !r.holds(i, &next))
+                        .map(|i| buggy.invariants[i].name)
                         .collect();
                     if let [only] = broken.as_slice() {
                         alone.insert(only);
@@ -986,14 +979,12 @@ fn derived_fd_handoff_no_leak_proves_and_catches_dangling_fd() {
     assert_proves_and_catches(&fd_handoff_no_leak_model());
 }
 
-/// Proof-carrying DSU (RFC Rung 1b, live wiring): the seamless update-apply authenticates
-/// the inherited fd map with a SINGLE-USE nonce stamp — minted into the `0700` dir, then
-/// consumed (read-then-unlink) before any fd is trusted. A presented nonce must authorize
-/// AT MOST ONCE: a replayed `ATERM_SEAMLESS_FDS` after one adoption finds no stamp and
-/// fails closed. PROVES `NoReplay` (`accepted <= minted /\ replayed = 0`) at Buggy=0, and
-/// CATCHES the replayable (not-unlinked) stamp at Buggy=1. Concretely bound to the real
-/// read-then-unlink consume (`control_auth::consume_seamless_stamp`) by aterm-gui's
-/// `seamless_stamp_is_single_use_and_fails_closed` conformance test.
+/// Proof-carrying DSU (RFC Rung 1b): a SINGLE-USE handoff nonce. A presented nonce must
+/// authorize AT MOST ONCE: a replayed `ATERM_SEAMLESS_FDS` after one adoption fails
+/// closed. PROVES `NoReplay` (`accepted <= minted /\ replayed = 0`) at Buggy=0, and
+/// CATCHES the replayable (not-consumed) nonce at Buggy=1. The `0700`-dir stamp this
+/// once modeled, and its conformance test, were removed; the model has no Tier-1 bind
+/// (see `seamless_nonce_model`'s docs for what carries the property today).
 #[test]
 fn derived_seamless_nonce_proves_and_catches_replay() {
     assert_proves_and_catches(&seamless_nonce_model());
@@ -1010,15 +1001,121 @@ fn derived_watcher_latch_proves_and_catches_silent_loss() {
 }
 
 /// Damage→present bounded response (the 2026-07-05 five-fps incident): pending
-/// PTY damage must reach a present within `Expiry + 1` ticks of the wake-latch
-/// protocol — a lost `Wake::Output` may cost one bounded heal window, never
-/// process-lifetime present starvation. PROVES the bound with the self-expiring
-/// latch (Buggy=0, `spawn::gated_output_wake`'s `WAKE_LATCH_EXPIRY_NS`),
-/// CATCHES the shipped one-shot latch (Buggy=1 → Damage, Lose, Tick* — the
-/// exact incident trace) as a counterexample.
+/// PTY damage waits at most `Expiry + 1` idle ticks for its present — a lost
+/// `Wake::Output` may cost one bounded heal window, never process-lifetime
+/// present starvation — and a wake stranded with its loop wake-up is re-posted
+/// by the first damage past its expiry. PROVES both with the evidence-based
+/// watchdog heal and the reader's stranded re-post (Buggy=0,
+/// `spawn::judge_output_wake`, `spawn::wake_stranded`), CATCHES the shipped
+/// one-shot latch (Buggy=1 → Damage, Lose, TurnEnd, Tick* — the exact incident
+/// trace — and a stranded wake swallowing damage). Both negative controls are
+/// replayed step by step, the stranded one being the shape a recheck-only
+/// watchdog cannot see: no `TurnEnd` ever saw the arm, so no deadline exists.
 #[test]
 fn derived_damage_to_present_proves_and_catches_starvation() {
-    assert_proves_and_catches(&damage_to_present_model());
+    let model = damage_to_present_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    // The incident: lost during the first turn, then the loop sleeps.
+    let starve = |m: &aterm_spec::derive::Model| {
+        let mut st = m.init_state();
+        assert!(m.fire("DamageFresh", &mut st));
+        assert!(m.fire("Lose", &mut st));
+        assert!(m.fire("TurnEnd", &mut st));
+        while m.fire("Tick", &mut st) {}
+        st
+    };
+    let fixed = starve(&model);
+    assert_eq!(
+        fixed["recheck"],
+        1 + 3 + 1,
+        "the pass that saw it folds a recheck"
+    );
+    assert!(model.check_invariant("DamageBounded", &fixed));
+    assert!(!buggy.check_invariant("DamageBounded", &starve(&buggy)));
+    // Stranded: posted while idle, lost with its wake-up, then more output.
+    let stranded = |m: &aterm_spec::derive::Model| {
+        let mut st = m.init_state();
+        assert!(m.fire("TurnEnd", &mut st));
+        assert!(m.fire("DamageFresh", &mut st));
+        assert!(m.fire("Lose", &mut st));
+        for _ in 0..4 {
+            assert!(
+                m.fire("Tick", &mut st),
+                "no recheck exists for a stranded wake"
+            );
+        }
+        assert_eq!(st["recheck"], 0);
+        st
+    };
+    let mut st = stranded(&model);
+    assert!(
+        !model.fire("DamageCoalesced", &mut st.clone()),
+        "past its expiry, damage may not coalesce onto a stranded wake"
+    );
+    assert!(model.fire("DamageRepost", &mut st));
+    assert_eq!(st["inflight"], 1, "re-posted");
+    let mut st = stranded(&buggy);
+    assert!(buggy.fire("DamageCoalesced", &mut st));
+    assert!(!buggy.check_invariant("StrandedReposted", &st));
+    assert_proves_and_catches(&model);
+}
+
+/// No false heal (2026-09-29): the watchdog never heals a wake still QUEUED
+/// behind a long frame. PROVES `NoFalseHeal` with the evidence rule (Buggy=0)
+/// and CATCHES the age-only heal (Buggy=1). The replayed live trace is pinned
+/// step by step: in a running turn, damage arms and posts a wake, the frame runs
+/// `Expiry + 1` ticks, and `about_to_wait` — where the age-only rule heals a
+/// wake that is in the queue and the evidence rule books nothing.
+#[test]
+fn derived_wake_heal_evidence_proves_and_catches_false_heal() {
+    let model = wake_heal_evidence_model();
+    let replay = |m: &aterm_spec::derive::Model| {
+        // The first turn is running at the initial state.
+        let mut st = m.init_state();
+        assert!(m.fire("DamageFresh", &mut st));
+        for _ in 0..4 {
+            assert!(m.fire("Tick", &mut st), "a busy frame lets time pass");
+        }
+        assert!(m.fire("TurnEnd", &mut st));
+        st
+    };
+    let fixed = replay(&model);
+    assert_eq!(fixed["latch"], 1, "the queued wake keeps its arm");
+    assert_eq!(fixed["inflight"], 1);
+    assert!(model.check_invariant("NoFalseHeal", &fixed));
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let healed = replay(&buggy);
+    assert_eq!(
+        healed["latch"], 0,
+        "negative control: the age rule heals it"
+    );
+    assert!(
+        !buggy.check_invariant("NoFalseHeal", &healed),
+        "negative control: the age-only heal of a queued wake is a false heal"
+    );
+    assert_proves_and_catches(&model);
+    // The two models are ONE machine at Buggy=0: the same reachable states
+    // under the same actions (only the Buggy dial's meaning differs).
+    let reach = |m: &aterm_spec::derive::Model| {
+        let mut frontier = vec![m.init_state()];
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(frontier[0].clone());
+        while let Some(st) = frontier.pop() {
+            for a in &m.actions {
+                for nxt in m.successors(a.name, &st) {
+                    if seen.insert(nxt.clone()) {
+                        frontier.push(nxt);
+                    }
+                }
+            }
+        }
+        seen
+    };
+    assert_eq!(
+        reach(&damage_to_present_model()),
+        reach(&model),
+        "DamageToPresent and WakeHealOnlyWhenLost must describe the same committed machine"
+    );
 }
 
 /// Observation Kernel (RFC L0): the single armed idle deadline must equal the
@@ -2207,8 +2304,7 @@ fn derived_coalesce_proves_and_catches_lane_divergence() {
 // since it gained `DialFail`. All of them are driven by ONE umbrella test over the
 // shared instance table. Adding a verified property is a generator instance (~3
 // lines) + one row in `harness::instances()` — no new test fn.
-#[path = "common/harness.rs"]
-mod harness;
+use crate::harness;
 
 /// LIVENESS / deadlock-freedom: deadlock-free at `Buggy = 0` (the served
 /// terminal stutters via the `Done` self-loop) and a DEADLOCK — not an
@@ -2227,15 +2323,24 @@ fn assert_deadlock_free_and_catches_wedge(
 }
 
 /// THE UMBRELLA: every property-combinator instance PROVES (Buggy=0) + CATCHES
-/// (Buggy=1) — a `Safety` invariant via [`assert_proves_and_catches`], a
+/// (Buggy=1) — a `Safety` invariant via [`verify::prove_and_catch_scalar`], a
 /// `Liveness` instance via [`assert_deadlock_free_and_catches_wedge`] — on both
 /// tiers. The introspection/control-plane models are iterated from the ONE shared
 /// table; a new property adds a row there, not a test fn here.
+///
+/// Both arms FAIL CLOSED on the interpreter tier: the Safety arm asserts each
+/// row is scalar (as the Liveness arm's `deadlock_free_and_catches_tiered`
+/// does), so a function-valued row fails on every machine rather than passing
+/// with only a `NOT RUN (not a pass)` line where `ty` is absent — the in-process
+/// `interp::prove_and_catch` the deleted `introspection_bmc.rs` ran on every
+/// row stays unconditional.
 #[test]
 fn property_classes_prove_and_catch_under_ty() {
     for inst in harness::instances() {
         match inst.class {
-            harness::Class::Safety => assert_proves_and_catches(&inst.model),
+            harness::Class::Safety => {
+                verify::prove_and_catch_scalar(&inst.model, inst.model.name);
+            }
             harness::Class::Liveness { is_final } => {
                 assert_deadlock_free_and_catches_wedge(&inst.model, is_final);
             }
@@ -2851,11 +2956,15 @@ fn derived_control_connection_admission_proves_and_catches_overflow() {
 }
 
 /// A control connection is on a request lane only while it has a request: idle,
-/// it parks; waiting, it moves to a wait lane; so persistent drivers never use
-/// the request lanes up and a fresh client is refused only for work or the
-/// open-connection bound. The mutant is the 2026-09-26 design (and four more
-/// defects), each caught alone; its headline trace is replayed here: two
-/// drivers go idle ON their lanes and the third client is refused for it.
+/// it parks; waiting, it moves to a wait lane, or — past the wait lanes — waits
+/// on at most `Inline` request lanes and is answered busy beyond them; so
+/// persistent drivers never use the request lanes up and a fresh client is
+/// refused only for work or the open-connection bound. The mutant is the
+/// 2026-09-26 design (and six more defects), each caught alone; three of its
+/// traces are replayed here: two drivers go idle ON their lanes and the third
+/// client is refused for it, waits past the wait lanes take every request
+/// lane, and a wait is kept on a request lane — then a second one answered
+/// busy — while the wait lane is free.
 #[test]
 fn derived_control_lane_tenure_proves_and_catches_the_held_lane() {
     let model = control_lane_tenure_model();
@@ -2872,32 +2981,93 @@ fn derived_control_lane_tenure_proves_and_catches_the_held_lane() {
     let refused = step(both_idle, "Refuse");
     assert!(!buggy.check_invariant("NoRefusalByIdleDriver", &refused));
 
-    // The same two drivers under the shipping design park: both request lanes
-    // are free, yet a third client is still refused — for the open-connection
-    // bound (Cap=2, two open), not for a lane an idle driver holds, so the
-    // refusal leaves `NoRefusalByIdleDriver` intact.
+    // Drivers under the shipping design park: both request lanes are free, yet
+    // a fourth client is still refused — for the open-connection bound (Cap=3,
+    // three open), not for a lane an idle driver holds, so the refusal leaves
+    // `NoRefusalByIdleDriver` intact.
     let step = |state, action| model.successors(action, &state)[0].clone();
-    let first = step(model.init_state(), "Admit");
-    let parked = step(first, "Finish");
-    let second = step(parked, "Admit");
-    let both_parked = step(second, "Finish");
-    assert_eq!(both_parked["parked"], 2);
+    let mut all_parked = model.init_state();
+    for _ in 0..3 {
+        all_parked = step(step(all_parked, "Admit"), "Finish");
+    }
+    assert_eq!(all_parked["parked"], 3);
     assert_eq!(
-        both_parked["working"] + both_parked["held"] + both_parked["queued"],
+        all_parked["working"] + all_parked["held"] + all_parked["inline"] + all_parked["queued"],
         0,
         "no request lane is taken"
     );
-    assert_eq!(both_parked["open"], 2, "open == Cap");
+    assert_eq!(all_parked["open"], 3, "open == Cap");
     assert!(
-        model.successors("Admit", &both_parked).is_empty(),
-        "Cap=2 bounds the open connections"
+        model.successors("Admit", &all_parked).is_empty(),
+        "Cap=3 bounds the open connections"
     );
-    let refused = model.successors("Refuse", &both_parked);
-    assert_eq!(refused.len(), 1, "the third client is refused");
+    let refused = model.successors("Refuse", &all_parked);
+    assert_eq!(refused.len(), 1, "the fourth client is refused");
     assert!(
         model.check_invariant("NoRefusalByIdleDriver", &refused[0]),
         "a refusal for the open-connection bound is not one an idle driver caused"
     );
+
+    // WAITS PAST THE WAIT LANES (the review of 2026-09-27). The one wait lane is
+    // taken, and a second wait is served on its request lane (the budget,
+    // Inline=1). A third wait cannot move either. The fallback as first shipped
+    // served it on its request lane too: both lanes then hold a wait, and a
+    // parked driver's next request has no lane to go to.
+    let third_wait = |m: &Model| {
+        let step = |state, action| m.successors(action, &state)[0].clone();
+        let one_waiting = step(step(m.init_state(), "Admit"), "Defer");
+        let one_inline = step(step(one_waiting, "Admit"), "InlineWait");
+        step(one_inline, "Admit")
+    };
+    let starved = buggy.successors("InlineWait", &third_wait(&buggy))[0].clone();
+    assert_eq!((starved["inline"], starved["waiting"]), (2, 1));
+    assert!(!buggy.check_invariant("RequestLaneLeftForRequests", &starved));
+    // The shipping design answers that third wait busy, promptly: its
+    // connection parks, a request lane stays free, and a parked driver's next
+    // request is picked up.
+    let third = third_wait(&model);
+    assert!(
+        model.successors("InlineWait", &third).is_empty(),
+        "the budget (Inline=1) is spent"
+    );
+    let busied = model.successors("BusyWait", &third)[0].clone();
+    assert_eq!(
+        (
+            busied["inline"],
+            busied["waiting"],
+            busied["parked"],
+            busied["busied"]
+        ),
+        (1, 1, 1, 1)
+    );
+    assert!(model.check_invariant("RequestLaneLeftForRequests", &busied));
+    let resumed = model.successors("Wake", &busied)[0].clone();
+    assert_eq!(
+        model.successors("Pick", &resumed).len(),
+        1,
+        "a parked driver's next request still finds a request lane"
+    );
+
+    // A WAIT WITH A REQUEST PIPELINED BEHIND IT (the review of the budget,
+    // 2026-09-27). Until its bytes moved with it, such a wait never left its
+    // request lane: it took the budget's place, and the next one was answered
+    // busy, the wait lane free all along (the fifth `aterm drive --dial`
+    // relay). The mutant replays that; the shipping design's only step for a
+    // wait beside a free wait lane is the move.
+    let step = |state, action| buggy.successors(action, &state)[0].clone();
+    let kept = step(step(buggy.init_state(), "Admit"), "InlineWait");
+    assert_eq!((kept["inline"], kept["waiting"]), (1, 0));
+    assert!(!buggy.check_invariant("WaitLaneTakenFirst", &kept));
+    let turned_away = step(step(kept, "Admit"), "BusyWait");
+    assert_eq!((turned_away["busied"], turned_away["waiting"]), (1, 0));
+    assert!(!buggy.check_invariant("WaitLaneTakenFirst", &turned_away));
+    let asked = model.successors("Admit", &model.init_state())[0].clone();
+    assert!(
+        model.successors("InlineWait", &asked).is_empty(),
+        "a free wait lane takes the wait"
+    );
+    assert!(model.successors("BusyWait", &asked).is_empty());
+    assert_eq!(model.successors("Defer", &asked).len(), 1);
 }
 
 /// Native Settings has one process instance and at most one ordinary implicit
@@ -4491,13 +4661,6 @@ fn derived_native_preview_font_convergence_proves_and_catches_lost_ready_frame()
     assert_proves_and_catches(&model);
 }
 
-#[test]
-fn derived_claude_light_admission_proves_and_catches_ignored_rejections() {
-    let model = aterm_spec::derive::claude_light_admission_model();
-    assert_proves_and_catches(&model);
-    assert_every_invariant_breaks_first(&model, &[]);
-}
-
 /// The mode light's return (owner, 2026-09-27: "when I toggle auto-approve,
 /// it turns off auto mode (what?!)"): proved at `Buggy=0`, and each defect it
 /// was written for is its own law's counterexample at `Buggy=1` — a press
@@ -5794,8 +5957,8 @@ fn derived_release_post_intents_are_durable_and_one_shot() {
 
     // Negative controls: a landed POST taken at its word. The draft converges,
     // its asset is journaled against it, and the asset converges, each with no
-    // re-listed object behind it — the re-read `step_draft` and the asset upload
-    // both perform before believing a POST.
+    // re-listed object behind it — the re-read in `bind_channel_release` and the
+    // asset upload both perform before believing a POST.
     let mut trusted = buggy.init_state();
     for action in ["PersistCreateIntent", "IssueCreatePost"] {
         assert!(buggy.fire(action, &mut trusted), "{action}");
@@ -5816,6 +5979,83 @@ fn derived_release_post_intents_are_durable_and_one_shot() {
     assert!(!model.action_enabled("ConvergeUploadedAsset", &trusted));
     assert!(buggy.fire("ConvergeUploadedAsset", &mut trusted));
     assert!(!buggy.check_invariant("UploadConvergenceRequiresVisibility", &trusted));
+
+    // An upload POST that PROVABLY created nothing (curl never sent it, or the server
+    // answered a 4xx) spends its intent and returns the one-shot budget: nothing was
+    // stored, nothing will be revealed, and the resume may post that asset once more
+    // instead of waiting for an object that does not exist.
+    let mut refused = model.init_state();
+    for action in [
+        "PersistCreateIntent",
+        "IssueCreatePost",
+        "RevealCreatedDraft",
+        "ConvergeCreatedDraft",
+        "PersistUploadIntent",
+        "IssueRefusedUploadPost",
+    ] {
+        assert!(model.fire(action, &mut refused), "{action}");
+    }
+    assert_eq!(refused["upload_landed"], 0);
+    assert!(!model.action_enabled("RevealUploadedAsset", &refused));
+    assert!(model.fire("RetractUploadIntent", &mut refused));
+    assert_eq!(refused["upload_intent"], 0);
+    assert_eq!(refused["upload_posts"], 0);
+    assert!(model.fire("PersistUploadIntent", &mut refused));
+    assert!(model.fire("IssueUploadPost", &mut refused));
+    // ... and a POST that may have landed is never retractable, whatever came before.
+    assert!(!model.action_enabled("RetractUploadIntent", &refused));
+    assert!(model.fire("RevealUploadedAsset", &mut refused));
+    assert!(model.fire("ConvergeUploadedAsset", &mut refused));
+
+    // The refusal is knowledge only the process that saw the answer has: a crash between
+    // the answer and the retraction leaves the intent standing, and the resume waits.
+    let mut forgotten = model.init_state();
+    for action in [
+        "PersistCreateIntent",
+        "IssueCreatePost",
+        "RevealCreatedDraft",
+        "ConvergeCreatedDraft",
+        "PersistUploadIntent",
+        "IssueRefusedUploadPost",
+        "Crash",
+        "Resume",
+    ] {
+        assert!(model.fire(action, &mut forgotten), "{action}");
+    }
+    assert_eq!(forgotten["upload_refusal_seen"], 0);
+    assert!(!model.action_enabled("RetractUploadIntent", &forgotten));
+    assert!(!model.action_enabled("PersistUploadIntent", &forgotten));
+
+    // Negative controls: the blanket retraction spends the intent of a POST that landed,
+    // leaving an object no intent names (which `--abandon` cannot withdraw); and a
+    // resumed process retracts on a refusal it never saw.
+    let mut landed = buggy.init_state();
+    for action in [
+        "PersistCreateIntent",
+        "IssueCreatePost",
+        "RevealCreatedDraft",
+        "ConvergeCreatedDraft",
+        "PersistUploadIntent",
+        "IssueUploadPost",
+    ] {
+        assert!(buggy.fire(action, &mut landed), "{action}");
+    }
+    assert!(buggy.check_invariant("LandedUploadStaysNamed", &landed));
+    assert!(buggy.fire("RetractUploadIntent", &mut landed));
+    assert!(!buggy.check_invariant("LandedUploadStaysNamed", &landed));
+    let mut unseen = buggy.init_state();
+    for action in [
+        "PersistCreateIntent",
+        "IssueCreatePost",
+        "RevealCreatedDraft",
+        "ConvergeCreatedDraft",
+        "PersistUploadIntent",
+        "IssueRefusedUploadPost",
+        "Crash",
+    ] {
+        assert!(buggy.fire(action, &mut unseen), "{action}");
+    }
+    assert!(!buggy.check_invariant("UploadRefusalIsProcessLocal", &unseen));
     assert_every_invariant_carries_a_mutant(&model, &["DurableIntentStateBounded"]);
 }
 
@@ -9145,10 +9385,11 @@ fn derived_native_update_overlap_handoff_proves_and_catches_ownership_regression
     // not create a power set of semantically equivalent refusal states.  Keep
     // this focused check here so a state-space regression fails in seconds,
     // rather than several minutes into `aterm-gui::spec_xref_closure`.
-    const EXPECTED_DEAD: [&str; 11] = [
+    const EXPECTED_DEAD: [&str; 12] = [
         "CommitWithoutFreshExactProof",
         "AckInexactLegacyBridge",
         "BuggyExitIgnoringFailedCommitWrite",
+        "BuggyCommitOverQueuedInput",
         "BuggyReleaseReadersOnProof",
         "BuggySignalLeaderOnly",
         "BuggyResumeParentBeforeReap",
@@ -9196,6 +9437,39 @@ fn derived_native_update_overlap_handoff_proves_and_catches_ownership_regression
     assert_eq!(modern.get("commit"), Some(&1));
     assert_eq!(modern.get("child_readers"), Some(&1));
     assert_eq!(modern.get("diagnostic_wake"), Some(&0));
+
+    // ROUND EIGHT OF THE UPDATE AUDIT, #18: input queued to the parent while its
+    // claim is held (what the claim answers takes real time) parks the write
+    // until it drains into the masters; a fence that ends with it undelivered
+    // gives the claim to the rejection, which grants nothing and rolls back.
+    let mut claimed = model.init_state();
+    for action in [
+        "ParkParentReaders",
+        "SpawnReaderlessChild",
+        "ChildPaintsExactProof",
+        "MainWinsCommitArbiter",
+        "QueueHardwareInput",
+    ] {
+        assert!(model.fire(action, &mut claimed), "{action}: {claimed:?}");
+    }
+    assert!(
+        model.successors("CommitModern", &claimed).is_empty(),
+        "a Commit written over input queued under its claim: {claimed:?}"
+    );
+    let mut refused = claimed.clone();
+    assert!(model.fire("DrainQueuedHardwareInput", &mut claimed));
+    assert!(model.fire("CommitModern", &mut claimed), "{claimed:?}");
+    assert_eq!(claimed.get("commit"), Some(&1));
+    for action in [
+        "HeldClaimRefused",
+        "KillRejectedChild",
+        "ReapKilledChild",
+        "ResumeParentAfterReap",
+    ] {
+        assert!(model.fire(action, &mut refused), "{action}: {refused:?}");
+    }
+    assert_eq!(refused.get("commit"), Some(&0));
+    assert_eq!(refused.get("parent_readers"), Some(&1));
 
     let mut revoked = model.init_state();
     for action in [
@@ -12212,7 +12486,7 @@ fn derived_flash_limiter_proves_and_catches_overlap_blindness() {
             // `model_registry()`, so the xref sweep never covered it and its
             // prove halves would fail open under a bad reduction.
             aterm_spec::verify::arm_whole_space_check(&mut cmd);
-            let out = cmd.output().expect("run ty check");
+            let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty check");
             let combined = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -12912,20 +13186,71 @@ const MODEL_SWITCH_CONFIGS: [(i64, i64, i64); 12] = [
 ];
 
 /// Each `HarnessModelSwitch` mutant and the law it is checked against alone.
-const MODEL_SWITCH_MUTANTS: [(&str, &str); 9] = [
+const MODEL_SWITCH_MUTANTS: [(&str, &str); 13] = [
     ("JudgeMovesOffList", "UpTheListOnly"),
+    ("RideMovesOffList", "UpTheListOnly"),
     (
         "JudgeForgetsTheRememberedChoice",
         "PersonsChoiceStaysInFamily",
     ),
+    ("RideOverridesAPersonsChoice", "PersonsChoiceStaysInFamily"),
     ("JudgeRetriesAFailedModel", "NeverOntoAppliedOrFailed"),
-    ("JudgeReadsAStaleAnnouncement", "NeverOntoAppliedOrFailed"),
+    ("RideCarriesAFailedModel", "NeverOntoAppliedOrFailed"),
     ("LadderWaitsForCold", "MovesExactlyWhenTheLadderSays"),
     ("LadderRetakenAfterReady", "AnnouncedModelRides"),
     ("SettleNeverFails", "SettleRecordsWhatRan"),
     ("SettleNeverVerifies", "SettleRecordsWhatRan"),
     ("SettleFailsAnAskThatRan", "AppliedAskStands"),
+    ("RefusedKeepsTheAsk", "AskedOnlyByARelaunch"),
+    (
+        "RelaunchKeepsAFailedFlag",
+        "NeverRelaunchedOntoAFailedModel",
+    ),
 ];
+
+/// The interpreter's half of one `HarnessModelSwitch` configuration, `m`:
+/// under a person's launch alias every law proven at `Buggy = 0` and nothing
+/// ever due, asked for or moved; otherwise the operator shape, every law the
+/// only law some mutant step breaks, and every law proven at `Buggy = 0`.
+fn model_switch_config_walks((default_fable, person_flag, build): (i64, i64, i64), m: &Model) {
+    if person_flag == 2 {
+        let healthy = aterm_spec::interp::with_buggy(m, 0);
+        let states = aterm_spec::interp::bmc(&healthy).expect("every law holds at Buggy=0");
+        let r = aterm_spec::interp::Resolved::new(&healthy).expect("the model resolves");
+        let moved = ["due", "mto", "set", "flag"].map(|v| r.slot(v));
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([r.init()]);
+        while let Some(st) = queue.pop_front() {
+            if seen.contains(&st) {
+                continue;
+            }
+            assert!(
+                moved.iter().all(|&v| st[v] == 0),
+                "a person's launch alias was moved: {:?}",
+                r.state(&st)
+            );
+            for a in 0..healthy.actions.len() {
+                queue.extend(r.successors(a, &st));
+            }
+            seen.insert(st);
+        }
+        eprintln!(
+            "HarnessModelSwitch DefaultFable={default_fable} PersonFlag=2 (alias) \
+             Build={build}: {states} states, every law proven (Buggy=0), nothing ever \
+             due, asked for or moved"
+        );
+        return;
+    }
+    assert_operator_model_shape(m, |_| false);
+    assert_every_invariant_breaks_first(m, &[]);
+    let states = aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(m, 0))
+        .expect("every law holds at Buggy=0");
+    eprintln!(
+        "HarnessModelSwitch DefaultFable={default_fable} PersonFlag={person_flag} \
+         Build={build}: {states} states, every law proven (Buggy=0) and the only law \
+         some mutant step breaks (Buggy=1)"
+    );
+}
 
 /// THE MODEL SWITCH: the live upgrade's model rule (`model_due`), ladder
 /// (`model_moves_now`), announcement (`model_to`) and settle step
@@ -12933,10 +13258,9 @@ const MODEL_SWITCH_MUTANTS: [(&str, &str); 9] = [
 /// lifecycle. Every law is the only law some mutant step breaks, in every
 /// configuration of the person's standing choices; each mutant, alone
 /// against its own law alone, is proven clean at `Buggy = 0` and caught at
-/// `Buggy = 1` by the interpreter and by `ty` wherever it is installed
-/// (`JudgeReadsAStaleAnnouncement` pins the DECISION half of
-/// `NeverOntoAppliedOrFailed`: its verdict is right, so the law's verdict
-/// half alone would not see it). Under a person's launch ALIAS
+/// `Buggy = 1` by the interpreter and by `ty` wherever it is installed (each
+/// `Ride*` mutant pins the RIDE half of its law: the verdict is right there,
+/// so the law's verdict half alone would not see it). Under a person's launch ALIAS
 /// (`PersonFlag = 2`) the rule keeps everything (`model-alias`), so no
 /// mutant's defect can show there: those configurations are proven at
 /// `Buggy = 0` and shown to move nothing, ever. Tier-1: aterm-agent's
@@ -12944,70 +13268,55 @@ const MODEL_SWITCH_MUTANTS: [(&str, &str); 9] = [
 #[test]
 fn derived_harness_model_switch_proves_and_catches_every_law() {
     let model = harness_model_switch_model();
-    for (default_fable, person_flag, build) in MODEL_SWITCH_CONFIGS {
-        let m = aterm_spec::interp::with_consts(
-            &model,
-            &[
-                ("DefaultFable", default_fable),
-                ("PersonFlag", person_flag),
-                ("Build", build),
-            ],
-        );
-        if person_flag == 2 {
-            let healthy = aterm_spec::interp::with_buggy(&m, 0);
-            let states = aterm_spec::interp::bmc(&healthy).expect("every law holds at Buggy=0");
-            let key = |st: &aterm_spec::interp::State| -> Vec<(&'static str, i64)> {
-                st.iter().map(|(k, v)| (*k, *v)).collect()
-            };
-            let mut seen = std::collections::BTreeSet::new();
-            let mut queue = std::collections::VecDeque::from([healthy.init_state()]);
-            while let Some(st) = queue.pop_front() {
-                if !seen.insert(key(&st)) {
-                    continue;
-                }
-                assert!(
-                    st["due"] == 0 && st["mto"] == 0 && st["set"] == 0 && st["flag"] == 0,
-                    "a person's launch alias was moved: {st:?}"
-                );
-                for action in &healthy.actions {
-                    queue.extend(healthy.successors(action.name, &st));
-                }
-            }
-            eprintln!(
-                "HarnessModelSwitch DefaultFable={default_fable} PersonFlag=2 (alias) \
-                 Build={build}: {states} states, every law proven (Buggy=0), nothing ever \
-                 due, asked for or moved"
+    let configs: Vec<((i64, i64, i64), Model)> = MODEL_SWITCH_CONFIGS
+        .iter()
+        .map(|&(default_fable, person_flag, build)| {
+            let m = aterm_spec::interp::with_consts(
+                &model,
+                &[
+                    ("DefaultFable", default_fable),
+                    ("PersonFlag", person_flag),
+                    ("Build", build),
+                ],
             );
-            continue;
+            ((default_fable, person_flag, build), m)
+        })
+        .collect();
+    // Each configuration's interpreter walks run on a thread of their own,
+    // while this thread runs every `ty`-tier obligation in turn. As one loop
+    // the walks (~9 s on one thread) sat between the `ty` runs, and this test
+    // was its binary's last to finish (2026-09-30, while every `ty` spawn
+    // still queued behind one lock, gone 2026-10-01; the binary at the gate's
+    // seven test threads, four runs each: 35.4 s -> 32.8 s median; this test
+    // alone 17 s -> 9.4 s).
+    std::thread::scope(|scope| {
+        for (config, m) in &configs {
+            scope.spawn(move || model_switch_config_walks(*config, m));
         }
-        assert_operator_model_shape(&m, |_| false);
-        assert_every_invariant_breaks_first(&m, &[]);
-        let states = aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&m, 0))
-            .expect("every law holds at Buggy=0");
-        eprintln!(
-            "HarnessModelSwitch DefaultFable={default_fable} PersonFlag={person_flag} \
-             Build={build}: {states} states, every law proven (Buggy=0) and the only law \
-             some mutant step breaks (Buggy=1)"
-        );
-        assert_proves_and_catches(&m);
-    }
+        for ((_, person_flag, _), m) in &configs {
+            if *person_flag != 2 {
+                assert_proves_and_catches(m);
+            }
+        }
 
-    // Each mutant alone against its own law alone: the interpreter's
-    // counterexample printed, and `ty` (where installed) proves the healthy
-    // arm and catches the mutant.
-    let mutants: Vec<&str> = MODEL_SWITCH_MUTANTS.iter().map(|(a, _)| *a).collect();
-    for (mutant, law) in MODEL_SWITCH_MUTANTS {
-        let mut single = model.clone();
-        single
-            .actions
-            .retain(|a| !mutants.contains(&a.name) || a.name == mutant);
-        single.invariants.retain(|inv| inv.name == law);
-        let (state, broken) = aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&single, 1))
-            .expect_err("the mutant alone must break its law");
-        assert_eq!(broken, law);
-        eprintln!("HarnessModelSwitch: `{mutant}` is caught by `{law}` at {state:?}");
-        assert_proves_and_catches(&single);
-    }
+        // Each mutant alone against its own law alone: the interpreter's
+        // counterexample printed, and `ty` (where installed) proves the
+        // healthy arm and catches the mutant.
+        let mutants: Vec<&str> = MODEL_SWITCH_MUTANTS.iter().map(|(a, _)| *a).collect();
+        for (mutant, law) in MODEL_SWITCH_MUTANTS {
+            let mut single = model.clone();
+            single
+                .actions
+                .retain(|a| !mutants.contains(&a.name) || a.name == mutant);
+            single.invariants.retain(|inv| inv.name == law);
+            let (state, broken) =
+                aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&single, 1))
+                    .expect_err("the mutant alone must break its law");
+            assert_eq!(broken, law);
+            eprintln!("HarnessModelSwitch: `{mutant}` is caught by `{law}` at {state:?}");
+            assert_proves_and_catches(&single);
+        }
+    });
 
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
 
@@ -13063,6 +13372,18 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
     );
     fire_all(&model, &mut other, &["SettleElapses", "Visit"]);
     assert_eq!((other["set"], other["fl"], other["due"]), (0, 1, 0));
+    // THE LINE (2026-10-01): a restart asking no model drops the failed
+    // `--model` its process was relaunched with; the line before kept it.
+    let mut line = other.clone();
+    let mut kept_flag = other.clone();
+    fire_all(&model, &mut line, &["Restart"]);
+    assert_eq!(
+        (line["flag"], line["live"]),
+        (2, 3),
+        "no --model, the default runs"
+    );
+    fire_all(&buggy, &mut kept_flag, &["RelaunchKeepsAFailedFlag"]);
+    assert!(!buggy.check_invariant("NeverRelaunchedOntoAFailedModel", &kept_flag));
     let mut never = other.clone();
     never.insert("set", 1);
     never.insert("sage", 1);
@@ -13096,6 +13417,24 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
     fire_all(&buggy, &mut failed_it, &["SettleFailsAnAskThatRan"]);
     assert!(!buggy.check_invariant("AppliedAskStands", &failed_it));
 
+    // A SIGNAL NEVER SENT ASKED NOTHING (2026-10-01): the READY'd restart's
+    // signal refused, its ask is taken back — nothing settles as FAILED, and
+    // the round, its model with it, stands. The refusal before kept the ask.
+    let mut refused = model.init_state();
+    fire_all(
+        &model,
+        &mut refused,
+        &["GoCold", "Visit", "Announce", "Visit"],
+    );
+    let mut kept = refused.clone();
+    fire_all(&model, &mut refused, &["Refused"]);
+    assert_eq!(
+        (refused["set"], refused["phase"], refused["ann"]),
+        (0, 1, 1)
+    );
+    fire_all(&buggy, &mut kept, &["RefusedKeepsTheAsk"]);
+    assert!(!buggy.check_invariant("AskedOnlyByARelaunch", &kept));
+
     // A person's answered `/model claude-fable-5-1`, remembered by the visit
     // that saw it, holds Fable against a cross-family move; the rule before
     // 18090b6ae forgot it at the answer.
@@ -13126,88 +13465,138 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
     assert!(!buggy.check_invariant("AnnouncedModelRides", &retaken));
 }
 
-/// OPEN — THE RIDE'S EXEMPTION IS A GAP IN THE CODE (skeptic review of
-/// `HarnessModelSwitch`, 2026-09-27). `UpTheListOnly`,
-/// `PersonsChoiceStaysInFamily` and `NeverOntoAppliedOrFailed` hold for the
-/// rule's verdict and for every visit's decision EXCEPT while an announced
-/// model rides: `upgrade_drive::visit_models` carries the upgrade's
-/// `model_list` whatever the visit decides, and a gave-up upgrade's late READY
-/// restarts with that `model_list` too (`restart` asks `st.model_list`). So
-/// the HEALTHY model reaches, in every configuration, a relaunch about to ask
-/// for `claude-opus-5-5`:
+/// THE RIDE KEEPS THE MOVE LAWS (2026-10-01; the gap the skeptic review of
+/// `HarnessModelSwitch` found on 2026-09-27). `UpTheListOnly`,
+/// `PersonsChoiceStaysInFamily` and `NeverOntoAppliedOrFailed` once held for
+/// the rule's verdict and every visit's decision EXCEPT while an announced
+/// model rode: `upgrade_drive::visit_models` carried the upgrade's
+/// `model_list` whatever the visit decided, and a gave-up upgrade's late READY
+/// restarted with it too (`restart` asks `st.model_list`), so the healthy
+/// model reached, in every configuration, a restart about to ask for
+/// `claude-opus-5-5`:
 ///
 /// * (a) after it was recorded FAILED — both from a standing notice and from
-///   a gave-up one (the latter where a newer build gives the late READY a
-///   restart to make);
+///   a gave-up one;
 /// * (b) over a person's `/model claude-fable-5-1` typed after the notice,
 ///   across families;
 /// * (c) off a model the list does not name (a person's `/model
 ///   claude-sonnet-5`).
 ///
-/// This test pins each as reachable. A fix re-takes those three laws inside
-/// the ride as well (the ride's model then gives way to a verdict of
-/// `model-failed-before`, `model-chosen-by-hand` or `model-off-list`), and
-/// flips this test into their proof.
-#[test]
-fn derived_harness_model_switch_open_ride_gaps_are_reachable() {
-    for (default_fable, person_flag, build) in MODEL_SWITCH_CONFIGS {
-        let m = aterm_spec::interp::with_buggy(
-            &aterm_spec::interp::with_consts(
-                &harness_model_switch_model(),
-                &[
-                    ("DefaultFable", default_fable),
-                    ("PersonFlag", person_flag),
-                    ("Build", build),
-                ],
-            ),
-            0,
-        );
-        let key = |st: &aterm_spec::interp::State| -> Vec<(&'static str, i64)> {
-            st.iter().map(|(k, v)| (*k, *v)).collect()
-        };
-        let mut seen = std::collections::BTreeSet::new();
-        let mut queue = std::collections::VecDeque::from([m.init_state()]);
+/// The ride's guard (`upgrade_models::ride_bar`) re-takes the three laws
+/// inside the ride, so NO healthy state reaches any of them now, in any
+/// configuration — and each is still reached the old way, through its
+/// `Ride*` mutant alone (the NEGATIVE CONTROLS: the reachability this test
+/// pinned before the fix, the code before 2026-10-01). A state "rides" here
+/// when a visit has just left the round carrying the model, which its restart
+/// then asks for (`Relaunch` asks whenever `ann == 1`).
+///
+/// Two tests, one per `Build` (each over its six configurations): every
+/// configuration is its own whole space.
+fn derived_harness_model_switch_ride_keeps_the_move_laws(only_build: i64) {
+    let gaps = |m: &Model| -> std::collections::BTreeSet<&'static str> {
+        // Walked resolved (`aterm_spec::interp::Resolved`): the states
+        // `successors` reaches by name, without a string-keyed map per step.
+        let r = aterm_spec::interp::Resolved::new(m).expect("the model resolves");
+        let [fresh, phase, ann, fl, live, cmd] =
+            ["fresh", "phase", "ann", "fl", "live", "cmd"].map(|v| r.slot(v));
+        // A state is queued once, when first seen: the same states as
+        // queueing every successor and skipping repeats as they come off.
+        let init = r.init();
+        let mut seen = std::collections::HashSet::from([init.clone()]);
+        let mut queue = std::collections::VecDeque::from([init]);
         let mut found = std::collections::BTreeSet::new();
         while let Some(st) = queue.pop_front() {
-            if !seen.insert(key(&st)) {
-                continue;
+            let rides = st[fresh] == 1 && st[phase] > 0 && st[ann] == 1;
+            if rides && st[fl] == 1 {
+                found.insert(if st[phase] == 1 {
+                    "(a) a ride asks for a model recorded failed"
+                } else {
+                    "(a) a late READY after a give-up asks for a model recorded failed"
+                });
             }
-            let rides = st["fresh"] == 1 && st["phase"] == 1 && st["ann"] == 1 && st["mto"] == 1;
-            let relaunches = !m.successors("Relaunch", &st).is_empty();
-            if rides && relaunches && st["fl"] == 1 {
-                found.insert("(a) a ride asks for a model recorded failed");
-            }
-            if st["fresh"] == 1 && st["phase"] == 2 && st["ann"] == 1 && st["fl"] == 1 && relaunches
-            {
-                found.insert("(a) a late READY after a give-up asks for a model recorded failed");
-            }
-            if rides && relaunches && st["live"] == 2 && st["cmd"] == 1 {
+            if rides && st[live] == 2 && st[cmd] == 1 {
                 found.insert("(b) a ride moves a person's /model across families");
             }
-            if rides && relaunches && st["live"] == 4 {
+            if rides && st[live] == 4 {
                 found.insert("(c) a ride moves a model the list does not name");
             }
-            for action in &m.actions {
-                queue.extend(m.successors(action.name, &st));
+            for a in 0..m.actions.len() {
+                for next in r.successors(a, &st) {
+                    if !seen.contains(&next) {
+                        seen.insert(next.clone());
+                        queue.push_back(next);
+                    }
+                }
             }
         }
-        // A person's launch alias keeps everything: nothing is ever
-        // announced with a model, so no ride exists to carry one.
-        let want = if person_flag == 2 {
-            0
-        } else if build == 1 {
-            4
-        } else {
-            3
-        };
-        assert_eq!(
-            found.len(),
-            want,
-            "DefaultFable={default_fable} PersonFlag={person_flag} Build={build}: {found:?} — \
-             a gap no longer reachable is a FIX: turn this test into the laws' proof inside \
-             the ride"
+        found
+    };
+    let mutants: Vec<&str> = MODEL_SWITCH_MUTANTS.iter().map(|(a, _)| *a).collect();
+    for (default_fable, person_flag, build) in MODEL_SWITCH_CONFIGS {
+        if build != only_build {
+            continue;
+        }
+        let m = aterm_spec::interp::with_consts(
+            &harness_model_switch_model(),
+            &[
+                ("DefaultFable", default_fable),
+                ("PersonFlag", person_flag),
+                ("Build", build),
+            ],
         );
+        let config = format!("DefaultFable={default_fable} PersonFlag={person_flag} Build={build}");
+        let healthy = gaps(&aterm_spec::interp::with_buggy(&m, 0));
+        assert!(
+            healthy.is_empty(),
+            "{config}: the ride still breaks a move law: {healthy:?}"
+        );
+        // Each gap, reached through its mutant alone. A person's launch alias
+        // keeps everything: nothing is ever announced with a model, so no
+        // ride exists to carry one, healthy or not.
+        for (mutant, want) in [
+            (
+                "RideCarriesAFailedModel",
+                &[
+                    "(a) a late READY after a give-up asks for a model recorded failed",
+                    "(a) a ride asks for a model recorded failed",
+                ][..],
+            ),
+            (
+                "RideOverridesAPersonsChoice",
+                &["(b) a ride moves a person's /model across families"][..],
+            ),
+            (
+                "RideMovesOffList",
+                &["(c) a ride moves a model the list does not name"][..],
+            ),
+        ] {
+            let mut single = m.clone();
+            single
+                .actions
+                .retain(|a| !mutants.contains(&a.name) || a.name == mutant);
+            let found = gaps(&aterm_spec::interp::with_buggy(&single, 1));
+            let want: std::collections::BTreeSet<&str> = if person_flag == 2 {
+                std::collections::BTreeSet::new()
+            } else {
+                want.iter().copied().collect()
+            };
+            assert_eq!(
+                found, want,
+                "{config}: `{mutant}` must reopen exactly its gap — a mutant that no longer \
+                 reaches it is no control"
+            );
+        }
     }
+}
+
+#[test]
+fn derived_harness_model_switch_ride_keeps_the_move_laws_at_build_0() {
+    derived_harness_model_switch_ride_keeps_the_move_laws(0);
+}
+
+#[test]
+fn derived_harness_model_switch_ride_keeps_the_move_laws_at_build_1() {
+    derived_harness_model_switch_ride_keeps_the_move_laws(1);
 }
 
 /// Fire `actions` in order on `model` from `state`, each of which must be

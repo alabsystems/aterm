@@ -5,10 +5,9 @@
 
 use super::*;
 
-/// The stars read the flanking rows through v2's occupancy bitsets
-/// alone. The engine's own copies of those rows ([`NbrProbe`]) were
-/// dropped for that reason and came back for the seam's content
-/// witnesses; this pins that the stars never needed them.
+/// The stars read the flanking rows through v2's occupancy bitsets alone; the
+/// engine's own row copies ([`NbrProbe`]) serve only the seam's content
+/// witnesses.
 #[test]
 fn neighbor_probe_still_gates_star_pixels_after_discarding_duplicate_row_storage() {
     let now = Instant::now();

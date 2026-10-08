@@ -2,9 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for `InputUnreadGate` (aterm-spec's
-//! `input_unread_gate_model`): the shipped `input_backlog::refuses`, fed by
-//! the real sink's reading of a real pty, is the model's `DriverKey` guard at
-//! every step — and the 2026-09-24 incident replays as the negative control.
+//! `input_unread_gate_model`): the shipped `input_backlog::gate`, fed by the
+//! real sink's reading of a real pty, is the model's `DriverKey` /
+//! `DriverRefused` guard and its warning at every step, and `classify`'s
+//! entry is its `Publish` guard — and both the frozen-program incident and a
+//! static 1 s refusal replay as negative controls.
 //!
 //! The incident: a frozen Claude Code left the owner's Enter unread in its
 //! slave's input queue; a supervisor, fencing its keys on a screen the frozen
@@ -19,50 +21,61 @@
 //! * `q` ← the number of writes this test made that the slave has not read,
 //!   cross-checked against the kernel's `b.queued` (their byte sum) and a
 //!   drained spill;
-//! * `a1` ← `min(b.wait / 500 ms, AgeMax)`, the probe's lower bound on the
-//!   oldest unread byte's wait. A `Tick` sleeps to the NEXT 500 ms boundary of
-//!   the oldest write's age plus a 100 ms margin (not a bare 550 ms sleep, so
-//!   one slow step cannot land two ticks of age in one).
+//! * `a1` ← the BAND of `b.wait`, the probe's lower bound on the oldest
+//!   unread byte's wait: `0` under `WARN_AFTER`, `1` under `STALL_AFTER`,
+//!   `2` from there. A `Tick` moves the reading's clock to the NEXT band
+//!   boundary of the oldest write's age;
+//! * `published` ← the model's own, handed to `gate` as the watch's
+//!   publication — the watch itself is aterm-gui's (`input_stall`), bound by
+//!   its own tests; what binds here is that the rule the watch's evidence
+//!   feeds (`classify`) and the rule the publication feeds (`gate`) are the
+//!   model's guards.
 //!
-//! TIMING IS BRACKETED, NOT HOPED FOR (the load-sensitive test audit of
-//! 2026-09-27). The sleep puts every reading at or past its tick's floor, but
-//! only the scheduler keeps it under the NEXT boundary: a test thread
-//! descheduled for ~400 ms before a reading ages the byte into a tick the
-//! model has not taken. So every reading with a byte queued is bracketed by
-//! the instant before its oldest write and the instant after the reading
-//! returned — the widest the wait can be — and a reading whose bracket
-//! reaches the model's next boundary is [`Late`]: the scenario reruns on a
-//! fresh pty rather than asserting on a projection the schedule, not the
-//! code, decided. A reading inside its bracket is judged exactly as before,
-//! so a mis-dated ledger or a moved `REFUSE_AFTER` still fails at once.
+//! THE CLOCK IS INJECTED, NOT SLEPT ON. The writes are real — a real pty, the
+//! real sink and ledger, the kernel's own queue count — but the instant a
+//! reading is taken AS OF is handed to `SinkWriter::input_backlog_at`: the
+//! writes' own bracketing instants plus the model's band boundary, so the
+//! reading is at or past its band's floor and under the next boundary
+//! whatever the scheduler does. Nothing sleeps, nothing is retried, and a
+//! mis-dated ledger or a moved `WARN_AFTER`/`STALL_AFTER` still fails at
+//! once. (The real kernel queue dating, wall clock and all, is
+//! `input_backlog_pty.rs`'s.)
 //!
 //! `reading` and `stopped` are the model's side of the reader: `Freeze`
-//! states that this test does not read, and `stopped` is `refuses`'s own
+//! states that this test does not read, and `stopped` is `gate`'s own
 //! argument, checked in BOTH values at every step. `a2` is not projected —
 //! the probe dates only the oldest byte.
 //!
-//! macOS-only, like the queue probes. The pairs come from `openpty`, whose
-//! slave is inheritable; harmless here, because this test binary spawns no
-//! child that could inherit it.
+//! macOS-only, like the queue probes. The pairs come from aterm-pty's
+//! `open_pty_pair`, both ends close-on-exec from birth, as every test's pair
+//! does: `openpty(3)`'s are inheritable, and a child spawned meanwhile keeps
+//! them.
 #![cfg(target_os = "macos")]
 
 use std::collections::{BTreeMap, VecDeque};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use aterm_session::input_backlog::{InputBacklog, refuses};
+use aterm_session::input_backlog::{
+    Contention, Gate, InputBacklog, InputWord, Liveness, STALL_AFTER, WARN_AFTER, classify, gate,
+};
 use aterm_session::sink::{ImmediateWrite, SinkWriter};
 use aterm_spec::derive::{Model, input_unread_gate_model};
 use aterm_spec::interp;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// One model tick of the oldest byte's wait — `Refuse = 2` ticks is
-/// `REFUSE_AFTER`.
-const TICK: Duration = Duration::from_millis(500);
-/// How far past a tick boundary a `Tick` sleeps, so the probe's lower bound
-/// has crossed it.
-const MARGIN: Duration = Duration::from_millis(100);
+/// The model's band boundaries: band `i` ends at `BANDS[i]` — `Warn = 1`
+/// is `WARN_AFTER`, `Stall = 2` is `STALL_AFTER`.
+const BANDS: [Duration; 2] = [WARN_AFTER, STALL_AFTER];
+/// The model's band for a wait.
+fn band(wait: Duration) -> i64 {
+    i64::try_from(BANDS.iter().filter(|b| wait >= **b).count()).expect("small")
+}
+
+/// The boundary that ends band `a1`, or `None` for the last band.
+fn boundary(a1: i64) -> Option<Duration> {
+    usize::try_from(a1).ok().and_then(|i| BANDS.get(i)).copied()
+}
 
 /// A pty pair with the slave raw (`VMIN = 1`, `VTIME = 0`: a key-at-a-time
 /// reader like every agent TUI) or canonical without echo, behind an
@@ -72,62 +85,17 @@ struct Rig {
     slave: i32,
     sink: SinkWriter,
     /// `(bytes, sent from, accepted by)` for every write the slave has not
-    /// read. The ledger stamps a write between the two instants: a sleep
-    /// measured from the second never under-ages it, and a reading's wait
-    /// can be no longer than the time since the first.
+    /// read. The ledger stamps a write between the two instants ([`Self::now`]
+    /// reads the clock off them).
     unread: VecDeque<(usize, Instant, Instant)>,
-}
-
-/// A reading taken too late to name the tick the model is in — the
-/// scheduler's doing, proved by the bracket, never a verdict on the code.
-struct Late {
-    step: &'static str,
-    /// The widest the oldest byte's wait could have been at the reading.
-    bracket: Duration,
-    /// The model's next tick boundary, which that reaches.
-    boundary: Duration,
-}
-
-/// Scenario attempts. Only a reading whose own bracket proved it late
-/// retries, and every real assertion panics on the attempt it fails. A late
-/// attempt has itself spent a whole tick or more, so the next one starts in a
-/// different scheduling episode without a sleep between them.
-const ATTEMPTS: usize = 4;
-
-/// Run `scenario` until one attempt takes every reading inside its tick.
-fn conclusive(scenario: impl Fn() -> Result<(), Late>) {
-    let mut late = Vec::new();
-    for _ in 0..ATTEMPTS {
-        match scenario() {
-            Ok(()) => return,
-            Err(Late {
-                step,
-                bracket,
-                boundary,
-            }) => late.push(format!("{step}: {bracket:?} >= {boundary:?}")),
-        }
-    }
-    panic!(
-        "every attempt took a reading past the model's next tick, so none \
-         could be judged: {late:?}"
-    );
+    /// How old the model says the oldest unread write is: what a [`Self::tick`]
+    /// advances, and what [`Self::reading`]'s clock adds to the write.
+    age: Duration,
 }
 
 impl Rig {
     fn new(raw: bool) -> Self {
-        let (mut master, mut slave) = (-1, -1);
-        // SAFETY: both out-params are live `c_int`s on this stack; the name,
-        // termios and winsize pointers may be null.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty");
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
         // SAFETY: `libc::termios` is plain integer fields and a byte array;
         // all zeros is a valid value, overwritten by `tcgetattr` below.
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
@@ -160,6 +128,7 @@ impl Rig {
             slave,
             sink,
             unread: VecDeque::new(),
+            age: Duration::ZERO,
         }
     }
 
@@ -174,15 +143,26 @@ impl Rig {
         self.unread.push_back((bytes.len(), sent, Instant::now()));
     }
 
-    /// Sleep until the oldest unread write's age crosses its next tick
-    /// boundary (plus [`MARGIN`]) — one model `Tick`.
-    fn tick(&self, ticks_so_far: i64) {
-        let (_, _, at) = *self.unread.front().expect("a tick ages a queued byte");
-        let ticks = u32::try_from(ticks_so_far + 1).expect("a small tick count");
-        let due = at + TICK * ticks + MARGIN;
-        let now = Instant::now();
-        if due > now {
-            thread::sleep(due - now);
+    /// Age the oldest unread write to the boundary that ends band `a1` — one
+    /// model `Tick`. The clock moves; nothing sleeps.
+    fn tick(&mut self, a1: i64) {
+        assert!(!self.unread.is_empty(), "a tick ages a queued byte");
+        self.age = boundary(a1).expect("a band that ends");
+    }
+
+    /// The instant a reading is taken as of. At age zero it is the instant
+    /// BEFORE the oldest unread write, ahead of every stamp the ledger can
+    /// have taken (a wait of exactly zero). Past zero it is the instant the
+    /// NEWEST unread write was accepted plus the [`Self::age`]: the ledger
+    /// dates a byte by one write's stamp, and coalescing dates a run by its
+    /// newest, so no stamp is later than that acceptance and the wait is at
+    /// least the age — and at most the age plus the span the test's writes
+    /// took, microseconds. With nothing queued there is no wait to date.
+    fn now(&self) -> Instant {
+        match (self.unread.front(), self.unread.back()) {
+            (Some(&(_, sent, _)), _) if self.age.is_zero() => sent,
+            (_, Some(&(_, _, accepted))) => accepted + self.age,
+            _ => Instant::now(),
         }
     }
 
@@ -197,12 +177,16 @@ impl Rig {
         let got = usize::try_from(r).expect("read");
         assert_eq!(got, want, "one read() returns every queued byte");
         self.unread.clear();
+        self.age = Duration::ZERO;
         buf[..got].to_vec()
     }
 
     /// The sink's reading, cross-checked against what this test wrote.
     fn reading(&self) -> InputBacklog {
-        let b = self.sink.input_backlog().expect("a pty master is measured");
+        let b = self
+            .sink
+            .input_backlog_at(self.now())
+            .expect("a pty master is measured");
         let bytes: usize = self.unread.iter().map(|(n, _, _)| n).sum();
         assert_eq!(
             b.queued, bytes,
@@ -210,28 +194,6 @@ impl Rig {
         );
         assert_eq!(b.spilled, Some(0), "nothing spilled: {b:?}");
         b
-    }
-
-    /// [`Self::reading`], for the model state `st`: [`Late`] when the reading
-    /// may have aged the oldest byte to the model's next tick, `a1 + 1`
-    /// (there is none once `a1` is `AgeMax`, which the projection caps at).
-    fn reading_in(&self, st: &State, step: &'static str) -> Result<InputBacklog, Late> {
-        let b = self.reading();
-        let returned = Instant::now();
-        if let Some(&(_, sent, _)) = self.unread.front()
-            && st["a1"] < 3
-        {
-            let bracket = returned - sent;
-            let boundary = TICK * u32::try_from(st["a1"] + 1).expect("a small tick count");
-            if bracket >= boundary {
-                return Err(Late {
-                    step,
-                    bracket,
-                    boundary,
-                });
-            }
-        }
-        Ok(b)
     }
 }
 
@@ -250,223 +212,288 @@ impl Drop for Rig {
 /// the model's own values in `st`.
 fn assert_projects(rig: &Rig, b: &InputBacklog, st: &State, step: &str) {
     let q = i64::try_from(rig.unread.len()).expect("small");
-    let a1 = i64::try_from(b.wait.as_millis() / TICK.as_millis())
-        .expect("small")
-        .min(3);
     let raw = i64::from(!b.canonical);
     assert_eq!(
-        (raw, q, a1),
+        (raw, q, band(b.wait)),
         (st["raw"], st["q"], st["a1"]),
         "{step}: the real reading {b:?} does not project onto the model state {st:?}"
     );
 }
 
-/// The conformance check proper: whenever the queue has room, the shipped
-/// `refuses` says NO exactly when the model's `DriverKey` is disabled — for a
-/// running job and for a stopped one.
+/// The conformance check proper, for a running job and a stopped one:
+///
+/// * `gate` REFUSES exactly when the model's `DriverRefused` is enabled — and,
+///   whenever the queue has room, exactly when `DriverKey` is disabled;
+/// * `gate` WARNS exactly when a `DriverKey` fired from this state leaves
+///   `warned = 1`;
+/// * `classify`, fed the watch's evidence for the model's reader (a frozen
+///   reader spins and draws nothing; a reading one is seen drawing), enters
+///   `stalled` exactly when `Publish` is enabled.
 fn assert_gate_is_the_guard(model: &Model, b: &InputBacklog, st: &State, step: &str) {
-    if st["q"] >= 2 {
-        return; // `Cap`: the model's queue is full, whatever the gate says.
-    }
+    let published = st["published"] == 1;
     for stopped in [false, true] {
         let mut s = st.clone();
         s.insert("stopped", i64::from(stopped));
+        let g = gate(b, stopped, published);
         assert_eq!(
-            refuses(b, stopped),
-            !model.action_enabled("DriverKey", &s),
-            "{step} (stopped={stopped}): refuses({b:?}) disagrees with DriverKey at {s:?}"
+            g == Gate::Refuse,
+            model.action_enabled("DriverRefused", &s),
+            "{step} (stopped={stopped}): gate({b:?}) = {g:?} disagrees with DriverRefused at {s:?}"
         );
+        if s["q"] >= 2 {
+            continue; // `Cap`: the model's queue is full, whatever the gate says.
+        }
+        assert_eq!(
+            g == Gate::Refuse,
+            !model.action_enabled("DriverKey", &s),
+            "{step} (stopped={stopped}): gate({b:?}) = {g:?} disagrees with DriverKey at {s:?}"
+        );
+        if g != Gate::Refuse {
+            let mut written = s.clone();
+            assert!(model.fire("DriverKey", &mut written));
+            assert_eq!(
+                g == Gate::Warn,
+                written["warned"] == 1,
+                "{step} (stopped={stopped}): gate({b:?}) = {g:?} disagrees with the warning"
+            );
+        }
+        if !stopped && !published {
+            let frozen = st["reading"] == 0;
+            let seen = Liveness::Watched {
+                drew: !frozen,
+                spinning: frozen,
+                contention: Contention::default(),
+            };
+            assert_eq!(
+                classify(Some(b), false, seen) == InputWord::Stalled,
+                model.action_enabled("Publish", &s),
+                "{step}: classify({b:?}, {seen:?}) disagrees with Publish at {s:?}"
+            );
+        }
     }
 }
 
-/// Fire `action` on the model, and check the invariant after it.
+/// Fire `action` on the model, and check every invariant after it.
 fn fire(model: &Model, action: &str, st: &mut State) {
     assert!(model.fire(action, st), "{action} is disabled at {st:?}");
-    assert!(
-        model.check_invariant("NoDriverKeyBehindStaleInput", st),
-        "{action}: {st:?}"
-    );
+    for inv in [
+        "NoDriverKeyBehindStalledInput",
+        "NoRefusalWithoutAnEstablishedStall",
+        "NoReadingProgramPublished",
+    ] {
+        assert!(model.check_invariant(inv, st), "{action}: {inv} at {st:?}");
+    }
+}
+
+/// Read, project, and bind one step.
+fn step(rig: &Rig, model: &Model, st: &State, name: &'static str) -> InputBacklog {
+    let b = rig.reading();
+    assert_projects(rig, &b, st, name);
+    assert_gate_is_the_guard(model, &b, st, name);
+    b
 }
 
 /// THE STEP-BY-STEP BIND. A raw program that has stopped reading; the
-/// human's Enter goes in and ages tick by tick. At every step the real
-/// reading projects onto the model's state, and `refuses` is `DriverKey`'s
-/// guard: open at 0 and 500 ms, shut from 1 s. A second human key still
-/// lands while the gate refuses (the window keyboard is never gated) and
-/// the kernel's count grows. The program reading everything clears it, and
-/// the gate opens again.
+/// human's Enter goes in and ages band by band. At every step the real
+/// reading projects onto the model's state and `gate`/`classify` are its
+/// guards: open under a second, a WARNING from a second on — the key would be
+/// written — and still only a warning at ten seconds, until the watch's
+/// evidence publishes the stall; only then a refusal. A second human key
+/// lands while the gate refuses (the window keyboard is never gated). The
+/// program reading everything opens the gate, and the watch withdraws.
 #[test]
-fn refuses_is_the_models_driver_key_guard_at_every_step() {
-    conclusive(|| {
-        let model = input_unread_gate_model();
-        let mut rig = Rig::new(true);
-        let mut st = model.init_state();
+fn gate_and_classify_are_the_models_guards_at_every_step() {
+    let model = input_unread_gate_model();
+    let mut rig = Rig::new(true);
+    let mut st = model.init_state();
 
-        fire(&model, "Freeze", &mut st);
-        let b = rig.reading_in(&st, "empty")?;
-        assert_projects(&rig, &b, &st, "empty");
-        assert_gate_is_the_guard(&model, &b, &st, "empty");
+    fire(&model, "Freeze", &mut st);
+    step(&rig, &model, &st, "empty");
 
-        rig.write(b"\r");
-        fire(&model, "HumanKey", &mut st);
-        for ticks in 0..2 {
-            let b = rig.reading_in(&st, "aging")?;
-            assert_projects(&rig, &b, &st, "aging");
-            assert_gate_is_the_guard(&model, &b, &st, "aging");
-            assert!(!refuses(&b, false), "younger than REFUSE_AFTER: {b:?}");
-            rig.tick(ticks);
-            fire(&model, "Tick", &mut st);
-        }
-        let stale = rig.reading_in(&st, "stale")?;
-        assert_projects(&rig, &stale, &st, "stale");
-        assert_gate_is_the_guard(&model, &stale, &st, "stale");
-        assert!(refuses(&stale, false), "past REFUSE_AFTER: {stale:?}");
-
-        // The human types again while the gate refuses: it lands, and it
-        // grows the count the gate reads.
-        assert!(model.action_enabled("HumanKey", &st));
-        rig.write(b"\r");
-        fire(&model, "HumanKey", &mut st);
-        let grown = rig.reading_in(&st, "grown")?;
-        assert_eq!(grown.queued, 2);
-        assert_projects(&rig, &grown, &st, "grown");
-        assert!(refuses(&grown, false), "{grown:?}");
-
-        // The program wakes and reads both keys.
-        assert_eq!(rig.read_all(), b"\r\r");
-        fire(&model, "Thaw", &mut st);
-        fire(&model, "Consume", &mut st);
-        fire(&model, "Consume", &mut st);
-        let cleared = rig.reading_in(&st, "cleared")?;
-        assert_projects(&rig, &cleared, &st, "cleared");
-        assert_gate_is_the_guard(&model, &cleared, &st, "cleared");
-        assert!(!refuses(&cleared, false));
-        Ok(())
-    });
-}
-
-/// A driver's key into an EMPTY queue is admitted — and so is a second one
-/// straight behind it, which is younger than `REFUSE_AFTER`. The gate stops
-/// a key only behind input the program has left unread for a second.
-#[test]
-fn a_driver_key_into_a_fresh_queue_is_admitted() {
-    conclusive(|| {
-        let model = input_unread_gate_model();
-        let mut rig = Rig::new(true);
-        let mut st = model.init_state();
-        fire(&model, "Freeze", &mut st);
-
-        for key in [&b"\x1b[B"[..], b"\r"] {
-            let b = rig.reading_in(&st, "driver")?;
-            assert_projects(&rig, &b, &st, "driver");
-            assert_gate_is_the_guard(&model, &b, &st, "driver");
-            assert!(!refuses(&b, false), "{b:?}");
-            rig.write(key);
-            fire(&model, "DriverKey", &mut st);
-        }
-        assert_eq!(rig.read_all(), b"\x1b[B\r");
-        Ok(())
-    });
-}
-
-/// CANONICAL TYPE-AHEAD NEVER REFUSES. A shell's complete line `ls\n` that
-/// nothing has read yet ages past `REFUSE_AFTER` and the gate stays open —
-/// the model's `raw = 0` branch.
-#[test]
-fn aged_canonical_typeahead_is_admitted() {
-    conclusive(|| {
-        let model = input_unread_gate_model();
-        let mut rig = Rig::new(false);
-        let mut st = model.init_state();
-        fire(&model, "ModeFlip", &mut st);
-        fire(&model, "Freeze", &mut st);
-
-        rig.write(b"ls\n");
-        fire(&model, "HumanKey", &mut st);
-        for ticks in 0..2 {
-            rig.tick(ticks);
-            fire(&model, "Tick", &mut st);
-        }
-        let b = rig.reading_in(&st, "typeahead")?;
-        assert!(b.canonical && b.wait >= Duration::from_secs(1), "{b:?}");
-        assert_projects(&rig, &b, &st, "typeahead");
-        assert_gate_is_the_guard(&model, &b, &st, "typeahead");
-        assert!(!refuses(&b, false), "{b:?}");
-        assert_eq!(rig.read_all(), b"ls\n");
-        Ok(())
-    });
-}
-
-/// The incident's schedule on both sides: the program stops reading, the
-/// human's Enter goes in, and it ages two ticks — past `REFUSE_AFTER`, to
-/// 1.1 s.
-fn enter_and_age_past_refuse(rig: &mut Rig, model: &Model, st: &mut State) {
-    fire(model, "Freeze", st);
     rig.write(b"\r");
+    fire(&model, "HumanKey", &mut st);
+    let b = step(&rig, &model, &st, "young");
+    assert_eq!(gate(&b, false, false), Gate::Open, "{b:?}");
+    rig.tick(0);
+    fire(&model, "Tick", &mut st);
+    let b = step(&rig, &model, &st, "warn band");
+    assert_eq!(gate(&b, false, false), Gate::Warn, "{b:?}");
+    rig.tick(1);
+    fire(&model, "Tick", &mut st);
+    let b = step(&rig, &model, &st, "stall band");
+    assert_eq!(
+        gate(&b, false, false),
+        Gate::Warn,
+        "ten seconds unread is still only a warning until the watch publishes: {b:?}"
+    );
+
+    fire(&model, "Publish", &mut st);
+    let stale = step(&rig, &model, &st, "published");
+    assert_eq!(gate(&stale, false, true), Gate::Refuse, "{stale:?}");
+
+    // The human types again while the gate refuses: it lands, and it
+    // grows the count the gate reads.
+    assert!(model.action_enabled("HumanKey", &st));
+    rig.write(b"\r");
+    fire(&model, "HumanKey", &mut st);
+    let grown = step(&rig, &model, &st, "grown");
+    assert_eq!(grown.queued, 2);
+    assert_eq!(gate(&grown, false, true), Gate::Refuse, "{grown:?}");
+
+    // The program wakes and reads both keys; the gate opens and the watch
+    // withdraws.
+    assert_eq!(rig.read_all(), b"\r\r");
+    fire(&model, "Thaw", &mut st);
+    fire(&model, "Consume", &mut st);
+    fire(&model, "Consume", &mut st);
+    let cleared = step(&rig, &model, &st, "cleared");
+    assert_eq!(gate(&cleared, false, true), Gate::Open);
+    fire(&model, "Withdraw", &mut st);
+    step(&rig, &model, &st, "withdrawn");
+}
+
+/// A driver's key into an EMPTY queue is written — and so is a second one
+/// straight behind it, which is younger than `WARN_AFTER`: no warning either.
+#[test]
+fn a_driver_key_into_a_fresh_queue_is_written_without_a_warning() {
+    let model = input_unread_gate_model();
+    let mut rig = Rig::new(true);
+    let mut st = model.init_state();
+    fire(&model, "Freeze", &mut st);
+
+    for key in [&b"\x1b[B"[..], b"\r"] {
+        let b = step(&rig, &model, &st, "driver");
+        assert_eq!(gate(&b, false, false), Gate::Open, "{b:?}");
+        rig.write(key);
+        fire(&model, "DriverKey", &mut st);
+        assert_eq!(st["warned"], 0);
+    }
+    assert_eq!(rig.read_all(), b"\x1b[B\r");
+}
+
+/// CANONICAL TYPE-AHEAD IS NEITHER WARNED NOR REFUSED. A shell's complete
+/// line `ls\n` that nothing has read yet ages past `WARN_AFTER` and the gate
+/// stays open — the model's `raw = 0` branch.
+#[test]
+fn aged_canonical_typeahead_is_written_without_a_warning() {
+    let model = input_unread_gate_model();
+    let mut rig = Rig::new(false);
+    let mut st = model.init_state();
+    fire(&model, "ModeFlip", &mut st);
+    fire(&model, "Freeze", &mut st);
+
+    rig.write(b"ls\n");
+    fire(&model, "HumanKey", &mut st);
+    rig.tick(0);
+    fire(&model, "Tick", &mut st);
+    let b = step(&rig, &model, &st, "typeahead");
+    assert!(b.canonical && b.wait >= WARN_AFTER, "{b:?}");
+    assert_eq!(gate(&b, false, false), Gate::Open, "{b:?}");
+    assert_eq!(rig.read_all(), b"ls\n");
+}
+
+/// NEGATIVE CONTROL — THE STATIC CAP. The
+/// human's Enter has waited 1.1 s in a program that has not read it yet — on
+/// a machine at a load of 150 that is a healthy Claude Code. The shipped
+/// `gate` WARNS, and the driver's key is written: the program reads both, in
+/// order. The static cap (the model's mutant family) refuses the same key at
+/// the same projected state with nothing established, and firing its
+/// refusal falsifies `NoRefusalWithoutAnEstablishedStall`.
+#[test]
+fn a_slow_read_is_warned_and_written_and_the_static_cap_is_caught() {
+    let model = input_unread_gate_model();
+    let cap = interp::with_buggy(&model, 1);
+    let mut rig = Rig::new(true);
+    let mut st = model.init_state();
+    rig.write(b"\r");
+    fire(&model, "HumanKey", &mut st);
+    rig.tick(0);
+    fire(&model, "Tick", &mut st);
+    let b = step(&rig, &model, &st, "slow");
+    assert_eq!(gate(&b, false, false), Gate::Warn, "{b:?}");
+
+    let mut capped = st.clone();
+    assert!(cap.action_enabled("DriverRefused", &capped));
+    assert!(cap.fire("DriverRefused", &mut capped));
+    assert!(
+        !cap.check_invariant("NoRefusalWithoutAnEstablishedStall", &capped),
+        "the static cap refuses a program nothing has shown is stuck"
+    );
+
+    rig.write(b"\x1b[B");
+    fire(&model, "DriverKey", &mut st);
+    assert_eq!(st["warned"], 1, "the reply carries the warning");
+    assert_eq!(rig.read_all(), b"\r\x1b[B", "read in order, both");
+}
+
+/// Age a fresh Enter into the stall band on every rig at once, and fire the
+/// same schedule on `model` — so two rigs share one ten-second age.
+fn enter_and_age_to_stall(rigs: &mut [&mut Rig], model: &Model, st: &mut State) {
+    fire(model, "Freeze", st);
+    for rig in rigs.iter_mut() {
+        rig.write(b"\r");
+    }
     fire(model, "HumanKey", st);
-    for ticks in 0..2 {
-        rig.tick(ticks);
+    for a1 in 0..2 {
+        for rig in rigs.iter_mut() {
+            rig.tick(a1);
+        }
         fire(model, "Tick", st);
     }
 }
 
 /// NEGATIVE CONTROL — THE INCIDENT, REPLAYED. The human's Enter goes into a
-/// raw program that is not reading, and waits 1.1 s.
+/// raw program that is not reading, ages past `STALL_AFTER`, and the watch's
+/// evidence publishes the stall.
 ///
-/// Today's actuator, `try_write_frame_immediate`, refuses only on lock
+/// The raw actuator, `try_write_frame_immediate`, refuses only on lock
 /// contention, a non-empty spill or a full queue, so the driver's `down`
 /// answers `Full` and the program's next `read()` returns `\r\x1b[B` — both
 /// keys together, the down acted on against a screen it never drew. The
 /// model's screen-only fence (`Buggy = 1`) admits `DriverKey` at the same
-/// projected state, and firing it falsifies `NoDriverKeyBehindStaleInput`.
+/// projected state, and firing it falsifies `NoDriverKeyBehindStalledInput`.
 ///
-/// Through `refuses` the same reading withholds the key, the correct model
+/// Through `gate` the same reading withholds the key, the correct model
 /// agrees `DriverKey` is disabled, and the program reads exactly `\r`.
 #[test]
 fn the_incident_replays_and_the_gate_withholds_the_key() {
-    conclusive(|| {
-        let model = input_unread_gate_model();
-        let fence = interp::with_buggy(&model, 1);
+    let model = input_unread_gate_model();
+    let fence = interp::with_buggy(&model, 1);
+    let mut unguarded = Rig::new(true);
+    let mut rig = Rig::new(true);
+    let mut st = model.init_state();
+    enter_and_age_to_stall(&mut [&mut unguarded, &mut rig], &model, &mut st);
+    fire(&model, "Publish", &mut st);
 
-        // Today: the screen-only fence.
-        let mut rig = Rig::new(true);
-        let mut st = fence.init_state();
-        enter_and_age_past_refuse(&mut rig, &fence, &mut st);
-        let b = rig.reading_in(&st, "incident")?;
-        assert!(b.wait >= Duration::from_millis(1100), "{b:?}");
-        assert_projects(&rig, &b, &st, "incident");
-        assert!(fence.action_enabled("DriverKey", &st));
-        assert!(fence.fire("DriverKey", &mut st));
-        assert!(
-            !fence.check_invariant("NoDriverKeyBehindStaleInput", &st),
-            "the screen-only fence lands the key behind the stale Enter"
-        );
-        assert_eq!(
-            rig.sink.try_write_frame_immediate(b"\x1b[B"),
-            ImmediateWrite::Full,
-            "today's actuator writes behind the unread Enter"
-        );
-        let now = Instant::now();
-        rig.unread.push_back((3, now, now));
-        assert_eq!(
-            rig.read_all(),
-            b"\r\x1b[B",
-            "one read() hands the program both keys — the incident"
-        );
-        drop(rig);
+    // The screen-only fence.
+    let b = unguarded.reading();
+    assert!(b.wait >= STALL_AFTER, "{b:?}");
+    assert_projects(&unguarded, &b, &st, "incident");
+    let mut screen = st.clone();
+    assert!(fence.action_enabled("DriverKey", &screen));
+    assert!(fence.fire("DriverKey", &mut screen));
+    assert!(
+        !fence.check_invariant("NoDriverKeyBehindStalledInput", &screen),
+        "the screen-only fence lands the key behind the stale Enter"
+    );
+    assert_eq!(
+        unguarded.sink.try_write_frame_immediate(b"\x1b[B"),
+        ImmediateWrite::Full,
+        "the raw actuator writes behind the unread Enter"
+    );
+    let now = Instant::now();
+    unguarded.unread.push_back((3, now, now));
+    assert_eq!(
+        unguarded.read_all(),
+        b"\r\x1b[B",
+        "one read() hands the program both keys — the incident"
+    );
 
-        // With the gate: the same schedule, the same reading, the key withheld.
-        let mut rig = Rig::new(true);
-        let mut st = model.init_state();
-        enter_and_age_past_refuse(&mut rig, &model, &mut st);
-        let b = rig.reading_in(&st, "gated")?;
-        assert!(b.wait >= Duration::from_millis(1100), "{b:?}");
-        assert_projects(&rig, &b, &st, "gated");
-        assert_gate_is_the_guard(&model, &b, &st, "gated");
-        assert!(refuses(&b, false), "the gate withholds the key: {b:?}");
-        assert!(!model.fire("DriverKey", &mut st));
-        assert_eq!(rig.read_all(), b"\r", "the program reads exactly its Enter");
-        assert_eq!(rig.reading().queued, 0);
-        Ok(())
-    });
+    // With the gate: the same schedule, the same reading, the key withheld.
+    let b = step(&rig, &model, &st, "gated");
+    assert!(b.wait >= STALL_AFTER, "{b:?}");
+    assert_eq!(gate(&b, false, true), Gate::Refuse, "withheld: {b:?}");
+    assert!(!model.fire("DriverKey", &mut st));
+    assert_eq!(rig.read_all(), b"\r", "the program reads exactly its Enter");
+    assert_eq!(rig.reading().queued, 0);
 }

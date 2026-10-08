@@ -2,87 +2,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! WASM-PROCESS CENSUS (OB-8..OB-12) — the L0-FREEZE obligation carried to the
-//! OTHER process this source tree ships: the wasm renderer modules
-//! (`crates/aterm-wasm` CPU, `crates/aterm-gpu-web` GPU/WebGL2,
-//! `crates/aterm-effects-web` effects overlay) that load into the Electron
-//! renderer page. Until 2026-07-14 this process was the census's named
-//! coverage gap ("the wasm surface is a different process, outside the
-//! one-process deadlock domain" — the REVIEWED_VENDORED_CRATES winit audit).
+//! Wasm-process census (OB-8..OB-12): the L0 freeze obligation for the wasm
+//! renderer modules (`crates/aterm-wasm` CPU, `crates/aterm-gpu-web`
+//! GPU/WebGL2) that load into the Electron renderer page.
 //!
-//! WHAT THE SURVEY FOUND (2026-07-14), and what this census therefore is:
+//! * The process is single-threaded by target: the modules build only for
+//!   `wasm32-unknown-unknown` with no `+atomics` and no shared memory, so a
+//!   `std::sync::Mutex` is uncontended and ABBA deadlock is impossible. The
+//!   lock-order obligation is vacuous here; that posture is printed every run
+//!   and kept honest by the OB-12 tripwire.
+//! * L0 freeze does transfer: the JS event loop hosting the module (page main
+//!   thread or the engine's Web Worker) is liveness-critical, and a long
+//!   synchronous export blocks it. The closure shares `aterm-grid`, so the same
+//!   `// COST: UNBOUNDED(<dim>)` sinks apply, with no worker thread to offload
+//!   to. `resize` exports detach via `resize_offloading_scrollback` and the
+//!   rewrap runs in a later host task (`pump_reflow`).
 //!
-//! * THE PROCESS IS SINGLE-THREADED — BY TARGET, NOT BY CONVENTION. The web
-//!   renderers build ONLY for `wasm32-unknown-unknown` (tools/wasm-bench/run.sh
-//!   and `xtask gate cells-foreign`'s wasm-cpu/wasm-gpu cells),
-//!   with no `+atomics` target feature and no SharedArrayBuffer shared
-//!   memory anywhere in the build configuration. On that target std threads
-//!   do not exist at runtime, so a `std::sync::Mutex` is uncontended by
-//!   construction: ABBA deadlock (OB-7's class) requires two threads and is
-//!   IMPOSSIBLE; a re-entrant self-lock panics loudly instead of blocking.
-//!   The LOCK-ORDER obligation is therefore VACUOUS for this process — it is
-//!   documented as a posture (printed every run) and kept honest by the
-//!   OB-12 tripwire, NOT implemented as dead graph machinery.
-//! * THE OBLIGATION THAT DOES TRANSFER IS L0-FREEZE. The JS event loop
-//!   hosting the module instance (the page main thread, or the one Web
-//!   Worker the host constructs the engine in) is the liveness-critical
-//!   context — the browser-tab analog of the winit main thread. A long
-//!   synchronous wasm export blocks input, rendering, and every other task
-//!   on that loop. The derived wasm closure SHARES `aterm-grid`, so the
-//!   exact same three `// COST: UNBOUNDED(<dim>)` sinks apply — but the
-//!   native mitigation does NOT: there is no worker thread to offload to.
-//! * THE STANDING REAL FINDING OF THE SURVEY — CLOSED 2026-07-14: both
-//!   terminal-bearing modules' `resize` exports called `Terminal::resize`
-//!   SYNCHRONOUSLY (the pre-a69a6bb3 shape the native app fixed), so the
-//!   wasm tab could freeze on a width reflow where the native app cannot.
-//!   FIXED by the COOPERATIVE offload (repair menu option 1): `resize` now
-//!   detaches via `resize_offloading_scrollback` (O(1)) and the one-shot
-//!   rewrap runs in a later host task (`pump_reflow`, with render-grace and
-//!   output-backlog safety nets for hosts that never pump) — no thread
-//!   needed. The registry entries were removed when the fix landed (OB-11
-//!   went stale-RED, the celebration path); [`WASM_STANDING_HAZARDS`] is
-//!   EMPTY today, and any reintroduced synchronous reach is RED via OB-10
-//!   immediately.
+//! Obligations (fail-closed; `[OB-n]` tags in the diagnostics):
 //!
-//! The obligations (each fail-closed; `[OB-n]` tags in the diagnostics):
+//! * OB-8 scan-set + marker coherence: the closure is derived from the root
+//!   crates' manifests (`scan_set::derive_process_scan_set`; an underivable
+//!   workspace stops the census). Every `COST: UNBOUNDED` marker in it maps to
+//!   a registered sink, and every registered sink defined inside it is marked.
+//! * OB-9 entry-point roots: each wasm root crate yields at least one public
+//!   fn (every `wasm_bindgen` export is a `pub fn`, a sound
+//!   over-approximation), so a parse regression cannot empty the surface.
+//! * OB-10 no entry point synchronously reaches an unbounded sink, via the
+//!   engine `term` field (`self.term.resize(..)`) or a direct sink call,
+//!   unless registered as a standing finding (OB-11), which is reported every
+//!   run.
+//! * OB-11 standing-finding registry coherence, both ways: every entry carries
+//!   a written finding and is re-detected this run (a fixed hazard makes a
+//!   stale entry red until removed); every detected hazard is registered.
+//! * OB-12 single-threaded tripwire: the shipped closure contains no
+//!   thread-spawn vocabulary (`thread::spawn(`, `thread::Builder`,
+//!   `Worker::new(`) outside test/kani/native-only items. Shipping wasm
+//!   threads fails the build until lock order is extended to this process.
 //!
-//! * OB-8  scan-set + marker coherence: the wasm-process closure is DERIVED
-//!   from the root crates' manifests (`scan_set::derive_process_scan_set`,
-//!   the same machinery and rules as OB-7's GUI closure — an underivable
-//!   workspace stops the census, never a guessed scope). Every
-//!   `// COST: UNBOUNDED(<dim>)` marker in the derived wasm closure must map
-//!   to a registered sink, and every registered sink whose def_file lies
-//!   INSIDE the wasm closure must still be marked (both directions).
-//! * OB-9  entry-point roots: every declared wasm ROOT crate must yield at
-//!   least one PUBLIC fn — the JS-callable surface (every `wasm_bindgen`
-//!   export is a `pub fn`, so the public-fn set over-approximates the export
-//!   set, the sound direction). A parse regression cannot silently shrink
-//!   the walked surface to nothing.
-//! * OB-10 no wasm entry point may SYNCHRONOUSLY reach an UNBOUNDED sink —
-//!   via the engine `term` field (`self.term.resize(..)`, the modeled
-//!   Terminal hop) or by calling a registered sink directly — unless the
-//!   site is a registered standing finding (OB-11), which is reported as a
-//!   candidate L0 hazard every run, never silently passed.
-//! * OB-11 standing-finding registry coherence, fail-closed BOTH ways: every
-//!   entry must carry a written finding AND still be detected at its
-//!   registered fn/file this run (fixed hazard ⇒ stale entry ⇒ RED until
-//!   removed — the celebration path); every detected hazard must be
-//!   registered or OB-10 fails. Because entries are matched by re-DETECTION,
-//!   renaming the `term` field out of the hop vocabulary also goes RED here
-//!   (the lexical model cannot rot silently).
-//! * OB-12 single-threaded posture tripwire: the shipped wasm closure must
-//!   contain ZERO thread-spawn vocabulary (`thread::spawn(`,
-//!   `thread::Builder`, `Worker::new(`) outside `#[cfg(test)]`/`#[cfg(kani)]`/
-//!   `#[test]`/`#[cfg(not(target_arch = "wasm32"))]`-gated items. This is
-//!   the evidence that keeps the OB-7-is-vacuous posture honest per run: if
-//!   aterm ever ships wasm threads (+atomics), this fails the build until
-//!   the lock-order obligation is EXTENDED to this process — extension, not
-//!   waiver, is the only repair.
-//!
-//! Consumers (same fan-out as the sibling censuses, so the runner and the gate
-//! cannot diverge): the fused `tools/freeze-safety-gate/build.rs` build
-//! (obligation 4), and the `aterm-census` bin (`targo --unverified run -p
-//! aterm-census -- --wasm`).
+//! Consumers: `tools/freeze-safety-gate/build.rs` and the `aterm-census` bin
+//! (`targo --unverified run -p aterm-census -- --wasm`).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -94,21 +52,14 @@ use crate::{
     parse_source_fns, scan_set, sink_dim, sink_file, strip_line_comment,
 };
 
-/// The wasm renderer modules — the cdylib crates that load into the Electron
-/// renderer page. One page = one census run; the closure is the UNION of the
-/// three modules' manifest closures (they share every engine crate, and a
-/// hazard in any module freezes the same page/worker event loop).
-pub const WASM_ROOT_CRATES: &[&str] = &[
-    "crates/aterm-effects-web",
-    "crates/aterm-gpu-web",
-    "crates/aterm-wasm",
-];
+/// The wasm renderer modules (cdylib crates loaded into the Electron renderer
+/// page). The closure is the union of their manifest closures, since a hazard
+/// in any module freezes the same event loop.
+pub const WASM_ROOT_CRATES: &[&str] = &["crates/aterm-gpu-web", "crates/aterm-wasm"];
 
-/// Item gates whose code never compiles into the SHIPPED wasm32 module:
-/// test/kani items (never shipped anywhere) plus native-only items. Masked
-/// before the walk and before the OB-12 spawn sweep. Exact-match (fail-closed:
-/// an unrecognized cfg spelling is NOT masked — a spawn token under it fails
-/// OB-12 and forces a re-audit rather than being silently excused).
+/// Item gates whose code never compiles into the shipped wasm32 module
+/// (test/kani and native-only items), masked before the walk and the OB-12
+/// sweep. Exact-match: an unrecognized cfg spelling is not masked.
 const WASM_UNSHIPPED_GATES: &[&str] = &[
     "#[cfg(test)]",
     "#[cfg(kani)]",
@@ -116,20 +67,15 @@ const WASM_UNSHIPPED_GATES: &[&str] = &[
     "#[cfg(not(target_arch = \"wasm32\"))]",
 ];
 
-/// Thread-spawn vocabulary: any of these in the shipped wasm closure breaks
-/// the single-threaded posture (OB-12). `thread::spawn(` also matches
-/// `std::thread::spawn(` and `wasm_thread::spawn(`; `thread::Builder` catches
-/// the named-builder form; `Worker::new(` catches in-module web_sys Worker
-/// construction (a worker spawned from JS is a separate instance with its own
-/// linear memory — a separate process in census terms — but a worker spawned
-/// from INSIDE the module would be new machinery to audit).
+/// Thread-spawn vocabulary that breaks the single-threaded posture (OB-12).
+/// `thread::spawn(` also matches `std::`/`wasm_thread::` forms;
+/// `Worker::new(` catches a worker spawned from inside the module (one spawned
+/// from JS is a separate instance).
 const SPAWN_TOKENS: &[&str] = &["thread::spawn(", "thread::Builder", "Worker::new("];
 
-/// A REGISTERED standing finding: a known, real, deliberately-unfixed
-/// synchronous unbounded reach in the wasm process. NOT a waiver — the
-/// difference is enforced: each entry is re-DETECTED every run (stale = RED),
-/// reprinted every run as a candidate L0 hazard with its full finding text,
-/// and never subtracts from the walked surface.
+/// A registered standing finding: a known, deliberately unfixed synchronous
+/// unbounded reach. Re-detected every run (stale = red), reprinted as a
+/// candidate L0 hazard, and never subtracted from the walked surface.
 struct StandingWasmHazard {
     /// The fn the hazard lives in (as defined at `def_file`).
     fn_symbol: &'static str,
@@ -140,16 +86,9 @@ struct StandingWasmHazard {
     finding: &'static str,
 }
 
-/// EMPTY since 2026-07-14: the survey's two findings (both terminal-bearing
-/// modules' `resize` exports calling `Terminal::resize` synchronously) were
-/// FIXED by the cooperative offload — `AtermTerminal::resize` /
-/// `AtermGpuTerminal::resize` now detach via `resize_offloading_scrollback`
-/// and defer the one-shot rewrap to a later host task (`pump_reflow` + the
-/// render-grace / output-backlog safety nets), so no export reaches the width
-/// reflow synchronously. The entries went stale-RED under OB-11 the moment
-/// the fix landed and were removed (the celebration path). The registry and
-/// its machinery stay: any future deliberately-unfixed reach must be
-/// registered here WITH its written candidate-L0 finding, or OB-10 is RED.
+/// Empty: no export reaches the width reflow synchronously. A future
+/// deliberately-unfixed reach must be registered here with its written
+/// finding, or OB-10 is red.
 const WASM_STANDING_HAZARDS: &[StandingWasmHazard] = &[];
 
 /// The honest limits of this census, printed verbatim in every RED diagnostic
@@ -174,10 +113,8 @@ pub const WASM_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         derived closure the same masked way.
 ";
 
-/// The thread/lock posture of the wasm process — printed EVERY run (GREEN or
-/// RED), because the honest conclusion of the survey IS the deliverable: the
-/// lock-order obligation is vacuous here, and this paragraph plus the OB-12
-/// tripwire are its evidence, re-stated and re-verified per run.
+/// The thread/lock posture of the wasm process, printed every run: lock order
+/// is vacuous here, with the OB-12 tripwire as evidence.
 pub const WASM_THREADING_POSTURE: &str =
     "    THREAD/LOCK POSTURE of the wasm process (why the LOCK-ORDER obligation is
     VACUOUS here — the evidence, re-verified every run by OB-12):
@@ -211,11 +148,10 @@ struct WasmTermHop {
     line: String,
 }
 
-/// Detect synchronous calls to an UNBOUNDED Terminal method through the wasm
-/// modules' engine-field naming discipline: the receiver identifier
+/// Detect synchronous calls to an unbounded Terminal method: the receiver
 /// immediately before `.{method}(` must be exactly `term` (matches
-/// `self.term.resize(..)` and a `term.resize(..)` local rebind; does NOT match
-/// `t.resize(`, `self.rgba.resize(`, `.resize_surface(`).
+/// `self.term.resize(..)` and a `term` local; not `t.resize(`,
+/// `self.rgba.resize(`, `.resize_surface(`).
 fn wasm_term_hops(body: &[String]) -> Vec<WasmTermHop> {
     let mut out = Vec::new();
     for raw in body {
@@ -299,7 +235,7 @@ fn spawn_sites(root: &Path, scan_dirs: &[String]) -> Vec<SpawnSite> {
     hits
 }
 
-/// Append the WHY + repair block for an OB-10 violation (the wasm repair menu
+/// Append the why + repair block for an OB-10 violation (the wasm repair menu
 /// differs from the native one: there is no worker thread to offload to).
 fn append_wasm_why_and_repair(log: &mut String) {
     let _ = writeln!(
@@ -326,9 +262,8 @@ fn append_wasm_why_and_repair(log: &mut String) {
     );
 }
 
-/// Run the wasm-process census over the aterm checkout at `root`. Pure
-/// function of the source tree (no cargo, no network, no build artifacts) —
-/// safe inside a build script, same as the sibling censuses.
+/// Run the wasm-process census over the checkout at `root`. A pure function
+/// of the source tree, safe inside a build script.
 pub fn run_wasm_census(root: &Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
@@ -379,11 +314,8 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         );
     }
 
-    // [OB-8] Marker <-> registry coherence over the DERIVED wasm closure. The
-    // registry side is conditional on the sink's crate being IN this closure
-    // (a sink in a GUI-only crate is the mainloop census's obligation, not
-    // ours) — today all three sinks live in aterm-grid, which the wasm
-    // closure shares.
+    // [OB-8] Marker <-> registry coherence over the derived closure. The
+    // registry side applies only to sinks whose crate is in this closure.
     let markers = collect_closure_markers(root, &scan.scan_dirs);
     for m in &markers {
         if !UNBOUNDED_REGISTRY.iter().any(|u| u.symbol == m.symbol) {
@@ -419,7 +351,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         }
     }
 
-    // Build the ROOT-crate call graph over the SHIPPED wasm32 surface.
+    // Build the ROOT-crate call graph over the shipped wasm32 surface.
     let mut fns: Vec<GuiFn> = Vec::new();
     let mut pub_count: std::collections::BTreeMap<&str, usize> = Default::default();
     for rc in WASM_ROOT_CRATES {
@@ -437,9 +369,8 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
             parse_source_fns(&masked, &rel, &mut fns);
         }
     }
-    // Entry points: fully-public fns (every wasm_bindgen export is `pub fn`,
-    // so this over-approximates the JS-callable surface — sound). `pub(crate)`
-    // and friends are not exports.
+    // Entry points: fully-public fns (a sound over-approximation of the
+    // `wasm_bindgen` exports).
     let mut roots: Vec<usize> = Vec::new();
     for (idx, f) in fns.iter().enumerate() {
         let def = f.body.first().map(String::as_str).unwrap_or("");
@@ -513,8 +444,8 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         path.join(" -> ")
     };
 
-    // Detect every reachable synchronous unbounded reach; classify each as a
-    // registered STANDING FINDING (reported) or an OB-10 violation (RED).
+    // Classify each synchronous unbounded reach as a registered standing
+    // finding (reported) or an OB-10 violation (red).
     let mut matched_hazards: std::collections::BTreeSet<usize> = Default::default();
     let mut standing_reported = 0usize;
     let mut standing: Vec<String> = Vec::new();
@@ -666,7 +597,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         failures += 1;
     }
 
-    // The posture is printed EVERY run — it is the documented conclusion, not
+    // The posture is printed every run — it is the documented conclusion, not
     // a failure artifact.
     let _ = write!(log, "{WASM_THREADING_POSTURE}");
 
@@ -714,14 +645,13 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan_set::test_fixtures::{repo_root, synth_tree};
 
     fn body(src: &str) -> Vec<String> {
         src.lines().map(|l| l.to_string()).collect()
     }
 
-    // ------------------------------------------------------------------
     // Unit tests: the wasm engine-hop detector and the shipped-surface mask.
-    // ------------------------------------------------------------------
 
     #[test]
     fn wasm_term_hop_flags_the_field_and_rebind_shapes() {
@@ -740,7 +670,7 @@ mod tests {
         assert!(wasm_term_hops(&body("        self.rgba.resize(n, 0);")).is_empty());
         // The test-local `t` receiver.
         assert!(wasm_term_hops(&body("        t.resize(0, 0);")).is_empty());
-        // A DIFFERENT method on the engine field.
+        // A different method on the engine field.
         assert!(wasm_term_hops(&body("        self.term.process(bytes);")).is_empty());
         // `resize_surface` must not match the `resize` method token.
         assert!(
@@ -783,30 +713,13 @@ mod tests {
         assert!(masked.contains("fn shipped"), "masked:\n{masked}");
     }
 
-    // ------------------------------------------------------------------
-    // Synthetic-tree tests: end-to-end runs against a minimal fabricated
-    // wasm workspace, GREEN (standing findings reported) and RED per
-    // obligation. Marker lines are assembled (never literal) so this file
-    // can never satisfy — or mask — a real marker.
-    // ------------------------------------------------------------------
-
-    fn synth_tree(name: &str, files: &[(String, String)]) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("aterm-wasm-census-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for (rel, contents) in files {
-            let path = root.join(rel);
-            std::fs::create_dir_all(path.parent().expect("rel has a parent")).expect("mkdir");
-            std::fs::write(&path, contents).expect("write synth file");
-        }
-        root
-    }
+    // Synthetic-tree tests: end-to-end runs against a fabricated wasm
+    // workspace, green and red per obligation. Marker lines are assembled so
+    // this file can never satisfy or mask a real marker.
 
     /// A minimal derivable workspace whose wasm closure carries the marked
-    /// sinks: the shared manifest fixture plus the three wasm root crates,
-    /// each depending on aterm-grid (so the derived closure includes the
-    /// marker files) — aterm-gui exists too (the fixture's GUI root), which
-    /// mirrors the real tree.
+    /// sinks: the shared manifest fixture plus the wasm root crates, each
+    /// depending on aterm-grid.
     fn synth_wasm_base() -> Vec<(String, String)> {
         let m = "// COST: UNBOUNDED"; // assembled so this line is never a marker
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(&[
@@ -836,8 +749,8 @@ mod tests {
             "crates/aterm-grid/src/lib.rs".to_string(),
             "// stub\n".to_string(),
         ));
-        // The three wasm root crates, each with a workspace dep on aterm-grid.
-        for rc in ["aterm-wasm", "aterm-gpu-web", "aterm-effects-web"] {
+        // The two wasm root crates, each with a workspace dep on aterm-grid.
+        for rc in ["aterm-wasm", "aterm-gpu-web"] {
             files.push((
                 format!("crates/{rc}/Cargo.toml"),
                 format!(
@@ -846,20 +759,13 @@ mod tests {
                 ),
             ));
         }
-        // The root manifest needs aterm-grid in [workspace.dependencies]; the
-        // fixture already added it via the extras list above. The wasm roots
-        // are NOT deps of aterm-gui — they are their own process roots.
-        files.push((
-            "crates/aterm-effects-web/src/lib.rs".to_string(),
-            "pub fn rain_overlay() {}\n".to_string(),
-        ));
+        // aterm-grid is already in [workspace.dependencies] via the extras;
+        // the wasm roots are their own process roots, not deps of aterm-gui.
         files
     }
 
-    /// The FIXED (2026-07-14 cooperative-offload) resize shapes of the two
-    /// terminal-bearing modules: `resize` detaches via the sanctioned
-    /// `resize_offloading_scrollback` boundary and a `pump_reflow` export
-    /// drives the deferred rewrap — no synchronous `term.resize(` hop left.
+    /// The resize shapes of the two terminal-bearing modules: `resize` detaches
+    /// via `resize_offloading_scrollback` and `pump_reflow` drives the rewrap.
     fn synth_fixed_roots() -> Vec<(String, String)> {
         vec![
             (
@@ -890,7 +796,7 @@ mod tests {
     fn synthetic_wasm_tree_with_offloaded_resize_is_green_with_zero_findings() {
         let mut files = synth_wasm_base();
         files.extend(synth_fixed_roots());
-        let root = synth_tree("green", &files);
+        let root = synth_tree("aterm-wasm-census", "green", &files);
         let out = run_wasm_census(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "expected GREEN, got:\n{}", out.log);
@@ -911,9 +817,8 @@ mod tests {
         );
     }
 
-    /// The regression tripwire that matters most after the fix: putting the
-    /// synchronous `self.term.resize(..)` hop BACK into a resize export is an
-    /// immediate OB-10 RED (the registry is empty — nothing sanctions it).
+    /// Putting a synchronous `self.term.resize(..)` back into a resize export
+    /// is an immediate OB-10 red.
     #[test]
     fn synthetic_reintroduced_sync_resize_is_red_ob10() {
         let mut files = synth_wasm_base();
@@ -924,7 +829,7 @@ mod tests {
              self.term.resize(rows, cols);\n}\n"
                 .to_string(),
         ));
-        let root = synth_tree("red-reintroduced", &files);
+        let root = synth_tree("aterm-wasm-census", "red-reintroduced", &files);
         let out = run_wasm_census(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
@@ -947,12 +852,12 @@ mod tests {
         // A NEW public export whose helper synchronously resizes: not in the
         // standing registry -> must be RED with the path.
         files.push((
-            "crates/aterm-effects-web/src/extra.rs".to_string(),
+            "crates/aterm-gpu-web/src/extra.rs".to_string(),
             "pub fn set_columns(&mut self, cols: u16) {\n    apply_cols(self, cols);\n}\n\
              fn apply_cols(s: &mut S, cols: u16) {\n    s.term.resize(s.rows, cols);\n}\n"
                 .to_string(),
         ));
-        let root = synth_tree("red-ob10", &files);
+        let root = synth_tree("aterm-wasm-census", "red-ob10", &files);
         let out = run_wasm_census(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
@@ -979,7 +884,7 @@ mod tests {
              let lines = reflow_scrollback_lines(&lines, cols);\n}\n"
                 .to_string(),
         ));
-        let root = synth_tree("red-direct", &files);
+        let root = synth_tree("aterm-wasm-census", "red-direct", &files);
         let out = run_wasm_census(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
@@ -990,27 +895,19 @@ mod tests {
         );
     }
 
-    // NOTE: the OB-11 stale-entry path ("a registered hazard was fixed →
-    // RED until the entry is removed") was exercised end-to-end FOR REAL on
-    // 2026-07-14: the cooperative-offload fix landed, both registered
-    // entries stopped re-detecting, the census went RED with the exact
-    // "NOT re-detected … remove the entry" diagnostic, and the entries were
-    // removed (the celebration path). With WASM_STANDING_HAZARDS now a
-    // compile-time-empty const, that arm cannot be driven from a synthetic
-    // tree (entries cannot be injected per-test); the reintroduction
-    // tripwire above covers the live regression class, and the OB-11 loops
-    // re-engage the day a new entry is registered.
+    // The OB-11 stale-entry path cannot be driven synthetically while
+    // `WASM_STANDING_HAZARDS` is an empty const.
 
     #[test]
     fn synthetic_unmasked_spawn_in_closure_is_red_ob12_and_gated_spawn_is_not() {
-        // (a) An UNGATED spawn in a closure crate: posture broken -> RED.
+        // (a) An ungated spawn in a closure crate: posture broken -> RED.
         let mut files = synth_wasm_base();
         files.extend(synth_fixed_roots());
         files.push((
             "crates/aterm-grid/src/worker.rs".to_string(),
             "pub fn kick() {\n    std::thread::spawn(|| {});\n}\n".to_string(),
         ));
-        let root = synth_tree("red-ob12", &files);
+        let root = synth_tree("aterm-wasm-census", "red-ob12", &files);
         let out = run_wasm_census(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
@@ -1028,7 +925,7 @@ mod tests {
              pub fn kick() {\n    std::thread::spawn(|| {});\n}\n"
                 .to_string(),
         ));
-        let root = synth_tree("green-gated-spawn", &files);
+        let root = synth_tree("aterm-wasm-census", "green-gated-spawn", &files);
         let out = run_wasm_census(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(
@@ -1045,7 +942,7 @@ mod tests {
             .filter(|(rel, _)| !rel.starts_with("crates/aterm-gpu-web/"))
             .chain(synth_fixed_roots().into_iter().take(1))
             .collect();
-        let root = synth_tree("red-ob8", &files);
+        let root = synth_tree("aterm-wasm-census", "red-ob8", &files);
         let out = run_wasm_census(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
@@ -1056,25 +953,11 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Real-tree obligations: `cargo test -p aterm-census` is itself teeth.
-    // ------------------------------------------------------------------
+    // Real-tree obligations.
 
-    fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("crates/aterm-census lives two levels under the repo root")
-            .to_path_buf()
-    }
-
-    /// Since the 2026-07-14 cooperative-offload fix NO export reaches the width
-    /// reflow synchronously, and the standing registry is empty. A standing
-    /// block and a nonzero standing count print only for a registered entry, so
-    /// the empty registry is the whole claim. The live tree is not re-walked
-    /// here: `tools/freeze-safety-gate`'s build runs this census on every
-    /// `verify --fast`, where an unregistered sync hop fails OB-10 and a
-    /// thread-spawn token fails OB-12.
+    /// No export reaches the width reflow synchronously and the standing
+    /// registry is empty. The live tree is walked by
+    /// `tools/freeze-safety-gate`'s build, not here.
     #[test]
     fn no_wasm_standing_hazard_is_registered() {
         assert!(
@@ -1085,9 +968,7 @@ mod tests {
 
     #[test]
     fn standing_hazards_resolve_on_this_tree() {
-        // Trivially empty since the 2026-07-14 fix; kept as teeth for any
-        // future entry (a registered finding must carry its analysis and
-        // still resolve at its def site).
+        // Any future entry must carry its analysis and resolve at its def site.
         let root = repo_root();
         for h in WASM_STANDING_HAZARDS {
             assert!(
@@ -1104,12 +985,10 @@ mod tests {
         }
     }
 
-    /// The derived WASM-process closure, pinned (the GUI canary's twin). A
-    /// LEGITIMATE dependency change updates the pin — the review diff is the
-    /// audit trail; an unexpected delta means the graph or the derivation
-    /// drifted. PROVENANCE: derived 2026-07-14 from the three web modules'
-    /// manifests (engine edges default-features = false — the disk tier and
-    /// its libc/zstd closure are OUT, unlike the GUI closure).
+    /// The derived wasm-process closure, pinned. A legitimate dependency change
+    /// updates the pin; an unexpected delta means the graph or derivation
+    /// drifted. Engine edges use `default-features = false`, so the disk tier
+    /// and its libc/zstd closure are out.
     ///
     /// # `aterm-uds` is an OVER-APPROXIMATION, not browser code
     ///
@@ -1157,11 +1036,10 @@ mod tests {
     /// `aterm-alloc` and `aterm-bits` lost the same edge from `aterm-core` but
     /// stay: other crates in the closure still reach them.
     ///
-    /// # `aterm-tempfile` and `aterm-ffi-types` LEFT the closure, 2026-09-25
+    /// # `aterm-tempfile` LEFT the closure, 2026-09-25
     ///
     /// `aterm-tempfile` left with aterm-grid's unused normal edge (it served
-    /// only a never-constructed disk-spill budget), and `aterm-ffi-types` with
-    /// aterm-selection's unused edge (its unused C-ABI mirror types).
+    /// only a never-constructed disk-spill budget).
     ///
     /// # `aterm-messages` ENTERED the closure, 2026-09-28 (38 -> 39)
     ///
@@ -1176,14 +1054,10 @@ mod tests {
             "crates/aterm-bits/src",
             "crates/aterm-codec/src",
             "crates/aterm-core/src",
-            // Entered the closure 2026-09-24: aterm-shell-integration names
-            // its per-build script folder by a SHA-256 of the script set, so
-            // no other build can rewrite what this one's tabs source.
-            // Dependency-free, lock-free and thread-free — pure arithmetic.
+            // aterm-shell-integration names its per-build script folder by a
+            // SHA-256 of the script set. Dependency-, lock- and thread-free.
             "crates/aterm-digest/src",
-            "crates/aterm-effects-web/src",
             "crates/aterm-effects/src",
-            "crates/aterm-error/src",
             "crates/aterm-gpu-web/src",
             "crates/aterm-gpu/src",
             "crates/aterm-grapheme/src",
@@ -1192,35 +1066,22 @@ mod tests {
             "crates/aterm-lexicon/src",
             "crates/aterm-log/src",
             "crates/aterm-lz4/src",
-            // Entered 2026-09-28 when aterm-render took the message band's
-            // composition (round 26, design ruling 331 of
-            // docs/DESIGN-unified-messages-2026-09-21.md) and aterm-wasm its
-            // `notice`/`messages` exports: clockless (its own fence greps its
-            // sources for a clock read), no thread vocabulary (OB-12 scans it
-            // here), zero `COST: UNBOUNDED` markers (OB-8), and every new
-            // export bounded by the engine's caps — three live rows, the
-            // 512-record ring, 60 mints a minute (OB-10). Its one dependency,
-            // aterm-time, was already pinned.
+            // aterm-render composes the message band and aterm-wasm exports
+            // `notice`/`messages`: clockless, no thread vocabulary, no
+            // `COST: UNBOUNDED` markers, and exports bounded by the engine's
+            // caps.
             "crates/aterm-messages/src",
             "crates/aterm-objc/src",
             "crates/aterm-parser/src",
-            // Entered the closure when the first-party PNG codec replaced
-            // `png` and the flate2/miniz_oxide compression stack behind it:
-            // aterm-render is in the web modules' graph and decodes inline
-            // images through it. Pure Rust over `aterm-codec`'s inflate, with
-            // no C build and no libc — which is precisely why it can be here
-            // when the crate it replaced brought a build script.
+            // aterm-render decodes inline images through it; pure Rust over
+            // `aterm-codec`'s inflate, no C build and no libc.
             "crates/aterm-png/src",
             "crates/aterm-policy/src",
             "crates/aterm-predict/src",
             "crates/aterm-provenance/src",
-            // Entered the closure when the first-party regular-expression
-            // engine replaced `regex` (+ regex-automata, regex-syntax,
-            // aho-corasick): aterm-selection and aterm-search compile patterns
-            // through it, and both are in the web modules' graph. Dependency-
-            // free and lock-free, so it adds no thread or lock vocabulary here.
+            // aterm-selection and aterm-search compile patterns through it.
+            // Dependency- and lock-free.
             "crates/aterm-regex/src",
-            "crates/aterm-render-api/src",
             "crates/aterm-render/src",
             "crates/aterm-rle/src",
             "crates/aterm-scene/src",
@@ -1229,18 +1090,12 @@ mod tests {
             "crates/aterm-selection/src",
             "crates/aterm-shell-integration/src",
             "crates/aterm-sixel/src",
-            // Entered the closure when the first-party clock replaced
-            // `web-time`: aterm-core, -types, -effects, -gpu and -predict all
-            // sample time through it, and on wasm it IS the shim that keeps
-            // `Instant::now()` off the panicking std path.
+            // The clock for aterm-core, -types, -effects, -gpu and -predict;
+            // on wasm it keeps `Instant::now()` off the panicking std path.
             "crates/aterm-time/src",
             "crates/aterm-toml/src",
             "crates/aterm-types/src",
-            // NOT browser code — see the over-approximation note on this test.
-            // Reached only through aterm-shell-integration's
-            // `cfg(any(unix, windows))` section, which wasm32-unknown-unknown
-            // never satisfies; the derivation counts cfg-target deps IN on
-            // every platform because it does not evaluate cfg predicates.
+            // Not browser code: see the over-approximation note on this test.
             "crates/aterm-uds/src",
             "crates/aterm-vi/src",
             "crates/aterm-wasm/src",

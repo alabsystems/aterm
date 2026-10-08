@@ -24,13 +24,15 @@ use aterm_render::{
     floor_selection_fg, rgb_to_u32,
 };
 
-fn renderer() -> Option<Renderer> {
-    Renderer::from_system(18.0, Theme::default()).map(|mut r| {
-        // Deterministic pixels: block on the lazy fallback parses so a parse
-        // landing between two renders can't recolour a "must not change" frame.
-        r.debug_block_on_lazy_fallbacks();
-        r
-    })
+fn renderer() -> Renderer {
+    Renderer::from_system(18.0, Theme::default())
+        .map(|mut r| {
+            // Deterministic pixels: block on the lazy fallback parses so a parse
+            // landing between two renders can't recolour a "must not change" frame.
+            r.debug_block_on_lazy_fallbacks();
+            r
+        })
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u32> {
@@ -50,19 +52,16 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
 /// CPU consult sites: glyph blit, combining blit, pass 3's underline colour,
 /// pass 3's strike/overline colour, and pass 3b's AA undercurl.
 ///
-/// The curl is called out because it is a SEPARATE pass with its OWN colour
-/// derivation (a fresh `InkWalk`/`CharFgWalk`, not pass 3's advanced ones), and
-/// it drifted: until ed9f774b the CPU curl kept the cell's own fg after ink.
+/// The curl is called out because it is a SEPARATE pass, which once derived
+/// its OWN colour (a fresh `InkWalk`/`CharFgWalk`; it now blends the ink pass 3
+/// records), and it drifted: until ed9f774b the CPU curl kept the cell's own fg after ink.
 /// The straight-underline cell does not cover it — `\x1b[4m` never reaches
 /// pass 3b. The GPU twin (`ink_gpu_matches_cpu`) gained its curly cell in that
 /// same fix; this CPU-only proof did not, and it is the only one that runs on a
 /// host without a working wgpu device.
 #[test]
 fn ink_renders_byte_identically_to_sgr_fg_recolor() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let ink: [u8; 3] = [0x7C, 0xC8, 0xFF];
     let (rows, cols) = (2usize, 16usize);
 
@@ -131,10 +130,7 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
 /// BLOCK is procedurally drawn at coverage 255 across the whole cell.
 #[test]
 fn ink_endpoint_exact_at_full_coverage() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(1, 4);
     term.process("\x1b[?25l█".as_bytes());
@@ -161,10 +157,7 @@ fn ink_endpoint_exact_at_full_coverage() {
 #[test]
 fn ink_then_selection_floor_applies_in_that_order() {
     use aterm_core::selection::{SelectionSide, SelectionType};
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(1, 4);
     term.process("\x1b[?25l█".as_bytes());
@@ -208,10 +201,7 @@ fn ink_then_selection_floor_applies_in_that_order() {
 /// readability against the cell's own bg. Same endpoint-exact pin as above.
 #[test]
 fn ink_then_min_contrast_floor_applies_in_that_order() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(1, 4);
     term.process("\x1b[?25l█".as_bytes());
@@ -250,10 +240,7 @@ fn ink_then_min_contrast_floor_applies_in_that_order() {
 /// the underline follows ink exactly (solid fill == exact ink bytes).
 #[test]
 fn sgr58_explicit_underline_color_wins_over_ink() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let ink_a: [u8; 3] = [0xFF, 0x00, 0x00];
     let ink_b: [u8; 3] = [0x00, 0xFF, 0x00];
@@ -306,10 +293,7 @@ fn sgr58_explicit_underline_color_wins_over_ink() {
 /// column alone is inert (that column carries no glyph and no decoration).
 #[test]
 fn wide_cjk_continuation_only_ink_is_inert() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let mut term = Terminal::new(1, 6);
     term.process("\x1b[?25l猫".as_bytes());
     let base = rend.render_input(&term.cell_frame(1, 6)).pixels.clone();
@@ -400,16 +384,14 @@ fn ink_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
 /// it follows the repo's manual-timing idiom:
 ///
 /// ```sh
-/// cargo test -p aterm-render --release --test ink \
-///   bench_ink_apply -- --ignored --nocapture
+/// targo --unverified test -p aterm-render --release --test render_suite -- \
+///   ink::bench_ink_apply --ignored --nocapture
 /// ```
 #[test]
-#[ignore = "perf gate (design §7.4): run manually in --release with --ignored --nocapture"]
+#[ignore = "perf gate (design §7.4): run manually: --release --test render_suite -- ink:: --ignored --nocapture"]
 fn bench_ink_apply() {
     use std::time::Instant;
-    let Some(mut rend) = renderer() else {
-        panic!("bench needs a system monospace font");
-    };
+    let mut rend = renderer();
     let (rows, cols) = (40usize, 120usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Program output must change the row PRISM WAKE decorates. A TUI can keep
-//! its caret on an unchanged composer while repainting a timer elsewhere.
+//! Program output must change the row the prism wake decorates. A TUI can
+//! keep its caret on an unchanged composer while repainting a timer elsewhere.
 
 use std::time::{Duration, Instant};
 
@@ -399,9 +399,9 @@ fn real_cell_observations_refine_the_attribution_snapshot_model() {
 
     assert_eq!(visited, model.actions.iter().map(|a| a.name).collect());
 
-    // Reproduce the historical convenience-path shape through the shipping
-    // low-level API: pass existing ink as if globally changed token meant row
-    // damage. The projection MUST reject its real (wrong) licence decision.
+    // A wrong licence input through the low-level API: pass existing ink as if
+    // a globally changed token meant row damage. The projection must reject
+    // its (wrong) licence decision.
     let mut wrong = OutputStreak::new(17);
     assert!(!wrong.note_output(1, &[(0, 0, 0)], h.now, false));
     let wrong_licence = wrong.note_output(2, &[(0, 0, 0)], h.now, false);

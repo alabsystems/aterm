@@ -1,34 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Burst-slicing certificate (v0.5.2 perf pass).
+//! Chunked feeding is equivalent to one `process()` of the whole burst.
 //!
-//! The PTY reader now slices a 64 KiB read into <=8 KiB chunks, RELEASING the single
-//! terminal mutex between chunks (`aterm-gui/src/spawn.rs`), so a keystroke typed
-//! during an output flood is no longer starved waiting on the whole burst's
-//! `process()` (~75-185 us). That lock-hold reduction is a FREE win only if feeding the
-//! VT engine in chunks is BYTE-IDENTICAL to one `process()` of the whole burst — and
-//! the reader accumulates per-chunk `take_response()` replies exactly as one final
-//! `take_response()` would.
+//! The PTY reader slices a 64 KiB read into <=8 KiB chunks and releases the
+//! terminal mutex between them (`aterm-gui/src/spawn.rs`), so a keystroke is not
+//! starved behind a flood. That is sound only if chunked feeding is
+//! byte-identical to one call, and per-chunk `take_response()` replies
+//! concatenate to what one final `take_response()` would return.
 //!
-//! The parser is a streaming state machine, so the equivalence holds; this test
-//! discharges that obligation CONCRETELY (not by an abstract model): over a >8 KiB
-//! corpus whose SGR/CSI escape sequences, multibyte CJK runs, and DSR query replies
-//! straddle the chunk boundaries, the final visible grid AND the concatenated query
-//! responses are identical for a whole-burst feed vs every chunking — down to one byte
-//! at a time (which splits every escape sequence), the real 8 KiB slice, and off-by-one
-//! around it. If a future change makes the engine sensitive to read boundaries, this
-//! reddens.
+//! Over a >8 KiB corpus whose SGR/CSI sequences, multibyte CJK runs and DSR
+//! queries straddle chunk boundaries, the final grid and the concatenated
+//! responses match for every chunking: one byte at a time (splitting every
+//! escape), the real 8 KiB slice, and off-by-one around it.
 //!
-//! One byte at a time is not merely a parser stress: a lone decoded multibyte char
-//! dispatches `print` (the per-glyph writer) while a coalesced run dispatches
-//! `print_unicode_bulk` (the batched writer). So this certificate is ALSO the oracle
-//! for batched-vs-per-char grid equivalence in the wide-glyph write path, and the
-//! corpus below carries the cases that path is sensitive to: Hangul (the whole
-//! Korean-text lead), a wide glyph landing on the last column (wrap + BCE tail blank),
-//! and DECSLRM with the cursor parked OUTSIDE the margin span (where the batched
-//! writer used to keep an unclamped row limit for the whole row — see
-//! `hangul_run_under_decslrm_matches_per_char_writes`).
+//! One byte at a time also exercises the per-glyph writer (`print`) where a
+//! coalesced run takes the batched one (`print_unicode_bulk`), so this is the
+//! batched-vs-per-char oracle for wide glyphs too. The corpus carries Hangul, a
+//! wide glyph landing on the last column (wrap + BCE tail blank), and DECSLRM
+//! with the cursor outside the margin span
+//! (`hangul_run_under_decslrm_matches_per_char_writes`).
 
 use aterm_core::terminal::Terminal;
 
@@ -40,7 +31,7 @@ const HANGUL: &str = "\u{C548}\u{B155}\u{D558}\u{C138}\u{C694}";
 /// A >8 KiB deterministic corpus mixing the surfaces most sensitive to chunk splits:
 /// multi-byte CSI/SGR sequences, multibyte UTF-8 (CJK and Hangul) runs, truecolor SGR,
 /// newlines (scroll), wide glyphs landing on the last column (autowrap + BCE tail
-/// blank), DECSLRM margin spans entered from OUTSIDE, and DSR cursor-position queries
+/// blank), DECSLRM margin spans entered from outside, and DSR cursor-position queries
 /// whose reply depends on the cursor position when processed.
 fn corpus() -> Vec<u8> {
     let mut v = Vec::new();
@@ -53,7 +44,7 @@ fn corpus() -> Vec<u8> {
         v.extend_from_slice(" \u{6F22}\u{C790}\u{6F22}\u{C790}".as_bytes()); // 漢자漢자
         v.extend_from_slice(b" \x1b[38;2;200;100;50mtruecolor\x1b[0m");
         if i % 3 == 0 {
-            // RIGHT-EDGE WRAP: park the cursor two columns short of the 80-column
+            // RIGHT-EDGE wrap: park the cursor two columns short of the 80-column
             // right edge, fill them, then start a wide run at the last column. The
             // glyph cannot fit, so the writer must blank the skipped tail cell with
             // a BCE blank and wrap — in the same column whether the run arrives
@@ -62,10 +53,10 @@ fn corpus() -> Vec<u8> {
             v.extend_from_slice(HANGUL.as_bytes());
         }
         if i % 5 == 0 {
-            // DECSLRM with the cursor OUTSIDE the span. `CSI ? 69 h` arms
+            // DECSLRM with the cursor outside the span. `CSI ? 69 h` arms
             // DECLRMM, `CSI 11 ; 41 s` sets the span to columns 11-41 (1-based)
-            // and homes the cursor to column 1 — LEFT of margins.left. A wide run
-            // started there crosses INTO the span mid-row, which is precisely
+            // and homes the cursor to column 1 — left of margins.left. A wide run
+            // started there crosses into the span mid-row, which is precisely
             // where a row limit derived once per row diverges from one re-derived
             // per glyph. The DSR right after it compares the resulting cursor
             // column byte-for-byte, on top of the grid comparison.
@@ -120,7 +111,7 @@ fn chunked_process_is_byte_identical_to_whole_burst() {
         "corpus must exercise the reply path (DSR), else the response check is vacuous"
     );
 
-    // Every chunking must reproduce the reference EXACTLY: 1 byte (splits every
+    // Every chunking must reproduce the reference exactly: 1 byte (splits every
     // sequence), small odd sizes, and the real 8 KiB slice +/- 1.
     for &chunk in &[1usize, 7, 64, 8191, 8192, 8193] {
         let (grid, resp) = feed(&data, chunk);
@@ -135,17 +126,31 @@ fn chunked_process_is_byte_identical_to_whole_burst() {
     }
 }
 
-/// The minimal, human-readable form of the divergence the corpus now covers,
-/// pinned on its own so a failure names the cause instead of "the corpus moved".
-///
-/// A run of 30 `한` starting at column 1 with a DECSLRM span of columns 11-41:
-/// the per-glyph writer re-derives the margin-clamped row limit before every
-/// syllable, so it wraps at the right margin (20 syllables on the row, the rest
-/// resuming at the left margin); the batched writer used to derive that limit
-/// ONCE, while the cursor was still outside the span, and so ran all 30 past the
-/// right margin on one row. Coalesced input hits the batched writer, one byte at
-/// a time hits the per-glyph one — identical bytes, and they must fold to an
-/// identical grid.
+/// RIS does not retract the replies earlier bytes generated: they are owed to
+/// the PTY peer, so a query and an `ESC c` in one slice answer exactly as when
+/// a slice boundary falls between them.
+#[test]
+fn ris_keeps_the_replies_queries_before_it_generated() {
+    let data = b"\x1b[c\x1b[>c\x1b[6n\x1bc";
+    let (whole_grid, whole_resp) = feed(data, data.len());
+    assert!(
+        whole_resp.ends_with(b"\x1b[1;1R"),
+        "the burst answers its DSR: {whole_resp:?}"
+    );
+    for chunk in 1..data.len() {
+        assert_eq!(
+            feed(data, chunk),
+            (whole_grid.clone(), whole_resp.clone()),
+            "chunk size {chunk}"
+        );
+    }
+}
+
+/// A run of 30 `한` from column 1 under a DECSLRM span of columns 11-41: the
+/// per-glyph writer re-derives the margin-clamped row limit before every
+/// syllable and wraps at the right margin (20 on the row, the rest resuming at
+/// the left margin); the batched writer must do the same even though the
+/// cursor starts outside the span.
 #[test]
 fn hangul_run_under_decslrm_matches_per_char_writes() {
     let mut v = Vec::new();

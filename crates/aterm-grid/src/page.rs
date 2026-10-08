@@ -10,20 +10,16 @@
 //!
 //! ## Memory Pooling
 //!
-//! The [`PageStore`] maintains a free list of recycled pages to avoid
-//! allocation overhead in hot paths. When pages are freed, they're added
-//! to the free list. New allocations first check the free list before
-//! allocating fresh memory.
+//! [`PageStore`] keeps a free list of recycled pages; new allocations take
+//! from it before allocating fresh memory. [`PageStore::preheat`]
+//! pre-allocates pages during initialization.
 //!
-//! Use [`PageStore::preheat`] to pre-allocate pages during initialization,
-//! eliminating allocation latency during normal operation.
+//! ## API Safety
 //!
-//! ## API Safety (#5573)
-//!
-//! [`Page`] is crate-internal — external code cannot construct or hold raw
-//! pages. [`PageSlice`] is accessible for downstream test scaffolding via
-//! `feature = "testing"`, but is not re-exported at the crate root or
-//! through the `aterm-core` facade. Production consumers use [`Row`] and
+//! [`Page`] is crate-internal: external code cannot construct or hold raw
+//! pages. [`PageSlice`] is reachable for downstream test scaffolding via
+//! `feature = "testing"` but is not re-exported at the crate root or through
+//! the `aterm-core` facade. Production consumers use [`Row`] and
 //! [`PageStore`] as their safe API boundary.
 //!
 #![allow(
@@ -39,11 +35,10 @@ use std::ptr::NonNull;
 
 /// Page size: 64 KB in production, 256 bytes under Kani.
 ///
-/// CBMC cannot model the full 64KB array symbolically — verification
-/// times out at 300s+ even with preheat bounds reduced to 2. 256 bytes
-/// is sufficient to verify offset arithmetic, allocation bounds, and
-/// memory pooling invariants (all are PAGE_SIZE-relative, not absolute).
-/// Follows the existing `KANI_MAX_ROWS`/`KANI_MAX_COLS` pattern in this crate.
+/// CBMC cannot model a 64 KB array symbolically in reasonable time. Offset
+/// arithmetic, allocation bounds and pooling invariants are all
+/// PAGE_SIZE-relative, so 256 bytes suffices (like `KANI_MAX_ROWS` /
+/// `KANI_MAX_COLS`).
 #[cfg(not(kani))]
 pub const PAGE_SIZE: usize = 64 * 1024;
 #[cfg(kani)]
@@ -55,7 +50,7 @@ pub const PAGE_SIZE: usize = 256;
 /// Uses `UnsafeCell` for interior mutability to satisfy Stacked Borrows -
 /// arena-allocated data may be accessed through multiple independent borrows.
 ///
-/// **Crate-internal (#5573):** external code cannot construct `Page` values.
+/// Crate-internal: external code cannot construct `Page` values.
 #[repr(C, align(4096))]
 pub(crate) struct Page {
     /// Raw page data wrapped in UnsafeCell for interior mutability.
@@ -99,16 +94,12 @@ impl Page {
     /// Create a new zeroed page.
     #[must_use]
     pub(crate) fn new() -> Box<Self> {
-        // Use calloc for zero-initialized, page-aligned memory
-        Box::new(Self {
-            data: UnsafeCell::new([0; PAGE_SIZE]),
-        })
+        Box::default()
     }
 
     /// Get a mutable pointer to the page data.
     ///
-    /// # Safety
-    /// The caller must ensure no other references to this data exist.
+    /// Writing through it requires that no other reference to the bytes exists.
     #[inline]
     pub(crate) fn data_ptr(&self) -> *mut u8 {
         self.data.get().cast()
@@ -229,8 +220,7 @@ pub type PageId = usize;
 
 /// A typed slice allocated within a page.
 ///
-/// **Crate-internal (#5573).** Production consumers use [`Row`] as their safe
-/// boundary. `PageSlice` is not accessible outside `aterm-grid`.
+/// Crate-internal: production consumers use [`Row`] as their safe boundary.
 #[derive(Debug)]
 pub struct PageSlice<T> {
     ptr: NonNull<T>,

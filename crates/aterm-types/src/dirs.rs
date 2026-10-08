@@ -17,10 +17,6 @@ use std::path::PathBuf;
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        // An EMPTY or RELATIVE `$HOME` is not a home: `PathBuf::from("")` made every
-        // caller's prefix relative to the cwd (the aterm front door laid
-        // `<cwd>/Library/Application Support/aterm/pkg/agents` under it, 2026-09-18),
-        // so such a value falls through to the passwd lookup like an unset one.
         home_from_env(std::env::var_os("HOME").as_deref())
             .or_else(|| passwd_home_dir(current_uid()))
     }
@@ -47,11 +43,9 @@ unsafe extern "C" {
     fn libc_getuid() -> u32;
 }
 
-/// `$HOME` as a home, or `None`: an EMPTY or RELATIVE value is no home at all.
-/// `PathBuf::from("")` used to make every caller's prefix relative to the cwd (the
-/// aterm front door laid `<cwd>/Library/Application Support/aterm/pkg/agents` under
-/// it, 2026-09-18), so such a value falls through to the passwd lookup like an
-/// unset one. Pure, so the rule is testable without touching the process env.
+/// `$HOME` as a home, or `None`: an EMPTY or RELATIVE value is no home at all
+/// (it would make every caller's prefix relative to the cwd), so it falls
+/// through to the passwd lookup like an unset one.
 #[cfg(unix)]
 fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     value.map(PathBuf::from).filter(|home| home.is_absolute())
@@ -62,12 +56,8 @@ fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
 /// Byte-wise (`fs::read`, not `read_to_string`): `/etc/passwd` is Unix
 /// boundary data, so it stays byte-exact end to end — the `:`-delimited
 /// format needs no UTF-8 decode (the uid field is ASCII digits and the home
-/// field goes straight into a `PathBuf`, which is bytes on Unix). On the
-/// UTF-8 files every real system has, this walks the exact same fields to
-/// the exact same result as the old string parse; it merely never takes the
-/// strict-UTF-8 reject the hardened Trust gate refutes (`read_to_string`
-/// failing the whole lookup over a stray legacy byte in, say, another
-/// user's GECOS field).
+/// field goes straight into a `PathBuf`, which is bytes on Unix), and a
+/// stray legacy byte in another user's GECOS field cannot fail the lookup.
 #[cfg(unix)]
 fn passwd_home_dir(uid: u32) -> Option<PathBuf> {
     let contents = std::fs::read("/etc/passwd").ok()?;
@@ -141,9 +131,7 @@ pub fn aterm_config_path() -> Option<PathBuf> {
 /// exactly the machines where a wrong path is a silent
 /// no-op — settings that never load and a hot-reload watcher that watches
 /// nothing. `aterm-gui`'s `app_config::config_path` delegates here, so the
-/// window and every CLI diagnostic name ONE file: measured 2026-09-22 on
-/// Windows, `aterm-gui --help` printed the Unix literal `~/.config/aterm/aterm.toml`
-/// while the window it describes was reading `%APPDATA%\aterm\aterm.toml`.
+/// window and every CLI diagnostic name ONE file.
 #[must_use]
 pub fn resolve_aterm_config_path(
     xdg_config_home: Option<&OsStr>,
@@ -230,14 +218,10 @@ pub fn resolve_data_dir(platform: DataPlatform) -> Option<PathBuf> {
 /// - in a development build only, the `ATERM_STATE_HOME` seam ([`crate::dev_seam!`],
 ///   read as [`state_dir`] reads it; the override root itself, and a relative value is
 ///   refused as `None`, as [`state_dir`] refuses it) — so an instance given its own
-///   state root also keeps its layout and its journals there (ruling 406,
-///   2026-09-29). Before, these followed only the OS data dir: an instance on the
-///   owner's `$HOME` with its own state root took the owner's `session.toml` and
-///   claimed — and deleted — the owner's dead journals, whose crash evidence sits in
-///   a logs folder it could not see;
-/// - otherwise [`data_dir`]`/aterm`, exactly as before on every platform (on Linux
-///   that is `$XDG_DATA_HOME`/`.local/share`, NOT [`state_dir`]'s `.local/state`: a
-///   shipped path does not move).
+///   state root never takes the owner's `session.toml` or claims the owner's crash
+///   journals (ruling 406);
+/// - otherwise [`data_dir`]`/aterm` (on Linux `$XDG_DATA_HOME`/`.local/share`,
+///   NOT [`state_dir`]'s `.local/state`: a shipped path does not move).
 ///
 /// `None` only when nothing resolves (a relative override, or no data dir).
 #[must_use]
@@ -267,10 +251,10 @@ pub fn resolve_aterm_data_dir(
 /// resolves no root ([`aterm_data_dir`], [`state_dir`]), but the process asked for one
 /// of its own, so it never stands in for the person whose `$HOME` it shares.
 ///
-/// What it gates is what such a process writes to the MACHINE (ruling 409,
-/// 2026-09-29): the `[machine]` settings (Universal Control, Spotlight) are the Mac's,
+/// What it gates is what such a process writes to the MACHINE (ruling 409):
+/// the `[machine]` settings (Universal Control, Spotlight) are the Mac's,
 /// not the instance's, so a launch's daily apply (`atpkg::machine::launch_apply_due`),
-/// a package pass's carried `[machine]` edit and Settings' Apply now stand aside under
+/// a package pass's carried `[machine]` edit and Settings' Apply stand aside under
 /// it, and a window says so to the passes it spawns (`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`,
 /// ruling 410), since the `atpkg` beside a development build may compile no seam. `aterm
 /// pkg machine apply` typed by a person still applies.
@@ -367,9 +351,7 @@ pub fn resolve_state_dir(
 /// - in a development build only, `$ATERM_STATE_HOME/logs` when that seam is set
 ///   ([`crate::dev_seam!`], as [`state_dir`] reads it; a relative value is refused as
 ///   `None`, as [`state_dir`] refuses it) — an instance given its own state root keeps
-///   its log there too, never in the person's log beside their real instance's
-///   (2026-09-24: a headless test instance's supervisor lines landed in the owner's
-///   `~/Library/Logs/aterm/aterm.log`);
+///   its log there too, never in the person's log beside their real instance's;
 /// - **macOS**: `$HOME/Library/Logs/aterm` (Console.app's convention);
 /// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm/logs` (absolute) or
 ///   `$HOME/.local/state/aterm/logs` — a Linux home has no business growing a `~/Library`;
@@ -441,8 +423,7 @@ pub fn identities_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// An empty or relative `$HOME` is not a home (2026-09-18): it fell through to
-    /// a cwd-relative prefix before, and the front door laid `agents/` under it.
+    /// An empty or relative `$HOME` is not a home.
     #[cfg(unix)]
     #[test]
     fn an_empty_or_relative_home_is_no_home() {
@@ -457,7 +438,7 @@ mod tests {
         );
     }
 
-    /// THE aterm.toml RULE (2026-09-22), pure: a set XDG_CONFIG_HOME wins on
+    /// THE aterm.toml RULE, pure: a set XDG_CONFIG_HOME wins on
     /// every platform; Windows then takes %APPDATA%; everyone else HOME/.config
     /// — the macOS arm included, which is the one way this differs from the OS
     /// config-dir convention (Application Support). An empty value is an unset
@@ -514,7 +495,7 @@ mod tests {
         );
     }
 
-    /// THE STATE ROOT RULE (session identities, 2026-09-17), pure: the
+    /// THE STATE ROOT RULE, pure: the
     /// override wins when absolute and is refused when relative; without it the
     /// platform default applies; and `identities_dir` is one segment below.
     #[test]
@@ -524,10 +505,7 @@ mod tests {
             xdg_state_home: Some(PathBuf::from("/xdg/state")),
             local_app_data: Some(PathBuf::from(r"C:\Users\who\AppData\Local")),
         };
-        // Spelled per host: `/tmp/...` is NOT absolute on Windows (no drive, no
-        // root — `Path::is_absolute` is false there), so the Unix literal made
-        // this assertion fail for a reason that has nothing to do with the
-        // resolver (measured 2026-09-22, the first Windows run of this suite).
+        // Spelled per host: `/tmp/...` is NOT absolute on Windows.
         #[cfg(not(windows))]
         let absolute_override = PathBuf::from("/tmp/aterm-state");
         #[cfg(windows)]
@@ -572,11 +550,11 @@ mod tests {
         );
     }
 
-    /// THE LOG DIRECTORY RULE (packages.log beside aterm.log, 2026-09-23), pure: macOS
+    /// THE LOG DIRECTORY RULE, pure: macOS
     /// keeps Console.app's `~/Library/Logs/aterm`, other Unix the XDG state dir's
     /// `aterm/logs` (a relative XDG value falls through to the home default), and nothing
     /// to resolve from is `None`. An instance given its own state root logs under it
-    /// (2026-09-24), a relative one is refused like the state root it would be.
+    /// and a relative one is refused like the state root it would be.
     #[test]
     fn logs_dir_follows_each_platforms_convention() {
         let platform = StatePlatform {
@@ -624,7 +602,7 @@ mod tests {
         assert_eq!(resolve_logs_dir(None, StatePlatform::default()), None);
     }
 
-    /// THE DATA ROOT RULE (ruling 406, 2026-09-29), pure: the state-home seam is the
+    /// THE DATA ROOT RULE (ruling 406), pure: the state-home seam is the
     /// data root itself when absolute — the restore manifest and the crash journals
     /// follow an instance given its own state root — and is refused when relative,
     /// never falling through to the owner's folder; unset, it is the OS data dir's
@@ -707,13 +685,9 @@ mod tests {
     /// A PRIVATE STATE ROOT IS THE SEAM BEING SET, and nothing else (ruling 409): the
     /// helper reads the same seam `aterm_data_dir` and `state_dir` read, so a process
     /// they place in its own root is one that leaves the machine's `[machine]` settings
-    /// alone. The environment is not mutated here (no lock in this crate), so this only
-    /// checks agreement with whatever the runner inherited, and with the seam unset a
-    /// helper that always answered `false` would pass it (ruling 410). The helper's pin is
-    /// at the process edge: atpkg's `tests/machine_edge.rs` sets the seam unset, absolute,
-    /// empty and relative on a real `atpkg` pass. The decisions that take the answer are
-    /// pinned with it injected (`atpkg::machine`'s `launch_apply_decision`, the window's
-    /// `packages_request_refusal` and `pass_lead`).
+    /// alone. The environment is not mutated here, so this checks agreement with what
+    /// the runner inherited (with the seam unset, an always-`false` helper passes); the
+    /// real pin is atpkg's `tests/machine_edge.rs`.
     #[test]
     fn a_private_state_root_is_the_state_home_seam_set() {
         let seam = crate::dev_seam!("ATERM_STATE_HOME");

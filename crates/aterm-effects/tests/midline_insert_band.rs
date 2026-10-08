@@ -1,39 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **TYPING INSIDE A LIT LINE KEEPS THE TAIL IT PUSHES LIT** (2026-09-24).
-//! The owner, on Linux, in Claude Code's composer: *"when I did a backward
-//! movement, the rainbow cursor trail fractured with black spaces when I
-//! started typing in the middle of a line"*.
+//! Typing inside a lit line keeps the tail it pushes lit.
 //!
 //! The take: a line typed at 12 cps, the caret walked back into it with ←
-//! (the host stamps a navigation key: `clear_typed`, then `note_motion`),
-//! a rest, then six keys typed INSIDE the line. Every key is an insert: the
-//! program rewrites the rest of the line one column on. The content witness
-//! read each of those columns as REPLACED text and melted the whole tail in
-//! 120 ms — the band went black from the caret to the end of the line on
-//! the first key, and each later edit cut another dark stretch out of the
-//! rainbow. Measured before the fix on every shape below: the lit map ended
-//! at the caret on every settled frame after the first key.
+//! (the host stamps a navigation key: `clear_typed`, then `note_motion`), a
+//! rest, then six keys typed inside the line. Every key is an insert: the
+//! program rewrites the rest of the line one column on.
 //!
-//! **The fix** is the shift pass (`Witness::shift_runs`,
-//! `Ribbon::shift_run`, run by `Engine::follow_rows` before the tick): the
-//! tail's glyphs are found where the insert pushed them and their light
-//! moves with them, clocks intact; and a key a hidden-caret composer
-//! reports at the PRINT's end (the line's end) is laid at the insert it made
-//! (`Ribbon::insert_landing`).
+//! The shift pass (`Witness::shift_runs`, `Ribbon::shift_run`, run by
+//! `Engine::follow_rows` before the tick) finds the tail's glyphs where the
+//! insert pushed them and moves their light with them, clocks intact; a key a
+//! hidden-caret composer reports at the print's end is laid at the insert it
+//! made (`Ribbon::insert_landing`).
 //!
-//! The repaint reaches the glass in six shapes ([`Shape`]): `inkish.py`'s
-//! split whole-line redraw, the same bytes in one read, the hide alone in
-//! the first read, Claude Code's own diff frame whole or torn after its
-//! hide, and readline's visible reprint-and-`CUB`. The census is the PLAN's
-//! coverage on the composer row: `#` at ≥ 20 coverage, `.` dark.
+//! The repaint arrives in six shapes ([`Shape`]): `inkish.py`'s split
+//! whole-line redraw, the same bytes in one read, the hide alone in the first
+//! read, Claude Code's own diff frame whole or torn after its hide, and
+//! readline's visible reprint-and-`CUB`. The census is the plan's coverage on
+//! the composer row: `#` at ≥ 20 coverage, `.` dark.
 
+use crate::common::{
+    LIT_COV, caret_sample, class_of, coverage, geom, holes_of, note_blink, observe_caret_row,
+    observe_ribbon_rows, rainbow_cfg,
+};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::rainbow_kitty::TypedClass;
-use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
+use aterm_effects::cursor_glow::{CursorGlow, GlowConfig};
 use std::time::{Duration, Instant};
 
 const CW: usize = 8;
@@ -45,59 +38,8 @@ const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
 /// `inkish.py`'s pause between a redraw's two reads.
 const INK_SPLIT_MS: u64 = 30;
-/// A column is LIT at this planned coverage (the glass census's 20/255).
-const LIT_COV: u8 = 20;
 /// A hole standing longer than this many frames is the defect.
 const HOLE_FRAMES_MAX: usize = 3;
-
-fn geom() -> Geom {
-    Geom {
-        cw: CW,
-        ch: CH,
-        rows: ROWS,
-        cols: COLS,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (COLS * CW) as u16,
-        win_h: (ROWS * CH) as u16,
-        head: 0,
-    }
-}
-
-/// The owner's config: rainbow kitty, tall body, intensity 0.70, dark.
-fn cfg() -> GlowConfig {
-    GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
-    }
-}
-
-/// The host's `typed_class_for` and `glyph_shifted && !spacebar`.
-fn class_of(ch: char) -> (bool, TypedClass) {
-    match ch {
-        ' ' => (false, TypedClass::Space),
-        '!' => (true, TypedClass::Bang),
-        c if c.is_uppercase() => (true, TypedClass::Capital),
-        _ => (false, TypedClass::Glyph),
-    }
-}
 
 /// How the composer's repaint reaches the glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +116,7 @@ impl Host {
         let mut h = Self {
             term,
             glow,
-            cfg: cfg(),
+            cfg: rainbow_cfg(),
             t0: now,
             now,
             last_event: now,
@@ -197,56 +139,31 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// EXACTLY the render path: the frame hold's caret row and every ribbon row
-    /// whether or not the caret is visible, the print anchor fed immediately
+    /// Exactly the render path: the frame hold's caret row and every ribbon
+    /// row whether or not the caret is visible, the print anchor fed just
     /// before the tick (`app_render.rs`), the tick, then the census.
     fn frame(&mut self) {
-        let c = self.term.cursor();
-        let cur = self.term.cursor_visible().then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink {
-            self.blink = epoch;
-            self.glow.note_repaint_blink(self.now);
-        }
-        let alt = self.term.is_alternate_screen();
-        self.glow.note_context(alt);
-        self.term
-            .row_cols_into(usize::from(c.row), &mut self.row_buf);
-        self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            self.glow.observe_ribbon_row(r, &self.row_buf);
-        }
+        let (c, cur) = caret_sample(&self.term);
+        note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
+        self.glow.note_context(self.term.is_alternate_screen());
+        observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+        observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow.observe_print_anchor(self.term.print_anchor());
-        self.glow
-            .tick(cur, self.now, &self.cfg, geom(), &mut self.out);
+        let g = geom(ROWS, COLS, CW, CH);
+        self.glow.tick(cur, self.now, &self.cfg, g, &mut self.out);
         self.record();
     }
 
     fn record(&mut self) {
         let row = self.row;
-        let mut cov = [0u8; COLS];
+        let cov = coverage(&self.glow, geom(ROWS, COLS, CW, CH), row);
+        // Every dark column between the first and last lit one.
+        let holes = holes_of(&cov)
+            .into_iter()
+            .flat_map(|(s, n)| s..s + n)
+            .map(|i| i as u16)
+            .collect();
         let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-        for sg in rib.plan_segments() {
-            let r = ((sg.spine / CH as f32) - 0.5).floor();
-            let c = (sg.x / CW as f32).floor();
-            if r >= 0.0 && c >= 0.0 && r as u16 == row && (c as usize) < COLS {
-                let i = c as usize;
-                cov[i] = cov[i].max(sg.cov);
-            }
-        }
-        let lit: Vec<usize> = (0..COLS).filter(|&i| cov[i] >= LIT_COV).collect();
-        let holes = if lit.len() >= 2 {
-            (lit[0]..=lit[lit.len() - 1])
-                .filter(|&i| cov[i] < LIT_COV)
-                .map(|i| i as u16)
-                .collect()
-        } else {
-            Vec::new()
-        };
         let mut cells: Vec<u16> = rib
             .cells()
             .iter()
@@ -391,10 +308,10 @@ impl Host {
     }
 
     /// One Left arrow `ms` after the last event, stamped as the host stamps
-    /// a navigation key (`clear_typed` then `note_motion`).
+    /// a navigation key (`clear_typed_keeping_hand` then `note_motion`).
     fn left(&mut self, ms: u64) {
         self.schedule(ms);
-        self.glow.clear_typed(self.now);
+        self.glow.clear_typed_keeping_hand(self.now);
         self.glow.note_motion(self.now);
         let before = self.text.clone();
         self.caret -= 1;
@@ -507,46 +424,51 @@ fn dark_text_cols(h: &Host, i: usize) -> Vec<usize> {
         .collect()
 }
 
-/// **THE LAW**, on every shape, at three depths into the line and two arrow
-/// paces: on every settled frame after a key typed inside the line, the
-/// band covers the WHOLE text — the prefix, the keys, and the tail they
-/// pushed — and no hole stands in it.
+/// On every shape, at three depths and two arrow paces: every settled frame
+/// after a key typed inside the line has the band covering the whole text
+/// (prefix, keys, and the pushed tail) with no hole.
 #[test]
 fn typing_inside_a_lit_line_keeps_the_tail_it_pushes_lit() {
-    for shape in SHAPES {
-        for back in [3usize, 8, 15] {
-            for left_ms in [60u64, 150] {
-                let (h, settled) = take(shape, back, left_ms);
-                let what = format!("{shape:?} back={back} left_ms={left_ms}");
-                assert_eq!(
-                    h.text,
-                    {
-                        let at = LINE.len() - back;
-                        format!("{}{MID}{}", &LINE[..at], &LINE[at..])
-                    },
-                    "{what}: the composer holds the edited line"
-                );
-                for &i in &settled {
-                    let dark = dark_text_cols(&h, i);
-                    assert!(
-                        dark.is_empty(),
-                        "{what}: text columns {dark:?} dark after a key typed inside the line\n{}",
-                        h.dump(i.saturating_sub(6), i)
-                    );
-                }
-                h.assert_no_standing_hole(&what);
-                let tally = h.glow.admission_tally();
-                assert_eq!(tally.declined, 0, "{what}: nothing declined");
-            }
+    // Each take replays on its own host and clock, so the 36 run on the
+    // binary's threads (`par_map`, 2026-10-05: 2.7 s on one thread alone);
+    // the first failing take in this order raises its own panic.
+    let takes: Vec<(Shape, usize, u64)> = SHAPES
+        .into_iter()
+        .flat_map(|shape| {
+            [3usize, 8, 15]
+                .into_iter()
+                .flat_map(move |back| [60u64, 150].map(|left_ms| (shape, back, left_ms)))
+        })
+        .collect();
+    crate::common::par_map(&takes, |&(shape, back, left_ms)| {
+        let (h, settled) = take(shape, back, left_ms);
+        let what = format!("{shape:?} back={back} left_ms={left_ms}");
+        assert_eq!(
+            h.text,
+            {
+                let at = LINE.len() - back;
+                format!("{}{MID}{}", &LINE[..at], &LINE[at..])
+            },
+            "{what}: the composer holds the edited line"
+        );
+        for &i in &settled {
+            let dark = dark_text_cols(&h, i);
+            assert!(
+                dark.is_empty(),
+                "{what}: text columns {dark:?} dark after a key typed inside the line\n{}",
+                h.dump(i.saturating_sub(6), i)
+            );
         }
-    }
+        h.assert_no_standing_hole(&what);
+        let tally = h.glow.admission_tally();
+        assert_eq!(tally.declined, 0, "{what}: nothing declined");
+    });
 }
 
-/// **TEXT A PROGRAM REPLACED DID NOT MOVE** — the negative control. The
-/// same lit line, and then no key at all: the program rewrites the tail
-/// with other text (a completion, a reflow). No block of the tail stands
-/// anywhere along the row, so nothing is carried, and the light under the
-/// replaced letters leaves as it always did (the witness's melt).
+/// Negative control: the same lit line, then no key; the program rewrites the
+/// tail with other text (a completion, a reflow). No tail block stands
+/// anywhere on the row, so nothing is carried and the light under the
+/// replaced letters melts.
 #[test]
 fn a_tail_the_program_rewrote_still_leaves() {
     for shape in [Shape::Visible, Shape::InkWhole, Shape::ClaudeWhole] {
@@ -567,9 +489,8 @@ fn a_tail_the_program_rewrote_still_leaves() {
         h.idle(400);
         let last = h.census.len() - 1;
         let f = &h.census[last];
-        // By CELL, not by the lit map: the plan feathers the band's edge
-        // one column past its last cell, which is the band ending, not
-        // light carried onto the rewritten text.
+        // By cell, not by the lit map: the plan feathers the band's edge one
+        // column past its last cell.
         let kept: Vec<u16> = f
             .cells
             .iter()

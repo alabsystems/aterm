@@ -118,12 +118,7 @@ mod tests {
     fn only_a_final_claude_target_change_replaces_the_marker() {
         use std::os::unix::fs::MetadataExt as _;
 
-        let prefix = std::env::temp_dir().join(format!(
-            "atpkg-claude-activation-notice-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&prefix);
-        std::fs::create_dir_all(&prefix).unwrap();
+        let prefix = crate::testdir::dir("atpkg-claude-activation-notice-");
         let layout = Layout {
             prefix: prefix.clone(),
         };
@@ -164,16 +159,12 @@ mod tests {
         .unwrap();
         note_if_changed(&layout, &before);
         assert_ne!(std::fs::metadata(&marker).unwrap().ino(), first);
-        let _ = std::fs::remove_dir_all(prefix);
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 
     #[test]
     fn a_rolled_back_claude_twin_emits_no_notice() {
-        let prefix = std::env::temp_dir().join(format!(
-            "atpkg-claude-activation-rollback-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&prefix);
+        let prefix = crate::testdir::dir("atpkg-claude-activation-rollback-");
         let layout = Layout {
             prefix: prefix.clone(),
         };
@@ -200,7 +191,7 @@ mod tests {
             !marker_path(&layout).exists(),
             "a pass that restored its original live twin cannot wake the host"
         );
-        let _ = std::fs::remove_dir_all(prefix);
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 
     /// THE CODEX BRANCH IS WOKEN TOO: a pass that moves only `agents/codex`
@@ -209,11 +200,7 @@ mod tests {
     /// go. NEGATIVE CONTROL: the same twin laid again moves nothing.
     #[test]
     fn a_codex_twin_change_replaces_the_marker_too() {
-        let prefix = std::env::temp_dir().join(format!(
-            "atpkg-codex-activation-notice-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&prefix);
+        let prefix = crate::testdir::dir("atpkg-codex-activation-notice-");
         let layout = Layout {
             prefix: prefix.clone(),
         };
@@ -242,6 +229,6 @@ mod tests {
             marker_path(&layout).exists(),
             "a moved Codex twin wakes the host"
         );
-        let _ = std::fs::remove_dir_all(prefix);
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 }

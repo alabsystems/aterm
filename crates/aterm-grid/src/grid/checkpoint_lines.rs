@@ -2,59 +2,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Line-level grid checkpoint primitives (GREEN-ORDER step 4 / design B.3.2).
+//! Line-level grid checkpoint primitives.
 //!
-//! These two methods form the *foundation gate* for `TerminalCheckpoint`:
-//! they project a [`Grid`]'s full cell content (scrollback + visible rows)
-//! into a flat `Vec<Line>` and restore the visible rows back from a slice of
-//! [`Line`]s — with full per-cell fidelity (wide chars, combining marks,
-//! complex/ZWJ graphemes, hyperlinks, RGB colors, SGR flags, and the
-//! per-row wrapped flag).
+//! Project a [`Grid`]'s cell content (scrollback + visible rows) into a flat
+//! `Vec<Line>` and restore visible rows from [`Line`]s, with per-cell fidelity
+//! (wide chars, combining marks, complex/ZWJ graphemes, hyperlinks, RGB
+//! colours, SGR flags, the wrapped flag).
 //!
-//! Both directions reuse the already-tested scrollback conversion paths:
+//! Both directions reuse the scrollback conversion paths, so any fidelity bug
+//! here is also a scrollback bug:
 //! - capture: [`extract_row_extras`](super::scroll_convert) +
-//!   [`row_to_line_with_stored_extras`](super::scroll_convert), the exact pair
-//!   the ring buffer uses when a row scrolls off into scrollback, so a row →
-//!   `Line` projection is faithful by construction (it resolves `StyleId` and
-//!   RGB-overflow colors into the line attrs the same way scrollback does).
-//! - restore: [`fill_row_from_line`](super::Grid::fill_row_from_line), the
-//!   exact path Kitty CSI +T "unscroll" uses to materialize a scrollback
-//!   `Line` back into a visible row (cells + wrapped flag + combining/complex/
-//!   RGB/hyperlink extras).
-//!
-//! Reusing the production scroll paths (rather than a bespoke walk) is what
-//! makes the round-trip honest: any fidelity bug here is also a scrollback
-//! fidelity bug, and is covered by the unit tests below plus the existing
-//! scroll_fill / scroll_convert suites.
+//!   [`row_to_line_with_stored_extras`](super::scroll_convert), the pair a row
+//!   scrolling off into scrollback goes through.
+//! - restore: [`fill_row_from_line`](super::Grid::fill_row_from_line), the path
+//!   Kitty CSI +T "unscroll" uses.
 
 use aterm_scrollback::Line;
 
 use super::Grid;
 
 impl Grid {
-    /// Project the full grid content into a flat list of [`Line`]s.
-    ///
-    /// Layout of the returned vector is **scrollback-then-visible**:
-    /// 1. `0..scrollback_lines()` history lines, oldest first (via the dense
+    /// Project the full grid content into a flat list of [`Line`]s, scrollback
+    /// then visible:
+    /// 1. `0..scrollback_lines()` history lines, oldest first (the dense
     ///    [`history_lines_from`](Self::history_lines_from) walk, whose item `i`
     ///    is [`try_get_history_line(i)`](Self::try_get_history_line)).
-    /// 2. `0..rows()` visible rows, top to bottom, each converted with the
-    ///    same stored-extras path the ring buffer uses for scroll-off.
+    /// 2. `0..rows()` visible rows, top to bottom.
     ///
-    /// History lines that fail to decompress (a corrupt/quarantined cold
-    /// block) are represented as an empty [`Line`] so the index space stays
-    /// dense and the visible-row split on restore remains exact; this is the
-    /// same lossy-but-bounded posture `checkpoint_snapshot` takes for
-    /// scrollback. The common in-memory case never hits this branch.
+    /// A history line that fails to decompress becomes an empty [`Line`], so
+    /// the index space stays dense and the visible split on restore is exact.
     #[must_use]
     #[cfg(test)]
     pub fn checkpoint_lines(&self) -> Vec<Line> {
         let scrollback_count = self.scrollback_lines();
         let mut lines = Vec::with_capacity(scrollback_count + self.rows() as usize);
 
-        // 1) Scrollback history, oldest (idx 0) → newest, through the dense
-        // walk: a decode failure is a placeholder, which keeps the slot dense
-        // with an empty line so the visible split stays exact.
+        // Scrollback history, oldest first; a decode failure becomes an empty
+        // placeholder line.
         lines.extend(
             self.history_lines_from(0)
                 .take(scrollback_count)
@@ -66,38 +50,25 @@ impl Grid {
         lines
     }
 
-    /// Project the visible rows preceded by at most `max_history` lines of the
-    /// MOST RECENT scrollback, in the same dense scrollback-then-visible layout
-    /// `Self::checkpoint_lines` produces.
-    ///
+    /// Project the visible rows preceded by at most `max_history` of the most
+    /// recent scrollback lines, in the layout `Self::checkpoint_lines` produces.
     /// This is the seamless-handoff projection.
-    /// [`Self::checkpoint_visible_lines`] bounded the cost by carrying no history
-    /// at all, which meant every in-session update truncated every tab to a single
-    /// screen — seamless for the shell, lossy for the human reading it. Carrying
-    /// the *whole* ring is the opposite failure: work proportional to an arbitrary
-    /// history inside a parked-reader window measured in milliseconds.
     ///
-    /// Cost is `O((rows + max_history) × cols)` regardless of how deep the ring
-    /// goes. The restore split is unaffected: `restore_grid` reads the LAST `rows`
-    /// lines as the visible grid and everything before them as history, so
-    /// trimming from the FRONT is always sound.
-    ///
-    /// Returns the same thing as [`Self::checkpoint_visible_lines`] when
-    /// `max_history == 0`, and as `Self::checkpoint_lines` when `max_history`
-    /// meets or exceeds [`Self::scrollback_lines`].
+    /// Cost is `O((rows + max_history) × cols)` however deep the ring goes.
+    /// Restore reads the last `rows` lines as the visible grid, so trimming
+    /// from the front is sound. Equals [`Self::checkpoint_visible_lines`] when
+    /// `max_history == 0` and `Self::checkpoint_lines` when `max_history` >=
+    /// [`Self::scrollback_lines`].
     #[must_use]
     pub fn checkpoint_lines_bounded(&self, max_history: usize) -> Vec<Line> {
         let scrollback_count = self.scrollback_lines();
         let keep = scrollback_count.min(max_history);
-        // History is indexed oldest (0) → newest, so the newest `keep` lines are
-        // the tail. Skipping the head is what makes the bound cheap: the skipped
-        // indices are never fetched, so a cold/compressed block is never touched.
+        // The newest `keep` lines are the tail; skipped indices are never
+        // fetched, so their cold blocks are never touched.
         let first = scrollback_count - keep;
         let mut lines = Vec::with_capacity(keep + self.rows() as usize);
-        // The dense history walk from `first`: one decode per warm block /
-        // cold page rather than a per-line tier lookup + clone, and the same
-        // dense-slot posture as `checkpoint_lines` — an unreadable line is a
-        // placeholder, emitted as an empty line so the visible split stays exact.
+        // Dense walk from `first` (one decode per warm block / cold page); an
+        // unreadable line becomes an empty placeholder.
         lines.extend(
             self.history_lines_from(first)
                 .take(keep)
@@ -107,12 +78,9 @@ impl Grid {
         lines
     }
 
-    /// Project only the visible grid rows, excluding scrollback.
-    ///
-    /// Seamless process handoff uses this bounded projection while PTY readers are
-    /// parked: its cost is `O(rows × cols)` regardless of months of history, yet
-    /// restoring it paints the exact screen because checkpoint restore interprets the
-    /// last `rows` serialized lines as the visible grid.
+    /// Project only the visible rows. Costs `O(rows × cols)`, and restore paints
+    /// the exact screen because it reads the last `rows` lines as the visible
+    /// grid.
     #[must_use]
     pub fn checkpoint_visible_lines(&self) -> Vec<Line> {
         let rows = self.rows();
@@ -120,9 +88,8 @@ impl Grid {
         let extras = self.extras();
         let styles = self.styles();
         for r in 0..rows {
-            // A checkpoint carries the live terminal frame, not the user's
-            // independently-scrolled viewport. `row()` applies display_offset;
-            // `row_at_screen()` deliberately ignores it.
+            // A checkpoint carries the live frame, not the scrolled viewport:
+            // `row_at_screen()` ignores display_offset.
             let Some(row) = self.row_at_screen(r) else {
                 lines.push(Line::new());
                 continue;
@@ -136,18 +103,14 @@ impl Grid {
 
     /// Restore the visible rows of this grid from a slice of [`Line`]s.
     ///
-    /// `visible[r]` is written into visible row `r` for `r in 0..rows()` (any
-    /// extra entries past `rows()` are ignored; any missing entries leave the
-    /// corresponding row cleared). Each line's cells, wrapped flag, and extras
-    /// (combining marks, complex/ZWJ chars, RGB colors, hyperlinks) are
-    /// transferred via [`fill_row_from_line`](Self::fill_row_from_line) — the
-    /// same internal placement logic `materialize_from_line` uses, so wide
-    /// chars and grapheme clusters land identically to a live write.
+    /// `visible[r]` is written into visible row `r` for `r in 0..rows()`;
+    /// entries past `rows()` are ignored and missing ones leave the row
+    /// cleared. Cells, wrapped flag and extras go through
+    /// [`fill_row_from_line`](Self::fill_row_from_line), so wide chars and
+    /// graphemes land as a live write would.
     ///
-    /// This does **not** touch scrollback; callers reconstruct scrollback at
-    /// grid-construction time (e.g. by attaching a populated
-    /// `ScrollbackStorage`). It is the inverse of the *visible* half of
-    /// `checkpoint_lines`.
+    /// Scrollback is untouched; callers attach it at grid construction. This is
+    /// the inverse of the visible half of `checkpoint_lines`.
     pub fn restore_visible_from_lines(&mut self, visible: &[Line]) {
         let rows = self.rows();
         let cols = self.cols();
@@ -175,12 +138,9 @@ mod tests {
         Line::with_attrs(text, Rle::new())
     }
 
-    /// Build a grid whose visible rows + scrollback round-trip through the
-    /// line codec, returning `(rebuilt_grid, original_lines)`.
-    ///
-    /// Re-creates a fresh grid of the same size with the captured scrollback
-    /// re-attached (oldest-first) and the visible rows restored — exactly the
-    /// shape `Terminal::from_checkpoint` uses.
+    /// Round-trip a grid through the line codec the way
+    /// `Terminal::from_checkpoint` does: a fresh grid with the scrollback
+    /// re-attached (oldest first) and the visible rows restored.
     fn rebuild_from_lines(rows: u16, cols: u16, lines: &[Line]) -> Grid {
         // Split scrollback (all but the last `rows`) from visible (last `rows`).
         let total = lines.len();
@@ -416,14 +376,9 @@ mod tests {
     #[test]
     fn roundtrip_complex_char() {
         let mut g = Grid::new(2, 10);
-        // A non-BMP / ZWJ emoji sequence stored as a complex char at col 0,
-        // followed by a normal trailing char so the row's cached `len` (which
-        // the test-only `set_cell` only extends on a non-empty write) covers
-        // the complex cell. In the live engine the parser write path maintains
-        // `len`; here we establish it explicitly.
-        // The family emoji is a WIDE (2-cell) ZWJ sequence: it occupies cols
-        // 0-1 (col 1 = wide continuation). Place the trailing normal char at
-        // col 2 so it doesn't collide, and write the wide-continuation spacer.
+        // A wide ZWJ family emoji as a complex char at cols 0-1 (col 1 is the
+        // spacer), then 'Z' at col 2 so the row's `len` covers the complex cell
+        // (the test-only `set_cell` extends `len` only on a non-empty write).
         g.set_cell(0, 2, Cell::new('Z'));
         g.set_cell(
             0,

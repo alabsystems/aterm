@@ -3,37 +3,28 @@
 
 //! True cost: `dom(C) = reach(root) \ reach(root, block C)`.
 //!
-//! The set of packages that would leave the graph if `C` left it — `C` itself
-//! plus everything only `C` was holding in. This is the ONLY sanctioned answer
-//! to "what does this dependency cost", and the reason is measured: in the
-//! Linux cell `softbuffer`'s subtree is 39–45 packages in isolation but its
-//! dominator is 8, because winit already pulls wayland-client and x11rb. A
-//! subtree count double-bills every shared dependency and would tell a carve
-//! plan to delete packages that are not going anywhere.
+//! The set of packages that would leave the graph if `C` left it: `C` plus
+//! everything only `C` was holding in. This is the only sanctioned answer to
+//! "what does this dependency cost"; a subtree count double-bills shared
+//! dependencies (e.g. a subtree of dozens whose dominator is a handful).
 //!
-//! The counterfactual is computed by BLOCKING a node during traversal, never by
-//! mutating the graph, so the same [`crate::model::Graph`] answers every query.
+//! The counterfactual blocks a node during traversal rather than mutating the
+//! graph, so the same [`crate::model::Graph`] answers every query.
 
 use crate::model::{CellSurvey, PkgId};
 use std::collections::BTreeSet;
 
-/// What falls if one package falls.
-///
-/// THIRD-PARTY ONLY, and the qualifier had to be added the hard way. See
-/// [`dom_against`]: a first-party workspace member reached ONLY through
-/// third-party parents is a real thing now — `[patch.crates-io]` puts
-/// `crates/aterm-profiling` and `crates/aterm-arrayvec` under `wgpu` and
-/// nowhere else — and counting those lines billed aterm's own code to the
-/// dependency that "costs" it.
+/// What falls if one package falls, third-party only: a first-party member
+/// reachable only through third-party parents (a `[patch.crates-io]` target)
+/// is not billed to the dependency. See [`dom_against`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DomCost {
-    /// THIRD-PARTY packages removed, INCLUDING the target when the target is
-    /// itself third-party. A leaf nobody else needs costs 1, never 0 —
-    /// `dom(libc) = 1 / 127,772` is a real, quotable number.
+    /// Third-party packages removed, including the target when it is
+    /// third-party. A leaf nobody else needs costs 1, never 0.
     pub pkgs: usize,
     /// Physical `*.rs` lines summed over those packages.
     pub loc: u64,
-    /// The other THIRD-PARTY packages that fall with it, sorted. Empty for a
+    /// The other third-party packages that fall with it, sorted. Empty for a
     /// leaf.
     pub also: Vec<PkgId>,
 }
@@ -46,11 +37,9 @@ pub fn dom(s: &CellSurvey, target: &PkgId) -> DomCost {
 
 /// Every third-party package with its cost, heaviest first.
 ///
-/// This is ~N traversals of an N-node graph and it is deliberately not
-/// cleverer than that: the graph is a few hundred nodes, the reference
-/// implementation does the same thing in about a second, and an incremental
-/// dominator algorithm would be a second definition of the number this whole
-/// program exists to defend.
+/// About N traversals of an N-node graph, deliberately: the graph is a few
+/// hundred nodes, and an incremental dominator algorithm would be a second
+/// definition of the number.
 pub fn ranked(s: &CellSurvey) -> Vec<(PkgId, DomCost)> {
     let base = s.graph.reach(None);
     let mut out: Vec<(PkgId, DomCost)> = s
@@ -69,26 +58,13 @@ fn dom_against(s: &CellSurvey, base: &BTreeSet<PkgId>, target: &PkgId) -> DomCos
     // `BTreeSet::difference` yields ascending order, so `also` is sorted by
     // construction rather than by a second pass.
     for id in base.difference(&without) {
-        // FIRST-PARTY REMOVALS ARE NOT A THIRD-PARTY COST, and this filter is
-        // the whole of that correction. It did not matter until a workspace
-        // member could be reached ONLY through third-party parents, which is
-        // exactly what `[patch.crates-io]` creates: `crates/aterm-profiling`
-        // and `crates/aterm-arrayvec` hang under `wgpu`/`naga` and under
-        // nothing else, so blocking `wgpu` removed them too and their 1,815
-        // lines were added to wgpu's bill. Two symptoms, both real: `wgpu` was
-        // reported 1,815 lines and 2 packages more expensive than it is, and
-        // the survey's own PARTITION CHECK went red — 37 non-nested rows
-        // covering 103 packages / 1,489,245 LOC against a cell holding 101 /
-        // 1,487,430. The check was right; the arithmetic was wrong.
+        // First-party removals are not a third-party cost: `[patch.crates-io]`
+        // targets such as `crates/aterm-profiling` hang only under third-party
+        // parents and would otherwise be billed to them (and break the survey's
+        // partition check).
         //
-        // This is the same class of error as measuring our facade as
-        // upstream's crate (`loc::package_dir`): first-party lines counted as
-        // third-party surface. Both
-        // directions of it flatter the campaign, so both are worth a comment.
-        //
-        // A package with no `facts` entry is counted IN, unchanged: that is a
-        // measurement gap, not evidence of first-partyness, and treating it as
-        // ours would hide it.
+        // A package with no `facts` entry is counted in: a measurement gap is
+        // not evidence of first-partyness.
         if s.facts.get(id).is_some_and(|f| !f.is_third_party) {
             continue;
         }
@@ -104,23 +80,12 @@ fn dom_against(s: &CellSurvey, base: &BTreeSet<PkgId>, target: &PkgId) -> DomCos
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loc::survey_cell;
     use crate::model::{Cell, Graph, PkgFacts};
     use crate::resolve::default_cells;
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-
-    fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("crates/aterm-forge sits two levels under the workspace root")
-            .to_path_buf()
-    }
-
     fn survey(cell_index: usize) -> CellSurvey {
         let cells = default_cells();
-        survey_cell(&repo_root(), &cells[cell_index])
+        crate::loc::real_workspace_survey(&cells[cell_index])
             .unwrap_or_else(|e| panic!("cell must survey offline: {e}"))
     }
 
@@ -192,15 +157,9 @@ mod tests {
         assert_eq!(dom(&s, &PkgId::new("shared", "1.0.0")).pkgs, 1);
     }
 
-    /// Blocking the root frees the WHOLE THIRD-PARTY SURFACE — 4 of the 5
-    /// nodes, not 5.
-    ///
-    /// It asserted 5 until `dom_against` stopped counting first-party
-    /// packages. The root is `aterm` itself, so the fifth node was aterm being
-    /// billed as a cost of depending on aterm. The new number is also the
-    /// stronger statement: `dom(root)` is now exactly `third_party().count()`,
-    /// which is asserted here rather than spelled as a literal, so the two
-    /// definitions of "the surface" cannot drift apart.
+    /// Blocking the root frees the whole third-party surface (4 of 5 nodes;
+    /// the root is first-party). Asserted as `third_party().count()` so the
+    /// two definitions of the surface cannot drift.
     #[test]
     fn blocking_the_root_costs_the_whole_third_party_surface() {
         let s = synthetic();
@@ -214,12 +173,8 @@ mod tests {
         );
     }
 
-    /// THE FILTER IS ARMED. A first-party node reached only through a
-    /// third-party parent is precisely the shape `[patch.crates-io]` creates
-    /// (`crates/aterm-profiling` under `wgpu` and nothing else), and it is the
-    /// shape that made the real survey's partition check go red. Without a
-    /// fixture that HAS one, `dom_against`'s skip could be deleted and every
-    /// other test here would still pass.
+    /// A first-party node reached only through a third-party parent (the
+    /// `[patch.crates-io]` shape) is not counted in the parent's dominator.
     #[test]
     fn a_first_party_node_under_a_third_party_parent_is_not_billed_to_it() {
         let mut s = synthetic();
@@ -270,12 +225,9 @@ mod tests {
     #[test]
     fn naga_falls_with_wgpu_and_libc_has_left_the_surface() {
         let s = survey(0);
-        // THE FLIP: "naga is wgpu's alone" resolved the strong way — BOTH left
-        // the graph when the first-party Metal renderer became the macOS
-        // default and wgpu became the tests' dev-edge oracle. Asserted as
-        // ABSENCE (the libc shape below): a dominator of zero would also be
-        // reported for a package forge simply failed to see, so presence is
-        // the thing to refute directly.
+        // wgpu and naga are absent from mac-arm (the Metal renderer is the
+        // default; wgpu is a dev-edge oracle). Asserted as absence, since a
+        // zero dominator would also be reported for an unseen package.
         for gone in ["wgpu", "wgpu-hal", "wgpu-core", "naga"] {
             assert!(
                 !s.third_party().any(|id| id.name == gone),
@@ -284,27 +236,15 @@ mod tests {
             );
         }
 
-        // `libc` used to be asserted here as "a leaf" — `dom(libc).also` empty.
-        // That assertion still PASSED after libc was retired to the first-party
-        // `crates/aterm-libc`, because a package that is not in the third-party
-        // surface has an empty dominator too. A test that passes both when a
-        // fact holds and when its subject has ceased to exist is not testing the
-        // fact. So the claim is now ABSENCE, stated directly — the same shape
-        // `loc`'s mac-arm ceiling test uses for AccessKit, and for the same
-        // reason: a cost of zero would also be reported for a package forge
-        // simply failed to see.
+        // `libc` is first-party (`crates/aterm-libc`); asserted as absence,
+        // since an empty dominator also holds for a package that is gone.
         assert!(
             !s.third_party().any(|id| id.name == "libc"),
             "libc is patched to crates/aterm-libc and must not be third-party"
         );
 
-        // THE objc2 EXIT (2026-09-05, measured.rs note (6)), in the same
-        // shape: `objc2-app-kit` (1 / 82,976) and `objc2-foundation`
-        // (2 / 60,733) were mac-arm anchors until the W12 + W13 merge ported
-        // the winit fork's and aterm-gui's last family files onto aterm-objc
-        // and retired every family row. Asserted as ABSENCE for the reason
-        // above: a zero-cost row would also be reported for a package forge
-        // failed to see.
+        // The objc2 family is absent from mac-arm (ported onto aterm-objc);
+        // asserted as absence for the same reason.
         for gone in [
             "objc2",
             "objc2-app-kit",
@@ -322,11 +262,9 @@ mod tests {
         }
     }
 
-    /// The shape every `DomCost` owes, over the real mac-arm ranking: a
-    /// dominator costs at least itself and never more than the whole surface,
-    /// and `also` lists the OTHER packages that fall — sorted, without the
-    /// target, one fewer than `pkgs`. The ranking holds every third-party
-    /// package once.
+    /// The shape every `DomCost` owes over the real mac-arm ranking: at least
+    /// itself, at most the whole surface, `also` sorted without the target and
+    /// one fewer than `pkgs`. Each third-party package ranks once.
     #[test]
     fn no_dominator_can_exceed_the_whole_third_party_surface() {
         let s = survey(0);

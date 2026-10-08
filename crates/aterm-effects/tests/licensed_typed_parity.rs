@@ -1,45 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LICENSED-MOVE PARITY — the other half of the license
-//! (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
+//! Licensed-move parity (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
 //!
-//! The license is a PRECONDITION, not a classifier: once a move is licensed —
-//! a fresh key hint stands behind it — the v0.43.0 classifier runs exactly as
-//! it did, and every pixel it lays must be the pixel it laid before. This file
-//! is the proof of that clause, and its golden was captured deliberately:
+//! The license is a precondition, not a classifier: once a move is licensed
+//! (a fresh key hint stands behind it) the classifier runs unchanged, so the
+//! pixels a licensed move lays must not depend on the license seam. This file
+//! pins, per style, a fold over emitted quads, frame fingerprints, spawn
+//! counts, the live light census, momentum and sound cues, using the public
+//! API only.
 //!
-//!   1. the script below was written against the tree WITHOUT the license
-//!      seam (the pre-license `HEAD`), run, and its fold printed;
-//!   2. the number was pasted into `GOLDEN`;
-//!   3. the same script was run against the tree WITH the seam.
+//! The light census reads whichever engine owns the frame (`live_light`): the
+//! rainbow kitty is its v2 engine, whose light is ribbon cells, stars and
+//! meteors, never a v1 spark, so for that style the census reads the `Status`
+//! rows `trail status` reports; the other styles read `live_sparks`.
 //!
-//! So a passing assertion here is a literal before/after equality across the
-//! license commit, per style, over emitted quads, frame fingerprints, spawn
-//! counts, the live light census, momentum, and sound cues. It uses the PUBLIC
-//! API only, so the same file can be replayed against either tree.
+//! Set `ATERM_CAPTURE_TYPED_PARITY=1` to print the fold instead of asserting.
 //!
-//! THE LIGHT CENSUS FORKS ON THE ENGINE THAT OWNS THE FRAME (`live_light`).
-//! Since §17.3 phase 7 of `docs/design/RAINBOW-KITTY-V2.md` the rainbow kitty
-//! IS its v2 engine, whose light is ribbon cells, stars and meteors and never a
-//! v1 spark — `CursorGlow::live_sparks` stays v1's spark census on purpose (the
-//! lib pins that v2 lays no spark) — so for that one style the census reads
-//! the same `Status` rows `trail status` reports. The other eight styles read
-//! `live_sparks` exactly as before, which is why their golden entries did not
-//! move when the fork landed.
-//!
-//! Set `ATERM_CAPTURE_TYPED_PARITY=1` to reprint the fold instead of asserting
-//! (that is how step 1 and step 3 were run).
-//!
-//! AND THE GOLDEN CARRIES ITS OWN CONTROL. A byte-exact constant that has been
-//! RE-BASELINED three times in four days is exactly the shape that quietly
-//! stops testing anything: each re-baseline is a human deciding from prose
-//! that the change was art rather than the seam, and nothing re-checks that
-//! the number can still move for the right reason.
-//! `an_unlicensed_script_moves_every_golden_entry` re-checks it every run —
-//! the identical script with every key hint withheld must move all nine
-//! entries — so the next author re-baselining a rainbow repaint is standing on
-//! a measurement, not on this comment.
+//! The golden carries its own control:
+//! `an_unlicensed_script_moves_every_golden_entry` runs the identical script
+//! with every key hint withheld and requires all nine entries to move.
 
 use std::time::{Duration, Instant};
 
@@ -104,11 +84,10 @@ fn trail_cfg() -> TrailConfig {
     }
 }
 
-/// The live per-cell light population, read from whichever engine owns the
-/// frame: v2's resident ribbon cells + live stars + live meteors while the
-/// rainbow kitty's engine is engaged (`CursorGlow::v2_status` is `Some`
-/// exactly then), v1's spark census for every other style. See the module
-/// header for why this is a fork and not a change to `live_sparks`.
+/// The live per-cell light population from whichever engine owns the frame:
+/// v2's resident ribbon cells + live stars + live meteors while the rainbow
+/// kitty's engine is engaged (`CursorGlow::v2_status` is `Some` exactly then),
+/// v1's spark census for every other style.
 fn live_light(glow: &CursorGlow) -> usize {
     glow.v2_status().map_or_else(
         || glow.live_sparks(),
@@ -116,29 +95,24 @@ fn live_light(glow: &CursorGlow) -> usize {
     )
 }
 
-/// The RESIDENT typed band — the cells the ribbon holds, lit or not. Under v2
-/// `CursorGlow::ribbon_segments` deliberately answers what is LIT on the glass
-/// (boundaries at or over the status coverage floor after the edge-in fade),
-/// so on the very frame a press lays its first cell it reads 0 while the cell
-/// is resident; `Status::cells` keeps the resident count and is what the
-/// split-batch law's "the suffix cut the resident ribbon" is about. For every
-/// other style the two readings are the same count.
+/// The resident typed band: the cells the ribbon holds, lit or not. Under v2
+/// `CursorGlow::ribbon_segments` answers what is lit (after the edge-in fade),
+/// so on the frame a press lays its first cell it reads 0 while the cell is
+/// resident; `Status::cells` keeps the resident count. For other styles the
+/// two readings agree.
 fn resident_ribbon(glow: &CursorGlow) -> usize {
     glow.v2_status()
         .map_or_else(|| glow.ribbon_segments(), |s| s.cells as usize)
 }
 
-/// A TYPED script — the shape the license exists to admit. Six glyph echoes at
+/// A typed script, the shape the license exists to admit: six glyph echoes at
 /// human cadence, a wrap at the right margin, three more glyphs on the new
 /// row, a gesture jump, and the decay tail.
 ///
-/// `licensed` is the SEAM, switched: with it false the identical cursor
-/// trajectory arrives with no key hint behind any of it — the pre-license
-/// denial path, cold program movement. Nothing else about the script changes,
-/// so the difference between the two folds is the license and only the
-/// license. `an_unlicensed_script_moves_every_golden_entry` is the standing
-/// control built on it; see the module header for why a golden that nothing
-/// can redden is the shape this file has to avoid.
+/// With `licensed` false the identical trajectory arrives with no key hint
+/// behind it (cold program movement), so the difference between the two folds
+/// is the license alone. `an_unlicensed_script_moves_every_golden_entry` is
+/// the control built on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TypedScriptOutcome {
     fingerprint: u64,
@@ -235,11 +209,8 @@ fn typed_script_with(c: &GlowConfig, licensed: bool) -> TypedScriptOutcome {
     }
 }
 
-/// RED-FIRST, and it was run that way: replayed against the pre-license tree
-/// this test FAILS (`earned light was wiped by a cold program move`), because
-/// the old denial path reached `clear_denied_move_visuals` and took the ribbon
-/// with it. It is the retention half of the license — the v0.43.0 law that
-/// earned light is never destroyed by someone else's output.
+/// Earned light is never destroyed by someone else's output: a cold program
+/// move must not wipe the ribbon a licensed typed run laid.
 #[test]
 fn earned_light_survives_a_cold_program_move() {
     let g = geom();
@@ -280,12 +251,11 @@ fn earned_light_survives_a_cold_program_move() {
     }
 }
 
-/// One physical keypress can be presented as more than one cursor delta when
-/// the terminal response is split across parser batches. The key's one-shot
-/// license belongs to the first observed move; a later suffix in the same
-/// freshness window must neither borrow that license nor erase the light the
-/// first batch earned. It still becomes the honest source anchor for whatever
-/// arrives next.
+/// One keypress can present as several cursor deltas when the response is
+/// split across parser batches. The key's one-shot license belongs to the
+/// first observed move; a later suffix in the same freshness window neither
+/// borrows it nor erases the light the first batch earned, but becomes the
+/// source anchor for what arrives next.
 #[test]
 fn split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors() {
     let g = geom();
@@ -373,627 +343,24 @@ const ALL_STYLES: [GlowStyle; 9] = [
     GlowStyle::Water,
     GlowStyle::Comet,
 ];
-// `GlowStyle::Classic` is DELIBERATELY ABSENT. This suite's subject is the
-// LICENSE SEAM — every test here asserts that a style draws nothing for a move
-// no keystroke asked for. The salvaged v0.28 engine does not consult that seam
-// at all (it spawns on observed cursor motion, which is what brings the
-// screen-crossing jump comet back), so listing it here would not extend the
-// suite's coverage — it would assert a property the style is defined not to
-// have, and the four failures are immediate. The classic engine's own
-// determinism and idle-zero pins live beside it in `classic_wake`, and its
-// whole-frame fold is pinned by
-// `builtins_are_byte_identical_and_never_touch_the_custom_path`.
+// `GlowStyle::Classic` is absent: every test here asserts that a style draws
+// nothing for a move no keystroke asked for, and the classic engine does not
+// consult the license (it spawns on observed cursor motion). Its determinism
+// and idle-zero pins live in `classic_wake`, and its whole-frame fold is
+// pinned by `builtins_are_byte_identical_and_never_touch_the_custom_path`.
 
 #[test]
 fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
-    // Captured on the PRE-license tree (see the module header).
-    //
-    // ONE ENTRY HAS BEEN RE-BASELINED, deliberately and on the record:
-    // `RainbowKitty` (index 2) moved 5_198_079_201_314_408_078 →
-    // 7_427_253_331_732_318_204 when the default dark ribbon's SPECTRUM and
-    // its typed-streak bloom were restored (owner, 2026-08-24: "I want it to
-    // look more like a rainbow!", "there used to be what looked like the jump
-    // streak drawing behind the cursor that was painted as typing"). That is a
-    // repaint of the default dark mark's emitter (`emit_rainbow_mark_dark`),
-    // not a license effect, and no
-    // byte-exact golden can survive an intentional repaint.
-    //
-    // THE CLAUSE THIS FILE PROVES IS UNDAMAGED, and the diff is the proof: the
-    // other EIGHT styles' folds are bit-for-bit the pre-license numbers, and
-    // rainbow's own admission, envelopes, retract and spark population are
-    // untouched by the restoration (only the emitter that turns those sparks
-    // into quads changed). Re-baseline an entry here ONLY for a deliberate,
-    // owner-driven change to that style's emitter — never to quiet a failure
-    // whose cause is the license seam itself, which is the one thing this
-    // number exists to catch.
-    // RE-BASELINED, ALL NINE, 2026-08-28 — MECHANICALLY, and the evidence is
-    // why that word is allowed here. The fold hashes each quad's Debug string
-    // (`fold(acc, format!("{q:?}").as_bytes())`), and `GlowQuad` gained an
-    // `alpha` byte so the source-over bed could share one blend with the
-    // additive family. Every Debug string therefore changed, for every style,
-    // whether or not a single photon moved.
-    //
-    // A moving entry is normally the loudest alarm this file has, so it was
-    // treated as one and CHECKED rather than re-recorded:
-    //   * exactly ONE site emitted `GlowBlend::Over` — `cursor_glow.rs`'s
-    //     rainbow bed (v2's ribbon and meteor in `rainbow_kitty/` since). Every
-    //     other stream, and all eight non-rainbow styles, are `alpha == 0`.
-    //   * `over_premul_is_add_sat_at_zero_alpha` (aterm-render) proves
-    //     EXHAUSTIVELY, over the whole byte cross-product, that at `alpha == 0`
-    //     the source-over equation IS `add_sat`.
-    //   * `source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_
-    //     alone` (aterm-gpu) renders a mixed field over real text and finds
-    //     CPU == GPU byte-exact, with the additive rows byte-identical when the
-    //     over rows are removed.
-    // So the light is unchanged and the licence seam did not move; the fold's
-    // INPUT REPRESENTATION grew a field. If all nine ever move again without a
-    // `GlowQuad` field change behind them, that is the regression this array
-    // exists to catch, and it must not be re-recorded.
-    // RE-CAPTURED ON THE MERGE, ALL NINE (rainbow-complete x origin/main).
-    // TWO independent, already-documented causes are live in the same tree for
-    // the first time, which is why NEITHER side's array survives:
-    //   * this branch's `GlowQuad::alpha` field (the mechanical cause recorded
-    //     above) rewrites every quad's Debug string, for every style, so all
-    //     nine move whether or not a photon moved;
-    //   * upstream's ROYGBIV palette and `head_hue` colour authority (the
-    //     repaint cause recorded below) move index 2 on top of that.
-    // THE MERGE-SPECIFIC CHECK, and it is a falsifiable one: the eight
-    // non-rainbow entries must equal THIS BRANCH's committed eight byte for
-    // byte, because ROYGBIV and `head_hue` can only reach rainbow while the
-    // `alpha` field is already priced into our numbers. Index 2 alone must be
-    // a value neither side ever recorded. Anything else — an upstream style
-    // moving, or index 2 landing back on a known number — is the seam, not the
-    // paint, and must not be re-recorded.
-    //
-    // **THE CHECK WAS RUN AND IT HELD, WHICH IS WHY THE ONE NUMBER BELOW MOVED.**
-    // Measured on the merged tree: indices 0, 1, 3, 4, 5, 6, 7 and 8 came back
-    // BYTE-IDENTICAL to the values this branch committed — not close, equal — and
-    // index 2 went `4_687_125_888_682_913_049` → `3_301_500_979_061_321_610`,
-    // which is neither this branch's six-anchor number nor upstream's
-    // (`15_294_253_527_449_941_578`). That is the surgical signature this file
-    // exists to police and not the seam's: a seam regression moves all nine and
-    // flips the admission tally, and the tally is frozen — `an_unlicensed_script_
-    // moves_every_golden_entry` still passes, as do both sibling tests in this
-    // file, untouched.
-    // RE-BASELINED A THIRD TIME 2026-08-27, entry 2 (rainbow) ONLY:
-    // `3_947_126_183_161_842_362` → the value below. The cause is NOT one
-    // repaint but four deliberate rainbow-emitter commits that landed on
-    // the codex lane and were never re-captured here — d0d0b863 (smooth
-    // rainbow, coherent kitty frames), 7d712dc0 (continuous presentation),
-    // 8c85c952 (unified fade + palette) and e2bc14c4 (gaps and colour
-    // seams). They reached main through the merge da2832f0, which kept
-    // origin/main's NUMBER while taking both sides' CODE, so this golden
-    // has been stale — and main red — ever since. (da2832f0 itself does
-    // not compile: it kept a use of `Self::RAINBOW_WAVE_RAD` whose const
-    // the codex side had deleted. A bisect therefore stops at the merge;
-    // the first commit that both builds and disagrees is d0d0b863.)
-    //
-    // The mechanisms are the emitter's clocks and raster: the hue and wave
-    // clocks moved onto the exact phase ring (`rainbow_momentum_bands`
-    // `phase * 2.2` → `rainbow_ring_turns(phase, 359.0/1024.0) * TAU`,
-    // `RAINBOW_LIGHT_RAIL_FLOW` 0.35 → 179/512), `rainbow_glint_profile`
-    // arrived, and a per-pixel sub-cell raster replaced the slab raster.
-    //
-    // WHY THIS IS A REPAINT AND NOT THE SEAM — measured, not argued. The
-    // fold was decomposed per channel at the golden's own tree and at
-    // HEAD. For all NINE styles, and for rainbow in particular, these are
-    // BYTE-IDENTICAL: `spawns`, `live_sparks`, `ribbon_segments`,
-    // `typing_momentum`, the comet-trail cells, the drained sound cues,
-    // the admission tally (licensed=10, declined=0) and the whole
-    // per-step trajectory including both engines' anchors. The other
-    // eight styles do not move on ANY channel. Only rainbow's frame
-    // fingerprint and its over-ink quad fold moved (1593 → 3047 quads).
-    // A seam regression cannot produce that signature: disabling the
-    // `type_hint` disjunct in `move_licensed` moves all NINE entries and
-    // flips the tally to licensed=1/declined=9, while reverting a single
-    // line of `emit_rainbow_mark_dark` moves index 2 alone with the tally
-    // frozen — which is exactly the shape observed here.
-    //
-    // Read the sentence above about "admission … untouched" as a claim
-    // about these MEASURED channels, not about the source: the machinery
-    // did change (e2bc14c4 added `refresh_rainbow_cell_owner` and altered
-    // the `hue_advances` seed), and both are provably counter-neutral on
-    // this script. Note also that the mark emitter's ink reaches this
-    // number only through the frame fingerprint — the ribbon is written
-    // to `under_out`, which the script never folds as quads — so both
-    // `fp` and the quad fold moved, and neither alone explains it.
-    //
-    // RE-BASELINED AGAIN (companion head-hue seam, 2026-08-28). Index 2 is
-    // the RAINBOW style and it moved ALONE; the other eight are unchanged
-    // bytes. That is the repaint signature this comment already documents,
-    // not the seam one: a seam regression "moves all NINE entries and flips
-    // the tally to licensed=1/declined=9", and the tally is frozen here —
-    // both sibling tests in this file (`split_batch_suffix_...` and
-    // `earned_light_survives_a_cold_program_move`) still pass untouched.
-    //
-    // The cause is `rainbow_head_rgb` gaining a `head_hue` colour authority.
-    // It previously read "the newest TYPING spark", but tail repair appends
-    // missing older cells AFTER the fresh head, so that sample was not the
-    // head; it also returned `None` before the first cell and after the last
-    // retired, and the `None <-> Some` swap threw the caret and its inner
-    // halo a whole palette arc on first-key and final-fade frames. Rainbow
-    // is the only style with a companion colour authority, so rainbow is the
-    // only index that can move.
-    //
-    // RECAPTURED 2026-08-27 for ROYGBIV. The palette moved from six
-    // anchors to the canonical seven — red, orange, yellow, green, blue,
-    // INDIGO, violet — on the owner's ruling (*"a rainbow. like in the
-    // sky"*), and the hand-built "neutralized handoff" that drove the
-    // green→blue interval 95.3% of the way to flat grey at its midpoint
-    // was deleted with it. A palette change necessarily moves a byte fold
-    // of the emitter, so this golden is re-captured rather than repaired.
-    // The evidence that it is still the SURGICAL change this file exists
-    // to police: the recapture moved index 2 alone
-    // (`3_947_126_183_161_842_362` was the six-anchor value) and every
-    // other style folded byte-identical, so the license seam still lays
-    // the pixel it always laid.
-    // Re-captured on the MERGED tree: upstream's companion head-hue seam
-    // and this branch's ROYGBIV palette are both present, which is why
-    // neither side's number survived the rebase. Index 2 moved ALONE and
-    // the other eight came back byte-identical to the committed values —
-    // the repaint signature this file's own diagnostic describes, not the
-    // seam one.
-    // RE-DERIVED 2026-08-29 after the caret/composited cyan law. Index 2 (rainbow)
-    // ALONE moved; the other EIGHT are byte-identical to the values this branch
-    // already carried, which is the evidence the licence seam did not move and only
-    // the rainbow colour path did. The array was rebuilt from measurement rather
-    // than merged, because a three-way merge of this literal had twice produced TEN
-    // entries in a nine-element array — a shape that does not compile and, worse,
-    // reads like a resolved conflict.
-    // RE-DERIVED ON THE MERGE 2026-08-29 (caret-rim pixel law x traverse-per-mark
-    // with decay): index 2 alone moved; the other EIGHT are byte-identical, the
-    // evidence the licence seam did not. Rebuilt from capture, never hand-merged —
-    // a three-way merge of this literal has produced ten entries in a nine-array
-    // twice before.
-    // RE-DERIVED 2026-08-29 (the sound-redesign merge), and the cause PRE-DATES
-    // the merge: measured at the merge BASE — plain main `89d9f7b4`, the merge
-    // that brought the cloud poof back to the shipped style — index 2 was
-    // ALREADY `12_902_664_559_077_609_800` against the committed
-    // `10_229_932_340_051_593_466`, i.e. main landed that merge without
-    // re-capturing the rainbow entry and has been red here since. The
-    // sound-redesign merge is measurement-NEUTRAL: the merged tree measures the
-    // SAME nine values as its base, bit for bit — index 2 alone differs from
-    // the committed array and the other EIGHT are byte-identical, the repaint
-    // signature (rainbow is the style the cloud work repainted), not the seam
-    // one. Captured from measurement, not hand-merged.
-    // RE-DERIVED 2026-08-29 (the light-strike lane), and the cause PRE-DATES
-    // the lane: measured at its base — the merge `7381ba1f` — index 2 was
-    // ALREADY `10_097_007_343_695_914_747` against the committed
-    // `12_902_664_559_077_609_800`, i.e. main once again landed a rainbow
-    // merge without re-capturing this entry (the exact shape the previous
-    // paragraph records). The lane itself is measurement-NEUTRAL here, and
-    // that was verified rather than argued: this dark-theme script measures
-    // the SAME nine values at the lane's base and at its head, bit for bit —
-    // the lane's spawn-gate edit only removes a `dark_theme` conjunct that is
-    // TRUE on this script, and its light draw arm is gated `!dark_theme`, so
-    // no dark byte can move. Index 2 alone differs from the committed array
-    // and the other EIGHT are byte-identical — the repaint signature, not the
-    // seam one. Captured from measurement, not hand-merged.
-    // RE-DERIVED 2026-08-30 (the PILE LAW, `settle_flying_pile`): the rainbow
-    // frame now settles cross-owner flying crossings and the near-caret
-    // allowance, so the rainbow entry's bytes legitimately move — index 2
-    // alone, `10_097_… → 10_857_…`, with the other EIGHT byte-identical
-    // (the repaint signature again). Captured from measurement on the merged
-    // tree, not hand-merged.
-    // RE-DERIVED 2026-08-30 (the RAINBOW METEOR lane): index 2 (rainbow) ALONE
-    // moved, `10_857_… → 12_019_…`; the other EIGHT came back byte-identical —
-    // the repaint signature this file's diagnostic describes, not the seam one
-    // (the admission tally is frozen and both sibling tests pass untouched).
-    // The rainbow bytes move for four deliberate, owner-driven reasons in the
-    // jump gesture this script fires at ms 1100: (1) the flight phase — the
-    // decay ticks at 1150/1400 now catch the meteor mid-flight/mid-retract on
-    // a re-based clock instead of the old full-span retract; (2) the Starburst
-    // is born at arrival (+RAINBOW_METEOR_FLIGHT_S), so the ring/sparkle
-    // frames shift by the flight; (3) the Land chime rides the arrival edge,
-    // so the cue drains one step later than it did; (4) the per-jump latch
-    // roll advances the caret's worn colour one lay step across the jump.
-    // Captured from measurement (ATERM_CAPTURE_TYPED_PARITY=1), not
-    // hand-merged.
-    // RE-DERIVED 2026-08-30 after the rainbow pile ledger began treating
-    // separated emission runs as one complete particle owner. Only index 2
-    // moved; the other eight and the independent licence controls stayed exact.
-    // RE-DERIVED 2026-08-30 (INTEGRATION, meteor+band merged onto the classic
-    // rework): the rainbow entry alone re-captured on the final tree.
-    // RE-DERIVED 2026-08-30 (the BAND/CLASSIC RECONCILIATION): index 2
-    // (rainbow) ALONE moved, `7_675_… → 331_874_…`; the other EIGHT came back
-    // byte-identical — the repaint signature, not the seam one. The rainbow
-    // bytes move for the reconciliation's four deliberate visible changes:
-    // (1) the classic unroll is the 14-cell short traverse now, so this
-    // script's 6- and 3-key runs lay their cells at 1/14 of the arc per cell
-    // instead of 1/6 (the owner's short-text law); (2) the tall body's core
-    // follows the equal-ledge law, so dim positions hold their plateau deeper
-    // and the emitted quad stack changes; (3) a lone typed cell's wake
-    // continues the classic walk reflected at the anchor instead of reading
-    // flat red; (4) the wrap's fresh row opens on the gated re-anchor. All
-    // captured from measurement (ATERM_CAPTURE_TYPED_PARITY=1), not
-    // hand-merged.
-    // RE-DERIVED 2026-08-31 (the POLISH WAVE): index 2 (rainbow) ALONE
-    // moved, `331_874_… → 747_825_…` (captured twice: once before the wave's
-    // last two emitter edits — the five-key traverse and the flight's
-    // crossing subdivision — and re-captured after them, index 2 alone
-    // moving both times); the other EIGHT came back
-    // byte-identical — the repaint signature, not the seam one. The rainbow
-    // bytes move for the wave's deliberate visible changes, every one
-    // owner-asked and gated: the bed's glass luma floor (the cool leg stops
-    // compositing below its own ground) with the caps table re-derived
-    // against the lifted ink; the whole-mark re-grant's melt walk-back and
-    // the honest-cost stride solve (the typed line stays lit end to end);
-    // the baseline strip's presence retune; the run's tail ease; the
-    // pause-resume bloom's splice mint; the five-key traverse (unroll
-    // 18 -> 16); and the denser star shower/strike. Captured from
-    // measurement (ATERM_CAPTURE_TYPED_PARITY=1), not hand-merged.
-    // RE-DERIVED 2026-08-31 (the SONG LANE): ALL NINE entries moved, and for
-    // ONE reason that is not the seam and not the light —
-    // `cursor_glow::SoundCue` gained a `shifted` field (the capital's octave;
-    // see `trail_sound::SHIFT_GLYPH_LIFT`), and this fold hashes the cue's
-    // `Debug` TEXT (`format!("{cue:?}")`), so every cue's string grew a
-    // `, shifted: false` and every style's number moved with it.
-    //
-    // PROVEN, not argued. Folding `format!("{cue:?}").replace(", shifted:
-    // false", "")` instead reproduces the PREVIOUS nine goldens byte-exactly
-    // (measured 2026-08-31 by exactly that one-line probe, reverted): the
-    // quads, frame fingerprints, spawn counts, live spark counts, ribbon
-    // segments, momentum and every other cue field are untouched, and the
-    // `shifted` flag itself is `false` on every cue this script mints — it is a
-    // key-time-only fact and this script types through the licence seam, not
-    // the key seam. Captured from measurement (ATERM_CAPTURE_TYPED_PARITY=1),
-    // not hand-merged.
-    //
-    // INDEX 2 MOVED AGAIN after that capture, `6_424_… -> 8_200_…`, and NOT for
-    // this reason: the rainbow crossing was re-paced in the same working tree
-    // (`SPECTRUM_ROOF_STEP`) and re-derived its own entry the way this file's
-    // history shows that lane always does — index 2 alone, the repaint
-    // signature. The other eight are the song lane's capture, untouched.
-    //
-    // AND RE-DERIVED AGAIN on the crossing work: entry 2 alone moved a second
-    // time — `GlowStyle::RainbowKitty` is the one style that reads
-    // `crate::spectrum`, and the crossing roof (deleted 2026-09-15) stopped
-    // sagging (its six interior samples rose to the roof's own `V 235` peak).
-    // The other eight
-    // are byte-identical to the song lane's values above, which is the check
-    // that makes this a COLOUR change and not a licence-seam one.
-    //
-    // AND ONCE MORE (2026-08-31, the grey band): entry 2 alone,
-    // `4_785_… -> 2_656_…`, for two changes that are both the rainbow and
-    // nothing else — the crossing roof (deleted 2026-09-15) re-paced to carry
-    // the exit past the cyan window's own shoulder, and
-    // `cursor_glow::rainbow_bed_true_hue`
-    // giving the ribbon's bed back the hue the ground steals. The other eight
-    // came back byte-identical from the same capture, which is the whole point
-    // of keeping them here: a bed-colour transform that had leaked into the
-    // licence seam, or into a style that does not read the arc, would have
-    // moved them.
-    //
-    // **RE-BASELINED AGAIN, 2026-08-31, AND AGAIN ONLY ENTRY `2`.** The
-    // lead-advance ruling replaced the classic field's stretch with
-    // `rainbow_classic_walk` and closed the spectrum through
-    // `rainbow_cycle_ink`, so the rainbow kitty's typed fold necessarily moves.
-    // Re-derived from measurement (`ATERM_CAPTURE_TYPED_PARITY=1`), not
-    // hand-merged. The other EIGHT came back byte-identical a second time —
-    // which is exactly the discipline this fixture exists for: the walk and the
-    // cycle are confined to the one style that reads the arc, and neither
-    // leaked into the licence seam nor into a style that does not.
-    // **RE-BASELINED ONCE MORE, 2026-08-31 (the organic-motion pass), AND
-    // AGAIN ONLY ENTRY `2`.** Two changes, both of them the rainbow ribbon's
-    // motion and nothing else: `rainbow_live_tail` gives the mark a far-end
-    // dissolve while it is still being typed (post-cap, where the coverage the
-    // cell shows actually lives), and the exit swoosh's two linear laws — the
-    // farthest-first SELECTION schedule and the per-cell retract FADE — are
-    // eased with `smoothstep`. Re-derived from measurement
-    // (`ATERM_CAPTURE_TYPED_PARITY=1`), not hand-merged. The other EIGHT came
-    // back byte-identical, which is the discipline this fixture exists for:
-    // a dissolve applied at the wrong seam, or an easing that had leaked into
-    // the shared retract path every style uses, would have moved them.
-    // RE-DERIVED 2026-08-31 (LIVING FLOW): the standing band's travelling
-    // luminance swell moves the rainbow entry's bytes; the channel is confined
-    // to the one style that draws the ribbon, which is why the other eight
-    // came back byte-identical. Captured, not hand-merged.
-    // RE-DERIVED 2026-08-31 (EVEN PACING): the LUT is resampled so equal cell
-    // steps are equal perceived colour steps — the rainbow entry alone moves,
-    // the other eight byte-identical.
-    // RE-DERIVED 2026-09-01 for Water alone: its broad wake moved below glyph
-    // ink, overlapping repaint owners deduplicate, and jump reflections drain
-    // into age-derived beads. The other eight entries remain the v0.69 values
-    // above; Water is captured on this rebased tree, not carried from v0.68.
-    // Re-captured only after combining those visible changes with the
-    // field-complete frame digest and perceptually paced spectrum anchors.
-    // Cursor field-isolation, plane geometry, and Water ownership/drain tests
-    // independently prove why the merged fold moved.
+    // Per-style fold of the licensed typed script, in `ALL_STYLES` order.
+    // Re-capture (`ATERM_CAPTURE_TYPED_PARITY=1`) only for a deliberate change
+    // to a style's emitter or to `GlowQuad`'s fields (the fold hashes each
+    // quad's Debug string), and confirm which entries moved and why; never to
+    // quiet a failure caused by the license seam, which this array exists to
+    // catch.
     const GOLDEN: [u64; 9] = [
-        // RE-BASELINED 2026-09-02 — the jump streak's METEOR dynamics. Owner:
-        // "FAST like meteor and then nicely fade… feeling snappy is important".
-        // The decay went from `1 - u^2` (a HOLD: 75 % bright at the halfway
-        // point) to `(1 - u)^2` (25 % there), and the life from 0.45..1.10 s to
-        // 0.30..0.72 s. SEVEN of the nine entries move because the jump streak's
-        // life is shared by every style that draws one; Fire and Water are
-        // byte-identical because they do not.
-        // RE-BASELINED 2026-09-08 — THE DISTANCE-GRADED LANDING (owner: "a
-        // bigger impact splash that scales more with the distance traveled").
-        // Two laws, one magnitude (`rainbow_kitty::timing::impact`), and the
-        // fold was DECOMPOSED between them on the merged tree by zeroing the
-        // classic grade's two constants (`CLASSIC_RING_RADIUS_PER_IMPACT`,
-        // `CLASSIC_RING_LIFE_PER_IMPACT`): under that, EXACTLY ONE entry still
-        // moves — 2 (RainbowKitty), whose meteor landing is m15's second-round
-        // shockwave/fan graded by the jump (`meteor::ring_full_radius`,
-        // `ring_ms`, `FAN_N_PER_IMPACT`, `FAN_REACH_PER_IMPACT_CH`); with the
-        // constants restored the other SEVEN move too — every style whose
-        // landing ring goes through `cursor_glow::emit_ring` (the six
-        // square-outline styles and Water's ripple), widened and lengthened
-        // by `classic_ring_radius_factor` / `classic_ring_life` on this
-        // script's screen-crossing jump. Fire (4) is the control: its strike
-        // ring is the meteor arm's, which this script does not reach, and its
-        // entry is byte-identical. (The classic grade's own commit re-minted
-        // no golden here; its suite run was filtered to ring/impact/momentum,
-        // so these numbers were first read on the merge.)
-        // **RE-BASELINED, ALL NINE, 2026-09-21 — MECHANICALLY, the same way
-        // as the `alpha` field on 2026-08-28 (above): ribbon quads carry a
-        // per-column gradient.** `GlowQuad` gained `color2`/`alpha2` (the
-        // quad's RIGHT edge; `ribbon_beam` samples the colour at each slab's
-        // two edges so a whole-cell slab ramps instead of stepping), and the
-        // fold hashes each quad's Debug string, so every string changed for
-        // every style whether or not a photon moved. CHECKED, not
-        // re-recorded blind: (1) exactly ONE emitter writes `color2 !=
-        // color` — `aterm_render::ribbon_beam`, the rainbow kitty's ribbon;
-        // every other producer writes its one colour to both ends
-        // (`GlowQuad::flat`), and `glow_lerp_is_the_identity_on_a_flat_pair_
-        // and_a_monotone_ramp_otherwise` (aterm-render) proves the per-column
-        // law is the bit-exact identity on a flat pair; (2) the damage-word
-        // goldens over the same styles (`cursor_glow::DELETION_GOLDENS`,
-        // which fold a flat quad to the pre-gradient pair bit for bit) held
-        // the eight non-kitty rows UNCHANGED on this tree's run —
-        // `the_other_nine_styles_are_byte_identical_with_v2_unconditional`
-        // green — while the four kitty rows moved; (3)
-        // `gradient_glow_under_is_byte_exact_cpu_vs_gpu` (aterm-gpu) renders
-        // ramps on real Metal and finds CPU == GPU byte-exact, the flat twin
-        // too. So the eight styles' light is unchanged and the fold's INPUT
-        // REPRESENTATION grew two fields; entry 2 alone also carries a real
-        // change of light. If all nine move again without a `GlowQuad` field
-        // change behind them, that is the regression this array exists to
-        // catch. Captured with `ATERM_CAPTURE_TYPED_PARITY=1`: was
-        // `[11_108_773_950_677_089_257, 13_440_444_393_441_563_092,
-        // 750_028_201_522_132_832, 12_359_376_227_302_100_357,
-        // 17_288_162_128_308_037_669, 13_741_658_660_564_044_123,
-        // 8_682_652_025_797_884_188, 1_945_409_555_229_807_496,
-        // 13_099_582_226_493_843_556]`.
         2_012_044_335_639_200_132,
         9_056_904_005_182_467_320,
-        // RE-BASELINED 2026-09-06 — v1 DELETED (RAINBOW-KITTY-V2.md §17.3
-        // phase 7): `rainbow kitty` is its v2 engine unconditionally, so this
-        // entry is v2's fold of the same script (and the fold's light channel
-        // is now `live_light`, v2's cells + stars + meteors for this style —
-        // v1's spark census reads 0 over a lit v2 ribbon). Captured with
-        // `ATERM_CAPTURE_TYPED_PARITY=1` on the deletion tree: the other EIGHT
-        // entries came back byte-identical (their light channel is still
-        // `live_sparks`, unchanged), and the control below re-proves that
-        // withholding every key hint still moves this entry — v2 admits its
-        // moves through the same style-agnostic licence gate v1 did (seam
-        // point 1 sits AFTER it), so a cold script reaches it with nothing.
-        // …and re-baselined again 2026-09-08 for the graded landing (above):
-        // 9_913_598_197_427_658_676 → 14_978_377_130_234_467_942, the one
-        // entry the kitty's own grade moves.
-        // RE-CAPTURED 2026-09-09 — THE FAN GRADE'S EXPRESSION FIXED. The
-        // 14_978… number encoded a mis-fit: `mint_landing` wrote
-        // `FAN_N_BASE + FAN_N_PER_IMPACT * impact` (and the same for the
-        // reach) under constants re-fitted to the `(impact − 1)` form the
-        // ring and the classic ring use, so the 8-cell floor threw 23 stars
-        // over 4.4 ch instead of m15's 19 over 2.8 and saturated by ≈ 30
-        // cells. `meteor::fan_count` / `fan_reach_ch` now carry the law
-        // (pinned at floor and cap by `fan_count_and_reach_are_the_graded_
-        // law_at_floor_and_cap`), and this script's jump lands a different
-        // fan. Captured with `ATERM_CAPTURE_TYPED_PARITY=1`: the other EIGHT
-        // came back byte-identical — the fix touches the kitty's fan alone.
-        // RE-CAPTURED 2026-09-09 — THE SPARKLE'S ARRIVAL. The music box's
-        // per-key glint was spawned at delay zero, inside the tine's own 4 ms
-        // attack, so a phase-random sine sat on every strike's crest and
-        // §9.6's "brightness, never a decibel" stopped holding under §22's
-        // flow (`the_box_opens_with_the_hand_and_never_gets_louder`). It now
-        // arrives at `KEY_GLINT_DELAY_S`, with the bloom. This script's fold
-        // takes the SOUND CUES, and `GlowStyle::RainbowKitty` is the one
-        // style whose cues reach the v2 music box, so entry 2 alone moves:
-        // captured with `ATERM_CAPTURE_TYPED_PARITY=1`, the other EIGHT came
-        // back byte-identical. Nothing visual moved at all — this commit
-        // touches no paint.
-        // RE-CAPTURED 2026-09-10 — THE STARBURST. The landing's shockwave
-        // ring and its two rainbow bands are replaced by
-        // `meteor::draw_burst`, an isotropic set of tapered lances at true
-        // SCREEN angles plus jets along the flight line (the owner: *"I want
-        // more a starburst versus the bands effect"*). This script's jump
-        // lands one, so entry 2 alone moves: captured with
-        // `ATERM_CAPTURE_TYPED_PARITY=1`, the other EIGHT came back
-        // byte-identical — the burst is v2-only and no other style's landing
-        // can reach it, which is this re-capture's control.
-        // RE-CAPTURED 2026-09-10 — the starburst's lance grew a third,
-        // shorter, thinner section so it closes toward a POINT instead of a
-        // blunt end (design section 7's falsifier 3, judged on captured
-        // frames at 5x). Entry 2 alone moves again; the other EIGHT came back
-        // byte-identical.
-        // RE-CAPTURED 2026-09-13 — THE OWNER'S GAPS (`RAINBOW-KITTY-V2.md`
-        // §29): a cell boundary takes the brighter cell's coverage, the
-        // one-finger hold is per row, abutting typed cohorts are healed
-        // into one before the plan, an erase holds its row and a late
-        // retreat still retracts. This script's typing and fold cross every
-        // one of those, so entry 2 alone moves; the other EIGHT came back
-        // byte-identical — the laws are v2's own and no other style's
-        // frame can reach them, which is this re-capture's control.
-        // RE-CAPTURED 2026-09-13 — THE COMET, THE VIVID RAIL AND THE
-        // FROM-THE-HAND ATTACK (`RAINBOW-KITTY-V2.md` §30; the owner: "a
-        // wider rainbow that seems to be painted from the cursor … I don't
-        // see much yellow?"). The body is fattest at the hand and thins
-        // behind it, a second polyline below the row bottom carries the
-        // full-value spectrum inside the caret's light band, and a new
-        // cell's light enters as a 40 ms wipe from the caret side. Entry 2
-        // alone moves (`7_634_783_364_044_148_639` →
-        // `13_840_333_753_928_455_602`); the other EIGHT came back
-        // byte-identical. The previous number is now the `rainbow kitty
-        // flat` spelling's pin (`the_flat_spelling_keeps_the_pre_comet_
-        // typed_fold`), which is this re-capture's second control: the
-        // gate restores the old fold byte for byte.
-        // RE-CAPTURED 2026-09-13 (the comet's review round): the rail's reach
-        // capped at RAIL_REACH_MAX_CH, the wipe on typed cells only, the last
-        // row flat. Entry 2 alone; the other EIGHT came back byte-identical.
-        // RE-CAPTURED 2026-09-14 — THE OWNER'S NOTCH AND SLIVERS
-        // (`docs/measured/cursor-notch-2026-09-14.md`): the band continues
-        // one cell under the caret so the block stands on it, a boundary's
-        // light is the older side's with the younger side entering at the
-        // tail ease (two abutting runs share their seam vertex), and the hot
-        // edge exists on a cold hand. This script's typing runs under a
-        // caret on every frame, so entry 2 alone moves
-        // (`7_629_358_332_570_765_847` → `9_091_786_048_869_394_637`); the
-        // other EIGHT came back byte-identical — the attach and the boundary
-        // law are the ribbon's own, which is this re-capture's control. The
-        // flat spelling's pin moved with it (below): none of the three is a
-        // comet branch.
-        // RE-CAPTURED 2026-09-14 — the rail's own ceiling (RAIL_LUMA_CEIL 0.54,
-        // L5 amended to the glyph rows; the owner's visible yellow). Entry 2
-        // alone; the other EIGHT came back byte-identical.
-        // RE-BAKED AT THE MERGE, 2026-09-14: the landing-palette round landed on a main
-        // already carrying the rail ceiling, the scrub and the new-line fade; the kitty
-        // entry read off the merged tree's own run (was 5_061_215_610_766_713_242).
-        // RE-CAPTURED 2026-09-13 — THE PHRASE REST (Rainbow Path v3 §2.6,
-        // step 5). The ribbon's grace after the last key is the melody's
-        // rest (0.90 s at the floor, tempo-scaled) where it was a 0.75 s
-        // literal; an erase holds the open phrase; a row the caret is not on
-        // retracts into its own nearest end. This script's swoosh tail and
-        // its erase move with it.
-        // RE-CAPTURED 2026-09-14 — RAINBOW PATH v3 MERGED ONTO THE SCRUB:
-        // the phrase rest, the erase/kill phrase hold, the per-row retract
-        // target and the overlay wake on the flight clock, on top of the
-        // comet body, the vivid rail and its ceiling, with `Ribbon::scrub`
-        // reading every keyed same-row move first. This script's typing, its
-        // erase and its fold cross all of them, so entry 2 alone moves;
-        // captured with `ATERM_CAPTURE_TYPED_PARITY=1`, the other EIGHT came
-        // back byte-identical — the laws are v2's own and no other style's
-        // frame can reach them, which is this re-capture's control.
-        // RE-CAPTURED AT THE 0.86 RC MERGE, 2026-09-14 — THE NOTCH ROUND
-        // MEETS RAINBOW PATH v3. Neither side's number can describe this
-        // tree: v3 had `17_850_034_006_297_281_646` without main's notch
-        // round, main had `5_416_272_849_145_983_171` without v3's phrase
-        // rest and overlay. What main brings that this script crosses is the
-        // ATTACH under the caret cell — the band continues one cell under
-        // the block — together with the boundary law (a seam's light is the
-        // older side's, the younger entering at the tail ease), the hot edge
-        // on a cold hand, and the floor under a leaving caret cell. This
-        // script types under a caret on every frame, so the attach alone
-        // reaches every typed frame of it. Main's soft-end fix
-        // (`Cohort::landing_col`) cannot reach this fold — the script only
-        // types rightward and never jumps — so it is a no-regression check
-        // on the typed path there, not a control. Read off the merged
-        // tree's own run with `ATERM_CAPTURE_TYPED_PARITY=1`: entry 2 is
-        // `6_195_508_255_605_043_548` here, and the other EIGHT came back
-        // byte-identical, which is this re-capture's control.
-        // RE-CAPTURED 2026-09-15, THE EDIT ROUND'S ANSWER LANE (the owner's
-        // four reports on 0.86: backspacing breaks the trail apart, the
-        // new-line transition, part of the trail drawing while editing, the
-        // blocky green→blue). This script types, ERASES and FOLDS, and TWO
-        // of the round's laws — no more — reach it:
-        //
-        //   * THE FOLD KEEPS ITS ROW (`Ribbon::folded_down` /
-        //     `Ribbon::leave_row`): a one-row-down echo retracts only the
-        //     cells the re-wrap moved instead of abandoning the whole row
-        //     the hand came off. The script folds, so it crosses this.
-        //   * THE WALK IS RE-PACED ACROSS GREEN→BLUE
-        //     (`rk::ribbon::CROSS_PACE`): a walk position inside that ONE
-        //     leg resolves to a different stop. The script draws a band on
-        //     every frame, so it crosses this too.
-        //
-        // DECOMPOSED, NOT ASSUMED (measured by switching each law of the
-        // round off in turn and re-reading this array): with BOTH of those
-        // forced back to their shipped expression and every other law of
-        // the round left in place, entry 2 reads
-        // `6_195_508_255_605_043_548` — the byte v0.86.0 shipped
-        // (`de9846727`), to the bit. The round's other laws (the repaint's
-        // home, the witness's blank cells, the scroll-followed re-anchor
-        // guard) move NO byte of this script, and the ERASE is v0.86.0's
-        // own `retract_suffix` again — the slide this round first built was
-        // dropped after measurement, so it moves nothing either.
-        //
-        // The green→blue confinement is
-        // `the_crossing_is_smoothed_out_of_its_own_legs_cells_and_nothing_else_moves`:
-        // `moved_off_leg == 0`, every anchor keeps its residency, and the
-        // warm end sits on the stops it shipped with.
-        //
-        // The bake was taken AFTER a defect it would otherwise have pinned
-        // was fixed: `Ribbon::typed_landing` was reading the engine's cold
-        // caret MIRROR (`(0, 0)`, before any caret has been observed) as
-        // "the hand" and redirecting the first key of a session onto row 0
-        // — the stray the law exists to prevent. It now requires the hand's
-        // row to be a row the ribbon holds a cell on.
-        //
-        // Entry 2 is `1_827_068_178_512_366_064` here — AND THE OTHER EIGHT
-        // CAME BACK BYTE-IDENTICAL, which is this round's proof that no
-        // other trail style moved.
-        //
-        // **RE-BASELINED 2026-09-15, THE CYAN-LAW DELETION ROUND, AND AGAIN
-        // ONLY ENTRY `2`.** `crate::spectrum` lost the green→blue crossing's
-        // authored roof, its four pacing knots and its EXEMPTION from the
-        // perceptual pace — the retired no-cyan ruling's last machinery — so
-        // the crossing is drawn in HSV between its own two anchors (through
-        // `#00FFFF` at `S 1.00, V 1.00` instead of the roof's `S 0.53,
-        // V 0.92`) and every entry of the table is re-spent: the seven anchors
-        // moved `[0, 63, 142, 258, 394, 471, 510]` ->
-        // `[0, 50, 112, 204, 419, 479, 510]`. `GlowStyle::RainbowKitty` is the
-        // one style that reads the arc, so it is the one entry that may move,
-        // and the other eight came back byte-identical from this tree's own
-        // capture (`ATERM_CAPTURE_TYPED_PARITY=1`) — which is the whole reason
-        // the eight are kept here.
-        //
-        // **RE-BASELINED 2026-09-21, THE FOLD FLOW, AND AGAIN ONLY ENTRY
-        // `2`** (was `750_028_201_522_132_832`). The script's wrap — the
-        // licensed typed fold `(2, 36) → (3, 0)` — now sets the row it left
-        // FLOWING (`Cohort::flow`, `Ribbon::flow_row`; the owner: *"the
-        // previous row's rainbow flows in the direction of typing while the
-        // rainbow continues on the next line"*): row 2 slides into its fold
-        // point from its last key over `FLOW_TOTAL_S` instead of holding
-        // still through its grace. Decomposed: with `Ribbon::flow_cohort`
-        // forced to a no-op and every other law of the round in place (the
-        // relay's walk, the follow pass, the flush clock, the witness's
-        // standing-space law), entry 2 reads `750_028_201_522_132_832`
-        // again, to the bit — the flow is the whole of the move — and the
-        // other eight came back byte-identical.
-        //
-        // **MERGED 2026-09-22 (the rainbow-ribbon integration).** The fold
-        // flow above and the gradient quad (`GlowQuad::color2`, the cause at
-        // the top of this array) both move entry 2; entries 0, 1 and 3..=8
-        // are the gradient branch's re-bake unchanged (the flow reaches no
-        // other style). Entry 2 was re-captured on the merged tree with
-        // `ATERM_CAPTURE_TYPED_PARITY=1`, and the other eight came back
-        // byte-identical to the gradient branch's values — the control.
-        // Entry 2: flow alone `7_947_582_046_364_369_296`, gradient alone
-        // `7_972_335_274_463_860_508`, both `2_404_759_666_353_363_322`.
-        // (…and all seven below re-baselined 2026-09-21 with entries 0 and
-        // 1 — the mechanical gradient-field cause recorded at the top.)
-        // **RE-BASELINED 2026-09-22, THE SPARK-FLOOR ROUND, AND AGAIN ONLY
-        // ENTRY `2`.** A meteor landing's SPARK SHOWER now keeps the
-        // ribbon's own floor law (`rainbow_kitty::meteor`'s `spark_room`,
-        // `rainbow_kitty::ribbon::Ribbon::hand_floor`): a spark whose throw
-        // would carry it left of the leftmost column the hand has held on
-        // that row is thrown the other way instead, at its own speed, for
-        // its own life. The shower is a rainbow-kitty landing mark, so
-        // `GlowStyle::RainbowKitty` is the one entry that may move — and the
-        // other eight came back byte-identical from this tree's own capture
-        // (`ATERM_CAPTURE_TYPED_PARITY=1`), which is the whole reason the
-        // eight are kept here. Nothing is culled, shortened or damped; only
-        // the direction of a throw that would have left the hand's ink.
-        // **MERGED 2026-09-22, ROUND TWO** (main's spark-floor and hand-floor
-        // rounds, this branch's fold flow and gradient quad): entry 2 is the
-        // only one the two rounds both move, and it is re-captured on the
-        // merged tree (`ATERM_CAPTURE_TYPED_PARITY=1`) — main's value
-        // `18_370_343_873_451_645_674` is what the merged tree reads, entries
-        // 0, 1 and 3..=8 came back byte-identical to main's, the control.
-        // **RE-BASELINED 2026-09-23, THE DRIFT AND THE SEAM, AND AGAIN ONLY
-        // ENTRY `2`** (was `18_370_343_873_451_645_674`; the owner: *"the
-        // existing line rainbow should beautifully flow and drift and fade
-        // away, not simply abruptly vanish. some subtle visualisation for the
-        // new line would also be welcome"*). The script's one wrap, `(2, 36)
-        // → (3, 0)`, sets row 2 flowing, and the flow is now a rigid drift
-        // with a settle and a far-first fade to a common end
-        // (`FLOW_TOTAL_S` 1.50 s), and the new row carries the seam
-        // (`Ribbon::seam`) along its tail. Decomposed: with `Ribbon::arm_seam`
-        // forced to a no-op entry 2 reads `13_596_216_564_162_636_141` — the
-        // drift alone — and with both it reads the value below; entries 0, 1
-        // and 3..=8 came back byte-identical, the control (neither reaches
-        // another style).
-        13_217_896_978_492_768_086,
+        9_770_655_941_870_276_673,
         6_434_568_479_864_447_486,
         1_103_233_083_236_013_119,
         10_518_610_175_969_919_396,
@@ -1022,99 +389,16 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     );
 }
 
-/// THE FLAT SPELLING COLLAPSES EVERY COMET BRANCH (2026-09-13,
-/// `RAINBOW-KITTY-V2.md` §30). With `GlowConfig::ribbon_flat` set — the
-/// `rainbow kitty flat` spelling, the owner's A/B control — every comet
-/// branch in `ribbon.rs` collapses to the pre-comet expression, and this is
-/// the byte-exact measurement of that claim.
-///
-/// RE-PINNED 2026-09-14 (Rainbow Path v3 merged). Until now this number WAS
-/// entry 2 of `GOLDEN` as it stood before the comet landed (8582a67f9), and
-/// it can no longer be: the merge moves laws the flag does not gate — the
-/// phrase rest, the erase/kill phrase hold, the per-row retract target and
-/// the overlay wake on its flight clock. The flag's own claim is unchanged
-/// and still measured: flat folds HERE, the default body folds elsewhere.
-///
-/// RE-CAPTURED AT THE 0.86 RC MERGE, 2026-09-14. Main's notch round is not
-/// a comet branch either — the attach under the caret cell, the boundary
-/// law, the hot edge's floor and the floor under a leaving caret cell stand
-/// under the flat body exactly as they stand under the comet — so the flat
-/// fold moves with them too. That is the same reason the number stopped
-/// being a time capsule and became a pin on the COLLAPSE: what is measured
-/// here is that the flag folds every comet branch off, and the `assert_ne!`
-/// control below is what keeps it a measurement rather than a claim.
+/// With `GlowConfig::ribbon_flat` set (the `rainbow kitty flat` spelling) every
+/// comet branch in `ribbon.rs` collapses to the pre-comet expression. The
+/// pinned fold measures the flat body; the `assert_ne!` control keeps it a
+/// measurement (the default comet body must fold differently).
 #[test]
 fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
-    // RE-BAKED AT THE MERGE, 2026-09-14 (was 7_634_783_364_044_148_639): the flat
-    // spelling's typed fold on the merged tree — the rail ceiling, the landing palette,
-    // the scrub and the new-line fade together.
-    // RE-CAPTURED AT THE 0.86 MERGE: the flat spelling still collapses every comet
-    // branch byte for byte, but the fold it collapses TO is not the pre-comet tree's —
-    // the phrase rest, the erase hold and the per-row retract are not gated by the flag,
-    // so they move this number too. It pins the COLLAPSE, not a snapshot of history.
-    // RE-CAPTURED AGAIN AT THE 0.86 RC MERGE, 2026-09-14: neither side's number can
-    // describe this tree — v3 had `6_809_270_375_967_585_791` without the notch round,
-    // main had `14_265_225_952_539_666_539` without the phrase rest, the erase hold and
-    // the per-row retract. The notch round's attach, boundary law and floors are not
-    // comet branches, so they move the flat fold alongside v3's ungated laws; read off
-    // the merged tree's own run as `18_065_821_225_995_789_763`. The `assert_ne!`
-    // control below held: the default body still folds this script elsewhere.
-    // RE-CAPTURED 2026-09-15, THE EDIT ROUND'S ANSWER LANE: the fold's kept
-    // row and the walk's green→blue pace are not comet branches — the flag
-    // gates the comet profile, the vivid rail and the from-the-hand wipe,
-    // not which row a fold abandons or which stop a walk position resolves
-    // to — so they stand under the flat body exactly as under the comet and
-    // the flat fold moves with them, entry 2 for entry 2. Decomposed the
-    // same way as `GOLDEN` above: with both of those laws forced back to
-    // their shipped expression this reads `18_065_821_225_995_789_763`, the
-    // byte v0.86.0 shipped, to the bit — so those two laws are the whole of
-    // the move here too. Read off this tree's own run as
-    // `17_458_915_969_075_301_022`; the `assert_ne!` control below still
-    // holds, which is what keeps this a pin on the COLLAPSE.
-    // RE-CAPTURED 2026-09-15, THE CYAN-LAW DELETION ROUND: the arc's own table
-    // is not a comet branch either — the flag gates the comet profile, the
-    // vivid rail and the from-the-hand wipe, not which colour a spectrum
-    // position resolves to — so deleting the green→blue crossing's roof, its
-    // pacing knots and its exemption from the perceptual pace (see `GOLDEN`'s
-    // entry 2 above) moves the flat fold with the comet one. Read off this
-    // tree's own run as `15_974_855_624_796_755_313`; the `assert_ne!` control
-    // below still holds.
-    // RE-CAPTURED 2026-09-21, THE FOLD FLOW (was
-    // `3_217_110_197_472_841_106`): the flow is not a comet branch — the
-    // flag gates the comet profile, the vivid rail and the from-the-hand
-    // wipe, not whether a row the hand typed off slides into its fold — so
-    // it moves the flat fold with the comet one. With `Ribbon::flow_cohort`
-    // forced to a no-op this reads `3_217_110_197_472_841_106` again, to the
-    // bit; the `assert_ne!` control below still holds.
-    // RE-CAPTURED 2026-09-21: ribbon quads carry a per-column gradient
-    // (`GlowQuad::color2`; the mechanical cause on `GOLDEN` above). The flat
-    // spelling collapses the comet BODY, not the colour walk, so its slabs
-    // ramp too and its Debug fold moves with the rest: was
-    // `3_217_110_197_472_841_106`; the `assert_ne!` control below still holds.
-    // MERGED 2026-09-22: both causes at once, re-captured on the merged tree
-    // (`ATERM_CAPTURE_TYPED_PARITY=1`): flow alone `13_244_379_200_867_644_932`,
-    // gradient alone `3_090_160_706_360_356_223`.
-    // RE-CAPTURED 2026-09-22, THE SPARK-FLOOR ROUND: a landing's spark
-    // shower is not a comet branch either — the flag gates the comet
-    // profile, the vivid rail and the from-the-hand wipe, not where a
-    // landing may throw its sparks — so bounding the shower at the hand's
-    // floor (see `GOLDEN`'s entry 2 above) moves the flat fold with the
-    // comet one. Read off this tree's own run as
-    // `2_196_076_727_577_883_205`; the `assert_ne!` control below still
-    // holds, which is what keeps this a pin on the COLLAPSE.
-    // MERGED 2026-09-22, ROUND TWO: both rounds' causes at once, re-captured
-    // on the merged tree (`ATERM_CAPTURE_TYPED_PARITY=1`); the `assert_ne!`
-    // control below still holds, which is what keeps this a pin on the
-    // COLLAPSE rather than on a number.
-    // RE-CAPTURED 2026-09-23, THE DRIFT AND THE SEAM (was
-    // `14_052_065_336_766_733_923`): neither is a comet branch — the flag
-    // gates the comet profile, the vivid rail and the from-the-hand wipe,
-    // not how a row the hand typed off drifts into its fold or the hot
-    // edge's floor on the continued row — so they move the flat fold with
-    // the comet one (`GOLDEN`'s entry 2 above; with the seam off this reads
-    // `17_897_746_613_815_188_275`). The `assert_ne!` control below still
-    // holds.
-    const PRE_COMET: u64 = 11_050_258_555_939_167_288;
+    // The flat spelling's typed fold. The flag gates the comet profile, the
+    // vivid rail and the from-the-hand wipe, but not other ribbon rules, so
+    // those move this value too.
+    const PRE_COMET: u64 = 10_810_081_371_715_245_225;
     let mut flat = cfg(GlowStyle::RainbowKitty);
     flat.ribbon_flat = true;
     let a = typed_script_with(&flat, true);
@@ -1133,28 +417,12 @@ fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
     );
 }
 
-/// THE CONTROL FOR THE GOLDEN ABOVE, and the reason it may be trusted.
+/// The control for the golden above: the identical script with key hints
+/// withheld (cold program movement over the same trajectory) must move every
+/// one of the nine entries, so the golden demonstrably depends on the license.
 ///
-/// A byte-exact number is only coverage if something can move it, and this
-/// file's has been RE-BASELINED three times in four days for deliberate
-/// rainbow repaints (see the comments inside `GOLDEN`). Every one of those
-/// re-baselines was a human deciding, from prose, that the change was art and
-/// not the seam. That decision now has a machine behind it: run the identical
-/// script with the key hints WITHHELD — the pre-license denial path, cold
-/// program movement over the same trajectory — and every one of the nine
-/// numbers must move.
-///
-/// PROVEN, not assumed: disabling the `type_hint` disjunct in
-/// `CursorGlow::move_licensed` and re-running the golden moves all NINE
-/// entries (measured 2026-08-28 by exactly that source mutation, reverted).
-/// This test reproduces that verdict from the PUBLIC API alone, on every run,
-/// so "the golden still catches a broken license" stops being a claim in a
-/// comment and becomes a result in the suite.
-///
-/// It is deliberately per-entry rather than a whole-array `assert_ne!`: an
-/// array comparison passes as soon as ONE style moves, which would let the
-/// control go green while eight styles had quietly stopped depending on the
-/// license at all.
+/// Per entry rather than a whole-array `assert_ne!`, which would pass as soon
+/// as one style moved.
 #[test]
 fn an_unlicensed_script_moves_every_golden_entry() {
     for (i, &style) in ALL_STYLES.iter().enumerate() {

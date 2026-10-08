@@ -8,8 +8,9 @@
 // it during the build (two-language design E10) -- so the argument stops being
 // prose the moment somebody edits the protocol out from under it.
 //
-// It is checked even under -Ztrust-verify=off, the workspace-wide opt-out in
-// .cargo/config.toml, because an island carries its own authority.
+// It is checked even under -Ztrust-verify=off, the switch the `targo
+// --unverified` lane puts on every unit, because an island carries its own
+// authority.
 //
 // WHAT IT PROVES, and what it does not: this is a theorem about the model below,
 // not about the Rust in this file. The code-bound half is the derived twin,

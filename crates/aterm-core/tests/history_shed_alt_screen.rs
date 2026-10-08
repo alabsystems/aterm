@@ -1,21 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The memory-pressure shed must reach a tab's history while that tab is on
-//! the ALTERNATE screen (2026-09-26).
+//! The memory-pressure shed reaches a tab's history while that tab is on the
+//! alternate screen.
 //!
-//! Evidence behind this file: every one of the 53 `memory pressure (warn):
-//! trimmed scrollback across N session(s)` lines the owner's live window
-//! (pids 6874 and 79405) logged said `0 session(s)`, while 3 of its 4 tabs ran
-//! Claude Code with `alt_screen=true`. The GUI's shed and its aggregate-cap
-//! lane read the store through `Terminal::scrollback`, which is the ACTIVE
-//! grid's; `CSI ?1049h` parks the primary grid — the only tiered store — in
-//! the inactive slot, so every alt-screen tab looked store-less and was
-//! skipped. `Terminal::history_scrollback` / `shed_history_scrollback` read
-//! and trim the grid that holds the history whichever slot it is in.
+//! `Terminal::scrollback` is the active grid's store, and `CSI ?1049h` parks
+//! the primary grid, the only tiered store, in the inactive slot.
+//! `Terminal::history_scrollback` / `shed_history_scrollback` read and trim
+//! the grid holding the history whichever slot it is in.
 //!
-//! Each test drives the real parser (`Terminal::process`) with real bytes: 50k
-//! lines of incompressible-ish history, then the real `?1049h`.
+//! Each test drives the real parser with 50k lines of history, then `?1049h`.
 
 use aterm_core::scrollback::{Scrollback, ScrollbackStorage};
 use aterm_core::terminal::Terminal;
@@ -69,8 +63,7 @@ fn shed_trims_the_primary_history_while_the_alt_screen_is_up() {
         term.modes().alternate_screen,
         "?1049h entered the alt screen"
     );
-    // The blind spot, stated: the ACTIVE grid is the store-less alt buffer.
-    // This is exactly what the GUI's pressure lanes used to read.
+    // The active grid is the store-less alt buffer.
     assert!(
         term.scrollback().is_none(),
         "the active (alt) grid carries no tiered store"
@@ -104,7 +97,7 @@ fn shed_trims_the_primary_history_while_the_alt_screen_is_up() {
         "the budget is restored after the shed, so history can grow again"
     );
 
-    // Leaving the alt screen brings back the TRIMMED primary: fewer lines,
+    // Leaving the alt screen brings back the trimmed primary: fewer lines,
     // not none.
     term.process(b"\x1b[?1049l");
     assert!(!term.modes().alternate_screen);

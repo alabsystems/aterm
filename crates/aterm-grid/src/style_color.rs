@@ -4,10 +4,8 @@
 
 //! RGBA color type with ANSI 256-color palette support.
 
-/// RGBA color.
-///
-/// Note: Default is black (0,0,0,255), not zero values.
-/// Use `Color::DEFAULT_FG` for white or `Color::DEFAULT_BG` for black explicitly.
+/// RGBA colour. Default is opaque black (0,0,0,255); use `Color::DEFAULT_FG`
+/// or `Color::DEFAULT_BG` explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct Color {
@@ -49,17 +47,9 @@ impl Color {
         (self.r, self.g, self.b)
     }
 
-    /// Create a color from an ANSI 256-color index.
-    ///
-    /// Color indices map as follows:
-    /// - 0-7: Standard colors (black, red, green, yellow, blue, magenta, cyan, white)
-    /// - 8-15: Bright colors (bright versions of 0-7)
-    /// - 16-231: 6x6x6 color cube
-    /// - 232-255: Grayscale (dark to light)
-    ///
-    /// Uses a pre-computed lookup table (1KB, L1d-resident) instead of
-    /// per-call arithmetic. Eliminates 3 divisions + 3 modulos for the
-    /// 216-color cube range (indices 16-231).
+    /// Create a colour from an ANSI 256-colour index: 0-7 standard, 8-15
+    /// bright, 16-231 the 6x6x6 cube, 232-255 greyscale. Reads a precomputed
+    /// 1KB table.
     #[must_use]
     #[inline]
     #[cfg(test)]
@@ -73,17 +63,14 @@ impl Color {
     pub const fn compute_ansi_256(index: u8) -> Self {
         // Standard ANSI colors (xterm defaults)
         const ANSI_16: [(u8, u8, u8); 16] = [
-            // This table MUST agree with the authoritative aterm-types
-            // ColorPalette::default_color (enforced by the
-            // grid_ansi_table_matches_color_palette test below). It is a
-            // style-intern CACHE KEY, never a pixel — the palette renders. The
-            // red/magenta/bright row were tempered away from raw neon primaries
-            // for contrast/harmony on a dark bg (two LLM judges); keep in sync.
+            // Must agree with aterm-types ColorPalette::default_color (checked by
+            // grid_ansi_table_matches_color_palette below). This is a
+            // style-intern cache key; the palette renders.
             (0, 0, 0),       // 0: Black
             (224, 108, 117), // 1: Red       (#E06C75, lifted from #CD0000)
             (0, 205, 0),     // 2: Green
             (205, 205, 0),   // 3: Yellow
-            (59, 142, 234),  // 4: Blue      (#3B8EEA, lifted from #0000EE)
+            (59, 142, 234),  // 4: Blue      (#3B8EEA)
             (198, 120, 221), // 5: Magenta   (#C678DD, lifted from #CD00CD)
             (0, 205, 205),   // 6: Cyan
             (229, 229, 229), // 7: White
@@ -127,10 +114,7 @@ impl Color {
     }
 }
 
-/// Pre-computed ANSI 256-color palette (1KB, compile-time evaluated).
-///
-/// Eliminates per-call division/modulo arithmetic for the 216-color cube
-/// (indices 16-231). Array index == palette index for O(1) lookup.
+/// Precomputed ANSI 256-colour palette, indexed by palette index.
 #[cfg(test)]
 static ANSI_256_TABLE: [Color; 256] = {
     let mut table = [Color::new(0, 0, 0); 256];
@@ -146,12 +130,9 @@ static ANSI_256_TABLE: [Color; 256] = {
 mod tests {
     use super::*;
 
-    /// This grid ANSI table is a style-intern CACHE KEY; the table that actually
-    /// reaches pixels is the authoritative `aterm_types::ColorPalette`. They MUST
-    /// agree on every one of the 256 indices — otherwise an SGR-coloured cell's
-    /// intern key encodes a different colour than the one rendered. Index 4 (Blue)
-    /// diverged historically (#0000EE here vs #3B8EEA in the palette); this guard
-    /// pins all 256 so the two tables can never silently drift again.
+    /// This table is a style-intern cache key and `aterm_types::ColorPalette`
+    /// renders; all 256 indices must agree, or a cell's key encodes a different
+    /// colour than the one drawn.
     #[test]
     fn grid_ansi_table_matches_color_palette() {
         for i in 0u16..=255 {

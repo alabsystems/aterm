@@ -3,68 +3,34 @@
 
 //! The raw runtime surface: symbols, typed sends, ownership, pools.
 //!
-//! Most of this module was PROMOTED from `aterm-gpu/src/metal/ffi.rs`, which
-//! established these conventions and states in its own header that it was the
-//! first in the tree to talk to the ObjC runtime directly. Promoted, not
-//! copied: three things that file gets wrong or does not need are DIFFERENT
-//! here, and each is marked where it lives —
-//!
-//! * the autorelease pool is a SCOPE, because the RAII token that file uses
-//!   lets safe code pop out of order (see [`AutoreleasePool`]);
-//! * [`msg`] chooses between `objc_msgSend` and `objc_msgSend_stret` from the
-//!   prototype's return type, because that file's single entry point is correct
-//!   only for the selector set it happens to send (see [`returns_indirectly`]);
-//! * the symbols that file deliberately never needed — class-pair creation,
-//!   super sends, protocols, [`autorelease`] — are bound here.
+//! Conventions follow `aterm-gpu/src/metal/ffi.rs`, except that the
+//! autorelease pool is a scope ([`AutoreleasePool`]), [`msg`] picks
+//! `objc_msgSend` or `objc_msgSend_stret` from the prototype's return type
+//! ([`returns_indirectly`]), and class-pair creation, super sends, protocols
+//! and [`autorelease`] are bound here too.
 
 use std::ffi::{CStr, c_char, c_uint, c_void};
 
-/// An Objective-C object pointer. Null is the ObjC `nil` and is always a valid
-/// value to send a message to, so this wraps a raw pointer rather than a
-/// `NonNull`. What a nil send RETURNS is zero for every register-class value
-/// (integers, pointers, floats, and structs that fit registers: CGPoint, CGSize,
-/// NSRange) — but an INDIRECT struct return (`objc_msgSend_stret` on x86_64:
-/// CGRect and anything over 16 bytes or unaligned) is left UNINITIALISED by
-/// libobjc there, while arm64 hands the same CGRect back in zeroed d0-d3. The
-/// typed `send_rect*` helpers nil-check for exactly that case (measured
-/// 2026-09-06 on an Intel Mac); a hand-cast `msg()` returning a struct must
-/// do the same.
+/// An Objective-C object pointer. Null is `nil`, a valid receiver, so this
+/// wraps a raw pointer rather than a `NonNull`.
 ///
-/// # Why this is a NEWTYPE and not `*mut c_void`
+/// A nil send returns zero for every register-class value (integers, pointers,
+/// floats, register-sized structs), but on x86_64 libobjc leaves an indirect
+/// struct return (`objc_msgSend_stret`: `CGRect`, anything over 16 bytes or
+/// with a misaligned field) uninitialised. The `send_rect*` helpers nil-check
+/// for that; a hand-cast `msg()` returning a struct must do the same.
 ///
-/// For the same reason [`Sel`] is, and the second half of the same defect. This
-/// was `pub type Id = *mut c_void;`, and the [`crate::Encode`] impl that gave
-/// `Id` its `"@"` was therefore written on `*mut c_void` itself, justified by
-/// "in this crate a MUTABLE raw void pointer in a method position always means
-/// `id` … nothing in aterm's 33 methods or winit's 71 passes a non-object
-/// `void *` in that position".
-///
-/// THAT CLAIM WAS FALSE, and false at the very site the crate named as W2's
-/// next piece of work. KVO's callback is
-/// `- (void)observeValueForKeyPath:(NSString *)k ofObject:(id)o
-/// change:(NSDictionary *)c context:(void *)ctx` — the SDK's
-/// `NSKeyValueObserving.h` spells that last parameter `void *`, NOT
-/// `const void *`; `objc2-foundation`'s generated binding writes it
-/// `context: *mut c_void`; and `vendor/winit/src/platform_impl/macos/
-/// window_delegate.rs:456` — the file this crate points at for W2 — writes
-/// `_context: *mut c_void`. MEASURED with clang on this box, the compiler emits
+/// A newtype so it can carry its own [`crate::Encode`] (`"@"`), leaving
+/// `*mut c_void` to mean `"^v"`. KVO's `context:` is `void *`, which clang
+/// encodes as `^v`:
 ///
 /// ```text
 /// observeValueForKeyPath:ofObject:change:context:   v48@0:8@16@24@32^v40
 /// ```
 ///
-/// i.e. `^v` in the fourth argument, while the old mapping would have
-/// registered `@`. Declaring an opaque caller-owned pointer as an OBJECT is
-/// strictly worse than the `":"` that motivated `Sel`'s newtype: `"@"` invites
-/// `NSInvocation`, forwarding and accessibility to RETAIN it.
-///
-/// The [`crate::Encode`] impl for `"@"` now lives on this type, which frees
-/// `*mut c_void` to mean what the runtime says it means (`"^v"`), and
-/// `tests/adversary_w2c.rs` declares the KVO method AT THE `*mut` SPELLING and
-/// reads the encoding back out of the runtime.
-///
-/// `#[repr(transparent)]` over the pointer, so it is still exactly the word the
-/// runtime passes and is still FFI-safe in an `extern "C"` prototype.
+/// Registering it as `"@"` would invite `NSInvocation`, forwarding and
+/// accessibility to retain it (`tests/adversary_w2c.rs`). `#[repr(transparent)]`,
+/// so it is FFI-safe and exactly the word the runtime passes.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id(*mut c_void);
@@ -73,10 +39,8 @@ impl Id {
     /// The Objective-C `nil`.
     pub const NIL: Self = Self(std::ptr::null_mut());
 
-    /// Wrap a raw object pointer.
-    ///
-    /// Safe, because holding an `id` is not what is dangerous — SENDING to one
-    /// is, and every send in this crate is already `unsafe`.
+    /// Wrap a raw object pointer. Safe: sending to an `id`, not holding one, is
+    /// what is dangerous, and every send is `unsafe`.
     #[inline]
     #[must_use]
     pub const fn from_ptr(ptr: *mut c_void) -> Self {
@@ -104,8 +68,8 @@ impl Id {
         self.0.expose_provenance()
     }
 
-    /// The address, WITHOUT exposing provenance — for identity comparisons and
-    /// for `-hash`, which on `NSObject` is the instance pointer.
+    /// The address without exposing provenance, for identity comparisons and
+    /// `-hash` (the instance pointer on `NSObject`).
     #[inline]
     #[must_use]
     pub fn addr(self) -> usize {
@@ -131,38 +95,19 @@ impl std::fmt::Debug for Id {
 }
 /// An Objective-C selector — an interned, immortal string the runtime owns.
 ///
-/// A NEWTYPE rather than the `*const c_void` alias it used to be, and the
-/// reason is an ENCODING, not a type-safety preference. [`crate::Encode`] maps
-/// a Rust type to the letter `class_addMethod` is told, and while `SEL` and
-/// `const void *` are the same machine word they are `":"` and `"^v"` to the
-/// runtime. As one alias they could not be told apart, so the impl had to pick:
-/// it picked `":"`, which made the RIGHT choice for `doCommandBySelector:` and
-/// the SILENT WRONG one for every `const void *context` — the shape
-/// `observeValueForKeyPath:ofObject:change:context:` has, which is KVO, which
-/// is what W2 needs for winit. Two types, two encodings, nothing to guess.
-///
-/// `#[repr(transparent)]` over the pointer, so it is still exactly the word the
-/// runtime passes and is still FFI-safe in an `extern "C"` prototype.
+/// A newtype so it can carry its own [`crate::Encode`]: `SEL` is `":"` while
+/// `const void *` is `"^v"`. `#[repr(transparent)]`, so it is FFI-safe and
+/// exactly the word the runtime passes.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sel(*const c_void);
 
 impl Sel {
-    /// The NIL selector.
-    ///
-    /// Not a defensive constant: `nil` is a legal, load-bearing value in a SEL
-    /// position, and W2 could not port `aterm-gui` without it.
-    /// `-[NSMenuItem initWithTitle:action:keyEquivalent:]` takes `nil` for
-    /// "this row is a label, not a command" — the status item's information
-    /// rows and the menu bar's disabled headers are exactly that — and
-    /// `-[NSControl setAction:]` takes it to unwire a control.
-    ///
-    /// It is a CONSTANT rather than a public `from_ptr`, which stays
-    /// `pub(crate)`: a selector this crate hands out is either interned by
-    /// `sel_registerName` or is this null, and there is no third source. A
-    /// nil SEL is inert on every path the runtime has — sending it is the one
-    /// thing that is not allowed, and `objc_msgSend` with a nil selector is a
-    /// crash rather than a no-op, which is why this is only ever an ARGUMENT.
+    /// The nil selector. Legal as an argument (`-[NSMenuItem
+    /// initWithTitle:action:keyEquivalent:]` for a label row,
+    /// `-[NSControl setAction:]` to unwire a control); never a valid selector
+    /// to send, since `objc_msgSend` with a nil selector crashes. The only
+    /// selector not interned by `sel_registerName`.
     pub const NULL: Self = Self(std::ptr::null());
 
     /// The raw selector pointer.
@@ -179,58 +124,43 @@ impl Sel {
         self.0.is_null()
     }
 
-    /// The selector's NAME, borrowed from the runtime's immortal selector
-    /// table.
-    ///
-    /// The same `sel_getName` call [`Sel`]'s `Debug` makes, given a name of its
-    /// own because an ENUMERATED selector — one that came back from
-    /// [`class_methods`] rather than from a literal a caller typed — has no
-    /// other way to be printed, matched or reported. `"(null)"` for
-    /// [`Sel::NULL`], so a report can name the null selector instead of
-    /// crashing while describing it.
+    /// The selector's name, borrowed from the runtime's immortal selector table.
+    /// Lets an enumerated selector (from [`class_methods`]) be printed or
+    /// matched. `"(null)"` for [`Sel::NULL`].
     #[must_use]
     pub fn name(self) -> &'static CStr {
         if self.0.is_null() {
             return c"(null)";
         }
-        // SAFETY: `self` is a non-null selector obtained from the runtime, so
-        // `sel_getName` returns a NUL-terminated string in libobjc's immortal
-        // selector table — never freed, so `'static` is honest.
+        // SAFETY: non-null selector from the runtime; `sel_getName` returns a
+        // NUL-terminated string in the immortal selector table, so `'static`.
         unsafe { CStr::from_ptr(sel_getName(self)) }
     }
 
-    /// Wrap a pointer the runtime returned. Not public: every selector this
-    /// crate hands out comes from `sel_registerName`, and one that did not
-    /// would be a dangling pointer the moment it was sent.
+    /// Wrap a pointer the runtime returned. Crate-private: every selector handed
+    /// out comes from `sel_registerName` (or is [`Sel::NULL`]).
     #[inline]
     pub(crate) const fn from_ptr(ptr: *const c_void) -> Self {
         Self(ptr)
     }
 }
 
-// SAFETY: a selector is a pointer into `libobjc`'s IMMORTAL selector table.
-// It is never freed, never written through, and interning is idempotent and
-// internally synchronised, so the pointer is valid on every thread for the
-// life of the process. This is the same fact `SelCache`'s `Relaxed` ordering
-// rests on, stated once here rather than re-argued at each use.
+// SAFETY: a selector points into libobjc's immortal selector table: never
+// freed or written, interning is idempotent and synchronised, so the pointer
+// is valid on every thread for the life of the process.
 unsafe impl Send for Sel {}
 // SAFETY: as above — the pointee is immutable and immortal.
 unsafe impl Sync for Sel {}
 
 impl std::fmt::Debug for Sel {
-    /// Prints the selector's NAME, through `sel_getName` rather than by casting
-    /// the pointer to a `char *`. On Apple's runtime a `SEL` happens to BE a
-    /// pointer to its own name, and reading it that way works — but that is an
-    /// implementation detail of `objc4`, not part of the ABI this crate is
-    /// entitled to rely on, and `sel_getName` is one call that costs nothing on
-    /// a debug path.
+    /// Prints the selector's name via `sel_getName`; that a `SEL` points at its
+    /// own name is an objc4 implementation detail, not ABI.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0.is_null() {
             return f.write_str("Sel(null)");
         }
-        // SAFETY: `self` is a non-null selector from `sel_registerName`, so
-        // `sel_getName` returns a NUL-terminated string the runtime owns and
-        // never frees.
+        // SAFETY: non-null selector from `sel_registerName`; `sel_getName`
+        // returns a NUL-terminated string the runtime never frees.
         let name = unsafe { CStr::from_ptr(sel_getName(*self)) };
         write!(f, "Sel({})", name.to_string_lossy())
     }
@@ -238,24 +168,13 @@ impl std::fmt::Debug for Sel {
 
 /// An Objective-C class object.
 ///
-/// A class is itself an object and has the same machine shape as an [`Id`], but
-/// it is NOT the same thing to the runtime and it does not have the same
-/// encoding: `@encode(Class)` is `"#"`, not `"@"`. MEASURED with clang on this
-/// box, `- (void)setDelegateClass:(Class)c` registers
+/// Same machine shape as [`Id`], but `@encode(Class)` is `"#"`:
 ///
 /// ```text
 /// setDelegateClass:                              v24@0:8#16
 /// ```
 ///
-/// This used to be `pub type ClassPtr = *mut c_void;`, the SAME alias as `Id`
-/// and `ProtocolPtr`, so no [`crate::Encode`] impl could tell the three apart
-/// and the one impl that existed said `"@"` for all of them. That is the defect
-/// [`Sel`] was newtyped for, one type over — fixed on the `const` side of the
-/// void pointer while three `*mut` spellings stood behind a single impl. All
-/// three are newtypes now, and each carries the letter clang emits: `"@"` for
-/// [`Id`], `"#"` here, `"@"` for [`ProtocolPtr`] (`@encode(Protocol *)` is `@`
-/// — measured, not assumed, because it is the one of the three that does NOT
-/// follow from its own name).
+/// A newtype so its [`crate::Encode`] can say so; [`ProtocolPtr`] encodes `"@"`.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClassPtr(*mut c_void);
@@ -285,7 +204,7 @@ impl ClassPtr {
         self.0.is_null()
     }
 
-    /// The address, with provenance exposed — what [`crate::ClassMeta`] stores
+    /// The address with provenance exposed — what [`crate::ClassMeta`] stores
     /// so it can live in a `OnceLock`.
     #[inline]
     #[must_use]
@@ -293,17 +212,15 @@ impl ClassPtr {
         self.0.expose_provenance()
     }
 
-    /// The address, WITHOUT exposing provenance — for the identity assertions
-    /// that prove a `OnceLock`-registered class is registered exactly once.
+    /// The address without exposing provenance, for identity assertions.
     #[inline]
     #[must_use]
     pub fn addr(self) -> usize {
         self.0.addr()
     }
 
-    /// This class object AS an object, for the sends that message a class
-    /// (`+alloc`, `+sharedWorkspace`). The conversion is explicit because the
-    /// two types are deliberately distinct in a method signature.
+    /// This class as an object, for class messages (`+alloc`,
+    /// `+sharedWorkspace`). Explicit because the two types differ in signatures.
     #[inline]
     #[must_use]
     pub const fn as_id(self) -> Id {
@@ -312,22 +229,17 @@ impl ClassPtr {
 }
 
 impl std::fmt::Debug for ClassPtr {
-    /// Prints the class's NAME, through `class_getName`.
+    /// Prints the class's name via `class_getName`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SAFETY: `self` is either null — which `class_name` reports as
-        // `"(nil)"` without dereferencing — or a class object, which is
-        // immortal once it has been handed out.
+        // SAFETY: `self` is null (reported as `"(nil)"` without a dereference)
+        // or a class object, which is immortal.
         let name = unsafe { class_name(*self) };
         write!(f, "Class({})", name.to_string_lossy())
     }
 }
 
 /// An Objective-C protocol object, as returned by `objc_getProtocol`.
-///
-/// A newtype for [`ClassPtr`]'s reason; `@encode(Protocol *)` is `"@"`, which
-/// is what the [`crate::Encode`] impl says — measured, because "it is called
-/// `Protocol` so it must encode like `Class`" is exactly the guess that would
-/// be wrong.
+/// `@encode(Protocol *)` is `"@"` (measured, not `"#"`).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProtocolPtr(*mut c_void);
@@ -361,50 +273,34 @@ impl std::fmt::Debug for ProtocolPtr {
     }
 }
 
-/// An `Ivar` handle, as returned by `class_getInstanceVariable`.
-///
-/// Left as a bare `*const c_void` alias, deliberately: an `Ivar` is an opaque
-/// runtime handle that NEVER appears in a method signature, so it never reaches
-/// [`crate::Encode`] and there is nothing for a newtype to disambiguate.
+/// An `Ivar` handle, as returned by `class_getInstanceVariable`. A plain alias:
+/// it never appears in a method signature, so it needs no [`crate::Encode`].
 pub type IvarPtr = *const c_void;
 
 /// The `objc_super` struct `objc_msgSendSuper` takes in place of a receiver.
-///
-/// `receiver` is the instance; `super_class` is the class whose implementation
-/// the send should START looking from — for `[super foo]` inside a method of
-/// class `C`, that is `C`'s superclass, NOT `C`.
+/// For `[super foo]` in a method of class `C`, `super_class` is `C`'s
+/// superclass, not `C`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ObjcSuper {
     /// The object the message is actually delivered to.
     pub receiver: Id,
-    /// Where method lookup starts (the SUPERCLASS of the defining class).
+    /// Where method lookup starts (the superclass of the defining class).
     pub super_class: ClassPtr,
 }
 
-// THE SEND ENTRY POINTS ARE `"C-unwind"`, AND THAT IS LOAD-BEARING.
-//
-// An `NSException` raised inside a send is a foreign exception unwinding
-// through the Rust frame that made the send. Declared `extern "C"` — rustc's
-// `nounwind` — the frame has no landing pad for that call, and what happens
-// next was MEASURED (docs/measured/2026-09-03-delivery-and-objc-exception-
-// containment.md, §2) to be one of three things, all bad: the frame's `Drop`s
-// are silently skipped, the process aborts with `failed to initiate panic,
-// error 3`, or LLVM DELETES a `catch_unwind` whose body only calls nounwind
-// functions. `"C-unwind"` gives the frame its landing pad, so a raise runs
-// every Rust destructor on the way to whoever catches it — the containment
-// in [`crate::exception`] — and it costs NOTHING on the hot path: the same
-// benchmark read 1.534 ns/send under both spellings.
-//
-// The prototype every send is cast to must carry the same ABI, which is why
-// [`MsgFn`] is implemented for `unsafe extern "C-unwind" fn(..)` ONLY: the
-// tree cannot keep both spellings live, because ONE `"C"` callee on the path
-// a raise takes is enough to lose the frames above it.
+// The send entry points are `"C-unwind"`. An `NSException` raised inside a
+// send unwinds through the calling Rust frame as a foreign exception; under
+// `extern "C"` (`nounwind`) that frame has no landing pad, so its `Drop`s are
+// skipped, the process aborts with `failed to initiate panic`, or LLVM deletes
+// a `catch_unwind` around nounwind calls. `"C-unwind"` runs every destructor
+// on the way to [`crate::exception`]'s containment at no hot-path cost.
+// [`MsgFn`] is implemented for `unsafe extern "C-unwind" fn(..)` only, since
+// one `"C"` frame on the raise path loses the frames above it.
 #[link(name = "objc")]
 unsafe extern "C-unwind" {
-    /// Declared with NO parameter list on purpose — see the crate docs. Every
-    /// call goes through [`msg`], which casts this to the exact prototype of
-    /// the selector being sent.
+    /// Declared with no parameter list on purpose. Every call goes through
+    /// [`msg`], which casts it to the exact prototype of the selector.
     fn objc_msgSend();
     /// Same discipline as [`objc_msgSend`], but the first argument is a
     /// `*const ObjcSuper` rather than the receiver. Cast through [`msg_super`].
@@ -425,27 +321,21 @@ unsafe extern "C" {
     fn objc_release(obj: Id);
     fn objc_autoreleasePoolPush() -> *mut c_void;
     fn objc_autoreleasePoolPop(pool: *mut c_void);
-    /// Hand a +1 reference to the innermost pool. Bound for [`autorelease`],
-    /// which is what a declared method that RETURNS an object needs: a method
-    /// not named `new*`/`alloc`/`copy*`/`mutableCopy*` owes its caller a +0
-    /// reference, and `objc_autorelease` is the only way to produce one from a
-    /// +1 without dropping it on the floor.
+    /// Hand a +1 reference to the innermost pool, for [`autorelease`]: a
+    /// declared method returning an object not named
+    /// `new*`/`alloc`/`copy*`/`mutableCopy*` owes its caller +0.
     fn objc_autorelease(obj: Id) -> Id;
 
-    // --- class-pair creation. ZERO uses of any of these existed in the tree
-    // before this crate; `metal/ffi.rs` never needed to DEFINE a class, only to
-    // message existing ones. This is the capability gap the objc2 cluster was
-    // being paid for. ---
+    // --- class-pair creation ---
     pub(crate) fn objc_allocateClassPair(
         superclass: ClassPtr,
         name: *const c_char,
         extra_bytes: usize,
     ) -> ClassPtr;
     pub(crate) fn objc_registerClassPair(cls: ClassPtr);
-    // These three return the Objective-C `BOOL`, NOT Rust's `bool`: on
-    // `x86_64-apple-darwin` — the compat slice this repo lipos into its
-    // universal binary — `BOOL` is `signed char`, whose 256 values do not all
-    // have a valid `bool` bit pattern. See [`crate::Bool`].
+    // These return Objective-C `BOOL`, not `bool`: on `x86_64-apple-darwin`
+    // `BOOL` is `signed char`, not every value of which is a valid `bool`. See
+    // [`crate::Bool`].
     pub(crate) fn class_addMethod(
         cls: ClassPtr,
         name: Sel,
@@ -460,85 +350,48 @@ unsafe extern "C" {
         types: *const c_char,
     ) -> crate::encode::Bool;
     pub(crate) fn class_addProtocol(cls: ClassPtr, protocol: ProtocolPtr) -> crate::encode::Bool;
-    // --- protocol REGISTRATION: the half of the protocol API `class_addProtocol`
-    // turned out to need. A protocol is present in a process only if some
-    // LOADED IMAGE carries it in its `__objc_protolist`, and a compiled
-    // Objective-C file carries only the protocols it adopts or names in
-    // `@protocol(…)` — a header declaration alone registers nothing. On macOS
-    // 14.4.1 AppKit's `__objc_protolist` has 415 entries and
-    // `NSApplicationDelegate` is not among them (only SwiftUI's image carries
-    // it there, and aterm never
-    // loads SwiftUI); the macOS 26 release cutter does register it. A Rust
-    // binary has no `__objc_protolist` of its own, so these two calls are how
-    // aterm supplies the missing object itself. See [`protocol_or_register`]. ---
+    // --- protocol registration. A protocol exists in a process only if a
+    // loaded image lists it in `__objc_protolist`; a header declaration alone
+    // registers nothing, and AppKit does not carry `NSApplicationDelegate` on
+    // every macOS. A Rust binary has no `__objc_protolist`, so aterm registers
+    // missing protocols itself. See [`protocol_or_register`]. ---
     fn objc_allocateProtocol(name: *const c_char) -> ProtocolPtr;
     fn objc_registerProtocol(proto: ProtocolPtr);
     pub(crate) fn class_getInstanceVariable(cls: ClassPtr, name: *const c_char) -> IvarPtr;
     pub(crate) fn ivar_getOffset(ivar: IvarPtr) -> isize;
 
-    // --- reading a registered method back out. The WRITE half of the encoding
-    // contract (`class_addMethod`'s `types`) has been here since W1; this is
-    // the READ half, and W2 is what needed it: a port whose only evidence is
-    // "it compiles" is precisely the trap this campaign has already been caught
-    // by, and the runtime's own answer to "what did you register?" is the
-    // cheapest evidence there is. ---
+    // --- reading a registered method back: the read half of the encoding
+    // contract, so tests can ask the runtime what was registered. ---
     pub(crate) fn class_getInstanceMethod(cls: ClassPtr, name: Sel) -> *const c_void;
     pub(crate) fn method_getTypeEncoding(method: *const c_void) -> *const c_char;
 
-    // --- and the IMP behind a row, which is a different question from its
-    // ENCODING and the only one that can answer "whose code will run?".
-    // `vendor/winit/.../app.rs` does not DECLARE a class in product code at
-    // all: it SWIZZLES `-[NSApplication sendEvent:]` with
-    // `method_setImplementation`, which leaves the type encoding untouched by
-    // construction. So every encoding check in the tree passes whether that
-    // swizzle happened or not, and the only live evidence that it did is the
-    // address of the function the runtime will call. ---
+    // --- the IMP behind a method: the only evidence of whose code will run.
+    // A swizzle leaves the encoding untouched, so encoding checks cannot see
+    // one. ---
     pub(crate) fn method_getImplementation(method: *const c_void) -> *const c_void;
 
-    // --- and the WRITE half of that same question, which is the W12
-    // capability. `method_setImplementation` is the ONE runtime call that can
-    // replace an implementation the class already has; `class_addMethod`
-    // CANNOT substitute for it, because `declare.rs`'s `add_method` asserts on
-    // the `NO` it returns for an existing row and an existing row is the
-    // premise of a swizzle. MEASURED, on this box, against a throwaway class
-    // (`crates/aterm-objc/tests/swizzle.rs` re-measures all three in Rust):
-    //
-    // * `method_setImplementation` takes NO `types` argument. It returns the
-    //   previous IMP and leaves the encoding byte-identical — `i@:` before and
-    //   after.
-    // * `class_replaceMethod` given a deliberately lying `{_Lie=qqqq}@:B`
-    //   IGNORES it when the class already has the row directly; the encoding
-    //   stays as registered.
-    // * `class_addMethod` with the same lie returns `NO` and changes nothing.
-    //
-    // So no swizzle this crate can perform is able to corrupt a type encoding,
-    // which is exactly why no encoding-shaped guard in this tree can SEE one.
-    // See [`crate::swizzle`] for what that costs and what is checked instead.
+    // --- replacing an existing implementation, for [`crate::swizzle`].
+    // `class_addMethod` returns `NO` for an existing row, so it cannot
+    // substitute. `method_setImplementation` takes no `types` argument and
+    // leaves the encoding unchanged; `class_replaceMethod` ignores a differing
+    // `types` for a row the class already has; `class_addMethod` changes
+    // nothing (`tests/swizzle.rs`). So no swizzle can corrupt an encoding, and
+    // no encoding check can see one. ---
     pub(crate) fn method_setImplementation(
         method: *const c_void,
         imp: *const c_void,
     ) -> *const c_void;
 
-    // --- and the WHOLE table, which is the only way to ask a question about a
-    // class that does not begin by naming what you expect to find. Every
-    // encoding check this crate had before W3 started from a selector somebody
-    // wrote down; two compile-verified plants (an argument retyped `Id` ->
-    // `Bool`, and a protocol dropped from the `protocols:` list) proved that a
-    // checker holding its own copy of the list checks its own copy. These three
-    // are what let a caller enumerate what the runtime ACTUALLY registered and
-    // then go looking for each row's authority. See
-    // `crates/aterm-gui/examples/objc_live_class_audit.rs`. ---
+    // --- the whole method/protocol table, so a caller can enumerate what the
+    // runtime actually registered instead of checking its own copy of a list
+    // (`crates/aterm-gui/examples/objc_live_class_audit.rs`). ---
     fn class_copyMethodList(cls: ClassPtr, out_count: *mut c_uint) -> *mut *const c_void;
     fn method_getName(method: *const c_void) -> Sel;
     fn class_copyProtocolList(cls: ClassPtr, out_count: *mut c_uint) -> *mut ProtocolPtr;
     fn protocol_getName(proto: ProtocolPtr) -> *const c_char;
 
-    // --- and the PROTOCOL's own answer, which is the authority a delegate
-    // method has to match. `class_getInstanceMethod` reports what SOMEBODY
-    // registered; a protocol reports what the framework will CALL. For a
-    // declared class the two are only the same if the port got it right, and
-    // W3's census found one winit row where they are not
-    // (`draggingEntered:`: `B@:@` registered against `Q@:@` declared). ---
+    // --- a protocol's own method description: what the framework will call,
+    // as opposed to what a class registered. ---
     fn protocol_getMethodDescription(
         proto: ProtocolPtr,
         sel: Sel,
@@ -547,10 +400,8 @@ unsafe extern "C" {
     ) -> ObjcMethodDescription;
 }
 
-// `class_copyMethodList` and `class_copyProtocolList` hand back a
-// malloc'd array the CALLER owns — the only two runtime accessors this crate
-// binds that allocate. `free` arrives with `std`'s libc; binding it here is
-// cheaper and more honest than leaking one array per audited class.
+// `class_copyMethodList` and `class_copyProtocolList` return a malloc'd array
+// the caller owns and must `free`.
 unsafe extern "C" {
     fn free(ptr: *mut c_void);
 }
@@ -566,90 +417,46 @@ struct ObjcMethodDescription {
     types: *const c_char,
 }
 
-// The INDIRECT-RETURN entry points, which exist ONLY on x86_64. `libobjc` on
-// arm64 exports no such symbol — MEASURED, by linking a C file that references
-// it: `-arch x86_64` links, `-arch arm64` fails with `Undefined symbols for
-// architecture arm64: "_objc_msgSend_stret"`. So the `cfg` is not tidiness; a
-// reference reaching an arm64 link line stops the build, and one reaching it
-// only under some feature combination would stop it in someone else's lane.
-// `objc_msgSend_stret` is what a send whose return value is
-// classified MEMORY by the System V x86-64 ABI must go through: the caller
-// passes a hidden pointer to the result in `RDI`, which is where plain
-// `objc_msgSend` expects `self`, so every argument shifts by one register and
-// the send silently reads garbage. On AAPCS64 the indirect-return pointer has
-// its own register (`x8`) and never displaces an argument, which is why arm64
-// has one entry point and needs no variant.
+// The indirect-return entry points exist only on x86_64; arm64 libobjc exports
+// no `_objc_msgSend_stret`, so a reference reaching an arm64 link fails.
+// System V x86-64 returns a MEMORY-class value through a hidden pointer in
+// `RDI`, where plain `objc_msgSend` expects `self`, so every argument would
+// shift by one register. AAPCS64 uses `x8` for that pointer, so arm64 needs
+// one entry point.
 //
-// `objc_msgSend_fpret` (x86_64 `long double`) and `objc_msgSend_fp2ret`
-// (`_Complex long double`) are deliberately NOT bound: Rust has no type with
-// the x87 80-bit ABI, so no prototype this crate can express reaches them.
-// Measured with clang, not assumed — see `tests/abi.rs`, which records the
-// per-return-type codegen and the boundary at 16 bytes.
+// `objc_msgSend_fpret` / `_fp2ret` (x87 `long double`) are not bound: no Rust
+// type has that ABI. `tests/abi.rs` records the per-return-type codegen.
 #[cfg(target_arch = "x86_64")]
 #[link(name = "objc")]
 unsafe extern "C-unwind" {
-    /// Same discipline as [`objc_msgSend`]: no parameter list, cast per send —
-    /// and the same `"C-unwind"` ABI, for the same reason.
+    /// Same discipline and `"C-unwind"` ABI as [`objc_msgSend`].
     fn objc_msgSend_stret();
     /// Same, against the super entry point.
     fn objc_msgSendSuper_stret();
 }
 
-// Foundation supplies `NSString`, which [`ns_string`] and [`ns_error_string`]
-// need. This block declares no symbol: its ONLY job is the `-framework
-// Foundation` link directive, because every class this crate reaches for lives
-// there rather than in `libobjc`. (`metal/ffi.rs` removed an empty
-// `#[link(name = "QuartzCore")]` block because the claim beside it was FALSE —
-// nothing in that file touched QuartzCore. Here the claim is true and load-
-// bearing: drop this block and `class(c"NSString")` returns nil in a binary
-// that links nothing else from Foundation, which `aterm-objc`'s own test
-// binary does not.)
+// Declares no symbol: it only links Foundation, where `NSString` and the other
+// classes this crate looks up live. Without it `class(c"NSString")` is nil in
+// a binary that links nothing else from Foundation, such as this crate's tests.
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
 
 /// A message-send prototype, decomposed far enough that [`msg`] can read its
-/// RETURN TYPE and pick the right entry point.
+/// return type and pick the right entry point.
 ///
-/// Implemented for `unsafe extern "C-unwind" fn(..) -> R` up to SIXTEEN parameters,
-/// INCLUDING the implicit `self` and `_cmd` — so up to a fourteen-colon
-/// selector. Counting the implicit pair is the whole of the correction: the
-/// ceiling used to be twelve parameters and was described as "every arity this
-/// crate can be asked for", which was false by demonstration, because
-/// `declare_class!` has no ceiling at all. An eleven-ARGUMENT method declared,
-/// registered and dispatched from Objective-C but could not be SENT from Rust
-/// (`E0277`), which is the arity trap D1 closed, one level up and one register
-/// further out.
+/// Implemented for `unsafe extern "C-unwind" fn(..) -> R` with up to sixteen
+/// parameters including the implicit `self` and `_cmd`, i.e. up to fourteen
+/// arguments. Sixteen is headroom, not an ABI boundary (register passing ends
+/// at eight on AAPCS64 and six on System V; the rest spill to the stack).
+/// AppKit's widest initializer takes ten arguments.
+/// [`crate::declare_class!`] asserts the same ceiling, so a method Rust cannot
+/// send fails to compile rather than registering.
 ///
-/// Sixteen is a ROUND NUMBER that clears every real signature by a wide margin.
-/// It used to be justified as stopping "where the ABI stops being uniform", and
-/// THAT IS FALSE: AAPCS64 has eight integer argument registers and System V
-/// x86-64 has six, so uniformity ends at eight and at six respectively — far
-/// below sixteen, and at two different places. Every arity past those spills to
-/// the stack, which the C ABI handles perfectly well and which `objc_msgSend`
-/// tail-calls through unchanged; there is no ABI edge at sixteen to stop at.
-/// The honest statement is the one this paragraph now makes: sixteen is where
-/// the macro repetition stops, chosen for headroom, not for a machine reason.
-/// AppKit's widest initializer,
-/// `initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:`,
-/// is exactly ten arguments — twelve parameters — and the widest real selector
-/// otherwise in the tree, `addObserver:selector:name:object:`, is four.
+/// The bound is what makes the `_stret` choice automatic — see
+/// [`returns_indirectly`].
 ///
-/// # The ceiling is loud at BOTH ends
-///
-/// It used to be loud only here. [`crate::declare_class!`] had no arity limit
-/// at all, so a fifteen-argument method REGISTERED, answered
-/// `respondsToSelector:` with `YES`, dispatched from Objective-C — and was
-/// unreachable from Rust, because no `MsgFn` impl could build its prototype.
-/// That is D1's trap and F1's trap a third time. The macro now carries a
-/// `const` assertion of its own, so the class fails to compile with a message
-/// naming this ceiling instead of registering a method Rust cannot call.
-///
-/// The bound is what makes the `_stret` choice AUTOMATIC rather than a rule a
-/// call site is asked to remember — see [`returns_indirectly`].
-///
-/// Fourteen arguments — sixteen parameters — is sendable; `tests/adversary_w2c.rs`
-/// declares such a method, registers it and sends it. Fifteen is not, and the
-/// wall is loud rather than silent:
+/// Fourteen arguments are sendable (`tests/adversary_w2c.rs`); fifteen do not
+/// compile:
 ///
 /// ```compile_fail
 /// # use aterm_objc::{Id, Sel, msg};
@@ -661,15 +468,9 @@ unsafe extern "C" {}
 /// ) -> i64 = unsafe { msg() };
 /// ```
 ///
-/// # The ABI is `"C-unwind"`, and ONLY `"C-unwind"`
-///
-/// There is deliberately no impl for `unsafe extern "C" fn(..)`. A send
-/// declared `"C"` is `nounwind` to rustc, so the frame making it has no
-/// landing pad for the `NSException` AppKit may raise inside it — its `Drop`s
-/// are skipped, or the process aborts with `failed to initiate panic`, or LLVM
-/// deletes the `catch_unwind` above it (all three MEASURED; see the note on
-/// `objc_msgSend`). One such callee on the path a raise takes is enough, so
-/// the old spelling is refused at the type level rather than discouraged:
+/// There is no impl for `unsafe extern "C" fn(..)`: a `"C"` send is
+/// `nounwind`, so an `NSException` raised inside it skips the calling frame's
+/// `Drop`s or aborts (see the note on `objc_msgSend`):
 ///
 /// ```compile_fail
 /// # use aterm_objc::{Id, Sel, msg};
@@ -678,10 +479,9 @@ unsafe extern "C" {}
 ///
 /// # Safety
 /// An implementor must be a bare `unsafe extern "C-unwind"` function pointer
-/// whose return type is `Ret`. Nothing else may implement it: [`msg`]
-/// transmutes a raw symbol address into `Self` and dispatches on
-/// `size_of::<Self::Ret>()`, so a lying `Ret` picks the wrong `objc_msgSend`
-/// variant — and a `"C"` implementor would reopen the unwinding hole above.
+/// whose return type is `Ret`: [`msg`] transmutes a symbol address into `Self`
+/// and dispatches on `size_of::<Self::Ret>()`, so a lying `Ret` picks the wrong
+/// entry point.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a message-send prototype `aterm-objc` can build",
     label = "not an `unsafe extern \"C-unwind\" fn(..) -> R` of at most 16 parameters",
@@ -695,9 +495,8 @@ pub unsafe trait MsgFn: Copy {
 
 macro_rules! impl_msg_fn {
     ($($arg:ident),*) => {
-        // SAFETY: the implementing type IS an `unsafe extern "C-unwind"`
-        // function pointer and `Ret` is written from its own return position,
-        // so it cannot disagree with itself.
+        // SAFETY: the implementing type is an `unsafe extern "C-unwind"`
+        // function pointer and `Ret` is its own return type.
         unsafe impl<Ret, $($arg),*> MsgFn for unsafe extern "C-unwind" fn($($arg),*) -> Ret {
             type Ret = Ret;
         }
@@ -725,23 +524,18 @@ impl_msg_fn!(
     A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
 );
 
-/// Whether a `R` comes back through a HIDDEN POINTER on this target's C ABI —
+/// Whether `R` comes back through a hidden pointer on this target's C ABI,
 /// which decides whether a send must go through `objc_msgSend_stret`.
 ///
-/// * `aarch64-apple-darwin`: always `false`. AAPCS64 passes the indirect-result
-///   pointer in `x8`, a register no argument ever occupies, so one entry point
-///   serves every return type and `libobjc` exports no `_stret` variant at all.
-/// * `x86_64-apple-darwin`: `size_of::<R>() > 16`. MEASURED against clang, not
-///   read off the System V document — a 16-byte struct of two `double`s comes
-///   back in `xmm0`/`xmm1` (plain `objc_msgSend`), a 17-byte one goes to memory
-///   (`objc_msgSend_stret`). See `tests/abi.rs`.
+/// * `aarch64-apple-darwin`: always `false`. The indirect-result pointer goes
+///   in `x8`, which no argument occupies, and libobjc has no `_stret` variant.
+/// * `x86_64-apple-darwin`: `size_of::<R>() > 16` (a 16-byte struct of two
+///   `double`s returns in `xmm0`/`xmm1`, 17 bytes goes to memory; see
+///   `tests/abi.rs`), or `R` has unaligned fields.
 ///
-/// # The term `size_of` cannot see
-///
-/// System V x86-64 classifies an object MEMORY if it is larger than eight
-/// eightbytes **or it contains unaligned fields**, and the second clause has no
-/// size threshold at all. MEASURED with clang on this box, real ObjC sends,
-/// `-arch x86_64 -O1 -S`, reading which symbol the call lands on:
+/// System V classifies a struct MEMORY if it exceeds eight eightbytes or
+/// contains unaligned fields, and the second clause has no size threshold.
+/// clang `-arch x86_64 -O1 -S` on real ObjC sends:
 ///
 /// ```text
 /// size align  type                                             x86_64 entry
@@ -756,18 +550,11 @@ impl_msg_fn!(
 ///   24     8  struct { double a, b, c; }                        _objc_msgSend_stret
 /// ```
 ///
-/// Two rows decide the design. A THREE-byte packed struct goes indirect, so
-/// there is no size below which the check can be skipped. And `packed { int
-/// a,b,c,d }` (16 bytes, align 1) goes DIRECT while `packed { char; short; }`
-/// (3 bytes, align 1) goes INDIRECT — identical `align_of`, opposite ABI —
-/// while `packed { char; short; }` and `struct { char c[3]; }` have the SAME
-/// size AND the SAME alignment and still differ. So no predicate over
-/// `size_of` and `align_of` can decide this, and the answer has to come from
-/// the type's author. It does, as [`crate::Encode::HAS_UNALIGNED_FIELDS`],
-/// which every impl in this crate takes the `false` default for and a packed
-/// type must set by hand — and [`msg`] will not send a return type that has no
-/// `Encode` impl at all, so there is no way to reach this function without
-/// having answered the question.
+/// Types with identical `size_of` and `align_of` land on different entry
+/// points, so the answer comes from the type's author as
+/// [`crate::Encode::HAS_UNALIGNED_FIELDS`] (default `false`; a packed type
+/// sets it). [`msg`] requires an `Encode` return type, so the question is
+/// always answered.
 #[inline]
 #[must_use]
 pub const fn returns_indirectly<R: crate::encode::Encode>() -> bool {
@@ -781,10 +568,9 @@ fn stret_entry() -> *const c_void {
     objc_msgSend_stret as *const c_void
 }
 
-/// Unreachable off x86_64: [`returns_indirectly`] is a `const false` there, so
-/// the branch that calls this folds away before codegen. It is a diverging
-/// function rather than a `cfg` around the body of [`msg`] so that both
-/// architectures compile the SAME send logic.
+/// Unreachable off x86_64: [`returns_indirectly`] is `const false` there, so
+/// the call folds away. A diverging function rather than a `cfg` in [`msg`]
+/// keeps one send logic for both architectures.
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 fn stret_entry() -> *const c_void {
@@ -808,19 +594,10 @@ fn super_stret_entry() -> *const c_void {
 /// Cast the untyped `objc_msgSend` to a concrete prototype, choosing the
 /// `_stret` entry point when `F`'s return type needs it.
 ///
-/// The choice is made by [`returns_indirectly`] from `F`'s own return type in a
-/// `const` block, so it costs nothing at run time and — this is the point — a
-/// call site CANNOT get it wrong. `metal/ffi.rs` had the same hazard and was
-/// safe only by accident of its selector set; here the type system picks.
-///
-/// The `Encode` bound on the return type is not decoration: it is what closes
-/// the packed-struct gap described on [`returns_indirectly`], because the ABI
-/// question it answers is one no amount of `size_of` can. It also refuses a
-/// `-> bool` prototype outright — `bool` deliberately has no [`crate::Encode`]
-/// impl, so an ObjC `BOOL` return can only be spelled [`crate::Bool`], which is
-/// D3's rule enforced on the RETURN side instead of merely documented there.
-/// It caught two live `-> bool` sends when it landed, one of them in
-/// `aterm-gui`.
+/// [`returns_indirectly`] decides in a `const` block, so the choice is free at
+/// run time and no call site can get it wrong. The `Encode` bound on the return
+/// type answers the packed-struct question `size_of` cannot, and refuses
+/// `-> bool` (an ObjC `BOOL` return is spelled [`crate::Bool`]).
 ///
 /// A return type whose ABI nobody has stated does not compile:
 ///
@@ -842,29 +619,25 @@ fn super_stret_entry() -> *const c_void {
 /// ```
 ///
 /// # Safety
-/// `F` must be the EXACT C prototype of the selector about to be sent,
-/// including the implicit `(self, _cmd)` leading pair. Getting this wrong is
-/// undefined behaviour on every Apple ABI.
+/// `F` must be the exact C prototype of the selector about to be sent,
+/// including the implicit `(self, _cmd)` pair. Anything else is undefined
+/// behaviour on every Apple ABI.
 #[inline]
 #[must_use]
 pub unsafe fn msg<F: MsgFn>() -> F
 where
     <F as MsgFn>::Ret: crate::encode::Encode,
 {
-    // A function pointer is exactly one pointer wide, so this rejects an `F`
-    // that could not be one. It does NOT prove `F` is a function type — a
-    // pointer-sized `F` would pass — which is why `MsgFn` is the real guard and
-    // is `unsafe` to implement.
+    // Rejects an `F` that is not pointer-wide. It does not prove `F` is a
+    // function type; `MsgFn` (unsafe to implement) is the real guard.
     const { assert!(size_of::<F>() == size_of::<*const c_void>()) };
     let entry = if const { returns_indirectly::<<F as MsgFn>::Ret>() } {
         stret_entry()
     } else {
         objc_msgSend as *const c_void
     };
-    // SAFETY: `entry` is the address of a function symbol, so it is a valid
-    // function pointer, and the assertion above pins `F` to pointer width. The
-    // caller's `F` supplies the prototype; the entry point matches `F`'s return
-    // class by construction.
+    // SAFETY: `entry` is a function symbol's address and `F` is pointer-wide.
+    // `F` supplies the prototype; the entry point matches its return class.
     unsafe { std::mem::transmute_copy(&entry) }
 }
 
@@ -872,9 +645,8 @@ where
 /// automatic `_stret` selection as [`msg`].
 ///
 /// # Safety
-/// `F` must be the EXACT C prototype of the selector about to be sent, with
-/// `*const ObjcSuper` in the receiver position and `Sel` second. The same
-/// register-corruption rule as [`msg`] applies, and so does its `Encode` bound.
+/// `F` must be the exact C prototype of the selector, with `*const ObjcSuper`
+/// in the receiver position and `Sel` second; otherwise as [`msg`].
 #[inline]
 #[must_use]
 pub unsafe fn msg_super<F: MsgFn>() -> F
@@ -892,36 +664,25 @@ where
     unsafe { std::mem::transmute_copy(&entry) }
 }
 
-/// The type encoding the runtime holds for `cls`'s INSTANCE method `name`, or
-/// `None` if the class does not implement it.
+/// The type encoding the runtime holds for `cls`'s instance method `name`, or
+/// `None` if neither it nor a superclass implements it.
 ///
-/// This is the mirror of what [`crate::declare_class!`] wrote through
-/// `class_addMethod`, read back from the runtime's own method table. It exists
-/// so a port can be checked against the encoding table rather than asserted to
-/// match it: `method_types(cls, sel!(validateMenuItem:))` returning
-/// `"B@:@"` on arm64 (`"c@:@"` on the x86_64 compat slice) is the difference
-/// between a `BOOL` AppKit can read and one it cannot.
-///
-/// Inherited methods count — `class_getInstanceMethod` walks the superclass
-/// chain — so a `None` means "no implementation anywhere above this class",
-/// which for a selector this crate declared would mean registration failed.
+/// Reads back what [`crate::declare_class!`] registered, so a port can be
+/// checked against the runtime: `method_types(cls, sel!(validateMenuItem:))`
+/// is `"B@:@"` on arm64 and `"c@:@"` on x86_64.
 ///
 /// # Safety
 /// `cls` must be a live class object.
 #[must_use]
 pub unsafe fn method_types(cls: ClassPtr, name: Sel) -> Option<String> {
-    // SAFETY: the caller guarantees `cls` is live; `name` is an interned
-    // selector, and `class_getInstanceMethod` tolerates a selector the class
-    // does not implement by returning NULL.
+    // SAFETY: `cls` is live; `name` is interned; an unimplemented selector
+    // yields NULL.
     let method = unsafe { class_getInstanceMethod(cls, name) };
     if method.is_null() {
         return None;
     }
-    // SAFETY: `method` is a live `Method` handle from the call above, and
-    // `method_getTypeEncoding` returns the NUL-terminated string the runtime
-    // copied at `class_addMethod` time and owns for the life of the class.
-    // It CAN be null for a method with no recorded types, which is why this is
-    // checked rather than assumed.
+    // SAFETY: `method` is a live `Method`; the encoding string is owned by the
+    // runtime for the class's life, and may be null (checked).
     let types = unsafe { method_getTypeEncoding(method) };
     if types.is_null() {
         return None;
@@ -937,24 +698,17 @@ pub unsafe fn method_types(cls: ClassPtr, name: Sel) -> Option<String> {
 /// The IMP the runtime will call for `name` on `cls`, or `None` if the class
 /// does not respond to it.
 ///
-/// The twin of [`method_types`], and the question that one cannot answer: an
-/// encoding says what SHAPE the call has, an IMP says WHOSE CODE runs. They
-/// come apart exactly where a swizzle lives — `method_setImplementation`
-/// replaces the function and keeps the types — which is the case
-/// `vendor/winit/src/platform_impl/macos/app.rs` is, and the reason this exists.
-///
-/// The returned pointer is a code address and is NEVER dereferenced or called
-/// through by this crate; it is for identity comparison and for asking the
-/// dynamic loader which image it came from.
+/// Where [`method_types`] gives the call's shape, this says whose code runs;
+/// the two differ after a swizzle, which replaces the IMP and keeps the types.
+/// The pointer is never called or dereferenced here: it is for identity
+/// comparison and for asking the dynamic loader which image it came from.
 ///
 /// # Safety
 /// `cls` must be a live class object or null.
 #[must_use]
 pub unsafe fn method_imp(cls: ClassPtr, name: Sel) -> Option<*const c_void> {
-    // SAFETY: the caller pins `cls` as live-or-null; `class_getInstanceMethod`
-    // tolerates null and a selector the class does not implement, answering
-    // NULL for both, and it walks the superclass chain exactly as
-    // `method_types` does.
+    // SAFETY: `cls` is live or null; `class_getInstanceMethod` answers NULL for
+    // null or an unimplemented selector and walks the superclass chain.
     let method = unsafe { class_getInstanceMethod(cls, name) };
     if method.is_null() {
         return None;
@@ -964,33 +718,21 @@ pub unsafe fn method_imp(cls: ClassPtr, name: Sel) -> Option<*const c_void> {
     (!imp.is_null()).then_some(imp)
 }
 
-/// The type encoding a PROTOCOL declares for `name`, or `None` if the protocol
-/// does not declare it.
+/// The type encoding a protocol declares for `name`, or `None` if it does not.
 ///
-/// This is the authority side of the encoding contract, and it is a different
-/// question from [`method_types`]. `method_types` answers "what did somebody
-/// register?"; this answers "what will the framework CALL?" — and for a
-/// declared class the two agree only if the port got it right. It is what makes
-/// a delegate row CHECKABLE rather than asserted: `NSDraggingDestination`
-/// declares `-draggingEntered:` as `Q24@0:8@16` (an eight-byte
-/// `NSDragOperation`), and a port that writes the Rust signature as `-> bool`
-/// registers `B@:@` — a ONE-byte return where the framework reads eight. That
-/// row exists in `vendor/winit`, and this function is how W3 found it in all
-/// seventy-two rather than in the one it was told about.
+/// The authority side of the encoding contract: [`method_types`] says what was
+/// registered, this says what the framework will call. For example
+/// `NSDraggingDestination` declares `-draggingEntered:` as `Q24@0:8@16`, and a
+/// port that returns `bool` registers a one-byte return where AppKit reads
+/// eight.
 ///
-/// Both the required and the optional table are searched, required first,
-/// because a delegate protocol declares almost everything optional and the
-/// caller almost never cares which table a row came from.
-///
-/// The string is the COMPILER-EMITTED form, with byte offsets
-/// (`"v24@0:8@16"`). [`crate::strip_method_offsets`] is the other half of any
-/// comparison against what this crate registers, which is offset-free by
-/// design — see the [`crate::encode`] module note.
+/// Searches the required table, then the optional one. The string is the
+/// compiler-emitted form with byte offsets (`"v24@0:8@16"`); compare through
+/// [`crate::strip_method_offsets`], since this crate registers offset-free
+/// strings (see [`crate::encode`]).
 ///
 /// # Safety
-/// `proto` must be a live protocol object (`nil` is tolerated and answers
-/// `None`, since `objc_getProtocol` returns nil for a framework that is not
-/// loaded).
+/// `proto` must be a live protocol object or nil (answers `None`).
 #[must_use]
 pub unsafe fn protocol_method_types(
     proto: ProtocolPtr,
@@ -1001,17 +743,14 @@ pub unsafe fn protocol_method_types(
         return None;
     }
     let is_instance = crate::encode::Bool::new(instance_method);
-    // SAFETY: the caller pins `proto` as live; `name` is an interned selector.
-    // `protocol_getMethodDescription` tolerates a selector the protocol does
-    // not declare by returning a ZEROED description, which is why `types` is
-    // null-checked rather than assumed.
+    // SAFETY: `proto` is live; `name` is interned. An undeclared selector
+    // yields a zeroed description, so `types` is null-checked.
     let mut desc = unsafe {
         protocol_getMethodDescription(proto, name, crate::encode::Bool::YES, is_instance)
     };
     if desc.types.is_null() {
-        // SAFETY: as above, against the OPTIONAL table — where every
-        // `NSWindowDelegate` and `NSDraggingDestination` row this port cares
-        // about actually lives.
+        // SAFETY: as above, against the optional table, where delegate rows
+        // usually live.
         desc = unsafe {
             protocol_getMethodDescription(proto, name, crate::encode::Bool::NO, is_instance)
         };
@@ -1030,9 +769,8 @@ pub unsafe fn protocol_method_types(
 
 /// Resolve a selector from a checked C-string literal, e.g. `sel(c"length")`.
 ///
-/// This is the UNCACHED form `metal/ffi.rs` uses — one `sel_registerName` per
-/// send. [`crate::sel!`] is the cached form and is what the per-frame call
-/// sites should use; see that macro for the measurement.
+/// Uncached: one `sel_registerName` per call. Per-frame call sites use the
+/// cached [`crate::sel!`].
 #[inline]
 #[must_use]
 pub fn sel(name: &'static CStr) -> Sel {
@@ -1043,81 +781,41 @@ pub fn sel(name: &'static CStr) -> Sel {
 
 /// Look up a class from a checked C-string literal, e.g. `class(c"NSString")`.
 ///
-/// # THIS IS NOT CACHED, AND IT COSTS MORE THAN THE SEND IT PRECEDES
-///
-/// [`sel!`](crate::sel) caches per call site because `metal/ffi.rs` resolving a
-/// selector on every send was worth fixing. `objc_getClass` is the same shape —
-/// a `libobjc` call that hashes a string — and it is NOT cached, so a call site
-/// spelled `class(c"Foo")` pays that hash on every pass.
-///
-/// MEASURED on this box, release, 2x10^6 iterations per arm, four alternating
-/// rounds (spread across rounds shown):
-///
-/// ```text
-/// pthread_main_np()                          0.87 ns/op
-/// objc_msgSend(+isMainThread), cached class   1.67-1.97 ns/op
-/// objc_getClass("NSThread")  ALONE           16.94-17.46 ns/op
-/// MainThread::new()  (getClass + the send)   18.24-18.68 ns/op
-/// ```
-///
-/// So the lookup is ~10x the send it exists to address, and it is 91% of what
-/// [`crate::MainThread::new`] costs — which is what [`crate::run_on_main`]
-/// pays on EVERY call, including its direct path. A real drive
-/// (`aterm-gui`'s `objc_ime_drive`, instrumented) performs **908** of these in
-/// one short window+IME session, and there are 115 `class(c"…")` call sites in
-/// the tree, several on per-frame Metal paths.
-///
-/// Nothing here is a correctness problem: classes are immortal and the pointer
-/// is stable, which is exactly why a `ClassCache` mirroring [`crate::SelCache`]
-/// would be sound and would take the number to ~2 ns. It is recorded rather
-/// than fixed because the fix is an API addition, not a bug fix, and because a
-/// cost this module states must be the cost it has.
+/// Not cached: every call pays `objc_getClass`'s string hash, roughly ten times
+/// the cost of a send and most of what [`crate::MainThread::new`] (and so
+/// [`crate::run_on_main`]) costs. Classes are immortal, so a cache mirroring
+/// [`crate::SelCache`] would be sound.
 #[inline]
 #[must_use]
 pub fn class(name: &'static CStr) -> ClassPtr {
-    // SAFETY: `CStr` supplies the exact C-string contract. Classes are
-    // immortal; the returned pointer is never released.
+    // SAFETY: `CStr` gives a valid C string. Classes are immortal; the pointer
+    // is never released.
     unsafe { objc_getClass(name.as_ptr()) }
 }
 
 /// Look up a protocol by name, e.g. `protocol(c"NSMenuDelegate")`. Null when
-/// no loaded image registers it. A pure lookup: it never registers anything,
-/// so a test process can observe true absence.
+/// no loaded image registers it. A pure lookup that never registers anything.
 ///
-/// Presence is a property of the LOADED IMAGES, not of what this binary links:
-/// the runtime registers a protocol only from an image whose
-/// `__objc_protolist` carries it, and a framework carries only the protocols
-/// its compiled files adopt or name in `@protocol(…)`. A framework that merely
-/// DECLARES a protocol in a header may not register it, and whether it does
-/// changes between macOS releases. Measured on macOS 14.4.1 with AppKit loaded:
-/// `NSWindowDelegate`, `NSMenuDelegate`, `NSToolbarDelegate`,
-/// `NSTextFieldDelegate`, `NSTextInputClient` and `NSDraggingDestination` are
-/// present and `NSApplicationDelegate` is ABSENT (the 415 entries of AppKit's
-/// `__objc_protolist` do not include it; only SwiftUI's image carries it
-/// there); on the
-/// macOS 26 release cutter it is present. So null does not mean the framework
-/// is unlinked — `class(c"NSApplication")` answers that — and a class that has
-/// to CLAIM a protocol goes through [`protocol_or_register`], which supplies
-/// the object when the host did not.
+/// Presence depends on the loaded images: the runtime registers a protocol only
+/// from an image whose `__objc_protolist` carries it, which a framework that
+/// merely declares it in a header may not, and this varies between macOS
+/// releases (some ship AppKit without `NSApplicationDelegate`). So null does
+/// not mean the framework is unlinked (`class(c"NSApplication")` answers that).
+/// A class that must claim a protocol uses [`protocol_or_register`].
 #[inline]
 #[must_use]
 pub fn protocol(name: &'static CStr) -> ProtocolPtr {
-    // SAFETY: `CStr` supplies the exact C-string contract. Protocol objects are
-    // immortal and are never released.
+    // SAFETY: `CStr` gives a valid C string. Protocol objects are immortal and
+    // never released.
     unsafe { objc_getProtocol(name.as_ptr()) }
 }
 
-/// The names of every protocol THIS CRATE registered because no loaded image
-/// had — in registration order, each once.
+/// The names of every protocol this crate registered because no loaded image
+/// had, in registration order, each once.
 ///
-/// Empty on a host whose frameworks register everything the tree claims (the
-/// macOS 26 release cutter); `["NSApplicationDelegate"]` on macOS 14.4.1 once
-/// the application delegate's class has been built. An auditor or census uses
-/// this to tell "the host's framework does not register this protocol" from
-/// "the framework registered it", which matters because a protocol this crate
-/// registered is NAME-ONLY: it declares no methods, so it is never an
-/// authority an encoding can be checked against, and
-/// [`protocol_method_types`] answers `None` for every selector on it.
+/// Tells an auditor "the host framework does not register this protocol" from
+/// "it does". A protocol registered here is name-only, so it is never an
+/// encoding authority: [`protocol_method_types`] answers `None` for it.
 #[must_use]
 pub fn protocols_registered_by_aterm() -> Vec<&'static CStr> {
     registered()
@@ -1133,53 +831,32 @@ fn registered() -> &'static std::sync::Mutex<Vec<&'static CStr>> {
     &REGISTERED
 }
 
-/// The protocol object for `name`, supplied by this crate if no loaded image
+/// The protocol object for `name`, registered by this crate if no loaded image
 /// registers it.
 ///
-/// This is what a class that CLAIMS a protocol needs, and the reason it cannot
-/// be plain [`protocol`]: `class_addProtocol` takes a protocol object, and
-/// whether the host's framework registered one is a fact about that host's
-/// build of the framework (see [`protocol`]). The alternatives were measured
-/// and rejected. Skipping the claim when the object is absent — what objc2's
-/// `declare_class!` did, silently, through v0.71.0 — leaves
-/// `-conformsToProtocol:` answering NO for a class whose whole job is to be
-/// that delegate, with nothing recording that it happened. Panicking — what
-/// v0.72.0 through v0.75.0 shipped — killed the app at launch on macOS 14.4.1
-/// before its first window, because the release cutter runs on macOS 26 where
-/// the one protocol AppKit does not register on 14.4.1 happens to be present.
+/// `class_addProtocol` needs a protocol object, and whether the host framework
+/// registers one varies by macOS release (see [`protocol`]). Skipping the claim
+/// leaves `-conformsToProtocol:` answering NO; panicking kills the app on hosts
+/// that lack the protocol.
 ///
-/// When the lookup is null this allocates a protocol of that name with
-/// `objc_allocateProtocol`, registers it with `objc_registerProtocol`, and
-/// records the name for [`protocols_registered_by_aterm`]. The protocol is
-/// NAME-ONLY on purpose: no method descriptions, no parent protocols. What a
-/// claim needs from the object is its identity — `conformsToProtocol:`
-/// compares names — and AppKit reaches a claimant's rows by selector, never
-/// through the protocol's method table: the application delegate's rows by
-/// `-respondsToSelector:` (measured on 14.4.1: a delegate with an EMPTY
-/// protocol list received every launch and termination row, after 26
-/// `application*` `respondsToSelector:` probes and zero `conformsToProtocol:`
-/// sends), and a text input client's REQUIRED rows by direct send once the
-/// class conforms (see [`class_protocols`]) — which a name-only protocol does
-/// not change, since the rows live on the class. Descriptions copied from a Rust-side table
-/// would make this crate the AUTHORITY the seam census checks the port
-/// against, and a census that compares a port to its own transcription checks
-/// nothing.
+/// When the lookup is null this allocates and registers a name-only protocol
+/// (no method descriptions, no parents) and records it for
+/// [`protocols_registered_by_aterm`]. A claim needs only identity:
+/// `conformsToProtocol:` compares names, and AppKit reaches a claimant's rows
+/// by selector (`-respondsToSelector:` for the application delegate, direct
+/// sends of required rows for a text input client; see [`class_protocols`]).
+/// Copying method descriptions from a Rust table would make this crate the
+/// authority the seam census checks the port against.
 ///
-/// Registration is serialized under one lock and is idempotent: a second
-/// caller finds the first's object through `objc_getProtocol`, and what is
-/// returned is always the runtime's answer, never the allocated pointer — two
-/// unserialized allocations of one name both succeed in libobjc and the loser
-/// is an orphan `objc_getProtocol` never returns (measured). If an image
-/// loaded LATER carries the real protocol (on 14.4.1, SwiftUI or ShareKit),
-/// the runtime keeps the object already registered under that name and remaps
-/// the image's own references to it, without a diagnostic (measured), so every
-/// `@protocol(…)` in the process still names one object.
+/// Registration is serialized under one lock and idempotent; the returned
+/// object is always `objc_getProtocol`'s answer, since two unserialized
+/// allocations of one name both succeed and the loser is an orphan. An image
+/// loaded later that carries the real protocol has its references remapped to
+/// the object already registered, so every `@protocol(…)` names one object.
 ///
 /// # Panics
-/// If the runtime refuses to register — allocation answering nil although the
-/// lookup found nothing, or the lookup still nil after registration — which no
-/// caller can provoke and a class that must claim a protocol cannot proceed
-/// without.
+/// If the runtime refuses to register (allocation nil although the lookup
+/// found nothing, or the lookup still nil after registration).
 #[must_use]
 pub fn protocol_or_register(name: &'static CStr) -> ProtocolPtr {
     let found = protocol(name);
@@ -1230,9 +907,7 @@ pub unsafe fn class_of(obj: Id) -> ClassPtr {
 /// A class's superclass. Null for a root class (or for `nil`).
 ///
 /// # Safety
-/// `cls` must be a live class object, or null. `metal/ffi.rs` left the
-/// equivalent accessors safe; this crate does not, because a `ClassPtr` here
-/// can come from a caller rather than only from [`class`] two lines above.
+/// `cls` must be a live class object, or null.
 #[must_use]
 pub unsafe fn superclass_of(cls: ClassPtr) -> ClassPtr {
     // SAFETY: class pointers are immortal once registered; the accessor has no
@@ -1254,33 +929,18 @@ pub unsafe fn class_name(cls: ClassPtr) -> &'static CStr {
     unsafe { CStr::from_ptr(class_getName(cls)) }
 }
 
-/// Every instance method a class registered ITSELF, with the type encoding the
+/// Every instance method a class registered itself, with the type encoding the
 /// runtime holds for each.
 ///
-/// # Why enumeration and not lookup
+/// Enumerates rather than looks up, so a check starts from what the runtime has
+/// and finds each row's authority ([`protocol_method_types`] /
+/// [`method_types`]) instead of re-checking its own list of selectors.
 ///
-/// [`method_types`] answers "what is registered for the selector I named", and
-/// every encoding check in this repository was built on it until W3. That shape
-/// cannot see a row nobody named, and it cannot see that the list it was handed
-/// has gone stale — which is not a hypothetical: two compile-verified plants in
-/// `vendor/winit`'s ported delegate (an argument retyped `Id` -> [`Bool`], and
-/// `NSWindowDelegate` deleted from the `protocols:` list) both passed a checker
-/// that re-declared the selectors it intended to check. This function is the
-/// other direction: ask the CLASS what it has, then go and find each row's
-/// authority ([`protocol_method_types`] / [`method_types`]).
-///
-/// INHERITED METHODS ARE NOT INCLUDED. `class_copyMethodList` reports only what
-/// this class object itself registered, which is exactly the set a
-/// [`crate::declare_class!`] site is responsible for; the superclass chain is
-/// [`method_types`]'s business.
-///
-/// The encoding is `None` for a method registered with no type string —
-/// impossible through [`crate::declare_class!`], possible through raw
-/// `class_addMethod`, and reported rather than hidden so an auditor can call it
-/// a finding.
-///
-/// The order is the runtime's and is NOT declaration order; sort by name if a
-/// stable report matters.
+/// Inherited methods are not included (`class_copyMethodList` reports only
+/// this class's own rows, which is what a [`crate::declare_class!`] site is
+/// responsible for). The encoding is `None` for a method registered without a
+/// type string (possible through raw `class_addMethod`). Order is the
+/// runtime's, not declaration order.
 ///
 /// # Safety
 /// `cls` must be a live class object.
@@ -1290,29 +950,27 @@ pub unsafe fn class_methods(cls: ClassPtr) -> Vec<(Sel, Option<String>)> {
         return Vec::new();
     }
     let mut count: c_uint = 0;
-    // SAFETY: the caller pins `cls` as live. `class_copyMethodList` writes the
-    // row count through `&mut count` and returns a malloc'd array of `Method`
-    // handles that this function owns and frees below. It answers null with a
-    // zero count for a class with no methods of its own.
+    // SAFETY: `cls` is live. `class_copyMethodList` writes the count and
+    // returns a malloc'd array (freed below), or null with a zero count.
     let list = unsafe { class_copyMethodList(cls, &raw mut count) };
     if list.is_null() {
         return Vec::new();
     }
     let mut rows = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
-        // SAFETY: `i < count`, and the runtime guarantees `count` live `Method`
-        // handles at `list`. A `Method` is owned by its class and outlives it.
+        // SAFETY: `i < count` live `Method` handles at `list`; a `Method` is
+        // owned by its class.
         let method = unsafe { *list.add(i) };
         // SAFETY: `method` is a live handle from the array above.
         let sel = unsafe { method_getName(method) };
-        // SAFETY: as above. The result CAN be null (a method registered with no
-        // types), which is why it is checked rather than assumed.
+        // SAFETY: as above. Null for a method registered without types
+        // (checked).
         let types = unsafe { method_getTypeEncoding(method) };
         let encoding = if types.is_null() {
             None
         } else {
-            // SAFETY: a non-null, NUL-terminated string the runtime copied at
-            // registration time and owns for the life of the class.
+            // SAFETY: a non-null, NUL-terminated string the runtime owns for
+            // the life of the class.
             Some(
                 unsafe { CStr::from_ptr(types) }
                     .to_string_lossy()
@@ -1321,43 +979,25 @@ pub unsafe fn class_methods(cls: ClassPtr) -> Vec<(Sel, Option<String>)> {
         };
         rows.push((sel, encoding));
     }
-    // SAFETY: `list` came from `class_copyMethodList`, which documents the array
-    // as the caller's to `free`. The `Method` handles it held are owned by the
-    // runtime and stay valid; only the array is released.
+    // SAFETY: the array from `class_copyMethodList` is the caller's to `free`;
+    // the `Method` handles stay owned by the runtime.
     unsafe { free(list.cast()) };
     rows
 }
 
-/// The protocols a class object CLAIMS — its own `class_addProtocol` list, not
+/// The protocols a class object claims — its own `class_addProtocol` list, not
 /// its superclass's.
 ///
-/// This is the half of a declared class that no encoding check can see. A
-/// `protocols:` list is not decoration: it is what makes `conformsToProtocol:`
-/// answer YES — the question a typed consumer asks of a delegate, and the one
-/// every conformance assertion in this tree asks. Whether AppKit itself asks
-/// it depends on the protocol. For the APPLICATION DELEGATE it does not: AppKit
-/// dispatches those rows by `-respondsToSelector:` (measured on macOS 14.4.1:
-/// 26 `application*` probes and zero `conformsToProtocol:` sends before a
-/// delegate with an empty protocol list received every launch and termination
-/// row), which is exactly why deleting `NSWindowDelegate` from `vendor/winit`'s
-/// delegate left every registered encoding correct, the build green and the
-/// driven event log byte-identical — the class simply stopped SAYING it was a
-/// window delegate, and nothing in this crate could report that until this
-/// function; now an auditor can ask. For `NSTextInputClient` it DOES:
+/// A claim is what makes `conformsToProtocol:` answer YES, and no encoding
+/// check can see it. Whether AppKit asks depends on the protocol: application
+/// delegate rows are dispatched by `-respondsToSelector:` alone, while
 /// `-[NSView _inputContext]` creates an `NSTextInputContext` only for a view
-/// whose class conforms, and that init sends the protocol's REQUIRED
-/// `validAttributesForMarkedText` (measured the same day: a non-conforming
-/// view answered nil, a conforming view that implements the row got a
-/// context, and a conforming view that implements nothing aborted with
-/// `unrecognized selector`). So a claim is a promise to implement the required
-/// rows, and `vendor/winit`'s view keeps it.
+/// whose class conforms to `NSTextInputClient`, then sends its required rows
+/// (a conforming view that lacks them aborts with `unrecognized selector`).
 ///
-/// A name in this list may be one this crate registered itself when the
-/// host's framework had not — see [`protocol_or_register`] and
-/// [`protocols_registered_by_aterm`]; the list does not say which.
-///
-/// Names, not [`ProtocolPtr`]s, because the only thing a caller does with the
-/// answer is compare it to the list the source claims.
+/// A name here may be one this crate registered itself (see
+/// [`protocol_or_register`], [`protocols_registered_by_aterm`]). Names, not
+/// [`ProtocolPtr`]s, since callers compare them with the claimed list.
 ///
 /// # Safety
 /// `cls` must be a live class object.
@@ -1367,9 +1007,8 @@ pub unsafe fn class_protocols(cls: ClassPtr) -> Vec<String> {
         return Vec::new();
     }
     let mut count: c_uint = 0;
-    // SAFETY: the caller pins `cls` as live; `class_copyProtocolList` writes
-    // the count through the pointer and returns a malloc'd array this function
-    // owns, or null with a zero count.
+    // SAFETY: `cls` is live; `class_copyProtocolList` writes the count and
+    // returns a malloc'd array this function frees, or null with a zero count.
     let list = unsafe { class_copyProtocolList(cls, &raw mut count) };
     if list.is_null() {
         return Vec::new();
@@ -1389,12 +1028,8 @@ pub unsafe fn class_protocols(cls: ClassPtr) -> Vec<String> {
     names
 }
 
-/// An owned (+1) Objective-C object. The ONLY place `objc_release` is called
-/// for untyped objects (see [`crate::Retained`] for the typed twin).
-///
-/// Wrapping every `new*` result is what keeps a renderer that rebuilds
-/// pipelines on every resize from leaking one object per event — the same
-/// `CfOwned` argument `aterm-http/src/verifier/apple.rs` makes for CoreFoundation.
+/// An owned (+1) Objective-C object. The only place `objc_release` is called
+/// for untyped objects ([`crate::Retained`] is the typed twin).
 #[derive(Debug)]
 pub struct Obj(Id);
 
@@ -1408,7 +1043,7 @@ impl Obj {
         if id.is_null() { None } else { Some(Self(id)) }
     }
 
-    /// Retain a BORROWED reference (an autoreleased or +0 return) to +1.
+    /// Retain a borrowed reference (an autoreleased or +0 return) to +1.
     ///
     /// # Safety
     /// `id` must be a live object pointer, or null.
@@ -1428,9 +1063,8 @@ impl Obj {
         self.0
     }
 
-    /// A second +1 handle to the SAME object (an `objc_retain`). Deliberately
-    /// not a `Clone` impl: every clone of a raw-pointer holder should be
-    /// visibly a retain at the call site, not something a derive can smuggle in.
+    /// A second +1 handle to the same object (`objc_retain`). Not `Clone`, so
+    /// every retain is visible at the call site.
     #[must_use]
     pub fn clone_retained(&self) -> Self {
         // SAFETY: `self.0` is non-null and live by construction (this holder
@@ -1438,7 +1072,7 @@ impl Obj {
         unsafe { Self::retain(self.0).expect("retaining a live non-null object") }
     }
 
-    /// Give up ownership WITHOUT releasing — the caller inherits the +1.
+    /// Give up ownership without releasing; the caller inherits the +1.
     #[must_use]
     pub(crate) fn into_raw(self) -> Id {
         let id = self.0;
@@ -1446,61 +1080,40 @@ impl Obj {
         id
     }
 
-    /// Hand the +1 to the innermost pool and return the now-BORROWED pointer.
+    /// Hand the +1 to the innermost pool and return the now-borrowed pointer.
     ///
-    /// This is what a declared method that returns an object owes its caller.
-    /// Objective-C's naming rule is not a convention the runtime enforces — it
-    /// is what every caller, ARC included, compiles against: a method whose
-    /// name does not begin `new`/`alloc`/`copy`/`mutableCopy` returns +0, so
-    /// returning a +1 leaks one object per call and returning a pointer whose
-    /// owner is about to drop returns a dangling one. See [`autorelease`].
+    /// What a declared method returning an object owes its caller when its name
+    /// does not begin `new`/`alloc`/`copy`/`mutableCopy`: +0. See
+    /// [`autorelease`].
     #[must_use]
     pub fn autorelease(self) -> Id {
-        // SAFETY: `self` owns exactly one +1 reference, which `into_raw` hands
-        // over without releasing and `objc_autorelease` then takes ownership
-        // of; the pointer that comes back is borrowed until the pool pops.
+        // SAFETY: `into_raw` hands over the one +1 without releasing and
+        // `objc_autorelease` takes it; the result is borrowed until the pool
+        // pops.
         unsafe { autorelease(self.into_raw()) }
     }
 }
 
 impl Drop for Obj {
-    /// Releasing an ObjC object runs its `dealloc`, and many `dealloc` paths
-    /// autorelease into whatever frame the drop happens in. That obligation is
-    /// the CALLER's — hold an [`AutoreleasePool`] across the scope — exactly as
-    /// `metal/ffi.rs` measured and documented it; a hidden push/pop per release
-    /// would buy nothing and cost two runtime calls on a per-frame path.
+    /// Releasing may run `dealloc`, which can autorelease into the current
+    /// frame; holding an [`AutoreleasePool`] across the scope is the caller's
+    /// obligation, not a hidden push/pop per release.
     fn drop(&mut self) {
-        // SAFETY: `self.0` is non-null by construction (both constructors
-        // reject null) and holds exactly one +1 reference, released once here.
+        // SAFETY: `self.0` is non-null by construction and holds exactly one +1
+        // reference, released once here.
         unsafe { objc_release(self.0) }
     }
 }
 
 /// Hand a +1 reference to the innermost autorelease pool on this thread.
 ///
-/// The returned pointer is the SAME object, now BORROWED: it stays alive until
-/// that pool pops, and the caller's obligation to release it is discharged.
+/// The returned pointer is the same object, now borrowed: it stays alive until
+/// that pool pops.
 ///
-/// # A pool is a LEAK obligation, not a safety one
-///
-/// This used to read "There must be a pool on this thread's stack" under
-/// `# Safety`, and that was a false contract of exactly the shape D2 was about:
-/// two SAFE methods in this crate — [`Obj::autorelease`] and
-/// [`crate::Retained::autorelease`] — call this function and neither can
-/// establish it, because neither can see the caller's stack. A safety
-/// precondition that safe code in the same crate violates by construction is
-/// not a precondition; it is either a bug in the wrappers or a bug in the
-/// contract.
-///
-/// MEASURED, in a child process with no pool anywhere on the thread: the
-/// object leaks and the process runs to a clean exit. Nothing is freed early,
-/// nothing dangles, nothing aborts, and a message still lands on the returned
-/// pointer afterwards — so the wrappers are right and the contract was wrong,
-/// and the requirement is demoted to what it actually is: a leak you own, not
-/// undefined behaviour.
-///
-/// The old text also promised a diagnostic, and that half was measured too and
-/// is likewise wrong by default. `libobjc` is SILENT here unless asked:
+/// With no pool on the thread the object leaks and nothing else goes wrong, so
+/// a missing pool is a leak, not undefined behaviour — which is why the safe
+/// [`Obj::autorelease`] and [`crate::Retained::autorelease`] may call this.
+/// libobjc reports it only under `OBJC_DEBUG_MISSING_POOLS=YES`:
 ///
 /// ```text
 /// $ CHILD=1 ./adversary_w2c                              (no output)
@@ -1510,49 +1123,34 @@ impl Drop for Obj {
 /// objc_autoreleaseNoPool() to debug
 /// ```
 ///
-/// Both exit 0. That matters for anyone hunting one of these leaks: the string
-/// to grep for does not appear until the environment variable is set.
-/// `tests/adversary_w2c.rs` runs the child both ways and asserts both.
-///
-/// On the main thread of a Cocoa app the event loop always has a pool, which is
-/// why a declared method may autorelease unconditionally; off it,
-/// [`autoreleasepool`] is how this crate puts one there.
+/// (`tests/adversary_w2c.rs` runs both.) A Cocoa main thread always has a pool
+/// in the event loop; elsewhere use [`autoreleasepool`].
 ///
 /// # Safety
 /// `obj` must be a +1 reference the caller is handing over, or null.
 #[inline]
 #[must_use]
 pub unsafe fn autorelease(obj: Id) -> Id {
-    // SAFETY: the caller pins `obj` as a +1 reference (or null, which
-    // `objc_autorelease` returns unchanged); the runtime takes ownership of
-    // that reference and hands back the same pointer at +0.
+    // SAFETY: `obj` is +1 or null (returned unchanged); the runtime takes the
+    // reference and returns the same pointer at +0.
     unsafe { objc_autorelease(obj) }
 }
 
 /// An `@autoreleasepool` scope.
 ///
-/// # Why this is not a bare RAII guard
-///
-/// It used to be, and the comment beside its `Drop` said pools were "strictly
-/// nested because this type is neither `Send` nor cloneable". THAT WAS FALSE,
-/// and it was false in the file this one was promoted from
-/// (`aterm-gpu/src/metal/ffi.rs`). Neither `!Send` nor `!Clone` implies LIFO
-/// drop order — `drop(outer); drop(inner);` is ordinary safe Rust — and popping
-/// the outer pool first releases everything the inner pool was holding, so any
-/// autoreleased pointer borrowed from it dangles, and the inner pop then hits
-/// the runtime's own check:
+/// Not a bare RAII guard: `!Send` and `!Clone` do not imply LIFO drop order,
+/// and popping an outer pool before an inner one frees what the inner pool
+/// holds and then aborts in the runtime:
 ///
 /// ```text
 /// Invalid or prematurely-freed autorelease pool … Invalid autorelease pools
 /// are a fatal error
 /// ```
 ///
-/// A use-after-free reachable from safe code is a soundness hole, not a
-/// footgun, so the scope form is the sanctioned API and the token constructor
-/// is `unsafe`. Nesting through [`autoreleasepool`] is structural: the inner
-/// scope cannot outlive the outer one, so out-of-order pop is unconstructible.
+/// So the token constructor is `unsafe` and [`autoreleasepool`]'s nested scopes
+/// are the safe API; an inner scope cannot outlive the outer one.
 ///
-/// The four lines that used to abort the process no longer compile:
+/// This does not compile:
 ///
 /// ```compile_fail
 /// # use aterm_objc::AutoreleasePool;
@@ -1570,77 +1168,54 @@ pub unsafe fn autorelease(obj: Id) -> Id {
 /// assert_eq!(n, 7);
 /// ```
 ///
-/// `tests/pools.rs` runs the first snippet in a child process and asserts the
-/// `SIGABRT`, so the hazard is measured rather than asserted.
+/// `tests/pools.rs` runs the first snippet unsafely in a child and asserts the
+/// `SIGABRT`.
 pub struct AutoreleasePool(*mut c_void);
 
 impl AutoreleasePool {
     /// Push a pool and hand back its token.
     ///
     /// # Safety
-    /// The returned value must be dropped BEFORE any pool pushed after it on
-    /// this thread, and on the same thread that pushed it. [`autoreleasepool`]
-    /// is the safe form and satisfies this by construction; call this directly
-    /// only where a scope genuinely cannot express the lifetime, and say why.
+    /// The value must be dropped before any pool pushed after it on this
+    /// thread, and on the thread that pushed it. [`autoreleasepool`] is the
+    /// safe form; use this only where a scope cannot express the lifetime.
     #[must_use]
     pub unsafe fn new() -> Self {
-        // SAFETY: push/pop are the documented runtime entry points and are
-        // balanced by `Drop`; the token is opaque and only handed back to pop.
-        // LIFO order is the CALLER's obligation, stated above.
+        // SAFETY: push/pop are the runtime entry points, balanced by `Drop`;
+        // LIFO order is the caller's obligation, stated above.
         Self(unsafe { objc_autoreleasePoolPush() })
     }
 }
 
 impl Drop for AutoreleasePool {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is the token from the matching push, and this type's
-        // only safe constructor is `autoreleasepool`, whose scope makes this
-        // pop the innermost one. A token minted by the `unsafe` `new` carries
-        // that same obligation on its caller.
+        // SAFETY: `self.0` is the matching push's token. The safe constructor
+        // `autoreleasepool` makes this the innermost pop; the `unsafe` `new`
+        // puts that obligation on its caller.
         unsafe { objc_autoreleasePoolPop(self.0) }
     }
 }
 
 /// Run `f` inside an `@autoreleasepool`.
 ///
-/// The pool pops when `f` returns, including when it returns by unwinding.
-/// Autoreleased objects reached inside are valid for the body and NOT after it,
-/// which is exactly the C scope, and nesting these calls is the only way this
-/// crate lets a second pool exist — see [`AutoreleasePool`] for why that is a
-/// soundness property rather than a style.
+/// The pool pops when `f` returns or unwinds. Autoreleased objects reached
+/// inside are valid for the body and not after it. Nesting these calls is the
+/// only way to open a second pool (see [`AutoreleasePool`]).
 ///
-/// # WHAT `&AutoreleasePool` IS NOT, and the rule that follows
-///
-/// It is a proof that **A** pool is open on this thread. It is NOT a proof that
-/// **THIS** pool is the one the runtime will use. Every `+0` return in
-/// Objective-C — `objc_loadWeak`, every framework method not named
-/// `new`/`alloc`/`copy` — autoreleases into the INNERMOST pool at the instant
-/// of the call, which is a fact about the thread's stack; a `&AutoreleasePool`
-/// parameter is a fact about a name the caller chose. Nesting is where they
-/// come apart, because inside `autoreleasepool(|inner| …)` the caller can still
-/// name `outer`.
-///
-/// **So a pool reference may GATE an operation and must NEVER appear in the
-/// returned lifetime.** `WeakObj::load_borrowed` broke this and was withdrawn;
-/// `crates/aterm-objc/src/weak.rs`'s module docs carry the counterexample, the
-/// SIGSEGV it produces from 100% safe code, and the measurement showing the
-/// form was not even faster. `tests/weak.rs`'s
-/// `a_pool_parameter_never_mints_a_lifetime` enforces the rule against this
-/// crate's source, `aterm-gui`'s and the winit fork's.
-///
-/// **AND NO BOUND ON `R` FIXES IT — measured, not reasoned.** The obvious
-/// repair is to stop the inner closure returning such a borrow. The escape does
-/// not need the return type: with every closure returning `()`, a `Cell`
-/// declared in the outer scope carries the borrow out just as well. `R: 'static`
-/// would forbid honest returns and still not close it. That is why the answer
-/// was to delete the API rather than to constrain this function, and it is
-/// worth knowing BEFORE the next capability mints a lifetime from a pool.
+/// `&AutoreleasePool` proves that a pool is open on this thread, not that it is
+/// the one the runtime will use: every +0 return autoreleases into the
+/// innermost pool at the moment of the call, and inside a nested scope the
+/// caller can still name the outer one. So a pool reference may gate an
+/// operation but must never appear in a returned lifetime (see the
+/// counterexample in [`crate::weak`]'s module docs; `tests/weak.rs`'s
+/// `a_pool_parameter_never_mints_a_lifetime` enforces it). No bound on `R`
+/// fixes that: a `Cell` in the outer scope can carry such a borrow out of a
+/// closure that returns `()`.
 #[inline]
 pub fn autoreleasepool<R>(f: impl FnOnce(&AutoreleasePool) -> R) -> R {
-    // SAFETY: the token is a local of THIS frame and is dropped when the frame
-    // ends — normally at the `drop` below, or during an unwind out of `f`.
-    // Either way nothing pushed after it can still be live, because anything
-    // that pushed did so inside `f` and has already returned or unwound.
+    // SAFETY: the token is a local of this frame, dropped below or during an
+    // unwind out of `f`; anything pushed after it was pushed inside `f` and has
+    // already returned or unwound.
     let pool = unsafe { AutoreleasePool::new() };
     let out = f(&pool);
     drop(pool);
@@ -1649,17 +1224,15 @@ pub fn autoreleasepool<R>(f: impl FnOnce(&AutoreleasePool) -> R) -> R {
 
 /// Build a +1 `NSString` from a Rust `&str`.
 ///
-/// Uses `alloc` + `initWithBytes:length:encoding:` rather than the familiar
-/// `+stringWithUTF8String:` so the result is OWNED rather than autoreleased —
-/// no pool is required and the lifetime is explicit.
+/// Uses `alloc` + `initWithBytes:length:encoding:` so the result is owned, not
+/// autoreleased, and needs no pool.
 #[must_use]
 pub fn ns_string(s: &str) -> Option<Obj> {
     const NS_UTF8: usize = 4;
     let cls = class(c"NSString");
-    // SAFETY: `alloc` returns a +1 uninitialized instance; the follow-up
-    // `initWithBytes:length:encoding:` consumes it and returns the initialized
-    // +1 object (or nil, which `from_owned` maps to `None`). The byte pointer
-    // is only read for `len` bytes during the call and is not retained.
+    // SAFETY: `alloc` returns +1 uninitialised; `initWithBytes:length:encoding:`
+    // consumes it and returns +1 or nil (`from_owned` maps nil to `None`). The
+    // bytes are read for `len` bytes during the call only.
     unsafe {
         let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = msg();
         let raw = alloc(cls, sel(c"alloc"));
@@ -1688,9 +1261,8 @@ pub unsafe fn ns_string_to_rust(s: Id) -> String {
         return String::new();
     }
     autoreleasepool(|_| {
-        // SAFETY: the caller pins `s` as a live NSString. `UTF8String` returns
-        // an interior pointer valid until the enclosing pool pops; the bytes
-        // are copied into an owned `String` before that happens.
+        // SAFETY: `s` is a live NSString. `UTF8String` is an interior pointer
+        // valid until the pool pops; it is copied before then.
         unsafe {
             let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
             let p = utf8(s, sel(c"UTF8String"));
@@ -1712,9 +1284,8 @@ pub unsafe fn ns_error_string(err: Id) -> String {
         return "(nil NSError)".to_owned();
     }
     autoreleasepool(|_| {
-        // SAFETY: `err` is a live `NSError`. `localizedDescription` returns an
-        // autoreleased object valid until the pool pops, and its bytes are
-        // copied into an owned `String` before that happens.
+        // SAFETY: `err` is a live `NSError`. `localizedDescription` is
+        // autoreleased and copied before the pool pops.
         unsafe {
             let desc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             let d = desc(err, sel(c"localizedDescription"));

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 #
@@ -7,8 +7,9 @@
 # machine can deal it (tests/handback_lane_keys.rs).
 #
 # It models one thing: WHO HOLDS THE TERMINAL. A command line that starts a job
-# (`fg`, a line running `sleep 30` — the mouse jobs, the pipelines and the
-# recovery row's re-arming job — or the live-holder row's python, which
+# (`fg`, a line running the lane's JOB, which prints `armed-<n>` — the mouse
+# jobs, the pipelines and the recovery row's re-arming job — or the live-holder
+# row's python, which
 # prints `parent-back`) hands the terminal to the job; Ctrl-Z or Ctrl-C that
 # reaches the job hands it back to the shell (one that reaches the shell is
 # absorbed, and the job still takes the terminal), and so does the Enter that
@@ -31,6 +32,16 @@
 #     matches (the line's echo satisfies the wait before the command ran).
 # Every other verb answers at once: `modes` with one dummy row, so the lane's
 # mode rows FAIL here — the test reads the violations, not the lane's verdict.
+#
+# NO CHILD PROCESS PER VERB. The lane makes a few hundred `ctl` calls (233 in a
+# run measured 2026-10-02), and each is a fork and exec of this script. The
+# helpers it used to fork in turn cost more than the calls: 335 execs of `cat`,
+# `grep`, `head` and `rm` beside 233 hops through `env`, and a subshell for every
+# command substitution, each one a process start whose price grows with the
+# machine's load. Every verb is a builtin now and the shebang names the shell,
+# so a call is the one exec of bash and nothing else. A builtin must read as the
+# program it replaced: see `slurp` (`$(cat)`), `v_await` (`grep -E | head -n 1`)
+# and the `polled` flag (a file's content, because only `rm` deletes a file).
 set -u
 st=${FAKE_ATERM_STATE:?names the state directory of the fake}
 
@@ -38,7 +49,28 @@ violation() {
     printf 'VIOLATION: %s\n' "$*" >>"$st/violations"
 }
 
-holder() { cat "$st/holder"; }
+# Who holds the terminal, `shell` or `job`, into HOLDER.
+holder() {
+    HOLDER=""
+    read -r HOLDER <"$st/holder"
+}
+
+# `$(cat)` without the cat: all of stdin into SLURPED, NUL bytes dropped and
+# trailing newlines stripped, as a command substitution does. A bare `read`
+# would keep the newlines (and `read -r line` stop at the first line of a typed
+# command that spans several), which `v_send` compares and `v_key` logs.
+SLURPED=""
+slurp() {
+    local chunk acc=""
+    while IFS= read -r -d '' chunk; do
+        acc=$acc$chunk
+    done
+    acc=$acc$chunk
+    while [[ $acc == *$'\n' ]]; do
+        acc=${acc%$'\n'}
+    done
+    SLURPED=$acc
+}
 
 if [ "${1:-}" = --headless ]; then
     case " $* " in *" --help "*)
@@ -54,7 +86,7 @@ if [ "${1:-}" = --headless ]; then
     echo shell >"$st/holder"
     : >"$st/pending"
     : >"$st/line"
-    rm -f "$st/polled"
+    echo 0 >"$st/polled"
     echo boot >>"$st/log"
     exec python3 -c 'import socket,sys,time
 s=socket.socket(socket.AF_UNIX);s.bind(sys.argv[1]);s.listen(8);time.sleep(600)' "$sock"
@@ -77,37 +109,43 @@ shift || true
 v_version() { echo "aterm fake"; }
 
 v_who() {
-    local pending pg=100
-    pending=$(cat "$st/pending")
+    local pending="" polled=0 pg=100
+    read -r pending <"$st/pending"
     if [ -n "$pending" ]; then
-        if [ -e "$st/polled" ]; then
+        read -r polled <"$st/polled"
+        if [ "$polled" = 1 ]; then
             echo "$pending" >"$st/holder"
             : >"$st/pending"
-            rm -f "$st/polled"
+            echo 0 >"$st/polled"
         else
-            : >"$st/polled"
+            echo 1 >"$st/polled"
         fi
     fi
-    [ "$(holder)" = job ] && pg=200
+    holder
+    [ "$HOLDER" = job ] && pg=200
     echo "0 s-fake driving=- watchers=0 turns=0 alive nonce=0 fgpgid=$pg"
 }
 
 hand_to() {
     echo "$1" >"$st/pending"
-    rm -f "$st/polled"
+    echo 0 >"$st/polled"
 }
 
 v_send() {
     local payload key=""
-    payload=$(cat)
-    [ "$payload" = "$(printf '\003')" ] && key=Ctrl-C
-    [ "$payload" = "$(printf '\032')" ] && key=Ctrl-Z
-    [ "$payload" = "$(printf '\r')" ] && key=Enter
+    slurp
+    payload=$SLURPED
+    case $payload in
+        $'\003') key=Ctrl-C ;;
+        $'\032') key=Ctrl-Z ;;
+        $'\r') key=Enter ;;
+    esac
     if [ -z "$key" ]; then
         printf '%s' "$payload" >>"$st/line"
         return
     fi
-    if [ "$(holder)" != job ]; then
+    holder
+    if [ "$HOLDER" != job ]; then
         # The shell absorbs it; the job it was meant for is untouched.
         violation "$key sent while the shell held the terminal"
         return
@@ -118,25 +156,39 @@ v_send() {
 
 v_key() {
     local line
-    line=$(cat "$st/line")
+    slurp <"$st/line"
+    line=$SLURPED
     : >"$st/line"
-    if [ "$(holder)" != shell ]; then
+    holder
+    if [ "$HOLDER" != shell ]; then
         violation "a command line typed while a job held the terminal: $line"
     fi
     printf '%s\n' "$line" >>"$st/typed"
     printf 'typed %s\n' "$line" >>"$st/log"
-    if [ "$line" = fg ] || [ "${line#*sleep 30}" != "$line" ] ||
+    if [ "$line" = fg ] || [ "${line#*armed}" != "$line" ] ||
         [ "${line#*parent-}" != "$line" ]; then
         hand_to job
     fi
 }
 
+# The first typed line the pattern matches, as `grep -E -e "$re" typed | head
+# -n 1` read it: one physical line at a time (a typed command that spans
+# several matches on each), POSIX ERE. macOS's grep adds enhanced escapes (`\<`,
+# `\w`) that `=~` does not read; the lane's patterns are plain (literals, `.`,
+# `|`), and a pattern that leaned on one would not read the same here.
 v_await() {
-    local re echoed=""
+    local re echoed="" l
     if [ "${1:-}" = match ]; then
         re=$2
         printf 'await %s\n' "$re" >>"$st/log"
-        [ -e "$st/typed" ] && echoed=$(grep -E -e "$re" "$st/typed" | head -n 1)
+        if [ -e "$st/typed" ]; then
+            while IFS= read -r l || [ -n "$l" ]; do
+                if [[ $l =~ $re ]]; then
+                    echoed=$l
+                    break
+                fi
+            done <"$st/typed"
+        fi
         if [ -n "$echoed" ]; then
             violation "await match /$re/ is satisfied by the echo of a typed line: $echoed"
         fi
@@ -151,7 +203,7 @@ v_signal() {
 
 v_modes() { echo "fake=1"; }
 
-if [ "$(type -t "v_$verb")" = function ]; then
+if declare -F "v_$verb" >/dev/null 2>&1; then
     "v_$verb" "$@"
 fi
 exit 0

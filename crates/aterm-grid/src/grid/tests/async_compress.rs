@@ -1,28 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THRU-5 — off-thread tier-compression offload (deferred bounded lazy-buffer
-//! drain). These tests pin the invariants the design rests on, all exercised
+//! Off-thread tier-compression offload (deferred bounded lazy-buffer drain),
 //! against the real `Grid`:
-//!   - while a worker owns the drain, staged lines stay READABLE (no scrub
-//!     blackout — the property that protects ARENA-SCROLL);
-//!   - a bounded drain loses NO history and preserves ORDER;
-//!   - the backlog is BOUNDED under sustained overload (inline fallback);
-//!   - with no worker attached, behavior is unchanged (inline drain).
+//!   - while a worker owns the drain, staged lines stay readable;
+//!   - a bounded drain loses no history and preserves order;
+//!   - the backlog stays bounded under sustained overload;
+//!   - with no worker attached, the drain runs inline as before.
 
 use crate::Grid;
+use crate::grid::test_support::feed_numbered_lines;
 use aterm_scrollback::Scrollback;
-
-/// Feed `n` distinguishable lines ("L{i}") through the grid, one per line-feed.
-fn feed_lines(grid: &mut Grid, start: usize, n: usize) {
-    for i in start..start + n {
-        grid.carriage_return();
-        for c in format!("L{i}").chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-    }
-}
 
 /// The oldest→newest history contents, reading every scrollback line.
 fn history_oldest_first(grid: &Grid) -> Vec<String> {
@@ -47,7 +35,7 @@ fn deferred_backlog_stays_readable_then_drains_without_loss() {
     // Feed past the 1000-line drain threshold: with the worker owning the drain,
     // these accumulate in the lazy buffer instead of being promoted inline.
     let total_fed = 1100usize;
-    feed_lines(&mut grid, 0, total_fed);
+    feed_numbered_lines(&mut grid, 0, total_fed);
 
     // The backlog is genuinely deferred (not drained inline)...
     let backlog = grid.lazy_backlog_len();
@@ -56,9 +44,8 @@ fn deferred_backlog_stays_readable_then_drains_without_loss() {
         "offload-active drain must be deferred: backlog={backlog}"
     );
 
-    // ...yet every staged line is READABLE right now (the anti-blackout property)
-    // and in strict oldest→newest order with no gaps (the newest few fed lines
-    // are still on the visible screen, not yet in scrollback).
+    // Every staged line is readable now, oldest to newest with no gaps (the
+    // newest few lines are still on screen).
     let before = history_oldest_first(&grid);
     assert_eq!(before.len(), grid.scrollback_lines());
     let expected: Vec<String> = (0..before.len()).map(|i| format!("L{i}")).collect();
@@ -96,7 +83,7 @@ fn bounded_drain_promotes_at_most_the_batch() {
     let scrollback = Scrollback::new(100, 1000, 100_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     grid.set_compress_offload_active(true);
-    feed_lines(&mut grid, 0, 1100);
+    feed_numbered_lines(&mut grid, 0, 1100);
 
     let start = grid.lazy_backlog_len();
     let after = grid.drain_lazy_bounded(200);
@@ -111,29 +98,26 @@ fn bounded_drain_promotes_at_most_the_batch() {
 
 #[test]
 fn backpressure_bounds_the_backlog_under_sustained_overload() {
-    // A 2 MiB memory budget holds fewer staged `L<n>` rows (each weighed at
-    // its few occupied cells plus the deferred-line header) than the 20k
-    // floor, so the staging cap IS the floor (the pre-budget cap); the store's
-    // 100k line limit is far away, so every drop is a real loss.
+    // A 2 MiB budget holds fewer staged `L<n>` rows than the 20k floor, so the
+    // staging cap is the floor; the 100k store limit is far away, so every drop
+    // is a real loss.
     let scrollback = Scrollback::new(100, 1000, 2 * 1024 * 1024);
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     grid.set_compress_offload_active(true);
 
-    // Feed far past the backpressure cap WITHOUT the worker ever running. The
-    // reader must bound the backlog WITHOUT compressing inline (inline LZ4/zstd
-    // on the PTY-drain path is the cat-flood collapse): past the cap it drops
-    // its OLDEST staged lines, O(1), trading history depth for ingest speed.
+    // Feed past the backpressure cap without the worker running: the reader
+    // bounds the backlog by dropping its oldest staged lines in O(1), never by
+    // compressing inline on the PTY-drain path.
     let total = Grid::ASYNC_COMPRESS_BACKPRESSURE + 5_000;
-    feed_lines(&mut grid, 0, total);
+    feed_numbered_lines(&mut grid, 0, total);
 
     assert!(
         grid.lazy_backlog_len() <= Grid::ASYNC_COMPRESS_BACKPRESSURE,
         "backlog must stay clamped at the cap via drop-oldest, got {}",
         grid.lazy_backlog_len()
     );
-    // The retained history is ONE marker row naming the cut, then a CONTIGUOUS
-    // newest suffix: truncated at the front (the deliberate flood trade), never
-    // gapped in the middle, and it still reaches (nearly) the last line fed.
+    // Retained history is one marker row naming the cut, then a contiguous
+    // newest suffix reaching (nearly) the last line fed.
     let hist = history_oldest_first(&grid);
     let marked: usize = hist[0]
         .strip_prefix(crate::grid::scroll_convert::FLOOD_MARKER_PREFIX)
@@ -172,20 +156,18 @@ fn backpressure_bounds_the_backlog_under_sustained_overload() {
 
 #[test]
 fn bounded_drain_is_a_noop_while_detached_for_reflow() {
-    // Regression: while the tiered store is detached for an off-thread reflow,
-    // drain_lazy_bounded must be a NO-OP that returns the UNCHANGED backlog (the
-    // staged lines are kept for the reflow re-attach flush — audit bug B). This
-    // is what lets the compression worker break on no-progress instead of
-    // busy-spinning the term lock for the whole reflow window.
+    // While the store is detached for reflow, drain_lazy_bounded is a no-op
+    // returning the unchanged backlog (kept for the re-attach flush), so the
+    // worker stops on no progress instead of spinning on the term lock.
     let scrollback = Scrollback::new(100, 1000, 100_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     grid.set_compress_offload_active(true);
-    feed_lines(&mut grid, 0, 400); // build some tiered history first
+    feed_numbered_lines(&mut grid, 0, 400); // build some tiered history first
     // Detach the store for a width-change reflow (must_use job dropped — this
     // test only exercises the detach WINDOW, not the re-attach).
     let _pending = grid.resize_offloading_scrollback(3, 100);
     // Re-accumulate a backlog into the now-detached lazy buffer.
-    feed_lines(&mut grid, 400, 1200);
+    feed_numbered_lines(&mut grid, 400, 1200);
     let before = grid.lazy_backlog_len();
     assert!(
         before > 256,
@@ -202,7 +184,7 @@ fn inactive_offload_drains_inline_as_before() {
     let scrollback = Scrollback::new(100, 1000, 100_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     // Default: no worker attached — the reader drains inline at the threshold.
-    feed_lines(&mut grid, 0, 1100);
+    feed_numbered_lines(&mut grid, 0, 1100);
     assert!(
         grid.lazy_backlog_len() <= 1000,
         "inline drain keeps the lazy buffer at/below the threshold, got {}",

@@ -2,16 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Canonical token-bucket rate limiter for policy [`RateLimit`] entries.
-//!
-//! Part of #7995. Hosts the single source-of-truth implementation consumed
-//! by the [`PolicyEngine`][pe]. The engine owns one [`TokenBucket`] per
-//! [`RateLimit`][rl] id declared on the active [`Policy`][p].
+//! Token-bucket rate limiter for policy [`RateLimit`] entries. The
+//! [`PolicyEngine`][pe] owns one [`TokenBucket`] per [`RateLimit`] id
+//! declared on the active [`Policy`].
 //!
 //! # Semantics
 //!
 //! A [`TokenBucket`] enforces three independent limits that map 1-to-1 onto
-//! the fields of [`RateLimit`][rl]:
+//! the fields of [`RateLimit`]:
 //!
 //! * `capacity_bytes` — burst budget. Tokens accumulate up to this ceiling
 //!   while idle and drain by `amount` on every successful consume.
@@ -19,9 +17,8 @@
 //!   between calls. A rate of 0 freezes the bucket at the current balance.
 //! * `per_sequence_max` — hard cap on any single `try_consume(amount)` call,
 //!   independent of the current token balance. A value of 0 disables the
-//!   per-call cap (only steady-state + burst apply). This models the
-//!   existing `MAX_RESPONSES_PER_SEQUENCE` counter in the OSC 4 / OSC 21
-//!   palette handlers (#7883).
+//!   per-call cap (only steady-state + burst apply). The OSC 4 / OSC 21
+//!   palette handlers use it as their per-query pair cap.
 //!
 //! A bucket with `capacity_bytes = 0` is a hard "deny all" — useful as a
 //! kill switch from a hot-swapped policy.
@@ -29,11 +26,8 @@
 //! # Time source abstraction
 //!
 //! Production callers use [`SystemClock`] (a zero-size wrapper over
-//! [`Instant::now`]). Tests inject a [`FakeClock`]-like type implementing
-//! [`TimeSource`] so the clock can advance deterministically without
-//! sleeping. This is the same pattern the pre-#7995 `response_rate_limiter`
-//! module used in aterm-core; we preserve it verbatim so the migration is
-//! value-equivalent.
+//! [`Instant::now`]). Tests implement [`TimeSource`] with a clock that
+//! advances only when stepped, so they never sleep.
 //!
 //! # Totality
 //!
@@ -45,17 +39,11 @@
 //! * Arithmetic uses `f64` for sub-millisecond refill accumulation and
 //!   saturates on the `Instant` delta.
 //!
-//! These properties are exercised by the Kani harness `rate_limit_bounds`
-//! (§8.1 of the design) and by the unit-test suite in this module.
-//!
 //! [pe]: crate::engine::PolicyEngine
-//! [rl]: crate::RateLimit
-//! [p]: crate::Policy
 
 use std::collections::HashMap;
 use std::time::Duration;
-// aterm_time::Instant == std::time::Instant on native; JS clock on wasm32 (engine-wide
-// aterm_time discipline — std::time::Instant::now() panics on wasm).
+// Not std's: `std::time::Instant::now()` panics on wasm32.
 use aterm_time::Instant;
 
 use crate::{Policy, RateLimit};
@@ -64,11 +52,8 @@ use crate::{Policy, RateLimit};
 // TimeSource abstraction
 // ---------------------------------------------------------------------------
 
-/// Abstraction over [`Instant::now`] so tests can drive the clock forward
-/// deterministically without sleeping.
-///
-/// Production callers use [`SystemClock`]; tests build a stateful fake that
-/// advances only when explicitly stepped.
+/// Abstraction over [`Instant::now`] so tests can step the clock without
+/// sleeping. Production callers use [`SystemClock`].
 pub trait TimeSource {
     /// Return the current instant.
     fn now(&self) -> Instant;
@@ -109,9 +94,8 @@ pub struct TokenBucket {
     /// Hard cap on a single `try_consume(amount)` call, independent of
     /// the bucket level. `0` means "no per-call cap".
     per_sequence_max: u64,
-    /// Last refill instant. `None` means "uninitialized — seed on next
-    /// call" so the first `try_consume` never pays a time lookup during
-    /// construction.
+    /// Last refill instant. `None` until the first `try_consume` seeds it,
+    /// so construction needs no clock.
     last_refill: Option<Instant>,
 }
 
@@ -457,8 +441,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // TokenBucket semantics — mirror the aterm-core/response_rate_limiter
-    // tests so the migration is value-equivalent.
+    // TokenBucket semantics
     // -----------------------------------------------------------------
 
     #[test]
@@ -538,7 +521,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // per_sequence_max semantics (ports #7883 MAX_RESPONSES_PER_SEQUENCE)
+    // per_sequence_max semantics
     // -----------------------------------------------------------------
 
     #[test]

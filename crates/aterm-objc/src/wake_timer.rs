@@ -1,55 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RUN-LOOP WAKE TIMER — the one `CFRunLoopTimer` aterm arms, and why its
+//! The run-loop wake timer — the one `CFRunLoopTimer` aterm arms, and why its
 //! repeat interval is a year.
 //!
-//! # The 2026-09-26 freeze
-//!
-//! aterm 0.93.0 (pid 3497) froze for minutes with the main thread ON-CPU in
-//! `__CFRunLoopDoTimer + 1220` in all eleven samples of the hang report, and no
-//! aterm frame beneath `-[NSApplication run]` (symbolicated against the
-//! release's own dSYM: `aterm_gui::main_entry` → winit's
-//! `EventLoop::run_on_demand` → `-[NSApplication run]` → … →
-//! `__CFRunLoopDoTimers` → `__CFRunLoopDoTimer`). Disassembled on the same
-//! macOS build (26.6.2, 25G83), that offset is the `add` of CoreFoundation's
-//! catch-up walk, run after a repeating timer's callout returns:
+//! After a repeating timer's callout, CoreFoundation advances its fire date
+//! one interval at a time until it passes the current time:
 //!
 //! ```text
 //! nextFireTSR = oldFireTSR;
 //! while (nextFireTSR <= mach_absolute_time_at_entry) nextFireTSR += intervalTSR;
 //! ```
 //!
-//! — one iteration per interval of LATENESS, with the run-loop lock held, so
-//! every thread that touches the main run loop (`CFRunLoopWakeUp` from the PTY
-//! reader and the control workers, `CFRunLoopPerformBlock` from AppKit's own
-//! event thread) parks behind it. The timer was winit's `EventLoopWaker`,
-//! created with a 0.1 µs interval "to mimic polling": 2 ticks of the 24 MHz
-//! timebase. The process had not been scheduled for 95,674 s (every thread's
-//! "last ran" in the report is either ~43 s or ≥ 95,881 s old; the system
-//! itself was awake — `kern.waketime` was eight days earlier), so the armed
-//! timer came due 26.6 hours late and CoreFoundation set out to walk
-//! 1.1 × 10¹² steps. Measured on the same Mac with CoreFoundation itself: an
-//! overdue timer at that interval costs 59 ms of spin per 20 s of lateness —
-//! ~4.7 minutes for the incident's gap. The same timer at the interval below
-//! takes ONE step and no measurable time.
+//! That is one iteration per interval of lateness, with the run-loop lock held,
+//! so every thread touching the main run loop (`CFRunLoopWakeUp`,
+//! `CFRunLoopPerformBlock`) parks behind it. winit's waker used a 0.1 µs
+//! interval (2 ticks of the 24 MHz timebase); a process that is not scheduled
+//! for a day then spins for minutes in `__CFRunLoopDoTimer`.
 //!
-//! # The rule, and what enforces it
+//! So the waker polls by re-arming, and its repeat interval is
+//! [`WAKE_TIMER_REPEAT_SECS`], a year: any survivable lateness costs one step.
+//! After firing, the timer is spent (next date a year out) until re-armed; the
+//! callout records that, so [`WakePlan`] never trusts a stale "already armed
+//! for now" (model: `aterm_spec::derive::run_loop_waker_model`).
 //!
-//! A repeating `CFRunLoopTimer`'s interval bounds how much work CoreFoundation
-//! does for lateness it did not cause. So the waker's interval is not "fast
-//! enough to poll" — polling is done by RE-ARMING, which is what a waker is for
-//! — it is [`WAKE_TIMER_REPEAT_SECS`], a year: any lateness a process can
-//! survive costs at most one step. After it fires, the timer is SPENT (its next
-//! date a year out) until the event loop arms it again, and the callout records
-//! that, so [`WakePlan`] never trusts a cached "already armed for now" that
-//! CoreFoundation has used up — the lost wake that would otherwise replace the
-//! spin (model: `aterm_spec::derive::run_loop_waker_model`).
-//!
-//! This module is the ONE place in the tree that creates a run-loop timer
+//! This module is the only place that creates a run-loop timer
 //! (`tools/grep_guard.sh` B15 fences `CFRunLoopTimerCreate` and the `NSTimer`
-//! constructors to it), so a new timer is argued for here, beside the arithmetic
-//! that prices it, instead of being copied in with a microsecond interval.
+//! constructors to it).
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -60,11 +37,10 @@ use crate::declare::MainThread;
 
 /// The repeat interval handed to CoreFoundation, in seconds: one Julian year.
 ///
-/// Not a cadence — the waker never waits for a repeat. It is the bound on
-/// CoreFoundation's catch-up walk ([`cf_catch_up_steps`]): lateness shorter than
-/// this costs one step, however long the process was stopped, suspended under a
-/// debugger or starved. CoreFoundation clamps intervals above ~16 years itself,
-/// so this stays inside the range it honours as written.
+/// Not a cadence: it bounds CoreFoundation's catch-up walk
+/// ([`cf_catch_up_steps`]), so shorter lateness costs one step however long the
+/// process was stopped. CoreFoundation clamps intervals above ~16 years, so
+/// this is honoured as written.
 pub const WAKE_TIMER_REPEAT_SECS: f64 = 31_557_600.0;
 
 /// How the waker was last armed, as the event loop asked for it.
@@ -90,12 +66,12 @@ pub enum WakeArm {
 }
 
 /// The waker's decision state, with no CoreFoundation in it — the part the
-/// derived model binds to, and the part a regression would break.
+/// derived model binds to.
 ///
 /// `armed` is what the event loop last asked for; `spent` is whether the timer
-/// has fired since. A spent timer is parked a year out, so an unchanged request
-/// must still re-arm it: `armed == Some(Now)` with `spent` set is NOT "already
-/// armed", and treating it as one loses every wake after the first.
+/// has fired since. A spent timer is parked a year out, so `armed == Some(Now)`
+/// with `spent` set is not "already armed"; treating it as one loses every
+/// wake after the first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WakePlan {
     armed: Option<WakeTarget>,
@@ -170,11 +146,9 @@ impl WakePlan {
 }
 
 /// How many times CoreFoundation's catch-up walk runs for a repeating timer that
-/// fires `lag_ticks` after its due date, at `interval_ticks` per repeat — the
-/// loop quoted in the module header (`while next <= now { next += interval }`,
-/// starting from the missed date). `None` for a zero interval, which
-/// CoreFoundation refuses by halting the process ("A CFRunLoopTimer with an
-/// interval of 0 is set to repeat").
+/// fires `lag_ticks` after its due date, at `interval_ticks` per repeat (the
+/// loop in the module docs). `None` for a zero interval, which CoreFoundation
+/// refuses by halting the process.
 #[must_use]
 pub const fn cf_catch_up_steps(lag_ticks: u64, interval_ticks: u64) -> Option<u64> {
     if interval_ticks == 0 {
@@ -299,9 +273,9 @@ impl WakeTimer {
         unsafe { Self::on(CFRunLoopGetMain(), kCFRunLoopCommonModes) }
     }
 
-    /// A waker on the CALLING thread's run loop, default mode — the same timer,
-    /// for a thread that runs its own loop (and for driving the real timer
-    /// from a test thread without touching the main run loop).
+    /// A waker on the calling thread's run loop, default mode — for a thread
+    /// running its own loop, or a test driving the real timer off the main run
+    /// loop.
     #[must_use]
     pub fn current_thread() -> Self {
         // SAFETY: as in `main`.
@@ -321,8 +295,8 @@ impl WakeTimer {
         };
         // SAFETY: CoreFoundation copies `context`; the flag it points at lives
         // as long as `Self` (the timer is invalidated in `Drop` first). The
-        // first fire date is past CoreFoundation's own limit, so the timer
-        // starts disarmed, matching `WakePlan::new`.
+        // first fire date is beyond CoreFoundation's limit, so the timer starts
+        // disarmed, matching `WakePlan::new`.
         let timer = unsafe {
             CFRunLoopTimerCreate(
                 std::ptr::null(),
@@ -385,8 +359,7 @@ impl WakeTimer {
         let date = match arm {
             WakeArm::Keep => return,
             // CoreFoundation turns any past date into "now", so the current
-            // time IS "now" — and it is the date the catch-up bound is
-            // measured from ([`WakeTimer::armed_date`]).
+            // time is "now", and the date the catch-up bound is measured from.
             WakeArm::Now => current,
             WakeArm::At(at) => current + at.saturating_duration_since(now).as_secs_f64(),
             WakeArm::Disarm => f64::MAX,
@@ -438,8 +411,8 @@ impl Drop for WakeTimer {
 mod tests {
     use super::*;
 
-    /// THE ROOT CAUSE, AS ARITHMETIC. The interval bounds CoreFoundation's
-    /// catch-up walk; winit's 0.1 µs made a 26.6 h stop cost ~10¹² steps.
+    /// The interval bounds CoreFoundation's catch-up walk: at 0.1 µs a 26.6 h
+    /// stop costs ~10¹² steps.
     #[test]
     fn a_week_of_lateness_costs_the_waker_one_catch_up_step() {
         let rate = mach_ticks_per_sec();
@@ -447,7 +420,7 @@ mod tests {
         let ours = interval_ticks(WAKE_TIMER_REPEAT_SECS, rate);
         assert!(ours > 0, "a zero-tick interval makes CoreFoundation halt");
         assert_eq!(cf_catch_up_steps(week, ours), Some(1));
-        // The historical interval, priced the same way: the incident.
+        // A 0.1 µs interval, priced the same way.
         let historical = interval_ticks(0.000_000_1, rate);
         let incident = interval_ticks(95_674.0, rate);
         assert!(

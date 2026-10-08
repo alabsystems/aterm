@@ -51,6 +51,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -58,6 +59,25 @@ fn workspace_root() -> PathBuf {
         .nth(2)
         .expect("crates/aterm-verify sits two levels under the root")
         .to_path_buf()
+}
+
+/// The fake, written once per process. macOS assesses a new executable on its
+/// first exec, one file at a time machine-wide and per inode, not per content
+/// (`aterm_verify::standin` has the measurements), so the two tests below link
+/// ONE file into their roots and its first exec is assessed once, not twice.
+/// It lives in a `/tmp` directory of the process's own, as `standin`'s do. The
+/// fake is bash's (`#!/bin/bash`), so `standin`'s `#!/bin/sh` text is not it.
+fn shared_fake() -> &'static Path {
+    static FAKE: OnceLock<PathBuf> = OnceLock::new();
+    FAKE.get_or_init(|| {
+        let dir = aterm_verify::mktemp_dir("atv-fh-fake").expect("scratch dir for the fake");
+        let fake = dir.join("aterm");
+        fs::write(&fake, include_str!("fixtures/handback-fake-aterm.sh")).expect("write the fake");
+        // Read-only, so a test that wrote through its link would fail loudly
+        // instead of rewriting the other's fake.
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o555)).expect("chmod the fake");
+        fake
+    })
 }
 
 struct Fake {
@@ -70,8 +90,11 @@ impl Fake {
     fn new(tag: &str) -> Self {
         let root = aterm_verify::mktemp_dir(tag).expect("scratch root");
         let bin = root.join("aterm");
-        fs::write(&bin, include_str!("fixtures/handback-fake-aterm.sh")).expect("write the fake");
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod the fake");
+        // A copy only when the link cannot be made (another filesystem): it is
+        // slower to first exec and as correct.
+        fs::hard_link(shared_fake(), &bin)
+            .or_else(|_| fs::copy(shared_fake(), &bin).map(|_| ()))
+            .expect("place the fake");
         let state = root.join("state");
         fs::create_dir_all(&state).expect("state dir");
         Self { root, bin, state }
@@ -178,12 +201,15 @@ fn the_fake_catches_a_driver_that_guesses_the_holder_or_waits_on_its_own_echo() 
     let script = r#"
 set -u
 F=$1 S=$2/s.sock
+# NO LIFELINE on purpose: "$F" is the fixture's stand-in (handback-fake-aterm.sh),
+# no aterm; its socket stub sleeps itself out within ten minutes.
 "$F" --headless --control-sock "$S" </dev/null >/dev/null 2>&1 &
 P=$!
 trap 'kill $P 2>/dev/null' EXIT
-for i in $(seq 1 80); do [ -S "$S" ] && break; sleep 0.1; done
+# A hang detector (a minute), not a latency budget: the socket must appear.
+for i in $(seq 1 600); do [ -S "$S" ] && break; sleep 0.1; done
 c() { "$F" ctl --sock "$S" --timeout 20 "$@"; }
-printf '%s' "sh -c 'sleep 30'" | c send --stdin
+printf '%s' "sh -c 'echo armed\"\"-1; sleep 30'" | c send --stdin
 c key enter
 c await idle 500
 printf '\003' | c send --stdin

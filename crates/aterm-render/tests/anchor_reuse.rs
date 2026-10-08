@@ -26,11 +26,13 @@
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, DirtyDecision, Renderer, Theme, WindowCpu, compute_dirty_rows};
 
-fn renderer() -> Option<Renderer> {
-    Renderer::from_system(16.0, Theme::default()).map(|mut r| {
-        r.debug_block_on_lazy_fallbacks();
-        r
-    })
+fn renderer() -> Renderer {
+    Renderer::from_system(16.0, Theme::default())
+        .map(|mut r| {
+            r.debug_block_on_lazy_fallbacks();
+            r
+        })
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// Render through the warm damage cache and assert byte-identity against a
@@ -50,7 +52,7 @@ fn render_both(
         (view.pixels().to_vec(), view.width(), view.height())
     };
     let outcome = wc.last_damage();
-    let mut fresh = renderer().expect("font (checked by caller)");
+    let mut fresh = renderer();
     let full = fresh.render_input(&input);
     assert_eq!((w, h), (full.width, full.height), "dims @ {label}");
     assert_eq!(pixels, full.pixels, "warm != full repaint @ {label}");
@@ -62,10 +64,7 @@ fn render_both(
 /// frames GATE-HIT instead of full-repainting (the audit's headline case).
 #[test]
 fn streaming_while_scrolled_gate_hits_on_the_anchor() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (6usize, 32usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -114,10 +113,7 @@ fn streaming_while_scrolled_gate_hits_on_the_anchor() {
 /// E3 zero-band present wins on; the anchor-only precheck full-repainted it).
 #[test]
 fn uniform_bottom_flood_gate_hits_on_equal_offsets() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (6usize, 32usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -165,10 +161,7 @@ fn uniform_bottom_flood_gate_hits_on_equal_offsets() {
 /// its own offset), and damage stays off the FullRepaint path.
 #[test]
 fn selection_and_cursor_survive_anchor_reuse() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (6usize, 32usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -220,10 +213,7 @@ fn selection_and_cursor_survive_anchor_reuse() {
 /// (never a stale anchor reuse), and the post-reflow frame is byte-exact.
 #[test]
 fn reflow_forces_full_and_stays_byte_exact() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (6usize, 32usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -272,6 +262,7 @@ fn image_lane_change_dirties_its_row_under_anchor_shift() {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
+                cell_offset_px: (0, 0),
                 scaling: aterm_core::grid::extra::ImageScaling::Fit,
                 source_rect: None,
             }),
@@ -308,10 +299,7 @@ fn image_lane_change_dirties_its_row_under_anchor_shift() {
 /// repin frame must still present byte-identically to a fresh full pipeline.
 #[test]
 fn fractional_present_over_anchor_reuse_is_byte_exact() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (6usize, 32usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -335,7 +323,7 @@ fn fractional_present_over_anchor_reuse_is_byte_exact() {
         DamageOutcome::Full,
         "the frac present must not defeat the anchor reuse"
     );
-    let mut fresh = renderer().expect("font");
+    let mut fresh = renderer();
     let mut fresh_wc = WindowCpu::new();
     let fresh_pixels = {
         let view = fresh.render_input_cached(&mut fresh_wc, &input);

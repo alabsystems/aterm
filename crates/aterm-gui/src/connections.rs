@@ -658,7 +658,6 @@ mod tests {
             byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
             turns: Arc::new(Mutex::new(crate::turn_ledger::TurnLedger::default())),
             meta: Mutex::new(crate::session_timeline::SessionMeta::default()),
-            app_kitty: Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
@@ -1043,10 +1042,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "aterm-test-conn-first-use-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            aterm_time::since_epoch().unwrap().as_nanos()
         ));
         let cfg = Some(dir.join("aterm.toml"));
         // First UI connect: shows AND latches (marker file appears)…

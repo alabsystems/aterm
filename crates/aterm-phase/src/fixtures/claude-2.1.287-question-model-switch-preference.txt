@@ -1,0 +1,22 @@
+# claude-code 2.1.287 · MEASURED 2026-10-02, `aterm ctl text` of a private headless aterm (120x50) running the real Claude Code (tools/real-claude-lab) · the model-switch preference question Claude Code asks ITSELF (`confirmWithUser`, source `refusal_fallback_preference`): its header, question, labels and descriptions as the 2.1.287 bundle builds them, drawn through AskUserQuestion, the dialog confirmWithUser opens (a stub cannot raise the vendor's own: it needs the server's refusal fallback). `Switch automatically` writes switchModelsOnFlag=true to the user settings, `Stay on …` writes false · socket dir renamed at.XXXX
+ ▐▛███▛█   Claude Code v2.1.287
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.XXXX/proj
+
+
+❯ ask it
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Model switch
+
+│ Opus 5.5 safeguards flagged this message. Switch to Sonnet 5 and keep going whenever this happens? You can change this
+│ later in /config.
+
+❯ 1. Switch automatically
+     Continue on Sonnet 5 now, and switch without asking from now on
+  2. Stay on Opus 5.5
+     Stop here without switching, and ask me each time a message is flagged
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

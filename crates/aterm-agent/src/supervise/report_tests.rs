@@ -68,19 +68,6 @@ fn closed() -> CtlReply {
     }
 }
 
-/// The protocol's escape, for building `history` lines.
-fn pct(s: &str) -> String {
-    s.bytes()
-        .map(|b| {
-            if b.is_ascii_graphic() && b != b'%' {
-                char::from(b).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
-}
-
 /// `history` as `aterm ctl` prints it: the records on stdout.
 fn history(turns: &[(u64, bool, &str, &str)]) -> CtlReply {
     let mut out = String::new();
@@ -89,7 +76,7 @@ fn history(turns: &[(u64, bool, &str, &str)]) -> CtlReply {
             "turn {id} submitted={} status=settled started_ms=1 dur_ms=2 seq=3 \
              hash=0000000000000000 arch={arch} text={}\n",
             u8::from(*submitted),
-            pct(text)
+            aterm_codec::pct::encode(text)
         ));
     }
     ok(&out)
@@ -463,7 +450,7 @@ fn a_message_that_starts_with_a_number_is_found() {
 }
 
 /// A long paste shows as `[Pasted text #N …]`, which the ledger's text never
-/// matches: the report opens at the LAST such row (the one above it on the
+/// matches: the report opens at the last such row (the one above it on the
 /// screen is the turn before).
 #[test]
 fn a_long_paste_opens_at_the_last_pasted_row() {
@@ -843,12 +830,11 @@ fn the_transcript_ends_at_the_live_zone() {
     assert_eq!(transcript_end(&rows(&["", ""])), 0);
 }
 
-// -------------------------------------------- round-7 review of the report
+// -------------------------------------------- report opening and row edge cases
 
-/// The `[Pasted text` fallback fired for ANY ledger text that was not found —
-/// here a short turn queued under the status row — and with an earlier turn's
-/// paste on the screen the report claimed `complete=1 marker=ledger turn=8`
-/// while it opened at turn 7's paste. A short turn is never a paste.
+/// A short turn is never a paste: with an earlier turn's paste on the screen
+/// and a short turn queued under the status row, the report does not open at
+/// the earlier paste.
 #[test]
 fn the_paste_fallback_never_claims_an_older_turns_paste() {
     let screen = claude(
@@ -909,9 +895,9 @@ fn a_numbered_draft_in_the_composer_is_not_the_start() {
     );
 }
 
-/// Above an idle composer (no done row), the worker's last transcript row
-/// was dropped when it was indented 20+ columns — indented code — taken for a
-/// hint. A hint is parked against the right edge; code is not.
+/// Above an idle composer (no done row), the worker's last transcript row is
+/// kept when indented 20+ columns (indented code): a hint is parked against
+/// the right edge; code is not.
 #[test]
 fn indented_code_above_an_idle_composer_survives() {
     let screen = claude(
@@ -935,9 +921,8 @@ fn indented_code_above_an_idle_composer_survives() {
     );
 }
 
-/// DRIVE_HELP promises "every other row is kept verbatim (done rows, …)", but
-/// the done row that ends an idle turn — here the one that says a monitor is
-/// STILL RUNNING — was taken for the status row and cut.
+/// The done row that ends an idle turn (here one saying a monitor is still
+/// running) is kept verbatim, not taken for the status row and cut.
 #[test]
 fn the_done_row_that_ends_a_turn_is_kept() {
     let screen = claude(
@@ -1000,7 +985,7 @@ fn an_aterm_ctl_that_frames_offscreen_as_status_falls_back() {
     );
 }
 
-/// A host whose archive is OFF (`enabled=0`) kept nothing that scrolled away:
+/// A host whose archive is off (`enabled=0`) kept nothing that scrolled away:
 /// the report is the screen's, and says no-archive even with the start found.
 #[test]
 fn an_archive_that_is_off_is_no_archive() {
@@ -1079,9 +1064,9 @@ fn a_paste_row_that_does_not_fit_the_turn_is_not_the_start() {
     );
 }
 
-// ------------------------------------------- round-11: the report's two views
+// ------------------------------------------- the report's two views
 
-/// The `--final` and `--messages` views on the saved screen of a REAL worker
+/// The `--final` and `--messages` views on the saved screen of a real worker
 /// (`idle-after-limit-and-model-switch`, the fixture
 /// [`the_transcript_ends_at_the_live_zone`] reads): the default report is
 /// byte-identical to what it always printed, `--final` is the worker's last

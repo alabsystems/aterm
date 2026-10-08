@@ -2,17 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Integration test: containment gate denials emit audit log events (#5533).
+//! Integration test: containment gate denials emit audit log events.
 //!
-//! Installs a custom logger that captures log messages, calls `log_denial()`,
-//! and asserts the expected structured output is captured with the correct
-//! `containment_audit` target.
+//! Installs a capturing logger, calls `log_denial()`, and asserts the expected
+//! output arrives with the `containment_audit` target.
 
 use std::sync::{Mutex, OnceLock};
 
 use aterm_containment::ContainmentMode;
 
-/// Mutex to serialize tests that share a process-global logger (#7698).
+/// Mutex to serialize tests that share a process-global logger.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Captured log record.
@@ -146,7 +145,7 @@ fn log_posture_is_neutral_not_denial() {
 
     captured().lock().unwrap().clear();
 
-    // A posture/permit event must share the audit target but NOT be a DENIED line.
+    // A posture/permit event shares the audit target but is not a DENIED line.
     aterm_containment::log_posture(
         "spawn",
         "os-network-sandbox",
@@ -173,13 +172,12 @@ fn log_posture_is_neutral_not_denial() {
 
 #[test]
 fn decide_permit_is_not_logged_as_denied() {
-    // Regression (#5533 follow-up): every spawn flows through `decide`, which
-    // records the OS-sandbox posture. A PERMITTED spawn must never surface in the
-    // audit stream as `DENIED:` — otherwise a `containment_audit | grep DENIED`
-    // audit aggregation false-positives on every successful/permitted spawn.
-    // The one spawn that IS refused — Containment where the platform has no OS
-    // sandbox (the owner's fail-closed ruling, 2026-09-25) — is logged as exactly
-    // one `DENIED:` naming that gap, and as no posture line.
+    // Every spawn goes through `decide`, which records the OS-sandbox posture
+    // (owner, 2026-09-25).
+    // A permitted spawn never appears as `DENIED:` (so `grep DENIED` counts
+    // only denials). The one refused spawn, Containment where the platform has
+    // no OS sandbox, logs exactly one `DENIED:` naming the gap and no posture
+    // line.
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = aterm_log::set_logger(&LOGGER);
     // Capture both posture (Info) and any denial (Warn) lines.
@@ -239,10 +237,9 @@ fn decide_permit_is_not_logged_as_denied() {
 
 #[test]
 fn posture_claims_resource_limits_only_for_the_mode_that_has_them() {
-    // Both launchers give Master and User aterm's own limits
-    // (`Limits::inherit`) and Safety the hardened ones (`Limits::shell_default`),
-    // so only Safety's no-sandbox record may claim resource limits. A single
-    // wording for all three once told every default (User) launch it had limits.
+    // Master and User get aterm's own limits (`Limits::inherit`) and Safety the
+    // hardened ones (`Limits::shell_default`), so only Safety's no-sandbox
+    // record may claim resource limits.
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = aterm_log::set_logger(&LOGGER);
     aterm_log::set_max_level(aterm_log::LevelFilter::Info);

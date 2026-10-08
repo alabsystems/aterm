@@ -14,9 +14,7 @@
 //! `DEFAULT_OWNER`/`DEFAULT_REPO`, so publisher and client read one value (the test
 //! `the_channel_is_exactly_the_one_clients_compiled_in` proves they agree). The engine
 //! (`pub publish`) creates that version's release first, as a SOURCE prerelease; the
-//! cut adopts it and completes it (owner ruling R4, 2026-09-23). Until 2026-09-26 the
-//! cut published a second object first — a draft on the private origin, flipped,
-//! archived and verified there — and then MIRRORED it here; that leg is gone.
+//! cut adopts it and completes it (owner ruling R4).
 //!
 //! ## What the release must get exactly right
 //!
@@ -46,13 +44,9 @@
 //! [`validate_channel_asset_set`] a total check with no "and maybe some extras" hole:
 //! either name on the channel is refused as an unexpected object.
 //!
-//! RETIRED 2026-08-26 (owner direction: ONE lean self-provisioning macOS
-//! download): the batteries-included seed, the Intel `aterm-<v>-x86_64.dmg`
-//! variant, the `aterm-<v>-lite.dmg` lean twin and the `aterm-offline.dmg`
-//! alias. The bare `aterm-<v>.dmg` name survives because the deployed updater
-//! binds it exactly (`aterm-update/src/github.rs` `authoritative_dmg_index`),
-//! but the bytes behind it are now the lean app — nothing ever required them
-//! to be seeded.
+//! ONE lean self-provisioning macOS download. The bare `aterm-<v>.dmg` name stays
+//! because the deployed updater binds it exactly (`aterm-update/src/github.rs`
+//! `authoritative_dmg_index`); the bytes behind it are the lean app.
 
 use std::path::{Path, PathBuf};
 
@@ -203,9 +197,8 @@ fn validate_slug(slug: &str) -> Result<()> {
 /// derives this same string from the TAG and refuses the release if the
 /// manifest's `dmg` field disagrees, so it is a name the cut cannot vary.
 ///
-/// Since 2026-08-26 the bytes under this name are the LEAN app image — the
-/// same signed, notarized bundle the updater zip carries, in the drag-install
-/// DMG gesture. The name is fleet-load-bearing; the seed behind it never was.
+/// The bytes under this name are the LEAN app image — the same signed,
+/// notarized bundle the updater zip carries, in the drag-install DMG gesture.
 #[must_use]
 pub fn dmg_asset_name(version: &str) -> String {
     format!("aterm-{version}.dmg")
@@ -293,9 +286,8 @@ pub fn sha256_sidecar_contents(sha256: &str, asset: &str) -> String {
 /// conditional because with an unpinned master no client ever looks for them, and
 /// the published set must not change by one byte while that is true.
 ///
-/// There is exactly ONE macOS DMG in this set (RETIRED 2026-08-26: the Intel
-/// `-x86_64` pair, the `-lite` twin and the `aterm-offline.dmg` alias). A
-/// channel head that still carries one of those names is refused as an
+/// There is exactly ONE macOS DMG in this set. A channel head that still carries
+/// a retired name (`-x86_64`, `-lite`, `aterm-offline.dmg`) is refused as an
 /// unexpected object — a human inspects rather than the cut converging
 /// `aterm.dmg` onto bytes a dead publisher minted under a different contract.
 #[must_use]
@@ -489,6 +481,36 @@ pub fn unclaimed_is_source_release(names: &[String]) -> std::result::Result<(), 
     }
 }
 
+/// Is the unclaimed source release this cut would adopt still a PRERELEASE?
+///
+/// The engine creates it as one (`BINARY_CUT_FOLLOWS_DEFAULT="true"` in the published
+/// tree's `publish/config.sh`), and that is the ONLY thing keeping the cut's uploads
+/// hidden from every client until its head PATCH: GitHub hands `latest` to a full
+/// release at creation, and the client's replay skips a prerelease even once its appcast
+/// is up. Adopt a FULL source release and the uploads land on the live head — the appcast
+/// is electable the moment it lands, before the exact-asset proof and the second floor
+/// read; `--abandon` refuses the release from then on (`verify::ReleaseState::Published`
+/// is "not a prerelease, carrying an appcast"); and a resume reads the same state as
+/// [`ChannelRelease::head_made`] and skips the proof and the floor altogether. The
+/// adoption is refused BEFORE its intent is persisted, so nothing is bound, uploaded or
+/// claimed by it.
+///
+/// # Errors
+/// A full release, completing "the release … ".
+pub fn unclaimed_source_is_prerelease(prerelease: bool) -> std::result::Result<(), String> {
+    if prerelease {
+        Ok(())
+    } else {
+        Err(
+            "is a FULL release, not the engine's source PRERELEASE — the engine that \
+             created it did not read `BINARY_CUT_FOLLOWS_DEFAULT=\"true\"` (an older \
+             engine, config drift, or a run from another commit), so it holds or can take \
+             `latest` with no appcast on it"
+                .to_string(),
+        )
+    }
+}
+
 /// The names the engine's source release carries: the attestation pair and the roster
 /// pair it re-uploads. They never decide whose a release is, and a withdrawal never
 /// takes them.
@@ -649,21 +671,19 @@ pub trait ChannelRelease {
 /// ([`channel_upload_rank`]), prove the asset set, check the floors again, make the
 /// release the head, prove what a stranger sees — unless the head is already made.
 ///
-/// A HEAD THE CUT MADE IS FINISHED, NEVER REFUSED (2026-09-26). The step can fail after
-/// its PATCH landed — the pointer gate's five-minute bound ran out on v0.93.0 — and the
-/// journal then stays at `publish` with the release already the fleet's head. Re-entering
-/// the write half there was wrong twice over: a roster join since the PATCH re-dresses
-/// that head with a generation this cut's signed appcast does not carry, so the floors
-/// read again refuse a release every client already runs — permanently, and with no
-/// exit, because `--abandon` refuses a published release and `yank` wants a finished
-/// journal — and an upload would have put the older roster pair back over the join's.
-/// So [`ChannelRelease::head_made`] is asked first, by the same predicate `--abandon`
-/// refuses on: every state abandon refuses, the resume finishes — with only what
-/// cannot refuse a head the fleet already runs: the head half of the ratchet (still
-/// never over a newer release), the idempotent PATCH, and the read side. The PATCH is
-/// re-sent because GitHub hands `latest` to any release published as a full release in
-/// between — an `atpkg-index-<n>` cut included — and the pointer gate would otherwise
-/// never pass. Nothing is uploaded, and no roster floor is read.
+/// A HEAD THE CUT MADE IS FINISHED, NEVER REFUSED. The step can fail after its PATCH landed (the
+/// pointer gate's five-minute bound running out), and the journal then stays at `publish` with the
+/// release already the fleet's head. Re-entering the write half there was wrong twice over: a
+/// roster join since the PATCH re-dresses that head with a generation this cut's signed appcast
+/// does not carry, so the floors read again refuse a release every client already runs —
+/// permanently, and with no exit, because `--abandon` refuses a published release and `yank` wants
+/// a finished journal — and an upload would have put the older roster pair back over the join's. So
+/// [`ChannelRelease::head_made`] is asked first, by the same predicate `--abandon` refuses on:
+/// every state abandon refuses, the resume finishes — with only what cannot refuse a head the fleet
+/// already runs: the head half of the ratchet (still never over a newer release), the idempotent
+/// PATCH, and the read side. The PATCH is re-sent because GitHub hands `latest` to any release
+/// published as a full release in between — an `atpkg-index-<n>` cut included — and the pointer
+/// gate would otherwise never pass. Nothing is uploaded, and no roster floor is read.
 ///
 /// The floors are read BEFORE THE BIND. A cut they refuse there has touched nothing
 /// and recorded nothing: no draft created, no adoption intent persisted, no channel
@@ -675,17 +695,13 @@ pub trait ChannelRelease {
 /// that read and the PATCH itself is the one window no read closes: GitHub offers no
 /// conditional PATCH.
 ///
-/// WHY THE HEAD PATCH IS ON EVERY PATH (2026-09-23). The cut OWNS GitHub's `latest`
-/// pointer — the one request every credential-less updater makes, and the target of
-/// the evergreen `releases/latest/download/aterm.dmg` / `aterm-mac.zip` links.
-/// `pub publish` creates the same vX.Y.0 release first, as a source release, and the
-/// cut ADOPTS it. The adopt path used to flip nothing ("already visible"), and passed
-/// its pointer gate only because that source release had already STOLEN `latest`
-/// from the previous app release — about twenty minutes before any app asset
-/// existed, during which every updater 302'd to a release with no appcast. The
-/// engine now creates that source release as a prerelease, which can never hold
-/// `latest`; without this PATCH on the adopt path the pointer would stay on the
-/// previous release and the gate would refuse every cut.
+/// WHY THE HEAD PATCH IS ON EVERY PATH. The cut OWNS GitHub's `latest` pointer — the
+/// one request every credential-less updater makes, and the target of the evergreen
+/// `releases/latest/download/aterm.dmg` / `aterm-mac.zip` links. `pub publish` creates
+/// the same vX.Y.0 release first as a source PRERELEASE, which can never hold
+/// `latest` (so no updater is sent to a release with no appcast); without this PATCH
+/// on the adopt path the pointer would stay on the previous release and the gate
+/// would refuse every cut.
 ///
 /// # Errors
 /// The first failing call; nothing after it runs.
@@ -965,11 +981,9 @@ update_channel = \"someone/else\"
 
     /// REGRESSION: the channel anchor has exactly ONE home.
     ///
-    /// It used to live in BOTH `[workspace.metadata.aterm] update_channel_pubkey`
-    /// and (after the pins refactor) `aterm_update_core::pins`. Two separately
-    /// edited committed values that nothing compared: editing one and not the other
-    /// yields releases signed by a key no client accepts, silently. The manifest key
-    /// is gone; this test fails if it comes back.
+    /// A second copy in `[workspace.metadata.aterm] update_channel_pubkey`, edited
+    /// apart from `aterm_update_core::pins`, would sign releases with a key no client
+    /// accepts, silently. This test fails if the manifest key comes back.
     #[test]
     fn the_channel_anchor_lives_only_in_pins() {
         assert!(

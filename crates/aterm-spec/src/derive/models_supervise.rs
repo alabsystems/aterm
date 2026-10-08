@@ -5,10 +5,10 @@
 //! the session claim it acts under, the focus-then-Enter choice it makes on
 //! an unnumbered dialog, the turn-end policy and its done check, the keys it
 //! sends to answer Claude Code's question dialog, the keystrokes of a
-//! decline, when it types into an API error the network caused, and the
-//! stall's remedy.
+//! decline, when it types into an API error the network caused, the
+//! stall's remedy, and the one ask a box gets however it is redrawn.
 
-use super::Model;
+use super::{Liveness, Model};
 
 /// The SUPERVISOR CLAIM (aterm-agent `supervise/claim.rs`): a loop presses
 /// only while its last word from the server was that the claim is its own
@@ -533,6 +533,9 @@ pub fn supervisor_done_check_model() -> Model {
 /// `tier1_the_real_remedy_signals_exactly_where_the_model_terms`) drives the
 /// real loop over a frozen worker in every reachable configuration and
 /// checks it sends `signal term` exactly where `Term` is enabled, once.
+/// Since 2026-09-29 `Term` is the remedy under `[harness] stall_term =
+/// true`; by default the same gate takes a WARNING instead (the agent left
+/// running), which the same Tier-1 checks where `Term` is enabled.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_stall_remedy_model() -> Model {
@@ -1110,15 +1113,17 @@ pub fn upgrade_refused_turn_end_model() -> Model {
 /// proves the SCREEN did not change between the read a key was decided on
 /// and its write, and a key written to the PTY that Claude Code has not
 /// read yet changes nothing on the screen. So every key is split here into
-/// its WRITE (`PersonKey`, `HarnessMove`, `HarnessEnter`: appended to the
-/// PTY's queue `q1`, `q2`, oldest first — 0 none, 1 a person's key, 2 the
-/// supervisor's `↑` or `↓` (the model abstracts the direction: a move is
-/// one row toward the chosen one), `3 + t` its Enter decided on tab `t`)
-/// and its CONSUME
+/// its WRITE (`PersonKey`, `HarnessMove`, `HarnessEnter`, `HarnessType`:
+/// appended to the PTY's queue `q1`, `q2`, oldest first — 0 none, 1 a
+/// person's key, 2 the supervisor's `↑` or `↓` (the model abstracts the
+/// direction: a move is one row toward the chosen one), `3 + t` its Enter
+/// decided on tab `t`, `4 + Tabs + t` its policy text decided on tab `t`,
+/// THE POLICY TEXT below) and its CONSUME
 /// by Claude Code (the head's effect on the dialog as it is THEN: `MoveLands`,
 /// `MoveShort`, `EnterTaken`, the person's `PersonMovesOff` … `PersonAnswers`,
-/// `KeyRefused` for a key the dialog's typeahead window drops, O4, and
-/// `KeyIntoTheComposer` for one read after the dialog closed). What keeps a
+/// `KeyRefused` for a key the dialog does not take: dropped by its
+/// typeahead window, O4, or — read after the dialog closed — typed into the
+/// composer, where `↑` recalls history). What keeps a
 /// supervisor key off a state it was not decided on is two guards the loop
 /// adds to the decision (and `Buggy = 1` drops both — the fence alone, as
 /// first specified):
@@ -1152,7 +1157,10 @@ pub fn upgrade_refused_turn_end_model() -> Model {
 /// after the one it was decided on (`NeverAnswersANextTabWithAStaleKey`),
 /// none on the review's cancel (`NeverCancelsTheReview`: the tool call is
 /// rejected and the model told to STOP, S7-03), and none read after the
-/// dialog closed (`NoKeyIntoTheComposer`: `↑` recalls history into it).
+/// dialog closed (`NoKeyIntoTheComposer`: `↑` recalls history into it). With
+/// the policy text (`Text = 1`) a fifth and a sixth: the text lands only in
+/// the empty field it was decided on (`OwnTextOnlyIntoItsEmptyField`), and
+/// only once on a tab (`TextNeverWrittenTwice`).
 ///
 /// `tab` is the dialog's tab (`0..Tabs-1` a question, `Tabs` the review,
 /// `Tabs + 1` closed; with `Review = 0` — a lone single-select question,
@@ -1175,12 +1183,16 @@ pub fn upgrade_refused_turn_end_model() -> Model {
 ///
 /// **The person fence** (`PersonFence`, R3b, built 2026-09-27): the loop
 /// reads the person's stamp on the read the key is decided on
-/// (`seen_quiet`), and the key names that read's person count (`key
+/// (`seen_quiet`), and the key names that read's person count (`key|send
 /// if-human=`), which the server checks under the same lock as the write —
 /// so a person's key written in the round trip since the read (`touched`:
 /// `PersonKey` sets it, a `Read` clears it) skips the supervisor's. Until
 /// then this was an ASSUMPTION (`QuietAtWrite`); at `PersonFence = 0` — a
 /// host that sends no count — the invariants are refuted, as they were.
+/// Out of the model: the fence is not atomic with the person's own write,
+/// which takes no terminal lock — a gesture counted after the server's
+/// check and written before the supervisor's write, inside that one hold,
+/// lands first.
 ///
 /// **One ASSUMPTION, not a mechanism** — a constant at 1 here, refuted at 0
 /// by `aterm-spec/tests/derived_supervise.rs`, so the model says exactly
@@ -1200,9 +1212,145 @@ pub fn upgrade_refused_turn_end_model() -> Model {
 /// scripted server and projects each read, key and wait onto this model:
 /// every key the real loop sends must be enabled here, at the state the
 /// environment actions that explain its reads lead to.
-#[must_use]
+///
+/// **THE POLICY TEXT** (`Text = 1`; the question-policy words `long-term`
+/// and `short-term`). On a tab that does not fall back (below) the
+/// supervisor chooses no option: it moves the focus onto the question's
+/// free-text row (`Type something.`), writes a fixed policy text there and
+/// presses Enter on it, so the worker decides by the policy. That is the ONE
+/// place a supervisor key may land in the free-text field. `Text = 0` is the
+/// recommended path above, and nothing of this section is reachable there:
+/// its reachable space is today's, state for state (pinned by the Tier-0
+/// tests).
+///
+/// * **Each tab runs its own route** (`fallback`). A tab the text is
+///   estimated not to fit, one with no free-text row (the preview form),
+///   and every tab of a window that cannot fence a typed answer are
+///   answered with their RECOMMENDED option instead — keyed as the
+///   recommended path keys it, its chosen row (`focus` 0) that option, no
+///   text ever written there (`HarnessType` needs a read that showed the tab
+///   not falling back). A dialog may mix such tabs with typed ones.
+///   `FitLostOnIt` / `FitLostOffIt` turn a tab to its recommended option,
+///   the focus on it or off it: before its first read or after, while the
+///   loop has written no text on it and no key of its is unread — never
+///   back, as the loop latches a tab it decided so (`fell_back`). A
+///   redraw that changes the route under a key still in flight is outside
+///   the model, as every redraw not caused by a key is (a pane resized
+///   under an unread key).
+/// * **The queue code** `4 + Tabs + t` is the text decided on tab `t` —
+///   one `send`, one queue item (`HarnessType`). Its consume is
+///   `TextLands` (read whole), `TextPartly` (its head dropped by the
+///   dialog's typeahead window, O4, leaving a suffix) or `KeyRefused`
+///   (dropped whole, or read after the dialog closed: into the composer).
+/// * **No retry, and once per tab.** A text the box did not take is handed
+///   over, never written again: a second text behind an unread first would
+///   land in a field no longer empty. `HarnessType` has no retry clause on
+///   the box as keyed — it needs `mine` 0, a read that showed the box
+///   CHANGED since its last key (which a person's move does as well as the
+///   key's own effect) — and it needs `wrote` 0: the loop remembers the
+///   text it wrote on this tab (the memory `OwnTextRemembered` names; the
+///   real loop's `QuestionMemory::typed`, by which it hands a field
+///   emptied again over as the text "gone"), so no text follows a first on
+///   one tab whatever changed after it — the law `TextNeverWrittenTwice`,
+///   refuted without the memory and by the fence alone. `HarnessType` also
+///   sets `retried` to `MaxRetry` — no try left on the box as keyed, as the
+///   real loop marks a text's pending write (main's P3 tries a KEY again
+///   after the back-off; a text never); on the box as keyed (the field
+///   focused, empty, not own) neither a move nor an Enter is enabled
+///   anyway, so that is the loop's record, not a guard the proof leans on
+///   (measured: at `retried = 0` every law still holds).
+/// * **`own`** is the field holding EXACTLY the supervisor's text, typed by
+///   it into that tab's empty, focused field (`TextLands` clean). Anything
+///   else in the field is `typed` — a person's text, their keys added to
+///   the supervisor's, a head-dropped suffix, a text landed on a field
+///   that was not empty — and hands the question over as a person's text
+///   does today (R2 d). Of those, `exact` is a person's own copy of the
+///   policy text (`PersonTypesPolicyText`) on a tab the supervisor wrote no
+///   text on: the one text no read of the field tells from the
+///   supervisor's — only its memory does. (Typed on a tab it DID write its
+///   text on, the field holds exactly its text again: `own`, by every read
+///   and by its memory, as the real ownership rule has it.) On a text tab the chosen row (`focus` 0) is the
+///   free-text row until own text is there; on a multi-select (`Multi =
+///   1`) the typed row then ticks itself and the `Submit`/`Next` button
+///   becomes the chosen row, with the focus still in the field (c3-05,
+///   c4-09 on 2.1.283: `[✔]` and the chip `☒` as the text lands).
+/// * **The laws, as they read here.** `NoDigitInTheField`: an Enter on a
+///   question tab that does not fall back is in the field unless the field
+///   holds exactly own text (over a person's text it would submit their
+///   words as the policy's, over an empty field it answers nothing), so
+///   `HarnessEnter` on such a tab needs a read that showed own text
+///   (`seen_own`); on a tab that falls back it is any row but its
+///   recommended option, as on the recommended path.
+///   `OwnTextOnlyIntoItsEmptyField` (`astray`): the text is read only on
+///   the tab it was decided on, into its focused, empty field — decided on
+///   a read that showed exactly that, and written under the same two
+///   guards as every key.
+/// * **The multi-select Enter hazard** (c3c, measured on 2.1.283): Enter
+///   while the focus is in a multi-select's field UNTICKS the typed row
+///   (`[✔]` to `[ ]`, the chip `☒` to `☐`), and the dialog then answers
+///   "did not answer". So on a multi-select the loop moves off the field
+///   (`↓` onto the button, `HarnessMove`) and presses Enter on the button
+///   only. `EnterWhereTyped = 1` (an Enter wherever own text was read) is
+///   that hazard as a dial, committed 0: at 1 it breaks
+///   `NoDigitInTheField` with no person acting at all.
+/// * **Growth upward and reflow.** The text wraps the field over more rows
+///   (c1-04: one row to three), and a dialog at the pane's foot grows
+///   UPWARD, moving the field's row (c3-04 to c3-05: two rows up); on a
+///   multi-select `↓` reflows the text by a cell or two (c3-06) without
+///   changing its one-space join. The model's box is its tab, focus row,
+///   focus parity, text and ownership, not its geometry: the real loop
+///   guards each key on the row as drawn on the read it was decided on, a
+///   changed drawing reads as a change (`fresh` 0), and a dialog cut at its
+///   head reads Unknown and is handed over.
+///
+/// A second ASSUMPTION at `Text = 1`, `OwnTextRemembered` (committed 1): the
+/// loop remembers the text it typed, per question, so a person's copy of
+/// the policy text is never taken for its own, and no text is written on a
+/// tab twice. At 0 (no memory: a person's exact copy reads as the loop's
+/// own, and a written text is forgotten) `NoDigitInTheField` is refuted —
+/// through a person's copy and through nothing else: a suffix, the text
+/// plus more and a person's own words are told apart by the field's
+/// byte-exact read, not by the memory — and so is `TextNeverWrittenTwice`.
+/// A lost memory (a restart, a claim handover) is therefore a stall, never
+/// an answer.
+///
+/// Out of the model for the text, and owed to the tests of the code that
+/// types it: that the one `send` is one ordered queue item (its bytes
+/// written under one lock hold, after any key queued before it); that the
+/// text carries no digit and no newline (no byte of it selects an option
+/// or submits); that the reader's one-space join of its wrapped rows gives
+/// it back exactly; the in-lock residual of `if-human=` (`PersonFence`
+/// above); the fit estimate itself (which tab falls back is the decider's,
+/// `text_fits`; the model covers every choice of it); and a dialog that
+/// mixes a single-select tab with a multi-select one (c4): `Multi` is one
+/// constant for the whole dialog, so such a dialog is bound tab form by
+/// tab form, not as one run — its typed multi-select tab and a typed
+/// single-select tab each fit a model instance, a multi-select tab that
+/// falls back fits both. Tier-1 of `Text = 1`: the decider
+/// (`policy/question_text_tests.rs`,
+/// `tier1_text_mode_decider_chooses_only_what_the_model_enables`, over
+/// typed and falling-back tabs; a blind, a memory-trusting and a
+/// multi-as-single decider as its negative controls) and the loop that
+/// types it (`supervise/run_question_text_tests.rs`,
+/// `tier1_the_policy_text_goes_only_where_the_model_allows`: each `send` its
+/// `HarnessType`, enabled where it goes, a tab too short for the text and
+/// a dialog of a typed tab and a falling-back tab bound too; a loop whose
+/// memory is seeded over a person's own copy of the text as its negative
+/// control, caught at the Enter the model forbids; and
+/// `a_persons_key_between_the_read_and_the_send_skips_the_policy_text`: a
+/// `send` the person fence skipped is the model's `PersonKey`, after which
+/// `HarnessType` is not enabled — enabled there at `PersonFence = 0`).
+///
+/// **The two instances** (the review of the question-lean re-port): a law
+/// no member of the `Buggy = 1` family can break at a model's committed
+/// constants is a GHOST to the workspace's non-vacuity sweep, and the two
+/// text laws are unbreakable at `Text = 0`, where no text is written. So
+/// this machine is checked as two models, each with only the laws its
+/// constants can break: [`supervisor_question_answer_model`], the
+/// recommended path, and [`supervisor_question_text_model`], the policy
+/// text.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn supervisor_question_answer_model() -> Model {
+fn supervisor_question_family() -> Model {
     crate::ty_model! {
         SupervisorQuestionAnswer {
             const Buggy = 0;
@@ -1211,6 +1359,10 @@ pub fn supervisor_question_answer_model() -> Model {
             const TakenBeforeStill = 1;
             const Review = 1;
             const MaxRetry = 2;
+            const Text = 0;
+            const Multi = 0;
+            const OwnTextRemembered = 1;
+            const EnterWhereTyped = 0;
             var tab = 0;
             var focus = 0;
             var row = 0;
@@ -1233,6 +1385,15 @@ pub fn supervisor_question_answer_model() -> Model {
             var cancelled = 0;
             var composer = 0;
             var opened = 1;
+            var own = 0;
+            var seen_own = 0;
+            var astray = 0;
+            var fallback = 0;
+            var seen_fallback = 0;
+            var wrote = 0;
+            var twice = 0;
+            var exact = 0;
+            var seen_exact = 0;
 
             // ---- a person writes a key (any: its effect is its consume's) ----
             action PersonKey when (tab <= Tabs && q2 == 0) {
@@ -1263,8 +1424,36 @@ pub fn supervisor_question_answer_model() -> Model {
                 q2 = 0;
                 fresh = 0;
             }
-            action PersonTypes when (q1 == 1 && tab <= Tabs - 1 && focus == 1) {
+            // Their text in the free-text row: off the chosen row when the
+            // chosen row is an option; with a policy text (`Text = 1`, a tab
+            // not falling back) the free-text row IS the chosen row, and
+            // their text — even keys added to the supervisor's own — makes
+            // the field not its own.
+            action PersonTypes when (
+                q1 == 1 && tab <= Tabs - 1 && (focus == 1 || (Text == 1 && fallback == 0))
+            ) {
                 typed = 1;
+                own = 0;
+                exact = 0;
+                q1 = q2;
+                q2 = 0;
+                fresh = 0;
+            }
+            // Their text is EXACTLY the policy text (a person's copy of it):
+            // the one text only the loop's memory tells from its own — no
+            // read of the field can (`OwnTextRemembered`). On a tab the loop
+            // wrote its text on (`wrote`), the field then holds exactly that
+            // text again, whoever typed its bytes: it IS the loop's own by
+            // every read and by its memory (the real ownership rule), and an
+            // Enter on it submits the policy text the loop wrote. On any
+            // other tab it is a person's copy (`exact`).
+            action PersonTypesPolicyText when (
+                Text == 1 && q1 == 1 && tab <= Tabs - 1 && (focus == 1 || fallback == 0)
+            ) {
+                typed = 1 - wrote;
+                own = wrote;
+                exact = 1 - wrote;
+                focus = if wrote == 1 && Multi == 1 { 1 } else { focus };
                 q1 = q2;
                 q2 = 0;
                 fresh = 0;
@@ -1276,6 +1465,10 @@ pub fn supervisor_question_answer_model() -> Model {
                 focus = 0;
                 row = 0;
                 typed = 0;
+                own = 0;
+                exact = 0;
+                fallback = 0;
+                wrote = 0;
                 q1 = q2;
                 q2 = 0;
                 fresh = 0;
@@ -1302,19 +1495,87 @@ pub fn supervisor_question_answer_model() -> Model {
                 fresh = 0;
             }
             // Enter answers the focused row: the tab moves on, the review
-            // submits (or, on its cancel, rejects the tool call).
-            action EnterTaken when (3 <= q1 && tab <= Tabs) {
+            // submits (or, on its cancel, rejects the tool call). With a
+            // policy text, an Enter on a question tab that does not fall
+            // back is in the field unless the field holds exactly the
+            // supervisor's own text; on a tab that falls back the chosen
+            // row is its recommended option, as on the recommended path.
+            action EnterTaken when (3 <= q1 && q1 <= 3 + Tabs && tab <= Tabs) {
                 stale = if q1 == 3 + tab { stale } else { 1 };
-                in_field = if tab <= Tabs - 1 && focus == 1 { 1 } else { in_field };
+                in_field = if tab <= Tabs - 1 && (
+                    focus == 1 || (Text == 1 && fallback == 0 && (own == 0 || typed == 1))
+                ) { 1 } else { in_field };
                 cancelled = if tab == Tabs && focus == 1 { 1 } else { cancelled };
                 tab = if tab == Tabs - 1 && Review == 0 { Tabs + 1 } else { tab + 1 };
                 focus = 0;
                 row = 0;
                 typed = 0;
+                own = 0;
+                exact = 0;
+                fallback = 0;
+                wrote = 0;
                 q1 = q2;
                 q2 = 0;
                 fresh = 0;
                 opened = 1;
+            }
+            // The policy text read whole. Into its own tab's EMPTY field,
+            // focused, it is the supervisor's own (`own`) — on a
+            // multi-select the row ticks itself and the Submit/Next button
+            // becomes the chosen row, the focus staying in the field.
+            // Anywhere else it is astray, and it is text no one may take
+            // for the supervisor's (`typed`).
+            action TextLands when (4 + Tabs <= q1 && tab <= Tabs) {
+                stale = if q1 == 4 + Tabs + tab { stale } else { 1 };
+                astray = if q1 == 4 + Tabs + tab && tab <= Tabs - 1 && focus == 0
+                    && typed == 0 && own == 0 { astray } else { 1 };
+                own = if q1 == 4 + Tabs + tab && tab <= Tabs - 1 && focus == 0
+                    && typed == 0 && own == 0 { 1 } else { 0 };
+                typed = if q1 == 4 + Tabs + tab && tab <= Tabs - 1 && focus == 0
+                    && typed == 0 && own == 0 { typed } else { 1 };
+                focus = if q1 == 4 + Tabs + tab && tab <= Tabs - 1 && focus == 0
+                    && typed == 0 && own == 0 && Multi == 1 { 1 } else { focus };
+                exact = 0;
+                q1 = q2;
+                q2 = 0;
+                fresh = 0;
+            }
+            // The typeahead window dropped its head (O4): the field holds a
+            // suffix of the text — not the supervisor's own.
+            action TextPartly when (
+                q1 == 4 + Tabs + tab && tab <= Tabs - 1 && focus == 0 &&
+                typed == 0 && own == 0
+            ) {
+                typed = 1;
+                own = 0;
+                exact = 0;
+                q1 = q2;
+                q2 = 0;
+                fresh = 0;
+            }
+            // THE TAB FALLS BACK (`Text = 1`): the text is estimated not to
+            // fit its pane (or the tab has no free-text row, or the window
+            // cannot fence a typed answer), so it is answered with its
+            // recommended option — the chosen row is that option from here
+            // on, the focus on it or off it. Only while the loop has written
+            // no text on the tab and none of its keys is unread (a redraw
+            // under a key in flight is outside the model, as any redraw is);
+            // never back (the loop latches it).
+            action FitLostOnIt when (
+                Text == 1 && fallback == 0 && tab <= Tabs - 1 && wrote == 0 &&
+                own == 0 && typed == 0 && q1 == 0 && q2 == 0
+            ) {
+                fallback = 1;
+                focus = 0;
+                fresh = 0;
+            }
+            action FitLostOffIt when (
+                Text == 1 && fallback == 0 && tab <= Tabs - 1 && wrote == 0 &&
+                own == 0 && typed == 0 && q1 == 0 && q2 == 0
+            ) {
+                fallback = 1;
+                focus = 1;
+                fresh = 0;
             }
             // A question tab drawn with its focus off the chosen row (the
             // vendor's option 1, the recommendation option 2; a toggled
@@ -1324,13 +1585,19 @@ pub fn supervisor_question_answer_model() -> Model {
                 row = 1 - row;
                 fresh = 0;
             }
-            // Dropped inside the dialog's typeahead window (O4): no effect.
+            // A key of the supervisor's the dialog does not take: dropped
+            // inside its typeahead window (O4), no effect — or, read after
+            // the dialog closed, typed into the composer (`↑` recalls
+            // history into it: `NoKeyIntoTheComposer`). ONE action, as
+            // `EnterTaken` sets `in_field`: that consume is reached only past
+            // the guards (`Buggy = 1`), so as an action of its own it was
+            // dead in the committed model — which `ty check
+            // --strict-vacuity` takes for a vacuous model unless the dead
+            // action alone is the mutant, and here the mutant is the guards'.
+            // (A key read after the close was dropped, or not, only in that
+            // same uncommitted space; the composer is where it goes.)
             action KeyRefused when (2 <= q1) {
-                q1 = q2;
-                q2 = 0;
-            }
-            action KeyIntoTheComposer when (2 <= q1 && Tabs + 1 <= tab) {
-                composer = 1;
+                composer = if Tabs + 1 <= tab { 1 } else { composer };
                 q1 = q2;
                 q2 = 0;
             }
@@ -1345,14 +1612,20 @@ pub fn supervisor_question_answer_model() -> Model {
                 seen_focus = focus;
                 seen_row = row;
                 seen_typed = typed;
+                seen_own = own;
+                seen_exact = exact;
+                seen_fallback = fallback;
                 seen_quiet = quiet;
                 touched = 0;
                 mine = if mine == 1 && tab == seen_tab && focus == seen_focus
-                    && row == seen_row && typed == seen_typed { 1 } else { 0 };
+                    && row == seen_row && typed == seen_typed
+                    && own == seen_own { 1 } else { 0 };
                 stilled = if mine == 1 && tab == seen_tab && focus == seen_focus
-                    && row == seen_row && typed == seen_typed { stilled } else { 0 };
+                    && row == seen_row && typed == seen_typed
+                    && own == seen_own { stilled } else { 0 };
                 retried = if mine == 1 && tab == seen_tab && focus == seen_focus
-                    && row == seen_row && typed == seen_typed { retried } else { 0 };
+                    && row == seen_row && typed == seen_typed
+                    && own == seen_own { retried } else { 0 };
             }
             // The read showed the box as keyed, and the screen then held
             // still 2 s (`await idle 2000`): by then its key was read.
@@ -1362,9 +1635,18 @@ pub fn supervisor_question_answer_model() -> Model {
             ) {
                 stilled = 1;
             }
+            // Enter on the chosen row. With a policy text, on a question
+            // tab that does not fall back only once the read showed the
+            // field holding the supervisor's own text: on that field, or on
+            // a multi-select's button after it. With no memory
+            // (`OwnTextRemembered = 0`) a person's exact copy of the text
+            // reads as its own.
             action HarnessEnter when (
-                fresh == 1 && q2 == 0 && seen_tab <= Tabs && seen_typed == 0 &&
-                seen_focus == 0 &&
+                fresh == 1 && q2 == 0 && seen_tab <= Tabs &&
+                (seen_typed == 0 || (OwnTextRemembered == 0 && seen_exact == 1)) &&
+                (seen_focus == 0 || (EnterWhereTyped == 1 && seen_own == 1)) &&
+                (Text == 0 || seen_fallback == 1 || seen_tab == Tabs || seen_own == 1 ||
+                    (OwnTextRemembered == 0 && seen_exact == 1)) &&
                 (Buggy == 1 || (
                     seen_quiet == 1 && (PersonFence == 0 || touched == 0) &&
                     (mine == 0 || (stilled == 1 && retried <= MaxRetry - 1))
@@ -1379,7 +1661,8 @@ pub fn supervisor_question_answer_model() -> Model {
                 fresh = 0;
             }
             action HarnessMove when (
-                fresh == 1 && q2 == 0 && seen_tab <= Tabs && seen_typed == 0 &&
+                fresh == 1 && q2 == 0 && seen_tab <= Tabs &&
+                (seen_typed == 0 || (OwnTextRemembered == 0 && seen_exact == 1)) &&
                 seen_focus == 1 &&
                 (Buggy == 1 || (
                     seen_quiet == 1 && (PersonFence == 0 || touched == 0) &&
@@ -1394,13 +1677,109 @@ pub fn supervisor_question_answer_model() -> Model {
                 mine = 1;
                 fresh = 0;
             }
+            // The policy text, written into the focused free-text row the
+            // read showed empty, on a tab that does not fall back — with no
+            // retry clause on the box as keyed (`retried` is the loop's
+            // record of it, THE POLICY TEXT), and once per tab whatever
+            // changes after it: the loop remembers the text it wrote
+            // (`wrote`, the memory `OwnTextRemembered` names) — under the
+            // person fence (`touched`), as every key.
+            action HarnessType when (
+                Text == 1 && seen_fallback == 0 && fresh == 1 && q2 == 0 &&
+                seen_tab <= Tabs - 1 &&
+                seen_focus == 0 && seen_typed == 0 && seen_own == 0 &&
+                (Buggy == 1 || (
+                    seen_quiet == 1 && (PersonFence == 0 || touched == 0) &&
+                    mine == 0 && (OwnTextRemembered == 0 || wrote == 0)
+                ))
+            ) {
+                q1 = if q1 == 0 { 4 + Tabs + seen_tab } else { q1 };
+                q2 = if q1 == 0 { 0 } else { 4 + Tabs + seen_tab };
+                twice = if wrote == 1 { 1 } else { twice };
+                wrote = 1;
+                retried = MaxRetry;
+                stilled = 0;
+                mine = 1;
+                fresh = 0;
+            }
 
             invariant NoDigitInTheField: in_field == 0;
             invariant NeverAnswersANextTabWithAStaleKey: stale == 0;
             invariant NeverCancelsTheReview: cancelled == 0;
             invariant NoKeyIntoTheComposer: composer == 0;
+            invariant OwnTextOnlyIntoItsEmptyField: astray == 0;
+            invariant TextNeverWrittenTwice: twice == 0;
         }
     }
+}
+
+/// The laws only a written policy text can break: at `Text = 0` no text is
+/// ever written, so none can fail there.
+const QUESTION_TEXT_LAWS: [&str; 2] = ["OwnTextOnlyIntoItsEmptyField", "TextNeverWrittenTwice"];
+
+/// The actions only the policy text enables: each guard needs `Text == 1`
+/// (`HarnessType`, `FitLostOnIt`, `FitLostOffIt`, `PersonTypesPolicyText`)
+/// or a text's queue code, which only `HarnessType` writes (`TextLands`,
+/// `TextPartly`) — false in every state at `Text = 0`.
+const QUESTION_TEXT_ACTIONS: [&str; 6] = [
+    "HarnessType",
+    "TextLands",
+    "TextPartly",
+    "FitLostOnIt",
+    "FitLostOffIt",
+    "PersonTypesPolicyText",
+];
+
+/// THE QUESTION ANSWER'S RECOMMENDED PATH (`answer-recommended@v1`, `Text =
+/// 0`, as committed): the machine documented on
+/// `supervisor_question_family` with the four laws every key of that path
+/// keeps — no Enter in the free-text field or off the chosen row, none on a
+/// later tab, none on the review's cancel, none into the composer — and
+/// only the actions that can fire there. The policy text's two laws and its
+/// six actions (`QUESTION_TEXT_LAWS`, `QUESTION_TEXT_ACTIONS`) are
+/// [`supervisor_question_text_model`]'s: at `Text = 0` every one of those
+/// actions is disabled in every state, so the reachable space is the same
+/// state for state (pinned by `aterm-spec/tests/derived_supervise.rs`), and
+/// a law about them is one nothing here can break. In
+/// `xref::model_registry()`: the non-vacuity sweep holds each of the four
+/// caught by the fence alone (`Buggy = 1`), and `ty check --strict-vacuity`
+/// every action live.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_question_answer_model() -> Model {
+    let mut m = supervisor_question_family();
+    m.invariants
+        .retain(|law| !QUESTION_TEXT_LAWS.contains(&law.name));
+    m.actions
+        .retain(|action| !QUESTION_TEXT_ACTIONS.contains(&action.name));
+    m
+}
+
+/// THE QUESTION ANSWER'S POLICY TEXT (`answer-long-term@v1`,
+/// `answer-short-term@v1`: `Text = 1`, a single-select dialog committed,
+/// `Multi` its dial): the machine documented on
+/// `supervisor_question_family` whole — every action and all six laws,
+/// each broken by the fence alone at these constants, single- and
+/// multi-select (`aterm-spec/tests/derived_supervise.rs`). Its own model
+/// (`SupervisorQuestionText`), so no law of it is judged where no text is
+/// written. NOT in `xref::model_registry()` yet: its `Buggy = 1` space (the
+/// fence alone, a text written again behind one unread) outgrows the
+/// interpreter's budget, which the workspace's non-vacuity sweep walks
+/// whole (`every_buggy_space_fits_the_interpreter`) — measured past 100 000
+/// states at the committed bounds and at `MaxRetry = 1`, single- and
+/// multi-select, against 30 527 for the recommended path; enrolling it
+/// needs a mutant that fires only from a state the guarded model reaches.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_question_text_model() -> Model {
+    let mut m = supervisor_question_family();
+    m.name = "SupervisorQuestionText";
+    for (name, value) in &mut m.consts {
+        if *name == "Text" {
+            *value = 1;
+        }
+    }
+    m
 }
 
 /// THE DECLINE'S KEYSTROKES (aterm-agent `supervise/press.rs`,
@@ -1868,6 +2247,129 @@ pub fn supervisor_network_wall_model() -> Model {
             invariant AMeasuredOutageIsTypedIntoAtMostOnceAHold:
                 dacts == 0 || (dacts == 1 && Hold <= dticks) || Hold + Hold <= dticks;
             invariant AtMostTwoActsAtOncePerEpisode: quick <= AtOnce;
+        }
+    }
+}
+
+/// THE RATING CARD'S `0` (aterm-agent `supervise/run.rs`, `Session::survey`, and its
+/// busy-read twin in `await_turn_from`): the harness writes a guarded `0` at a
+/// Claude Code rating card only where that `0` is taken and lands nowhere else, and
+/// removes a `0` the card dropped only when the card can no longer take it — the property
+/// the owner asked for (2026-09-28): the person typing into the composer never receives a
+/// `0` meant for a survey, and the harness never deletes its own dismissal.
+///
+/// `card` is the card on the screen (0 none, 1 open and YOUNG — inside the vendor's
+/// 600 ms mount settle, which drops a digit and leaves it in the composer as text —
+/// 2 open and aged); `hand` a person's keystroke within `human_grace_s`; `draft` text
+/// typed in the composer; `boxed` an approval box up. `zero` is the `0` the harness wrote:
+/// 0 none, 1 PENDING (written, and the vendor's 400 ms debounce may still take it: a
+/// digit typed at an aged card is taken when the timer runs and ANY change to the composer
+/// before that cancels the take, a backspace included), 2 STANDING (the debounce has run
+/// and the composer still holds it: the card dropped it). `takes` is 1 while a pending `0`
+/// is going to be taken (written at an aged card, which has not left since); `owed` is the
+/// loop's memory that a `0` of its own may still be in the composer.
+///
+/// A press is enabled only for an AGED card with nobody's hand on the session, no draft, no
+/// box and no `0` already of ours (a second would make `00`, which abandons the card and
+/// stays in the composer); the stray `0` a card dropped is backspaced only when it is
+/// STANDING — past the landing time, longer than the vendor's debounce — and is the
+/// composer's whole text with no person at the keyboard, and a backspace the server
+/// REFUSES (`halted`, `busy`, `rate`) leaves it owed. `Buggy = 1` presses whatever the state
+/// (inside the settle, under a person's hand, over a draft or a box, on a `0` already
+/// there), backspaces a pending `0` (the first prototype's flaw: it read the `0` still
+/// pending at 500 ms and deleted its own dismissal), and forgets a `0` whose backspace was
+/// refused — each caught by its invariant on its own path. Tier-1 (aterm-agent
+/// `run_engine_tests.rs`) drives the real `Session` over the scripted server and projects
+/// every `key` request onto this model.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_survey_press_model() -> Model {
+    crate::ty_model! {
+        SupervisorSurveyPress {
+            const Buggy = 0;
+            const Tries = 2;
+            var card = 0;
+            var hand = 0;
+            var draft = 0;
+            var boxed = 0;
+            var zero = 0;
+            var takes = 0;
+            var owed = 0;
+            var tries = 0;
+            var young_zero = 0;
+            var hand_zero = 0;
+            var draft_zero = 0;
+            var stacked_zero = 0;
+            var pending_backspace = 0;
+
+            action CardOpens when (card == 0) {
+                card = 1;
+                tries = 0;
+            }
+            action SettleElapses when (card == 1) {
+                card = 2;
+            }
+            action CardLeaves when (card > 0) {
+                card = 0;
+                takes = 0;
+            }
+            action PersonTypes when (hand == 0) {
+                hand = 1;
+            }
+            action GraceEnds when (hand == 1) {
+                hand = 0;
+            }
+            action DraftTyped when (draft == 0 && zero == 0) {
+                draft = 1;
+            }
+            action DraftGone when (draft == 1) {
+                draft = 0;
+            }
+            action BoxUp when (boxed == 0) {
+                boxed = 1;
+            }
+            action BoxGone when (boxed == 1) {
+                boxed = 0;
+            }
+            action Press when (
+                card > 0 && tries <= Tries - 1 &&
+                ((card == 2 && hand == 0 && draft == 0 && boxed == 0 && zero == 0) || Buggy == 1)
+            ) {
+                tries = tries + 1;
+                young_zero = if card == 1 { 1 } else { young_zero };
+                hand_zero = if hand == 1 { 1 } else { hand_zero };
+                draft_zero = if draft == 1 || boxed == 1 { 1 } else { draft_zero };
+                stacked_zero = if zero > 0 { 1 } else { stacked_zero };
+                takes = if card == 2 { 1 } else { 0 };
+                zero = 1;
+                owed = 1;
+            }
+            action DebounceRuns when (zero == 1) {
+                card = if takes == 1 { 0 } else { card };
+                owed = if takes == 1 { 0 } else { owed };
+                zero = if takes == 1 { 0 } else { 2 };
+                takes = 0;
+            }
+            action Backspace when (
+                draft == 0 && hand == 0 && (zero == 2 || (Buggy == 1 && zero == 1))
+            ) {
+                pending_backspace = if zero == 1 && takes == 1 { 1 } else { pending_backspace };
+                zero = 0;
+                takes = 0;
+                owed = 0;
+            }
+            action BackspaceRefused when (
+                draft == 0 && hand == 0 && (zero == 2 || (Buggy == 1 && zero == 1))
+            ) {
+                owed = if Buggy == 1 { 0 } else { 1 };
+            }
+
+            invariant NoZeroInsideTheSettle: young_zero == 0;
+            invariant NoZeroUnderAPersonsHand: hand_zero == 0;
+            invariant NoZeroOverADraftOrABox: draft_zero == 0;
+            invariant NoZeroOverAZero: stacked_zero == 0;
+            invariant NoBackspaceOfAPendingZero: pending_backspace == 0;
+            invariant NoForgottenZero: zero <= 1 || owed == 1;
         }
     }
 }
@@ -2366,5 +2868,517 @@ pub fn supervisor_codex_rate_nudge_liveness() -> crate::derive::Liveness {
         ],
         strong: vec!["Restore"],
         mutants: vec!["ResumeOnCheap", "ForgetOnRestart", "HoldBeforeRestore"],
+    }
+}
+
+/// THE USAGE WALL RESUMES (aterm-agent `supervise/policy/turn_end.rs`, the wall
+/// arm of `decide_turn_end`, over the reader's wall): a session at a usage wall
+/// is continued once its tokens are back — automatically, in bounded time,
+/// on a ladder that never gives up.
+///
+/// `wall` 0 the worker works, 1 the wall shows (a point the loop decides),
+/// 2 an act is in flight, 3 the wall is MASKED (drawn, but read as busy: the
+/// tab-1 stall of 2026-09-28, a weekly wall behind a background shell), 4 the
+/// loop has given up, 5 the wall's rows are OUT OF VIEW (scrolled off, a `/model`
+/// under them: the tab reads busy on its shell) and `mem` says the loop still
+/// remembers the wall it waits on. `bg` the agent's own background work. `clock` the ticks
+/// since the wall appeared (saturating); the account has its tokens back at
+/// `due` (`ResetAt`, or `Skew` ticks later). `view` 0 the reset is placed where the notice
+/// says, 1 placed in the past (a bare clock time read by the session-window
+/// rule). `tries` the acts typed at this wall (saturating), `waited` the ticks
+/// since the last one, `blind` the acts typed at this wall before the tokens
+/// came (saturating), `sitting` 1 for a wall FOUND standing with nothing on
+/// the screen to date its print.
+///
+/// A wall found sitting is placed by the session window's rule: a bare clock
+/// more than five hours ahead reads as passed (`view = 1`), and its one try is
+/// the price the policy accepts (`NoBlindAct` allows exactly that one). The
+/// wall that ANSWERS a try (`Met`: printed again after a turn, or standing
+/// with the line held and no turn run — Claude Code queues a line typed into a
+/// standing limit) is a print the loop watched, and the reset is placed where
+/// the notice says (`view = 0`); `Buggy` keeps the guess, and the ladder types
+/// into the standing wall every rung until the reset — the 24 lines of
+/// 2026-10-01, caught by `NoBlindAct`. Every act waits for the reset as
+/// placed AND its rung (the real `max(reset + grace, since + rung)`).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_usage_wall_model() -> Model {
+    crate::ty_model! {
+        SupervisorUsageWall {
+            const Buggy = 0;
+            const ResetAt = 2;
+            const Grace = 1;
+            const Rung1 = 1;
+            const Rung2 = 2;
+            const Skew = 8;
+            const Cap = 12;
+            const Hidden = 1;
+            var wall = 0;
+            var bg = 0;
+            var due = 2;
+            var clock = 0;
+            var view = 0;
+            var tries = 0;
+            var waited = 0;
+            var blind = 0;
+            var mem = 1;
+            var sitting = 0;
+
+            // ---- the world ----
+            action BackgroundStarts when (bg == 0) {
+                bg = 1;
+            }
+            action BackgroundEnds when (bg == 1) {
+                bg = 0;
+            }
+            // A wall appears: on time (the account's tokens come at the
+            // reset the notice names) or late (they come `Skew` ticks after).
+            action WallAppears when (wall == 0) {
+                wall = 1;
+                sitting = 0;
+                blind = 0;
+                due = ResetAt;
+                clock = 0;
+                view = 0;
+                tries = 0;
+                waited = 0;
+            }
+            action WallAppearsLate when (wall == 0) {
+                wall = 1;
+                sitting = 0;
+                blind = 0;
+                due = ResetAt + Skew;
+                clock = 0;
+                view = 0;
+                tries = 0;
+                waited = 0;
+            }
+            // A wall FOUND standing (a loop that starts at it, a relaunch that
+            // redraws the conversation without its done row): nothing dates
+            // its print, the session rule places its bare clock, and a clock
+            // more than five hours ahead reads as passed.
+            action WallFoundSitting when (wall == 0) {
+                wall = 1;
+                sitting = 1;
+                blind = 0;
+                due = ResetAt;
+                clock = 0;
+                view = 1;
+                tries = 0;
+                waited = 0;
+            }
+            action Tick when (1 <= wall && clock <= Cap - 1) {
+                clock = clock + 1;
+                waited = if waited <= Rung2 - 1 { waited + 1 } else { waited };
+            }
+
+            // The wall's rows leave the screen while the agent's shell keeps
+            // the tab reading busy (a scroll back, a `/model` under it), and
+            // come back (the `Hidden` dial: 0 switches the world off).
+            action WallHides when (Hidden == 1 && wall == 1 && bg == 1) {
+                wall = 5;
+            }
+            action WallShows when (wall == 5) {
+                wall = 1;
+            }
+
+            // ---- the supervisor ----
+            // The first act: `Grace` past the reset the notice names (150 s and a
+            // session's share of a minute in the real policy); each
+            // one after a wall that answered again: a rung, the last for every
+            // one after it — for ever.
+            action Act when (
+                (wall == 1 || (wall == 5 && mem == 1)) &&
+                ((view == 0 && ResetAt + Grace <= clock) || view == 1) && (
+                    tries == 0 ||
+                    (tries == 1 && Rung1 <= waited) ||
+                    (2 <= tries && Rung2 <= waited)
+                )
+            ) {
+                blind = if clock <= ResetAt - 1 { if blind <= 1 { blind + 1 } else { blind } } else { blind };
+                tries = if tries <= 2 { tries + 1 } else { tries };
+                wall = 2;
+                waited = 0;
+            }
+            // What the act led to: the tokens are back (the worker works), or
+            // the wall answers again.
+            action Taken when (wall == 2 && due <= clock) {
+                wall = 0;
+                tries = 0;
+                clock = 0;
+                waited = 0;
+                view = 0;
+                sitting = 0;
+                blind = 0;
+            }
+            // ... the wall answers again: the next rung counts from THIS
+            // appearance (the real `since`), as a fresh try's answer is
+            // immediate but time may pass while it is in flight. The answer is
+            // a print the loop watched: the reset is placed where the notice
+            // says.
+            action Met when (wall == 2 && clock <= due - 1) {
+                wall = 1;
+                waited = 0;
+                view = 0;
+            }
+
+            // ---- the defects (dead at the committed config) ----
+            // The wall drawn behind background work, read as busy: no point. It
+            // stays masked (the reader lifts it when the shell ends, which the
+            // world never has to do, so no lift is modelled: a defect action
+            // must be caught alone, and a lift alone could not even fire).
+            action WallMasked when (Buggy == 1 && wall == 0 && bg == 1) {
+                wall = 3;
+                sitting = 0;
+                blind = 0;
+                due = ResetAt;
+                clock = 0;
+                view = 0;
+                tries = 0;
+                waited = 0;
+            }
+            // The loop forgets the wall it waits on when its rows leave (a
+            // restart, an update): nothing remembers it, and no point forms.
+            action MemoryLost when (Buggy == 1 && wall == 5 && mem == 1) {
+                mem = 0;
+            }
+            // The loop gives up after three tries.
+            action GivesUp when (Buggy == 1 && wall == 1 && 3 <= tries) {
+                wall = 4;
+            }
+            // The wall answers the act, and the loop keeps its guess: a wall
+            // standing after an act nobody took read as no print (2026-10-01),
+            // the ladder typing into it every rung until the reset.
+            action MetKeepsTheGuess when (Buggy == 1 && wall == 2 && clock <= due - 1) {
+                wall = 1;
+                waited = 0;
+            }
+            // A bare clock time read by the session window's rule: the reset
+            // is placed in the past and the first act goes at once.
+            action WallMisplaced when (Buggy == 1 && wall == 0) {
+                wall = 1;
+                sitting = 0;
+                blind = 0;
+                due = ResetAt;
+                clock = 0;
+                view = 1;
+                tries = 0;
+                waited = 0;
+            }
+
+            // No act before the tokens are back but the one try of a wall
+            // found with nothing to date it.
+            invariant NoBlindAct: blind <= sitting;
+            // No wall is masked (`wall == 3`) and the ladder never gives up
+            // (`wall == 4`): the defects' marks, each caught alone.
+            invariant NoStuckWall: wall <= 2 || wall == 5;
+            // The loop remembers the wall it waits on.
+            invariant WallRemembered: mem == 1;
+        }
+    }
+}
+
+/// THE USAGE WALL ENDS ([`supervisor_usage_wall_model`]): `[]<>(the worker works \/ the
+/// tokens are not back yet)` — on every fair behaviour, a wall whose tokens
+/// have come does not stand for good. Fairness assumed, and nothing more: the
+/// clock ticks while the Mac is awake (`Tick`), the loop acts once an act is
+/// enabled (`Act`), and the account answers a continuation once it has its
+/// tokens (`Taken`). The world is NOT fair: background work may start and
+/// never end, and a wall may come late. Broken alone by `WallMasked` (the
+/// 2026-09-28 stall: a wall drawn behind background work, read as busy, so no
+/// point ever forms) and by `GivesUp` (a ladder with a last try).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_usage_wall_liveness() -> Liveness {
+    use super::{eq, int, le, or_, sub, var};
+    Liveness {
+        name: "TheUsageWallEnds",
+        goal: or_(
+            eq(var("wall"), int(0)),
+            le(var("clock"), sub(var("due"), int(1))),
+        ),
+        weak: vec!["Tick", "Act", "Taken"],
+        strong: vec![],
+        mutants: vec!["WallMasked", "GivesUp", "MemoryLost"],
+    }
+}
+
+/// THE MODEL SWITCH (aterm-agent `supervise/policy/turn_end.rs`, the model
+/// bucket's arm of `decide_turn_end` and `TurnEndState::restarted`, and the
+/// host's `restart` in `supervise/turn_end_loop.rs`): a tab at a model
+/// limit is moved to the fallback model by a relaunch the host makes when the
+/// agent's own jobs allow it, and comes back to the bucket's model only at a
+/// reset the notice NAMED and that was still ahead when the switch was made
+/// — never on a guess.
+///
+/// `bucket` 1 the model's limit stands; `named` 1 the notice names a reset
+/// (0: an entitlement, `requires usage credits`); `on` 1 the tab is on the
+/// fallback; `back` 1 the switch owes a return at the reset
+/// (`ModelSwitch::back_at`); `jobs` 1 the agent's own background work runs
+/// (the host refuses the relaunch while it does); `clock` the ticks since the
+/// wall appeared; `probed` the wall has been acted on (the continuation typed
+/// at the reset goes FIRST, before the fallback is asked for again, and a
+/// made switch is an act too); `tries` the asks the host refused; `flips` the
+/// relaunches since the worker last did real work; `gaveup`, `held`, `badret`
+/// are the defects' marks. One tick is one minute.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_model_switch_model() -> Model {
+    crate::ty_model! {
+        SupervisorModelSwitch {
+            const Buggy = 0;
+            const ResetAt = 2;
+            const Cap = 3;
+            const Guess = 1;
+            const GiveUpAfter = 2;
+            var bucket = 0;
+            var named = 0;
+            var on = 0;
+            var back = 0;
+            var jobs = 0;
+            var clock = 0;
+            var probed = 0;
+            var tries = 0;
+            var flips = 0;
+            var gaveup = 0;
+            var held = 0;
+            var badret = 0;
+
+            // ---- the world ----
+            action JobsStart when (jobs == 0) {
+                jobs = 1;
+            }
+            action JobsEnd when (jobs == 1) {
+                jobs = 0;
+            }
+            action Tick when (bucket == 1 && clock <= Cap - 1) {
+                clock = clock + 1;
+            }
+            // A wall needs a turn that ran: after a relaunch the worker works
+            // before it can hit another (the count of relaunches starts over).
+            action Works when (bucket == 0 && on == 0 && 1 <= flips) {
+                flips = 0;
+            }
+            action BucketHitsNamed when (bucket == 0 && on == 0 && flips == 0) {
+                bucket = 1;
+                named = 1;
+                back = 0;
+                clock = 0;
+                probed = 0;
+                tries = 0;
+                gaveup = 0;
+            }
+            action BucketHitsUnnamed when (bucket == 0 && on == 0 && flips == 0) {
+                bucket = 1;
+                named = 0;
+                back = 0;
+                clock = 0;
+                probed = 0;
+                tries = 0;
+                gaveup = 0;
+            }
+            // The limit lifts at the reset it named (an entitlement lifts when
+            // a person buys it, which the model leaves to the world).
+            action BucketLifts when (bucket == 1 && named == 1 && ResetAt <= clock) {
+                bucket = 0;
+            }
+
+            // ---- the supervisor ----
+            // At the reset the CONTINUATION goes first: the wall may have
+            // lifted, and a switch made at that moment would be for nothing.
+            action Continue when (bucket == 1 && on == 0 && named == 1 && ResetAt <= clock && probed == 0) {
+                probed = 1;
+            }
+            // Ask the host for the fallback. It is made when the agent's jobs
+            // are not running and refused (`wait:changed`) while they are; the
+            // ask is repeated on the restart back-off, never given up. A
+            // switch made owes a return only at a named reset still ahead.
+            action AskFallback when (
+                bucket == 1 && on == 0 && gaveup == 0 &&
+                (named == 0 || probed == 1 || clock <= ResetAt - 1)
+            ) {
+                tries = if tries <= GiveUpAfter { tries + 1 } else { tries };
+                on = if jobs == 0 { 1 } else { on };
+                probed = if jobs == 0 { 1 } else { probed };
+                back = if jobs == 0 { if named == 1 && clock <= ResetAt - 1 { 1 } else { 0 } } else { back };
+                flips = if jobs == 0 { if flips <= 3 { flips + 1 } else { flips } } else { flips };
+            }
+            // The return: only at the reset the switch owes, once it has come,
+            // and only when the host can make it. A return the host cannot
+            // make now is DEFERRED and holds nothing.
+            action Return when (on == 1 && back == 1 && ResetAt <= clock && jobs == 0) {
+                on = 0;
+                back = 0;
+                flips = if flips <= 3 { flips + 1 } else { flips };
+            }
+
+            // ---- the defects (dead at the committed config) ----
+            // A return with none owed (`Guess` ticks after the switch: the 240
+            // relaunches in five days, 2026-09-22 to 09-27): back to a wall
+            // that stands, and the fallback asked for again.
+            action GuessedReturn when (Buggy == 1 && on == 1 && bucket == 1 && back == 0 && Guess <= clock) {
+                on = 0;
+                flips = if flips <= 3 { flips + 1 } else { flips };
+                badret = 1;
+            }
+            // The asks stop after a few refusals while the wall stands.
+            action GivesUp when (Buggy == 1 && on == 0 && bucket == 1 && GiveUpAfter <= tries) {
+                gaveup = 1;
+            }
+            // A deferred return holds the point: nothing else is decided.
+            action ReturnBlocks when (Buggy == 1 && on == 1 && back == 1 && ResetAt <= clock && jobs == 1) {
+                held = 1;
+            }
+
+            invariant NoReturnWithoutAReset: badret == 0;
+            invariant NoPingPong: flips <= 3;
+            invariant PointsGoOn: held == 0;
+            // The asks for the fallback never stop while the wall stands.
+            invariant AsksNeverStop: gaveup == 0;
+        }
+    }
+}
+
+/// THE FALLBACK IS MADE ([`supervisor_model_switch_model`]): `[]<>(the tab is
+/// on the fallback \/ the limit lifted \/ the agent's jobs run)` — on every
+/// fair behaviour, a tab whose jobs are not holding the relaunch is moved.
+/// The jobs are the environment's and are NOT fair: they may run for ever, and
+/// then the tab stays where it is, asked again at every back-off ("if they
+/// end, it is made"). Fairness assumed: the loop asks (`AskFallback`) and, at a
+/// reset, types the continuation first (`Continue`). Broken alone by
+/// `GivesUp` (the asks stop after a few refusals).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_model_switch_liveness() -> Liveness {
+    use super::{eq, int, or_, var};
+    Liveness {
+        name: "TheFallbackIsMade",
+        goal: or_(
+            or_(eq(var("on"), int(1)), eq(var("bucket"), int(0))),
+            eq(var("jobs"), int(1)),
+        ),
+        weak: vec!["AskFallback", "Continue"],
+        strong: vec![],
+        mutants: vec!["GivesUp"],
+    }
+}
+
+/// THE SAME BOX IS ONE POINT (aterm-agent `supervise/run.rs`: the review
+/// key of a box, `point_key`, and the look that hands a point over; FIX 3,
+/// the re-alert of 2026-09-25: `CLEARED` then `ESCALATED` 7 s apart at seq
+/// 94641/95788 for the same box): a request standing on the screen is asked
+/// of the manager ONCE however the vendor redraws it — re-wrapped at another
+/// width, its focus moved, its auto-deny countdown ticking, the transcript
+/// reflowed above it — and EVERY request the loop looks at is asked, a
+/// second box drawn over the first with no read between included (two Edit
+/// boxes on one path, their diffs different).
+///
+/// `req` is the request on the screen (0 none; 1 and 2 share a head — the
+/// same kind and path, the review's (a); 3 is request 2 asked AGAIN, which
+/// the worker does only after it worked); `seen` how many requests were
+/// drawn; `form` the drawing of the one up (a redraw flips it); `key` the
+/// loop's review key of what it reads; `handed` the key of the point last
+/// handed over; `live` that a read since the last look saw the worker's own
+/// busy row (a turn ran); `asks` the asks of the request up (counted to 2:
+/// one past the bound `OneAskPerRequest` states, which is all a slip needs
+/// to break it, so the mutants' space stays finite); `looked` that the loop
+/// looked at it. `Look` is the loop's look: a point already handed, with no
+/// live busy read since, is passed over; anything else is a new point,
+/// asked.
+///
+/// `Buggy = 1` is the three slips this model must catch, together, each
+/// breaking an invariant of its own — and each has its own dial as well, so
+/// a test can turn one on alone: `Drawing` keys the DRAWING (the rows as
+/// laid out, the countdown, the rows above — the key before FIX 3: a redraw
+/// asks one request twice, `OneAskPerRequest`); `Coarse` keys the head
+/// alone (kind and path — the rejected plan: the second of two Edit boxes on
+/// one path is looked at and never asked, `EveryLookedRequestIsAsked`);
+/// `WritingWorks` takes a read that shows only output being written
+/// (`writing`: no composer, no box, no busy row, the screen never held
+/// still) for the worker's turn (the review's (c): the box redrawn through
+/// it is asked twice, `OneAskPerRequest`).
+///
+/// It ASSUMES the one residual no key can see: an identical request comes
+/// back only after the worker worked (`live`). Two identical requests queued
+/// back to back, with no busy read between them, are one ask. The settle
+/// (`box_first_seen`) and the wait's read under a file box's first row are
+/// not actions here; the walk below binds the second. Tier-1 (aterm-agent
+/// `run_box_key_tests.rs`) drives the real `Session` over the scripted
+/// server and walks each read onto these actions: every invariant at every
+/// state, the real review key's equalities against `key == handed` at every
+/// look, the real file-request comparison against the request at every read
+/// the wait makes under a box's row, and each real ask posted right after
+/// the read the model asks at — with the key before FIX 3 replayed through
+/// the same walk as the caught negative control.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_box_ask_model() -> Model {
+    crate::ty_model! {
+        SupervisorBoxAsk {
+            const Buggy = 0;
+            const Drawing = 0;
+            const Coarse = 0;
+            const WritingWorks = 0;
+            var req = 0;
+            var seen = 0;
+            var form = 0;
+            var key = 0;
+            var handed = 0;
+            var live = 0;
+            var asks = 0;
+            var looked = 0;
+
+            // The next request drawn — over the last with no read between,
+            // or after it left; the SAME request again (3) only after work.
+            action NextBox when (seen <= 2 && (seen <= 1 || live == 1)) {
+                seen = seen + 1;
+                req = seen + 1;
+                form = 0;
+                asks = 0;
+                looked = 0;
+                key = if Coarse == 1 || Buggy == 1 {
+                    1
+                } else {
+                    if seen == 2 { 2 } else { seen + 1 }
+                };
+            }
+            // The vendor redraws the request up: re-wrapped, its focus moved,
+            // its countdown ticked, the transcript reflowed above it.
+            action Redraw when (req > 0) {
+                form = 1 - form;
+                key = if Drawing == 1 || Buggy == 1 {
+                    if form == 1 { key - 10 } else { key + 10 }
+                } else {
+                    key
+                };
+            }
+            // A read of output being written, the box off the screen a
+            // moment (no composer, no busy row, never still).
+            action Writing when (req > 0) {
+                live = if WritingWorks == 1 || Buggy == 1 { 1 } else { live };
+            }
+            // A person (or the manager) answers the request: it leaves.
+            action Answer when (req > 0) {
+                req = 0;
+            }
+            // The worker works: its busy row read.
+            action Work when (req == 0) {
+                live = 1;
+            }
+            // The loop's look at the request up.
+            action Look when (req > 0) {
+                asks = if handed == key && live == 0 {
+                    asks
+                } else {
+                    if asks <= 1 { asks + 1 } else { asks }
+                };
+                handed = key;
+                live = 0;
+                looked = 1;
+            }
+
+            invariant OneAskPerRequest: asks <= 1;
+            invariant EveryLookedRequestIsAsked: req == 0 || looked == 0 || asks > 0;
+        }
     }
 }

@@ -1,67 +1,48 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Streaming RFC 1951 (raw DEFLATE) and RFC 1952 (gzip) decompression over
-//! `std::io::Read`.
+//! Streaming RFC 1951 (raw DEFLATE), RFC 1950 (zlib) and RFC 1952 (gzip)
+//! decompression over `std::io::Read`.
 //!
-//! The one-shot [`inflate`](super::inflate) in the parent module decompresses a
-//! whole slice into a whole `Vec`, which is right for a terminal escape payload
-//! and wrong for an archive: atpkg's `tar-gz` and `zip` install lanes hand a
-//! decompressed stream straight to a tar/zip walker that vets and writes one
-//! entry at a time, under a size cap that reaches 2 GiB. Buffering that in
-//! memory to reuse the one-shot entry point would have traded a dependency for
-//! a hundreds-of-megabytes allocation.
+//! atpkg's `tar-gz` and `zip` lanes feed a decompressed stream to an extractor
+//! one entry at a time under caps up to 2 GiB, and `aterm-png` unfilters an
+//! image a scanline at a time, so buffering the whole output for the one-shot
+//! [`inflate`](super::inflate) is not an option for either.
 //!
-//! So this is the same engine, driven incrementally. It reuses the parent's
-//! `Huffman` construction, its root-table accelerator, its dynamic-table reader
-//! and its bit reader **unchanged** — the subtle parts are not written twice.
-//! The only thing that is new is the driver:
+//! This drives the parent's `Huffman` construction, root tables, dynamic-table
+//! reader and bit reader incrementally:
 //!
-//! * compressed bytes accumulate in a small input buffer refilled from the
-//!   source, and the output keeps a 32 KiB history window plus whatever the
-//!   caller has not read yet, so memory is bounded no matter how large the
-//!   stream is;
-//! * every unit of work — a block header, a table read, one symbol, one stored
-//!   byte — runs against a CHECKPOINT of the bit reader. If it hits the end of
-//!   what has arrived, the checkpoint is restored, more input is read, and the
-//!   unit is retried from exactly where it began. Nothing is decoded twice
-//!   beyond the one unit that was interrupted, so the work stays linear.
-//!
-//! Retry-from-checkpoint is what makes reuse possible at all: the parent's
-//! decoders signal "out of input" as [`InflateError::Truncated`] and are written
-//! as straight-line recursive descent. Rather than rewrite them as a resumable
-//! state machine — a rewrite of the most heavily tested code in the crate —
-//! the driver treats `Truncated` as "not yet" whenever the SOURCE has more to
-//! give, and as a real error once it does not.
+//! * input accumulates in a small refilled buffer; output keeps a 32 KiB history
+//!   window plus undelivered bytes, so memory is bounded;
+//! * each unit of work (block header, table read, symbol, stored byte) runs
+//!   against a checkpoint of the bit reader. On
+//!   [`InflateError::Truncated`] with more source to read, the checkpoint is
+//!   restored, input is refilled and the unit retried; once the source is
+//!   exhausted `Truncated` is a real error. Work stays linear.
 
 use std::io::{self, Read};
 
 use super::{
-    BitReader, DIST_BASE, DIST_EXTRA, Huffman, InflateError, LENGTH_BASE, LENGTH_EXTRA,
-    ROOT_BUILD_AFTER, fixed_dist, fixed_lit, read_dynamic_tables,
+    Adler32, BitReader, DIST_BASE, DIST_EXTRA, Huffman, InflateError, LENGTH_BASE, LENGTH_EXTRA,
+    ROOT_BUILD_AFTER, check_zlib_header, fixed_dist, fixed_lit, read_dynamic_tables,
 };
 use crate::crc32::Crc32;
 
 /// The DEFLATE sliding window: the furthest a back-reference can reach.
 const WINDOW: usize = 32 * 1024;
-/// How much decoded output one `pump` aims to produce before handing control
-/// back. Large enough that the per-call overhead disappears, small enough that
-/// the live output buffer stays around 100 KiB.
+/// Decoded output one `pump` aims to produce before returning; keeps the live
+/// output buffer around 100 KiB.
 const PUMP_TARGET: usize = 32 * 1024;
-/// How many bytes must be reclaimable before either buffer is compacted. Both
-/// compactions are `memmove`s, so they are done in large, infrequent steps
-/// rather than on every read.
+/// Reclaimable bytes required before a buffer is compacted (a `memmove`).
 const COMPACT_SLACK: usize = 64 * 1024;
 /// Bytes pulled from the source per refill.
 const IN_CHUNK: usize = 32 * 1024;
-/// The largest gzip member header this accepts, so a source that never produces
-/// a NUL cannot grow the header buffer without bound. RFC 1952 sets no limit;
-/// real headers are tens of bytes and the FNAME/FCOMMENT fields are paths.
+/// Largest accepted gzip member header, so a source with no NUL cannot grow the
+/// header buffer without bound (RFC 1952 sets no limit).
 const MAX_GZIP_HEADER: usize = 64 * 1024;
 
-/// A saved bit-reader position: everything needed to rebuild a [`BitReader`]
-/// over a (possibly extended) input buffer and continue exactly where it left
-/// off.
+/// A saved bit-reader position, enough to rebuild a [`BitReader`] over a
+/// (possibly extended) input buffer and continue.
 #[derive(Debug, Clone, Copy)]
 struct Cursor {
     /// Index of the next byte not yet pulled into the accumulator.
@@ -98,13 +79,9 @@ impl Cursor {
         }
     }
 
-    /// Index of the first input byte that is not yet spoken for — `pos` less the
-    /// whole bytes still sitting unread in the accumulator.
-    ///
-    /// After the final block of a member this is where the gzip trailer starts,
-    /// which is the only reason the driver tracks the accumulator's depth at all.
-    /// It is also the compaction floor: dropping input at or past this index
-    /// would discard bytes the stream still has to interpret.
+    /// Index of the first input byte not yet spoken for: `pos` less the whole
+    /// bytes still unread in the accumulator. After a member's final block this
+    /// is where the gzip trailer starts; it is also the compaction floor.
     const fn byte_position(&self) -> usize {
         self.pos.saturating_sub((self.count / 8) as usize)
     }
@@ -118,10 +95,8 @@ enum Phase {
     StoredHeader,
     /// Inside a stored block, with `remaining` literal bytes still to copy.
     Stored { remaining: u32 },
-    /// Inside a Huffman-coded block. `warm` counts the symbols still to decode
-    /// before the root tables are built — the parent module's `ROOT_BUILD_AFTER`
-    /// deferral, kept so a stream of tiny blocks never pays for tables it cannot
-    /// amortise.
+    /// Inside a Huffman-coded block. `warm` counts symbols left before the root
+    /// tables are built (the parent's `ROOT_BUILD_AFTER` deferral).
     Huff {
         lit: Box<Huffman>,
         dist: Box<Huffman>,
@@ -177,11 +152,9 @@ impl Inflater {
         self.out.len().saturating_sub(self.out_at)
     }
 
-    /// Reclaim the front of both buffers, in infrequent large steps.
-    ///
-    /// The output keeps [`WINDOW`] bytes behind the write head (a back-reference
-    /// may reach that far) plus everything undelivered; the input keeps
-    /// everything from [`Cursor::byte_position`] on.
+    /// Reclaim the front of both buffers. Output keeps [`WINDOW`] bytes behind
+    /// the write head plus everything undelivered; input keeps everything from
+    /// [`Cursor::byte_position`] on.
     fn compact(&mut self) {
         let drop_out = self.out_at.min(self.out.len().saturating_sub(WINDOW));
         if drop_out >= COMPACT_SLACK {
@@ -198,10 +171,9 @@ impl Inflater {
     /// Decode until [`PUMP_TARGET`] bytes are pending, the input runs dry, or
     /// the final block ends.
     ///
-    /// Every arm follows the same shape: checkpoint, attempt, and on
-    /// [`InflateError::Truncated`] restore the checkpoint and report
-    /// [`Pump::NeedInput`] — leaving the decoder byte-for-byte as it was before
-    /// the attempt, so the retry after a refill is not a partial re-decode.
+    /// Each arm checkpoints, attempts, and on [`InflateError::Truncated`]
+    /// restores the checkpoint and returns [`Pump::NeedInput`], leaving the
+    /// decoder exactly as before the attempt.
     fn pump(&mut self) -> Result<Pump, InflateError> {
         let Self {
             input,
@@ -248,9 +220,8 @@ impl Inflater {
                                     };
                                 }
                                 2 => {
-                                    // The whole table read is ONE unit: on
-                                    // starvation it is retried from the block
-                                    // header's end, never resumed half-built.
+                                    // The table read is one unit: retried from
+                                    // the header's end, never resumed half-built.
                                     match read_dynamic_tables(&mut br) {
                                         Err(InflateError::Truncated) => {
                                             *cursor = save;
@@ -330,10 +301,8 @@ impl Inflater {
                         if out.len().saturating_sub(*out_at) >= PUMP_TARGET {
                             break;
                         }
-                        // The parent module's two-phase decode: the first
-                        // `ROOT_BUILD_AFTER` symbols run the bit-at-a-time walk,
-                        // then both root tables are armed once and the fast
-                        // decoder takes over for the rest of the block.
+                        // Two-phase decode: the walk for `ROOT_BUILD_AFTER`
+                        // symbols, then armed root tables for the rest.
                         if *warm == 0 {
                             lit.arm_root();
                             dist.arm_root();
@@ -365,14 +334,11 @@ impl Inflater {
     }
 }
 
-/// Decode ONE literal or match into `out`. Returns `true` at end-of-block.
+/// Decode one literal or match into `out`. Returns `true` at end-of-block.
 ///
-/// Byte-for-byte the parent module's `block_loop` body with two differences, both
-/// forced by streaming: there is no `max_output` ceiling (nothing accumulates —
-/// the caller's own cap is what bounds an expansion bomb, exactly as it did
-/// under the retired `flate2`), and a back-reference distance is checked against
-/// the TOTAL bytes produced rather than `out.len()`, because `out` has been
-/// compacted down to the window and no longer holds the whole output.
+/// The parent's `block_loop` body, except: no `max_output` ceiling (the
+/// caller's cap bounds an expansion bomb), and a back-reference distance is
+/// checked against total bytes produced, since `out` is compacted to the window.
 fn decode_one(
     br: &mut BitReader<'_>,
     lit: &Huffman,
@@ -414,11 +380,8 @@ fn decode_one(
         _ => return Err(InflateError::BadDistance),
     };
     let distance = dbase as usize + br.read_bits(dextra)? as usize;
-    // A distance may reach back over bytes already handed to the caller, so the
-    // legality test is against everything ever produced; the retained window is
-    // what makes it *reachable*. `distance <= WINDOW` always (the largest
-    // distance code is 32768), and `compact` never shrinks `out` below `WINDOW`
-    // bytes, so a distance that passes here is always inside `out`.
+    // Legality is against everything ever produced; the retained window makes
+    // it reachable (`distance <= WINDOW`, and `compact` keeps `WINDOW` bytes).
     if distance == 0 || distance as u64 > *produced {
         return Err(InflateError::BadDistance);
     }
@@ -473,9 +436,8 @@ impl std::error::Error for InflateError {}
 
 /// A raw RFC 1951 DEFLATE stream, decompressed as it is read.
 ///
-/// Reading stops at the final block; bytes after it in `source` are left
-/// unconsumed, which is what a zip member needs — the member's compressed
-/// extent is decided by the central directory, not by the decompressor.
+/// Reading stops at the final block and leaves later bytes in `source`
+/// unconsumed (a zip member's extent comes from the central directory).
 pub struct DeflateReader<R> {
     source: R,
     inflater: Inflater,
@@ -555,9 +517,108 @@ impl<R: Read> Read for DeflateReader<R> {
     }
 }
 
-/// Copy up to `buf.len()` pending bytes out of `inf`, optionally folding them
-/// into `crc` on the way past. Every produced byte crosses this function exactly
-/// once, which is what makes the gzip checksum exact without a second pass.
+impl<R: Read> DeflateReader<R> {
+    /// Refill until the input buffer holds at least `len` bytes. A source that
+    /// ends first is a truncated stream.
+    fn fill_to(&mut self, len: usize) -> io::Result<()> {
+        while self.inflater.input.len() < len {
+            if !self.refill()? {
+                return Err(io_err(InflateError::Truncated));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where a [`ZlibReader`] is in its stream.
+enum ZlibState {
+    /// The two header bytes have not been checked yet.
+    Header,
+    /// Inside the DEFLATE data.
+    Body,
+    /// The final block ended and the Adler-32 matched.
+    Done,
+}
+
+/// An RFC 1950 zlib stream, decompressed as it is read.
+///
+/// The header is checked as [`zlib_decompress`](super::zlib_decompress) checks
+/// it, and the Adler-32 that follows the DEFLATE data is verified when the
+/// final block ends: `read` returns `Ok(0)` only after it matched. Bytes after
+/// the checksum are not part of the stream and are never looked at, which is
+/// the prefix semantics of [`zlib_decompress_prefix`](super::zlib_decompress_prefix)
+/// (a PNG's padded final `IDAT`). Memory is the DEFLATE window plus one
+/// refill, whatever the stream decompresses to.
+pub struct ZlibReader<R> {
+    inner: DeflateReader<R>,
+    adler: Adler32,
+    state: ZlibState,
+}
+
+impl<R: Read> ZlibReader<R> {
+    /// Wrap `source`.
+    pub fn new(source: R) -> Self {
+        Self {
+            inner: DeflateReader::new(source),
+            adler: Adler32::new(),
+            state: ZlibState::Header,
+        }
+    }
+}
+
+impl<R: Read> Read for ZlibReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            match self.state {
+                ZlibState::Done => return Ok(0),
+                ZlibState::Header => {
+                    self.inner.fill_to(2)?;
+                    let input = &self.inner.inflater.input;
+                    let (Some(&cmf), Some(&flg)) = (input.first(), input.get(1)) else {
+                        return Err(io_err(InflateError::Truncated));
+                    };
+                    check_zlib_header(cmf, flg).map_err(io_err)?;
+                    // Nothing has been decoded yet, so the bit reader is empty
+                    // and starting it two bytes in skips exactly the header.
+                    self.inner.inflater.cursor.pos = 2;
+                    self.state = ZlibState::Body;
+                }
+                ZlibState::Body => {
+                    let n = self.inner.read(buf)?;
+                    if let Some(produced) = buf.get(..n)
+                        && n > 0
+                    {
+                        self.adler.update(produced);
+                        return Ok(n);
+                    }
+                    // The final block ended; the checksum starts at the next
+                    // whole byte.
+                    let at = self.inner.inflater.cursor.byte_position();
+                    self.inner.fill_to(at.saturating_add(4))?;
+                    let Some(&trailer) = self
+                        .inner
+                        .inflater
+                        .input
+                        .get(at..)
+                        .and_then(<[u8]>::first_chunk::<4>)
+                    else {
+                        return Err(io_err(InflateError::Truncated));
+                    };
+                    if u32::from_be_bytes(trailer) != self.adler.finish() {
+                        return Err(io_err(InflateError::BadChecksum));
+                    }
+                    self.state = ZlibState::Done;
+                }
+            }
+        }
+    }
+}
+
+/// Copy up to `buf.len()` pending bytes out of `inf`, folding them into `crc`
+/// if given. Every produced byte passes here exactly once.
 fn take_pending(inf: &mut Inflater, buf: &mut [u8], crc: Option<&mut Crc32>) -> usize {
     let pending = inf.pending();
     let n = pending.min(buf.len());
@@ -674,18 +735,14 @@ enum GzState {
 
 /// A multi-member RFC 1952 gzip stream, decompressed as it is read.
 ///
-/// Multi-member because that is what `gzip -d` does and what the retired
-/// `flate2::read::MultiGzDecoder` did: a concatenation of gzip files is itself a
-/// gzip file, and real `.tar.gz` producers emit them.
-///
-/// Every member's CRC-32 and length trailer is CHECKED. That is the property
-/// that makes a truncated or corrupted download fail loudly here rather than
-/// become a short tar the extractor might otherwise treat as merely small.
+/// A concatenation of gzip files is a gzip file (as `gzip -d` treats it).
+/// Every member's CRC-32 and length trailer is checked, so a truncated or
+/// corrupted download fails instead of yielding a short tar.
 pub struct GzipReader<R> {
     source: R,
-    /// Bytes read from the source that the framing layer still owns — header
-    /// and trailer bytes. Handed to the inflater on entering a member's body and
-    /// taken back, minus what the body consumed, on leaving it.
+    /// Source bytes the framing layer owns (header and trailer). Handed to the
+    /// inflater on entering a member's body and taken back, minus what the
+    /// body consumed, on leaving it.
     frame: Vec<u8>,
     inflater: Inflater,
     state: GzState,

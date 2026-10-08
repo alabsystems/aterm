@@ -42,8 +42,8 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         // Only a mode that is not already `0700` is written: a `chmod(2)` to the
         // mode a directory already has still moves its `st_ctime` (APFS), and
         // tippy aborts when an ancestor of its executable changes ctime mid-run
-        // — aterm-update-core's copy of this rule learned that on 2026-09-15
-        // (privatedir.rs). The stat below still proves the final mode.
+        // (aterm-update-core's privatedir.rs keeps the same rule). The stat
+        // below still proves the final mode.
         if !std::fs::metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
@@ -118,10 +118,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "aterm-fs-restricted-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
         ));
         let dir = root.join("identities").join("worker");
         ensure_private_dir(&dir).expect("created");
@@ -151,11 +148,8 @@ mod tests {
     /// so its `st_ctime` does not move — while a drifted mode is still forced back
     /// to `0700`. A same-mode chmod moves the ctime on APFS, and tippy snapshots the
     /// ctime of every ancestor of the executable it runs and aborts on a change
-    /// ("ancestor … changed identity or contents"). This copy of the rule kept the
-    /// unconditional chmod after aterm-update-core's copy dropped it on 2026-09-15,
-    /// and on 2026-09-24 a merge-contract run lost its whole tippy stage to it:
-    /// `~/Library/Application Support/aterm`, the control-socket directory and an
-    /// ancestor of the atpkg store, had its ctime moved mid-compile.
+    /// ("ancestor … changed identity or contents"), and
+    /// `~/Library/Application Support/aterm` is an ancestor of the atpkg store.
     #[cfg(unix)]
     #[test]
     fn an_already_private_dir_keeps_its_ctime_and_a_drifted_one_is_hardened() {

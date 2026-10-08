@@ -15,10 +15,9 @@ use super::*;
 const PROOF_MAX_ROWS: u16 = 64;
 const PROOF_MAX_COLS: u16 = 256;
 
-/// DamageTracker bitset marking never goes out of bounds.
-/// Reduced rows<=8, unwind 10 — Vec::extend_with needs rows+1 unwind
-/// plus internal loop overhead. 8 rows covers all code paths (in-bounds,
-/// out-of-bounds) without hitting CBMC's memory budget.
+/// DamageTracker bitset marking never goes out of bounds. Rows <= 8 with
+/// unwind 10 (`Vec::extend_with` needs rows+1) covers the in- and
+/// out-of-bounds paths within CBMC's memory budget.
 #[kani::proof]
 #[kani::unwind(10)]
 fn damage_tracker_mark_row_bounds() {
@@ -70,7 +69,7 @@ fn damage_tracker_cell_bounds_valid() {
     }
 }
 
-/// Boundary regression: marking u16::MAX - 1 keeps right bound at u16::MAX.
+/// Marking u16::MAX - 1 keeps the right bound at u16::MAX.
 #[kani::proof]
 #[kani::unwind(10)] // Vec allocation needs rows+1 unwind
 fn damage_tracker_cell_bounds_near_u16_max() {
@@ -302,19 +301,11 @@ fn damage_partial_unmarked_not_damaged() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // DamageTracker::clear() proofs
-// ---------------------------------------------------------------------------
 
-/// clear() is behaviorally equivalent to new() for same row count.
-///
-/// After clear(rows), every observable query must return the same value
-/// as on a freshly constructed DamageTracker::new(rows). This proves the
-/// zero-allocation frame-to-frame reset path is safe.
-///
-/// Rows capped at 4 (not 8) because mark_cell column tracking doubles
-/// the Vec state space; two DamageTracker instances push CBMC past its
-/// memory budget at rows=8 (OOM exit 241 at ~94s).
+/// clear(rows) is observably equivalent to DamageTracker::new(rows), so the
+/// allocation-free frame reset is safe. Rows capped at 4: two trackers with
+/// column tracking exceed CBMC's memory budget at 8.
 #[kani::proof]
 #[kani::unwind(6)]
 fn damage_tracker_clear_equivalent_to_new() {
@@ -351,19 +342,11 @@ fn damage_tracker_clear_equivalent_to_new() {
     );
 }
 
-// =============================================================================
-// A4: copy_damaged_cells_inner buffer write index safety
-// Part of #6765 (Visual Verification Pipeline Sprint, Stream A4).
-// =============================================================================
+// Damage-driven buffer copy: write index safety
 
-/// A4.1: For any symbolic damage state, every buffer write index
-/// computed from `row_damage_bounds` is within `rows * cols`.
-///
-/// This proves the critical safety property of `copy_damaged_cells_inner`:
-/// when iterating `col in left..right` from `row_damage_bounds(row, cols)`,
-/// the index `row * cols + col` never exceeds the allocated buffer size.
-///
-/// Covers both Full and Partial damage variants.
+/// For any symbolic damage state (Full or Partial), every index
+/// `row * cols + col` with `col` in `row_damage_bounds(row, cols)` is below
+/// `rows * cols`, as a damage-driven `row * cols + col` buffer copy requires.
 #[kani::proof]
 #[kani::unwind(10)]
 fn damage_buffer_write_index_in_bounds() {
@@ -403,10 +386,8 @@ fn damage_buffer_write_index_in_bounds() {
     }
 }
 
-/// A4.2: Full damage produces valid indices for every cell position.
-///
-/// When damage is Full, `row_damage_bounds` returns `(0, cols)` for every
-/// row, so every `row * cols + col` for `col in 0..cols` must be in bounds.
+/// Full damage yields `(0, cols)` for every row, and every resulting index is
+/// in bounds.
 #[kani::proof]
 fn damage_full_all_indices_in_bounds() {
     let rows: u16 = kani::any();
@@ -421,7 +402,7 @@ fn damage_full_all_indices_in_bounds() {
     kani::assume(row < rows);
     kani::assume(col < cols);
 
-    // This is the exact index computation from copy_damaged_cells_inner.
+    // The index a damage-driven `row * cols + col` buffer copy computes.
     let index = usize::from(row) * usize::from(cols) + usize::from(col);
     kani::assert(
         index < buffer_size,

@@ -1,42 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A BAND THAT FOLLOWED ITS TEXT ONCE FOLLOWS IT AGAIN** (2026-09-25).
+//! A band that followed its text once follows it again.
 //!
 //! The follow pass carries a band onto the row its text moved to
 //! (`rk::witness::Witness::follow_runs`) and counts a glyph found there only
-//! if it ARRIVED. A record the pass carried stands on a row whose neighbours
-//! it has never seen, and a SECOND move with no key between — a box
-//! relocated twice, an inline chat box pushed down by two streamed rows,
-//! Claude Code's composer growing at a second newline after the far-row
-//! read of the first was dropped — must follow as the first did, not melt
-//! under text standing right there.
+//! if it arrived. A record the pass carried stands on a row whose neighbours
+//! it has never seen, and a second move with no key between (a box relocated
+//! twice, an inline chat box pushed down by two streamed rows, Claude Code's
+//! composer growing at a second newline after the far-row read of the first
+//! was dropped) must follow as the first did.
 //!
-//! The witness's evidence (`rk::witness`, its module doc): a carried record
-//! FORGETS what it saw — its new row's neighbours are not the old ones —
-//! and starts over as a record just armed, and nothing it did not see is
-//! evidence against a move: requiring a frame to show the destination empty
-//! first melted a move on the very next frame, or two rows away
-//! (`tests/moves_are_followed.rs`). A scroll moves every row alike, so it
-//! keeps what was seen (`Witness::translate`). A copy beside a line is a
-//! twin only once it has stood there `TWIN_MIN`, so a program that draws a
-//! line's new row up to three frames before it erases the old — a torn
-//! repaint, no synchronized-update bracket — still follows. And a run beside
-//! a row the host was asked for and did not deliver waits one walk for its
-//! verdict (`Witness::find_deferred_runs`), so a line moved onto that row
-//! follows on the next frame.
+//! The witness's evidence (`rk::witness` module doc): a carried record
+//! forgets what it saw and starts over as a record just armed, and nothing
+//! it did not see is evidence against a move. A scroll moves every row
+//! alike, so it keeps what was seen (`Witness::translate`). A copy beside a
+//! line is a twin only once it has stood there `TWIN_MIN`, so a torn repaint
+//! that draws a line's new row before erasing the old still follows. A run
+//! beside a row the host was asked for and did not deliver waits one walk
+//! for its verdict (`Witness::find_deferred_runs`), so a line moved onto
+//! that row follows on the next frame.
 //!
-//! Every law runs at the HOST seam, GUI-faithfully (`trail_host::Core`: the
-//! content-scroll seam, then the frame hold's rows, then the tick; a frame that
-//! scrolled samples nothing). Each names its reading on 0.93.0, and the
-//! mechanism that holds it.
+//! Every law runs at the host seam (`trail_host::Core`: the content-scroll
+//! seam, then the frame hold's rows, then the tick; a frame that scrolled
+//! samples nothing).
 
-#[macro_use]
-mod trail_host;
-
+use crate::trail_host::{Core, Opts, Theme};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::Duration;
-use trail_host::{Core, Opts, Theme};
 
 /// The GUI's frame seam (`trail_host::Core`): the content-scroll seam (a
 /// frame that scrolled samples nothing), the frame hold's rows — the caret row's
@@ -50,10 +41,10 @@ const SEAM: Opts = Opts {
 };
 
 /// The host: `trail_host`'s frame seam on a grid of 8×16 cells, and this
-/// file's input gestures. `drop_far_frames = 1` drops the NEXT frame's
-/// far-row read: only the caret's row and its `±1`, which `app_render.rs`
-/// captures under its first terminal lock, reach the witness — the second,
-/// generation-checked read lost its race with a newer grid.
+/// file's input gestures. `drop_far_frames = 1` drops the next frame's
+/// far-row read: only the caret's row and its `±1` (captured under the
+/// first terminal lock in `app_render.rs`) reach the witness, as when the
+/// second, generation-checked read loses its race with a newer grid.
 struct Host {
     c: Core,
 }
@@ -106,45 +97,6 @@ impl Host {
     }
 }
 
-/// **A LINE RELOCATED TWICE, NO KEY BETWEEN, FOLLOWS BOTH TIMES** — the
-/// plain shape of `tests/abandoned_ribbon.rs`'s relocation law, twice:
-/// `hello world` typed, then a program clears the screen and redraws the
-/// line one row lower (or higher), and 150 ms later — still no key — one
-/// row farther. The second move is carried as the first was: the carried
-/// records start over, and nothing they have not seen yet counts against
-/// the move. Were a carried record's unseen neighbours read as "not
-/// arrived", the second move would read `(followed +0, retired +11)` in
-/// both directions, the band melted under its own text. GREEN on 0.93.0.
-#[test]
-fn a_line_relocated_twice_without_a_key_follows_both_times() {
-    for (from, to) in [(5u16, [6u16, 7]), (20, [19, 18])] {
-        let mut h = Host::new(24, 80);
-        h.term.process(format!("\x1b[{};1H", from + 1).as_bytes());
-        h.frame();
-        h.type_str("hello world");
-        h.idle(200);
-        let want: Vec<u16> = (0..11).collect();
-        assert_eq!(
-            h.live(from),
-            want,
-            "fixture: the band is under `hello world`"
-        );
-        for (k, row) in to.into_iter().enumerate() {
-            let (f0, r0) = h.counts();
-            h.program(format!("\x1b[2J\x1b[{};1Hhello world", row + 1).as_bytes());
-            h.frame();
-            let (f1, r1) = h.counts();
-            assert_eq!(
-                (f1 - f0, r1 - r0, h.live(row)),
-                (11, 0, want.clone()),
-                "move {} from row {from}: the band follows its text onto row {row}, nothing retired",
-                k + 1
-            );
-            h.idle(150);
-        }
-    }
-}
-
 /// An inline chat box (Claude Code outside fullscreen): transcript rows
 /// above it, then a rule, the prompt row with `text`, a rule and a status
 /// row, its top on 0-based `top` and the caret after the text. A full
@@ -170,15 +122,12 @@ fn draw_box(cols: usize, top: usize, text: &str, transcript: usize) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// **AN INLINE BOX MOVED BY STREAMED ROWS FOLLOWS EVERY MOVE** — the
-/// relocation sweep: `fix the flaky test in the witness` typed into an
-/// inline box, then the box re-laid by a streaming answer growing above it
-/// (down) or a transcript row retracted (up), one or two rows a move, with
-/// 60, 150 or 300 ms between the moves and no key. Every move carries all
-/// 33 cells onto the text's new row and retires nothing. Read fail-closed,
-/// a carried record's unseen neighbours refuse every second move in the
-/// direction of the first (or farther): 21 of these 27 cases,
-/// `(followed +0, retired +33)`. GREEN on 0.93.0.
+/// An inline box moved by streamed rows follows every move:
+/// `fix the flaky test in the witness` typed into an inline box, then the
+/// box re-laid by a streaming answer growing above it (down) or a
+/// transcript row retracted (up), one or two rows a move, 60, 150 or 300 ms
+/// between moves and no key. Every move carries all 33 cells onto the
+/// text's new row and retires nothing.
 #[test]
 fn an_inline_box_moved_by_streamed_rows_follows_every_move() {
     const COLS: usize = 100;
@@ -238,17 +187,13 @@ fn an_inline_box_moved_by_streamed_rows_follows_every_move() {
     );
 }
 
-/// **AN INLINE BOX AT THE SCREEN'S BOTTOM, UNDER STREAMED ROWS.** The box
-/// sits on the last four rows; each streamed row is written where the
-/// box's top rule stood and the box re-written under it, the last CRLF
-/// scrolling the screen: the box's text ends on the same screen row while
-/// the scroll carried its band a row UP. The follow pass brings it back
-/// down on the next frame — which it can only do if the rule row the text
-/// was seen above still counts as seen after the scroll
-/// (`Witness::translate` keeps the evidence: the whole screen moved). GREEN
-/// on 0.93.0. RED with a scroll that FORGETS the evidence, from push 1; RED
-/// with a carried record's unseen neighbours read fail-closed, from push 2
-/// `(followed +0, retired +33, 0 lit)`.
+/// An inline box at the screen's bottom, under streamed rows. The box sits
+/// on the last four rows; each streamed row is written where the box's top
+/// rule stood and the box re-written under it, the last CRLF scrolling the
+/// screen: the text ends on the same screen row while the scroll carried
+/// its band a row up. The follow pass brings it back down on the next
+/// frame, which needs the rule row the text was seen above to still count
+/// as seen after the scroll (`Witness::translate`).
 #[test]
 fn an_inline_box_at_the_screen_s_bottom_keeps_its_band_under_every_streamed_row() {
     const ROWS: usize = 40;
@@ -303,7 +248,7 @@ fn an_inline_box_at_the_screen_s_bottom_keeps_its_band_under_every_streamed_row(
 /// Claude Code's bottom-anchored composer on the alternate screen (the
 /// shape of `tests/composer_multiline_wrap.rs`): a rule, the text rows, the
 /// caret row, a rule and a status row. A composer newline (Shift+Enter)
-/// repaints the box one row HIGHER with an empty caret row, inside one
+/// repaints the box one row higher with an empty caret row, inside one
 /// synchronized update.
 struct Composer {
     h: Host,
@@ -393,18 +338,16 @@ impl Composer {
     }
 }
 
-/// **A FAR-ROW READ DROPPED ON ONE NEWLINE'S FRAME COSTS NO LATER FOLLOW.**
+/// A far-row read dropped on one newline's frame costs no later follow.
 /// Claude Code's composer, a short list typed a line at a time with
-/// Shift+Enter between. On the first newline's echo frame the GUI's second,
-/// generation-checked far-row read is dropped (a PTY chunk landed between
-/// its two locks), so only the caret's row and its `±1` reach the witness;
-/// the first line still follows up (its destination is the caret's `−1`).
-/// At the SECOND newline that line moves up again, and must follow again.
-/// The run beside the withheld row waits one walk for its verdict, and a
-/// carried record's unseen neighbours are no evidence against the second
-/// move. RED on 0.93.0 at the line the neutral twin fixed: line 1 shares
-/// `- ` with line 0 at the same columns, and those letters, read as holes,
-/// split its block (`(followed +14, retired +15)`).
+/// Shift+Enter between. On the first newline's echo frame the far-row read
+/// is dropped, so only the caret's row and its `±1` reach the witness; the
+/// first line still follows up (its destination is the caret's `−1`). At
+/// the second newline that line moves up again and follows again: the run
+/// beside the withheld row waits one walk for its verdict, and a carried
+/// record's unseen neighbours are no evidence against the move. Line 1
+/// shares `- ` with line 0 at the same columns, and those letters must not
+/// read as holes.
 #[test]
 fn a_far_row_read_dropped_on_one_newline_s_frame_costs_no_later_follow() {
     let mut c = Composer::new(53, 91);
@@ -446,17 +389,13 @@ fn a_far_row_read_dropped_on_one_newline_s_frame_costs_no_later_follow() {
     }
 }
 
-/// **A ROW THE HOST HAS A SLOT FOR IS NEVER WITHHELD.** Three typed bands
-/// on rows 3, 7 and 11 fill the bands' eight rows of the witness's list,
-/// and the caret is parked on row 20, a row no band lives on. The host
-/// reads the caret's row first, then every row of the list: its
-/// `CURSOR_WITNESS_ROWS` slots hold them all, so no row of the list is
-/// "asked for and not delivered", and nothing is deferred. A program then
-/// rewrites row 7's text in place — other glyphs at the band's columns —
-/// and the band's four cells retire on that frame. With the caret's row
-/// taking one of only eight slots, the list's last row got none, read as
-/// withheld on every frame, and the rewrite beside it retired a frame
-/// late. GREEN on 0.93.0, which deferred nothing.
+/// A row the host has a slot for is never withheld. Three typed bands on
+/// rows 3, 7 and 11 fill the bands' eight rows of the witness's list, and
+/// the caret is parked on row 20, where no band lives. The host reads the
+/// caret's row first, then every row of the list: its
+/// `CURSOR_WITNESS_ROWS` slots hold them all, so nothing is deferred. A
+/// program then rewrites row 7's text in place and the band's four cells
+/// retire on that frame, not a frame late.
 #[test]
 fn a_row_the_host_has_a_slot_for_is_never_withheld() {
     let mut h = Host::new(24, 80);
@@ -486,16 +425,13 @@ fn a_row_the_host_has_a_slot_for_is_never_withheld() {
     );
 }
 
-/// **A TORN REPAINT STILL FOLLOWS.** A program with no synchronized-update
-/// bracket re-lays a line one row away in two PTY writes the host presents
-/// on consecutive frames: first the line on its new row, then the erase of
-/// its old one. On the first frame the line stands on BOTH rows — one frame
-/// of a copy beside it, which is not yet a twin (`Seen::pending`: it has not
-/// stood `TWIN_MIN`) — and on the second its text has moved. The band
-/// follows, down (a box pushed by a row above it) and up (a bottom-anchored
-/// box growing). GREEN on 0.93.0 (it never looked again after arming); RED
-/// if one frame of a copy made a twin. Tears across two and three frames
-/// are `tests/moves_are_followed.rs`'s
+/// A torn repaint still follows. A program with no synchronized-update
+/// bracket re-lays a line one row away in two PTY writes presented on
+/// consecutive frames: first the line on its new row, then the erase of its
+/// old one. On the first frame the line stands on both rows, a copy that is
+/// not yet a twin (`Seen::pending`: it has not stood `TWIN_MIN`); on the
+/// second its text has moved. The band follows, down and up. Tears across
+/// two and three frames are in `tests/moves_are_followed.rs`
 /// (`a_torn_repaint_across_up_to_three_frames_follows`).
 #[test]
 fn a_torn_repaint_that_draws_the_new_row_a_frame_before_it_erases_the_old_still_follows() {

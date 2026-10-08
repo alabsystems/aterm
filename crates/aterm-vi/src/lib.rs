@@ -375,7 +375,7 @@ impl ViMode {
         self.perform_inline_search(grid, state.char, state.kind.reversed())
     }
 
-    /// Internal: execute an inline search and move cursor.
+    /// Run an inline search and move the cursor to the result.
     fn perform_inline_search(
         &mut self,
         grid: &dyn BufferAccess,

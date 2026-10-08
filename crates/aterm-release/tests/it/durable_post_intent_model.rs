@@ -3,7 +3,7 @@
 
 //! Tier-1 conformance for journal-v5 one-shot GitHub POST authority.
 
-use crate::{publish, sign};
+use crate::{ledger, publish, sign};
 
 use aterm_spec::derive::{
     Model, release_durable_post_intent_model, release_historical_recovery_model,
@@ -61,8 +61,8 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         signature_required: false,
         signature_pubkey: None,
         // Unattributed, as a FORK's cut is: with no master pinned no roster authorizes
-        // anything and no roster asset ships. WRONG BEFORE: "as every cut from this tree
-        // is" — this tree's master has been armed since 2026-08-15.
+        // anything and no roster asset ships (this tree's master has been armed since
+        // 2026-08-15).
         signature_machine_id: None,
         attribution: None,
         roster: None,
@@ -221,6 +221,276 @@ fn lost_response_converges_visible_create_and_upload_without_repost() {
     assert!(!buggy.check_invariant("LostCreatePermitCannotPost", &retry));
 }
 
+/// AN UPLOAD INTENT IS SPENT ONLY ON A POST THAT PROVABLY CREATED NOTHING — over the
+/// real journal, and against the derived model. `upload_channel_asset` settles every
+/// finished upload POST through `CutCtx::settle_upload_intent`; this drives that settle
+/// with what curl says, over a journal that is really written and read back, and asks
+/// the one question a resume asks next: may the asset be POSTed again?
+///
+/// A POST curl never sent (exit 2) or the server answered with a 4xx (a token that
+/// expired mid-cut, a throttle, a refused upload) created nothing: its intent is
+/// retracted, the durable list `--abandon` withdraws from loses only that name, and the
+/// resume may post it once more. Everything else can hide a stored object and keeps its
+/// intent — the NEGATIVE CONTROLS, the rows a blanket retraction would get wrong: with the
+/// intent standing the resume decides `AwaitVisibility` and mints no permit.
+///
+/// Each row is also projected onto `ReleaseDurablePostIntent`, whose world it is: a POST
+/// that created nothing is `IssueRefusedUploadPost`, one that may have landed is
+/// `IssueUploadPost`, and the model's `RetractUploadIntent` is enabled for exactly the
+/// rows the real settle retracts. The blanket retraction is replayed on the model's
+/// mutant and lands an object no intent names.
+#[test]
+fn an_upload_intent_is_freed_by_a_post_that_created_nothing_and_by_nothing_else() {
+    use publish::PostOutcome::{NeverSent, Refused, Unknown};
+    const NAME: &str = "aterm-0.55.0.dmg";
+    const OTHER: &str = "aterm-0.55.0-mac.zip";
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("upload-intent-settle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let model = release_durable_post_intent_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+    // One upload POST that finished as `out`, settled by a cut of `kind`: the verdict, the
+    // journal as read back from disk, and whether the resume may post `NAME` again (the
+    // shipping decision, then the real permit).
+    let settled = |kind: CutKind, out: &ledger::RunOut| {
+        let mut ctx = context(&root, true);
+        ctx.kind = kind;
+        // The journal's invariant: an upload intent implies the bound release.
+        drop(ctx.persist_release_intent().unwrap());
+        ctx.release_id = Some(55);
+        let journal = ctx.journal.as_mut().unwrap();
+        journal.release_id = Some(55);
+        journal.save(&ctx.journal_path).unwrap();
+        drop(ctx.persist_upload_intent(NAME).unwrap());
+        drop(ctx.persist_upload_intent(OTHER).unwrap());
+        let verdict = ctx.settle_upload_intent(NAME, out);
+        let on_disk = Journal::load(&ctx.journal_path).unwrap().unwrap();
+        assert_eq!(on_disk.upload_intents, ctx.upload_intents);
+        let issued = ctx.upload_intents.iter().any(|issued| issued == NAME);
+        let reposts = match publish::durable_post_decision(issued, false) {
+            DurablePostDecision::PersistIntentThenPost => {
+                drop(
+                    ctx.persist_upload_intent(NAME)
+                        .expect("a permit for the repost"),
+                );
+                true
+            }
+            DurablePostDecision::AwaitVisibility => {
+                assert!(ctx.persist_upload_intent(NAME).is_err(), "no second permit");
+                false
+            }
+            DurablePostDecision::ConvergeVisible => unreachable!("nothing is visible"),
+        };
+        // What the journal held when the settle returned, not after the repost above.
+        (verdict, on_disk.upload_intents, reposts)
+    };
+    // The model, at the moment the upload POST has finished: `created_nothing` is the
+    // world (the POST was refused or never left), which the process knows only then.
+    let posted = |created_nothing: bool| {
+        let mut state = model.init_state();
+        for action in [
+            "PersistCreateIntent",
+            "IssueCreatePost",
+            "RevealCreatedDraft",
+            "ConvergeCreatedDraft",
+            "PersistUploadIntent",
+            if created_nothing {
+                "IssueRefusedUploadPost"
+            } else {
+                "IssueUploadPost"
+            },
+        ] {
+            step(&model, &mut state, action, action);
+        }
+        state
+    };
+    let out = |status: i32, stderr: &str| ledger::RunOut {
+        status,
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    };
+    let http = |code: u16| {
+        out(
+            22,
+            &format!("curl: (22) The requested URL returned error: {code}"),
+        )
+    };
+
+    // Freed: only this POST's intent goes — the durable list `--abandon` withdraws from
+    // still names every other upload this cut made — and the resume may post it again.
+    for (label, finished, verdict) in [
+        (
+            "curl refused its own arguments",
+            out(2, "curl: option --upload-file: out of memory"),
+            NeverSent,
+        ),
+        ("401: the token expired mid-cut", http(401), Refused),
+        ("403: throttled", http(403), Refused),
+        ("422: the upload was refused", http(422), Refused),
+    ] {
+        let (got, intents, reposts) = settled(CutKind::Rehearse, &finished);
+        assert_eq!(got.expect("a retraction"), verdict, "{label}");
+        assert_eq!(intents, [OTHER], "{label}");
+        assert!(reposts, "{label}");
+
+        // The model: retractable, and once retracted the resume may persist a fresh
+        // intent (and so a fresh permit) — the same answer as `reposts`.
+        let mut state = posted(true);
+        assert!(
+            model.action_enabled("RetractUploadIntent", &state),
+            "{label}"
+        );
+        step(&model, &mut state, "RetractUploadIntent", label);
+        assert_eq!(
+            model.action_enabled("PersistUploadIntent", &state),
+            reposts,
+            "{label}"
+        );
+    }
+
+    // NEGATIVE CONTROLS: each of these can hide a delivered request and keeps its intent
+    // (so the resume waits for visibility), and none is misread as a refusal.
+    for (label, finished) in [
+        ("502: the edge can hide a stored object", http(502)),
+        ("500", http(500)),
+        ("a timeout", out(28, "curl: (28) Operation timed out")),
+        (
+            "a reset",
+            out(56, "curl: (56) Recv failure: Connection reset by peer"),
+        ),
+        ("killed", out(-1, "")),
+        (
+            "wording this code has never seen",
+            out(22, "curl: (22) some future wording"),
+        ),
+        ("success: the probe decides", out(0, "")),
+    ] {
+        let (got, intents, reposts) = settled(CutKind::Rehearse, &finished);
+        assert_eq!(got.expect("no retraction to fail"), Unknown, "{label}");
+        assert_eq!(intents, [NAME, OTHER], "{label}");
+        assert!(!reposts, "{label}");
+
+        // The model refuses to retract a POST that may have landed, and with the intent
+        // standing it refuses a fresh one; the mutant retracts it anyway and leaves an
+        // object no intent names.
+        let state = posted(false);
+        assert!(
+            !model.action_enabled("RetractUploadIntent", &state),
+            "{label}"
+        );
+        assert_eq!(
+            model.action_enabled("PersistUploadIntent", &state),
+            reposts,
+            "{label}"
+        );
+        let hidden = buggy.successors("RetractUploadIntent", &state)[0].clone();
+        assert!(
+            !buggy.check_invariant("LandedUploadStaysNamed", &hidden),
+            "{label}: a blanket retraction hides a stored object"
+        );
+    }
+
+    // THE ANSWERED 4xx RE-PROVES THE LEASE; THE NEVER-SENT EXIT DOES NOT. This cut is REAL
+    // and holds no lease, as a process fenced out of its claim would find. A refusal it
+    // cannot prove it still owns keeps its intent (the journal on disk is untouched and the
+    // resume waits) and says why; curl's exit 2, which a round-7 audit found under memory
+    // pressure, is retracted with no further call that could fail.
+    let (got, intents, reposts) = settled(CutKind::Real, &http(422));
+    let why = got.expect_err("a refusal from a process that cannot prove its lease");
+    assert!(
+        why.to_string().contains("KEPT") && why.to_string().contains("re-prove"),
+        "{why}"
+    );
+    assert_eq!(
+        intents,
+        [NAME, OTHER],
+        "the intent survives the failed proof"
+    );
+    assert!(!reposts);
+    let (got, intents, reposts) = settled(
+        CutKind::Real,
+        &out(2, "curl: option --upload-file: out of memory"),
+    );
+    assert_eq!(got.expect("never sent needs no lease"), NeverSent);
+    assert_eq!(intents, [OTHER]);
+    assert!(reposts);
+
+    // The mutant a resumed process is: the refusal it retracts on died with the process
+    // that saw it (`IssueRefusedUploadPost`, then a crash, keeps it in the mutant).
+    let mut crashed = buggy.init_state();
+    for action in [
+        "PersistCreateIntent",
+        "IssueCreatePost",
+        "RevealCreatedDraft",
+        "ConvergeCreatedDraft",
+        "PersistUploadIntent",
+        "IssueRefusedUploadPost",
+        "Crash",
+    ] {
+        assert!(buggy.fire(action, &mut crashed), "{action}");
+    }
+    assert!(!buggy.check_invariant("UploadRefusalIsProcessLocal", &crashed));
+    let mut healthy = posted(true);
+    step(
+        &model,
+        &mut healthy,
+        "Crash",
+        "the refusal dies with its process",
+    );
+    step(&model, &mut healthy, "Resume", "the resume never saw it");
+    assert!(
+        !model.action_enabled("RetractUploadIntent", &healthy),
+        "a resumed process waits for the object, as the resume does"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// WHAT THE UPLOAD DOES NEXT is one pure decision (`publish::after_upload_post`), read by
+/// the live `upload_channel_asset` and by the fake GitHub alike, so a row of this table
+/// is the live behaviour. The probe is a network call: never asked when the POST provably
+/// never left, best-effort after a refusal (an object there is converged on and the
+/// journal names it again — `422 already_exists` is a 4xx too — but a probe that fails
+/// leaves the refusal standing), and load-bearing after an unknowable outcome.
+#[test]
+fn what_an_upload_does_after_its_post_is_one_table() {
+    use publish::AfterUploadPost::{Ambiguous, Converge, NeverSent, Refused};
+    use publish::PostOutcome;
+    let decide = |outcome, seen: Result<bool, ()>| {
+        let mut asked = 0;
+        let verdict = publish::after_upload_post(outcome, || {
+            asked += 1;
+            seen.map_err(|()| ledger::Error::new("the probe failed"))
+        });
+        (verdict.map_err(|error| error.to_string()), asked)
+    };
+
+    // Never sent: local and provable, so the probe is never asked — even one that would
+    // have found an object.
+    assert_eq!(decide(PostOutcome::NeverSent, Ok(true)), (Ok(NeverSent), 0));
+    assert_eq!(decide(PostOutcome::NeverSent, Err(())), (Ok(NeverSent), 0));
+
+    // Refused: one best-effort probe. Visible converges and asks the journal to name it;
+    // absent, or a probe that fails, is the refusal as reported.
+    assert_eq!(
+        decide(PostOutcome::Refused, Ok(true)),
+        (Ok(Converge { journal: true }), 1)
+    );
+    assert_eq!(decide(PostOutcome::Refused, Ok(false)), (Ok(Refused), 1));
+    assert_eq!(decide(PostOutcome::Refused, Err(())), (Ok(Refused), 1));
+
+    // Unknown: the probe decides, and the intent was never retracted, so a visible object
+    // is already named. A probe that fails fails the step — the intent stands.
+    assert_eq!(
+        decide(PostOutcome::Unknown, Ok(true)),
+        (Ok(Converge { journal: false }), 1)
+    );
+    assert_eq!(decide(PostOutcome::Unknown, Ok(false)), (Ok(Ambiguous), 1));
+    let (failed, asked) = decide(PostOutcome::Unknown, Err(()));
+    assert!(failed.is_err() && asked == 1, "{failed:?}");
+}
+
 #[test]
 fn absent_cleanup_selector_is_fail_closed_for_issued_or_unknown_intent() {
     assert_eq!(
@@ -286,7 +556,7 @@ const OTHER_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
 /// Project one recovery observation onto `ReleaseHistoricalRecovery`: what the
 /// journal knows (`None` = lost), and whether a draft is visible and bound to the
-/// claim's commit — the shipping `claim_bound`, which only a visible draft has.
+/// claim's commit — the shipping `claim_bound_draft`, which only a visible draft has.
 fn recovery_state(model: &Model, knowledge: Option<bool>, visible: bool, bound: bool) -> State {
     let mut state = model.init_state();
     let learned = match knowledge {

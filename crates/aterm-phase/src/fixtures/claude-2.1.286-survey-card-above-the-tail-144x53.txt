@@ -1,0 +1,19 @@
+# claude-code 2.1.286 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x53), the managed 2.1.286 launched by path against a local stub of the API (no login, nothing leaves the machine) · the forced rating card after a 'hi' turn: head row 11, options row 12, composer top rule row 14, so `text --json tail=40` starts at row 13 and holds neither card row; the rows end at the last drawn row (the pane's 35 blank rows are not saved), the scratch folder is redacted at equal width
+ ▐▛███▛█   Claude Code v2.1.286
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.XXXX/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Crunched for 0s · done 1:59 AM
+
+● How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                       ◐ medium · /effort

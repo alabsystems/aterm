@@ -30,10 +30,12 @@ use std::collections::HashMap;
 use aterm_render::Theme;
 use aterm_session::SessionId;
 
-use crate::settings::{Roles, SettingsGeom, fit, text_w};
-use crate::tray_raster::row_baseline;
+#[cfg(a11y_tree)]
+use crate::palette::{a11y_epoch_from, a11y_slot_for, list_overlay_a11y};
+use crate::palette::{finish_overlay_card, overlay_card_frame, row_text_writer};
+use crate::settings::{Roles, SettingsGeom};
 use crate::type_scale::TypeStep;
-use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
+use crate::widget::{DrawPrim, TrayInput, rgba};
 
 /// The most body lines shown at once; beyond this the card scrolls.
 const MAX_BODY_LINES: usize = 16;
@@ -689,22 +691,13 @@ impl ConnectionMapState {
                 }
             }
         }
-        let epoch = h.finish() as u32;
-        if epoch == u32::MAX {
-            u32::MAX - 1
-        } else {
-            epoch
-        }
+        a11y_epoch_from(h.finish())
     }
 
     /// Decode a node minted by the CURRENT epoch to its item index.
     #[cfg(a11y_tree)]
     pub(crate) fn a11y_item_index(&self, node: accesskit::NodeId) -> Option<usize> {
-        let slot = usize::try_from(node.0 & u64::from(u32::MAX))
-            .ok()?
-            .checked_sub(1)?;
-        (a11y_node_id_for(self.a11y_epoch(), slot) == node && slot < self.items().len())
-            .then_some(slot)
+        a11y_slot_for(self.a11y_epoch(), node, self.items().len())
     }
 }
 
@@ -782,57 +775,9 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let layout = map_layout(state, g);
-    let (card_x, card_y, card_w, card_h) = layout.card;
-    let radius = (ch * 0.6).min(14.0);
-    let mut prims: Vec<DrawPrim> = vec![
-        DrawPrim::Panel {
-            x: card_x - 3.0,
-            y: card_y + 2.0,
-            w: card_w + 6.0,
-            h: card_h + 6.0,
-            radius: radius + 3.0,
-            fill: rgba([0, 0, 0], 0x2A),
-        },
-        DrawPrim::Panel {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-            radius,
-            fill: rgba(r.surface, 0xFF),
-        },
-        DrawPrim::Stroke {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-            radius,
-            width: 1.0,
-            color: rgba(r.separator, 0xE0),
-        },
-        DrawPrim::ClipPush {
-            x: card_x,
-            y: card_y,
-            w: card_w,
-            h: card_h,
-        },
-    ];
-
-    let text_at = |prims: &mut Vec<DrawPrim>, x: f32, y0: f32, step: TypeStep, s: String, color| {
-        if s.is_empty() {
-            return;
-        }
-        let size = step.px(px);
-        prims.push(text_prim(
-            x,
-            row_baseline(y0, ch, size.get()),
-            s,
-            size,
-            TextWeight::Regular,
-            TextFace::Mono,
-            color,
-        ));
-    };
+    let (card_x, card_y, _, _) = layout.card;
+    let mut prims = overlay_card_frame(layout.card, ch, &r, false);
+    let text_at = row_text_writer(px, ch);
 
     // Title row: the surface + its honest totals (and the projection in use).
     {
@@ -913,40 +858,17 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
     } else {
         "\u{2191}\u{2193} move   \u{23ce} raise   \u{232b} disconnect   esc close"
     };
-    let fsize = TypeStep::Caption.px(px);
-    let hint_w = text_w(hint, fsize.get());
-    let fx = card_x + fit((card_w - hint_w) * 0.5, cw, card_w - hint_w - cw);
-    text_at(
-        &mut prims,
-        fx,
-        card_y + layout.card_rows.saturating_sub(1) as f32 * ch,
-        TypeStep::Caption,
-        hint.to_string(),
-        rgba(r.text_tertiary, 0xFF),
-    );
-    prims.push(DrawPrim::ClipPop);
-
-    TrayInput {
-        prims,
-        card: layout.card,
-    }
+    finish_overlay_card(prims, hint, layout.card, layout.card_rows, g, &r)
 }
 
 /// The map's accessibility tree — the palette scheme verbatim: a ListBox of
 /// the chip/arrow items, epoch-guarded ids, focus follows the cursor.
 #[cfg(a11y_tree)]
 pub(crate) fn map_a11y(state: &ConnectionMapState) -> accesskit::TreeUpdate {
-    use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
+    use accesskit::{Action, Node, Role};
 
-    const LIST: NodeId = NodeId(u64::MAX);
-    let root_id = NodeId(0);
     let items = state.items();
-    let epoch = state.a11y_epoch();
-
-    let mut nodes: Vec<(NodeId, Node)> = Vec::with_capacity(items.len() + 2);
-    let mut children: Vec<NodeId> = Vec::with_capacity(items.len());
-    for (slot, item) in items.iter().enumerate() {
-        let id = a11y_node_id_for(epoch, slot);
+    let rows = items.iter().enumerate().map(|(slot, item)| {
         let mut node = Node::new(Role::MenuItem);
         let label = match *item {
             MapItem::Chip { group, chip } => state.chip_text(&state.groups[group].chips[chip]),
@@ -955,37 +877,9 @@ pub(crate) fn map_a11y(state: &ConnectionMapState) -> accesskit::TreeUpdate {
         node.set_label(label);
         node.add_action(Action::Focus);
         node.add_action(Action::Click);
-        nodes.push((id, node));
-        children.push(id);
-    }
-
-    let mut list = Node::new(Role::ListBox);
-    list.set_children(children);
-    nodes.push((LIST, list));
-
-    let mut root = Node::new(Role::Window);
-    root.set_label("Connection Map");
-    root.set_children(vec![LIST]);
-    nodes.push((root_id, root));
-
-    let focus = if items.is_empty() {
-        root_id
-    } else {
-        a11y_node_id_for(epoch, state.selected.min(items.len() - 1))
-    };
-
-    TreeUpdate {
-        nodes,
-        tree: Some(Tree::new(root_id)),
-        tree_id: TreeId::ROOT,
-        focus,
-    }
-}
-
-/// Mint a row node id (epoch high half, `slot + 1` low — the palette scheme).
-#[cfg(a11y_tree)]
-fn a11y_node_id_for(epoch: u32, slot: usize) -> accesskit::NodeId {
-    accesskit::NodeId((u64::from(epoch) << 32) | (slot as u64 + 1))
+        node
+    });
+    list_overlay_a11y("Connection Map", state.a11y_epoch(), state.selected, rows)
 }
 
 #[cfg(test)]

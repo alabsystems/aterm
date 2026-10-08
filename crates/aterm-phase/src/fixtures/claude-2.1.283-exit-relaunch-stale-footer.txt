@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-27, `aterm ctl text` of a private headless aterm built from main 9d1ce4862 (150x50) · `/exit` of an idle Claude Code, then `claude --model haiku` typed at the returned prompt with no `clear`: the old process's LAST FRAME (its `/exit` spinner, `⎿  Tip:`, composer frame and `esc to interrupt` footer) stays above the new launch card and idle composer; `status` published `agent=busy` (`reason status row: spinner`) for 2+ minutes, until the new session's first turn · user and host redacted at equal length, conversation id zeroed
+user@host-redacted-xxx proj % claude --model haiku
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   ~/scratch.noindex/stale-footer-busy-run/inst/proj
+
+
+❯ Reply with just the word hello.
+
+⏺ hello
+
+✻ Worked for 0s · done 9:51 AM
+
+❯ /exit
+
+· Flibbertigibbeting…
+  ⎿  Tip: Share Claude Code and earn $10 in usage credits · /passes
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt · ← for agents
+
+Resume this session with:
+claude --resume 00000000-0000-0000-0000-000000000000
+user@host-redacted-xxx proj % claude --model haiku
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   ~/scratch.noindex/stale-footer-busy-run/inst/proj
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "edit <filepath> to..."
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

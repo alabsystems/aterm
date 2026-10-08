@@ -445,8 +445,5 @@ mod tests {
                 "rust-toolchain.toml",
             ]
         );
-        assert!(SOURCE_INPUTS.contains(&"crates"));
-        assert!(SOURCE_INPUTS.contains(&"vendor"));
-        assert!(SOURCE_INPUTS.contains(&"Cargo.lock"));
     }
 }

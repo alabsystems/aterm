@@ -1966,19 +1966,7 @@ impl CompiledUi {
             self.fingerprint(),
         )];
         lines.extend(self.paint.iter().map(|paint| self.paint_node_audit(paint)));
-        lines.extend(audits.into_iter().map(|audit| {
-            format!(
-                "paint-text key={:?} kind={} overflow={} clip-truncated={} required={:.1} available={:.1} authored-available={:.1} painted={:?}",
-                audit.key.as_str(),
-                audit.kind,
-                audit.overflow,
-                audit.clip_truncated,
-                audit.required,
-                audit.available,
-                audit.authored_available,
-                audit.painted,
-            )
-        }));
+        lines.extend(audits.iter().map(text_fit_line));
         for paint in &self.paint {
             match &paint.content {
                 UiContent::SettingsPreview(spec) => {
@@ -2012,12 +2000,54 @@ impl CompiledUi {
         lines
     }
 
+    /// Every fit failure [`Self::paint_audit_lines`] reports, WITHOUT formatting
+    /// the whole audit: a text node whose fit audit overflows (clip truncation
+    /// included — [`finish_text_fit`] folds it into `overflow`), a node an
+    /// ancestor clip materially cuts (the summary's `clipped=`), and a text
+    /// viewport whose `paint-editor` record says `clip-truncated=true`. Each
+    /// failure is the audit's own record for that node, so a caller that finds
+    /// this non-empty can print it as-is. It is the cheap form of "zero
+    /// overflow, zero clipped" for sweeps that compile thousands of pages: the
+    /// full audit renders a `paint-node` record per node, each with a linear
+    /// semantic and focus-order lookup, and only a failure needs to read it.
+    #[cfg(test)]
+    pub(crate) fn fit_failures(&self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for paint in &self.paint {
+            if let Some(audit) = text_fit_audit(paint).filter(|audit| audit.overflow) {
+                failures.push(text_fit_line(&audit));
+            }
+            if materially_clipped(paint.rect, paint.clip) {
+                failures.push(self.paint_node_audit(paint));
+            }
+            if let UiContent::TextViewport(spec) = &paint.content {
+                let line = text_viewport_paint_audit(paint, spec);
+                if line.contains(" clip-truncated=true ") {
+                    failures.push(line);
+                }
+            }
+        }
+        failures
+    }
+
+    /// The `paint-text` record [`Self::paint_audit_lines`] prints for the FIRST
+    /// painted node keyed `key` that has a text-fit audit — the same line, built
+    /// without building the rest of the audit.
+    #[cfg(test)]
+    pub(crate) fn text_fit_audit_line(&self, key: &UiKey) -> Option<String> {
+        self.paint
+            .iter()
+            .filter(|paint| paint.key == *key)
+            .find_map(text_fit_audit)
+            .map(|audit| text_fit_line(&audit))
+    }
+
     fn paint_node_audit(&self, paint: &PaintNode) -> String {
         let semantic = self.semantic(&paint.key);
         let role = semantic.map_or_else(|| "-".to_string(), |node| format!("{:?}", node.role));
         let label = semantic.map_or_else(String::new, |node| node.label.clone());
         let value =
-            semantic.map_or_else(|| "-".to_string(), |node| audit_semantic_value(&node.value));
+            semantic.map_or_else(|| "-".to_string(), |node| semantic_value_words(&node.value));
         let action = semantic
             .and_then(|node| node.action.as_ref())
             .map_or("-", ActionId::as_str);
@@ -2356,7 +2386,8 @@ fn text_viewport_fingerprint(spec: &TextViewportSpec) -> u64 {
     hash.finish() | 1
 }
 
-fn audit_semantic_value(value: &SemanticValue) -> String {
+/// A semantic value as the audit and the control verbs print it.
+pub(crate) fn semantic_value_words(value: &SemanticValue) -> String {
     match value {
         SemanticValue::None => "-".to_string(),
         SemanticValue::Text(value) => format!("{value:?}"),
@@ -2414,6 +2445,21 @@ struct TextFitAudit {
     available: f32,
     authored_available: f32,
     painted: String,
+}
+
+/// The `paint-text` audit record for one text-fit audit.
+fn text_fit_line(audit: &TextFitAudit) -> String {
+    format!(
+        "paint-text key={:?} kind={} overflow={} clip-truncated={} required={:.1} available={:.1} authored-available={:.1} painted={:?}",
+        audit.key.as_str(),
+        audit.kind,
+        audit.overflow,
+        audit.clip_truncated,
+        audit.required,
+        audit.available,
+        audit.authored_available,
+        audit.painted,
+    )
 }
 
 fn effective_horizontal_width(node: &PaintNode, left: f32, right: f32) -> f32 {
@@ -5928,7 +5974,7 @@ fn resolve_length(length: Length, available: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// THE LOG'S MARK IS THE BAND'S ICON (rulings 262 and 263): the icon is
@@ -7101,6 +7147,47 @@ mod tests {
         assert_eq!(position(&live_features), position(&inert_features));
     }
 
+    /// `CompiledUi::fit_failures` is the cheap verdict the zero-overflow sweeps
+    /// assert on instead of the full paint audit. Pin it to the audit it replaces:
+    /// its records are EXACTLY the audit lines the full-audit check selected
+    /// (`overflow=true`, `clip-truncated=true`, and the `clipped=true` paint-node
+    /// records the summary's `clipped=` counts), and it is empty exactly when the
+    /// full audit's summary reads `overflow=0` and `clipped=0` with no such line.
+    fn assert_fit_failures_match_full_audit(compiled: &CompiledUi) -> Vec<String> {
+        let audit = compiled.paint_audit_lines();
+        let summary = &audit[0];
+        let selected = audit[1..]
+            .iter()
+            .filter(|line| {
+                line.contains("overflow=true")
+                    || line.contains("clip-truncated=true")
+                    || (line.starts_with("paint-node ") && line.contains(" clipped=true "))
+            })
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let failures = compiled.fit_failures();
+        assert_eq!(
+            failures
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            selected,
+            "fit_failures must be the full audit's failure records"
+        );
+        assert_eq!(
+            failures.len(),
+            selected.len(),
+            "fit_failures reports each failure record once"
+        );
+        let clean_summary = summary.contains(" overflow=0 ") && summary.contains(" clipped=0 ");
+        assert_eq!(
+            failures.is_empty(),
+            clean_summary && selected.is_empty(),
+            "fit_failures passes exactly when the full audit passes: {summary}"
+        );
+        failures
+    }
+
     #[test]
     fn paint_audit_reports_exact_text_and_button_overflow() {
         let tree = UiTree::new(
@@ -7121,10 +7208,24 @@ mod tests {
             ]),
         );
         let compiled = tree
+            .clone()
             .compile(LogicalRect::new(0.0, 0.0, 140.0, 100.0))
             .expect("audit fixture compiles");
         let audit = compiled.paint_audit_lines();
         assert!(audit[0].contains("text-nodes=2 overflow=2"));
+        let failures = assert_fit_failures_match_full_audit(&compiled);
+        assert_eq!(
+            failures.len(),
+            2,
+            "both overflowing nodes fail the cheap verdict"
+        );
+        let roomy = tree
+            .compile(LogicalRect::new(0.0, 0.0, 1200.0, 100.0))
+            .expect("roomy audit fixture compiles");
+        assert!(
+            assert_fit_failures_match_full_audit(&roomy).is_empty(),
+            "the same tree with room to fit passes both verdicts"
+        );
         assert!(audit.iter().any(|line| {
             line.contains("key=\"long-text\"")
                 && line.contains("kind=text")
@@ -7182,6 +7283,19 @@ mod tests {
 
         let audit = compiled.paint_audit_lines();
         assert!(audit[0].contains("clipped=1"));
+        let failures = assert_fit_failures_match_full_audit(&compiled);
+        assert!(
+            failures
+                .iter()
+                .any(|line| line.starts_with("paint-node key=\"clipped-text\"")),
+            "the ancestor-clipped node fails the cheap verdict: {failures:?}"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|line| line.starts_with("paint-text key=\"clipped-text\"")),
+            "the clip-truncated text fails the cheap verdict: {failures:?}"
+        );
         assert!(audit.iter().any(|line| {
             line.starts_with("paint-node key=\"clipped-text\"")
                 && line.contains("rect=0.0,0.0,360.0,28.0")
@@ -7264,9 +7378,38 @@ mod tests {
                 && line.contains("minibuffer-active=false")
                 && line.contains("paint-fingerprint=")
         }));
+        assert!(
+            assert_fit_failures_match_full_audit(&editor).is_empty(),
+            "a roomy editor passes both verdicts"
+        );
+        // Cut by a clipped ancestor shorter than its authored height: the
+        // paint-editor record says clip-truncated=true, and the cheap verdict
+        // must report that record.
+        let clipped = UiTree::new(
+            UiNode::new(
+                "app",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+            )
+            .layout(Layout::column().clipped())
+            .children(vec![
+                editor_viewport()
+                    .root
+                    .layout(Layout::default().height(Length::Fixed(420.0))),
+            ]),
+        )
+        .compile(LogicalRect::new(0.0, 0.0, 760.0, 90.0))
+        .unwrap();
+        let failures = assert_fit_failures_match_full_audit(&clipped);
+        assert!(
+            failures.iter().any(|line| {
+                line.starts_with("paint-editor key=\"editor/buffer\"")
+                    && line.contains(" clip-truncated=true ")
+            }),
+            "a clip-truncated editor fails the cheap verdict: {failures:?}"
+        );
     }
 
-    fn button(key: &str, label: &str) -> UiNode {
+    pub(crate) fn button(key: &str, label: &str) -> UiNode {
         UiNode::new(
             key,
             UiContent::Button(Control::new(

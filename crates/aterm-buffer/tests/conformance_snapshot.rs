@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Conformance: the real `snapshot()` obeys the DERIVED isolation discipline.
+//! Conformance: the real `snapshot()` obeys the derived isolation discipline.
 //!
-//! `aterm_spec::derive::snapshot_model()` is the drift-free model of snapshot
-//! isolation: once a snapshot is taken, a later write must NOT leak into it
-//! (`SnapshotIsolated`: `leaked = 0`; `ty` catches a leak at `Buggy=1` in
-//! `aterm-spec/tests/derived_ring_ty.rs`). This binds that property to the real
-//! `Surface::snapshot` / `Snapshot::read_text`: a snapshot's view is captured at
-//! snapshot time and is unaffected by subsequent writes to the surface. The
-//! observed no-leak state is checked against the model's own `SnapshotIsolated`
-//! invariant. Pure Rust + real code, so it always runs.
+//! `aterm_spec::derive::snapshot_model()`'s `SnapshotIsolated` (`leaked = 0`):
+//! a write after `Surface::snapshot` does not reach `Snapshot::read_text`. The
+//! observed state is checked against the model's own invariant. Pure Rust, so
+//! it always runs.
 
+use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Edit, LineId, Range, Surface};
-mod support;
 use aterm_spec::derive::snapshot_model;
 use std::collections::BTreeMap;
-use support::{read_cap, write_cap};
 
 fn full_range() -> Range {
     Range {
@@ -42,8 +37,8 @@ fn real_snapshot_isolated_from_later_writes() {
     let snap_after = snap.read_text(&read_cap(), full_range()).text;
     let surface_now = s.read_text(&read_cap(), full_range()).text;
 
-    // Isolation: the snapshot's view is unchanged by the later write, and differs
-    // from the surface's new view. In the derived model this is exactly `leaked = 0`.
+    // The snapshot's view is unchanged and differs from the surface's new view
+    // (`leaked = 0`).
     assert_eq!(
         snap_after, captured,
         "snapshot view must be isolated from later writes (no leak)"

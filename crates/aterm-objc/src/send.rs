@@ -1,56 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One `unsafe fn` per C PROTOTYPE — the typed [`msg`] casts every send needs.
+//! One `unsafe fn` per C prototype — the typed [`msg`] casts every send needs.
 //!
-//! # Why these are in the RUNTIME crate and not in a binding layer
-//!
-//! This crate's charter says a send "casts [`msg`] to the EXACT prototype of
-//! the selector; a wrong prototype corrupts registers silently, so a typed cast
-//! per selector is the only sound form." These functions ARE that rule, written
-//! once per shape instead of once per call site — and every one of them is pure
-//! runtime: **not one names a framework class, a selector, or a framework
-//! symbol.** `send_v_usize(recv, sel, a)` knows nothing about AppKit. That is
-//! the test for whether something belongs here, and these pass it, so the
-//! module's presence does not weaken the "zero framework bindings" rule stated
-//! in [the crate note](crate) — the constants, the `NSString` globals and the
-//! class lookups that DO name AppKit stay with their callers.
-//!
-//! # Where they came from, and why they moved
-//!
-//! W2 wrote them in `aterm-gui`'s `appkit.rs` as `pub(crate)` helpers, where
-//! they grew to 35 shapes serving that crate's 206 distinct selectors. W8 needed
-//! the same shapes inside `vendor/winit`, which cannot import an `aterm-gui`
-//! private module — and the vendored fork is measured by a RATCHETED
-//! `third_party_loc`, so a second copy there would have charged ~500 lines of
-//! first-party ABI plumbing to the third-party budget the campaign exists to
-//! shrink, and left two copies of a safety-critical layer free to drift.
-//!
-//! Moving them here costs the fork nothing, gives `aterm-gui` the same
-//! functions under the same names (`appkit` re-exports this module), and leaves
-//! exactly ONE definition of each prototype in the tree. `appkit.rs`'s call
-//! sites — `toolbar.rs`'s 268 among them — are unchanged.
+//! Each helper is pure runtime: none names a framework class, selector or
+//! symbol, so they belong here rather than in a binding layer, and
+//! `aterm-gui` (re-exported from `appkit`) and `vendor/winit` share one
+//! definition of each prototype.
 //!
 //! # Ownership
 //!
-//! These are prototypes, not policy: none of them retains, releases or
-//! autoreleases, and none inspects the selector to guess whether the object it
-//! returns is +1 or +0. The CALLER decides, exactly as it must in Objective-C —
-//! an `alloc`/`new`/`copy`/`mutableCopy` result goes into [`Obj`] or
-//! [`Retained`]; anything else is BORROWED and lives until the enclosing
+//! None of these retains, releases or autoreleases. The caller decides: an
+//! `alloc`/`new`/`copy`/`mutableCopy` result goes into [`Obj`] or
+//! [`Retained`]; anything else is borrowed until the enclosing
 //! [`autoreleasepool`] pops.
 //!
 //! # Safety
 //!
-//! Every function here is `unsafe` for one reason: the caller asserts that the
-//! selector it passes really has the C prototype named in the function's name,
-//! and that `recv` is a live receiver that responds to it. Picking the wrong
-//! helper is the same defect as writing the wrong cast by hand, and has the
-//! same consequence — corrupted registers on both Apple ABIs.
+//! Every function is `unsafe` because the caller asserts that `sel` has the C
+//! prototype the function's name spells and that `recv` is a live receiver
+//! that responds to it. The wrong helper corrupts registers exactly as a wrong
+//! hand-written cast would.
 
 use crate::{Bool, CGPoint, CGRect, CGSize, ClassPtr, Id, Sel, msg};
 
-/// `+alloc` on `cls` — a +1, zero-filled, UNINITIALISED instance.
+/// `+alloc` on `cls` — a +1, zero-filled, uninitialised instance.
 ///
 /// # Safety
 /// `cls` must be a live, registered class. The result is +1 and the caller owes
@@ -294,26 +268,17 @@ pub unsafe fn send_f64(recv: Id, sel: Sel) -> f64 {
     }
 }
 
-/// `-(NSRect)sel`.
-///
-/// This is the shape that made `objc_msgSend_stret` a blocker (D4): an
-/// `NSRect` is 32 bytes, so on the `x86_64-apple-darwin` compat slice this send
-/// goes to a DIFFERENT entry point. No call site has to remember that —
-/// [`msg`] reads it off the return type in a `const` block.
+/// `-(NSRect)sel`. A 32-byte return, so on x86_64 [`msg`] routes it through
+/// `objc_msgSend_stret`.
 ///
 /// # Safety
 /// See the module note.
 #[must_use]
 pub unsafe fn send_rect(recv: Id, sel: Sel) -> CGRect {
-    // A nil receiver: libobjc zeroes REGISTER-class returns on the nil path
-    // (rax/rdx, xmm0/xmm1; d0-d3 on arm64) but never touches an INDIRECT
-    // struct return — and a 32-byte CGRect is `objc_msgSend_stret` on x86_64,
-    // so `[nil frame]` handed back whatever was on the stack (measured
-    // 2026-09-06 on an Intel Mac: 0xAB poison survives; clang-compiled ObjC
-    // only reads zero because clang wraps every stret send in its own nil
-    // check + memset). arm64 returns CGRect in d0-d3, zeroed, which is why the
-    // "nil returns zero" contract held on every dev machine. The check is the
-    // one clang makes.
+    // Nil receiver: libobjc zeroes register-class returns on the nil path but
+    // never writes an indirect struct return, and a 32-byte CGRect is
+    // `objc_msgSend_stret` on x86_64, so `[nil frame]` would return stack
+    // garbage. clang makes the same check around every stret send.
     if recv.is_null() {
         return CGRect::default();
     }
@@ -387,13 +352,8 @@ pub unsafe fn send_v_id_isize_id(recv: Id, sel: Sel, a: Id, b: isize, c: Id) {
     }
 }
 
-/// `-(NSPoint)sel` — `-[NSEvent locationInWindow]`.
-///
-/// An `NSPoint` is SIXTEEN bytes of two `f64`, which is the row of
-/// [`crate::returns_indirectly`]'s measured table that returns DIRECTLY on
-/// both arches — unlike the 32-byte [`send_rect`], which sits five functions
-/// ABOVE this one and takes the `_stret` entry on the compat slice. Neither
-/// call site has to know that; the choice is read off the return type.
+/// `-(NSPoint)sel` — `-[NSEvent locationInWindow]`. Sixteen bytes of two
+/// `f64`, returned directly on both architectures (unlike [`send_rect`]).
 ///
 /// # Safety
 /// See the module note.
@@ -420,7 +380,7 @@ pub unsafe fn send_point_point(recv: Id, sel: Sel, a: CGPoint) -> CGPoint {
 }
 
 /// `-(NSPoint)sel:(NSPoint)a fromView:(id)b` — `-[NSView
-/// convertPoint:fromView:]`, where a nil `b` means WINDOW coordinates.
+/// convertPoint:fromView:]`, where a nil `b` means window coordinates.
 ///
 /// # Safety
 /// See the module note.
@@ -454,7 +414,7 @@ pub unsafe fn send_rect_rect_id(recv: Id, sel: Sel, a: CGRect, b: Id) -> CGRect 
 }
 
 /// `-(id)sel:(NSUInteger)a` — `-[NSWindow standardWindowButton:]`, whose
-/// argument is an `NSWindowButton`: an `NSUInteger` enum, NOT an `NSInteger`.
+/// argument is an `NSWindowButton`: an `NSUInteger` enum, not an `NSInteger`.
 ///
 /// # Safety
 /// See the module note, including the ownership paragraph.
@@ -517,9 +477,8 @@ pub unsafe fn send_id_rect_usize_id_id(
 }
 
 /// `-(id)sel:(id)a target:(id)b action:(SEL)c` — `+[NSButton
-/// buttonWithTitle:target:action:]`. The MIRROR of [`send_id_id_sel_id`]: same
-/// three arguments, `SEL` in the LAST position rather than the middle, which is
-/// exactly the distinction a shared `*const c_void` spelling would have lost.
+/// buttonWithTitle:target:action:]`. The mirror of [`send_id_id_sel_id`], with
+/// `SEL` last.
 ///
 /// # Safety
 /// See the module note, including the ownership paragraph.
@@ -533,10 +492,8 @@ pub unsafe fn send_id_id_id_sel(recv: Id, sel: Sel, a: Id, b: Id, c: Sel) -> Id 
 }
 
 // ---------------------------------------------------------------------------
-// W8. The shapes `vendor/winit`'s `window_delegate.rs` and `view.rs` need that
-// `aterm-gui` never did. Each carries the SDK declaration it was derived from,
-// because the prototype IS the safety obligation and a reader who cannot
-// re-derive it cannot check it.
+// Shapes `vendor/winit` needs. Each carries the SDK declaration it was derived
+// from, since the prototype is the safety obligation.
 // ---------------------------------------------------------------------------
 
 /// `-(void)sel:(NSRect)a flag:(BOOL)b`.
@@ -587,18 +544,12 @@ pub unsafe fn send_v_id_isize(recv: Id, sel: Sel, a: Id, b: isize) {
 ///
 /// `NSKeyValueObserving.h` — `-addObserver:(NSObject *)observer
 /// forKeyPath:(NSString *)keyPath options:(NSKeyValueObservingOptions)options
-/// context:(void *)context`.
-///
-/// THE `context:` ARGUMENT IS `^v`, NOT `@`, and this crate has been wrong
-/// about that before: the note on [`crate::IvarSlot`] records "a mutable raw
-/// void pointer in a method position always means `id`" as a claim the KVO
-/// registration refutes. It is a bare pointer AppKit stores and hands back
-/// verbatim; it is never messaged and never retained.
+/// context:(void *)context`. `context:` is `^v`, not `@`: a bare pointer AppKit
+/// stores and hands back verbatim, never messaged or retained.
 ///
 /// # Safety
-/// See the module note. `d` is stored by the observed object and returned to
-/// the observer unchanged — it is not dereferenced here and must satisfy
-/// whatever the observing method assumes of it.
+/// See the module note. `d` is not dereferenced here and must satisfy whatever
+/// the observing method assumes of it.
 pub unsafe fn send_v_id_id_usize_ptr(
     recv: Id,
     sel: Sel,
@@ -616,13 +567,12 @@ pub unsafe fn send_v_id_id_usize_ptr(
 
 /// `-(void)sel:(SEL)a withObject:(id)b afterDelay:(NSTimeInterval)c`.
 ///
-/// `NSRunLoop.h` — `-performSelector:(SEL)aSelector withObject:(id)anArgument
-/// afterDelay:(NSTimeInterval)delay`. `NSTimeInterval` is `double`.
+/// `NSRunLoop.h` — `-performSelector:withObject:afterDelay:`.
+/// `NSTimeInterval` is `double`.
 ///
 /// # Safety
-/// See the module note. `a` is scheduled, not sent, so `recv` must still be
-/// live when the run loop reaches it — the send itself does not retain, but
-/// `-performSelector:withObject:afterDelay:` does.
+/// See the module note. `-performSelector:withObject:afterDelay:` retains
+/// `recv` until the run loop performs `a`.
 pub unsafe fn send_v_sel_id_f64(recv: Id, sel: Sel, a: Sel, b: Id, c: f64) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
@@ -649,21 +599,10 @@ pub unsafe fn send_v_id_sel_id_id(recv: Id, sel: Sel, a: Id, b: Sel, c: Id, d: I
 
 /// `+(id)sel:(const id *)a count:(NSUInteger)b`.
 ///
-/// `NSArray.h` — `+arrayWithObjects:(const ObjectType _Nonnull [])objects
-/// count:(NSUInteger)cnt`, the one array constructor that does not need a
-/// nil-terminated variadic list. A VARIADIC send would be the wrong shape on
-/// AAPCS64 (see the crate note), which is why this counted form is the one
-/// used.
-///
-/// # `idptr`, not `ptr`, and the census is why
-///
-/// This was `send_id_ptr_usize` for one commit, sharing the `ptr` token with
-/// [`send_v_id_id_usize_ptr`]'s KVO `context:`. They are NOT the same argument:
-/// `context:` encodes `^v` (a bare `void *` the runtime never touches) and this
-/// one encodes `r^@` — a CONST pointer to object pointers, which Foundation
-/// dereferences `b` times and retains each element of. The Rust types were
-/// always right (`*mut c_void` against `*const Id`); the NAMES were not, and
-/// `winit_sent_prototypes.rs` said so the first time it ran.
+/// `NSArray.h` — `+arrayWithObjects:count:`, the counted form; a variadic send
+/// would be the wrong shape on AAPCS64. `idptr`, not `ptr`: the argument
+/// encodes `r^@` (Foundation reads and retains `b` elements), unlike the KVO
+/// `context:` `^v` of [`send_v_id_id_usize_ptr`].
 ///
 /// # Safety
 /// See the module note, including the ownership paragraph. `a` must point to
@@ -682,12 +621,9 @@ pub unsafe fn send_id_idptr_usize(recv: Id, sel: Sel, a: *const Id, b: usize) ->
 /// `NSWindow.h` — `-contentRectForFrameRect:(NSRect)frameRect`;
 /// `NSView.h` — `-convertRectToScreen:(NSRect)rect`.
 ///
-/// Both the argument and the return are 32-byte homogeneous floating-point
-/// aggregates, so on AAPCS64 the argument goes in `d0`-`d3` and the result
-/// comes back in `d0`-`d3` — neither takes the indirect path. [`msg`] picks
-/// `objc_msgSend_stret` from the RETURN type on `x86_64` and this shape is one
-/// of the cases where the two ABIs genuinely differ; see
-/// [`crate::returns_indirectly`].
+/// On AAPCS64 both the argument and the return are homogeneous float
+/// aggregates in `d0`-`d3`; on x86_64 the return is `_stret` (see
+/// [`crate::returns_indirectly`]).
 ///
 /// # Safety
 /// See the module note.
@@ -705,27 +641,16 @@ pub unsafe fn send_rect_rect(recv: Id, sel: Sel, a: CGRect) -> CGRect {
     }
 }
 
-/// `-(NSInteger)sel:(NSUInteger)a` — MIXED SIGNEDNESS, and it is measured.
+/// `-(NSInteger)sel:(NSUInteger)a` — `-[NSApplication requestUserAttention:]`.
 ///
-/// `NSApplication.h` — `-requestUserAttention:(NSRequestUserAttentionType)`
-/// returns the request identifier, which every caller in this tree discards.
-/// It is still declared with its real return type: reading the result is
-/// optional, DECLARING it is not, because a prototype that returns `()` where
-/// the IMP returns a word is a different function type.
-///
-/// THE ARGUMENT IS UNSIGNED AND THE RETURN IS SIGNED, which is not a shape
-/// anything else here has and is not what it was first written as. This helper
-/// was `send_isize_isize` until `method_getTypeEncoding` was asked:
+/// Mixed signedness, as the runtime reports it:
 ///
 /// ```text
 /// NSApplication  requestUserAttention:  q24@0:8Q16
 /// ```
 ///
-/// `q` out, `Q` in. `NSRequestUserAttentionType` is an `NSUInteger` enum while
-/// `NSModalResponse`-style identifiers are `NSInteger`, and the selector
-/// straddles the two. Nothing would have caught it at runtime — both are 64-bit
-/// words on both Apple ABIs and the only two values passed are 0 and 10 — which
-/// is exactly why the encodings are read rather than reasoned about.
+/// The return is declared even though callers discard it, since a `()`
+/// prototype is a different function type.
 ///
 /// # Safety
 /// See the module note.
@@ -739,15 +664,13 @@ pub unsafe fn send_isize_usize(recv: Id, sel: Sel, a: usize) -> isize {
 
 /// `-(NSInteger)sel:(NSRect)a owner:(id)b userData:(void *)c assumeInside:(BOOL)d`.
 ///
-/// `NSView.h` — `-addTrackingRect:(NSRect)rect owner:(id)owner
-/// userData:(void *)data assumeInside:(BOOL)flag`, returning an
-/// `NSTrackingRectTag` (an `NSInteger`). `userData` is `^v` and is handed back
-/// verbatim to the owner's mouse-entered/exited rows; see the note on
-/// [`send_v_id_id_usize_ptr`].
+/// `NSView.h` — `-addTrackingRect:owner:userData:assumeInside:`, returning an
+/// `NSTrackingRectTag` (`NSInteger`). `userData` is `^v`, handed back verbatim
+/// to the owner's mouse-entered/exited rows.
 ///
 /// # Safety
-/// See the module note. `b` is retained by neither the view nor this send, so
-/// it must outlive the tracking rect or be removed first.
+/// See the module note. `b` is not retained, so it must outlive the tracking
+/// rect or be removed first.
 pub unsafe fn send_isize_rect_id_ptr_bool(
     recv: Id,
     sel: Sel,
@@ -772,11 +695,8 @@ pub unsafe fn send_isize_rect_id_ptr_bool(
 
 /// `-(unsigned short)sel`.
 ///
-/// `NSEvent.h` — `-keyCode`, the ONE selector in either ported tree whose
-/// return is narrower than a word. It is `unsigned short`, not `NSUInteger`,
-/// and the difference is not academic: a prototype claiming a full word would
-/// read the upper 48 bits of `x0`, which AAPCS64 leaves UNSPECIFIED for a
-/// `short` return.
+/// `NSEvent.h` — `-keyCode`. Not `NSUInteger`: AAPCS64 leaves the upper 48 bits
+/// of `x0` unspecified for a `short` return.
 ///
 /// # Safety
 /// See the module note.
@@ -791,11 +711,8 @@ pub unsafe fn send_u16(recv: Id, sel: Sel) -> u16 {
 
 /// `-(BOOL)sel:(NSInteger)a`.
 ///
-/// `NSApplication.h` — `-setActivationPolicy:`, which ANSWERS whether the
-/// policy was accepted. The fork ignores that answer, exactly as it did through
-/// `objc2-app-kit`'s binding, and the return type is still part of the
-/// prototype: a `void` declaration would leave `x0` unread, which is harmless
-/// here and wrong in general, and the census compares the whole string.
+/// `NSApplication.h` — `-setActivationPolicy:`. Callers ignore the answer, but
+/// the return type is part of the prototype.
 ///
 /// # Safety
 /// See the module note.
@@ -809,8 +726,8 @@ pub unsafe fn send_bool_isize(recv: Id, sel: Sel, a: isize) -> bool {
 
 /// `-(void)sel:(id)a atStart:(BOOL)b`.
 ///
-/// `NSApplication.h` — `-postEvent:atStart:`, the send `stop_app_immediately`
-/// makes to wake `-[NSApplication run]` out of its own event wait.
+/// `NSApplication.h` — `-postEvent:atStart:`, used to wake `-[NSApplication
+/// run]` out of its event wait.
 ///
 /// # Safety
 /// See the module note.
@@ -824,36 +741,12 @@ pub unsafe fn send_v_id_bool(recv: Id, sel: Sel, a: Id, b: bool) {
 
 /// `-(unsigned int)sel`.
 ///
-/// `NSValue.h` — `-unsignedIntValue`, which `monitor.rs` reads off the
-/// `@"NSScreenNumber"` entry of `-[NSScreen deviceDescription]` to get a
-/// `CGDirectDisplayID`.
+/// `NSValue.h` — `-unsignedIntValue`, read off `-[NSScreen deviceDescription]`'s
+/// `@"NSScreenNumber"` to get a `CGDirectDisplayID` (`uint32_t`).
 ///
-/// THE SECOND NARROW RETURN IN THE TREE, and it is narrow for a different
-/// reason than [`send_u16`]'s: `-keyCode` is a `short` because the SDK says so,
-/// while this one is `unsigned int` because `CGDirectDisplayID` is a `uint32_t`
-/// and `NSNumber` has an accessor per C type. objc2's `NSNumber::as_u32` is
-/// this selector; the fork's `get_display_id` called it through that binding.
-///
-/// # ITS SEVERITY IS MEASURED, AND IT IS LOW — stated rather than inflated
-///
-/// The reasoning that would put this beside [`send_u16`] is that `Q` reads the
-/// upper 32 bits of `x0`, which AAPCS64 leaves UNSPECIFIED for an `int` return.
-/// That is true of the ABI and NOT true of what this implementation does.
-/// Measured on this box through both prototypes, over
-/// `+[NSNumber numberWithUnsignedLong:]` values `0`, `1`, `0x7fff_ffff`,
-/// `0xffff_ffff` and `0x1234_5678`:
-///
-/// ```text
-/// v=0xffffffff  send_u32=0xffffffff  send_usize=0x00000000ffffffff
-/// v=0x12345678  send_u32=0x12345678  send_usize=0x0000000012345678
-/// ```
-///
-/// — the upper word is zero every time. And the fork's one caller assigns the
-/// result to a `u32`, so a `Q` prototype would truncate to the same number even
-/// if it were not. So this helper exists because the RUNTIME says `I` and the
-/// census checks the letter, not because a wrong letter here is currently
-/// observable. `send_u16`'s case is the one that bites: a `short` return really
-/// does leave the upper bits dirty.
+/// AAPCS64 leaves the upper 32 bits of `x0` unspecified for an `int` return;
+/// in practice Foundation zeroes them, so this helper exists because the
+/// runtime encodes `I` and the prototype census checks the letter.
 ///
 /// # Safety
 /// See the module note.
@@ -868,10 +761,8 @@ pub unsafe fn send_u32(recv: Id, sel: Sel) -> u32 {
 
 /// `-(BOOL)sel:(Class)a`.
 ///
-/// `NSObject.h` — `-isKindOfClass:(Class)aClass`. A `Class` is an object
-/// pointer at the ABI, but it is a DIFFERENT argument than an instance and the
-/// helper says so rather than letting a call site launder one into the other
-/// through [`ClassPtr::as_id`].
+/// `NSObject.h` — `-isKindOfClass:(Class)aClass`. Takes a [`ClassPtr`] rather
+/// than laundering one through [`ClassPtr::as_id`].
 ///
 /// # Safety
 /// See the module note.
@@ -887,7 +778,6 @@ pub unsafe fn send_bool_cls(recv: Id, sel: Sel, a: ClassPtr) -> bool {
 /// `+(id)keyEventWithType:location:modifierFlags:timestamp:windowNumber:`
 /// `context:characters:charactersIgnoringModifiers:isARepeat:keyCode:`.
 ///
-/// TEN arguments, and the only send in either tree that needs its own shape.
 /// `NSEvent.h` declares it
 ///
 /// ```text
@@ -903,11 +793,8 @@ pub unsafe fn send_bool_cls(recv: Id, sel: Sel, a: ClassPtr) -> bool {
 ///                               keyCode:(unsigned short)code;
 /// ```
 ///
-/// `NSEventType` and `NSEventModifierFlags` are both `NSUInteger`;
-/// `NSTimeInterval` is `double`; `keyCode` is `unsigned short` (see
-/// [`send_u16`]). The name is mechanical, like every other shape here, because
-/// a shape whose name is a nickname cannot be checked against its own
-/// signature by reading.
+/// `NSEventType` and `NSEventModifierFlags` are `NSUInteger`; `NSTimeInterval`
+/// is `double`; `keyCode` is `unsigned short` (see [`send_u16`]).
 ///
 /// # Safety
 /// See the module note, including the ownership paragraph — the result is +0
@@ -963,23 +850,11 @@ pub unsafe fn send_id_usize_point_usize_f64_isize_id_id_id_bool_u16(
 ///                                    data2:(NSInteger)d2;
 /// ```
 ///
-/// # `subtype:` is a SIGNED SHORT, and it is the only one of its kind here
-///
-/// Every other narrow integer in this module is `unsigned short` — `keyCode:`,
-/// which [`send_u16`] exists for. `subtype:` is not: the header spells it bare
-/// `short`, and the runtime agrees. The full encoding, read from
-/// `method_getTypeEncoding` rather than derived from the header, is
+/// `subtype:` is a signed `short` (`s`, not `S`), per the runtime:
 ///
 /// ```text
 /// @92@0:8Q16{CGPoint=dd}24Q40d48q56@64s72q76q84
 /// ```
-///
-/// — note the `s` at offset 72, where `S` would be the unsigned twin. This is
-/// the same class of distinction as the `-requestUserAttention:` defect W8
-/// shipped and this crate's prototype census caught: two spellings that occupy
-/// the same register and differ only in sign. `NSEventSubtypeWindowExposed` is
-/// 0, so no value the fork passes could ever have exposed the difference at
-/// runtime, which is exactly why it is written from the encoding.
 ///
 /// # Safety
 /// See the module note, including the ownership paragraph — the result is +0
@@ -1019,32 +894,21 @@ pub unsafe fn send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
 }
 
 // ---------------------------------------------------------------------------
-// W9 phase 2 — the shapes `cursor.rs` and `view.rs` need.
-//
-// Six, and TWO OF THEM ARE HERE BECAUSE THE RUNTIME DISAGREED WITH THE
-// BINDING'S APPEARANCE. `-magnification` is `d16@0:8` and `-rotation` is
-// `f16@0:8`: the two are adjacent properties on `NSEvent`, both feed a gesture
-// event, both read as "a float" in Rust — and one of them is a `float` while
-// the other is a `double`. On AAPCS64 a `float` return arrives in `s0`, the low
-// half of `d0`, so reading it with the `d` prototype yields a denormal built
-// out of the caller's stale high bits rather than a wrong-but-plausible number.
-// Nothing but `method_getTypeEncoding` distinguishes them, which is what
-// [`send_f32`] exists for.
+// Shapes `cursor.rs` and `view.rs` need. `-magnification` is `d16@0:8` but
+// `-rotation` is `f16@0:8`: on AAPCS64 a `float` return arrives in `s0`, so
+// reading it with the `double` prototype yields garbage. Only
+// `method_getTypeEncoding` tells them apart, hence [`send_f32`].
 // ---------------------------------------------------------------------------
 
-/// `-(float)sel` — a C `float`, NOT a `CGFloat`.
+/// `-(float)sel` — a C `float`, not a `CGFloat`.
 ///
 /// ```text
 /// NSEvent  rotation  f16@0:8
 /// NSEvent  pressure  f16@0:8
 /// ```
 ///
-/// Both are `float` in `NSEvent.h` (`@property(readonly) float rotation;`)
-/// while every geometric quantity beside them — `-magnification`,
-/// `-scrollingDeltaX`, `-timestamp` — is `double`. [`send_f64`] is the wrong
-/// prototype for these two and would not have been caught by any value they
-/// carry: a rotation of `0.0` reads back `0.0` under either cast, because the
-/// register happens to be zero.
+/// Neighbouring properties (`-magnification`, `-scrollingDeltaX`,
+/// `-timestamp`) are `double`; [`send_f64`] is the wrong prototype for these.
 ///
 /// # Safety
 /// See the module note.
@@ -1059,14 +923,12 @@ pub unsafe fn send_f32(recv: Id, sel: Sel) -> f32 {
 
 /// `-(id)sel:(SEL)a`.
 ///
-/// `NSObject.h` — `-performSelector:(SEL)aSelector`, which `cursor.rs` uses to
-/// reach the undocumented `+[NSCursor _helpCursor]` family by name.
+/// `NSObject.h` — `-performSelector:`, used to reach the undocumented
+/// `+[NSCursor _helpCursor]` family by name.
 ///
 /// # Safety
-/// See the module note, including the ownership paragraph. `-performSelector:`
-/// returns whatever the invoked method returns under ITS OWN convention: the
-/// cursor selectors here are `+…Cursor` accessors, so the result is +0
-/// autoreleased and must not be released.
+/// See the module note, including the ownership paragraph. The result follows
+/// the invoked method's convention; the `+…Cursor` accessors return +0.
 #[must_use]
 pub unsafe fn send_id_sel(recv: Id, sel: Sel, a: Sel) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1078,21 +940,9 @@ pub unsafe fn send_id_sel(recv: Id, sel: Sel, a: Sel) -> Id {
 
 /// `-(NSUInteger)sel:(NSUInteger)a`.
 ///
-/// `NSString.h` — `-lengthOfBytesUsingEncoding:(NSStringEncoding)enc`, read as
-/// `Q24@0:8Q16`.
-///
-/// # Why this shape is not a nicety
-///
-/// `objc2-foundation` spells two different selectors as two nearly identical
-/// Rust methods: `NSString::len()` is
-/// `-lengthOfBytesUsingEncoding:NSUTF8StringEncoding` — a UTF-8 BYTE count —
-/// and `NSString::len_utf16()` is `-length`, a UTF-16 CODE UNIT count. `view.rs`
-/// calls both, three lines apart, on the IME pre-edit path: `-length` clamps
-/// the index the input method proposes, and the byte count is what winit's
-/// `Ime::Preedit` cursor range is measured in. Porting both to `-length` would
-/// compile, would be exactly right for ASCII, and would put the pre-edit
-/// caret in the wrong place for every non-ASCII composition — which is most of
-/// what an IME is for.
+/// `NSString.h` — `-lengthOfBytesUsingEncoding:` (`Q24@0:8Q16`): a UTF-8 byte
+/// count, as opposed to `-length`'s UTF-16 code units. The IME pre-edit path
+/// needs both, and confusing them misplaces the caret for non-ASCII text.
 ///
 /// # Safety
 /// See the module note.
@@ -1107,14 +957,12 @@ pub unsafe fn send_usize_usize(recv: Id, sel: Sel, a: usize) -> usize {
 
 /// `-(unsigned char *)sel` — an interior pointer into the receiver's storage.
 ///
-/// `NSBitmapImageRep.h` — `-bitmapData`, read as `*16@0:8`. The `*` is the
-/// runtime's spelling of `char *`, which is what `@encode(unsigned char *)`
-/// reduces to; it is NOT `^C`.
+/// `NSBitmapImageRep.h` — `-bitmapData`, encoded `*16@0:8` (`*` is the
+/// runtime's `char *`, not `^C`).
 ///
 /// # Safety
-/// See the module note. The pointer is INTERIOR to `recv` and is valid only
-/// while `recv` is alive and its buffer un-reallocated; writing through it is
-/// writing into the receiver's pixels.
+/// See the module note. The pointer is valid only while `recv` is alive and its
+/// buffer is not reallocated; writes go into the receiver's pixels.
 #[must_use]
 pub unsafe fn send_charptr(recv: Id, sel: Sel) -> *mut core::ffi::c_uchar {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1126,23 +974,13 @@ pub unsafe fn send_charptr(recv: Id, sel: Sel) -> *mut core::ffi::c_uchar {
 
 /// `-(id)sel:(const void *)a length:(NSUInteger)b`.
 ///
-/// `NSData.h` — `-initWithBytes:(const void *)bytes length:(NSUInteger)length`,
-/// read as `@32@0:8r^v16Q24`.
-///
-/// # `cptr`, not `ptr`, and it is the same distinction the census already made
-///
-/// [`send_v_id_id_usize_ptr`]'s KVO `context:` is `^v` — a bare `void *` the
-/// runtime stores and hands back untouched. This one is `r^v`: a CONST pointer
-/// Foundation reads `b` bytes out of and copies. They occupy the same register
-/// and encode differently, which is precisely the pair
-/// `winit_sent_prototypes.rs` was written to keep apart, so the name carries
-/// the difference rather than the comment.
+/// `NSData.h` — `-initWithBytes:length:`, encoded `@32@0:8r^v16Q24`. `cptr`
+/// (`r^v`, read and copied) as opposed to `ptr` (`^v`, stored untouched).
 ///
 /// # Safety
-/// See the module note, including the ownership paragraph — `-initWithBytes:`
-/// is an initialiser and its result is +1. `a` must point to at least `b`
-/// readable bytes for the duration of the call; they are COPIED, so the buffer
-/// may be freed afterwards.
+/// See the module note, including the ownership paragraph — an initialiser, so
+/// the result is +1. `a` must point to at least `b` readable bytes for the
+/// call; they are copied.
 #[must_use]
 pub unsafe fn send_id_cptr_usize(recv: Id, sel: Sel, a: *const core::ffi::c_void, b: usize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1169,26 +1007,21 @@ pub unsafe fn send_id_cptr_usize(recv: Id, sel: Sel, a: *const core::ffi::c_void
 ///                             bitsPerPixel:(NSInteger)pBits;
 /// ```
 ///
-/// Read from the runtime rather than the header:
+/// As the runtime encodes it:
 ///
 /// ```text
 /// @88@0:8^*16q24q32q40q48B56B60@64q72q80
 /// ```
 ///
-/// — ten arguments plus `self` and `_cmd`, so four of them are passed on the
-/// STACK on AAPCS64 rather than in `x0`-`x7`. That is the reason a shape this
-/// long is written out in full instead of approximated: a variadic declaration
-/// would place them somewhere else entirely, and the two `B`s at offsets 56 and
-/// 60 are single BYTES the caller must not widen.
-///
-/// `planeptr` is `^*` — a pointer to `char *`, i.e. an ARRAY of plane pointers
-/// — and is distinct from both `ptr` (`^v`) and `cptr` (`r^v`). `cursor.rs`
-/// passes null, which asks the receiver to allocate its own buffer.
+/// Four arguments go on the stack on AAPCS64, and the two `B`s are single
+/// bytes the caller must not widen. `planeptr` is `^*`, an array of plane
+/// pointers (distinct from `ptr` `^v` and `cptr` `r^v`); null asks the receiver
+/// to allocate its own buffer.
 ///
 /// # Safety
-/// See the module note, including the ownership paragraph — this is an
-/// initialiser and its result is +1. `a` must be null or point to `spp` plane
-/// pointers; `h` must be a live `NSColorSpaceName` (an `NSString`).
+/// See the module note, including the ownership paragraph — an initialiser, so
+/// the result is +1. `a` must be null or point to `spp` plane pointers; `h`
+/// must be a live `NSColorSpaceName` (an `NSString`).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn send_id_planeptr_isize_isize_isize_isize_bool_bool_id_isize_isize(
@@ -1240,14 +1073,12 @@ pub unsafe fn send_id_planeptr_isize_isize_isize_isize_bool_bool_id_isize_isize(
 
 /// `-(id)sel:(NSSize)a`.
 ///
-/// `NSImage.h` — `-initWithSize:(NSSize)size`, read as `@32@0:8{CGSize=dd}16`.
-/// A 16-byte homogeneous floating-point aggregate, so it goes in `d0`/`d1` on
-/// AAPCS64 and in `xmm0`/`xmm1` on the compat slice; neither is an indirect
-/// argument.
+/// `NSImage.h` — `-initWithSize:`, encoded `@32@0:8{CGSize=dd}16`; passed in
+/// `d0`/`d1` (AAPCS64) or `xmm0`/`xmm1` (x86_64).
 ///
 /// # Safety
-/// See the module note, including the ownership paragraph — this is an
-/// initialiser and its result is +1.
+/// See the module note, including the ownership paragraph — an initialiser, so
+/// the result is +1.
 #[must_use]
 pub unsafe fn send_id_size(recv: Id, sel: Sel, a: CGSize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1259,13 +1090,11 @@ pub unsafe fn send_id_size(recv: Id, sel: Sel, a: CGSize) -> Id {
 
 /// `-(id)sel:(id)a hotSpot:(NSPoint)b`.
 ///
-/// `NSCursor.h` — `-initWithImage:(NSImage *)newImage hotSpot:(NSPoint)point`,
-/// read as `@40@0:8@16{CGPoint=dd}24`.
+/// `NSCursor.h` — `-initWithImage:hotSpot:`, encoded `@40@0:8@16{CGPoint=dd}24`.
 ///
 /// # Safety
-/// See the module note, including the ownership paragraph — this is an
-/// initialiser and its result is +1. `a` must be a live `NSImage`; the receiver
-/// retains it for itself.
+/// See the module note, including the ownership paragraph — an initialiser, so
+/// the result is +1. `a` must be a live `NSImage`; the receiver retains it.
 #[must_use]
 pub unsafe fn send_id_id_point(recv: Id, sel: Sel, a: Id, b: CGPoint) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1278,24 +1107,18 @@ pub unsafe fn send_id_id_point(recv: Id, sel: Sel, a: Id, b: CGPoint) -> Id {
 /// `-(id)sel:(id)a withInteger:(NSInteger)b`.
 ///
 /// `NSBitmapImageRep.h` —
-/// `-bitmapImageRepByConvertingToColorSpace:(NSColorSpace *)targetSpace
-///  renderingIntent:(NSColorRenderingIntent)renderingIntent`, read from the
-/// runtime as
+/// `-bitmapImageRepByConvertingToColorSpace:renderingIntent:`, encoded
 ///
 /// ```text
 /// @32@0:8@16q24
 /// ```
 ///
-/// The `q` is what makes this its own shape rather than [`send_id_id_id`]-ish:
-/// `NSColorRenderingIntent` is an `NSInteger`, not an object and not an
-/// `NSUInteger`. Its twin [`send_id_usize_id`] has the same two argument KINDS
-/// in the other order and a different signedness, which is exactly the pair the
-/// campaign's census exists to keep apart.
+/// `NSColorRenderingIntent` is an `NSInteger`. [`send_id_usize_id`] has the
+/// same argument kinds in the other order with the other signedness.
 ///
 /// # Safety
-/// See the module note, including the ownership paragraph — this selector does
-/// not begin `new`/`alloc`/`copy`, so its result is +0 and BORROWED. `a` must
-/// be a live object of the class the selector expects.
+/// See the module note, including the ownership paragraph — the result is +0
+/// and borrowed. `a` must be a live object of the class the selector expects.
 #[must_use]
 pub unsafe fn send_id_id_isize(recv: Id, sel: Sel, a: Id, b: isize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1307,22 +1130,17 @@ pub unsafe fn send_id_id_isize(recv: Id, sel: Sel, a: Id, b: isize) -> Id {
 
 /// `-(id)sel:(NSUInteger)a withObject:(id)b`.
 ///
-/// `NSBitmapImageRep.h` —
-/// `-representationUsingType:(NSBitmapImageFileType)storageType
-///  properties:(NSDictionary<NSBitmapImageRepPropertyKey, id> *)properties`,
-/// read from the runtime as
+/// `NSBitmapImageRep.h` — `-representationUsingType:properties:`, encoded
 ///
 /// ```text
 /// @32@0:8Q16@24
 /// ```
 ///
-/// `NSBitmapImageFileType` is an `NSUInteger`. See [`send_id_id_isize`] for why
-/// the near-twin is a separate shape.
+/// `NSBitmapImageFileType` is an `NSUInteger`; see [`send_id_id_isize`].
 ///
 /// # Safety
-/// See the module note, including the ownership paragraph — this selector does
-/// not begin `new`/`alloc`/`copy`, so its result is +0 and BORROWED. `b` must
-/// be nil or a live object of the class the selector expects.
+/// See the module note, including the ownership paragraph — the result is +0
+/// and borrowed. `b` must be nil or a live object of the expected class.
 #[must_use]
 pub unsafe fn send_id_usize_id(recv: Id, sel: Sel, a: usize, b: Id) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1334,23 +1152,18 @@ pub unsafe fn send_id_usize_id(recv: Id, sel: Sel, a: usize, b: Id) -> Id {
 
 /// `-(void)sel:(void *)a length:(NSUInteger)b`.
 ///
-/// `NSData.h` — `-getBytes:(void *)buffer length:(NSUInteger)length`, read from
-/// the runtime as
+/// `NSData.h` — `-getBytes:length:`, encoded
 ///
 /// ```text
 /// v32@0:8^v16Q24
 /// ```
 ///
-/// `^v` and NOT `r^v`: the buffer is WRITTEN by the receiver, so the pointer is
-/// mutable and non-const. That is the distinction [`send_id_cptr_usize`] sits on
-/// the other side of — same two argument kinds, opposite direction of travel,
-/// different encoding — and the two must not be confused for one shape.
+/// `^v`, not `r^v`: the receiver writes the buffer (the opposite direction of
+/// [`send_id_cptr_usize`]).
 ///
 /// # Safety
-/// See the module note. Beyond the prototype: `a` must point at `b` writable,
-/// properly aligned bytes the receiver may fill, and `b` must not exceed the
-/// receiver's own length (`NSData` raises for an over-long read rather than
-/// truncating).
+/// See the module note. `a` must point at `b` writable bytes, and `b` must not
+/// exceed the receiver's length (`NSData` raises rather than truncating).
 pub unsafe fn send_v_ptr_usize(recv: Id, sel: Sel, a: *mut core::ffi::c_void, b: usize) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {

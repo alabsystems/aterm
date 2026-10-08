@@ -224,6 +224,34 @@ impl ClassSet {
         self.ranges.append(&mut extra);
         self.normalize();
     }
+
+    /// Add one POSIX item — `[:lower:]`, or `[:^lower:]` — to this class.
+    ///
+    /// The item's own `^` is applied the way a bracketed class applies its own
+    /// and in the same order: fold, THEN complement (the `regex` crate's
+    /// `unicode_fold_and_negate`, at both levels). The other order is a wrong
+    /// answer, not a slower one: the complement of `[a-z]` holds `A-Z`, `ſ` and
+    /// the KELVIN SIGN, whose orbits are `a-z`, `s` and `k`, so folding it hands
+    /// back every code point there is and `(?i)[[:^lower:]]` matches letters.
+    /// The whole class is folded again when it closes, which is idempotent
+    /// here: a complement taken after folding holds no member of any orbit it
+    /// excluded.
+    fn add_posix(&mut self, table: &[(char, char)], negated: bool, case_insensitive: bool) {
+        let mut item = Self {
+            ranges: table.to_vec(),
+            perls: Vec::new(),
+            negated: false,
+        };
+        if case_insensitive {
+            item.case_fold();
+        } else {
+            item.normalize();
+        }
+        if negated {
+            item.ranges = complement(&item.ranges);
+        }
+        self.ranges.append(&mut item.ranges);
+    }
 }
 
 /// The parsed pattern.
@@ -286,6 +314,11 @@ struct Parser<'a> {
     /// an error in the `regex` crate and accepting one here would be a
     /// divergence for no gain.
     group_names: Vec<String>,
+    /// A flag directive (`(?i)`) is the last thing parsed in this branch. It is
+    /// an item in the `regex` crate's grammar, so a quantifier after it has
+    /// nothing to repeat — it must not reach back past the directive to the
+    /// item before it. Set by the directive, cleared by every item pushed.
+    after_flag_directive: bool,
 }
 
 /// Parse `pattern` under the builder's starting `flags`.
@@ -304,6 +337,7 @@ pub(crate) fn parse(pattern: &str, flags: Flags) -> Result<Ast, Error> {
         alts: Vec::new(),
         concat: Vec::new(),
         group_names: Vec::new(),
+        after_flag_directive: false,
     };
     p.run()
 }
@@ -372,6 +406,7 @@ impl Parser<'_> {
             ));
         }
         self.concat.push((ast, depth));
+        self.after_flag_directive = false;
         Ok(())
     }
 
@@ -495,6 +530,9 @@ impl Parser<'_> {
             self.pos += 1;
             greedy = !greedy;
         }
+        if self.after_flag_directive {
+            return self.err("repetition operator missing expression");
+        }
         let Some((node, depth)) = self.concat.pop() else {
             return self.err("repetition operator missing expression");
         };
@@ -519,7 +557,7 @@ impl Parser<'_> {
     ///
     /// An unescaped `{` always opens one. That is the `regex` crate's rule too —
     /// `a{b}` and `a{,3}` are errors there, not literals — and a divergence here
-    /// would mean accepting a pattern the oracle rejects. A literal brace is
+    /// would mean accepting a pattern `regex` rejects. A literal brace is
     /// `\{`; a `}` on its own is already a literal, in both engines.
     fn parse_counted(&mut self) -> Result<(u32, Option<u32>), Error> {
         debug_assert_eq!(self.peek(), Some('{'));
@@ -642,6 +680,7 @@ impl Parser<'_> {
                     match self.bump() {
                         Some(')') => {
                             self.flags = flags;
+                            self.after_flag_directive = true;
                             return Ok(());
                         }
                         Some(':') => {}
@@ -922,8 +961,8 @@ impl Parser<'_> {
                 ));
             }
             if c == '[' {
-                if let Some(posix) = self.parse_posix_class()? {
-                    set.ranges.extend_from_slice(posix);
+                if let Some((table, negated)) = self.parse_posix_class()? {
+                    set.add_posix(table, negated, self.flags.case_insensitive);
                     self.reject_shorthand_range()?;
                     continue;
                 }
@@ -1023,10 +1062,11 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// `[:alpha:]` and friends — ASCII-only, exactly as in the `regex` crate.
+    /// `[:alpha:]` and friends — ASCII-only, exactly as in the `regex` crate —
+    /// as the item's positive table and whether it is negated (`[:^alpha:]`).
     /// Returns `Ok(None)` when the bracket does not open a *known* POSIX name,
     /// which is the only case the caller may treat as an error.
-    fn parse_posix_class(&mut self) -> Result<Option<Ranges>, Error> {
+    fn parse_posix_class(&mut self) -> Result<Option<(Ranges, bool)>, Error> {
         if self.peek_at(1) != Some(':') {
             return Ok(None);
         }
@@ -1043,11 +1083,11 @@ impl Parser<'_> {
             return Ok(None);
         }
         let name: String = self.pat[from..i].iter().collect();
-        let Some(ranges) = posix_class(&name, negated) else {
+        let Some(table) = posix_class(&name) else {
             return Ok(None);
         };
         self.pos = i + 2;
-        Ok(Some(ranges))
+        Ok(Some((table, negated)))
     }
 }
 
@@ -1068,68 +1108,65 @@ type Ranges = &'static [(char, char)];
 
 /// The POSIX bracket classes. ASCII-only — `[[:alpha:]]` does not match `é` in
 /// the `regex` crate either.
-fn posix_class(name: &str, negated: bool) -> Option<Ranges> {
-    const ALNUM: Ranges = &[('0', '9'), ('A', 'Z'), ('a', 'z')];
-    const ALPHA: Ranges = &[('A', 'Z'), ('a', 'z')];
-    const ASCII: Ranges = &[('\0', '\u{7f}')];
-    const BLANK: Ranges = &[('\t', '\t'), (' ', ' ')];
-    const CNTRL: Ranges = &[('\0', '\u{1f}'), ('\u{7f}', '\u{7f}')];
-    const DIGIT: Ranges = &[('0', '9')];
-    const GRAPH: Ranges = &[('!', '~')];
-    const LOWER: Ranges = &[('a', 'z')];
-    const PRINT: Ranges = &[(' ', '~')];
-    const PUNCT: Ranges = &[('!', '/'), (':', '@'), ('[', '`'), ('{', '~')];
-    const SPACE: Ranges = &[('\t', '\r'), (' ', ' ')];
-    const UPPER: Ranges = &[('A', 'Z')];
-    const WORD: Ranges = &[('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')];
-    const XDIGIT: Ranges = &[('0', '9'), ('A', 'F'), ('a', 'f')];
-    // Complements, precomputed: a class is one flat range list, and the class
-    // parser has no way to express "negate just this item".
-    const N_ALNUM: Ranges = &[('\0', '/'), (':', '@'), ('[', '`'), ('{', char::MAX)];
-    const N_ALPHA: Ranges = &[('\0', '@'), ('[', '`'), ('{', char::MAX)];
-    const N_ASCII: Ranges = &[('\u{80}', char::MAX)];
-    const N_BLANK: Ranges = &[('\0', '\u{8}'), ('\n', '\u{1f}'), ('!', char::MAX)];
-    const N_CNTRL: Ranges = &[(' ', '~'), ('\u{80}', char::MAX)];
-    const N_DIGIT: Ranges = &[('\0', '/'), (':', char::MAX)];
-    const N_GRAPH: Ranges = &[('\0', ' '), ('\u{7f}', char::MAX)];
-    const N_LOWER: Ranges = &[('\0', '`'), ('{', char::MAX)];
-    const N_PRINT: Ranges = &[('\0', '\u{1f}'), ('\u{7f}', char::MAX)];
-    const N_PUNCT: Ranges = &[
-        ('\0', ' '),
-        ('0', '9'),
-        ('A', 'Z'),
-        ('a', 'z'),
-        ('\u{7f}', char::MAX),
-    ];
-    const N_SPACE: Ranges = &[('\0', '\u{8}'), ('\u{e}', '\u{1f}'), ('!', char::MAX)];
-    const N_UPPER: Ranges = &[('\0', '@'), ('[', char::MAX)];
-    const N_WORD: Ranges = &[
-        ('\0', '/'),
-        (':', '@'),
-        ('[', '^'),
-        ('`', '`'),
-        ('{', char::MAX),
-    ];
-    const N_XDIGIT: Ranges = &[('\0', '/'), (':', '@'), ('G', '`'), ('g', char::MAX)];
-
-    let (yes, no): (Ranges, Ranges) = match name {
-        "alnum" => (ALNUM, N_ALNUM),
-        "alpha" => (ALPHA, N_ALPHA),
-        "ascii" => (ASCII, N_ASCII),
-        "blank" => (BLANK, N_BLANK),
-        "cntrl" => (CNTRL, N_CNTRL),
-        "digit" => (DIGIT, N_DIGIT),
-        "graph" => (GRAPH, N_GRAPH),
-        "lower" => (LOWER, N_LOWER),
-        "print" => (PRINT, N_PRINT),
-        "punct" => (PUNCT, N_PUNCT),
-        "space" => (SPACE, N_SPACE),
-        "upper" => (UPPER, N_UPPER),
-        "word" => (WORD, N_WORD),
-        "xdigit" => (XDIGIT, N_XDIGIT),
+///
+/// Positive tables only: an item's own `^` is applied by
+/// [`ClassSet::add_posix`], after case folding, never baked in here — a
+/// precomputed complement folds in the wrong order.
+fn posix_class(name: &str) -> Option<Ranges> {
+    let table: Ranges = match name {
+        "alnum" => &[('0', '9'), ('A', 'Z'), ('a', 'z')],
+        "alpha" => &[('A', 'Z'), ('a', 'z')],
+        "ascii" => &[('\0', '\u{7f}')],
+        "blank" => &[('\t', '\t'), (' ', ' ')],
+        "cntrl" => &[('\0', '\u{1f}'), ('\u{7f}', '\u{7f}')],
+        "digit" => &[('0', '9')],
+        "graph" => &[('!', '~')],
+        "lower" => &[('a', 'z')],
+        "print" => &[(' ', '~')],
+        "punct" => &[('!', '/'), (':', '@'), ('[', '`'), ('{', '~')],
+        "space" => &[('\t', '\r'), (' ', ' ')],
+        "upper" => &[('A', 'Z')],
+        "word" => &[('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')],
+        "xdigit" => &[('0', '9'), ('A', 'F'), ('a', 'f')],
         _ => return None,
     };
-    Some(if negated { no } else { yes })
+    Some(table)
+}
+
+/// The code point after `c`, stepping over the surrogate gap.
+fn char_after(c: char) -> Option<char> {
+    match c {
+        '\u{d7ff}' => Some('\u{e000}'),
+        _ => char::from_u32(u32::from(c) + 1),
+    }
+}
+
+/// The code point before `c`, stepping over the surrogate gap.
+fn char_before(c: char) -> Option<char> {
+    match c {
+        '\u{e000}' => Some('\u{d7ff}'),
+        _ => u32::from(c).checked_sub(1).and_then(char::from_u32),
+    }
+}
+
+/// Every code point NOT in `ranges`, which must be sorted and disjoint (what
+/// [`ClassSet::normalize`] leaves), as sorted, disjoint ranges.
+fn complement(ranges: &[(char, char)]) -> Vec<(char, char)> {
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    let mut from = Some('\0');
+    for &(lo, hi) in ranges {
+        if let Some(f) = from
+            && f < lo
+            && let Some(to) = char_before(lo)
+        {
+            out.push((f, to));
+        }
+        from = char_after(hi);
+    }
+    if let Some(f) = from {
+        out.push((f, char::MAX));
+    }
+    out
 }
 
 /// Collapse a branch's items into one node.
@@ -1271,6 +1308,46 @@ mod tests {
         };
         assert!(set.matches('x') && !set.matches('4'));
         assert!(message("[[:nosuch:]]").contains("nested character classes"));
+    }
+
+    /// An item's own `^` is the exact complement of its FOLDED table: every
+    /// code point a POSIX table or its fold can reach, and the edges of the
+    /// scalar-value space and of the surrogate gap, land in exactly one of the
+    /// two.
+    #[test]
+    fn a_negated_posix_item_is_the_complement_of_its_folded_table() {
+        let names = [
+            "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph", "lower", "print",
+            "punct", "space", "upper", "word", "xdigit",
+        ];
+        let edges = [0xd7ff, 0xe000, 0x10_ffff];
+        for name in names {
+            let table = posix_class(name).expect("a known name");
+            for case_insensitive in [false, true] {
+                let (mut yes, mut no) = (ClassSet::default(), ClassSet::default());
+                yes.add_posix(table, false, case_insensitive);
+                no.add_posix(table, true, case_insensitive);
+                yes.normalize();
+                no.normalize();
+                for c in (0..=0x2200u32).chain(edges).filter_map(char::from_u32) {
+                    assert_ne!(
+                        yes.matches(c),
+                        no.matches(c),
+                        "[:{name}:] and [:^{name}:] (case-insensitive: {case_insensitive}) \
+                         agree about U+{:04X}",
+                        u32::from(c)
+                    );
+                }
+            }
+        }
+        // The fold is applied BEFORE the complement: `(?i)[:^lower:]` excludes
+        // the exotic members of the `k` and `s` orbits along with `A-Z`.
+        let mut no = ClassSet::default();
+        no.add_posix(posix_class("lower").expect("known"), true, true);
+        for c in ['a', 'Z', '\u{17f}', '\u{212a}'] {
+            assert!(!no.matches(c), "(?i)[:^lower:] must not hold {c:?}");
+        }
+        assert!(no.matches('1') && no.matches('\u{e9}'));
     }
 
     /// The depth cap is enforced while parsing, so neither the parser nor the

@@ -1,78 +1,35 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE ARMED TRIPWIRES for the claims `crates/aterm-once-cell` rests on.
+//! Tripwires for the claims `crates/aterm-once-cell` rests on:
 //!
-//! This crate is not `crates/aterm-core-maths`. That shim's whole argument is
-//! "no body of it ever runs", and one test per consumer is enough to hold it.
-//! Here the API is CALLED on four of the five cells, so what has to be watched
-//! is different and larger:
+//! 1. [`every_once_cell_path_in_the_graph_is_an_item_this_shim_provides`] —
+//!    each `once_cell::…` path in a consumer's source names an item this crate has.
+//! 2. [`no_consumer_reaches_for_an_item_this_shim_omits`] — the omitted upstream
+//!    items stay unreferenced.
+//! 3. [`the_consumer_set_is_still_the_one_this_shim_was_measured_against`] — the
+//!    per-cell parent set, re-derived from the live resolve, is unchanged.
+//! 4. [`the_dead_consumers_are_still_dead`] — the three `cfg`-dead imports stay dead.
+//! 5. [`no_cell_enables_a_feature_this_shim_ignores`] — no cell turns on an
+//!    upstream feature that would change upstream's implementation.
 //!
-//! 1. [`every_once_cell_path_in_the_graph_is_an_item_this_shim_provides`] walks
-//!    every consumer's resolved source tree and requires each `once_cell::…`
-//!    path to name something this crate actually has.
-//! 2. [`no_consumer_reaches_for_an_item_this_shim_omits`] is the other half:
-//!    the five upstream items deliberately left out must stay unreferenced.
-//! 3. [`the_consumer_set_is_still_the_one_this_shim_was_measured_against`]
-//!    re-derives the direct-parent set per cell from the live resolve, so a
-//!    dependency bump that adds a WHOLE NEW consumer fails here rather than
-//!    silently widening the surface.
-//! 4. [`the_dead_consumers_are_still_dead`] pins the three imports that sit
-//!    under a `cfg` which is off, per cell — the only reason mac-arm, whose
-//!    sole parent is `rustls`, carries no live code at all.
-//! 5. [`no_cell_enables_a_feature_this_shim_ignores`] guards the four upstream
-//!    feature names that would change upstream's implementation and are
-//!    accepted-and-ignored here.
+//! No file list is hardcoded: each consumer's source root comes from `cargo
+//! metadata` and is walked recursively, and the consumer set comes from `cargo
+//! tree`, so a new file, module or consumer is read by construction.
 //!
-//! # THE WEAKNESS THIS FIXES, named by `core_maths`'s judge
-//!
-//! `crates/aterm-core-maths/tests/consumers.rs` walks a HARDCODED FILE LIST per
-//! consumer, with a `found > 0` control to catch the list going stale. That
-//! control is too weak in one specific direction, and the judge said so: if a
-//! dependency bump MOVES a call into a new file while leaving one mention in an
-//! old file, `found` is still positive, the test still passes, and the new call
-//! site is never examined. Nothing here hardcodes a file. Every test walks the
-//! consumer's source root recursively from the live `cargo metadata`, and the
-//! CONSUMER SET itself is re-derived from `cargo tree` rather than typed in —
-//! so a new file, a new module and a new crate are all caught by construction.
-//!
-//! # ARMED — each plant was compiled and run, not argued
-//!
-//! A tripwire nobody has seen fire is a tripwire nobody knows is connected. Each
-//! of these was planted, VERIFIED TO COMPILE (a plant that does not build proves
-//! nothing about the test), run, and then restored. The evidence is the message
-//! the test actually printed:
-//!
-//! * `PROVIDED` loses `("sync", "Lazy")` ->
-//!   [`every_once_cell_path_in_the_graph_is_an_item_this_shim_provides`] exits
-//!   101: ``\`criterion\` USES A \`once_cell\` ITEM THIS SHIM DOES NOT PROVIDE``,
-//!   naming `criterion-0.5.1/src/lib.rs:88`.
-//! * `OMITTED` gains `"OnceBox"` ->
-//!   [`no_consumer_reaches_for_an_item_this_shim_omits`] exits 101 naming
-//!   `ahash-0.8.12/src/random_state.rs:111`.
-//! * `EXPECTED_PARENTS` loses `"x11rb"` ->
-//!   [`the_consumer_set_is_still_the_one_this_shim_was_measured_against`] exits
-//!   101: ``THE \`once_cell\` CONSUMER SET ON \`linux\` … HAS CHANGED``, printing
-//!   the nine names it found.
-//! * the recorded `rustls` guard is flipped to `#[cfg(feature = "std")]` ->
-//!   [`the_dead_consumers_are_still_dead`] exits 101 naming
-//!   `rustls-0.23.41/src/crypto/mod.rs:706`.
-//! * `INERT_FEATURES` gains `"race"` ->
-//!   [`no_cell_enables_a_feature_this_shim_ignores`] exits 101:
-//!   ``CELL \`mac-arm\` … ENABLES \`once_cell/race\```.
-//!
-//! The behaviour half of the suite is armed the same way; see the header of
-//! `tests/behaviour.rs` for its four plants and their messages.
+//! Each tripwire was armed by a plant that compiled, ran and failed:
+//! `PROVIDED` without `("sync", "Lazy")` (names `criterion-0.5.1/src/lib.rs:88`),
+//! `OMITTED` with `"OnceBox"` (names `ahash-0.8.12/src/random_state.rs:111`),
+//! `EXPECTED_PARENTS` without `"x11rb"`, the `rustls` guard flipped to
+//! `#[cfg(feature = "std")]`, and `INERT_FEATURES` with `"race"`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The five cells, spelled out rather than recomputed from
-/// `aterm_forge::resolve`, so a change to either side of the pairing shows up
-/// as a diff here. `wasm32-unknown-unknown` carries TWO cells — the two cdylib
-/// modules aterm ships to a browser — which is why the root package is part of
-/// the key and the triple alone is not.
+/// The five cells, spelled out (not taken from `aterm_forge::resolve`) so a
+/// change shows up as a diff here. `wasm32-unknown-unknown` carries two cells,
+/// so the root package is part of the key.
 const CELLS: [(&str, &str); 5] = [
     ("aterm", "aarch64-apple-darwin"),
     ("aterm", "x86_64-unknown-linux-gnu"),
@@ -94,14 +51,9 @@ const PROVIDED: [(&str, &str); 5] = [
     ("race", "OnceBox"),
 ];
 
-/// The upstream items this shim deliberately does NOT provide, and which a
-/// consumer must therefore never name. See divergence 5 in `src/lib.rs`.
-///
-/// `sync::OnceCell::wait`, `sync::OnceCell::get_unchecked` and the two
-/// `with_value` constructors are omitted too, but they are METHOD names reached
-/// through a local alias, which no lexical scan can see reliably; using one is
-/// a compile error, which is the fail-closed direction. These three are TYPE
-/// names, so they appear in an import and this scan does catch them.
+/// Upstream types this shim omits (divergence 5 in `src/lib.rs`). The omitted
+/// methods (`wait`, `get_unchecked`) are not scanned: a lexical scan cannot
+/// follow them, and using one is a compile error.
 const OMITTED: [&str; 3] = ["OnceNonZeroUsize", "OnceBool", "OnceRef"];
 
 /// Upstream feature names that this shim accepts and IGNORES, and which would
@@ -172,7 +124,31 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// `cargo <args>` in `root`, run at most once per `(root, args)` per process.
+///
+/// Every answer is a pure function of the lockfile and manifests, and cargo
+/// serialises each call on its package-cache lock, so repeats are pure wall
+/// time. A failed run is not cached: it panics in the test that asked.
 fn cargo(root: &Path, args: &[&str]) -> String {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Slots = BTreeMap<(PathBuf, Vec<String>), Arc<OnceLock<String>>>;
+    static SLOTS: OnceLock<Mutex<Slots>> = OnceLock::new();
+    let key = (
+        root.to_path_buf(),
+        args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>(),
+    );
+    let slot = SLOTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_default()
+        .clone();
+    slot.get_or_init(|| cargo_uncached(root, args)).clone()
+}
+
+fn cargo_uncached(root: &Path, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO"))
         .current_dir(root)
         .args(args)
@@ -198,22 +174,13 @@ struct Mention {
     path: Parsed,
 }
 
-/// Every package that actually LINKS `once_cell`, as `(name, source root)`,
-/// taken from the live resolve rather than a list — so a new consumer is
-/// discovered instead of skipped.
+/// Every package that links `once_cell`, as `(name, source root)`, from the
+/// live resolve.
 ///
-/// Derived from `cargo tree`, NOT from scanning manifests for the name. That
-/// distinction was measured rather than assumed: `rustix 1.1.4` declares
-/// `[target."cfg(windows)".dev-dependencies.once_cell]` and never mentions the
-/// crate in a single line of its own source, so a manifest scan reports a
-/// consumer whose sources cannot be checked and the per-consumer non-vacuity
-/// control below fires on a package that is not in any graph. `cargo tree`
-/// answers the question that matters — who does the linker pull it in for — and
-/// rustix is not one of them on any cell.
-///
-/// The union covers the five shipped cells plus the HOST DEV graph, because
-/// `cargo test` builds that one: `criterion` and `tempfile` call these types
-/// too, and a shim that broke them would break the suite proving it correct.
+/// From `cargo tree`, not a manifest scan: `rustix 1.1.4` declares a
+/// `cfg(windows)` dev-dependency on `once_cell` it never uses and that is in no
+/// graph. The union covers the five cells plus the host dev graph, which
+/// `cargo test` builds (`criterion`, `tempfile`).
 fn consumers(root: &Path) -> Vec<(String, PathBuf)> {
     let mut names: BTreeSet<String> = BTreeSet::new();
     for (pkg, triple) in CELLS {
@@ -250,11 +217,9 @@ fn host_dev_parents(root: &Path) -> BTreeSet<String> {
 /// The directory holding a resolved third-party package's sources, from
 /// `cargo metadata`'s `manifest_path` for it.
 ///
-/// The lookup is by DIRECTORY NAME (`<name>-<version>`), not by scanning
-/// forward from a `"name":"<name>"` key: that key also appears in every
-/// dependant's dependency list, so a forward scan finds the wrong package's
-/// `manifest_path`. `crates/aterm-core-maths` learned that one the hard way and
-/// wrote it down; this is the same helper with its lesson kept.
+/// Matched by directory name (`<name>-<version>`), not by scanning forward
+/// from a `"name":"<name>"` key: that key also appears in every dependant's
+/// dependency list, so a forward scan finds the wrong `manifest_path`.
 fn source_root(root: &Path, name: &str) -> PathBuf {
     let json = cargo(root, &["metadata", "--format-version", "1"]);
     const KEY: &str = "\"manifest_path\":\"";
@@ -292,9 +257,8 @@ fn source_root(root: &Path, name: &str) -> PathBuf {
     hits.remove(0)
 }
 
-/// Every `.rs` file under `dir`, recursively. THE POINT OF THIS FUNCTION is
-/// that no test in this file names a path: a call site that moves to a new
-/// module is still read.
+/// Every `.rs` file under `dir`, recursively, so a call site that moves to a
+/// new module is still read.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -346,11 +310,9 @@ enum Parsed {
     NotAPath,
     /// One or more `module::Item` pairs. A braced group yields all of them.
     Items(Vec<(String, String)>),
-    /// A `once_cell::` path that names no item this scan can pin to a
-    /// `module::Type` pair — `use once_cell::{sync, unsync};`,
-    /// `use once_cell::sync::{self, Lazy};`, `use once_cell::sync as oc;`.
-    /// Reported, never skipped: see the note on
-    /// [`every_once_cell_path_in_the_graph_is_an_item_this_shim_provides`].
+    /// A `once_cell::` path that rebinds a module (`use once_cell::{sync, unsync};`,
+    /// `use once_cell::sync::{self, Lazy};`, `use once_cell::sync as oc;`), so
+    /// its types arrive on lines this scan cannot see. Reported, never skipped.
     Unresolvable,
 }
 
@@ -359,17 +321,8 @@ enum Parsed {
 /// Only the first two segments after `once_cell::` are taken, so a trailing
 /// method (`::once_cell::unsync::Lazy::force`, which `wasm-bindgen` writes)
 /// reduces to the same pair as the import that introduced it. A `docs.rs` URL
-/// spells the path with slashes and is deliberately not matched.
-///
-/// BRACED GROUPS ARE EXPANDED, and that is not a nicety. The first version of
-/// this function took exactly one segment pair and returned `None` for
-/// anything else, and the caller treated `None` as "a doc comment: nothing to
-/// resolve". `use once_cell::sync::{Lazy, OnceCell};` — an ordinary import
-/// form no consumer happens to use TODAY — parsed as `None` and was therefore
-/// SILENTLY SKIPPED, so the one test that checks the API surface for the four
-/// cells this machine cannot compile would have passed while never reading the
-/// import. That is the same shape of hole `core_maths`'s judge named in the
-/// hardcoded file list, one level down.
+/// spells the path with slashes and is not matched. Braced groups yield every
+/// item, so `use once_cell::sync::{Lazy, OnceCell};` is read, not skipped.
 fn parse_path(line: &str) -> Parsed {
     fn seg(s: &str) -> (String, &str) {
         let n = s
@@ -426,7 +379,7 @@ fn parse_path(line: &str) -> Parsed {
     Parsed::Items(vec![(module, item)])
 }
 
-/// The parser's own tripwire. These are the forms that used to vanish.
+/// Every import form either resolves or reports itself unresolvable.
 #[test]
 fn parse_path_resolves_every_import_form_or_says_it_cannot() {
     let items = |v: &[(&str, &str)]| {
@@ -448,7 +401,7 @@ fn parse_path_resolves_every_import_form_or_says_it_cannot() {
         parse_path("::once_cell::unsync::Lazy::force(&self.0 .0)"),
         items(&[("unsync", "Lazy")])
     );
-    // THE FOUR THAT USED TO BE SILENTLY SKIPPED.
+    // Braced and module-rebinding forms.
     assert_eq!(
         parse_path("use once_cell::sync::{Lazy, OnceCell};"),
         items(&[("sync", "Lazy"), ("sync", "OnceCell")]),
@@ -519,8 +472,7 @@ fn every_once_cell_path_in_the_graph_is_an_item_this_shim_provides() {
     let consumers = consumers(&root);
     assert!(
         !consumers.is_empty(),
-        "no third-party package in the resolve declares `once_cell` — either the patch row is \
-         gone or `declares_once_cell` has stopped matching, and this test is proving nothing"
+        "no `once_cell` consumers resolved; this test checks nothing"
     );
 
     let mut checked = 0usize;
@@ -530,27 +482,18 @@ fn every_once_cell_path_in_the_graph_is_an_item_this_shim_provides() {
         // whose sources never mention it would pass the loop below vacuously.
         assert!(
             !ms.is_empty(),
-            "`{name}` declares a `once_cell` dependency but its sources at {} never mention it — \
-             the walk found nothing, so this test proved nothing about `{name}`",
+            "`{name}` links `once_cell` but no source under {} mentions it",
             src_root.display()
         );
         for m in ms {
             let pairs = match &m.path {
                 Parsed::NotAPath => continue, // a doc comment or a URL
-                // NEVER SKIPPED. An import form this scan cannot follow is the
-                // one case where "found nothing" and "there is nothing" look
-                // alike, and four of the five cells are never COMPILED on the
-                // machine that runs this suite (no cross std is installed), so
-                // this test is the only thing reading their call sites.
+                // Never skipped: for an import this scan cannot follow, "found
+                // nothing" and "there is nothing" look alike.
                 Parsed::Unresolvable => panic!(
-                    "\n\n`{name}` IMPORTS `once_cell` IN A FORM THIS SCAN CANNOT FOLLOW.\n\
-                     {}:{}\n    {}\n\n\
-                     `use once_cell::{{sync, unsync}};`, `use once_cell::sync::{{self, …}};` and \
-                     `use once_cell::sync as x;` all rebind a MODULE, and the types then arrive \
-                     on lines that never contain the string `once_cell`. Silently skipping one \
-                     would leave the API surface of the four cells this machine cannot compile \
-                     unchecked. Read the new call sites by hand, then either teach `parse_path` \
-                     this form or record the crate here.\n",
+                    "`{name}` imports `once_cell` in a form this scan cannot follow (a module \
+                     rebind):\n{}:{}\n    {}\nRead its call sites by hand, then teach \
+                     `parse_path` the form.",
                     m.file.display(),
                     m.line_no,
                     m.line
@@ -561,12 +504,9 @@ fn every_once_cell_path_in_the_graph_is_an_item_this_shim_provides() {
                 checked += 1;
                 assert!(
                     PROVIDED.iter().any(|(pm, pi)| pm == module && pi == item),
-                    "\n\n`{name}` USES A `once_cell` ITEM THIS SHIM DOES NOT PROVIDE.\n\
-                     {}:{} refers to `once_cell::{module}::{item}`:\n    {}\n\n\
-                     crates/aterm-once-cell exports only {PROVIDED:?}. Either add the item (and \
-                     say what it costs — this crate is `#![forbid(unsafe_code)]`, and the three \
-                     race cells upstream provides are `AtomicPtr`/`AtomicUsize` code) or retire \
-                     the `[patch.crates-io] once_cell` row for this build.\n",
+                    "`{name}` uses `once_cell::{module}::{item}`, which this shim does not \
+                     provide (it exports {PROVIDED:?}):\n{}:{}\n    {}\nAdd the item \
+                     (`unsafe` is forbidden) or retire the `[patch.crates-io] once_cell` row.",
                     m.file.display(),
                     m.line_no,
                     m.line
@@ -576,8 +516,7 @@ fn every_once_cell_path_in_the_graph_is_an_item_this_shim_provides() {
     }
     assert!(
         checked > 0,
-        "walked {} consumers and resolved not one `once_cell::…` path — `parse_path` has stopped \
-         matching and every assertion above is vacuous",
+        "{} consumers walked, 0 `once_cell::…` paths resolved; `parse_path` no longer matches",
         consumers.len()
     );
 }
@@ -592,13 +531,8 @@ fn no_consumer_reaches_for_an_item_this_shim_omits() {
             for omitted in OMITTED {
                 assert!(
                     !m.line.contains(omitted),
-                    "\n\n`{name}` NAMES `{omitted}`, WHICH THIS SHIM OMITS ON PURPOSE.\n\
-                     {}:{}\n    {}\n\n\
-                     `race::OnceNonZeroUsize`, `race::OnceBool` and `race::OnceRef` are upstream \
-                     cells built on raw atomics; crates/aterm-once-cell leaves them out because \
-                     it forbids `unsafe` and nothing reached for them. Adding one means adding \
-                     that unsafe back, or an `unsafe`-free equivalent, and re-measuring the \
-                     unsafe-token line of this row. See divergence 5 in src/lib.rs.\n",
+                    "`{name}` names `{omitted}`, which this shim omits (divergence 5 in \
+                     src/lib.rs):\n{}:{}\n    {}\nAdd an `unsafe`-free equivalent.",
                     m.file.display(),
                     m.line_no,
                     m.line
@@ -621,24 +555,18 @@ fn the_consumer_set_is_still_the_one_this_shim_was_measured_against() {
         let expected: BTreeSet<String> = expected.iter().map(|s| (*s).to_string()).collect();
         assert_eq!(
             found, expected,
-            "\n\nTHE `once_cell` CONSUMER SET ON `{cell}` ({pkg} / {triple}) HAS CHANGED.\n\
+            "`once_cell` parents on `{cell}` ({pkg} / {triple}) changed\n\
              found:    {found:?}\n\
-             expected: {expected:?}\n\n\
-             This is the check that a hardcoded file list cannot do: a dependency bump that \
-             hands `once_cell` a NEW parent brings call sites no other test in this file has \
-             read. Re-run the census in the src/lib.rs header for the added crate — which \
-             module, which methods, and whether the import is `cfg`-gated off — then update \
-             EXPECTED_PARENTS, the liveness table in src/lib.rs, and DEAD_CONSUMERS if the new \
-             one is dead.\n"
+             expected: {expected:?}\n\
+             Census the new parent (module, methods, cfg guard), then update EXPECTED_PARENTS, \
+             the liveness table in src/lib.rs, and DEAD_CONSUMERS if it is dead."
         );
     }
 }
 
 /// Whether the item on line `idx` is compiled only when `guard` holds.
 ///
-/// TWO SHAPES, because the three dead consumers use both and the obvious
-/// implementation only handles one. `rustls` and `naga` put the attribute
-/// directly on the `use`:
+/// Two shapes. `rustls` and `naga` put the attribute directly on the `use`:
 ///
 /// ```text
 /// #[cfg(not(feature = "std"))]
@@ -653,16 +581,9 @@ fn the_consumer_set_is_still_the_one_this_shim_was_measured_against() {
 ///     use once_cell::race::OnceBox;
 /// ```
 ///
-/// A "previous line equals the guard" test — which is what
-/// `crates/aterm-core-maths/tests/consumers.rs` can afford, because both of its
-/// consumers use the first shape — reports read-fonts as UNGUARDED and fails on
-/// a correct tree. So this walks the enclosing blocks too, tracking which
-/// attribute (if any) immediately preceded each `{`.
-///
-/// Brace counting is lexical and would be fooled by a `{` inside a string or a
-/// comment. That is a false NEGATIVE — it reports "not guarded" and fails the
-/// test, naming the file and line — so the failure mode is a loud, diagnosable
-/// stop, never a silent pass.
+/// So this also walks enclosing blocks, tracking the attribute (if any) that
+/// preceded each `{`. Brace counting is lexical; a `{` in a string or comment
+/// can only make it report "not guarded", a loud failure, never a silent pass.
 fn guarded_by(lines: &[&str], idx: usize, guard: &str) -> bool {
     // Shape one: the attribute sits directly above the item.
     if idx > 0 && lines[idx - 1].trim() == guard {
@@ -701,7 +622,7 @@ fn the_dead_consumers_are_still_dead() {
     let root = workspace_root();
     let consumers = consumers(&root);
 
-    // Half one: the import is still written under the guard we recorded.
+    // The import is still under the recorded guard.
     for (name, guard, _) in DEAD_CONSUMERS {
         let (_, src_root) = consumers
             .iter()
@@ -721,15 +642,9 @@ fn the_dead_consumers_are_still_dead() {
                 guarded += 1;
                 assert!(
                     guarded_by(&lines, i, guard),
-                    "\n\n{}:{} imports `once_cell` WITHOUT the `{guard}` this shim's liveness \
-                     table records for `{name}` — neither on the `use` itself nor on any \
-                     enclosing block.\n    {}\n\n\
-                     If the guard moved or went away, `{name}` is now LIVE code on every cell it \
-                     appears in — including mac-arm, where `rustls` is the only parent and this \
-                     shim is currently dead weight. That is not automatically wrong (the bodies \
-                     are correct), but it changes what has to be true: re-read the contract notes \
-                     in src/lib.rs, especially the exactly-once one, and update the liveness \
-                     table in the crate header.\n",
+                    "{}:{} imports `once_cell` without the recorded `{guard}`, so `{name}` is \
+                     now live code:\n    {}\nRe-check the contracts in src/lib.rs and update \
+                     its liveness table.",
                     file.display(),
                     i + 1,
                     line.trim()
@@ -738,14 +653,12 @@ fn the_dead_consumers_are_still_dead() {
         }
         assert!(
             guarded > 0,
-            "no `use once_cell::…` line found anywhere under {} — `{name}` is recorded as a DEAD \
-             consumer but the walk found no import to check, so this test proved nothing",
+            "no `use once_cell::…` line under {}; dead consumer `{name}` was not checked",
             src_root.display()
         );
     }
 
-    // Half two: the feature that keeps each guard false is still resolved on
-    // every cell the crate appears on.
+    // The feature that keeps each guard false still resolves on every cell.
     for (i, (pkg, triple)) in CELLS.iter().enumerate() {
         let cell = CELL_NAMES[i];
         let parents = direct_parents(&root, pkg, triple);
@@ -762,15 +675,9 @@ fn the_dead_consumers_are_still_dead() {
             let want = format!("{name} feature \"{feature}\"");
             assert!(
                 tree.contains(&want),
-                "\n\nTHE once_cell REPLACEMENT HAS BECOME LIVE CODE IN `{name}` ON `{cell}`.\n\
-                 Cell `{pkg}` / `{triple}` resolves `{name}` WITHOUT its `{feature}` feature, so \
-                 its `{guard} use once_cell::…` is now compiled and this shim's bodies run there \
-                 for real.\n\n\
-                 THAT IS NOT AUTOMATICALLY WRONG — the bodies are correct on every target aterm \
-                 builds — but it is a change nobody has measured, and for `rustls` it is the \
-                 difference between mac-arm carrying no live code at all and carrying some. Read \
-                 the liveness table and the divergence list in crates/aterm-once-cell/src/lib.rs \
-                 before accepting it.\n"
+                "`{name}` on `{cell}` ({pkg} / {triple}) resolves without feature `{feature}`, so \
+                 its `{guard}` import is live. Check the liveness table and divergences in \
+                 crates/aterm-once-cell/src/lib.rs before accepting it."
             );
         }
     }
@@ -799,12 +706,8 @@ fn no_cell_enables_a_feature_this_shim_ignores() {
             let bad = format!("once_cell feature \"{feature}\"");
             assert!(
                 !tree.contains(&bad),
-                "\n\nCELL `{cell}` ({pkg} / {triple}) ENABLES `once_cell/{feature}`.\n\
-                 crates/aterm-once-cell DECLARES that feature so the resolve succeeds, and then \
-                 IGNORES it — upstream would switch to a different implementation \
-                 (`critical-section`/`portable-atomic` primitives, or a `parking_lot` parking \
-                 lot). Whoever turned it on wanted that behaviour and is silently not getting \
-                 it. Either implement the feature here or take it back off.\n"
+                "cell `{cell}` ({pkg} / {triple}) enables `once_cell/{feature}`, which this shim \
+                 ignores; implement it or turn it off."
             );
         }
     }

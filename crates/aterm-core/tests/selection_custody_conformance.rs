@@ -1,31 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SELECTION CUSTODY Phase 4 — damage is a question about OVERLAP.
+//! Selection custody: damage is a question about overlap.
 //!
-//! The selection half of the reported bug: "the scroll position is lost because some
-//! other program is running and filling the bottom of the screen" — and with it, the
-//! highlight.
-//!
-//! Before this phase, twenty-five grid sites set `content_scroll_delta = i32::MAX`, a
-//! sentinel meaning "kill the selection". It was applied backwards in BOTH
-//! directions:
-//!
-//! * a status bar scrolling rows 18-23 destroyed a highlight anchored at row -40 in
-//!   scrollback — content it never touched;
-//! * a `\r` + EL progress bar rewrote the row UNDER a live highlight and left it in
-//!   place, so a copy returned text the user never selected.
-//!
-//! The lattice replaces the sentinel with an absolute-row BAND, and a selection is
-//! cleared iff it actually overlaps.
+//! Grid operations record selection damage as absolute-row bands, and a
+//! selection is cleared iff it overlaps one. So a status bar scrolling rows
+//! 18-23 spares a highlight anchored in scrollback, and a `\r` + EL progress
+//! bar rewriting the highlighted row clears it (a copy must never return text
+//! the user did not select).
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 
 /// A terminal with history, scrolled back, holding a completed selection on the
-/// oldest visible line — i.e. a selection anchored in SCROLLBACK.
+/// oldest visible line — i.e. a selection anchored in scrollback.
 ///
-/// The span reaches past the line NUMBER on purpose. `has_selection()` alone cannot
+/// The span reaches past the line number on purpose. `has_selection()` alone cannot
 /// tell "the highlight stayed put" from "the highlight slid onto a neighbouring
 /// line", and every row here starts with the same five characters — so the tests
 /// below compare [`selected_text`], which is what a ⌘-C would actually return.
@@ -53,8 +43,8 @@ fn selected_text(term: &Terminal) -> String {
         .expect("a live selection must resolve to text")
 }
 
-/// THE REPORTED BUG. A program repainting a status bar in a scroll region at the
-/// bottom of the screen must not destroy a highlight sitting in scrollback.
+/// A program repainting a status bar in a scroll region at the bottom of the
+/// screen must not destroy a highlight sitting in scrollback.
 #[test]
 fn a_region_scroll_spares_a_selection_it_never_touched() {
     let mut term = with_scrollback_selection(24, 40);
@@ -76,7 +66,7 @@ fn a_region_scroll_spares_a_selection_it_never_touched() {
     );
 }
 
-/// …and the same op MUST still clear a selection that IS inside the region.
+/// …and the same op must still clear a selection that is inside the region.
 /// Over-clearing is safe; leaving a highlight over replaced content is not.
 #[test]
 fn a_region_scroll_clears_a_selection_inside_it() {
@@ -84,7 +74,7 @@ fn a_region_scroll_clears_a_selection_inside_it() {
     for i in 0..64 {
         term.process(format!("line-{i}\r\n").as_bytes());
     }
-    // Select on a LIVE row inside the region we are about to scroll.
+    // Select on a live row inside the region we are about to scroll.
     {
         let sel = term.text_selection_mut();
         sel.start_selection(20, 0, SelectionSide::Left, SelectionType::Simple);
@@ -101,10 +91,9 @@ fn a_region_scroll_clears_a_selection_inside_it() {
         "a selection inside the scrolled region must be cleared"
     );
 
-    // DISCRIMINATOR. The assertion above passed under the pre-Phase-4 `i32::MAX`
-    // sentinel too — that sentinel cleared EVERYTHING. Re-run the identical op with
-    // the selection moved OUT of the region: the lattice must now spare it. The two
-    // halves together fail under a blanket clear AND under a never-clear.
+    // Discriminator: a blanket clear passes the assertion above. Re-run the same
+    // op with the selection outside the region: it must be spared. Together the
+    // halves fail under both a blanket clear and a never-clear.
     {
         let sel = term.text_selection_mut();
         sel.start_selection(2, 0, SelectionSide::Left, SelectionType::Simple);
@@ -163,7 +152,7 @@ fn ordinary_output_still_preserves_a_scrollback_selection() {
     );
     // The half `has_selection()` cannot see. Five uniform scrolls move every
     // anchor five rows; `adjust_for_scroll` is what keeps the highlight over the
-    // same characters, and a control that never checks the TEXT would pass with the
+    // same characters, and a control that never checks the text would pass with the
     // compensation deleted — the selection would simply name a different line.
     assert_eq!(
         selected_text(&term),
@@ -179,11 +168,9 @@ fn clearing_the_scrollback_still_clears_the_selection() {
     let mut term = with_scrollback_selection(24, 40);
     let before = selected_text(&term);
 
-    // DISCRIMINATOR first: ED 2 erases the VISIBLE screen only. It records a band
-    // over the live rows, which a scrollback anchor is disjoint from — so the
-    // highlight survives, naming the same history line. Under the old `i32::MAX`
-    // sentinel this cleared too, which is what made the ED 3 assertion below
-    // pass for the wrong reason.
+    // Discriminator first: ED 2 erases the visible screen only; its band over the
+    // live rows is disjoint from a scrollback anchor, so the highlight survives
+    // on the same history line. A blanket clear would fail here.
     term.process(b"\x1b[2J");
     assert!(
         term.text_selection().has_selection(),
@@ -199,10 +186,10 @@ fn clearing_the_scrollback_still_clears_the_selection() {
     );
 }
 
-/// The INVERSE hole: an op that REWRITES the row a highlight sits on must clear it.
-/// EL recorded nothing before, so a `\r` + EL progress bar or spinner rewrote the row
-/// under a live highlight and left it painted — a copy then returned text the user
-/// never selected. Over-clearing is safe; a stale highlight is not.
+/// An op that rewrites the row a highlight sits on must clear it: a `\r` + EL
+/// progress bar or spinner under a live highlight would otherwise make a copy
+/// return text the user never selected. Over-clearing is safe; a stale
+/// highlight is not.
 #[test]
 fn erasing_the_selected_line_clears_the_stale_highlight() {
     let mut term = Terminal::new(24, 40);
@@ -225,7 +212,7 @@ fn erasing_the_selected_line_clears_the_stale_highlight() {
     );
 }
 
-/// …but EL on a DIFFERENT row must leave the highlight alone. This is the half that
+/// …but EL on a different row must leave the highlight alone. This is the half that
 /// makes the previous test a scoped rule rather than a return to clearing everything.
 #[test]
 fn erasing_another_line_spares_the_highlight() {
@@ -251,10 +238,9 @@ fn erasing_another_line_spares_the_highlight() {
     );
     assert_eq!(selected_text(&term), before, "…and must not move it");
 
-    // DISCRIMINATOR. Sparing alone is what the PRE-Phase-4 code did for every EL
-    // (it recorded nothing at all), so the assertion above cannot fail if the EL
-    // band is reverted. Erasing the SELECTED row with the same op must clear —
-    // which pins that the sparing is a scoped answer about overlap, not silence.
+    // Discriminator: sparing alone is also what recording nothing does. Erasing
+    // the selected row with the same op must clear, so the sparing is a scoped
+    // answer about overlap.
     term.process(b"\x1b[1;1H\x1b[K");
     assert!(
         !term.text_selection().has_selection(),
@@ -263,7 +249,7 @@ fn erasing_another_line_spares_the_highlight() {
 }
 
 /// DECCARA changes attributes only — the characters, and therefore what a copy
-/// returns, are unchanged. It must NOT clear the selection.
+/// returns, are unchanged. It must not clear the selection.
 #[test]
 fn changing_attributes_over_the_selection_spares_it() {
     let mut term = Terminal::new(24, 40);
@@ -290,9 +276,9 @@ fn changing_attributes_over_the_selection_spares_it() {
         "…and the copy is byte-identical, which is the reason it may be spared"
     );
 
-    // DISCRIMINATOR. DECCARA is unmarked under every implementation of the lattice,
+    // Discriminator. DECCARA is unmarked under every implementation of the lattice,
     // so the assertions above hold vacuously on their own. A DECCRA whose
-    // DESTINATION is those same cells REPLACES the characters — same rows, same
+    // destination is those same cells replaces the characters — same rows, same
     // columns, different question — and must clear. What separates the two is
     // whether the text changed, and this pins exactly that.
     term.process(b"\x1b[2;1;3;10;1;1;1$v");
@@ -302,8 +288,8 @@ fn changing_attributes_over_the_selection_spares_it() {
     );
 }
 
-/// DECCRA copies a rectangle; the DESTINATION cells are replaced, so a highlight over
-/// them is stale and must go — while the SOURCE, only read, is untouched.
+/// DECCRA copies a rectangle; the destination cells are replaced, so a highlight over
+/// them is stale and must go — while the source, only read, is untouched.
 #[test]
 fn a_rect_copy_clears_over_its_destination_but_spares_its_source() {
     // Destination overlaps the selection.
@@ -349,17 +335,12 @@ fn a_rect_copy_clears_over_its_destination_but_spares_its_source() {
     );
 }
 
-/// REGRESSION (introduced by Phase 3's `finalize_resize` narrowing, found by the
-/// Phase 5 planning sweep): a rows-GROW that reveals history must move the selection
-/// with its content.
+/// A rows-grow that reveals history must move the selection with its content.
 ///
-/// `Grid::resize_with_reflow_mode` computes `revealed` and compensates the cursor and
-/// the saved cursor for it, with a comment that says every pre-resize viewport row
-/// "now sits `revealed` rows further down" (`reflow.rs:235-244`). Nothing compensated
-/// the SELECTION. That was harmless while `finalize_resize` cleared unconditionally —
-/// Phase 3 replaced the clear with `adjust_for_scroll(0, ..)`, a delta of ZERO, so the
-/// anchors stay put while the text moves down: the highlight ends up over different
-/// text and a copy returns something the user never selected.
+/// `Grid::resize_with_reflow_mode` shifts every pre-resize viewport row down by
+/// `revealed` and compensates the cursor and saved cursor for it; the selection
+/// must move by the same amount, or the highlight lands over different text and
+/// a copy returns something the user never selected.
 #[test]
 fn a_rows_grow_that_reveals_history_moves_the_selection_with_its_content() {
     let mut term = Terminal::new(4, 20);
@@ -378,18 +359,14 @@ fn a_rows_grow_that_reveals_history_moves_the_selection_with_its_content() {
         .expect("the selection resolves to text");
     assert!(!before.is_empty());
 
-    // Rows-only GROW, which reveals retained history above the old viewport.
+    // Rows-only grow, which reveals retained history above the old viewport.
     term.resize(10, 20);
 
-    // NOT guarded on `has_selection()`. This test exists to pin the wrong-copy path
-    // 613fab63 fixed, and a guard makes it PASS under the very regression it names:
-    // restore the unconditional rows-resize clear and there is no selection left, so
-    // a guarded body never runs and the test reports green while the behaviour it is
-    // called after ("moves the selection with its content") is gone.
+    // Not guarded on `has_selection()`: an unconditional clear on rows-resize
+    // would leave no selection, and a guarded body would then pass vacuously.
     assert!(
         term.text_selection().has_selection(),
-        "a rows-only GROW must not destroy the selection — Phase 3 replaced the \
-         unconditional clear precisely so it survives"
+        "a rows-only GROW must not destroy the selection"
     );
     let after = term
         .selection_to_string()
@@ -420,11 +397,10 @@ fn with_capped_history(rows: u16, cols: u16, limit: usize) -> Terminal {
     term
 }
 
-/// PARTIAL EVICTION. Scrolling one endpoint of a selection past the history floor
-/// used to destroy the whole highlight — including the part still on screen and still
-/// copyable. It now clamps that endpoint onto the oldest retained row and REPORTS the
-/// loss, which is what the copy walk has done for years: `selection_to_string_capped`
-/// reads `first_row = adj_start_row.max(-history)`.
+/// Partial eviction: scrolling one endpoint of a selection past the history
+/// floor clamps that endpoint onto the oldest retained row and reports the
+/// loss, keeping the part still on screen, as the copy walk does
+/// (`selection_to_string_capped` reads `first_row = adj_start_row.max(-history)`).
 #[test]
 fn evicting_one_endpoint_truncates_instead_of_destroying_the_selection() {
     let mut term = with_capped_history(24, 40, 50);
@@ -470,7 +446,7 @@ fn evicting_one_endpoint_truncates_instead_of_destroying_the_selection() {
     );
 }
 
-/// The non-vacuity control: once BOTH endpoints are evicted there is nothing to clamp
+/// The non-vacuity control: once both endpoints are evicted there is nothing to clamp
 /// onto and the honest answer is still a clear, with no sticky ` incomplete`.
 #[test]
 fn evicting_both_endpoints_still_clears_the_selection() {
@@ -489,7 +465,7 @@ fn evicting_both_endpoints_still_clears_the_selection() {
     assert_eq!(term.selection_to_string_bounded(), (None, false));
 }
 
-/// EVICTION WITH NO DELTA. Shrinking the retention limit drops the oldest lines
+/// eviction with no delta. Shrinking the retention limit drops the oldest lines
 /// without scrolling anything and without recording a damage band, so neither the
 /// geometric transform nor the damage test in `post_process` sees it. This is the
 /// entry point `adjust_for_scroll` cannot serve.
@@ -520,13 +496,12 @@ fn shrinking_the_retention_limit_truncates_a_selection_it_evicted() {
     assert!(term.text_selection().truncated());
 }
 
-/// THE ALT-SCREEN GUARD, at the terminal level. The alt grid is always
-/// `Grid::with_scrollback(rows, cols, 0)`, so its floor is row 0 and there is no
-/// oldest RETAINED row to clamp onto. Clamping would pin the highlight to alt row 0 —
-/// content the user never selected — and a full-screen alt scroll takes the uniform
-/// delta path and records no damage band that could catch it afterwards. The guard is
-/// structural (`min_row == 0`), not a test of `alternate_screen`, so it holds for a
-/// primary grid configured with zero scrollback too.
+/// The alt-screen guard, at the terminal level. The alt grid has no scrollback
+/// (`Grid::with_scrollback(rows, cols, 0)`), so there is no oldest retained row
+/// to clamp onto; clamping would pin the highlight to alt row 0, and a
+/// full-screen alt scroll records no band that could catch it afterwards. The
+/// guard is structural (`min_row == 0`), so it also holds for a primary grid
+/// with zero scrollback.
 #[test]
 fn a_scroll_on_the_alt_screen_clears_rather_than_clamping_to_alt_row_zero() {
     let mut term = Terminal::new(24, 40);
@@ -537,7 +512,7 @@ fn a_scroll_on_the_alt_screen_clears_rather_than_clamping_to_alt_row_zero() {
     for i in 0..10 {
         term.process(format!("alt-{i}\r\n").as_bytes());
     }
-    // Select on alt with the LOWER endpoint one scroll away from the floor and the
+    // Select on alt with the lower endpoint one scroll away from the floor and the
     // upper endpoint safely inside it — the shape a both-endpoints case cannot test.
     {
         let sel = term.text_selection_mut();
@@ -558,14 +533,8 @@ fn a_scroll_on_the_alt_screen_clears_rather_than_clamping_to_alt_row_zero() {
 }
 
 // ---------------------------------------------------------------------------
-// The REST of the inverse hole: ECH / ICH / DCH, and ordinary character output.
-//
-// EL was marked on the argument that a `\r` + EL spinner left a highlight over
-// replaced text. ECH, ICH and DCH are the same class — explicit CSI content
-// replacement on the cursor's row — and recorded nothing, so the two ops differed
-// only in which one got a mark: `\x1b[40X` left the stale highlight that `\x1b[K`
-// cleared. Ordinary output is the third shape, and the one the spinner example
-// actually names when the program does not bother with EL.
+// ECH / ICH / DCH and ordinary character output: like EL, each replaces content
+// on the cursor's row, so each records selection damage.
 // ---------------------------------------------------------------------------
 
 /// A 24x40 terminal with `hello world` on live row 0 and a completed selection over
@@ -600,7 +569,7 @@ fn erasing_chars_on_the_selected_line_clears_the_stale_highlight() {
     );
 }
 
-/// DCH (CSI P) shifts the row's tail LEFT under the highlight, so the copy comes back
+/// DCH (CSI P) shifts the row's tail left under the highlight, so the copy comes back
 /// shifted by N columns — text the user never selected, not even a prefix of it.
 #[test]
 fn deleting_chars_on_the_selected_line_clears_the_stale_highlight() {
@@ -614,7 +583,7 @@ fn deleting_chars_on_the_selected_line_clears_the_stale_highlight() {
     );
 }
 
-/// ICH (CSI @) shifts it RIGHT, the mirror image.
+/// ICH (CSI @) shifts it right, the mirror image.
 #[test]
 fn inserting_chars_on_the_selected_line_clears_the_stale_highlight() {
     let mut term = with_live_row_zero_selection();
@@ -627,7 +596,7 @@ fn inserting_chars_on_the_selected_line_clears_the_stale_highlight() {
     );
 }
 
-/// …and all three on ANOTHER row must spare it. Without this half the fix above is
+/// …and all three on another row must spare it. Without this half the fix above is
 /// indistinguishable from a return to clearing on every content op.
 #[test]
 fn char_edits_on_another_line_spare_the_highlight() {
@@ -645,13 +614,11 @@ fn char_edits_on_another_line_spare_the_highlight() {
     }
 }
 
-/// …and the POSITIVE half, the bug itself: ECH/ICH/DCH on the row the highlight
-/// sits on rewrite it (program output, no keypress — the GUI's typing-deselect
-/// never fires), so the stale highlight MUST be cleared or a copy returns text
-/// the user never selected. The spare test above only proves the scoping is not
-/// a blanket clear; without this direction, a regression that recorded NO
-/// selection damage on these ops would pass it. Uses the cursor's own row
-/// (1;1H) so the edit overlaps the selection on row 0.
+/// The positive half: ECH/ICH/DCH on the highlighted row (program output, so
+/// the GUI's typing-deselect never fires) must clear the stale highlight.
+/// Without this direction, recording no damage for these ops would pass the
+/// spare test above. Uses the cursor's own row (1;1H) so the edit overlaps the
+/// selection on row 0.
 #[test]
 fn char_edits_on_the_selected_line_clear_the_stale_highlight() {
     for op in [&b"\x1b[40X"[..], &b"\x1b[3P"[..], &b"\x1b[3@"[..]] {
@@ -668,7 +635,7 @@ fn char_edits_on_the_selected_line_clear_the_stale_highlight() {
     }
 }
 
-/// The canonical progress bar WITHOUT an erase: `\r` plus a plain overwrite. The
+/// The canonical progress bar without an erase: `\r` plus a plain overwrite. The
 /// design used exactly this example, and only the `\r\e[K` spelling was closed —
 /// ordinary character output recorded nothing, so the highlight stayed painted over
 /// `Progress: 90%` and a copy returned it.
@@ -692,14 +659,13 @@ fn a_bare_carriage_return_overwrite_clears_the_stale_highlight() {
     );
 }
 
-/// Every PRINT PATH records, not just the one the progress bar happens to take. The
-/// parser splits printable text four ways — a bulk ASCII blast, a per-character
-/// `print`, a bulk Unicode run, and REP's bulk arm, which reaches the grid without
-/// going through `write_char` at all — and a bracket missing from any one of them is
-/// a stale highlight for whichever program's output takes that shape.
+/// Every print path records: the parser splits printable text four ways (a
+/// bulk ASCII blast, per-character `print`, a bulk Unicode run, and REP's bulk
+/// arm, which bypasses `write_char`), and a missing bracket in any one is a
+/// stale highlight for output of that shape.
 #[test]
 fn every_print_path_records_output_damage_on_the_row_it_lands() {
-    // (tail of the SETUP batch, then the overwrite batch)
+    // (tail of the setup batch, then the overwrite batch)
     for (setup, overwrite) in [
         ("", "\rAAAA"),             // bulk ASCII blast
         ("", "\ré"),                // one non-ASCII char: the per-character path
@@ -725,9 +691,8 @@ fn every_print_path_records_output_damage_on_the_row_it_lands() {
     }
 }
 
-/// …and an overwrite on a row the selection does not touch must spare it — the
-/// property that makes ordinary-output damage a BAND rather than the old
-/// kill-everything sentinel. A background job repainting further down the screen is
+/// …and an overwrite on a row the selection does not touch must spare it:
+/// ordinary-output damage is a band, not a blanket clear. A background job repainting further down the screen is
 /// the common case.
 #[test]
 fn ordinary_output_on_another_row_spares_the_highlight() {
@@ -741,7 +706,7 @@ fn ordinary_output_on_another_row_spares_the_highlight() {
     }
     assert!(term.text_selection().has_selection());
 
-    // A genuine OVERWRITE of row 9, not an append onto blank cells: this must record
+    // A genuine overwrite of row 9, not an append onto blank cells: this must record
     // a band, and the band must miss row 0.
     term.process(b"\x1b[10;1Hbackground job OUTPUT");
 
@@ -751,7 +716,7 @@ fn ordinary_output_on_another_row_spares_the_highlight() {
     );
 }
 
-/// A print that APPENDS past a row's existing content REPLACES nothing, so it must
+/// A print that appends past a row's existing content replaces nothing, so it must
 /// not clear a selection over that row. Not a nicety: a top-anchored history splice
 /// (Codex `insert_history`) fills the blank row it just created, and the piecewise
 /// remap deliberately carries a selection across that — marking the fill would
@@ -783,11 +748,9 @@ fn appending_to_the_selected_row_spares_the_highlight() {
     );
 }
 
-/// TWO DISJOINT REPAINTS IN ONE BATCH. An inline TUI redrawing its title row and its
-/// composer box in one PTY read produces two separated EL bands. They used to
-/// hull-union into one band covering everything between them, destroying a selection
-/// on rows nothing had rewritten — and adding EL to the marking set is what made that
-/// reachable. The bands are kept apart now, up to `MAX_SELECTION_DAMAGE_BANDS`.
+/// Two disjoint repaints in one batch (an inline TUI redrawing its title row and
+/// composer box in one read) stay two bands, up to `MAX_SELECTION_DAMAGE_BANDS`,
+/// so a selection on the rows between them survives.
 #[test]
 fn two_disjoint_repaints_in_one_batch_spare_the_selection_between_them() {
     let mut term = Terminal::new(24, 40);
@@ -802,7 +765,7 @@ fn two_disjoint_repaints_in_one_batch_spare_the_selection_between_them() {
     }
     assert!(term.text_selection().has_selection());
 
-    // ONE batch: the title row and the composer box, twenty rows apart.
+    // One batch: the title row and the composer box, twenty rows apart.
     term.process(b"\x1b[1;1H\x1b[K\x1b[21;1H\x1b[K");
 
     assert!(
@@ -811,7 +774,7 @@ fn two_disjoint_repaints_in_one_batch_spare_the_selection_between_them() {
     );
 }
 
-/// The bound is FOUR, and it is exact in both directions. Four disjoint repaints stay
+/// The bound is four, and it is exact in both directions. Four disjoint repaints stay
 /// four bands…
 #[test]
 fn four_disjoint_repaints_in_one_batch_spare_the_selection_between_them() {
@@ -831,13 +794,9 @@ fn four_disjoint_repaints_in_one_batch_spare_the_selection_between_them() {
     );
 }
 
-/// …and so is a FIFTH, which the first version of this bound could not manage.
-///
-/// The accumulator originally held four bands and collapsed to the HULL on the
-/// fifth, so a box border drawn in pieces and then filled — four regions plus one
-/// drawn as two — lost every gap and cleared a selection nothing had rewritten. The
-/// set now holds eight and, past that, absorbs the closest PAIR rather than
-/// collapsing. This is the case that regressed.
+/// A fifth band: the accumulator holds eight bands and past that merges the
+/// closest pair rather than collapsing to the hull, so a box border drawn in
+/// pieces and then filled keeps its gaps.
 #[test]
 fn a_fifth_disjoint_repaint_still_spares_the_gap_between_them() {
     let mut term = Terminal::new(24, 40);
@@ -860,11 +819,11 @@ fn a_fifth_disjoint_repaint_still_spares_the_gap_between_them() {
     );
 }
 
-/// Past the bound the set gives up precision, and it must give it up in the SAFE
+/// Past the bound the set gives up precision, and it must give it up in the safe
 /// direction: an over-clear, never a stale highlight over replaced text.
 ///
 /// Nine separated repaints for a bound of eight. Whatever pair absorbs, the cover
-/// still includes every row that was erased — so a selection ON one of them goes.
+/// still includes every row that was erased — so a selection on one of them goes.
 #[test]
 fn past_the_bound_a_selection_on_a_repainted_row_still_clears() {
     let mut term = Terminal::new(24, 40);
@@ -888,15 +847,13 @@ fn past_the_bound_a_selection_on_a_repainted_row_still_clears() {
     );
 }
 
-/// The output-dedup guard must DIE with the batch that owns it.
+/// The output-dedup guard dies with the batch that owns it.
 ///
-/// `damage_selection_output` skips recording when a print lands on the row it just
-/// recorded, so a run of prints into one row costs one band instead of thousands.
-/// That guard is an assertion about the CURRENT accumulator, so `take_selection_damage`
-/// clears it on drain. If it leaked across batches, the first print of the next batch
-/// landing on the same row would record nothing — and a selection made in between
-/// would survive text that replaced it, which is the stale-highlight, wrong-copy
-/// failure this whole design exists to prevent.
+/// `damage_selection_output` skips recording when a print lands on the row it
+/// just recorded, and `take_selection_damage` clears that guard on drain. If it
+/// leaked across batches, the next batch's first print on the same row would
+/// record nothing and a selection made in between would survive being
+/// overwritten.
 #[test]
 fn the_output_dedup_guard_does_not_leak_into_the_next_batch() {
     let mut term = Terminal::new(24, 40);
@@ -918,7 +875,7 @@ fn the_output_dedup_guard_does_not_leak_into_the_next_batch() {
         "precondition: an overwriting print clears a selection on the row it replaced"
     );
 
-    // Batch 2 lands on the SAME row. A leaked guard would suppress this mark.
+    // Batch 2 lands on the same row. A leaked guard would suppress this mark.
     select_row_5(&mut term);
     assert!(
         term.text_selection().has_selection(),

@@ -37,6 +37,9 @@ aterm-spec = { workspace = true, optional = true }
 # (src/windows/) is direct kernel32 `extern "system"` FFI — no libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# The child's inheritance strip (`spawnfd::InheritStrip`): the one copy of it,
+# beside the workspace's other descriptor primitives. Dependency-free.
+aterm-uds = { workspace = true }
 
 # Test-only: the pty tests mint a root `Authority` (unix.rs, windows/mod.rs,
 # tests/windows_smoke.rs). `launcher-mint` makes the sealed

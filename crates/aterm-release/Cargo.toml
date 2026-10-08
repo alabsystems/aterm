@@ -43,6 +43,10 @@ aterm-types = { workspace = true }
 # so publisher and updater client agree by compilation, not by convention — the
 # publish-time byte round-trip through the CLIENT's parser is the bridge proof.
 aterm-update-core = { workspace = true }
+# The LIFELINE the x86_64 slice's Rosetta session holds (`aterm_uds::lifeline`,
+# gap #36): a cut killed mid-drive takes the translated instance with it. A
+# dependency-free leaf the shipped binary links already.
+aterm-uds = { workspace = true }
 # The cutter builds with the toolchain atpkg installs, so it resolves the store the
 # same way atpkg does rather than guessing at a path.
 atpkg = { workspace = true }
@@ -51,7 +55,7 @@ atpkg = { workspace = true }
 serde = { workspace = true }
 # First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
 # untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
-# behind it; `serde_json` survives only as that crate's [dev-dependencies] oracle.
+# behind it.
 aterm-json = { workspace = true }
 aterm-toml = { workspace = true }
 # DMG sha256 is computed in-process (dmg.rs) — never shelled out to `shasum`,
@@ -61,11 +65,9 @@ aterm-digest = { workspace = true }
 # deliberately external/owner-only, but trusting its exit status would not bind
 # the bytes uploaded to the public key compiled into clients.
 ring = { version = "0.17.14", default-features = false }
-# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
-# to the retired `base64` package's `general_purpose::STANDARD` engine by
-# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
-# point every trust path uses: canonical padding REQUIRED and no trailing bits,
-# so a pinned key has exactly one spelling.
+# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# the entry point every trust path uses: canonical padding REQUIRED and no
+# trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
 # The provisioning engine: `targo --unverified ship provision` drives the join ceremony
 # in-process (RELEASE-KEYS.md's "signing is in-process" rule, extended to
@@ -75,9 +77,16 @@ aterm-codec = { workspace = true }
 atpkg-keys = { workspace = true }
 
 [dev-dependencies]
+# The one trustd probe and skip line, and the bounded child runner the tests' own
+# codesign spawns use (`aterm_uds::deadline`).
+aterm-uds = { workspace = true, features = ["test-support"] }
 # Tier-1 binds the real release-floor resolver and late guard to their derived
 # lifecycle model; production release binaries retain no spec dependency.
 aterm-spec = { workspace = true }
+# Test scratch directories removed on drop. (The two production private
+# directories, `buildplan::PrivateSliceDir` and `publish::PrivateTempDir`, keep
+# their own code: library code this crate's Trust lane verifies.)
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

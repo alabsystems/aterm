@@ -30,19 +30,20 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     layout: atpkg::store::Layout,
 }
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-seed-disabled-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-seed-disabled-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(root.join("registry")).unwrap();
+        std::fs::create_dir_all(root.path().join("registry")).unwrap();
         let prefix = atpkg::store::default_prefix(&home);
         assert!(
             prefix.starts_with(&home),
@@ -57,7 +58,7 @@ impl Fixture {
     }
 
     fn seed(&self, declined: bool) -> Output {
-        let config = self.root.join("config");
+        let config = self.root.path().join("config");
         std::fs::create_dir_all(config.join("aterm")).unwrap();
         std::fs::write(
             config.join("aterm/aterm.toml"),
@@ -71,10 +72,10 @@ impl Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.arg("seed")
             .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env(
                 "ATPKG_REGISTRY",
-                format!("dir:{}", self.root.join("registry").display()),
+                format!("dir:{}", self.root.path().join("registry").display()),
             )
             .env_remove("RUSTUP_HOME")
             .env_remove("ATERM_CHILD")
@@ -96,12 +97,6 @@ impl Fixture {
         .into_iter()
         .filter(|p| std::fs::symlink_metadata(p).is_ok())
         .collect()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

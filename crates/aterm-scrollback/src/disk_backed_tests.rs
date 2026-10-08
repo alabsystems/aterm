@@ -740,13 +740,11 @@ fn disk_backed_tier_aware_truncate_avoids_rebuild() {
     }
 }
 
-/// Push with line_limit exercises constant-time truncation via front_offset.
-///
-/// With the old decompress-and-rebuild approach, every push to a full
-/// scrollback was O(N). With tier-aware truncation, cold-tier removal
-/// is O(1) per push.
+/// Push with line_limit truncates from the front (tier-aware truncation via
+/// front_offset) and keeps the newest lines readable. Its cost is not read
+/// off a clock here: a correctness test holds no latency budget.
 #[test]
-fn disk_backed_push_with_line_limit_constant_time() {
+fn disk_backed_push_with_line_limit_keeps_the_newest_lines() {
     use aterm_tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -765,116 +763,107 @@ fn disk_backed_push_with_line_limit_constant_time() {
     assert_eq!(sb.line_count(), 100);
 
     // Push 200 more lines (each triggers a truncation).
-    // With O(1) truncation this completes quickly. With O(N) rebuild
-    // each push would decompress all 100 kept lines.
-    let start = std::time::Instant::now();
     for i in 0..200 {
         sb.push_str(&format!("extra-{i}")).unwrap();
     }
-    let elapsed = start.elapsed();
 
     assert_eq!(sb.line_count(), 100, "line limit enforced");
 
     // Verify last pushed line is accessible.
     let last = sb.get_line(99).unwrap().unwrap();
     assert_eq!(last.to_string(), "extra-199");
-
-    // Sanity: this should complete in well under 5 seconds even on slow CI.
-    // The old O(N) approach could take 10+ seconds with Zstd decompression.
-    assert!(
-        elapsed.as_secs() < 5,
-        "push loop took {elapsed:?} — expected <5s with O(1) truncation"
-    );
 }
 
 // =========================================================================
-// Property tests: DiskBacked push_str + get_line round-trip (#2603)
+// DiskBacked push_str + get_line round-trip over generated lines (#2603)
 // =========================================================================
 //
 // Kani cannot verify DiskBacked directly because the constructor requires
 // file I/O, and the cold tier uses Zstd compression (FFI to C library).
-// These property tests cover the full pipeline that Kani cannot reach:
-// push_str → Line → serialize → compress → disk → decompress → deserialize
-// → get_line → content comparison.
+// This covers the full pipeline Kani cannot reach: push_str → Line →
+// serialize → compress → disk → decompress → deserialize → get_line.
 
-mod proptest_disk_backed {
-    use super::*;
-    use proptest::prelude::*;
-
-    /// Strategy for generating terminal-like line content.
-    ///
-    /// Includes plain ASCII, short strings, and Unicode to exercise
-    /// different serialization paths (inline vs heap storage).
-    fn line_content_strategy() -> impl Strategy<Value = String> {
-        prop_oneof![
-            // Plain ASCII (common case)
-            "[a-zA-Z0-9 ]{0,120}",
-            // Short strings (inline storage path)
-            "[a-z]{0,10}",
-            // Longer lines (heap storage path)
-            "[a-zA-Z0-9 !@#$%]{120,300}",
-            // Unicode content
-            "(hello|世界|ñoño|café|🎉){1,5}",
-        ]
-    }
-
-    proptest! {
-        // 64 cases (not default 256): each case does full disk I/O through
-        // hot→warm→cold tiers, making 256 iterations disproportionately
-        // expensive (~12s). 64 cases still exercises all code paths.
-        #![proptest_config(ProptestConfig::with_cases(64))]
-
-        /// Push N lines via push_str, then verify every line via get_line.
-        ///
-        /// Exercises the full disk-backed pipeline: hot → warm → cold (disk)
-        /// → read back with decompression and cache.
-        #[test]
-        fn push_str_get_line_roundtrip(
-            lines in proptest::collection::vec(line_content_strategy(), 1..60),
-        ) {
-            let dir = aterm_tempfile::tempdir().unwrap();
-            let path = dir.path().join("prop-roundtrip.dtrm");
-
-            // Small limits to force tier transitions (hot→warm→cold)
-            let config = DiskBackedScrollbackConfig::new(&path)
-                .with_hot_limit(5)
-                .with_warm_limit(10)
-                .with_block_size(5);
-            let mut sb = DiskBackedScrollback::with_config(config).unwrap();
-
-            for line in &lines {
-                sb.push_str(line).unwrap();
-            }
-
-            // Verify line count
-            prop_assert_eq!(sb.line_count(), lines.len());
-
-            // Verify tier sum invariant
-            let hot = sb.hot_line_count();
-            let warm = sb.warm_line_count();
-            let cold = sb.cold_line_count();
-            prop_assert_eq!(sb.line_count(), hot + warm + cold,
-                "line_count ({}) != hot ({}) + warm ({}) + cold ({})",
-                sb.line_count(), hot, warm, cold);
-
-            // Verify every line round-trips correctly
-            for (i, expected) in lines.iter().enumerate() {
-                let retrieved = sb.get_line(i)
-                    .unwrap_or_else(|e| panic!("get_line({i}) I/O error: {e}"))
-                    .unwrap_or_else(|| panic!("get_line({i}) returned None"));
-                let actual = retrieved.to_string();
-                let tier = if i < cold { "cold" } else if i < cold + warm { "warm" } else { "hot" };
-                prop_assert!(
-                    actual == *expected,
-                    "line {} content mismatch (tier: {}): got {:?}, expected {:?}",
-                    i, tier, actual, expected
-                );
-            }
-
-            // Out-of-bounds must return None
-            let oob = sb.get_line(lines.len()).unwrap();
-            prop_assert!(oob.is_none(), "out-of-bounds index must return None");
+/// Terminal-like line content across the serialization paths: plain ASCII,
+/// short (inline storage), long (heap storage) and multi-byte Unicode.
+fn generated_line(next: &mut impl FnMut(u64) -> u64) -> String {
+    const ASCII: &[u8] = b"abcXYZ019 ";
+    const WIDE: &[u8] = b"abcXYZ019 !@#$%";
+    const WORDS: &[&str] = &["hello", "世界", "ñoño", "café", "🎉"];
+    let pick = |next: &mut dyn FnMut(u64) -> u64, from: &[u8], n: u64| -> String {
+        (0..n)
+            .map(|_| char::from(from[next(from.len() as u64) as usize]))
+            .collect()
+    };
+    match next(4) {
+        0 => {
+            let n = next(121);
+            pick(next, ASCII, n)
         }
+        1 => {
+            let n = next(11);
+            (0..n).map(|_| char::from(b'a' + next(26) as u8)).collect()
+        }
+        2 => {
+            let n = 120 + next(181);
+            pick(next, WIDE, n)
+        }
+        _ => (0..1 + next(5))
+            .map(|_| WORDS[next(WORDS.len() as u64) as usize])
+            .collect(),
+    }
+}
+
+/// Push N lines, then verify every line, the tier sum and the out-of-bounds
+/// read. Each case does full disk I/O through hot→warm→cold, so 64 cases.
+#[test]
+fn push_str_get_line_roundtrip() {
+    let mut rng = aterm_spec::rng::XorShift::new(0xD15C_BAC0);
+    let mut next = move |n: u64| rng.below(n);
+    for _ in 0..64 {
+        let lines: Vec<String> = (0..1 + next(59))
+            .map(|_| generated_line(&mut next))
+            .collect();
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("roundtrip.dtrm");
+
+        // Small limits to force tier transitions (hot→warm→cold)
+        let config = DiskBackedScrollbackConfig::new(&path)
+            .with_hot_limit(5)
+            .with_warm_limit(10)
+            .with_block_size(5);
+        let mut sb = DiskBackedScrollback::with_config(config).unwrap();
+        for line in &lines {
+            sb.push_str(line).unwrap();
+        }
+
+        assert_eq!(sb.line_count(), lines.len());
+        let (hot, warm, cold) = (
+            sb.hot_line_count(),
+            sb.warm_line_count(),
+            sb.cold_line_count(),
+        );
+        assert_eq!(sb.line_count(), hot + warm + cold, "tier sum");
+
+        for (i, expected) in lines.iter().enumerate() {
+            let actual = sb
+                .get_line(i)
+                .unwrap_or_else(|e| panic!("get_line({i}) I/O error: {e}"))
+                .unwrap_or_else(|| panic!("get_line({i}) returned None"))
+                .to_string();
+            let tier = if i < cold {
+                "cold"
+            } else if i < cold + warm {
+                "warm"
+            } else {
+                "hot"
+            };
+            assert_eq!(actual, *expected, "line {i} ({tier})");
+        }
+
+        assert!(
+            sb.get_line(lines.len()).unwrap().is_none(),
+            "out-of-bounds index must return None"
+        );
     }
 }
 

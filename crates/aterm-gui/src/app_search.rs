@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cmd-F / Emacs-navigation find overlay: the in-progress find state (`SearchState`),
-//! the absolute→
-//! selection coordinate map (`map_matches`), and the `App`-side enter/recompute/
-//! apply/step/exit methods (an inherent-impl split).
+//! Cmd-F / Emacs-navigation find overlay: the in-progress find state
+//! (`SearchState`), the absolute → selection coordinate map (`map_matches`), and
+//! the `App`-side enter/recompute/apply/step/exit methods.
 //!
-//! The heavy lifting — a FULL-history trigram search built off the term lock and
-//! cached across keystrokes — lives in [`crate::control::search_full_history`],
-//! shared with the socket `search` verb so a live ⌘F and a scripted `search` over the
-//! same content reuse one index. This module is the GUI adapter: it calls that helper,
-//! maps the engine's ABSOLUTE match rows into the overlay's SELECTION coordinates, and
-//! drives the current-match cursor + highlight.
+//! The search itself (a full-history trigram index built off the term lock and
+//! cached across keystrokes) lives in [`crate::control::search_full_history`],
+//! shared with the socket `search` verb so a live ⌘F and a scripted `search` over
+//! the same content reuse one index. This module calls it, maps the engine's
+//! absolute match rows into the overlay's selection coordinates, and drives the
+//! current-match cursor and highlight.
 
 use std::time::Instant;
 
@@ -21,10 +20,10 @@ use aterm_core::search::{SearchDirection as EngineSearchDirection, SearchMatch};
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 
-/// Direction of an incremental terminal search. Forward is the legacy Cmd-F
+/// Direction of an incremental terminal search. Forward is the plain Cmd-F
 /// default; backward is selected by Cmd-R/Ctrl-R and makes every query recompute
-/// land at/before the Emacs search point immediately (there is never a
-/// wrong-direction flash).
+/// land at/before the Emacs search point immediately (never a wrong-direction
+/// flash).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SearchDirection {
     #[default]
@@ -50,12 +49,11 @@ impl SearchDirection {
     }
 }
 
-/// One text-field edit of the find query — the vocabulary behind the find bar's
-/// caret. The bar is a REAL single-line text field, so it speaks the standard
-/// macOS/readline motions (^A/^E/^B/^F, ⌥←/⌥→ by word, Home/End) and kills
-/// (^K/^U/^W, ⌥⌫, ⌘⌫) rather than only appending and popping at the end.
+/// One text-field edit of the find query. The bar is a real single-line text
+/// field, so it speaks the standard macOS/readline motions (^A/^E/^B/^F, ⌥←/⌥→
+/// by word, Home/End) and kills (^K/^U/^W, ⌥⌫, ⌘⌫).
 ///
-/// Split out of the key handler so the whole editing model is pure, unit-testable
+/// Kept separate from the key handler so the editing model is pure, unit-testable
 /// state ([`SearchState::edit`]) and repeatable on a held key
 /// ([`crate::SearchRepeatAction`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,70 +78,43 @@ pub(crate) enum SearchEdit {
     MoveTo(usize),
 }
 
-/// Word characters for the ⌥-arrow / ^W / ⌥⌫ motions: alphanumerics plus `_`, the
-/// readline convention. Everything else (space, punctuation, path separators) is a
-/// boundary, so ⌥← walks a path or a shell command one component at a time.
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// Byte offset of the previous word boundary before `at`: skip any separators
-/// immediately behind the caret, then the word itself. `at` must be a char boundary
-/// (every caret position is).
+/// Byte offset of the previous word boundary before `at`: the start of the word the
+/// caret is in, or else of the word before it.
+///
+/// A word is the readline convention's run of alphanumerics plus `_`, with the marks
+/// and the format controls that spell it ([`aterm_grapheme::words`], the rule a
+/// double-click follows too). Everything else (space, punctuation, path separators,
+/// an invisible control) is a boundary, so ⌥← walks a path or a shell command one
+/// component at a time and never stops inside `नमस्ते` or `می‌خواهم`. A step costs
+/// the distance it moves, not the length of the field.
 fn prev_word_boundary(s: &str, at: usize) -> usize {
-    let mut idx = at.min(s.len());
-    let back = |i: usize| -> Option<(usize, char)> {
-        s[..i].chars().next_back().map(|c| (i - c.len_utf8(), c))
-    };
-    while let Some((prev, ch)) = back(idx) {
-        if is_word_char(ch) {
-            break;
-        }
-        idx = prev;
-    }
-    while let Some((prev, ch)) = back(idx) {
-        if !is_word_char(ch) {
-            break;
-        }
-        idx = prev;
-    }
-    idx
+    aterm_grapheme::word_start_before(s, at, aterm_grapheme::is_word_char).unwrap_or(0)
 }
 
-/// Byte offset of the next word boundary after `at` — the forward twin of
-/// [`prev_word_boundary`].
+/// Byte offset of the next word boundary after `at`: the end of the word the caret is
+/// in, or else of the word after it — the forward twin of [`prev_word_boundary`],
+/// read from the last word break before the caret.
 fn next_word_boundary(s: &str, at: usize) -> usize {
-    let mut idx = at.min(s.len());
-    let ahead = |i: usize| -> Option<(usize, char)> {
-        s[i..].chars().next().map(|c| (i + c.len_utf8(), c))
-    };
-    while let Some((next, ch)) = ahead(idx) {
-        if is_word_char(ch) {
-            break;
-        }
-        idx = next;
-    }
-    while let Some((next, ch)) = ahead(idx) {
-        if !is_word_char(ch) {
-            break;
-        }
-        idx = next;
-    }
-    idx
+    let from = aterm_grapheme::word_break_before(s, at, aterm_grapheme::is_word_char);
+    aterm_grapheme::words(
+        s.get(from..).unwrap_or_default(),
+        aterm_grapheme::is_word_char,
+    )
+    .map(|word| from.saturating_add(word.end))
+    .find(|&end| end > at)
+    .unwrap_or(s.len())
 }
 
 /// Apply one [`SearchEdit`] to a bare `(text, cursor)` single-line field, returning
-/// `true` when the TEXT changed and `false` for a pure caret move.
+/// `true` when the text changed and `false` for a pure caret move.
 ///
-/// The whole editing model of every in-grid single-line field lives here, on the
-/// two values a field actually is — the find bar owns a [`SearchState`], the tab
-/// strip's inline rename owns a `String` plus a byte offset, and both get the same
-/// caret motions, word/line kills and paste behaviour from ONE reducer rather than
-/// two that drift.
+/// The editing model of every in-grid single-line field: the find bar (a
+/// [`SearchState`]) and the tab strip's inline rename (a `String` plus a byte
+/// offset) share the same caret motions, kills and paste behaviour.
 ///
 /// Pure and total: every offset is clamped into `text` and floored onto a char
-/// boundary, so no edit — including one applied a frame after the text it was
-/// classified against — can panic or split a multi-byte character.
+/// boundary, so no edit (even one applied a frame after the text it was
+/// classified against) can panic or split a multi-byte character.
 pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: SearchEdit) -> bool {
     // The largest char boundary at or before `at`, already clamped into `text`.
     let floor = |text: &str, at: usize| -> usize {
@@ -166,10 +137,10 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
     let at = *cursor;
     match edit {
         SearchEdit::Insert(insert) => {
-            // ⎋/⏎/⇥ and friends are COMMANDS in a one-line field, and a multi-line
-            // clipboard is not one line: keep the printable characters only. The two
-            // Unicode line/paragraph separators are line breaks that `is_control`
-            // does NOT classify as such, so they are named explicitly.
+            // ⎋/⏎/⇥ and friends are commands in a one-line field, and a multi-line
+            // clipboard is not one line: keep printable characters only. The
+            // Unicode line/paragraph separators are not `is_control`, so they are
+            // named explicitly.
             let insert: String = insert
                 .chars()
                 .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
@@ -261,31 +232,29 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
     }
 }
 
-/// Drop the find highlight only when the output that invalidated the match vector
-/// could actually have moved the text under it.
+/// Drop the find highlight only when the output that invalidated the match
+/// vector could have moved the text under it.
 ///
-/// The four stamps the find bar keeps (`results_dirty`,
-/// `match_absolute_row_revision`, `match_history_renumber_epoch`,
-/// `match_content_seq`) answer ONE question: "may I still use this match vector
-/// to compute a row and a column". They are not evidence about the HIGHLIGHT,
-/// which since the selection-custody work is maintained by `post_process`
-/// itself — a uniform scroll remaps the anchors, a piecewise splice remaps or
-/// destroys them, and a damage band that overlaps them clears them. By the time
-/// the GUI runs, the selection is already correct or already gone.
+/// The find bar's four stamps (`results_dirty`, `match_absolute_row_revision`,
+/// `match_history_renumber_epoch`, `match_content_seq`) say whether the match
+/// vector may still be used to compute a row and column. They say nothing about
+/// the highlight, which `post_process` maintains itself: a uniform scroll remaps
+/// the anchors, a piecewise splice remaps or destroys them, and an overlapping
+/// damage band clears them. By the time the GUI runs, the selection is already
+/// correct or gone.
 ///
-/// So the band that matters is the MUTABLE one: rows at or below `live_top_abs` are the
-/// live screen, which the streaming write can have overwritten cell-by-cell under an
-/// unchanged row number. Rows above it are archived history — immutable except for
-/// eviction and wholesale renumbering, both of which the engine already accounted for.
-/// This is the same immutability argument `CachedSearchIndex` is built on.
+/// So only the mutable band matters: rows at or below `live_top_abs` are the live
+/// screen, which streaming output can overwrite cell by cell under an unchanged
+/// row number. Rows above are archived history, immutable except for eviction and
+/// wholesale renumbering, which the engine already accounted for (the same
+/// argument `CachedSearchIndex` relies on).
 ///
-/// `live_top_abs` is `absolute_row_counter − rows`, i.e. `Grid::base_y()`, NOT
-/// `top_visible_absolute_row()` — the latter folds in `display_offset`, which would make
-/// the predicate depend on where the user happens to be looking.
+/// `live_top_abs` is `absolute_row_counter − rows`, i.e. `Grid::base_y()`, not
+/// `top_visible_absolute_row()`, which folds in `display_offset` and would make
+/// the predicate depend on where the user is looking.
 ///
-/// Returns whether a highlight was actually destroyed — the caller records a
-/// `UserClear` when it was (PRESS CUSTODY), and a refusal that found nothing to clear
-/// must not claim one.
+/// Returns whether a highlight was destroyed: the caller records a `UserClear`
+/// (press custody) only then.
 fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) -> bool {
     let live_top_abs = u64::try_from(term.grid().base_y()).unwrap_or(u64::MAX);
     let live_bottom_abs = live_top_abs.saturating_add(u64::from(term.rows().saturating_sub(1)));
@@ -299,38 +268,32 @@ fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) -> boo
     false
 }
 
-/// The viewport a find was OPENED from, as an ABSOLUTE anchor rather than a
+/// The viewport a find was opened from, as an absolute anchor rather than a
 /// `display_offset` + `base_y` pair to re-derive a delta from.
 ///
-/// The delta form (`origin_offset + (base_y_now − origin_base_y)`) is only correct
-/// while every row keeps its absolute number and the row count is unchanged, so it
-/// carried a revision gate that skipped the restore outright whenever a top-anchored
-/// protected-footer splice landed. That gate fires for exactly the TUIs that repaint
-/// a pinned footer — codex, Claude Code — so ⎋ silently did nothing all day. An
-/// absolute anchor needs no gate: `scroll_to_absolute_row` re-finds the same LINE
-/// however much output streamed past it, and a splice only renumbers rows BELOW the
-/// insertion point (`apply_absolute_row_update` shifts from `old_live_top + bottom + 1`
-/// down), which is strictly under any scrolled-back origin.
+/// `scroll_to_absolute_row` re-finds the same line however much output streamed
+/// past it, and a protected-footer splice (as codex and Claude Code repaint)
+/// only renumbers rows below the insertion point (`apply_absolute_row_update`
+/// shifts from `old_live_top + bottom + 1` down), strictly under any
+/// scrolled-back origin, so no revision gate is needed.
 ///
-/// Two staleness channels genuinely have no answer and are refused rather than
-/// guessed at, because both make the anchor name a row that no longer exists:
-/// [`Self::history_renumber_epoch`] (a Kitty CSI +T unscroll, a width reflow) and
-/// [`Self::on_alt_screen`] (entering/leaving the alt buffer swaps in a grid whose
-/// absolute counter restarts at `visible_rows`). The old arithmetic teleported the
-/// user to the top of scrollback in the alt case; refusing is a no-op instead.
+/// Two staleness channels have no answer and are refused, since both make the
+/// anchor name a row that no longer exists: [`Self::history_renumber_epoch`] (a
+/// Kitty CSI +T unscroll, a width reflow) and [`Self::on_alt_screen`] (the alt
+/// buffer's absolute counter restarts at `visible_rows`). Refusing leaves the
+/// viewport alone.
 ///
-/// A THIRD channel is deliberately unguarded: scrollback eviction / `\x1b[3J` can
-/// drop the anchored line while find is open. `scroll_to_absolute_row` clamps to the
-/// oldest retained row, which is what `scroll_display` already did, so the failure
-/// mode degrades to "as far back as history still goes" rather than teleporting.
-/// `Grid::oldest_absolute_row` is the predicate if that is ever worth refusing too.
+/// Scrollback eviction / `\x1b[3J` is unguarded: it can drop the anchored line
+/// while find is open, and `scroll_to_absolute_row` then clamps to the oldest
+/// retained row ("as far back as history goes"). `Grid::oldest_absolute_row` is
+/// the predicate if that is ever worth refusing too.
 pub(crate) struct FindOrigin {
     /// The absolute row that was at the TOP of the viewport when find opened.
     pub(crate) top_visible_absolute_row: u64,
-    /// Find opened at the live tail (`display_offset == 0`). Load-bearing, not
-    /// defensive: at the tail the anchored row is exactly the row a protected-footer
-    /// splice ARCHIVES, so anchoring would drop a tail follower one row off the
-    /// bottom on every footer repaint. A tail follower gets the tail back instead.
+    /// Find opened at the live tail (`display_offset == 0`). At the tail the
+    /// anchored row is exactly the row a protected-footer splice archives, so
+    /// anchoring would drop a tail follower one row off the bottom on every
+    /// footer repaint; a tail follower gets the tail back instead.
     pub(crate) was_live: bool,
     /// Which buffer the anchor's absolute numbering belongs to.
     pub(crate) on_alt_screen: bool,
@@ -338,45 +301,167 @@ pub(crate) struct FindOrigin {
     pub(crate) history_renumber_epoch: u64,
 }
 
-/// In-progress Cmd-F find over the full live screen + scrollback history. Matches are
-/// `(row, start_col, end_col)` in SELECTION coordinates (0..rows = live screen,
-/// negative = scrollback); the current one is highlighted by setting the text
-/// selection (the existing overlay — no renderer change) and scrolled into view.
-///
-/// `end_col` is INCLUSIVE and measured from `row`'s column 0 — it is NOT clamped
-/// to the grid width. A long line is one line to the reader and several rows on
-/// the grid, so a hit can start before a soft wrap and finish after it; such a
-/// hit is one match, and its `end_col` runs past the width by exactly the part
-/// that continues on the rows below. Both consumers — the selection the current
-/// match arms and the highlight-all tint — divide by the width to get there.
 /// What the find bar, the title and a screen reader say of a search that found
-/// nothing while the history was away for a rewrap (design ruling 237) — the
-/// long form; the bar shortens it to fit (`find_bar::status_seg`).
+/// nothing while the history was away for a rewrap (the long form; the bar
+/// shortens it to fit, `find_bar::status_seg`).
 pub(crate) const HISTORY_AWAY_NONE: &str = "none yet, history rewrapping";
 
+/// What a find count rests on. The find bar, the window title and the spoken
+/// status word their qualifiers from this one value, so the three name the same
+/// cause: the depth cap (`newest 100,000 lines`), the match limit (`match
+/// limit`), a rewrap holding the history away (`rewrapping`), or output since
+/// the count (`stale`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CountFacts {
+    /// The count is a floor: some of the history was not searched, or the list
+    /// stopped at the match limit.
+    pub(crate) truncated: bool,
+    /// The terminal changed since the count was taken.
+    pub(crate) stale: bool,
+    /// A rewrap held the history away; only the screen was searched.
+    pub(crate) history_away: bool,
+    /// The depth cap stopped the search after this many of the newest lines.
+    pub(crate) searched_lines: Option<usize>,
+    /// The list stopped at [`aterm_search::MAX_SEARCH_MATCHES`].
+    pub(crate) match_capped: bool,
+}
+
+impl CountFacts {
+    /// `+` when the count is a floor.
+    pub(crate) fn plus(&self) -> &'static str {
+        if self.truncated { "+" } else { "" }
+    }
+
+    /// The compact marks: `+` (a floor), `…` (stale), both, or none.
+    pub(crate) fn mark(&self) -> &'static str {
+        match (self.truncated, self.stale) {
+            (true, true) => "+…",
+            (true, false) => "+",
+            (false, true) => "…",
+            (false, false) => "",
+        }
+    }
+
+    /// `newest 100,000 lines` (`short`: `newest 100k lines`), when the depth cap
+    /// stopped the search.
+    pub(crate) fn depth(&self, short: bool) -> Option<String> {
+        self.searched_lines
+            .map(|lines| format!("newest {} lines", line_count(lines, short)))
+    }
+
+    /// Why a floor is a floor, when the code knows; `partial history` when it
+    /// does not. `None` for a whole census, and while the history is away
+    /// (`rewrapping` says it).
+    fn cause(&self, hits: bool, short: bool) -> Option<String> {
+        if self.history_away {
+            None
+        } else if self.match_capped && hits {
+            Some("match limit".to_string())
+        } else if let Some(depth) = self.depth(short) {
+            Some(depth)
+        } else {
+            self.truncated.then(|| "partial history".to_string())
+        }
+    }
+
+    /// The qualifiers of a count of hits, widest first: the cause, then
+    /// `rewrapping`, then `stale`.
+    pub(crate) fn hit_words(&self, short: bool) -> Vec<String> {
+        let mut words: Vec<String> = self.cause(true, short).into_iter().collect();
+        if self.history_away {
+            words.push("rewrapping".to_string());
+        }
+        if self.stale {
+            words.push("stale".to_string());
+        }
+        words
+    }
+
+    /// A zero-match's verdict: `no matches in newest 100,000 lines` when the
+    /// depth cap stopped it, else `no matches`.
+    pub(crate) fn none_base(&self, short: bool) -> String {
+        match self.depth(short) {
+            Some(depth) if !self.history_away => format!("no matches in {depth}"),
+            _ => "no matches".to_string(),
+        }
+    }
+
+    /// The qualifiers a zero-match carries after [`Self::none_base`].
+    pub(crate) fn none_words(&self) -> Vec<String> {
+        let mut words: Vec<String> = if self.searched_lines.is_some() {
+            Vec::new()
+        } else {
+            self.cause(false, false).into_iter().collect()
+        };
+        if self.stale {
+            words.push("stale".to_string());
+        }
+        words
+    }
+}
+
+/// `100,000`; `short` writes a round thousand as `100k`.
+pub(crate) fn line_count(lines: usize, short: bool) -> String {
+    if short && lines >= 1000 && lines.is_multiple_of(1000) {
+        return format!("{}k", lines / 1000);
+    }
+    let digits = lines.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// ` (a, b)`, or nothing for no words.
+pub(crate) fn parenthesized(words: &[String]) -> String {
+    if words.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", words.join(", "))
+    }
+}
+
+/// `, a, b`, or nothing for no words.
+fn comma_list(words: &[String]) -> String {
+    words.iter().map(|word| format!(", {word}")).collect()
+}
+
+/// In-progress find over the live screen and scrollback history. Matches are
+/// `(row, start_col, end_col)` in selection coordinates (0..rows = live screen,
+/// negative = scrollback); the current one is highlighted through the text
+/// selection and scrolled into view.
+///
+/// `end_col` is inclusive and measured from `row`'s column 0, not clamped to
+/// the grid width: a hit that crosses a soft wrap is one match whose `end_col`
+/// runs past the width by the part continuing on the rows below. Both consumers
+/// (the current match's selection and the highlight-all tint) divide by the
+/// width to get there.
 #[derive(Default)]
 pub(crate) struct SearchState {
     pub(crate) query: String,
-    /// Caret position in [`Self::query`], as a BYTE offset on a char boundary. Every
-    /// mutation goes through [`Self::edit`]/[`Self::set_query`], which maintain that
-    /// invariant, and the find bar paints the caret here (not merely after the text).
+    /// Caret position in [`Self::query`], as a byte offset on a char boundary.
+    /// Every mutation goes through [`Self::edit`]/[`Self::set_query`], which keep
+    /// that invariant; the find bar paints the caret here.
     pub(crate) cursor: usize,
     pub(crate) matches: Vec<(i32, u16, u32)>,
     /// Exact point-relative hit when it lies outside the capped batch. Keeping
     /// it separate avoids inserting/removing/shifting 100k elements on every
     /// truncated Cmd-S/Cmd-R repeat.
     point_match: Option<(i32, u16, u32)>,
-    /// The most rows any match in [`Self::matches`] spans past its own — 0 while
-    /// nothing straddles a soft wrap. The compositor binary-slices the sorted
-    /// matches to the visible band by their START row, so without this allowance
-    /// a hit that begins just above the viewport would lose the tint on the part
-    /// of it that IS on screen.
+    /// The most rows any match in [`Self::matches`] spans past its own (0 while
+    /// nothing straddles a soft wrap). The compositor binary-slices the sorted
+    /// matches to the visible band by start row, so without this allowance a hit
+    /// beginning just above the viewport would lose the tint on its visible part.
     pub(crate) max_match_rows: i32,
-    /// The grid `base_y()` the selection rows in [`Self::matches`] were computed against
-    /// (see [`App::search_recompute`]). Selection rows are FRAME-relative but are consumed
-    /// a frame or more later (apply + splice), so if concurrent PTY output scrolls the grid
-    /// meanwhile, the apply/highlight paths re-anchor by `current_base_y − match_base_y` —
-    /// keeping the match on the right line even while output streams into the search.
+    /// The grid `base_y()` the selection rows in [`Self::matches`] were computed
+    /// against (see [`App::search_recompute_in`]). Selection rows are
+    /// frame-relative but consumed a frame or more later, so if PTY output scrolls
+    /// the grid meanwhile, the apply/highlight paths re-anchor by
+    /// `current_base_y − match_base_y`.
     pub(crate) match_base_y: i64,
     /// Terminal revision for top-anchored protected-footer insertions when
     /// [`Self::matches`] was computed. Such a piecewise row splice cannot be
@@ -385,15 +470,12 @@ pub(crate) struct SearchState {
     pub(crate) match_absolute_row_revision: u64,
     /// `Grid::history_renumber_epoch()` when [`Self::matches`] was computed.
     ///
-    /// THE STAMP THE FOOTER REVISION CANNOT STAND IN FOR. A width reflow — an
-    /// edge drag, a font zoom, a divider move — rewraps history and renumbers
-    /// every retained row WHOLESALE, and it moves no `absolute_row_revision` at
-    /// all. Measured with the bar open on "P09=" and one Ctrl-=: `matches` still
-    /// said row 15, the grid now had "P09=" on row 11, and the tint painted a
-    /// four-cell box squarely on "P05=" while the bar read "Find: P09=" 1/1.
-    /// Every consumer of a stored match row therefore fails closed on THIS
-    /// stamp as well — the same law `Terminal::finalize_resize` already applies
-    /// to the text selection, which a width change drops outright.
+    /// The footer revision cannot stand in for this: a width reflow (an edge
+    /// drag, a font zoom, a divider move) rewraps history and renumbers every
+    /// retained row wholesale without moving `absolute_row_revision`, so a stored
+    /// row would point at different text. Every consumer of a stored match row
+    /// fails closed on this stamp too, as `Terminal::finalize_resize` does for the
+    /// text selection.
     pub(crate) match_history_renumber_epoch: u64,
     /// Terminal content generation captured with [`Self::matches`]. Ordinary
     /// streaming output changes this even when absolute-row coordinates remain
@@ -410,29 +492,33 @@ pub(crate) struct SearchState {
     pub(crate) direction: SearchDirection,
     /// Match case (default off = case-insensitive). Toggled with `⌥⌘C` in find mode.
     pub(crate) case_sensitive: bool,
-    /// Treat the query as a regular expression (default off = literal). Toggled with
-    /// `⌥⌘R`; a malformed pattern sets [`Self::regex_error`] instead of matching.
+    /// Treat the query as a regular expression (default off = literal). Toggled
+    /// with `⌥⌘R`; a malformed pattern sets [`Self::regex_error`] instead of
+    /// matching.
     ///
-    /// `^` and `$` anchor the LOGICAL line — the line the reader sees — not the
-    /// grid row a soft wrap split it onto, because find matches whole wrapped
-    /// runs. So `^` does not match at the start of a continuation row, and `$`
-    /// does not match the character a wrap merely pushed to a row's end.
+    /// `^` and `$` anchor the logical line the reader sees, not the grid row a
+    /// soft wrap split it onto, because find matches whole wrapped runs.
     pub(crate) is_regex: bool,
     /// The last recompute's query was an INVALID regex (only reachable in regex mode).
     /// Distinguishes "your pattern is broken" from "zero hits" in the find bar.
     pub(crate) regex_error: bool,
-    /// The search index evicted the oldest history before this query ran (scrollback
-    /// deeper than the configured index cap), so a "no matches" means "none in the
-    /// searched history", not "none anywhere". Copied from [`aterm_search::SearchResults`]
-    /// `incomplete` each recompute so the find bar can qualify a zero-match honestly.
-    /// Also set while a width change's rewrap holds the session's history detached
-    /// (design ruling 234): the search reached only the screen.
+    /// The count is a floor: the depth cap left older history unsearched
+    /// ([`Self::searched_lines`]), the list stopped at the match limit
+    /// ([`Self::match_capped`]), or a width change's rewrap held the history
+    /// detached and only the screen was searched. Copied from
+    /// [`aterm_search::SearchResults`] `incomplete` on each recompute.
     pub(crate) truncated: bool,
+    /// How many of the newest lines the search read when the depth cap
+    /// (`search_history_lines`) left older history unread; `None` when it read
+    /// the whole buffer. Implies [`Self::truncated`].
+    pub(crate) searched_lines: Option<usize>,
+    /// The batch stopped at [`aterm_search::MAX_SEARCH_MATCHES`]: there are
+    /// more hits than the list holds. Implies [`Self::truncated`].
+    pub(crate) match_capped: bool,
     /// The search ran while a width change's rewrap held the session's history
-    /// detached (design ruling 237): the text may well be there, the history is
-    /// simply away. Implies [`Self::truncated`], and says more than it: a
-    /// zero-match here is `none yet`, never `no matches`, because the search runs
-    /// again by itself at the re-attach (`App::rerun_searches_of`).
+    /// detached: the text may be there, the history is simply away. Implies
+    /// [`Self::truncated`]; a zero-match here is `none yet`, never `no matches`,
+    /// because the search runs again at the re-attach (`App::rerun_searches_of`).
     pub(crate) history_away: bool,
     /// Absolute search origin used for Emacs-style point anchoring. At the live
     /// bottom this is the terminal cursor; in a scrolled viewport it is the
@@ -443,38 +529,37 @@ pub(crate) struct SearchState {
 
 impl SearchState {
     /// Replace the whole query (recall, find-again, scripted seeds) and park the
-    /// caret at its END — the single seam that keeps [`Self::cursor`] on a char
-    /// boundary inside the new text.
+    /// caret at its end, keeping [`Self::cursor`] on a char boundary.
     pub(crate) fn set_query(&mut self, query: String) {
         self.query = query;
         self.cursor = self.query.len();
     }
 
-    /// Apply one text-field [`SearchEdit`], returning `true` when the QUERY TEXT
-    /// changed (so the caller re-runs the search) and `false` for a pure caret move
-    /// (which only needs a repaint — the caret is part of the painted state).
-    ///
-    /// Pure and total: every offset is clamped into the query and floored onto a char
-    /// boundary, so no edit — including one applied a frame after the text it was
-    /// classified against — can panic or split a multi-byte character.
+    /// Apply one text-field [`SearchEdit`], returning `true` when the query text
+    /// changed (the caller re-runs the search) and `false` for a pure caret move
+    /// (only a repaint). Pure and total, like [`apply_field_edit`].
     pub(crate) fn edit(&mut self, edit: SearchEdit) -> bool {
         apply_field_edit(&mut self.query, &mut self.cursor, edit)
     }
 
-    /// Temporary native-title projection while find owns the chrome. Kept on
-    /// the search state so warning expiry can restore the exact latest status
-    /// without duplicating its formatting policy.
-    /// The `+` (history deeper than the index) and `…` (the terminal changed
-    /// since this was counted) qualifiers the title and the find bar both carry,
-    /// in that order. Empty when the count is an exact census of the present
-    /// screen — which is the only state that gets to state a bare number.
-    pub(crate) fn count_qualifier(&self) -> &'static str {
-        match (self.truncated, self.results_dirty) {
-            (true, true) => "+…",
-            (true, false) => "+",
-            (false, true) => "…",
-            (false, false) => "",
+    /// The facts behind the count, in the one shape the bar, the title and the
+    /// spoken status all word it from.
+    pub(crate) fn count_facts(&self) -> CountFacts {
+        CountFacts {
+            truncated: self.truncated,
+            stale: self.results_dirty,
+            history_away: self.history_away,
+            searched_lines: self.searched_lines,
+            match_capped: self.match_capped,
         }
+    }
+
+    /// The `+` (the count is a floor) and `…` (the terminal changed since this
+    /// was counted) marks the find bar carries, in that order. Empty only when
+    /// the count is an exact census of the present screen.
+    #[cfg(test)]
+    pub(crate) fn count_qualifier(&self) -> &'static str {
+        self.count_facts().mark()
     }
 
     /// The find panel's answer as a screen reader hears it (`match 2 of 7`,
@@ -483,12 +568,7 @@ impl SearchState {
     /// no verdict either: a field nobody has typed into has found nothing yet.
     #[cfg(any(a11y_tree, test))]
     pub(crate) fn spoken_status(&self) -> Option<String> {
-        let spelled = match (self.truncated, self.results_dirty) {
-            (true, true) => " (partial history, stale)",
-            (true, false) => " (partial history)",
-            (false, true) => " (stale)",
-            (false, false) => "",
-        };
+        let facts = self.count_facts();
         if self.regex_error {
             Some("bad regex".to_string())
         } else if self.query.is_empty() {
@@ -497,22 +577,23 @@ impl SearchState {
             // Ruling 237: the painter's long form, at every width.
             Some(HISTORY_AWAY_NONE.to_string())
         } else if self.matches.is_empty() {
-            Some(format!("no matches{spelled}"))
+            Some(format!(
+                "{}{}",
+                facts.none_base(false),
+                parenthesized(&facts.none_words())
+            ))
         } else {
             Some(format!(
                 "match {} of {}{}",
                 self.current + 1,
                 self.matches.len(),
-                match (self.history_away, self.results_dirty) {
-                    (true, true) => " (partial history, rewrapping, stale)",
-                    (true, false) => " (partial history, rewrapping)",
-                    (false, _) => spelled,
-                }
+                parenthesized(&facts.hit_words(false))
             ))
         }
     }
 
     pub(crate) fn window_title(&self) -> String {
+        let facts = self.count_facts();
         if self.query.is_empty() {
             "aterm — find:".to_string()
         } else if self.regex_error {
@@ -523,17 +604,19 @@ impl SearchState {
             format!("aterm — find: {} ({HISTORY_AWAY_NONE})", self.query)
         } else if self.matches.is_empty() {
             format!(
-                "aterm — find: {} (no matches{})",
+                "aterm — find: {} ({}{})",
                 self.query,
-                self.count_qualifier()
+                facts.none_base(false),
+                comma_list(&facts.none_words())
             )
         } else {
             format!(
-                "aterm — find: {} ({}/{}{})",
+                "aterm — find: {} ({}/{}{}{})",
                 self.query,
                 self.current + 1,
                 self.matches.len(),
-                self.count_qualifier()
+                facts.plus(),
+                comma_list(&facts.hit_words(false))
             )
         }
     }
@@ -611,13 +694,9 @@ impl SearchState {
         }
     }
 
-    /// Record how far the deepest hit in the installed batch reaches BELOW the
-    /// row it starts on, for a grid `cols` wide — [`Self::max_match_rows`].
-    ///
-    /// Derived from the batch rather than carried from the engine so it can
-    /// never disagree with the matches it describes: it is exactly the row
-    /// allowance the compositor's start-row slice needs to keep a straddling
-    /// hit's visible tail.
+    /// Record how far the deepest hit in the installed batch reaches below the
+    /// row it starts on, for a grid `cols` wide ([`Self::max_match_rows`]).
+    /// Derived from the batch so it always agrees with the matches it describes.
     fn note_match_rows(&mut self, cols: usize) {
         let cols = cols.max(1);
         let depth = |&(_, _, end): &(i32, u16, u32)| end as usize / cols;
@@ -638,60 +717,51 @@ impl SearchState {
         }
     }
 
-    /// Repaint fingerprint of the find bar's DISPLAYED state — exactly the fields
-    /// [`splice_find_bar`](crate::App::splice_find_bar) reads to draw the bar:
-    /// the query text, the current-match index + match count, the case/regex
-    /// toggles, and the regex-error/truncated readouts. Folded into
-    /// [`RepaintKey`](crate::RepaintKey) so an interactive find edit that does not
-    /// move the highlighted match still presents. FNV-1a over those fields —
-    /// allocation-free and order-stable; the value never needs a "0 means hidden"
-    /// marker because the key builders substitute `0` when there is no active find.
+    /// Repaint fingerprint of the find bar's displayed state: exactly the fields
+    /// [`splice_find_bar`](crate::App::splice_find_bar) reads (query, caret,
+    /// current index and count, case/regex toggles, regex-error/truncated
+    /// readouts). Folded into [`RepaintKey`](crate::RepaintKey) so a find edit
+    /// that does not move the highlighted match still presents. FNV-1a over
+    /// those fields; the key builders substitute `0` when no find is active.
     pub(crate) fn fingerprint(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut mix = |b: u8| {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        };
-        for &b in self.query.as_bytes() {
-            mix(b);
-        }
+        let mut h = aterm_hash::Fnv1a64::new();
+        h.write(self.query.as_bytes());
         // The CARET is painted state: a bare ^A/^E/⌥←, which changes no match, still
         // has to reach glass, so the edit position is part of the fingerprint.
-        for word in [self.cursor as u64] {
-            for b in word.to_le_bytes() {
-                mix(b);
-            }
+        for word in [
+            self.cursor as u64,
+            self.current as u64,
+            self.matches.len() as u64,
+            self.searched_lines.map_or(0, |lines| lines as u64 + 1),
+        ] {
+            h.write(&word.to_le_bytes());
         }
-        for word in [self.current as u64, self.matches.len() as u64] {
-            for b in word.to_le_bytes() {
-                mix(b);
-            }
+        for flag in [
+            self.case_sensitive,
+            self.is_regex,
+            self.regex_error,
+            self.truncated,
+            self.match_capped,
+            self.history_away,
+            self.results_dirty,
+        ] {
+            h.write_u8(u8::from(flag));
         }
-        mix(u8::from(self.case_sensitive));
-        mix(u8::from(self.is_regex));
-        mix(u8::from(self.regex_error));
-        mix(u8::from(self.truncated));
-        mix(u8::from(self.history_away));
-        mix(u8::from(self.results_dirty));
         if let Some((row, start, end)) = self.point_match {
-            for byte in row.to_le_bytes() {
-                mix(byte);
-            }
-            for byte in start.to_le_bytes().into_iter().chain(end.to_le_bytes()) {
-                mix(byte);
-            }
+            h.write(&row.to_le_bytes());
+            h.write(&start.to_le_bytes());
+            h.write(&end.to_le_bytes());
         }
-        h
+        h.finish()
     }
 }
 
 #[cfg(test)]
 thread_local! {
     static POINT_LOOKUP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Test seam: while set, every find recompute on this thread reads as
-    /// torn (`consistent == false`), as both full-history passes do when
-    /// output moves `content_seq` under them — which the real search only
-    /// reaches by racing a live writer.
+    /// Test seam: while set, every find recompute on this thread reads as torn
+    /// (`consistent == false`), as both full-history passes do when output moves
+    /// `content_seq` under them.
     pub(crate) static FORCE_TORN_SEARCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -712,25 +782,21 @@ fn take_point_lookup_comparisons() -> usize {
     })
 }
 
-/// Map engine [`SearchMatch`]es (ABSOLUTE rows, EXCLUSIVE end columns) to the find
-/// overlay's SELECTION coordinates: `sel_row = abs_row − base_y` (0..rows = live
-/// screen, negative = scrollback) with INCLUSIVE end columns, sorted top-to-bottom
-/// then left-to-right so next/prev reads in visual order. `base_y` is the absolute
-/// row of the LIVE top line (`grid().base_y()`) — display-offset-independent, so the
-/// coordinates are valid wherever the viewport happens to be sitting; the apply path
-/// moves it by absolute row and never needs a snap. Rows or columns that fall outside
-/// the overlay's `i32`/`u16` range are dropped rather than wrapped. Pure, so it is
-/// unit-testable.
+/// Map engine [`SearchMatch`]es (absolute rows, exclusive end columns) to the
+/// find overlay's selection coordinates: `sel_row = abs_row − base_y` (0..rows =
+/// live screen, negative = scrollback) with inclusive end columns, sorted
+/// top-to-bottom then left-to-right so next/prev reads in visual order. `base_y`
+/// is the absolute row of the live top line (`grid().base_y()`), independent of
+/// the display offset. Rows or columns outside the overlay's `i32`/`u16` range
+/// are dropped rather than wrapped.
 ///
-/// The engine's columns are DISPLAY/cell columns (its `ColumnMap` counts a wide CJK
-/// glyph as two), so they pass straight through — the mapped `(start, end)` index the
-/// render grid and the selection directly, with no per-cell width adjustment here.
+/// The engine's columns are display/cell columns (its `ColumnMap` counts a wide
+/// CJK glyph as two), so they pass straight through.
 ///
-/// `end` is the one column that can exceed the grid width: a hit that straddles a
-/// soft wrap continues on the row below, and carrying the overflow (rather than
-/// clamping it at the width) is what lets the consumers paint the second half at
-/// all. It is `u32` for that reason — a match on a deeply wrapped line can run
-/// past `u16`, and DROPPING such a match would put the silent-miss back.
+/// `end` is the one column that can exceed the grid width: a hit straddling a
+/// soft wrap continues on the row below, and carrying the overflow lets the
+/// consumers paint the second half. It is `u32` because a match on a deeply
+/// wrapped line can run past `u16`.
 pub(crate) fn map_matches(matches: &[SearchMatch], base_y: i64) -> Vec<(i32, u16, u32)> {
     let mut out: Vec<(i32, u16, u32)> = matches
         .iter()
@@ -743,9 +809,9 @@ pub(crate) fn map_matches(matches: &[SearchMatch], base_y: i64) -> Vec<(i32, u16
             Some((row, start, end))
         })
         .collect();
-    // The engine's hot path already emits visual order. Validate that in one linear
-    // pass and pay O(k log k) only for a defensive out-of-order producer (including
-    // older/socket-derived result sources), so ordinary incremental search remains O(k).
+    // The engine's hot path already emits visual order: validate that in one
+    // linear pass and sort (O(k log k)) only for an out-of-order producer, so
+    // ordinary incremental search stays O(k).
     if out
         .windows(2)
         .any(|pair| (pair[0].0, pair[0].1) > (pair[1].0, pair[1].1))
@@ -759,12 +825,11 @@ impl App {
     /// `(row geometry died, content moved)` for the open find, or `None` when
     /// nothing is being searched.
     ///
-    /// The first term folds BOTH ways a stored row number dies: the piecewise
-    /// protected-footer splice (`absolute_row_revision`) and the wholesale
-    /// history renumbering a width reflow performs (`history_renumber_epoch`),
-    /// which moves the footer revision not at all. They are one bit because
-    /// every caller does the same thing with them — refuse to re-anchor, and
-    /// re-aim the Emacs point at the buffer edge.
+    /// The first term folds both ways a stored row number dies: the piecewise
+    /// protected-footer splice (`absolute_row_revision`) and the wholesale history
+    /// renumbering of a width reflow (`history_renumber_epoch`). Every caller
+    /// treats them alike: refuse to re-anchor, and re-aim the Emacs point at the
+    /// buffer edge.
     fn search_stamp_mismatch(&self, wid: crate::WindowId) -> Option<(bool, bool)> {
         let ws = self.windows.get(&wid)?;
         let search = ws.search.as_ref()?;
@@ -805,8 +870,8 @@ impl App {
             }
         }
         if let Some(term) = term {
-            // PRESS CUSTODY: same rule as the navigation refusal — this clears the
-            // highlight only when the live screen could have moved under it, and it
+            // Press custody: as on the navigation refusal, this clears the
+            // highlight only when the live screen could have moved under it, and
             // records a `UserClear` exactly when it does.
             let mut t = term_lock(&term);
             if clear_selection_if_content_is_mutable(&mut t) {
@@ -841,8 +906,8 @@ impl App {
                 );
             }
             // A native front never falls through to the parked terminal search
-            // host. Markdown/Recovery currently have no find action, so Find is
-            // an explicit no-op there.
+            // host. Markdown/Recovery have no find action, so Find is a no-op
+            // there.
             return;
         }
         if self.front_terminal(wid).is_some() {
@@ -850,7 +915,7 @@ impl App {
         }
     }
 
-    /// Enter (or refresh) legacy Cmd-F find mode in the forward direction.
+    /// Enter (or refresh) plain Cmd-F find mode in the forward direction.
     pub(crate) fn search_enter(&mut self) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -858,12 +923,10 @@ impl App {
         self.search_enter_impl_in(wid, true, true);
     }
 
-    /// Enter (or refresh) terminal find in an explicit direction, seeding a fresh find
-    /// from the app-STICKY
-    /// match-case / regex toggles so reopening find keeps the mode you last left it in.
-    /// The ORIGIN viewport (display_offset + the base_y it was read against) is captured
-    /// here, BEFORE any recompute snaps to the bottom, so a cancel (⎋/^G) can put the
-    /// user back on the exact content they were reading (see [`Self::search_cancel`]).
+    /// Enter (or refresh) terminal find in an explicit direction, seeding a fresh
+    /// find from the app-sticky match-case / regex toggles. The origin viewport is
+    /// captured before any recompute moves it, so a cancel (⎋/^G) returns the user
+    /// to the content they were reading (see [`Self::search_cancel`]).
     pub(crate) fn search_enter_direction(&mut self, forward: bool) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -877,8 +940,8 @@ impl App {
         self.search_enter_impl_in(wid, forward, false);
     }
 
-    /// Shared entry path. Legacy Cmd-F deliberately starts at the beginning of
-    /// the buffer; Emacs Cmd-S/Cmd-R start at point (cursor or viewport edge).
+    /// Shared entry path. Plain Cmd-F starts at the beginning of the buffer;
+    /// Emacs Cmd-S/Cmd-R start at point (cursor or viewport edge).
     fn search_enter_impl_in(
         &mut self,
         wid: crate::WindowId,
@@ -929,18 +992,18 @@ impl App {
         let (find_origin, anchor_absolute_row, anchor_col) = origin;
         let already_open = self.windows.get(&wid).is_some_and(|ws| ws.search.is_some());
         if !already_open {
-            // A ⌘S/⌘R that only flips the direction of an OPEN find must not move the
-            // origin to wherever find navigation just put the viewport, hence the gate.
+            // A ⌘S/⌘R that only flips the direction of an open find must not move
+            // the origin to wherever find navigation put the viewport, hence the
+            // gate.
             //
-            // `or_insert`, not `insert`: a tab switch tears the bar down through the
-            // neutral close, which PARKS this entry rather than restoring (it runs on
-            // the winit thread under the no-engine-mutex discipline `sync_window`
-            // documents, so it cannot scroll). Reopening find on that terminal and
-            // pressing ⎋ therefore still lands on what the user was reading before the
-            // find that the switch interrupted. Both USER exits — ⎋ and ⏎ — remove the
-            // entry, so every open that follows a modelled exit captures afresh, which
-            // is what `EmacsSearchNavigation`'s unconditional `origin = viewport`
-            // says. A tab switch is not in that model's alphabet.
+            // `or_insert`, not `insert`: a tab switch tears the bar down through
+            // the neutral close, which parks this entry rather than restoring (it
+            // runs on the winit thread without the engine mutex, so it cannot
+            // scroll). Reopening find on that terminal and pressing ⎋ still lands
+            // on what the user was reading before the interrupted find. Both user
+            // exits (⎋ and ⏎) remove the entry, so every open after a modelled
+            // exit captures afresh, as `EmacsSearchNavigation`'s unconditional
+            // `origin = viewport` says; a tab switch is outside that model.
             self.find_origins
                 .entry((session, wid))
                 .or_insert(find_origin);
@@ -1025,23 +1088,8 @@ impl App {
         self.search_recompute_in(wid);
     }
 
-    /// Re-run the find for the current query over the FULL live screen + scrollback
-    /// history, then show the first directional match at the Emacs search point.
-    ///
-    /// Delegates the search to [`crate::control::search_full_history`] — the
-    /// off-lock, chunked, cached trigram index shared with the socket `search` verb —
-    /// so a keystroke over unchanged content reuses the immutable index (then validates
-    /// its generation under one short lock), while ordinary output incrementally
-    /// refreshes the prior visible rows plus appended rows. Coordinate revisions and
-    /// other unsafe-to-reuse changes rebuild only the retained suffix. The engine returns matches keyed by
-    /// ABSOLUTE row; [`map_matches`] converts them to selection coordinates against
-    /// `base_y`, and that `base_y` is stashed as [`SearchState::match_base_y`] so the apply
-    /// and highlight paths can re-anchor the (frame-relative) rows if output scrolls the
-    /// grid before they run. `incomplete` (history deeper than the index cap) becomes
-    /// [`SearchState::truncated`]; an invalid regex sets `regex_error`.
-    /// Frontmost-window convenience wrapper. Every PRODUCTION caller is the
-    /// window-targeted `search_recompute_in` form (a keystroke stays bound to the window it was
-    /// routed to), so this survives for the headless tests that drive one window.
+    /// Frontmost-window convenience wrapper for headless tests; production
+    /// callers use [`Self::search_recompute_in`].
     #[cfg(test)]
     pub(crate) fn search_recompute(&mut self) {
         let Some(wid) = self.frontmost_window else {
@@ -1050,6 +1098,18 @@ impl App {
         self.search_recompute_in(wid);
     }
 
+    /// Re-run window `wid`'s find over the live screen and scrollback history,
+    /// then show the first directional match at the Emacs search point.
+    ///
+    /// Delegates to [`crate::control::search_full_history`] (the off-lock,
+    /// chunked, cached trigram index shared with the socket `search` verb): a
+    /// keystroke over unchanged content reuses the index, ordinary output
+    /// refreshes the prior visible rows plus appended rows, and coordinate
+    /// revisions rebuild only the retained suffix. [`map_matches`] converts the
+    /// engine's absolute rows to selection coordinates against `base_y`, stashed
+    /// as [`SearchState::match_base_y`] so apply and highlight can re-anchor if
+    /// output scrolls the grid first. `incomplete` becomes
+    /// [`SearchState::truncated`]; an invalid regex sets `regex_error`.
     pub(crate) fn search_recompute_in(&mut self, wid: crate::WindowId) {
         self.search_recompute_from_anchor_in(wid, false);
     }
@@ -1112,13 +1172,15 @@ impl App {
                 ),
                 None => return,
             };
-        // (matches, regex_error, truncated, base_y): an empty query is the neutral "bar
+        // (matches, regex_error, the floor's facts, base_y): an empty query is the neutral "bar
         // open, nothing typed" state (no error, no truncation readout).
         let (
             matches,
             point_match,
             regex_error,
             truncated,
+            searched_lines,
+            match_capped,
             base_y,
             absolute_row_revision,
             history_renumber_epoch,
@@ -1137,6 +1199,8 @@ impl App {
                 Vec::new(),
                 None,
                 false,
+                false,
+                None,
                 false,
                 base_y,
                 row_rev,
@@ -1175,6 +1239,8 @@ impl App {
                     }),
                     false,
                     search.results.incomplete,
+                    search.searched_lines,
+                    search.results.matches.len() >= aterm_search::MAX_SEARCH_MATCHES,
                     search.base_y,
                     search.absolute_row_revision,
                     search.history_renumber_epoch,
@@ -1190,6 +1256,8 @@ impl App {
                         Vec::new(),
                         None,
                         true,
+                        false,
+                        None,
                         false,
                         i64::try_from(terminal.grid().base_y()).unwrap_or(i64::MAX),
                         terminal.absolute_row_revision(),
@@ -1230,6 +1298,8 @@ impl App {
             s.results_dirty = false;
             s.regex_error = regex_error;
             s.truncated = truncated || (rewrapping && !query.is_empty());
+            s.searched_lines = searched_lines;
+            s.match_capped = match_capped;
             s.history_away = rewrapping && !query.is_empty();
             if let Some(point) = point_match {
                 s.install_point_match(point);
@@ -2074,7 +2144,10 @@ fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u6
 
 #[cfg(test)]
 mod tests {
-    use super::{FindAction, SearchDirection, SearchEdit, SearchMatch, SearchState, map_matches};
+    use super::{
+        FindAction, SearchDirection, SearchEdit, SearchMatch, SearchState, map_matches,
+        next_word_boundary, prev_word_boundary,
+    };
     use crate::{App, WindowId, term_lock};
 
     /// An App whose session capability writes to an observer pipe, so a test can
@@ -2342,7 +2415,7 @@ mod tests {
         let mut search = seeded();
         assert_eq!(search.spoken_status().as_deref(), Some("match 1 of 3"));
         // Hits on the screen while the history is away for a rewrap: the panel
-        // paints `1/3+ (rewrapping)`, and `1/3+… (rewrapping)` once a torn
+        // paints `1/3+ (rewrapping)`, and `1/3+ (rewrapping, stale)` once a torn
         // rerun kept the old count.
         let away = SearchState {
             history_away: true,
@@ -2351,7 +2424,7 @@ mod tests {
         };
         assert_eq!(
             away.spoken_status().as_deref(),
-            Some("match 1 of 3 (partial history, rewrapping)")
+            Some("match 1 of 3 (rewrapping)")
         );
         let torn = SearchState {
             results_dirty: true,
@@ -2359,7 +2432,7 @@ mod tests {
         };
         assert_eq!(
             torn.spoken_status().as_deref(),
-            Some("match 1 of 3 (partial history, rewrapping, stale)")
+            Some("match 1 of 3 (rewrapping, stale)")
         );
         search.results_dirty = true;
         assert_eq!(
@@ -2378,6 +2451,64 @@ mod tests {
         );
         search.query.clear();
         assert_eq!(search.spoken_status(), None);
+    }
+
+    /// A floor names its cause, and the title, the spoken status and the bar
+    /// name the same one: the depth cap says how far it searched, the match
+    /// limit says the list is full — never `partial history` for a search that
+    /// read the whole buffer.
+    #[test]
+    fn a_floor_names_how_far_it_searched_or_the_match_limit() {
+        let depth = SearchState {
+            truncated: true,
+            searched_lines: Some(100_000),
+            ..seeded()
+        };
+        assert_eq!(
+            depth.window_title(),
+            "aterm — find: foo (1/3+, newest 100,000 lines)"
+        );
+        assert_eq!(
+            depth.spoken_status().as_deref(),
+            Some("match 1 of 3 (newest 100,000 lines)")
+        );
+        let none = SearchState {
+            matches: Vec::new(),
+            results_dirty: true,
+            ..depth
+        };
+        assert_eq!(
+            none.window_title(),
+            "aterm — find: foo (no matches in newest 100,000 lines, stale)"
+        );
+        assert_eq!(
+            none.spoken_status().as_deref(),
+            Some("no matches in newest 100,000 lines (stale)")
+        );
+
+        let full = SearchState {
+            truncated: true,
+            match_capped: true,
+            ..seeded()
+        };
+        assert_eq!(full.window_title(), "aterm — find: foo (1/3+, match limit)");
+        assert_eq!(
+            full.spoken_status().as_deref(),
+            Some("match 1 of 3 (match limit)")
+        );
+        assert!(!full.window_title().contains("history"));
+
+        let away = SearchState {
+            truncated: true,
+            history_away: true,
+            ..seeded()
+        };
+        assert_eq!(away.window_title(), "aterm — find: foo (1/3+, rewrapping)");
+
+        assert_eq!(super::line_count(100_000, false), "100,000");
+        assert_eq!(super::line_count(100_000, true), "100k");
+        assert_eq!(super::line_count(123_456, true), "123,456");
+        assert_eq!(super::line_count(999, false), "999");
     }
 
     fn set_query(app: &mut App, wid: WindowId, query: &str) {
@@ -2484,7 +2615,7 @@ mod tests {
                 .as_ref()
                 .expect("find")
                 .window_title()
-                .contains("(1/3…)"),
+                .contains("(1/3, stale)"),
             "the title carries the same qualifier as the bar"
         );
         // (`find_status_line`'s own rendering of this flag is pinned beside the
@@ -2511,13 +2642,15 @@ mod tests {
     ///
     /// `clear` is `ED 2` + `ED 3`: the screen is blanked and the scrollback is
     /// DROPPED. With no history left, a rows-grow cannot reveal anything, so it
-    /// appends blank rows at the BOTTOM — which grows the retained-line total while
-    /// `absolute_row_counter` stays put, and `oldest_absolute_row()` is
-    /// `counter − visible − scrollback`. Every retained row's absolute key
-    /// therefore shifted DOWN by the number of appended rows. The GUI's index-reuse
-    /// path carried the pre-shift keys forward, re-fed only the rows at/after the
-    /// OLD visible base, and left the top band of the screen — where everything
-    /// printed since the clear lives — absent from the corpus entirely.
+    /// appends blank rows at the BOTTOM — which grew the retained-line total while
+    /// `absolute_row_counter` stayed put (until 2026-10-01; the counter now moves
+    /// with the appended rows), and `oldest_absolute_row()` is `counter − visible −
+    /// scrollback`. Every retained row's absolute key shifted DOWN by the number of
+    /// appended rows. The GUI's index-reuse path carried the pre-shift keys
+    /// forward, re-fed only the rows at/after the OLD visible base, and left the
+    /// top band of the screen — where everything printed since the clear lives —
+    /// absent from the corpus entirely. Kept as the end-to-end witness that find
+    /// sees the whole glass across such a grow, whatever the grid's bookkeeping.
     #[test]
     fn growing_the_window_after_a_clear_keeps_the_visible_screen_searchable() {
         let _serial = crate::control::search_cap_test_guard();
@@ -2558,17 +2691,17 @@ mod tests {
         );
     }
 
-    /// The same slide, the other way — and the one the retained-floor guard
-    /// CANNOT see.
-    ///
-    /// A shrink that trims the trailing blanks a screen-clear left behind also
-    /// changes the retained-line total, so the absolute space slides — but
-    /// UPWARD, which looks exactly like the ordinary retention advance the reuse
-    /// guard exists to allow. Nothing but the grid's own renumber report
-    /// separates them. Here the clear KEEPS its history (`ED 2` alone, no
-    /// `ED 3`), so there are rows below the refreshed band: a reused index files
-    /// them at pre-slide keys and answers about the wrong lines — or drops them
-    /// as evicted while the terminal still holds them.
+    /// The shrink the other way: one that trims the trailing blanks a
+    /// screen-clear left behind. Until 2026-10-01 that slid the absolute space
+    /// UPWARD (the counter stayed while the retained total fell), which looks
+    /// exactly like the ordinary retention advance the reuse guard allows, and
+    /// only the grid's renumber report kept a reused index from filing history
+    /// at pre-slide keys. The trim now moves the counter with the rows it drops
+    /// (`Grid::keep_keys_across_bottom_rows`, as a shell's command marks need),
+    /// so nothing slides: the deep needle keeps its absolute row, a reused or
+    /// rebuilt index answers it there, and that row holds it. Here the clear
+    /// KEEPS its history (`ED 2` alone, no `ED 3`), so there are rows below the
+    /// refreshed band for a wrongly keyed index to misfile.
     #[test]
     fn shrinking_the_window_after_a_screen_clear_keeps_history_correctly_keyed() {
         let _serial = crate::control::search_cap_test_guard();
@@ -2603,22 +2736,21 @@ mod tests {
             (t.rows(), t.cols())
         };
         let oldest_before = term_lock(&term).grid().oldest_absolute_row();
+        let history_before = term_lock(&term).grid().scrollback_lines();
         term_lock(&term).resize(rows.saturating_sub(6).max(6), cols);
-        let oldest_after = term_lock(&term).grid().oldest_absolute_row();
-        let slide =
-            i64::try_from(oldest_after).unwrap_or(0) - i64::try_from(oldest_before).unwrap_or(0);
-        assert!(
-            slide > 0,
-            "fixture: the trailing-blank trim really did slide the absolute space"
+        assert_eq!(
+            term_lock(&term).grid().scrollback_lines(),
+            history_before,
+            "fixture: the shrink only trimmed blanks — no row was demoted into history"
+        );
+        assert_eq!(
+            term_lock(&term).grid().oldest_absolute_row(),
+            oldest_before,
+            "the trailing-blank trim slides no key"
         );
 
         let after = absolute_of(&mut app, deep).expect("the deep needle is still in history");
-        assert_eq!(
-            after,
-            before + slide,
-            "the needle's absolute row must be the one the SLID grid now gives it, \
-             not the key a reused index filed it under"
-        );
+        assert_eq!(after, before, "the needle keeps its absolute row");
         // And the row that name points at really is the one holding the text.
         let text = {
             let t = term_lock(&term);
@@ -2745,6 +2877,82 @@ mod tests {
         let mut s = field("abc");
         assert!(!s.edit(SearchEdit::MoveTo(99)));
         assert_eq!(s.cursor, 3);
+    }
+
+    /// The words ⌥→ then ⌥← find in `text`, as byte ranges.
+    fn field_words(text: &str) -> Vec<(usize, usize)> {
+        let mut words = Vec::new();
+        let mut at = 0;
+        loop {
+            let end = next_word_boundary(text, at);
+            let start = prev_word_boundary(text, end);
+            if end == at || start < at {
+                return words;
+            }
+            words.push((start, end));
+            at = end;
+        }
+    }
+
+    /// The words a double-click selects in `text`, as byte ranges.
+    fn clicked_words(text: &str) -> Vec<(usize, usize)> {
+        let smart = aterm_core::selection::SmartSelection::new();
+        let mut words: Vec<(usize, usize)> = text
+            .char_indices()
+            .filter_map(|(at, _)| smart.word_boundaries_at(text, at))
+            .collect();
+        words.dedup();
+        words
+    }
+
+    /// ⌥←/⌥→, ^W and ⌥⌫ step over a word whole, in every script, and stop exactly
+    /// where a double-click ends the same word. A mark, a virama and a format
+    /// control that spells the word (a ZWNJ, a ZWJ, the Mongolian vowel separator)
+    /// belong to it: the find field used to stop at the virama of `नमस्ते` and at
+    /// the half space of `می‌خواهم`, so ⌥⌫ deleted half a word and left a dangling
+    /// virama. An invisible character between two words (a joiner between two
+    /// Latin letters, a bidi override, the word joiner, a mark) still separates
+    /// them, as it does for a double-click.
+    #[test]
+    fn word_motions_step_over_whole_words_like_a_double_click() {
+        for word in [
+            "\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947}", // नमस्ते
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}", // می‌خواهم
+            "\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}",         // ශ්‍රී
+            "\u{0926}\u{0930}\u{094D}\u{200D}\u{092F}\u{093E}", // दर्‍या
+            "\u{09B0}\u{200D}\u{09CD}\u{09AF}\u{09BE}\u{09AC}", // র‍্যাব
+            "\u{182C}\u{1820}\u{1837}\u{180E}\u{1820}",         // ᠬᠠᠷ᠎ᠠ
+            "cafe\u{301}",
+        ] {
+            let text = format!("x {word} y");
+            let end = 2 + word.len();
+            assert_eq!(
+                field_words(&text),
+                [(0, 1), (2, end), (end + 1, end + 2)],
+                "{word:?}"
+            );
+            assert_eq!(field_words(&text), clicked_words(&text), "{word:?}");
+            let mut s = field(&format!("x {word}"));
+            assert!(s.edit(SearchEdit::DeleteWordBack));
+            assert_eq!(s.query, "x ", "⌥⌫ deletes {word:?} whole");
+        }
+        for text in [
+            "foo\u{200D}bar",
+            "foo\u{200C}bar",
+            "abc\u{202E}def",
+            "a\u{2060}b",
+            "x\u{200E}y",
+            "ab\u{180E}cd",
+        ] {
+            let split = text.find(|c: char| !c.is_ascii()).unwrap();
+            let after = split + text[split..].chars().next().unwrap().len_utf8();
+            assert_eq!(
+                field_words(text),
+                [(0, split), (after, text.len())],
+                "{text:?}"
+            );
+            assert_eq!(field_words(text), clicked_words(text), "{text:?}");
+        }
     }
 
     /// The caret is PAINTED state, so it has to be part of the repaint fingerprint —

@@ -132,10 +132,8 @@ pub(crate) enum Verdict {
     /// The verified build's platform signature check did not FINISH in time
     /// ([`StageError::VerifyDeferred`]): no verdict on the bytes and no fault, so nothing
     /// moved, nothing is memoized, its archive is kept, and the next pass checks it again.
-    /// Not a failure ([`Outcome::is_failure`]) — until 2026-09-26 it was a
-    /// [`Verdict::Failed`], and codex 0.157.0's 238 MB binary, IO-throttled under the
-    /// window's utility clamp, raised "Package update failed" twice on 2026-09-25 for a
-    /// build that verified 21 s later.
+    /// Not a failure ([`Outcome::is_failure`]): codex's 238 MB binary, IO-throttled under
+    /// the window's utility clamp, can run past the deadline and verify seconds later.
     Deferred {
         /// The version whose check did not finish.
         version: Version,
@@ -288,7 +286,7 @@ impl Outcome {
             Verdict::Linked => Err(FlowError::Linked(program.to_string())),
             // The vendor's release channel was not reached: its own error, so the verb
             // can add the one action the index lane's offline ending already gets — re-run
-            // when the connection is back (audit, 2026-09-25).
+            // when the connection is back.
             Verdict::Unreachable { .. } => Err(FlowError::VendorUnreachable(
                 line.strip_prefix("atpkg: ").unwrap_or(&line).to_string(),
             )),
@@ -404,7 +402,7 @@ pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -
             version: stamp.legacy_version_of(build),
         };
     }
-    let previous = previous_of(layout, program, installed);
+    let previous = previous_of(layout, lane.policy, program, installed);
     let mut legacy_asked = false;
     // A legacy build's signed root that nothing holds is read, with its version, from the
     // signed manifest the version lookup below reads; that lookup does not ask again.
@@ -532,7 +530,7 @@ pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -
                 return done(unread_head(&head, installed));
             }
             Decision::Tombstone => {
-                crate::flow::tombstone_program(layout, program, active);
+                crate::flow::install_tombstone_shims(layout, program, active);
                 return done(Verdict::Tombstoned { from: installed });
             }
             Decision::Install { version, reason } => {
@@ -722,8 +720,8 @@ pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
                     | FlowError::StageRefused(_)
                     | FlowError::VendorRefused(_)
             );
-            // The signature check did not finish: a wait, never a refusal or a failure
-            // (2026-09-26). A yanked installed build still takes the fallback below, as
+            // The signature check did not finish: a wait, never a refusal or a failure.
+            // A yanked installed build still takes the fallback below, as
             // for any landing that did not happen.
             let v = if let FlowError::Stage(StageError::VerifyDeferred(why)) = &e {
                 Verdict::Deferred {
@@ -889,7 +887,7 @@ fn yank_fallback(
             to,
         ),
         Decision::Tombstone if head_refused => {
-            crate::flow::tombstone_program(lane.layout, inputs.program, active);
+            crate::flow::install_tombstone_shims(lane.layout, inputs.program, active);
             Verdict::Tombstoned {
                 from: inputs.installed,
             }
@@ -998,15 +996,20 @@ fn installed_of(layout: &Layout, program: &str, active: Option<u64>) -> Installe
     }
 }
 
-/// The newest retained complete vendor build below the active vendor build — the only
-/// rollback target a yank may move to.
-fn previous_of(layout: &Layout, program: &str, installed: Installed) -> Option<InstalledView> {
+/// The newest retained vendor build below the active vendor build that a rollback lands on
+/// under `policy` ([`rollback_lands_on`]) — the only rollback target a yank may move to.
+fn previous_of(
+    layout: &Layout,
+    policy: &Policy,
+    program: &str,
+    installed: Installed,
+) -> Option<InstalledView> {
     let Installed::Vendor(current) = installed else {
         return None;
     };
     retained_below(layout, program, current.build)
         .into_iter()
-        .next()
+        .find(|v| rollback_lands_on(layout, policy, program, v.build))
 }
 
 /// The retained complete vendor builds of `program` below store build `below`, newest
@@ -1038,6 +1041,28 @@ fn retained_legacy_below(layout: &Layout, program: &str, below: u64) -> Vec<u64>
         .collect();
     builds.sort_unstable_by(|a, b| b.cmp(a));
     builds
+}
+
+/// THE VENDOR ROLLBACK TARGET PREDICATE: whether [`roll_back_by_hand`] may land `program`
+/// on its retained `build` — complete as [`installed_of`] reads one (a vendor build by its
+/// record, a legacy index build by its marker), with a `bin/` to run, and named by no yank
+/// in `policy`. ONE predicate for every reader, as [`crate::flow::rollback_lands_on`] is
+/// for the index lane: the verb lands on the newest retained build below the active one it
+/// admits, a yank's own move on the newest such vendor build ([`previous_of`]), and gc
+/// keeps exactly that build below the live one ([`crate::gc::reclaimable`]), under the
+/// latch the verb reads.
+pub(crate) fn rollback_lands_on(
+    layout: &Layout,
+    policy: &Policy,
+    program: &str,
+    build: u64,
+) -> bool {
+    layout.build_dir(program, build).join("bin").is_dir()
+        && match installed_of(layout, program, Some(build)) {
+            Installed::Vendor(view) => !policy.is_yanked(program, view.version),
+            Installed::Legacy { build, .. } => !policy.is_legacy_yanked(program, build),
+            Installed::Nothing => false,
+        }
 }
 
 /// What a by-hand rollback moved, each build as a line names it: a version, or a legacy
@@ -1076,38 +1101,35 @@ pub(crate) fn roll_back_by_hand(
                     "{} is not a complete build — `aterm pkg update {program}` re-stages it",
                     super::display_build(program, b)
                 ),
-                None => format!("{program} is not installed/active (aterm pkg list shows what is)"),
+                None => format!(
+                    "{program} is not installed — nothing to roll back (aterm pkg list shows \
+                     what is)"
+                ),
             });
         }
     };
-    // (build, label, yanked), newest first: every legacy number is below every vendor id.
-    let candidates: Vec<(u64, String, bool)> = retained_below(layout, program, below)
+    // (build, label) of every retained complete build below the active one, newest first:
+    // every legacy number is below every vendor id. The verb lands on the first one
+    // [`rollback_lands_on`] admits, so what it refuses of these is a yank.
+    let retained: Vec<(u64, String)> = retained_below(layout, program, below)
         .into_iter()
-        .map(|v| {
-            (
-                v.build,
-                v.version.to_string(),
-                policy.is_yanked(program, v.version),
-            )
-        })
+        .map(|v| (v.build, v.version.to_string()))
         .chain(
             retained_legacy_below(layout, program, below)
                 .into_iter()
-                .map(|b| {
-                    (
-                        b,
-                        super::build_words(b),
-                        policy.is_legacy_yanked(program, b),
-                    )
-                }),
+                .map(|b| (b, super::build_words(b))),
         )
         .collect();
-    let Some((to_build, to, _)) = candidates.iter().find(|c| !c.2).cloned() else {
-        let yanked: Vec<&str> = candidates.iter().map(|c| c.1.as_str()).collect();
+    let Some((to_build, to)) = retained
+        .iter()
+        .find(|(b, _)| rollback_lands_on(layout, policy, program, *b))
+        .cloned()
+    else {
+        let yanked: Vec<&str> = retained.iter().map(|(_, label)| label.as_str()).collect();
         return Err(match yanked.len() {
-            0 => format!("no retained {program} build below {from} — {program} {from} stays"),
+            0 => format!("no older {program} build is kept — {program} {from} stays"),
             n => format!(
-                "{program} {} {} yanked and no older build is retained — {program} {from} stays",
+                "{program} {} {} yanked and no older build is kept — {program} {from} stays",
                 yanked.join(", "),
                 if n == 1 { "is" } else { "are" }
             ),
@@ -1158,10 +1180,9 @@ fn keep_legacy_facts(
 
 /// The legacy index build a rollback of `program` would land on — the `active` one, or the
 /// newest retained below the active vendor build — when no signed root is held for it:
-/// none kept in its stamp, and no recorded row for that build carrying one. A client
-/// before 2026-09-23 kept none (its first vendor install overwrote the only row that had
-/// it), and one that rewrote the stamp from its own fields dropped it; the lane reads it
-/// again from the build's signed manifest ([`plan_one`]), at most once a pass.
+/// none kept in its stamp, and no recorded row for that build carrying one (an older
+/// client's first vendor install overwrote it, or its stamp rewrite dropped it); the lane
+/// reads it again from the build's signed manifest ([`plan_one`]), at most once a pass.
 pub(crate) fn legacy_root_owed(layout: &Layout, program: &str, active: Option<u64>) -> Option<u64> {
     let build = match installed_of(layout, program, active) {
         Installed::Legacy { build, .. } => build,
@@ -1251,7 +1272,8 @@ fn verdict_line(spec: &VendorSpec, verdict: &Verdict) -> String {
                     installed_words(*k)
                 ),
                 KeepReason::Held => format!(
-                    "atpkg: {p} held by local pin ({}); `aterm pkg unpin {p}` to allow updates",
+                    "atpkg: {p} not updated — you pinned it at {} (`aterm pkg unpin {p}` lets it \
+                     update)",
                     installed_words(*k)
                 ),
                 KeepReason::LegacyUnread => format!(
@@ -1324,7 +1346,6 @@ fn verdict_line(spec: &VendorSpec, verdict: &Verdict) -> String {
 pub(crate) mod world {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
-    use std::io::Write as _;
     use std::path::{Path, PathBuf};
 
     use super::Trust;
@@ -1403,8 +1424,7 @@ pub(crate) mod world {
         Err(aterm_update_core::codesign::CodesignError::TimedOut)
     }
 
-    /// [`trust`] with a codesign stand-in that never finishes by its deadline — codex's
-    /// 238 MB binary under the window's utility clamp on 2026-09-25.
+    /// [`trust`] with a codesign stand-in that never finishes by its deadline.
     pub(crate) fn trust_timing_out() -> Trust {
         Trust {
             team_check: timeout_check,
@@ -1708,7 +1728,6 @@ pub(crate) mod world {
 
     /// A gzip'd tar of `files`, with their directories.
     pub(crate) fn tarball(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
         let mut dirs: Vec<String> = Vec::new();
         for (path, _, _) in files {
             let mut acc = String::new();
@@ -1720,25 +1739,17 @@ pub(crate) mod world {
                 }
             }
         }
-        for dir in &dirs {
-            let mut h = tar::Header::new_ustar();
-            h.set_entry_type(tar::EntryType::Directory);
-            h.set_mode(0o755);
-            h.set_size(0);
-            h.set_cksum();
-            builder.append_data(&mut h, dir, std::io::empty()).unwrap();
-        }
-        for (path, bytes, mode) in files {
-            let mut h = tar::Header::new_ustar();
-            h.set_mode(*mode);
-            h.set_size(bytes.len() as u64);
-            h.set_cksum();
-            builder.append_data(&mut h, path, *bytes).unwrap();
-        }
-        let tar = builder.into_inner().unwrap();
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        gz.write_all(&tar).unwrap();
-        gz.finish().unwrap()
+        let mut entries: Vec<(&str, u8, &str, &[u8], u32)> = dirs
+            .iter()
+            .map(|d| (d.as_str(), b'5', "", &[][..], 0o755))
+            .collect();
+        entries.extend(
+            files
+                .iter()
+                .map(|&(path, bytes, mode)| (path, b'0', "", bytes, mode)),
+        );
+        let tar = crate::extract::fixtures::tar_bytes(&entries);
+        crate::extract::fixtures::gzip_bytes(&tar)
     }
 
     fn unreachable<T>(what: &str) -> Result<T, VendorFetchError> {
@@ -1897,17 +1908,9 @@ pub(crate) mod world {
         (body.into_bytes(), sig)
     }
 
-    /// A fresh 0700 prefix under the temp dir.
-    pub(crate) fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-vlane-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        Layout { prefix: p }
+    /// A fresh 0700 prefix under the temp dir, removed when the test ends.
+    pub(crate) fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-vlane-{label}-"))
     }
 
     /// The store directory of `program`'s vendor `version`.
@@ -2055,7 +2058,13 @@ mod tests {
         let env = crate::shim_env::read_sidecar(&dir);
         assert_eq!(
             env.entries(),
-            [("DISABLE_AUTOUPDATER".to_string(), "1".to_string())]
+            [
+                ("DISABLE_AUTOUPDATER".to_string(), "1".to_string()),
+                (
+                    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY".to_string(),
+                    "1".to_string()
+                ),
+            ]
         );
         let shim = std::fs::read_to_string(l.shim(&crate::store::ToolName::new("claude").unwrap()))
             .unwrap();
@@ -2432,10 +2441,7 @@ mod tests {
         }
     }
 
-    /// A SIGNATURE CHECK THAT DID NOT FINISH IS A WAIT, NOT A FAILURE (2026-09-26). On
-    /// 2026-09-25 codex 0.157.0's 238 MB binary ran past codesign's deadline twice under
-    /// the window's utility clamp, and each pass was a `Verdict::Failed` — exit 1, "Package
-    /// update failed" — for bytes that verified 21 s later. Now a timeout is
+    /// A SIGNATURE CHECK THAT DID NOT FINISH IS A WAIT, NOT A FAILURE. A codesign timeout is
     /// `Verdict::Deferred`: no failure, the installed build kept, nothing memoized (the
     /// next pass is not refused as a signer memo would be), the verified archive carried
     /// (the next pass re-stages it with no download), and that pass lands it. The control
@@ -2507,7 +2513,8 @@ mod tests {
         let o = run_with(&l, &f, &Policy::default(), &world::trust(), claude(), true);
         assert_eq!(
             o.line(),
-            "atpkg: claude held by local pin (2.1.281); `aterm pkg unpin claude` to allow updates"
+            "atpkg: claude not updated — you pinned it at 2.1.281 (`aterm pkg unpin claude` lets \
+             it update)"
         );
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
     }
@@ -2548,6 +2555,19 @@ mod tests {
             o.line(),
             "atpkg: claude 2.1.283 → 2.1.284 (2.1.283 is yanked; Anthropic latest)"
         );
+        // The head and the build just below it yanked too: the move rolls back past both to
+        // the newest retained build a rollback lands on, never tombstones over it.
+        let o = run(
+            &l,
+            &f,
+            &Policy::from_entries(["claude@2.1.283", "claude@2.1.284"]),
+            claude(),
+        );
+        assert_eq!(
+            o.line(),
+            "atpkg: claude 2.1.284 is yanked — rolled back to 2.1.282"
+        );
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
     }
 
     #[test]
@@ -2777,10 +2797,9 @@ mod tests {
         );
     }
 
-    /// A LEGACY ROOT NOTHING HOLDS IS READ AGAIN, ONCE. A client before 2026-09-23 read the
-    /// legacy build's version without keeping its root, and its first vendor install
-    /// overwrote the row that had it; an older client rewriting the stamp drops it too. The
-    /// next pass holding a verified index reads the root from the build's signed manifest
+    /// A LEGACY ROOT NOTHING HOLDS IS READ AGAIN, ONCE. An older client's first vendor
+    /// install overwrote the row that held it, or its stamp rewrite dropped it. The next
+    /// pass holding a verified index reads the root from the build's signed manifest
     /// and keeps it; no later pass asks again, and none asks with no index.
     #[test]
     fn a_legacy_root_nothing_holds_is_read_from_its_signed_manifest_once() {

@@ -1,44 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE TRAIL HOST** (2026-09-25) — the one GUI-faithful frame seam that
+//! The trail host: the GUI-faithful frame seam that
 //! `tests/copies_are_not_moves.rs` and `tests/moves_are_followed.rs` drive
 //! their case families through, and `tests/erased_under_its_twin.rs`,
 //! `tests/copy_beside_the_line.rs`, `tests/moved_again_without_a_key.rs` and
-//! `tests/composer_multiline_wrap.rs` their laws (each declares
-//! `#[macro_use] mod trail_host;`).
+//! `tests/composer_multiline_wrap.rs` their laws (`effects_suite` mounts
+//! `common`, whose replay pool runs a law's cases, and `#[macro_use]
+//! trail_host` once; each file imports `crate::trail_host::…`).
 //!
-//! A real `aterm_core::terminal::Terminal` driven byte for byte; each frame
+//! A real `aterm_core::terminal::Terminal` is driven byte for byte. Each frame
 //! (`Core::frame`) is the GUI's: SYNC-1 withholding when asked, the
-//! content-scroll seam first (a scroll or band move is applied to the engine
-//! and the frame samples NOTHING, as `app_render.rs` does), then the frame hold — the
-//! caret row's probe, which is also its witness sample, and every row
-//! `CursorGlow::ribbon_rows` names into the GUI's `CURSOR_WITNESS_ROWS`
-//! slots, read AFTER the last `process` — then the tick. What differs between the families is an explicit [`Opts`]; the
-//! host options a family sweeps (`far_ok`: the composed host's far-row read
-//! dropped; `drop_far_frames`: one such drop; a pet's frame demand) are
-//! fields of [`Core`]. [`PacedHost`] frames time on a flat 16 ms or 8 ms
-//! train or at the GUI's real pacing ([`Pace`]).
+//! content-scroll seam first (a scroll or band move is applied and the frame
+//! samples nothing, as `app_render.rs` does), then the frame hold (the caret
+//! row's probe, also its witness sample, and every row
+//! `CursorGlow::ribbon_rows` names into the GUI's `CURSOR_WITNESS_ROWS` slots,
+//! read after the last `process`), then the tick. Family differences are an
+//! explicit [`Opts`]; host options a family sweeps (`far_ok`,
+//! `drop_far_frames`, a pet's frame demand) are fields of [`Core`].
+//! [`PacedHost`] frames time on a flat 16 ms or 8 ms train or at the GUI's real
+//! pacing ([`Pace`]).
 //!
-//! Every case is registered by id ([`case`]) and judged by the reading its
-//! family states ([`Outcome::ff`]: `(followed, frames the row no key wrote
-//! was lit)` against `(0, 0)`; [`Outcome::mf`]: lines or moves that went dark
-//! under text that stayed, against `0`). A law runs the cases under one id
-//! prefix ([`holds`], [`holds_where`]) and each must hold — or, where the law
-//! states LIMITS, a rule over the ids names them with its reason
-//! ([`holds_but`]): each case the rule names must still read bad and every
-//! other must hold, so a change to a limit is seen and the law is restated.
+//! Every case is registered by id ([`case`]) and judged by its family's reading
+//! ([`Outcome::ff`]: `(followed, frames the row no key wrote was lit)` against
+//! `(0, 0)`; [`Outcome::mf`]: lines or moves that went dark under text that
+//! stayed, against `0`). A law runs the cases under one id prefix ([`holds`],
+//! [`holds_where`]); where it states limits, a rule over the ids names them
+//! with its reason ([`holds_but`]), and each named case must still read bad
+//! while every other holds.
 //!
-//! **THE GRID AND ITS SPINE.** A family's grid is the product of what it
-//! sweeps (widths, key rates, pauses, tear lengths, pacings). A release
-//! build, or `TRAIL_LAWS_FULL=1`, runs every case of it — and the merge
-//! gate's test run sets it (`aterm_verify::stages::TRAIL_LAWS_FULL`), so the
-//! gate enforces every rule on the full grid; a plain debug run runs its
-//! SPINE ([`sweep`]): the values that cross each stated threshold on both
-//! sides, and the ones 0.93.0 was RED on, so every law still holds a case
-//! that must hold and every limit rule still names a case — which
-//! [`holds_but`] asserts. The counts the laws quote (`RED on 0.93.0 8/8`)
-//! are of the full grid.
+//! **Grid and spine.** A family's grid is the product of what it sweeps
+//! (widths, key rates, pauses, tear lengths, pacings). A release build, or
+//! `TRAIL_LAWS_FULL=1` (set by the merge gate via
+//! `aterm_verify::stages::TRAIL_LAWS_FULL`), runs every case; a debug run runs
+//! the spine ([`sweep`]): values crossing each stated threshold on both sides,
+//! so every law holds a case that must hold and every limit rule names one
+//! ([`holds_but`] asserts this). Counts quoted by the laws are of the full
+//! grid.
 #![allow(dead_code)]
 
 use aterm_core::render::GlowQuad;
@@ -49,7 +47,7 @@ use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
-// OUTCOMES AND CASES
+// Outcomes and cases
 // ---------------------------------------------------------------------------
 
 /// One case's reading and verdict.
@@ -64,7 +62,7 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// A FALSE-FOLLOW reading: `(followed, frames the wrong row was lit)`
+    /// A false-follow reading: `(followed, frames the wrong row was lit)`
     /// against `(0, 0)`.
     pub fn ff(followed: u64, retired: u64, lit: usize) -> Self {
         Self {
@@ -77,7 +75,7 @@ impl Outcome {
         }
     }
 
-    /// A MISSED-FOLLOW / composer reading: `dark` lines or moves that went
+    /// A missed-follow / composer reading: `dark` lines or moves that went
     /// out under text that stayed, against `0`.
     pub fn mf(followed: u64, retired: u64, dark: u64) -> Self {
         Self {
@@ -188,7 +186,7 @@ pub fn istr(g: &[i32]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// THE SHARED HOST CORE
+// The shared host core
 // ---------------------------------------------------------------------------
 
 /// The frame seam's variants, as the case families use them.
@@ -268,9 +266,9 @@ pub struct Core {
     pub scroll: Option<ContentScrollState>,
     pub alt_seen: Option<bool>,
     pub o: Opts,
-    /// `false`: EVERY frame's far-row read (rows beyond the caret's `±1`) is
-    /// dropped — the composed host's second, generation-checked read losing
-    /// its race while output streams.
+    /// `false`: every frame's far-row read (rows beyond the caret's `±1`) is
+    /// dropped, as when the composed host's generation-checked read loses its
+    /// race while output streams.
     pub far_ok: bool,
     /// The next `n` frames' far-row reads are dropped (one-shot staleness).
     pub drop_far_frames: u32,
@@ -318,8 +316,8 @@ impl Core {
         }
     }
 
-    /// ONE FRAME: (SYNC-1), the content-scroll seam, the frame hold's samples (the
-    /// caret row's probe and the rows the witness names), the tick.
+    /// One frame: (SYNC-1), the content-scroll seam, the frame hold's samples
+    /// (the caret row's probe and the rows the witness names), the tick.
     pub fn frame(&mut self) {
         if self.o.honour_sync && self.term.sync_open_dirty() {
             return;
@@ -508,7 +506,7 @@ macro_rules! core_deref {
 }
 
 // ---------------------------------------------------------------------------
-// THE PACED HOST
+// The paced host
 // ---------------------------------------------------------------------------
 
 /// How a [`PacedHost`] frames time.
@@ -646,7 +644,7 @@ impl PacedHost {
 }
 
 // ---------------------------------------------------------------------------
-// THE GRID, AND THE LAW RUNNER
+// The grid, and the law runner
 // ---------------------------------------------------------------------------
 
 /// Whether the laws run every case of each family's grid: in a release
@@ -656,7 +654,7 @@ pub fn full_grid() -> bool {
     !cfg!(debug_assertions) || std::env::var_os("TRAIL_LAWS_FULL").is_some_and(|v| v != "0")
 }
 
-/// **ONE AXIS OF A FAMILY'S GRID**: every value of `all` under the full grid
+/// One axis of a family's grid: every value of `all` under the full grid
 /// ([`full_grid`]), only `spine` otherwise. The spine is drawn from `all`.
 pub fn sweep<T: Clone + PartialEq + std::fmt::Debug>(all: &[T], spine: &[T]) -> Vec<T> {
     assert!(
@@ -670,17 +668,24 @@ pub fn sweep<T: Clone + PartialEq + std::fmt::Debug>(all: &[T], spine: &[T]) -> 
     }
 }
 
-/// Runs every case of `cases` whose id satisfies `pick`, in order, and fails
-/// listing every one that does not read as it must: bad where `limit` names
-/// it (a limit that holds now is a finding too — restate the law), held
-/// everywhere else. Panics inside a case propagate: an engine assertion is a
-/// failure of the law.
+/// Runs every case of `cases` whose id satisfies `pick` and fails listing,
+/// in order, every one that does not read as it must: bad where `limit`
+/// names it (a limit that holds now is a finding too — restate the law),
+/// held everywhere else. Panics inside a case propagate: an engine assertion
+/// is a failure of the law.
+///
+/// Each case builds its own host on its own clock (`Send + Sync`, nothing
+/// shared), so the cases run on the binary's threads
+/// ([`crate::common::par_map`]) and are judged in order after. MEASURED
+/// 2026-09-30, the gate's full grid at `RUST_TEST_THREADS=7`: one after
+/// another, `moves_are_followed`'s 96 unsynced-composer tears took 41 s and
+/// the binary 47.5 s; on the pool the law takes 8.2 s and the binary 12.4 s.
 fn run_law(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -> bool) {
     let picked: Vec<Case> = cases.into_iter().filter(|c| pick(&c.id)).collect();
     assert!(!picked.is_empty(), "the law picks no case");
+    let outcomes = crate::common::par_map(&picked, |c| (c.run)());
     let mut broken = Vec::new();
-    for c in &picked {
-        let o = (c.run)();
+    for (c, o) in picked.iter().zip(outcomes) {
         let is_limit = limit(&c.id);
         if o.ok == is_limit {
             broken.push(format!(
@@ -709,7 +714,7 @@ fn run_law(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -
     );
 }
 
-/// **A FAMILY HOLDS**: every case whose id satisfies `pick` holds.
+/// A family holds: every case whose id satisfies `pick` holds.
 pub fn holds_where(cases: Vec<Case>, pick: impl Fn(&str) -> bool) {
     run_law(cases, pick, |_| false);
 }
@@ -719,12 +724,9 @@ pub fn holds(cases: Vec<Case>, prefix: &str) {
     holds_where(cases, |id| id.starts_with(prefix));
 }
 
-/// **A FAMILY HOLDS, BUT FOR ITS STATED LIMITS** — a rule over the picked
-/// ids that says WHY each is one (a tear past a measured threshold, a move
-/// onto a row no band names): every picked case the rule names must read
-/// bad, and every other must hold. Neither side may be empty — a rule that
-/// names no case states nothing, and one that names every case leaves
-/// nothing to hold — so a grid's spine ([`sweep`]) must keep a case on each.
+/// A family holds but for its stated limits: every picked case `limit` names
+/// must read bad, and every other must hold. Neither side may be empty, so a
+/// grid's spine ([`sweep`]) must keep a case on each.
 pub fn holds_but(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -> bool) {
     let named = cases.iter().filter(|c| pick(&c.id) && limit(&c.id)).count();
     let picked = cases.iter().filter(|c| pick(&c.id)).count();

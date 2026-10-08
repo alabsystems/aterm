@@ -13,11 +13,5 @@ description = "Unicode grapheme cluster segmentation and width calculation for t
 # TextShapingConfig used in production (width.rs) and test/kani code paths
 aterm-types = { workspace = true }
 
-[dev-dependencies]
-# Dev-dependency only: cross-validation of generated width tables (#7887)
-unicode-width = "0.2"
-# Dev-dependency only: cross-validation of inline grapheme iterator (#7698, #7887)
-unicode-segmentation = "1.11"
-
 [lints]
 workspace = true

@@ -95,49 +95,7 @@ impl ContainmentPolicy {
 mod tests {
     use super::*;
 
-    /// Verify all policy mappings match the policy table exactly.
-    ///
-    /// | Mode        | Net       | Fs        | Proc      |
-    /// |-------------|-----------|-----------|-----------|
-    /// | Master(3)   | Full(1)   | Full(3)   | Full(2)   |
-    /// | User(2)     | Full(1)   | HomeRW(2) | Full(2)   |
-    /// | Safety(1)   | Full(1)   | ProjRW(1) | Restr(1)  |
-    /// | Contain(0)  | None(0)   | TmpOnly(0)| NoFork(0) |
-    #[test]
-    fn test_master_policy() {
-        let c = ContainmentPolicy::capabilities(ContainmentMode::Master);
-        assert_eq!(c.network, NetworkCapability::Full);
-        assert_eq!(c.fs, FsCapability::Full);
-        assert_eq!(c.process, ProcessCapability::Full);
-    }
-
-    #[test]
-    fn test_user_policy() {
-        let c = ContainmentPolicy::capabilities(ContainmentMode::User);
-        assert_eq!(c.network, NetworkCapability::Full);
-        assert_eq!(c.fs, FsCapability::HomeReadWrite);
-        assert_eq!(c.process, ProcessCapability::Full);
-    }
-
-    #[test]
-    fn test_safety_policy() {
-        let c = ContainmentPolicy::capabilities(ContainmentMode::Safety);
-        // Safety narrows nothing on the network: no level promises filtering
-        // that nothing does.
-        assert_eq!(c.network, NetworkCapability::Full);
-        assert_eq!(c.fs, FsCapability::ProjectReadWrite);
-        assert_eq!(c.process, ProcessCapability::Restricted);
-    }
-
-    #[test]
-    fn test_containment_policy() {
-        let c = ContainmentPolicy::capabilities(ContainmentMode::Containment);
-        assert_eq!(c.network, NetworkCapability::None);
-        assert_eq!(c.fs, FsCapability::TmpOnly);
-        assert_eq!(c.process, ProcessCapability::NoFork);
-    }
-
-    /// NonEscalation: mode can NEVER increase in capability.
+    /// NonEscalation: mode can never increase in capability.
     /// Verify that for all modes m1 < m2, every capability of m1 <= m2.
     #[test]
     fn test_monotonic_capabilities() {
@@ -168,6 +126,16 @@ mod tests {
     /// intended discriminants as raw u8 constants and verifies each policy
     /// function returns the matching capability, catching any drift between the
     /// documented encoding and the implementation.
+    ///
+    /// | Mode        | Net       | Fs        | Proc      |
+    /// |-------------|-----------|-----------|-----------|
+    /// | Master(3)   | Full(1)   | Full(3)   | Full(2)   |
+    /// | User(2)     | Full(1)   | HomeRW(2) | Full(2)   |
+    /// | Safety(1)   | Full(1)   | ProjRW(1) | Restr(1)  |
+    /// | Contain(0)  | None(0)   | TmpOnly(0)| NoFork(0) |
+    ///
+    /// Safety narrows nothing on the network: no level promises filtering
+    /// that nothing does.
     ///
     ///   Network: None=0, Full=1
     ///   Fs:      TmpOnly=0, ProjectRW=1, HomeRW=2, Full=3

@@ -99,10 +99,12 @@ pub struct Reading {
     /// requires it.
     pub phase_authoritative: bool,
     /// The wall the last turn ended on — `None` while a box is up, and while
-    /// the worker is (hard) busy only a HEALTH wall
+    /// a turn is running (a spinner, `esc to interrupt`) only a HEALTH wall
     /// ([`ScreenReader::health_wall`]: Claude Code's critical-memory banner,
-    /// which it draws under a running spinner). A turn that ended on `API
-    /// Error: 529` reads [`Phase::Idle`] with a wall here.
+    /// which it draws under a running spinner). Work the agent left running in
+    /// the background (a shell, a workflow) is no running turn: a wall the
+    /// turn ended on is read behind it, as [`Phase::Limited`]. A turn that
+    /// ended on `API Error: 529` reads [`Phase::Idle`] with a wall here.
     pub wall: Option<Wall>,
     /// The box, when [`Self::phase`] is [`Phase::Prompt`].
     pub prompt: Option<PromptV2>,
@@ -135,7 +137,9 @@ pub trait ScreenReader: Sync {
     fn prompt(&self, rows: &[String]) -> Option<PromptV2>;
     fn wall(&self, rows: &[String]) -> Option<Wall>;
     /// A wall that says the PROGRAM, not the turn, is stuck — read even
-    /// while the worker is hard busy, where [`Self::wall`] is not asked (a
+    /// while a turn is running (a spinner or `esc to interrupt`; work left
+    /// running in the background does not count, and a wall behind it is a
+    /// wall), where [`Self::wall`] is not asked (a
     /// retry notice under a live spinner is not a wall yet; a process past
     /// saving is one however busy its spinner looks). `None` by default:
     /// only a reader that knows its program's own such banner has one.
@@ -143,6 +147,12 @@ pub trait ScreenReader: Sync {
         None
     }
     fn survey(&self, rows: &[String]) -> bool;
+    /// The open rating card ([`crate::survey::survey_block`]) that [`Self::survey`]
+    /// reports: its kind, its rows and the `key if=` guard for its question row.
+    /// `None` for a program that draws none.
+    fn survey_block(&self, _rows: &[String]) -> Option<crate::survey::SurveyBlock> {
+        None
+    }
     /// THE AGENT'S OWN BACKGROUND WORK, AND NOTHING ELSE, KEEPS THIS SCREEN
     /// BUSY: its turn is over, the composer drawn, and what runs on is work
     /// it started (a dynamic workflow, a background agent, a shell, a Codex
@@ -180,6 +190,15 @@ pub trait ScreenReader: Sync {
     /// turn shows, and only that row — its leaving ends the turn (`await
     /// gone`). `None`: nothing on this program's screen says a turn runs.
     fn busy_guard(&self) -> Option<String>;
+    /// The first row a running turn's busy row can be on — the top of the
+    /// live zone: a wait on [`Self::busy_guard`] is armed over this row and
+    /// the rows under it, never over a busy row above it that another
+    /// process left there ([`crate::phase::busy_zone_start`]). `0` by
+    /// default: the whole screen, for a program whose layout says nothing
+    /// about where a dead process's rows end.
+    fn busy_zone_start(&self, _rows: &[String]) -> usize {
+        0
+    }
     /// The strings this program's guards name.
     fn anchors(&self) -> &'static [Anchor];
     /// Whether `phase`, read from `rows`, is evidence ([`Reading::
@@ -278,6 +297,9 @@ impl ScreenReader for ClaudeReader {
     fn survey(&self, rows: &[String]) -> bool {
         survey_open(rows)
     }
+    fn survey_block(&self, rows: &[String]) -> Option<crate::survey::SurveyBlock> {
+        crate::survey::survey_block(rows)
+    }
     fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
         crate::phase::background_wait(rows)
     }
@@ -315,7 +337,12 @@ impl ScreenReader for ClaudeReader {
     }
     /// The busy footer's `esc to interrupt`, under the spinner.
     fn busy_guard(&self) -> Option<String> {
-        Some(guard_regex(crate::anchor("busy.interrupt")))
+        Some(guard_regex(
+            const { crate::anchors::anchor_text("busy.interrupt") },
+        ))
+    }
+    fn busy_zone_start(&self, rows: &[String]) -> usize {
+        crate::phase::busy_zone_start(rows)
     }
     fn anchors(&self) -> &'static [Anchor] {
         ANCHORS
@@ -347,8 +374,8 @@ impl ScreenReader for ClaudeReader {
     /// leaves the previous run's box on the main grid above the new launch
     /// line (its footer `Press Ctrl-C again to exit`), and the screens of the
     /// new launch — the shell's rows under that line, then the new REPL half
-    /// drawn — show that old box whole. Measured on 2.1.283 (the review of
-    /// 2026-09-26, 150x50): the server published `agent=idle` from such a
+    /// drawn — show that old box whole. Measured on 2.1.283 (2026-09-26,
+    /// 150x50): the server published `agent=idle` from such a
     /// frame 187-352 ms before the new REPL was drawn, and a draft typed on
     /// `await agent idle` was lost 3 of 3 after the folder-trust dialog, 1 of
     /// 3 without it (the `INLINE_RELAUNCH_*` fixtures). The cursor is under
@@ -431,7 +458,7 @@ impl ScreenReader for CodexReader {
     fn busy_guard(&self) -> Option<String> {
         Some(format!(
             "{}\\)",
-            guard_regex(crate::anchors::anchor_text("codex.busy.interrupt"))
+            guard_regex(const { crate::anchors::anchor_text("codex.busy.interrupt") })
         ))
     }
     fn anchors(&self) -> &'static [Anchor] {
@@ -540,7 +567,7 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
     // A footerless box of no kind aterm-phase names (a setup dialog) is
     // drawn the same by any program's menu — a shell script's `❯ 1. dev`
     // under a rule and a title — so it names Claude Code only where the
-    // program's name already did (the harness round-3 review of 2026-09-24).
+    // program's name already did.
     let names_claude = |p: PromptV2| p.kind != PromptKind::Other || crate::prompt::footed(rows, &p);
     if has_composer_frame(rows) || parse_prompt_v2(rows).is_some_and(names_claude) {
         &ClaudeReader
@@ -575,10 +602,11 @@ pub fn read_at(
 /// screen is read by its tail: the first of its last `n` DRAWN rows, counted
 /// up from its last row that is not blank. The blank rows under what is
 /// drawn are not counted against `n`; they stay in the zone, below it, so
-/// `rows[live_zone_start(rows, n)..]` is the grid's last `n` rows and the
-/// blank rows' worth above them. The server's agent verdict reads this zone
-/// (`presence::CLASSIFY_ROWS`), and so does a supervisor whose tail read
-/// ends on a blank row and is taken again whole.
+/// on a screen with no GAP (below) `rows[live_zone_start(rows, n)..]` is the
+/// grid's last `n` rows and the blank rows' worth above them. The server's
+/// agent verdict reads this zone (`presence::CLASSIFY_ROWS`), and so does a
+/// supervisor whose tail read ends on a blank row or holds a gap
+/// ([`live_zone_reaches_above`]) and is taken again whole.
 ///
 /// Why drawn rows: Claude Code's INLINE renderer (its classic main-screen
 /// renderer — `tui = "default"`, `CLAUDE_CODE_NO_FLICKER=0`, or its
@@ -589,18 +617,69 @@ pub fn read_at(
 /// rows, never its caret or top rule, and Claude Code's `idle` there was no
 /// evidence (measured on 2.1.283, 2026-09-26: a 50-row pane, the REPL on
 /// rows 8-11 — `agent=` stayed `unknown` and `await agent idle` timed out).
-/// A screen drawn to its last row (the fullscreen renderer's footer, a
-/// Codex composer) has the zone the grid's last `n` rows always gave — and so
-/// does one whose blank rows are ordinary separators; only a GAP of
-/// [`BLANK_GAP`] blank rows or more counts as one row, so the last thing said
-/// above a tall pane's blank middle stays in the zone.
+///
+/// Why a GAP counts as one row: a run of [`BLANK_GAP`] blank rows or more is
+/// not a separator but the pane's empty middle, and it counts as ONE row
+/// against `n`, however tall — so the last thing said above it stays in the
+/// zone. A screen drawn to its last row with no such run (the fullscreen
+/// renderer's footer on a full transcript, a Codex composer) has exactly the
+/// grid's last `n` rows as its zone, and so does one whose blank rows are
+/// ordinary one-to-three-row separators; a screen drawn to its last row that
+/// DOES hold a gap has a zone that reaches above the last `n` rows (the
+/// measured tall pane, below).
 #[must_use]
 pub fn live_zone_start(rows: &[String], n: usize) -> usize {
+    zone_walk(rows, n).0
+}
+
+/// Whether the live zone of a screen begins ABOVE `tail`, its last `n` rows —
+/// for a supervisor that reads a screen by `text tail=<n>` and must know when
+/// the rows it holds are not the whole of the zone. True when `tail` is drawn
+/// to its last row and HOLDS a GAP: [`BLANK_GAP`] blank rows or more, which
+/// count as one row against `n`, so the walk of [`live_zone_start`] reaches
+/// the tail's top with rows to spare and goes on above it.
+///
+/// What a tail cannot show is a gap CUT by its top row: fewer than
+/// [`BLANK_GAP`] blank rows of a longer run lie in the tail, the rest above
+/// it. That needs `n - 3` or more drawn rows under the gap, a tall box or
+/// dialog at the foot of the pane (a 38-row question dialog in a 60-row pane
+/// has two blank rows at the tail's top and 22 above), and what it hides
+/// above the box is the transcript's last words: this returns `false` there,
+/// as the box is what the reader reads. (Asking for the whole read whenever
+/// the tail's first row is blank would cost every poll of such a pane a
+/// second read of the pane to say the same thing.) A tail that ends on a
+/// blank row is not this function's either: what is drawn ends above the
+/// grid's last row and the zone begins above the tail on that alone (the
+/// supervisor's `drawn_above_tail`, which lets the tail stand only where its
+/// reader decides a box or a running turn from it; an idle composer, or a tail
+/// it decides nothing from, is read whole). `tail` is the screen's last `n`
+/// rows; a shorter one is the whole screen and has nothing above it.
+///
+/// Measured 2026-09-28 on Claude Code 2.1.284, 144x50: a fresh fullscreen
+/// session whose first turn ended on `⏺ API Error: Can't reach the API
+/// server` has the error on row 8, 35 blank rows, then the composer and its
+/// footer on rows 46-49 — the last 40 rows begin at row 10, below the error,
+/// hold the gap, and read as an ordinary idle turn end without it.
+#[must_use]
+pub fn live_zone_reaches_above(tail: &[String], n: usize) -> bool {
+    let drawn_to_the_last_row = tail
+        .last()
+        .is_some_and(|r| !crate::text::trim(r).is_empty());
+    if tail.len() < n || !drawn_to_the_last_row {
+        return false;
+    }
+    let (start, budget) = zone_walk(tail, n);
+    start == 0 && budget > 0
+}
+
+/// [`live_zone_start`]'s walk: where it stops, and the budget it has left
+/// (rows of `n` unspent when it ran out of rows).
+fn zone_walk(rows: &[String], n: usize) -> (usize, usize) {
     let drawn = rows
         .iter()
-        .rposition(|r| !r.trim().is_empty())
+        .rposition(|r| !crate::text::trim(r).is_empty())
         .map_or(0, |last| last + 1);
-    let blank = |i: usize| rows[i].trim().is_empty();
+    let blank = |i: usize| crate::text::trim(&rows[i]).is_empty();
     let (mut start, mut budget) = (drawn, n);
     while start > 0 && budget > 0 {
         start -= 1;
@@ -609,10 +688,10 @@ pub fn live_zone_start(rows: &[String], n: usize) -> usize {
         // by it. Claude Code's fullscreen renderer pins the composer to the
         // pane's foot, so a short transcript in a tall pane leaves the last
         // thing said (`⏺ API Error: …`) far above it — measured on 2.1.284,
-        // 2026-09-28, 144x50: the error on row 8, the composer on rows 45-47,
-        // `agent=idle` with no wall because row 8 was 41 rows above the last
-        // drawn row. A run of fewer than [`BLANK_GAP`] rows is an ordinary
-        // separator and counts row by row, as it always did.
+        // 2026-09-28, 144x50: the error on row 8, the composer's top rule on
+        // row 46, `agent=idle` with no wall because row 8 was 41 rows above
+        // the last drawn row. A run of fewer than [`BLANK_GAP`] rows is an
+        // ordinary separator and counts row by row, as it always did.
         if blank(start) {
             let mut top = start;
             while top > 0 && blank(top - 1) {
@@ -624,12 +703,12 @@ pub fn live_zone_start(rows: &[String], n: usize) -> usize {
         }
         budget -= 1;
     }
-    start
+    (start, budget)
 }
 
 /// How many blank rows in a row make a GAP rather than a separator
 /// ([`live_zone_start`]).
-const BLANK_GAP: usize = 4;
+pub const BLANK_GAP: usize = 4;
 
 /// The program word of a `program=` / `detail=` value: the basename of its
 /// first word, lowercased, a login shell's `-` dropped.
@@ -1033,8 +1112,8 @@ mod tests {
         assert_eq!(ClaudeReader.health_wall(&busy).map(|w| w.row), Some(at));
     }
 
-    /// CLAUDE CODE IS IDLE AT ITS COMPOSER, NOT BEFORE IT (the live e2e of
-    /// 2026-09-26, NEW-1: the server published `agent=idle` 72-248 ms after
+    /// CLAUDE CODE IS IDLE AT ITS COMPOSER, NOT BEFORE IT (live, 2026-09-26:
+    /// the server published `agent=idle` 72-248 ms after
     /// the harness pressed the folder-trust dialog, before Claude Code had
     /// drawn its REPL, and a first prompt sent on `await agent idle` was lost
     /// or left unsent). Measured on 2.1.283 frame by frame (the `LAUNCH_*`
@@ -1045,15 +1124,23 @@ mod tests {
     /// authoritative idle (the control: a draft typed at that frame landed
     /// every time). The other readings of a screen with no composer frame
     /// stand, authoritative: the trust dialog is a prompt, a spinner row is
-    /// busy, a last row ending in `?` a question, a wall a wall.
+    /// busy, a last row ending in `?` a question, a wall a wall. A dialog the
+    /// reader has no reading of (2.1.292's classifier-billing notice, measured)
+    /// is the same `idle` without evidence: the supervisor's dialog canary
+    /// stands on it.
     #[test]
     fn claude_codes_idle_is_read_at_its_composer() {
         use crate::prompt::fixtures::{
-            LAUNCH_BEFORE_REPL, LAUNCH_REPL_HALF_DRAWN, LAUNCH_REPL_READY,
+            AUTO_CLASSIFIER_BILLING_NOTICE_MEASURED, LAUNCH_BEFORE_REPL, LAUNCH_REPL_HALF_DRAWN,
+            LAUNCH_REPL_READY,
         };
         for (name, text) in [
             ("before the REPL", LAUNCH_BEFORE_REPL),
             ("the REPL half drawn", LAUNCH_REPL_HALF_DRAWN),
+            (
+                "the classifier-billing notice",
+                AUTO_CLASSIFIER_BILLING_NOTICE_MEASURED,
+            ),
         ] {
             let r = read(Some("claude"), &screen(text), Some(2));
             assert_eq!(r.program, Program::Claude, "{name}");
@@ -1103,28 +1190,15 @@ mod tests {
         );
     }
 
-    /// CLAUDE CODE'S INLINE REPL IS READ WHERE IT IS DRAWN (the review of
-    /// 2026-09-26): its inline renderer (the classic main-screen one) draws
-    /// the REPL under the line that launched it and leaves the rows below
-    /// blank until the transcript fills the pane. Measured on 2.1.283 at
-    /// 150x50 (the `INLINE_*` fixtures): the prompt box drawn whole on rows
-    /// 8-11, 38 blank rows under it. The grid's last 40 rows hold its bottom
-    /// rule and footer, not its caret or top rule — read there, its `idle`
-    /// was no evidence, `agent=` stayed `unknown` and `await agent idle`
-    /// timed out (RED: the first assertion). The live zone is the last 40
-    /// DRAWN rows ([`live_zone_start`]): the whole REPL, authoritative `idle`
-    /// (GREEN). The inline launch's other frames keep their readings through
-    /// the zone: the dialog is the trust prompt, the half-drawn REPL (its
-    /// bottom rule begun, `──`) no evidence. A screen drawn to its last row
-    /// has the zone the grid's last 40 rows always gave (the fullscreen
-    /// REPL's control).
-    /// THE TALL PANE (a real render, 2026-09-28): a short transcript with the
-    /// composer pinned at the foot leaves 36 blank rows between the last thing
-    /// said and the composer, and the error on row 8 lay 41 rows above the
-    /// last drawn row — cut by the zone, so `agent=idle` with no wall while
-    /// the library read the wall on the whole screen. A gap of blank rows
-    /// counts as one row. CONTROLS: a screen with only one-row separators
-    /// cuts exactly as before, and a gap of three rows is a separator.
+    /// THE TALL PANE (a real render, 2026-09-28, Claude Code 2.1.284 at
+    /// 144x50, `API_ERROR_TALL_PANE_MEASURED`): a short transcript with the
+    /// composer pinned at the foot leaves 35 blank rows between the turn's
+    /// done row (row 10) and the composer's top rule (row 46), and the error
+    /// on row 8 lay 41 rows above the last drawn row (the footer, row 49) —
+    /// cut by the zone, so `agent=idle` with no wall while the library read
+    /// the wall on the whole screen. A gap of blank rows counts as one row.
+    /// CONTROLS: a screen with only one-row separators cuts exactly as
+    /// before, and a gap of three rows is a separator.
     #[test]
     fn a_long_blank_gap_does_not_cut_the_last_thing_said_out_of_the_zone() {
         use crate::prompt::fixtures::API_ERROR_TALL_PANE_MEASURED;
@@ -1137,7 +1211,30 @@ mod tests {
             .iter()
             .rposition(|r| r.starts_with('❯'))
             .expect("caret");
-        assert!(error < 10 && cursor > 44, "{error} {cursor}");
+        // THE NUMBERS THE FIXTURE'S HEADER AND THE DOCS GIVE (0-based, the
+        // header dropped): a 50-row pane, the error on row 8, the done row on
+        // row 10, 35 blank rows, the composer on rows 46-48 (the caret on
+        // 47) and the footer on row 49 — 41 rows above the last drawn row.
+        let done = rows
+            .iter()
+            .position(|r| r.starts_with("✻ Worked for"))
+            .expect("the done row");
+        let top_rule = rows
+            .iter()
+            .position(|r| r.starts_with('─'))
+            .expect("the composer's top rule");
+        assert_eq!(
+            (rows.len(), error, done, top_rule, cursor),
+            (50, 8, 10, 46, 47)
+        );
+        assert!(rows[done + 1..top_rule].iter().all(|r| r.trim().is_empty()));
+        assert_eq!(top_rule - done - 1, 35, "35 blank rows");
+        assert!(!rows[rows.len() - 1].trim().is_empty(), "drawn to the foot");
+        assert_eq!(
+            rows.len() - 1 - error,
+            41,
+            "41 rows above the last drawn row"
+        );
         // RED: the grid's last 40 rows, and the zone as it was counted.
         assert!(rows.len() - 40 > error, "the old cut lies below the error");
         // GREEN: the zone reaches the error and the reader finds the wall.
@@ -1182,6 +1279,105 @@ mod tests {
         assert_eq!(live_zone_start(&vec![String::new(); 62], 40), 0);
     }
 
+    /// A SUPERVISOR THAT READS THE LAST 40 ROWS ASKS WHETHER THE ZONE IS
+    /// ABOVE THEM ([`live_zone_reaches_above`]): the measured tall pane's last
+    /// 40 rows begin on its done row, hold the 35-row gap and the composer,
+    /// and say so (the zone reaches the error above them); a full transcript,
+    /// one-to-three-row separators and a tail that ends on a blank row (the
+    /// inline renderer's, another rule's) do not. The answer is checked
+    /// against the whole screen's own zone on a sweep of runs: exact for a
+    /// gap of four rows or more inside the tail, and blind, by design, to one
+    /// the tail's top row cuts (the function's doc says why).
+    #[test]
+    fn a_tail_that_holds_a_gap_says_the_zone_reaches_above_it() {
+        use crate::prompt::fixtures::API_ERROR_TALL_PANE_MEASURED;
+        let tall = screen(API_ERROR_TALL_PANE_MEASURED);
+        let tail_of = |rows: &[String]| rows[rows.len().saturating_sub(40)..].to_vec();
+        // The measured tall pane: the gap is in the tail.
+        assert!(live_zone_reaches_above(&tail_of(&tall), 40));
+        // CONTROL: the same pane's rows with the gap filled — a full
+        // transcript — are the last 40 rows, and the tail says nothing above.
+        let mut full = tall.clone();
+        for row in &mut full[11..46] {
+            *row = "· earlier".to_string();
+        }
+        assert!(!live_zone_reaches_above(&tail_of(&full), 40));
+        assert_eq!(live_zone_start(&full, 40), 10);
+        // CONTROL: separators of one to three rows are counted row by row.
+        for gap in 1..BLANK_GAP {
+            let mut sep = full.clone();
+            for row in &mut sep[30..30 + gap] {
+                row.clear();
+            }
+            assert!(!live_zone_reaches_above(&tail_of(&sep), 40), "gap {gap}");
+        }
+        // The gap's own size: BLANK_GAP rows is one, the tail says so.
+        let mut four = full.clone();
+        for row in &mut four[30..30 + BLANK_GAP] {
+            row.clear();
+        }
+        assert!(live_zone_reaches_above(&tail_of(&four), 40));
+        assert_eq!(live_zone_start(&four, 40), 10 - (BLANK_GAP - 1));
+        // CONTROL: a tail that ENDS on a blank row is `drawn_above_tail`'s.
+        let mut inline = tall.clone();
+        inline.extend(std::iter::repeat_n(String::new(), 12));
+        assert!(!live_zone_reaches_above(&tail_of(&inline), 40));
+        assert!(!live_zone_reaches_above(&vec![String::new(); 40], 40));
+        // The limit, stated: a gap CUT by the tail's top row — fewer than
+        // BLANK_GAP of its rows inside — is not seen from the tail alone, and
+        // a tail that begins on a blank row is no reason to read twice.
+        let mut cut = full.clone();
+        cut[10].clear();
+        assert!(!live_zone_reaches_above(&tail_of(&cut), 40));
+        // EXACT OVER RUNS: a blank run of one to ten rows whose last row is 0
+        // to 3 rows inside the tail (so 1 to 4 of its rows are in it) is seen
+        // when four or more of its rows are inside, and where the whole
+        // screen's zone begins above its last 40 rows and the tail does not
+        // say so, the run is one of the cut ones — never another shape.
+        let (mut above_seen, mut cut_seen) = (0, 0);
+        for run in 1..=10usize {
+            for inside in 0..=3usize {
+                let mut rows: Vec<String> = (0..62).map(|i| format!("row {i}")).collect();
+                let last40 = rows.len() - 40;
+                let bottom = last40 + inside;
+                for row in &mut rows[(bottom + 1).saturating_sub(run)..=bottom] {
+                    row.clear();
+                }
+                let in_tail = run.min(inside + 1);
+                let above = live_zone_start(&rows, 40) < last40;
+                let asks = live_zone_reaches_above(&tail_of(&rows), 40);
+                assert_eq!(asks, in_tail >= BLANK_GAP, "run {run}, {inside} inside");
+                assert_eq!(
+                    above,
+                    run >= BLANK_GAP,
+                    "run {run}, {inside} inside: the zone is above the tail"
+                );
+                above_seen += usize::from(above);
+                cut_seen += usize::from(above && !asks);
+            }
+        }
+        assert!(above_seen > 10, "the sweep saw {above_seen} zones above");
+        assert!(
+            cut_seen > 0,
+            "and some cut ones ({cut_seen}) the tail cannot see"
+        );
+    }
+
+    /// CLAUDE CODE'S INLINE REPL IS READ WHERE IT IS DRAWN: its inline
+    /// renderer (the classic main-screen one) draws the REPL under the line
+    /// that launched it and leaves the rows below blank until the transcript
+    /// fills the pane. Measured on 2.1.283 at
+    /// 150x50 (the `INLINE_*` fixtures): the prompt box drawn whole on rows
+    /// 8-11, 38 blank rows under it. The grid's last 40 rows hold its bottom
+    /// rule and footer, not its caret or top rule — read there, its `idle`
+    /// was no evidence, `agent=` stayed `unknown` and `await agent idle`
+    /// timed out (RED: the first assertion). The live zone is the last 40
+    /// DRAWN rows ([`live_zone_start`]): the whole REPL, authoritative `idle`
+    /// (GREEN). The inline launch's other frames keep their readings through
+    /// the zone: the dialog is the trust prompt, the half-drawn REPL (its
+    /// bottom rule begun, `──`) no evidence. A screen drawn to its last row
+    /// with no blank gap has the zone the grid's last 40 rows always gave
+    /// (the fullscreen REPL's control).
     #[test]
     fn an_inline_repl_above_the_last_40_rows_is_read_in_the_live_zone() {
         use crate::prompt::fixtures::{
@@ -1268,9 +1464,8 @@ mod tests {
         }
     }
 
-    /// CLAUDE CODE'S SHELL MODE IS ITS PROMPT BOX (the review of 2026-09-26:
-    /// the rule above first read it `idle` NOT authoritatively, where every
-    /// build before it read `idle`). `!` typed into the empty prompt box
+    /// CLAUDE CODE'S SHELL MODE IS ITS PROMPT BOX (the rule above first read
+    /// it `idle` NOT authoritatively). `!` typed into the empty prompt box
     /// turns the caret into `!` — of every printable key typed alone there on
     /// 2.1.283, the one that changes the caret — and the REPL is up, taking
     /// keys: authoritative `idle`, the placeholder under the caret or a
@@ -1334,9 +1529,9 @@ mod tests {
     }
 
     /// CLAUDE CODE'S IDLE IS THE PROMPT BOX THAT HOLDS THE CURSOR (the
-    /// review of 2026-09-26: the inline renderer relaunched in the SAME tab,
-    /// 150x50). The previous run's prompt box stays on the main grid above
-    /// the new launch line, and the screens of the new launch show it whole:
+    /// inline renderer relaunched in the SAME tab, 150x50). The previous
+    /// run's prompt box stays on the main grid above the new launch line,
+    /// and the screens of the new launch show it whole:
     /// read by the frame alone, the frame right after the folder-trust
     /// dialog was pressed read authoritative `idle`, the server published
     /// `agent=idle` from it 187-352 ms before the new REPL was drawn, and a
@@ -1538,7 +1733,7 @@ mod tests {
 
     /// The banner's remedy tail is the VENDOR's (`— restart and resume with
     /// claude --continue`), and [`crate::wall::memory_banner_head`] leaves it
-    /// out of anything aterm repeats (2026-09-26: `--continue` resumes the
+    /// out of anything aterm repeats (`--continue` resumes the
     /// directory's newest conversation — a sibling tab's where two share
     /// it). NEGATIVE CONTROL: the whole message still carries it, so the cut
     /// is what removes it.

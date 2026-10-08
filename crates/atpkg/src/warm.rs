@@ -30,14 +30,21 @@
 //!   that session — EXCEPT the ones that say where the user keeps the program's state or
 //!   which endpoint it talks to ([`KEEP`]: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, an
 //!   identity session's among them): stripping those refreshed the default home's caches,
-//!   which that user's program never reads. It runs through the `bin/` shim, so the shim's
-//!   own environment (`DISABLE_AUTOUPDATER=1`) applies.
+//!   which that user's program never reads. Where no shell of the user's made this
+//!   process's environment — the window, started from the Dock, whose head watch lands
+//!   most builds — what their login shell exports completes it (those variables, the
+//!   opt-outs below, and what the program honours itself, such as `DISABLE_TELEMETRY`),
+//!   the way their next launch of the program gets them ([`persons_setup`]). It
+//!   runs through the `bin/` shim, so the shim's own environment (`DISABLE_AUTOUPDATER=1`)
+//!   applies.
 //! * **Never against the user's choice.** A program the user turned the vendor's
 //!   non-essential traffic off for ([`OPT_OUTS`]) is not warmed (its whole point is that
 //!   traffic); one that has never run on this account ([`STATE`]: a default-set install
 //!   the user never launched) has no account caches to refresh and is not warmed either;
-//!   and nothing is warmed as root (a `sudo aterm pkg update` would leave root-owned files
-//!   in the user's home).
+//!   nor is anything the window started when the person's login shell could not be read
+//!   ([`Ended::SetupUnread`]): an opt-out kept there is never taken to be absent; and
+//!   nothing is warmed as root (a `sudo aterm pkg update` would leave root-owned files in
+//!   the user's home).
 //! * **Bounded.** Past [`DEADLINE`] the warm's whole process group is killed.
 //! * **Best effort.** A warm that fails, times out or finds the build already replaced
 //!   fails nothing and is never retried: the user's own first launch does the same work.
@@ -274,9 +281,219 @@ pub fn run_hidden(rest: &[OsString]) -> ExitCode {
     if let Some(request) = Request::parse(rest).filter(|_| !running_as_root()) {
         let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
         let home = aterm_types::dirs::home_dir();
-        let _ = warm(&request, &inherited, home.as_deref(), HOLD, DEADLINE);
+        let _ = warm(
+            &request,
+            &inherited,
+            login_shell_env,
+            home.as_deref(),
+            HOLD,
+            DEADLINE,
+        );
     }
     ExitCode::SUCCESS
+}
+
+/// The variable the rc hook exports in every shell that sources it ([`crate::hooks`]).
+/// Present, it says the person's rc chain — which sources the hook — already ran in this
+/// environment's ancestry, so whatever that chain exports is here; absent, that no shell
+/// of theirs made it: the window, started by launchd from the Dock, whose head watch lands
+/// most builds (measured on the live window, 2026-10-02: launchd's variables and the
+/// update handoff's, no rc export at all).
+const SHELL_MARK: &str = "ATPKG_BIN";
+
+/// What the probe shell exports about ITSELF rather than about the person — where it stood
+/// and how deep it ran — and so is never taken from it ([`persons_setup`]): the warm runs
+/// from home ([`warm_command`]), and a `PWD` the rc `cd`'d to would name another directory.
+const SHELL_OWN: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
+
+/// The person's own setup as the next launch of the program will see it: `inherited`, and —
+/// where no shell of theirs made it ([`SHELL_MARK`] absent) — every variable their login
+/// shell exports (`login`, asked at most once and only then) that `inherited` leaves unset
+/// or empty, but the shell's own ([`SHELL_OWN`]). What `inherited` sets always wins: an
+/// identity session's config home, a pass typed with a variable of its own, the `PATH` the
+/// window already read from that same shell. [`declined`] reads the whole of it; the
+/// program gets it under the rule it gets `inherited` by — no AI variable but [`KEEP`]'s
+/// ([`warm`]).
+///
+/// Why (audit 2026-10-02): a warm the window's head watch started inherited launchd's
+/// environment, so a `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` the person exports in
+/// `~/.zshrc` never reached [`declined`] — claude ran and made the traffic they turned off,
+/// on every landing — and a `CLAUDE_CONFIG_DIR` kept there was not the home warmed. Every
+/// variable, not those two lists' names alone (review of that fix): the program honours
+/// some itself — a `DISABLE_TELEMETRY=1` kept there is why [`OPT_OUTS`] leaves that one
+/// out, and the first cut never passed it on, so a window-started warm sent the telemetry
+/// they had turned off — and a Bedrock choice ([`KEEP`]) is worth nothing without the
+/// `AWS_REGION` beside it. Their next `claude` starts from a shell that has read that rc,
+/// with all of it. Asked only once the build is known to be the active one ([`warm`]), and
+/// never as root ([`run_hidden`]).
+///
+/// `None` when their login shell had to be asked and gave no answer ([`login_shell_env`]):
+/// unread is not unset (audit round 2, 2026-10-02). A slow rc, one that `exec`s tmux
+/// (which has no terminal there), one that `exec`s another shell, a shell the warm does
+/// not ask (nu, tcsh, ksh) and no `$SHELL` at all each fell through to `inherited` alone,
+/// and claude ran past an opt-out the person's own terminal gets from that rc — logged
+/// `exit=0`, measured in all five. [`warm`] runs nothing then.
+fn persons_setup(
+    inherited: &[(OsString, OsString)],
+    login: impl FnOnce() -> Option<Vec<(OsString, OsString)>>,
+) -> Option<Vec<(OsString, OsString)>> {
+    let set_in = |name: &OsString| {
+        inherited
+            .iter()
+            .any(|(key, value)| key == name && !value.is_empty())
+    };
+    let mut setup = inherited.to_vec();
+    if set_in(&OsString::from(SHELL_MARK)) {
+        return Some(setup);
+    }
+    for (name, value) in login()? {
+        if value.is_empty() || SHELL_OWN.iter().any(|own| name == *own) || set_in(&name) {
+            continue;
+        }
+        setup.retain(|(key, _)| *key != name);
+        setup.push((name, value));
+    }
+    Some(setup)
+}
+
+/// How long the person's login shell has to print its environment ([`login_shell_env`]):
+/// the window's own bound for the `PATH` it reads the same way (aterm-gui
+/// `spawn::LOGIN_PATH_BUDGET`) — an rc file that blocks (a `read`, an `ssh-add` prompt)
+/// costs a warm no more than this.
+#[cfg(unix)]
+const LOGIN_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long the read of an answered login shell may outlast [`LOGIN_BUDGET`]: what it
+/// printed is in the pipe by then, but a background job its rc started can hold the pipe
+/// open for as long as it lives.
+#[cfg(unix)]
+const LOGIN_GRACE: Duration = Duration::from_secs(1);
+
+/// The variable the probe's own `env -0` sets ([`login_shell_env`]), and nothing else
+/// does: the probe's environment never carries it. Its record in an answer is what says
+/// the person's login shell ran the probe and printed the environment its rc made — not
+/// that something the rc handed the shell to (another shell, which reads the empty stdin
+/// and exits 0) printed whatever it printed. Never part of the person's setup.
+#[cfg(unix)]
+const ASKED_MARK: &str = "ATPKG_WARM_ASKED";
+
+/// The person's login shell's environment ([`persons_setup`]): `<shell> -l -i -c
+/// '/usr/bin/env -0 ATPKG_WARM_ASKED=1'` — the shell [`login_shell`] picks — in a session
+/// of its own (no controlling terminal for `-i` to take; its id is the group the budget
+/// kills), its stdin and stderr `/dev/null`. `None` when there is no such shell, it did not
+/// exit 0 within [`LOGIN_BUDGET`] (its whole session killed then), or what it printed does
+/// not carry the probe's own record ([`ASKED_MARK`]).
+#[cfg(unix)]
+fn login_shell_env() -> Option<Vec<(OsString, OsString)>> {
+    use std::io::Read as _;
+    let shell = login_shell(std::env::var_os("SHELL"))?;
+    let mut child = aterm_uds::spawnfd::command(&shell)
+        .args(["-l", "-i", "-c", &format!("/usr/bin/env -0 {ASKED_MARK}=1")])
+        .env_remove(ASKED_MARK)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .setsid(true)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Drained on a helper that streams what it reads and is never joined: an rc file's
+    // background job may hold the pipe's write end for as long as it lives.
+    let (sent, chunks) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if sent.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + LOGIN_BUDGET;
+    let answered = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(POLL),
+            _ => {
+                // The whole session (its leader's pid is its group's id), before the
+                // leader is reaped.
+                crate::platform::kill_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    if !answered {
+        return None;
+    }
+    let stop = deadline.max(std::time::Instant::now()) + LOGIN_GRACE;
+    let mut out = Vec::new();
+    while let Ok(chunk) =
+        chunks.recv_timeout(stop.saturating_duration_since(std::time::Instant::now()))
+    {
+        out.extend_from_slice(&chunk);
+    }
+    let mut records = parse_env0(&out);
+    let asked = records
+        .iter()
+        .position(|(name, value)| name == ASKED_MARK && value == "1")?;
+    records.remove(asked);
+    Some(records)
+}
+
+/// No login shell to ask off Unix, where no warm is started ([`spawn_landed`]).
+#[cfg(not(unix))]
+fn login_shell_env() -> Option<Vec<(OsString, OsString)>> {
+    None
+}
+
+/// The shell [`login_shell_env`] runs: `$SHELL` when it is zsh, bash or fish — a shell
+/// whose `-l -i -c` reads the person's login and interactive rc files and then runs the
+/// probe — else none. The window's own login-shell `PATH` read (aterm-gui
+/// `spawn::login_shell_path`) asks `/bin/zsh` instead, and this one must not: `/bin/zsh`'s
+/// rc is not a nu, tcsh or ksh user's setup, nor anyone's whose `$SHELL` is unset. A
+/// `PATH` may fall back to a default; an opt-out may not, so their setup goes unread
+/// ([`persons_setup`]).
+#[cfg(unix)]
+fn login_shell(shell: Option<OsString>) -> Option<PathBuf> {
+    shell.map(PathBuf::from).filter(|s| {
+        matches!(
+            s.file_name().and_then(|n| n.to_str()),
+            Some("zsh" | "bash" | "fish")
+        )
+    })
+}
+
+/// `env -0`'s records as (name, value) pairs: each `NAME=VALUE` ends at a NUL and the value
+/// is taken whole, so a multi-line value elsewhere (an exported function, a prompt) cannot
+/// forge a record as a line-split read lets it. A banner an rc file printed ahead of the
+/// first record is cut off at its last newline (a name holds none).
+#[cfg(unix)]
+fn parse_env0(out: &[u8]) -> Vec<(OsString, OsString)> {
+    use std::os::unix::ffi::OsStringExt as _;
+    out.split(|b| *b == 0)
+        .filter_map(|record| {
+            let eq = record.iter().position(|b| *b == b'=')?;
+            let name = &record[..eq];
+            let name = name
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(name, |nl| &name[nl + 1..]);
+            (!name.is_empty()).then(|| {
+                (
+                    OsString::from_vec(name.to_vec()),
+                    OsString::from_vec(record[eq + 1..].to_vec()),
+                )
+            })
+        })
+        .collect()
 }
 
 /// How a warm ended.
@@ -294,6 +511,9 @@ enum Ended {
     OptedOut,
     /// Not run: the program has never run on this account ([`STATE`]).
     NeverRun,
+    /// Not run: no shell of the person's made this environment and their login shell gave
+    /// no answer ([`persons_setup`]), so an opt-out they keep there could not be read.
+    SetupUnread,
 }
 
 impl Ended {
@@ -306,6 +526,7 @@ impl Ended {
             Self::SpawnFailed => String::from("spawn-failed"),
             Self::OptedOut => String::from("opted-out"),
             Self::NeverRun => String::from("never-run"),
+            Self::SetupUnread => String::from("setup-unread"),
         }
     }
 }
@@ -339,12 +560,16 @@ fn declined(
 }
 
 /// Run `request`'s warm with its stdin held `hold` and the whole of it bounded by
-/// `deadline`, under the `inherited` environment from `home`, and log it — or nothing at
-/// all when the build is no longer the active one (a later landing, a rollback: that
-/// build's own warm, or none, is what counts). A warm [`declined`] is logged, not run.
+/// `deadline`, under the `inherited` environment completed with the person's own setup
+/// ([`persons_setup`], `login` its login shell's environment) from `home`, and log it — or
+/// nothing at all when the build is no longer the active one (a later landing, a rollback:
+/// that build's own warm, or none, is what counts; no login shell is asked then). A warm
+/// [`declined`], or whose person's setup went unread ([`Ended::SetupUnread`]), is logged,
+/// not run.
 fn warm(
     request: &Request,
     inherited: &[(OsString, OsString)],
+    login: impl FnOnce() -> Option<Vec<(OsString, OsString)>>,
     home: Option<&Path>,
     hold: Duration,
     deadline: Duration,
@@ -358,12 +583,31 @@ fn warm(
     }
     let tool = ToolName::new(program)?;
     let argv = warm_argv(request.spec)?;
+    let Some(setup) = persons_setup(inherited, login) else {
+        // An opt-out already in hand is final, and says so; short of one, the unread rc
+        // may keep it.
+        let ended = declined(program, inherited, home)
+            .filter(|why| *why == Ended::OptedOut)
+            .unwrap_or(Ended::SetupUnread);
+        log(&layout, program, request.build, &ended.words(), 0);
+        return Some(ended);
+    };
     let started = std::time::Instant::now();
-    let ended = if let Some(declined) = declined(program, inherited, home) {
+    let ended = if let Some(declined) = declined(program, &setup, home) {
         declined
     } else {
         let keys = inherited.iter().map(|(key, _)| key.clone());
-        match warm_command(&layout, &tool, argv, keys, home).spawn() {
+        let mut command = warm_command(&layout, &tool, argv, keys, home);
+        // What the login shell added to the person's setup reaches the program by the rule
+        // `inherited` does — no AI variable but [`KEEP`]'s — and never over [`CHILD_ENV`].
+        for (name, value) in setup.iter().filter(|pair| !inherited.contains(pair)) {
+            if !name.to_str().is_some_and(stripped)
+                && !CHILD_ENV.iter().any(|(child, _)| name == *child)
+            {
+                command.env(name, value);
+            }
+        }
+        match command.spawn() {
             Ok(child) => drive(child, hold, deadline),
             Err(_) => Ended::SpawnFailed,
         }
@@ -373,11 +617,20 @@ fn warm(
     Some(ended)
 }
 
+/// Whether the variable `name` is kept from the warm's program: an AI variable
+/// ([`aterm_types::domain::is_ai_env_var`]) that is not the person's own setup ([`KEEP`]).
+fn stripped(name: &str) -> bool {
+    aterm_types::domain::is_ai_env_var(name) && !KEEP.contains(&name)
+}
+
 /// The warm's command: `<prefix>/bin/<tool> <argv…>` ([`crate::landing::shim_command`]),
 /// every inherited AI variable among `inherited` removed but the user's own setup
 /// ([`KEEP`]), [`CHILD_ENV`] set, run from `home` (else the prefix), stdin a pipe the warm
 /// never writes, stdout and stderr `/dev/null`, in a process group of its own so the
-/// deadline can kill all of it.
+/// deadline can kill all of it — and holding nothing else of this process
+/// ([`aterm_uds::spawnfd::InheritNothing`]): the shim command is raw because the
+/// pass-throughs that exec it hand their caller's descriptors on, and the warm is no
+/// pass-through (review of 2026-10-01).
 fn warm_command(
     layout: &Layout,
     tool: &ToolName,
@@ -385,13 +638,12 @@ fn warm_command(
     inherited: impl IntoIterator<Item = OsString>,
     home: Option<&Path>,
 ) -> std::process::Command {
+    use aterm_uds::spawnfd::InheritNothing as _;
     let args: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
     let mut command = crate::landing::shim_command(layout, tool, &args);
+    command.inherit_nothing();
     for key in inherited {
-        if key
-            .to_str()
-            .is_some_and(|k| aterm_types::domain::is_ai_env_var(k) && !KEEP.contains(&k))
-        {
+        if key.to_str().is_some_and(stripped) {
             command.env_remove(key);
         }
     }
@@ -477,19 +729,24 @@ fn log(layout: &Layout, program: &str, build: u64, outcome: &str, ms: u64) {
 mod tests {
     use super::*;
 
-    /// A scratch store, removed when the test ends however it ends.
-    struct Scratch(Layout);
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0.prefix);
-        }
+    /// A scratch store (a fresh 0700 prefix), removed when the test ends however it
+    /// ends.
+    struct Scratch {
+        layout: Layout,
+        _dir: aterm_tempfile::TempDir,
     }
 
     fn scratch(label: &str) -> Scratch {
-        Scratch(crate::vendor_direct::lane::world::layout(&format!(
-            "warm-{label}"
-        )))
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-vlane-warm-{label}-"))
+            .tempdir()
+            .unwrap();
+        Scratch {
+            layout: Layout {
+                prefix: dir.path().to_path_buf(),
+            },
+            _dir: dir,
+        }
     }
 
     /// `program` active at `build` in `layout`, its store executable the shell `script`.
@@ -551,12 +808,6 @@ mod tests {
         })
     }
 
-    #[test]
-    fn the_hidden_verb_keeps_its_name() {
-        assert_eq!(HIDDEN_VERB, "__warm");
-        assert!(HOLD < DEADLINE);
-    }
-
     /// THE GATES: no warm under an unpinned manager, from a development `dir:` registry,
     /// over a store that is not the configured one, or as root; the negative control warms.
     #[test]
@@ -580,7 +831,7 @@ mod tests {
     #[test]
     fn a_landed_build_is_launched_once_through_atpkg_only_when_admitted() {
         let scratch = scratch("launches");
-        let layout = &scratch.0;
+        let layout = &scratch.layout;
         // A program name no other test starts, so the per-process set is this test's own.
         install(layout, "claude", 2_009_991, "#!/bin/sh\nexit 0\n");
         let programs = landed(&["claude", "ay"]);
@@ -646,7 +897,7 @@ mod tests {
     #[test]
     fn the_plan_skips_removed_held_linked_inactive_and_unwarmed_programs() {
         let scratch = scratch("plan");
-        let layout = &scratch.0;
+        let layout = &scratch.layout;
         assert!(
             planned(layout, &["claude", "codex"]).is_empty(),
             "nothing active"
@@ -828,7 +1079,7 @@ mod tests {
     #[test]
     fn an_opted_out_or_never_run_program_is_declined() {
         let scratch = scratch("declined");
-        let home = scratch.0.prefix.join("home");
+        let home = scratch.layout.prefix.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let env = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
             pairs
@@ -849,7 +1100,7 @@ mod tests {
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         assert_eq!(declined("claude", &none, h), None, "~/.claude alone");
         // The user's own config homes decide, not the defaults.
-        let elsewhere = scratch.0.prefix.join("elsewhere");
+        let elsewhere = scratch.layout.prefix.join("elsewhere");
         let moved = env(&[
             ("CLAUDE_CONFIG_DIR", elsewhere.to_str().unwrap()),
             ("CODEX_HOME", elsewhere.to_str().unwrap()),
@@ -878,7 +1129,7 @@ mod tests {
     #[test]
     fn the_warm_closes_stdin_at_the_hold_and_kills_the_group_at_the_deadline() {
         let scratch = scratch("drive");
-        let layout = &scratch.0;
+        let layout = &scratch.layout;
         let marks = layout.prefix.join("marks");
         std::fs::create_dir_all(&marks).unwrap();
         let tool = ToolName::new("claude").unwrap();
@@ -914,7 +1165,7 @@ mod tests {
             "claude",
             2_001_281,
             &format!(
-                "#!/bin/sh\ntrap '' TERM\nsleep 60 &\necho $! > '{}/grandchild.tmp'\n\
+                "#!/bin/sh\ntrap '' TERM\nsleep 120 &\necho $! > '{}/grandchild.tmp'\n\
                  mv '{0}/grandchild.tmp' '{0}/grandchild'\nwhile :; do sleep 1; done\n",
                 marks.display()
             ),
@@ -930,7 +1181,9 @@ mod tests {
             drive(child, Duration::from_millis(50), Duration::from_millis(300)),
             Ended::Killed
         );
-        let gone = (0..500).any(|_| {
+        // A minute's hang detector, inside the grandchild's own two-minute sleep, so only
+        // the group's kill can end it in time.
+        let gone = (0..3000).any(|_| {
             // SAFETY: signal 0 only asks whether the pid is addressable.
             let alive = unsafe { libc::kill(grandchild, 0) } == 0;
             if alive {
@@ -941,6 +1194,70 @@ mod tests {
         assert!(gone, "the group went with it");
     }
 
+    /// THE INHERITANCE: the warm's child holds its stdio and nothing else of this
+    /// process. A descriptor held WITHOUT close-on-exec (as another thread's socketpair
+    /// is before its `F_SETFD`), above 99 so no shell's own open lands on its number,
+    /// reaches the same shim started by the pass-throughs' spawn,
+    /// `aterm_uds::spawnfd::transparent` (the negative control: they hand their
+    /// caller's descriptors on), and not the warm's. The control was the raw
+    /// `shim_command` spawned by `std` until Trust's SP-1, whose std hands such a child
+    /// its stdio alone: the pass-throughs `exec` that command, which keeps the table, so
+    /// the spawn that must carry it on every std is `transparent`'s.
+    #[cfg(unix)]
+    #[test]
+    fn the_warm_child_inherits_its_stdio_and_nothing_else() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let scratch = scratch("inherit");
+        let layout = &scratch.layout;
+        let marks = layout.prefix.join("marks");
+        std::fs::create_dir_all(&marks).unwrap();
+        let tool = ToolName::new("claude").unwrap();
+        let spec = crate::vendor_direct::spec("claude").unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: F_DUPFD duplicates a descriptor this test owns onto the lowest free
+        // number from 100 (and close-on-exec clear); the new one is owned below.
+        let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 100) };
+        assert!(fd >= 100, "F_DUPFD: {}", std::io::Error::last_os_error());
+        // SAFETY: `fd` was just opened here and nothing else owns it.
+        let _held = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        install(
+            layout,
+            "claude",
+            2_001_282,
+            &format!(
+                "#!/bin/sh
+if [ -e /dev/fd/{fd} ]; then w=held; else w=absent; fi
+                 echo $w > '{m}/fd.tmp'
+mv '{m}/fd.tmp' '{m}/fd'
+",
+                m = marks.display()
+            ),
+        );
+        // What the script saw, once it has said (and the mark gone for the next run).
+        let seen = || {
+            let mark = marks.join("fd");
+            assert!(appears(&mark), "the script ran");
+            let what = std::fs::read_to_string(&mark).unwrap().trim().to_string();
+            std::fs::remove_file(&mark).unwrap();
+            what
+        };
+        let mut control = aterm_uds::spawnfd::transparent(layout.shim(&tool))
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            seen(),
+            "held",
+            "the negative control: the pass-throughs' spawn hands it on"
+        );
+        assert!(control.wait().unwrap().success());
+        let mut child = warm_command(layout, &tool, spec.warm, [], None)
+            .spawn()
+            .unwrap();
+        assert_eq!(seen(), "absent");
+        drop(child.stdin.take());
+        let _ = child.wait();
+    }
+
     /// THE RECORD: each warm that ran or was declined is one `warm` line — its own exit
     /// code, `killed`, `spawn-failed`, `opted-out`, `never-run` — and a stale build runs
     /// nothing and logs nothing. No outcome here depends on how fast a script starts.
@@ -948,7 +1265,7 @@ mod tests {
     #[test]
     fn each_warm_is_one_log_line_and_a_stale_build_is_none() {
         let scratch = scratch("record");
-        let layout = &scratch.0;
+        let layout = &scratch.layout;
         let logs = layout.prefix.join("logs");
         let _bound = crate::packages_log::test_bind::bind(logs.clone(), layout.prefix.clone());
         // The account has run claude: its state is under this home.
@@ -962,7 +1279,16 @@ mod tests {
         };
         let no_env: Vec<(OsString, OsString)> = Vec::new();
         let run = |build, env: &[(OsString, OsString)], home: &Path, deadline| {
-            warm(&request(build), env, Some(home), Duration::ZERO, deadline)
+            // The login shell answers and sets nothing: what is decided here is the record,
+            // not the setup.
+            warm(
+                &request(build),
+                env,
+                || Some(Vec::new()),
+                Some(home),
+                Duration::ZERO,
+                deadline,
+            )
         };
         // Exits 3 once stdin closes (at once: no hold), however long its exec takes.
         install(

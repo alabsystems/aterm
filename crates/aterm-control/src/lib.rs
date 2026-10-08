@@ -5,15 +5,11 @@
 //! drive a session through the [`SessionHost`] trait instead of through
 //! `aterm-gui`'s winit event loop, `Store` and subscriber registry.
 //!
-//! WHY A TRAIT AND NOT A MOVE: the protocol is already right, but the SERVER is
-//! not extractable — the dispatcher lives in a GUI crate that owns the window.
-//! Parameterizing the verb bodies over a host lets a second host (a daemon with
-//! panes but no frame source) answer the SAME wire without a dialect, and lets
-//! [`HostCapabilities`] turn "this host cannot do that" into an honest
-//! `ERR unsupported` rather than a plausible-looking empty answer.
-//!
-//! This crate carries NO winit dependency by construction; that is the property
-//! the extraction exists to create.
+//! The dispatcher lives in the GUI crate that owns the window, so the verb
+//! bodies are parameterized over a host: a second host (a daemon with panes
+//! but no frame source) answers the same wire, and [`HostCapabilities`] turns
+//! a missing facility into `ERR unsupported`. This crate has no winit
+//! dependency.
 
 pub mod cast_drift;
 pub mod host;

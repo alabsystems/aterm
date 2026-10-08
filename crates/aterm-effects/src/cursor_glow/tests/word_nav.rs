@@ -17,12 +17,11 @@ fn wordnav_row(fill: u16) -> [char; 40] {
     row
 }
 
-/// (1) ZSH: the shell integration binds `\e[1;3D`/`\e[1;3C` to
+/// (1) zsh: the shell integration binds `\e[1;3D`/`\e[1;3C` to
 /// backward-/forward-word, and zsh echoes a word move as a caret-only
-/// `\x08`×n / `ESC[nC` — the caret never hides. Twenty alternating
-/// Option+Left/Right over `… lazy dogs` at the owner's own cadence must
-/// sound twenty times. The control that proves the rest of this block is
-/// about the SEAM, not about the keys.
+/// `\x08`×n / `ESC[nC` (the caret never hides). Twenty alternating
+/// Option+Left/Right must sound twenty times. The control showing the rest of
+/// this block is about the seam, not the keys.
 #[test]
 fn twenty_word_keys_in_zsh_sound_twenty_times() {
     let g = geom();
@@ -52,18 +51,15 @@ fn twenty_word_keys_in_zsh_sound_twenty_times() {
     assert_eq!(glow.admission_tally().declined, 0);
 }
 
-/// (2) AN INK-STYLE TUI (Claude Code's shape): every repaint is
-/// `ESC[?25l` … rewrite the line … `CUP` … `ESC[?25h`, and on macOS a
-/// multi-KiB frame reaches the reader in 1024-byte slices, so a present
-/// can land while the caret is HIDDEN. The next visible tick is then a
-/// hidden→visible RELOCATION, and the bounded ConPTY hide-bridge refused
-/// any hop past 2 cells — silently, with no ring row at all, and wiping
-/// the nav hint on its way out. Twenty word keys, twenty cues.
+/// (2) An Ink-style TUI (Claude Code's shape): every repaint is `ESC[?25l` …
+/// rewrite … `CUP` … `ESC[?25h`, and a multi-KiB frame arrives in 1024-byte
+/// slices, so a present can land while the caret is hidden. The next visible
+/// tick is a hidden→visible relocation, which the nav bridge admits. Twenty
+/// word keys, twenty cues.
 #[test]
 fn twenty_word_keys_through_an_ink_repaint_sound_twenty_times() {
-    // Both arms: the pane the host names under its frame hold (the reach
-    // the nav bridge actually runs under — here the geom's own 40 columns), and
-    // no pane at all (the unpaned fallback).
+    // Both arms: the pane the host names under its frame hold (the nav
+    // bridge's reach; here the geom's 40 columns), and no pane (the fallback).
     for paned in [true, false] {
         twenty_word_keys_through_an_ink_repaint(paned);
     }
@@ -145,11 +141,10 @@ fn a_word_pair_sixty_milliseconds_apart_sounds_twice() {
     assert_eq!((cues.nav, cues.meteor), (2, 0), "two keys, two ticks");
 }
 
-/// (4) THE ANTI-STRAY CONTROL, and the reason the bridge above yields to
-/// the nav HINT rather than to the hide window: a program relocating its
-/// caret across a hidden repaint with NO key behind it must still mint
-/// nothing — and the same relocation under a STALE nav hint must still
-/// mint nothing, because a stale stamp is not a licence.
+/// (4) Anti-stray control, and why the bridge yields to the nav hint rather
+/// than the hide window: a program relocating its caret across a hidden
+/// repaint with no key behind it mints nothing, and neither does the same
+/// relocation under a stale nav hint.
 #[test]
 fn a_hidden_program_relocation_with_no_fresh_key_still_sounds_nothing() {
     let g = geom();
@@ -214,12 +209,10 @@ fn a_hidden_program_relocation_with_no_fresh_key_still_sounds_nothing() {
     );
 }
 
-/// …and the SOURCE the nav bridge is allowed to reach back to is bounded
-/// too. A viewport parked in history feeds `cur = None` for as long as the
-/// user reads, so the engine's last VISIBLE cell can be seconds old and
-/// belong to a screen that is no longer there; a word key pressed then must
-/// not mint a screen-crossing gesture from it. `nav_bridge_source_ok`: the
-/// cell must have been visible within one hide window OF THE KEY.
+/// The source cell the nav bridge may reach back to is bounded too: a viewport
+/// parked in history feeds `cur = None`, so the last visible cell can be
+/// seconds old. `nav_bridge_source_ok` requires it visible within one hide
+/// window of the key.
 #[test]
 fn the_nav_bridge_never_reaches_back_to_a_source_the_key_did_not_move_from() {
     let g = geom();
@@ -281,12 +274,10 @@ fn the_nav_bridge_never_reaches_back_to_a_source_the_key_did_not_move_from() {
     assert_eq!((cues.nav, cues.meteor), (1, 0));
 }
 
-/// (5) THE WORD KILL (Ctrl-W, Option+Backspace): one `KillWord` per chord.
+/// (5) The word kill (Ctrl-W, Option+Backspace): one `KillWord` per chord.
 /// Its voice rides the erase detector's poof edge, so the caret retreat it
-/// also produces must stay inert — and must stay inert
-/// exactly ONCE: the kill hint lives 0.35 s and is cleared only by the
-/// poof that fires, so a kill whose erase went unwitnessed used to swallow
-/// the user's next real word move as a second "retreat".
+/// produces stays inert, exactly once: an unwitnessed kill must not swallow
+/// the next real word move as a second retreat.
 #[test]
 fn each_word_kill_sounds_once_and_never_eats_the_next_word_move() {
     let g = geom();
@@ -316,9 +307,8 @@ fn each_word_kill_sounds_once_and_never_eats_the_next_word_move() {
     }
     assert_eq!(kills, 4, "one word poof per word kill");
 
-    // THE UNWITNESSED KILL: a chord whose erase the probe never proves
-    // leaves the kill hint standing. The word move pressed 200 ms later is
-    // the USER's, and must sound.
+    // An unwitnessed kill leaves the kill hint standing; the word move pressed
+    // 200 ms later is the user's and must sound.
     let kill = t0 + Duration::from_millis(1200);
     glow.note_word_kill(kill, true);
     col -= 5;
@@ -347,20 +337,12 @@ fn each_word_kill_sounds_once_and_never_eats_the_next_word_move() {
     );
 }
 
-/// (7) A KILL'S RETREAT THAT LANDS WITH A BAND MOVE OR A SCROLL IS STILL
-/// THE KILL'S. The host replays every band move and scroll and then
-/// drops the row probe, and
-/// `drop_row_probe` clears `kill_hint` — the poof's row-content proof.
-/// The retreat gate read that hint for its freshness, so a ^U/^W whose
-/// caret snap arrived in the same frame as a Codex line (the shape
-/// band moves exist for) was classified `Nav`: v2 minted a meteor, the
-/// Meteor cue sounded, and the pending retreat was never spent. The
-/// pending retreat now carries its own clock (bounded by the kill's
-/// window, superseded by a real navigation press), and the probe fence
-/// may clear the poof's proof without the retreat changing class.
-/// Three shapes — the band move, the scroll, and the band move with an
-/// intermediate no-move frame between it and the retreat — against the
-/// control with neither.
+/// (7) A kill's retreat that lands with a band move or a scroll is still the
+/// kill's. The host replays band moves and scrolls, then drops the row probe,
+/// which clears `kill_hint`; the pending retreat carries its own clock
+/// (bounded by the kill's window, superseded by a real navigation press), so
+/// it keeps its class. Three shapes (band move, scroll, band move with an
+/// intermediate no-move frame) against the control with neither.
 #[test]
 fn a_kill_retreat_landing_with_a_band_move_or_a_scroll_is_not_a_navigation_meteor() {
     #[derive(Clone, Copy, Debug)]
@@ -399,9 +381,8 @@ fn a_kill_retreat_landing_with_a_band_move_or_a_scroll_is_not_a_navigation_meteo
         let meteors_before = glow.v2_status().map_or(0, |s| s.meteors);
         let kill = at(2000);
         glow.note_kill(kill, true);
-        // What app_render's replay does for a band move or a scroll
-        // that lands in the retreat's frame: translate, then drop the
-        // probe.
+        // What app_render's replay does for a band move or scroll landing in
+        // the retreat's frame: translate, then drop the probe.
         let row = match fence {
             Fence::None => 13,
             Fence::Band | Fence::BandThenFrame => {
@@ -455,23 +436,16 @@ fn a_kill_retreat_landing_with_a_band_move_or_a_scroll_is_not_a_navigation_meteo
     }
 }
 
-/// (6) THE HELD PARK AND THE NAV BRIDGE ARE NEVER TWO VERDICTS ON ONE
-/// MOVE (decided at the merge of this fix onto the park).
+/// (6) The held park and the nav bridge never give two verdicts on one move;
+/// their order is pinned both ways:
 ///
-/// Both describe the same shape — "the caret came back across a repaint
-/// that hid it" — so the order they run in is a law, not an accident,
-/// and this pins it in both directions:
-///
-/// 1. THE PARK IS JUDGED FIRST. A navigation press flushes a held park
-///    (`note_motion` -> `flush_held_park`) BEFORE it stamps `nav_hint`,
-///    so Ink's park keeps its own `Move`, from its own origin, and the
-///    word key inherits nothing of it.
-/// 2. THE BRIDGE THEN ONLY CHOOSES A SOURCE CELL, and `spawn` chooses
-///    park-or-spawn after it — where `park_candidate` refuses outright
-///    while the nav hint is fresh (and `note_motion` has cleared the
-///    typed bank the park stands on besides). So the landing the nav
-///    bridge newly admits can never be swallowed as a park: the word
-///    hop sounds, and the ring carries its licensed row.
+/// 1. The park is judged first: a navigation press flushes a held park
+///    (`note_motion` -> `flush_held_park`) before stamping `nav_hint`, so
+///    Ink's park keeps its own `Move` and the word key inherits nothing.
+/// 2. The bridge then only chooses a source cell, and `spawn` chooses
+///    park-or-spawn after it, where `park_candidate` refuses while the nav
+///    hint is fresh. So a landing the nav bridge admits is never swallowed as
+///    a park: the word hop sounds and the ring carries its licensed row.
 #[test]
 fn a_word_key_judges_a_held_park_before_its_own_landing_is_bridged() {
     let g = wide_geom();
@@ -506,10 +480,9 @@ fn a_word_key_judges_a_held_park_before_its_own_landing_is_bridged() {
         "…as its own move, from its own origin"
     );
 
-    // The word key's OWN echo arrives through Ink's hidden bracket, nine
-    // cells on — a landing the bounded bridge refused before this fix.
-    // It is spawned, not held: `park_candidate` refuses under a fresh nav
-    // hint, so there is no second park to flush.
+    // The word key's own echo arrives through Ink's hidden bracket, nine cells
+    // on. It is spawned, not held: `park_candidate` refuses under a fresh nav
+    // hint.
     glow.note_repaint_blink(hop + Duration::from_millis(8));
     glow.tick(
         None,

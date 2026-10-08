@@ -19,7 +19,10 @@
 //! ## What the child gets, and what it does not
 //!
 //! Two `socketpair(AF_UNIX)`s. The child inherits the far ends at fds 3 and 4
-//! ([`aterm_uds::spawnfd`]); this process serves the near ends through its
+//! ([`aterm_uds::spawnfd`]) and no other descriptor above stdio — on Darwin the
+//! launch is a `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so nothing it
+//! does not name (Metal's unflagged shader-cache files, another connection's
+//! socketpair end mid-`pair()`) can reach the child; this process serves the near ends through its
 //! ordinary request loop with [`crate::control::Scope::Bridge`] PRE-RESOLVED, so
 //! no `AUTH` line is read and no token exists. **The authority is the
 //! descriptor.** A second process cannot present it, an agent inside a session
@@ -65,7 +68,7 @@
 //! agent than leaving it alone, supervision or not: the halt does not wait for
 //! the supervisor's opinion.
 
-use std::process::{Command, Stdio};
+use aterm_uds::spawnfd::{ChildStdio, LaneChild, LaneCommand};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -85,7 +88,7 @@ const RELAUNCH_MAX: Duration = Duration::from_secs(30);
 ///
 /// THE TEST IS DURATION, NOT SPAWN SUCCESS, and that distinction is the whole
 /// point of the ceiling above. `supervise` used to reset the back-off on every
-/// `Ok(child)` — i.e. whenever `Command::spawn` succeeded — and escalate only on
+/// `Ok(child)` — i.e. whenever the spawn succeeded — and escalate only on
 /// `Err`, which is the binary being MISSING. The failure the doc actually names
 /// (a bad cap file, an unreachable broker) spawns fine and exits within
 /// milliseconds, so it reset the floor every time: five process spawns a second,
@@ -113,6 +116,19 @@ pub(crate) fn configured_command(config: &crate::app_config::Config) -> Option<V
         })?;
     let argv: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
     (!argv.is_empty()).then_some(argv)
+}
+
+/// `[fabric] hold_on_bridge_lost`: `true` restores the fail-closed sweep (a
+/// lost bridge holds every session it governed); absent or `false` — the
+/// default since the owner's direction of 2026-09-29 — leaves them running
+/// with an advisory ([`crate::fabric::bridge_lost`]).
+#[must_use]
+pub(crate) fn hold_on_bridge_lost(config: &crate::app_config::Config) -> bool {
+    config
+        .fabric
+        .as_ref()
+        .and_then(|f| f.hold_on_bridge_lost)
+        .unwrap_or(false)
 }
 
 /// THE SUPERVISOR RECORD — one per process, and its `armed` half is ONE-WAY.
@@ -213,6 +229,10 @@ pub(crate) fn status() -> SupervisorStatus {
 /// launched with no `[fabric] command` records `None`, which is what a later
 /// bare `attach` answers `ERR fabric no command` from.
 pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
+    // `[fabric] hold_on_bridge_lost`: read before any bridge can attach, so the
+    // first loss already answers to it (`fabric::bridge_lost`). Absent is the
+    // default since 2026-09-29: a lost bridge halts nothing.
+    crate::fabric::set_hold_on_bridge_lost(hold_on_bridge_lost(config));
     let configured = configured_command(config);
     let carried = {
         let mut g = supervisor();
@@ -319,7 +339,7 @@ pub(crate) fn arm(argv: Vec<String>) -> Result<(), ArmError> {
 /// remedy being the relaunch the verb exists to avoid. The same typo in
 /// `[fabric] command` did the same from startup.
 ///
-/// The name is resolved the way `Command::spawn` will resolve it: a word with a
+/// The name is resolved the way the spawn will resolve it: a word with a
 /// `/` is a path (relative to this process's cwd, which the child inherits); a
 /// bare word is searched on `PATH` — THIS process's `PATH`, which is the child's
 /// too, since [`filter_child_env`] passes it through — the way `execvp` searches
@@ -404,10 +424,10 @@ fn supervise(argv: &[String]) {
     let mut backoff = RELAUNCH_MIN;
     loop {
         match launch_once(argv) {
-            Ok(mut child) => {
+            Ok(launched) => {
                 aterm_log::info!("fabric bridge started: {}", argv.join(" "));
                 let started = Instant::now();
-                let status = child.wait();
+                let status = launched.wait_and_retire();
                 let ran = started.elapsed();
                 backoff = next_backoff(backoff, Some(ran));
                 let how = match &status {
@@ -434,7 +454,7 @@ fn supervise(argv: &[String]) {
 }
 
 /// The next back-off, given the current one and how long the child RAN — `None`
-/// when `Command::spawn` itself failed and no child ever existed.
+/// when the spawn itself failed and no child ever existed.
 ///
 /// A bridge that ran for [`RELAUNCH_HEALTHY`] is not a configuration error, so
 /// its restart starts from the floor again. Everything else — a spawn failure, or
@@ -450,33 +470,79 @@ fn next_backoff(current: Duration, ran: Option<Duration>) -> Duration {
     }
 }
 
+/// One bridge generation: the child, and a second handle on each near end, so
+/// the lanes can be RETIRED when the child exits.
+struct Launched {
+    child: LaneChild,
+    near: [std::os::unix::net::UnixStream; 2],
+}
+
+impl Launched {
+    /// Wait for the bridge to exit, then SHUT BOTH LANES DOWN.
+    ///
+    /// The fail-closed halt fires when a near end reads its end-of-file, and
+    /// that used to come only when the LAST copy of the far end closed — which
+    /// is not the bridge's exit when another process holds a copy: a child this
+    /// process spawned elsewhere caught the far end between `socketpair` and
+    /// its `F_SETFD` (49 of 400 plain spawns racing a `pair()`, measured in the
+    /// 2026-09-30 review), or one the bridge itself left behind. That holder
+    /// kept the old generation's lanes — `Scope::Bridge` authority — served,
+    /// and the halt unfired, for as long as it lived. `shutdown` acts on the
+    /// socket, not on a descriptor, so the serving threads read end-of-file now
+    /// and every copy of the far end is dead with it: the authority ends with
+    /// the process it was handed to.
+    ///
+    /// Each half on its own ([`aterm_uds::hangup::hang_up`]): a bridge that
+    /// half-closed a lane before it exited has shut that near end's read half,
+    /// and Darwin refuses a both-ways `shutdown` of it, shutting NOTHING — the
+    /// holder of the far end went on reading what the lane wrote.
+    fn wait_and_retire(mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait();
+        for lane in &self.near {
+            aterm_uds::hangup::hang_up(lane);
+        }
+        status
+    }
+}
+
 /// One launch: two socketpairs, the child, and both near ends attached.
-fn launch_once(argv: &[String]) -> std::io::Result<std::process::Child> {
+fn launch_once(argv: &[String]) -> std::io::Result<Launched> {
+    launch_serving(argv, crate::control::attach_fabric_bridge)
+}
+
+/// [`launch_once`], serving each near end with `attach` (the control server's
+/// [`crate::control::attach_fabric_bridge`]; a test's recorder).
+fn launch_serving(
+    argv: &[String],
+    attach: impl Fn(std::os::unix::net::UnixStream, crate::fabric::BridgeGeneration) -> bool,
+) -> std::io::Result<Launched> {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
 
     let (near_verb, far_verb) = UnixStream::pair()?;
     let (near_push, far_push) = UnixStream::pair()?;
-    let mut cmd = Command::new(&argv[0]);
+    // The handles that retire the lanes (`F_DUPFD_CLOEXEC`: flagged from
+    // birth), taken before anything is spawned or served.
+    let near = [near_verb.try_clone()?, near_push.try_clone()?];
+    let mut cmd = LaneCommand::new(&argv[0]);
     cmd.args(&argv[1..])
-        // THE ENVIRONMENT IS FILTERED, not inherited whole. `Command` inherits the
+        // THE ENVIRONMENT IS FILTERED, not inherited whole. A spawn inherits the
         // parent block by default, which handed the one process holding
         // `Scope::Bridge` aterm's own identity, its control-socket path, and — when
         // this aterm is itself nested — the OUTER instance's `ATERM_EDGE_TOKENS`
         // path, plus the `ATERM_EDGE_*` bearer secrets themselves when that outer
         // aterm is an older one that still injected them (audit finding F1 moved
-        // them into a 0600 file). `env_clear` + the deny list is the same rule
-        // the PTY spawn seam applies to a child shell (`aterm-pty`'s
-        // `build_child_env`), applied at this seam because that one does not
-        // cover it.
-        .env_clear()
-        .envs(filter_child_env(std::env::vars_os()))
+        // them into a 0600 file). The whole block replaced by the deny-listed
+        // one is the same rule the PTY spawn seam applies to a child shell
+        // (`aterm-pty`'s `build_child_env`), applied at this seam because that
+        // one does not cover it.
+        .env_exactly(filter_child_env(std::env::vars_os()))
         // The child's stdin is NOTHING. Its two real channels are fds 3 and 4,
         // and leaving stdin attached to aterm's own would let a bridge read
         // whatever aterm was launched with.
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdin(ChildStdio::Null)
+        .stdout(ChildStdio::Inherit)
+        .stderr(ChildStdio::Inherit);
     let child = aterm_uds::spawnfd::spawn_with_two_fds(
         cmd,
         OwnedFd::from(far_verb),
@@ -492,13 +558,13 @@ fn launch_once(argv: &[String]) -> std::io::Result<std::process::Child> {
     // LATER launch's live bridge disconnected. See
     // [`crate::fabric::BridgeGeneration`].
     let generation = crate::fabric::next_bridge_generation();
-    if !crate::control::attach_fabric_bridge(near_verb, generation) {
+    if !attach(near_verb, generation) {
         aterm_log::warn!("fabric bridge verb lane could not be served");
     }
-    if !crate::control::attach_fabric_bridge(near_push, generation) {
+    if !attach(near_push, generation) {
         aterm_log::warn!("fabric bridge push lane could not be served");
     }
-    Ok(child)
+    Ok(Launched { child, near })
 }
 
 /// aterm's environment with the deny list applied — what the bridge child gets.
@@ -532,6 +598,7 @@ mod tests {
         Config {
             fabric: Some(FabricConfig {
                 command: cmd.map(str::to_string),
+                hold_on_bridge_lost: None,
             }),
             ..Config::default()
         }
@@ -609,6 +676,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **THE LANES ARE RETIRED WHEN THE BRIDGE EXITS, whoever else holds a far
+    /// end** (2026-09-30 review, F2). The bridge here leaves a process behind
+    /// holding both far ends — what a child spawned elsewhere in this process
+    /// holds when it caught a lane between `socketpair` and its `F_SETFD`. The
+    /// recorder holds the near ends as the serving threads do. Once the bridge
+    /// is reaped, the near verb end must read its end-of-file — the read the
+    /// fail-closed halt waits on — though the holder lives on (before: the read
+    /// blocked until the holder died, here past the hang detector).
+    #[test]
+    fn the_lanes_are_retired_when_the_bridge_exits_whoever_else_holds_a_far_end() {
+        use std::io::{BufRead as _, Read as _};
+        use std::os::unix::net::UnixStream;
+        let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::<UnixStream>::new()));
+        let recorder = {
+            let served = std::sync::Arc::clone(&served);
+            move |near: UnixStream, _generation| {
+                served.lock().unwrap().push(near);
+                true
+            }
+        };
+        let argv: Vec<String> = ["/bin/sh", "-c", "sleep 300 & echo $! >&4; exit 0"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let launched = launch_serving(&argv, recorder).expect("launch the stand-in bridge");
+        let (mut verb, push) = {
+            let mut near = served.lock().unwrap();
+            assert_eq!(near.len(), 2, "both lanes served");
+            let push = near.pop().unwrap();
+            (near.pop().unwrap(), push)
+        };
+        // Both read bounds are set while the sockets are connected: Darwin
+        // refuses `setsockopt` on one that is shut down.
+        push.set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        verb.set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        // The holder's pid, so it is reaped by its exact pid below.
+        let mut line = String::new();
+        std::io::BufReader::new(&push)
+            .read_line(&mut line)
+            .expect("the holder's pid");
+        let holder: i32 = line.trim().parse().expect("a pid");
+        let status = launched.wait_and_retire().expect("reap the bridge");
+        let mut byte = [0u8; 1];
+        let read = verb.read(&mut byte);
+        // SAFETY: a plain signal to the holder this test's bridge started, by
+        // its exact pid.
+        unsafe {
+            libc::kill(holder, libc::SIGKILL);
+        }
+        assert!(status.success(), "{status:?}");
+        assert_eq!(
+            read.map_err(|e| e.kind()),
+            Ok(0),
+            "the near end read no end-of-file while another process held the far one"
+        );
+    }
+
+    /// A LANE THE BRIDGE HALF-CLOSED IS RETIRED TOO. The stand-in bridge shuts
+    /// its verb lane's write half (with `perl`: a shell cannot `shutdown`) and
+    /// exits, leaving a holder of both far ends behind, as above. The near verb
+    /// end already reads end-of-file from the half-close, so what the retire
+    /// must still end is the other direction: once the bridge is reaped, a
+    /// write to the lane must fail, where it reached the holder before.
+    ///
+    /// NEGATIVE CONTROL (run by restoring the both-ways `shutdown`): Darwin
+    /// refused it for a near end whose read half the bridge's half-close had
+    /// shut (`ENOTCONN`) and shut nothing, so the write still succeeded.
+    #[test]
+    fn a_lane_the_bridge_half_closed_is_retired_whoever_else_holds_a_far_end() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let perl = ["/usr/bin/perl", "/bin/perl"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("a `perl` binary");
+        let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::<UnixStream>::new()));
+        let recorder = {
+            let served = std::sync::Arc::clone(&served);
+            move |near: UnixStream, _generation| {
+                served.lock().unwrap().push(near);
+                true
+            }
+        };
+        let script = format!(
+            "{perl} -e 'open(my $s, \"+<&=\", 3) or die \"fd 3: $!\"; \
+             shutdown($s, 1) or die \"shutdown: $!\"' || exit 1; \
+             sleep 300 & echo $! >&4; exit 0"
+        );
+        let argv: Vec<String> = ["/bin/sh", "-c", &script]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let launched = launch_serving(&argv, recorder).expect("launch the stand-in bridge");
+        let (verb, push) = {
+            let mut near = served.lock().unwrap();
+            assert_eq!(near.len(), 2, "both lanes served");
+            let push = near.pop().unwrap();
+            (near.pop().unwrap(), push)
+        };
+        // Set while the socket is connected: Darwin refuses `setsockopt` on one
+        // that is shut down.
+        push.set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        // The holder's pid, so it is reaped by its exact pid below; it is
+        // written after the half-close, so the half-close has happened.
+        let mut line = String::new();
+        std::io::BufReader::new(&push)
+            .read_line(&mut line)
+            .expect("the holder's pid");
+        let holder: i32 = line.trim().parse().expect("a pid");
+        let status = launched.wait_and_retire().expect("reap the bridge");
+        let wrote = (&verb).write(b"after the retire\n").map_err(|e| e.kind());
+        // SAFETY: a plain signal to the holder this test's bridge started, by
+        // its exact pid.
+        unsafe {
+            libc::kill(holder, libc::SIGKILL);
+        }
+        assert!(status.success(), "{status:?}");
+        assert_eq!(
+            wrote,
+            Err(std::io::ErrorKind::BrokenPipe),
+            "a write to a retired lane reached the far end's holder"
+        );
+    }
+
     /// DEFAULT OFF. An instance with no `[fabric]` table and no env var launches
     /// nothing — the same secure default the embedded operator keeps, and the
     /// reason a fabric-unaware machine pays nothing for the feature existing.
@@ -677,7 +871,7 @@ mod tests {
     /// unreachable broker").
     ///
     /// `supervise` used to reset the back-off on every `Ok(child)`, i.e. whenever
-    /// `Command::spawn` SUCCEEDED, and escalate only on `Err` — which is the
+    /// the spawn SUCCEEDED, and escalate only on `Err` — which is the
     /// binary being missing. A bad `--cap-file` makes `Bridge::new` fail,
     /// `aterm-link serve` print and exit 1 in milliseconds, and `launch_once`
     /// still return `Ok`: five spawns a second, two socketpairs and two aterm
@@ -807,8 +1001,8 @@ mod tests {
         assert_eq!(kept, vec![b"PLAIN_\xffKEY".to_vec()]);
     }
 
-    /// The filter is WIRED, not merely available: `launch_once` clears the child's
-    /// environment and rebuilds it through [`filter_child_env`]. A pure unit test
+    /// The filter is WIRED, not merely available: `launch_once` gives the child
+    /// [`filter_child_env`]'s block as its WHOLE environment. A pure unit test
     /// of the filter proves nothing if the spawn does not call it.
     #[test]
     fn the_launch_seam_actually_applies_the_filter() {
@@ -818,12 +1012,8 @@ mod tests {
             .map(|(p, _)| p)
             .expect("fabric_launch.rs has a tests module");
         assert!(
-            production.contains(".env_clear()"),
-            "the child's environment must be cleared before it is rebuilt"
-        );
-        assert!(
-            production.contains(".envs(filter_child_env(std::env::vars_os()))"),
-            "the child's environment must come through the deny-listed filter"
+            production.contains(".env_exactly(filter_child_env(std::env::vars_os()))"),
+            "the child's whole environment must be the deny-listed filter's"
         );
     }
 
@@ -835,7 +1025,7 @@ mod tests {
     /// an empty argv arms nothing — `launch_once` indexes `argv[0]`, and a
     /// thread panicking on it would have "armed" a supervisor that runs nothing.
     ///
-    /// The argv names a program that does not exist, ON PURPOSE: `Command::spawn`
+    /// The argv names a program that does not exist, ON PURPOSE: the spawn
     /// fails at once, so the thread this leaks into the test process spawns no
     /// child and only sleeps out its back-off (to the 30 s ceiling).
     #[test]

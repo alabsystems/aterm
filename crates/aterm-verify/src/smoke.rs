@@ -150,12 +150,13 @@ pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
 /// ours and nothing can be recycled under a signal sent to it next. The state,
 /// never a nap: a loaded machine can keep `sh -c 'exit 7'` alive past any fixed
 /// sleep, and a TERM that beats it to its `exit` turns "died on its own" into
-/// "retired by us". Bounded only as a fail-safe (`false`). The smokes' own
-/// tests use it to witness a child's exit before a teardown.
+/// "retired by us". Bounded only as a fail-safe (`false`): a minute's hang
+/// detector, never a latency budget. The smokes' own tests use it to witness a
+/// child's exit before a teardown.
 #[cfg(test)]
 #[must_use]
 pub(crate) fn exited_on_its_own(pid: u32) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let stat = Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -170,6 +171,25 @@ pub(crate) fn exited_on_its_own(pid: u32) -> bool {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Whether the console session's screen is locked: `CGSSessionScreenIsLocked`
+/// in `ioreg -n Root -d1`'s console users. A locked screen is why no window can
+/// come forward, so a smoke that could not do so says that instead of a guess.
+/// `false` when it cannot be read.
+#[must_use]
+pub fn screen_locked() -> bool {
+    Command::new("/usr/sbin/ioreg")
+        .args(["-n", "Root", "-d1"])
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|out| reads_locked(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// [`screen_locked`]'s reading of `ioreg`'s text.
+#[must_use]
+pub fn reads_locked(ioreg: &str) -> bool {
+    ioreg.contains("\"CGSSessionScreenIsLocked\"=Yes")
 }
 
 /// Bring exactly the launched GUI process to the front without Accessibility or
@@ -316,6 +336,17 @@ pub fn socket_listening(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_locked_console_session_reads_locked_and_an_unlocked_one_does_not() {
+        let locked = r#""IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"CGSSessionScreenIsLocked"=Yes,"kCGSSessionUserIDKey"=501})"#;
+        let open =
+            r#""IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserIDKey"=501})"#;
+        assert!(super::reads_locked(locked));
+        assert!(!super::reads_locked(open));
+        assert!(!super::reads_locked(""), "an unread ioreg is not a lock");
+    }
+
     use super::*;
 
     #[test]
@@ -394,7 +425,7 @@ mod tests {
         // outlast, letting the TERM below kill it first and read as ours.
         let exited = exited_on_its_own(child.id());
         let (ok, _) = retire_smoke_child(&mut child);
-        assert!(exited, "`exit 7` never exited within 30 s");
+        assert!(exited, "`exit 7` never exited within a minute");
         assert!(!ok, "exit 7 is not something this teardown caused");
     }
 

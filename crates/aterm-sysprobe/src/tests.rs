@@ -191,34 +191,27 @@ fn a_linux_reading_assembles_from_the_texts() {
 /// private scratch directory, makes those links real there (on unix), and
 /// removes the copy when the fixture drops.
 struct Fixture {
-    dir: std::path::PathBuf,
+    dir: aterm_tempfile::TempDir,
 }
 
 impl Fixture {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("aterm-sysprobe-fixture-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-sysprobe-fixture-")
+            .tempdir()
+            .unwrap();
         copy_fixture(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/linux"),
-            &dir,
+            dir.path(),
         );
         Self { dir }
     }
 
     fn roots(&self) -> linux::Roots {
         linux::Roots {
-            proc: self.dir.join("proc"),
-            sys: self.dir.join("sys"),
+            proc: self.dir.path().join("proc"),
+            sys: self.dir.path().join("sys"),
         }
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -613,10 +606,10 @@ fn every_helper_past_a_floor_is_named_not_only_the_leaders() {
     );
 }
 
-/// Memory in use is Activity Monitor's `Memory Used` — app memory (internal
-/// less purgeable) + wired + compressed — measured on this 24 GB m1 at
-/// `kern.memorystatus_level` 89, where the old `1000 − 10·level` read 2.6 GB
-/// "in use" beside Activity Monitor's ~8 GB.
+/// Memory in use is Activity Monitor's `Memory Used`: app memory (internal
+/// less purgeable) + wired + compressed. Measured on a 24 GB m1 at
+/// `kern.memorystatus_level` 89, where `1000 − 10·level` reads 2.6 GB in use
+/// beside Activity Monitor's ~8 GB.
 #[test]
 fn memory_in_use_is_counted_from_the_vm_pages() {
     let page = 16_384;
@@ -630,6 +623,23 @@ fn memory_in_use_is_counted_from_the_vm_pages() {
         used_mib_of(1, 5, 0, 0, page),
         Some(0),
         "purgeable past internal"
+    );
+}
+
+/// Memory AVAILABLE is free + inactive + purgeable pages (what the memory
+/// ceiling moves with), never more than the machine where that is known.
+/// NEGATIVE CONTROLS: a zero page size is unknown; a sum past the machine
+/// (a purgeable page on the inactive queue, counted twice) is capped.
+#[test]
+fn memory_available_is_free_inactive_and_purgeable_pages() {
+    let page = 16_384;
+    let got = available_mib_of(100_000, 200_000, 4_000, page, None).unwrap();
+    assert_eq!(got, (100_000 + 200_000 + 4_000) * 16 / 1024);
+    assert_eq!(available_mib_of(1, 1, 1, 0, None), None);
+    assert_eq!(
+        available_mib_of(8_000_000, 8_000_000, 0, page, Some(128 * 1024)),
+        Some(128 * 1024),
+        "capped at the machine"
     );
 }
 
@@ -655,13 +665,11 @@ fn the_probe_can_move_to_its_thread() {
 // Live, on this host.
 // ---------------------------------------------------------------------------
 
-/// Burn `ms` of this thread's CPU — measured on the THREAD's CPU clock, not
-/// the wall. The live test asserts the process's `cpu_ns` moved by most of
-/// the spin, and a wall-clock spin on a machine loaded past its cores gets
-/// less than that share of a core, so the assert read the load, not the
-/// timebase (the load-sensitive test audit of 2026-09-27; the same shape as
-/// daea43981's input-stall fix). Process CPU is at least this thread's, so
-/// the assert holds at any load and still catches an unconverted mach tick.
+/// Burn `ms` of this thread's CPU, timed on the THREAD's CPU clock, not the
+/// wall: on a machine loaded past its cores a wall-clock spin gets less than
+/// a core, and the live test's `cpu_ns` assert would read the load. Process
+/// CPU is at least this thread's, so the assert holds at any load and still
+/// catches an unconverted mach tick.
 #[cfg(target_os = "macos")]
 fn spin(ms: u64) {
     fn thread_cpu_ns() -> u64 {
@@ -688,22 +696,11 @@ fn spin(ms: u64) {
 fn the_probe_reads_cpu_memory_and_thermal_on_this_host() {
     let mut probe = Probe::new();
     let a = probe.reading();
-    // THE KERNEL PUBLISHES THESE TICKS ON ITS OWN SCHEDULE, not on our read.
-    // `host_statistics(HOST_CPU_LOAD_INFO)` answers from a snapshot the kernel
-    // refreshes periodically, so two reads a fixed span apart can come back
-    // byte-identical however hard this thread spins in between — and then
-    // `CpuTicks::advance` folds a zero delta, correctly, and `total` does not
-    // move. MEASURED 2026-09-24 on an otherwise IDLE M5: a single `spin(120)`
-    // reproduced identical `busy_ticks` in roughly one run of three, which is
-    // a merge gate that refuses one branch in three for a reason that is not
-    // about the branch.
-    //
-    // So DRIVE the evidence instead of assuming a span is long enough for it:
-    // spin until the counter moves, bounded, and fail naming what never did.
-    // The property is unchanged and still refutable — busy CPU must advance
-    // these ticks — but it is no longer also a claim that 120 ms is always
-    // enough for the kernel to have said so.
-    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    // `HOST_CPU_LOAD_INFO` answers from a snapshot the kernel refreshes on
+    // its own schedule: on an idle M5 one `spin(120)` left `busy_ticks`
+    // unchanged in about one run of three. So spin until the counter moves,
+    // under a minute's hang detector (never a latency budget).
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
     let b = loop {
         spin(120);
         let b = probe.reading();
@@ -716,7 +713,7 @@ fn the_probe_reads_cpu_memory_and_thermal_on_this_host() {
         }
         assert!(
             Instant::now() < deadline,
-            "HOST_CPU_LOAD_INFO never advanced over 5 s of spinning — the \
+            "HOST_CPU_LOAD_INFO never advanced over a minute of spinning — the \
              probe is reading a counter that does not move: {a:?} -> {b:?}"
         );
     };
@@ -846,18 +843,150 @@ fn a_reading_and_a_sweep_cost_milliseconds_not_more() {
     assert!(read_us[5] < 50_000 && scan_us[5] < 250_000);
 }
 
-/// A process's working directory is read from the OS: this test's own is
-/// what the process says it is. NEGATIVE CONTROL: a pid that cannot exist
-/// reads as nothing, never as some directory.
+/// A process's working directory and executable are read from the OS: this
+/// test's own are what the process says they are. NEGATIVE CONTROL: a pid
+/// that cannot exist reads as nothing, never as some directory or program.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn a_processs_working_directory_is_its_own() {
+fn a_processs_working_directory_and_executable_are_its_own() {
     let own = crate::process_cwd(std::process::id()).expect("our own cwd");
     let want = std::env::current_dir().expect("current dir");
     assert_eq!(
         std::fs::canonicalize(&own).ok(),
         std::fs::canonicalize(&want).ok()
     );
-    assert_eq!(crate::process_cwd(0), None);
-    assert_eq!(crate::process_cwd(u32::MAX), None);
+    let exe = crate::process_path(std::process::id()).expect("our own executable");
+    let want = std::env::current_exe().expect("current exe");
+    assert_eq!(
+        std::fs::canonicalize(&exe).ok(),
+        std::fs::canonicalize(&want).ok()
+    );
+    for nobody in [0, u32::MAX] {
+        assert_eq!(crate::process_cwd(nobody), None);
+        assert_eq!(crate::process_path(nobody), None);
+    }
+}
+
+/// A process group's memory is its members' FOOTPRINT, summed, and only its
+/// own members': this test process's group grows by what it touches (512
+/// MiB allocated and written, most of it read back past a 384 MiB margin
+/// for the other members' churn); a child started in its own group
+/// (`process_group(0)`, as Claude Code starts its Bash tool's shells) is its
+/// own group, and a child left in ours is measured as one of ours.
+/// NEGATIVE CONTROLS: a pid that cannot exist and pid 0 read as nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_groups_memory_is_its_own_members_footprint() {
+    use std::os::unix::process::CommandExt as _;
+    let me = std::process::id();
+    let before = crate::group_memory(me).expect("our own group");
+    assert!(
+        before.measured >= 1 && before.footprint_mib > 0,
+        "{before:?}"
+    );
+    let mut hog = vec![0u8; 512 << 20];
+    for page in hog.chunks_mut(4096) {
+        page[0] = 1;
+    }
+    let after = crate::group_memory(me).expect("our own group");
+    std::hint::black_box(&hog);
+    assert!(
+        after.footprint_mib >= before.footprint_mib + 384,
+        "{before:?} -> {after:?}"
+    );
+    drop(hog);
+
+    let apart = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("sleep in a group of its own");
+    let beside = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("sleep in our group");
+    let apart_pid = apart.id();
+    let own = crate::group_memory(apart_pid);
+    let ours = crate::group_memory(beside.id());
+    for mut child in [apart, beside] {
+        let _ = child.kill(); // SIGKILL
+        let _ = child.wait();
+    }
+    let own = own.expect("the child's own group");
+    assert_eq!((own.pgid, own.measured), (apart_pid, 1), "{own:?}");
+    assert_ne!(own.pgid, after.pgid, "a group of its own: {own:?}");
+    assert_eq!(ours.map(|g| g.pgid), Some(after.pgid), "{ours:?}");
+
+    assert_eq!(crate::group_memory(0), None);
+    assert_eq!(crate::group_memory(u32::MAX), None);
+}
+
+/// The machine's facts read on this host: its physical memory and the
+/// kernel's pressure level, each one `sysctl`.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_machines_memory_and_pressure_are_read_on_this_host() {
+    let mib = crate::physical_memory_mib().expect("hw.memsize");
+    assert!(mib >= 4 * 1024, "{mib} MiB");
+    assert!(crate::memory_pressure().is_some());
+    // What is available and in use, each within the machine.
+    let now = crate::machine_memory().expect("HOST_VM_INFO64");
+    assert!(now.available_mib <= mib, "{now:?} of {mib} MiB");
+    assert!(
+        now.used_mib > 0 && now.used_mib <= mib,
+        "{now:?} of {mib} MiB"
+    );
+}
+
+/// The swap counter reads on this host, and agrees with the strain row's
+/// own count (pages, from the same `HOST_VM_INFO64`) to within what the
+/// machine swapped between the two reads.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_swap_counter_reads_on_this_host_as_the_strain_rows_count() {
+    let kib = crate::swapped_kib().expect("HOST_VM_INFO64");
+    let r = Probe::new().reading();
+    let pages = r.swap_pages.expect("the reading's swap count");
+    let row_kib = pages * u64::from(r.page_kib);
+    assert!(row_kib >= kib, "{row_kib} KiB then, {kib} KiB before");
+    assert!(
+        row_kib - kib < 1 << 20,
+        "a GiB swapped between two reads: {kib} -> {row_kib}"
+    );
+}
+
+/// THE SWAP RATE over the caller's readings: none from one reading; the
+/// recorded 2026-09-28 thrash (89 MB/s, `swap 89 MB/s` in the freeze's
+/// Messages row) read back from a counter that grew 445 MiB in 5 s; a
+/// second reader a millisecond later answers the same rate instead of a
+/// span of one page; a counter that stood still reads zero; a gap past
+/// [`SWAP_SPAN_MAX`] starts again (no rate), and an unknown counter forgets
+/// the base. NEGATIVE CONTROL: a meter taking its rate over the short span
+/// would read the millisecond reader's zero, which the assertion rejects.
+#[test]
+fn the_swap_meter_reads_a_rate_over_a_span_of_its_readings() {
+    let t0 = Instant::now();
+    let s = std::time::Duration::from_secs;
+    let mut m = SwapMeter::new();
+    assert_eq!(m.observe(t0, Some(10_000_000)), None, "one reading");
+    let thrash = 10_000_000 + 89 * 1024 * 5;
+    assert_eq!(m.observe(t0 + s(5), Some(thrash)), Some(89 * 1024));
+    let later = t0 + s(5) + std::time::Duration::from_millis(1);
+    assert_eq!(
+        m.observe(later, Some(thrash)),
+        Some(89 * 1024),
+        "a reading inside the shortest span answers the last rate"
+    );
+    assert_eq!(m.observe(t0 + s(10), Some(thrash)), Some(0), "still");
+    assert_eq!(m.observe(t0 + s(15), Some(thrash - 1)), Some(0), "back");
+    let gap = thrash + (1 << 30);
+    assert_eq!(m.observe(t0 + s(200), Some(gap)), None, "a stale base");
+    assert_eq!(m.observe(t0 + s(205), Some(gap + 5 * 4096)), Some(4096));
+    assert_eq!(m.observe(t0 + s(206), None), None, "unknown");
+    assert_eq!(
+        m.observe(t0 + s(211), Some(1)),
+        None,
+        "the base was forgotten"
+    );
+    assert_eq!(m.observe(t0 + s(216), Some(1 + 5 * 8192)), Some(8192));
 }

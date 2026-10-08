@@ -2,12 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! Build provenance — version, git commit, build timestamp, and a content signature
-//! of the running binary. Surfaced in two places: the cross-platform About overlay
+//! of the running binary. Surfaced in two places: the native Settings `/about` route
 //! ([`about_fields`]) and over the control socket
 //! (`aterm-ctl version`, see [`crate::control`]).
 //!
-//! `VERSION` comes from the shared application identity; `GIT_COMMIT` and
-//! `BUILD_TIME` are stamped at compile time by `build.rs`.
+//! `VERSION` comes from the shared application identity; the commit, build
+//! number and build time are the binary's [`BuildStamp`], stamped by
+//! `crates/aterm/build.rs`.
 //! [`binary_signature`] is computed at runtime from the actual executable, so it
 //! reflects the EXACT shipped bytes (the `.app`'s signed binary hashes differently
 //! from the bare `target/release` binary — which is correct: it is what's running).
@@ -35,44 +36,172 @@ pub(crate) const SITE: &str = aterm_types::identity::SITE;
 /// version`, as written, in every build.
 pub(crate) const VERSION: &str = aterm_types::version::APP_VERSION;
 
-/// Short git commit the binary was built from — with a `-dirty` suffix when the
+/// THE PER-COMMIT HALF OF BUILD PROVENANCE, stamped into the shipped binary by
+/// `crates/aterm/build.rs` and handed to this library at the top of `main`
+/// ([`install_build_stamp`], spelled by [`build_stamp!`](crate::build_stamp)).
+///
+/// WHY IT IS NOT AN `env!` OF THIS CRATE (2026-10-05). It was, stamped by this
+/// crate's own build script, and every value here moves with every commit. A
+/// build script's `rustc-env` reaches every unit of its package, so a commit that
+/// touched nothing here (an empty one, a docs edit) re-ran that script and
+/// recompiled all of aterm-gui (its lib, its lib tests, its examples and bin)
+/// and then everything that links it. Measured on the incremental dev profile:
+/// an empty commit cost 185 s of `targo --unverified test --workspace
+/// --no-run` (aterm-gui, aterm-release and aterm recompiled); in the gate, whose
+/// `CARGO_INCREMENTAL=0` makes each a cold compile of ~900k lines, it was most
+/// of a test-compile stage. Stamped in the binary crate instead, a commit
+/// recompiles that crate's own small units and relinks.
+///
+/// The values and their meaning are unchanged: every surface (About, `aterm
+/// ctl version`, the menu signature, the handoff identity, the bundle's build
+/// number) reads them through the accessors below. A process whose `main` never
+/// installed a stamp (the dev-only `aterm-gui` bin and its examples) reads
+/// [`BuildStamp::UNSTAMPED`]: the facts a build without git always carried
+/// (`unknown`, build `0`), which the handoff already refuses outside
+/// `debug_assertions`. This library's own test binary reads `TEST_STAMP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildStamp {
+    /// Short commit (12 hex, `-dirty` suffixed for an uncommitted tree), or
+    /// `"unknown"` without git.
+    pub git_commit: &'static str,
+    /// All forty hexadecimal commit characters, or `"unknown"`.
+    pub git_commit_full: &'static str,
+    /// `"true"` when the tree had uncommitted changes, else `"false"`.
+    pub git_dirty: &'static str,
+    /// UTC build timestamp (RFC3339), or `"unknown"`.
+    pub build_time: &'static str,
+    /// Monotonic build number (see [`build_number`]).
+    pub build_number: &'static str,
+    /// Commits since the newest release tag (see [`dev_commits`]).
+    pub dev_commits: &'static str,
+}
+
+impl BuildStamp {
+    /// What a process reads before (or without) [`install_build_stamp`].
+    pub const UNSTAMPED: Self = Self {
+        git_commit: "unknown",
+        git_commit_full: "unknown",
+        git_dirty: "false",
+        build_time: "unknown",
+        build_number: "0",
+        dev_commits: "0",
+    };
+}
+
+static STAMP: OnceLock<BuildStamp> = OnceLock::new();
+
+/// Install the running binary's [`BuildStamp`]. The binary's `main` calls this
+/// first, before anything reads provenance; the first install wins, so nothing
+/// later in the process can re-stamp it.
+pub fn install_build_stamp(stamp: BuildStamp) {
+    let _ = STAMP.set(stamp);
+}
+
+/// The [`BuildStamp`] of the crate that expands it, read from the `rustc-env`
+/// values `crates/aterm/build.rs` emits. Only a crate whose build script emits
+/// them can expand it: the compile fails otherwise, never a silent default.
+#[macro_export]
+macro_rules! build_stamp {
+    () => {
+        $crate::BuildStamp {
+            git_commit: env!("ATERM_GIT_COMMIT"),
+            git_commit_full: env!("ATERM_GIT_COMMIT_FULL"),
+            git_dirty: env!("ATERM_GIT_DIRTY"),
+            build_time: env!("ATERM_BUILD_TIME"),
+            build_number: env!("ATERM_BUILD_NUMBER"),
+            dev_commits: env!("ATERM_DEV_COMMITS"),
+        }
+    };
+}
+
+/// What this library's OWN test binary reads: a clean, stamped, CURRENT build.
+///
+/// Its tests were written against a compile-time stamp that always carried the
+/// tree's real commit and its committer epoch, so they exercise the stamped
+/// path (a hex commit) and play a build newer than every release fixture they
+/// name (`running + 1` is a successor, `v0.100.0`'s number is in the past). A
+/// fixed stamp keeps both true and makes the suite deterministic: the commit is
+/// a recognisable non-commit, and the build number is 2065's epoch, far above
+/// any real release and well inside the sub-2^32 range `CFBundleVersion` takes.
+#[cfg(test)]
+const TEST_STAMP: BuildStamp = BuildStamp {
+    git_commit: "7e57b1d0c0de",
+    git_commit_full: "7e57b1d0c0de7e57b1d0c0de7e57b1d0c0de7e57",
+    git_dirty: "false",
+    build_time: "2065-01-24T05:20:00Z",
+    build_number: "3000000000",
+    dev_commits: "1",
+};
+
+fn stamp() -> &'static BuildStamp {
+    #[cfg(test)]
+    let unstamped = &TEST_STAMP;
+    #[cfg(not(test))]
+    let unstamped = &BuildStamp::UNSTAMPED;
+    STAMP.get().unwrap_or(unstamped)
+}
+
+/// Short git commit the binary was built from, with a `-dirty` suffix when the
 /// working tree had uncommitted changes. `"unknown"` when git was unavailable at
-/// build time (e.g. a source tarball). Stamped by `build.rs`.
-pub(crate) const GIT_COMMIT: &str = env!("ATERM_GIT_COMMIT");
+/// build time (e.g. a source tarball).
+#[must_use]
+pub(crate) fn git_commit() -> &'static str {
+    stamp().git_commit
+}
 
 /// Full source identity for authenticated native-artifact probes. Unlike the
 /// display abbreviation this binds all forty hexadecimal commit characters.
-pub(crate) const GIT_COMMIT_FULL: &str = env!("ATERM_GIT_COMMIT_FULL");
-pub(crate) const GIT_DIRTY: &str = env!("ATERM_GIT_DIRTY");
+#[must_use]
+pub(crate) fn git_commit_full() -> &'static str {
+    stamp().git_commit_full
+}
+
+/// `"true"` when the build's tree was dirty.
+#[must_use]
+pub(crate) fn git_dirty() -> &'static str {
+    stamp().git_dirty
+}
+
 pub(crate) const BINARY_TARGET: &str = env!("ATERM_BINARY_TARGET");
 
-/// UTC build timestamp (RFC3339), or `"unknown"`. Stamped by `build.rs`.
-pub(crate) const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
+/// UTC build timestamp (RFC3339), or `"unknown"`.
+#[must_use]
+pub(crate) fn build_time() -> &'static str {
+    stamp().build_time
+}
 
-/// Monotonic build number, stamped by `build.rs`. The updater's ordering lives
+/// Monotonic build number. The updater's ordering lives
 /// here in metadata, independent of the app/source display version above. For a
 /// RELEASE this is the number `targo --unverified ship cut` claims in the append-only
-/// `RELEASES.ledger` (`max(last + 1, unix_now)` — strictly increasing by
+/// `RELEASES.ledger` (`max(last + 1, unix_now)`, strictly increasing by
 /// construction, epoch-scale) and pins via `SOURCE_DATE_EPOCH`; a dev build
-/// falls back to HEAD's committer Unix epoch — the same seconds scale, so dev
+/// falls back to HEAD's committer Unix epoch, the same seconds scale, so dev
 /// and release builds stay mutually ordered. Used as the macOS
 /// `CFBundleVersion`.
-pub(crate) const BUILD_NUMBER: &str = env!("ATERM_BUILD_NUMBER");
+#[must_use]
+pub(crate) fn build_number() -> &'static str {
+    stamp().build_number
+}
 
 /// Commits since the newest release tag at build time ("0" when git or the
-/// tag was unavailable) — the menu bar's DEV COUNTER: the third slot of a dev
-/// build's displayed version (owner, 2026-08-16; a release's third slot is
-/// always literal 0, so a nonzero counter can never be mistaken for one).
-#[cfg(any(target_os = "macos", test))]
-pub(crate) const DEV_COMMITS: &str = env!("ATERM_DEV_COMMITS");
+/// tag was unavailable): the version signature's DEV COUNTER
+/// ([`crate::menu::version_signature`]: the macOS menu bar's Version title and
+/// the Windows tab strip's version label), the third slot of a dev build's
+/// displayed version (owner, 2026-08-16; a release's third slot is always
+/// literal 0, so a nonzero counter can never be mistaken for one).
+#[must_use]
+pub(crate) fn dev_commits() -> &'static str {
+    stamp().dev_commits
+}
 
 /// Whether a release lane produced this binary. `targo --unverified ship cut` (both
 /// architecture builds) and the Linux release lane set `ATERM_RELEASE_BUILD`
 /// for the build, and no ordinary build does, so its presence at compile time
-/// IS the release/dev discriminator — read by display surfaces only (the menu
-/// bar's DEV signature). It carries no version: every build reports
-/// [`VERSION`].
-#[cfg(any(target_os = "macos", test))]
+/// IS the release/dev discriminator — read by display surfaces only (the DEV
+/// signature of [`crate::menu::version_signature`]). No Windows lane goes through
+/// the release cutter, so every Windows build reads `· DEV` today, truthfully;
+/// only a Windows release lane may ever set it. It carries no version: every
+/// build reports [`VERSION`].
 pub(crate) const IS_RELEASE_BUILD: bool = option_env!("ATERM_RELEASE_BUILD").is_some();
 
 /// Full first line of the producing compiler's `-vV`, e.g.
@@ -166,7 +295,7 @@ pub(crate) fn compiler_commit_short() -> &'static str {
 /// Display-ONLY by contract: the running build's version is not an input to the
 /// updater at all — `aterm_update::check_now` does not take one. Selection is by
 /// the release's `vMAJOR.MINOR.PATCH` tag and the apply gate is the monotonic
-/// [`BUILD_NUMBER`], so this string can never affect an update comparison.
+/// [`build_number`], so this string can never affect an update comparison.
 #[must_use]
 pub(crate) fn version_display() -> &'static str {
     VERSION
@@ -235,7 +364,7 @@ pub(crate) fn compiler_summary() -> String {
 /// This is a build FINGERPRINT, not a cryptographic attestation — it uses the
 /// workspace's non-cryptographic FxHash to avoid pulling in a crypto dependency. It
 /// is enough to tell two builds apart and to confirm "the binary I'm running is the
-/// one I shipped", which is its purpose in the cross-platform About overlay and
+/// one I shipped", which is its purpose in the native Settings `/about` route and
 /// `aterm-ctl version`.
 #[must_use]
 pub(crate) fn binary_signature() -> &'static str {
@@ -253,11 +382,10 @@ pub(crate) fn binary_signature() -> &'static str {
     .as_str()
 }
 
-/// Structured `(key, value)` provenance rows — the SINGLE source the own-rendered,
-/// introspectable About overlay both PAINTS and serialises for the `controls about`
-/// verb, so its pixels and its machine-readable text can never disagree. Each row's
-/// value is what "copy this row" puts on the clipboard. Cross-platform (the overlay
-/// replaces the macOS-only native panel).
+/// Structured `(key, value)` provenance rows — the SINGLE source the native Settings
+/// `/about` route PAINTS, `controls about` serialises (that route's semantic frame) and
+/// its COPY action puts on the clipboard ([`crate::about::provenance_text`]), so its
+/// pixels and its machine-readable text can never disagree. Cross-platform.
 #[must_use]
 pub(crate) fn about_fields() -> Vec<(&'static str, String)> {
     let mut fields = vec![
@@ -271,9 +399,9 @@ pub(crate) fn about_fields() -> Vec<(&'static str, String)> {
         // Project Site" button — where aterm comes from (owner, 2026-09-14).
         ("site", SITE.to_string()),
         ("version", version_display().to_string()),
-        ("build", BUILD_NUMBER.to_string()),
-        ("commit", GIT_COMMIT.to_string()),
-        ("built", BUILD_TIME.to_string()),
+        ("build", build_number().to_string()),
+        ("commit", git_commit().to_string()),
+        ("built", build_time().to_string()),
         // The RUNNING slice's CPU arch (`aarch64`/`x86_64`). For a universal binary this
         // reflects which slice is executing on THIS Mac — so with a mixed-flavor build
         // (arm64 = Trust +t, x86_64 = upstream +r) `arch` + the `compiler` row together
@@ -342,8 +470,11 @@ pub(crate) fn control_line() -> String {
         COMPILER_TRUST_VERSION
     };
     // `update_pin_sha256=`: the paper master this build trusts — the one anchor that
-    // authorizes a release.
-    let update_pin_sha256 = aterm_update::compiled_update_pin_sha256();
+    // authorizes a release. A pure function of a compiled-in const, so it is
+    // computed once, not on every `version` (every `aterm ctl` call's probe).
+    static UPDATE_PIN_FINGERPRINT: OnceLock<String> = OnceLock::new();
+    let update_pin_sha256 =
+        UPDATE_PIN_FINGERPRINT.get_or_init(aterm_update::compiled_update_pin_sha256);
     // `objc_contained=` — how many NSExceptions `aterm_objc::exception` has
     // caught inside declared Objective-C methods in THIS process (each one is
     // also an ERROR line in aterm.log). Additive, per the rule above; `0` off
@@ -353,12 +484,15 @@ pub(crate) fn control_line() -> String {
     #[cfg(not(target_os = "macos"))]
     let objc_contained = 0u64;
     format!(
-        "OK version={} build={BUILD_NUMBER} commit={GIT_COMMIT} built={BUILD_TIME} \
+        "OK version={} build={} commit={} built={} \
          arch={} trustc={} trustc_commit={} trustc_host={COMPILER_HOST} flavor={COMPILER_FLAVOR} \
          trust={trust} rust_compat={} \
          profile={BUILD_PROFILE} trust_verify={TRUST_VERIFY} update_pin_sha256={update_pin_sha256} \
          objc_contained={objc_contained} signature={}\n",
         version_display(),
+        build_number(),
+        git_commit(),
+        build_time(),
         std::env::consts::ARCH,
         compiler_release(),
         compiler_commit_short(),

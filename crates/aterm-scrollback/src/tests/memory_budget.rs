@@ -95,11 +95,16 @@ fn set_memory_budget_evicts_cold_pages() {
     sb.set_memory_budget(1)
         .expect("memory budget reduction should succeed");
 
-    // Cold pages should have been evicted
+    // Cold pages should have been evicted — all of them: nothing fits a 1-byte budget
     assert!(
         sb.cold_line_count() < cold_before,
         "cold tier should shrink after budget reduction: before={cold_before}, after={}",
         sb.cold_line_count()
+    );
+    assert_eq!(
+        sb.cold_line_count(),
+        0,
+        "a 1-byte budget leaves no cold page"
     );
     assert!(
         sb.line_count() < total_before,

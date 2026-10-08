@@ -1,58 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! MOTION POLICY (W11) — the SINGLE accessibility gate for every decorative
-//! animation aterm paints. One pure, total resolution folds the three motion
-//! facts — config `motion = auto|full|reduced`, the live OS "Reduce Motion"
-//! accessibility flag (macOS: `NSWorkspace.accessibilityDisplayShouldReduceMotion`,
-//! observed live via the apprt seam), and the window's focus — into one
-//! [`MotionPolicy`] value, and every animated effect ([`MotionEffect`]) obtains
-//! its animation amplitude from that value with ONE call
+//! Motion policy: the single accessibility gate for every decorative animation.
+//! One pure, total resolution folds config `motion = auto|full|reduced`, the
+//! live OS Reduce Motion flag (macOS
+//! `NSWorkspace.accessibilityDisplayShouldReduceMotion`, via the apprt seam) and
+//! the window's focus into one [`MotionPolicy`], and every animated effect
+//! ([`MotionEffect`]) takes its amplitude from it with one call
 //! ([`MotionPolicy::amplitude`] / [`MotionPolicy::animate`]).
 //!
-//! Later motion features (smooth scroll, ink-fade, …) join by adding a
-//! [`MotionEffect`] variant: the exhaustive match in `amplitude` then FAILS TO
-//! COMPILE until the new effect's Reduced amplitude is decided, and the
-//! reduced-motion totality proof below fails unless that amplitude is exactly 0.
+//! A new motion feature adds a [`MotionEffect`] variant: the exhaustive match in
+//! `amplitude` does not compile until its reduced amplitude is decided, and the
+//! totality test fails unless that amplitude is exactly 0.
 //!
-//! # Invariant (proven)
+//! # Invariant
 //!
-//! `MotionPolicy::resolve` is a PURE TOTAL function of `(config, system_flag,
-//! focus)`, and under a `Reduced` policy every governed animation amplitude is
-//! EXACTLY 0. Two-tier proof:
+//! `MotionPolicy::resolve` is a pure total function of `(config, system_flag,
+//! focus)`, and under `Reduced` every governed amplitude is exactly 0:
 //!
-//! * Tier-0 (abstract): `aterm_spec::derive::motion_policy_model()` — the ty
-//!   model checked by the real Trust `ty` in aterm-spec's `derived_ring_ty`
-//!   (proves the invariant at `Buggy=0`, and REQUIRES a counterexample at
-//!   `Buggy=1`, which reproduces the pre-W11 defect: the OS flag was never
-//!   queried, so auto mode kept animating under system Reduce Motion).
-//! * Tier-1 (this code): the `reduced_motion_totality` test below enumerates
-//!   the COMPLETE 3×2×2 input domain × the full [`MotionEffect::ALL`] set —
-//!   with finite inputs the exhaustive test is a complete proof over the
-//!   shipping resolver itself.
+//! * Tier 0: `aterm_spec::derive::motion_policy_model()`, checked by Trust `ty`
+//!   in aterm-spec's `spec_suite/derived_ring_ty.rs` (proved at `Buggy=0`; a
+//!   counterexample required at `Buggy=1`, where auto mode ignores the OS flag).
+//! * Tier 1: `reduced_motion_totality` enumerates the complete 3×2×2 input
+//!   domain × [`MotionEffect::ALL`] over the shipping resolver.
 //!
-//! # Functional motion vs the load-shed latch
+//! # Functional motion and the load-shed latch
 //!
-//! `App::motion_policy` has a FOURTH input the proof above does not model: the
-//! load-adaptive shedding latch (`perf_reduced`), a RENDER-COST heuristic that
-//! forces `Reduced` for a 1.5–30 s dwell once presents run over budget. That
-//! latch exists to shed DECORATION. Two governed effects are not decoration but
-//! the terminal's response to the user's own hand — the wheel/trackpad glide
-//! ([`MotionEffect::SmoothScroll`]) and the scroll-position pill's fade
-//! ([`MotionEffect::ScrollPill`]) — and shedding them turns manual scrolling
-//! into whole-row snapping for the dwell (the owner's 2026-09-22 report of
-//! blocky scrolling in a large Codex session is the case this closes off;
-//! whether the latch actually tripped there was not measured — read
-//! `perf_reduced`/`shed_transitions` on that instance). [`MotionEffect::load_shed_exempt`]
-//! names that functional set; `App::effect_policy` resolves an exempt effect
-//! from the three ACCESSIBILITY facts alone. The exemption never touches this
-//! module's invariant: under a `Reduced` policy — OS Reduce Motion, `motion =
-//! "reduced"`, or an unfocused window — an exempt effect's amplitude is still
-//! exactly 0, as `reduced_motion_totality` proves over the full effect set.
+//! The host's `App::motion_policy` has a fourth input: the load-adaptive
+//! shedding latch (`perf_reduced`), a render-cost heuristic that forces
+//! `Reduced` for a 1.5–30 s dwell once presents run over budget, to shed
+//! decoration. The wheel/trackpad glide ([`MotionEffect::SmoothScroll`]) and the
+//! scroll pill's fade ([`MotionEffect::ScrollPill`]) respond to the user's hand,
+//! and shedding them would snap scrolling to whole rows, so
+//! [`MotionEffect::load_shed_exempt`] names them and `App::effect_policy`
+//! resolves them from the three accessibility facts alone. Under a `Reduced`
+//! policy (OS Reduce Motion, `motion = "reduced"`, unfocused) their amplitude is
+//! still exactly 0 (owner, 2026-09-22).
 
-/// The `motion` config value: how aterm decides whether decorative animations
-/// run. `Auto` (the default and the value for any unknown string) consumes the
-/// platform sample: live Reduce Motion on macOS, an attach-time animations
+/// The `motion` config value. `Auto` (the default, and any unknown string) uses
+/// the platform sample: live Reduce Motion on macOS, an attach-time animations
 /// sample on Windows, and no OS-driven reduction where no query exists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum MotionMode {
@@ -81,90 +67,68 @@ impl MotionMode {
     }
 }
 
-/// Every decorative animation the policy governs — the ENUMERATED effect set
-/// the reduced-motion totality proof quantifies over. Each variant names the
-/// real seam that consumes its amplitude.
+/// Every decorative animation the policy governs: the effect set the totality
+/// proof quantifies over. Each variant names the seam that consumes its
+/// amplitude.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MotionEffect {
-    /// The LUMEN cursor aurora (comet / bloom crown / landing ring / particles):
-    /// the amplitude scales `GlowConfig::intensity` in `App::redraw_window` /
-    /// `App::redraw_compose` (0 ⇒ the animator clears and emits nothing).
+    /// The Lumen cursor aurora (comet, bloom crown, landing ring, particles): the
+    /// amplitude scales `GlowConfig::intensity` in `App::redraw_window` /
+    /// `App::redraw_compose` (0: the animator clears and emits nothing).
     CursorGlow,
-    /// Sparkle-word twinkle/jitter animation (`WordDecorations::tick`): 0 ⇒ the
-    /// static path (steady residual spark / cat-paw still draw — they are not
-    /// motion).
+    /// Sparkle-word twinkle and jitter (`WordDecorations::tick`): 0 selects the
+    /// static path (the steady spark and cat still draw; they are not motion).
     WordSparkles,
-    /// The retained Settings test-scaffold cursor-effect demo lane
-    /// (`next_demo_tick` arming in `about_to_wait`): 0 ⇒ the demo phase freezes.
-    SettingsDemo,
     /// The M1 smooth-scroll wheel GLIDE (`App::scroll_wheel_animated`): 0 ⇒ the
     /// viewport snaps instantly (no eased motion, no glide deadlines armed).
     SmoothScroll,
-    /// The M1 scroll-pill FADE ramp (`scroll_motion::pill_alpha`): 0 ⇒ the pill
-    /// still shows (it is information, not decoration) but hides BINARY at the
-    /// hold boundary instead of animating a fade.
+    /// The scroll-pill fade ramp (`scroll_motion::pill_alpha`): at 0 the pill
+    /// still shows (it is information) but hides at once at the hold boundary.
     ScrollPill,
-    /// The M2 "ink that dries" stream fade (the host's `stream_fade`): 0 ⇒ the
-    /// bypass gate (`fade_permitted`) forces the instant path — every frame is
-    /// byte-identical to the no-feature output and all ink dries immediately.
+    /// The "ink that dries" stream fade (the host's `stream_fade`): 0 makes
+    /// `fade_permitted` force the instant path, byte-identical to no fade.
     StreamFade,
-    /// The PHOSPHOR matrix rain (`MatrixRain::set_reduced_motion`, fed at the
-    /// render tick): 0 ⇒ the engine emits NOTHING (empty channels, fp 0,
-    /// inactive — timers disarm) — bypass-to-final-state (the drained-empty
-    /// frame), not a freeze.
+    /// The matrix rain (`MatrixRain::set_reduced_motion`, fed at the render
+    /// tick): 0 means the engine emits nothing (empty channels, fp 0, timers
+    /// disarmed), the final state rather than a freeze.
     MatrixRain,
-    /// Robi's tip BUBBLE's slide (`robi_bubble::layout` scales
-    /// `RobiBubble::rise` by this amplitude; the name is the retired
-    /// transient notice's, whose widget the bubble is): 0 ⇒ the bubble holds
-    /// its rest position for its whole life and only the alpha ramp remains.
-    /// It still SHOWS under reduced motion — it simply stops travelling.
+    /// Robi's tip bubble slide (`robi_bubble::layout` scales `RobiBubble::rise`
+    /// by it): at 0 the bubble holds its rest position and only the alpha ramp
+    /// remains; it still shows.
     NoticePill,
-    /// ROBI the helper robot's show (`aterm_effects::robi`, gated in the
-    /// redraw's Robi block): 0 ⇒ no show STARTS and a live one is stopped —
-    /// bypass-to-final-state (no robot on glass), the matrix-rain rule. He is
-    /// pure decoration; his tips re-appear on the next show once motion
-    /// returns.
+    /// Robi's show (`aterm_effects::robi`, gated in the redraw's Robi block): at 0
+    /// no show starts and a live one stops (no robot drawn); his tips return
+    /// with the next show once motion returns.
     Robi,
-    /// PRISM WAKE's output streak (`OutputStreak::tick` reads the amplitude as
-    /// `StreakConfig::intensity`): 0 ⇒ the engine RESETS and emits nothing —
-    /// no quads, no sound cue, fp 0, inactive. Bypass-to-final-state (the
-    /// settled frame), the matrix-rain rule, and deliberately a pin rather
-    /// than an ease: an effect that answers PROGRAM OUTPUT is exactly the kind
-    /// a motion-sensitive user needs GONE, not merely gentler.
+    /// Prism wake's output streak (`OutputStreak::tick` reads it as
+    /// `StreakConfig::intensity`): at 0 the engine resets and emits nothing (no
+    /// quads, no cue, fp 0). A pin rather than an ease: an effect answering
+    /// program output is one a motion-sensitive user needs gone.
     OutputStreak,
-    /// The UPGRADE RIM (the host's `level_up`): the pulse, the climb, the hue
-    /// travel and the thickening all scale with this amplitude. 0 ⇒ a STILL
-    /// rim at a fixed alpha and thickness — the information (an update is
-    /// applying) is kept, the movement is removed: the notice pill's rule, not
-    /// the matrix rain's.
+    /// The upgrade rim (the host's `level_up`): pulse, climb, hue travel and
+    /// thickening scale with it. At 0 the rim is still at fixed alpha and
+    /// thickness: the information stays, the movement goes.
     UpgradeSurge,
-    /// The PRESENCE rim's one edge ripple (the host's `presence`): a 300 ms flash
-    /// along the driven window's rim when a peer's turn submit verifiably
-    /// landed. 0 ⇒ the ripple never STARTS — the frame is the steady rim's
-    /// image, byte for byte (the information, "driven", is the rim itself and
-    /// the band's words; the flash is decoration).
+    /// The presence rim's edge ripple (the host's `presence`): a 300 ms flash
+    /// along the driven window's rim when a peer's turn submit landed. At 0 the
+    /// ripple never starts; the steady rim carries the information.
     PresenceRipple,
-    /// The MESSAGE BAND's live indicator (design §10.8, ruling 140): a busy
-    /// row's braille spinner and whole-row comet (`aterm_messages::Meter::busy`
-    /// — main's `BandBusy`, folded in on the merge: one effect, one gate), the
-    /// determinate bar's glide and glint, the completion echo's glow and fade.
-    /// 0 ⇒ `Pace::Still`: a bar that moves only with its data, a busy row's own
-    /// glyph over its unlit track, a still ✓ on completion. The information
-    /// stays; the movement goes (the notice pill's rule).
+    /// The message band's live indicator: a busy row's braille spinner and
+    /// whole-row comet (`aterm_messages::Meter::busy`), the determinate bar's
+    /// glide and glint, the completion echo's glow and fade. At 0 it is
+    /// `Pace::Still`: a bar moving only with its data, a busy row's glyph over
+    /// its unlit track, a still ✓ on completion.
     BandProgress,
 }
 
 impl MotionEffect {
-    /// The COMPLETE governed-effect set, in `seq` order. The totality proof
-    /// iterates this array; [`Self::seq`]'s exhaustive match plus the
-    /// `effect_set_is_complete` test pin the two together, so a new effect
-    /// cannot silently skip the reduced-motion invariant. Test-only, like
-    /// `seq`: production consumers gate per-effect via [`MotionPolicy`].
+    /// The complete governed-effect set in `seq` order, which the totality proof
+    /// iterates. [`Self::seq`]'s exhaustive match and `effect_set_is_complete`
+    /// keep them together. Test-only; production gates via [`MotionPolicy`].
     #[cfg(test)]
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::CursorGlow,
         Self::WordSparkles,
-        Self::SettingsDemo,
         Self::SmoothScroll,
         Self::ScrollPill,
         Self::StreamFade,
@@ -177,48 +141,40 @@ impl MotionEffect {
         Self::BandProgress,
     ];
 
-    /// Stable index of each variant (0..ALL.len()). EXHAUSTIVE match on purpose:
-    /// adding a variant fails compilation here until it is given an index, and
-    /// `effect_set_is_complete` fails until [`Self::ALL`] carries it at that
-    /// index — so the proof's quantification domain grows in lockstep.
+    /// Stable index of each variant (0..ALL.len()). Exhaustive, so a new variant
+    /// must be indexed here and `effect_set_is_complete` fails until
+    /// [`Self::ALL`] carries it.
     #[cfg(test)]
     fn seq(self) -> usize {
         match self {
             Self::CursorGlow => 0,
             Self::WordSparkles => 1,
-            Self::SettingsDemo => 2,
-            Self::SmoothScroll => 3,
-            Self::ScrollPill => 4,
-            Self::StreamFade => 5,
-            Self::MatrixRain => 6,
-            Self::NoticePill => 7,
-            Self::Robi => 8,
-            Self::OutputStreak => 9,
-            Self::UpgradeSurge => 10,
-            Self::PresenceRipple => 11,
-            Self::BandProgress => 12,
+            Self::SmoothScroll => 2,
+            Self::ScrollPill => 3,
+            Self::StreamFade => 4,
+            Self::MatrixRain => 5,
+            Self::NoticePill => 6,
+            Self::Robi => 7,
+            Self::OutputStreak => 8,
+            Self::UpgradeSurge => 9,
+            Self::PresenceRipple => 10,
+            Self::BandProgress => 11,
         }
     }
 
-    /// Whether this effect is FUNCTIONAL motion the load-adaptive shedding
-    /// latch must never demote (see the module doc): the terminal answering
-    /// the user's hand rather than decorating the glass. The same line
-    /// [`SeriousModePolicy`] draws — serious mode removes decorative output
-    /// and "must not demote functional motion such as smooth scrolling or the
-    /// scroll position pill". EXHAUSTIVE on purpose (no `_`): a new
-    /// [`MotionEffect`] fails to compile until its class is decided, exactly
-    /// as [`MotionPolicy::amplitude`] forces its Reduced amplitude.
+    /// Whether this effect is functional motion the load-shed latch must never
+    /// demote (see the module doc): the terminal answering the user's hand. The
+    /// same line [`SeriousModePolicy`] draws. Exhaustive, so a new
+    /// [`MotionEffect`] must be classified.
     ///
-    /// Accessibility is NOT exemptable: this classifies only what the render
-    /// cost heuristic may shed. OS Reduce Motion, `motion = "reduced"` and the
-    /// unfocused demotion still zero an exempt effect through `resolve`.
+    /// Accessibility is not exemptable: OS Reduce Motion, `motion = "reduced"`
+    /// and unfocused demotion still zero an exempt effect through `resolve`.
     #[must_use]
     pub const fn load_shed_exempt(self) -> bool {
         match self {
             Self::SmoothScroll | Self::ScrollPill => true,
             Self::CursorGlow
             | Self::WordSparkles
-            | Self::SettingsDemo
             | Self::StreamFade
             | Self::MatrixRain
             | Self::NoticePill
@@ -231,10 +187,9 @@ impl MotionEffect {
     }
 }
 
-/// The resolved motion policy for one window, one frame: either animations run
-/// at full amplitude, or every governed amplitude is exactly 0 (static effects
-/// only). Obtained via the host's `App::motion_policy` — the ONE call consumers
-/// (and future motion features) make.
+/// The resolved motion policy for one window and frame: animations at full
+/// amplitude, or every governed amplitude exactly 0. Obtained via the host's
+/// `App::motion_policy`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MotionPolicy {
     /// Animations run at their configured amplitude.
@@ -243,11 +198,10 @@ pub enum MotionPolicy {
     Reduced,
 }
 
-/// Every nonessential effect suppressed by "serious mode".  This set is kept
-/// separate from [`MotionEffect`]: serious mode removes decorative output, but
-/// must not demote functional motion such as smooth scrolling or the scroll
-/// position pill, and it must not affect cursor blink, visual bell, or window
-/// attention.
+/// Every nonessential effect suppressed by serious mode. Kept apart from
+/// [`MotionEffect`]: serious mode removes decorative output but must not demote
+/// functional motion (smooth scrolling, the scroll pill), cursor blink, the
+/// visual bell or window attention.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SeriousEffect {
     TerminalSound,
@@ -265,10 +219,9 @@ pub enum SeriousEffect {
     /// The presence rim's turn-submit ripple: decoration on a rim that
     /// otherwise moves only with a fact.
     PresenceRipple,
-    /// The message band's live indicator MOTION (STATUS-SURFACE.md:739-741:
-    /// Serious Mode retires motion) — the busy spinner and comet included
-    /// (main's `BandBusy`, folded in on the merge). The band and its words
-    /// stay; the indicator takes its still form.
+    /// The message band's live indicator motion, the busy spinner and comet
+    /// included. The band and its words stay; the indicator takes its still
+    /// form.
     BandProgress,
 }
 
@@ -312,10 +265,9 @@ impl SeriousEffect {
     }
 }
 
-/// Pure, total projection from the single effective serious-mode bit to each
-/// decorative output gate.  Keeping this law independent of mutable App state
-/// makes the transition and render paths share one decision and gives the
-/// finite truth table below a complete executable proof.
+/// Pure, total projection from the effective serious-mode bit to each
+/// decorative output gate, independent of App state, so transition and render
+/// paths share one decision and the truth table below is a complete proof.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SeriousModePolicy {
     serious: bool,
@@ -349,14 +301,13 @@ impl SeriousModePolicy {
 }
 
 impl MotionPolicy {
-    /// Resolve the policy — a PURE, TOTAL function of the three motion facts:
+    /// Resolve the policy, a pure total function of:
     ///
-    /// * `mode` — config `motion` (`Auto` follows `system_reduce`; `Full` /
+    /// * `mode`: config `motion` (`Auto` follows `system_reduce`; `Full` /
     ///   `Reduced` override it),
-    /// * `system_reduce` — the live OS "Reduce Motion" accessibility flag,
-    /// * `focused` — this window's focus: an UNFOCUSED window always demotes to
-    ///   static effects (W11b), regardless of config — background motion is
-    ///   pure distraction and its animation timers are already focus-gated.
+    /// * `system_reduce`: the live OS Reduce Motion flag,
+    /// * `focused`: an unfocused window always demotes to static effects,
+    ///   whatever the config.
     #[must_use]
     pub fn resolve(mode: MotionMode, system_reduce: bool, focused: bool) -> Self {
         let animate = focused
@@ -368,11 +319,10 @@ impl MotionPolicy {
         if animate { Self::Full } else { Self::Reduced }
     }
 
-    /// The ANIMATION amplitude for `effect` under this policy: `1.0` under
-    /// [`Self::Full`], EXACTLY `0.0` under [`Self::Reduced`] — the invariant the
-    /// two-tier proof pins (see the module doc). The `Reduced` arm matches every
-    /// effect EXPLICITLY (no `_`), so a new [`MotionEffect`] variant forces an
-    /// explicit decision here and the totality test rejects any nonzero choice.
+    /// The animation amplitude for `effect`: `1.0` under [`Self::Full`], exactly
+    /// `0.0` under [`Self::Reduced`]. The `Reduced` arm matches every effect
+    /// explicitly, so a new variant needs a decision and the totality test
+    /// rejects anything nonzero.
     #[must_use]
     pub fn amplitude(self, effect: MotionEffect) -> f32 {
         match self {
@@ -380,7 +330,6 @@ impl MotionPolicy {
             Self::Reduced => match effect {
                 MotionEffect::CursorGlow
                 | MotionEffect::WordSparkles
-                | MotionEffect::SettingsDemo
                 | MotionEffect::SmoothScroll
                 | MotionEffect::ScrollPill
                 | MotionEffect::StreamFade
@@ -405,36 +354,23 @@ impl MotionPolicy {
 
 #[cfg(test)]
 mod tests {
-    //! Two-tier proof, Tier-1 (real code): these tests enumerate the SAME
-    //! invariant the derived ty model `motion_policy_model()` carries
-    //! (aterm-spec/src/derive.rs; Tier-0 checked by the real Trust `ty` in
-    //! aterm-spec's derived_ring_ty), over the SHIPPING `MotionPolicy` itself.
-    //! The whole input domain is finite (3 modes × 2 system flags × 2 focus
-    //! states × 8 effects), so the exhaustive enumeration is a COMPLETE proof
-    //! under plain `cargo test`.
+    //! Tier 1: these tests enumerate the invariant the ty model
+    //! `motion_policy_model()` carries (aterm-spec, checked by Trust `ty`) over
+    //! the shipping `MotionPolicy`. The input domain is finite (3 modes × 2
+    //! system flags × 2 focus states × every effect), so the enumeration is a
+    //! complete proof.
 
     use super::{MotionEffect, MotionMode, MotionPolicy, SeriousEffect, SeriousModePolicy};
 
-    /// REDUCE MOTION IS A MOTION SETTING, NOT AN AUDIO SETTING (2026-09-22).
+    /// Reduce Motion is a motion setting, not an audio setting. The audio
+    /// verdict depends on focus and the user's brightness knob, never on the
+    /// motion policy, so Reduce Motion (and the load-shed envelope on the same
+    /// scalar) dims the light without closing the key seam.
     ///
-    /// The visual law above is left exactly as it is — under `Reduced` every
-    /// governed amplitude is still EXACTLY 0. This states that the AUDIO
-    /// verdict is a DIFFERENT total function of the same domain: it depends
-    /// on focus and on the person's own brightness knob, never on the motion
-    /// policy — so `Reduce Motion` (and the load-shed envelope, which rides
-    /// the same scalar) dims the light without closing the key seam. Before
-    /// the split, a `Reduce Motion` session had no typing sound at all — an
-    /// accessibility setting deleting an audio feature over a click that
-    /// costs no GPU.
-    ///
-    /// IT DRIVES THE REAL ENGINE, over the real policy, on purpose. An
-    /// earlier draft of this test computed `let audible = focused;` and then
-    /// asserted `audible == focused` — a local against itself, green through
-    /// the exact re-subordination it names. Here the policy's own amplitude
-    /// folds `GlowConfig::intensity` the way `tick_cursor_fx` folds it, the
-    /// shipping `CursorGlow::tick` runs, and the assertion reads the engine's
-    /// `sound_seam_open()`. If the seam ever goes back to reading the folded
-    /// scalar, every `Reduced`-and-focused row here fails.
+    /// Drives the real engine: the policy's amplitude folds
+    /// `GlowConfig::intensity` as `App::cursor_frame` does, `CursorGlow::tick`
+    /// runs, and the assertion reads `sound_seam_open()`. If the seam reads the
+    /// folded scalar, every reduced-and-focused row fails.
     #[test]
     fn reduce_motion_never_mutes_typing() {
         use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
@@ -479,11 +415,10 @@ mod tests {
             for system_reduce in [false, true] {
                 for focused in [false, true] {
                     let p = MotionPolicy::resolve(mode, system_reduce, focused);
-                    // THE host's fold, called rather than transcribed: the
-                    // motion amplitude scales the VISUAL scalar, and
-                    // `audible` is focus and the user's own brightness knob
-                    // (nonzero here) — it reads nothing from `p`. No load
-                    // shed in this domain (envelope 1.0).
+                    // The host's fold, called rather than transcribed: the
+                    // motion amplitude scales the visual scalar; `audible` is
+                    // focus and the brightness knob (nonzero here), not `p`. No
+                    // load shed in this domain (envelope 1.0).
                     let mut cfg = base;
                     crate::sound_policy::fold_window_audibility(
                         &mut cfg,
@@ -529,13 +464,11 @@ mod tests {
         );
     }
 
-    /// REDUCED-MOTION TOTALITY (the W11 PROVE bullet): `resolve` is total over
-    /// the full `(config, system_flag, focus)` domain, its truth table is
-    /// exactly "animate ⟺ focused ∧ (full ∨ (auto ∧ ¬system))", and under a
-    /// `Reduced` policy every governed effect's amplitude is EXACTLY 0 (with
-    /// `animate()` false). Under `Full` every amplitude is exactly 1 — the
-    /// NON-VACUITY control: both policy branches are reachable and the
-    /// invariant is not satisfied by a constant-zero amplitude.
+    /// Reduced-motion totality: `resolve` is total over `(config, system_flag,
+    /// focus)`, its truth table is "animate ⟺ focused ∧ (full ∨ (auto ∧
+    /// ¬system))", and under `Reduced` every governed amplitude is exactly 0
+    /// (`animate()` false). Under `Full` every amplitude is exactly 1, so both
+    /// branches are reachable.
     #[test]
     fn reduced_motion_totality() {
         let mut saw_full = false;
@@ -583,12 +516,9 @@ mod tests {
         assert!(saw_reduced, "the Reduced policy must be reachable");
     }
 
-    /// The load-shed exemption is EXACTLY the functional-motion pair (the
-    /// wheel glide and the scroll pill) and nothing else — a decorative effect
-    /// that slipped into the exempt set would keep painting under overload,
-    /// which is the one thing the latch exists to stop. And the exemption
-    /// weakens nothing the proof above pins: every exempt effect's amplitude
-    /// is still exactly 0 under a `Reduced` policy.
+    /// The load-shed exemption is exactly the functional pair (wheel glide and
+    /// scroll pill): a decorative effect in it would paint under overload. Every
+    /// exempt effect is still exactly 0 under `Reduced`.
     #[test]
     fn load_shed_exemption_is_exactly_functional_motion() {
         for e in MotionEffect::ALL {
@@ -616,10 +546,9 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL (the pre-W11 defect, the ty model's `Buggy=1` twin):
-    /// a resolver that ignores the OS flag under `Auto` disagrees with the
-    /// proven one exactly on the (Auto, sys=true, focused=true) point — so the
-    /// truth-table assertion above genuinely catches that regression.
+    /// Negative control (the ty model's `Buggy=1` twin): a resolver ignoring the
+    /// OS flag under `Auto` differs from the proven one exactly at (Auto,
+    /// sys=true, focused=true), so the truth-table assertion catches it.
     #[test]
     fn ignoring_the_system_flag_is_caught() {
         let buggy = |mode: MotionMode, _sys: bool, focused: bool| -> MotionPolicy {
@@ -643,8 +572,7 @@ mod tests {
         );
     }
 
-    /// UNFOCUSED DEMOTION (W11b): an unfocused window is Reduced under EVERY
-    /// mode/flag combination — background windows get static effects only.
+    /// An unfocused window is Reduced under every mode/flag combination.
     #[test]
     fn unfocused_windows_demote_to_static() {
         for mode in [MotionMode::Auto, MotionMode::Full, MotionMode::Reduced] {
@@ -658,10 +586,8 @@ mod tests {
         }
     }
 
-    /// The effect set is COMPLETE and duplicate-free: `ALL[i].seq() == i` for
-    /// every entry. `seq`'s match is exhaustive, so a new variant fails to
-    /// compile until indexed — and this test fails until `ALL` lists it, which
-    /// pulls it into the totality proof's quantification domain.
+    /// The effect set is complete and duplicate-free: `ALL[i].seq() == i` for
+    /// every entry, so a new variant joins the totality proof's domain.
     #[test]
     fn effect_set_is_complete() {
         for (i, e) in MotionEffect::ALL.iter().enumerate() {
@@ -681,9 +607,8 @@ mod tests {
         assert_eq!(MotionMode::parse("bogus"), MotionMode::Auto);
     }
 
-    /// Complete truth table for serious mode: every enumerated fun effect
-    /// is allowed in normal mode and denied in serious mode.  Both rows are
-    /// reachable, so the proof cannot pass via a constant result.
+    /// Serious mode's truth table: every fun effect is allowed in normal mode
+    /// and denied in serious mode; both rows are reachable.
     #[test]
     fn serious_mode_policy_is_total_and_non_vacuous() {
         let mut saw_allowed = false;
@@ -718,10 +643,9 @@ mod tests {
     }
 
     /// Tier-1 conformance: drive the derived serious-mode state machine and
-    /// project each of its requested/effective bits through the shipping
-    /// `SeriousModePolicy`. This includes changing a preference underneath the
-    /// overlay and proves disable restores the latest request, not a stale
-    /// startup snapshot.
+    /// project its requested/effective bits through `SeriousModePolicy`,
+    /// including a preference change under the overlay; disabling restores the
+    /// latest request, not a stale startup snapshot.
     #[test]
     fn serious_mode_policy_conforms_to_derived_transition_model() {
         let model = aterm_spec::derive::serious_mode_model();

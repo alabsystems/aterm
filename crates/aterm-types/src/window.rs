@@ -3,9 +3,6 @@
 // Author: Andrew Yates
 
 //! Window operations (CSI t - XTWINOPS) for terminal control.
-//!
-//! Extracted from `aterm-core/src/terminal/window.rs` to `aterm-types`
-//! as part of #5663 terminal extraction (Part of #5663, #2341).
 
 /// Window operation requested by CSI t (XTWINOPS) escape sequences.
 ///

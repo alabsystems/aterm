@@ -1,0 +1,14 @@
+# claude-code 2.1.287 · COMPOSED 2026-10-02, never captured: the texts are the bundle's (the title, body, detail and options N:L335446@11772, their layout N:L361846@563 (`wGe`: the Dialog over a column of [body, dim detail], then the Select `qn` N:L350439 with `hideIndexes`, its focus opening on the confirm row); N is the 2.1.287 strings dump docs/SPEC-claude-accounts-resets-2026-10-02.md cites), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; same Dialog component; the wrap is NOT read in the bundle), the values are invented · OPEN: replace with a capture (SPEC §6) · the reset confirmation on a 60-column grid: the body wrapped onto a second row at the Dialog's 54 columns (a word wrap, assumed)
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Use your reset?
+
+   Refills your weekly limit now · your weekly reset day
+   stays Oct 9 at 5am
+   2 resets left · use by Oct 5 at 3pm
+
+   ❯ Yes, use my reset
+     No, keep it
+
+   Enter to confirm · Esc to cancel

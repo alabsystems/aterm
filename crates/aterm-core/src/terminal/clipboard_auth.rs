@@ -2,76 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Clipboard-access capability authority — host-side authorization for
-//! OSC 52 clipboard *set* and *query* operations.
-//!
-//! # The privilege-conflation problem
+//! Clipboard-access capability authority: host-side authorization for OSC 52
+//! clipboard set and query.
 //!
 //! OSC 52 lets a program write (`OSC 52 ; c ; <base64> ST`) and read
-//! (`OSC 52 ; c ; ? ST`) the system clipboard. The parser delivers these
-//! sequences through `ActionSink::osc_dispatch` like any other escape
-//! sequence, so the clipboard callback in `Terminal::handle_osc_52_set`
-//! and `Terminal::handle_osc_52_query` sees attacker-controlled bytes
-//! (a `cat malicious.txt` from the PTY) as bit-identical to a legitimate
-//! host-driven clipboard write. See
-//! `reports/2026-04-18-privilege-conflation-audit.md` — **CF-004** and
-//! **CF-005**.
+//! (`OSC 52 ; c ; ? ST`) the system clipboard, and PTY bytes (a `cat` of a
+//! hostile file) look identical to a legitimate write. So the clipboard
+//! callback is reachable only through a zero-sized capability
+//! ([`ClipboardWriteCapability`] / [`ClipboardQueryCapability`], private
+//! `_seal`) minted by `ClipboardAuth::try_mint_*_capability`.
 //!
-//! Prior state:
-//! * OSC 52 *set* was **ungated** — any PTY-origin bytes could reach the
-//!   host's clipboard delegate (CF-004).
-//! * OSC 52 *query* was gated by a **runtime bool** (`allow_osc52_query`)
-//!   that lived on `TerminalModes`. A refactor that moved the check or a
-//!   new clipboard-query sequence that forgot to check it would silently
-//!   re-open the hole (CF-005).
+//! The host grants and revokes access with [`ClipboardAuth::authorize_write`],
+//! [`ClipboardAuth::authorize_query`] and their `revoke_*` counterparts,
+//! exposed as `Terminal::authorize_clipboard_access` /
+//! `revoke_clipboard_access`. Handlers can mint but never authorize (those
+//! methods are `pub(crate)` and called only from the host API), so the parser
+//! has no path from "no authorization" to "has capability".
 //!
-//! # The structural fix — mirror of [`super::modal_auth`]
+//! A handler that skips the mint has no token to pass, and the callback sits
+//! behind helpers ([`invoke_set`], [`invoke_query`], [`invoke_clear`]) that
+//! demand one. Fresh terminals start with both capabilities revoked.
 //!
-//! Clipboard invocation sites no longer take a `&mut ClipboardCallback`
-//! directly. They call `ClipboardAuth::try_mint_write_capability` or
-//! `ClipboardAuth::try_mint_query_capability`, each of which returns
-//! `Option<ClipboardWriteCapability>` / `Option<ClipboardQueryCapability>`.
-//! These types are **zero-sized with a private `_seal: ()`** — no code
-//! outside this module can construct one.
-//!
-//! Authorization is set by the host:
-//!
-//! * [`ClipboardAuth::authorize_write`] / [`revoke_write`]
-//! * [`ClipboardAuth::authorize_query`] / [`revoke_query`]
-//!
-//! Exposed on [`super::Terminal`] as
-//! `authorize_clipboard_access` / `revoke_clipboard_access`. Like
-//! `ModalProtocolAuth`, the `ClipboardAuth` field is reachable from the
-//! parser handler (so [`try_mint_write_capability`] can be called from
-//! inside `handle_osc_52_set`), but the **authorize/revoke** methods are
-//! `pub(crate)` and never called from handler code — they are reached
-//! only through the host-facing `Terminal::authorize_clipboard_access`
-//! API. The parser therefore has no structural path to escalate itself
-//! from "no authorization" to "has capability": the only transition is
-//! through a host API call, which is the definition of the trust
-//! boundary.
-//!
-//! # Why zero-sized capabilities (and not an enum returned by a gate
-//! function)?
-//!
-//! The zero-sized token pattern matches `modal_auth` for consistency and
-//! for the same reason: the token's lifetime statically flows from the
-//! authorization check to the callback invocation. A future reviewer who
-//! inlines the `if let Some(cap) = ...` block and forgets to check the
-//! capability will get a compiler error (`cap` is unused); a future
-//! handler that calls `clipboard.callback` directly (bypassing the
-//! capability) will see the callback hidden behind a private helper that
-//! demands a token.
-//!
-//! # Default posture
-//!
-//! Fresh terminals start with both capabilities **revoked**. Hosts must
-//! opt in. This matches the existing `allow_osc52_query` default
-//! (`false`) and tightens the previous-default OSC 52 *set*, which was
-//! effectively "allowed iff a clipboard callback is set."
+//! That is the engine's posture, not aterm's shipped one: the native GUI
+//! (`aterm-gui`'s `configure_clipboard`) authorizes write for every tab, so a
+//! program's OSC 52 set reaches the system clipboard with no prompt (as in kitty
+//! and WezTerm), and authorizes query only when the user sets `allow_osc52_query`.
+//! The standard policy's `OSC 52 set` rule requires `User` origin, so PTY bytes
+//! fall to `BridgeDecision::Fallback` and the host's bit decides.
 
 use super::callbacks::ClipboardCallback;
-use super::policy_bridge::BridgeDecision;
 use super::policy_gates::PolicyGates;
 use super::types::{ClipboardOperation, ClipboardSelection};
 use aterm_policy::selector::DispatchedSequence;
@@ -80,25 +39,14 @@ use aterm_policy::selector::DispatchedSequence;
 // Public API selector for host-facing `authorize_*` / `revoke_*` methods.
 // ---------------------------------------------------------------------------
 
-/// Selector for the two classes of OSC 52 clipboard access.
-///
-/// Used by host-facing APIs
+/// Selector for the two classes of OSC 52 clipboard access, used by
 /// [`super::Terminal::authorize_clipboard_access`] and
-/// [`super::Terminal::revoke_clipboard_access`] to identify which
-/// capability to grant or revoke. Parallel to
-/// [`super::modal_auth::ModalProtocol`].
+/// [`super::Terminal::revoke_clipboard_access`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClipboardAccess {
-    /// OSC 52 clipboard *set* / *clear* (write).
-    ///
-    /// Gates CF-004: attacker-controlled OSC 52 bytes writing to the
-    /// host clipboard.
+    /// OSC 52 clipboard set / clear (write).
     Write,
-    /// OSC 52 clipboard *query* (read).
-    ///
-    /// Gates CF-005: attacker-controlled OSC 52 query reading the host
-    /// clipboard back through the PTY response stream. Formerly gated
-    /// by the runtime bool `TerminalModes::allow_osc52_query`.
+    /// OSC 52 clipboard query (read back through the PTY response stream).
     Query,
 }
 
@@ -106,25 +54,18 @@ pub enum ClipboardAccess {
 // Capability tokens — zero-sized, unforgeable outside this module.
 // ---------------------------------------------------------------------------
 
-/// Capability for OSC 52 clipboard *set*.
+/// Capability for OSC 52 clipboard set.
 ///
-/// Zero-sized. Its constructor is private to this module, so the only
-/// way to obtain one is through `ClipboardAuth::try_mint_write_capability`,
-/// which requires the host to have previously called
-/// [`ClipboardAuth::authorize_write`].
-///
-/// Consumed by value when passed to [`invoke_set`]; this prevents a
-/// single authorization from being silently replayed if the token were
-/// accidentally stashed (the Rust move semantics enforce it).
+/// Zero-sized; minted only by `ClipboardAuth::try_mint_write_capability` after
+/// [`ClipboardAuth::authorize_write`]. Consumed by value by [`invoke_set`], so
+/// one authorization cannot be replayed from a stashed token.
 #[must_use = "ClipboardWriteCapability has no effect unless passed to invoke_set"]
 pub(super) struct ClipboardWriteCapability {
     _seal: (),
 }
 
-/// Capability for OSC 52 clipboard *query*.
-///
-/// Parallel to [`ClipboardWriteCapability`]. Minted only through
-/// `ClipboardAuth::try_mint_query_capability` after a host call to
+/// Capability for OSC 52 clipboard query, minted only by
+/// `ClipboardAuth::try_mint_query_capability` after
 /// [`ClipboardAuth::authorize_query`].
 #[must_use = "ClipboardQueryCapability has no effect unless passed to invoke_query"]
 pub(super) struct ClipboardQueryCapability {
@@ -137,10 +78,8 @@ pub(super) struct ClipboardQueryCapability {
 
 /// Host-side authorization state for OSC 52 clipboard access.
 ///
-/// Lives on [`super::Terminal`]. Forwarded through [`super::TerminalHandler`]
-/// so parser handlers can call `try_mint_*_capability`, but the
-/// `authorize_*` / `revoke_*` methods are `pub(crate)` — handlers cannot
-/// escalate their own authorization.
+/// Forwarded to [`super::TerminalHandler`] so handlers can mint; the
+/// `authorize_*` / `revoke_*` methods are `pub(crate)` and host-only.
 #[derive(Debug, Default)]
 pub(crate) struct ClipboardAuth {
     write_authorized: bool,
@@ -156,18 +95,14 @@ impl ClipboardAuth {
         }
     }
 
-    /// Authorize OSC 52 clipboard *set* (write).
-    ///
-    /// After this call, subsequent PTY-origin `OSC 52 ; <selection> ; <base64> ST`
-    /// sequences will mint a [`ClipboardWriteCapability`] and invoke the
-    /// clipboard callback with the decoded content.
+    /// Authorize OSC 52 clipboard set: PTY-origin set sequences then mint a
+    /// [`ClipboardWriteCapability`] and reach the callback.
     pub(crate) fn authorize_write(&mut self) {
         self.write_authorized = true;
     }
 
-    /// Revoke OSC 52 clipboard *set*. After this call, subsequent
-    /// PTY-origin OSC 52 set sequences are silently dropped (no callback
-    /// invocation) until [`authorize_write`] is called again.
+    /// Revoke OSC 52 clipboard *set*: PTY-origin sets are dropped until
+    /// [`authorize_write`] is called again.
     pub(crate) fn revoke_write(&mut self) {
         self.write_authorized = false;
     }
@@ -183,9 +118,6 @@ impl ClipboardAuth {
     }
 
     /// Whether OSC 52 clipboard *set* is currently authorized.
-    ///
-    /// Read-only observer for host APIs / FFI. Does **not** mint a
-    /// capability; for that, use [`try_mint_write_capability`].
     #[cfg(test)]
     pub(crate) const fn is_write_authorized(&self) -> bool {
         self.write_authorized
@@ -197,15 +129,8 @@ impl ClipboardAuth {
         self.query_authorized
     }
 
-    /// Attempt to mint a write capability. Returns `Some` iff
-    /// [`authorize_write`] has been called and not since revoked.
-    ///
-    /// This is the only way a handler can obtain a
-    /// [`ClipboardWriteCapability`], and the capability is the only
-    /// argument that unlocks [`invoke_set`]. A handler that bypasses
-    /// this and tries to call the callback directly will find the
-    /// callback field is not part of its public API surface (it lives
-    /// behind [`invoke_set`] / [`invoke_query`] / [`invoke_clear`]).
+    /// Mint a write capability iff [`authorize_write`] was called and not
+    /// since revoked.
     #[cfg(test)]
     pub(super) fn try_mint_write_capability(&self) -> Option<ClipboardWriteCapability> {
         if self.write_authorized {
@@ -215,8 +140,8 @@ impl ClipboardAuth {
         }
     }
 
-    /// Attempt to mint a query capability. Returns `Some` iff
-    /// [`authorize_query`] has been called and not since revoked.
+    /// Mint a query capability iff [`authorize_query`] was called and not
+    /// since revoked.
     #[cfg(test)]
     pub(super) fn try_mint_query_capability(&self) -> Option<ClipboardQueryCapability> {
         if self.query_authorized {
@@ -226,57 +151,39 @@ impl ClipboardAuth {
         }
     }
 
-    /// Engine-consulting variant of `Self::try_mint_write_capability`
-    /// (#7994). Reads the compiled `OSC 52 set` gate verdict, which
-    /// [`super::policy_gates`] resolved from [`probe_osc52_set`] at
-    /// [`super::policy_gates::GATE_ORIGIN`] when the policy was installed:
+    /// Engine-consulting variant of `Self::try_mint_write_capability`, reading
+    /// the `OSC 52 set` gate that [`super::policy_gates`] compiled from
+    /// [`probe_osc52_set`] at [`super::policy_gates::GATE_ORIGIN`]:
     ///
-    /// * Engine matches a sequence-specific rule whose response is
-    ///   `Execute` → mint allowed.
-    /// * Engine matches only a universal wildcard `Execute` rule
-    ///   (`response any`) → falls back to the legacy `write_authorized`
-    ///   bool so broad profiles cannot silently reopen this deny-by-default
-    ///   sink.
-    /// * Engine matches a rule with any other response → mint denied
-    ///   (fail-closed, regardless of the legacy `authorize_write` state).
-    /// * Engine falls through to `defaults.unmatched` (no matching rule)
-    ///   → fall back to the legacy `write_authorized` bool. This is the
-    ///   Release N backward-compat guarantee from design §6.2/§6.3.
+    /// * a sequence-specific rule with response `Execute` mints;
+    /// * only a universal wildcard `Execute` rule (`response any`) falls back
+    ///   to `write_authorized`, so broad profiles cannot reopen this
+    ///   deny-by-default sink;
+    /// * a rule with any other response refuses, whatever `write_authorized` says;
+    /// * no matching rule, or no policy installed
+    ///   (`BridgeDecision::Fallback`), falls back to `write_authorized`.
     ///
-    /// With no policy installed, `gates.osc52_set()` is
-    /// [`BridgeDecision::Fallback`] and the behavior is identical to
-    /// `Self::try_mint_write_capability`.
-    ///
-    /// # Why a compiled verdict and not an `evaluate` call
-    ///
-    /// [`probe_osc52_set`] is a literal and the production origin is the literal
-    /// `OriginTag::Pty`, so this gate's verdict is a pure function of the
-    /// installed policy. It used to be re-derived on every OSC 52 dispatch:
-    /// three heap allocations for the constant probe plus two bucket walks. It
-    /// is now resolved once per installed policy in [`super::policy_gates`],
-    /// which builds it from THIS module's probe constructor so the two cannot
-    /// drift. See `terminal/policy_bridge.rs` for the decision tree.
+    /// The probe and origin are literals, so the verdict is resolved once per
+    /// installed policy. `terminal/policy_bridge.rs` has the decision tree.
     pub(super) fn try_mint_write_capability_with_engine(
         &self,
         gates: PolicyGates,
     ) -> Option<ClipboardWriteCapability> {
-        if allow(gates.osc52_set(), self.write_authorized) {
+        if gates.osc52_set().resolve(self.write_authorized) {
             Some(ClipboardWriteCapability { _seal: () })
         } else {
             None
         }
     }
 
-    /// Engine-consulting variant of `Self::try_mint_query_capability`
-    /// (#7994). Same bridge semantics as
-    /// [`Self::try_mint_write_capability_with_engine`] but against the
-    /// `OSC 52 query` selector and the `query_authorized` legacy bool.
-    /// Wildcard `Execute` rules likewise fall back instead of overgranting.
+    /// Engine-consulting variant of `Self::try_mint_query_capability`: the same
+    /// rules as [`Self::try_mint_write_capability_with_engine`], against the
+    /// `OSC 52 query` selector and `query_authorized`.
     pub(super) fn try_mint_query_capability_with_engine(
         &self,
         gates: PolicyGates,
     ) -> Option<ClipboardQueryCapability> {
-        if allow(gates.osc52_query(), self.query_authorized) {
+        if gates.osc52_query().resolve(self.query_authorized) {
             Some(ClipboardQueryCapability { _seal: () })
         } else {
             None
@@ -284,18 +191,11 @@ impl ClipboardAuth {
     }
 }
 
-/// Probe sequence used by the OSC 52 **set** policy lookup.
+/// Probe sequence for the OSC 52 set policy lookup.
 ///
-/// The engine's selector matcher treats the second param as a Base64
-/// payload for the `OSC 52 set` alias (anything that is not literal
-/// `?`). We use `SGVsbG8=` as the canonical representative — the exact
-/// content doesn't matter, only that the alias matches.
-///
-/// Every input is a literal, which is why [`super::policy_gates`] can resolve
-/// this gate once per installed policy instead of rebuilding the probe (three
-/// heap allocations) on every OSC 52 dispatch. It is `pub(super)` so the gate
-/// table compiles from THIS definition — a second, hand-copied probe could
-/// drift and answer the gate from the wrong rule bucket.
+/// Any second param other than `?` matches the `OSC 52 set` alias, so
+/// `SGVsbG8=` stands in for every payload. `pub(super)` so
+/// [`super::policy_gates`] compiles the gate from this one definition.
 #[inline]
 pub(super) fn probe_osc52_set() -> DispatchedSequence {
     DispatchedSequence::osc(52, [String::from("c"), String::from("SGVsbG8=")])
@@ -310,25 +210,13 @@ pub(super) fn probe_osc52_query() -> DispatchedSequence {
     DispatchedSequence::osc(52, [String::from("c"), String::from("?")])
 }
 
-#[inline]
-fn allow(decision: BridgeDecision, legacy_allow: bool) -> bool {
-    decision.resolve(legacy_allow)
-}
-
 // ---------------------------------------------------------------------------
 // Callback invokers — the only way to reach `ClipboardCallback` from a
 // handler.
 // ---------------------------------------------------------------------------
 
-/// Invoke the host clipboard callback with a *set* operation.
-///
-/// The capability token is consumed by value. If the callback is
-/// unwired, this is a no-op (same behavior as the pre-capability code:
-/// a clipboard write with no host delegate is silently dropped). A
-/// clear consequence of the `_token` parameter is that static analysis
-/// of the call-graph can prove the callback is reached iff a capability
-/// was minted, which is iff `ClipboardAuth::authorize_write` was called
-/// through the host API.
+/// Invoke the host clipboard callback with a set operation, consuming the
+/// capability. A no-op without a callback.
 pub(super) fn invoke_set(
     callback_slot: &mut Option<ClipboardCallback>,
     _token: ClipboardWriteCapability,
@@ -360,16 +248,11 @@ pub(super) fn invoke_query(
     callback(op)
 }
 
-/// Invoke the host clipboard callback with a *clear* operation.
+/// Invoke the host clipboard callback with a clear operation.
 ///
-/// Clear is **not** capability-gated separately. The policy choice here
-/// is that a terminal which has authorized write implicitly authorizes
-/// clear (clear is less dangerous than set — the attacker can only
-/// empty the clipboard, not inject arbitrary content). We therefore
-/// take a [`ClipboardWriteCapability`] rather than introducing a third
-/// token type. Hosts that want to block clear entirely can revoke write
-/// authorization; hosts that want to allow clear but not set can
-/// enforce that in the callback itself.
+/// Clear takes the write capability rather than a token of its own: it can
+/// only empty the clipboard. Hosts that want clear but not set enforce that
+/// in the callback.
 pub(super) fn invoke_clear(
     callback_slot: &mut Option<ClipboardCallback>,
     _token: ClipboardWriteCapability,
@@ -391,27 +274,15 @@ pub(super) fn invoke_clear(
 mod tests {
     use super::*;
     use aterm_policy::engine::PolicyEngine;
-    use aterm_policy::{
-        Defaults, OriginTag, Policy, Profile, Response, Rule, SCHEMA_VERSION, profiles,
-    };
+    use aterm_policy::{OriginTag, Policy, Response, profiles};
 
     fn policy_with_rule(sequence: &str, response: Response) -> Policy {
-        Policy {
-            schema_version: SCHEMA_VERSION,
-            profile: Profile::Standard,
-            defaults: Defaults {
-                unmatched: Response::Drop,
-                shell_integration_require_nonce: false,
-            },
-            rules: vec![Rule {
-                sequence: sequence.to_owned(),
-                origin_min: OriginTag::Pty,
-                response,
-                rate_limit: None,
-                prompt_id: None,
-            }],
-            rate_limits: vec![],
-        }
+        crate::terminal::policy_bridge::one_rule_policy(
+            sequence,
+            response,
+            OriginTag::Pty,
+            Response::Drop,
+        )
     }
 
     #[test]

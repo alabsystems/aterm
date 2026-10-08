@@ -1,33 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! GPU render panic-freedom + CPU/GPU parity on ADVERSARIAL engine states.
+//! GPU render panic-freedom and CPU/GPU parity on adversarial engine states.
 //!
-//! `parity_fuzz.rs` sweeps a CURATED token set, and the CPU render fuzz
-//! (`aterm-render`) drives hostile escape/UTF-8 input but renders only on the
-//! CPU. Neither exercises the GPU-specific code (atlas packing, colour atlas,
-//! wgpu encode, cursor compositing) across the broad adversarial input space —
-//! where a degenerate quad or an atlas overflow from hundreds of distinct
-//! random glyphs would crash the GPU-mode window. This drives the engine with
-//! random bytes + crafted CSI/OSC/SGR + emoji/CJK/combining/procedural content,
-//! renders on the GPU, and asserts: no panic, a valid frame, and CPU==GPU
-//! within the established <=8-LSB parity bound (which the GPU upholds by
-//! construction — it pulls the CPU renderer's exact glyph bytes). Deterministic.
+//! Drives the engine with random bytes, crafted CSI/OSC/SGR and
+//! emoji/CJK/combining/procedural content to exercise the GPU-specific code
+//! (atlas packing, colour atlas, wgpu encode, cursor compositing), renders on
+//! the GPU, and asserts no panic, a valid frame, and CPU==GPU within the
+//! <=8-LSB parity bound. Deterministic.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::Theme;
 
-mod common;
-use common::{
+use crate::common::{
     backends, count_exceeding_frame as count_exceeding,
     max_channel_delta_frame as max_channel_delta,
 };
 
-/// Per-pixel ceiling for the rare glyph AA-FRINGE pixel (inherent software-vs-
-/// hardware sRGB encode difference under linear-light; see `parity_fuzz.rs`).
-/// Interiors stay byte-tight (<=8). Measured worst here: 33.
+/// Per-pixel ceiling for the rare glyph AA-fringe pixel (software vs hardware
+/// sRGB encode; see `parity_fuzz.rs`). Interiors stay within 8.
 const EDGE_CEIL: i32 = 40;
-/// Max fringe pixels per frame. Measured worst: 1 px/frame; 8 is margin.
+/// Max fringe pixels per frame.
 const MAX_FRINGE_PX: usize = 8;
 
 #[inline]
@@ -86,9 +79,8 @@ fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    // CPU/GPU byte-parity fuzz: compare the SHARED base render. The GPU-only
-    // bloom and heat shimmer are present-quality layers outside the parity
-    // proof — disable them here.
+    // Compare the shared base render: GPU-only bloom and heat shimmer are
+    // outside the parity check.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     // Deterministic parity: block on the lazy fallback parses so neither
@@ -136,27 +128,19 @@ fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
         );
         assert!(!gpu_frame.pixels.is_empty(), "iter {it}: empty GPU frame");
 
-        // CPU==GPU <=1-LSB parity is asserted where it holds EXACTLY. DECDHL
-        // (double-HEIGHT, dec 1/2) is EXCLUDED: when the doubled glyph's top half
-        // is anchored above the visible area (e.g. DHL-bottom on the first row),
-        // the vertical clip boundary doesn't align to the 2x source grid, and the
-        // GPU's continuous UV + NEAREST sampling picks a different source row than
-        // the CPU's integer per-pixel clip — a known, degenerate parity edge (the
-        // dedicated `decdhl_double_height` test covers the aligned case at delta
-        // 1). DECDHL is still rendered above to pin its PANIC-freedom. DECDWL
-        // (dec 0, horizontal-only) is exact and IS checked.
+        // DECDHL (double height, dec 1/2) is excluded from parity: when the top
+        // half is anchored above the visible area, the clip boundary does not
+        // align to the 2x source grid, and GPU UV + NEAREST sampling picks a
+        // different source row than the CPU's integer clip
+        // (`gpu_matches_cpu::decdhl_double_height_gpu_matches_cpu` covers the
+        // aligned case). It is still rendered for panic-freedom. DECDWL (dec 0) is exact and checked.
         let is_decdhl = dec == 1 || dec == 2;
         if !is_decdhl {
             let d = max_channel_delta(&cpu_frame, &gpu_frame);
             worst = worst.max(d);
-            // LINEAR-LIGHT parity, bounded BY MAGNITUDE *and* COUNT. Linear-light
-            // compositing amplifies a sub-pixel software-vs-hardware sRGB encode
-            // difference at glyph AA-FRINGE pixels (the SAME "integer per-pixel clip"
-            // parity edge the DECDHL note above describes — just now visible beyond
-            // DECDHL). Interiors stay byte-tight (<=8); only ~1 fringe px/frame
-            // differs (measured worst delta 33). Bounding BOTH the per-pixel ceiling
-            // AND the fringe COUNT keeps the rigour — a real regression blows the
-            // count into the thousands and is caught. See `parity_fuzz.rs`.
+            // Bounded by magnitude and count: linear-light compositing amplifies
+            // the software/hardware sRGB encode difference at a few glyph
+            // AA-fringe pixels; interiors stay within 8. See `parity_fuzz.rs`.
             let exc = count_exceeding(&cpu_frame, &gpu_frame, 8);
             worst_exc = worst_exc.max(exc);
             assert!(

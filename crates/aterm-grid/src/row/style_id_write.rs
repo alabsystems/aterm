@@ -1,10 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! StyleId-based write methods for Row.
-//!
-//! These methods are only available in test and Kani contexts where StyleId
-//! is the preferred way to style cells (vs inline colors in production).
+//! StyleId-based write methods for Row (test and Kani only; production stores
+//! inline colours).
 
 use super::super::CellFlags;
 use super::super::cell::Cell;
@@ -12,11 +10,8 @@ use super::super::style::StyleId;
 use super::{Row, RowFlags};
 
 impl Row {
-    /// Write a styled character at the given column using StyleId.
-    ///
-    /// This is the StyleId variant of `write_char_styled`. Instead of storing
-    /// inline colors, the cell stores a StyleId that references the StyleTable.
-    /// If overwriting part of a wide character, the orphaned half is cleared to space.
+    /// Write a character at `col` referencing a StyleTable entry. An overwritten
+    /// wide character's orphaned half is cleared to space.
     #[inline]
     pub fn write_char_with_style_id(
         &mut self,
@@ -50,26 +45,18 @@ impl Row {
         if col >= self.len {
             self.len = col.saturating_add(1);
         } else if old_len > 0 && self.cells[old_len - 1].is_empty() {
-            // Interior single-width write over a WIDE head at the tail cleared its
-            // continuation via fixup_wide_char_overwrite; if that was the last
-            // content (old_len == col+2), len would be stale-high. #7522 len class,
-            // mirrored from write_char_packed (recalculate never over-shrinks).
-            // Ungated (unlike write_char_packed): this variant's fixup is itself
-            // ungated, and write_wide_char_with_style_id doesn't set HAS_WIDE_CHARS,
-            // so the recalc must match the fixup's condition, not the fast-path flag.
+            // An interior write over a tail WIDE head cleared its continuation;
+            // recompute len (never over-shrinks). Ungated, matching this
+            // variant's ungated fixup.
             self.recalculate_len_up_to(old_len);
         }
         self.flags |= RowFlags::DIRTY | RowFlags::HAS_STYLE_ID;
         true
     }
 
-    /// Write a wide (double-width) character at the given column using StyleId.
-    ///
-    /// This is the StyleId variant of `write_wide_char`. Instead of storing
-    /// inline colors, the cells store a StyleId that references the StyleTable.
-    /// Wide characters occupy two cells. The first cell contains the character
-    /// with the WIDE flag set, and the second cell is a continuation cell.
-    /// If overwriting parts of other wide characters, the orphaned halves are cleared.
+    /// Write a wide character at `col` referencing a StyleTable entry: the
+    /// first cell carries WIDE, the second is its continuation. Orphaned halves
+    /// of overwritten wide chars are cleared.
     ///
     /// Returns `true` if the write succeeded, `false` if out of bounds.
     #[inline]
@@ -107,11 +94,8 @@ impl Row {
             // Write main cell with WIDE flag
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::with_style_id(c, style_id, cell_flags.union(CellFlags::WIDE));
-            // Write continuation cell, carrying the lead's rendition (the same law
-            // as `write_wide_char_packed`: a rendition belongs to the character,
-            // and a double-width character is one character in two columns).
-            // `with_style_id` adds USES_STYLE_ID itself, which is why
-            // `wide_continuation_of` masks bits 14-15 out rather than passing them.
+            // The continuation carries the lead's rendition; `with_style_id` adds
+            // USES_STYLE_ID itself, so `wide_continuation_of` masks bits 14-15.
             *self.cells.get_unchecked_mut(col_usize + 1) =
                 Cell::with_style_id(' ', style_id, cell_flags.wide_continuation_of());
         }
@@ -119,18 +103,11 @@ impl Row {
         if col + 1 >= self.len {
             self.len = col.saturating_add(2);
         } else if old_len > 0 && self.cells[old_len - 1].is_empty() {
-            // Interior wide write orphaned a pre-existing wide char's continuation
-            // at col+2 (fixup_wide_char_write); if that was the last content
-            // (old_len == col+3), len would be stale-high. #7522 len class,
-            // mirrored from write_wide_char_packed (recalculate never over-shrinks).
+            // An orphaned continuation at col+2 may have been the last content;
+            // recompute len (never over-shrinks).
             self.recalculate_len_up_to(old_len);
         }
-        // Set HAS_WIDE_CHARS (matching the production write_wide_char_packed):
-        // without it a later HAS_WIDE_CHARS-gated fixup (e.g. write_char /
-        // write_char_packed) would skip its wide cleanup on this row, leaving a
-        // live orphaned continuation AND a stale-high len when the head is
-        // overwritten. The flag is the row-level fast-path predicate for wide
-        // fixup, so every wide write must set it.
+        // HAS_WIDE_CHARS gates the row's wide fixups, so every wide write sets it.
         self.flags |= RowFlags::DIRTY | RowFlags::HAS_STYLE_ID | RowFlags::HAS_WIDE_CHARS;
         true
     }

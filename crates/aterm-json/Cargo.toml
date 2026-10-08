@@ -19,16 +19,11 @@ description = "First-party JSON for aterm: a serde Deserializer/Serializer and a
 # graph for a dozen other reasons. Retiring serde is explicitly NOT in scope.
 serde = { workspace = true }
 
-[dev-dependencies]
-# THE ORACLE — never in the shipped graph. The crate this one retires, kept so
-# every parse and every serialization is proved equal to the reference: the
-# same accept-or-reject verdict on malformed input, and BYTE-IDENTICAL output,
-# which matters because some of this JSON is hashed into a checkpoint
-# fingerprint and some of it is a request body a server reads. Pinned here
-# rather than inherited from [workspace.dependencies]: the point of this crate
-# is that no shipped member declares it any more.
-serde_json = "1"
-serde = { workspace = true }
-
 [lints]
 workspace = true
+
+[lib]
+# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
+# gate while still being linked and executed. Off; doctests are governed
+# separately and still run.
+test = false

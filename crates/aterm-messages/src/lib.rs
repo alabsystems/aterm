@@ -4,92 +4,84 @@
 //! `aterm-messages` — one band, one model, one log.
 //!
 //! The platform-neutral engine behind aterm's unified message system
-//! (docs/DESIGN-unified-messages-2026-09-21.md §1): the message model, the
-//! glass policy (which rows are on the band, in what order, for how long), the
-//! single-row width law, the durable tagged log ring and its line codec, the
-//! wire grammars and the seamless-handoff carry. It emits **layouts in
-//! cells** ([`glass::Presentation`]); the host paints them, appends the log
-//! lines it drains, and performs the plain-data [`model::Intent`]s a press
-//! returns (`ATERM_DESIGN` §2.2: the engine requests, the frontend performs).
+//! (docs/DESIGN-unified-messages-2026-09-21.md): the message model, the glass
+//! policy (which rows are on the band, in what order, for how long), the
+//! single-row width law, the tagged log ring and its line codec, the wire
+//! grammars and the seamless-handoff carry. It emits layouts in cells
+//! ([`glass::Presentation`]); the host paints them, appends the log lines it
+//! drains, and performs the plain-data [`model::Intent`]s a press returns.
 //!
 //! # Contract
 //!
 //! * **Clockless.** Every method that reads time takes `now: Instant`
-//!   ([`Instant`] is `aterm_time::Instant` — exactly `std::time::Instant` on
-//!   native). A crate-local test greps these sources for a clock read and
-//!   asserts zero hits, so the engine can be driven deterministically and
-//!   on wasm.
-//! * **No platform.** No `std::fs`, no threads, no sockets, no `RenderCell`,
-//!   no theme: the engine paints the band's STRUCTURE — which character in
-//!   which cell, in which ink slot, on which ground ([`paint`], design ruling
-//!   319) — and RESOLVES it to colours over a plain-RGB palette derived from
-//!   a theme's background, foreground and cursor ([`ink`], ruling 324); the
-//!   host owns the file, its cells and the theme and forced-palette reads.
-//! * **Bounded.** [`MAX_LIVE`] unretired messages, [`LOG_CAP`] records in the
-//!   ring, [`PENDING_PERSIST_CAP`] undrained persist lines, every string
-//!   sanitized and capped at ingress — a hostile reporter cannot grow the
-//!   process or forge a row.
-//! * **Constants, not knobs** (D8): every hold, cap and floor is a `pub const`
-//!   here, measured against the status bars it replaces.
+//!   ([`Instant`] is `aterm_time::Instant`), so the engine runs
+//!   deterministically and on wasm.
+//! * **No platform.** No `std::fs`, threads, sockets or theme: [`paint`] lays
+//!   out the band's structure (character, ink slot and ground per cell) and
+//!   [`ink`] resolves it over a plain-RGB palette derived from a theme's
+//!   background, foreground and cursor; the host owns the file, the cells and
+//!   the theme.
+//! * **Bounded.** [`MAX_LIVE`] unretired messages, [`LOG_CAP`] ring records,
+//!   [`PENDING_PERSIST_CAP`] undrained persist lines; every string is sanitized
+//!   and capped at ingress, so a hostile reporter cannot grow the process or
+//!   forge a row.
+//! * **Constants, not knobs.** Every hold, cap and floor is a `pub const` here.
 //!
 //! # Indicators and motion
 //!
-//! A row's INDICATOR is its meter's state (design ruling 139, the merge's
-//! M4): a fill draws the bar, [`Meter::busy`] the comet, and neither draws
-//! nothing (the braille spinner went with ruling 251: the comet already says
-//! the work moves). The METER IS THE ROW (ruling 55, kept by ruling
-//! 136): a metered row's meter is `(0, cols, fill)` and a busy row's track
-//! `(0, cols)`, laid under every word and mapped by the host onto the
-//! window's pixels, gutters included — they cost the words no room and are
-//! never shed ([`glass`]). The MOTION is the engine's (ruling 140): the host
-//! reads one frame at a time through [`MessageCenter::motion`] and wakes at
-//! [`MessageCenter::motion_deadline`], the only clock, on one 33 ms grid; a
-//! frame hands it FRACTIONS of the row ([`animate::Surface`]) and an echo's
-//! glyph, never a pixel. A frame never enters the center, so it
-//! never bumps a revision, never re-grids and never arms
-//! [`MessageCenter::deadline`]; [`MessageCenter::busy_on_glass`] says whether
-//! a committed row is busy.
+//! A row's indicator is its meter's state: a fill draws the bar,
+//! [`Meter::busy`] the comet, neither draws nothing. The meter spans the whole
+//! row (`(0, cols, fill)`, a busy track `(0, cols)`), laid under the words and
+//! mapped by the host onto the window's pixels, gutters included, so it costs
+//! the words no room and is never shed. Motion is the engine's: the host reads
+//! one frame at a time through [`MessageCenter::motion`] and wakes at
+//! [`MessageCenter::motion_deadline`] on one 33 ms grid; a frame carries
+//! fractions of the row ([`animate::Surface`]) and an echo's glyph, never a
+//! pixel. A frame never enters the center: it bumps no revision, re-grids
+//! nothing and never arms [`MessageCenter::deadline`].
+//! [`MessageCenter::busy_on_glass`] says whether a committed row is busy.
 //!
-//! A host runs all of it through ONE driver, [`drive`] (design ruling 336):
-//! the step (settle, commit, drain, the wire's paced paint), each view's
-//! layout, motion frame, next change and paint key, and the deadline folds —
-//! the host injects the clock, the afford, the freeze and each view's look.
+//! A host runs all of it through one driver, [`drive`]: the step (settle,
+//! commit, drain, the wire's paced paint), each view's layout, motion frame,
+//! next change and paint key, and the deadline folds; the host injects the
+//! clock, the afford, the freeze and each view's look.
 //!
 //! # The presence row
 //!
-//! The same chrome carries one more row: the per-tab PRESENCE row (who is
-//! driving the session, what its agent is doing, its mail and its link) and
-//! the window's rim. Its pure core is [`presence`] (design ruling 348): the
-//! facts a host gathers, the per-session slot and its story, the levels, the
-//! words and their width law, the tones, the painted cells and the
-//! per-window view. What only a host can know — an agent wall's vocabulary,
-//! its published input stall, its own harness's name and the wire's percent
-//! codec — comes in through [`presence::Host`], implemented on a host-local
-//! marker; the host reads the screen, the leases and the fabric, and hands
-//! the facts in. Its sequencing is one driver as well, [`presence::drive`]
-//! (design ruling 353), over the host's [`presence::drive::Desk`].
+//! The same chrome carries the per-tab presence row (who drives the session,
+//! what its agent is doing, its mail and its link) and the window's rim. Its
+//! pure core is [`presence`]: the facts a host gathers, the per-session slot and
+//! its story, the levels, the words and their width law, the tones, the painted
+//! cells and the per-window view. What only a host knows (an agent wall's
+//! vocabulary, its input stall, its harness's name, the wire's percent codec)
+//! comes in through [`presence::Host`]; sequencing is [`presence::drive`] over
+//! the host's [`presence::drive::Desk`].
+//!
+//! # The window's chrome rows together
+//!
+//! The strip, the band and the presence row share one window's grid, and
+//! each spaces only its OWN fall from its own rise. [`chrome`] (design
+//! ruling 414) is the floor across them: after any rise of a
+//! window's chrome rows, no source's quiet fall re-grids it back inside
+//! [`chrome::CHROME_REGROW_SETTLE`]. The host notes the rises and hands the
+//! floor in ([`drive::Commit::floor`], [`presence::drive::Desk::chrome_floor`]);
+//! the fall laws read it.
 //!
 //! # The Settings ▸ Messages page
 //!
-//! The log's page is a MODEL here and a layout in the host: [`page`] (design
-//! ruling 382) builds the projection ONCE over the center
-//! ([`page::MessagesState::of`]) — every record newest first in the wire's
-//! own state words, the live rows' current words, the band row each is on,
-//! which authored intents can still be pressed, the tags in the chips' order
-//! — and holds the page's words (its chrome's too, ruling 395), its filter,
-//! its day clock and the feedback line for a press. What only a host
-//! can know — its clock, its log folder, whether the log is saved, its UTC
-//! offset, the staged build, whether a log file is there, which agent
-//! upgrades stand and take a word, and how many detail lines a reporter's
-//! record spends on its sentence — comes in through [`page::Host`]; the host
-//! lays the page out and paints it.
+//! [`page`] builds the log page's model once over the center
+//! ([`page::MessagesState::of`]): every record newest first in the wire's state
+//! words, the live rows' current words, the band row each is on, which authored
+//! intents can still be pressed, the tags in chip order, and the page's words,
+//! filter, day clock and press feedback. Host facts (clock, log folder, UTC
+//! offset, staged build, agent upgrades, detail-line budget) come in through
+//! [`page::Host`]; the host lays the page out and paints it.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
-// Test code is exempt from the pedantic bar, as in aterm-core; production
-// code is still held to all + pedantic.
+// Test code is exempt from the pedantic bar; production code is not.
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
 #![allow(
     clippy::module_name_repetitions,
@@ -104,11 +96,15 @@ pub use aterm_time::Instant;
 pub mod animate;
 pub(crate) mod carry;
 pub(crate) mod center;
+pub mod chrome;
+pub(crate) mod digest;
 pub mod drive;
+pub mod exceptions;
 pub(crate) mod glass;
 pub mod ink;
 pub mod log;
 pub(crate) mod model;
+pub mod need;
 pub mod page;
 pub mod paint;
 pub mod palette;
@@ -125,7 +121,10 @@ mod adversarial;
 
 pub use animate::{Anim, BandMotion, FineTone, Look, Pace, ROW, RowMotion, Stop, Surface, Tone};
 pub use carry::{CarriedMessage, Carry};
-pub use center::{Echo, EchoKind, Live, MessageCenter, Outcome, PostOutcome, Posted, Settled};
+pub use center::{
+    CatchUp, DigestSync, Echo, EchoKind, Live, MessageCenter, Outcome, PostOutcome, Posted, Settled,
+};
+pub use digest::{DigestEntry, DigestView, RECENT_FILED, ReportScope, report as exceptions_report};
 pub use glass::{CapsuleLayout, CapsuleRole, Hit, Links, Presentation, RowKind, RowLayout};
 pub use log::{CodecError, LogLine, LogRecord, LogState, MessageLog, Retired, Shelf};
 pub use model::{
@@ -140,14 +139,17 @@ pub use wire::{
 };
 
 // ---------------------------------------------------------------------------
-// Constants (D8: constants, not knobs).
+// Constants.
 // ---------------------------------------------------------------------------
 
-/// Visible band rows, including the overflow row (D1).
+/// Visible band rows, including the overflow row.
 pub const MAX_ROWS: u16 = 3;
 /// Unretired messages (glass + queue). Past it a post evicts.
 pub(crate) const MAX_LIVE: usize = 64;
-/// In-memory log ring; also the on-disk retention.
+/// Records in the in-memory log ring: what Settings ▸ Messages shows and what
+/// a launch's replay of the disk tail keeps. Once `WIRE_LOG_SHARE` of a full
+/// ring's records are wire-owned, the oldest retired wire record goes first.
+/// Disk retention is the host's (`aterm-gui`'s `messages_store`), in bytes.
 pub const LOG_CAP: usize = 512;
 /// Undrained persist lines. Past it the oldest is dropped and counted.
 pub(crate) const PENDING_PERSIST_CAP: usize = 1024;
@@ -163,7 +165,7 @@ pub(crate) const KEY_CAP: usize = 48;
 pub(crate) const STATS_CAP: usize = 40;
 /// Authored intents per message; `Details ›` is implicit.
 pub(crate) const MAX_ACTIONS: usize = 2;
-/// Cells each side of a row (`status_bars.rs:2365-2373`).
+/// Cells each side of a row.
 pub const MARGIN: usize = 1;
 /// The glyph's column.
 pub const GLYPH_COL: usize = 1;
@@ -173,52 +175,46 @@ pub const TITLE_COL: usize = 3;
 pub(crate) const BEFORE_CAPSULES: usize = 2;
 /// Cells between capsules.
 pub(crate) const CAPSULE_GAP: usize = 1;
-/// Below this many cells the excerpt is DROPPED, never stubbed
-/// (`status_bars.rs:143-147`) — save its whole lead clause, which is not a
-/// stub (`behind for 7 h`; design ruling 402, `text::lead_clause`).
+/// Below this many cells the excerpt is dropped, never stubbed, unless its
+/// whole lead clause fits (`behind for 7 h`, `text::lead_clause`).
 pub(crate) const DETAIL_FLOOR: usize = 20;
 /// The title elides no further; capsules never drop.
 pub(crate) const TITLE_MIN: usize = 12;
 /// The joint between a detail's pieces, the one every words builder writes;
-/// [`text::shape_detail`] sheds pieces at it (`status_bars.rs:150-152`).
+/// [`text::shape_detail`] sheds pieces at it.
 pub const PIECE_SEP: &str = " \u{00b7} ";
 
-/// A Success row's default hold (`HOLD_OK`, `status_bars.rs:69`).
+/// A Success row's default hold.
 pub const HOLD_SUCCESS: Duration = Duration::from_secs(8);
-/// An Info row's default hold (`HOLD_NOTICE`, `status_bars.rs:78`).
+/// An Info row's default hold.
 pub(crate) const HOLD_INFO: Duration = Duration::from_secs(30);
-/// A Warn row's default hold (`status_bars.rs:74`).
+/// A Warn row's default hold.
 pub const HOLD_WARN: Duration = Duration::from_secs(45);
 /// An Error row's default hold — an error earns a longer read than a warning.
 pub(crate) const HOLD_ERROR: Duration = Duration::from_secs(60);
-// `HOLD_STAGED_AUTOMATIC` (10 min) RETIRED 2026-09-23 (design ruling 57);
-// since 2026-09-24 the automatic lane's staged build takes no row at all (a
-// record, the owner's silent path).
-/// A staged update that applies only on a press (`status_bars.rs:96`).
+/// A staged update that applies only on a press.
 pub const HOLD_STAGED_MANUAL: Duration = Duration::from_secs(60);
-/// A decision row (the retired toast's `ADMIN_STEP_TTL`, notice.rs:146).
+/// A decision row's hold.
 pub const HOLD_ASK: Duration = Duration::from_mins(10);
-/// A route row after Open Settings: a terse restate of the question's row
-/// (the owner's attention rule, 2026-09-23 — the design's ruling 46; it was
-/// the retired card's 90 s `OPENED_SETTINGS_TTL`). The route stays behind
-/// Details and on Settings ▸ Messages.
+/// A route row after Open Settings: a terse restate of the question's row.
+/// The route stays behind Details and on Settings ▸ Messages.
 pub const HOLD_ROUTE: Duration = Duration::from_secs(15);
-/// A failed gesture (was the 5.4 s pill).
+/// A failed gesture's hold.
 pub const HOLD_GESTURE: Duration = Duration::from_secs(12);
-/// A tailed toolchain meter folds after this much silence (`status_bars.rs:107`).
+/// A tailed toolchain meter folds after this much silence.
 pub const STALE_TAILED: Duration = Duration::from_secs(30);
-/// An announcement-only toolchain row's cap (`status_bars.rs:111`).
+/// An announcement-only toolchain row's cap.
 pub const STALE_ANNOUNCE: Duration = Duration::from_mins(20);
-/// A live update row's cap (`status_bars.rs:128`).
+/// A live update row's cap.
 pub const STALE_UPDATE: Duration = Duration::from_mins(15);
-/// A carried row's cap across the seamless handoff (`status_bars.rs:101`).
+/// A carried row's cap across the seamless handoff.
 pub const STALE_HANDOFF: Duration = Duration::from_secs(125);
-/// D1 hysteresis: grow now, shrink after this much quiet.
+/// Band hysteresis: grow now, shrink after this much quiet.
 pub const SHRINK_QUIET: Duration = Duration::from_millis(1500);
 /// A queued row folds unseen after `max(hold, this)`.
 pub(crate) const OVERFLOW_PATIENCE_MIN: Duration = Duration::from_secs(60);
 
-// ---- Attention and motion (design §10.4.1) --------------------------------
+// ---- Attention and motion --------------------------------------------------
 
 /// A row that would appear and fold inside this costs two re-grids for
 /// nothing: a progress row posted with `reveal_after(PROGRESS_GRACE)` reaches
@@ -226,34 +222,19 @@ pub(crate) const OVERFLOW_PATIENCE_MIN: Duration = Duration::from_secs(60);
 pub const PROGRESS_GRACE: Duration = Duration::from_secs(2);
 /// The one frame grid every motion phase is read on — the host's 30 fps cap.
 pub const ANIM_FRAME: Duration = Duration::from_millis(33);
-/// One comet's breathing crossing of the WHOLE ROW (design ruling 138): its
-/// head enters at the window's left edge with the comet wholly outside, and
-/// the crossing ends as its tail clears the right edge — [`COMET_PERMILLE`]
-/// more than the row. The next comet enters as this one leaves, so the row is
-/// never empty for longer than a frame. Three seconds, main's sweep (24
-/// frames of 125 ms): 0.4 rows a second reads as calm at 80 columns (13
-/// cells a second) and at 200 (33), where the pill's 2.4 s over twenty cells
-/// was a scurry once the track became the window.
+/// One comet's crossing of the whole row: its head enters at the window's left
+/// edge and the crossing ends as its tail clears the right edge
+/// ([`COMET_PERMILLE`] more than the row). The next comet enters as this one
+/// leaves, so the row is never empty for longer than a frame.
 pub const COMET_PERIOD: Duration = Duration::from_millis(3000);
-/// The comet's length in permille of the ROW (a quarter of the window), its
-/// soft leading edge included: a tail that rises as the square of its length
-/// toward the hot head, then the leading edge falling back to the track over
-/// [`COMET_LEAD_PERMILLE`]. No straight edge anywhere — the ends of the row
-/// are the window's own edges. A quarter, not main's fifth (design ruling
-/// 242): drawn to the PIXEL, the square's steepest stretch — at the head —
-/// must stay under two levels a pixel on an 80-column window, where a fifth
-/// stepped three.
+/// The comet's length in permille of the row, soft leading edge included: a
+/// tail rising as the square of its length toward the hot head, then the
+/// leading edge falling to the track over [`COMET_LEAD_PERMILLE`]. A quarter
+/// keeps the head's steepest stretch under two levels a pixel at 80 columns.
 pub const COMET_PERMILLE: u32 = 250;
-/// The comet's soft LEADING edge, in permille of the row: the head's tone
-/// falls to the track over this, ahead of the head. Four percent, not two:
-/// on whole cells a 2 % lead is narrower than one cell plus its gutter, so
-/// the head read as a straight edge — a 172-of-255 step between neighbouring
-/// cells at 114 columns on a 2000 px window, 192 at 80 on 1000 px. At 4 % the
-/// worst step on those windows is 104 and 138 (the merge's build stage,
-/// 2026-09-24; `paint::tests::the_comet_sweeps_the_window_edge_to_edge` pins it).
-/// Eight percent since round 12 (design ruling 242): drawn to the pixel, the
-/// lead is a straight ramp, and two levels a pixel on an 80-column window
-/// needs about this much.
+/// The comet's soft leading edge in permille of the row: the head's tone falls
+/// to the track over this, ahead of the head. Drawn to the pixel it is a
+/// straight ramp; two levels a pixel at 80 columns needs about this much.
 pub(crate) const COMET_LEAD_PERMILLE: u32 = 80;
 /// The comet's hot head, lifted toward the glint (0–255).
 pub(crate) const COMET_HEAD_LIFT: u8 = 150;
@@ -264,22 +245,20 @@ pub const GLINT_PERIOD: Duration = Duration::from_millis(4000);
 pub const GLINT_TRAVEL: Duration = Duration::from_millis(1600);
 /// The first glint, after the motion epoch.
 pub const GLINT_DELAY: Duration = Duration::from_millis(1200);
-/// The glint's radius in permille of the row: a raised-cosine lift about
-/// six percent of the row wide (design ruling 242) — at least
-/// [`GLINT_MIN_HALF_CELLS`] half cells, so a narrow window's glint is never a
-/// one-column smudge.
+/// The glint's radius in permille of the row (a raised-cosine lift about six
+/// percent of the row wide), at least [`GLINT_MIN_HALF_CELLS`] half cells so a
+/// narrow window's glint is never a one-column smudge.
 pub(crate) const GLINT_RADIUS_PERMILLE: u32 = 30;
-/// The glint's least radius, in HALF cells of the row (three: a lift at
-/// least one and a half cells wide).
+/// The glint's least radius in half cells of the row (a lift at least one and
+/// a half cells wide).
 pub(crate) const GLINT_MIN_HALF_CELLS: u32 = 3;
-/// The glint's peak lift (0–255): the host's glint ink is itself the one
-/// perceptual step (ruling 242), so the peak reaches it whole.
+/// The glint's peak lift (0–255): the host's glint ink is itself one
+/// perceptual step, so the peak reaches it whole.
 pub(crate) const GLINT_PEAK: u8 = 255;
 /// A data jump in a determinate fill glides over at least this long…
 pub const FILL_GLIDE: Duration = Duration::from_millis(180);
-/// …plus this much per percentage point it travels (design ruling 245: a
-/// fixed 180 ms on the 30 fps grid was four or five hops whatever the
-/// distance — 7 to 14 cells a frame on a big jump)…
+/// …plus this much per percentage point it travels, so a big jump does not
+/// hop many cells a frame…
 pub const FILL_GLIDE_PER_POINT: Duration = Duration::from_millis(7);
 /// …and never longer than this.
 pub const FILL_GLIDE_MAX: Duration = Duration::from_millis(600);
@@ -287,34 +266,32 @@ pub const FILL_GLIDE_MAX: Duration = Duration::from_millis(600);
 /// to have (60 Hz): glides and echoes are read on it while they are in
 /// flight ([`MessageCenter::set_refresh`]).
 pub const REFRESH_DEFAULT: Duration = Duration::from_micros(16_667);
-/// A Complete echo's one conclusive SWEEP: a glint about four cells wide
-/// (at 80 columns) crossing the whole row once, at twice the glint's pace
-/// (design ruling 244).
+/// A Complete echo's one conclusive sweep: a glint about four cells wide (at
+/// 80 columns) crossing the whole row once, at twice the glint's pace.
 pub const ECHO_SWEEP: Duration = Duration::from_millis(800);
 /// The sweep's radius in permille of the row.
 pub const ECHO_SWEEP_PERMILLE: u32 = 25;
 /// An echo's fade.
 pub(crate) const ECHO_FADE: Duration = Duration::from_millis(250);
-/// A Fault echo's cross-fade from the fill to the warn wash (ruling 244):
-/// premultiplied, never through another hue.
+/// A Fault echo's cross-fade from the fill to the warn wash: premultiplied,
+/// never through another hue.
 pub const ECHO_FAULT_CROSS: Duration = Duration::from_millis(120);
 /// A Fault echo's warn wash holds until this far in, then fades.
 pub const ECHO_FAULT_FLASH: Duration = Duration::from_millis(350);
-/// A BUSY row's Fault: its comet, frozen where it failed, drains to the
-/// track over this (ruling 244).
+/// A busy row's Fault: its comet, frozen where it failed, drains to the track
+/// over this.
 pub const ECHO_DRAIN: Duration = Duration::from_millis(80);
 /// Heavy-load words show after the declared load lasted this long.
 pub const LOAD_AFTER: Duration = Duration::from_secs(5);
 /// A byte stream that has not advanced for this long reads "stalled".
 pub const STALL_AFTER: Duration = Duration::from_secs(10);
-/// A COUNT (steps or items) reads "stalled" once it has gone this many of
-/// its own mean gaps between advances without one — and never before
-/// [`STALL_AFTER`] (design ruling 265): a count may sit still while one item
-/// takes long, so its patience is its own pace, not a byte stream's.
+/// A count (steps or items) reads "stalled" after this many of its own mean
+/// gaps without an advance, never before [`STALL_AFTER`]: one item may take
+/// long, so a count's patience is its own pace.
 pub(crate) const COUNT_STALL_GAPS: u32 = 4;
-/// A row reaching the end of its reveal grace whose work projects to end
-/// within this is held back (design ruling 265): a row shown for under a
-/// second and then its echo is the flash the grace exists to prevent.
+/// A row ending its reveal grace whose work projects to end within this is
+/// held back: a row shown for under a second and then its echo is the flash
+/// the grace exists to prevent.
 pub const REVEAL_MIN_LEFT: Duration = Duration::from_millis(1500);
 /// …for at most this long past its grace: a projection that keeps saying
 /// "almost done" and is wrong still reaches the glass.
@@ -322,9 +299,8 @@ pub const REVEAL_DEFER_MAX: Duration = Duration::from_secs(2);
 /// How often a held-back reveal is looked at again.
 pub(crate) const REVEAL_RECHECK: Duration = Duration::from_millis(250);
 /// A latched ETA whose completion instant has passed with nothing new stands
-/// at `<5 s left` for at most this long — or a fifth of the estimate it latched,
-/// when that is longer — and then goes blank: an estimate that ran out is not
-/// a promise of five more seconds (review 2026-09-24).
+/// at `<5 s left` for at most this long (or a fifth of the latched estimate,
+/// if longer), then goes blank.
 pub(crate) const ETA_OVERDUE_MIN: Duration = Duration::from_secs(5);
 /// A busy row shows its elapsed time from here on.
 pub const ELAPSED_AFTER: Duration = Duration::from_secs(10);
@@ -342,66 +318,59 @@ pub(crate) const STABLE_SPAN: Duration = Duration::from_secs(4);
 pub(crate) const STABLE_MIN: Duration = Duration::from_secs(2);
 /// The projection ring's cap.
 pub(crate) const PROJECTIONS_CAP: usize = 16;
-/// The percent slot: two cells of gap, then the percent right-aligned in
-/// four (`"  100%"`), so `100%` keeps the row's standard two-space gap
-/// (design ruling 246).
+/// The percent slot: two cells of gap, then the percent right-aligned in four
+/// (`"  100%"`).
 pub(crate) const PCT_W: usize = 6;
-/// The elapsed slot, LABELLED (design ruling 241): `"for 59 min"` — a busy
-/// row says how long it has run in words, never a bare `0:41` clock.
+/// The elapsed slot, labelled: `"for 59 min"`, never a bare `0:41` clock.
 pub(crate) const ELAPSED_W: usize = 10;
-/// The elapsed slot's SHORT form, where the long one does not fit:
-/// `"for 59m"`, `"for 999h"` — the same numbers, changing at the same
-/// instants.
+/// The elapsed slot's short form where the long one does not fit: `"for 59m"`,
+/// `"for 999h"`, changing at the same instants.
 pub(crate) const ELAPSED_SHORT_W: usize = 8;
-/// The ETA slot: `"59 min left"` or `"stalled"` — a remaining time says
-/// `left`, which already says it is an estimate (no `~`, ruling 241).
+/// The ETA slot: `"59 min left"` or `"stalled"`; `left` already says it is an
+/// estimate, so no `~`.
 pub(crate) const ETA_W: usize = 11;
-/// The ETA slot's SHORT form, where the long one does not fit: `"59m left"`,
-/// `"<5s left"` or `"stalled"` — the same numbers, changing at the same
-/// instants, still saying `left` (at 80 columns a first run's row under disk
-/// load has room for this and not for the long form).
+/// The ETA slot's short form where the long one does not fit: `"59m left"`,
+/// `"<5s left"` or `"stalled"`, changing at the same instants.
 pub(crate) const ETA_SHORT_W: usize = 8;
 /// The ETA slot's word for a byte stream that stopped (painted in warn).
 pub const STALLED_WORD: &str = "stalled";
 /// A Fault echo's word in the row's time slot (painted in warn, like a
 /// stall): the failure is said, not only tinted.
 pub const FAILED_WORD: &str = "failed";
-/// A Complete echo's word in the row's time slot when its title has no
-/// past tense ([`Message::finished_words`] is `None`; ruling 247): the ✓
-/// alone beside `Uploading the backup` would read as still going.
+/// A Complete echo's word in the row's time slot when its title has no past
+/// tense ([`Message::finished_words`] is `None`): the ✓ alone beside
+/// `Uploading the backup` would read as still going.
 pub const DONE_WORD: &str = "done";
-// ---- The wire's `notice` verb (design rulings 163–198) ------------------
+// ---- The wire's `notice` verb ----------------------------------------------
 
 /// A wire progress row's staleness cap: an abandoned row fades (`Stale`, a
 /// Vanish echo) this long after its last line; a live script re-sends its line
 /// (an identical line costs nothing painted and re-arms the cap).
 pub(crate) const STALE_WIRE: Duration = Duration::from_secs(120);
-/// The most wire rows live at once: the glass's [`MAX_ROWS`], the overflow
-/// row included, so everything one script has in flight is ON the glass —
-/// never its ETA row under `… 2 more messages` (design ruling 197). A
-/// restate or a same-key supersede never counts against it.
+/// The most wire rows live at once: the glass's [`MAX_ROWS`], overflow row
+/// included, so everything one script has in flight is on the glass. A
+/// restate or a same-key supersede does not count against it.
 pub(crate) const WIRE_LIVE_CAP: usize = MAX_ROWS as usize;
 /// New wire messages — rows and records, each a log line — per trailing
 /// [`WIRE_MINT_WINDOW`].
 pub(crate) const WIRE_MINTS_PER_WINDOW: usize = 60;
 /// The title and detail bytes those mints may carry per window: each is
-/// written to `messages.log` twice (its Posted and its Retired line), so a
-/// flood of full-detail records cannot rotate aterm's own lines out of the
-/// file within minutes (design ruling 194).
+/// written to `messages.log` twice (Posted and Retired), so a flood of
+/// full-detail records cannot rotate aterm's own lines out of the file.
 pub(crate) const WIRE_BYTES_PER_WINDOW: usize = 16 * 1024;
-/// `notice act` presses per [`WIRE_MINT_WINDOW`]: each repaints, may open
-/// a window and logs a line, so a loop cannot (design ruling 195).
+/// `notice act` presses per [`WIRE_MINT_WINDOW`]: each repaints, may open a
+/// window and logs a line.
 pub(crate) const WIRE_PRESSES_PER_WINDOW: usize = 10;
-/// The most wire-owned records the log ring keeps once it is full: past it a
-/// new record evicts the oldest retired WIRE record, so a script can never
-/// push aterm's own history out of the ring (design ruling 194).
+/// The most wire-owned records the log ring keeps once full: past it a new
+/// record evicts the oldest retired wire record, so a script can never push
+/// aterm's own history out of the ring.
 pub(crate) const WIRE_LOG_SHARE: usize = 128;
 /// That window.
 pub(crate) const WIRE_MINT_WINDOW: Duration = Duration::from_secs(60);
 /// The least gap between two paints a wire line causes: one motion frame.
 pub const WIRE_PAINT_GAP: Duration = ANIM_FRAME;
-/// The wire's key namespace: `notice` can only ever NAME a key under it, so
-/// it can never restate, end, supersede or record over a host row.
+/// The wire's key namespace: `notice` can only name a key under it, so it can
+/// never restate, end, supersede or record over a host row.
 pub const WIRE_KEY_PREFIX: &str = "wire.";
 /// A wire key's longest spelling after [`WIRE_KEY_PREFIX`].
 pub(crate) const WIRE_KEY_MAX: usize = 40;
@@ -412,22 +381,20 @@ pub const GLASS_TITLE_CHARS: usize = 48;
 const _: () =
     assert!(WIRE_KEY_PREFIX.len() + WIRE_KEY_MAX <= KEY_CAP && GLASS_TITLE_CHARS < TITLE_CAP);
 
-// ---- Strain: explaining very heavy system use (design rulings 206–212) ----
+// ---- Strain: explaining very heavy system use ------------------------------
 //
-// The strain engine ([`strain`]) puts ONE row on the glass — `Typing slowed by
-// <cause>` — only while aterm MEASURED slow typing (FELT), a resource is past
-// its enter line (HEAVY), the cause is named from what was measured (NAMED)
+// The strain engine ([`strain`]) puts one row on the glass, `Typing slowed by
+// <cause>`, only while aterm measured slow typing (felt), a resource is past
+// its enter line (heavy), the cause is named from what was measured (named)
 // and it is not the person's own command or an aterm job that already has a
-// row (NOT OWN). Everything else is a record. Nothing is sampled until FELT is
+// row (not own). Everything else is a record. Nothing is sampled until felt is
 // suspected, so a calm machine arms nothing.
 
 /// The strain row's supersede key; its records share it.
 pub const STRAIN_KEY: &str = "system.strain";
-/// A hardware key whose arrival-to-present took at least this long is SLOW:
-/// 2.6× this m1's measured p95 of 23.1 ms.
+/// A hardware key whose arrival-to-present took at least this long is slow.
 pub const SLOW_KEY_MS: u32 = 60;
-/// A key this slow is a HITCH as well as slow — the lag a person feels as a
-/// stall, not a drag.
+/// A key this slow is also a hitch: lag felt as a stall, not a drag.
 pub(crate) const HITCH_MS: u32 = 250;
 /// A main-loop turn at least this long, ending within the host's typing
 /// tail, is a hitch (the host decides the tail and calls
@@ -435,7 +402,7 @@ pub(crate) const HITCH_MS: u32 = 250;
 pub const FREEZE_MS: u32 = 400;
 /// The trailing window [`strain::StrainTracker::felt`] reads.
 pub(crate) const FEEL_WINDOW: Duration = Duration::from_secs(6);
-/// FELT needs at least this many keys in the window, half of them slow…
+/// Felt needs at least this many keys in the window, half of them slow…
 pub(crate) const FEEL_MIN_KEYS: usize = 6;
 /// …or this many hitches.
 pub(crate) const FEEL_MIN_HITCHES: usize = 2;
@@ -446,14 +413,14 @@ pub(crate) const STRAIN_SAMPLE_EVERY: Duration = Duration::from_secs(2);
 /// A process sweep rides every this-many readings (the first reading of an
 /// episode is a sweep: the baseline the next one takes deltas against).
 pub(crate) const STRAIN_SCAN_EVERY: u32 = 2;
-/// Consecutive readings past a kind's enter line before it is HEAVY.
+/// Consecutive readings past a kind's enter line before it is heavy.
 pub(crate) const STRAIN_ENTER_READINGS: u8 = 2;
 /// Consecutive readings past a kind's clear line before it clears.
 pub(crate) const STRAIN_CLEAR_READINGS: u8 = 3;
-/// FELT must have held this long before a row: the heavy-load words' own
+/// Felt must have held this long before a row: the heavy-load words' own
 /// onset ([`LOAD_AFTER`]).
 pub(crate) const STRAIN_ONSET: Duration = LOAD_AFTER;
-/// Suspect falls back to calm after FELT has been false this long…
+/// Suspect falls back to calm after felt has been false this long…
 pub(crate) const STRAIN_UNFELT_CALM: Duration = Duration::from_secs(8);
 /// …or after no hardware key for this long.
 pub(crate) const STRAIN_NO_KEY_CALM: Duration = Duration::from_secs(15);
@@ -461,7 +428,7 @@ pub(crate) const STRAIN_NO_KEY_CALM: Duration = Duration::from_secs(15);
 pub(crate) const STRAIN_RECORD_AFTER: Duration = Duration::from_secs(5);
 /// An open row folds after no hardware key for this long…
 pub(crate) const STRAIN_IDLE: Duration = Duration::from_secs(30);
-/// …or after FELT has been false this long across at least
+/// …or after felt has been false this long across at least
 /// [`FEEL_MIN_KEYS`] keys…
 pub(crate) const STRAIN_UNFELT_FOLD: Duration = Duration::from_secs(20);
 /// …or after this long on the glass, whatever the machine does.
@@ -474,7 +441,7 @@ pub const STALE_STRAIN: Duration = Duration::from_secs(30);
 /// fades a row the engine still holds (an identical restatement repaints
 /// nothing).
 pub(crate) const STRAIN_KEEPALIVE: Duration = Duration::from_secs(10);
-/// The gauge moves the row only by at least this much (ruling 170).
+/// The gauge moves the row only by at least this much.
 pub(crate) const STRAIN_RESTATE_PERMILLE: u16 = 20;
 /// The same cause (kind and culprit) stays off the glass this long after
 /// its fold…
@@ -488,7 +455,7 @@ pub(crate) const STRAIN_RECORDS_PER_WINDOW: usize = 6;
 pub(crate) const STRAIN_RECORD_WINDOW: Duration = Duration::from_secs(3600);
 /// At most one `Memory pressure critical` record (while calm) per this.
 pub(crate) const STRAIN_CRITICAL_EVERY: Duration = Duration::from_mins(10);
-/// A culprit is NAMED only past this many milli-cores…
+/// A culprit is named only past this many milli-cores…
 pub(crate) const STRAIN_NAMED_MILLICORES: u32 = 1000;
 /// …and this share (percent) of the machine's busy core-time.
 pub(crate) const STRAIN_NAMED_SHARE_PCT: u32 = 40;
@@ -520,7 +487,11 @@ mod tests {
     const SOURCES: &[(&str, &str)] = &[
         ("lib.rs", include_str!("lib.rs")),
         ("model.rs", include_str!("model.rs")),
+        ("need.rs", include_str!("need.rs")),
         ("center.rs", include_str!("center.rs")),
+        ("chrome.rs", include_str!("chrome.rs")),
+        ("digest.rs", include_str!("digest.rs")),
+        ("exceptions.rs", include_str!("exceptions.rs")),
         ("glass.rs", include_str!("glass.rs")),
         ("log.rs", include_str!("log.rs")),
         ("text.rs", include_str!("text.rs")),
@@ -544,14 +515,11 @@ mod tests {
         ("presence/drive.rs", include_str!("presence/drive.rs")),
     ];
 
-    /// Invariant 1: the engine never samples a clock. Family C's C3 walks only
-    /// core/src/terminal (tools/grep_guard.sh, family C), so the crate carries its
-    /// own fence: `Instant::now()` / `SystemTime::now()` count == 0 in the
-    /// SHIPPED code — everything before each file's `#[cfg(test)]` MODULE
-    /// (tests mint a base instant to drive the engine from, as the status
-    /// bars' tests do; the grep guard's own scan strips test blocks the
-    /// same way). A `#[cfg(test)]` on a single accessor ends nothing: the
-    /// cut is at the test module, so the scan cannot quietly shrink.
+    /// Invariant 1: the engine never samples a clock. `tools/grep_guard.sh`'s
+    /// C3 walks only core/src/terminal, so the crate carries its own fence: no
+    /// `::now()` in the SHIPPED code, everything before each file's
+    /// `#[cfg(test)]` MODULE (tests mint a base instant). A `#[cfg(test)]` on a
+    /// single accessor ends nothing, so the scan cannot quietly shrink.
     #[test]
     fn no_wall_clock_in_this_crate() {
         // Assembled so this test's own text is not a hit.
@@ -600,7 +568,7 @@ mod tests {
                     .strip_suffix(';')
             })
             .collect();
-        assert_eq!(modules.len(), 18, "{modules:?}");
+        assert_eq!(modules.len(), 22, "{modules:?}");
         let mut scanned = 1;
         for m in &modules {
             let flat = format!("{m}.rs");
@@ -627,7 +595,7 @@ mod tests {
         );
     }
 
-    /// The constants are the status bars' numbers, not new ones.
+    /// The holds are the measured status-bar values.
     #[test]
     fn holds_are_the_measured_status_bar_values() {
         use super::*;
@@ -642,25 +610,23 @@ mod tests {
 }
 
 #[cfg(test)]
-mod band_tests;
-
-#[cfg(test)]
-mod review_tests;
-
-#[cfg(test)]
 mod attention_tests;
-
 #[cfg(test)]
-mod round12_tests;
-
+mod band_tests;
 #[cfg(test)]
-mod round13_tests;
-
-#[cfg(test)]
-mod round14_tests;
-
+mod door_tests;
 #[cfg(test)]
 mod drive_tests;
+#[cfg(test)]
+mod entry_tests;
+#[cfg(test)]
+mod exception_fuzz_tests;
+#[cfg(test)]
+mod family_tests;
+#[cfg(test)]
+mod need_tests;
+#[cfg(test)]
+mod overflow_tests;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]
@@ -668,8 +634,16 @@ mod presence_drive_tests;
 #[cfg(test)]
 mod presence_tests;
 #[cfg(test)]
-mod round15_tests;
+mod progress_words_tests;
 #[cfg(test)]
-mod round16_tests;
+mod record_end_tests;
 #[cfg(test)]
-mod round21_tests;
+mod regression_tests;
+#[cfg(test)]
+mod review_tests;
+#[cfg(test)]
+mod row_buttons_tests;
+#[cfg(test)]
+mod row_words_tests;
+#[cfg(test)]
+mod width_law_tests;

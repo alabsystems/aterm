@@ -2,9 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Materialize/fill round-trip tests — scrollback Line ↔ Grid row fidelity (#4216).
-//!
-//! Migrated from aterm-core as part of #6556 Batch 2.
+//! Materialize/fill round-trip tests: scrollback Line ↔ Grid row fidelity.
 
 use super::super::*;
 
@@ -73,10 +71,9 @@ fn materialize_from_line_roundtrip_wide_chars() {
     assert!(mat.cells[1].flags().contains(CellFlags::WIDE_CONTINUATION));
 }
 
-/// East-Asian-Ambiguous width is a write-time terminal policy. Once printed,
-/// the main cell's WIDE bit and continuation are the geometry authority: moving
-/// the row through Line-backed scrollback must not reclassify it with the
-/// default narrow Unicode table.
+/// East-Asian-Ambiguous width is decided at write time; afterwards the cell's
+/// WIDE bit and continuation are authoritative, and scrollback does not
+/// reclassify it with the narrow Unicode table.
 #[test]
 fn line_roundtrip_preserves_write_time_ambiguous_width() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -135,9 +132,8 @@ fn line_roundtrip_preserves_write_time_ambiguous_width() {
 #[test]
 fn materialize_keeps_decsca_protected_text() {
     // PROTECTED (DECSCA) shares bit 10 with WIDE_CONTINUATION. Row→line
-    // materialization SKIPS wide-continuation spacers; it must NOT skip
-    // protected glyphs, or DECSCA-protected text vanishes from scrollback
-    // (and from `line`/search/copy of history). Regression for that collision.
+    // materialization skips spacers but keeps protected glyphs, so protected
+    // text survives in scrollback, search and copy.
     let mut grid = Grid::new(3, 12);
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
@@ -156,9 +152,8 @@ fn materialize_keeps_decsca_protected_text() {
 
 #[test]
 fn materialize_drops_spacer_but_keeps_protected_neighbor() {
-    // Disambiguation: a real spacer (after a WIDE lead) collapses away; a
-    // protected cell that merely shares bit 10 is kept. Lays out 世<spacer>!
-    // where `!` is PROTECTED — the line must read "世!".
+    // A real spacer (after a WIDE lead) collapses; a protected cell sharing bit
+    // 10 stays. 世<spacer>! with `!` protected reads "世!".
     let mut grid = Grid::new(3, 12);
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
@@ -391,9 +386,7 @@ fn materialize_wide_char_at_last_col_does_not_corrupt_rgb() {
 }
 
 /// VS16 presentation width survives materialization: a scrolled-back `❤️Z`
-/// keeps the heart as the 2-column emoji-presentation cell the live writer
-/// made it (WIDE + continuation), so `Z` stays at column 2 — no column shift
-/// after the line enters scrollback.
+/// keeps the heart as a 2-column cell, so `Z` stays at column 2.
 #[test]
 fn materialize_preserves_vs16_widened_cell() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -419,10 +412,8 @@ fn materialize_preserves_vs16_widened_cell() {
     );
 }
 
-/// The live writer's row-edge exception survives materialization: a VS16 heart
-/// whose base sits at the LAST column was never widened live (no room for the
-/// continuation spacer — `widen_previous_cell_for_vs16` bails), so the restore
-/// must keep it as that narrow cell instead of dropping an "unfittable" wide.
+/// A VS16 heart at the last column was never widened live (no room for the
+/// spacer), so the restore keeps it narrow instead of dropping it.
 #[test]
 fn materialize_keeps_vs16_heart_narrow_at_last_column() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -467,10 +458,8 @@ fn materialize_preserves_vs15_narrowed_cell() {
     assert_eq!(row.cells[1].char(), 'Z', "Z stays at col 1 as it was live");
 }
 
-/// The skin-tone fold gates on effective width end-to-end: a text-presentation
-/// `☝🏽Z` materializes as the SPLIT layout the live writer produced (narrow ☝ at
-/// col 0, the modifier as its own wide cell at cols 1-2, Z at col 3) — not a
-/// folded single cell that would pull `Z` two columns left.
+/// A text-presentation `☝🏽Z` materializes in the live writer's split layout
+/// (narrow ☝ at col 0, the modifier wide at cols 1-2, Z at col 3), not folded.
 #[test]
 fn materialize_keeps_unfolded_skin_tone_split() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -487,7 +476,7 @@ fn materialize_keeps_unfolded_skin_tone_split() {
     assert!(row.cells[2].is_wide_continuation());
     assert_eq!(row.cells[3].char(), 'Z', "Z stays at col 3 as it was live");
 
-    // And the VS16-widened variant folds into ONE wide cell, Z at col 2.
+    // And the VS16-widened variant folds into one wide cell, Z at col 2.
     let attrs: Rle<CellAttrs> = [CellAttrs::DEFAULT; 4].into_iter().collect();
     let line = Line::with_attrs("\u{261D}\u{FE0F}\u{1F3FD}Z", attrs);
     let row = materialize_from_line(&line, 10);
@@ -499,9 +488,7 @@ fn materialize_keeps_unfolded_skin_tone_split() {
     assert_eq!(row.cells[2].char(), 'Z');
 }
 
-// ============================================================================
-// materialize_from_line untested code paths (#4234)
-// ============================================================================
+// materialize_from_line code paths
 
 #[test]
 fn materialize_from_line_zwj_family_emoji() {
@@ -857,11 +844,9 @@ fn extract_row_extras_hyperlink_spans_use_physical_columns() {
     assert_eq!(&*s2.url, "https://second.test");
 }
 
-// ============================================================================
-// advance_grapheme_unit optimization tests (#5951)
-// ============================================================================
+// advance_grapheme_unit tests
 
-/// Mixed-content round-trip after allocation elimination (#5951).
+/// Mixed-content round-trip.
 #[test]
 fn materialize_mixed_content_allocation_free_path() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -920,7 +905,7 @@ fn materialize_mixed_content_allocation_free_path() {
     assert_eq!(row.len(), 7, "row should have 7 occupied columns");
 }
 
-/// `fill_row_from_line` round-trip with mixed content (#5951).
+/// `fill_row_from_line` round-trip with mixed content.
 #[test]
 fn fill_row_mixed_content_allocation_free_path() {
     let text = "A中🎉e\u{0301}B";
@@ -972,18 +957,10 @@ fn fill_row_mixed_content_allocation_free_path() {
     );
 }
 
-/// A rendition belongs to the CHARACTER, not to the column: a double-width
-/// character is one character in two columns, so its continuation spacer carries
-/// the lead's visual attributes.
-///
-/// Scroll-off conversion DROPS spacers (`scroll_convert::is_spacer`) and both
-/// consumers re-derive them — `materialize_from_line` for a scrolled-back read,
-/// `fill_row_from_line` for the deferred fill. Built there with a bare
-/// `WIDE_CONTINUATION`, a highlighted wide glyph would lose its right half the
-/// moment its row left the screen even after the live write path was fixed:
-/// the renderer swaps fg/bg for the lead only, and `lead.resolved_fg ==
-/// spacer.resolved_bg` for every colour pair, so the spilled half composites
-/// invisibly (measured 153/153 flat pixels per spacer, zero glyph ink).
+/// A double-width character's continuation spacer carries the lead's visual
+/// attributes. Scroll-off conversion drops spacers (`scroll_convert::is_spacer`),
+/// and both re-derivations (`materialize_from_line`, `fill_row_from_line`)
+/// rebuild them with the lead's rendition.
 #[test]
 fn line_roundtrip_carries_rendition_into_the_wide_spacer() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -995,9 +972,8 @@ fn line_roundtrip_carries_rendition_into_the_wide_spacer() {
         .union(CellFlags::UNDERLINE)
         .union(CellFlags::STRIKETHROUGH);
 
-    // Built cell-by-cell, NOT through `Row::write_wide_char`: the live write
-    // path has a spacer of its own, and this test must fail for the
-    // materialize/fill sites rather than for that one.
+    // Built cell by cell, not via `Row::write_wide_char`, so only the
+    // materialize/fill sites are under test.
     let mut grid = Grid::new(2, 8);
     grid.row_mut(0).unwrap().set(
         0,
@@ -1041,18 +1017,12 @@ fn line_roundtrip_carries_rendition_into_the_wide_spacer() {
     );
 }
 
-/// The companion law for the values the flags SELECT: the spacer must also carry
-/// the lead's SGR 58 underline colour and truecolor fg/bg, which do not fit in
-/// the flag word and live in the cell's `CellExtra`.
+/// The spacer also carries the lead's SGR 58 underline colour and truecolor
+/// fg/bg, which live in the `CellExtra`.
 ///
-/// The `Line` deliberately carries the underline span over the LEAD'S COLUMN
-/// ONLY — which is exactly the shape `extract_row_extras` produces, because it
-/// skips spacer columns, and exactly the shape already sitting in every
-/// scrollback file an older build wrote. Both re-derivation paths must colour
-/// both halves from it anyway; that is what makes this a heal rather than a
-/// format change. Without the mirror the spacer takes `wide_continuation_of`'s
-/// UNDERLINE bit and then reports no colour, which `render_cells` publishes as a
-/// default-foreground rule: a two-tone underline under one character.
+/// The `Line` carries the underline span over the lead's column only (the shape
+/// `extract_row_extras` produces, since it skips spacers); both re-derivation
+/// paths colour both halves from it.
 #[test]
 fn line_roundtrip_carries_rendition_extras_into_the_wide_spacer() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -1111,10 +1081,8 @@ fn line_roundtrip_carries_rendition_extras_into_the_wide_spacer() {
     );
 }
 
-/// An indexed SGR 58 colour must reach the spacer in its PACKED form, so it
-/// still re-resolves against the live palette. `set_underline_color_u32` clears
-/// `HAS_UNDERLINE_COLOR` when it stores an index, so a mirror that copied
-/// `underline_color()` — the RGB-only accessor — would silently carry nothing.
+/// An indexed SGR 58 colour reaches the spacer in packed form, so it still
+/// re-resolves against the live palette (`underline_color()` is RGB-only).
 #[test]
 fn wide_spacer_mirror_preserves_an_indexed_underline_colour() {
     use crate::grid::scroll_materialize::materialize_from_line;

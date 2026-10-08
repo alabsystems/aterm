@@ -7,12 +7,12 @@
 //! This crate is published into the build under the package name `log` (the
 //! directory is `crates/aterm-log-shim`; see the manifest for why the two names
 //! differ, and why this one needed a suffix) so that `[patch.crates-io]` can
-//! redirect the **twenty** third-party consumers in aterm's graph at code we
+//! redirect the **fourteen** third-party consumers in aterm's graph at code we
 //! own. It replaces `log 0.4.32` — 6,286 lines of Rust in the package, 5,698 of
 //! them under `src/` — with a six-element lattice and seven macros that do
 //! nothing at all.
 //!
-//! # The consumers, all twenty, per cell
+//! # The consumers, all fourteen, per cell
 //!
 //! The brief this crate was built from named seven. Re-derived here — and the
 //! re-derivation is the point, because eight of them are absent from the mac
@@ -20,35 +20,24 @@
 //! backends that use `log` hardest cfg'd out:
 //!
 //! ```text
-//! cargo tree -e all --workspace --target <cell> --depth 2 \
-//!   -i 'https://github.com/rust-lang/crates.io-index#log@0.4.32'
+//! cargo tree -e all --workspace --target <cell> --depth 2 -i log
 //! ```
 //!
-//! THE SOURCE-QUALIFIED SPEC IS REQUIRED, and the bare `-i log` that reads more
-//! naturally is a TRAP. Once this crate exists, the workspace holds two packages
-//! named `log` — this path member and the registry copy — so `-i log` is
-//! ambiguous; cargo resolves it to the member, which nothing depends on, and
-//! prints NOTHING AT ALL rather than an error. A reviewer who runs the short
-//! form sees an empty consumer list and concludes the package already left the
-//! graph. It has not: until the `[patch.crates-io]` row lands, every consumer
-//! below still resolves to the registry copy, and the command above shows them.
+//! The root `[patch.crates-io]` row is live, so the lock holds exactly one
+//! `log` — this path member — and every consumer below resolves to it.
 //!
 //! * **all four cells** (mac-arm, windows-msvc, linux-gnu, wasm32) — `naga`,
-//!   `wgpu`, `wgpu-core`, `wgpu-hal`, `wgpu-types`, `rustybuzz`,
-//!   `rustls-platform-verifier`, and through `[dev-dependencies]` of
-//!   `aterm-bench` / `aterm-render`: `alacritty_terminal`, `termwiz`, `vte`,
-//!   `wezterm-bidi`, `wezterm-dynamic`
+//!   `wgpu`, `wgpu-core`, `wgpu-hal`, `wgpu-types`, `rustybuzz`
 //! * **windows + linux** — `gpu-allocator`
 //! * **linux only** — `calloop`, `sctk-adwaita`, `smithay-client-toolkit`,
 //!   `tiny-skia`, `wayland-sys`, `xkbcommon-dl`
 //! * **windows build-dependency** — `gl_generator` (under `glutin_wgl_sys`),
 //!   the graph's only `#[macro_use] extern crate log;`
 //!
-//! `-e all`, not `-e normal`: the five dev-dependency consumers contribute 146
-//! macro sites and the only match-arm and tail-expression forms in the census,
-//! and a `-e normal` census does not see one of them. `--depth 2`, not
-//! `--depth 1`: `-e all` prints a feature tree, so the package rows are one
-//! level further down than the `-e normal` form.
+//! `-e all`, not `-e normal`: a consumer reached only through a dev or build
+//! edge (`gl_generator` is one) is invisible to a `-e normal` census.
+//! `--depth 2`, not `--depth 1`: `-e all` prints a feature tree, so the package
+//! rows are one level further down than the `-e normal` form.
 //!
 //! # Why a no-op is *correct*, and why that is proved rather than argued
 //!
@@ -67,7 +56,7 @@
 //!    added to any workspace crate's `[dev-dependencies]` would keep the narrow
 //!    count at 0 while this shim silently blanked that test's output.
 //! 2. **Nothing calls `log::set_logger` or `log::set_max_level`.** Grepped
-//!    across all twenty consumer source trees: zero hits for `set_logger`,
+//!    across all fourteen consumer source trees: zero hits for `set_logger`,
 //!    `set_boxed_logger` and `impl Log for`. Every `set_max_level` in the
 //!    workspace is `aterm_log::set_max_level` — a *different crate*, which is
 //!    the whole subject of the "why not delegate" section below.
@@ -105,8 +94,7 @@
 //!   `log_enabled!`
 //!
 //! A future consumer writing `log!(compute_level(), …)` would lose that call.
-//! `tests/consumer_forms.rs` pins the delta explicitly rather than leaving it to
-//! be discovered, and the five level macros have **no** delta at all: upstream
+//! The five level macros have **no** delta at all: upstream
 //! passes them a constant `Level::Error`, so there was never anything to read.
 //!
 //! # The corollary: installing a logger means retiring this shim
@@ -129,7 +117,7 @@
 //!
 //! aterm already ships a first-party logging facade with `Level`, `LevelFilter`,
 //! `Metadata`, `Record`, `Log`, `set_logger`, `set_max_level` and `max_level` —
-//! `crates/aterm-log`, which fifteen workspace crates depend on. The extraction
+//! `crates/aterm-log`, which fourteen workspace crates depend on. The extraction
 //! wave's default is to delegate to code like that rather than rewrite it. This
 //! target is the exception, and the exception is wide enough to swallow the
 //! rule. Four measured reasons, worst first:
@@ -148,13 +136,13 @@
 //!    The first three build the `vk::DebugUtilsMessageSeverityFlagsEXT` bitmask
 //!    handed to the Vulkan driver. All four are `false` today because
 //!    upstream's global is `Off`. `aterm_log`'s global is **not** `Off`:
-//!    `crates/aterm/src/main.rs` sets `Info` and
-//!    `crates/aterm-gui/src/watchdog.rs` sets `Trace`. A `max_level()` that
+//!    `crates/aterm-gui/src/logging.rs` (`install_file_logger`) sets `Info`
+//!    unless the dev `ATERM_LOG` seam says otherwise. A `max_level()` that
 //!    forwarded there would switch VERBOSE / INFO / WARNING severities on in
 //!    the validation callback — extra driver callbacks, extra allocations, per
 //!    frame — on the two cells that cannot be compiled or run on the machine
 //!    that develops this. So [`max_level`] reads **this crate's own static**,
-//!    which nothing in this crate writes, and `tests/consumer_forms.rs` pins it.
+//!    which nothing in this crate writes.
 //! 2. **`Display for Level` would silently change formatting.** Upstream is
 //!    `fmt.pad(self.as_str())` (log-0.4.32/src/lib.rs:528-530), which honours
 //!    width, alignment and precision. `aterm_log`'s is `f.write_str("WARN")`,
@@ -197,7 +185,7 @@
 //! `RecordBuilder`, `Metadata`, `MetadataBuilder`, `set_logger`,
 //! `set_boxed_logger`, `set_max_level`, `logger()`, `SetLoggerError`,
 //! `STATIC_MAX_LEVEL`, `kv`, `__private_api`. None is named anywhere in the
-//! twenty consumer trees (grepped: zero hits for `__private_api`, `log::kv`,
+//! fourteen consumer trees (grepped: zero hits for `__private_api`, `log::kv`,
 //! `kv::Source`, `STATIC_MAX_LEVEL`, `set_logger`, `set_boxed_logger`,
 //! `impl Log for`, `log::Record`, `log::Metadata`). Exporting no-op versions
 //! would be worse than omitting them: a consumer that called `set_logger` would
@@ -241,26 +229,16 @@
 //!
 //! macOS resolves `wgpu-hal` to `default, metal, portable-atomic` — no dx12, no
 //! gles, no vulkan. So a local build reaches the five LEVEL macros in bulk
-//! (naga, rustybuzz, and, under `cargo test`, the five dev-dependency
-//! consumers) and, of the hard forms, only naga's three `log!` sites and its one
+//! (naga, rustybuzz) and, of the hard forms, only naga's three `log!` sites and its one
 //! `log_enabled!`. Invisible here: all seven wgpu-hal `log!` sites, all four
 //! `max_level()` sites, the `const &[(&str, log::Level)]` array, the five
 //! `level == log::Level::…` comparisons, gpu-allocator's glob and its two
 //! raw-string `log!`s, smithay's eighteen `target:` forms, and gl_generator's
 //! `#[macro_use] extern crate log;`.
 //!
-//! `tests/consumer_forms.rs` is therefore the deliverable, not an extra: every
-//! invocation form in the twenty consumer trees, copied verbatim with a comment
-//! naming its file and line. Compiling it *is* the proof that this surface
-//! accepts what the real consumers write. It also carries the transcribed table
-//! oracle (see the manifest's `[dev-dependencies]` comment for why a live
-//! differential is structurally impossible for a `[patch.crates-io]` target) and
-//! the armed tripwires for the zero-evaluation claim.
+//! ## A real patch, run
 //!
-//! ## The one piece of evidence that is not transcription: a real patch, run
-//!
-//! `tests/consumer_forms.rs` proves this surface accepts *copies* of what the
-//! consumers write. To prove it accepts what they ACTUALLY write, the shim was
+//! To prove this surface accepts what the consumers ACTUALLY write, the shim was
 //! put behind a live `[patch.crates-io]` in a throwaway workspace — outside this
 //! repo, so nothing here was touched — and the real registry sources were
 //! compiled against it. Everything reachable on this cell went green:
@@ -285,21 +263,21 @@
 //! [patch.crates-io]
 //! log = { path = "<this repo>/crates/aterm-log-shim" }
 //! EOF
-//! # plus a .cargo/config.toml carrying this repo's `-Ztrust-verify=off` table,
-//! # because a workspace outside the repo verifies strictly and drowns in
-//! # soundness-gate banners.
+//! # plus a .cargo/config.toml carrying this repo's then `-Ztrust-verify=off`
+//! # table, because a workspace outside the repo verifies strictly and drowns in
+//! # soundness-gate banners. To repeat it today, name the lane instead
+//! # (`targo --unverified check`): the repo's config carries no off-switch since
+//! # 2026-10-07.
 //! cargo check      # => 0 errors
 //! ```
 //!
-//! `cargo tree -i log` confirms the patch took there (in THAT workspace the
-//! name is unambiguous, because the patch leaves exactly one `log`; here it is
-//! not — see the trap noted above). The single `log v0.4.32` node is
-//! the path to this directory, and NAGA 29.0.3 — the crate carrying three of
+//! `cargo tree -i log` confirms the patch took there. The single
+//! `log v0.4.32` node is the path to this directory, and NAGA 29.0.3 — the crate carrying three of
 //! the twelve `log!` sites, the graph's only `log_enabled!`, and `log::Level` in
-//! a closure parameter type — compiles from scratch against it. That is eight of
-//! the twenty consumers proved by execution rather than by copy. The other
-//! twelve are Windows-only, Linux-only, or inside `wgpu-hal` backends this cell
-//! does not build; for those, the oracle file is all the evidence there is.
+//! a closure parameter type — compiles from scratch against it, as does
+//! rustybuzz: those consumers are proved by execution rather than by copy. The
+//! rest are Windows-only, Linux-only, or inside `wgpu-hal` backends this cell
+//! does not build; for those, the per-site census in these docs is the evidence.
 //!
 //! The run also DEMONSTRATED the documented `unused_variables` divergence: the
 //! throwaway crate's own `pub fn shout(level: log::Level)`, whose `level` is
@@ -308,7 +286,7 @@
 
 #![no_std]
 // `no_std` unconditionally, and not behind the `std` feature — the same choice
-// `crates/aterm-tracing` made and for a sharper reason. Seven of the twenty
+// `crates/aterm-tracing` made and for a sharper reason. Seven of the fourteen
 // consumers are `#![no_std]` (naga, wgpu, wgpu-core, wgpu-hal, wgpu-types,
 // rustybuzz, tiny-skia) and `gpu-allocator` is
 // `#![cfg_attr(not(feature = "std"), no_std)]`; none of them enables `log/std`,
@@ -332,9 +310,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// ```
 ///
 /// Index *is* the discriminant for both enums, which is what makes
-/// [`FromStr`] a linear scan in both directions. `tests/consumer_forms.rs`
-/// asserts every entry against [`Level::as_str`] / [`LevelFilter::as_str`], so
-/// the two spellings of the same table cannot drift apart.
+/// [`FromStr`] a linear scan in both directions.
 static LOG_LEVEL_NAMES: [&str; 6] = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
 
 /// Upstream's `LEVEL_PARSE_ERROR`, transcribed from
@@ -400,11 +376,8 @@ impl Level {
     ///
     /// Written as a total match rather than upstream's
     /// `LevelFilter::from_usize(*self as usize).unwrap()`: same answer on every
-    /// input, no panic branch for the Trust verifier to carry. Reachable in the
-    /// graph only behind two `cfg`s — `rustls-platform-verifier-0.6.2`'s
-    /// `src/tests/ffi.rs:46` calls it, under
-    /// `#[cfg(any(test, feature = "ffi-testing"))] mod tests;` and then
-    /// `#[cfg(target_os = "android")]`, and `ffi-testing` is enabled on no cell.
+    /// input, no panic branch for the Trust verifier to carry. No consumer in
+    /// the graph calls it.
     #[must_use]
     #[inline]
     pub const fn to_level_filter(&self) -> LevelFilter {
@@ -421,8 +394,7 @@ impl Level {
     ///
     /// The same string the [`fmt::Display`] impl produces. Upstream indexes
     /// `LOG_LEVEL_NAMES[*self as usize]`; a total match is the same function
-    /// without the bounds check, and the test file asserts the two agree
-    /// entry-for-entry.
+    /// without the bounds check.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -478,7 +450,7 @@ impl fmt::Display for Level {
     /// `pad` honours width, alignment and precision; `write_str` ignores them.
     /// `format!("{:>7}", Level::Warn)` is `"   WARN"` here and upstream, and
     /// would be `"WARN"` through `aterm_log`. Transcribed from
-    /// `log-0.4.32/src/lib.rs:528-530`; pinned in `tests/consumer_forms.rs`.
+    /// `log-0.4.32/src/lib.rs:528-530`.
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.pad(self.as_str())
     }
@@ -616,7 +588,7 @@ impl FromStr for LevelFilter {
     /// Upstream's semantics exactly (`log-0.4.32/src/lib.rs:665-676`): ASCII
     /// case-insensitive, no trimming, and `"off"` IS accepted — the scan starts
     /// at index 0. That asymmetry with [`Level::from_str`] is deliberate
-    /// upstream and is pinned in `tests/consumer_forms.rs`.
+    /// upstream.
     fn from_str(level: &str) -> Result<Self, Self::Err> {
         for (idx, name) in LOG_LEVEL_NAMES.iter().enumerate() {
             if name.eq_ignore_ascii_case(level) {
@@ -726,7 +698,7 @@ const fn level_filter_from_usize(u: usize) -> Option<LevelFilter> {
 //                   `aterm-log` dependency the manifest currently omits, and
 //                   gives up `no_std` for the seven `no_std` consumers.
 //
-// THREE THINGS THE FORWARD DECISION MUST BE MADE WITH IN VIEW, none of which is
+// TWO THINGS THE FORWARD DECISION MUST BE MADE WITH IN VIEW, neither of which is
 // visible from the diff that would make it:
 //
 // 1. It turns the four `max_level()` sites TRUE and switches on Vulkan
@@ -739,12 +711,6 @@ const fn level_filter_from_usize(u: usize) -> Option<LevelFilter> {
 //    closures have empty bodies. Forwarding makes them format and emit *inside*
 //    a `catch_unwind` on the Vulkan/D3D12 debug-callback thread — a re-entrancy
 //    path from a driver callback into aterm's own logger and its watchdog.
-// 3. Five of the twenty consumers are reached only through
-//    `[dev-dependencies]` — alacritty_terminal, termwiz, vte, wezterm-bidi,
-//    wezterm-dynamic — and they contribute 147 macro sites, 92 of them
-//    `trace!` (61 in alacritty_terminal alone). Where those crates serve as aterm's
-//    differential ORACLES, forwarding changes what a failing oracle run prints,
-//    and blanking them (today) already changes what it does not print.
 
 /// The backing global for [`max_level`], structurally identical to upstream's
 /// `MAX_LOG_LEVEL_FILTER` (`log-0.4.32/src/lib.rs:458`) — *minus the setter*.
@@ -769,8 +735,8 @@ static MAX_LOG_LEVEL_FILTER: AtomicUsize = AtomicUsize::new(0);
 /// `egl.get_configs()` loop. All four are false today because upstream's global
 /// starts at `Off` and nothing in the graph calls `log::set_max_level`.
 ///
-/// `aterm_log::max_level()` is a *different global*, and it is set: `Info` in
-/// `crates/aterm/src/main.rs`, `Trace` in `crates/aterm-gui/src/watchdog.rs`.
+/// `aterm_log::max_level()` is a *different global*, and it is set: `Info`
+/// by default in `crates/aterm-gui/src/logging.rs` (`install_file_logger`).
 /// Forwarding to it would flip all four sites on. So this reads
 /// [`MAX_LOG_LEVEL_FILTER`], which nothing writes.
 ///
@@ -871,8 +837,7 @@ macro_rules! trace {
 /// binds `let lvl = $lvl;` before its enabled-check and so evaluates the level
 /// even on a disabled callsite. All twelve `log!` sites in the graph pass a
 /// plain `Copy` local or closure parameter with no side effect (enumerated in
-/// the module docs), so the delta is unobservable today. It is pinned by a test
-/// rather than left to be rediscovered.
+/// the module docs), so the delta is unobservable today.
 ///
 /// ```
 /// use log::{log, Level};

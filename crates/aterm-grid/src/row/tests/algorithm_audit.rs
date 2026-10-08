@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 //
-// Algorithm audit tests: insert/delete chars wide character invariants,
+// Boundary tests: insert/delete chars wide character invariants,
 // len tracking edge cases, selective_clear_range len recalculation,
 // and recalculate_len_up_to boundary conditions.
 
@@ -11,8 +11,7 @@ use super::make_row;
 
 // insert_chars / delete_chars wide character invariants
 
-/// ICH (insert chars) at a position that bisects a wide character pair.
-/// Regression test for #2412.
+/// ICH at a position that bisects a wide character pair.
 #[test]
 fn insert_chars_at_wide_continuation_clears_orphan() {
     use crate::{CellFlags, PackedColor};
@@ -32,9 +31,8 @@ fn insert_chars_at_wide_continuation_clears_orphan() {
     let cell2 = row.get(2).unwrap();
     let cell3 = row.get(3).unwrap();
 
-    // After insert at the continuation position, col 2's WIDE cell has no
-    // adjacent continuation at col 3 (it shifted to col 4). The orphaned
-    // first half is cleared by wide char fixup.
+    // The continuation shifted to col 4, so col 2's orphaned WIDE head is
+    // cleared by the wide-char fixup.
     assert_eq!(
         cell2.flags() & CellFlags::WIDE,
         CellFlags::empty(),
@@ -47,8 +45,7 @@ fn insert_chars_at_wide_continuation_clears_orphan() {
     );
 }
 
-/// DCH (delete chars) removing the WIDE cell should clear the orphaned
-/// continuation. Regression test for #2412.
+/// DCH removing the WIDE cell clears the orphaned continuation.
 #[test]
 fn delete_chars_splits_wide_char_at_boundary() {
     use crate::{CellFlags, PackedColor};
@@ -70,8 +67,8 @@ fn delete_chars_splits_wide_char_at_boundary() {
 
     assert_eq!(cell0.char(), 'A', "col 0 should be unchanged");
 
-    // After delete, the WIDE_CONTINUATION from col 2 shifts to col 1.
-    // It is cleared by wide char fixup since it no longer has a preceding WIDE cell.
+    // The continuation shifts from col 2 to col 1 and, with no WIDE head before
+    // it, is cleared by the fixup.
     assert_eq!(
         cell1.flags() & CellFlags::WIDE_CONTINUATION,
         CellFlags::empty(),
@@ -85,8 +82,7 @@ fn delete_chars_splits_wide_char_at_boundary() {
     );
 }
 
-/// delete_chars removing only the continuation of a wide char
-/// should clear the orphaned WIDE cell. Regression test for #2412.
+/// delete_chars removing only the continuation clears the orphaned WIDE cell.
 #[test]
 fn delete_chars_removes_continuation_orphans_wide() {
     use crate::{CellFlags, PackedColor};
@@ -204,7 +200,7 @@ fn selective_clear_range_len_with_protected_at_end() {
     assert_eq!(row.len(), 5);
 
     // Selectively clear the entire range 0..5
-    // Should erase A, B, C, D but NOT P
+    // Should erase A, B, C, D but not P
     row.selective_clear_range(0, 5);
 
     assert_eq!(
@@ -222,7 +218,7 @@ fn selective_clear_range_len_with_protected_at_end() {
     );
 }
 
-/// selective_clear on a row where ALL cells are protected should not change len.
+/// selective_clear on a row where all cells are protected should not change len.
 #[test]
 fn selective_clear_all_protected_preserves_len() {
     use crate::{CellFlags, PackedColor};
@@ -251,7 +247,7 @@ fn selective_clear_all_protected_preserves_len() {
 
 // recalculate_len_up_to boundary conditions
 
-/// clear_range in the middle of content should NOT change len.
+/// clear_range in the middle of content should not change len.
 #[test]
 fn clear_range_middle_preserves_len() {
     let (_pages, mut row) = make_row(10);
@@ -273,7 +269,7 @@ fn clear_range_middle_preserves_len() {
     assert_eq!(row.get(9).unwrap().char(), 'J');
 }
 
-/// erase_chars in the middle of content should NOT change len.
+/// erase_chars in the middle of content should not change len.
 #[test]
 fn erase_chars_middle_preserves_len() {
     let (_pages, mut row) = make_row(10);
@@ -293,11 +289,8 @@ fn erase_chars_middle_preserves_len() {
     assert_eq!(row.get(5).unwrap().char(), 'F');
 }
 
-/// ECH of a WIDE head whose continuation is the row's LAST content cell must
-/// leave `Row::len` correct. Regression: the len-recalc guard used
-/// `end >= old_len`, which is false when the wide pair is the row's tail
-/// (old_len == end + 1), so the separately-cleared orphan continuation at
-/// index `end` (== old_len - 1) left len overstated and leaked trailing blanks.
+/// ECH of a WIDE head whose continuation is the row's last content cell leaves
+/// `Row::len` correct (the orphan cleared at `end` == old_len - 1 shrinks len).
 #[test]
 fn erase_chars_wide_head_at_tail_recalcs_len() {
     use crate::{CellFlags, PackedColor};
@@ -306,7 +299,7 @@ fn erase_chars_wide_head_at_tail_recalcs_len() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Content: A, B, then a wide char at cols 2-3. cells = A,B,WIDE,CONT; len=4.
+    // cells = A, B, WIDE, CONT; len = 4.
     row.write_char(0, 'A');
     row.write_char(1, 'B');
     row.write_wide_char(2, '\u{4E2D}', fg, bg, CellFlags::empty());
@@ -355,17 +348,9 @@ fn delete_chars_at_last_col() {
     assert_eq!(row.get(0).unwrap().char(), 'A');
 }
 
-// Row::set col+1 boundary tests
-//
-// Row::set computes `self.len = col + 1` when updating the length tracker.
-// This could overflow u16 if col == u16::MAX (65535). The overflow is
-// currently unreachable because:
-//   - cells is allocated from cols: u16, so cells.len() <= 65535
-//   - get_mut(65535) on a 65535-element vec fails (valid indices: 0..65534)
-//   - Therefore the branch containing `col + 1` is never reached for col=65535
-//
-// These tests document the invariant: writing to the last valid column
-// (cols-1) must succeed and produce len=cols without overflow.
+// Row::set boundary tests: `self.len = col + 1` cannot overflow, since rows
+// are at most PAGE_SIZE / size_of::<Cell>() columns wide. Writing the last
+// valid column yields len == cols.
 
 /// Row::set at the last valid column should update len to cols.
 #[test]
@@ -402,13 +387,8 @@ fn row_set_single_column_row() {
     assert_eq!(row.len(), 1);
 }
 
-/// Row::set at last column of a large row (8192 columns — PAGE_SIZE limit).
-/// Verifies that col + 1 arithmetic is correct at the practical maximum:
-/// cols = 8192, last valid col = 8191, len = 8191 + 1 = 8192.
-///
-/// Note: u16::MAX (65535) exceeds PAGE_SIZE and cannot be allocated.
-/// The col + 1 overflow at u16::MAX is unreachable because the page
-/// allocator rejects rows wider than PAGE_SIZE / sizeof(Cell) ≈ 8192.
+/// Row::set at the last column of an 8192-column row (the PAGE_SIZE limit)
+/// yields len == 8192.
 #[test]
 fn row_set_page_max_cols_last_valid() {
     // 8192 cells × 8 bytes = 65536 = PAGE_SIZE exactly
@@ -429,7 +409,7 @@ fn row_set_page_max_cols_last_valid() {
     );
 }
 
-/// Row::set does NOT overflow on repeated writes to the same column.
+/// Row::set does not overflow on repeated writes to the same column.
 #[test]
 fn row_set_repeated_same_column_no_len_regression() {
     let (_pages, mut row) = make_row(10);

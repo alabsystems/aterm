@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// The one-future, one-thread executor the NATIVE GPU init path runs on.
+// The one-future, one-thread executor the native GPU init path runs on.
 //
-// wgpu's adapter/device acquisition is `async` because the browser has no other
-// way to express it; natively there is no reactor, no task set and no
-// concurrency — exactly one future, driven to completion on the calling thread,
-// which is what startup wants. Retiring `pollster` for these ~40 lines removes a
-// package from the shipped graph for a surface aterm uses three times.
+// wgpu's adapter/device acquisition is `async` for the browser's sake;
+// natively there is exactly one future, driven to completion on the calling
+// thread.
 //
-// The contract, both halves of which the GPU path actually exercises:
-//   * a future that is ALREADY `Ready` on its first poll returns without ever
-//     touching the condvar (wgpu-core's `push_error_scope().pop()` resolves
-//     immediately — no GPU round trip, no event loop);
-//   * a future whose waker fires from ANOTHER thread (wgpu's device/adapter
-//     callbacks land on a driver thread) wakes this one exactly once.
+// Both cases the GPU path hits are supported:
+//   * a future already `Ready` on its first poll returns without touching the
+//     condvar (e.g. wgpu-core's `push_error_scope().pop()`);
+//   * a future whose waker fires from another thread (wgpu's driver-thread
+//     callbacks) wakes this one exactly once.
 //
-// The wake flag is CONSUMED by the waiter, not merely observed, so a wake that
-// arrives *during* a poll — before this thread reaches the wait — is not lost:
-// the next `wait()` sees the latch already set and returns immediately instead
-// of sleeping for a wake that has already happened. That is the whole race, and
-// the latch is the whole fix.
+// The waiter consumes the wake flag, so a wake that arrives during a poll,
+// before the thread reaches the wait, is not lost: the next `wait()` sees the
+// latch set and returns immediately.
 
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -80,12 +75,9 @@ impl Wake for Signal {
 
 /// Drive `fut` to completion on the calling thread and return its output.
 ///
-/// This BLOCKS. It is native-only by construction: blocking the browser's main
-/// thread is forbidden, so the wasm renderer `.await`s the same futures instead
-/// (see [`crate::GpuContext::from_instance`], which both paths share).
-///
-/// Between polls the thread sleeps on a condvar — no spinning, so an adapter
-/// request that takes a driver-load's worth of milliseconds costs no CPU.
+/// Blocks, so it is native-only; the wasm renderer awaits the same futures
+/// (see [`crate::GpuContext::from_instance`]). Between polls the thread
+/// sleeps on a condvar rather than spinning.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     // Pinned to this stack frame; `pin!` makes the future unreachable by name
     // afterwards, so it cannot be moved while polled and no `unsafe` is needed.
@@ -177,9 +169,8 @@ mod tests {
         joiner.join().expect("waker thread");
     }
 
-    /// A wake delivered from INSIDE `poll`, before the executor reaches its
-    /// wait: the latch must already be set, so the next wait returns at once
-    /// instead of sleeping forever for a wake that has been and gone.
+    /// A wake delivered inside `poll`, before the executor waits, sets the
+    /// latch, so the next wait returns at once.
     #[test]
     fn wake_during_poll_is_not_lost() {
         struct WakeThenPend(u8);
@@ -197,9 +188,8 @@ mod tests {
         assert_eq!(block_on(WakeThenPend(3)), 9);
     }
 
-    /// Several wakes before a single wait must not leave a surplus latch that
-    /// turns the NEXT park into a busy spin (the token-accounting bug a bare
-    /// `thread::park`/`unpark` pair invites).
+    /// Several wakes before one wait leave no surplus latch that would turn
+    /// the next park into a busy spin.
     #[test]
     fn surplus_wakes_collapse_to_one() {
         struct Storm(u8);

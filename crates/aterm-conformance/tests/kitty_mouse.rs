@@ -224,8 +224,6 @@ fn mouse_1000_wheel_up_is_button_64_and_shift_adds_4() {
 /// xterm ctlseqs, Mouse Tracking: the wheel block continues past 4/5 —
 /// "buttons 6 and 7" are the horizontal (tilt) wheel, event codes 66 and 67.
 /// SGR (1006) so the code is readable; a tilt-left is `CSI < 66 ; x ; y M`.
-/// This pair was UNREACHABLE before the encoder took a 4-way direction: the
-/// GUI dropped horizontal gestures and the encoder had no code to give them.
 #[test]
 fn mouse_1006_horizontal_wheel_is_buttons_66_and_67() {
     let t = term_24x80(b"\x1b[?1000h\x1b[?1006h");
@@ -268,8 +266,8 @@ fn mouse_1006_thumb_buttons_are_128_and_129() {
 
 /// xterm ctlseqs, "SGR (1006)" extended mouse mode: events are reported as
 /// `CSI < Cb ; Px ; Py M` for press and the same with final `m` for release.
-/// Unlike X10, the button code is NOT offset by 32 and the release event
-/// carries the ORIGINAL button number (the final character disambiguates),
+/// Unlike X10, the button code is not offset by 32 and the release event
+/// carries the original button number (the final character disambiguates),
 /// so applications can tell which button was released.
 #[test]
 fn mouse_1006_sgr_press_release_keeps_button() {
@@ -340,15 +338,10 @@ fn mouse_1005_utf8_two_byte_coordinate_beyond_95() {
 /// representable position is 223 (32+223 = 255); larger positions "cannot
 /// be reported" in a single byte (xterm's MOUSE_LIMIT).
 ///
-/// The FRAME, though, is not negotiable. An application that set DECSET 1000
-/// and nothing else reads a fixed six-byte `ESC [ M Cb Cx Cy` record; it has
-/// no parser for any other form. This engine used to answer an out-of-range
-/// coordinate with the SGR (1006) form — a protocol the application never
-/// enabled, whose parameter bytes an X10-only reader most likely passes
-/// through as literal input. On a terminal wider than 223 columns that turned
-/// every far-right click into typed garbage. So: CLAMP the coordinate to the
-/// representable maximum and keep the six-byte frame. Apps that need the far
-/// columns enable 1006 or 1005 themselves, and both are unlimited here.
+/// The frame is fixed: an application that set only DECSET 1000 reads six-byte
+/// `ESC [ M Cb Cx Cy` records, so an out-of-range coordinate is clamped to the
+/// maximum rather than answered in a form the app never enabled. Apps needing
+/// far columns enable 1006 or 1005, both unlimited.
 #[test]
 fn mouse_x10_coordinate_beyond_223_clamps_and_keeps_the_x10_frame() {
     let t = term_24x80(b"\x1b[?1000h"); // default X10-style encoding
@@ -364,21 +357,20 @@ fn mouse_x10_coordinate_beyond_223_clamps_and_keeps_the_x10_frame() {
         "the pre-fix SGR promotion is exactly the defect: a 1006 report the \
          application never requested"
     );
-    // Release keeps the frame too, which means the LEGACY button-3
-    // substitution the X10 form requires (no button identity in this frame —
-    // that is what enabling 1006 buys, #7473).
+    // Release keeps the frame too, with the legacy button-3 substitution the
+    // X10 form requires (no button identity; 1006 provides that).
     assert_eq!(
         t.encode_mouse_release(0, 300, 5, 0),
         Some(vec![0x1b, b'[', b'M', 32 + 3, 255, 38])
     );
-    // Boundary: 0-based col 222 -> 1-based 223 is the LAST single-byte
+    // Boundary: 0-based col 222 -> 1-based 223 is the last single-byte
     // position (32+223 = 255) and is byte-identical to the clamped form.
     assert_eq!(
         t.encode_mouse_press(0, 222, 5, 0),
         Some(vec![0x1b, b'[', b'M', 32, 255, 38]),
         "1-based 223 encodes as byte 255 — the X10 maximum"
     );
-    // Negative control: an app that DOES enable 1006 gets the true coordinate.
+    // Negative control: an app that does enable 1006 gets the true coordinate.
     let sgr = term_24x80(b"\x1b[?1000h\x1b[?1006h");
     assert_eq!(
         sgr.encode_mouse_press(0, 300, 5, 0).as_deref(),
@@ -392,7 +384,7 @@ fn mouse_x10_coordinate_beyond_223_clamps_and_keeps_the_x10_frame() {
 // =========================================================================
 
 /// xterm ctlseqs, "Button-event tracking" (DECSET 1002): motion is reported
-/// ONLY while a button is down, with 32 added to the button code (left drag
+/// only while a button is down, with 32 added to the button code (left drag
 /// Cb = 0+32 -> byte 32+32 = 64). Motion with no button held (X10 "button"
 /// 3) must report nothing under 1002.
 #[test]

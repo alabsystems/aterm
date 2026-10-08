@@ -5,11 +5,10 @@
 //!
 //! Scope is set by what the title-summary worker actually does: one request per
 //! connection, a known-length body, `Connection: close`, and NO redirect
-//! following (the retired client was configured `max_redirects(0)`, and a
-//! summary endpoint that redirects is a misconfiguration, not something to
-//! chase — chasing it is how a bearer token reaches a host the operator never
-//! named). There is no connection pool and no HTTP/2, because one bounded
-//! worker making one call at a time needs neither.
+//! following (a summary endpoint that redirects is a misconfiguration, and
+//! chasing it is how a bearer token reaches a host the operator never named).
+//! There is no connection pool and no HTTP/2, because one bounded worker
+//! making one call at a time needs neither.
 //!
 //! # Hardening
 //!
@@ -21,18 +20,23 @@
 //!   drive this process into swap by streaming forever.
 //! * The header block is bounded too: an endpoint that never stops sending
 //!   headers hits [`MAX_HEADER_BYTES`] instead of growing a buffer without end.
-//! * `Content-Length` and `Transfer-Encoding: chunked` arriving TOGETHER is a
+//! * `Content-Length` and `Transfer-Encoding` arriving TOGETHER is a
 //!   request-smuggling signature and is rejected outright, and so is every
 //!   other response whose end is ambiguous: duplicate `Content-Length` headers
-//!   that disagree, and a length that is not `1*DIGIT` (`decide_framing`).
+//!   that disagree, a length that is not `1*DIGIT`, and a transfer coding other
+//!   than exactly `chunked` (`decide_framing`, RFC 9112 §6.3).
+//! * Interim 1xx responses are read past to the final one (`read_head`, RFC
+//!   9110 §15.2), on the CONNECT exchange as on every other.
 //! * An unusable endpoint is refused WITHOUT echoing it, since the one shape
-//!   the URI policy exists to refuse (userinfo) carries a credential.
+//!   the URI policy exists to refuse (userinfo) carries a credential. An
+//!   unusable proxy setting fails the request the same way, naming its variable
+//!   ([`crate::proxy`]); it never falls back to a direct connection.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::proxy::{self, EnvSource, ProcessEnv, ProxyMode};
+use crate::proxy::{self, EnvSource, ProcessEnv, ProxyMode, ProxyTarget};
 use crate::stream::{Connect, Deadline, Guard, Stream, TcpConnector};
 use crate::tls::{self, Trust};
 use crate::uri::{Scheme, Uri};
@@ -272,7 +276,7 @@ impl RequestBuilder<'_> {
         let guard: Arc<dyn Guard> = self
             .guard
             .unwrap_or_else(|| Arc::new(crate::stream::AlwaysAuthorized));
-        let via = proxy::resolve(self.client.proxy_mode, &target, env);
+        let via = proxy::resolve(self.client.proxy_mode, &target, env)?;
 
         let mut stream = self.client.open(&target, via.as_ref(), &guard, deadline)?;
         let head = render_request(
@@ -295,12 +299,14 @@ impl Client {
     fn open(
         &self,
         target: &Uri,
-        via: Option<&Uri>,
+        via: Option<&ProxyTarget>,
         guard: &Arc<dyn Guard>,
         deadline: Deadline,
     ) -> Result<Stream, Error> {
+        // A `ProxyTarget` is always a plain `http://` proxy (`proxy::resolve`
+        // refuses an `https://` one), so plaintext to it is what it speaks.
         let (host, port) = match via {
-            Some(p) => (p.host().to_owned(), p.port()),
+            Some(p) => (p.uri().host().to_owned(), p.uri().port()),
             None => (target.host().to_owned(), target.port()),
         };
         let tcp = self.connector.connect(&host, port, deadline)?;
@@ -310,9 +316,9 @@ impl Client {
             (Scheme::Http, _) => Ok(Stream::plain(tcp, Arc::clone(guard), deadline)),
             // HTTPS through a proxy: CONNECT first, then handshake against the
             // ORIGIN name so the proxy cannot substitute its own certificate.
-            (Scheme::Https, Some(_)) => {
+            (Scheme::Https, Some(proxy)) => {
                 let mut plain = Stream::plain(tcp, Arc::clone(guard), deadline);
-                connect_tunnel(&mut plain, target)?;
+                connect_tunnel(&mut plain, target, proxy.basic_auth())?;
                 let tcp = plain
                     .into_tcp()
                     .ok_or_else(|| Error::Protocol("proxy tunnel lost its socket".to_owned()))?;
@@ -343,45 +349,52 @@ impl Client {
     }
 }
 
-/// Issue `CONNECT host:port` and require a 2xx before handing the socket to TLS.
-fn connect_tunnel(stream: &mut Stream, target: &Uri) -> Result<(), Error> {
+/// Issue `CONNECT host:port`, with the proxy's Basic credential when it has
+/// one, and require a 2xx before handing the socket to TLS.
+fn connect_tunnel(
+    stream: &mut Stream,
+    target: &Uri,
+    basic_auth: Option<&str>,
+) -> Result<(), Error> {
     let authority = target.authority();
-    let request = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    let mut request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n"
     );
+    if let Some(credential) = basic_auth {
+        request.push_str(&format!("Proxy-Authorization: Basic {credential}\r\n"));
+    }
+    request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
     // Read the tunnel response UNBUFFERED, one byte at a time. A BufReader here
     // would read past the blank line and swallow the first bytes of the peer's
     // TLS ServerHello into a buffer that is dropped with it — the handshake
-    // would then stall on data that had already arrived.
-    let status = read_status_line(stream)?;
-    let mut consumed = 0usize;
-    loop {
-        let line = read_line(stream, &mut consumed)?;
-        if line.is_empty() {
-            break;
-        }
-    }
-    if !(200..300).contains(&status.code) {
+    // would then stall on data that had already arrived. The head is read by
+    // the same `read_head` as every other response, interim 1xx included; a
+    // 2xx's framing headers are ignored, as RFC 9110 §9.3.6 requires.
+    let head = read_head(stream)?;
+    if !(200..300).contains(&head.code) {
         return Err(Error::Protocol(format!(
             "proxy refused CONNECT with status {}",
-            status.code
+            head.code
         )));
     }
     Ok(())
 }
 
 /// Render the request head. The target is origin-form normally, absolute-form
-/// when speaking plain HTTP to a proxy (RFC 9112 §3.2.2).
+/// when speaking plain HTTP to a proxy (RFC 9112 §3.2.2), and only then does
+/// the head carry the proxy's credential: inside a `CONNECT` tunnel the origin
+/// reads every header.
 fn render_request(
     method: &str,
     target: &Uri,
-    via: Option<&Uri>,
+    via: Option<&ProxyTarget>,
     headers: &[(String, String)],
     body_len: usize,
 ) -> String {
-    let request_target = if via.is_some() && target.scheme() == Scheme::Http {
+    let absolute_via = via.filter(|_| target.scheme() == Scheme::Http);
+    let request_target = if absolute_via.is_some() {
         format!(
             "{}://{}{}",
             target.scheme().as_str(),
@@ -393,6 +406,9 @@ fn render_request(
     };
     let mut head = format!("{method} {request_target} HTTP/1.1\r\n");
     head.push_str(&format!("Host: {}\r\n", target.host_header()));
+    if let Some(credential) = absolute_via.and_then(ProxyTarget::basic_auth) {
+        head.push_str(&format!("Proxy-Authorization: Basic {credential}\r\n"));
+    }
     // One request per connection: no pool to keep warm, and an explicit close
     // makes the response's end unambiguous.
     head.push_str("Connection: close\r\n");
@@ -417,8 +433,14 @@ fn render_request(
 }
 
 /// Headers [`render_request`] emits itself; a caller cannot override or
-/// duplicate one.
-const GENERATED_HEADERS: &[&str] = &["host", "content-length", "connection"];
+/// duplicate one. The proxy credential is the proxy URL's alone: one a caller
+/// set would duplicate it, or ride a tunnel to the origin.
+const GENERATED_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "connection",
+    "proxy-authorization",
+];
 
 /// Reject a header whose name or value could terminate the header block early.
 fn validate_header(name: &str, value: &str) -> Result<(), Error> {
@@ -477,8 +499,10 @@ impl Response {
     }
 }
 
-struct StatusLine {
+/// A final response head: its status and its header fields.
+struct Head {
     code: u16,
+    headers: Vec<(String, String)>,
 }
 
 /// Read one CRLF-terminated line, enforcing the header-block budget.
@@ -511,9 +535,23 @@ fn read_line<R: Read>(reader: &mut R, consumed: &mut usize) -> Result<String, Er
     String::from_utf8(raw).map_err(|_| Error::Protocol("header line is not UTF-8".to_owned()))
 }
 
-fn read_status_line<R: Read>(reader: &mut R) -> Result<StatusLine, Error> {
-    let mut consumed = 0usize;
-    let line = read_line(reader, &mut consumed)?;
+/// A number in HTTP's own grammar — `1*DIGIT` (radix 10) or `1*HEXDIG` (radix
+/// 16) — and nothing else. Rust's integer parsers also take a leading `+`,
+/// which none of HTTP's number grammars allow, so EVERY number read off the
+/// wire (status code, `Content-Length`, chunk size) goes through here rather
+/// than straight to `from_str_radix`. Overflow is `None` too.
+fn parse_http_number(text: &str, radix: u32) -> Option<usize> {
+    if text.is_empty() || !text.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    usize::from_str_radix(text, radix).ok()
+}
+
+/// The status code of one status line. RFC 9112 §4 makes it exactly `3DIGIT`
+/// and RFC 9110 §15 puts it in 100..=599; `u16::from_str` alone would also take
+/// `+200`, `0200` and `65535`.
+fn read_status_line<R: Read>(reader: &mut R, consumed: &mut usize) -> Result<u16, Error> {
+    let line = read_line(reader, consumed)?;
     let mut parts = line.splitn(3, ' ');
     let version = parts
         .next()
@@ -521,11 +559,61 @@ fn read_status_line<R: Read>(reader: &mut R) -> Result<StatusLine, Error> {
     if !version.starts_with("HTTP/1.") {
         return Err(Error::Protocol(format!("unsupported version {version:?}")));
     }
-    let code = parts
+    parts
         .next()
-        .and_then(|c| c.parse::<u16>().ok())
-        .ok_or_else(|| Error::Protocol(format!("unparseable status line {line:?}")))?;
-    Ok(StatusLine { code })
+        .filter(|code| code.len() == 3)
+        .and_then(|code| parse_http_number(code, 10))
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (100..=599).contains(code))
+        .ok_or_else(|| Error::Protocol(format!("unparseable status line {line:?}")))
+}
+
+/// The header fields up to the empty line that ends a head.
+fn read_header_fields<R: Read>(
+    reader: &mut R,
+    consumed: &mut usize,
+) -> Result<Vec<(String, String)>, Error> {
+    let mut headers = Vec::new();
+    loop {
+        let line = read_line(reader, consumed)?;
+        if line.is_empty() {
+            return Ok(headers);
+        }
+        if headers.len() >= MAX_HEADER_COUNT {
+            return Err(Error::Protocol("too many response headers".to_owned()));
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| Error::Protocol(format!("header without a colon: {line:?}")))?;
+        headers.push((name.trim().to_owned(), value.trim().to_owned()));
+    }
+}
+
+/// Read the FINAL response head, skipping every interim (1xx) one before it.
+///
+/// RFC 9110 §15.2: a client MUST be able to parse one or more 1xx responses
+/// before the final one, even when it did not ask for any — a server may answer
+/// every POST with `100 Continue`, or send `103 Early Hints` — and each of them
+/// ends at its empty line (RFC 9112 §6.3). Taking the first head as THE
+/// response hands the caller a 1xx status with the real response as its "body",
+/// and makes a proxy's CONNECT look refused. `101 Switching Protocols` is no
+/// interim response here: this client never asks to upgrade. Every head shares
+/// ONE [`MAX_HEADER_BYTES`] budget, so a peer cannot stream 1xx heads forever.
+fn read_head<R: Read>(reader: &mut R) -> Result<Head, Error> {
+    let mut consumed = 0usize;
+    loop {
+        let code = read_status_line(reader, &mut consumed)?;
+        let headers = read_header_fields(reader, &mut consumed)?;
+        match code {
+            101 => {
+                return Err(Error::Protocol(
+                    "unrequested 101 Switching Protocols".to_owned(),
+                ));
+            }
+            100..=199 => {}
+            _ => return Ok(Head { code, headers }),
+        }
+    }
 }
 
 /// Read status line, headers and body from `stream`.
@@ -537,24 +625,9 @@ fn read_response(stream: Stream, limit: usize) -> Result<Response, Error> {
 /// in-memory bytes the unit tests feed it, so both run ONE framing path rather
 /// than the tests exercising a copy that could drift from what ships.
 fn read_response_from<R: BufRead>(reader: &mut R, limit: usize) -> Result<Response, Error> {
-    let status = read_status_line(reader)?;
-    let mut consumed = 0usize;
-    let mut headers = Vec::new();
-    loop {
-        let line = read_line(reader, &mut consumed)?;
-        if line.is_empty() {
-            break;
-        }
-        if headers.len() >= MAX_HEADER_COUNT {
-            return Err(Error::Protocol("too many response headers".to_owned()));
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| Error::Protocol(format!("header without a colon: {line:?}")))?;
-        headers.push((name.trim().to_owned(), value.trim().to_owned()));
-    }
-
-    let body = match decide_framing(&headers)? {
+    let Head { code, headers } = read_head(reader)?;
+    let body = match decide_framing(code, &headers)? {
+        Framing::Empty => Vec::new(),
         Framing::Chunked => read_chunked(reader, limit)?,
         Framing::Length(declared) => {
             if declared > limit {
@@ -568,7 +641,7 @@ fn read_response_from<R: BufRead>(reader: &mut R, limit: usize) -> Result<Respon
         Framing::ToEof => read_to_limit(reader, limit)?,
     };
     Ok(Response {
-        status: status.code,
+        status: code,
         headers,
         body,
     })
@@ -578,6 +651,8 @@ fn read_response_from<R: BufRead>(reader: &mut R, limit: usize) -> Result<Respon
 /// body whose end two parties disagree about is the whole smuggling class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Framing {
+    /// No content: the response ends at its header block (1xx, 204, 304).
+    Empty,
     /// `Transfer-Encoding: chunked`.
     Chunked,
     /// `Content-Length`, already parsed and agreed across duplicates.
@@ -586,16 +661,22 @@ enum Framing {
     ToEof,
 }
 
-/// Resolve the response framing, refusing every ambiguous combination.
+/// Resolve the response framing (RFC 9112 §6.3), refusing every ambiguous
+/// combination.
 ///
-/// Rejected: chunked and `Content-Length` together (the smuggling signature),
-/// duplicate `Content-Length` headers that disagree, and a length that is not
-/// `1*DIGIT` per RFC 9112 — Rust's `usize` parser accepts a leading `+`, which
-/// the grammar does not, so the digits are checked before parsing. EVERY
-/// `Transfer-Encoding` header is read, not only the first: a peer that sends
-/// `gzip` in one header and `chunked` in the next is still framing the body as
-/// chunked, and taking the first alone would read it as unframed.
-fn decide_framing(headers: &[(String, String)]) -> Result<Framing, Error> {
+/// A 1xx, 204 or 304 response ends at its header block WHATEVER framing
+/// headers it carries (rule 1; a 304 may name the length of the representation
+/// it did not send). Otherwise rejected: `Transfer-Encoding` and
+/// `Content-Length` together, whatever the coding (rule 3: the transfer coding
+/// overrides the length, and the pair is the smuggling signature), duplicate
+/// `Content-Length` headers that disagree, a length that is not `1*DIGIT`
+/// ([`parse_http_number`]), and any transfer coding list other
+/// than exactly `chunked`. This client decodes chunked and nothing else: a
+/// non-final chunked does not frame the body at all (rule 4), and any other
+/// coding would leave the caller holding coded bytes it takes for the content.
+/// EVERY `Transfer-Encoding` header is read, not only the first: `gzip` in one
+/// header and `chunked` in the next is the list `gzip, chunked`.
+fn decide_framing(status: u16, headers: &[(String, String)]) -> Result<Framing, Error> {
     /// EVERY value under `name`, not just the first — duplicates are the point.
     fn values<'a>(headers: &'a [(String, String)], name: &'a str) -> impl Iterator<Item = &'a str> {
         headers
@@ -603,21 +684,31 @@ fn decide_framing(headers: &[(String, String)]) -> Result<Framing, Error> {
             .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
-    let chunked = values(headers, "transfer-encoding").any(|v| {
-        v.split(',')
-            .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
-    });
+    if matches!(status, 100..=199 | 204 | 304) {
+        return Ok(Framing::Empty);
+    }
+    let transfer_encoded = values(headers, "transfer-encoding").next().is_some();
+    // The codings in order across every header, empty list elements dropped
+    // (RFC 9110 §5.6.1). Exactly one, `chunked`, is the one list decoded here.
+    let mut codings = values(headers, "transfer-encoding")
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let only_chunked = codings
+        .next()
+        .is_some_and(|t| t.eq_ignore_ascii_case("chunked"))
+        && codings.next().is_none();
 
     let mut declared: Option<usize> = None;
     for text in values(headers, "content-length") {
-        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(Error::Protocol(format!(
-                "Content-Length is not 1*DIGIT: {text:?}"
-            )));
-        }
-        let parsed = text
-            .parse::<usize>()
-            .map_err(|_| Error::Protocol(format!("unparseable Content-Length {text:?}")))?;
+        let parsed = parse_http_number(text, 10).ok_or_else(|| {
+            let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+            Error::Protocol(if digits {
+                format!("Content-Length {text:?} is too large")
+            } else {
+                format!("Content-Length is not a decimal byte count: {text:?}")
+            })
+        })?;
         // Repeating the SAME value is legal and harmless; repeating a different
         // one leaves two parties disagreeing about where this response ends.
         match declared {
@@ -630,16 +721,21 @@ fn decide_framing(headers: &[(String, String)]) -> Result<Framing, Error> {
         }
     }
 
+    if !transfer_encoded {
+        return Ok(declared.map_or(Framing::ToEof, Framing::Length));
+    }
     // Both framings at once is the request-smuggling signature. Refuse.
-    if chunked && declared.is_some() {
+    if declared.is_some() {
         return Err(Error::Protocol(
-            "response carries both Content-Length and chunked Transfer-Encoding".to_owned(),
+            "response carries both Content-Length and Transfer-Encoding".to_owned(),
         ));
     }
-    if chunked {
-        return Ok(Framing::Chunked);
+    if !only_chunked {
+        return Err(Error::Protocol(
+            "response uses a transfer coding other than chunked".to_owned(),
+        ));
     }
-    Ok(declared.map_or(Framing::ToEof, Framing::Length))
+    Ok(Framing::Chunked)
 }
 
 /// Read to EOF, erroring rather than truncating past `limit`.
@@ -664,10 +760,15 @@ fn read_chunked<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, Error>
     let mut header_budget = 0usize;
     loop {
         let line = read_line(reader, &mut header_budget)?;
-        // A chunk-size line may carry `;ext` parameters.
-        let size_text = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|_| Error::Protocol(format!("unparseable chunk size {size_text:?}")))?;
+        // A chunk-size line may carry `;ext` parameters, and BWS before the
+        // first `;` (RFC 9112 §7.1.1) — but nothing before the size itself.
+        let size_text = line
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches([' ', '\t']);
+        let size = parse_http_number(size_text, 16)
+            .ok_or_else(|| Error::Protocol(format!("unparseable chunk size {size_text:?}")))?;
         if size == 0 {
             // Trailer section, then done.
             let mut trailer_budget = 0usize;
@@ -710,8 +811,15 @@ fn read_chunked<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, Error>
 mod tests {
     use super::*;
 
+    /// A wait for something that must happen is a hang detector, never a latency budget.
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
     fn uri(text: &str) -> Uri {
         Uri::parse(text).unwrap()
+    }
+
+    fn proxy(text: &str) -> ProxyTarget {
+        proxy::parse_proxy("HTTPS_PROXY", text).unwrap()
     }
 
     /// TCP reads may stop anywhere in the head or body. Drain the declared
@@ -749,12 +857,8 @@ mod tests {
         let endpoint = format!("http://{}/request", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
+            stream.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
+            stream.set_write_timeout(Some(HANG_DETECTOR)).unwrap();
             let body = read_plain_request(&mut stream);
             stream.write_all(response).unwrap();
             body
@@ -853,11 +957,7 @@ mod tests {
             plain_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         // This trust input is intentionally unusable. The HTTP request must
         // still succeed because only HTTPS is allowed to touch the lazy cache.
-        let client = Client::new(
-            Trust::Roots(Vec::new()),
-            ProxyMode::Direct,
-            Duration::from_secs(2),
-        );
+        let client = Client::new(Trust::Roots(Vec::new()), ProxyMode::Direct, HANG_DETECTOR);
         let response = client.post(&endpoint).send(b"{}").unwrap();
         assert_eq!(server.join().unwrap(), b"{}");
         assert_eq!(response.body(), b"ok");
@@ -885,12 +985,51 @@ mod tests {
         let head = render_request(
             "POST",
             &uri("http://api.test/v1/x"),
-            Some(&uri("http://proxy.test:3128")),
+            Some(&proxy("http://proxy.test:3128")),
             &[],
             0,
         );
         assert!(
             head.starts_with("POST http://api.test/v1/x HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(!head.contains("Proxy-Authorization"), "{head}");
+    }
+
+    #[test]
+    fn the_proxy_credential_rides_the_absolute_form_and_never_the_tunnel() {
+        let via = proxy("http://alice:s3cret@proxy.test:3128");
+        // A caller's own Proxy-Authorization is dropped in both shapes: it
+        // would duplicate the proxy URL's, or reach the origin.
+        let caller = [(
+            "proxy-authorization".to_owned(),
+            "Basic Y2FsbGVy".to_owned(),
+        )];
+        let head = render_request("POST", &uri("http://api.test/v1/x"), Some(&via), &caller, 0);
+        // base64("alice:s3cret"), exactly once.
+        assert_eq!(
+            head.matches("Proxy-Authorization: Basic YWxpY2U6czNjcmV0\r\n")
+                .count(),
+            1,
+            "{head}"
+        );
+        assert_eq!(
+            head.to_ascii_lowercase()
+                .matches("proxy-authorization:")
+                .count(),
+            1,
+            "{head}"
+        );
+        // Inside a CONNECT tunnel the origin reads the head: no credential.
+        let head = render_request(
+            "POST",
+            &uri("https://api.test/v1/x"),
+            Some(&via),
+            &caller,
+            0,
+        );
+        assert!(
+            !head.to_ascii_lowercase().contains("proxy-authorization"),
             "{head}"
         );
     }
@@ -902,7 +1041,7 @@ mod tests {
         let head = render_request(
             "POST",
             &uri("https://api.test/v1/x"),
-            Some(&uri("http://proxy.test:3128")),
+            Some(&proxy("http://proxy.test:3128")),
             &[],
             0,
         );
@@ -963,10 +1102,8 @@ mod tests {
     }
 
     fn parse(raw: &[u8], limit: usize) -> Result<Response, Error> {
-        // Drive the SAME parser read_response runs on a live socket, over an
-        // in-memory reader. (This used to re-implement the framing decision
-        // inline, so a framing defect in the shipped path could not redden
-        // these tests.)
+        // The SAME parser read_response runs on a live socket, over an
+        // in-memory reader.
         read_response_from(&mut BufReader::new(raw), limit)
     }
 
@@ -981,37 +1118,39 @@ mod tests {
     fn framing_refuses_every_response_whose_end_is_ambiguous() {
         // One function owns this decision because a body whose end two parties
         // disagree about IS the smuggling class.
-        assert_eq!(decide_framing(&headers(&[])).unwrap(), Framing::ToEof);
+        assert_eq!(decide_framing(200, &headers(&[])).unwrap(), Framing::ToEof);
         assert_eq!(
-            decide_framing(&headers(&[("Content-Length", "7")])).unwrap(),
+            decide_framing(200, &headers(&[("Content-Length", "7")])).unwrap(),
             Framing::Length(7)
         );
         assert_eq!(
-            decide_framing(&headers(&[("Transfer-Encoding", "chunked")])).unwrap(),
-            Framing::Chunked
-        );
-        // A later Transfer-Encoding still frames the body; taking only the
-        // first header would read this one as unframed and run to EOF.
-        assert_eq!(
-            decide_framing(&headers(&[
-                ("Transfer-Encoding", "gzip"),
-                ("Transfer-Encoding", "chunked"),
-            ]))
-            .unwrap(),
+            decide_framing(200, &headers(&[("Transfer-Encoding", "chunked")])).unwrap(),
             Framing::Chunked
         );
         // Repeating the SAME length is legal; disagreeing is not.
         assert_eq!(
-            decide_framing(&headers(&[
-                ("Content-Length", "5"),
-                ("content-length", "5")
-            ]))
+            decide_framing(
+                200,
+                &headers(&[("Content-Length", "5"), ("content-length", "5")])
+            )
             .unwrap(),
             Framing::Length(5)
+        );
+        // A bodiless status ignores whatever framing it declares.
+        assert_eq!(
+            decide_framing(204, &headers(&[("Content-Length", "5")])).unwrap(),
+            Framing::Empty
         );
         for ambiguous in [
             vec![("Content-Length", "5"), ("Content-Length", "9")],
             vec![("Content-Length", "5"), ("Transfer-Encoding", "chunked")],
+            vec![("Content-Length", "5"), ("Transfer-Encoding", "gzip")],
+            // EVERY Transfer-Encoding header is read: these two are the list
+            // `gzip, chunked`, refused.
+            vec![
+                ("Transfer-Encoding", "gzip"),
+                ("Transfer-Encoding", "chunked"),
+            ],
             vec![
                 ("Transfer-Encoding", "gzip"),
                 ("Transfer-Encoding", "chunked"),
@@ -1024,21 +1163,36 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    decide_framing(&headers(&ambiguous)),
+                    decide_framing(200, &headers(&ambiguous)),
                     Err(Error::Protocol(_))
                 ),
                 "{ambiguous:?} must be refused"
             );
         }
+        // The refusal names what is wrong with the value, overflow apart.
+        let message =
+            |value: &str| match decide_framing(200, &headers(&[("Content-Length", value)])) {
+                Err(Error::Protocol(m)) => m,
+                other => panic!("{value:?}: {other:?}"),
+            };
+        assert_eq!(
+            message("+5"),
+            "Content-Length is not a decimal byte count: \"+5\""
+        );
+        let huge = "9".repeat(40);
+        assert_eq!(
+            message(&huge),
+            format!("Content-Length {huge:?} is too large")
+        );
     }
 
     #[test]
     fn the_parser_frames_through_decide_framing() {
-        // The in-memory parser and the socket path are one function now; a
-        // response decide_framing refuses must be refused end to end too.
+        // A response decide_framing refuses must be refused end to end too.
         for raw in [
             &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 9\r\n\r\nhi"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nhi"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
         ] {
             assert!(
                 matches!(parse(raw, 1024), Err(Error::Protocol(_))),
@@ -1046,8 +1200,6 @@ mod tests {
                 String::from_utf8_lossy(raw)
             );
         }
-        let later_chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n";
-        assert_eq!(parse(later_chunked, 1024).unwrap().body(), b"hi");
     }
 
     #[test]
@@ -1066,6 +1218,25 @@ mod tests {
 5;name=v\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: t\r\n\r\n";
         let response = parse(raw, 1024).unwrap();
         assert_eq!(response.body(), b"hello world");
+    }
+
+    #[test]
+    fn a_chunk_size_is_hex_digits_and_nothing_else() {
+        // RFC 9112 §7.1: chunk-size = 1*HEXDIG, with BWS allowed only BEFORE a
+        // chunk extension's `;`. `usize::from_str_radix` also takes a leading
+        // `+` — the same leniency `Content-Length` is already guarded against.
+        for size in ["+2", " 2", "\t2", "0x2", ""] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size}\r\nhi\r\n0\r\n\r\n"
+            );
+            assert!(
+                matches!(parse(raw.as_bytes(), 1024), Err(Error::Protocol(_))),
+                "chunk size {size:?} must be refused"
+            );
+        }
+        let spaced_extension =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2 ;name=v\r\nhi\r\n0\r\n\r\n";
+        assert_eq!(parse(spaced_extension, 1024).unwrap().body(), b"hi");
     }
 
     #[test]
@@ -1112,6 +1283,87 @@ mod tests {
             &b"HTTP/1.1 notanumber OK\r\n\r\n"[..],
         ] {
             assert!(parse(raw, 1024).is_err(), "{raw:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn interim_1xx_responses_are_skipped_to_the_final_one() {
+        // RFC 9110 §15.2: a client MUST parse 1xx responses before the final
+        // one even unasked — a server may answer every POST with `100
+        // Continue`, or send `103 Early Hints`. The first head is not THE
+        // response, and the final one is not its body.
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\n\
+HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n\
+HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let response = parse(raw, 1024).unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"ok");
+        // An interim head's fields are not the final response's.
+        assert_eq!(response.header("link"), None);
+        // 101 is never interim here: this client never asks to upgrade.
+        let upgrade = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n";
+        assert!(matches!(parse(upgrade, 1024), Err(Error::Protocol(_))));
+        // Interim heads share the head budget: an endless stream of them ends.
+        let endless = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(MAX_HEADER_BYTES);
+        assert!(matches!(parse(&endless, 1024), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn bodiless_statuses_end_at_their_header_block_whatever_they_declare() {
+        // RFC 9112 §6.3 rule 1: 204 and 304 carry no content regardless of
+        // their framing headers (a 304 may name the length of the
+        // representation it did NOT send). Reading the declared length would
+        // wait for bytes that never come — an error here, a stall until the
+        // deadline against a server that keeps the connection open.
+        for raw in [
+            &b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n"[..],
+            &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n"[..],
+            &b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+        ] {
+            let response = parse(raw, 1024)
+                .unwrap_or_else(|error| panic!("{:?}: {error:?}", String::from_utf8_lossy(raw)));
+            assert!(response.body().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_transfer_coding_this_client_cannot_decode_is_refused() {
+        // RFC 9112 §6.3: Transfer-Encoding OVERRIDES Content-Length (so the two
+        // together are an error whatever the coding), and only a FINAL chunked
+        // frames the body. This client decodes chunked and nothing else, so any
+        // other coding would hand the caller coded bytes as if they were the
+        // content.
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 2\r\n\r\nhi"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nhi"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
+        ] {
+            assert!(
+                matches!(parse(raw, 1024), Err(Error::Protocol(_))),
+                "{:?} must be refused",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        // An empty list element is not a coding (RFC 9110 §5.6.1).
+        let listed = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: , chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n";
+        assert_eq!(parse(listed, 1024).unwrap().body(), b"hi");
+    }
+
+    #[test]
+    fn a_status_code_is_exactly_three_digits() {
+        for raw in [
+            &b"HTTP/1.1 +200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 0200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 999 OK\r\nContent-Length: 0\r\n\r\n"[..],
+        ] {
+            assert!(
+                matches!(parse(raw, 1024), Err(Error::Protocol(_))),
+                "{:?} must be refused",
+                String::from_utf8_lossy(raw)
+            );
         }
     }
 

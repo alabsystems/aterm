@@ -56,15 +56,9 @@ fn grapheme_display_width_bounded() {
 
 /// Verify truncate_to_width returns valid UTF-8.
 ///
-/// Uses fixed representative values to avoid loop unrolling explosion.
-/// Tests boundary cases: empty truncate, partial truncate, no truncate.
-///
-/// NOTE: This harness is sensitive to unwind bounds because truncate_to_width
-/// calls split_graphemes() → grapheme_indices(true) from unicode-segmentation.
-/// The crate's grapheme boundary state machine creates exponential CBMC paths.
-/// unwind(10) helps but may still timeout on slower machines; was 599.5s at
-/// unwind(5). If this continues to timeout, consider a Kani-specific stub
-/// for split_graphemes that bypasses unicode-segmentation.
+/// Uses fixed representative values (empty, partial and no truncation) to
+/// avoid loop-unrolling explosion; the grapheme state machine behind
+/// `split_graphemes` makes CBMC paths grow quickly with the unwind bound.
 #[kani::proof]
 #[kani::unwind(10)]
 fn truncate_preserves_utf8() {
@@ -145,9 +139,8 @@ fn byte_to_column_identity_at_zero() {
 #[kani::proof]
 #[kani::unwind(14)]
 fn byte_to_column_bounded_by_display_width() {
-    // Use our internal str_width (generated from Unicode 16.0 tables) instead of
-    // the external unicode-width crate: unicode-width is a dev-dependency and is
-    // not visible to #[cfg(kani)] builds. Part of #7954 drift-hygiene rerun.
+    // The crate's own tables: the unicode-width dev-dependency is not visible
+    // to #[cfg(kani)] builds.
     use crate::tables::str_width;
 
     let s = "hello world";

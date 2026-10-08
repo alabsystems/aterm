@@ -103,6 +103,9 @@ pub struct Selected {
     pub index: TrustedIndex,
     /// The exact verified bytes the index was parsed from.
     pub verified: VerifiedBytes,
+    /// Which of the candidates handed in won, by position — the caller's handle on the
+    /// winning candidate itself (a label is diagnostics only and need not be unique).
+    pub candidate: usize,
 }
 
 /// What one verify-then-select pass learned: the winner (if any) **and** the newest roster
@@ -132,6 +135,7 @@ pub struct Selection {
 /// One candidate that got past the roster tier: the generation that admitted it, and the
 /// index bytes still waiting to be verified under it.
 struct Admitted {
+    at: usize,
     label: String,
     index_bytes: Vec<u8>,
     sig: Vec<u8>,
@@ -208,7 +212,7 @@ pub fn select_index(
     let mut weighed: Vec<Weighed> = Vec::new();
     let mut admitted: Vec<Admitted> = Vec::new();
     let mut observed_roster_seq = 0u64;
-    for c in candidates {
+    for (at, c) in candidates.into_iter().enumerate() {
         // Taken as an owned verdict, not a borrow, so the miss arm below can extend the
         // memo. `Some(None)` is "already weighed, already refused"; `None` is "not yet
         // weighed". The scan is linear in the number of DISTINCT pairs, which is bounded
@@ -235,6 +239,7 @@ pub fn select_index(
         };
         observed_roster_seq = observed_roster_seq.max(roster.seq());
         admitted.push(Admitted {
+            at,
             label: c.label,
             index_bytes: c.index_bytes,
             sig: c.sig,
@@ -278,6 +283,7 @@ pub fn select_index(
                 label: a.label,
                 index,
                 verified,
+                candidate: a.at,
             });
         }
     }

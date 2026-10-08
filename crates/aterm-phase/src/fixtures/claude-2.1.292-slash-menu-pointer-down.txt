@@ -1,0 +1,32 @@
+# claude-code 2.1.292 · MEASURED 2026-10-06, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · `/mod` typed in the composer and the menu's pointer moved down twice (Down, Down): `  ❯ /plugin-authoring` is the THIRD entry, under two entries whose descriptions wrap onto a second row at column 32 — the pointer is on whichever entry is highlighted, not under the rule, and no row between the rules carries it (the scratch folder is redacted at equal width)
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ first normal turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Sautéed for 0s · done 5:12 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /mod
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    /model                      Set the AI model for Claude Code (currently Opus 5.5)
+    /code-review                Review the current diff, or a PR number/branch/path target, for correctness bugs (plus
+                                reuse/simplification/efficiency cleanups where the model's review recipe covers them) at the given effort lev…
+  ❯ /plugin-authoring           Make a mod: a live pane, band, status line, toast or hook inside Claude Code (terminal or desktop Code tab),
+                                written as a plugin of function hooks that hot-reloads in this session. Load before writing or debugging a ho…
+    /update-config              Use this skill to configure the Claude Code harness via settings.json. Automated behaviors ("from now on when
+                                X", "each time X", "whenever X", "before/after X") require hooks configured in settings.json - the harness ex…
+    /doctor                     Health-check the user's Claude Code setup and fix issues: diagnose installation health — what the `claude
+                                doctor` terminal diagnostics cover — from local data (duplicate or leftover installs, PATH, unparseable setti…
+    /loop                       Run a prompt or slash command on a recurring interval (e.g. /loop 5m /foo). Omit the interval to let the model
+                                self-pace.
+    /claude-api                 Reference for the Claude API / Anthropic SDK — model ids, pricing, params, streaming, tool use, MCP, agents,
+                                caching, token counting, model migration. TRIGGER — read BEFORE opening the target file; don't skip because i…
+    /effort                     Set effort level for model usage
+    /fast                       Toggle fast mode (Opus 5.5)
+    /status                     Show Claude Code status including version, model, account, API connectivity, and tool statuses
+    /plan                       Enable plan mode or view the current session plan

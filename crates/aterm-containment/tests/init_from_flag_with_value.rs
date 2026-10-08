@@ -4,28 +4,37 @@
 
 //! Integration test: `init_mode_from_flag` takes the flag's mode over the default.
 //!
-//! This runs in its own binary (fresh OnceLock).
+//! This runs in a fresh process (`crate::in_fresh_process`), so the OnceLock is fresh.
 
 use aterm_containment::ContainmentMode;
 
 #[test]
 fn init_from_flag_uses_the_flag_over_default() {
-    let mode = aterm_containment::init_mode_from_flag(Some("safety"), ContainmentMode::Master)
-        .expect("init_mode_from_flag should succeed");
+    crate::in_fresh_process(
+        module_path!(),
+        "init_from_flag_uses_the_flag_over_default",
+        || {
+            let mode =
+                aterm_containment::init_mode_from_flag(Some("safety"), ContainmentMode::Master)
+                    .expect("init_mode_from_flag should succeed");
 
-    // The flag's "safety" overrides the Master default.
-    assert_eq!(mode, ContainmentMode::Safety);
+            // The flag's "safety" overrides the Master default.
+            assert_eq!(mode, ContainmentMode::Safety);
 
-    // Global mode should now be Safety.
-    assert_eq!(aterm_containment::current_mode(), ContainmentMode::Safety);
+            // Global mode should now be Safety.
+            assert_eq!(
+                aterm_containment::try_current_mode(),
+                Some(ContainmentMode::Safety)
+            );
 
-    // Capabilities should match Safety policy.
-    let caps =
-        aterm_containment::ContainmentPolicy::capabilities(aterm_containment::current_mode());
-    assert_eq!(caps.network, aterm_containment::NetworkCapability::Full);
-    assert_eq!(
-        caps.process,
-        aterm_containment::ProcessCapability::Restricted
+            // Capabilities should match Safety policy.
+            let caps = aterm_containment::ContainmentPolicy::capabilities(mode);
+            assert_eq!(caps.network, aterm_containment::NetworkCapability::Full);
+            assert_eq!(
+                caps.process,
+                aterm_containment::ProcessCapability::Restricted
+            );
+            assert_eq!(caps.fs, aterm_containment::FsCapability::ProjectReadWrite);
+        },
     );
-    assert_eq!(caps.fs, aterm_containment::FsCapability::ProjectReadWrite);
 }

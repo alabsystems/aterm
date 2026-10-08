@@ -1,59 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CLAUDE CODE LIGHTS, host side: a few lights in the rule under Claude
-//! Code's input box, left of aterm's footer facts (`crate::claude_footer`) —
-//! the permission mode and fast mode (owner directions, 2026-09-24 and
-//! 2026-09-28). What each light means, where it is read from and which of
-//! Claude's own inputs flips it are decided in `aterm_agent::harness::lights`;
-//! this module puts them on the glass and carries the gestures.
+//! THE CLAUDE CODE LIGHTS, host side: a light in the rule under Claude Code's
+//! input box, left of aterm's footer facts (`crate::claude_footer`) — the
+//! permission mode (owner directions, 2026-09-24 and 2026-09-28). What it
+//! means, where it is read from and which of Claude's own inputs flips it are
+//! decided in `aterm_agent::harness::lights`; this module puts it on the
+//! glass and carries the gestures. Fast mode has no chip of aterm's (owner,
+//! 2026-09-30): Claude Code draws its own `↯` in its top rule.
 //!
-//! * DEVIATIONS ONLY: a light is drawn — as a labelled chip, `⏸ plan`,
-//!   `○ fast` — only while it shows what the owner does not
-//!   expect (`lights::deviates`), while a toggle of it is in flight, a
-//!   refusal or a just-switched notice for it is on show, or the pointer or
-//!   the keyboard selection is on it. At rest, everything as expected,
-//!   nothing is drawn: `claude_lights_block` is `None` and the rule carries
-//!   the facts alone. The chips never replace or cover Claude's own mode
-//!   pill, which stays on Claude's row under the rule, whole: the mode chip
-//!   is aterm's own click and keyboard target, in aterm's span of the rule.
-//!   A rule too narrow for the chips beside the model draws none (the model
-//!   gives way last, `footer::fit_rule`).
-//! * HOVER a chip: its title and state replace nothing — they appear just
-//!   right of the chips, where the rule has room: a hover's, a selection's or
+//! * DEVIATIONS ONLY: the light is drawn — as a labelled chip, `⏸ plan` —
+//!   only while it shows what the owner does not expect
+//!   (`lights::deviates`), while a toggle of it is in flight, a refusal or a
+//!   just-switched notice for it is on show, or the pointer or the keyboard
+//!   selection is on it. At rest, everything as expected, nothing is drawn:
+//!   `claude_lights_block` is `None` and the rule carries the facts alone.
+//!   The chip never replaces or covers Claude's own mode pill, which stays
+//!   on Claude's row under the rule, whole: the mode chip is aterm's own
+//!   click and keyboard target, in aterm's span of the rule. A rule too
+//!   narrow for the chip beside the model draws none (the model gives way
+//!   last, `footer::fit_rule`).
+//! * HOVER the chip: its title and state replace nothing — they appear just
+//!   right of the chip, where the rule has room: a hover's, a selection's or
 //!   a toggle's title is the first thing a narrow rule gives up, short then
 //!   gone, before any of the facts, while a REASON — where a mode return
-//!   stopped, a refusal — outranks the branch and the path, never the model
-//!   or the effort (`footer::fit_rule`). CLICK it: it toggles.
+//!   stopped — outranks the branch and the path, never the model or the
+//!   effort (`footer::fit_rule`). CLICK it: it toggles.
 //! * `ctrl+shift+tab` (macOS; elsewhere it is aterm's `prev_tab`) REVEALS
-//!   every known light of the focused pane and selects the next (Claude
-//!   keeps its own shift+tab); while one is selected, Return or Space toggles
-//!   it (on the mode in bypass or auto it does nothing), ←/→ move, and
-//!   Escape — or any other key, which then goes on to Claude as usual — lets
-//!   go, and the lights at rest go with the selection. Only a chip the pane has ROOM for is ever
-//!   selected (the reveal gives way first), and a selection whose chip is
-//!   not on the glass is let go by the next key: a light nobody can see
-//!   never takes a Return meant for Claude.
+//!   the known light of the focused pane and selects it (Claude keeps its
+//!   own shift+tab); while it is selected, Return or Space toggles it (in
+//!   bypass or auto it does nothing), and Escape — or any other key, which
+//!   then goes on to Claude as usual — lets go, and the light at rest goes
+//!   with the selection. Only a chip the pane has ROOM for is ever selected
+//!   (the reveal gives way first), and a selection whose chip is not on the
+//!   glass is let go by the next key: a light nobody can see never takes a
+//!   Return meant for Claude.
 //! * A toggle is Claude's own input, and it is READ BACK: the light shows
-//!   `◐` until Claude's screen says it switched, and says so in its title if
-//!   Claude did not within `harness::lights::settle_ms`. A slash command is
-//!   pasted only into an EMPTY composer, never while a driver may still be
-//!   typing its own prompt there, and it is SUBMITTED only while the composer
-//!   holds exactly it (`lights::composer_holds`) and no person has touched
-//!   the session since aterm typed it (`HumanInputStamp::last`). Not submitted in
-//!   time, it is TAKEN BACK — one ctrl+u, under the same two conditions, read
-//!   back once — and anything else leaves it where it is, the light saying so:
-//!   aterm never types into, or deletes, what may be a person's. `/fast` is
-//!   Claude's IMMEDIATE command: it is typed and submitted mid-turn too, and
-//!   Claude's own answer is READ (`lights::fast_answers`), for up to
-//!   `lights::FAST_SETTLE_MS` from the Enter — a refusal shows in Claude's
-//!   words, and one that is the account's or the build's own answer
-//!   (`lights::FastRefusal::lasting`) is latched per Claude build and model,
-//!   in memory until aterm restarts, so the light stops asking
-//!   (`App::claude_fast_latch`). A `/fast on` that took an auto session out
-//!   of auto (Claude's server flag, `lights::AUTO_OFF_FOR_FAST`) says so, and
-//!   is latched for the build: in auto mode the fast light then stops asking
-//!   and refuses a click.
+//!   `◐` until Claude's screen says it switched, and says in its title where
+//!   it stopped if Claude did not within `harness::lights::SETTLE_MS` of a
+//!   press.
 //! * THE MODE RETURN. A click on the mode chip (manual, accept edits, plan or
 //!   don't ask) presses shift+tab AT ONCE — the click is the person's input,
 //!   mid-turn included, like their own shift+tab in Claude — and each next
@@ -72,8 +57,8 @@
 //! * WHO PRESSED. The click's own first input goes as the person's
 //!   (`input::Source::Human`: it stamps the person clock the supervisor keeps
 //!   its hands off by — the person just clicked). Every input aterm sends
-//!   after it on its own — the mode return's next presses, a typed command's
-//!   Enter or ctrl+u — goes as `input::Source::Controller`: no person made it
+//!   after it on its own — the mode return's next presses — goes as
+//!   `input::Source::Controller`: no person made it
 //!   at that instant, and stamping it would hold the supervisor off a session
 //!   for its whole `[harness] human_grace_s` (120 s) after every automatic
 //!   step, a box that opens meanwhile unanswered.
@@ -85,9 +70,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::lights::{
-    self, Drive, FastAnswer, FastRefusal, Light, LightState, Mode, Reading, Screen,
-};
+use aterm_agent::harness::lights::{self, Light, LightState, Mode, Reading, Screen};
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -102,10 +85,6 @@ const REFUSAL_SHOWN: Duration = Duration::from_secs(4);
 enum Refusal {
     /// The light is not on Claude's screen right now.
     NotShown,
-    /// A slash command would have been typed over the person's draft.
-    Draft,
-    /// The input was sent and Claude did not switch.
-    NoChange,
     /// A mode return stopped short of bypass or auto — a press went
     /// unanswered past its own deadline, a box covered the composer, or the
     /// input seam took no next press — in this mode, which the light names:
@@ -121,25 +100,8 @@ enum Refusal {
     /// session's shift+tab cycle holds neither bypass nor auto. Stopped in
     /// this mode, which the light names.
     NotInCycle(Mode),
-    /// Claude is mid-turn; a slash command it does not run mid-turn waits
-    /// for it to finish.
-    Busy,
-    /// Claude answered the command with a refusal, in these words.
-    Vendor(FastRefusal),
-    /// Turning fast mode on in auto mode would turn auto mode off: this
-    /// Claude build has done it before (`lights::AUTO_OFF_FOR_FAST`).
-    CostsAuto,
-    /// The slash command aterm typed is still in the composer: a person
-    /// touched the session before it went, or it could not be taken back.
-    LeftTyped,
-    /// A driver may still be typing its prompt into the composer (a `lease`,
-    /// or a `turn` whose prompt Claude has not taken yet): a slash command
-    /// must not land in it.
-    Driven,
-    /// The input seam accepted nothing: no toggle owns the command.
+    /// The input seam did not accept the click's press: no toggle began.
     InputRejected,
-    /// Earlier accepted input has not yet left the session's ordered FIFO.
-    InputPending,
 }
 
 impl Refusal {
@@ -159,8 +121,6 @@ impl Refusal {
     fn says(self) -> String {
         match self {
             Refusal::NotShown => "not on screen right now",
-            Refusal::Draft => "clear the prompt first",
-            Refusal::NoChange => "Claude did not switch",
             Refusal::StoppedIn(mode) => return format!("stopped in {} mode", mode.word()),
             Refusal::StoppedMidTurn(mode) => {
                 return format!("stopped in {} mode mid-turn; click again", mode.word());
@@ -168,13 +128,7 @@ impl Refusal {
             Refusal::NotInCycle(mode) => {
                 return format!("no bypass or auto in this cycle; in {} mode", mode.word());
             }
-            Refusal::Busy => "wait for Claude to finish",
-            Refusal::Vendor(why) => why.title(),
-            Refusal::CostsAuto => "Claude turns auto mode off with it here",
-            Refusal::LeftTyped => "command left in the prompt",
-            Refusal::Driven => "a driver has the session",
             Refusal::InputRejected => "input was not accepted; try again",
-            Refusal::InputPending => "wait for queued input",
         }
         .to_owned()
     }
@@ -184,8 +138,6 @@ impl Refusal {
 #[derive(Debug, Clone)]
 struct Pending {
     light: Light,
-    from: LightState,
-    drive: Drive,
     /// The mode when the toggle began (a cycle that leaves it is done).
     started: Mode,
     /// The mode when the last shift+tab was sent: a frame showing another
@@ -195,9 +147,8 @@ struct Pending {
     /// lap, and the search stops there.
     seen: Vec<Mode>,
     presses: u8,
-    /// Past this, the toggle is given up. A mode return's is refreshed on
-    /// every press: it is the time for ONE shift+tab's answer. A command's
-    /// is set again at its Enter: the time Claude takes to answer it.
+    /// Past this, the toggle is given up. Refreshed on every press: it is the
+    /// time for ONE shift+tab's answer.
     deadline: Instant,
     /// The loop's next look at the engine while one is armed: ONE timer per
     /// toggle, however many wakes arrive meanwhile.
@@ -206,29 +157,11 @@ struct Pending {
     /// aterm's own next press waited for the turn to end. A deadline reached
     /// so says so (`Refusal::StoppedMidTurn`).
     held_mid_turn: bool,
-    /// A command's: the fewest of Claude's transcript echoes of it that carry
-    /// an answer since the click (`lights::FastAnswers::echoed`). Only a
-    /// count above it is an answer to THIS toggle — never an earlier try's
-    /// still on screen.
-    echoes_floor: usize,
-    /// A command's: the notification under the composer that was up at the
-    /// click (`lights::FastAnswers::notice`) — an earlier try's answer, not
-    /// this one's. Cleared the moment the slot shows anything else or
-    /// nothing; from then on a notification there is this toggle's.
-    stale_notice: Option<FastAnswer>,
-    /// A command's: Claude's newest word on fast mode seen since the click,
-    /// stale or not — what the light says if the toggle's own answer never
-    /// comes to be told apart (Claude's words, rather than "did not switch").
-    last_said: Option<FastAnswer>,
 }
 
 /// How often a mode return in flight reads the engine for Claude's answer:
 /// a pill redraw lands within a frame or two.
 const MODE_POLL: Duration = Duration::from_millis(80);
-
-/// How often a submitted command in flight reads the engine for Claude's
-/// answer: `/fast` may take its whole `lights::FAST_SETTLE_MS` to answer.
-const ANSWER_POLL: Duration = Duration::from_millis(250);
 
 /// What a mode return in flight does next, decided from the engine's reading
 /// ([`WindowLights::advance`]).
@@ -247,79 +180,6 @@ enum Advance {
     Lapped,
 }
 
-/// One engine read of a session whose command is in flight
-/// ([`WindowLights::answer`]).
-#[derive(Debug, Clone, Copy)]
-struct CommandRead {
-    /// Fast mode off the composer's rule.
-    fast: LightState,
-    /// The permission mode its pill names.
-    mode: Option<Mode>,
-    /// Claude's answers to the command on screen.
-    answers: lights::FastAnswers,
-    /// Claude says auto mode is off because fast mode is on
-    /// (`lights::says_auto_off_for_fast`).
-    auto_off: bool,
-}
-
-/// How a command in flight ended, for the host's latch
-/// (`App::claude_fast_latch`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CommandEnd {
-    /// Claude refused it, for this reason.
-    refusal: Option<FastRefusal>,
-    /// Turning fast mode on took the session out of auto mode.
-    cost_auto: bool,
-}
-
-/// How often a typed command's composer is read until its Enter goes: the
-/// paste's echo usually lands within a frame or two.
-const TYPED_POLL: Duration = Duration::from_millis(80);
-
-/// How long after a ctrl+u the composer is read back.
-const CLEAR_READ_BACK: Duration = Duration::from_millis(300);
-
-/// A slash command aterm typed into a session's composer for a light, from the
-/// paste until it was submitted, taken back or left (`App::claude_typed`).
-/// Kept per SESSION, not per window: the text is in the session's composer
-/// whichever window — if any — still shows it, so closing the window that
-/// started the toggle does not strand it.
-#[derive(Debug, Clone)]
-pub(crate) struct Typed {
-    light: Light,
-    /// The light's state when the toggle began: another one on screen means
-    /// the command went, whoever pressed its Enter.
-    from: LightState,
-    cmd: &'static str,
-    /// The session's person clock right after aterm's own last write to it
-    /// (`HumanInputStamp::last`): any other value is a person's gesture since
-    /// — the composer may hold their text now, and aterm types nothing more.
-    stamp: u64,
-    /// Claude runs the command mid-turn (`Drive::Command::immediate`): its
-    /// Enter does not wait for the turn to end.
-    immediate: bool,
-    /// The driver holding the session's lease at the paste (`who`'s
-    /// `driving=` token), if any: a lease taken or changed SINCE is another
-    /// hand, and aterm types nothing more.
-    lease_at_paste: Option<String>,
-    /// Another hand came to the session since the paste — a person's
-    /// gesture, or a driver's lease: aterm types nothing more, and the
-    /// deadline says what became of the command.
-    hands_off: bool,
-    /// Past this, the command is taken back, or left and said.
-    deadline: Instant,
-    /// The next poll's instant while one is armed: ONE timer per record,
-    /// however many footer wakes arrive meanwhile.
-    next_poll: Option<Instant>,
-    /// A ctrl+u went out; the composer is read back at this instant.
-    cleared: Option<Instant>,
-    /// The deadline found the prompt empty and was moved once: the paste's
-    /// echo may still be on its way from a busy Claude. The late look only
-    /// takes the command back — no Enter goes after the light has said
-    /// Claude did not switch.
-    late: bool,
-}
-
 /// One session's lights in one window.
 #[derive(Debug, Clone, Default)]
 struct SessionLights {
@@ -329,11 +189,8 @@ struct SessionLights {
     pending: Option<Pending>,
     refused: Option<(Light, Refusal, Instant)>,
     /// A toggle that took: its light stays drawn, titled with its new state,
-    /// until this instant — then, back as expected, it goes. The words, where
-    /// Claude said more than the new state (`Fast mode ON · model set to …`),
-    /// belong to THIS notice and go with it: a later notice of another light
-    /// can never inherit them.
-    notice: Option<(Light, Instant, Option<&'static str>)>,
+    /// until this instant — then, back as expected, it goes.
+    notice: Option<(Light, Instant)>,
 }
 
 /// One painted light, in frame cells — recorded by the painter, read by the
@@ -369,49 +226,6 @@ pub(crate) struct WindowLights {
     sessions: HashMap<u64, SessionLights>,
 }
 
-/// What Claude said of fast mode that outlives one toggle, for every window
-/// (`App::claude_fast_latch`). In memory only: until aterm restarts.
-#[derive(Debug, Default)]
-pub(crate) struct FastLatch {
-    /// Claude's LASTING refusals (`FastRefusal::lasting`), by the Claude
-    /// build (`FooterFacts::version`) and model (`FooterFacts::model`) that
-    /// said them — a refusal of one model does not stop asking on another,
-    /// and a new build asks once more. While one holds, the fast light stops
-    /// asking there.
-    refused: HashMap<(Option<String>, Option<String>), FastRefusal>,
-    /// The Claude builds on which turning fast mode on took a session out of
-    /// auto mode (`lights::AUTO_OFF_FOR_FAST`).
-    costs_auto: std::collections::HashSet<Option<String>>,
-    /// Bumped on every change: a term of every window's repaint key, so a
-    /// latch taken in one window repaints the chips of every other.
-    generation: u64,
-}
-
-impl FastLatch {
-    /// Latch `why` for `build` and `model`; whether it is new.
-    fn refuse(&mut self, build: Option<String>, model: Option<String>, why: FastRefusal) -> bool {
-        let new = self.refused.insert((build, model), why) != Some(why);
-        if new {
-            self.generation = self.generation.wrapping_add(1);
-        }
-        new
-    }
-
-    /// Latch that fast mode costs auto mode on `build`; whether it is new.
-    fn cost_auto(&mut self, build: Option<String>) -> bool {
-        let new = self.costs_auto.insert(build);
-        if new {
-            self.generation = self.generation.wrapping_add(1);
-        }
-        new
-    }
-
-    /// The repaint key's term.
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-}
-
 impl WindowLights {
     /// Everything about the lights that is GUI state rather than grid
     /// content, for the repaint key: a hover, a selection, a toggle in flight
@@ -426,7 +240,7 @@ impl WindowLights {
             .filter(|(_, s)| {
                 s.pending.is_some()
                     || s.refused.is_some_and(|(_, _, until)| until > now)
-                    || s.notice.is_some_and(|(_, until, _)| until > now)
+                    || s.notice.is_some_and(|(_, until)| until > now)
             })
             .collect();
         if self.hover.is_none() && self.selected.is_none() && active.is_empty() {
@@ -446,10 +260,10 @@ impl WindowLights {
             {
                 (light, why).hash(&mut h);
             }
-            if let Some((light, until, said)) = s.notice
+            if let Some((light, until)) = s.notice
                 && until > now
             {
-                (light, "notice", said).hash(&mut h);
+                (light, "notice").hash(&mut h);
             }
         }
         h.finish() | 1
@@ -509,48 +323,30 @@ impl WindowLights {
         rows: &[String],
         read: impl FnOnce(&[String]) -> Option<Screen>,
     ) -> Step {
-        let Some((screen, auto_off)) = crate::reader_guard::read_or_none(
-            &format!("{session}"),
-            "Claude Code lights",
-            rows,
-            || (read(rows), lights::says_auto_off_for_fast(rows)),
-        ) else {
+        let Some(screen) =
+            crate::reader_guard::read_or_none(session, "Claude Code lights", rows, || read(rows))
+        else {
             return Step::default();
         };
-        Step {
-            auto_off_for_fast: auto_off,
-            ..self.observe(session, screen.as_ref())
-        }
+        self.observe(session, screen.as_ref())
     }
 
     /// Fold one frame's reading of `session`'s screen in: remember what each
-    /// light shows. A toggle is NEVER
-    /// stepped here: a frame that shows Claude's answer — the pill moved on,
-    /// the fast tag switched — only wakes the loop, which reads the ENGINE
-    /// and decides ([`App::advance_claude_mode_returns`],
-    /// [`App::answer_claude_commands`]) — the same decision whether or not a
-    /// frame is painted. (A command's Enter is judged from the engine by the
-    /// loop too, `App::drain_claude_typed`.) What the caller must do: wake the
-    /// loop.
+    /// light shows. A toggle is NEVER stepped here: a frame that shows
+    /// Claude's answer — the pill moved on — only wakes the loop, which reads
+    /// the ENGINE and decides ([`App::advance_claude_mode_returns`]) — the
+    /// same decision whether or not a frame is painted. What the caller must
+    /// do: wake the loop.
     fn observe(&mut self, session: u64, screen: Option<&Screen>) -> Step {
         let s = self.sessions.entry(session).or_default();
         s.shown.fold(&lights::read(screen));
         let Some(p) = s.pending.as_ref() else {
             return Step::default();
         };
-        let wake = match (&p.drive, screen) {
-            // Claude answered the last press (or the pill moved on its own):
-            // the loop reads the engine and decides.
-            (Drive::CycleMode, Some(screen)) => screen.mode.is_some_and(|m| m != p.mode_at_press),
-            (Drive::CycleMode, None) => false,
-            (Drive::Command { .. }, _) => {
-                let now_state = s.shown.state(p.light);
-                now_state != p.from && now_state != LightState::Unknown
-            }
-        };
+        // Claude answered the last press (or the pill moved on its own): the
+        // loop reads the engine and decides.
         Step {
-            wake,
-            ..Step::default()
+            wake: screen.is_some_and(|screen| screen.mode.is_some_and(|m| m != p.mode_at_press)),
         }
     }
 
@@ -569,7 +365,7 @@ impl WindowLights {
         let Some(s) = self.sessions.get_mut(&session) else {
             return Advance::Wait;
         };
-        let Some(p) = s.pending.as_mut().filter(|p| p.drive == Drive::CycleMode) else {
+        let Some(p) = s.pending.as_mut() else {
             return Advance::Wait;
         };
         let Some((mode, busy)) = screen.and_then(|screen| Some((screen.mode?, screen.busy))) else {
@@ -579,7 +375,7 @@ impl WindowLights {
         if mode.is_expected() {
             s.pending = None;
             s.refused = None;
-            s.notice = Some((Light::Mode, now + REFUSAL_SHOWN, None));
+            s.notice = Some((Light::Mode, now + REFUSAL_SHOWN));
             return Advance::Arrived;
         }
         // The footer wake may be delayed past this press's deadline. Read the
@@ -611,69 +407,6 @@ impl WindowLights {
         Advance::Press { expect: mode }
     }
 
-    /// Resolve `session`'s command in flight from the ENGINE: its light
-    /// switched (`fast`, off the rule), or Claude answered it — a transcript
-    /// echo beyond the count at the click, else a notification other than
-    /// the one up at the click (`answers`, `lights::fast_answers`). A refusal
-    /// is said in Claude's words; a switch that took an auto session out of
-    /// auto (`auto_off`: Claude's own words on screen, or the pill `mode` left
-    /// auto for a mode the owner does not expect) is said too. Both are
-    /// returned, for the host's latch. Anything else waits — Claude may be
-    /// applying it, its composer hidden — noting Claude's newest word for
-    /// the deadline's title.
-    fn answer(&mut self, session: u64, read: &CommandRead, now: Instant) -> Option<CommandEnd> {
-        let s = self.sessions.get_mut(&session)?;
-        let p = s
-            .pending
-            .as_mut()
-            .filter(|p| matches!(p.drive, Drive::Command { .. }))?;
-        let answers = read.answers;
-        // The notification slot: the one up at the click is an earlier
-        // try's until the slot shows anything else, or nothing.
-        if answers.notice != p.stale_notice {
-            p.stale_notice = None;
-        }
-        let notice = answers.notice.filter(|_| p.stale_notice.is_none());
-        let echo = answers.echo.filter(|_| answers.echoed > p.echoes_floor);
-        p.echoes_floor = p.echoes_floor.min(answers.echoed);
-        p.last_said = answers.newest().or(p.last_said);
-        // The echo is tied to the command; the notification names none.
-        let answered = echo.or(notice);
-        let light = p.light;
-        let switched = read.fast != p.from && read.fast != LightState::Unknown;
-        let turned_on = match answered {
-            Some(FastAnswer::On | FastAnswer::OnModelMoved) => true,
-            Some(_) => false,
-            None => switched && read.fast == LightState::On,
-        };
-        let cost_auto = turned_on
-            && p.started == Mode::Auto
-            && (read.auto_off || read.mode.is_some_and(|m| !m.is_expected()));
-        let (refusal, said) = match answered {
-            Some(FastAnswer::Refused(why)) => (Some(why), None),
-            _ if cost_auto => (None, Some("on \u{00B7} Claude turned auto mode off")),
-            Some(FastAnswer::OnModelMoved) => (None, Some("on \u{00B7} Claude switched the model")),
-            Some(FastAnswer::On | FastAnswer::Off) => (None, None),
-            None if switched => (None, None),
-            None => return None,
-        };
-        s.pending = None;
-        match refusal {
-            Some(why) => {
-                s.refused = Some((light, Refusal::Vendor(why), now + REFUSAL_SHOWN));
-                s.notice = None;
-            }
-            None => {
-                s.refused = None;
-                s.notice = Some((light, now + REFUSAL_SHOWN, said));
-                if read.fast != LightState::Unknown {
-                    s.shown.fast = read.fast;
-                }
-            }
-        }
-        Some(CommandEnd { refusal, cost_auto })
-    }
-
     /// Give up on every toggle past its deadline — a mode return past its
     /// LAST press's, naming the mode it stopped in (the session did switch,
     /// just not all the way) — and end every refusal and notice past its
@@ -703,25 +436,16 @@ impl WindowLights {
             if let Some(p) = &s.pending
                 && p.deadline <= now
             {
-                let why = match p.drive {
-                    // The last mode seen — by a frame, if a box has kept the
-                    // engine's reading from it since.
-                    Drive::CycleMode => match s.shown.mode.unwrap_or(p.mode_at_press) {
-                        at if at.is_expected() => None,
-                        at if p.held_mid_turn => Some(Refusal::StoppedMidTurn(at)),
-                        at => Some(Refusal::StoppedIn(at)),
-                    },
-                    // Claude's own newest word where it refused — an answer
-                    // the count could not tie to this try (a retry answered
-                    // in the same notification slot) is still Claude's.
-                    Drive::Command { .. } => Some(match p.last_said {
-                        Some(FastAnswer::Refused(why)) => Refusal::Vendor(why),
-                        _ => Refusal::NoChange,
-                    }),
+                // The last mode seen — by a frame, if a box has kept the
+                // engine's reading from it since.
+                let why = match s.shown.mode.unwrap_or(p.mode_at_press) {
+                    at if at.is_expected() => None,
+                    at if p.held_mid_turn => Some(Refusal::StoppedMidTurn(at)),
+                    at => Some(Refusal::StoppedIn(at)),
                 };
                 match why {
                     Some(why) => s.refused = Some((p.light, why, now + REFUSAL_SHOWN)),
-                    None => s.notice = Some((p.light, now + REFUSAL_SHOWN, None)),
+                    None => s.notice = Some((p.light, now + REFUSAL_SHOWN)),
                 }
                 s.pending = None;
                 refused.push(*session);
@@ -731,7 +455,7 @@ impl WindowLights {
                 s.refused = None;
                 any = true;
             }
-            if s.notice.is_some_and(|(_, until, _)| until <= now) {
+            if s.notice.is_some_and(|(_, until)| until <= now) {
                 s.notice = None;
                 any = true;
             }
@@ -756,18 +480,10 @@ impl WindowLights {
     /// a caller short of room drops first (`reveal: false`,
     /// [`App::claude_lights_block`]). With everything as expected the block
     /// is EMPTY: no chip, no title, nothing to hit.
-    fn block(
-        &self,
-        session: u64,
-        blank: RenderCell,
-        expect: &lights::Expect,
-        now: Instant,
-        reveal: bool,
-    ) -> Block {
+    fn block(&self, session: u64, blank: RenderCell, now: Instant, reveal: bool) -> Block {
         self.block_with(
             session,
             blank,
-            expect,
             now,
             self.selected
                 .filter(|(id, _)| *id == session)
@@ -779,15 +495,10 @@ impl WindowLights {
 
     /// [`Self::block`] with the selection and the hover given — so the
     /// keyboard can ask whether a selection would FIT before making it.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the block's inputs, each one named; a struct would only rename them"
-    )]
     fn block_with(
         &self,
         session: u64,
         blank: RenderCell,
-        expect: &lights::Expect,
         now: Instant,
         selected: Option<Light>,
         hover: Option<Light>,
@@ -801,11 +512,11 @@ impl WindowLights {
         let refused = s.refused.filter(|(_, _, until)| *until > now);
         let noticed = s
             .notice
-            .filter(|(_, until, _)| *until > now)
-            .map(|(light, _, _)| light);
+            .filter(|(_, until)| *until > now)
+            .map(|(light, _)| light);
         let pending = s.pending.as_ref().map(|p| p.light);
         let drawn = |light: Light| {
-            lights::deviates(light, &s.shown, expect)
+            lights::deviates(light, &s.shown)
                 || pending == Some(light)
                 || refused.is_some_and(|(l, _, _)| l == light)
                 || noticed == Some(light)
@@ -823,14 +534,7 @@ impl WindowLights {
         let mut short_title = Vec::new();
         let mut reason = false;
         if let Some(light) = titled {
-            let (what, why) = what_of(
-                s,
-                light,
-                refused,
-                focus.is_some_and(|(_, l)| l == light),
-                expect,
-                now,
-            );
+            let (what, why) = what_of(s, light, refused, focus.is_some_and(|(_, l)| l == light));
             reason = why;
             let cells = |text: String| -> Vec<RenderCell> {
                 text.chars()
@@ -887,60 +591,37 @@ fn revealed(light: Light, shown: &Reading) -> bool {
 }
 
 /// What `light`'s title says after its name: the refusal on show, the toggle
-/// in flight, what Claude said of a switch, else its state — and, under the
-/// pointer or the selection, what a click does. And whether it says WHY (the
-/// refusal — where a mode return stopped is one — or Claude's words): a
-/// reason outranks the branch and the path in the rule, and the rest gives
-/// way before any fact (`footer::fit_rule`).
+/// in flight, else its state — and, under the pointer or the selection, what
+/// a click does. And whether it says WHY (the refusal — where a mode return
+/// stopped is one): a reason outranks the branch and the path in the rule,
+/// and the rest gives way before any fact (`footer::fit_rule`).
 fn what_of(
     s: &SessionLights,
     light: Light,
     refused: Option<(Light, Refusal, Instant)>,
     focused: bool,
-    expect: &lights::Expect,
-    now: Instant,
 ) -> (String, bool) {
     if let Some((l, why, _)) = refused
         && l == light
     {
         return (why.says(), true);
     }
-    if let Some(p) = s.pending.as_ref().filter(|p| p.light == light) {
-        // A command stays in flight while Claude applies it, its composer
-        // hidden for up to `lights::FAST_SETTLE_MS`: not a refusal.
-        let what = match (&p.drive, p.from) {
-            (Drive::Command { .. }, LightState::Off) => "turning on\u{2026}",
-            (Drive::Command { .. }, _) => "turning off\u{2026}",
-            (Drive::CycleMode, _) => "switching\u{2026}",
-        };
-        return (what.to_owned(), false);
+    if s.pending.as_ref().is_some_and(|p| p.light == light) {
+        return ("switching\u{2026}".to_owned(), false);
     }
-    if let Some((l, until, Some(said))) = s.notice
-        && l == light
-        && until > now
-    {
-        return (said.to_owned(), true);
-    }
-    let what = match (light, s.shown.state(light), s.shown.mode) {
-        // The chip beside it names the mode.
-        (Light::Mode, LightState::Off, Some(_)) if focused => "click for bypass or auto".to_owned(),
-        (Light::Mode, LightState::On | LightState::Off, Some(mode)) => mode.word().to_owned(),
-        (Light::Fast, LightState::Off, Some(Mode::Auto)) if focused && expect.fast_costs_auto => {
-            "off \u{00B7} Claude turns auto mode off with it here".to_owned()
-        }
-        (Light::Fast, LightState::Off, _) if focused => "off \u{00B7} click to turn on".to_owned(),
-        (Light::Fast, LightState::On, _) if focused => "on \u{00B7} click to turn off".to_owned(),
-        (_, LightState::On, _) => "on".to_owned(),
-        (_, LightState::Off, _) => "off".to_owned(),
-        (_, LightState::Unknown, _) => "not on screen right now".to_owned(),
+    // The chip beside it names the mode; a mode not known is not on screen.
+    let what = match s.shown.mode {
+        Some(_) if focused && s.shown.state(light) == LightState::Off => "click for bypass or auto",
+        Some(mode) => mode.word(),
+        None => "not on screen right now",
     };
-    (what, false)
+    (what.to_owned(), false)
 }
 
 /// A chip's glyph, word and ink. The mode by its own pill glyph and word, in
 /// its hue where Claude gives it one (bypass, auto) and the row's ink
-/// otherwise; fast mode as a dot and its word — lit in its hue when on, dim
-/// when off. A toggle in flight shows `◐`.
+/// otherwise; a light whose mode is not known as a dim `◌` and its word. A
+/// toggle in flight shows `◐`.
 fn chip(
     light: Light,
     shown: &Reading,
@@ -948,31 +629,10 @@ fn chip(
     ink: [u8; 3],
     dim: [u8; 3],
 ) -> (&'static str, &'static str, [u8; 3]) {
-    let dot = |state: LightState| match (switching, state) {
-        (true, _) => "\u{25D0}",
-        (false, LightState::On) => "\u{25CF}",
-        (false, LightState::Off) => "\u{25CB}",
-        (false, LightState::Unknown) => "\u{25CC}",
-    };
-    match (light, shown.mode) {
-        (Light::Mode, Some(mode)) => (
-            if switching {
-                dot(LightState::On)
-            } else {
-                mode.glyph()
-            },
-            mode.word(),
-            mode.hue().unwrap_or(ink),
-        ),
-        _ => {
-            let state = shown.state(light);
-            let lit = switching || state == LightState::On;
-            (
-                dot(state),
-                light.word(),
-                if lit { light.hue() } else { dim },
-            )
-        }
+    let glyph = |own: &'static str| if switching { "\u{25D0}" } else { own };
+    match shown.mode {
+        Some(mode) => (glyph(mode.glyph()), mode.word(), mode.hue().unwrap_or(ink)),
+        None => (glyph("\u{25CC}"), light.word(), dim),
     }
 }
 
@@ -982,10 +642,6 @@ struct Step {
     /// Claude answered a toggle's input: wake the loop, which reads the
     /// engine and decides the next step.
     wake: bool,
-    /// Claude says auto mode is off because fast mode is on
-    /// (`lights::says_auto_off_for_fast`): the host latches it for the
-    /// session's build.
-    auto_off_for_fast: bool,
 }
 
 /// Row `r` of `t`'s live screen as text, trailing blanks trimmed — what
@@ -998,50 +654,17 @@ fn row_text(t: &aterm_core::terminal::Terminal, r: usize) -> String {
     line
 }
 
-/// A toggle's reading of the whole screen: its lights [`Screen`] and whether
-/// the composer is EMPTY (`harness::upgrade::composer_is_empty`, the rule the
-/// live-upgrade driver types by) — `None` without a composer on screen.
-/// `cursor` is the terminal cursor; `dim_col2[r]` whether row `r`'s column 2
-/// is drawn DIM (a placeholder suggestion on the caret row, not a draft).
-fn read_screen_now(
-    rows: &[String],
-    cursor: (usize, usize),
-    dim_col2: &[bool],
-) -> Option<(Screen, bool)> {
-    let caret = aterm_phase::phase::composer_draft(rows).map(|(caret, _)| caret);
-    let dim = caret.is_some_and(|row| dim_col2.get(row).copied().unwrap_or(false));
-    let screen = lights::read_screen(rows)?;
-    let empty = aterm_agent::harness::upgrade::composer_is_empty(rows, Some(cursor), dim);
-    Some((screen, empty))
-}
-
-/// `read` inside the reader's panic fence for a toggle on `session`: a
-/// panic is warned once and read as no composer (the toggle is refused,
-/// `NotShown` — nothing is typed off an unread screen).
-fn fenced_screen_now(
+/// `read` inside the reader's panic fence for `session`'s live screen: a
+/// panic is warned once and read as no composer. A toggle is refused
+/// (`NotShown`, so nothing is pressed off an unread screen), a mode return
+/// takes no step, and the footer lays in no upgrade note
+/// (`App::claude_composer_now`).
+fn fenced_screen_now<T>(
     session: u64,
     rows: &[String],
-    read: impl FnOnce() -> Option<(Screen, bool)>,
-) -> Option<(Screen, bool)> {
-    crate::reader_guard::read_or_none(
-        &format!("{session}"),
-        "Claude Code light toggle",
-        rows,
-        read,
-    )
-    .flatten()
-}
-
-/// One session's live screen as the toggles read it, copied out of its
-/// engine under the lock ([`App::claude_rows_now`]).
-struct EngineRows {
-    /// Its rows as text, trailing blanks trimmed.
-    rows: Vec<String>,
-    /// The terminal cursor: (row, column).
-    cursor: (usize, usize),
-    /// Whether each row's column 2 is drawn DIM (on the caret row, a
-    /// placeholder suggestion, not a draft).
-    dim_col2: Vec<bool>,
+    read: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    crate::reader_guard::read_or_none(session, "Claude Code live screen", rows, read).flatten()
 }
 
 /// `blank`'s ink halfway to its ground: the off light and the title.
@@ -1052,50 +675,6 @@ fn dim_of(blank: RenderCell) -> [u8; 3] {
         mix(blank.fg[1], blank.bg[1]),
         mix(blank.fg[2], blank.bg[2]),
     ]
-}
-
-/// A typed command's composer, read from the engine (`App::typed_view`).
-#[derive(Debug, Clone, Copy)]
-struct TypedView {
-    /// The session's person clock at the read (`HumanInputStamp::last`).
-    stamp: u64,
-    /// A composer is on screen and the view is not scrolled back.
-    readable: bool,
-    /// The composer is empty (a placeholder suggestion is empty).
-    empty: bool,
-    /// Claude is mid-turn.
-    busy: bool,
-    /// The composer holds exactly the command (`lights::composer_holds`).
-    holds: bool,
-    /// The light shows another state than when the toggle began: the
-    /// command went.
-    switched: bool,
-}
-
-impl TypedView {
-    fn unreadable(stamp: u64) -> Self {
-        Self {
-            stamp,
-            readable: false,
-            empty: false,
-            busy: false,
-            holds: false,
-            switched: false,
-        }
-    }
-}
-
-/// A ctrl+u did not take a typed command back: a Claude Code whose composer
-/// no longer kills the line with it. Said in aterm's log once a run, so the
-/// drift is found by reading the log rather than by commands left behind.
-fn note_uncleared(session: u64, cmd: &str) {
-    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        aterm_log::warn!(
-            "claude lights: session {session}: ctrl+u did not take back {cmd:?}; the command is \
-             left in the prompt (a Claude Code whose composer changed?)"
-        );
-    }
 }
 
 /// Ask `ws`'s window, where it has one, for a frame.
@@ -1140,8 +719,8 @@ impl Block {
         self.cols.iter().any(|(_, l)| *l == light)
     }
 
-    /// A block of `lights` (the chips' cells, as one fast chip) and its
-    /// titles, for the rule's layout tests (`claude_footer`).
+    /// A block of `lights` (the chips' cells, as one chip) and its titles,
+    /// for the rule's layout tests (`claude_footer`).
     pub(crate) fn of_chips(
         lights: Vec<RenderCell>,
         title: Vec<RenderCell>,
@@ -1149,7 +728,7 @@ impl Block {
         reason: bool,
     ) -> Block {
         Block {
-            cols: vec![(0..lights.len(), Light::Fast)],
+            cols: vec![(0..lights.len(), Light::Mode)],
             title,
             short_title,
             reason,
@@ -1160,10 +739,8 @@ impl Block {
 
 impl App {
     /// Read one Claude Code pane's screen for its lights: remember what each
-    /// shows and move a toggle in flight along, waking the loop when its next
-    /// step was queued. Called for EVERY Claude Code pane each frame, painted
-    /// footer or not: a pasted slash command opens Claude's completion list
-    /// where the mode row was, and the toggle must still see the command land.
+    /// shows, and wake the loop when a toggle in flight was answered. Called
+    /// for EVERY Claude Code pane each frame, painted footer or not.
     pub(crate) fn observe_claude_lights(&mut self, wid: WindowId, session: u64, rows: &[String]) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -1173,12 +750,6 @@ impl App {
             .observe_rows(session, rows, lights::read_screen);
         if step.wake {
             crate::claude_footer::post_changed(session);
-        }
-        if step.auto_off_for_fast {
-            let (build, _) = self.claude_build_and_model(session);
-            if self.claude_fast_latch.cost_auto(build) {
-                self.redraw_every_window();
-            }
         }
     }
 
@@ -1196,50 +767,17 @@ impl App {
         room: usize,
     ) -> Option<Block> {
         let ws = self.windows.get(&wid)?;
-        let expect = self.claude_lights_expect(session);
         let now = Instant::now();
         [true, false]
             .into_iter()
-            .map(|reveal| ws.claude_lights.block(session, blank, &expect, now, reveal))
+            .map(|reveal| ws.claude_lights.block(session, blank, now, reveal))
             .find(|block| block.lights.len() <= room)
             .filter(|block| !block.cols.is_empty())
     }
 
-    /// `session`'s Claude build and model, as its footer facts name them —
-    /// the fast latch's key.
-    fn claude_build_and_model(&self, session: u64) -> (Option<String>, Option<String>) {
-        self.pool
-            .get(session)
-            .and_then(|entry| {
-                entry
-                    .ctx
-                    .timeline
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .claude_footer_shown()
-                    .map(|facts| (facts.version, facts.model))
-            })
-            .unwrap_or_default()
-    }
-
-    /// What the owner expects of `session`'s lights: fast mode ON, unless
-    /// Claude refused it lastingly for this session's Claude build and
-    /// model — and not in auto mode where this build has taken auto off for
-    /// it (the latch, `App::claude_fast_latch`).
-    fn claude_lights_expect(&self, session: u64) -> lights::Expect {
-        let latch = &self.claude_fast_latch;
-        if latch.refused.is_empty() && latch.costs_auto.is_empty() {
-            return lights::Expect::default();
-        }
-        let (build, model) = self.claude_build_and_model(session);
-        lights::Expect {
-            fast_costs_auto: latch.costs_auto.contains(&build),
-            fast: !latch.refused.contains_key(&(build, model)),
-        }
-    }
-
-    /// Every window repaints: a latch changed what their chips say.
-    fn redraw_every_window(&self) {
+    /// Every window repaints: a `[claude_footer]` switch changed what their
+    /// Claude Code rules say.
+    pub(crate) fn redraw_every_window(&self) {
         for ws in self.windows.values() {
             redraw(ws);
         }
@@ -1354,28 +892,11 @@ impl App {
 
     /// Flip `light` of `session` with Claude's own input (see the module
     /// header): refused, with the reason on the light, when its state is not
-    /// on screen, or a slash command would land on a draft, on a turn Claude
-    /// does not run it in, or in a driver's prompt. A light already as
+    /// on screen or the input seam takes no press. A light already as
     /// expected (the mode light in bypass or auto) does nothing at all.
-    /// Decided from the
-    /// ENGINE's screen as it is now, not from the last painted frame: a mode
-    /// that changed since is the one the toggle starts from.
-    #[cfg_attr(
-        test,
-        aterm_spec::refines(
-            machine = "claude_light_admission",
-            action = "StartAccepted",
-            project = "claude_lights::gesture_tests::project_admission"
-        )
-    )]
-    #[cfg_attr(
-        test,
-        aterm_spec::refines(
-            machine = "claude_light_admission",
-            action = "StartRejected",
-            project = "claude_lights::gesture_tests::project_admission"
-        )
-    )]
+    /// Decided from the ENGINE's screen as it is now, not from the last
+    /// painted frame: a mode that changed since is the one the toggle starts
+    /// from.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -1388,16 +909,13 @@ impl App {
         let now = Instant::now();
         // One toggle per SESSION, whichever window started it: the same
         // session shown in two windows must not run two mode cycles at once,
-        // each pressing on the other's answers — and a command aterm typed is
-        // the session's until it is submitted, taken back or left.
-        if self.claude_typed.contains_key(&session)
-            || self.windows.values().any(|w| {
-                w.claude_lights
-                    .sessions
-                    .get(&session)
-                    .is_some_and(|s| s.pending.is_some())
-            })
-        {
+        // each pressing on the other's answers.
+        if self.windows.values().any(|w| {
+            w.claude_lights
+                .sessions
+                .get(&session)
+                .is_some_and(|s| s.pending.is_some())
+        }) {
             return;
         }
         let refuse = |ws: &mut crate::WindowState, why: Refusal| {
@@ -1409,115 +927,26 @@ impl App {
             redraw(ws);
             wake_after(session, REFUSAL_SHOWN);
         };
-        let reading = self.claude_screen_now(session);
-        let lease = self.session_lease(session);
-        let expect = self.claude_lights_expect(session);
-        let ordering = self
-            .pool
-            .get(session)
-            .is_some_and(|entry| crate::app_input::paste_order::is_ordering(&entry.ctx.sink));
+        let screen = self.claude_screen_now(session);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let Some((screen, empty)) = reading else {
-            refuse(ws, Refusal::NotShown);
-            return;
-        };
-        let reading = lights::read(Some(&screen));
-        let from = reading.state(light);
+        let reading = lights::read(screen.as_ref());
         // The mode light in a mode the owner expects: nothing to do — its one
         // action is back to bypass or auto, and the session is there. Never a
         // press away from it (owner, 2026-09-27).
-        if light == Light::Mode && from == LightState::On {
+        if reading.state(light) == LightState::On {
             return;
         }
-        let Some(drive) = lights::drive(light, &reading) else {
-            refuse(ws, Refusal::NotShown);
-            return;
-        };
-        if let Drive::Command { immediate, .. } = drive {
-            if !empty {
-                refuse(ws, Refusal::Draft);
-                return;
-            }
-            // A command Claude does not run mid-turn would flip a turn later,
-            // the light wrong meanwhile: it waits for the turn. `/fast` is
-            // IMMEDIATE (`lights::Drive::Command`): Claude runs it mid-turn,
-            // the composer still up.
-            if screen.busy && !immediate {
-                refuse(ws, Refusal::Busy);
-                return;
-            }
-            // A driver may still be typing into this composer: a cooperative
-            // `lease`'s holder at any time, a `turn` until Claude has taken
-            // its prompt. A busy Claude under a `turn` HAS taken it — a
-            // command typed now cannot join that prompt. A mode light stays
-            // free — shift+tab never touches the prompt.
-            if lease
-                .as_ref()
-                .is_some_and(|(_, turn)| !*turn || !screen.busy)
-            {
-                refuse(ws, Refusal::Driven);
-                return;
-            }
-            if ordering {
-                // The empty screen can precede an earlier accepted paste's
-                // echo. Do not add our command behind that unread draft.
-                refuse(ws, Refusal::InputPending);
-                return;
-            }
-            // Fast mode on, in auto mode, on a build that has taken auto off
-            // for it before: the trade is not made on a click the person
-            // may take for "fast mode" alone.
-            if light == Light::Fast
-                && from == LightState::Off
-                && screen.mode == Some(Mode::Auto)
-                && expect.fast_costs_auto
-            {
-                refuse(ws, Refusal::CostsAuto);
-                return;
-            }
-        }
-        let command = match drive {
-            Drive::Command { cmd, immediate } => Some((cmd, immediate)),
-            Drive::CycleMode => None,
-        };
-        // A mode light is only ever clicked while its pill is read (`from` is
-        // Unknown otherwise), so the mode is there to start the cycle from.
         // Don't ask too: it leads on to manual, and forward from there.
-        let Some(mode) = screen.mode.or(command.map(|_| Mode::Manual)) else {
+        let Some(mode) = reading.mode.filter(|_| lights::deviates(light, &reading)) else {
             refuse(ws, Refusal::NotShown);
             return;
         };
-        let (first, poll) = match command {
-            None => (
-                crate::input::InputEvent::KeySequence(lights::SHIFT_TAB.to_vec()),
-                MODE_POLL,
-            ),
-            Some((cmd, _)) => (
-                crate::input::InputEvent::Paste(
-                    cmd.to_owned(),
-                    crate::input::PasteFraming::AtDrain,
-                ),
-                ANSWER_POLL,
-            ),
-        };
-        // The toggle's answer may take `settle`; the typed command's echo and
-        // Enter, one ordinary step.
-        let settle = Duration::from_millis(lights::settle_ms(&drive));
-        let echo = Duration::from_millis(lights::SETTLE_MS);
-        // Claude's answers to the command already on screen: an earlier try's
-        // is never this one's.
-        let answers = command
-            .and_then(|(cmd, _)| {
-                self.claude_rows_now(session)
-                    .map(|now| lights::fast_answers(&now.rows, cmd))
-            })
-            .unwrap_or_default();
         // The click's own input: the person's (see the module header).
         let outcome = self.input_to_session(
             wid,
-            first,
+            crate::input::InputEvent::KeySequence(lights::SHIFT_TAB.to_vec()),
             crate::input::Source::Human,
             Some(session),
             crate::app_input::PressPhase::Initial,
@@ -1526,130 +955,102 @@ impl App {
             return;
         };
         if outcome != crate::input::InputOutcome::Ok {
-            // A full/disconnected FIFO accepted no command. In particular,
-            // an earlier queued paste's identical echo must never become ours.
             refuse(ws, Refusal::InputRejected);
             return;
         }
+        let settle = Duration::from_millis(lights::SETTLE_MS);
         let s = ws.claude_lights.sessions.entry(session).or_default();
         s.shown.fold(&reading);
         s.refused = None;
         s.pending = Some(Pending {
             light,
-            from,
-            drive,
             started: mode,
             mode_at_press: mode,
             seen: Vec::new(),
             presses: 1,
             deadline: now + settle,
-            next_poll: Some(now + poll),
+            next_poll: Some(now + MODE_POLL),
             held_mid_turn: false,
-            echoes_floor: answers.echoed,
-            stale_notice: answers.notice,
-            last_said: None,
         });
         redraw(ws);
         wake_after(session, settle);
         // The toggle reads the engine for its answer on its own timer,
         // painted frames or none.
-        wake_after(session, poll);
-        if let Some((cmd, immediate)) = command
-            && let Some(entry) = self.pool.get(session)
-        {
-            // The paste stamped the person clock itself (it went through the
-            // seam as the click's input): read AFTER it, so only a later
-            // gesture moves it.
-            let stamp = entry.ctx.human_input.last();
-            self.claude_typed.insert(
-                session,
-                Typed {
-                    light,
-                    from,
-                    cmd,
-                    stamp,
-                    immediate,
-                    lease_at_paste: lease.map(|(token, _)| token),
-                    hands_off: false,
-                    deadline: now + echo,
-                    next_poll: Some(now + TYPED_POLL),
-                    cleared: None,
-                    late: false,
-                },
-            );
-            wake_after(session, TYPED_POLL);
-        }
+        wake_after(session, MODE_POLL);
     }
 
-    /// The driver holding `session`'s lease now, as `who`'s `driving=` token
-    /// (`<turn-id>` for a `turn`, `lease:<holder>` for a live `lease`,
-    /// `Lease::driving_token`), and whether it is a `turn` — `None` when no
-    /// driver holds it (a lapsed lease reads as none).
-    fn session_lease(&self, session: u64) -> Option<(String, bool)> {
-        let entry = self.pool.get(session)?;
-        let lease = entry
-            .ctx
-            .turn_lease
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let lease = lease.as_ref()?;
-        lease
-            .driving_token(crate::metrics::now_us())
-            .map(|token| (token, matches!(lease, crate::Lease::Turn { .. })))
+    /// `session`'s screen read straight from its engine (behind the reader's
+    /// panic fence) — `None` without a composer on screen or on a reader
+    /// panic. The engine's lock is held only to copy the rows out; the reader
+    /// runs after it is dropped.
+    fn claude_screen_now(&self, session: u64) -> Option<Screen> {
+        let rows = self.claude_rows_now(session)?;
+        fenced_screen_now(session, &rows, || lights::read_screen(&rows))
     }
 
-    /// `session`'s screen read straight from its engine ([`read_screen_now`],
-    /// behind the reader's panic fence) — `None` without a composer on
-    /// screen or on a reader panic. The engine's lock is held only to copy
-    /// the rows out; the reader runs after it is dropped.
-    fn claude_screen_now(&self, session: u64) -> Option<(Screen, bool)> {
-        let EngineRows {
-            rows,
-            cursor,
-            dim_col2,
-        } = self.claude_rows_now(session)?;
-        fenced_screen_now(session, &rows, || read_screen_now(&rows, cursor, &dim_col2))
+    /// `session`'s screen and whether its composer is EMPTY, read straight
+    /// from its engine behind the reader's panic fence — by the rule the
+    /// upgrade's gate reads it with ([`upgrade::composer_is_empty`]: a dim
+    /// suggestion on the caret row is no draft). `None` without a composer
+    /// on screen or on a reader panic. The engine's lock is held only to copy
+    /// the rows, the cursor and each row's column-2 DIM flag out. Read by the
+    /// footer for a live upgrade's note (`crate::claude_footer`: which words,
+    /// and none while a turn runs), every frame while one stands.
+    ///
+    /// [`upgrade::composer_is_empty`]: aterm_agent::harness::upgrade::composer_is_empty
+    pub(crate) fn claude_composer_now(&self, session: u64) -> Option<(Screen, bool)> {
+        let (rows, cursor, dim_col2) = {
+            let entry = self.pool.get(session)?;
+            let t = crate::term_lock(&entry.term);
+            if t.grid().display_offset() > 0 {
+                return None;
+            }
+            let rows: Vec<String> = (0..usize::from(t.rows()))
+                .map(|r| row_text(&t, r))
+                .collect();
+            let cursor = t.cursor();
+            let cursor = (usize::from(cursor.row), usize::from(cursor.col));
+            let dim_col2: Vec<bool> = (0..t.rows())
+                .map(|row| {
+                    t.grid()
+                        .row_at_screen(row)
+                        .and_then(|cells| cells.get(2))
+                        .is_some_and(|cell| cell.flags().contains(aterm_core::grid::CellFlags::DIM))
+                })
+                .collect();
+            (rows, cursor, dim_col2)
+        };
+        fenced_screen_now(session, &rows, || {
+            let caret = aterm_phase::phase::composer_draft(&rows).map(|(caret, _)| caret);
+            let dim = caret.is_some_and(|row| dim_col2.get(row).copied().unwrap_or(false));
+            let screen = lights::read_screen(&rows)?;
+            let empty = aterm_agent::harness::upgrade::composer_is_empty(&rows, Some(cursor), dim);
+            Some((screen, empty))
+        })
     }
 
-    /// `session`'s live screen copied out of its engine: its rows as text,
-    /// the cursor, and whether each row's column 2 is drawn DIM (on the caret
-    /// row, a placeholder suggestion, not a draft — the `cell` verb's
-    /// reading, which `composer_is_empty` wants). `None` for a gone session
-    /// or a view scrolled into history. The lock is held only to copy.
-    fn claude_rows_now(&self, session: u64) -> Option<EngineRows> {
+    /// `session`'s live screen copied out of its engine, its rows as text.
+    /// `None` for a gone session or a view scrolled into history. The lock is
+    /// held only to copy.
+    fn claude_rows_now(&self, session: u64) -> Option<Vec<String>> {
         let entry = self.pool.get(session)?;
         let t = crate::term_lock(&entry.term);
         if t.grid().display_offset() > 0 {
             return None;
         }
-        let rows: Vec<String> = (0..usize::from(t.rows()))
-            .map(|r| row_text(&t, r))
-            .collect();
-        let cursor = t.cursor();
-        let cursor = (usize::from(cursor.row), usize::from(cursor.col));
-        let dim_col2: Vec<bool> = (0..t.rows())
-            .map(|row| {
-                t.grid()
-                    .row_at_screen(row)
-                    .and_then(|cells| cells.get(2))
-                    .is_some_and(|cell| cell.flags().contains(aterm_core::grid::CellFlags::DIM))
-            })
-            .collect();
-        Some(EngineRows {
-            rows,
-            cursor,
-            dim_col2,
-        })
+        Some(
+            (0..usize::from(t.rows()))
+                .map(|r| row_text(&t, r))
+                .collect(),
+        )
     }
 
     /// The footer wake's lights half: move every mode return along from the
-    /// ENGINE ([`Self::advance_claude_mode_returns`]), give up on toggles past
-    /// their deadline (and time the end of the refusal that says so), then
-    /// the typed commands' Enter or take-back ([`Self::drain_claude_typed`]).
+    /// ENGINE ([`Self::advance_claude_mode_returns`]), then give up on toggles
+    /// past their deadline (and time the end of the refusal that says so).
     pub(crate) fn drain_claude_lights(&mut self) {
         let now = Instant::now();
         self.advance_claude_mode_returns(now);
-        self.answer_claude_commands(now);
         for ws in self.windows.values_mut() {
             let (changed, refused) = ws.claude_lights.expire(now);
             if changed {
@@ -1659,7 +1060,6 @@ impl App {
                 wake_after(session, REFUSAL_SHOWN);
             }
         }
-        self.drain_claude_typed(now);
     }
 
     /// Every mode return in flight, one step from the ENGINE's screen as it
@@ -1714,16 +1114,12 @@ impl App {
                 ws.claude_lights
                     .sessions
                     .iter()
-                    .filter(|(_, s)| {
-                        s.pending
-                            .as_ref()
-                            .is_some_and(|p| p.drive == Drive::CycleMode)
-                    })
+                    .filter(|(_, s)| s.pending.is_some())
                     .map(|(session, _)| (*wid, *session))
             })
             .collect();
         for (wid, session) in returns {
-            let screen = self.claude_screen_now(session).map(|(screen, _)| screen);
+            let screen = self.claude_screen_now(session);
             let Some(ws) = self.windows.get_mut(&wid) else {
                 continue;
             };
@@ -1763,352 +1159,6 @@ impl App {
         }
     }
 
-    /// Every slash command in flight, resolved from the ENGINE: its light
-    /// switched, or Claude's own answer to it (`lights::fast_answers`) — a
-    /// refusal said in Claude's words, and latched for this Claude build and
-    /// model when it is lasting (`lights::FastRefusal::lasting`); a switch
-    /// that took auto mode off latched for the build. One poll is kept
-    /// armed while the command is in flight — through a view scrolled into
-    /// history, which the engine read skips: an idle Claude hides its
-    /// composer while it applies `/fast`, and nothing paints meanwhile.
-    fn answer_claude_commands(&mut self, now: Instant) {
-        let commands: Vec<(WindowId, u64, &'static str)> = self
-            .windows
-            .iter()
-            .flat_map(|(wid, ws)| {
-                ws.claude_lights.sessions.iter().filter_map(|(session, s)| {
-                    match s.pending.as_ref()?.drive {
-                        Drive::Command { cmd, .. } => Some((*wid, *session, cmd)),
-                        Drive::CycleMode => None,
-                    }
-                })
-            })
-            .collect();
-        for (wid, session, cmd) in commands {
-            let read = self
-                .claude_rows_now(session)
-                .and_then(|EngineRows { rows, .. }| {
-                    crate::reader_guard::read_or_none(
-                        &format!("{session}"),
-                        "Claude Code fast answer",
-                        &rows,
-                        || {
-                            let screen = lights::read_screen(&rows);
-                            CommandRead {
-                                fast: lights::read(screen.as_ref()).fast,
-                                mode: screen.and_then(|screen| screen.mode),
-                                answers: lights::fast_answers(&rows, cmd),
-                                auto_off: lights::says_auto_off_for_fast(&rows),
-                            }
-                        },
-                    )
-                });
-            let (build, model) = self.claude_build_and_model(session);
-            let Some(ws) = self.windows.get_mut(&wid) else {
-                continue;
-            };
-            let end = read.and_then(|read| ws.claude_lights.answer(session, &read, now));
-            let Some(end) = end else {
-                // Not answered, or not readable (scrolled back, a reader
-                // panic): look again.
-                ws.claude_lights.arm_poll(session, now, ANSWER_POLL);
-                continue;
-            };
-            redraw(ws);
-            wake_after(session, REFUSAL_SHOWN);
-            let mut latched = false;
-            if let Some(why) = end.refusal.filter(|why| why.lasting()) {
-                latched |= self.claude_fast_latch.refuse(build.clone(), model, why);
-            }
-            if end.cost_auto {
-                latched |= self.claude_fast_latch.cost_auto(build);
-            }
-            if latched {
-                self.redraw_every_window();
-            }
-        }
-    }
-
-    /// The typed commands' half of the footer wake: for each slash command a
-    /// light typed, read the session's composer from the ENGINE and decide —
-    /// submit it (the composer holds exactly it, Claude is idle or runs the
-    /// command mid-turn, and no other hand has come to the session since),
-    /// wait, or at the deadline take it
-    /// back (one ctrl+u under the same conditions, read back once) or leave it
-    /// and say so. No key ever goes into a composer another hand has touched:
-    /// the text may be theirs.
-    #[cfg_attr(
-        test,
-        aterm_spec::refines(
-            machine = "claude_light_admission",
-            action = "FollowAccepted",
-            project = "claude_lights::gesture_tests::project_admission"
-        )
-    )]
-    #[cfg_attr(
-        test,
-        aterm_spec::refines(
-            machine = "claude_light_admission",
-            action = "FollowRejected",
-            project = "claude_lights::gesture_tests::project_admission"
-        )
-    )]
-    #[cfg_attr(
-        test,
-        aterm_spec::refines(
-            machine = "claude_light_admission",
-            action = "Wait",
-            project = "claude_lights::gesture_tests::project_admission"
-        )
-    )]
-    fn drain_claude_typed(&mut self, now: Instant) {
-        let sessions: Vec<u64> = self.claude_typed.keys().copied().collect();
-        for session in sessions {
-            let Some(t) = self.claude_typed.get(&session).cloned() else {
-                continue;
-            };
-            // A ctrl+u's read-back is not due yet: its own wake is posted.
-            if t.cleared.is_some_and(|at| now < at) {
-                continue;
-            }
-            let Some(view) = self.typed_view(session, &t) else {
-                self.claude_typed.remove(&session);
-                continue;
-            };
-            if t.cleared.is_some() {
-                self.claude_typed.remove(&session);
-                if view.holds {
-                    note_uncleared(session, t.cmd);
-                    self.leave_claude_typed(session, t.light, now);
-                } else if !view.switched {
-                    // Taken back: the command never went, and nothing will
-                    // answer it — said now, not at the end of the answer's
-                    // own window (`lights::FAST_SETTLE_MS`).
-                    self.end_claude_command(session, t.light, now);
-                }
-                continue;
-            }
-            // A lease taken or changed since the paste is another hand; one
-            // that was live at the paste (a `turn` whose prompt Claude had
-            // already taken) is not.
-            let lease = self.session_lease(session).map(|(token, _)| token);
-            let leased = lease.is_some() && lease != t.lease_at_paste;
-            let hands_off = t.hands_off || view.stamp != t.stamp || leased;
-            let ordering = self
-                .pool
-                .get(session)
-                .is_some_and(|entry| crate::app_input::paste_order::is_ordering(&entry.ctx.sink));
-            if now >= t.deadline {
-                self.claude_typed.remove(&session);
-                if ordering {
-                    // The command may still arrive after this deadline.
-                    // Never queue Return or cleanup behind undelivered input.
-                    self.leave_claude_typed(session, t.light, now);
-                    continue;
-                }
-                // It went — the person's own Return, say: nothing to say.
-                if view.switched {
-                    continue;
-                }
-                if !hands_off
-                    && view.holds
-                    && let Some(kill) = crate::control::parse_key("ctrl+u")
-                {
-                    let Some(stamp) = self.send_typed(session, kill) else {
-                        self.leave_claude_typed(session, t.light, now);
-                        continue;
-                    };
-                    self.claude_typed.insert(
-                        session,
-                        Typed {
-                            stamp,
-                            cleared: Some(now + CLEAR_READ_BACK),
-                            ..t
-                        },
-                    );
-                    wake_after(session, CLEAR_READ_BACK);
-                    continue;
-                }
-                if !hands_off && view.readable && view.empty && !t.late {
-                    // Nothing in the prompt yet: one late look, in case the
-                    // paste's echo is still on its way.
-                    self.claude_typed.insert(
-                        session,
-                        Typed {
-                            deadline: now + REFUSAL_SHOWN,
-                            next_poll: None,
-                            late: true,
-                            ..t
-                        },
-                    );
-                    wake_after(session, REFUSAL_SHOWN);
-                    continue;
-                }
-                if !(view.readable && view.empty) {
-                    self.leave_claude_typed(session, t.light, now);
-                }
-                continue;
-            }
-            if hands_off {
-                // No more keys; the toggle's settle wake brings the deadline.
-                if let Some(rec) = self.claude_typed.get_mut(&session) {
-                    rec.hands_off = true;
-                }
-                continue;
-            }
-            if t.late {
-                // The late look waits for its own wake; it never submits.
-                continue;
-            }
-            if !ordering && view.holds && (!view.busy || t.immediate) {
-                let accepted = self.send_typed(
-                    session,
-                    crate::input::InputEvent::KeySequence(b"\r".to_vec()),
-                );
-                self.claude_typed.remove(&session);
-                if accepted.is_none() {
-                    // Do not silently forget an unsubmitted command or retry
-                    // later under a composer that another gesture may change.
-                    self.leave_claude_typed(session, t.light, now);
-                } else {
-                    self.open_claude_answer_window(session, t.light, now);
-                }
-                continue;
-            }
-            if t.next_poll.is_none_or(|at| now >= at)
-                && let Some(rec) = self.claude_typed.get_mut(&session)
-            {
-                rec.next_poll = Some(now + TYPED_POLL);
-                wake_after(session, TYPED_POLL);
-            }
-        }
-    }
-
-    /// A typed command's Enter went: Claude's answer may take its whole
-    /// window (`lights::settle_ms`, the up-to-8 s org check of `/fast`) FROM
-    /// NOW — the paste's echo may have taken most of a step already, and
-    /// the window must not be spent before the command is even submitted.
-    fn open_claude_answer_window(&mut self, session: u64, light: Light, now: Instant) {
-        let mut settle = None;
-        for ws in self.windows.values_mut() {
-            if let Some(p) = ws
-                .claude_lights
-                .sessions
-                .get_mut(&session)
-                .and_then(|s| s.pending.as_mut())
-                .filter(|p| p.light == light)
-            {
-                let window = Duration::from_millis(lights::settle_ms(&p.drive));
-                p.deadline = p.deadline.max(now + window);
-                settle = Some(window);
-            }
-        }
-        if let Some(window) = settle {
-            wake_after(session, window);
-        }
-    }
-
-    /// Send one of a typed command's keys to `session` through the input
-    /// seam — aterm's own write after the click, not a person's gesture, so
-    /// as `Source::Controller` (the module header) — and return the person
-    /// clock right after acceptance: any other value later is a person.
-    /// `None` means no route or rejected input; the caller must say text is left.
-    fn send_typed(&mut self, session: u64, ev: crate::input::InputEvent) -> Option<u64> {
-        // A window that shows the session (its focused pane, else any of its
-        // tabs); a session no window shows is reached through any window.
-        let wid = self
-            .windows_with_focused_session(session)
-            .first()
-            .copied()
-            .or_else(|| {
-                self.tabs_viewing_session(session)
-                    .first()
-                    .map(|(wid, _)| *wid)
-            })
-            .or_else(|| self.windows.keys().next().copied())?;
-        if self.input_to_session(
-            wid,
-            ev,
-            crate::input::Source::Controller,
-            Some(session),
-            crate::app_input::PressPhase::Initial,
-        ) != crate::input::InputOutcome::Ok
-        {
-            return None;
-        }
-        self.pool
-            .get(session)
-            .map(|entry| entry.ctx.human_input.last())
-    }
-
-    /// A typed command is left in `session`'s composer: every window that
-    /// knows the session drops the toggle and says so on the light.
-    fn leave_claude_typed(&mut self, session: u64, light: Light, now: Instant) {
-        for ws in self.windows.values_mut() {
-            let Some(s) = ws.claude_lights.sessions.get_mut(&session) else {
-                continue;
-            };
-            if s.pending.as_ref().is_some_and(|p| p.light == light) {
-                s.pending = None;
-            }
-            s.refused = Some((light, Refusal::LeftTyped, now + REFUSAL_SHOWN));
-            redraw(ws);
-        }
-        wake_after(session, REFUSAL_SHOWN);
-    }
-
-    /// A typed command was taken back before it went: every window whose
-    /// toggle of `light` is still in flight on `session` ends it, saying
-    /// Claude did not switch.
-    fn end_claude_command(&mut self, session: u64, light: Light, now: Instant) {
-        for ws in self.windows.values_mut() {
-            let Some(s) = ws.claude_lights.sessions.get_mut(&session) else {
-                continue;
-            };
-            if s.pending.take_if(|p| p.light == light).is_none() {
-                continue;
-            }
-            s.refused = Some((light, Refusal::NoChange, now + REFUSAL_SHOWN));
-            redraw(ws);
-        }
-        wake_after(session, REFUSAL_SHOWN);
-    }
-
-    /// `session`'s composer as the typed command `typed` sees it, read from the
-    /// engine (the reader behind its panic fence; a panic reads as
-    /// unreadable) — `None` when the session is gone.
-    fn typed_view(&self, session: u64, typed: &Typed) -> Option<TypedView> {
-        let stamp = self.pool.get(session)?.ctx.human_input.last();
-        let Some(EngineRows {
-            rows,
-            cursor,
-            dim_col2,
-        }) = self.claude_rows_now(session)
-        else {
-            return Some(TypedView::unreadable(stamp));
-        };
-        let read = crate::reader_guard::read_or_none(
-            &format!("{session}"),
-            "Claude Code typed command",
-            &rows,
-            || {
-                read_screen_now(&rows, cursor, &dim_col2).map(|(screen, empty)| {
-                    let now = lights::read(Some(&screen)).state(typed.light);
-                    TypedView {
-                        stamp,
-                        readable: true,
-                        empty,
-                        busy: screen.busy,
-                        holds: lights::composer_holds(&rows, cursor, typed.cmd),
-                        switched: now != typed.from && now != LightState::Unknown,
-                    }
-                })
-            },
-        )
-        .flatten();
-        Some(read.unwrap_or_else(|| TypedView::unreadable(stamp)))
-    }
-
     /// Stop `session`'s toggle in flight and say why on its light.
     fn abandon_claude_light(&mut self, wid: WindowId, session: u64, why: Refusal) {
         let now = Instant::now();
@@ -2125,8 +1175,8 @@ impl App {
     }
 
     /// The keyboard half (see the module header): `ctrl+shift+tab` selects
-    /// the focused pane's next light; with one selected, Return/Space toggle,
-    /// ←/→ move and Escape lets go. Any other key lets go and is NOT consumed.
+    /// the focused pane's next light; with one selected, Return/Space toggle
+    /// and Escape lets go. Any other key lets go and is NOT consumed.
     /// Whether the key was the lights'.
     pub(crate) fn on_key_claude_lights(
         &mut self,
@@ -2174,7 +1224,6 @@ impl App {
         let Some(session) = self.focused_session_id(wid) else {
             return false;
         };
-        let expect = self.claude_lights_expect(session);
         let now = Instant::now();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
@@ -2219,7 +1268,6 @@ impl App {
                     .block_with(
                         session,
                         RenderCell::default(),
-                        &expect,
                         now,
                         Some(light),
                         None,
@@ -2230,20 +1278,12 @@ impl App {
                     <= room
             })
         };
-        let step = |from: Option<Light>, forward: bool| -> Option<Light> {
+        let step = |from: Option<Light>| -> Option<Light> {
             let n = order.len();
             let at = from
                 .and_then(|l| order.iter().position(|o| *o == l))
-                .unwrap_or(if forward { n.checked_sub(1)? } else { 0 });
-            (1..=n)
-                .map(|k| {
-                    order[if forward {
-                        (at + k) % n
-                    } else {
-                        (at + n * k - k) % n
-                    }]
-                })
-                .find(|l| fits(*l))
+                .unwrap_or(n.checked_sub(1)?);
+            (1..=n).map(|k| order[(at + k) % n]).find(|l| fits(*l))
         };
         let selected = ws
             .claude_lights
@@ -2254,7 +1294,7 @@ impl App {
         // glass — even with no chip to select for want of room: passed on,
         // it would reach Claude as shift+tab, and cycle its mode.
         if select_chord && room.is_some() {
-            if let Some(next) = step(selected, true) {
+            if let Some(next) = step(selected) {
                 ws.claude_lights.select(Some((session, next)));
                 redraw(ws);
             }
@@ -2269,13 +1309,6 @@ impl App {
                 ws.claude_lights.select(None);
                 redraw(ws);
                 self.toggle_claude_light(wid, session, light);
-                true
-            }
-            Key::Named(NamedKey::ArrowRight | NamedKey::ArrowLeft) if plain => {
-                let forward = matches!(ev.logical_key, Key::Named(NamedKey::ArrowRight));
-                let next = step(Some(light), forward).map(|l| (session, l));
-                ws.claude_lights.select(next);
-                redraw(ws);
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -2313,50 +1346,12 @@ mod tests {
         assert_eq!(w.fingerprint(now), hovered);
 
         w.sessions.get_mut(&1_000).unwrap().refused =
-            Some((Light::Fast, Refusal::Draft, now + Duration::from_secs(1)));
+            Some((Light::Mode, Refusal::NotShown, now + Duration::from_secs(1)));
         assert_ne!(w.fingerprint(now), hovered);
         assert_eq!(w.fingerprint(now + Duration::from_secs(2)), hovered);
 
         w.hover = None;
         assert_eq!(w.fingerprint(now + Duration::from_secs(2)), 0);
-    }
-
-    /// Manual cost diagnostic: run with `--ignored --nocapture` to compare a
-    /// visible light with and without a long history of inert Claude sessions.
-    #[test]
-    #[ignore = "manual fingerprint cost diagnostic"]
-    fn lights_fingerprint_one_vs_thousand_inert_sessions() {
-        const SAMPLES: u128 = 50_000;
-        let now = Instant::now();
-        let mut short = WindowLights {
-            hover: Some((7, Light::Mode)),
-            ..WindowLights::default()
-        };
-        short.sessions.insert(7, SessionLights::default());
-        short.sessions.get_mut(&7).unwrap().refused =
-            Some((Light::Fast, Refusal::Draft, now + Duration::from_secs(60)));
-        let mut long = WindowLights {
-            hover: short.hover,
-            ..WindowLights::default()
-        };
-        long.sessions = short.sessions.clone();
-        for session in 100..1_100 {
-            long.sessions.insert(session, SessionLights::default());
-        }
-        assert_eq!(short.fingerprint(now), long.fingerprint(now));
-
-        let measure = |w: &WindowLights| {
-            let start = Instant::now();
-            for _ in 0..SAMPLES {
-                std::hint::black_box(w.fingerprint(now));
-            }
-            start.elapsed().as_nanos() / SAMPLES
-        };
-        eprintln!(
-            "Claude lights fingerprint: 1 session={} ns/call, 1001 sessions={} ns/call",
-            measure(&short),
-            measure(&long)
-        );
     }
 
     fn blank() -> RenderCell {
@@ -2392,15 +1387,15 @@ mod tests {
     /// folds NOTHING in — the lights keep what they showed, a mode cycle in
     /// flight takes no step (no shift+tab queued, its press count and mode
     /// untouched) — and a toggle's own reading is refused (`None`: nothing is
-    /// typed). Controls: the same screen through the real readers DOES step
-    /// the cycle, and a toggle's reading of it is a composer, empty.
+    /// pressed). Controls: the same screen through the real readers DOES step
+    /// the cycle, and a toggle's reading of it is a composer.
     #[test]
     fn a_reader_panic_folds_nothing_in_and_types_nothing() {
         let now = Instant::now();
         let rule = "\u{2500}".repeat(60);
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&rule, MANUAL, ""));
-        start(&mut w, Light::Mode, Drive::CycleMode, Mode::Manual, now);
+        start(&mut w, Light::Mode, Mode::Manual, now);
         let shown = w.sessions[&7].shown;
         let boom = |_: &[String]| -> Option<Screen> { panic!("stand-in reader panic") };
         let plan = screen(&rule, PLAN, "");
@@ -2410,26 +1405,24 @@ mod tests {
         let p = s.pending.as_ref().expect("the toggle is still in flight");
         assert_eq!((p.presses, p.mode_at_press), (1, Mode::Manual));
         // A toggle's reading.
-        let dims = vec![false; plan.len()];
         assert!(
-            fenced_screen_now(7, &plan, || -> Option<(Screen, bool)> {
+            fenced_screen_now(7, &plan, || -> Option<Screen> {
                 panic!("stand-in reader panic")
             })
             .is_none()
         );
-        let (_, empty) = fenced_screen_now(7, &plan, || read_screen_now(&plan, (1, 2), &dims))
-            .expect("the real reader sees the composer");
-        assert!(empty);
+        assert!(
+            fenced_screen_now(7, &plan, || lights::read_screen(&plan)).is_some(),
+            "the real reader sees the composer"
+        );
         // Control: the real reader wakes the loop on the same screen.
         assert!(observe(&mut w, &plan).wake);
     }
 
-    fn start(w: &mut WindowLights, light: Light, drive: Drive, mode: Mode, now: Instant) {
+    fn start(w: &mut WindowLights, light: Light, mode: Mode, now: Instant) {
         let s = w.sessions.entry(7).or_default();
         s.pending = Some(Pending {
             light,
-            from: s.shown.state(light),
-            drive,
             started: mode,
             mode_at_press: mode,
             seen: Vec::new(),
@@ -2437,9 +1430,6 @@ mod tests {
             deadline: now + Duration::from_millis(lights::SETTLE_MS),
             next_poll: None,
             held_mid_turn: false,
-            echoes_floor: 0,
-            stale_notice: None,
-            last_said: None,
         });
     }
 
@@ -2458,13 +1448,7 @@ mod tests {
         let rule = "\u{2500}".repeat(60);
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&rule, ACCEPT, ""));
-        start(
-            &mut w,
-            Light::Mode,
-            Drive::CycleMode,
-            Mode::AcceptEdits,
-            now,
-        );
+        start(&mut w, Light::Mode, Mode::AcceptEdits, now);
         assert_eq!(
             w.advance(7, engine(&rule, ACCEPT).as_ref(), now),
             Advance::Wait,
@@ -2506,7 +1490,7 @@ mod tests {
         );
         assert!(w.sessions[&7].pending.is_none(), "auto reached");
         assert!(
-            matches!(w.sessions[&7].notice, Some((Light::Mode, _, None))),
+            matches!(w.sessions[&7].notice, Some((Light::Mode, _))),
             "the arrival is said on the chip for a moment"
         );
         assert_eq!(w.sessions[&7].shown.state(Light::Mode), LightState::On);
@@ -2533,7 +1517,7 @@ mod tests {
         let rule = "\u{2500}".repeat(60);
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&rule, MANUAL, ""));
-        start(&mut w, Light::Mode, Drive::CycleMode, Mode::Manual, now);
+        start(&mut w, Light::Mode, Mode::Manual, now);
         assert_eq!(
             w.advance(7, engine(&rule, BUSY_ACCEPT).as_ref(), now),
             Advance::Wait,
@@ -2551,7 +1535,7 @@ mod tests {
         // Held to the deadline: stopped, and said so.
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&rule, MANUAL, ""));
-        start(&mut w, Light::Mode, Drive::CycleMode, Mode::Manual, now);
+        start(&mut w, Light::Mode, Mode::Manual, now);
         assert_eq!(
             w.advance(7, engine(&rule, BUSY_ACCEPT).as_ref(), now),
             Advance::Wait
@@ -2563,7 +1547,7 @@ mod tests {
             Some((Light::Mode, Refusal::StoppedMidTurn(Mode::AcceptEdits), _))
         ));
         let title: String = w
-            .block(7, blank(), &lights::Expect::default(), due, true)
+            .block(7, blank(), due, true)
             .title
             .iter()
             .map(|c| c.ch)
@@ -2587,7 +1571,7 @@ mod tests {
         let rule = "\u{2500}".repeat(60);
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&rule, MANUAL, ""));
-        start(&mut w, Light::Mode, Drive::CycleMode, Mode::Manual, now);
+        start(&mut w, Light::Mode, Mode::Manual, now);
         let two = now + Duration::from_millis(2000);
         assert_eq!(
             w.advance(7, engine(&rule, ACCEPT).as_ref(), two),
@@ -2612,7 +1596,7 @@ mod tests {
             Some((Light::Mode, Refusal::StoppedIn(Mode::AcceptEdits), _))
         ));
         let title: String = w
-            .block(7, blank(), &lights::Expect::default(), two, true)
+            .block(7, blank(), two, true)
             .title
             .iter()
             .map(|c| c.ch)
@@ -2632,7 +1616,7 @@ mod tests {
         let rule = "\u{2500}".repeat(60);
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&rule, MANUAL, ""));
-        start(&mut w, Light::Mode, Drive::CycleMode, Mode::Manual, now);
+        start(&mut w, Light::Mode, Mode::Manual, now);
         let due = now + Duration::from_millis(lights::SETTLE_MS);
 
         assert_eq!(
@@ -2650,13 +1634,7 @@ mod tests {
 
         // The same answer before its deadline still makes the next press.
         let mut timely = WindowLights::default();
-        start(
-            &mut timely,
-            Light::Mode,
-            Drive::CycleMode,
-            Mode::Manual,
-            now,
-        );
+        start(&mut timely, Light::Mode, Mode::Manual, now);
         assert_eq!(
             timely.advance(
                 7,
@@ -2671,13 +1649,7 @@ mod tests {
         // Already at the requested mode: accepting the late observation
         // sends no key and keeps the actual success visible.
         let mut arrived = WindowLights::default();
-        start(
-            &mut arrived,
-            Light::Mode,
-            Drive::CycleMode,
-            Mode::Manual,
-            now,
-        );
+        start(&mut arrived, Light::Mode, Mode::Manual, now);
         assert_eq!(
             arrived.advance(7, engine(&rule, BYPASS).as_ref(), due),
             Advance::Arrived
@@ -2685,407 +1657,72 @@ mod tests {
         assert!(arrived.sessions[&7].pending.is_none());
     }
 
-    /// A cycle that holds neither bypass nor auto (manual → accept edits →
-    /// plan → manual): the search comes back round to MANUAL and stops — the
-    /// mode the person had — saying neither is in this cycle and naming the
-    /// mode, never pressing on into another lap.
-    #[test]
-    fn a_cycle_without_an_expected_mode_is_refused_after_one_lap_back_where_it_began() {
-        let now = Instant::now();
-        let rule = "\u{2500}".repeat(60);
-        let mut w = WindowLights::default();
-        observe(&mut w, &screen(&rule, MANUAL, ""));
-        start(&mut w, Light::Mode, Drive::CycleMode, Mode::Manual, now);
-        for (row, mode) in [(ACCEPT, Mode::AcceptEdits), (PLAN, Mode::Plan)] {
-            assert_eq!(
-                w.advance(7, engine(&rule, row).as_ref(), now),
-                Advance::Press { expect: mode },
-                "{mode:?}: press on"
-            );
-        }
-        assert_eq!(
-            w.advance(7, engine(&rule, MANUAL).as_ref(), now),
-            Advance::Lapped,
-            "a lap: stop"
-        );
-        let s = &w.sessions[&7];
-        assert!(s.pending.is_none());
-        assert!(matches!(
-            s.refused,
-            Some((Light::Mode, Refusal::NotInCycle(Mode::Manual), _))
-        ));
-        assert_eq!(s.shown.mode, Some(Mode::Manual), "manual, as before");
-    }
-
-    /// A slash command's frames queue nothing — its Enter is judged from the
-    /// engine by the loop (`App::drain_claude_typed`), never off a frame — a
-    /// frame whose tag moved only WAKES the loop, and the engine's read
-    /// resolves it (`WindowLights::answer`).
-    #[test]
-    fn a_commands_frames_queue_nothing_and_its_tag_resolves_it() {
-        let now = Instant::now();
-        let bare = "\u{2500}".repeat(60);
-        let mut w = WindowLights::default();
-        observe(&mut w, &screen(&bare, BYPASS, ""));
-        start(
-            &mut w,
-            Light::Fast,
-            Drive::Command {
-                cmd: "/fast on",
-                immediate: true,
-            },
-            Mode::Bypass,
-            now,
-        );
-        assert!(!observe(&mut w, &screen(&bare, BYPASS, "/fast on")).wake);
-        let tagged = format!("{} \u{21AF} \u{2500}", "\u{2500}".repeat(40));
-        assert!(observe(&mut w, &screen(&tagged, BYPASS, "")).wake);
-        assert!(w.sessions[&7].pending.is_some(), "a frame decides nothing");
-        let end = w.answer(
-            7,
-            &read_of(LightState::On, Mode::Bypass, Default::default()),
-            now,
-        );
-        assert_eq!(
-            end,
-            Some(CommandEnd {
-                refusal: None,
-                cost_auto: false
-            })
-        );
-        assert!(w.sessions[&7].pending.is_none());
-    }
-
-    /// An engine read for [`WindowLights::answer`]: fast mode, the pill, the
-    /// answers, nothing said of auto mode.
-    fn read_of(fast: LightState, mode: Mode, answers: lights::FastAnswers) -> CommandRead {
-        CommandRead {
-            fast,
-            mode: Some(mode),
-            answers,
-            auto_off: false,
-        }
-    }
-
-    /// `/fast on` in flight in session 7, fast mode off, from `mode`, with
-    /// `answers` on screen at the click.
-    fn fast_in_flight(mode: Mode, answers: lights::FastAnswers, now: Instant) -> WindowLights {
-        let mut w = WindowLights::default();
-        observe(&mut w, &screen(&"\u{2500}".repeat(60), BYPASS, ""));
-        start(
-            &mut w,
-            Light::Fast,
-            Drive::Command {
-                cmd: "/fast on",
-                immediate: true,
-            },
-            mode,
-            now,
-        );
-        let p = w.sessions.get_mut(&7).unwrap().pending.as_mut().unwrap();
-        p.echoes_floor = answers.echoed;
-        p.stale_notice = answers.notice;
-        w
-    }
-
-    /// THE NOTIFICATION SLOT IS NOT COUNTED (the review of 2026-09-27): a
-    /// notification up at the click is an earlier try's; a DIFFERENT one in
-    /// its place, or any once the slot has emptied, is this try's — and a
-    /// new transcript answer is never overruled by a stale notification.
-    /// The same words replaced in place cannot be told from the old ones: the
-    /// toggle waits, and its deadline says Claude's newest words, not "did
-    /// not switch".
-    #[test]
-    fn a_notification_is_this_tries_only_once_it_changed_and_an_echo_outranks_a_stale_one() {
-        use lights::{FastAnswer as A, FastAnswers, FastRefusal as R};
-        let now = Instant::now();
-        let checking = Some(A::Refused(R::Checking));
-        let stale = FastAnswers {
-            notice: checking,
-            ..FastAnswers::default()
-        };
-        // The same notification still up: not an answer.
-        let mut w = fast_in_flight(Mode::Bypass, stale, now);
-        assert_eq!(
-            w.answer(7, &read_of(LightState::Off, Mode::Bypass, stale), now),
-            None
-        );
-        // A different one in the slot: this try's.
-        let refused = FastAnswers {
-            notice: Some(A::Refused(R::DisabledByOrg)),
-            ..FastAnswers::default()
-        };
-        assert_eq!(
-            w.answer(7, &read_of(LightState::Off, Mode::Bypass, refused), now),
-            Some(CommandEnd {
-                refusal: Some(R::DisabledByOrg),
-                cost_auto: false
-            })
-        );
-        // The slot emptied, then the same words again: this try's.
-        let mut w = fast_in_flight(Mode::Bypass, stale, now);
-        let empty = FastAnswers::default();
-        assert_eq!(
-            w.answer(7, &read_of(LightState::Off, Mode::Bypass, empty), now),
-            None
-        );
-        assert_eq!(
-            w.answer(7, &read_of(LightState::Off, Mode::Bypass, stale), now),
-            Some(CommandEnd {
-                refusal: Some(R::Checking),
-                cost_auto: false
-            })
-        );
-        // A new echo while the stale notification is still up: the echo
-        // speaks, not the stale words.
-        let mut w = fast_in_flight(Mode::Bypass, stale, now);
-        let echoed = FastAnswers {
-            echoed: 1,
-            echo: Some(A::On),
-            notice: checking,
-        };
-        assert_eq!(
-            w.answer(7, &read_of(LightState::Off, Mode::Bypass, echoed), now),
-            Some(CommandEnd {
-                refusal: None,
-                cost_auto: false
-            }),
-            "the echo's ON, not the stale refusal"
-        );
-        // Unresolvable to the end: the deadline says Claude's words.
-        let mut w = fast_in_flight(Mode::Bypass, stale, now);
-        assert_eq!(
-            w.answer(7, &read_of(LightState::Off, Mode::Bypass, stale), now),
-            None
-        );
-        let due = now + Duration::from_millis(lights::SETTLE_MS);
-        assert_eq!(w.expire(due), (true, vec![7]));
-        assert!(matches!(
-            w.sessions[&7].refused,
-            Some((Light::Fast, Refusal::Vendor(R::Checking), _))
-        ));
-    }
-
-    /// Claude's words on a notice go WITH that notice: a fast notice that
-    /// said "Claude switched the model" ends, and a later mode notice is the
-    /// mode's own. (The retired separate `said` slot outlived its notice and
-    /// titled the mode chip "Permission mode: on · Claude switched the
-    /// model".)
-    #[test]
-    fn a_notices_words_never_title_another_light() {
-        let now = Instant::now();
-        let rule = "\u{2500}".repeat(60);
-        let mut w = fast_in_flight(Mode::Bypass, lights::FastAnswers::default(), now);
-        let moved = lights::FastAnswers {
-            echoed: 1,
-            echo: Some(lights::FastAnswer::OnModelMoved),
-            notice: None,
-        };
-        assert!(
-            w.answer(7, &read_of(LightState::On, Mode::Bypass, moved), now)
-                .is_some()
-        );
-        let title = |w: &WindowLights, at: Instant| -> String {
-            w.block(7, blank(), &lights::Expect::default(), at, true)
-                .title
-                .iter()
-                .map(|c| c.ch)
-                .collect()
-        };
-        assert_eq!(
-            title(&w, now),
-            "Fast mode: on \u{00B7} Claude switched the model  ",
-            "control: the fast notice says Claude's words"
-        );
-        let later = now + REFUSAL_SHOWN;
-        assert_eq!(w.expire(later), (true, Vec::new()));
-        observe(&mut w, &screen(&rule, PLAN, ""));
-        start(&mut w, Light::Mode, Drive::CycleMode, Mode::Plan, later);
-        observe(&mut w, &screen(&rule, BYPASS, ""));
-        let due = later + Duration::from_millis(lights::SETTLE_MS);
-        assert_eq!(w.expire(due), (true, vec![7]), "arrived, by the deadline");
-        assert_eq!(title(&w, due), "Permission mode: bypass  ");
-    }
-
-    /// FAST MODE THAT TOOK AUTO MODE OFF (Claude Code 2.1.283, under its
-    /// server flag `tengu_auto_mode_config.disableFastMode`): a `/fast on`
-    /// from auto that Claude answers ON, with the pill now manual or its own
-    /// words on screen, is said on the fast light and returned for the
-    /// host's latch. Control: the same answer from bypass costs nothing.
-    #[test]
-    fn fast_mode_that_took_auto_off_says_so() {
-        let now = Instant::now();
-        let on = lights::FastAnswers {
-            echoed: 1,
-            echo: Some(lights::FastAnswer::On),
-            notice: None,
-        };
-        let mut w = fast_in_flight(Mode::Auto, lights::FastAnswers::default(), now);
-        assert_eq!(
-            w.answer(7, &read_of(LightState::On, Mode::Manual, on), now),
-            Some(CommandEnd {
-                refusal: None,
-                cost_auto: true
-            })
-        );
-        assert!(matches!(
-            w.sessions[&7].notice,
-            Some((Light::Fast, _, Some(said))) if said.contains("auto mode off")
-        ));
-        let mut w = fast_in_flight(Mode::Auto, lights::FastAnswers::default(), now);
-        let read = CommandRead {
-            auto_off: true,
-            ..read_of(LightState::On, Mode::Auto, on)
-        };
-        assert_eq!(
-            w.answer(7, &read, now).map(|end| end.cost_auto),
-            Some(true),
-            "Claude's own words"
-        );
-        let mut w = fast_in_flight(Mode::Bypass, lights::FastAnswers::default(), now);
-        assert_eq!(
-            w.answer(7, &read_of(LightState::On, Mode::Bypass, on), now),
-            Some(CommandEnd {
-                refusal: None,
-                cost_auto: false
-            }),
-            "control: bypass"
-        );
-    }
-
-    /// A toggle Claude never answers is given up at its deadline, the light
-    /// says why, and the session is named so the refusal's end is timed.
-    #[test]
-    fn an_unanswered_toggle_is_refused_by_name() {
-        let now = Instant::now();
-        let rule = "\u{2500}".repeat(60);
-        let mut w = WindowLights::default();
-        observe(&mut w, &screen(&rule, BYPASS, ""));
-        start(
-            &mut w,
-            Light::Fast,
-            Drive::Command {
-                cmd: "/fast on",
-                immediate: true,
-            },
-            Mode::Bypass,
-            now,
-        );
-        assert_eq!(w.expire(now), (false, Vec::new()));
-        assert_eq!(
-            w.expire(now + Duration::from_millis(lights::SETTLE_MS)),
-            (true, vec![7])
-        );
-        let s = &w.sessions[&7];
-        assert!(s.pending.is_none());
-        assert!(matches!(
-            s.refused,
-            Some((Light::Fast, Refusal::NoChange, _))
-        ));
-        let block = w.block(7, blank(), &lights::Expect::default(), now, true);
-        let text: String = block.title.iter().map(|c| c.ch).collect();
-        assert!(
-            text.starts_with("Fast mode: Claude did not switch"),
-            "{text:?}"
-        );
-    }
-
-    /// DEVIATIONS ONLY: at rest — bypass or auto, fast on — the block is
-    /// EMPTY. Plan mode and fast off each draw a labelled chip, one
-    /// cell apart, a cell of margin after; the title comes APART from the
-    /// chips (only the chips must fit); a box over the composer keeps the last
-    /// reading rather than dropping the row.
+    /// DEVIATIONS ONLY: at rest — bypass or auto — the block is EMPTY. Plan
+    /// mode draws a labelled chip, a cell of margin after; the title comes
+    /// APART from the chip (only the chip must fit); a box over the composer
+    /// keeps the last reading rather than dropping the row.
     #[test]
     fn only_deviations_are_drawn_and_the_block_keeps_what_it_saw() {
         let now = Instant::now();
-        let expect = lights::Expect::default();
-        let lit = format!("{} workspace \u{21AF} \u{2500}", "\u{2500}".repeat(40));
+        let bare = "\u{2500}".repeat(60);
         let mut w = WindowLights::default();
         for mode in [BYPASS, AUTO] {
-            observe(&mut w, &screen(&lit, mode, ""));
-            let rest = w.block(7, blank(), &expect, now, true);
+            observe(&mut w, &screen(&bare, mode, ""));
+            let rest = w.block(7, blank(), now, true);
             assert!(
                 rest.lights.is_empty() && rest.cols.is_empty() && rest.title.is_empty(),
                 "nothing at rest: {mode:?}"
             );
         }
-        // Control: plan mode, and fast mode off.
-        let bare = "\u{2500}".repeat(60);
+        // Control: plan mode.
         observe(&mut w, &screen(&bare, PLAN, ""));
-        let block = w.block(7, blank(), &expect, now, true);
+        let block = w.block(7, blank(), now, true);
         let text: String = block.lights.iter().map(|c| c.ch).collect();
-        assert_eq!(text, "\u{23F8} plan \u{25CB} fast");
-        assert_eq!(block.cols, vec![(0..6, Light::Mode), (7..13, Light::Fast)]);
+        assert_eq!(text, "\u{23F8} plan");
+        assert_eq!(block.cols, vec![(0..6, Light::Mode)]);
         assert!(block.title.is_empty(), "nothing asked for a title");
         assert_eq!(block.lights[0].fg, blank().fg, "plan, in the row's ink");
-        assert_eq!(block.lights[7].fg, dim_of(blank()), "fast off, dim");
         w.observe(7, None);
         assert_eq!(
-            w.block(7, blank(), &expect, now, true).lights,
+            w.block(7, blank(), now, true).lights,
             block.lights,
             "a covered composer keeps the last reading"
         );
-        w.hover = Some((7, Light::Fast));
-        let hovered = w.block(7, blank(), &expect, now, true);
+        w.hover = Some((7, Light::Mode));
+        let hovered = w.block(7, blank(), now, true);
         let title: String = hovered.title.iter().map(|c| c.ch).collect();
-        assert_eq!(title, "Fast mode: off \u{00B7} click to turn on  ");
+        assert_eq!(title, "Permission mode: click for bypass or auto  ");
         assert_eq!(
             hovered.lights.len(),
             block.lights.len(),
             "the title is apart"
         );
         assert!(
-            hovered.lights[7..13].iter().all(|c| c.bold),
+            hovered.lights.iter().all(|c| c.bold),
             "the whole hovered chip is marked"
-        );
-        assert!(!hovered.lights[0].bold);
-        // A latched refusal stops asking for fast mode.
-        w.hover = None;
-        assert!(
-            !w.block(
-                7,
-                blank(),
-                &lights::Expect {
-                    fast: false,
-                    ..expect
-                },
-                now,
-                true
-            )
-            .shows(Light::Fast)
         );
     }
 
-    /// Return toggles the SELECTED light, so the row marks and titles that
-    /// one even while the pointer rests on another.
+    /// The keyboard selection reveals the light at rest and marks it: in
+    /// bypass, the chip names the mode.
     #[test]
-    fn the_keyboard_selection_outranks_a_resting_pointer() {
+    fn the_keyboard_selection_reveals_the_light_at_rest() {
         let now = Instant::now();
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&"\u{2500}".repeat(60), BYPASS, ""));
-        w.hover = Some((7, Light::Mode));
-        w.selected = Some((7, Light::Fast));
-        let block = w.block(7, blank(), &lights::Expect::default(), now, true);
+        assert!(w.block(7, blank(), now, true).cols.is_empty(), "at rest");
+        w.selected = Some((7, Light::Mode));
+        let block = w.block(7, blank(), now, true);
         let title: String = block.title.iter().map(|c| c.ch).collect();
-        assert!(title.starts_with("Fast mode:"), "{title:?}");
-        let at = |l: Light| {
-            block
-                .cols
-                .iter()
-                .find(|(_, x)| *x == l)
-                .unwrap_or_else(|| panic!("{l:?} is revealed"))
-                .0
-                .start
-        };
-        assert!(block.lights[at(Light::Fast)].bold);
-        assert!(
-            !block.lights[at(Light::Mode)].bold,
-            "the pointer's, unmarked"
-        );
+        assert_eq!(title, "Permission mode: bypass  ");
         assert_eq!(
-            block.lights[at(Light::Mode)].ch,
-            '\u{23F5}',
-            "the selection reveals the expected mode too"
+            block.lights[0].ch, '\u{23F5}',
+            "the expected mode, revealed"
+        );
+        assert!(block.lights[0].bold);
+        assert!(
+            w.block(7, blank(), now, false).shows(Light::Mode),
+            "the selection itself is drawn without the reveal"
         );
     }
 
@@ -3094,9 +1731,9 @@ mod tests {
         let now = Instant::now();
         let mut w = WindowLights::default();
         assert_eq!(w.fingerprint(now), 0);
-        w.hover = Some((7, Light::Fast));
-        let a = w.fingerprint(now);
         w.hover = Some((7, Light::Mode));
+        let a = w.fingerprint(now);
+        w.selected = Some((7, Light::Mode));
         assert_ne!(a, 0);
         assert_ne!(a, w.fingerprint(now));
     }
@@ -3120,12 +1757,37 @@ mod gesture_tests {
     use std::time::{Duration, Instant};
 
     use aterm_agent::harness::footer::FooterFacts;
-    use aterm_agent::harness::lights::{self, Light, LightState, Mode};
+    use aterm_agent::harness::lights::{self, Light, Mode};
     use aterm_core::terminal::RenderCell;
     use aterm_session::sink::SinkWriter;
     use winit::event::{ElementState, MouseButton};
 
     use crate::{App, WindowId, term_lock};
+
+    /// One synthetic key press and release, as a person taps it.
+    #[cfg(target_os = "macos")]
+    fn tap(
+        app: &mut App,
+        wid: WindowId,
+        named: winit::keyboard::NamedKey,
+        code: winit::keyboard::KeyCode,
+        text: &str,
+    ) {
+        use winit::keyboard::{Key, KeyLocation, PhysicalKey, SmolStr};
+        for state in [ElementState::Pressed, ElementState::Released] {
+            app.on_key(
+                wid,
+                winit::event::KeyEvent::synthetic_for_test(
+                    PhysicalKey::Code(code),
+                    Key::Named(named),
+                    Some(SmolStr::new(text)),
+                    KeyLocation::Standard,
+                    state,
+                    false,
+                ),
+            );
+        }
+    }
 
     const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)";
     const AUTO: &str = "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)";
@@ -3145,7 +1807,10 @@ mod gesture_tests {
     /// to see the hang-up, which it reports only once every copy is gone
     /// (`POLLHUP`; a `shutdown` does not help — a send to a shut-down Unix
     /// socket peer still succeeds on macOS). Bounded, so a copy that never
-    /// closes fails here by name instead of as a model mismatch.
+    /// closes fails here by name instead of as a model mismatch — by a hang
+    /// detector, not a timing claim: a sibling's child reaches its exec when
+    /// the machine schedules it, and at a landing run's load (100-240) that
+    /// is not within any few seconds.
     fn hang_up(app: &App, session: u64, reader: UnixStream) {
         let sink = app.pool.get(session).expect("session").ctx.sink.clone();
         drop(reader);
@@ -3154,7 +1819,7 @@ mod gesture_tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(120);
         while pfd.revents & libc::POLLHUP == 0 {
             assert!(
                 Instant::now() < deadline,
@@ -3197,21 +1862,6 @@ mod gesture_tests {
     /// The owner's whole facts, as [`publish_facts`] publishes them.
     const WHOLE_FACTS: &str = "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main \u{2500}";
 
-    /// Wait (bounded) for the light's initial paste to leave the ordered
-    /// writer, so the follow-up reaches the real write instead of waiting
-    /// behind it. The bytes arrive before the writer retires its slot.
-    fn ordering_retired(app: &App, session: u64) {
-        let sink = app.pool.get(session).expect("session").ctx.sink.clone();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while crate::app_input::paste_order::is_ordering(&sink) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            !crate::app_input::paste_order::is_ordering(&sink),
-            "the follow-up reaches the real write"
-        );
-    }
-
     /// The facts the resolver publishes for the session's Claude Code
     /// process; without them no footer, and no light, is painted.
     fn publish_facts(app: &App, session: u64) {
@@ -3240,8 +1890,7 @@ mod gesture_tests {
     /// test widened it, [`wide_app`]): a transcript row, the composer between
     /// its two pane-wide rules with an EMPTY draft and the cursor at its
     /// caret (row 21, column 2), and `mode` on the last row — with bracketed
-    /// paste ON, as Claude Code always has it, so a pasted command reaches the
-    /// PTY framed ([`PASTED`]).
+    /// paste ON, as Claude Code always has it.
     fn draw_claude(app: &App, session: u64, mode: &str) {
         let rule = "\u{2500}".repeat(cols(app, session));
         let screen = format!(
@@ -3249,19 +1898,6 @@ mod gesture_tests {
              \x1b[23;1H{rule}\x1b[24;1H{mode}\x1b[22;3H"
         );
         feed(app, session, screen.as_bytes());
-    }
-
-    /// `/fast on` as the light's paste reaches Claude: bracketed.
-    const PASTED: &[u8] = b"\x1b[200~/fast on\x1b[201~";
-
-    /// Claude turns fast mode on: `↯` on the composer's top rule.
-    fn set_fast(app: &App, session: u64) {
-        let rule = "\u{2500}".repeat(cols(app, session) - 10);
-        feed(
-            app,
-            session,
-            format!("\x1b[21;1H{rule} \u{21AF} \u{2500}\x1b[22;3H").as_bytes(),
-        );
     }
 
     /// The frame row of the pane's footer: the composer's bottom rule, which
@@ -3344,12 +1980,12 @@ mod gesture_tests {
         (x, y)
     }
 
-    /// What the session's PTY received: up to 2 s for `want` bytes, then
+    /// What the session's PTY received: up to a minute for `want` bytes, then
     /// 30 ms more for any that should NOT have come.
     fn pty(reader: &mut UnixStream, want: usize) -> Vec<u8> {
         let mut got = Vec::new();
         let mut buf = [0u8; 256];
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut linger: Option<Instant> = None;
         loop {
             match reader.read(&mut buf) {
@@ -3372,15 +2008,14 @@ mod gesture_tests {
         got
     }
 
-    /// THE CHIPS NEVER TOUCH OTHER INK (main's 35d8c4ca7, a real render on
+    /// THE CHIP NEVER TOUCHES OTHER INK (main's 35d8c4ca7, a real render on
     /// 2.1.284, 2026-09-28): in auto mode Claude right-aligns `◐ medium ·
-    /// /effort` on its mode row, and the chips then drawn on that row beside
-    /// it read `/effort○ fast`. The chips are in the composer's bottom rule
-    /// now, and Claude's row stays Claude's — so the MEASURED screen, drawn at
-    /// its own 144 columns, keeps the tail exactly where Claude put it, and
-    /// every chip in the rule has a blank cell on each side: never glued to a
-    /// rule glyph, another chip, a title or a fact. In manual mode too, where
-    /// two chips stand side by side. CONTROL: the rule's own glyphs are ink a
+    /// /effort` on its mode row, and chips then drawn on that row beside it
+    /// glued onto it. The chip is in the composer's bottom rule now, and
+    /// Claude's row stays Claude's — so the MEASURED screen, drawn at its own
+    /// 144 columns, keeps the tail exactly where Claude put it, and the chip
+    /// in the rule has a blank cell on each side: never glued to a rule
+    /// glyph, a title or a fact. CONTROL: the rule's own glyphs are ink a
     /// chip must not touch, and they are there.
     #[test]
     fn the_effort_tail_stays_on_claudes_row_and_every_chip_stands_clear_in_the_rule() {
@@ -3398,6 +2033,12 @@ mod gesture_tests {
             frame(&mut app, wid);
             let claude = row_text(&app, wid, mode_row(&app, wid));
             assert_eq!(claude.trim_end(), mode, "Claude's row is whole");
+            if mode == measured {
+                // Auto mode is as expected: no chip at rest. Reveal it.
+                app.windows.get_mut(&wid).unwrap().claude_lights.selected =
+                    Some((session, Light::Mode));
+                frame(&mut app, wid);
+            }
             let hits = &app.windows[&wid].claude_lights.hits;
             assert!(!hits.is_empty(), "{mode:?}: a chip is drawn");
             let rule = footer_row(&app, wid);
@@ -3406,7 +2047,7 @@ mod gesture_tests {
                 .map(|c| c.ch)
                 .collect();
             assert!(text.contains(&'\u{2500}'), "control: the rule's glyphs");
-            for light in [Light::Mode, Light::Fast] {
+            for light in Light::ALL {
                 let cols: Vec<usize> = hits
                     .iter()
                     .filter(|h| h.light == light)
@@ -3445,24 +2086,22 @@ mod gesture_tests {
             }
             frame(&mut app, wid);
             let mode = hit(&app, wid, Light::Mode);
-            let fast = hit(&app, wid, Light::Fast);
             let text = row_text(&app, wid, mode.0);
             assert!(
                 text.contains("\u{25C6} Opus 5.5 xhigh"),
                 "the footer is painted: {text:?}"
             );
             assert_eq!(cell_at(&app, wid, mode).ch, '\u{23F8}', "{text:?}");
-            assert!(text.contains("\u{23F8} manual \u{25CB} fast"), "{text:?}");
+            assert!(text.contains("\u{23F8} manual"), "{text:?}");
             let claude = row_text(&app, wid, mode_row(&app, wid));
             assert!(
                 claude.contains("\u{23F8} manual mode on"),
                 "the chip never takes the pill's place: Claude's row is whole: {claude:?}"
             );
-            assert_eq!(cell_at(&app, wid, fast).ch, '\u{25CB}', "{text:?}");
             assert!(pty(&mut reader, 0).is_empty(), "a frame types nothing");
 
-            // Hover: the gap beside the light is not one; the light is.
-            let (x, y) = px_of(&app, wid, (fast.0, fast.1 - 1));
+            // Hover: the gap before the light is not one; the light is.
+            let (x, y) = px_of(&app, wid, (mode.0, mode.1 - 1));
             app.on_cursor_moved(wid, x, y);
             assert_eq!(app.windows[&wid].claude_lights.hover, None);
             let (x, y) = px_of(&app, wid, mode);
@@ -3487,8 +2126,8 @@ mod gesture_tests {
                     .clone()
                     .expect("the toggle is in flight");
                 assert_eq!(
-                    (p.light, p.from, p.started, p.presses),
-                    (Light::Mode, LightState::Off, Mode::Manual, 1)
+                    (p.light, p.started, p.presses),
+                    (Light::Mode, Mode::Manual, 1)
                 );
             }
             app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
@@ -3549,7 +2188,7 @@ mod gesture_tests {
             );
             let text = row_text(&app, wid, mode.0);
             assert!(
-                text.contains("\u{25CB} fast  bypass ") && text.contains(WHOLE_FACTS),
+                text.contains("\u{23F5}\u{23F5} bypass  bypass ") && text.contains(WHOLE_FACTS),
                 "the hover's title, short in an 80-column pane beside the whole facts: {text:?}"
             );
             // A click on the chip while it says so presses nothing.
@@ -3592,19 +2231,17 @@ mod gesture_tests {
     }
 
     /// AT REST NOTHING IS DRAWN (owner, 2026-09-27: "I don't want to show the
-    /// state of parameters that I always expect to be on"): bypass or auto,
-    /// fast on — the rule carries the facts alone, no chip, nothing to hit,
-    /// while the rule is still known to be on the glass (the keyboard's way
-    /// to the lights); and Claude's own row under it, its pill and hint,
-    /// is exactly as Claude drew it (owner, 2026-09-28). Control: fast off
-    /// draws its chip.
+    /// state of parameters that I always expect to be on"): bypass or auto —
+    /// the rule carries the facts alone, no chip, nothing
+    /// to hit, while the rule is still known to be on the glass (the
+    /// keyboard's way to the lights); and Claude's own row under it, its pill
+    /// and hint, is exactly as Claude drew it (owner, 2026-09-28).
     #[test]
     fn at_rest_the_rule_carries_the_facts_alone() {
         for mode in [BYPASS, AUTO] {
             let (mut app, wid, session, _reader) = app();
             publish_facts(&app, session);
             draw_claude(&app, session, mode);
-            set_fast(&app, session);
             frame(&mut app, wid);
             let lights = &app.windows[&wid].claude_lights;
             assert!(lights.hits.is_empty(), "{mode:?}");
@@ -3621,51 +2258,21 @@ mod gesture_tests {
             // Claude's own row is whole: its pill, its hint.
             let claude = row_text(&app, wid, mode_row(&app, wid));
             assert_eq!(claude.trim_end(), mode, "Claude's row, as drawn");
-            // Control: fast mode off asks for fast mode.
-            draw_claude(&app, session, mode);
-            frame(&mut app, wid);
-            assert!(
-                app.windows[&wid]
-                    .claude_lights
-                    .hits
-                    .iter()
-                    .all(|h| h.light == Light::Fast)
-                    && !app.windows[&wid].claude_lights.hits.is_empty(),
-                "{mode:?}: fast off draws its chip, and only it"
-            );
         }
     }
 
     /// THE KEYBOARD REACHES A LIGHT AT REST (macOS): with nothing drawn,
-    /// `ctrl+shift+tab` reveals every known light — the expected mode
-    /// included, `⏵⏵ bypass` — and Return on the expected mode presses
-    /// nothing; the reveal goes with the selection.
+    /// `ctrl+shift+tab` reveals the known light — the expected mode,
+    /// `⏵⏵ bypass` — and Return on the expected mode presses nothing; the
+    /// reveal goes with the selection.
     #[cfg(target_os = "macos")]
     #[test]
     fn ctrl_shift_tab_reveals_the_lights_at_rest() {
-        use winit::event::KeyEvent;
-        use winit::keyboard::SmolStr;
-        use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
+        use winit::keyboard::{KeyCode, ModifiersState, NamedKey};
 
-        fn tap(app: &mut App, wid: WindowId, named: NamedKey, code: KeyCode, text: &str) {
-            for state in [ElementState::Pressed, ElementState::Released] {
-                app.on_key(
-                    wid,
-                    KeyEvent::synthetic_for_test(
-                        PhysicalKey::Code(code),
-                        Key::Named(named),
-                        Some(SmolStr::new(text)),
-                        KeyLocation::Standard,
-                        state,
-                        false,
-                    ),
-                );
-            }
-        }
         let (mut app, wid, session, mut reader) = app();
         publish_facts(&app, session);
         draw_claude(&app, session, BYPASS);
-        set_fast(&app, session);
         frame(&mut app, wid);
         assert!(app.windows[&wid].claude_lights.hits.is_empty(), "at rest");
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
@@ -3679,8 +2286,8 @@ mod gesture_tests {
         frame(&mut app, wid);
         let text = row_text(&app, wid, footer_row(&app, wid));
         assert!(
-            text.contains("\u{23F5}\u{23F5} bypass \u{25CF} fast"),
-            "every known light, revealed: {text:?}"
+            text.contains("\u{23F5}\u{23F5} bypass"),
+            "the known light, revealed: {text:?}"
         );
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
         assert!(
@@ -3695,31 +2302,15 @@ mod gesture_tests {
     }
 
     /// THE KEYBOARD ROUTE (macOS: elsewhere `ctrl+shift+tab` is `prev_tab`):
-    /// the chord selects the focused pane's lights in order and types
-    /// nothing; Return toggles the selected light — one shift+tab, and NOT
-    /// the Return; the selection lets go. Control: with nothing selected,
-    /// Return is Claude's again.
+    /// the chord selects the focused pane's light and types nothing (again,
+    /// it stays on the one light); Return toggles it — one
+    /// shift+tab, and NOT the Return; the selection lets go. Control: with
+    /// nothing selected, Return is Claude's again.
     #[cfg(target_os = "macos")]
     #[test]
     fn ctrl_shift_tab_selects_a_light_and_return_toggles_it() {
-        use winit::event::KeyEvent;
-        use winit::keyboard::SmolStr;
-        use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
+        use winit::keyboard::{KeyCode, ModifiersState, NamedKey};
 
-        fn key(named: NamedKey, code: KeyCode, text: &str, state: ElementState) -> KeyEvent {
-            KeyEvent::synthetic_for_test(
-                PhysicalKey::Code(code),
-                Key::Named(named),
-                Some(SmolStr::new(text)),
-                KeyLocation::Standard,
-                state,
-                false,
-            )
-        }
-        fn tap(app: &mut App, wid: WindowId, named: NamedKey, code: KeyCode, text: &str) {
-            app.on_key(wid, key(named, code, text, ElementState::Pressed));
-            app.on_key(wid, key(named, code, text, ElementState::Released));
-        }
         fn set_mods(app: &mut App, wid: WindowId, mods: ModifiersState) {
             app.windows.get_mut(&wid).expect("window").mods = mods;
         }
@@ -3742,14 +2333,8 @@ mod gesture_tests {
         tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
-            Some((session, Light::Fast))
-        );
-        set_mods(&mut app, wid, ModifiersState::empty());
-        tap(&mut app, wid, NamedKey::ArrowLeft, KeyCode::ArrowLeft, "");
-        assert_eq!(
-            app.windows[&wid].claude_lights.selected,
             Some((session, Light::Mode)),
-            "\u{2190} moves back"
+            "the one light stays selected"
         );
         assert!(pty(&mut reader, 0).is_empty(), "the chord is the lights'");
         frame(&mut app, wid);
@@ -3795,7 +2380,7 @@ mod gesture_tests {
         );
         // Its moment over, back as expected: the chip goes.
         let past = Instant::now() - Duration::from_millis(1);
-        if let Some((_, until, _)) = app
+        if let Some((_, until)) = app
             .windows
             .get_mut(&wid)
             .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
@@ -3864,7 +2449,7 @@ mod gesture_tests {
     /// pane, says where it stopped without its light's name. The REASON
     /// outranks the branch and the path (`footer::fit_rule`): it takes their
     /// room, never the model's or the effort's. In a 120-column pane it
-    /// comes whole, beside the whole facts. Control: the chips are all there.
+    /// comes whole, beside the whole facts. Control: the chip is there.
     #[test]
     fn a_stop_too_long_to_title_in_full_says_the_reason_alone() {
         for cols in [80_u16, 120] {
@@ -3907,8 +2492,8 @@ mod gesture_tests {
                 );
             }
             assert!(
-                text.contains("\u{23F5}\u{23F5} accept edits \u{25CB} fast"),
-                "{cols}: control: the chips: {text:?}"
+                text.contains("\u{23F5}\u{23F5} accept edits"),
+                "{cols}: control: the chip: {text:?}"
             );
         }
     }
@@ -3960,50 +2545,7 @@ mod gesture_tests {
         assert_eq!(presses, 4);
         let s = &app.windows[&wid].claude_lights.sessions[&session];
         assert!(s.pending.is_none() && s.refused.is_none());
-        assert!(matches!(s.notice, Some((Light::Mode, _, _))));
-    }
-
-    /// REGRESSION (review 2026-09-25): a cycle that never reaches an
-    /// expected mode (neither bypass nor auto: a session started without
-    /// --dangerously-skip-permissions on an account without auto mode) is
-    /// searched exactly ONE lap and the search stops back where it began, the
-    /// person's mode restored, saying neither is in this session's cycle —
-    /// and naming the mode.
-    #[test]
-    fn a_cycle_that_never_reaches_an_expected_mode_is_refused_after_one_lap_where_it_began() {
-        let ring = [ACCEPT, PLAN, MANUAL];
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, ACCEPT);
-        frame(&mut app, wid);
-        let (x, y) = px_of(&app, wid, hit(&app, wid, Light::Mode));
-        app.on_cursor_moved(wid, x, y);
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-        let mut at = 0;
-        let mut presses = 0;
-        while pty(&mut reader, lights::SHIFT_TAB.len()) == lights::SHIFT_TAB {
-            presses += 1;
-            at = (at + 1) % ring.len();
-            redraw_mode_row(&app, session, ring[at]);
-            frame(&mut app, wid);
-            app.on_claude_footer_changed(session);
-        }
-        assert_eq!(presses, ring.len(), "one lap, no more");
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(s.pending.is_none(), "the search stopped");
-        assert!(matches!(
-            s.refused,
-            Some((
-                Light::Mode,
-                super::Refusal::NotInCycle(Mode::AcceptEdits),
-                _
-            ))
-        ));
-        assert_eq!(
-            ring[at], ACCEPT,
-            "a toggle that did not take leaves the person's mode where it was"
-        );
+        assert!(matches!(s.notice, Some((Light::Mode, _))));
     }
 
     /// REGRESSION (review 2026-09-25): a light selected with ctrl+shift+tab
@@ -4013,24 +2555,7 @@ mod gesture_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_mouse_press_lets_a_keyboard_selection_go() {
-        use winit::event::KeyEvent;
-        use winit::keyboard::{
-            Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
-        };
-        fn key(named: NamedKey, code: KeyCode, text: &str, state: ElementState) -> KeyEvent {
-            KeyEvent::synthetic_for_test(
-                PhysicalKey::Code(code),
-                Key::Named(named),
-                Some(SmolStr::new(text)),
-                KeyLocation::Standard,
-                state,
-                false,
-            )
-        }
-        fn tap(app: &mut App, wid: WindowId, named: NamedKey, code: KeyCode, text: &str) {
-            app.on_key(wid, key(named, code, text, ElementState::Pressed));
-            app.on_key(wid, key(named, code, text, ElementState::Released));
-        }
+        use winit::keyboard::{KeyCode, ModifiersState, NamedKey};
         fn click(app: &mut App, wid: WindowId, cell: (usize, usize)) {
             let (x, y) = px_of(app, wid, cell);
             app.on_cursor_moved(wid, x, y);
@@ -4063,8 +2588,8 @@ mod gesture_tests {
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
         tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-        // The half-width pane's rule has room for the revealed chips beside
-        // the model: the first light, the mode's, is the one selected.
+        // The half-width pane's rule has room for the revealed chip beside
+        // the model: the mode's light is selected.
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
             Some((session, Light::Mode))
@@ -4085,927 +2610,10 @@ mod gesture_tests {
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
     }
 
-    /// Claude echoes a draft into the composer: the caret row reads
-    /// `❯ <draft>` and the cursor sits right behind it.
-    fn echo_draft(app: &App, session: u64, draft: &str) {
-        let col = 3 + draft.chars().count();
-        feed(
-            app,
-            session,
-            format!("\x1b[22;1H\x1b[2K\u{276F} {draft}\x1b[22;{col}H").as_bytes(),
-        );
-    }
-
-    /// Put `session`'s typed command past its deadline (or its ctrl+u past
-    /// its read-back), as the timers would.
-    fn past_due(app: &mut App, session: u64) {
-        let past = Instant::now() - Duration::from_millis(1);
-        let t = app.claude_typed.get_mut(&session).expect("a typed command");
-        t.deadline = past;
-        if t.cleared.is_some() {
-            t.cleared = Some(past);
-        }
-    }
-
-    /// Hold `session`'s typed command well BEFORE its deadline, however
-    /// slowly the test reached its drain: a loaded machine (a whole workspace
-    /// run, the tiered checks' `ty` spawns) can spend all of `SETTLE_MS`
-    /// between the click and the drain, which then takes the deadline's
-    /// take-back instead of the Return the case is about (measured
-    /// 2026-09-27: the accepted case failed 25 of 96 runs under a 96-way
-    /// overload, its drain on the ctrl+u path).
-    fn not_due(app: &mut App, session: u64) {
-        let t = app.claude_typed.get_mut(&session).expect("a typed command");
-        t.deadline = Instant::now() + Duration::from_secs(60);
-    }
-
     fn refusal(app: &App, wid: WindowId, session: u64) -> Option<(Light, super::Refusal)> {
         app.windows[&wid].claude_lights.sessions[&session]
             .refused
             .map(|(light, why, _)| (light, why))
-    }
-
-    fn project_admission(
-        app: &App,
-        wid: WindowId,
-        session: u64,
-        expected: &aterm_spec::interp::State,
-    ) -> aterm_spec::interp::State {
-        // Phase and receipt facts describe the driven action. Ownership and
-        // the visible rejection notice come from the genuine App state.
-        let mut observed = expected.clone();
-        observed.insert("owned", i64::from(app.claude_typed.contains_key(&session)));
-        observed.insert(
-            "left",
-            i64::from(refusal(app, wid, session) == Some((Light::Fast, super::Refusal::LeftTyped))),
-        );
-        observed
-    }
-
-    fn drive_admission_action<T>(action: &str, drive: impl FnOnce() -> T) -> T {
-        use aterm_spec::xref;
-
-        assert!(xref::reset_entered_anchors());
-        let result = drive();
-        let entered = xref::entered_anchor_ids();
-        xref::disarm_entered_anchors();
-        let anchor = xref::refinements()
-            .find(|anchor| anchor.machine == "claude_light_admission" && anchor.action == action)
-            .expect("the admission action has a shipping anchor");
-        assert!(
-            entered.contains(anchor.entry_id),
-            "{action} missed its shipping function"
-        );
-        result
-    }
-
-    fn check_admission_transition(
-        app: &App,
-        wid: WindowId,
-        session: u64,
-        action: &str,
-        state: &mut aterm_spec::interp::State,
-    ) {
-        let model = aterm_spec::derive::claude_light_admission_model();
-        let before = state.clone();
-        assert!(model.fire(action, state));
-        let observed = project_admission(app, wid, session, state);
-        let (ok, evidence) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &before,
-            &observed,
-            Some(action),
-            "Claude light real input-admission conformance",
-        );
-        assert!(ok, "{action}: {evidence}");
-
-        // Each failure's historical post-state must be rejected, independent
-        // of whether its shipping anchor was entered.
-        let mut historical = observed.clone();
-        match action {
-            "StartRejected" => {
-                historical.insert("owned", 1);
-            }
-            "FollowRejected" => {
-                historical.insert("left", 0);
-            }
-            _ => return,
-        }
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &before,
-            &historical,
-            Some(action),
-            "ignored admission receipt negative control",
-        );
-        assert!(!ok, "{action} must reject the historical ignored receipt");
-    }
-
-    /// A rejected light paste cannot own an identical, delayed echo from a
-    /// person's earlier accepted paste. Both actual channel-failure paths
-    /// produce zero bytes, no Typed record, no pending toggle, and no Enter.
-    #[test]
-    fn rejected_light_paste_never_claims_an_earlier_pastes_echo() {
-        use crate::input::{InputEvent, InputOutcome, PasteFraming, Source};
-
-        for unavailable in [false, true] {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, BYPASS);
-            frame(&mut app, wid);
-            assert_eq!(
-                app.input_to_session(
-                    wid,
-                    InputEvent::Paste("/fast on".into(), PasteFraming::AtDrain),
-                    Source::Human,
-                    Some(session),
-                    crate::app_input::PressPhase::Initial,
-                ),
-                InputOutcome::Ok,
-            );
-            assert_eq!(
-                pty(&mut reader, PASTED.len()),
-                PASTED,
-                "the person's earlier paste"
-            );
-            let sink = app.pool.get(session).unwrap().ctx.sink.clone();
-            let rejection =
-                crate::app_input::paste_order::reject_admission_for_test(&sink, unavailable);
-            let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
-            drive_admission_action("StartRejected", || click(&mut app, wid, Light::Fast));
-            check_admission_transition(&app, wid, session, "StartRejected", &mut state);
-            assert!(
-                app.windows[&wid].claude_lights.sessions[&session]
-                    .pending
-                    .is_none()
-            );
-            assert_eq!(
-                refusal(&app, wid, session),
-                Some((Light::Fast, super::Refusal::InputRejected))
-            );
-            assert!(
-                pty(&mut reader, 0).is_empty(),
-                "rejected paste: unavailable={unavailable}"
-            );
-            drop(rejection);
-
-            // The engine receives the earlier paste's delayed echo. The
-            // rejection stamped the same person clock as a successful click,
-            // so only respecting its admission result protects this draft.
-            echo_draft(&app, session, "/fast on");
-            app.on_claude_footer_changed(session);
-            assert!(
-                pty(&mut reader, 0).is_empty(),
-                "never submit someone else's echo"
-            );
-            assert!(app.claude_typed.is_empty());
-        }
-    }
-
-    /// An already accepted, genuinely stalled paste is not an empty composer:
-    /// the light refuses before adding its command behind that unseen draft.
-    #[test]
-    fn a_light_refuses_ownership_behind_a_real_queued_paste() {
-        use crate::input::{InputEvent, InputOutcome, PasteFraming, Source};
-        use std::io::Write;
-
-        let (mut reader, mut writer) = UnixStream::pair().unwrap();
-        reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        writer.set_nonblocking(true).unwrap();
-        let mut seeded = 0;
-        loop {
-            match writer.write(&[b'.'; 4096]) {
-                Ok(n) if n > 0 => seeded += n,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                other => panic!("fill owned socket: {other:?}"),
-            }
-        }
-        writer.set_nonblocking(false).unwrap();
-        let sink = Arc::new(SinkWriter::new_owned(writer.into()));
-        let mut app = App::headless_for_test_with_sink(Arc::clone(&sink));
-        let wid = WindowId(0);
-        let session = app.focused_session_id(wid).unwrap();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        // Unframed, so the bytes read back are the paste's alone.
-        feed(&app, session, b"\x1b[?2004l");
-        frame(&mut app, wid);
-        let body = 3 * 1024 * 1024; // Larger than the entire bounded spill.
-        assert_eq!(
-            app.input_to_session(
-                wid,
-                InputEvent::Paste("p".repeat(body), PasteFraming::AtDrain),
-                Source::Human,
-                Some(session),
-                crate::app_input::PressPhase::Initial,
-            ),
-            InputOutcome::Ok
-        );
-        assert!(crate::app_input::paste_order::is_ordering(&sink));
-        let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
-        drive_admission_action("StartRejected", || click(&mut app, wid, Light::Fast));
-        check_admission_transition(&app, wid, session, "StartRejected", &mut state);
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::InputPending))
-        );
-        let mut actual = vec![0; seeded + body];
-        reader.read_exact(&mut actual).unwrap();
-        assert!(actual[..seeded].iter().all(|byte| *byte == b'.'));
-        assert!(actual[seeded..].iter().all(|byte| *byte == b'p'));
-        reader.set_nonblocking(true).unwrap();
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "no light command joined the earlier paste"
-        );
-    }
-
-    /// The initial paste really lands. Accepted Return completes once;
-    /// a real closed-sink failure leaves a notice for Return and Ctrl-U.
-    #[test]
-    fn light_follow_up_admission_conforms_and_rejection_leaves_a_notice() {
-        for (failed, take_back) in [(false, false), (true, false), (true, true)] {
-            let (mut app, wid, session, reader) = app();
-            let mut reader = Some(reader);
-            publish_facts(&app, session);
-            draw_claude(&app, session, BYPASS);
-            frame(&mut app, wid);
-            let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
-            drive_admission_action("StartAccepted", || click(&mut app, wid, Light::Fast));
-            assert_eq!(pty(reader.as_mut().unwrap(), PASTED.len()), PASTED);
-            check_admission_transition(&app, wid, session, "StartAccepted", &mut state);
-            ordering_retired(&app, session);
-            echo_draft(&app, session, "/fast on");
-            if take_back {
-                past_due(&mut app, session);
-            } else {
-                not_due(&mut app, session);
-            }
-            if failed {
-                // Genuine PTY-sink write failure, no fake receipt.
-                hang_up(&app, session, reader.take().expect("the observer"));
-            }
-            let action = if failed {
-                "FollowRejected"
-            } else {
-                "FollowAccepted"
-            };
-            drive_admission_action(action, || app.on_claude_footer_changed(session));
-            check_admission_transition(&app, wid, session, action, &mut state);
-            if failed {
-                assert!(
-                    app.windows[&wid].claude_lights.sessions[&session]
-                        .pending
-                        .is_none()
-                );
-                let title: String = app.windows[&wid]
-                    .claude_lights
-                    .block(
-                        session,
-                        RenderCell::default(),
-                        &lights::Expect::default(),
-                        Instant::now(),
-                        true,
-                    )
-                    .title
-                    .iter()
-                    .map(|cell| cell.ch)
-                    .collect();
-                assert!(title.contains("command left in the prompt"), "{title}");
-            } else {
-                assert_eq!(pty(reader.as_mut().unwrap(), 1), b"\r");
-            }
-            app.on_claude_footer_changed(session);
-            if let Some(reader) = reader.as_mut() {
-                assert!(
-                    pty(reader, 0).is_empty(),
-                    "no automatic retry after the decision"
-                );
-            }
-            assert!(app.claude_typed.is_empty());
-        }
-    }
-
-    /// While accepted ordered input remains, neither Return nor cleanup may
-    /// join it. Draining resumes ordinary submission; expiry leaves a notice.
-    #[test]
-    fn light_follow_up_waits_for_ordered_input_or_leaves_it_at_deadline() {
-        for expire in [false, true] {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, BYPASS);
-            frame(&mut app, wid);
-            let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
-            drive_admission_action("StartAccepted", || click(&mut app, wid, Light::Fast));
-            assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-            check_admission_transition(&app, wid, session, "StartAccepted", &mut state);
-            echo_draft(&app, session, "/fast on");
-            let sink = app.pool.get(session).unwrap().ctx.sink.clone();
-            let pin = crate::app_input::paste_order::pin_ordering_for_test(&sink);
-            drive_admission_action("Wait", || app.on_claude_footer_changed(session));
-            check_admission_transition(&app, wid, session, "Wait", &mut state);
-            assert!(
-                pty(&mut reader, 0).is_empty(),
-                "no Return while input remains ordered"
-            );
-            if expire {
-                past_due(&mut app, session);
-                drive_admission_action("FollowRejected", || app.on_claude_footer_changed(session));
-                check_admission_transition(&app, wid, session, "FollowRejected", &mut state);
-                assert!(
-                    pty(&mut reader, 0).is_empty(),
-                    "no Ctrl-U behind undelivered input"
-                );
-                drop(pin);
-            } else {
-                drop(pin);
-                drive_admission_action("FollowAccepted", || app.on_claude_footer_changed(session));
-                check_admission_transition(&app, wid, session, "FollowAccepted", &mut state);
-                assert_eq!(
-                    pty(&mut reader, 1),
-                    b"\r",
-                    "drained input resumes submission"
-                );
-            }
-            app.on_claude_footer_changed(session);
-            assert!(pty(&mut reader, 0).is_empty());
-            assert!(app.claude_typed.is_empty());
-        }
-    }
-
-    /// A CLICK ON THE FAST LIGHT pastes `/fast on` into the empty composer;
-    /// the Enter waits until the ENGINE shows the composer holding exactly
-    /// it, goes once, and the light resolves when Claude's `↯` tag shows —
-    /// the frame that shows it only wakes the loop, which reads the engine.
-    #[test]
-    fn a_fast_click_submits_the_command_once_the_composer_holds_it() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED, "the paste");
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty(), "no echo yet: no Enter");
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert_eq!(pty(&mut reader, 1), b"\r", "the Enter, once it is there");
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty(), "once");
-        assert!(app.claude_typed.is_empty());
-        let rule = "\u{2500}".repeat(70);
-        feed(
-            &app,
-            session,
-            format!("\x1b[21;1H{rule} \u{21AF} \u{2500}\x1b[22;1H\x1b[2K\u{276F} \x1b[22;3H")
-                .as_bytes(),
-        );
-        frame(&mut app, wid);
-        assert!(
-            app.windows[&wid].claude_lights.sessions[&session]
-                .pending
-                .is_some(),
-            "a frame decides nothing"
-        );
-        app.on_claude_footer_changed(session);
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(s.pending.is_none(), "the tag resolved it");
-        assert_eq!(s.shown.fast, LightState::On);
-    }
-
-    /// A PERSON TYPES after the paste: the text is theirs now. No Enter (the
-    /// old cursor-row guard `contains("/fast on")` passed `/fast onh` and
-    /// submitted it), no ctrl+u at the deadline, and the light says the
-    /// command is left in the prompt.
-    #[test]
-    fn a_person_typing_after_the_paste_stops_the_enter_and_the_take_back() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        app.input_to_session(
-            wid,
-            crate::input::InputEvent::Text("h".into()),
-            crate::input::Source::Human,
-            Some(session),
-            crate::app_input::PressPhase::Initial,
-        );
-        assert_eq!(pty(&mut reader, 1), b"h");
-        echo_draft(&app, session, "/fast onh");
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "no Enter under a person's text"
-        );
-        assert!(
-            app.claude_typed[&session].hands_off,
-            "aterm types nothing more"
-        );
-        past_due(&mut app, session);
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty(), "no take-back either");
-        assert!(app.claude_typed.is_empty());
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::LeftTyped))
-        );
-        // The person's gesture alone decides it, even before any echo: the
-        // same click with the person's key typed straight after it.
-        let (mut app, wid, session, mut reader) = super::gesture_tests::app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        echo_draft(&app, session, "/fast on");
-        app.input_to_session(
-            wid,
-            crate::input::InputEvent::Text("h".into()),
-            crate::input::Source::Human,
-            Some(session),
-            crate::app_input::PressPhase::Initial,
-        );
-        assert_eq!(pty(&mut reader, 1), b"h");
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "the screen still reads exactly the command, but a person has keyed since"
-        );
-    }
-
-    /// UNANSWERED: the command sat in the composer past its deadline. It is
-    /// taken back with ONE ctrl+u while the composer holds exactly it, and
-    /// read back once: cleared, nothing more; still there, the light says so
-    /// and nothing more is pressed.
-    #[test]
-    fn a_command_not_submitted_in_time_is_taken_back_once() {
-        for honoured in [true, false] {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, BYPASS);
-            frame(&mut app, wid);
-            click(&mut app, wid, Light::Fast);
-            assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-            echo_draft(&app, session, "/fast on");
-            past_due(&mut app, session);
-            app.on_claude_footer_changed(session);
-            assert_eq!(pty(&mut reader, 1), b"\x15", "one ctrl+u, not the Enter");
-            if honoured {
-                echo_draft(&app, session, "");
-            }
-            past_due(&mut app, session);
-            app.on_claude_footer_changed(session);
-            assert!(pty(&mut reader, 0).is_empty(), "never a second press");
-            assert!(app.claude_typed.is_empty());
-            let left = refusal(&app, wid, session)
-                .is_some_and(|(_, why)| why == super::Refusal::LeftTyped);
-            assert_eq!(left, !honoured, "honoured={honoured}");
-            // Taken back, the toggle ends NOW — not after the answer's whole
-            // window (`FAST_SETTLE_MS`) of "turning on…".
-            let s = &app.windows[&wid].claude_lights.sessions[&session];
-            assert!(s.pending.is_none(), "honoured={honoured}");
-            if honoured {
-                assert_eq!(
-                    refusal(&app, wid, session),
-                    Some((Light::Fast, super::Refusal::NoChange))
-                );
-            }
-        }
-    }
-
-    /// THE TAKE-BACK'S PERSON FENCE: a person keyed the session (a character
-    /// and its backspace) and the composer reads exactly the command again —
-    /// the one shape a ctrl+u would clear. It is theirs to keep: no ctrl+u.
-    #[test]
-    fn a_person_keyed_prompt_is_never_taken_back() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        for key in ["x", "\x7f"] {
-            app.input_to_session(
-                wid,
-                crate::input::InputEvent::KeySequence(key.as_bytes().to_vec()),
-                crate::input::Source::Human,
-                Some(session),
-                crate::app_input::PressPhase::Initial,
-            );
-        }
-        assert_eq!(pty(&mut reader, 2), b"x\x7f");
-        echo_draft(&app, session, "/fast on");
-        past_due(&mut app, session);
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "no ctrl+u under a person's hand"
-        );
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::LeftTyped))
-        );
-    }
-
-    /// The person pressed Return on the command themselves: it went, and
-    /// the light switched — nothing is taken back and nothing is said.
-    #[test]
-    fn a_command_the_person_submitted_is_not_called_left() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        app.input_to_session(
-            wid,
-            crate::input::InputEvent::KeySequence(b"\r".to_vec()),
-            crate::input::Source::Human,
-            Some(session),
-            crate::app_input::PressPhase::Initial,
-        );
-        assert_eq!(pty(&mut reader, 1), b"\r");
-        app.on_claude_footer_changed(session);
-        let rule = "\u{2500}".repeat(70);
-        feed(
-            &app,
-            session,
-            format!("\x1b[21;1H{rule} \u{21AF} \u{2500}\x1b[22;1H\x1b[2K\u{276F} \x1b[22;3H")
-                .as_bytes(),
-        );
-        past_due(&mut app, session);
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty());
-        assert!(app.claude_typed.is_empty());
-        assert_ne!(
-            refusal(&app, wid, session).map(|(_, why)| why),
-            Some(super::Refusal::LeftTyped)
-        );
-    }
-
-    /// A driver's lease taken AFTER the paste stops the Enter too: the
-    /// driver's `turn` would submit its prompt merged with the command.
-    #[test]
-    fn a_lease_taken_after_the_paste_stops_the_enter() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        *app.pool
-            .get(session)
-            .expect("session")
-            .ctx
-            .turn_lease
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(crate::Lease::Turn {
-            id: 7,
-            driver: None,
-            typing: true,
-        });
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "no Enter into a driven session"
-        );
-        past_due(&mut app, session);
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty(), "and no take-back");
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::LeftTyped))
-        );
-    }
-
-    /// However many footer wakes arrive, a waiting command keeps ONE poll
-    /// armed: a wake before its instant arms nothing more.
-    #[test]
-    fn a_waiting_command_arms_one_poll() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        assert!(app.claude_typed[&session].next_poll.is_some());
-        // The real poll is TYPED_POLL away and can come due while a loaded
-        // machine runs this loop: pin its instant ahead, so every wake below
-        // is one before it (the mirror of `past_due`).
-        let armed = Some(Instant::now() + Duration::from_secs(60));
-        app.claude_typed
-            .get_mut(&session)
-            .expect("waiting")
-            .next_poll = armed;
-        for _ in 0..5 {
-            app.on_claude_footer_changed(session);
-        }
-        assert_eq!(
-            app.claude_typed[&session].next_poll, armed,
-            "no poll re-armed early"
-        );
-        app.claude_typed
-            .get_mut(&session)
-            .expect("waiting")
-            .next_poll = Some(Instant::now() - Duration::from_millis(1));
-        let fired = Instant::now();
-        app.on_claude_footer_changed(session);
-        assert!(
-            app.claude_typed[&session].next_poll >= Some(fired + super::TYPED_POLL),
-            "the poll that fired is re-armed, once"
-        );
-    }
-
-    /// A LATE ECHO: the prompt was still empty at the deadline, and the paste
-    /// lands after it. One late look takes it back — never an Enter after the
-    /// light said Claude did not switch. Control: an echo that never comes
-    /// ends the record in silence.
-    #[test]
-    fn a_paste_echoed_after_the_deadline_is_taken_back() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        past_due(&mut app, session);
-        app.on_claude_footer_changed(session);
-        assert!(app.claude_typed[&session].late, "one late look");
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "no Enter during the late look"
-        );
-        past_due(&mut app, session);
-        app.on_claude_footer_changed(session);
-        assert_eq!(pty(&mut reader, 1), b"\x15", "the late echo is taken back");
-        // Control: the echo never comes.
-        let (mut app, wid, session, mut reader) = super::gesture_tests::app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        for _ in 0..2 {
-            past_due(&mut app, session);
-            app.on_claude_footer_changed(session);
-        }
-        assert!(pty(&mut reader, 0).is_empty());
-        assert!(app.claude_typed.is_empty(), "ended, once");
-    }
-
-    /// An empty screen does not license a late look while accepted input
-    /// is still ordered. The original deadline leaves the text explicitly,
-    /// and a later echo cannot resurrect submission or cleanup.
-    #[test]
-    fn queued_input_at_an_empty_deadline_never_arms_a_late_look() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
-        drive_admission_action("StartAccepted", || click(&mut app, wid, Light::Fast));
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        check_admission_transition(&app, wid, session, "StartAccepted", &mut state);
-        let sink = app.pool.get(session).unwrap().ctx.sink.clone();
-        let pin = crate::app_input::paste_order::pin_ordering_for_test(&sink);
-        past_due(&mut app, session);
-        drive_admission_action("FollowRejected", || app.on_claude_footer_changed(session));
-        check_admission_transition(&app, wid, session, "FollowRejected", &mut state);
-        assert!(
-            app.claude_typed.is_empty(),
-            "no late record behind ordered input"
-        );
-        assert!(pty(&mut reader, 0).is_empty(), "no Return or cleanup");
-        drop(pin);
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "the expired record stays ended"
-        );
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::LeftTyped))
-        );
-    }
-
-    /// Input can become queued after the late look was armed. Its deadline
-    /// must retain the same ordering guard as the first one: no Ctrl-U joins
-    /// undelivered bytes, and the remaining command is acknowledged.
-    #[test]
-    fn queued_input_at_the_late_deadline_prevents_cleanup() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
-        drive_admission_action("StartAccepted", || click(&mut app, wid, Light::Fast));
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        check_admission_transition(&app, wid, session, "StartAccepted", &mut state);
-        past_due(&mut app, session);
-        drive_admission_action("Wait", || app.on_claude_footer_changed(session));
-        check_admission_transition(&app, wid, session, "Wait", &mut state);
-        assert!(app.claude_typed[&session].late);
-        assert!(app.claude_typed[&session].next_poll.is_none());
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "late echo never sends Enter"
-        );
-        let sink = app.pool.get(session).unwrap().ctx.sink.clone();
-        let pin = crate::app_input::paste_order::pin_ordering_for_test(&sink);
-        past_due(&mut app, session);
-        drive_admission_action("FollowRejected", || app.on_claude_footer_changed(session));
-        check_admission_transition(&app, wid, session, "FollowRejected", &mut state);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "no late cleanup behind ordered input"
-        );
-        assert!(app.claude_typed.is_empty());
-        drop(pin);
-        app.on_claude_footer_changed(session);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "drain does not retry expired cleanup"
-        );
-    }
-
-    /// A late take-back's sink can fail too. A real closed socket must leave
-    /// the explicit notice, not a fictitious successful Ctrl-U read-back.
-    #[test]
-    fn a_failed_late_cleanup_leaves_the_command_explicitly() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
-        drive_admission_action("StartAccepted", || click(&mut app, wid, Light::Fast));
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        check_admission_transition(&app, wid, session, "StartAccepted", &mut state);
-        past_due(&mut app, session);
-        drive_admission_action("Wait", || app.on_claude_footer_changed(session));
-        check_admission_transition(&app, wid, session, "Wait", &mut state);
-        assert!(app.claude_typed[&session].late);
-        echo_draft(&app, session, "/fast on");
-        ordering_retired(&app, session);
-        hang_up(&app, session, reader);
-        past_due(&mut app, session);
-        drive_admission_action("FollowRejected", || app.on_claude_footer_changed(session));
-        check_admission_transition(&app, wid, session, "FollowRejected", &mut state);
-        assert!(
-            app.claude_typed.is_empty(),
-            "no read-back for a failed Ctrl-U"
-        );
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::LeftTyped))
-        );
-        app.on_claude_footer_changed(session);
-        assert!(app.claude_typed.is_empty());
-    }
-
-    /// The two tests above flaked under load (the gate of 2026-09-27): a
-    /// child another test was spawning held a copy of the observer across
-    /// its close, so the follow-up write was really accepted. Force that
-    /// interleaving — a live child keeps the observer open for a moment
-    /// after this test drops its own — and each failed follow-up (Return,
-    /// ctrl+u take-back, late cleanup) must still be rejected with the
-    /// notice: [`hang_up`] waits the copy out instead of letting the write
-    /// land in a socket it keeps connected. A `drop` alone fails this every
-    /// time.
-    #[test]
-    fn a_failed_follow_up_is_rejected_though_a_child_briefly_holds_the_observer() {
-        for (take_back, late) in [(false, false), (true, false), (false, true)] {
-            let case = format!("take_back={take_back} late={late}");
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, BYPASS);
-            frame(&mut app, wid);
-            let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
-            drive_admission_action("StartAccepted", || click(&mut app, wid, Light::Fast));
-            assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-            check_admission_transition(&app, wid, session, "StartAccepted", &mut state);
-            if late {
-                past_due(&mut app, session);
-                drive_admission_action("Wait", || app.on_claude_footer_changed(session));
-                check_admission_transition(&app, wid, session, "Wait", &mut state);
-            }
-            ordering_retired(&app, session);
-            echo_draft(&app, session, "/fast on");
-            if take_back || late {
-                past_due(&mut app, session);
-            } else {
-                not_due(&mut app, session);
-            }
-            let copy = reader.try_clone().expect("a second reference");
-            let mut holder = std::process::Command::new("/bin/sleep")
-                .arg("0.3")
-                .stdin(std::os::fd::OwnedFd::from(copy))
-                .spawn()
-                .expect("a child holding the observer");
-            hang_up(&app, session, reader);
-            // The drain runs while an unreaped child could still hold the
-            // copy: only `hang_up`'s wait for the hang-up keeps its write
-            // from landing (reaped first, even a bare drop would pass).
-            drive_admission_action("FollowRejected", || app.on_claude_footer_changed(session));
-            let _ = holder.wait();
-            check_admission_transition(&app, wid, session, "FollowRejected", &mut state);
-            assert!(app.claude_typed.is_empty(), "{case}: no read-back");
-            assert_eq!(
-                refusal(&app, wid, session),
-                Some((Light::Fast, super::Refusal::LeftTyped)),
-                "{case}"
-            );
-        }
-    }
-
-    /// Under a box (the composer not on screen) at the deadline nothing is
-    /// pressed, and the light says the command may still be in the prompt.
-    #[test]
-    fn nothing_is_pressed_into_a_box_at_the_deadline() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        feed(&app, session, b"\x1b[2J\x1b[10;1H Do you want to proceed?");
-        past_due(&mut app, session);
-        app.on_claude_footer_changed(session);
-        assert!(pty(&mut reader, 0).is_empty());
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::LeftTyped))
-        );
-    }
-
-    /// A DRIVER holds the session's lease: a command light types nothing and
-    /// says why; a mode light still presses (shift+tab never touches the
-    /// prompt). Control: once the lease is gone, the command pastes.
-    #[test]
-    fn a_driven_session_refuses_a_command_light_but_not_a_mode_light() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, PLAN);
-        frame(&mut app, wid);
-        let set_lease = |app: &App, lease: Option<crate::Lease>| {
-            let entry = app.pool.get(session).expect("session");
-            *entry
-                .ctx
-                .turn_lease
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = lease;
-        };
-        set_lease(
-            &app,
-            Some(crate::Lease::Turn {
-                id: 41,
-                driver: None,
-                typing: true,
-            }),
-        );
-        click(&mut app, wid, Light::Fast);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "no paste into a driver's prompt"
-        );
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::Driven))
-        );
-        click(&mut app, wid, Light::Mode);
-        assert_eq!(
-            pty(&mut reader, 3),
-            lights::SHIFT_TAB,
-            "a mode light is free"
-        );
-        let past = Instant::now() - Duration::from_millis(1);
-        if let Some(p) = app
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-            .and_then(|s| s.pending.as_mut())
-        {
-            p.deadline = past;
-        }
-        app.on_claude_footer_changed(session);
-        set_lease(&app, None);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(
-            pty(&mut reader, PASTED.len()),
-            PASTED,
-            "control: no lease, the paste"
-        );
     }
 
     /// A return that ENDED is over: its deadline passed with the press
@@ -5052,6 +2660,34 @@ mod gesture_tests {
             .deadline = Instant::now() - Duration::from_millis(1);
     }
 
+    /// Hold `session`'s mode-return press well BEFORE its deadline, however
+    /// slowly the test reaches the next drain — once the drive just done
+    /// (`since` taken before it) is seen to have given the press its own
+    /// full `SETTLE_MS`. The conformance tests fire the tiered checks between
+    /// a press and the drain of Claude's answer, and on a loaded machine (a
+    /// landing run at load 100-170, the checks' `ty` spawns among it) those
+    /// alone can spend the whole 2.5 s: the drain then read the press as
+    /// overdue and sent nothing, and the test failed on the empty PTY
+    /// (`left: []`, `right: [27, 91, 90]`) — the deadline's case, not the
+    /// answer's the test is about. The deadline's own cases stay with
+    /// [`past_deadline`] and the tests that time it.
+    fn press_not_due(app: &mut App, wid: WindowId, session: u64, since: Instant) {
+        let p = app
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
+            .and_then(|s| s.pending.as_mut())
+            .expect("in flight");
+        // Bounded on both sides: a press that did not re-arm keeps the 60 s
+        // hold the previous call left, past `now + SETTLE_MS`.
+        let settle = Duration::from_millis(lights::SETTLE_MS);
+        assert!(
+            since + settle <= p.deadline && p.deadline <= Instant::now() + settle,
+            "the drive gives the press its own deadline"
+        );
+        p.deadline = Instant::now() + Duration::from_secs(60);
+    }
+
     /// THE RETURN RUNS WITHOUT FRAMES (the review of 2026-09-27): a pane that
     /// leaves the screen — a background tab, an occluded window — gets no
     /// frames, and a return decided from painted frames stranded there. Each
@@ -5093,7 +2729,7 @@ mod gesture_tests {
         assert!(pty(&mut reader, 0).is_empty(), "bypass: done");
         let s = &app.windows[&wid].claude_lights.sessions[&session];
         assert!(s.pending.is_none() && s.refused.is_none());
-        assert!(matches!(s.notice, Some((Light::Mode, _, _))));
+        assert!(matches!(s.notice, Some((Light::Mode, _))));
     }
 
     /// The model's `mode` of the pill `screen` shows.
@@ -5120,7 +2756,7 @@ mod gesture_tests {
         expected: &aterm_spec::interp::State,
     ) -> aterm_spec::interp::State {
         let mut observed = expected.clone();
-        let screen = app.claude_screen_now(session).map(|(screen, _)| screen);
+        let screen = app.claude_screen_now(session);
         observed.insert("covered", i64::from(screen.is_none()));
         let shown = screen.as_ref().and_then(|screen| screen.mode);
         if let Some(mode) = shown {
@@ -5139,7 +2775,7 @@ mod gesture_tests {
         let phase = if s.pending.is_some() {
             1
         } else if s.refused.is_some_and(|(_, _, until)| until > now)
-            || s.notice.is_some_and(|(_, until, _)| until > now)
+            || s.notice.is_some_and(|(_, until)| until > now)
         {
             2
         } else {
@@ -5255,7 +2891,9 @@ mod gesture_tests {
                 draw_claude(&app, session, MANUAL);
             }
             frame(&mut app, wid);
+            let since = Instant::now();
             drive_mode_return_action("Click", || click(&mut app, wid, Light::Mode));
+            press_not_due(&mut app, wid, session, since);
             assert_eq!(
                 pty(&mut reader, 3),
                 lights::SHIFT_TAB,
@@ -5275,7 +2913,9 @@ mod gesture_tests {
                 redraw_mode_row(&app, session, answer);
                 check_mode_return_transition(&app, wid, session, "Answer", &mut state, None);
                 if i < last {
+                    let since = Instant::now();
                     drive_mode_return_action("Press", || app.on_claude_footer_changed(session));
+                    press_not_due(&mut app, wid, session, since);
                     assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "{answer:?}");
                     check_mode_return_transition(&app, wid, session, "Press", &mut state, None);
                 }
@@ -5365,12 +3005,16 @@ mod gesture_tests {
             draw_claude(&app, session, MANUAL);
             frame(&mut app, wid);
             let mut state = model.init_state();
+            let since = Instant::now();
             drive_mode_return_action("Click", || click(&mut app, wid, Light::Mode));
+            press_not_due(&mut app, wid, session, since);
             assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
             check_mode_return_transition(&app, wid, session, "Click", &mut state, None);
             redraw_mode_row(&app, session, ACCEPT);
             check_mode_return_transition(&app, wid, session, "Answer", &mut state, None);
+            let since = Instant::now();
             drive_mode_return_action("Press", || app.on_claude_footer_changed(session));
+            press_not_due(&mut app, wid, session, since);
             assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
             check_mode_return_transition(&app, wid, session, "Press", &mut state, None);
             // A turn starts before Claude answers the press, then it answers.
@@ -5424,13 +3068,17 @@ mod gesture_tests {
             state.insert("mode", 2);
             state.insert("start", 2);
             assert!(model.fire("Narrow", &mut state));
+            let since = Instant::now();
             drive_mode_return_action("Click", || click(&mut app, wid, Light::Mode));
+            press_not_due(&mut app, wid, session, since);
             assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
             check_mode_return_transition(&app, wid, session, "Click", &mut state, None);
             for answer in [PLAN, MANUAL] {
                 redraw_mode_row(&app, session, answer);
                 check_mode_return_transition(&app, wid, session, "Answer", &mut state, None);
+                let since = Instant::now();
                 drive_mode_return_action("Press", || app.on_claude_footer_changed(session));
+                press_not_due(&mut app, wid, session, since);
                 assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "{answer:?}");
                 check_mode_return_transition(&app, wid, session, "Press", &mut state, None);
             }
@@ -5458,7 +3106,9 @@ mod gesture_tests {
             draw_claude(&app, session, MANUAL);
             frame(&mut app, wid);
             let mut state = model.init_state();
+            let since = Instant::now();
             drive_mode_return_action("Click", || click(&mut app, wid, Light::Mode));
+            press_not_due(&mut app, wid, session, since);
             assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
             check_mode_return_transition(&app, wid, session, "Click", &mut state, None);
             redraw_mode_row(&app, session, ACCEPT);
@@ -5481,339 +3131,14 @@ mod gesture_tests {
         }
     }
 
-    /// Claude mid-turn: `esc to interrupt` on the mode row.
-    const BUSY: &str = "  \u{23F5}\u{23F5} bypass permissions on \u{00B7} esc to interrupt";
-
-    /// FAST MODE MID-TURN (owner, 2026-09-27: "fast mode toggle doesn't
-    /// work"): Claude runs `/fast` mid-turn (`immediate`, measured on
-    /// 2.1.283), so a click during a turn is NOT refused — the command is
-    /// pasted, and its Enter goes as soon as the composer holds it, the turn
-    /// still running. Negative control: a command Claude does NOT run
-    /// mid-turn keeps its Enter until the turn ends (the record forced
-    /// non-immediate), and nothing is pressed meanwhile.
-    #[test]
-    fn a_fast_click_mid_turn_is_typed_and_submitted_at_once() {
-        for immediate in [true, false] {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, BUSY);
-            frame(&mut app, wid);
-            click(&mut app, wid, Light::Fast);
-            assert_eq!(
-                pty(&mut reader, PASTED.len()),
-                PASTED,
-                "not refused for the turn"
-            );
-            assert_eq!(refusal(&app, wid, session), None);
-            app.claude_typed.get_mut(&session).expect("typed").immediate = immediate;
-            not_due(&mut app, session);
-            echo_draft(&app, session, "/fast on");
-            app.on_claude_footer_changed(session);
-            if immediate {
-                assert_eq!(pty(&mut reader, 1), b"\r", "the Enter, mid-turn");
-            } else {
-                assert!(
-                    pty(&mut reader, 0).is_empty(),
-                    "control: a non-immediate command waits for the turn"
-                );
-            }
-        }
-    }
-
-    /// THE REAL IDLE SEQUENCE: after the Enter, Claude hides its composer
-    /// while it asks whether fast mode is available (up to 8 s, the vendor's
-    /// `Rdr`), then shows `↯`. The old 2.5 s deadline called that "Claude did
-    /// not switch". Now the toggle is still in flight 4 s in — no refusal, no
-    /// ctrl+u — and `↯` resolves it. Control: past `FAST_SETTLE_MS` with no
-    /// answer at all, it is given up.
-    #[test]
-    fn a_fast_click_waits_out_claudes_availability_check() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        let clicked = Instant::now();
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        not_due(&mut app, session);
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert_eq!(pty(&mut reader, 1), b"\r");
-        // Claude applies it: no composer, a progress line.
-        feed(
-            &app,
-            session,
-            b"\x1b[2J\x1b[20;1H  Turning fast mode on\xe2\x80\xa6",
-        );
-        app.on_claude_footer_changed(session);
-        frame(&mut app, wid);
-        let four = clicked + Duration::from_millis(4000);
-        assert_eq!(
-            app.windows
-                .get_mut(&wid)
-                .unwrap()
-                .claude_lights
-                .expire(four),
-            (false, Vec::new()),
-            "4 s in, still waiting"
-        );
-        assert!(pty(&mut reader, 0).is_empty(), "no ctrl+u");
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(s.pending.is_some() && s.refused.is_none());
-        assert!(
-            super::what_of(
-                s,
-                Light::Fast,
-                None,
-                false,
-                &lights::Expect::default(),
-                Instant::now()
-            )
-            .0
-            .starts_with("turning on"),
-            "the chip says it is turning on"
-        );
-        // Control: the deadline is fast mode's own, 10 s.
-        let deadline = s.pending.as_ref().unwrap().deadline;
-        assert!(deadline >= clicked + Duration::from_millis(lights::FAST_SETTLE_MS));
-        // The composer back, `↯` on its rule: on.
-        draw_claude(&app, session, BYPASS);
-        set_fast(&app, session);
-        app.on_claude_footer_changed(session);
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(s.pending.is_none() && s.refused.is_none(), "resolved");
-        assert_eq!(s.shown.fast, LightState::On);
-        assert!(matches!(s.notice, Some((Light::Fast, _, _))));
-    }
-
-    /// The transcript's echo of `/fast on` and Claude's `⎿` answer under it,
-    /// above the composer (a SYNTHETIC layout from the 2.1.283 strings).
-    fn answer_fast(app: &App, session: u64, answer: &str) {
-        feed(
-            app,
-            session,
-            format!(
-                "\x1b[16;1H\x1b[2K\u{276F} /fast on\x1b[17;1H\x1b[2K  \u{23BF}  {answer}\x1b[22;3H"
-            )
-            .as_bytes(),
-        );
-    }
-
-    /// CLAUDE'S OWN REFUSAL, IN ITS WORDS: `Fast mode is not available`
-    /// under the echo ends the toggle at once as that refusal, titled "not
-    /// available in this Claude" — and, being the build's answer, it is
-    /// LATCHED for this Claude build and model: once said, the fast chip
-    /// stops asking there. Controls: a retry-later refusal (`Checking fast
-    /// mode availability`) and a reason this build does not know (`Fast mode
-    /// unavailable: …`, `FastRefusal::Other`) are said but not latched, and
-    /// the chip keeps asking; the latch is one build's and one model's — a
-    /// session on another model is asked again, and another build's refusal
-    /// latched later does not undo this one.
-    #[test]
-    fn claudes_refusal_is_said_in_its_words_and_a_lasting_one_stops_the_asking() {
-        for (answer, lasting) in [
-            ("Fast mode is not available", true),
-            ("Checking fast mode availability\u{2026}", false),
-            ("Fast mode unavailable: something new", false),
-        ] {
-            let (mut app, wid, session, mut reader) = app();
-            publish_facts(&app, session);
-            draw_claude(&app, session, BYPASS);
-            frame(&mut app, wid);
-            click(&mut app, wid, Light::Fast);
-            assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-            not_due(&mut app, session);
-            echo_draft(&app, session, "/fast on");
-            app.on_claude_footer_changed(session);
-            assert_eq!(pty(&mut reader, 1), b"\r");
-            echo_draft(&app, session, "");
-            answer_fast(&app, session, answer);
-            app.on_claude_footer_changed(session);
-            let why = refusal(&app, wid, session);
-            assert!(
-                matches!(why, Some((Light::Fast, super::Refusal::Vendor(_)))),
-                "{answer:?}: {why:?}"
-            );
-            frame(&mut app, wid);
-            let text = row_text(&app, wid, footer_row(&app, wid));
-            let words = if lasting {
-                "not available in this Claude"
-            } else if answer.starts_with("Checking") {
-                "Claude is still checking; try again"
-            } else {
-                "Claude did not switch (see its message)"
-            };
-            assert!(text.contains(words), "{text:?}");
-            assert_eq!(
-                !app.claude_fast_latch.refused.is_empty(),
-                lasting,
-                "{answer:?}"
-            );
-            // The refusal's moment over.
-            if let Some((_, _, until)) = app
-                .windows
-                .get_mut(&wid)
-                .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-                .and_then(|s| s.refused.as_mut())
-            {
-                *until = Instant::now() - Duration::from_millis(1);
-            }
-            app.on_claude_footer_changed(session);
-            // The pointer leaves the chip it clicked: a hovered chip stays
-            // drawn, whatever it shows.
-            app.clear_claude_light_hover(wid);
-            frame(&mut app, wid);
-            let asking = app.windows[&wid]
-                .claude_lights
-                .hits
-                .iter()
-                .any(|h| h.light == Light::Fast);
-            assert_eq!(asking, !lasting, "{answer:?}: the chip asks again?");
-            assert!(pty(&mut reader, 0).is_empty(), "no key after the Enter");
-            if lasting {
-                // Another build's refusal, latched later, leaves this one's.
-                assert!(app.claude_fast_latch.refuse(
-                    Some("2.1.998".into()),
-                    Some("Opus 5.5".into()),
-                    lights::FastRefusal::DisabledByOrg,
-                ));
-                frame(&mut app, wid);
-                assert!(
-                    !app.windows[&wid]
-                        .claude_lights
-                        .hits
-                        .iter()
-                        .any(|h| h.light == Light::Fast),
-                    "this build's latch still holds"
-                );
-                // Control: the latch is the BUILD's and the MODEL's. A
-                // session now on another model, then on another Claude
-                // build, is asked for fast mode again, once.
-                for (version, model) in [(None, "Sonnet 5"), (Some("2.1.999"), "Opus 5.5")] {
-                    let entry = app.pool.get(session).expect("session");
-                    let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                    let mut facts = timeline.claude_footer().cloned().expect("facts");
-                    facts.version = version.map(str::to_owned);
-                    facts.model = Some(model.to_owned());
-                    assert!(timeline.set_claude_footer(PGID, None, Some(facts)));
-                    drop(timeline);
-                    frame(&mut app, wid);
-                    assert!(
-                        app.windows[&wid]
-                            .claude_lights
-                            .hits
-                            .iter()
-                            .any(|h| h.light == Light::Fast),
-                        "{model} on {version:?} is asked again"
-                    );
-                }
-            }
-        }
-    }
-
-    /// An answer from an EARLIER try, still on screen at the click, is not
-    /// this toggle's: the click is still in flight after a wake. Control: a
-    /// new answer under a new echo resolves it.
-    #[test]
-    fn an_earlier_answer_on_screen_is_not_this_clicks() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        answer_fast(&app, session, "Fast mode is currently unavailable");
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        app.on_claude_footer_changed(session);
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(
-            s.pending.is_some() && s.refused.is_none(),
-            "the old answer is not this one's"
-        );
-        // Control: Claude answers this try, under its own echo.
-        feed(
-            &app,
-            session,
-            "\x1b[18;1H\x1b[2K\u{276F} /fast on\x1b[19;1H\x1b[2K  \u{23BF}  Fast mode ON\x1b[22;3H"
-                .as_bytes(),
-        );
-        app.on_claude_footer_changed(session);
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(
-            s.pending.is_none() && s.refused.is_none(),
-            "this one's answer"
-        );
-        assert!(matches!(s.notice, Some((Light::Fast, _, _))));
-    }
-
-    /// WHO MAY STILL BE TYPING: a `turn` whose prompt a busy Claude has
-    /// already taken does not refuse a fast click (its prompt is sent), and a
-    /// lease live at the paste does not stop the Enter; a cooperative
-    /// `lease` refuses it (its holder may type at any time). The idle `turn`
-    /// is `a_driven_session_refuses_a_command_light_but_not_a_mode_light`.
-    #[test]
-    fn a_turn_already_taken_by_a_busy_claude_does_not_refuse_fast_but_a_lease_does() {
-        let set_lease = |app: &App, session: u64, lease: Option<crate::Lease>| {
-            *app.pool
-                .get(session)
-                .expect("session")
-                .ctx
-                .turn_lease
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = lease;
-        };
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BUSY);
-        frame(&mut app, wid);
-        set_lease(
-            &app,
-            session,
-            Some(crate::Lease::Turn {
-                id: 41,
-                driver: None,
-                typing: true,
-            }),
-        );
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(
-            pty(&mut reader, PASTED.len()),
-            PASTED,
-            "the turn's prompt is sent"
-        );
-        not_due(&mut app, session);
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert_eq!(pty(&mut reader, 1), b"\r", "the same turn, no new hand");
-        // A cooperative lease: refused.
-        let (mut app, wid, session, mut reader) = super::gesture_tests::app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BUSY);
-        frame(&mut app, wid);
-        set_lease(
-            &app,
-            session,
-            Some(crate::Lease::Drive {
-                holder: "manager".into(),
-                expires_us: u64::MAX,
-                conn: None,
-                hard: false,
-            }),
-        );
-        click(&mut app, wid, Light::Fast);
-        assert!(pty(&mut reader, 0).is_empty());
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::Driven))
-        );
-    }
-
     /// Claude Code's bottom block drawn `cols` wide — [`draw_claude`] for a
-    /// window resized narrower — with fast mode ON on its rule.
-    fn draw_claude_fast_cols(app: &App, session: u64, mode: &str, cols: usize) {
+    /// window resized narrower. Only the chip-room test draws it, and that
+    /// test is macOS's.
+    #[cfg(target_os = "macos")]
+    fn draw_claude_cols(app: &App, session: u64, mode: &str, cols: usize) {
         let rule = "\u{2500}".repeat(cols);
-        let fast_rule = format!("{} \u{21AF} \u{2500}", "\u{2500}".repeat(cols - 4));
         let screen = format!(
-            "\x1b[?2004h\x1b[2J\x1b[19;1H\u{25CF} done\x1b[21;1H{fast_rule}\x1b[22;1H\u{276F} \
+            "\x1b[?2004h\x1b[2J\x1b[19;1H\u{25CF} done\x1b[21;1H{rule}\x1b[22;1H\u{276F} \
              \x1b[23;1H{rule}\x1b[24;1H{mode}\x1b[22;3H"
         );
         feed(app, session, screen.as_bytes());
@@ -5822,9 +3147,8 @@ mod gesture_tests {
     /// NO SELECTION NOBODY CAN SEE (the review of 2026-09-27): the keyboard
     /// selects only a chip the pane has ROOM for, the reveal giving way
     /// first. At 40 columns, accept edits: the chip drawn at rest stays on
-    /// the glass when the chord selects it (the whole reveal does not fit),
-    /// and the walk does not step onto a chip that cannot be drawn beside
-    /// it. The window narrowed to 30 columns, no chip fits: the standing
+    /// the glass when the chord selects it. The window narrowed to 30
+    /// columns, no chip fits: the standing
     /// selection is let go by the next key, and that Return is CLAUDE'S —
     /// never swallowed by a light off the glass. Control: at 30 columns a
     /// fresh chord selects nothing (and reaches Claude as no shift+tab), and
@@ -5832,25 +3156,7 @@ mod gesture_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keyboard_never_selects_a_chip_the_pane_has_no_room_for() {
-        use winit::event::KeyEvent;
-        use winit::keyboard::{
-            Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
-        };
-        fn tap(app: &mut App, wid: WindowId, named: NamedKey, code: KeyCode, text: &str) {
-            for state in [ElementState::Pressed, ElementState::Released] {
-                app.on_key(
-                    wid,
-                    KeyEvent::synthetic_for_test(
-                        PhysicalKey::Code(code),
-                        Key::Named(named),
-                        Some(SmolStr::new(text)),
-                        KeyLocation::Standard,
-                        state,
-                        false,
-                    ),
-                );
-            }
-        }
+        use winit::keyboard::{KeyCode, ModifiersState, NamedKey};
         fn chord(app: &mut App, wid: WindowId) {
             app.windows.get_mut(&wid).unwrap().mods =
                 ModifiersState::CONTROL | ModifiersState::SHIFT;
@@ -5861,7 +3167,7 @@ mod gesture_tests {
         let (mut app, wid, session, mut reader) = app();
         publish_facts(&app, session);
         assert!(app.apply_term_resize(wid, 24, 40));
-        draw_claude_fast_cols(&app, session, ACCEPT_SHORT, 40);
+        draw_claude_cols(&app, session, ACCEPT_SHORT, 40);
         frame(&mut app, wid);
         let at_rest = hit(&app, wid, Light::Mode);
         chord(&mut app, wid);
@@ -5872,20 +3178,14 @@ mod gesture_tests {
         frame(&mut app, wid);
         let text = row_text(&app, wid, at_rest.0);
         assert!(
-            text.contains("\u{23F5}\u{23F5} accept edits") && !text.contains("fast"),
-            "the chip stays, the reveal gives way: {text:?}"
+            text.contains("\u{23F5}\u{23F5} accept edits"),
+            "the chip stays: {text:?}"
         );
         assert_eq!(hit(&app, wid, Light::Mode).0, at_rest.0);
-        tap(&mut app, wid, NamedKey::ArrowRight, KeyCode::ArrowRight, "");
-        assert_eq!(
-            app.windows[&wid].claude_lights.selected,
-            Some((session, Light::Mode)),
-            "no step onto a chip with no room beside it"
-        );
         assert!(pty(&mut reader, 0).is_empty());
         // Narrower: no chip fits at all.
         assert!(app.apply_term_resize(wid, 24, 30));
-        draw_claude_fast_cols(&app, session, ACCEPT_SHORT, 30);
+        draw_claude_cols(&app, session, ACCEPT_SHORT, 30);
         frame(&mut app, wid);
         assert!(app.windows[&wid].claude_lights.hits.is_empty(), "no room");
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
@@ -5906,237 +3206,6 @@ mod gesture_tests {
         );
         tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
         assert_eq!(pty(&mut reader, 1), b"\r");
-    }
-
-    /// THE ANSWER WINDOW OPENS AT THE ENTER (the review of 2026-09-27): the
-    /// paste's echo may take most of a step, and Claude's up-to-8 s org check
-    /// starts at the Enter — so the Enter sets the toggle's deadline a whole
-    /// `FAST_SETTLE_MS` from itself. And the Enter is ATERM'S keystroke, not
-    /// the person's: it leaves the person clock as the click left it, so the
-    /// supervisor's `human_grace_s` is the click's alone. Controls: the click
-    /// itself stamps the clock, and the deadline before the Enter is the one
-    /// set short here.
-    #[test]
-    fn the_answer_window_opens_at_the_enter_and_the_enter_is_aterms_own() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        let clock = |app: &App| app.pool.get(session).unwrap().ctx.human_input.last();
-        let before = clock(&app);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        let after_click = clock(&app);
-        assert_ne!(after_click, before, "control: the click is the person's");
-        not_due(&mut app, session);
-        // The echo was slow: the click's window is nearly spent.
-        let short = Instant::now() + Duration::from_millis(100);
-        app.windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-            .and_then(|s| s.pending.as_mut())
-            .expect("in flight")
-            .deadline = short;
-        echo_draft(&app, session, "/fast on");
-        let enter = Instant::now();
-        app.on_claude_footer_changed(session);
-        assert_eq!(pty(&mut reader, 1), b"\r");
-        let deadline = app.windows[&wid].claude_lights.sessions[&session]
-            .pending
-            .as_ref()
-            .expect("still in flight")
-            .deadline;
-        assert!(
-            deadline >= enter + Duration::from_millis(lights::FAST_SETTLE_MS),
-            "a whole answer window from the Enter"
-        );
-        assert_eq!(clock(&app), after_click, "the Enter stamps no person");
-    }
-
-    /// A VIEW SCROLLED INTO HISTORY keeps the answer poll armed (the review
-    /// of 2026-09-27): the engine read skips a scrolled view, and nothing
-    /// paints one — so the loop must keep looking, and read Claude's answer
-    /// once the view is back. Control: the answer, read, resolves in
-    /// Claude's words (not the deadline's "did not switch").
-    #[test]
-    fn a_scrolled_view_keeps_the_answer_poll_armed() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        feed(&app, session, "history\r\n".repeat(60).as_bytes());
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        not_due(&mut app, session);
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert_eq!(pty(&mut reader, 1), b"\r");
-        echo_draft(&app, session, "");
-        answer_fast(
-            &app,
-            session,
-            "Fast mode has been disabled by your organization",
-        );
-        let term = app.pool.get(session).expect("session").term.clone();
-        term_lock(&term).scroll_display(5);
-        assert!(app.claude_rows_now(session).is_none(), "scrolled back");
-        let poll = |app: &mut App| -> Option<Instant> {
-            app.windows[&wid].claude_lights.sessions[&session]
-                .pending
-                .as_ref()
-                .and_then(|p| p.next_poll)
-        };
-        let past = Instant::now() - Duration::from_millis(1);
-        app.windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-            .and_then(|s| s.pending.as_mut())
-            .expect("in flight")
-            .next_poll = Some(past);
-        app.on_claude_footer_changed(session);
-        assert!(
-            poll(&mut app).is_some_and(|at| at > Instant::now()),
-            "the poll is armed again"
-        );
-        term_lock(&term).scroll_to_bottom();
-        app.on_claude_footer_changed(session);
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((
-                Light::Fast,
-                super::Refusal::Vendor(lights::FastRefusal::DisabledByOrg)
-            ))
-        );
-    }
-
-    /// The repaint key of a window: its footer term, as a frame computes it.
-    fn footer_key(app: &mut App, wid: WindowId) -> u64 {
-        let prepared = app.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
-            wid,
-            crate::app_render::ComposedCursorFxClock::Advance(Instant::now()),
-        );
-        let crate::app_render::CapturePreparation::Ready((_, plan)) = prepared else {
-            panic!("the headless capture must produce a frame");
-        };
-        app.claude_footer_fp(wid, &plan)
-    }
-
-    /// THE LATCH REPAINTS EVERY WINDOW (the review of 2026-09-27): a latch
-    /// taken in one window changes what the fast chip says in every other,
-    /// so it is a term of every window's repaint key — an idle pane does not
-    /// keep a stale, clickable `○ fast`. Control: the same latch again is no
-    /// change, and the key stays.
-    #[test]
-    fn a_latch_moves_every_windows_repaint_key() {
-        let (mut app, wid, session, _reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, BYPASS);
-        frame(&mut app, wid);
-        let before = footer_key(&mut app, wid);
-        assert_eq!(footer_key(&mut app, wid), before, "a quiet key is stable");
-        assert!(app.claude_fast_latch.refuse(
-            None,
-            Some("Opus 5.5".into()),
-            lights::FastRefusal::NotAvailable
-        ));
-        let latched = footer_key(&mut app, wid);
-        assert_ne!(latched, before, "the latch repaints");
-        assert!(!app.claude_fast_latch.refuse(
-            None,
-            Some("Opus 5.5".into()),
-            lights::FastRefusal::NotAvailable
-        ));
-        assert_eq!(footer_key(&mut app, wid), latched, "control: no change");
-        frame(&mut app, wid);
-        assert!(
-            !app.windows[&wid]
-                .claude_lights
-                .hits
-                .iter()
-                .any(|h| h.light == Light::Fast),
-            "and the chip is gone"
-        );
-    }
-
-    /// FAST MODE THAT TOOK AUTO MODE OFF, END TO END: from auto, `/fast on`
-    /// is answered ON and Claude moves the session to manual, saying why
-    /// (`lights::AUTO_OFF_FOR_FAST`). The fast chip says so; the build is
-    /// latched; and from then on, in auto mode, the fast chip is not drawn,
-    /// and a click on it (the keyboard's reveal) is REFUSED — auto is never
-    /// traded for fast again unseen. Control: in bypass the latch costs
-    /// nothing, and the fast chip still asks.
-    #[test]
-    fn fast_mode_that_took_auto_off_is_never_traded_again_unseen() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, AUTO);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Fast);
-        assert_eq!(pty(&mut reader, PASTED.len()), PASTED);
-        not_due(&mut app, session);
-        echo_draft(&app, session, "/fast on");
-        app.on_claude_footer_changed(session);
-        assert_eq!(pty(&mut reader, 1), b"\r");
-        echo_draft(&app, session, "");
-        answer_fast(&app, session, "Fast mode ON");
-        redraw_mode_row(
-            &app,
-            session,
-            "  \u{23F8} manual mode on \u{00B7} auto mode unavailable while fast mode is on \u{00B7} run /fast off",
-        );
-        set_fast(&app, session);
-        app.on_claude_footer_changed(session);
-        let s = &app.windows[&wid].claude_lights.sessions[&session];
-        assert!(s.pending.is_none());
-        assert!(
-            matches!(s.notice, Some((Light::Fast, _, Some(said))) if said.contains("auto mode off")),
-            "{:?}",
-            s.notice
-        );
-        assert!(app.claude_fast_latch.costs_auto.contains(&None));
-        // Back in auto, fast off: not asked.
-        draw_claude(&app, session, AUTO);
-        if let Some(s) = app
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-        {
-            s.notice = None;
-        }
-        app.clear_claude_light_hover(wid);
-        frame(&mut app, wid);
-        assert!(
-            !app.windows[&wid]
-                .claude_lights
-                .hits
-                .iter()
-                .any(|h| h.light == Light::Fast),
-            "auto is not asked to trade"
-        );
-        app.toggle_claude_light(wid, session, Light::Fast);
-        assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
-        assert_eq!(
-            refusal(&app, wid, session),
-            Some((Light::Fast, super::Refusal::CostsAuto))
-        );
-        // Control: bypass loses nothing to fast mode.
-        draw_claude(&app, session, BYPASS);
-        if let Some(s) = app
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
-        {
-            s.refused = None;
-        }
-        frame(&mut app, wid);
-        assert!(
-            app.windows[&wid]
-                .claude_lights
-                .hits
-                .iter()
-                .any(|h| h.light == Light::Fast),
-            "bypass: the fast chip asks"
-        );
     }
 
     // The mode-return machine's actions that are not aterm's: Claude's own

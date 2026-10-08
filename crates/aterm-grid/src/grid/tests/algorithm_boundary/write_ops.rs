@@ -120,9 +120,7 @@ fn write_ascii_blast_scrolls_at_screen_bottom() {
     assert!(grid.row(1).unwrap().is_empty());
 }
 
-// ========================================================================
 // Carriage return
-// ========================================================================
 
 #[test]
 fn carriage_return_at_col_zero_is_noop() {
@@ -148,9 +146,7 @@ fn carriage_return_then_line_feed_sequence() {
     assert_eq!(grid.cursor_row(), 3);
 }
 
-// ========================================================================
 // Erase rect boundary conditions
-// ========================================================================
 
 #[test]
 fn erase_rect_inverted_coordinates_is_noop() {
@@ -165,9 +161,7 @@ fn erase_rect_inverted_coordinates_is_noop() {
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
 }
 
-// ========================================================================
 // Backspace boundary
-// ========================================================================
 
 #[test]
 fn backspace_from_mid_column() {
@@ -179,8 +173,7 @@ fn backspace_from_mid_column() {
     assert_eq!(grid.cursor_row(), 1);
 }
 
-// Algorithm audit: Row insert_chars/delete_chars boundary conditions
-// ========================================================================
+// Row insert_chars/delete_chars boundary conditions
 
 /// insert_chars at the last column should only affect that column.
 #[test]
@@ -232,9 +225,7 @@ fn erase_chars_at_content_boundary() {
     );
 }
 
-// ========================================================================
-// ECH/ICH/DCH extras management (#4057)
-// ========================================================================
+// ECH/ICH/DCH extras management
 
 use crate::extra::CellCoord;
 

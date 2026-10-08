@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REGRESSION: an in-session update refused to apply — forever — on any desk
-//! where a session was sitting on the alternate screen.
+//! The alt blob of a checkpoint taken on the alternate screen has exactly
+//! `rows` records.
 //!
-//! `Terminal::alt_grid` is the INACTIVE grid, not "the alternate screen". While
-//! the alternate screen is up it holds the SAVED PRIMARY, scrollback and all
-//! (`terminal/buffer_api.rs`: "`self.alt_grid`, which holds the SAVED PRIMARY").
-//!
-//! The handoff wire gives the alt blob exactly `rows` records: `CheckpointMeta`
-//! carries a single `history_lines`, and that field describes the MAIN blob, so
-//! the alt blob has no way to declare a history count of its own. The consumer
-//! therefore validates it with `history = 0`. Projecting the inactive grid with
-//! `max_history` instead made the blob `min(primary_scrollback, max) + rows`
-//! records; `deserialize_lines_strict` refuses a declared count above the
-//! expected one outright, so `screen_digest` returned `None` and every apply
-//! failed with "visible checkpoint set could not be committed canonically".
-//!
-//! These tests pin the wire shape at the producer, which is the only place that
-//! can honour it.
+//! `Terminal::alt_grid` is the inactive grid: while the alternate screen is up
+//! it holds the saved primary, scrollback and all. `CheckpointMeta` carries one
+//! `history_lines`, describing the main blob, so the consumer validates the alt
+//! blob with `history = 0` and `deserialize_lines_strict` refuses any larger
+//! declared count. The producer is the only place that can honour that shape,
+//! so these tests pin it there.
 
 use aterm_core::scrollback::{deserialize_lines_strict, serialize_lines};
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
@@ -40,7 +31,7 @@ fn is_canonical(bytes: &[u8], expected: usize, cols: u16) -> bool {
         .is_some_and(|lines| lines.len() == expected && serialize_lines(&lines) == bytes)
 }
 
-/// A terminal whose PRIMARY screen has real scrollback behind it.
+/// A terminal whose primary screen has real scrollback behind it.
 fn primary_with_history() -> Terminal {
     let mut t = Terminal::new(ROWS, COLS);
     for i in 0..(usize::from(ROWS) + 400) {
@@ -53,8 +44,8 @@ fn carry(t: &Terminal) -> TerminalCheckpoint {
     t.checkpoint_carry(CARRY).expect("parser is Ground")
 }
 
-/// The precondition the regression depends on: the primary really does carry
-/// history, so the alt-screen case below is not vacuous.
+/// Precondition: the primary really does carry history, so the alt-screen case
+/// below is not vacuous.
 #[test]
 fn the_primary_screen_carries_history() {
     let cp = carry(&primary_with_history());
@@ -64,9 +55,8 @@ fn the_primary_screen_carries_history() {
     );
 }
 
-/// THE REGRESSION. While the alternate screen is up, the saved primary — with
-/// its scrollback — is what `alt_grid` holds, and the wire still allows it
-/// exactly `rows` records.
+/// While the alternate screen is up, `alt_grid` holds the saved primary with
+/// its scrollback, and the wire still allows it exactly `rows` records.
 #[test]
 fn the_alt_blob_is_exactly_rows_records_while_the_alternate_screen_is_up() {
     let mut t = primary_with_history();
@@ -88,7 +78,7 @@ fn the_alt_blob_is_exactly_rows_records_while_the_alternate_screen_is_up() {
     );
 }
 
-/// The other entry mode. 1047 reuses the PERSISTENT alternate buffer rather
+/// The other entry mode. 1047 reuses the persistent alternate buffer rather
 /// than allocating a cleared one, so it reaches the same parked saved primary
 /// by a different path.
 #[test]
@@ -109,12 +99,11 @@ fn the_alt_blob_is_exactly_rows_records_under_mode_1047_too() {
     );
 }
 
-/// CONTROL: back on the primary screen, `alt_grid` holds the PERSISTENT
-/// alternate buffer, whose ring cap is 0 by xterm spec. This passed before the
-/// fix and must keep passing — the fix must not disturb the case that worked.
+/// Control: back on the primary screen, `alt_grid` holds the persistent
+/// alternate buffer, whose ring cap is 0 (xterm).
 ///
-/// Exit via 1047, not 1049: 1049 DISCARDS the alternate buffer (`alt_grid`
-/// becomes `None`), so it cannot exercise a parked alt blob at all.
+/// Exit via 1047, not 1049: 1049 discards the alternate buffer (`alt_grid`
+/// becomes `None`), so it cannot exercise a parked alt blob.
 #[test]
 fn the_alt_blob_is_exactly_rows_records_after_leaving_the_alternate_screen() {
     let mut t = primary_with_history();
@@ -134,7 +123,7 @@ fn the_alt_blob_is_exactly_rows_records_after_leaving_the_alternate_screen() {
     );
 }
 
-/// The MAIN blob's own contract, which is the one `history_lines` describes:
+/// The main blob's own contract, which is the one `history_lines` describes:
 /// `rows + history_lines` records. Pinned alongside so a fix to the alt side
 /// cannot quietly break the side that is allowed to carry history.
 #[test]
@@ -153,16 +142,11 @@ fn the_main_blob_is_rows_plus_its_declared_history() {
 }
 
 // ---------------------------------------------------------------------------
-// REGRESSION (2026-09-14, live): after a self-update handoff the adopted
-// worker's first archived alt-screen rows were its composer's rule and footer.
-//
-// The adopted engine restores the checkpoint at the OLD grid size, the app
-// repaints that screen, and the window's first resize converges engine and PTY
-// to the new frame. The repaint diffed as identical, so no chrome height was
-// ever measured, and the resize flushed the whole old screen into the archive:
-// rules, prompt and footer included. The restored screen is now the baseline,
-// and a resize before any chrome was measured leaves out the rows the new frame
-// still shows at the bottom.
+// After a self-update handoff the adopted engine restores the checkpoint at the
+// old grid size, the app repaints, and the window's first resize converges to
+// the new frame. The restored screen is the archive's baseline, and a resize
+// before any chrome height was measured leaves out the rows the new frame still
+// shows at the bottom, so the composer's rule and footer are not archived.
 
 /// A synthetic Claude-Code-shaped screen (never a real capture): transcript
 /// rows, then the composer — a blank, a rule, the prompt, a rule, the footer —
@@ -264,10 +248,10 @@ fn an_adopted_screen_resized_before_its_first_frame_archives_only_what_left() {
 }
 
 // ---------------------------------------------------------------------------
-// Round 10: the ARCHIVE itself crosses the handoff (`AltArchiveCarry`). The
-// old engine's capture is split as the GUI splits it — the head inside the
-// freeze, beside the checkpoint; the rows afterwards, behind the fence — and
-// the adopting engine imports it right after restoring the checkpoint.
+// The archive crosses the handoff (`AltArchiveCarry`). The old engine's capture
+// is split as the GUI splits it (the head inside the freeze, beside the
+// checkpoint; the rows afterwards, behind the fence), and the adopting engine
+// imports it right after restoring the checkpoint.
 
 use aterm_core::terminal::{AltArchiveCarry, AltArchiveGapKind, AltArchiveImport, AltArchiveQuery};
 
@@ -424,13 +408,10 @@ fn an_adopting_engine_with_the_archive_off_drops_the_carry() {
     assert!(new.alt_archive().is_empty());
 }
 
-/// A TAIL carry — what the GUI sends: the rows after its recent turns' marks
-/// — and then, at the SAME size, the app scrolls back past the tail's first
-/// row (someone rereading earlier context) and forward again. The tail
-/// reaches as far back as the differ can point, so the adopted engine
-/// recognizes every re-shown row as the old one does: nothing archived twice,
-/// no gap. (Round-10 review: it archived the scrolled-back rows again, as new
-/// rows, with no gap and `lost=0`.)
+/// A tail carry (what the GUI sends: the rows after its recent turns' marks),
+/// then, at the same size, the app scrolls back past the tail's first row and
+/// forward again. The tail reaches as far back as the differ can point, so the
+/// adopted engine recognizes every re-shown row: nothing archived twice, no gap.
 #[test]
 fn a_tail_carry_recognizes_a_scroll_back_past_its_first_row() {
     let (mut old, cp, _) = old_side(300, false);
@@ -464,9 +445,8 @@ fn a_tail_carry_recognizes_a_scroll_back_past_its_first_row() {
 }
 
 /// The freeze had no time for the differ's state: it is taken after the
-/// freeze, behind the fence, and the adopted engine goes on exactly — no
-/// `restore` gap, so a report across the handoff stays whole. (Round-10
-/// review: without it the report said `archive-gap` with every row there.)
+/// freeze, behind the fence, and the adopted engine goes on exactly, with no
+/// `restore` gap, so a report across the handoff stays whole.
 #[test]
 fn a_differ_state_taken_after_the_freeze_goes_on_exactly() {
     let (mut old, cp, _) = old_side(12, false);

@@ -1,46 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
+use crate::walk::{only, reachable, walk};
 use aterm_spec::derive::{Model, harness_upgrade_notice_owner_model};
 use aterm_spec::{interp, verify};
-
-type S = BTreeMap<&'static str, i64>;
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
-
-fn run(m: &Model, actions: &[&str]) -> S {
-    let mut s = m.init_state();
-    for action in actions {
-        assert!(m.fire(action, &mut s), "{action} at {s:?}");
-    }
-    s
-}
-
-/// Every state `m` reaches, invariants unchecked.
-fn reachable(m: &Model) -> Vec<S> {
-    let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([m.init_state()]);
-    let mut out = Vec::new();
-    while let Some(s) = queue.pop_front() {
-        if !seen.insert(s.clone()) {
-            continue;
-        }
-        for a in &m.actions {
-            let mut next = s.clone();
-            if m.fire(a.name, &mut next) {
-                queue.push_back(next);
-            }
-        }
-        out.push(s);
-    }
-    out
-}
 
 /// The defects the notice's owner was fixed for, one knob each, and the
 /// invariant that catches each alone.
@@ -155,7 +118,7 @@ fn each_notice_owner_defect_is_caught_on_its_own() {
 fn a_notice_whose_process_is_gone_is_asked_afresh_in_a_new_round() {
     let model = harness_upgrade_notice_owner_model();
     for holder in ["Resume", "OtherTab", "Recycled"] {
-        let s = run(&model, &["Announce", "Ready", "OwnerExits", holder]);
+        let s = walk(&model, &["Announce", "Ready", "OwnerExits", holder]);
         assert!(model.action_enabled("Reask", &s), "{holder}: {s:?}");
         assert!(!model.action_enabled("Terminate", &s), "{holder}: {s:?}");
         assert!(!model.action_enabled("Look", &s), "{holder}: no wait");
@@ -183,7 +146,7 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_in_a_new_round() {
     // While the notified process lives it is waited for, in either tab: a
     // wait the visit says, and no strand.
     for holder in ["Resume", "OtherTab"] {
-        let s = run(&model, &["Announce", "Ready", holder]);
+        let s = walk(&model, &["Announce", "Ready", holder]);
         assert!(!model.action_enabled("Reask", &s), "{holder}");
         assert!(!model.action_enabled("Terminate", &s), "{holder}");
         let mut looked = s.clone();
@@ -192,7 +155,7 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_in_a_new_round() {
     }
     // Two live holders, or a partial scan: no re-ask either.
     for proof in ["DuplicateOwner", "IncompleteScan"] {
-        let s = run(
+        let s = walk(
             &model,
             &["Announce", "Ready", "OwnerExits", "OtherTab", proof],
         );
@@ -201,13 +164,13 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_in_a_new_round() {
     }
     // Main before the fix: the visit waits for good.
     let stuck = interp::with_consts(&model, &[("NoReask", 1)]);
-    let mut s = run(&stuck, &["Announce", "Ready", "OwnerExits", "Resume"]);
+    let mut s = walk(&stuck, &["Announce", "Ready", "OwnerExits", "Resume"]);
     assert!(!stuck.action_enabled("Reask", &s));
     assert!(stuck.fire("Look", &mut s));
     assert!(!stuck.check_invariant("NeverWaitsOnAGoneNotice", &s));
     // The wrong fix: the new process signalled on the gone one's READY.
     let kept = interp::with_consts(&model, &[("KeepRound", 1)]);
-    let mut s = run(
+    let mut s = walk(
         &kept,
         &[
             "Announce",

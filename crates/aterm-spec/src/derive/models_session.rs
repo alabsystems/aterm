@@ -645,11 +645,10 @@ pub fn fd_handoff_no_leak_model() -> Model {
 /// PROOF-CARRYING DSU — the SINGLE-USE HANDOFF NONCE obligation, Rung 1b (live wiring)
 /// of `docs/RFC-proof-carrying-dsu.md`.
 ///
-/// The seamless update-apply authenticates the inherited PTY-master fd map with a
-/// single-use nonce STAMP minted into the per-user `0700` dir: the outgoing side writes
-/// it (`mint_seamless_stamp`), the incoming boot PRESENTS the nonce it was handed and
-/// CONSUMES the stamp (`consume_seamless_stamp`: read-then-UNLINK, constant-time compare)
-/// BEFORE it trusts any fd. Single-use is the whole gate: a spoofed or REPLAYED
+/// The seamless update-apply authenticated the inherited PTY-master fd map with a
+/// single-use nonce STAMP minted into the per-user `0700` dir, consumed
+/// (read-then-UNLINK) by the incoming boot BEFORE it trusted any fd; that stamp has
+/// since been removed. Single-use is the whole gate: a spoofed or REPLAYED
 /// `ATERM_SEAMLESS_FDS` presented after one adoption must find no stamp and fail closed —
 /// otherwise a same-uid adversary could re-present a stale fd map and be authorized twice.
 ///
@@ -661,10 +660,11 @@ pub fn fd_handoff_no_leak_model() -> Model {
 /// invariant `NoReplay` (`accepted <= minted /\ replayed = 0`) — a presented nonce
 /// authorizes at most as many times as one was minted (i.e. once), and no replay ever
 /// authorizes — proving it at Buggy=0 and CATCHING the replayable-stamp bug at Buggy=1.
-/// The concrete binding is the real read-then-unlink consume
-/// (`control_auth::consume_seamless_stamp`), pinned by the `aterm-gui`
-/// `seamless_stamp_is_single_use_and_fails_closed` conformance test (correct nonce → once;
-/// replay → none; wrong nonce → fail closed — the negative control).
+/// The stamp's Tier-1 conformance test went with it, so this model has no Tier-1 bind
+/// now. What carries the single-use property today: the attempt nonce travels as
+/// `ATERM_SEAMLESS_NONCE`, and `handoff_rendezvous::claim_incoming` CONSUMES the
+/// rendezvous names out of the environment whether or not it succeeds and refuses a
+/// grant naming any other attempt.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -889,8 +889,8 @@ pub fn read_image_seq_model() -> Model {
 
 /// The aterm session PTY-master FD-LIFECYCLE discipline as a DERIVED model
 /// (initiative A7, WS-G/concurrency) — the drift-free, code-bound twin that
-/// SUPERSEDES the hand-written `FdLifecycle.tla` (now quarantined to `specs/legacy/`,
-/// exactly as the kernel-family specs were when their derived twins took over). It
+/// SUPERSEDES the hand-written `FdLifecycle.tla` (deleted on 2026-10-01 with the
+/// rest of `specs/legacy/`, as the kernel-family specs were). It
 /// is the SINGLE source of truth for the `SinkWriter` ownership state machine in
 /// `aterm-session/src/sink.rs`:
 ///
@@ -1826,8 +1826,12 @@ pub fn dispatch_complete_model() -> Model {
 /// CLONE of a local socket gets EOF and the worker thread joins (no thread/fd
 /// leak). `child_read_open`/`client_read_open` model the two read halves a pump
 /// blocks on; `done` gates the post-teardown check. `Teardown` shuts the halves:
-/// the correct discipline (`shutdown(Both)`) closes the read halves; `Buggy = 1`
-/// models the original `shutdown(Write)`-only, which leaves the read halves open.
+/// the correct discipline (a hang-up of each socket, `aterm_uds::hangup::hang_up`:
+/// its write half, then its read half, each on its own) closes the read halves;
+/// `Buggy = 1` models the original `shutdown(Write)`-only, which leaves the read
+/// halves open. The worker's exit does not rest on that wake alone: it also
+/// polls before each read and stops on a flag set before every hang-up of the
+/// child, so a lost wake costs one poll, not a parked thread.
 ///
 /// Invariant `ReadersUnblockAfterTeardown`: after teardown, both read halves are
 /// closed (so both pumps unblock). `ty` proves it at `Buggy = 0` and returns the
@@ -1845,7 +1849,7 @@ pub fn dispatch_complete_model() -> Model {
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn relay_teardown_model() -> Model {
-    // shutdown(Both) closes BOTH read halves (Buggy shutdown(Write) leaves them
+    // A hang-up closes BOTH read halves (Buggy shutdown(Write) leaves them
     // open → the parked-reader leak). The flags init OPEN (1); Teardown gates on
     // `done`. Invariant: not-yet-torn-down OR both read halves closed.
     props::teardown_clears(props::Teardown {
@@ -2175,20 +2179,29 @@ pub fn session_id_claim_model() -> Model {
 }
 
 /// WHO ANSWERS AN ADOPTED `@<sid>` WHILE A SEAMLESS UPDATE DECIDES (aterm-gui
-/// `control::ambiguous_sid_refusal` over `identity_claim::live_holder`; the
-/// 2026-09-28 update 0.95 → 0.97).
+/// `control::publish_when_committed`, and `control::ambiguous_sid_refusal` over
+/// `identity_claim::live_holder`; the 2026-09-28 update 0.95 → 0.97).
 ///
-/// The dispatch refuses an id this process hosts when `graph/<sid>` names ANOTHER
-/// live process: two holders of one address, so a keystroke could land in a
-/// stranger's window. A successor on a per-process socket publishes the carried
-/// ids as soon as it has booted — before the predecessor's Commit (measured on
-/// every update since the in-GUI supervisor host shipped: 191–272 ms early) —
-/// while the predecessor still owns the sessions, decides the Commit and rolls
-/// back on a rejection. Read as a second holder, the entry refused the
-/// predecessor's own supervisor (`ERR ambiguous session id … also served by pid
-/// <successor>`: a supervisor restart, and on rejected attempts a restart budget
-/// spent). The fix exempts the ONE pid this process's handoff lane registered —
-/// the kernel's answer for its own candidate — for as long as the attempt decides.
+/// `graph/<sid>` is the address every `@<sid>` client resolves. The dispatch
+/// refuses an id this process hosts when that entry names ANOTHER live process:
+/// two holders of one address, so a keystroke could land in a stranger's window.
+/// A successor on a per-process socket used to publish the carried ids as soon as
+/// it had booted — before the predecessor's Commit (measured on every update since
+/// the in-GUI supervisor host shipped: 191–272 ms early) — while the predecessor
+/// still owned the sessions, decided the Commit and rolled back on a rejection.
+/// Read as a second holder, the entry refused the predecessor's own supervisor
+/// (`ERR ambiguous session id … also served by pid <successor>`: a supervisor
+/// restart, and on rejected attempts a restart budget spent). Two layers close it,
+/// and the model carries both:
+///
+/// * THE ORDER (round seven of the update audit): a successor publishes the
+///   carried entries only once the Commit has released its gate. While this
+///   process owns a session, its address names no other process it could be
+///   handed to — `CandidateNamedOnlyAfterCommit`.
+/// * THE EXEMPTION (2026-09-28): should an entry name this process's own
+///   candidate early anyway, it is the transfer this process is deciding, not a
+///   second holder — the ONE pid this process's handoff lane registered, for as
+///   long as the attempt decides — `RefusesExactlyAStranger`.
 ///
 /// `cand`: this process's candidate, 0 none yet, 1 alive, 2 proven dead (a
 /// rejection reaps before the lane lets go of it); `registered`: the lane's
@@ -2200,26 +2213,33 @@ pub fn session_id_claim_model() -> Model {
 /// Commit's `_exit`); `asked`: the last request this process answered, 0 none, else
 /// 1 + the entry it met; `refused`: whether it was refused.
 ///
-/// Two dials, one per half of the one invariant `RefusesExactlyAStranger`:
+/// Three dials:
 ///
-/// * `Buggy = 1` — the rule before 2026-09-28: refuse ANY live foreign entry,
-///   the candidate's included. Caught at `SuccessorPublishes` → `Request`: the
-///   predecessor refuses its own session while it still owns it.
+/// * `Buggy = 1` — the code before 2026-09-28: the successor publishes at boot
+///   AND the dispatch refuses ANY live foreign entry, the candidate's included.
+///   Caught twice: `Launch` → `SuccessorPublishes` names the candidate while this
+///   process owns the session, and a `Request` there refuses its own session.
+/// * `Early = 1` — the successor publishes at boot, the exemption in place (0.98
+///   through round six). `CandidateNamedOnlyAfterCommit` is caught; the exemption
+///   alone still keeps `RefusesExactlyAStranger` — checked with the order's
+///   invariant set aside, so the second layer is proved on its own.
 /// * `Blanket = 1` — an exemption keyed on "an attempt is deciding" rather than on
 ///   WHICH pid: a stranger publishing the same id during an update is then
 ///   served. Caught at `StrangerPublishes` → `Request`.
 ///
-/// A request after a `Reject` meets a dead candidate's entry, which no rule
+/// A request after a `Reject` meets a dead candidate's entry (only under `Early`:
+/// in the committed order a rejected candidate never published), which no rule
 /// refuses (a dead pid is no holder); one after the Commit never reaches this
-/// process. In the FORK lane the registration follows `spawn` by microseconds, and a
-/// child that published inside them would meet the pre-fix refusal — never a
-/// misdelivery; the model takes the launched lane's order, where the registration
-/// comes at the dial, before the grant gives the successor any id to publish.
+/// process. In the FORK lane the registration follows `spawn` by microseconds; the
+/// model takes the launched lane's order, where the registration comes at the dial,
+/// before the grant gives the successor any id to publish.
 ///
 /// Tier-1: aterm-gui's
-/// `control::tests::an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit`
-/// drives the real `ambiguous_sid_refusal` and `resolve_explicit` through every
-/// entry and registration state, and `identity_claim::tests::
+/// `control::publish_when_committed_tests::a_candidates_entries_name_it_only_after_the_commit`
+/// drives the real gated publication (`SuccessorPublishes` at the Commit, never
+/// before), `control::tests::an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit`
+/// the real `ambiguous_sid_refusal` and `resolve_explicit` through every entry and
+/// registration state, and `identity_claim::tests::
 /// a_handoff_candidate_registration_is_exactly_its_own` the registration's life.
 #[must_use]
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
@@ -2228,7 +2248,8 @@ pub fn session_id_claim_model() -> Model {
 pub fn handoff_address_owner_model() -> Model {
     crate::ty_model! {
         HandoffAddressOwner {
-            const Buggy = 0;      // 1 = refuse every live foreign entry, the candidate's too
+            const Buggy = 0;      // 1 = publish at boot AND refuse every live foreign entry
+            const Early = 0;      // 1 = the successor publishes at boot (the exemption kept)
             const Blanket = 0;    // 1 = exempt every entry while an attempt decides
             var cand = 0;         // 0 none, 1 alive, 2 proven dead
             var registered = 0;   // the lane's registration names the candidate
@@ -2244,9 +2265,10 @@ pub fn handoff_address_owner_model() -> Model {
                 registered = 1;
             }
 
-            // The candidate, booted with the carried ids, publishes their entries
-            // before the Commit (a per-process socket does not wait for it).
-            action SuccessorPublishes when (cand == 1 && entry == 0) {
+            // The candidate publishes the carried ids' entries once the Commit has
+            // released its gate (`Early`/`Buggy`: as soon as it has booted).
+            action SuccessorPublishes when (cand == 1 && entry == 0
+                                            && (pred == 0 || Early == 1 || Buggy == 1)) {
                 entry = 1;
             }
 
@@ -2277,7 +2299,11 @@ pub fn handoff_address_owner_model() -> Model {
                 registered = 0;
             }
 
-            // THE PROPERTY: refuse exactly the entries a stranger holds — never the
+            // THE ORDER: while this process owns the session, its address names no
+            // candidate of this process's — one server per address at every instant.
+            invariant CandidateNamedOnlyAfterCommit: pred == 0 || entry == 0 || entry == 2;
+
+            // THE EXEMPTION: refuse exactly the entries a stranger holds — never the
             // transfer this process is deciding, always a real duplicate.
             invariant RefusesExactlyAStranger: if asked == 3 { refused == 1 } else { refused == 0 };
         }

@@ -12,8 +12,8 @@
 //! * **anchor empty → [`AppleTier::Inactive`]**. The bundle is signed ad-hoc
 //!   (`--sign -`), the DMG is not signed, nothing is notarized, and the
 //!   manifest's `team_id` is empty. This is what a FORK ships, and what aterm shipped
-//!   before `APPLE_TEAM_ID` was armed on 2026-08-15 — WRONG BEFORE: "what aterm ships
-//!   today" — and the active path does not move one byte of it.
+//!   before `APPLE_TEAM_ID` was armed on 2026-08-15 — and the active path does not
+//!   move one byte of it.
 //! * **anchor set → [`AppleTier::Active`]**. Developer-ID sign, notarize,
 //!   staple and VERIFY — or fail the cut. There is deliberately no third state
 //!   in which the pipeline signs with a Developer-ID identity and then declines
@@ -217,29 +217,18 @@ impl std::fmt::Debug for ReleaseCredentials {
 }
 
 impl ReleaseCredentials {
-    /// Load and validate the profile at `path`.
-    ///
-    /// Enforces the ownership rule `release.conf` had — owner-only, no group/other
-    /// write — because the file still holds a private key, and derives the public
-    /// identity IN-PROCESS. The old path shelled out to `atpkg-keys pubkey`, which
-    /// meant a release could not be cut without a second binary built and on disk.
     /// Resolve signing material the ONE-PATH way: an explicit `--release-credentials`
     /// profile when given, else THIS MACHINE's provisioned identity
     /// (`~/.aterm/machine.key` + `machine.toml`, written by `atpkg-keys setup`/`join`),
     /// else `None` — the ordinary unsigned/ad-hoc cut.
     ///
-    /// # Why ambient machine state is now correct where `release.conf` was not
+    /// # Why ambient machine state is correct here
     ///
-    /// The doc above retired `~/.aterm/release.conf` because an ambient file silently
-    /// decided WHAT KEY signed, and "what signed this?" was answerable only by shell
-    /// archaeology. Both premises have flipped. The machine key is not "some key a
-    /// file happens to name" — it is this machine's identity, minted once by
-    /// `atpkg-keys setup`/`join`, useless unless the master-signed roster names it,
-    /// and the atpkg producer tools already read it from exactly this location. And
-    /// "what signed this?" is now answered by the ATTRIBUTION inside the signed
-    /// manifest (`machine_id`, bound by every client), which is a strictly better
-    /// answer than the path on a command line. Requiring the owner to base64 the same
-    /// key into a second file per product was the last two-channel seam in the design.
+    /// The machine key is not "some key a file happens to name" — it is this machine's
+    /// identity, minted once by `atpkg-keys setup`/`join`, useless unless the
+    /// master-signed roster names it, and the atpkg producer tools read it from exactly
+    /// this location. "What signed this?" is answered by the ATTRIBUTION inside the
+    /// signed manifest (`machine_id`, bound by every client), not by a command line.
     ///
     /// The flag still wins when present (Apple stanza, or a deliberately different
     /// key), and a HALF-provisioned machine — key without identity, or unreadable
@@ -306,6 +295,8 @@ impl ReleaseCredentials {
         }))
     }
 
+    /// Load and validate the profile at `path`: owner-only, no group/other write
+    /// (it holds a private key), and the public identity derived IN-PROCESS.
     pub fn load(path: &Path) -> Result<Self, String> {
         let meta =
             std::fs::metadata(path).map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -678,7 +669,7 @@ fn describe_candidates(candidates: &[DevIdIdentity]) -> String {
 fn parse_find_identity_line(line: &str) -> Option<DevIdIdentity> {
     let (_, rest) = line.trim().split_once(") ")?;
     let (sha1, rest) = rest.split_once(' ')?;
-    if sha1.len() != 40 || !sha1.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !aterm_codec::hex::is_hex(sha1, 40) {
         return None;
     }
     let common_name = rest.trim().strip_prefix('"')?.strip_suffix('"')?;
@@ -698,7 +689,7 @@ fn parse_find_identity_line(line: &str) -> Option<DevIdIdentity> {
 pub enum AppleTier {
     /// `pins::APPLE_TEAM_ID` is empty. Ad-hoc signing, no notarization, no
     /// claim — what a FORK ships, and what aterm shipped before the anchor was armed on
-    /// 2026-08-15. (WRONG BEFORE: "what aterm ships today".)
+    /// 2026-08-15.
     Inactive,
     /// The anchor is set AND everything needed to keep its promise resolved.
     /// Constructing this value is the proof: there is no way to reach the active
@@ -1527,16 +1518,13 @@ pub fn notarize_app(app: &Path, tier: &AppleTier, tools: &dyn AppleTools) -> Res
 ///   `Ok(true)`. Every step propagates its error, so a failure anywhere aborts
 ///   the cut.
 ///
-/// The state this function used to have — sign with Developer-ID, print that it
-/// was NOT notarized, and return `Ok(false)` so the release continued — is gone
-/// deliberately. The manifest emits `team_id` from the anchor unconditionally,
-/// and `tools/install.sh` plus the in-app updater both read a non-empty
-/// `team_id` as a promise that the artifact is Developer-ID signed AND
-/// notarized. Shipping a signed-but-unnotarized artifact under that manifest is
-/// a lie the pipeline tells its own clients, and the clients reject it — after
-/// the release is already published. A release must not be able to claim what it
-/// did not do, so the only way past this function on the active path is to have
-/// actually done it.
+/// There is no signed-but-unnotarized `Ok(false)` on the active path. The manifest emits `team_id`
+/// from the anchor unconditionally, and `tools/install.sh` plus the in-app updater both read a
+/// non-empty `team_id` as a promise that the artifact is Developer-ID signed AND notarized.
+/// Shipping a signed-but-unnotarized artifact under that manifest is a lie the pipeline tells its
+/// own clients, and the clients reject it — after the release is already published. A release must
+/// not be able to claim what it did not do, so the only way past this function on the active path
+/// is to have actually done it.
 ///
 /// `tools` is injected for the reason [`notarize_app`] gives.
 pub fn sign_and_notarize_dmg(

@@ -6,7 +6,7 @@
 //! Hot tier is in [`hot_tier`](super::hot_tier).
 //! Cold tier is in [`cold_tier`](super::cold_tier).
 
-use super::line::{Line, serialize_lines};
+use super::line::{Line, serialize_lines, serialize_pages};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -91,8 +91,12 @@ impl WarmBlock {
     /// Create a warm block from lines.
     #[must_use]
     pub(crate) fn from_lines(lines: &[Line]) -> Self {
-        let line_count = lines.len();
-        let serialized = serialize_lines(lines);
+        Self::from_page(lines.len(), &serialize_lines(lines))
+    }
+
+    /// Create a warm block from a serialized page of `line_count` lines.
+    #[must_use]
+    fn from_page(line_count: usize, serialized: &[u8]) -> Self {
         // `compress_prepend_size` fails only when the input exceeds
         // u32::MAX bytes. A warm block holds at most `block_size` hot lines,
         // whose serialization is always well under 4 GiB, so the `Err` arm
@@ -103,7 +107,7 @@ impl WarmBlock {
         // invariant" discharge as the `saturating_*` fixes in this crate).
         // (Unreachable `Err` ⇒ empty buffer; clippy's `manual_unwrap_or_default`
         // requires the combinator form of the same discharge.)
-        let compressed = crate::lz4::compress_prepend_size(&serialized).unwrap_or_default();
+        let compressed = crate::lz4::compress_prepend_size(serialized).unwrap_or_default();
 
         Self {
             compressed,
@@ -234,13 +238,26 @@ impl WarmTier {
         self.blocks.len()
     }
 
-    /// Push a block of lines (compresses them).
+    /// Push a batch of lines (compresses them).
+    ///
+    /// Bounded by BYTES as well as lines: the batch becomes as many
+    /// consecutive blocks as keep each block's serialized page within
+    /// [`MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES`](crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES),
+    /// the most a reader decodes. A batch of rows whose every cell carries its
+    /// own 8 KiB link passes it, and a block its reader refused would be
+    /// unreadable until eviction quarantined it. Every line an honest grid
+    /// makes fits a page alone (`line_codec_block` asserts it), and the
+    /// cumulative index takes blocks of any size.
     pub(crate) fn push_block(&mut self, lines: &[Line]) {
-        if lines.is_empty() {
-            return;
+        let pages = serialize_pages(lines, crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES);
+        for (line_count, page) in pages {
+            self.push_compressed(WarmBlock::from_page(line_count, &page));
         }
+    }
+
+    /// Append one compressed block at the newest end.
+    fn push_compressed(&mut self, block: WarmBlock) {
         let old_index_bytes = self.index_bytes();
-        let block = WarmBlock::from_lines(lines);
         let block_bytes = block.compressed_size();
         self.line_count = self.line_count.saturating_add(block.line_count());
         let cumulative = self

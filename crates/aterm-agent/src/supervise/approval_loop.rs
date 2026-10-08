@@ -58,7 +58,11 @@
 //! press", not an approval pressed again each second (harness round-1
 //! review, 2026-09-24), and a box the vendor redraws before it takes it
 //! down is not pressed twice (measured live 2026-09-25, 2.1.283: every
-//! approved rm box of the proof run was).
+//! approved rm box of the proof run was). What a box's rows ARE — its span,
+//! less the countdown, the focus marker and the blank rows — is read in one
+//! place, [`box_rows`], which the loop's review key of a box reads too
+//! (`run.rs`'s `box_key`): the press and the escalation agree on what "the
+//! same box" is.
 //!
 //! Two things hold a box before it is judged or pressed. The vendor's key
 //! guard: a box is judged only on a read made once it has shown
@@ -68,11 +72,33 @@
 //! has made stale. And a person: an answer the policy has is held for
 //! `human_grace_s` after their last keystroke ([`Session::held_for_person`]).
 //!
-//! **A question dialog** ([`RULE_ANSWER_RECOMMENDED`], `policy/question.rs`:
-//! Enter on its recommended option, under `[harness] answer_questions`) is
-//! keyed only when the things the pure decision cannot know hold, each read
-//! fresh (the critique of 2026-09-25) — else the loop waits and decides
-//! again on a fresh read, and never escalates for the wait
+//! **The usage-limit dialog's grant row** (`limit-reset@v1`, under `[harness]
+//! limit_reset`, which ships `false`; `reset_loop.rs`,
+//! `docs/SPEC-claude-accounts-resets-2026-10-02.md`). The policy decides the
+//! row in front of the wait row; before its first key the loop's own gates
+//! and then its HOST are asked ([`Session::reset_take`]), and anything but
+//! the host's go answers the dialog with the decision the same read gets
+//! WITHOUT that rule ([`Session::reset_fallback`], through
+//! [`Session::auto_act`] again) — the wait row, by the requests a build with
+//! the key off sends. The row's press is the confirmed focus move every
+//! focus-answered box gets, its every key fenced on the judged read's person
+//! count as well (the host is asked between that read and the first key);
+//! once its Enter is written, what it opens is the
+//! loop's own step, owed and run from there ([`Session::reset_run`]), never
+//! another rule's box. A press that does not land is tried again on the
+//! press back-off and never badged ([`Session::reset_press_missed`]); one
+//! that cannot be made at all is passed over, never handed to a person. Its
+//! approval is named by the row's label, so the safe rules' repeat cap never
+//! counts it against the wait row of the same dialog.
+//!
+//! **A question dialog** (`policy/question.rs`: under `[harness]
+//! answer_questions`, Enter on its recommended option —
+//! `answer-recommended@v1` — or, under the priority words `long-term` /
+//! `short-term`, that word's policy text written into its free-text row and
+//! Enter on it — `answer-long-term@v1`, `answer-short-term@v1`: THE POLICY
+//! TEXT, below) is keyed only when the things the pure decision cannot know
+//! hold, each read fresh (the critique of 2026-09-25) — else the loop waits
+//! and decides again on a fresh read, and never escalates for the wait
 //! ([`Session::question_hold`]):
 //!
 //! 1. **A person has been quiet** (R1): the read's person stamp (`text
@@ -118,37 +144,120 @@
 //!    model re-asking it, and nobody else is there to answer it — it is
 //!    answered again after a pause that doubles with each further return,
 //!    from [`REFUSAL_PAUSE`] to a minute ([`reask_pause`]), journaled
-//!    `WAITING … re-asking`. No count hands it over.
+//!    `WAITING … re-asking`. No count hands it over. Under a text word the
+//!    pause comes before ANY key of the answer — its moves, its policy text,
+//!    a falling-back tab's toggle — so the dialog waits it out with nothing
+//!    of the loop's in it; under `recommended` before the answering Enter's
+//!    keys, as on main.
 //!
-//! The press itself ([`Session::press_question`]) waits about a second after
-//! a tab first appears before its first key (O4), moves the focus one row at
-//! a time — each move seen landing before the next, never re-sent — and
-//! presses Enter guarded on the focused row as drawn, every key under the
-//! generation fence. A fenced key skipped because the screen moved
+//! **HOW it is answered is resolved per dialog** (`decide_box`): the
+//! session's `questions` word over the global `answer_questions` and
+//! `question_priority` ([`Session::question_policy`], the one resolver the
+//! turn end's answer in prose uses too — for its PRIORITY words only: the
+//! session's `ask` holds its dialogs, never a question it asks in prose,
+//! which no `aterm drive answer` can answer and no hand-back watches). The
+//! word at the loop's FIRST key or text on a dialog is LATCHED
+//! ([`QuestionMemory::mode`]): a dialog whose word reads otherwise later is
+//! handed over (the word changed mid-dialog: decision 13), while before the
+//! first key a new word simply applies. The latch is THIS supervisor's
+//! memory, so it covers the session's own word: a change to the global
+//! `question_priority` (to any `[harness]` key) restarts the window's
+//! supervisor (`harness_host`), whose fresh memory latches nothing — the
+//! new word answers the rest of a dialog the old one only moved on or
+//! partly answered, and one it typed into reads as a person's (its text
+//! remembered by no one: THE POLICY TEXT, below) and is handed over. A text
+//! word on a window that cannot fence a typed answer — `send` without its
+//! generation fence, a read with no person count (`human_seq`: no
+//! `if-human=`), no person stamp — answers the WHOLE dialog with its
+//! recommended option instead, ledgered under the word's own rule with
+//! `(recommended: this window cannot fence a typed answer: …)` in its
+//! subject (decision 12: never parked). Under `recommended` — the default —
+//! every dialog's decision, key and request is main's, byte for byte: its
+//! keys carry main's `if-human=` wherever the read has a count; no `help
+//! send` asked, nothing written into the free-text row. (A question
+//! asked in PROSE is main's in decision, key and text, and reads the
+//! session's word — one bare `meta` more than main — before its act:
+//! `Session::decide_to_act`.)
+//!
+//! **THE POLICY TEXT** — the one place a supervisor key lands in a
+//! question's free-text row — rests on what the loop adds to the decider:
+//!
+//! * **Memory.** The loop remembers, per question, the priority whose text a
+//!   `send` of its own may have written there ([`QuestionMemory::typed`]:
+//!   recorded on `OK`, on a partial or failed write and on no answer; never
+//!   on a skip or `ERR busy …`, which wrote nothing). Text that reads as the
+//!   policy's with no such memory — a person's, or the loop's own after a
+//!   restart — is a person's, and handed over: a lost memory is a stall,
+//!   never an answer (the model's `OwnTextRemembered`).
+//! * **The exact read-back.** After the one `send` the field must read the
+//!   text back byte for byte on the reader's one-space join (ticked, on a
+//!   multi-select) before the press returns [`Press::Typed`]; the Enter is a
+//!   later decision, on a read that shows the field holding it, and goes only
+//!   while the field's text and tick are still what that read showed. A
+//!   read-back the screen held still for before it (its settle latched) IS
+//!   that read ([`Step::Decide`]: the Enter costs the decision's `status`
+//!   and `meta` and the key, fenced on the read-back's generation); one it
+//!   did not gets a fresh look.
+//! * **The person fence at the write.** The `send`, and every key, names the
+//!   person count of the read it was decided on (`if-human=`, main's R3b
+//!   fence); not atomic with the person's own write.
+//! * **Never written twice.** A text whose box never showed it is handed
+//!   over, not re-sent — attended or not: main's P3 tries a KEY the dialog
+//!   did not take again after the press back-off, but a text sent again
+//!   behind one still unread would land in a field no longer empty, and no
+//!   other key may follow it on that tab (the model's `HarnessType` has no
+//!   retry, `TextNeverWrittenTwice`) — and so is a field the loop remembers
+//!   writing that reads empty again.
+//! * **Never an Enter in a multi-select's field** (c3c on 2.1.283: it
+//!   unticks the row and the dialog answers "did not answer"): the focus is
+//!   moved off it onto `Next`/`Submit` first, and the Enter goes there.
+//!
+//! A person's input after the loop's text (R1) makes the dialog's end theirs:
+//! the loop may still press Enter on its own text once they are quiet, the
+//! field intact, but the dialog is not told as the policy's choice — whether
+//! the read the loop decides on shows them or the `status` made for that
+//! decision does (`QuestionMemory::person_gave_input`).
+//!
+//! The press itself ([`Session::press_question`], and for the policy text
+//! [`Session::press_question_text`]) waits about a second after a tab first
+//! appears before its first key or text (O4), moves the focus one row at a
+//! time — each move seen landing before the next, never re-sent — and
+//! presses Enter guarded on the focused row as drawn, every key and the
+//! text's one `send` under the generation fence. A fenced key skipped because the screen moved
 //! (`reason=changed`) settles and decides again, never presses again at
 //! once. Every question decision, answered or escalated, journals the
 //! dialog's rows (`DIALOG seq=<n> rule=<id> <rows>`, O3).
 //!
 //! The derived model `SupervisorQuestionAnswer` (aterm-spec
-//! `supervisor_question_answer_model`) states 1 and 2 as guards over keys
+//! `supervisor_question_answer_model`; the policy text's twin is
+//! `SupervisorQuestionText`) states 1 and 2 as guards over keys
 //! split into their write and Claude Code's read of them, and proves that
 //! every key meets the dialog as the read it was decided on showed it —
 //! never the free-text field, a next tab, the review's cancel or the
 //! composer — naming the one round trip between a stamp's read and the
 //! write, and the retry's premise (a key is read by Claude Code before the
-//! screen holds still 2 s after it), as the assumptions it rests on.
+//! screen holds still 2 s after it), as the assumptions it rests on. At
+//! `Text = 1` it adds the policy text, each tab on its own route — on a
+//! tab the text goes to, an Enter only over the field holding exactly the
+//! loop's own text and the text only into its tab's empty focused field,
+//! once; on a tab that falls back, the recommended path's keys — and the
+//! memory as a third assumption.
 //! `tier1_a_question_key_goes_only_where_the_model_allows`
-//! (`run_engine_tests.rs`) binds this loop to it.
+//! (`run_engine_tests.rs`) binds this loop to it, and
+//! `tier1_the_policy_text_goes_only_where_the_model_allows` and
+//! `tier1_a_tab_that_falls_back_goes_only_where_the_model_allows`
+//! (`run_question_text_tests.rs`) bind its text path at `Text = 1`, with a
+//! blind loop (memory seeded over a person's text) as the negative control.
 
 use super::super::policy::WorkerEnv;
 use super::super::policy::approval::{
-    Answer, AnswerTarget, ApprovalCtx, Choice, Decision, DeclineStep, RULE_LIMIT_WAIT,
-    RULE_READ_ONLY, decide,
+    AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_LIMIT_RESET,
+    RULE_LIMIT_WAIT, RULE_READ_ONLY, decide,
 };
 use super::super::policy::approval::{
-    NudgeCtx, RULE_GOAL_RESUME, RULE_RATE_NUDGE_KEEP, RULE_RATE_NUDGE_SWITCH,
+    NudgeCtx, RULE_GOAL_RESUME, RULE_RATE_NUDGE_KEEP, RULE_RATE_NUDGE_SWITCH, RULE_RM_BREAKER_WARN,
 };
-use super::super::policy::question::{RULE_ANSWER_RECOMMENDED, begun};
+use super::super::policy::question::{begun, fall_back_to, is_question_rule};
 use super::super::policy::turn_end::WindDown;
 use super::*;
 use crate::harness::upgrade_drive::{LiveTab, roster_rows, unique_tab_for_group};
@@ -156,12 +265,11 @@ use aterm_phase::{QuestionDialog, QuestionFocus, QuestionForm};
 use aterm_types::domain::ENV_PARENT_SESSION_ID;
 
 /// One answer since the last review point: the parser's command (the safe
-/// rules' cap, [`MAX_APPROVALS_OF_ONE_COMMAND`]); for a key that ANSWERS a
-/// question — a single-select or preview option, the multi-select button,
-/// the review's submit; not a multi-select toggle — the question it answered
-/// ([`question_key`], the re-ask back-off [`REASKED_AFTER`]); and for a
-/// decline, the box it declined (`press.rs`'s `decline_box`: a box too tall
-/// to read has no command), counted apart from approvals.
+/// rules' cap, [`MAX_APPROVALS_OF_ONE_COMMAND`]); for a key that answers a
+/// question (a single-select or preview option, the multi-select button, the
+/// review's submit; not a toggle) the question it answered ([`question_key`],
+/// for [`REASKED_AFTER`]); and for a decline, the box it declined
+/// (`press.rs`'s `decline_box`), counted apart from approvals.
 #[derive(Debug, Clone)]
 pub(super) struct Approved {
     command: String,
@@ -177,9 +285,9 @@ enum Act {
     Decline { refusal: usize, text: String },
 }
 
-/// How often the same question is answered — or the same box declined —
-/// since the last review point before its next return is the worker asking
-/// again (O5): answered again, after [`reask_pause`].
+/// How often the same question is answered, or the same box declined, since
+/// the last review point before its next return is the worker asking again
+/// (O5): answered again, after [`reask_pause`].
 const REASKED_AFTER: usize = 2;
 
 /// The pause before a re-asked question answered `answered` times is
@@ -192,11 +300,9 @@ pub(super) fn reask_pause(answered: usize) -> Duration {
 
 /// How many waits for the screen to hold still (`await idle 2000`, a
 /// [`WAIT_STEP`] each) a key whose effect no read has shown gets before the
-/// wait is backed off ([`Session::box_back_off`]) — or, in `supervise`'s one
-/// look, the box handed to its manager: the retry's premise is a screen that
-/// HELD STILL after the key (a key read by Claude Code by then), so a screen
-/// that never does — a ticking row the box identity leaves out — is never
-/// keyed again until it does.
+/// wait is backed off ([`Session::box_back_off`]), or, in `supervise`'s one
+/// look, the box handed to its manager. The retry needs a screen that held
+/// still after the key, so one that never does is never keyed again.
 const MAX_UNSETTLED_WAITS: u32 = 3;
 
 /// How long the screen must hold still before a question is keyed on a host
@@ -204,8 +310,8 @@ const MAX_UNSETTLED_WAITS: u32 = 3;
 /// person's quiet, waited once per box.
 const QUESTION_STANDIN_QUIET: Duration = Duration::from_secs(10);
 
-/// What the loop remembers of the question dialog it is answering
-/// (module header, "A question dialog"): cleared when the worker works again
+/// What the loop remembers of the question dialog it is answering (module
+/// docs, "A question dialog"): cleared when the worker works again
 /// ([`Session::look`]).
 #[derive(Debug, Default)]
 pub(super) struct QuestionMemory {
@@ -226,16 +332,73 @@ pub(super) struct QuestionMemory {
     /// The re-asked question ([`question_key`]) and its answer count whose
     /// pause ([`reask_pause`]) was waited: answered on the next decision.
     pub(super) reasked: Option<(String, usize)>,
-    /// The answers the loop's OWN Enters gave this dialog, as the decider
-    /// names them (`<question> → <option>`), in order — the review's submit
-    /// and a multi-select's toggles excepted: told ONCE as `CHOSE` when the
-    /// worker works again ([`Session::tell_answered`]), with a `story chose`
-    /// to the window (the chime and the pulse).
+    /// The answers the loop's own Enters gave this dialog (`<question> →
+    /// <option>`), in order, the review's submit and multi-select toggles
+    /// excepted: told once as `CHOSE` when the worker works again
+    /// ([`Session::tell_answered`]), with a `story chose` to the window.
     pub(super) answered: Vec<String>,
-    /// The dialog was a PERSON'S at some point — their input while it was up,
-    /// a key yielded to them, or the dialog handed over: its end is theirs,
+    /// The dialog was a person's at some point (their input while it was up,
+    /// a key yielded to them, or the dialog handed over): its end is theirs,
     /// never told as the policy's choice.
     pub(super) theirs: bool,
+    /// The dialog as drawn ([`box_identity`]) when the policy last held it
+    /// (`Session::question_held`: the session's word `ask`): a later decision
+    /// that reads it drawn otherwise makes its end [`Self::theirs`]
+    /// (`Session::decide_box`).
+    pub(super) held_as: Option<String>,
+    /// The policy texts the loop wrote, per question ([`question_key`]): the
+    /// priority whose text a `send` of the loop's may have written into that
+    /// question's free-text row, recorded when the server wrote it (`OK`),
+    /// wrote part of it, or gave no answer, and never when it wrote nothing
+    /// (`skipped`, `ERR busy …`, `ERR halted`). A text that reads as the
+    /// policy's with no entry here is a person's (`OwnTextRemembered`).
+    pub(super) typed: std::collections::BTreeMap<String, QuestionPriority>,
+    /// The latch: the answering word ([`Self::deciding`]) at the loop's first
+    /// key or text on this dialog. A dialog whose effective word differs
+    /// later is handed over; before the first key a new word simply applies.
+    /// This loop's memory only: a restarted supervisor begins with none.
+    pub(super) mode: Option<QuestionPriority>,
+    /// The answering word of the decision in hand (`decide_box`): what the
+    /// press latches ([`Self::mode`]) at its first write.
+    pub(super) deciding: Option<QuestionPriority>,
+    /// An answer the loop's own Enter gave was the worker's, decided by the
+    /// policy text in its field: `CHOSE` names the latched word, not
+    /// `recommended` ([`Session::tell_answered`]).
+    pub(super) by_text: bool,
+    /// The fallback latch, per question ([`question_key`]): questions whose
+    /// tab the loop decided on its recommended option under a text word
+    /// because the text would not fit the pane
+    /// ([`super::super::policy::question::falls_back`]). Such a tab stays on
+    /// that path until answered: its own toggle is never read back as a
+    /// person's check, and its answer is never handed over half done.
+    pub(super) fell_back: std::collections::BTreeSet<String>,
+}
+
+impl QuestionMemory {
+    /// A person gave the session input while this dialog is up (R1): once a
+    /// key, a text or an answering Enter of the loop's has reached it, the
+    /// dialog's end is [`Self::theirs`]. Input before any write of the loop's
+    /// changes nothing. Both places a person holds a question answer call
+    /// this: the read the loop decides on ([`Session::question_hold`]) and the
+    /// `status` read made for that decision ([`Session::held_for_person`], in
+    /// [`Session::auto_read`]).
+    pub(super) fn person_gave_input(&mut self) {
+        if self.pending.is_some() || !self.answered.is_empty() || !self.typed.is_empty() {
+            self.theirs = true;
+        }
+    }
+}
+
+/// What a question write was ([`QuestionPending::kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingKind {
+    /// A focus move (`up`, `down`).
+    Move,
+    /// An Enter: an answer, or a multi-select toggle.
+    Enter,
+    /// The policy text (`send`): never written twice — its pending write
+    /// is handed over, never retried ([`Session::decide_box`]).
+    Text,
 }
 
 /// What the loop remembers of the decline it is carrying out
@@ -243,7 +406,7 @@ pub(super) struct QuestionMemory {
 /// ([`Session::look`]).
 #[derive(Debug, Default)]
 pub(super) struct DeclineMemory {
-    /// The decline's last keystroke WRITTEN whose effect no read has shown
+    /// The decline's last keystroke written whose effect no read has shown
     /// yet: never written a second time.
     pub(super) pending: Option<DeclinePending>,
     /// The re-raised box (`press.rs`'s `decline_box`) and its decline count
@@ -272,24 +435,114 @@ pub(super) struct QuestionPending {
     pub(super) identity: String,
     /// The focus the key was written on.
     pub(super) focus: QuestionFocus,
-    /// The key was an Enter (an answer, or a multi-select toggle), not a
-    /// focus move.
-    pub(super) enter: bool,
-    /// A read showed the box unchanged, and the screen then HELD STILL
+    /// What was written.
+    pub(super) kind: PendingKind,
+    /// A read showed the box unchanged, and the screen then held still
     /// (`await idle 2000` latched) before the loop read again: the retry's
     /// premise.
     pub(super) waited: bool,
     /// Waits for the screen to hold still that ran out instead
     /// ([`MAX_UNSETTLED_WAITS`]).
     pub(super) unsettled: u32,
-    /// How many times the key was WRITTEN again on this box and focus
-    /// ([`Session::question_pending`] counts it when the key goes, never
-    /// before).
+    /// How many times the key was written again on this box and focus
+    /// ([`Session::question_pending`] counts it when the key goes).
     pub(super) retries: u32,
     /// The press back-off before the next try was waited
     /// ([`Session::box_back_off`]): the next read that still shows the box
     /// as keyed, the screen having held still, keys it again.
     pub(super) backed_off: bool,
+}
+
+/// Why this dialog's text priority is answered with its recommended option
+/// instead, the whole dialog: the fences a typed answer needs that this
+/// window did not name (`decide_box`, decision 12). `None`: it names them all.
+fn text_unfenced(caps: &Caps, screen: &Screen) -> Option<String> {
+    let mut missing: Vec<&str> = Vec::new();
+    if caps.send_gen != Some(true) {
+        missing.push("send if-gen=");
+    }
+    if screen.human_seq.is_none() {
+        missing.push("the person count (human_seq)");
+    }
+    if screen.human == HumanInput::Unknown {
+        missing.push("the person stamp (human_ms)");
+    }
+    (!missing.is_empty()).then(|| {
+        format!(
+            "this window cannot fence a typed answer: no {}",
+            missing.join(", no ")
+        )
+    })
+}
+
+/// How a session's question is answered ([`Session::question_policy`]):
+/// with which priority (`None`: it is the person's), whether the session's
+/// own word said so, and, for a session word this build does not know, why
+/// none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct QuestionPolicy {
+    /// The priority it is answered with; `None`: handed over.
+    pub(super) answer: Option<QuestionPriority>,
+    /// The session's `questions` word decided it (not the global policy).
+    pub(super) by_session: bool,
+    /// Why `answer` is `None` when the reason is not the plain `ask`.
+    pub(super) why: Option<String>,
+}
+
+impl QuestionPolicy {
+    /// The global policy alone, no session's word read: `answer_questions`,
+    /// answered by `question_priority`.
+    pub(super) fn global(opts: &SuperviseOpts) -> Self {
+        Self {
+            answer: opts
+                .policy
+                .answer_questions
+                .then_some(opts.policy.question_priority),
+            by_session: false,
+            why: None,
+        }
+    }
+
+    /// Why the question is the person's, in the words an escalation names
+    /// (the session's own `ask`, or an unknown word), when the session's word
+    /// handed it over; `None` otherwise.
+    pub(super) fn session_reason(&self) -> Option<String> {
+        (self.by_session && self.answer.is_none()).then(|| {
+            self.why.clone().unwrap_or_else(|| {
+                "this session's `questions` word is ask: a question is the person's to answer"
+                    .to_string()
+            })
+        })
+    }
+}
+
+/// A session's stored `questions` word as its policy: `ask` answers none; a
+/// priority word ([`QuestionPriority::parse`]) answers with it; any other
+/// word answers none and says so, never falling through to the global
+/// policy.
+fn session_word(word: &str) -> QuestionPolicy {
+    if word == "ask" {
+        return QuestionPolicy {
+            answer: None,
+            by_session: true,
+            why: None,
+        };
+    }
+    match QuestionPriority::parse(word) {
+        Some(p) => QuestionPolicy {
+            answer: Some(p),
+            by_session: true,
+            why: None,
+        },
+        None => QuestionPolicy {
+            answer: None,
+            by_session: true,
+            why: Some(format!(
+                "this session's `questions` word {word} is not one this supervisor knows: a \
+                 question is the person's to answer"
+            )),
+        },
+    }
 }
 
 /// What a question's answer waits on before it is keyed
@@ -306,9 +559,8 @@ enum Hold {
     BackOff(String),
 }
 
-/// One field of a bare `meta` reply, found BY KEY: `None` when the reply has
-/// no such field (a build that predates it) or it is unset (`-`), else the
-/// value, pct-decoded.
+/// One field of a bare `meta` reply, found by key: `None` when the reply has
+/// no such field or it is unset (`-`), else the value, pct-decoded.
 fn meta_word(stdout: &str, key: &str) -> Option<String> {
     let line = stdout.lines().find(|l| l.starts_with("OK"))?;
     let prefix = format!("{key}=");
@@ -335,7 +587,7 @@ pub(super) fn question_key(dialog: &QuestionDialog, rows: &[String]) -> String {
     }
 }
 
-/// Whether an Enter on `target` ANSWERS the question (it moves on or
+/// Whether an Enter on `target` answers the question (it moves on or
 /// submits) rather than toggling a multi-select option.
 fn answers(dialog: &QuestionDialog, target: AnswerTarget) -> bool {
     !matches!(
@@ -345,7 +597,7 @@ fn answers(dialog: &QuestionDialog, target: AnswerTarget) -> bool {
 }
 
 /// The dialog's rows as drawn, the rule above its tab bar to its footer,
-/// joined into one journal line (O3: the incident's journal kept none).
+/// joined into one journal line (O3).
 fn dialog_rows(rows: &[String]) -> Option<String> {
     let v2 = aterm_phase::parse_prompt_v2(rows)?;
     let (top, bottom) = v2.span;
@@ -369,31 +621,60 @@ fn note_dialog(review: &mut dyn Review, seq: u64, rule_id: &str, rows: &[String]
 }
 
 /// What "the same box" is after a press ([`Session::box_left`]): the box's
-/// kind and every row of it as drawn, title to footer, trimmed — its body
-/// with it (an Edit's diff, a tool's arguments, a Chrome box's action in
-/// its title, a workflow's script) — less the auto-deny countdown, which
-/// ticks while the box waits: its `⚠` row and every row it wrapped onto in
-/// a narrow grid (the harness round-2 review of 2026-09-24: aterm-phase
-/// joins those into [`aterm_phase::PromptV2::auto_deny`], and the ticking
-/// first row no longer equalled it, so each tick read as a new box). A row
-/// is the countdown's while the rows so far spell the start of it, led by
-/// its `⚠` row. The focus marker `❯` is left out as well: a focus move
-/// changes it, and an identity that counted it read the moved box as a new
-/// one (the harness round-3 review of 2026-09-24). So are its blank rows:
-/// within 5 ms of a taken `1` the vendor (2.1.283) wipes the countdown and
-/// ONE of the two blank rows under it, and keeps the box drawn some 550 ms
-/// more — an identity that counted blank rows read that as the box leaving,
-/// and the box still on the screen was decided and pressed a second time
-/// (measured live 2026-09-25, every approved rm box of the proof run).
-/// `None` with no box on `rows`.
+/// kind and its rows as [`box_rows`] keeps them, one per line — every row of
+/// it as drawn, title to footer, trimmed, its body with it (an Edit's diff, a
+/// tool's arguments, a Chrome box's action in its title, a workflow's script)
+/// — less its auto-deny countdown, its focus marker and its blank rows
+/// ([`box_rows`] says why each is left out). `None` with no box on `rows`.
 pub(super) fn box_identity(rows: &[String]) -> Option<String> {
     let v2 = aterm_phase::parse_prompt_v2(rows)?;
+    let mut key = format!("{}\n", v2.kind.name());
+    for (_, row) in box_rows(&v2, rows) {
+        key.push_str(row);
+        key.push('\n');
+    }
+    Some(key)
+}
+
+/// The rows the box `v2` read on `rows` is made of, with their indexes: every
+/// row of its span, title to footer (to its last row, for a footerless box),
+/// trimmed, and a leading focus marker `❯` stripped — less what the vendor
+/// redraws while the box waits, which is not the box:
+///
+/// * THE AUTO-DENY COUNTDOWN, which ticks every second: its `⚠` row and every
+///   row it wrapped onto in a narrow grid (the harness round-2 review of
+///   2026-09-24: aterm-phase joins those into
+///   [`aterm_phase::PromptV2::auto_deny`], and the ticking first row no
+///   longer equalled it, so each tick read as a new box). A row is the
+///   countdown's while the rows so far spell the start of it, led by its `⚠`
+///   row.
+/// * THE FOCUS MARKER `❯`: a focus move changes it, and an identity that
+///   counted it read the moved box as a new one (the harness round-3 review
+///   of 2026-09-24).
+/// * BLANK ROWS: within 5 ms of a taken `1` the vendor (2.1.283) wipes the
+///   countdown and ONE of the two blank rows under it, and keeps the box
+///   drawn some 550 ms more — an identity that counted blank rows read that
+///   as the box leaving, and the box still on the screen was decided and
+///   pressed a second time (measured live 2026-09-25, every approved rm box
+///   of the proof run).
+///
+/// The one reading of "the box's rows" the press's identity
+/// ([`box_identity`]) and the loop's review key (`run.rs`'s `box_key`) share.
+pub(super) fn box_rows<'a>(
+    v2: &aterm_phase::PromptV2,
+    rows: &'a [String],
+) -> Vec<(usize, &'a str)> {
     let (top, bottom) = v2.span;
     let countdown = v2.auto_deny.as_deref();
-    let mut key = format!("{}\n", v2.kind.name());
+    let mut out = Vec::new();
     // What is left of the countdown to spell, once its `⚠` row is seen.
     let mut rest: Option<&str> = None;
-    for r in rows.iter().take(bottom.saturating_add(1)).skip(top) {
+    for (i, r) in rows
+        .iter()
+        .enumerate()
+        .take(bottom.saturating_add(1))
+        .skip(top)
+    {
         let t = r.trim();
         if t.is_empty() {
             continue;
@@ -410,10 +691,9 @@ pub(super) fn box_identity(rows: &[String]) -> Option<String> {
             continue;
         }
         rest = None;
-        key.push_str(t);
-        key.push('\n');
+        out.push((i, t));
     }
-    Some(key)
+    out
 }
 
 /// The label of the option the focus is on in the box on `rows`, if any.
@@ -454,14 +734,11 @@ fn may_run_git(p: &aterm_phase::PromptV2) -> bool {
 }
 
 /// The session's `s-…` id and the foreground process group of its PTY, off a
-/// `who` reply's rows ([`roster_rows`], the live upgrade's one reading of the
-/// roster): the row of `stable` — the `s-…` id the loop addresses (`@s-…`),
-/// which no other session or instance reuses — where the loop has one, else
-/// the row whose instance-local id is `local` (what `status sid=` named; a
-/// local id is reused, and means this instance's session only). Refused when
-/// the roster cannot be read, when the kernel could not read the group, and
-/// when another row names the same group ([`unique_tab_for_group`]: a group
-/// two PTYs claim is no session's alone).
+/// `who` reply's rows ([`roster_rows`]): the row of `stable` (the `s-…` id
+/// the loop addresses, never reused) where the loop has one, else the row
+/// whose instance-local id is `local`. Refused when the roster cannot be
+/// read, when the kernel could not read the group, and when another row
+/// names the same group ([`unique_tab_for_group`]).
 pub(super) fn session_group(
     rows: &str,
     stable: Option<&str>,
@@ -500,22 +777,17 @@ pub(super) fn session_group(
 const PROGRAM_SETTLE: Duration = Duration::from_millis(2000);
 
 impl<C: Ctl> Session<'_, C> {
-    /// The session's foreground program as `status program=` names it —
-    /// `None` from a host that does not publish it, whose screen then names
-    /// the reader ([`aterm_phase::identify`]) — and `None` too when the
-    /// server's own verdict (`agent=`, lane C) already identified an agent
-    /// on this screen while `program=` still names something else: the name
-    /// is re-read off the server's event loop, and an agent `exec`ed in
-    /// place keeps its launcher's name (`bash`) until the screen moves
-    /// (measured on this lane's live check), while the verdict sticks to
-    /// the process group it identified. A shell showing a captured box gets
-    /// no verdict (`agent=-`), so it keeps its name and is never judged as
-    /// an agent.
+    /// The session's foreground program as `status program=` names it, or
+    /// `None`: from a host that does not publish it (the screen then names
+    /// the reader, [`aterm_phase::identify`]), and when the server's own
+    /// verdict (`agent=`) already identified an agent on this screen while
+    /// `program=` names something else (an agent `exec`ed in place keeps its
+    /// launcher's name until the screen moves). A shell showing a captured
+    /// box gets no verdict (`agent=-`), so it is never judged as an agent.
     ///
-    /// The same read says when a PERSON last typed into the session
-    /// (`human_ms=`, [`Session::person`]): every act the loop decides is
-    /// decided on a status read made for it, so the person is never older
-    /// than the decision.
+    /// The same read says when a person last typed into the session
+    /// (`human_ms=`, [`Session::person`]), so the person is never older than
+    /// the decision.
     pub(super) fn foreground_program(&mut self) -> Result<Option<String>, Fail> {
         let r = self.call(&["status"])?;
         if self.unserved(&r) {
@@ -524,19 +796,19 @@ impl<C: Ctl> Session<'_, C> {
         if !r.ok() {
             self.person = None;
             self.status_sid = None;
+            self.halted = false;
             return Ok(None);
         }
         let field = |f: &str| super::escalate::status_field(&r.stdout, f).map(str::to_string);
+        self.halted = field("hold").as_deref() == Some("1");
         self.status_sid = field("sid").filter(|s| s != "-");
         self.person = field("human_ms")
             .and_then(|ms| ms.parse::<u64>().ok())
             .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)));
-        // ANOTHER DRIVER'S HAND on the session — a drive lease, a turn a named
-        // driver typed (`hand=lease:<holder>`, `hand=turn:<id>:<holder>`) —
-        // holds the loop as a person's keystroke does: the manager driving
-        // the worker answers it (the hazards review of 2026-09-25: the host
-        // continued every turn a manager dispatched, and typed `answer_text`
-        // over questions meant for the manager). An owner-class turn names
+        // Another driver's hand on the session (a drive lease or a turn a
+        // named driver typed: `hand=lease:<holder>`, `hand=turn:<id>:<holder>`)
+        // holds the loop as a person's keystroke does, so the loop never
+        // fights a manager driving the worker. An owner-class turn names
         // nobody: this loop's own continuations are typed so.
         // (A halt is the server's to refuse: `ERR halted` parks the loop.)
         self.driver = crate::harness::relaunch::driver_hand(&r.stdout);
@@ -556,16 +828,13 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The approval policy's context: the session's cwd (`meta` read fresh
-    /// when `fresh_cwd`), for a box that may run git (`git`) the worker's
-    /// environment ([`ApprovalCtx::worker`]) and the directories its Bash
-    /// tool may stand in, from the transcripts under the worker's own Claude
-    /// Code directory ([`ApprovalCtx::shell_cwds`]), for any Bash box
-    /// (`bash`) the worker's environment and — when it is read from the
-    /// session ([`WorkerSource::Session`]; a fixed one is a test's, whose
-    /// startup [`ApprovalCtx::new`] already holds) — the startup its Bash
-    /// tool's shell runs with ([`ApprovalCtx::shell`]), the footer's mode,
-    /// the process's home/uid/`$TMPDIR`, the approve level and trust roots
-    /// `opts` sets.
+    /// when `fresh_cwd`); for a box that may run git (`git`) the worker's
+    /// environment ([`ApprovalCtx::worker`]) and the directories its Bash tool
+    /// may stand in ([`ApprovalCtx::shell_cwds`]); for any Bash box (`bash`)
+    /// the worker's environment and, when read from the session
+    /// ([`WorkerSource::Session`]), its Bash tool's shell startup
+    /// ([`ApprovalCtx::shell`]); the footer's mode, the process's
+    /// home/uid/`$TMPDIR`, and the approve level and trust roots `opts` sets.
     fn approval_ctx(
         &mut self,
         fresh_cwd: bool,
@@ -595,10 +864,14 @@ impl<C: Ctl> Session<'_, C> {
         );
         ctx.cwd_known = cwd.is_some();
         ctx.set_trust_roots(&opts.policy.trust_roots, env.uid);
-        // A safe rule a retired key took away (`config::Withheld`): its roots.
+        // A safe rule a withdrawn key took away (`config::Withheld`): its roots.
         if opts.policy.withheld.rm_breaker {
             ctx.scratch_roots.clear();
         }
+        // An unproven rm breaker is approved with a warning under `safe`
+        // unless the owner asked for it (`rm_breaker_ask`), or the withdrawn
+        // `rm_breaker = false` said no rm is answered at all.
+        ctx.rm_breaker_warn = !opts.policy.rm_breaker_ask && !opts.policy.withheld.rm_breaker;
         if opts.policy.withheld.read_outside_cwd {
             ctx.read_roots.clear();
         }
@@ -608,14 +881,15 @@ impl<C: Ctl> Session<'_, C> {
         ctx.model_fallback = opts.policy.model_fallback.is_some();
         ctx.model_restore = self.turn_end.restore_target(Instant::now());
         // A goal the live upgrade paused for its move, owed its resume: the
-        // paused goal's box the relaunched Codex opens with is its to answer
-        // — only that Codex's box, still leading its terminal and not left
-        // to a person (`goal_hold::box_is_upgrades`: a person's own `codex
-        // resume` in the tab draws a box of theirs), and never under an open
-        // save-then-wait switch, whose session it is (the goal would run on
-        // the cheaper model).
+        // paused goal's box the relaunched Codex opens with is its to answer,
+        // only that Codex's box, still leading its terminal and not left to a
+        // person (`goal_hold::box_is_upgrades`), and never under an open
+        // save-then-wait switch (the goal would run on the cheaper model).
         ctx.goal_resume = !self.turn_end.switch_open() && self.goal_box_is_upgrades();
         ctx.limit_wait = opts.policy.limit_wait;
+        // The grant row's rule, under `[harness] limit_reset` — and never
+        // again at a dialog mount the reset was passed over for.
+        ctx.limit_reset = opts.policy.limit_reset && !self.reset_passed_here();
         ctx.python_allow = allow.to_vec();
         if git || bash {
             let session = matches!(env.worker, WorkerSource::Session);
@@ -641,15 +915,13 @@ impl<C: Ctl> Session<'_, C> {
         Ok(ctx)
     }
 
-    /// The WORKER's environment ([`WorkerEnv`]): the environment at exec of
-    /// the session's foreground process group's leader — `who`'s `fgpgid=` on
-    /// the session's row ([`session_group`]: by the `@s-…` the loop addresses,
-    /// else by the local id the last `status` named) — read through the
-    /// kernel ([`atpkg::caller_shell::process_args`]), and bound to this
-    /// session by the `ATERM_PARENT_SESSION_ID` every aterm session hands its
-    /// shell: a process whose variable names another session, or none, is not
-    /// taken for the worker. `Err` says what could not be read or did not
-    /// hold.
+    /// The worker's environment ([`WorkerEnv`]): the environment at exec of
+    /// the session's foreground process group's leader (`who`'s `fgpgid=` on
+    /// the session's row, [`session_group`]), read through the kernel
+    /// ([`atpkg::caller_shell::process_args`]) and bound to this session by
+    /// the `ATERM_PARENT_SESSION_ID` every aterm session hands its shell: a
+    /// process whose variable names another session, or none, is not taken
+    /// for the worker. `Err` says what could not be read or did not hold.
     pub(super) fn worker_env(&mut self) -> Result<WorkerEnv, String> {
         let stable = self
             .sid
@@ -684,29 +956,49 @@ impl<C: Ctl> Session<'_, C> {
     /// The decision on the box on `screen`: read by the reader for the
     /// session's foreground program, then [`decide`]d. Under `approve =
     /// "none"` nothing is read and the box escalates — but a question, or
-    /// the usage-limit dialog while `limit_wait` is on, each its own rule's.
+    /// the usage-limit dialog while `limit_wait` is on (or `limit_reset`,
+    /// at a mount its reset was not passed over for), each its own rule's.
+    ///
+    /// Where the decision is the usage-limit dialog's GRANT ROW
+    /// ([`RULE_LIMIT_RESET`]), the decision the same read gets WITHOUT that
+    /// rule is kept beside it ([`Session::reset_fallback`]): what the dialog
+    /// is answered with if the reset is passed over before its first key
+    /// ([`Session::reset_take`]) — the answer of a build with the key off,
+    /// with no second read and no second `status`.
     pub(super) fn decide_box(
         &mut self,
         screen: &Screen,
         opts: &SuperviseOpts,
         allow: &[String],
     ) -> Result<Decision, Fail> {
+        // Every decision starts with the dialog held by no policy and no word
+        // deciding it, before the early escalations below, which read
+        // `question_held` ([`Self::auto_read`]'s Escalate arm).
+        self.question_held = false;
+        self.question.deciding = None;
+        self.reset_fallback = None;
         // A question is no permission, and neither is the usage-limit
-        // dialog: no level limits either (only `answer_questions` and
-        // `limit_wait`), so under `none` the screen is read (no request) for
-        // one before anything is asked.
-        let own_rule = || {
+        // dialog: no level limits either (only `answer_questions`,
+        // `limit_wait` and `limit_reset`), so under `none` the screen is read
+        // (no request) for one before anything is asked.
+        // The reset's rule is the GRANT ROW's: a dialog that draws none is
+        // read for it by nobody.
+        let limit_reset = opts.policy.limit_reset && !self.reset_passed_here();
+        let own_rule = |limit_reset: bool| {
             aterm_phase::read(None, &screen.rows, None)
                 .prompt
                 .is_some_and(|p| {
                     p.kind == PromptKind::Question
-                        || p.kind == PromptKind::UsageLimit && opts.policy.limit_wait
+                        || p.kind == PromptKind::UsageLimit
+                            && (opts.policy.limit_wait
+                                || limit_reset && aterm_phase::reset_row(&p).is_some())
                 })
         };
-        if opts.policy.approve == Approve::None && !own_rule() {
-            return Ok(Decision::Escalate {
-                reason: "approve = \"none\": every box is the owner's".to_string(),
-            });
+        let owners = || Decision::Escalate {
+            reason: "approve = \"none\": every box is the owner's".to_string(),
+        };
+        if opts.policy.approve == Approve::None && !own_rule(limit_reset) {
+            return Ok(owners());
         }
         if let Some(holder) = self.claim.watching_behind() {
             return Ok(Decision::Escalate {
@@ -721,11 +1013,10 @@ impl<C: Ctl> Session<'_, C> {
         );
         if reading.prompt.is_none() && aterm_phase::read(None, &screen.rows, None).prompt.is_some()
         {
-            // The screen shows an agent's box and the named program is none:
-            // a shell showing a capture — or an agent just started, whose
-            // name the server resolves off its event loop (lane C). The
-            // server's own verdict waits for the name: `await agent prompt`,
-            // bounded, then the name is read once more.
+            // The screen shows an agent's box and the named program is none: a
+            // shell showing a capture, or an agent just started whose name the
+            // server has not resolved yet. Wait for the server's verdict
+            // (`await agent prompt`, bounded), then read the name once more.
             let settle = PROGRAM_SETTLE.as_millis().to_string();
             let r = self.call(&["await", "agent", "prompt", "timeout", &settle])?;
             if self.unserved(&r) {
@@ -761,63 +1052,197 @@ impl<C: Ctl> Session<'_, C> {
         {
             ctx.nudge = NudgeCtx {
                 enabled: opts.policy.rate_nudge,
-                // A press a restarted loop found only INTENDED (its key may
-                // never have gone) leaves the nudge still up to be decided
-                // again.
+                // A press a restarted loop found only intended (its key may
+                // never have gone) leaves the nudge up to be decided again.
                 open: self.turn_end.switch_landed(),
                 from: self.nudge_from(),
                 limits: self.codex_records().limits,
             };
         }
-        // THE SESSION'S WORD (2026-09-25): a question dialog is answered by
-        // this session's own `questions` word where it has one — `ask` hands
-        // it to a person, `recommended` answers it — over the table's
-        // `answer_questions`, but never over a loop's own `--no-answer` or a
-        // value the reader could not take (`session_questions`). A dialog the
-        // POLICY hands over is held: the wait for it re-reads the word
-        // ([`Session::wait_for_next`]).
-        self.question_held = false;
-        let mut asked_by_session = false;
-        if opts.policy.session_questions
-            && reading
-                .prompt
-                .as_ref()
-                .is_some_and(|p| p.kind == PromptKind::Question)
+        ctx.screen_cols = screen
+            .cols
+            .unwrap_or_else(|| super::super::policy::question::widest_row(&screen.rows));
+        // The pane's height: a `tail=` read's rows are its last 40.
+        ctx.screen_rows = screen.pane_rows.unwrap_or(screen.first + screen.rows.len());
+        // The session's word: a question dialog is answered by this session's
+        // own `questions` word where it has one (`ask` hands it to a person,
+        // a priority word answers by that priority), over the table's
+        // `answer_questions` and `question_priority`, but never over a loop's
+        // own `--no-answer` or a value the reader could not take
+        // (`session_questions`). A dialog the policy hands over is held: the
+        // wait for it re-reads the word ([`Session::wait_for_next`]).
+        let mut said_by_session = None;
+        let mut fallback: Option<(QuestionPriority, String)> = None;
+        // The question a text word decides, for the fallback latch.
+        let mut latchable: Option<(String, QuestionDialog)> = None;
+        if let Some(prompt) = reading
+            .prompt
+            .as_ref()
+            .filter(|p| p.kind == PromptKind::Question)
         {
-            let (answers, by_session) = self.question_policy(opts)?;
-            ctx.answer_questions = answers;
-            asked_by_session = by_session && !answers;
-            self.question_held = !answers;
+            let policy = if opts.policy.session_questions {
+                let policy = self.question_policy(opts)?;
+                self.question_held = policy.answer.is_none();
+                // The dialog the policy held has changed since (a tab
+                // answered, a check toggled, while the loop's hands were off
+                // it): someone else answered there, and its end is theirs.
+                let drawn = box_identity(&screen.rows);
+                if self
+                    .question
+                    .held_as
+                    .as_ref()
+                    .is_some_and(|was| Some(was) != drawn.as_ref())
+                {
+                    self.question.theirs = true;
+                }
+                self.question.held_as = if self.question_held { drawn } else { None };
+                policy
+            } else {
+                QuestionPolicy::global(opts)
+            };
+            ctx.answer_questions = policy.answer.is_some();
+            said_by_session = policy.session_reason();
+            if let Some(word) = policy.answer {
+                // How it is answered: the word, and what the loop remembers
+                // writing into this question's free-text row.
+                ctx.question_priority = word;
+                self.question.deciding = Some(word);
+                let this = prompt
+                    .question_dialog
+                    .as_ref()
+                    .map(|d| (question_key(d, &screen.rows), d.focus()));
+                ctx.question_own = this
+                    .as_ref()
+                    .and_then(|(k, _)| self.question.typed.get(k).copied());
+                ctx.question_fell_back = this
+                    .as_ref()
+                    .is_some_and(|(k, _)| self.question.fell_back.contains(k));
+                // The latch: the word at the loop's first key on this dialog
+                // is the dialog's; a word changed since is a person's call
+                // (decision 13).
+                if let Some(latched) = self.question.mode.filter(|m| *m != word) {
+                    return Ok(Decision::Escalate {
+                        reason: format!(
+                            "the question policy was {} at the supervisor's first key on this \
+                             dialog and is {} now: a person answers it",
+                            latched.word(),
+                            word.word()
+                        ),
+                    });
+                }
+                // R3a for the text: the loop's policy text written, and the
+                // box still as it was keyed, so the text was not taken. It is
+                // never written twice: handed over. The other two guards are
+                // the decider's ("gone": a field the loop wrote that reads
+                // empty, `policy/question.rs`'s `choose_text`) and the press's
+                // (`press.rs`: a question the loop wrote a text into is never
+                // written into again).
+                if let (Some((_, focus)), Some(pending)) = (&this, &self.question.pending)
+                    && pending.kind == PendingKind::Text
+                    && pending.focus == *focus
+                    && box_identity(&screen.rows).as_deref() == Some(pending.identity.as_str())
+                {
+                    return Ok(Decision::Escalate {
+                        reason: "the dialog did not take the policy text: a text is never written \
+                                 twice"
+                            .to_string(),
+                    });
+                }
+                // A text priority needs every fence a typed answer rests on
+                // (the send's generation fence, the person fence on the send
+                // and the Enter, and the person stamp): a window that lacks
+                // one answers the whole dialog with its recommended option
+                // instead, told (decision 12).
+                if word.text().is_some() {
+                    let _ = self.gen_fence_known()?;
+                    let _ = self.send_fence_known()?;
+                    if let Some(why) = text_unfenced(&self.caps, screen) {
+                        ctx.question_priority = QuestionPriority::Recommended;
+                        fallback = Some((word, why));
+                    } else if let (Some((key, _)), Some(dialog)) =
+                        (this, prompt.question_dialog.clone())
+                    {
+                        latchable = Some((key, dialog));
+                    }
+                }
+            }
         }
-        Ok(match decide(&reading, &screen.rows, &ctx) {
-            // The escalation names the word that decided it: the session's
-            // own `ask`, not a switch the owner left on.
-            Decision::Escalate { .. } if asked_by_session => Decision::Escalate {
-                reason: "this session's `questions` word is ask: a question is the person's to \
-                         answer"
-                    .to_string(),
+        let decision = decide(&reading, &screen.rows, &ctx);
+        // The grant row's rule: the decision this read gets without it, kept
+        // for a reset passed over before its first key. Under `none` a
+        // dialog read for its grant row alone, and not decided by the row's
+        // rule (its head off the screen, no option focused), is the owner's
+        // by the words of a loop with the key off.
+        let owners_box = opts.policy.approve == Approve::None && !own_rule(false);
+        if matches!(&decision, Decision::Approve { rule_id, .. } if *rule_id == RULE_LIMIT_RESET) {
+            self.reset_fallback = Some(if owners_box {
+                owners()
+            } else {
+                ctx.limit_reset = false;
+                decide(&reading, &screen.rows, &ctx)
+            });
+        } else if owners_box {
+            return Ok(owners());
+        }
+        // The fallback latch: a tab this text word decided on its recommended
+        // option (the text would not fit) stays there.
+        if let (
+            Some((key, dialog)),
+            Decision::Approve {
+                choice: Choice::Answer(answer),
+                ..
             },
+        ) = (latchable, &decision)
+            && super::super::policy::question::falls_back(&dialog, answer)
+        {
+            self.question.fell_back.insert(key);
+        }
+        Ok(match decision {
+            // The escalation names the word that decided it: the session's
+            // own `ask` (or a word this build does not know), not a switch
+            // the owner left on.
+            Decision::Escalate { .. } if said_by_session.is_some() => Decision::Escalate {
+                reason: said_by_session.unwrap_or_default(),
+            },
+            // The recommended option answered under a text word this window
+            // cannot type for: ledgered under the word's own rule, the
+            // fallback said as the decider says its own
+            // (`<question> → <label> (recommended: <why>)`).
+            decision @ Decision::Approve { rule_id, .. }
+                if is_question_rule(rule_id) && fallback.is_some() =>
+            {
+                let (word, why) = fallback.unwrap_or_default();
+                fall_back_to(decision, word, &why)
+            }
             decision => decision,
         })
     }
 
     /// A question dialog the loop's own keys answered, done (the worker works
-    /// again) with no person taking part: said ONCE — one `CHOSE seq=<n>
-    /// rule=answer-recommended@v1 policy=recommended <question → answer | …>`
-    /// line, printed and journaled, told to the window as `story chose
-    /// recommended` (its chime and rim pulse: the owner's "a little sound and
-    /// animation for choosing"), through a `watch`'s teller or, in the hosted
-    /// loop that has none, one `story` request of its own.
+    /// again) with no person taking part: said once as `CHOSE seq=<n>
+    /// rule=<rule> policy=<word> <question → answer | …>`, printed and
+    /// journaled, and told to the window as `story chose <word>` (its chime
+    /// and rim pulse), through a `watch`'s teller or, in the hosted loop, one
+    /// `story` request. The rule is the latched word's
+    /// ([`QuestionMemory::mode`]); the word is the latched text word when a
+    /// tab was answered from the policy text, else `recommended`.
     pub(super) fn tell_answered(
         &mut self,
-        answered: &[String],
+        done: &QuestionMemory,
         seq: u64,
-        opts: &SuperviseOpts,
+        notes: Option<&Path>,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        let said = answered.join(" | ");
+        let said = done.answered.join(" | ");
+        let latched = done.mode.unwrap_or_default();
+        let rule = latched.rule_id();
+        let word = if done.by_text {
+            latched.word()
+        } else {
+            QuestionPriority::Recommended.word()
+        };
         let line = format!(
-            "CHOSE seq={seq} rule={RULE_ANSWER_RECOMMENDED} policy=recommended {}",
+            "CHOSE seq={seq} rule={rule} policy={word} {}",
             clip(&one_line(&said))
         );
         review.say(&line).map_err(Fail::Hard)?;
@@ -828,38 +1253,59 @@ impl<C: Ctl> Session<'_, C> {
             // answers `ERR usage`, and nothing printed changes.
             let _ = self.call(&["story", verb, &text]);
         }
-        append_note(
-            opts.notes.as_deref(),
-            &format!("chose ({RULE_ANSWER_RECOMMENDED}, recommended): {said}"),
-        )?;
+        append_note(notes, &format!("chose ({rule}, {word}): {said}"))?;
         Ok(())
     }
 
-    /// Whether this session's question dialog is ANSWERED: its own
-    /// `questions` word (`recommended` yes, `ask` no), read BY KEY off a bare
-    /// `meta` reply (its `cwd=` noted on the way), else the table's switch
-    /// (`[harness] answer_questions`). A build whose meta has no such field,
-    /// an unset one (`-`) and a refused read all fall to the table's switch.
-    pub(super) fn question_policy_answers(&mut self, opts: &SuperviseOpts) -> Result<bool, Fail> {
-        Ok(self.question_policy(opts)?.0)
+    /// The question dialog in hand is done (the worker works again, read
+    /// busy): what the loop remembered of it is forgotten, and a dialog the
+    /// loop's own keys answered is told once ([`Self::tell_answered`], at
+    /// `seq`), never one a person took part in (`theirs`) or one the policy
+    /// still held when it ended (`question_held`). Called at the turn's first
+    /// busy read ([`Self::await_turn_from`]) and, as the fallback, at the
+    /// look's worked edge ([`Self::look`]).
+    pub(super) fn question_done(
+        &mut self,
+        seq: u64,
+        notes: Option<&Path>,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        let done = std::mem::take(&mut self.question);
+        let held_to_end = std::mem::take(&mut self.question_held);
+        if !done.answered.is_empty() && !done.theirs && !held_to_end {
+            self.tell_answered(&done, seq, notes, review)?;
+        }
+        Ok(())
     }
 
-    /// [`Self::question_policy_answers`], and whether the SESSION'S word
-    /// decided it (`false`: the global switch did).
-    fn question_policy(&mut self, opts: &SuperviseOpts) -> Result<(bool, bool), Fail> {
-        let global = opts.policy.answer_questions;
+    /// Whether this session's question dialog is answered
+    /// ([`Self::question_policy`]'s answer is some priority): the hand-back
+    /// poll's question.
+    pub(super) fn question_policy_answers(&mut self, opts: &SuperviseOpts) -> Result<bool, Fail> {
+        Ok(self.question_policy(opts)?.answer.is_some())
+    }
+
+    /// The one resolver of how this session's questions are answered (its
+    /// dialogs, and those it asks in prose by its priority words): its own
+    /// `questions` word, read by key off a bare `meta` reply (its `cwd=`
+    /// noted on the way), where `ask` answers none, `recommended`,
+    /// `long-term` or `short-term` answers with that priority, and any other
+    /// word answers none and says so; else the table's `answer_questions`,
+    /// answered by `question_priority`. A meta with no such field, an unset
+    /// one (`-`) and a refused read all fall to the table's.
+    pub(super) fn question_policy(&mut self, opts: &SuperviseOpts) -> Result<QuestionPolicy, Fail> {
+        let global = QuestionPolicy::global(opts);
         let r = self.call(&["meta"])?;
         if self.unserved(&r) {
             return Err(Fail::Lost(format!("meta failed: {}", r.stderr.trim())));
         }
         if !r.ok() {
-            return Ok((global, false));
+            return Ok(global);
         }
         self.note_cwd(&r.stdout);
-        Ok(match meta_word(&r.stdout, "questions").as_deref() {
-            Some("recommended") => (true, true),
-            Some("ask") => (false, true),
-            _ => (global, false),
+        Ok(match meta_word(&r.stdout, "questions") {
+            None => global,
+            Some(word) => session_word(&word),
         })
     }
 
@@ -888,14 +1334,28 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`BOX_SETTLE`]: the vendor refuses a key sooner, and re-arms its
     /// refusal on it), counted from the read that FIRST showed it — `None`
     /// once it has shown that long. A box seen before (held for a person,
-    /// judged again after a moved screen) waits no more.
-    fn box_young(&mut self, turn: &Turn, allow: &[String]) -> Option<Duration> {
-        let key = review_key(turn, allow);
+    /// judged again after a moved screen) waits no more; one REDRAWN is the
+    /// box seen before — its review key ([`Session::review_key`]) holds across
+    /// a re-wrap, a moved focus and a ticking countdown, so none of them
+    /// restarts the settle, and a box whose countdown ticks every second is
+    /// never starved of its judgement. That key no longer tells the same box
+    /// asked again after the worker worked from the one before it wherever
+    /// the letters right above the two read alike (a whole box's key keeps
+    /// no more of the transcript than those: `run.rs`'s `box_key`), so the
+    /// box's MOUNT is ended where it is seen to end: a read with no box on it
+    /// ([`Session::await_turn_from`]) and a press's box seen leaving
+    /// ([`Self::box_left`]) forget it, and the box after it settles afresh.
+    fn box_young(&mut self, turn: &Turn) -> Option<Duration> {
+        let key = self.review_key(turn);
         let first = match &self.box_first_seen {
             Some((k, at)) if *k == key => *at,
             _ => {
                 let now = Instant::now();
                 self.box_first_seen = Some((key, now));
+                // A new mount: a reset passed over at the one before it is
+                // asked about afresh.
+                self.reset_passed = None;
+                self.reset_again = 0;
                 now
             }
         };
@@ -905,10 +1365,10 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Whether a person holds the act this look was about to take (`act`,
     /// for the journal): they typed into the session within `human_grace_s`
-    /// of the last status read — made now when `fresh` ([`Self::
-    /// foreground_program`]). Held, nothing is pressed, typed or escalated —
-    /// the person is right there — the loop notes `HELD`, and the point is
-    /// looked at again once the grace has passed ([`Self::turn_end_now`]).
+    /// of the last status read, made now when `fresh` ([`Self::
+    /// foreground_program`]). Held, nothing is pressed, typed or escalated,
+    /// the loop notes `HELD`, and the point is looked at again once the grace
+    /// has passed ([`Self::turn_end_now`]).
     pub(super) fn held_for_person(
         &mut self,
         seq: u64,
@@ -952,20 +1412,17 @@ impl<C: Ctl> Session<'_, C> {
 
     /// One turn under the approval policy. A box [`decide`] approves is
     /// pressed under its guard (noted, ledgered, and reported to `review`)
-    /// and the loop looks again once the box has LEFT; a box it escalates —
-    /// with the reason kept for the escalation's text ([`Session::box_reason`])
-    /// — is a review point, and so is anything that is not a box, the same
-    /// approval back after two presses, a press whose box row aterm could not
-    /// find on this very screen (its guard matched no row), a box that did
-    /// not move after the press, and a fallback press withheld because the
-    /// session survey is open ([`Pressing::Withheld`]). A press the server skipped because the box
-    /// left or the fenced screen moved, parked on a hold, or backed off
-    /// after `ERR busy …`/`ERR rate`, is followed by a fresh read and a fresh
-    /// decision — never the same press again. When the connection is lost
-    /// before the press is seen through, what the loop knows it did is
-    /// noted — a `1` the server confirmed is an approval, a press whose
-    /// answer never came is noted as such and is not — and the loss is
-    /// ridden out.
+    /// and the loop looks again once the box has left. A review point is: a
+    /// box it escalates (the reason kept, [`Session::box_reason`]), anything
+    /// that is not a box, the same approval back after two presses, a press
+    /// whose guard matched no row on this very screen, a box that did not
+    /// move after the press, and a fallback press withheld because the
+    /// session survey is open ([`Pressing::Withheld`]). A press the server
+    /// skipped (the box left, the fenced screen moved, a hold, `ERR busy
+    /// …`/`ERR rate`) is followed by a fresh read and decision, never the
+    /// same press again. On a lost connection, what the loop knows it did is
+    /// noted (a confirmed `1` is an approval, an unanswered press is not) and
+    /// the loss is ridden out.
     pub(super) fn auto_read(
         &mut self,
         turn: Turn,
@@ -984,11 +1441,10 @@ impl<C: Ctl> Session<'_, C> {
         let seq = turn.screen.seq;
         // Too young to judge: waited on, bounded by what is left of the
         // settle, and read again.
-        if let Some(wait) = self.box_young(&turn, allow) {
+        if let Some(wait) = self.box_young(&turn) {
             self.wait(&["seq", &seq.to_string()], wait)?;
             return Ok(Step::Again { settle: false });
         }
-        let notes = opts.notes.as_deref();
         let decision = self.decide_box(&turn.screen, opts, allow)?;
         // The `status` that named the program says the worker is not reading
         // its input: this box is neither pressed nor escalated; the next look
@@ -997,15 +1453,44 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(Step::Again { settle: false });
         }
         // A person at the keyboard wins: an answer the policy has is held
-        // until their grace has passed — on the status read the decision
-        // was made on — and neither pressed nor escalated.
+        // until their grace has passed, on the status read the decision was
+        // made on, and neither pressed nor escalated. On a question dialog the
+        // loop has already written to, their input (or another driver's hand)
+        // makes its end theirs (R1): after their grace the loop may still
+        // press Enter on its own text, but it tells no `CHOSE` for it.
         if matches!(
             decision,
             Decision::Approve { .. } | Decision::Decline { .. }
         ) && self.held_for_person(seq, "the box's answer", false, opts, review)?
         {
+            if p.kind == PromptKind::Question {
+                self.question.person_gave_input();
+            }
             return Ok(Step::Review(turn));
         }
+        self.auto_act(turn, p, decision, opts, approved, deadline, review)
+    }
+
+    /// What [`Self::auto_read`] does with the box `p` on `turn` once it is
+    /// decided, the stall check and the person's hold behind it: escalate
+    /// it, or press its answer and see the press through. Its own function
+    /// so that the usage-limit dialog's reset, passed over before its first
+    /// key ([`Self::reset_take`]), is answered by the decision made without
+    /// the reset's rule ([`Session::reset_fallback`]) through this same
+    /// path, on the same read.
+    #[allow(clippy::too_many_arguments)]
+    fn auto_act(
+        &mut self,
+        turn: Turn,
+        p: aterm_phase::PromptV2,
+        decision: Decision,
+        opts: &SuperviseOpts,
+        approved: &mut Vec<Approved>,
+        deadline: Instant,
+        review: &mut dyn Review,
+    ) -> Result<Step, Fail> {
+        let seq = turn.screen.seq;
+        let notes = opts.notes.as_deref();
         let (rule_id, act, subject, unproven) = match decision {
             Decision::Escalate { reason } => {
                 append_note(
@@ -1015,14 +1500,14 @@ impl<C: Ctl> Session<'_, C> {
                 self.ledger_row("-", approvals::Outcome::Escalated, &p.command, &reason, seq);
                 if p.kind == PromptKind::Question {
                     note_dialog(review, seq, "-", &turn.screen.rows);
-                    // Handed to a person for a reason of its own — not the
-                    // POLICY holding it (`question_held`), which a hand-back
+                    // Handed to a person for a reason of its own, not the
+                    // policy holding it (`question_held`), which a hand-back
                     // lifts: answered then, the answer is still the policy's.
                     if !self.question_held {
                         self.question.theirs = true;
                     }
                 }
-                self.box_reason = Some((review_key(&turn, allow), reason));
+                self.box_reason = Some((self.review_key(&turn), reason));
                 return Ok(Step::Review(turn));
             }
             Decision::Approve {
@@ -1041,12 +1526,12 @@ impl<C: Ctl> Session<'_, C> {
         };
         // What the lines name (module header): the decision's subject.
         let what = shown_subject(&subject, &p.command);
-        // A question's answer: its dialog read again from the same rows —
-        // the key's bookkeeping needs it — and the waits the pure decision
-        // cannot know (module header, "A question dialog").
+        // A question's answer: its dialog read again from the same rows (the
+        // key's bookkeeping needs it), and the waits the pure decision cannot
+        // know (module docs, "A question dialog").
         let (question, toggle) = match &act {
             Act::Approve {
-                choice: Choice::Answer(Answer::FocusEnter { target, .. }),
+                choice: Choice::Answer(answer),
                 ..
             } => {
                 let Some(dialog) =
@@ -1056,38 +1541,45 @@ impl<C: Ctl> Session<'_, C> {
                     self.question.theirs = true;
                     append_note(notes, &format!("handed to the manager ({why}): {what}"))?;
                     self.ledger_row(rule_id, approvals::Outcome::Escalated, &what, why, seq);
-                    self.box_reason = Some((review_key(&turn, allow), why.to_string()));
+                    self.box_reason = Some((self.review_key(&turn), why.to_string()));
                     return Ok(Step::Review(turn));
                 };
                 let identity = box_identity(&turn.screen.rows).unwrap_or_else(|| what.clone());
-                let answering = answers(&dialog, *target);
+                // An Enter that moves on or submits answers the question; a
+                // multi-select toggle and a written policy text do not. Only
+                // the answering Enter is counted as an answer
+                // (`Approved::question`, below).
+                let answering = answer
+                    .enter_target()
+                    .is_some_and(|target| answers(&dialog, target));
                 let this_question = question_key(&dialog, &turn.screen.rows);
                 let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
+                // The re-ask pause (O5) is waited before the keys of the
+                // answering Enter, and, under a text word, before any key of an
+                // answer (its moves, its policy text, a falling-back tab's
+                // toggle), so the dialog waits it out with nothing of the
+                // loop's in it.
+                let text_word = self.question.deciding.is_some_and(|w| w.text().is_some());
+                let reask = (answering || text_word).then_some(this_question.as_str());
                 match self.question_hold(
-                    &turn,
-                    &dialog,
-                    &identity,
-                    answering.then_some(this_question.as_str()),
-                    approved,
-                    grace,
-                    review,
+                    &turn, &dialog, &identity, reask, approved, grace, rule_id, review,
                 )? {
                     None => {}
                     Some(Hold::Again) => return Ok(Step::Again { settle: true }),
                     Some(Hold::BackOff(why)) => {
-                        return self.box_back_off(&turn, allow, &what, &why, review);
+                        return self.box_back_off(&turn, &what, &why, review);
                     }
                     Some(Hold::HandOver(why)) => {
                         self.question.theirs = true;
                         append_note(notes, &format!("handed to the manager ({why}): {what}"))?;
                         self.ledger_row(rule_id, approvals::Outcome::Escalated, &what, &why, seq);
                         note_dialog(review, seq, rule_id, &turn.screen.rows);
-                        self.box_reason = Some((review_key(&turn, allow), why));
+                        self.box_reason = Some((self.review_key(&turn), why));
                         return Ok(Step::Review(turn));
                     }
                 }
-                let toggle = match (&dialog.form, *target) {
-                    (QuestionForm::Multi { .. }, AnswerTarget::Option(n)) => {
+                let toggle = match (&dialog.form, answer.enter_target()) {
+                    (QuestionForm::Multi { .. }, Some(AnswerTarget::Option(n))) => {
                         Some((this_question.clone(), n))
                     }
                     _ => None,
@@ -1117,30 +1609,55 @@ impl<C: Ctl> Session<'_, C> {
             Act::Approve { .. } => None,
         };
         // Under full power a box that comes back is answered again (module
-        // header): the cap is the safe rules', on the parser's command — a
-        // question's has its own ([`Self::question_hold`]), and a decline's
-        // ([`Self::decline_again`]).
+        // docs): the cap is the safe rules', on the parser's command; a
+        // question's has its own ([`Self::question_hold`]), as does a
+        // decline's ([`Self::decline_again`]).
         let repeats = approved
             .iter()
             .filter(|a| a.declined.is_none() && a.command == p.command)
             .count();
         if opts.policy.approve != Approve::All
-            && rule_id != RULE_ANSWER_RECOMMENDED
+            && !is_question_rule(rule_id)
             && declined.is_none()
             && repeats >= MAX_APPROVALS_OF_ONE_COMMAND
         {
             let why = "the same prompt came back after two approvals";
             append_note(notes, &format!("handed to the manager ({why}): {what}"))?;
             self.ledger_row(rule_id, approvals::Outcome::Escalated, &what, why, seq);
-            self.box_reason = Some((review_key(&turn, allow), why.to_string()));
+            self.box_reason = Some((self.review_key(&turn), why.to_string()));
             return Ok(Step::Review(turn));
         }
+        // THE USAGE-LIMIT DIALOG'S GRANT ROW: the loop's own gates and then
+        // the host's word, LAST, before any key ([`Self::reset_take`]). A
+        // pass answers the dialog with the decision made without the reset's
+        // rule on this same read — the wait row, by the keys a build with
+        // `limit_reset` off writes.
+        let reset = rule_id == RULE_LIMIT_RESET;
+        if reset {
+            match self.reset_take(&turn, opts, review)? {
+                super::reset_loop::ResetAsked::Take => {}
+                super::reset_loop::ResetAsked::Again => return Ok(Step::Again { settle: false }),
+                super::reset_loop::ResetAsked::Pass => {
+                    let plain = self
+                        .reset_fallback
+                        .take()
+                        .unwrap_or_else(|| Decision::Escalate {
+                            reason: "a usage-limit dialog whose reset was passed over".to_string(),
+                        });
+                    return self.auto_act(turn, p, plain, opts, approved, deadline, review);
+                }
+            }
+        }
         // A press no safe rule proved says it was waved through, and why; a
-        // decline, the text the worker was given.
+        // decline, the text the worker was given; the grant row, the wall its
+        // claim is for.
         let unproven = unproven.map(|u| format!("unproven: {u}"));
-        let over = match &act {
-            Act::Decline { text, .. } => text.clone(),
-            Act::Approve { .. } => unproven.clone().unwrap_or_default(),
+        let over = match (&act, &self.reset_taken) {
+            (Act::Decline { text, .. }, _) => text.clone(),
+            (Act::Approve { .. }, Some((go, _))) if reset => {
+                format!("taken: wall until {}", go.until)
+            }
+            (Act::Approve { .. }, _) => unproven.clone().unwrap_or_default(),
         };
         let approved_note = match (&act, &unproven) {
             (Act::Decline { text, .. }, _) => format!("declined ({rule_id}): {what} — {text}"),
@@ -1151,13 +1668,13 @@ impl<C: Ctl> Session<'_, C> {
             (Act::Approve { .. }, None) => format!("approved ({rule_id}): {what}"),
         };
         let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
-        // CODEX'S RATE-LIMIT NUDGE'S SWITCH: the save-then-wait switch it
+        // Codex's rate-limit nudge's switch: the save-then-wait switch it
         // opens is made, stamped as pressed, and ledgered as the press's
-        // INTENT (`phase=intent`), BEFORE the key goes — a loop that dies
+        // intent (`phase=intent`) before the key goes, so a loop that dies
         // between the key and its record still carries the switch on (a
         // restart seeds it, and the footer then says whether the press
-        // landed). It opens here only once the box is seen leaving; a press
-        // that did not land closes it.
+        // landed). It opens only once the box is seen leaving; a press that
+        // did not land closes it.
         let intent = if rule_id == RULE_RATE_NUDGE_SWITCH {
             let label = what.rsplit_once(" => ").map_or("", |(_, l)| l).to_string();
             let w = self.nudge_intent(&label);
@@ -1176,11 +1693,17 @@ impl<C: Ctl> Session<'_, C> {
             Act::Approve {
                 guard,
                 choice: Choice::Focus { steps, label },
-            } => self.press_focused(&p, *steps, label, "enter", guard, &turn.screen)?,
+            } => {
+                // The grant row's keys are fenced on the judged read's person
+                // count as well: the host's claim is asked for between that
+                // read and the first key, and a person may key meanwhile.
+                let person = turn.screen.human_seq.filter(|_| reset);
+                self.press_focused(&p, *steps, label, "enter", guard, &turn.screen, person)?
+            }
             Act::Approve {
                 guard,
                 choice: Choice::FocusKey { steps, label, key },
-            } => self.press_focused(&p, *steps, label, key, guard, &turn.screen)?,
+            } => self.press_focused(&p, *steps, label, key, guard, &turn.screen, None)?,
             Act::Approve {
                 choice: Choice::Answer(answer),
                 ..
@@ -1189,8 +1712,18 @@ impl<C: Ctl> Session<'_, C> {
                 self.press_decline(*refusal, text, &turn.screen, grace)?
             }
         };
+        // The policy text's read-back, when the press made one the screen
+        // held still before (`Press::Typed` below): taken here, whatever the
+        // press did, so none outlives it.
+        let read_back = self.read_back.take();
+        // The grant row's approval is named by its own label, so the safe
+        // rules' cap never counts it against the wait row of the same dialog.
         let this = Approved {
-            command: p.command.clone(),
+            command: if reset {
+                what.clone()
+            } else {
+                p.command.clone()
+            },
             question,
             declined,
         };
@@ -1198,12 +1731,12 @@ impl<C: Ctl> Session<'_, C> {
             match &pressing {
                 // Seen through below: open once the box leaves.
                 Pressing::Done(Press::Pressed { .. }) => {}
-                // The key may have landed and nothing saw after it: the
-                // switch is carried as only INTENDED — the footer says
-                // whether it landed (`TurnEndState::footer_seen`, and at the
-                // next point `TurnEndState::observe`); a box still up is
-                // decided again, and nothing of the switch stops or types
-                // anything before the footer shows the cheaper model.
+                // The key may have landed and nothing saw after it: the switch
+                // is carried as only intended; the footer says whether it
+                // landed (`TurnEndState::footer_seen`, and at the next point
+                // `TurnEndState::observe`); a box still up is decided again,
+                // and nothing of the switch acts before the footer shows the
+                // cheaper model.
                 Pressing::Lost {
                     known: Some(Press::Pressed { .. }) | None,
                     ..
@@ -1218,7 +1751,18 @@ impl<C: Ctl> Session<'_, C> {
             Pressing::Done(press) => press,
             Pressing::Unconfirmed { why, retry } => {
                 if retry && self.retries_presses(opts, review, rule_id) {
-                    return self.press_missed(&turn, allow, &what, &why, review);
+                    return self.press_missed(&turn, &what, &why, opts, review);
+                }
+                // A grant row that cannot be pressed is passed over, never
+                // handed to a person: the wait row answers its dialog.
+                if reset {
+                    self.reset_pass(
+                        seq,
+                        &format!("the row was not pressed ({why})"),
+                        opts,
+                        review,
+                    );
+                    return Ok(Step::Again { settle: false });
                 }
                 let why = if this.declined.is_some() {
                     format!("the decline could not be carried out: {why}")
@@ -1227,11 +1771,11 @@ impl<C: Ctl> Session<'_, C> {
                 };
                 append_note(notes, &format!("handed to the manager ({why}): {}", what))?;
                 self.ledger_row(rule_id, approvals::Outcome::Escalated, &what, &why, seq);
-                if rule_id == RULE_ANSWER_RECOMMENDED {
+                if is_question_rule(rule_id) {
                     self.question.theirs = true;
                     note_dialog(review, seq, rule_id, &turn.screen.rows);
                 }
-                self.box_reason = Some((review_key(&turn, allow), why));
+                self.box_reason = Some((self.review_key(&turn), why));
                 return Ok(Step::Review(turn));
             }
             Pressing::Withheld => {
@@ -1259,8 +1803,16 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(Step::Again { settle: false });
             }
             Pressing::Lost { known, why } => {
+                // The grant row's Enter with no answer: it may have taken
+                // the row, so what it opens is owed its end — and never
+                // entered ([`Self::reset_row_lost`]). Lost at an arrow, no
+                // row was taken: the claim stays in hand, and the dialog is
+                // decided again after the reconnect.
+                if reset && self.focus_key_tried {
+                    self.reset_row_lost(&what, seq);
+                }
                 match known {
-                    Some(Press::Pressed { seq: at }) => {
+                    Some(Press::Pressed { seq: at } | Press::Typed { seq: at }) => {
                         if let Some((q, n)) = toggle {
                             self.question.toggled.entry(q).or_default().insert(n);
                         }
@@ -1293,29 +1845,35 @@ impl<C: Ctl> Session<'_, C> {
         };
         self.refusal_pause = REFUSAL_PAUSE;
         match press {
-            // A question's key: its effect is the next read's to show — the
-            // next tab, a checkbox, the focus, the review gone (R3a, module
-            // header) — never waited out as "the box must leave", which any
-            // redraw satisfies.
-            Press::Pressed { seq: at } if rule_id == RULE_ANSWER_RECOMMENDED => {
+            // A question's key: its effect is the next read's to show (the
+            // next tab, a checkbox, the focus, the review gone; R3a), never
+            // waited out as "the box must leave", which any redraw satisfies.
+            Press::Pressed { seq: at } if is_question_rule(rule_id) => {
                 self.changed_streak = 0;
                 // An answer the loop's own Enter gave (not a toggle, not the
-                // review's submit): told once when the dialog is done — a
-                // retry of the same Enter (P3) told once with it.
-                if answer_named
-                    && !matches!(
-                        &act,
-                        Act::Approve {
-                            choice: Choice::Answer(Answer::FocusEnter {
-                                target: AnswerTarget::ReviewSubmit,
-                                ..
-                            }),
-                            ..
-                        }
-                    )
-                    && self.question.answered.last() != Some(&what)
-                {
+                // review's submit): told once when the dialog is done; a retry
+                // of the same Enter is told once with it.
+                let submit = matches!(
+                    &act,
+                    Act::Approve {
+                        choice: Choice::Answer(answer),
+                        ..
+                    } if answer.enter_target() == Some(AnswerTarget::ReviewSubmit)
+                );
+                if answer_named && !submit && self.question.answered.last() != Some(&what) {
                     self.question.answered.push(what.clone());
+                }
+                // Answered by the worker from the loop's own text in its
+                // field (OwnText, or the multi-select's button after it): the
+                // dialog is told under the latched word.
+                if answer_named
+                    && !submit
+                    && this
+                        .question
+                        .as_ref()
+                        .is_some_and(|q| self.question.typed.contains_key(q))
+                {
+                    self.question.by_text = true;
                 }
                 // A multi-select toggle the loop made: its check is the
                 // loop's, not a person's (R2 (d)).
@@ -1333,14 +1891,81 @@ impl<C: Ctl> Session<'_, C> {
                 self.wait(&["seq", &at.to_string()], STRAY_SETTLE)?;
                 Ok(Step::Again { settle: true })
             }
+            // The usage-limit dialog's grant row, taken: what it opens is
+            // the loop's own step, owed from the Enter on and run from here
+            // ([`Self::reset_run`]) — the pending line, the confirmation and
+            // its end are never another rule's to judge.
+            Press::Pressed { seq: at } if reset => {
+                self.changed_streak = 0;
+                self.press_retry = None;
+                self.reset_row_taken();
+                approved.push(this);
+                self.answered(&act, rule_id, &what, &over, (at, seq), review)?;
+                append_note(notes, &approved_note)?;
+                self.box_first_seen = None;
+                self.wait(&["seq", &at.to_string()], self.reset_waits.step)?;
+                self.reset_run(None, deadline, opts, review)?;
+                Ok(Step::Again { settle: true })
+            }
+            // The policy text written into the free-text row and read back
+            // exactly: no Enter here; the next read decides it (Enter on the
+            // field, or the multi-select's button), under R1 and R3a like any
+            // key. Not an answer yet: nothing is added to what `CHOSE` tells.
+            Press::Typed { seq: at } => {
+                self.changed_streak = 0;
+                let word = match &act {
+                    Act::Approve {
+                        choice: Choice::Answer(answer),
+                        ..
+                    } => answer.typed().unwrap_or_default(),
+                    _ => QuestionPriority::default(),
+                }
+                .word();
+                approved.push(this);
+                append_note(notes, &approved_note)?;
+                self.ledger_row(
+                    rule_id,
+                    approvals::Outcome::Approved,
+                    &what,
+                    &format!(
+                        "typed the {word} policy text into the free-text row: the worker decides"
+                    ),
+                    seq,
+                );
+                review.approved(at, &what)?;
+                note_unproven(review, at, rule_id, unproven.as_deref());
+                note_dialog(review, seq, rule_id, &turn.screen.rows);
+                // No wait on `at`: the press waited on the send's own seq and
+                // read the text back settled, so a wait past the read-back's
+                // seq would wait on a change that is not coming. That read,
+                // made after the screen held still, is the next look's turn,
+                // saving a settle and a second read before the Enter. Its box
+                // is past the vendor's key guard (it held still longer than
+                // [`BOX_SETTLE`] before the read), so the settle is counted
+                // from before it. A read-back the screen did not hold still
+                // before gets a fresh look.
+                match read_back
+                    .map(|(back, still)| (self.turn_of(back), still))
+                    .filter(|(next, _)| next.phase == Phase::Prompt)
+                {
+                    Some((next, still)) => {
+                        let since = Instant::now()
+                            .checked_sub(still)
+                            .unwrap_or_else(Instant::now);
+                        self.box_first_seen = Some((self.review_key(&next), since));
+                        Ok(Step::Decide(next.screen))
+                    }
+                    None => Ok(Step::Again { settle: true }),
+                }
+            }
             Press::Yielded { seq: at } => {
-                if rule_id == RULE_ANSWER_RECOMMENDED {
+                if is_question_rule(rule_id) {
                     self.question.theirs = true;
                 }
                 // A person keyed the session while the answer was keyed:
                 // nothing more was sent; the next read waits for their quiet
-                // (`question_hold`) and decides again — never escalated for
-                // the wait (R1).
+                // (`question_hold`) and decides again, never escalated for the
+                // wait (R1).
                 self.ledger_row(
                     rule_id,
                     approvals::Outcome::Skipped,
@@ -1383,23 +2008,21 @@ impl<C: Ctl> Session<'_, C> {
                 };
                 self.answered(&act, rule_id, &what, &over, (at, seq), review)?;
                 note_unproven(review, at, rule_id, unproven.as_deref());
-                // The box must LEAVE before the next look: `await gone` is
+                // The box must leave before the next look: `await gone` is
                 // level-triggered and a box shows no busy footer, so an
-                // immediate re-read of an unchanged screen would match the same
-                // box and press it again — the stray digit the guard exists to
-                // prevent.
-                // Any move is not its leaving: the vendor redraws a box it
-                // has taken (the countdown wiped, the transcript above
-                // reflowed) before it takes it down ([`box_identity`]).
+                // immediate re-read of an unchanged screen would match the
+                // same box and press it again. Any move is not its leaving:
+                // the vendor redraws a box it has taken (the countdown wiped,
+                // the transcript reflowed) before it takes it down
+                // ([`box_identity`]).
                 let identity = box_identity(&turn.screen.rows).unwrap_or_default();
                 let screen = match self.box_left(at, &identity, deadline)? {
                     Past::Moved => {
                         self.press_retry = None;
-                        // The switch landed: it opens — the turn the box
-                        // covered ended under it, and a person's keystroke
-                        // before this is no hand in anything after — and the
-                        // goal turn Codex runs under the box is stopped at
-                        // once. The keep: the covered turn ended there too.
+                        // The switch landed and opens: the turn the box covered
+                        // ended under it, a person's keystroke before this is
+                        // no hand in anything after, and the goal turn Codex
+                        // runs under the box is stopped at once.
                         if let Some(w) = intent {
                             self.open_wind(w);
                             let screen = self.screen()?;
@@ -1423,7 +2046,7 @@ impl<C: Ctl> Session<'_, C> {
                         screen
                     }
                     // The budget ran out waiting: nothing is read or handed
-                    // over after it — the box as last read is the TIMEOUT's
+                    // over after it; the box as last read is the timeout's
                     // ([`Self::look`]). A nudge's switch that may have landed
                     // is carried as open, as its intent row says.
                     Past::Still(None) => {
@@ -1436,15 +2059,15 @@ impl<C: Ctl> Session<'_, C> {
                 let why = "the box did not change after the press";
                 let still = self.turn_of(screen);
                 if self.retries_presses(opts, review, rule_id) {
-                    return self.press_missed(&still, allow, &what, why, review);
+                    return self.press_missed(&still, &what, why, opts, review);
                 }
                 append_note(notes, &format!("handed to the manager ({why}): {what}"))?;
                 Ok(Step::Review(still))
             }
             Press::Changed { seq: at } => {
                 // The screen moved between the read and the press: read and
-                // decide again — and after a streak of these, hand the box
-                // over rather than press it unfenced ([`MAX_CHANGED_PRESSES`]).
+                // decide again, and after a streak of these, hand the box over
+                // rather than press it unfenced ([`MAX_CHANGED_PRESSES`]).
                 self.changed_streak += 1;
                 self.ledger_row(
                     rule_id,
@@ -1460,18 +2083,18 @@ impl<C: Ctl> Session<'_, C> {
                          moved, or the key was not taken)"
                     );
                     if self.retries_presses(opts, review, rule_id) {
-                        return self.press_missed(&turn, allow, &what, &why, review);
+                        return self.press_missed(&turn, &what, &why, opts, review);
                     }
                     append_note(notes, &format!("handed to the manager ({why}): {}", what))?;
-                    self.box_reason = Some((review_key(&turn, allow), why));
+                    self.box_reason = Some((self.review_key(&turn), why));
                     return Ok(Step::Review(turn));
                 }
                 // A question's key skipped this way settles and is decided
-                // again — a person's key may be what moved the screen, and
-                // the quiet is checked again first — never pressed again at
-                // once (R2).
+                // again (a person's key may be what moved the screen, and the
+                // quiet is checked again first), never pressed again at once
+                // (R2).
                 Ok(Step::Again {
-                    settle: rule_id == RULE_ANSWER_RECOMMENDED,
+                    settle: is_question_rule(rule_id),
                 })
             }
             Press::Skipped { seq: at } => {
@@ -1489,10 +2112,10 @@ impl<C: Ctl> Session<'_, C> {
                     // answers; at full power it is read and tried again.
                     let why = "aterm could not find the box's row";
                     if self.retries_presses(opts, review, rule_id) {
-                        return self.press_missed(&turn, allow, &what, why, review);
+                        return self.press_missed(&turn, &what, why, opts, review);
                     }
                     append_note(notes, &format!("handed to the manager ({why}): {}", what))?;
-                    self.box_reason = Some((review_key(&turn, allow), why.to_string()));
+                    self.box_reason = Some((self.review_key(&turn), why.to_string()));
                     return Ok(Step::Review(turn));
                 }
                 append_note(
@@ -1526,53 +2149,100 @@ pub(super) struct PressRetry {
 
 impl<C: Ctl> Session<'_, C> {
     /// Whether a press that did not land is tried again
-    /// ([`Self::press_missed`]) rather than handed over: with nobody there
-    /// to take it (`watch`, the window's host) — `supervise`'s one look
-    /// hands it to the manager it returns to — at full power, or for a
-    /// question's answer or the usage-limit dialog's wait (`rule_id`), which
-    /// no `approve` level limits: only `answer_questions` or `limit_wait`,
-    /// which already decided it.
+    /// ([`Self::press_missed`]) rather than handed over: with nobody there to
+    /// take it (`watch`, the window's host; `supervise`'s one look hands it to
+    /// its manager) at full power, or for a question's answer or the
+    /// usage-limit dialog's wait or reset (`rule_id`), which no `approve`
+    /// level limits.
     fn retries_presses(&self, opts: &SuperviseOpts, review: &dyn Review, rule_id: &str) -> bool {
         review.unattended()
             && (opts.policy.approve == Approve::All
-                || rule_id == RULE_ANSWER_RECOMMENDED
-                || rule_id == RULE_LIMIT_WAIT)
+                || is_question_rule(rule_id)
+                || rule_id == RULE_LIMIT_WAIT
+                || rule_id == RULE_LIMIT_RESET)
     }
 
-    /// FULL POWER'S ANSWER TO A PRESS THAT DID NOT LAND (the philosophy review
-    /// of 2026-09-25: the box did not change after the press, a streak of
-    /// fenced presses that did not land, a focus move that did not land, or
-    /// a box row aterm could not find on the very screen read (its guard
-    /// matched no row) — each handed the box
-    /// to a person, and the box was never tried again; headless, nobody could
-    /// answer): [`Self::box_back_off`], journaled `WAITING seq=<n> the press
-    /// did not land (<why>) …`.
+    /// Full power's answer to a press that did not land (the box did not
+    /// change after the press, a streak of fenced presses that did not land,
+    /// a focus move that did not land, or a guard that matched no row on the
+    /// very screen read): [`Self::box_back_off`], journaled `WAITING seq=<n>
+    /// the press did not land (<why>) …`, since nobody else can answer it.
+    ///
+    /// The usage-limit dialog's GRANT ROW is tried again on the same pauses
+    /// and NEVER BADGED ([`Self::reset_press_missed`]): a reset raises no
+    /// attention, and its dialog has another answer.
     fn press_missed(
         &mut self,
         turn: &Turn,
-        allow: &[String],
         what: &str,
         why: &str,
+        opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<Step, Fail> {
         let why = format!("the press did not land ({why})");
-        self.box_back_off(turn, allow, what, &why, review)
+        if self.reset_taken.is_some() {
+            return self.reset_press_missed(turn, &why, opts, review);
+        }
+        self.box_back_off(turn, what, &why, review)
     }
 
-    /// THE PRESS BACK-OFF, for a box nobody else is there to answer — a press
-    /// that did not land ([`Self::press_missed`]), a question key the dialog
-    /// did not take, a screen that never held still for the key to be sent
-    /// again ([`Self::question_hold`]): the box is read and decided again
+    /// The grant row's press did not land, the host's go for it in hand
+    /// ([`Session::reset_taken`]): read and tried again after the press
+    /// back-off's pause — the host answers its own claim with the go again —
+    /// and, where any other box would be badged ([`PRESS_BADGE_AFTER`]),
+    /// PASSED OVER instead ([`Self::reset_pass`]: the host is told the reset
+    /// was kept, nothing opened), so the wait row answers the dialog.
+    fn reset_press_missed(
+        &mut self,
+        turn: &Turn,
+        why: &str,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<Step, Fail> {
+        let key = box_identity(&turn.screen.rows).unwrap_or_default();
+        let (now, seq) = (Instant::now(), turn.screen.seq);
+        let (tries, since) = match self.press_retry.as_mut().filter(|r| r.key == key) {
+            Some(r) => {
+                r.tries = r.tries.saturating_add(1);
+                (r.tries, r.since)
+            }
+            None => {
+                self.press_retry = Some(PressRetry {
+                    key,
+                    tries: 1,
+                    since: now,
+                    badged: false,
+                });
+                (1, now)
+            }
+        };
+        if now.duration_since(since) >= self.press_badge_after {
+            self.press_retry = None;
+            self.reset_pass(seq, why, opts, review);
+            return Ok(Step::Again { settle: false });
+        }
+        let pause = crate::supervise::ladder::doubling(REFUSAL_PAUSE, tries - 1, PRESS_RETRY_MAX);
+        review.note(&format!(
+            "WAITING seq={seq} rule={RULE_LIMIT_RESET} {why} (try {tries}): read and tried again \
+             in {} ms",
+            pause.as_millis()
+        ));
+        self.wait(&["seq", &seq.to_string()], pause)?;
+        Ok(Step::Again { settle: false })
+    }
+
+    /// The press back-off, for a box nobody else is there to answer (a press
+    /// that did not land, [`Self::press_missed`]; a question key the dialog
+    /// did not take; a screen that never held still for the key to be sent
+    /// again, [`Self::question_hold`]): the box is read and decided again
     /// after a pause that doubles from [`REFUSAL_PAUSE`] to
-    /// [`PRESS_RETRY_MAX`] — Claude Code drops keys 0.3 s after it draws a
-    /// box, a transient the next try passes — and once it has missed for
-    /// [`PRESS_BADGE_AFTER`] the session is badged ([`Self::escalate_point`],
-    /// a keyed badge that goes with the box) while the tries go on.
-    /// Journaled `WAITING seq=<n> <why> (try <n>) …` each time.
+    /// [`PRESS_RETRY_MAX`] (Claude Code drops keys 0.3 s after it draws a
+    /// box), and once it has missed for [`PRESS_BADGE_AFTER`] the session is
+    /// badged ([`Self::escalate_point`]) while the tries go on. Journaled
+    /// `WAITING seq=<n> <why> (try <n>) …` each time.
     fn box_back_off(
         &mut self,
         turn: &Turn,
-        allow: &[String],
         what: &str,
         why: &str,
         review: &mut dyn Review,
@@ -1603,19 +2273,20 @@ impl<C: Ctl> Session<'_, C> {
         ));
         if badge && review.unattended() {
             let reason = format!("{why}; still trying ({tries} tries)");
-            self.escalate_point(turn, allow, Some(&reason), review)?;
+            self.escalate_point(turn, Some(&reason), review)?;
         }
         self.wait(&["seq", &seq.to_string()], pause)?;
         Ok(Step::Again { settle: false })
     }
 
-    /// What a question's answer waits on before it is keyed (module header,
-    /// "A question dialog"): `None` to key it now, [`Hold::Again`] after a
-    /// wait — a person not quiet for `grace` yet, the loop's own last key not
-    /// seen taking effect yet — or [`Hold::HandOver`]. `identity` is the box
-    /// as drawn ([`box_identity`]); `answering` the question an Enter on this
-    /// decision answers ([`question_key`]; `None` for a multi-select toggle),
-    /// for the re-ask cap.
+    /// What a question's answer waits on before it is keyed (module docs, "A
+    /// question dialog"): `None` to key it now, [`Hold::Again`] after a wait
+    /// (a person not quiet for `grace` yet, the loop's own last key not seen
+    /// taking effect yet), or [`Hold::HandOver`]. `identity` is the box as
+    /// drawn ([`box_identity`]); `answering` the question this decision's
+    /// keys begin or answer ([`question_key`]; `None` for a multi-select
+    /// toggle under `recommended`), for the re-ask pause; `rule_id` the
+    /// decision's rule, which a `WAITING` line names.
     #[allow(clippy::too_many_arguments)]
     fn question_hold(
         &mut self,
@@ -1625,6 +2296,7 @@ impl<C: Ctl> Session<'_, C> {
         answering: Option<&str>,
         approved: &[Approved],
         grace: Duration,
+        rule_id: &str,
         review: &mut dyn Review,
     ) -> Result<Option<Hold>, Fail> {
         let seq = turn.screen.seq;
@@ -1634,17 +2306,14 @@ impl<C: Ctl> Session<'_, C> {
             HumanInput::Never => {}
             HumanInput::Ago(ms) if ms >= quiet_ms => {}
             HumanInput::Ago(ms) => {
-                // A person's input after the loop's own keys reached the
-                // dialog: whatever the loop answers after their quiet, the
-                // dialog's end is not told as the policy's alone. (Input
-                // before any key of the loop's is, as often as not, the
-                // prompt that led to the question.)
-                if self.question.pending.is_some() || !self.question.answered.is_empty() {
-                    self.question.theirs = true;
-                }
+                // A person's input after the loop's own keys, or its policy
+                // text, reached the dialog: its end is theirs
+                // ([`QuestionMemory::person_gave_input`]).
+                self.question.person_gave_input();
                 self.note_question_wait(
                     review,
                     seq,
+                    rule_id,
                     identity,
                     &format!(
                         "a person gave the session input {ms} ms ago: the question waits for {} \
@@ -1662,6 +2331,7 @@ impl<C: Ctl> Session<'_, C> {
                 self.note_question_wait(
                     review,
                     seq,
+                    rule_id,
                     identity,
                     &format!(
                         "this host does not stamp a person's input: the question waits for the \
@@ -1690,7 +2360,7 @@ impl<C: Ctl> Session<'_, C> {
         // its check may not be drawn yet (R2 (d) below).
         let toggling = match &unchanged {
             Some(QuestionPending {
-                enter: true,
+                kind: PendingKind::Enter,
                 focus: QuestionFocus::Option(n),
                 ..
             }) => Some(*n),
@@ -1701,6 +2371,8 @@ impl<C: Ctl> Session<'_, C> {
         let unattended = review.unattended();
         // A key sent again on the box as it was keyed is no re-ask (3).
         let retrying = unchanged.is_some();
+        // (A policy text not taken never gets here: `decide_box` hands that
+        // box over first, since a text is never written twice.)
         match unchanged {
             Some(QuestionPending {
                 waited: false,
@@ -1709,14 +2381,14 @@ impl<C: Ctl> Session<'_, C> {
             }) => {
                 if unsettled == 0 {
                     review.note(&format!(
-                        "WAITING seq={seq} rule={RULE_ANSWER_RECOMMENDED} the dialog has not \
-                         shown the last key's effect: read again once the screen holds still"
+                        "WAITING seq={seq} rule={rule_id} the dialog has not shown the last \
+                         key's effect: read again once the screen holds still"
                     ));
                 }
-                // Only a screen that HELD STILL is the retry's premise (a
-                // key read by Claude Code by then); a wait that ran out is
-                // waited again, and after a few backed off (or, to a manager,
-                // handed over) — never keyed.
+                // Only a screen that held still is the retry's premise (a key
+                // read by Claude Code by then); a wait that ran out is waited
+                // again, and after a few backed off (or, to a manager, handed
+                // over), never keyed.
                 let settled = matches!(self.wait(&["idle", IDLE_MS], WAIT_STEP)?, Wait::Latched);
                 if let Some(p) = self.question.pending.as_mut() {
                     if settled {
@@ -1767,9 +2439,9 @@ impl<C: Ctl> Session<'_, C> {
                 // The back-off waited, the screen still: the key again.
             }
             // Once more at once: a key the dialog refused (its typeahead
-            // window, O4) is gone, and the screen held still after it. A
-            // retry is counted when that key is WRITTEN (`question_pending`),
-            // so a press that sends nothing does not count as one.
+            // window, O4) is gone, and the screen held still after it. A retry
+            // is counted when that key is written (`question_pending`), so a
+            // press that sends nothing does not count as one.
             Some(_) => {}
             None => {
                 // The last key took effect: its box's back-off is over.
@@ -1784,9 +2456,9 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         // R2 (d): on a multi-select, every check is one the loop made, and
-        // every check it made still reads checked — else a person has begun
-        // answering. The one toggle still in flight on the box exactly as
-        // the loop keyed it is exempt: it may not have landed yet (above).
+        // every check it made still reads checked; else a person has begun
+        // answering. The one toggle still in flight on the box exactly as the
+        // loop keyed it is exempt: it may not have landed yet (above).
         if let QuestionForm::Multi { options, .. } = &dialog.form {
             let mine = self
                 .question
@@ -1827,9 +2499,9 @@ impl<C: Ctl> Session<'_, C> {
                 self.question.reasked = Some((q.to_string(), answered));
                 let pause = reask_pause(answered);
                 review.note(&format!(
-                    "WAITING seq={seq} rule={RULE_ANSWER_RECOMMENDED} the same question came back \
-                     after {answered} answers since the last review point (the model is \
-                     re-asking it): answered again in {} ms",
+                    "WAITING seq={seq} rule={rule_id} the same question came back after \
+                     {answered} answers since the last review point (the model is re-asking \
+                     it): answered again in {} ms",
                     pause.as_millis()
                 ));
                 self.wait(&["seq", &seq.to_string()], pause)?;
@@ -1843,8 +2515,8 @@ impl<C: Ctl> Session<'_, C> {
     /// said: an approval `approved` (its `reason` the `unproven:` of a press
     /// no safe rule proved) and its `APPROVED` line to `review`; a decline
     /// `declined` (its `reason` the text typed) and a journal-only `DECLINED
-    /// seq=<at> rule=<id> <subject> => <text>` — an answer, never a line a
-    /// manager waits on, a badge or mail.
+    /// seq=<at> rule=<id> <subject> => <text>`, never a line a manager waits
+    /// on, a badge or mail.
     fn answered(
         &mut self,
         act: &Act,
@@ -1871,11 +2543,10 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The pause before the box `key` (`press.rs`'s `decline_box`) is
-    /// declined again, when it came back [`REASKED_AFTER`] or more times
-    /// since the last review point and that pause ([`reask_pause`]) has not
-    /// been waited yet: the worker has not acted on its reason yet, and
-    /// nobody else is there to answer it (module header) — never a count
-    /// that hands it over.
+    /// declined again, when it came back [`REASKED_AFTER`] or more times since
+    /// the last review point and that pause ([`reask_pause`]) has not been
+    /// waited yet: the worker has not acted on its reason yet, and nobody
+    /// else is there to answer it.
     fn decline_again(&mut self, key: &str, approved: &[Approved]) -> Option<Duration> {
         let declines = approved
             .iter()
@@ -1893,23 +2564,27 @@ impl<C: Ctl> Session<'_, C> {
         Some(reask_pause(declines))
     }
 
-    /// The journal's `WAITING seq=<n> rule=answer-recommended@v1 <why>`, once
+    /// The journal's `WAITING seq=<n> rule=<the decision's rule> <why>`, once
     /// per box however many waits it takes.
-    fn note_question_wait(&mut self, review: &mut dyn Review, seq: u64, identity: &str, why: &str) {
+    fn note_question_wait(
+        &mut self,
+        review: &mut dyn Review,
+        seq: u64,
+        rule_id: &str,
+        identity: &str,
+        why: &str,
+    ) {
         if self.question.waiting_said.as_deref() != Some(identity) {
             self.question.waiting_said = Some(identity.to_string());
-            review.note(&format!(
-                "WAITING seq={seq} rule={RULE_ANSWER_RECOMMENDED} {why}"
-            ));
+            review.note(&format!("WAITING seq={seq} rule={rule_id} {why}"));
         }
     }
 
-    /// Whether a box pressed at `at` LEFT ([`Self::moved_past`]), a move
-    /// that leaves the same box ([`box_identity`] equal to `identity`: its
-    /// countdown ticked or was wiped, the transcript above it reflowed)
-    /// being no move: the wait goes on past it, for at most one
-    /// [`WAIT_STEP`] from the press, and then the box as read is
-    /// [`Past::Still`] — "the box did not change after the press".
+    /// Whether a box pressed at `at` left ([`Self::moved_past`]), a move that
+    /// leaves the same box ([`box_identity`] equal to `identity`) being no
+    /// move: the wait goes on past it for at most one [`WAIT_STEP`] from the
+    /// press, and then the box as read is [`Past::Still`] ("the box did not
+    /// change after the press").
     fn box_left(&mut self, at: u64, identity: &str, deadline: Instant) -> Result<Past, Fail> {
         let until = Instant::now() + WAIT_STEP;
         let mut since = at;
@@ -1927,6 +2602,9 @@ impl<C: Ctl> Session<'_, C> {
             }
             let now = self.screen()?;
             if box_identity(&now.rows).as_deref() != Some(identity) {
+                // The box left: the next one mounts afresh, and waits out its
+                // own settle ([`Self::box_young`]).
+                self.box_first_seen = None;
                 return Ok(Past::Moved);
             }
             if Instant::now() >= until {
@@ -1945,5 +2623,11 @@ impl<C: Ctl> Session<'_, C> {
 fn note_unproven(review: &mut dyn Review, seq: u64, rule_id: &str, unproven: Option<&str>) {
     if let Some(u) = unproven {
         review.note(&format!("UNPROVEN seq={seq} rule={rule_id} {u}"));
+        // The warning an unproven rm breaker is approved with under `approve
+        // = "safe"`: said, not only journaled, since it is the one line that
+        // stands where the person's box would.
+        if rule_id == RULE_RM_BREAKER_WARN {
+            let _ = review.say(&format!("WARN seq={seq} rule={rule_id} {u}"));
+        }
     }
 }

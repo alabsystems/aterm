@@ -1,9 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE LOGIN WALL OF 2026-09-27 (tab `s-b5cf2faabac5ce5127bd`, Claude session
-//! `03396a15-856e-4f1b-8174-ae9a3e4b369f`, Claude Code 2.1.281), replayed
-//! through the real driver.
+//! A recorded login-wall session (Claude Code 2.1.281), replayed through the
+//! real driver.
 
 use super::*;
 use crate::harness::upgrade::{
@@ -11,13 +10,13 @@ use crate::harness::upgrade::{
     gate_release, gate_restart, next_step, ready_since, requested_step,
 };
 
-/// The incident's conversation, target and salt (its state file, read
-/// 2026-09-27: `"salt":1790373062`, `"to":"2.1.283"`).
+/// The recorded conversation, target and salt (from its state file:
+/// `"salt":1790373062`, `"to":"2.1.283"`).
 const INCIDENT_SESSION: &str = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
 const INCIDENT_SALT: u64 = 1_790_373_062;
 const INCIDENT_TAB: &str = "s-b5cf2faabac5ce5127bd";
 
-/// The ledger's four announcements (`t`, marker), 2026-09-27 UTC.
+/// The ledger's four announcements (`t`, marker), UTC.
 const LEDGER: [(u64, &str); 4] = [
     (1_790_485_402, "ATERM-UPGRADE-READY-cd35db51"),
     (1_790_487_206, "ATERM-UPGRADE-READY-86dddca2"),
@@ -25,13 +24,13 @@ const LEDGER: [(u64, &str); 4] = [
     (1_790_490_814, "ATERM-UPGRADE-READY-12cbabd0"),
 ];
 
-/// The state file 0.93.0 left, byte for byte (read 2026-09-27 14:37 UTC).
+/// The state file aterm 0.93.0 left, byte for byte.
 const OWNERS_STATE: &str = r#"{"asks":0,"at":0,"confirm_by":0,"from":"2.1.281","last_seq":766968,"launch_model":"","line":"","mark":0,"marker":"ATERM-UPGRADE-READY-12cbabd0","model_before":"","noted":"","notice_pid":4205,"notice_start":"Thu Sep 24 04:27:57 2026","phase":"failed","pid":0,"resumed_on":"","resumed_pid":0,"salt":1790373062,"seq_since":1790519879,"shell":0,"source":"managed","tab":"s-b5cf2faabac5ce5127bd","to":"2.1.283","why":"unanswered"}"#;
 
-/// Where the incident's rows ran (the owner's home rewritten).
+/// Where the recorded rows ran (the home directory rewritten).
 const CWD: &str = "/Users//owner/aterm/.claude/worktrees/harness-upgrade";
 
-/// The keys every row of the incident's transcript carries after its own.
+/// The keys every row of the recorded transcript carries after its own.
 fn tail_keys(ts: &str, session: &str) -> String {
     format!(
         r#""timestamp":"{ts}","userType":"external","entrypoint":"cli","cwd":"{CWD}","sessionId":"{session}","version":"2.1.281","gitBranch":"docs/keeper-approved","slug":"shimmying-wibbling-salamander""#
@@ -42,8 +41,8 @@ fn json_str(text: &str) -> String {
     aterm_json::to_string(&Value::from(text)).expect("json")
 }
 
-/// A turn typed into the composer (`origin` `human`: a person's, the
-/// supervisor's and the upgrade's alike — measured).
+/// A turn typed into the composer (`origin` `human` for a person's, the
+/// supervisor's and the upgrade's alike).
 fn typed_row(ts: &str, session: &str, text: &str, source: &str) -> String {
     format!(
         r#"{{"parentUuid":"00000000-0000-4000-8000-000000000001","isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000002","type":"user","message":{{"role":"user","content":{}}},"uuid":"00000000-0000-4000-8000-000000000003","permissionMode":"bypassPermissions","origin":{{"kind":"human"}},"promptSource":"{source}","turnOrigin":"human",{}}}"#,
@@ -70,10 +69,10 @@ fn notification_row(ts: &str, session: &str) -> String {
     )
 }
 
-/// THE LOGIN WALL as Claude Code 2.1.281 writes it: a `<synthetic>`
-/// assistant row, `isApiErrorMessage` and `error` `authentication_failed`,
-/// its one text `Login expired · Please run /login` (measured: every turn from
-/// 05:00:24 to 14:33:36 UTC ended on one, 45-86 ms after it began).
+/// The login wall as Claude Code 2.1.281 writes it: a `<synthetic>` assistant
+/// row, `isApiErrorMessage` and `error` `authentication_failed`, its one text
+/// `Login expired · Please run /login` (every turn from 05:00:24 to 14:33:36
+/// UTC ended on one, 45-86 ms after it began).
 fn auth_wall_row(ts: &str, session: &str) -> String {
     format!(
         r#"{{"parentUuid":"00000000-0000-4000-8000-00000000000a","isSidechain":false,"type":"assistant","uuid":"00000000-0000-4000-8000-00000000000b","message":{{"diagnostics":null,"id":"00000000-0000-4000-8000-00000000000c","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"Login expired · Please run /login"}}],"context_management":null}},"error":"authentication_failed","isApiErrorMessage":true,"perTurnEffort":"xhigh","session_id":"{session}",{}}}"#,
@@ -141,12 +140,11 @@ fn notice_text(marker: &str) -> String {
     )
 }
 
-/// The incident's rows, 05:00:24 to 14:34:21 UTC (the transcript's rows
-/// 9912-10019, shape only: every key, nesting and type and the vendor's
-/// and the harness's own texts kept; ids, paths and the agent's prose
-/// rewritten), for the conversation `session`. `upto` cuts it: the rows up
-/// to and including the `upto`-th notice's wall (1-4), or everything (`5`).
-/// `login`: the person's `/login` and what came after it.
+/// The recorded rows, 05:00:24 to 14:34:21 UTC (shape only: every key, nesting
+/// and type and the vendor's and harness's texts kept; ids, paths and the
+/// agent's prose rewritten), for the conversation `session`. `upto` cuts it:
+/// the rows up to and including the `upto`-th notice's wall (1-4), or
+/// everything (`5`). `login`: the person's `/login` and what followed.
 fn incident(session: &str, upto: usize, login: bool) -> String {
     let wall = |ts_in: &str, ts_out: &str, ms: u64| {
         [
@@ -235,9 +233,9 @@ fn incident(session: &str, upto: usize, login: bool) -> String {
     rows.join("\n") + "\n"
 }
 
-/// The screen the incident's session showed at the wall, as `text --json`
-/// answers it: [`aterm_phase::prompt::fixtures::LOGIN_EXPIRED`], the caret at
-/// column 2, no person's input.
+/// The screen the session showed at the wall, as `text --json` answers it:
+/// [`aterm_phase::prompt::fixtures::LOGIN_EXPIRED`], the caret at column 2, no
+/// person's input.
 fn walled_screen_json() -> String {
     let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED);
     screen_json(&rows)
@@ -269,7 +267,7 @@ fn stand_in() -> Command {
     c
 }
 
-/// Targets holding the incident's target build.
+/// Targets holding the recorded target build.
 fn to_2_1_283() -> Targets {
     Targets {
         managed: Some(Candidate {
@@ -294,13 +292,12 @@ struct Visited {
     ledger: Vec<String>,
 }
 
-/// ONE REAL VISIT ([`visit_with_claim`]) of a stand-in agent in [`TAB`]
+/// One real visit ([`visit_with_claim`]) of a stand-in agent in [`TAB`]
 /// holding `session`: its session file registered, its transcript
-/// `transcript`, its state what `st` makes of the stand-in's session file,
-/// its tab showing `screen` (`text --json`), `targets` the builds on offer,
-/// and the agent its shell's foreground job for `fg` job reads (then
-/// suspended: a restart reached waits `changed` at its last look, nothing
-/// signalled).
+/// `transcript`, its state what `st` makes of the stand-in's session file, its
+/// tab showing `screen` (`text --json`), `targets` the builds on offer, and the
+/// agent its shell's foreground job (then suspended: a restart reached waits
+/// `changed` at its last look, nothing signalled).
 #[cfg(unix)]
 fn visit_at(
     label: &str,
@@ -392,8 +389,8 @@ fn logged_in_screen_json() -> String {
     screen_json(&logged_in_rows())
 }
 
-/// The owner's screen seq (its state's `last_seq`): a screen that has not moved
-/// since the state was written, as the owner's had not.
+/// The recorded screen seq (the state's `last_seq`): a screen that has not
+/// moved since the state was written.
 const OWNERS_SEQ: &str = r#""seq":766968"#;
 
 /// `screen` (`text --json`) at the owner's seq.
@@ -403,9 +400,12 @@ fn at_owners_seq(screen: String) -> String {
 
 /// The owner's state file with the stand-in's pid and start where 0.93.0's
 /// notice named the owner's (4205, `Thu Sep 24 04:27:57 2026`), and the
-/// stand-in's tab: every other byte as read.
+/// stand-in's tab and running build (the stand-in runs 1.0.0, and a record
+/// an older build wrote names its process by the build it was found behind):
+/// every other byte as read.
 fn owners_state_for(sf: &SessionFile) -> St {
     let text = OWNERS_STATE
+        .replace(r#""from":"2.1.281""#, r#""from":"1.0.0""#)
         .replace(
             r#""notice_pid":4205"#,
             &format!(r#""notice_pid":{}"#, sf.pid),
@@ -415,8 +415,8 @@ fn owners_state_for(sf: &SessionFile) -> St {
     St::from_json(&text).expect("the owner's state reads")
 }
 
-/// A state of the incident's upgrade: `phase`, the round's first `asks`
-/// markers typed, the notice's fences on the stand-in.
+/// A state of the recorded upgrade: `phase`, the round's first `asks` markers
+/// typed, the notice's fences on the stand-in.
 fn incident_state(phase: Phase, asks: usize) -> impl FnOnce(&SessionFile, u64) -> St {
     move |sf, now| {
         let asked: Vec<String> = LEDGER[..asks].iter().map(|(_, m)| m.to_string()).collect();
@@ -443,8 +443,8 @@ fn incident_state(phase: Phase, asks: usize) -> impl FnOnce(&SessionFile, u64) -
     }
 }
 
-/// The incident's rows up to the person's `/login` and its output: the
-/// login back, the agent not yet asked anything.
+/// The recorded rows up to the person's `/login` and its output: the login
+/// back, the agent not yet asked anything.
 fn up_to_the_login(upto: usize) -> String {
     let all = incident(INCIDENT_SESSION, upto, true);
     let cut = all
@@ -459,7 +459,7 @@ fn ts(epoch: u64) -> String {
     crate::harness::usage::rfc3339_utc(i64::try_from(epoch).expect("epoch"))
 }
 
-/// The unix second of one of the incident's stamps.
+/// The unix second of one of the recorded stamps.
 fn at(stamp: &str) -> u64 {
     crate::harness::upgrade_models::parse_utc(stamp).expect("a stamp")
 }
@@ -477,16 +477,15 @@ fn idle() -> Facts {
 
 // ---------------------------------------------------------------- the readers
 
-/// THE LOGIN FACT IS THE SUPERVISOR'S OWN READING, AND THE TRANSCRIPT'S: the
-/// incident's screen reads as the wall by the one recogniser the supervisor
-/// reads walls with; the transcript's last word on the login is Claude
-/// Code's `authentication_failed` row at every moment from 05:00:24 until the
-/// person's `Login successful` at 14:33:36 — which is when the wall LIFTED —
-/// and a turn the session's own model answers lifts it too. NEGATIVE
-/// CONTROLS: the screen once the login is back; the transcript before the
-/// wall, after the lift and after a model's answer; a synthetic row that is
-/// no login's (`No response requested.`, an overload); the wall's words in a
-/// subagent's row.
+/// The login fact is the supervisor's reading and the transcript's: the
+/// recorded screen reads as the wall by the supervisor's wall recogniser; the
+/// transcript's last word on the login is Claude Code's
+/// `authentication_failed` row from 05:00:24 until the person's
+/// `Login successful` at 14:33:36, when the wall lifted; a turn the session's
+/// model answers lifts it too. Negative controls: the screen once the login is
+/// back; the transcript before the wall, after the lift and after a model's
+/// answer; a synthetic row that is not a login's (`No response requested.`,
+/// an overload); the wall's words in a subagent's row.
 #[test]
 fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
     use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
@@ -517,7 +516,7 @@ fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
         "the gutter form"
     );
 
-    // The transcript, cut at each moment of the incident.
+    // The transcript, cut at each recorded moment.
     for upto in 0..=4 {
         let walled = incident(INCIDENT_SESSION, upto, false);
         assert!(upgrade::transcript_login_wall(&walled), "{upto} notices in");
@@ -567,7 +566,7 @@ fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
         Some(at("2026-09-27T09:00:05Z"))
     );
 
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     assert!(!upgrade::transcript_login_wall(""));
     let before = notification_row("2026-09-27T05:00:24.013Z", INCIDENT_SESSION);
     assert!(!upgrade::transcript_login_wall(&before));
@@ -586,9 +585,8 @@ fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
     );
 }
 
-/// The other session of 2026-09-27 (`07e2381c…`, tab `s-4906566e7ab0a0c15ee3`,
-/// Claude Code 2.1.283), its rows' shared keys: its home, branch and slug
-/// rewritten.
+/// A second recorded session (Claude Code 2.1.283): its rows' shared keys,
+/// home, branch and slug rewritten.
 fn keys_2_1_283(ts: &str) -> String {
     format!(
         r#""timestamp":"{ts}","userType":"external","entrypoint":"cli","cwd":"/Users//owner/aterm","sessionId":"{OTHER_SESSION}","version":"2.1.283","gitBranch":"main","slug":"rewritten-slug""#
@@ -598,10 +596,9 @@ fn keys_2_1_283(ts: &str) -> String {
 /// That session's conversation.
 const OTHER_SESSION: &str = "07e2381c-db77-4897-bfb1-0e1d5acd881d";
 
-/// A local command's row as Claude Code 2.1.283 writes it (measured
-/// 2026-09-27, 14:33:54 UTC, that session's `/login`): a `system` row,
-/// `subtype` `local_command`, the text in a TOP-LEVEL `content` — not the
-/// `user` row, caveat first, 2.1.281 wrote in the incident's session.
+/// A local command's row as Claude Code 2.1.283 writes it: a `system` row,
+/// `subtype` `local_command`, the text in a top-level `content`, not the
+/// caveat-first `user` row 2.1.281 writes.
 fn local_command_2_1_283(ts: &str, content: &str, run: bool) -> String {
     let run = if run {
         r#""commandRun":{"command":"login","args":""},"#
@@ -615,16 +612,14 @@ fn local_command_2_1_283(ts: &str, content: &str, run: bool) -> String {
     )
 }
 
-/// THE LOGIN AS CLAUDE CODE 2.1.283 WRITES IT LIFTS THE WALL — the build the
-/// upgrade moves sessions ONTO (measured 2026-09-27 in the owner's other
-/// session, `07e2381c…`, 14:33:45-14:34:11 UTC): the wall as 2.1.281 writes
-/// it (`authentication_failed`, `Not logged in · Please run /login`), then the
-/// person's `/login` and `Login successful` as two `system` / `local_command`
-/// rows with a top-level `content` (no `user` row), then — nothing typed —
-/// the model answering the prompt the wall had answered. The login is back at
-/// the `Login successful` row, not at the model's answer 17 s later (a
-/// session whose pending prompt is not asked again has no such answer).
-/// NEGATIVE CONTROL: another local command's output lifts nothing.
+/// The login as Claude Code 2.1.283 writes it lifts the wall: the wall
+/// (`authentication_failed`, `Not logged in · Please run /login`), then the
+/// person's `/login` and `Login successful` as two `system`/`local_command`
+/// rows with a top-level `content`, then, nothing typed, the model answering
+/// the prompt the wall had answered. The login is back at `Login successful`,
+/// not at the model's answer (a session whose pending prompt is not asked
+/// again has none). Negative control: another local command's output lifts
+/// nothing.
 #[test]
 fn the_login_as_2_1_283_writes_it_lifts_the_wall() {
     let asked = format!(
@@ -655,7 +650,7 @@ fn the_login_as_2_1_283_writes_it_lifts_the_wall() {
         upgrade::login_lifted_at(&logged_in),
         Some(at("2026-09-27T14:33:54Z"))
     );
-    // NEGATIVE CONTROL: another command's output.
+    // Negative control: another command's output.
     let other = walled
         + &local_command_2_1_283(
             "2026-09-27T14:33:54.544Z",
@@ -667,18 +662,17 @@ fn the_login_as_2_1_283_writes_it_lifts_the_wall() {
     assert_eq!(upgrade::login_lifted_at(&other), None);
 }
 
-/// WHICH NOTICE REACHED THE MODEL: over the incident's rows, every one of the
-/// four notices' own turn was the login wall's — undelivered, before the
-/// login and after it (the model's READY at 14:34 answered the last notice
-/// as history, in the turn the owner's `continue` began). NEGATIVE CONTROLS:
-/// a notice the model answered, one nothing has answered yet, and a marker
-/// the tail holds no notice of (`None`: too short to judge).
+/// Which notice reached the model: over the recorded rows, each of the four
+/// notices' own turn was the login wall's, before the login and after it (the
+/// model's later READY answered the last notice as history). Negative
+/// controls: a notice the model answered, one nothing has answered yet, and a
+/// marker the tail holds no notice of (`None`: too short to judge).
 #[test]
 fn a_notice_answered_only_by_the_wall_never_reached_the_model() {
     for upto in 1..=4 {
         let tail = incident(INCIDENT_SESSION, upto, false);
         for (_, marker) in &LEDGER[..upto] {
-            assert!(upgrade::notice_undelivered(&tail, marker), "{marker}");
+            assert_eq!(upgrade::notice_fate(&tail, marker), Some(true), "{marker}");
         }
     }
     let whole = incident(INCIDENT_SESSION, 4, true);
@@ -734,12 +728,12 @@ fn a_notice_answered_only_by_the_wall_never_reached_the_model() {
 
 // ---------------------------------------------------------------- the reducer
 
-/// A SESSION AT THE LOGIN WALL IS NEVER ASKED, AND NOTHING OF THE UPGRADE'S IS
-/// SPENT THERE: every gate waits `login` — the owner's `--now` and a break of
-/// the agent's background work included — no re-ask, no give-up, no void and
-/// no restart is taken, and an announced upgrade's clock (and the READY's)
-/// restarts at every look that finds the wall. NEGATIVE CONTROLS: the same
-/// facts off the wall take each of those steps.
+/// A session at the login wall is never asked, and nothing of the upgrade's
+/// is spent there: every gate waits `login` (the owner's `--now` and a break
+/// of background work included), with no re-ask, give-up, void or restart, and
+/// an announced upgrade's clock (and the READY's) restarts at every look that
+/// finds the wall. Negative controls: the same facts off the wall take each of
+/// those steps.
 #[test]
 fn a_session_at_the_login_wall_is_never_asked_and_no_clock_runs() {
     let wall = Facts {
@@ -801,8 +795,8 @@ fn a_session_at_the_login_wall_is_never_asked_and_no_clock_runs() {
         }
     );
     assert_eq!(ready_since(50, true, &wall, 90), 90);
-    // NEGATIVE CONTROLS: off the wall the same looks ask, re-ask, give up,
-    // end and void, and the clocks run.
+    // Negative controls: off the wall the same looks ask, re-ask, give up, end
+    // and void, and the clocks run.
     let free = idle();
     assert_eq!(
         next_step(&Phase::Pending, &free, false, later),
@@ -820,13 +814,11 @@ fn a_session_at_the_login_wall_is_never_asked_and_no_clock_runs() {
     assert_eq!(ready_since(50, true, &free, 90), 50);
 }
 
-/// AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK the wall and the refund hold
-/// too. Main's break now re-asks, and gives up past the last ask, wherever a
-/// notice's window has run out (the orphaned-background fix of 2026-09-27):
-/// a break at the login wall still waits `login` — no give-up there — and a
-/// notice the wall answered is typed again as the same ask, never given up
-/// on. NEGATIVE CONTROL: the same break with the last notice read and
-/// unanswered gives up.
+/// At a break of the agent's background work the wall and the refund hold
+/// too: a break re-asks, and gives up past the last ask, wherever a notice's
+/// window has run out, but at the login wall it still waits `login`, and a
+/// notice the wall answered is typed again as the same ask. Negative control:
+/// the same break with the last notice read and unanswered gives up.
 #[test]
 fn a_break_of_background_work_spends_nothing_at_the_login_wall() {
     let at_break = Facts {
@@ -851,23 +843,21 @@ fn a_break_of_background_work_spends_nothing_at_the_login_wall() {
     };
     assert_eq!(next_step(&tired, &unread, false, late), Step::Announce);
     assert_eq!(announce_asks(&tired, true), MAX_ASKS, "the same ask");
-    // NEGATIVE CONTROL.
+    // Negative control.
     assert_eq!(next_step(&tired, &at_break, false, late), Step::GiveUp);
 }
 
-/// A NOTICE THE WALL ANSWERED SPENT NO ASK: its upgrade types it again at the
-/// first point a notice could be — without waiting out its window, and never
-/// giving up on it — as the same ask (the same READY marker); a READY that
-/// came first still wins, and the wall still waits. An upgrade that GAVE UP
-/// on such notices (0.93.0's, the owner's state) is asked about as the
-/// upgrade it would have been had they spent no ask ([`upgrade::rearmed`]):
-/// pending when none reached the model — the incident's four, counted over
-/// the round's markers as 0.93.0 minted them — else announced with the asks
-/// that did, its window run out, its next notice the next ask. NEGATIVE
-/// CONTROLS: a notice the model received waits its window and is given up
-/// on after the last ask; a give-up whose last notice the model received, or
-/// that received every one, stays given up; a stop for any other reason
-/// stays stopped.
+/// A notice the wall answered spent no ask: its upgrade types it again at the
+/// first point a notice could be, without waiting out its window or giving up,
+/// as the same ask (the same READY marker); a READY that came first still wins,
+/// and the wall still waits. An upgrade that gave up on such notices (the
+/// recorded 0.93.0 state) is treated as though they spent no ask
+/// ([`upgrade::rearmed`]): pending when none reached the model (counted over
+/// the round's markers), else announced with the asks that did, its window run
+/// out, its next notice the next ask. Negative controls: a notice the model
+/// received waits its window and is given up on after the last ask; a give-up
+/// whose last notice, or every notice, the model received stays given up; a
+/// stop for any other reason stays stopped.
 #[test]
 fn a_notice_the_wall_answered_spent_no_ask() {
     let unread = Facts {
@@ -890,7 +880,7 @@ fn a_notice_the_wall_answered_spent_no_ask() {
     assert_eq!(announce_asks(&fresh, true), 1);
     assert_eq!(announce_asks(&tired, true), MAX_ASKS);
     assert_eq!(announce_asks(&Phase::Pending, true), 1);
-    // The give-up taken back, over the incident's own rows.
+    // The give-up taken back, over the recorded rows.
     let to = Version::parse("2.1.283").expect("to");
     let round = upgrade::round_markers(INCIDENT_SESSION, &to, INCIDENT_SALT);
     assert_eq!(
@@ -948,7 +938,7 @@ fn a_notice_the_wall_answered_spent_no_ask() {
         next_step(&tired, &drafted, false, late),
         Step::Wait("draft")
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let read = idle();
     assert_eq!(
         next_step(&fresh, &read, false, soon),
@@ -971,17 +961,15 @@ fn a_notice_the_wall_answered_spent_no_ask() {
 
 // ---------------------------------------------------------------- the real visit
 
-/// THE INCIDENT THROUGH THE REAL VISIT (the driver's own `visit`, a parked
-/// stand-in agent, a stand-in instance serving the screens, the incident's
-/// rows as the transcript): at the wall nothing is typed — a pending upgrade
-/// and an announced one whose window ran out both wait `login`, and so does
-/// one whose screen no longer shows the wall (the `/login` dialog dismissed)
-/// while the transcript's last word on the login is still the wall. Once the
-/// login is back, the upgrade that had typed four notices into the wall
-/// types its last one again — ask 4, marker `12cbabd0`, the ledger saying
-/// why — instead of giving up (main: `gave-up`, then the release line typed
-/// into the wall). NEGATIVE CONTROL: had the model received that fourth
-/// notice, the same visit gives up.
+/// The recorded session through the real visit (the driver's `visit`, a parked
+/// stand-in agent, a stand-in instance serving the screens, the recorded rows
+/// as transcript): at the wall nothing is typed. A pending upgrade and an
+/// announced one whose window ran out both wait `login`, as does one whose
+/// screen no longer shows the wall while the transcript's last word on the
+/// login is still the wall. Once the login is back, the upgrade that typed four
+/// notices into the wall types its last one again (ask 4, marker `12cbabd0`,
+/// the ledger saying why) instead of giving up. Negative control: had the
+/// model received that fourth notice, the same visit gives up.
 #[cfg(unix)]
 #[test]
 fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
@@ -1075,7 +1063,7 @@ fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
         "{:?}",
         again.ledger
     );
-    // NEGATIVE CONTROL: the fourth notice answered by the model.
+    // Negative control: the fourth notice answered by the model.
     let read = up_to_the_login(4).replace(
         &auth_wall_row("2026-09-27T06:33:33.157Z", INCIDENT_SESSION),
         &model_row(
@@ -1085,7 +1073,7 @@ fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
             "end_turn",
         ),
     );
-    assert!(!upgrade::notice_undelivered(&read, LEDGER[3].1));
+    assert_eq!(upgrade::notice_fate(&read, LEDGER[3].1), Some(false));
     let gave_up = visit_at(
         "read",
         INCIDENT_SESSION,
@@ -1101,14 +1089,13 @@ fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
     );
 }
 
-/// A READY TO THE CURRENT MARKER AUTHORIZES THE RESTART, UNDER EVERY GATE, read
-/// by the real reader from the real transcript: the notice typed again once
-/// the login is back, the agent's `ATERM-UPGRADE-READY-12cbabd0` on a line by
-/// itself — the restart is taken (the stand-in's job read stops it just
-/// before the signal: `wait:changed-before-signal`, nothing signalled). A
-/// person's draft holds it (`draft`), and so does the wall coming back after
-/// the answer (`login`). NEGATIVE CONTROL: the READY quoted in a sentence is
-/// no answer.
+/// A READY to the current marker authorizes the restart under every gate, read
+/// by the real reader from the real transcript: the notice typed again once the
+/// login is back, the agent's `ATERM-UPGRADE-READY-12cbabd0` on a line by
+/// itself, and the restart is taken (the stand-in's job read stops it just
+/// before the signal: `wait:changed-before-signal`). A person's draft holds it
+/// (`draft`), and so does the wall returning after the answer (`login`).
+/// Negative control: the READY quoted in a sentence is no answer.
 #[cfg(unix)]
 #[test]
 fn a_ready_to_the_current_marker_restarts_under_every_gate() {
@@ -1203,7 +1190,7 @@ fn a_ready_to_the_current_marker_restarts_under_every_gate() {
         3,
     );
     assert_eq!(at_wall.step, "wait:login", "{at_wall:?}");
-    // NEGATIVE CONTROL: quoted, not answered.
+    // Negative control: quoted, not answered.
     let quoted = answered(&format!(
         "I will reply with {marker} once the build is done."
     ));
@@ -1220,19 +1207,13 @@ fn a_ready_to_the_current_marker_restarts_under_every_gate() {
     assert_eq!(waits.step, "wait:awaiting-ready", "{waits:?}");
 }
 
-/// THE STATE 0.93.0 LEFT IS READ AND RECOVERED: the owner's file, byte for
-/// byte, reads as the upgrade that gave up (`failed:unanswered`) with its
-/// last marker, its tab and its notice's fences, and writes back the same. A
-/// READY to its marker that came AFTER the give-up — the agent's, at 14:34,
-/// once the owner had logged in — is honoured: the restart is taken (a
-/// timeout is not a refusal). Where the owner spoke after that READY — as
-/// they did at 14:34:47 — the answer is spent, and the give-up is taken back
-/// all the same: none of its four notices reached the model (each one's own
-/// turn was the wall's, counted over the markers 0.93.0 minted), so it is
-/// asked again from its first ask — the round's notices found further back
-/// than the ordinary tail when the conversation has gone on past them. A
-/// newer target asks afresh, in a round of its own. NEGATIVE CONTROL: a
-/// give-up whose last notice the model received stays given up.
+/// A recorded state file of a given-up upgrade is read and recovered: it reads
+/// as `failed:unanswered` with its last marker, tab and fences, and writes
+/// back the same. A READY to its marker after the give-up is honoured. Where
+/// the owner spoke after that READY the give-up is still taken back (none of
+/// its notices reached the model), found further back than the ordinary tail
+/// when the conversation has gone on. A newer target asks afresh. Negative
+/// control: a give-up whose last notice the model received stays given up.
 #[cfg(unix)]
 #[test]
 fn the_state_0_93_0_left_is_read_and_recovered() {
@@ -1303,8 +1284,7 @@ fn the_state_0_93_0_left_is_read_and_recovered() {
         "{:?}",
         rearmed.ledger
     );
-    // The conversation gone on 400 KB past the notice (the owner's was 419 KB
-    // on by the time main read it): found further back.
+    // The conversation gone on 400 KB past the notice: found further back.
     let mut far = spoken.clone();
     let filler = model_row(
         "2026-09-27T15:00:00.000Z",
@@ -1354,7 +1334,7 @@ fn the_state_0_93_0_left_is_read_and_recovered() {
     );
     assert_ne!(saved.marker, LEDGER[3].1);
 
-    // NEGATIVE CONTROL: the last notice read by the model, no READY.
+    // Negative control: the last notice read by the model, no READY.
     let read = spoken.replace(
         &auth_wall_row("2026-09-27T06:33:33.157Z", INCIDENT_SESSION),
         &model_row(
@@ -1379,10 +1359,9 @@ fn the_state_0_93_0_left_is_read_and_recovered() {
     );
     assert_eq!(stays.step, "wait:failed", "{stays:?}");
     assert!(stays.typed.is_empty());
-    // And the same give-up AS 0.93.0 WROTE IT — no `failed_at`, a stop older
-    // than the stamp: NO STOP IS FOR GOOD (the owner, 2026-09-27), so it is
-    // re-armed at its first look — a new round, new markers, nothing typed
-    // at that look — not waited on as `failed` for ever.
+    // The same give-up as 0.93.0 wrote it (no `failed_at`, a stop older than
+    // the stamp): no stop is final, so it is re-armed at its first look (a new
+    // round, new markers, nothing typed at that look).
     let old = visit_at(
         "stays-unstamped",
         INCIDENT_SESSION,
@@ -1408,19 +1387,18 @@ fn the_state_0_93_0_left_is_read_and_recovered() {
     );
 }
 
-/// THE CLOCK IS HELD THROUGH THE WALL: a notice the model READ ten hours ago,
+/// The clock is held through the wall: a notice the model read ten hours ago,
 /// whose wind-down turn the login wall then answered, is not asked again the
-/// moment the login is back — its window starts at the lift the transcript
-/// records (`wait:awaiting-ready`). NEGATIVE CONTROL: the same notice with no
+/// moment the login is back; its window starts at the lift the transcript
+/// records (`wait:awaiting-ready`). Negative control: the same notice with no
 /// wall after it has run its window out and is asked again.
 #[cfg(unix)]
 #[test]
 fn the_clock_is_held_through_the_login_wall() {
     let now = now_s();
     let marker = LEDGER[0].1;
-    // The conversation has a task — a person's prompt before the notice, as
-    // the incident's had — or main's taskless rule restarts it afresh with
-    // no notice at all.
+    // The conversation has a task (a person's prompt before the notice), or
+    // the taskless rule would restart it afresh with no notice.
     let person = typed_row(
         &ts(now - 40_000),
         INCIDENT_SESSION,
@@ -1472,7 +1450,7 @@ fn the_clock_is_held_through_the_login_wall() {
         held.saved.expect("state").phase,
         Phase::Announced { at_s, asks: 1 } if at_s >= now - 60
     ));
-    // NEGATIVE CONTROL: no wall after it.
+    // Negative control: no wall after it.
     let read_only = [
         person,
         typed_row(
@@ -1506,11 +1484,10 @@ fn the_clock_is_held_through_the_login_wall() {
     assert_eq!(reasked.step, "announced:2", "{reasked:?}");
 }
 
-/// The notices queued behind the weekly limit, the same day: none typed
-/// behind the first, a copy typed again straight away at most
-/// `upgrade::REQUEUE_MAX` times and past that once per rest or on the
-/// owner's word, the give-up 0.93.0 spent on them rested and re-armed, and
-/// the Tier-1 bind of `harness_upgrade_limit_queue_model` — over this
-/// module's apparatus.
+/// The notices queued behind the weekly limit: none typed behind the first, a
+/// copy typed again straight away at most `upgrade::REQUEUE_MAX` times and
+/// past that once per rest or on the owner's word, a give-up spent on them
+/// rested and re-armed, and the Tier-1 bind of
+/// `harness_upgrade_limit_queue_model`, over this module's apparatus.
 #[path = "upgrade_queued_tests.rs"]
 mod queued;

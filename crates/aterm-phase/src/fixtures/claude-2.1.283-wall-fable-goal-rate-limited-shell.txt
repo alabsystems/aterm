@@ -1,0 +1,16 @@
+# claude-code 2.1.283 · HAND-BUILT 2026-09-28: the Fable bucket's row as 2026-09-26 MEASURED it (a `⎿` gutter row under a workflow-completion notice, idle-after-limit-and-model-switch.txt) followed by the /goal echo the 2.1.283 binary carries for a 429 with no account quota (`Goal paused · the request was rate limited · send a message to retry`, drawn as a `⏺` row in column 0 like the measured weekly echo), a done row counting a background shell, the bypass footer's `· 1 shell ·` · the model bucket's wall behind the goal echo and a shell
+⏺ The reviewers are out; nothing else can start until one returns.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+⏺ Dynamic workflow "Second review pass (read-only)" completed · 5s
+  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.
+
+⏺ Goal paused · the request was rate limited · send a message to retry
+
+✻ Churned for 0s · done 11:30 PM · 1 shell still running
+                                                                                 ◎ /goal active (1d)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xhigh ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage

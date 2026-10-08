@@ -5,11 +5,11 @@
 //! The temporal-model registry for `aterm-spec` — the build-gate opt-in target.
 //!
 //! This is aterm's adoption of Trust's build-time temporal gate (see Trust's
-//! `docs/TY_ANNOTATION_FEATURE.md`): `tcargo trust build` (and `tcargo trust
+//! `docs/TY_ANNOTATION_FEATURE.md`): `targo trust build` (and `targo trust
 //! temporal`) run this example as PART OF the build, model-checking every derived
 //! `Model` with the embedded ty checker and FAILING the build (nonzero exit) on
 //! any violated, vacuous, or undecidable verdict. It is also runnable directly as
-//! a CI/local backstop:
+//! a local backstop:
 //!
 //! ```text
 //! targo --unverified run -p aterm-spec --example trust_models
@@ -68,7 +68,7 @@ fn run_ty(ty: &PathBuf, spec: &PathBuf, cfg: &PathBuf) -> std::io::Result<String
     // `aterm_spec::verify::arm_whole_space_check`. This one reports verdicts a
     // human reads, which is exactly the audience a false "Proved" misleads.
     aterm_spec::verify::arm_whole_space_check(&mut cmd);
-    let out = cmd.output()?;
+    let out = aterm_spec::verify::ty_output(&mut cmd)?;
     Ok(format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

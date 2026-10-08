@@ -1,226 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W3 P2, P3 and the port itself — the seventy-one rows the winit port has to
-//! register, checked against the runtime's own authority instead of against a
-//! claim.
+//! Census of the rows `vendor/winit`'s macOS backend registers, checked
+//! against the runtime's own authority.
 //!
-//! # What changed when the fork was ported, and the number that went stale
-//!
-//! ALL SEVENTY-ONE ROWS are declared by [`aterm_objc::declare_class!`] today —
-//! 23 in `window_delegate.rs`, 43 in `view.rs`, 3 in `app_state.rs` and 2 in
-//! `window.rs`. One of them, `draggingEntered:`, was CORRECTED in the move.
-//! This header used to say "23 of the 72", which was true for exactly one wave
-//! and then quietly became the reason a reader would over-read the test at the
-//! bottom of this file; the count is asserted by
-//! [`the_table_still_covers_every_declared_method`] and stated here to match it.
-//!
-//! IT WAS SEVENTY-TWO UNTIL W12, and the 72nd was not product code: `app.rs`'s
-//! `TestApplication` declared a `sendEvent:` inside a `#[cfg(test)] mod tests`
-//! that this repository could never compile — `winit` is a path dependency and
-//! not a workspace member, so `cargo test -p winit` refuses outright. W12
-//! deletes that module rather than porting code no compiler ever sees, and
-//! [`the_swizzled_row_still_encodes_the_way_app_rs_types_it`] takes over the
-//! one thing its row was really buying: a reading of
-//! `-[NSApplication sendEvent:]`'s LIVE encoding against the type `app.rs`
-//! swizzles it with.
-//! So this file is no longer only a survey of a fork it does not touch: it is
-//! the census of a fork that is CONVERTED, and three things below keep it
-//! honest about that.
-//!
-//! * The staleness guard counts BOTH spellings (`#[method(…)]` and `@sel(…)`).
-//!   It did not, and the port made it go RED at 49 against 72 — which is the
-//!   guard working, and is why it now also asserts WHICH file is ported. It is
-//!   a COUNT, and W3 phase 3 found out what a count cannot see: every one of
-//!   the seventy-two `site:` pointers was stale by 30-85 lines while the count
-//!   was green, because the port added lines above the declarations without
-//!   adding or removing any. [`every_site_points_at_the_line_that_declares_it`]
-//!   is the other axis — it follows each pointer into the fork and requires the
-//!   line to declare that selector.
-//! * The disagreement set is now EMPTY, and an empty expectation is the weakest
-//!   form of that test. It keeps `checked == 70` so it cannot pass vacuously.
-//! * [`the_ported_signatures_encode_to_the_authority`] re-derives 23 of those
-//!   71 rows from COMPILED Rust signatures — the same types the port writes,
-//!   through the same macro, read back out of the same runtime — so the `winit`
-//!   column below stops being the only witness for them. TWENTY-THREE, NOT
-//!   SEVENTY-ONE, and the reason is `PortedShapes`: the mirror class is written
-//!   in this file and mirrors `window_delegate.rs` alone. The other 48 ported
-//!   rows are covered on that axis by `objc_live_class_audit.rs`, which reads
-//!   the REGISTERED class instead of a mirror and is strictly the better
-//!   instrument — which is also why the mirror was never grown. The test
-//!   asserts that split rather than leaving it to be inferred.
-//!
-//! # THIS FILE IS A MIRROR, AND THE MIRROR IS NOT THE FORK
-//!
-//! Read the previous bullet carefully, because for one wave it was read as more
-//! than it says. `PortedShapes` is declared HERE, from signatures written HERE.
-//! It proves that `aterm_objc::declare_class!` turns those Rust types into
-//! those encodings; it proves NOTHING about the class `vendor/winit` actually
-//! registers, and this file never loads that class. Two compile-verified plants
-//! settled what the gap is worth — an argument in `windowDidResize:` retyped
-//! `Id` -> [`Bool`] (registering `v@:B` where `NSWindowDelegate` says `v@:@`),
-//! and `NSWindowDelegate` deleted from the fork's `protocols:` list. Each left
-//! `cargo build -p aterm-gui` at exit 0 and THIS FILE at 6/6, and the first one
-//! also left a driven event log byte-identical to clean head, because AppKit
-//! reaches a delegate row by direct `objc_msgSend` and that body never reads
-//! its argument.
-//!
-//! What closes it is `crates/aterm-gui/examples/objc_live_class_audit.rs`: it
-//! enumerates `class_copyMethodList` on the class AppKit is holding as a real
-//! `NSWindow`'s delegate and finds each row's authority itself, so it has no
-//! list to go stale. The verify ladder runs it. It is an `[[example]]` because
-//! libtest cannot host AppKit — `pthread_main_np()` is 0 on every worker,
-//! `--test-threads=1` included — which is also why this file cannot simply be
-//! extended to do the job.
-//!
-//! The division of labour is deliberate and each half is load-bearing: the
-//! auditor checks SHAPES and CLAIMS on the live class and cannot see a method
-//! that was deleted; the staleness guard below counts the fork's own `@sel(` /
-//! `#[method(` sites against this table and can. Neither is a weaker version of
-//! the other.
-//!
-//! # Why a census and not a spot check
-//!
-//! W3's preconditions arrived as two assertions about `vendor/winit`'s five
-//! declared classes: that no declared method takes a block (so the missing
-//! `"@?"` encoding does not block the port), and that `draggingEntered:` is the
-//! ONE row whose registered encoding disagrees with the protocol it
-//! implements. Both are
-//! statements about all seventy-two methods, and neither can be settled by
-//! reading the one row you were told about — the failure mode of this whole
-//! campaign has been a guard armed at a spelling that occurs nowhere.
-//!
-//! THE LINE NUMBER LEFT THAT SENTENCE IN W8, and the reason is the point of
-//! [`every_site_points_at_the_line_that_declares_it`]. It read
-//! "`window_delegate.rs:385`'s `draggingEntered:`" and the row in [`ROWS`] said
-//! `459` — the PROSE was stale by 74 lines and had been for two waves, while
-//! the machine-checked pointer beside it was green, because nothing follows a
-//! line number written in a doc comment. A pointer a test cannot follow is a
-//! pointer that will be wrong; the selector alone is stable and the table below
-//! is where the line lives.
-//!
-//! So every row is asked. The AUTHORITY is the live Objective-C runtime:
+//! [`ROWS`] lists every declared method (all seventy-one are declared with
+//! [`aterm_objc::declare_class!`]). Each row's authority is the live runtime:
 //! `protocol_getMethodDescription` for a delegate protocol,
-//! `class_getInstanceMethod` for an override of a real AppKit class. What the
-//! port WILL register is written beside it, derived from the Rust signature
-//! `vendor/winit` has today. The two are compared modulo the byte offsets
-//! `NSMethodSignature` recomputes anyway.
+//! `class_getInstanceMethod` for an override of an AppKit class. The `winit`
+//! column is the encoding the fork's Rust signature produces; the two are
+//! compared modulo byte offsets.
 //!
-//! # The verdict, and it is not what the precondition said
+//! Guards against staleness:
 //!
-//! * NO row takes a block, and none takes a bare C function pointer either —
-//!   so `"@?"` is not on the port's critical path. It is implemented anyway
-//!   ([`aterm_objc::BlockPtr`]), because "no site needs it" is a fact about
-//!   today and the tests below measure `@?` against Foundation's own
-//!   `enumerateLinesUsingBlock:` rather than against a table. W3 phase 3 asked
-//!   whether that earns its lines and answered in `block.rs`: 24 lines of code
-//!   under 84 of measurement, and the alternative spelling a port would reach
-//!   for without it (`*mut c_void`) is not neutral but WRONG — `^v`, a KVO
-//!   context pointer.
-//! * `draggingEntered:` WAS the only disagreeing row — a ONE-byte `BOOL` where
-//!   the framework reads an EIGHT-byte `NSDragOperation`. The port closed it
-//!   (`-> usize`), so the disagreement set is empty today. The measurement of
-//!   the defect stays, because deleting it with the defect would leave the next
-//!   reader with an assertion where there used to be evidence.
-//! * TWO rows have no authority anywhere in the runtime, and the count is a
-//!   CORRECTION. This bullet said THREE — `frameDidChange:`, `insertBackTab:`
-//!   and `cancelOperation:` — while the table three screens below already gave
-//!   `cancelOperation:` a `Proto("NSStandardKeyBindingResponding")` and carried
-//!   only TWO `Authority::None` rows. One branch, two files, contradictory
-//!   reasons: the W3 judge found the same sentence disagreeing with itself
-//!   inside `objc_live_class_audit.rs`, and this is the source it was copied
-//!   from.
+//! * [`the_table_still_covers_every_declared_method`] counts `@sel(…)` /
+//!   `#[method(…)]` sites in the fork against the table.
+//! * [`every_site_points_at_the_line_that_declares_it`] follows each `site:`
+//!   into the fork and requires that line to declare the selector.
+//! * [`the_ported_signatures_encode_to_the_authority`] re-derives the
+//!   `window_delegate.rs` rows from compiled Rust signatures through a mirror
+//!   class declared here.
 //!
-//!   The runtime's own answer, now MEASURED on every run by
-//!   [`the_key_binding_family_is_measured_not_asserted`] rather than asserted
-//!   here: NOTHING ON `WinitView`'S CHAIN — not `NSView`, not `NSResponder`,
-//!   not `NSObject` — implements any of `insertTab:`, `insertBackTab:` and
-//!   `cancelOperation:`, so not one of the three is an override of anything;
-//!   and `NSStandardKeyBindingResponding` DECLARES `insertTab:` and
-//!   `cancelOperation:` (`v@:@` both) but NOT `insertBackTab:`. So the rows
-//!   nothing declares are `frameDidChange:` and `insertBackTab:`, and the
-//!   asymmetry is in AppKit's own headers rather than in this fork.
+//! This file is a mirror, not the fork: it never loads the class `vendor/winit`
+//! registers. `crates/aterm-gui/examples/objc_live_class_audit.rs` (an
+//! `[[example]]`, since libtest cannot host AppKit) enumerates the registered
+//! classes and finds each row's authority, but cannot see a deleted method;
+//! the count here can.
 //!
-//!   THE WIDTH OF THAT SENTENCE IS ITSELF A CORRECTION. Both this census and
-//!   the live-class auditor used to say "no loaded class implements any of
-//!   them", on the strength of a check over TWO classes. Measured over all
-//!   26,318 classes loaded with AppKit: `insertTab:` has 3 implementations,
-//!   `cancelOperation:` has 7, `insertBackTab:` has 0. The derivation survives
-//!   because it never needed the runtime-wide claim — it needs the CHAIN to be
-//!   empty and the existing implementations to agree, and both are now
-//!   asserted at exactly that width.
+//! Findings pinned here: no row takes a block (`@?`) or a function pointer
+//! (`^?`); the disagreement set is empty (`draggingEntered:` returns
+//! `NSDragOperation`, `Q`); two rows have no runtime authority
+//! (`frameDidChange:`, `insertBackTab:`), and
+//! [`the_key_binding_family_is_measured_not_asserted`] checks why.
 //!
-//!   A row with no authority cannot be checked BY THIS FILE, which is a
-//!   statement about this census and not about the port: the live-class auditor
-//!   closes both of them by other means — a shape DERIVED from the two sibling
-//!   key-binding actions the protocol does declare for `insertBackTab:`, and a
-//!   compiled `method_encoding!` over the fork's own Rust types for
-//!   `frameDidChange:`. Until W3 phase 3 those two rows were the only ones in
-//!   the whole surface that nothing checked at all, and two compile-verified
-//!   plants (`insert_back_tab` retyped to take a `Bool`, and `frame_did_change`
-//!   retyped to RETURN one, on the resize hot path) passed every gate in the
-//!   tree.
-//!
-//! # AppKit is loaded on purpose
-//!
-//! `aterm-objc` links neither AppKit nor Foundation explicitly; Foundation
-//! arrives with std, AppKit does not, and `objc_getProtocol("NSWindowDelegate")`
-//! answers nil in a bare test process (measured). The census `dlopen`s AppKit,
-//! which is the whole of its dependency on it — no `objc2-app-kit`, no new
-//! third-party line.
-//!
-//! # A protocol the host may not register
-//!
-//! Loading AppKit does not register every protocol its headers declare: the
-//! runtime registers a protocol only from an image whose `__objc_protolist`
-//! carries it, and a framework carries only the protocols its compiled files
-//! adopt or name. `NSApplicationDelegate` is such a protocol on macOS 14.4.1
-//! (the 415 entries of AppKit's `__objc_protolist` do not include it; only
-//! SwiftUI's image carries it there) and a present one on the macOS 26 release
-//! cutter. The
-//! product supplies a NAME-ONLY protocol for it at declaration
-//! (`aterm_objc::protocol_or_register`), which is exactly why this census must
-//! never read such a protocol as an authority: it declares no methods. Rows
-//! whose authority the host lacks are reported as unchecked ON THIS HOST, and
-//! the set of protocols that may be lacking is written down (`HOST_MAY_LACK`)
-//! so a new absence still goes red. This generalisation used to be read the
-//! other way — "absent means AppKit did not load" — and it was that reading,
-//! asserted in the product, that killed v0.72.0 through v0.75.0 at launch on
-//! 14.4.1.
+//! The census `dlopen`s AppKit, since a bare test process does not load it.
+//! Some hosts' AppKit does not register every protocol it declares
+//! (`NSApplicationDelegate`); the product then supplies a name-only protocol
+//! with no methods, which is never an authority. Rows whose authority the host
+//! lacks are reported unchecked, and [`HOST_MAY_LACK`] names which protocols
+//! may be absent, so a new absence still fails.
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CString, c_void};
 
 use aterm_objc::{
     Bool, ClassType, Encode, class, declare_class, method_types, protocol, protocol_method_types,
     sel, sel_uncached, strip_method_offsets,
 };
 
-unsafe extern "C" {
-    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
-}
+#[path = "support/appkit.rs"]
+mod appkit;
+#[path = "support/winit_fork.rs"]
+mod winit_fork;
 
-/// `RTLD_LAZY`.
-const RTLD_LAZY: c_int = 0x1;
-
-/// Load AppKit into this test process, once.
-///
-/// Returns whether it is present. On a machine without AppKit the census has no
-/// authority to consult and says so loudly rather than passing vacuously.
-fn load_appkit() -> bool {
-    use std::sync::OnceLock;
-    static LOADED: OnceLock<bool> = OnceLock::new();
-    *LOADED.get_or_init(|| {
-        let path = CString::new("/System/Library/Frameworks/AppKit.framework/AppKit")
-            .expect("no interior NUL");
-        // SAFETY: `dlopen` with a valid C path and `RTLD_LAZY`; the handle is
-        // deliberately never closed — AppKit is process-lifetime once loaded,
-        // and the classes and protocols it registers are immortal.
-        let handle = unsafe { dlopen(path.as_ptr(), RTLD_LAZY) };
-        !handle.is_null()
-    })
-}
+use appkit::load_appkit;
+use winit_fork::{fork_backend, fork_sources};
 
 // ------------------------------------------------------------------ the table
 
@@ -249,27 +84,23 @@ struct Row {
     winit: &'static str,
 }
 
-/// Expand the one target-dependent letter. `BOOL` is `"B"` on arm64 and `"c"`
-/// on the x86_64 compat slice, so a table written with a literal `B` would be
-/// wrong on half of what aterm ships.
+/// Expand the one target-dependent letter: `BOOL` is `"B"` on arm64 and `"c"`
+/// on x86_64.
 fn expand(spec: &str) -> String {
     spec.replace('B', Bool::ENCODING)
 }
 
 /// Protocols a host's AppKit may not register although AppKit is loaded.
 ///
-/// Measured: macOS 14.4.1 registers none of these (`objc_getProtocol` is nil
-/// while `NSApplication` the class is present); the macOS 26 release cutter
-/// registers all of them. A row whose authority is on this list and absent is
-/// reported as unchecked on this host — never as agreement, never as a failure
-/// — and [`the_host_allowance_is_exactly_what_this_host_lacks`] keeps the list
-/// honest: an absent protocol NOT on it is a red census, by name.
+/// A row whose authority is on this list and absent is reported unchecked on
+/// this host, never as agreement or failure.
+/// [`the_host_allowance_is_exactly_what_this_host_lacks`] makes an absent
+/// protocol not on the list fail by name.
 const HOST_MAY_LACK: &[&str] = &["NSApplicationDelegate"];
 
-/// Whether the HOST's own frameworks registered `name`: false when it is
-/// absent, and false when the only object under that name is the name-only one
-/// `aterm_objc` supplied (which a test in this process may have provoked by
-/// declaring a class that claims it).
+/// Whether the host's own frameworks registered `name`: false when absent, or
+/// when the only object under that name is the name-only one `aterm_objc`
+/// supplied.
 fn host_registers(name: &str) -> bool {
     let p = protocol(static_cstr(name));
     !p.is_null()
@@ -285,17 +116,14 @@ enum Reading {
     /// Nothing in the runtime declares it (an [`Authority::None`] row); the
     /// string is the written reason.
     NoAuthority(&'static str),
-    /// The authority is a protocol THIS HOST's AppKit does not register, so
-    /// there is nothing to read; the string is the protocol.
+    /// The authority is a protocol this host's AppKit does not register; the
+    /// string is the protocol.
     HostLacksProtocol(&'static str),
 }
 
-/// The rows a host may leave unchecked, and the proof that it is exactly them.
-///
-/// Either the host registers every protocol in [`HOST_MAY_LACK`] and the list
-/// is empty, or the list is precisely the rows whose authority it lacks — the
-/// application delegate's three — printed, so a transcript from such a host
-/// says what it did not check.
+/// Asserts the unchecked rows are exactly the allowance: empty when the host
+/// registers every protocol in [`HOST_MAY_LACK`], otherwise precisely the rows
+/// whose authority it lacks (printed).
 fn assert_host_lacking_is_the_allowance(host_lacking: &[(&str, &str, &str)]) {
     let expected: Vec<(&str, &str, &str)> = ROWS
         .iter()
@@ -327,12 +155,8 @@ fn assert_host_lacking_is_the_allowance(host_lacking: &[(&str, &str, &str)]) {
     }
 }
 
-/// The seventy-two rows, in source order per file.
-///
-/// Regenerating this table is `grep -n '#\[method' vendor/winit/src/
-/// platform_impl/macos/{app_state,window,app,window_delegate,view}.rs`, and
-/// `the_table_still_covers_every_declared_method` re-counts it on every run so
-/// it cannot silently go stale against the fork.
+/// The declared rows, in source order per file.
+/// [`the_table_still_covers_every_declared_method`] re-counts them each run.
 #[rustfmt::skip]
 const ROWS: &[Row] = &[
     // ---- ApplicationDelegate : NSObject <NSApplicationDelegate>
@@ -361,8 +185,7 @@ const ROWS: &[Row] = &[
     Row { site: "window_delegate.rs:460", sel: "windowDidFailToEnterFullScreen:",    authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
     Row { site: "window_delegate.rs:484", sel: "windowDidChangeOcclusionState:",     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
     Row { site: "window_delegate.rs:493", sel: "windowDidChangeScreen:",             authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    // THE ONE ROW THAT USED TO DISAGREE. `-> bool` where NSDraggingDestination
-    // declares NSDragOperation — CLOSED by the port: it is `-> usize` now.
+    // Returns `NSDragOperation` (`usize`), as `NSDraggingDestination` declares.
     Row { site: "window_delegate.rs:533", sel: "draggingEntered:",                   authority: Authority::Proto("NSDraggingDestination"), winit: "Q@:@" },
     Row { site: "window_delegate.rs:552", sel: "prepareForDragOperation:",           authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
     Row { site: "window_delegate.rs:559", sel: "performDragOperation:",              authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
@@ -415,12 +238,8 @@ const ROWS: &[Row] = &[
     Row { site: "view.rs:1037", sel: "acceptsFirstMouse:",           authority: Authority::Class("NSView"), winit: "B@:@" },
 ];
 
-/// A `&'static CStr` from a table entry.
-///
-/// `class` and `protocol` take `&'static CStr` because every real call site
-/// writes a `c"…"` literal; a census reads its names out of a table, so it
-/// leaks seventy-two small allocations for the life of the test process. That
-/// is the cheapest honest bridge and it stays in the test.
+/// A `&'static CStr` from a table entry. `class` and `protocol` take
+/// `&'static CStr`, so the census leaks one small allocation per name.
 fn static_cstr(name: &str) -> &'static std::ffi::CStr {
     Box::leak(
         CString::new(name)
@@ -435,9 +254,8 @@ fn authority_encoding(row: &Row) -> Reading {
     let raw = match row.authority {
         Authority::Proto(name) => {
             if !host_registers(name) {
-                // Absence has two causes and only one is an allowance: AppKit
-                // not being loaded makes every census here vacuous, and is
-                // told apart by a class AppKit always registers.
+                // Absence is an allowance only if AppKit is loaded, told apart
+                // by a class AppKit always registers.
                 assert!(
                     !class(c"NSApplication").is_null(),
                     "AppKit did not load, so this census would pass vacuously"
@@ -453,9 +271,8 @@ fn authority_encoding(row: &Row) -> Reading {
             let p = protocol(static_cstr(name));
             // SAFETY: `p` is a live protocol object the host registered.
             let Some(t) = (unsafe { protocol_method_types(p, s, true) }) else {
-                // A REAL protocol that does not declare the row is a census
-                // failure, never a skip: the table says this protocol is the
-                // authority and the runtime says it is not.
+                // A real protocol that does not declare the row is a census
+                // failure, never a skip.
                 panic!(
                     "{} {}: {name} is registered by this host and does not declare it",
                     row.site, row.sel
@@ -479,23 +296,10 @@ fn authority_encoding(row: &Row) -> Reading {
 
 // --------------------------------------------------------------------- tests
 
-/// Count the DECLARATION sites in one of the fork's files.
-///
-/// Both spellings, because the fork is mid-port: objc2's `#[method(…)]` and
-/// `#[method_id(…)]` for the files still on it, `aterm_objc`'s `@sel(…)` for the
-/// ported ones. Counting only the first would make this guard shrink silently
-/// as files move, which is exactly what it did when `window_delegate.rs` landed
-/// (49 against 72, RED).
-///
-/// ONLY AT THE START OF A LINE, and that is a CORRECTION. The count used to be
-/// `src.matches("#[method_id(")` over the whole file, which counts the token
-/// wherever it appears — including inside a comment. `view.rs`'s port added two
-/// `LOCAL PATCH` notes explaining what objc2's `#[method_id(…)]` used to do with
-/// an object return, and this guard went RED at 74 against 72 for a file that
-/// had converted 43 rows into 43 rows. A guard a comment can move is a guard
-/// that will drift, and the fix belongs here rather than in the prose: a
-/// declaration attribute is always the first token on its line, and nothing
-/// else is.
+/// Count the declaration sites in one of the fork's files: objc2's
+/// `#[method(…)]` / `#[method_id(…)]` and `aterm_objc`'s `@sel(…)`, only at
+/// the start of a line so a mention in a comment (such as a `LOCAL PATCH`
+/// note) does not count.
 fn declaration_sites(src: &str) -> usize {
     src.lines()
         .map(str::trim_start)
@@ -503,22 +307,6 @@ fn declaration_sites(src: &str) -> usize {
             l.starts_with("#[method(") || l.starts_with("#[method_id(") || l.starts_with("@sel(")
         })
         .count()
-}
-
-/// The fork's macOS backend, as a path this crate can read.
-///
-/// Factored out because THREE guards now read the fork rather than one, and a
-/// census whose file path is written three times is a census with three places
-/// to go stale.
-fn fork_backend() -> std::path::PathBuf {
-    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/winit/src/platform_impl/macos");
-    assert!(
-        base.is_dir(),
-        "the vendored winit macOS backend is not at {}",
-        base.display()
-    );
-    base
 }
 
 /// The declaration a line makes, if it makes one: the selector inside
@@ -532,26 +320,9 @@ fn declared_selector(line: &str) -> Option<&str> {
     rest.split(')').next()
 }
 
-/// EVERY `site:` points at the line that declares that selector.
-///
-/// # The rot this closes, which the counting guard structurally could not see
-///
-/// `site:` is this table's only pointer back into the fork — it is what a
-/// reader follows to check a row, and what a reviewer follows to judge one. All
-/// seventy-two of them were stale by 30-85 lines when the W3 judge checked
-/// them: `view.rs:538`, given as `insertBackTab:`, was a BLANK LINE;
-/// `view.rs:376`, given as `firstRectForCharacterRange:actualRange:`, was a
-/// comment; `view.rs:159`, given as `isFlipped`, was module prose 41 lines
-/// above the class. Every one of them still passed
-/// [`the_table_still_covers_every_declared_method`], because that guard COUNTS
-/// declaration sites and a count cannot see where they are.
-///
-/// So this is not a stronger version of that guard, it is the other axis of the
-/// same question, and it is the cheap one: read the line the row names and
-/// require it to be that row's declaration. It goes RED on the first line
-/// inserted above a declaration, which is exactly how the last set rotted — 43
-/// rows moved by 41 lines when the port added a doc comment and a `protocols:`
-/// line to `view.rs`'s class header, and nothing said a word.
+/// Every `site:` points at the line that declares that selector. The count
+/// guard cannot see where declarations are, so a line inserted above one is
+/// caught only here.
 #[test]
 fn every_site_points_at_the_line_that_declares_it() {
     let base = fork_backend();
@@ -587,32 +358,12 @@ fn every_site_points_at_the_line_that_declares_it() {
     assert_eq!(checked, 71, "every row's site was followed, none skipped");
 }
 
-/// The key-binding family, MEASURED — because the reason two rows carry is
-/// otherwise a claim about AppKit's headers.
-///
-/// `insertBackTab:` is one of the two rows in this census with no authority,
-/// and the reason written beside it is a statement about the runtime: that
-/// `NSStandardKeyBindingResponding` declares its two siblings and not it, and
-/// that nothing on the view's chain implements any of the three. The W3 judge
-/// found the PROSE version of that statement wrong in two places at once — the
-/// module docs above said three rows had no authority when the table said two,
-/// and `objc_live_class_audit.rs` said "NSResponder implements it but declares
-/// it nowhere", which is false in both halves. A sentence cannot be trusted to
-/// stay true about a framework it does not read.
-///
-/// A LATER JUDGE FOUND THE REPLACEMENT SENTENCE WRONG TOO, in the other
-/// direction: "no loaded class implements any of them" was measured over two
-/// classes and is false over 26,318 (3 implement `insertTab:`, 7 implement
-/// `cancelOperation:`). The lesson is the same one and it is why this test now
-/// checks BOTH halves the derivation actually rests on — an empty chain, and
-/// agreement among the implementations that do exist — instead of one claim
-/// about the whole runtime.
-///
-/// This reads it. It is also the derivation the live-class auditor stands on:
-/// having measured that AppKit declares `v@:@` for the two siblings it does
-/// declare, the auditor holds `insertBackTab:` to that same string, and a plant
-/// that retyped its argument to `Bool` — registering `v@:B` where the
-/// key-binding dispatch passes an object — goes RED there.
+/// Measures the key-binding facts behind the `insertBackTab:` row:
+/// `NSStandardKeyBindingResponding` declares `insertTab:` and
+/// `cancelOperation:` (`v@:@`) but not `insertBackTab:`; nothing on the view's
+/// superclass chain implements any of the three; and the implementations that
+/// do exist elsewhere agree with the protocol. The live-class auditor holds
+/// `insertBackTab:` to the siblings' `v@:@`.
 #[test]
 fn the_key_binding_family_is_measured_not_asserted() {
     assert!(
@@ -627,10 +378,9 @@ fn the_key_binding_family_is_measured_not_asserted() {
     let mut sibling = None;
     for name in ["insertTab:", "cancelOperation:"] {
         let s = sel_uncached(static_cstr(name));
-        // SAFETY: `p` is a live protocol object, asserted non-null, and `s` is
-        // a live selector. The `true` is INSTANCE-versus-class; the required
-        // and optional tables are both consulted inside, which is what finds
-        // these two — they are `@optional`.
+        // SAFETY: `p` is a live protocol object (asserted non-null) and `s` a
+        // live selector. `true` means instance methods; both the required and
+        // optional tables are searched (these rows are `@optional`).
         let types = unsafe { protocol_method_types(p, s, true) }
             .unwrap_or_else(|| panic!("NSStandardKeyBindingResponding declares {name}"));
         let types = strip_method_offsets(&types);
@@ -641,13 +391,11 @@ fn the_key_binding_family_is_measured_not_asserted() {
         }
     }
 
-    // And the one it does NOT declare. This is the asymmetry the exemption
-    // exists for; if AppKit ever adds it, this goes RED and the row stops
-    // needing to be derived at all.
+    // The one it does not declare. If AppKit adds it, this fails and the row
+    // no longer needs a derived shape.
     let back_tab = sel_uncached(c"insertBackTab:");
-    // SAFETY: `p` is live and `back_tab` is a live selector. Asked as an
-    // instance method and then as a class one, so "not declared" means not
-    // declared in either of the protocol's four tables.
+    // SAFETY: `p` is live and `back_tab` a live selector. Asked as instance and
+    // class method, so "not declared" covers all four tables.
     for instance in [true, false] {
         assert!(
             unsafe { protocol_method_types(p, back_tab, instance) }.is_none(),
@@ -658,24 +406,10 @@ fn the_key_binding_family_is_measured_not_asserted() {
         );
     }
 
-    // NONE OF THE THREE IS ON THIS VIEW'S CHAIN, which is the half that
-    // matters and the half this test used to overstate.
-    //
-    // The comment and the assertion here both said "no loaded class implements
-    // any of them", from a check over TWO classes. That is FALSE and the
-    // auditor repeated it: measured over all 26,318 classes loaded with AppKit,
-    // `insertTab:` has THREE implementations (NSCollectionView,
-    // NSColorPickerPencilView, NSTextView) and `cancelOperation:` has SEVEN
-    // (NSWindow, NSTableView, NSPopover, _NSPopoverWindow,
-    // _NSDatePickerOverlayPanel, NSTitlebarRenamingSession,
-    // NSVisualTabPickerRootView). Only `insertBackTab:` has none.
-    //
-    // What the derivation actually needs is that NOTHING ON `WinitView`'s
-    // SUPERCLASS CHAIN implements any of the three — otherwise the row would
-    // have a real inherited authority and would not need a derived one — and
-    // that every implementation that does exist AGREES on the shape. Both are
-    // asserted below, at the width they are true at. `class_getInstanceMethod`
-    // walks the chain, so asking these three classes IS asking the chain.
+    // None of the three is on `WinitView`'s superclass chain (otherwise the row
+    // would have a real inherited authority). `class_getInstanceMethod` walks
+    // the chain, so asking these classes asks the chain. Other classes do
+    // implement `insertTab:` and `cancelOperation:`; see below.
     for class_name in ["NSView", "NSResponder", "NSObject"] {
         let c = class(static_cstr(class_name));
         assert!(!c.is_null(), "{class_name} is present");
@@ -691,10 +425,8 @@ fn the_key_binding_family_is_measured_not_asserted() {
         }
     }
 
-    // And the other half: every implementation ANYWHERE agrees with the
-    // protocol's own declaration, which is what makes the sibling shape usable
-    // for a row that has no declaration. Measured over the classes that do
-    // implement them rather than asserted about the runtime at large.
+    // Every implementation that exists agrees with the protocol's declaration,
+    // which is what makes the sibling shape usable for the undeclared row.
     for (name, implementors) in [
         (
             "insertTab:",
@@ -726,12 +458,8 @@ fn the_key_binding_family_is_measured_not_asserted() {
     }
 }
 
-/// The table has not gone stale against the fork it describes.
-///
-/// A hand-written census is worth exactly what its staleness guard is worth, so
-/// the count is re-derived from `vendor/winit`'s own source on every run. The
-/// path is relative to this crate's manifest; if the fork ever moves, this
-/// fails loudly rather than checking nothing.
+/// The table has not gone stale against the fork it describes; the count is
+/// re-derived from `vendor/winit`'s source. A moved fork fails loudly.
 #[test]
 fn the_table_still_covers_every_declared_method() {
     let base = fork_backend();
@@ -755,11 +483,7 @@ fn the_table_still_covers_every_declared_method() {
     );
     assert_eq!(ROWS.len(), 71);
 
-    // And the port's own progress, stated as a number rather than implied: ALL
-    // 71 are declared by `aterm_objc::declare_class!` today — 23 in
-    // `window_delegate.rs`, 43 in `view.rs`, 3 in `app_state.rs` and 2 in
-    // `window.rs`. This is the pair that moves as each further file is ported,
-    // and that would catch a file half-converted.
+    // Per-file counts of `@sel(…)` rows, so a half-converted file is caught.
     let mut ported_total = 0;
     for (file, want) in [
         ("window_delegate.rs", 23),
@@ -782,24 +506,9 @@ fn the_table_still_covers_every_declared_method() {
     }
     assert_eq!(ported_total, 71, "all 71 rows are declared by aterm_objc");
 
-    // THE EXCEPTION THAT USED TO BE HERE IS GONE, and its shape is worth
-    // keeping because the reason it was an exception is the reason it was
-    // deleted rather than ported. `app.rs` declared a 72nd row — `sendEvent:`
-    // on a `TestApplication` inside `#[cfg(test)] mod tests`, with a `todo!()`
-    // body — and porting it would have moved NOTHING off objc2: the class does
-    // not exist in a shipping process, so no live-class audit can ever read it.
-    // It could not even be COMPILED here: `winit` is a path dependency and not
-    // a workspace member, so `cargo test -p winit` answers *"package `winit`
-    // cannot be tested because it requires dev-dependencies and is not a member
-    // of the workspace"*. W12 deleted the module, and what `app.rs` really
-    // ships — a `method_setImplementation` swizzle of `-[NSApplication
-    // sendEvent:]` — is now covered by
-    // `the_swizzled_row_still_encodes_the_way_app_rs_types_it` below and by
-    // `objc_window_drive`'s IMP/`dladdr` stage.
-    //
-    // The assertion left behind is that app.rs declares NOTHING: if a row ever
-    // reappears there it is product code, and it owes a port, a table row and
-    // an audit target like every other one.
+    // `app.rs` declares no methods (it swizzles `-[NSApplication sendEvent:]`,
+    // covered by `the_swizzled_row_still_encodes_the_way_app_rs_types_it`). A
+    // declaration reappearing there owes a table row and an audit target.
     let app_src = std::fs::read_to_string(base.join("app.rs")).expect("the fork is readable");
     assert_eq!(
         declaration_sites(&app_src),
@@ -819,14 +528,9 @@ fn the_table_still_covers_every_declared_method() {
     }
 }
 
-/// P2 — NOT ONE of the seventy-two takes a block, or a C function pointer.
-///
-/// The proof is over the RUNTIME's encodings, not over a source grep: a block
-/// argument is `@?` and a function pointer is `^?` wherever it appears, so
-/// asking every authority for its own string and looking for those two letters
-/// settles it for the rows that HAVE an authority. The three that do not are
-/// named, and their winit signatures are `v@:@` — one object argument, no
-/// block.
+/// No row takes a block (`@?`) or a C function pointer (`^?`), checked over the
+/// runtime's encodings for every row with an authority; the rows without one
+/// are named.
 #[test]
 fn no_declared_winit_method_takes_a_block() {
     assert!(
@@ -867,9 +571,8 @@ fn no_declared_winit_method_takes_a_block() {
             row.sel
         );
     }
-    // The rows with no runtime authority, listed rather than hidden.
-    // Every row without an authority carries a written reason, and the SET is
-    // fixed: a new one appearing means a method the census cannot check.
+    // The rows with no runtime authority form a fixed set, each with a reason;
+    // a new one is a method the census cannot check.
     for (site, s, _, why) in &unchecked {
         assert!(
             !why.is_empty(),
@@ -888,19 +591,14 @@ fn no_declared_winit_method_takes_a_block() {
         ],
         "the set of rows no protocol or class declares changed"
     );
-    // And the rows whose protocol THIS HOST does not register: exactly the
-    // allowance, or nothing.
+    // Rows whose protocol this host does not register: exactly the allowance.
     assert_host_lacking_is_the_allowance(&host_lacking);
 }
 
-/// P2's other half — `@?` IS implemented, and correctly, measured against
-/// Foundation's own compiler-emitted signature.
-///
-/// `-[NSString enumerateLinesUsingBlock:]` is clang-compiled and registers
-/// `v24@0:8@?16`. A declared method taking [`aterm_objc::BlockPtr`] registers
-/// the same string, offset-free. The COUNTEREXAMPLE is in the same test: the
-/// spelling this crate would otherwise have used, `*mut c_void`, registers
-/// `^v` — an opaque caller-owned pointer where the runtime expects a block.
+/// `@?` is implemented correctly: a declared method taking
+/// [`aterm_objc::BlockPtr`] registers what `-[NSString
+/// enumerateLinesUsingBlock:]` does (`v24@0:8@?16`, offset-free), while
+/// `*mut c_void` registers `^v`.
 #[test]
 fn the_block_encoding_is_what_foundation_itself_emits() {
     let ns_string = class(c"NSString");
@@ -926,31 +624,14 @@ fn the_block_encoding_is_what_foundation_itself_emits() {
     assert_eq!(<aterm_objc::BlockPtr as Encode>::ENCODING, "@?");
 }
 
-/// P3 — the disagreement set, which the port has now EMPTIED.
+/// The set of rows whose registered encoding differs from the runtime's
+/// authority is empty.
 ///
-/// This test IS the counterexample: it does not assert "the port is right", it
-/// computes the set of rows whose registered encoding differs from the
-/// runtime's own authority and asserts what that set is. Last wave the answer
-/// was exactly `{draggingEntered:}`, and the doc said "fix that row and the
-/// assertion fails until the expectation is updated". THE ROW IS FIXED — it
-/// returns `usize` — so this is that update, and the expected set is now empty.
-///
-/// An empty expectation is the weakest form of this test, so it does not stand
-/// alone. `checked == 70` keeps it from passing vacuously, and
-/// [`the_ported_signatures_encode_to_the_authority`] below re-derives 23 of
-/// these 70 from COMPILED Rust signatures through the real macro and the real
-/// runtime, so a wrong type in those is caught by a second, independent
-/// instrument rather than by this table's transcription of it. For the other 47
-/// this test's transcription IS the only reading in this crate, and the second
-/// one lives in `crates/aterm-gui/examples/objc_live_class_audit.rs`.
-///
-/// The reading that can see a FRAMEWORK moving under `app.rs`'s swizzle used to
-/// be one of these rows and is now
-/// [`the_swizzled_row_still_encodes_the_way_app_rs_types_it`], which is
-/// strictly stronger: it derives the expected string from the same Rust type
-/// `app.rs` installs rather than from a transcription. The auditor's part A
-/// cannot make that comparison — for a `Rows::Patched` target it reads both
-/// sides off the same `Method` object.
+/// `checked == 70` keeps it from passing vacuously.
+/// [`the_ported_signatures_encode_to_the_authority`] re-derives the
+/// `window_delegate.rs` rows from compiled signatures; for the rest this
+/// table's transcription is the only reading here, and
+/// `objc_live_class_audit.rs` reads the registered classes.
 #[test]
 fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
     assert!(
@@ -995,9 +676,8 @@ fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
          x86_64 codegen below to show why that mattered"
     );
 
-    // And the size of the lie that WAS here, kept: one byte where eight are
-    // read. It is the reason the row moved, and deleting the measurement with
-    // the defect would leave the next reader with only an assertion.
+    // `draggingEntered:` once returned a one-byte `BOOL` where AppKit reads an
+    // eight-byte `NSDragOperation`.
     assert_eq!(size_of::<Bool>(), 1);
     assert_eq!(size_of::<usize>(), 8);
     assert_ne!(
@@ -1008,11 +688,9 @@ fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
     );
 }
 
-/// The allowance is exactly what this host lacks, in both directions: every
-/// protocol a row's authority names that this host does not register is on
-/// [`HOST_MAY_LACK`] — so a NEW absence is red, by name — and every name on
-/// the allowance is a real authority in the table, so it cannot outlive the
-/// rows it excuses.
+/// Every protocol a row names that this host does not register is on
+/// [`HOST_MAY_LACK`], and every name on the allowance is a real authority in
+/// the table.
 #[test]
 fn the_host_allowance_is_exactly_what_this_host_lacks() {
     assert!(load_appkit(), "AppKit must load for this to mean anything");
@@ -1095,25 +773,13 @@ declare_class! {
 // ------------------------------------------------- the ported signatures
 
 aterm_objc::declare_class! {
-    /// A MIRROR of `window_delegate.rs`'s 23 declared methods: the same
-    /// selectors, at the same Rust argument and return types the port writes.
+    /// A mirror of `window_delegate.rs`'s declared methods: the same selectors
+    /// at the same Rust argument and return types.
     ///
-    /// # Why a mirror and not the class itself
-    ///
-    /// `WinitWindowDelegate` is registered by `vendor/winit`, which depends on
-    /// THIS crate — a test here cannot instantiate it, and its Rust type is
-    /// `pub(crate)` to winit besides. So this class re-declares the 23
-    /// signatures and asks the runtime what THEY encode to.
-    ///
-    /// That closes a real gap and leaves a real one, and both should be said.
-    /// It CLOSES the gap between the [`ROWS`] table's `winit` column — which is
-    /// a human transcription — and what the Rust types actually produce: the
-    /// mirror is compiled, so `Id` vs `Bool` vs `usize` vs `*mut c_void` is
-    /// checked by the encoding machinery rather than by reading. It does NOT
-    /// prove that `window_delegate.rs` writes these same types; the only
-    /// instrument for that is the registered class in a process where a real
-    /// `WinitWindow` exists, which needs AppKit's main thread and so lives in
-    /// the wave's `[[example]]` driver, not in libtest.
+    /// `WinitWindowDelegate` itself lives in `vendor/winit` (which depends on
+    /// this crate) and cannot be instantiated here. The mirror checks that the
+    /// Rust types produce the right encodings, not that `window_delegate.rs`
+    /// writes those types; the live-class auditor covers that.
     struct PortedShapes: NSObject {
         const NAME: &str = "ATermW3PortedShapes";
         type Ivars = ();
@@ -1206,33 +872,14 @@ aterm_objc::declare_class! {
     }
 }
 
-/// Every one of `window_delegate.rs`'s signatures encodes to what the runtime's
-/// own authority declares — read off a REGISTERED class, not off the table.
+/// Every `window_delegate.rs` signature, declared on [`PortedShapes`], encodes
+/// to what the runtime's authority declares (read off the registered mirror
+/// class, not the table).
 ///
-/// This is the instrument that would have caught the P3 defect at the moment it
-/// was written, and it is the one that catches its successor: pick `Bool` where
-/// the protocol says `Q`, or `Id` where it says `^v`, and the registered string
-/// stops matching `protocol_getMethodDescription`'s.
-///
-/// # ITS WIDTH IS 23 OF 71, AND THAT IS DELIBERATE
-///
-/// The count used to be typed out as `assert_eq!(checked, 23, "all 23 ported
-/// rows, none skipped")`, which was exactly true for one wave — when 23 WAS the
-/// number of ported rows — and then silently became a wrong description of a
-/// correct test. 71 rows are ported now; this reads 23 of them, because
-/// [`PortedShapes`] is a mirror declared in THIS FILE and it mirrors
-/// `window_delegate.rs` alone.
-///
-/// Growing the mirror to 71 would be the wrong move and it is worth saying why
-/// rather than leaving it as an omission: a mirror proves that
-/// `aterm_objc::declare_class!` turns these Rust types into these encodings, and
-/// nothing about the class `vendor/winit` registers — the point this file's
-/// header makes at length. The instrument that reads the REGISTERED class is
-/// `crates/aterm-gui/examples/objc_live_class_audit.rs`, it covers all 71 rows
-/// plus `-dealloc` on all four classes, and the verify ladder runs it. So the
-/// split is asserted here, with the count DERIVED from the table rather than
-/// typed, and the number a future wave has to keep true is "every row the mirror
-/// declares", not "23".
+/// Covers only the rows the mirror declares; the expected count is derived
+/// from the table. The other ported rows are read by
+/// `crates/aterm-gui/examples/objc_live_class_audit.rs`, which inspects the
+/// registered classes and is the better instrument.
 #[test]
 fn the_ported_signatures_encode_to_the_authority() {
     assert!(
@@ -1263,10 +910,8 @@ fn the_ported_signatures_encode_to_the_authority() {
         assert_eq!(expand(row.winit), registered, "{} table row", row.sel);
         checked += 1;
     }
-    // DERIVED, not typed: every row the table attributes to the file the mirror
-    // covers, and no other. If a row is added to `window_delegate.rs` and to the
-    // table but not to `PortedShapes`, the `method_types` lookup above panics
-    // with the selector's name — this only has to keep the two counts equal.
+    // Derived from the table: every row attributed to the mirrored file. A row
+    // added to the table but not to `PortedShapes` panics in the lookup above.
     let expected = ROWS.iter().filter(mirrored).count();
     assert_eq!(checked, expected, "every mirrored row, none skipped");
     assert_eq!(
@@ -1274,12 +919,7 @@ fn the_ported_signatures_encode_to_the_authority() {
         "window_delegate.rs's 23 rows are what the mirror holds"
     );
 
-    // AND THE PART THIS TEST DOES NOT COVER, stated as a number so it cannot
-    // drift into silence. 71 rows are ported; 48 of them are read on this axis
-    // only by the live-class auditor, which is the better instrument and the
-    // reason the mirror was never grown.
-    // (The `app.rs:` filter that used to sit here is gone with the row it
-    // excluded — every row in the table is a ported one now.)
+    // The rows this test does not cover, as a number, so it cannot drift.
     let ported = ROWS.len();
     assert_eq!(ported, 71, "all 71 rows are ported; see the header");
     assert_eq!(
@@ -1293,31 +933,18 @@ fn the_ported_signatures_encode_to_the_authority() {
 
 // ------------------------------------ the ivar slot under a substituting init
 
-/// What a SUBSTITUTING initializer actually costs — four survivors, measured.
+/// A substituting initializer defeats the [`aterm_objc::IvarSlot`]
+/// initialised flag for three of four kinds of survivor.
 ///
-/// `vendor/winit/src/platform_impl/macos/window.rs` uses `alloc_ivars` rather
-/// than `alloc_init` because `-[NSWindow initWithContentRect:…]` is an
-/// `id`-returning initializer and is entitled to release `self` and answer
-/// another object. The comment beside that decision used to close with one
-/// sentence about what a substitution would cost — "the SURVIVOR's slot would
-/// read `initialized == false` because `class_createInstance` zero-fills, and
-/// [`aterm_objc::IvarSlot::get`] asserts on that in release builds too, a named
-/// panic and not a read of uninitialised bytes" — written explicitly for "the
-/// next class that carries state through a substituting initializer".
+/// `window.rs` uses `alloc_ivars` because `-[NSWindow initWithContentRect:…]`
+/// may release `self` and return another object. The flag catches a survivor
+/// of the same class only; a superclass, sibling-subclass or unrelated
+/// survivor is not caught.
 ///
-/// IT IS TRUE OF ONE SURVIVOR IN FOUR, and this test is the measurement. An
-/// initializer may hand back an instance of the same class, of the SUPERCLASS,
-/// of a SIBLING subclass, or of something else entirely, and the flag only
-/// guards the first.
-///
-/// The subject carries a `u8` rather than the `()` `WinitWindow` uses, because
-/// `()` has no value to hand out wrongly and the sentence being corrected is
-/// about a class that carries STATE. The slot is therefore 2 bytes rather than
-/// 1, and where the runtime places it is a HOST fact the test measures: on the
-/// macOS 26 release cutter `NSWindow` is 520 bytes with its last ivar ending at
-/// 513, and an align-1 slot goes in the padding either way; on macOS 14.4.1
-/// `NSWindow` is 448 bytes with no padding at all and the slot lands at 448,
-/// past the allocation. Three survivors in four defeat the flag on both.
+/// The subject carries a `u8` (a 2-byte slot) so there is state to hand out
+/// wrongly. Where the slot lands is a host fact: in `NSWindow`'s tail padding
+/// on some macOS releases, at the end of the allocation on others. Three of
+/// four survivors defeat the flag either way.
 #[test]
 fn a_substituting_initializer_defeats_the_initialized_flag() {
     assert!(
@@ -1325,10 +952,8 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
         "AppKit must load: this is about NSWindow's instance layout"
     );
 
-    // `class_createInstance` is `+alloc`'s own allocator and the function the
-    // corrected sentence names. It has no wrapper in this crate because no
-    // shipping call site allocates without initialising; declared here for the
-    // same reason `dlopen` is above.
+    // `+alloc`'s own allocator; no crate wrapper exists because nothing ships
+    // an allocation without an initializer.
     unsafe extern "C" {
         fn class_createInstance(cls: aterm_objc::ClassPtr, extra: usize) -> aterm_objc::Id;
         fn class_getInstanceSize(cls: aterm_objc::ClassPtr) -> usize;
@@ -1356,22 +981,11 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
     let window_size = unsafe { class_getInstanceSize(class(c"NSWindow")) };
     let object_size = unsafe { class_getInstanceSize(class(c"NSObject")) };
     let slot = size_of::<aterm_objc::IvarSlot<u8>>();
-    // WHERE THE SLOT LANDS IS A HOST FACT, measured rather than assumed. On the
-    // macOS 26 release cutter `NSWindow` is 520 bytes with its last ivar ending
-    // at 513, so the runtime places a small, align-1 slot in the TAIL PADDING —
-    // inside the superclass's own allocation, which is why case (b) below can
-    // read memory there rather than fault. On macOS 14.4.1 `NSWindow` is 448
-    // bytes with its last ivar ending exactly at 448: there is no padding, the
-    // slot lands AT the instance size, and a plain `NSWindow`'s malloc block
-    // ends there too, so case (b) is settled by arithmetic instead — the read
-    // would be out of bounds, the shape of case (d).
-    //
-    // "Inside the allocation" is measured against the MALLOC BLOCK of the
-    // plain `NSWindow` case (b) reads, not against `class_getInstanceSize`:
-    // the block is the larger of the two (malloc rounds up to its quantum),
-    // and it is what "in bounds" means. A host whose instance size is not a
-    // multiple of the quantum has slack past its last ivar that is padding in
-    // every sense that matters here.
+    // Where the slot lands is a host fact: in `NSWindow`'s tail padding
+    // (inside a plain `NSWindow`'s allocation, so case (b) can read it) or at
+    // the instance size with no padding (so case (b) is settled by arithmetic,
+    // like (d)). "Inside" is measured against the malloc block, which malloc
+    // rounds up past `class_getInstanceSize`.
     let superclass_instance = unsafe { class_createInstance(class(c"NSWindow"), 0) };
     let block = unsafe { malloc_size(superclass_instance.as_ptr()) };
     let in_padding = (off as usize) + slot <= block;
@@ -1380,9 +994,8 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
         "the slot at {off} straddles the end of a plain NSWindow's {block}-byte block"
     );
 
-    // Every instance below is deliberately leaked: `-dealloc` on an NSWindow
-    // that never ran an initializer is not a thing this test wants to provoke,
-    // and four allocations for the life of a test process cost nothing.
+    // Every instance is leaked: `-dealloc` on an uninitialised NSWindow is not
+    // something to provoke.
     let slot_of = |obj: aterm_objc::Id| -> *mut aterm_objc::IvarSlot<u8> {
         // SAFETY: `obj` points at an instance of a class whose layout includes
         // `off`, asserted above for every class used here.
@@ -1400,7 +1013,7 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
 
-    // (a) A SURVIVOR OF THE SAME CLASS. The claim holds, and only here.
+    // (a) A survivor of the same class: the flag holds.
     let same_class = unsafe { class_createInstance(subject.class(), 0) };
     assert_eq!(
         reads_a_value(same_class),
@@ -1410,10 +1023,9 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
          sentence describes"
     );
 
-    // (b) A PLAIN `NSWindow`. It panics too, and NOT for the stated reason:
-    // there is no slot there at all, only tail padding that happens to be zero
-    // — on a host that HAS tail padding. Where there is none the slot is past
-    // the block and no read is performed, because the read is the defect.
+    // (b) A plain `NSWindow`: panics only because its tail padding happens to
+    // be zero, where it has padding; otherwise the slot is past the block and
+    // no read is performed.
     if in_padding {
         assert_eq!(
             reads_a_value(superclass_instance),
@@ -1421,10 +1033,9 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
             "NSWindow's tail padding is zero as allocated, so this panics — by \
              accident of what has not been written there yet"
         );
-        // SAFETY: `off` is inside the plain NSWindow's own malloc block
-        // (`in_padding`, measured against `malloc_size`) and belongs to no
-        // ivar of NSWindow's; writing one byte of padding is what a future
-        // framework ivar would do for real.
+        // SAFETY: `off` is inside the plain NSWindow's malloc block
+        // (`in_padding`, via `malloc_size`) and belongs to no ivar; writing one
+        // padding byte is what a future framework ivar would do.
         unsafe { *superclass_instance.as_ptr().cast::<u8>().offset(off) = 1 };
         assert!(
             reads_a_value(superclass_instance).is_some(),
@@ -1446,8 +1057,8 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
         );
     }
 
-    // (c) A SIBLING SUBCLASS whose own slot the runtime placed at the same
-    // offset. It initialises ITS OWN ivar honestly, and we read the value.
+    // (c) A sibling subclass whose own slot sits at the same offset: it
+    // initialises its own ivar honestly, and we read that value.
     let sibling_instance = unsafe { class_createInstance(sibling.class(), 0) };
     // SAFETY: the sibling's slot is at its own registered offset, freshly
     // zeroed, and is the same `IvarSlot<u8>` shape.
@@ -1470,10 +1081,8 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
 
     std::panic::set_hook(previous);
 
-    // (d) AN `NSObject`-SIZED SURVIVOR. No read is performed, because the read
-    // IS the defect: the arithmetic alone settles it, against the real malloc
-    // block rather than against `class_getInstanceSize` — the block is the
-    // larger of the two and is what "out of bounds" actually means here.
+    // (d) An `NSObject`-sized survivor: the slot is outside its malloc block,
+    // so no read is performed.
     let object_instance = unsafe { class_createInstance(class(c"NSObject"), 0) };
     let block = unsafe { malloc_size(object_instance.as_ptr()) };
     assert!(
@@ -1484,35 +1093,20 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
         off as usize - block
     );
 
-    // So three of the four defeat the flag. What the flag actually guards is the
-    // window between `+alloc` and the ivar store ON ONE INSTANCE; a class whose
-    // `Ivars` carry state must establish that its designated initializer does
-    // not substitute, which is what window.rs's 1,024-window measurement does.
+    // The flag guards only the window between `+alloc` and the ivar store on one
+    // instance; a class whose `Ivars` carry state must ensure its designated
+    // initializer does not substitute.
 }
 
 // ------------------------------------------------- the swizzled framework row
 
-/// `-[NSApplication sendEvent:]` STILL ENCODES THE WAY `app.rs` TYPES IT.
+/// `-[NSApplication sendEvent:]`'s live encoding matches the type `app.rs`
+/// swizzles it with.
 ///
-/// # What this replaces, and why it is stronger
-///
-/// The table above carried a 72nd row whose `winit` column read `v@:@` and
-/// whose authority was `-[NSApplication sendEvent:]`'s live encoding. It was
-/// attached to `app.rs`'s test-only `TestApplication` declaration, which W12
-/// deleted — but the comparison it performed is the one thing in the tree that
-/// can notice AppKit changing the signature of the row this backend PATCHES.
-///
-/// It is re-made here from a better source. The expected string is not
-/// transcribed: it is DERIVED by [`aterm_objc::MethodFn`] from the same Rust
-/// function-pointer type `app.rs` declares and installs, which is exactly the
-/// derivation `SwizzleSite::install` performs at launch. So this test and the
-/// product code cannot disagree about what the fork expects — there is one
-/// source and it is a type.
-///
-/// The fork's own spelling of that type is read out of `app.rs` and compared,
-/// so the copy below cannot drift from the fork it claims to mirror. That is
-/// the failure mode a transcribed row has and a derived one does not, moved to
-/// the one place a derivation still needs a transcription.
+/// The expected string is derived by [`aterm_objc::MethodFn`] from the same
+/// function-pointer type `SwizzleSite::install` checks at launch, and the
+/// fork's own spelling of that type is read from `app.rs` and compared, so this
+/// copy cannot drift.
 #[test]
 fn the_swizzled_row_still_encodes_the_way_app_rs_types_it() {
     use aterm_objc::{Id, MethodFn, Sel};
@@ -1522,8 +1116,7 @@ fn the_swizzled_row_still_encodes_the_way_app_rs_types_it() {
     /// `app.rs`'s `SendEvent`, spelled again.
     type SendEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);
 
-    // THE FORK REALLY DECLARES THIS TYPE. A derivation from a type that has
-    // drifted from the fork's is a derivation from nothing.
+    // The fork really declares this type.
     let app_src =
         std::fs::read_to_string(fork_backend().join("app.rs")).expect("the fork is readable");
     assert!(
@@ -1536,9 +1129,8 @@ fn the_swizzled_row_still_encodes_the_way_app_rs_types_it() {
     let derived = <SendEvent as MethodFn>::method_encoding();
     assert_eq!(derived, "v@:@", "the derivation itself moved");
 
-    // SAFETY: `NSApplication` is a live registered class and `sendEvent:` an
-    // interned selector; `method_types` tolerates a selector the class does not
-    // implement by answering `None`.
+    // SAFETY: `NSApplication` is a live class and `sendEvent:` an interned
+    // selector; `method_types` answers `None` for an unimplemented one.
     let live = unsafe {
         aterm_objc::method_types(
             aterm_objc::class(c"NSApplication"),
@@ -1555,61 +1147,19 @@ fn the_swizzled_row_still_encodes_the_way_app_rs_types_it() {
     );
 }
 
-/// …AND THE FORK PATCHES EXACTLY THE ROWS THIS FILE CHECKS.
-///
-/// # The spelling the test above is armed at, and the one it is not
-///
-/// [`the_swizzled_row_still_encodes_the_way_app_rs_types_it`] derives its
-/// expectation from a type instead of transcribing a string, which is the right
-/// improvement and is not the whole question. Its SUBJECT is still one hand-written
-/// literal in one file: it reads `app.rs` for
-/// `type SendEvent = …` and checks `-[NSApplication sendEvent:]`. **A SECOND
-/// swizzle landing anywhere in the fork would leave it passing, unchanged**,
-/// because nothing in it asks how many rows the fork patches. That is pass 14's
-/// finding — a guard whose subject is its own table rather than the code — one
-/// spelling out, at the capability W12 added.
-///
-/// So the subject here is the fork. Every `SwizzleSite::install` call in the
-/// macOS backend is found in the source, and the set must be exactly the one
-/// above covers. A new one fails this test on the day it lands, with its own
-/// file and line, instead of on the day AppKit changes underneath it.
+/// The fork swizzles exactly the rows this file checks: every
+/// `SwizzleSite::install` call in the macOS backend is found in the source and
+/// must match the checked set, so a new swizzle fails here with its file and
+/// line.
 #[test]
 fn the_fork_patches_exactly_the_framework_rows_this_file_checks() {
-    /// Every `(file, line, selector)` at which the fork installs a swizzle.
-    ///
-    /// A site is `NAME.install(cls, sel!(x), f)`; the selector is the second
-    /// argument, which is where a selector goes. Read from the source, not
-    /// from a list.
+    /// Every `(file, line, selector)` at which the fork installs a swizzle
+    /// (`NAME.install(cls, sel!(x), f)`), read from the source.
     fn install_sites() -> Vec<(String, usize, String)> {
-        let dir = fork_backend();
-        let mut stack = vec![dir.clone()];
-        let mut paths = Vec::new();
-        while let Some(d) = stack.pop() {
-            for entry in std::fs::read_dir(&d).expect("the fork's macOS backend is readable") {
-                let path = entry.expect("a readable entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|x| x == "rs") {
-                    paths.push(path);
-                }
-            }
-        }
-        paths.sort();
         let mut out = Vec::new();
-        for path in paths {
-            let file = path
-                .strip_prefix(&dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            let src = std::fs::read_to_string(&path).expect("readable");
-            // `//` comments removed: this fork's own prose spells `.install(`
-            // in the doc comment that explains it.
-            let stripped: String = src
-                .lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n");
+        // `//` comments removed: this fork's own prose spells `.install(`
+        // in the doc comment that explains it.
+        for (file, stripped) in fork_sources() {
             let mut from = 0_usize;
             while let Some(at) = stripped[from..].find(".install(") {
                 let start = from + at;
@@ -1653,8 +1203,7 @@ fn the_fork_patches_exactly_the_framework_rows_this_file_checks() {
         uncovered.len(),
         uncovered.join("\n  ")
     );
-    // …and BOTH WAYS, so a row whose site is deleted does not leave a check
-    // standing over nothing.
+    // Both ways, so a deleted site does not leave a check over nothing.
     let stale: Vec<&str> = CHECKED
         .iter()
         .filter(|c| !sites.iter().any(|(_, _, sel)| sel == *c))

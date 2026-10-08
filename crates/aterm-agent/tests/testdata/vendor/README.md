@@ -34,10 +34,10 @@ Re-run it after a Claude Code update:
 ```sh
 tools/harness-capture.sh              # drive a live vendor, write a corpus
 tools/harness-capture.sh --from-raw <scratch>/raw   # redact + manifest again, no vendor
-targo --unverified test -p aterm-agent --test vendor_corpus
+targo --unverified test -p aterm-agent --test agent_suite -- vendor_corpus::
 ```
 
-## These files are REDACTED, and that is stated rather than hidden
+## These files are REDACTED
 
 What the vendor sends names the machine it ran on: the owner's home, the
 scratch directory's random name, the per-session scratchpad, the session
@@ -68,20 +68,15 @@ something else tomorrow. It means that the day it does, a re-capture says so.
 
 `StopFailure` and `PostModelSwitch` are not captured: one needs a real API
 failure and the other a real model switch, and neither can be caused on
-demand without faking the condition — which would make the fixture a
-hand-written payload wearing a capture's clothes. They are exercised by the
-hand-written suites in `src/harness/*_tests.rs`, which say plainly that that
-is what they are.
+demand without faking the condition. They are exercised by the hand-written
+suites in `src/harness/*_tests.rs`.
 
-`Notification` is not here either, and for a duller reason: the vendor sends
-it when it wants the human's attention, and the three turns this capture
-drives did not produce one. A run that idles at a prompt does. It is a hook
-the harness registers, so a future capture may well carry it; nothing in the
-replay requires it.
+`Notification` is not here either: the vendor sends it when it wants the
+human's attention, and the three turns this capture drives did not produce
+one. Nothing in the replay requires it.
 
 `screen/usage.txt` is ONE SCREEN, not the whole `/usage` page — it ends on
 the vendor's own `↓` scroll indicator, so the "What's contributing to your
 limits usage?" body below the fold is not in the corpus. The three windows
 the replay reads (`Current session`, `Current week (all models)`, `Current
-week (Fable)`) are all above it. The capture reads a frame, and a frame is
-what a frame holds.
+week (Fable)`) are all above it.

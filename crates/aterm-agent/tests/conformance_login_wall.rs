@@ -1,38 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `HarnessLoginWall` (aterm-spec `harness_login_wall_model`): on
-//! EVERY reachable state of the model, the REAL code — the screen reader
-//! (`aterm_phase`), the upgrade's transcript fold (`upgrade::transcript_login`),
-//! its give-up take-back (`upgrade::rearmed` over `upgrade::notices_received`),
-//! its clocks (`upgrade::clock_held`, `upgrade::clock_held_until`), its reducer
-//! (`upgrade::next_step`, `upgrade::announce_asks`) and the supervisor's
-//! turn-end decider (`decide_turn_end`, with the `TurnEndState` the loop keeps)
-//! — is handed what the state stands for and takes exactly the step the
-//! model's guards allow.
+//! Tier-1 for `HarnessLoginWall` (aterm-spec `harness_login_wall_model`): on
+//! every reachable state of the model, the real code (the screen reader
+//! `aterm_phase`, `upgrade::transcript_login`, `upgrade::rearmed` over
+//! `upgrade::notices_received`, `upgrade::clock_held`/`clock_held_until`,
+//! `upgrade::next_step`/`announce_asks`, and `decide_turn_end`) is handed what
+//! the state stands for and takes exactly the step the model's guards allow.
 //!
-//! What a state stands for: its SCREEN — the incident's `⏺ Login expired ·
-//! Please run /login` row where `wall`, the `/login` dialog's `Login
-//! interrupted` under it where the row was dismissed, the person's `Login
-//! successful` where `back`, else a turn that ended after three minutes of
-//! work; its TRANSCRIPT — the upgrade's latest notice (the round's, for a
-//! give-up), each answered by the login wall's `authentication_failed` row
-//! where `unread` or by the model, the person's `/login` where `back`, the
-//! agent's READY where `ready`, and a turn the wall answered last where
-//! `stood`; and its clocks — an announced upgrade's window run out where
-//! `window`, the login's lift recent or long past to match. The real facts
-//! are read back from those (the screen's wall, the transcript's, a notice's
-//! fate), every one checked against the state, and the decisions compared:
-//! the supervisor types `/login` exactly where `TypeLogin` is enabled and a
-//! continuation exactly where `Continue` is; the upgrade announces exactly
-//! where `Announce` is (and to the ask the model's `Announce` makes: the same
-//! ask, or the bound reached, alike), gives up exactly where `GiveUp` is,
-//! takes the restart exactly where `Restart` is, and lets its window run out
-//! exactly where `Elapse` may.
+//! A state stands for a screen (the `⏺ Login expired · Please run /login` row
+//! where `wall`, `Login interrupted` where dismissed, `Login successful` where
+//! `back`, else a turn that ended after real work), a transcript (the latest
+//! notice answered by the wall's `authentication_failed` row or by the model,
+//! the person's `/login`, the agent's READY, a turn the wall answered last)
+//! and clocks. The real facts are read back and checked against the state, and
+//! the supervisor types `/login` and continuations, and the upgrade announces,
+//! gives up, restarts and lets its window run out, exactly where `TypeLogin`,
+//! `Continue`, `Announce`, `GiveUp`, `Restart` and `Elapse` are enabled.
 //!
-//! NEGATIVE CONTROLS: the model with any ONE defect switched on — the
-//! incident's code (`Buggy`), and each knob — disagrees with the real code
-//! somewhere, so a green walk is not vacuous.
+//! Negative controls: the model with any one defect switched on (`Buggy`, and
+//! each knob) disagrees with the real code somewhere.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -50,7 +37,7 @@ use aterm_spec::derive::{Model, harness_login_wall_model};
 
 type S = BTreeMap<&'static str, i64>;
 
-/// The incident's conversation, target and round salt.
+/// The recorded conversation, target and round salt.
 const SESSION: &str = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
 const SALT: u64 = 1_790_373_062;
 /// The walk's clock: a unix second well after every stamp it writes.
@@ -82,7 +69,7 @@ fn reachable(m: &Model) -> Vec<S> {
 
 // ---------------------------------------------------------------- the screen
 
-/// The incident's screen with its wall row replaced by `tail`.
+/// The recorded screen with its wall row replaced by `tail`.
 fn with_tail(tail: &[&str]) -> Vec<String> {
     let mut r = screen(LOGIN_EXPIRED);
     let at = r

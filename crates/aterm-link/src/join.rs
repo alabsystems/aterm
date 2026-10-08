@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm fabric mint-for` and `aterm fabric join` — a SECOND HOST joins the
-//! fleet over the sealed transport (round 16, the m7 case).
+//! fleet over the sealed transport.
 //!
 //! ```text
 //! host 1:  aterm fabric on --tcp <bind> --key-file <k> [--allow-remote]
@@ -46,8 +46,8 @@
 //! Mints `<node-id>`'s eight grants (§8.2's node ring, [`crate::enable::node_grants`])
 //! on THIS host's fleet, under THIS host's `<root>/mint.secret` — the root the
 //! fabric is on, found the way `off` finds it. `new` provisions a fresh
-//! `n-<16 hex>` for a host that has none yet. Like every round-16 surface it
-//! is refused, by naming the feature, in a build without `sealed`. It refuses
+//! `n-<16 hex>` for a host that has none yet. Like every sealed-wire surface
+//! it is refused, by naming the feature, in a build without `sealed`. It refuses
 //! a malformed id, this host's OWN node id (two bridges answering as one node
 //! read each other's mail and fire each other's wills), a secret that is
 //! missing or short — and a root that JOINED another host's fleet: its own
@@ -154,7 +154,7 @@ pub const NEW_NODE: &str = "new";
 /// Whether `node` is a NODE id: `n-` and a principal segment.
 #[must_use]
 pub fn is_node_id(node: &str) -> bool {
-    node.starts_with("n-") && node.len() > 2 && crate::subject::is_principal(node)
+    node.starts_with("n-") && crate::subject::is_principal(node)
 }
 
 /// The `(fleet, node)` a cap file's grants were minted for — exactly §8.2's
@@ -243,10 +243,8 @@ fn this_fabric() -> Option<(String, String, Option<String>)> {
 /// `aterm fabric mint-for <node-id>|new [--out <cap>] [--fleet <F>]`.
 #[must_use]
 pub fn mint_for(opts: &MintForOpts) -> ExitCode {
-    // A ROUND-16 SURFACE, REFUSED BY NAME IN A DEFAULT BUILD like `on --tcp`
-    // and `join`: a cap is only ever for a host that joins over the sealed
-    // wire, and a host whose build cannot serve that wire has nobody to mint
-    // for. The help and the changelog say "every command"; this made it true.
+    // REFUSED BY NAME IN A DEFAULT BUILD, like `on --tcp` and `join`: a cap
+    // is only for a host that joins over the sealed wire.
     if !crate::transport::SEALED {
         eprintln!(
             "aterm fabric mint-for: {}",
@@ -288,7 +286,7 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     };
     if !is_node_id(&node) {
         eprintln!(
-            "aterm fabric mint-for: `{}` is not a node id — `n-` and [a-z0-9-] (the id in the \
+            "aterm fabric mint-for: `{}` is not a node id (`n-` and [a-z0-9-], in the \
              joining host's <root>/link-state/node), or `{NEW_NODE}` for a fresh one",
             safe(&node, 64)
         );
@@ -296,26 +294,22 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     }
     if own.as_deref() == Some(node.as_str()) {
         eprintln!(
-            "aterm fabric mint-for: {node} is THIS host's own node id ({}/node): a second host \
-             needs its own — two bridges answering as one node read each other's mail and fire \
-             each other's wills. Use the other host's id, or `{NEW_NODE}`",
+            "aterm fabric mint-for: {node} is THIS host's own node id ({}/node); a second host \
+             needs its own. Use the other host's id, or `{NEW_NODE}`",
             p.state().display()
         );
         return ExitCode::from(2);
     }
-    // A ROOT THAT JOINED ANOTHER HOST'S FLEET MINTS NOTHING. Its node cap came
-    // from that host (`join` installed it) and the broker it dials checks
-    // every cap against THAT host's secret — so a secret left here by an
-    // earlier one-host `on` would mint caps the broker refuses, behind a
-    // `join` line naming that broker. The test is the root's own cap: on the
-    // host that serves the fleet it was minted under this root's secret.
+    // A ROOT THAT JOINED ANOTHER HOST'S FLEET MINTS NOTHING: the broker it
+    // dials checks caps against THAT host's secret, so a secret left here by
+    // an earlier `on` would mint caps the broker refuses. The test is the
+    // root's own cap, minted under this root's secret only on the serving host.
     let cap = p.cap();
     if cap.exists() && !minted_here(&p.secret(), &cap) {
         eprintln!(
-            "aterm fabric mint-for: this root's node cap ({}) was not minted under {} — this \
-             host JOINED a fleet whose broker another host serves{}, and that broker accepts \
-             only caps minted under ITS host's mint secret. Run `aterm fabric mint-for` on the \
-             host that serves it",
+            "aterm fabric mint-for: this root's node cap ({}) was not minted under {}: this \
+             host JOINED a fleet whose broker another host serves{}. Run `aterm fabric \
+             mint-for` on that host",
             cap.display(),
             p.secret().display(),
             here.as_ref().map_or_else(String::new, |(_, b, _)| format!(
@@ -337,8 +331,8 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     for grant in node_grants(&fleet, &node) {
         match astream_cap::mint(&secret, &grant) {
             Ok(c) => {
-                let tag: String = c.tag.iter().map(|b| format!("{b:02x}")).collect();
-                lines.push_str(&format!("{} {tag}\n", c.filter));
+                lines.push_str(&astream_cap::capfile::format_line(&c.filter, &c.tag));
+                lines.push('\n');
             }
             Err(e) => {
                 eprintln!("aterm fabric mint-for: the mint refused `{grant}`: {e}");
@@ -357,22 +351,21 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
             // follow one at `--out`, into a file somebody else chose.
             if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
                 eprintln!(
-                    "aterm fabric mint-for: {} exists and is not a regular file (a symlink?) — \
-                     a cap is never written through one; remove it or choose another --out",
+                    "aterm fabric mint-for: {} exists and is not a regular file; remove it or \
+                     choose another --out",
                     path.display()
                 );
                 return ExitCode::FAILURE;
             }
             match std::fs::read(&path) {
-                // THE SAME CAP IS ALREADY THERE — and the line below says
-                // `(0600)`, so it is made so first. A copy another user
-                // could read may have been read: that is said too.
+                // THE SAME CAP IS ALREADY THERE: made 0600 first, since the
+                // line below says so, and a wider mode is reported.
                 Ok(old) if old == lines.as_bytes() => match private_mode(&path) {
                     Ok(None) => {}
                     Ok(Some(was)) => eprintln!(
                         "aterm fabric mint-for: {} held this cap at mode {was:03o}, readable by \
-                         other users — now 0600. If it may have been copied, that copy IS the \
-                         node: mint for a fresh id (`mint-for {NEW_NODE}`) and use that one",
+                         other users; now 0600. If it may have been copied, mint for a fresh id \
+                         (`mint-for {NEW_NODE}`)",
                         path.display()
                     ),
                     Err(e) => {
@@ -382,8 +375,8 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
                 },
                 Ok(_) => {
                     eprintln!(
-                        "aterm fabric mint-for: {} exists and holds a different cap — it is never \
-                         overwritten; remove it or choose another --out",
+                        "aterm fabric mint-for: {} exists and holds a different cap; remove it or \
+                         choose another --out",
                         path.display()
                     );
                     return ExitCode::FAILURE;
@@ -420,8 +413,8 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
         )
     ));
     say(
-        "the mint secret stays on this host: the two files the joining host needs are the \
-         cap above and the fleet's key file"
+        "the joining host needs the cap above and the fleet's key file; the mint secret stays \
+         here"
             .to_string(),
     );
     let cap_shown = written
@@ -438,15 +431,15 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
             ));
             if crate::transport::is_loopback_endpoint(&broker).unwrap_or(false) {
                 say(format!(
-                    "  ({broker} is this machine's loopback: a host on ANOTHER machine names this \
-                     host's own address with that port, and the broker must be bound to one it \
-                     can reach — `aterm fabric on --tcp 0.0.0.0:<port> --allow-remote`)"
+                    "  ({broker} is loopback: another machine names this host's address, and the \
+                     broker must bind one it can reach — `aterm fabric on --tcp 0.0.0.0:<port> \
+                     --allow-remote`)"
                 ));
             }
         }
         _ => say(
-            "this host's fabric is not on the sealed TCP wire, so no host can join it yet: \
-             `aterm fabric on --tcp <bind> --key-file <k>` first (a `sealed` build)"
+            "this host's fabric is not on the sealed TCP wire: run `aterm fabric on --tcp <bind> \
+             --key-file <k>` first (a `sealed` build)"
                 .to_string(),
         ),
     }
@@ -459,8 +452,7 @@ fn read_mint_secret(path: &Path) -> Result<Vec<u8>, String> {
     let shown = path.display();
     if !path.exists() {
         return Err(format!(
-            "no mint secret at {shown}: `aterm fabric on` on this host mints it (it is the fleet's \
-             first host's, and it never leaves that host)"
+            "no mint secret at {shown}: `aterm fabric on` on the fleet's first host mints it"
         ));
     }
     let lossy = path.to_string_lossy();
@@ -468,8 +460,7 @@ fn read_mint_secret(path: &Path) -> Result<Vec<u8>, String> {
     let secret = std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?;
     if secret.len() < enable::SECRET_LEN {
         return Err(format!(
-            "{shown} holds {} bytes; a mint secret is at least {} (a short key mints a \
-             capability that seals nothing)",
+            "{shown} holds {} bytes; a mint secret is at least {}",
             secret.len(),
             enable::SECRET_LEN
         ));
@@ -517,16 +508,11 @@ fn check_inputs(opts: &JoinOpts) -> Result<Checked, String> {
         return Err("--broker <host:port> is required: the first host's sealed broker".to_string());
     };
     if !opts.tcp {
-        return Err(
-            "--tcp is required: `join` speaks only the sealed TCP wire (--tcp --key-file), and \
-             says so on its command line"
-                .to_string(),
-        );
+        return Err("--tcp is required: `join` speaks only the sealed TCP wire".to_string());
     }
     let (Some(key), Some(cap)) = (opts.key_file.as_deref(), opts.cap_file.as_deref()) else {
         return Err(
-            "--key-file <k> and --cap-file <c> are required: the fleet's pre-shared key and this \
-             node's cap, the two files copied from the first host"
+            "--key-file <k> and --cap-file <c> are required (both copied from the first host)"
                 .to_string(),
         );
     };
@@ -687,8 +673,7 @@ fn local_broker_step(p: &Paths, service: Service, remote: &str, out: &mut Out) -
             out.done(
                 "broker",
                 &format!(
-                    "stop launchd {label} and remove {} — this host dials {} now, and a KeepAlive \
-                     broker nobody dials still holds its socket and log",
+                    "stop launchd {label} and remove {} — this host dials {} now",
                     plist.display(),
                     safe(remote, 128)
                 ),
@@ -803,9 +788,8 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
         out.fail(
             "cap",
             &format!(
-                "it was minted under THIS root's own mint secret ({}): this root is the fleet's \
-                 first host, and joining itself would stop the broker it serves. `join` is for a \
-                 SECOND host",
+                "it was minted under THIS root's own mint secret ({}): this is the fleet's first \
+                 host; `join` is for a second one",
                 p.secret().display()
             ),
         );
@@ -819,9 +803,8 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
         out.fail(
             "node",
             &format!(
-                "this host is {have} ({}/node) and the cap was minted for {node}: identity is \
-                 provisioned, never re-minted (a new id abandons this node's mail lane). On the \
-                 first host: `aterm fabric mint-for {have} --out <cap>`, and join with that cap",
+                "this host is {have} ({}/node) and the cap was minted for {node}. On the first \
+                 host: `aterm fabric mint-for {have} --out <cap>`, and join with that cap",
                 state.display()
             ),
         );
@@ -839,7 +822,7 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    match enable::binary_has_link(&p).and_then(|()| enable::binary_has_sealed(&p)) {
+    match enable::binary_has_link(&p) {
         Ok(()) => out.ok(
             "binary",
             &format!(
@@ -863,28 +846,21 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
         Err(()) if !opts.dry_run => return ExitCode::FAILURE,
         Err(()) => None,
     };
-    // THE NODE IS NOBODY ELSE'S RIGHT NOW. A node whose presence row reads
-    // live is answered by a bridge at this moment; when this root has never
-    // recorded that node, the bridge is ANOTHER root's (the same cap joined
-    // twice), and a second one would share its lane: mail one delivers the
-    // other publishes `undeliverable reason=not-hosted` for, the presence
-    // row's host= flips between them, and either one's exit fires a will that
-    // marks the node gone under the one still running (round 16 review,
-    // measured). Refused before anything is written. This root's OWN node —
-    // a second `join` — is `already`, as it always was.
+    // THE NODE IS NOBODY ELSE'S RIGHT NOW. A live presence row for a node
+    // this root never recorded is ANOTHER root's bridge (the same cap joined
+    // twice); a second would share its lane — mail answered `not-hosted`,
+    // host= flipping, each one's will marking the node gone under the
+    // other. Refused before anything is written. This root's OWN node — a
+    // second `join` — is `already`.
     if let Some(row) = seen.filter(|r| r.state == "live") {
         if read_node(&state).as_deref() != Some(node.as_str()) {
             out.fail(
                 "node",
                 &format!(
-                    "{node} is LIVE on the fleet right now (its presence row: host={} \
-                     fabric={}) and this root has never been it — another root already \
-                     answers as {node}, and two bridges answering as one node deliver each \
-                     other's mail as undeliverable and fire each other's wills. Each host \
-                     needs a node of its own: on the first host `aterm fabric mint-for \
-                     {NEW_NODE} --out <cap>`, and join with that cap (or, if that other \
-                     root is gone for good, `aterm fabric off` there and wait for its row to \
-                     read state=gone)",
+                    "{node} is LIVE on the fleet (host={} fabric={}) and this root has \
+                     never been it: another root answers as {node}. On the first host \
+                     `aterm fabric mint-for {NEW_NODE} --out <cap>` and join with that cap, \
+                     or run `aterm fabric off` on the other root and wait for state=gone",
                     safe(&row.host, 64),
                     safe(&row.fabric, 32)
                 ),
@@ -896,28 +872,8 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
     }
 
     // 2. the root
-    if p.root.is_dir() && state.is_dir() {
-        out.already("root", &format!("{} (0700)", p.root.display()));
-    } else {
-        out.done(
-            "root",
-            &format!("create {} and {} (0700)", p.root.display(), state.display()),
-            &format!("created {} (0700)", p.root.display()),
-        );
-        if !opts.dry_run {
-            if let Err(e) = std::fs::create_dir_all(&state).and_then(|()| {
-                for d in [&p.root, &state] {
-                    std::fs::set_permissions(
-                        d,
-                        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-                    )?;
-                }
-                Ok(())
-            }) {
-                out.fail("root", &format!("{}: {e}", state.display()));
-                return ExitCode::from(2);
-            }
-        }
+    if !enable::root_step(&p, &state, &mut out) {
+        return ExitCode::from(2);
     }
 
     // 3. the node id: RECORDED from the cap, never re-minted.
@@ -946,13 +902,8 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
                 ),
                 &format!("recorded {node}"),
             );
-            if !opts.dry_run {
-                let write =
-                    crate::state::StateDir::open(&state).and_then(|s| s.node_id(|| node.clone()));
-                if let Err(e) = write {
-                    out.fail("node", &format!("{}/node: {e}", state.display()));
-                    return ExitCode::from(2);
-                }
+            if !enable::record_node(&state, &node, &mut out) {
+                return ExitCode::from(2);
             }
         }
     }
@@ -985,8 +936,7 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
         out.note(
             "copies",
             &format!(
-                "{} and {} are what this host reads from now on; the files copied in ({} and {}) \
-                 are not read again — delete them",
+                "this host reads {} and {} now; delete the copies ({} and {})",
                 p.installed_key().display(),
                 p.cap().display(),
                 checked.key_src.display(),
@@ -1074,13 +1024,10 @@ fn probe_remote(c: &Checked, out: &mut Out) -> Result<Option<NodePresence>, ()> 
         return Ok(row);
     }
     let why = view.error.unwrap_or_else(|| "no answer".to_string());
-    // TWO WAYS A SEALED CONNECT ENDS EARLY, and they are told apart by where:
-    // a WRONG KEY fails the handshake's key confirmation, which the far end
-    // sends before it hangs up — `failed to authenticate`, definite; a
-    // connection DROPPED before the broker said anything (reset, EOF on its
-    // hello) is astream's pre-authentication bound — 64 connections inside
-    // the handshake at once, 5 s each, the rest dropped at accept — or not a
-    // broker at all. The old hint called both "this key is not the broker's".
+    // TWO WAYS A SEALED CONNECT ENDS EARLY: a WRONG KEY fails the handshake's
+    // key confirmation (`failed to authenticate`, definite); a connection
+    // DROPPED before the broker said anything is astream's pre-authentication
+    // bound (64 connections in the handshake, 5 s each) or not a broker.
     let hint = if why.contains("failed to authenticate") {
         "the sealed handshake failed to authenticate: this key is not the broker's — copy the \
          first host's key file again"
@@ -1090,14 +1037,11 @@ fn probe_remote(c: &Checked, out: &mut Out) -> Result<Option<NodePresence>, ()> 
         || why.contains("Broken pipe")
     {
         "the broker dropped the connection before the sealed handshake finished: its \
-         pre-authentication slots were full (astream admits 64 connections into the handshake at \
-         once, for up to 5 s each, and anyone who can reach the port can hold them — \
-         docs/FABRIC-SECOND-HOST.md, What it does NOT protect), or what answers there is not a \
-         sealed broker. Run the join again in a few seconds; a wrong key fails differently \
-         (`failed to authenticate`)"
+         pre-authentication slots were full (docs/FABRIC-SECOND-HOST.md), or it is not a sealed \
+         broker. Retry in a few seconds"
     } else if !view.reachable {
-        "nothing answered there: on the first host `aterm fabric` shows the broker's endpoint, \
-         and that one TCP port must be open to this host"
+        "nothing answered: `aterm fabric` on the first host shows the endpoint, and its TCP port \
+         must be open to this host"
     } else if !view.attached {
         "the broker refused the cap: it was not minted under that broker's mint secret — run \
          `mint-for` on the host that serves it"
@@ -1156,8 +1100,7 @@ mod tests {
                 .iter()
                 .map(|g| {
                     let c = astream_cap::mint(key, g).expect("mint");
-                    let tag: String = c.tag.iter().map(|b| format!("{b:02x}")).collect();
-                    format!("{} {tag}\n", c.filter)
+                    astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
                 })
                 .collect();
             let path = dir.join(name);

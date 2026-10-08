@@ -5,7 +5,7 @@
 //! bundle, `dist/cut-<build>.noindex/aterm.app`, from
 //! the `apps/aterm-mac/Info.plist` template via in-process string substitution
 //! (CFBundleShortVersionString, sealed `CFBundleVersion = n`, ATermGitCommit
-//! with the `-dirty` rule matching aterm-gui/build.rs), copy the static
+//! with the `-dirty` rule matching crates/aterm/build.rs), copy the static
 //! resources (ShellIntegration/, Help.html, Credits.html, aterm.icns) and the
 //! successor's handoff policy (`publish/handoff-policy.toml`), nest
 //! atpkg + aterm-ctl + aterm-cli in Contents/MacOS, and write the
@@ -51,7 +51,7 @@ pub struct BundleSpec {
     pub aterm_bin: PathBuf,
 }
 
-/// Pure `-dirty` rule, EXACTLY matching crates/aterm-gui/build.rs: the suffix
+/// Pure `-dirty` rule, EXACTLY matching crates/aterm/build.rs: the suffix
 /// is only appended to a REAL commit — an unborn/.git-less tree stamps a bare
 /// "unknown", never "unknown-dirty", so the plist and the binary agree.
 pub fn commit_stamp(short_commit: Option<&str>, dirty: bool) -> String {
@@ -179,8 +179,7 @@ pub fn staging_dir_name(build: u64) -> String {
 
 /// Whether `name` names a cut staging directory, `cut-<digits>.noindex`. Nothing
 /// else under `dist/` qualifies, so the journal (`cut-state.toml`) and the DMGs are
-/// never mistaken for one — and neither is the fixed `dist/cut-app/` the cut
-/// assembled in until 2026-09-23: no cut writes, reads or prunes it any more, so a
+/// never mistaken for one — and neither is the retired fixed `dist/cut-app/`, so a
 /// process running out of it is never under a delete this code makes.
 #[must_use]
 pub fn is_staging_dir_name(name: &str) -> bool {
@@ -192,25 +191,10 @@ pub fn is_staging_dir_name(name: &str) -> bool {
 /// Where THIS cut's bundle is built, signed, notarized and packaged:
 /// `dist/cut-<build>.noindex/aterm.app`.
 ///
-/// The cut used to assemble directly into `dist/aterm.app`. On 2026-08-19 that
-/// produced a corrupt release: the bundle step sealed the batteries-included
-/// toolchain into it, the running aterm's activation lane took the half-built
-/// bundle six minutes later (it was signed by then, and newer than the running
-/// build), and the successor's first-run `atpkg seed` pass judged the seal spent
-/// on an already-provisioned machine and DELETED it — a gigabyte removed from the
-/// artifact the cutter was still packaging. The DMG had been built and kept the
-/// seal; the updater zip had not, silently took the seedless path and skipped the
-/// gate that proves the stripped bundle still passes Gatekeeper. Only the
-/// provenance recount caught it, after two notarizations.
-///
-/// Moving assembly to `dist/cut-app/` fixed THAT. What the
-/// move did NOT do, although this comment said so until 2026-09-23, is keep
-/// [`assemble`]'s `rm -rf` away from a live process: the path was fixed, nothing
-/// checked it, and the 2026-09-23 audit found the owner's aterm (pid 85619) running
-/// out of `dist/cut-app/aterm.app` — the directory the next cut would have deleted
-/// under it, re-attributing the process to a path that no longer resolves, which
-/// is how macOS came to reset the owner's TCC grants on 2026-09-21. What keeps a
-/// live process out from under the cut NOW is four things together:
+/// A fixed assembly path once let the running aterm adopt a half-built bundle, and
+/// later put the owner's aterm under the next cut's `rm -rf` (which is how macOS
+/// reset its TCC grants). What keeps a live process out from under the cut is
+/// four things together:
 ///
 /// 1. the name is unique per claim ([`staging_dir_name`]), so building never has
 ///    to remove anybody else's bundle;
@@ -223,12 +207,11 @@ pub fn is_staging_dir_name(name: &str) -> bool {
 ///    only when the process list PROVES nothing runs from it.
 ///
 /// Every step after `build` reads the bundle from here too; nothing copies it
-/// anywhere else. The cut used to finish by placing it at `dist/aterm.app`, a dev
-/// install its own updater watched — a copy no install path depends on (the dev
-/// app is tools/dev-app.sh's; a release installs from the DMG), so it is gone. And
-/// once a real or rehearsed cut is done, [`discard_staged_app`] removes this claim's
-/// staging directory too (under the same liveness rule), so no finished cut leaves a
-/// launchable copy of the app behind; a dry run keeps it to inspect.
+/// anywhere else (a release installs from the DMG; the dev app is
+/// tools/dev-app.sh's). Once a real or rehearsed cut is done,
+/// [`discard_staged_app`] removes this claim's staging directory too (under the
+/// same liveness rule), so no finished cut leaves a launchable copy of the app
+/// behind; a dry run keeps it to inspect.
 #[must_use]
 pub fn staged_app_path(dist: &Path, build: u64) -> PathBuf {
     dist.join(staging_dir_name(build)).join("aterm.app")
@@ -243,8 +226,7 @@ pub type RunningProcess = (String, String);
 /// `proc_listallpids` + `proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux), which
 /// is the view `tccd` attributes against. Not `ps -Ao comm=`: its `comm` is argv[0],
 /// so a relative, symlinked or PATH launch out of a staging bundle would read as
-/// running from somewhere else (the 2026-09-23 audit of the placement guard, main
-/// 70ba9c074). And not `std::env::current_exe()`, which on macOS is the
+/// running from somewhere else. And not `std::env::current_exe()`, which on macOS is the
 /// `execve`-time string and never follows a rename.
 ///
 /// `None` and `Some(vec![])` are deliberately different: the first is "I could
@@ -403,17 +385,10 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     let mac_dir = spec.repo_root.join("apps/aterm-mac");
     let app = staged_app_path(&spec.out_dir, spec.build_number);
 
-    // NO `.metadata_never_index` MARKER, in dist/ or in the assembly directory. As a
-    // Spotlight exclusion it is INERT — MEASURED 2026-09-02 on macOS 26.6.2 by A/B test
-    // (crates/atpkg/src/noindex.rs): only a directory name ending `.noindex` (`aterm pkg
-    // noindex`) keeps a subtree out, so an assembled bundle is indexed with or without it. Its
-    // other job, a "build output, not an install" sentinel, had one reader — atpkg's
-    // reclaim of a bundled toolchain seed — deleted with the sealed-seed client lane in
-    // Phase 5 (docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md §5.1). A marker
-    // nothing reads is a claim with no witness, so none is written; the directories come
-    // into being with the bundle below.
-    // The Spotlight exclusion that does work is the per-claim staging directory's own
-    // name, which ends `.noindex` ([`staging_dir_name`]).
+    // NO `.metadata_never_index` MARKER: as a Spotlight exclusion it is inert (MEASURED
+    // on macOS 26.6.2, crates/atpkg/src/noindex.rs) and nothing else reads it. The
+    // exclusion that works is the staging directory's `.noindex` name
+    // ([`staging_dir_name`]).
     let staging_dir = spec.out_dir.join(staging_dir_name(spec.build_number));
 
     // NO LIVE BUNDLE UNDER THIS `rm -rf`. The pre-claim gate refused the cut if
@@ -471,8 +446,7 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     // plus argv0 compat SYMLINKS. One Mach-O carries the window, the session,
     // and every verb; the symlinks keep every pre-one-binary name resolving
     // (old installs' ~/.local/bin/aterm -> aterm-cli, in-session `aterm-ctl`
-    // scripts, the drive/fleet clients' sibling lookup, aterm-nest's aterm-gui
-    // lookup, direct atpkg calls).
+    // scripts, the drive/fleet clients' sibling lookup, direct atpkg calls).
     // The binary dispatches on argv[0], so each alias IS that tool. Symlinks
     // are not Mach-Os: nothing extra to sign, and the sealed bundle covers
     // them as resources.
@@ -560,12 +534,6 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
         println!("    bundled Help.html");
     }
 
-    // RETIRED 2026-08-26 (step 6d, the batteries-included toolchain seed sealed
-    // under `Contents/Resources/toolchain-seed.lproj`; the client lane that read it
-    // followed in Phase 5, 2026-09-23): aterm ships ONE lean
-    // self-provisioning bundle — the client's own `atpkg` lane installs the
-    // toolchain from the network on first launch, and nothing is sealed here.
-
     // --- 6e. the successor's handoff policy (plan P0-5) ----------------------
     // HERE, BEFORE `sign::sign_app`, and that order is the whole point: the
     // signature seals `Contents/`, so the file the outgoing build reads from
@@ -586,7 +554,7 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
 /// the bundle step, so both judge the same bytes by the same rule.
 pub fn handoff_policy_for_cut(
     repo_root: &Path,
-) -> Result<(String, aterm_update_core::handoff_policy::HandoffPolicy), String> {
+) -> Result<(String, aterm_update_core::handoff_policy::PolicyFile), String> {
     let path = repo_root.join(aterm_update_core::handoff_policy::SOURCE_PATH);
     let shown = path.display().to_string();
     let text = std::fs::read_to_string(&path)
@@ -602,15 +570,15 @@ pub fn handoff_policy_for_cut(
 pub fn handoff_policy_of_text(
     text: &str,
     shown: &str,
-) -> Result<aterm_update_core::handoff_policy::HandoffPolicy, String> {
-    use aterm_update_core::handoff_policy::{HandoffPolicy, MAX_POLICY_BYTES};
+) -> Result<aterm_update_core::handoff_policy::PolicyFile, String> {
+    use aterm_update_core::handoff_policy::{MAX_POLICY_BYTES, PolicyFile};
     if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_POLICY_BYTES {
         return Err(format!(
             "{shown} is {} bytes; producers ignore a policy over {MAX_POLICY_BYTES}",
             text.len()
         ));
     }
-    HandoffPolicy::parse_for_cut(text)
+    PolicyFile::parse_for_cut(text)
         .map_err(|why| format!("{shown} is not a policy producers can follow: {why}"))
 }
 
@@ -629,7 +597,7 @@ pub fn handoff_policy_unreadable(why: &str) -> String {
 pub fn place_handoff_policy(
     repo_root: &Path,
     app: &Path,
-) -> Result<aterm_update_core::handoff_policy::HandoffPolicy, String> {
+) -> Result<aterm_update_core::handoff_policy::PolicyFile, String> {
     let (text, policy) = handoff_policy_for_cut(repo_root)?;
     let dest = app.join(aterm_update_core::handoff_policy::BUNDLE_PATH);
     std::fs::write(&dest, text.as_bytes()).map_err(|e| format!("write {}: {e}", dest.display()))?;
@@ -678,9 +646,8 @@ pub fn write_provenance(spec: &BundleSpec, app: &Path, signed_by: &str) -> Resul
     let path = spec
         .out_dir
         .join(format!("aterm-{}-build.txt", spec.short_version));
-    // `seed=no` is a CONSTANT since 2026-08-26 (the batteries-included seal is
-    // retired): kept as a line rather than dropped so every existing consumer
-    // of the provenance record keeps parsing the field it always found.
+    // `seed=no` is a constant (no toolchain seed ships), kept so every consumer of
+    // the provenance record still finds the field.
     let seed_lines = "seed=no\n";
     let body = format!(
         "name=aterm\n\
@@ -724,8 +691,7 @@ pub fn epoch_to_rfc3339(epoch: u64) -> String {
 
 #[cfg(test)]
 mod alias_tests {
-    /// THE ARGV0 ALIAS SET IS HAND-TYPED IN FIVE PLACES, and on 2026-09-12 an
-    /// audit found `aterm-link` in four of them. This pins the bundle's copy
+    /// THE ARGV0 ALIAS SET IS HAND-TYPED IN SEVERAL PLACES. This pins the bundle's copy
     /// against the OTHER lists in the repository, so the next verb to grow an
     /// alias cannot ship working from a source checkout and dead from a release.
     ///
@@ -750,11 +716,15 @@ mod alias_tests {
         ] {
             let text = std::fs::read_to_string(root.join(script))
                 .unwrap_or_else(|e| panic!("{script}: {e}"));
-            let Some(line) = text.lines().find(|l| l.contains("for alias in aterm-cli")) else {
-                panic!("{script} no longer spells its alias loop the way this test reads it");
+            // A loop over the names, or (install.sh, whose uninstall sweep reads
+            // the same names) the one variable its loop walks.
+            let Some(line) = text.lines().find(|l| {
+                l.contains("for alias in aterm-cli") || l.starts_with("STORE_ALIASES=\"aterm-cli")
+            }) else {
+                panic!("{script} no longer spells its alias list the way this test reads it");
             };
             for alias in line
-                .split_whitespace()
+                .split(|c: char| c.is_whitespace() || c == '"')
                 // `for alias in … aterm-gui; do` — the loop's own punctuation
                 // rides on the last word.
                 .map(|w| w.trim_end_matches(';'))
@@ -772,7 +742,7 @@ mod alias_tests {
 
 #[cfg(test)]
 mod staging_tests {
-    //! PER-CLAIM STAGING (2026-09-23): each claim builds in its own
+    //! PER-CLAIM STAGING: each claim builds in its own
     //! `dist/cut-<build>.noindex/`, and an older staging directory is removed only
     //! when the process list PROVES nothing runs out of it.
 
@@ -809,9 +779,8 @@ mod staging_tests {
         for name in ["cut-1.noindex", "cut-1790000000.noindex"] {
             assert!(is_staging_dir_name(name), "{name}");
         }
-        // The fixed directory the cut assembled in until 2026-09-23 is no longer
-        // one: nothing reads, writes or prunes it, so a process running out of it
-        // is never under this cutter's delete.
+        // The retired fixed `cut-app` is not one: a process running out of it is
+        // never under this cutter's delete.
         for name in [
             "cut-app",
             "cut-state.toml",

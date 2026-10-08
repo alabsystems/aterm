@@ -2,41 +2,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The seamless update's HISTORY CARRY, grid half (2026-09-26).
+//! The seamless update's history carry, grid half.
 //!
-//! An in-session update used to hand the successor at most 256 lines of each
-//! tab's scrollback (`aterm-gui`'s `MAX_HANDOFF_HISTORY_LINES`), fewer under
-//! deadline pressure: the rest of a 100,000-line ring stayed behind with the
-//! old process. The carry that replaces it has three grid-level steps, and
-//! they are here so the three share one notion of "the same history":
+//! An in-session update hands the successor each tab's full scrollback. The
+//! grid-level steps live here so they share one notion of "the same history":
 //!
-//! * [`Grid::history_fence`] — what a history export is fenced on: the
+//! * [`Grid::history_fence`]: what a history export is fenced on: the
 //!   renumber epoch (a width reflow, an unscroll), the scrollback-clear
 //!   generation (ED3, RIS), the reveal generation (a rows-grow that handed
 //!   history back to the screen), the width, and the absolute rows the
 //!   retained history spans. While all of that holds, every absolute row the
-//!   fence covers names the SAME line it named at the fence (eviction only
-//!   ever drops the oldest, and keeps every survivor's key).
-//! * [`Grid::history_lines_since_fence`] — a bounded slice of that history by
-//!   absolute row, refused the moment the fence no longer holds, so the
-//!   outgoing process can export the whole history in short lock holds while
-//!   its readers are still live.
-//! * [`OlderHistory`] + [`Grid::attach_older_history`] — the successor's
-//!   import: the exported lines are built into a tiered store OFF the lock,
-//!   then placed BEFORE the oldest line the grid retains under one brief lock
-//!   whose cost is the grid's own tiered history (right after an update: the
-//!   few hundred lines the screen carry brought), never the imported depth.
-//!
-//! [`Grid::reserve_older_history_keys`] is the fourth, smaller piece: the
-//! successor makes room below its oldest row for the lines it expects to
-//! import BEFORE anything reads an absolute row (raising its counter by what
-//! the free keys there fall short of — nothing, when the restore continued
-//! the source's numbering), so the import later lands under keys nobody has
-//! used and the live screen's keys never move. It hands
-//! back an [`OlderHistoryClaim`], the successor's own fence: the attach is
-//! refused once the pane's scrollback was CLEARED after the reserve (ED3, a
-//! reset), so an import that lands late never puts back history the user
-//! erased.
+//!   fence covers names the same line (eviction only drops the oldest and
+//!   keeps survivors' keys).
+//! * [`Grid::history_lines_since_fence`]: a bounded slice of that history by
+//!   absolute row, refused once the fence no longer holds, so the outgoing
+//!   process can export everything in short lock holds while its readers
+//!   stay live.
+//! * [`OlderHistory`] + [`Grid::attach_older_history`]: the successor's
+//!   import: exported lines are built into a tiered store off the lock, then
+//!   placed before the oldest retained line under one brief lock whose cost is
+//!   the grid's own tiered history, not the imported depth.
+//! * [`Grid::reserve_older_history_keys`]: before anything reads an absolute
+//!   row, the successor makes room below its oldest row for the expected
+//!   import (raising its counter only by the shortfall of free keys; nothing
+//!   when the restore continued the source's numbering), so the import lands
+//!   under unused keys and live keys never move. It returns an
+//!   [`OlderHistoryClaim`]: the attach is refused once the pane's scrollback
+//!   was cleared after the reserve (ED3, a reset), so a late import never
+//!   restores erased history.
 
 use aterm_scrollback::{Line, Scrollback, ScrollbackStorage};
 
@@ -54,10 +47,10 @@ pub struct HistoryFence {
     pub renumber_epoch: u64,
     /// `GridStorage::scrollback_clear_gen` — ED3 and a full reset advance it.
     pub clear_gen: u64,
-    /// `GridStorage::history_reveal_gen` — a rows-grow that handed history
-    /// lines back to the screen advances it: a revealed line can be rewritten
-    /// and pushed back under the SAME absolute key with other text, and
-    /// neither the epoch nor `end` would show it (2026-09-26 review).
+    /// `GridStorage::history_reveal_gen`: a rows-grow that handed history lines
+    /// back to the screen advances it. A revealed line can be rewritten and
+    /// pushed back under the same absolute key with other text, which neither
+    /// the epoch nor `end` would show.
     pub reveal_gen: u64,
     /// The width every history line is wrapped at.
     pub cols: u16,
@@ -78,10 +71,10 @@ impl HistoryFence {
         self.end.saturating_sub(self.oldest)
     }
 
-    /// Whether `now` — a fence taken LATER from the same grid — still
-    /// describes this fence's history: same epoch, same clear generation, no
-    /// reveal since, same width, neither side detached, and the absolute
-    /// counter has not gone backwards (a replaced grid starts it over).
+    /// Whether `now`, a fence taken later from the same grid, still describes
+    /// this fence's history: same epoch, same clear generation, no reveal
+    /// since, same width, neither side detached, and the absolute counter has
+    /// not gone backwards (a replaced grid starts it over).
     #[must_use]
     pub fn holds_at(&self, now: &HistoryFence) -> bool {
         !self.detached
@@ -96,12 +89,10 @@ impl HistoryFence {
 
 /// The successor's fence on its own import: the scrollback-clear generation
 /// of the grid whose keys [`Grid::reserve_older_history_keys`] reserved.
-/// [`Grid::attach_older_history`] requires it, and refuses once that grid's
-/// scrollback was cleared since — the import lands on a worker, after Commit,
-/// while the adopted shell and whatever it replays already run, and an ED3 or
-/// a reset in that window is the user's word that this history is GONE
-/// (2026-09-26 review: an import after `ESC [3J` put back the 46 lines the
-/// clear had just removed).
+/// [`Grid::attach_older_history`] requires it and refuses once that grid's
+/// scrollback was cleared since: the import lands on a worker after Commit,
+/// while the adopted shell already runs, and an ED3 or reset in that window
+/// means the user wants this history gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OlderHistoryClaim {
     clear_gen: u64,
@@ -139,15 +130,13 @@ pub struct OlderHistory {
 
 impl OlderHistory {
     /// Build `lines` (oldest first, wrapped at `from_cols`) for a grid `cols`
-    /// wide: rewrapped when the widths differ (the successor's window may
-    /// have settled at another width since the export), then pushed into an
-    /// UNBOUNDED store — neither a line limit nor a memory budget may evict a
-    /// line here, because this is not where retention is decided; the grid's
-    /// own settings are applied at [`Grid::attach_older_history`].
-    // Cost: O(imported history) in ONE call, honestly — the rewrap and the
-    // store build, like `PendingScrollbackReflow::reflow`. It takes no lock:
-    // its one caller is the successor's history-import worker, which holds
-    // none while it runs, and nothing on the main thread calls it.
+    /// wide: rewrapped when the widths differ (the successor's window may have
+    /// settled at another width), then pushed into an unbounded store. No line
+    /// limit or budget evicts here; the grid's own retention applies at
+    /// [`Grid::attach_older_history`].
+    // Cost: O(imported history) in one call (rewrap and store build, like
+    // `PendingScrollbackReflow::reflow`). Takes no lock: its one caller is the
+    // successor's history-import worker; nothing on the main thread calls it.
     #[must_use]
     pub fn build(lines: &[Line], from_cols: u16, cols: u16) -> Self {
         let mut store = Scrollback::with_defaults();
@@ -202,8 +191,8 @@ pub enum OlderHistoryRefusal {
     /// grid) to place history in front of.
     NoTieredStore(OlderHistory),
     /// The pane's scrollback was cleared (ED3, a reset) after the keys were
-    /// reserved ([`OlderHistoryClaim`]): the history stays cleared. Not a
-    /// loss — the user erased what the import would have put back.
+    /// reserved ([`OlderHistoryClaim`]), so the history stays cleared: the
+    /// user erased what the import would have restored.
     Cleared(OlderHistory),
 }
 
@@ -240,13 +229,12 @@ impl Grid {
         }
     }
 
-    /// Up to `max` history lines starting at absolute row `from`, and never
-    /// past `fence.end` — the lines `fence` covers, oldest first, read while
-    /// the fence still holds. An empty `Ok` once `from` reaches `fence.end`.
+    /// Up to `max` history lines starting at absolute row `from` and never past
+    /// `fence.end`: the lines `fence` covers, oldest first, read while the
+    /// fence holds. An empty `Ok` once `from` reaches `fence.end`.
     ///
-    /// A line the store cannot decode is an empty line, the dense-slot
-    /// posture every other history projection takes, so absolute rows and
-    /// line counts stay exact.
+    /// An undecodable line is an empty line, as in every other history
+    /// projection, so absolute rows and line counts stay exact.
     // COST: O(max × cols) — bounded by the caller's chunk, so an exporter can
     // walk a deep history in short lock holds while the grid keeps changing.
     pub fn history_lines_since_fence(
@@ -280,24 +268,20 @@ impl Grid {
 
     /// Make room for `lines` keys below the oldest retained line, so history
     /// later placed in front of it ([`Self::attach_older_history`]) lands
-    /// under keys nothing has used, and no retained or visible row's key moves.
+    /// under unused keys and no retained or visible row's key moves.
     ///
-    /// Only the SHORTFALL is raised: the keys already free below the oldest
-    /// row (`oldest_absolute_row()` of them) are used first. A grid that
-    /// CONTINUES the source's numbering (`Self::continue_absolute_numbering`,
-    /// the checkpoint restore) already sits exactly on the source's keys, and
-    /// the lines the import brings are the source's lines right below them —
-    /// so nothing moves, and the shell marks and blocks the restore installed
-    /// at the source's absolute rows keep naming their lines (2026-09-27
-    /// review: raising by the whole import renumbered every restored row up
-    /// by it while the marks stayed put). A grid numbered from zero (a parent
-    /// that named no counter) has no free key, and is raised by all of it.
+    /// Only the shortfall is raised: the `oldest_absolute_row()` keys already
+    /// free below the oldest row are used first. A grid that continues the
+    /// source's numbering (`Self::continue_absolute_numbering`, the checkpoint
+    /// restore) already sits on the source's keys and the imported lines sit
+    /// right below them, so nothing moves and restored shell marks and blocks
+    /// keep naming their lines. A grid numbered from zero has no free key and
+    /// is raised by the whole import.
     ///
-    /// ONLY for a grid that was just built from a checkpoint, before anything
-    /// has read an absolute row from it but the restore itself — the
-    /// successor's adopt path, ahead of its reader. Raised there, the rows
-    /// below the oldest retained line read as evicted until the import fills
-    /// them, which is exactly what they are if it never does.
+    /// Only for a grid just built from a checkpoint, before anything but the
+    /// restore has read an absolute row (the successor's adopt path). The rows
+    /// below the oldest retained line then read as evicted until the import
+    /// fills them.
     ///
     /// Returns the claim the import must present ([`OlderHistoryClaim`]).
     #[must_use]
@@ -310,34 +294,32 @@ impl Grid {
         }
     }
 
-    /// Whether `claim` still admits an import here: this grid's scrollback
-    /// has not been cleared since the reserve that minted it. A pure read — an
-    /// importer asks it before paying for the read and decode of a sidecar
-    /// the attach would refuse anyway.
+    /// Whether `claim` still admits an import here: this grid's scrollback has
+    /// not been cleared since the reserve that minted it. A pure read, so an
+    /// importer can check before reading and decoding a sidecar the attach
+    /// would refuse.
     #[must_use]
     pub fn older_history_claim_holds(&self, claim: OlderHistoryClaim) -> bool {
         claim.clear_gen == self.storage.scrollback_clear_gen
     }
 
-    /// Place `older` BEFORE the oldest line this grid retains — unless its
+    /// Place `older` before the oldest line this grid retains, unless its
     /// scrollback was cleared since `claim` was minted
-    /// ([`OlderHistoryRefusal::Cleared`]) — then apply the grid's own
-    /// retention (its line limit and memory budget evict the oldest, as they
-    /// would have in the process that exported the history).
-    /// Returns how many of the imported lines were retained.
+    /// ([`OlderHistoryRefusal::Cleared`]), then apply the grid's own retention
+    /// (line limit and memory budget evict the oldest, as in the exporting
+    /// process). Returns how many imported lines were retained.
     ///
-    /// Every retained line keeps its absolute key when the counter was
-    /// reserved for the import ([`Self::reserve_older_history_keys`]); when it
-    /// was not (or a rewrap made the history longer than reserved), the
-    /// counter is raised to cover it and that is announced the way every
-    /// other renumbering is — the renumber epoch advances and host
-    /// coordinates are invalidated. The epoch advances either way, because
-    /// the cached search index assumes the oldest row only ever moves forward.
-    // COST: O(tiered-history-lines) under the caller's lock — the grid's OWN
+    /// Retained lines keep their absolute keys when the counter was reserved
+    /// ([`Self::reserve_older_history_keys`]); otherwise (or if a rewrap made
+    /// the history longer than reserved) the counter is raised and that is
+    /// announced like any renumbering: the epoch advances and host coordinates
+    /// are invalidated. The epoch advances either way, since the cached search
+    /// index assumes the oldest row only moves forward.
+    // COST: O(tiered-history-lines) under the caller's lock: the grid's own
     // tiered lines are re-pushed behind the imported ones (right after an
-    // update: the screen carry's few hundred lines); the imported depth was
-    // paid by `OlderHistory::build`, off the lock. Called from the successor's
-    // history-import worker only.
+    // update, only the screen carry's lines); the imported depth was paid by
+    // `OlderHistory::build` off the lock. Called only from the successor's
+    // history-import worker.
     pub fn attach_older_history(
         &mut self,
         older: OlderHistory,
@@ -379,10 +361,10 @@ impl Grid {
             }
         }
         self.storage.scrollback = Some(ScrollbackStorage::Memory(store));
-        // The keys: base_y (and with it every retained and visible row's key)
-        // is `counter - visible` and does not move, so only the oldest row
-        // moves back — unless the counter cannot cover the history it now
-        // retains, when it is raised and the move is a renumbering.
+        // base_y (and with it every retained and visible key) is
+        // `counter - visible` and does not move; only the oldest row moves back,
+        // unless the counter cannot cover the retained history, when it is
+        // raised and the move is a renumbering.
         let needed = u64::from(self.storage.visible_rows) + self.scrollback_lines() as u64;
         if self.storage.absolute_row_counter < needed {
             self.storage.absolute_row_counter = needed;

@@ -1,34 +1,23 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The colour and shell-integration sub-projections of a
-//! [`TerminalCheckpoint`](super::TerminalCheckpoint).
+//! The colour, shell-integration and title sub-projections of a
+//! [`TerminalCheckpoint`](super::TerminalCheckpoint): state an application set
+//! that an in-session update must carry.
 //!
-//! Both are state an APPLICATION set, which an in-session update used to drop:
-//! a base16-shell palette (OSC 4) or an OSC 10/11 theme reverted to the host's
-//! colours, and the OSC 133/633 command blocks vanished — worse, a command
-//! running across the update never completed, because the successor's A→B→C→D
-//! state machine sat at "no prompt" and ignored the D that ended it.
-//!
-//! * [`ColorRepr`] carries the colour state as a DIFF from the host's
+//! * [`ColorRepr`] carries the colour state as a diff from the host's
 //!   configured baseline, so adopting into a terminal whose theme changed
-//!   applies the application's overrides on top of the NEW theme rather than
-//!   resurrecting the old one. The XTPUSHCOLORS stack travels whole: each entry
-//!   is exactly what the application asked to have restored.
-//! * [`ShellRepr`] carries the phase, the in-progress mark and block, the
-//!   completed marks and blocks that are still readable, and the monotonic
-//!   counters observers key on. Their rows are absolute, and the checkpoint
-//!   carries each grid's absolute row counter so the restored grids continue
-//!   the same numbering: a mark means the same line after the handoff.
+//!   applies the application's overrides (OSC 4, OSC 10/11) on the new theme.
+//!   The XTPUSHCOLORS stack travels whole.
+//! * [`ShellRepr`] carries the OSC 133/633 phase, the in-progress mark and
+//!   block, the still-readable completed marks and blocks, and the monotonic
+//!   counters observers key on. Rows are absolute and each grid's absolute row
+//!   counter is carried, so a mark names the same line after the handoff and a
+//!   command running across the update still completes on its D.
 //! * [`TitleRepr`] carries the window title (OSC 0/2), the icon name (OSC 0/1)
-//!   and the XTWINOPS title stack (CSI 22/23 t). An in-session update used to
-//!   drop all three: the tab kept its label only until the successor's first
-//!   frame, then fell back to the working directory until the program happened
-//!   to set a title again (the 2026-09-28 round-four plan, item 8), and a
-//!   program that pushed its caller's title to restore it on exit restored
-//!   nothing. The successor treats a carried title as OSC input
-//!   ([`Terminal::restore_title`]): capped, stripped of controls, the stack
-//!   bounded.
+//!   and the XTWINOPS title stack (CSI 22/23 t). The successor treats a carried
+//!   title as OSC input ([`Terminal::restore_title`]): capped, stripped of
+//!   controls, the stack bounded.
 
 use std::collections::VecDeque;
 
@@ -572,16 +561,16 @@ impl Terminal {
         }
     }
 
-    /// Install a carried [`TitleRepr`] AS IF A PROGRAM HAD SENT IT: every string
+    /// Install a carried [`TitleRepr`] as if a program had sent it: every string
     /// capped and stripped the way the OSC handler stores one, and the stack cut
-    /// to [`TITLE_STACK_MAX_DEPTH`] entries — its BOTTOM ones, because that is
+    /// to [`TITLE_STACK_MAX_DEPTH`] entries — its bottom ones, because that is
     /// what a live engine keeps when a push finds the stack full (the push is
     /// dropped). A real change of the window title bumps the title epoch, so a
     /// host polling [`Terminal::title_epoch`] relabels the tab.
     ///
     /// Why not the host's `set_title`: it caps but does not sanitize, since a
     /// host sets its own words. A carried title is the previous process's copy
-    /// of a PROGRAM's words, read back from a file, and gets the program's rules.
+    /// of a program's words, read back from a file, and gets the program's rules.
     pub fn restore_title(&mut self, repr: &TitleRepr) {
         let window = carried_title(&repr.window);
         if *self.title.window != *window {

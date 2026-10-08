@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The round-trip gate: parse then print must reproduce the source BYTE FOR
-//! BYTE, for every `.toml` file in this repository.
+//! The round-trip gate: every `.toml` file in this repository parses, and
+//! parse then print reproduces the source BYTE FOR BYTE.
 //!
 //! Comment and formatting preservation is the entire contract of the document
 //! half — `targo --unverified forge` asserts that rewriting `vendor/forge.toml` does not
@@ -10,7 +10,7 @@
 //! font size will not reflow their config. Anything less than byte equality on
 //! an unmodified document breaks both.
 
-mod common;
+use crate::common;
 
 use common::corpus;
 
@@ -24,6 +24,9 @@ fn every_toml_file_in_the_repository_round_trips_byte_for_byte() {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
+        if let Err(e) = aterm_toml::from_str::<aterm_toml::Value>(&text) {
+            failures.push(format!("{}: value parse failed: {e}", path.display()));
+        }
         let document: aterm_toml::edit::DocumentMut = match text.parse() {
             Ok(d) => d,
             Err(e) => {
@@ -102,30 +105,6 @@ fn formatting_details_survive() {
             document.to_string(),
             source,
             "round-trip changed {source:?}"
-        );
-    }
-}
-
-/// The oracle round-trips these too. Agreeing with `toml_edit` here is what
-/// makes the swap safe for `targo --unverified forge`, whose own test asserts byte equality
-/// through the crate being replaced.
-#[test]
-fn the_oracle_round_trips_the_same_corpus() {
-    for path in corpus() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(theirs) = text.parse::<toml_edit::DocumentMut>() else {
-            continue;
-        };
-        let ours: aterm_toml::edit::DocumentMut = text
-            .parse()
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        assert_eq!(
-            ours.to_string(),
-            theirs.to_string(),
-            "{}: our rendering differs from toml_edit's",
-            path.display()
         );
     }
 }

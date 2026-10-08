@@ -2,19 +2,14 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Test-only Grid write convenience methods.
-//!
-//! These combined write+advance methods are superseded by the split
-//! write/advance primitives in `write_split.rs` for production use.
-//! Retained here for test readability.
+//! Test-only combined write+advance methods; production uses the split
+//! primitives in `write_split.rs`.
 
 use super::{CellFlags, Grid, PackedColor, StyleId};
 
 impl Grid {
-    /// Write a styled character at cursor position and advance cursor.
-    ///
-    /// Production code uses `write_split::write_char_at_cursor_packed` + `advance_cursor_*` instead.
-    /// Retained for test convenience.
+    /// Write a styled character at the cursor and advance it (production:
+    /// `write_split::write_char_at_cursor_packed` + `advance_cursor_*`).
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)

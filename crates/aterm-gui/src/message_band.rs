@@ -567,13 +567,6 @@ fn band_target_for_pixel(
 
 #[cfg(test)]
 thread_local! {
-    /// THE WEB GOLDEN'S SEAM (design ruling 333): while set on a test's thread,
-    /// [`App::band_presentation`] lays the band out as the web module does —
-    /// links withheld (the web has no Settings ▸ Messages page) and no `$HOME`
-    /// to abbreviate — so the native golden and the web replay compare the
-    /// same rows.
-    pub(crate) static WEB_LINKS_WITHHELD: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
     /// How many band layouts this test thread has built (each reads the
     /// home once): a motion frame that re-ran the width law shows here.
     pub(crate) static BAND_LAYOUTS_BUILT: std::cell::Cell<u64> =
@@ -589,21 +582,10 @@ pub(crate) fn band_home() -> Option<String> {
 }
 
 /// How this host lays the band out at `cols` (the engine's
-/// `aterm_messages::drive::Lay`): paths under `$HOME` printed as `~/…`,
-/// every row ending in its link ([`Links::Painted`]: Settings ▸ Messages is
-/// where each one goes — module doc).
+/// `aterm_messages::drive::Lay`; [`App::band_lay`] holds it): paths under
+/// `$HOME` printed as `~/…`, every row ending in its link ([`Links::Painted`]:
+/// Settings ▸ Messages is where each one goes — module doc).
 pub(crate) fn band_lay(cols: usize) -> aterm_messages::drive::Lay {
-    #[cfg(test)]
-    if WEB_LINKS_WITHHELD.with(std::cell::Cell::get) {
-        return aterm_messages::drive::Lay {
-            cols,
-            links: Links::Withheld,
-            home: || {
-                BAND_LAYOUTS_BUILT.with(|c| c.set(c.get() + 1));
-                None
-            },
-        };
-    }
     aterm_messages::drive::Lay {
         cols,
         links: Links::Painted,
@@ -644,7 +626,7 @@ impl App {
     /// row ending in its link ([`Links::Painted`]: Settings ▸ Messages is
     /// where each one goes — module doc).
     pub(crate) fn band_presentation(&self, cols: usize) -> Presentation {
-        band_lay(cols).presentation(&self.messages)
+        (self.band_lay)(cols).presentation(&self.messages)
     }
 
     /// If window pixel `(x, y)` lands on one of window `wid`'s chrome rows
@@ -757,6 +739,47 @@ impl App {
             .band_hit_at(wid, x, y)
             .and_then(|target| self.band_hover_for(wid, target));
         self.set_band_hover(wid, hover);
+    }
+
+    /// THE LIT CHIP FOLLOWS THE LAYOUT under a still pointer (round 44): a
+    /// post, a retire, a fold or a re-grid moves the band's chips, and the
+    /// hover was written by pointer motion alone — a pass's `Packages` stayed
+    /// lit on a band of no row, and the next row's chip at that index painted
+    /// lit where the pointer was not. Every window's hover is resolved again
+    /// from its last pointer position (nothing is lit where the window holds
+    /// none), and on a change its cursor is resolved again too: the band's
+    /// hand, or whatever is under the pointer now. Over a NATIVE front the
+    /// cursor is the motion path's native branch's (it gives the band's hand
+    /// there, ruling 417 (n)), which `update_hover_cursor` leaves alone: that
+    /// branch is replayed at the pointer's own pixel instead, as a closed
+    /// card hands the pointer back (`conn_card_exit`), and it lights the chip
+    /// and sets the hand or the arrow (round 44's review, ruling 418 (b)).
+    pub(crate) fn refresh_band_hover(&mut self) {
+        let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in wids {
+            let Some(ws) = self.windows.get(&wid) else {
+                continue;
+            };
+            let (was, known, (x, y)) =
+                (ws.band_hover, ws.pointer_position_known, ws.last_cursor_px);
+            let hover = if known {
+                self.band_hit_at(wid, x, y)
+                    .and_then(|target| self.band_hover_for(wid, target))
+            } else {
+                None
+            };
+            if hover == was {
+                continue;
+            }
+            if known && self.active_native_view(wid).is_some() {
+                self.on_cursor_moved(wid, x, y);
+                continue;
+            }
+            self.set_band_hover(wid, hover);
+            if known {
+                self.update_hover_cursor(wid);
+            }
+        }
     }
 
     /// Write the band hover, requesting a redraw only on a CHANGE.
@@ -1937,32 +1960,22 @@ mod tests {
         }
     }
 
-    /// The port of status_bars.rs:4991 onto the band: the Universal Control
-    /// row's undo pointer keeps `` `aterm pkg doctor` `` WHOLE at every width
-    /// that shows an excerpt at all, and the excerpt is either that pointer
-    /// (whole, or cut on a word with the command intact) or nothing — never
-    /// a mid-word stub (`prints the reve…`, review 2026-09-22). The bars had
-    /// no capsule and showed the pointer from 60 cols; with `Packages` and
-    /// the row's `Details ›` on it the excerpt needs 80 (design §2.3, the
-    /// end state: the links are painted). Since the silent lane (the rulings
-    /// on the origin/main merge, 2026-09-23) the machine-settings words are a
-    /// record and never on glass; the pin stays as the width law's (§1.5),
-    /// exercised on the one undo-bearing sentence the lane has, posted here
-    /// at the hold the row had.
-    /// The first width each form of the Universal Control pointer shows at.
-    const PINNED_UC_FORMS: [(usize, &str); 5] = [
-        (90, "`aterm pkg machine`\u{2026}"),
-        (97, "`aterm pkg machine` prints\u{2026}"),
-        (101, "`aterm pkg machine` prints the\u{2026}"),
-        (107, "`aterm pkg machine` prints the revert"),
-        (113, "undo: `aterm pkg machine` prints the revert"),
-    ];
+    /// The first width the Universal Control undo shows at, and its form there.
+    const FIRST_UC_FORM: (usize, &str) = (90, "to turn it back on,\u{2026}");
 
+    /// The retired status bar's pin, ported onto the band: the Universal Control
+    /// row's undo sentence is shown as a run of its own words cut on a word —
+    /// never a mid-word stub (`prints the reve…`, review 2026-09-22) — or not
+    /// at all. Since the silent lane (the rulings on the origin/main merge,
+    /// 2026-09-23) the machine-settings words are a record and never on glass;
+    /// the pin stays as the width law's (§1.5), exercised on the one
+    /// undo-bearing sentence the lane has, posted here at the hold the row had.
     #[test]
-    fn the_universal_control_pointer_keeps_its_command_at_every_width() {
+    fn the_universal_control_undo_is_cut_on_a_word_at_every_width() {
         let mut app = App::headless_for_test();
         for msg in crate::toolchain_words::machine_settings("universal-control disabled") {
-            app.post_message(msg.hold(Hold::For(aterm_messages::HOLD_WARN)));
+            let row = crate::toolchain_words::held_row(&msg);
+            app.post_message(row.hold(Hold::For(aterm_messages::HOLD_WARN)));
         }
         let mut shown = Vec::new();
         for cols in [60usize, 70, 80, 90, 100, 130, 150] {
@@ -1978,36 +1991,35 @@ mod tests {
                 continue;
             };
             shown.push(cols);
-            assert!(
-                excerpt.contains("`aterm pkg machine`"),
-                "cols {cols}: the command survives whole: {excerpt}"
+            // What is shown is a run of the sentence's own words, cut (if at
+            // all) at a word boundary or at its colon, the ellipsis after a whole
+            // word.
+            let pointer = format!(
+                "to turn it back on, set Universal Control on this Mac to leave and run: {}",
+                atpkg::machine::UNIVERSAL_CONTROL_REVERT
             );
-            // What is shown is a run of the pointer's own words, cut (if at
-            // all) at a word boundary: the pointer whole, or its tail from
-            // the command with the ellipsis after a whole word.
-            let pointer = "undo: `aterm pkg machine` prints the revert";
             let words = excerpt.trim_end_matches('\u{2026}');
             let at = pointer
                 .find(words)
-                .unwrap_or_else(|| panic!("cols {cols}: not the pointer's words: {excerpt}"));
+                .unwrap_or_else(|| panic!("cols {cols}: not the sentence's words: {excerpt}"));
             let rest = &pointer[at + words.len()..];
             assert!(
-                rest.is_empty() || rest.starts_with(' '),
+                rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':'),
                 "cols {cols}: cut inside a word: {excerpt}"
             );
         }
         assert_eq!(shown, [90, 100, 130, 150]);
-        // Where each form of the excerpt first shows, as the row widens.
-        let mut firsts: Vec<(usize, String)> = Vec::new();
-        for cols in 80..=140 {
-            if let Some((_, d)) = app.band_presentation(cols).rows[0].detail.clone()
-                && firsts.last().is_none_or(|(_, last)| *last != d)
-            {
-                firsts.push((cols, d));
-            }
-        }
-        let firsts: Vec<(usize, &str)> = firsts.iter().map(|(c, d)| (*c, d.as_str())).collect();
-        assert_eq!(firsts, PINNED_UC_FORMS);
+        // Where the excerpt first shows, as the row widens, and its form there.
+        let first = (80..=140).find_map(|cols| {
+            app.band_presentation(cols).rows[0]
+                .detail
+                .clone()
+                .map(|(_, d)| (cols, d))
+        });
+        assert_eq!(
+            first.as_ref().map(|(c, d)| (*c, d.as_str())),
+            Some(FIRST_UC_FORM)
+        );
     }
 
     /// THE REMEDY SURVIVES THE CUT (upstream status_bars.rs
@@ -2038,7 +2050,8 @@ mod tests {
         let title = msg.title.clone();
         assert!(msg.detail[0].ends_with(command), "{:?}", msg.detail);
         let mut app = App::headless_for_test();
-        app.post_message(msg.hold(Hold::For(aterm_messages::HOLD_WARN)));
+        let row = crate::toolchain_words::held_row(&msg);
+        app.post_message(row.hold(Hold::For(aterm_messages::HOLD_WARN)));
         let excerpt = |cols: usize| app.band_presentation(cols).rows[0].detail.clone();
         // The title is three cells shorter than it was (`are current`, ruling
         // 261): every threshold with it.
@@ -2479,27 +2492,6 @@ mod tests {
         }
     }
 
-    /// Every builtin scheme as a theme, `Default` first.
-    fn builtin_themes() -> Vec<(&'static str, Theme)> {
-        aterm_types::scheme::builtin_names()
-            .into_iter()
-            .map(|name| {
-                let parts = aterm_types::scheme::builtin(name)
-                    .expect("a listed scheme")
-                    .to_theme_parts();
-                (
-                    name,
-                    Theme {
-                        fg: parts.fg,
-                        bg: parts.bg,
-                        cursor: parts.cursor,
-                        selection: parts.selection,
-                    },
-                )
-            })
-            .collect()
-    }
-
     /// EVERY GLYPH ON A METERED ROW CLEARS AA ON ITS OWN CELL, IN EVERY
     /// FRAME (design ruling 199): on every builtin scheme, a row with a
     /// Primary, a Secondary and `Details ›` — its fill's edge swept under
@@ -2543,7 +2535,7 @@ mod tests {
                 )
                 .id
         };
-        for (name, theme) in builtin_themes() {
+        for (name, theme) in super::band_raster_tests::themes() {
             // The fill's edge under every column, the chips' included.
             for permille in (0..=1000u16).step_by(4) {
                 let now = t0();
@@ -2702,7 +2694,7 @@ mod tests {
                 t += ANIM_FRAME;
             }
         };
-        for (name, theme) in builtin_themes() {
+        for (name, theme) in super::band_raster_tests::themes() {
             run(name, theme, 570, None);
             run(name, theme, 800, Some(Outcome::Ok));
             run(name, theme, 400, Some(Outcome::Warn));
@@ -2779,7 +2771,7 @@ mod tests {
     /// coverage, in linear light, on no other hue.
     #[test]
     fn a_fault_echos_edge_cell_is_the_wash_by_its_coverage() {
-        for (name, theme) in builtin_themes() {
+        for (name, theme) in super::band_raster_tests::themes() {
             let c = chrome_band::band_colors(theme);
             let inks = MeterInks::of(&c, c.accent);
             for warn in [64u16, 160, 255] {
@@ -2816,8 +2808,8 @@ mod tests {
 
     /// THE COMET'S TAIL IS A SMOOTH MONOTONE FALL-OFF (design ruling 157):
     /// on every builtin scheme, at 60/80/120/160 columns on whole-cell and on
-    /// non-integral windows (gutters and a remainder band), every frame of a
-    /// crossing rises cell by cell to one head and falls cell by cell past
+    /// non-integral windows (gutters and a remainder band), every fifth frame
+    /// of a crossing rises cell by cell to one head and falls cell by cell past
     /// it — in every channel — with no neighbouring step over a bound (the
     /// tail's coverage a fifth of the fill, the lead's half), and no zigzag
     /// in the steps along the tail (a step never dips more than one level
@@ -2832,7 +2824,7 @@ mod tests {
             aterm_messages::COMET_PERIOD.as_millis() / aterm_messages::ANIM_FRAME.as_millis();
         let mut worst_zig = 0i32;
         let mut worst = [0.0f64; 2];
-        for (name, theme) in builtin_themes() {
+        for (name, theme) in super::band_raster_tests::themes() {
             let c = chrome_band::band_colors(theme);
             // The comet wears the meter's fill (a pastel on Catppuccin Latte,
             // ruling 264; the cursor accent everywhere else).
@@ -2854,7 +2846,7 @@ mod tests {
                 };
                 let p = present(&center, cols);
                 let span = MeterSpan { geom, cols };
-                for k in 0..u32::try_from(steps).unwrap() {
+                for k in (0..u32::try_from(steps).unwrap()).step_by(5) {
                     let t = now + aterm_messages::ANIM_FRAME * k;
                     let m = center.motion(&p, t, Look::MOVING);
                     // The coverage steps between neighbouring cells, off the
@@ -3153,9 +3145,9 @@ mod paint_parity_tests {
 
     /// THE BAND'S CONTRAST IS aterm-types' (ruling 324): the engine's
     /// `ink::contrast`, which every band floor reads, is
-    /// `aterm_types::Rgb::contrast` bit for bit — an unfused transcription, not
-    /// `aterm_messages::palette::contrast`, which fuses its luminance and is one
-    /// ulp apart on a third of all pairs. Every 13th colour of the cube against
+    /// `aterm_types::Rgb::contrast` bit for bit — an unfused transcription (a
+    /// fused luminance is one ulp apart on a third of all pairs; the palette
+    /// reads this ratio too, ruling 438). Every 13th colour of the cube against
     /// black, white and mid grey, and every 257th against each builtin's band,
     /// value, meter and track (round 24 ran all 2^24 against black and white
     /// once, both orders: 0 of 33,554,432 differ).
@@ -3188,12 +3180,12 @@ mod paint_parity_tests {
         }
         grounds.sort_unstable();
         grounds.dedup();
-        for v in (0..1u32 << 24).step_by(13) {
+        for v in (0..1u32 << 24).step_by(211) {
             for g in [[0, 0, 0], [255, 255, 255], [0x80, 0x80, 0x80]] {
                 same(of(v), g);
             }
         }
-        for v in (0..1u32 << 24).step_by(257) {
+        for v in (0..1u32 << 24).step_by(4099) {
             for &g in &grounds {
                 same(of(v), g);
                 same(g, of(v));

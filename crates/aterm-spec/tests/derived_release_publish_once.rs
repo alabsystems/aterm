@@ -5,28 +5,11 @@
 //! and finishes every head it makes. Tier-1 lives in
 //! `crates/aterm-release/tests/it/channel_latest.rs`.
 
-use std::collections::BTreeSet;
-
-use aterm_spec::derive::{Model, release_publish_once_model};
+use aterm_spec::derive::release_publish_once_model;
 use aterm_spec::{interp, verify};
 
-#[path = "common/conjunct_audit.rs"]
-mod conjunct_audit;
-use conjunct_audit::audit_guard_conjuncts;
-
-/// Every action the committed machine (`Buggy = 0`) can take — the audit's subject.
-/// The others are the negative controls, each audited below as independently caught.
-fn committed_actions(m: &Model) -> BTreeSet<&'static str> {
-    interp::fired_actions(&interp::with_buggy(m, 0))
-}
-
-fn walk(m: &Model, path: &[&str]) -> interp::State {
-    let mut state = m.init_state();
-    for action in path {
-        assert!(m.fire(action, &mut state), "{action}: {state:?}");
-    }
-    state
-}
+use crate::conjunct_audit::audit_guard_conjuncts;
+use crate::walk::{committed_actions, walk};
 
 #[test]
 fn publish_once_proves_and_catches_every_defect_class() {

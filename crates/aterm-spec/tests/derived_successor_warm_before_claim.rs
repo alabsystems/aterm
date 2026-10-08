@@ -7,8 +7,9 @@
 //! nothing — and each mutant (the post-claim `publish()` into `environ`, a
 //! pre-claim bind, a revealed placeholder, a proving warm present, a folded
 //! hint) is caught. P2's order: the warm prologue runs before the dial except
-//! on the relative-socket shape, a stale hint is re-selected before any
-//! carried present, and every successor proves or exits.
+//! on the relative-socket shape, a stale hint is re-selected and a config
+//! edited during the hold is warmed again before any carried present, and
+//! every successor proves or exits.
 
 use aterm_spec::{
     derive::{
@@ -27,7 +28,7 @@ fn successor_warm_before_claim_proves_and_catches() {
 }
 
 /// Each invariant mutant with the invariant it was written for.
-const MUTANTS: [(&str, &str); 8] = [
+const MUTANTS: [(&str, &str); 9] = [
     ("PublishToEnv", "NoEnvMutationAfterSpawn"),
     ("BindWhileWarming", "NothingOwnedBeforeClaim"),
     ("RevealPlaceholder", "NeverRevealedBeforeClaim"),
@@ -35,6 +36,10 @@ const MUTANTS: [(&str, &str); 8] = [
     ("FoldHint", "HintNotInProof"),
     ("WarmBeforeDialOnRelativeSocket", "NoCwdChangeAfterSpawn"),
     ("PresentAtHintedSize", "CarriedPresentAtCarriedSize"),
+    (
+        "PresentUnderStaleConfig",
+        "CarriedPresentUnderCurrentConfig",
+    ),
     // Also the liveness property's mutant (below).
     ("JoinWorkerBeforeDial", "PrologueJoinsNoThread"),
 ];
@@ -48,7 +53,7 @@ fn only(mutant: &str) -> aterm_spec::derive::Model {
     model
 }
 
-/// Every invariant is falsified by one mutant ALONE, so none of the nine is
+/// Every invariant is falsified by one mutant ALONE, so none of the ten is
 /// carried by another's counterexample.
 #[test]
 fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
@@ -76,7 +81,9 @@ fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
 
 /// P2's order, walked: the launched lane warms before it dials; the relative
 /// socket shape cannot, and warms after the intake; a stale hint blocks the
-/// carried present until the join re-selects the carried size.
+/// carried present until the join re-selects the carried size, and a config
+/// edit the outgoing process applied during the hold blocks it until the
+/// config half of the warm runs again.
 #[test]
 fn the_warm_precedes_the_dial_except_where_the_intake_changes_directory() {
     let model = native_update_successor_warm_before_claim_model();
@@ -143,6 +150,26 @@ fn the_warm_precedes_the_dial_except_where_the_intake_changes_directory() {
     );
     assert!(model.fire("Reshape", &mut stale));
     assert!(model.fire("RealPresent", &mut stale));
+
+    let mut edited = model.init_state();
+    for action in [
+        "Capture",
+        "SpawnWarm",
+        "WarmDone",
+        "Dial",
+        "ConfigEdit",
+        "ClaimOk",
+        "TakeOwned",
+        "Adopt",
+    ] {
+        assert!(model.fire(action, &mut edited), "{action}: {edited:?}");
+    }
+    assert!(
+        !model.action_enabled("RealPresent", &edited),
+        "no carried present under the config the early warm read: {edited:?}"
+    );
+    assert!(model.fire("Rewarm", &mut edited));
+    assert!(model.fire("RealPresent", &mut edited));
 }
 
 /// Liveness: every successor proves or exits, under the fairness stated on

@@ -193,31 +193,6 @@ fn inherited_block(text: &mut String, s: &Sorted<'_>, base: &differential::BaseR
          \x20         here and in the receipt (`inherited`) for main to fix:\n",
     );
     since_list(text, &s.inherited, base.now);
-    nearest_block(text, s, base);
-}
-
-/// WHY EACH INHERITED RED QUALIFIED, when the base is a NEAREST one (opt-in,
-/// [`crate::nearest`]) — nothing under the exact rule, so a default run's
-/// verdict is what it always was.
-fn nearest_block(text: &mut String, s: &Sorted<'_>, base: &differential::BaseReds) {
-    let Some(gate) = &base.nearest else {
-        return;
-    };
-    if s.inherited.is_empty() {
-        return;
-    }
-    text.push_str(&format!(
-        "          NEAREST BASE (--nearest-base, opt-in): main's receipt is for {}, {} commit(s)\n\
-         \x20         before the merge-base {}, which has none that serves; each red above was\n\
-         \x20         inherited from it because:\n",
-        short(&base.commit),
-        gate.steps,
-        short(&gate.merge_base)
-    ));
-    for (f, _) in &s.inherited {
-        let why = gate.qualifies(f).unwrap_or("it qualified");
-        text.push_str(&format!("      - {}: {why}\n", f.id));
-    }
 }
 
 /// Render the verdict block and decide the exit code, judging every red
@@ -257,16 +232,12 @@ pub fn under_load_block(t: &Tally) -> String {
             }
         }
     }
-    let Some((_, first, _)) = items.first() else {
+    if items.is_empty() {
         return String::new();
-    };
-    let mut text = format!(
-        "          UNDER LOAD — a label, not an excuse: {} failure(s) read as a clock running\n\
-         \x20         out, in a stage whose one-minute load passed half of the machine's {}\n\
-         \x20         cores. A busy machine can starve a correct test, and each still counts\n\
-         \x20         here; re-take it on a quieter machine before reading it as the change's:\n",
-        items.len(),
-        first.cores
+    }
+    let mut text = String::from(
+        "          UNDER LOAD — still counted; re-run these on a quieter machine before reading\n\
+         \x20         them as the change's (load past half the cores):\n",
     );
     for (f, load, marker) in &items {
         text.push_str(&format!(
@@ -365,7 +336,6 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
                 "          INHERITED — red on main with the same failure, so not this change's:\n",
             );
             since_list(&mut text, &sorted.inherited, base.now);
-            nearest_block(&mut text, &sorted, base);
         }
         could_not_run_tail(&mut text, t);
         return Verdict {
@@ -412,19 +382,24 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
             "  VERIFY: COULD NOT RUN (mode={mode_word} scope={scope_word}) — DO NOT merge\n"
         ));
         // Nothing decided is not "nothing wrong" (2026-09-27): most often the
-        // machine (no driver, a missing helper, a refused test), but a paint
-        // or spin probe that could not launch its window is COULD NOT RUN too,
-        // and that can be a crash in the code — so the reader is sent to each
-        // row's own reason, never told the change is cleared or which cause is
-        // likelier.
+        // machine (no driver, a full disk), but a paint or spin probe that could
+        // not launch its window is COULD NOT RUN too, and that can be a crash in
+        // the code. The clause says so only when a measuring row is among them.
+        let probe = t
+            .could_not_run
+            .iter()
+            .any(|c| c.contains(crate::stages::MEASURING_TESTS[0]));
         text.push_str(&format!(
-            "          {n} could not execute — no verdict; one that could not launch may be a \
-             crash in the change:\n"
+            "          {n} could not execute — nothing was decided; each row says why{}:\n",
+            if probe {
+                "; a paint or spin probe that could not launch may be a crash in the change"
+            } else {
+                ""
+            }
         ));
         for c in &t.could_not_run {
             text.push_str(&format!("      - {c}\n"));
         }
-        text.push_str("          Fix each reason above and run again.\n");
         if let Some(base) = base {
             inherited_block(&mut text, &sorted, base);
         }
@@ -470,7 +445,7 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
             }
         }
         text.push_str(if mode.runs(Tier::Land) {
-            "          Before you land: `tools/verify.sh`, whole-tree, with nothing skipped.\n"
+            land_remedy(scope, t)
         } else {
             "          `tools/verify.sh` is the merge contract. A release cut needs a --measure\n\
              \x20         run of the committed tree it cuts, green with nothing skipped.\n"
@@ -583,6 +558,31 @@ fn could_not_run_tail(text: &mut String, t: &Tally) {
     text.push_str("          fix those too, or the next run decides less than this one.)\n");
 }
 
+/// A narrowed LAND run's one action, chosen from the kinds of skip in it. A
+/// skip the reader can lift by re-running gets the whole-tree line; a
+/// `--no-windows` skip lifts only on an idle desktop; a library this host's
+/// verifier ceiling refused cannot be lifted on this machine at all (its skip
+/// row names the RAM that verifies it), nor is a test run's skip for a wedged
+/// `trustd` (its row names the reboot), so the verdict ends at that row.
+fn land_remedy(scope: &Scope, t: &Tally) -> &'static str {
+    let names_its_remedy = |s: &String| {
+        s.starts_with(crate::stages::TRUST_NARROWED_BY_MEMORY)
+            || s.starts_with(crate::libtest::TRUSTD_SKIPPED)
+    };
+    let windows = |s: &String| s.contains(crate::plan::NO_WINDOWS_REASON);
+    let rerunnable =
+        scope.narrowing().is_some() || t.skips.iter().any(|s| !names_its_remedy(s) && !windows(s));
+    if rerunnable || t.skips.is_empty() {
+        "          Before you land: `tools/verify.sh`, whole-tree, with nothing skipped.\n"
+    } else if t.skips.iter().any(windows) {
+        "          The windowed stages run on an idle desktop: `tools/verify.sh` there.\n"
+    } else {
+        // The skip row already names what lifts it (the RAM that verifies the
+        // library, the reboot that clears trustd); no re-run here does.
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,7 +608,6 @@ mod tests {
                 hash: (*hash).to_string(),
                 opaque: None,
                 timing: None,
-                package: None,
             })
             .collect();
         // Rows a caller named by hand come first and have no findings; the
@@ -641,7 +640,6 @@ mod tests {
                 })
                 .collect(),
             now: NOW,
-            nearest: None,
         })
     }
 
@@ -658,7 +656,6 @@ mod tests {
             hash: H.into(),
             opaque: None,
             timing,
-            package: None,
         };
         let busy = StageLoad {
             start: 7482,
@@ -719,8 +716,8 @@ mod tests {
         assert!(!v.claims_merge_contract);
         assert!(
             v.text.contains(
-                "          UNDER LOAD — a label, not an excuse: 1 failure(s) read as a clock \
-                 running\n"
+                "          UNDER LOAD — still counted; re-run these on a quieter machine before \
+                 reading\n"
             ),
             "{}",
             v.text
@@ -817,64 +814,6 @@ mod tests {
     /// <sha>)` and main's receipt, then the new reds (why each is new), the
     /// ones past the cap with their age, and the inherited ones — each named
     /// once, and exit 1.
-    /// THROUGH A NEAREST BASE (opt-in) the verdict names the base, the
-    /// merge-base it stands in for, and why each inherited red qualified; a
-    /// red the gate refused is NEW with its reason. Judged by the exact rule
-    /// the same tally prints none of it.
-    #[test]
-    fn a_nearest_base_names_why_each_inherited_red_qualified() {
-        let t = with_row(
-            with_row(
-                tally(0, 0, &[]),
-                "tests of a",
-                &[("-p a --lib -- red_a", H)],
-            ),
-            "tests of c",
-            &[("-p c --lib -- red_c", H)],
-        );
-        let Against::Base(exact) = main_red(&[
-            ("-p a --lib -- red_a", H, 3600),
-            ("-p c --lib -- red_c", H, 3600),
-        ]) else {
-            unreachable!("main_red is a base")
-        };
-        let mut crates = std::collections::BTreeMap::new();
-        crates.insert("a".to_string(), Ok("no file of `a` changed".to_string()));
-        crates.insert("c".to_string(), Err(crate::nearest::RADIUS_CHANGED));
-        let near = differential::BaseReds {
-            nearest: Some(crate::nearest::Gate {
-                merge_base: "1".repeat(40),
-                steps: 7,
-                span_secs: 7200,
-                crates,
-            }),
-            ..exact.clone()
-        };
-        let mut t = t;
-        for (row, package) in [(0, "a"), (1, "c")] {
-            for f in &mut t.findings[row] {
-                f.package = Some(package.to_string());
-            }
-        }
-        let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &Against::Base(near));
-        assert_eq!(v.exit, exit::FAILED, "{}", v.text);
-        assert!(
-            v.text.contains("NEAREST BASE (--nearest-base, opt-in)")
-                && v.text.contains("7 commit(s)")
-                && v.text
-                    .contains("      - -p a --lib -- red_a: no file of `a` changed")
-                && v.text.contains(&format!(
-                    "      - -p c --lib -- red_c — never inherited: {}",
-                    crate::nearest::RADIUS_CHANGED
-                )),
-            "{}",
-            v.text
-        );
-        let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &Against::Base(exact));
-        assert!(v.claims_merge_contract, "{}", v.text);
-        assert!(!v.text.contains("NEAREST"), "{}", v.text);
-    }
-
     #[test]
     fn a_judged_failure_names_new_expired_and_inherited_reds_apart() {
         let t = with_row(
@@ -1185,6 +1124,50 @@ mod tests {
                 .contains("      - tippy lint (Trust stage2 toolchain not built)")
         );
         assert!(v.text.contains("      - gui smoke (macOS only)"));
+        assert!(v.text.contains("Before you land: `tools/verify.sh`"));
+    }
+
+    /// The narrowed PASS's one action is one the reader can take: a skip this
+    /// machine's RAM caused is not lifted by re-running, and a `--no-windows`
+    /// skip lifts only on an idle desktop.
+    #[test]
+    fn a_narrowed_pass_names_only_an_action_this_machine_can_take() {
+        let memory = format!(
+            "{}not verified on this host (8 GiB RAM): aterm-ctl; 20 GiB of RAM verifies it",
+            crate::stages::TRUST_NARROWED_BY_MEMORY
+        );
+        let windows = format!("gui smoke ({})", crate::plan::NO_WINDOWS_REASON);
+        let ws = Scope::workspace();
+        let only_memory = verdict(Mode::Fast, &ws, &tally(0, 0, &[&memory]));
+        // Its skip row names the RAM that verifies it; the verdict's action ends
+        // there, and the MEASURE tier note follows straight on.
+        assert!(
+            only_memory
+                .text
+                .contains(&format!("      - {memory}\n          MEASURE tier:")),
+            "{}",
+            only_memory.text
+        );
+        assert!(!only_memory.text.contains("Before you land:"));
+        for skips in [vec![windows.as_str()], vec![windows.as_str(), &memory]] {
+            let v = verdict(Mode::Fast, &ws, &tally(0, 0, &skips));
+            assert!(
+                v.text.contains(
+                    "The windowed stages run on an idle desktop: `tools/verify.sh` there"
+                ),
+                "{}",
+                v.text
+            );
+            assert!(!v.text.contains("the skip above"), "{}", v.text);
+            assert!(!v.text.contains("Before you land:"), "{}", v.text);
+        }
+        // Any skip a re-run can lift keeps the whole-tree line.
+        let mixed = verdict(
+            Mode::Fast,
+            &ws,
+            &tally(0, 0, &[&memory, "tippy lint (no tippy)"]),
+        );
+        assert!(mixed.text.contains("Before you land:"), "{}", mixed.text);
     }
 
     /// The failure side of the skip rule above. A run is read top-to-bottom by
@@ -1439,16 +1422,32 @@ mod tests {
             v.text
                 .contains("VERIFY: COULD NOT RUN (mode=fast scope=workspace) — DO NOT merge")
         );
-        assert!(v.text.contains(
-            "          2 could not execute — no verdict; one that could not launch may be a \
-             crash in the change:\n"
-        ));
+        assert!(
+            v.text.contains(
+                "          2 could not execute — nothing was decided; each row says why:\n"
+            )
+        );
+        assert!(!v.text.contains("run again"), "{}", v.text);
         assert!(
             !v.text.contains("NOT a verdict on your change"),
             "{}",
             v.text
         );
         assert!(!v.text.contains(MERGE_CONTRACT_SENTENCE));
+        // A measuring probe that could not launch may be the change crashing.
+        let mut t = tally(0, 0, &[]);
+        t.could_not_run = vec![
+            "targo test --workspace --test paint --test spin -- measuring:: — exit 3".to_string(),
+        ];
+        let v = verdict(Mode::Fast, &Scope::workspace(), &t);
+        assert!(
+            v.text.contains(
+                "each row says why; a paint or spin probe that could not launch may be a crash \
+                 in the change:\n"
+            ),
+            "{}",
+            v.text
+        );
     }
 
     #[test]

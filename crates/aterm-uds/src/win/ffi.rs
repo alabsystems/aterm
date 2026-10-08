@@ -3,7 +3,8 @@
 
 //! Raw Win32 declarations for the AF_UNIX-over-winsock transport — the ONLY
 //! FFI in this crate, kept in one auditable file. `ws2_32` (sockets),
-//! `kernel32` (short-path fallback + pid liveness), `bcrypt` (CSPRNG). All
+//! `kernel32` (short-path fallback + pid liveness + console presence for
+//! `crate::spawn`), `bcrypt` (CSPRNG). All
 //! import libraries ship with every Windows SDK, so `#[link]` is clean on
 //! stable with zero dependencies.
 
@@ -134,6 +135,9 @@ unsafe extern "system" {
     ) -> RawHandle;
     pub(crate) fn GetExitCodeProcess(hProcess: RawHandle, lpExitCode: *mut u32) -> i32;
     pub(crate) fn CloseHandle(hObject: RawHandle) -> i32;
+    /// The pids attached to this process's console; 0 when it has none
+    /// (`crate::spawn::have_console`).
+    pub(crate) fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
 }
 
 #[link(name = "bcrypt")]

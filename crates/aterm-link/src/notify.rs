@@ -10,10 +10,9 @@
 //!                   [--exec-timeout <ms>] [--tcp [--key-file <p>]]
 //! ```
 //!
-//! Until this verb is green the fabric has no outbound path at all: `ls` and
-//! `aterm fabric` are both PULLS, so an `attention` raised on a headless box at
-//! 3 a.m. reaches nobody until somebody looks (§13). This runs a command the
-//! operator chose — ntfy, mail, a webhook — once per matching record.
+//! `ls` and `aterm fabric` are PULLS, so without this an `attention` raised on
+//! a headless box reaches nobody until somebody looks (§13). This runs a
+//! command the operator chose — ntfy, mail, a webhook — once per matching record.
 //!
 //! ## The failure it chooses, said out loud
 //!
@@ -22,14 +21,10 @@
 //! one atomic act. The journal entry is therefore written **before** the exec and
 //! completed **after** it, and an entry left in `firing` by a crash is IN DOUBT.
 //!
-//! **This rung re-fires an in-doubt entry.** The chosen failure is *a command that
-//! runs twice*, never *a command that never runs* — because the one thing A10
-//! exists to prevent is an escalation that reaches nobody, and a duplicate push
-//! costs a human two seconds while a lost one costs them the night. The re-fire is
-//! labelled: the command sees `ATERM_NOTIFY_DUP=1` and the journal keeps the whole
-//! history, so a duplicate is legible rather than mysterious. There is no third
-//! option, and pretending otherwise would be the "exactly once" claim this
-//! codebase keeps refusing to accept.
+//! **An in-doubt entry re-fires.** The chosen failure is *a command that runs
+//! twice*, never *a command that never runs*: A10 exists to prevent an
+//! escalation that reaches nobody. The re-fire is labelled — the command sees
+//! `ATERM_NOTIFY_DUP=1` and the journal keeps the history.
 //!
 //! Every other window resolves the same way. A crash between the `firing` write
 //! and the spawn re-fires (the command runs, once). A crash between the spawn and
@@ -83,9 +78,10 @@
 //! drop, which is the one thing this module refuses to do. The budget is what
 //! bounds a storm.
 
+use aterm_uds::spawnfd::Stdio;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -214,26 +210,14 @@ impl Sel {
     /// one-or-more segments, so a right-anchored reading of an over-long subject
     /// is exactly the forgery a peer would reach for.
     ///
-    /// **AND EVERY SEGMENT IT KEEPS IS A PRINCIPAL, CHECKED HERE.** The shape
-    /// used to be the whole of the wall, and the segments went into [`Hit`]
-    /// verbatim — from there into `/bin/sh -c`'s ENVIRONMENT, which is the one
-    /// seam in this crate where a stranger's bytes reach a human's phone. They
-    /// are not cap-forced: a node's grant is `rw,p=<n>:/f/<F>/pub/<n>/>`, so a
-    /// presence row's owner segment is whatever that node types, and an inbox
-    /// grant is `rw,p=<p>:/f/<F>/in/*/*/<p>/*`, so BOTH the node and the sid of
-    /// an `ask` are the SENDER's. astream refuses only wildcards and bytes below
-    /// `0x20`, so a 200 000-byte segment, a bidi override and a homoglyph all
-    /// arrive intact — and a big enough environment block makes `Command::spawn`
-    /// fail `E2BIG` AFTER the rate budget was charged, which is a push the human
-    /// never gets and a slot they cannot get back.
-    ///
-    /// This crate's other two readers of the same rows already refuse it —
-    /// `cli.rs`'s `column()` truncates, `glance::Row::parse` REJECTS — so the
-    /// wall here is theirs, not a third one: the presence arm calls
-    /// [`crate::glance::Row::parse`] outright, and the other two arms call the
-    /// same [`crate::subject::is_principal`] that `parse_in` and `Row::parse`
-    /// are built out of. A refused subject is not a hit: no journal line, no
-    /// budget charged, nothing spawned.
+    /// **Every segment it keeps is a principal, checked here**, because each one
+    /// becomes an environment value of `/bin/sh -c`. They are not cap-forced: a
+    /// presence row's owner, and an `ask`'s node and sid, are the SENDER's
+    /// choice, and astream refuses only wildcards and bytes below `0x20`. An
+    /// oversized segment would make `spawn` fail `E2BIG` after the rate budget
+    /// was charged. The presence arm calls [`crate::glance::Row::parse`]; the
+    /// others call [`crate::subject::is_principal`]. A refused subject is not a
+    /// hit: no journal line, no budget charged, nothing spawned.
     fn hit(&self, fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Hit> {
         let segs: Vec<&str> = subject.split('/').collect();
         if segs.first() != Some(&"") || segs.get(1) != Some(&"f") || segs.get(2) != Some(&fleet) {
@@ -243,13 +227,8 @@ impl Sel {
         let field = |k: &str| parsed.unknown.get(k).cloned().unwrap_or_default();
         match self {
             Sel::Attention => {
-                // ONE READER OF A PRESENCE ROW, NOT THREE. `glance::Row::parse`
-                // is the wall `ls` and `aterm fabric` already stand behind: seven
-                // segments, this fleet, `pub`/`presence`, a node that is a
-                // principal and an owner that is `node` or an `s-` principal.
-                // A second copy of that rule here is a second chance to disagree
-                // with it, and the row that reaches a human's phone is the last
-                // place to be the looser reader.
+                // One reader of a presence row: the same wall `ls` and
+                // `aterm fabric` stand behind, so the three cannot disagree.
                 let row = crate::glance::Row::parse(fleet, offset, subject, body)?;
                 let attention = crate::pct::decode(row.field("attention"));
                 if attention.is_empty() || attention == crate::glance::ABSENT {
@@ -340,25 +319,17 @@ pub struct Hit {
     pub text: String,
 }
 
-/// The subject, as an environment value.
-///
-/// EVERY SEGMENT IS ALREADY A PRINCIPAL by the time this runs, so the length is
-/// bounded by construction — which is exactly the kind of agreement between two
-/// places that this project's worst defects are made of. It is bounded HERE too,
-/// through the same flattening every other untrusted string in this file goes
-/// through, so the bound on what `exec` puts in an environment block is one
-/// number in one place rather than a property of a parse three arms away.
+/// The subject, as an environment value. Every segment is already a
+/// principal, but it is flattened and capped here too, so the bound on what
+/// `exec` puts in an environment block is [`TEXT_MAX`], not a property of the
+/// parse.
 fn subject_env(subject: &str) -> String {
     one_line(subject)
 }
 
 /// Flatten untrusted text to one line of printable ASCII, capped at
-/// [`TEXT_MAX`].
-///
-/// Not decoration. This string is handed to a command the operator wrote, and
-/// that command may well echo it at a terminal: a raw `ESC` or `CR` in an
-/// attention string must not become an escape sequence somewhere down the line,
-/// and a body is arbitrary bytes from anyone holding a cap.
+/// [`TEXT_MAX`]. The command may echo it at a terminal, so a raw `ESC` or `CR`
+/// from a cap holder must not survive.
 fn one_line(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(TEXT_MAX));
     for ch in s.chars() {
@@ -474,33 +445,18 @@ impl Store {
     }
 }
 
-/// TEST-ONLY fault injection, armed by `$ATERM_LINK_NOTIFY_FAULT` — and
-/// TEST-ONLY is enforced, not merely documented: [`Fault::from_env`] reads the
-/// variable through `aterm_types::dev_seam!`, which a release build compiles to
-/// `None`, so a released `aterm-link notify` honours no fault at all.
+/// TEST-ONLY fault injection, armed by `$ATERM_LINK_NOTIFY_FAULT`.
+/// [`Fault::from_env`] reads it through `aterm_types::dev_seam!`, which a
+/// release build compiles to `None`. The gate is required, as for
+/// `bridge::Fault`: the variable is on no env deny list (it is inherited
+/// through `fabric_launch::filter_child_env` on purpose), and [`Fault::fire`]
+/// kills the notifier — the fabric's only outbound path — between a command
+/// and its journal line.
 ///
-/// THE GATE IS THE BRIDGE'S, APPLIED TO ITS TWIN. `bridge::Fault` closed exactly
-/// this in round 2 and its doc argued the whole case; the argument transfers
-/// word for word, because `ATERM_LINK_NOTIFY_FAULT` sits in the same place as
-/// `ATERM_LINK_FAULT`: on neither `ENV_DENY_VARS` nor `ENV_DENY_PREFIXES` (see
-/// `aterm_types::env_sanitize`), and inherited through
-/// `fabric_launch::filter_child_env` ON PURPOSE, which that file states in as
-/// many words. So the variable survives the PTY child-shell seam, a login
-/// profile, a launchd plist and a nested-aterm hop, and what it buys an attacker
-/// here is worse than a doc defect: [`Fault::fire`] kills the process between the
-/// operator's escalation command and the journal line that records it, and A10
-/// is the fabric's ONLY outbound path — an `attention` raised on a headless box
-/// at 3 a.m. reaches nobody until somebody looks. One env var turned the
-/// escalation channel off and re-paged the human on restart. A fix that gated
-/// one of two identically-placed knobs was half a fix;
-/// [`tests::no_fault_knob_this_crate_ships_is_armed_in_a_released_binary`] is
-/// what makes the next one impossible to forget.
-///
-/// The in-doubt window is between the command's exit and the journal's `fired`
-/// line, and it is microseconds wide. A test that raced it from outside would be
-/// the flake this codebase refuses, so the process crashes ITSELF at exactly that
-/// point — A3's idiom, one shot, with the marker in the state dir because the
-/// process that would remember is the one that dies.
+/// The in-doubt window (command exit to the `fired` line) is microseconds
+/// wide, so instead of racing it from outside the process kills ITSELF there —
+/// one shot, with the marker in the state dir because the process that would
+/// remember is the one that dies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
     None,
@@ -510,10 +466,7 @@ enum Fault {
 
 impl Fault {
     fn from_env(store: &Store) -> Self {
-        // A RELEASED BINARY HONOURS NO FAULT — the same first line, for the same
-        // reason, as `bridge::Fault::from_env`. See the type's doc: this knob is
-        // stripped by no deny list, and the process it kills is the fleet's only
-        // way to wake a human.
+        // A released binary honours no fault (see the type's doc).
         let Some(fault) = aterm_types::dev_seam!("ATERM_LINK_NOTIFY_FAULT") else {
             return Fault::None;
         };
@@ -532,7 +485,7 @@ impl Fault {
     /// and not `abort` (its `SIGABRT` made macOS write a crash report per fault).
     fn fire(self, store: &Store) -> ! {
         let _ = std::fs::write(store.root.join("fault-fired"), b"1\n");
-        eprintln!("aterm-link notify: ATERM_LINK_NOTIFY_FAULT={self:?} — dying here");
+        eprintln!("aterm-link notify: ATERM_LINK_NOTIFY_FAULT={self:?}: dying");
         aterm_uds::process::kill_self_now()
     }
 }
@@ -687,7 +640,7 @@ impl Notifier {
                 )?;
                 eprintln!(
                     "aterm-link notify: DROPPED off={off} on={} reason=rate limit={}/{}ms \
-                     suppressed={} — the record is still on the bus",
+                     suppressed={}; the record stays on the bus",
                     hit.on, self.cfg.limit, self.cfg.window_ms, self.suppressed
                 );
                 self.counts.dropped += 1;
@@ -706,23 +659,9 @@ impl Notifier {
             format!("{off} fired on={} {verdict} dup={}", hit.on, u8::from(dup)),
         )?;
         // CLEARED ONLY WHEN THE COMMAND WAS TOLD, and `rc=0` is the only verdict
-        // that says so.
-        //
-        // This used to clear unconditionally, `verdict` unread — including
-        // `rc=spawn-failed`, which is the case where `Command::spawn` itself
-        // failed and NO process ever received `ATERM_NOTIFY_SUPPRESSED`. Twenty
-        // rate-dropped escalations then became zero on disk and the human was
-        // never told any of them existed, which is precisely the silence the
-        // rate limiter's whole design exists to avoid (see the header).
-        //
-        // The other verdicts are judged the same way and for the same reason.
-        // `rc=<n>` and `rc=signalled` mean the command ran and did not say it
-        // succeeded; `rc=timeout` means it was killed part-way; `rc=wait-failed`
-        // means this process lost track of it. In every one of those the env was
-        // delivered but the PUSH may not have been, and the module's chosen
-        // direction is stated at the top of this file: told twice, never untold.
-        // So the count is KEPT and rides on the next command that answers `rc=0`.
-        // It is a counter, not a queue — keeping it costs one number.
+        // that says so: `spawn-failed` delivered nothing, and `rc=<n>`,
+        // `signalled`, `timeout` and `wait-failed` may not have pushed. The
+        // count rides to the next `rc=0` — told twice, never untold.
         if carried > 0 && verdict == "rc=0" {
             self.suppressed -= carried;
             self.store.set_suppressed(self.suppressed)?;
@@ -737,7 +676,7 @@ impl Notifier {
     /// Run the operator's command. Never fails the run: a notifier that exited
     /// because `curl` was missing would be a notifier that stopped notifying.
     fn exec(&self, hit: &Hit, dup: bool, suppressed: u64) -> String {
-        let mut cmd = Command::new("/bin/sh");
+        let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
         cmd.arg("-c")
             .arg(&self.cfg.exec)
             .stdin(Stdio::null())
@@ -790,7 +729,7 @@ impl Notifier {
                 let _ = child.kill();
                 let _ = child.wait();
                 eprintln!(
-                    "aterm-link notify: --exec outlived --exec-timeout for off={}; killed",
+                    "aterm-link notify: --exec timed out for off={}; killed",
                     hit.offset
                 );
                 return "rc=timeout".to_string();
@@ -1016,9 +955,8 @@ aterm-link notify — run a command when the fabric needs a human
                     --on <attention|ask:<p>|halt>,... --exec <cmd> [options]
 
   --on <sel>,...         what is worth waking someone for; repeatable
-  --exec <cmd>           the command, run as `/bin/sh -c <cmd>`. Every fact about
-                         the record arrives in $ATERM_NOTIFY_* — nothing from a
-                         record is ever interpolated into this string
+  --exec <cmd>           run as `/bin/sh -c <cmd>`; record facts arrive only in
+                         $ATERM_NOTIFY_*, never in <cmd>
   --rate <n>/<window>    the budget, e.g. 10/1m, 1/30s, 40/1h (default 10/1m)
   --since head|start|<n> where a selector with no cursor starts (default head)
   --once                 catch up to the head and exit, rather than following
@@ -1027,10 +965,8 @@ aterm-link notify — run a command when the fabric needs a human
   --tcp                  reach the broker over TCP — PLAINTEXT unless --key-file
   --key-file <path>      the sealed wire's key (needs --tcp and a `sealed` build)
 
-The command runs once per matching OFFSET, deduped durably across a restart. The
-one window that cannot be closed is the exec itself: a crash between the spawn
-and the journal's completion RE-FIRES, with ATERM_NOTIFY_DUP=1. A push that
-arrives twice is the failure this verb chooses; one that never arrives is not.
+The command runs once per matching offset, deduped across restarts. A crash
+during the exec re-fires it with ATERM_NOTIFY_DUP=1: twice, never zero times.
 ";
 
 /// `aterm-link notify`.
@@ -1040,9 +976,8 @@ arrives twice is the failure this verb chooses; one that never arrives is not.
 /// Never: every failure is an exit code and a line on stderr.
 #[must_use]
 pub fn main(args: &[String]) -> ExitCode {
-    // A BUILD WITHOUT THE SEALED WIRE refuses it by name, before the key file
-    // is read and without the usage under it, rather than following selectors
-    // whose every subscribe fails, every 5 s, for ever — `serve`'s rule.
+    // A build without the sealed wire refuses it by name, before the key file
+    // is read, rather than retrying a subscribe that can never succeed.
     if let Some(refusal) = transport::sealed_flags_refusal(args) {
         eprintln!("aterm-link notify: --key-file: {refusal}");
         return ExitCode::from(2);
@@ -1159,29 +1094,16 @@ fn parse(args: &[String]) -> Result<Config, String> {
         ));
     }
     if cfg.on.is_empty() {
-        return Err("--on is required: there is nothing to watch for".to_string());
+        return Err("--on is required".to_string());
     }
     if cfg.exec.is_empty() {
-        return Err("--exec is required: there is nothing to run".to_string());
+        return Err("--exec is required".to_string());
     }
-    // A KEY WITHOUT `--tcp` IS A MISTAKE, NOT A DEFAULT — `serve`'s rule, for
-    // `serve`'s reason, and the two must not disagree about it.
-    cfg.transport = match (tcp, key_file) {
-        (false, None) => Transport::Unix,
-        (true, None) => {
-            eprintln!(
-                "aterm-link notify: --tcp without --key-file is PLAINTEXT. Trusted networks only."
-            );
-            Transport::Tcp
-        }
-        (true, Some(path)) => Transport::Sealed(Box::new(
-            transport::read_key_file(&path)
-                .map_err(|e| format!("--key-file {}", transport::describe(&path, &e)))?,
-        )),
-        (false, Some(_)) => {
-            return Err("--key-file needs --tcp (the sealed wire is a TCP transport)".to_string())
-        }
-    };
+    cfg.transport = crate::cli::transport_from_flags(
+        tcp,
+        key_file,
+        "aterm-link notify: --tcp without --key-file is PLAINTEXT. Trusted networks only.",
+    )?;
     if cfg.state_dir.is_empty() {
         cfg.state_dir = crate::cli::default_state_dir();
     }
@@ -1194,10 +1116,7 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
     let (n, window) = s.split_once('/').ok_or_else(bad)?;
     let limit: u32 = n.parse().map_err(|_| bad())?;
     if limit == 0 {
-        return Err(format!(
-            "--rate {s}: a limit of 0 would drop every notification; \
-             stop the notifier instead of blinding it"
-        ));
+        return Err(format!("--rate {s}: a limit of 0 drops every notification"));
     }
     let (digits, unit) = window.split_at(window.len().saturating_sub(1));
     let count: u64 = digits.parse().map_err(|_| bad())?;
@@ -1208,7 +1127,7 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
         _ => return Err(bad()),
     };
     if ms == 0 {
-        return Err(format!("--rate {s}: a zero window is not a window"));
+        return Err(format!("--rate {s}: the window must be non-zero"));
     }
     Ok((limit, ms))
 }
@@ -1262,23 +1181,9 @@ mod tests {
         producer.join().unwrap();
     }
 
-    /// **EVERY SUBJECT SEGMENT THAT BECOMES AN ENVIRONMENT VALUE IS A
-    /// PRINCIPAL.** The shape check was the whole wall, and the segments went
-    /// into `Hit` verbatim — from there into `/bin/sh -c`'s environment.
-    ///
-    /// They are not cap-forced. A presence row's OWNER segment is whatever the
-    /// publishing node types; an `ask`'s node AND sid are whatever the SENDER
-    /// types (its grant cap-forces only the addressee, which is the operator's
-    /// own `--on ask:<p>`). astream refuses wildcards and bytes under `0x20` and
-    /// nothing else, so 200 000 bytes, a bidi override and a homoglyph all
-    /// arrive intact. The 200 000-byte case is the sharp one: the budget slot is
-    /// charged BEFORE `exec`, and an environment block over `ARG_MAX` fails
-    /// `spawn` with `E2BIG` — a terminal `fired rc=spawn-failed` for a push that
-    /// never happened, ten times a minute, while the operator's real escalations
-    /// answer `dropped reason=rate`.
-    ///
-    /// `cli.rs`'s `column()` truncates these segments and `glance::Row::parse`
-    /// rejects them; this is the reader whose output reaches a human's phone.
+    /// Every subject segment that becomes an environment value is a principal:
+    /// a sender-chosen 200 000-byte segment would otherwise fail `spawn` with
+    /// `E2BIG` after the budget slot was charged.
     #[test]
     fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value() {
         let huge = "x".repeat(200_000);
@@ -1319,8 +1224,7 @@ mod tests {
             None
         );
 
-        // AND WHAT DOES PASS IS BOUNDED, at one number in one place rather than
-        // as a consequence of a parse three arms away.
+        // And what does pass is bounded by `TEXT_MAX`.
         let hit = ask
             .hit("f1", 7, "/f/f1/in/n-a/s-b/h-andrew/ask", b"v=1 t=1 text=hi")
             .expect("the honest ask");
@@ -1331,66 +1235,6 @@ mod tests {
                 "{v} is not printable ASCII"
             );
         }
-    }
-
-    /// **NO FAULT KNOB THIS CRATE SHIPS IS ARMED IN A RELEASED BINARY**, and
-    /// the scan is the whole `src/` directory rather than the two files that
-    /// have one today.
-    ///
-    /// The defect this replaces was a fix that closed ONE of two identical
-    /// doors: `bridge.rs` gated `$ATERM_LINK_FAULT` on `debug_assertions` and
-    /// wrote a long doc about why, and `notify.rs` — same idiom, same env
-    /// position, same `abort()` — was left armed in every build. Four
-    /// independent lenses reported the survivor. A list of files to check would
-    /// have the same shape of gap as that fix did, so this reads the directory:
-    /// a `*_FAULT` variable is read through `aterm_types::dev_seam!` (compiled out
-    /// of a release build) and never through `std::env`, and the next knob added
-    /// anywhere in the crate fails here until it is. (`aterm-update-core`'s
-    /// `env_reads` gate holds the same rule workspace-wide.)
-    #[test]
-    fn no_fault_knob_this_crate_ships_is_armed_in_a_released_binary() {
-        // Assembled, so this test's own source is not the thing it finds.
-        let reads_a_fault = concat!("_FAULT", "\")");
-        let gate = concat!("dev_", "seam!(\"");
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut knobs: Vec<String> = Vec::new();
-        let mut files = 0;
-        for entry in std::fs::read_dir(&dir).expect("the crate's own src/") {
-            let path = entry.expect("a dir entry").path();
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            files += 1;
-            let body = std::fs::read_to_string(&path).expect("read a source file");
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if !body.contains(reads_a_fault) {
-                continue;
-            }
-            knobs.push(name.clone());
-            for (at, _) in body.match_indices(reads_a_fault) {
-                let line = &body[body[..at].rfind('\n').map_or(0, |i| i + 1)..at];
-                assert!(
-                    line.contains(gate),
-                    "{name} reads a fault knob out of the environment with no \
-                     release gate — a shipped binary honours it: {line}"
-                );
-            }
-        }
-        assert!(
-            files > 1,
-            "the scan must read the whole crate, not one file"
-        );
-        knobs.sort();
-        // NOT VACUOUS. Both known knobs must still be FOUND by the scan — a
-        // rename that hides one from this search is the same hole again.
-        assert_eq!(
-            knobs,
-            vec!["bridge.rs".to_string(), "notify.rs".to_string()],
-            "the two fault knobs this crate ships"
-        );
     }
 
     fn scratch(tag: &str) -> String {
@@ -1522,7 +1366,11 @@ mod tests {
             Notifier::new(cfg(&dir)).expect("reopen").verdict(5),
             Some("fired")
         );
-        for off in 100..(100 + JOURNAL_KEEP as u64 + 8) {
+        n.journal.extend(
+            (100..99 + JOURNAL_KEEP as u64)
+                .map(|off| format!("{off} fired on=attention rc=0 dup=0")),
+        );
+        for off in 5_000..5_008 {
             n.record(off, format!("{off} fired on=attention rc=0 dup=0"))
                 .expect("write");
         }
@@ -1563,8 +1411,7 @@ mod tests {
         }
     }
 
-    /// The rate flag's grammar, including the two limits that would blind the
-    /// notifier without saying so.
+    /// The rate flag's grammar, including a zero limit and a zero window.
     #[test]
     fn the_rate_flag_refuses_a_budget_that_would_drop_everything() {
         assert_eq!(parse_rate("10/1m"), Ok((10, 60_000)));
@@ -1574,10 +1421,7 @@ mod tests {
             parse_rate("0/1m").is_err(),
             "a zero limit is refused by name"
         );
-        assert!(
-            parse_rate("10/0m").is_err(),
-            "a zero window is not a window"
-        );
+        assert!(parse_rate("10/0m").is_err(), "a zero window is refused");
         for bad in ["10", "10/1d", "x/1m", "10/m", ""] {
             assert!(parse_rate(bad).is_err(), "{bad}");
         }

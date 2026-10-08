@@ -1,48 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// THE TRAY MUST NOT COST THE SCISSOR — and must still look identical.
+// A resident tray card (settings panel, transient card, build badge) must not
+// disable the scissored present, and must still look identical.
 //
-// A resident tray card (the modal settings panel, a transient card, and —
-// for the whole session, from one cosmetic Settings
-// toggle — the static build BADGE) used to force `present_prev = None` on every
-// present, turning every keystroke echo and every cursor blink into a full
-// O(rows·cols) grid re-encode. The card now composites over the THROWAWAY
-// `present_offscreen` copy (the route the comet halo already takes) instead of
-// into the persistent offscreen, so the offscreen stays a clean scissor base.
+// The card composites over the throwaway `present_offscreen` copy (as the
+// comet halo does), so the persistent offscreen stays a clean scissor base.
+// This drives the real present seam: `present_virtual` runs the same
+// `present_to_view` body as the swapchain arm, and the video tap harvests the
+// presented bytes.
 //
-// That is a PRESENT-PATH change, and the present path is exactly where the tray
-// had no coverage: `tray_upload_skips_unchanged_card_bytes` and
-// `fractional_scroll_keeps_tray_pixels_pinned` both drive `render_input` (the
-// readback/full-repaint entry), and `present_real.rs` passes `tray: None`
-// everywhere. So this suite drives the REAL seam — `present_virtual` runs the
-// same `present_to_view` compose-and-blit body as the swapchain arm — and
-// harvests the presented bytes through the VIDEO tap.
-//
-// Three properties, each of which the change could plausibly have broken:
-//   1. a scissored present under a resident card is BYTE-IDENTICAL to the same
-//      frame presented as a fresh full repaint, and the scissor actually fires
-//      (the negative control: it did not before);
-//   2. dropping the card leaves NO stale card pixels, even though the drop frame
+// Properties:
+//   1. a scissored present under a resident card equals the same frame as a
+//      fresh full repaint, and the scissor actually fires;
+//   2. dropping the card leaves no stale card pixels, though the drop frame
 //      repaints nothing;
-//   3. the card still sits ABOVE the comet halo (the z-order the in-place bake
-//      produced), with a negative control proving the halo reaches those pixels.
+//   3. the card sits above the comet halo, with a negative control proving
+//      the halo reaches those pixels.
 //
-// Gated like the rest of the GPU suite: no GPU / no system font -> no-op.
+// No GPU / no system font: no-op.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};
 use aterm_gpu::{GpuRenderer, TrayQuad, WindowGpu};
 use aterm_render::{GlowQuad, RenderInput, Theme, premul_rgb};
 
+use crate::common;
+
 fn gpu_or_skip() -> Option<GpuRenderer> {
-    match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            None
-        }
-    }
+    common::gpu_or_skip(18.0, Theme::default())
 }
 
 fn opts() -> CaptureOpts {
@@ -54,11 +40,10 @@ fn opts() -> CaptureOpts {
     }
 }
 
-/// Present `seq` (input + this frame's tray) through the headless VIRTUAL target
-/// with the tap armed, and harvest every presented frame's exact bytes. One fresh
-/// `WindowGpu` per call, so each arm starts with no prior frame — the only state
-/// that carries across arms is the renderer's (atlas, pipelines), which is what
-/// makes an A/B of two arms meaningful.
+/// Present `seq` (input + tray per frame) through the virtual target with the
+/// tap armed and harvest every frame's bytes. A fresh `WindowGpu` per call, so
+/// each arm starts without a prior frame; only renderer state (atlas,
+/// pipelines) carries across arms.
 fn harvest(
     gpu: &mut GpuRenderer,
     w: u32,
@@ -132,10 +117,8 @@ fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
     let scissored = gpu.scissor_taken() - scissors_before;
     let fulls = gpu.full_repaints() - fulls_before;
 
-    // THE HEADLINE: a resident card no longer costs the scissor. Before this
-    // change both presents were Full (the card unconditionally cleared
-    // `present_prev`); now the first is Full (no prior frame) and the second
-    // scissors its one dirty row.
+    // A resident card does not cost the scissor: the first present is Full (no
+    // prior frame) and the second scissors its one dirty row.
     assert_eq!(
         (scissored, fulls),
         (1, 1),
@@ -201,9 +184,8 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
     let (rows, cols) = (6usize, 20usize);
     let (plain, _) = two_frames(rows, cols);
     let (cw, ch) = gpu.cell_size();
-    // A live comet: additive glow quads in the middle of the grid. With the bloom
-    // on (the default) this is the `fx_present` route — the one the card used to
-    // share via `bake_in_place`, and the one whose ORDER this change moves.
+    // A live comet: additive glow quads mid-grid. With bloom on (the default)
+    // this takes the `fx_present` route the card also composites on.
     let mut glowing = plain.clone();
     for i in 0..3u16 {
         glowing.cursor_glow_add.push(GlowQuad {
@@ -222,9 +204,8 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
 
-    // NEGATIVE CONTROL FIRST: with no card, the glow must change the frame.
-    // Without this the equality below could pass for the boring reason that the
-    // halo never drew at all.
+    // Negative control first: with no card, the glow must change the frame,
+    // or the equality below could pass because the halo never drew.
     let bare_glow = harvest(&mut gpu, fw, fh, &[(&glowing, None)]);
     let bare_plain = harvest(&mut gpu, fw, fh, &[(&plain, None)]);
     assert!(
@@ -232,11 +213,9 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
         "negative control: the comet halo must reach the presented frame"
     );
 
-    // A FULLY OPAQUE, FULL-FRAME card. Composited ABOVE the halo (the in-place
-    // bake's z-order) it hides every pixel of it, so the glowing and plain frames
-    // present identically. Composited BELOW it — the hazard of moving the card
-    // onto the halo's own target — the additive light would show through and the
-    // two would differ.
+    // A fully opaque full-frame card. Above the halo it hides it entirely, so
+    // glowing and plain frames present identically; below it, the additive
+    // light would show through.
     let pixels = card(fw, fh, [18, 20, 24, 255]);
     let quad = TrayQuad {
         rgba: &pixels,

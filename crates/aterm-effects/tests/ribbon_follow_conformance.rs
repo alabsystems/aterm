@@ -1,39 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE REAL FOLLOW PASS CONFORMS TO THE TWIN CONTRACT** (2026-09-23 — the
-//! owner: *"the existing line rainbow should beautifully flow and drift and
-//! fade away, not simply abruptly vanish"*). Tier-1 for `aterm-spec`'s
-//! `ribbon_follow_twin_model` (`RibbonFollowTwin`): the content witness's
-//! ARM writes a twin bit (`Witness::walk`) and its FOLLOW reads it
-//! (`Witness::follow_runs`), and nothing tied the two to a model until the
-//! review of the twin-neutral landing found two changes to them that the
-//! whole suite let through — the trailing edge rider's `gone && trail_open`
-//! read as `trail_open`, and the follow counter's accumulation replaced by
-//! a no-op.
+//! Tier-1 conformance of the real follow pass to `aterm-spec`'s
+//! `ribbon_follow_twin_model` (`RibbonFollowTwin`): the content witness's arm
+//! writes a twin bit (`Witness::walk`) and its follow reads it
+//! (`Witness::follow_runs`). This keeps an existing line rainbow following
+//! its text rather than vanishing (owner, 2026-09-23).
 //!
-//! Since 2026-09-26 the bit the reader reads is the ACCUMULATED arrival
-//! evidence (`Seen::arrivals`), and a twin at arm time is one of the ways a
-//! record comes to have none; how the witness WRITES that evidence through
-//! the frames of a record's life is the writer's own model,
-//! `RibbonArrivalEvidence`, bound in `tests/ribbon_arrival_conformance.rs`.
-//! This file drives the reader through the arm-time way.
+//! The bit the reader reads is the accumulated arrival evidence
+//! (`Seen::arrivals`); a twin at arm time is one way a record comes to have
+//! none. How the witness writes that evidence over a record's life is the
+//! writer's model, `RibbonArrivalEvidence`, bound in
+//! `tests/ribbon_arrival_conformance.rs`. This file drives the reader through
+//! the arm-time case.
 //!
-//! Every configuration of a six-record run is driven through the REAL
-//! witness: each record ARRIVED (its glyph a row up, no twin at arm time),
-//! STANDING (its glyph a row up, and there when armed), ABSENT (not there)
-//! or ABSENT-TWIN (there when armed, gone since), and each GONE from its own
-//! row or not — `4^6 × 2^6` runs, the model read once per `3^6 × 2^6` (it
-//! counts both ABSENTs alike) and every invariant checked on it at `N = 6`
-//! (the Tier-0 proof is at `N = 4`). The six glyphs are distinct, so no
-//! suffix of the run can stand relaid at the start of its own row
-//! (`Witness::relaid_suffix` reads `0` throughout: the model has no relay).
-//! The real verdict — named or not, its extent, the missed count — must be
-//! exactly the model's `Decide` successor at `N = 6`, and every invariant
-//! must hold on it. The negative control replays the 2026-09-22 veto (a
-//! twin never found, never neutral) against the same configurations: it is
-//! the model at `Buggy = 1`, bit for bit, and `AnArrivedBlockFollows`
-//! refuses it on hundreds of them — the check is not vacuous.
+//! Every configuration of a six-record run is driven through the real
+//! witness: each record arrived (its glyph a row up, no twin at arm time),
+//! standing (its glyph a row up and there when armed), absent, or absent-twin
+//! (there when armed, gone since), and each gone from its own row or not.
+//! That is `4^6 x 2^6` runs, the model read once per `3^6 x 2^6` (both absent
+//! classes count alike), with every invariant checked at `N = 6` (Tier-0
+//! proves `N = 4`). The six glyphs are distinct, so no suffix can stand
+//! relaid at its row's start (`Witness::relaid_suffix` stays `0`; the model
+//! has no relay). The real verdict (named or not, extent, missed count) must
+//! equal the model's `Decide` successor. The negative control replays a veto
+//! rule (a twin never found, never neutral), which is the model at
+//! `Buggy = 1`, and `AnArrivedBlockFollows` refuses it on hundreds of
+//! configurations.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -85,10 +78,9 @@ fn cell(col: u16, born: Instant) -> Cell {
     }
 }
 
-/// The REAL verdict: arm `abcdef` on row 5 with row 4 holding each
-/// STANDING and ABSENT-TWIN record's glyph, then blank each GONE record's
-/// column on row 5 and put each ARRIVED and STANDING record's glyph on
-/// row 4.
+/// The real verdict: arm `abcdef` on row 5 with row 4 holding each standing
+/// and absent-twin record's glyph, then blank each gone record's column on
+/// row 5 and put each arrived and standing record's glyph on row 4.
 fn real(w: &mut Witness, cells: &[Cell], classes: &[Class; N], gone: &[bool; N]) -> Verdict {
     let at_arm: Vec<char> = (0..N)
         .map(|k| match classes[k] {
@@ -124,9 +116,8 @@ fn real(w: &mut Witness, cells: &[Cell], classes: &[Class; N], gone: &[bool; N])
         &mut retire,
         &mut release,
     );
-    // Every cell is armed by that walk: `GLYPHS` holds no blank, and a
-    // glyph read under a record-less cell is armed (`Witness::len` is
-    // test-only inside the crate since the 2026-09 dead-code sweep).
+    // Every cell is armed by that walk: `GLYPHS` holds no blank, and a glyph
+    // read under a record-less cell is armed.
     assert!(GLYPHS.iter().all(|&g| g != ' '));
     assert!(retire.is_empty() && release.is_empty());
     let score = w.follow_runs(
@@ -151,10 +142,9 @@ fn real(w: &mut Witness, cells: &[Cell], classes: &[Class; N], gone: &[bool; N])
     }
 }
 
-/// The 2026-09-22 VETO, replayed: a twin at the target is never found and
-/// never neutral — a hole — and the found records must be one block of at
-/// least two and at least half of ALL the armed records. No riders, and no
-/// missed count (it had none).
+/// The veto rule, replayed: a twin at the target is never found and never
+/// neutral (a hole), and the found records must be one block of at least two
+/// and at least half of all armed records. No riders and no missed count.
 fn veto(classes: &[Class; N], gone: &[bool; N]) -> (i64, i64, i64) {
     let gone_n = gone.iter().filter(|g| **g).count();
     if gone_n < 2 || gone_n * 2 < N {
@@ -182,22 +172,53 @@ fn veto(classes: &[Class; N], gone: &[bool; N]) -> (i64, i64, i64) {
     }
 }
 
-/// The model's state after scanning the configuration and deciding.
-fn modelled(model: &Model, classes: &[Class; N], gone: &[bool; N]) -> BTreeMap<&'static str, i64> {
-    let mut state = model.init_state();
-    for k in 0..N {
-        let action = match (classes[k], gone[k]) {
+/// The model's scan, replayed incrementally. [`every_configuration`] visits
+/// configurations in record order, so consecutive ones share a scanned prefix:
+/// [`Self::modelled`] fires only the records after the first one whose scan
+/// action changed. `Model::fire` is a function of the action and the state, so
+/// the state reached is the one a scan from `init_state` reaches.
+struct Scanner<'m> {
+    model: &'m Model,
+    /// `prefix[k]`: the action fired for record `k` and the state after it.
+    prefix: Vec<(&'static str, BTreeMap<&'static str, i64>)>,
+}
+
+impl<'m> Scanner<'m> {
+    fn new(model: &'m Model) -> Self {
+        Self {
+            model,
+            prefix: Vec::with_capacity(N),
+        }
+    }
+
+    /// The model's state after scanning the configuration and deciding.
+    fn modelled(&mut self, classes: &[Class; N], gone: &[bool; N]) -> BTreeMap<&'static str, i64> {
+        let actions: [&'static str; N] = std::array::from_fn(|k| match (classes[k], gone[k]) {
             (Class::Arrived, false) => "ScanArrived",
             (Class::Arrived, true) => "ScanArrivedGone",
             (Class::Standing, false) => "ScanStanding",
             (Class::Standing, true) => "ScanStandingGone",
             (Class::Absent | Class::AbsentTwin, false) => "ScanAbsent",
             (Class::Absent | Class::AbsentTwin, true) => "ScanAbsentGone",
+        });
+        let keep = self
+            .prefix
+            .iter()
+            .zip(&actions)
+            .take_while(|(done, action)| done.0 == **action)
+            .count();
+        self.prefix.truncate(keep);
+        let mut state = match self.prefix.last() {
+            Some((_, scanned)) => scanned.clone(),
+            None => self.model.init_state(),
         };
-        assert!(model.fire(action, &mut state), "{action} is enabled");
+        for &action in &actions[keep..] {
+            assert!(self.model.fire(action, &mut state), "{action} is enabled");
+            self.prefix.push((action, state.clone()));
+        }
+        assert!(self.model.fire("Decide", &mut state), "Decide is enabled");
+        state
     }
-    assert!(model.fire("Decide", &mut state), "Decide is enabled");
-    state
 }
 
 /// `state` with the verdict `v` projected onto it — the extent only where
@@ -225,27 +246,27 @@ fn at_n(mut model: Model, buggy: i64) -> Model {
 }
 
 /// Every configuration of the model's three classes and the gone bits:
-/// `f(classes, gone)` — `3^6 × 2^6` runs.
+/// `f(classes, gone)` — `3^6 × 2^6` runs. Record `k`'s `(class, gone)` pair
+/// is digit `k` of a base-6 count with the last record least significant, so
+/// consecutive configurations share their longest scanned prefix
+/// ([`Scanner`]).
 fn every_configuration(mut f: impl FnMut(&[Class; N], &[bool; N])) {
     const CLASSES: [Class; 3] = [Class::Arrived, Class::Standing, Class::Absent];
-    for code in 0..3usize.pow(N as u32) {
+    for code in 0..6usize.pow(N as u32) {
         let mut classes = [Class::Absent; N];
+        let mut gone = [false; N];
         let mut c = code;
-        for slot in &mut classes {
-            *slot = CLASSES[c % 3];
-            c /= 3;
+        for k in (0..N).rev() {
+            let digit = c % 6;
+            classes[k] = CLASSES[digit / 2];
+            gone[k] = digit % 2 == 1;
+            c /= 6;
         }
-        for bits in 0..(1u32 << N) {
-            let mut gone = [false; N];
-            for (k, g) in gone.iter_mut().enumerate() {
-                *g = bits & (1 << k) != 0;
-            }
-            f(&classes, &gone);
-        }
+        f(&classes, &gone);
     }
 }
 
-/// Every way of making some of `classes`' ABSENT records ABSENT-TWIN.
+/// Every way of making some of `classes`' absent records absent-twin.
 fn with_absent_twins(classes: &[Class; N], mut f: impl FnMut(&[Class; N])) {
     let absent: Vec<usize> = (0..N).filter(|&k| classes[k] == Class::Absent).collect();
     for sub in 0..(1u32 << absent.len()) {
@@ -265,11 +286,12 @@ fn the_real_follow_pass_is_the_twin_contract_on_every_six_record_run() {
     let t0 = Instant::now();
     let cells: Vec<Cell> = (0..N as u16).map(|c| cell(c, t0)).collect();
     let mut w = Witness::new();
+    let mut scan = Scanner::new(&model);
     let (mut runs, mut named, mut missed) = (0usize, 0usize, 0usize);
     every_configuration(|classes, gone| {
-        // The model at N = 6 (Tier-0 proves it at 4): every Decide state
-        // of the sweep keeps every invariant.
-        let state = modelled(&model, classes, gone);
+        // The model at N = 6 (Tier-0 proves it at 4): every Decide state of
+        // the sweep keeps every invariant.
+        let state = scan.modelled(classes, gone);
         for inv in INVARIANTS {
             assert!(
                 model.check_invariant(inv, &state),
@@ -295,20 +317,20 @@ fn the_real_follow_pass_is_the_twin_contract_on_every_six_record_run() {
     );
 }
 
-/// **THE NEGATIVE CONTROL**: the 2026-09-22 veto the owner's vanish came
-/// from is exactly the model at `Buggy = 1` — so the dial the Tier-0 check
-/// catches is this code — and projected onto the correct model it breaks
-/// `AnArrivedBlockFollows` wherever a twin stood inside or flush against an
-/// arrived block, and nowhere without a twin.
+/// Negative control: the veto rule is the model at `Buggy = 1`, and projected
+/// onto the correct model it breaks `AnArrivedBlockFollows` wherever a twin
+/// stood inside or flush against an arrived block, and nowhere without a
+/// twin.
 #[test]
 fn the_2026_09_22_veto_is_the_buggy_model_and_the_contract_refuses_it() {
     let model = at_n(ribbon_follow_twin_model(), 0);
     let buggy = at_n(ribbon_follow_twin_model(), 1);
+    let (mut scan, mut scan_buggy) = (Scanner::new(&model), Scanner::new(&buggy));
     let (mut refused, mut total) = (0usize, 0usize);
     every_configuration(|classes, gone| {
         total += 1;
         let (named, lo, hi) = veto(classes, gone);
-        let b = modelled(&buggy, classes, gone);
+        let b = scan_buggy.modelled(classes, gone);
         assert_eq!(
             b["named"], named,
             "{classes:?} gone {gone:?}: the Buggy model is the veto"
@@ -320,7 +342,7 @@ fn the_2026_09_22_veto_is_the_buggy_model_and_the_contract_refuses_it() {
                 "{classes:?} gone {gone:?}: the Buggy model's extent is the veto's"
             );
         }
-        let state = modelled(&model, classes, gone);
+        let state = scan.modelled(classes, gone);
         let p = project(&state, (named, lo, hi, state["missed"]));
         if !model.check_invariant("AnArrivedBlockFollows", &p) {
             refused += 1;

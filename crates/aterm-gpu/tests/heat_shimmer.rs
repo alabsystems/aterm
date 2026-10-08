@@ -1,51 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// HEAT-SHIMMER laws (the bloom parity class at PRESENT time): the air above
-// burning cells refracts — a subtle rising per-pixel UV displacement of the
-// finished frame, derived from the SAME `cursor_glow_add` stream the bloom
-// feeds on. Like the bloom it is deliberately OUTSIDE the CPU/GPU byte
-// differentials (they call `set_shimmer(false)`), and ALWAYS inside what
-// introspection reads. This suite pins the honesty contract:
+// Heat shimmer: a subtle rising per-pixel UV displacement of the finished
+// frame above burning cells, derived from the `cursor_glow_add` stream the
+// bloom uses. Like the bloom it is outside the CPU/GPU byte differentials
+// (they call `set_shimmer(false)`) and inside everything introspection reads.
 //
-//   * NO-OP LAW — flag off, an empty glow stream, or a region-less stream
-//     (fire on the top row: no air above it) presents BYTE-IDENTICAL pixels,
-//     on both the offscreen-readback and the present paths;
-//   * BOUNDED DISPLACEMENT — no pixel's value travels farther than the
-//     amplitude (+ the bilinear footprint): every shimmered pixel stays
-//     within the min/max envelope of its small source neighbourhood;
-//   * SCOPED — outside the derived region rect the frame is byte-identical
-//     (hard zero beyond the bound), and inside it the shimmer is really
-//     there (non-vacuous);
-//   * ALL THREE INTROSPECTION PATHS — the offscreen readback (`render_input`,
-//     the control-socket `image` source), the copyable-SWAPCHAIN video tap,
-//     and the VIRTUAL present (81cbf35c) all carry the shimmer, and the two
-//     tap arms agree byte-for-byte with the phase pinned;
-//   * SCISSOR HONESTY — a scissored application-present encoder source equals
-//     a fresh full render at the same pinned phase, preserving app-boundary
-//     present/introspection parity.
+//   * No-op: flag off, an empty glow stream, or a region-less stream (fire on
+//     the top row) presents identical pixels on the readback and present
+//     paths.
+//   * Bounded displacement: every shimmered pixel stays within the min/max
+//     envelope of its small source neighbourhood.
+//   * Scoped: outside the derived region rect the frame is byte-identical,
+//     and inside it the shimmer is present.
+//   * Introspection: the offscreen readback (`render_input`, the `image`
+//     source), the swapchain video tap and the virtual present all carry it;
+//     the two taps agree byte-for-byte with the phase pinned.
+//   * Scissor: a scissored present source equals a fresh full render at the
+//     same pinned phase.
 //
-// The pass's ONE wall-clock term (the rising phase — the documented
-// bloom-class exception, like the SDR crown envelope) is pinned via
+// The pass's one wall-clock term (the rising phase) is pinned via
 // `set_shimmer_phase_for_test` wherever bytes are compared.
 //
-// Gated like the differential harness: no GPU / no system font -> no-op.
+// No GPU or no system font: no-op.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET};
 use aterm_render::{FirePatch, GlowQuad, RenderInput, Theme, premul_rgb};
 
+use crate::common;
+
 fn gpu_or_skip() -> Option<aterm_gpu::GpuRenderer> {
-    match aterm_gpu::GpuRenderer::new(16.0, Theme::default()) {
-        Ok(mut g) => {
-            g.debug_block_on_lazy_fallbacks();
-            Some(g)
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            None
-        }
-    }
+    let mut g = common::gpu_or_skip(16.0, Theme::default())?;
+    g.debug_block_on_lazy_fallbacks();
+    Some(g)
 }
 
 /// A warm ember comet: one row of premultiplied fire-orange glow quads over
@@ -66,11 +54,10 @@ fn fire_comet(row: usize, cols: std::ops::Range<usize>, cw: usize, ch: usize) ->
     .collect()
 }
 
-/// The FIRE-STYLE marker the shimmer gate keys on (`shimmer_live`): only the
-/// EMBERFORGE fire style fills `fire_patch`, so the heat haze never wobbles a
-/// phaser/laser/water frame. A ZERO-AREA patch marks the style live without
-/// rasterizing a single field pixel — the fixtures' bytes stay those of the
-/// glow stream alone.
+/// The fire-style marker the shimmer gate keys on (`shimmer_live`): only the
+/// fire style fills `fire_patch`, so phaser/laser/water frames never shimmer.
+/// A zero-area patch marks the style live without rasterizing any field
+/// pixel, so fixture bytes are the glow stream's alone.
 fn fire_marker() -> Vec<FirePatch> {
     vec![FirePatch::default()]
 }
@@ -85,10 +72,9 @@ fn lanes(p: u32) -> [i32; 4] {
     ]
 }
 
-/// NO-OP LAW: flag off / empty stream / region-less stream (fire on the top
-/// row) all present byte-identical pixels — offscreen readback AND present
-/// path. The flag-off arm runs UNPINNED (wall clock live): two renders agree
-/// only if no time-dependent pass ran at all.
+/// No-op: flag off / empty stream / region-less stream present identical
+/// pixels on the readback and present paths. The flag-off arm runs with the
+/// wall clock live, so agreement shows no time-dependent pass ran.
 #[test]
 fn shimmer_no_op_law_flag_off_and_empty_region() {
     let Some(mut gpu) = gpu_or_skip() else { return };
@@ -163,11 +149,11 @@ fn shimmer_no_op_law_flag_off_and_empty_region() {
     );
 }
 
-/// BOUNDED DISPLACEMENT + SCOPED: over a high-contrast stripe pattern, every
-/// shimmered pixel stays within the min/max envelope of its ±2 px horizontal /
-/// ±3 px vertical source neighbourhood (amplitude ≤ 1.5 + bilinear footprint,
-/// with ±1 rounding slack), the alpha lane is untouched, every pixel OUTSIDE
-/// the derived region rect is byte-identical, and the region really shimmers.
+/// Bounded and scoped: over a high-contrast stripe pattern, every shimmered
+/// pixel stays within the min/max of its ±2 px horizontal / ±3 px vertical
+/// neighbourhood (amplitude ≤ 1.5 + bilinear footprint, ±1 rounding), alpha
+/// is untouched, pixels outside the region rect are byte-identical, and the
+/// region does shimmer.
 #[test]
 fn shimmer_bounded_displacement_and_scoped_to_region() {
     let Some(mut gpu) = gpu_or_skip() else { return };
@@ -291,18 +277,16 @@ fn tap_virtual(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h:
     take.frames[0].rgba.clone()
 }
 
-/// ALL THREE INTROSPECTION PATHS carry the shimmer: the offscreen readback
-/// (`render_input` — the control-socket `image` source), the copyable
-/// SWAPCHAIN video tap, and the VIRTUAL present's tap. With the phase pinned
-/// the two tap arms are byte-identical (the present-real theorem extended over
-/// the shimmer), both differ from their shimmer-off twins ONLY inside the
-/// region rect, and the offscreen readback shimmers identically.
+/// All three introspection paths carry the shimmer: the offscreen readback,
+/// the swapchain video tap, and the virtual present's tap. With the phase
+/// pinned the two taps are byte-identical, each differs from its shimmer-off
+/// counterpart only inside the region rect, and the readback shimmers
+/// identically.
 #[test]
 fn shimmer_reaches_all_three_introspection_paths() {
     let Some(mut gpu) = gpu_or_skip() else { return };
-    // THE FLIP: the three taps here are the wgpu stand-in harness (the
-    // swapchain stand-in reads the wgpu offscreen) — the WGPU ORACLE arm.
-    // The armed tap ring has its own differential
+    // These taps are the wgpu stand-in harness (the wgpu oracle arm). The
+    // armed tap ring has its own differential
     // (`armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte`).
     #[cfg(target_os = "macos")]
     gpu.disarm_metal_for_oracle();
@@ -373,10 +357,8 @@ fn shimmer_reaches_all_three_introspection_paths() {
     );
 }
 
-/// SCISSOR HONESTY (the bloom's scissor law extended): with the phase pinned,
-/// a SCISSORED shimmer application-present encoder source (one keystroke, the
-/// comet moves) is byte-identical to a fresh full render of the same input,
-/// preserving app-boundary present/introspection parity on the incremental path.
+/// Scissor: with the phase pinned, a scissored shimmer present source (one
+/// keystroke, the comet moves) equals a fresh full render of the same input.
 #[test]
 fn shimmer_scissored_present_matches_fresh_render() {
     let Some(mut gpu) = gpu_or_skip() else { return };

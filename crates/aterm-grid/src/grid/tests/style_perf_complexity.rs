@@ -2,23 +2,14 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Complexity and regression-focused grid tests extracted from style_perf.rs.
-//!
-//! Migrated from aterm-core as part of #6556 Batch 2.
+//! Complexity tests for scroll-off and lazy scrollback promotion.
 
 use super::super::*;
 
-// =============================================================================
 // Performance Tests (O(n * cols) verification)
-// =============================================================================
 
-/// Verify scroll_up defers row_to_line conversion (lazy scrollback promotion).
-///
-/// With lazy promotion, `scroll_up` captures cells into `DeferredLine` via O(1)
-/// memcpy instead of performing O(cols) `row_to_line` conversion. The conversion
-/// happens later when scrollback is actually read. This test verifies:
-/// 1. Zero `row_to_line` ops at scroll time (deferral works)
-/// 2. Materialization ops scale linearly when scrollback is drained
+/// scroll_up captures cells into `DeferredLine`s without `row_to_line`
+/// conversion; draining scrollback materializes them in linear ops.
 #[test]
 fn scroll_up_linear_time() {
     let rows = 100;
@@ -181,11 +172,8 @@ fn reflow_linear_time_columns() {
     );
 }
 
-/// Verify many scroll_up(1) calls defer row_to_line (lazy scrollback promotion).
-///
-/// With lazy promotion, repeated `scroll_up(1)` calls accumulate `DeferredLine`
-/// entries in the lazy buffer without performing `row_to_line` conversion.
-/// Materialization ops scale linearly when the buffer is drained.
+/// Repeated scroll_up(1) accumulates `DeferredLine`s with zero `row_to_line`
+/// ops; draining is linear.
 #[test]
 fn scroll_up_handles_many_rows() {
     fn measure_scroll_and_drain(scrolls: usize) -> (usize, usize) {
@@ -293,11 +281,8 @@ fn row_to_line_linear_in_columns() {
     );
 }
 
-/// Verify single scroll_up(1) defers conversion and is O(1) with respect to grid size.
-///
-/// With lazy promotion, `scroll_up(1)` captures a single `DeferredLine` regardless
-/// of grid size — the conversion cost is zero at scroll time. When drained, the
-/// materialization cost is O(cols), independent of total grid rows.
+/// A single scroll_up(1) costs zero conversion ops at any grid size; draining
+/// costs O(cols).
 #[test]
 fn scroll_single_line_constant_time() {
     let cols = 80;

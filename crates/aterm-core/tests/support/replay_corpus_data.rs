@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 //
-// Adversarial determinism corpora (machine-generated from a hazard sweep).
-// Each targets a real bulk-vs-single / projection hazard in the engine.
+// Adversarial determinism corpora, each targeting a bulk-vs-single or
+// projection hazard in the engine.
 
 /// (name, output-byte records) tuples. Full concat ends at parser-ground.
 pub const CORPORA: &[(&str, &[&[u8]])] = &[

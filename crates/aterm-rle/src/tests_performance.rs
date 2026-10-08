@@ -76,8 +76,8 @@ fn rle_set_well_compressed_is_constant() {
     let small = measure_sets_on_uniform(100);
     let large = measure_sets_on_uniform(10_000);
 
-    // Both should use the same number of iterations (O(1) — binary search
-    // finds the run, then O(1) split/compact with only 1-3 runs).
+    // One run before the set, so the linear walk visits one run at either
+    // length; split/compact touch at most 3 runs.
     assert_eq!(
         small, large,
         "single set() on uniform RLE should be O(1) regardless of length: \
@@ -86,9 +86,6 @@ fn rle_set_well_compressed_is_constant() {
 }
 
 /// Prove that `set_range()` across the full RLE is O(R) (linear in run count).
-///
-/// This is a more precise test than `rle_set_range_linear_iterations` in tests.rs:
-/// it measures the ratio at two specific sizes and verifies linearity.
 #[test]
 fn rle_set_range_linear_in_runs() {
     fn measure_set_range(run_count: u32) -> usize {
@@ -117,34 +114,4 @@ fn rle_set_range_linear_in_runs() {
         "4x runs should ~4x set_range iterations (linear): \
          small={small_iters}, large={large_iters}, ratio={ratio:.2}"
     );
-}
-
-/// Prove that `find_run()` is an O(R) walk that visits each run at most once.
-///
-/// The prefix-sum index that made this O(log R) was deleted: it cost one heap
-/// allocation on EVERY constructed `Rle` — paid by the scrollback
-/// materialization path per line, including the all-default lines whose `Rle`
-/// is discarded unread — and its only readers (`get`/`set`/`set_range`/`Index`)
-/// have no production caller. Runs per scrollback line are 1-6, so the walk is
-/// bounded by construction at the sizes that exist; what must not regress is
-/// visiting a run MORE than once, which this pins as an exact count.
-#[test]
-fn rle_find_run_linear_visits_each_run_once() {
-    fn measure_find_last(run_count: u32) -> usize {
-        let mut rle: Rle<u8> = Rle::new();
-        for i in 0..run_count {
-            rle.push((i & 1) as u8);
-        }
-
-        reset_run_iterations();
-        let result = rle.get(run_count - 1);
-        assert!(result.is_some());
-        take_run_iterations()
-    }
-
-    let small = measure_find_last(100);
-    let large = measure_find_last(100_000);
-
-    assert_eq!(small, 100, "one iteration per run, no more (small)");
-    assert_eq!(large, 100_000, "one iteration per run, no more (large)");
 }

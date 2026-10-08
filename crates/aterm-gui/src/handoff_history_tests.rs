@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The history carry, end to end on real engines: the export with the
-//! session live, the park's checkpoint, the join, the sidecar crossing, and
-//! the import after Commit — plus every way it falls back, each of which must
-//! COUNT what it leaves behind.
+//! The history carry end to end on real engines: the export with the session
+//! live, the park's checkpoint, the join, the sidecar crossing, and the import
+//! after Commit, plus every fallback, each of which must count what it leaves
+//! behind.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,6 +12,7 @@ use std::time::Duration;
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 use super::*;
+use crate::seamless::ladder_tests::link_dense;
 use crate::session_store::{SessionHandoff, SessionRecord};
 
 const NONCE: &str = "00112233445566778899aabbccddeeff";
@@ -22,7 +23,8 @@ fn write_lines(t: &mut Terminal, prefix: &str, from: usize, count: usize) {
     }
 }
 
-fn history(t: &Terminal) -> Vec<String> {
+/// The main grid's scrollback as trimmed text, oldest first.
+pub(crate) fn history(t: &Terminal) -> Vec<String> {
     let grid = t.main_grid();
     (0..grid.scrollback_lines())
         .map(|i| {
@@ -63,8 +65,10 @@ fn record(local_id: u64) -> SessionRecord {
         claim_known: false,
         attention_owners: Vec::new(),
         viewport_from_bottom: None,
+        render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
+        journal_key: None,
     }
 }
 
@@ -89,13 +93,13 @@ fn live(rows: u16, cols: u16) -> Arc<Mutex<Terminal>> {
 
 /// The export, run to completion (it has nothing to wait on here).
 fn export(dir: &Path, sessions: &[(u64, &Arc<Mutex<Terminal>>)]) -> ExportResults {
-    let sessions = sessions
+    let sessions: Vec<_> = sessions
         .iter()
         .map(|(id, term)| (*id, Arc::clone(term)))
         .collect();
     let results = HistoryExporter::start(dir.to_path_buf(), sessions, false)
         .expect("the export worker starts")
-        .finish(Duration::from_secs(30));
+        .finish(aterm_spec::wait::MUST_HAPPEN);
     assert!(!results.unfinished, "the export finished");
     results
 }
@@ -165,29 +169,51 @@ fn cross(dir: &Path, term: &Arc<Mutex<Terminal>>, between: impl FnOnce(&mut Term
     }
 }
 
+/// A live session 3000 lines deep, its view scrolled 1000 lines back.
+fn scrolled_back_session() -> Arc<Mutex<Terminal>> {
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+    term.lock().unwrap().scroll_display(1000);
+    term
+}
+
+/// The successor opens session 1's sidecar in `dir` for `record`, before the
+/// proof, with the whole aggregate budget to spend.
+fn open_sidecar(dir: &Path, record: &SessionRecord) -> AdoptedHistory {
+    let mut remaining = MAX_AGGREGATE_BYTES;
+    incoming(record, false, false, &named(dir, 1), dir, &mut remaining)
+}
+
+/// The import after Commit of `history` into `term`, as session 1.
+fn import_one(term: &Arc<Mutex<Terminal>>, history: AdoptedHistory) -> ImportReport {
+    run_imports(vec![ImportJob {
+        session: 1,
+        term: Arc::clone(term),
+        history,
+    }])
+    .remove(0)
+}
+
+/// An adopted session scrolled 1000 lines back at the park, adopted and ready
+/// for its import: the successor and its history.
+fn scrolled_back_adoption(dir: &Path) -> (Arc<Mutex<Terminal>>, AdoptedHistory) {
+    let term = scrolled_back_session();
+    let crossed = cross(dir, &term, |_| {});
+    let mut adopted = open_sidecar(dir, &crossed.manifest.sessions[0]);
+    let successor = adopt(&crossed.checkpoint, &mut adopted);
+    (successor, adopted)
+}
+
 /// The successor's whole half for session 1: open before the proof, adopt,
 /// import after Commit.
 fn receive(dir: &Path, crossed: &Crossed) -> (Arc<Mutex<Terminal>>, ImportReport) {
-    let mut remaining = MAX_AGGREGATE_BYTES;
-    let adopted = incoming(
-        &crossed.manifest.sessions[0],
-        false,
-        &named(dir, 1),
-        dir,
-        &mut remaining,
-    );
+    let mut adopted = open_sidecar(dir, &crossed.manifest.sessions[0]);
     assert!(
         !named(dir, 1).exists(),
         "the successor unlinks the sidecar as it opens it"
     );
-    let mut adopted = adopted;
     let term = adopt(&crossed.checkpoint, &mut adopted);
-    let report = run_imports(vec![ImportJob {
-        session: 1,
-        term: Arc::clone(&term),
-        history: adopted,
-    }])
-    .remove(0);
+    let report = import_one(&term, adopted);
     (term, report)
 }
 
@@ -260,21 +286,6 @@ fn a_whole_history_crosses_the_handoff_in_order_and_nothing_is_counted_lost() {
 }
 
 #[test]
-fn output_after_the_export_that_the_checkpoint_carries_still_meets_it() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let term = live(8, 40);
-    write_lines(&mut term.lock().unwrap(), "old", 0, 1000);
-    let crossed = cross(dir.path(), &term, |t| write_lines(t, "late", 0, 100));
-    assert_eq!(
-        crossed.joined.fallback, None,
-        "100 late lines fit the 256 carried"
-    );
-    let (successor, report) = receive(dir.path(), &crossed);
-    assert_eq!(report.lost(), 0);
-    assert_eq!(history(&successor.lock().unwrap()), crossed.parent_history);
-}
-
-#[test]
 fn a_rewrap_after_the_export_breaks_the_fence_and_the_loss_is_counted() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let term = live(8, 40);
@@ -320,7 +331,7 @@ fn a_scrollback_clear_after_the_export_breaks_the_fence() {
     });
     assert_eq!(crossed.joined.fallback, Some(Fallback::FenceMoved));
     let (successor, _) = receive(dir.path(), &crossed);
-    // The rows still ON SCREEN at the clear (the last seven) scroll into the
+    // The rows still on screen at the clear (the last seven) scroll into the
     // new history like any other; every row that was scrollback is gone.
     let resurrected: Vec<String> = history(&successor.lock().unwrap())
         .into_iter()
@@ -334,20 +345,6 @@ fn a_scrollback_clear_after_the_export_breaks_the_fence() {
         resurrected.is_empty(),
         "a history the user cleared never comes back from a sidecar: {resurrected:?}"
     );
-}
-
-#[test]
-fn more_output_after_the_export_than_the_checkpoint_carries_is_counted() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let term = live(8, 40);
-    write_lines(&mut term.lock().unwrap(), "old", 0, 1000);
-    let crossed = cross(dir.path(), &term, |t| write_lines(t, "flood", 0, 400));
-    assert_eq!(crossed.joined.fallback, Some(Fallback::Outrun));
-    assert_eq!(
-        crossed.joined.dropped,
-        crossed.parent_history.len() as u64 - 256
-    );
-    assert_eq!(crossed.manifest.sessions[0].history, None);
 }
 
 #[test]
@@ -397,6 +394,7 @@ fn a_sidecar_of_another_length_is_refused_before_the_proof() {
     let adopted = incoming(
         &crossed.manifest.sessions[0],
         false,
+        false,
         &path,
         dir.path(),
         &mut remaining,
@@ -421,6 +419,7 @@ fn a_screen_this_build_refused_drops_its_sidecar_and_counts_it() {
     let adopted = incoming(
         &crossed.manifest.sessions[0],
         true,
+        false,
         &path,
         dir.path(),
         &mut remaining,
@@ -513,13 +512,20 @@ fn an_export_nobody_takes_leaves_nothing_on_disk() {
         false,
     )
     .unwrap();
+    let exited = exporter.exited();
     drop(exporter);
     // The worker notices the stop at its next chunk and removes what it
-    // wrote; wait for THAT, bounded only against a real leak.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !dir_entries(dir.path()).is_empty() && std::time::Instant::now() < deadline {
+    // wrote. Wait for it to finish — not for the directory to look empty,
+    // which it also does before the worker has written anything.
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while !exited.load(std::sync::atomic::Ordering::Acquire) && std::time::Instant::now() < deadline
+    {
         std::thread::yield_now();
     }
+    assert!(
+        exited.load(std::sync::atomic::Ordering::Acquire),
+        "the dropped exporter's worker finished"
+    );
     assert!(
         dir_entries(dir.path()).is_empty(),
         "a dropped exporter leaks nothing"
@@ -543,11 +549,9 @@ fn a_session_without_history_exports_nothing_and_loses_nothing() {
     assert!(dir_entries(dir.path()).is_empty());
 }
 
-/// A SCROLLBACK THE ADOPTED SHELL CLEARS BEFORE THE IMPORT LANDS STAYS CLEARED,
-/// and is no loss (2026-09-26 review): the import runs on a worker after
-/// Commit, while the shell and what it replays already run, and before the
-/// claim an `ESC [3J` in that window was undone by the import. No count, no
-/// band row. NEGATIVE CONTROL: the same crossing with no clear imports it all
+/// A scrollback the adopted shell clears (`ESC [3J`) before the post-Commit
+/// import lands stays cleared, with no loss count and no band row. Negative
+/// control: the same crossing with no clear imports everything
 /// (`a_whole_history_crosses_the_handoff_in_order_and_nothing_is_counted_lost`).
 #[test]
 fn a_scrollback_cleared_before_the_import_stays_cleared_and_is_not_counted() {
@@ -556,22 +560,10 @@ fn a_scrollback_cleared_before_the_import_stays_cleared_and_is_not_counted() {
     write_lines(&mut term.lock().unwrap(), "secret", 0, 2000);
     let crossed = cross(dir.path(), &term, |_| {});
     assert!(crossed.joined.take > 0);
-    let mut remaining = MAX_AGGREGATE_BYTES;
-    let mut adopted = incoming(
-        &crossed.manifest.sessions[0],
-        false,
-        &named(dir.path(), 1),
-        dir.path(),
-        &mut remaining,
-    );
+    let mut adopted = open_sidecar(dir.path(), &crossed.manifest.sessions[0]);
     let successor = adopt(&crossed.checkpoint, &mut adopted);
     successor.lock().unwrap().process(b"\x1b[3J");
-    let report = run_imports(vec![ImportJob {
-        session: 1,
-        term: Arc::clone(&successor),
-        history: adopted,
-    }])
-    .remove(0);
+    let report = import_one(&successor, adopted);
     assert!(report.cleared, "{report:?}");
     assert_eq!((report.imported, report.lost()), (0, 0));
     assert_eq!(report.failed, None);
@@ -586,15 +578,11 @@ fn a_scrollback_cleared_before_the_import_stays_cleared_and_is_not_counted() {
     );
 }
 
-/// THE EXPORT FOLLOWS (2026-09-26 review). On the launched lane the first pass
-/// runs beside the launch, and the park comes seconds later — the successor's
-/// whole boot, then the gate's wait for a quiet moment, up to the automatic
-/// lane's two-minute hold — so a tab that printed more than the screen carry's
-/// 256 lines in between fell back to them: a build still running at the
-/// update, the very log the carry exists for. Following, the export takes
-/// what lands after its first pass, and the park still meets it.
-/// NEGATIVE CONTROL: the same output after an export that does NOT follow
-/// outruns the join, and is counted.
+/// The export follows: output printed between its first pass and the park
+/// (the successor's boot plus the gate's wait, up to the automatic lane's
+/// two-minute hold) is taken too, so the park still meets it. Negative control:
+/// the same output after a non-following export outruns the join and is
+/// counted.
 #[test]
 fn a_following_export_takes_what_lands_after_its_first_pass() {
     for follow in [true, false] {
@@ -608,13 +596,16 @@ fn a_following_export_takes_what_lands_after_its_first_pass() {
         )
         .unwrap();
         assert!(
-            exporter.await_caught_up(Duration::from_secs(30)),
+            exporter.await_caught_up(aterm_spec::wait::MUST_HAPPEN),
             "the first pass finished"
         );
         // The build keeps printing while the successor boots: four times
         // what the checkpoint carries.
         write_lines(&mut term.lock().unwrap(), "late", 0, 1000);
-        assert!(exporter.halt(Duration::from_secs(30)), "the export stopped");
+        assert!(
+            exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+            "the export stopped"
+        );
         let results = exporter.finish(Duration::ZERO);
         let (checkpoint, head) = park(1, &term);
         let parent_history = history(&term.lock().unwrap());
@@ -650,14 +641,18 @@ fn a_following_export_takes_what_lands_after_its_first_pass() {
                 crossed.parent_history.len() - 256,
                 "everything but the screen carry's lines, counted"
             );
+            assert_eq!(
+                crossed.manifest.sessions[0].history, None,
+                "no sidecar is named for an outrun export"
+            );
         }
     }
 }
 
-/// THE PARK'S STOP ([`HistoryExporter::halt`]), which the park runs on the main
-/// thread before it freezes anything, whether the export is following or
-/// still in its first pass: the worker answers that it stopped, whatever it
-/// finished is handed over whole, and what nobody takes is removed.
+/// The park's stop ([`HistoryExporter::halt`]), run on the main thread before
+/// anything freezes, in either the following or first-pass phase: the worker
+/// answers, finished work is handed over whole, and what nobody takes is
+/// removed.
 #[test]
 fn the_parks_stop_is_answered_and_hands_over_only_whole_exports() {
     // Following, caught up: stopped, its one export covers its whole history.
@@ -667,9 +662,9 @@ fn the_parks_stop_is_answered_and_hands_over_only_whole_exports() {
     let mut exporter =
         HistoryExporter::start(dir.path().to_path_buf(), vec![(1, Arc::clone(&term))], true)
             .unwrap();
-    assert!(exporter.await_caught_up(Duration::from_secs(30)));
+    assert!(exporter.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
     assert!(
-        exporter.halt(Duration::from_secs(30)),
+        exporter.halt(aterm_spec::wait::MUST_HAPPEN),
         "the stop is answered"
     );
     let results = exporter.finish(Duration::ZERO);
@@ -696,7 +691,7 @@ fn the_parks_stop_is_answered_and_hands_over_only_whole_exports() {
     let depth = history(&sessions[0].1.lock().unwrap()).len();
     let mut exporter = HistoryExporter::start(dir.path().to_path_buf(), sessions, true).unwrap();
     assert!(
-        exporter.halt(Duration::from_secs(30)),
+        exporter.halt(aterm_spec::wait::MUST_HAPPEN),
         "the stop is answered"
     );
     let results = exporter.finish(Duration::ZERO);
@@ -708,11 +703,10 @@ fn the_parks_stop_is_answered_and_hands_over_only_whole_exports() {
     assert!(dir_entries(dir.path()).is_empty());
 }
 
-/// THE PARK'S PAUSE ([`HistoryExporter::pause`], round six of the update
-/// audit, finding 14): answered like the stop, and nothing is read while it
-/// holds — but a RESUME goes on following, so the lines printed while a
-/// missed park waited to re-park are in the sidecar the landed one hands
-/// over, and `finish` stops a paused export at once with its work whole.
+/// The park's pause ([`HistoryExporter::pause`]) is answered like the stop and
+/// reads nothing while held; a resume goes on following, so lines printed while
+/// a missed park waited are in the sidecar, and `finish` stops a paused export
+/// at once with its work whole.
 #[test]
 fn a_paused_export_resumes_following_and_finishes_whole() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -721,9 +715,9 @@ fn a_paused_export_resumes_following_and_finishes_whole() {
     let mut exporter =
         HistoryExporter::start(dir.path().to_path_buf(), vec![(1, Arc::clone(&term))], true)
             .unwrap();
-    assert!(exporter.await_caught_up(Duration::from_secs(30)));
+    assert!(exporter.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
     assert!(
-        exporter.pause(Duration::from_secs(30)),
+        exporter.pause(aterm_spec::wait::MUST_HAPPEN),
         "the pause is answered"
     );
     // Paused: the history grows past it, and a repeated pause of the same
@@ -732,8 +726,14 @@ fn a_paused_export_resumes_following_and_finishes_whole() {
     exporter.resume();
     // Resumed: the next pause's last look reaches the history's end.
     assert!(
-        exporter.pause(Duration::from_secs(30)),
+        exporter.pause(aterm_spec::wait::MUST_HAPPEN),
         "the re-pause is answered"
+    );
+    // Stopped under the hang detector, not finish's 100 ms HALT_WAIT:
+    // the worker's answer to the stop must happen, however loaded the box.
+    assert!(
+        exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+        "the stop is answered"
     );
     let results = exporter.finish(Duration::ZERO);
     assert!(!results.unfinished, "a paused export finishes at once");
@@ -747,6 +747,74 @@ fn a_paused_export_resumes_following_and_finishes_whole() {
     assert!(dir_entries(dir.path()).is_empty(), "nobody took it");
 }
 
+/// A RESUME THAT OVERTAKES A TIMED-OUT PAUSE (round eight of the update
+/// audit, finding 16): the pause times out while the worker's last look waits
+/// on the terminal lock, the park misses and resumes, and the worker reaches
+/// its wait after the resume. It must go on following: the lines printed
+/// before the next park are in the export, not lost to `Outrun`.
+#[test]
+fn a_resume_that_overtakes_a_timed_out_pause_keeps_the_export_following() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 2500);
+    let sessions = ExportSessions::from(vec![(1, Arc::clone(&term))]);
+    let followed = Arc::clone(&sessions.followed);
+    let mut exporter = HistoryExporter::start(dir.path().to_path_buf(), sessions, true).unwrap();
+    assert!(exporter.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
+    let guard = term.lock().unwrap();
+    assert!(
+        !exporter.pause(Duration::from_millis(20)),
+        "the last look waits on the lock, so the pause times out"
+    );
+    exporter.resume();
+    drop(guard);
+    // More than the next pause's last look plus the screen carry can take.
+    write_lines(&mut term.lock().unwrap(), "late", 0, 3000);
+    await_followed(&followed, &term);
+    assert!(
+        exporter.pause(aterm_spec::wait::MUST_HAPPEN),
+        "the re-pause is answered"
+    );
+    // Stopped under the hang detector, not finish's 100 ms HALT_WAIT:
+    // the worker's answer to the stop must happen, however loaded the box.
+    assert!(
+        exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+        "the stop is answered"
+    );
+    let results = exporter.finish(Duration::ZERO);
+    assert_eq!(results.exports.len(), 1);
+    let joined = join(
+        Some(results.exports[0].facts),
+        term.lock().unwrap().history_fence(),
+        256,
+    );
+    assert_eq!(joined.fallback, None, "the export followed: {joined:?}");
+    assert_eq!(joined.dropped, 0);
+}
+
+/// A VIEW OVER A SCREEN THAT DID NOT CROSS STAYS AT THE BOTTOM (round eight,
+/// finding 38): a session adopted with no screen to restore (its meta did not
+/// parse) restored no history, so the park's offset has nothing it named here,
+/// and the scrollback the program writes after the update is not it.
+/// NEGATIVE CONTROL: the clamp still lets a view into history that crossed
+/// (`a_view_into_withheld_history_stays_at_the_live_bottom`).
+#[test]
+fn a_view_over_a_screen_that_did_not_cross_stays_at_the_bottom() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut adopted = open_sidecar(
+        dir.path(),
+        &SessionRecord {
+            viewport_from_bottom: Some(50),
+            ..record(1)
+        },
+    );
+    let term = live(8, 40);
+    crate::spawn::hydrate_adopted_engine(&term, None, None, None, None, 1, &mut adopted);
+    write_lines(&mut term.lock().unwrap(), "after", 0, 300);
+    let _ = import_one(&term, adopted);
+    assert_eq!(term.lock().unwrap().grid().display_offset(), 0);
+}
+
 /// The finished command whose rows `t` retains, found by the command it ran.
 fn finished_output(t: &Terminal, command: &str) -> Option<String> {
     t.all_blocks()
@@ -755,14 +823,11 @@ fn finished_output(t: &Terminal, command: &str) -> Option<String> {
         .and_then(|b| t.block_output(b))
 }
 
-/// THE SHELL CARRY MEETS THE HISTORY CARRY (2026-09-27 review). The adopt
-/// restores the checkpoint — its OSC 133 marks and blocks at the source's
-/// absolute rows — then reserves the sidecar's keys, then imports after
-/// Commit. When the reserve raised the counter by the whole sidecar, every
-/// restored row moved up by it and the marks did not: a finished block read
-/// nothing, and a command running across the update completed with the old
-/// history as its output. Through the real seam (`hydrate_adopted_engine`)
-/// and the real import, both read exactly what the parent's do.
+/// The shell carry meets the history carry: the adopt restores OSC 133 marks
+/// and blocks at the source's absolute rows, reserves the sidecar's keys, then
+/// imports after Commit. Through the real seam (`hydrate_adopted_engine`) and
+/// import, finished and running blocks read exactly what the parent's do, not
+/// rows shifted by the reserve.
 #[test]
 fn command_blocks_read_their_own_lines_after_the_history_import() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -805,23 +870,14 @@ fn command_blocks_read_their_own_lines_after_the_history_import() {
     );
 }
 
-/// THE SUCCESSOR SAYS A POLICY'S WITHHOLDING AS THE POLICY'S (round 3 of the
-/// update-robustness work, 2026-09-27). Under a successor handoff policy of
-/// `carry = "visible"` or `"repaint"` the outgoing process carries NO
-/// scrollback — no history lines in the screen carry, no sidecar — and counts
-/// every line the park saw as left behind. The successor's band row read that
-/// count as a failure and added "everything on screen and the newest lines
-/// came across": no newest line crossed, and under `repaint` no screen did.
-/// Driven the whole way: the park's zero-history checkpoint, the worker's join
-/// under the withheld plan, the manifest over its TOML wire (which now says
-/// why), the successor's `incoming`, its import, and the row
-/// `settle_handoff_history` posts. NEGATIVE CONTROL: a real fallback (a rewrap
+/// Under a successor policy of `carry = "visible"` or `"repaint"` the outgoing
+/// process carries no scrollback and counts every line as left behind; the
+/// successor's band row says the policy withheld them, not that a fallback
+/// failed with "the newest lines came across". Driven end to end: the
+/// zero-history checkpoint, the join under the withheld plan, the manifest over
+/// its TOML wire, the successor's `incoming`, its import, and the row
+/// `settle_handoff_history` posts. Negative control: a real fallback (a rewrap
 /// after the export) keeps the failure row, its comfort, and no policy words.
-///
-/// RED before the fix, run 2026-09-27 on fd30337e5 (this test less the
-/// `history_withheld`/`withheld` checks, which name what the fix adds): the
-/// withheld case posted "the newest lines came across" (`left: true, right:
-/// false` at the comfort assertion).
 #[cfg(unix)]
 #[test]
 fn a_withheld_carry_is_said_as_the_policys_on_the_successors_band() {
@@ -862,14 +918,7 @@ fn a_withheld_carry_is_said_as_the_policys_on_the_successors_band() {
         );
         let manifest = SessionHandoff::from_toml(&wire).expect("and parses back");
 
-        let mut remaining = MAX_AGGREGATE_BYTES;
-        let mut adopted = incoming(
-            &manifest.sessions[0],
-            false,
-            &named(dir.path(), 1),
-            dir.path(),
-            &mut remaining,
-        );
+        let mut adopted = open_sidecar(dir.path(), &manifest.sessions[0]);
         let successor = adopt(&checkpoint, &mut adopted);
         let reports = run_imports(vec![ImportJob {
             session: 1,
@@ -885,6 +934,8 @@ fn a_withheld_carry_is_said_as_the_policys_on_the_successors_band() {
                 lines: lost,
                 tabs: 1,
                 withheld: if withheld { lost } else { 0 },
+                held: 0,
+                held_failed: 0,
             },
             "{at}"
         );
@@ -909,21 +960,8 @@ fn a_withheld_carry_is_said_as_the_policys_on_the_successors_band() {
 }
 
 // ---------------------------------------------------------------------------
-// A link-dense line in the carried history (2026-09-28)
+// A link-dense line in the carried history
 // ---------------------------------------------------------------------------
-
-/// `n` one-cell OSC 8 links (`L`, then a space), each to a `url_len`-byte URL
-/// — the row `seamless_ladder_tests::link_dense` builds for the screen carry.
-fn link_dense(n: usize, url_len: usize) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for link in 0..n {
-        let mut url = format!("https://example.test/{link}/");
-        let pad = url_len.saturating_sub(url.len());
-        url.push_str(&"u".repeat(pad));
-        bytes.extend_from_slice(format!("\x1b]8;;{url}\x1b\\L\x1b]8;;\x1b\\ ").as_bytes());
-    }
-    bytes
-}
 
 /// A shell at 80 columns with `total` lines of output: a short OSC 8 link on
 /// every 97th line, and at line `dense` a row of twelve 8 KiB links, whose
@@ -971,17 +1009,13 @@ fn assert_same_wire(what: &str, got: &[Line], want: &[Line]) {
     }
 }
 
-/// THE EXPORT AS v0.94.0–v0.97.0 SHIP IT, the producer whose bytes are fixed
-/// forever (law L3). Their `header`, `begin_export`, `OpenExport::append` and
-/// `line_caps` are one text (checked against `git show
-/// v0.97.0:crates/aterm-gui/src/handoff_history.rs` and its v0.94.0 and
-/// v0.95.0 twins), and the line codec's bytes have not moved since v0.94.0:
-/// the fence and the first chunk under one lock, then each chunk of
-/// [`CHUNK_LINES`] lines, oldest first, as one frame of `serialize_lines` over
-/// the lines EXACTLY as the history holds them. That is this build's first pass
-/// without [`strip_over_cap_links`], and
+/// The export as v0.94.0–v0.97.0 write it, whose bytes are fixed: the fence and
+/// the first chunk under one lock, then each chunk of [`CHUNK_LINES`] lines,
+/// oldest first, as one frame of `serialize_lines` over the lines exactly as
+/// the history holds them. That is this build's first pass without
+/// [`strip_over_cap_links`];
 /// [`the_shipped_producer_is_this_builds_export_but_the_strip`] pins it to the
-/// live export byte for byte wherever the strip has nothing to drop.
+/// live export byte for byte where the strip drops nothing.
 fn shipped_export(dir: &Path, local_id: u64, term: &Arc<Mutex<Terminal>>) -> HistoryExport {
     let t = term.lock().unwrap();
     let fence = t.history_fence();
@@ -1021,10 +1055,10 @@ fn shipped_export(dir: &Path, local_id: u64, term: &Arc<Mutex<Terminal>>) -> His
     }
 }
 
-/// THE IMPORT'S FRAME LOOP AS v0.94.0–v0.97.0 SHIP IT (`read_sidecar` at the
-/// tag): every frame the first `take` lines reach is decoded by
-/// `deserialize_lines_strict` under [`line_caps`], and the first frame that
-/// does not decode refuses the whole sidecar. `Ok` with the lines it keeps.
+/// The import's frame loop as v0.94.0–v0.97.0 run it (`read_sidecar`): every
+/// frame the first `take` lines reach is decoded by `deserialize_lines_strict`
+/// under [`line_caps`], and the first frame that fails refuses the whole
+/// sidecar. `Ok` with the lines it keeps.
 fn shipped_import_frames(bytes: &[u8], take: u64) -> Result<u64, &'static str> {
     let cols = u16::from_le_bytes([bytes[8], bytes[9]]);
     let (content_cap, record_cap) = line_caps(cols);
@@ -1070,16 +1104,12 @@ fn the_shipped_producer_is_this_builds_export_but_the_strip() {
     );
 }
 
-/// THE 2026-09-28 DEFECT, on the bytes the shipped producers write: a tab
-/// whose carried history holds one link-dense line lost ALL of it on every
-/// v0.94.0–v0.97.0 → next hop, because the import refused the whole sidecar
-/// for the one frame the line was in. Now every line crosses: the dense
-/// line's text exact and its links dropped, every other line — its links
-/// included — exact, nothing counted lost. Both places the line can sit: among
-/// the sidecar's `take` lines (older than the checkpoint's 256), and among the
-/// checkpoint's own lines but in a frame the take reaches, which is decoded
-/// all the same. NEGATIVE CONTROL: the shipped import's frame loop refuses
-/// each of these sidecars.
+/// A link-dense line in sidecars the shipped producers wrote costs only its
+/// links: the dense line's text is exact with its links dropped, every other
+/// line (links included) is exact, nothing is counted lost. Covers the line
+/// among the sidecar's `take` lines (older than the checkpoint's 256) and among
+/// the checkpoint's own lines in a frame the take reaches. Negative control:
+/// the shipped import's frame loop refuses each of these sidecars.
 #[test]
 fn a_link_dense_line_a_shipped_producer_wrote_costs_only_its_links() {
     let (_, record_cap) = line_caps(80);
@@ -1174,10 +1204,9 @@ fn a_link_dense_line_a_shipped_producer_wrote_costs_only_its_links() {
     }
 }
 
-/// THE EXPORT DROPS THE LINKS ITSELF, on both of its paths — the first pass
-/// and a following export's ticks — so this build writes no frame the strict
-/// decode refuses: the shipped import's frame loop reads the whole sidecar.
-/// What it writes is the history with only the over-cap lines' links dropped.
+/// The export drops over-cap links itself on both paths (first pass and a
+/// following export's ticks), so it writes no frame the strict decode refuses;
+/// only the over-cap lines lose their links.
 #[test]
 fn the_export_writes_no_record_over_the_cap() {
     let (_, record_cap) = line_caps(80);
@@ -1190,7 +1219,7 @@ fn the_export_writes_no_record_over_the_cap() {
             follow,
         )
         .unwrap();
-        assert!(exporter.await_caught_up(Duration::from_secs(30)));
+        assert!(exporter.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
         if follow {
             // A second dense row lands after the first pass: a tick takes it.
             let mut t = term.lock().unwrap();
@@ -1198,7 +1227,10 @@ fn the_export_writes_no_record_over_the_cap() {
             t.process(b"\r\n");
             write_lines(&mut t, "late", 0, 20);
         }
-        assert!(exporter.halt(Duration::from_secs(30)), "the export stopped");
+        assert!(
+            exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+            "the export stopped"
+        );
         let mut results = exporter.finish(Duration::ZERO);
         let export = results.exports.remove(0);
         let history_now = history_wire(&term.lock().unwrap());
@@ -1249,9 +1281,9 @@ fn read_frames(cols: u16, frames: &[Vec<u8>], take: u64) -> Result<SidecarLines,
     read_sidecar(&bytes[..], bytes.len() as u64, &hasher.finalize(), take)
 }
 
-/// The leniency is exactly one: a record over the cap because of its links,
-/// within the hard ceiling. A frame corrupt in any other way still refuses
-/// the whole sidecar, as it did, and the digest still binds the repaired one.
+/// The only leniency is a record over the cap because of its links, within the
+/// hard ceiling. A frame corrupt any other way still refuses the whole sidecar,
+/// and the digest still binds the repaired one.
 #[test]
 fn a_frame_corrupt_for_any_other_reason_still_refuses_the_sidecar() {
     use aterm_core::scrollback::{CellAttrs, HyperlinkSpan, Rle};
@@ -1334,23 +1366,17 @@ fn a_frame_corrupt_for_any_other_reason_still_refuses_the_sidecar() {
     );
 }
 
-/// WHERE THE PERSON WAS READING (round five, item 18): a session scrolled
-/// back into its history at the park crosses with its viewport — lines from
-/// the bottom, on the record as `viewport_from_bottom` — and the successor
-/// puts it back once the import has put the history back under it, clamped to
-/// the scrollback that exists there. Here the offset is far past the 256 lines
-/// the screen carry holds, so only an apply AFTER the import can reach it.
-/// NEGATIVE CONTROLS: a view at the live bottom writes nothing (an older
-/// reader sees the wire it always saw, and a record without the field — every
-/// older producer's — leaves the successor at the bottom); a record naming more
-/// than exists is clamped; and a successor view the person already moved is
-/// left where they put it.
+/// A session scrolled back at the park crosses with its viewport (lines from
+/// the bottom, `viewport_from_bottom`), and the successor restores it after the
+/// import, clamped to the scrollback there. The offset is past the screen
+/// carry's 256 lines, so only a post-import apply reaches it. Negative controls:
+/// a view at the live bottom writes nothing (a record without the field leaves
+/// the successor at the bottom); an over-long offset is clamped; a view the
+/// person already moved is left alone.
 #[test]
 fn a_scrolled_viewport_is_restored_after_import() {
     let dir = aterm_tempfile::tempdir().unwrap();
-    let term = live(8, 40);
-    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
-    term.lock().unwrap().scroll_display(1000);
+    let term = scrolled_back_session();
     assert_eq!(term.lock().unwrap().grid().display_offset(), 1000);
     let crossed = cross(dir.path(), &term, |_| {});
     let record = &crossed.manifest.sessions[0];
@@ -1408,25 +1434,9 @@ fn a_scrolled_viewport_is_restored_after_import() {
 
     // A view the person moved in the successor before the import is theirs.
     let dir = aterm_tempfile::tempdir().unwrap();
-    let term = live(8, 40);
-    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
-    term.lock().unwrap().scroll_display(1000);
-    let crossed = cross(dir.path(), &term, |_| {});
-    let mut remaining = MAX_AGGREGATE_BYTES;
-    let mut adopted = incoming(
-        &crossed.manifest.sessions[0],
-        false,
-        &named(dir.path(), 1),
-        dir.path(),
-        &mut remaining,
-    );
-    let successor = adopt(&crossed.checkpoint, &mut adopted);
+    let (successor, adopted) = scrolled_back_adoption(dir.path());
     successor.lock().unwrap().scroll_display(5);
-    let _ = run_imports(vec![ImportJob {
-        session: 1,
-        term: Arc::clone(&successor),
-        history: adopted,
-    }]);
+    let _ = import_one(&successor, adopted);
     assert_eq!(
         successor.lock().unwrap().grid().display_offset(),
         5,
@@ -1443,40 +1453,20 @@ fn top_line(t: &Terminal) -> String {
         .unwrap_or_default()
 }
 
-/// THE VIEWPORT IS ANCHORED TO THE PARK'S BOTTOM, NOT TO WHEREVER OUTPUT HAS
-/// PUSHED IT BY THE IMPORT. The restore runs on the import worker after
-/// Commit, with the adopted reader already appending; the offset the park
-/// measured, replayed from the bottom as it stands then, lands as many lines
-/// below the reading position as have scrolled into history since. The adopt
-/// notes the bottom it restored, and the restore adds what was pushed since.
-///
-/// RED before the fix: the view landed 50 lines low — `line2050`'s screen
-/// instead of `line2000`'s.
+/// The viewport is anchored to the park's bottom, not wherever output has
+/// pushed it by the import: the adopt notes the bottom it restored, and the
+/// restore adds the lines pushed into history since.
 #[test]
 fn a_restored_viewport_holds_the_lines_read_at_the_park() {
     let dir = aterm_tempfile::tempdir().unwrap();
-    let term = live(8, 40);
-    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
-    term.lock().unwrap().scroll_display(1000);
+    let term = scrolled_back_session();
     let read_at_park = top_line(&term.lock().unwrap());
     let crossed = cross(dir.path(), &term, |_| {});
-    let mut remaining = MAX_AGGREGATE_BYTES;
-    let mut adopted = incoming(
-        &crossed.manifest.sessions[0],
-        false,
-        &named(dir.path(), 1),
-        dir.path(),
-        &mut remaining,
-    );
+    let mut adopted = open_sidecar(dir.path(), &crossed.manifest.sessions[0]);
     let successor = adopt(&crossed.checkpoint, &mut adopted);
     // The adopted reader, running between the Commit and the import.
     write_lines(&mut successor.lock().unwrap(), "after", 0, 50);
-    let report = run_imports(vec![ImportJob {
-        session: 1,
-        term: Arc::clone(&successor),
-        history: adopted,
-    }])
-    .remove(0);
+    let report = import_one(&successor, adopted);
     assert_eq!(report.failed, None);
     let t = successor.lock().unwrap();
     assert_eq!(
@@ -1491,30 +1481,14 @@ fn a_restored_viewport_holds_the_lines_read_at_the_park() {
     );
 }
 
-/// INPUT SENT SINCE THE ADOPT TAKES THE VIEW BACK. A person typing at the
-/// prompt the revealed window shows — before the import worker gets to the
-/// restore — must not have the view yanked up into history under them. The
-/// adopt notes the session's input count; any input attempt since skips the
-/// restore. NEGATIVE CONTROL: the same session with no input is restored.
-///
-/// RED before the fix: the restore ran whatever had been typed.
+/// Input sent since the adopt skips the viewport restore, so a person typing
+/// at the prompt is not yanked into history. Negative control: the same
+/// session with no input is restored.
 #[test]
 fn input_since_the_adopt_skips_the_viewport_restore() {
     for typed in [false, true] {
         let dir = aterm_tempfile::tempdir().unwrap();
-        let term = live(8, 40);
-        write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
-        term.lock().unwrap().scroll_display(1000);
-        let crossed = cross(dir.path(), &term, |_| {});
-        let mut remaining = MAX_AGGREGATE_BYTES;
-        let mut adopted = incoming(
-            &crossed.manifest.sessions[0],
-            false,
-            &named(dir.path(), 1),
-            dir.path(),
-            &mut remaining,
-        );
-        let successor = adopt(&crossed.checkpoint, &mut adopted);
+        let (successor, mut adopted) = scrolled_back_adoption(dir.path());
         // A sink over no descriptor: the write fails, but the ATTEMPT is what
         // the session's input count takes, exactly as for a keystroke — the
         // one egress law every key, paste and `send` writes through.
@@ -1531,11 +1505,7 @@ fn input_since_the_adopt_skips_the_viewport_restore() {
                 crate::input::EgressMode::Interactive,
             );
         }
-        let _ = run_imports(vec![ImportJob {
-            session: 1,
-            term: Arc::clone(&successor),
-            history: adopted,
-        }]);
+        let _ = import_one(&successor, adopted);
         assert_eq!(
             successor.lock().unwrap().grid().display_offset(),
             if typed { 0 } else { 1000 },
@@ -1544,12 +1514,9 @@ fn input_since_the_adopt_skips_the_viewport_restore() {
     }
 }
 
-/// A pipe whose read end never blocks: the test's stand-in for a PTY master,
-/// read back to see what the session was sent. Both ends are close-on-exec: a
-/// child another test of this binary spawns meanwhile must not inherit the
-/// write end, or a read that expects EOF once the sink drops it sees `EAGAIN`
-/// (measured: `a_pending_viewport_restore_keeps_no_pty_master_open` read -1
-/// under the whole `--lib` suite, and passed alone).
+/// A pipe whose read end never blocks: the test's stand-in for a PTY master.
+/// Both ends are close-on-exec so a child another test spawns cannot inherit
+/// the write end and turn an expected EOF into `EAGAIN`.
 #[cfg(unix)]
 fn nonblocking_pipe() -> [i32; 2] {
     let mut pipe = [0; 2];
@@ -1569,26 +1536,6 @@ fn nonblocking_pipe() -> [i32; 2] {
     pipe
 }
 
-/// An adopted session scrolled 1000 lines back at the park, adopted and ready
-/// for its import: the successor and its history.
-#[cfg(unix)]
-fn scrolled_back_adoption(dir: &Path) -> (Arc<Mutex<Terminal>>, AdoptedHistory) {
-    let term = live(8, 40);
-    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
-    term.lock().unwrap().scroll_display(1000);
-    let crossed = cross(dir, &term, |_| {});
-    let mut remaining = MAX_AGGREGATE_BYTES;
-    let mut adopted = incoming(
-        &crossed.manifest.sessions[0],
-        false,
-        &named(dir, 1),
-        dir,
-        &mut remaining,
-    );
-    let successor = adopt(&crossed.checkpoint, &mut adopted);
-    (successor, adopted)
-}
-
 /// What reaches a session after its adopt without anyone typing into it.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1603,18 +1550,11 @@ enum AfterAdopt {
     Key,
 }
 
-/// ONLY INPUT SOMEONE SENT TAKES THE VIEW BACK — NOT A REPORT, NOT AN ENGINE
-/// REPLY. The restore stands aside for a person typing at the prompt; it
-/// must not stand aside for the focus report a focus-reporting program is
-/// sent the moment the successor's window takes focus at Commit, nor for the
-/// DA/DSR replies the engine writes — the sink's input epoch counts both, so
-/// a watch on it skipped the restore in exactly the session it is for.
-/// Driven through the real App routes: `write_focus_report` (the report the
-/// focus delta writes), the reply writer's own sink write, and `App::input`
-/// for the key. NEGATIVE CONTROL: the key skips the restore.
-///
-/// RED before the fix: the focus report and the reply each skipped it (the
-/// sink's epoch moved for both, asserted below so the premise is measured).
+/// Only input someone sent skips the restore: not the focus report sent when
+/// the successor's window takes focus at Commit, nor the engine's DA/DSR
+/// replies (the sink's input epoch counts both, asserted below). Driven through
+/// the real App routes: `write_focus_report`, the reply writer's sink write,
+/// and `App::input` for the key. Negative control: the key skips the restore.
 #[cfg(unix)]
 #[test]
 fn a_report_or_an_engine_reply_after_the_adopt_leaves_the_viewport_restore() {
@@ -1667,11 +1607,7 @@ fn a_report_or_an_engine_reply_after_the_adopt_leaves_the_viewport_restore() {
             epoch,
             "{after:?}: the sink's epoch moved — the watch must not read it"
         );
-        let _ = run_imports(vec![ImportJob {
-            session: 1,
-            term: Arc::clone(&successor),
-            history: adopted,
-        }]);
+        let _ = import_one(&successor, adopted);
         assert_eq!(
             successor.lock().unwrap().grid().display_offset(),
             if after == AfterAdopt::Key { 0 } else { 1000 },
@@ -1687,15 +1623,10 @@ fn a_report_or_an_engine_reply_after_the_adopt_leaves_the_viewport_restore() {
     }
 }
 
-/// THE WATCH HOLDS NO DESCRIPTOR. An owned sink closes the PTY master when
-/// its last reference goes; a tab closed while the imports run must hang up
-/// its child then, not whenever the import worker reaches its job. The
-/// adopted history waiting for its import keeps the session's input count,
-/// never its sink: dropping the sink closes the master at once (the read end
-/// sees EOF) with the watch still alive, and the watch still works.
-///
-/// RED before the fix: the watch held the sink, and the master stayed open
-/// (the read end saw `EAGAIN`, not EOF) until the history was dropped.
+/// The restore's watch holds no descriptor: the adopted history keeps the
+/// session's input count, never its sink, so dropping the sink closes the PTY
+/// master at once (the read end sees EOF) and a tab closed during the import
+/// hangs up its child; the watch still works.
 #[cfg(unix)]
 #[test]
 fn a_pending_viewport_restore_keeps_no_pty_master_open() {
@@ -1711,8 +1642,7 @@ fn a_pending_viewport_restore_keeps_no_pty_master_open() {
     // The tab closes: its session context — the sink with it — is dropped.
     drop(sink);
     // EOF within a bound, not at once: a child forked between `pipe` and the
-    // close-on-exec above holds the write end until it execs. The defect held
-    // it until the history dropped, which no bound outlasts.
+    // close-on-exec above holds the write end until it execs.
     let mut hup = libc::pollfd {
         fd: pipe[0],
         events: libc::POLLIN,
@@ -1729,11 +1659,7 @@ fn a_pending_viewport_restore_keeps_no_pty_master_open() {
         n, 0,
         "the master closed when its tab did (EOF), import pending"
     );
-    let _ = run_imports(vec![ImportJob {
-        session: 1,
-        term: Arc::clone(&successor),
-        history: adopted,
-    }]);
+    let _ = import_one(&successor, adopted);
     assert_eq!(
         successor.lock().unwrap().grid().display_offset(),
         1000,
@@ -1744,34 +1670,20 @@ fn a_pending_viewport_restore_keeps_no_pty_master_open() {
     }
 }
 
-/// THE ATTACH'S OWN RENUMBERING IS NOT OUTPUT. The restore adds every rise
-/// of the history grid's absolute row counter since the adopt, as lines
-/// output pushed into history; but an attach whose history is longer than
-/// the adopt reserved (a rewrap, or a reserve that fell short) raises the
-/// counter itself, moving every key — the adopt's bottom with them — and
-/// pushing nothing. Here the parent sent no counter (an older producer) and
-/// the reserve fell short, so the attach renumbers by the whole import; the
-/// view must still land on the lines read at the park.
-///
-/// RED before the fix: the view landed as many lines too high as the attach
-/// renumbered.
+/// The attach's own renumbering is not output. The restore adds every rise of
+/// the absolute row counter since the adopt as pushed lines, but an attach
+/// whose history is longer than the adopt reserved (a rewrap, or a short
+/// reserve) raises the counter itself and pushes nothing. Here the parent sent
+/// no counter and the reserve fell short, so the attach renumbers by the whole
+/// import; the view must still land on the lines read at the park.
 #[test]
 fn an_attach_that_renumbers_does_not_move_the_restored_viewport() {
     let dir = aterm_tempfile::tempdir().unwrap();
-    let term = live(8, 40);
-    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
-    term.lock().unwrap().scroll_display(1000);
+    let term = scrolled_back_session();
     let read_at_park = top_line(&term.lock().unwrap());
     let mut crossed = cross(dir.path(), &term, |_| {});
     crossed.checkpoint.absolute_row_counter = 0;
-    let mut remaining = MAX_AGGREGATE_BYTES;
-    let mut adopted = incoming(
-        &crossed.manifest.sessions[0],
-        false,
-        &named(dir.path(), 1),
-        dir.path(),
-        &mut remaining,
-    );
+    let mut adopted = open_sidecar(dir.path(), &crossed.manifest.sessions[0]);
     let take = adopted.reserve();
     assert!(take > 0, "a carry to import");
     // The adopt with a reserve that falls short: the restore, a claim for no
@@ -1784,12 +1696,7 @@ fn an_attach_that_renumbers_does_not_move_the_restored_viewport() {
         adopted.anchor_in(&engine);
     }
     let bottom = adopted.bottom_at_adopt.expect("anchored");
-    let report = run_imports(vec![ImportJob {
-        session: 1,
-        term: Arc::clone(&successor),
-        history: adopted,
-    }])
-    .remove(0);
+    let report = import_one(&successor, adopted);
     assert_eq!(report.failed, None);
     assert!(report.imported > 0);
     let t = successor.lock().unwrap();
@@ -1809,49 +1716,6 @@ fn top_row(t: &Terminal) -> String {
         .to_string()
 }
 
-/// ROUND SIX, FINDING 24: OUTPUT AFTER THE PARK DOES NOT MOVE THE READER. At
-/// Commit the adopted readers parse whatever the freeze queued BEFORE the
-/// import puts the view back, so a session still printing had moved its
-/// bottom by then — and a view put back as "N lines above the bottom" landed
-/// on lines printed after the update. The view comes back on the very line
-/// the person was reading. NEGATIVE CONTROL: with no output in between, the
-/// same line (as round five's test, above, pins by offset).
-#[test]
-fn output_after_the_park_does_not_move_the_restored_view() {
-    for post_park in [0usize, 30] {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let term = live(8, 40);
-        write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
-        term.lock().unwrap().scroll_display(1000);
-        let reading = top_row(&term.lock().unwrap());
-        assert!(reading.starts_with("line"), "reading history: {reading:?}");
-        let crossed = cross(dir.path(), &term, |_| {});
-        let mut remaining = MAX_AGGREGATE_BYTES;
-        let mut adopted = incoming(
-            &crossed.manifest.sessions[0],
-            false,
-            &named(dir.path(), 1),
-            dir.path(),
-            &mut remaining,
-        );
-        let successor = adopt(&crossed.checkpoint, &mut adopted);
-        // The post-Commit drain: the readers run before the import does.
-        write_lines(&mut successor.lock().unwrap(), "after", 0, post_park);
-        let report = run_imports(vec![ImportJob {
-            session: 1,
-            term: Arc::clone(&successor),
-            history: adopted,
-        }])
-        .remove(0);
-        assert_eq!(report.failed, None);
-        assert_eq!(
-            top_row(&successor.lock().unwrap()),
-            reading,
-            "{post_park} line(s) after the park: the person is back on the line they read"
-        );
-    }
-}
-
 /// ROUND SIX, FINDING 24 (its second half): A PERSON WORKING AT THE PROMPT IS
 /// NOT PULLED UP. Keys typed before Commit replay at Commit, and more follow
 /// it; paste and End do the same at the bottom. None of them moves a view that
@@ -1861,7 +1725,9 @@ fn output_after_the_park_does_not_move_the_restored_view() {
 /// adopt and the import now leaves the view at the bottom. NEGATIVE CONTROL:
 /// with no gesture, and with only output, a bare modifier or a key release in
 /// between (none of which says where the person wants to be), the view is put
-/// back on the line read at the park.
+/// back on the line read at the park. The `output` row is the finding's first
+/// half: output the adopted readers parse at Commit, before the import, does
+/// not move the reader off the line they were reading.
 #[test]
 fn a_gesture_after_the_adopt_keeps_the_view_at_the_bottom() {
     use crate::app_input::{PressKind, apply_press_custody};
@@ -1901,27 +1767,13 @@ fn a_gesture_after_the_adopt_keeps_the_view_at_the_bottom() {
     ];
     for (what, gesture, restored) in cases {
         let dir = aterm_tempfile::tempdir().unwrap();
-        let term = live(8, 40);
-        write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
-        term.lock().unwrap().scroll_display(1000);
+        let term = scrolled_back_session();
         let reading = top_row(&term.lock().unwrap());
         let crossed = cross(dir.path(), &term, |_| {});
-        let mut remaining = MAX_AGGREGATE_BYTES;
-        let mut adopted = incoming(
-            &crossed.manifest.sessions[0],
-            false,
-            &named(dir.path(), 1),
-            dir.path(),
-            &mut remaining,
-        );
+        let mut adopted = open_sidecar(dir.path(), &crossed.manifest.sessions[0]);
         let successor = adopt(&crossed.checkpoint, &mut adopted);
         gesture(&mut successor.lock().unwrap());
-        let report = run_imports(vec![ImportJob {
-            session: 1,
-            term: Arc::clone(&successor),
-            history: adopted,
-        }])
-        .remove(0);
+        let report = import_one(&successor, adopted);
         assert_eq!(report.failed, None, "{what}");
         let t = successor.lock().unwrap();
         if restored {
@@ -1936,20 +1788,65 @@ fn a_gesture_after_the_adopt_keeps_the_view_at_the_bottom() {
     }
 }
 
-/// A VIEW SCROLLED INTO HISTORY THAT DID NOT CROSS STAYS AT THE LIVE BOTTOM
-/// (round seven, item 21). Under a successor policy of `carry = "visible"` or
-/// `"repaint"` the park carries no history — a zero-history screen carry and
-/// the withheld plan — yet the record still names where the person was
-/// reading. The adopted program keeps writing after Commit, and those lines
-/// are the only scrollback the successor holds when the import worker runs:
-/// scrolling the view up into them shows output printed after the update, not
-/// what the person was reading, and stops the pane following live output.
-/// NEGATIVE CONTROL: an offset inside the history the screen carry brought is
-/// still put back, riding the lines pushed since the adopt; one past it is
-/// clamped to the oldest line that crossed.
-///
-/// RED before the fix: the withheld view was scrolled up 50 lines, into the
-/// output written after the adopt.
+/// A visible paste into the front session (⌘-V, menu Paste, a drop, `aterm ctl
+/// paste`) is a gesture too, though it bypasses the press custody and at the
+/// live bottom moves nothing. Driven through `App::input` with
+/// `InputEvent::Paste`. Negative control: no paste, and the view is restored.
+#[cfg(unix)]
+#[test]
+fn a_visible_paste_after_the_adopt_keeps_the_view_at_the_bottom() {
+    use crate::input::{InputEvent, PasteFraming, Source};
+    for paste in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let term = scrolled_back_session();
+        let reading = top_row(&term.lock().unwrap());
+        let crossed = cross(dir.path(), &term, |_| {});
+        let mut adopted = open_sidecar(dir.path(), &crossed.manifest.sessions[0]);
+        // The successor's front session is the adopted one — its engine
+        // hydrated as `spawn_session` hydrates it — and its PTY a socket.
+        let (_program, pty) = std::os::unix::net::UnixStream::pair().unwrap();
+        let sink = Arc::new(aterm_session::sink::SinkWriter::new_owned(pty.into()));
+        let mut app = crate::App::headless_for_test_with_sink(sink);
+        let successor = Arc::clone(&app.pool.get(0).expect("session 0").term);
+        crate::spawn::hydrate_adopted_engine(
+            &successor,
+            Some(&crossed.checkpoint),
+            None,
+            None,
+            None,
+            1,
+            &mut adopted,
+        );
+        assert_eq!(successor.lock().unwrap().grid().display_offset(), 0);
+        if paste {
+            let ev = InputEvent::Paste("ls".into(), PasteFraming::Gesture { bracketed: false });
+            assert_eq!(
+                app.input(crate::WindowId(0), ev, Source::Human),
+                crate::input::InputOutcome::Ok
+            );
+        }
+        let report = import_one(&successor, adopted);
+        assert_eq!(report.failed, None);
+        let t = successor.lock().unwrap();
+        if paste {
+            assert_eq!(
+                t.grid().display_offset(),
+                0,
+                "a paste at the prompt after the adopt: the person stays at the bottom"
+            );
+        } else {
+            assert_eq!(top_row(&t), reading, "no paste: the view is put back");
+        }
+    }
+}
+
+/// A view scrolled into history that did not cross stays at the live bottom.
+/// Under `carry = "visible"` or `"repaint"` no history crosses, yet the record
+/// still names the reading position; scrolling into post-Commit output would
+/// show lines printed after the update and stop the pane following. Negative
+/// control: an offset inside the history the screen carry brought is restored,
+/// riding the lines pushed since the adopt; one past it is clamped to the
+/// oldest line that crossed.
 #[test]
 fn a_view_into_withheld_history_stays_at_the_live_bottom() {
     for (carried, scrolled, want) in [(0, 500, 0), (256, 100, 150), (256, 500, 306)] {
@@ -1972,26 +1869,643 @@ fn a_view_into_withheld_history_stays_at_the_live_bottom() {
             dir.path(),
             NONCE,
         );
-        let mut remaining = MAX_AGGREGATE_BYTES;
-        let mut adopted = incoming(
-            &manifest.sessions[0],
-            false,
-            &named(dir.path(), 1),
-            dir.path(),
-            &mut remaining,
-        );
+        let mut adopted = open_sidecar(dir.path(), &manifest.sessions[0]);
         let successor = adopt(&checkpoint, &mut adopted);
         // The adopted program, writing between the Commit and the import.
         write_lines(&mut successor.lock().unwrap(), "after", 0, 50);
-        let _ = run_imports(vec![ImportJob {
-            session: 1,
-            term: Arc::clone(&successor),
-            history: adopted,
-        }]);
+        let _ = import_one(&successor, adopted);
         assert_eq!(
             successor.lock().unwrap().grid().display_offset(),
             want,
             "carried {carried}, scrolled {scrolled}"
         );
     }
+}
+
+/// A HELD PANE'S LEFT-BEHIND LINES SAY WHY (the review of round eight's
+/// finding 39, whose fix said every one as a held pane's by design, a failed
+/// carry included). The producer types the reason ([`HeldLoss`]) from the
+/// attempt's plan ([`ExportResults::take_held`]) and the join
+/// ([`name_held_sidecar`]); the successor reads it back off the two wire keys
+/// ([`HeldLoss::from_wire`]) and books the lines by it ([`incoming_held`]):
+///
+/// * a policy that carries no scrollback → the new version's request;
+/// * a hop to an older build, which takes a held screen alone → a held
+///   pane's, by design;
+/// * an export offered and not reaching the pane, and an export whose fence
+///   a resize moved → a FAILURE, folded into [`LossSummary::held_failed`]
+///   (never under "the newest lines came across"), and a record that says
+///   both keys is read as failed.
+#[test]
+fn a_held_panes_left_lines_say_why() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "held", 0, 200);
+    let head = || capture_head(7, &term.lock().unwrap()).fence;
+    let lines = head().lines();
+    assert!(lines > 0, "PRECONDITION: the pane has scrollback");
+    let held_name = |tag: &str| dir.path().join(format!("held-{tag}.hist"));
+
+    // The plan's reason, for a pane with no export.
+    let plans = [
+        (ExportResults::default(), false, HeldLoss::Failed),
+        (ExportResults::default(), true, HeldLoss::ScreenOnly),
+        (
+            HistoryPlan::Withheld.results(dir.path()),
+            false,
+            HeldLoss::Withheld,
+        ),
+        (
+            HistoryPlan::Withheld.results(dir.path()),
+            true,
+            HeldLoss::Withheld,
+        ),
+    ];
+    for (mut results, older, why) in plans {
+        let held = results.take_held(&[7], older);
+        assert!(held.exports.is_empty());
+        assert_eq!(held.unexported, why, "older successor: {older}");
+        let carried = name_held_sidecar(None, head(), held_name("none"), held.unexported);
+        assert_eq!(
+            (carried.stamp, carried.dropped, carried.why),
+            (None, lines, why),
+            "no export: every line, with the plan's reason"
+        );
+    }
+
+    // An export the pane's fence no longer meets: a failure, whatever the
+    // plan would have said of a missing one.
+    let mut results = export(dir.path(), &[(7, &term)]);
+    let held = results.take_held(&[7], false);
+    assert_eq!(held.exports.len(), 1, "the held pane's export is taken");
+    assert!(results.exports.is_empty(), "and left out of the join");
+    term.lock().unwrap().resize(8, 33);
+    let moved = name_held_sidecar(
+        held.exports.into_iter().next(),
+        head(),
+        held_name("moved"),
+        HeldLoss::ScreenOnly,
+    );
+    assert_eq!(
+        (moved.stamp.is_none(), moved.why),
+        (true, HeldLoss::Failed),
+        "a moved fence is a failed carry"
+    );
+    assert!(moved.dropped > 0);
+
+    // The successor books each by its keys.
+    for ((withheld, failed), why) in [
+        ((false, false), HeldLoss::ScreenOnly),
+        ((true, false), HeldLoss::Withheld),
+        ((false, true), HeldLoss::Failed),
+        ((true, true), HeldLoss::Failed),
+    ] {
+        assert_eq!(HeldLoss::from_wire(withheld, failed), why);
+        let mut remaining = MAX_AGGREGATE_BYTES;
+        let history = incoming_held(
+            None,
+            500,
+            why,
+            7,
+            &held_name("in"),
+            dir.path(),
+            &mut remaining,
+        );
+        assert_eq!(
+            carried_loss([&history]),
+            LossSummary {
+                lines: 500,
+                tabs: 1,
+                withheld: if why == HeldLoss::Withheld { 500 } else { 0 },
+                held: if why == HeldLoss::ScreenOnly { 500 } else { 0 },
+                held_failed: if why == HeldLoss::Failed { 500 } else { 0 },
+            },
+            "{why:?}"
+        );
+    }
+
+    // A handed session's failure is never a held pane's.
+    let handed = AdoptedHistory {
+        dropped: 40,
+        lost: 40,
+        ..AdoptedHistory::default()
+    };
+    assert_eq!(carried_loss([&handed]).held_failed, 0);
+}
+
+/// A HELD PANE NEVER TAKES THE ROOM A LIVE TAB'S FOLLOW NEEDS (the review of
+/// round eight's finding 39). Held panes' exports fill the aggregate after
+/// the handed session's first pass; the handed session keeps printing, more
+/// than the screen carry holds, and its follow evicts the LARGEST held export
+/// for the room, so it follows and its whole history crosses. The evicted
+/// pane is told as not exported (said as a held pane's failed carry) and its
+/// sidecar is gone; the other held pane keeps its export. A frame the handed
+/// session could not take even with every held export gone evicts none.
+/// NEGATIVE CONTROL: the same desk with those panes exported as handed
+/// sessions — whose room nothing takes back, as a held pane's was not before
+/// the review — outruns the join.
+#[test]
+fn a_held_panes_export_gives_way_to_a_live_tabs_follow() {
+    // Session 1 is the live tab; 2 (deep) and 3 (shallow) are held panes.
+    let desk = || {
+        let tab = live(8, 40);
+        write_lines(&mut tab.lock().unwrap(), "tab", 0, 3000);
+        let deep = live(8, 40);
+        write_lines(&mut deep.lock().unwrap(), "deep", 0, 4000);
+        let shallow = live(8, 40);
+        write_lines(&mut shallow.lock().unwrap(), "shallow", 0, 100);
+        [tab, deep, shallow]
+    };
+    let [tab, deep, shallow] = desk();
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let measured = export(scratch.path(), &[(1, &tab), (2, &deep), (3, &shallow)]);
+    let len = |id: u64| {
+        measured
+            .exports
+            .iter()
+            .find(|export| export.local_id == id)
+            .map(|export| export.len)
+            .expect("every session exported")
+    };
+    let (len1, len2, len3) = (len(1), len(2), len(3));
+    drop(measured);
+    // What the follow takes: 1000 lines, more than the screen carry's 256,
+    // in one frame (written under one lock), smaller than the deep pane's
+    // export and larger than the shallow one's.
+    let late = 1000;
+
+    // Run the launched lane's export over a fresh desk under `cap`, print
+    // `late` lines into the tab once the first pass is done, park, and join
+    // the tab.
+    let run = |handed: &[u64], held: &[u64], cap: u64| {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let terms = desk();
+        let pick = |ids: &[u64]| -> Vec<(u64, Arc<Mutex<Terminal>>)> {
+            ids.iter()
+                .map(|id| (*id, Arc::clone(&terms[usize::try_from(*id - 1).unwrap()])))
+                .collect()
+        };
+        let sessions = ExportSessions {
+            handed: pick(handed),
+            held: pick(held),
+            ..ExportSessions::default()
+        };
+        let mut exporter =
+            HistoryExporter::start_within(dir.path().to_path_buf(), sessions, true, cap).unwrap();
+        // Every first pass, the held panes' too: they run between the follows.
+        assert!(
+            exporter.await_passed(aterm_spec::wait::MUST_HAPPEN),
+            "every first pass finished"
+        );
+        write_lines(&mut terms[0].lock().unwrap(), "late", 0, late);
+        assert!(
+            exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+            "the export stopped"
+        );
+        let results = exporter.finish(Duration::ZERO);
+        assert!(!results.unfinished);
+        assert!(
+            results
+                .exports
+                .iter()
+                .fold(0, |sum, export| sum + export.len)
+                <= cap,
+            "the sidecars stay within the aggregate"
+        );
+        (dir, terms, results)
+    };
+    let cross_tab = |dir: &Path, tab: &Arc<Mutex<Terminal>>, results: ExportResults| {
+        let (checkpoint, head) = park(1, tab);
+        let parent_history = history(&tab.lock().unwrap());
+        let mut manifest = manifest(&[1]);
+        let verdicts = stamp_manifest(
+            &mut manifest,
+            &[(1, checkpoint.clone())],
+            &[head],
+            results,
+            dir,
+            NONCE,
+        );
+        Crossed {
+            parent_history,
+            checkpoint,
+            manifest,
+            joined: verdicts[0].1,
+        }
+    };
+
+    // The aggregate exactly full after the first pass: the follow evicts
+    // the deep pane, and the tab's whole history crosses.
+    let (dir, terms, mut results) = run(&[1], &[2, 3], len1 + len2 + len3);
+    assert_eq!(
+        results.refused,
+        vec![(2, EVICTED.to_string())],
+        "the deep pane, the largest, gave way"
+    );
+    let entries = dir_entries(dir.path());
+    assert!(
+        !entries.iter().any(|name| name.ends_with(".s2.hist")),
+        "the evicted sidecar is gone: {entries:?}"
+    );
+    let held = results.take_held(&[2, 3], false);
+    assert_eq!(
+        held.exports
+            .iter()
+            .map(|export| export.local_id)
+            .collect::<Vec<_>>(),
+        vec![3],
+        "the shallow pane keeps its export"
+    );
+    assert_eq!(held.unexported, HeldLoss::Failed, "said as a failed carry");
+    let evicted = name_held_sidecar(
+        None,
+        capture_head(2, &terms[1].lock().unwrap()).fence,
+        dir.path().join("held-2.hist"),
+        held.unexported,
+    );
+    assert_eq!(
+        (evicted.stamp, evicted.dropped, evicted.why),
+        (
+            None,
+            capture_head(2, &terms[1].lock().unwrap()).fence.lines(),
+            HeldLoss::Failed
+        ),
+        "every line of the evicted pane stays behind, counted"
+    );
+    assert!(results.refused.is_empty(), "the held refusal left the join");
+    let crossed = cross_tab(dir.path(), &terms[0], results);
+    assert_eq!(crossed.joined.fallback, None, "{:?}", crossed.joined);
+    assert_eq!(crossed.joined.dropped, 0);
+    let (successor, report) = receive(dir.path(), &crossed);
+    assert_eq!((report.lost(), report.failed.clone()), (0, None));
+    assert_eq!(
+        history(&successor.lock().unwrap()),
+        crossed.parent_history,
+        "the tab's whole history crossed, the late lines included"
+    );
+    drop(held);
+
+    // A frame no held export could make room for evicts nothing: the
+    // shallow pane alone is smaller than the tab's late frame.
+    let (dir, terms, results) = run(&[1], &[3], len1 + len3);
+    assert!(results.refused.is_empty(), "{:?}", results.refused);
+    assert!(
+        results.exports.iter().any(|export| export.local_id == 3),
+        "the held pane keeps its export"
+    );
+    let crossed = cross_tab(dir.path(), &terms[0], results);
+    assert_eq!(crossed.joined.fallback, Some(Fallback::Outrun));
+
+    // NEGATIVE CONTROL: the same panes as handed sessions take room nothing
+    // gives back, and the tab outruns the join.
+    let (dir, terms, results) = run(&[1, 2, 3], &[], len1 + len2 + len3);
+    assert!(results.refused.is_empty(), "{:?}", results.refused);
+    let crossed = cross_tab(dir.path(), &terms[0], results);
+    assert_eq!(
+        crossed.joined.fallback,
+        Some(Fallback::Outrun),
+        "without the eviction the tab's follow stops"
+    );
+    assert!(crossed.joined.dropped > 0);
+}
+
+/// The desk of round eight's #801: a live tab (session 1, 3000 lines deep) and
+/// a deep held pane (session 2) whose first pass the test holds where it is,
+/// as a pane of a million lines is held by its own depth until the park.
+fn desk_with_a_deep_held_pane() -> (Arc<Mutex<Terminal>>, Arc<Mutex<Terminal>>, Arc<AtomicU64>) {
+    let tab = live(8, 40);
+    write_lines(&mut tab.lock().unwrap(), "tab", 0, 3000);
+    let deep = live(8, 40);
+    write_lines(&mut deep.lock().unwrap(), "deep", 0, 4000);
+    (tab, deep, Arc::new(AtomicU64::new(2)))
+}
+
+/// The tab's join at the park, against what the export handed over.
+fn join_the_tab(tab: &Arc<Mutex<Terminal>>, results: &ExportResults) -> Joined {
+    let export = results
+        .exports
+        .iter()
+        .find(|export| export.local_id == 1)
+        .map(|export| export.facts);
+    let (checkpoint, head) = park(1, tab);
+    join(export, head.fence, carried_history(&checkpoint))
+}
+
+/// Wait (a hang detector) until every handed session's export has followed
+/// `term`'s history to its end: the event a fixed sleep used to hope for.
+fn await_followed(followed: &AtomicU64, term: &Arc<Mutex<Terminal>>) {
+    let end = term.lock().unwrap().history_fence().end;
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the export followed the history to its end",
+        || (followed.load(Ordering::Acquire) >= end).then_some(()),
+    );
+}
+
+/// A HELD PANE'S FIRST PASS NEVER STOPS A LIVE TAB BEING FOLLOWED (round eight
+/// of the update audit, #801). On the launched lane the export ran every first
+/// pass, the held panes' included, before it followed anything: while a deep
+/// `--hold` pane was read, a tab printing a build went unfollowed, the park
+/// paused the export in the middle of the held pass, and the last look (2,048
+/// lines) plus the screen carry (256) could not reach back to where the tab's
+/// export ended — the join was `Outrun` and the tab's whole older scrollback
+/// stayed behind, which with no held pane exported it kept.
+///
+/// The held pass here never finishes (the test holds it). The park gate is
+/// told the export caught up once the TAB's pass is done; the tab prints 3000
+/// lines, the export follows them, and the park pauses it in the middle of the
+/// held pass: the tab's join is whole, and the held pane is told why it has no
+/// export.
+///
+/// NEGATIVE CONTROL, the order this replaced: the same unfinished pass ahead of
+/// the following — here a handed session's, which the export still runs before
+/// it follows — and the tab's join is `Outrun`.
+#[test]
+fn a_held_pass_never_stops_a_live_tab_being_followed() {
+    let late = 3000;
+    assert!(
+        late > 2 * CHUNK_LINES + 256,
+        "PRECONDITION: more than the last look and the screen carry reach"
+    );
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (tab, deep, stalled) = desk_with_a_deep_held_pane();
+    let sessions = ExportSessions {
+        handed: vec![(1, Arc::clone(&tab))],
+        held: vec![(2, Arc::clone(&deep))],
+        stalled: Some(Arc::clone(&stalled)),
+        followed: Arc::default(),
+    };
+    let followed = Arc::clone(&sessions.followed);
+    let mut exporter = HistoryExporter::start(dir.path().to_path_buf(), sessions, true).unwrap();
+    assert!(
+        exporter.await_caught_up(aterm_spec::wait::MUST_HAPPEN),
+        "the park need not wait for a held pane's pass"
+    );
+    write_lines(&mut tab.lock().unwrap(), "late", 0, late);
+    await_followed(&followed, &tab);
+    assert!(
+        exporter.pause(aterm_spec::wait::MUST_HAPPEN),
+        "the pause is answered in the middle of the held pass"
+    );
+    assert!(
+        !exporter.passed,
+        "PRECONDITION: the held pass is unfinished"
+    );
+    // Stopped under the hang detector, not finish's 100 ms HALT_WAIT:
+    // the worker's answer to the stop must happen, however loaded the box.
+    assert!(
+        exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+        "the stop is answered"
+    );
+    let results = exporter.finish(Duration::ZERO);
+    assert!(!results.unfinished, "{results:?}");
+    let joined = join_the_tab(&tab, &results);
+    assert_eq!(joined.fallback, None, "the tab was followed: {joined:?}");
+    assert_eq!(joined.dropped, 0);
+    assert_eq!(
+        results.refused,
+        vec![(2, STOPPED_BEFORE_ITS_PASS.to_string())],
+        "the held pane is told why it has no export"
+    );
+    drop(results);
+    assert!(
+        dir_entries(dir.path()).is_empty(),
+        "nothing is left on disk"
+    );
+
+    // NEGATIVE CONTROL: an unfinished pass ahead of the following.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (tab, deep, stalled) = desk_with_a_deep_held_pane();
+    let sessions = ExportSessions {
+        handed: vec![(1, Arc::clone(&tab)), (2, Arc::clone(&deep))],
+        held: Vec::new(),
+        stalled: Some(stalled),
+        followed: Arc::default(),
+    };
+    let mut exporter = HistoryExporter::start(dir.path().to_path_buf(), sessions, true).unwrap();
+    assert!(
+        !exporter.await_caught_up(FOLLOW_EVERY * 4),
+        "PRECONDITION: the pass ahead of the following never finishes"
+    );
+    write_lines(&mut tab.lock().unwrap(), "late", 0, late);
+    std::thread::sleep(FOLLOW_EVERY * 20);
+    assert!(exporter.pause(aterm_spec::wait::MUST_HAPPEN));
+    // Stopped under the hang detector, not finish's 100 ms HALT_WAIT:
+    // the worker's answer to the stop must happen, however loaded the box.
+    assert!(
+        exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+        "the stop is answered"
+    );
+    let results = exporter.finish(Duration::ZERO);
+    assert_eq!(
+        join_the_tab(&tab, &results).fallback,
+        Some(Fallback::Outrun),
+        "unfollowed, the tab outruns the join"
+    );
+}
+
+/// THE PARK GATE WAITS FOR A HELD PANE'S PASS, BOUNDEDLY (round eight of the
+/// update audit, the last review of #801). #801 made the gate wait only for the
+/// HANDED sessions' first passes (`caught_up`), so on the launched lane the park
+/// landed at the dial and stopped a deep `--hold` pane's pass half-way: its
+/// whole scrollback stayed behind, told as [`STOPPED_BEFORE_ITS_PASS`] — the
+/// loss #39 was fixed to stop. The gate now waits for every first pass
+/// (`passed`), within [`EXPORT_PATIENCE`]; the held pass runs between the
+/// tab's follows, so the tab, still printing, is never outrun meanwhile.
+///
+/// NEGATIVE CONTROL: keyed on `caught_up`, the gate would have parked while
+/// the held pass was still running.
+#[test]
+fn the_park_gate_waits_for_a_held_pass_and_its_scrollback_crosses() {
+    let late = 3000;
+    assert!(
+        late > 2 * CHUNK_LINES + 256,
+        "PRECONDITION: more than the last look and the screen carry reach"
+    );
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (tab, deep, stalled) = desk_with_a_deep_held_pane();
+    let sessions = ExportSessions {
+        handed: vec![(1, Arc::clone(&tab))],
+        held: vec![(2, Arc::clone(&deep))],
+        stalled: Some(Arc::clone(&stalled)),
+        followed: Arc::default(),
+    };
+    let followed = Arc::clone(&sessions.followed);
+    let mut exporter = HistoryExporter::start(dir.path().to_path_buf(), sessions, true).unwrap();
+    assert!(exporter.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
+    assert!(
+        !exporter.passed(),
+        "PRECONDITION: the held pass is unfinished"
+    );
+    assert!(
+        park_wait(!exporter.passed(), Duration::ZERO).is_some(),
+        "the gate waits for the held pane's pass"
+    );
+    assert_eq!(
+        park_wait(!exporter.caught_up(), Duration::ZERO),
+        None,
+        "NEGATIVE CONTROL: keyed on the handed passes, the gate would park now"
+    );
+    // The tab keeps printing while the held pass runs; then the pass is let go.
+    write_lines(&mut tab.lock().unwrap(), "late", 0, late);
+    stalled.store(u64::MAX, Ordering::Release);
+    assert!(
+        exporter.await_passed(aterm_spec::wait::MUST_HAPPEN),
+        "the held pass finishes"
+    );
+    assert_eq!(
+        park_wait(!exporter.passed(), Duration::ZERO),
+        None,
+        "the gate lets the park go once every pass is done"
+    );
+    await_followed(&followed, &tab);
+    assert!(exporter.pause(aterm_spec::wait::MUST_HAPPEN));
+    // Stopped under the hang detector, not finish's 100 ms HALT_WAIT:
+    // the worker's answer to the stop must happen, however loaded the box.
+    assert!(
+        exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+        "the stop is answered"
+    );
+    let results = exporter.finish(Duration::ZERO);
+    assert!(
+        results.refused.is_empty(),
+        "nothing is told as not exported: {:?}",
+        results.refused
+    );
+    assert!(
+        results.exports.iter().any(|export| export.local_id == 2),
+        "the held pane's scrollback crosses"
+    );
+    let joined = join_the_tab(&tab, &results);
+    assert_eq!(joined.fallback, None, "the tab was followed: {joined:?}");
+    // The launched lane's gate is keyed on it.
+    let gate = include_str!("app_update_handoff.rs");
+    assert!(
+        gate.contains(".is_some_and(|export| !export.passed());"),
+        "the park gate waits on every first pass, the held panes' too"
+    );
+}
+
+/// A HELD PASS A PAUSE INTERRUPTS GOES ON WHERE IT STOOD (round eight of the
+/// update audit, #801): a park that misses resumes the export, and the held
+/// pane's pass — kept across the pause, not dropped — finishes, while the tab
+/// is followed; the next park hands both over whole.
+#[test]
+fn a_paused_held_pass_finishes_after_the_resume() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (tab, deep, stalled) = desk_with_a_deep_held_pane();
+    let sessions = ExportSessions {
+        handed: vec![(1, Arc::clone(&tab))],
+        held: vec![(2, Arc::clone(&deep))],
+        stalled: Some(Arc::clone(&stalled)),
+        followed: Arc::default(),
+    };
+    let followed = Arc::clone(&sessions.followed);
+    let mut exporter = HistoryExporter::start(dir.path().to_path_buf(), sessions, true).unwrap();
+    assert!(exporter.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
+    assert!(
+        exporter.pause(aterm_spec::wait::MUST_HAPPEN),
+        "paused in the middle of the held pass"
+    );
+    // The park missed: the export resumes, and the held pass is let go.
+    stalled.store(u64::MAX, Ordering::Release);
+    exporter.resume();
+    write_lines(&mut tab.lock().unwrap(), "late", 0, 3000);
+    assert!(
+        exporter.await_passed(aterm_spec::wait::MUST_HAPPEN),
+        "the held pass finished after the resume"
+    );
+    await_followed(&followed, &tab);
+    assert!(exporter.pause(aterm_spec::wait::MUST_HAPPEN));
+    // Stopped under the hang detector, not finish's 100 ms HALT_WAIT:
+    // the worker's answer to the stop must happen, however loaded the box.
+    assert!(
+        exporter.halt(aterm_spec::wait::MUST_HAPPEN),
+        "the stop is answered"
+    );
+    let results = exporter.finish(Duration::ZERO);
+    assert!(results.refused.is_empty(), "{:?}", results.refused);
+    let held = results
+        .exports
+        .iter()
+        .find(|export| export.local_id == 2)
+        .expect("the held pane's export");
+    assert_eq!(
+        held.facts.lines as usize,
+        history(&deep.lock().unwrap()).len(),
+        "the held pane's whole history"
+    );
+    let joined = join_the_tab(&tab, &results);
+    assert_eq!(joined.fallback, None, "{joined:?}");
+    assert_eq!(joined.dropped, 0);
+}
+
+/// THE FORK LANE GIVES HELD PANES LITTLE OF ITS FREEZE (round eight of the
+/// update audit, #801). The fork lane exports with every reader parked, so the
+/// held panes' passes, which come last, lengthened the freeze by up to the
+/// whole [`FORK_EXPORT_WAIT`]; and the export they left unfinished was said as
+/// one that had not reached every tab, though it had. Past the handed
+/// sessions' passes the held ones get at most their own bound: here a held
+/// pass that never finishes, a wait of a minute and a held bound of nothing,
+/// and the export is handed over at once, the tab's whole, not "unfinished",
+/// and the held pane told why it has none.
+///
+/// FAILS WITHOUT THE FIX: the export waited out the whole wait for the held
+/// pass, and was booked unfinished.
+#[test]
+fn the_fork_lanes_held_passes_wait_only_their_own_bound() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (tab, deep, stalled) = desk_with_a_deep_held_pane();
+    let sessions = ExportSessions {
+        handed: vec![(1, Arc::clone(&tab))],
+        held: vec![(2, Arc::clone(&deep))],
+        stalled: Some(stalled),
+        followed: Arc::default(),
+    };
+    let started = std::time::Instant::now();
+    let results = HistoryExporter::start(dir.path().to_path_buf(), sessions, false)
+        .unwrap()
+        .finish_deferred(aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
+    assert!(
+        started.elapsed() < aterm_spec::wait::MUST_HAPPEN / 2,
+        "the held pass was not waited for: {:?}",
+        started.elapsed()
+    );
+    assert!(!results.unfinished, "every tab was reached: {results:?}");
+    assert_eq!(
+        results
+            .exports
+            .iter()
+            .map(|export| export.local_id)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    // Told before the worker's `Done` — which the halt waits for only
+    // `HALT_WAIT` — so the held pane's reason may or may not be in by then;
+    // no other reason ever is.
+    assert!(
+        results
+            .refused
+            .iter()
+            .all(|refused| *refused == (2, STOPPED_BEFORE_ITS_PASS.to_string())),
+        "{:?}",
+        results.refused
+    );
+    let joined = join_the_tab(&tab, &results);
+    assert_eq!((joined.fallback, joined.dropped), (None, 0));
+
+    // CONTROL: a held pass that finishes within its bound is handed over.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (tab, deep, _) = desk_with_a_deep_held_pane();
+    let sessions = ExportSessions {
+        handed: vec![(1, Arc::clone(&tab))],
+        held: vec![(2, Arc::clone(&deep))],
+        stalled: None,
+        followed: Arc::default(),
+    };
+    let results = HistoryExporter::start(dir.path().to_path_buf(), sessions, false)
+        .unwrap()
+        .finish_deferred(aterm_spec::wait::MUST_HAPPEN, aterm_spec::wait::MUST_HAPPEN);
+    assert!(results.refused.is_empty(), "{:?}", results.refused);
+    assert_eq!(results.exports.len(), 2);
 }

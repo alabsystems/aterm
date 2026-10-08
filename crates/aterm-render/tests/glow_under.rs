@@ -30,8 +30,9 @@ use aterm_core::render::{CharFg, EffectStreamDamage, GlowQuad, RenderInput};
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, DirtyDecision, Renderer, Theme, WindowCpu, compute_dirty_rows};
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// A single-row-band flame-body quad (the producer splits row-spanning bodies
@@ -147,10 +148,7 @@ fn luma(p: u32) -> u32 {
 /// pre-light frame, and nothing outside the quad's row band changes.
 #[test]
 fn silhouette_law_glyph_darker_than_lit_background() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 10);
     // A full-block glyph at row 1 col 2: full-coverage stroke pixels, so the
@@ -270,10 +268,7 @@ fn cell_pixels(
 /// operand entirely.
 #[test]
 fn char_fg_follows_into_line_decorations() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     // Deterministic pixels: a lazy fallback parse landing between two renders
     // would recolour a frame this test compares byte-for-byte (the ink.rs
     // discipline).
@@ -449,10 +444,7 @@ fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
 /// gate-hit check on the steady state.
 #[test]
 fn damaged_path_no_ghosting_as_glow_under_and_char_fg_animate() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let rows = 6usize;
     let mut term = Terminal::new(rows as u16, 12);

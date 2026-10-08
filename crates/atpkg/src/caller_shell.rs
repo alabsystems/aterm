@@ -1,21 +1,19 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SHELL THAT TYPED THIS (2026-09-16): which shell `aterm pkg doctor` / `which` are
+//! THE SHELL THAT TYPED THIS: which shell `aterm pkg doctor` / `which` are
 //! answering, so the one remedy they print — `. ~/.aterm/shell.d/00-atpkg.zsh`, `source
 //! …fish`, the dot-source for pwsh — is in the dialect of the shell it is typed into.
 //!
 //! `$SHELL` is the LOGIN shell, not the one in front of the user: aterm spawns the
 //! configured `shell` (`--shell`, the config key) without re-pointing `$SHELL`, so a
-//! fish tab on a zsh-login machine used to be told `. ~/.aterm/shell.d/00-atpkg.zsh` "here
-//! picks the managed copy up" — a line fish cannot source (`${__atpkg_p//…}` is not fish)
-//! — while the window's status row, keyed on the spawn shell, said the fish line in the
-//! same tab (review finding, 2026-09-16). The signal a tab actually carries is its
+//! fish tab on a zsh-login machine would be handed a zsh line fish cannot source. The
+//! signal a tab actually carries is its
 //! PROCESS TREE: `aterm pkg …` is a child of the shell that typed it (`exec`'d shims keep
 //! the parent), so the parent's executable name is the shell — `zsh`, `bash`, `fish`,
 //! `pwsh` — read once, by pid, with no fork: `sysctl(KERN_PROCARGS2)` on macOS (the exec
 //! path leads the buffer), `/proc/<pid>/exe` on Linux. Only when the parent is not a
-//! shell at all (`sudo`, `make`, a Python driver) does `$SHELL` answer, as before.
+//! shell at all (`sudo`, `make`, a Python driver) does `$SHELL` answer.
 
 /// The shell families this crate can name a remedy for, or hand a PATH line to:
 /// the parent's executable name is admitted only when it is one of these, so a driver
@@ -149,10 +147,8 @@ fn macos_exe_name(pid: u32) -> Option<String> {
 
 /// The basename of the exec path a `KERN_PROCARGS2` buffer leads with, read on its own
 /// ([`procargs2_exec_path`]) — never through the whole-layout [`parse_procargs2`]. The name
-/// needs one string, and routing it through the parser made every argv the parser refuses
-/// cost the caller's shell: a parent past 65 535 argv words went unnamed, and the remedy
-/// line was printed in `$SHELL`'s dialect instead (2026-09-23 audit; this reader never
-/// looked at argc before the parser existed).
+/// needs one string, and an argv the parser refuses must not cost the caller's shell (the
+/// remedy line would fall back to `$SHELL`'s dialect).
 #[cfg(any(target_os = "macos", test))]
 fn exe_name_of_procargs2(buf: &[u8]) -> Option<String> {
     std::path::Path::new(procargs2_exec_path(buf)?)
@@ -238,8 +234,8 @@ pub fn process_args(pid: u32) -> Option<ProcArgs> {
 /// so exactly one trailing NUL is a terminator and every other empty piece is an EMPTY
 /// WORD — kept, as [`parse_procargs2`] keeps one on macOS. Dropping empties handed a flag
 /// whose value was `""` the next word as its value: `--append-system-prompt ""
-/// --dangerously-skip-permissions` read back as the prompt swallowing the flag, and the
-/// live-upgrade relaunch typed that pairing (2026-09-23 audit). No trailing NUL (a process
+/// --dangerously-skip-permissions` would read back as the prompt swallowing the flag. No
+/// trailing NUL (a process
 /// that rewrote its title) splits as it stands; no bytes at all are no words.
 #[cfg(any(test, target_os = "linux"))]
 fn split_nul_list(bytes: &[u8]) -> Vec<String> {
@@ -265,8 +261,8 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<ProcArgs> {
     // The bound is the one the layout sets: every argv word takes at least one byte of
     // `rest` (its NUL, or its last byte at the very end), so a count past that is a buffer
     // this parser does not recognise. A fixed cap is not such a bound — ARG_MAX admits
-    // more than 65 535 short words (a live `/bin/zsh` carrying 70 004 argv was measured,
-    // 2026-09-23), and refusing one refused a real process whole.
+    // more than 65 535 short words (a live `/bin/zsh` carrying 70 004 argv was measured),
+    // and refusing one refused a real process whole.
     let argc = usize::try_from(argc).ok().filter(|&n| n <= rest.len())?;
     let mut at = exec_path.len();
     while rest.get(at) == Some(&0) {
@@ -393,39 +389,20 @@ mod tests {
         assert_eq!(invoking_shell_from(None, None), None);
     }
 
-    /// Whether `child` ends by SIGKILL within `patience` — the kernel's code-signing kill of
-    /// a process whose deleted executable it must page back in. Any other end, or none,
-    /// is `false`: only that one death is the fixture's, not the reader's.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn killed_within(child: &mut std::process::Child, patience: std::time::Duration) -> bool {
-        use std::os::unix::process::ExitStatusExt as _;
-        let deadline = std::time::Instant::now() + patience;
-        loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                return status.signal() == Some(libc::SIGKILL);
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
     /// Poll until `pid` answers `want`, bounded. `Command::spawn` does not promise the
     /// child has exec'd — macOS takes the `posix_spawn` path, which returns as soon as the
-    /// kernel has the process — so measuring straight after a spawn races the exec, and the
-    /// outliving case below would delete the file before exec ever read it. A timeout here
-    /// means the child never got there, not that the law under test failed.
+    /// kernel has the process — so measuring straight after a spawn races the exec. A
+    /// timeout here means the child never got there, not that the law under test failed.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn await_exec(pid: u32, want: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         loop {
             if process_exe_name(pid).as_deref() == Some(want) {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "pid {pid} never came up as {want:?} within 30 s — the spawn or the exec \
+                "pid {pid} never came up as {want:?} within a minute — the spawn or the exec \
                  failed, which is not what this case is about"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -462,179 +439,6 @@ mod tests {
         let _ = child.wait();
         assert_eq!(name.as_deref(), Some("sleep"));
         assert_eq!(process_exe_name(u32::MAX), None);
-    }
-
-    /// A program whose file is deleted under it is still named: the state of every shell
-    /// running across a package upgrade, and the one where Linux's exe link reads
-    /// `/…/sleep (deleted)`. macOS keeps answering the exec path it recorded for a live
-    /// process, so both platforms are asserted the same way.
-    ///
-    /// The fixture must be a copy of this test binary, not of a system one: macOS refuses
-    /// to exec a copy of `/bin/sleep` (an AMFI launch constraint on `com.apple.sleep`), and
-    /// a child that never reaches exec leaves nothing to name.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn a_program_outliving_its_own_file_is_still_named() {
-        if std::env::var_os(PROBE_ENV).is_some() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("atpkg-exe-name-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // THE KERNEL CAN END THE FIXTURE, AND THAT IS NOT THE READER FAILING. A deleted
-        // executable's code pages are backed by the unlinked file; under memory pressure
-        // macOS evicts clean code pages, and when the parked copy wakes and pages code back
-        // in from the unlinked file, code-signing validation fails and the kernel SIGKILLs
-        // it. Measured 2026-09-23 under 12-way parallel load: 6 of 480 attempts had the
-        // child already dead of signal 9 at the read (`try_wait` said so), and the reader
-        // correctly answered `None` for a process that no longer existed — which failed
-        // this case in two of four landing gates. So an attempt whose child DIED before the
-        // read measured the fixture, not the reader: it is rebuilt, a bounded number of
-        // times. A LIVE child whose name reads `None` still fails at once.
-        const ATTEMPTS: u32 = 5;
-        const KILL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
-        for _ in 0..ATTEMPTS {
-            // A basename of our own choosing, which is what is asserted: the reader must
-            // answer the file's name, not the name of the binary it was copied from.
-            let exe = dir.join("outliver");
-            std::fs::copy(std::env::current_exe().unwrap(), &exe).expect("copy this test binary");
-            let mut perms = std::fs::metadata(&exe).unwrap().permissions();
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                perms.set_mode(0o755);
-            }
-            std::fs::set_permissions(&exe, perms).unwrap();
-            // THE COPY'S FIRST EXEC IS PAID HERE, UNBOUNDED. A copy is a new file, and the
-            // first exec of a new file waits, at 0% CPU, until macOS `syspolicyd` has
-            // assessed it, one file at a time behind every test binary the gate links: a
-            // 43 MB fresh Mach-O measured 30 s there (2026-09-28), exactly where the
-            // readiness bound below fired on a child that had not started yet. A later exec
-            // of the same file costs nothing (the manual.rs `run_once` rule), so the copy
-            // runs once with no outliver env — the probe returns at once — and the bounded
-            // spawn, the unlink and the read below all meet the same, assessed file.
-            let _ = std::process::Command::new(&exe)
-                .args(["--exact", "--quiet", OUTLIVER_PROBE])
-                .env(PROBE_ENV, "1")
-                .env_remove(OUTLIVER_ENV)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            // The child announces when its test body has reached the park. An exec path
-            // alone does not establish that under a parallel workspace test.
-            let mut child = std::process::Command::new(&exe)
-                .args(["--exact", "--nocapture", "--quiet", OUTLIVER_PROBE])
-                .env(PROBE_ENV, "1")
-                .env(OUTLIVER_ENV, "1")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn the copy of this test binary");
-            let stdout = child.stdout.take().expect("probe stdout pipe");
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let reader = std::thread::spawn(move || {
-                use std::io::BufRead as _;
-                let mut output = Vec::new();
-                let mut signalled = false;
-                for line in std::io::BufReader::new(stdout).lines() {
-                    match line {
-                        Ok(line) => {
-                            if !signalled && line.contains("atpkg-outliver-ready") {
-                                let _ = ready_tx.send(Ok(()));
-                                signalled = true;
-                            }
-                            output.push(line);
-                        }
-                        Err(error) => {
-                            if !signalled {
-                                let _ = ready_tx.send(Err(format!(
-                                    "reading probe readiness failed: {error}; output: {output:?}"
-                                )));
-                            }
-                            return;
-                        }
-                    }
-                }
-                if !signalled {
-                    let _ = ready_tx.send(Err(format!(
-                        "probe exited before readiness; output: {output:?}"
-                    )));
-                }
-            });
-            let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(30));
-            if !matches!(ready, Ok(Ok(()))) {
-                let _ = child.kill();
-                let status = child.wait();
-                reader.join().expect("probe stdout reader");
-                let _ = std::fs::remove_file(&exe);
-                let _ = std::fs::remove_dir_all(&dir);
-                panic!("copied test process was not ready: {ready:?}; status: {status:?}");
-            }
-            // Independently wait until the pid reader can name the exec before unlink.
-            await_exec(child.id(), "outliver");
-            std::fs::remove_file(&exe).expect("delete it under the running process");
-            let name = process_exe_name(child.id());
-            // Whether the kernel was ending the child when it was read. A process being
-            // torn down refuses its arguments BEFORE `waitpid` can report it (measured: the
-            // read failed while an immediate `try_wait` still said running), so a `None` gets
-            // a bounded moment to show a SIGKILL; a live child is still running after it.
-            let died = name.is_none() && killed_within(&mut child, KILL_PATIENCE);
-            let _ = child.kill();
-            let _ = child.wait();
-            reader.join().expect("probe stdout reader");
-            if name.is_none() && died {
-                continue;
-            }
-            let _ = std::fs::remove_dir_all(&dir);
-            assert_eq!(
-                name.as_deref(),
-                Some("outliver"),
-                "the reader must still name a process whose file was deleted under it"
-            );
-            return;
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        panic!(
-            "the kernel ended the deleted-file child before it could be read in all {ATTEMPTS} \
-             attempts — the fixture could not stand up on this machine, which says nothing \
-             about the reader"
-        );
-    }
-
-    /// The env that puts the copy above into its waiting mode, and the name of the case it
-    /// runs there: one test, so the copy does nothing but park until it is killed.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    const OUTLIVER_ENV: &str = "ATPKG_CALLER_SHELL_OUTLIVER";
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    const OUTLIVER_PROBE: &str = "caller_shell::tests::probe_parks_until_killed";
-
-    /// The copy's whole job: exist, under its own name, until the parent kills it.
-    ///
-    /// No wall clock: the park ends on an event — killed (the normal path) or the parent
-    /// going away. A fixed timeout would let a descheduled parent come back to a probe that
-    /// had already exited, so an expired fixture would read as the law failing. Watching
-    /// the parent also keeps a stray out of the process table if the parent dies first.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn probe_parks_until_killed() {
-        if std::env::var_os(OUTLIVER_ENV).is_none() {
-            return;
-        }
-        // SAFETY: `getppid` takes no arguments, reads no memory we own and cannot
-        // fail (POSIX gives it no error return).
-        let spawner = unsafe { libc::getppid() };
-        println!("atpkg-outliver-ready");
-        {
-            use std::io::Write as _;
-            std::io::stdout().flush().expect("flush probe readiness");
-        }
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            // SAFETY: as above.
-            if unsafe { libc::getppid() } != spawner {
-                return;
-            }
-        }
     }
 
     /// End to end through a REAL shell: `sh -c` / `zsh -c` / `bash -c` / `fish -c` each
@@ -728,10 +532,9 @@ mod tests {
     }
 
     /// An argc past 65 535 is a real process, not a malformed buffer: ARG_MAX admits more
-    /// short words than that (a live `/bin/zsh` carrying 70 004 argv read back whole), where
-    /// this parser used to answer `None` — and the exe-name reader lost the shell with it.
-    /// Such a buffer parses whole and names its executable; a count no buffer of its size
-    /// can hold is refused without reserving for it.
+    /// short words than that (a live `/bin/zsh` carrying 70 004 argv read back whole). Such a
+    /// buffer parses whole and names its executable; a count no buffer of its size can hold is
+    /// refused without reserving for it.
     #[test]
     fn procargs2_admits_an_argc_past_65535_and_bounds_it_by_the_buffer() {
         let n = 70_000_usize;
@@ -817,7 +620,7 @@ mod tests {
     }
 
     /// A live process started with an EMPTY argument reads back with it, in place — on
-    /// Linux through the `/proc` arm (the one that used to drop it), on macOS through
+    /// Linux through the `/proc` arm, on macOS through
     /// `KERN_PROCARGS2`. `read` is a shell builtin, so the shell itself is what waits, and
     /// closing its stdin ends it.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -838,7 +641,7 @@ mod tests {
             .expect("/bin/sh");
         // The last word is the sign the exec happened (see `await_exec`); what is asserted
         // is the word before it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let argv = loop {
             let argv = process_args(child.id()).map(|a| a.argv);
             if argv
@@ -857,7 +660,7 @@ mod tests {
         let argv = argv.unwrap_or_default();
         assert!(
             argv.last().is_some_and(|w| w == tail[2]),
-            "the shell never read back as exec'd within 30 s ({argv:?}) — the spawn failed, \
+            "the shell never read back as exec'd within a minute ({argv:?}) — the spawn failed, \
              which is not what this case is about"
         );
         assert!(

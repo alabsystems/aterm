@@ -1,43 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// CPU==GPU parity for M4 Cascadia N:1 MERGED ligatures (`admit_collapsed`): a run
-// whose OpenType shaping COLLAPSES several cells into ONE wide glyph is sliced
-// into per-cell tiles, and the GPU must key + place those tiles byte-for-byte
-// with the CPU (each slice is an ordinary cell-local `mono_gid` slice glyph both
-// backends share via the atlas). aterm bundles no merged-ligature font, so this
-// DISCOVERS one (any font with the classic Latin `f_i`/`f_l`/`ffi` ligatures
-// collapses `fi`/`fl`/`ffi` N:1) and SKIPs cleanly when none is present or no GPU
-// is available. The discovered file is handed to both renderers as their FAMILY
-// (the window's `--font` seam), so nothing here writes the environment.
+// CPU==GPU parity for N:1 merged ligatures (`admit_collapsed`): a run whose
+// shaping collapses several cells into one wide glyph is sliced into per-cell
+// tiles (cell-local `mono_gid` slice glyphs shared via the atlas), and the GPU
+// must place them exactly as the CPU does. No merged-ligature font is bundled,
+// so one is discovered (Latin `f_i`/`f_l`/`ffi` ligatures collapse N:1); with
+// none, or no GPU, the test skips. The font is handed to both renderers as
+// their family (`--font`), so nothing writes the environment.
 
+use crate::common;
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
-mod common;
-use common::max_channel_delta_frame as max_channel_delta;
+use crate::common::max_channel_delta_frame as max_channel_delta;
 
-/// A font path whose `fi` collapses N:1 under `liga`/`calt`. Order:
+/// A font path whose `fi` collapses N:1 under `liga`/`calt` — the CPU row plan
+/// slices it into [`aterm_render::ColumnGlyph::LigatedSlice`] columns. Order:
 /// $ATERM_MERGED_FONT, then well-known macOS faces carrying Latin `f`-ligatures.
 /// `None` -> the caller SKIPs.
 fn merged_ligature_font_path() -> Option<std::path::PathBuf> {
-    let feats = aterm_render::ligature_shaping::build_feature_list(&[], true);
     let collapses = |path: &std::path::Path| -> bool {
         let Ok(bytes) = std::fs::read(path) else {
             return false;
         };
+        let Ok(mut r) = Renderer::from_bytes(&bytes, 18.0, Theme::default()) else {
+            return false;
+        };
+        r.set_text_shaping(shaping(true));
+        let mut term = Terminal::new(1, 4);
+        term.process(b"fi");
+        let mut plan = Vec::new();
+        r.row_glyph_plan(&term.cell_frame(1, 4), 0, &[], &mut plan);
         matches!(
-            aterm_render::ligature_shaping::shape_ligature_run(
-                &bytes,
-                0,
-                "fi",
-                &['f', 'i'],
-                true,
-                true,
-                &feats,
-                &[],
-            ),
-            Some(aterm_render::ShapedRun::Collapsed { .. })
+            plan.first(),
+            Some(aterm_render::ColumnGlyph::LigatedSlice { .. })
         )
     };
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -86,10 +83,9 @@ fn merged_ligature_gpu_matches_cpu() {
     let Some((mut cpu, mut gpu)) = common::backends_with_font(font, px, theme) else {
         return;
     };
-    // A CPU renderer with the merge DECLINED, to prove the sliced frame is not
-    // vacuously equal (the font really collapses `fi`/`fl`/`ffi`). Settled on
-    // the same terms as the kit's pair, so a chain landing between the arms
-    // cannot fake (or mask) the difference.
+    // A CPU renderer with the merge declined, proving the sliced frame is not
+    // vacuously equal. Settled like the kit's pair, so a chain landing between
+    // arms cannot fake or mask the difference.
     let Some(mut cpu_off) = font
         .to_str()
         .and_then(|family| Renderer::from_system_with_family(Some(family), px, theme))
@@ -134,10 +130,9 @@ fn merged_ligature_gpu_matches_cpu() {
     );
 }
 
-/// CPU==GPU parity with a BLOCK cursor parked on a merged-ligature cell: the
-/// cut-out re-colours only the cursor cell's slice tile, and the GPU quad slicing
-/// must reproduce it. Non-vacuous: the cursor frame differs from the hidden-cursor
-/// frame.
+/// CPU==GPU parity with a block cursor on a merged-ligature cell: the cut-out
+/// re-colours only that cell's slice tile. Non-vacuous: the cursor frame
+/// differs from the hidden-cursor frame.
 #[test]
 fn merged_ligature_cursor_gpu_matches_cpu() {
     let theme = Theme::default();

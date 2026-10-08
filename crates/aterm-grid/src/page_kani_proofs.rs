@@ -113,11 +113,8 @@ fn page_store_allocation_safe() {
     let rows: u16 = kani::any();
     let cols: u16 = kani::any();
     kani::assume(rows >= 2 && rows <= KANI_MAX_ROWS);
-    // Constrain cols so two Cell rows fit comfortably within Kani PAGE_SIZE
-    // (256 bytes). Cell is 8 bytes, so max theoretical = 256/8/2 = 16 cols.
-    // But cols=16 fills the page exactly (256 bytes), leaving no headroom
-    // for PageStore alignment overhead — causing solver explosion (OOM kill).
-    // Use cols <= 8 (128 bytes for 2 rows) for tractable verification.
+    // Two Cell rows within the 256-byte Kani PAGE_SIZE: cols <= 8 (128 bytes)
+    // leaves room for alignment and keeps the solver tractable.
     kani::assume(cols >= 4 && cols <= 8);
 
     let mut store = PageStore::new();
@@ -157,9 +154,8 @@ fn preheat_stats_consistent() {
 #[kani::unwind(6)]
 fn alloc_from_preheated_reduces_free() {
     let preheat: usize = kani::any();
-    // Reduced from 8 to 4: Kani PAGE_SIZE=256 makes PageStore Vec operations
-    // expensive for the solver. 4 pages is sufficient to verify the free-list
-    // accounting invariant.
+    // Kani's PAGE_SIZE=256 makes PageStore Vec operations costly for the
+    // solver; 4 pages suffice for the free-list accounting invariant.
     kani::assume(preheat > 0 && preheat <= 4);
 
     let mut store = PageStore::new();
@@ -219,9 +215,6 @@ fn shrink_to_fit_releases_free_pages() {
     kani::assert(store.stats().pages_free == 0, "stats should reflect shrink");
 }
 
-// allocation_after_reset_uses_free_list removed (#5887): fixed reset/allocate
-// smoke test with no symbolic inputs; better suited to a unit test than Kani.
-
 #[kani::proof]
 #[kani::unwind(6)]
 fn stats_pages_in_use_bounded() {
@@ -248,9 +241,6 @@ fn stats_pages_in_use_bounded() {
         "free + in_use should equal total",
     );
 }
-
-// offset_get_never_dangling removed (#5887): tautological — asserts the
-// exact same expression as its kani::assume. No production code called.
 
 /// Proof: alloc_slice alignment is correct
 #[kani::proof]
@@ -330,9 +320,3 @@ fn page_slice_as_mut_slice_write_round_trips() {
         "as_slice must observe writes from as_mut_slice",
     );
 }
-
-// page_data_ptr_edge_writes_are_in_bounds removed (#5887): concrete first/last-byte
-// write smoke test with no symbolic state; better suited to a unit test than Kani.
-
-// page_and_page_slice_send_sync_bounds_hold removed (#5887): compile-time
-// trait checks (assert_send/assert_sync) provide no runtime or symbolic value.

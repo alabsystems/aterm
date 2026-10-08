@@ -1,13 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The [`Provenance<T, O>`] `#[repr(transparent)]` wrapper and the inherent
-//! constructors production mints through: [`Provenance::from_host`] and
-//! [`Provenance::from_pty`].
+//! The [`Provenance<T, O>`] `#[repr(transparent)]` wrapper and its
+//! constructor [`Provenance::from_pty`].
 
 use core::marker::PhantomData;
 
-use crate::origin::{Host, Origin, OriginTag, Pty};
+use crate::origin::{Origin, Pty};
 
 /// A value tagged with its static origin.
 ///
@@ -17,36 +16,9 @@ use crate::origin::{Host, Origin, OriginTag, Pty};
 /// out `&Provenance<[u8], Pty>` over PTY byte slices without copying.
 ///
 /// `O` is `PhantomData<fn() -> O>` so the struct is *invariant* in `O`.
-/// This prevents accidental variance-driven `Provenance<T, Pty>` →
-/// `Provenance<T, Host>` upcasts in generic code.
 ///
 /// `Provenance` does not implement `Deref` or any auto-converting trait;
 /// consumers must call [`Provenance::as_ref`] explicitly.
-///
-/// # Origins do not convert
-///
-/// `From<T>` exists for the `Host` origin only, so a value that is already
-/// tagged cannot be relabelled with `.into()`. PTY bytes, for a start:
-///
-/// ```
-/// use aterm_provenance::{Host, Provenance, Pty};
-/// // Control: the constructors and paths below are valid; only the forge is not.
-/// let pty = Provenance::<_, Pty>::from_pty(b"rm -rf /".to_vec());
-/// let host: Provenance<Vec<u8>, Host> = b"ls".to_vec().into();
-/// # let _ = (pty, host);
-/// ```
-///
-/// ```compile_fail,E0277
-/// use aterm_provenance::{Host, Provenance, Pty};
-/// let pty = Provenance::<_, Pty>::from_pty(b"rm -rf /".to_vec());
-/// let _host: Provenance<Vec<u8>, Host> = pty.into();
-/// ```
-///
-/// ```compile_fail,E0277
-/// use aterm_provenance::{Provenance, Pty, User};
-/// let pty = Provenance::<_, Pty>::from_pty(String::from("sudo"));
-/// let _user: Provenance<String, User> = pty.into();
-/// ```
 #[repr(transparent)]
 pub struct Provenance<T: ?Sized, O: Origin> {
     // `_origin` is placed before `value` so the unsized-trailing layout works
@@ -70,7 +42,7 @@ impl<T: Copy, O: Origin> Copy for Provenance<T, O> {}
 impl<T: core::fmt::Debug + ?Sized, O: Origin> core::fmt::Debug for Provenance<T, O> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Provenance")
-            .field("tag", &O::TAG)
+            .field("origin", &core::any::type_name::<O>())
             .field("value", &&self.value)
             .finish()
     }
@@ -83,22 +55,6 @@ impl<T: PartialEq + ?Sized, O: Origin> PartialEq for Provenance<T, O> {
 }
 
 impl<T: Eq + ?Sized, O: Origin> Eq for Provenance<T, O> {}
-
-// Constructors. One inherent impl per origin marker so that constructing
-// `Provenance<_, Host>` requires naming `Host` in scope — this is how the
-// audit surface stays grep-able (§4.1).
-
-impl<T> Provenance<T, Host> {
-    /// Construct a `Provenance<T, Host>`. Marks `value` as host-origin; only
-    /// code that legitimately holds a host-trusted value may call this.
-    #[must_use]
-    pub const fn from_host(value: T) -> Self {
-        Self {
-            value,
-            _origin: PhantomData,
-        }
-    }
-}
 
 impl<T> Provenance<T, Pty> {
     /// Construct a `Provenance<T, Pty>`. Marks `value` as PTY-origin
@@ -113,17 +69,6 @@ impl<T> Provenance<T, Pty> {
 }
 
 impl<T: ?Sized, O: Origin> Provenance<T, O> {
-    /// Returns the runtime [`OriginTag`] for this static origin.
-    ///
-    /// Implemented via [`Origin::runtime_tag`] (identical to `O::TAG`; each
-    /// sealed impl returns its tag) so the polymorphic MIR stays free of
-    /// `OriginTag`-typed unevaluated constants, which the Trust L0 verifier
-    /// cannot model pre-monomorphization.
-    #[must_use]
-    pub fn tag(&self) -> OriginTag {
-        O::runtime_tag()
-    }
-
     /// Borrow the inner value. Preserves origin (the borrow is not tagged,
     /// but the borrow's lifetime is bounded by `self`; most sinks consume
     /// the full `Provenance<_, _>` instead).
@@ -140,13 +85,5 @@ impl<T: ?Sized, O: Origin> Provenance<T, O> {
     #[must_use]
     pub fn as_ref(&self) -> &T {
         &self.value
-    }
-}
-
-impl<T> From<T> for Provenance<T, Host> {
-    /// Only `Host` has a `From` impl. Other origins require the explicit
-    /// `from_<origin>` constructor so grep-audit can find every tag site.
-    fn from(value: T) -> Self {
-        Self::from_host(value)
     }
 }

@@ -1287,7 +1287,7 @@ mod tests {
         // pid 1 exists and is not ours: EPERM is alive, not gone.
         assert!(!leader_gone(1));
         // A reaped child's pid is gone.
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg("exit 0")
             .spawn()
@@ -1350,11 +1350,10 @@ mod tests {
     fn foreground_handback_a_stopped_member_of_a_leaderless_group_is_seen() {
         use super::FgRole::{Bystander, Holder};
         use super::{group_empty, group_gone, group_has_stopped_member};
-        use std::os::unix::process::CommandExt as _;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         /// Kills and reaps what it holds, however the test ends.
-        struct Reaped(Vec<std::process::Child>);
+        struct Reaped(Vec<aterm_uds::spawnfd::Child>);
         impl Drop for Reaped {
             fn drop(&mut self) {
                 for child in &mut self.0 {
@@ -1364,21 +1363,22 @@ mod tests {
             }
         }
         fn until(what: &str, mut done: impl FnMut() -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !done() {
-                assert!(Instant::now() < deadline, "timed out waiting for {what}");
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            let seen = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                Duration::from_millis(5),
+                || done().then_some(()),
+            );
+            assert!(seen.is_some(), "timed out waiting for {what}");
         }
 
-        let leader = std::process::Command::new("/bin/sleep")
+        let leader = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("60")
             .process_group(0)
             .spawn()
             .expect("spawn the leader");
         let pgid = i32::try_from(leader.id()).expect("a pid");
         let mut held = Reaped(vec![leader]);
-        let member = std::process::Command::new("/bin/sleep")
+        let member = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("60")
             .process_group(pgid)
             .spawn()

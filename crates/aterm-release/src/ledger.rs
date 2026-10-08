@@ -276,7 +276,7 @@ pub type ClaimChangelogs<'a> = &'a dyn Fn(&str, &str) -> Result<(String, String)
 /// n is baked into the binary, so the number must be settled first; a lost
 /// race here costs seconds.
 ///
-/// ONE RELEASE COMMIT, ON THE PUBLISHED COMMIT (2026-09-23, owner ruling R2). The
+/// ONE RELEASE COMMIT, ON THE PUBLISHED COMMIT (owner ruling R2). The
 /// release commit is `plan.source` plus the ledger line and the rolled changelog —
 /// the tree `pub publish` exported, and the tree the binary is built from. Main
 /// takes it whatever its tip is: as a fast-forward when main has not moved past the
@@ -630,4 +630,221 @@ pub fn check_version_shape(version: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Fixture plumbing every test binary shares: the `git` a fixture's own setup and
+/// reads run, the runner tests hand the code under test, a fresh repository with
+/// its identity, and stand-in executables.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    /// The executable a `git` from PATH ends up running, resolved once per process.
+    ///
+    /// WHY (MEASURED on a 14-core M-series Mac): macOS's `/usr/bin/git`
+    /// is xcode-select's trampoline, which finds the developer directory and execs
+    /// the git it names on every call: 8.3 ms of CPU per `rev-parse HEAD` against
+    /// 2.7 ms for that git run directly, 200 in a row, and 23 ms against 7.8 ms with
+    /// fourteen at once; the `it` binary ran 4,936 git processes through it. It is
+    /// the same file with the same argv; the trampoline adds only the SDK variables
+    /// (`SDKROOT`, `CPATH`, `LIBRARY_PATH`, `MANPATH`), which git does not read.
+    /// Where the `git` on PATH is no trampoline (Linux, a Homebrew git first) this
+    /// is that git.
+    pub(crate) fn git_path() -> &'static Path {
+        static GIT: OnceLock<PathBuf> = OnceLock::new();
+        GIT.get_or_init(|| {
+            let on_path = std::env::var_os("PATH")
+                .and_then(|path| {
+                    std::env::split_paths(&path)
+                        .map(|dir| dir.join("git"))
+                        .find(|candidate| candidate.is_file())
+                })
+                .unwrap_or_else(|| PathBuf::from("git"));
+            if !cfg!(target_os = "macos") || on_path != Path::new("/usr/bin/git") {
+                return on_path;
+            }
+            // What the trampoline asks (`xcrun --find`), so the same git.
+            Command::new("/usr/bin/xcrun")
+                .args(["--find", "git"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+                .filter(|found| found.is_file())
+                .unwrap_or(on_path)
+        })
+    }
+
+    /// `git`, for a fixture's own setup and reads ([`git_path`]).
+    pub(crate) fn git() -> Command {
+        Command::new(git_path())
+    }
+
+    /// The [`GitRunner`](super::GitRunner) a test hands the code under test:
+    /// [`GitCli`](super::GitCli)'s `git -C <repo> <args…>`, its output and exit read as `GitCli`
+    /// reads them, run by [`git_path`] rather than the `git` on PATH: the same executable without
+    /// the trampoline in front of it (MEASURED: it takes the `it` binary's trampolined git
+    /// processes from 2,818 to 109). `GitCli` itself still runs wherever the code under test builds
+    /// its own: the cut tree, a receipt store, the cutter binary the handoff tests drive.
+    pub(crate) struct Git {
+        repo: PathBuf,
+    }
+
+    impl Git {
+        pub(crate) fn new(repo: impl Into<PathBuf>) -> Self {
+            Git { repo: repo.into() }
+        }
+    }
+
+    impl super::GitRunner for Git {
+        fn git(&self, args: &[&str]) -> super::Result<super::RunOut> {
+            let out = git()
+                .arg("-C")
+                .arg(&self.repo)
+                .args(args)
+                .output()
+                .map_err(|e| {
+                    super::Error::new(format!("failed to spawn git {}: {e}", args.join(" ")))
+                })?;
+            Ok(super::RunOut {
+                status: out.status.code().unwrap_or(-1),
+                stdout: out.stdout,
+                stderr: out.stderr,
+            })
+        }
+    }
+
+    /// `git init -q -b main <dir>`, then [`config`] there.
+    ///
+    /// # Panics
+    /// When git fails: a fixture without its repository decides nothing.
+    pub(crate) fn init(dir: &Path, pairs: &[(&str, &str)]) {
+        let out = git()
+            .args(["init", "-q", "-b", "main"])
+            .arg(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git init {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        config(dir, pairs);
+    }
+
+    /// What one `git config <key> <value>` per pair leaves in the config of a fresh
+    /// init, clone or bare repository at `repo`, written in one append: each section
+    /// once, in the order its first key comes, its keys in order — where git puts a
+    /// key whose section the file does not hold yet, and the next of that section's
+    /// keys after it (checked byte for byte against git 2.50). One
+    /// write, not a process per pair. A value is written bare, so one git would quote
+    /// is refused.
+    ///
+    /// Then `maintenance.auto = false`, which every fixture takes: each commit, fetch
+    /// and push into it started a `git maintenance run --auto` that ran no task in a
+    /// repository this small (`gc --auto` waits for thousands of loose objects or
+    /// fifty packs) — 540 of the `it` binary's 6,496 git processes, not one of
+    /// which started a child. A bare origin takes it with `&[]`: its
+    /// pushes ran one each.
+    ///
+    /// # Panics
+    /// On a key that is not `section.name`, a section the file already holds, a value
+    /// git would quote, or a config that cannot be written.
+    pub(crate) fn config(repo: &Path, pairs: &[(&str, &str)]) {
+        let file = if repo.join(".git").is_dir() {
+            repo.join(".git/config")
+        } else {
+            repo.join("config")
+        };
+        let mut text = fs::read_to_string(&file).unwrap();
+        let mut sections: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
+        for &(key, value) in pairs.iter().chain([&("maintenance.auto", "false")]) {
+            // `remote.origin.url` goes under `[remote "origin"]`, not `[remote]`.
+            let (section, name) = key
+                .split_once('.')
+                .filter(|(_, name)| !name.contains('.'))
+                .expect("a section.name key, no subsection");
+            // git quotes a value with an outer space, `#` or `;`, and escapes a
+            // quote, a backslash, a newline and a tab (git 2.50).
+            assert!(
+                !value.is_empty()
+                    && value.trim() == value
+                    && !value.contains(['"', '\\', '#', ';', '\n', '\t']),
+                "{key} = {value:?} is a value git would quote"
+            );
+            match sections.iter_mut().find(|(s, _)| *s == section) {
+                Some((_, keys)) => keys.push((name, value)),
+                None => sections.push((section, vec![(name, value)])),
+            }
+        }
+        for (section, keys) in sections {
+            assert!(
+                !text.contains(&format!("[{section}]")),
+                "[{section}] already in {}",
+                file.display()
+            );
+            text.push_str(&format!("[{section}]\n"));
+            for (name, value) in keys {
+                text.push_str(&format!("\t{name} = {value}\n"));
+            }
+        }
+        fs::write(&file, text).unwrap();
+    }
+
+    /// Put an executable `#!/bin/sh` stand-in running `body` at `path`: one file
+    /// per distinct text per process, hard-linked into place.
+    ///
+    /// WHY: macOS assesses every NEW executable file at its first exec, one file
+    /// at a time machine-wide — 117 ms per file at idle (MEASURED), and
+    /// seconds each with fourteen fixtures writing them at once — and the
+    /// assessment is per inode, so a link of a file already run is free. So write
+    /// the body with no path of its own: `$0` is the link that was run, and a
+    /// sibling comes from it (`${0%/*}/..`). The shared file is read-only, so a
+    /// stand-in written over in place fails loudly; it lives in a temp directory
+    /// of the process's own, which outlives it (the system's temp sweep removes it).
+    ///
+    /// # Panics
+    /// When `path`'s directory cannot be made or the stand-in cannot be written.
+    pub(crate) fn standin(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        static DIR: OnceLock<Option<aterm_tempfile::TempDir>> = OnceLock::new();
+        static SHARED: Mutex<BTreeMap<String, PathBuf>> = Mutex::new(BTreeMap::new());
+
+        let text = format!("#!/bin/sh\n{body}");
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let _ = fs::remove_file(path);
+        let shared = DIR
+            .get_or_init(|| {
+                aterm_tempfile::Builder::new()
+                    .prefix("aterm-release-standins-")
+                    .tempdir()
+                    .ok()
+            })
+            .as_ref()
+            .and_then(|dir| {
+                let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(file) = shared.get(&text) {
+                    return Some(file.clone());
+                }
+                let file = dir.path().join(shared.len().to_string());
+                fs::write(&file, &text).ok()?;
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o555)).ok()?;
+                shared.insert(text.clone(), file.clone());
+                Some(file)
+            });
+        if shared.is_some_and(|file| fs::hard_link(file, path).is_ok()) {
+            return;
+        }
+        // No shared directory, or `path` on another filesystem: a plain copy is
+        // slower to first exec and as correct.
+        fs::write(path, &text).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }

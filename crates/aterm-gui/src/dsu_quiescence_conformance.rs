@@ -57,16 +57,15 @@ type State = BTreeMap<&'static str, i64>;
 /// `MaxReq` lifted past every real run.
 const OVERRIDES: &[(&str, i64)] = &[("MaxReq", 1_000)];
 
-/// Every wait in this file: generous, because a loaded machine only slows the
-/// reader down — it never changes what the reader may do.
-const PATIENCE: Duration = Duration::from_secs(10);
+/// Every wait in this file: a hang detector, never a latency budget, because a
+/// loaded machine only slows the reader down — it never changes what the
+/// reader may do.
+const PATIENCE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
+/// A spin that yields the core between looks (a zero gap).
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + PATIENCE;
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::yield_now();
-    }
+    let seen = aterm_spec::wait::within(PATIENCE, Duration::ZERO, || done().then_some(()));
+    assert!(seen.is_some(), "timed out waiting for {what}");
 }
 
 /// A real session on a real pseudo-terminal, with the real reader attached and
@@ -82,18 +81,7 @@ impl Rig {
     fn attach(id: u64) -> Self {
         // The headless App only lends its `SessionFactory` to the attach.
         let app = App::headless_for_test();
-        let (mut master, mut slave) = (-1i32, -1i32);
-        // SAFETY: openpty(3) into two valid out-slots; no name/termios/winsize.
-        let opened = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(opened, 0, "openpty");
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
         let mut session = crate::stub_session(id);
         session.master = master;
         let (ready_tx, ready_rx) = mpsc::channel::<()>();

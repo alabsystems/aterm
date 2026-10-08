@@ -15,7 +15,7 @@
 //!   insists on) and hands every other call to the real git;
 //! * a fake publication engine (`PUBLICATION_ENGINE`) whose ledger names an OLDER
 //!   commit than the checkout's tip, as `pub publish` leaves it once peers push;
-//! * a stub `targo` (`TRUST_STAGE2_BIN`) that records how it was called and writes,
+//! * a stub `targo` (`TRUST_STAGE2_BIN`) that records how it was called and puts,
 //!   where the build would, a stub cutter that records how IT was called.
 //!
 //! What it proves: the build runs once, in the cut tree, into its own target dir; the
@@ -24,6 +24,7 @@
 //! started with that marker refuses rather than building again — the loop guard.
 //! Hermetic: no network, no launchd, no real build.
 
+use crate::ledger::testing;
 use crate::publish;
 
 use std::fs;
@@ -34,7 +35,7 @@ const CARGO_TOML: &str = "[workspace]\nmembers = []\n\n[workspace.package]\nvers
                           repository = \"https://github.com/o/r\"\n";
 
 struct Scratch {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     /// The operator's checkout, on `main` at the tip.
     op: PathBuf,
     /// The commit the engine's ledger names — older than the tip.
@@ -43,14 +44,8 @@ struct Scratch {
     tip: String,
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = testing::git()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -64,38 +59,22 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-/// The real git, found before the shim is put in front of it.
-fn real_git() -> PathBuf {
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join("git"))
-                .find(|candidate| candidate.is_file())
-        })
-        .expect("git on PATH")
-}
-
 fn scratch(label: &str) -> Scratch {
-    let root = fs::canonicalize(std::env::temp_dir())
-        .unwrap()
-        .join(format!("aterm-cut-handoff-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let dir = aterm_tempfile::Builder::new()
+        .prefix(&format!("aterm-cut-handoff-{label}-"))
+        .tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap())
+        .unwrap();
+    let root = dir.path();
     let op = root.join("op");
     fs::create_dir_all(&op).unwrap();
-    git(&op, &["init", "-q", "-b", "main"]);
-    for (key, value) in [
-        ("user.name", "t"),
-        ("user.email", "t@example.invalid"),
-        ("commit.gpgsign", "false"),
-    ] {
-        git(&op, &["config", key, value]);
-    }
+    testing::init(
+        &op,
+        &[
+            ("user.name", "t"),
+            ("user.email", "t@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
     fs::write(op.join("Cargo.toml"), CARGO_TOML).unwrap();
     fs::write(op.join(".gitignore"), "/dist/\n/target/\n").unwrap();
     fs::write(op.join("lib.rs"), "published\n").unwrap();
@@ -110,9 +89,10 @@ fn scratch(label: &str) -> Scratch {
     let tip = git(&op, &["rev-parse", "HEAD"]);
     let bare = root.join("origin.git");
     git(
-        &root,
+        root,
         &["clone", "-q", "--bare", op.to_str().unwrap(), "origin.git"],
     );
+    testing::config(&bare, &[]);
     git(&op, &["remote", "add", "origin", bare.to_str().unwrap()]);
     git(&op, &["fetch", "-q", "origin"]);
 
@@ -126,42 +106,47 @@ fn scratch(label: &str) -> Scratch {
     )
     .unwrap();
 
-    let bin = root.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    executable(
-        &bin.join("git"),
+    // The stand-ins hold no path of their own, so each is one shared file
+    // hard-linked into every scratch (`testing::standin`): a copy written per
+    // scratch paid macOS's first-exec assessment three times a scratch, and the
+    // shim ran git through `/usr/bin/git`'s trampoline. Measured 2026-10-05, the
+    // five tests in one process: 3.0-5.6 s before, 1.6-1.9 s after. The shim
+    // hands every other call to the git that trampoline would run.
+    testing::standin(
+        &root.join("bin/git"),
         &format!(
-            "#!/bin/sh\n\
-             case \" $* \" in\n\
+            "case \" $* \" in\n\
              *\" remote get-url origin \"*) echo https://github.com/o/r.git; exit 0 ;;\n\
              esac\n\
              exec '{}' \"$@\"\n",
-            real_git().display()
+            testing::git_path().display()
         ),
     );
+    // `targo` logs into the scratch root, its own directory's parent, and
+    // "builds" the cutter by linking `standin/aterm-release` where the build
+    // would put it, with the root beside it for the cutter to log into.
     let stage2 = root.join("stage2");
     fs::create_dir_all(&stage2).unwrap();
     fs::write(stage2.join("trustc"), "").unwrap();
-    executable(
+    testing::standin(
         &stage2.join("targo"),
-        &format!(
-            "#!/bin/sh\n\
-             {{ echo \"cwd=$(pwd -P)\"; echo \"args=$*\"; echo \"target=$CARGO_TARGET_DIR\"; }} \
-             >> '{log}/targo.log'\n\
-             mkdir -p \"$CARGO_TARGET_DIR/release\"\n\
-             cat > \"$CARGO_TARGET_DIR/release/aterm-release\" <<'CUTTER'\n\
-             #!/bin/sh\n\
-             {{ echo \"cwd=$(pwd -P)\"; echo \"args=$*\"; echo \"marker=$ATERM_CUT_REBUILT_FOR\"; }} \
-             >> '{log}/cutter.log'\n\
-             exit 0\n\
-             CUTTER\n\
-             chmod +x \"$CARGO_TARGET_DIR/release/aterm-release\"\n",
-            log = root.display()
-        ),
+        "root=\"${0%/*}/..\"\n\
+         { echo \"cwd=$(pwd -P)\"; echo \"args=$*\"; echo \"target=$CARGO_TARGET_DIR\"; } \
+         >> \"$root/targo.log\"\n\
+         mkdir -p \"$CARGO_TARGET_DIR/release\"\n\
+         ln -f \"$root/standin/aterm-release\" \"$CARGO_TARGET_DIR/release/aterm-release\"\n\
+         printf '%s\\n' \"$root\" > \"$CARGO_TARGET_DIR/release/aterm-release.root\"\n",
+    );
+    testing::standin(
+        &root.join("standin/aterm-release"),
+        "read -r root < \"$0.root\"\n\
+         { echo \"cwd=$(pwd -P)\"; echo \"args=$*\"; echo \"marker=$ATERM_CUT_REBUILT_FOR\"; } \
+         >> \"$root/cutter.log\"\n\
+         exit 0\n",
     );
     fs::create_dir_all(root.join("home")).unwrap();
     Scratch {
-        root,
+        root: dir,
         op,
         published,
         tip,
@@ -172,7 +157,7 @@ fn scratch(label: &str) -> Scratch {
 fn cutter(s: &Scratch, args: &[&str], marker: Option<&str>) -> Output {
     let path = format!(
         "{}:{}",
-        s.root.join("bin").display(),
+        s.root.path().join("bin").display(),
         std::env::var("PATH").unwrap_or_default()
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-release"));
@@ -180,9 +165,9 @@ fn cutter(s: &Scratch, args: &[&str], marker: Option<&str>) -> Output {
         .args(args)
         .current_dir(&s.op)
         .env("PATH", path)
-        .env("HOME", s.root.join("home"))
-        .env("PUBLICATION_ENGINE", s.root.join("engine"))
-        .env("TRUST_STAGE2_BIN", s.root.join("stage2"))
+        .env("HOME", s.root.path().join("home"))
+        .env("PUBLICATION_ENGINE", s.root.path().join("engine"))
+        .env("TRUST_STAGE2_BIN", s.root.path().join("stage2"))
         .env_remove("ATERM_CUT_REBUILT_FOR");
     if let Some(commit) = marker {
         command.env("ATERM_CUT_REBUILT_FOR", commit);
@@ -191,7 +176,7 @@ fn cutter(s: &Scratch, args: &[&str], marker: Option<&str>) -> Output {
 }
 
 fn log(s: &Scratch, name: &str) -> Option<String> {
-    fs::read_to_string(s.root.join(name)).ok()
+    fs::read_to_string(s.root.path().join(name)).ok()
 }
 
 fn assert_operator_checkout_unmoved(s: &Scratch) {
@@ -215,7 +200,7 @@ fn a_cut_is_handed_to_the_published_commits_cutter_once_and_the_checkout_never_m
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
 
-    let tree = s.root.join("op-cut.noindex");
+    let tree = s.root.path().join("op-cut.noindex");
     assert_eq!(
         log(&s, "targo.log").as_deref(),
         Some(
@@ -304,7 +289,7 @@ fn a_resume_is_handed_to_the_release_commits_cutter_in_the_cut_tree() {
             s.published
         )
     );
-    let tree = s.root.join("op-cut.noindex");
+    let tree = s.root.path().join("op-cut.noindex");
     assert_eq!(git(&tree, &["rev-parse", "HEAD"]), s.published);
     assert_operator_checkout_unmoved(&s);
 }
@@ -356,7 +341,7 @@ fn an_older_format_journal_is_resumed_and_abandoned_by_its_own_cutter() {
             )),
             "{verb}: handed to the claim's cutter, same verb\n{stdout}"
         );
-        let tree = s.root.join("op-cut.noindex");
+        let tree = s.root.path().join("op-cut.noindex");
         assert_eq!(git(&tree, &["rev-parse", "HEAD"]), s.published, "{verb}");
         assert!(
             s.op.join("dist/cut-state.toml").is_file(),

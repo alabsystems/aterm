@@ -57,9 +57,9 @@
 
 #![cfg(target_os = "macos")]
 
+use aterm_uds::spawnfd::command;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// The shipped `CFBundleIdentifier` (`aterm-release`'s bundle stamper default).
@@ -142,7 +142,7 @@ fn running_application_job(printout: &str, bundle_id: &str, pid: i32) -> Option<
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> String {
-    let output = Command::new(program)
+    let output = command(program)
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("run {program}: {error}"));
@@ -180,14 +180,9 @@ fn instance_pids(executable: &Path) -> BTreeSet<i32> {
 }
 
 fn wait_until(mut ready: impl FnMut() -> bool, budget: Duration, what: &str) {
-    let deadline = Instant::now() + budget;
-    loop {
-        if ready() {
-            return;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let seen =
+        aterm_spec::wait::within(budget, Duration::from_millis(100), || ready().then_some(()));
+    assert!(seen.is_some(), "timed out waiting for {what}");
 }
 
 /// Wait for exactly ONE instance to appear that was not in `known`.
@@ -226,9 +221,7 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         if let Some(pid) = self.0.take() {
             let pid = pid.to_string();
-            let _ = Command::new("/bin/kill")
-                .args(["-9", pid.as_str()])
-                .status();
+            let _ = command("/bin/kill").args(["-9", pid.as_str()]).status();
         }
     }
 }
@@ -362,7 +355,7 @@ fn survivor_is_a_live_launchd_application_job() {
     // carries the QA seam that re-execs the SAME binary through the FULL
     // overlap handoff, so no staged release is needed to exercise the protocol.
     let mut before = instance_pids(&executable);
-    let opened = Command::new("/usr/bin/open")
+    let opened = command("/usr/bin/open")
         .arg("-n")
         .args(["--env", "ATERM_DEBUG_SEAMLESS_REEXEC=1"])
         .arg("-a")
@@ -374,7 +367,7 @@ fn survivor_is_a_live_launchd_application_job() {
     let original = wait_for_new_instance(
         &executable,
         &before,
-        Duration::from_secs(30),
+        aterm_spec::wait::MUST_HAPPEN,
         "the LaunchServices-launched instance",
     );
     let mut owned = KillOnDrop(Some(original));
@@ -397,7 +390,7 @@ fn survivor_is_a_live_launchd_application_job() {
                 .trim()
                 .is_empty()
         },
-        Duration::from_secs(30),
+        aterm_spec::wait::MUST_HAPPEN,
         "the first session's shell",
     );
 
@@ -405,14 +398,14 @@ fn survivor_is_a_live_launchd_application_job() {
     // A live shell is not necessarily settled: its startup files may still be
     // producing structural output, which correctly revokes a handoff snapshot.
     // Wait on the fixture's own readiness signal instead of racing that output.
-    let ready = Command::new(&ctl)
+    let ready = command(&ctl)
         .args(["--pid", original_pid.as_str(), "ready"])
         .status()
         .expect("wait for fixture readiness");
     assert!(ready.success(), "aterm-ctl ready failed");
 
     // Drive the handoff through the same verb the GUI's [Relaunch] nudge uses.
-    let applied = Command::new(&ctl)
+    let applied = command(&ctl)
         .args(["--pid", original_pid.as_str(), "update", "apply"])
         .status()
         .expect("run aterm-ctl update apply");

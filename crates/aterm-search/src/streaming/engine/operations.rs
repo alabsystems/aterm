@@ -1114,7 +1114,9 @@ mod regex_scan_budget_tests {
     }
 
     /// A row the engine cannot finish scanning yields no matches — fail closed
-    /// — promptly, and leaves the fact readable rather than silently short.
+    /// — and leaves the fact readable rather than silently short. The
+    /// compiled pattern's sticky flag is the proof the step budget bounded the
+    /// scan; no clock is read.
     ///
     /// Fail *closed* rather than refuse, unlike the index: `scan_row` is a
     /// model-checked transition of the `streaming_search` machine with no error
@@ -1122,22 +1124,16 @@ mod regex_scan_budget_tests {
     /// through the one-time `aterm_log` warning and the compiled pattern's own
     /// sticky flag.
     #[test]
-    fn a_row_that_exhausts_the_budget_yields_no_matches_promptly() {
+    fn a_row_that_exhausts_the_budget_yields_no_matches() {
         let mut search = case_sensitive_engine();
         search
             .start_search(EXPENSIVE, FilterMode::Regex)
             .expect("a pattern the size ceiling admits");
         let wide = "x".repeat(4096);
 
-        let started = std::time::Instant::now();
         let found = search.scan_row(0, &wide, 1);
-        let elapsed = started.elapsed();
 
         assert_eq!(found, 0, "an unfinishable row must not invent matches");
-        assert!(
-            elapsed.as_secs() < 5,
-            "the row took {elapsed:?}; the step budget is not bounding the scan"
-        );
         assert!(
             search
                 .compiled_regex

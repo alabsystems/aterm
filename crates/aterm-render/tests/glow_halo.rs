@@ -27,8 +27,9 @@ use aterm_core::render::{HaloMode, RainHalo};
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, DirtyDecision, Renderer, Theme, WindowCpu, compute_dirty_rows};
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// A single-row-band halo whose falloff centre is the quad centre — the
@@ -61,10 +62,7 @@ fn luma(p: u32) -> u32 {
 /// light only ever brightens the base.
 #[test]
 fn glow_halo_luminance_decreases_radially_from_centre() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 10);
     term.process(b"\x1b[?25l"); // glyph-free: the halo's own gradient, unperturbed
@@ -184,10 +182,7 @@ fn glow_halo_dirty_gate_marks_prev_and_cur_rows() {
 /// frame doubles as the gate-hit check on the steady state.
 #[test]
 fn damaged_path_no_ghosting_as_glow_halo_animates() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let rows = 6usize;
     let mut term = Terminal::new(rows as u16, 12);
@@ -267,10 +262,8 @@ fn falloff_weight(q: &RainHalo, pad: usize, x: usize, y: usize) -> u8 {
 /// veil's row band changes.
 #[test]
 fn over_halo_darkens_white_background_where_add_is_invisible() {
-    let Some(mut rend) = Renderer::from_system(18.0, light_theme()) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = Renderer::from_system(18.0, light_theme())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 10);
     term.process(b"\x1b[?25l"); // glyph-free: the veil's own gradient, unperturbed
@@ -336,10 +329,8 @@ fn over_halo_darkens_white_background_where_add_is_invisible() {
 /// also a no-op).
 #[test]
 fn over_halo_with_zero_coverage_is_a_noop() {
-    let Some(mut rend) = Renderer::from_system(18.0, light_theme()) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = Renderer::from_system(18.0, light_theme())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 10);
     term.process(b"\x1b[?25lzero coverage");
@@ -381,10 +372,7 @@ fn add_only_stream_matches_the_historical_math_byte_for_byte() {
         HaloMode::Add,
         "legacy streams stay Add"
     );
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 10);
     term.process(b"\x1b[?25l"); // glyph-free: bg-only base, exact expectations
@@ -428,10 +416,7 @@ fn add_only_stream_matches_the_historical_math_byte_for_byte() {
 /// ember: every covered pixel must equal `over_rgb(add_sat(base, ..), ..)`.
 #[test]
 fn mixed_stream_composites_add_before_over() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 10);
     term.process(b"\x1b[?25l");

@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-27, `aterm ctl text` of a private headless aterm built from main 9d1ce4862 (150x50) · the relaunched session of claude-2.1.283-exit-relaunch-stale-footer.txt asked to raise an AskUserQuestion dialog: the dialog is live at the foot while the old process's `esc to interrupt` footer still stands above the new launch card, so `await gone esc.to.interrupt` (whole grid) never latched and the hosted loop keyed the dialog ~26 s after it was drawn · user and host redacted at equal length, conversation id zeroed
+user@host-redacted-xxx proj % claude --model haiku
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   ~/scratch.noindex/stale-footer-busy-run/inst/proj
+
+
+❯ Reply with just the word hello.
+
+⏺ hello
+
+✻ Worked for 0s · done 9:51 AM
+
+❯ /exit
+
+· Flibbertigibbeting…
+  ⎿  Tip: Share Claude Code and earn $10 in usage credits · /passes
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt · ← for agents
+
+Resume this session with:
+claude --resume 00000000-0000-0000-0000-000000000000
+user@host-redacted-xxx proj % claude --model haiku
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   ~/scratch.noindex/stale-footer-busy-run/inst/proj
+
+
+❯ Use the AskUserQuestion tool to ask me one question: which color do I prefer, with options Red and Blue (mark Blue as recommended). Then reply with
+  the answer only.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which color do you prefer?
+
+❯ 1. Blue (Recommended)
+     A cool, calming color often associated with trust and stability
+  2. Red
+     A warm, energetic color often associated with passion and action
+  3. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+

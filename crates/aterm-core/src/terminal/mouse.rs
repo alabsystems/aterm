@@ -52,10 +52,9 @@ impl Terminal {
             return None;
         }
 
-        // Pass the ORIGINAL button: the encoder substitutes the legacy
-        // button-3 release code only for the single-byte formats that need it,
-        // so an SGR release keeps the button identity and the 'm' terminator
-        // (#7473).
+        // Pass the original button: the encoder substitutes the button-3 release
+        // code only for the single-byte formats, so an SGR release keeps the
+        // button identity and the 'm' terminator.
         Some(encode_mouse(
             button | modifiers,
             col,
@@ -93,17 +92,11 @@ impl Terminal {
         Some(encode_mouse(cb, col, row, self.modes.mouse_encoding, false))
     }
 
-    /// Encode a mouse wheel event on any of the FOUR wheel directions.
+    /// Encode a mouse wheel event in any of the four wheel directions.
     ///
     /// Returns the escape sequence to send to the application, or `None` if
     /// mouse reporting is disabled. Coordinates are 0-indexed.
-    ///
-    /// `dir` used to be a bare `up: bool` with the button hardcoded to 64/65,
-    /// which made the horizontal axis INEXPRESSIBLE: a tilt wheel and a
-    /// two-finger horizontal trackpad swipe had nowhere to go, so Neovim, tmux,
-    /// and every other mouse-tracking app never saw xterm's buttons 6/7 (SGR
-    /// 66/67) from aterm on ANY platform. [`WheelDir::code`] carries the whole
-    /// button table now, so this function has no direction policy left in it.
+    /// [`WheelDir::code`] carries the button table (xterm buttons 4-7).
     #[must_use]
     pub fn encode_mouse_wheel(
         &self,
@@ -170,9 +163,8 @@ mod tests {
             .expect("SGR reports are ASCII")
     }
 
-    /// All FOUR directions, not just the vertical pair: 64/65 up/down and
-    /// 66/67 left/right (xterm's buttons 4-7). The horizontal half is the
-    /// capability this widening added — it was previously unrepresentable.
+    /// All four directions: 64/65 up/down and 66/67 left/right (xterm's
+    /// buttons 4-7).
     #[test]
     fn wheel_encodes_all_four_xterm_buttons() {
         let t = sgr_tracking();
@@ -193,9 +185,8 @@ mod tests {
         assert_eq!(String::from_utf8(bytes).expect("ascii"), "\x1b[<83;11;6M");
     }
 
-    /// TRACKING OFF: every direction — the new horizontal pair included —
-    /// reports NOTHING. The wheel then belongs to aterm's own viewport, and a
-    /// horizontal flick has no viewport to move.
+    /// Tracking off: every direction reports nothing; the wheel belongs to
+    /// aterm's own viewport.
     #[test]
     fn wheel_reports_nothing_without_tracking() {
         let t = Terminal::new(24, 80);

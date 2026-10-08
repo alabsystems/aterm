@@ -140,22 +140,8 @@ fn project(model: &Model, observed: Observed) -> State {
 }
 
 fn assert_transition(model: &Model, before: Observed, after: Observed, action: &'static str) {
-    let before = project(model, before);
-    let after = project(model, after);
-    assert_eq!(
-        model.successors(action, &before).as_slice(),
-        std::slice::from_ref(&after),
-        "real Packages transition must conform specifically to {action}"
-    );
-    assert_eq!(admits(model, &before, &after), Some(action));
-    for invariant in &model.invariants {
-        assert!(
-            model.check_invariant(invariant.name, &after),
-            "post-state violates {}::{}: {after:?}",
-            model.name,
-            invariant.name,
-        );
-    }
+    let (before, after) = (project(model, before), project(model, after));
+    crate::conformance_support::assert_sole_transition(model, &before, &after, action);
 }
 
 #[test]
@@ -284,14 +270,10 @@ fn real_packages_service_conforms_for_refresh_failure_preservation_and_success()
     assert!(!model.check_invariant("FinalResultIsPresented", &false_success));
 }
 
-/// A FAILING ROW DOES NOT SPEAK FOR A VERB (2026-09-22). The Packages badge's
-/// attention headline (`Needs attention: codex refused` — a refusal named as one since
-/// Phase 4, 2026-09-23) is what a page with no verb
-/// result shows; a verb that completed over the same failing record keeps its own
-/// headline, so the model's `FinalResultIsPresented` binds the shipping page with
-/// failing rows in it — not only the row-less reports above. Negative control: the
-/// rendering this slice first shipped, the attention line in place of a completed
-/// check's headline, is the state the invariant refuses.
+/// A failing row shows the attention headline only when no verb result exists; a
+/// verb completed over the same failing record keeps its own headline
+/// (`FinalResultIsPresented`). Negative control: the attention line in place of a
+/// completed check's headline.
 #[test]
 fn a_failing_row_is_presented_as_attention_never_as_a_verb_result() {
     use crate::packages_screen::{ATTENTION_PREFIX, presented_result_of};

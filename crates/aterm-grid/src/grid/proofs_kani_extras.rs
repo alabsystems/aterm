@@ -2,29 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kani proofs for HAS_EXTRAS/COMPLEX flag independence, rendering guard
-//! completeness, ScrolledRowExtras is_empty correctness, HAS_EXTRAS bit
-//! independence with color data, and color mutation safety.
+//! Kani proofs for cell extras flags. Invariant proofs (StyleId, Cell::EMPTY,
+//! round trip, AC7 iff, ring_extras) are in `proofs_kani_extras_invariants.rs`.
 //!
-//! Invariant proofs (StyleId, Cell::EMPTY, roundtrip, AC7 iff, ring_extras)
-//! are in `proofs_kani_extras_invariants.rs`.
-//!
-//! ## Verification Targets
-//!
-//! 1. **HAS_EXTRAS ↔ COMPLEX independence**: flags in different Cell fields
-//!    (PackedColors vs CellFlags) can be set/cleared independently.
-//! 2. **Rendering guard completeness**: `has_extras() || is_complex()` catches
-//!    exactly the cells needing extras probes (bulk.rs + cell_style.rs).
-//! 3. **Shift-up amortization**: shift_rows_up_by invalidates old logical row
-//!    lookups (the entry moves to a lower logical row).
-//! 4. **ScrolledRowExtras::is_empty()**: operates on real struct, verifying
-//!    all 5 Vec fields are checked. A false positive causes permanent data loss.
-//! 5. **HAS_EXTRAS bit independence**: bit 16 of PackedColors is orthogonal
-//!    to fg/bg color index bits and mode bits.
-//! 6. **Color mutation safety**: all PackedColors color setters preserve the
-//!    HAS_EXTRAS bit.
-//!
-//! Part of memory_verification phase, #5445 epic.
+//! 1. HAS_EXTRAS (PackedColors) and COMPLEX (CellFlags) set and clear
+//!    independently.
+//! 2. `has_extras() || is_complex()` catches exactly the cells needing extras
+//!    probes (bulk.rs, cell_style.rs).
+//! 3. shift_rows_up_by moves an entry off its old logical row.
+//! 4. `ScrolledRowExtras::is_empty()` checks all five Vec fields.
+//! 5. PackedColors bit 16 is orthogonal to the colour index and mode bits.
+//! 6. Every PackedColors colour setter preserves HAS_EXTRAS.
 
 use std::sync::Arc;
 
@@ -33,14 +21,9 @@ use crate::{Cell, PackedColors};
 use aterm_alloc::SmallVec;
 use aterm_scrollback::HyperlinkSpan;
 
-/// HAS_EXTRAS and COMPLEX flags are independent: setting one never clears the other.
-///
-/// These flags live in different Cell fields (PackedColors vs CellFlags) but
-/// both gate extras probing in the rendering path. The `|| cell.is_complex()`
-/// safety net relies on this independence — a complex cell with unset HAS_EXTRAS
-/// must still be probed.
-///
-/// Uses symbolic overflow indices to verify independence across all index values.
+/// HAS_EXTRAS and COMPLEX are independent: setting one never clears the other,
+/// for every symbolic overflow index. The render path's `|| is_complex()`
+/// relies on this.
 #[kani::proof]
 fn has_extras_and_complex_flags_independent() {
     // Start with a complex cell using a symbolic overflow index
@@ -96,14 +79,9 @@ fn has_extras_and_complex_flags_independent() {
     );
 }
 
-/// Rendering guard completeness: `has_extras() || is_complex()` catches all
-/// cells that need extras probing.
-///
-/// Models the actual rendering path condition from bulk.rs and cell_style.rs.
-/// Verifies that for all possible Cell flag combinations, the guard correctly
-/// identifies cells needing extras lookup. This is the formal basis for the
-/// safety net added to both FFI and GPU rendering paths.
-///
+/// `has_extras() || is_complex()` (the render path's condition in bulk.rs and
+/// cell_style.rs) identifies every cell needing an extras lookup, over all
+/// flag combinations.
 #[kani::proof]
 fn rendering_guard_covers_all_extras_cases() {
     let has_extras_flag: bool = kani::any();
@@ -141,14 +119,9 @@ fn rendering_guard_covers_all_extras_cases() {
     }
 }
 
-/// Shift-up-by amortization roundtrip: insert at logical (r, c), then
-/// shift_rows_up_by(0, n), then get at logical (r, c) must return None
-/// (the entry moved to a lower logical row or was scrolled off).
-///
-/// After shift_rows_up_by(0, n), logical row r maps to physical row r + (offset + n).
-/// But the entry was stored at physical row r + offset. So looking up logical row r
-/// now looks for physical row r + offset + n, which won't find the entry stored
-/// at r + offset. The entry is now at logical row r - n (if r >= n) or scrolled off.
+/// Insert at logical (r, c), shift_rows_up_by(0, n): a get at (r, c) returns
+/// None, since logical row r now maps to physical r + offset + n while the
+/// entry sits at r + offset (logical r - n, or scrolled off).
 #[kani::proof]
 fn shift_up_amortization_invalidates_old_logical() {
     let logical_row: u16 = kani::any();
@@ -178,14 +151,8 @@ fn shift_up_amortization_invalidates_old_logical() {
     }
 }
 
-/// ScrolledRowExtras::is_empty() on real struct: true iff all 5 Vec fields empty.
-///
-/// Constructs real ScrolledRowExtras instances with symbolic field population
-/// and verifies is_empty() returns the correct answer. This replaces the
-/// previous abstract boolean model that was tautological.
-///
-/// A false positive causes permanent data loss: hyperlinks, RGB colors, and
-/// combining marks silently dropped from ring buffer scrollback.
+/// `ScrolledRowExtras::is_empty()` on the real struct is true iff all five Vec
+/// fields are empty; a false positive would drop scrollback extras.
 #[kani::proof]
 fn scrolled_row_extras_is_empty_on_real_struct() {
     let has_hyperlinks: bool = kani::any();
@@ -229,12 +196,8 @@ fn scrolled_row_extras_is_empty_on_real_struct() {
     }
 }
 
-/// HAS_EXTRAS bit independence: setting/clearing bit 16 preserves all color data.
-///
-/// Verifies that with_extras_flag() and without_extras_flag() are orthogonal
-/// to fg_index, bg_index, fg_mode, and bg_mode. This is the critical invariant
-/// that allows the rendering path to use has_extras() as a fast skip without
-/// corrupting color information.
+/// with_extras_flag() and without_extras_flag() leave fg_index, bg_index,
+/// fg_mode and bg_mode unchanged.
 #[kani::proof]
 fn has_extras_bit_independent_of_colors() {
     let raw: u32 = kani::any();
@@ -290,11 +253,7 @@ fn has_extras_bit_independent_of_colors() {
     );
 }
 
-/// Color mutations preserve has_extras() flag.
-///
-/// Verifies that setting fg/bg colors (indexed, RGB mode, default) does not
-/// corrupt the HAS_EXTRAS bit. This is the reverse direction from the previous
-/// proof: color ops must not clobber bit 16.
+/// Colour setters (indexed, RGB, default) preserve has_extras().
 #[kani::proof]
 fn color_mutations_preserve_has_extras() {
     let fg_index: u8 = kani::any();

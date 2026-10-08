@@ -1,58 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NON-VACUITY PROOFS for `targo --unverified forge check`.
+//! Non-vacuity proofs for `targo --unverified forge check`: each test plants a
+//! violation and asserts the gate goes red.
 //!
-//! `crates/xtask/src/gate.rs`'s `NON_VACUITY_REGISTRY` requires every roster
-//! gate to name a real test that PLANTS A VIOLATION and asserts the gate goes
-//! RED. These five do exactly that, and each one drives the VERB —
-//! [`aterm_forge::check::check_report`], the symbol the roster calls — not a
-//! helper inside it. A fixture that exercises a component and is scored as
-//! proof of the verb is the specific over-claim that registry exists to stop.
+//! Each drives the verb, not a helper: the carve, fork-ledger and liveness
+//! fixtures call [`aterm_forge::check::check_report`] over the whole cell
+//! matrix; the review-registration and NOTICE fixtures call
+//! [`aterm_forge::check::run`] with `--cell mac-arm` (`check_one_cell`), since
+//! their obligations are judged before the per-cell loop.
 //!
 //! # How each fixture is built
 //!
-//! Every test constructs a MINIATURE ATERM WORKSPACE in its own directory under
-//! the cargo target tmpdir (never in the repository, never in `/tmp`): a
-//! `crates/aterm` root package plus the two web modules `crates/aterm-wasm` and
-//! `crates/aterm-gpu-web`, so that all FIVE cells have something to resolve, a
-//! REAL copy of `vendor/indexmap` so the provenance obligations have real
-//! provenance files to find, the repository's own `deny.toml`, a `NOTICE`
-//! naming exactly the forks present, a `vendor/forge.toml` fork ledger
-//! recording them over the measured matrix, and a generated `Cargo.lock`.
+//! Each test builds a miniature aterm workspace in its own directory under the
+//! cargo target tmpdir (never in the repository or `/tmp`): a `crates/aterm`
+//! root plus the web modules `crates/aterm-wasm` and `crates/aterm-gpu-web` (so
+//! every cell has a root to resolve; the wasm cells are rooted at the web
+//! modules), a real copy of `vendor/indexmap` with its provenance files, the
+//! repository's `deny.toml`, a `NOTICE` naming exactly the forks present, a
+//! `vendor/forge.toml` ledger over the measured matrix, and a generated
+//! `Cargo.lock`. All roots carry the `indexmap` edge, so the patch is live in
+//! every cell.
 //!
-//! THE WEB MODULES ARE NOT DECORATION. The matrix roots its two `wasm32` cells
-//! at `aterm-wasm` and `aterm-gpu-web`, because `aterm` is a `[[bin]]` nothing
-//! compiles for wasm32 (see `aterm_forge::resolve::default_cells`). A fixture
-//! carrying only `crates/aterm` would leave both of those cells UNRESOLVABLE,
-//! and `[OB-12]` refuses a cell it cannot resolve — so every test here would go
-//! red for the wrong reason and each one would "prove" its obligation
-//! vacuously. They carry the same `indexmap` edge the root does, so the patch
-//! is live in all five cells and the liveness fixture can assert all five.
+//! Two details matter:
 //!
-//! Two details of that construction are load-bearing rather than incidental:
+//!   * `git init`: otherwise the fixture inherits this repository's
+//!     `.gitignore`, whose `target` rule makes `[OB-10]` report every vendored
+//!     path as ignored.
+//!   * `exclude = ["vendor", "other"]`: the vendored crates carry the
+//!     `[workspace]` stub `[OB-3]` requires, and reaching one as a path
+//!     dependency inside the workspace directory is "multiple workspace roots
+//!     found". The real repository reaches forks through `[patch.crates-io]`
+//!     only.
 //!
-//!   * `git init`. Attest's `[OB-10]` asks `git check-ignore` whether anything
-//!     under `vendor/` is swallowed by an ignore rule. A fixture under
-//!     `target/` inherits THIS repository's `.gitignore`, whose `target` rule
-//!     matches every path in it — MEASURED: `git check-ignore -v --no-index --
-//!     vendor/indexmap` prints `.gitignore:4:target` and exits 0. Without its own
-//!     repository the fixture would be RED before any violation was planted,
-//!     and every test below would pass vacuously in the worst way: by being
-//!     unable to be green.
-//!   * `exclude = ["vendor", "other"]`. The vendored crates carry the empty
-//!     `[workspace]` stub that attest's `[OB-3]` requires, and a stub-bearing
-//!     manifest reached as a PATH DEPENDENCY inside the workspace directory is
-//!     "multiple workspace roots found in the same workspace" — measured, not
-//!     guessed. The real repository never hits this because it reaches its
-//!     forks through `[patch.crates-io]` alone.
-//!
-//! EVERY test asserts GREEN FIRST. Without that, a fixture that is red for some
-//! unrelated reason would "prove" the gate can go red while proving nothing.
+//! Every test asserts green first, so a red can only come from the plant.
 
 use aterm_forge::check::check_report;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The forge verb over one cell (`targo --unverified forge check --cell
+/// mac-arm`, i.e. [`aterm_forge::check::run`]), folded to `(green, transcript)`
+/// as `check_report` does: could-not-run is red, with the reason and the
+/// transcript so far.
+///
+/// Used by the `[OB-11]` and `[OB-6]` fixtures, whose violations are judged
+/// before the per-cell loop. The `[OB-13]`, `[OB-17]` and `[OB-12]` fixtures
+/// keep the whole matrix.
+fn check_one_cell(root: &Path) -> (bool, String) {
+    match aterm_forge::check::run(root, &["mac-arm".to_string()]) {
+        Ok(outcome) => (outcome.ok, outcome.log),
+        Err(why) => (false, why),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The fixture workspace
@@ -64,13 +64,18 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// The GREEN baseline: one reviewed, fully-provenanced fork (`indexmap`),
+    /// The green baseline: one reviewed, fully-provenanced fork (`indexmap`),
     /// live in every cell, named in NOTICE and in the fork ledger, with no
-    /// carve rows and no ratchet file yet.
+    /// carve rows and no ratchet file.
     fn baseline(name: &str) -> Self {
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("forge-red-{name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("fixture root");
+        // `target/` exists so nested `targo tree` runs keep cargo's rustc info
+        // cache (`target/.rustc_info.json`, written only into an EXISTING
+        // target dir): 0.75 s per `tree` cold against 0.01 s warm. The real
+        // checkout has a `target/` too, and forge never reads the root
+        // listing, so no obligation sees it.
+        std::fs::create_dir_all(root.join("target")).expect("fixture root");
         let fx = Self { root };
 
         copy_tree(
@@ -131,9 +136,8 @@ impl Fixture {
         fx.write_notice(&[("indexmap", "2.14.0", "Apache-2.0 OR MIT")]);
         fx.write_ledger("");
 
-        // See the module docs: without its own repository, this fixture lives
-        // inside the aterm checkout's ignored `target/` and attest's [OB-10]
-        // reports every vendored path as swallowed.
+        // Own repository, so the parent checkout's `target/` ignore rule does
+        // not apply (see the module docs).
         let _ = Command::new("git")
             .args(["init", "-q"])
             .current_dir(&fx.root)
@@ -238,9 +242,8 @@ impl Fixture {
         );
     }
 
-    /// A complete, well-formed fork kit — everything attest asks of a vendored
-    /// crate — so that when a test plants one, the ONLY thing wrong with it is
-    /// the thing the test is about.
+    /// A complete, well-formed fork kit, so a planted fork is wrong only in
+    /// the way the test is about.
     fn add_wellformed_fork(&self, name: &str, version: &str) {
         let dir = format!("vendor/{name}");
         self.write(
@@ -301,12 +304,11 @@ fn copy_tree(from: &Path, to: &Path) {
 // The proofs
 // ---------------------------------------------------------------------------
 
-/// `[OB-13]` — the carve ledger. A path the ledger records as DELETED is
-/// present again: GREEN before, RED after, GREEN again once it is removed.
+/// `[OB-13]` the carve ledger: a path recorded as deleted is present again.
+/// Green before, red after, green again once removed.
 ///
-/// The carved path is `vendor/indexmap/src/rayon`, a real module of the real
-/// fork — feature-gated behind `rayon`, which no aterm build enables — so the
-/// reinstatement is a real one rather than a placeholder file.
+/// The carved path is `vendor/indexmap/src/rayon`, a real module of the fork
+/// behind the `rayon` feature, which no aterm build enables.
 #[test]
 fn a_reinstated_carved_module_reds_the_forge_verb() {
     let fx = Fixture::baseline("carve-ledger");
@@ -366,18 +368,14 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
     );
 }
 
-/// `[OB-11]` — the census cross-check. A `[patch.crates-io]` entry with no
-/// `REVIEWED_VENDORED_CRATES` row is a fork nobody reviewed.
-///
-/// The planted fork is otherwise FLAWLESS — stub, `.cargo_vcs_info.json`,
-/// `Cargo.toml.orig`, retained LICENSE, a trust marker, a NOTICE line, an
-/// allowed SPDX arm, live in the graph — so the RED can only come from the
-/// missing review.
+/// `[OB-11]` the census cross-check: a `[patch.crates-io]` entry with no
+/// `REVIEWED_VENDORED_CRATES` row. The planted fork is otherwise complete, so
+/// the red can only come from the missing review.
 #[test]
 fn an_unreviewed_patch_entry_reds_the_forge_verb() {
     let fx = Fixture::baseline("unreviewed-fork");
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         ok,
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
@@ -424,7 +422,7 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
     );
     fx.regen_lock();
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         !ok,
         "an unreviewed path fork must turn the forge verb RED:\n{log}"
@@ -443,14 +441,12 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
     );
 }
 
-/// `[OB-6]`, reached through the verb — NOTICE agreement. A fork that ships in
-/// the source distribution without a NOTICE line is a redistribution failure,
-/// and `check` must not be green while attest says so.
+/// `[OB-6]` through the verb: a fork without a NOTICE line keeps `check` red.
 #[test]
 fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
     let fx = Fixture::baseline("notice-omission");
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         ok,
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
@@ -460,7 +456,7 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
     // has simply been dropped from NOTICE.
     fx.write_notice(&[]);
 
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(
         !ok,
         "a NOTICE that omits a shipped fork must turn the forge verb RED:\n{log}"
@@ -476,14 +472,12 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
 
     // Restoring the line restores GREEN: the fixture is not stuck red.
     fx.write_notice(&[("indexmap", "2.14.0", "Apache-2.0 OR MIT")]);
-    let (ok, log) = check_report(fx.root());
+    let (ok, log) = check_one_cell(fx.root());
     assert!(ok, "restoring the NOTICE line must restore GREEN:\n{log}");
 }
 
-/// `[OB-17]` — the fork ledger. A `[forge] cells` row forge does not measure
-/// is the edit a judge made on 2026-09-17 (`TOTALLY-BOGUS` /
-/// `sparc64-unknown-none`) that left this verb GREEN while only a unit test
-/// read the ledger; a `[[fork]]` block describing another copy is its twin.
+/// `[OB-17]` the fork ledger: a `[forge] cells` row forge does not measure, or
+/// a `[[fork]]` block describing another copy, turns the verb red.
 #[test]
 fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
     let fx = Fixture::baseline("fork-ledger");
@@ -567,16 +561,10 @@ fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
     assert!(ok, "restoring the ledger must restore GREEN:\n{log}");
 }
 
-/// `[OB-12]` — patch liveness, the obligation that justifies this gate. A
-/// second, UNPATCHED copy of a patched crate resolving beside the fork.
-///
-/// This is the shape the real tree carried on Linux until 2026-08-27: `winnow
-/// 1.0.3` from the registry beside the `winnow 0.7.15` aterm forked, reached
-/// through `accesskit_winit → … → toml_edit 0.25`. Retiring `toml_edit` for the
-/// first-party `aterm-toml` retired the fork, so the live instance is gone —
-/// which is exactly why it is synthesized here, reduced to two path packages
-/// that can be planted and removed. cargo reports the shape as nothing at all:
-/// the build is green and `cargo metadata` says the patch is in force.
+/// `[OB-12]` patch liveness: a second, unpatched copy of a patched crate
+/// resolving beside the fork. Cargo reports nothing (the build is green and
+/// `cargo metadata` says the patch is in force), so it is synthesized here as
+/// two path packages.
 #[test]
 fn an_unpatched_sibling_version_reds_the_forge_verb() {
     let fx = Fixture::baseline("unpatched-sibling");
@@ -586,15 +574,28 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         ok,
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
-    // The COUNT comes from the matrix, not from a number typed here: this line
-    // said `all 5 cell(s)` and went red the day the matrix grew to the six
-    // SHIPPED triples, which is a fact about `default_cells()` and not about the
-    // liveness obligation this fixture exists to prove.
+    // The count comes from the matrix, not a literal.
     let live_all = format!(
         "✓ indexmap live in all {} cell(s)",
         aterm_forge::resolve::default_cells().len()
     );
     assert!(log.contains(&live_all), "{log}");
+    // Every obligation REPORTS, GREEN included. A block dropped from the report
+    // is no FAIL line, and no fixture plants `[OB-14]`, so nothing else would
+    // notice one gone.
+    for tag in [
+        "[OB-1..OB-10]",
+        "[OB-11]",
+        "[OB-12]",
+        "[OB-13]",
+        "[OB-14]",
+        "[OB-17]",
+    ] {
+        assert!(
+            log.contains(tag),
+            "every obligation must report; `{tag}` did not:\n{log}"
+        );
+    }
 
     // Plant the violation: an intermediate dependency drags in a second
     // `indexmap` at another major, exactly as toml_edit 0.25 did for winnow.
@@ -639,10 +640,8 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
          indexmap = { path = \"../../vendor/indexmap\" }\n\
          dep_b = { path = \"../dep_b\" }\n",
     );
-    // The two wasm cells are rooted at the web modules, so the planted sibling
-    // has to reach THEM to be in their graphs at all. Without this the closing
-    // assertion — every cell is scored — would be asserted over two cells the
-    // violation never touched, which is the vacuity this file exists to refuse.
+    // The wasm cells are rooted at the web modules, so the planted sibling
+    // must reach them too, or the every-cell assertion would be vacuous there.
     for web in ["aterm-wasm", "aterm-gpu-web"] {
         fx.write(
             &format!("crates/{web}/Cargo.toml"),

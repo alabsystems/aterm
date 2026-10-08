@@ -6,7 +6,7 @@
 //!
 //! The engine is the runtime consumer of [`Policy`]. It
 //!
-//! 1. Pre-compiles every [`Rule::sequence`] selector string into a
+//! 1. Pre-compiles every [`crate::Rule::sequence`] selector string into a
 //!    [`SequenceSelector`] at construction time.
 //! 2. Buckets the compiled rules by `(function, major)` so evaluation can
 //!    narrow the candidate list to a handful of rules before walking them in
@@ -23,19 +23,16 @@
 //!
 //! # Totality
 //!
-//! Evaluation never panics, never allocates on the hot path (the returned
-//! [`Decision`] carries a [`Copy`] [`Response`] and a precomputed rate-limit
-//! id shared via `Arc`, so a match is a refcount bump rather than a heap
-//! allocation), and always returns a defined value — including when the rule
-//! list is empty or every rule's selector failed to compile. This is codified
-//! by the unit tests in this module and in `tests.rs`.
+//! Evaluation never panics, never allocates (the rate-limit id in a
+//! [`Decision`] is a precomputed `Arc<str>`), and always returns a defined
+//! value — including when the rule list is empty or every selector failed to
+//! compile.
 //!
 //! # Rate limits
 //!
-//! The engine exposes the matched
-//! [`Rule`]'s `rate_limit` field to the caller via [`Decision::rate_limit`]
-//! so the handler site can consult the bucket. The engine itself only
-//! decides response + rate-limit id; it does not own bucket state.
+//! [`PolicyEngine::evaluate`] only names the matched rule's bucket
+//! ([`Decision::rate_limit`]); the handler debits it through
+//! [`PolicyEngine::rate_limit_try_consume`] or a resolved [`RateLimitSlot`].
 
 use std::collections::HashMap as BucketMap;
 use std::sync::Arc;
@@ -52,10 +49,8 @@ use crate::{
 
 /// Result of [`PolicyEngine::evaluate`].
 ///
-/// Returns the winning [`Response`] plus the matched rule's named rate-limit
-/// reference (if any). The rate-limit id is the string key into
-/// [`Policy::rate_limits`]; the engine itself does not consult the bucket —
-/// the handler site does.
+/// The winning [`Response`] plus the matched rule's rate-limit id, a key into
+/// [`Policy::rate_limits`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Decision {
     /// The effective response for the evaluated sequence.
@@ -66,13 +61,8 @@ pub struct Decision {
     pub matched_rule: Option<usize>,
     /// Rate-limit id copied from the matched rule (if any). `None` when the
     /// decision came from the default path or the matched rule had no rate
-    /// limit.
-    ///
-    /// Stored as an `Arc<str>` so the hot `evaluate` path returns a cheap
-    /// atomic refcount bump instead of a fresh `String` allocation per match
-    /// (the ids are precomputed once in [`PolicyEngine::new`]). `Arc<str>`
-    /// derefs to `str` and compares/hashes by value, so the derived
-    /// `PartialEq`/`Eq`/`Hash` keep their by-value semantics.
+    /// limit. An `Arc<str>` precomputed in [`PolicyEngine::new`], so a match
+    /// does not allocate; it still compares and hashes by value.
     pub rate_limit: Option<Arc<str>>,
 }
 
@@ -116,10 +106,7 @@ pub struct PolicyEngine {
     /// Indices of rules whose bucket is the universal matcher
     /// (`FunctionKind::Wildcard`).
     wildcard_bucket: Vec<usize>,
-    /// One slot per rule: the matched rule's rate-limit id, precomputed as a
-    /// shared `Arc<str>` so [`Self::walk_bucket`] hands the winning
-    /// [`Decision`] a refcount bump instead of allocating a fresh `String` on
-    /// every match. `None` mirrors `rule.rate_limit == None`.
+    /// One slot per rule: its rate-limit id, shared into every [`Decision`].
     rate_limit_ids: Vec<Option<Arc<str>>>,
     /// Runtime rate-limiter buckets seeded from `policy.rate_limits`.
     /// Consulted by [`Self::rate_limit_try_consume`] at handler call sites.
@@ -137,9 +124,6 @@ impl PolicyEngine {
         let mut compiled = Vec::with_capacity(policy.rules.len());
         let mut buckets: BucketMap<BucketKey, Vec<usize>> = BucketMap::new();
         let mut wildcard_bucket = Vec::new();
-        // Precompute the shared rate-limit ids once so the `evaluate` hot path
-        // returns an `Arc` clone (refcount bump) instead of a per-match
-        // `String` allocation.
         let mut rate_limit_ids = Vec::with_capacity(policy.rules.len());
 
         for (idx, rule) in policy.rules.iter().enumerate() {
@@ -154,10 +138,7 @@ impl PolicyEngine {
                     }
                     compiled.push(Some(sel));
                 }
-                Err(_) => {
-                    // Rule remains in the policy but cannot match anything.
-                    compiled.push(None);
-                }
+                Err(_) => compiled.push(None),
             }
         }
 
@@ -190,7 +171,8 @@ impl PolicyEngine {
     ///    sequence and `origin.dominates(rule.origin_min)`, return the
     ///    rule's response. A selector-match without an origin-match
     ///    **continues** to the next rule.
-    /// 3. Repeat step 2 for the wildcard bucket.
+    /// 3. Repeat step 2 for the same function's `major = None` bucket
+    ///    (e.g. `"CSI t"`), then for the universal wildcard bucket.
     /// 4. Fall through to `policy.defaults.unmatched`.
     ///
     /// The wildcard bucket is consulted last because a rule that matches by
@@ -243,9 +225,7 @@ impl PolicyEngine {
         origin: OriginTag,
     ) -> Option<Decision> {
         for &idx in indices {
-            // Defensive: indices in a bucket always have Some(compiled)
-            // because only parsed selectors get bucketed. But we re-check
-            // for totality — no panic on a malformed engine state.
+            // Only parsed selectors are bucketed; re-checked for totality.
             let Some(selector) = self.compiled.get(idx).and_then(Option::as_ref) else {
                 continue;
             };
@@ -262,10 +242,6 @@ impl PolicyEngine {
             return Some(Decision {
                 response: rule.response,
                 matched_rule: Some(idx),
-                // Cheap atomic refcount bump on the precomputed id rather than
-                // a fresh `String` malloc+memcpy on the hot path. The slot is
-                // kept in lockstep with `policy.rules` by `Self::new`, but we
-                // index defensively to preserve totality.
                 rate_limit: self.rate_limit_ids.get(idx).cloned().flatten(),
             });
         }
@@ -519,10 +495,7 @@ mod tests {
 
     #[test]
     fn rate_limit_id_is_shared_not_reallocated_per_match() {
-        // The id is precomputed once in `new` and handed out via an `Arc`
-        // refcount bump, so repeated evaluations of the same match return
-        // clones of the *same* allocation (no per-match `String` malloc on the
-        // hot path).
+        // Repeated matches share the id precomputed in `new`.
         let eng = PolicyEngine::new(profiles::standard());
         let a = eng
             .evaluate(&osc(9, &["build done"]), OriginTag::User)

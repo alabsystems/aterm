@@ -2,61 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Response capability — structural gate on the `send_response` sink.
+//! Response capability: a structural gate on the `send_response` sink.
 //!
-//! # Why this module exists
+//! Dozens of sequences (DA1/DA2/DA3, DSR/CPR, DECRQSS, XTGETTCAP, color
+//! queries, title and XTWINOPS reports, …) push bytes into the PTY writeback
+//! buffer. [`ResponseCapability`] is a zero-sized token whose only constructor
+//! ([`ResponseCapability::mint_for_dispatch`], `pub(super)`) is called from the
+//! `ActionSink` dispatch entry points in `handler_actions.rs`; every
+//! response-producing handler takes `&ResponseCapability` and passes it to
+//! [`super::handler::TerminalHandler::send_response`]. A handler without one
+//! does not compile, and the parser crate cannot name the type.
 //!
-//! Privilege-conflation finding CF-003 (see
-//! `reports/2026-04-18-privilege-conflation-audit.md`) identified 31
-//! escape sequences (DA1/DA2/DA3, DSR/CPR, DECRQSS, XTGETTCAP, color
-//! queries, title reports, XTWINOPS geometry reports, …) that each push
-//! attacker-chosen bytes into the PTY writeback buffer. Each new response
-//! site is one forgotten rate-limit or buffer-cap check away from a
-//! DSR/DA amplification attack or fingerprint leak.
-//!
-//! Phase 1 (commit `0313b2561`) used the exact pattern below to close
-//! the Terminal-class RCE on DCS 2000 p / 1000 p:
-//! `ConductorActivationToken` / `TmuxActivationToken` are zero-sized,
-//! unforgeable from outside the crate, and required as an explicit
-//! argument on `SshConductorMode::activate` / `TmuxControlMode::activate`.
-//! The parser data path cannot construct one, so the compiler itself
-//! discharges the "PTY-origin activation" class. See
-//! [`super::modal_auth`] for the template.
-//!
-//! # The structural gate
-//!
-//! [`ResponseCapability`] is a zero-sized token whose only constructor
-//! ([`ResponseCapability::mint_for_dispatch`]) is `pub(super)` to the
-//! terminal module and is called only from the `ActionSink` dispatch
-//! entry points in `handler_actions.rs`. Every response-producing
-//! handler receives `&ResponseCapability` as an explicit argument and
-//! calls [`super::handler::TerminalHandler::send_response`] which takes
-//! `&ResponseCapability`. A handler that forgets — or a future feature
-//! that calls `send_response` without a capability — fails to compile.
-//!
-//! Because `ResponseCapability::mint_for_dispatch` is `pub(super)` to
-//! the terminal module, the set of places that can originate a
-//! response is bounded by the shape of the type.
-//!
-//! # Relation to rate limiting
-//!
-//! The capability is an *authorization* gate ("this call is inside a
-//! parser-dispatched response-generating sequence"), not a *policy* gate.
-//! Rate limiting continues to live on
+//! The capability authorizes an attempt; it does not relax rate limiting.
 //! [`super::response_rate_limiter::ResponseRateLimiter`] and the
-//! [`super::MAX_RESPONSE_BUFFER_SIZE`] cap, both of which run inside
-//! `send_response` regardless of whether a capability is present. The
-//! capability cannot relax those — it only proves that a response *may*
-//! be attempted at all.
+//! [`super::MAX_RESPONSE_BUFFER_SIZE`] cap still run inside `send_response`.
 
-/// Dispatch-kind hint used by
-/// `ResponseCapability::mint_for_dispatch_with_engine` to select the
-/// right [`aterm_policy::selector::DispatchedSequence`] probe shape
-/// (#7994).
-///
-/// The enum lives here rather than in the policy crate because the
-/// terminal module is the only producer and the policy crate should
-/// not depend on our dispatch taxonomy.
+/// Dispatch kind that selects the [`aterm_policy::selector::DispatchedSequence`]
+/// probe shape. Lives here because the terminal module is its only producer.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ProbeKind {
     /// CSI dispatch (ESC `[` ... `<final_byte>`). Production probes only the
@@ -78,7 +40,7 @@ impl ProbeKind {
     /// Catch-all probe for the single `send_response` sink. The response sink
     /// does not know the originating dispatch shape, so a `response any`
     /// wildcard `Drop` rule must be able to suppress every reply through it;
-    /// the DCS wildcard bucket is exactly that catch-all (#7994).
+    /// the DCS wildcard bucket is exactly that catch-all.
     #[inline]
     #[must_use]
     pub(super) const fn response_sink() -> Self {
@@ -86,18 +48,13 @@ impl ProbeKind {
     }
 }
 
-/// Zero-sized proof that the calling context is allowed to push bytes
-/// into the terminal response buffer.
+/// Zero-sized proof that the calling context may push bytes into the terminal
+/// response buffer.
 ///
-/// Minted only by [`Self::mint_for_dispatch`], which is `pub(super)` to
-/// the terminal module and invoked from the `ActionSink` dispatch
-/// entry points in `handler_actions.rs` (CSI / ESC / OSC / DCS).
-/// Consumers outside the terminal module cannot construct one; the
-/// type's internal field is private.
-///
-/// Required by [`super::handler::TerminalHandler::send_response`]. The
-/// capability is passed by shared reference so multiple response sites
-/// in one dispatch can share a single token without ownership transfer.
+/// Minted only by [`Self::mint_for_dispatch`] from the `ActionSink` dispatch
+/// entry points (CSI / ESC / OSC / DCS); the private field prevents
+/// construction elsewhere. Passed by reference so several response sites in
+/// one dispatch share one token.
 #[derive(Debug)]
 pub(super) struct ResponseCapability {
     /// Private seal — prevents construction outside this module.
@@ -109,23 +66,11 @@ pub(super) struct ResponseCapability {
 }
 
 impl ResponseCapability {
-    /// Mint a new response capability for the current dispatch frame.
+    /// Mint a response capability for the current dispatch frame.
     ///
-    /// Called exclusively from `ActionSink` dispatch methods in
-    /// `handler_actions.rs` at the start of a parser-originated
-    /// sequence that may legitimately produce a response (CSI, ESC,
-    /// OSC, DCS). The returned capability is bound to the calling
-    /// scope and borrowed by the downstream handlers for the duration
-    /// of that dispatch.
-    ///
-    /// # Why this is `pub(super)`
-    ///
-    /// The constructor is `pub(super)`, which restricts it to the
-    /// `terminal` module. The dispatch entry points live in
-    /// `handler_actions.rs` inside the same module; no other caller
-    /// can reach this function. The parser crate (`aterm-parser`) has
-    /// no access: it only sees the [`ActionSink`] trait, whose methods
-    /// take `&mut dyn ActionSink` and cannot name this type.
+    /// `pub(super)`: called only from the `ActionSink` dispatch methods in
+    /// `handler_actions.rs`. The parser crate sees only the [`ActionSink`]
+    /// trait and cannot name this type.
     ///
     /// [`ActionSink`]: crate::parser::ActionSink
     #[inline]
@@ -134,51 +79,24 @@ impl ResponseCapability {
         Self { _seal: () }
     }
 
-    /// Engine-consulting variant of [`Self::mint_for_dispatch`] (#7994).
+    /// Engine-consulting variant of [`Self::mint_for_dispatch`].
     ///
-    /// Consults the [`aterm_policy::engine::PolicyEngine`] with a probe
-    /// for the dispatched sequence (CSI / ESC / OSC / DCS, identified by
-    /// `kind` and `major`) at `origin`. Returns `None` if the engine
-    /// denies the sequence — callers skip response emission for this
-    /// dispatch frame. When the engine is absent or falls through, the
-    /// capability is always minted, preserving the pre-engine behavior
-    /// (response_capability has no legacy boolean to fall back to;
-    /// "allow by default at fallthrough" matches the existing always-
-    /// mint semantics and design §6.3 Release N backward-compat).
+    /// Probes the [`aterm_policy::engine::PolicyEngine`] with the dispatched
+    /// sequence (`kind` and `major`) at `origin` and returns `None` when the
+    /// engine denies it. With no engine, or no matching rule, it always mints.
+    /// A host can suppress every response with a `response any` rule set to
+    /// `Drop`.
     ///
-    /// Hosts that want to suppress all response-producing sequences
-    /// (fingerprint mitigation, DECRQSS/DSR hardening) can attach a
-    /// policy with the `response any` wildcard rule set to `Drop`.
+    /// `kind` selects the probe: `ProbeKind::Csi { final_byte }`,
+    /// `Esc { final_byte }`, `Osc { command }` (the OSC number from
+    /// `params[0]`), or `Dcs { final_byte }`. When parameters are not yet
+    /// parsed, use [`mint_for_dispatch`] and let the specific capability module
+    /// consult the engine.
     ///
-    /// Called from the ActionSink dispatch entry points in
-    /// `handler_actions.rs`. The `kind` parameter selects the probe
-    /// shape:
-    ///
-    /// * `ProbeKind::Csi { final_byte }` — CSI dispatch
-    /// * `ProbeKind::Esc { final_byte }` — ESC dispatch
-    /// * `ProbeKind::Osc { command }` — OSC dispatch (command is the
-    ///   OSC command number from params[0])
-    /// * `ProbeKind::Dcs { final_byte }` — DCS dispatch
-    ///
-    /// For OSC dispatch specifically, callers pass the parsed OSC
-    /// command number; for dispatches where the parameters are not
-    /// yet parsed (e.g. OSC mint before the command byte is read)
-    /// callers should use [`mint_for_dispatch`] and defer engine
-    /// consultation to the specific capability module (clipboard,
-    /// notification, etc.) which has a full parameter view.
-    ///
-    /// # Not on the dispatch path any more
-    ///
-    /// The single production caller was the `send_response` sink, whose probe
-    /// (`ProbeKind::response_sink()`) and origin (`OriginTag::Pty`) are
-    /// compile-time constants — so its verdict is now resolved once per
-    /// installed policy in [`super::policy_gates`] and read as a field. This
-    /// function is retained as the **reference implementation** that the
-    /// compiled table is checked against: `policy_gates`'s
-    /// `compiled_gate_matches_the_per_dispatch_mint` test asserts the two agree
-    /// for every built-in profile and for hand-written allow/deny policies, so a
-    /// future change to probe shape or bridge semantics that forgets the table
-    /// fails a test instead of silently answering a gate from the wrong rule.
+    /// Not on the dispatch path: the `send_response` sink's probe and origin
+    /// are constants, so [`super::policy_gates`] compiles its verdict once per
+    /// installed policy. This is the reference implementation that table is
+    /// checked against (`compiled_gate_matches_the_per_dispatch_mint`).
     #[inline]
     #[must_use]
     #[cfg(test)]
@@ -187,15 +105,9 @@ impl ResponseCapability {
         origin: aterm_policy::OriginTag,
         kind: ProbeKind,
     ) -> Option<Self> {
-        // Default no-policy fast path (#7994 perf): with no engine
-        // installed (the common case — `Terminal::new` attaches none),
-        // `engine_decision` returns `Fallback` and `Fallback.resolve(true)`
-        // is `true`, so this function always mints `Some`. Skip building the
-        // `DispatchedSequence` probe — the probe is read only when an engine
-        // is present, and the Dcs response-sink arm below would otherwise
-        // burn two heap `String` allocations per reply (the 1-byte
-        // `str::to_owned` plus the `Into<String>` clone in
-        // `DispatchedSequence::dcs`). Behavior-identical to falling through.
+        // No engine (the default): `engine_decision` would return `Fallback`,
+        // which resolves to allow, so skip building the probe and its heap
+        // strings.
         if engine.is_none() {
             return Some(Self::mint_for_dispatch());
         }
@@ -212,13 +124,10 @@ impl ResponseCapability {
 /// Build the [`aterm_policy::selector::DispatchedSequence`] a [`ProbeKind`]
 /// stands for.
 ///
-/// This is the **single** definition of every dispatch probe.
-/// `ResponseCapability::mint_for_dispatch_with_engine` calls it on the
-/// per-dispatch path, and [`super::policy_gates::PolicyGates`] calls it when it
-/// compiles a constant probe's verdict once per installed policy. Sharing one
-/// definition is what makes the compiled verdict provably the verdict the
-/// per-dispatch call would have produced — a second, hand-copied probe could
-/// drift and silently answer a gate from the wrong rule bucket.
+/// The single definition of every dispatch probe, shared by
+/// `ResponseCapability::mint_for_dispatch_with_engine` and
+/// [`super::policy_gates::PolicyGates`], so the compiled verdict is the one the
+/// per-dispatch call would produce.
 #[must_use]
 pub(super) fn probe_for(kind: ProbeKind) -> aterm_policy::selector::DispatchedSequence {
     match kind {
@@ -255,25 +164,18 @@ mod tests {
     #[test]
     fn in_module_construction_succeeds() {
         let cap = ResponseCapability::mint_for_dispatch();
-        // Structural assertion: ZST occupies no bytes, confirming the
-        // capability compiles to a type-level argument with no runtime cost.
+        // Zero-sized: the capability costs nothing at runtime.
         assert_eq!(std::mem::size_of_val(&cap), 0);
     }
 
-    /// The seal field is `()` — no payload, no discriminant, no heap.
-    /// Keeps the capability zero-cost at the ABI boundary.
+    /// The seal field is `()`: no payload, no discriminant, no heap.
     #[test]
     fn capability_is_zero_sized() {
         assert_eq!(std::mem::size_of::<ResponseCapability>(), 0);
     }
 
-    /// #7994 perf fast path: with no policy engine installed (the default),
-    /// the engine-consulting mint still always yields `Some` — the early
-    /// return skips building the `DispatchedSequence` probe but is
-    /// behavior-identical to falling through `engine_decision` (which
-    /// returns `Fallback`, and `Fallback.resolve(true) == true`). Exercised
-    /// across every `ProbeKind` shape so the fast path cannot diverge from
-    /// the probe-building path for any dispatch kind.
+    /// With no policy engine the engine-consulting mint always yields `Some`,
+    /// for every `ProbeKind`, matching the probe-building path.
     #[test]
     fn no_engine_still_mints_some() {
         let origin = aterm_policy::OriginTag::Pty;

@@ -1,67 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PIPELINE TABLE — the one declaration of every render pipeline aterm
-//! builds, read by BOTH backends.
+//! The pipeline table: the single declaration of every render pipeline, read
+//! by both backends.
 //!
-//! # Why this file exists
+//! Each row holds entry points, blend, write mask, colour-target role, vertex
+//! layout and topology. `renderer.rs` builds its wgpu descriptors from
+//! [`PIPELINES`] ([`PipelineSpec::wgpu_color_target`],
+//! [`PipelineSpec::wgpu_vertex_buffers`], [`PipelineSpec::wgpu_primitive`],
+//! `spec.vs` / `spec.fs`), and `metal/pipelines.rs` builds
+//! `MTLRenderPipelineState`s from the same rows; `metal/shaders.rs` derives its
+//! entry-point roster from them. No construction site spells this state, so
+//! the backends cannot drift.
 //!
-//! `renderer.rs` used to spell each pipeline's entry points, blend factors,
-//! write mask, colour-target role and vertex layout as a 40-line `wgpu`
-//! descriptor literal at each of its seventeen `create_render_pipeline` call
-//! sites, and `metal/` re-spelled a handful of them by hand in its tests. A
-//! judge proved what that costs: the two Metal pipeline tests each papered over
-//! the missing colour write mask IN A DIFFERENT AND MUTUALLY INCONSISTENT WAY
-//! and so certified a state the renderer does not use —
+//! Guards: `tests/pipeline_table_guard.rs`'s source scan fails a
+//! re-inlined literal, and `metal::pipelines::tests` fails a row Metal cannot
+//! express.
 //!
-//! * the fire test built `(One, One, One, One)` with NO write mask, which is
-//!   not `renderer.rs`'s fire-add state (that one is RGB-only);
-//! * the EDR test substituted `(Zero, One)` on the alpha channel, which is not
-//!   `renderer.rs`'s `alpha: add` either — it passed only because
-//!   `fs_hdr_glow` happens to emit alpha `0.0`;
-//! * both built on a `Bgra8*` attachment while the offscreen the renderer
-//!   attaches is `Rgba8Unorm` / `Rgba8UnormSrgb`.
+//! There is one row per pipeline. `build_glow_boost_pipeline` is one call site
+//! building two rows (the HDR crown, `fs_hdr_glow` on `Rgba16Float` One/One,
+//! and the SDR crown, `fs_sdr_glow` on the swapchain format with `Screen`).
 //!
-//! Each of those is a hand-copied constant that drifted, and a hand-copied
-//! constant is exactly what cannot be trusted to keep two backends in step. So
-//! the state moved HERE, once, and both consumers read it:
-//!
-//! * `renderer.rs` builds its `wgpu` descriptors out of [`PIPELINES`]
-//!   ([`PipelineSpec::wgpu_color_target`], [`PipelineSpec::wgpu_vertex_buffers`],
-//!   [`PipelineSpec::wgpu_primitive`], `spec.vs` / `spec.fs`), so there is no
-//!   longer a blend factor, a write mask or an entry-point string spelled at a
-//!   construction site at all;
-//! * `metal/pipelines.rs` builds real `MTLRenderPipelineState` objects out of
-//!   the same rows, and `metal/shaders.rs` derives its MSL entry-point roster
-//!   from them.
-//!
-//! The bar this is held to is `metal::pipelines::tests` plus
-//! `renderer::pipeline_table_tests`: a construction site that re-inlines a
-//! literal fails [`crate::renderer::pipeline_table_tests`]'s source scan, and a
-//! table row Metal cannot express fails the Metal pipeline sweep.
-//!
-//! # Seventeen sites, eighteen pipelines
-//!
-//! `renderer.rs` has seventeen `create_render_pipeline` call sites but builds
-//! EIGHTEEN distinct pipelines: `build_glow_boost_pipeline` is one site
-//! parameterised twice, once for the EDR crown (`fs_hdr_glow`, `Rgba16Float`,
-//! One/One) and once for its SDR twin (`fs_sdr_glow`, the live swapchain
-//! format, `Screen`). The table has one row per PIPELINE, because the two rows
-//! differ in every field that matters.
-//!
-//! # What the table deliberately does NOT hold
-//!
-//! Bind-group layouts, uniform buffers, samplers and pipeline layouts — the
-//! per-backend resource OBJECTS. What it DOES hold since W2 is WHERE those
-//! objects bind on the first-party Metal side: [`BindSpec`], one column per
-//! row, replacing the prose-only maps that used to live in
-//! `crate::metal::blit`'s header and `ffi::draw_and_read`'s doc. The MSL scan
-//! in `crate::metal::shaders` guards the column against the `.metal` sources
-//! in both directions.
+//! Not held here: bind-group layouts, buffers, samplers and pipeline layouts
+//! (per-backend objects). Where those bind on the Metal side is the
+//! [`BindSpec`] column, checked against the `.metal` sources both ways by the
+//! scan in `crate::metal::shaders`.
 
-/// Which shader module a pipeline's entry points live in. One variant per
-/// WGSL `const &str` in `renderer.rs` and per `.metal` file beside
-/// `crate::metal::shaders`; the two are twins, so this names both.
+/// Which shader module a pipeline's entry points live in: one WGSL const in
+/// `renderer.rs` and its `.metal` twin beside `crate::metal::shaders`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ShaderLibrary {
     /// `renderer.rs::SHADER` / `shaders/cell.metal`.
@@ -105,10 +71,9 @@ impl ShaderLibrary {
     ];
 }
 
-/// A blend factor. Exactly the five `renderer.rs` uses — a closed set on
-/// purpose, so a sixth cannot appear on one backend without a matching
-/// `MTLBlendFactor` on the other (`crate::metal::ffi::BlendFactor` is the twin,
-/// and `metal::pipelines` maps this enum onto it exhaustively).
+/// A blend factor: a closed set mapped exhaustively onto
+/// `crate::metal::ffi::BlendFactor` by `metal::pipelines`, so a new factor
+/// cannot land on one backend only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Factor {
     /// `wgpu::BlendFactor::Zero` / `MTLBlendFactorZero`.
@@ -119,10 +84,8 @@ pub(crate) enum Factor {
     SrcAlpha,
     /// `wgpu::BlendFactor::OneMinusSrcAlpha` / `MTLBlendFactorOneMinusSourceAlpha`.
     OneMinusSrcAlpha,
-    /// `wgpu::BlendFactor::OneMinusSrc` / `MTLBlendFactorOneMinusSourceColor` —
-    /// the SCREEN operator's destination factor (`BoostComposite::Screen`). It
-    /// is the one factor no Metal pipeline in this tree could express before
-    /// the table existed, because `ffi::BlendFactor` did not declare it.
+    /// `wgpu::BlendFactor::OneMinusSrc` / `MTLBlendFactorOneMinusSourceColor`,
+    /// the screen operator's destination factor.
     OneMinusSrc,
 }
 
@@ -217,7 +180,7 @@ impl BlendComponent {
         dst: Factor::One,
         op: BlendOp::Add,
     };
-    /// `src + dst * (1 - src)` — SCREEN, `BoostComposite::Screen`.
+    /// `src + dst * (1 - src)` — SCREEN, the SDR crown (`Pipeline::SdrGlow`).
     const SCREEN: Self = Self {
         src: Factor::One,
         dst: Factor::OneMinusSrc,
@@ -240,9 +203,8 @@ impl BlendComponent {
 pub(crate) struct Blend {
     /// The RGB channels' equation.
     pub(crate) color: BlendComponent,
-    /// The alpha channel's equation. It still runs when the write mask is
-    /// [`WriteMask::Color`] — the result is simply discarded — so it is stated
-    /// rather than left implicit.
+    /// The alpha channel's equation, stated even under [`WriteMask::Color`],
+    /// where its result is discarded.
     pub(crate) alpha: BlendComponent,
 }
 
@@ -253,11 +215,9 @@ impl Blend {
         color: BlendComponent::STRAIGHT_OVER,
         alpha: BlendComponent::OVER,
     };
-    /// `wgpu::BlendState::REPLACE`. Kept as an explicit BLEND rather than
-    /// `None` only where `renderer.rs` spells it that way; Metal expresses the
-    /// identical fixed-function state as blending DISABLED, and
-    /// [`Self::is_replace`] is what lets the Metal side make that swap
-    /// deliberately instead of by accident.
+    /// `wgpu::BlendState::REPLACE`, kept explicit where the renderer spells it.
+    /// Metal expresses it as blending disabled; [`Self::is_replace`] makes that
+    /// swap deliberate.
     const REPLACE: Self = Self {
         color: BlendComponent::REPLACE,
         alpha: BlendComponent::REPLACE,
@@ -267,7 +227,7 @@ impl Blend {
         color: BlendComponent::ADD,
         alpha: BlendComponent::ADD,
     };
-    /// `BoostComposite::Screen` on both halves.
+    /// The SDR crown's (`Pipeline::SdrGlow`) SCREEN on both halves.
     const SCREEN: Self = Self {
         color: BlendComponent::SCREEN,
         alpha: BlendComponent::SCREEN,
@@ -313,12 +273,9 @@ impl Blend {
     }
 }
 
-/// Which channels a pipeline's colour attachment may write.
-///
-/// Metal's DEFAULT is ALL and `wgpu`'s is ALL, so a pipeline that MEANT
-/// [`Self::Color`] and forgot to say so is silent on both backends until a
-/// translucent window goes opaque. Ten of the eighteen rows below are
-/// [`Self::Color`]; the field is not defaulted anywhere.
+/// Which channels a pipeline's colour attachment may write. Both backends
+/// default to all channels, so a forgotten [`Self::Color`] would turn a
+/// translucent window opaque; the field has no default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteMask {
     /// `wgpu::ColorWrites::COLOR` — RGB only, alpha left exactly as loaded.
@@ -347,17 +304,14 @@ impl WriteMask {
     }
 }
 
-/// WHICH attachment a pipeline draws into — a role, not a format, because the
-/// concrete format depends on the adapter (`srgb_offscreen`) and on the live
-/// swapchain. [`TargetFormats::resolve`] turns a role into the format.
+/// Which attachment a pipeline draws into: a role, since the format depends on
+/// the adapter (`srgb_offscreen`) and the live swapchain.
+/// [`TargetFormats::resolve`] maps a role to its format.
 ///
-/// The sRGB/Unorm split is THE FORMAT LAW (see `crate::metal::shaders`): the
-/// base OVER/REPLACE passes attach the sRGB-typed VIEW so fixed-function
-/// blending composites in linear light, and the additive passes attach the
-/// plain Unorm view of the SAME texture so `One`/`One` stays byte-exact against
-/// the CPU `add_sat`. Getting that backwards is invisible to a pipeline build
-/// and visible only as a gamma shift in the frame, which is precisely why the
-/// choice is a table row rather than an argument at the call site.
+/// Base OVER/REPLACE passes attach the sRGB view so blending runs in linear
+/// light; additive passes attach the Unorm view of the same texture so One/One
+/// stays byte-exact with the CPU `add_sat`. A wrong choice shows only as a
+/// gamma shift, which is why it is a table column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetRole {
     /// The sRGB-typed view of the offscreen — `GpuContext::offscreen_srgb_view_format`.
@@ -372,9 +326,8 @@ pub(crate) enum TargetRole {
     Edr,
 }
 
-/// The formats a construction site can offer a [`TargetRole`]. Built once from
-/// the `GpuContext` (`GpuContext::pipeline_targets`) so a site cannot hand a
-/// pipeline the wrong one of the offscreen's two views.
+/// The formats a construction site can offer a [`TargetRole`], built once from
+/// `GpuContext::pipeline_targets`.
 #[derive(Clone, Copy, Debug)]
 #[cfg(wgpu_arm)]
 pub(crate) struct TargetFormats {
@@ -400,9 +353,8 @@ impl TargetFormats {
     /// The concrete colour-attachment format for `role`.
     ///
     /// # Panics
-    /// If `role` is [`TargetRole::Present`] and this site has no destination
-    /// format. That is a construction-time programming error (a pipeline built
-    /// from the wrong seam), not a runtime condition.
+    /// If `role` is [`TargetRole::Present`] and no destination format was
+    /// supplied (a construction-time programming error).
     pub(crate) fn resolve(self, role: TargetRole) -> wgpu::TextureFormat {
         match role {
             TargetRole::OffscreenSrgb => self.offscreen_srgb,
@@ -468,10 +420,9 @@ pub(crate) enum AttrFormat {
     /// `wgpu::VertexFormat::Unorm8x4` / `MTLVertexFormatUChar4Normalized` —
     /// every packed RGBA colour.
     Unorm8x4,
-    /// `wgpu::VertexFormat::Uint8x4` / `MTLVertexFormatUChar4` — the fire `tsl`
-    /// bytes and the glow colour PAIR (`GlowInstance::color`/`color2`), read as
-    /// raw integers: the glow fragment ramps the two ends in INTEGER arithmetic
-    /// per column, so it needs the exact bytes, not a normalized float.
+    /// `wgpu::VertexFormat::Uint8x4` / `MTLVertexFormatUChar4`: the fire `tsl`
+    /// bytes and the glow colour pair, read as raw integers for the integer
+    /// per-column ramp.
     Uint8x4,
     /// `wgpu::VertexFormat::Float32x4` / `MTLVertexFormatFloat4` — glyph rect
     /// and UV.
@@ -507,9 +458,8 @@ impl AttrFormat {
     }
 }
 
-/// A per-INSTANCE vertex buffer layout: the instance struct's stride and its
-/// attributes. Every aterm quad is 6 (or 4) vertices of one instance, so the
-/// step mode is per-instance for all of them and is not a field.
+/// A per-instance vertex buffer layout: stride and attributes. Every quad is
+/// one instance, so the step mode is always per-instance.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VertexLayoutSpec {
     /// The instance struct's name, for the golden listing.
@@ -525,17 +475,14 @@ pub(crate) struct VertexLayoutSpec {
 /// Which instance stream a pipeline reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VertexLayout {
-    /// No vertex buffer at all: the fullscreen-triangle and tray passes derive
-    /// their positions from `[[vertex_id]]` (`buffers: &[]` in `wgpu`, and no
-    /// `MTLVertexDescriptor` in Metal).
+    /// No vertex buffer: the fullscreen-triangle and tray passes derive
+    /// positions from `[[vertex_id]]`.
     None,
     /// `renderer.rs::BgInstance` — 12 bytes.
     Bg,
-    /// `renderer.rs::GlowInstance` — 16 bytes: the bg rect plus a colour PAIR,
-    /// the two ends of a per-column gradient ([`aterm_render::GlowQuad::color2`],
-    /// 2026-09-21). Every consumer of a `GlowQuad` stream reads this layout —
-    /// the glow additive pipeline and both crown pipelines — so a gradient
-    /// quad ramps on every path that draws it.
+    /// `renderer.rs::GlowInstance`, 16 bytes: the rect plus a left/right colour
+    /// pair ([`aterm_render::GlowQuad::color2`]). Used by the glow pipeline and
+    /// both crowns.
     Glow,
     /// `renderer.rs::GlyphInstance` — 40 bytes.
     Glyph,
@@ -564,11 +511,10 @@ pub(crate) const BG_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     ],
 };
 
-/// `GlowInstance`: `[u16;4]` rect + `[u8;4]` LEFT-edge colour + `[u8;4]`
-/// RIGHT-edge colour. Both colours are `Uint8x4`, NOT `Unorm8x4`: the fragment
-/// computes `aterm_render::glow_lerp`'s integer law per column and divides by
-/// 255 itself, which is what keeps it byte-exact with the CPU rasterizer (the
-/// rasterizer's float interpolant would not be).
+/// `GlowInstance`: `[u16;4]` rect, `[u8;4]` left colour, `[u8;4]` right colour.
+/// Both colours are `Uint8x4` because the fragment applies
+/// `aterm_render::glow_lerp`'s integer law per column and divides by 255
+/// itself, byte-exact with the CPU.
 pub(crate) const GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     #[cfg(test)]
     name: "GlowInstance",
@@ -709,8 +655,7 @@ const fn wgpu_attr(a: VertexAttr) -> wgpu::VertexAttribute {
     }
 }
 
-/// The `wgpu` attribute array for [`BG_LAYOUT`], derived from it rather than
-/// re-spelled — this is what `renderer.rs::BG_ATTRS` used to be.
+/// The wgpu attribute array for [`BG_LAYOUT`], derived from it.
 #[cfg(wgpu_arm)]
 static BG_ATTRS: [wgpu::VertexAttribute; 2] =
     [wgpu_attr(BG_LAYOUT.attrs[0]), wgpu_attr(BG_LAYOUT.attrs[1])];
@@ -781,68 +726,39 @@ static FIRE_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBuffe
     attributes: &FIRE_ATTRS,
 }];
 
-/// WHERE one row's resources bind on the first-party Metal side — the per-row
-/// binding map that used to be prose in two places (`crate::metal::blit`'s
-/// header table and `ffi::draw_and_read`'s hardcoded 0/0/2) and is now a
-/// column both consumers read: `metal/blit.rs` and the encoder call sites
-/// spell their `set*:atIndex:` indices FROM here, and the MSL scan in
-/// `crate::metal::shaders` checks every `.metal` entry point against it in
-/// BOTH directions (a declared-but-untabled binding and a tabled-but-
-/// undeclared binding both fail, naming file and line).
+/// Where one row's resources bind on the Metal side. `metal/blit.rs` and the
+/// encoder call sites take their `set*:atIndex:` indices from here, and the MSL
+/// scan in `crate::metal::shaders` checks every `.metal` entry point against it
+/// in both directions.
 ///
-/// The instance stream is NOT here: it always binds at the one deconflicted
-/// vertex-buffer slot (`metal::ffi::INSTANCE_STREAM_SLOT`), reached only
-/// through the vertex descriptor / `set_instance_stream`, never spelled by a
-/// row.
+/// The instance stream is not here; it always binds at
+/// `metal::ffi::INSTANCE_STREAM_SLOT`.
 ///
-/// # The wgpu cross-check, and exactly how far it reaches
+/// Cross-check with the WGSL twins
+/// (`renderer::tests::the_wgsl_binding_map_agrees_with_the_tables_bind_column`):
 ///
-/// The WGSL twins of these shaders declare the same resources as
-/// `@group(g) @binding(b)`, and the seven `BindGroupLayout`s in `renderer.rs`
-/// restate them per layout. Where the mapping is expressible it is guarded
-/// (`renderer::tests::the_wgsl_binding_map_agrees_with_the_tables_bind_column`
-/// scans the WGSL consts against this column under the law below); where it is
-/// not, this doc says so rather than forcing it:
-///
-/// * **Uniform BUFFERS map 1:1 by number**: a `var<uniform>` at
-///   `@binding(b)` keeps `b` as its Metal `[[buffer]]` index — cell and
-///   hdr_glow at 0, blit/bloom/shimmer/tray at 2. Expressible, guarded.
-/// * **Texture and sampler NUMBERS do not map 1:1.** WGSL binding numbers
-///   share one per-group space while Metal keeps three per-stage, per-type
-///   spaces, so the twins give textures and samplers per-type sequential
-///   slots in `(group, binding)` order: the blit's sampler at
-///   `@binding(1)` is `[[sampler(0)]]`. The guarded mapping is therefore
-///   "b-th texture/sampler of the module -> slot b-th of its type", not "same
-///   number".
-/// * **The stage split is not expressible from the wgpu side at all.** WGSL
-///   module-scope declarations and `BindGroupLayoutEntry::visibility` are
-///   stage UPPER BOUNDS: the cell `Uniforms` layout is VERTEX_FRAGMENT-visible
-///   for all twelve cell rows, but only `fs_glyph` declares the fragment-stage
-///   bind in MSL, because an MSL entry point declares what it READS. So the
-///   WGSL cross-check compares the per-LIBRARY union, and the per-entry-point
-///   split is the MSL scan's job alone.
-/// * **wgpu's own internal MSL slots are not claimed here.** On macOS wgpu
-///   derives naga's `BindingMap` from the `BindGroupLayout` at pipeline build;
-///   that map is invisible to this crate and free to differ. This column names
-///   the FIRST-PARTY MSL slots only.
+/// * Uniform buffers keep their binding number as the `[[buffer]]` index (cell
+///   and hdr_glow at 0; blit, bloom, shimmer, tray at 2).
+/// * Textures and samplers take per-type sequential slots in `(group, binding)`
+///   order (the blit sampler at `@binding(1)` is `[[sampler(0)]]`).
+/// * The per-stage split is not visible from WGSL module scope, so that check
+///   compares the per-library union; the MSL scan checks each entry point.
+/// * wgpu's own internal MSL slots are not described here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) struct BindSpec {
-    /// The VERTEX-stage uniform block's `[[buffer(n)]]` index, or `None` for a
-    /// `[[vertex_id]]`-only vertex function that reads no uniform (`vs_fs`,
-    /// `vs_blit`). Cell and crown vertex functions sit at 0 — safe ONLY
-    /// because the instance stream binds at `INSTANCE_STREAM_SLOT` — while
-    /// `vs_tray` (no `[[stage_in]]`, so no collision to dodge) kept its WGSL
-    /// binding and says 2.
+    /// The vertex-stage uniform `[[buffer(n)]]` index, or `None` for a
+    /// `[[vertex_id]]`-only function (`vs_fs`, `vs_blit`). Cell and crown
+    /// vertex functions use 0 (safe because the stream binds at
+    /// `INSTANCE_STREAM_SLOT`); `vs_tray` uses 2.
     pub(crate) vertex_uniform: Option<u32>,
     /// The FRAGMENT-stage `[[texture(n)]]` slots, in slot order.
     pub(crate) fragment_textures: &'static [u32],
     /// The FRAGMENT-stage `[[sampler(n)]]` slots, in slot order.
     pub(crate) fragment_samplers: &'static [u32],
-    /// The FRAGMENT-stage `[[buffer(n)]]` slots, in slot order. `fs_glyph`
-    /// re-binds the SAME 16-byte `Uniforms` block the vertex stage reads
-    /// (Metal buffer argument tables are per-stage, so one buffer costs two
-    /// binds); the post passes read their own uniform at 2.
+    /// Fragment-stage `[[buffer(n)]]` slots in order. `fs_glyph` re-binds the
+    /// vertex stage's `Uniforms` (argument tables are per stage); post passes
+    /// read their uniform at 2.
     pub(crate) fragment_buffers: &'static [u32],
 }
 
@@ -864,18 +780,17 @@ impl BindSpec {
         fragment_samplers: &[0],
         fragment_buffers: &[],
     };
-    /// `fs_glyph` alone: [`Self::CELL_ATLAS`] plus the `Uniforms` block
-    /// re-bound to the fragment stage at `[[buffer(0)]]` (it reads
-    /// `text_blend`, the corrected-alpha remap gate).
+    /// `fs_glyph`: [`Self::CELL_ATLAS`] plus `Uniforms` re-bound at fragment
+    /// `[[buffer(0)]]` (it reads `text_blend`).
     const CELL_GLYPH_TEXT: Self = Self {
         vertex_uniform: Some(0),
         fragment_textures: &[0],
         fragment_samplers: &[0],
         fragment_buffers: &[0],
     };
-    /// The `[[vertex_id]]` post passes (bloom / shimmer / blit): no vertex
-    /// uniform; the staged frame at fragment texture/sampler 0 and the pass's
-    /// own uniform at fragment `[[buffer(2)]]` (the WGSL `@binding(2)`, kept).
+    /// The `[[vertex_id]]` post passes (bloom, shimmer, blit): no vertex
+    /// uniform; the frame at fragment texture/sampler 0 and the pass uniform at
+    /// fragment `[[buffer(2)]]`.
     const POST_FS: Self = Self {
         vertex_uniform: None,
         fragment_textures: &[0],
@@ -944,10 +859,8 @@ pub(crate) struct PipelineSpec {
     pub(crate) write_mask: WriteMask,
     /// Which instance stream feeds the vertex stage.
     pub(crate) vertex: VertexLayout,
-    /// The primitive topology. The wgpu arm builds its pipeline with it; the
-    /// Metal arm names the primitive at each draw call instead (triangles for
-    /// the instanced rows and the fullscreen passes, `draw_strip_quad` for the
-    /// tray), so only the tests hold this column against it.
+    /// The primitive topology. wgpu builds the pipeline with it; Metal names the
+    /// primitive at each draw, so only the tests check this column there.
     #[cfg(any(wgpu_arm, test))]
     pub(crate) topology: Topology,
     /// Where the row's resources bind on the Metal side — see [`BindSpec`].
@@ -956,9 +869,8 @@ pub(crate) struct PipelineSpec {
 }
 
 impl PipelineSpec {
-    /// The `wgpu` colour-target state: this row's blend + write mask, over the
-    /// format its [`TargetRole`] resolves to. The ONE place a `renderer.rs`
-    /// construction site gets a `ColorTargetState` from.
+    /// The wgpu colour-target state: blend and write mask over the format the
+    /// row's [`TargetRole`] resolves to.
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu_color_target(&self, targets: TargetFormats) -> wgpu::ColorTargetState {
         wgpu::ColorTargetState {
@@ -1209,8 +1121,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_fs",
         fs: "fs_bloom",
         target: TargetRole::OffscreenUnorm,
-        // THE HALO IS INSIDE THE BUDGET: `Screen` spends the headroom the
-        // destination has left, so the halo can brighten and never saturate.
+        // `Screen` spends only the destination's remaining headroom.
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
@@ -1227,13 +1138,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         target: TargetRole::OffscreenUnorm,
         // REPLACE by omission: the fragment IS the refracted frame.
         blend: None,
-        // ALL, alpha included: the refraction displaces the WHOLE sample
-        // (fs_shimmer returns the displaced rgba), so the translucent
-        // present's alpha coheres with the rgb it publishes. Under Color the
-        // alpha byte stayed the UNDISPLACED pixel's — rgb and opacity from
-        // two different source pixels inside the haze band (2026-09-01
-        // audit). Opaque presents are byte-identical either way (uniform
-        // offscreen alpha inside the grid).
+        // All channels: the refraction displaces the whole sample, so alpha
+        // stays consistent with the rgb on a translucent present.
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
         #[cfg(any(wgpu_arm, test))]
@@ -1266,7 +1172,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_hdr_glow",
         fs: "fs_sdr_glow",
         target: TargetRole::Present,
-        // THE CROWN IS INSIDE THE BUDGET — see `BoostComposite::Screen`.
+        // `Screen`: the crown brightens without saturating.
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
@@ -1335,7 +1241,7 @@ pub(crate) enum Pipeline {
     FireAdd = 7,
     /// EMBERFORGE FirePatch, source-over half.
     FireOver = 8,
-    /// Sparkle-word paw, W7 undercurl, glyph contrast-halo.
+    /// Sparkle-word paw, undercurl, glyph contrast-halo.
     DecoOver = 9,
     /// Sparkle-word sparkle.
     DecoAdd = 10,
@@ -1379,13 +1285,8 @@ pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
 ];
 
 impl Pipeline {
-    /// This pipeline's row.
-    ///
-    /// [`PIPELINES`] is a `static`, not a `const`, so this hands back a
-    /// reference to THE row rather than to a per-call-site copy of it — which
-    /// is what lets a test assert that two lookups of the same slot are the
-    /// same object, and what keeps eighteen `PipelineSpec`s out of every
-    /// caller's rodata.
+    /// This pipeline's row. [`PIPELINES`] is a `static`, so every lookup returns
+    /// the same object.
     pub(crate) fn spec(self) -> &'static PipelineSpec {
         &PIPELINES[self as usize]
     }
@@ -1417,13 +1318,9 @@ impl Pipeline {
     }
 }
 
-/// Every DISTINCT entry point `library` must export, in first-use order.
-///
-/// This is what `crate::metal::shaders::libraries` hands the MSL compile test,
-/// so the roster is DERIVED from the table rather than maintained beside it —
-/// the exact structural hole that let `vs_fs` be renamed to `vs_fs_bloom` in
-/// the MSL while `renderer.rs` went on asking for `vs_fs`, with a
-/// self-consistent roster test that could not see it.
+/// Every distinct entry point `library` must export, in first-use order,
+/// derived from the table so the MSL roster cannot drift from what the
+/// renderer requests.
 #[cfg(test)]
 pub(crate) fn entry_points(library: ShaderLibrary) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
@@ -1441,10 +1338,8 @@ pub(crate) fn entry_points(library: ShaderLibrary) -> Vec<&'static str> {
     out
 }
 
-/// The whole table as one stable text block, one line per row. The golden
-/// listing `renderer::pipeline_table_tests::the_pipeline_table_is_what_it_says`
-/// pins, so that changing any blend factor, write mask, entry point, target
-/// role, vertex layout or topology is a REVIEWED diff instead of a silent one.
+/// The whole table as one text block, one line per row, pinned by
+/// `tests::the_pipeline_table_is_what_it_says`.
 #[cfg(test)]
 pub(crate) fn listing() -> String {
     let mut s = String::new();
@@ -1455,12 +1350,9 @@ pub(crate) fn listing() -> String {
     s
 }
 
-/// The checked-in golden of [`listing`] — `crates/aterm-gpu/pipeline-table.txt`.
-///
-/// It lives in its OWN FILE, beside the crate rather than inside this one, on
-/// purpose: a blend factor or a write mask cannot then be edited in the same
-/// hunk as the assertion that was supposed to notice. Comment lines (`#`) and
-/// blank lines are stripped before comparison so the file can explain itself.
+/// The golden of [`listing`], `crates/aterm-gpu/pipeline-table.txt`, kept in
+/// its own file so a value change and its assertion cannot share a hunk. `#`
+/// comment lines and blank lines are stripped before comparison.
 #[cfg(test)]
 const GOLDEN: &str = include_str!("../pipeline-table.txt");
 
@@ -1468,22 +1360,9 @@ const GOLDEN: &str = include_str!("../pipeline-table.txt");
 mod tests {
     use super::*;
 
-    /// THE REVIEW GATE over the table's VALUES.
-    ///
-    /// Threading the table through both backends made drift BETWEEN them
-    /// impossible — there is only one declaration left — but it cannot make a
-    /// wrong declaration impossible. This is the guard for that half: every
-    /// field of every row, as one text block, pinned against a checked-in
-    /// golden. Changing a blend factor, a write mask, an entry point, a target
-    /// role, a vertex layout or a topology is now a two-file diff a reviewer
-    /// sees, instead of one character inside a 40-line descriptor.
-    ///
-    /// This is NOT the "hand-copied constant in two places" the table exists to
-    /// abolish, and the difference is worth being precise about: a hand-copy is
-    /// a SECOND PRODUCER OF BEHAVIOUR that can disagree with the first while
-    /// both keep working. The golden produces no behaviour at all — nothing
-    /// builds a pipeline from it — so it cannot disagree with the renderer; it
-    /// can only refuse to be silent.
+    /// Every field of every row, pinned against the checked-in golden, so a
+    /// change to any pipeline value is a reviewed two-file diff. The golden
+    /// produces no behaviour, so it cannot disagree with the renderer.
     #[test]
     fn the_pipeline_table_is_what_it_says() {
         let want: Vec<&str> = GOLDEN
@@ -1516,9 +1395,8 @@ mod tests {
         );
     }
 
-    /// The enum discriminants ARE the indices into [`PIPELINES`], and
-    /// [`ALL_PIPELINES`] enumerates every one exactly once. Everything else in
-    /// this module indexes through those two facts.
+    /// Enum discriminants are the indices into [`PIPELINES`], and
+    /// [`ALL_PIPELINES`] lists every one exactly once.
     #[test]
     fn the_row_index_is_the_enum_discriminant() {
         assert_eq!(PIPELINES.len(), PIPELINE_COUNT);
@@ -1537,10 +1415,8 @@ mod tests {
         assert_eq!(names.len(), before, "two rows share a name");
     }
 
-    /// The `wgpu` vertex-buffer layouts are DERIVED from the neutral ones, so
-    /// this pins the derivation rather than the values: each layout must carry
-    /// exactly its spec's stride, attribute count, formats and offsets, and
-    /// must step per INSTANCE (every aterm quad is one instance).
+    /// Each derived wgpu vertex-buffer layout carries its spec's stride,
+    /// attribute count, formats and offsets, stepping per instance.
     #[test]
     fn the_wgpu_vertex_layouts_are_the_tables_own() {
         for p in ALL_PIPELINES {
@@ -1571,9 +1447,8 @@ mod tests {
         }
     }
 
-    /// A [`TargetRole::Present`] row needs the destination format and every
-    /// other row must NOT — that is what keeps the offscreen's sRGB/Unorm
-    /// choice out of the call sites' hands.
+    /// A [`TargetRole::Present`] row needs the destination format and no other
+    /// row does.
     #[test]
     fn target_roles_resolve_from_the_context_not_the_call_site() {
         let targets = TargetFormats {
@@ -1610,13 +1485,9 @@ mod tests {
         );
     }
 
-    /// Two rows naming the SAME entry point in the SAME library must declare
-    /// the SAME bindings for that stage, because the MSL declares each
-    /// function's argument table exactly once — a per-row disagreement could
-    /// never be satisfied by any `.metal` source and would mean the column
-    /// stopped describing the shaders. (The MSL scan in `metal::shaders`
-    /// checks the column against the sources; this checks it against ITSELF,
-    /// and runs on every platform that compiles the crate.)
+    /// Rows naming the same entry point in the same library declare the same
+    /// bindings for that stage, since MSL declares each function's arguments
+    /// once.
     #[test]
     fn rows_sharing_an_entry_point_share_its_bindings() {
         for a in ALL_PIPELINES {
@@ -1655,10 +1526,8 @@ mod tests {
                 }
             }
         }
-        // Every fragment texture in this shader set is sampled (not read raw
-        // via a slot with no sampler), so the two slot lists pair 1:1 — a row
-        // that breaks the pairing is a new shader SHAPE and must be a reviewed
-        // change here, not an accident.
+        // Every fragment texture here is sampled, so texture and sampler slots
+        // pair 1:1; a new shape must be a reviewed change.
         for p in ALL_PIPELINES {
             let b = p.spec().binds;
             assert_eq!(

@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The reviewer's proofs of the motion layer's DEADLINES and the ETA's
-//! honesty (design §10.4.4, §10.4.6, §10.8; review 2026-09-24), driven only
-//! through the crate's public API at injected instants.
+//! honesty (design §10.4.4, §10.4.6, §10.8), driven only through the crate's
+//! public API at injected instants.
 //!
 //! The central tool is [`audit`]: it walks the host's loop — wake at each
 //! `motion_deadline`, prepare the frame there — and between two wakes looks
@@ -11,10 +11,6 @@
 //! Such a change is a MISSED frame: the pixels on glass are stale until some
 //! unrelated wake repaints the window, and on an idle, unfocused window that
 //! may be never. A wake at which nothing drawable changed is a WASTED wake.
-//!
-//! The tests headed `DEFECT (review 2026-09-24)` pinned a defect the review
-//! found; each failed then and passes with its fix (the final fixer's round,
-//! design §10.14 rulings 108-110).
 
 use aterm_messages::progress::eta_words;
 use aterm_messages::text::char_width;
@@ -386,7 +382,7 @@ fn a_bar_never_wakes_for_a_frame_that_draws_nothing_new() {
     }
 }
 
-/// DEFECT (review 2026-09-24): A STALL NEVER REPAINTS WHERE THE ETA SLOT
+/// A STALL NEVER REPAINTS WHERE THE ETA SLOT
 /// STARVED. `motion_deadline` folds the stall's onset only for a MOVING,
 /// graded bar at least 1.5 cells long (center.rs, the `look.graded && f >=
 /// 384` arm), or through the ETA slot's `next_change`. Where the width
@@ -519,7 +515,7 @@ fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
     }
 }
 
-/// DEFECT (review 2026-09-24): AN OVERDUE ETA READS `<5 s` FOREVER FOR WORK
+/// AN OVERDUE ETA READS `<5 s` FOREVER FOR WORK
 /// COUNTED IN STEPS OR ITEMS. Once the latched completion instant passes
 /// with no further reading, `eta()` answers `Remaining(0)` — `<5 s` — for as
 /// long as the row lives: a minute (or ten) later it still promises "under
@@ -584,7 +580,7 @@ fn the_elapsed_clock_ticks_exactly_on_its_deadlines() {
     assert!(first >= now + ELAPSED_AFTER && first < now + ELAPSED_AFTER + ANIM_FRAME);
 }
 
-/// DEFECT (review 2026-09-24): A SAME-ACTIVITY SUPERSEDE RESTARTS THE
+/// A SAME-ACTIVITY SUPERSEDE RESTARTS THE
 /// ELAPSED CLOCK. The readout is `elapsed_words(q − posted_at)`, and a
 /// supersede by key is a new post — so work that re-words its row
 /// (`announce_toolchain_pass` twice; any reporter that re-titles a phase of
@@ -641,11 +637,11 @@ fn the_elapsed_clock_survives_a_same_activity_supersede() {
     );
 }
 
-/// A FAULT ECHO'S HOLD ASKS NO FRAME (review round 12, ruling 245): a bar's
+/// A FAULT ECHO'S HOLD ASKS NO FRAME (ruling 245): a bar's
 /// warn wash stands still from `ECHO_FAULT_CROSS` to `ECHO_FAULT_FLASH`, a
 /// busy row's drain from `ECHO_DRAIN` — no display frame there draws
 /// anything new, so none wakes; the fade's first frame is the next wake, and
-/// nothing is missed. Fourteen to sixteen empty wakes per Fault before.
+/// nothing is missed.
 #[test]
 fn a_fault_echo_never_wakes_through_its_hold() {
     for indeterminate in [false, true] {

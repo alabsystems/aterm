@@ -5,26 +5,20 @@
 //! BiDi visual-reordering bridge (feature `bidi`).
 //!
 //! Wires the engine's BiDi configuration ([`BiDiMode`] + [`ParagraphDirection`])
-//! to the UAX #9 reordering in the `aterm-bidi` crate. Compiled ONLY
-//! when the off-by-default `bidi` feature is enabled; with the feature off this
-//! module is absent and the engine build is byte-identical (the no-op posture in
-//! `bidi_stubs.rs` is unaffected).
+//! to the UAX #9 reordering in `aterm-bidi`. Compiled only with the
+//! off-by-default `bidi` feature (on in `aterm-gui`); without it rows render in
+//! logical order.
 //!
-//! Scope: this produces the per-line visual→logical column permutation AND
-//! applies it at render time. [`Terminal::apply_bidi_reorder`] permutes each row
-//! of the render snapshot (built by `cell_frame_into`) into visual order, so with
-//! the `bidi` feature enabled (it is, in `aterm-gui`) RTL runs display correctly
-//! on BOTH the CPU and GPU renderers and in the `image` introspection capture.
-//! Runtime-gated by [`BiDiMode`] (default `Implicit`); pure-LTR rows are skipped.
+//! [`Terminal::apply_bidi_reorder`] permutes each row of the render snapshot
+//! (from `cell_frame_into`) into visual order, so RTL runs display correctly in
+//! the CPU and GPU renderers and the `image` capture. Gated at runtime by
+//! [`BiDiMode`] (default `Implicit`); pure-LTR rows are skipped.
 //!
-//! The paragraph direction each row is resolved against is the SCP direction
-//! (`CSI Ps SP k`; the default `Auto` means the terminal's default, LTR).
-//! First-strong autodetection (UAX #9 P2/P3) runs ONLY while DECSET 2501
-//! (`modes.bidi_autodetection`) is set — the Terminal WG default is disabled,
-//! and with it disabled the SCP direction is used directly. That gate is what
-//! keeps an `ls` row whose first entry is Hebrew from becoming an RTL paragraph
-//! and mirroring its LTR columns end to end while the grid (and `ctl text`)
-//! still hold the logical order.
+//! Each row is resolved against the SCP paragraph direction (`CSI Ps SP k`;
+//! the default `Auto` is LTR). First-strong autodetection (UAX #9 P2/P3) runs
+//! only while DECSET 2501 (`modes.bidi_autodetection`) is set, default off per
+//! the Terminal WG, so an `ls` row whose first entry is Hebrew stays an LTR
+//! paragraph instead of mirroring its columns.
 
 use super::Terminal;
 use aterm_types::{BiDiMode, ParagraphDirection};
@@ -48,17 +42,12 @@ impl Terminal {
         )
     }
 
-    /// Visual→logical CELL permutation for a rendered row, honoring this terminal's
-    /// BiDi mode/direction AND wide-glyph cell pairing.
-    ///
-    /// A renderer holds [`RenderCell`](super::RenderCell) rows; a wide glyph (CJK,
-    /// wide emoji) occupies two cells — a lead cell plus a right-half continuation
-    /// — that must stay paired and unmirrored when the line is reordered.
-    /// `result[v] == l` means the logical cell at index `l` is drawn at visual
-    /// column `v` (left to right). Returns the identity permutation when BiDi is
-    /// disabled or the row is pure left-to-right, so a renderer can apply it
-    /// unconditionally. This is the cell-level companion to [`Self::bidi_visual_order`]
-    /// and the entry point a renderer integration calls per visible row.
+    /// Visual→logical cell permutation for a rendered row, honoring this
+    /// terminal's BiDi mode/direction and wide-glyph pairing: a wide glyph's
+    /// lead and continuation cells stay paired and unmirrored. `result[v] == l`
+    /// means logical cell `l` is drawn at visual column `v`. The identity when
+    /// BiDi is disabled or the row is pure LTR. The cell-level companion to
+    /// [`Self::bidi_visual_order`], called per visible row by renderers.
     #[must_use]
     pub fn bidi_visual_order_cells(&self, cells: &[super::RenderCell]) -> Vec<usize> {
         // Fast path: with BiDi off, skip the per-cell scalar/flag allocations.
@@ -76,15 +65,12 @@ impl Terminal {
         )
     }
 
-    /// Visible row `row` in DISPLAY order, for an introspection read: the row's
-    /// text laid out as the frame paints it, and the visual→logical column map
-    /// the renderer applies ([`Self::bidi_visual_order_cells`] over the same cell
-    /// scalars and wide-continuation flags): `map[v] == l` means the logical
-    /// column `l` is drawn at visual column `v`. A wide glyph's continuation cell
-    /// contributes no text (the `get_line_text` rule), and trailing blanks are
-    /// dropped from the text; the map always covers every column. The identity
-    /// when BiDi is off or the row is pure left-to-right. `None` for a row off
-    /// the screen.
+    /// Visible row `row` in display order, for introspection: the row's text as
+    /// the frame paints it, and the visual→logical map the renderer applies
+    /// ([`Self::bidi_visual_order_cells`] over the same cells; `map[v] == l`). A
+    /// wide glyph's continuation contributes no text and trailing blanks are
+    /// dropped; the map covers every column. The identity when BiDi is off or
+    /// the row is pure LTR. `None` for a row off the screen.
     #[must_use]
     pub fn row_display_order(&self, row: u16) -> Option<(String, Vec<usize>)> {
         if row >= self.grid.rows() {
@@ -121,48 +107,31 @@ impl Terminal {
         Some((text, map))
     }
 
-    /// Reorder each row of a render snapshot into BiDi VISUAL order, in place.
+    /// Reorder each row of a render snapshot into BiDi visual order, in place.
     ///
-    /// This is the render-time application of [`Self::bidi_visual_order_cells`]:
-    /// it permutes the dense [`RenderCell`](super::RenderCell) row AND the
-    /// column-indexed sparse arrays (clusters / combining marks / inline images)
-    /// AND the cursor column, so a renderer that draws the snapshot left-to-right
-    /// shows right-to-left runs in the correct visual order. Called from
-    /// [`Terminal::cell_frame_into`](super::Terminal::cell_frame_into), so BOTH
-    /// the CPU and GPU renderers (and the `image` introspection capture) get
-    /// visual order for free.
+    /// Applies [`Self::bidi_visual_order_cells`] to the dense
+    /// [`RenderCell`](super::RenderCell) row, the column-indexed sparse arrays
+    /// (clusters, combining marks, inline images) and the cursor column. Called
+    /// from [`Terminal::cell_frame_into`](super::Terminal::cell_frame_into).
+    /// Pure-LTR rows are skipped by a first-RTL-block guard; a no-op when BiDi is
+    /// disabled.
     ///
-    /// Pure-LTR rows are skipped via a cheap first-RTL-block guard, so frames
-    /// with no right-to-left content are byte-identical to the non-BiDi path.
-    /// A no-op when BiDi is disabled.
+    /// Rows resolve against the SCP paragraph direction, with first-strong
+    /// autodetection only under DECSET 2501 (see
+    /// [`base_direction_from_classes`]). By default each row is an LTR
+    /// paragraph, so only RTL runs reverse in place and the cursor stays on its
+    /// cell.
     ///
-    /// Every row is resolved against the SCP paragraph direction; UAX #9
-    /// first-strong autodetection runs only while DECSET 2501 is set (see
-    /// [`base_direction_from_classes`]). Under the shipping default — SCP 0,
-    /// 2501 reset — that is an LTR paragraph per row, so a row is permuted
-    /// only where an RTL run reverses in place: LTR words, digits and written
-    /// blanks keep their columns, and the cursor stays on its cell.
+    /// `refill_mask` is the damage-scoped arm's row mask (`None` on the full arm:
+    /// every row). Unnamed rows are retained, which the carrier allows only when
+    /// the previous fill permuted nothing ([`RenderInput::engine_row_order`] was
+    /// `Logical`) and no mode/direction/autodetection change forced full damage
+    /// (`invalidate_bidi_all`); a retained row then reorders as the identity, so
+    /// skipping it is exact and keeps the scoped arm `O(damaged rows × cols)`.
     ///
-    /// `refill_mask` is the DMG-1 damage-scoped arm's row mask (`None` on the
-    /// full arm — every row is processed, the historical behaviour). Rows the
-    /// mask does not name are RETAINED rows, and the carrier only allows them
-    /// to be retained while [`RenderInput::engine_row_order`] was `Logical`
-    /// — i.e. the previous fill permuted nothing, so every retained channel is
-    /// still in LOGICAL order — and while a mode/direction/autodetection
-    /// change (each of which calls `invalidate_bidi_all`, marking FULL damage)
-    /// has not forced the full arm. Under those two facts a retained row's
-    /// reorder decision is a pure function of unchanged inputs and re-derives
-    /// as the identity, so skipping it is exact rather than merely cheap.
-    /// Skipping is also what keeps the scoped arm's cost `O(damaged rows ×
-    /// cols)` in a `bidi` build: the first-RTL-block guard would otherwise
-    /// re-scan every retained cell.
-    ///
-    /// RETURNS whether any row was actually permuted — the value the fill
-    /// stamps into `engine_row_order`. A `true` costs the NEXT frame its
-    /// scoped arm (retained rows would be in visual order, and re-permuting
-    /// them would double-permute); it never makes THIS frame wrong, because
-    /// every row this fill permuted it permuted from logical order exactly
-    /// once.
+    /// Returns whether any row was permuted, stamped into `engine_row_order`:
+    /// `true` makes the next frame take the full arm (retained rows would be in
+    /// visual order), never this frame wrong.
     pub(crate) fn apply_bidi_reorder(
         &mut self,
         frame: &mut crate::render::RenderInput,
@@ -174,10 +143,8 @@ impl Terminal {
         let mut reordered_any = false;
         let dir = self.modes.bidi_direction;
         let autodetect = self.modes.bidi_autodetection;
-        // Reusable scratch buffers (held on `bidi_state` so their capacity persists
-        // across rows AND frames); cleared + refilled per row, never reallocated for
-        // a stable terminal size. Output is byte-identical to the per-row-allocating
-        // path.
+        // Reusable scratch buffers held on `bidi_state`, cleared and refilled per
+        // row, so a stable terminal size reorders without reallocation.
         let scratch = &mut self.bidi_state.scratch;
         for r in 0..frame.cells.len() {
             // Retained (unmasked) row on the damage-scoped arm: provably still
@@ -187,9 +154,9 @@ impl Terminal {
             {
                 continue;
             }
-            // The cheap guard skips any row with no codepoint in or after the first
-            // RTL block (U+0590); only such rows can reorder. Then compute the
-            // per-cell BiDi classes + wide flags ONCE into the reused scratch.
+            // Skip rows with no codepoint at or after the first RTL block
+            // (U+0590); only those can reorder. Then compute per-cell BiDi classes
+            // and wide flags once into the scratch.
             {
                 let row = &frame.cells[r];
                 if !row.iter().any(|c| c.ch >= '\u{0590}') {
@@ -202,7 +169,7 @@ impl Terminal {
                     .extend(row.iter().map(|c| aterm_bidi::bidi_class(c.ch)));
                 scratch.wide.extend(row.iter().map(|c| c.wide));
             }
-            // Pure-LTR (no R/AL/AN) → identity permutation; nothing to reorder.
+            // Pure-LTR (no R/AL/an) → identity permutation; nothing to reorder.
             if !aterm_bidi::has_bidi_classes(&scratch.classes) {
                 continue;
             }
@@ -212,9 +179,8 @@ impl Terminal {
             scratch
                 .brackets
                 .extend(frame.cells[r].iter().map(|c| aterm_bidi::bracket_of(c.ch)));
-            // Resolve the visual→logical CELL permutation into `scratch.cell_order`,
-            // reusing the UAX #9 working memory — no per-row heap allocation after
-            // warmup. Output is byte-identical to `reorder_cells_with_classes`.
+            // Resolve the visual→logical cell permutation into
+            // `scratch.cell_order`, reusing the UAX #9 working memory.
             aterm_bidi::reorder_cells_with_classes_into(
                 &scratch.classes,
                 &scratch.brackets,
@@ -247,14 +213,12 @@ impl Terminal {
                         *c = inv[*c];
                     }
                 }
-                // Reordering permutes the visual columns, so the (col, _) keys are no
-                // longer ascending. Re-sort by column — each list holds one entry per
-                // column, so this is a total order and output-neutral — so the
-                // per-column lookups (RenderInput::cluster_at/combining_at/image_at and
-                // the CPU cluster_for/combining_for/image_covers) stay binary-searchable
-                // instead of falling back to O(cols²) linear scans on a dense reordered
-                // row. Runs only on genuinely-reordered rows (identity is skipped above).
-                entries.sort_unstable_by_key(|(c, _)| *c);
+                // Reordering leaves the (col, _) keys unsorted: re-sort by column,
+                // stably so one cell's image layers keep their draw order, so the
+                // per-column lookups (RenderInput::cluster_at/combining_at/images_at,
+                // the CPU cluster_for/combining_for/image_covers) stay binary
+                // searches. Only reordered rows reach here.
+                entries.sort_by_key(|(c, _)| *c);
             }
             remap_cols(&mut frame.clusters[r], &scratch.inv);
             remap_cols(&mut frame.combining[r], &scratch.inv);
@@ -269,13 +233,11 @@ impl Terminal {
     }
 }
 
-/// Pure mapping from BiDi config + line scalars to the visual→logical permutation.
-///
-/// `autodetect` is DECSET 2501 (`modes.bidi_autodetection`): whether UAX #9
-/// first-strong detection may override the SCP direction `dir` (see
-/// [`base_direction`]). Kept free-standing (not a method) so it is testable
-/// without constructing a `Terminal`. `Terminal::bidi_visual_order` is the
-/// one-line wrapper over it.
+/// Pure mapping from BiDi config and line scalars to the visual→logical
+/// permutation. `autodetect` is DECSET 2501: whether first-strong detection
+/// may override the SCP direction `dir` (see [`base_direction`]).
+/// Free-standing so it is testable without a `Terminal`;
+/// `Terminal::bidi_visual_order` wraps it.
 #[must_use]
 #[cfg(test)]
 pub fn compute_visual_order(
@@ -292,11 +254,10 @@ pub fn compute_visual_order(
     aterm_bidi::reorder_visual_to_logical(scalars, base)
 }
 
-/// Cell-level companion to [`compute_visual_order`]: parallel per-cell scalar and
-/// wide-continuation slices in, visual→logical CELL permutation out. Kept
-/// free-standing so it is testable without constructing a `Terminal`; wide-glyph
-/// cell pairs are kept together (see [`aterm_bidi::reorder_cells_with_classes`]).
-/// `autodetect` is DECSET 2501, as for [`compute_visual_order`].
+/// Cell-level companion to [`compute_visual_order`]: per-cell scalars and
+/// wide-continuation flags in, visual→logical cell permutation out, keeping
+/// wide-glyph pairs together (see [`aterm_bidi::reorder_cells_with_classes`]).
+/// `autodetect` is DECSET 2501.
 #[must_use]
 pub fn compute_visual_order_cells(
     mode: BiDiMode,
@@ -308,9 +269,8 @@ pub fn compute_visual_order_cells(
     if mode == BiDiMode::Disabled {
         return (0..cell_chars.len()).collect();
     }
-    // Compute the per-cell BiDi classes ONCE, then derive the `has_bidi` check,
-    // the base direction, AND the level resolution from the same slice (instead
-    // of recomputing `bidi_class` 2–3x over the row). Output is identical.
+    // Compute per-cell BiDi classes once and derive the `has_bidi` check, base
+    // direction and level resolution from them.
     let classes: Vec<aterm_bidi::BidiClass> = cell_chars
         .iter()
         .map(|&c| aterm_bidi::bidi_class(c))
@@ -326,21 +286,17 @@ pub fn compute_visual_order_cells(
     aterm_bidi::reorder_cells_with_classes(&classes, &brackets, is_wide_continuation, base)
 }
 
-/// Map the engine's [`ParagraphDirection`] onto an `aterm-bidi` `BaseDirection`.
+/// Map the engine's [`ParagraphDirection`] onto an `aterm-bidi`
+/// `BaseDirection`.
 ///
-/// `autodetect` is DECSET 2501 (`modes.bidi_autodetection`). The Terminal WG
-/// recommendation makes it the ONLY switch for first-strong detection: SCP 0
-/// selects "the terminal's default" direction (LTR), 2501 defaults to disabled,
-/// and while it is disabled "the model's corresponding flag is used directly".
-/// So `Auto` is an LTR paragraph and `AutoRtl` an RTL one until 2501 is set;
-/// only then does either run UAX #9 P2/P3 over the row. Mapping `Auto` to
-/// `BaseDirection::Auto` unconditionally made every row whose first strong
-/// character is R/AL an RTL paragraph, and L2 then mirrored its LTR columns.
+/// `autodetect` is DECSET 2501, which the Terminal WG makes the only switch for
+/// first-strong detection (default off; SCP 0 is the terminal's default, LTR).
+/// Without it `Auto` is an LTR paragraph and `AutoRtl` an RTL one; with it
+/// both run UAX #9 P2/P3 over the row.
 ///
-/// `AutoRtl` under autodetection (default RTL when the line has no strong
-/// character) has no direct UAX #9 analogue: it resolves to `Auto` when a
-/// strong L/R/AL character is present and `Rtl` otherwise, matching its
-/// "default to RTL" intent. SCP 1/2 (`Ltr`/`Rtl`) force their direction.
+/// `AutoRtl` under autodetection resolves to `Auto` when a strong L/R/AL
+/// character is present and `Rtl` otherwise. SCP 1/2 (`Ltr`/`Rtl`) force
+/// their direction.
 #[cfg(test)]
 fn base_direction(
     dir: ParagraphDirection,
@@ -380,10 +336,9 @@ fn base_direction(
     }
 }
 
-/// Class-slice companion to [`base_direction`] for callers that already computed
-/// the per-cell [`BidiClass`](aterm_bidi::BidiClass) slice (the cell-reorder
-/// path). Identical mapping; only the `AutoRtl` strong-character scan reads the
-/// precomputed classes instead of recomputing `bidi_class`.
+/// [`base_direction`] for callers that already have the per-cell
+/// [`BidiClass`](aterm_bidi::BidiClass) slice; `AutoRtl`'s strong-character
+/// scan reads the precomputed classes.
 fn base_direction_from_classes(
     dir: ParagraphDirection,
     autodetect: bool,
@@ -427,16 +382,16 @@ mod tests {
     const ALEF: char = '\u{05D0}';
     const BET: char = '\u{05D1}';
 
-    /// End-to-end: a render snapshot of a Hebrew line is reordered into visual
-    /// (right-to-left) order by `cell_frame` (which calls `apply_bidi_reorder`),
-    /// while a pure-ASCII line is left in logical order.
+    /// A render snapshot of a Hebrew line is reordered into visual order by
+    /// `cell_frame` (via `apply_bidi_reorder`), while a pure-ASCII line stays in
+    /// logical order.
     #[test]
     fn cell_frame_reorders_rtl_row_visually() {
         let mut term = Terminal::new(4, 8);
         // Default BiDiMode is Implicit, so a fresh terminal reorders RTL.
         assert_ne!(term.modes.bidi_mode, BiDiMode::Disabled);
 
-        // Write three Hebrew letters: logical order ALEF, BET, GIMEL.
+        // Write three Hebrew letters: logical order ALEF, bet, GIMEL.
         term.process("\u{05D0}\u{05D1}\u{05D2}".as_bytes());
         let frame = term.cell_frame(4, 8);
         let row: Vec<char> = frame.cells[0].iter().take(3).map(|c| c.ch).collect();
@@ -525,9 +480,8 @@ mod tests {
 
     #[test]
     fn explicit_mode_also_reorders_via_the_bridge() {
-        // The bridge reorders for any non-Disabled mode (Explicit included) — the
-        // mode distinction (engine-driven vs auto) is handled upstream; here a
-        // non-disabled mode means "produce a visual order".
+        // The bridge reorders for any non-Disabled mode (Explicit included);
+        // the mode distinction is handled upstream.
         assert_eq!(
             cv(BiDiMode::Explicit, ParagraphDirection::Rtl, "ab"),
             vec![0, 1]
@@ -551,9 +505,9 @@ mod tests {
             base_direction(ParagraphDirection::AutoRtl, true, &[ALEF]),
             BaseDirection::Auto
         );
-        // With 2501 reset (the default) the SCP direction is used directly:
-        // `Auto` is the terminal's default, LTR; `AutoRtl` is RTL, strong
-        // characters or not. SCP 1/2 force their direction either way.
+        // With 2501 reset (default) the SCP direction is used directly: `Auto`
+        // is LTR, `AutoRtl` is RTL, strong characters or not; SCP 1/2 force
+        // their direction.
         assert_eq!(
             base_direction(ParagraphDirection::Auto, false, &[ALEF, 'a']),
             BaseDirection::Ltr
@@ -628,10 +582,10 @@ mod tests {
     #[test]
     fn cells_implicit_reorders_rtl_keeping_wide_pair() {
         // ALEF (R, 1 cell) + 中 (L, 2 cells). Under the default LTR paragraph
-        // (2501 reset) the lone Hebrew letter is a one-cell RTL run and the
-        // row is the identity. With 2501 set the first strong character makes
-        // an RTL paragraph → 中 moves left of the Hebrew letter but its
-        // [lead, continuation] cells stay in order.
+        // the lone Hebrew letter is a one-cell RTL run and the row is the
+        // identity. With 2501 set the first strong character makes an RTL
+        // paragraph: 中 moves left of the Hebrew letter with its lead and
+        // continuation cells in order.
         let chars = [ALEF, CJK, ' '];
         let wide = [false, false, true];
         assert_eq!(
@@ -656,11 +610,10 @@ mod tests {
         );
     }
 
-    /// The introspection read's display order IS the renderer's: the map
-    /// `row_display_order` returns equals `bidi_visual_order_cells` over the
-    /// same row's render cells, and the text is the cells laid out in that
-    /// order — a Hebrew run reads right to left, a wide glyph stays whole, and
-    /// an LTR row is the identity with its logical text.
+    /// The introspection read's display order is the renderer's: the map from
+    /// `row_display_order` equals `bidi_visual_order_cells` over the same row's
+    /// render cells, and the text follows that order (Hebrew reads right to
+    /// left, a wide glyph stays whole, an LTR row is the identity).
     #[test]
     fn row_display_order_is_the_renderers_permutation() {
         let mut t = Terminal::new(2, 10);
@@ -733,12 +686,9 @@ mod tests {
     }
 
     /// An `ls`-shaped row whose first entry is Hebrew. The grid holds
-    /// "אב.txt  foo.txt  bar.txt"; under the shipping default (SCP 0, DECSET
-    /// 2501 reset) the paragraph is LTR, so only the Hebrew run reverses and
-    /// the LTR columns keep their places. Before the 2501 gate the first
-    /// strong character made an RTL paragraph and L2 mirrored the whole row
-    /// to "txt  foo.txt  bar.txt.בא" — the columns transposed on glass while
-    /// `ctl text` (the grid) still read fine.
+    /// "אב.txt  foo.txt  bar.txt"; under the default (SCP 0, DECSET 2501 reset)
+    /// the paragraph is LTR, so only the Hebrew run reverses and the LTR columns
+    /// keep their places instead of the whole row mirroring.
     const LS_ROW: &str = "\u{05D0}\u{05D1}.txt  foo.txt  bar.txt";
     const LS_ROW_LTR: &str = "\u{05D1}\u{05D0}.txt  foo.txt  bar.txt";
 
@@ -759,9 +709,8 @@ mod tests {
         assert_eq!(row0(&mut term, 2, 32, 24), LS_ROW_LTR);
 
         // A table row: digits, an RTL word, digits, a word. The RTL word
-        // attaches the following digits (UAX #9 N1 treats EN as R), so the
-        // pair "אב  34" reverses as a unit; the leading "12" and trailing
-        // "end" columns are untouched.
+        // attaches the following digits (UAX #9 N1 treats EN as R), so
+        // "אב  34" reverses as a unit; "12" and "end" stay put.
         let mut table = Terminal::new(2, 32);
         table.process("  12  \u{05D0}\u{05D1}  34  end".as_bytes());
         assert_eq!(
@@ -783,9 +732,9 @@ mod tests {
         assert_eq!(row0(&mut term, 2, 32, 24), LS_ROW_LTR);
         term.take_damage();
 
-        // Set: the row's first strong character is Hebrew → RTL paragraph.
-        // The already-stored row must be reprojected AND damaged, so a
-        // renderer that retained it repaints.
+        // Set: the row's first strong character is Hebrew, so an RTL paragraph.
+        // The stored row must be reprojected and damaged so a renderer that
+        // retained it repaints.
         term.process(b"\x1b[?2501h");
         assert!(
             term.has_damage(),
@@ -834,11 +783,10 @@ mod tests {
         assert_eq!(row0(&mut term, 2, 32, 24), LS_ROW_LTR);
     }
 
-    /// A pure-RTL word padded with WRITTEN blanks (an app that pads its
-    /// columns) stays left-anchored under the default LTR paragraph, and the
-    /// cursor stays on its cell. Under the old RTL-paragraph resolution UAX #9
-    /// L1 put the trailing blanks at paragraph level 1 too, so the whole row
-    /// reversed: the word jumped to the right edge and the cursor to column 0.
+    /// A pure-RTL word padded with written blanks stays left-anchored under the
+    /// default LTR paragraph, and the cursor stays on its cell (an RTL
+    /// paragraph would move the word to the right edge and the cursor to
+    /// column 0).
     #[test]
     fn pure_rtl_row_stays_left_anchored() {
         let mut term = Terminal::new(2, 8);
@@ -853,10 +801,9 @@ mod tests {
         );
     }
 
-    /// Fixed-point property of the default (2501 reset) resolution: for a row
-    /// shaped [ASCII word][blanks][Hebrew word][blanks][ASCII word], every
-    /// ASCII cell is a fixed point of the permutation — an LTR paragraph
-    /// never moves an L run, whatever the RTL run between them does.
+    /// Under the default resolution (2501 reset), for a row
+    /// [ASCII word][blanks][Hebrew word][blanks][ASCII word] every ASCII cell is
+    /// a fixed point: an LTR paragraph never moves an L run.
     #[test]
     fn ltr_cells_are_fixed_points_under_the_default_paragraph() {
         let ascii = ["a", "foo.txt", "x1", "README", "end"];
@@ -883,10 +830,9 @@ mod tests {
                                 );
                             }
                         }
-                        // Negative control: with 2501 set a leading RTL word is
-                        // the paragraph's first strong character, so the row
-                        // mirrors — its first logical cell lands in the LAST
-                        // visual column (the old default's signature).
+                        // Negative control: with 2501 set a leading RTL word is the
+                        // first strong character, so the row mirrors and its first
+                        // logical cell lands in the last visual column.
                         let rtl_first = format!("{rtl}{blanks}{lead}{blanks}{trail}");
                         let scalars: Vec<char> = rtl_first.chars().collect();
                         let order = compute_visual_order(

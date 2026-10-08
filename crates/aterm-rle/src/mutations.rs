@@ -42,19 +42,9 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         }
     }
 
-    /// Find the run containing an index.
+    /// Find the run containing `index`: `(run_index, offset_within_run)`.
     ///
-    /// O(runs) linear walk of the run lengths. Returns
-    /// `(run_index, offset_within_run)`.
-    ///
-    /// This used to prefer a binary search over a cached prefix-sum index. The
-    /// index was deleted (see the `Rle` type docs): it cost an allocation on
-    /// every constructed `Rle` on the scrollback materialization path, no
-    /// production caller reaches any of the four readers that consulted it, and
-    /// `with_value` already produced `Rle`s that ran here permanently. Runs per
-    /// line are 1-6, so the walk is short by construction — and it is the shape
-    /// the Kani harnesses already prove (`proofs_saturation.rs` drove exactly
-    /// this path).
+    /// O(runs) linear walk; see the `Rle` docs for why there is no index.
     pub(super) fn find_run(&self, index: u32) -> Option<(usize, u32)> {
         self.find_run_linear(index)
     }

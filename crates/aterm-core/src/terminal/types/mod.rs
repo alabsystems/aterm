@@ -9,13 +9,13 @@
 //! depend on grid primitives). This module re-exports all of them.
 
 // ============================================================================
-// Re-exports from aterm-grid (Part of #2341 checkpoint extraction prep)
+// Re-exports from aterm-grid
 // ============================================================================
 
 pub use crate::grid::{CurrentStyle, SavedCursorState};
 
 // ============================================================================
-// Public re-exports from aterm-types (Part of #5663 Phase 1)
+// Public re-exports from aterm-types
 // ============================================================================
 
 pub use aterm_types::TerminalModes;
@@ -76,6 +76,16 @@ impl SgrPushMask {
         Self(bits)
     }
 
+    /// The mask's bits, as a checkpoint carries them.
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// A mask from carried bits; a bit no attribute group names is dropped.
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
     pub fn has_bold(self) -> bool {
         (self.0 & Self::BOLD) != 0
     }
@@ -111,14 +121,9 @@ impl SgrPushMask {
     }
 }
 
-/// SGR attribute stack entry for XTPUSHSGR/XTPOPSGR.
-///
-/// Stores all SGR-related state that can be pushed/popped via xterm's
-/// SGR stack feature (CSI # { to push, CSI # } to pop).
-///
-/// When selective parameters are used (`CSI # { 1 ; 30`), only the
-/// specified attributes are saved/restored. The `mask` field tracks
-/// which attributes were pushed.
+/// SGR attribute stack entry for XTPUSHSGR/XTPOPSGR (`CSI # {` / `CSI # }`).
+/// A selective push (`CSI # { 1 ; 30`) saves and restores only the
+/// attributes in `mask`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SgrStackEntry {
     /// Current style attributes (fg, bg, flags, protected).

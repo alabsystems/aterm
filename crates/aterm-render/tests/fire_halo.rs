@@ -27,8 +27,9 @@ use aterm_core::render::{CharFg, FireHaloCell, FireMode, FirePatch};
 use aterm_core::terminal::Terminal;
 use aterm_render::{DirtyDecision, Renderer, Theme, compute_dirty_rows};
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// Summed-RGB luminance proxy (monotone per channel).
@@ -100,10 +101,7 @@ const HEAT_GLOW_FG: u32 = 0x00FF_C87A;
 /// WCAG contrast ratio between the glyph stroke and its immediate surround.
 #[test]
 fn halo_separates_engulfed_glyph_from_bright_fire() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (3usize, 10usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -212,10 +210,7 @@ fn halo_separates_engulfed_glyph_from_bright_fire() {
 ///     text everywhere else is untouched.
 #[test]
 fn no_halo_without_fire_and_untouched_rows_byte_identical() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (3usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -322,10 +317,7 @@ fn no_halo_without_fire_and_untouched_rows_byte_identical() {
 /// gone there is nothing to darken (and no ring at all — the gate).
 #[test]
 fn halo_decays_when_fire_recedes() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (3usize, 10usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -393,10 +385,7 @@ fn halo_decays_when_fire_recedes() {
 /// and even the weak lick darkens something (the alpha floor — no pop-in).
 #[test]
 fn halo_alpha_scales_with_engulfment_strength() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (3usize, 10usize);
     let mut term = Terminal::new(rows as u16, cols as u16);

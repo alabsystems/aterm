@@ -17,11 +17,9 @@ use super::TaskbarProgress;
 use super::shell::{ANNOTATIONS_MAX, TERMINAL_MARKS_MAX};
 use super::{Annotation, CommandMark, ShellState, Terminal, TerminalMark};
 
-/// Maximum number of OSC 1337 user variables retained per terminal.
-///
-/// When the map is full, inserting a new key evicts the oldest entry
-/// (FIFO). Updates to existing keys never evict. Mirrors the cap that
-/// previously lived in the now-removed OSC 1337 handler module.
+/// Maximum number of OSC 1337 user variables retained per terminal. When full,
+/// a new key evicts the oldest entry (FIFO); updates to existing keys never
+/// evict.
 #[cfg(test)]
 const USER_VARS_MAX: usize = 256;
 
@@ -54,18 +52,17 @@ impl Terminal {
 
     /// Monotonic count of completed commands (OSC 133;D). Strictly increases
     /// once per completion — pair with [`Self::last_completed_command`] for an
-    /// unambiguous "a NEW command just finished" edge (same-millisecond
+    /// unambiguous "a new command just finished" edge (same-millisecond
     /// completions share an end timestamp but never a seq). Survives `reset`.
     #[must_use]
     pub fn completed_command_seq(&self) -> u64 {
         self.shell.completed_seq
     }
 
-    /// Which integration BODY the shell signs that it runs (the LOADER / BODY
-    /// split, 2026-09-26): the 16-hex address of the script folder its body came
-    /// from, from the last SIGNED `633;P;AtermIntegration=` mark — or carried
-    /// across a seamless update from the engine before this one. `None` until
-    /// one arrives: a shell whose script predates loaders never sends one.
+    /// Which integration body the shell signs that it runs: the 16-hex address
+    /// of its script folder, from the last signed `633;P;AtermIntegration=`
+    /// mark or carried across a seamless update. `None` until one arrives
+    /// (scripts without a loader never send one).
     #[must_use]
     pub fn shell_integration_rev(&self) -> Option<&str> {
         self.shell
@@ -74,7 +71,7 @@ impl Terminal {
             .and_then(|rev| std::str::from_utf8(rev).ok())
     }
 
-    /// Get the most recent COMPLETED command mark (exit code recorded),
+    /// Get the most recent completed command mark (exit code recorded),
     /// regardless of status — the "what just finished" probe (PHOSPHOR's
     /// exit-status weather reads this per frame under the render lock).
     #[must_use]
@@ -151,7 +148,7 @@ impl Terminal {
     /// to 1 at use to avoid a divide-by-zero. Defaults to a sane 8×16 so headless
     /// tests are self-contained.
     ///
-    /// Calling this is also what makes the metric REPORTABLE: it is the only
+    /// Calling this is also what makes the metric reportable: it is the only
     /// writer of the flag [`Self::host_cell_pixel_size`] reads, and the XTWINOPS
     /// pixel reports (CSI 14 t / 16 t) answer from that and stay silent until a
     /// host has spoken. A host with real font metrics should call this as soon as
@@ -171,7 +168,7 @@ impl Terminal {
         self.iterm2.cell_px
     }
 
-    /// The cell pixel size a HOST actually reported, or `None` if none has.
+    /// The cell pixel size a host actually reported, or `None` if none has.
     ///
     /// The engine cannot measure a glyph — only the frontend holding the
     /// rasterizer can. So this is `None` for a headless engine, and for a live
@@ -179,7 +176,7 @@ impl Terminal {
     /// axis is treated as unreported too: it is not a cell box any font could
     /// have, and reporting it would tell an application to divide by zero.
     ///
-    /// Callers that answer a wire QUERY must use this and stay silent on `None`
+    /// Callers that answer a wire query must use this and stay silent on `None`
     /// rather than fall back to [`Self::cell_pixel_size`]; see
     /// `handler_window`'s XTWINOPS pixel reports.
     #[must_use]
@@ -245,10 +242,7 @@ impl Terminal {
         removed
     }
 
-    /// Get the current taskbar progress state (ConEmu OSC 9;4).
-    ///
-    /// Returns the last progress state set by the application, or None
-    /// if no progress has been set.
+    /// The last taskbar progress state the program set (ConEmu OSC 9;4).
     ///
     /// # Example
     /// ```
@@ -273,13 +267,13 @@ mod tests {
     #[test]
     fn set_user_var_evicts_oldest_first_deterministically() {
         let mut term = Terminal::new(24, 80);
-        // Fill to capacity in a known insertion order: k0..k(MAX-1).
+        // Fill to capacity in a known insertion order: k0..k.
         for i in 0..USER_VARS_MAX {
             term.set_user_var(&format!("k{i}"), &format!("v{i}"));
         }
         assert_eq!(term.user_vars().len(), USER_VARS_MAX);
 
-        // Inserting a new key at capacity must evict the OLDEST key (k0),
+        // Inserting a new key at capacity must evict the oldest key (k0),
         // deterministically — not an arbitrary HashMap entry.
         term.set_user_var("new", "value");
         assert_eq!(term.user_vars().len(), USER_VARS_MAX);
@@ -337,7 +331,7 @@ mod tests {
     }
 
     /// `completed_command_seq` strictly increases once per OSC 133;D — two
-    /// commands completing within the same MILLISECOND (indistinguishable by
+    /// commands completing within the same millisecond (indistinguishable by
     /// `command_end_time_ms`) still read as two edges — and it survives a
     /// terminal reset (a reset must never replay an old value to observers).
     #[test]

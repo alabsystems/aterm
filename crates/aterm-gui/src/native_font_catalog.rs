@@ -11,6 +11,12 @@ use crate::app_config::{Config, ConfigAssetCatalog, FontConfig};
 use crate::native_config_service::ConfigDiskObservation;
 use crate::{Wake, effective_font_family};
 
+/// How the worker's refusal of the configured `font_family` opens — its
+/// warning under `config.fonts`. A reload whose prepared fonts carry none
+/// ADMITTED the family, and so answers the launch thread's own verdict
+/// (`App::replace_config_messages_after_font_work`, round 44's review).
+pub(crate) const FAMILY_REFUSED: &str = "config font_family:";
+
 #[derive(Clone)]
 pub(crate) struct PrimarySeed {
     pub(crate) path: Option<String>,
@@ -45,6 +51,7 @@ pub(crate) struct Completion {
     pub(crate) observation: ConfigDiskObservation,
     pub(crate) config: Config,
     pub(crate) values: std::collections::BTreeMap<String, String>,
+    pub(crate) disk_faults: crate::native_config_service::DiskFaults,
     pub(crate) assets: Arc<ConfigAssetCatalog>,
     pub(crate) path_feed_fps: crate::app_config::PathFeedFps,
     pub(crate) sparkle: crate::app_config::PreparedSparkleRuntime,
@@ -59,6 +66,7 @@ pub(crate) struct PreparedConfigGeneration {
     pub(crate) observation: ConfigDiskObservation,
     pub(crate) config: Config,
     pub(crate) values: std::collections::BTreeMap<String, String>,
+    pub(crate) disk_faults: crate::native_config_service::DiskFaults,
     pub(crate) assets: Arc<ConfigAssetCatalog>,
     pub(crate) path_feed_fps: crate::app_config::PathFeedFps,
     pub(crate) sparkle: crate::app_config::PreparedSparkleRuntime,
@@ -72,6 +80,7 @@ impl Completion {
             observation: self.observation,
             config: self.config,
             values: self.values,
+            disk_faults: self.disk_faults,
             assets: self.assets,
             path_feed_fps: self.path_feed_fps,
             sparkle: self.sparkle,
@@ -158,6 +167,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
         observation,
         config: source_config,
         values,
+        disk_faults,
         assets,
         path_feeds: path_generation,
     } = request.prepared;
@@ -239,7 +249,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
                 .cloned()
                 .unwrap_or_else(|| "font resolution failed".into());
             warnings.push(format!(
-                "config font_family: {error}; keeping the current working face"
+                "{FAMILY_REFUSED} {error}; keeping the current working face"
             ));
             (
                 request.primary.path.clone(),
@@ -292,6 +302,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
                 observation,
                 config: source_config,
                 values,
+                disk_faults,
                 assets,
                 path_feed_fps,
                 sparkle,
@@ -410,6 +421,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
         observation,
         config: source_config,
         values,
+        disk_faults,
         assets,
         path_feed_fps,
         sparkle,
@@ -463,14 +475,13 @@ mod tests {
     }
 
     fn request_with_text(sequence: u64, text: &str) -> Request {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-font-lane-{}-{}",
-            std::process::id(),
-            sequence
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aterm.toml");
+        // The config file only has to exist while it is observed: the prepared
+        // observation carries its bytes, and the worker never reopens it.
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-font-lane-")
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("aterm.toml");
         std::fs::write(&path, text).unwrap();
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)

@@ -36,19 +36,14 @@ pub(crate) enum AcquireOutcome<O> {
 #[derive(Debug)]
 pub(crate) struct Completed<O> {
     pub(crate) generation: u64,
-    /// Wall time this request spent QUEUED — `try_request` publishing the
-    /// command until this worker was scheduled to dequeue it — which is a
-    /// different leg from the acquisition the outcome carries.
+    /// Time this request spent queued, from `try_request` until the worker
+    /// dequeued it, separate from the acquisition the outcome carries.
     ///
-    /// It is a latency the CALLER pays: a frame that finds no prefetched
-    /// drawable returns `AcquireRefusal::Pending` and cannot present until
-    /// this worker runs, so on a saturated machine a descheduled worker
-    /// defers a key echo by whole panel periods. The acquisition's own clock
-    /// (`LayerAcquire::run`) starts INSIDE the worker, after this leg is
-    /// already over, so it reports the ~0.02 ms `nextDrawable` cost and
-    /// nothing of the wait — which is how the stall came to be
-    /// unattributable. Stamped at admission, measured at dequeue, published
-    /// beside the acquire wait as `acquire_queue_*`.
+    /// The caller pays it: a frame without a prefetched drawable returns
+    /// `AcquireRefusal::Pending` and cannot present until the worker runs. The
+    /// acquisition's own clock (`LayerAcquire::run`) starts inside the worker
+    /// and cannot see this. Published beside the acquire wait as
+    /// `acquire_queue_*`.
     pub(crate) queue_ns: u64,
     pub(crate) outcome: AcquireOutcome<O>,
 }
@@ -56,9 +51,8 @@ pub(crate) struct Completed<O> {
 enum Command<I, R> {
     Request {
         generation: u64,
-        /// Admission time, for [`Completed::queue_ns`]. Stamped by
-        /// `try_request` rather than by the worker, because the whole point
-        /// is to measure the span the worker is NOT running.
+        /// Admission time for [`Completed::queue_ns`], stamped by `try_request`
+        /// because the span to measure is when the worker is not running.
         queued: aterm_time::Instant,
         input: I,
     },
@@ -94,17 +88,9 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
         // ONE consuming close, so retirement can never wait for acquisition.
         let (commands, requests) = mpsc::sync_channel(2);
         let (completed, results) = mpsc::sync_channel(1);
-        // THE MARKER IS FOR THE CENSUS, and the fact it states is already true.
-        // `mod metal` is `#[cfg(target_os = "macos")]` at its declaration
-        // (aterm-gpu/src/lib.rs:83), so nothing in this module can reach
-        // wasm32 — but OB-12's wasm-closure scan is LEXICAL over the crates in
-        // the closure, not a walk of the module graph, so it cannot see that
-        // cfg from here and reported the posture as "broken or unproven". The
-        // honest repair the diagnostic itself names for code that never ships
-        // to wasm is the recognized marker, so the true fact is written where
-        // the scanner reads. It is redundant to the compiler and load-bearing
-        // to the gate; if the census ever learns to follow a module's own cfg,
-        // this line is the one to delete.
+        // The wasm census scans lexically and cannot see that `mod metal` is
+        // macOS-only (lib.rs), so the marker states it where the scanner reads.
+        // Redundant to the compiler.
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::Builder::new()
             .name("aterm-drawable-acquire".to_owned())
@@ -158,9 +144,8 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
             Err(mpsc::TryRecvError::Empty) => return None,
             Err(mpsc::TryRecvError::Disconnected) => Completed {
                 generation,
-                // A synthesized terminal result: no worker ever dequeued the
-                // request, so there is no queue span to report. Zero here is
-                // "not measured", and the caller books no sample for it.
+                // Synthesized result: no worker dequeued the request, so no
+                // queue span (0 = not measured; no sample is booked).
                 queue_ns: 0,
                 outcome: AcquireOutcome::Disconnected,
             },
@@ -172,12 +157,11 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
         Some(completed)
     }
 
-    /// Close once, discard any unclaimed result, and retire after acquisition.
-    /// No join or blocking send occurs on the caller. Resource destructors
-    /// retain their cleanup obligations. On failure the caller retains the
-    /// retirement payload. With the private one-request /
-    /// one-close protocol, capacity two cannot be full; a disconnected worker
-    /// has already ceased acquisition and no longer needs deferred retirement.
+    /// Close once, discard any unclaimed result, and retire after acquisition,
+    /// without joining or blocking. Destructors keep their cleanup obligations.
+    /// On failure the caller keeps the retirement payload. With one request and
+    /// one close, the capacity-two channel cannot be full; a disconnected
+    /// worker has already stopped acquiring.
     pub(crate) fn close(mut self, retirement: R) -> Result<(), R> {
         self.closed = true;
         drop(self.results.take());
@@ -193,10 +177,8 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
     }
 }
 
-// SAFETY: `pthread_set_qos_class_self_np` is libpthread's, part of `libSystem`,
-// which is linked into every process on this platform (the same reason
-// `aterm-objc`'s libdispatch block needs no link attribute). `qos_class_t` is
-// `unsigned int` in `<sys/qos.h>`.
+// SAFETY: `pthread_set_qos_class_self_np` is in libpthread, part of
+// `libSystem`, which every process links. `qos_class_t` is `unsigned int`.
 unsafe extern "C" {
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
 }
@@ -205,19 +187,13 @@ unsafe extern "C" {
 /// `qos::Role::Interactive` maps to.
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 
-/// Rank the acquisition thread with the keystroke→glass path it serves.
-///
-/// A new pthread does NOT inherit its creator's class, so spawning from the
-/// main thread (pri 47) left this one at `QOS_CLASS_DEFAULT` (pri 31), level
-/// with every compiler on a saturated machine. The main thread never waits on
-/// it synchronously, but a frame (a key echo included) cannot present until
-/// this thread is scheduled to hand the drawable back, so a descheduled worker
-/// defers the present by whole panel periods. Measured on the live window:
-/// `acquire_p99_ms=5.24 max_acquire_wait_ms=15.32 present_p99_ms=75.50` for
-/// 0.6 ms of frame CPU. It holds no lock the UI thread contends (both channels
-/// are `sync_channel`s used with `try_*` on the caller side), so raising it
-/// cannot invert anything. Declared for the whole thread, so the blocking
-/// `nextDrawable` wait and the retirement drop both run at this class.
+/// Give the acquisition thread user-interactive QoS. A new pthread does not
+/// inherit its creator's class and would run at `QOS_CLASS_DEFAULT`, level
+/// with compilers on a busy machine, and a frame cannot present until this
+/// thread hands the drawable back. It holds no lock the UI thread contends
+/// (the caller uses `try_*` on `sync_channel`s), so this cannot cause
+/// inversion. Applies to the whole thread, including the blocking
+/// `nextDrawable` and retirement drops.
 fn declare_interactive_thread() {
     // SAFETY: sets this thread's own QoS class; takes no pointers and mutates
     // no shared state. Failure leaves the default class and is not actionable.
@@ -241,9 +217,8 @@ fn run_worker<I, O, R>(
                 queued,
                 input,
             } => {
-                // FIRST, before any acquisition work: this stamp closes the
-                // span that began at `try_request`, so it measures exactly
-                // how long this thread was not scheduled to serve the frame.
+                // First, before any work: close the span that began at
+                // `try_request`.
                 let queue_ns = u64::try_from(queued.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let outcome = if poisoned {
                     // Normal admission closes when the panic result
@@ -261,10 +236,9 @@ fn run_worker<I, O, R>(
                         }
                     }
                 };
-                // The owner remains pending through publication,
-                // so a second result cannot fill the one-slot queue.
-                // Closing drops the receiver; rejection then drops
-                // the output here, before the Retire command runs.
+                // The owner stays pending through publication, so a second
+                // result cannot fill the one-slot queue. After close the
+                // receiver is gone; the output drops here before Retire runs.
                 if completed
                     .try_send(Completed {
                         generation,
@@ -290,11 +264,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    /// A HANG DETECTOR, never a latency budget: every wait under it is for a
-    /// thread handoff that must happen (a worker entering, a release, a wake,
-    /// a retirement), and each returns the instant it does. A minute, as the
-    /// house rule for correctness waits says, so a descheduled worker on a
-    /// loaded gate is not read as a lost wake.
+    /// Hang detector, not a latency budget: every wait is for a handoff that
+    /// must happen, and returns as soon as it does. One minute, so a
+    /// descheduled worker on a loaded machine is not read as a lost wake.
     const LIMIT: Duration = Duration::from_secs(60);
 
     struct Retirement {
@@ -591,9 +563,8 @@ mod tests {
         assert!(worker.try_take().is_none());
     }
 
-    // SAFETY: `qos_class_self` is libpthread's, part of `libSystem`, linked into
-    // every process on this platform. It reads only the calling thread's own
-    // requested class.
+    // SAFETY: `qos_class_self` is in libpthread (`libSystem`) and reads only the
+    // calling thread's class.
     unsafe extern "C" {
         fn qos_class_self() -> u32;
     }
@@ -616,9 +587,8 @@ mod tests {
         let AcquireOutcome::Ready(class) = result.outcome else {
             panic!("acquisition did not complete: {:?}", result.outcome);
         };
-        // A new pthread does NOT inherit its creator's class: spawned bare from
-        // any parent class it reads QOS_CLASS_DEFAULT (0x15, sched pri 31), the
-        // compilers' band, below the main thread it hands drawables to.
+        // A bare new pthread reads QOS_CLASS_DEFAULT (0x15), below the main
+        // thread it serves.
         assert_eq!(QOS_CLASS_USER_INTERACTIVE, USER_INTERACTIVE_RAW);
         assert_eq!(
             class, USER_INTERACTIVE_RAW,
@@ -627,21 +597,11 @@ mod tests {
         assert!(worker.close(()).is_ok());
     }
 
-    /// THE QUEUE LEG IS MEASURED, not inferred.
-    ///
-    /// `LayerAcquire::run` starts its clock INSIDE the worker, so the figure
-    /// it publishes (`acquire_wait`) can only ever be what `nextDrawable`
-    /// itself cost — ~0.02 ms in the steady state. The leg that actually
-    /// stalls a key echo is the one BEFORE it: admission until this thread is
-    /// scheduled to dequeue. During that span the frame has already returned
-    /// `AcquireRefusal::Pending` and the main thread is parked waiting for
-    /// `Wake::GpuSurfaceReady`, so it is pure keystroke→glass latency — and
-    /// before `queue_ns` it was stamped nowhere and reached no metric, which
-    /// is what made a real stall unattributable.
-    ///
-    /// Deterministic, and it generates NO load: the request is admitted while
-    /// the worker loop is still held shut behind a gate, so the measured span
-    /// is the test's own gate rather than a scheduling race it had to lose.
+    /// The queue leg is measured: `LayerAcquire::run` times only
+    /// `nextDrawable` itself, while admission-to-dequeue is when a frame waits
+    /// after returning `AcquireRefusal::Pending`. The request is admitted while
+    /// the worker loop is held behind a gate, so the measured span is the
+    /// test's own gate, with no load generated.
     #[test]
     fn a_request_waiting_for_a_descheduled_worker_books_its_queue_time() {
         const GATE: Duration = Duration::from_millis(50);
@@ -672,10 +632,8 @@ mod tests {
         woken.recv_timeout(LIMIT).unwrap();
         let result = worker.try_take().unwrap();
         assert!(matches!(result.outcome, AcquireOutcome::Ready(())));
-        // The acquisition itself was a no-op closure, so every nanosecond
-        // here is queue. `>=` and not a window: the worker CANNOT have
-        // dequeued before `start`, so this bound holds by construction on any
-        // machine, at any load, without generating any.
+        // The acquisition was a no-op, so all of this is queue. The worker
+        // cannot dequeue before `start`, so this bound holds on any machine.
         assert!(
             result.queue_ns >= u64::try_from(GATE.as_nanos()).unwrap(),
             "a request that waited {GATE:?} for the worker booked {} ns of queue time",

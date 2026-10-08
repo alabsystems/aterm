@@ -3,35 +3,15 @@
 
 //! Thin wrapper over [`aterm_lz4`] for scrollback compression (#7943).
 //!
-//! Historically this module contained an inline LZ4 block-format
-//! compressor/decompressor (introduced by #7698 during the zero-external-
-//! dependency campaign). Wave 4 of that campaign (#7730) separately vendored
-//! a more thorough, upstream-tracking block-mode subset of `lz4_flex` into
-//! the in-tree [`aterm_lz4`] crate. For a while both implementations coexisted.
-//! Issue #7943 consolidates onto the single [`aterm_lz4`] backend and leaves
-//! this module as a thin wrapper that preserves the scrollback-specific
-//! [`Lz4Error`] surface and the 16 MiB allocation-bomb cap.
-//!
-//! On-wire compatibility: both the previous inline implementation and
-//! [`aterm_lz4`] emit the **standard LZ4 block format** with a 4-byte
-//! little-endian size prefix. Pages compressed by either implementation
-//! decompress correctly here, so no scrollback snapshot migration is needed.
-//!
-//! Public surface:
-//!   - [`compress_prepend_size`]: LZ4 block compress with 4-byte LE size prefix.
-//!   - [`decompress_size_prepended`]: decompress with allocation-bomb cap.
-//!   - [`Lz4Error`]: scrollback-facing error enum. Variants that cannot be
-//!     produced by the current backend are retained for backwards-compatible
-//!     pattern matching by callers (notably the Kani proofs in
-//!     `lz4_kani.rs`).
+//! Keeps the scrollback-facing [`Lz4Error`] surface and adds the
+//! scrollback-layer caps (the 64 MiB page cap on output, 512 : 1 claimed
+//! ratio). The wire format is the standard LZ4 block with a 4-byte
+//! little-endian size prefix.
 
 use std::fmt;
 
-/// Error type for LZ4 decompression failures.
-///
-/// Matches the variants the original inline implementation could produce,
-/// kept stable so the scrollback Kani proofs (#7934) and regression tests
-/// can continue to `matches!` on the same enum.
+/// Error type for LZ4 decompression failures. The Kani proofs (#7934) and
+/// regression tests `matches!` on these variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lz4Error {
     /// Input is too short to contain valid data (shorter than the 4-byte
@@ -73,8 +53,8 @@ impl Lz4Error {
     /// Render the exact `Display` message without going through
     /// `format_args!`: the `write!` expansion embeds an unsafe
     /// `fmt::Arguments` construction the strict Trust gate cannot lower and
-    /// fails closed on. Byte-identical to the previous `write!`-based arms
-    /// (`dec_string` renders decimals exactly like `usize`'s `Display`).
+    /// fails closed on (`dec_string` renders decimals exactly like `usize`'s
+    /// `Display`).
     pub(crate) fn to_message(&self) -> String {
         use crate::error::dec_string;
         match self {
@@ -123,18 +103,20 @@ impl fmt::Display for Lz4Error {
 
 impl std::error::Error for Lz4Error {}
 
-/// Maximum safe decompressed size (16 MiB). Prevents allocation bombs from
-/// corrupt size prefixes while being generous enough for any real scrollback
-/// page. This cap is enforced here (not in the shared [`aterm_lz4`] crate)
+/// Maximum safe decompressed size: the scrollback page cap
+/// ([`MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES`](crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES)),
+/// the same limit the warm tier's writer pages its blocks by, so no block it
+/// stores is refused here. Prevents allocation bombs from corrupt size
+/// prefixes. This cap is enforced here (not in the shared [`aterm_lz4`] crate)
 /// because it is a scrollback-layer policy, not an LZ4 format constraint.
-const MAX_DECOMPRESSED_SIZE: usize = 16 * 1024 * 1024;
+const MAX_DECOMPRESSED_SIZE: usize = crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES;
 
 /// Maximum acceptable compression ratio (output bytes ÷ compressed bytes).
 ///
 /// #7940 §09 compression-bomb ceiling: the absolute `MAX_DECOMPRESSED_SIZE`
-/// cap alone is not enough — a 4-byte size prefix claiming 16 MiB expands a
-/// ~5-byte payload into 16 MiB of allocation, which on systems that don't
-/// bound memory tightly amplifies attacker bytes 3 000 000 : 1 before the
+/// cap alone is not enough — a 4-byte size prefix claiming 64 MiB expands a
+/// ~5-byte payload into 64 MiB of allocation, which on systems that don't
+/// bound memory tightly amplifies attacker bytes 13 000 000 : 1 before the
 /// allocation-bomb cap even engages.
 ///
 /// LZ4 block format has a theoretical maximum ratio of 255 : 1 (the longest
@@ -146,7 +128,7 @@ const MAX_DECOMPRESSED_SIZE: usize = 16 * 1024 * 1024;
 ///
 /// This is a ceiling on *claimed* ratio (prefix_size / compressed_body_len),
 /// checked before decompression actually runs, so an attacker cannot force
-/// a 16 MiB allocation from a 4-byte LZ4 block.
+/// a cap-sized allocation from a 4-byte LZ4 block.
 const MAX_COMPRESSION_RATIO: usize = 512;
 
 // ---------------------------------------------------------------------------
@@ -171,8 +153,8 @@ pub fn compress_prepend_size(input: &[u8]) -> Result<Vec<u8>, Lz4Error> {
 /// Decompress data that was produced by [`compress_prepend_size`] (or the
 /// equivalent upstream `lz4_flex::compress_prepend_size`).
 ///
-/// Reads a 4-byte LE size prefix, enforces the scrollback-layer 16 MiB
-/// allocation-bomb cap, then decompresses the remainder.
+/// Reads a 4-byte LE size prefix, enforces the scrollback-layer page cap
+/// against allocation bombs, then decompresses the remainder.
 pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, Lz4Error> {
     if input.len() < 4 {
         return Err(Lz4Error::InputTooShort);
@@ -183,9 +165,8 @@ pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, Lz4Error> {
     }
     // Fast path: zero-length payload. `aterm_lz4` (and upstream `lz4_flex`)
     // require at least one token byte in the block; an empty body after a
-    // zero-size prefix is rejected as `ExpectedAnotherByte`. The previous
-    // inline decoder, and the scrollback callers that rely on it, treat an
-    // empty block as a valid zero-byte decode, so preserve that behavior.
+    // zero-size prefix is rejected as `ExpectedAnotherByte`. Scrollback
+    // callers treat an empty block as a valid zero-byte decode.
     if original_size == 0 && input.len() == 4 {
         return Ok(Vec::new());
     }
@@ -264,8 +245,8 @@ mod tests {
 
     #[test]
     fn test_max_decompressed_size_rejection() {
-        // Craft a size prefix claiming 17 MiB (just over the 16 MiB limit).
-        let size: u32 = 17 * 1024 * 1024;
+        // Craft a size prefix claiming one byte over the limit.
+        let size = u32::try_from(MAX_DECOMPRESSED_SIZE + 1).expect("cap fits the prefix");
         let mut data = size.to_le_bytes().to_vec();
         data.push(0x00);
         assert!(matches!(
@@ -276,11 +257,11 @@ mod tests {
 
     #[test]
     fn test_max_decompressed_size_at_limit() {
-        // Exactly 16 MiB should be accepted (the check is >).
-        let input = vec![0u8; 16 * 1024 * 1024];
+        // Exactly the limit should be accepted (the check is >).
+        let input = vec![0u8; MAX_DECOMPRESSED_SIZE];
         let compressed = compress_prepend_size(&input).unwrap();
-        let decompressed = decompress_size_prepended(&compressed).expect("16 MiB at limit");
-        assert_eq!(decompressed.len(), 16 * 1024 * 1024);
+        let decompressed = decompress_size_prepended(&compressed).expect("at limit");
+        assert_eq!(decompressed.len(), MAX_DECOMPRESSED_SIZE);
     }
 
     #[test]
@@ -308,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_compression_bomb_rejected_tiny_body_huge_claim() {
-        // The classic bomb shape: minimal body, near-max claimed size.
+        // The classic bomb shape: minimal body, large claimed size.
         // Claim 16 MiB from a 16-byte body (~1 048 576 : 1 ratio).
         let claimed: u32 = 16 * 1024 * 1024;
         let mut data = claimed.to_le_bytes().to_vec();

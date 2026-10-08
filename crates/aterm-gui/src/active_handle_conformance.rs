@@ -2,40 +2,29 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 bind for `ActiveHandle` (`aterm_spec::derive::active_handle_model`):
-//! the process-wide control `ActiveHandle` must always name the session the
-//! user is looking at — the FRONT window's active tab's focused pane.
+//! the process-wide control `ActiveHandle` always names the front window's
+//! active tab's focused pane.
 //!
-//! This drives a headless `App` through the shipping seams that move that
-//! session — tab append/switch/cycle/move, a split and pane-focus moves, a
-//! pane collapse, a tab close, a background pane EOF, a new front window, a
-//! background window's tab churn, and a front-window close — and after each
-//! one projects the real state onto the model's `<<truth, handle, next>>`.
+//! A headless `App` is driven through the seams that move that session (tab
+//! append/switch/cycle/move, split, pane focus and collapse, tab close, a
+//! background pane EOF, window open/close, background tab churn), and each step
+//! projects the real state onto the model's `<<truth, handle, next>>`. The three
+//! seams that spawn a PTY are driven from their post-spawn half
+//! (`install_new_tab`, `install_split_pane`, `install_window_state_with_parent`)
+//! with a stub session; that half moves the front and re-points the handle.
 //!
-//! The three seams that CREATE a session (`open_tab_in`,
-//! `split_focused_pane_in_window`, `create_window_logical`) spawn a PTY through
-//! the event loop, which a unit test does not have. Each is split at that spawn,
-//! and the step drives the shipping half after it — `install_new_tab`,
-//! `install_split_pane`, `install_window_state_with_parent` — with a stub
-//! session. That half is where the front moves and where the handle is
-//! re-pointed, so it is the half the model judges; the spawn moves nothing.
+//! Projection:
 //!
-//! The projection:
-//!
-//! * `truth` is read from the CANONICAL tab model (`tab_set` → focused view →
-//!   terminal session), not from any mirror the sync paths maintain;
+//! * `truth` comes from the canonical tab model (`tab_set` → focused view →
+//!   terminal session), not a mirror;
 //! * `handle` is the real `active_handle`'s session;
-//! * the model gives every change of the front session a FRESH id, so the
-//!   projection relabels: a real change of `truth` takes `next`, and `handle`
-//!   projects to that same id when the real handle followed, to its previous
-//!   id when it stayed put (the stale-handle shape `Buggy = 1` allows), and to
-//!   an id no action produces when it moved anywhere else.
+//! * each front change takes the fresh id `next`; `handle` projects to it when
+//!   the real handle followed, to the previous id when it stayed (the stale
+//!   shape `Buggy = 1` allows), and to an unreachable id otherwise.
 //!
-//! A step that does not move the front session is not a model step; it must
-//! leave the handle on the truth too.
-//!
-//! NEGATIVE CONTROL: the swallow, projected from a real state (the front moves
-//! and the handle stays), is rejected by the committed model and admitted by
-//! `Buggy = 1`'s `CloseOrNewFront`.
+//! A step that does not move the front session must also leave the handle on
+//! the truth. Negative control: a real front move with the handle left behind is
+//! rejected by the model and admitted by `Buggy = 1`'s `CloseOrNewFront`.
 
 use std::collections::BTreeMap;
 
@@ -173,8 +162,8 @@ const STEPS: &[Step] = &[
     ("SwitchActive", "move a tab", |a| {
         a.move_tab(WindowId(0), 0, 2)
     }),
-    // Pane paths — the 2026-09-14 audit found these re-mirroring only the
-    // per-window state: the swallow-prone family.
+    // Pane paths: these re-mirror only per-window state, so they are the
+    // swallow-prone family.
     ("CloseOrNewFront", "split", |a| {
         let sid = a.next_session_id;
         a.install_split_pane(
@@ -234,7 +223,7 @@ fn real_front_session_moves_keep_the_handle_conforming() {
     assert!(app.structural_invariants_ok());
 }
 
-/// The swallow from a REAL state: the front session moves, the handle stays.
+/// The swallow from a real state: the front session moves, the handle stays.
 #[test]
 fn a_front_move_that_leaves_the_handle_behind_is_the_buggy_step() {
     let mut app = App::headless_for_test();

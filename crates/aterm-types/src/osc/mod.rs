@@ -4,9 +4,6 @@
 
 //! OSC protocol types: notifications, remote host, taskbar progress and the
 //! shell-integration version report.
-//!
-//! Extracted from `aterm-core::terminal::types::osc` to break circular
-//! dependencies (Part of #5663, #2341).
 
 mod iterm2;
 mod notifications;

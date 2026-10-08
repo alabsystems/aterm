@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// VT conformance, batch 4 — behavioral depth: the alt-screen mode trio
-// (47/1047/1049), DECCOLM gating + DECNCSM, DECSCNM reverse video, left/right
-// margins (DECLRMM/DECSLRM), tab ops (CHT/CBT/TBC), charset shifts (SO/SI/SS2),
+// VT conformance: the alt-screen mode trio (47/1047/1049), DECCOLM
+// gating + DECNCSM, DECSCNM reverse video, left/right margins
+// (DECLRMM/DECSLRM), tab ops (CHT/CBT/TBC), charset shifts (SO/SI/SS2),
 // DECALN, DECDWL/DECSWL, DECSC charset save, REP, and DECSCA selective erase.
 //
 // Every expectation is spec-correct xterm/VT510 behavior with the source cited
-// inline. The engine bugs this batch originally flushed out (47/1047 cursor
-// sharing, alt-buffer persistence, DECSCA text read-back) are fixed; all pass.
+// inline.
 
 use aterm_conformance::{Screen, run};
 use aterm_core::terminal::Terminal;
@@ -270,8 +269,8 @@ fn cht_forward_and_cbt_backward_tab_stops() {
     assert_eq!(s.cursor(), (0, 8), "CBT moves back one tab stop");
 }
 
-/// CBT's left-margin clamp is gated on DECOM, and this pins it THROUGH THE
-/// ESCAPE SEQUENCE.
+/// CBT's left-margin clamp is gated on DECOM, pinned through the escape
+/// sequence.
 ///
 /// xterm `tabs.c` `TabToPrevStop` clamps the landing column to the left margin
 /// only when the ORIGIN flag is set:
@@ -285,20 +284,13 @@ fn cht_forward_and_cbt_backward_tab_stops() {
 /// set_cur_col(screen, next_column);
 /// ```
 ///
-/// Note this is NOT `CursorBack`'s rule: `cursor.c` clamps CUB to the left
-/// margin unconditionally. xterm treats the two differently, and aterm used to
-/// apply the CUB rule to both.
-///
-/// The Grid-level tests for this call `back_tab_margin` directly, so they
-/// cannot see whether the handler passes the mode at all — a review found that
-/// replacing `self.modes.origin_mode` with `false` left every other test in the
-/// tree green. Both arms below run the real `CSI Z`, and the DECOM-set arm is
-/// the one that dies under that mutation. (Swapping the two mode arguments is
-/// not observable: the clamp's gate is their conjunction.)
+/// Unlike `CursorBack`, which `cursor.c` clamps to the left margin
+/// unconditionally. Both arms run the real `CSI Z`, so the handler's passing of
+/// the mode is covered, not just `back_tab_margin`.
 #[test]
 fn cbt_stops_at_the_left_margin_only_under_decom() {
     // Margins at 1-based 11..31, i.e. 0-based 10..30. Default tab stops are
-    // every 8, so the nearest stop left of column 12 is column 8 — OUTSIDE the
+    // every 8, so the nearest stop left of column 12 is column 8 — outside the
     // left margin, which is what makes the two arms differ.
     let armed = b"\x1b[?69h\x1b[11;31s";
 
@@ -358,17 +350,16 @@ fn so_si_locking_shift_g1_line_drawing() {
 #[test]
 fn ss2_single_shifts_exactly_one_char_from_g2() {
     // ESC * 0 designates DEC line drawing into G2; SS2 (ESC N) shifts G2 into
-    // GL for the NEXT CHARACTER ONLY (xterm ctlseqs / ECMA-35 single shift),
+    // GL for the next character only (xterm ctlseqs / ECMA-35 single shift),
     // so the first 'q' is U+2500 and the second is plain ASCII 'q'.
     let s = run(b"\x1b*0\x1bNqq");
     assert_eq!(s.row(0), "\u{2500}q");
 }
 
-/// SO + DECSTBM + truecolor on the same cells (REARCH B-5): a region scroll
-/// moves the shifted glyphs with their colour, leaves rows outside the region
-/// alone, and leaves the locking shift in force for new output. The two
-/// controls make each half non-vacuous: without SO the moved row reads `qqq`,
-/// and with SI before the scroll the new output reads `qq`.
+/// SO + DECSTBM + truecolor on the same cells: a region scroll moves the
+/// shifted glyphs with their colour, leaves rows outside the region alone, and
+/// keeps the locking shift in force for new output. Controls: without SO the
+/// moved row reads `qqq`; with SI before the scroll the new output reads `qq`.
 #[test]
 fn so_shift_and_truecolor_survive_a_scroll_region_scroll() {
     const FG: [u8; 3] = [10, 200, 30];
@@ -466,12 +457,7 @@ fn ed2_erases_complete_lines_so_a_decdwl_row_comes_back_single_width() {
     // character attributes cleared." xterm's ED 2 (`do_erase_display` case 2 ->
     // `ClearScreen` -> `ClearBufRows(0, max_row)`) carries the same rule in its
     // own comment: "clearing the whole row resets the doublesize characters".
-    //
-    // Until this landed, one stray `ESC#6` in the byte stream — a banner tool, a
-    // `cat` of a binary, vttest — poisoned a screen row that `clear` could not
-    // undo. Measured on glass at 40x200 with a 9x17 cell: ten characters drew
-    // 180 inked device columns after the trigger against 90 before, with
-    // byte-identical grid text, and half the row's 200 columns unreachable.
+    // So a stray `ESC#6` cannot leave a row double-width after `clear`.
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1b[1;1H\x1b#6"); // DECDWL poisons row 0
     s.feed(b"\x1b[2J\x1b[H"); // ED 2 + home — the `clear` a user reaches for
@@ -519,7 +505,7 @@ fn el2_leaves_a_decdwl_row_double_because_xterm_does() {
 fn decsc_decrc_saves_and_restores_charset() {
     // xterm ctlseqs: DECSC saves the character sets (G0..G3) and shift state;
     // DECRC restores them. So: G0=line-drawing, DECSC, G0=ASCII writes 'q',
-    // DECRC restores G0=line-drawing AND the cursor, so 'q' overwrites as U+2500.
+    // DECRC restores G0=line-drawing and the cursor, so 'q' overwrites as U+2500.
     let s = run(b"\x1b(0\x1b7\x1b(Bq\x1b8q");
     assert_eq!(s.row(0), "\u{2500}");
     assert_eq!(s.cursor(), (0, 1));
@@ -549,9 +535,9 @@ fn decsca_protects_from_decsed_but_not_from_ed() {
     // protection off for later writes (VT510 DECSCA)
     s.feed(b"ab\x1b[1\"qCD\x1b[0\"q");
     s.feed(b"\x1b[?2J");
-    // VT510 DECSED 2: erases only cells NOT protected by DECSCA
+    // VT510 DECSED 2: erases only cells not protected by DECSCA
     assert_eq!(s.row(0), "  CD", "DECSED erases unprotected cells only");
     s.feed(b"\x1b[2J");
-    // VT510/xterm: ED is NOT selective — it erases regardless of DECSCA
+    // VT510/xterm: ED is not selective — it erases regardless of DECSCA
     assert_eq!(s.screen(), "", "plain ED erases protected cells too");
 }

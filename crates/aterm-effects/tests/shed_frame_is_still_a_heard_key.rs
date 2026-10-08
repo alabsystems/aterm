@@ -1,24 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A SHED FRAME IS STILL A HEARD KEY** (2026-09-22).
+//! A shed frame is still a heard key.
 //!
-//! `GlowConfig::intensity` used to be one scalar carrying three unrelated
-//! meanings — the user's brightness knob, the accessibility policy, and the
-//! host's performance headroom — and the AUDIO seam read it. So when the
-//! adaptive load-shed latch faded its envelope to 0, or macOS `Reduce Motion`
-//! zeroed the motion amplitude, `CursorGlow::tick` took its zero-amplitude
-//! return, set `sound_live = false`, and `cue_keystroke_shifted` refused every
-//! key on its first line. Typing went silent for a MOTION and a PERFORMANCE
-//! policy, over a click that costs no GPU — measured live on the owner's Mac
-//! as `motion_stage=reduced shed=0.00 intensity=0.00` while `aterm ctl tone`
-//! in the same breath printed `audio=live sounds=on volume=0.40`.
-//!
-//! The scalar is split: `intensity` keeps the VISUAL amplitude and
-//! [`GlowConfig::audible`] carries the one fact the engine cannot see — whose
-//! window the key landed in. These tests pin the new law and the hard part of
-//! it: the click's timbre inputs must stay FRESH on the silent-visual path,
-//! or the fix trades silence for a wrong sound.
+//! `GlowConfig::intensity` is the visual amplitude only (user brightness,
+//! accessibility and load-shed); [`GlowConfig::audible`] carries whether the
+//! key landed in the focused window. So a load-shed or Reduce Motion frame at
+//! zero amplitude still clicks. These tests pin that law and its hard part: the
+//! click's timbre inputs stay fresh on the silent-visual path.
 
 use aterm_core::render::GlowQuad;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
@@ -103,20 +92,16 @@ impl Rig {
     }
 }
 
-/// D1 AND D2 AND THE FOCUS RULING, in one file with its own negative controls.
-///
-/// A frame the host shed for performance, and a `Reduce Motion` frame, both
-/// arrive at the engine's zero-amplitude return with `audible = true` — so the
-/// key seam stays OPEN and the click sounds. An UNFOCUSED window arrives with
-/// `audible = false` and stays mute. And the master switch is not overridable:
-/// `enabled = false` with `audible = true` is still silent, because that
-/// branch runs a full thermal teardown and is the user's own off knob.
+/// A shed frame and a Reduce Motion frame both reach the zero-amplitude return
+/// with `audible = true`, so the key seam stays open and the click sounds. An
+/// unfocused window (`audible = false`) stays mute, and `enabled = false` is
+/// silent regardless (the user's own off knob, with a full thermal teardown).
 #[test]
 fn a_shed_frame_keeps_the_key_seam_open() {
     let base = cfg(GlowStyle::RainbowKitty);
     let t0 = Instant::now();
 
-    // SHED / REDUCE MOTION: dark, focused ⇒ heard.
+    // Shed / Reduce Motion: dark, focused ⇒ heard.
     let mut r = Rig::new();
     r.tick(t0, &base);
     let t1 = t0 + Duration::from_millis(16);
@@ -134,7 +119,7 @@ fn a_shed_frame_keeps_the_key_seam_open() {
         "the host must be able to pop that cue on the same call"
     );
 
-    // NEGATIVE CONTROL 1 — the same dark tick, unfocused.
+    // Negative control 1: the same dark tick, unfocused.
     let mut r = Rig::new();
     r.tick(t0, &base);
     r.tick(t1, &dark(&base, false));
@@ -147,7 +132,7 @@ fn a_shed_frame_keeps_the_key_seam_open() {
         "an unfocused window must not chirp"
     );
 
-    // NEGATIVE CONTROL 2 — the master switch is not overridable by `audible`.
+    // Negative control 2: the master switch is not overridable by `audible`.
     let mut r = Rig::new();
     r.tick(t0, &base);
     let off = GlowConfig {
@@ -163,16 +148,10 @@ fn a_shed_frame_keeps_the_key_seam_open() {
     assert!(!r.glow.cue_keystroke_kind(t1, SoundKind::Typed));
 }
 
-/// DECISION F — the hard part. `keyed_blaze` reads `heat_gain_live` /
-/// `heat_tau_live`, snapshotted from the config. They used to be written in
-/// lockstep with `sound_live = true` on the LIT path only, so a click minted
-/// during a shed run would have read whatever the last DRAWING tick left —
-/// the wrong style's constants after a switch, or a `Default` zero.
-///
-/// They are now written at the end of the lazy thermal decay, above the
-/// zero-amplitude return, so a silent-visual tick refreshes them. Fire's
-/// constants differ from Lumen's by a factor of ~3.5 on gain, so a stale
-/// snapshot is loudly visible in the cue's heat.
+/// `keyed_blaze` reads `heat_gain_live` / `heat_tau_live`, snapshotted from
+/// the config at the end of the lazy thermal decay (above the zero-amplitude
+/// return), so a silent-visual tick refreshes them. Fire's gain is about 3.5x
+/// Lumen's, so a stale snapshot shows in the cue's heat.
 #[test]
 fn the_silent_visual_click_reads_this_tick_s_thermal_constants() {
     let t0 = Instant::now();
@@ -181,10 +160,9 @@ fn the_silent_visual_click_reads_this_tick_s_thermal_constants() {
 
     let t1 = t0 + Duration::from_millis(16);
 
-    // The blaze a key earns is `heat_cadence(gap) * heat_gain_live`, and the
-    // FIRST key of a session earns no cadence at all (there is no previous
-    // key to measure a gap against). So every arm cues one key to start the
-    // cadence clock, then reads the SECOND key's blaze 16 ms later.
+    // A key's blaze is `heat_cadence(gap) * heat_gain_live`, and the first key
+    // earns no cadence, so each arm cues one key and reads the second key's
+    // blaze 16 ms later.
     let probe = |first: &GlowConfig, second: &GlowConfig| -> f32 {
         let mut r = Rig::new();
         r.tick(t0, first);
@@ -228,10 +206,8 @@ fn the_silent_visual_click_reads_this_tick_s_thermal_constants() {
     );
 }
 
-/// THE LIT PATH IS UNCHANGED by the hoist. `heat_gain`/`heat_tau` are pure
-/// functions of the config and nothing between the old store site and the new
-/// one reads either field, so a scripted lit sequence must produce the exact
-/// same cue stream. Argued in the design; checked here.
+/// The lit path's cue stream is unchanged: `heat_gain`/`heat_tau` are pure
+/// functions of the config.
 #[test]
 fn the_lit_path_is_byte_identical_after_the_hoist() {
     let t0 = Instant::now();
@@ -257,15 +233,12 @@ fn the_lit_path_is_byte_identical_after_the_hoist() {
     }
 }
 
-/// THE KEY-CREDIT LEDGER SURVIVES A SHED FRAME. `cue_move_sound` spends a
-/// key-born credit so the echo of a key stays silent (one character, one
-/// click). While shed, the credit is banked at the key and no echo can spend
-/// it — the spawn path is unreachable. The latch FLAPS (the owner's machine
-/// measured 41 transitions), so those echoes arrive after the light returns
-/// and must still find their credits. Wiping the ledger per dark frame would
-/// double-click the whole boundary burst.
+/// The key-credit ledger survives a shed frame. `cue_move_sound` spends a
+/// key-born credit so a key's echo stays silent (one character, one click).
+/// While shed the credit is banked and no echo can spend it; the latch flaps,
+/// so echoes arriving after the light returns must still find their credits.
 ///
-/// The unfocused case keeps today's wipe, which is the negative control.
+/// The unfocused case wipes the ledger (negative control).
 #[test]
 fn a_shed_tick_keeps_the_keyed_click_ledger() {
     // Water: an ordinary echo-spawning style, the one the existing
@@ -291,8 +264,8 @@ fn a_shed_tick_keeps_the_keyed_click_ledger() {
         "the banked credit must mute the echo of the key it stood for"
     );
 
-    // NEGATIVE CONTROL — unfocused: no credit is banked (and no click), so
-    // the same echo clicks exactly once on refocus.
+    // Negative control, unfocused: no credit is banked (and no click), so the
+    // same echo clicks exactly once on refocus.
     let mut r = Rig::new();
     r.tick(t0, &base);
     r.tick_at(t1, &dark(&base, false), 0);
@@ -305,24 +278,16 @@ fn a_shed_tick_keeps_the_keyed_click_ledger() {
         "with no credit banked the echo must click once"
     );
 
-    // THE BOUND ON SWALLOWED KEYS, pinned rather than incidental, AND its
-    // lit-path control.
+    // The bound on swallowed keys, with its lit-path control.
     //
-    // Type a burst into something that never echoes (a password prompt, a TUI
-    // that eats input): every key banks a credit, none is spent, and a later
-    // PROGRAM-driven move can then spend one and arrive silent. The ledger is
-    // capped at `MAX_KEYED_CLICKS` (8) and self-clears at `KEYED_CLICK_FRESH`
-    // (0.75 s), so the hole is bounded at 8 echoes inside 0.75 s of the last
-    // key.
+    // A burst typed into something that never echoes (a password prompt)
+    // banks credits, so a later program-driven move can arrive silent. The
+    // ledger is capped at `MAX_KEYED_CLICKS` (8) and self-clears at
+    // `KEYED_CLICK_FRESH` (0.75 s), bounding the hole.
     //
-    // The second arm is the reason this is a BOUND and not a regression: the
-    // lit path banks exactly the same way. `clear_keyed_clicks` has two
-    // callers in the whole engine — `clear_sound_ledger` and
-    // `begin_style_fade` — so no per-tick wipe has ever run on a DRAWING
-    // frame. Keeping the credits across a shed frame makes the dark path
-    // behave like the lit one; it does not open anything the lit path had
-    // closed. (Wiping per dark tick instead would double-click the whole
-    // burst the moment the shed latch flapped back.)
+    // The lit path banks the same way (`clear_keyed_clicks` is called only by
+    // `clear_sound_ledger` and `begin_style_fade`), so keeping credits across
+    // a shed frame matches the lit path.
     let mut banked = [0usize; 2];
     for (i, lit) in [false, true].into_iter().enumerate() {
         let mut r = Rig::new();
@@ -348,10 +313,8 @@ fn a_shed_tick_keeps_the_keyed_click_ledger() {
         }
         banked[i] = silent;
     }
-    // NOTE the count is "moves that arrived silent", not the ledger's depth:
-    // a program move with no fresh key is also declined by the LICENCE gate,
-    // which is silent for its own reason. That is fine — the claim under test
-    // is the EQUALITY, which is insensitive to it.
+    // The count is moves that arrived silent, not ledger depth: the licence
+    // gate also declines a keyless program move. The claim is the equality.
     assert_eq!(
         banked[0], banked[1],
         "the shed path must bank exactly what the LIT path banks — the bound \
@@ -360,10 +323,9 @@ fn a_shed_tick_keeps_the_keyed_click_ledger() {
     );
 }
 
-/// THE MASTER-OFF TICK STILL WIPES THE SOUND LEDGER, and so does `reset`.
-/// `clear_sound_ledger` was split out of `clear_transient_state` so the
-/// zero-amplitude return could call it CONDITIONALLY; this is the guard
-/// against that refactor quietly removing a wipe someone depended on.
+/// The master-off tick and `reset` still wipe the sound ledger
+/// (`clear_sound_ledger` is called conditionally by the zero-amplitude
+/// return).
 #[test]
 fn a_master_off_tick_still_wipes_the_sound_ledger() {
     let base = cfg(GlowStyle::Water);
@@ -405,12 +367,9 @@ fn a_master_off_tick_still_wipes_the_sound_ledger() {
     }
 }
 
-/// IDLE-ZERO HOLDS while the audio seam is open. Opening the seam must not
-/// leak a wake: `self.heat` is charged only on the spawn path, which is
-/// unreachable while dark, so the thermal integrators still cool to EXACTLY
-/// zero over the lazy decay and `is_active()` disarms. (Charging `heat` at
-/// key time instead would arm `ember_live()` and keep the frame train awake
-/// forever on every shed keystroke.)
+/// Idle-zero holds while the audio seam is open: `self.heat` is charged only
+/// on the spawn path, unreachable while dark, so the thermal integrators cool
+/// to exactly zero and `is_active()` disarms.
 #[test]
 fn idle_zero_holds_while_the_audio_seam_is_open() {
     let base = cfg(GlowStyle::RainbowKitty);
@@ -432,10 +391,9 @@ fn idle_zero_holds_while_the_audio_seam_is_open() {
     );
 }
 
-/// NO BACKLOG TRAP. `cue_keystroke_shifted` refuses once the cue queue is
-/// full, so a queue that grew while dark would re-silence typing through the
-/// back door. It cannot grow: the host pops its own cue on the same call.
-/// This turns that argument into a check.
+/// No backlog trap: `cue_keystroke_shifted` refuses when the cue queue is
+/// full, and the host pops its own cue on the same call, so the queue cannot
+/// grow while dark.
 #[test]
 fn a_dark_audible_run_never_fills_the_cue_backlog() {
     let base = cfg(GlowStyle::RainbowKitty);

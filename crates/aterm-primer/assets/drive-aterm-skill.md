@@ -11,7 +11,7 @@ description: Drive, observe, and screenshot another aterm terminal session (anot
 
 ## There is NO MCP server — use the CLI or the library API
 
-aterm ships **no MCP server**, deliberately. Do not look for one, do not add one. Two
+aterm ships **no MCP server**, deliberately — there is none to find or wrap. Two
 supported paths:
 
 1. **The CLI** — `aterm ctl`, `aterm drive`, `aterm fleet` (also the argv0 aliases
@@ -19,8 +19,9 @@ supported paths:
 2. **The library API** — `aterm-agent`'s `CtlClient`/`RelayClient`/`Turn`/`SelfGovernor`
    (all four live in that one crate), for embedding rather than shelling out.
 
-**The verb table is generated at build time — run `aterm ctl --help` for the authoritative
-verb list and never guess a verb.** This file carries only the idioms `--help` does not.
+**The verb table is generated at build time — `aterm ctl --help` is the authoritative verb
+list, and a guessed verb answers `ERR unknown verb`.** This file carries only the idioms
+`--help` does not.
 
 ## Reading the catalog cheaply
 
@@ -32,7 +33,7 @@ aterm help introspection    # the same full catalog anywhere, no live instance n
 ```
 
 `help <junk>` is `ERR unknown verb` and a stray flag is an `ERR` — never a silent full
-catalog. Load one entry when you need it; do not load all of them to find `text`.
+catalog. One entry is the cheap read; `--full` loads all of them.
 
 ## When to use this
 
@@ -44,10 +45,11 @@ catalog. Load one entry when you need it; do not load all of them to find `text`
 
 Not for one-shot non-interactive commands — use Bash for those.
 
-## Before you type into a peer (the house rule)
+## Before you type into a peer (what to know)
 
-The other tabs on this machine are often other agents mid-task. Before any `turn`, `send`,
-`key`, or `paste` into a peer:
+The other tabs on this machine are often other agents mid-task, and text typed into an
+agent's prompt reaches it as its human's words. Three reads say what is there, for any
+`turn`, `send`, `key`, or `paste` into a peer:
 
 1. `aterm ctl "@$SID" status` — `detail=` names what it is running while a
    shell-integration block executes: the program reduced to its basename, plus an
@@ -66,24 +68,26 @@ The other tabs on this machine are often other agents mid-task. Before any `turn
    `detail=` is dark, `agent=` is the server's verdict on an agent's screen (`prompt`,
    `question`, `wall:<kind>`, …), and `supervisor=` other than `-` means a supervisor —
    `aterm-harness@<pid>` is the window's own, on by default and fully automatic for every
-   Claude Code and Codex session — is already answering its prompts: leave its boxes to it and the
-   human.
+   Claude Code and Codex session — is already answering its prompts, so a box there is
+   being answered.
    `input=` is whether it is READING its input (macOS; `-` elsewhere): `stalled` or
-   `stopped` is a frozen or stopped program whose screen still looks live. A key into a
-   program that left input unread is refused `ERR busy input-unread … (<why>; <what to
-   do>)` and nothing is written: back off, and never retry it in a loop. Its `signal …`
-   remedies act on the peer's program: leave them to its owner unless the human told you
-   to.
+   `stopped` is a frozen or stopped program whose screen still looks live. A key written
+   behind input a program has left unread for a second still lands, and its OK says so
+   (`warn=input-unread input_bytes=<n> input_wait_ms=<ms>`): it is slow, so read the
+   screen before the next key. A key into a `stalled` or `stopped` program is refused
+   `ERR busy input-unread … (<why>; <what to do>)` and nothing is written; a retry gets
+   the same answer until the program reads its input. Its `signal …` remedies act on the
+   peer's program, which is its owner's work.
 2. `aterm ctl "@$SID" meta` — `role=` is whatever its owner stamped (`-` = unset).
-3. **Never type into another agent's prompt unless the human named the session AND the
-   message.** Reading (`text`, `image`, `status`, `blocks`) is always fine.
+3. **What you type into another agent's prompt is its next instruction**, arriving as if
+   from its human. Reading (`text`, `image`, `status`, `blocks`) changes nothing.
 
 Stamp yourself on arrival so peers can tell the same about you:
 `aterm ctl @self meta set role agent:<your-name>`.
 
 ## Flags and environment
 
-No environment variable changes what aterm does: the launch choices are FLAGS.
+The launch choices are FLAGS; no environment variable selects one.
 
 | Spelling | On | Meaning |
 |---|---|---|
@@ -182,8 +186,8 @@ aterm-ctl: found 2 control sockets in ~/Library/Application Support/aterm but co
 - **Exit 2** — could not LOOK or could not REACH: sockets were found but none answered (a
   sandbox refusing `connect()`, stale sockets of exited pids, an unreadable or rejected
   token — each named with its cause, plus one hint for the dominant one), or the directory
-  is missing, unreadable, or unresolvable (`$HOME` and `$XDG_RUNTIME_DIR` unset). Act on the
-  reason; do not conclude there is nothing to drive.
+  is missing, unreadable, or unresolvable (`$HOME` and `$XDG_RUNTIME_DIR` unset). The
+  reason is the answer; exit 2 never means there is nothing to drive.
 - **Exit 124** — every found socket timed out.
 
 When `$XDG_RUNTIME_DIR` is set, `~/Library/Application Support/aterm` is NOT consulted, and
@@ -255,15 +259,20 @@ aterm ctl "@$SID" blocks        # shell-integration command blocks; the executin
   `tail=0` are refused, not silently treated as `text`. `blocktext <id> trim` and
   `temporal <tick> trim` take the `trim` modifier too.
 - `screen` is always JSON and budgets ~213 bytes per cell — **~400 KB on a 24×80 grid**.
-  Reach for `text trim` unless you genuinely need attributes.
+  Reach for `text trim` unless you genuinely need attributes. Polling it? Every frame ends
+  with `"etag":"<16 hex>"`, and `screen since=<etag>` answers
+  `{"unchanged":true,"seq":<n>,"gen":"<epoch>.<seq>","etag":"<etag>"}` — tens of bytes, no
+  grid read — until anything the frame shows changes (output, a resize, a scroll, a
+  selection, a config reload's colours); then it is the full frame, carrying the next etag.
 - On a bottom-pinned TUI `trim` buys nothing: Claude Code pins its composer to the LAST
-  row, so `text trim` trims 0 rows and every look costs the whole 63-row grid, ~5 KB
-  (measured: 1,518 reads moved 8.1 MB for the last ~20 rows each time) — `text tail=20
-  trim` is the cheap read there. Let `await gone` / `await seq` decide WHEN to read, and
+  row, so `text trim` trims 0 rows and every look costs the whole grid (~5 KB at 63
+  rows) — `text tail=20 trim` is the cheap read there. Let `await gone` / `await seq` decide WHEN to read, and
   read the prompt box only at decision points — never on a poll.
-- `search` replies `OK <n>` (or `OK <n> incomplete` when the match cap was hit or
-  scrollback was evicted mid-scan; `aterm ctl` says `results may be incomplete` on stderr),
-  then one `<row> <col> <len>` per match where **row is the ABSOLUTE scrollback row**.
+- `search` replies `OK <n>` (or `OK <n> incomplete` when history older than
+  `search_history_lines` was not searched, `OK <n> incomplete capped` at 100000 matches,
+  `OK <n> incomplete rewrapping` when a resize left only the screen; `aterm ctl` names the
+  cause on stderr), then one `<row> <col> <len>` per match where **row is the ABSOLUTE
+  scrollback row**.
 - `--json` goes *after* the verb. The verbs that honor it are named in the protocol header of
   `aterm ctl help --full`, which is GENERATED from the server's own allowlist — read it rather
   than a copy.
@@ -295,13 +304,16 @@ aterm ctl "@$SID" image --bytes                # OK 1 + "<w> <h> <nbytes> <base6
 ## Detect a render desync in a peer
 
 A full-screen app (Claude Code, vim, htop) draws DIFFS onto the screen it believes is
-there. A resize on the alternate screen can move that screen under it: the shrink
-demotes the top row (the alt screen keeps no history) and the grow back appends a blank
-one, so a net-zero flap (64 -> 63 -> 64 rows) shifts everything up one row. An app that
+there. A resize on the alternate screen can move that screen under it: the alternate
+screen keeps no history, so the shrink drops its top row and the grow back appends a
+blank one, and a net-zero flap (64 -> 63 -> 64 rows) shifts everything up one row. A flap
+nothing was written across is undone by the engine (it keeps the row the shrink took and
+hands it back); one output split between the halves can still shift the screen, which
+aterm repairs for Claude Code by default (below, `[render] repaint_nudge`). An app that
 repaints only when its SIGWINCH handler reads a CHANGED size (Node's does) misses a flap
-whose two halves both land before the handler runs, and every later frame is drawn one
-row off: text on the wrong rows, a rule drawn over, a blank bottom row. All three reads
-are Read-class, so they are safe against a tab a human is using:
+whose two halves both land before the handler runs, and every later frame is drawn one row
+off: text on the wrong rows, a rule drawn over, a blank bottom row. All three reads are
+Read-class, so they are safe against a tab a human is using:
 
 ```sh
 aterm ctl "@$SID" status | tr ' ' '\n' | grep -E '^(render|resizes|flaps)='  # 1. the cheap check
@@ -309,15 +321,20 @@ aterm ctl "@$SID" resizes 20    # 2. the ledger: what each resize moved, and who
 aterm ctl "@$SID" cast drift    # 3. the proof: the recording replayed with and without each suspect run
 ```
 
-1. `status` carries `render=<ok|displaced|desync-risk|unverified|->`. `displaced`: a
-   resize moved alt-screen content the app has not drawn over yet (or drew over under 1 s
-   ago). `desync-risk`: after a NET-ZERO flap the app drew over the moved content (judged
+1. `status` carries `render=<ok|displaced|desync-risk|unverified|unjudged|->`. `displaced`: a
+   resize moved alt-screen content and the engine still owes the rows (a full clear or screen
+   switch, an undo, or the size coming back and being judged, ends it). `desync-risk`: after a NET-ZERO flap the app drew over the moved content (judged
    1 s after the resize) and no full clear or screen switch has repainted it since. It is
    a risk, not a proof: an app that repaints every row without clearing keeps it set.
    `unverified`: the app drew over rows a resize that CHANGED the size moved, and no
    clear followed — its repaint or a diff on shifted rows, which the counters cannot tell
-   apart; run `cast drift`. `-`: the engine was busy; ask again. `resizes=`/`flaps=` are
-   lifetime counts.
+   apart; run `cast drift`. `unjudged`: the ENGINE owes rows (a flap left the screen one
+   row up, whatever the program drew since or did not) with the size back and a second
+   passed, but the program has not shown that it clears its screen when resized, so a miss
+   cannot be told from a repaint without a clear; `resizes` prints the `epoch` line.
+   Claude Code (and a session a full clear healed within a second of a resize) reads
+   `desync-risk` there instead. `-`: the engine was busy; ask again. `resizes=`/`flaps=`
+   are lifetime counts.
 2. `resizes [<n>] [since=<id>]` answers `resize` rows (`from=`/`to=` as `<cols>x<rows>`,
    `demoted=`/`appended=`, `shift=` negative = content moved UP, `site=` the entry point
    that asked — `input` (a ctl `resize`), `window`, `chrome` (a strip, band or presence
@@ -330,12 +347,23 @@ aterm ctl "@$SID" cast drift    # 3. the proof: the recording replayed with and 
    selects. `net=zero displaced=-1 verdict=desync-risk` is the incident's shape (a flap
    with output between its halves, a mode set or a spinner frame, so the grow appended:
    `appended=1 restored=0`; one with none is undone by the engine: `restored=1`, the row
-   goes back to the shrink's run, `displaced=+0`, `verdict=none`, `render=ok`, even when
-   the 250 ms gap split the halves); `verdict=healed` means a later ESC[2J or alt-screen
-   switch repainted it; `unverified` is a size change the app drew over afterwards with
-   no clear (a repaint, or not). A flap whose halves are over 250 ms apart with a draw
-   between is two runs, each `net=changed`, never a risk: `cast drift` decides it,
-   however far apart the halves were.
+   goes back to the shrink's run, which reads `displaced=+0`, `verdict=none` and
+   `render=ok` even when the 250 ms gap split the halves); `verdict=healed` means a
+   later ESC[2J or alt-screen switch repainted it; `unverified` is a size change the app
+   drew over afterwards with no clear (a repaint, or not). A flap whose halves the app
+   drew between, or more than 250 ms split, is two runs, each `net=changed`, never a
+   risk for the run judge: `cast drift` decides it, however far apart the halves were —
+   but the ENGINE's debt is judged apart from run shape: an `epoch <e> ... shift=-1
+   drew=<0|1> class=<agent|learned|unknown> verdict=<...>` row says how many rows the
+   engine owes the program, and reads `desync-risk` once the size is back and a second has
+   passed (for Claude Code) whether or not the program drew in between. `verdict=restored
+   by=undo` is the engine handing the rows back; `healed by=app` a repaint; `healed
+   by=nudge` aterm's own repair (`[render] repaint_nudge`): for a Claude Code tab at
+   `desync-risk` it holds the PTY one row short, waits for the program's repaint, restores
+   the size and waits again, without a key and without resizing the engine (the header
+   shows `nudge=<idle|armed|short|restoring> nudged=<n>`, and `resizes total=` does not
+   move). It never runs under a halt, a lease, a person's key or a selection, so a peer
+   you drive is left alone; `repaint_nudge = "log"` only writes `would-nudge` lines.
    `t=` is milliseconds on the `timeline` clock, not the cast's seconds. `aterm ctl`
    prints its `OK` header on stderr. A watcher sees the same as it happens on `subscribe
    "@$SID" events` (`EVENT <n> resize …`, `EVENT <n> render desync-risk …`), and
@@ -365,12 +393,21 @@ predates the terminal's resize undo, so a flap with nothing between its halves s
 its screen too: the client replays without the undo, and the header says `undo=off`.
 Offline, from a saved recording: `aterm ctl cast drift --file <cast.txt> [--screen
 <text.txt>] [--until <t>] [seed=alt]` (the undo is dropped only when that alone
-reproduces the `--screen`); a recording that starts mid-app (no alt-screen toggle in
+reproduces the `--screen`, and never for a recording whose header carries
+`aterm_resize_undo`: that engine kept the undo, so a fidelity failure is `unfaithful`,
+not an older aterm); a recording that starts mid-app (no alt-screen toggle in
 it) needs `seed=alt`, unless a `--screen` lets the fidelity check pick the seed: without
 either, when the two seeds disagree the answer is `verdict=unknown seed=ambiguous`.
 
-The reads change nothing. A desync ends at the app's next full repaint; do not resize,
-key or signal a human's tab to force one: report what the reads say.
+The reads change nothing. A desync ends at the app's next full repaint; a resize, key or
+signal that forces one acts on a human's tab, and the reads already say what happened.
+By default (`[render] repaint_nudge = "on"`) aterm repairs a displaced Claude Code tab
+itself, once per epoch, through the program's own resize handling; `"log"` only records
+what it would have done and `"off"` does nothing (`ctl resizes` prints `nudge=`). For any
+other program a displaced screen ends at its next full repaint. If `render=` is
+`desync-risk` after about ten seconds, the reads are what to report. `unjudged`
+means aterm cannot tell: the program has not shown that it clears the screen when it is
+resized, so it matters only if the screen looks wrong.
 
 ## Act
 
@@ -380,7 +417,7 @@ aterm ctl "@$SID" key enter
 aterm ctl "@$SID" key if=Do.you.want.to.proceed 1   # GUARDED: pressed only if a visible row matches — OK seq=<n> | OK skipped seq=<n>
 aterm ctl "@$SID" send if=Do.you.want.to.proceed 1  # the same guard on a raw write
 aterm ctl "@$SID" ctrl c
-aterm ctl "@$SID" paste 'some text'  # bracketed-paste seam
+aterm ctl "@$SID" paste 'some text'  # bracketed paste
 aterm ctl "@$SID" resize 30 100      # ROWS first
 aterm ctl "@$SID" mainscreen         # a full-screen app killed from outside left its screen up: back to the shell's (OK left=1)
 aterm ctl confirm yes                # Windows: answer the close/quit an `invoke` left waiting in the window (`controls front`)
@@ -392,9 +429,8 @@ effects stay inert; use `key` when you want "a human typed this" provenance.
 
 ### Answer a prompt that can vanish: `key if=<re> <name>`
 
-A prompt can resolve between your read and your press — measured: an auto-mode rule
-answered a Claude Code permission box between a supervisor's `text` and its `key 1`, and
-the `1` landed in the composer as text. A read-then-press is two requests with a window
+A prompt can resolve between your read and your press (an auto-mode rule answers the box,
+and your `1` lands in the composer as text). A read-then-press is two requests with a window
 between them; `key [id=<key>] [if=<re>] <name>` closes it. Under ONE hold of the terminal
 lock the server tests `<re>` against the visible rows and, only if some row matches, writes
 the key — no output can land between the check and the press.
@@ -429,7 +465,7 @@ does not). For anything multi-line or byte-exact, use the stdin-payload forms
 
 ```sh
 printf 'line one\nline two\n' | aterm ctl "@$SID" send --stdin   # RAW, verbatim
-cat script.py                 | aterm ctl "@$SID" paste --stdin  # through the PASTE seam
+cat script.py                 | aterm ctl "@$SID" paste --stdin  # with paste semantics
 cat blob.bin                  | aterm ctl "@$SID" feed-bin       # RAW, no inline length
 ```
 
@@ -537,17 +573,14 @@ aterm ctl "@$SID" await block                        # OK block <seq>
 aterm ctl "@$SID" wait 30000                         # OK complete <id> exit=<code|->
 ```
 
-- **Idle-settle is NOT a completion signal for an interactive agent.** Measured against
-  Claude Code: `turn idle=3000` settled after 4.5 s while the worker was still thinking —
-  its screen sits static for 3+ s mid-turn, and its composer glyph is on screen the whole
+- **Idle-settle is NOT a completion signal for an interactive agent.** Claude Code's
+  screen sits static for 3+ s mid-turn, and its composer glyph is on screen the whole
   time, so `await match` on the prompt returns mid-turn too. The signal that holds is the
   busy footer DISAPPEARING (`esc to interrupt` in Claude Code; substitute the program's
   own). `await gone <re>` blocks until no screen row matches and replies `OK gone <seq>` or
-  `OK timeout` (exit 124). **`<re>` is ONE whitespace-free token — `esc.to.interrupt`.** The
-  request line is re-split on whitespace server-side, so `await gone 'esc to interrupt'`
-  arms the regex `esc` and silently drops `to interrupt`: any row holding `esc` (a `press
-  esc` hint, say) then pins the wait, and it never matched the footer at all (`aterm ctl`
-  prints a stderr `note:` before sending such a pattern, and still sends it — see *Act*). It is
+  `OK timeout` (exit 124). **`<re>` is ONE whitespace-free token — `esc.to.interrupt`;**
+  `await gone 'esc to interrupt'` arms the regex `esc` and drops `to interrupt`, so any row
+  holding `esc` pins the wait (see *Act*). It is
   **level-triggered**: if the text is already absent it returns at once, so issue it only
   after the footer is up (right after your `turn`/`send`, or after `text` showed it), or
   you latch on the pre-turn screen. The turn form, `turn settle=gone:esc.to.interrupt
@@ -621,7 +654,10 @@ and a read naming its session `@<n>`, which exit 75 too — and a `turn`, which 
 never asked again: its text may already have been typed, so read the screen before you send
 it again — and a `post`, which exits 75 too: it may already be queued and carried to the
 successor under its id, so re-post it only with the same `key=`, or after `outbox` shows it
-gone. Any other verb cut by an update exits 1.
+gone. Any other verb cut by an update exits 1. `dial` exits 75 too when the remote closes the
+connection before it answers (or before a stream's sessions exit): dial again — but a dialled
+`turn`, `post`, `await block`, `await consent` or bare `await seq` may already have taken
+effect, or seen its change, on the remote, so check there first, as above.
 
 Unit mismatch: the client's `--timeout` is in **SECONDS** (default 900, `0` disables);
 every server-side verb timeout is in **milliseconds**.
@@ -716,7 +752,7 @@ Semantics that matter:
 ```sh
 aterm ctl dial-list
 aterm ctl dial <name> text             # ONE verb on the remote; reply is the REMOTE's
-aterm drive --dial <name> prompt 'run the tests'
+aterm drive --socket <path> --dial <name> prompt 'run the tests'
 ```
 
 - **`dial <name>` with no verb is rejected** — a bare dial would deadlock a one-shot client.
@@ -804,10 +840,11 @@ your turn (`--final` its last message block alone), `ledger` how the whole loop 
 
 **Every Claude Code and Codex session aterm hosts is already supervised** by the window's
 own host (`supervisor=aterm-harness@<pid>` in `status`/`ls`): it answers boxes and
-questions, continues ended turns, relaunches a crashed Claude Code, holds off while a person
-types (`human_ms=`) or another driver holds the session (`hand=`), and escalates the rest to
-the menu bar (`attention`). A `watch` you start there watches only. Its limits are aterm.toml
-`[harness]` (`aterm help harness`); the `supervise-agent` skill has the rules.
+questions, continues ended turns, relaunches a crashed Claude Code or Codex where it can,
+holds off while a person types (`human_ms=`) or another driver holds the session
+(`hand=`), and escalates the rest to the menu bar (`attention`). A `watch` you start
+there watches only. Its limits are aterm.toml `[harness]` (`aterm help harness`); the
+`supervise-agent` skill has the rules.
 
 **With the fabric on, mail is the channel and the screen is the safety net.** `watch
 --mail` parks ONE `await inbox since=<id>` on YOUR session (`@self`, or `--inbox @sid`)
@@ -827,17 +864,21 @@ from before the turn was seen to begin. `task` posts `kind=task` from your sessi
 when the worker is idle, types the one-line nudge `Inbox: task @<off>` as a turn — nothing
 wakes a worker for mail; it is typed to, as you would type to it.
 
-**Never rate a session for the human.** While Claude Code's session survey (`● How is
-Claude doing this session?` over `1: Bad    2: Fine   3: Good   0: Dismiss`) is open
-above the composer, a turn whose first character is 1, 2 or 3 is taken as the human's
+**A digit can rate the session for the human.** While one of Claude Code's rating surveys (`● How is
+Claude doing this session?`, or the long-context, plugin or memory card, over `1: Bad
+2: Fine   3: Good   0: Dismiss`) is open above the composer, a turn whose first character is 1, 2 or 3 is taken as the human's
 rating. `aterm drive phase` (and `await-turn`) ends with `survey 0` while it is open:
-dismiss it with `aterm ctl "@$SID" key 'if=^●.How.is.Claude.doing' 0` — `0`, guarded on
-the survey's own row (a copy quoted in the transcript or in a tool's output matches
-nothing), quoted for zsh — before you type. `watch` prints `EVENT survey seq=<n> dismiss
-with: …` once when it appears under `[harness] dismiss_surveys = false`; otherwise
-`watch` presses the `0` itself and prints `DISMISSED survey seq=<n>` once the survey has
-gone (still open, it prints the `EVENT survey` line and presses the `0` again on a growing
-back-off, badging the session from the second miss); a monitor that filters `watch`'s lines keeps it:
+dismiss it with the command `watch` prints, `aterm ctl "@$SID" key 'if=^●.How.is.Claude.doing' 0`
+for the session survey — `0`, guarded on THAT card's own question row (a copy quoted in
+the transcript or in a tool's output matches nothing), quoted for zsh; a guard typed from
+memory names only the session survey — before you type. `watch` prints `EVENT survey
+seq=<n>[ kind=<k>] dismiss with: …` once when it appears under `[harness] dismiss_surveys
+= false`; otherwise `watch` presses the `0` itself (on a busy read too, once per
+appearance) and prints `DISMISSED survey seq=<n>[ kind=<k>]` once the survey has gone
+(still open, it prints the `EVENT survey` line and presses the `0` again on a growing
+back-off; from the second miss the host is told, and no tab is marked). A line that says `not pressed (…)`
+names no command: read the card (`aterm ctl "@$SID" text`) and decide, and never press a
+`0` on the drafted-feedback card, the transcript-share question or the web-setup offer; a monitor that filters `watch`'s lines keeps it:
 `grep --line-buffered -E '^(EVENT|APPROVED|CHOSE|DISMISSED|CONTINUED|TYPED|RESTARTED|MAIL|EXTEND|RECONNECT|WATCHING|TIMEOUT|EXIT)'`.
 
 **A worker running out of context is a decision point too.** Claude Code parks `1% until
@@ -854,13 +895,12 @@ what happens during its run only: a compaction between two runs prints nothing, 
 an `EVENT context` check `phase` before the next run — no `context <n>%` line (and no box
 up) means it compacted. Only the indicator is read: alone on its row, ending against the
 right edge above the composer; a copy quoted in the transcript does not count unless it,
-too, ends at that edge. Never type `/compact` or `/clear` into the worker for it without
-the human.
+too, ends at that edge. `/compact` or `/clear` typed into the worker rewrites or drops its
+whole context, including what its human told it.
 
 **Read what the worker said since your turn with `aterm drive report`; the screen alone
 loses what scrolled off a fullscreen app.** Claude Code runs on the alternate screen and
-repaints in place, so a row that leaves its top is gone from `text` (`lines` stays 0) —
-measured, 7 of the 35 message blocks one worker turn displayed were still on the screen.
+repaints in place, so a row that leaves its top is gone from `text` (`lines` stays 0).
 The host keeps those rows (`aterm ctl "@$SID" offscreen`), and every `turn` records where
 they stood when it began (`history`'s `arch=`); `report` joins them with the screen in one
 read, from your turn's `❯` row down to the live zone, every row verbatim. Its header
@@ -901,8 +941,8 @@ use `aterm ctl` — that path is in-process.
 2. A listing that finds nothing says WHY and exits 2; `no live aterm instances found` (exit 1)
    is printed only for a readable, empty socket dir. A sandbox refusing the socket is the
    answer, not an obstacle — nothing to configure.
-3. Peers may be agents: read `status` (`detail=`) and `meta` (`role=`) before you `turn`/`send`;
-   never type into another agent's prompt unless the human named the session and the message.
+3. Peers may be agents: `status` (`detail=`) and `meta` (`role=`) say what a session runs
+   and who stamped it; text typed into an agent's prompt is its next instruction.
 4. `turn` verdict → stderr, rows → stdout; `trim=1` adds `trimmed=<k>` to the verdict.
 5. Exit 124 = timeout, not failure-to-connect.
 6. `await seq <n> timeout 0` is the cheap "did anything change?" check — but `seq` is
@@ -910,8 +950,8 @@ use `aterm ctl` — that path is in-process.
 7. `wait`/`await block`/`blocks` are silent no-ops without OSC-133.
 8. `image` can't capture a background tab, needs a bare filename, returns a path with spaces.
 9. Inline `send` forbids newlines — use `--stdin` forms (≤256 KiB).
-10. `search` rows are absolute scrollback rows; a cut result says `aterm-ctl: results may be
-    incomplete` on stderr.
+10. `search` rows are absolute scrollback rows; a cut result names its cause on stderr
+    (`older history not searched`, `results stop at 100000 matches`, `screen only`).
 11. `screen` is ~400 KB; `text trim` is the cheap read (`text tail=<n> trim` on a bottom-pinned
     TUI). `text <anything but trim / tail= / rows= / order=>` is `ERR usage`.
 12. Client `--timeout` is seconds; server-side timeouts are milliseconds (cap 600000).
@@ -924,10 +964,7 @@ use `aterm ctl` — that path is in-process.
     regex is ONE token — a quoted space does not survive the wire (`'esc to interrupt'`
     arms `esc`, and in a `turn` TYPES `to interrupt …` as the message). `await gone` is
     level-triggered, so arm it only while the footer is up; the turn form waits for the
-    footer to appear first and falls back to idle-settle if it never does. On a
-    bottom-pinned TUI `text trim` trims nothing — read `text tail=20 trim` and let `await
-    gone`/`await seq` decide when to read. `aterm ctl` prints a stderr `note:` before
-    sending a pattern with whitespace, and still sends it.
+    footer to appear first.
 18. `key if=<re> <name>` / `send if=<re> <text>` check and press under ONE lock: `OK skipped
     seq=<n>` (exit 0) means no row matched and nothing was written — an answer, not an
     error. The guard is ONE token: `if=Do.you.want.to.proceed`.

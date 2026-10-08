@@ -3,8 +3,8 @@
 //
 // FRM-1's correctness gate: `render_row_bg` no longer emits a background fill
 // whose colour is the one the band's BASE already carries (the full path's
-// `pixels.resize(w·h, frame_bg | bg_t<<24)`, the damaged path's `fill_band_bg`
-// of exactly that value). The elision is byte-identical BY CONSTRUCTION — the
+// `pixels.resize(w·h, frame_bg | bg_t<<24)`, the damaged path's band reset
+// to exactly that value). The elision is byte-identical BY CONSTRUCTION — the
 // skipped `fill` would store the u32 already in every pixel it covers — but
 // "by construction" is only as good as the predicate, so this file pins the
 // four fixtures where a NAIVE version of that predicate breaks:
@@ -39,8 +39,9 @@ use aterm_render::{Renderer, Theme, WindowCpu, rgb_to_u32};
 const ROWS: usize = 6;
 const COLS: usize = 20;
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// A terminal whose LIVE default background is the renderer theme's — the state
@@ -85,10 +86,7 @@ fn frame(
 
 #[test]
 fn plain_frame_default_cells_carry_the_clear_colour() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = renderer();
     let mut term = themed_term();
     term.process(b"hello");
     let input = term.cell_frame(ROWS, COLS);
@@ -122,10 +120,7 @@ fn plain_frame_default_cells_carry_the_clear_colour() {
 
 #[test]
 fn sgr_background_equal_to_the_frame_default_renders_the_same_pixel() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = renderer();
     let theme_bg = Theme::default().bg;
     let mut term = themed_term();
     // Row 1 col 0: an EXPLICIT truecolor background that coincides exactly with
@@ -189,10 +184,8 @@ fn under_a_wallpaper_nothing_is_elided_against_the_theme_background() {
         selection: theme_bg,
         ..Theme::default()
     };
-    let Some(mut r) = Renderer::from_system(18.0, theme) else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, theme)
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let mut term = themed_term();
     term.process(b"selected text here");
     {
@@ -247,10 +240,7 @@ fn under_a_wallpaper_nothing_is_elided_against_the_theme_background() {
 
 #[test]
 fn background_opacity_keeps_the_transmittance_byte_on_default_cells() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = renderer();
     // Below 1.0, so `bg_transmittance()` is non-zero and the band's base is
     // `frame_bg | (bg_t << 24)`, not `frame_bg`.
     r.set_background_opacity(0.75);
@@ -279,10 +269,7 @@ fn background_opacity_keeps_the_transmittance_byte_on_default_cells() {
 
 #[test]
 fn a_partial_damage_repaint_is_byte_identical_to_a_full_repaint() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut warm = renderer();
     let theme_bg = Theme::default().bg;
     let mut term = themed_term();
     term.process(
@@ -298,12 +285,12 @@ fn a_partial_damage_repaint_is_byte_identical_to_a_full_repaint() {
     let _ = frame(&mut warm, &mut wc, &term.cell_frame(ROWS, COLS));
 
     // A one-row mutation: the damaged path re-establishes ONLY that row's band
-    // from `fill_band_bg` and then runs the elided background pass over it.
+    // (Phase A's band reset) and then runs the elided background pass over it.
     for step in 0..6u8 {
         term.process(format!("\x1b[1;1Hstep {step}").as_bytes());
         let input = term.cell_frame(ROWS, COLS);
         let damaged = frame(&mut warm, &mut wc, &input);
-        let mut fresh = renderer().expect("system font");
+        let mut fresh = renderer();
         let full = fresh.render_input(&input);
         assert_eq!(
             damaged.len(),

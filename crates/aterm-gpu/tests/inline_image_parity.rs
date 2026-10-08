@@ -8,12 +8,12 @@
 //
 // Gated: no GPU or no system font -> the test no-ops.
 
+use crate::common;
 use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, Theme};
 use std::sync::Arc;
 
-mod common;
-use common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
+use crate::common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
 
 /// Solid-colour `w`×`h` RGBA PNG.
 fn solid_rgba_png(w: u32, h: u32, rgba_pixel: [u8; 4]) -> Vec<u8> {
@@ -66,10 +66,6 @@ fn gpu_skips_glyph_under_image_like_cpu() {
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    // Deterministic parity: block on the lazy fallback parses so neither
-    // renderer compares a provisional `.notdef` frame against a real glyph.
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
@@ -86,10 +82,8 @@ fn gpu_skips_glyph_under_image_like_cpu() {
     let cpu_frame = cpu.render_input(&input);
     let gpu_frame = gpu.render_input(&mut win, &input, None);
 
-    // The 'W' foreground is near-white (37 = white). After the image covers the
-    // cell, NEITHER path may leave white glyph pixels in cell (0,0): the CPU
-    // paints the yellow image, the GPU paints the cell bg — but crucially, no
-    // white glyph survives on EITHER path (image-vs-glyph precedence).
+    // After the image covers cell (0,0), neither path leaves white glyph pixels
+    // there (image-over-glyph precedence).
     let white_glyph = |px: &[u32]| -> usize {
         px.iter()
             .filter(|&&p| rr(p) > 200 && gg(p) > 200 && bb(p) > 200)
@@ -100,9 +94,8 @@ fn gpu_skips_glyph_under_image_like_cpu() {
     assert_eq!(cpu_white, 0, "CPU must not draw the glyph under the image");
     assert_eq!(gpu_white, 0, "GPU must not draw the glyph under the image");
 
-    // Sanity: an UNCOVERED bright glyph elsewhere still renders on both paths,
-    // proving the suppression is specific to image cells, not global. Write a
-    // glyph on row 2 (clear of the image) and confirm both paths draw it.
+    // An uncovered glyph on row 2 still renders on both paths, so suppression
+    // is specific to image cells.
     let mut term2 = Terminal::new(rows as u16, cols as u16);
     term2.set_cell_pixel_size(cw as u16, ch as u16);
     term2.process(b"\x1b[2;1H\x1b[37mW");
@@ -121,18 +114,12 @@ fn gpu_skips_glyph_under_image_like_cpu() {
 
 #[test]
 fn gpu_skips_emoji_under_image_like_cpu() {
-    // image-vs-EMOJI precedence: a colour emoji covered by an image must not show
-    // its colour glyph on either path. The emoji would otherwise key to the
-    // colour atlas; the image guard must suppress it identically on CPU and GPU.
+    // An image also suppresses a colour emoji's glyph on both paths.
     let theme = Theme::default();
     let px = 18.0;
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    // Deterministic parity: block on the lazy fallback parses so neither
-    // renderer compares a provisional `.notdef` frame against a real glyph.
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
@@ -163,24 +150,13 @@ fn gpu_skips_emoji_under_image_like_cpu() {
 
 #[test]
 fn combining_mark_draws_over_negative_z_image_on_cpu_and_gpu() {
-    // A Kitty z<0 placement is explicitly BEHIND text. Use an OPAQUE tile so
-    // this catches both suppression and painter-order regressions: if either
-    // backend emits the tile after glyphs, the image erases the base and accent.
+    // A Kitty z<0 placement is behind text. An opaque tile catches both
+    // suppression and painter-order errors.
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     // Make the solid-image-background oracle exact: glyph coverage blends
     // directly over the framebuffer, without the corrected-alpha remap's
     // separate home-cell-bg operand.
@@ -196,6 +172,7 @@ fn combining_mark_draws_over_negative_z_image_on_cpu_and_gpu() {
         rows: 1,
         z_index: -1,
         band_lift_px: 0,
+        cell_offset_px: (0, 0),
         scaling: aterm_core::grid::extra::ImageScaling::Fit,
         source_rect: None,
     });
@@ -301,27 +278,14 @@ fn combining_mark_draws_over_negative_z_image_on_cpu_and_gpu() {
 
 #[test]
 fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
-    // Alpha makes ordering non-commutative. The correct result (image over cell
-    // bg/underlayers, then glyph) must match a no-image oracle whose cell bg is
-    // that exact source-over composite. A live `glow_under` deliberately forces
-    // the GPU's A1/A2/A3 additive split, guarding the A3-open gate for an
-    // under-image stream. The former buggy order (glyph, then image) cannot
-    // match this oracle on glyph pixels.
+    // With alpha, order matters: image over cell bg, then glyph, must match a
+    // no-image oracle whose cell bg is that composite. A live `glow_under`
+    // forces the GPU's additive pass split for an under-image stream.
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     cpu.set_text_blending(aterm_render::TextBlending::Linear);
     gpu.set_text_blending(aterm_render::TextBlending::Linear);
     let (cw, ch) = cpu.cell_size();
@@ -359,6 +323,7 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
         rows: 1,
         z_index: -1,
         band_lift_px: 0,
+        cell_offset_px: (0, 0),
         scaling: aterm_core::grid::extra::ImageScaling::Fit,
         source_rect: None,
     });
@@ -460,19 +425,9 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
 fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (2usize, 4usize);
     let frame_default_bg = [1, 2, 3];
@@ -506,6 +461,7 @@ fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
             rows: 1,
             z_index,
             band_lift_px: 0,
+            cell_offset_px: (0, 0),
             scaling: aterm_core::grid::extra::ImageScaling::Fit,
             source_rect: None,
         });
@@ -593,25 +549,18 @@ fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
 
 #[test]
 fn image_pixels_gpu_match_cpu() {
-    // THE inline-image pixel-pass gate: with the GPU image pass landed, an
-    // image-covered cell must paint the SAME pixels on the GPU as the CPU's
-    // `blit_image_cell` composite — within the usual 8-LSB blend tolerance the
-    // colour-emoji path also rides (float ALPHA_BLENDING vs integer `blend`).
+    // An image-covered cell paints the same pixels on the GPU as the CPU's
+    // `blit_image_cell`, within the 8-LSB blend tolerance.
     let theme = Theme::default();
     let px = 18.0;
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    // Deterministic parity: block on the lazy fallback parses so neither
-    // renderer compares a provisional `.notdef` frame against a real glyph.
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
-    // A 3x2 magenta image with a fully-transparent right column, so we exercise
-    // BOTH the opaque straight-RGBA blit AND the straight-alpha-over-bg composite
-    // (the transparent column must show the cell bg through on both paths).
+    // A 3x2 magenta image with a transparent right column: an opaque blit plus
+    // straight-alpha over bg.
     let (iw, ih) = (3u32 * cw as u32, 2u32 * ch as u32);
     let mut rgba = Vec::with_capacity((iw * ih * 4) as usize);
     for _y in 0..ih {
@@ -644,9 +593,7 @@ fn image_pixels_gpu_match_cpu() {
     let delta = max_channel_delta(&cpu_frame, &gpu_frame);
     assert!(delta <= 8, "image-pixel CPU/GPU diverge by {delta} > 8");
 
-    // Sanity: the GPU actually drew the image (the opaque magenta is present in
-    // cell (0,0), not just the bg) — otherwise a do-nothing GPU pass would also
-    // pass the delta check if the CPU were blank, which it is not.
+    // The GPU drew the opaque magenta in cell (0,0).
     let magenta = |f: &Frame, row: usize, col: usize| -> usize {
         cell_pixels(f, cw, ch, row, col)
             .iter()
@@ -665,36 +612,21 @@ fn image_pixels_gpu_match_cpu() {
 
 #[test]
 fn sixel_rawrgba8_pixels_gpu_match_cpu() {
-    // THE sixel pixel-pass gate: a DECODED sixel image — tagged
-    // `ImageFormat::RawRgba8`, the format the shipped GUI now renders — must paint
-    // the SAME pixels on the GPU as the CPU's `blit_image_cell` composite, within
-    // the usual 8-LSB blend tolerance. This mirrors `image_pixels_gpu_match_cpu`
-    // (the PNG gate) but drives a REAL sixel DCS through the Terminal so the
-    // RawRgba8 decode→place→render path is what is under test, not a PNG.
-    //
-    // Build is sixel-enabled for aterm-gpu's TEST build (Cargo.toml dev-dep
-    // re-declares aterm-core with `features = ["sixel"]`); without it the DCS would
-    // be consumed as Unknown and no image would be placed, so the sanity check
-    // below (GPU actually drew the sixel red) doubles as a "feature really on" gate.
+    // A decoded sixel (`ImageFormat::RawRgba8`) driven through the Terminal
+    // paints the same pixels on the GPU as the CPU's `blit_image_cell`, within
+    // the 8-LSB tolerance. The test build enables aterm-core's `sixel` feature;
+    // the red sanity check below also proves the feature is on.
     let theme = Theme::default();
     let px = 18.0;
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    // Deterministic parity: block on the lazy fallback parses so neither
-    // renderer compares a provisional `.notdef` frame against a real glyph.
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
-    // A sixel whose raster is `2*cw` px wide × 6 px tall (one sixel band): the LEFT
-    // `cw` columns are full opaque red (`~` = all six band rows set), the RIGHT
-    // `cw` columns are UNPAINTED (`?` = empty column) so they stay transparent.
-    // At the cw×ch cell metric the footprint is 2×1 cells: the left cell is opaque
-    // red, the right cell is fully transparent (cell bg shows through) — exactly
-    // the opaque-blit AND straight-alpha-over composite the PNG gate exercises,
-    // but via RawRgba8.
+    // A sixel raster `2*cw` px wide and 6 px tall: the left `cw` columns opaque
+    // red (`~`), the right `cw` columns unpainted (`?`). The footprint is 2x1
+    // cells: an opaque cell and a transparent one.
     let mut dcs: Vec<u8> = Vec::new();
     // raster attrs 1;1;Ph;Pv with Ph=2*cw, Pv=6; define color 1 = RGB% red; select it.
     dcs.extend_from_slice(format!("\x1bP0;0;8q\"1;1;{};6#1;2;100;0;0#1", 2 * cw).as_bytes());
@@ -741,12 +673,9 @@ fn sixel_rawrgba8_pixels_gpu_match_cpu() {
 
 #[test]
 fn image_scissored_present_byte_identical_to_full() {
-    // No-regression gate for the scissored present path WITH images: a reused
-    // renderer driven through an image frame then a single-cell change (which
-    // takes the scissored dirty-row repaint) must read back BYTE-IDENTICAL to a
-    // fresh FULL render of the same input. Images now mark their rows dirty
-    // (`row_differs` compares the per-row image list), so the scissor band always
-    // covers them — an image can never be left stale on a partial repaint.
+    // A reused renderer through an image frame then a one-cell change (the
+    // scissored path) reads back identical to a fresh full render. Images mark
+    // their rows dirty (`row_differs`), so the band covers them.
     let theme = aterm_render::Theme::default();
     let px = 18.0;
     let Some((cpu, mut gpu)) = backends(px, theme) else {
@@ -815,10 +744,6 @@ fn image_free_frame_stays_within_cpu_gpu_tolerance() {
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
-    // Deterministic parity: block on the lazy fallback parses so neither
-    // renderer compares a provisional `.notdef` frame against a real glyph.
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     let (rows, cols) = (4usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[31mhello\x1b[0m \x1b[44mworld\x1b[0m");
@@ -830,9 +755,8 @@ fn image_free_frame_stays_within_cpu_gpu_tolerance() {
     assert!(delta <= 8, "image-free CPU/GPU diverge by {delta} > 8");
 }
 
-/// KITTY-CORE pixel verification: a Kitty `a=T` RGBA image rasterizes to real
-/// pixels through the SAME CPU inline-image compositor that iTerm2/Sixel use.
-/// CPU-only (no GPU device needed); skips if no system font.
+/// A Kitty `a=T` RGBA image rasterizes to real pixels through the CPU inline
+/// image compositor. CPU-only; skips without a system font.
 #[test]
 fn kitty_rgba_image_rasterizes_to_pixels_cpu() {
     let theme = Theme::default();
@@ -877,10 +801,9 @@ fn kitty_rgba_image_rasterizes_to_pixels_cpu() {
     );
 }
 
-/// iTerm2 `preserveAspectRatio=0` STRETCHES a square picture over a 4x1-cell
-/// box on BOTH backends — the stretch lives in the one shared decode, so the
-/// GPU samples the same filled footprint the CPU blits. The default (FIT) is
-/// the control: the square is centred and the box's last column stays bare.
+/// iTerm2 `preserveAspectRatio=0` stretches a square picture over a 4x1-cell box
+/// on both backends (the stretch is in the shared decode). The default (fit) is
+/// the control: centred, last column bare.
 #[test]
 fn stretched_image_fills_its_footprint_on_cpu_and_gpu() {
     let theme = Theme::default();
@@ -931,10 +854,9 @@ fn stretched_image_fills_its_footprint_on_cpu_and_gpu() {
     }
 }
 
-/// A Kitty put with a source rectangle (`x=`/`y=`/`w=`/`h=`) shows only that
-/// part of the image, identically on both backends: the crop, like the
-/// scaling, happens in the one shared decode. The uncropped put is the
-/// control.
+/// A Kitty source rectangle (`x=`/`y=`/`w=`/`h=`) shows only that part, the same
+/// on both backends (the crop is in the shared decode). The uncropped put is
+/// the control.
 #[test]
 fn kitty_cropped_put_matches_cpu_and_gpu() {
     let theme = Theme::default();
@@ -994,5 +916,260 @@ fn kitty_cropped_put_matches_cpu_and_gpu() {
             count(frame, 2, true) > 0,
             "{name}: control: the uncropped put starts red"
         );
+    }
+}
+
+/// Transmit a one-cell Kitty image of one straight-alpha RGBA colour as image
+/// `id`, without showing it.
+fn kitty_solid_cell(term: &mut Terminal, id: u32, cw: usize, ch: usize, rgba: [u8; 4]) {
+    let raw: Vec<u8> = rgba.iter().copied().cycle().take(cw * ch * 4).collect();
+    let b64 = aterm_codec::base64::encode(&raw).expect("encode");
+    term.process(format!("\x1b_Ga=t,f=32,s={cw},v={ch},i={id},q=2;{b64}\x1b\\").as_bytes());
+}
+
+/// Overlapping Kitty images are layers drawn by z-index regardless of placement
+/// order, alike on both backends: half-transparent green at z=1 over opaque red
+/// at z=0 gives olive either way, and opaque red at z=2 over the green is pure
+/// red.
+#[test]
+fn overlapping_kitty_images_stack_by_z_on_cpu_and_gpu() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (4usize, 8usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.set_cell_pixel_size(cw as u16, ch as u16);
+    kitty_solid_cell(&mut term, 1, cw, ch, [230, 20, 20, 255]);
+    kitty_solid_cell(&mut term, 2, cw, ch, [20, 230, 20, 128]);
+    let put = |term: &mut Terminal, row: usize, id: u32, z: i32| {
+        term.process(format!("\x1b[{};1H\x1b_Ga=p,i={id},z={z},C=1,q=2\x1b\\", row + 1).as_bytes());
+    };
+    put(&mut term, 0, 1, 0);
+    put(&mut term, 0, 2, 1);
+    put(&mut term, 1, 2, 1);
+    put(&mut term, 1, 1, 2);
+    put(&mut term, 2, 2, 1);
+    put(&mut term, 2, 1, 0);
+    term.process(b"\x1b[?25l"); // no cursor over the cells compared
+    let input = term.cell_frame(rows, cols);
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(delta <= 8, "stacked images: CPU/GPU diverge by {delta} > 8");
+
+    let centre = |f: &Frame, row: usize| f.pixels[(row * ch + ch / 2) * f.width + cw / 2];
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        let (over, reversed, red) = (centre(frame, 0), centre(frame, 2), centre(frame, 1));
+        assert!(
+            rr(over) > 120 && gg(over) > 120 && bb(over) < 60,
+            "{name}: green (z=1) blends over red (z=0): {over:06x}"
+        );
+        assert_eq!(
+            over, reversed,
+            "{name}: placed the other way round, z still decides"
+        );
+        assert!(
+            rr(red) > 200 && gg(red) < 60,
+            "{name}: opaque red (z=2) covers the green: {red:06x}"
+        );
+    }
+}
+
+/// `X=`/`Y=` offset a Kitty image inside its first cell on both backends: a
+/// one-cell red raster placed half a cell in has a 2x2 footprint whose top-left
+/// strip stays background.
+#[test]
+fn kitty_put_offset_matches_cpu_and_gpu() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (4usize, 8usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.set_cell_pixel_size(cw as u16, ch as u16);
+    kitty_solid_cell(&mut term, 1, cw, ch, [230, 20, 20, 255]);
+    let (ox, oy) = (cw / 2, ch / 2);
+    term.process(format!("\x1b[1;1H\x1b_Ga=p,i=1,X={ox},Y={oy},q=2\x1b\\\x1b[?25l").as_bytes());
+    let input = term.cell_frame(rows, cols);
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(delta <= 8, "offset put: CPU/GPU diverge by {delta} > 8");
+
+    let at = |f: &Frame, x: usize, y: usize| f.pixels[y * f.width + x];
+    let red = |p: u32| rr(p) > 200 && gg(p) < 60 && bb(p) < 60;
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        assert!(!red(at(frame, 0, 0)), "{name}: the corner stays background");
+        assert!(!red(at(frame, ox - 1, oy)), "{name}: left of the offset");
+        assert!(!red(at(frame, ox, oy - 1)), "{name}: above the offset");
+        assert!(
+            red(at(frame, ox, oy)),
+            "{name}: the image starts at the offset"
+        );
+        assert!(
+            red(at(frame, cw + ox - 1, ch + oy - 1)),
+            "{name}: and runs one cell on, into the next cell and row"
+        );
+        assert!(!red(at(frame, cw + ox, oy)), "{name}: and no further");
+    }
+}
+
+/// A placement relative to a virtual placement is drawn where the parent's
+/// placeholders put it: a blue virtual placement at (1, 2) and a red placement
+/// `H=1`/`V=1` from it, red in cell (2, 3), on both backends.
+#[test]
+fn placement_relative_to_a_virtual_one_matches_cpu_and_gpu() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (4usize, 8usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.set_cell_pixel_size(cw as u16, ch as u16);
+    kitty_solid_cell(&mut term, 1, cw, ch, [20, 20, 230, 255]);
+    kitty_solid_cell(&mut term, 2, cw, ch, [230, 20, 20, 255]);
+    term.process(b"\x1b_Ga=p,U=1,i=1,p=7,q=2\x1b\\");
+    // Image 1 in the foreground, placement 7 in the underline colour, tile
+    // (0, 0) in the first two diacritics.
+    term.process("\x1b[2;3H\x1b[38;5;1m\x1b[58;5;7m\u{10EEEE}\u{0305}\u{0305}\x1b[0m".as_bytes());
+    term.process(b"\x1b_Ga=p,i=2,P=1,Q=7,H=1,V=1,q=2\x1b\\\x1b[?25l");
+    let input = term.cell_frame(rows, cols);
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "floating placement: CPU/GPU diverge by {delta} > 8"
+    );
+
+    let centre = |f: &Frame, row: usize, col: usize| {
+        f.pixels[(row * ch + ch / 2) * f.width + col * cw + cw / 2]
+    };
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        let parent = centre(frame, 1, 2);
+        assert!(
+            bb(parent) > 200 && rr(parent) < 60,
+            "{name}: the placeholder draws its virtual placement: {parent:06x}"
+        );
+        let child = centre(frame, 2, 3);
+        assert!(
+            rr(child) > 200 && bb(child) < 60,
+            "{name}: the relative placement sits one cell down and right: {child:06x}"
+        );
+    }
+}
+
+/// A stack of images taller in total than one texture still shows its top
+/// image on both backends: the GPU plane packs the layers a cell shows first
+/// and drops the deepest. Sixteen opaque 200-row images stacked in cell (0, 0):
+/// both show the sixteenth.
+#[test]
+fn a_stack_taller_than_the_image_texture_shows_its_top_on_cpu_and_gpu() {
+    use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (4usize, 8usize);
+    let colour = |layer: u8| [layer * 15, 255 - layer * 15, 40, 255];
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.set_cell_pixel_size(cw as u16, ch as u16);
+    term.process(b"\x1b[?25l");
+    let mut input = term.cell_frame(rows, cols);
+    for layer in 1..=16u8 {
+        let image = Arc::new(ImageData {
+            bytes: colour(layer).to_vec(),
+            format: ImageFormat::RawRgba8 {
+                width: 1,
+                height: 1,
+            },
+            cols: 1,
+            rows: 200,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Stretch,
+            source_rect: None,
+        });
+        input.images[0].push((
+            0,
+            ImageRef {
+                image,
+                cell_row: 0,
+                cell_col: 0,
+                kitty: None,
+            },
+        ));
+    }
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let top = colour(16);
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        let centre = frame.pixels[(ch / 2) * frame.width + cw / 2];
+        assert!(
+            (rr(centre) - i32::from(top[0])).abs() <= 8
+                && (gg(centre) - i32::from(top[1])).abs() <= 8,
+            "{name}: the top image shows: {centre:06x}"
+        );
+    }
+}
+
+/// A Kitty animation's frame advance repaints on retained renderers (same
+/// `Renderer`, `GpuRenderer` and `WindowGpu`, caches included), alike on both:
+/// red, blue, red, blue.
+#[test]
+fn a_kitty_frame_advance_repaints_on_retained_cpu_and_gpu_renderers() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (4usize, 8usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.set_cell_pixel_size(cw as u16, ch as u16);
+    let t0 = aterm_time::Instant::now();
+    let at = |ms: u64| aterm_core::terminal::ClockReading {
+        monotonic: t0 + std::time::Duration::from_millis(ms),
+        wall_ms: None,
+    };
+    let frame = |rgba: [u8; 4]| {
+        let raw: Vec<u8> = rgba.iter().copied().cycle().take(cw * ch * 4).collect();
+        aterm_codec::base64::encode(&raw).expect("encode")
+    };
+    let (red, blue) = (frame([230, 20, 20, 255]), frame([20, 20, 230, 255]));
+    for command in [
+        format!("\x1b_Ga=t,f=32,s={cw},v={ch},i=7,q=2;{red}\x1b\\"),
+        format!("\x1b_Ga=f,f=32,s={cw},v={ch},i=7,z=30,q=2;{blue}\x1b\\"),
+        "\x1b_Ga=a,i=7,r=1,z=30\x1b\\".to_string(),
+        "\x1b[1;1H\x1b_Ga=p,i=7,C=1,q=2\x1b\\\x1b[?25l".to_string(),
+        "\x1b_Ga=a,i=7,s=3\x1b\\".to_string(),
+    ] {
+        term.process_at(command.as_bytes(), at(0));
+    }
+    let mut win = aterm_gpu::WindowGpu::new();
+    let centre = |f: &Frame| f.pixels[(ch / 2) * f.width + cw / 2];
+    for (step, want_red) in [(0u64, true), (30, false), (60, true), (90, false)] {
+        term.advance_kitty_animations(at(step).monotonic);
+        let input = term.cell_frame(rows, cols);
+        let cpu_frame = cpu.render_input(&input);
+        let gpu_frame = gpu.render_input(&mut win, &input, None);
+        for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+            let pixel = centre(frame);
+            let red = rr(pixel) > 200 && bb(pixel) < 60;
+            let blue = bb(pixel) > 200 && rr(pixel) < 60;
+            assert!(
+                if want_red { red } else { blue },
+                "{name} at {step} ms: {pixel:06x}"
+            );
+        }
     }
 }

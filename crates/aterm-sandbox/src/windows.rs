@@ -3,26 +3,15 @@
 
 //! Windows actuator for [`crate::Limits`].
 //!
-//! Two lanes, honest about what each does:
+//! * [`apply_limits`] (the [`crate::Limits::apply`] body) is a no-op: Windows has
+//!   no rlimits and no pre-exec `fork` seam.
+//! * [`apply_to_job`] folds memory, CPU time and the active-process cap into the
+//!   job's extended-limit info and optionally installs UI restrictions. The
+//!   ConPTY seam (`aterm-pty/src/windows/mod.rs`, after
+//!   `AssignProcessToJobObject`) calls it on the still-suspended child's job and
+//!   terminates the child if it fails.
 //!
-//! * [`apply_limits`] (the [`crate::Limits::apply`] body): a documented,
-//!   capability-gated NO-OP. POSIX rlimits do not exist here and there is no
-//!   per-process `setrlimit` seam to run before exec (Windows has no `fork`).
-//! * [`apply_to_job`] (the [`crate::Limits::apply_to_job`] body): the REAL Job
-//!   Object confinement lane. Given the Job Object the ConPTY spawn seam already
-//!   creates (`aterm-pty`), it folds the requested resource limits (memory, CPU
-//!   time, the active-process cap) into the job's extended-limit info and, for a
-//!   hardened profile, installs Job Object UI restrictions — so the kernel
-//!   enforces them on the child and everything it spawns. This is
-//!   query-modify-write, so any `LimitFlags` the caller already set (e.g.
-//!   `KILL_ON_JOB_CLOSE`) are preserved.
-//!
-//! The ConPTY seam (`aterm-pty/src/windows/mod.rs`, after
-//! `AssignProcessToJobObject`) calls [`apply_to_job`] on the still-suspended
-//! child's job and terminates the child if it fails.
-//!
-//! The cap gate in `lib.rs` runs on BOTH entry points (a weak `Cap<Sandbox>` can
-//! never actuate — SEC-2).
+//! The cap gate in `lib.rs` runs on both entry points (SEC-2).
 
 use std::ffi::c_void;
 use std::io;
@@ -30,10 +19,7 @@ use std::os::windows::io::RawHandle;
 
 use crate::Limits;
 
-/// Windows: POSIX-style resource limits are NOT actuated by `apply` — return
-/// `Ok(())` so the capability-gated spawn proceeds. The real Windows resource
-/// lane is [`apply_to_job`], invoked at the ConPTY spawn seam against the
-/// child's Job Object.
+/// No-op: Windows limits are installed by [`apply_to_job`].
 pub(crate) fn apply_limits(_limits: &Limits) -> io::Result<()> {
     Ok(())
 }
@@ -79,11 +65,10 @@ const HARDENED_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_READCLIPBOARD
 /// Fold the requested resource limits into `job`'s extended-limit info so the
 /// kernel enforces them on every process in the job.
 ///
-/// QUERY-MODIFY-WRITE: the current info is read first, so any `LimitFlags` the
-/// caller already installed (the ConPTY seam sets `KILL_ON_JOB_CLOSE`) are
-/// preserved — this only OR-s in the memory/CPU flags for the fields it sets.
+/// Query-modify-write: `LimitFlags` already on the job (the ConPTY seam's
+/// `KILL_ON_JOB_CLOSE`) are kept; only the flags for set fields are OR-ed in.
 ///
-/// Mapping (honest scope):
+/// Mapping:
 /// * [`Limits::address_space`] → `ProcessMemoryLimit` + `LIMIT_PROCESS_MEMORY`.
 /// * [`Limits::cpu_seconds`] → `PerProcessUserTimeLimit` + `LIMIT_PROCESS_TIME`.
 /// * [`Limits::active_processes`] → `ActiveProcessLimit` + `LIMIT_ACTIVE_PROCESS`.
@@ -149,17 +134,14 @@ pub(crate) fn apply_to_job(limits: &Limits, job: RawHandle) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    // UI restrictions ride a SEPARATE info class, so they need their own write
-    // AFTER the extended limits land (a failure here still fails closed).
+    // A separate info class, so a separate write.
     if limits.restrict_ui {
         apply_ui_restrictions(job)?;
     }
     Ok(())
 }
 
-/// Install the [`HARDENED_UI_RESTRICTIONS`] on `job` via a
-/// `JobObjectBasicUIRestrictions` write — a separate info class from the
-/// extended limits, so it is its own `SetInformationJobObject` call.
+/// Install [`HARDENED_UI_RESTRICTIONS`] on `job` (`JobObjectBasicUIRestrictions`).
 ///
 /// # Errors
 /// The `SetInformationJobObject` OS error (e.g. an invalid job handle).
@@ -367,7 +349,6 @@ mod tests {
         // query-modify-write must NOT clear it while adding the memory flag.
         const KILL_ON_JOB_CLOSE: u32 = 0x2000;
         let job = TestJob::create();
-        // Pre-set KILL_ON_JOB_CLOSE the way aterm-pty does.
         {
             let mut info: JobObjectExtendedLimitInformation = unsafe { std::mem::zeroed() };
             info.BasicLimitInformation.LimitFlags = KILL_ON_JOB_CLOSE;

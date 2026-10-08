@@ -2,35 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kani proofs for ring_hyperlinks invariant.
-//!
-//! Verifies that `ring_hyperlinks.len() == ring_buffer_scrollback()` holds
-//! across all valid combinations of scroll_up and erase_scrollback operations.
-//!
-//! These proofs use abstract state machine modeling (not actual Grid calls)
-//! to verify the algorithm maintains the invariant for all symbolic inputs.
-//! The corresponding concrete test at `tests/scrollback.rs:365` validates
-//! that the production code matches this model.
-//!
-//! Part of #4149 (ring buffer hyperlink preservation).
+//! Kani proofs that `ring_hyperlinks.len() == ring_buffer_scrollback()` across
+//! scroll_up and erase_scrollback, on an abstract state machine. The concrete
+//! test in `tests/scrollback.rs` checks the production code against it.
 
 use super::KANI_MAX_ROWS;
 
-/// ring_hyperlinks.len() == ring_buffer_scrollback() after scroll_up.
-///
-/// Models the ring_hyperlinks state machine with symbolic scroll amounts.
-/// The invariant is: after any sequence of scroll_up(n) operations,
-/// ring_hyperlinks.len() == total_lines.saturating_sub(visible_rows).
-///
-/// Phase 1 (growth): ring_hyperlinks grows by rows_to_add, matching the
-/// increase in ring_buffer_scrollback().
-/// Phase 2 (reuse): push_back then pop_front per row = net 0, and
-/// ring_buffer_scrollback() is unchanged.
-///
-/// This proof covers all valid combinations of visible_rows (2..=8),
-/// max_scrollback (0..=4), and up to 12 scroll operations each with
-/// symbolic batch sizes (1..=4). The existing concrete test at
-/// scrollback.rs:365 validates that production code matches this model.
+/// ring_hyperlinks.len() == total_lines.saturating_sub(visible_rows) after any
+/// sequence of scroll_up(n). Growth adds rows_to_add to both; reuse pushes and
+/// pops per row (net 0). Covers visible_rows 2..=8, max_scrollback 0..=4, and
+/// up to 12 scrolls of symbolic size 1..=4.
 #[kani::proof]
 #[kani::unwind(13)] // 12 iterations + 1
 fn ring_hyperlinks_len_matches_scrollback() {
@@ -62,9 +43,7 @@ fn ring_hyperlinks_len_matches_scrollback() {
         ring_hyperlinks_len += rows_to_add;
         total_lines += rows_to_add;
 
-        // Phase 2: reuse (at capacity)
-        // Each reused row does push_back then pop_front = net 0.
-        // total_lines unchanged. ring_hyperlinks_len unchanged.
+        // Reuse at capacity: push_back then pop_front per row, net 0.
 
         // Check invariant after this scroll_up.
         let ring_sb = total_lines.saturating_sub(visible_rows as usize);
@@ -75,11 +54,8 @@ fn ring_hyperlinks_len_matches_scrollback() {
     }
 }
 
-/// ring_hyperlinks invariant holds across erase_scrollback + scroll_up.
-///
-/// erase_scrollback resets ring_hyperlinks to empty and total_lines to
-/// visible_rows. The invariant must hold after the reset and after
-/// subsequent scroll_up operations.
+/// The invariant holds after erase_scrollback (ring_hyperlinks empty,
+/// total_lines = visible_rows) and subsequent scroll_up calls.
 #[kani::proof]
 #[kani::unwind(9)] // 8 iterations + 1
 fn ring_hyperlinks_invariant_across_erase() {

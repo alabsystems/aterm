@@ -29,7 +29,7 @@ impl Grid {
         self.storage.scrollback_mut()
     }
 
-    /// Get total scrollback lines available (ring buffer + tiered scrollback).
+    /// Total scrollback lines (tiered + lazy-staged + ring).
     #[must_use]
     #[inline]
     pub fn scrollback_lines(&self) -> usize {
@@ -94,7 +94,7 @@ impl Grid {
             let Some(row) = self.storage.ring_history_row(ring_idx) else {
                 return Ok(None);
             };
-            // Use preserved extras from ring_extras (#4149, #4215).
+            // Use preserved extras from ring_extras.
             let default_extras = scroll_convert::ScrolledRowExtras::default();
             let extras = self
                 .storage
@@ -106,21 +106,18 @@ impl Grid {
         }
     }
 
-    /// DENSE forward walk over history from index `start` (0 = oldest) to the
-    /// newest history line: item `k` is exactly what
-    /// [`get_history_line(start + k)`](Self::get_history_line) returns, a
-    /// `None` standing in for a line that cannot be read.
+    /// Dense forward walk over history from index `start` (0 = oldest) to the
+    /// newest line: item `k` is exactly what
+    /// [`get_history_line(start + k)`](Self::get_history_line) returns, with
+    /// `None` for an unreadable line.
     ///
-    /// The tiered store is walked through
-    /// [`ScrollbackStorage::dense_from`] — one decode per warm block / cold
-    /// page, lines moved out, hot lines borrowed, one warning per corrupt
-    /// segment — instead of the per-line binary search, block-cache probe and
-    /// `Line` clone `get_history_line` pays on every tiered line. The lazy
-    /// buffer and the ring are read exactly as the per-line reader reads them.
-    /// Coordinates are stable: an undecodable segment yields one placeholder
-    /// per line it spans, so an absolute row keyed as `oldest + start + k`
-    /// is always the right row. Pinned against the per-line oracle by
-    /// `history_lines_from_matches_get_history_line_*`.
+    /// The tiered store is walked via [`ScrollbackStorage::dense_from`] (one
+    /// decode per warm block / cold page, lines moved out, hot lines borrowed,
+    /// one warning per corrupt segment) instead of a per-line search, cache
+    /// probe and clone. The lazy buffer and ring are read as the per-line
+    /// reader reads them. An undecodable segment yields one placeholder per
+    /// line, so `oldest + start + k` always keys the right row. Checked against
+    /// the per-line reader by `history_lines_from_matches_get_history_line_*`.
     #[must_use]
     pub fn history_lines_from(&self, start: usize) -> HistoryLines<'_> {
         // The same three counts `try_get_history_line` partitions by.
@@ -185,13 +182,11 @@ impl Grid {
     /// Drop the `n` oldest ring-scrollback lines (ring-only retention shrink;
     /// see [`Grid::set_scrollback_line_limit`]).
     ///
-    /// Rebuilds the retained rows into a fresh page store (the
-    /// `erase_scrollback` pattern) so the evicted lines' page memory is
-    /// actually reclaimed — a plain drain would strand it in the old pages
-    /// until the next full rebuild. Surviving lines keep their absolute-row
-    /// identity: only `total_lines` shrinks, so `oldest_absolute_row()`
-    /// advances by exactly `n` — the same observable effect as `scroll_up`'s
-    /// at-capacity eviction.
+    /// Rebuilds the retained rows into a fresh page store (as
+    /// `erase_scrollback` does) so the evicted lines' page memory is
+    /// reclaimed. Survivors keep their absolute-row identity: only
+    /// `total_lines` shrinks, so `oldest_absolute_row()` advances by `n`, like
+    /// `scroll_up`'s at-capacity eviction.
     pub(crate) fn evict_oldest_ring_scrollback(&mut self, n: usize) {
         let n = n.min(self.storage.ring_buffer_scrollback());
         if n == 0 {
@@ -229,49 +224,29 @@ impl Grid {
         self.storage.mark_content_full();
     }
 
-    /// The RING-tier row behind reverse history index `rev_idx`, with its
-    /// preserved extras — or `None` when that index lands in the lazy buffer or
-    /// the tiered store instead (SCR-2).
+    /// The ring-tier row behind reverse history index `rev_idx`, with its
+    /// preserved extras, or `None` when that index is in the lazy buffer or
+    /// tiered store.
     ///
-    /// The tier test is [`Self::try_get_history_line`]'s ring arm, arrived at
-    /// from the OTHER end. That one walks forward from the OLDEST line, so it
-    /// needs the tiered line count and the lazy length to find where the ring
-    /// starts. `rev_idx` already counts back from the NEWEST line, and the ring
-    /// holds exactly the newest `ring_buffer_scrollback()` lines
-    /// (`scrollback_lines() == tiered + lazy + ring`), so the same question —
-    /// "is this a ring line, and which one?" — is answered by the ring count
-    /// ALONE: `rev_idx < ring`, at `ring - 1 - rev_idx`.
-    ///
-    /// That is not merely tidier; it is the cheapest possible form of the
-    /// question for the rows this DECLINES. It runs per visible row on every
-    /// history read, including every read that lands in the warm/cold tiers,
-    /// where anything it does is pure overhead on a path it cannot speed up —
-    /// and asking the tiered store for `line_count()` is a `dyn` call.
-    ///
-    /// MEASURED, `scroll_scrub_harness`, this form vs the tiered+lazy form vs
-    /// the pre-SCR-2 baseline (medians of 3+ alternating runs, both orders):
-    /// `scrub_median_rps` 2.75M / 2.67M / 1.96M, `pageup_median_rps` 1.94M /
-    /// 1.92M / 1.96M, `jump_top_median_jps` 55.9k / 55.7k / 59.1k. So this form
-    /// buys ~3% more scrub and gives pageup back; the ~5% `jump_top` cost is
-    /// NOT this arithmetic (it survives `#[inline(never)]` on the fast
-    /// materializer too) but the price the deep-tier path pays for the ring
-    /// path existing at all — a fence with a 0.45 pass ratio and 1.4x of
-    /// headroom over its floor, bought with a ~40% gain on the scrub phase the
-    /// same fence measures.
+    /// The ring holds exactly the newest `ring_buffer_scrollback()` lines
+    /// (`scrollback_lines() == tiered + lazy + ring`), and `rev_idx` counts
+    /// back from the newest, so the ring count alone answers it: ring line iff
+    /// `rev_idx < ring`, at `ring - 1 - rev_idx`. This avoids a `dyn`
+    /// `line_count()` call on the tiered store for every declined row, since
+    /// it runs per visible row on every history read.
     fn ring_history_row_at_rev(
         &self,
         rev_idx: usize,
     ) -> Option<(&super::Row, Option<&scroll_convert::ScrolledRowExtras>)> {
         let ring = self.storage.ring_buffer_scrollback();
-        // `checked_*`: a `rev_idx` past the ring (a tiered or deferred line, or
-        // past history entirely) underflows here, and the underflow IS the
-        // decline — the caller then reads it as a `Line`, exactly as before.
+        // `checked_*`: a `rev_idx` past the ring underflows here, and that is
+        // the decline; the caller then reads it as a `Line`.
         let ring_idx = ring.checked_sub(rev_idx.checked_add(1)?)?;
         let row = self.storage.ring_history_row(ring_idx)?;
         Some((row, self.storage.ring_history_extras(ring_idx)))
     }
 
-    /// Materialize a scrollback line with full fidelity (#4216).
+    /// Materialize a scrollback line with full fidelity.
     ///
     /// Returns a [`MaterializedRow`](scroll_materialize::MaterializedRow)
     /// containing cells plus supplementary extras (hyperlinks, complex chars,
@@ -279,19 +254,13 @@ impl Grid {
     /// `MaterializedRow::get_extra(col)` for scrollback cells using the same
     /// code path as visible-area cells.
     ///
-    /// For hot-tier lines, the `Cow` from `history_line_rev` avoids cloning —
-    /// `materialize_from_line` only needs `&Line` via `Deref`. (#5950)
-    ///
-    /// RING TIER FIRST (SCR-2). For the newest ~10_000 lines the source row is
-    /// still in RAM as real `Cell`s, so going through `history_line_rev` means
-    /// serializing those cells to text + RLE attrs and immediately parsing them
-    /// back — two O(cols) passes and ~4 allocations to move data between two
-    /// in-memory representations of the same row.
+    /// Ring tier first: for the newest lines the source row is still in RAM as
+    /// `Cell`s, and
     /// [`materialize_from_row_extras`](scroll_materialize::materialize_from_row_extras)
-    /// reads the row directly, and returns `None` whenever it cannot PROVE it
-    /// would produce what the round trip produces — so this is a speed decision
-    /// only, and the line below stays the answer for every case it declines and
-    /// for every line that has left the ring.
+    /// reads it directly instead of serializing to text + RLE and parsing
+    /// back. It returns `None` whenever it cannot prove the same result, so the
+    /// `history_line_rev` path (whose hot-tier `Cow` avoids a clone) remains
+    /// the answer for declined cases and lines beyond the ring.
     #[must_use]
     pub fn materialize_scrollback_row_full(
         &self,
@@ -307,16 +276,12 @@ impl Grid {
         Some(scroll_materialize::materialize_from_line(&line, cols))
     }
 
-    /// Get total history line count (tiered + ring buffer scrollback).
+    /// Total history lines; same as [`Self::scrollback_lines`].
     #[must_use]
     #[inline]
     pub fn history_line_count(&self) -> usize {
         self.storage.scrollback_lines()
     }
-
-    // -------------------------------------------------------------------------
-    // Memory budget
-    // -------------------------------------------------------------------------
 }
 
 // Uses aterm-scrollback's disk-tier-gated DiskBackedScrollback APIs.
@@ -351,10 +316,10 @@ mod tests {
             .open(&cold_path)
             .and_then(|file| file.set_len(32))
             .expect("truncate cold file");
-        // Windows twin: the cold tier holds the file MAPPED, and Windows refuses
-        // to shrink a user-mapped file (ERROR_USER_MAPPED_FILE), so corrupt by
-        // OVERWRITING every page byte past the 32-byte header with garbage
-        // instead — same observable effect (every cold-page read fails).
+        // Windows: the cold tier maps the file and Windows refuses to shrink a
+        // mapped file (ERROR_USER_MAPPED_FILE), so corrupt it by overwriting
+        // every page byte past the 32-byte header instead (every cold-page read
+        // fails either way).
         #[cfg(windows)]
         {
             use std::io::{Seek, SeekFrom, Write};
@@ -376,8 +341,8 @@ mod tests {
         (grid, temp_dir)
     }
 
-    /// Regression (#4496): `try_get_history_line` propagates scrollback errors
-    /// instead of masking them as `None`.
+    /// `try_get_history_line` propagates scrollback errors instead of masking
+    /// them as `None`.
     #[test]
     fn try_get_history_line_propagates_scrollback_error() {
         let (grid, _temp_dir) = grid_with_corrupted_scrollback();
@@ -388,8 +353,8 @@ mod tests {
         );
     }
 
-    /// Regression (#4496): the compatibility wrapper `get_history_line` returns
-    /// `None` (not panic) for corrupted scrollback, preserving the `Option` API.
+    /// The compatibility wrapper `get_history_line` returns `None` (not panic)
+    /// for corrupted scrollback.
     #[test]
     fn get_history_line_returns_none_on_error() {
         let (grid, _temp_dir) = grid_with_corrupted_scrollback();
@@ -400,8 +365,8 @@ mod tests {
         );
     }
 
-    /// Regression (#4496): `try_history_line_rev` propagates errors for the
-    /// reverse-index access path used by scrollback rendering.
+    /// `try_history_line_rev` propagates errors on the reverse-index path used
+    /// by scrollback rendering.
     #[test]
     fn try_history_line_rev_propagates_scrollback_error() {
         let (grid, _temp_dir) = grid_with_corrupted_scrollback();
@@ -416,8 +381,8 @@ mod tests {
         );
     }
 
-    /// Regression (#4496): `SearchContent::get_row_text` for Grid does not panic
-    /// on corrupted scrollback and returns `None` instead.
+    /// `SearchContent::get_row_text` for Grid returns `None` rather than
+    /// panicking on corrupted scrollback.
     #[test]
     fn search_content_returns_none_on_corrupted_scrollback() {
         use aterm_types::SearchContent;

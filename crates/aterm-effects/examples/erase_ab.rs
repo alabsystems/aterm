@@ -1,34 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ERASE A/B — the audition bench for what a DELETE sounds like, the way
-//! `typing_voice_ab` is the bench for the keystroke. That one cannot answer
-//! the question this one exists for, because a delete is not one event: it
-//! is a keystroke bell and the erase POOF'S OWN NOISE landing inside the same
-//! 45 ms, and the only thing that settles whether that pair reads as *one
-//! gesture* or as *two keys* is an ear.
+//! Erase A/B: the audition bench for what a delete sounds like (as
+//! `typing_voice_ab` is for the keystroke). A delete is a keystroke bell plus
+//! the erase poof's own noise inside the same 45 ms, and whether that reads as
+//! one gesture or two keys takes an ear.
 //!
-//! It renders the SAME four delete shapes a shell user actually deletes with —
-//! plain Backspace, a held Backspace run, Ctrl-W, Ctrl-U — through the real
-//! synth in two arms:
+//! It renders four delete shapes (plain Backspace, a held Backspace run,
+//! Ctrl-W, Ctrl-U) through the real synth in three arms:
 //!
-//! - `a-shipped-*` — the pre-2026-08-28 cue stream, where a plain Backspace
-//!   fired its keystroke bell AND the full [`SoundKind::Kill`] swoosh (a
-//!   per-command, tier-3 gesture) for one physical key;
-//! - `b-puff-*` — the same shapes with the delete voices as they now ship: the
-//!   bell plus [`SoundKind::Poof`], the cloud's small breath. Kill CHORDS are
-//!   byte-identical between the arms — only the plain-Backspace shapes move,
-//!   which is exactly the claim the pair is here to let you check by ear.
+//! - `a-shipped-*`: a plain Backspace fires its bell and the full
+//!   [`SoundKind::Kill`] swoosh (a per-command, tier-3 gesture);
+//! - `b-puff-*`: the bell plus [`SoundKind::Poof`], the cloud's small breath
+//!   (the shipping voice). Kill chords are identical between the arms;
+//! - `c-bell-only`: the keystroke bell alone, the reference.
 //!
-//! Deterministic: fixed seed, fixed scripts, no dependency, no rng of its own.
+//! Deterministic: fixed seed, fixed scripts, no rng of its own.
 //!
 //!   cargo run -p aterm-effects --example erase_ab [-- <out_dir>] [--voice <name>]
 //!   afplay target/erase-ab/b-puff-backspace.wav
 //!
-//! Each render prints peak dBFS and the time in ms between the bell's onset and
-//! the delete voice's — the two numbers that say "quieter than the key" and
-//! "close enough to be one gesture" — but the numbers are the sanity check. The
-//! WAVs are the deliverable.
+//! Each render prints peak dBFS and the ms between the bell's onset and the
+//! delete voice's, as a sanity check; the WAVs are the deliverable.
 
 use std::path::PathBuf;
 
@@ -53,10 +46,9 @@ fn backspace(at: f32, delete_voice: Option<SoundKind>) -> Script {
     s
 }
 
-/// A HELD Backspace: keys at ~65 ms (macOS autorepeat), but the poof is rate-
-/// limited to one per `POOF_MIN_GAP` (0.14 s) by `cursor_glow`, so only some of
-/// the keys carry a delete voice. That asymmetry is audible and is the whole
-/// reason this shape gets its own render.
+/// A held Backspace: keys at ~65 ms (macOS autorepeat), but the poof is
+/// rate-limited to one per `POOF_MIN_GAP` (0.14 s) by `cursor_glow`, so only
+/// some keys carry a delete voice.
 fn held_backspace(delete_voice: Option<SoundKind>) -> Script {
     let mut s = Script::new();
     let mut last_poof = f32::MIN;
@@ -78,10 +70,8 @@ fn scripts(delete_voice: Option<SoundKind>) -> Vec<(&'static str, Script)> {
         // Ten of them, held.
         ("backspace-held", held_backspace(delete_voice)),
         // A word kill: no keystroke of its own, so the swoosh is its whole
-        // voice — IDENTICAL in the two delete arms, and here as the reference
-        // the puff should read as the little brother of. In the bell-only arm
-        // it is genuinely empty (a kill chord has no bell), which makes its
-        // `adds` column the swoosh's own level.
+        // voice, identical in both delete arms. In the bell-only arm it is
+        // empty, so its `adds` column is the swoosh's own level.
         (
             "ctrl-w",
             delete_voice.map_or_else(Script::new, |_| vec![(0.10, SoundKind::Kill)]),
@@ -196,24 +186,19 @@ fn main() {
     let out = out.unwrap_or_else(|| PathBuf::from("target/erase-ab"));
     std::fs::create_dir_all(&out).expect("out dir");
 
-    // A = the shipped-until-2026-08-28 stream (Backspace fired the full kill
-    // swoosh); B = the puff. Kill chords are identical in both.
+    // A = Backspace fires the full kill swoosh; B = the puff. Kill chords are
+    // identical in both.
     let arms: [(&str, Option<SoundKind>); 3] = [
         ("a-shipped", Some(SoundKind::Kill)),
         ("b-puff", Some(SoundKind::Poof)),
-        // THE REFERENCE, and the reason it earns a place beside the two arms:
-        // it is what a delete sounds like with NO delete voice at all — the
-        // keystroke bell alone. Measured against it, `a-shipped` turns out to
-        // be BIT-IDENTICAL on every plain-Backspace shape, because the swoosh
-        // it cues lands ~16 ms behind the bell and the synth's `MIN_GAP` (45 ms)
-        // thins it. The delete "noise" the code believed it was making was
-        // never reaching the speaker; that is what `b-puff`'s min-gap bypass
-        // fixes, and this file is the control that proves it.
+        // The reference: a delete with no delete voice, the bell alone.
+        // `a-shipped` is bit-identical to it on every plain-Backspace shape,
+        // since its swoosh lands ~16 ms behind the bell and the synth's
+        // `MIN_GAP` (45 ms) thins it; `b-puff` bypasses the min gap.
         ("c-bell-only", None),
     ];
-    // The bell-only reference first, so every other arm can be reported as what
-    // it ADDS over a delete with no delete voice at all.
-    // Every arm of one shape is rendered to the SAME length (the shape's
+    // The bell-only reference first, so every other arm is reported as what
+    // it adds. Every arm of one shape renders to the same length (the
     // longest script + 1.2 s of tail) so the difference is sample-aligned.
     let lens: Vec<f32> = scripts(Some(SoundKind::Kill))
         .into_iter()

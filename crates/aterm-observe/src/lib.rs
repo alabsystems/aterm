@@ -129,17 +129,23 @@ const REGEX_STEP_LIMIT: u64 = 1 << 22;
 /// Returns an [`aterm_regex::Error`] if `pattern` exceeds the length ceiling,
 /// exceeds the compiled-size limits, or is not a valid regular expression.
 pub fn row_matcher(pattern: &str) -> Result<Arc<dyn RowMatch>, aterm_regex::Error> {
+    Ok(Arc::new(RegexRowMatch {
+        re: bounded_regex(pattern)?,
+    }))
+}
+
+/// The pattern compiled under every bound [`row_matcher`] documents.
+fn bounded_regex(pattern: &str) -> Result<aterm_regex::Regex, aterm_regex::Error> {
     if pattern.len() > MAX_REGEX_PATTERN_LEN {
         return Err(aterm_regex::Error::Syntax(format!(
             "pattern exceeds maximum length ({MAX_REGEX_PATTERN_LEN} bytes)"
         )));
     }
-    let re = aterm_regex::RegexBuilder::new(pattern)
+    aterm_regex::RegexBuilder::new(pattern)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
         .step_limit(REGEX_STEP_LIMIT)
-        .build()?;
-    Ok(Arc::new(RegexRowMatch { re }))
+        .build()
 }
 
 #[cfg(test)]
@@ -270,8 +276,8 @@ mod tests {
     #[test]
     fn row_matcher_bounds_compiled_size() {
         // `(a{200}){200}` is a short (13-byte) pattern that compiles happily
-        // under the regex crate's 10 MiB default but blows past our 128 KiB
-        // REGEX_SIZE_LIMIT — the classic "small pattern, huge NFA" amplifier.
+        // under a 10 MiB limit but blows past our 128 KiB REGEX_SIZE_LIMIT —
+        // the classic "small pattern, huge NFA" amplifier.
         // row_matcher must reject it, proving the size caps are wired (not just
         // the length gate). If this ever compiles, the size_limit call is gone.
         let amplifier = "(a{200}){200}";
@@ -280,8 +286,11 @@ mod tests {
             "under the length gate"
         );
         assert!(
-            regex::Regex::new(amplifier).is_ok(),
-            "sanity: the crate's default (10 MiB) accepts this pattern",
+            aterm_regex::RegexBuilder::new(amplifier)
+                .size_limit(10 << 20)
+                .build()
+                .is_ok(),
+            "sanity: a 10 MiB limit accepts this pattern",
         );
         assert!(
             row_matcher(amplifier).is_err(),
@@ -301,7 +310,9 @@ mod tests {
     ///
     /// The refusal must be a NON-match rather than a latch: latching on a row
     /// the engine never finished reading would release an agent's `await` on
-    /// evidence that was never gathered.
+    /// evidence that was never gathered. That the budget is what ended the scan
+    /// is read off the compiled pattern's sticky flag (shared with its clone in
+    /// the matcher), never a stopwatch.
     #[test]
     fn row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget() {
         let pattern = "(?:x?){1020}z";
@@ -309,17 +320,16 @@ mod tests {
             pattern.len() <= MAX_REGEX_PATTERN_LEN,
             "under the length gate"
         );
-        let matcher = row_matcher(pattern).expect("compiles: the size ceiling admits this one");
+        let re = bounded_regex(pattern).expect("compiles: the size ceiling admits this one");
+        let matcher = RegexRowMatch { re: re.clone() };
         let row = "x".repeat(4096);
-        let started = std::time::Instant::now();
         assert!(
             !matcher.matches(&row),
             "an unfinishable row is a non-match, never a latch"
         );
         assert!(
-            started.elapsed().as_secs() < 2,
-            "the row took {:?}; the step budget is not bounding the scan",
-            started.elapsed()
+            re.step_limit_exceeded(),
+            "the step budget is not bounding the scan"
         );
 
         // A row it CAN finish still answers normally — the budget refuses the
@@ -351,11 +361,8 @@ mod tests {
     /// `[dev-dependencies]`. The kernel stays vocabulary-free; the engine lives
     /// here. If someone adds one to the core's production deps, this fails.
     ///
-    /// Both names are checked. `regex` is the retired third-party crate (still
-    /// reachable as a dev-only oracle, so the assertion is not vacuous);
-    /// `aterm-regex` is the first-party engine that replaced it. Dropping the
-    /// second name is how this invariant would quietly stop guarding anything
-    /// after the swap.
+    /// Both names are checked: `regex` is the retired third-party crate,
+    /// `aterm-regex` the first-party engine that replaced it.
     #[test]
     fn regex_is_not_in_aterm_core_production_deps() {
         let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/../aterm-core/Cargo.toml");

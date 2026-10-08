@@ -412,7 +412,25 @@ impl NetProbe {
 /// One settings source, read only if it is a regular file of at most
 /// [`SETTINGS_CAP`] bytes of text — opened non-blocking, so a FIFO planted
 /// there cannot park the reader.
+///
+/// A source inside a file-provider domain (iCloud Drive, a sync provider's folder)
+/// is [`Source::Unreadable`] WITHOUT being opened: the open raises a system dialog
+/// that has no timeout, and this is the one netprobe thread every session shares.
+/// `Unreadable` is already the safe direction (the route reads custom and is not
+/// measured). The predicate is atpkg's lexical one, fed a resolved path.
 fn read_source(path: &Path) -> Source {
+    read_source_in(aterm_types::dirs::home_dir().as_deref(), path)
+}
+
+/// [`read_source`] against an explicit `home`, so a test needs no `$HOME`.
+fn read_source_in(home: Option<&Path>, path: &Path) -> Source {
+    if let Some(home) = home {
+        let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if atpkg::protected::under_file_provider_domain(&home, &resolved) {
+            return Source::Unreadable;
+        }
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -530,6 +548,63 @@ pub(crate) fn route_of_agent(pid: u32, argv: &[String], cwd: &str) -> Route {
         Path::new(netwatch::MANAGED_DIR),
         Path::new(netwatch::MANAGED_PREFS_DIR),
     ))
+}
+
+/// WHETHER AGENT `pid`'S SETTINGS LEAVE IT ITS STORED LOGIN, read now (the
+/// accounts design, §6 rule 1): the SAME gather the route is read from
+/// ([`gather`]: its exec environment and every settings source Claude Code
+/// reads for it), handed to `accounts::ProcessLogin` — and the vendor's
+/// profile store, where that process's environment places it
+/// ([`stored_login_of`]). `false`: some source gives it a credential, a
+/// profile or an `apiKeyHelper`, a source that is there could not be read,
+/// or its environment could not — it is then no stored login, and nothing of
+/// an account is recorded for it or advised to it. Asked by the window's
+/// host only where the owner listed an account, once per agent process.
+pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> bool {
+    let env = atpkg::caller_shell::process_args(pid).map(|a| a.env);
+    stored_login_of(
+        &gather(
+            env,
+            argv,
+            Path::new(cwd),
+            Path::new(netwatch::MANAGED_DIR),
+            Path::new(netwatch::MANAGED_PREFS_DIR),
+        ),
+        aterm_types::dirs::home_dir().as_deref(),
+    )
+}
+
+/// [`stored_login_of_agent`] over what was gathered: the environment
+/// (`accounts::ProcessLogin::of_env`), the settings sources
+/// (`with_settings`: the one settings reader, `netwatch::settings_of`) and
+/// the vendor's profile store (`with_profile_store`: one listing of the
+/// directory `accounts::profile_configs_dir` names for that environment —
+/// names only, no config opened). A store inside a file-provider domain of
+/// `home` is NOT LISTED (the listing could raise a consent dialog in aterm's
+/// name, as a settings file there could, [`read_source`]): it is read as
+/// holding a config, the direction that leaves the session alone. An
+/// environment that could not be read, or reads empty, is no stored login.
+fn stored_login_of(facts: &RouteFacts, home: Option<&Path>) -> bool {
+    use aterm_agent::harness::accounts;
+    let Some(env) = facts.env.as_ref().filter(|env| !env.is_empty()) else {
+        return false;
+    };
+    let pairs = || env.iter().filter_map(|kv| kv.split_once('='));
+    let profile = accounts::profile_configs_dir(pairs()).is_some_and(|configs| {
+        // As named and as resolved: a store that does not exist yet has no
+        // resolved path, and is still not to be listed where it is named.
+        let unseen = home.is_some_and(|home| {
+            let real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+            let resolved = std::fs::canonicalize(&configs).unwrap_or_else(|_| configs.clone());
+            atpkg::protected::under_file_provider_domain(home, &configs)
+                || atpkg::protected::under_file_provider_domain(&real, &resolved)
+        });
+        unseen || accounts::profile_configured(&configs)
+    });
+    accounts::ProcessLogin::of_env(pairs())
+        .with_settings(&facts.settings)
+        .with_profile_store(profile)
+        .stored_login
 }
 
 #[cfg(test)]
@@ -712,11 +787,11 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
         let addr = listener.local_addr().expect("addr");
         drop(listener);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
             assert!(
                 Instant::now() < deadline,
-                "{addr} still accepts 10 s after its listener was dropped"
+                "{addr} still accepts a minute after its listener was dropped"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1016,6 +1091,129 @@ mod tests {
 
     fn write(path: &Path, text: &str) {
         std::fs::write(path, text).expect("write");
+    }
+
+    /// A settings file inside a file-provider domain is never opened: it reads
+    /// `Unreadable` (the safe direction) though its text is perfectly good, while
+    /// the same file in an ordinary folder is read.
+    #[test]
+    fn a_settings_file_under_a_file_provider_domain_is_unreadable_never_opened() {
+        let dir = scratch("provider");
+        let home = dir.join("home");
+        let provider = home.join("Library/CloudStorage/x/.claude");
+        let ordinary = home.join("src/.claude");
+        for folder in [&provider, &ordinary] {
+            std::fs::create_dir_all(folder).expect("dir");
+            write(&folder.join("settings.json"), "{}");
+        }
+        assert!(matches!(
+            read_source_in(Some(&home), &provider.join("settings.json")),
+            Source::Unreadable
+        ));
+        assert!(matches!(
+            read_source_in(Some(&home), &ordinary.join("settings.json")),
+            Source::Text(text) if text == "{}"
+        ));
+        // no home known: nothing to fence against, the read is what it was
+        assert!(matches!(
+            read_source_in(None, &provider.join("settings.json")),
+            Source::Text(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE AGENT'S SETTINGS SIDE OF ITS LOGIN ([`stored_login_of`]): over the
+    /// route's own gather, a quiet tree leaves it its stored login; and it
+    /// is NO stored login where a settings source — the user's, the
+    /// project's, a `--settings` — gives it an API key or names an
+    /// `apiKeyHelper`, where a source could not be parsed, where the
+    /// vendor's profile store holds a config (under `$HOME/.config/anthropic`,
+    /// or where `ANTHROPIC_CONFIG_DIR` names it), where that store is inside
+    /// a file-provider domain (never listed), and where the environment was
+    /// not read at all or reads empty. NEGATIVE CONTROLS: settings that set
+    /// only a model and an `env` block with no such name leave it; and so
+    /// does a profile store with no `.json` in it.
+    #[test]
+    fn an_agents_settings_and_profile_store_can_take_its_stored_login_away() {
+        let dir = scratch("stored");
+        let home = dir.join("home");
+        let env = |more: &[String]| {
+            let mut env = vec![format!("HOME={}", home.display()), "USER=owner".to_string()];
+            env.extend(more.iter().cloned());
+            Some(env)
+        };
+        let stored = |env: Option<Vec<String>>, argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            stored_login_of(
+                &gather(
+                    env,
+                    &argv,
+                    &dir.join("proj"),
+                    &dir.join("managed"),
+                    &dir.join("prefs"),
+                ),
+                Some(&home),
+            )
+        };
+        let user = home.join(".claude/settings.json");
+        // NEGATIVE CONTROLS: nothing that names a login.
+        assert!(stored(env(&[]), &["claude"]), "a quiet tree");
+        write(&user, "{\"model\":\"opus\",\"env\":{\"EDITOR\":\"vi\"}}");
+        assert!(stored(env(&[]), &["claude"]), "a model and an editor");
+
+        for (why, text) in [
+            (
+                "an API key in an env block",
+                "{\"env\":{\"ANTHROPIC_API_KEY\":\"k\"}}",
+            ),
+            ("an apiKeyHelper", "{\"apiKeyHelper\":\"/opt/key.sh\"}"),
+            ("a profile", "{\"env\":{\"ANTHROPIC_PROFILE\":\"p\"}}"),
+            ("a file that does not parse", "{"),
+        ] {
+            write(&user, text);
+            assert!(!stored(env(&[]), &["claude"]), "{why}: the user's");
+            write(&user, "{}");
+            write(&dir.join("proj/.claude/settings.local.json"), text);
+            assert!(!stored(env(&[]), &["claude"]), "{why}: the project's");
+            std::fs::remove_file(dir.join("proj/.claude/settings.local.json")).expect("rm");
+            assert!(
+                !stored(env(&[]), &["claude", "--settings", text]),
+                "{why}: --settings"
+            );
+            assert!(stored(env(&[]), &["claude"]), "{why}: gone again");
+        }
+
+        // The vendor's profile store.
+        let configs = home.join(".config/anthropic/configs");
+        std::fs::create_dir_all(&configs).expect("configs");
+        write(&configs.join("notes.txt"), "x");
+        assert!(stored(env(&[]), &["claude"]), "no config in the store");
+        write(&configs.join("default.json"), "{}");
+        assert!(!stored(env(&[]), &["claude"]), "a config in the store");
+        std::fs::remove_file(configs.join("default.json")).expect("rm");
+        let elsewhere = dir.join("store/configs");
+        std::fs::create_dir_all(&elsewhere).expect("configs");
+        write(&elsewhere.join("work.json"), "{}");
+        let named = [format!(
+            "ANTHROPIC_CONFIG_DIR={}",
+            dir.join("store").display()
+        )];
+        assert!(
+            !stored(env(&named), &["claude"]),
+            "where the variable names it"
+        );
+        // Inside a file-provider domain: never listed, read as configured.
+        let cloud = [format!(
+            "ANTHROPIC_CONFIG_DIR={}",
+            home.join("Library/CloudStorage/x").display()
+        )];
+        assert!(!stored(env(&cloud), &["claude"]), "a store nobody lists");
+        assert!(!home.join("Library/CloudStorage").exists(), "nor made");
+
+        // An environment that was not read is no stored login.
+        assert!(!stored(None, &["claude"]));
+        assert!(!stored(Some(Vec::new()), &["claude"]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE ROUTE'S SOURCES, READ-ONLY: a quiet tree is the default route;

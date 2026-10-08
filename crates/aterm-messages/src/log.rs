@@ -9,7 +9,8 @@
 //! reads a newer file and vice versa. Every line ends with an `end=` field
 //! the decoder requires, so a line cut short by a crash mid-append —
 //! anywhere, inside its last value included — fails to decode instead of
-//! reading as a shorter record. A file is an ingress like any other: the
+//! reading as a shorter record; so does one the next append was glued onto
+//! (a second `kind=`). A file is an ingress like any other: the
 //! decoder clips every word to the model's caps and drops empty detail
 //! lines, so a hand-edited or hostile line cannot put in the ring what
 //! `post` would never have admitted.
@@ -21,8 +22,8 @@ use crate::center::Outcome;
 use crate::model::{Glyph, Intent, Message, MessageId, Origin, Severity, Tag, WallStamp};
 use crate::text::clip;
 use crate::{
-    DETAIL_LINE_CAP, DETAIL_LINES_CAP, Instant, KEY_CAP, LOG_CAP, PENDING_PERSIST_CAP, TITLE_CAP,
-    WIRE_LOG_SHARE,
+    DETAIL_LINE_CAP, DETAIL_LINES_CAP, Instant, KEY_CAP, LOG_CAP, MAX_ACTIONS, PENDING_PERSIST_CAP,
+    TITLE_CAP, WIRE_LOG_SHARE,
 };
 
 /// The longest line the decoder accepts. Sized from the model's caps so that
@@ -156,7 +157,8 @@ pub enum LogState {
 
 /// One message as the log keeps it: the words at post, updated to the final
 /// words when it retires (restatements are never logged, so the Retired
-/// line carries them).
+/// line carries them). The mark is the one exception: while the row lives
+/// the ring's record reads the mark it SHOWS (ruling 415 (l)).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
     /// The id.
@@ -165,9 +167,10 @@ pub struct LogRecord {
     pub stamp: WallStamp,
     /// The reporter family.
     pub tag: Tag,
-    /// The severity.
+    /// The severity: the live row's while it lives, the one it retired
+    /// under once retired.
     pub severity: Severity,
-    /// The glyph.
+    /// The glyph, as the severity.
     pub glyph: Glyph,
     /// The title (final words once retired).
     pub title: String,
@@ -190,6 +193,11 @@ pub struct LogRecord {
     pub retired_at: Option<Instant>,
     /// The last capsule pressed, and when.
     pub last_action: Option<(String, u64)>,
+    /// An entry of the digest ([`crate::need::Need::Later`]): written as an
+    /// optional `need=later` key an older build ignores, and kept OPEN by a
+    /// replay (every other posted-and-never-retired line loads as Stale),
+    /// so the exception survives a restart until it is filed.
+    pub later: bool,
 }
 
 impl LogRecord {
@@ -212,6 +220,7 @@ impl LogRecord {
             retired_unix_ms: None,
             retired_at: None,
             last_action: None,
+            later: matches!(msg.need, crate::need::Need::Later(_)),
         }
     }
 
@@ -219,6 +228,34 @@ impl LogRecord {
     #[must_use]
     pub fn is_live(&self) -> bool {
         self.state == LogState::Posted
+    }
+
+    /// `true` for a digest entry the owner or the digest itself FILED
+    /// (`Dismissed`, `Answered`, `Unseen`, `Evicted`): the retirements that
+    /// keep the fact quiet for its span. `Resolved` and `Superseded` end a
+    /// cause and are news when it returns; they are not filings.
+    #[must_use]
+    pub(crate) fn filed_exception(&self) -> bool {
+        self.later
+            && matches!(
+                self.retired(),
+                Some(
+                    Retired::Dismissed
+                        | Retired::Answered { .. }
+                        | Retired::Unseen
+                        | Retired::Evicted
+                )
+            )
+    }
+
+    /// The ring keeps a filed exception for [`crate::need::FILED_KEEP`] after
+    /// its FILING (not after its posting): the fact's quiet span is counted
+    /// from the dismissal, so 512 later records must not push the dismissal
+    /// out while it still holds. `since_ms` is the earliest filing worth
+    /// keeping.
+    #[must_use]
+    fn kept_as_filing(&self, since_ms: u64) -> bool {
+        self.filed_exception() && self.retired_unix_ms.is_some_and(|t| t >= since_ms)
     }
 
     /// The wire's record ([`Origin::wire_owned`]): it counts against the
@@ -319,7 +356,8 @@ pub enum CodecError {
     MissingField(&'static str),
     /// A field did not parse.
     BadField(&'static str),
-    /// No `end=` terminator: the line was cut short mid-append.
+    /// No `end=` terminator: the line was cut short mid-append — or the
+    /// next append was glued onto the cut (a second `kind=`).
     Truncated,
 }
 
@@ -375,6 +413,9 @@ impl LogLine {
                     field("key", key);
                 }
                 field("origin", rec.origin.as_str());
+                if rec.later {
+                    field("need", "later");
+                }
             }
             Self::Retired {
                 id,
@@ -430,8 +471,8 @@ impl LogLine {
     /// # Errors
     /// [`CodecError`] for a line that is not `m1`, is over the size cap,
     /// names an unknown kind, lacks a required field, or has no `end=`
-    /// terminator (it was cut short). The loader skips such a line and
-    /// keeps reading.
+    /// terminator of its own (it was cut short, perhaps with the next line
+    /// glued on). The loader skips such a line and keeps reading.
     pub fn decode(line: &str) -> Result<Self, CodecError> {
         let line = line.strip_suffix('\n').unwrap_or(line);
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -443,6 +484,15 @@ impl LogLine {
             return Err(CodecError::NotM1);
         }
         let fields = Fields::parse(tokens);
+        // TWO LINES GLUED (ruling 415 (g)): an append cut short (a
+        // short write, a full disk) leaves no newline, and the next append
+        // lands on the same physical line. Every line opens with its `kind=`,
+        // so a second one is the next line's start: the torn line has no
+        // terminator of its own, and the first-wins fields would read a
+        // chimera of the two under the next line's `end=`.
+        if fields.0.iter().filter(|(k, _)| k == "kind").count() > 1 {
+            return Err(CodecError::Truncated);
+        }
         let decoded = match fields.get("kind") {
             Some("posted") => decode_posted(&fields)?,
             Some("retired") => Self::Retired {
@@ -492,6 +542,8 @@ fn decode_posted(fields: &Fields) -> Result<LogLine, CodecError> {
         .iter()
         .filter_map(|a| Intent::decode(a))
         .filter(|i| *i != Intent::Details)
+        // `post` keeps at most MAX_ACTIONS (ruling 415 (k)).
+        .take(MAX_ACTIONS)
         .collect();
     let origin = Origin::parse(&fields.need("origin")?).ok_or(CodecError::BadField("origin"))?;
     Ok(LogLine::Posted(LogRecord {
@@ -515,6 +567,7 @@ fn decode_posted(fields: &Fields) -> Result<LogLine, CodecError> {
         retired_unix_ms: None,
         retired_at: None,
         last_action: None,
+        later: fields.get("need") == Some("later"),
     }))
 }
 
@@ -663,12 +716,19 @@ pub(crate) struct FinalWords<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct MessageLog {
     ring: VecDeque<LogRecord>,
+    /// How many of [`Self::ring`]'s records are the wire's
+    /// ([`LogRecord::wire_owned`], fixed for a record's life: its origin and
+    /// key never change in the ring), kept beside it so an eviction does not
+    /// count the whole ring.
+    wire_records: usize,
     next_id: u64,
     pending: VecDeque<(LogLine, Shelf)>,
     dropped: u32,
     /// REPLAY ONLY (ruling 270): a file id another writer posted again,
     /// mapped to the fresh ids its later records were loaded under, oldest
-    /// first — so no two records in the ring share an id.
+    /// first — so no two records in the ring share an id. A record the seed
+    /// moves off a carried number is listed under its file id too
+    /// ([`Self::adopt_carried`]).
     remapped: BTreeMap<u64, Vec<MessageId>>,
     /// The fresh ids [`Self::remapped`] handed out: a record under one of
     /// them is not the file's record of that number.
@@ -707,7 +767,10 @@ impl MessageLog {
         match line {
             LogLine::Posted(mut rec) => {
                 let file_id = rec.id;
-                let candidates = self.replay_candidates(file_id);
+                // One look for the file id's own record serves both the
+                // candidates and the collision test below.
+                let held = self.get(file_id).is_some();
+                let candidates = self.candidates_given(file_id, held);
                 if candidates.iter().any(|id| {
                     self.get(*id).is_some_and(|r| {
                         !Self::closed_by_a_line(r)
@@ -718,14 +781,19 @@ impl MessageLog {
                 }) {
                     return;
                 }
-                if self.get(file_id).is_some() || !candidates.is_empty() {
+                if held || !candidates.is_empty() {
                     let fresh = self.next_id();
                     self.raise(fresh);
                     self.minted_at_replay.insert(fresh.raw());
                     self.remapped.entry(file_id.raw()).or_default().push(fresh);
                     rec.id = fresh;
                 }
-                rec.state = LogState::Retired(Retired::Stale);
+                // Every line on disk came from a process that is gone, and a
+                // Posted with no Retired is a row nobody folded: Stale — except
+                // an exception, which is still open until it is filed.
+                if !rec.later {
+                    rec.state = LogState::Retired(Retired::Stale);
+                }
                 rec.retired_at = None;
                 self.push_record(rec);
             }
@@ -765,11 +833,18 @@ impl MessageLog {
     /// Load a whole file's lines ([`Self::replay`] each, in the order given —
     /// the loader sorts them by id): first past EVERY id among them, so an id
     /// minted for a collision is above the file's own and never renumbers a
-    /// record that comes later in the sort (ruling 270; live, day three's fix
-    /// stage: a collision at 3 minted 4 and pushed the wire's 4…9 up by one).
+    /// record that comes later in the sort (ruling 270). The top is the
+    /// highest id that CAN raise the sequence: one corrupt or hand-edited id
+    /// at the ceiling raises nothing ([`Self::raise`]), and taken as the top
+    /// it would switch the pre-raise off for the whole file (ruling 415 (i)).
     pub fn replay_all(&mut self, lines: impl IntoIterator<Item = LogLine>) {
         let lines: Vec<LogLine> = lines.into_iter().collect();
-        if let Some(top) = lines.iter().filter_map(LogLine::id).max() {
+        if let Some(top) = lines
+            .iter()
+            .filter_map(LogLine::id)
+            .filter(|id| id.next().raw() < ID_CEILING)
+            .max()
+        {
             self.raise(top);
         }
         for line in lines {
@@ -777,12 +852,38 @@ impl MessageLog {
         }
     }
 
+    /// The number the FILE gave the record under `id`: `id` itself, unless a
+    /// replay minted it for a collision, or the seed moved the record off a
+    /// carried number ([`Self::remapped`], [`Self::adopt_carried`]) — then the
+    /// file id it was remapped from; `None` for an id a merge minted, whose
+    /// file id is not kept.
+    ///
+    /// A host that asks which process wrote a record by the number it was
+    /// written under reads it here, never off [`LogRecord::id`]: a record of
+    /// another writer of the shared file that collided is loaded under a fresh
+    /// id above the file's top (ruling 270), whatever its own number was.
+    #[must_use]
+    pub fn file_id_of(&self, id: MessageId) -> Option<u64> {
+        if !self.minted_at_replay.contains(&id.raw()) {
+            return Some(id.raw());
+        }
+        self.remapped
+            .iter()
+            .find(|(_, fresh)| fresh.contains(&id))
+            .map(|(file, _)| *file)
+    }
+
     /// The records loaded for file id `file_id`, oldest first: the ring's
     /// own record of that number (unless a remap minted it), then the ones
     /// remapped from it.
     fn replay_candidates(&self, file_id: MessageId) -> Vec<MessageId> {
-        let own = (!self.minted_at_replay.contains(&file_id.raw()) && self.get(file_id).is_some())
-            .then_some(file_id);
+        self.candidates_given(file_id, self.get(file_id).is_some())
+    }
+
+    /// [`Self::replay_candidates`], given whether the ring `held` a record
+    /// under `file_id`.
+    fn candidates_given(&self, file_id: MessageId, held: bool) -> Vec<MessageId> {
+        let own = (held && !self.minted_at_replay.contains(&file_id.raw())).then_some(file_id);
         own.into_iter()
             .chain(
                 self.remapped
@@ -919,6 +1020,40 @@ impl MessageLog {
 
     // ---- the center's side --------------------------------------------
 
+    /// THE LATEST WORD on a fact: among the retired records under `key` (of
+    /// the digest's when `exceptions`, of every other class when not), the one
+    /// that retired last — by its retirement TIME, never by ring position. A
+    /// record posted after an entry opened and before the owner dismissed it
+    /// sits later in the ring but is an older word. Ties go to the higher id.
+    #[must_use]
+    pub(crate) fn last_word(&self, key: &str, exceptions: bool) -> Option<&LogRecord> {
+        self.ring
+            .iter()
+            .filter(|r| r.later == exceptions && r.key.as_deref() == Some(key) && !r.is_live())
+            .max_by_key(|r| (r.retired_unix_ms.unwrap_or(0), r.id))
+    }
+
+    /// The filings of `key`'s exception at or after `since_ms` — how often the
+    /// owner has put this same fact away lately, for the back-off of its
+    /// quiet span ([`crate::need::Resurface::backed_off`]).
+    #[must_use]
+    pub(crate) fn filings_since(&self, key: &str, since_ms: u64) -> u32 {
+        let n = self
+            .ring
+            .iter()
+            .filter(|r| {
+                r.key.as_deref() == Some(key)
+                    && matches!(
+                        r.retired(),
+                        Some(Retired::Dismissed | Retired::Answered { .. })
+                    )
+                    && r.later
+                    && r.retired_unix_ms.is_some_and(|t| t >= since_ms)
+            })
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
     /// Mint the next id.
     pub(crate) fn mint(&mut self) -> MessageId {
         let id = self.next_id();
@@ -952,36 +1087,47 @@ impl MessageLog {
     /// 194).
     fn push_record(&mut self, rec: LogRecord) {
         if self.ring.len() >= LOG_CAP {
-            self.evict_one();
+            self.evict_one(rec.stamp.unix_ms);
         }
+        self.wire_records += usize::from(rec.wire_owned());
         self.ring.push_back(rec);
     }
 
-    /// Make room for one record: the oldest retired wire record once the wire
-    /// holds its share, else the oldest retired record, else the oldest.
-    fn evict_one(&mut self) {
-        let wire_full = self.ring.iter().filter(|r| r.wire_owned()).count() >= WIRE_LOG_SHARE;
+    /// Make room for one record stamped `at_ms`: the oldest retired wire record
+    /// once the wire holds its share, else the oldest retired record, else the
+    /// oldest. A filed exception outlives the ordinary FIFO for `FILED_KEEP`
+    /// after its filing: the dismissal IS the fact's memory
+    /// (`MessageCenter::quiet_record`), and the ring is counted in records,
+    /// not days. Only when nothing else can go does the oldest record leave
+    /// whatever it is.
+    fn evict_one(&mut self, at_ms: u64) {
+        let wire_full = self.wire_records >= WIRE_LOG_SHARE;
         let wire_victim = || {
             self.ring
                 .iter()
                 .position(|r| r.wire_owned() && !r.is_live())
         };
+        let keep_since = at_ms.saturating_sub(crate::need::FILED_KEEP_MS);
         let victim = wire_full
             .then(wire_victim)
             .flatten()
+            .or_else(|| {
+                self.ring
+                    .iter()
+                    .position(|r| !r.is_live() && !r.kept_as_filing(keep_since))
+            })
             .or_else(|| self.ring.iter().position(|r| !r.is_live()));
-        match victim {
-            Some(i) => {
-                self.ring.remove(i);
-            }
-            None => {
-                self.ring.pop_front();
-            }
+        let gone = match victim {
+            Some(i) => self.ring.remove(i),
+            None => self.ring.pop_front(),
+        };
+        if gone.is_some_and(|r| r.wire_owned()) {
+            self.wire_records -= 1;
         }
     }
 
-    /// THE FILE READ AGAIN, merged into the ring (round-seven update audit,
-    /// finding 41). A seamless successor on the late-park lane loads the file
+    /// THE FILE READ AGAIN, merged into the ring. A seamless successor on the
+    /// late-park lane loads the file
     /// when it BOOTS, and its parent keeps recording until Commit — posting,
     /// retiring, pressing — so the boot's load is missing every record the
     /// parent wrote after it, and reads a row the parent closed after it as
@@ -990,7 +1136,11 @@ impl MessageLog {
     ///
     /// * ids: never mint at or below the file's top again;
     /// * a record the ring already holds (the same stamp and tag, and the same
-    ///   id or posted words) that is LIVE here stays as it is — a carried row
+    ///   id, posted words or FILE id — a collision loads a record under a
+    ///   fresh id that differs between two loads once the file's top moved,
+    ///   and its words change when it retires; ruling 415 (f);
+    ///   a ring record the file holds under its own id is paired by that id
+    ///   alone) that is LIVE here stays as it is — a carried row
     ///   is this process's now; one the boot read as `Stale` takes the ending
     ///   the file has (its state, final words and mark), and a press the file
     ///   records is kept;
@@ -1002,13 +1152,35 @@ impl MessageLog {
     pub(crate) fn merge_reloaded(&mut self, disk: &MessageLog) {
         self.raise_to(disk.next_id);
         for rec in &disk.ring {
+            let file_id = disk.file_id_of(rec.id);
+            // A ring record the file holds under its OWN id (the same stamp
+            // and tag) is that record, never another of the same words: two
+            // records of one stamp, tag and title, the first evicted here
+            // before Commit, handed the first's ending to the second (round
+            // 44). Only the id key pairs it.
+            let claimed = |r: &LogRecord| {
+                disk.get(r.id)
+                    .is_some_and(|d| d.id != rec.id && d.stamp == r.stamp && d.tag == r.tag)
+            };
             let same = self
                 .ring
                 .iter()
                 .position(|r| r.stamp == rec.stamp && r.tag == rec.tag && r.id == rec.id)
                 .or_else(|| {
                     self.ring.iter().position(|r| {
-                        r.stamp == rec.stamp && r.tag == rec.tag && r.title == rec.title
+                        r.stamp == rec.stamp
+                            && r.tag == rec.tag
+                            && r.title == rec.title
+                            && !claimed(r)
+                    })
+                })
+                .or_else(|| {
+                    let file_id = file_id?;
+                    self.ring.iter().position(|r| {
+                        r.stamp == rec.stamp
+                            && r.tag == rec.tag
+                            && self.file_id_of(r.id) == Some(file_id)
+                            && !claimed(r)
                     })
                 });
             if let Some(i) = same {
@@ -1043,13 +1215,14 @@ impl MessageLog {
             }
             self.raise(rec.id);
             if self.ring.len() >= LOG_CAP {
-                self.evict_one();
+                self.evict_one(rec.stamp.unix_ms);
             }
             let at = self
                 .ring
                 .iter()
                 .position(|r| r.id > rec.id)
                 .unwrap_or(self.ring.len());
+            self.wire_records += usize::from(rec.wire_owned());
             self.ring.insert(at, rec);
         }
     }
@@ -1082,15 +1255,15 @@ impl MessageLog {
     /// it (its stamp and tag — the title may have been restated since), else
     /// inserted.
     ///
-    /// ONE ID, ONE RECORD (ruling 270; round 17 review, V3): the carried id
+    /// ONE ID, ONE RECORD (ruling 270): the carried id
     /// is the live row's and wins. A record of ANOTHER writer loaded under
     /// that number — a file id, or one [`Self::replay_all`] minted for a
     /// collision above the file's top while the parent's Posted line was
-    /// not yet on disk — moves to a fresh id and keeps its own words, never
-    /// re-opened under the carried row's. The parent's own record, if a
-    /// collision loaded it under a minted id, takes its number back. The
-    /// center raises past the carry's `next_id` first, so the fresh id is
-    /// above every carried one.
+    /// not yet on disk — moves to a fresh id and keeps its own words and its
+    /// file id (ruling 416 (a)), never re-opened under the carried row's.
+    /// The parent's own record, if a collision loaded it under a minted id,
+    /// takes its number back. The center raises past the carry's `next_id`
+    /// first, so the fresh id is above every carried one.
     pub(crate) fn adopt_carried(&mut self, rec: LogRecord) {
         self.raise(rec.id);
         let mine = self.replay_candidates(rec.id).into_iter().find(|id| {
@@ -1098,8 +1271,18 @@ impl MessageLog {
                 .is_some_and(|r| r.stamp == rec.stamp && r.tag == rec.tag)
         });
         if mine != Some(rec.id) && self.get(rec.id).is_some() {
+            // The squatter keeps its FILE id (ruling 416 (a)): its fresh id
+            // takes the carried one's place among that number's remaps, so
+            // Commit's reload knows it by it ([`Self::merge_reloaded`]) once
+            // its words have changed.
+            let file_id = self.file_id_of(rec.id);
             let fresh = self.mint();
             self.minted_at_replay.insert(fresh.raw());
+            if let Some(file_id) = file_id {
+                let remaps = self.remapped.entry(file_id).or_default();
+                remaps.retain(|id| *id != rec.id);
+                remaps.push(fresh);
+            }
             if let Some(squatter) = self.get_mut(rec.id) {
                 squatter.id = fresh;
             }
@@ -1114,6 +1297,57 @@ impl MessageLog {
                 existing.detail = rec.detail;
             }
             None => self.push_record(rec),
+        }
+    }
+
+    /// The FILE's record of the row posted under file id `id` at `stamp` with
+    /// `tag` — under its own number, or under the fresh id a collision with
+    /// another writer's record of that number moved it to (ruling 270); `None`
+    /// when the file holds no such record. [`Self::get`] by `id` alone answers
+    /// the other writer's record there instead.
+    #[must_use]
+    pub fn record_of_file_id(
+        &self,
+        id: MessageId,
+        stamp: WallStamp,
+        tag: &Tag,
+    ) -> Option<&LogRecord> {
+        self.ring
+            .iter()
+            .rev()
+            .find(|r| r.stamp == stamp && r.tag == *tag && self.file_id_of(r.id) == Some(id.raw()))
+    }
+
+    /// The mark the FILE gives the record posted under file id `id` at
+    /// `stamp` with `tag` — its own number, or a collision's remap of it —
+    /// while no line has closed it (its Posted line open, or retired
+    /// `Stale`, which a later Retired line still lands on): the mark a
+    /// Retired line appended for that row is weighed against (ruling 270;
+    /// ruling 416 (b)). `None` when the file holds no such record.
+    pub(crate) fn open_posted_mark(
+        &self,
+        id: MessageId,
+        stamp: WallStamp,
+        tag: &Tag,
+    ) -> Option<(Severity, Glyph)> {
+        self.ring
+            .iter()
+            .find(|r| {
+                r.stamp == stamp
+                    && r.tag == *tag
+                    && !Self::closed_by_a_line(r)
+                    && self.file_id_of(r.id) == Some(id.raw())
+            })
+            .map(|r| (r.severity, r.glyph))
+    }
+
+    /// A live row now shows `mark` (a restate, or a seeded row over the
+    /// file's Posted line): its record reads it while it lives, so the wire's
+    /// `sev=` says what the glass and the page say (ruling 415 (l)).
+    /// No line: the Retired line carries the mark the row retires under.
+    pub(crate) fn show_mark(&mut self, id: MessageId, mark: (Severity, Glyph)) {
+        if let Some(rec) = self.get_mut(id).filter(|r| r.is_live()) {
+            (rec.severity, rec.glyph) = mark;
         }
     }
 
@@ -1147,6 +1381,157 @@ impl MessageLog {
             repeats: words.repeats,
             mark: words.mark,
         });
+    }
+
+    /// THE PARENT'S ENDING OF A CARRIED ROW, adopted at Commit
+    /// (`MessageCenter::end_carried_rows_the_parent_ended`):
+    /// the ring's record of live row `id` takes the ending `from` (the file's
+    /// record of the same row) has — its state, its final words and mark, and a
+    /// press it records — WITHOUT a line of its own: the parent wrote that one, and
+    /// it is in the file. Like any record read from disk, it holds no instant of
+    /// this process's.
+    pub(crate) fn adopt_ending(&mut self, id: MessageId, from: &LogRecord) {
+        if let Some(rec) = self.get_mut(id) {
+            rec.state = from.state.clone();
+            rec.retired_unix_ms = from.retired_unix_ms;
+            rec.retired_at = None;
+            rec.title.clone_from(&from.title);
+            rec.detail.clone_from(&from.detail);
+            rec.repeats = from.repeats;
+            rec.severity = from.severity;
+            rec.glyph = from.glyph;
+            if rec.last_action.is_none() {
+                rec.last_action.clone_from(&from.last_action);
+            }
+        }
+    }
+
+    /// The cause behind `key`'s digest entry ended while nothing was open: when
+    /// the latest word on the key is a filing, retire that record `Resolved`
+    /// at `unix_ms` (a second `Retired` line, which replay applies in order),
+    /// so [`Self::last_word`] no longer keeps the fact quiet. `true` when it
+    /// did.
+    pub(crate) fn resolve_filing(&mut self, key: &str, unix_ms: u64, now: Instant) -> bool {
+        let Some(last) = self.last_word(key, true).filter(|r| r.filed_exception()) else {
+            return false;
+        };
+        let (id, title, detail, repeats) = (
+            last.id,
+            last.title.clone(),
+            last.detail.clone(),
+            last.repeats,
+        );
+        self.record_retired(
+            id,
+            Retired::Resolved(Outcome::Ok),
+            unix_ms,
+            now,
+            FinalWords {
+                title: &title,
+                detail: &detail,
+                repeats,
+                mark: None,
+            },
+        );
+        true
+    }
+
+    /// The read, dismissal or answer `id` that keeps a standing row's key quiet
+    /// no longer stands for the row's fact
+    /// ([`crate::MessageCenter::end_standing_quiet`]): it retires again
+    /// `Withdrawn` at `unix_ms`, its words kept (a second `Retired` line, which
+    /// replay applies in order), so [`Self::last_word`]'s quiet ends. `false`
+    /// when there is no such record.
+    pub(crate) fn withdraw_read(&mut self, id: MessageId, unix_ms: u64, now: Instant) -> bool {
+        let Some(read) = self.get(id) else {
+            return false;
+        };
+        let (title, detail, repeats) = (read.title.clone(), read.detail.clone(), read.repeats);
+        self.record_retired(
+            id,
+            Retired::Withdrawn,
+            unix_ms,
+            now,
+            FinalWords {
+                title: &title,
+                detail: &detail,
+                repeats,
+                mark: None,
+            },
+        );
+        true
+    }
+
+    /// A RECORD RE-WORDED IN PLACE ([`crate::MessageCenter::reword_record`]):
+    /// the record takes `title` and `detail`, and a second `retired` line
+    /// carrying them goes to the log under the SAME retirement, instant and
+    /// repeats — so a relaunch replays the one record with its latest words
+    /// ([`Self::replay`] merges a later Retired line into its record), and an
+    /// older build reads it the same way. Its retirement instant in this
+    /// process ([`LogRecord::retired_at`]) is untouched: nothing finished
+    /// again. `false` (nothing queued) when there is no such retired record,
+    /// or its words are these already.
+    pub(crate) fn record_reworded(
+        &mut self,
+        id: MessageId,
+        title: &str,
+        detail: &[String],
+    ) -> bool {
+        let Some(rec) = self.get_mut(id) else {
+            return false;
+        };
+        let (LogState::Retired(how), Some(unix_ms)) = (rec.state.clone(), rec.retired_unix_ms)
+        else {
+            return false;
+        };
+        if rec.title == title && rec.detail == detail {
+            return false;
+        }
+        rec.title = title.to_string();
+        rec.detail = detail.to_vec();
+        let repeats = rec.repeats;
+        self.push_pending(LogLine::Retired {
+            id,
+            how,
+            unix_ms,
+            title: title.to_string(),
+            detail: detail.to_vec(),
+            repeats,
+            mark: None,
+        });
+        true
+    }
+
+    /// A RETIRED RECORD RETIRED AGAIN, AS `how`
+    /// ([`crate::MessageCenter::supersede_record`]): its words, instant and
+    /// repeats stay, and a second `retired` line carrying them under `how`
+    /// goes to the log, so a relaunch replays the new retirement
+    /// ([`Self::replay`] takes a later Retired line's). Its retirement
+    /// instant in this process ([`LogRecord::retired_at`]) is untouched.
+    /// `false` (nothing queued) when there is no such retired record, or it
+    /// is retired `how` already.
+    pub(crate) fn record_retired_again(&mut self, id: MessageId, how: Retired) -> bool {
+        let Some(rec) = self.get_mut(id) else {
+            return false;
+        };
+        let (LogState::Retired(was), Some(unix_ms)) = (&rec.state, rec.retired_unix_ms) else {
+            return false;
+        };
+        if *was == how {
+            return false;
+        }
+        rec.state = LogState::Retired(how.clone());
+        let line = LogLine::Retired {
+            id,
+            how,
+            unix_ms,
+            title: rec.title.clone(),
+            detail: rec.detail.clone(),
+            repeats: rec.repeats,
+            mark: None,
+        };
+        self.push_pending(line);
+        true
     }
 
     /// A capsule press.
@@ -1246,6 +1631,7 @@ pub(crate) mod tests {
             retired_unix_ms: None,
             retired_at: None,
             last_action: None,
+            later: false,
         }
     }
 
@@ -1451,7 +1837,7 @@ pub(crate) mod tests {
         assert_eq!(log.len(), 2, "deduped by id");
     }
 
-    /// TWO INSTANCES, ONE ID (the owner's `messages.log`, 2026-09-26): a
+    /// TWO INSTANCES, ONE ID: a
     /// test instance posted and retired its id 15; the long-running window,
     /// whose counter had not seen it, later posted and retired its own 15.
     /// Both records load, each with its own words. NEGATIVE CONTROL: a Posted
@@ -1566,7 +1952,7 @@ pub(crate) mod tests {
         assert_eq!(ids, [15, 17, 16], "16 keeps its number");
     }
 
-    /// RULING 270 (round 17 review, V2): a DELIVERED row retires under its
+    /// RULING 270: a DELIVERED row retires under its
     /// finished words (`Deploying site` → `Deployed site`, or `— done`), so a
     /// Retired line is routed by the words the center derives from each open
     /// candidate's posted title, not by the posted title alone. When the
@@ -1729,7 +2115,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Review (2026-09-24, design ruling 194): a script posting once a
+    /// Ruling 194: a script posting once a
     /// second must not push aterm's own history (the crash record, a config
     /// error) out of the ring. The wire's records past [`WIRE_LOG_SHARE`]
     /// evict each other; a host record goes only to another host record.
@@ -1793,6 +2179,7 @@ pub(crate) mod tests {
         let wire_n = log.records().filter(|r| r.wire_owned()).count();
         assert_eq!(wire_n, WIRE_LOG_SHARE);
         assert_eq!(log.len() - wire_n, LOG_CAP - WIRE_LOG_SHARE);
+        assert_eq!(log.wire_records, wire_n, "the kept count is the ring's");
         // A carried wire row's record (origin carried, a `wire.` key) is the
         // wire's too; a host key is not.
         let carried = LogRecord {
@@ -1809,8 +2196,8 @@ pub(crate) mod tests {
         assert!(!hosted.wire_owned());
     }
 
-    /// REVIEW (2026-09-22): a message at the crate's OWN caps reads back
-    /// from its own line. The caps are in CHARS (24 × 240 detail + 120
+    /// A message at the crate's OWN caps reads back from its own line. The
+    /// caps are in CHARS (24 × 240 detail + 120
     /// title + 48 key); [`MAX_LINE_BYTES`] is in BYTES, so it is sized from
     /// the caps at four bytes a char (box-drawing, CJK and backslash-escaped
     /// text at the cap encode to 11–24 KiB) with room to spare — never
@@ -1861,10 +2248,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// REVIEW (2026-09-22): a line cut short mid-append fails to decode
-    /// wherever the cut lands — a cut INSIDE the last field's value used to
-    /// read as a different record (`label=Open`, `rep=1` for 12, `n=1` for
-    /// 12); the `end=` terminator catches it.
+    /// A line cut short mid-append fails to decode wherever the cut lands: a
+    /// cut INSIDE the last field's value would read as a different record
+    /// (`label=Open`, `rep=1` for 12, `n=1` for 12); the `end=` terminator
+    /// catches it.
     #[test]
     fn a_truncated_last_field_fails_to_decode() {
         let acted = LogLine::Acted {
@@ -1902,11 +2289,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// REVIEW (2026-09-22): ids keep rising after replay — including past a
-    /// replayed id at the ceiling. `raise` used to saturate `next_id` at
-    /// `u64::MAX`, after which `mint` handed out `u64::MAX` forever: one
-    /// corrupt or hand-edited line made every later post share one id. An
-    /// id at or past [`ID_CEILING`] is kept as a record but never raises the
+    /// Ids keep rising after replay, including past a replayed id at the
+    /// ceiling: a saturated `next_id` would make every later post share
+    /// `u64::MAX`. An id at or past [`ID_CEILING`] is kept as a record but
+    /// never raises the
     /// sequence, and a forged carry's `next_id` there is ignored the same.
     #[test]
     fn ids_keep_rising_after_replaying_a_max_id() {
@@ -1939,8 +2325,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE FILE READ AGAIN AT COMMIT (round-seven update audit, finding 41):
-    /// the late-park successor loaded the file at its boot, and its parent
+    /// THE FILE READ AGAIN AT COMMIT: the late-park successor loaded the file
+    /// at its boot, and its parent
     /// kept recording until Commit. Merging the file read again gives the
     /// row the parent closed after the boot its real ending (never `Stale`),
     /// brings in the records the parent wrote after the boot, leaves a row
@@ -2033,10 +2419,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// REVIEW (2026-09-22): words the loader takes from the file are not
-    /// re-capped or re-sanitized — a hand-edited or hostile line puts a
-    /// 5000-char, ESC-bearing, newline-bearing title in the ring, past every
-    /// cap `post` enforces; `copy_text` and the page then carry it.
+    /// Words the loader takes from the file are capped and sanitized like a
+    /// post's: a hand-edited or hostile line's 5000-char, ESC-bearing,
+    /// newline-bearing title never reaches the ring, `copy_text` or the page.
     #[test]
     fn loaded_records_are_capped_like_posted_ones() {
         let detail: Vec<String> = (0..30)
@@ -2087,11 +2472,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// REVIEW (2026-09-22): `detail=` on the wire is both `[]` and `[""]`,
-    /// so a record with ONE empty detail line used to read back with none
-    /// and a compaction was not the identity for it. Now `[""]` is
+    /// `detail=` on the wire is both `[]` and `[""]`, so `[""]` is
     /// unrepresentable: the builder drops empty lines, and so does the
-    /// decoder, so no message the engine holds is ambiguous on the wire.
+    /// decoder, so no message the engine holds is ambiguous on the wire and
+    /// a compaction is the identity.
     #[test]
     fn a_lone_empty_detail_line_round_trips() {
         let msg = Message::new(tags::SYSTEM, Severity::Info, "t").line("");

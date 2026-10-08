@@ -5,14 +5,11 @@
 //! and `[update] auto_apply` for the headless `aterm update` verbs, which say whether a
 //! downloaded build installs by itself.
 //!
-//! THE ONE SWITCH (2026-09-23). `$ATERM_NO_AUTO_UPDATE` was the only way to turn the
-//! app updater off, and an environment variable reaches only the processes one shell
-//! launched: never the window a Dock click or a login item starts, never a nested
-//! instance past the deny-list. The owner's rule is that a person's controls are
-//! Settings, not environment ("NOT ENV VARS those are for development"), so the switch
-//! is a key in the SAME `aterm.toml` the window reads — Settings ▸ Software Update
-//! writes it — and every process that runs the updater (the window, a terminal session, the
-//! `aterm update` verbs) reads it here, identically.
+//! THE ONE SWITCH is a setting, not an environment variable: a variable reaches only the
+//! processes one shell launched, never the window a Dock click or a login item starts,
+//! and a person's controls are Settings. It is a key in the SAME `aterm.toml` the window
+//! reads — Settings ▸ Software Update writes it — and every process that runs the updater
+//! (the window, a terminal session, the `aterm update` verbs) reads it here, identically.
 //!
 //! Only the `[update]` table is deserialized, on its own (atpkg's one-table wrapper
 //! discipline), so a typo in another table cannot flip it. A file that is missing,

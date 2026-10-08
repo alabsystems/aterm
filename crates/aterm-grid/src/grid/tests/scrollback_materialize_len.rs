@@ -2,9 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! MaterializedRow::len() unit tests (#5613).
-//!
-//! Migrated from aterm-core as part of #6556 Batch 2.
+//! MaterializedRow::len() unit tests.
 
 use super::super::*;
 
@@ -97,9 +95,8 @@ fn materialized_row_len_styled_trailing_spaces() {
     let line = Line::with_attrs("A ", attrs);
     let row = materialize_from_line(&line, 10);
 
-    // A trailing coloured space is a WRITTEN cell, so it counts toward len exactly
-    // as the live `Row::len` (write high-water mark) does — the previous `len() == 1`
-    // was the gap that dropped coloured status-bar blanks on scrollback.
+    // A trailing coloured space is a written cell and counts toward len, as the
+    // live `Row::len` (write high-water mark) does.
     assert_eq!(
         row.len(),
         2,

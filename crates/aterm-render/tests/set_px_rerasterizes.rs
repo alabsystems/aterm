@@ -15,10 +15,9 @@
 // relies on.
 
 use aterm_render::{Renderer, Theme};
-use proptest::prelude::*;
 
 // Bundled ligature font (same fixture the ligature gate uses). Embedded so the
-// property test always runs — the metrics scaling assertion needs real font
+// test always runs — the metrics scaling assertion needs real font
 // metrics, not a host-dependent system font that may be absent under CI/SSH.
 const FONT: &[u8] = include_bytes!("fixtures/jetbrains-mono.ttf");
 
@@ -32,92 +31,93 @@ fn glyph_dims(r: &mut Renderer, ch: char) -> (usize, usize) {
     (img.width(), img.height())
 }
 
-proptest! {
-    // PROPERTY (a): cell_width and cell_height scale (monotonically, roughly
-    // proportionally) with px. A strictly LARGER px must yield cells at least as
-    // large on BOTH axes and strictly larger on at least one — the metrics are
-    // re-derived from the font at the new px, never frozen at construction. We use
-    // a meaningful gap (>= 4 px) so the integer ceil/round of cell metrics is
-    // guaranteed to move, avoiding flakiness from sub-pixel rounding at tiny deltas.
-    #[test]
-    fn set_px_scales_cell_metrics_monotonically(
-        base in 10.0f32..40.0,
-        delta in 4.0f32..40.0,
-    ) {
-        let small = base;
-        let large = base + delta;
+// PROPERTY (a): cell_width and cell_height scale (monotonically, roughly
+// proportionally) with px. A strictly LARGER px must yield cells at least as
+// large on BOTH axes and strictly larger on at least one — the metrics are
+// re-derived from the font at the new px, never frozen at construction. A
+// meaningful gap (>= 4 px) guarantees the integer ceil/round of cell metrics
+// moves, avoiding flakiness from sub-pixel rounding at tiny deltas.
+#[test]
+fn set_px_scales_cell_metrics_monotonically() {
+    for small in [10.0f32, 13.5, 17.25, 24.0, 31.5, 39.75] {
+        for delta in [4.0f32, 7.5, 16.0, 27.25, 39.5] {
+            let large = small + delta;
+            let mut r = renderer_at(small);
+            let (w0, h0) = r.cell_size();
 
-        let mut r = renderer_at(small);
-        let (w0, h0) = r.cell_size();
+            r.set_px(large);
+            let (w1, h1) = r.cell_size();
 
-        r.set_px(large);
-        let (w1, h1) = r.cell_size();
+            assert!(
+                w1 >= w0,
+                "{small}->{large}: cell width shrank: {w0} -> {w1}"
+            );
+            assert!(
+                h1 >= h0,
+                "{small}->{large}: cell height shrank: {h0} -> {h1}"
+            );
+            assert!(
+                w1 > w0 || h1 > h0,
+                "{small}->{large}: a >=4px size increase must grow a cell axis"
+            );
+            // Ratio sanity: a near-doubling of px must NOT leave the cell
+            // roughly the same size (that would mean metrics were not
+            // re-derived). Generous slack for integer rounding.
+            let want = large / small;
+            let got_h = h1 as f32 / h0 as f32;
+            assert!(
+                got_h > 1.0 + (want - 1.0) * 0.5,
+                "cell height must scale roughly with px: px x{want:.2} but height only x{got_h:.2}"
+            );
 
-        prop_assert!(w1 >= w0, "wider px must not shrink cell width: {w0} -> {w1}");
-        prop_assert!(h1 >= h0, "wider px must not shrink cell height: {h0} -> {h1}");
-        prop_assert!(
-            w1 > w0 || h1 > h0,
-            "a >=4px size increase must grow at least one cell axis: ({w0},{h0}) -> ({w1},{h1})"
-        );
-        // Ratio sanity: a near-doubling of px must NOT leave the cell roughly the
-        // same size (that would mean metrics were not re-derived). Allow generous
-        // slack for integer rounding, but reject "barely moved".
-        let want = large / small;
-        let got_h = h1 as f32 / h0 as f32;
-        prop_assert!(
-            got_h > 1.0 + (want - 1.0) * 0.5,
-            "cell height must scale roughly with px: px x{want:.2} but height only x{got_h:.2}"
-        );
-
-        // Round-trip: shrinking back re-derives the ORIGINAL metrics (no drift).
-        r.set_px(small);
-        prop_assert_eq!(r.cell_size(), (w0, h0), "set_px round-trips cell metrics");
-    }
-
-    // PROPERTY (b): set_px(new_px) INVALIDATES the glyph cache, and a subsequent
-    // render re-rasterizes at the new px. We rasterize a glyph (filling the cache),
-    // assert the cache is non-empty, then set_px and assert the cache is EMPTY
-    // (dropped), then re-rasterize and assert the new image is sized for the new px
-    // (not the stale old-px bitmap).
-    #[test]
-    fn set_px_invalidates_glyph_cache_and_rerasterizes(
-        base in 12.0f32..28.0,
-        delta in 6.0f32..30.0,
-    ) {
-        let small = base;
-        let large = base + delta;
-
-        let mut r = renderer_at(small);
-
-        // Warm the atlas at the small px.
-        let (w_small, h_small) = glyph_dims(&mut r, 'M');
-        prop_assert!(r.glyph_cache_len() > 0, "rasterizing must populate the glyph cache");
-        prop_assert!(w_small > 0 && h_small > 0, "small-px 'M' must rasterize to a real bitmap");
-
-        // Re-size: the cache must be DROPPED (stale bitmaps were rasterized at the
-        // old px). This is the invariant the host's DPR fix depends on — without it
-        // the new frame would blit upscaled, soft glyphs.
-        r.set_px(large);
-        prop_assert_eq!(
-            r.glyph_cache_len(),
-            0,
-            "set_px must clear the glyph atlas so glyphs re-rasterize at the new px"
-        );
-
-        // The NEXT rasterization produces a glyph sized for the LARGER px (it was
-        // re-rasterized, not upscaled from the dropped cache).
-        let (_w_large, h_large) = glyph_dims(&mut r, 'M');
-        prop_assert!(r.glyph_cache_len() > 0, "re-rasterization re-populates the cache");
-        prop_assert!(
-            h_large > h_small,
-            "re-rasterized glyph must be taller at the larger px: {h_small} -> {h_large}"
-        );
+            // Round-trip: shrinking back re-derives the ORIGINAL metrics.
+            r.set_px(small);
+            assert_eq!(r.cell_size(), (w0, h0), "set_px round-trips cell metrics");
+        }
     }
 }
 
-// A focused (non-proptest) sanity case so the contract is also pinned at a fixed,
-// human-readable size pair, and so the suite has a deterministic regression anchor
-// even if proptest shrinking ever masks a corner.
+// PROPERTY (b): set_px(new_px) INVALIDATES the glyph cache, and a subsequent
+// render re-rasterizes at the new px — never the stale old-px bitmap.
+#[test]
+fn set_px_invalidates_glyph_cache_and_rerasterizes() {
+    for small in [12.0f32, 15.5, 19.25, 23.0, 27.75] {
+        for delta in [6.0f32, 11.5, 20.0, 29.75] {
+            let large = small + delta;
+            let mut r = renderer_at(small);
+
+            // Warm the atlas at the small px.
+            let (w_small, h_small) = glyph_dims(&mut r, 'M');
+            assert!(
+                r.glyph_cache_len() > 0,
+                "rasterizing must populate the glyph cache"
+            );
+            assert!(w_small > 0 && h_small > 0, "small-px 'M' must rasterize");
+
+            // The cache must be DROPPED (stale bitmaps were rasterized at the
+            // old px) — the invariant the host's DPR fix depends on.
+            r.set_px(large);
+            assert_eq!(
+                r.glyph_cache_len(),
+                0,
+                "set_px must clear the glyph atlas so glyphs re-rasterize at the new px"
+            );
+
+            let (_w_large, h_large) = glyph_dims(&mut r, 'M');
+            assert!(
+                r.glyph_cache_len() > 0,
+                "re-rasterization re-populates the cache"
+            );
+            assert!(
+                h_large > h_small,
+                "{small}->{large}: re-rasterized glyph must be taller: {h_small} -> {h_large}"
+            );
+        }
+    }
+}
+
+// A focused sanity case so the contract is also pinned at a human-readable
+// size pair.
 #[test]
 fn set_px_doubling_clears_cache_and_doubles_height_anchor() {
     let mut r = renderer_at(16.0);

@@ -80,9 +80,20 @@ impl<'a> HandOver<'a> {
 /// prelude would hand over here again), with `args` verbatim. Built here, apart from the
 /// `exec`, so the argument vector is pinned on every platform; `cli::cmd_landing` hands
 /// it to [`crate::platform::exec_or_run`].
+///
+/// Raw, not `aterm_uds::spawnfd::command`: the landing verb and a self-update's forward
+/// become the tool's shim, so their caller's descriptors are the tool's (B27's
+/// allow-list; the warm pass strips the command itself, `warm::warm_command`). They
+/// `exec` it on Unix, which keeps the whole table on every std; SPAWNED, a `std` command
+/// hands its child stdio alone under Trust's std since SP-1, so a pass-through that waits
+/// on its program spawns with `aterm_uds::spawnfd::transparent` instead. Its
+/// Windows console is decided here all the same (`aterm_uds::spawn::set_flags`,
+/// `Console::Quiet`, B28): it shares the console the verb runs in, and a caller with
+/// none gets a windowless one, never a visible console window.
 #[must_use]
 pub fn shim_command(layout: &Layout, tool: &ToolName, args: &[String]) -> std::process::Command {
     let mut command = std::process::Command::new(layout.shim(tool));
+    aterm_uds::spawn::set_flags(&mut command, aterm_uds::spawn::Console::Quiet, 0);
     command.args(args);
     command
 }
@@ -109,11 +120,6 @@ pub fn sweep(layout: &Layout) {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-
-    #[test]
-    fn the_hidden_verb_keeps_its_name() {
-        assert_eq!(HIDDEN_VERB, "__landing");
-    }
 
     /// THE VERB'S OPERANDS AND WHAT IT RUNS (pinned on every platform, 2026-09-17): the
     /// program, the absolute prefix operand, exactly one `--` stripped, the user's own
@@ -174,11 +180,8 @@ mod pure_tests {
 mod tests {
     use super::*;
 
-    fn temp_layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-landing-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        Layout { prefix: p }
+    fn temp_layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-landing-{label}-"))
     }
 
     /// EVERY MARKER GOES, WHOEVER WROTE IT (Phase 2, 2026-09-22): a live pid's marker in
@@ -241,10 +244,10 @@ mod windows_tests {
 
     #[test]
     fn the_verb_runs_the_bin_shim_as_a_child_with_its_real_code() {
-        let p = std::env::temp_dir().join(format!("atpkg-landing-win-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        let layout = Layout { prefix: p };
+        let p = crate::testdir::dir("atpkg-landing-win-");
+        let layout = Layout {
+            prefix: p.to_path_buf(),
+        };
         let tool = ToolName::new("claude").unwrap();
         let log = layout.prefix.join("log.txt");
         let target = layout

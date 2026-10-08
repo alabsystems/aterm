@@ -4,28 +4,16 @@
 //! TOML 1.0.0 for aterm — the serde front end and the comment-preserving
 //! document model, first-party.
 //!
-//! # Why this crate exists
+//! # What it serves
 //!
-//! aterm reads and writes TOML in three registers, and until now that cost four
-//! third-party packages:
+//! | job | what it needs |
+//! |-----|---------------|
+//! | load `aterm.toml`, every `Cargo.toml`, the art assets | a `serde::Deserializer` |
+//! | save the Preferences window's edits without touching a comment | a format-preserving DOM |
+//! | underline a config diagnostic in the editor | byte spans on every node |
 //!
-//! | job | what it needs | what it used |
-//! |-----|---------------|--------------|
-//! | load `aterm.toml`, every `Cargo.toml`, the art assets | a `serde::Deserializer` | `toml` |
-//! | save the Preferences window's edits without touching a comment | a format-preserving DOM | `toml_edit` |
-//! | underline a config diagnostic in the editor | byte spans on every node | both |
-//!
-//! `toml` + `toml_edit` brought SIX packages and 64,783 lines of third-party
-//! source for that, measured by `forge survey` on every cell before and after
-//! the swap: `toml`, `toml_edit`, `toml_write`, `winnow`, and `serde_spanned` +
-//! `toml_datetime`, which are reached only through `toml` itself. One of the
-//! six, `winnow`, aterm had to FORK to fix an `offset_from` divide-by-zero,
-//! which meant carrying a vendored parser-combinator library and a
-//! `[patch.crates-io]` entry in order to read config files. That fork went with
-//! them.
-//!
-//! This crate is both registers over one parser, in a fraction of the code,
-//! with the spec's rules enforced where they are load-bearing.
+//! All three run over one parser. It replaces `toml` and `toml_edit` (six
+//! packages, 64,783 lines of third-party source, including a forked `winnow`).
 //!
 //! # The two halves
 //!
@@ -62,7 +50,7 @@
 //! Nothing in TOML 1.0.0 is left out. The deliberate omissions are all TOML
 //! 1.1 *drafts* — the `\e` escape, unquoted trailing newlines in inline
 //! tables, seconds-optional times, and `\x` escapes — because 1.1 is not a
-//! released spec and the crates this replaces do not implement them either.
+//! released spec.
 
 #![forbid(unsafe_code)]
 

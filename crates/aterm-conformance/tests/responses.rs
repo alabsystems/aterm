@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 //
 // Response correctness — feed a query, drain Terminal::take_response(), assert
-// the EXACT reply bytes. Expectations are xterm/VT510-correct; where the reply
+// the exact reply bytes. Expectations are xterm/VT510-correct; where the reply
 // embeds an identity constant (DA1/DA2/DA3 device params, firmware version),
 // the engine's own documented identity is asserted and marked as such.
 
@@ -121,15 +121,11 @@ fn decrqm_reports_reset_for_origin_mode_off() {
 #[test]
 fn decrqm_2048_in_band_resize_reports_reset_when_off() {
     // xterm DECRPM: Ps=2 = mode recognized but reset. In-band resize
-    // notifications (mode 2048) are now implemented — aterm emits a size report
-    // on enable and on every resize — so DECRQM reports the real state: Ps=2
-    // (reset) at power-on since 2048 is off by default, including after the
-    // kitty keyboard protocol is enabled. Neovim 0.10+ pushes kitty flags and
-    // then probes 2048; because aterm actually delivers the notifications,
-    // reporting the mode as known (not the Ps=0 "not recognized") is correct
-    // and does not strand the client. See handler_dec.rs decrqm_reports_mode_
-    // 2048_state for the on/off state coverage; this pins the kitty-keyboard
-    // arm against the historical 2048 misrouting.
+    // notifications (mode 2048) are implemented (a size report on enable and
+    // on every resize), so DECRQM reports the real state: reset at power-on,
+    // including after the kitty keyboard protocol is enabled (Neovim 0.10+
+    // pushes kitty flags, then probes 2048). handler_dec.rs
+    // decrqm_reports_mode_2048_state covers the on/off states.
     assert_eq!(resp(b"\x1b[?2048$p"), "\x1b[?2048;2$y");
     assert_eq!(resp(b"\x1b[>1u\x1b[?2048$p"), "\x1b[?2048;2$y");
 }
@@ -138,13 +134,13 @@ fn decrqm_2048_in_band_resize_reports_reset_when_off() {
 fn kitty_keyboard_flags_query_uses_csi_question_u_not_decrqm() {
     // Kitty keyboard protocol: flags are reported via CSI ? u -> CSI ? Pf u.
     // The protocol has no DEC private mode number, so DECRQM is never the
-    // channel for it (the misrouted 2048 arm this pins against).
+    // channel for it.
     assert_eq!(resp(b"\x1b[>1u\x1b[?u"), "\x1b[?1u");
 }
 
 // --- DECRQSS ---------------------------------------------------------------
 // Validity code: the engine follows xterm's convention — DCS 1 $ r .. ST for a
-// VALID request, DCS 0 $ r ST for invalid. Note this is INVERTED from the DEC
+// valid request, DCS 0 $ r ST for invalid. Note this is inverted from the DEC
 // VT510/VT520 manuals, where 0 means valid and 1 means invalid; xterm's
 // convention is what modern applications expect.
 
@@ -186,11 +182,9 @@ fn decrqss_decscusr_reports_cursor_style() {
 
 #[test]
 fn decrqss_decscl_reports_level_and_fixed_7bit_c1() {
-    // DECSCL ("p) reports the conformance level plus the C1 *transmission* mode
-    // (1 = 8-bit / S8C1T, 2 = 7-bit / S7C1T). aterm has a FIXED 7-bit C1
-    // transmission policy: even when DECSCL is SET requesting 8-bit C1 (Pc = 1),
-    // the report must come back 7-bit (;2). The set-side deliberately ignores the
-    // C1 mode and the report mirrors the real, invariant state — not a placeholder.
+    // DECSCL ("p) reports the conformance level plus the C1 transmission mode
+    // (1 = 8-bit / S8C1T, 2 = 7-bit / S7C1T). aterm's C1 transmission is fixed
+    // at 7-bit, so even with 8-bit requested (Pc = 1) the report says ;2.
     // Set VT520 (Pl = 65) with 8-bit C1 requested, then query DECSCL.
     assert_eq!(
         resp(b"\x1b[65;1\"p\x1bP$q\"p\x1b\\"),

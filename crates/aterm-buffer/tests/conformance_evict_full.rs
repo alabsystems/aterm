@@ -1,26 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Conformance: the real `EventLog`'s live ring satisfies the DERIVED faithful
-//! ring's `EvictOldestContiguous`.
-//!
-//! `aterm_spec::derive::evict_full_model()` is the function-valued model whose
-//! invariant `EvictOldestContiguous` (`\A n : live[n] <=> (lo =< n /\ n =< seq)`)
-//! `ty` proves (Tier 0): the live region is EXACTLY the contiguous window
-//! `[lo, seq]`, so eviction removes precisely the oldest event — never a hole,
-//! never two. The scalar ring conformance binds only `seq`/`lo`; THIS test binds
-//! the actual ring CONTENTS, by driving the genuine shipping `EventLog` past its
-//! cap (so eviction fires) and checking that the set of live seqs is exactly the
-//! window. A bug that evicted out of order, dropped an extra event, or left a hole
-//! would violate it. Pure Rust + real code, so it always runs.
+//! Conformance: the real `EventLog`'s live ring satisfies the derived
+//! `evict_full_model()`'s `EvictOldestContiguous`
+//! (`\A n : live[n] <=> (lo =< n /\ n =< seq)`): the live region is exactly the
+//! window `[lo, seq]`, so eviction removes precisely the oldest event. The
+//! scalar ring conformance binds only `seq`/`lo`; this binds the ring contents
+//! past the cap. Pure Rust, so it always runs.
 
+use crate::support::write_cap;
 use aterm_buffer::{Edit, Surface};
-mod support;
 use aterm_spec::derive::evict_full_model;
 use std::collections::BTreeSet;
-use support::write_cap;
 
-/// The real ring cap (mirrors `aterm_buffer::MAX_LOG_EVENTS = 1<<16`).
+/// The real ring cap (`aterm_buffer::MAX_LOG_EVENTS`).
 const CAP: u64 = 1 << 16;
 
 #[test]

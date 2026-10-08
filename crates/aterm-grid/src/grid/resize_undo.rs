@@ -2,60 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! THE RESIZE UNDO: a rows-only shrink on a grid that keeps no history, then a
-//! grow back with nothing drawn in between, is an exact identity.
+//! Resize undo: a rows-only shrink on a grid that keeps no history, then a grow
+//! back with nothing drawn in between, is an exact identity.
 //!
-//! WHY (measured 2026-09-28 against a live Claude Code tab). The window
-//! re-gridded 121x52→51→52 within 0.8 ms, about once a minute. The alternate
-//! screen keeps no history (`max_scrollback = 0`), so the shrink's TOP-DEMOTE was
-//! evicted in the same call and the grow could only append a blank row: every
-//! row sat one higher than the app painted it. Claude Code repaints only when
-//! its SIGWINCH handler reads a CHANGED size; when both halves landed before the
-//! handler ran it read 52 == 52, skipped the repaint, and diffed onto the
-//! shifted rows for good. Whatever re-grids a window, the app's picture must
-//! survive a flap it never saw, so the engine undoes it.
+//! Why: an alternate screen keeps no history, so a shrink evicts its demoted
+//! top row and a plain grow appends a blank, leaving every row one higher than
+//! the app painted it. An app that repaints only on a changed size (read after
+//! both halves landed) never heals that shift.
 //!
-//! HOW. A Native rows-only shrink of a grid with no retention and no tiered
-//! store (the alt screen's shape) keeps what it takes off the screen in a
-//! stash, one entry per row in unit-shrink order: TRIMMED blank rows (nothing
-//! to keep: a blank append rebuilds them), then the DEMOTED top rows, then the
-//! PUSHED bottom rows, each with its extras box. A later shrink stacks onto the
-//! stash; a grow pops it LIFO, re-inserting demoted rows above the viewport
-//! (the ordinary reveal then relabels them, moving the cursor, the saved
-//! cursor, the extras and the selection back down) and appending pushed rows
-//! where it would append blanks. When the grow lands back on the height the
-//! first shrink started from, the cursor picture that shrink found (cursor,
-//! pending wrap, the grid's saved cursor, the scroll region and the horizontal
-//! margins, which every resize resets) is put back too, and the stash goes.
+//! How: a Native rows-only shrink of a grid with no retention and no tiered
+//! store keeps what it takes off the screen in a stash, one entry per row in
+//! unit-shrink order: trimmed blank rows, then demoted top rows, then pushed
+//! bottom rows, each with its extras. A later shrink stacks onto the stash; a
+//! grow pops it LIFO, re-inserting demoted rows above the viewport (the reveal
+//! then relabels them and moves cursor, saved cursor, extras and selection
+//! down) and appending pushed rows where it would append blanks. When the grow
+//! lands on the first shrink's starting height, that shrink's cursor picture
+//! (cursor, pending wrap, saved cursor, scroll region, horizontal margins) is
+//! restored and the stash dropped.
 //!
-//! WHEN IT IS VALID. Only while nothing could have seen or changed the screen
-//! the shrink left: the grid's `content_gen` is where the last resize sealed it,
-//! the width, height and cursor picture are what that resize left, the grid
-//! still keeps no history and the policy is Native. Anything else DROPS the
-//! stash, and the resize runs exactly as it always has (the historical shift,
-//! which the app's own repaint heals). `Terminal::process_at` drops it on any
-//! input at all, so no mutation path that marks damage without bumping
-//! `content_gen` can slip between the halves; an alt-screen switch and a reset
-//! drop it too. An app that drew at the smaller size keeps today's behaviour:
-//! its SIGWINCH repaint at the changed size is what heals it.
+//! Validity: the stash holds only while `content_gen`, width, height and
+//! cursor picture are what the sealing resize left, the grid keeps no history
+//! and the policy is Native; otherwise it is dropped and the resize runs
+//! normally. `Terminal::process_at` drops it on any input (not every mutation
+//! bumps `content_gen`), as do an alt-screen switch and a reset.
 //!
-//! Why ANY input, not only a `content_gen` move: not every mutation path bumps
-//! `content_gen` (VS15/VS16 presentation fixes and OSC 1337 are two that did
-//! not), so a narrower rule would hand back rows over a screen that changed.
-//! The cost is that output which draws nothing (a mode set, a query) between
-//! the halves still leaves the historical shift; an app whose handler ran
-//! there saw the changed size and repaints, but an unrelated spinner frame
-//! does not. The undo makes the incident's flap (nothing between the halves)
-//! an identity; it does not close the window entirely, and the host must still
-//! not flap.
-//!
-//! Session-only: never checkpointed, never journalled beyond the counts in
-//! [`crate::ResizeShape`]. A checkpoint or live upgrade between the halves
-//! restores a grid with no undo, so that flap keeps the historical shift.
-//!
-//! The selection lives on the host, not here: `Terminal` keeps the one the
-//! first shrink found and puts it back on [`crate::ResizeShape::undone`],
-//! keyed by [`Grid::resize_undo_serial`].
+//! Session-only: never checkpointed or journalled beyond the counts in
+//! [`crate::ResizeShape`]. The selection lives on the host: `Terminal` keeps
+//! the one the first shrink found and restores it on
+//! [`crate::ResizeShape::undone`], keyed by [`Grid::resize_undo_serial`].
 
 use super::scroll_convert::ScrolledRowExtras;
 use super::{Cursor, Grid, HorizontalMargins, ScrollRegion};
@@ -97,7 +72,7 @@ pub(crate) struct ResizeUndo {
     pub(crate) entries: Vec<UndoRow>,
     /// The width every entry was taken at.
     cols: u16,
-    /// The height the FIRST shrink started from, and the cursor picture it
+    /// The height the first shrink started from, and the cursor picture it
     /// found there.
     rows_before: u16,
     pre: CursorPicture,
@@ -206,17 +181,11 @@ impl Grid {
     }
 
     /// The Native rows-grow's half: pop up to `grow` entries (newest first).
-    /// Demoted rows are re-inserted ABOVE the viewport as history, oldest on
-    /// top, with their extras boxes aligned in `ring_extras`, so the reveal that
-    /// follows relabels them into the viewport and moves every other row, the
-    /// cursor and the selection back down by their count. Everything taken off
-    /// the BOTTOM — pushed rows (`Some`) and trimmed blanks (`None`, a fresh
-    /// blank row) — is returned in pop order, which is top-first, for the
-    /// caller to append in exactly that order. A trimmed entry popped before a
-    /// pushed one sat ABOVE it: a push at 8→7 then a trim at 7→6 left
-    /// `[L5, blank, X]` on the bottom, and a single grow 6→8 that appended the
-    /// pushed rows before the blanks (the first cut of this undo) gave back
-    /// `[L5, X, blank]` while the ledger read `displaced=0`.
+    /// Demoted rows are re-inserted above the viewport as history, oldest on
+    /// top, with their extras aligned in `ring_extras`, so the following reveal
+    /// relabels them into the viewport. Bottom entries (pushed rows as `Some`,
+    /// trimmed blanks as `None`) are returned in pop order, which is top-first,
+    /// for the caller to append in that order.
     ///
     /// A stash is only admitted on a grid with no history
     /// (`keeps_resize_undo`), so every row inserted here is the whole history.
@@ -268,9 +237,8 @@ impl Grid {
         bottom
     }
 
-    /// Forget the stash: the next grow appends blanks, as it always did. Called
-    /// on any output ([`crate::Grid`] owners: `Terminal::process_at`), on an
-    /// alternate-screen switch and on a reset.
+    /// Forget the stash: the next grow appends blanks. Called on any output
+    /// (`Terminal::process_at`), an alternate-screen switch and a reset.
     #[inline]
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
@@ -346,9 +314,8 @@ mod tests {
         )
     }
 
-    /// The incident's shape: 121x52 on a grid that keeps no history, every row
-    /// painted, the cursor on the bottom row, a scroll region set. 52→51→52 with
-    /// nothing between the halves hands the demoted top row back.
+    /// 121x52 on a grid that keeps no history, every row painted, cursor on the
+    /// bottom row, a scroll region set: 52→51→52 hands the demoted top row back.
     #[test]
     fn a_quiet_52_51_52_flap_is_an_identity() {
         let mut grid = labelled(52, 121, 51, 0);
@@ -450,11 +417,8 @@ mod tests {
         assert_eq!(picture(&grid), before);
     }
 
-    /// A PUSH then a TRIM, handed back by ONE grow: the trimmed blank sat above
-    /// the pushed row and must come back above it. (Adversarial review of the
-    /// first cut: 8→7 pushed `X`, 7→6 trimmed the blank now at the bottom, and
-    /// the grow 6→8 appended `X` before the blank, `[L5, X, blank]`, while the
-    /// ledger read `displaced=0 render=ok`.) Every unwind order agrees.
+    /// A push then a trim, handed back by one grow: the trimmed blank sat above
+    /// the pushed row and comes back above it. Every unwind order agrees.
     #[test]
     fn a_trim_stacked_on_a_push_comes_back_above_it() {
         fn painted() -> Grid {
@@ -489,9 +453,8 @@ mod tests {
         assert_eq!((grow.restored_bottom, grow.appended), (1, 1));
     }
 
-    /// Anything between the halves that could have shown the app the smaller
-    /// screen, or changed it, drops the undo: the grow appends as it always
-    /// did and the screen stays shifted (the app's own repaint heals it).
+    /// Anything between the halves that could have shown or changed the smaller
+    /// screen drops the undo: the grow appends and the screen stays shifted.
     #[test]
     fn a_write_a_cursor_move_or_a_width_change_drops_the_undo() {
         type Between = fn(&mut Grid);

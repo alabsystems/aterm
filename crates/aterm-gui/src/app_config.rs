@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Config subsystem: the `aterm.toml` model (`Config`) plus the loaders and
-//! precedence resolvers (font px, force scale, grid size, tab-strip rows), AND
-//! the `App`-side font/scale/backend/config methods that consume them
-//! (set_font_px, rebuild_backend, on_scale_factor_changed, on_resize,
-//! reload_config, toggle_fullscreen). A verbatim inherent-impl split.
+//! Config subsystem: the `aterm.toml` model (`Config`), its loaders and
+//! precedence resolvers (font px, force scale, grid size, tab-strip rows), and
+//! the `App` methods that consume them (font, scale, backend, resize, reload,
+//! fullscreen).
 
 use aterm_core::terminal::{ColorPalette, CursorStyle, Rgb};
 use aterm_render::Theme;
-use std::io::Read as _;
 use winit::dpi::PhysicalSize;
 
 use crate::input::{InputEvent, Source};
@@ -19,89 +17,42 @@ use crate::{
     term_lock,
 };
 
-/// THE PLATFORM DEFAULT for decoration that paints OVER content the user is trying
-/// to read. `true` everywhere except WINDOWS.
+/// Platform default for decoration drawn over content: `true` everywhere except
+/// Windows, whose defaults are minimal and fast (decorative GPU presents on the
+/// keystroke path cost typing latency there).
 ///
-/// WHY THE SPLIT, from this repo's own history rather than taste. The owner's
-/// standing Windows directive is a minimal, fast, native terminal, and it was
-/// already shipped once: `6272bd7a` ("fix(windows/ux): minimal fast defaults — kill
-/// typing lag, yellow cast, HUD, loud cursor") turned `cursor_trail`,
-/// `cursor_trail_bloom`, `stream_fade` and `show_hud` OFF after a Windows audit
-/// traced typing lag to "decorative work shipped ON by default doing full-frame GPU
-/// presents on the keystroke hot path", and `d22ba722` ("keep 6272bd7a minimal-fast
-/// defaults OFF; correct the stale tests") restored that after a test-driven revert
-/// put them back.
+/// It governs `cursor_trail` (the resident cat is drawn over text). Keys that stay
+/// out: `cursor_trail_bloom`, `hdr_glow` and `cursor_fire_shimmer` already emit
+/// nothing with the trail off; `[sparkle_words] enabled` draws under text and is
+/// capped (see `Config::sparkle_words_enabled_or_default`); `stream_fade` is off
+/// everywhere and the remaining effects are opt-in.
 ///
-/// IT OWNS ONE KEY (a second, `pkg_progress_effects` — the retired floating
-/// progress card's party trim — left with the card; the status bars that replaced
-/// it carry no decoration for it to govern).
-///
-/// * `cursor_trail` — the audit's HEADLINE, and the one this family exists for. The
-///   default STYLE became `rainbow kitty pet` long after `5b11ff2c` made the
-///   "batteries-on delight" call about a ~260 ms aurora, so the master now seats a
-///   permanently resident, walking, full-body cat drawn `FreeZ::OverText` across live
-///   output; the auditor photographed it sitting on a line of real terminal text
-///   beside the caret. The owner's own `aterm.toml` already writes
-///   `cursor_trail = false` by hand — a default a user has to undo is not a default.
-///   Native Settings seeds every row from the RESOLVED config, so this default
-///   re-baselines the Windows projection of the disclosure ladder ("Inactive · Cursor
-///   trail Off" on every dependent row), the music-suppression reason, the
-///   cursor-runway preview and the compact pickers' pagination — those screens are
-///   exactly what a macOS owner with `cursor_trail = false` sees today, and they were
-///   reviewed as part of this change rather than left to a later hand.
-///
-/// WHAT IS NOT IN IT, and why — read before adding a key:
-///
-/// * `cursor_trail_bloom`. Every consumer reads it as `cursor_trail_or_default() && …`,
-///   so with the master off it can already emit nothing; splitting it would buy no
-///   pixel and no millisecond, and would only degrade the look for the Windows owner
-///   who opts back in with `cursor_trail = true`.
-/// * `[sparkle_words] enabled` — the word engine pushes its animal heads
-///   `FreeZ::UnderText`, so every glyph still draws on top of the fur: it decorates
-///   output rather than covering it, and its population is capped (`MAX_CATS = 8`)
-///   rather than accumulating. (It is also a live product gate in native Settings with
-///   its own disclosure ladder and migration path.) See
-///   `Config::sparkle_words_enabled_or_default`, which also names the one honest
-///   exception. (Named, not linked: that resolver is `#[cfg(test)]`, so an
-///   intra-doc link from this shipping item would not resolve.)
-/// * `hdr_glow`, `cursor_fire_shimmer` — both default ON, and both only do work on
-///   frames carrying cursor-GLOW quads, which only the trail produces; with the
-///   Windows trail default off, a fresh Windows config already pays neither.
-/// * `stream_fade` (already OFF everywhere since `6272bd7a`), `show_hud` (a retired
-///   key — the HUD is gone), functional motion, the visual bell, cursor blink, and
-///   everything already opt-in (Robi, the ambient sound bed).
-///
-/// Nothing here silences a key the user set: every consumer is
-/// `Option::unwrap_or(DEFAULT_DECORATIVE_EFFECTS)`, so an explicit `true` in
-/// `aterm.toml` turns the effect on, on Windows exactly like anywhere else.
+/// An explicit value in `aterm.toml` always wins: every consumer is
+/// `Option::unwrap_or(DEFAULT_DECORATIVE_EFFECTS)`.
 pub(crate) const DEFAULT_DECORATIVE_EFFECTS: bool = !cfg!(windows);
 
 /// User config file (`$XDG_CONFIG_HOME/aterm/aterm.toml`, else
 /// `~/.config/aterm/aterm.toml`). Every field is optional; unknown keys are
-/// ignored (forward-compatible). Precedence at startup is env var > config >
-/// built-in default, so existing `ATERM_*` usage and `-e`/`-d` flags still win.
-/// v1 exposes the settings that were previously env-only; it will grow to mirror
-/// the engine's `TerminalConfig` (colours, cursor, scrollback) as themes land.
+/// ignored. Precedence is launch flag > config > built-in default; no environment
+/// variable sets a key.
 ///
-/// `PartialEq` (derived through every embedded table) lets the prepared config
-/// admission path skip runtime side effects when a worker supplies a semantic
-/// no-op. Exact text, comments, and asset generations still advance through the
-/// versioned native config service independently of that runtime dedupe.
+/// `PartialEq` lets config admission skip runtime side effects for a semantic
+/// no-op; text, comments and asset generations are versioned separately by the
+/// native config service.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct Config {
     /// Glyph size in physical px (`--font-px` outranks it for one launch).
     pub(crate) font_px: Option<f32>,
-    /// GPU (wgpu/Metal/Vulkan) rendering. Default ON (all platforms) with an
-    /// automatic CPU fallback if the GPU is unavailable (device init OR the first
-    /// window's surface fails); set `gpu = false` (or launch with `--cpu`) to
-    /// force the CPU renderer. `--gpu` forces on.
+    /// GPU rendering. Default on, with automatic CPU fallback when device init or
+    /// the first surface fails; `gpu = false` (or `--cpu`) forces the CPU
+    /// renderer, `--gpu` forces on.
     pub(crate) gpu: Option<bool>,
     /// Scrollback history limit, in lines (engine `TerminalConfig.scrollback_limit`;
     /// default 100 000). 0 means unlimited (bounded only by the memory budget).
     pub(crate) scrollback_lines: Option<usize>,
-    /// Cursor shape: `"block"` (default) or `"bar"` (alias `"beam"`). The underline
-    /// option is retired (programs may still request it via DECSCUSR).
+    /// Cursor shape: `"block"` (default) or `"bar"` (alias `"beam"`). Underline
+    /// is not offered (programs may still request it via DECSCUSR).
     pub(crate) cursor_style: Option<String>,
     /// Whether the cursor blinks (default true). Combined with `cursor_style`.
     pub(crate) cursor_blink: Option<bool>,
@@ -116,78 +67,41 @@ pub(crate) struct Config {
     /// Theme: indexed palette colours, `#RRGGBB`, by 0-based index (0–15 are the
     /// ANSI/bright set; up to 256). e.g. `palette = ["#1d1f21", "#cc6666", …]`.
     pub(crate) palette: Option<Vec<String>>,
-    /// MOTION POLICY (W11): `"auto"` (DEFAULT — follow Reduce Motion live on
-    /// macOS, sample the Windows animations switch at window attach, and use no
-    /// OS-driven reduction where no query exists), `"full"` (always animate), or
-    /// `"reduced"` (never animate). Governs every decorative animation — the
-    /// cursor aurora, sparkle words, matrix rain, and the Settings effect
-    /// demo — through ONE resolved [`crate::motion::MotionPolicy`]. Unknown
-    /// values fall back to `auto`. Unfocused windows always demote to static
-    /// effects regardless of this value. Hot-reloadable.
+    /// Motion policy: `"auto"` (default: follow Reduce Motion live on macOS,
+    /// sample the Windows animations switch at window attach, no reduction
+    /// elsewhere), `"full"` or `"reduced"`. Governs every decorative animation
+    /// through one [`crate::motion::MotionPolicy`]; unknown values fall back to
+    /// `auto`, and unfocused windows always show static effects. Hot-reloadable.
     pub(crate) motion: Option<String>,
-    /// LOAD-ADAPTIVE MOTION (the Change #1 effect-shedding heuristic): when `true`
-    /// (DEFAULT) a sustained RENDER-overload session drops every decorative animation
-    /// to the proven zero-amplitude Reduced state so aterm stays responsive. Set
-    /// `false` to opt OUT of the heuristic entirely — animations then follow `motion`
-    /// / the OS Reduce-Motion flag alone. `motion = "full"` overrides the shed
-    /// regardless of this (an explicit "always animate"). Hot-reloadable.
+    /// Load-adaptive motion: when `true` (default) sustained render overload drops
+    /// decorative animation to the reduced state. `false` opts out;
+    /// `motion = "full"` overrides the shed. Hot-reloadable.
     pub(crate) load_adaptive_motion: Option<bool>,
-    /// SERIOUS MODE: suppress every nonessential sound and decorative effect while
-    /// preserving terminal behavior, cursor blink, visual bell/attention, and
-    /// functional motion such as smooth scrolling. DEFAULT OFF. This is an
-    /// overriding projection only: individual effect preferences and runtime rain
-    /// overrides remain intact and become effective again when serious mode turns off.
+    /// Serious mode: suppress nonessential sound and decorative effects while
+    /// keeping terminal behavior, cursor blink, visual bell and functional motion.
+    /// Default off. Individual effect preferences are left intact and apply again
+    /// when it turns off.
     pub(crate) serious_mode: Option<bool>,
-    /// Cursor MOTION TRAIL — the "streaming trailer" effect. DEFAULT ON and
-    /// exactly idle at rest; set `cursor_trail = false` to opt out.
+    /// Cursor motion trail. Default on (see [`DEFAULT_DECORATIVE_EFFECTS`]) and
+    /// idle at rest; `cursor_trail = false` opts out.
     pub(crate) cursor_trail: Option<bool>,
-    /// TYPING-MOMENTUM GLOW — the cursor glows with how fast you type and
-    /// cools down when you stop; while warm it does not blink. DEFAULT ON
-    /// (owner, 2026-09-08: "the blinking cursor is annoying, I want some
-    /// momentum glow for typing faster that cools down"); set
-    /// `cursor_momentum_glow = false` to opt out. Any style, any shape; it
-    /// rides the cursor-effects lane, so `cursor_trail = false` (the effects
-    /// master) turns it off with everything else — which the frame step has
-    /// honoured since 2026-09-27 (before, a master-off window typed into fast
-    /// still lit it). So its effective default follows the master's:
-    /// [`DEFAULT_DECORATIVE_EFFECTS`], OFF on Windows — no ruling of its own,
-    /// only this key's contract meeting the owner's Windows minimal-fast
-    /// default for the master; `cursor_trail = true` turns the family on.
+    /// Typing-momentum glow: the cursor glows with typing speed, cools when
+    /// typing stops, and does not blink while warm. Rides the cursor-effects lane,
+    /// so `cursor_trail = false` turns it off too; its effective default follows
+    /// [`DEFAULT_DECORATIVE_EFFECTS`] (owner, 2026-09-08).
     pub(crate) cursor_momentum_glow: Option<bool>,
-    /// Trail STYLE: `rainbow kitty pet` (DEFAULT — the smooth momentum-driven
-    /// rainbow ribbon with the full-body cat that walks, runs and pounces along
-    /// the line), `rainbow kitty` (THE SAME THING: since 2026-08-26 every
-    /// kitty-named spelling, bare `kitty` included, draws the full-body
-    /// resident, because a style called *kitty* that drew no kitty was a naming
-    /// trap), `rainbow kitty flying` (the same ribbon under the OLD FLYING KITTY
-    /// HEAD instead — the explicit opt-in for anyone who wants the rare flypast
-    /// back; `flying kitty`/`kitty flying` and the historical
-    /// `nyan rainbow`/`nyan`/`rainbow` also select it), `rainbow kitty
-    /// underline` (the explicit highlighter-plus-under-baseline alternate),
-    /// and `rainbow kitty tall` (an explicit spelling of the DEFAULT v0.43
-    /// full-height geometry the letters stand inside),
-    /// `phaser` (a full-spectrum additive hue sweep along the
-    /// swept path), `comet` (the cadence-comet: a directional fading comet of
-    /// `TrailCell`s that ignites longer/hotter with fast sustained typing, wrapped in
-    /// the additive light crown), `lumen` (the additive light crown only — comet +
-    /// bloom + ping), `sparkle`
-    /// (phaser comet + spark particles), `fire` (rising embers), `laser` (white-hot
-    /// beam), `water`, `beam` (a bloom-free beam-only crown, no trail body), or `off`.
-    /// (`nyan rainbow`, `nyan` and `rainbow` are back-compat aliases for
-    /// `rainbow kitty flying` — the animal they have always drawn;
-    /// `kitty`/`kitty pet`/`pet kitty` for the resident pet.)
+    /// Trail style: `rainbow kitty pet` (default: rainbow ribbon plus the
+    /// full-body cat; every kitty-named spelling, bare `kitty` included, selects
+    /// it), `rainbow kitty flying` (the ribbon under the flying kitty head; also
+    /// `flying kitty`, `kitty flying`, `nyan rainbow`, `nyan`, `rainbow`),
+    /// `rainbow kitty underline`, `rainbow kitty tall` (the default full-height
+    /// geometry), `phaser`, `comet`, `lumen`, `sparkle`, `fire`, `laser`,
+    /// `water`, `beam`, or `off`.
     ///
-    /// THE RAINBOW KITTY IS v2 (`docs/design/RAINBOW-KITTY-V2.md`; switched
-    /// 2026-09-05, the previous engine deleted 2026-09-06): every
-    /// rainbow-kitty spelling above — the default included — draws the
-    /// rebuilt engine (the meteor on Ctrl-A/Ctrl-E, stardust, the music-box
-    /// typing voice under `trail_sound_style = "auto"`). The seam-era `… v2`
-    /// spellings are accepted and mean the same as the bare ones; the old
-    /// `… v1` escape (`rainbow kitty v1`, `kitty v1`, `nyan v1`, `rainbow
-    /// v1`, `… v1 pet`/`flying`/`underline`/`tall`) names nothing now — it
-    /// falls back to the default like any unknown spelling, and the fallback
-    /// is reported (`--validate-config`, the load-time warning, `trail
-    /// status`'s `resolved=`). Neither word is offered in the Settings picker.
+    /// Rainbow kitty styles draw the engine in `docs/design/RAINBOW-KITTY-V2.md`;
+    /// `… v2` spellings mean the same as the bare ones. Unknown spellings
+    /// (including `… v1`) fall back to the default, and the fallback is reported
+    /// (`--validate-config`, the load-time warning, `trail status`'s `resolved=`).
     pub(crate) cursor_trail_style: Option<String>,
     /// Trail Pack manifests — user-generated cursor trails as data (design
     /// `docs/trail-packs.md`). Each entry is a path to a `*.toml` Trail Pack
@@ -196,135 +110,60 @@ pub(crate) struct Config {
     /// unknown fields/effects rejected, every scalar clamped); an unreadable or
     /// invalid pack is skipped with a warning, never disabling the whole trail.
     pub(crate) cursor_trail_packs: Option<Vec<String>>,
-    /// Trail SOUND EFFECTS — the aural half of the trail styles: each style's
-    /// signature palette (water's droplets, fire's crackle, the beam's photon
-    /// hum…) plays softly on the same spawn edge that lights the trail.
-    /// DEFAULT ON, and silent by construction whenever the trail itself is
-    /// off, reduced-motion, or the window is unfocused. `trail_sounds = false`
-    /// mutes them; the Settings › Cursor › Trail effect card has the toggle.
+    /// Trail sound effects: each style's sound palette plays softly on the same
+    /// spawn edge that lights the trail. Default on; silent whenever the trail is
+    /// off, motion is reduced or the window is unfocused. `trail_sounds = false`
+    /// mutes them.
     pub(crate) trail_sounds: Option<bool>,
-    /// Trail sound VOLUME, `0.0`–`1.0` (default `0.4` — tuned so a lone
-    /// keystroke peaks ≈ −22 dBFS: audible in a quiet room, far under the
-    /// bell). Config-file only; the panel exposes the on/off toggle.
+    /// Trail sound volume, `0.0`–`1.0` (default `0.4`: a lone keystroke peaks
+    /// around −22 dBFS). Config-file only.
     pub(crate) trail_sound_volume: Option<f32>,
-    /// Trail sound AMBIENT BED (`trail_sound_bed`, default ON since the owner's
-    /// 2026-09-09 ruling): the continuous per-style background texture that
-    /// swells behind fast typing (water's stream, fire's ember wash, the
-    /// beam's hum…). `false` gates the bed mixer ENTIRELY — the synth's bed
-    /// layer is never fed, so it renders exactly zero samples (not a muted
-    /// gain-0 pass) — while the discrete notes, the brrrring, the bonk and
-    /// the melody are untouched. The bed DSP itself is kept intact behind
-    /// this gate: a redesign tournament evaluates it next phase.
+    /// Trail sound ambient bed (default on): the per-style background texture
+    /// behind fast typing. `false` gates the bed mixer entirely (zero samples
+    /// rendered); discrete notes and the melody are unaffected
+    /// (owner, 2026-09-09).
     pub(crate) trail_sound_bed: Option<bool>,
-    /// TYPING SOUND (`trail_sound_style`, default `"auto"`): WHICH voice
-    /// speaks for the keystroke sounds — the Settings ▸ Sound ▸ "Typing
-    /// sound" picker. `"auto"` follows the visual trail style (each style's
-    /// signature palette — today's sound, bit for bit). Every other value
-    /// picks an instrument spoken whatever the trail looks like: the nine
-    /// palettes by what they SOUND like — `"music box"` (the rainbow
-    /// kitty's; `"glass bell"`, the deleted v1 instrument's name, is an
-    /// alias of it), `"warm pluck"` (lumen), `"glitter"` (sparkle), `"ice
-    /// chime"` (comet), `"droplet"` (water), `"pew"` (phaser), `"zap"`
-    /// (laser), `"tick"` (beam), `"crackle"` (fire) — the `"mechanical"`
-    /// keyboard (switch click + case thock), and three sound-only voices:
-    /// `"typewriter"` (slug clack + platen thud; a margin-bell ding and
-    /// carriage zip on Enter), `"marimba"` (a warm rosewood bar under a yarn
-    /// mallet) and `"felt"` (a felt-muted piano — the hush). Aliases accepted
-    /// on load, never offered: the trail-style names (`water`, `comet`,
-    /// `rainbow kitty`, …), `bell`, `raindrop`, `mech`, `thock`, `mechanical
-    /// keyboard`, `piano`, `clack`, … (`SoundVoice::ALIASES`). Each keystroke,
-    /// deletion, Enter and the cursor's melody speak in the chosen voice and
-    /// its own ambient bed; the kitty's hold-song stays the kitty's. Every
-    /// voice sits on the same −21 dBFS typing floor and under the same rate
-    /// governor; volume/on-off/bed gates apply as usual. Picking a voice in
-    /// Settings plays one keystroke of it.
+    /// Typing sound voice (default `"auto"`, the Settings ▸ Sound ▸ "Typing
+    /// sound" picker). `"auto"` follows the trail style's palette. Other values
+    /// pick a voice regardless of trail: `"music box"` (alias `"glass bell"`),
+    /// `"warm pluck"`, `"glitter"`, `"ice chime"`, `"droplet"`, `"pew"`,
+    /// `"zap"`, `"tick"`, `"crackle"`, `"mechanical"`, `"typewriter"`,
+    /// `"marimba"` and `"felt"`. Load-only aliases are in `SoundVoice::ALIASES`.
+    /// Every voice shares the same typing floor, rate governor and
+    /// volume/on-off/bed gates; the kitty's hold-song stays the kitty's.
     pub(crate) trail_sound_style: Option<String>,
-    /// TONE MELODY (`tone_melody`, default ON): the trail-sound melody leans
-    /// with the inferred MOOD of the line being typed — a tiny on-device
-    /// classifier (`aterm_effects::tone`, multilingual char-n-gram net over
-    /// the TYPED line only, never screen content) picks one of five coarse
-    /// tones, and the synth answers with a scale-table/feel lean (calm
-    /// breathes, excitement brightens a whole tone, frustration turns minor,
-    /// playfulness goes suspended and skippy; technical/uncertain is
-    /// bit-exactly today's sound). Shipped ENABLED because the effect is
-    /// deliberately SUBTLE — same instruments, same volume, same governor,
-    /// consonance invariant intact — and inert whenever trail sounds are
-    /// (off, muted, unfocused, reduced-motion, headless). `false` pins the
-    /// melody to today's neutral constitution and stops the classifier from
-    /// ever running.
+    /// Tone melody (default on): an on-device classifier (`aterm_effects::tone`)
+    /// infers one of five moods from the typed line only (never screen content)
+    /// and the synth leans its scale and feel accordingly. Inert whenever trail
+    /// sounds are; `false` keeps the neutral melody and never runs the classifier.
     pub(crate) tone_melody: Option<bool>,
-    /// ROBI THE HELPER ROBOT (`robi`, default OFF — owner directive: the
-    /// resident is opt-IN; `robi = true` in aterm.toml or the Settings toggle
-    /// invites him back). A little white robot with a cyan visor (ported from
-    /// the user's Nitro Keyboard game) lives on the glass as a PERMANENT
-    /// RESIDENT once invited, cycling forever through his rounds: he walks
-    /// along the row being typed, does jumping jacks while sharing a
-    /// getting-started tip, extends a ladder up past the grid, climbs it,
-    /// swings across the tab bar like monkey bars while sharing a deeper tip
-    /// (aterm features, shell tricks, Claude Code tricks), drops, and rests —
-    /// then goes around again. His tips render as a speech bubble above his
-    /// head (`robi_bubble`, anchored to him). Typing `robi` or
-    /// `robot` restarts his rounds at the greeting. His idle stands are
-    /// static, so a resting Robi costs zero repaints. Hidden under reduced
-    /// motion, serious mode, or the default OFF — never by focus or time.
+    /// Robi the helper robot (default off). Once enabled he lives on the glass,
+    /// cycling through rounds (walking the typed row, climbing a ladder, swinging
+    /// across the tab bar) while showing tips in a speech bubble (`robi_bubble`).
+    /// Typing `robi` or `robot` restarts his rounds. Idle stands cost no
+    /// repaints; hidden under reduced motion or serious mode.
     pub(crate) robi: Option<bool>,
-    /// RAINBOW SPARKLE CELEBRATION (`notice_sparkle`, default ON — user-facing
-    /// features ship enabled; this is an opt-OUT). The post-update notice — the
-    /// one card whose whole job is to feel like a small reward — wears a
-    /// hue-cycling badge and a ring of twinkling rainbow sparkles instead of a
-    /// flat cursor-coloured disc. Purely decorative: the wording, the timing and
-    /// the click behaviour are untouched, every OTHER notice (update ready,
-    /// background status, Robi's tips) is unchanged, and reduced motion holds the
-    /// hues still so the card is colourful without moving.
+    /// Rainbow sparkle on the post-update notice (default on): a hue-cycling
+    /// badge and twinkling sparkles instead of a flat disc. Decorative only;
+    /// other notices are unchanged, and reduced motion holds the hues still.
     pub(crate) notice_sparkle: Option<bool>,
-    /// SING-ALONG RIFF (`trail_sound_riff`, default ON — user-facing features
-    /// ship enabled; this is an opt-OUT).
-    ///
-    /// The held-key celebration's song (`aterm_effects::kitty_sing` →
-    /// `Celebration(RiffBar)`) is TIER 5, the loudest thing the engine emits.
-    /// Before this key the only ways to quiet it were the master `trail_sounds`
-    /// switch — which kills every sound, keystrokes included — or
-    /// `trail_sound_volume`, which turns the keystrokes down with it. `false`
-    /// schedules no riff bar while leaving every other voice at its configured
-    /// level.
-    ///
-    /// SOUND ONLY: the sing-along's visuals (ribbon saturation, star shower,
-    /// the dancing cat and its singing face) are deliberately NOT gated here —
-    /// motion belongs to the motion contract, and the owner asked to quiet the
-    /// song, not to cancel the celebration. Subordinate to the existing law:
-    /// raw window focus × `trail_sounds` × `trail_sound_volume` still apply
-    /// first, so this can only ever take sound away.
+    /// Sing-along riff (default on): `false` schedules no riff bar for the
+    /// held-key celebration (`aterm_effects::kitty_sing`), the loudest sound the
+    /// engine emits, while other voices keep their levels. Sound only; the
+    /// celebration's visuals follow the motion policy. Focus, `trail_sounds` and
+    /// `trail_sound_volume` apply first.
     pub(crate) trail_sound_riff: Option<bool>,
-    /// AUDIBLE TERMINAL BELL (`bell_sound`, default ON — opt-OUT like every
-    /// other user-facing feature here).
-    ///
-    /// BEL (0x07) rings the user's configured system alert sound: `NSBeep` on
-    /// macOS, `MessageBeep` on Windows. It is NOT a synth voice, so
-    /// `trail_sound_volume` and `trail_sounds` do not reach it — before this key
-    /// it was the one sound in the product with no configuration at all. `false`
-    /// suppresses the beep only; the visual bell flash and the urgent-window /
-    /// Dock-bounce attention request stay, because those are how a muted
-    /// terminal still surfaces background activity.
-    ///
-    /// Parsed and preserved everywhere; INERT off macOS/Windows, which have no
-    /// beep call to gate (see `crate::diagnostics` capability warnings).
+    /// Audible terminal bell (default on). BEL rings the system alert sound
+    /// (`NSBeep` on macOS, `MessageBeep` on Windows), outside the trail synth's
+    /// volume controls. `false` suppresses the beep only; the visual bell and the
+    /// attention request stay. Inert off macOS/Windows.
     pub(crate) bell_sound: Option<bool>,
-    /// THE SUPERVISOR'S CHOICE CHIME (`choice_sound`, default ON — the owner's
-    /// "a little sound … for choosing", 2026-09-23).
-    ///
-    /// When the in-window supervisor answers Claude Code's question dialog
-    /// (`[harness] answer_questions`, or the session's own `meta set questions
-    /// recommended`), the window tells it as a `chose` story and plays one
-    /// short, quiet chime through the cursor-trail synth's output
-    /// (`App::chose_chime`). Bell-class, not trail-class: it plays for a
-    /// session in a background tab too, because the point is that the human
-    /// NOTICES a question was answered without them — but never headless,
-    /// never in serious mode, never with the Music effects master
-    /// (`trail_sounds`) off, and at most one per two seconds. `false` silences
-    /// the chime only; the band's `◆ chose` flash and the rim pulse stay.
-    ///
-    /// Parsed and preserved everywhere; INERT off macOS, where the synth has
-    /// no output (see `crate::diagnostics` capability warnings).
+    /// Supervisor choice chime (default on; owner, 2026-09-23): when the
+    /// in-window supervisor answers Claude Code's question dialog, a short
+    /// quiet chime plays through the trail synth (`App::chose_chime`), also for
+    /// background tabs, at most once per two seconds, never headless, in
+    /// serious mode or with `trail_sounds` off. `false` silences the chime
+    /// only. Inert off macOS.
     pub(crate) choice_sound: Option<bool>,
     /// Trail colour, `#RRGGBB`. Defaults to the (themed) cursor colour, so the
     /// trail matches the cursor unless overridden here.
@@ -332,115 +171,62 @@ pub(crate) struct Config {
     /// Secondary/accent colour, `#RRGGBB` (comet tail + landing ring of the LUMEN
     /// styles). Defaults to a brightened cursor colour.
     pub(crate) cursor_trail_accent: Option<String>,
-    /// Path to a PNG sprite for the cat that flies in front of the cursor on the
-    /// `rainbow kitty` style. Supply your own image (RGBA or RGB PNG, ideally a small
-    /// transparent pixel-art sprite facing right); it is nearest-scaled to fit
-    /// the cursor and flown in front. Unset ⇒ the built-in homage sprite. `~`
-    /// expands to $HOME.
-    ///
-    /// The field name IS the TOML key (serde, no rename), and a config key has
-    /// no alias seam the way the trail-style VALUE does — so this one keeps the
-    /// `nyan` spelling on purpose: renaming it would orphan every
-    /// `cursor_nyan_sprite` line already sitting in a user's `config.toml`.
+    /// Path to a PNG sprite for the flying cat on the `rainbow kitty flying`
+    /// style (RGBA or RGB, ideally small right-facing pixel art), nearest-scaled
+    /// to the cursor. Unset uses the built-in sprite. `~` expands to $HOME.
+    /// The key keeps its `nyan` spelling so existing configs still apply.
     pub(crate) cursor_nyan_sprite: Option<String>,
-    /// WALLPAPER image path: a picture drawn as the BACKDROP of every terminal
-    /// tab (settings and other native tabs are never wallpapered). The image is
-    /// cover-scaled to the window, toned toward the theme background by
-    /// [`wallpaper_dim`](Self::wallpaper_dim), and shows through every cell
-    /// whose background is the terminal default; selections and explicitly
-    /// colored backgrounds still paint over it. Set from Settings ▸ Wallpaper
-    /// (Choose Image… / Detach) or by hand. PNG everywhere; JPEG/HEIC/TIFF/GIF
-    /// and friends decode through the system on macOS. `~` expands to $HOME.
-    /// Unset ⇒ no wallpaper (the flat theme background, exactly as before).
+    /// Wallpaper image drawn behind every terminal tab (not native tabs).
+    /// Cover-scaled, toned toward the theme background by
+    /// [`wallpaper_dim`](Self::wallpaper_dim), and visible through cells with the
+    /// default background. PNG everywhere; other formats decode through the
+    /// system on macOS. `~` expands to $HOME. Unset means no wallpaper.
     pub(crate) wallpaper: Option<String>,
     /// How strongly the wallpaper is toned toward the theme background for
     /// text legibility: `0.0` shows the raw image, `1.0` is the flat theme
     /// background. Default 0.3.
     pub(crate) wallpaper_dim: Option<f32>,
-    /// WALLPAPER TEXT TINT: default-colored glyphs pick up the hue of the
-    /// backdrop under their own cell at an automatically readable brightness —
-    /// light ink over the picture's dark areas, dark ink over its bright
-    /// ones, always clearing a WCAG contrast floor — so the text shimmers
-    /// with the picture behind it and stays legible on any wallpaper.
-    /// SGR-colored text (prompts, `ls` colors) keeps its own colors. Only
-    /// active while a wallpaper is attached. Default ON.
+    /// Wallpaper text tint (default on): default-colored glyphs take the hue of
+    /// the backdrop under their cell at a brightness that clears a WCAG contrast
+    /// floor. SGR-colored text keeps its colors. Active only with a wallpaper.
     pub(crate) wallpaper_text_tint: Option<bool>,
     /// How long (milliseconds) a swept cell takes to fade out. Default 260.
     pub(crate) cursor_trail_ms: Option<u64>,
     /// Maximum comet length in cells (a long jump keeps the brightest cells
     /// nearest the cursor). Default 24.
     pub(crate) cursor_trail_length: Option<usize>,
-    /// Aurora brightness 0.0..=1.0 (LUMEN styles). Default 1.0.
+    /// Trail brightness 0.0..=1.0, every style. Default 1.0.
     pub(crate) cursor_trail_intensity: Option<f32>,
     /// Bloom-crown radius in cells (LUMEN styles); 0 disables the crown. Default 0.6.
     pub(crate) cursor_trail_radius: Option<f32>,
     /// Landing-ring "ping" on a jump (LUMEN styles). Default true.
     pub(crate) cursor_trail_ring: Option<bool>,
-    // `cursor_trail_wake_ms` IS RETIRED (2026-09-16). It was the previous
-    // rainbow kitty's typing-wake dial; `RAINBOW-KITTY-V2.md` §17.3 phase 7
-    // deleted the walk that read it and left the key "parsed but inert", with
-    // a Settings row that went on promising a plume length. Nothing read it:
-    // deleting `GlowConfig::wake_persist_s` and building `aterm-effects`
-    // returned nine struct-literal writes and one self-copy, and no read.
-    //
-    // It is retired the way this file retires keys — the field is gone, so an
-    // authored value no longer reaches anything, and
-    // `native_config_language::RETIRED_CONFIG_KEYS` carries the key so a
-    // config that sets it still LOADS and Manual tells the truth about it
-    // ("Rainbow kitty typing wake was removed; … has no effect (the authored
-    // value will be preserved)") instead of answering it as a typo. What
-    // replaced it: `cursor_trail_ms` prices every ribbon cell's life
-    // (`Ribbon::cell_life`), floored at the phrase rest the typist's own
-    // inter-key interval sets — so "how much recent typing you see" is the
-    // trail-duration dial plus the melody, not a fixed travel window.
-    /// GPU-only cursor-comet BLOOM: a soft gaussian halo around the streak,
-    /// composited at present time on the GPU (all wgpu backends — DX12/Vulkan/Metal);
-    /// the CPU/software path is unaffected. DEFAULT ON. Set
-    /// `cursor_trail_bloom = false` to disable.
+    /// GPU-only cursor bloom: a soft gaussian halo composited at present time.
+    /// The CPU path is unaffected. Default on.
     pub(crate) cursor_trail_bloom: Option<bool>,
     /// Bloom STRENGTH — how much of the blurred glow is added back (0.0..=3.0).
     /// Default 0.85; higher is more radiant (very high can blow out toward white).
     pub(crate) cursor_trail_bloom_strength: Option<f32>,
     /// Bloom RADIUS — how far the halo spreads, in half-res texels (0.5..=8.0).
-    /// Default 2.2; higher is a wider, softer glow.
+    /// Default 1.8 for the rainbow kitty styles, 2.2 otherwise; higher is a wider,
+    /// softer glow.
     pub(crate) cursor_trail_bloom_radius: Option<f32>,
-    /// GPU-only HEAT SHIMMER: the air above burning/glowing cursor cells
-    /// refracts — a subtle rising heat-haze composited at present time on the
-    /// GPU (the bloom's parity class; the CPU/software path has no shimmer).
-    /// DEFAULT ON. Set `cursor_fire_shimmer = false` to disable.
+    /// GPU-only heat shimmer above glowing cursor cells, composited at present
+    /// time (the CPU path has none). Default on.
     pub(crate) cursor_fire_shimmer: Option<bool>,
-    /// M3 phase B — EDR cursor glow (macOS + GPU + a wide-gamut/HDR panel).
-    /// DEFAULT ON. When available, new windows get an `Rgba16Float` swapchain
-    /// tagged extended-linear-sRGB (the first-party Metal swapchain derives
-    /// `wantsExtendedDynamicRangeContent` from `format == Rgba16Float`, as
-    /// wgpu-hal does on the oracle arm) and the LUMEN cursor aurora is
-    /// re-emitted ABOVE SDR reference white — real light, bounded by the
-    /// screen's `maximumExtendedDynamicRangeColorComponentValue` (re-queried on
-    /// monitor changes and, throttled to 250 ms, as the window redraws).
-    /// "Available" is decided per window against the SCREEN it sits on: a
-    /// window attached while its screen reports no EDR potential
-    /// (`maximumPotentialExtendedDynamicRangeColorComponentValue` of 1.0 — an
-    /// SDR-only monitor) gets the cheaper 8-bit swapchain and so, with
-    /// `cursor_glow_sdr_boost` above 0 on a dark theme, the SDR glow-boost
-    /// crown, which an f16 swapchain on that screen suppresses. Such a window
-    /// is re-picked to f16 once its screen reports potential above 1.0: when
-    /// it changes monitors (a drag, an unplug, an undock), and on the same
-    /// monitor at its next redraw-time re-query (e.g. after High Dynamic
-    /// Range is turned on for that monitor, should macOS then report a higher
-    /// potential). It never drops back to 8-bit live: an f16 window dragged
-    /// onto an SDR screen draws neither the >1.0 aurora nor the SDR crown
-    /// there. That was the pre-gate behaviour on every SDR screen, and it now
-    /// differs from a window opened on that screen. The GRID stays
-    /// reference-white SDR (proven clamp), the
-    /// offscreen/readback source of truth is untouched, and with this off the
-    /// present is byte-identical to pre-M3 (the `HdrPresentGate` proof +
-    /// aterm-gpu's `hdr_gate` suite). Hot-reloadable: turning it OFF kills
-    /// the >1.0 emission immediately; turning it ON lets an existing f16-capable
-    /// Windows surface upgrade when the live output HDR probe admits it, and on
-    /// macOS lets a window that attached 8-bit while it was off take f16 at
-    /// its next redraw-time re-query, if its screen reports EDR potential
-    /// above 1.0 (windows opened after the reload attach with the new value).
-    /// See [`Config::hdr_glow_or_default`].
+    /// EDR cursor glow (macOS, GPU, HDR-capable screen). Default on. Where the
+    /// window's screen reports EDR potential above 1.0, the window gets an
+    /// `Rgba16Float` extended-linear-sRGB swapchain and the lumen aurora is drawn
+    /// above SDR white, bounded by the screen's current EDR headroom (re-queried
+    /// on monitor change and, throttled to 250 ms, on redraw). Other windows get
+    /// the 8-bit swapchain and the SDR glow-boost crown. A window moves to f16
+    /// when its screen gains EDR potential but never back to 8-bit live.
+    ///
+    /// The grid stays SDR and readback is unaffected; with this off the present
+    /// is byte-identical to the non-HDR path (`HdrPresentGate`, aterm-gpu's
+    /// `hdr_gate` suite). Hot-reloadable: off stops >1.0 emission immediately;
+    /// on lets capable surfaces upgrade at the next probe or re-query. See
+    /// [`Config::hdr_glow_or_default`].
     pub(crate) hdr_glow: Option<bool>,
     /// SDR glow-boost strength (0..=1): how much additive crown the cursor glow
     /// may add on a standard (non-HDR) desktop, on top of the offscreen-baked
@@ -449,61 +235,41 @@ pub(crate) struct Config {
     /// themes self-degrade to invisible), hard-capped at 0.35 by a proven bound.
     /// `0.0` disables. See [`Config::cursor_glow_sdr_boost_or_default`].
     pub(crate) cursor_glow_sdr_boost: Option<f32>,
-    /// Predictive local echo (mosh-style speculative typing): `adaptive` (DEFAULT —
-    /// paint the typed glyph INSTANTLY, the moment the shell has proven it echoes the
-    /// current line, on local shells and remote/ssh alike), `off`, or `always`.
-    /// Alt-screen (vim/less) and unechoed (password) contexts never show a guess in
-    /// `adaptive` — the epoch resets each submitted line, so a password prompt shows
-    /// nothing until it echoes (which it never does).
+    /// Predictive local echo: `adaptive` (default: paint typed glyphs instantly
+    /// once the shell has proven it echoes the current line, local or remote),
+    /// `off`, or `always`. `adaptive` shows no guess in the alternate screen or
+    /// unechoed (password) input; the echo proof resets each submitted line.
     pub(crate) predictive_echo: Option<String>,
-    /// Focus-linked shell priority boost (Windows QoS): while an aterm window
-    /// is FOCUSED, its visible tab's shell processes (and their ConPTY console
-    /// hosts) run at ABOVE_NORMAL with power throttling (EcoQoS) claimed off,
-    /// so keystroke echo never loses the CPU to background NORMAL-priority
-    /// load — the ConPTY "laggy but smooth" starvation. On blur everything
-    /// returns to NORMAL / system-managed. Root-shell-only: programs the shell
-    /// launches (builds) still start at NORMAL. DEFAULT ON; `focus_boost =
-    /// false` opts out. Hot-reloadable (applies on the next focus/tab change,
-    /// and immediately on reload). A no-op on Unix (no ConPTY middlemen).
+    /// Focus-linked shell priority (Windows): while a window is focused, its
+    /// visible tab's shell processes and ConPTY hosts run above normal priority
+    /// with EcoQoS off so keystroke echo is not starved; on blur they return to
+    /// normal. Root shell only. Default on; hot-reloadable; no-op on Unix.
     pub(crate) focus_boost: Option<bool>,
-    /// M2 "ink that dries": newly-streamed cells FADE IN from the cell
-    /// background to their final foreground over `stream_fade_ms` (the exact
-    /// linear-light blend on an ease-out envelope). DEFAULT OFF when absent;
-    /// the generated starter file opts in explicitly. Hard bypasses
-    /// keep latency-critical paths instant — keystroke echo, the alternate
-    /// screen (vim/less), a viewport scrolled away from the bottom, and a
-    /// Reduced motion policy (W11) all render exact bytes. Set
-    /// `stream_fade = true` to enable.
+    /// Stream fade: newly streamed cells fade in to their foreground over
+    /// `stream_fade_ms`. Default off. Keystroke echo, the alternate screen, a
+    /// scrolled viewport and reduced motion always render exact bytes.
     pub(crate) stream_fade: Option<bool>,
-    /// How long (milliseconds) fresh ink takes to dry — the stream-fade
-    /// window. Default 90; clamped to 16..=1000 so a typo can't wedge the
-    /// fade timer on or strobe it.
+    /// Stream-fade duration in milliseconds. Default 90, clamped to 16..=1000.
     pub(crate) stream_fade_ms: Option<u64>,
-    /// Named built-in colour scheme ("theme palette"), e.g. `theme = "Dracula"`
-    /// (case-insensitive). One key sets the default fg/bg, cursor, selection AND the
-    /// full ANSI 0–15 palette. The individual `foreground`/`background`/`cursor_color`/
-    /// `selection_color`/`palette` keys still layer ON TOP (last-wins). An unknown
-    /// name warns and falls back to the built-in default. See [`aterm_types::scheme`].
+    /// Built-in colour scheme by name, e.g. `theme = "Dracula"` (case-insensitive):
+    /// sets default fg/bg, cursor, selection and the ANSI 0–15 palette. The
+    /// individual colour keys layer on top. An unknown name warns and uses the
+    /// default. See [`aterm_types::scheme`].
     ///
-    /// AUTO LIGHT/DARK SPLIT: `theme = "dark:<name>,light:<name>"` follows the live
-    /// OS appearance — aterm switches schemes when the desktop toggles light↔dark
-    /// (the same `winit` signal that drives [`crate::app_colorscheme`]). A plain
-    /// `theme = "<name>"` is used for BOTH appearances. A split that omits one side
-    /// uses the built-in Default for that side. See [`Self::resolve_theme_name`].
+    /// `theme = "dark:<name>,light:<name>"` follows the live OS appearance (see
+    /// [`crate::app_colorscheme`]); a missing side uses the built-in default.
+    /// See [`Self::resolve_theme_name`].
     pub(crate) theme: Option<String>,
-    /// Interactive shell to spawn (config `shell`). A program name resolved with
-    /// smart discovery — `"bash"` finds Git for Windows' `bash.exe` even off
-    /// `%PATH%`, `"pwsh"`/`"cmd"`/`"wsl"`/`"nu"` resolve too — or an absolute path
-    /// used verbatim. Unset → the platform default (Windows: pwsh → powershell →
-    /// cmd; Unix: `$SHELL`). Overridden by the `--shell` flag. See
-    /// `windows::shell`.
+    /// Interactive shell (config `shell`): a program name resolved with smart
+    /// discovery (`"bash"` finds Git for Windows' `bash.exe` off `%PATH%`;
+    /// `"pwsh"`, `"cmd"`, `"wsl"`, `"nu"` resolve too) or an absolute path. Unset
+    /// uses the platform default (Windows: pwsh, powershell, cmd; Unix: `$SHELL`).
+    /// `--shell` overrides it. See `windows::shell`.
     ///
-    /// Shell-integration tier by shell: zsh/bash/fish/pwsh and `"wsl"` (whose
-    /// distro must use bash as its login shell) get the full OSC 7 + OSC 133
-    /// set; `"cmd"` is PARTIAL — prompt marks, jump-to-prompt and cwd tracking
-    /// work, but cmd has no hook for when a command starts or finishes, so its
-    /// blocks carry no command text and no exit code and `wait` never fires;
-    /// `"nu"` gets none. See `aterm_shell_integration::ShellType`.
+    /// Shell integration: zsh/bash/fish/pwsh and `"wsl"` (bash login shell) get
+    /// OSC 7 + OSC 133; `"cmd"` gets prompt marks and cwd only (no command text,
+    /// exit code or `wait`); `"nu"` gets none. See
+    /// `aterm_shell_integration::ShellType`.
     pub(crate) shell: Option<String>,
     /// Extra argv passed to the `shell` after argv[0] (config `shell_args`), e.g.
     /// `["-l", "-i"]` for a login+interactive bash — or, for `shell = "wsl"`,
@@ -514,235 +280,135 @@ pub(crate) struct Config {
     pub(crate) columns: Option<u16>,
     /// Initial window height in rows (default 24, clamped 5..=300).
     pub(crate) lines: Option<u16>,
-    /// How many of the newest addressable lines the ⌘F / socket `search` index retains
-    /// before evicting the oldest — i.e. how deep a find reaches into scrollback (default
-    /// 100 000 = the engine's `DEFAULT_MAX_CACHED_LINES`). Floored to the visible row count,
-    /// so the LIVE SCREEN is always searched no matter how small this is set (`0` ⇒ live
-    /// screen only). The index is built off the term lock and cached across keystrokes, so
-    /// raising this deepens search at the cost of index memory, not per-keystroke latency;
-    /// scrollback beyond it is honestly reported as a partial result. See [`search_index_depth`].
+    /// How many of the newest lines the find / socket `search` index retains
+    /// (default 100 000, the engine's `DEFAULT_MAX_CACHED_LINES`). Floored to the
+    /// visible rows, so the live screen is always searched. The index is built off
+    /// the term lock and cached, so this trades memory, not keystroke latency;
+    /// deeper scrollback is reported as a partial result. See [`search_index_depth`].
     pub(crate) search_history_lines: Option<u32>,
-    /// Primary font FAMILY name (e.g. `"JetBrains Mono"`). Resolved to a font
-    /// file via [`resolve_font_family`]; on a miss the loader falls back to
-    /// the built-in [`FONT_CANDIDATES`], so an unset / unknown family is
-    /// byte-identical to before. `--font` outranks it for one launch.
+    /// Primary font family (e.g. `"JetBrains Mono"`), resolved via
+    /// [`resolve_font_family`]; a miss falls back to [`FONT_CANDIDATES`].
+    /// `--font` outranks it.
     pub(crate) font_family: Option<String>,
-    /// DISPLAY FACE (`display_font`): one of the bundled display faces by id
-    /// (`"pixel"`, `"chunky"`, `"engraved"`, `"bubble"` —
-    /// [`aterm_render::DISPLAY_FACES`]). When set it OUTRANKS `font_family`: the
-    /// whole terminal renders in that face (resolved as the virtual family
-    /// `display:<id>` from embedded bytes, never the filesystem). Unset = the
-    /// normal font selection, byte-identical to before this key existed. The
-    /// Settings "Display Faces" page drives this as mutually-exclusive
-    /// toggles (all off ⇒ the key is cleared). Hot-reloadable. `--font`
-    /// still outranks it (launch flag > config, the one precedence law).
+    /// Display face (`display_font`): a bundled face id (`"pixel"`, `"chunky"`,
+    /// `"engraved"`, `"bubble"`; [`aterm_render::DISPLAY_FACES`]). When set it
+    /// outranks `font_family` and resolves as the virtual family `display:<id>`
+    /// from embedded bytes. Hot-reloadable; `--font` still outranks it.
     ///
-    /// `game_font` is the DEPRECATED spelling and stays a serde alias: deleting
-    /// a shipped key would turn every config that carries it into a complaint
-    /// about a line the user wrote correctly at the time. Legacy VALUES
-    /// (`minecraft`, …) resolve the same way — see
-    /// [`aterm_render::DISPLAY_FACE_LEGACY_IDS`] and
+    /// `game_font` is accepted as a deprecated alias, and legacy values resolve
+    /// through [`aterm_render::DISPLAY_FACE_LEGACY_IDS`]; see
     /// [`warn_deprecated_display_font_spelling`].
     #[serde(alias = "game_font")]
     pub(crate) display_font: Option<String>,
-    /// REAL BOLD face for SGR-bold cells (W6, ghostty's `font-family-bold`): a
-    /// family name or file path, resolved like `font_family` and injected via the
-    /// renderer's `set_bold_font` seam — a true heavier weight instead of the
-    /// synthetic embolden / discovered `-Bold` sibling. ABSENT = the existing
-    /// lazy sibling discovery (byte-identical).
+    /// Real bold face for SGR-bold cells: a family name or path, resolved like
+    /// `font_family` and injected via the renderer's `set_bold_font`. Absent uses
+    /// the discovered `-Bold` sibling or synthetic embolden.
     pub(crate) font_family_bold: Option<String>,
-    /// REAL ITALIC face for SGR-italic cells (W6, ghostty's
-    /// `font-family-italic`). ABSENT = discovery / synthetic shear.
+    /// Real italic face for SGR-italic cells. Absent uses discovery or
+    /// synthetic shear.
     pub(crate) font_family_italic: Option<String>,
-    /// REAL BOLD-ITALIC face (W6, ghostty's `font-family-bold-italic`).
-    /// Outranks `font_family_bold` + synthetic shear for bold-italic cells.
+    /// Real bold-italic face; outranks `font_family_bold` plus synthetic shear.
     pub(crate) font_family_bold_italic: Option<String>,
-    /// Whether SYNTHETIC bold/italic (coverage dilation / shear) may be applied
-    /// when no real styled face exists (W6, ghostty's `font-synthetic-style`).
-    /// ABSENT = `true` (byte-identical); `false` renders such cells with the
-    /// regular face. Real styled faces are unaffected.
+    /// Whether synthetic bold/italic may be applied when no real styled face
+    /// exists. Absent means `true`; `false` renders such cells with the regular
+    /// face.
     pub(crate) font_synthetic_style: Option<bool>,
-    /// Ordered broad-coverage FALLBACK font chain (W6): family names or paths,
-    /// most-preferred first — `fallback_fonts = ["Sarasa Mono", "Apple Symbols"]`
-    /// or the comma-separated string form `fallback_fonts = "Sarasa Mono, Apple
-    /// Symbols"` (what the Settings editor writes). Explicit entries strictly
-    /// outrank the built-in discovery candidates (the renderer's proven
-    /// `fallback_chain_order` law). Hot-reloadable.
+    /// Ordered fallback font chain: family names or paths, most preferred first,
+    /// as an array or a comma-separated string (what Settings writes). Explicit
+    /// entries outrank the built-in candidates. Hot-reloadable.
     pub(crate) fallback_fonts: Option<FontList>,
-    /// Monochrome SYMBOL fallback face (W6): family name or path, consulted only
-    /// after the primary + broad fallback miss. Outranks discovery.
-    /// Hot-reloadable.
+    /// Monochrome symbol fallback face (name or path), consulted after the
+    /// primary and fallback chain miss. Hot-reloadable.
     pub(crate) symbol_font: Option<String>,
     /// Colour-EMOJI face (W6): family name or path. Outranks discovery.
     /// Hot-reloadable.
     pub(crate) emoji_font: Option<String>,
-    /// Window CHROME appearance (titlebar / traffic lights), independent of the
-    /// terminal body theme: `"auto"` (default — follow the OS light/dark setting,
-    /// including live day-night switches), `"light"`, or `"dark"`. Maps to
-    /// [`WindowTheme`] via [`Config::window_theme_or_default`]; an unknown value
-    /// warns and falls back to `auto`. This is cross-platform: AppKit sets the
-    /// native NSWindow appearance, Windows applies the DWM/winit titlebar theme,
-    /// and Linux forwards the choice to winit's system-decoration theme.
+    /// Window chrome appearance, independent of the terminal theme: `"auto"`
+    /// (default, follows the OS live), `"light"`, or `"dark"`. Maps to
+    /// [`WindowTheme`] via [`Config::window_theme_or_default`]; unknown values
+    /// warn and fall back to `auto`. Applied on macOS, Windows and Linux.
     pub(crate) window_theme: Option<String>,
-    /// GPU-present COLOUR SPACE (M3 phase A): the colour space the window's
-    /// CAMetalLayer is TAGGED with at surface attach — aterm's declared
-    /// interpretation of the submitted sRGB-encoded bytes. `"srgb"` (the
-    /// default) requests one sRGB→display mapping. `"display-p3"` reproduces the
-    /// legacy UNTAGGED look on a wide-gamut Mac (the bytes are read as P3
-    /// coordinates — oversaturated but familiar). Compositor colour management
-    /// and display output are unobserved; the rendered/readback BYTES remain
-    /// identical either way (the parity/readback suites pin this).
-    /// Maps to [`WindowColorspace`] via [`Config::window_colorspace_or_default`];
-    /// unknown values warn and fall back to `srgb`. Hot-reloadable; inert off
-    /// macOS and on the CPU (softbuffer) present path.
+    /// Colour space the macOS CAMetalLayer is tagged with: `"srgb"` (default) or
+    /// `"display-p3"` (the oversaturated untagged look on wide-gamut screens).
+    /// Rendered and readback bytes are identical either way. Maps to
+    /// [`WindowColorspace`] via [`Config::window_colorspace_or_default`]; unknown
+    /// values fall back to `srgb`. Hot-reloadable; inert off macOS and on the CPU
+    /// present path.
     pub(crate) window_colorspace: Option<String>,
-    /// When `true`, the Alt/Option modifier sends ESC-prefixed (Meta) key
-    /// sequences — the standard terminal expectation. When `false`, a composed
-    /// text value supplied by the OS is forwarded instead (for example Option+A
-    /// → `å` on macOS); non-text Alt chords still use the terminal encoder.
-    /// ABSENT keeps the cross-platform default (Meta), so no config is unchanged.
-    /// See [`Config::option_as_meta_or_default`].
+    /// `true` (default) makes Alt/Option send ESC-prefixed (Meta) sequences;
+    /// `false` forwards the OS-composed text (Option+A → `å` on macOS) while
+    /// non-text Alt chords still use the encoder. See
+    /// [`Config::option_as_meta_or_default`].
     pub(crate) option_as_meta: Option<bool>,
-    /// Pastejacking guard: when `true` (the DEFAULT), a Cmd-V / menu paste of
-    /// MULTI-LINE clipboard text is confirmed first (a native dialog) WHENEVER the
-    /// terminal is not in bracketed-paste mode — so a hidden newline in copied text
-    /// can't silently submit commands at a bare prompt / REPL. A single trailing
-    /// newline is not multi-line and is never flagged; bracketed paste (the modern
-    /// shell default) bypasses it entirely. Set `false` to paste without confirmation.
-    /// Whatever this decides, the bracketed-paste reading it decided BY is the one the
-    /// pasted bytes are framed with ([`crate::input::PasteFraming`]) — a program that
-    /// flips DEC 2004 while the paste is queued cannot make the question and the wire
-    /// disagree. See [`Config::confirm_multiline_paste_or_default`].
+    /// Pastejacking guard (default on): a paste holding any line end (a trailing
+    /// one included: it submits the line) outside bracketed-paste mode is
+    /// confirmed first. The bracketed-paste state checked is the one the bytes are
+    /// framed with ([`crate::input::PasteFraming`]). See
+    /// [`Config::confirm_multiline_paste_or_default`].
     pub(crate) confirm_multiline_paste: Option<bool>,
-    /// RESTORE-1: reopen the previous graceful quit's windows/tabs/panes (with each
-    /// pane's cwd) at the next launch, macOS-Terminal/iTerm style. Default ON — a v1
-    /// daily driver is expected to come back the way it was left. Set
-    /// `restore_session = false` for a fresh single window every launch. Scrollback
-    /// content is NOT persisted (layout + cwd only). See
+    /// Reopen the previous graceful quit's windows, tabs and panes (with each
+    /// pane's cwd) at launch. Default on. Scrollback is not persisted. See
     /// [`Config::restore_session_or_default`].
     pub(crate) restore_session: Option<bool>,
-    /// Copy a mouse selection to the system CLIPBOARD automatically the moment a
-    /// drag-select completes (mouse-up), so no explicit Cmd-C is needed. DEFAULT
-    /// ON off Linux — the copy-on-select convenience, flipped on with the other
-    /// visual/UX defaults; set `copy_on_select = false` to opt out (the
-    /// explicit-copy behaviour). ON LINUX the default is OFF, because a
-    /// selection there already owns the X11 PRIMARY buffer unconditionally
-    /// (`finish_selection`) — the platform convention is selection→PRIMARY,
-    /// explicit copy→CLIPBOARD, and defaulting this on made every drag CLOBBER
-    /// the explicit Ctrl+Shift+C copy (audit finding); `copy_on_select = true`
-    /// still opts into writing both. The selection is left highlighted either
-    /// way, so Cmd-C / Ctrl+Shift+C still works. See
+    /// Copy a mouse selection to the clipboard on mouse-up. Default on except on
+    /// Linux, where the selection already owns PRIMARY and copy-on-select would
+    /// clobber an explicit Ctrl+Shift+C copy; `true` there writes both. See
     /// [`Config::copy_on_select_or_default`].
     pub(crate) copy_on_select: Option<bool>,
-    /// RIGHT-CLICK gesture in the terminal grid: `"copy_paste"` — the
-    /// conhost/Windows-Terminal convention (a right press with VT mouse tracking
-    /// OFF copies the selection if one exists, else pastes) — or `"off"` (the
-    /// press is left to the seam: reported to a tracking app, inert otherwise).
-    /// ABSENT takes the PLATFORM default: `copy_paste` on Windows (both native
-    /// terminals ship it, so a Windows hand expects it), `off` everywhere else
-    /// (macOS right-click means "context menu"; Linux pastes on MIDDLE click —
-    /// seeding a second paste button there would be surprising, not native).
-    /// Maps to [`RightClickGesture`] via [`Config::right_click_or_default`]; an
-    /// unknown value warns and falls back to the platform default.
+    /// Right-click in the grid: `"copy_paste"` (with mouse tracking off, copy the
+    /// selection if any, else paste) or `"off"` (reported to a tracking app,
+    /// otherwise inert). Absent uses the platform default: `copy_paste` on
+    /// Windows, `off` elsewhere. Maps to [`RightClickGesture`] via
+    /// [`Config::right_click_or_default`]; unknown values use the default.
     pub(crate) right_click: Option<String>,
-    /// Which KEYBOARD chord pops a tab's context menu (Windows and Linux, the
-    /// in-grid-strip platforms; the strip's right-click always does):
-    /// `"menu_key"` — the dedicated Menu/Application key ONLY; `"on"` — the
-    /// Menu key AND Shift+F10, the two spellings Windows has shipped since NT;
-    /// or `"off"` — neither, both keys go to the application and the menu is
-    /// pointer-only. ABSENT = `"menu_key"`.
+    /// Keyboard chord that opens a tab's context menu on Windows and Linux:
+    /// `"menu_key"` (default, the Menu key only), `"on"` (Menu key and
+    /// Shift+F10), or `"off"` (pointer only). The default avoids Shift+F10
+    /// because applications receive it as `kf22`.
     ///
-    /// The default is the FREE spelling, not the Windows pair, because the two
-    /// keys cost different things. No legacy keyboard mode has a sequence for
-    /// the Menu key, so claiming it takes nothing from any application.
-    /// Shift+F10 is `ESC[21;2~` — terminfo `kf22`, a key xterm has delivered
-    /// for decades (it numbers Shift+F1..F12 as F13..F24) and one a program
-    /// binds expecting to receive it; a terminal that eats it by default breaks
-    /// that program with no visible cause. `"on"` is the opt-in for a hand that
-    /// wants the second spelling anyway.
-    ///
-    /// This exists because the chord is deliberately NOT a rebindable
-    /// `[keybindings]` action (an OS convention, not an aterm command — and a
-    /// config typo must not be able to delete the only keyboard route to the
-    /// menu), which without a knob would leave a user no way to give the keys
-    /// back at all. A one-key ESCAPE HATCH is not the same hazard as a rebind
-    /// table: it cannot silently shadow the chord, it can only surrender it.
-    ///
-    /// Independent of the deference rule that always applies: a front terminal
-    /// whose app negotiated the kitty enhancement that makes the key reportable
-    /// keeps that key regardless of this setting (see
-    /// `App::front_defers_tab_menu_chord`). Maps to [`TabMenuChord`] via
-    /// [`Config::tab_menu_chord_or_default`]; an unknown value warns and falls
-    /// back to the default.
+    /// The chord is not a `[keybindings]` action (a config typo must not remove
+    /// the only keyboard route to the menu); this key can only surrender it.
+    /// A front terminal whose app enabled kitty key reporting keeps the key
+    /// regardless (`App::front_defers_tab_menu_chord`). Maps to [`TabMenuChord`]
+    /// via [`Config::tab_menu_chord_or_default`]; unknown values use the default.
     pub(crate) tab_menu_chord: Option<String>,
-    /// WHERE A NEW TERMINAL OPENS when one is already running: `"new_window"`
-    /// (the DEFAULT — every launch is its own window and its own process, which
-    /// is what aterm has always done) or `"attach"` (a launch joins the running
-    /// instance as a tab and exits; with nothing reachable it starts one, so the
-    /// first launch of the day is unchanged). Windows Terminal's own spellings
-    /// `useNew` / `useExisting` are accepted aliases.
+    /// Where a new terminal opens when one is running: `"new_window"` (default,
+    /// its own window and process) or `"attach"` (joins the running instance as
+    /// a tab, else starts one). `useNew` / `useExisting` are aliases.
     ///
-    /// This key is read by the FRONT DOOR (`crates/aterm/src/main.rs`), not by
-    /// the window — the decision happens before a window exists — and by the
-    /// Windows jump list, which uses it to decide whether a "New Tab" taskbar
-    /// task would tell the truth. `aterm new-window` is never routed by it, so
-    /// there is always a way to get a separate window. Parsed by
-    /// `aterm_cli::WindowingBehavior` (that crate owns the front-door grammar
-    /// and this crate does not depend on it); an unrecognized value warns once
-    /// and falls back to `new_window` — a typo may not move where terminals open.
+    /// Read by the front door (`crates/aterm/src/main.rs`) and the Windows jump
+    /// list, parsed by `aterm_cli::WindowingBehavior`; `aterm new-window` ignores
+    /// it. Unknown values warn once and fall back to `new_window`.
     pub(crate) windowing_behavior: Option<String>,
-    /// Show the subtle TOP-RIGHT build/version badge (`v{version} · {build}`) so the
-    /// running build is answerable at a glance without opening About. Default OFF.
-    /// Toggleable via the native Settings tab ▸ Window ▸ "Show build/version badge". See
+    /// Show the top-right build/version badge. Default off. See
     /// [`Config::show_build_badge_or_default`] and [`crate::build_badge`].
     pub(crate) show_build_badge: Option<bool>,
-    /// User keyboard shortcuts: a `[keybindings]` table mapping chord strings
-    /// (`"cmd+shift+t"`) to action names (`"new_tab"`). Parsed into a
-    /// `HashMap<Chord, Action>` checked first in `on_key`; a miss falls through to
-    /// the hardcoded defaults, and a malformed entry is warned + skipped. ABSENT =
-    /// an empty map (the hardcoded path is reached unchanged).
+    /// `[keybindings]`: chord strings (`"cmd+shift+t"`) to action names
+    /// (`"new_tab"`), checked first in `on_key`; a miss falls through to the
+    /// built-in chords. Malformed entries are warned and skipped.
     pub(crate) keybindings: Option<std::collections::BTreeMap<String, String>>,
-    /// User INPUT POLICY: a `[key_sequences]` table mapping chord strings
-    /// (`"shift+enter"`, `"f5"`) to the RAW BYTES that chord should send to the PTY,
-    /// overriding aterm's default key encoding for ANY app. Values expand
-    /// `\n \r \t \e \0 \a \b \f \v \\ \xNN \u{NNNN}` escapes. A TOML *basic*
-    /// (double-quote) string only understands `\n \r \t`; put any value containing
-    /// `\e`, `\xNN`, or `\u{...}` in a TOML *literal* (single-quote) string (`'\e[A'`),
-    /// or a stray backslash escape is a TOML syntax error that fails the WHOLE config.
-    /// Consulted in `on_key` after `[keybindings]` and BEFORE the encoder AND the
-    /// non-menu hardcoded chords, so a rule on e.g. `f5` or `shift+enter` wins. NOTE: on
-    /// macOS the native menu key equivalents (Cmd-C Copy, Cmd-V Paste, Cmd-F Find, …) are
-    /// intercepted by AppKit BEFORE `on_key`, so a rule on those never fires (the menu
-    /// claims them first). A bad chord / escape / empty / oversized (>1 KiB) value is
-    /// warned + skipped; `aterm --validate-config` flags them. ABSENT = no overrides.
+    /// `[key_sequences]`: chord strings (`"shift+enter"`, `"f5"`) to raw bytes
+    /// sent to the PTY instead of the default encoding. Values expand
+    /// `\n \r \t \e \0 \a \b \f \v \\ \xNN \u{NNNN}`; use a TOML literal
+    /// (single-quote) string for `\e`, `\xNN` or `\u{...}`, since a basic string
+    /// rejects them and fails the whole config. Consulted after `[keybindings]`
+    /// and before the encoder and non-menu built-in chords. macOS menu key
+    /// equivalents (Cmd-C, Cmd-V, Cmd-F, …) never reach it. Bad or oversized
+    /// (>1 KiB) entries are warned and skipped.
     pub(crate) key_sequences: Option<std::collections::BTreeMap<String, String>>,
-    /// Rows reserved at the TOP of the window for the in-grid tab strip. DEFAULT is
-    /// now `0` ([`DEFAULT_TAB_STRIP_ROWS`]) — the in-grid strip read as a non-native
-    /// "ugly frame" drawn inside the terminal, and the native macOS window TOOLBAR
-    /// (toolbar.rs) now carries the New Tab affordance. Set `tab_strip_rows = 1` in
-    /// config to bring the in-grid strip back. Clamped to [`MAX_TAB_STRIP_ROWS`].
+    /// Rows reserved at the top for the in-grid tab strip. Default 0 on macOS
+    /// (the toolbar carries tabs) and 1 elsewhere ([`DEFAULT_TAB_STRIP_ROWS`]);
+    /// clamped to [`MAX_TAB_STRIP_ROWS`].
     pub(crate) tab_strip_rows: Option<u16>,
-    /// C3 (Windows) — how TALL the in-grid tab band is: `"standard"` (the Windows
-    /// DEFAULT) sizes the whole band to [`TAB_BAND_STANDARD_LOGICAL_PX`] ≈ a WinUI
-    /// tab, `"compact"` keeps the pre-C3 height (exactly the strip's cell rows plus
-    /// the top pad). The extra pixels are a SYNTHETIC chrome `head` band — the same
-    /// mechanism macOS uses for chrome that overlaps the grid — so the resize law,
-    /// the pointer mapping, the chrome bleed and the pixel band's centring already
-    /// understand them; see `App::synthetic_strip_head_px`.
-    ///
-    /// OFF WINDOWS THIS KEY IS INERT (parsed, never consulted): macOS puts its tabs
-    /// in the native toolbar and Linux's in-grid strip is tuned to its own chrome.
-    /// It is also inert whenever the strip itself is off (`tab_strip_rows = 0`) —
-    /// a band with no strip in it would be dead space that shifts the grid down.
-    /// An unknown value warns and falls back to the platform default.
+    /// Windows in-grid tab band height: `"standard"` (default, about
+    /// [`TAB_BAND_STANDARD_LOGICAL_PX`], a WinUI tab) or `"compact"` (the strip's
+    /// cell rows plus top pad). The extra pixels are a synthetic chrome head band
+    /// (`App::synthetic_strip_head_px`). Inert off Windows and when
+    /// `tab_strip_rows = 0`; unknown values use the default.
     pub(crate) tab_band_height: Option<String>,
-    /// SELECTED-TAB color override (`active_tab_color`, `#RRGGBB`): paints the
-    /// ACTIVE tab's background with a user-picked color in BOTH tab renderers —
-    /// the native macOS toolbar pill and the in-grid strip. The label ink flips
-    /// black/white by the override's own luminance so the title stays readable
-    /// on any pick. ABSENT = today's translucent system default, byte-identical
-    /// (the Settings "Tab Color" page calls that "Transparent white"). Driven
-    /// by the Tab Color spectrum page; hot-reloadable.
+    /// Active tab background colour (`#RRGGBB`) in both the macOS toolbar and the
+    /// in-grid strip; label ink flips black/white by luminance. Absent uses the
+    /// translucent system default. Hot-reloadable.
     pub(crate) active_tab_color: Option<String>,
     /// Generate a live Activity fallback as terminal output changes. Default ON;
     /// `false` disables generation while preserving both the stable Title and any
@@ -765,7 +431,8 @@ pub(crate) struct Config {
     /// Defaults to 20 and is clamped to 1..=120.
     pub(crate) title_summary_timeout_seconds: Option<u64>,
     /// Proxy policy for remote model requests. `environment` (default) honors
-    /// the standard HTTP(S)_PROXY/NO_PROXY environment; `direct` bypasses it.
+    /// the standard HTTP(S)_PROXY/ALL_PROXY/NO_PROXY environment, and a proxy
+    /// setting it cannot use fails the request; `direct` bypasses it.
     /// Aterm's attested managed Ollama is always direct regardless of this key.
     pub(crate) title_summary_proxy_mode: Option<TitleSummaryProxyMode>,
     /// Optional path to a PEM CA bundle for private remote model services. This
@@ -790,345 +457,230 @@ pub(crate) struct Config {
     /// Composition of application title and live description in the native
     /// window title. Defaults to `title-description`.
     pub(crate) window_title_format: Option<TitleFormat>,
-    /// Master switch for per-session status classification (RFC: Tab Subject &
-    /// Status §12). Default ON. `false` genuinely stops the classifier — no
-    /// evidence is gathered, no terminal lock is attempted, and no session ever
-    /// publishes a status — rather than merely hiding what it computed.
+    /// Master switch for per-session status classification. Default on; `false`
+    /// stops the classifier entirely.
     pub(crate) tab_status: Option<bool>,
     /// How long a foreground job may print nothing before its phase becomes
     /// `quiet`. Default 5000; clamped to 500..=120000 so a typo can neither make
     /// every job look stalled instantly nor keep a finished build lit for hours.
     pub(crate) tab_status_quiet_after_ms: Option<u64>,
-    /// Minimum time a candidate phase must hold before it is published. Default
-    /// 750; clamped to 0..=10000. Zero is legal and means "publish every
-    /// transition", which is honest for scripted/headless drivers even though it
-    /// lets a spinner flap the badge.
+    /// Minimum time a candidate phase must hold before publication. Default 750,
+    /// clamped to 0..=10000; zero publishes every transition.
     pub(crate) tab_status_dwell_ms: Option<u64>,
-    /// Whether a classified status projects onto the tab's busy/attention
-    /// indicator bits. Default ON. Turning this off keeps classification running
-    /// (the record stays readable through the `status` verb and the tooltip) and
-    /// only stops the tab chrome from marking itself.
+    /// Whether a classified status sets the tab's busy/attention marks. Default
+    /// on; off keeps classification (the `status` verb, tooltip) running.
     pub(crate) tab_status_badge: Option<bool>,
-    /// Whether a session's live connection role (Session Connections §4) draws
-    /// the fourth tab status mark (▲ outbound / ▽ inbound / hourglass both).
-    /// Default ON. Turning this off hides the MARK only: the connections
-    /// themselves, their audit trail, and the wire/introspection surfaces
-    /// (`chrome` states, `edges`) stay live — authority must never be quieter
-    /// than the chrome showing it.
+    /// Whether a session's connection role draws the fourth tab mark (▲ outbound,
+    /// ▽ inbound, hourglass both). Default on; off hides only the mark.
     pub(crate) tab_connection_badge: Option<bool>,
-    /// EXPLAIN HEAVY LOAD (design §10.14, ruling 212): when typing slows in a
-    /// focused window while something else is loading the machine, the band
-    /// says what (`Typing slowed by cargo in tab 2`), with a level meter; the
-    /// details go to the log. Default ON. `false` stops the feature entirely:
-    /// the row withdraws, the probe is never asked for another reading, and
-    /// nothing is armed. Applied live.
+    /// Explain heavy load (default on): when typing slows in a focused window
+    /// while something else loads the machine, the band names the cause
+    /// (`Typing slowed by cargo in tab 2`) with a level meter. `false` stops the
+    /// probe entirely. Applied live.
     pub(crate) explain_heavy_load: Option<bool>,
-    /// DESKTOP ALERTS: whether aterm posts its OWN notices as operating-system
-    /// notifications — the escalation herald ("aterm · needs you", "agent
-    /// stopped", "program frozen"), the embedded operator ("aterm operator"),
-    /// the consent attention path and the update-health banner. Default OFF
-    /// (owner, 2026-09-28: "I don't know what these OSX alerts are from aterm
-    /// but they are annoying, disable them" — without `terminal-notifier`
-    /// macOS shows them as Script Editor's). Off, only the desktop banner is
-    /// withheld: the herald's and the consent path's facts stay in the menu bar
-    /// and the tab marks, update health's in the message band and
-    /// `messages.log`. The operator's notices are shown nowhere else, so its
-    /// queue (`aterm fleet status` and `next`) is their one record. Program
-    /// notifications (OSC 9/99/777) are `allow_notifications`'s, not this key's.
-    /// Applied live (`notify::spawn_delivery`'s `own_alerts`).
+    /// Whether aterm posts its own notices (escalation herald, embedded operator,
+    /// consent attention, update health) as OS notifications. Default off. When
+    /// off, the facts remain in the menu bar, tab marks, message band and
+    /// `messages.log`; the operator's notices remain only in its queue
+    /// (`aterm fleet status`). Program notifications (OSC 9/99/777) are governed
+    /// by `allow_notifications`. Applied live (`notify::spawn_delivery`)
+    /// (owner, 2026-09-28).
     pub(crate) desktop_alerts: Option<bool>,
-    /// Whether every FRESH session spawn also installs/updates the coding-agent
-    /// primer (and the bundled skills) for every DETECTED agent — the same upsert
-    /// `aterm agents install` performs, run by aterm itself on a detached thread
-    /// and throttled to once a minute per process. Default ON: the primer is the
-    /// only channel that reaches an agent's context in every cwd, and a machine
-    /// where nobody ran the manual install had every agent row `absent`
-    /// (docs/AGENT-EXPERIENCE-2026-08-26.md F1). `false` genuinely stops it — no
-    /// context file is read or written — which is what makes `aterm agents
-    /// remove` stick; `aterm agents status` names this key for exactly that reason.
+    /// Whether each fresh session spawn also installs or updates the coding-agent
+    /// primer and bundled skills for every detected agent (the `aterm agents
+    /// install` upsert, on a detached thread, at most once a minute). Default on.
+    /// `false` stops it entirely, which is what makes `aterm agents remove` stick.
     pub(crate) agents_auto_prime: Option<bool>,
-    /// BiDi (right-to-left) text handling: `"implicit"` (default — automatic
-    /// per-line UAX#9 reordering, so Hebrew/Arabic display in visual order),
-    /// `"disabled"` (keep logical order), or `"explicit"` (app-controlled). Maps to
-    /// the engine `BiDiConfig.mode`. ABSENT keeps the engine default (Implicit).
+    /// BiDi handling: `"implicit"` (default, per-line UAX#9 reordering),
+    /// `"disabled"` (logical order), or `"explicit"` (app-controlled). Maps to the
+    /// engine `BiDiConfig.mode`.
     pub(crate) bidi: Option<String>,
-    /// East-Asian Ambiguous-width characters: `"narrow"` (default, 1 cell) or
-    /// `"wide"` (2 cells). Maps to the engine `ambiguous_width_double`. CJK users
-    /// who expect ambiguous glyphs (some punctuation, line-drawing) to be
-    /// double-width set `"wide"`. ghostty has no equivalent knob.
+    /// East-Asian ambiguous-width characters: `"narrow"` (default, 1 cell) or
+    /// `"wide"` (2 cells). Maps to the engine `ambiguous_width_double`.
     pub(crate) ambiguous_width: Option<String>,
-    /// Programming LIGATURES (`=>`, `!=`, `===`, …) for fonts that carry them
-    /// (JetBrains Mono, Fira Code, Cascadia Code). Default ON (`true`). Set `false`
-    /// to render strictly per-cell. Maps to the renderer's `LigatureMode`
-    /// (`Enabled`/`Disabled`); the cursor's cell always renders un-ligated. ABSENT =
-    /// on, so no config is byte-identical to the pre-ligature-config renderer.
+    /// Programming ligatures for fonts that carry them. Default on; `false`
+    /// renders per cell. Maps to the renderer's `LigatureMode`; the cursor's cell
+    /// always renders unligated.
     pub(crate) ligatures: Option<bool>,
-    /// MERGED (Cascadia N:1) ligatures: admit runs whose OpenType shaping collapses
-    /// several cells into ONE wide glyph (Cascadia Code's convention), rendered by
-    /// slicing that glyph into per-cell tiles. DEFAULT OFF (`false`/absent) — the
-    /// renderer stays on the 1:1 "spacer convention" every Fira/JetBrains-style font
-    /// uses, byte-identical to before. Turn ON only with a merged-ligature font
-    /// (Cascadia Code); a no-op on 1:1 fonts. Maps to `TextShapingConfig::admit_collapsed`.
+    /// Merged (N:1) ligatures: admit runs whose shaping collapses several cells
+    /// into one wide glyph (Cascadia Code), sliced into per-cell tiles. Default
+    /// off; a no-op on 1:1 fonts. Maps to `TextShapingConfig::admit_collapsed`.
     pub(crate) merged_ligatures: Option<bool>,
-    /// OpenType FONT FEATURES applied to the primary face, e.g.
-    /// `font_features = ["ss01", "zero", "-calt"]`. A bare tag (or `+tag`) ENABLES
-    /// the feature, `-tag` disables it, and `tag=N` sets an explicit value
-    /// (stylistic alternates). Tags are 1–4 ASCII chars; unknown/typo'd tags are
-    /// harmlessly ignored by the shaper. Each list entry may itself be a
-    /// space-separated group (`"+ss01 +zero"`). ABSENT = no extra features
-    /// (byte-identical to before). See [`Config::text_shaping`].
+    /// OpenType features for the primary face, e.g.
+    /// `font_features = ["ss01", "zero", "-calt"]`: `tag`/`+tag` enables, `-tag`
+    /// disables, `tag=N` sets a value. Tags are 1–4 ASCII chars; unknown tags are
+    /// ignored by the shaper. An entry may be a space-separated group. See
+    /// [`Config::text_shaping`].
     pub(crate) font_features: Option<Vec<String>>,
-    /// How glyph antialiasing coverage blends over the cell (W2):
-    /// `"linear-corrected"` (DEFAULT — linear-light blending with ghostty's
-    /// perceptual alpha remap, so text carries the apparent stroke weight of
-    /// native CoreText apps) or `"linear"` (the exact physical blend; midtone
-    /// fringes render brighter, which reads thin in dark themes). An unknown
-    /// value warns and keeps the default. Hot-reloadable (appearance-only).
-    /// See [`Config::text_blending_or_default`].
+    /// Glyph coverage blending: `"linear-corrected"` (default, linear-light with a
+    /// perceptual alpha remap matching native CoreText stroke weight) or
+    /// `"linear"` (the exact physical blend, which reads thinner on dark themes).
+    /// Unknown values keep the default. Hot-reloadable. See
+    /// [`Config::text_blending_or_default`].
     pub(crate) text_blending: Option<String>,
-    /// macOS: rasterize glyphs with CoreText FONT SMOOTHING (Apple's stem
-    /// darkening) for a heavier, native-weight glyph — ghostty's
-    /// `font-thicken`. Default `false`. Parsed but inert off macOS (the
-    /// portable fontdue path has no smoothing). Hot-reloadable.
+    /// macOS: rasterize with CoreText font smoothing (stem darkening) for a
+    /// heavier glyph. Default `false`; inert off macOS. Hot-reloadable.
     pub(crate) font_thicken: Option<bool>,
-    /// Variable-font axis requests for the PRIMARY face (W9), e.g.
-    /// `font_variation = ["wght=450", "opsz=14"]`. Each entry is `tag=value`
-    /// (1–4 char OpenType axis tag); values are clamped to the font's `fvar`
-    /// axis bounds, tags the font has no axis for are ignored, and malformed
-    /// entries warn + skip. ABSENT = the default instantiation — the
-    /// `Regular` named instance, else `wght=400` clamped (the SF Mono
-    /// rescue) — and a non-variable font is byte-identical to before.
-    /// A [`FontList`] so the Settings editor can round-trip it as one
-    /// comma-joined string (like `fallback_fonts`); the TOML-array spelling
-    /// `["wght=450", "opsz=14"]` still parses identically.
+    /// Variable-font axis requests for the primary face, e.g.
+    /// `font_variation = ["wght=450", "opsz=14"]`. Values clamp to the font's
+    /// `fvar` bounds, unknown axes are ignored, malformed entries warn and skip.
+    /// Absent uses the `Regular` named instance, else `wght=400` clamped. A
+    /// [`FontList`] so Settings can round-trip it as one comma-joined string.
     pub(crate) font_variation: Option<FontList>,
-    /// Requested `wght` (weight) for the primary face (W9), 1–1000 — the
-    /// discoverable alias of `font_variation = ["wght=N"]`, applied AFTER it
-    /// (so this key wins on conflict). Clamped to the axis; ignored for
+    /// Requested `wght` (1–1000) for the primary face, applied after
+    /// `font_variation` (this key wins). Clamped to the axis; ignored for
     /// non-variable fonts.
     pub(crate) font_weight: Option<u32>,
-    /// Moonshot (W9): extra `wght` added on DARK themes only, e.g.
-    /// `font_weight_dark_nudge = 50` — light-on-dark text reads thinner than
-    /// dark-on-light at equal stroke weight. Applied ONLY when the nudged
-    /// instance's `'M'` advance equals the default instance's within 0.25px
-    /// AND the cell geometry is unchanged (monospace variable fonts hold
-    /// advances constant, which makes this uniquely grid-safe); otherwise
-    /// the W2 linear-corrected blend (on by default) remains the weight
-    /// compensation. ABSENT/0 = off. Clamped 0..=300.
+    /// Extra `wght` on dark themes only (light-on-dark reads thinner). Applied
+    /// only when the nudged instance keeps the `'M'` advance within 0.25px and
+    /// the cell geometry unchanged. Absent or 0 is off; clamped 0..=300.
     pub(crate) font_weight_dark_nudge: Option<f32>,
-    /// Aesthetic stem-weight gamma applied to glyph coverage (`< 1.0`
-    /// thickens, `> 1.0` thins; clamped 0.30..=3.0). ABSENT = `1.0` (identity —
-    /// the linear-light pipeline needs no correction). Hot-reloadable.
+    /// Stem-weight gamma on glyph coverage (`< 1.0` thickens, `> 1.0` thins;
+    /// clamped 0.30..=3.0). Absent means `1.0`. Hot-reloadable.
     pub(crate) stem_gamma: Option<f32>,
-    /// Native (Linux/Windows) glyph grid-fitting mode (W13/R2): `"full"` (the
-    /// autohinter snaps stems in BOTH axes, the crispest grayscale result,
-    /// measured side-by-side against `light`/`native`/`off` in the R2
-    /// evidence), `"light"` (vertical-only — the desktop `hintslight` look),
-    /// `"native"` (the font's own bytecode when it has one), or `"off"` (no
-    /// grid fitting — the raw fontdue raster). ABSENT (or an unrecognized
-    /// spelling) = `"full"`. LIVE on Linux and Windows; inert
-    /// on macOS, where CoreText applies its own grid discipline.
-    /// Hot-reloadable (drops the glyph atlas).
+    /// Linux/Windows glyph grid-fitting: `"full"` (default, both axes, crispest),
+    /// `"light"` (vertical only), `"native"` (the font's bytecode), or `"off"`.
+    /// Unknown spellings mean `"full"`. Inert on macOS. Hot-reloadable (drops
+    /// the glyph atlas).
     pub(crate) font_hinting: Option<String>,
-    /// Linux subpixel-RGB text (RFC-linux-subpixel-text stage 1): `"off"`
-    /// (the DEFAULT — grayscale everywhere, byte-identical to before),
-    /// `"rgb"` (per-channel LCD coverage on horizontal-RGB panels), or
-    /// `"bgr"`. CPU-COMPOSITOR ONLY this stage: the GPU backend renders
-    /// grayscale regardless (run with `gpu = false` / `--cpu` to see it), and
-    /// the CPU path itself falls back to grayscale under translucency
-    /// (`background_opacity < 1`) or a wallpaper, and for non-primary-family
-    /// glyphs. ABSENT (or an unrecognized spelling) = `"off"`. Inert on macOS (subpixel was
-    /// removed OS-wide) and Windows. Hot-reloadable.
+    /// Linux subpixel text: `"off"` (default, grayscale), `"rgb"` or `"bgr"`.
+    /// CPU compositor only; it falls back to grayscale under translucency, a
+    /// wallpaper, or non-primary-family glyphs. Unknown spellings mean `"off"`.
+    /// Inert on macOS and Windows. Hot-reloadable.
     pub(crate) font_subpixel: Option<String>,
-    /// Line-height multiplier on the cell BOX (W5a): rows space out (or
-    /// tighten) WITHOUT changing the glyph size. Clamped 0.8..=2.0; ABSENT =
-    /// `1.0` (byte-identical). The added/removed leading splits half above /
-    /// half below the glyph (the leading law). Hot-reloadable (re-grids).
+    /// Line-height multiplier on the cell box, without changing glyph size;
+    /// leading splits half above, half below. Clamped 0.8..=2.0; absent means
+    /// `1.0`. Hot-reloadable.
     pub(crate) line_height: Option<f32>,
-    /// Baseline escape hatch (W5a): shift every glyph baseline by a signed px
-    /// delta, for faces whose vendor metrics still sit visually off after the
-    /// half-leading law. Clamped ±32; ABSENT = `0` (pure derivation).
+    /// Signed px shift of every glyph baseline, for faces whose metrics sit off.
+    /// Clamped ±32; absent means `0`.
     pub(crate) adjust_baseline: Option<i64>,
-    /// Underline position escape hatch (W7): shift the font-table-resolved
-    /// underline top by a signed px delta (positive = down). Clamped ±32;
-    /// ABSENT = `0` (pure table/heuristic derivation, re-clamped in-cell).
+    /// Signed px shift of the underline top (positive is down). Clamped ±32;
+    /// absent means `0`.
     pub(crate) adjust_underline_position: Option<i64>,
     /// Underline thickness escape hatch (W7): fatten/thin the resolved
     /// underline by a signed px delta. Clamped ±32; ABSENT = `0`.
     pub(crate) adjust_underline_thickness: Option<i64>,
-    /// Descender ink-skip (W7): zero underline coverage within a 1px dilation
-    /// of the cell's own glyph ink, so g/j/p/q/y descenders are never struck
-    /// through. ABSENT = `true` (on — the browser behavior no terminal ships).
+    /// Skip underline coverage within 1px of the cell's glyph ink so descenders
+    /// are not struck through. Absent means `true`.
     pub(crate) underline_skip_descenders: Option<bool>,
-    /// Per-cell minimum WCAG contrast ratio (xterm's `minimumContrastRatio`,
-    /// W5b): every glyph fg (and its decorations, combining marks, and the
-    /// cursor fill) is floored against the bg it actually sits on. `1.0` (and
-    /// ABSENT) = off — byte-identical; clamped 1.0..=21.0. Hot-reloadable.
+    /// Per-cell minimum WCAG contrast ratio: glyph fg, decorations and the
+    /// cursor fill are floored against their actual bg. `1.0` (absent) is off;
+    /// clamped 1.0..=21.0. Hot-reloadable.
     pub(crate) minimum_contrast: Option<f32>,
-    /// Selected-text foreground `#RRGGBB` (theme `selectionForeground`, W5c):
-    /// an explicit ink for selected cells. ABSENT = the WCAG contrast-floor
-    /// default (fg floored to 4.5:1 against the selection band).
+    /// Selected-text foreground `#RRGGBB`. Absent floors fg to 4.5:1 against the
+    /// selection band.
     pub(crate) selection_foreground: Option<String>,
-    /// Dim the selection band while the window is UNFOCUSED (xterm's
-    /// `selectionInactiveBackground` behavior, W5c): the band recedes to a
-    /// bg-blended tone when focus leaves. ABSENT = `false` (byte-identical:
-    /// the band keeps the active colour regardless of focus).
+    /// Dim the selection band while the window is unfocused. Absent means
+    /// `false`.
     pub(crate) selection_inactive: Option<bool>,
-    /// Ink a hairline along the edges of the SPLIT pane that takes keystrokes,
-    /// inside the 1-cell divider gaps the compositor already draws between panes
-    /// (`app_render::ActivePaneMark`). ABSENT = `true` (on) — without it the
-    /// caret is the only witness, and a full-screen application is free to hide
-    /// it. `false` composes the plain seam grid, byte-identical to a frame with
-    /// no mark. Inert in a single-pane window (no divider gap exists) and in any
-    /// window that does not have the keyboard. Live on the next composed frame;
-    /// nothing to hot-reload into the renderer, because the mark is cells the
-    /// compositor writes.
+    /// Draw a hairline along the edges of the focused split pane, inside the
+    /// divider gaps (`app_render::ActivePaneMark`). Absent means `true`; inert in
+    /// a single-pane or unfocused window. Takes effect on the next composed frame.
     pub(crate) split_focus_mark: Option<bool>,
-    /// Break programming ligatures at the CURSOR cell (W5d): the cell under
-    /// the cursor renders per-cell so the block cursor never sits on a
-    /// multi-column ligature glyph (`LigatureMode::CursorDisabled`). ABSENT =
-    /// `false` (ligatures render through the cursor, as before). Ignored when
-    /// `ligatures = false` (everything is per-cell already).
+    /// Render the cursor cell per-cell so the block cursor never sits on a
+    /// ligature (`LigatureMode::CursorDisabled`). Absent means `false`; ignored
+    /// when `ligatures = false`.
     pub(crate) cursor_break_ligatures: Option<bool>,
-    /// SGR 1 (bold) promotes indexed colors 0–7 to their bright 8–15 siblings
-    /// (W5f). ABSENT = `true` (the classic xterm promotion, byte-identical);
+    /// SGR 1 promotes indexed colors 0–7 to bright 8–15. Absent means `true`;
     /// `false` keeps bold a pure weight change.
     pub(crate) bold_is_bright: Option<bool>,
-    /// SGR 2 (dim/faint): the fraction of the foreground retained, blended
-    /// toward the cell BACKGROUND in linear light (W5e — theme-independent, so
-    /// faint recedes on light themes too). Clamped 0.0..=1.0; ABSENT = `0.5`.
+    /// SGR 2 (faint): fraction of the foreground kept, blended toward the cell
+    /// background in linear light. Clamped 0.0..=1.0; absent means `0.5`.
     pub(crate) faint_opacity: Option<f32>,
-    /// M5 true vibrancy: window BACKGROUND OPACITY (`0.0` = fully transparent
-    /// glass … `1.0` = solid). Clamped 0.0..=1.0; ABSENT = `1.0` (solid —
-    /// byte-identical). Multiplied into the BACKGROUND-QUAD alpha only (glyph
-    /// ink, decorations, and images stay opaque over their cell fills). THE MOVE:
-    /// whenever this is `< 1.0` the per-cell minimum-contrast floor auto-engages
-    /// at WCAG AA (4.5:1) — see [`Config::effective_minimum_contrast`] — so glass
-    /// can never make text illegible. Implemented only by the macOS GPU window
-    /// path; every CPU path and non-macOS GPU window keeps a solid grid and is
-    /// diagnosed as such. Hot-reloadable.
+    /// Window background opacity (`0.0` transparent to `1.0` solid, the default).
+    /// Applies to background quads only; glyphs and images stay opaque. Below
+    /// `1.0` the minimum-contrast floor engages at 4.5:1
+    /// ([`Config::effective_minimum_contrast`]). Implemented only on the macOS
+    /// GPU path; other paths stay solid and are diagnosed. Hot-reloadable.
     pub(crate) background_opacity: Option<f32>,
-    /// M5 window MATERIAL — `none` | `hud` | `sidebar` | `under-window` (aliases
-    /// `underwindow`/`under_window`, case-insensitive). On macOS GPU this selects
-    /// the `NSVisualEffectView` blended behind a translucent background and thus
-    /// requires `background_opacity < 1.0`. On Windows GPU it independently maps
-    /// to Mica/Acrylic DWM chrome while the grid remains opaque. Other paths have
-    /// no material consumer. ABSENT / `none` disables it. Hot-reloadable.
+    /// Window material: `none` | `hud` | `sidebar` | `under-window` (aliases
+    /// `underwindow`/`under_window`, case-insensitive). On macOS GPU it selects
+    /// the `NSVisualEffectView` behind a translucent background (requires
+    /// `background_opacity < 1.0`); on Windows GPU it maps to Mica/Acrylic chrome
+    /// with an opaque grid. Absent / `none` disables it. Hot-reloadable.
     pub(crate) background_material: Option<String>,
-    /// All-edge interior WINDOW PADDING in LOGICAL px (scaled by the display
-    /// factor like the built-in default): the breathing room between the window
-    /// edge and the grid. ABSENT = `12.0` (the tuned [`crate::PAD_LOGICAL_PX`]
-    /// default — byte-identical). Clamped 0..=64 so a typo can't push the grid
-    /// off the glass. Hot-reloadable: a reload re-resolves every window's
-    /// per-window metrics and re-grids (see [`App::reload_config`]).
+    /// Window padding on all edges in logical px (scaled by the display factor).
+    /// Absent means `12.0` ([`crate::PAD_LOGICAL_PX`]); clamped 0..=64.
+    /// Hot-reloadable (see [`App::reload_config`]).
     pub(crate) window_padding: Option<f32>,
-    /// TOP-edge padding OVERRIDE in logical px, tighter than `window_padding`
-    /// (the ~46 pt chrome band already separates the grid from the window's top
-    /// edge). ABSENT = `2.0` ([`crate::PAD_TOP_LOGICAL_PX`]). Clamped at the
-    /// resolver to `0..=window_padding` — the renderer enforces `pad_top <= pad`
-    /// ([`aterm_render::Renderer::set_pad_top`] clamps), so the resolver keeps
-    /// the configured value inside the valid domain rather than letting the
-    /// clamp silently rewrite it. Hot-reloadable, like `window_padding`.
+    /// Top padding override in logical px. Absent means `2.0`
+    /// ([`crate::PAD_TOP_LOGICAL_PX`]); clamped to `0..=window_padding`, the
+    /// domain [`aterm_render::Renderer::set_pad_top`] accepts. Hot-reloadable.
     pub(crate) window_padding_top: Option<f32>,
-    /// Security opt-in for OSC 52 clipboard QUERIES (`Pd = "?"`): a program in
-    /// the terminal reads the clipboard back. Default OFF (fail-closed). When on,
-    /// macOS/Windows answer with the SYSTEM pasteboard (`spawn.rs`, the Query arm
-    /// — remote vim/tmux clipboard sync is the use), so text copied in other apps
-    /// is readable by the program; Linux answers only the selections aterm owns.
-    /// On macOS 26 a programmatic pasteboard read is what raises the system's
-    /// paste alert ("aterm would like to paste from …"): the program asked, the
-    /// alert names aterm, because the read is aterm's. Manual diagnoses an
-    /// authored `true` value with that caveat.
+    /// Allow OSC 52 clipboard queries (`Pd = "?"`). Default off. When on,
+    /// macOS/Windows answer with the system pasteboard (`spawn.rs`), so text
+    /// copied in other apps becomes readable; Linux answers only selections aterm
+    /// owns. On macOS 26 the read raises the system paste alert naming aterm.
     pub(crate) allow_osc52_query: Option<bool>,
-    /// SECURE KEYBOARD ENTRY (`secure_keyboard_entry`, default OFF): while on
-    /// AND aterm is frontmost, macOS blocks other processes from observing
-    /// this app's keystrokes (`EnableSecureEventInput` — the guard iTerm2
-    /// exposes under this name, with the same focus scoping: TN2150 instructs
-    /// releasing on deactivation, and `crate::secure_input` gates engagement
-    /// on any-window-focused, so a backgrounded aterm never suppresses other
-    /// apps' global hotkeys). Process-level, recorded at launch and on every
-    /// config commit; macOS-only — Wayland is secure by default, X11 cannot
-    /// be secured, and the Settings row says so instead of pretending.
+    /// Secure keyboard entry (default off): while on and an aterm window is
+    /// focused, macOS blocks other processes from observing keystrokes
+    /// (`EnableSecureEventInput`, gated in `crate::secure_input`). macOS only.
     pub(crate) secure_keyboard_entry: Option<bool>,
-    /// Security opt-in for XTWINOPS (`CSI t`). On Linux the GUI installs a
-    /// window callback (`spawn::configure_window_ops` → `App::on_window_op`),
-    /// so authorized manipulations (iconify, maximize, fullscreen, resize —
-    /// move stays denied in-core) reach the winit window. REPORTS are answered
-    /// by the engine on every platform, never by the host callback (an async
-    /// wake cannot carry a synchronous reply): window title / icon label,
-    /// text-grid size (`CSI 18 t`), and — from the cell box the GUI pushes
-    /// through `Terminal::set_cell_pixel_size` — the text area in pixels
-    /// (`CSI 14 t`) and the cell size (`CSI 16 t`). Window/screen POSITION and
-    /// screen size remain unanswered: nothing in-core knows them. Elsewhere no
-    /// callback is installed and only those engine reports work. Default OFF
-    /// because even title/grid reports can fingerprint the host — and the pixel
-    /// pair discloses the host's font metrics, so it rides the same mint.
+    /// Allow XTWINOPS (`CSI t`). On Linux authorized manipulations (iconify,
+    /// maximize, fullscreen, resize; move is denied in-core) reach the window via
+    /// `spawn::configure_window_ops` → `App::on_window_op`. The engine answers
+    /// reports on every platform: title/icon label, grid size (`CSI 18 t`), text
+    /// area pixels (`CSI 14 t`) and cell size (`CSI 16 t`); position and screen
+    /// size are never answered. Default off because reports can fingerprint the
+    /// host.
     pub(crate) allow_window_ops: Option<bool>,
-    /// Security opt-in: allow desktop notifications (OSC 9 / 99 / 777). Default
-    /// OFF. Maps to `allow_notifications`. Delivery is a subprocess running under
-    /// aterm's identity — `terminal-notifier` when installed, else `osascript` —
-    /// which is why a program's notification needs this opt-in (`notify.rs`,
-    /// *Identity and consent*: measured to preflight only, never to prompt).
+    /// Allow desktop notifications (OSC 9 / 99 / 777). Default off. Delivery runs
+    /// under aterm's identity (`terminal-notifier` or `osascript`; see
+    /// `notify.rs`), hence the opt-in.
     pub(crate) allow_notifications: Option<bool>,
     /// Security opt-in: allow apps to set indexed colors (OSC 4 / numeric OSC 21).
     /// Default OFF. Maps to `allow_palette_reconfigure`.
     pub(crate) allow_palette_reconfigure: Option<bool>,
-    /// Security opt-in: allow Kitty graphics NON-DIRECT transmission mediums to read
-    /// host files / shared memory (`t=f` file, `t=t` temp file, `t=s` POSIX shm).
-    /// Default OFF (fail-closed) — letting a program make the terminal read arbitrary
-    /// user-readable files off an escape sequence is an exfiltration/abuse surface.
-    /// When enabled, a size-capped resolver (`spawn::configure_kitty_file_transfer`)
-    /// is installed; otherwise non-direct mediums are skipped cleanly.
+    /// Allow Kitty graphics non-direct mediums (`t=f` file, `t=t` temp file,
+    /// `t=s` POSIX shm) to read host files. Default off (an exfiltration
+    /// surface). When on, a size-capped resolver is installed
+    /// (`spawn::configure_kitty_file_transfer`).
     pub(crate) allow_kitty_file_transfer: Option<bool>,
-    /// Opt-in: run the per-session hydratable temporal recorder (the B.9 spine read
-    /// back by the `temporal` control verb). Default OFF — an opt-out session pays no
-    /// writer thread and no retention growth. When enabled, each tab seeds a t0
-    /// keyframe and taps its reader hot path so the session is time-travel-replayable.
+    /// Run the per-session temporal recorder read by the `temporal` control verb.
+    /// Default off (no writer thread, no retention). When on, each tab seeds a t0
+    /// keyframe and taps its reader so the session can be replayed.
     pub(crate) temporal_recording: Option<bool>,
-    /// L3 network drive (`[net]`): the opt-in TLS listener that lets a remote
-    /// aterm drive THIS one, plus the saved `[[net.connections]]` this aterm can
-    /// dial to drive a remote (the `dial <name>` control verb). Absent ⇒ no
-    /// network surface (secure default). See [`NetConfig`] and [`crate::net_listen`]/
-    /// [`crate::net_connections`].
+    /// Network drive (`[net]`): the opt-in TLS listener that lets a remote aterm
+    /// drive this one, plus saved `[[net.connections]]` for the `dial <name>`
+    /// verb. Absent means no network surface. See [`NetConfig`],
+    /// [`crate::net_listen`], [`crate::net_connections`].
     pub(crate) net: Option<NetConfig>,
-    /// The fabric bridge (`[fabric]`): the `aterm-link serve …` child this
-    /// instance launches, holding the far ends of two socketpairs at fds 3 and 4
-    /// and speaking `Scope::Bridge` over them. Absent ⇒ no fabric (secure
-    /// default, exactly like the embedded operator). The one spelling in a shipped
-    /// build (a development build's `ATERM_FABRIC_COMMAND` seam overrides it). See
-    /// [`FabricConfig`] and [`crate::fabric_launch`].
+    /// Fabric bridge (`[fabric]`): the `aterm-link serve …` child holding the far
+    /// ends of two socketpairs at fds 3 and 4, speaking `Scope::Bridge`. Absent
+    /// means no fabric. Development builds may override it with
+    /// `ATERM_FABRIC_COMMAND`. See [`FabricConfig`], [`crate::fabric_launch`].
     pub(crate) fabric: Option<FabricConfig>,
-    /// The embedded operator (`[operator]`): the EXPERIMENTAL in-process observer
-    /// and durable attention queue behind `aterm fleet manage`. Absent ⇒ OFF. See
+    /// Embedded operator (`[operator]`): the experimental in-process observer and
+    /// attention queue behind `aterm fleet manage`. Absent means off. See
     /// [`OperatorConfig`] and [`crate::operator_host`].
     pub(crate) operator: Option<OperatorConfig>,
-    /// In-app self-update (`[update]`): whether the silent updater runs (`enabled`), how
-    /// a staged build applies (`auto_apply`), and — in a DEVELOPMENT build only — which
-    /// GitHub repo it pulls notarized releases from. Absent ⇒ on, and the compiled-in
-    /// default channel (`alabsystems/aterm`, the PUBLIC mirror — readable with no token,
-    /// which is what lets a freshly installed machine update). No environment variable
-    /// overrides any of it (2026-09-23). The location is NOT the trust anchor — the compiled-in pinned
-    /// Team ID + Apple notarization are — so repointing the channel cannot get an
-    /// untrusted build installed. macOS-only in effect; parsed (and inert) elsewhere.
-    /// See [`UpdateConfig`], crate `aterm-update`, and `docs/RELEASING.md`.
+    /// Self-update (`[update]`): whether the updater runs, how a staged build
+    /// applies, and (development builds only) which GitHub repo it pulls from.
+    /// Absent means on, from the public `alabsystems/aterm` channel. No
+    /// environment variable overrides it. The pinned Team ID and notarization are
+    /// the trust anchor, not the location. Effective on macOS only. See
+    /// [`UpdateConfig`], crate `aterm-update`, `docs/RELEASING.md`.
     pub(crate) update: Option<UpdateConfig>,
-    /// Sparkle words (`[sparkle_words]`): decorate matched profanity words with a
-    /// randomized sparkle and cat/kitty words with a cat-paw. A leftover
-    /// `[sparkle_words.orca]` table (the orca class was deleted 2026-09-27) is
-    /// ignored; the config editor reports it as compatibility-only.
-    /// Absent ⇒ both live keyword toys are ON; set `enabled = false` to disable.
-    /// See [`SparkleWordsConfig`].
+    /// Sparkle words (`[sparkle_words]`): sparkle matched profanity and give
+    /// cat/kitty words a cat-paw. A `[sparkle_words.orca]` table is ignored.
+    /// Absent means both are on. See [`SparkleWordsConfig`].
     pub(crate) sparkle_words: Option<SparkleWordsConfig>,
-    /// PHOSPHOR matrix rain (`[matrix_rain]`): Matrix digital rain UNDER the
-    /// text, in empty cells only. Absent ⇒ feature OFF (inverted vs sparkle —
-    /// costume mode is opt-in, required by the zero-cost pins); set
-    /// `enabled = true` to rain. See [`MatrixRainConfig`].
+    /// Matrix rain (`[matrix_rain]`) under the text, in empty cells only. Absent
+    /// means off. See [`MatrixRainConfig`].
     pub(crate) matrix_rain: Option<MatrixRainConfig>,
-    /// PRESENCE (`[presence]`, round 19): the two surfaces a window shows who
-    /// is driving it on — the band under the tab bar and the colour rim —
-    /// each a durable on/off the View menu's checkables write. Absent ⇒ both
-    /// ON. See [`PresenceConfig`].
+    /// Presence (`[presence]`): the driver band under the tab bar and the colour
+    /// rim, each toggled from the View menu. Absent means both on. See
+    /// [`PresenceConfig`].
     pub(crate) presence: Option<PresenceConfig>,
+    /// THE CLAUDE CODE FOOTER's switches (`[claude_footer]`, owner 2026-09-30):
+    /// what aterm writes into the rule under Claude Code's input box. Absent ⇒
+    /// `Σ` shown. See [`ClaudeFooterConfig`].
+    pub(crate) claude_footer: Option<ClaudeFooterConfig>,
+    /// RENDER REPAIR (`[render]`): what aterm does about a full-screen Claude
+    /// Code tab whose screen a resize of its own window left displaced. See
+    /// [`RenderConfig`]. Read once at launch.
+    pub(crate) render: Option<RenderConfig>,
     /// PRISM WAKE — the output streak (`[output_streak]`,
     /// `docs/DESIGN-output-streak-2026-08-30.md`): a thin per-theme rainbow
     /// comet answering fresh PROGRAM OUTPUT, plus one soft pip per episode.
@@ -1136,39 +688,31 @@ pub(crate) struct Config {
     /// `[matrix_rain]`, which stays opt-in); `enabled = false` opts out. See
     /// [`OutputStreakConfig`], whose field docs carry the per-key laws.
     pub(crate) output_streak: Option<OutputStreakConfig>,
-    /// Bundled ALab toolchain manager (`[packages]`, the `atpkg` lane): Automatic
-    /// updates (`enabled`), the install consent (`auto_install`) and the per-program
-    /// `exclude` the CO-LOCATED `atpkg` reads out of this SAME file itself. Absent ⇒ the
-    /// batteries-included default. See [`PackagesConfig`].
+    /// Toolchain manager (`[packages]`, `atpkg`): automatic updates, install
+    /// consent and per-program `exclude`, read by `atpkg` from this same file.
+    /// See [`PackagesConfig`].
     pub(crate) packages: Option<PackagesConfig>,
-    /// The upstream-Rust reroute (`[reroute]`): whether a rerouted `cargo`/`rustc`/`tlc`
-    /// announces itself. Read by the CO-LOCATED `atpkg` (`atpkg::config::RerouteConfig`);
-    /// mirrored so Settings can offer the switch. See [`RerouteConfig`].
+    /// Upstream-Rust reroute (`[reroute]`): whether a rerouted `cargo`/`rustc`/`tlc`
+    /// announces itself. Read by `atpkg` (`atpkg::config::RerouteConfig`);
+    /// mirrored for Settings. See [`RerouteConfig`].
     pub(crate) reroute: Option<RerouteConfig>,
-    /// macOS consent posture (`[privacy]`, the TCC lane): the master switch, the
-    /// silent full-disk-access probe, the one-time macOS access card, the owner-initiated
-    /// folder warm-up and the protected-root set the consent tier shares with
-    /// Containment. Absent ⇒ today's behavior (report the posture, probe silently,
-    /// offer the warm-up only on an explicit gesture). See [`PrivacyConfig`].
+    /// macOS consent posture (`[privacy]`): master switch, silent access probes,
+    /// the one-time access card, the folder warm-up and the protected-root set
+    /// shared with Containment. See [`PrivacyConfig`].
     pub(crate) privacy: Option<PrivacyConfig>,
-    /// macOS host settings (`[machine]`): Universal Control off for this host and
-    /// cargo build output hidden from Spotlight. The CO-LOCATED `atpkg` reads the
-    /// SAME table out of this file and applies it from `aterm pkg machine apply` (run as
-    /// the window opens and by a terminal session once a day) and at a package pass after
-    /// an edit; the GUI only displays and edits it.
-    /// Absent ⇒ both on. See [`MachineConfig`].
+    /// macOS host settings (`[machine]`): Universal Control off and cargo build
+    /// output hidden from Spotlight. Applied by `atpkg` (`aterm pkg machine
+    /// apply`); the GUI only displays and edits it. Absent means both on. See
+    /// [`MachineConfig`].
     pub(crate) machine: Option<MachineConfig>,
-    /// THE PTY KEEPER (`[keeper]`, P3 of `docs/DESIGN-pty-keeper-2026-09-26.md`):
-    /// whether this window registers every terminal's master with the keeper,
-    /// so a crash, a kill or a Force Quit does not hang its shells up and the
-    /// next launch reattaches them. Absent ⇒ OFF (P3 is opt-in; P4 turns it on
-    /// by default). Read at launch. See [`KeeperConfig`].
+    /// PTY keeper (`[keeper]`, `docs/DESIGN-pty-keeper-2026-09-26.md`): register
+    /// every terminal's master with the keeper so a crash or kill does not hang
+    /// up its shells and the next launch reattaches them. Absent means off. Read
+    /// at launch. See [`KeeperConfig`].
     pub(crate) keeper: Option<KeeperConfig>,
-    /// The supervisor's `[harness]` policy, as the table's ONE reader takes it
-    /// from the file's whole text ([`HarnessPolicy`]). Not deserialized: that
-    /// reader also reads a `harness.<key>` written below another table's
-    /// header and a file that is not TOML at all, so the loader sets it
-    /// ([`Config::parse`]).
+    /// The `[harness]` policy ([`HarnessPolicy`]), read from the file's whole
+    /// text rather than deserialized (it also accepts dotted `harness.<key>`
+    /// lines under other tables and non-TOML text); set in [`Config::parse`].
     #[serde(skip)]
     pub(crate) harness: HarnessPolicy,
 }
@@ -1209,7 +753,8 @@ impl TitleSummaryProvider {
 /// Proxy behavior for opt-in remote title-summary providers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 pub(crate) enum TitleSummaryProxyMode {
-    /// Honor HTTP_PROXY, HTTPS_PROXY, and NO_PROXY from the aterm process.
+    /// Honor HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY from the aterm
+    /// process.
     #[default]
     #[serde(rename = "environment")]
     Environment,
@@ -1267,24 +812,38 @@ pub(crate) const DEFAULT_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 20;
 pub(crate) const MIN_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 1;
 pub(crate) const MAX_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 120;
 
-/// Tab Subject & Status policy bounds (RFC §12). Declared `pub(crate)` so
-/// `prefs` derives its slider domain from the SAME numbers the resolver clamps
-/// to — a Settings save can then never write a value reload would silently
-/// rewrite.
+/// Tab status bounds, shared with `prefs` so a Settings save never writes a
+/// value the resolver would clamp.
 pub(crate) const DEFAULT_TAB_STATUS_QUIET_AFTER_MS: u64 = 5_000;
 pub(crate) const MIN_TAB_STATUS_QUIET_AFTER_MS: u64 = 500;
 pub(crate) const MAX_TAB_STATUS_QUIET_AFTER_MS: u64 = 120_000;
 pub(crate) const DEFAULT_TAB_STATUS_DWELL_MS: u64 = 750;
 pub(crate) const MIN_TAB_STATUS_DWELL_MS: u64 = 0;
 pub(crate) const MAX_TAB_STATUS_DWELL_MS: u64 = 10_000;
-/// Nominal observation budget: at most one classification per session per this
-/// interval (RFC §10). NOT a config key — the RFC's configuration surface is the
-/// four `tab_status*` keys, and an interval the user can raise independently of
-/// dwell would just be a way to make dwell unserviceable.
+/// At most one classification per session per this interval. Not
+/// configurable: raising it independently of dwell would break dwell.
 const NOMINAL_TAB_STATUS_OBSERVE_INTERVAL_MS: u64 = 250;
 /// Floor on that budget, which `tab_status_dwell_ms = 0` would otherwise take to
 /// zero and turn every output burst into a classification.
 const MIN_TAB_STATUS_OBSERVE_INTERVAL_MS: u64 = 50;
+
+/// Whether two renderer themes paint the same. `aterm_render::Theme` has no
+/// `PartialEq`; the exhaustive destructure makes a new field a compile error
+/// here instead of a change that escapes the comparison.
+pub(crate) fn theme_eq(a: Theme, b: Theme) -> bool {
+    let Theme {
+        fg,
+        bg,
+        cursor,
+        selection,
+    } = a;
+    (fg, bg, cursor, selection) == (b.fg, b.bg, b.cursor, b.selection)
+}
+
+/// Pack an [`Rgb`] as the renderer's `0x00RRGGBB`.
+fn rgb_u32(c: Rgb) -> u32 {
+    (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)
+}
 
 /// An ordered font list (W6 `fallback_fonts`) that deserializes from EITHER a
 /// TOML array of strings (`["A", "B"]`) or a single comma-separated string
@@ -1355,13 +914,12 @@ pub(crate) struct SparkleWordsConfig {
     /// Languages whose AMBIGUOUS homograph entries are un-gated (`["all"]` = every
     /// language). Non-ambiguous forms always load. Default `["en"]`.
     pub(crate) languages: Option<Vec<String>>,
-    /// Force the static, non-twinkling path. Default false. (An OS reduced-motion
-    /// query is a future refinement; this is the explicit user override.)
+    /// Force the static, non-twinkling path. Default false. The explicit user
+    /// override; the OS Reduce Motion flag is folded in per frame through
+    /// `MotionPolicy` (app_render).
     pub(crate) reduced_motion: Option<bool>,
-    /// Suppress decorations on the ALTERNATE screen. Default FALSE — full-screen
-    /// TUIs (Claude Code foremost) decorate like the primary screen; `true`
-    /// restores the pre-2026-07-04 behavior (vim/less/htop UI text never
-    /// decorated — the design §1 knob, hardcoded until now).
+    /// Suppress decorations on the alternate screen. Default false (full-screen
+    /// TUIs decorate like the primary screen).
     pub(crate) suppress_in_alt_screen: Option<bool>,
     /// External lexicon TOML (`[[entry]]` blocks) merged OVER the builtin. `~` and
     /// `$HOME` are expanded. Absent ⇒ builtin only. Re-read on config reload.
@@ -1373,8 +931,7 @@ pub(crate) struct SparkleWordsConfig {
     pub(crate) toy_packs: Option<Vec<String>>,
     /// Global folded surfaces to never decorate, regardless of category.
     pub(crate) deny: Option<Vec<String>>,
-    /// The non-feline Sparkle Words product settings. The historical table name is
-    /// retained for config compatibility; its `enabled` key gates profanity,
+    /// The non-feline Sparkle Words settings; its `enabled` key gates profanity,
     /// emphasis and custom/Toy Pack words together.
     pub(crate) profanity: Option<SparkleProfanityConfig>,
     /// The steady feline CAT-PAW sub-table.
@@ -1387,10 +944,9 @@ pub(crate) struct SparkleWordsConfig {
     pub(crate) ink: Option<SparkleInkConfig>,
     /// The emphasis / hype-word class sub-table (v2, ink-only).
     pub(crate) emphasis: Option<SparkleEmphasisConfig>,
-    /// v3 §6 custom word-effect specs (`[[sparkle_words.custom]]`): per-word
-    /// `ink` / `burst` / `graphic` axes, any combination. Words auto-append
-    /// to the emphasis class, override class defaults regardless of the
-    /// match's class, and bypass per-class enable gates.
+    /// Custom word-effect specs (`[[sparkle_words.custom]]`): per-word `ink`,
+    /// `burst` and `graphic` axes in any combination. Words join the emphasis
+    /// class, override class defaults and bypass per-class enable gates.
     ///
     /// ```toml
     /// [[sparkle_words.custom]]
@@ -1407,11 +963,9 @@ pub(crate) struct SparkleWordsConfig {
 /// per-pack byte/recipe/word caps enforced by `aterm-effects`.
 const MAX_ACTIVE_TOY_PACKS: usize = 8;
 
-/// Worst-case work for one worker/startup path-feed fingerprint pass: one
-/// lexicon, eight Toy Packs, and eight Trail Packs. Each bounded reader may
-/// consume one sentinel byte past its parser cap, for at most 17 opens and
-/// 2,883,601 bytes read. This is an I/O-volume bound, not a wall-clock promise
-/// for an unhealthy filesystem.
+/// Worst-case I/O for one path-feed fingerprint pass: one lexicon, eight Toy
+/// Packs and eight Trail Packs, each reader taking at most one sentinel byte
+/// past its cap (17 opens, 2,883,601 bytes).
 #[cfg(test)]
 const MAX_PATH_FEED_OPEN_ATTEMPTS: usize = 1 + 2 * MAX_ACTIVE_TOY_PACKS;
 #[cfg(test)]
@@ -1429,9 +983,8 @@ struct LoadedToyPacks {
 
 type AdmittedPathFeed = (std::path::PathBuf, Result<String, String>);
 
-/// Read one configured effect feed once, then bind both its consumer bytes and
-/// its fingerprint to that same admitted handle. The path and readability bits
-/// deliberately match the test-only independent fingerprint oracle.
+/// Read one configured effect feed once and derive both its consumer bytes and
+/// its fingerprint from that one handle.
 fn read_and_fingerprint_path_feed(
     path: &str,
     max_bytes: usize,
@@ -1472,32 +1025,24 @@ fn read_and_fingerprint_path_feed_with_reader(
     }
 }
 
-/// Immutable word-decoration runtime compiled for one admitted config
-/// generation. File reads, Toy Pack compilation, and lexicon construction all
-/// happen before this value reaches the event loop; render-time recomputation
-/// only clones this memory-backed value through the Serious Mode gate.
+/// Word-decoration runtime compiled for one admitted config generation. File
+/// reads, Toy Pack compilation and lexicon construction happen before it
+/// reaches the event loop.
 #[derive(Clone)]
 pub(crate) struct PreparedSparkleRuntime {
     resolved: Option<crate::word_decorations::Resolved>,
-    /// THE KITTY-COMMAND VOCABULARY (`aterm_lexicon::TrickLexicon`), compiled
-    /// here — off the keystroke path, on the same worker and from the same
-    /// `[sparkle_words] languages` as the word lexicon — and NOT a member of
-    /// [`Resolved`](crate::word_decorations::Resolved): the sparkle master and
-    /// the family bits decide whether the WORD ENGINE runs, and the trick
-    /// table must never keep it alive for a flash, nor go away with it. It
-    /// is compiled whatever the master says (a few hundred surfaces; the
-    /// dispatch gates read the master themselves), so the input path holds
-    /// one `Arc` per generation and never a `None` it has to explain. The
-    /// typed-line listener asks for it only at a word boundary on a still-pure
-    /// line (`TrickListener::needs_lexicon`), and re-keying a config
-    /// generation replaces the `Arc` — no per-press refcount traffic.
+    /// Kitty-command vocabulary (`aterm_lexicon::TrickLexicon`), compiled off the
+    /// keystroke path from the same `[sparkle_words] languages` as the word
+    /// lexicon. Kept outside [`Resolved`](crate::word_decorations::Resolved) so
+    /// it neither keeps the word engine alive nor disappears with it; compiled
+    /// regardless of the master switch (dispatch checks it). Replaced per
+    /// generation; the input path borrows it only at word boundaries.
     tricks: std::sync::Arc<aterm_lexicon::TrickLexicon>,
 }
 
-/// One bounded, internally consistent generation of every path-backed effect
-/// feed. Each prepared consumer and its fingerprint derive from the same
-/// same-handle admitted bytes, so pathname replacement and ABA edits cannot
-/// label stale runtime data as the current generation.
+/// One consistent generation of every path-backed effect feed. Each consumer
+/// and its fingerprint derive from the same admitted bytes, so a path swap
+/// cannot label stale data as current.
 #[derive(Clone)]
 pub(crate) struct PreparedPathFeedGeneration {
     pub(crate) sparkle: PreparedSparkleRuntime,
@@ -1506,18 +1051,14 @@ pub(crate) struct PreparedPathFeedGeneration {
 }
 
 impl PreparedSparkleRuntime {
-    /// The compiled kitty-command vocabulary of this generation (see the
-    /// field). Borrowed, never cloned, by the input path: the borrow lives for
-    /// one press and the generation cannot be replaced under it.
+    /// This generation's kitty-command vocabulary, borrowed for one press.
     pub(crate) fn tricks(&self) -> &aterm_lexicon::TrickLexicon {
         &self.tricks
     }
 
-    /// Exact custom-spec consumers admitted for this already-prepared runtime
-    /// generation. The resolved table includes valid Toy Packs followed by
-    /// inline overrides, so Settings can disclose live dependencies without
-    /// reopening a manifest or treating an authored path as proof of an
-    /// effect shape.
+    /// Custom-spec consumers for this generation (valid Toy Packs, then inline
+    /// overrides), so Settings can disclose dependencies without reopening
+    /// manifests.
     pub(crate) fn consumer_capabilities(&self) -> aterm_effects::spec::SpecConsumerCapabilities {
         let Some(resolved) = self.resolved.as_ref() else {
             return Default::default();
@@ -1574,30 +1115,22 @@ pub(crate) fn path_feed_read_count() -> usize {
     PATH_FEED_READS.with(std::cell::Cell::get)
 }
 
-/// One immutable, validated Trail Pack catalog for one config generation.
-///
-/// The versioned config service is the sole production resolver.  It shares this
-/// value by `Arc` with the live terminal host and every semantic Settings view,
-/// keeping manifest IO, diagnostics, picker ids, and rendered parameters on the
-/// exact same revision instead of quietly compiling the same files again.
+/// Validated Trail Pack catalog for one config generation, shared by `Arc`
+/// between the live host and Settings so manifests are compiled once per
+/// revision.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrailPackCatalog {
     pub(crate) packs: std::collections::HashMap<String, aterm_effects::cursor_glow::TrailParams>,
     pub(crate) ids: Vec<String>,
     pub(crate) diagnostics: Vec<String>,
-    /// Presentation parsed once with this immutable config-asset generation.
-    /// The live redraw path reads this POD instead of rescanning the style and
-    /// companion vocabularies every frame.
+    /// Presentation parsed once per asset generation so redraw does not rescan
+    /// the style vocabulary.
     resolved_style_raw: Box<str>,
     resolved_presentation: ResolvedTrailPresentation,
 }
 
-/// Maximum encoded PNG bytes admitted for one custom kitty cursor sprite.
-///
-/// The general terminal image decoder deliberately accepts much larger payloads;
-/// this config asset is tiny UI chrome and therefore has a tighter independent
-/// budget.  The resolver uses a `take(MAX + 1)` read, so a misleading file
-/// metadata length can never turn config admission into an unbounded allocation.
+/// Maximum encoded PNG bytes for a custom kitty cursor sprite. Read with
+/// `take(MAX + 1)`, so file metadata cannot cause an unbounded allocation.
 pub(crate) const MAX_KITTY_SPRITE_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum width or height of a decoded custom cursor sprite.
 pub(crate) const MAX_KITTY_SPRITE_DIMENSION: usize = 1024;
@@ -1614,9 +1147,8 @@ pub(crate) const MAX_WALLPAPER_SOURCE_DIMENSION: usize = 8192;
 /// memory bound — still larger than any window it will be cover-scaled to).
 pub(crate) const MAX_WALLPAPER_KEEP_DIMENSION: usize = 4096;
 
-/// The installed-theme directory is ambient user input.  Discovery retains a
-/// bounded, deterministic prefix and every individual file is read through a
-/// hard byte limit before it can enter a config snapshot.
+/// Installed-theme discovery keeps a bounded, deterministic prefix and reads
+/// every file under a hard byte limit.
 pub(crate) const MAX_USER_THEME_FILES: usize = 128;
 const MAX_USER_THEME_CANDIDATES: usize = 512;
 /// Total directory entries inspected before theme discovery fails closed.
@@ -1631,11 +1163,9 @@ enum ThemeAssetResolution {
     Invalid(std::sync::Arc<str>),
 }
 
-/// One bounded custom-theme file admitted before the event loop starts.
-///
-/// Invalid entries are deliberately retained for diagnostics but never appear
-/// in the picker.  A configured bad file therefore fails closed in the live
-/// renderer and Manual reports the same reason from the same catalog.
+/// One bounded custom-theme file. Invalid entries are kept for diagnostics but
+/// never listed in the picker, so a bad configured file fails closed and Manual
+/// reports the same reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ThemeAsset {
     name: String,
@@ -1644,24 +1174,19 @@ struct ThemeAsset {
     resolution: ThemeAssetResolution,
 }
 
-/// Parsed custom themes for one immutable config generation.
-///
-/// Built-ins remain owned by `aterm-types`; this catalog contains only files.
-/// Consumers must resolve through [`Self::resolve`] rather than opening the
-/// theme directory themselves. The background directory observer parses a new
-/// catalog off-thread and the config reducer publishes it as another complete
-/// generation, keeping every live surface generation-consistent.
+/// Parsed custom themes (files only; built-ins live in `aterm-types`) for one
+/// config generation. Consumers resolve through [`Self::resolve`]; the
+/// directory observer parses a new catalog off-thread and publishes it as a
+/// complete generation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ThemeCatalog {
     entries: Vec<ThemeAsset>,
     truncated: bool,
 }
 
-/// Live watcher failures that must retain the last admitted catalog. Invalid
-/// UTF-8, syntax, names, and oversized files are deterministic asset
-/// diagnostics and still produce an `Invalid` entry; these variants are host
-/// observation failures where publishing a replacement would make a transient
-/// permission/race look like user intent.
+/// Live watcher failures that keep the last admitted catalog. Deterministic
+/// file problems (bad UTF-8, syntax, size) still yield an `Invalid` entry;
+/// these are transient host failures that must not look like user intent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ThemeCatalogWatchError {
     DirectoryUnreadable,
@@ -1705,12 +1230,10 @@ impl ThemeCatalog {
         Self::discover_in_with(directory, false, || {}).unwrap_or_default()
     }
 
-    /// Fallible counterpart used by the live directory watcher. Startup keeps
-    /// its historical best-effort fallback through [`Self::discover_in`], but a
-    /// running process must distinguish an actually empty/deleted directory
-    /// from a transient permission, mount, or enumeration failure. Publishing
-    /// `Default` for the latter would discard the last admitted custom-theme
-    /// generation and could silently move the renderer off the selected theme.
+    /// Fallible discovery for the live watcher: distinguishes an empty or
+    /// deleted directory from a transient enumeration failure, so a failure
+    /// never discards the admitted catalog. Startup uses the best-effort
+    /// [`Self::discover_in`].
     pub(crate) fn try_discover_in(
         directory: &std::path::Path,
     ) -> Result<Self, ThemeCatalogWatchError> {
@@ -1862,10 +1385,8 @@ impl ThemeCatalog {
         })
     }
 
-    /// Resolve a built-in or parsed user-theme entry, case-insensitively. No
-    /// filesystem access is possible from this API. Case-fold collisions are
-    /// rejected during admission, so picker, renderer, engine, and diagnostics
-    /// all observe one unambiguous identity for a configured name.
+    /// Resolve a built-in or parsed user theme, case-insensitively, without
+    /// filesystem access. Case-fold collisions are rejected at admission.
     pub(crate) fn resolve(&self, name: &str) -> Result<aterm_types::ColorScheme, String> {
         if let Some(scheme) = aterm_types::scheme::builtin(name) {
             return Ok(scheme);
@@ -1906,12 +1427,9 @@ impl ThemeCatalog {
     }
 }
 
-/// Canonicalize the custom-theme namespace with the same ASCII-insensitive
-/// identity used by built-ins, the native picker, and config resolution. A
-/// case-sensitive filesystem may contain both `Work.conf` and `work.conf`; it
-/// is safer to reject that ambiguous logical name than to let directory order
-/// decide which palette a user sees. One invalid sentinel retains the
-/// diagnostic while keeping both spellings out of the picker.
+/// Canonicalize custom theme names case-insensitively, like built-ins. Names
+/// that collide by case (`Work.conf` vs `work.conf`) collapse to one invalid
+/// sentinel rather than letting directory order pick a palette.
 fn normalize_theme_entries(mut entries: Vec<ThemeAsset>) -> Vec<ThemeAsset> {
     entries.sort_by(|left, right| {
         left.name
@@ -1970,92 +1488,32 @@ enum ThemeFileReadError {
     Invalid(String),
 }
 
+/// One theme candidate, read through the shared same-handle regular-file
+/// reader (`aterm_effects::file_feed`): it opens without following a link
+/// swapped in after the scan and verifies the opened handle is a regular file
+/// before reading. That handle check is the security boundary.
 fn read_bounded_theme_file(path: &std::path::Path) -> Result<Vec<u8>, ThemeFileReadError> {
-    let file = open_regular_theme_file(path).map_err(ThemeFileReadError::Unavailable)?;
-    let mut bytes = Vec::with_capacity(MAX_USER_THEME_FILE_BYTES.min(16 * 1024));
-    file.take((MAX_USER_THEME_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| ThemeFileReadError::Unavailable(format!("unreadable ({error})")))?;
-    if bytes.len() > MAX_USER_THEME_FILE_BYTES {
-        return Err(ThemeFileReadError::Invalid(format!(
-            "larger than the {MAX_USER_THEME_FILE_BYTES}-byte theme limit"
-        )));
-    }
-    Ok(bytes)
+    aterm_effects::file_feed::read_bounded_regular_file(path, MAX_USER_THEME_FILE_BYTES).map_err(
+        |error| {
+            // `InvalidData` is the reader's over-limit verdict, `InvalidInput`
+            // its not-a-regular-file refusal; every other error is an
+            // open/read observation.
+            match error.kind() {
+                std::io::ErrorKind::InvalidData => ThemeFileReadError::Invalid(format!(
+                    "larger than the {MAX_USER_THEME_FILE_BYTES}-byte theme limit"
+                )),
+                std::io::ErrorKind::InvalidInput => ThemeFileReadError::Unavailable(
+                    "theme source is not a regular non-link file".into(),
+                ),
+                _ => ThemeFileReadError::Unavailable(format!("unreadable ({error})")),
+            }
+        },
+    )
 }
 
-/// Open one theme candidate without following a link swapped in after the
-/// directory scan, then verify the opened handle itself is a regular file.
-/// The directory entry check is only a cheap filter; this handle-level check is
-/// the security boundary shared by startup parsing and live watcher discovery.
-#[cfg(unix)]
-pub(crate) fn open_regular_theme_file(path: &std::path::Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| format!("unreadable regular theme file ({error})"))?;
-    if !file
-        .metadata()
-        .map_err(|error| format!("unreadable theme metadata ({error})"))?
-        .file_type()
-        .is_file()
-    {
-        return Err("theme source is not a regular file".to_string());
-    }
-    Ok(file)
-}
-
-#[cfg(windows)]
-pub(crate) fn open_regular_theme_file(path: &std::path::Path) -> Result<std::fs::File, String> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|error| format!("unreadable regular theme file ({error})"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("unreadable theme metadata ({error})"))?;
-    if !metadata.file_type().is_file()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    {
-        return Err("theme source is not a regular non-reparse file".to_string());
-    }
-    Ok(file)
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn open_regular_theme_file(path: &std::path::Path) -> Result<std::fs::File, String> {
-    let before = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("unreadable theme metadata ({error})"))?;
-    if !before.file_type().is_file() {
-        return Err("theme source is not a regular file".to_string());
-    }
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("unreadable regular theme file ({error})"))?;
-    if !file
-        .metadata()
-        .map_err(|error| format!("unreadable theme metadata ({error})"))?
-        .file_type()
-        .is_file()
-    {
-        return Err("theme source changed away from a regular file".to_string());
-    }
-    Ok(file)
-}
-
-/// One fully-resolved custom kitty cursor asset for an admitted config generation.
-///
-/// `Invalid` is intentionally distinct from `BuiltIn`: a bad authored sprite
-/// fails closed (the cursor companion is disabled) and remains diagnosable.  It
-/// can never silently turn into the built-in homage in app-rendered output while Settings says
-/// the custom value is active.
+/// Resolved custom kitty cursor asset for one config generation. `Invalid`
+/// fails closed (the companion is disabled) and stays diagnosable; it never
+/// falls back to the built-in sprite.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum KittySpriteAsset {
     #[default]
@@ -2108,12 +1566,10 @@ impl KittySpriteAsset {
     }
 }
 
-/// The admitted WALLPAPER image for one config revision — the `wallpaper` key
-/// resolved once at the same seam as the rainbow kitty sprite, so live
-/// rendering, validation, and Settings all see one decode verdict. `Ready`
-/// holds straight sRGB RGBA8, already bounded to
-/// [`MAX_WALLPAPER_KEEP_DIMENSION`] per side; per-window cover-scaling to the
-/// frame happens at splice time against this one source.
+/// Admitted wallpaper image for one config revision, shared by rendering,
+/// validation and Settings. `Ready` holds straight sRGB RGBA8 bounded to
+/// [`MAX_WALLPAPER_KEEP_DIMENSION`] per side; per-window cover scaling happens
+/// at splice time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WallpaperAsset {
     /// No `wallpaper` key configured — no backdrop, the historical frame.
@@ -2167,10 +1623,9 @@ impl WallpaperAsset {
     }
 }
 
-/// Every non-text config asset admitted at one revision.  `ConfigSnapshot`
-/// carries one outer `Arc<ConfigAssetCatalog>` and the live host, capture, and
-/// all Settings views clone that exact Arc; there is no independently-resolved
-/// Trail/rainbow kitty/theme/sparkle-consumer lane that can lag the text generation.
+/// Every non-text config asset admitted at one revision. `ConfigSnapshot`
+/// carries one `Arc<ConfigAssetCatalog>` that the live host, capture and
+/// Settings all share.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ConfigAssetCatalog {
     pub(crate) trail_packs: std::sync::Arc<TrailPackCatalog>,
@@ -2179,13 +1634,10 @@ pub(crate) struct ConfigAssetCatalog {
     /// same revision seam as the kitty sprite.
     pub(crate) wallpaper: WallpaperAsset,
     pub(crate) themes: std::sync::Arc<ThemeCatalog>,
-    /// Shared-setting consumers derived from the exact admitted inline + Toy
-    /// Pack spec table and prepared lexicon. `Some(default())` is an
-    /// authoritative observation that no reachable word consumes shared
-    /// tuning. `None` is the real preliminary production generation while Toy
-    /// Packs/lexicon are pending worker preparation (and is also used by the
-    /// manifest-I/O-free test catalog). Settings presents that state as pending;
-    /// it never reopens a pack or infers effect shapes from authored paths.
+    /// Shared-setting consumers from the admitted inline and Toy Pack specs.
+    /// `Some(default())` means no word consumes shared tuning; `None` means Toy
+    /// Packs and lexicon are still pending worker preparation (also used by the
+    /// test catalog), which Settings shows as pending.
     pub(crate) sparkle_spec_consumers:
         Option<std::sync::Arc<aterm_effects::spec::SpecConsumerCapabilities>>,
 }
@@ -2218,9 +1670,8 @@ impl TrailPackCatalog {
         self.resolved_style_raw = raw.trim().into();
     }
 
-    /// Cached production answer, with a dynamic fallback for test/preview code
-    /// that deliberately mutates `Config` without publishing a new immutable
-    /// asset generation.
+    /// Cached answer, with a dynamic fallback for test/preview code that
+    /// mutates `Config` without publishing a new asset generation.
     pub(crate) fn presentation_for(&self, raw: &str) -> ResolvedTrailPresentation {
         let raw = raw.trim();
         if raw == self.resolved_style_raw.as_ref() {
@@ -2231,9 +1682,8 @@ impl TrailPackCatalog {
     }
 }
 
-/// Why a configured trail style cannot emit.  This is shared by live terminal
-/// rendering, validation, and Settings previews so an invalid value never turns
-/// into the parser's visual `Lumen` fallback in only one of those surfaces.
+/// Why a configured trail style cannot emit; shared by rendering, validation
+/// and Settings so an invalid value is treated the same everywhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrailStyleIssue {
     Unknown,
@@ -2251,23 +1701,18 @@ pub(crate) struct ResolvedTrailStyle {
     pub(crate) issue: Option<TrailStyleIssue>,
 }
 
-/// All string-keyed presentation decisions for one resolved trail style.
-///
-/// Kept beside the immutable Trail Pack catalog because both are admitted from
-/// the same config generation. Rendering then consumes only `Copy` fields;
-/// aliases, companion species, ribbon geometry, and pack lookup cannot drift or
-/// be reparsed independently on the frame path.
+/// All string-keyed presentation decisions for one resolved trail style,
+/// admitted with the Trail Pack catalog so rendering reads only `Copy` fields.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ResolvedTrailPresentation {
     pub(crate) style: ResolvedTrailStyle,
     pub(crate) beam: bool,
     pub(crate) ribbon_tall: bool,
-    /// The explicit `... flat` spelling: the 2026-09-13 flat body instead of
-    /// the default comet body and vivid rail (`RAINBOW-KITTY-V2.md` §30).
+    /// The explicit `... flat` spelling: the flat body instead of the default
+    /// comet body and vivid rail (`RAINBOW-KITTY-V2.md` §30).
     pub(crate) ribbon_flat: bool,
-    /// The classic wake's COLOUR FACE — the spectrum (`false`) or the
-    /// theme-following two-tone tracer (`true`). A spelling fork like the
-    /// ribbon geometry beside it, not a style of its own.
+    /// Classic wake colour: spectrum (`false`) or the theme-following two-tone
+    /// tracer (`true`).
     pub(crate) classic_mono: bool,
     pub(crate) pet_species: Option<aterm_effects::kitty_pet::PetSpecies>,
     pub(crate) comet: bool,
@@ -2330,10 +1775,9 @@ pub(crate) struct CursorGlowInputs {
     pub(crate) ring: bool,
 }
 
-/// `[sparkle_words.ink]` — the animated glyph-ink shimmer (v2): matched words'
-/// glyphs recolor through a two-tone gradient with one traveling specular sweep,
-/// then settle to constant bytes. Applies to emphasis + profanity + feline;
-/// takes effect only when `sparkle_words.enabled` is on.
+/// `[sparkle_words.ink]`: animated glyph-ink shimmer (two-tone gradient with
+/// one specular sweep, then constant). Applies to emphasis, profanity and
+/// feline words when `sparkle_words.enabled` is on.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleInkConfig {
@@ -2350,9 +1794,8 @@ pub(crate) struct SparkleInkConfig {
     pub(crate) loop_: Option<bool>,
 }
 
-/// `[sparkle_words.emphasis]` — hype words, the ink-only 4th lexicon class:
-/// no sprite, just the animated ink. Ships EMPTY — the builtin lexicon has no
-/// emphasis forms; `extra_words` is the sole population mechanism.
+/// `[sparkle_words.emphasis]`: ink-only hype words. The built-in lexicon has
+/// none; `extra_words` populates it.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleEmphasisConfig {
@@ -2369,20 +1812,15 @@ pub(crate) struct SparkleEmphasisConfig {
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleProfanityConfig {
-    /// Enable the non-feline Sparkle Words toy. Default TRUE. This historical
-    /// location remains stable, but the switch also gates emphasis and
-    /// custom/Toy Pack words so the Top Settings toggle is an honest
-    /// product-level off switch. Keyword Kitties remains independent.
+    /// Enable the non-feline Sparkle Words toy. Default true. Also gates
+    /// emphasis and custom/Toy Pack words; Keyword Kitties is independent.
     pub(crate) enabled: Option<bool>,
-    /// `"rainbow"` (the v3 default: animated rainbow ink, `supernova_chance`%
-    /// of episodes escalate to the FUCK SUPER NOVA) | `"nova"` = the v2
-    /// classic nova (dip → flash → ring + rays → debris → ember) |
-    /// `"sparkle"` = the exact v1 randomized sparkle. Unknown values fall
-    /// back to `"rainbow"`.
+    /// `"rainbow"` (default: animated rainbow ink; `supernova_chance`% of
+    /// episodes escalate to the super nova), `"nova"` (the classic nova), or
+    /// `"sparkle"` (randomized sparkle). Unknown values mean `"rainbow"`.
     pub(crate) style: Option<String>,
-    /// v3 §3.2: FUCK SUPER NOVA escalation chance, percent. Default 10,
-    /// clamped 0..=100 (0 disables). Consulted only under
-    /// `style = "rainbow"` (documented — nova/sparkle ignore it).
+    /// Super nova escalation chance, percent. Default 10, clamped 0..=100 (0
+    /// disables). Used only by `style = "rainbow"`.
     pub(crate) supernova_chance: Option<u32>,
     /// Quasar (1/512) / Singularity (1/1024) rare nova variants (§3.5/§6.1).
     /// Default TRUE.
@@ -2397,20 +1835,13 @@ pub(crate) struct SparkleProfanityConfig {
     pub(crate) jitter: Option<i8>,
     /// Opacity 0.0..=1.0. Default 0.85.
     pub(crate) intensity: Option<f32>,
-    /// Play the discordant curse BONK when a profanity word is TYPED at the
-    /// live caret (the cursor-audio framework's sparkle-words gesture — a
-    /// minor-second/tritone clash against the trail melody's current degree).
-    /// Default TRUE, riding the same on-by-default product choice as the
-    /// sparkles and `trail_sounds`; it is silenced with them by focus loss,
-    /// reduced motion, zero `trail_sound_volume`, or `enabled = false` here.
-    /// HOST-side gate only, the feline `log` precedent: the effects engine
-    /// always records its bounded cues and the App drains-and-drops when off.
+    /// Play the discordant bonk when a profanity word is typed at the caret.
+    /// Default true; silenced by focus loss, reduced motion or zero
+    /// `trail_sound_volume`. Host-side gate: the engine records its cues and the
+    /// App drops them when off.
     pub(crate) bonk: Option<bool>,
-    /// ALSO bonk when an on-screen curse's supernova ignites (the detonation
-    /// edge — fires for `cat` output and scrollback redraws too, since screen
-    /// content detonates regardless of who typed it). Default FALSE so the
-    /// bonk stays typed-provenance-only unless explicitly opted in;
-    /// rate-limited by the §6.4 flash limiter when on.
+    /// Also bonk when an on-screen curse's supernova ignites (including program
+    /// output and redraws). Default false; rate-limited by the flash limiter.
     pub(crate) bonk_detonation: Option<bool>,
     /// Extra whole words to treat as profanity (added to the lexicon).
     pub(crate) extra_words: Option<Vec<String>>,
@@ -2424,30 +1855,25 @@ pub(crate) struct SparkleProfanityConfig {
 pub(crate) struct SparkleFelineConfig {
     /// Decorate cat/kitty words. Default TRUE (takes effect only when master on).
     pub(crate) enabled: Option<bool>,
-    /// `"cat"` (default) is the only graphic style. `"paw"` remains a legacy
-    /// compatibility value and selects ink-only rendering; cat-art v4 emits no
-    /// paw graphic. Unknown values fall back to `"cat"`.
+    /// `"cat"` (default) is the only graphic style; `"paw"` selects ink-only
+    /// rendering. Unknown values mean `"cat"`.
     pub(crate) style: Option<String>,
-    /// Retired idle-animation key. Parsed and preserved for compatibility, but
-    /// cat-art v4 has no idle scheduler and this value has no effect.
+    /// Parsed and preserved for compatibility; has no effect.
     pub(crate) idle: Option<bool>,
-    /// Retired gaze key. Parsed and preserved for compatibility, but v4 eyes
-    /// are authored into the sprite and this value has no effect.
+    /// Parsed and preserved for compatibility; has no effect.
     pub(crate) gaze: Option<bool>,
     /// Fortune (1/512) / Nebula (1/1024) rare cats (§3.5/§5.4). Default TRUE.
     pub(crate) magic: Option<bool>,
-    /// Retired paw-tint key. Parsed and preserved; no v4 graphic consumes it.
+    /// Parsed and preserved for compatibility; has no effect.
     pub(crate) color: Option<String>,
-    /// Retired feline-opacity key. Parsed and preserved; no v4 graphic consumes it.
+    /// Parsed and preserved for compatibility; has no effect.
     pub(crate) intensity: Option<f32>,
     /// Decorate the bare 3-letter `cat` token (also the shell command). Default true.
     pub(crate) allow_bare_cat: Option<bool>,
     /// Decorate a lone CJK cat ideograph (`猫`) anywhere. Default false (high FP).
     pub(crate) cjk_single_char: Option<bool>,
-    /// Record sightings into the durable, machine-owned Kitty Log
-    /// (`kitty-log.toml`, §F4). Default TRUE. HOST-side gate only: the
-    /// effects engine always records (bounded per tick) and the App drains-
-    /// and-drops when this is false — nothing is counted or written.
+    /// Record sightings in the Kitty Log (`kitty-log.toml`). Default true.
+    /// Host-side gate: when false the App drops the engine's records.
     pub(crate) log: Option<bool>,
     /// Extra whole words to treat as feline (added to the lexicon).
     pub(crate) extra_words: Option<Vec<String>>,
@@ -2455,10 +1881,9 @@ pub(crate) struct SparkleFelineConfig {
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
-/// `[sparkle_words.canine]` — the typed-word DOG cameo. Unlike the ambient
-/// families this class draws nothing from the screen scanner; its `enabled`
-/// gates the input-path summon (typing `dog`/`puppy`/… after a lot of typing),
-/// and its word lists ride the same lexicon override as every other class.
+/// `[sparkle_words.canine]`: the typed-word dog cameo. `enabled` gates the
+/// input-path summon (typing `dog`/`puppy`/… after sustained typing); the
+/// screen scanner never draws it.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleCanineConfig {
@@ -2471,40 +1896,31 @@ pub(crate) struct SparkleCanineConfig {
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
-/// `[sparkle_words.tricks]` — KITTY COMMANDS: a pet-command word typed at a
-/// word boundary on a line of nothing but pet talk (`sit␣`, `kitty jump␣`,
-/// `good kitty␣`) flashes rainbow and the cursor pet performs it. Like the
-/// dog it draws nothing from the screen scanner — the typed-line listener
-/// (`aterm_effects::typed_tricks`) is fed on the input path only, so program
-/// output, a paste and a controller's raw bytes never command the cat. Its
-/// vocabulary is the lexicon crate's SEPARATE trick table, compiled from the
-/// same `[sparkle_words] languages` as the word lexicon (English is never
-/// gated), and it is its own table because these words (`sit`, `down`,
-/// `play`) must never be surfaces the ambient scanner decorates.
+/// `[sparkle_words.tricks]`: kitty commands. A pet-command word typed at a word
+/// boundary on a line of only pet talk (`sit␣`, `kitty jump␣`, `good kitty␣`)
+/// flashes rainbow and the cursor pet performs it. Fed from the input path only
+/// (`aterm_effects::typed_tricks`), so output, pastes and raw controller bytes
+/// never command the cat. Its vocabulary is a separate lexicon table so words
+/// like `sit` are never decorated by the ambient scanner.
 ///
-/// Config-file-only, like `[sparkle_words.canine]`: no Settings leaf. The
-/// `enabled` bit rides UNDER the `[sparkle_words] enabled` master and is
-/// independent of every other family, so a user who keeps only the cat can
-/// still talk to it.
+/// Config-file only. `enabled` sits under the `[sparkle_words] enabled` master
+/// and is independent of the other families.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleTricksConfig {
     /// Let typed kitty commands move the pet and flash the word. Default TRUE
     /// (takes effect only when the sparkle master is on).
     pub(crate) enabled: Option<bool>,
-    /// Folded trick surfaces that never count as a command — for someone with a
-    /// real `sit` or `play` program on their PATH. The line is still judged
-    /// (the listener does not know the list); only the answer is withheld,
-    /// and with it the exit-127 forgiveness a submitted pet-only line earns.
+    /// Trick surfaces that never count as a command (for a real `sit` or `play`
+    /// on PATH). The line is still judged; only the answer and its exit-127
+    /// forgiveness are withheld.
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
-/// The `[matrix_rain]` table (PHOSPHOR, design §12). OFF BY DEFAULT — the
-/// inverse of `[sparkle_words]`. Every field is optional; defaults + clamps
-/// live ONLY in [`Config::matrix_rain_params`] (the enabled bit resolves
-/// separately in [`Config::matrix_rain_enabled`]), so an absent key and a
-/// default-valued key are indistinguishable. PURELY VISUAL — the grid is
-/// never mutated; copy/selection/search/recordings read exact bytes.
+/// The `[matrix_rain]` table. Off by default. Defaults and clamps live only in
+/// [`Config::matrix_rain_params`] and [`Config::matrix_rain_enabled`], so an
+/// absent key equals a default-valued one. Purely visual: the grid is never
+/// mutated.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct MatrixRainConfig {
@@ -2531,25 +1947,20 @@ pub(crate) struct MatrixRainConfig {
     /// Idle seconds until the mandatory drain, clamped 2..=120. There is no
     /// `idle = "keep"` — no configuration animates forever (design §5).
     pub(crate) idle_secs: Option<u64>,
-    /// Suppress emission on the alternate screen. Default FALSE (design §7:
-    /// rain shows in fullscreen TUIs out of the box; the master switch is
-    /// already opt-in).
+    /// Suppress emission on the alternate screen. Default false.
     pub(crate) suppress_in_alt_screen: Option<bool>,
     /// v1: parsed but inert — the materialize sweep is deferred (design §14).
     pub(crate) materialize: Option<bool>,
-    /// OUTPUT MATERIAL BANK (v1.1): the rain's alphabet is rasterized literally
-    /// from the program's real on-screen output (case/digits/punctuation and
-    /// supported Unicode retain their codepoint shapes), outside the current
-    /// cursor/composer protection band.
-    /// Default TRUE; `false` keeps the classic pure-kana field.
+    /// Output material bank: the rain's alphabet is rasterized from the program's
+    /// real on-screen output, outside the cursor/composer band. Default true;
+    /// `false` keeps the pure-kana field.
     pub(crate) output_material: Option<bool>,
-    /// Turn-complete head sweep on the WORKING→CALM edge. Default true.
+    /// Turn-complete head sweep on the working→calm edge. Default true.
     pub(crate) turn_wave: Option<bool>,
     /// Visual bell → 2 s constant-luminance amber hue ramp. Default true.
     pub(crate) bell_alert: Option<bool>,
-    /// Command EXIT STATUS in the weather (OSC 133/633 shell integration):
-    /// success fires the finishing head-sweep, failure holds a 2 s ember
-    /// tint — glanceable pass/fail without reading text. Default true.
+    /// Show command exit status (OSC 133/633): success fires the head sweep,
+    /// failure holds a 2 s ember tint. Default true.
     pub(crate) exit_tint: Option<bool>,
     /// v1: parsed but inert — occupied-cell recolour is v1.1 (design §14).
     pub(crate) ink_text: Option<bool>,
@@ -2560,24 +1971,53 @@ pub(crate) struct MatrixRainConfig {
     pub(crate) seed: Option<u64>,
 }
 
-/// The `[presence]` table (round 19, SPEC19 §9): the View ▸ Presence Band and
-/// Presence Rim checkables' durable state. BOTH ON BY DEFAULT — the band and
-/// the rim are how a window says who is driving it, and a quiet window costs
-/// nothing for them (the rim is change-driven, the row folds). Every field is
-/// optional; an absent key and `true` are indistinguishable, which is what the
-/// resolvers [`Config::presence_band_enabled`] / [`Config::presence_rim_enabled`]
-/// encode. The toggles write the leaf keys (`presence.band`, `presence.rim`)
-/// through the one serialized config lane, never a whole-table rewrite.
+/// The `[presence]` table: durable state of the View ▸ Presence Band and
+/// Presence Rim checkables. Both default on; absent equals `true`
+/// ([`Config::presence_band_enabled`], [`Config::presence_rim_enabled`]). The
+/// toggles write the leaf keys through the serialized config lane.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct PresenceConfig {
     /// The band row under the tab bar. Absent ⇒ shown (its fold law applies);
     /// `false` ⇒ hidden, and `chrome` reports an empty band.
     pub(crate) band: Option<bool>,
-    /// The colour rim. Absent ⇒ shown; `false` ⇒ never painted (the band,
-    /// when shown, still says the fact in words — the rim never carried a fact
-    /// the band does not).
+    /// The colour rim. Absent means shown; `false` never paints it (the band
+    /// carries the same facts in words).
     pub(crate) rim: Option<bool>,
+}
+
+/// The `[claude_footer]` table (owner, 2026-09-30): what the Claude Code
+/// footer (`crate::claude_footer`) writes into the composer's bottom rule.
+/// `usage` is ON BY DEFAULT; an absent key and `true` are the same, which is
+/// what [`Config::claude_footer_usage`] encodes. A GUI table, not
+/// `[harness]`: that table's rule is that the file only ever takes power
+/// away, and it has one reader in `aterm-agent`. There is no fast-mode key:
+/// aterm draws no fast chip (Claude Code's own `↯` marks fast mode).
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ClaudeFooterConfig {
+    /// `Σ` — Claude's working time and the session's merged token totals in
+    /// the rule, `Σ 7h52m ↑395M ↓2.0M`. Owner, 2026-09-30: "'↑395M ↓2.0M'
+    /// bring back this summary by default. I really like it. I just can't
+    /// have so many different model stats." `false` hides it; the limit wall
+    /// (`⧗`) shows either way.
+    pub(crate) usage: Option<bool>,
+}
+
+/// The `[render]` table: how aterm repairs a displaced Claude Code tab.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct RenderConfig {
+    /// `repaint_nudge`: `"on"` (DEFAULT: aterm tells that one program its
+    /// terminal is one row shorter, waits for its repaint, tells it the true
+    /// size, waits for the second repaint - no key is sent, the window and the
+    /// screen aterm draws are never resized), `"log"` (everything but the two
+    /// size changes runs, and what would have been done goes to `aterm.log`) or
+    /// `"off"`. Any case. Only Claude Code is ever nudged, whatever the value.
+    /// Read once at launch: relaunch to apply a change. A word aterm does not
+    /// know reads as `log` (it never acts on a word it cannot read) and is
+    /// reported by the config diagnostics.
+    pub(crate) repaint_nudge: Option<String>,
 }
 
 /// The `[harness]` table as the supervisor reads it: the policy every agent
@@ -2585,15 +2025,12 @@ pub(crate) struct PresenceConfig {
 /// reader refused or found outside the root table.
 ///
 /// Read by [`aterm_agent::supervise::SupervisorConfig::from_aterm_toml`], the
-/// table's ONE reader — the same one `aterm drive watch|supervise` and the
-/// live-upgrade sweep read it with — so no two of them disagree on a key, a
-/// default or a refusal. Its rule is the owner's (2026-09-24): every power is
-/// on by default and the file can only take power away — and only by an
-/// explicit setting (2026-09-25): an off spelling is its key's limit, a value
-/// that is neither the key's own nor an off keeps the key's default, and a
-/// `false` filed under another table still limits.
-/// Part of [`Config`]'s `PartialEq`, so a reload that only edits `[harness]`
-/// is not deduped away.
+/// same reader `aterm drive watch|supervise` and the live-upgrade sweep use
+/// (owner, 2026-09-24).
+/// Every power defaults on and the file can only take power away, by an
+/// explicit off spelling; any other value keeps the default, and a `false`
+/// under another table still limits. Part of [`Config`]'s `PartialEq`, so a
+/// `[harness]`-only reload is not deduped.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub(crate) struct HarnessPolicy {
     /// The policy.
@@ -2615,14 +2052,11 @@ impl HarnessPolicy {
         Self { policy, notes }
     }
 
-    /// What the policy is, in the words Settings ▸ Harness shows: `Automatic`
-    /// when every key is at its full-power default, `Off` when the master
-    /// switch is, else `Automatic · limited: <key: value> · …` — each written
-    /// key named as the LIMIT it is, never as a feature switched on, because
-    /// none can switch one on (the rule above) — and `· yours: <key>, …` for
-    /// what the file changed without limiting (a text). Which is which is the
-    /// contract's own reading (`SupervisorConfig::against_default`); this only
-    /// formats it.
+    /// The policy as Settings ▸ Harness shows it: `Automatic` at full-power
+    /// defaults, `Off` when the master switch is, else
+    /// `Automatic · limited: <key: value> · …`, plus `· yours: <key>, …` for
+    /// non-limiting changes. Classification is
+    /// `SupervisorConfig::against_default`'s; this only formats it.
     pub(crate) fn words(&self) -> String {
         if !self.policy.enabled {
             return "Off: no agent session is supervised".to_string();
@@ -2639,60 +2073,42 @@ impl HarnessPolicy {
     }
 }
 
-/// The `[output_streak]` table — PRISM WAKE
-/// (`docs/DESIGN-output-streak-2026-08-30.md`). ON BY DEFAULT, which is the
-/// inverse of `[matrix_rain]` beside it and the same posture as
-/// `[sparkle_words]`: owner ruling 2026-08-31, *"default on."* Every field is
-/// optional; defaults + clamps live ONLY in the six
-/// `Config::output_streak_*_or_default` resolvers, so an absent key and a
-/// default-valued key are indistinguishable — and every numeric one clamps
-/// rather than rejecting, because a config typo must never abort the load
-/// (the `[matrix_rain]` idiom, kept deliberately identical).
+/// The `[output_streak]` table (`docs/DESIGN-output-streak-2026-08-30.md`). On
+/// by default. Defaults and clamps live only in the
+/// `Config::output_streak_*_or_default` resolvers; numeric values clamp rather
+/// than reject so a typo never aborts the load.
 ///
-/// PURELY ADDITIVE LIGHT over the grid interior: the engine never mutates a
-/// cell, so copy, selection, search and recordings read exact bytes, and the
-/// `OVER_INK_COV_CAP` law keeps text no harder to read than with the effect
-/// off. The numeric bands below are the HOST's half of a two-sided clamp —
-/// `aterm_effects::output_streak` re-clamps every one of them defensively, so
-/// neither an embedder nor a future caller can widen what a user may reach.
+/// Additive light only: cells are never mutated, and `OVER_INK_COV_CAP` keeps
+/// text legible. `aterm_effects::output_streak` re-clamps every numeric value.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct OutputStreakConfig {
-    /// Master switch. Absent ⇒ ON everywhere except Windows (see
-    /// [`Config::output_streak_enabled_or_default`] for the full ruling and
-    /// the platform law it inherits).
+    /// Master switch. Absent means on except on Windows (see
+    /// [`Config::output_streak_enabled_or_default`]).
     pub(crate) enabled: Option<bool>,
     /// Amplitude scale `0..=1` (default `1.0`). Non-finite fails OFF.
     pub(crate) intensity: Option<f32>,
     /// Comet tail length in cells, clamped into
     /// [`aterm_effects::output_streak::TAIL_MIN`]`..=`[`aterm_effects::output_streak::TAIL_MAX`].
-    /// Declared `u32` (not `u16`) for the same reason `matrix_rain.fps` is:
-    /// a wider parse type means an absurd value CLAMPS instead of failing
-    /// deserialization and taking the whole config file down with it.
+    /// `u32` so an absurd value clamps instead of failing deserialization.
     pub(crate) tail: Option<u32>,
     /// Resident comet cap, clamped `1..=`[`aterm_effects::output_streak::MAX_COMETS`].
     /// Declared `u32` for the parse-then-clamp reason above.
     pub(crate) max_streaks: Option<u32>,
-    /// Mandatory idle drain in seconds, clamped `2..=120`. There is no
-    /// `idle = "keep"` here any more than there is in `[matrix_rain]` — no
-    /// configuration animates forever (design §5).
+    /// Idle drain in seconds, clamped `2..=120`; nothing animates forever.
     pub(crate) idle_secs: Option<f32>,
     /// Whether the episode's pip and closing exhale may be recorded at all.
     /// Absent ⇒ ON (the same owner ruling: it is ONE feature).
     pub(crate) sound: Option<bool>,
 }
 
-/// The `[packages]` table (the bundled-ALab-toolchain `atpkg` lane,
-/// `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §11). Every field is optional;
-/// defaults live ONLY in the resolvers ([`Config::packages_enabled`],
-/// [`Config::packages_auto_install`]) — an absent table is the batteries-included
-/// default. The keys (and the `[packages.links]` sub-table, which this struct
-/// deliberately does not declare — serde tolerates unknown keys) are read by the
-/// co-located `atpkg` binary from this SAME file, so there is one config surface; the
-/// GUI mirrors the two a person has, with atpkg's exact resolution
-/// (`atpkg::config::PackagesConfig::{enabled, auto_install}`, pinned equal by a test).
-/// There is NO environment alternative to any of it (2026-09-23, owner: "NOT ENV VARS
-/// those are for development"), and the loop's cadence is no knob at all (Phase 3).
+/// The `[packages]` table (`atpkg`, `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §11).
+/// Defaults live only in [`Config::packages_enabled`] and
+/// [`Config::packages_auto_install`]. `atpkg` reads the same keys (and the
+/// undeclared `[packages.links]` sub-table) from this file; the GUI mirrors
+/// the two user-facing keys with atpkg's resolution
+/// (`atpkg::config::PackagesConfig::{enabled, auto_install}`). No environment
+/// variable overrides it (owner, 2026-09-23: env vars are for development).
 ///
 /// ```toml
 /// [packages]
@@ -2703,26 +2119,23 @@ pub(crate) struct OutputStreakConfig {
 /// # exclude      = ["trust"]   # per-program opt-out
 /// ```
 ///
-/// Retired spellings, still honoured: `auto_update = false` reads as `enabled = false`,
-/// `seed_install` as `auto_install` when that is unset (`aterm pkg doctor --verbose` names
-/// both).
-/// `channel`/`include` are retired and ignored. `prefix`, `account` and the `owner/repo`
-/// form of `[packages.links]` are DEVELOPMENT settings a shipped binary drops.
+/// Legacy spellings: `auto_update = false` reads as `enabled = false`, and
+/// `seed_install` as `auto_install` when that is unset. `channel`/`include` are
+/// ignored; `prefix`, `account` and `owner/repo` links are development-only.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct PackagesConfig {
     /// Automatic updates — THE switch. Absent ⇒ ON.
     pub(crate) enabled: Option<bool>,
-    /// RETIRED 2026-09-23, folded into `enabled`: an `auto_update = false` still in a
-    /// file reads as off ([`Config::packages_enabled`]); Settings writes only `enabled`
-    /// and drops this key when it does.
+    /// Legacy spelling of `enabled`: `auto_update = false` reads as off
+    /// ([`Config::packages_enabled`]); Settings drops it when writing `enabled`.
     pub(crate) auto_update: Option<bool>,
-    /// THE install consent — may atpkg install toolset members nobody named (the
-    /// first-run fill, new members of the signed set)? Absent ⇒ ON, batteries included
-    /// ([`Config::packages_auto_install`]). Consumed by atpkg; mirrored for Settings.
+    /// Install consent: may atpkg install toolset members nobody named (first-run
+    /// fill, new members of the signed set)? Absent means on
+    /// ([`Config::packages_auto_install`]). Read by atpkg; mirrored for Settings.
     pub(crate) auto_install: Option<bool>,
-    /// RETIRED 2026-09-23, folded into `auto_install`: read in its place when
-    /// `auto_install` is unset; Settings drops it when it writes `auto_install`.
+    /// Legacy spelling of `auto_install`, read when that is unset; Settings drops
+    /// it when writing `auto_install`.
     pub(crate) seed_install: Option<bool>,
     /// A DEVELOPMENT setting (index owner repoint), consumed by a development build's
     /// atpkg only and shown nowhere in Settings.
@@ -2731,41 +2144,27 @@ pub(crate) struct PackagesConfig {
     pub(crate) exclude: Option<Vec<String>>,
 }
 
-/// `[privacy] warmup_hold_ms` DEFAULT: 120 s. The in-place apply already backs
-/// off while the user is interacting; a warm-up is the same shape (an owner
-/// gesture, seconds long) and gets the same bounded courtesy, not an open one.
+/// Default `[privacy] warmup_hold_ms`: 120 s, the same bounded hold the
+/// in-place apply gives an interacting user.
 pub(crate) const PRIVACY_WARMUP_HOLD_MS_DEFAULT: u64 = 120_000;
 
-/// `[privacy] warmup_hold_ms` CEILING: 10 min, applied as a clamp in
-/// [`Config::privacy_warmup_hold_ms`] and reported by `--validate-config`.
-///
-/// The hold exists so a system modal raised by an owner gesture is not cut off
-/// mid-answer by the automatic in-place apply. A hold longer than this stops
-/// being that and becomes indistinguishable from pinning a build to one
-/// instance — which the design refuses outright — so the value is clamped here
-/// rather than trusted, and the author is told the effective number.
+/// Ceiling for `[privacy] warmup_hold_ms`: 10 min, clamped in
+/// [`Config::privacy_warmup_hold_ms`] and reported by `--validate-config`. The
+/// hold keeps the in-place apply from interrupting a system modal; a longer
+/// hold would amount to pinning a build.
 pub(crate) const PRIVACY_WARMUP_HOLD_MS_MAX: u64 = 600_000;
 
-/// `[privacy] probe_interval_ms` DEFAULT: 5 s. It is a FLOOR on re-probing, so
-/// it is also the worst-case lag between a human answering a system dialog and
-/// aterm's posture changing.
+/// Default `[privacy] probe_interval_ms`: 5 s, a floor on re-probing and so the
+/// worst-case lag before a dialog answer changes aterm's posture.
 pub(crate) const PRIVACY_PROBE_INTERVAL_MS_DEFAULT: u64 = 5_000;
 
-/// The `[privacy] warmup` vocabulary: whether the deliberate pre-prompting
-/// gesture ("Ask for folder access now", on the Security panel) is offered.
+/// `[privacy] warmup`: whether the "Ask for folder access now" gesture on the
+/// Security panel is offered. There is no first-launch value: a consent
+/// action must never fire without a gesture.
 ///
-/// THERE IS DELIBERATELY NO FIRST-LAUNCH VALUE. Walking the folder set the
-/// first time aterm opens would stack three system modals in front of a person
-/// who has not yet typed anything, which is its own bad surprise — and a
-/// consent-raising action that fires without a gesture is exactly what this
-/// design exists to remove. The vocabulary is closed here so a future "do it
-/// automatically" value has to be argued for in code review rather than
-/// arriving as a string in someone's config.
-///
-/// An unknown spelling resolves to the default rather than failing the parse:
-/// [`crate::app_config::load_config`] discards the WHOLE file on a serde error,
-/// so a closed serde enum here would silently throw away every other setting
-/// over one typo. `--validate-config` names the typo instead.
+/// Unknown spellings resolve to the default rather than failing the parse,
+/// because [`crate::app_config::load_config`] discards the whole file on a
+/// serde error; `--validate-config` names the typo.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PrivacyWarmup {
     /// Never offered.
@@ -2799,133 +2198,112 @@ impl PrivacyWarmup {
     }
 }
 
-/// The `[privacy]` table (the macOS consent / TCC lane,
-/// `docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §4). Every field is optional;
-/// defaults live ONLY in the resolvers ([`Config::privacy_enabled`] and its
-/// siblings) — an absent table is exactly the shipping behavior.
+/// The `[privacy]` table (macOS consent / TCC,
+/// `docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §4). Defaults live only in the
+/// resolvers ([`Config::privacy_enabled`] and siblings).
 ///
-/// The table governs REPORTING plus one owner-initiated gesture. Nothing here
-/// answers a system dialog, and nothing here grants aterm access it does not
-/// already have: the only thing that widens what aterm may read is a grant the
-/// owner makes in System Settings.
-///
-/// **No environment variable, by design.** `ATERM_*` is stripped from the
-/// shells aterm spawns (`aterm_types::env_sanitize`), and a knob a program
-/// inside a session could flip would be a consent surface an agent controls.
-/// For the same reason there is no control verb that writes this table.
+/// It governs reporting plus one owner-initiated gesture; nothing here answers
+/// a system dialog or widens aterm's access. There is no environment variable
+/// or control verb for it, so a program inside a session cannot change it.
 ///
 /// ```toml
 /// [privacy]
 /// # enabled            = true            # master switch; false ⇒ every consent field reads `unknown`
-/// # check              = true            # the silent, prompt-free full-disk-access probe
-/// # notice             = true            # the one-time macOS access card (Open Settings / Not now)
+/// # check              = true            # the silent, prompt-free probes: Full Disk Access (opens
+/// #                                      #   one file), the debugger rule (DevToolsSecurity -status)
+/// #                                      #   and the Developer Tools answer (reads tccd's log)
+/// # notice             = true            # the Full Disk Access question, asked once per real need (Open Settings / Not now)
 /// # report_attribution = true            # per-session responsible-pid corroboration
 /// # warmup             = "on-request"    # "never" | "on-request"  (no first-launch value, by design)
-/// # warmup_folders     = ["documents", "desktop", "downloads", "app-data"]
+/// # warmup_folders     = ["documents", "desktop", "downloads"]   # "app-data" may be listed, but is not asked for by default
 /// # warmup_hold_ms     = 120000          # hard cap on the in-place-apply hold while a warm-up runs
 /// # probe_interval_ms  = 5000            # floor on re-probing; also the worst-case posture lag
-/// # observer           = false           # the tccd log observer (§3.6) — OFF by default
+/// # observer           = (absent)        # the tccd log observer (§3.6): absent = a narrow sentinel, false = off, true = the full stream;
+/// #                                      #   false also stops the Developer Tools row's log read
 /// # protected_roots    = []              # empty ⇒ aterm_containment::sbpl::PRIVATE_SUBDIRS
 /// # auto_accept        = false           # RESERVED — not implemented; see below
 /// ```
 ///
-/// `auto_accept` is parsed and deliberately UNIMPLEMENTED — no resolver reads
-/// it, so nothing in the build can act on it. Setting it earns a
-/// `--validate-config` semantic warning naming the grant that does work, which
-/// makes the refusal DISCOVERABLE rather than silent: a reserved key that says
-/// "aterm will not do this, here is what does" beats an unknown key that says
-/// nothing and beats a key that quietly does nothing.
+/// `auto_accept` is parsed but unimplemented; setting it earns a
+/// `--validate-config` warning naming the grant that does work.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct PrivacyConfig {
-    /// Master for the whole consent lane. Absent ⇒ ON. With it off every
-    /// consent field reads `unknown`, no probe runs, no notice fires and the
-    /// warm-up gesture is not offered — `unknown` because aterm stopped
-    /// looking, which is not the same claim as "denied".
+    /// Master for the consent lane. Absent means on. Off, every consent field
+    /// reads `unknown` (aterm stopped looking, not "denied"), no probe or notice
+    /// runs and the warm-up is not offered.
     pub(crate) enabled: Option<bool>,
-    /// The silent, prompt-free full-disk-access probe. Absent ⇒ ON. It opens
-    /// one already-protected file read-only and closes it; it cannot raise a
-    /// dialog, and it reads nothing.
+    /// Silent macOS access probes. Absent means on. The Full Disk Access probe
+    /// opens one protected file read-only; the debugger-rule probe runs
+    /// `DevToolsSecurity -status`
+    /// (`aterm_containment::consent::devtools_status_command`); the Developer
+    /// Tools answer is one bounded `/usr/bin/log show` of tccd's own log
+    /// (`aterm_containment::consent::probe_devtool`). None can raise a dialog;
+    /// all run only from inside the app bundle.
     pub(crate) check: Option<bool>,
-    /// The one-time macOS ACCESS CARD (`consent_card`): the passive card,
-    /// raised at launch while Full Disk Access is denied on a grant-stable
-    /// build, whose *Open Settings* deep-links to the pane and whose *Not now*
-    /// records the answer for the life of the config directory. Absent ⇒ ON.
+    /// The one-time macOS access card (`consent_card`), raised at launch while
+    /// Full Disk Access is denied on a grant-stable build; *Not now* is recorded
+    /// for the life of the config directory. Absent means on.
     pub(crate) notice: Option<bool>,
-    /// Per-session responsible-process corroboration on the reports. Absent ⇒
-    /// ON. It only corroborates: aterm's own adoption record is what decides
-    /// whether a session is `live` or `adopted`.
+    /// Per-session responsible-process corroboration on reports. Absent means on.
+    /// aterm's adoption record still decides `live` vs `adopted`.
     pub(crate) report_attribution: Option<bool>,
     /// `"never"` | `"on-request"`. Absent ⇒ `on-request`. See [`PrivacyWarmup`]
     /// for why there is no first-launch value.
     pub(crate) warmup: Option<String>,
     /// Which folders the warm-up walks, by NAME
-    /// (`aterm_containment::consent::Folder`). Absent ⇒ every folder the
-    /// consent module knows, in the order it walks them. An explicit empty
+    /// (`aterm_containment::consent::Folder`). Absent ⇒
+    /// [`Folder::WARMUP_DEFAULT`](aterm_containment::Folder::WARMUP_DEFAULT): the
+    /// three folders, not `app-data` (macOS forgets that answer when the process
+    /// that received it is replaced; the name stays valid in an explicit list). An explicit empty
     /// list means exactly what it says — nothing to walk — which is NOT how
     /// `protected_roots` reads an empty list, on purpose: one is a work list,
     /// the other is a policy that must never resolve to "nothing is sensitive".
     pub(crate) warmup_folders: Option<Vec<String>>,
-    /// Hard cap on the in-place-apply hold held while a warm-up worker is live,
-    /// in ms. Absent ⇒ [`PRIVACY_WARMUP_HOLD_MS_DEFAULT`]; clamped to
-    /// [`PRIVACY_WARMUP_HOLD_MS_MAX`].
+    /// Cap in ms on the in-place-apply hold while a warm-up runs. Absent means
+    /// [`PRIVACY_WARMUP_HOLD_MS_DEFAULT`]; clamped to [`PRIVACY_WARMUP_HOLD_MS_MAX`].
     pub(crate) warmup_hold_ms: Option<u64>,
     /// Floor on re-probing, in ms. Absent ⇒
     /// [`PRIVACY_PROBE_INTERVAL_MS_DEFAULT`].
     pub(crate) probe_interval_ms: Option<u64>,
-    /// The `tccd` log OBSERVER (design §3.6, `crate::consent_observer`).
-    /// Absent ⇒ FALSE. It streams `/usr/bin/log` and reports a pending consent
-    /// prompt only on a direct observation; it is spike-gated, depends on
-    /// admin-group membership, and reads an undocumented message format, so it
-    /// ships off and is turned on here or not at all. There is deliberately no
-    /// environment variable and no control verb: a program inside a session
-    /// must not be able to enable a consent surface.
+    /// The `tccd` log OBSERVER (design §3.6, `crate::consent_observer`), a
+    /// tri-state. ABSENT ⇒ the SENTINEL: one `/usr/bin/log stream` child with
+    /// a predicate that matches only the line macOS writes when it shows a
+    /// consent dialog (`AUTHREQ_PROMPTING`), silent between dialogs, whose
+    /// only job is to tell the card that a real need exists. `false` ⇒ off.
+    /// `true` ⇒ the FULL stream, the correlation table, the tab mark and the
+    /// per-dialog banner. It depends on admin-group membership (it sees
+    /// nothing otherwise, and says `unavailable`) and reads an undocumented
+    /// message format. Config only: there is deliberately no environment
+    /// variable and no control verb, so a program inside a session cannot
+    /// enable a consent surface. `false` also stops the Developer Tools row's
+    /// `log show` (`refused_observer_off`): it is a read of the same log.
     pub(crate) observer: Option<bool>,
-    /// Which roots count as protected. Absent or EMPTY ⇒
-    /// `aterm_containment::sbpl::PRIVATE_SUBDIRS` under `$HOME` — the same set
-    /// the Containment tier denies, because the containment tier and the
-    /// consent tier must not disagree about which paths are sensitive. Entries
-    /// are absolute or `~/`-prefixed; anything else is ignored and named by
-    /// `--validate-config`.
+    /// Protected roots. Absent or empty means
+    /// `aterm_containment::sbpl::PRIVATE_SUBDIRS` under `$HOME`, the set
+    /// Containment denies. Entries must be absolute or `~/`-prefixed; others are
+    /// ignored and named by `--validate-config`.
     pub(crate) protected_roots: Option<Vec<String>>,
-    /// RESERVED AND UNIMPLEMENTED. aterm does not answer macOS consent
-    /// dialogs — it has no supported way to, and a terminal that clicked
-    /// "Allow" on a person's behalf would be a worse thing than the
-    /// interruption it removed. Parsed so the refusal can be stated by
-    /// `--validate-config` instead of the key reading as unknown; deliberately
-    /// NOT given a resolver, so no consumer can grow one by accident.
+    /// Reserved and unimplemented: aterm never answers consent dialogs. Parsed
+    /// only so `--validate-config` can explain that; no resolver reads it.
     pub(crate) auto_accept: Option<bool>,
 }
 
-/// `[machine]` — the macOS host settings the CO-LOCATED `atpkg` applies FIRST on every
-/// package pass and on `aterm pkg machine apply`, mirrored here so Settings ▸ Security
-/// can show the switches and confirm the measured state:
-///
-/// ```toml
-/// [machine]
-/// universal_control = "off"   # "off" (default: disable it for this host) | "leave"
-/// spotlight_noindex = true    # rename cargo target dirs under $HOME to .noindex
-/// ```
-///
-/// Both readers of this table — this struct and `atpkg::config::MachineConfig` — must
-/// resolve the same defaults; `machine_defaults_agree_across_the_two_config_readers`
-/// pins that.
-/// The `[reroute]` table — one key, `announce` (default ON): a rerouted SIGNPOST name
-/// (`cargo`, `rustc`, `tlc`) prints its announcement before it runs the upstream tool
-/// unless this is `false`. The owner's 2026-09-08 ask ("some kind of printed message
-/// … that could be suppressed with a flag") made a SETTING on 2026-09-23, replacing
-/// `$ATERM_REROUTE_QUIET`. The co-located atpkg reads it; the GUI mirrors it for the
-/// Settings row, with atpkg's resolution (pinned equal by a test).
+/// The `[reroute]` table, read by atpkg and mirrored here with atpkg's
+/// resolution. `announce` (default on): a stub prints its line before running
+/// an upstream tool. `strict` (default off): refuse instead of warn (`z3`
+/// refused, a missing Trust tool not replaced by upstream, a stub that cannot
+/// reach atpkg failing closed) (owner, 2026-09-08).
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct RerouteConfig {
     pub(crate) announce: Option<bool>,
+    pub(crate) strict: Option<bool>,
 }
 
-/// The `[keeper]` table — one key, `enabled` (default OFF in P3): the window
-/// registers each terminal with this build's PTY keeper (`aterm keeper start`
-/// runs one), and a launch after a crash reattaches the shells the keeper
-/// held. Off, nothing is registered, and no keeper is dialled.
+/// The `[keeper]` table: `enabled` (default off) registers each terminal with
+/// this build's PTY keeper (`aterm keeper start`) so a launch after a crash
+/// reattaches its shells.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct KeeperConfig {
@@ -2942,6 +2320,10 @@ impl Config {
     }
 }
 
+/// `[machine]`: macOS host settings `atpkg` applies on every package pass and on
+/// `aterm pkg machine apply`, mirrored so Settings ▸ Security can show them.
+/// `atpkg::config::MachineConfig` must resolve the same defaults
+/// (`machine_defaults_agree_across_the_two_config_readers`).
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct MachineConfig {
@@ -2953,12 +2335,10 @@ pub(crate) struct MachineConfig {
     pub(crate) spotlight_noindex: Option<bool>,
 }
 
-/// The `[net]` table: the inbound listener settings and the outbound
-/// `[[net.connections]]` registry. Every field optional; an empty/absent table is
-/// the secure default (no port bound, nothing to dial). The table is the one
-/// spelling — no environment variable overrides it (2026-09-24) — and the
-/// listener binds ONLY in a top-level aterm (never one launched inside another
-/// aterm — see [`crate::net_listen`]).
+/// The `[net]` table: the inbound listener and the outbound `[[net.connections]]`
+/// registry. Absent means no port bound and nothing to dial. No environment
+/// variable overrides it, and the listener binds only in a top-level aterm
+/// (see [`crate::net_listen`]).
 ///
 /// ```toml
 /// [net]
@@ -2973,18 +2353,17 @@ pub(crate) struct MachineConfig {
 /// host        = "work.example:7100"
 /// fingerprint = "sha256:ab12…"                     # the remote cert's SHA-256
 /// ```
-/// Provision the drive token once with `aterm-ctl dial-token work-box <token>`
-/// (macOS Keychain, else a 0600 file); then `aterm-ctl dial work-box`. The `<token>`
-/// is the PERSISTENT `network-drive capability token` the remote prints at listener
-/// startup (stored beside its TLS key) — it survives restarts, so this is a
-/// one-time setup, NOT re-copied after every remote restart.
+/// `fingerprint` is what the remote listener prints at startup. Provision the
+/// token once with `aterm ctl dial-token work-box <token>` (Keychain, else a
+/// 0600 file), then `aterm ctl dial work-box <verb>`. The token is the remote's
+/// persistent `aterm-network-drive.token` beside its `[net] key`; only when that
+/// file is unusable does the listener use a per-launch token printed at startup.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct NetConfig {
-    /// Inbound numeric `IP:port` bind address for the TLS listener, e.g.
-    /// `"0.0.0.0:7100"` or `"[::1]:7100"`. Hostnames are deliberately rejected
-    /// so startup and Manual validation never block on DNS. Absent ⇒ listener
-    /// OFF.
+    /// Inbound numeric `IP:port` for the TLS listener (`"0.0.0.0:7100"`,
+    /// `"[::1]:7100"`). Hostnames are rejected so validation never blocks on DNS.
+    /// Absent means off.
     pub(crate) listen: Option<String>,
     /// Path to the operator's server certificate (DER).
     pub(crate) cert: Option<String>,
@@ -2994,19 +2373,15 @@ pub(crate) struct NetConfig {
     pub(crate) connections: Vec<Connection>,
 }
 
-/// One saved remote endpoint in `[[net.connections]]`. The drive TOKEN is NOT
-/// stored here — it lives in the macOS Keychain (`aterm-net-drive`/`<name>`) or a
-/// referenced 0600 `token_file` on other platforms (see
-/// [`crate::net_connections::resolve_token`]).
+/// One saved remote in `[[net.connections]]`. The drive token lives in the
+/// macOS Keychain (`aterm-net-drive`/`<name>`) or a 0600 `token_file`
+/// ([`crate::net_connections::resolve_token`]).
 ///
-/// The OPTIONAL `sid`/`expect_nonce` fields are the session rebind pin. Both default
-/// to absent, in which case the dial path is byte-identical to an un-pinned dial
-/// (only the TLS cert `fingerprint` is enforced). When `expect_nonce` is set, the
-/// dialer enforces [`aterm_net::RemoteEndpoint::matches`] BEFORE relaying, against
-/// the live nonce the remote's `sessions bridge` roster reports for `sid` (or for
-/// any session carrying `expect_nonce`, when `sid` is absent) — a relaunched or
-/// closed remote session is refused, never relayed unverified; see
-/// [`crate::net_connections::dial_relay`].
+/// Optional `sid`/`expect_nonce` pin the remote session: with `expect_nonce`
+/// set, the dialer checks [`aterm_net::RemoteEndpoint::matches`] against the
+/// remote's `sessions bridge` roster before relaying and refuses a relaunched or
+/// closed session ([`crate::net_connections::dial_relay`]). Without them only
+/// the cert `fingerprint` is enforced.
 #[derive(Clone, PartialEq, serde::Deserialize)]
 pub(crate) struct Connection {
     /// The name you `dial` (e.g. `"work-box"`). Unique within the registry.
@@ -3022,10 +2397,8 @@ pub(crate) struct Connection {
     /// absent ⇒ any remote session carrying `expect_nonce` satisfies the pin.
     #[serde(default)]
     pub(crate) sid: Option<String>,
-    /// OPTIONAL: the remote session's launch NONCE to pin (rebind guard). Absent ⇒
-    /// no rebind check (un-pinned, byte-identical dial). Present ⇒ the dialer
-    /// reads the remote's roster and enforces it before relaying, failing closed
-    /// when the pinned session is not reported.
+    /// Optional remote launch nonce to pin. Present, the dialer checks the
+    /// remote's roster before relaying and fails closed if it is missing.
     #[serde(default)]
     pub(crate) expect_nonce: Option<String>,
 }
@@ -3037,22 +2410,22 @@ pub(crate) struct Connection {
 /// command = "aterm-link serve --fleet lab --broker /run/astream.sock --cap-file ~/.config/aterm/fabric.cap"
 /// ```
 ///
-/// The command is split on whitespace and executed DIRECTLY — never through a
-/// shell, so no character of it is an injection surface for whoever can write the
-/// config. The child inherits two socketpair ends at fds 3 and 4 and nothing
-/// else: no instance token, no socket path, no aterm credential. Its authority is
-/// the DESCRIPTOR — there is no token file to steal, and the only way to be the
-/// bridge is to be the process aterm spawned.
+/// The command is split on whitespace and executed directly (no shell). The
+/// child inherits only two socketpair ends at fds 3 and 4; its authority is the
+/// descriptor, with no token or socket path to steal.
 ///
-/// The instance supervises it and relaunches with back-off. That is not a way
-/// around the halt: when either descriptor closes, every session the bridge
-/// governed is held `reason=fabric-lost origin=fleet` BEFORE any relaunch, so
-/// killing the bridge is strictly worse for an agent than leaving it alone.
+/// The instance supervises it and relaunches with back-off. When a descriptor
+/// closes, existing holds stay and governed sessions keep running with
+/// `status hold_advisory=fabric-lost`; `hold_on_bridge_lost = true` instead
+/// holds each `reason=fabric-lost origin=fleet` before any relaunch.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct FabricConfig {
     /// The bridge command line. Absent or blank ⇒ the fabric is off.
     pub(crate) command: Option<String>,
+    /// Whether a lost bridge holds the sessions it governed
+    /// (`crate::fabric::bridge_lost`). Absent means `false` (advisory only).
+    pub(crate) hold_on_bridge_lost: Option<bool>,
 }
 
 /// The `[operator]` table: whether this process starts the embedded operator.
@@ -3062,12 +2435,9 @@ pub(crate) struct FabricConfig {
 /// enabled = true   # then `aterm fleet manage <sid>`
 /// ```
 ///
-/// OFF by default and on purpose: a new profile's managed allowlist is empty, so
-/// an operator nobody opted into observes nothing while still costing a resident
-/// thread, a durable WAL under the state root and a place in the self-update path
-/// (`docs/OPERATOR-EMBEDDED.md`). This key is the one spelling — the
-/// `ATERM_OPERATOR` / `ATERM_NO_OPERATOR` / `ATERM_OPERATOR_PROFILE` variables are
-/// gone (2026-09-24). Read once, at launch.
+/// Off by default: an unconfigured operator observes nothing yet costs a
+/// thread, a WAL under the state root and a place in the self-update path
+/// (`docs/OPERATOR-EMBEDDED.md`). Read once, at launch.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct OperatorConfig {
@@ -3085,14 +2455,11 @@ impl Config {
     }
 }
 
-/// The `[update]` table: whether the in-app self-updater runs (`enabled`, "Check for
-/// updates automatically"), whether a staged build applies itself (`auto_apply`), and —
-/// in a DEVELOPMENT build only — where it pulls releases from. Every field optional; an
-/// absent table (or field) is the default: on, applied at once, the compiled-in channel
-/// (`alabsystems/aterm`, the public mirror). A shipped binary reads its compiled channel
-/// whatever `owner`/`repo` say ([`aterm_update::Source::resolve`]), and there is no
-/// environment alternative to any key (2026-09-23: `ATERM_NO_AUTO_UPDATE`,
-/// `ATERM_NO_AUTO_APPLY`, `ATERM_UPDATE_OWNER`/`_REPO` are gone).
+/// The `[update]` table: whether the self-updater runs (`enabled`), whether a
+/// staged build applies itself (`auto_apply`), and, in development builds only,
+/// where releases come from. Absent means on, applied at once, from the
+/// compiled-in public channel; a shipped binary ignores `owner`/`repo`
+/// ([`aterm_update::Source::resolve`]). No environment variable overrides it.
 ///
 /// ```toml
 /// [update]
@@ -3100,70 +2467,53 @@ impl Config {
 /// repo  = "aterm"
 /// ```
 ///
-/// This only chooses the SOURCE of the bytes. Authenticity is anchored by the
-/// pinned Team ID compiled into the binary plus Apple notarization, so a repointed
-/// (or hijacked) source still cannot install an untrusted bundle — it just fails
-/// verification and nothing is staged.
+/// This only chooses the source. The pinned Team ID and Apple notarization
+/// anchor authenticity, so a repointed source cannot stage an untrusted bundle.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct UpdateConfig {
-    /// "Check for updates automatically" (Settings ▸ Software Update). Absent ⇒ ON. Off
-    /// stops the BACKGROUND checker (`aterm_update::automatic`) in the window and every
-    /// terminal session; a check or an apply a person asks for still runs — the row says
-    /// "automatically". Read ONCE per process by
-    /// `aterm_update_core::settings::update_enabled` (the updater's own reader of this
-    /// same key, so the window and a terminal session agree), so a change applies from
-    /// the next launch. It replaces `ATERM_NO_AUTO_UPDATE` (2026-09-23).
+    /// "Check for updates automatically" (Settings ▸ Software Update). Absent
+    /// means on. Off stops the background checker (`aterm_update::automatic`);
+    /// manual checks and applies still run. Read once per process by
+    /// `aterm_update_core::settings::update_enabled`, so a change applies at the
+    /// next launch.
     pub(crate) enabled: Option<bool>,
-    /// GitHub owner (the `OWNER` in `github.com/OWNER/REPO`). Absent ⇒ default
-    /// (`alabsystems`). A DEVELOPMENT setting: only a development build honours it
-    /// (`aterm_update_core::REPOINT_IS_A_DEV_SEAM`), and Settings does not show it.
+    /// GitHub owner (`github.com/OWNER/REPO`). Absent means `alabsystems`.
+    /// Honoured only by development builds
+    /// (`aterm_update_core::REPOINT_IS_A_DEV_SEAM`); not shown in Settings.
     pub(crate) owner: Option<String>,
     /// GitHub repository name. Absent ⇒ default (`aterm`). A development setting, like
     /// `owner`.
     pub(crate) repo: Option<String>,
-    /// Apply a freshly-staged update IMMEDIATELY (default ON): the seamless
-    /// handoff carries every window/tab/split — shells, screens, layout — across
-    /// the re-exec, so there is no reason to sit on a staged build (the owner:
-    /// "no passive scheduler; I want immediate"). `false` stages the build and
-    /// leaves applying it to a click (the Version menu's ⬆️ item, the palette's
-    /// Version row, the tab-strip ↻, Settings ▸ Software Update) — still in
-    /// place, still with the shells running; the next launch picks up a stage
-    /// only if no handoff ever ran.
+    /// Apply a staged update immediately (default on): the handoff carries every
+    /// window, tab and split across the re-exec. `false` stages it and waits for
+    /// a click (Version menu, palette, tab-strip ↻, Settings ▸ Software Update);
+    /// the next launch picks up a stage only if no handoff ran.
     pub(crate) auto_apply: Option<bool>,
-    /// OPT IN to Apple Developer-ID + notarization enforcement for self-updates.
+    /// Require Apple Developer-ID signing and notarization for self-updates.
     ///
-    /// Shipped aterm compiles the real Team ID in (Tier APPLE armed 2026-08-15),
-    /// which always wins; this setting matters only to forks/self-hosted builds
-    /// with an empty compiled pin, where absent means the structural
-    /// `codesign --verify` only. That is what lets an unsigned build update, and
-    /// it is deliberate —
-    /// authenticity in that tier comes from the channel plus the manifest SHA-256
-    /// (and the Ed25519 manifest signature when one is configured).
+    /// Shipped aterm compiles its Team ID in, which always wins; this matters
+    /// only to forks with an empty compiled pin, where absent means structural
+    /// `codesign --verify` only (authenticity then comes from the channel, the
+    /// manifest SHA-256 and any configured Ed25519 signature).
     ///
-    /// Set it to a Team ID once you actually sign releases with a Developer ID and
-    /// the updater will additionally require every staged bundle to be signed by
-    /// that team AND accepted by Gatekeeper.
+    /// Set it to a Team ID to require every staged bundle to be signed by that
+    /// team and accepted by Gatekeeper.
     ///
     /// ```toml
     /// [update]
     /// require_team_id = "ABCDE12345"
     /// ```
     ///
-    /// It can only TIGHTEN: a build that already has a Team ID compiled in ignores
-    /// this key entirely, so a config file can never downgrade a signed build's
-    /// trust anchor. See `aterm_update::set_required_team_id`.
-    ///
-    /// A DEVELOPMENT setting since 2026-09-23 (a fork's self-hosted build): only a
-    /// development build installs it ([`update_required_team_id`]), and Settings does
-    /// not show it.
+    /// It can only tighten. Development builds only
+    /// ([`update_required_team_id`]); not shown in Settings. See
+    /// `aterm_update::set_required_team_id`.
     pub(crate) require_team_id: Option<String>,
 }
 
-/// `[update] require_team_id` as THIS build honours it: the configured Team ID in a
-/// development build (`debug_assertions`, or this crate's `dev-seams` feature, which
-/// the release cutter never enables); `None` in a shipped binary, whose compiled pin is
-/// its only anchor — one true path (2026-09-23).
+/// `[update] require_team_id` as this build honours it: the configured value in
+/// a development build (`debug_assertions` or `dev-seams`); `None` in a shipped
+/// binary, whose compiled pin is its only anchor.
 pub(crate) fn update_required_team_id(config: &Config) -> Option<&str> {
     if !cfg!(any(debug_assertions, feature = "dev-seams")) {
         return None;
@@ -3174,10 +2524,8 @@ pub(crate) fn update_required_team_id(config: &Config) -> Option<&str> {
         .and_then(|u| u.require_team_id.as_deref())
 }
 
-/// The `update.auto_apply` answer. Two states: the environment veto that was the
-/// third (`ATERM_NO_AUTO_APPLY`, "off for this run") is gone (2026-09-23, owner: "NOT
-/// ENV VARS those are for development") — `[update] auto_apply` in Settings is the one
-/// control.
+/// The `update.auto_apply` answer; `[update] auto_apply` is the only control
+/// (owner, 2026-09-23).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AutoApplySetting {
     /// The default: the in-session lane applies a staged build by itself.
@@ -3186,10 +2534,9 @@ pub(crate) enum AutoApplySetting {
     OffByConfig,
 }
 
-/// Whether a staged update applies by itself: config `update.auto_apply` (default
-/// TRUE). A plain read of the config every time, never memoised: a `OnceLock` whose
-/// initializer asks its own owner parks the caller forever, and that shape hung every
-/// apply on 2026-08-30.
+/// Whether a staged update applies by itself: `update.auto_apply` (default
+/// true). Read fresh every time, never memoised: a `OnceLock` whose initializer
+/// asks its own owner would deadlock.
 pub(crate) fn update_auto_apply_setting(config: &Config) -> AutoApplySetting {
     if config
         .update
@@ -3203,10 +2550,9 @@ pub(crate) fn update_auto_apply_setting(config: &Config) -> AutoApplySetting {
     }
 }
 
-/// "Check for updates automatically" as SAVED — `[update] enabled`, default ON. The
-/// updater reads the same key once per process (`aterm_update::automatic`); this is the
-/// saved value the next launch reads, from the config already in memory. Settings ▸
-/// Software Update names it beside the value this process runs (`App::update_checks_running`).
+/// "Check for updates automatically" as saved (`[update] enabled`, default on):
+/// the value the next launch reads. Settings shows it beside the running value
+/// (`App::update_checks_running`).
 pub(crate) fn update_checks_automatic(config: &Config) -> bool {
     config
         .update
@@ -3220,13 +2566,9 @@ pub(crate) fn update_auto_apply(config: &Config) -> bool {
     matches!(update_auto_apply_setting(config), AutoApplySetting::On)
 }
 
-/// Default rows reserved for the in-grid tab strip, PER PLATFORM. On macOS this is
-/// `0` — tabs live in the native window toolbar (toolbar.rs), so an in-terminal
-/// frame would be redundant. On every other platform (Linux/X11) the native toolbar
-/// is a no-op ([`crate::platform::AppRtLinux`]), so the in-grid strip is the ONLY
-/// tab UI: it defaults to `1` row, otherwise a second/third tab is completely
-/// invisible and un-switchable by mouse. Override either way with config
-/// `tab_strip_rows = N`.
+/// Default in-grid tab strip rows per platform: `0` on macOS (tabs live in the
+/// native toolbar), `1` elsewhere, where the strip is the only tab UI. Config
+/// `tab_strip_rows = N` overrides it.
 #[cfg(target_os = "macos")]
 pub(crate) const DEFAULT_TAB_STRIP_ROWS: u16 = 0;
 /// See the macOS variant above — non-macOS defaults the in-grid strip ON.
@@ -3244,23 +2586,19 @@ pub(crate) fn resolve_tab_strip_rows(config: &Config) -> u16 {
         .min(MAX_TAB_STRIP_ROWS)
 }
 
-/// Resolve the ⌘F / socket `search` index depth cap from `search_history_lines`: how
-/// many of the newest addressable lines the trigram index retains (the rest of history
-/// is reported as a partial result). Unset → the engine's
-/// [`DEFAULT_MAX_CACHED_LINES`](aterm_core::search::DEFAULT_MAX_CACHED_LINES); the value
-/// is pushed to [`crate::control::set_search_max_lines`] at startup and on reload.
+/// Search index depth from `search_history_lines`: how many of the newest lines
+/// the trigram index retains. Unset means
+/// [`DEFAULT_MAX_CACHED_LINES`](aterm_core::search::DEFAULT_MAX_CACHED_LINES).
+/// Pushed to [`crate::control::set_search_max_lines`] at startup and reload.
 pub(crate) fn search_index_depth(config: &Config) -> usize {
     config
         .search_history_lines
         .map_or(aterm_core::search::DEFAULT_MAX_CACHED_LINES, |n| n as usize)
 }
 
-/// Resolve a raw plain or appearance-split theme selector with the runtime's
-/// deliberately permissive compatibility semantics. Existing hand-authored
-/// files may contain an unrecognized segment beside a valid `dark:`/`light:`
-/// side; the recognized side still applies while an omitted side is Default.
-/// Renderer config and Settings preview share this helper so diagnostics can
-/// flag malformed bytes without inventing different effective pixels.
+/// Resolve a plain or appearance-split theme selector permissively: an
+/// unrecognized segment beside a valid `dark:`/`light:` side is ignored and an
+/// omitted side is Default. Shared by the renderer and Settings preview.
 pub(crate) fn resolve_theme_name_value(
     raw: Option<&str>,
     appearance: aterm_types::Appearance,
@@ -3291,21 +2629,18 @@ pub(crate) fn resolve_theme_name_value(
 }
 
 impl Config {
-    /// `aterm.toml`'s text as the running configuration: the typed parse, and
-    /// the `[harness]` policy the table's one reader takes from the same text
-    /// ([`HarnessPolicy::read`]). Every load the window runs on comes through
-    /// here — the launch ([`load_config`]) and the config service's every
-    /// observation and patch — so the policy is always the file's.
+    /// Parse `aterm.toml` text: the typed config plus the `[harness]` policy
+    /// ([`HarnessPolicy::read`]). Every load (launch and config service) goes
+    /// through here.
     pub(crate) fn parse(text: &str) -> Result<Self, aterm_toml::Error> {
         let mut config: Self = aterm_toml::from_str(text)?;
         config.harness = HarnessPolicy::read(text);
         Ok(config)
     }
 
-    /// What a load runs on when `text` is not a configuration: every setting
-    /// at its default, and the `[harness]` lines the owner wrote still read
-    /// (the table's reader reads a file that is not TOML line by line), so a
-    /// limit written there holds through a typo in any other table.
+    /// Config used when `text` does not parse: all defaults, but `[harness]`
+    /// lines still read (its reader is line-based), so a limit there survives a
+    /// typo elsewhere.
     pub(crate) fn stand_in(text: &str) -> Self {
         Self {
             harness: HarnessPolicy::read(text),
@@ -3313,43 +2648,33 @@ impl Config {
         }
     }
 
-    /// Resolve the scheme NAME this config selects for `appearance`, honouring the
-    /// optional OS-appearance SPLIT `theme = "dark:<name>,light:<name>"`.
-    ///
-    /// A plain value with no `dark:`/`light:` prefix is the single theme for BOTH
-    /// appearances (unchanged behavior). In the split form the segment matching
-    /// `appearance` wins; an omitted side resolves to `None` (the built-in Default).
-    /// Keys and the surrounding whitespace are case/space-insensitive; the theme
-    /// NAME keeps its original case (so `light:GitHub Light` resolves correctly).
+    /// Scheme name this config selects for `appearance`, honouring
+    /// `theme = "dark:<name>,light:<name>"`. A plain value applies to both; an
+    /// omitted side is `None` (built-in Default). Prefixes are case- and
+    /// space-insensitive; the name keeps its case.
     pub(crate) fn resolve_theme_name(&self, appearance: aterm_types::Appearance) -> Option<String> {
         resolve_theme_name_value(self.theme.as_deref(), appearance)
     }
 
-    /// Resolve the BASE color scheme this config selects for `appearance` (see
-    /// [`Self::resolve_theme_name`]): the named built-in (case-insensitive), a user
-    /// theme FILE of that name, or the built-in [`aterm_types::ColorScheme::default`]
-    /// when no theme — or an unresolvable / malformed one — is set. The per-key color
-    /// overrides (`foreground`/…/`palette`) are layered ON TOP of this base by the
-    /// callers, so they always win.
+    /// Base color scheme for `appearance` (see [`Self::resolve_theme_name`]): the
+    /// named built-in, a user theme file of that name, or
+    /// [`aterm_types::ColorScheme::default`]. Callers layer the per-key color
+    /// overrides on top.
     fn base_scheme_for_with_themes(
         &self,
         appearance: aterm_types::Appearance,
         themes: &ThemeCatalog,
     ) -> aterm_types::ColorScheme {
-        // Resolves SILENTLY (unresolvable/malformed name → Default): both renderer
-        // and engine projections call this. The diagnostic is [`theme_misses`],
-        // over this exact admitted catalog.
+        // Resolves silently (a bad name gives Default); [`theme_misses`] reports
+        // it against the same catalog.
         match self.resolve_theme_name(appearance) {
             None => aterm_types::ColorScheme::default(),
             Some(name) => themes.resolve(&name).unwrap_or_default(),
         }
     }
 
-    /// The RENDERER theme (window clear colour, cursor, selection highlight). Starts
-    /// from the selected scheme's chrome ([`Self::base_scheme_for`]); the per-key color
-    /// keys then override individual slots (unchanged precedence) so the window CLEAR
-    /// colour matches a configured `background` and `selection_color` themes the
-    /// highlight.
+    /// The renderer theme (clear colour, cursor, selection): the scheme's chrome
+    /// ([`Self::base_scheme_for_with_themes`]) with per-key color overrides applied.
     #[cfg(test)]
     pub(crate) fn theme(&self) -> Theme {
         self.theme_for(aterm_types::Appearance::Dark)
@@ -3378,62 +2703,51 @@ impl Config {
             cursor: tp.cursor,
             selection: tp.selection,
         };
-        let u = |c: Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
         if let Some(c) = self.foreground.as_deref().and_then(parse_hex_color) {
-            t.fg = u(c);
+            t.fg = rgb_u32(c);
         }
         if let Some(c) = self.background.as_deref().and_then(parse_hex_color) {
-            t.bg = u(c);
+            t.bg = rgb_u32(c);
         }
         if let Some(c) = self.cursor_color.as_deref().and_then(parse_hex_color) {
-            t.cursor = u(c);
+            t.cursor = rgb_u32(c);
         }
         if let Some(c) = self.selection_color.as_deref().and_then(parse_hex_color) {
-            t.selection = u(c);
+            t.selection = rgb_u32(c);
         }
         t
     }
 
-    /// Whether Alt/Option should send ESC-prefixed (Meta) sequences. The
-    /// cross-platform DEFAULT is `true`, matching the engine encoder. Setting
-    /// `option_as_meta = false` forwards OS-composed text when one is available;
-    /// non-text Alt chords continue through the ordinary terminal encoder.
+    /// Whether Alt/Option sends ESC-prefixed (Meta) sequences. Default `true`,
+    /// matching the engine encoder.
     pub(crate) fn option_as_meta_or_default(&self) -> bool {
         self.option_as_meta.unwrap_or(true)
     }
 
-    /// Whether a multi-line paste is confirmed when bracketed paste is off. DEFAULT
-    /// when absent is `true` (safe): the modern shell default (bracketed paste) skips
-    /// the check, so the dialog only ever appears for the genuinely-risky bare-prompt /
-    /// REPL case. Setting `confirm_multiline_paste = false` disables it.
+    /// Whether a paste holding a line end (a trailing one included) is confirmed
+    /// when bracketed paste is off. Default `true`; `confirm_multiline_paste =
+    /// false` disables it.
     pub(crate) fn confirm_multiline_paste_or_default(&self) -> bool {
         self.confirm_multiline_paste.unwrap_or(true)
     }
 
-    /// Whether the previous graceful quit's windows/tabs/panes (+ per-pane cwd) are
-    /// reopened at launch (RESTORE-1). DEFAULT when absent is `true` — batteries-on,
-    /// the macOS-Terminal/iTerm expectation. `restore_session = false` opts out.
+    /// Whether the previous graceful quit's windows, tabs and panes (with cwd)
+    /// reopen at launch. Default `true`.
     pub(crate) fn restore_session_or_default(&self) -> bool {
         self.restore_session.unwrap_or(true)
     }
 
-    /// Whether a completed mouse selection auto-copies to the system CLIPBOARD.
-    /// DEFAULT when absent is `true` off Linux — the copy-on-select convenience,
-    /// flipped on with the other visual/UX defaults; `copy_on_select = false`
-    /// opts out (the ghostty/macOS explicit-copy behaviour). On LINUX the
-    /// default is `false`: a selection already owns the X11 PRIMARY buffer
-    /// unconditionally, and the platform convention keeps the CLIPBOARD for
-    /// explicit copies only — defaulting this on made every drag clobber the
-    /// user's Ctrl+Shift+C copy (audit finding). An explicit
-    /// `copy_on_select = true` still opts into writing both buffers.
+    /// Whether a completed mouse selection copies to the clipboard. Default
+    /// `true` except on Linux, where the selection already owns PRIMARY and the
+    /// clipboard is kept for explicit copies; `true` there writes both.
     pub(crate) fn copy_on_select_or_default(&self) -> bool {
         self.copy_on_select
             .unwrap_or(cfg!(not(target_os = "linux")))
     }
 
-    /// Master switch for generated live Activity. Generation is batteries-on,
-    /// while `false` or `title_summary_provider = "off"` retains Title/Description
-    /// composition and only disables the generated fallback.
+    /// Master switch for generated live Activity. Default on; `false` or
+    /// `title_summary_provider = "off"` keeps Title/Description composition and
+    /// disables only the generated fallback.
     pub(crate) fn descriptive_titles_or_default(&self) -> bool {
         self.descriptive_titles.unwrap_or(true)
     }
@@ -3454,11 +2768,10 @@ impl Config {
             .unwrap_or(DEFAULT_TITLE_SUMMARY_MODEL)
     }
 
-    /// Explicit endpoint used by the resolved provider. An absent Ollama value is
-    /// deliberately preserved as `None`: the worker selects its private ephemeral
-    /// endpoint at runtime. OpenAI-compatible service configuration is fail-closed
-    /// and must provide an endpoint. In-process and disabled providers ignore a
-    /// stale value.
+    /// Explicit endpoint for the resolved provider. An absent Ollama value stays
+    /// `None` (the worker picks a private ephemeral endpoint); an
+    /// OpenAI-compatible provider fails closed without one. In-process and
+    /// disabled providers ignore it.
     pub(crate) fn title_summary_endpoint_or_default(&self) -> Option<&str> {
         let configured = self
             .title_summary_endpoint
@@ -3547,30 +2860,26 @@ impl Config {
         self.window_title_format.unwrap_or_default()
     }
 
-    /// Whether aterm primes detected coding agents itself on each fresh session
-    /// spawn (see the field). Batteries-on; `false` is a real off — nothing is
-    /// read or written.
+    /// Whether aterm primes detected coding agents on each fresh session spawn.
+    /// Default on; `false` reads and writes nothing.
     pub(crate) fn agents_auto_prime_or_default(&self) -> bool {
         self.agents_auto_prime.unwrap_or(true)
     }
 
-    /// Master switch for status classification. Batteries-on, and `false` is a
-    /// real off: the observer stops gathering evidence entirely, so a user who
-    /// does not want this subsystem pays nothing for it.
+    /// Master switch for status classification. Default on; `false` stops
+    /// evidence gathering entirely.
     pub(crate) fn tab_status_or_default(&self) -> bool {
         self.tab_status.unwrap_or(true)
     }
 
-    /// Whether a status projects onto the tab's indicator bits. Independent of
-    /// [`Self::tab_status_or_default`]: the record can be useful to a script
-    /// while the chrome stays quiet.
+    /// Whether a status sets the tab's indicator bits, independent of
+    /// [`Self::tab_status_or_default`].
     pub(crate) fn tab_status_badge_or_default(&self) -> bool {
         self.tab_status_badge.unwrap_or(true)
     }
 
-    /// Whether the connection role marks the tab (Session Connections §4).
-    /// Opt-OUT like every user-facing feature; hides only the mark — see the
-    /// field doc.
+    /// Whether the connection role marks the tab. Default on; hides only the
+    /// mark.
     pub(crate) fn tab_connection_badge_or_default(&self) -> bool {
         self.tab_connection_badge.unwrap_or(true)
     }
@@ -3613,11 +2922,9 @@ impl Config {
         }
     }
 
-    /// The observation budget interval. Derived rather than configured: an
-    /// interval COARSER than the dwell would make the dwell unserviceable (a
-    /// candidate could not be re-seen inside its own window), so the budget
-    /// tracks dwell downward and stops at a floor that keeps an output flood
-    /// from becoming a classification flood.
+    /// Observation budget interval, derived from dwell: it tracks dwell downward
+    /// (a coarser interval would make dwell unserviceable) and stops at a floor
+    /// so an output flood is not a classification flood.
     pub(crate) fn tab_status_observe_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.tab_status_dwell_ms_or_default().clamp(
             MIN_TAB_STATUS_OBSERVE_INTERVAL_MS,
@@ -3625,58 +2932,36 @@ impl Config {
         ))
     }
 
-    /// Whether the cursor motion-trail ("streaming trailer") is on. Default
-    /// [`DEFAULT_DECORATIVE_EFFECTS`]: ON as an opt-OUT everywhere except Windows,
-    /// where the minimal-fast directive makes it an opt-IN.
+    /// Whether the cursor motion trail is on. Default
+    /// [`DEFAULT_DECORATIVE_EFFECTS`]: on except on Windows.
     ///
-    /// ON (mac/Linux, and any host that says `cursor_trail = true`) the trail ignites a
-    /// ~260 ms additive aurora on each cursor move and decays to EXACTLY 0% idle, so a
-    /// still screen costs nothing; the GPU bloom pass is effect-frame-only and
-    /// load-sheds under pressure. That aurora is what `5b11ff2c` decided — the owner's
-    /// batteries-on delight call — and it stands, unchanged, on those platforms.
-    ///
-    /// OFF ON WINDOWS, because the key stopped meaning the thing that was decided. The
-    /// default STYLE later became `rainbow kitty pet`, so this master now also seats a
-    /// PERMANENTLY RESIDENT walking cat drawn `FreeZ::OverText` across live output — the
-    /// 2026-08 Windows audit photographed it sitting on a line of real terminal text
-    /// beside the caret. A decoration that covers output it did not produce is the one
-    /// thing the minimal-fast directive rules out, and the owner's own `aterm.toml`
-    /// already wrote `cursor_trail = false` by hand: a default a user has to undo is not
-    /// a default. Turning it off also stops the four expensive effect pipelines this
-    /// master alone can bind (see [`Self::warms_effect_pipelines`]) from ever being
-    /// asked for.
-    ///
-    /// This is a DEFAULT, never a veto: a Windows user who wants the cat writes
-    /// `cursor_trail = true` and gets it, whole. Nothing about the trail's behaviour,
-    /// its style, or its gates differs by platform once it is on.
+    /// When on, each cursor move ignites a ~260 ms additive aurora that decays to
+    /// zero at idle; the GPU bloom pass runs only on effect frames and sheds
+    /// under load. The default style also draws a resident cat over output, which
+    /// is why Windows defaults it off. Off, the four expensive effect pipelines
+    /// only this master binds are never requested
+    /// ([`Self::warms_effect_pipelines`]). An explicit `cursor_trail = true`
+    /// turns it on identically on every platform.
     pub(crate) fn cursor_trail_or_default(&self) -> bool {
         self.cursor_trail.unwrap_or(DEFAULT_DECORATIVE_EFFECTS)
     }
 
-    /// The typing-momentum glow switch (default ON; `cursor_momentum_glow =
-    /// false`). The glow also needs the effects master
-    /// ([`Self::cursor_trail_or_default`]), which the frame step folds in.
+    /// Typing-momentum glow switch (default on). The glow also needs the
+    /// effects master ([`Self::cursor_trail_or_default`]), folded in by the
+    /// frame step.
     pub(crate) fn cursor_momentum_glow_or_default(&self) -> bool {
         self.cursor_momentum_glow.unwrap_or(true)
     }
 
-    /// Whether a config APPLY should warm the demand-driven effect pipelines
+    /// Whether a config apply should warm the demand-driven effect pipelines
     /// (`aterm_gpu::EffectPipeline`) off the frame path.
     ///
-    /// The nine effect-only cell pipelines are built by `encode_frame` the first
-    /// frame that binds one, so a launch compiles none of them. Correctness never
-    /// depends on this predicate — it only decides whether a config apply pays a
-    /// compile EARLY so the first frame that draws a newly-enabled effect does not
-    /// hitch.
-    ///
-    /// Keyed on the cursor-trail master because that is the sole producer of the
-    /// only four pipelines whose inline build is a visible hitch: `fire_add` +
-    /// `fire_over` (111.07 ms together on dx12) and `rain_glow` +
-    /// `rain_glow_over` (17.70). With the trail off none of those can be bound,
-    /// and the five that remain reachable are each well under one frame — so an
-    /// unconditional warm would hand a `cursor_trail = false` owner the exact
-    /// 136 ms of never-drawn compiles this whole design removes, merely moved off
-    /// the launch and onto their first config save.
+    /// Effect pipelines are built lazily by `encode_frame`; this only decides
+    /// whether a config apply compiles them early to avoid a first-frame hitch.
+    /// Keyed on the cursor-trail master because it alone can bind the pipelines
+    /// with a visible build cost (`fire_add`, `fire_over`, `rain_glow`,
+    /// `rain_glow_over`); with the trail off, warming would compile pipelines
+    /// that are never drawn.
     pub(crate) fn warms_effect_pipelines(&self) -> bool {
         self.cursor_trail_or_default()
     }
@@ -3699,19 +2984,12 @@ impl Config {
         self.robi.unwrap_or(false)
     }
 
-    /// THE KITTY-COMMAND GATE, resolved: `[sparkle_words] enabled` (the
-    /// master, read through its one resolved owner
-    /// [`Self::sparkle_words_enabled_or_default`] so this never re-types its
-    /// default) AND `[sparkle_words.tricks] enabled` (default on). Read on the
-    /// input path once per press — three `Option` reads, resolved beside the
-    /// Serious Mode policy before the window is borrowed — and spent only at a
-    /// listener EVENT (a fire, a confirmation, a submitted pet-only line).
-    /// Never a reason not to feed the listener: line state is maintained
-    /// whatever this says (the `tone_tracker` window-maintenance law).
-    /// Serious Mode is the caller's second gate, from the policy, so the two
-    /// answers cannot drift. Independent of the FAMILY bits on purpose: with
-    /// every sparkle family off the word engine does not run and nothing can
-    /// flash, but the pet still obeys (`aterm help kitty` says so).
+    /// Kitty-command gate: `[sparkle_words] enabled` (via
+    /// [`Self::sparkle_words_enabled_or_default`]) and
+    /// `[sparkle_words.tricks] enabled` (default on). Read once per press and
+    /// used only at a listener event; the listener's line state is maintained
+    /// regardless. Serious mode is the caller's second gate. Independent of the
+    /// family bits: with every family off the pet still obeys.
     pub(crate) fn kitty_tricks_enabled(&self) -> bool {
         self.sparkle_words_enabled_or_default()
             && self
@@ -3722,13 +3000,10 @@ impl Config {
                 .unwrap_or(true)
     }
 
-    /// Whether `word` — a trick token AS TYPED (`SIT`, `goooood`) — is on
-    /// `[sparkle_words.tricks] ignore_words`. Both sides are folded with the
-    /// lexicon's own fold so the list matches the way the vocabulary does;
-    /// the elongation fold is deliberately not applied (a user who lists
-    /// `purr` has said nothing about `purrrrr`). Costs nothing with the list
-    /// absent or empty (the default): the fold allocates only when there is
-    /// something to compare against, and this runs once per FIRE, not per key.
+    /// Whether `word` (a trick token as typed) is on
+    /// `[sparkle_words.tricks] ignore_words`. Both sides use the lexicon's fold
+    /// without elongation folding (`purr` does not cover `purrrrr`). Allocates
+    /// only when the list is non-empty; runs once per fire.
     pub(crate) fn kitty_trick_ignored(&self, word: &str) -> bool {
         let Some(ignore) = self
             .sparkle_words
@@ -3743,10 +3018,8 @@ impl Config {
         ignore.iter().any(|w| aterm_lexicon::fold(w) == folded)
     }
 
-    /// Secure Keyboard Entry (`secure_keyboard_entry`): fail-closed default OFF
-    /// like every other security opt-in — the OS mechanism has real side
-    /// effects (it suppresses other apps' global hotkeys while active), so it
-    /// is the user's call, never a surprise.
+    /// Secure keyboard entry (default off, like every security opt-in: it
+    /// suppresses other apps' global hotkeys while active).
     pub(crate) fn secure_keyboard_entry_or_default(&self) -> bool {
         self.secure_keyboard_entry.unwrap_or(false)
     }
@@ -3756,51 +3029,37 @@ impl Config {
         self.notice_sparkle.unwrap_or(true)
     }
 
-    /// Ambient-bed on/off (`trail_sound_bed`, default ON since 2026-09-09; see
-    /// the field docs: notes/brrrring/bonk/melody unaffected).
+    /// Ambient-bed on/off (`trail_sound_bed`, default on).
     pub(crate) fn trail_sound_bed_or_default(&self) -> bool {
-        // ON by default — the owner, 2026-09-09: "i don't know what rainbow sky
-        // bed is but turn it on and let me see it". The pad is voiced from the
-        // live chord, so the derived line always lands in key over it.
+        // The pad is voiced from the live chord, so the derived line stays in key
+        // (owner, 2026-09-09).
         self.trail_sound_bed.unwrap_or(true)
     }
 
-    /// Sing-along RIFF on/off (`trail_sound_riff`, default ON — a shipped
-    /// feature, so this is an opt-OUT). The riff's own switch: the celebration's
-    /// VISUALS keep running when it is off, and every existing sound gate
-    /// (raw focus × `trail_sounds` × `trail_sound_volume`) still applies first,
-    /// so this can only ever remove sound. See the field docs for why the
-    /// loudest voice in the engine needed a switch of its own.
+    /// Sing-along riff on/off (`trail_sound_riff`, default on). Visuals continue
+    /// when off, and focus, `trail_sounds` and `trail_sound_volume` apply first.
     pub(crate) fn trail_sound_riff_or_default(&self) -> bool {
         self.trail_sound_riff.unwrap_or(true)
     }
 
-    /// Audible terminal bell on/off (`bell_sound`, default ON). Gates ONLY the
-    /// OS alert sound (`NSBeep` / `MessageBeep`) — never the visual bell flash
-    /// or the urgent-window attention request, which are how a muted terminal
-    /// still surfaces background activity. `trail_sound_volume` deliberately
-    /// does not reach this: the beep is an OS sound, not a synth voice.
+    /// Audible bell on/off (`bell_sound`, default on). Gates only the OS alert
+    /// sound (`NSBeep` / `MessageBeep`), not the visual bell or attention
+    /// request; `trail_sound_volume` does not apply.
     pub(crate) fn bell_sound_or_default(&self) -> bool {
         self.bell_sound.unwrap_or(true)
     }
 
-    /// The supervisor's choice chime on/off (`choice_sound`, default ON).
-    /// Gates ONLY the chime a `chose` story plays — never the band's flash or
-    /// the rim pulse. Read by `App::chose_chime` after serious mode and the
-    /// Music effects master, and before the chime's own rate limiter.
+    /// Choice chime on/off (`choice_sound`, default on). Gates only the chime,
+    /// not the band flash or rim pulse. Read by `App::chose_chime` after serious
+    /// mode and the Music master, before its rate limiter.
     pub(crate) fn choice_sound_or_default(&self) -> bool {
         self.choice_sound.unwrap_or(true)
     }
 
-    /// The parsed `trail_sound_style` voice (default `"auto"` → follow the
-    /// visual trail style, the exact pre-override identity). Resolved by the
-    /// synth's own parser ([`aterm_effects::trail_sound::SoundVoice::parse`]:
-    /// the picker's canonical spellings plus the documented aliases,
-    /// case-insensitive) — borrow-free, no allocation, so the per-frame sound
-    /// seam pays nothing (the `cursor_trail_style_raw` precedent). Unknown
-    /// spellings fall back to `auto` (the sound keeps playing; the Settings
-    /// picker, save-time validation and `--validate-config`'s domain warning
-    /// keep the spelling honest).
+    /// Parsed `trail_sound_style` voice (default `"auto"`, follow the trail
+    /// style), via [`aterm_effects::trail_sound::SoundVoice::parse`]
+    /// (case-insensitive, aliases included) without allocating. Unknown
+    /// spellings fall back to `auto`; `--validate-config` warns.
     pub(crate) fn trail_sound_voice(&self) -> aterm_effects::trail_sound::SoundVoice {
         use aterm_effects::trail_sound::SoundVoice;
         self.trail_sound_style
@@ -3809,20 +3068,12 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// [`Self::trail_sound_voice`] for a TRAIL gesture under one resolved
-    /// presentation (`RAINBOW-KITTY-V2.md` §16 row 9): `auto` follows the
-    /// visual trail, and while the trail is the rainbow kitty (the style
-    /// resolved to `RainbowKitty` — every spelling, the default, a typo's
-    /// fallback) the trail's own instrument is the MUSIC BOX
-    /// ([`aterm_effects::trail_sound::SoundVoice::RainbowKittyV2`]). The
-    /// voice is named on the event itself, which is how the synth knows
-    /// (§16 row 9: "an explicit instrument wins" — the seam's host-side latch
-    /// died with v1 at phase 7, and the resolved voice is the only signal
-    /// left). An explicit voice is the user's and is never overridden; every
-    /// other presentation is the exact identity of the plain read. Trail
-    /// gestures ONLY — the bonk, the sing-along riff and the output pips are
-    /// style-agnostic and keep their own chain whatever the trail draws, so
-    /// their seams keep calling the plain read.
+    /// [`Self::trail_sound_voice`] for a trail gesture under one resolved
+    /// presentation (`RAINBOW-KITTY-V2.md` §16 row 9): with `auto` and a rainbow
+    /// kitty trail, the voice is the music box
+    /// ([`aterm_effects::trail_sound::SoundVoice::RainbowKittyV2`]), named on the
+    /// event. An explicit voice is never overridden. Trail gestures only; the
+    /// bonk, riff and output pips use the plain read.
     pub(crate) fn trail_sound_voice_for(
         &self,
         presentation: ResolvedTrailPresentation,
@@ -3839,10 +3090,8 @@ impl Config {
         }
     }
 
-    /// The `--validate-config` domain warning for `trail_sound_style`: an
-    /// unknown spelling is not an error at load (the voice falls back to
-    /// `auto` and the sound keeps playing), but it IS a silent no-op the
-    /// author should hear about — the `cursor_trail_style_warning` twin.
+    /// `--validate-config` warning for an unknown `trail_sound_style` (at load
+    /// it silently falls back to `auto`).
     pub(crate) fn trail_sound_style_warning(&self) -> Option<String> {
         use aterm_effects::trail_sound::SoundVoice;
         let raw = self.trail_sound_style.as_deref().map(str::trim)?;
@@ -3856,9 +3105,8 @@ impl Config {
         ))
     }
 
-    /// Trail sound volume 0..1 (`trail_sound_volume`, default 0.4), clamped
-    /// so a config typo can never make keystrokes loud. TOML accepts NaN/Inf;
-    /// those fail silent rather than poisoning the audio graph.
+    /// Trail sound volume 0..1 (`trail_sound_volume`, default 0.4), clamped;
+    /// NaN/Inf read as silent.
     pub(crate) fn trail_sound_volume(&self) -> f32 {
         match self.trail_sound_volume {
             Some(value) if value.is_finite() => value.clamp(0.0, 1.0),
@@ -3867,9 +3115,8 @@ impl Config {
         }
     }
 
-    /// The wallpaper legibility dim (`wallpaper_dim`): the fraction the image
-    /// is toned toward the theme background. Clamped to `0..=1`; a non-finite
-    /// value and the unset default both read 0.3.
+    /// Wallpaper dim fraction toward the theme background, clamped to `0..=1`;
+    /// unset or non-finite reads 0.3.
     pub(crate) fn wallpaper_dim_or_default(&self) -> f32 {
         match self.wallpaper_dim {
             Some(value) if value.is_finite() => value.clamp(0.0, 1.0),
@@ -3883,11 +3130,9 @@ impl Config {
         self.wallpaper_text_tint.unwrap_or(true)
     }
 
-    /// The parsed `motion` policy mode (W11): `auto` (DEFAULT — use the available
-    /// platform sample: live on macOS, attach-time on Windows, unavailable on
-    /// other platforms) / `full` / `reduced`; unknown strings fall back to
-    /// `auto`. Borrow-free parse per call, so the per-redraw caller
-    /// (`App::motion_policy`) pays no allocation.
+    /// Parsed `motion` mode: `auto` (default), `full` or `reduced`; unknown
+    /// strings mean `auto`. Allocation-free for the per-redraw caller
+    /// (`App::motion_policy`).
     pub(crate) fn motion_mode(&self) -> crate::motion::MotionMode {
         self.motion.as_deref().map_or(
             crate::motion::MotionMode::Auto,
@@ -3895,30 +3140,24 @@ impl Config {
         )
     }
 
-    /// Whether load-adaptive effect shedding may force the Reduced state for
-    /// DECORATIVE effects under a sustained render-overload session (Change #1).
-    /// DEFAULT `true`; `false` opts out so animations follow `motion` / the OS
-    /// Reduce-Motion flag alone. `motion = "full"` overrides the shed regardless
-    /// of this. Functional motion (the wheel glide, the scroll pill) is never
-    /// shed under either value. See [`crate::App::motion_policy`] and
-    /// [`crate::App::effect_policy`].
+    /// Whether load-adaptive shedding may force the reduced state for decorative
+    /// effects under sustained render overload. Default `true`. `motion = "full"`
+    /// overrides the shed; functional motion is never shed. See
+    /// [`crate::App::motion_policy`] and [`crate::App::effect_policy`].
     pub(crate) fn load_adaptive_motion_or_default(&self) -> bool {
         self.load_adaptive_motion.unwrap_or(true)
     }
 
-    /// Serious-mode master gate. DEFAULT OFF; the App keeps the resolved value so
-    /// toggles and hot reloads can apply one atomic transition without rewriting any
-    /// of the underlying effect settings.
+    /// Serious-mode master gate. Default off; the App keeps the resolved value
+    /// so toggles apply as one transition without rewriting effect settings.
     pub(crate) fn serious_mode_or_default(&self) -> bool {
         self.serious_mode.unwrap_or(false)
     }
 
-    /// Predictive-local-echo mode string (`off` / `adaptive` / `always`). DEFAULT
-    /// `adaptive`: ON once an echo is confirmed on the current line and measured RTT
-    /// is high enough for speculation to help; fast local echo remains unpainted.
-    /// Unechoed input (passwords) is never shown because each submitted line resets
-    /// the confirmation epoch.
-    /// Set `off` to disable, or `always` for the aggressive (unsafe-at-prompts) variant.
+    /// Predictive echo mode (`off` / `adaptive` / `always`). Default `adaptive`:
+    /// on once echo is confirmed on the current line and RTT is high enough to
+    /// help; unechoed input is never shown. `always` is the aggressive variant,
+    /// unsafe at prompts.
     pub(crate) fn predictive_echo_or_default(&self) -> &str {
         self.predictive_echo
             .as_deref()
@@ -3926,21 +3165,15 @@ impl Config {
             .unwrap_or("adaptive")
     }
 
-    /// Focus-linked shell priority boost master switch. DEFAULT ON — it costs
-    /// nothing when idle (a few cheap syscalls per focus/tab CHANGE — priority
-    /// class + power-throttling per transitioning session's shell root and
-    /// conhost, so ~4 per session entering/leaving the visible set — and none
-    /// while typing), directly counters the ConPTY echo-starvation under load,
-    /// and only ever touches the shell ROOT process + its console host (never
-    /// the programs the shell runs). `focus_boost = false` opts out.
+    /// Focus-linked shell priority boost. Default on: a few syscalls per focus or
+    /// tab change and none while typing; touches only the shell root and its
+    /// console host.
     pub(crate) fn focus_boost_or_default(&self) -> bool {
         self.focus_boost.unwrap_or(true)
     }
 
-    /// M2 stream fade master switch. DEFAULT OFF — even with the keystroke-echo bypass,
-    /// leaving it on runs an O(rows×cols) whole-grid fingerprint pass on the UI thread
-    /// before every committed frame. A minimal terminal does no per-frame diff work;
-    /// opt in with `stream_fade = true`.
+    /// Stream fade master switch. Default off: it runs an O(rows×cols)
+    /// fingerprint pass on the UI thread before every committed frame.
     pub(crate) fn stream_fade_or_default(&self) -> bool {
         self.stream_fade.unwrap_or(false)
     }
@@ -3967,25 +3200,18 @@ impl Config {
         self.cursor_trail_color
             .as_deref()
             .and_then(parse_hex_color)
-            .map(|c| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b))
+            .map(rgb_u32)
     }
 
-    /// The PRIMARY-FONT REQUEST with the display-face override applied: a valid
-    /// `display_font` selection wins as the virtual family `display:<id>` — or,
-    /// for a MIX of 2..=3 `+`-joined ids, `display:<id>+<id>[+<id>]` (every
-    /// character then deterministically picks one face of the mix). Otherwise
-    /// the plain `font_family` passes through verbatim. Unknown/duplicate ids
-    /// are DROPPED (and `"off"` never counts), so a typo can never blank the
-    /// terminal; more than three keeps the first three (the toggles cap there
-    /// anyway). Every font resolution site (startup, catalog worker,
-    /// diagnostics) funnels through this so the toggles can never half-apply.
+    /// Primary-font request with the display-face override applied: a valid
+    /// `display_font` becomes the virtual family `display:<id>`, or for a mix of
+    /// 2..=3 `+`-joined ids `display:<id>+<id>[+<id>]` (each character picks one
+    /// face deterministically). Otherwise `font_family` passes through. Unknown
+    /// or duplicate ids and `"off"` are dropped, and at most three are kept.
+    /// Every font resolution site goes through this.
     ///
-    /// Legacy ids are CANONICALIZED here rather than special-cased downstream:
-    /// `minecraft` becomes `pixel`, so one config value produces one virtual
-    /// family and every consumer sees the same spelling. `mariokart` — the one
-    /// retired id with no successor — canonicalizes to nothing and therefore
-    /// falls through to `font_family`, which is the documented migration: a
-    /// config that was valid yesterday warns and loads, it does not fail.
+    /// Legacy ids are canonicalized here (`minecraft` → `pixel`); an id with no
+    /// successor (`mariokart`) falls through to `font_family`.
     pub(crate) fn font_family_request(&self) -> Option<String> {
         let display = self.display_font.as_deref().and_then(|raw| {
             let mut ids: Vec<&'static str> = Vec::new();
@@ -4003,9 +3229,8 @@ impl Config {
         display.or_else(|| self.font_family.clone())
     }
 
-    /// The selected-tab color override as `[r, g, b]`, if `active_tab_color` is
-    /// set and a valid `#RRGGBB`. `None` → both tab renderers keep today's
-    /// translucent system default ("Transparent white" in the Tab Color page).
+    /// Active tab color as `[r, g, b]` when `active_tab_color` is a valid
+    /// `#RRGGBB`; `None` keeps the translucent system default.
     pub(crate) fn active_tab_color_rgb(&self) -> Option<[u8; 3]> {
         self.active_tab_color
             .as_deref()
@@ -4018,34 +3243,22 @@ impl Config {
         self.cursor_trail_accent
             .as_deref()
             .and_then(parse_hex_color)
-            .map(|c| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b))
+            .map(rgb_u32)
     }
 
-    /// The configured cursor-trail style, trimmed but NOT lowercased. The
-    /// immutable config-asset generation parses it once and the frame path
-    /// consumes a [`ResolvedTrailPresentation`]; keeping this borrowed still
-    /// avoids an allocation at status, validation, and preview seams.
+    /// Configured cursor-trail style, trimmed but not lowercased. Borrowed to
+    /// avoid allocating at status, validation and preview seams.
     pub(crate) fn cursor_trail_style_raw(&self) -> &str {
-        // Default: the RAINBOW KITTY PET (the smooth rainbow ribbon trailed by the
-        // walking cat — the companion the owner runs), read from the single
-        // definition in `prefs` rather than re-typed here, so a rename
-        // of the style cannot leave this resolver pointing at a dead spelling.
-        // `glow_config`/`trail_config` split the layers.
+        // Default style comes from its one definition in `prefs`.
         self.cursor_trail_style
             .as_deref()
             .unwrap_or(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
             .trim()
     }
 
-    /// Aurora brightness, default 1.0 (0.7 until 2026-09-13: the rainbow bed
-    /// multiplies this knob under its legibility bar, so the shipped default
-    /// ran the bed 30 % under the one restraint the owner kept — "bright,
-    /// not dim" — and every offline golden was measured at 1.0), clamped
-    /// 0.0..=1.0. A non-finite value
-    /// (`intensity = nan` is valid TOML) FAILS OFF to `0.0`: `clamp` passes NaN
-    /// through, and NaN defeats every downstream `intensity <= 0.0` disable
-    /// check (NaN compares false), so it would flow into the light math instead
-    /// of provably disabling — the `sdr_glow_budget` "NaN fails OFF" posture.
+    /// Trail brightness, default 1.0, clamped 0.0..=1.0. Non-finite values
+    /// (`nan` is valid TOML) read as `0.0`, since NaN would slip past every
+    /// downstream `intensity <= 0.0` check.
     pub(crate) fn cursor_trail_intensity_or_default(&self) -> f32 {
         let v = self.cursor_trail_intensity.unwrap_or(1.0);
         if v.is_finite() {
@@ -4065,12 +3278,8 @@ impl Config {
         self.cursor_trail_ring.unwrap_or(true)
     }
 
-    /// `[sparkle_words] suppress_in_alt_screen` — the design §1 knob, wired
-    /// 2026-07-04. DEFAULT FALSE: sparkle words decorate the ALTERNATE screen
-    /// too (full-screen TUIs — Claude Code foremost — are a primary surface,
-    /// not an exception); `true` restores the previously hardcoded suppression
-    /// (vim/less/htop program UI text never decorated). Two `Option` reads per
-    /// frame — the `kitty_log_enabled` precedent, no cache to invalidate.
+    /// `[sparkle_words] suppress_in_alt_screen`. Default false: the alternate
+    /// screen is decorated too; `true` leaves full-screen program UI undecorated.
     pub(crate) fn sparkle_suppress_alt_screen(&self) -> bool {
         self.sparkle_words
             .as_ref()
@@ -4162,15 +3371,10 @@ impl Config {
         loaded
     }
 
-    /// Resolve one immutable Trail Pack catalog. This is the only manifest I/O
-    /// primitive. Preliminary startup catalogs remain empty; the published
-    /// path-feed generation resolves consumer data and fingerprint from the
-    /// same admitted bytes, then shares the returned `Arc`.
-    ///
-    /// Fail-closed per pack: unreadable/invalid manifests become retained
-    /// diagnostics and are skipped, while a later duplicate id wins. Diagnostics
-    /// are data rather than immediate stderr writes so each host can surface them
-    /// once without Settings construction producing duplicate warnings.
+    /// Resolve one immutable Trail Pack catalog; the only manifest I/O
+    /// primitive. Unreadable or invalid manifests are skipped and kept as
+    /// diagnostics (data, not stderr, so each host reports them once); a later
+    /// duplicate id wins.
     pub(crate) fn resolve_trail_pack_catalog(&self) -> std::sync::Arc<TrailPackCatalog> {
         self.resolve_trail_pack_catalog_with_fingerprint_and_reader(|_, path, max_bytes| {
             aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes)
@@ -4237,10 +3441,9 @@ impl Config {
         (std::sync::Arc::new(loaded), fingerprint.finish())
     }
 
-    /// Resolve the non-feed portion of a catalog while the exact Trail/Sparkle
-    /// generation is prepared separately. This admits the custom kitty sprite
-    /// once and installs an intentionally empty Trail placeholder that must be
-    /// replaced before publication to a live `App`.
+    /// Resolve the non-feed part of a catalog while the Trail/Sparkle generation
+    /// is prepared separately: admits the kitty sprite and installs an empty
+    /// Trail placeholder that must be replaced before publication.
     pub(crate) fn resolve_preliminary_asset_catalog_with_themes(
         &self,
         themes: std::sync::Arc<ThemeCatalog>,
@@ -4256,20 +3459,15 @@ impl Config {
         })
     }
 
-    /// Resolve every filesystem-backed visual asset for one config generation.
-    ///
-    /// This is the sole production rainbow kitty PNG I/O/decode seam.  The versioned
-    /// config service calls it before advancing the revision, then publishes the
-    /// returned outer Arc with the exact TOML text.  Present, capture, semantic
-    /// Settings view construction, and effects code only clone/read the result.
+    /// Resolve every filesystem-backed visual asset for one config generation;
+    /// the only production kitty PNG decode seam. The config service calls it
+    /// before advancing the revision and publishes the `Arc` with the TOML text.
     pub(crate) fn resolve_asset_catalog_with_themes(
         &self,
         themes: std::sync::Arc<ThemeCatalog>,
     ) -> std::sync::Arc<ConfigAssetCatalog> {
-        // Sparkle Toy Packs are compiled by the font/config preparation lane.
-        // This preliminary catalog deliberately reports `None`: an inline-only
-        // projection is not an authoritative answer for the exact combined
-        // table and must never be published as though it were complete.
+        // Toy Packs are compiled by the preparation lane, so this preliminary
+        // catalog reports `None` rather than an incomplete inline-only answer.
         std::sync::Arc::new(ConfigAssetCatalog {
             trail_packs: self.resolve_trail_pack_catalog(),
             kitty_sprite: resolve_kitty_sprite_asset(self.cursor_nyan_sprite.as_deref()),
@@ -4284,16 +3482,12 @@ impl Config {
         self.resolve_asset_catalog_with_themes(ThemeCatalog::empty())
     }
 
-    /// Content fingerprints of every active file the config references BY PATH
-    /// — see [`PathFeedFps`]. Streams each referenced file through the same
-    /// bounded, same-handle admission used by its loader (test oracle only; the
-    /// production generation carries the fingerprint from its consumer read).
-    /// Disabled Sparkle feeds have no consumer and therefore no file identity. The
-    /// PATH participates in each stream (two files swapping contents must not
-    /// cancel out) and so does readability (a file appearing or disappearing is
-    /// a content change even though its bytes stay unknown). Pack lists are
-    /// capped at the same `MAX_ACTIVE_TOY_PACKS` the consumers load, so an
-    /// over-cap tail can neither mask nor fake a change.
+    /// Content fingerprints of every active file the config references by path
+    /// ([`PathFeedFps`]), streamed through each loader's bounded admission (test
+    /// oracle; production carries the fingerprint from its consumer read).
+    /// Disabled Sparkle feeds are skipped. The path and readability are part of
+    /// each stream, and pack lists are capped at `MAX_ACTIVE_TOY_PACKS` like the
+    /// loaders.
     #[cfg(test)]
     pub(crate) fn path_feed_fingerprints(&self) -> PathFeedFps {
         #[cfg(test)]
@@ -4383,9 +3577,8 @@ impl Config {
         }
     }
 
-    /// Mirror the runtime Toy Pack admission checks for `--validate-config`.
-    /// This stays on the explicit diagnostics path; normal startup uses
-    /// `sparkle_toy_packs` once and does not pay for a second read.
+    /// Toy Pack admission checks for `--validate-config`; normal startup does not
+    /// pay for this second read.
     pub(crate) fn sparkle_toy_pack_warnings(&self) -> Vec<String> {
         let Some(paths) = self
             .sparkle_words
@@ -4420,9 +3613,8 @@ impl Config {
         warnings
     }
 
-    /// Resolve the complete cold-path pack/config bundle once. The native app
-    /// calls this only from `recompute_sparkle` (startup, config reload, or a
-    /// user re-enable), never from the per-frame effects tick.
+    /// Resolve the pack/config bundle once, from `recompute_sparkle` (startup,
+    /// reload, re-enable), never per frame.
     pub(crate) fn sparkle_runtime_parts(
         &self,
     ) -> Option<(crate::word_decorations::DecoConfig, Option<String>)> {
@@ -4446,9 +3638,8 @@ impl Config {
             .and_then(|sparkle| sparkle.enabled)
             == Some(false)
         {
-            // A disabled feed has no consumer. Configuring/re-enabling it changes
-            // the semantic table itself and forces a fresh worker generation, so
-            // touching dormant paths need not do any startup I/O or parsing.
+            // A disabled feed has no consumer; re-enabling it forces a fresh
+            // worker generation, so dormant paths need no I/O.
             return (None, fingerprint.finish());
         }
         let admitted_lexicon = self.admitted_sparkle_lexicon(&mut fingerprint);
@@ -4468,9 +3659,8 @@ impl Config {
         (resolved, fingerprint.finish())
     }
 
-    /// Compile the complete sparkle runtime on a host worker (or once during
-    /// startup, before the event loop begins). This is the only production
-    /// caller of the path-backed runtime resolver.
+    /// Compile the complete sparkle runtime on a host worker (or once at
+    /// startup, before the event loop).
     #[cfg(test)]
     pub(crate) fn prepare_sparkle_runtime(&self) -> PreparedSparkleRuntime {
         self.prepare_sparkle_runtime_with_fingerprint().0
@@ -4479,12 +3669,9 @@ impl Config {
     fn prepare_sparkle_runtime_with_fingerprint(&self) -> (PreparedSparkleRuntime, u64) {
         let (parts, fingerprint) = self.sparkle_runtime_parts_with_fingerprint();
         let langs = self.sparkle_languages();
-        // THE KITTY-COMMAND VOCABULARY rides the same worker and the same
-        // `languages` as the word lexicon, and is compiled whether or not the
-        // master resolved a word engine (see `PreparedSparkleRuntime::tricks`).
-        // Its data problems are reported like the lexicon's: the embedded table
-        // is pinned conflict-free under every language set by its own tests, so
-        // a line here is a build that shipped bad data, never a user's fault.
+        // The kitty-command vocabulary uses the same worker and `languages` as the
+        // word lexicon and is compiled whether or not a word engine resolved.
+        // Its data problems indicate bad embedded data, never user error.
         let tricks = {
             let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
             let tricks = aterm_lexicon::TrickLexicon::with_languages(&refs);
@@ -4516,14 +3703,11 @@ impl Config {
         (PreparedSparkleRuntime { resolved, tricks }, fingerprint)
     }
 
-    /// The files this config names BY PATH whose CONTENT is applied state: the
-    /// Sparkle Words lexicon and Toy Packs (only while `[sparkle_words]` is not
-    /// explicitly disabled — a disabled feed has no consumer) and the Trail
-    /// Packs, each list capped at [`MAX_ACTIVE_TOY_PACKS`] exactly as its loader
-    /// caps it, `~`/`$HOME` expanded as the loaders expand them. The config
-    /// watcher stats these beside `aterm.toml` (metadata only), so editing only
-    /// one of them hot-reloads it; [`PathFeedFps`] then decides from the bytes
-    /// whether anything actually changed.
+    /// Files this config names by path whose content is applied state: the
+    /// Sparkle lexicon and Toy Packs (unless `[sparkle_words]` is disabled) and
+    /// the Trail Packs, capped at [`MAX_ACTIVE_TOY_PACKS`] and expanded like the
+    /// loaders. The config watcher stats these beside `aterm.toml`;
+    /// [`PathFeedFps`] decides from the bytes whether anything changed.
     pub(crate) fn path_feed_paths(&self) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
         if let Some(sparkle) = self
@@ -4553,6 +3737,68 @@ impl Config {
         paths
     }
 
+    /// Every file besides `aterm.toml` whose content a warm of this config
+    /// presents, by the path its reader opens (warm successor P2): the user
+    /// theme file each appearance selects (`<theme dir>/<name>.conf`; a
+    /// built-in name, or one that is not a file stem, opens none), the custom
+    /// kitty sprite, the wallpaper, and the path feeds
+    /// ([`Self::path_feed_paths`]). At most `2 + 2 + 1 + 2 ×
+    /// MAX_ACTIVE_TOY_PACKS` paths. `main_entry` stamps them beside the file's
+    /// text before its early warm (`crate::WarmConfigRead`), so an edit to one
+    /// during the dial's hold is warmed again before any carried present.
+    ///
+    /// Not listed, on purpose:
+    /// * the rest of the theme directory. The warm parses every `.conf` there,
+    ///   but only the selected file reaches a present; another one changes the
+    ///   Settings picker's list, which the watcher reconciles after Commit
+    ///   with no repaint. The selected file is stamped at the config's
+    ///   spelling, so on a case-sensitive volume a file whose name differs
+    ///   from it only in case (which the catalog still resolves) and a
+    ///   case-fold twin (which makes the catalog refuse the name) are not
+    ///   seen, nor are files that push it past [`MAX_USER_THEME_FILES`].
+    /// * fonts (the configured family and fallbacks, the system font
+    ///   directories). No running process re-reads a font on a change, so the
+    ///   outgoing process never parks under an edited one and nothing repaints
+    ///   one after Commit.
+    pub(crate) fn warm_read_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(directory) = aterm_types::scheme::user_theme_dir() {
+            for appearance in [
+                aterm_types::Appearance::Dark,
+                aterm_types::Appearance::Light,
+            ] {
+                let Some(name) = self.resolve_theme_name(appearance) else {
+                    continue;
+                };
+                if aterm_types::scheme::builtin(&name).is_some()
+                    || safe_user_theme_name(&name).is_err()
+                {
+                    continue;
+                }
+                let path = directory.join(format!("{name}.conf"));
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        // Spelled as `resolve_kitty_sprite_asset` / `resolve_wallpaper_asset`
+        // read them: trimmed, a blank value opens nothing, an over-long one is
+        // refused unread.
+        for raw in [
+            self.cursor_nyan_sprite.as_deref(),
+            self.wallpaper.as_deref(),
+        ] {
+            if let Some(raw) = raw
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty() && raw.len() <= MAX_KITTY_SOURCE_ID_BYTES)
+            {
+                paths.push(sparkle_expand_tilde(raw));
+            }
+        }
+        paths.extend(self.path_feed_paths());
+        paths
+    }
+
     /// Prepare every path-backed effect consumer and identify it from the exact
     /// same-handle bytes that entered its parser. The deco and trail feeds are
     /// independent transactions; combining their two immutable results needs
@@ -4567,47 +3813,16 @@ impl Config {
         }
     }
 
-    /// THE `[sparkle_words] enabled` MASTER, resolved — one owner for that key's
-    /// default so no consumer re-types it.
+    /// The `[sparkle_words] enabled` master, resolved in one place.
     ///
-    /// DEFAULT ON, on every platform, and deliberately NOT a member of the
-    /// [`DEFAULT_DECORATIVE_EFFECTS`] family — re-decided in 2026-08 when
-    /// `cursor_trail` DID join it, so this is a live judgement and not an omission.
-    /// Three reasons, all checked against the code rather than assumed:
+    /// Default on everywhere, outside [`DEFAULT_DECORATIVE_EFFECTS`]: matched
+    /// words' heads draw `FreeZ::UnderText` so glyphs stay on top, the on-screen
+    /// population is capped (`MAX_CATS = 8`), and Settings treats this key as a
+    /// live product gate with its own disclosure ladder and migration path. The
+    /// one over-text path is the profanity supernova burst, capped at one
+    /// (`supernova::MAX_ACTIVE_SUPERNOVAE`) and tunable via `supernova_chance`.
     ///
-    /// * It DECORATES output; it does not cover it. A matched word gets its animal
-    ///   head pushed `FreeZ::UnderText` (`word_decorations`), so every glyph still
-    ///   draws on top of the fur — the 2026-08 Windows audit's claim that the engine
-    ///   "REPLACES the words fox and dog" is wrong on the code. The resident pet, the
-    ///   trail bloom and the provisioning card's cat are the ones that really do cover
-    ///   live pixels, and each of those now has its own answer.
-    /// * It does not ACCUMULATE. `MAX_CATS = 8` caps the on-screen population no
-    ///   matter how long the dump runs; `persist` (cap `PERSIST_CAP = 512`) is
-    ///   identity bookkeeping, not sprites. The audit's "accumulating across a
-    ///   4000-line dump" is bounded at eight heads.
-    /// * This key is not only a config default: native Settings treats it as a LIVE
-    ///   PRODUCT GATE, with its own disclosure ladder ("Inactive · Sparkle Words
-    ///   master Off"), its own migration path (the patch writer retires it in favour
-    ///   of the two independent toy keys), and a dozen projection tests that read it.
-    ///   Flipping its default by platform is a Settings redesign, not a default
-    ///   change.
-    ///
-    /// THE ONE HONEST EXCEPTION, recorded rather than hidden: the profanity family's
-    /// `supernova` escalation (`[sparkle_words.profanity] supernova_chance`, default
-    /// 30) pushes its blast cloud `FreeZ::OverText`. That is a transient burst, capped
-    /// by `supernova::MAX_ACTIVE_SUPERNOVAE = 1`, and it can only fire when a curse
-    /// word is already on screen — it is not the resident, unprompted decoration on
-    /// ORDINARY output that the minimal-fast directive rules out. If that one path
-    /// ever wants a Windows answer, the aim is `supernova_chance`, not this master.
-    ///
-    /// It landed in `3dc6c33c` as the resolved owner of this default with
-    /// only the `[sparkle_words] enabled` assertions below as callers (the
-    /// shipping resolver reaches the same key through
-    /// `sparkle_deco_config_with_pack_specs`, which reads its own
-    /// already-cloned `sw`), and was `#[cfg(test)]` for as long as that held.
-    /// The kitty-command gate ([`Self::kitty_tricks_enabled`]) is its first
-    /// shipping caller: the pet's answer to a typed command rides this master
-    /// and must not re-type its default.
+    /// Callers: the kitty-command gate ([`Self::kitty_tricks_enabled`]) and tests.
     pub(crate) fn sparkle_words_enabled_or_default(&self) -> bool {
         self.sparkle_words
             .as_ref()
@@ -4615,13 +3830,9 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// Resolve the `[sparkle_words]` table into a renderer-ready [`DecoConfig`],
-    /// applying every default + clamp. `None` when the feature is explicitly disabled or
-    /// every category is off (the caller then renders byte-identically).
-    ///
-    /// ON BY DEFAULT: an absent `[sparkle_words]` table (or absent `enabled` key) turns
-    /// on the two live families—profanity sparkle and feline cat-paw.
-    /// Set `enabled = false` (or a live category's `enabled = false`) to silence it.
+    /// Resolve `[sparkle_words]` into a renderer-ready [`DecoConfig`] with
+    /// defaults and clamps applied. `None` when disabled or every category is
+    /// off. An absent table enables profanity sparkle and feline cat-paw.
     #[cfg(test)]
     pub(crate) fn sparkle_deco_config(&self) -> Option<crate::word_decorations::DecoConfig> {
         if self
@@ -4649,42 +3860,31 @@ impl Config {
         let can_cfg = sw.canine.clone().unwrap_or_default();
         let ink_cfg = sw.ink.clone().unwrap_or_default();
         let emph = sw.emphasis.clone().unwrap_or_default();
-        // Top Settings exposes exactly two independent keyword toys. Keep the
-        // historical profanity key as the stable config spelling, but resolve it
-        // as the product gate for every NON-FELINE word effect. Otherwise the
-        // visible "Sparkle Words" switch would leave emphasis/custom recipes live.
+        // The profanity key is the Sparkle Words product gate for every
+        // non-feline word effect, so its switch also stops emphasis and custom
+        // recipes.
         let sparkle_words = prof.enabled.unwrap_or(true);
         let profanity = sparkle_words;
         let feline = fel.enabled.unwrap_or(true);
-        // The dog rides the PRODUCT switch like every non-feline effect (the
-        // two-toys law: the historical profanity key is the Sparkle Words
-        // master, keyword kitties alone stay independent), with its own
-        // enable bit under it for turning just the dogs off.
+        // Dogs ride the Sparkle Words switch, with their own enable bit under it.
         let canine = sparkle_words && can_cfg.enabled.unwrap_or(true);
         let ink_enabled = ink_cfg.enabled.unwrap_or(true);
-        // v3 §6: the custom-word spec table (per-word overrides, keyed by the
-        // scanner's form_hash semantics — folded spaced surfaces, possessive
-        // variants, RAW CJK hashes).
+        // Custom-word spec table, keyed by the scanner's form_hash semantics
+        // (folded spaced surfaces, possessive variants, raw CJK hashes).
         let custom_entries = sw.custom.clone().unwrap_or_default();
         let (inline_specs, _) = aterm_effects::spec::build_custom(&custom_entries);
-        // Inline config is the user's most local authority and overlays all
-        // imported packs, including every possessive/hash variant. A product-off
-        // Sparkle Words switch must make both sources inert, not merely hide the
-        // built-in profanity class.
+        // Inline config overlays all imported packs; the Sparkle Words switch
+        // makes both sources inert.
         if sparkle_words {
             spec_table.overlay(inline_specs);
         } else {
             spec_table = aterm_effects::spec::SpecTable::default();
         }
-        // v3 §6 default-emphasis resolve. `emph.enabled` gates only ordinary,
-        // non-overridden emphasis matches. Custom words are indexed under the
-        // emphasis class, but the engine resolves their override BEFORE its
-        // per-class gate (`WordDecorations::scan_row`: the class match runs
-        // only when `ov.is_none()`), so they intentionally remain independent
-        // of `emphasis.enabled`. Retain `has_custom` in this class-activity
-        // projection so a graphic-only or burst-only custom has an admitted
-        // emphasis lane with ink off; it is not evidence that the user's
-        // emphasis switch controls that custom recipe.
+        // `emph.enabled` gates only ordinary, non-overridden emphasis matches.
+        // Custom words resolve their override before the per-class gate
+        // (`WordDecorations::scan_row`), so they stay independent of it;
+        // `has_custom` keeps an emphasis lane admitted for graphic- or
+        // burst-only customs.
         let emphasis = sparkle_words
             && emph.enabled.unwrap_or(true)
             && (ink_enabled || spec_table.has_custom());
@@ -4700,7 +3900,6 @@ impl Config {
             .unwrap_or(2200)
             .clamp(ink_sweep_floor, 6000);
         let ink_strength = ink_cfg.strength.unwrap_or(0.75).clamp(0.0, 1.0);
-        let rgb_u32 = |c: Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
         let palette: Vec<u32> = prof
             .palette
             .unwrap_or_default()
@@ -4708,11 +3907,10 @@ impl Config {
             .filter_map(|s| parse_hex_color(s))
             .map(rgb_u32)
             .collect();
-        // OS reduced-motion query is a future refinement; honour the explicit
-        // config flag for now.
+        // The explicit `[sparkle_words] reduced_motion` override; the OS Reduce
+        // Motion flag is folded in per frame through `MotionPolicy` (app_render).
         let reduced_motion = sw.reduced_motion.unwrap_or(false);
-        // Alt-screen suppression is opt-IN since 2026-07-03 (the v1 hardcoded
-        // suppression left full-screen TUIs like Claude Code undecorated).
+        // Alt-screen suppression is opt-in.
         let suppress_in_alt_screen = sw.suppress_in_alt_screen.unwrap_or(false);
         // Global `deny` + per-category `ignore_words`, folded so they match the
         // scanner's folded surfaces. Empty (the default) → no allocation churn.
@@ -4744,8 +3942,7 @@ impl Config {
             // decorates the `cat` shell command); set `allow_bare_cat = false` to opt out.
             allow_bare_cat: fel.allow_bare_cat.unwrap_or(true),
             cjk_single_char: fel.cjk_single_char.unwrap_or(false),
-            // `paw` is retained as a legacy ink-only mode. Cat is the only mode
-            // that emits a feline graphic under cat-art v4.
+            // `paw` is an ink-only mode; only `cat` emits a feline graphic.
             feline_style: if fel
                 .style
                 .as_deref()
@@ -4756,12 +3953,9 @@ impl Config {
                 crate::word_decorations::FelineStyle::Cat
             },
             feline_magic: fel.magic.unwrap_or(true),
-            // §10 / v3 §3.1: "sparkle" is the exact v1 path, "nova" the v2
-            // classic nova; anything else (incl. absent) is the v3 rainbow.
-            // Trimmed and case-insensitive, matching Manual's enum admission
-            // and mirroring the web `set_sparkle_profanity`
-            // setter — a cased "Nova" must not silently fall through to
-            // Rainbow (and its supernova escalation roll).
+            // "sparkle" and "nova" select those styles; anything else (including
+            // absent) is rainbow. Trimmed and case-insensitive, matching Manual
+            // and the web `set_sparkle_profanity` setter.
             profanity_style: match prof.style.as_deref().map(str::trim) {
                 Some(s) if s.eq_ignore_ascii_case("sparkle") => {
                     crate::word_decorations::ProfanityStyle::Sparkle
@@ -4772,12 +3966,7 @@ impl Config {
                 _ => crate::word_decorations::ProfanityStyle::Rainbow,
             },
             profanity_magic: prof.magic.unwrap_or(true),
-            // v3 §3.2: escalation chance, 0..=100 (0 disables).
-            // Was `unwrap_or(30)` while the field's documented contract (see the
-            // `supernova_chance` doc comment) says "Default 10" — so the shipping
-            // default fired the 3.6 s screen-owning detonation ladder THREE TIMES as
-            // often as documented. The doc is the specification; the code now matches
-            // it. Set `supernova_chance = 30` explicitly to restore the old rate.
+            // Escalation chance, 0..=100 (0 disables); default 10 as documented.
             supernova_chance: prof.supernova_chance.unwrap_or(10).min(100) as u8,
             spec_table,
             palette,
@@ -4795,10 +3984,9 @@ impl Config {
         })
     }
 
-    /// Build the lexicon override TOML for the sparkle feature. Imported Toy
-    /// Packs follow the external lexicon/category extras in configured order;
-    /// inline custom surfaces come last, matching their highest spec precedence.
-    /// A missing/unreadable input is logged and skipped while the rest survives.
+    /// Build the lexicon override TOML: external lexicon/category extras, then
+    /// Toy Packs in configured order, then inline custom surfaces (highest
+    /// precedence). Unreadable inputs are logged and skipped.
     #[cfg(test)]
     pub(crate) fn sparkle_override_toml(&self) -> Option<String> {
         let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
@@ -4852,10 +4040,8 @@ impl Config {
         // Each strict pack was already production-scanner validated. Preserve
         // configured order so the lexicon document mirrors spec overlay order.
         out.push_str(pack_lexicon_toml);
-        // v3 §6: custom spec words auto-append to the emphasis class (CJK
-        // surfaces as `cjk = true` entries — the silent-drop fix), so they
-        // actually scan; their per-word specs ride the resolved DecoConfig's
-        // spec table.
+        // Custom spec words append to the emphasis class (CJK surfaces as
+        // `cjk = true` entries) so they scan; their specs ride the DecoConfig.
         if let Some(customs) = sw.custom.as_deref() {
             let (_, fragment) = aterm_effects::spec::build_custom(customs);
             out.push_str(&fragment);
@@ -4863,16 +4049,28 @@ impl Config {
         (!out.is_empty()).then_some(out)
     }
 
-    /// The `[matrix_rain]` DURABLE enabled bit: `enabled = true` present in the
-    /// table. Absent table / absent key ⇒ OFF (costume mode stays opt-in).
-    /// Deliberately split from [`Config::matrix_rain_params`]: a per-session
-    /// runtime override resolves `override.unwrap_or(THIS)`, so a session can
-    /// force rain ON even when the config never enables it.
+    /// The durable `[matrix_rain]` enabled bit; absent means off. Separate from
+    /// [`Config::matrix_rain_params`] because a per-session override resolves
+    /// `override.unwrap_or(this)` and can force rain on.
     pub(crate) fn matrix_rain_enabled(&self) -> bool {
         self.matrix_rain
             .as_ref()
             .and_then(|mr| mr.enabled)
             .unwrap_or(false)
+    }
+
+    /// The `[render] repaint_nudge` mode: `on` when the key is absent, the
+    /// word's own mode when it is `on`, `log` or `off`, and `log` for any other
+    /// word: a word aterm cannot read is no leave to act (the config diagnostics
+    /// report it). Read once, at launch.
+    pub(crate) fn repaint_nudge_mode(&self) -> aterm_core::terminal::repaint_nudge::Mode {
+        use aterm_core::terminal::repaint_nudge::Mode;
+        self.render
+            .as_ref()
+            .and_then(|r| r.repaint_nudge.as_deref())
+            .map_or_else(Mode::default, |word| {
+                Mode::parse(word.trim()).unwrap_or(Mode::Log)
+            })
     }
 
     /// The `[presence] band` RESOLVED bit (default TRUE): whether the presence
@@ -4887,6 +4085,16 @@ impl Config {
         self.presence.as_ref().and_then(|p| p.rim).unwrap_or(true)
     }
 
+    /// The `[claude_footer] usage` RESOLVED bit (default TRUE): whether the
+    /// Claude footer shows `Σ` — working time and tokens. See
+    /// [`ClaudeFooterConfig`].
+    pub(crate) fn claude_footer_usage(&self) -> bool {
+        self.claude_footer
+            .as_ref()
+            .and_then(|c| c.usage)
+            .unwrap_or(true)
+    }
+
     /// The `[harness] enabled` RESOLVED bit (default TRUE): whether the
     /// window supervises the agent sessions it hosts — the Settings ▸ Harness
     /// row. It is the SUPERVISOR'S bit ([`Self::harness`], read by the
@@ -4899,12 +4107,9 @@ impl Config {
         self.harness.policy.enabled
     }
 
-    /// The `[harness] approve` RESOLVED level (`all` by default; owner,
-    /// 2026-09-24): what the supervisor answers a permission box with —
-    /// `all`, `safe` or `none`. Read from the same one reader as
-    /// [`Self::harness_enabled`], so the Settings row and the supervisor cannot
-    /// disagree: an off spelling is `none`, and a value that is no level
-    /// (`approve = "maybe"`) keeps `all` here too.
+    /// Resolved `[harness] approve` level (`all`, `safe` or `none`; default
+    /// `all`), from the same reader as [`Self::harness_enabled`]. An off
+    /// spelling is `none`; a non-level value keeps `all` (owner, 2026-09-24).
     pub(crate) fn harness_approve(&self) -> &'static str {
         use aterm_agent::supervise::config::Approve;
         match self.harness.policy.approve {
@@ -4914,11 +4119,17 @@ impl Config {
         }
     }
 
-    /// What the `[harness]` reader said about the file, as config notices
-    /// (`config harness.<key>: …`), each with what the key resolved to. A
-    /// key that is not a harness key, or a retired one, is left out: the
-    /// config language's ignored-key or retired-key notice already names it,
-    /// the latter in the reader's words ([`collect_key_notices`]).
+    /// Resolved `[harness] question_priority` (default `recommended`): answer
+    /// with the recommended option or by the `long-term` / `short-term` policy
+    /// text. From the same reader as [`Self::harness_enabled`]; an unreadable
+    /// value keeps the default and disables `answer_questions` (fail closed).
+    pub(crate) fn harness_question_priority(&self) -> aterm_agent::supervise::QuestionPriority {
+        self.harness.policy.question_priority
+    }
+
+    /// The `[harness]` reader's notes as config notices (`config harness.<key>:
+    /// …`), each with its resolved value. Non-harness and retired keys are left
+    /// to the ignored/retired-key notices ([`collect_key_notices`]).
     pub(crate) fn harness_notices(&self) -> Vec<String> {
         use aterm_agent::supervise::config::{is_retired_key_note, is_unknown_key_note};
         self.harness
@@ -4929,38 +4140,29 @@ impl Config {
             .collect()
     }
 
-    /// `[packages] enabled` — Automatic updates, THE switch (default TRUE), with the
-    /// retired `auto_update` folded in exactly as atpkg folds it
-    /// (`atpkg::config::PackagesConfig::enabled`): an `auto_update = false` still in the
-    /// file reads as off. It gates the window's background loop (the launch pass, the
-    /// schedule, the head watch); a package action a person clicks still runs. The gate
-    /// is config-only (no environment kill switch since 2026-09-23), and the cadence has
-    /// no knob (Phase 3). The loop reads the same resolver's atpkg twin LIVE from the file
-    /// (Phase 4, `LiveSwitch` in lib.rs); this one seeds the Settings switch — the one
-    /// value it shows, on the Packages page and in Search — and the page's service line.
+    /// `[packages] enabled` (default true), folding `auto_update = false` in as
+    /// atpkg does (`atpkg::config::PackagesConfig::enabled`). Gates the window's
+    /// background package loop; clicked actions still run. The loop reads atpkg's
+    /// twin live from the file (`LiveSwitch` in lib.rs); this seeds the Settings
+    /// switch and service line.
     pub(crate) fn packages_enabled(&self) -> bool {
         self.packages
             .as_ref()
             .is_none_or(|p| p.enabled.unwrap_or(true) && p.auto_update != Some(false))
     }
 
-    /// WHY [`Self::packages_enabled`] reads off, when the retired `auto_update = false` is
-    /// what holds it — `enabled` itself not written off — in atpkg's own words
-    /// (`atpkg::config::auto_update_note`, what doctor and the config editor say), so
-    /// Settings ▸ Packages explains an Off it did not write and never advises a spelling
-    /// that would turn the opt-out back on. Not a second switch: the state is
-    /// `packages_enabled` alone, and writing `enabled` drops the retired key
-    /// (`prefs::RETIRED_PACKAGES_SPELLINGS`).
+    /// Why [`Self::packages_enabled`] reads off when a legacy
+    /// `auto_update = false` holds it, in atpkg's words
+    /// (`atpkg::config::auto_update_note`). Informational only; writing `enabled`
+    /// drops the legacy key (`prefs::RETIRED_PACKAGES_SPELLINGS`).
     pub(crate) fn packages_retired_switch_note(&self) -> Option<String> {
         let packages = self.packages.as_ref()?;
         (packages.auto_update == Some(false) && packages.enabled != Some(false))
             .then(|| atpkg::config::auto_update_note(false, packages.enabled))
     }
 
-    /// `[packages] auto_install` — THE install consent (default TRUE, batteries
-    /// included), with the retired `seed_install` read in its place while it is unset,
-    /// exactly as atpkg resolves it (`atpkg::config::PackagesConfig::auto_install`).
-    /// Consumed by the co-located `atpkg`; the GUI displays and edits it.
+    /// `[packages] auto_install` (default true), reading legacy `seed_install`
+    /// when unset, as atpkg does (`atpkg::config::PackagesConfig::auto_install`).
     pub(crate) fn packages_auto_install(&self) -> bool {
         self.packages
             .as_ref()
@@ -4968,11 +4170,10 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// `[machine] universal_control`, resolved with the SAME table as
-    /// `atpkg::config::MachineConfig::universal_control` (absent, empty and `"off"`
-    /// ⇒ `Off`; `"leave"` ⇒ `Leave`; any other spelling ⇒ the inert `Leave`). The
-    /// GUI does not print about a bad spelling — the config language service names
-    /// it, and atpkg says so once on its own stderr.
+    /// `[machine] universal_control`, resolved like
+    /// `atpkg::config::MachineConfig::universal_control` (absent, empty, `"off"`
+    /// ⇒ `Off`; anything else ⇒ `Leave`). Bad spellings are reported by the
+    /// config language service and atpkg, not here.
     pub(crate) fn machine_universal_control(&self) -> atpkg::config::UniversalControlPolicy {
         match self
             .machine
@@ -4993,9 +4194,8 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// The `[privacy]` master bit (default TRUE). With it off every consent
-    /// field reads `unknown` — the honest word for "aterm stopped looking",
-    /// which is a different claim from `denied`.
+    /// The `[privacy]` master bit (default true). Off, every consent field reads
+    /// `unknown`, not `denied`.
     pub(crate) fn privacy_enabled(&self) -> bool {
         self.privacy
             .as_ref()
@@ -5003,26 +4203,21 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// The `[privacy]` `check` bit (default TRUE): the silent, prompt-free
-    /// full-disk-access probe. Read it through [`Config::privacy_probe_gate`]
-    /// rather than alone — the master switch gates it, and a caller that reads
-    /// this bit by itself would probe with the lane switched off.
+    /// The `[privacy]` `check` bit (default true): the silent access probes.
+    /// Read through [`Config::privacy_probe_gate`], which also applies the master.
     pub(crate) fn privacy_check(&self) -> bool {
         self.privacy.as_ref().and_then(|p| p.check).unwrap_or(true)
     }
 
-    /// The `[privacy]` `notice` bit (default TRUE): the one-time macOS access
-    /// card (`consent_card`). Also gated by the master switch, which is why
-    /// `enabled = false` with `notice = true` earns a `--validate-config`
-    /// warning instead of silently never firing.
+    /// The `[privacy]` `notice` bit (default true): the one-time access card.
+    /// Also gated by the master; `--validate-config` warns on `enabled = false`
+    /// with `notice = true`.
     pub(crate) fn privacy_notice(&self) -> bool {
         self.privacy.as_ref().and_then(|p| p.notice).unwrap_or(true)
     }
 
-    /// The `[privacy]` `report_attribution` bit (default TRUE): per-session
-    /// responsible-process corroboration on the consent reports. It only
-    /// corroborates — aterm's own adoption record decides `live` vs `adopted`,
-    /// and turning this off removes a column, not a verdict.
+    /// The `[privacy]` `report_attribution` bit (default true): per-session
+    /// responsible-process corroboration. Off removes a column, not a verdict.
     pub(crate) fn privacy_report_attribution(&self) -> bool {
         self.privacy
             .as_ref()
@@ -5030,10 +4225,9 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// The two probe bits as the consent module's OWN gate type, so no caller
-    /// has to remember that the master switch outranks `check`. Pass this to
-    /// `aterm_containment::probe_fda`; it refuses when either bit is off,
-    /// before any syscall.
+    /// Both probe bits as the consent module's gate type, so the master always
+    /// outranks `check`. `aterm_containment::probe_fda` refuses before any
+    /// syscall when either is off.
     pub(crate) fn privacy_probe_gate(&self) -> aterm_containment::ProbeGate {
         aterm_containment::ProbeGate {
             enabled: self.privacy_enabled(),
@@ -5042,9 +4236,8 @@ impl Config {
     }
 
     /// The `[privacy]` `warmup` mode (default [`PrivacyWarmup::OnRequest`]).
-    /// An unrecognized spelling resolves to the default and is named by
-    /// `--validate-config`; it never fails the parse, because that would
-    /// discard the whole config file over one typo.
+    /// Unknown spellings resolve to the default and are named by
+    /// `--validate-config`.
     pub(crate) fn privacy_warmup(&self) -> PrivacyWarmup {
         self.privacy
             .as_ref()
@@ -5053,36 +4246,31 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// The `[privacy]` `warmup_folders` NAMES (default: every folder the
-    /// consent module knows, in the order the warm-up walks them — taken from
-    /// `aterm_containment::Folder::ALL` rather than written out, so this
-    /// default cannot drift from the module that owns the paths).
+    /// The `[privacy]` `warmup_folders` NAMES (default: the consent module's
+    /// `aterm_containment::Folder::WARMUP_DEFAULT`, in the order the warm-up walks
+    /// them — taken from there rather than written out, so this default cannot
+    /// drift from the module that owns the paths; `app-data` is not in it, because
+    /// its Allow is forgotten when the process that received it is replaced).
     ///
-    /// Names only. The PATHS are resolved by
-    /// `aterm_containment::consent::folder_paths`, never here: a protected
-    /// path literal in this crate is a system modal parked in front of whatever
-    /// thread ran it (`tools/grep_guard.sh` B13).
-    ///
-    /// An unknown name survives into this list — dropping it here would hide
-    /// the typo the validator exists to report; the resolver that turns names
-    /// into paths skips it.
+    /// Names only: paths are resolved by
+    /// `aterm_containment::consent::folder_paths`, because a protected path
+    /// literal here would raise a system modal (`tools/grep_guard.sh` B13).
+    /// Unknown names are kept for the validator and skipped by the resolver.
     pub(crate) fn privacy_warmup_folders(&self) -> Vec<String> {
         self.privacy
             .as_ref()
             .and_then(|p| p.warmup_folders.clone())
             .unwrap_or_else(|| {
-                aterm_containment::Folder::ALL
+                aterm_containment::Folder::WARMUP_DEFAULT
                     .iter()
                     .map(|folder| folder.as_str().to_string())
                     .collect()
             })
     }
 
-    /// The `[privacy]` `warmup_hold_ms` RESOLVED value (default
-    /// [`PRIVACY_WARMUP_HOLD_MS_DEFAULT`]), CLAMPED to
-    /// [`PRIVACY_WARMUP_HOLD_MS_MAX`] so a configured hold can never grow into
-    /// a way of pinning a build to one instance. `--validate-config` states the
-    /// effective value when the clamp bites.
+    /// Resolved `[privacy] warmup_hold_ms` (default
+    /// [`PRIVACY_WARMUP_HOLD_MS_DEFAULT`]), clamped to
+    /// [`PRIVACY_WARMUP_HOLD_MS_MAX`]; `--validate-config` reports the clamp.
     pub(crate) fn privacy_warmup_hold_ms(&self) -> u64 {
         self.privacy
             .as_ref()
@@ -5091,10 +4279,8 @@ impl Config {
             .min(PRIVACY_WARMUP_HOLD_MS_MAX)
     }
 
-    /// The `[privacy]` `probe_interval_ms` RESOLVED floor (default
-    /// [`PRIVACY_PROBE_INTERVAL_MS_DEFAULT`]) on re-probing, which is also the
-    /// worst-case lag between a human answering a system dialog and aterm's
-    /// reported posture changing.
+    /// Resolved `[privacy] probe_interval_ms` floor (default
+    /// [`PRIVACY_PROBE_INTERVAL_MS_DEFAULT`]), also the worst-case posture lag.
     pub(crate) fn privacy_probe_interval_ms(&self) -> u64 {
         self.privacy
             .as_ref()
@@ -5102,30 +4288,37 @@ impl Config {
             .unwrap_or(PRIVACY_PROBE_INTERVAL_MS_DEFAULT)
     }
 
-    /// The `[privacy]` `observer` bit (default FALSE — the shipping default).
+    /// The `[privacy]` `observer` key as a mode (design §3.6): absent is the
+    /// [`ObserverMode::Sentinel`], `false` is off, `true` is the full stream.
     ///
-    /// The `tccd` log observer (design §3.6) ships OFF: it is spike-gated, it
-    /// needs admin-group membership to see anything at all, and it parses an
-    /// undocumented message format. Config only — `crate::consent_observer`
-    /// takes this resolved `bool` as an argument and reads no environment knob
-    /// of its own, so a program inside a session has nothing to flip.
-    pub(crate) fn privacy_observer(&self) -> bool {
-        self.privacy
-            .as_ref()
-            .and_then(|p| p.observer)
-            .unwrap_or(false)
+    /// Config only — `crate::consent_observer` takes this resolved value as an
+    /// argument and reads no environment knob of its own, so a program inside
+    /// a session has nothing to flip. Whether a sentinel actually STARTS is
+    /// the host's call (`App::effective_observer_mode`): it needs the card's
+    /// own switches on, since it exists only to feed the card.
+    pub(crate) fn privacy_observer_mode(&self) -> crate::consent_observer::ObserverMode {
+        use crate::consent_observer::ObserverMode;
+        match self.privacy.as_ref().and_then(|p| p.observer) {
+            None => ObserverMode::Sentinel,
+            Some(false) => ObserverMode::Off,
+            Some(true) => ObserverMode::Full,
+        }
     }
 
-    /// The `[privacy]` `protected_roots` RESOLVED to absolute paths.
+    /// `[privacy] observer = false`: the owner turned off aterm's reading of
+    /// tccd's log, which also stops the Developer Tools row's `log show`. A
+    /// plain read, so the control modules can ask it without naming the
+    /// observer.
+    pub(crate) fn privacy_observer_off(&self) -> bool {
+        self.privacy_observer_mode() == crate::consent_observer::ObserverMode::Off
+    }
+
+    /// `[privacy] protected_roots` resolved to absolute paths. Absent or empty
+    /// means `aterm_containment::sbpl::PRIVATE_SUBDIRS` under `$HOME`, the set
+    /// Containment denies; resolution lives in `aterm_containment::consent`.
     ///
-    /// Absent or EMPTY resolves to `aterm_containment::sbpl::PRIVATE_SUBDIRS`
-    /// under `$HOME` — the SAME set the Containment tier denies, on purpose:
-    /// the containment tier and the consent tier must not disagree about which
-    /// paths are sensitive. The resolution (and every path literal in it) lives
-    /// in `aterm_containment::consent`; this crate only threads the answer.
-    ///
-    /// An empty result means `$HOME` is unset and no absolute override was
-    /// given. Treat that as "cannot answer", never as "nothing is protected".
+    /// An empty result means `$HOME` is unset with no absolute override: treat
+    /// it as "cannot answer", never "nothing is protected".
     pub(crate) fn privacy_protected_roots(&self) -> Vec<std::path::PathBuf> {
         let overrides = self
             .privacy
@@ -5135,21 +4328,14 @@ impl Config {
         aterm_containment::protected_roots(overrides)
     }
 
-    /// Resolve the `[matrix_rain]` table into engine-ready PARAMETERS
-    /// ([`crate::matrix_rain::RainConfig`]), applying every default + clamp
-    /// (design §12 — defaults/clamps live ONLY here; the engine re-clamps
-    /// defensively). INDEPENDENT of the `enabled` bit: an absent/disabled
-    /// table still synthesizes the full default + theme-derived parameter set,
-    /// because a per-session override can force rain ON over a disabled config
-    /// (the enabled decision lives in [`Config::matrix_rain_enabled`] +
-    /// `App::session_rain_enabled`). The returned config always carries
-    /// `enabled: true` — host-side gating decides whether an engine ever
-    /// exists, and the zero-cost D-1 pin is preserved there (no engine is
-    /// constructed while every visible session is off).
+    /// Resolve `[matrix_rain]` into [`crate::matrix_rain::RainConfig`] with every
+    /// default and clamp (the engine re-clamps). Independent of the enabled bit:
+    /// a per-session override can force rain on over a disabled config
+    /// ([`Config::matrix_rain_enabled`], `App::session_rain_enabled`), so the
+    /// result always carries `enabled: true` and host gating decides whether an
+    /// engine exists.
     ///
-    /// `default_bg`/`theme_fg` are the live renderer theme (`0x00RR_GGBB`) —
-    /// the ramp + §6 luminance derivation read them the way the renderer
-    /// knows them.
+    /// `default_bg`/`theme_fg` are the live renderer theme (`0x00RR_GGBB`).
     pub(crate) fn matrix_rain_params(
         &self,
         default_bg: u32,
@@ -5157,9 +4343,8 @@ impl Config {
     ) -> crate::matrix_rain::RainConfig {
         use crate::matrix_rain::{RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainHue};
         let mr = self.matrix_rain.clone().unwrap_or_default();
-        // §6 alpha ceiling: the overrides land only when USER-set — `None`
-        // keeps the engine's theme-derived luminance path. The head floor is
-        // the resolved body alpha (heads never dimmer than the body).
+        // Alpha overrides apply only when user-set; `None` keeps the engine's
+        // theme-derived path. Heads are never dimmer than the body.
         let alpha = mr
             .alpha
             .map(|a| a.clamp(u32::from(RAIN_ALPHA_FLOOR), u32::from(RAIN_ALPHA_CAP)) as u8);
@@ -5170,9 +4355,7 @@ impl Config {
         let hue = match mr.hue.as_deref().map(str::trim) {
             Some(h) if h.eq_ignore_ascii_case("theme") => RainHue::Theme,
             Some(h) if h.starts_with('#') => match parse_hex_color(h) {
-                Some(c) => {
-                    RainHue::Custom((u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b))
-                }
+                Some(c) => RainHue::Custom(rgb_u32(c)),
                 // Malformed hex fails CLOSED to the stock green — a typo must
                 // never abort the whole config load or invent a colour.
                 None => RainHue::Matrix,
@@ -5201,57 +4384,25 @@ impl Config {
             output_material: mr.output_material.unwrap_or(true),
             exit_tint: mr.exit_tint.unwrap_or(true),
             bell_alert: mr.bell_alert.unwrap_or(true),
-            // 0 is the "derive per window at enable" sentinel — resolved to a
-            // stable per-window seed at engine build (rain_config_for_window),
-            // never wall-clock randomness.
+            // 0 means "derive a stable per-window seed at engine build"
+            // (rain_config_for_window), never wall-clock randomness.
             seed: mr.seed.unwrap_or(0),
             default_bg: default_bg & 0x00FF_FFFF,
             theme_fg: theme_fg & 0x00FF_FFFF,
         }
     }
 
-    /// THE `[output_streak]` MASTER — PRISM WAKE's on/off bit
-    /// (`docs/DESIGN-output-streak-2026-08-30.md` §7).
+    /// The `[output_streak]` master (`docs/DESIGN-output-streak-2026-08-30.md`
+    /// §7). Default [`DEFAULT_DECORATIVE_EFFECTS`]: on except on Windows, where
+    /// unprompted decoration over program output is off by default.
     ///
-    /// **DEFAULT ON. This key is an opt-OUT**, by owner ruling 2026-08-31 —
-    /// *"default on."* That ruling STRUCK the design's own open question §11.1
-    /// and carried one consequence the resolvers below inherit: every governor
-    /// in design §5 is now a SHIPPING promise (the flood, echo, empty-damage
-    /// and reduced-motion laws are blocking tests, not best-effort ones for an
-    /// opt-in toy). It is written here the way the other shipped opt-OUTs are —
-    /// [`Self::notice_sparkle_or_default`], [`Self::trail_sound_riff_or_default`],
-    /// [`Self::bell_sound_or_default`] — and deliberately NOT the way the
-    /// opt-INs beside it are ([`Self::matrix_rain_enabled`],
-    /// [`Self::robi_or_default`]).
+    /// Off switches:
     ///
-    /// THE THREE OFF SWITCHES, named because a default-ON decoration owes the
-    /// reader its exits:
-    ///
-    /// * `enabled = false` under `[output_streak]` in `aterm.toml` — the
-    ///   durable one, resolved here, and hot-reloaded like every other key on
-    ///   this struct (the whole `Config` is replaced on a config-file
-    ///   generation, so a save takes effect without a restart).
-    /// * REDUCED MOTION — OS Reduce Motion or `motion = "reduced"`. Design §7
-    ///   pins this as exact zero, not eased: `MotionEffect::OutputStreak` at
-    ///   amplitude 0 fully RESETS the engine (empty vectors, fingerprint 0, no
-    ///   cues), rather than dimming it.
-    /// * `aterm ctl streak off` — the per-session runtime override, the
-    ///   `cmd_rain` twin, which wins over this durable bit until the session
-    ///   ends.
-    ///
-    /// AND THE PLATFORM LAW ON TOP, which is why this reads
-    /// [`DEFAULT_DECORATIVE_EFFECTS`] rather than a bare `true`. Design §7 is
-    /// explicit that the decorative-family-off-on-Windows gate "is a platform
-    /// law, not a family default, and stands" — the owner's ruling moved the
-    /// FAMILY default (ON instead of the opt-in this was drafted as), it did
-    /// not repeal the 2026-08 Windows minimal-fast directive that `6272bd7a`
-    /// and `d22ba722` twice established. This effect is squarely what that
-    /// directive addresses: unprompted decoration painted over ORDINARY program
-    /// output, on the exact path a Windows audit once traced typing lag to. So
-    /// on Windows a fresh config resolves OFF and `enabled = true` opts back
-    /// in, whole; everywhere else the ruling's "default on" is what a fresh
-    /// config gets. A DEFAULT, never a veto — in both directions, on every
-    /// platform.
+    /// * `enabled = false` under `[output_streak]` (hot-reloaded).
+    /// * Reduced motion (OS or `motion = "reduced"`): `MotionEffect::OutputStreak`
+    ///   at amplitude 0 fully resets the engine.
+    /// * `aterm ctl streak off`: a per-session override that wins until the
+    ///   session ends.
     pub(crate) fn output_streak_enabled_or_default(&self) -> bool {
         self.output_streak
             .as_ref()
@@ -5259,26 +4410,12 @@ impl Config {
             .unwrap_or(DEFAULT_DECORATIVE_EFFECTS)
     }
 
-    /// Whether PRISM WAKE may SPEAK (`[output_streak] sound`, default ON).
-    ///
-    /// ON by the SAME owner ruling as the master above — design §11.1 records
-    /// it as a consequence rather than a second decision: *"the sound half is
-    /// ON by the same ruling (it is one feature, and the ladder's own gates —
-    /// episode law, focus, the `trail_sounds` master — are what keep it
-    /// soft)"*. So this is an opt-OUT like [`Self::trail_sound_riff_or_default`],
-    /// its nearest sibling, and not like the opt-in bed.
-    ///
-    /// A plain `true` and NOT [`DEFAULT_DECORATIVE_EFFECTS`], deliberately:
-    /// that family exists for decoration painted over content the user is
-    /// reading, and a sound covers no pixel. It also cannot be heard on a
-    /// Windows box regardless, because a cue is recorded only on a spawn edge
-    /// and the master above already resolves OFF there — and because the synth
-    /// host is macOS-only (design §6, "platform truth"), which
-    /// [`crate::diagnostics`]' capability matrix already discloses.
-    ///
-    /// SUBORDINATE, like every other voice: `trail_sounds` × `trail_sound_volume`
-    /// × RAW window focus × `SeriousEffect::TerminalSound` all apply FIRST, so
-    /// this key can only ever take sound away, never add it.
+    /// Whether the output streak plays sound (`[output_streak] sound`, default
+    /// on). A plain `true` rather than [`DEFAULT_DECORATIVE_EFFECTS`] since a
+    /// sound covers no pixel; cues are recorded only on spawn edges, so with the
+    /// master off it is silent anyway. The synth host is macOS-only
+    /// ([`crate::diagnostics`]). `trail_sounds`, `trail_sound_volume`, window
+    /// focus and `SeriousEffect::TerminalSound` apply first.
     pub(crate) fn output_streak_sound_or_default(&self) -> bool {
         self.output_streak
             .as_ref()
@@ -5286,22 +4423,11 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// PRISM WAKE amplitude scale (`[output_streak] intensity`, default `1.0`),
-    /// clamped `0..=1`.
-    ///
-    /// This is a SCALE on the engine's shipping amplitude, not the amplitude
-    /// itself: peak coverage is `output_streak::ALPHA_DEFAULT` (the 0.10 class)
-    /// under a hard `ALPHA_CLAMP` of 0.18 that lives in the state machine, so
-    /// no value here — and no embedder, theme derivation or future caller —
-    /// can put more light on a cell than the design's ceiling ruling allows.
-    /// `0` is a real setting, not a failure: design §1 pins intensity ≤ 0 as a
-    /// full RESET rather than a dimming, so it costs exactly what `enabled =
-    /// false` costs.
-    ///
-    /// TOML accepts `nan`/`inf`; those FAIL OFF to `0.0` rather than poisoning
-    /// the quad stream downstream — `clamp` passes NaN straight through, and
-    /// these scalars reach premultiplied vertex colours. Same arm, same reason,
-    /// as [`Self::trail_sound_volume`] and
+    /// Output streak amplitude scale (`[output_streak] intensity`, default
+    /// `1.0`), clamped `0..=1`. It scales `output_streak::ALPHA_DEFAULT` under
+    /// the engine's hard `ALPHA_CLAMP`; `0` is a full reset, costing the same as
+    /// `enabled = false`. Non-finite values read as `0.0` (they would reach
+    /// vertex colours), like [`Self::trail_sound_volume`] and
     /// [`Self::cursor_trail_bloom_strength_or_default`].
     pub(crate) fn output_streak_intensity_or_default(&self) -> f32 {
         match self
@@ -5316,15 +4442,9 @@ impl Config {
     }
 
     /// Comet tail length in cells (`[output_streak] tail`, default 9), clamped
-    /// into [`aterm_effects::output_streak::TAIL_MIN`]`..=`[`aterm_effects::output_streak::TAIL_MAX`].
-    ///
-    /// The band is the ENGINE's own constant pair, read rather than re-typed,
-    /// so this resolver cannot drift from the state machine that re-clamps it.
-    /// A tail shorter than the floor stops reading as a comet at all; one
-    /// longer than the ceiling stops being a sheen and becomes a rainbow bar
-    /// laid across the user's text, which the ceiling ruling forbids.
-    /// Out-of-band values CLAMP (they never reject the file) — the
-    /// `[matrix_rain]` law: a typo may not take a whole config down.
+    /// into [`aterm_effects::output_streak::TAIL_MIN`]`..=`[`aterm_effects::output_streak::TAIL_MAX`],
+    /// the engine's own bounds. Out-of-band values clamp; they never reject the
+    /// file.
     pub(crate) fn output_streak_tail_or_default(&self) -> u16 {
         use aterm_effects::output_streak::{TAIL_MAX, TAIL_MIN};
         let raw = self
@@ -5336,25 +4456,10 @@ impl Config {
     }
 
     /// Resident comet cap (`[output_streak] max_streaks`, default 3), clamped
-    /// `1..=`[`aterm_effects::output_streak::MAX_COMETS`].
-    ///
-    /// The floor is 1, not 0: "no comets" is spelled `enabled = false`, and a
-    /// zero here would be a second, silent off switch that no disclosure
-    /// ladder names. The ceiling is the engine's own `MAX_COMETS`, read rather
-    /// than re-typed. Note that this cap is the WEAKEST of the governors in
-    /// design §5 — the ~700 ms engine ignition floor
-    /// (`aterm_effects::output_streak::SPAWN_MIN_GAP_MS`) and the flood ribbon
-    /// both bind long before it does — so raising it to 4 buys density in a
-    /// burst, never a faster rate.
-    ///
-    /// AND NOT THE ONE THIS SENTENCE USED TO NAME FIRST. Design §5 listed the
-    /// word-nova's ≤2/s window-wide ignition limiter among PRISM WAKE's
-    /// governors, and this doc repeated it; the engine as shipped never charges
-    /// that limiter (no `FlashLimiter` reservation exists in `output_streak.rs`,
-    /// and nothing here makes one on its behalf). The rate this cap sits under
-    /// is the engine's own per-pane floor, and what keeps a per-pane floor safe
-    /// is that WCAG 2.3.1's rate arm is measured per cell and a cell belongs to
-    /// exactly one pane — see the engine's module docs.
+    /// `1..=`[`aterm_effects::output_streak::MAX_COMETS`]. The floor is 1 because
+    /// off is spelled `enabled = false`. The engine's per-pane ignition floor
+    /// (`aterm_effects::output_streak::SPAWN_MIN_GAP_MS`) binds first, so a
+    /// higher cap adds burst density, not rate.
     pub(crate) fn output_streak_max_streaks_or_default(&self) -> u8 {
         use aterm_effects::output_streak::MAX_COMETS;
         let raw = self
@@ -5365,18 +4470,9 @@ impl Config {
         raw.clamp(1, MAX_COMETS as u32) as u8
     }
 
-    /// The MANDATORY idle drain in seconds (`[output_streak] idle_secs`,
-    /// default 10), clamped `2..=120` — the same band `[matrix_rain]` uses,
-    /// for the same design §5 reason: **no configuration animates forever.**
-    /// There is no `idle = "keep"` spelling to reach for.
-    ///
-    /// A non-finite value fails to the band FLOOR rather than to the default.
-    /// That is the deliberate choice and the asymmetry is the point: every
-    /// other fail-silent arm in this file picks the value that does LESS, and
-    /// for a drain timeout doing less means draining sooner. Falling back to
-    /// the 10 s default would let `idle_secs = nan` buy a longer animation
-    /// than `idle_secs = 2`, which is exactly the "a typo animates forever"
-    /// class the band exists to close.
+    /// Idle drain in seconds (`[output_streak] idle_secs`, default 10), clamped
+    /// `2..=120`; nothing animates forever. Non-finite values read as the floor,
+    /// not the default, so a typo never lengthens the animation.
     pub(crate) fn output_streak_idle_secs_or_default(&self) -> f32 {
         match self
             .output_streak
@@ -5389,36 +4485,13 @@ impl Config {
         }
     }
 
-    /// The `--validate-config` domain warning for `[output_streak]`: the one
-    /// value in this table that is a SILENT NO-OP rather than a clamp.
+    /// `--validate-config` warning for `[output_streak]`: `sound = true` under
+    /// `enabled = false` is unreachable (cues are recorded only on edges that
+    /// also emit light). Out-of-band numeric keys are documented clamps and are
+    /// not warned.
     ///
-    /// WHAT IS DELIBERATELY NOT WARNED, so a later reader can check the
-    /// reasoning instead of reading an omission: the four numeric keys. An
-    /// out-of-band `tail`, `max_streaks`, `intensity` or `idle_secs` is
-    /// DOCUMENTED clamping behaviour, and this repo warns about no such key —
-    /// not [`Self::trail_sound_volume`], not `matrix_rain.fps`/`density`/
-    /// `speed`/`trail`/`mutation_ms`/`idle_secs`. The numeric warnings that DO
-    /// exist in [`crate::diagnostics`] are all the other shape: a value whose
-    /// EFFECTIVE result differs from its own documented band for a reason the
-    /// author cannot see from the key alone (`matrix_rain.head_alpha` raised
-    /// to the resolved body alpha, `sparkle_words.ink.sweep_ms` raised by
-    /// `loop`, `window_padding_top` capped by `window_padding`).
-    ///
-    /// `sound = true` under `enabled = false` IS that shape. A cue is recorded
-    /// only on an edge that also minted light (design §6), so with the master
-    /// off the pip is unreachable — not quieter, unreachable — and the author
-    /// who wrote the key has no way to see that from the key.
-    ///
-    /// TEST-ONLY, and gated to say so, on the
-    /// [`Self::sparkle_words_enabled_or_default`] precedent: the shipping
-    /// caller for a warning of this shape is the aggregator in
-    /// [`crate::diagnostics`], and that file is a different rung of the design
-    /// §10 ladder. An ungated definition with only `#[cfg(test)]` callers is a
-    /// `dead_code` finding in the LIB target, so the definition is gated to
-    /// match its callers rather than left to rot. When the diagnostics rung
-    /// lands, delete the attribute and push the string as a
-    /// `ConfigSemanticWarning` keyed `output_streak.sound` — nothing else here
-    /// has to change.
+    /// Test-only until [`crate::diagnostics`] pushes it as a
+    /// `ConfigSemanticWarning` keyed `output_streak.sound`.
     #[cfg(test)]
     pub(crate) fn output_streak_warning(&self) -> Option<String> {
         let streak = self.output_streak.as_ref()?;
@@ -5430,27 +4503,17 @@ impl Config {
         })
     }
 
-    /// GPU cursor-comet bloom — the light CROWN around the comet head. DEFAULT ON,
-    /// paired with whatever `cursor_trail` resolves to: with the comet's continuous
-    /// beam this is the shipped "luminous streak" signature. The cost (a half-res
-    /// blur pass) runs only on effect frames, which the trail timer paces at the
-    /// display rate with ~0.2ms frame cost (measured, AMD 780M iGPU); the
-    /// `perf_reduced` load-shed latch and `motion` policy both drop it under
-    /// pressure/accessibility, and `cursor_trail_bloom = false` opts out.
-    ///
-    /// ON EVERY PLATFORM, Windows included, and deliberately NOT a member of the
-    /// [`DEFAULT_DECORATIVE_EFFECTS`] family: every consumer reads this as
-    /// `cursor_trail_or_default() && …`, so the Windows trail default already makes it
-    /// inert on a fresh config. Splitting it too would buy no pixel and no
-    /// millisecond there, and would hand the Windows owner who writes
-    /// `cursor_trail = true` a trail missing its crown.
+    /// GPU cursor bloom, the light crown around the comet head. Default on, on
+    /// every platform: consumers read it as `cursor_trail_or_default() && …`, so
+    /// it is inert wherever the trail is off. The half-res blur runs only on
+    /// effect frames and is dropped by the `perf_reduced` latch and the `motion`
+    /// policy.
     pub(crate) fn cursor_trail_bloom_or_default(&self) -> bool {
         self.cursor_trail_bloom.unwrap_or(true)
     }
 
-    /// Bloom strength, default 0.85, clamped 0.0..=3.0. Non-finite (`nan` is
-    /// valid TOML) FAILS OFF to 0.0 — `clamp` passes NaN through, and these
-    /// values feed GPU shader params directly (the intensity resolver's twin).
+    /// Bloom strength, default 0.85, clamped 0.0..=3.0. Non-finite values read
+    /// as 0.0 since they feed shader params directly.
     pub(crate) fn cursor_trail_bloom_strength_or_default(&self) -> f32 {
         let v = self.cursor_trail_bloom_strength.unwrap_or(0.85);
         if v.is_finite() {
@@ -5460,47 +4523,38 @@ impl Config {
         }
     }
 
-    /// The bloom radius (half-res blur texels) every style other than the
-    /// rainbow kitty has always had — the one global value the knob used to
-    /// default to for all of them, kept byte-identical.
+    /// Bloom radius (half-res blur texels) for every style except the rainbow
+    /// kitty.
     pub(crate) const CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT: f32 = 2.2;
 
-    /// The rainbow kitty's bloom radius, `RAINBOW-KITTY-V2.md` §21 row 14:
-    /// **1.8 texels** — a tighter halo than the 2.2 default, for a theme
-    /// whose stars are already haloed. The row's derivation: the bloom is a
-    /// post pass on `out` fed by the head core, the white heat, the landing
-    /// pin, the ring and the stars, and v2's stars carry their own halos
-    /// (the `halos` lane), so the post-pass halo they get on top is the
-    /// tighter one; the colour train (`under`) and the ribbon never bloom, so
-    /// text stays crisp at either radius. The row called this a host
-    /// follow-up because the knob was one global value; it is per-style now,
-    /// with the knob as the explicit override.
+    /// The rainbow kitty's bloom radius (`RAINBOW-KITTY-V2.md` §21 row 14): a
+    /// tighter halo than the default because its stars carry their own halos.
+    /// The colour train and ribbon never bloom, so text stays crisp.
     pub(crate) const RAINBOW_KITTY_BLOOM_RADIUS: f32 = 1.8;
 
+    /// The unset bloom radius for a resolved trail style:
+    /// [`Self::RAINBOW_KITTY_BLOOM_RADIUS`] for the rainbow kitty,
+    /// [`Self::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT`] otherwise.
+    pub(crate) fn bloom_radius_style_default(style: ResolvedTrailStyle) -> f32 {
+        if style.style == Some(aterm_effects::cursor_glow::GlowStyle::RainbowKitty) {
+            Self::RAINBOW_KITTY_BLOOM_RADIUS
+        } else {
+            Self::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT
+        }
+    }
+
     /// Bloom radius (half-res texels) for the resolved trail style, clamped
-    /// 0.5..=8.0: the user's explicit `cursor_trail_bloom_radius` when set
-    /// (the override — for every style), else PER-STYLE —
-    /// [`Self::RAINBOW_KITTY_BLOOM_RADIUS`] (1.8) when the style resolved to
-    /// [`aterm_effects::cursor_glow::GlowStyle::RainbowKitty`], else
-    /// [`Self::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT`] (2.2, byte-identical to
-    /// what every other style, `off` and a pack always had). Takes the
-    /// config-generation [`ResolvedTrailPresentation`] so the answer comes
-    /// from the same pre-parsed resolution the frame path reads (no string
-    /// parsing at the three GPU pin seams: launch, the deferred join, the
-    /// config reload). Non-finite falls back to the per-style default (a NaN
-    /// radius would poison the GPU blur weights; the strength resolver owns
-    /// the fail-OFF arm).
+    /// 0.5..=8.0: an explicit `cursor_trail_bloom_radius` for every style, else
+    /// [`Self::RAINBOW_KITTY_BLOOM_RADIUS`] for
+    /// [`aterm_effects::cursor_glow::GlowStyle::RainbowKitty`] and
+    /// [`Self::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT`] otherwise. Takes the
+    /// pre-parsed [`ResolvedTrailPresentation`] so the GPU pin seams parse no
+    /// strings. Non-finite values fall back to the per-style default.
     pub(crate) fn cursor_trail_bloom_radius_or_default(
         &self,
         presentation: ResolvedTrailPresentation,
     ) -> f32 {
-        let per_style = if presentation.style.style
-            == Some(aterm_effects::cursor_glow::GlowStyle::RainbowKitty)
-        {
-            Self::RAINBOW_KITTY_BLOOM_RADIUS
-        } else {
-            Self::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT
-        };
+        let per_style = Self::bloom_radius_style_default(presentation.style);
         let v = self.cursor_trail_bloom_radius.unwrap_or(per_style);
         if v.is_finite() {
             v.clamp(0.5, 8.0)
@@ -5509,48 +4563,36 @@ impl Config {
         }
     }
 
-    /// GPU heat shimmer above burning cells — the bloom's parity class.
-    /// DEFAULT ON (quality-first): it costs one small staged copy + one
-    /// scissored pass, only on frames that carry glow quads. The `perf_reduced`
-    /// load-shed latch drops it exactly as it drops the bloom, and
-    /// reduced-motion / unfocused windows emit no glow quads ⇒ no hot region ⇒
-    /// no shimmer automatically. `cursor_fire_shimmer = false` opts out.
+    /// GPU heat shimmer above burning cells. Default on: one staged copy and one
+    /// scissored pass, only on frames with glow quads. Dropped with the bloom by
+    /// the `perf_reduced` latch; reduced motion and unfocused windows emit no
+    /// glow quads, hence no shimmer.
     pub(crate) fn cursor_fire_shimmer_or_default(&self) -> bool {
         self.cursor_fire_shimmer.unwrap_or(true)
     }
 
-    /// M3 phase B: whether the EDR cursor glow is opted in. DEFAULT ON — on an
-    /// HDR-enabled desktop (Windows scRGB DX12 / macOS EDR) the aurora gets real
-    /// headroom and the streak becomes genuinely luminous; on an SDR desktop the
-    /// sanitized headroom is 0 and the EDR pass is PROVABLY INERT (the present
-    /// stays byte-identical), so the default is safe everywhere and lights up
-    /// exactly where the panel can show it. `hdr_glow = false` opts out.
+    /// Whether the EDR cursor glow is enabled. Default on: on an HDR desktop
+    /// (Windows scRGB DX12 / macOS EDR) the aurora gets real headroom; on SDR the
+    /// headroom is 0 and the EDR pass is inert (byte-identical present).
     pub(crate) fn hdr_glow_or_default(&self) -> bool {
         self.hdr_glow.unwrap_or(true)
     }
 
-    /// SDR glow-boost strength (`cursor_glow_sdr_boost`), DEFAULT 0.25, clamped
-    /// 0..=1; `0` disables. The renderer combines it with the live background's
-    /// luma into a proven-bounded budget (`aterm_render::hdr::sdr_glow_budget`)
-    /// and eases it in with a ~45ms attack, so light themes self-degrade to
-    /// invisible regardless of this knob and onsets BLOOM rather than strobe.
-    /// NaN fails OFF inside the budget math. (Was 0.35 with instant onset — the
-    /// owner reported it as a per-keystroke "cursor flash".)
+    /// SDR glow-boost strength (`cursor_glow_sdr_boost`), default 0.25, clamped
+    /// 0..=1; `0` disables. The renderer combines it with background luma into
+    /// a bounded budget (`aterm_render::hdr::sdr_glow_budget`) and eases it in
+    /// over ~45ms, so light themes fade it out and onsets do not strobe. NaN
+    /// reads as off inside the budget math.
     pub(crate) fn cursor_glow_sdr_boost_or_default(&self) -> f32 {
         self.cursor_glow_sdr_boost.unwrap_or(0.25).clamp(0.0, 1.0)
     }
 
-    /// Build the renderer text-shaping config from the typography keys
-    /// (`ligatures` + `cursor_break_ligatures` + `font_features`). The DEFAULT
-    /// (`ligatures` absent/`true`, no break, no `font_features`) returns
-    /// `TextShapingConfig::default()` — `LigatureMode::Enabled`
-    /// with only the base `liga`+`calt` — so an unset config is byte-identical to the
-    /// pre-WIRE-FONTFEAT renderer. `cursor_break_ligatures = true` maps to
-    /// `LigatureMode::CursorDisabled` (W5d — the cursor cell renders per-cell);
-    /// `ligatures = false` wins over it (everything is per-cell already).
-    /// `ambiguous_width` is intentionally NOT mapped here:
-    /// it is routed through the engine cell-width path (`ambiguous_width_double`),
-    /// which the renderer's `TextShapingConfig.ambiguous_width` field does not drive.
+    /// Renderer text-shaping config from `ligatures`, `cursor_break_ligatures`
+    /// and `font_features`. Defaults give `TextShapingConfig::default()`
+    /// (`LigatureMode::Enabled`, base `liga`+`calt`). `cursor_break_ligatures`
+    /// maps to `LigatureMode::CursorDisabled`; `ligatures = false` wins over it.
+    /// `ambiguous_width` goes through the engine (`ambiguous_width_double`), not
+    /// here.
     pub(crate) fn text_shaping(&self) -> aterm_render::TextShapingConfig {
         use aterm_types::text_shaping::{
             FontFeature, FontFeatureSet, LigatureMode, parse_font_features,
@@ -5560,9 +4602,8 @@ impl Config {
             (_, Some(true)) => LigatureMode::CursorDisabled,
             _ => LigatureMode::Enabled,
         };
-        // Each list entry may itself be a space-separated group; parse them all and
-        // flatten onto the PRIMARY face (`font_id == 0`, the only face the shaper
-        // drives). Malformed tags are dropped by the parser.
+        // Entries may be space-separated groups; flatten onto the primary face
+        // (`font_id == 0`). The parser drops malformed tags.
         let features: Vec<FontFeature> = self
             .font_features
             .as_deref()
@@ -5587,10 +4628,9 @@ impl Config {
         }
     }
 
-    /// Coverage blend mode (W2): `"linear-corrected"` (the DEFAULT, also for an
-    /// absent key) or `"linear"`; case-insensitive, with `linear_corrected`
-    /// accepted as an alias. An unknown value warns and keeps the default —
-    /// same fail-safe shape as `cursor_style`/`window_theme`.
+    /// Coverage blend mode: `"linear-corrected"` (default) or `"linear"`;
+    /// case-insensitive, `linear_corrected` accepted. Unknown values warn and
+    /// keep the default.
     pub(crate) fn text_blending_or_default(&self) -> aterm_render::TextBlending {
         match self.text_blending.as_deref().map(str::trim) {
             None => aterm_render::TextBlending::LinearCorrected,
@@ -5616,11 +4656,9 @@ impl Config {
         self.font_thicken.unwrap_or(false)
     }
 
-    /// The W9 variable-font requests: parsed `font_variation` entries with
-    /// `font_weight` appended LAST (later wins in the renderer's overlay, so
-    /// the discoverable key beats a conflicting `wght=` entry). Malformed
-    /// entries are collected into the returned warnings (config-notice
-    /// banner, like the other font keys) and skipped — never a hard failure.
+    /// Variable-font requests: parsed `font_variation` entries with
+    /// `font_weight` appended last (so it wins). Malformed entries are returned
+    /// as warnings and skipped.
     pub(crate) fn font_variation_requests(&self) -> (Vec<(u32, f32)>, Vec<String>) {
         let mut warns = Vec::new();
         let mut out: Vec<(u32, f32)> = self
@@ -5654,36 +4692,30 @@ impl Config {
         }
     }
 
-    /// EFFECTIVE stem gamma: the `stem_gamma` config key, else `1.0` (identity).
-    /// Clamped to the renderer's `0.30..=3.0`; a non-finite value falls back to
-    /// the identity.
+    /// Effective stem gamma: `stem_gamma`, else `1.0`, clamped to
+    /// `0.30..=3.0`; non-finite values mean `1.0`.
     pub(crate) fn stem_gamma_or_default(&self) -> f32 {
         aterm_render::clamp_stem_gamma(self.stem_gamma.unwrap_or(1.0))
     }
 
-    /// EFFECTIVE native grid-fitting mode: the `font_hinting` config key, else
-    /// `"full"`. The renderer's own parser resolves unrecognized spellings to the
-    /// default, so this stays a plain string hand-off (the setter is the single
-    /// source of spelling truth).
+    /// Effective grid-fitting mode: `font_hinting`, else `"full"`. The
+    /// renderer's parser handles unknown spellings.
     pub(crate) fn font_hinting_or_default(&self) -> String {
         self.font_hinting
             .clone()
             .unwrap_or_else(|| "full".to_string())
     }
 
-    /// EFFECTIVE Linux subpixel-RGB mode: the `font_subpixel` config key, else
-    /// `"off"`. The renderer's own parser resolves unrecognized spellings to the
-    /// default, so this stays a plain string hand-off — the `font_hinting`
-    /// discipline exactly.
+    /// Effective Linux subpixel mode: `font_subpixel`, else `"off"`. The
+    /// renderer's parser handles unknown spellings.
     pub(crate) fn font_subpixel_or_default(&self) -> String {
         self.font_subpixel
             .clone()
             .unwrap_or_else(|| "off".to_string())
     }
 
-    /// Line-height multiplier (W5a), default `1.0`, clamped to the sane
-    /// 0.8..=2.0 (a typo can't collapse or explode the grid; the renderer
-    /// additionally floors at 0.5). Non-finite values fall back to `1.0`.
+    /// Line-height multiplier, default `1.0`, clamped 0.8..=2.0 (the renderer
+    /// floors at 0.5). Non-finite values mean `1.0`.
     pub(crate) fn line_height_or_default(&self) -> f32 {
         match self.line_height {
             Some(v) if v.is_finite() => v.clamp(0.8, 2.0),
@@ -5732,26 +4764,21 @@ impl Config {
         }
     }
 
-    /// The explicit selected-text foreground as packed `0x00RRGGBB`, if
-    /// `selection_foreground` is set and parses. `None` → the renderer's WCAG
-    /// contrast-floor default.
+    /// Selected-text foreground as `0x00RRGGBB` when `selection_foreground`
+    /// parses; `None` uses the renderer's contrast-floor default.
     pub(crate) fn selection_foreground_u32(&self) -> Option<u32> {
         self.selection_foreground
             .as_deref()
             .and_then(parse_hex_color)
-            .map(|c| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b))
+            .map(rgb_u32)
     }
 
-    /// Whether the selection band dims while the window is unfocused (W5c).
-    /// Default OFF (byte-identical to the pre-W5 desktop, which never wired
-    /// the renderer's inactive-selection path).
+    /// Whether the selection band dims while unfocused. Default off.
     pub(crate) fn selection_inactive_or_default(&self) -> bool {
         self.selection_inactive.unwrap_or(false)
     }
 
-    /// Whether a split marks the pane that takes keystrokes. Default ON: the
-    /// caret is the only other witness, and an application that hides it takes
-    /// even that away.
+    /// Whether a split marks the focused pane. Default on.
     pub(crate) fn split_focus_mark_or_default(&self) -> bool {
         self.split_focus_mark.unwrap_or(true)
     }
@@ -5773,9 +4800,8 @@ impl Config {
         }
     }
 
-    /// M5 vibrancy material, default [`BackgroundMaterial::None`]. Parsed
-    /// case-insensitively; an unrecognized value warns once (like themes) and
-    /// falls back to `None`.
+    /// Window material, default [`BackgroundMaterial::None`]. Case-insensitive;
+    /// unknown values warn once and fall back to `None`.
     pub(crate) fn background_material_or_default(&self) -> BackgroundMaterial {
         match self.background_material.as_deref() {
             None => BackgroundMaterial::None,
@@ -5789,11 +4815,9 @@ impl Config {
         }
     }
 
-    /// All-edge interior window padding in LOGICAL px (`window_padding`),
-    /// default [`crate::PAD_LOGICAL_PX`] (12.0), clamped 0..=[`MAX_WINDOW_PADDING_PX`]
-    /// so a config typo can never push the grid off the glass. Non-finite
-    /// (`nan` is valid TOML) falls back to the default — NaN would poison the
-    /// `round(pad·scale)` derivation every window metric flows through.
+    /// Window padding in logical px (`window_padding`), default
+    /// [`crate::PAD_LOGICAL_PX`] (12.0), clamped 0..=[`MAX_WINDOW_PADDING_PX`].
+    /// Non-finite values use the default (NaN would poison every window metric).
     pub(crate) fn window_padding_or_default(&self) -> f32 {
         match self.window_padding {
             Some(v) if v.is_finite() => v.clamp(0.0, MAX_WINDOW_PADDING_PX),
@@ -5801,13 +4825,10 @@ impl Config {
         }
     }
 
-    /// TOP-edge padding override in logical px (`window_padding_top`), default
-    /// [`crate::PAD_TOP_LOGICAL_PX`] (2.0). Clamped to `0..=window_padding` —
-    /// the renderer's `set_pad_top` enforces `pad_top <= pad` in device px
-    /// (aterm-render), so the resolver keeps the LOGICAL value inside the same
-    /// domain and the two clamps can never disagree. The default is also capped
-    /// by the resolved base pad, so `window_padding = 1` alone yields a valid
-    /// 1/1 pair rather than a 2-over-1 top.
+    /// Top padding in logical px (`window_padding_top`), default
+    /// [`crate::PAD_TOP_LOGICAL_PX`] (2.0), clamped to `0..=window_padding` to
+    /// match the renderer's `set_pad_top` (`pad_top <= pad`). The default is
+    /// also capped by the resolved base pad.
     pub(crate) fn window_padding_top_or_default(&self) -> f32 {
         let pad = self.window_padding_or_default();
         match self.window_padding_top {
@@ -5816,14 +4837,10 @@ impl Config {
         }
     }
 
-    /// THE MOVE — the EFFECTIVE per-cell minimum contrast the renderer is handed
-    /// (M5 legibility guarantee). Whenever the window is translucent
-    /// (`background_opacity < 1.0`) the floor auto-engages at WCAG AA (4.5:1),
-    /// raising the user's configured `minimum_contrast` if it sits lower — glass
-    /// that cannot make text illegible (unlike iTerm2's blur / ghostty's
-    /// `background-blur`, which let text sink into the desktop). An opaque window
-    /// keeps EXACTLY the configured floor. PURE (config → f32): exhaustively
-    /// proven by `vibrancy_contrast_guarantee` (Tier-1) and model-checked by
+    /// Effective per-cell minimum contrast for the renderer: when the window is
+    /// translucent (`background_opacity < 1.0`) the floor is raised to at least
+    /// WCAG AA (4.5:1); an opaque window keeps the configured floor exactly.
+    /// Proven by `vibrancy_contrast_guarantee` (Tier-1) and
     /// `aterm_spec::derive::vibrancy_contrast_model` (Tier-0, `NeverIllegible`).
     pub(crate) fn effective_minimum_contrast(&self) -> f32 {
         let base = self.minimum_contrast_or_default();
@@ -5834,29 +4851,20 @@ impl Config {
         }
     }
 
-    /// Warn (like themes) when a configured `font_family` does not RESOLVE to a
-    /// font file — previously a misspelled family silently reduced to the
-    /// built-in candidates with zero output and `--validate-config`
-    /// false-greened (W5h). Returns the message so startup/reload can both
-    /// print it AND surface it in the config-notice banner. `family` is the
-    /// EFFECTIVE family (`--font` > config), matching what the
-    /// backend will actually try.
+    /// Warning when a configured `font_family` does not resolve to a font file,
+    /// for the startup/reload notice and `--validate-config`. `family` is the
+    /// effective family (`--font` > config).
     pub(crate) fn font_family_warning(family: Option<&str>) -> Option<String> {
         Self::font_family_admission(family).err()
     }
 
-    /// The admission VERDICT behind [`Self::font_family_warning`], with the
-    /// resolved path when it admits: `Ok(None)` for no family requested,
-    /// `Ok(Some(path))` for an admissible one (the exact file — or `display:`
-    /// name — the backend should build from, so the build does not resolve
-    /// the family a second time), `Err(warning)` otherwise.
+    /// Admission verdict behind [`Self::font_family_warning`]: `Ok(None)` for no
+    /// family, `Ok(Some(path))` with the exact file (or `display:` name) the
+    /// backend should build from, `Err(warning)` otherwise.
     ///
-    /// This is the ONE resolve of a configured family at startup, and it runs
-    /// on the backend worker: it walks the font directories and, for a family
-    /// whose files carry style suffixes (`JetBrainsMono-Regular.ttf`), reads
-    /// and parses `name` tables until a match — 5-50 ms warm, seconds cold.
-    /// The main thread used to run the same resolve 20 lines after spawning
-    /// the worker that was about to run it again, for a warning string.
+    /// The one startup resolve of a configured family; it runs on the backend
+    /// worker because it walks font directories and may parse `name` tables
+    /// (milliseconds warm, seconds cold).
     pub(crate) fn font_family_admission(family: Option<&str>) -> Result<Option<String>, String> {
         let Some(fam) = family.map(str::trim).filter(|s| !s.is_empty()) else {
             return Ok(None);
@@ -5870,16 +4878,10 @@ impl Config {
         }
     }
 
-    /// Warn (the `font_family_warning` twin) when a configured
-    /// `cursor_trail_style` is a spelling the engine does not recognize. The
-    /// value is not honoured — `resolve_trail_style` falls back to
-    /// [`crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE`] — so a typo'd `"phasr"`
-    /// draws the default trail, and this message is the only place the
-    /// substitution is stated. Checked against the
-    /// canonical option set + the documented alias table
-    /// ([`crate::prefs::cursor_trail_style_canonical`]) — the same source the
-    /// Settings picker resolves through. Returns the message so startup, reload,
-    /// AND `--validate-config` surface the identical diagnostic.
+    /// Warning when `cursor_trail_style` is an unrecognized spelling (it falls
+    /// back to [`crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE`]). Checked against
+    /// [`crate::prefs::cursor_trail_style_canonical`], the source the Settings
+    /// picker uses. Shared by startup, reload and `--validate-config`.
     pub(crate) fn cursor_trail_style_warning(&self, catalog: &TrailPackCatalog) -> Option<String> {
         let raw = self.cursor_trail_style.as_deref().map(str::trim)?;
         match resolve_trail_style(raw, catalog).issue {
@@ -5891,13 +4893,9 @@ impl Config {
                      effect is disabled; add its manifest to cursor_trail_packs = [\"…\"]"
                 ))
             }
-            // The vocabulary is JOINED from `CURSOR_TRAIL_STYLES`, which is the
-            // domain the picker offers; spelling it out here would let the
-            // sentence and the picker disagree about what this build accepts the
-            // moment a style joins the roster. The near miss leads the sentence
-            // because the in-window banner paints one line per notice and
-            // truncates at the terminal width — the recovery has to survive an
-            // 80-column window, the vocabulary is the part that can be cut.
+            // The vocabulary is joined from `CURSOR_TRAIL_STYLES` so it matches the
+            // picker. The near miss leads because the banner truncates one line
+            // per notice at the terminal width.
             Some(TrailStyleIssue::Unknown) => Some(format!(
                 "cursor_trail_style: unknown style {raw:?}{suggestion} (falling back to \
                  {default:?}; expected one of {options}, a documented alias like \
@@ -5914,19 +4912,14 @@ impl Config {
         }
     }
 
-    /// Whether to show the OPTIONAL floating top-right build/version pill. Default OFF:
-    /// the version now lives in the menu bar (the top-level `v<version>` menu, which
-    /// opens About), so the floating pill is an opt-in extra rather than the primary
-    /// surface. Enable with `show_build_badge = true` or the native Settings tab. See
-    /// [`crate::build_badge`].
+    /// Whether to show the floating top-right build/version pill. Default off
+    /// (the version lives in the menu bar). See [`crate::build_badge`].
     pub(crate) fn show_build_badge_or_default(&self) -> bool {
         self.show_build_badge.unwrap_or(false)
     }
 
-    /// Resolve the window-chrome appearance ([`WindowTheme`]) from config. The
-    /// DEFAULT when the key is absent is [`WindowTheme::Auto`] — follow the OS
-    /// effective appearance — so an unset config no longer forces dark chrome on a
-    /// light desktop. An unknown / malformed value warns and falls back to `Auto`.
+    /// Window-chrome appearance ([`WindowTheme`]); default [`WindowTheme::Auto`].
+    /// Unknown values warn and fall back to `Auto`.
     pub(crate) fn window_theme_or_default(&self) -> WindowTheme {
         match self.window_theme.as_deref() {
             None => WindowTheme::Auto,
@@ -5942,11 +4935,9 @@ impl Config {
         }
     }
 
-    /// Resolve the grid right-click gesture ([`RightClickGesture`]) from config
-    /// `right_click`. The DEFAULT when the key is absent is PER-PLATFORM
-    /// ([`RightClickGesture::PLATFORM_DEFAULT`]): `copy_paste` on Windows, `off`
-    /// elsewhere. An unknown / malformed value warns and falls back to that same
-    /// platform default (the `window_theme` fail-safe shape).
+    /// Grid right-click gesture ([`RightClickGesture`]) from `right_click`.
+    /// Default [`RightClickGesture::PLATFORM_DEFAULT`]; unknown values warn and
+    /// use it.
     pub(crate) fn right_click_or_default(&self) -> RightClickGesture {
         match self.right_click.as_deref() {
             None => RightClickGesture::PLATFORM_DEFAULT,
@@ -5962,18 +4953,12 @@ impl Config {
         }
     }
 
-    /// Resolve the tab-context-menu KEYBOARD chord policy ([`TabMenuChord`])
-    /// from config `tab_menu_chord`. The DEFAULT when the key is absent is
-    /// [`TabMenuChord::MenuKey`] — the one spelling no application can receive,
-    /// so an unedited config never takes terminfo `kf22` (Shift+F10) away from
-    /// the program in the terminal. An unknown / malformed value warns and falls
-    /// back to that default (the `right_click` fail-safe shape); falling back to
-    /// `On` instead would let a typo steal a key.
+    /// Tab-context-menu keyboard chord ([`TabMenuChord`]) from `tab_menu_chord`.
+    /// Default [`TabMenuChord::MenuKey`], which no application can receive, so
+    /// Shift+F10 (`kf22`) stays with the program. Unknown values warn and fall
+    /// back to the default, never to `On`.
     ///
-    /// Read only by the in-grid-strip chord arms (`on_key`'s and the convergence
-    /// seam's, Windows and Linux) and by this file's own tests, so on macOS it
-    /// is a live-but-uncalled resolver rather than a missing one — the config
-    /// key still parses and validates everywhere, exactly like `right_click`'s.
+    /// Read only by the in-grid strip chord arms (Windows, Linux) and tests.
     #[cfg(any(not(target_os = "macos"), test))]
     pub(crate) fn tab_menu_chord_or_default(&self) -> TabMenuChord {
         match self.tab_menu_chord.as_deref() {
@@ -5990,11 +4975,9 @@ impl Config {
         }
     }
 
-    /// Resolve the GPU-present colour-space tag ([`WindowColorspace`]) from config
-    /// `window_colorspace`. The DEFAULT when the key is absent is
-    /// [`WindowColorspace::Srgb`] — the colour-managed interpretation. An unknown /
-    /// malformed value warns and falls back to `Srgb` (the `window_theme`
-    /// fail-safe shape).
+    /// GPU-present colour-space tag ([`WindowColorspace`]) from
+    /// `window_colorspace`; default [`WindowColorspace::Srgb`]. Unknown values
+    /// warn and fall back to `Srgb`.
     pub(crate) fn window_colorspace_or_default(&self) -> WindowColorspace {
         match self.window_colorspace.as_deref() {
             None => WindowColorspace::Srgb,
@@ -6010,11 +4993,9 @@ impl Config {
         }
     }
 
-    /// C3: resolve the in-grid tab band's height policy ([`TabBandHeight`]) from
-    /// config `tab_band_height`. The DEFAULT when the key is absent is PER-PLATFORM
-    /// ([`TabBandHeight::PLATFORM_DEFAULT`]): `standard` on Windows and Linux,
-    /// `compact` elsewhere. An unknown / malformed value warns and falls back to
-    /// that same platform default (the `window_theme` fail-safe shape).
+    /// In-grid tab band height ([`TabBandHeight`]) from `tab_band_height`;
+    /// default [`TabBandHeight::PLATFORM_DEFAULT`]. Unknown values warn and use
+    /// it.
     pub(crate) fn tab_band_height_or_default(&self) -> TabBandHeight {
         match self.tab_band_height.as_deref() {
             None => TabBandHeight::PLATFORM_DEFAULT,
@@ -6031,12 +5012,10 @@ impl Config {
     }
 }
 
-/// The RENDERER-side typography/appearance knobs a config resolves to (W5):
-/// the single value-of-record the App caches, the startup seed and every
-/// hot-reload diff against. PURE (`from_config` + `diff`), so the
-/// key→renderer-call routing is unit-provable without a backend: each config
-/// key maps to EXACTLY ONE [`KnobChange`] variant, and each variant to exactly
-/// one renderer call (see `reload_config` / `rebuild_backend`).
+/// Renderer typography/appearance knobs resolved from config: the value the
+/// App caches, seeds at startup and diffs on reload. Pure (`from_config`,
+/// `diff`): each key maps to exactly one [`KnobChange`] variant and each
+/// variant to one renderer call (see `reload_config` / `rebuild_backend`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct RenderKnobs {
     /// `line_height` → `Backend::set_line_height` (cell GEOMETRY: re-grids).
@@ -6059,10 +5038,9 @@ pub(crate) struct RenderKnobs {
     /// `background_opacity` → `Backend::set_background_opacity` (present-time,
     /// M5). `1.0` = solid (byte-identical default).
     pub(crate) background_opacity: f32,
-    /// `background_material` (M5): resolved, validated and diffed before driving
-    /// `AppRt::window_set_vibrancy`. macOS GPU installs a behind-window effect only
-    /// while translucent; Windows GPU installs a DWM backdrop independently. CPU
-    /// and unsupported-platform paths diagnose the setting as inert.
+    /// `background_material`, applied via `AppRt::window_set_vibrancy`. macOS GPU
+    /// installs a behind-window effect only while translucent; Windows GPU
+    /// installs a DWM backdrop independently; other paths diagnose it as inert.
     pub(crate) background_material: BackgroundMaterial,
 }
 
@@ -6087,9 +5065,7 @@ impl RenderKnobs {
     pub(crate) fn from_config(cfg: &Config) -> Self {
         Self {
             line_height: cfg.line_height_or_default(),
-            // THE MOVE: the renderer is handed the EFFECTIVE floor — auto-raised
-            // to WCAG AA whenever the window is translucent (M5). An opaque
-            // window resolves to exactly the configured `minimum_contrast`.
+            // The effective floor: raised to WCAG AA while translucent.
             minimum_contrast: cfg.effective_minimum_contrast(),
             selection_fg: cfg.selection_foreground_u32(),
             selection_inactive: cfg.selection_inactive_or_default(),
@@ -6143,23 +5119,15 @@ impl RenderKnobs {
         out
     }
 }
-/// The App-owned renderer settings that BAKE INTO RASTERIZED COVERAGE or the
-/// cell box — the subset of [`crate::App::pin_backend_render_config_core`]'s
-/// list whose renderer setters drop the glyph cache when the value differs
-/// from the one the constructor started with: `set_text_shaping` (on an
-/// ambiguous-width change), `set_font_thicken`, `set_stem_gamma`,
-/// `set_font_hinting` (where the hint seam exists), `set_line_height` and
-/// `set_adjust_baseline`. Every other knob that path pins is blend-, blit- or
-/// present-time and keeps the cache.
+/// Renderer settings that bake into rasterized coverage or the cell box, whose
+/// setters drop the glyph cache on change: `set_text_shaping` (ambiguous
+/// width), `set_font_thicken`, `set_stem_gamma`, `set_font_hinting`,
+/// `set_line_height` and `set_adjust_baseline`.
 ///
-/// One struct, applied by ONE setter list (`Backend::pin_glyph_raster_knobs`),
-/// because two callers must agree on it: the backend worker pins these BEFORE
-/// its post-seal glyph warm, and the join re-pins them from the App's fields.
-/// Only when the worker pinned the same values is the join's re-pin the no-op
-/// it already is for a default config — otherwise the first setter that
-/// differs discards the warm, and the first frame rasterizes the prompt on the
-/// UI thread (the P36 mechanism, back for any `line_height`, `font_thicken`,
-/// `stem_gamma` or `adjust_baseline` in aterm.toml).
+/// Applied by one setter list (`Backend::pin_glyph_raster_knobs`) because the
+/// backend worker pins them before its glyph warm and the join re-pins them;
+/// if the values differ the warm is discarded and the first frame rasterizes
+/// on the UI thread.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct GlyphRasterKnobs {
     /// `ligatures` / `font_features` / `merged_ligatures` → `set_text_shaping`.
@@ -6177,11 +5145,9 @@ pub(crate) struct GlyphRasterKnobs {
 }
 
 impl GlyphRasterKnobs {
-    /// Resolve the knobs from a launch config with the same `*_or_default`
-    /// precedence the App's fields are seeded with (env alias > config key >
-    /// built-in default), so the worker's pin and the join's re-pin cannot
-    /// disagree. `main_entry` resolves this ONCE and hands the same value to
-    /// both.
+    /// Resolve the knobs with the same precedence the App's fields use (env
+    /// alias > config key > default). `main_entry` resolves once and hands the
+    /// value to both the worker and the join.
     pub(crate) fn from_config(cfg: &Config) -> Self {
         Self {
             text_shaping: cfg.text_shaping(),
@@ -6200,18 +5166,14 @@ impl Default for RenderKnobs {
     }
 }
 
-/// The RESOLVED per-style / fallback font config (W6) — file paths, not family
-/// names — the value-of-record the App caches, the startup seed and every
-/// hot-reload diff against (like [`RenderKnobs`]). PURE resolution
-/// ([`Self::from_config`]) so the key→path mapping is unit-testable; the one
-/// impure step (family → file via [`aterm_render::resolve_font_family`]) is the
-/// same resolver `font_family` uses. Applied to the backend by
+/// Resolved styled/fallback font config (file paths, not family names): the
+/// value the App caches, seeds and diffs on reload, like [`RenderKnobs`]. Family
+/// resolution uses [`aterm_render::resolve_font_family`]; applied by
 /// [`crate::apply_font_config_to_backend`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct FontConfig {
-    /// Resolved styled-face file paths `[bold, italic, bold-italic]`
-    /// (`font_family_bold` / `_italic` / `_bold_italic`). `None` = unset or
-    /// unresolvable (warned) — the renderer keeps discovery/synthetic.
+    /// Styled-face paths `[bold, italic, bold-italic]`. `None` means unset or
+    /// unresolvable (warned); the renderer keeps discovery/synthetic.
     pub(crate) styled_paths: [Option<String>; 3],
     /// `font_synthetic_style` (default `true`).
     pub(crate) synthetic_style: bool,
@@ -6237,10 +5199,8 @@ impl Default for FontConfig {
 }
 
 impl FontConfig {
-    /// Resolve the W6 font keys from a config. Returns the resolved paths plus
-    /// human warnings for entries that do not resolve to a font file (surfaced
-    /// like [`Config::font_family_warning`] — never a hard failure; the
-    /// unresolvable entry is skipped and everything else still applies).
+    /// Resolve the font keys into paths plus warnings for entries that do not
+    /// resolve (skipped, never a hard failure).
     pub(crate) fn from_config(cfg: &Config) -> (Self, Vec<String>) {
         let mut warns = Vec::new();
         let mut resolve = |key: &str, fam: Option<&str>| -> Option<String> {
@@ -6286,13 +5246,9 @@ impl FontConfig {
         )
     }
 
-    /// Preserve the last working live face for an AUTHORED entry which failed
-    /// resolution/admission in `from_config`.
-    ///
-    /// `None` normally means “unset; restore discovery”. For an authored key,
-    /// however, `None` means the new value was rejected. Treating those two cases
-    /// alike would let an oversized/FIFO/missing edit clobber a working styled,
-    /// symbol, or emoji face. Valid siblings still advance independently.
+    /// Keep the last working face for an authored entry that failed admission in
+    /// `from_config`. For an authored key `None` means rejected, not unset, so a
+    /// bad edit must not clobber a working face; valid siblings still advance.
     #[cfg(test)]
     pub(crate) fn preserve_rejected_from(&mut self, cfg: &Config, previous: &Self) {
         fn preserve(authored: Option<&str>, next: &mut Option<String>, old: &Option<String>) {
@@ -6342,27 +5298,15 @@ impl FontConfig {
     }
 }
 
-/// Deprecation notice (once per process) for the legacy env-only fallback-font
-/// knobs, now that the visible TOML keys exist (W6). The aliases keep working
-/// — they rank BELOW explicit config entries and ABOVE discovery (the
-/// renderer's proven `fallback_chain_order`) — this only nudges toward the
-/// discoverable keys.
-/// A titlebar band larger than this is a mid-transition artifact, never real
-/// chrome: plain titlebars are ~22–40 pt and unified-toolbar bands ~52–62 pt,
-/// while transition artifacts measure in the hundreds (screen-vs-window frame
-/// disagreement).
+/// A titlebar band larger than this is a mid-transition artifact: real bands
+/// are ~22–62 pt, artifacts measure in the hundreds.
 const TITLEBAR_BAND_SANITY_CAP_PTS: f64 = 120.0;
 
-/// Fail-closed acceptance for one AppKit titlebar-band sample (pure — see the
-/// call site's ACCEPTANCE note). Fullscreen FORCES 0 (the titlebar detaches;
-/// any other reading is a mid-transition artifact). A decorated windowed
-/// sample of `<= 0` or beyond [`TITLEBAR_BAND_SANITY_CAP_PTS`] keeps the
-/// previously accepted band — chrome'd windows always carry a real band, so
-/// those readings can only be transition artifacts, and committing one is
-/// what drew terminal row 0 under the toolbar chip (or starved fullscreen
-/// rows above a dead band). An UNDECORATED windowed sample of 0 is truth,
-/// not artifact, and is accepted — runtime decoration toggles must not pin a
-/// stale band.
+/// Fail-closed acceptance for one AppKit titlebar-band sample. Fullscreen forces
+/// 0. A decorated windowed sample `<= 0` or above
+/// [`TITLEBAR_BAND_SANITY_CAP_PTS`] is a transition artifact and keeps the
+/// previous band (committing it would misplace row 0). An undecorated windowed
+/// 0 is real and accepted.
 fn accept_titlebar_band_pts(
     measured_pts: f64,
     fullscreen: bool,
@@ -6381,29 +5325,20 @@ fn accept_titlebar_band_pts(
     measured_pts
 }
 
-/// Whether a titlebar-band sample is a plausible real band (positive, within
-/// the sanity cap) — the ONE predicate `accept_titlebar_band_pts`'s commit
-/// path and `titlebar_band_decision`'s memory update share, so "commits" and
-/// "becomes the memory" can never drift apart.
+/// Whether a titlebar-band sample is plausible (positive, within the cap);
+/// shared by the commit path and the memory update.
 fn titlebar_band_sane(pts: f64) -> bool {
     pts > 0.0 && pts <= TITLEBAR_BAND_SANITY_CAP_PTS
 }
 
-/// The full head decision for one titlebar-band sample:
+/// Titlebar head decision for one sample:
 /// `(measured, fullscreen, decorated, memory) -> (applied, new_memory)`.
 ///
-/// `applied` is [`accept_titlebar_band_pts`] with the last-good-windowed
-/// MEMORY as its fallback — NOT the currently applied band. The applied band
-/// is 0 for the whole of a fullscreen stay (forced, by design), so using it
-/// as the fallback would leave an exit-transition artifact sample nothing to
-/// restore but 0; the memory is what still remembers the real band across the
-/// stay (see the two-slot note on `WindowState::head_pts`).
-///
-/// `new_memory` advances ONLY when a sane decorated windowed sample commits —
-/// the acceptance success path. Everything else preserves it: fullscreen
-/// samples (the applied 0 is forced, not measured), undecorated samples (the
-/// band is legitimately gone, but the chrome may come back), and rejected
-/// artifacts (keeping them is the whole point).
+/// `applied` is [`accept_titlebar_band_pts`] with the last-good windowed memory
+/// as fallback, not the applied band (which is 0 throughout fullscreen); see
+/// `WindowState::head_pts`. `new_memory` advances only when a sane decorated
+/// windowed sample commits; fullscreen, undecorated and rejected samples keep
+/// it.
 pub(crate) fn titlebar_band_decision(
     measured_pts: f64,
     fullscreen: bool,
@@ -6456,13 +5391,8 @@ mod titlebar_band_acceptance_tests {
         }
     }
 
-    /// The defect this module's `prev = 55.0` cases silently assumed away:
-    /// `on_resize` used to feed the APPLIED band back as `prev_pts`, and the
-    /// applied band is forced to 0 for the whole of a fullscreen stay — so on
-    /// a bad exit sample the "keep the last good band" defense could only
-    /// ever keep 0. Driven through `titlebar_band_decision` (the exact caller
-    /// wiring; the AppKit measurement is the only thing faked), the two-slot
-    /// design must carry 55 across the stay and restore it on exit.
+    /// The memory slot carries the real band (55) across a fullscreen stay and
+    /// restores it when the exit sample is an artifact.
     #[test]
     fn band_memory_survives_a_fullscreen_stay_and_restores_on_exit_artifact() {
         // Windowed, decorated, sane 55 pt band: commits AND becomes memory.
@@ -6479,17 +5409,14 @@ mod titlebar_band_acceptance_tests {
         let (applied, memory) = titlebar_band_decision(0.0, true, true, memory);
         assert_eq!((applied, memory), (0.0, 55.0));
 
-        // Exit fullscreen with the classic artifact: decorated + windowed but
-        // the sample still reads 0.0. The defense must restore 55, not "keep"
-        // the fullscreen 0 that the old single-slot wiring fed it.
+        // Exit fullscreen with the classic artifact: decorated, windowed, 0.0.
+        // The band must restore to 55.
         let (applied, memory) = titlebar_band_decision(0.0, false, true, memory);
         assert_eq!((applied, memory), (55.0, 55.0));
     }
 
-    /// The memory slot advances ONLY on the acceptance success path — every
-    /// non-committing sample preserves it (rejected artifacts, fullscreen's
-    /// forced 0, and the undecorated truth-0, which applies but must not
-    /// poison the fallback for when the chrome returns).
+    /// The memory slot advances only on successful acceptance; artifacts,
+    /// fullscreen's forced 0 and the undecorated 0 preserve it.
     #[test]
     fn band_memory_advances_only_when_a_windowed_sample_commits() {
         // Windowed rejected artifacts: applied falls back to memory, memory holds.
@@ -6511,22 +5438,10 @@ mod titlebar_band_acceptance_tests {
     }
 }
 
-/// Deprecation notice (once per process) for the PRE-RENAME display-face
-/// spellings — the `game_font` key and the game-named ids (`minecraft`, …).
-///
-/// Both keep working, which is the whole point: a key or value that was correct
-/// when it was written must not become a config error later. But the user is
-/// told the new spelling, because the old one is the one they will keep copying
-/// out of old notes otherwise.
-///
-/// `mariokart` gets its own sentence. It is the one retired id with NO
-/// successor — its face shipped a `name` table still reading "Typeface © (your
-/// company)", so there was nothing to relicense and nothing to promote in its
-/// place. Silence would leave the user staring at their ordinary font with no
-/// idea why the setting stopped taking.
-///
-/// Reads the RAW config text, not the parsed struct, because `#[serde(alias)]`
-/// is exactly the machinery that erases which spelling was on disk.
+/// Once-per-process deprecation notice for the `game_font` key and game-named
+/// display-face ids (`minecraft`, …), which still work. `mariokart` has no
+/// successor and gets its own sentence. Reads the raw config text because
+/// `#[serde(alias)]` erases which spelling was used.
 fn warn_deprecated_display_font_spelling(source: &str, config: &Config) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -6549,10 +5464,9 @@ fn warn_deprecated_display_font_spelling(source: &str, config: &Config) {
     });
 }
 
-/// Each retired face id in `display_font`: a renamed one names its new id, and a
-/// deleted one says what draws in its place — the rest of the mix, or the primary
-/// font when nothing else is left. `--validate-config` prints these words too, so
-/// an accepted-but-retired id is not called valid in silence.
+/// Notices for each retired id in `display_font`: a renamed one names its new
+/// id, a deleted one says what draws instead. Also printed by
+/// `--validate-config`.
 pub(crate) fn display_font_notices(config: &Config) -> Vec<String> {
     let Some(raw) = config.display_font.as_deref() else {
         return Vec::new();
@@ -6581,13 +5495,9 @@ pub(crate) fn display_font_notices(config: &Config) -> Vec<String> {
         .collect()
 }
 
-/// M5 honest fallback (once per process): `background_opacity < 1.0` requests
-/// translucent glass. The GPU backend composites it for real (PostMultiplied
-/// swapchain over an `NSVisualEffectView`), but the CPU softbuffer surface is
-/// opaque with no non-opaque composite, so on the CPU backend a translucent value
-/// renders solid — warn rather than silently ignore the key. The M5 legibility
-/// guarantee still applies (the effective contrast floor rose regardless), so the
-/// solid fallback never hurts text.
+/// Once-per-process warning that `background_opacity < 1.0` renders solid on
+/// the CPU backend (the softbuffer surface is opaque). The raised contrast floor
+/// still applies.
 fn warn_background_opacity_unimplemented_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -6597,11 +5507,8 @@ fn warn_background_opacity_unimplemented_once() {
              renders solid (use the GPU backend for real vibrancy; the raised contrast \
              floor still applies)"
         );
-        // The stderr line above is invisible to any windowed launch (a
-        // Finder-launched .app, a Start-Menu launch — the same reason the
-        // message band exists at all), and this is a key the user deliberately
-        // set and can watch do nothing. Give it the band too (design R5), on
-        // the pre-App inbox: the first pin can run before `App` exists.
+        // Windowed launches never see stderr, so also queue a message-band
+        // notice on the pre-App inbox (the first pin can run before `App`).
         crate::message_inbox::queue_message(crate::message_reporters::cpu_renderer_no_effect(
             "background_opacity",
             "it has no translucent present path, so the window stays solid; enable the GPU \
@@ -6610,12 +5517,9 @@ fn warn_background_opacity_unimplemented_once() {
     });
 }
 
-/// M5 honest fallback (once per process): a non-`none` `background_material`
-/// selects a window-level `NSVisualEffectView` blur, driven on the GPU backend
-/// (via `AppRt::window_set_vibrancy`). The CPU softbuffer surface cannot composite
-/// over such a view, so on the CPU backend the material has no consumer — warn
-/// once (a valid value parses cleanly, so it would otherwise be a completely
-/// silent no-op) rather than let the user believe the blur engaged.
+/// Once-per-process warning that a non-`none` `background_material` has no
+/// effect on the CPU backend, which cannot composite over an
+/// `NSVisualEffectView`.
 fn warn_background_material_unimplemented_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -6634,10 +5538,9 @@ fn warn_background_material_unimplemented_once() {
     });
 }
 
-/// Window-CHROME appearance, distinct from the terminal-body color scheme.
-/// Resolved from config `window_theme` via [`Config::window_theme_or_default`] and
-/// applied through the cross-platform [`crate::platform::AppRt::window_set_appearance`]
-/// seam (native AppKit/DWM chrome or winit's system-decoration theme).
+/// Window-chrome appearance, distinct from the terminal color scheme. Resolved
+/// via [`Config::window_theme_or_default`] and applied through
+/// [`crate::platform::AppRt::window_set_appearance`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum WindowTheme {
     /// Follow the OS light/dark setting, so chrome tracks live appearance switches.
@@ -6663,13 +5566,10 @@ impl WindowTheme {
     }
 }
 
-/// What a RIGHT press in the terminal grid does when no app is tracking the
-/// mouse. Resolved from config `right_click` via
-/// [`Config::right_click_or_default`], consumed by the right-button pre-dispatch
-/// arm in `app_mouse::on_mouse_input`. Deliberately NOT an `Option<bool>`: the
-/// gesture is a semantics choice (section-4 decision #2 — paste vs context menu
-/// vs both), so the key is an open enum a future `"menu"` variant can join
-/// without a config break.
+/// What a right press in the grid does when no app tracks the mouse. Resolved
+/// via [`Config::right_click_or_default`], consumed in
+/// `app_mouse::on_mouse_input`. An enum so further gestures can join without a
+/// config break.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightClickGesture {
     /// The conhost / Windows Terminal convention: copy the selection if one
@@ -6681,12 +5581,10 @@ pub(crate) enum RightClickGesture {
 }
 
 impl RightClickGesture {
-    /// The per-platform default when the key is absent: `CopyPaste` on Windows
-    /// (conhost QuickEdit and Windows Terminal both ship it — a Windows user's
-    /// hand expects the gesture), `Off` elsewhere (macOS right-click culturally
-    /// means "context menu", and Linux already pastes on MIDDLE click). A
-    /// `cfg!` const, not two `#[cfg]` items, so the non-Windows arm stays
-    /// type-checked on every platform build.
+    /// Default when the key is absent: `CopyPaste` on Windows (conhost and
+    /// Windows Terminal convention), `Off` elsewhere (macOS right-click is the
+    /// context menu, Linux pastes on middle click). A `cfg!` const so the
+    /// non-Windows arm stays type-checked on every platform build.
     pub(crate) const PLATFORM_DEFAULT: Self = if cfg!(windows) {
         Self::CopyPaste
     } else {
@@ -6705,26 +5603,16 @@ impl RightClickGesture {
     }
 }
 
-/// Which KEYBOARD spellings of "show this tab's context menu" aterm CLAIMS.
-/// Resolved from config `tab_menu_chord` via
-/// [`Config::tab_menu_chord_or_default`], consumed by `app_input::tab_menu_chord`
-/// on both the winit and the control-seam route.
+/// Which keyboard spellings of "show this tab's context menu" aterm claims.
+/// Resolved via [`Config::tab_menu_chord_or_default`], consumed by
+/// `app_input::tab_menu_chord` on both the winit and control-seam routes.
 ///
-/// An open enum rather than an `Option<bool>` for the same reason
-/// [`RightClickGesture`] is: the interesting answer is not on/off but WHICH of
-/// the two spellings a user wants to keep, because their costs differ. The Menu
-/// key reaches an application ONLY under a kitty enhancement (and that case is
-/// already deferred unconditionally), so claiming it is nearly free; Shift+F10
-/// is a real legacy-encodable chord (`ESC[21;2~` — terminfo `kf22`, xterm's
-/// F22, since it numbers Shift+F1..F12 as F13..F24) that claiming genuinely
-/// takes away. That asymmetry is why the DEFAULT is [`Self::MenuKey`]: the
-/// terminal contract — a key an application receives by terminfo is the
-/// application's — outranks the second Windows spelling, which stays one
-/// config line away.
+/// The default is [`Self::MenuKey`]: the Menu key reaches an application only
+/// under a kitty enhancement (already deferred), while Shift+F10 is terminfo
+/// `kf22` (`ESC[21;2~`), which programs receive and bind.
 ///
-/// Only the Windows-and-Linux chord arms (and the tests) read it, so the type is
-/// gated to them; the `tab_menu_chord` key itself is a plain string that parses
-/// on every platform.
+/// Gated to the Windows/Linux chord arms and tests; the config key parses
+/// everywhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(not(target_os = "macos"), test))]
 pub(crate) enum TabMenuChord {
@@ -6766,22 +5654,14 @@ impl TabMenuChord {
     }
 }
 
-/// C3 — how tall the in-grid tab band is. Resolved from config `tab_band_height`
-/// via [`Config::tab_band_height_or_default`], consumed ONLY by the Windows
-/// synthetic-head derivation (`App::synthetic_strip_head_px`).
-///
-/// WHY AN ENUM AND NOT A PIXEL COUNT: the band is not one number the user should
-/// have to compute. Its height is `pad_top + head + strip_rows·cell_h`, and two of
-/// those three terms move with the font and the DPI. A named target ("as tall as a
-/// native tab") is the thing a person actually wants; the residue is arithmetic.
-/// A future `"tall"` (the 40 px Fluent touch target) joins without a config break.
+/// In-grid tab band height. Resolved via [`Config::tab_band_height_or_default`],
+/// consumed only by `App::synthetic_strip_head_px`. A named target rather than a
+/// pixel count because the band is `pad_top + head + strip_rows·cell_h` and two
+/// terms move with font and DPI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TabBandHeight {
-    /// The pre-C3 height: no synthetic head at all, so the band is exactly the top
-    /// pad plus the strip's cell rows — 21 px at the Windows defaults, 96 dpi
-    /// (2 px top pad + one 19 px cell row at FONT_PX 16), as measured, not estimated.
-    /// The default off Windows, and the escape hatch for an owner who wants the
-    /// tightest possible chrome.
+    /// No synthetic head: the band is the top pad plus the strip's cell rows
+    /// (21 px at Windows defaults, 96 dpi). The default off Windows and Linux.
     Compact,
     /// Size the WHOLE band to [`TAB_BAND_STANDARD_LOGICAL_PX`] logical px — a real
     /// WinUI tab — by reserving the difference as a synthetic chrome head.
@@ -6789,16 +5669,11 @@ pub(crate) enum TabBandHeight {
 }
 
 impl TabBandHeight {
-    /// The per-platform default when the key is absent: `Standard` on Windows (the
-    /// in-grid strip is the window's ONLY tab chrome there, and a 23 px band next
-    /// to a 32 px caption reads as a squashed toolbar) AND on Linux (same
-    /// only-chrome premise, and the pixel band that designs the Linux strip —
-    /// [`crate::tab_bar::pixel_band`] — is drawn for the full
-    /// [`TAB_BAND_STANDARD_LOGICAL_PX`] canvas: cards optically centred in a
-    /// native-height bar, which one 18-px cell row cannot carry). `Compact` on
-    /// macOS, which carries tabs in the native toolbar and never paints this band
-    /// at all. A `cfg!` const, not two `#[cfg]` items, so both arms stay
-    /// type-checked everywhere.
+    /// Default when the key is absent: `Standard` on Windows and Linux, where the
+    /// in-grid strip is the only tab chrome (and the Linux pixel band,
+    /// [`crate::tab_bar::pixel_band`], is drawn for the full
+    /// [`TAB_BAND_STANDARD_LOGICAL_PX`] canvas); `Compact` on macOS, which never
+    /// paints this band. A `cfg!` const so both arms stay type-checked.
     pub(crate) const PLATFORM_DEFAULT: Self = if cfg!(any(windows, target_os = "linux")) {
         Self::Standard
     } else {
@@ -6816,9 +5691,8 @@ impl TabBandHeight {
         }
     }
 
-    /// The band height this policy targets, in LOGICAL px (1/96 in on Windows).
-    /// `0.0` for [`Self::Compact`] — which makes the whole synthetic-head law
-    /// collapse to `head = 0`, i.e. the byte-identical pre-C3 geometry.
+    /// Target band height in logical px (1/96 in on Windows); `0.0` for
+    /// [`Self::Compact`], which makes the synthetic head 0.
     pub(crate) fn target_logical_px(self) -> f32 {
         match self {
             Self::Compact => 0.0,
@@ -6827,40 +5701,29 @@ impl TabBandHeight {
     }
 }
 
-/// The `"standard"` band target in LOGICAL px, per platform's own chrome idiom.
-/// WINDOWS: 32 is the Win11/WinUI tab strip height (Windows Terminal's own tab
-/// row measures 32-34 px at 100%), and it is also what the caption next to it is
-/// — so the two read as one chrome block rather than a full-height title bar
-/// over a squashed toolbar. LINUX: 36 is the libadwaita `AdwTabBar` content
-/// height (GNOME Console/Text Editor tab rows measure 34-38 px at 100%), the
-/// bar the pixel band's card design is drawn against. A `cfg!` const so both
-/// arms stay type-checked everywhere; only the platform that reads the value
-/// through [`TabBandHeight::Standard`] ever feels it.
+/// The `"standard"` band target in logical px: 32 on Windows (the WinUI tab
+/// strip and caption height), 36 on Linux (libadwaita `AdwTabBar`, the height
+/// the pixel band's cards are drawn against). A `cfg!` const so both arms stay
+/// type-checked.
 pub(crate) const TAB_BAND_STANDARD_LOGICAL_PX: f32 = if cfg!(target_os = "linux") {
     36.0
 } else {
     32.0
 };
 
-/// Sanity cap on the SYNTHETIC head, in device px, as a multiple of the cell
-/// height: a pathological config (huge `tab_band_height` target against a tiny
-/// font) must never be able to push the grid down by more than the band could
-/// plausibly need. Distinct from [`TITLEBAR_BAND_SANITY_CAP_PTS`], which guards a
-/// MEASURED AppKit value; this one guards arithmetic we control, so it only has to
-/// be a backstop.
+/// Backstop on the synthetic head, in multiples of the cell height, so a
+/// pathological config cannot push the grid far down. Unlike
+/// [`TITLEBAR_BAND_SANITY_CAP_PTS`] it guards our own arithmetic.
 const SYNTHETIC_BAND_HEAD_CELL_CAP: usize = 4;
 
-/// THE C3 LAW, pure: the synthetic chrome-head band in DEVICE px for a strip of
-/// `strip_rows` rows of `cell_h` px sitting under `pad_top_px` of top padding, when
-/// the whole band should measure `target_logical` logical px at `scale`.
+/// Synthetic chrome-head band in device px for `strip_rows` rows of `cell_h` px
+/// under `pad_top_px`, when the whole band should measure `target_logical`
+/// logical px at `scale`.
 ///
-/// `head = clamp(round(target·scale) − pad_top − strip_rows·cell_h)`: the band the
-/// viewer sees is `head + pad_top + strip_rows·cell_h`, so this is simply "reserve
-/// the remainder". It is deliberately a SUBTRACTION rather than a fixed additive
-/// band: at a large font (or `tab_strip_rows = 2`) the cell rows already exceed the
-/// target, the remainder is zero, and the band stops growing instead of stacking a
-/// constant on top of an already-tall row. Every degenerate input (strip off, zero
-/// target, non-finite scale) returns 0 — the byte-identical pre-C3 geometry.
+/// `head = clamp(round(target·scale) − pad_top − strip_rows·cell_h)`: it
+/// reserves the remainder, so at a large font the head goes to zero rather
+/// than stacking on a tall row. Degenerate input (strip off, zero target,
+/// non-finite scale) returns 0.
 pub(crate) fn synthetic_band_head_px(
     target_logical: f32,
     pad_top_px: usize,
@@ -6868,10 +5731,8 @@ pub(crate) fn synthetic_band_head_px(
     cell_h: usize,
     scale: f64,
 ) -> usize {
-    // NOT `target_logical <= 0.0`: that is FALSE for NaN, and this guard must
-    // send NaN down the degenerate path the doc comment above promises. The
-    // `partial_cmp` form says the same thing as the negated `>` it replaces —
-    // proceed ONLY on a definite Greater — while satisfying
+    // Proceed only on a definite Greater so NaN takes the degenerate path
+    // (`target_logical <= 0.0` is false for NaN); this form also satisfies
     // `clippy::neg_cmp_op_on_partial_ord`.
     let target_is_positive = matches!(
         target_logical.partial_cmp(&0.0),
@@ -6893,21 +5754,18 @@ pub(crate) fn synthetic_band_head_px(
     head.min(cell_h.saturating_mul(SYNTHETIC_BAND_HEAD_CELL_CAP))
 }
 
-/// GPU-present colour-space TAG for the window's CAMetalLayer (M3 phase A),
-/// resolved from config `window_colorspace` via
-/// [`Config::window_colorspace_or_default`] and applied at surface attach (and on
-/// hot reload) through [`crate::platform::AppRt::window_set_surface_colorspace`].
-/// The tag changes how ColorSync INTERPRETS the presented bytes, never the bytes
-/// themselves — the readback/introspection parity path is untouched by
-/// construction (and pinned by the parity suites).
+/// Colour-space tag for the window's CAMetalLayer, resolved via
+/// [`Config::window_colorspace_or_default`] and applied at surface attach and
+/// on reload through [`crate::platform::AppRt::window_set_surface_colorspace`].
+/// The tag changes how ColorSync interprets the bytes, never the bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum WindowColorspace {
     /// Tag the layer sRGB (the default): theme colours render as authored;
     /// ColorSync performs the one honest sRGB→panel mapping.
     #[default]
     Srgb,
-    /// Tag the layer Display-P3: the sRGB bytes are read as P3 coordinates —
-    /// the legacy untagged behaviour on wide-gamut panels (stretched/saturated).
+    /// Tag the layer Display-P3: sRGB bytes are read as P3 coordinates (the
+    /// untagged, oversaturated look on wide-gamut panels).
     DisplayP3,
 }
 
@@ -6924,22 +5782,17 @@ impl WindowColorspace {
     }
 }
 
-/// Upper clamp on `window_padding` (logical px): generous breathing room is
-/// allowed, but past this the pad starts eating whole rows/columns on small
-/// windows — the `tab_strip_rows` "can't starve the terminal" posture.
+/// Upper clamp on `window_padding` (logical px); beyond it the pad eats whole
+/// rows or columns on small windows.
 pub(crate) const MAX_WINDOW_PADDING_PX: f32 = 64.0;
 
-/// The WCAG-AA per-cell contrast floor (4.5:1) the M5 legibility guarantee
-/// auto-engages whenever the window is translucent. The twin of the `Floor`
-/// const in `aterm_spec::derive::vibrancy_contrast_model`.
+/// WCAG AA contrast floor (4.5:1) applied while the window is translucent; the
+/// twin of `Floor` in `aterm_spec::derive::vibrancy_contrast_model`.
 pub(crate) const VIBRANCY_CONTRAST_FLOOR: f32 = 4.5;
 
-/// M5 true vibrancy: the macOS `NSVisualEffectView` MATERIAL blended behind the
-/// translucent window background, resolved from config `background_material` via
-/// [`Config::background_material_or_default`]. Only meaningful when
-/// `background_opacity < 1.0` on the GPU backend; `None` installs no vibrancy
-/// view (and is the byte-identical default). The variants mirror AppKit's
-/// `NSVisualEffectView.Material` cases the terminal exposes.
+/// macOS `NSVisualEffectView` material behind a translucent window, resolved
+/// via [`Config::background_material_or_default`]. Meaningful only with
+/// `background_opacity < 1.0` on the GPU backend; `None` installs no view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum BackgroundMaterial {
     /// No vibrancy view — the background is whatever `background_opacity`
@@ -6969,19 +5822,15 @@ impl BackgroundMaterial {
     }
 }
 
-/// Content fingerprints of the active files the config references BY PATH: the
-/// `sparkle_words.lexicon` file and `sparkle_words.toy_packs` manifests (the
-/// word-decoration feed) and the `cursor_trail_packs` manifests (the Trail Pack
-/// registry feed). The APPLIED configuration includes these files' CONTENT, yet
-/// `Config` equality compares only the path strings — so the reload dedupe must
-/// compare fingerprints too, or a feed-only edit (the config watcher re-posts a
-/// byte-identical `aterm.toml` observation when a file it names changes —
-/// `config_watcher.rs`, docs/TOY_PACKS.md, docs/sparkle-words-design.md) would
-/// silently stop re-reading them. An explicitly disabled Sparkle table has no active consumer and
-/// therefore performs no path I/O; re-enabling changes the table itself and
-/// prepares current bytes. Split in two so the consumers reset precisely: the deco feed
-/// warrants a per-window `word_decos.hard_reset()`, the trail feed only a
-/// registry rebuild (cursor glow — never a decoration reset).
+/// Content fingerprints of the active files the config references by path: the
+/// `sparkle_words.lexicon` file and `sparkle_words.toy_packs` manifests (deco
+/// feed) and the `cursor_trail_packs` manifests (trail feed). `Config`
+/// equality compares only path strings, so reload dedupe also compares these;
+/// otherwise a feed-only edit (the watcher re-posts an identical `aterm.toml`
+/// observation, `config_watcher.rs`) would be ignored. A disabled Sparkle table
+/// does no path I/O. Split so consumers reset precisely: the deco feed triggers
+/// a per-window word-engine `hard_reset()`, the trail feed only a registry
+/// rebuild.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct PathFeedFps {
     /// Lexicon + toy-pack content: feeds the compiled lexicon the per-window
@@ -6991,15 +5840,11 @@ pub(crate) struct PathFeedFps {
     pub(crate) trail: u64,
 }
 
-/// Whether a reload must HARD-RESET the per-window word decorations: the keys
-/// that feed them changed — the `[sparkle_words]` table, the theme its palette
-/// derives from, or (the path-referenced blindspot) the CONTENT of the
-/// lexicon/toy-pack files that table names by path. Config-struct equality alone
-/// cannot see the last one: a lexicon-FILE edit plus an unrelated config edit
-/// parses `sparkle_words` equal while the compiled lexicon is about to change —
-/// without the fingerprint term the App-level lexicon would rebuild but every
-/// window would keep showing decorations from the OLD lexicon on a byte-idle
-/// grid (the per-window rescan is damage-epoch-driven, never lexicon-driven).
+/// Whether a reload must hard-reset per-window word decorations: the
+/// `[sparkle_words]` table, its theme, or the content of its path-referenced
+/// lexicon/toy-pack files changed. The fingerprint term catches file edits that
+/// leave `sparkle_words` equal; the per-window rescan is damage-driven, so
+/// without it windows would keep old-lexicon decorations.
 fn deco_feed_changed(old: &Config, new: &Config, fresh_deco_fp: u64, applied_deco_fp: u64) -> bool {
     old.sparkle_words != new.sparkle_words
         || old.theme != new.theme
@@ -7047,23 +5892,15 @@ fn read_bounded_kitty_png(path: &std::path::Path) -> Result<Vec<u8>, String> {
 }
 
 fn stable_asset_fingerprint(tag: u8, source: &[u8], w: u16, h: u16, rgba: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    let mut fold = |bytes: &[u8]| {
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
-    };
-    fold(&[tag]);
-    fold(&(source.len() as u64).to_le_bytes());
-    fold(source);
-    fold(&w.to_le_bytes());
-    fold(&h.to_le_bytes());
-    fold(&(rgba.len() as u64).to_le_bytes());
-    fold(rgba);
-    hash | 1
+    let mut hash = aterm_hash::Fnv1a64::new();
+    hash.write_u8(tag);
+    hash.write(&(source.len() as u64).to_le_bytes());
+    hash.write(source);
+    hash.write(&w.to_le_bytes());
+    hash.write(&h.to_le_bytes());
+    hash.write(&(rgba.len() as u64).to_le_bytes());
+    hash.write(rgba);
+    hash.finish() | 1
 }
 
 fn resolve_kitty_sprite_asset(raw: Option<&str>) -> KittySpriteAsset {
@@ -7116,16 +5953,12 @@ fn invalid_wallpaper(source_id: &str, reason: impl AsRef<str>) -> WallpaperAsset
     }
 }
 
-/// Decode the configured wallpaper's bytes to straight sRGB RGBA8: PNG through
-/// the shared hardened decoder (wallpaper dimension budget), and every other
-/// format (JPEG/HEIC/TIFF/GIF, …) through the system `NSBitmapImageRep` lane on
-/// macOS — the decoded rep is converted to sRGB and re-encoded as PNG so Rust
-/// reads a standardized straight-RGBA channel order (the window-capture
-/// pattern), never the rep's implementation-defined layout.
+/// Decode wallpaper bytes to straight sRGB RGBA8: PNG through the shared
+/// hardened decoder, other formats through `NSBitmapImageRep` on macOS,
+/// converted to sRGB and re-encoded as PNG so Rust reads a standard straight
+/// RGBA layout.
 fn decode_wallpaper_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
-    if let Some(decoded) =
-        aterm_render::decode_png_rgba8_bounded(bytes, MAX_WALLPAPER_SOURCE_DIMENSION as u32)
-    {
+    if let Some(decoded) = aterm_png::decode_rgba8(bytes, MAX_WALLPAPER_SOURCE_DIMENSION as u32) {
         return Ok(decoded);
     }
     #[cfg(target_os = "macos")]
@@ -7157,12 +5990,10 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
     const NS_COLOR_RENDERING_INTENT_PERCEPTUAL: isize = 3;
 
     autoreleasepool(|_| {
-        // SAFETY: pure raster work from immutable bytes; none of these classes
-        // is main-thread-bound (no view or window is involved).
-        // `+dataWithBytes:length:` is `-(id)(const void *, NSUInteger)` and
-        // COPIES; `+imageRepWithData:` is `-(id)(NSData *)` and returns an
-        // AUTORELEASED rep, alive for this pool; `-pixelsWide`/`-pixelsHigh`
-        // are `-(NSInteger)`.
+        // SAFETY: raster work on immutable bytes; no class here is
+        // main-thread-bound. `+dataWithBytes:length:` copies,
+        // `+imageRepWithData:` returns an autoreleased rep alive for this pool,
+        // and `-pixelsWide`/`-pixelsHigh` return `NSInteger`.
         unsafe {
             let data_with: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, usize) -> Id =
                 aterm_objc::msg();
@@ -7194,12 +6025,10 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
                     "decoded image must be 1..={MAX_WALLPAPER_SOURCE_DIMENSION} pixels per side"
                 ));
             }
-            // Convert the pixels (not merely retag) to the renderer's canonical
-            // sRGB before Rust reads them — the window-capture rule.
-            // `+sRGBColorSpace` is `-(id)`, an immortal shared space;
-            // `-bitmapImageRepByConvertingToColorSpace:renderingIntent:` is
-            // `-(id)(NSColorSpace *, NSColorRenderingIntent)` where the intent
-            // is an `NSInteger`.
+            // Convert (not retag) the pixels to sRGB before Rust reads them.
+            // `+sRGBColorSpace` is an immortal shared space;
+            // `-bitmapImageRepByConvertingToColorSpace:renderingIntent:` takes
+            // an `NSInteger` intent.
             let srgb = appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace));
             if srgb.is_null() {
                 return Err("could not convert the image to sRGB".to_string());
@@ -7214,12 +6043,9 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
             if rep.is_null() {
                 return Err("could not convert the image to sRGB".to_string());
             }
-            // PNG standardizes the rep's implementation-defined channel order
-            // and premultiplication into straight RGBA before Rust reads it.
-            // `-representationUsingType:properties:` is
-            // `-(NSData *)(NSBitmapImageFileType, NSDictionary *)`; an EMPTY
-            // properties dictionary is `+dictionary`, which is nil-free and
-            // autoreleased.
+            // PNG normalizes channel order and premultiplication to straight
+            // RGBA. `-representationUsingType:properties:` returns `NSData *`;
+            // the empty properties dictionary is an autoreleased `+dictionary`.
             let properties = appkit::send_id(class(c"NSDictionary").as_id(), sel!(dictionary));
             let representation: unsafe extern "C-unwind" fn(Id, Sel, usize, Id) -> Id =
                 aterm_objc::msg();
@@ -7232,9 +6058,8 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
             if png.is_null() {
                 return Err("could not re-encode the decoded image".to_string());
             }
-            // `-length` is `-(NSUInteger)` and `-getBytes:length:` is
-            // `-(void)(void *, NSUInteger)`, a BOUNDED copy into a destination
-            // the caller owns for the call.
+            // `-length` returns `NSUInteger`; `-getBytes:length:` is a bounded
+            // copy into a caller-owned buffer.
             let png_len = appkit::send_usize(png, sel!(length));
             let mut png_bytes = vec![0_u8; png_len];
             if png_len != 0 {
@@ -7247,33 +6072,22 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
                     png_len,
                 );
             }
-            aterm_render::decode_png_rgba8_bounded(
-                &png_bytes,
-                MAX_WALLPAPER_SOURCE_DIMENSION as u32,
-            )
-            .ok_or_else(|| "could not read the decoded image pixels".to_string())
+            aterm_png::decode_rgba8(&png_bytes, MAX_WALLPAPER_SOURCE_DIMENSION as u32)
+                .ok_or_else(|| "could not read the decoded image pixels".to_string())
         }
     })
 }
 
-/// The AppKit wallpaper decoder, driven on REAL bytes.
-///
-/// `decode_wallpaper_appkit` is the whole reason a non-PNG wallpaper works on
-/// macOS at all, and the port rewrote every one of its eleven sends. Nothing in
-/// the suite reached it before — it decoded, and if it had started returning
-/// transposed or channel-swapped pixels the only detector would have been a
-/// user's desktop. So: hand a hand-written 24-bit BMP (a format the pure-Rust
-/// path CANNOT decode, so this can only be AppKit) to the real function and
-/// check the geometry and the channel order that come back.
+/// The AppKit wallpaper decoder on real bytes: a 24-bit BMP (which only the
+/// AppKit path can decode) must come back with the right geometry and channel
+/// order.
 #[cfg(all(test, target_os = "macos"))]
 mod appkit_wallpaper_tests {
     use super::decode_wallpaper_appkit;
 
-    /// A 2x2 24-bit BMP: red, green on the top row; blue, white below.
-    ///
-    /// BMP stores rows BOTTOM-UP and pixels as B,G,R, with each row padded to a
-    /// 4-byte boundary — so this literal also pins that the decoder is not
-    /// merely echoing our own bytes back.
+    /// A 2x2 24-bit BMP: red, green on the top row; blue, white below. BMP
+    /// stores rows bottom-up as B,G,R with 4-byte row padding, so the decoder
+    /// cannot just echo the bytes.
     fn two_by_two_bmp() -> Vec<u8> {
         let mut v = Vec::new();
         // BITMAPFILEHEADER: "BM", size, reserved, pixel-data offset.
@@ -7366,9 +6180,8 @@ pub(crate) fn resolve_wallpaper_asset(raw: Option<&str>) -> WallpaperAsset {
     if w == 0 || h == 0 || rgba.len() != w.saturating_mul(h).saturating_mul(4) {
         return invalid_wallpaper(&source_id, "decoded image has inconsistent dimensions");
     }
-    // Bound resident memory: downscale (linear-light, aspect-preserving) so
-    // neither side exceeds the keep budget. Windows are cover-scaled FROM this,
-    // and the budget exceeds any frame, so no visible quality is lost.
+    // Downscale (linear-light, aspect-preserving) to the keep budget; windows
+    // cover-scale from this, and the budget exceeds any frame.
     let longest = w.max(h);
     if longest > MAX_WALLPAPER_KEEP_DIMENSION {
         let dw = (w * MAX_WALLPAPER_KEEP_DIMENSION / longest).max(1);
@@ -7395,11 +6208,9 @@ pub(crate) fn resolve_wallpaper_asset(raw: Option<&str>) -> WallpaperAsset {
     }
 }
 
-/// Escape `w` as a TOML basic string (including surrounding quotes). Escapes
-/// `\`/`"` AND control characters — a raw newline/tab/etc. is illegal in a TOML
-/// basic string, so without this a single malformed `extra_words` entry would
-/// make the WHOLE generated override document fail to parse and silently drop
-/// every custom word (profanity/feline/emphasis), not just the offending one.
+/// Escape `w` as a TOML basic string (with quotes), including control
+/// characters; one bad `extra_words` entry would otherwise break the whole
+/// override document.
 fn toml_basic_string(w: &str) -> String {
     let mut s = String::with_capacity(w.len() + 2);
     s.push('"');
@@ -7450,10 +6261,9 @@ pub(crate) fn parse_hex_color(s: &str) -> Option<Rgb> {
 }
 
 impl Config {
-    /// Build the engine `TerminalConfig` deltas this config implies, or `None`
-    /// when nothing engine-side is set (so the GUI skips `apply_config`).
-    /// [`Self::terminal_config_for`] at the default (Dark) appearance. Test-only: the
-    /// runtime always resolves for the live OS appearance via the `_for` variant.
+    /// Engine `TerminalConfig` deltas this config implies, or `None` when
+    /// nothing engine-side is set; [`Self::terminal_config_for`] at the default
+    /// (Dark) appearance. Test-only.
     #[cfg(test)]
     pub(crate) fn terminal_config(&self) -> Option<aterm_core::config::TerminalConfig> {
         self.terminal_config_for(aterm_types::Appearance::Dark)
@@ -7486,10 +6296,9 @@ impl Config {
         if self.cursor_style.is_some() || self.cursor_blink.is_some() {
             let blink = self.cursor_blink.unwrap_or(true);
             let cursor_style = self.cursor_style.as_deref().unwrap_or("block").trim();
-            // The "_" underline OPTION is retired (owner: keep block + "|").
-            // Programs may still request underline via DECSCUSR — that is
-            // terminal protocol, not user configuration; a config asking for
-            // it falls back to the bar with a one-line note.
+            // Underline is not a config option; programs may still request it
+            // via DECSCUSR. A config asking for it falls back to the bar with a
+            // one-line note.
             tc.cursor_style = if cursor_style.eq_ignore_ascii_case("block") {
                 if blink {
                     CursorStyle::BlinkingBlock
@@ -7526,10 +6335,8 @@ impl Config {
             tc.cursor_blink = blink;
             any = true;
         }
-        // A named theme seeds the engine default fg/bg, cursor, and the full ANSI
-        // palette; the per-key color blocks below then override individual slots
-        // (last-wins). No theme = this block is skipped, so the per-key path stays
-        // byte-identical to before.
+        // A named theme seeds the engine fg/bg, cursor and ANSI palette; the
+        // per-key colors below override individual slots.
         if self.resolve_theme_name(appearance).is_some() {
             // A theme that is absent or invalid resolves to Default here in
             // silence; [`theme_load_notices`] says so, once per launch or reload.
@@ -7568,9 +6375,7 @@ impl Config {
                 }
             }
         }
-        // Selection highlight → engine `selection_background` (OSC-21 queryable). The
-        // renderer Theme already carries it for drawing; mirror it into the engine so a
-        // configured selection colour is also reported on query, not left as `None`.
+        // Mirror the selection colour into the engine so OSC 21 queries report it.
         if let Some(s) = &self.selection_color {
             match parse_hex_color(s) {
                 Some(rgb) => {
@@ -7584,9 +6389,8 @@ impl Config {
                 }
             }
         }
-        // Selected-text foreground is dynamic OSC 19 state too. Mirror the
-        // renderer knob into TerminalConfig so OSC 19 query/119/RIS and newly
-        // spawned sessions share one configured baseline with the pixels.
+        // Selected-text foreground is OSC 19 state; mirror it so queries, 119,
+        // RIS and new sessions share the configured baseline.
         if let Some(s) = &self.selection_foreground {
             match parse_hex_color(s) {
                 Some(rgb) => {
@@ -7600,9 +6404,8 @@ impl Config {
                 }
             }
         }
-        // Indexed palette (engine `custom_palette`; also resolved into RenderCell).
-        // Explicit overrides layer ON TOP of the theme's ANSI palette (if a theme set
-        // one); without a theme this starts empty — byte-identical to before.
+        // Indexed palette (engine `custom_palette`): explicit entries layer on
+        // top of the theme's ANSI palette, else start empty.
         if let Some(entries) = &self.palette {
             let mut pal = tc.custom_palette.take().unwrap_or_else(ColorPalette::new);
             let mut ok = false;
@@ -7681,26 +6484,20 @@ impl Config {
         any.then_some(tc)
     }
 
-    /// The engine [`TerminalConfig`] to actually APPLY to terminals: the optional
-    /// config deltas ([`Self::terminal_config`]) with the engine's default fg/bg
-    /// ALWAYS pinned to the renderer [`Self::theme`].
+    /// The engine [`TerminalConfig`] to apply: [`Self::terminal_config`] with the
+    /// default fg/bg pinned to the renderer [`Self::theme`].
     ///
-    /// The engine's spec default background is black (`0,0,0`) — correct VT
-    /// semantics — but the GUI clears the window (and the interior padding) to the
-    /// THEME background (`#111318`). Left unsynced, an unstyled cell paints spec-black
-    /// while the margins paint the theme bg, so the text area reads visibly *blacker*
-    /// than its surroundings (two visual judges flagged this "black-backed text" — see
-    /// tools/visual-judge). Pinning the engine defaults to the theme makes a default
-    /// cell paint exactly the colour the window clears to. `theme()` already folds in
-    /// any `foreground`/`background` config, so an explicit theme is honoured too.
+    /// The engine's spec default background is black, but the window clears to
+    /// the theme background; pinning makes a default cell paint exactly the
+    /// window colour. `theme()` already folds in `foreground`/`background`.
     #[cfg(test)]
     pub(crate) fn applied_terminal_config(&self) -> aterm_core::config::TerminalConfig {
         self.applied_terminal_config_for(aterm_types::Appearance::Dark)
     }
 
-    /// [`Self::applied_terminal_config`] resolved for a specific OS `appearance` — the
-    /// engine config the GUI applies live when the desktop toggles light↔dark under a
-    /// `dark:…,light:…` split theme (see [`Self::resolve_theme_name`]).
+    /// [`Self::applied_terminal_config`] for a specific OS `appearance`, applied
+    /// live when a `dark:…,light:…` theme flips (see
+    /// [`Self::resolve_theme_name`]).
     #[cfg(test)]
     pub(crate) fn applied_terminal_config_for(
         &self,
@@ -7734,15 +6531,11 @@ impl Config {
     }
 }
 
-/// Resolve the config file path without creating anything.
-/// The `font_px_explicit` pin after a config reload: an admitted `--font-px` /
-/// `config.font_px` pins outright; otherwise an effective px that DIFFERS from the
-/// (re-derived) scale default is a LIVE Cmd-+/− zoom this reload is preserving — it
-/// must KEEP its pin. Dropping the pin while keeping the zoomed px re-arms
-/// [`App::apply_window_scale`], which then flips the backend to the scale default at
-/// the next redraw (a tab switch suffices) WITHOUT a re-grid: bigger cells painted
-/// into the zoom-fitted, wider grid — a frame wider than the window, chopped at both
-/// edges. Pure, so the pin law is unit-testable.
+/// The `font_px_explicit` pin after a reload: an admitted `--font-px` /
+/// `config.font_px` pins; otherwise a px that differs from the scale default is
+/// a live zoom and keeps its pin. Dropping it would let
+/// [`App::apply_window_scale`] reset the px without a re-grid, drawing a frame
+/// wider than the window.
 pub(crate) fn reload_font_pin(
     explicit_now: bool,
     new_font_px: f32,
@@ -7751,32 +6544,26 @@ pub(crate) fn reload_font_pin(
     explicit_now || (new_font_px - new_default_font_px).abs() >= 0.5
 }
 
-/// Resolve the config file path without creating anything. THE rule is
-/// `aterm_types::dirs::aterm_config_path` — `$XDG_CONFIG_HOME`, then `%APPDATA%`
-/// on Windows (which has neither XDG nor, usually, HOME; without that arm BOTH
-/// Settings persistence via `prefs::save_prefs_snapshot_observed` and the mtime
-/// hot-reload watcher silently no-op there), then `$HOME/.config` — shared with
-/// the CLI's `explain-config` and `doctor` so the window and its diagnostics
-/// cannot name two files.
+/// Resolve the config file path without creating anything, via
+/// `aterm_types::dirs::aterm_config_path` (`$XDG_CONFIG_HOME`, then `%APPDATA%`
+/// on Windows, then `$HOME/.config`). Shared with the CLI's `explain-config` and
+/// `doctor`.
 pub(crate) fn config_path() -> Option<std::path::PathBuf> {
     aterm_types::dirs::aterm_config_path()
 }
 
-/// One ambient launch override that currently outranks aterm.toml. Settings
-/// captures these facts into its view model, and Manual's host diagnostics use
-/// the same resolver, so preview, accessibility, save feedback, and validation
-/// cannot disagree about an environment-pinned value.
+/// One launch override that outranks aterm.toml, shared by Settings and
+/// Manual's host diagnostics so they agree on pinned values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ActiveEnvironmentOverride {
-    /// The launch flag that set it (`--font-px`, `--columns`): since
-    /// 2026-09-24 no environment variable overrides an aterm.toml key.
+    /// The launch flag that set it (`--font-px`, `--columns`); no environment
+    /// variable overrides an aterm.toml key.
     pub(crate) variable: &'static str,
     pub(crate) effective: String,
 }
 
-/// Resolve an active environment/CLI override for one config key. Invalid
-/// values are deliberately absent because the runtime also falls through to
-/// aterm.toml for them.
+/// Resolve an active launch override for one config key. Invalid values are
+/// absent because the runtime falls through to aterm.toml for them too.
 pub(crate) fn active_environment_override(key: &str) -> Option<ActiveEnvironmentOverride> {
     let resolved = |variable, effective| ActiveEnvironmentOverride {
         variable,
@@ -7802,10 +6589,7 @@ pub(crate) fn active_environment_override(key: &str) -> Option<ActiveEnvironment
             .shell
             .filter(|value| !value.is_empty())
             .map(|value| resolved("--shell", value)),
-        // No `update.*`, `packages.*` or `net.*` key has an environment override
-        // any more (2026-09-23: `ATERM_UPDATE_OWNER`/`_REPO`, `ATERM_NO_AUTO_APPLY`
-        // and `ATPKG_ACCOUNT` are gone; 2026-09-24: the `[net]` listener's three
-        // variables), so none is resolved here.
+        // No `update.*`, `packages.*` or `net.*` key has a launch override.
         _ => None,
     }
 }
@@ -7836,22 +6620,16 @@ pub(crate) fn load_config() -> Config {
     config
 }
 
-/// Why the launch could not take `aterm.toml`: the file could not be read
-/// (permissions, a dangling link, a directory) or it read but is not a
-/// configuration. Borrowed so the two call sites format the error they hold.
+/// Why the launch could not take `aterm.toml`: unreadable (permissions,
+/// dangling link, directory) or not a configuration.
 pub(crate) enum LaunchConfigProblem<'a> {
     Unreadable(&'a dyn std::fmt::Display),
     Invalid(&'a dyn std::fmt::Display),
 }
 
-/// THE LAUNCH-TIME CONFIG NOTICE — what the window's banner and the console both
-/// say when `aterm.toml` did not load at start. Until 2026-09-15 an unreadable
-/// or invalid file at launch was ONE stderr line: a windowed launch never saw it,
-/// every setting silently ran at its default, and the first thing the window
-/// then said about the file was a later reload's "running settings … were kept
-/// unchanged" — true, and useless, because nothing had ever been loaded
-/// (glass hunt, m17-tower, 2026-09-01, finding 2). The line names the path,
-/// the problem, and the consequence, and says what ends it.
+/// Launch-time config notice, shown in the window banner and on the console
+/// when `aterm.toml` did not load at start: names the path, the problem, the
+/// consequence (defaults in use) and what ends it.
 pub(crate) fn launch_config_notice(
     path: &std::path::Path,
     problem: LaunchConfigProblem<'_>,
@@ -7863,34 +6641,24 @@ pub(crate) fn launch_config_notice(
             path.display()
         ),
         LaunchConfigProblem::Invalid(error) => format!(
-            "aterm.toml is not a valid configuration ({error}) — every setting is running at its \
-             default. Fix {} and it loads on the next change.",
+            "aterm.toml is not a valid configuration ({error}) — the window's settings except \
+             [harness] are at their defaults. Fix {} and it loads on the next change.",
             path.display()
         ),
     }
 }
 
-/// Set once by [`load_config`] when the launch load failed — the [`launch_config_notice`]
-/// it printed, kept verbatim rather than reduced to a bool. Read by the config watcher,
-/// so a later reload refusal says the running settings are the DEFAULTS from a launch
-/// that could not read the file — not "kept unchanged" as if a loaded configuration were
-/// being protected — and by `--diagnose` / `--show-config`, which have to say on STDOUT
-/// both that the file was rejected and why.
+/// The [`launch_config_notice`] from a failed launch load, set once by
+/// [`load_config`]. The config watcher uses it so a later reload refusal says
+/// the running settings are launch defaults, and `--diagnose` /
+/// `--show-config` report it on stdout.
 static LAUNCH_LOAD_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn note_launch_load_failed(notice: String) {
-    // First failure wins: `load_config` runs more than once per process, and the
-    // launch's own reason is the one the reports must name. The band's row
-    // (design R3) rides the pre-App inbox — `load_config` runs before `App`
-    // exists — and the inbox folds the repeat on its own.
+    // First failure wins (`load_config` runs more than once). The band row goes
+    // through the pre-App inbox, which folds repeats.
     crate::message_inbox::queue_message(crate::message_reporters::launch_load_failure(&notice));
     let _ = LAUNCH_LOAD_FAILURE.set(notice);
-}
-
-/// Whether this process launched WITHOUT its `aterm.toml` (unreadable or invalid
-/// at start), so every setting is at its default until the file loads.
-pub(crate) fn launch_load_failed() -> bool {
-    launch_load_failure().is_some()
 }
 
 /// WHY this process launched without its `aterm.toml` — the same sentence the
@@ -7899,14 +6667,47 @@ pub(crate) fn launch_load_failure() -> Option<&'static str> {
     LAUNCH_LOAD_FAILURE.get().map(String::as_str)
 }
 
-/// The `agents_auto_prime` knob alone, read WITHOUT [`load_config`]'s user-visible
-/// side effects (its stderr lines for an unreadable/invalid file and the
-/// deprecation notice it queues for the banner): the auto-prime thread runs on
-/// every fresh spawn, off the UI thread, and must never print or queue anything
-/// on its own account. Same file resolution and the SAME serde parse the app
-/// uses, so the key cannot be read two ways — an unreadable, missing, or
-/// malformed file resolves to the default (on), exactly as [`load_config`]
-/// resolves it.
+/// The current `[net]` table, read without [`load_config`]'s stderr lines and
+/// launch banner, using the same file resolution and parse. A missing file is
+/// no table; `Err` says why an existing file gives none, for `dial` and
+/// `dial-list`.
+pub(crate) fn net_config_now() -> Result<Option<NetConfig>, String> {
+    let Some(path) = config_path() else {
+        return Ok(None);
+    };
+    let observation =
+        crate::native_config_service::VersionedConfigService::observe_path(&path, true)
+            .map_err(|error| error.replace('\n', "; "))?;
+    net_config_from_text(&observation.text)
+}
+
+/// [`net_config_now`] over `text`: the parse error as `line <n>: <message>`
+/// (its annotated `Display` spans several lines, and a control reply is one).
+pub(crate) fn net_config_from_text(text: &str) -> Result<Option<NetConfig>, String> {
+    Config::parse(text)
+        .map(|config| config.net)
+        .map_err(|error| {
+            let message = error.message_text().replace('\n', "; ");
+            match error.span() {
+                Some(span) => {
+                    // End of input sits on the last line, not the empty one after it.
+                    let before = text.as_bytes().get(..span.start).unwrap_or(text.as_bytes());
+                    let before = if span.start >= text.len() {
+                        before.strip_suffix(b"\n").unwrap_or(before)
+                    } else {
+                        before
+                    };
+                    let line = before.iter().filter(|&&byte| byte == b'\n').count() + 1;
+                    format!("line {line}: {message}")
+                }
+                None => message,
+            }
+        })
+}
+
+/// The `agents_auto_prime` setting, read without [`load_config`]'s stderr lines
+/// or notices (the auto-prime thread must stay quiet). Same file resolution and
+/// parse; unreadable, missing or malformed files give the default (on).
 pub(crate) fn agents_auto_prime_setting() -> bool {
     let Some(path) = config_path() else {
         return true;
@@ -7971,20 +6772,11 @@ pub(crate) fn resolve_font_px(config: &Config) -> f32 {
     resolve_font_px_with(launch::flags().font_px, config.font_px)
 }
 
-/// The config-banner line for a `font_px` [`resolve_font_px`] will IGNORE —
-/// outside `FONT_PX_MIN..=FONT_PX_MAX` or not finite — or `None` when the key
-/// is unset or admissible. The resolver falls through to the default rather
-/// than clamping, so until 2026-09-22 a config carrying `font_px = 0.0` loaded
-/// in silence at the default size: the writer now refuses such a value
-/// (`prefs::typed_item`), and this is the same verdict for a file authored by
-/// hand or by an older build. The verdict is the resolver's own predicate
-/// ([`font_px_in_range`]), so the banner speaks exactly when the size is not
-/// applied; the words are the banner row's own — the state and the accepted
-/// range, as the unaccepted-values family beside it says an enum it refused —
-/// and `--validate-config` prints the same sentence.
-/// It says the value is IGNORED rather than naming the size used instead:
-/// that is the default, or a valid `--font-px`, which outranks the config.
-/// Startup and every reload push it onto that row.
+/// Banner line for a `font_px` that [`resolve_font_px`] ignores (outside
+/// `FONT_PX_MIN..=FONT_PX_MAX` or not finite), or `None` when unset or
+/// admissible. Uses the resolver's predicate ([`font_px_in_range`]); says the
+/// value is ignored and the accepted range. Also printed by `--validate-config`
+/// and pushed at startup and every reload.
 pub(crate) fn font_px_load_notice(config: &Config) -> Option<String> {
     let px = config.font_px.filter(|px| !font_px_in_range(px))?;
     Some(format!(
@@ -8016,10 +6808,8 @@ pub(crate) fn theme_misses(config: &Config, themes: &ThemeCatalog) -> Vec<String
     misses
 }
 
-/// [`theme_misses`] for the band's unaccepted-values row: until 2026-09-28 a theme
-/// the window could not load drew Default with a line only on stderr, which a Dock
-/// launch does not have. Startup, every reload and every theme-directory change
-/// push it.
+/// [`theme_misses`] for the band's unaccepted-values row, pushed at startup,
+/// every reload and every theme-directory change.
 pub(crate) fn theme_load_notices(config: &Config, themes: &ThemeCatalog) -> Vec<String> {
     prefixed_notices(theme_misses(config, themes))
 }
@@ -8031,12 +6821,9 @@ pub(crate) fn font_px_is_explicit(config: &Config) -> bool {
     font_px_is_explicit_with(launch::flags().font_px, config.font_px)
 }
 
-/// Whether the GPU renderer should be requested at launch, resolved with the SAME
-/// precedence the `main` backend-selection funnel uses so the running renderer and
-/// the `--diagnose` / `--show-config` reports cannot drift on it. Most specific
-/// first: `--cpu` forces CPU; else `--gpu` forces GPU (the last of the two given
-/// wins); else config `gpu = false`/`true` decides; else DEFAULT TO GPU on every
-/// platform (the CPU renderer is the automatic fallback when no device initializes).
+/// Whether to request the GPU renderer, with the same precedence as `main`'s
+/// backend selection: `--cpu`, else `--gpu` (last one given wins), else config
+/// `gpu`, else GPU (the CPU renderer is the automatic fallback).
 pub(crate) fn resolve_want_gpu(config: &Config) -> bool {
     let flag = launch::flags().renderer;
     resolve_want_gpu_with(
@@ -8075,18 +6862,11 @@ pub(crate) fn resolve_want_gpu_with(
         }
 }
 
-/// Diff two configs for RESTART-ONLY keys — settings read once at process launch that
-/// [`App::reload_config`] deliberately does NOT hot-apply — and return a human notice
-/// for each that changed. Today that is the initial window grid (`columns`/`lines`): a
-/// live reload must not snap the now-freely-resizable window back to its configured
-/// size, so an edit lands on the *next* launch. Without this the edit is a silent
-/// no-op ("I changed `columns` and nothing happened"); the returned lines become the
-/// `config.restart` row of the message band (`message_reporters::ConfigFamily::Restart`).
-///
-/// PURE + total (no `self`, no I/O) so it unit-tests without a window — the same shape
-/// as the keybinding `*_warn` helpers that already feed the band. The launch flags
-/// (`--columns`/`--lines`) are intentionally ignored: they are fixed for the
-/// process, so they can't change across a reload and never generate a spurious notice.
+/// Notices for changed restart-only keys, which [`App::reload_config`] does not
+/// hot-apply: the initial grid (`columns`/`lines`, so a reload does not snap the
+/// window back) and `gpu`. The lines feed the `config.restart` band row
+/// (`message_reporters::ConfigFamily::Restart`). Pure; launch flags are fixed
+/// per process and ignored.
 pub(crate) fn restart_notices(old: &Config, new: &Config) -> Vec<String> {
     let mut out = Vec::new();
     if old.columns != new.columns || old.lines != new.lines {
@@ -8095,9 +6875,8 @@ pub(crate) fn restart_notices(old: &Config, new: &Config) -> Vec<String> {
                 .to_string(),
         );
     }
-    // The renderer backend (GPU vs CPU) is built once at launch; a live GPU↔CPU
-    // swap would tear down every window's present surface. Same silent-no-op
-    // class as columns/lines now that `gpu` is settable from the Settings model.
+    // The renderer backend is built once at launch; a live GPU↔CPU swap would
+    // tear down every window's present surface.
     if old.gpu != new.gpu {
         out.push(
             "gpu applies on next launch (the renderer backend is chosen at startup)".to_string(),
@@ -8106,28 +6885,23 @@ pub(crate) fn restart_notices(old: &Config, new: &Config) -> Vec<String> {
     out
 }
 
-/// The band's view of [`crate::native_config_language::key_warnings`], added
-/// to `warns` in two families, every sentence carrying the `config …` prefix
-/// every config sentence uses on stderr:
+/// The band's view of [`crate::native_config_language::key_warnings`], added to
+/// `warns` in two families, each sentence prefixed `config …`:
 ///
-/// * the keys `aterm.toml` sets that this build will do nothing with, every one
-///   of them (`message_reporters::ConfigFamily::IgnoredKeys`). The old
-///   three-line cap and its roll-up went with the overwrite banner: the family
-///   is ONE row now, with every sentence a detail line behind its Details
-///   press, so a broken `[section]` cannot evict the keybinding and
-///   restart-only rows the same reload also shows;
-/// * the retired and deprecated spellings, each still read or decided by a
-///   newer key (`ConfigFamily::RetiredKeys`), a record and never a row —
-///   counted with the first family, they were "not known to this build", and
-///   a working `auto_update = false` read that way invites the deletion that
-///   turns automatic updates back on (design ruling 42).
+/// * keys `aterm.toml` sets that this build ignores
+///   (`message_reporters::ConfigFamily::IgnoredKeys`), one row with every
+///   sentence as a detail line;
+/// * retired and deprecated spellings still read by a newer key
+///   (`ConfigFamily::RetiredKeys`), a record rather than a row, so a working
+///   legacy spelling is not presented as unknown.
 ///
-/// The whole point of the band is that stderr reaches nobody who launched from
-/// a dock, a Start-menu tile or Finder. A misspelled KEY is the silent no-op that
-/// most needs it — the setting simply never applies, and until the reader is told
-/// the near-miss spelling there is no way to find out why. Startup and reload
-/// both call this so a typo introduced by a live edit is reported exactly like
-/// one that was there at launch.
+/// A known key whose value its reader could not use
+/// (`native_config_language::ConfigAnalysis::unaccepted_values`) is in
+/// neither: [`unaccepted_value_notices`] tells it in
+/// `ConfigFamily::UnacceptedValues`.
+///
+/// Windowed launches have no stderr, and a misspelled key is otherwise
+/// invisible. Startup and reload both call this.
 pub(crate) fn collect_key_notices(
     warns: &mut crate::message_reporters::ConfigWarnings,
     text: &str,
@@ -8138,11 +6912,9 @@ pub(crate) fn collect_key_notices(
     warns.extend(ConfigFamily::RetiredKeys, prefixed_notices(keys.retired));
 }
 
-/// The supervisor's `[harness]` notices ([`Config::harness_notices`]: what
-/// its one reader refused, each with what it resolved to), added to `warns`
-/// as `ConfigFamily::UnacceptedValues` — the one spelling the launch and both
-/// reload paths share, so the three can never disagree about what the band
-/// says.
+/// The supervisor's `[harness]` notices ([`Config::harness_notices`]) added to
+/// `warns` as `ConfigFamily::UnacceptedValues`; shared by launch and both reload
+/// paths.
 pub(crate) fn collect_harness_notices(
     warns: &mut crate::message_reporters::ConfigWarnings,
     config: &Config,
@@ -8160,15 +6932,10 @@ pub(crate) fn ignored_key_notices(text: &str) -> Vec<String> {
 
 /// The band's view of
 /// [`crate::native_config_language::unaccepted_value_warnings`]: keys whose
-/// authored VALUE this build does not accept, minus any that `already_told`
-/// explains, prefixed like [`collect_key_notices`].
-///
-/// The same silent no-op one level down, and the same reason for a window
-/// surface: `window_theme = "drak"` keeps the default and says so only on a
-/// stderr a dock launch does not have. Call this LAST — after every
-/// loader-specific warning this launch or reload collected — because the filter
-/// reads them, and a key whose own resolver already named the value it refused
-/// must keep that fuller sentence instead of also getting the generic one.
+/// value this build rejects or its reader could not use, minus any
+/// `already_told` explains, prefixed like [`collect_key_notices`]. Call it
+/// last, after every loader-specific warning, so a resolver's fuller sentence
+/// is not duplicated by the generic one.
 pub(crate) fn unaccepted_value_notices(text: &str, already_told: &[String]) -> Vec<String> {
     prefixed_notices(crate::native_config_language::unaccepted_value_warnings(
         text,
@@ -8176,9 +6943,7 @@ pub(crate) fn unaccepted_value_notices(text: &str, already_told: &[String]) -> V
     ))
 }
 
-/// Give one group of config lines the `config …` prefix every other config
-/// sentence carries on stderr. Shared so the two groups cannot drift into
-/// different prefixes.
+/// Give config lines the `config …` prefix used on stderr.
 fn prefixed_notices(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
@@ -8195,9 +6960,8 @@ pub(crate) fn resolve_initial_columns(config: &Config) -> u16 {
         .clamp(20, 500)
 }
 
-/// Fresh-launch terminal height; the row twin of
-/// [`resolve_initial_columns`]. A seamless handoff may supply a carried frame
-/// ahead of this resolver, but a normal launch and `--show-config` share it.
+/// Fresh-launch terminal height; the row twin of [`resolve_initial_columns`]. A
+/// seamless handoff may supply a carried frame first.
 pub(crate) fn resolve_initial_lines(config: &Config) -> u16 {
     explicit_initial_lines()
         .or(config.lines)
@@ -8205,14 +6969,10 @@ pub(crate) fn resolve_initial_lines(config: &Config) -> u16 {
         .clamp(5, 300)
 }
 
-/// The EXPLICIT launch-time grid overrides alone — `--columns`/`--lines`,
-/// WITHOUT the config fallback the resolvers above fold in. W3's cold-restore grid seed needs the distinction: an explicit
-/// `aterm --columns 200` is a per-launch request that outranks the persisted
-/// session's grid, while a config `columns` is a static default that restore
-/// exists to supersede (config > manifest would mean quitting a resized window
-/// never reopens at its own size, i.e. no size restore for anyone who sets the
-/// key). Unclamped on purpose — callers clamp alongside the value they merge
-/// with, keeping one clamp per decision.
+/// Explicit launch grid overrides only (`--columns`/`--lines`), without the
+/// config fallback. Cold restore needs the distinction: an explicit flag
+/// outranks the persisted session grid, a config `columns` does not.
+/// Unclamped; callers clamp alongside the value they merge with.
 pub(crate) fn explicit_initial_columns() -> Option<u16> {
     crate::cli::launch_flags().columns
 }
@@ -8222,12 +6982,10 @@ pub(crate) fn explicit_initial_lines() -> Option<u16> {
     crate::cli::launch_flags().lines
 }
 
-/// The explicit render-scale override from `--scale` (finite and positive, checked
-/// by the flag parser). When set it overrides BOTH the headless 1.0 default and a
-/// real window's `scale_factor()`, driving the auto-scaled font (`round(FONT_PX·f)`)
-/// and the interior padding (`pad_for_scale(f)`) so an offscreen `image` capture
-/// renders at the same DPI a real window of that scale would (e.g. `--scale 2` ≈ 2×
-/// Retina). One load of the installed launch flags: this sits on the redraw path.
+/// Explicit render scale from `--scale` (finite, positive). Overrides both the
+/// headless 1.0 default and a window's `scale_factor()`, driving the auto-scaled
+/// font and padding so an offscreen `image` renders at that DPI. One load of the
+/// launch flags, since this is on the redraw path.
 pub(crate) fn resolve_force_scale() -> Option<f64> {
     launch::flags().scale
 }
@@ -8238,9 +6996,8 @@ pub(crate) fn resolve_force_scale() -> Option<f64> {
 /// in-range config value; else the built-in default. An out-of-range source falls
 /// through rather than being clamped.
 pub(crate) fn resolve_font_px_with(flag: Option<f32>, config: Option<f32>) -> f32 {
-    // Filter EACH source by range independently so an out-of-range value falls
-    // through to a valid config value instead of `.or(config)` pinning the bad
-    // value and then `.filter` collapsing straight to default.
+    // Filter each source by range independently so a bad flag falls through to
+    // a valid config value.
     admitted_font_px(flag, config).unwrap_or(FONT_PX)
 }
 
@@ -8253,16 +7010,14 @@ fn admitted_font_px(flag: Option<f32>, config: Option<f32>) -> Option<f32> {
         .or(config.filter(font_px_in_range))
 }
 
-/// Pure explicit-pin counterpart of [`resolve_font_px_with`]. Keeping this on
-/// the same admission helper prevents an invalid authored value from pinning
-/// the 12px fallback and silently bypassing HiDPI auto-size.
+/// Explicit-pin counterpart of [`resolve_font_px_with`], on the same admission
+/// helper so an invalid value never pins the fallback and bypasses auto-size.
 pub(crate) fn font_px_is_explicit_with(flag: Option<f32>, config: Option<f32>) -> bool {
     admitted_font_px(flag, config).is_some()
 }
 
 /// A glyph size as the window carry writes it: thousandths of a physical px,
-/// `None` outside the zoom's own bounds (`FONT_PX_MIN..=FONT_PX_MAX`, which
-/// every size this process draws at is already inside).
+/// `None` outside `FONT_PX_MIN..=FONT_PX_MAX`.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -8286,26 +7041,16 @@ pub(crate) struct LaunchFont {
     pub(crate) reset_px: f32,
 }
 
-/// THE CARRIED ZOOM, OR THE CONFIG'S FONT (the round-four plan, item 15).
-/// `resolved`/`explicit` are what this launch derived from its flags and
-/// config (`resolve_font_px`, `font_px_is_explicit`, the headless `--scale`
-/// size); `carry` is the outgoing window's frame, `Some` only on an
-/// authenticated handoff boot.
+/// The carried zoom, or the config's font. `resolved`/`explicit` come from
+/// this launch's flags and config; `carry` is the outgoing window's frame,
+/// `Some` only on an authenticated handoff boot.
 ///
-/// A carry that holds the zoom PAIR (`WindowCarry::font_px_milli` and
-/// `font_reset_px_milli`, written only while a person had the font zoomed)
-/// wins: the successor draws at the zoomed px, pinned the way a live zoom
-/// pins it (`App::set_font_px_with`), and Cmd-0 goes back to the outgoing
-/// process's reset size. The carried `rows`/`cols` are that zoomed grid, so
-/// without this the first window was drawn at the config's font — a
-/// different frame and different text at every update. It outranks the
-/// flags like the rest of the carried frame: a successor inherits its
-/// parent's LAUNCH argv, and `--font-px` there is the size before the zoom.
-///
-/// The successor is the hostile-input boundary: a pair with either half
-/// missing or outside the zoom's own bounds is ignored whole, and the launch
-/// keeps the config's font — today's behaviour, never a clamp to a size
-/// nobody chose.
+/// A carry holding the zoom pair (`WindowCarry::font_px_milli` and
+/// `font_reset_px_milli`) wins: the successor draws at the zoomed px, pinned
+/// like a live zoom (`App::set_font_px_with`), and Cmd-0 returns to the
+/// outgoing reset size. It outranks the flags, since a successor inherits its
+/// parent's launch argv. A pair with either half missing or out of bounds is
+/// ignored whole (no clamping).
 pub(crate) fn successor_font_px(
     resolved: f32,
     explicit: bool,
@@ -8317,12 +7062,10 @@ pub(crate) fn successor_font_px(
     launch_font_for_zoom(resolved, explicit, px_milli, reset_milli)
 }
 
-/// [`successor_font_px`] over the zoom pair alone, in the carry's shape —
-/// what the warm prologue derives its BUILD size from when it runs before the
-/// dial (`main_entry`'s `WarmOrder::BeforeDial`), where the pair is the
-/// advisory launch hint's (`handoff_warm_hint`), not yet the carry's. Same
-/// admission, same answer for the same pair: a hint that matches the carry
-/// builds at exactly the size the carry then selects.
+/// [`successor_font_px`] over the zoom pair alone, for the warm prologue that
+/// runs before the dial (`WarmOrder::BeforeDial`) using the launch hint
+/// (`handoff_warm_hint`). Same admission, so a matching hint builds at the size
+/// the carry then selects.
 #[allow(
     clippy::cast_precision_loss,
     reason = "a carried size is a u32 of thousandths; any value past f32's exact range is far \
@@ -8354,9 +7097,9 @@ pub(crate) fn launch_font_for_zoom(
     }
 }
 
-/// Resolve one raw style against the exact catalog revision used by the host.
-/// Builtins and aliases come exclusively from `prefs`; this function adds only
-/// the dynamic `pack:<id>` domain and fail-closed classification.
+/// Resolve one raw style against the host's catalog revision. Builtins and
+/// aliases come from `prefs`; this adds the `pack:<id>` domain and fail-closed
+/// classification.
 pub(crate) fn resolve_trail_style(raw: &str, catalog: &TrailPackCatalog) -> ResolvedTrailStyle {
     let raw = raw.trim();
     if let Some(id) = raw.strip_prefix("pack:") {
@@ -8385,13 +7128,10 @@ pub(crate) fn resolve_trail_style(raw: &str, catalog: &TrailPackCatalog) -> Reso
         };
     }
     let Some(canonical) = crate::prefs::cursor_trail_style_canonical(raw) else {
-        // AN UNRECOGNIZED SPELLING FALLS BACK; IT DOES NOT SWITCH THE EFFECT
-        // OFF. `style: None` is reserved for the resolutions that genuinely
-        // mean "draw nothing" — `off`, and a `pack:` naming no loaded pack —
-        // because `resolve_cursor_glow` gates the whole effect on it. A typo
-        // resolves to the default style and keeps `issue`, which is what
-        // `Config::cursor_trail_style_warning` and the Settings disclosure
-        // read to say the value was not honoured.
+        // An unrecognized spelling falls back to the default style and keeps
+        // `issue` for the warning and Settings. `style: None` is reserved for
+        // `off` and an unloaded `pack:`, since `resolve_cursor_glow` gates the
+        // whole effect on it.
         return ResolvedTrailStyle {
             canonical: Some(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE),
             style: Some(aterm_effects::cursor_glow::GlowStyle::parse(
@@ -8412,11 +7152,8 @@ pub(crate) fn resolve_trail_style(raw: &str, catalog: &TrailPackCatalog) -> Reso
     }
 }
 
-/// Resolve every string-keyed trail presentation fork in one pass.
-///
-/// This is a config-generation operation. The returned value is `Copy` and is
-/// cached in [`TrailPackCatalog`], so the redraw path never repeats alias,
-/// geometry, companion, or species scans.
+/// Resolve every string-keyed trail presentation fork in one pass, per config
+/// generation; the `Copy` result is cached in [`TrailPackCatalog`].
 pub(crate) fn resolve_trail_presentation(
     raw: &str,
     catalog: &TrailPackCatalog,
@@ -8454,20 +7191,12 @@ pub(crate) fn resolve_trail_presentation_from_style(
     }
 }
 
-/// The spelling the raw-token predicates must read: what the trail actually
-/// DRAWS, not what was authored.
-///
-/// The companion, species, comet and ribbon forks are string predicates over
-/// the style token rather than [`aterm_effects::cursor_glow::GlowStyle`] arms,
-/// so they have to be asked about the same spelling
-/// [`resolve_trail_style`] settled on. Asked about a typo they answer for a
-/// look nothing renders — the default's ribbon under the wrong companion.
-/// Aliases collapse onto their canonical (an alias and its canonical agree on
-/// every one of those predicates; `prefs`'
-/// `cursor_trail_style_aliases_agree_with_engine_parse` pins it), and a
-/// `pack:<id>` token comes back unchanged because no builtin predicate matches
-/// it whether or not the pack is loaded. The tests' reading of what
-/// [`resolve_trail_style`] settles on.
+/// The spelling the raw-token predicates must read: what the trail draws, not
+/// what was authored. The companion, species, comet and ribbon forks are string
+/// predicates, so a typo must be replaced by the spelling
+/// [`resolve_trail_style`] settled on. Aliases collapse onto their canonical
+/// (pinned by `prefs`' `cursor_trail_style_aliases_agree_with_engine_parse`);
+/// `pack:<id>` is returned unchanged.
 #[cfg(test)]
 pub(crate) fn effective_trail_style_token(raw: &str) -> &str {
     let raw = raw.trim();
@@ -8478,21 +7207,17 @@ pub(crate) fn effective_trail_style_token(raw: &str) -> &str {
         .unwrap_or(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
 }
 
-/// Canonical cold-path construction of the engine's `GlowConfig`: THIS
-/// host's resolved spelling and knobs through the engine's one config law
-/// ([`aterm_effects::cursor_fx::resolve_glow_config`], the construction the web
-/// pipeline runs too). The live terminal and Settings renderer preview differ
-/// only in explicitly injected geometry/theme facts (`dark_theme` and
-/// `head_dx`); preference semantics are byte-for-byte shared there.
+/// Cold-path construction of the engine's `GlowConfig` through
+/// [`aterm_effects::cursor_fx::resolve_glow_config`] (shared with the web
+/// pipeline). The live terminal and Settings preview differ only in injected
+/// geometry/theme facts (`dark_theme`, `head_dx`).
 pub(crate) fn resolve_cursor_glow(
     inputs: CursorGlowInputs,
     presentation: ResolvedTrailPresentation,
     theme_cursor: u32,
     dark_theme: bool,
-    // The theme's resolved default foreground / background (`0x00RRGGBB`, or
-    // `COLOR_UNSET` when the caller has none). Parameters rather than
-    // constants for the same reason `dark_theme` is: this is the cold-path
-    // construction, and the live values are folded per frame.
+    // Theme default fg/bg (`0x00RRGGBB`, or `COLOR_UNSET`); parameters because
+    // live values are folded per frame.
     theme_fg: u32,
     theme_bg: u32,
     head_dx: f32,
@@ -8514,9 +7239,8 @@ pub(crate) fn resolve_cursor_glow(
             style: presentation.style.style,
             pack: presentation.style.pack,
             beam: presentation.beam,
-            // THE TALL BODY IS THE DEFAULT (owner, 2026-08-29: "WHERE IS MY
-            // TALL RIBBON"): only an explicit `... underline` spelling selects
-            // the highlighter-plus-under-baseline mark.
+            // The tall body is the default; only `... underline` selects the
+            // under-baseline mark (owner, 2026-08-29).
             ribbon_tall: presentation.ribbon_tall,
             ribbon_flat: presentation.ribbon_flat,
             classic_mono: presentation.classic_mono,
@@ -8529,13 +7253,9 @@ pub(crate) fn resolve_cursor_glow(
     )
 }
 
-/// The lexicon build-time conflicts [`App::recompute_sparkle`] actually logs,
-/// given the resolved scan options: a "requires `cjk_single_char = true`"
-/// warning describes a surface that WILL scan once that opt-in is on, so it
-/// is dropped when the resolved config enables it (the lexicon cannot see
-/// scan options; the resolver can). The predicate is shared with the web
-/// resolver (`EffectsPipeline::sparkle_lexicon_warnings`) so both paths
-/// filter identically.
+/// Lexicon conflicts [`App::recompute_sparkle`] logs for the resolved scan
+/// options: a "requires `cjk_single_char = true`" warning is dropped when that
+/// opt-in is on. Shared with `EffectsPipeline::sparkle_lexicon_warnings`.
 fn sparkle_logged_warnings(
     conflicts: &[String],
     cjk_single_char: bool,
@@ -8545,11 +7265,9 @@ fn sparkle_logged_warnings(
         .filter(move |w| aterm_effects::pipeline::lexicon_warning_applies(w, cjk_single_char))
 }
 
-/// The GUI render authority that must move in lockstep with a fallible backend
-/// rebuild during config hot-reload. Config reload applies many independent
-/// settings before reaching the renderer; capturing only this slice lets a
-/// rejected font/geometry change roll back without discarding successful input,
-/// session, title-summary, or package changes from the same file edit.
+/// Render authority that must roll back with a failed backend rebuild during
+/// reload, so a rejected font/geometry change does not discard the same edit's
+/// successful input, session or package changes.
 struct ReloadRenderSnapshot {
     config: Config,
     default_font_px: f32,
@@ -8620,10 +7338,8 @@ impl ReloadRenderSnapshot {
             }
         }
 
-        // Theme colours are shared by the engine's default cells and the GUI
-        // renderer. The engine was already live-applied earlier in reload_config;
-        // re-derive it from the hybrid config (old render slice + all other new
-        // settings) so those two surfaces remain one transaction too.
+        // Theme colours feed both the engine defaults and the renderer; re-derive
+        // the engine config from the hybrid config so both stay consistent.
         let terminal_config = app
             .config
             .applied_terminal_config_for_with_assets(app.os_appearance, &app.config_assets.themes);
@@ -8636,12 +7352,9 @@ impl ReloadRenderSnapshot {
     }
 }
 
-/// Restore precisely the config keys that feed [`ReloadRenderSnapshot`]. Keeping
-/// the rest of the freshly parsed `Config` in place is load-bearing: a rejected
-/// font face must not undo a simultaneous keybinding, scrollback, smart-title,
-/// package-consent, or other independent live edit. Restoring these keys also
-/// defeats reload dedupe, so the watcher's second edge can retry a transient
-/// renderer failure instead of permanently accepting a config/backend mismatch.
+/// Restore only the config keys behind [`ReloadRenderSnapshot`], keeping every
+/// other freshly parsed edit. Restoring them also defeats reload dedupe, so the
+/// watcher's next edge can retry a transient renderer failure.
 fn restore_render_config_fields(target: &mut Config, previous: &Config) {
     macro_rules! restore {
         ($($field:ident),+ $(,)?) => {
@@ -8692,11 +7405,9 @@ fn restore_render_config_fields(target: &mut Config, previous: &Config) {
 }
 
 impl App {
-    /// Rebuild the cached sparkle-words state ([`App::sparkle`]) from the current
-    /// config and Serious Mode policy. Runs only when `sparkle_dirty` is set
-    /// (startup or config reload) — never per frame — so the per-frame path neither
-    /// re-resolves config nor recompiles the lexicon. A malformed user lexicon
-    /// override is logged and the builtin is used (config is not discarded).
+    /// Rebuild [`App::sparkle`] from config and Serious Mode policy. Runs only
+    /// when `sparkle_dirty` is set, never per frame. A malformed user lexicon is
+    /// logged and the builtin used.
     pub(crate) fn recompute_sparkle(&mut self) {
         self.sparkle_dirty = false;
         self.sparkle = if !self
@@ -8709,37 +7420,22 @@ impl App {
         };
     }
 
-    /// **RESOLVE THE SPARKLE RUNTIME IF IT IS STILL DIRTY**, so a gate that
-    /// asks "do cats exist?" gets the same answer a drawn frame would.
+    /// Resolve the sparkle runtime if still dirty, so a gate asking "do cats
+    /// exist?" gets the same answer a drawn frame would.
     ///
-    /// `self.sparkle` is a RENDER-PATH CACHE: it starts `None` with
-    /// `sparkle_dirty` set, and the only thing that fills it is the per-frame
-    /// `if self.sparkle_dirty { self.recompute_sparkle(); }` in `app_render`.
-    /// In a window the first frame always precedes the first menu press, so
-    /// nothing noticed. ON THE CONTROL SOCKET IT DOES NOT: a headless instance
-    /// renders only when a capture drives its clock, so a gate reading the raw
-    /// cache answers "off" for a config that has effects ON, purely because no
-    /// frame has been drawn yet.
-    ///
-    /// MEASURED on a live `--headless` instance (2026-09-15, debug build):
-    /// `invoke FavouriteKitty` before any frame answered `OK invoked
-    /// FavouriteKitty` and pinned NOTHING — a silent no-op reported as success
-    /// — while the identical call after one `image` pinned. `kitty wear` on the
-    /// same instance refused with "effects are off" while they were on.
-    ///
-    /// Callers that gate on the cat's existence use this, never the field.
+    /// `self.sparkle` is a render-path cache filled by the first frame. A
+    /// headless instance driven over the control socket may not have drawn one,
+    /// so reading the raw field would report effects off. Gates on the cat's
+    /// existence use this, never the field.
     pub(crate) fn ensure_sparkle(&mut self) {
         if self.sparkle_dirty {
             self.recompute_sparkle();
         }
     }
 
-    /// Whether the Kitty Log RECORDER is on: `[sparkle_words.feline] log`
-    /// (default true, config-file-only — `apply_prefs_edits` is top-level-only,
-    /// like every sparkle key). Host-side gate: the effects engine always
-    /// records and the drain sites drop when this is false (§F4.7). Master-off
-    /// (`sparkle == None`) never reaches a drain at all. A couple of `Option`
-    /// reads — cheap enough to resolve at each drain, no cache to invalidate.
+    /// Whether the Kitty Log recorder is on (`[sparkle_words.feline] log`,
+    /// default true, config-file only). The engine always records; drain sites
+    /// drop when false. Resolved at each drain.
     pub(crate) fn kitty_log_enabled(&self) -> bool {
         self.config
             .sparkle_words
@@ -8749,11 +7445,9 @@ impl App {
             .unwrap_or(true)
     }
 
-    /// The curse-BONK host gate (`[sparkle_words.profanity] bonk`, default
-    /// ON) — the feline `log` twin: the effects engine always records its
-    /// bounded cues, this gate decides whether the drain makes sound.
-    /// Per-class/master sparkle enables need no re-check here — a disabled
-    /// profanity class produces no occurrences, hence no cues.
+    /// Curse-bonk host gate (`[sparkle_words.profanity] bonk`, default on). The
+    /// engine records cues; this decides whether the drain plays them. A
+    /// disabled profanity class produces no cues.
     pub(crate) fn curse_bonk_enabled(&self) -> bool {
         self.config
             .sparkle_words
@@ -8763,9 +7457,8 @@ impl App {
             .unwrap_or(true)
     }
 
-    /// The detonation-edge opt-in (`bonk_detonation`, default OFF): admits
-    /// the on-screen `Detonated` cue kind, which fires for output content —
-    /// off by default so the bonk keeps strict typed provenance.
+    /// Detonation-edge opt-in (`bonk_detonation`, default off): admits
+    /// `Detonated` cues from on-screen output.
     pub(crate) fn curse_bonk_detonation_enabled(&self) -> bool {
         self.config
             .sparkle_words
@@ -8775,19 +7468,13 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Rebuild the cached matrix-rain PARAMETER resolve ([`App::rain`]) from
-    /// the current config + live theme. Runs only when `rain_dirty` is set
-    /// (startup, config reload, appearance flip, toggle) — never per frame.
-    /// Parameters resolve UNCONDITIONALLY (defaults + theme derivation even
-    /// with no `[matrix_rain]` table) because a per-session override can force
-    /// rain ON over a disabled config; the ENABLED decision is per-session
-    /// ([`App::session_rain_enabled`]) and read at the frame gate. The new
-    /// config is pushed into every LIVE engine (`set_config` keeps the tick
-    /// epoch — a hot reload never time-travels the field); engines are built
-    /// lazily at the next effective-on tick and are deliberately NOT dropped
-    /// here when the config disables rain — the render path's suspended/drain
-    /// gate winds a now-off window's field down instead (and a session
-    /// override may keep another window's field legitimately alive).
+    /// Rebuild [`App::rain`] parameters from config and live theme when
+    /// `rain_dirty` is set, never per frame. Parameters resolve unconditionally
+    /// because a session override can force rain on; the enabled decision is
+    /// per-session ([`App::session_rain_enabled`]). The config is pushed into
+    /// every live engine (`set_config` keeps the tick epoch); engines are built
+    /// lazily and not dropped here, since the render path winds a disabled
+    /// window's field down.
     pub(crate) fn recompute_matrix_rain(&mut self) {
         self.rain_dirty = false;
         let bg = self.theme.bg & 0x00FF_FFFF;
@@ -8795,18 +7482,16 @@ impl App {
         let cfg = self.config.matrix_rain_params(bg, fg);
         self.rain = Some(cfg);
         for (wid, ws) in self.windows.iter_mut() {
-            if let Some(e) = ws.matrix_rain.as_mut() {
+            if let Some(e) = ws.fx.rain_mut() {
                 e.set_config(crate::rain_config_for_window(cfg, *wid));
             }
         }
     }
 
-    /// Effective rain state for session `sid`: its runtime override when one
-    /// was set (View ▸ Matrix Rain / `toggle_matrix_rain` / `aterm-ctl rain`),
-    /// else the durable `[matrix_rain] enabled` config bit. The override is
-    /// runtime-only (never persisted; it dies with the session) and WINS over
-    /// a config reload until cleared — an explicit session gesture outranks a
-    /// background file flip.
+    /// Effective rain state for session `sid`: its runtime override (View ▸
+    /// Matrix Rain, `toggle_matrix_rain`, `aterm-ctl rain`) if set, else the
+    /// `[matrix_rain] enabled` bit. The override is never persisted and wins
+    /// over reloads until cleared.
     pub(crate) fn session_rain_enabled(&self, sid: u64) -> bool {
         self.serious_mode_policy()
             .allows(crate::motion::SeriousEffect::MatrixRain)
@@ -8816,13 +7501,9 @@ impl App {
                 .unwrap_or_else(|| self.config.matrix_rain_enabled())
     }
 
-    /// Set (or clear, `None`) the runtime rain override for session `sid`,
-    /// then mark the resolve stale and wake every window whose FRONT session
-    /// is `sid` so the flip presents on the very next frame. Turning a session
-    /// off deliberately does NOT drop that window's engine here: the render
-    /// gate's suspended/drain path clears the visible field on the next frame
-    /// (instant off, exactly like alt-screen suppression) and the weather
-    /// machine winds down to 0% idle; re-enabling resumes/rebuilds lazily.
+    /// Set or clear the rain override for `sid`, mark the resolve stale and wake
+    /// every window whose front session is `sid`. Turning off does not drop the
+    /// engine; the render path clears the field next frame and winds down.
     pub(crate) fn set_session_rain_override(&mut self, sid: u64, over: Option<bool>) {
         self.pool.set_rain_override(sid, over);
         // Ensure the parameter resolve exists before the next frame (a session
@@ -8835,21 +7516,15 @@ impl App {
                 w.request_redraw();
             }
         }
-        // An OPEN palette's "Matrix Rain" checkmark mirrors the front session's
-        // effective state — re-resolve it now, whatever surface flipped the
-        // override (ctl, menu bar, keybinding, the palette row itself), so the
-        // repaint the redraw above triggers paints the POST-flip row.
+        // Refresh an open palette's "Matrix Rain" checkmark so the repaint shows
+        // the post-flip state, whatever surface flipped it.
         self.palette_refresh_live();
     }
 
-    /// Toggle matrix rain for the FRONT session of window `wid` (the
-    /// `toggle_matrix_rain` action, the View ▸ Matrix Rain menu item, the
-    /// palette row, and `aterm-ctl rain toggle` all converge here): flip the
-    /// session's current EFFECTIVE state into an explicit per-session
-    /// override. This replaced the old app-global `rain_force_off` kill latch
-    /// — the toggle now turns rain ON too (even over a disabled config), and
-    /// only for the session being looked at. No-op when the window's front
-    /// content is not a terminal (native tabs have no session to toggle).
+    /// Toggle matrix rain for the front session of window `wid` (action, menu,
+    /// palette, `aterm-ctl rain toggle`): the session's effective state flips
+    /// into an explicit override, so it can turn rain on over a disabled config.
+    /// No-op when the front content is not a terminal.
     pub(crate) fn toggle_matrix_rain(&mut self, wid: crate::WindowId) {
         let Some(sid) = self.front_terminal(wid).map(|t| t.session) else {
             return;
@@ -8858,17 +7533,14 @@ impl App {
         self.set_session_rain_override(sid, Some(!effective));
     }
 
-    /// The `fx` control-socket verb ([`crate::Wake::FxControl`]), acting on the
-    /// focused window's FRONT session: `Status` reads, `Celebrate` ARMS the
-    /// window's sing-along detector (`kitty_sing::KittySing::arm_external`)
-    /// for that session — latched here, spent by the session's next keyed
-    /// edge in the render path (the green verdict, or a keyed Enter through
-    /// the input seam). `Ok` carries the post-state line every form answers:
-    /// `armed=<none|green|enter> sig=<hex> bars=<n> live=<bool> bar=<n|none>
-    /// drive=<f> cooldown_ms=<n> style=<rainbow-kitty|other>`. `Err` when no
-    /// window is focused, the front content is not a terminal, the trail is
-    /// not the rainbow kitty (an arm that could never light is refused, not
-    /// swallowed), or the detector refuses (pending arm, cooldown, bars).
+    /// The `fx` control verb ([`crate::Wake::FxControl`]) on the focused window's
+    /// front session: `Status` reads; `Celebrate` arms the sing-along detector
+    /// (`kitty_sing::KittySing::arm_external`), spent by the session's next keyed
+    /// edge. `Ok` carries `armed=<none|green|enter> sig=<hex> bars=<n>
+    /// live=<bool> bar=<n|none> drive=<f> cooldown_ms=<n>
+    /// style=<rainbow-kitty|other>`. `Err` when no window is focused, the front
+    /// is not a terminal, the trail is not the rainbow kitty, or the detector
+    /// refuses (pending arm, cooldown, bars).
     pub(crate) fn fx_control(&mut self, op: crate::FxCtlOp) -> Result<String, String> {
         let Some(wid) = self.frontmost_window else {
             return Err("no focused window".to_string());
@@ -8897,11 +7569,13 @@ impl App {
                     "cursor trail is not the rainbow kitty (nothing to celebrate with)".to_string(),
                 );
             }
-            ws.kitty_sing
+            ws.fx
+                .companions_mut()
+                .kitty_sing
                 .arm_external(now, sid, sig, bars, on)
                 .map_err(|refusal| refusal.to_string())?;
         }
-        let sing = &ws.kitty_sing;
+        let sing = &ws.fx.companions_mut().kitty_sing;
         let (armed, sig, bars) = sing
             .armed_external()
             .map_or(("none", 0, 0), |arm| (arm.on.as_str(), arm.sig, arm.bars));
@@ -8915,19 +7589,12 @@ impl App {
         ))
     }
 
-    /// The `rain` control-socket verb ([`crate::Wake::RainControl`]), acting on
-    /// the focused window's FRONT session. `Ok` carries the wire tail after
-    /// `OK ` — every op (including the writes) answers with the same one-line
-    /// status shape so a driver reads the post-state without a second round
-    /// trip: `config_enabled=<bool> session_override=<none|on|off>
+    /// The `rain` control verb ([`crate::Wake::RainControl`]) on the focused
+    /// window's front session. Every op answers with one status line:
+    /// `config_enabled=<bool> session_override=<none|on|off>
     /// effective=<bool> engine=<none|live> active=<bool>
-    /// scope=<window|focused-pane> focused=<bool> animating=<bool>` (the
-    /// engine tail is the split-pane-audit honesty fix: the render state is
-    /// observable, so a driver can SEE that a split renders rain in the
-    /// focused pane only — and that an unfocused/Reduced window animates
-    /// nothing at all, the W11 law). `Err` when no window is focused or the
-    /// front content is not a terminal (native tabs have no session to
-    /// toggle) — an honest refusal, never a silent no-op.
+    /// scope=<window|focused-pane> focused=<bool> animating=<bool>`. `Err` when no
+    /// window is focused or the front content is not a terminal.
     pub(crate) fn rain_control(&mut self, op: crate::RainCtlOp) -> Result<String, String> {
         let Some(wid) = self.frontmost_window else {
             return Err("no focused window".to_string());
@@ -8949,19 +7616,14 @@ impl App {
             Some(true) => "on",
             Some(false) => "off",
         };
-        // ENGINE introspection (split-pane audit): `effective=true` alone once
-        // lied in a split (the engine was hard-dropped and nothing could
-        // render while every surface reported success). Rain now follows the
-        // FOCUSED pane on composed frames, and this tail makes the actual
-        // render state observable to a driver: whether this window holds a
-        // live engine, whether it is actively raining/draining (`is_active` —
-        // the wake-arming predicate), and which SCOPE the emission covers
-        // (`window` = single-pane/zoomed original path, `focused-pane` =
-        // split compose).
+        // Engine introspection: whether the window holds a live engine, whether
+        // it is raining/draining (`is_active`, the wake predicate), and the
+        // emission scope (`window` for single-pane/zoomed, `focused-pane` for a
+        // split, where rain follows the focused pane).
         let (engine, active, diag) = self
             .windows
             .get(&wid)
-            .and_then(|ws| ws.matrix_rain.as_ref())
+            .and_then(|ws| ws.fx.rain())
             .map_or(("none", false, String::new()), |e| {
                 ("live", e.is_active(), format!(" {}", e.diag_line()))
             });
@@ -8973,14 +7635,10 @@ impl App {
         } else {
             "window"
         };
-        // The resolved MOTION facts (W11): rain is a serious animation, so an
-        // unfocused window (or Reduced motion) emits NOTHING even while
-        // `effective=true engine=live` — without these two fields "why isn't
-        // it raining" is undebuggable over the socket (split-pane audit).
-        // Resolved through the SAME fold the render tick uses — the
-        // `motion_focus` recording pin plus `motion_policy`'s load-shed
-        // latch — so the status can never claim animating=true while the
-        // live policy is Reduced (post-merge re-audit).
+        // Motion facts: an unfocused or reduced-motion window emits nothing even
+        // with `effective=true engine=live`. Resolved through the same fold as
+        // the render tick (`motion_focus` plus `motion_policy`'s load-shed
+        // latch) so the status matches the live policy.
         let raw_focused = self.windows.get(&wid).is_some_and(|ws| ws.focused);
         let focused = self.motion_focus(wid, raw_focused);
         let motion = self.motion_policy(focused);
@@ -8999,41 +7657,21 @@ impl App {
         ))
     }
 
-    /// Throttled entry for live (interactive) window resizes. A width drag with a large
-    /// scrollback rewraps the entire off-screen history per intermediate width on the
-    /// event-loop thread, which hitches the drag. Apply the FIRST resize of a drag
-    /// immediately (leading edge), then coalesce subsequent ones into `pending_resize`
-    /// and apply only the latest on the trailing settle (`new_events`) — so the reflow
-    /// runs at most ~20 Hz and once more for the final size, instead of per cell-width.
+    /// Throttled entry for interactive window resizes. A width change rewraps the
+    /// whole scrollback on the event-loop thread, so the first resize of a drag
+    /// applies immediately and later width changes coalesce into
+    /// `pending_resize`, applied at most ~20 Hz and once more at the trailing
+    /// settle (`new_events`). A resize that keeps the column count (height-only)
+    /// rewraps nothing and applies immediately.
     ///
-    /// Recorder determinism: a COALESCED size is never passed to `on_resize`, so the
-    /// engine never resizes to it and the asciicast/temporal spine never records it. The
-    /// engine only ever applies the throttled subset + the final size, in the same order
-    /// relative to PTY output, so a recorded session replays byte-identically. Only
-    /// interactive `WindowEvent::Resized` routes here; the control-socket `resize` verb
-    /// (`apply_term_resize`, echo_to_window) stays immediate + exact.
+    /// Columns come from [`Self::grid_dims_for`] on the window's authoritative
+    /// `inner_size()`, the same law `on_resize` uses; rows are not compared
+    /// because they also depend on chrome headroom.
     ///
-    /// WIDTH IS WHAT THE THROTTLE IS FOR, and now that is what it costs. The whole
-    /// justification above — "rewraps the entire off-screen history" — is a property
-    /// of a COLUMN change: reflow is what rewrapping means. A height-only drag (the
-    /// bottom edge, the common vertical resize) rewraps nothing; it adds or drops
-    /// grid rows and pushes the difference into scrollback. Coalescing those at
-    /// 20 Hz bought no work back and made the terminal body visibly trail the window
-    /// edge by up to a throttle window before snapping — the vertical half of the
-    /// "shredded, then redrawn" drag. So the throttle now gates on the reflow it
-    /// exists to bound: a resize that leaves the column count alone applies
-    /// immediately, and only genuine width changes coalesce.
-    ///
-    /// Columns are derived through the SAME [`Self::grid_dims_for`] law `on_resize`
-    /// uses, off the window's authoritative `inner_size()` (the winit macOS `Resized`
-    /// payload can lie — see `on_resize`), so this decision cannot disagree with the
-    /// resize it is deciding about. Only `cols` is compared: `rows` additionally
-    /// depends on the chrome headroom `on_resize` re-derives, while `cols` is a pure
-    /// function of width, pad and cell width.
-    ///
-    /// Recorder determinism is unchanged: applying MORE of the drag's real sizes only
-    /// adds genuine resizes to the spine in the order they happened; the engine still
-    /// never sees a coalesced size.
+    /// A coalesced size never reaches `on_resize`, so the engine and the
+    /// recorder spine only see real sizes in order and replay stays
+    /// byte-identical. The control-socket `resize` verb (`apply_term_resize`)
+    /// stays immediate.
     pub(crate) fn on_resize_throttled(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
         let now = std::time::Instant::now();
         let reflows = self.resize_changes_columns(wid, size);
@@ -9049,25 +7687,14 @@ impl App {
                 ws.next_resize_settle = None;
             }
             self.on_resize(wid, size);
-            // RE-ARM THE SETTLE AFTER A ROW-ONLY APPLY — it is the payer for the
-            // active-tab-only scope this apply just ran under.
+            // Re-arm the settle after a row-only apply. A live-drag apply sizes only
+            // the active tab and marks the window `panes_stale`; the trailing settle
+            // pays the AllTabs pass for background tabs. A row-only drag coalesces
+            // nothing, so without this no settle would be armed.
             //
-            // A leading-edge apply runs with `resize_live_drag` set, which sizes only
-            // the ACTIVE tab's panes and marks the window `panes_stale`; the other
-            // tabs' engines and PTY winsize are settled by the eager AllTabs pass the
-            // trailing settle performs. On the WIDTH path a settle is guaranteed —
-            // the next coalesced event arms one. A row-only drag now coalesces
-            // NOTHING, so without this nothing would ever arm one and background tabs
-            // would sit at the pre-drag row count until the user switched to them.
-            //
-            // It must run AFTER `on_resize`: a committing `apply_term_resize` clears
-            // both fields itself (a committed resize supersedes a stale coalesce), so
-            // arming before the call would simply be wiped.
-            //
-            // Re-arming with the CURRENT size is not lossy for a still-pending width
-            // change: `flush_pending_resize` -> `on_resize` re-reads the window's
-            // authoritative `inner_size()`, so the settle always applies the geometry
-            // the window really has, not whatever was recorded when it was armed.
+            // Must run after `on_resize`, since a committing `apply_term_resize`
+            // clears both fields. Arming with the current size is safe:
+            // `flush_pending_resize` re-reads `inner_size()`.
             if !reflows
                 && let Some(ws) = self.windows.get_mut(&wid)
                 && ws.next_resize_settle.is_none()
@@ -9084,13 +7711,10 @@ impl App {
         }
     }
 
-    /// Apply a coalesced resize whose trailing-settle deadline fired (`new_events`):
-    /// reflow the final pending size once, and clear the throttle state.
-    ///
-    /// This is also where the drag's DEBT is settled. Every leading-edge apply during
-    /// a drag runs under `resize_live_drag`, which sizes only the ACTIVE tab's panes
-    /// and leaves the window `panes_stale`; the background tabs' engines and PTY
-    /// winsize are owed an eager AllTabs pass, and this is the one place that pays it.
+    /// Apply a coalesced resize whose settle deadline fired: reflow the final
+    /// size once and clear the throttle state. Also pays the drag's debt: the
+    /// eager AllTabs pass for background tabs left `panes_stale` by live-drag
+    /// applies.
     pub(crate) fn flush_pending_resize(&mut self, wid: WindowId) {
         let Some(size) = self.windows.get(&wid).and_then(|ws| ws.pending_resize) else {
             return;
@@ -9101,15 +7725,10 @@ impl App {
             ws.next_resize_settle = None;
         }
         self.on_resize(wid, size);
-        // PAY THE DEBT EXPLICITLY. `on_resize` clears `panes_stale` only as a side
-        // effect of `apply_term_resize` reaching `resize_panes`, and that call
-        // early-returns whenever the derived grid already equals the applied one — so
-        // a drag whose settle lands on a size already applied (the common case: the
-        // hand stops, the final size was the last one applied) performed NO AllTabs
-        // pass and stranded every background tab at the pre-drag geometry until the
-        // user happened to switch to one. Deliberately gated on the flag rather than
-        // run unconditionally: with a single tab `panes_stale` is never set (the
-        // scope has nothing to defer), so this is inert for the common window.
+        // Pay the AllTabs debt explicitly: `on_resize` clears `panes_stale` only
+        // via `resize_panes`, which early-returns when the grid is unchanged (the
+        // usual settle), which would strand background tabs at the pre-drag size.
+        // Single-tab windows never set `panes_stale`.
         if self.windows.get(&wid).is_some_and(|ws| ws.panes_stale) {
             self.resize_panes_scoped(wid, false);
         }
@@ -9118,7 +7737,7 @@ impl App {
         }
     }
 
-    /// A resize ENTRY POINT for the ledger (`site=window`): this shim alone is
+    /// Resize entry point for the ledger (`site=window`); only this shim is
     /// `#[track_caller]`, the body is [`Self::on_resize_inner`].
     #[track_caller]
     pub(crate) fn on_resize(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
@@ -9128,47 +7747,24 @@ impl App {
 
     /// The body of [`Self::on_resize`].
     fn on_resize_inner(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
-        // AUTHORITATIVE SIZE. winit's macOS `Resized` payload is emitted from
-        // `frameDidChange:` off the raw NSView frame, which winit itself documents as
-        // unreliable ("the frame size may change without a window resize occurring") and
-        // can momentarily report the WRONG size — observed after a file drag is REJECTED
-        // (an image dragged from a browser puts image DATA, not a file URL, on the
-        // pasteboard; macOS only accepts `NSFilenamesPboardType`, so the drop inserts
-        // nothing): the drop's tracking-rect churn / nested `NSEventTrackingRunLoopMode`
-        // fires a `frameDidChange` with a too-small frame. Trusting that here shrinks the
-        // grid + swapchain and leaves the window "scrunched" — a smaller framebuffer
-        // top-anchored in a full-size window, dead background below — and it STICKS,
-        // because no further resize arrives to correct it (opening a tab, or any other
-        // re-grid, is what heals it). Re-read the window's authoritative `inner_size()`
-        // so a spurious payload can't stick; `pad_split` below already clamps cells to
-        // ≥1, so even a genuine tiny size never yields a zero-dimension grid. Headless /
-        // tests have no `os_window` and keep the caller's `size` (behaviour unchanged).
+        // Re-read the authoritative `inner_size()`: winit's macOS `Resized` payload
+        // comes from `frameDidChange:` and can briefly report a wrong (too small)
+        // size, e.g. during a rejected drag-and-drop, and nothing later corrects
+        // it. `pad_split` clamps cells to ≥1. Headless windows keep `size`.
         let size = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.os_window.as_ref())
             .map_or(size, |w| w.inner_size());
-        // FIRE-INTO-CHROME: fullscreen transitions collapse (and restore) the
-        // titlebar band WITHOUT a scale change, so re-derive the headroom from
-        // AppKit on every real resize of a chrome'd window (a cheap geometry
-        // msg_send). macOS-only: elsewhere the band is always 0. Must run
-        // BEFORE `grid_dims_for` so the rows law sees the new headroom.
+        // Fullscreen transitions collapse and restore the titlebar band without a
+        // scale change, so re-derive the headroom from AppKit on every real resize
+        // of a chrome'd window (macOS only), before `grid_dims_for`.
         //
-        // ACCEPTANCE (fullscreen-toggle draw-error fix): a Resized event can
-        // fire MID-fullscreen-transition, when `contentLayoutRect` and the
-        // content bounds disagree transiently — sampling then used to stick a
-        // bogus band forever (head=0 windowed drew row 0 under the toolbar
-        // chip; an inflated head in fullscreen starved rows above a dead
-        // band). The vendored winit now emits one settled Resized per
-        // completed transition (windowDid{Enter,Exit}FullScreen local patch),
-        // and this block additionally fail-closes each sample: fullscreen
-        // FORCES head 0 (the design invariant — the titlebar detaches); a
-        // windowed chrome'd sample of 0 or beyond the sanity cap restores the
-        // LAST-GOOD-WINDOWED band instead of committing the artifact. The
-        // fallback is `last_windowed_band_pts`, NOT `head_pts`: the applied
-        // `head_pts` is (correctly) 0 for the whole of a fullscreen stay, so
-        // falling back to it on a bad exit sample could only ever "keep" 0 —
-        // the memory slot is what still holds the real band to return to.
+        // Each sample fails closed (`titlebar_band_decision`): fullscreen forces 0;
+        // a windowed chrome'd sample of 0 or above the sanity cap restores
+        // `last_windowed_band_pts` (not `head_pts`, which is 0 throughout
+        // fullscreen). The vendored winit also emits one settled Resized per
+        // completed transition.
         if cfg!(target_os = "macos")
             && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone())
         {
@@ -9186,10 +7782,8 @@ impl App {
             );
             let head = (head_pts * scale).round() as usize;
             if let Some(ws) = self.windows.get_mut(&wid) {
-                // The memory writes unconditionally (it may need to catch up —
-                // e.g. the first windowed sample after attach — while the
-                // applied band is unchanged); the backend retune stays gated
-                // on a real applied change.
+                // The memory always updates (it may need to catch up); the backend
+                // retune runs only on a real applied change.
                 ws.last_windowed_band_pts = band_memory_pts;
                 if ws.head_pts != head_pts || ws.metrics.head != head {
                     ws.head_pts = head_pts;
@@ -9198,38 +7792,19 @@ impl App {
                 }
             }
         }
-        // C3 (Windows + Linux): the SYNTHETIC tab-band head, re-derived. Unlike
-        // macOS's band this one is COMPUTED, not sampled — from the window's own cell box,
-        // the live strip row count and the configured target — so it has to be
-        // re-derived on the one event every input funnels through. And they do all
-        // funnel through here: a font zoom and a config reload both re-grid every
-        // window via `rebuild_backend` → `on_resize`; a `tab_strip_rows` edit calls
-        // `on_resize` explicitly; a per-monitor DPI move produces the `Resized`
-        // winit emits after `ScaleFactorChanged`. Must run BEFORE `grid_dims_for`,
-        // which reserves the head out of the height (same ordering rule as macOS).
+        // Windows/Linux synthetic tab-band head, computed from the cell box, strip
+        // rows and configured target. Every input funnels through here (font zoom
+        // and reload via `rebuild_backend`, `tab_strip_rows` edits, DPI moves via
+        // `Resized`); must run before `grid_dims_for`.
         //
-        // ATTACHED windows only, mirroring every other head derivation in the file
-        // (`refresh_all_window_metrics`, `on_scale_factor_changed`): a never-attached
-        // window has no chrome to make room for, its record carries the sealed boot
-        // band, and seeding a synthetic one would move the geometry every headless
-        // capture/snapshot pins.
+        // Attached windows only, like the other head derivations: a never-attached
+        // window keeps its sealed boot band so headless captures stay stable.
         //
-        // A runtime `cfg!` and NOT a `#[cfg]` attribute — the same form the macOS
-        // band block twelve lines above uses, and for the same reason `TabBandHeight::
-        // PLATFORM_DEFAULT` is a `cfg!` const rather than two `#[cfg]` items: this is
-        // the ONE non-test call site of the whole C3 config chain
-        // (`synthetic_strip_head_px` → `tab_band_height_or_default` → `TabBandHeight`
-        // → `synthetic_band_head_px`), so an attribute here would make every link
-        // unreachable on macOS and hand the lint gate (`-D warnings`, tools/verify.sh)
-        // six `dead_code` findings plus "field `tab_band_height` is never read" there.
-        // As a runtime `false` the body still type-checks on every platform and still
-        // costs nothing: on macOS `PLATFORM_DEFAULT` is `Compact`, so the law would
-        // return 0 even if the branch DID run, and the optimiser drops it whole —
-        // which is also the guard that matters: macOS's `ws.metrics.head` holds a
-        // real MEASURED AppKit titlebar band, and letting this write run there would
-        // clobber it with the law's 0. The Windows-only attach and L1-early-reveal
-        // call sites can stay `#[cfg(windows)]` — one live root per platform is
-        // enough, and Linux's attach path funnels through here.
+        // A runtime `cfg!` rather than `#[cfg]`: this is the only non-test caller
+        // of the `synthetic_strip_head_px` chain, which would otherwise be dead
+        // code on macOS. On macOS `PLATFORM_DEFAULT` is `Compact` and the branch
+        // is compiled out, so the measured AppKit band in `ws.metrics.head` is
+        // never overwritten.
         if cfg!(any(windows, target_os = "linux")) {
             let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
             let cell_h = self.win_cell_size(wid).1;
@@ -9240,38 +7815,21 @@ impl App {
                 .filter(|ws| ws.os_window.is_some())
                 && ws.metrics.head != head
             {
-                // Stored in POINTS beside the applied px, like the measured macOS
-                // band, so the two SHARED re-derivations that read `head_pts`
-                // (`on_scale_factor_changed`, `refresh_all_window_metrics`) can
-                // reproduce a band for this window without knowing this law.
-                //
-                // POINTS ARE A LOSSY CARRIER FOR A DERIVED BAND, deliberately. The law
-                // is `round(target·scale) − pad_top(scale) − rows·cell_h(scale)`, and
-                // only the first term is proportional to `scale`; `round(head_pts·s')`
-                // therefore reproduces the law at a NEW scale only while `pad_top` and
-                // `cell_h` happen to move with the DPI too. Under `font_px_explicit`
-                // (or `--scale`) the font — and so `cell_h` — is pinned, and
-                // the interim band is off by the residue. That is accepted, not
-                // overlooked: `ScaleFactorChanged` is always followed by the `Resized`
-                // winit emits for the new size, which lands right back here and
-                // re-derives from the law, so the drift can survive at most one frame
-                // and never reaches a committed geometry.
+                // Stored in points beside the applied px so the shared re-derivations
+                // reading `head_pts` (`on_scale_factor_changed`,
+                // `refresh_all_window_metrics`) can reproduce it. Lossy at a new
+                // scale when the font is pinned, but the `Resized` that follows
+                // `ScaleFactorChanged` re-derives it here within one frame.
                 ws.head_pts = head as f64 / if scale > 0.0 { scale } else { 1.0 };
                 ws.metrics.head = head;
                 self.backend.set_head(head);
             }
         }
         let (rows, cols) = self.grid_dims_for(wid, size);
-        // Phase 0.5: route through the seam so the window-resize and the control
-        // `resize` verb share the one clamp + apply path. `echo_to_window: false`
-        // is the KEY (RES-1 regression fix): the window ALREADY has this size (the
-        // user is dragging the edge / the WM resized us), so the seam applies the
-        // term+PTY+framebuffer resize via `apply_term_resize` WITHOUT calling
-        // `request_inner_size` — re-requesting the size would fight an interactive
-        // edge-drag and risk a resize feedback loop. Only the `resize` VERB (no
-        // window event of its own) sets `echo_to_window: true`. This is a transport
-        // flag, not a `Source` branch — both a human-issued and a controller-issued
-        // `resize` verb echo the same way.
+        // Route through the shared seam so window resizes and the `resize` verb
+        // use one clamp and apply path. `echo_to_window: false` because the
+        // window already has this size; re-requesting it would fight an edge drag.
+        // Only the `resize` verb echoes.
         self.input(
             wid,
             InputEvent::Resize {
@@ -9283,16 +7841,35 @@ impl App {
         );
     }
 
-    /// THE CHROME ROWS CHANGED — the tab strip took more/fewer rows, or a status
-    /// bar appeared or folded — so every window is re-split between chrome and
-    /// terminal: clear each window's strip cache + force a repaint, and re-grid
-    /// each from its own OS window size (the chrome now takes more/fewer rows,
-    /// and the PTY is told — `on_resize` → `apply_term_resize`, a no-op when the
-    /// count did not actually move). The chrome is GLOBAL, but
-    /// `tab_segments`/`last_present` are per-window, hence the sweep. Shared by
-    /// the `tab_strip_rows` reload and `App::sync_message_band_rows` so the two
-    /// cannot re-grid by different laws.
+    /// Chrome rows changed (tab strip or status bar): clear each window's strip
+    /// cache, repaint, and re-grid it from its OS size (`on_resize` →
+    /// `apply_term_resize`, a no-op when the count did not move). Shared by the
+    /// `tab_strip_rows` reload and `App::sync_message_band_rows`.
+    ///
+    /// Resize entry point for the ledger (`site=chrome`, outermost, so each
+    /// window's `on_resize` books under it); only this shim is
+    /// `#[track_caller]`. Inside [`Self::with_chrome_regrid_batch`] it is
+    /// recorded and applied at the batch's end.
+    #[track_caller]
     pub(crate) fn regrid_for_chrome_rows(&mut self) {
+        if let Some(batch) = self.chrome_regrid_batch.as_mut() {
+            batch.all();
+            return;
+        }
+        let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Chrome);
+        self.regrid_for_chrome_rows_inner();
+    }
+
+    /// The body of [`Self::regrid_for_chrome_rows`].
+    fn regrid_for_chrome_rows_inner(&mut self) {
+        #[cfg(test)]
+        {
+            crate::resize_ledger::note_chrome_regrid_site_for_test();
+            let windows: Vec<WindowId> = self.windows.keys().copied().collect();
+            for wid in windows {
+                crate::app_presence::note_chrome_regrid_applied(self, wid);
+            }
+        }
         let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
             .windows
             .iter_mut()
@@ -9306,43 +7883,33 @@ impl App {
         for (wid, size) in sized {
             self.on_resize(wid, size);
             if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                // W1 (Linux): the whole-cell min-size lattice folds the chrome
-                // rows in, so it moves with them — re-push it, or an edge drag
-                // snaps to a lattice one row off and shaves a row.
+                // Linux: the whole-cell min-size lattice includes chrome rows, so
+                // re-push it or an edge drag snaps one row off.
                 #[cfg(target_os = "linux")]
                 w.set_min_inner_size(Some(self.whole_cell_min_size(wid)));
                 w.request_redraw();
             }
         }
+        // The band moved with the chrome, under a pointer that did not
+        // (round 44): its lit chip is resolved again.
+        self.refresh_band_hover();
     }
 
-    /// The grid `(rows, cols)` window `wid` gets for raw window `size` — the
-    /// PURE half of [`Self::on_resize`] (which also applies it), shared with
-    /// [`Self::apply_window_scale`]'s safety-net gate so both derive from the ONE law.
+    /// The `(rows, cols)` window `wid` gets for raw `size`: the pure half of
+    /// [`Self::on_resize`], shared with [`Self::apply_window_scale`] and
+    /// [`Self::settle_initial_frame`].
     ///
-    /// W12: grids THIS window from ITS OWN cell metrics (mixed-DPI) — a resize of a
-    /// background, different-DPI window must divide by that window's cell box, not
-    /// whichever window the shared renderer is currently activated to. The grid
-    /// occupies the window MINUS the `2·pad` interior border — the inverse of
-    /// `frame_px`; this is the PROVEN `aterm_render::pad_split` policy (maximal grid;
-    /// the `0..cell-1` remainder is absorbed into per-edge theme-bg bands at present
-    /// time, so the swapchain can be the RAW window size and the compositor never
-    /// rescales) — the same `cells` as the historical `max(usable/cell, 1)`, now the
-    /// law the ty model + lattice tests pin. The chrome rows — the tab strip plus
-    /// any live status bar ([`Self::chrome_rows`]) — are reserved out of the
-    /// terminal grid while always leaving at least one terminal row.
-    /// `pub(crate)` so the LINUX INITIAL-FRAME SETTLE
-    /// ([`Self::settle_initial_frame`], in `app_window`) can ask the ONE grid law
-    /// "does this surface already carry the grid the attach asked for?" instead of
-    /// re-deriving a private copy of it.
+    /// Uses this window's own cell metrics (mixed DPI). The grid fills the window
+    /// minus the `2·pad` border by `aterm_render::pad_split` (maximal grid; the
+    /// remainder becomes theme-bg bands at present, so the swapchain is the raw
+    /// window size). Chrome rows ([`Self::chrome_rows`]) are reserved out of the
+    /// grid, leaving at least one terminal row.
     pub(crate) fn grid_dims_for(&self, wid: WindowId, size: PhysicalSize<u32>) -> (u16, u16) {
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid);
         let cols = aterm_render::pad_split(size.width as usize, pad, cw).cells as u16;
-        // FIRE-INTO-CHROME rows law: the chrome headroom (the titlebar band above
-        // the padded grid) is reserved OUT of the height before fitting. Top and
-        // bottom are explicit: tightening the top no longer silently expands the
-        // bottom. Equal pads reduce to the historical `pad_split` cell count.
+        // Reserve the chrome headroom out of the height before fitting; top and
+        // bottom pads are explicit.
         let win_rows = crate::asymmetric_pad_cells(
             (size.height as usize).saturating_sub(self.win_head(wid)),
             self.win_pad_top(wid),
@@ -9353,30 +7920,16 @@ impl App {
         (rows, cols)
     }
 
-    /// W1 (Wayland column-shave fix, fixwave5): the min inner size that puts
-    /// the resize-increment lattice ON the whole-cell frame lattice for
-    /// window `wid`.
+    /// Minimum inner size that aligns the resize-increment lattice with the
+    /// whole-cell frame lattice for window `wid`.
     ///
-    /// winit's Wayland backend snaps every INTERACTIVE resize to
-    /// `min_inner_size + k·increment` (the X11 base-size convention, with the
-    /// min standing in as the base). With the min at the arbitrary UX floor
-    /// (164×98 logical), that lattice is incongruent with the frame law
-    /// (`2·pad + cols·cell_w` wide), so a PURE-VERTICAL bottom-edge drag
-    /// re-snapped the untouched width down by up to `cell_w − 1` px — below
-    /// the exact fit — and shaved one column (the band residue absorbed
-    /// asymmetrically by the snap). Anchoring the min to the frame lattice
-    /// makes every snapped size an exact whole-cell frame, so an edge drag
-    /// can never shave a column (or row) the user did not drag away.
-    ///
-    /// The historical 164×98 LOGICAL floor is kept as a lower bound: the
-    /// returned min is the smallest lattice point at or above it, in PHYSICAL
-    /// px — the same unit the increments are passed in, so winit's logical
-    /// conversion treats base and step alike.
-    // PLATFORM SCOPE, mirrored from the caller: the only call site is
-    // `app_window.rs`'s `set_min_inner_size`, which is `#[cfg(target_os = "linux")]`
-    // ("macOS/Windows never carried a whole-cell floor"). Without the same cfg here
-    // the fn is dead on every other target and trips the dead-code gate.
-    // `test` is in the set because this module's own tests call it on every host.
+    /// winit's Wayland backend snaps interactive resizes to
+    /// `min_inner_size + k·increment`; with an arbitrary minimum, a vertical drag
+    /// could snap the width down and shave a column. The result is the smallest
+    /// lattice point at or above the 164×98 logical floor, in physical px like
+    /// the increments.
+    // Linux-only like its sole caller (`app_window.rs`'s `set_min_inner_size`);
+    // `test` because this module's tests call it on every host.
     #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn whole_cell_min_size(&self, wid: WindowId) -> PhysicalSize<u32> {
         let (cw, ch) = self.win_cell_size(wid);
@@ -9402,28 +7955,15 @@ impl App {
         )
     }
 
-    /// Whether applying `size` to window `wid` would change its COLUMN count —
-    /// i.e. whether the resize about to be applied carries a scrollback rewrap.
+    /// Whether applying `size` to window `wid` changes its column count, i.e.
+    /// carries a scrollback rewrap; the predicate for
+    /// [`Self::on_resize_throttled`].
     ///
-    /// This is the throttle's real predicate (see [`Self::on_resize_throttled`]).
-    /// It reads the window's authoritative `inner_size()` exactly as
-    /// [`Self::on_resize`] does, because the winit macOS `Resized` payload is
-    /// documented-unreliable and a spurious width there would otherwise coalesce a
-    /// resize that is not actually a reflow (or vice versa). Headless windows
-    /// (no `os_window`) keep the caller's `size`, matching `on_resize`.
-    ///
-    /// Comparing COLS only is what makes this agree with the resize it is deciding
-    /// about even though `on_resize` re-derives the macOS titlebar band first: the
-    /// band is reserved out of the HEIGHT, so it can move `rows` but never `cols`,
-    /// which is a pure function of width, pad and cell width.
-    ///
-    /// Conservative on the unknown, and on disagreement: a window we cannot find is
-    /// treated as reflowing, so an unrecognized id keeps the old throttled behaviour
-    /// rather than bypassing a guard on a guess. The same applies to the one case
-    /// where `ws.cols` cannot track the derived value — a grid outside
-    /// `MAX_GRID_ROWS`/`MAX_GRID_COLS` is `RangeRejected` before `apply_term_resize`
-    /// runs, so `ws.cols` never catches up and this reports "reflows" forever. That
-    /// is the safe direction (the window keeps the throttle it had), not a defect.
+    /// Reads the authoritative `inner_size()` like [`Self::on_resize`] (headless
+    /// windows keep `size`). Only cols are compared because the titlebar band
+    /// affects rows, not cols. An unknown window, or a grid outside
+    /// `MAX_GRID_ROWS`/`MAX_GRID_COLS` (whose `ws.cols` never catches up),
+    /// reports "reflows", keeping the throttle.
     fn resize_changes_columns(&self, wid: WindowId, size: PhysicalSize<u32>) -> bool {
         let Some(ws) = self.windows.get(&wid) else {
             return true;
@@ -9433,19 +7973,16 @@ impl App {
         cols != ws.cols
     }
 
-    /// Live font zoom (Cmd-+/Cmd--/Cmd-0): rebuild the [`Backend`] at `px`, then
-    /// re-grid for the new cell size in the SAME window (more/fewer rows+cols) and
-    /// tell the PTY. A failed rebuild (GPU hiccup / no font) keeps the current size
-    /// — zoom never crashes. No-op without a window (headless).
+    /// Live font zoom (Cmd-+/Cmd--/Cmd-0): rebuild the [`Backend`] at `px`,
+    /// re-grid each window and tell the PTY. A failed rebuild keeps the current
+    /// size. No-op without a window.
     pub(crate) fn set_font_px(&mut self, px: f32) {
         let _ = self.set_font_px_with(px, Self::rebuild_backend);
     }
 
-    /// Transactional core of [`Self::set_font_px`]. Keeping the fallible rebuild
-    /// behind an injected closure gives the rollback path a deterministic test:
-    /// renderer construction can fail, but the App's font authority and every
-    /// per-window metrics record must remain paired with the renderer that is
-    /// still live.
+    /// Transactional core of [`Self::set_font_px`]. The rebuild is an injected
+    /// closure so the rollback path is testable: on failure the App's font and
+    /// per-window metrics stay paired with the live renderer.
     pub(crate) fn set_font_px_with(
         &mut self,
         px: f32,
@@ -9458,28 +7995,18 @@ impl App {
         let previous_px = self.font_px;
         let previous_explicit = self.font_px_explicit;
         self.font_px = px;
-        // A live zoom is an EXPLICIT font size, exactly like `--font-px` /
-        // `config.font_px`: pin it so (a) HiDPI auto-scale (`apply_window_scale`) can't
-        // revert the zoom on the next scale re-eval, and (b) `refresh_all_window_metrics`
-        // resolves each window at THIS px (`applied`) instead of the scale-derived
-        // default (`for_scale`) — without the pin an auto (non-explicit) window's zoom is
-        // silently discarded.
+        // A live zoom is an explicit size like `--font-px`: pin it so auto-scale
+        // cannot revert it and `refresh_all_window_metrics` resolves at this px.
         self.font_px_explicit = true;
-        // W12: the per-window `MetricsView` is the pixel authority `win_cell_size` /
-        // `win_pad` read — INCLUDING the re-grid inside `rebuild_backend`. Re-resolve it
-        // to the new px FIRST, mirroring the config-reload path (which skips
-        // `apply_window_scale` the same way, see `refresh_all_window_metrics`'s callsite);
-        // otherwise the re-grid divides each window by the STALE cell box, so the grid +
-        // PTY never resize (the zoom looks dead) while the rebuilt backend draws the
-        // new-size glyphs into the old layout — bigger cells overflowing their slots, i.e.
-        // "font size does nothing and the glyphs garble".
+        // Re-resolve per-window metrics to the new px before `rebuild_backend`
+        // re-grids, as config reload does; otherwise the re-grid divides by the
+        // stale cell box and new glyphs overflow the old layout.
         self.refresh_all_window_metrics();
         if rebuild(self) {
             true
         } else {
-            // `rebuild_backend` leaves the old renderer untouched on failure.
-            // Restore its matching App/window metrics too; otherwise input,
-            // geometry and the next frame would disagree about the cell box.
+            // The old renderer survives a failed rebuild; restore its matching
+            // App and window metrics too.
             self.font_px = previous_px;
             self.font_px_explicit = previous_explicit;
             self.refresh_all_window_metrics();
@@ -9487,10 +8014,9 @@ impl App {
         }
     }
 
-    /// Commit the config-reload render transaction only after the backend accepts
-    /// its candidate font/geometry state. The injected rebuild seam is the same
-    /// deterministic failure hook used by the regression test; production passes
-    /// [`Self::rebuild_backend`].
+    /// Commit the reload render transaction only after the backend accepts the
+    /// candidate font/geometry. Production passes [`Self::rebuild_backend`]; the
+    /// seam lets tests inject a failure.
     fn finish_reload_render_transaction_with(
         &mut self,
         previous: ReloadRenderSnapshot,
@@ -9507,10 +8033,9 @@ impl App {
         }
     }
 
-    /// The live glyph-affecting knobs, as the App holds them — the join's and
-    /// every rebuild's input to `Backend::pin_glyph_raster_knobs`. At launch
-    /// these ARE the values `main_entry` resolved once and handed the backend
-    /// worker (the fields are seeded from the same [`GlyphRasterKnobs`]).
+    /// The live glyph-affecting knobs, input to
+    /// `Backend::pin_glyph_raster_knobs`. At launch they equal what `main_entry`
+    /// handed the backend worker.
     pub(crate) fn glyph_raster_knobs(&self) -> GlyphRasterKnobs {
         GlyphRasterKnobs {
             text_shaping: self.text_shaping.clone(),
@@ -9522,14 +8047,12 @@ impl App {
         }
     }
 
-    /// Re-pin every memory-backed App-owned renderer setting onto a freshly
-    /// constructed or re-faced backend. Path-backed font generations cross
-    /// their own worker-only prepare/seal boundary before publication.
+    /// Re-pin every memory-backed App-owned renderer setting onto a new or
+    /// re-faced backend. Path-backed font generations are prepared and sealed
+    /// on their own worker.
     pub(crate) fn pin_backend_render_config_core(&mut self) {
-        // The glyph-affecting subset goes through the ONE setter list the
-        // backend worker also ran before its post-seal warm
-        // (`GlyphRasterKnobs`): same values, so every setter here early-outs
-        // and the warm reaches the first frame.
+        // The glyph subset uses the same setter list the worker ran before its
+        // warm, so each setter early-outs and the warm survives.
         let raster = self.glyph_raster_knobs();
         self.backend.pin_glyph_raster_knobs(&raster);
         self.backend.set_text_blending(self.text_blending);
@@ -9543,21 +8066,17 @@ impl App {
         self.backend.set_adjust_underline(upos, uthick);
         self.backend
             .set_underline_skip_descenders(self.render_knobs.underline_skip_descenders);
-        // A combined opacity + font/geometry reload reaches this repin path
-        // instead of `apply_render_knob`. End a windowed macOS swapchain tap before the
-        // newly translucent renderer can present a frame whose compositor-owned
-        // backdrop is absent from the raw recording.
+        // A combined opacity and font/geometry reload lands here, so end a
+        // windowed macOS swapchain tap before a translucent frame (whose
+        // compositor backdrop the raw recording lacks) can present.
         let _ = self.video_abort_translucent_swapchain(
             self.render_knobs.background_opacity,
             cfg!(target_os = "macos"),
         );
         self.backend
             .set_background_opacity(self.render_knobs.background_opacity);
-        // `backend_kind_undecided` keeps a headless launch's UNREDEEMED GPU intent
-        // out of these two "this run cannot do it" verdicts: the backend really is
-        // the CPU renderer at this instant, but `ensure_pixel_backend` may still
-        // install the device, and a deferral is not allowed to invent a diagnostic
-        // the same launch would not have printed before.
+        // `backend_kind_undecided`: a headless launch may still install the GPU
+        // (`ensure_pixel_backend`), so do not print CPU-only diagnostics yet.
         if !self.backend.is_gpu() && !self.backend_kind_undecided() {
             if self.render_knobs.background_opacity < 1.0 {
                 warn_background_opacity_unimplemented_once();
@@ -9568,12 +8087,9 @@ impl App {
         }
     }
 
-    /// Rebuild the [`Backend`] from the CURRENT `self.font_px` + `self.theme`,
-    /// re-grid the window for the new cell metrics, and repaint. The single proven
-    /// rebuild path shared by live font-zoom ([`Self::set_font_px`]) and live
-    /// config hot-reload ([`Self::reload_config`]) — a font-size OR theme change.
-    /// A failed rebuild (GPU hiccup / no font) keeps the current backend, so a
-    /// reload/zoom never crashes. No-op re-grid without a window (headless).
+    /// Rebuild the [`Backend`] from the current `font_px` and `theme`, re-grid
+    /// and repaint. Shared by font zoom ([`Self::set_font_px`]) and config reload
+    /// ([`Self::reload_config`]). A failed rebuild keeps the current backend.
     #[must_use = "a failed rebuild leaves the prior renderer live and requires caller policy"]
     pub(crate) fn rebuild_backend(&mut self) -> bool {
         self.rebuild_backend_with_prepared(None)
@@ -9586,11 +8102,8 @@ impl App {
             crate::tray_raster::PreparedChromeFonts,
         )>,
     ) -> bool {
-        // Preserve the interior padding across the rebuild — a fresh backend starts
-        // at `pad == 0`, so a font-zoom / config-reload would otherwise drop the
-        // border. (The pad is a device-px constant for the session's scale; it does
-        // not change with the font size.) Ditto the chrome headroom: a device-px
-        // constant for the window's titlebar band, independent of the font.
+        // Preserve the padding and chrome headroom across the rebuild (a fresh
+        // backend starts at 0); both are device-px constants independent of font.
         let pad = self.backend.pad();
         let pad_top = self.backend.pad_top();
         let head = self.backend.head();
@@ -9603,18 +8116,13 @@ impl App {
                 self.font_family.clone(),
                 self.theme,
             );
-            // The catalog worker sealed the generation it prepared, so the debt a
-            // headless launch may still be carrying is settled by the swap itself
-            // — redeeming it first would read three font files into the renderer
-            // this line replaces, and the discovery intern never evicts.
+            // The catalog worker sealed its generation, so the swap settles any
+            // deferred headless seal debt; redeeming first would read fonts into a
+            // renderer about to be replaced.
             self.settle_deferred_font_seal();
         } else {
-            // "From admitted" means FROM RESIDENT BYTES, which a deferred headless
-            // generation does not yet have: `rebuild_from_admitted` refuses an
-            // unsealed one outright, and a live theme reload would fail-soft into
-            // keeping the old renderer for a reason that has nothing to do with
-            // the reload. Redeem the seal first so this path sees the generation
-            // an eager launch would have handed it.
+            // `rebuild_from_admitted` needs resident bytes and refuses an unsealed
+            // deferred headless generation, so redeem the seal first.
             self.redeem_deferred_font_seal();
             if let Err(error) = self
                 .backend
@@ -9632,20 +8140,15 @@ impl App {
         // Re-apply every configured shaping/typography/render/font setting. In
         // particular line_height lands before the re-grid below.
         self.pin_backend_render_config_core();
-        // Replacing WindowGpu below destroys any swapchain/virtual tap. End the
-        // recording while that tap and its reply/output-dir ownership are still
-        // coherent instead of leaving a deadline-backed zombie.
+        // Replacing WindowGpu destroys any swapchain/virtual tap; end the
+        // recording while its ownership is still coherent.
         let _ = self.video_abort_backend_rebuild();
-        // The atlas/face changed, so every window's offscreen + dirty-gate are stale.
-        // Reset the per-window GPU caches (the swapchain stays valid — same device) and
-        // the introspection scratch, and force a repaint. NOTE: the swapchains and OS
-        // windows are untouched, so no surface is orphaned.
-        self.reset_gpu_window_caches();
-        // Re-grid EVERY window that has an OS window for the new cell metrics (from
-        // ITS OWN inner_size), then repaint it. At n==1 this is the one window —
-        // identical to the old front-only re-grid. W1: also refresh each window's
-        // whole-cell resize increments (the cell metrics just changed) and its
-        // recorded raw pixel size, so the swapchain keeps tracking the window.
+        // The atlas/face changed: reset both renderers' per-window caches and the
+        // introspection scratch, and repaint. Swapchains and OS windows survive.
+        self.reset_window_raster_caches();
+        // Re-grid every OS window for the new cell metrics from its own
+        // inner_size, refresh its resize increments and recorded raw size, then
+        // repaint.
         let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
             .windows
             .iter()
@@ -9671,15 +8174,9 @@ impl App {
             }
             self.on_resize(wid, size);
             if let Some(ws) = self.windows.get_mut(&wid) {
-                let window = ws.os_window.clone();
-                // A live font/theme rebuild is an external visual stimulus.
-                // Couple the recovery reset to its repaint edge and retain the
-                // acknowledgement until a real present/drop.
-                let _ = crate::rearm_present_and_request(&mut ws.present_retry, true, || {
-                    if let Some(window) = window {
-                        window.request_redraw();
-                    }
-                });
+                // A font/theme rebuild is an external visual stimulus: couple the
+                // recovery reset to its repaint edge until a real present or drop.
+                ws.rearm_present(true);
             }
         }
         // The primary face may have changed (family/zoom reload): re-hand the
@@ -9689,34 +8186,37 @@ impl App {
         } else {
             self.sync_chrome_fonts();
         }
-        // M5: a rebuild re-pinned the bg opacity on the new face; keep the
-        // window-level vibrancy (backdrop + opacity flip) in step on the GPU
-        // backend. Idempotent — no-op at the solid default / off macOS.
+        // Re-apply window vibrancy after the rebuild re-pinned bg opacity
+        // (idempotent; no-op when solid or off macOS).
         if self.backend.is_gpu() {
             self.apply_window_vibrancy();
         }
         true
     }
 
-    /// Reset every per-window GPU cache (`WindowGpu`: offscreen + dirty-gate /
-    /// scissor state) and the introspection scratch after the renderer's face
-    /// or device changed, keeping the surface/monitor state (EDR headroom,
-    /// reference-white scale, capture colour space) that is NOT a render cache.
-    /// Extracted verbatim from [`Self::rebuild_backend_with_prepared`]; the H1
-    /// fail-soft rebuild (`retry_attach_on_opaque_swapchain`) calls it too, where
-    /// the device itself was replaced — a `Virtual` target holding old-device
-    /// textures must not survive into the fresh context.
-    pub(crate) fn reset_gpu_window_caches(&mut self) {
+    /// Reset every per-window raster cache after the face or device changed:
+    /// both renderers' content caches and the `RepaintKey` gate
+    /// (`WindowState::invalidate_raster_caches`), a fresh `WindowGpu`
+    /// (offscreen, dirty gate, scissor) that keeps the surface state (EDR
+    /// headroom, reference-white scale, capture colour space), and the
+    /// introspection scratch. Also used by `retry_attach_on_opaque_swapchain`,
+    /// where the device itself was replaced and old-device textures must not
+    /// survive.
+    ///
+    /// The CPU cache must go too: it keys on frame size, grid origin and font
+    /// epoch, and a new face at the same cell box can repeat all three (a
+    /// prepared generation seals to the boot epoch, `rebuild_from_admitted`
+    /// restarts it), so it would gate-hit on the old glyphs.
+    pub(crate) fn reset_window_raster_caches(&mut self) {
         self.introspect_gpu = aterm_gpu::WindowGpu::new();
         for ws in self.windows.values_mut() {
+            ws.invalidate_raster_caches();
             if let Some(
                 PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
             ) = &mut ws.present
             {
-                // M3 phase B + capture colour: per-screen EDR headroom,
-                // reference-white scaling, and the compositor's colour-space
-                // tag survive the cache reset. They are surface/monitor state,
-                // not render caches.
+                // EDR headroom, reference-white scaling and the colour-space tag
+                // are surface state, not caches.
                 let edr = window_gpu.edr_max();
                 let sdr_white_scale = window_gpu.sdr_white_scale();
                 let capture_color_space = window_gpu.capture_color_space();
@@ -9725,23 +8225,19 @@ impl App {
                 window_gpu.set_sdr_white_scale(sdr_white_scale);
                 window_gpu.set_capture_color_space(capture_color_space);
             }
-            ws.last_present = None;
-            // Headless has no winit redraw edge to acknowledge: image capture
-            // renders synchronously, while an in-flight Virtual recording owns
-            // its own paced timer. Reopen its gate without manufacturing a fake
-            // outstanding OS request. Windowed targets use the coupled helper
-            // after their geometry is rebuilt by the caller.
+            // Headless has no winit redraw edge: capture renders synchronously
+            // and a Virtual recording has its own timer, so reopen the gate
+            // directly. Windowed targets use the coupled helper later.
             if ws.os_window.is_none() {
                 let _ = ws.present_retry.on_external_stimulus();
             }
         }
     }
 
-    /// Hand the renderer's resolved PRIMARY face bytes (+ the discovered real
-    /// `-Bold` sibling) to the chrome rasterizer ([`crate::tray_raster`]), so the
-    /// Settings/About/Palette overlays render in the USER'S terminal font — the
-    /// embedded DejaVu stays strictly a per-char coverage fallback. Called after
-    /// every backend (re)build; the overlays re-rasterize on their next repaint.
+    /// Hand the renderer's primary face bytes (and the discovered `-Bold`
+    /// sibling) to [`crate::tray_raster`] so the Settings/About/Palette overlays
+    /// use the user's terminal font; embedded DejaVu stays a per-char fallback.
+    /// Called after every backend build.
     pub(crate) fn sync_chrome_fonts(&mut self) {
         let (font_px, theme) = (self.font_px, self.theme);
         let (primary, bold, semantic) = match self.backend.ready_mut() {
@@ -9759,13 +8255,10 @@ impl App {
         crate::tray_raster::set_chrome_fonts(primary, bold, semantic);
     }
 
-    /// Route ONE renderer knob change to EXACTLY ONE renderer call (W5) — the
-    /// mapping the config round-trip test pins. Shared by startup (apply the
-    /// non-default knobs onto the fresh backend) and hot-reload (apply the
-    /// diff). `SelectionInactive` has no immediate backend call by design: the
-    /// per-window present seam (`redraw_window`) folds the App-cached knob
-    /// with THIS window's live focus every frame, so a mid-session config flip
-    /// takes effect on the next present.
+    /// Route one renderer knob change to exactly one renderer call (pinned by the
+    /// config round-trip test). Used at startup and on reload.
+    /// `SelectionInactive` has no backend call: `redraw_window` folds it with
+    /// the window's focus every frame.
     pub(crate) fn apply_render_knob(&mut self, change: KnobChange) {
         match change {
             KnobChange::LineHeight(v) => self.backend.set_line_height(v),
@@ -9778,40 +8271,30 @@ impl App {
                 self.backend.set_underline_skip_descenders(v);
             }
             KnobChange::BackgroundOpacity(v) => {
-                // The recording was admitted while the client was opaque. Abort
-                // it before this live renderer change can append a translucent
-                // raw layer under the recording's original opaque admission.
+                // The recording was admitted opaque; abort it before a translucent
+                // raw layer can be appended.
                 let _ = self.video_abort_translucent_swapchain(v, cfg!(target_os = "macos"));
                 self.backend.set_background_opacity(v);
-                // M5 TRUE VIBRANCY: on the GPU backend the translucent present path
-                // IS wired (PostMultiplied swapchain + NSVisualEffectView), so a
-                // live opacity edit re-applies the window/Metal-layer opacity flip
-                // and backdrop (`self.render_knobs` already holds the new value).
-                // The CPU softbuffer surface is opaque with no non-opaque composite,
-                // so a translucent value there stays honestly solid — the warn-once.
+                // On the GPU backend, re-apply the window/layer opacity flip and
+                // backdrop. The CPU surface is opaque, so it stays solid and warns
+                // once.
                 if self.backend.is_gpu() {
                     self.apply_window_vibrancy();
                 } else if v < 1.0 && !self.backend_kind_undecided() {
                     warn_background_opacity_unimplemented_once();
                 }
             }
-            // The window-level NSVisualEffectView backdrop is driven from the
-            // resolved knobs: on the GPU backend re-apply it live (it only shows
-            // when the window is also translucent); on the CPU backend it has no
-            // consumer, so a non-`none` material warns once.
+            // The NSVisualEffectView backdrop follows the knobs: re-applied live on
+            // the GPU backend (visible only when translucent); on CPU a non-`none`
+            // material warns once.
             KnobChange::BackgroundMaterial(m) => {
                 if self.backend.is_gpu() {
-                    // H1 (Windows Mica/Acrylic): mirror the knob onto the GPU
-                    // renderer FIRST, so the redraw `apply_window_vibrancy`
-                    // nudges reconciles the swapchain composite mode against
-                    // the new value (Opaque ⇄ PreMultiplied on a DComp visual
-                    // instance). Both directions matter live: material → none
-                    // MUST go opaque (with no DWM backdrop installed behind the
-                    // visual, margin alpha would expose the windows behind);
-                    // none → material re-engages the margins — but only when
-                    // the instance was BUILT visual (material set at launch).
-                    // A reload onto a plain HWND-swapchain instance stays
-                    // DWM-chrome-only, which `window_set_vibrancy` diagnoses.
+                    // Windows Mica/Acrylic: update the GPU renderer first so the
+                    // redraw reconciles the swapchain composite mode (Opaque ⇄
+                    // PreMultiplied on a DComp visual). Material → none must go
+                    // opaque; none → material re-engages only if the instance was
+                    // built as a visual. A plain HWND swapchain stays DWM-chrome
+                    // only, which `window_set_vibrancy` diagnoses.
                     if let Some(g) = self.backend.gpu_mut() {
                         g.set_backdrop_margins(m != BackgroundMaterial::None);
                     }
@@ -9823,15 +8306,11 @@ impl App {
         }
     }
 
-    /// M5 TRUE VIBRANCY: (re)apply the window-level `NSVisualEffectView` backdrop
-    /// and the window/Metal-layer opacity flip to EVERY attached window from the
-    /// resolved `background_material` / `background_opacity` knobs (the source of
-    /// truth on `self.render_knobs`). Called at window attach and on a live
-    /// `background_opacity` / `background_material` reload. `translucent` is
-    /// `background_opacity < 1.0`; the theme `bg` restores the opaque seamless-
-    /// titlebar fill when translucency turns off. No-op off macOS (the Linux apprt
-    /// stub does nothing). Each window is nudged to repaint so the GPU present
-    /// reconciles the swapchain composite-alpha mode on its next frame.
+    /// Apply the `NSVisualEffectView` backdrop and window/layer opacity to every
+    /// attached window from the resolved knobs, at attach and on a
+    /// `background_opacity` / `background_material` reload. The theme `bg`
+    /// restores the opaque titlebar fill when translucency turns off. No-op off
+    /// macOS. Each window repaints so the swapchain composite mode reconciles.
     pub(crate) fn apply_window_vibrancy(&self) {
         let material = self.render_knobs.background_material;
         let translucent =
@@ -9846,41 +8325,28 @@ impl App {
         }
     }
 
-    /// Live THEME-ONLY swap — the cheap sibling of [`Self::rebuild_backend`], shared
-    /// by [`Self::reload_config`] (colour-only config edit) and
-    /// [`Self::sync_app_theme_to_appearance`] (OS light/dark flip on a split theme).
-    /// Glyphs are coverage masks coloured at draw time, so a fg/bg/cursor/selection
-    /// change leaves the face, glyph atlas, and cell metrics all valid: push the new
-    /// [`Theme`] onto the LIVE backend — no font re-parse, no atlas drop, no re-grid.
-    /// Any font-px or family change must still go through `rebuild_backend`.
+    /// Live theme-only swap, the cheap sibling of [`Self::rebuild_backend`], used
+    /// by [`Self::reload_config`] and [`Self::sync_app_theme_to_appearance`].
+    /// Glyphs are coloured at draw time, so the new [`Theme`] goes onto the live
+    /// backend without re-parsing fonts, dropping the atlas or re-gridding.
     ///
-    /// The theme is NOT cell content, so every presentation cache that diffs on
-    /// content would stale-serve the OLD colours on a byte-idle grid (selection
-    /// band, idle cursor, padding border) and must be dropped here: the E3
-    /// strip-row cache (+ macOS titlebar bg, kept in step with the terminal bg),
-    /// the per-window CPU pixel cache / GPU prev-frame / `RepaintKey` gate, and the
-    /// introspection readback scratch.
+    /// Theme is not cell content, so content-diffing caches must be dropped: the
+    /// strip-row cache (and macOS titlebar bg), per-window CPU pixel cache, GPU
+    /// prev-frame, `RepaintKey` gate and introspection scratch.
     pub(crate) fn apply_theme_live(&mut self, new_theme: Theme) {
         // Assign FIRST so later rebuilds/zooms bake the new theme.
         self.theme = new_theme;
-        // PHOSPHOR: the rain ramp + §6 luminance derivation are computed from
-        // this theme's bg/fg — an OS light/dark flip (this fn's
-        // `sync_app_theme_to_appearance` caller never passes through
-        // `reload_config`) must re-resolve them or the field keeps raining the
-        // OLD theme's tints over the new background.
+        // Matrix rain derives its ramp from the theme; an OS appearance flip
+        // skips `reload_config`, so mark it dirty here.
         self.rain_dirty = true;
         match self.backend.ready_mut() {
             Backend::Cpu(r) => r.set_theme(new_theme),
             Backend::Gpu(g) => g.set_theme(new_theme),
         }
         self.introspect_gpu.invalidate_present();
-        // LINUX CSD: the header band's light/dark variant is resolved FROM this
-        // terminal theme when config `window_theme` is Auto (chrome_theme_for_apprt),
-        // so a live theme swap must re-push it or the header keeps the OLD side.
-        // Resolved before the windows borrow; macOS/Windows deliberately skip the
-        // re-push — their chrome already tracks via `window_set_background_color`
-        // below / the DWM config policy, and their `window_set_appearance` does
-        // strictly more work than a variant flip.
+        // Linux CSD: the header's light/dark variant follows this theme under
+        // `window_theme = auto`, so re-push it. macOS/Windows chrome already
+        // tracks via `window_set_background_color` / DWM.
         #[cfg(target_os = "linux")]
         let linux_chrome_theme = self.chrome_theme_for_apprt();
         let bg = new_theme.bg;
@@ -9889,14 +8355,7 @@ impl App {
         let strip_dark = crate::tab_bar::theme_is_dark(bg);
         for (wid, ws) in self.windows.iter_mut() {
             ws.last_strip_fp = None;
-            ws.last_present = None;
-            ws.cpu_cache.invalidate();
-            if let Some(
-                PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
-            ) = &mut ws.present
-            {
-                window_gpu.invalidate_present();
-            }
+            ws.invalidate_raster_caches();
             if let Some(w) = ws.os_window.as_ref() {
                 apprt.window_set_background_color(w, bg);
                 #[cfg(target_os = "linux")]
@@ -9910,34 +8369,22 @@ impl App {
                 crate::toolbar::set_active_tab_color(handle, self.config.active_tab_color_rgb());
             }
         }
-        // This method is also called directly for OS light/dark flips outside
-        // `reload_config`; refresh the semantic fork here so variable-font
-        // dark-nudge and theme-dependent raster state never lag that path.
+        // Also reached directly on OS appearance flips; refresh the font fork so
+        // dark-nudge and theme-dependent raster state keep up.
         self.sync_chrome_fonts();
     }
 
-    /// HiDPI follow-through for `WindowEvent::ScaleFactorChanged` — a window moved to
-    /// a display with a different scale factor (or its display's scale changed). winit
-    /// hands us the new factor; re-derive the auto-scaled font (`round(FONT_PX·scale)`) and
-    /// interior pad and rebuild, so glyphs stay crisp and correctly sized at the new
-    /// DPI. This is the SAME derivation [`Self::attach_os_window`] runs once at window
-    /// creation, now applied on the fly instead of being frozen at the creation DPI.
+    /// Handle `WindowEvent::ScaleFactorChanged`: re-derive the auto-scaled font
+    /// (`round(FONT_PX·scale)`) and pad for the new DPI, like
+    /// [`Self::attach_os_window`] does at creation.
     ///
-    /// Honored only for the AUTO font (no `--font-px` / `config.font_px`) and
-    /// when no scale is force-pinned (`--scale` deliberately
-    /// ignore the real monitor — a forced scale must render identically everywhere).
-    /// A no-op when neither the font nor the pad would change (a spurious event, or
-    /// the initial post-creation event whose scale `attach_os_window` already applied,
-    /// or returning to a display at the same DPI).
+    /// Only for the auto font (no `--font-px` / `config.font_px`) and no forced
+    /// `--scale`. A no-op when nothing would change.
     ///
-    /// PER-WINDOW DPI: aterm renders every window through ONE shared backend, so the
-    /// changed window's new scale is stored on ITS [`WindowState`] and applied to the
-    /// shared backend lazily, at the top of that window's `redraw_window`
-    /// ([`Self::apply_window_scale`]). This is what lets two windows on
-    /// different-DPI monitors each render at their own scale — the backend is re-tuned
-    /// to whichever window is drawing — instead of the most-recently-scaled window
-    /// dictating the font size for all of them. We only record + request a redraw here;
-    /// the natural `Resized` winit emits after a scale change re-grids the window.
+    /// All windows share one backend, so the new scale is stored on this
+    /// window's [`WindowState`] and applied lazily when it draws
+    /// ([`Self::apply_window_scale`]); the `Resized` winit emits afterwards
+    /// re-grids it.
     pub(crate) fn on_scale_factor_changed(&mut self, wid: WindowId, scale: f64) {
         // Explicit font or a force-pinned scale ⇒ DPI is intentionally fixed; ignore.
         if self.font_px_explicit || resolve_force_scale().is_some() {
@@ -9951,19 +8398,13 @@ impl App {
         );
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.scale = scale;
-            // W12: refresh this window's per-window metric RECORD from its OWN scale
-            // (the auto-derived font_px + pad), so `WindowState::metrics` tracks the
-            // live DPI rather than staying frozen at the attach-time value. The shared
-            // backend is still re-tuned lazily in `apply_window_scale`; this is the
-            // per-window source of truth, not the render authority. The chrome
-            // headroom re-derives from the attach-captured POINTS band at the new
-            // scale — no AppKit round-trip (that is why `head_pts` is stored).
+            // Refresh this window's metric record from its own scale (the per-window
+            // source of truth; the backend is re-tuned lazily). The head re-derives
+            // from the stored points band without an AppKit round-trip.
             //
-            // ATTACHED windows only: a never-attached (headless) window's record
-            // holds the sealed boot band (`--scale` pad / `$ATERM_HEADROOM_PX`
-            // head); re-deriving pad/head from the incoming scale would wipe it and
-            // re-open the frames=0 class the seal closed. Mirror the attach gate in
-            // `refresh_all_window_metrics` / `apply_window_scale` (ba9f05db).
+            // Attached windows only: a headless window's record holds the sealed
+            // boot band (`--scale` pad, `$ATERM_HEADROOM_PX`) and must not be
+            // overwritten.
             if ws.os_window.is_some() {
                 ws.metrics = crate::MetricsView::for_scale_padded(scale, pad_l, pad_top_l);
                 ws.metrics.head = (ws.head_pts * scale).round() as usize;
@@ -9972,22 +8413,11 @@ impl App {
                 }
             }
         }
-        // W5: re-derive the whole-cell RESIZE INCREMENTS from the metrics just
-        // refreshed. The increments are a `PhysicalSize` the WM stores verbatim,
-        // so a per-monitor DPI change (drag to the other monitor on Windows,
-        // where this event is the WM_DPICHANGED translation) leaves the OLD
-        // scale's cell box in force: a 150%→100% move keeps snapping edge drags
-        // in ~26 px steps against a ~17 px cell — coarser than a whole cell, so
-        // most stops leave a remainder and the padding bands go uneven. The
-        // attach site and the font/theme rebuild both set increments; this event
-        // was the one metrics-changing path that forgot to (a regression from
-        // the W12 per-window-DPI rework, which replaced the heavy
-        // `rebuild_backend` — increments refresh included — with the light
-        // per-window record update above). `win_cell_size` reads the refreshed
-        // `ws.metrics.font_px`, so the borrow must end first; the unattached
-        // (headless) case is a no-op via the `os_window` map below, matching the
-        // attach gate above. macOS re-applies increments itself at
-        // `windowWillStartLiveResize`, so this is redundant-but-harmless there.
+        // Re-derive the whole-cell resize increments from the refreshed metrics:
+        // the WM stores them verbatim, so a per-monitor DPI move would otherwise
+        // keep the old cell box and leave uneven padding bands. Headless windows
+        // are skipped via `os_window`; macOS also re-applies them at
+        // `windowWillStartLiveResize`.
         let (cw, ch) = self.win_cell_size(wid);
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
@@ -9998,40 +8428,22 @@ impl App {
         }
     }
 
-    /// Re-tune the shared backend's font size + interior pad to window `wid`'s DPI
-    /// scale before that window composes. Called at the top of `redraw_window`. This
-    /// is the mechanism behind true per-window DPI on a single shared renderer: each
-    /// window loads its own scale as it draws. GUARDED — a no-op (zero cost) when the
-    /// backend is already tuned to this scale, so the common case (one window, or
-    /// several windows at equal DPI) never rebuilds. A rebuild only happens when
-    /// consecutive redraws cross a DPI boundary; two windows at DIFFERENT DPI both
-    /// animating continuously would thrash the shared font atlas, but that is rare and
-    /// correctness-preserving. Honors the auto-font / no-force-scale gate, matching
-    /// [`Self::attach_os_window`]'s derivation.
+    /// Re-tune the shared backend's font size and pad to window `wid`'s scale
+    /// before it composes (top of `redraw_window`), giving per-window DPI on one
+    /// renderer. A no-op when already tuned; only redraws that alternate across
+    /// DPIs switch. Honors the auto-font / no-force-scale gate like
+    /// [`Self::attach_os_window`].
     pub(crate) fn apply_window_scale(&mut self, wid: WindowId) {
-        // CELL-PX-1, and FIRST for the same reason the pad/head re-tune below is
-        // hoisted above the pinned-font early return: the cell pixel size the
-        // engines report over DEC 1016 and size OSC 1337 images with is a property
-        // of the window's resolved metrics regardless of HOW the font was pinned,
-        // so an explicit `--font-px` / `config.font_px` / `--scale` must not
-        // route around it. This is also the seam that corrects the BOOT session,
-        // spawned before the backend build was joined (`cell_px: None`) — every
-        // raster seam runs `apply_window_scale`, so the first frame fixes it.
-        // Guarded by a per-window memo, so the steady state takes no engine locks.
+        // The cell pixel size reported over DEC 1016 and used for OSC 1337 images
+        // depends on the resolved metrics however the font was pinned, so sync it
+        // before the pinned-font early return. This also corrects the boot session
+        // spawned before the backend joined (`cell_px: None`). Memoized per window.
         self.sync_cell_pixel_size(wid);
-        // Pad + head are PER-WINDOW variants of the ONE shared backend regardless
-        // of how the font size is pinned — re-tune them BEFORE the pinned-font
-        // early return (adversarial review: with a pinned font, a Settings
-        // window's attach-time `set_head(0)` otherwise de-tuned every chrome'd
-        // window's head for good, composing the grid under the titlebar).
-        // ATTACHED windows only: a headless (never-attached) window's metrics
-        // were never applied — its record carries the scale-1 defaults, and
-        // re-tuning the shared backend from them WIPED the boot-time truth
-        // (`--scale N` pad and the `ATERM_HEADROOM_PX` band): the video tap
-        // sized itself with the boot values, the first redraw shrank the frame,
-        // and the dims gate early-stopped every headless recording at frames=0
-        // (the latency audit's root cause). Headless has exactly one logical
-        // window; the boot values ARE its per-window metrics.
+        // Pad and head are per-window on the shared backend however the font is
+        // pinned, so re-tune them before the pinned-font early return.
+        // Attached windows only: a headless window's record holds scale-1
+        // defaults, and applying them would wipe the boot `--scale` pad and
+        // `ATERM_HEADROOM_PX` band that headless recordings are sized by.
         if let Some(m) = self
             .windows
             .get(&wid)
@@ -10051,14 +8463,9 @@ impl App {
         if self.font_px_explicit || resolve_force_scale().is_some() {
             return;
         }
-        // W12: this window's OWN resolved metrics (the per-window source of truth,
-        // maintained at attach + on `ScaleFactorChanged`) are the authority. We
-        // SELECT them on the shared renderer via the LIGHT `activate_px` — which
-        // keeps every other window's warm glyph atlas resident (the sizes coexist
-        // by `px_q`) — instead of the heavy `rebuild_backend` (drop-atlas + re-face)
-        // this used to do. For the auto font `metrics == MetricsView::for_scale(scale)`,
-        // so the resolved size is byte-identical to the old `round(FONT_PX·scale)`;
-        // only the switch cost changed (no teardown, no thrash between two DPIs).
+        // This window's resolved metrics are the authority. Select them with the
+        // light `activate_px`, which keeps other sizes' glyph atlases resident,
+        // instead of a full rebuild.
         let Some(m) = self.windows.get(&wid).map(|ws| ws.metrics) else {
             return;
         };
@@ -10074,22 +8481,15 @@ impl App {
         self.backend.set_pad(m.pad);
         self.backend.set_pad_top(m.pad_top);
         self.backend.set_head(m.head);
-        // Track the ACTIVE (drawing) window's size on the App so the remaining
-        // draw-path reads that consult `self.font_px` report THIS window's size,
-        // and Cmd-0 resets to this scaled default rather than the tiny FONT_PX base.
+        // Track the drawing window's size so `self.font_px` reads and Cmd-0 use
+        // this window's scaled default.
         self.default_font_px = m.font_px;
         self.font_px = m.font_px;
         self.backend.activate_px(m.font_px);
-        // The ACTIVE cell box just changed for this window: if its grid no longer
-        // matches (`grid_dims_for`, the SAME law `on_resize` applies), re-grid it so
-        // the composed frame can never exceed the glass — the belt-and-braces for any
-        // path that moved `ws.metrics` without a paired re-grid, where painting the
-        // new px into the old grid would chop the frame at both edges. GATED on a
-        // real dims mismatch: the genuine multi-DPI flip (two windows on different
-        // scales alternating redraws) has a consistent per-window grid, and an
-        // unconditional `on_resize` would take every session's term mutex and rewrite
-        // a shared session's `cell_pixel_size` on every alternating redraw
-        // (`apply_term_resize` does that work before its equal-dims early return).
+        // If the grid no longer matches the new cell box (`grid_dims_for`), re-grid
+        // so the frame never exceeds the window. Gated on a real mismatch: an
+        // unconditional `on_resize` would lock every session and rewrite shared
+        // `cell_pixel_size` on each alternating multi-DPI redraw.
         if let Some((size, cur)) = self
             .windows
             .get(&wid)
@@ -10102,17 +8502,10 @@ impl App {
         }
     }
 
-    /// HEADLESS boot, the ONE-geometry-authority seal: copy the APPLIED boot
-    /// metrics (`--scale` pad, the `$ATERM_HEADROOM_PX` head band, the resolved
-    /// font) into every never-attached window's per-window record. Without this
-    /// the record keeps the scale-1 construction defaults, and the auto-font arm
-    /// of [`Self::apply_window_scale`] (live when neither `--scale` nor an
-    /// explicit font pins the size — the arm 4d27aae5's attachment gate does NOT
-    /// cover) re-tunes the shared backend from those never-applied values on the
-    /// FIRST redraw a recording drives: the video tap arms with the boot
-    /// geometry, the first present composes without the band, and the dims gate
-    /// kills the take at frames=0 — with the band then gone from every later
-    /// `image`/recording too.
+    /// Headless boot seal: copy the applied boot metrics (`--scale` pad,
+    /// `$ATERM_HEADROOM_PX` head, resolved font) into every never-attached
+    /// window's record, so [`Self::apply_window_scale`]'s auto-font arm does not
+    /// re-tune from scale-1 defaults on the first recorded redraw.
     pub(crate) fn seed_headless_boot_metrics(&mut self) {
         let m = crate::MetricsView::applied(
             self.font_px,
@@ -10127,14 +8520,9 @@ impl App {
         }
     }
 
-    /// Toggle the window's full-screen state (View ▸ Enter Full Screen). Uses
-    /// winit's borderless full-screen on the current monitor — the same path a
-    /// future keybinding would use.
-    ///
-    /// Returns the REASON it declined when no OS window exists yet, rather than
-    /// succeeding silently: the menu seam reports that refusal instead of
-    /// answering OK for a full-screen toggle that never happened. Key-path
-    /// callers, for which a refusal has nowhere to go, discard it explicitly.
+    /// Toggle borderless full screen on the current monitor (View ▸ Enter Full
+    /// Screen). Returns the reason when no OS window exists, so the menu seam can
+    /// report the refusal; key-path callers discard it.
     pub(crate) fn toggle_fullscreen(&self) -> Result<(), &'static str> {
         let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) else {
             return Err("no window is on screen to full-screen");
@@ -10147,24 +8535,15 @@ impl App {
         Ok(())
     }
 
-    /// The path-referenced half of a BYTE-EQUAL config reload: the parsed
-    /// `aterm.toml` matches the applied one, but the applied state also includes
-    /// the CONTENT of files the config names by path (trail-pack manifests, the
-    /// sparkle lexicon, toy packs), and editing such a file then re-saving/
-    /// `touch`ing `aterm.toml` is their documented hot-reload path. Compare the
-    /// fresh content fingerprints against the applied worker generation
-    /// ([`App::path_feed_fps`]):
+    /// Path-referenced half of a byte-equal config reload: the parsed
+    /// `aterm.toml` is unchanged, but files it names (trail-pack manifests,
+    /// sparkle lexicon, toy packs) may have changed. Compare fresh fingerprints
+    /// with [`App::path_feed_fps`]:
     ///
-    /// * unchanged ⇒ admission stays a FULL runtime no-op — the dedupe win is kept
-    ///   intact (no engine re-diffs, no word-deco reset, no settings-popup
-    ///   churn), while exact text authority still advances independently;
-    /// * changed ⇒ arm `sparkle_dirty` so the next frame activates the already
-    ///   compiled worker bundle, hard-reset the per-window word decorations ONLY
-    ///   when the deco feed (lexicon/toys) changed — a trail-manifest edit
-    ///   feeds cursor glow, never decorations — and request repaints so the
-    ///   rebuild lands without waiting for organic damage. The remaining
-    ///   reload side-effect storm is still skipped: the parsed config is
-    ///   identical, so nothing else can have changed.
+    /// * unchanged: a full runtime no-op;
+    /// * changed: arm `sparkle_dirty` to activate the compiled worker bundle,
+    ///   hard-reset word decorations only when the deco feed changed, and
+    ///   request repaints. Nothing else can have changed.
     fn refresh_path_feeds(&mut self, fresh: PathFeedFps) {
         if fresh == self.path_feed_fps {
             return;
@@ -10172,11 +8551,10 @@ impl App {
         let previous = std::mem::replace(&mut self.path_feed_fps, fresh);
         self.sparkle_dirty = true;
         if fresh.deco != previous.deco {
-            // Retire only word-owned episodes. Cursor companions share this
-            // renderer's atlas, but a lexicon rebuild is not their lifecycle
-            // authority and must not teleport or rebake them.
+            // Retire only word-owned episodes; cursor companions share the atlas
+            // but have their own lifecycle.
             for ws in self.windows.values_mut() {
-                ws.word_decos.hard_reset_words();
+                ws.fx.decos_mut().hard_reset_words();
             }
         }
         for ws in self.windows.values() {
@@ -10186,18 +8564,14 @@ impl App {
         }
     }
 
-    /// Publish one already-admitted immutable asset generation to the App and
-    /// every existing window. This is the sole post-construction writer of
-    /// [`App::config_assets`]: callers hand it the exact outer Arc carried by a
-    /// versioned config snapshot, and it performs only Arc clones plus scalar
-    /// effects-state installation. All path reads and PNG decoding happened
-    /// before the snapshot reached this seam.
+    /// Publish one admitted asset generation to the App and every window; the
+    /// only post-construction writer of [`App::config_assets`]. Callers pass the
+    /// `Arc` from a versioned config snapshot; this only clones `Arc`s and
+    /// installs scalar effects state (all I/O happened earlier).
     ///
-    /// Pointer identity is intentional. A fresh outer catalog can represent a
-    /// byte-identical `aterm.toml` whose same-path rainbow kitty file changed, or a
-    /// theme-directory-only generation. Both must reach every window before
-    /// the next capture/effect tick. Re-publishing the same Arc is a complete
-    /// no-op, including no redraw request.
+    /// Pointer identity decides: a new catalog may carry a changed kitty file or
+    /// theme directory under byte-identical `aterm.toml`, and must reach every
+    /// window. Re-publishing the same `Arc` is a complete no-op.
     pub(crate) fn publish_config_assets(
         &mut self,
         assets: std::sync::Arc<ConfigAssetCatalog>,
@@ -10215,10 +8589,9 @@ impl App {
         installed
     }
 
-    /// Publish a parsed theme-directory generation produced by the background
-    /// watcher. No filesystem operation occurs here: the event loop swaps one
-    /// immutable catalog, reapplies the engine palette/chrome, and fans the same
-    /// snapshot to Settings and Manual diagnostics.
+    /// Publish a theme-directory generation from the background watcher: swap
+    /// the catalog, reapply the engine palette and chrome, and fan the snapshot
+    /// to Settings and Manual. No filesystem access.
     pub(crate) fn reload_theme_catalog(&mut self, themes: std::sync::Arc<ThemeCatalog>) {
         let before = self.native_config_service.snapshot();
         let snapshot = self.native_config_service.replace_theme_catalog(themes);
@@ -10239,22 +8612,14 @@ impl App {
         let theme = self
             .config
             .theme_for_with_assets(self.os_appearance, &snapshot.assets.themes);
-        let changed = (theme.fg, theme.bg, theme.cursor, theme.selection)
-            != (
-                self.theme.fg,
-                self.theme.bg,
-                self.theme.cursor,
-                self.theme.selection,
-            );
-        if changed {
+        if !theme_eq(theme, self.theme) {
             self.apply_theme_live(theme);
         }
         self.publish_native_config_snapshot(&snapshot);
 
-        // A theme file that arrived or left changes whether the configured theme
-        // is drawn, and that verdict rides the unaccepted-values row: rebuild the
-        // row as the byte-equal reload does. Skipped while the snapshot holds a
-        // config edit this App has not applied yet; that apply rebuilds the row.
+        // A theme file arriving or leaving changes whether the configured theme
+        // draws, so rebuild the unaccepted-values row, unless the snapshot holds
+        // an unapplied config edit whose apply will rebuild it.
         if *snapshot.config == self.config
             && theme_misses(&self.config, &before.assets.themes)
                 != theme_misses(&self.config, &snapshot.assets.themes)
@@ -10282,22 +8647,17 @@ impl App {
         }
     }
 
-    /// Apply a worker-prepared exact config observation after the watcher read
-    /// `~/.config/aterm/aterm.toml`. Parsing, path-backed asset loading, and font
-    /// preparation happen off the event loop; this side installs the immutable
-    /// generation into every live session without a restart.
+    /// Apply a worker-prepared config observation of `aterm.toml`. Parsing,
+    /// asset loading and font preparation happen off the event loop; this
+    /// installs the generation into every live session.
     ///
-    /// VALIDATION / FAIL-SAFE: malformed, partial, unreadable, or unstable input
-    /// never reaches this typed seam and cannot replace the running config. Valid
-    /// UTF-8 malformed TOML still reaches Manual from the original observation so
-    /// its diagnostics can repair the exact rejected bytes.
+    /// Malformed, partial or unreadable input never reaches this seam and cannot
+    /// replace the running config; malformed UTF-8 TOML still reaches Manual for
+    /// diagnostics.
     ///
-    /// PRECEDENCE (no regression): font size flows through [`resolve_font_px`] —
-    /// the SAME `--font-px > config > default` order as startup — so the launch
-    /// flag still wins after an edit. GPU is a launch-time decision and is NOT
-    /// hot-swapped here (`self.use_gpu` is fixed); only font size, the renderer
-    /// theme, and the engine `TerminalConfig` (scrollback/cursor/colours/palette,
-    /// diffed by `Terminal::apply_config`) are re-applied.
+    /// Font size uses [`resolve_font_px`] (`--font-px > config > default`). GPU
+    /// is a launch-time decision; only font size, renderer theme and engine
+    /// `TerminalConfig` (via `Terminal::apply_config`) are re-applied.
     fn request_font_catalog_generation(
         &mut self,
         mut prepared: crate::native_config_service::PreparedConfigObservation,
@@ -10324,9 +8684,8 @@ impl App {
         self.next_font_catalog_sequence = sequence.saturating_add(1);
         self.requested_font_catalog_sequence = sequence;
         if !std::sync::Arc::ptr_eq(&prepared.assets.themes, &self.config_assets.themes) {
-            // Theme discovery can overtake a config worker. Trail/rainbow kitty and
-            // Sparkle consumers do not depend on the theme catalog, so rebase
-            // that Arc in memory instead of reopening any source.
+            // A theme generation can overtake the config worker; Trail/kitty and
+            // Sparkle consumers do not depend on it, so rebase the Arc in memory.
             prepared.assets = std::sync::Arc::new(ConfigAssetCatalog {
                 trail_packs: std::sync::Arc::clone(&prepared.assets.trail_packs),
                 kitty_sprite: prepared.assets.kitty_sprite.clone(),
@@ -10390,6 +8749,7 @@ impl App {
                         observation: completion.observation,
                         config: completion.config,
                         values: completion.values,
+                        disk_faults: completion.disk_faults,
                         assets: completion.assets,
                         path_feeds,
                     },
@@ -10405,15 +8765,12 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn reload_config(&mut self) {
-        // Re-read + strictly re-parse. A parse error (malformed/partial mid-edit
-        // file) or an unreadable/absent file is REJECTED so the live config is
-        // never replaced by defaults; the previous config stays intact.
+        // Re-read and strictly re-parse; malformed, partial or unreadable files
+        // are rejected and the previous config stays.
         let Some(path) = config_path() else { return };
-        // One stable read supplies Manual, strict parsing, and the versioned
-        // service. Sharing the bytes and file-generation baseline closes the
-        // watcher race where each consumer could previously see a different
-        // edit. Malformed-but-UTF-8 bytes still reach a clean Manual buffer and
-        // its diagnostics; the running Config changes only after strict parse.
+        // One stable read feeds Manual, strict parsing and the versioned service,
+        // so every consumer sees the same edit. Malformed UTF-8 bytes still reach
+        // Manual; the running Config changes only after a strict parse.
         let observation = match crate::native_config_service::VersionedConfigService::observe_path(
             &path, false,
         ) {
@@ -10428,9 +8785,9 @@ impl App {
         self.reload_config_observation(observation);
     }
 
-    /// Apply the exact bounded generation sampled by the config host. Watcher
-    /// callers must use this entry point instead of reopening the logical path:
-    /// acknowledgement and application then refer to one immutable observation.
+    /// Apply the exact generation sampled by the config host. Watchers use this
+    /// rather than reopening the path, so acknowledgement and application refer
+    /// to one observation.
     pub(crate) fn reload_config_observation(
         &mut self,
         observation: crate::native_config_service::ConfigDiskObservation,
@@ -10438,10 +8795,9 @@ impl App {
         self.prepare_native_config_external_observation(observation);
     }
 
-    /// Exact worker-prepared twin of [`Self::reload_config_observation`]. The
-    /// supplied feed/rainbow kitty generation is immutable; a theme that overtook
-    /// persistence is rebased in memory and guarded by the theme-generation
-    /// ticket.
+    /// Worker-prepared twin of [`Self::reload_config_observation`]. A theme that
+    /// overtook persistence is rebased in memory and guarded by the
+    /// theme-generation ticket.
     pub(crate) fn reload_prepared_config_observation(
         &mut self,
         prepared: crate::native_config_service::PreparedConfigObservation,
@@ -10452,6 +8808,24 @@ impl App {
         self.request_font_catalog_generation(prepared);
     }
 
+    /// Admit a config generation. For `HarnessPolicyOneWriter` this is
+    /// `AdmitOn`/`AdmitOff`; it writes no policy (the watcher is its one writer).
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "HarnessPolicyOneWriter",
+            action = "AdmitOn",
+            project = "aterm_gui::config_watcher::tests::project_harness_writer"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "HarnessPolicyOneWriter",
+            action = "AdmitOff",
+            project = "aterm_gui::config_watcher::tests::project_harness_writer"
+        )
+    )]
     pub(crate) fn apply_prepared_config_generation(
         &mut self,
         generation: crate::native_font_catalog::PreparedConfigGeneration,
@@ -10468,11 +8842,10 @@ impl App {
         self.apply_prepared_config_generation_unfenced(generation);
     }
 
-    /// Admit a deferred runtime generation after a reconciliation worker has
-    /// sampled the same exact config baseline. The matching sample is the
-    /// ordering proof that clears the write fence; routing this back through
-    /// [`Self::apply_prepared_config_generation`] would see that still-closed
-    /// fence, defer the same payload again, and reconcile forever.
+    /// Admit a deferred generation after a reconciliation worker sampled the same
+    /// baseline, which clears the write fence. Going back through
+    /// [`Self::apply_prepared_config_generation`] would hit the closed fence and
+    /// defer forever.
     pub(crate) fn apply_reconciled_prepared_config_generation(
         &mut self,
         generation: crate::native_font_catalog::PreparedConfigGeneration,
@@ -10488,19 +8861,26 @@ impl App {
     ) {
         let crate::native_font_catalog::PreparedConfigGeneration {
             observation,
-            config,
+            mut config,
             values,
+            disk_faults,
             assets: prepared_assets,
             path_feed_fps: fresh_feeds,
             sparkle: prepared_sparkle,
             fonts: mut prepared_fonts,
             warnings: mut font_prepare_warnings,
         } = generation;
+        // The lane never writes the supervisor's policy: the watcher's read is its
+        // one writer (`config_watcher::observed_harness`,
+        // `Wake::HarnessPolicyObserved`). Workers finish in arbitrary order, so a
+        // generation keeps the running policy, and the dedupe compares with it.
+        config.harness = self.harness_policy.get().clone();
         let admitted_baseline = observation.baseline.clone();
         let config_snapshot = match self.native_config_service.synchronize_observation_prepared(
             observation,
             config.clone(),
             values,
+            disk_faults,
             prepared_assets,
         ) {
             Ok(snapshot) => snapshot,
@@ -10510,14 +8890,10 @@ impl App {
                     &admitted_baseline,
                     crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
                 );
-                // The fence is re-armed here with no worker sample scheduled, so
-                // anything already in the semantic queue would sit until some
-                // unrelated event happened to pump. That is the abandonment that
-                // reported itself as a 30s wedged event loop. It matters on this
-                // arm specifically because
-                // `apply_reconciled_prepared_config_generation` reaches it from a
-                // reconciliation completion, i.e. from the exact probe a queued
-                // control caller is parked behind.
+                // The fence is re-armed with no worker sample scheduled, so reject
+                // queued semantic requests now rather than leaving them until some
+                // unrelated event pumps. This arm is reached from a reconciliation
+                // completion, which a queued control caller may be waiting on.
                 self.reject_pending_native_config(&format!(
                     "config generation could not be admitted: {error}"
                 ));
@@ -10527,62 +8903,33 @@ impl App {
         };
         self.prepared_sparkle = prepared_sparkle;
 
-        // SEMANTIC DEDUPE: re-applying an identical prepared config is pure
-        // side-effect churn — engine
-        // re-diffs on every tab, per-window word-deco hard resets, settings
-        // popup cancels, a possible font/backend probe — so a parse that
-        // equals the currently applied config stops here (the native snapshot
-        // above still saw the latest raw text, so an in-place formatting-only
-        // edit stays synced). Field-by-field `PartialEq`, not an mtime
-        // heuristic: a `touch` with unchanged content is equally a no-op.
+        // Semantic dedupe: re-applying an identical config is side-effect churn
+        // (engine re-diffs, word-deco resets, popup cancels, backend probes), so an
+        // equal parse stops here (field-wise `PartialEq`; the native snapshot has
+        // already seen the new text).
         //
-        // BUT config equality is not the whole applied state: files referenced
-        // BY PATH (trail-pack manifests, the sparkle lexicon, toy packs) are
-        // part of it too, and a feed-only edit reaches here as a byte-equal
-        // re-observation (the config watcher stamps those files beside
-        // `aterm.toml`). So a byte-equal parse
-        // still refreshes those feeds when their content fingerprints drifted
-        // (`refresh_path_feeds`); only a reload where BOTH the parsed config
-        // AND the referenced files are unchanged is the full no-op.
+        // Path-referenced files (trail-pack manifests, sparkle lexicon, toy packs)
+        // are also applied state, and a feed-only edit arrives as a byte-equal
+        // observation, so `refresh_path_feeds` still checks their fingerprints.
         if config == self.config && prepared_fonts.is_none() {
-            // Semantic equality does not mean transaction equality: comments,
-            // formatting, and explicit-default edits still advance the native
-            // service revision. Fan that snapshot out before returning so the
-            // next Settings patch does not start from a stale base revision.
+            // Comments, formatting and explicit-default edits still advance the
+            // service revision; publish the snapshot so the next Settings patch
+            // starts from the current base.
             self.publish_config_assets(std::sync::Arc::clone(&config_snapshot.assets));
             self.publish_native_config_snapshot(&config_snapshot);
             self.refresh_path_feeds(fresh_feeds);
             self.finish_native_config_external_admission(&admitted_baseline);
-            // …AND THE TEXT-DERIVED DIAGNOSTICS, which this return used to eat.
-            //
-            // The dedupe's whole justification is that re-applying an identical
-            // parsed config is side-effect churn. These two notices are not
-            // derived from the parsed config at all — they read the raw TEXT,
-            // which is precisely the thing that DID change. A misspelled key
-            // leaves no trace in `Config`, so adding one (the commonest case:
-            // a setting the user has never set before, typed wrong) parses
-            // EQUAL, returned here, and said nothing — on stderr or in the
-            // window — while the identical file at launch warns. That defeats
-            // `collect_key_notices`'s own documented contract, that "startup
-            // and reload both call this so a typo introduced by a live edit is
-            // reported exactly like one that was there at launch".
-            //
-            // Posting a possibly-EMPTY set is also correct and is the second
-            // half of the fix: the replace first resolves the live rows of
-            // the families this path re-derives (and the launch load failure
-            // a file that now parses has answered), so fixing the typo takes
-            // the warning down even when the parse is otherwise unchanged.
-            // ONLY those rows: this path recomputes nothing from the parse,
-            // so the keybinding, font and trail rows the last full reload
-            // posted are still true, and a comment-only save must not resolve
-            // them — the `config.` prefix resolve did, and logged them fixed
-            // (Phase 3 review, ruling 28).
+            // Text-derived diagnostics still run: a misspelled key leaves no trace
+            // in `Config`, so the parse is equal but the notice is new. Posting a
+            // possibly empty set also clears a fixed typo. Only the families
+            // derived from text (and a now-answered launch load failure) are
+            // replaced; keybinding, font and trail rows from the last full reload
+            // stay.
             let mut warns = crate::message_reporters::ConfigWarnings::default();
             collect_key_notices(&mut warns, &config_snapshot.text);
             collect_harness_notices(&mut warns, &config);
-            // The value did not change, but the unaccepted-values row is
-            // rebuilt from scratch here, so an ignored `font_px` must be
-            // restated or it vanishes on an unrelated comment edit.
+            // The unaccepted-values row is rebuilt from scratch, so restate an
+            // ignored `font_px` or it vanishes on an unrelated edit.
             warns.extend(
                 crate::message_reporters::ConfigFamily::UnacceptedValues,
                 font_px_load_notice(&config),
@@ -10611,35 +8958,24 @@ impl App {
             return;
         }
 
-        // Renderer construction is the one fallible live-apply step. Snapshot
-        // its complete authority before any of the independent config edits below
-        // are published; only this slice rolls back if font discovery/build fails.
+        // Renderer construction is the one fallible step; snapshot its authority
+        // first so only this slice rolls back if the font build fails.
         let reload_render_before = ReloadRenderSnapshot::capture(self);
 
-        // Restart-only keys (window `columns`/`lines`): read once at launch and NOT
-        // hot-appliable (a reload must not snap the now-resizable window back to its
-        // configured size). Diff the OLD `self.config` against the freshly-parsed
-        // `config` BEFORE `self.config` is overwritten below, so an edit that can't take
-        // effect surfaces a transient banner instead of a silent no-op ("I changed
-        // `columns` and nothing happened"). Folded into the reload `warns` further down.
+        // Restart-only keys (`columns`/`lines`, `gpu`): diff against the old config
+        // before it is overwritten so the change is reported, not silently ignored.
         let restart_notices = restart_notices(&self.config, &config);
 
-        // Window-padding regime diff, taken against the OLD config before it is
-        // overwritten below: a changed `window_padding`/`window_padding_top`
-        // must RE-GRID every attached window (the pad participates in the
-        // `grid_dims_for` split) and repaint, not just wait for the next
-        // organic redraw. Compared at the RESOLVED level so a no-op edit
-        // (e.g. writing the explicit default) stays a no-op.
+        // A changed resolved `window_padding`/`window_padding_top` must re-grid
+        // every attached window (pad feeds `grid_dims_for`); diffed against the old
+        // config before it is overwritten.
         let old_padding = (
             self.config.window_padding_or_default(),
             self.config.window_padding_top_or_default(),
         );
 
-        // Scoped-collateral diff, taken against the OLD `self.config` before it
-        // is overwritten below: whether the keys that FEED the word decorations
-        // changed (the `[sparkle_words]` table / lexicon inputs, or the theme its
-        // palette derives from) — only then is the per-window `hard_reset`
-        // warranted.
+        // Whether the word-decoration inputs (`[sparkle_words]`, lexicon, theme)
+        // changed; only then is the per-window `hard_reset` warranted.
         let sparkle_feed_changed = deco_feed_changed(
             &self.config,
             &config,
@@ -10648,35 +8984,24 @@ impl App {
         );
         self.path_feed_fps = fresh_feeds;
 
-        // Engine-side config (scrollback/cursor/theme colours/palette). Clearing a
-        // previously-set key reverts it: `applied_terminal_config()` rebuilds from a
-        // fresh default each reload (the engine diffs via `apply_config`, so a no-op
-        // delta is free) while ALWAYS pinning the engine default fg/bg to the theme,
-        // so a revert lands on the themed background, never spec-black. Apply to EVERY
-        // live tab — window-level config, like a resize — and refresh the factory so
-        // future Cmd-T tabs inherit the new config.
-        // THE TYPING-SOUND AUDITION from the reload path: a native-window pick
-        // or a hand edit that CHANGES the voice plays one keystroke of it
-        // (`typing_sound_to_audition_on_swap` — the in-app row already
-        // auditioned at commit time and latched the same voice, so its own
-        // reload is silent here; startup never reaches this branch — the
-        // initial config is set at construction and a byte-equal watcher pass
-        // returns above). Decided against the latch BEFORE the swap.
+        // Typing-sound audition: a changed voice plays one keystroke
+        // (`typing_sound_to_audition_on_swap`; an in-app pick already auditioned
+        // and latched it, so its reload is silent). Decided before the swap.
         let audition_voice = self.typing_sound_to_audition_on_swap(&config);
-        // Retain the parsed config so a later OS light↔dark switch can re-resolve a
-        // `dark:…,light:…` split theme without re-reading disk (see
-        // `App::sync_app_theme_to_appearance`). Resolve the engine/renderer theme for
-        // the CURRENT OS appearance so a reload preserves the active light/dark side.
+        // A changed privacy probe gate is applied before the swap.
         if self.config.privacy_probe_gate() != config.privacy_probe_gate() {
             // Retire an in-flight answer even if an off/on pair of reloads
             // arrives before any card/status read sees the intermediate state.
             self.consent.invalidate();
         }
+        // The Claude footer's `[claude_footer]` switches change what every
+        // window's Claude Code panes show — an idle background window too,
+        // which no other branch below repaints.
+        let claude_footer_changed = self.config.claude_footer != config.claude_footer;
         self.config = config.clone();
-        // The supervisor's `[harness]` policy applies on reload: its workers
-        // restart under a changed policy, and `enabled = false` stops them
-        // within one wait (`harness_host`; a lock and a wake, no I/O here).
-        self.adopt_harness_policy(config.harness.clone());
+        if claude_footer_changed {
+            self.redraw_every_window();
+        }
         // Secure Keyboard Entry is PROCESS-level (Carbon secure input), so a
         // config commit records the wish here, once, beside the swap — not per
         // window or per session (engagement is focus-gated in secure_input).
@@ -10693,47 +9018,34 @@ impl App {
             // under the new look — the settings the user just wrote.
             self.audition_typing_sound(voice);
         }
-        // Selected-tab color override (`active_tab_color`): pinned UNCONDITIONALLY
-        // on every reload — a pure tab-color edit changes neither theme nor font,
-        // so no rebuild branch below would re-sync the native strip. The setter is
-        // an idempotent atomic compare, so the no-change case costs nothing.
+        // Pin `active_tab_color` on every reload: a tab-color-only edit triggers
+        // no rebuild branch below. The setter is an idempotent atomic compare.
         {
             let override_rgb = self.config.active_tab_color_rgb();
             for handle in self._toolbars.values() {
                 crate::toolbar::set_active_tab_color(handle, override_rgb);
             }
-            // The in-grid strip caches painted rows behind a fingerprint that
-            // does not carry the override; drop the cache so the next splice
-            // repaints with the new active-tab color. The PRESENT early-out
-            // must be bypassed too (post-merge re-audit): the RepaintKey's
-            // strip term carries titles/count, not this override, so without
-            // `last_present = None` a pure tab-color edit could sit invisible
-            // until some other change forced a present (the E3 rebuild branch
-            // already clears both).
+            // The strip-row cache fingerprint and the RepaintKey do not include the
+            // override, so drop the cache and `last_present` to repaint.
             for ws in self.windows.values_mut() {
                 ws.last_strip_fp = None;
                 ws.last_present = None;
             }
         }
-        // `motion = "reduced"` is a live accessibility edge. Reconcile it at the
-        // same generation-admission point that publishes the new config: every
-        // retained glide lands immediately on its pinned target and is dropped,
-        // instead of surviving until another wheel input or deadline tick.
+        // `motion = "reduced"` is a live accessibility edge: land every retained
+        // glide on its target now rather than at the next input or tick.
         self.settle_reduced_scroll_motion(std::time::Instant::now());
-        // Serious mode is an effective App projection, not a rewrite of any
-        // individual effect setting. Apply its edge immediately after publishing the
-        // new source config so a disable restores values from THIS generation.
+        // Serious mode is a projection, not a rewrite of effect settings; apply
+        // its edge right after publishing so a disable restores this generation's
+        // values.
         self.apply_serious_mode(config.serious_mode_or_default());
         self.publish_config_assets(std::sync::Arc::clone(&config_snapshot.assets));
         self.publish_native_config_snapshot(&config_snapshot);
-        // Smart-title Settings are live authority, not restart-only metadata: revoke
-        // queued provider work immediately and repaint tab/window composition even if
-        // every terminal is currently idle.
+        // Smart-title settings apply live: revoke queued provider work and
+        // repaint tab/window composition.
         self.reconfigure_title_summaries();
-        // Tab status is live authority for the same reason: the policy is COPIED
-        // into every per-session classifier at construction, so without this a
-        // Settings edit would apply only to sessions opened afterwards, and the
-        // event loop's wait deadline would still be serving the old interval.
+        // Tab status policy is copied into each classifier at construction, so
+        // push it to existing sessions and the event loop's wait deadline.
         self.reconfigure_session_status();
         // `explain_heavy_load` is live: `false` parks the strain engine,
         // withdraws its row and drops the probe thread; nothing is armed after.
@@ -10741,45 +9053,34 @@ impl App {
         // `desktop_alerts` is live: the notification thread reads the switch
         // per message, so aterm's own notices stop (or resume) with this store.
         self.apply_desktop_alerts(config.desktop_alerts_or_default());
-        // Per-keystroke config caches (predictive_echo / cursor_trail_style): a reload
-        // can change either, so drop the resolved values — they re-resolve on the next
-        // keystroke. Keeps a live style/predict change taking effect immediately.
+        // Drop per-keystroke caches (predictive_echo, cursor_trail_style); they
+        // re-resolve on the next keystroke.
         self.predict_mode_cache = None;
         self.kitty_cursor_enabled_cache = None;
-        // Sparkle words: a reload can change `languages`/category toggles/lexicon, so
-        // mark the App cache stale (rebuilt before the next frame) and flush each
-        // window's cached occurrence set — otherwise, on a byte-idle grid, the stale
-        // scan would persist until the next damage epoch. Cheap; a no-op when off.
+        // Sparkle words: mark the App cache stale and flush each window's cached
+        // occurrences so a byte-idle grid does not keep a stale scan.
         self.sparkle_dirty = true;
-        // PHOSPHOR: a reload can change any [matrix_rain] knob (or the theme
-        // the ramp derives from) — mark the resolve stale; the recompute gate
-        // pushes the new config into every live engine via `set_config`
-        // (keeps the tick epoch) before the next frame. An open palette's
-        // "Matrix Rain" checkmark reads the effective state (override else the
-        // just-reloaded `enabled` bit) — re-resolve it so the row can't show
-        // the pre-reload state until closed and reopened.
+        // Matrix rain: mark the resolve stale (pushed into live engines via
+        // `set_config` before the next frame) and refresh an open palette's
+        // checkmark.
         self.rain_dirty = true;
-        // [presence]: a reload can flip the band or the rim (a hand edit, or
-        // the View toggles' own durable write landing) — adopt the bits and
-        // re-project every window (`app_fabric_menu.rs`).
+        // [presence]: adopt the band/rim bits and re-project every window
+        // (`app_fabric_menu.rs`).
         self.adopt_presence_config();
         self.palette_refresh_live();
-        // [packages] consent flags feed the Settings ▸ Packages projection;
-        // re-publish (memory-only) so a flipped switch or a hand-edit shows on
-        // the status card without waiting for the next worker pass.
+        // Re-publish the Settings ▸ Packages projection (memory-only) so consent
+        // changes show immediately.
         self.publish_native_packages_state();
-        // Terminal/theme/config palette authority changed. A resident pet may
-        // remain visible across the reload, so explicitly retire only its
-        // appearance contrast sample; position, action and breed stay intact.
+        // Palette authority changed: retire only a resident pet's contrast sample,
+        // keeping position, action and breed.
         for ws in self.windows.values_mut() {
-            ws.companion.invalidate_colors();
+            ws.fx.companion_mut().invalidate_colors();
         }
-        // A Sparkle Words reload retires word episodes and done marks, but
-        // preserves the independent cursor companion's placement and sprite
-        // caches. Other config edits remain a complete no-op for this state.
+        // A Sparkle Words reload retires word episodes and done marks but keeps
+        // the cursor companion's placement and sprite caches.
         if sparkle_feed_changed {
             for ws in self.windows.values_mut() {
-                ws.word_decos.hard_reset_words();
+                ws.fx.decos_mut().hard_reset_words();
             }
         }
         let applied_tc = config.applied_terminal_config_for_with_assets(
@@ -10790,41 +9091,30 @@ impl App {
             term_lock(&s.term).apply_config(&applied_tc);
         }
         self.session_factory.terminal_config = Some(applied_tc);
-        // `allow_kitty_file_transfer` is a session-factory opt-in (not part of
-        // `TerminalConfig`), so refresh it here too — otherwise a reload's new value
-        // would only reach tabs spawned BEFORE restart. Mirrors the startup default.
-        // (Existing sessions keep their spawn-time policy; new Cmd-T tabs pick this up.)
+        // `allow_kitty_file_transfer` is a session-factory setting; refresh it so
+        // new tabs pick it up (existing sessions keep their spawn-time policy).
         self.session_factory.allow_kitty_file_transfer =
             config.allow_kitty_file_transfer.unwrap_or(false);
-        // Shell policy is also spawn-time, not process-time: preserve the
-        // launch CLI/environment override, otherwise publish the reloaded
-        // config to the factory so the next Cmd-T session uses it. Existing
-        // PTYs necessarily keep the command they were spawned with.
+        // Shell policy is spawn-time: keep a launch `--shell` override, else
+        // publish the reloaded config so the next tab uses it.
         self.session_factory.shell_override = resolve_shell_override(&config);
         self.session_factory
             .shell_args
             .clone_from(&config.shell_args);
-        // `temporal_recording` is likewise a session-factory opt-in (not part of
-        // `TerminalConfig`); refresh it on reload so a live edit reaches new Cmd-T
-        // tabs. Existing sessions keep their spawn-time wiring. Mirrors the default.
+        // `temporal_recording` is a session-factory opt-in; refresh it for new
+        // tabs.
         self.session_factory.temporal_recording = config.temporal_recording.unwrap_or(false);
-        // `search_history_lines` drives the process-global search index depth cap (read
-        // by both ⌘F and the socket `search` verb). Re-push it on reload so an edit applies
-        // live — the cap is part of the index cache key, so the next search rebuilds at the
-        // new depth instead of waiting for a restart.
+        // Re-push the global search depth cap (⌘F and the `search` verb); it is
+        // part of the index cache key, so the next search rebuilds at the new depth.
         crate::control::set_search_max_lines(search_index_depth(&config));
 
-        // Input-level config (no backend rebuild): the keybinding table and the
-        // Option-as-Meta flag are re-applied live so an edit takes effect on the next
-        // keypress. Use `resolved_warn` (NOT `from_config_warn`) so a reload keeps the
-        // platform DEFAULTS overlaid, matching `App::new` — on Linux those defaults seed
-        // copy/paste/new-tab/etc., so a defaults-less reload would silently kill them.
-        // Clearing the user `[keybindings]` table now reverts to the platform defaults
-        // (empty on macOS, where the hardcoded Cmd-* path is the convention); dropping
-        // `option_as_meta` restores the default (Meta) — both diff-free when unchanged.
-        // The reload's config warnings, one family each
-        // (`message_reporters::ConfigWarnings`, design R4): the band's
-        // `config.*` rows are REPLACED as a set at the end of this reload.
+        // Input config applies live on the next keypress. Keybindings use
+        // `resolved_warn` so platform defaults stay overlaid, as in `App::new`
+        // (on Linux they seed copy/paste/new-tab). Clearing `[keybindings]` or
+        // `option_as_meta` restores the defaults.
+        // Config warnings are collected per family
+        // (`message_reporters::ConfigWarnings`) and replace the band's
+        // `config.*` rows as a set at the end of this reload.
         use crate::message_reporters::ConfigFamily;
         let mut warns = crate::message_reporters::ConfigWarnings::default();
         let (keybindings, kb_warns) =
@@ -10838,12 +9128,8 @@ impl App {
         // Restart-only edits (columns/lines) ride the SAME band as dropped-rule
         // warnings — both are "your edit didn't fully take effect" messages.
         warns.extend(ConfigFamily::Restart, restart_notices);
-        // …as does a key this build ignores. A hand edit that misspells the key
-        // is the same class taken to its limit — the edit took no effect at all —
-        // and it is the class the reader has no other way to discover, since the
-        // parsed config the rest of this reload inspects has no record of it.
-        // (A retired or deprecated spelling is recorded, not shown:
-        // `collect_key_notices`.)
+        // Ignored keys too: a misspelled key has no trace in the parsed config.
+        // Retired spellings are recorded, not shown (`collect_key_notices`).
         collect_key_notices(&mut warns, &config_snapshot.text);
         // …and so does a refused Secure Keyboard Entry transition (see the
         // apply site above): same class exactly — an edit that did not take.
@@ -10861,37 +9147,23 @@ impl App {
                 ),
             );
         }
-        // W5h: an unresolvable `font_family` warns (like themes) instead of
-        // silently reducing to the built-in candidates. Uses the same
-        // effective family (env > config > platform default) the rebuild will try.
-        // THE WORKER'S ANSWER IS AUTHORITATIVE, `None` INCLUDED. This used to
-        // `.or_else(|| self.font_family.clone())`, which conflated the catalog
-        // worker's two very different `None`s — except only one of them is a
-        // `None`, which is what made the conflation invisible:
-        //
-        // * REJECTED a bad family: the worker returns `previous_family` (SOME)
-        //   and warns "keeping the current working face". Trusting it verbatim
-        //   preserves that, which is the documented intent — a rejected family
-        //   is not a request to swap to a built-in face.
-        // * REVERTED to the built-in candidates, because the user CLEARED
-        //   `font_family` (deleted the key, or turned every Settings ▸ Display
-        //   Faces toggle off, which clears `display_font`): the worker returns
-        //   `None` as its explicit verdict, having already resolved the
-        //   built-ins. The `.or_else` resurrected the removed family here, so
-        //   `App.font_family` stayed pinned to it for the life of the process
-        //   and was fed straight back as the next reload's `previous_family`.
-        //
-        // So: when the worker RAN, take what it said. Fall back to the current
-        // family only when no font work happened this reload at all, where
-        // nothing about the family can have changed.
+        // An unresolvable `font_family` warns. The catalog worker's answer is
+        // authoritative, `None` included: a rejected family comes back as
+        // `previous_family` (keep the working face), while a cleared family comes
+        // back as `None` (built-ins). Fall back to the current family only when no
+        // font work ran this reload.
         let requested_effective_family = match prepared_fonts.as_ref() {
             Some(prepared) => prepared.family.clone(),
             None => self.font_family.clone(),
         };
+        // Font work ran and admitted the family, so the launch-time `font_family`
+        // verdict is answered too.
+        let family_admitted = prepared_fonts.is_some()
+            && !font_prepare_warnings
+                .iter()
+                .any(|w| w.starts_with(crate::native_font_catalog::FAMILY_REFUSED));
         warns.extend(ConfigFamily::Fonts, font_prepare_warnings.drain(..));
-        // An unrecognized `cursor_trail_style` silently draws the DEFAULT style
-        // instead of the requested one — warn on the same band, or the
-        // substitution has no surface at all.
+        // An unrecognized `cursor_trail_style` draws the default; warn on the band.
         warns.extend(
             ConfigFamily::CursorTrail,
             config_snapshot
@@ -10928,21 +9200,15 @@ impl App {
                 format!("config wallpaper {source:?} invalid: {reason}"),
             );
         }
-        // W6: re-resolve the per-style / fallback font keys (families → paths),
-        // riding the same banner for unresolvable entries. The diff against the
-        // cached resolved config decides below whether the backend is touched.
+        // Re-resolve the per-style/fallback font keys (families → paths), warning
+        // for unresolvable entries; the diff below decides whether the backend is
+        // touched.
         let new_font_config = prepared_fonts
             .as_ref()
             .map(|prepared| prepared.config.clone())
             .unwrap_or_else(|| self.font_config.clone());
-        // LAST among the families, once every resolver above has had its say: a
-        // key spelled right whose VALUE this build does not accept keeps the
-        // default just as silently as a misspelled key ignores the edit. The
-        // filter reads the sentences already collected, so a resolver that named
-        // the value it refused keeps its fuller sentence and this adds nothing
-        // for that key.
-        // The supervisor's `[harness]` values it refused (a known key with a
-        // value it cannot take: `continue = "maybe"`, which keeps its default).
+        // The supervisor's refused `[harness]` values (a known key with a value it
+        // cannot take keeps its default).
         collect_harness_notices(&mut warns, &config);
         // A `font_px` the resolver ignores says so here, like it does at launch,
         // and so does a theme the window draws Default in place of.
@@ -10956,64 +9222,49 @@ impl App {
         for w in warns.sentences() {
             crate::logging::stderr_line!("aterm-gui: {w}");
         }
-        // Surface dropped rules / restart notices on the band, one row per
-        // family. A fresh (possibly empty) set first RESOLVES every live
-        // `config.` row, so a fixed config takes its warnings down; the sync
-        // repaints every window.
-        self.replace_config_messages(warns.into_messages());
+        // Post warnings, one row per family. A fresh (possibly empty) set first
+        // resolves every live `config.` row, so fixed issues clear; windows
+        // repaint.
+        self.replace_config_messages_after_font_work(warns.into_messages(), family_admitted);
         self.option_as_meta = config.option_as_meta_or_default();
         self.confirm_multiline_paste = config.confirm_multiline_paste_or_default();
-        // Copy-on-select is a live input-policy toggle: a reload that flips it takes
-        // effect on the next selection (dropping the key restores the on-by-default
-        // policy).
+        // Copy-on-select applies from the next selection.
         self.copy_on_select = config.copy_on_select_or_default();
 
         // Tab-strip rows are window chrome: a change re-splits the window between the
         // strip and the terminal, so re-grid (like a resize) if it changed.
         let new_strip = resolve_tab_strip_rows(&config);
         if new_strip != self.tab_strip_rows {
+            // A strip rise raises every window's chrome rows and is noted, so no
+            // presence fold or band shrink re-grids inside the settle. A fall
+            // (a Settings edit) is immediate.
+            if aterm_messages::chrome::is_rise(self.tab_strip_rows, new_strip) {
+                self.note_chrome_rise_everywhere(std::time::Instant::now());
+            }
             self.tab_strip_rows = new_strip;
             self.regrid_for_chrome_rows();
         }
 
-        // Window chrome appearance (titlebar light/dark/auto): re-apply live so a
-        // `window_theme` edit takes effect without a restart, AND update the cached
-        // field so windows opened AFTER the reload use the new value (attach reads
-        // `self.window_theme`). Cross-platform: AppKit/DWM/winit each consume the
-        // same value. Light/Dark re-apply is idempotent; Auto clears the forced
-        // appearance and resumes the platform's system-theme behavior.
+        // Re-apply `window_theme` live and cache it for windows attached later.
+        // Light/Dark are idempotent; Auto clears the forced appearance.
         let new_window_theme = config.window_theme_or_default();
         if new_window_theme != self.window_theme {
             self.window_theme = new_window_theme;
-            // The chrome PAINTERS resolve from this field too (Linux:
-            // `chrome_palette_theme` feeds the tab band's strip tones and the
-            // native pages' role palette), and the strip row cache's
-            // fingerprint carries no theme term — `apply_theme_live` clears it
-            // by hand on a theme swap, so a `window_theme` edit must do the
-            // same or the band stale-serves the old side on a byte-idle grid.
-            // Native page rasters re-lower via the compile stamp (the resolved
-            // chrome theme is a paint-revision term); the present caches are
-            // dropped here so the rebuilt pixels actually reach glass.
+            // Chrome painters resolve from this field too (Linux
+            // `chrome_palette_theme`), and the strip row cache fingerprint has no
+            // theme term, so drop it and the present caches as `apply_theme_live`
+            // does. Native pages re-lower via the compile stamp.
             for ws in self.windows.values_mut() {
                 ws.last_strip_fp = None;
-                ws.last_present = None;
-                ws.cpu_cache.invalidate();
-                if let Some(
-                    PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
-                ) = &mut ws.present
-                {
-                    window_gpu.invalidate_present();
-                }
+                ws.invalidate_raster_caches();
                 if let Some(w) = ws.os_window.as_ref() {
                     w.request_redraw();
                 }
             }
         }
         {
-            // macOS/Windows receive the raw Light/Dark/Auto policy (Auto keeps
-            // following the live OS appearance through the platform seam); on Linux
-            // the one resolution seam maps Auto onto the terminal theme's darkness
-            // so the CSD header tracks the body (see `chrome_theme_for_apprt`).
+            // macOS/Windows get the raw policy (Auto follows the OS); on Linux Auto
+            // maps onto the terminal theme's darkness (`chrome_theme_for_apprt`).
             let chrome_theme = self.chrome_theme_for_apprt();
             let apprt = &self.apprt;
             for ws in self.windows.values() {
@@ -11023,14 +9274,10 @@ impl App {
             }
         }
 
-        // GPU-present colour space (M3): re-tag each GPU window's CAMetalLayer so a
-        // `window_colorspace` edit takes effect without a restart, and cache the
-        // value for windows attached after the reload. Re-tagging is cheap,
-        // idempotent, and interpretation-only (bytes/readback untouched), applied
-        // only on an actual change. Routed through the SAME proven precedence as
-        // attach (`resolve_surface_colorspace`): an HDR (Rgba16Float) window keeps
-        // its extended-linear tag — its pixels ARE linear; the config tag would
-        // mis-render them. No-op off macOS / on the CPU present path.
+        // Re-tag each GPU window's CAMetalLayer on a `window_colorspace` change
+        // and cache it for later windows. Uses the attach precedence
+        // (`resolve_surface_colorspace`): an HDR (Rgba16Float) window keeps its
+        // extended-linear tag. No-op off macOS or on the CPU path.
         let new_colorspace = config.window_colorspace_or_default();
         if new_colorspace != self.window_colorspace {
             self.window_colorspace = new_colorspace;
@@ -11052,11 +9299,9 @@ impl App {
                 );
                 let effective_colorspace =
                     apprt.window_set_surface_colorspace(w, surface_colorspace);
-                // Keep capture's explicit source metadata in the same update as
-                // the compositor tag. A P3 retag without this write would turn
-                // the next unprofiled PNG into mislabeled wide-gamut bytes. A
-                // failed retag leaves the old platform tag in effect, so retain
-                // the prior known metadata rather than claiming the request won.
+                // Update capture's source metadata with the compositor tag so the
+                // next PNG is labelled correctly; a failed retag keeps the old
+                // metadata.
                 let previous_capture_space = window_gpu.capture_color_space();
                 let capture_space = crate::platform::capture_space_after_surface_tag(
                     effective_colorspace,
@@ -11066,18 +9311,11 @@ impl App {
             }
         }
 
-        // M3 phase B: the EDR glow opt-in, live. Turning it OFF gates the >1.0
-        // aurora pass off on the NEXT present of every window (the plan follows
-        // `hdr_glow` per frame — proven safe on a still-f16 swapchain, whose blit
-        // keeps linear-decoding with the grid clamped at reference white).
-        // Turning it ON also admits an existing f16-capable Windows SDR surface
-        // to the renderer's throttled output-HDR probe; configure+scRGB tag must
-        // both succeed before the next present can use the HDR arms (the
-        // exhaustive hdr_gate law).
-        // Heat-shimmer hot-reload gate, resolved BEFORE the `&mut` backend
-        // borrow below: skipped while the load-shed latch holds the shimmer
-        // off — the latch transition (app_render) restores the configured
-        // value on recovery.
+        // `hdr_glow` applies from the next present (the plan reads it per frame;
+        // safe on an f16 swapchain). Turning it on also admits an f16-capable
+        // Windows SDR surface to the throttled output-HDR probe (hdr_gate).
+        // Shimmer reload is resolved before the backend borrow and skipped while
+        // the load-shed latch holds it off; the latch restores it on recovery.
         let shimmer_reload = if self.serious_mode_enabled() {
             Some(false)
         } else if self.load_shed_active() {
@@ -11085,12 +9323,8 @@ impl App {
         } else {
             Some(config.cursor_fire_shimmer_or_default())
         };
-        // Bloom on/off is the shimmer's parity class under the shed latch: while
-        // shed holds it off, a reload must not re-enable it (the latch transition
-        // in app_render restores the configured value on recovery). The
-        // strength/radius PARAMS are latch-independent (the shed gates the pass,
-        // not its tuning), so they always re-push — previously none of the three
-        // `cursor_trail_bloom*` keys hot-reloaded at all.
+        // Bloom on/off follows the shimmer rule under the shed latch; strength and
+        // radius always re-push (the latch gates the pass, not its tuning).
         let bloom_reload = if self.serious_mode_enabled() {
             Some(false)
         } else if self.load_shed_active() {
@@ -11098,10 +9332,8 @@ impl App {
         } else {
             Some(config.cursor_trail_bloom_or_default())
         };
-        // The radius is PER-STYLE (rainbow kitty 1.8, else 2.2; the knob
-        // overrides), so it reads the presentation of THIS generation: both
-        // `self.config` and the asset catalog were swapped above, and this is
-        // resolved before the `&mut` backend borrow below.
+        // The radius is per style, read from this generation's presentation
+        // before the backend borrow.
         let bloom_radius = config.cursor_trail_bloom_radius_or_default(self.trail_presentation());
         if let Backend::Gpu(g) = self.backend.ready_mut() {
             g.set_hdr_glow(config.hdr_glow_or_default());
@@ -11120,69 +9352,33 @@ impl App {
                 config.cursor_trail_bloom_strength_or_default(),
                 bloom_radius,
             );
-            // EFFECT-PIPELINE WARM-UP, and the ONE seam that gets it.
+            // Effect-pipeline warm-up. Effect pipelines are built lazily by
+            // `encode_frame`, so the first frame drawing a newly enabled effect
+            // would pay its compile inline (visible for the fire pipelines). A
+            // config apply is where a person enables effects, so warm here, several
+            // frames ahead; the launch path (`pin_gpu_effect_config`) does not warm.
+            // Idempotent.
             //
-            // The nine effect-only cell pipelines are demand-driven: a launch
-            // builds none of them (136.13 ms of dx12 shader compiles a default
-            // config never draws with), and `encode_frame` builds whichever the
-            // frame in front of it actually binds. That is correct for every
-            // enable path — a config reload, the Settings UI, an editor that
-            // starts emitting undercurls — but the frame that FIRST draws a
-            // newly-enabled effect would pay the compile inline, and for
-            // EMBERFORGE fire that is `fire_add` + `fire_over` = 111.07 ms on
-            // one frame. Visible.
-            //
-            // This is a config APPLY, which is exactly and only where an effect
-            // can be switched on by a human: not the launch path (that one runs
-            // `pin_gpu_effect_config`, which deliberately does NOT warm), and not
-            // a frame. Warming here puts every pipeline in place several frames
-            // before the first quad that needs one, where the beat a reload
-            // already costs hides it and nothing is animating. Idempotent, so
-            // every reload after the first is nine `is_some` checks.
-            //
-            // GATED ON THE TRAIL MASTER, because an UNCONDITIONAL warm here just
-            // relocates the defect this whole change removes: it would hand the
-            // `cursor_trail = false` owner the same 136 ms of compiles they never
-            // draw with, moved off the launch and onto their first config save.
-            // `cursor_trail` is the master for the entire cursor-glow family
-            // (`glow_config` folds it into `GlowConfig::enabled`), and that family
-            // is the sole producer of the only four pipelines whose inline build
-            // is a VISIBLE hitch: `fire_add`+`fire_over` (111.07 ms together) and
-            // `rain_glow`+`rain_glow_over` (17.70). With it off none of those four
-            // can be bound at all, so there is nothing to hide.
-            //
-            // The five that remain reachable with the trail off — `deco_over`
-            // (2.72 ms; an undercurl from any editor, no config knob gates it),
-            // `sprite_over` (3.26; wallpaper/pets), `deco_add` (2.06),
-            // `glow_add` (1.64), `cursor_blend` (0.40) — are each well under one
-            // 16.7 ms frame, so the demand path absorbs them where they happen and
-            // a warm would buy nothing. Correctness never rides on this either
-            // way: `encode_frame` ensures whatever the frame binds regardless, so
-            // a wrong guess here costs at most one sub-frame compile, never a
-            // missing effect.
+            // Gated on the trail master, the only producer of the pipelines with a
+            // visible build cost (`fire_add`, `fire_over`, `rain_glow`,
+            // `rain_glow_over`); the rest are sub-frame and handled on demand.
+            // Correctness never depends on this.
             if config.warms_effect_pipelines() {
                 g.warm_effect_pipelines();
             }
         }
 
-        // Focus-boost hot-reload: re-fold the want-set NOW (it reads the just-
-        // replaced `self.config`), so flipping `focus_boost` while a window is
-        // already focused applies immediately — OFF un-boosts every session via
-        // the empty want-set, ON boosts the currently visible ones — instead of
-        // waiting for the next focus/tab change.
+        // Re-fold the focus-boost want-set now so a `focus_boost` flip applies to
+        // an already-focused window immediately.
         self.recompute_focus_boost();
 
-        // GUI-level: renderer theme (window clear colour, cursor, selection),
-        // font size, and font family. Rebuild the backend ONLY when something it
-        // bakes in actually changed (theme, resolved font px, or family) — a
-        // metadata-only save (e.g. a comment edit) then costs nothing visible.
+        // Renderer theme, font size and family: rebuild only when something the
+        // backend bakes in changed, so a comment edit costs nothing visible.
         let new_theme =
             config.theme_for_with_assets(self.os_appearance, &config_snapshot.assets.themes);
-        // Re-derive the AUTO default font with the SAME HiDPI logic
-        // `attach_os_window` / `on_scale_factor_changed` use, so editing an
-        // unrelated key (e.g. a colour) on a Retina display does NOT shrink the
-        // font back to the FONT_PX (12px) base. An admitted explicit env/config font
-        // is honored verbatim (and re-pins `font_px_explicit`).
+        // Re-derive the auto font with the same HiDPI logic as attach and scale
+        // changes, so an unrelated edit does not shrink it to the 12px base. An
+        // explicit font is honored and re-pins `font_px_explicit`.
         let font_explicit_now = font_px_is_explicit(&config);
         let new_default_font_px = if font_explicit_now {
             resolve_font_px(&config)
@@ -11202,10 +9398,8 @@ impl App {
                 FONT_PX
             }
         };
-        // Only re-apply the font when the derived default ACTUALLY changed, so a
-        // live Cmd-+/Cmd-- zoom survives an unrelated config edit (and Cmd-0 still
-        // resets to the up-to-date scaled default). A metadata-only save is then a
-        // true no-op (new == old) instead of forcing a font shrink.
+        // Re-apply the font only when the derived default changed, so a live zoom
+        // survives unrelated edits and Cmd-0 resets to the current default.
         let default_changed = (new_default_font_px - self.default_font_px).abs() >= 0.5;
         self.default_font_px = new_default_font_px;
         let new_font_px = if default_changed {
@@ -11213,52 +9407,26 @@ impl App {
         } else {
             self.font_px
         };
-        // THE PIN: a surviving live zoom (effective px away from the scale default)
-        // must KEEP `font_px_explicit` — see `reload_font_pin`. The old
-        // unconditional `= font_explicit_now` dropped a Cmd-+/− zoom's pin while
-        // preserving its px, re-arming `apply_window_scale`, which then flipped the
-        // backend to the scale default at the next redraw (a tab switch was enough)
-        // WITHOUT a re-grid — bigger cells painted into the zoom-fitted, wider
-        // grid: a frame wider than the window, chopped at both edges.
+        // A surviving live zoom keeps `font_px_explicit` (see `reload_font_pin`).
         self.font_px_explicit =
             reload_font_pin(font_explicit_now, new_font_px, new_default_font_px);
-        // `Theme` is a 4×u32 POD without `PartialEq`; compare its fields directly
-        // (the renderer bakes these in, so any change needs a backend rebuild).
-        let theme_changed = (
-            new_theme.fg,
-            new_theme.bg,
-            new_theme.cursor,
-            new_theme.selection,
-        ) != (
-            self.theme.fg,
-            self.theme.bg,
-            self.theme.cursor,
-            self.theme.selection,
-        );
+        // The renderer bakes the theme in, so any change needs a backend rebuild.
+        let theme_changed = !theme_eq(new_theme, self.theme);
         let font_changed = (new_font_px - self.font_px).abs() >= 0.5;
-        // Effective family keeps the env > config > platform-default precedence on
-        // live reload too (the SAME `effective_font_family` as startup and the
-        // `--show-config` diagnostics, so the `family_changed` diff below can never
-        // see a spurious change from resolution drift): a `--font`
-        // override set at launch stays in force across a config reload rather than
-        // being clobbered by the reloaded config `font_family`.
-        // A rejected configured family is not a request to swap to a built-in
-        // face. Keep the last admitted family/face in the app-render artifact and surface the exact
-        // admission failure above. A later valid edit advances normally.
+        // Effective family keeps `--font` > config > platform default, via the
+        // same `effective_font_family` as startup and `--show-config`. A rejected
+        // family keeps the last admitted face; the failure is reported above.
         let effective_family = requested_effective_family;
         let family_changed = effective_family != self.font_family;
-        // Text shaping (ligatures / font_features). Update the source of truth BEFORE
-        // a possible rebuild so `rebuild_backend` re-applies the NEW shaping; if no
-        // rebuild is needed we push it through directly below.
+        // Text shaping: update the source of truth before a possible rebuild; if
+        // none is needed it is pushed directly below.
         let new_shaping = config.text_shaping();
         let shaping_changed = new_shaping != self.text_shaping;
         self.text_shaping = new_shaping;
-        // W2 typography knobs (`text_blending` / `font_thicken` / `stem_gamma`
-        // / `font_hinting`): same source-of-truth-before-rebuild discipline.
-        // All four change glyph APPEARANCE but not cell CONTENT (hinting never
-        // moves the linear advances — the hinted-seam contract), so a
-        // knob-only edit rides the shaping branch below (backend push +
-        // per-window present-cache invalidation).
+        // Typography knobs (`text_blending`, `font_thicken`, `stem_gamma`,
+        // `font_hinting`) change glyph appearance but not advances, so a
+        // knob-only edit rides the shaping branch (backend push plus present-cache
+        // invalidation).
         let new_blending = config.text_blending_or_default();
         let new_thicken = config.font_thicken_or_default();
         let new_stem_gamma = config.stem_gamma_or_default();
@@ -11274,25 +9442,19 @@ impl App {
         self.stem_gamma = new_stem_gamma;
         self.font_hinting = new_font_hinting;
         self.font_subpixel = new_font_subpixel;
-        // W5 renderer knobs: PURE diff — one KnobChange per changed key, each
-        // routed to exactly one renderer call (`apply_render_knob`). A
-        // line_height change alters the CELL GEOMETRY (every window re-grids),
-        // so it takes the full rebuild path below — which re-pins all knobs —
-        // while the others ride the appearance-only push branch.
+        // Renderer knobs: one KnobChange per changed key. `line_height` changes
+        // cell geometry and takes the full rebuild path; the rest are
+        // appearance-only pushes.
         let new_knobs = RenderKnobs::from_config(&config);
         let knob_changes = self.render_knobs.diff(&new_knobs);
         self.render_knobs = new_knobs;
-        // W6 font config: update the source of truth before installing the
-        // already-prepared renderer generation. Resolving families, admitting
-        // files, and parsing faces all happened on the catalog worker.
+        // Font config: update the source of truth before installing the
+        // renderer generation the catalog worker prepared.
         let font_cfg_changed = new_font_config != self.font_config;
         self.font_config = new_font_config;
-        // W9 variable-font requests: same source-of-truth-before-rebuild
-        // discipline. A change re-instantiates the primary, which can move
-        // the CELL GEOMETRY (a heavier wght can shift MVAR metrics), so it
-        // takes the full rebuild path below — like `line_height`. The
-        // malformed-entry warnings were already surfaced at startup; a
-        // reload re-parses silently (unchanged behaviour for other keys).
+        // Variable-font requests: a change re-instantiates the primary and can
+        // move cell geometry, so it takes the full rebuild path. Malformed-entry
+        // warnings were shown at startup; a reload re-parses silently.
         let (new_variations, _vf_warns) = config.font_variation_requests();
         let new_dark_nudge = config.font_weight_dark_nudge_or_default();
         let variations_changed = new_variations != self.font_variations
@@ -11302,9 +9464,8 @@ impl App {
         let geometry_knob_changed = knob_changes
             .iter()
             .any(|c| matches!(c, KnobChange::LineHeight(_)));
-        // Theme-only edits fall to the live fast path below; a rebuild is reserved
-        // for changes the backend actually bakes in (font px/family, cell geometry,
-        // or a variable-font re-instantiation).
+        // Theme-only edits take the live fast path; a rebuild is only for font
+        // px/family, cell geometry or variable-font changes.
         let prepared_font_refresh = prepared_fonts.is_some();
         let backend_rebuild_needed = font_changed
             || family_changed
@@ -11312,26 +9473,16 @@ impl App {
             || variations_changed
             || font_cfg_changed
             || prepared_font_refresh;
-        // W12 ORDERING (mirrors `set_font_px`): commit the effective px and re-resolve
-        // every window's per-window metric authority BEFORE any rebuild re-grids —
-        // `on_resize` divides each window by `win_cell_size` (= `ws.metrics`), so a
-        // refresh AFTER the rebuild (the old tail call) left the re-grid dividing by
-        // the STALE cell box, and the grid never matched the rebuilt glyphs.
+        // Commit the px and re-resolve every window's metrics before any rebuild
+        // re-grids, since `on_resize` divides by `ws.metrics` (as in `set_font_px`).
         self.font_px = new_font_px;
         self.refresh_all_window_metrics();
-        // LIVE-APPLY a padding edit: the refresh above re-resolved every
-        // attached window's `metrics.pad`/`pad_top` from the new config, and
-        // `apply_window_scale` (top of `redraw_window`) re-tunes the shared
-        // backend from that record — but the GRID still holds the old pad's
-        // cell count, and only the front window would organically repaint. So
-        // when the resolved padding regime changed without an encompassing font /
-        // geometry rebuild, re-grid each sized window
-        // (`on_resize` divides the SAME glass size by the refreshed metrics —
-        // the one `grid_dims_for` law) and request a redraw everywhere, which
-        // routes through `apply_window_scale` to push the new pads. A combined
-        // rebuild defers this: success re-grids every window in rebuild_backend,
-        // while failure restores the exact prior metrics without ever changing
-        // the grid/PTY dimensions.
+        // Live-apply a padding edit: the refresh above updated each attached
+        // window's pad, but the grid still has the old cell count. When the
+        // padding changed without a font/geometry rebuild, re-grid each sized
+        // window and redraw everywhere (`apply_window_scale` pushes the pads). A
+        // rebuild handles it itself: success re-grids, failure restores the prior
+        // metrics.
         let new_padding = (
             config.window_padding_or_default(),
             config.window_padding_top_or_default(),
@@ -11362,8 +9513,7 @@ impl App {
                     app.rebuild_backend_with_prepared(prepared)
                 });
             // Publish theme-dependent native chrome only after the fallible face
-            // commit. Otherwise a rejected family could leave the titlebar on the
-            // new theme while the terminal renderer stays on the old one.
+            // commit, so a rejected family cannot leave the titlebar out of step.
             if rebuild_succeeded && theme_changed {
                 let bg = self.theme.bg;
                 let apprt = &self.apprt;
@@ -11371,10 +9521,8 @@ impl App {
                 let strip_dark = crate::tab_bar::theme_is_dark(bg);
                 for (wid, ws) in self.windows.iter_mut() {
                     ws.last_strip_fp = None;
-                    // Keep the seamless titlebar (window_set_background_color) in step
-                    // with the new terminal bg, so a live theme change does not reopen a
-                    // colour seam between the compact bar and the terminal body. No-op
-                    // off macOS (the Linux apprt does nothing here).
+                    // Keep the seamless titlebar colour in step with the new
+                    // terminal bg (no-op off macOS).
                     if let Some(w) = ws.os_window.as_ref() {
                         apprt.window_set_background_color(w, bg);
                     }
@@ -11390,18 +9538,10 @@ impl App {
                 }
             }
         } else if theme_changed {
-            // Colour-only edit (font px + family unchanged): the face and glyph
-            // atlas stay valid, so the full rebuild — primary-font re-discovery,
-            // fontdue re-parse, atlas drop, per-window re-grid — would be pure
-            // waste on the event loop. Push the theme onto the LIVE backend
-            // instead; every colour-save while iterating on a scheme (and every
-            // native Settings colour edit admitted through the serialized config
-            // lane) is then a repaint, not a font parse. ENRICHED with our appearance knobs:
-            // a single save can flip the theme AND a shaping/typography/render
-            // knob, and none of those force a rebuild — apply them live here
-            // too. `apply_theme_live` does all the per-window cache invalidation, so
-            // there is no duplicate repaint. (`font_px` was committed above, before
-            // the metrics refresh.)
+            // Colour-only edit: the face and atlas stay valid, so push the theme
+            // onto the live backend instead of a full rebuild. Shaping, typography
+            // and render knobs changed in the same save apply live here too;
+            // `apply_theme_live` handles cache invalidation.
             self.font_family = effective_family;
             if shaping_changed {
                 self.backend.set_text_shaping(self.text_shaping.clone());
@@ -11422,16 +9562,10 @@ impl App {
             }
             self.apply_theme_live(new_theme);
         } else if shaping_changed || typography_changed || !knob_changes.is_empty() {
-            // Shaping/typography-only edit (no font/theme/family change, so no backend
-            // rebuild): push the new settings straight onto the live backend. These
-            // flips change glyph APPEARANCE but not cell CONTENT, so every cache that
-            // diffs on content would re-present the OLD glyphs. `set_text_shaping` /
-            // `set_font_thicken` / `set_stem_gamma` already drop the SHARED atlas /
-            // glyph caches where needed (`set_text_blending` is blend-time only); here
-            // we additionally drop each window's PER-WINDOW present cache (CPU pixel
-            // cache + GPU prev-frame) and the GUI RepaintKey gate — mirroring the
-            // theme-change role of `WindowGpu::invalidate_present` /
-            // `WindowCpu::invalidate`.
+            // Shaping/typography-only edit: push settings onto the live backend.
+            // The setters drop shared atlas/glyph caches as needed; also drop each
+            // window's present cache (CPU pixel cache, GPU prev-frame) and the
+            // RepaintKey gate, since content-diffing caches would show old glyphs.
             self.backend.set_text_shaping(self.text_shaping.clone());
             self.backend.set_text_blending(self.text_blending);
             self.backend.set_font_thicken(self.font_thicken);
@@ -11446,14 +9580,7 @@ impl App {
                 self.apply_render_knob(change);
             }
             for ws in self.windows.values_mut() {
-                ws.last_present = None;
-                ws.cpu_cache.invalidate();
-                if let Some(
-                    PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
-                ) = &mut ws.present
-                {
-                    window_gpu.invalidate_present();
-                }
+                ws.invalidate_raster_caches();
                 if let Some(w) = ws.os_window.as_ref() {
                     w.request_redraw();
                 }
@@ -11465,12 +9592,8 @@ impl App {
                 w.request_redraw();
             }
         }
-        // (The per-window metric refresh moved ABOVE the rebuild — the W12 ordering
-        // note before the branch — so the re-grid divides by the NEW cell box.)
-        // A live fast-path mutation does not pass through `rebuild_backend`'s
-        // `sync_chrome_fonts`, so refresh the exact semantic font fork only
-        // after every relevant backend setter has landed. This is rare
-        // config-change work; steady semantic paint stays allocation-free.
+        // The live fast path skips `rebuild_backend`'s `sync_chrome_fonts`, so
+        // refresh the font fork after every backend setter has landed.
         if !backend_rebuild_needed
             && !theme_changed
             && (shaping_changed || typography_changed || !knob_changes.is_empty())
@@ -11483,81 +9606,38 @@ impl App {
         self.finish_native_config_external_admission(&admitted_baseline);
     }
 
-    /// Re-resolve EVERY window's per-window [`MetricsView`] from the live font
-    /// regime (W12). An explicit `--font-px` / `config.font_px` (or a
-    /// force-pinned scale) fixes the px for all windows — each keeps its own
-    /// scale-derived `pad`; otherwise each window's metrics are the pure
-    /// [`MetricsView::for_scale`] of its OWN display scale. Used after a config
-    /// reload changes the font size regime, so the per-window pixel authority the
-    /// draw / hit-test / IME paths read never diverges from the rebuilt backend.
-    /// NEVER-ATTACHED windows keep their sealed pad/head (only the font regime
-    /// re-resolves) — see the seam note inside.
-    /// The interior padding (device px per edge) for `scale` under the LIVE
-    /// config: [`crate::logical_to_device_px`] over
-    /// [`Config::window_padding_or_default`]. The config-aware twin of the free
-    /// [`crate::pad_for_scale`] (which stays pinned to the built-in default for
-    /// the pure MetricsView proofs); with an unset config the two are equal.
+    /// Interior padding (device px per edge) at `scale` under the live config:
+    /// [`crate::logical_to_device_px`] over [`Config::window_padding_or_default`].
+    /// Config-aware twin of [`crate::pad_for_scale`]; equal when unset.
     pub(crate) fn cfg_pad_for_scale(&self, scale: f64) -> usize {
         crate::logical_to_device_px(self.config.window_padding_or_default(), scale)
     }
 
-    /// TOP-edge twin of [`Self::cfg_pad_for_scale`] —
-    /// `Config::window_padding_top_or_default` at `scale`, additionally capped at
-    /// the base pad in DEVICE px (rounding could otherwise lift a logical-equal
-    /// pair above the base at fractional scales; the renderer clamps the same way).
+    /// Top-edge twin of [`Self::cfg_pad_for_scale`], capped at the base pad in
+    /// device px (rounding could exceed it at fractional scales).
     pub(crate) fn cfg_pad_top_for_scale(&self, scale: f64) -> usize {
         crate::logical_to_device_px(self.config.window_padding_top_or_default(), scale)
             .min(self.cfg_pad_for_scale(scale))
     }
 
-    /// C3 — THE SYNTHETIC TAB-BAND HEAD, in DEVICE px, for a window at `scale`
-    /// whose cell box is `cell_h` px tall. `0` on macOS, `0` with the strip off,
-    /// `0` under `tab_band_height = "compact"`, and `0` whenever the strip's cell
-    /// rows already reach the target — every one of which reproduces the pre-C3
-    /// geometry byte for byte.
+    /// Synthetic tab-band head in device px for a window at `scale` with cell
+    /// height `cell_h`. Zero on macOS, with the strip off, under
+    /// `tab_band_height = "compact"`, or when the strip rows already reach the
+    /// target.
     ///
-    /// WHY A `head` BAND AND NOT A BIGGER `pad_top`. The Windows band measured 21 px
-    /// (2 px lip + one 19 px cell row at FONT_PX 16 / 96 dpi) where a WinUI tab is
-    /// 32-34. Two mechanisms could close that:
+    /// A `head` band rather than a bigger `pad_top`: `pad_top` is grid padding
+    /// that applies with the strip off too, while `head` already means "host
+    /// chrome over the grid" and is handled everywhere (`grid_dims_for`,
+    /// `frame_size`, `pixel_to_term_cell`, `strip_col_for_pixel`,
+    /// `fill_chrome_bleed`, the pixel band's centring and cache key). Gated on
+    /// `tab_strip_rows > 0`.
     ///
-    ///   * raise the Windows `window_padding_top` default — but `pad_top` is
-    ///     interior padding of the GRID. It applies with the strip OFF too, so a
-    ///     `tab_strip_rows = 0` window would silently gain a dead 11 px gutter and
-    ///     every geometry proof (`pad_split`, the asymmetric-pad lattice, hundreds
-    ///     of `pad_top` call sites) would have to move with it. That is a blast
-    ///     radius out of all proportion to a chrome tweak.
+    /// Takes `cell_h` because attach and the early reveal hold a cell box the
+    /// per-window `MetricsView` does not yet have.
     ///
-    ///   * a synthetic `head` — the band aterm ALREADY has for "host chrome that
-    ///     overlaps the grid", which is exactly what this is. `head` is reserved
-    ///     out of the height before the rows are fitted (`grid_dims_for`), added
-    ///     back by `frame_size`, stripped by `pixel_to_term_cell` /
-    ///     `strip_col_for_pixel` (a click in the head band over the strip already
-    ///     maps to the strip — `gy` saturates to 0), filled edge-to-edge in the
-    ///     band tone by `fill_chrome_bleed`'s `[0, grid_top)` rule, and folded into
-    ///     the pixel band's optical centring through `band_top_px = pad_top + head`
-    ///     (and into its cache key, so a change re-rasters exactly once). Nothing
-    ///     new has to learn about it.
-    ///
-    /// It is gated on `tab_strip_rows > 0` for the same reason the first bullet is
-    /// rejected: a band with nothing in it is not chrome, it is a shifted grid.
-    ///
-    /// Takes `cell_h` rather than reading it, because the two callers that matter
-    /// hold a cell box the per-window `MetricsView` does not yet (attach, before
-    /// the record is written) or cannot (the L1 early reveal, whose whole premise
-    /// is CACHED metrics from a previous run).
-    ///
-    /// COMPILED ON EVERY PLATFORM, not `#[cfg(windows)]`. It is the one non-test
-    /// consumer of the C3 config chain (`Config::tab_band_height_or_default`,
-    /// [`TabBandHeight`], [`synthetic_band_head_px`], [`TAB_BAND_STANDARD_LOGICAL_PX`],
-    /// `SYNTHETIC_BAND_HEAD_CELL_CAP`), so gating it out would make all of them
-    /// unreachable off Windows and Linux and break the `-D warnings` gate on macOS
-    /// with a fan of `dead_code` findings. On macOS it is not a stub either: the
-    /// law genuinely evaluates to 0 there, because [`TabBandHeight::PLATFORM_DEFAULT`]
-    /// is `Compact` and a `compact` target collapses the whole derivation. The `0`
-    /// promised in the first paragraph is therefore a RESULT, computed by the same
-    /// arithmetic Windows and Linux run, not a platform special case — which is
-    /// also what keeps the chain type-checked and test-covered on the platform
-    /// that never calls it (see `tab_band_height_tests`).
+    /// Compiled on every platform so the config chain stays live and tested; on
+    /// macOS it computes 0 because [`TabBandHeight::PLATFORM_DEFAULT`] is
+    /// `Compact`.
     pub(crate) fn synthetic_strip_head_px(&self, scale: f64, cell_h: usize) -> usize {
         synthetic_band_head_px(
             self.config.tab_band_height_or_default().target_logical_px(),
@@ -11568,37 +9648,25 @@ impl App {
         )
     }
 
-    // NOTE: no per-platform TWIN, deliberately — one function, one law, every
-    // platform. On macOS the synthetic band does not exist (its `head` is a
-    // MEASURED AppKit titlebar — see `AppRt::titlebar_band_pts`), but that absence
-    // is expressed by `PLATFORM_DEFAULT = Compact` returning 0 through the shared
-    // arithmetic, not by a second `#[cfg]` body. The one platform-shaped guard that
-    // DOES have to stay a guard is the CALL in `on_resize`, and it is a runtime
-    // `cfg!(any(windows, target_os = "linux"))` for the same reason: on macOS
-    // `ws.metrics.head` holds a real measured titlebar band, so letting the C3
-    // write run there would clobber it with this law's 0.
-
+    /// Re-resolve every window's [`MetricsView`] from the live font regime. An
+    /// explicit `--font-px` / `config.font_px` or forced scale fixes the px for
+    /// all windows (each keeps its own pad); otherwise each window gets
+    /// [`MetricsView::for_scale`] of its own scale. Never-attached windows keep
+    /// their sealed pad and head.
     pub(crate) fn refresh_all_window_metrics(&mut self) {
         let pinned = self.font_px_explicit || resolve_force_scale().is_some();
         let font_px = self.font_px;
-        // Resolve the configured LOGICAL padding once, outside the borrow of
-        // `windows` — the per-window derivation below stays pure of everything
-        // but the window's own scale (the W12 law), with the config supplying
-        // the logical constants.
+        // Resolve the logical padding once, outside the `windows` borrow.
         let (pad_l, pad_top_l) = (
             self.config.window_padding_or_default(),
             self.config.window_padding_top_or_default(),
         );
         for ws in self.windows.values_mut() {
-            // The chrome headroom is a property of the window's titlebar band, not
-            // of the font regime: re-derive it from the attach-captured points at
-            // the window's own scale on BOTH branches (`for_scale` carries none).
-            // A NEVER-ATTACHED window has no captured band: its sealed record
-            // ([`Self::seed_headless_boot_metrics`]) is the applied boot truth,
-            // and re-deriving from `head_pts` (0) wiped the `$ATERM_HEADROOM_PX`
-            // band on every delta config reload — the next recording's first
-            // redraw re-tuned the shared backend from the wiped record, re-opening
-            // the frames=0 class through this seam. Keep the sealed head + pad.
+            // The chrome headroom re-derives from the attach-captured points at
+            // the window's scale on both branches (`for_scale` carries none). A
+            // never-attached window keeps its sealed record
+            // ([`Self::seed_headless_boot_metrics`]), including the
+            // `$ATERM_HEADROOM_PX` band.
             let attached = ws.os_window.is_some();
             let head = if attached {
                 (ws.head_pts * ws.scale).round() as usize
@@ -11606,12 +9674,10 @@ impl App {
                 ws.metrics.head
             };
             ws.metrics = if pinned {
-                // A pinned font fixes the PX, not the padding: an ATTACHED
-                // window's pad re-resolves from the live config at its own scale
-                // (identical to the old kept value when `window_padding` is
-                // unset, since attach derived it from the same constants) so a
-                // padding edit hot-applies under `--font-px` too. A
-                // never-attached window keeps its sealed boot pad, as below.
+                // A pinned font fixes the px, not the padding: an attached
+                // window's pad re-resolves from the live config so padding edits
+                // apply under `--font-px` too; a never-attached window keeps its
+                // sealed pad.
                 let (pad, pad_top) = if attached {
                     let pad = crate::logical_to_device_px(pad_l, ws.scale);
                     (
@@ -11632,37 +9698,24 @@ impl App {
             };
             ws.metrics.head = head;
         }
-        // CELL-PX-1: every window's resolved cell box may have just moved (a font
-        // zoom, a `font_size` / `font_family` reload, a theme whose metrics differ),
-        // so report the new one to the engines HERE rather than waiting for each
-        // window's next raster seam. `apply_window_scale` alone would leave a
-        // BACKGROUND window's sessions answering DEC 1016 and sizing OSC 1337
-        // images from the pre-change cell box for as long as that window went
-        // unpainted — a shell does not stop emitting because its window is behind
-        // another. This is a metrics-change seam, not a per-frame one, so the
-        // engine locks it takes are rare; the per-window memo makes the windows
-        // whose resolved size did not actually move free anyway.
+        // The resolved cell box may have moved (zoom, font or theme reload), so
+        // report it to the engines here rather than waiting for each window's next
+        // raster seam; background windows' sessions still answer DEC 1016 and size
+        // OSC 1337 images. The per-window memo makes unchanged windows free.
         //
-        // A FACE swap resolves here against the face still installed on the shared
-        // backend (`set_font_px_with` refreshes metrics BEFORE `rebuild_backend`,
-        // deliberately — the re-grid needs the new px). That is exactly right for a
-        // pure zoom, and merely early for a face change: the memo keys on the
-        // RESOLVED size, so the first post-rebuild `apply_window_scale` still
-        // pushes when the new face resolves differently. It can never strand a
-        // stale value.
+        // A face swap resolves here against the still-installed face (metrics are
+        // refreshed before `rebuild_backend`); the memo keys on the resolved size,
+        // so the first post-rebuild `apply_window_scale` still pushes a change.
         let wids: Vec<crate::WindowId> = self.windows.keys().copied().collect();
         for wid in wids {
             self.sync_cell_pixel_size(wid);
         }
     }
 
-    /// Warn (once per config load) about configured `font_features` that cannot take
-    /// effect, so the user isn't left with a silent no-op ("it looked the same"):
-    /// (1) tokens the parser rejected — typos like `+toolong` / `cv01=x` (mirrors the
-    /// per-key warnings the other config keys already emit); and (2) valid tags the
-    /// ACTIVE FONT doesn't advertise in its `GSUB` (any feature on a no-GSUB font such
-    /// as Menlo/Monaco, or an unsupported tag like `ss99`). Must be called AFTER the
-    /// shaping is applied to the backend so the font probe reflects the live face.
+    /// Warn once per config load about `font_features` that cannot take effect:
+    /// tokens the parser rejected, and valid tags the active font's `GSUB` does
+    /// not advertise. Call after shaping is applied so the probe sees the live
+    /// face.
     pub(crate) fn warn_font_feature_issues(&self) {
         let Some(specs) = self.config.font_features.as_deref() else {
             return;
@@ -11721,9 +9774,9 @@ mod reload_render_transaction_tests {
         let old_metrics = app.windows[&wid].metrics;
         let previous = ReloadRenderSnapshot::capture(&app);
 
-        // This is the candidate state reload_config publishes before its one
-        // fallible step. It deliberately changes every cached renderer source,
-        // both geometry keys, theme keys, and one UNRELATED live input policy.
+        // The candidate state reload_config publishes before its fallible step:
+        // changes every cached renderer source, both geometry keys, theme keys
+        // and one unrelated live input policy.
         let candidate: Config = aterm_toml::from_str(
             r##"
 font_px = 23.0
@@ -11848,20 +9901,7 @@ copy_on_select = true
         assert_eq!(app.default_font_px, old_default_font_px);
         assert_eq!(app.font_px, old_font_px);
         assert_eq!(app.font_px_explicit, old_font_px_explicit);
-        assert_eq!(
-            (
-                app.theme.fg,
-                app.theme.bg,
-                app.theme.cursor,
-                app.theme.selection
-            ),
-            (
-                old_theme.fg,
-                old_theme.bg,
-                old_theme.cursor,
-                old_theme.selection
-            )
-        );
+        assert!(super::theme_eq(app.theme, old_theme));
         assert_eq!(app.font_family, old_family);
         assert_eq!(app.text_shaping, old_shaping);
         assert_eq!(app.text_blending, old_blending);
@@ -11873,17 +9913,78 @@ copy_on_select = true
         assert_eq!(app.font_config, old_font_config);
         assert_eq!(app.windows[&wid].metrics, old_metrics);
     }
+
+    /// A face rebuild that keeps the cell box (a `font_weight` edit on a variable
+    /// face, as the catalog worker prepares it) repaints a CPU window in full.
+    /// The CPU damage cache keys on frame size, grid origin and font epoch, and a
+    /// sealed generation can repeat all three, so without the rebuild dropping it
+    /// the window re-presents the old glyphs (the windowed CPU present copies
+    /// `presented_pixels` on a gate hit).
+    #[test]
+    fn a_same_cell_box_face_rebuild_repaints_the_cpu_window() {
+        use aterm_render::DamageOutcome;
+
+        fn present_cpu(
+            app: &mut crate::App,
+            input: &aterm_render::RenderInput,
+        ) -> (Vec<u32>, DamageOutcome) {
+            let crate::App {
+                backend, windows, ..
+            } = app;
+            let crate::Backend::Cpu(renderer) = backend.ready_mut() else {
+                panic!("headless test backend is CPU")
+            };
+            let ws = windows
+                .get_mut(&crate::WindowId(0))
+                .expect("headless fixture window");
+            let _ = renderer.render_input_cached(&mut ws.cpu_cache, input);
+            (
+                ws.cpu_cache.presented_pixels().to_vec(),
+                ws.cpu_cache.last_damage(),
+            )
+        }
+
+        let mut app = crate::App::headless_for_test();
+        let mut term = aterm_core::terminal::Terminal::new(3, 8);
+        term.process(b"\x1b[?25lABC");
+        let input = term.cell_frame(3, 8);
+        let _ = present_cpu(&mut app, &input);
+        assert_eq!(
+            present_cpu(&mut app, &input).1,
+            DamageOutcome::GateHit,
+            "negative control: an identical frame really is cached"
+        );
+        let cell = app.backend.cell_size();
+
+        let mut prepared = aterm_render::Renderer::from_system(app.font_px, app.theme)
+            .expect("system font for the prepared generation");
+        let _ = prepared.set_font_variations(&[(u32::from_be_bytes(*b"wght"), 800.0)], 0.0);
+        let _ = prepared.seal_admitted_font_sources();
+        let chrome = crate::tray_raster::prepare_chrome_fonts(None, None, None);
+        assert!(app.rebuild_backend_with_prepared(Some((prepared, chrome))));
+        assert_eq!(
+            app.backend.cell_size(),
+            cell,
+            "the case needs an unchanged cell box"
+        );
+
+        let (pixels, damage) = present_cpu(&mut app, &input);
+        assert_eq!(damage, DamageOutcome::Full, "the face rebuild repaints");
+        let crate::Backend::Cpu(renderer) = app.backend.ready_mut() else {
+            panic!("headless test backend is CPU")
+        };
+        assert!(
+            pixels == renderer.render_input(&input).pixels,
+            "the window shows what the new face renders"
+        );
+    }
 }
 
 #[cfg(test)]
 mod descriptive_title_config_tests {
 
-    /// The effects-OFF owner must not pay the effect-pipeline warm-up on a config
-    /// save. The nine pipelines are demand-driven so a launch compiles none of
-    /// them; warming them unconditionally at the config-apply seam would hand a
-    /// `cursor_trail = false` config the same 136 ms of never-drawn dx12 compiles,
-    /// merely relocated off the launch onto the first save. With the trail off the
-    /// only pipelines still reachable are sub-frame builds the demand path absorbs.
+    /// With `cursor_trail = false`, a config save does not warm the effect
+    /// pipelines (the only ones still reachable build within a frame).
     #[test]
     fn an_effects_off_config_never_warms_the_effect_pipelines() {
         let off: Config = aterm_toml::from_str("cursor_trail = false\n").unwrap();
@@ -11891,14 +9992,11 @@ mod descriptive_title_config_tests {
             !off.warms_effect_pipelines(),
             "`cursor_trail = false` must not compile fire/rain pipelines it can never bind"
         );
-        // The batteries-on default and an explicit opt-in DO warm: with the trail
-        // live, `fire_add` + `fire_over` alone are 111.07 ms, and paying that
-        // inline on the first frame that ignites is a hitch the eye sees.
+        // The default and an explicit opt-in warm (the fire pipelines are a
+        // visible hitch inline).
         let on: Config = aterm_toml::from_str("cursor_trail = true\n").unwrap();
         assert!(on.warms_effect_pipelines());
-        // …and the ABSENT key follows the platform default, so the warm is exactly
-        // as demand-driven as the trail itself: paid where the trail ships on,
-        // never paid on Windows, where a fresh config can bind none of it.
+        // An absent key follows the platform default, like the trail itself.
         assert_eq!(
             Config::default().warms_effect_pipelines(),
             super::DEFAULT_DECORATIVE_EFFECTS,
@@ -12091,42 +10189,8 @@ window_title_format = "description"
         assert!(!cfg("tab_connection_badge = false").tab_connection_badge_or_default());
     }
 
-    /// `explain_heavy_load` round-trips: absent reads ON (the owner asked for
-    /// the row), an explicit `false` reads OFF, an explicit `true` reads ON.
-    #[test]
-    fn explain_heavy_load_defaults_on_and_round_trips() {
-        let cfg = |s: &str| -> Config { aterm_toml::from_str(s).unwrap() };
-        assert!(Config::default().explain_heavy_load_or_default());
-        assert!(!cfg("explain_heavy_load = false").explain_heavy_load_or_default());
-        assert!(cfg("explain_heavy_load = true").explain_heavy_load_or_default());
-        assert_eq!(
-            cfg("explain_heavy_load = false").explain_heavy_load,
-            Some(false),
-            "an explicit value is kept as written"
-        );
-    }
-
-    /// `desktop_alerts` round-trips: absent reads OFF (the owner turned
-    /// aterm's desktop alerts off), an explicit `true` reads ON, an explicit
-    /// `false` reads OFF and is kept as written.
-    #[test]
-    fn desktop_alerts_default_off_and_round_trip() {
-        let cfg = |s: &str| -> Config { aterm_toml::from_str(s).unwrap() };
-        assert!(!Config::default().desktop_alerts_or_default());
-        assert!(cfg("desktop_alerts = true").desktop_alerts_or_default());
-        assert!(!cfg("desktop_alerts = false").desktop_alerts_or_default());
-        assert_eq!(
-            cfg("desktop_alerts = false").desktop_alerts,
-            Some(false),
-            "an explicit value is kept as written"
-        );
-        assert_eq!(cfg("").desktop_alerts, None, "absent stays absent");
-    }
-
-    /// The observation budget is DERIVED, not configured: it must never be
-    /// coarser than the dwell it has to serve (a candidate that cannot be
-    /// re-seen inside its own window can never be published), and never fall to
-    /// zero, which would turn every output burst into a classification.
+    /// The derived observation budget is never coarser than the dwell and never
+    /// zero.
     #[test]
     fn the_observation_interval_tracks_dwell_between_a_floor_and_the_budget() {
         let ms = |toml: &str| cfg(toml).tab_status_observe_interval().as_millis();
@@ -12237,7 +10301,7 @@ mod cfg_engine_tests {
         unaccepted_value_notices,
     };
     #[cfg(unix)]
-    use super::{ThemeCatalogWatchError, open_regular_theme_file};
+    use super::{ThemeCatalogWatchError, read_bounded_theme_file};
     use aterm_core::config::BiDiMode;
 
     fn cfg(toml: &str) -> Config {
@@ -12287,22 +10351,27 @@ mod cfg_engine_tests {
     fn bool_knobs_resolve_their_default_and_both_spellings() {
         /// `(key, shipped default, resolver)`.
         type Knob = (&'static str, bool, fn(&Config) -> bool);
-        let rows: [Knob; 5] = [
+        let rows: [Knob; 7] = [
             // Serious mode is opt-in.
             ("serious_mode", false, Config::serious_mode_or_default),
             // Focus boost ships ON: the anti-starvation lane costs nothing when idle
             // and only touches the shell root + conhost; `false` opts out.
             ("focus_boost", true, Config::focus_boost_or_default),
-            // The tone melody ships ENABLED (subtle by design — the neutral verdict is
-            // bit-exactly today's sound); `false` pins the neutral melody at the drain
-            // seams and stops the classifier via `tone_infer_active`.
+            // Tone melody defaults on; `false` pins the neutral melody and stops
+            // the classifier via `tone_infer_active`.
             ("tone_melody", true, Config::tone_melody_or_default),
             // Robi is opt-IN (owner directive: disabled by default).
             ("robi", false, Config::robi_or_default),
-            // The ambient bed: the owner turned it ON by default (2026-09-09);
-            // `false` silences the drone at the drain seams, and notes, brrrring, bonk
-            // and melody are unaffected by it.
+            // The ambient bed defaults on; `false` silences only the drone.
             ("trail_sound_bed", true, Config::trail_sound_bed_or_default),
+            // The strain row is opt-OUT: the owner asked for it.
+            (
+                "explain_heavy_load",
+                true,
+                Config::explain_heavy_load_or_default,
+            ),
+            // aterm's own desktop notices are opt-IN.
+            ("desktop_alerts", false, Config::desktop_alerts_or_default),
         ];
         for (key, default, read) in rows {
             assert_eq!(
@@ -12391,11 +10460,11 @@ mod cfg_engine_tests {
         {
             assert!(catalog.resolve("Alias").is_err());
             assert!(
-                open_regular_theme_file(&dir.join("Alias.conf")).is_err(),
+                read_bounded_theme_file(&dir.join("Alias.conf")).is_err(),
                 "the handle-level open must reject a symlink even if it is swapped in after scanning"
             );
             assert!(
-                open_regular_theme_file(&dir.join("Pipe.conf")).is_err(),
+                read_bounded_theme_file(&dir.join("Pipe.conf")).is_err(),
                 "the nonblocking handle-level open must reject a FIFO without waiting for a writer"
             );
         }
@@ -12439,10 +10508,8 @@ mod cfg_engine_tests {
         assert_eq!(catalog.ready_names().collect::<Vec<_>>(), ["Work"]);
         assert_eq!(catalog.resolve("work"), catalog.resolve("WORK"));
 
-        // These can coexist on a case-sensitive host (the in-memory constructor
-        // makes that generation portable to case-insensitive test hosts).
-        // Neither spelling may silently win, because the picker and config
-        // resolver intentionally expose one case-insensitive namespace.
+        // Case-colliding names can coexist on a case-sensitive host; neither may
+        // win, since the picker and resolver share one case-insensitive namespace.
         let collided = ThemeCatalog::from_schemes([
             (
                 "Work".to_string(),
@@ -12669,9 +10736,8 @@ mod cfg_engine_tests {
         assert_eq!(tc.bidi.mode, BiDiMode::Disabled);
     }
 
-    /// W6: a DEFAULT config resolves to the default [`super::FontConfig`] with
-    /// no warnings — the startup `apply_font_config` is then a provable no-op
-    /// (every renderer setter no-ops on its construction value).
+    /// A default config resolves to the default [`super::FontConfig`] with no
+    /// warnings, so the startup apply is a no-op.
     #[test]
     fn w6_font_config_default_resolves_to_noop() {
         let (fc, warns) = super::FontConfig::from_config(&Config::default());
@@ -12683,18 +10749,16 @@ mod cfg_engine_tests {
         assert!(fc.synthetic_style, "synthesis defaults ON (byte-identical)");
     }
 
-    /// W6: unresolvable entries warn and are SKIPPED (never a hard failure);
-    /// a file path entry resolves verbatim; `font_synthetic_style = false`
-    /// carries through.
+    /// Unresolvable entries warn and are skipped; a file path resolves verbatim;
+    /// `font_synthetic_style = false` carries through.
     #[test]
     fn w6_font_config_warns_and_skips_unresolvable() {
         let fixture = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../aterm-render/assets/DejaVuSansMono.ttf"
         );
-        // `CARGO_MANIFEST_DIR` is a NATIVE path — on Windows it is
-        // `C:\Users\…`, which a TOML basic string reads as escape sequences.
-        // It goes through the same escaper the sibling W6 fixtures use.
+        // `CARGO_MANIFEST_DIR` is a native path (backslashes on Windows), so escape
+        // it for the TOML basic string.
         let toml = format!(
             "font_family_bold = \"definitely-not-a-real-font-xyzzy\"\n\
              font_synthetic_style = false\n\
@@ -12715,9 +10779,8 @@ mod cfg_engine_tests {
         assert!(warns[1].contains("fallback_fonts"));
     }
 
-    /// UI apply fail-safe: an authored path which fails bounded admission is a
-    /// rejected replacement, not an instruction to clear the last working face.
-    /// The exact size policy reaches the Settings/Manual diagnostic.
+    /// An authored path that fails bounded admission is a rejected replacement,
+    /// not a clear of the working face; the size policy reaches the diagnostic.
     #[test]
     fn w6_rejected_oversized_face_preserves_last_working_font() {
         let root = std::env::temp_dir().join(format!(
@@ -12779,9 +10842,8 @@ mod cfg_engine_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// M2: stream-fade defaults — OFF (minimal fast defaults, 6272bd7a), window
-    /// 90 ms — and the `stream_fade_ms` clamp (16..=1000), so a typo can't wedge
-    /// the fade timer on or strobe it.
+    /// Stream fade defaults off with a 90 ms window, and `stream_fade_ms` clamps
+    /// to 16..=1000.
     #[test]
     fn m2_stream_fade_defaults_and_clamp() {
         let d = Config::default();
@@ -12797,14 +10859,9 @@ mod cfg_engine_tests {
         );
     }
 
-    /// A `font_px` the resolver ignores (outside `FONT_PX_MIN..=FONT_PX_MAX`,
-    /// or not finite) is a banner line at load — the value, the accepted
-    /// range, and that the default size is what the window got — and the
-    /// resolver really does fall back; an unset or admissible size is silent.
-    /// Before 2026-09-22 a config carrying `font_px = 0.0` loaded at the
-    /// default size and said nothing. `--validate-config` flags exactly the
-    /// same values, so the two surfaces never disagree about WHETHER a size is
-    /// applied.
+    /// An ignored `font_px` (out of range or non-finite) yields a banner line
+    /// with the value and accepted range, and the resolver falls back; unset or
+    /// admissible sizes are silent. Matches `--validate-config`.
     #[test]
     fn an_ignored_font_px_is_a_load_notice() {
         let with = |font_px: Option<f32>| Config {
@@ -12874,13 +10931,9 @@ mod cfg_engine_tests {
         assert!(restart_notices(&a, &both)[0].contains("next launch"));
     }
 
-    /// A vocabulary is only a recovery if it is THE vocabulary and it points at
-    /// the option that was meant. Both halves of the sentence are answered from
-    /// [`crate::prefs::CURSOR_TRAIL_STYLES`] — the domain the picker offers — so
-    /// a style cannot join the picker and be either missing from the list or
-    /// unreachable from a typo of it. Pinning the join verbatim is what a
-    /// hand-written copy of the list cannot satisfy for long: it holds only
-    /// while every entry, its order and its separator agree with the picker's.
+    /// The warning's vocabulary and near-miss suggestion both come from
+    /// [`crate::prefs::CURSOR_TRAIL_STYLES`], so the joined list must match the
+    /// picker's entries, order and separator verbatim.
     #[test]
     fn the_trail_style_message_offers_the_pickers_domain_and_names_a_near_miss_in_it() {
         let catalog = TrailPackCatalog::default();
@@ -12903,10 +10956,8 @@ mod cfg_engine_tests {
         }
     }
 
-    /// The typo the lane is named for: one dropped letter inside a two-word
-    /// value. The list alone leaves the reader to diff fifteen options by eye,
-    /// and in an 80-column window the list is what the banner truncates — so the
-    /// near miss is stated before it, not after.
+    /// One dropped letter in a two-word value: the near miss is stated before
+    /// the list, which is what an 80-column banner truncates.
     #[test]
     fn a_mistyped_trail_style_names_the_style_it_meant_before_listing_the_rest() {
         let catalog = TrailPackCatalog::default();
@@ -12923,11 +10974,8 @@ mod cfg_engine_tests {
         );
     }
 
-    /// A file whose `[section]` header is misspelled produces one ignored leaf
-    /// per entry, and EVERY one of them is reported: the family is one band
-    /// row with the sentences behind Details, so there is no longer a cap
-    /// that would hide nine of twelve and let the reader fix three. Each
-    /// carries the `config …` prefix the stderr echo uses.
+    /// A misspelled `[section]` header yields one ignored leaf per entry, and
+    /// every one is reported with the `config …` prefix (no cap).
     #[test]
     fn ignored_key_notices_carry_every_key_and_the_config_prefix() {
         let many = (0..12)
@@ -12948,12 +10996,9 @@ mod cfg_engine_tests {
         );
     }
 
-    /// stderr reaches nobody who launched from a dock, a Start-menu tile or
-    /// Finder, and a value this build does not accept is exactly as silent there
-    /// as a misspelled key: the resolver keeps the default and the window says
-    /// nothing. Carries the same `config …` prefix and the same cap as its
-    /// ignored-key twin, and stands down for a key whose own resolver line
-    /// already named the value it refused.
+    /// A value this build rejects is reported on the band with the `config …`
+    /// prefix, and stands down for a key whose resolver already named the
+    /// refused value.
     #[test]
     fn an_unaccepted_value_reaches_the_banner_unless_a_resolver_already_named_it() {
         let notices = unaccepted_value_notices("window_theme = \"drak\"\n", &[]);
@@ -13033,22 +11078,8 @@ mod cfg_engine_tests {
         assert_eq!(s, aterm_render::TextShapingConfig::default());
     }
 
-    #[test]
-    fn ligatures_false_disables() {
-        use aterm_types::text_shaping::LigatureMode;
-        assert_eq!(
-            cfg("ligatures = false").text_shaping().ligature_mode,
-            LigatureMode::Disabled
-        );
-        assert_eq!(
-            cfg("ligatures = true").text_shaping().ligature_mode,
-            LigatureMode::Enabled
-        );
-    }
-
-    /// W2 `text_blending`: absent/`linear-corrected` (any case, either
-    /// separator) → the corrected default; `linear` opts out; an unknown value
-    /// fails safe to the default rather than erroring the whole config.
+    /// `text_blending`: absent or `linear-corrected` (any case, either separator)
+    /// is the default; `linear` opts out; unknown values fall back to the default.
     #[test]
     fn text_blending_parses_with_corrected_default() {
         use aterm_render::TextBlending;
@@ -13127,35 +11158,39 @@ mod cfg_engine_tests {
         assert_eq!(s.font_features[0].features.len(), 2);
     }
 
+    /// Mapping invariants of `Config::text_shaping` over generated typography
+    /// keys (the example tests above cover points; this covers the space). For
+    /// ANY `ligatures` / `font_features`: (1) the ligature mode is total + exact
+    /// (`Some(false)` => Disabled, else Enabled); (2) features land on at most
+    /// ONE primary-face (`font_id == 0`) set that is never empty; (3)
+    /// `ambiguous_width` is never set here (the engine cell-width path owns it).
     #[test]
-    fn font_features_empty_yields_no_set() {
-        // All-malformed input collapses to no feature set (a no-op, not an empty set).
-        assert!(
-            cfg("font_features = [\"+toolong\"]")
-                .text_shaping()
-                .font_features
-                .is_empty()
-        );
-    }
-
-    proptest::proptest! {
-        /// Mapping invariants of `Config::text_shaping` over ARBITRARY typography keys
-        /// (the example tests above cover points; this covers the space). For ANY
-        /// `ligatures` / `font_features`: (1) the ligature mode is total + exact
-        /// (`Some(false)` => Disabled, else Enabled); (2) features land on at most ONE
-        /// primary-face (`font_id == 0`) set that is never empty; (3) `ambiguous_width`
-        /// is never set here (the engine cell-width path owns it).
-        #[test]
-        fn text_shaping_mapping_invariants(
-            lig in proptest::option::of(proptest::prelude::any::<bool>()),
-            feats in proptest::option::of(
-                proptest::collection::vec("[+-]?[a-zA-Z0-9 ]{0,6}", 0..5)
-            ),
-        ) {
-            use aterm_types::text_shaping::{AmbiguousWidth, LigatureMode};
+    fn text_shaping_mapping_invariants() {
+        use aterm_types::text_shaping::{AmbiguousWidth, LigatureMode};
+        const CHARS: &[u8] = b"abzAZ09 ";
+        let mut rng = aterm_spec::rng::XorShift::new(0x7E47_5A9E);
+        let mut next = move |n: u64| rng.below(n);
+        for _ in 0..256 {
+            let lig = [None, Some(false), Some(true)][next(3) as usize];
+            let feats = (next(2) == 0).then(|| {
+                (0..next(5))
+                    .map(|_| {
+                        let mut f = String::new();
+                        match next(3) {
+                            0 => f.push('+'),
+                            1 => f.push('-'),
+                            _ => {}
+                        }
+                        for _ in 0..next(7) {
+                            f.push(char::from(CHARS[next(CHARS.len() as u64) as usize]));
+                        }
+                        f
+                    })
+                    .collect::<Vec<_>>()
+            });
             let config = Config {
                 ligatures: lig,
-                font_features: feats,
+                font_features: feats.clone(),
                 ..Config::default()
             };
             let s = config.text_shaping();
@@ -13164,12 +11199,12 @@ mod cfg_engine_tests {
             } else {
                 LigatureMode::Enabled
             };
-            proptest::prop_assert_eq!(s.ligature_mode, expected);
-            proptest::prop_assert_eq!(s.ambiguous_width, AmbiguousWidth::Single);
-            proptest::prop_assert!(s.font_features.len() <= 1);
+            assert_eq!(s.ligature_mode, expected, "{lig:?} {feats:?}");
+            assert_eq!(s.ambiguous_width, AmbiguousWidth::Single);
+            assert!(s.font_features.len() <= 1, "{feats:?}");
             if let Some(set) = s.font_features.first() {
-                proptest::prop_assert_eq!(set.font_id, 0);
-                proptest::prop_assert!(!set.features.is_empty());
+                assert_eq!(set.font_id, 0);
+                assert!(!set.features.is_empty(), "{feats:?}");
             }
         }
     }
@@ -13206,9 +11241,8 @@ mod cfg_engine_tests {
         assert!(!tc.allow_palette_reconfigure);
     }
 
-    /// The two live Sparkle-word products are ON by default—an absent
-    /// `[sparkle_words]` table enables profanity + feline + bare-`cat`, and an
-    /// explicit master-off fully opts out.
+    /// Both live Sparkle-word products default on (an absent table enables
+    /// profanity, feline and bare `cat`); an explicit master-off opts out fully.
     #[test]
     fn sparkle_words_default_on_for_the_two_live_products() {
         let deco = Config::default()
@@ -13233,8 +11267,7 @@ mod cfg_engine_tests {
         assert_eq!(deco.ink_strength, 0.75);
         assert_eq!(deco.ink_sweep_ms, 2200);
         assert!(!deco.ink_loop, "one sweep per appearance by default");
-        // Cat is the only graphic mode. Retired compatibility keys do not enter
-        // the runtime effects carrier at all.
+        // Cat is the only graphic mode; legacy keys never reach the runtime.
         assert_eq!(deco.feline_style, crate::word_decorations::FelineStyle::Cat);
         assert!(deco.feline_magic, "Fortune/Nebula windows on by default");
     }
@@ -13249,11 +11282,7 @@ mod cfg_engine_tests {
             crate::word_decorations::ProfanityStyle::Rainbow,
             "rainbow is the v3 default"
         );
-        // 10, matching the `supernova_chance` field's DOCUMENTED contract ("Default
-        // 10"). The resolver shipped `unwrap_or(30)` — so the escalation ladder, whose
-        // nuke tier owns the screen for 3.6 s including a 260 ms full-screen flash and
-        // can ignite from a word still being typed, fired three times as often as
-        // documented. This test pinned the code rather than the contract.
+        // Matches the documented `supernova_chance` default.
         assert_eq!(deco.supernova_chance, 10, "10% escalation by default");
         let deco = cfg("[sparkle_words.profanity]\nstyle = \"nova\"\nsupernova_chance = 250")
             .sparkle_deco_config()
@@ -13274,10 +11303,8 @@ mod cfg_engine_tests {
         );
     }
 
-    /// FIX IV regression: the native style match is trimmed and case-INsensitive, like
-    /// the web `set_sparkle_profanity` setter — `style = "Nova"` selects the
-    /// classic nova (it must not silently become Rainbow + supernova roll),
-    /// `"SPARKLE"` the v1 sparkle.
+    /// The native style match is trimmed and case-insensitive, like the web
+    /// `set_sparkle_profanity` setter: `"Nova"` selects nova, `"SPARKLE"` sparkle.
     #[test]
     fn sparkle_profanity_style_matches_trimmed_and_case_insensitively() {
         let deco = cfg("[sparkle_words.profanity]\nstyle = \" Nova \"")
@@ -13306,10 +11333,9 @@ mod cfg_engine_tests {
         );
     }
 
-    /// v3 §6: `[[sparkle_words.custom]]` parses, keys the resolved spec
-    /// table by the scanner's folded form_hash, appends its words to the
-    /// synthesized lexicon override (CJK as `cjk = true`), and keeps the
-    /// emphasis class scanning with ink disabled (the resolve gate is
+    /// `[[sparkle_words.custom]]` parses, keys the spec table by folded
+    /// form_hash, appends words to the lexicon override (CJK as `cjk = true`),
+    /// and keeps emphasis scanning with ink off (gate:
     /// `enabled && (ink_enabled || has_custom_specs)`).
     #[test]
     fn sparkle_custom_specs_resolve_and_survive_ink_off() {
@@ -13349,9 +11375,8 @@ mod cfg_engine_tests {
         assert!(over.contains("forms = [\"猫神\"]"), "{over}");
     }
 
-    /// Top Settings promises two independent keyword toys. Turning Sparkle Words
-    /// off must suppress every non-feline route, including custom specs that used
-    /// to bypass the profanity flag, while Keyword Kitties remains live.
+    /// Sparkle Words off suppresses every non-feline route, custom specs
+    /// included, while Keyword Kitties stays live.
     #[test]
     fn sparkle_words_product_toggle_suppresses_all_non_feline_effects() {
         let c = cfg(concat!(
@@ -13452,8 +11477,7 @@ mod cfg_engine_tests {
         let config = config_with_toy_packs(std::slice::from_ref(&pack), "");
         let prepared = config.prepare_sparkle_runtime();
 
-        // Make any accidental render-time reopen observable independently of
-        // the counter: the admitted source no longer exists after preparation.
+        // Delete the admitted source so any render-time reopen would fail.
         std::fs::remove_file(&pack).expect("remove admitted Toy Pack source");
         super::reset_sparkle_host_prepare_count();
         let mut app = crate::App::headless_for_test();
@@ -13502,6 +11526,7 @@ mod cfg_engine_tests {
                 observation,
                 config,
                 values: std::collections::BTreeMap::new(),
+                disk_faults: std::sync::Arc::default(),
                 assets,
                 path_feed_fps: feeds,
                 sparkle,
@@ -13517,25 +11542,11 @@ mod cfg_engine_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A TYPO ADDED BY A LIVE EDIT IS REPORTED LIKE ONE THAT WAS THERE AT LAUNCH
-    /// — which is `ignored_key_notices`'s own documented contract, and which the
-    /// semantic dedupe used to defeat.
+    /// A typo added by a live edit is reported like one present at launch, even
+    /// though the parsed `Config` is equal and the reload takes the dedupe path.
     ///
-    /// A misspelled key leaves NO trace in the parsed `Config`, so adding one —
-    /// the commonest case by far, a setting the user has never set before typed
-    /// wrong — parses EQUAL to what is already applied. The reload then took the
-    /// dedupe's early return and said nothing at all: no banner, and no stderr
-    /// line either. The same file at launch warns. So the one edit class that
-    /// most needs telling ("I added a setting and nothing happened") was the one
-    /// class that produced no output on any launch mode.
-    ///
-    /// The empty case is asserted too, and is the second half of the fix rather
-    /// than a formality: the notice must still be PUBLISHED when there is
-    /// nothing to say, because that is what takes a stale banner down once the
-    /// typo is fixed — an edit which, again, parses equal. And ONLY the rows
-    /// this path re-derives come down: a row from a family it never recomputes
-    /// (the chord the last full reload skipped) is still true after a
-    /// comment-only save and stands (ruling 28).
+    /// The empty case is published too, so fixing the typo clears its row; only
+    /// rows this path re-derives are replaced (an unrelated chord row stays).
     #[test]
     fn a_misspelled_key_added_by_a_live_edit_still_warns_through_the_dedupe() {
         fn apply(app: &mut crate::App, dir: &std::path::Path, text: &str) {
@@ -13553,6 +11564,7 @@ mod cfg_engine_tests {
                     observation,
                     config,
                     values: std::collections::BTreeMap::new(),
+                    disk_faults: std::sync::Arc::default(),
                     assets,
                     path_feed_fps,
                     sparkle,
@@ -13594,9 +11606,8 @@ mod cfg_engine_tests {
             app.post_message(msg);
         }
 
-        // NEGATIVE CONTROL / the clearing half: fixing the typo also parses
-        // equal, and must take ITS row back down rather than leave it up —
-        // and only its row: the chord's, not re-derived here, is still true.
+        // Negative control: fixing the typo clears its row only; the chord row
+        // stays.
         apply(&mut app, &dir, "# fixed\n");
         assert!(
             app.messages
@@ -13614,9 +11625,8 @@ mod cfg_engine_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A theme the window cannot load draws Default, and until 2026-09-28 said so
-    /// only on stderr. The band's unaccepted-values row now names it, and the
-    /// theme file arriving in the themes directory takes the row down.
+    /// An unloadable theme is named on the unaccepted-values row, and the theme
+    /// file arriving in the themes directory clears it.
     #[test]
     fn a_theme_that_does_not_load_is_on_the_band_until_its_file_arrives() {
         const NAME: &str = "Aterm Test Theme 7F1C";
@@ -13638,6 +11648,7 @@ mod cfg_engine_tests {
                 observation,
                 config,
                 values: std::collections::BTreeMap::new(),
+                disk_faults: std::sync::Arc::default(),
                 assets,
                 path_feed_fps,
                 sparkle,
@@ -13769,14 +11780,11 @@ mod cfg_engine_tests {
         }
     }
 
-    /// FIX 8 (native path) regression: `recompute_sparkle`'s warning log
-    /// filters the lexicon conflicts by the RESOLVED scan options — the
-    /// single-char-CJK "requires `cjk_single_char = true`" warning must not
-    /// fire when the user's config already enables that opt-in (the lexicon
-    /// cannot see scan options), while genuinely unscannable surfaces
-    /// (mixed-script) keep warning either way. Exercises the exact
+    /// `recompute_sparkle`'s warning filter uses the resolved scan options: the
+    /// "requires `cjk_single_char = true`" warning is dropped when that opt-in is
+    /// on, while mixed-script surfaces warn either way. Runs the full
     /// config → deco-config → override → lexicon → `sparkle_logged_warnings`
-    /// chain `recompute_sparkle` runs (minus the eprintln).
+    /// chain.
     #[test]
     fn sparkle_lexicon_cjk_single_char_warning_respects_opt_in() {
         let logged = |feline_extra: &str| -> Vec<String> {
@@ -13825,9 +11833,8 @@ mod cfg_engine_tests {
         );
     }
 
-    /// Alt-screen suppression is opt-IN (2026-07-03): the default decorates the
-    /// alternate screen too (full-screen TUIs like Claude Code sparkle), and
-    /// `suppress_in_alt_screen = true` restores the v1 launch behavior.
+    /// Alt-screen suppression is opt-in: the default decorates the alternate
+    /// screen; `suppress_in_alt_screen = true` suppresses it.
     #[test]
     fn sparkle_alt_screen_decorates_by_default_and_knob_opts_out() {
         let deco = Config::default()
@@ -13847,10 +11854,8 @@ mod cfg_engine_tests {
         );
     }
 
-    /// `suppress_in_alt_screen` (the design §1 knob, wired 2026-07-04): DEFAULT
-    /// FALSE — the alternate screen (Claude Code, any full-screen TUI) decorates
-    /// like the primary screen; an explicit `true` restores the old hardcoded
-    /// vim/less/htop suppression.
+    /// `suppress_in_alt_screen` defaults to false; an explicit `true`
+    /// suppresses alternate-screen decoration.
     #[test]
     fn sparkle_words_decorate_alt_screen_by_default() {
         assert!(
@@ -13871,8 +11876,8 @@ mod cfg_engine_tests {
         );
     }
 
-    /// The legacy paw mode remains parseable as ink-only. The four retired
-    /// feline controls round-trip as source data but never enter live state.
+    /// The legacy paw mode parses as ink-only; the four legacy feline controls
+    /// round-trip as source data but never enter live state.
     #[test]
     fn sparkle_feline_legacy_values_round_trip_without_claiming_removed_effects() {
         let config = cfg(
@@ -13916,10 +11921,8 @@ mod cfg_engine_tests {
         );
     }
 
-    /// `[sparkle_words.feline] log` (§F4.7): the STARTER_CONFIG key
-    /// deserializes, defaults ON when absent, and is a host-side gate only —
-    /// it must NOT perturb the resolved `DecoConfig` (the effects-side
-    /// recorder always runs; the App drains-and-drops).
+    /// `[sparkle_words.feline] log` deserializes, defaults on, and is host-side
+    /// only: it does not change the resolved `DecoConfig`.
     #[test]
     fn sparkle_feline_log_key_deserializes_and_defaults_on() {
         let c = cfg("[sparkle_words.feline]\nlog = false");
@@ -13946,10 +11949,8 @@ mod cfg_engine_tests {
         );
     }
 
-    /// `[sparkle_words.profanity]` curse-BONK knobs (the feline `log`
-    /// pattern): both keys round-trip, `bonk` resolves ON by default,
-    /// `bonk_detonation` OFF by default (typed provenance only), and neither
-    /// touches the decorations themselves.
+    /// Curse-bonk knobs round-trip: `bonk` defaults on, `bonk_detonation` off,
+    /// and neither changes the decorations.
     #[test]
     fn sparkle_profanity_bonk_keys_deserialize_with_host_defaults() {
         let c = cfg("[sparkle_words.profanity]\nbonk = false\nbonk_detonation = true");
@@ -13973,9 +11974,9 @@ mod cfg_engine_tests {
         );
     }
 
-    /// `[sparkle_words.ink]` round-trip: the `loop` TOML key (a Rust keyword,
-    /// serde-renamed) parses, and every numeric clamps into its documented range
-    /// — including the higher sweep floor a looping shimmer requires.
+    /// `[sparkle_words.ink]`: the serde-renamed `loop` key parses and every
+    /// number clamps to its documented range, including the higher sweep floor
+    /// for a looping shimmer.
     #[test]
     fn sparkle_ink_round_trip_and_clamps() {
         let deco = cfg(
@@ -14112,15 +12113,11 @@ mod cfg_engine_tests {
     }
 }
 
-/// W5 PROOF (config round-trip): every new key (a) PARSES from `aterm.toml`
-/// through serde into its resolver's clamped value, (b) SERIALIZES through the
-/// Settings writer (`prefs::apply_prefs_edits`) back into TOML that re-parses
-/// to the same value, and (c) HOT-RELOAD-DIFFS to exactly ONE renderer call:
-/// the pure [`RenderKnobs::diff`] emits exactly one [`KnobChange`] per changed
-/// key (renderer knobs), and the engine keys land on exactly one
-/// `TerminalConfig` field each (routed by the engine's own `apply_config`
-/// diff). `apply_render_knob` is a 1:1 match from variant to `Backend` call,
-/// so the chain key → KnobChange → renderer call has no fan-out anywhere.
+/// Config round-trip: each renderer key (a) parses to its clamped resolver
+/// value, (b) serializes through `prefs::apply_prefs_edits` and re-parses
+/// equal, and (c) diffs to exactly one [`KnobChange`] (or one `TerminalConfig`
+/// field for engine keys). `apply_render_knob` maps each variant to one
+/// `Backend` call, so there is no fan-out.
 #[cfg(test)]
 mod w5_knob_tests {
     use super::{Config, KnobChange, RenderKnobs};
@@ -14320,9 +12317,8 @@ mod w5_knob_tests {
         );
     }
 
-    /// (b) Settings-writer round-trip: each new key serializes through
-    /// `apply_prefs_edits` (typed per `edit_kind`) into TOML that re-parses to
-    /// the same resolved value.
+    /// Each key serializes through `apply_prefs_edits` and re-parses to the same
+    /// resolved value.
     #[test]
     fn new_keys_round_trip_through_prefs_writer() {
         use crate::prefs::{
@@ -14355,9 +12351,8 @@ mod w5_knob_tests {
         assert_eq!(c.adjust_baseline_or_default(), -2);
     }
 
-    /// (c) hot-reload diff: each renderer-knob key, changed ALONE, emits
-    /// exactly ONE `KnobChange` — the variant `apply_render_knob` routes to
-    /// exactly one `Backend` call. An unchanged config emits none.
+    /// Each renderer key changed alone emits exactly one `KnobChange`; an
+    /// unchanged config emits none.
     #[test]
     fn each_knob_key_diffs_to_exactly_one_change() {
         let base = RenderKnobs::default();
@@ -14408,13 +12403,10 @@ mod w5_knob_tests {
         assert_eq!(all.diff(&base).len(), 3, "one change per reverted key");
     }
 
-    /// THE MOVE (M5): `background_opacity < 1.0` is the ONE key that deliberately
-    /// fans out to TWO knob changes — the opacity itself AND the auto-engaged
-    /// WCAG-AA contrast floor (`MinimumContrast(4.5)`), because a user on the
-    /// default `minimum_contrast = 1.0` must not get illegible glass. When the
-    /// user already configured a floor >= 4.5 the fan-out collapses to just the
-    /// opacity (the floor is unchanged), and reverting to solid drops the floor
-    /// back to the configured value.
+    /// `background_opacity < 1.0` fans out to two changes: the opacity and the
+    /// auto-raised floor (`MinimumContrast(4.5)`). With a configured floor ≥ 4.5
+    /// only the opacity changes; reverting to solid restores the configured
+    /// floor.
     #[test]
     fn translucency_couples_opacity_to_the_contrast_floor() {
         let base = RenderKnobs::default();
@@ -14449,12 +12441,9 @@ mod w5_knob_tests {
         );
     }
 
-    /// M5 true vibrancy: a translucent `background_opacity` and a valid
-    /// `background_material` each resolve to a LIVE value — NOT the silent no-op
-    /// default. This guards against a regression where the settings become inert (a
-    /// translucent opacity collapsing to `>= 1.0`, or a valid material resolving to
-    /// `None`); the resolved values are exactly what the GPU present +
-    /// `AppRt::window_set_vibrancy` consume (and the CPU backend warns on).
+    /// A translucent `background_opacity` and a valid `background_material`
+    /// resolve to live values (not `>= 1.0` or `None`), which the GPU present and
+    /// `AppRt::window_set_vibrancy` consume.
     #[test]
     fn vibrancy_config_resolves_to_warnable_values() {
         // A translucent opacity resolves < 1.0 → drives the translucent present.
@@ -14482,16 +12471,12 @@ mod w5_knob_tests {
     }
 }
 
-/// M5 PROOF (the legibility guarantee, Tier-1). The SHIPPING resolver
-/// [`Config::effective_minimum_contrast`] is driven EXHAUSTIVELY over the
-/// opacity × configured-contrast lattice, asserting the SAME `NeverIllegible`
-/// invariant the `ty` model `aterm_spec::derive::vibrancy_contrast_model` carries
-/// abstractly (Tier-0): translucent glass ALWAYS clears WCAG AA (4.5:1),
-/// regardless of how low the user set (or left) `minimum_contrast`; an opaque
-/// window keeps EXACTLY the configured floor. House style: a NON-VACUITY control
-/// (the floor genuinely RISES for a default install running glass) and a NEGATIVE
-/// control (the pre-fix defect — raw `minimum_contrast_or_default` would ship
-/// sub-4.5 glass — is reproduced and shown excluded).
+/// Legibility guarantee (Tier-1): [`Config::effective_minimum_contrast`] over
+/// the opacity × configured-contrast lattice satisfies the `NeverIllegible`
+/// invariant of `aterm_spec::derive::vibrancy_contrast_model`: translucent
+/// windows always clear 4.5:1, opaque ones keep the configured floor. Includes
+/// a non-vacuity control (the floor rises for a default install) and a
+/// negative control (the raw configured floor would ship sub-4.5 glass).
 #[cfg(test)]
 mod vibrancy_contrast_guarantee {
     use super::{Config, VIBRANCY_CONTRAST_FLOOR};
@@ -14563,9 +12548,8 @@ mod vibrancy_contrast_guarantee {
             "a default install running glass must auto-engage 4.5:1"
         );
 
-        // NEGATIVE CONTROL: the pre-fix path (handing the renderer the RAW
-        // `minimum_contrast_or_default`) would have shipped 1.0 contrast under
-        // glass — the exact illegibility defect the guarantee excludes.
+        // Negative control: the raw `minimum_contrast_or_default` would ship 1.0
+        // under glass.
         assert!(
             default_glass.minimum_contrast_or_default() < VIBRANCY_CONTRAST_FLOOR,
             "control precondition: the raw floor is below AA"
@@ -14588,8 +12572,7 @@ mod window_theme_tests {
 
     #[test]
     fn window_theme_resolves_auto_light_dark_and_defaults_to_auto() {
-        // No key at all -> Auto (follow the OS), so a light desktop is no longer
-        // forced dark.
+        // No key means Auto (follow the OS).
         assert_eq!(
             Config::default().window_theme_or_default(),
             WindowTheme::Auto
@@ -14614,8 +12597,8 @@ mod window_theme_tests {
     }
 }
 
-/// THE DECORATIVE-OVERLAY DEFAULT — [`DEFAULT_DECORATIVE_EFFECTS`] — and the one
-/// law that keeps a platform default from becoming a platform veto.
+/// [`DEFAULT_DECORATIVE_EFFECTS`]: a platform default that explicit keys always
+/// override.
 #[cfg(test)]
 mod decorative_effect_default_tests {
     use super::{Config, DEFAULT_DECORATIVE_EFFECTS};
@@ -14624,36 +12607,10 @@ mod decorative_effect_default_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// THE MINIMAL-FAST DEFAULT: with a FRESH, EMPTY config a Windows terminal
-    /// stands no resident decoration on live output. Asserted against `cfg!` (the
-    /// `tab_band_height` precedent) so the same test is honest on every host:
-    /// elsewhere the delight stays on. The switch is a DEFAULT, never a veto: an
-    /// explicit key wins on every platform, in both directions.
-    #[test]
-    fn decorative_overlays_default_off_on_windows_and_on_elsewhere() {
-        let on = !cfg!(windows);
-        assert_eq!(DEFAULT_DECORATIVE_EFFECTS, on);
-        assert_eq!(Config::default().cursor_trail_or_default(), on);
-        // A config that merely EXISTS is still a fresh config for this key.
-        assert_eq!(cfg("font_px = 14.0").cursor_trail_or_default(), on);
-        assert!(cfg("cursor_trail = true").cursor_trail_or_default());
-        assert!(!cfg("cursor_trail = false").cursor_trail_or_default());
-    }
-
-    /// THE TRAIL MASTER JOINED THE FAMILY, and the two keys beside it did NOT.
-    /// This test pins that boundary in both directions so neither half drifts.
-    ///
-    /// * `cursor_trail` is IN. It is the only key that seats a permanently resident
-    ///   sprite `FreeZ::OverText` on live terminal output, which is the exact thing
-    ///   the minimal-fast directive rules out.
-    /// * `cursor_trail_bloom` is OUT, and that is not an oversight: every consumer
-    ///   reads it as `cursor_trail_or_default() && …`, so with the master off it can
-    ///   emit nothing at all. Splitting an already-inert key would buy no pixel and
-    ///   no millisecond, and would rob the Windows owner who writes
-    ///   `cursor_trail = true` of the crown that makes the trail look shipped.
-    /// * `[sparkle_words] enabled` is OUT on the merits — see
-    ///   [`Config::sparkle_words_enabled_or_default`], which carries the argument
-    ///   and the one honest exception to it.
+    /// `cursor_trail` follows [`DEFAULT_DECORATIVE_EFFECTS`];
+    /// `cursor_trail_bloom` (inert with the master off) and
+    /// `[sparkle_words] enabled` (see
+    /// [`Config::sparkle_words_enabled_or_default`]) do not.
     #[test]
     fn the_trail_master_is_platform_split_and_its_two_neighbours_are_not() {
         let fresh = Config::default();
@@ -14682,14 +12639,10 @@ mod decorative_effect_default_tests {
 
 #[cfg(test)]
 mod output_streak_cfg_tests {
-    //! PRISM WAKE's `[output_streak]` resolver pins
-    //! (`docs/DESIGN-output-streak-2026-08-30.md` §5, §7, §10). Three laws are
-    //! under test and none of them is a taste call: the table ships ON as an
-    //! opt-OUT (owner ruling 2026-08-31) while the Windows decorative platform
-    //! law still stands over it; every numeric key CLAMPS into its documented
-    //! band at BOTH ends instead of rejecting the file; and every non-finite
-    //! scalar fails silent toward LESS effect rather than poisoning the quad
-    //! stream or buying an animation the band forbids.
+    //! `[output_streak]` resolver tests
+    //! (`docs/DESIGN-output-streak-2026-08-30.md` §5, §7, §10): the table
+    //! defaults on except on Windows, numeric keys clamp at both ends, and
+    //! non-finite scalars fall toward less effect.
 
     use super::{Config, DEFAULT_DECORATIVE_EFFECTS};
     use aterm_effects::output_streak::{MAX_COMETS, TAIL_MAX, TAIL_MIN};
@@ -14698,14 +12651,9 @@ mod output_streak_cfg_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// THE OPT-OUT, in both directions. A fresh install animates (owner ruling
-    /// 2026-08-31, *"default on"*) — asserted against `cfg!` via
-    /// [`DEFAULT_DECORATIVE_EFFECTS`] rather than a bare `true`, because design
-    /// §7 keeps the Windows minimal-fast platform law standing over the new
-    /// family default. A config that merely EXISTS, and a `[output_streak]`
-    /// table that sets only other knobs, are both still fresh for this key; and
-    /// an explicit value wins on every platform, in both directions, so this
-    /// stays a default and never becomes a veto.
+    /// Default follows [`DEFAULT_DECORATIVE_EFFECTS`]; a config or table that
+    /// sets only other keys still gets the default, and an explicit value wins
+    /// on every platform.
     #[test]
     fn the_output_streak_ships_on_as_an_opt_out_under_the_windows_platform_law() {
         assert_eq!(DEFAULT_DECORATIVE_EFFECTS, !cfg!(windows));
@@ -14727,11 +12675,8 @@ mod output_streak_cfg_tests {
         assert!(!cfg("[output_streak]\nenabled = false").output_streak_enabled_or_default());
     }
 
-    /// THE SOUND HALF SHIPS ON TOO, because the ruling treats the streak as ONE
-    /// feature (design §11.1). A plain `true` and not the decorative platform
-    /// family: that family exists for decoration painted over content, and a
-    /// pip covers no pixel — on Windows the master above already resolves off,
-    /// so nothing is ever heard there regardless of this bit.
+    /// Sound defaults on (plain `true`, not the decorative family); on Windows
+    /// the master is already off.
     #[test]
     fn the_streak_pip_ships_on_because_the_ruling_calls_it_one_feature() {
         assert!(
@@ -14743,11 +12688,8 @@ mod output_streak_cfg_tests {
         assert!(!cfg("[output_streak]\nsound = false").output_streak_sound_or_default());
     }
 
-    /// EVERY NUMERIC KEY CLAMPS AT BOTH ENDS, into the band its doc comment
-    /// promises, and the two cell-counted ones read the ENGINE's own constants
-    /// so the host clamp and the state machine's defensive re-clamp cannot
-    /// drift. Nothing here rejects the file: an absurd value is a clamp, never
-    /// a config that fails to load.
+    /// Every numeric key clamps at both ends into its documented band; the
+    /// cell-counted ones use the engine's constants. Nothing rejects the file.
     #[test]
     fn every_output_streak_number_clamps_into_its_band_at_both_ends() {
         let fresh = Config::default();
@@ -14806,13 +12748,8 @@ mod output_streak_cfg_tests {
         assert_eq!(set.output_streak_idle_secs_or_default(), 33.5);
     }
 
-    /// NON-FINITE FAILS SILENT, and always toward LESS effect. TOML accepts
-    /// `nan`/`inf`, and `f32::clamp` passes NaN straight through, so an
-    /// unguarded resolver would hand a NaN to premultiplied vertex colours and
-    /// to a drain deadline. Intensity fails OFF (the
-    /// `cursor_trail_bloom_strength` arm); `idle_secs` fails to the band FLOOR,
-    /// not to its 10 s default, so `nan` can never buy a LONGER animation than
-    /// the shortest value a user is allowed to type.
+    /// Non-finite values fall toward less effect: intensity reads 0.0 and
+    /// `idle_secs` the band floor, never the 10 s default.
     #[test]
     fn non_finite_output_streak_scalars_fail_silent_toward_less_effect() {
         for source in [
@@ -14839,11 +12776,8 @@ mod output_streak_cfg_tests {
         }
     }
 
-    /// THE ONE DOMAIN WARNING, and its deliberate silences. A clamp is
-    /// documented behaviour and this repo warns about no clamped key, so three
-    /// out-of-band numbers produce nothing; `sound = true` under a disabled
-    /// master is the other shape — a value that is silently UNREACHABLE for a
-    /// reason invisible from the key — and it is named.
+    /// Only `sound = true` under a disabled master warns; out-of-band numbers
+    /// (documented clamps) do not.
     #[test]
     fn the_streak_warning_names_only_the_silently_unreachable_pip() {
         assert!(Config::default().output_streak_warning().is_none());
@@ -14867,17 +12801,10 @@ mod output_streak_cfg_tests {
         );
     }
 
-    /// A launch that could not take `aterm.toml` runs every setting at its
-    /// default — but the `[harness]` lines the owner wrote still read (the
-    /// table's reader reads a file that is not TOML line by line), so a limit
-    /// written there holds through a typo in any other table. NEGATIVE
-    /// CONTROL: a broken file with no `[harness]` lines is every power on,
-    /// the owner's rule for a file that limits nothing.
-    /// Settings ▸ Harness's words: every key the file limits is named, in the
-    /// supervisor's KEYS order, as `<key>: <value>`; a rewritten text is named
-    /// apart, as `yours`, never as a limit; `trust_roots` only where `safe`
-    /// reads it; `Off` outranks every limit. NEGATIVE CONTROL: no table is
-    /// `Automatic`.
+    /// Settings ▸ Harness words: each limited key named in the supervisor's KEYS
+    /// order as `<key>: <value>`; a rewritten text named apart as `yours`;
+    /// `trust_roots` only where `safe` reads it; `Off` outranks every limit.
+    /// Negative control: no table is `Automatic`.
     #[test]
     fn the_harness_words_name_every_limit_in_key_order() {
         assert_eq!(super::HarnessPolicy::read("").words(), "Automatic");
@@ -14886,7 +12813,7 @@ mod output_streak_cfg_tests {
                    dismiss_surveys = false\ncontinue = false\ncontinue_text = \"go\"\n\
                    continue_per_hour = 2\nrules_file = \"/r\"\nretry_api_errors = false\n\
                    probe_api = false\nresume_limits = false\nlimit_wait = false\n\
-                   model_fallback = \"\"\n\
+                   accounts = \"off\"\nmodel_fallback = \"\"\n\
                    compact_on_context_wall = false\nrelaunch = false\nupgrade = false\n\
                    human_grace_s = 600\n";
         assert_eq!(
@@ -14894,7 +12821,7 @@ mod output_streak_cfg_tests {
             "Automatic \u{b7} limited: headless: off \u{b7} approve: none \
              \u{b7} answer_questions: off \u{b7} dismiss_surveys: off \u{b7} continue: off \
              \u{b7} continue_per_hour: 2 \u{b7} retry_api_errors: off \u{b7} probe_api: off \
-             \u{b7} resume_limits: off \u{b7} limit_wait: off \
+             \u{b7} resume_limits: off \u{b7} limit_wait: off \u{b7} accounts: off \
              \u{b7} model_fallback: off \u{b7} compact_on_context_wall: off \u{b7} relaunch: off \
              \u{b7} upgrade: off \u{b7} human_grace_s: 600 \
              \u{b7} yours: answer_text, continue_text, rules_file"
@@ -14907,6 +12834,28 @@ mod output_streak_cfg_tests {
             super::HarnessPolicy::read("[harness]\nanswer_text = \"ask me\"\n").words(),
             "Automatic \u{b7} yours: answer_text"
         );
+        // `accounts`: `wall` is a limit of `early` and named; `early`, the
+        // default, is none (NEGATIVE CONTROL).
+        assert_eq!(
+            super::HarnessPolicy::read("[harness]\naccounts = \"wall\"\n").words(),
+            "Automatic \u{b7} limited: accounts: wall"
+        );
+        assert_eq!(
+            super::HarnessPolicy::read("[harness]\naccounts = \"early\"\n").words(),
+            "Automatic"
+        );
+        // `limit_reset`: its `true` gives the supervisor more, so it is named
+        // as the owner's own choice and never as a limit; `false`, the
+        // default, names nothing (NEGATIVE CONTROL).
+        assert_eq!(
+            super::HarnessPolicy::read("[harness]\nlimit_reset = true\n").words(),
+            "Automatic \u{b7} yours: limit_reset"
+        );
+        assert_eq!(
+            super::HarnessPolicy::read("[harness]\nlimit_reset = false\n").words(),
+            "Automatic"
+        );
+        assert!(!super::HarnessPolicy::read("").policy.limit_reset);
         assert_eq!(
             super::HarnessPolicy::read(&format!("{all}enabled = false\n")).words(),
             "Off: no agent session is supervised"
@@ -14932,14 +12881,72 @@ mod output_streak_cfg_tests {
         );
     }
 
-    /// THE SUPERVISOR'S POLICY is `[harness]` as its one reader
-    /// (`SupervisorConfig::from_aterm_toml`) takes the file's text: a key a
-    /// reload changes makes a changed `Config` (so it is not deduped away), a
-    /// value the reader cannot take keeps its key's default and is a config
-    /// notice naming the key (an off spelling is the key's limit — owner
-    /// ruling of 2026-09-25), a `false` filed under another table still
-    /// limits and is named, and an unknown key is left to the ignored-key
-    /// notice — never a failed load, never silence.
+    /// `[harness] question_priority`: its three words are read without touching
+    /// `answer_questions`; a refused value keeps the default with one notice;
+    /// `answer_questions = false` answers nothing but keeps the priority.
+    #[test]
+    fn a_refused_question_priority_changes_nothing() {
+        use aterm_agent::supervise::QuestionPriority;
+        let cfg = |text: &str| Config::parse(text).expect("valid config");
+        for (word, want) in [
+            ("recommended", QuestionPriority::Recommended),
+            ("long-term", QuestionPriority::LongTerm),
+            ("short-term", QuestionPriority::ShortTerm),
+        ] {
+            let c = cfg(&format!("[harness]\nquestion_priority = \"{word}\"\n"));
+            let policy = &c.harness.policy;
+            assert!(c.harness.notes.is_empty(), "{word}: {:?}", c.harness.notes);
+            assert_eq!(policy.question_priority, want);
+            assert!(policy.answer_questions && policy.session_questions);
+            assert_eq!(c.harness_question_priority(), want);
+            assert!(c.harness_notices().is_empty());
+        }
+        assert_eq!(
+            Config::default().harness_question_priority(),
+            QuestionPriority::Recommended
+        );
+        for text in [
+            "[harness]\nquestion_priority = \"long_term\"\n",
+            "[harness]\nquestion_priority = true\n",
+            "[harness]\nanswer_questions = true\nquestion_priority = \"sometimes\"\n",
+        ] {
+            let c = cfg(text);
+            assert_eq!(
+                c.harness.policy,
+                aterm_agent::supervise::SupervisorConfig::default(),
+                "{text:?}"
+            );
+            let told = c.harness_notices();
+            assert_eq!(told.len(), 1, "{told:?}");
+            assert!(
+                told[0].starts_with("config harness.question_priority:")
+                    && told[0].ends_with("keeps its default"),
+                "{told:?}"
+            );
+        }
+        for text in [
+            "[harness]\nanswer_questions = false\nquestion_priority = \"long-term\"\n",
+            "[harness]\nquestion_priority = \"long-term\"\nanswer_questions = false\n",
+        ] {
+            let c = cfg(text);
+            assert!(c.harness.notes.is_empty(), "{:?}", c.harness.notes);
+            assert!(!c.harness.policy.answer_questions, "{text:?}");
+            assert_eq!(
+                c.harness.policy.question_priority,
+                QuestionPriority::LongTerm
+            );
+            assert!(
+                c.harness.policy.session_questions,
+                "a switch written right keeps the session's say"
+            );
+        }
+    }
+
+    /// `[harness]` as `SupervisorConfig::from_aterm_toml` reads it: a changed
+    /// key makes a changed `Config` (not deduped); an unreadable value keeps its
+    /// default and is a notice naming the key (an off spelling is a limit); a
+    /// `false` under another table still limits and is named; an unknown key is
+    /// left to the ignored-key notice. Never a failed load.
     #[test]
     fn the_harness_table_is_the_supervisors_policy() {
         use aterm_agent::supervise::{SuperviseOpts, SupervisorConfig};
@@ -14967,10 +12974,8 @@ mod output_streak_cfg_tests {
         // A reload that changes only a policy key is a changed Config.
         assert!(set != cfg(&text.replace("continue = false", "continue = true")));
 
-        // A VALUE it cannot read keeps its key's default and is a notice
-        // naming the key; the load still stands and the rest of the table
-        // still applies (owner ruling of 2026-09-25: only an explicit setting
-        // takes power away — this was the key's limit until then).
+        // An unreadable value keeps its default and is a notice naming the key;
+        // the load stands and the rest of the table applies.
         let bad = cfg("[harness]\ncontinue = \"maybe\"\nheadless = false\ncontine = true\n");
         assert!(!bad.harness.policy.headless, "the other keys still apply");
         assert!(
@@ -14998,10 +13003,8 @@ mod output_streak_cfg_tests {
             cfg("[harness]\napprove = \"everything\"\n").harness_approve(),
             "all"
         );
-        // The config language's own domain check stands down for a value the
-        // reader already named: its words would be a second, different
-        // sentence about the same line. NEGATIVE CONTROL: without the
-        // reader's note, the domain check says it.
+        // The config language's domain check stands down for a value the reader
+        // already named. Negative control: without the reader's note it speaks.
         let text = "[harness]\napprove = \"everything\"\n";
         let told = cfg(text).harness_notices();
         assert!(told[0].contains("keeps its default"), "{told:?}");
@@ -15020,8 +13023,8 @@ mod output_streak_cfg_tests {
             misplaced.harness_notices()
         );
 
-        // `approve = "none"` is what stops the engine pressing.
-        // NEGATIVE CONTROL: the default presses.
+        // `approve = "none"` stops the engine pressing; negative control: the
+        // default presses.
         let presses = |c: &Config| {
             SuperviseOpts::hosted_with(&c.harness.policy).policy.approve
                 != aterm_agent::supervise::config::Approve::None
@@ -15038,10 +13041,8 @@ mod output_streak_cfg_tests {
         assert!(presses(&Config::default()));
         assert!(presses(&cfg("[harness]\napprove = \"safe\"\n")));
     }
-    /// The whole table round-trips through serde — the hot-reload contract.
-    /// `Config` is replaced wholesale on a config-file generation and derives
-    /// `PartialEq` through every embedded table, so a semantic no-op still
-    /// dedupes and a real edit still lands without a restart.
+    /// The whole table round-trips through serde; with `PartialEq` a no-op
+    /// dedupes and a real edit lands without a restart.
     #[test]
     fn the_output_streak_table_round_trips_for_hot_reload() {
         let source = concat!(
@@ -15056,9 +13057,8 @@ mod output_streak_cfg_tests {
         assert_eq!(streak.max_streaks, Some(2));
         assert_eq!(streak.idle_secs, Some(45.0));
         assert_eq!(streak.sound, Some(false));
-        // `Config` derives `PartialEq` but deliberately not `Debug` (it carries
-        // the whole user config, secrets included), so these compare with
-        // `assert!` rather than `assert_eq!`.
+        // `Config` is not `Debug` (it may carry secrets), so compare with
+        // `assert!`.
         assert!(
             parsed == cfg(source),
             "a semantic no-op reload compares equal"
@@ -15076,10 +13076,9 @@ mod output_streak_cfg_tests {
     }
 }
 
-/// C3 — the tab band's height policy and the synthetic-head arithmetic that
-/// realizes it. The law is pure, so the whole geometry is provable without a
-/// window; the ONE host-dependent fact (the real cell height of the shipped face)
-/// gets its own Windows test below.
+/// Tab band height policy and synthetic-head arithmetic. The law is pure; the
+/// one host-dependent fact (the shipped face's cell height) has its own
+/// Windows test.
 #[cfg(test)]
 mod tab_band_height_tests {
     use super::{Config, TabBandHeight, synthetic_band_head_px};
@@ -15088,9 +13087,8 @@ mod tab_band_height_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// The absent-key default is PER-PLATFORM — `standard` only where the in-grid
-    /// band is the window's actual tab chrome (Windows and Linux). Asserted
-    /// against `cfg!` so the same test is honest on every host.
+    /// The absent-key default is `standard` on Windows and Linux only (checked
+    /// via `cfg!`).
     #[test]
     fn tab_band_height_defaults_per_platform_when_absent() {
         let expected = if cfg!(any(windows, target_os = "linux")) {
@@ -15133,9 +13131,7 @@ mod tab_band_height_tests {
         assert_eq!(TabBandHeight::parse("nope"), None);
     }
 
-    /// THE DEFECT THIS BUNDLE EXISTS TO AVOID: with the strip OFF there is no band,
-    /// so there must be no head — otherwise the knob would push every grid down by
-    /// a gutter with nothing in it. Held for BOTH targets and every scale.
+    /// With the strip off there is no head, for both targets and every scale.
     #[test]
     fn no_strip_means_no_head_at_any_target_or_scale() {
         for target in [0.0, 32.0, 40.0] {
@@ -15170,11 +13166,9 @@ mod tab_band_height_tests {
         }
     }
 
-    /// The whole point: `head + pad_top + strip_rows·cell_h` lands ON the target,
-    /// at 96 dpi and at 150%. Asserted against the platform's own
-    /// [`super::TAB_BAND_STANDARD_LOGICAL_PX`] (32 on Windows — the WinUI tab
-    /// row; 36 on Linux — the libadwaita one), with a 2-3 px top pad and one
-    /// strip row, the shipped shape on both.
+    /// `head + pad_top + strip_rows·cell_h` lands on
+    /// [`super::TAB_BAND_STANDARD_LOGICAL_PX`] at 96 dpi and 150%, with a 2-3 px
+    /// top pad and one strip row.
     #[test]
     fn standard_totals_the_target_band_at_96dpi_and_150_percent() {
         let target = TabBandHeight::Standard.target_logical_px();
@@ -15188,19 +13182,15 @@ mod tab_band_height_tests {
             band,
             "the band the viewer sees IS the target"
         );
-        // 150%: the target scales with the DPI, and so does everything it is
-        // measured against, so the residue is re-derived rather than scaled.
+        // At 150% the residue is re-derived, not scaled.
         let band = (target as f64 * 1.5).round() as usize;
         let head = synthetic_band_head_px(target, 3, 1, 28, 1.5);
         assert_eq!(head, band - 3 - 28);
         assert_eq!(head + 3 + 28, band);
     }
 
-    /// A SUBTRACTION, not an addition: once the strip's own rows reach the target
-    /// (a big font, or `tab_strip_rows = 2`), the band stops growing instead of
-    /// stacking a constant on top of an already-tall row. Cell heights are
-    /// derived from the platform's own target so the premise holds on every
-    /// per-platform `TAB_BAND_STANDARD_LOGICAL_PX`.
+    /// Once the strip rows reach the target (big font or two rows), the head is
+    /// zero rather than stacking. Cell heights derive from the platform target.
     #[test]
     fn a_tall_strip_absorbs_the_target_and_the_head_collapses() {
         let target = TabBandHeight::Standard.target_logical_px();
@@ -15210,9 +13200,8 @@ mod tab_band_height_tests {
         assert_eq!(synthetic_band_head_px(target, 2, 2, 21, 1.0), 0);
     }
 
-    /// The backstop: even a pathological target cannot push the grid down by more
-    /// than [`super::SYNTHETIC_BAND_HEAD_CELL_CAP`] cells, and a non-finite or
-    /// non-positive scale is treated as 1.0 rather than producing a NaN band.
+    /// A pathological target is capped at [`super::SYNTHETIC_BAND_HEAD_CELL_CAP`]
+    /// cells; a non-finite or non-positive scale is treated as 1.0.
     #[test]
     fn the_head_is_capped_and_degenerate_scales_are_survivable() {
         assert_eq!(
@@ -15224,15 +13213,8 @@ mod tab_band_height_tests {
         }
     }
 
-    /// A NON-FINITE TARGET is degenerate too, and the doc comment promises it
-    /// returns 0 — but only `scale` was covered above, so the guard that
-    /// implements it for `target_logical` was untested.
-    ///
-    /// It matters because the natural-looking rewrite is WRONG: the guard reads
-    /// `!(target > 0.0)` rather than `target <= 0.0` precisely because the
-    /// latter is FALSE for NaN and would let a NaN target through into the
-    /// pixel arithmetic. This pins the behaviour so the next author who tidies
-    /// that comparison finds out here instead of on a user's screen.
+    /// A NaN or non-positive target returns 0; the guard must not be rewritten
+    /// as `target <= 0.0`, which is false for NaN.
     #[test]
     fn a_non_finite_or_non_positive_target_yields_no_head() {
         for target in [f32::NAN, f32::NEG_INFINITY, 0.0, -32.0] {
@@ -15242,12 +13224,8 @@ mod tab_band_height_tests {
                 "degenerate target {target} must collapse the head"
             );
         }
-        // POSITIVE INFINITY is deliberately NOT in that list: `inf > 0.0` is
-        // TRUE, so it passes the guard and is bounded by the cell cap like any
-        // other oversized target. The doc comment promises 0 for a non-finite
-        // SCALE, not for a non-finite target — writing this test is what
-        // established the difference, so it is pinned here rather than left to
-        // be rediscovered.
+        // Positive infinity passes the guard (`inf > 0.0`) and is bounded by the
+        // cell cap like any oversized target.
         assert_eq!(
             synthetic_band_head_px(f32::INFINITY, 0, 1, 10, 1.0),
             10 * super::SYNTHETIC_BAND_HEAD_CELL_CAP
@@ -15257,10 +13235,9 @@ mod tab_band_height_tests {
         assert_ne!(synthetic_band_head_px(32.0, 2, 1, 21, 1.0), 0);
     }
 
-    /// The HOST-DEPENDENT half, Windows only: against the face aterm actually
-    /// ships with at the Windows `FONT_PX`, the standard band really does reach
-    /// the target (or, if this host's face is unusually tall, the head correctly
-    /// collapses to 0 — never a partial band that overshoots).
+    /// Windows only: with the shipped face at the Windows `FONT_PX`, the
+    /// standard band reaches the target, or the head collapses to 0 if the face
+    /// is unusually tall (never overshooting).
     #[cfg(windows)]
     #[test]
     fn the_shipped_windows_face_reaches_the_standard_band() {
@@ -15317,9 +13294,8 @@ mod right_click_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// The absent-key default is PER-PLATFORM: the conhost/WT gesture on Windows,
-    /// off elsewhere — asserted against `cfg!` so the same test is honest on
-    /// whichever platform runs it.
+    /// The absent-key default is copy/paste on Windows, off elsewhere (checked
+    /// via `cfg!`).
     #[test]
     fn right_click_defaults_per_platform_when_absent() {
         let expected = if cfg!(windows) {
@@ -15332,9 +13308,8 @@ mod right_click_tests {
         assert_eq!(cfg("font_px = 14.0").right_click_or_default(), expected);
     }
 
-    /// Both explicit values parse, case-insensitive and trimmed, and the dash
-    /// alias is accepted — so EITHER platform can opt into the other's default
-    /// (the config-escape the semantics decision requires).
+    /// Both explicit values parse case-insensitively and trimmed, with the dash
+    /// alias, so either platform can opt into the other's default.
     #[test]
     fn right_click_explicit_values_override_the_platform_default() {
         assert_eq!(
@@ -15375,9 +13350,8 @@ mod right_click_tests {
     }
 }
 
-/// C5 REMEDIATION — the tab-menu chord's ESCAPE HATCH. The chord is not in the
-/// rebindable `[keybindings]` table by design, so this knob is the ONLY way a
-/// user gives the keys back; it has to parse, default, and fail safe.
+/// The tab-menu chord knob, the only way to give the keys back (the chord is
+/// not in `[keybindings]`): it must parse, default and fail safe.
 #[cfg(test)]
 mod tab_menu_chord_tests {
     use super::{Config, TabMenuChord};
@@ -15386,9 +13360,7 @@ mod tab_menu_chord_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// Absent ⇒ `MenuKey` — an unedited config claims only the spelling no
-    /// application can receive. Shift+F10 is terminfo `kf22`; a program that
-    /// binds it must get it without editing the terminal's config.
+    /// Absent means `MenuKey`, so Shift+F10 (`kf22`) stays with the program.
     #[test]
     fn absent_claims_the_menu_key_only() {
         assert_eq!(
@@ -15416,8 +13388,7 @@ mod tab_menu_chord_tests {
         assert!(both.claims_shift_f10());
     }
 
-    /// The point of the middle value: hand ⇧F10 back (a real legacy-encodable
-    /// chord) while keeping the Menu key (which no legacy mode reports at all).
+    /// `menu_key` hands Shift+F10 back while keeping the Menu key.
     #[test]
     fn menu_key_surrenders_shift_f10_and_off_surrenders_both() {
         let only = cfg("tab_menu_chord = \"menu_key\"").tab_menu_chord_or_default();
@@ -15434,10 +13405,8 @@ mod tab_menu_chord_tests {
         assert!(!off.claims_shift_f10());
     }
 
-    /// Case-insensitive, trimmed, dash alias — and an unknown value WARNS AND
-    /// DEFAULTS rather than failing the config or silently disabling the menu.
-    /// The fallback is the default (`MenuKey`), not `On`: a typo must not be
-    /// the thing that steals Shift+F10 from the application.
+    /// Case-insensitive, trimmed, dash alias; an unknown value warns and falls
+    /// back to `MenuKey`, never `On`.
     #[test]
     fn parsing_is_forgiving_and_invalid_falls_back_to_menu_key() {
         assert_eq!(
@@ -15483,9 +13452,8 @@ mod window_colorspace_tests {
         );
     }
 
-    /// The full accepted token set, case-insensitive + trimmed, including the
-    /// `display-p3` aliases. Everything else falls back to `Srgb` with a warning
-    /// (the `window_theme` fail-safe shape).
+    /// The accepted token set (case-insensitive, trimmed, `display-p3` aliases);
+    /// anything else falls back to `Srgb` with a warning.
     #[test]
     fn window_colorspace_parse_tokens_and_fallback() {
         assert_eq!(
@@ -15530,9 +13498,8 @@ mod window_padding_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// Unset keys resolve to EXACTLY the built-in constants (12 / 2) — the
-    /// byte-identical guarantee the MetricsView proofs rely on: with no config
-    /// the config-aware padding paths and the historical constant paths agree.
+    /// Unset keys resolve to exactly the built-in constants (12 / 2), so the
+    /// config-aware padding paths agree with the constant paths.
     #[test]
     fn window_padding_defaults_to_builtin_constants() {
         let c = Config::default();
@@ -15540,9 +13507,7 @@ mod window_padding_tests {
         assert_eq!(c.window_padding_top_or_default(), crate::PAD_TOP_LOGICAL_PX);
     }
 
-    /// The resolver clamps to the documented 0..=64 domain and fails non-finite
-    /// values back to the default — a `nan` must never reach the
-    /// `round(pad·scale)` derivation every window metric flows through.
+    /// The resolver clamps to 0..=64 and maps non-finite values to the default.
     #[test]
     fn window_padding_clamps_and_rejects_non_finite() {
         assert_eq!(
@@ -15563,9 +13528,8 @@ mod window_padding_tests {
         );
     }
 
-    /// The TOP override is clamped to `0..=window_padding` at the RESOLVER (the
-    /// renderer's `pad_top <= pad` law, enforced before device-px rounding), and
-    /// the 2.0 default is itself capped by a smaller base pad.
+    /// The top override clamps to `0..=window_padding` at the resolver, and the
+    /// 2.0 default is capped by a smaller base pad.
     #[test]
     fn window_padding_top_never_exceeds_base_pad() {
         assert_eq!(
@@ -15589,11 +13553,9 @@ mod window_padding_tests {
         );
     }
 
-    /// LIVE-APPLY, resolver level: the padding a config reload hands
-    /// `refresh_all_window_metrics` flows through `MetricsView::for_scale_padded`
-    /// — prove the config→device-px derivation at the scales the reload path
-    /// re-resolves, including the reload dedupe premise (equal resolved padding
-    /// ⇒ no re-grid work is even attempted).
+    /// Config padding flows through `MetricsView::for_scale_padded` at the
+    /// scales the reload path re-resolves, and equal resolved padding means no
+    /// re-grid is attempted.
     #[test]
     fn window_padding_config_drives_metrics_derivation() {
         let c = cfg("window_padding = 20.0\nwindow_padding_top = 5.0");
@@ -15663,53 +13625,15 @@ mod headless_boot_metrics_tests {
         );
     }
 
-    /// The frames=0 recording law, NO-`--scale` arm (4d27aae5 gated the
-    /// pad/head retune on attachment; this pins its auto-font sibling): with a
-    /// boot headroom band (`$ATERM_HEADROOM_PX`) applied to the shared backend
-    /// at DEFAULT scale, the first redraw's `apply_window_scale` on the
-    /// never-attached headless window must not re-tune the backend from the
-    /// never-applied record — a video tap armed with the boot geometry must
-    /// still match the first present's frame, and the band must survive for
-    /// every later `image`/recording (the wipe was permanent). The empirical
-    /// repro: ~25 `image` captures (which never retune) at 584×420, then the
-    /// FIRST `video`'s redraw wiped head 60→0, early-stopping the take at
-    /// frames=0 while retries "worked" at a band-less 584×360.
-    #[test]
-    fn headless_boot_band_survives_the_first_redraw_retune() {
-        let mut app = crate::App::headless_for_test();
-        app.font_px_explicit = false; // auto font ⇒ the W12 activate arm is live
-        // The boot seam: `--scale` pad + `$ATERM_HEADROOM_PX` head applied to
-        // the shared backend (the test backend boots at pad 0 / head 0), then
-        // sealed into the headless window's record exactly as boot does.
-        app.backend.set_pad(12);
-        app.backend.set_head(60);
-        app.seed_headless_boot_metrics();
-        let armed = app.backend.frame_size(24, 80);
-        // The recording loop's first redraw runs this retune before the present.
-        app.apply_window_scale(crate::WindowId(0));
-        assert_eq!(app.backend.head(), 60, "the headroom band survives");
-        assert_eq!(app.backend.pad(), 12, "the boot pad survives");
-        assert_eq!(
-            app.backend.frame_size(24, 80),
-            armed,
-            "the first present's frame still matches the armed tap geometry"
-        );
-    }
-
-    /// The frames=0 recording law, CONFIG-RELOAD seam: a post-boot delta reload
-    /// (`settings set` carrying a REAL change) unconditionally runs
-    /// `refresh_all_window_metrics`, which used to re-derive every window's head
-    /// from the ATTACH-captured `head_pts` — 0 for a never-attached headless
-    /// window — discarding the boot seal. The next `video`'s first redraw then
-    /// re-tuned the shared backend from the wiped record (`set_head(0)`): the
-    /// take died at frames=0 / resized_early_stop and the `$ATERM_HEADROOM_PX`
-    /// band was permanently gone from every later `image` (584×420 → 584×360).
-    /// The seal must survive the regime re-resolve.
+    /// A post-boot config reload runs `refresh_all_window_metrics`; the
+    /// headless boot seal (pad and `$ATERM_HEADROOM_PX` head) must survive it so
+    /// later recordings and captures keep the band.
     #[test]
     fn headless_boot_band_survives_a_delta_config_reload() {
         let mut app = crate::App::headless_for_test();
         app.font_px_explicit = false; // auto font ⇒ the W12 activate arm is live
-        // The boot seam, exactly as the first-redraw test above.
+        // Boot seam: apply the `--scale` pad and `$ATERM_HEADROOM_PX` head to the
+        // backend (test backend boots at 0/0), then seal them as boot does.
         app.backend.set_pad(12);
         app.backend.set_head(60);
         app.seed_headless_boot_metrics();
@@ -15740,12 +13664,8 @@ mod headless_boot_metrics_tests {
         );
     }
 
-    /// D2: a synthetic `ScaleFactorChanged` routed to a NEVER-ATTACHED window
-    /// must keep its sealed boot band — pre-fix `on_scale_factor_changed`
-    /// re-derived `pad`/`head` from the incoming scale unconditionally, wiping
-    /// the seal (the same seam `refresh_all_window_metrics` closed in ba9f05db).
-    /// Unreachable on real winit today (it never delivers the event to a
-    /// headless window), but pinned so a future synthetic scale route stays safe.
+    /// A synthetic `ScaleFactorChanged` to a never-attached window keeps its
+    /// sealed boot band. winit never delivers this to a headless window today.
     #[test]
     fn headless_boot_band_survives_a_scale_factor_change() {
         let mut app = crate::App::headless_for_test();
@@ -15780,9 +13700,8 @@ mod headless_boot_metrics_tests {
         );
     }
 
-    /// The seal copies the APPLIED boot truth verbatim into the record, so the
-    /// record and the shared backend can never disagree on headless geometry
-    /// (`win_pad`/`win_cell_size` and the retune guard all read this record).
+    /// The seal copies the applied boot values verbatim, so the record and the
+    /// shared backend agree on headless geometry.
     #[test]
     fn seed_copies_applied_boot_truth_into_the_record() {
         let mut app = crate::App::headless_for_test();
@@ -15966,11 +13885,9 @@ mod reload_dedupe_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// The prepared-admission dedupe's equality gate: two parses of the same
-    /// content are EQUAL, and equality is semantic rather than byte-level, so a
-    /// comment/whitespace-only edit (or a bare `touch`) also dedupes; while a
-    /// real one-key edit (the rapid trail-style switch) compares UNEQUAL and
-    /// still applies.
+    /// Dedupe equality is semantic: two parses of the same content, or a
+    /// comment/whitespace-only edit, compare equal; a one-key edit compares
+    /// unequal.
     #[test]
     fn reload_dedupe_equality_matches_parsed_content_not_bytes() {
         let a = cfg("cursor_trail = true\ncursor_trail_style = \"fire\"\n");
@@ -15992,13 +13909,9 @@ mod reload_dedupe_tests {
         );
     }
 
-    /// The path-feed fingerprints (`Config::path_feed_fingerprints`) track the
-    /// CONTENT of the files the config references by path — stable while the
-    /// files are untouched, moved by an edit, and split per consumer: the
-    /// lexicon feeds only the `deco` stream (word decorations), a trail-pack
-    /// manifest only the `trail` stream (cursor-glow registry). A file
-    /// disappearing is a content change too. This is what lets the reload
-    /// dedupe keep touch-to-reload alive without giving up its no-op win.
+    /// Path-feed fingerprints track file content: stable while untouched, moved
+    /// by an edit or deletion, and split per consumer (lexicon → `deco`, trail
+    /// manifest → `trail`).
     #[test]
     fn path_feed_fingerprints_track_referenced_file_content() {
         let dir = std::env::temp_dir().join(format!("aterm-feed-fp-{}", std::process::id()));
@@ -16007,9 +13920,8 @@ mod reload_dedupe_tests {
         let pack = dir.join("trail-pack.toml");
         std::fs::write(&lex, "one").unwrap();
         std::fs::write(&pack, "alpha").unwrap();
-        // Paths reach TOML through the crate's own escaper, never raw: a
-        // Windows fixture path (`C:\Users\…`) pasted into a basic string is
-        // `\U` — an invalid escape the parser rejects outright.
+        // Paths go through the crate's escaper; a raw Windows path would be an
+        // invalid `\U` escape.
         let config = cfg(&format!(
             "cursor_trail_packs = [{}]\n[sparkle_words]\nlexicon = {}\n",
             super::toml_basic_string(&pack.to_string_lossy()),
@@ -16041,10 +13953,9 @@ mod reload_dedupe_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A path generation is one transaction per consumer: mutation after the
-    /// same-handle read cannot relabel the admitted bytes with the replacement
-    /// file's fingerprint. This is the ABA-resistant Tier-1 projection for the
-    /// derived path-feed snapshot model.
+    /// A path generation is one transaction per consumer: a file replaced after
+    /// the same-handle read cannot relabel the admitted bytes (Tier-1 projection
+    /// of the path-feed snapshot model).
     #[test]
     fn path_feed_generation_binds_consumer_and_fingerprint_to_one_read() {
         let dir =
@@ -16071,9 +13982,8 @@ mod reload_dedupe_tests {
                         admitted_path,
                         max_bytes,
                     );
-                    // The pathname changes after the real bounded read but before
-                    // this sole injected reader returns. Consumer parsing and
-                    // fingerprinting must both stay on the returned v1 String.
+                    // Replace the file after the bounded read; parsing and
+                    // fingerprinting must both use the returned v1 string.
                     std::fs::write(&pack, v2).unwrap();
                     admitted
                 },
@@ -16258,14 +14168,10 @@ mod reload_dedupe_tests {
         );
     }
 
-    /// The BYTE-EQUAL reload path (`refresh_path_feeds`) — the touch-to-reload
-    /// regression proof: (1) a repeated exact observation with NOTHING changed anywhere
-    /// stays a full no-op, including no word-deco reset (the dedupe's original
-    /// win); (2) an edit to the lexicon FILE alone — config bytes identical —
-    /// re-arms the pre-frame recompute AND hard-resets the per-window word
-    /// decorations, so the stale lexicon can't survive on a byte-idle grid;
-    /// (3) a trail-pack manifest edit re-arms the recompute (registry rebuild)
-    /// WITHOUT touching the decorations it never feeds.
+    /// Byte-equal reload (`refresh_path_feeds`): (1) nothing changed is a full
+    /// no-op with no word-deco reset; (2) a lexicon file edit re-arms the
+    /// recompute and hard-resets word decorations; (3) a trail-pack edit re-arms
+    /// the recompute without touching decorations.
     #[test]
     fn byte_equal_reload_still_rereads_touched_path_feed_files() {
         let dir = std::env::temp_dir().join(format!("aterm-feed-touch-{}", std::process::id()));
@@ -16290,9 +14196,8 @@ mod reload_dedupe_tests {
         app.recompute_sparkle();
         assert!(!app.sparkle_dirty, "recompute clears the dirty latch");
 
-        // Seed a SCANNED per-window state so a hard_reset is observable:
-        // after an (empty) rescan at epoch 7, `needs_rescan(7)` is false and
-        // only a reset can flip it back.
+        // Seed a scanned per-window state so a hard_reset is observable: after an
+        // empty rescan at epoch 7 only a reset makes `needs_rescan(7)` true.
         let (deco_cfg, lexicon) = {
             let r = app.sparkle.as_ref().expect("sparkle resolves on defaults");
             (r.cfg.clone(), r.lexicon.clone())
@@ -16300,7 +14205,7 @@ mod reload_dedupe_tests {
         let wid = crate::WindowId(0);
         let seed_scan = |app: &mut crate::App| {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.word_decos.rescan_from_cells(
+            ws.fx.decos_mut().rescan_from_cells(
                 &[],
                 &[],
                 0,
@@ -16311,7 +14216,7 @@ mod reload_dedupe_tests {
                 std::time::Instant::now(),
             );
             assert!(
-                !ws.word_decos.needs_rescan(7),
+                !ws.fx.decos().needs_rescan(7),
                 "probe seeded: scanned at epoch 7"
             );
         };
@@ -16322,7 +14227,7 @@ mod reload_dedupe_tests {
         app.refresh_path_feeds(fresh);
         assert!(!app.sparkle_dirty, "nothing changed ⇒ no recompute re-arm");
         assert!(
-            !app.windows[&wid].word_decos.needs_rescan(7),
+            !app.windows[&wid].fx.decos().needs_rescan(7),
             "…and no word-deco reset (the settings-commit + watcher dedupe win)"
         );
 
@@ -16335,7 +14240,7 @@ mod reload_dedupe_tests {
             "lexicon content change re-arms the recompute"
         );
         assert!(
-            app.windows[&wid].word_decos.needs_rescan(7),
+            app.windows[&wid].fx.decos().needs_rescan(7),
             "changed lexicon hard-resets the per-window decorations"
         );
 
@@ -16351,18 +14256,15 @@ mod reload_dedupe_tests {
             "trail manifest change re-arms the recompute"
         );
         assert!(
-            !app.windows[&wid].word_decos.needs_rescan(7),
+            !app.windows[&wid].fx.decos().needs_rescan(7),
             "a trail-only edit never resets word decorations"
         );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The CHANGED-config path's reset gate (`deco_feed_changed`): a lexicon
-    /// FILE edit hiding behind an unrelated config edit still hard-resets —
-    /// config-struct equality alone cannot see it (the `[sparkle_words]` table
-    /// stores only the PATH), and without the fingerprint term the rebuilt
-    /// App lexicon would never reach windows idle on a byte-stable grid.
+    /// `deco_feed_changed`: a lexicon file edit behind an unrelated config edit
+    /// still hard-resets (the table stores only the path).
     #[test]
     fn deco_feed_gate_sees_lexicon_content_behind_an_unrelated_edit() {
         let old = cfg("font_px = 12.0\n");
@@ -16388,10 +14290,9 @@ mod reload_dedupe_tests {
 
 #[cfg(test)]
 mod whole_cell_min_size_tests {
-    //! fixwave5: winit's Wayland backend snaps interactive resizes to
-    //! `min_inner_size + k·increment`, so the min must sit ON the whole-cell
-    //! frame lattice or an exact-fit width gets re-snapped below the fit on a
-    //! pure-vertical edge drag (one column shaved).
+    //! Wayland snaps interactive resizes to `min_inner_size + k·increment`, so
+    //! the min must lie on the whole-cell frame lattice or a vertical drag
+    //! shaves a column.
 
     #[test]
     fn min_size_sits_on_the_whole_cell_frame_lattice() {
@@ -16403,9 +14304,8 @@ mod whole_cell_min_size_tests {
         let base_h =
             app.win_head(wid) + app.win_pad_top(wid) + pad + usize::from(app.tab_strip_rows) * ch;
 
-        // Congruence: every exact whole-cell frame `2·pad + C·cw` at or above
-        // the min is a lattice point of `min + k·cw` — the property that keeps
-        // a vertical drag from re-snapping the width below the exact fit.
+        // Every exact frame `2·pad + C·cw` at or above the min is a lattice point
+        // of `min + k·cw`.
         assert_eq!(
             (min.width as usize - 2 * pad) % cw,
             0,
@@ -16427,10 +14327,8 @@ mod whole_cell_min_size_tests {
 
 #[cfg(test)]
 mod theme_live_tests {
-    /// `apply_theme_live` recolours the LIVE backend in place — the next frame
-    /// paints the new theme without a backend rebuild — and drops the caches that
-    /// would otherwise stale-serve the old colours on a byte-idle grid (the E3
-    /// strip-row cache and the per-window `RepaintKey` gate).
+    /// `apply_theme_live` recolours the live backend without a rebuild and drops
+    /// the strip-row cache and per-window `RepaintKey` gate.
     #[test]
     fn apply_theme_live_recolours_backend_and_drops_caches() {
         let mut app = crate::App::headless_for_test();
@@ -16447,8 +14345,16 @@ mod theme_live_tests {
         let before = render(app.backend.ready_mut());
 
         // Seed the strip cache so its invalidation is observable (non-vacuous).
-        app.windows.get_mut(&wid).unwrap().last_strip_fp =
-            Some((0xFEED, 80, false, None, false, None));
+        app.windows.get_mut(&wid).unwrap().last_strip_fp = Some((
+            0xFEED,
+            80,
+            false,
+            None,
+            false,
+            None,
+            crate::tab_bar::VersionSlotCols::NONE,
+            false,
+        ));
 
         let tp = aterm_types::scheme::builtin("Dracula")
             .unwrap()
@@ -16484,11 +14390,10 @@ mod theme_live_tests {
 
 #[cfg(test)]
 mod matrix_rain_cfg_tests {
-    //! PHOSPHOR `[matrix_rain]` resolver pins (design §12): defaults + clamps
-    //! live ONLY in `Config::matrix_rain_params`, the durable enabled bit
-    //! resolves separately (`Config::matrix_rain_enabled`, default OFF —
-    //! inverted vs sparkle, required by the zero-cost pins), and malformed
-    //! hue input fails CLOSED without aborting the config load.
+    //! `[matrix_rain]` resolver tests: defaults and clamps live only in
+    //! `Config::matrix_rain_params`, the enabled bit resolves separately
+    //! (`Config::matrix_rain_enabled`, default off), and malformed hue input
+    //! fails closed without aborting the load.
 
     use super::{
         Config, PRIVACY_PROBE_INTERVAL_MS_DEFAULT, PRIVACY_WARMUP_HOLD_MS_DEFAULT,
@@ -16500,20 +14405,16 @@ mod matrix_rain_cfg_tests {
     const BG: u32 = 0x0011_1318;
     const FG: u32 = 0x00D0_D0D0;
 
-    /// The enabled-gated composition the pre-split resolver used to return —
-    /// the parameter pins below read through it so they also witness that the
-    /// split (`matrix_rain_enabled` + `matrix_rain_params`) still composes to
-    /// the old contract.
+    /// The enabled-gated composition of `matrix_rain_enabled` and
+    /// `matrix_rain_params`, used by the parameter tests below.
     fn rain(toml: &str) -> Option<RainConfig> {
         let cfg = aterm_toml::from_str::<Config>(toml).expect("valid toml");
         cfg.matrix_rain_enabled()
             .then(|| cfg.matrix_rain_params(BG, FG))
     }
 
-    /// OFF BY DEFAULT (the zero-cost posture): an absent table, a table with
-    /// no `enabled` key, and an explicit `enabled = false` all resolve the
-    /// enabled bit FALSE — no engine is ever constructed on any of these
-    /// paths without a session override.
+    /// Off by default: an absent table, a table without `enabled`, and
+    /// `enabled = false` all resolve false.
     #[test]
     fn rain_is_off_by_default() {
         assert!(
@@ -16530,11 +14431,8 @@ mod matrix_rain_cfg_tests {
         );
     }
 
-    /// The parameter resolve is INDEPENDENT of the enabled bit (the session-
-    /// override contract): an absent/disabled table still synthesizes the full
-    /// §12 default set with the live theme, identical to the enabled resolve —
-    /// so a session forcing rain ON over a disabled config gets the exact same
-    /// field it would get from `enabled = true`.
+    /// Parameters resolve independently of the enabled bit, so a session forcing
+    /// rain on over a disabled config gets the same field as `enabled = true`.
     #[test]
     fn params_resolve_independent_of_enabled() {
         let disabled = aterm_toml::from_str::<Config>("[matrix_rain]\nenabled = false\nfps = 24")
@@ -16555,13 +14453,10 @@ mod matrix_rain_cfg_tests {
         );
     }
 
-    /// The `[packages]` switch (2026-09-23, one path): an absent table (and an empty
-    /// one) is the batteries-included default — the background tools loop runs and the
-    /// toolset installs; `enabled = false` stops the loop, and so does the retired
-    /// `auto_update = false`, still honoured; the retired `channel`/`include` are no
-    /// longer fields (unknown keys, ignored), and the rest of the table — including the
-    /// `[packages.links]` sub-table this struct deliberately leaves to atpkg's own
-    /// reader — round-trips through serde.
+    /// `[packages]`: an absent or empty table is the default (loop runs, toolset
+    /// installs); `enabled = false` or legacy `auto_update = false` stops the
+    /// loop; `channel`/`include` are ignored unknown keys; the rest, including
+    /// `[packages.links]`, round-trips.
     #[test]
     fn packages_switch_resolves_defaults_and_the_retired_spellings() {
         assert!(
@@ -16581,8 +14476,8 @@ mod matrix_rain_cfg_tests {
             !retired.packages_enabled(),
             "the retired auto_update = false still reads as off"
         );
-        // …and Settings says why, in atpkg's words — only while the retired key is what
-        // holds it off (an `enabled = false` beside it is the switch's own Off).
+        // Settings explains an off held by the legacy key, in atpkg's words, but
+        // not when `enabled = false` is set beside it.
         assert_eq!(
             retired.packages_retired_switch_note(),
             Some(atpkg::config::auto_update_note(false, None))
@@ -16623,14 +14518,9 @@ mod matrix_rain_cfg_tests {
         assert_eq!(p.exclude.as_deref(), Some(["trust".to_string()].as_slice()));
     }
 
-    /// TRUTH-TRIANGLE cross-pin for the shared `[packages]` keys: the two
-    /// independent readers of the ONE table — this GUI `Config` (what the
-    /// Settings switches and the status card display) and the co-located
-    /// atpkg's own `PackagesConfig` (what the update pass actually does) —
-    /// must resolve identical defaults AND identical explicit values, the retired
-    /// spellings included. A resolution changed on one side only fails HERE instead
-    /// of shipping a switch that lies about the loop. The `[reroute]` switch is pinned
-    /// the same way.
+    /// The GUI `Config` and atpkg's `PackagesConfig` resolve identical defaults
+    /// and explicit values for the shared `[packages]` keys, legacy spellings
+    /// included; `[reroute]` is pinned the same way.
     #[test]
     fn packages_defaults_agree_across_the_two_config_readers() {
         for text in [
@@ -16663,6 +14553,8 @@ mod matrix_rain_cfg_tests {
             "",
             "[reroute]\nannounce = true\n",
             "[reroute]\nannounce = false\n",
+            "[reroute]\nstrict = true\n",
+            "[reroute]\nannounce = false\nstrict = false\n",
         ] {
             let gui = aterm_toml::from_str::<Config>(text).unwrap();
             assert_eq!(
@@ -16673,12 +14565,16 @@ mod matrix_rain_cfg_tests {
                 atpkg::config::parse_reroute(text).announce(),
                 "reroute.announce: {text:?}"
             );
+            assert_eq!(
+                gui.reroute.as_ref().and_then(|r| r.strict).unwrap_or(false),
+                atpkg::config::parse_reroute(text).strict(),
+                "reroute.strict: {text:?}"
+            );
         }
     }
 
-    /// `[update] enabled` — "Check for updates automatically" — is read by the updater
-    /// itself (`aterm_update_core::settings`), from the same file the GUI parses: the two
-    /// must agree, default ON.
+    /// `[update] enabled` resolves the same in the GUI and in
+    /// `aterm_update_core::settings`, default on.
     #[test]
     fn update_enabled_agrees_with_the_updaters_own_reader() {
         for text in [
@@ -16696,9 +14592,8 @@ mod matrix_rain_cfg_tests {
         }
     }
 
-    /// `[update] require_team_id` is a DEVELOPMENT setting: a test build is a
-    /// development build, so it is honoured here — and the gate is the cfg, which a
-    /// shipped build compiles off.
+    /// `[update] require_team_id` is honoured in development builds, which
+    /// includes test builds.
     #[test]
     fn a_required_team_id_is_honoured_by_a_development_build() {
         let config =
@@ -16706,9 +14601,8 @@ mod matrix_rain_cfg_tests {
         assert_eq!(super::update_required_team_id(&config), Some("ABCDE12345"));
     }
 
-    /// The `[machine]` defaults, stated once: an ABSENT table is the shipping
-    /// behavior — Universal Control is switched off for this host and cargo build
-    /// output is hidden from Spotlight.
+    /// `[machine]` defaults: Universal Control off and cargo output hidden from
+    /// Spotlight.
     #[test]
     fn machine_absent_section_resolves_documented_defaults() {
         let c = Config::default();
@@ -16767,10 +14661,8 @@ mod matrix_rain_cfg_tests {
         );
     }
 
-    /// TRUTH-TRIANGLE cross-pin for the shared `[machine]` keys: this GUI `Config`
-    /// (what the Security page shows and edits) and the co-located atpkg's own
-    /// `MachineConfig` (what the pass actually applies) must resolve identical
-    /// defaults AND identical explicit values.
+    /// The GUI `Config` and atpkg's `MachineConfig` resolve identical defaults and
+    /// explicit values for `[machine]`.
     #[test]
     fn machine_defaults_agree_across_the_two_config_readers() {
         let gui = Config::default();
@@ -16799,11 +14691,23 @@ mod matrix_rain_cfg_tests {
         }
     }
 
-    /// The `[privacy]` defaults, stated once: an ABSENT table is the shipping
-    /// behavior — the lane is on, the probe is on, the notice is on,
-    /// attribution corroboration is on, the warm-up is offered but never
-    /// automatic, and the folder list is the consent module's own, in the order
-    /// the warm-up walks them.
+    /// `[privacy]` defaults: lane, probe, notice and attribution on; warm-up
+    /// offered but never automatic; folders are the consent module's, in walk
+    /// order.
+    #[test]
+    fn observer_mode_defaults_to_sentinel_false_is_off_true_is_full() {
+        use crate::consent_observer::ObserverMode;
+        let mode = |text: &str| {
+            aterm_toml::from_str::<Config>(text)
+                .expect("parses")
+                .privacy_observer_mode()
+        };
+        assert_eq!(mode(""), ObserverMode::Sentinel, "no [privacy] table");
+        assert_eq!(mode("[privacy]\n"), ObserverMode::Sentinel, "key absent");
+        assert_eq!(mode("[privacy]\nobserver = false\n"), ObserverMode::Off);
+        assert_eq!(mode("[privacy]\nobserver = true\n"), ObserverMode::Full);
+    }
+
     #[test]
     fn privacy_absent_section_resolves_every_documented_default() {
         let c = Config::default();
@@ -16819,7 +14723,7 @@ mod matrix_rain_cfg_tests {
         assert_eq!(c.privacy_warmup().as_str(), "on-request");
         assert_eq!(
             c.privacy_warmup_folders(),
-            aterm_containment::Folder::ALL
+            aterm_containment::Folder::WARMUP_DEFAULT
                 .iter()
                 .map(|folder| folder.as_str().to_string())
                 .collect::<Vec<_>>(),
@@ -16833,11 +14737,44 @@ mod matrix_rain_cfg_tests {
         // The reserved key has no resolver at all — nothing in the build can
         // read it, which is what makes "unimplemented" structural rather than
         // a promise. It still round-trips so the validator can name it.
-        assert!(
-            !c.privacy_observer(),
-            "the tccd log observer ships OFF (design §3.6)"
+        assert_eq!(
+            c.privacy_observer_mode(),
+            crate::consent_observer::ObserverMode::Sentinel,
+            "the tccd observer defaults to the narrow sentinel (design §3.6)"
         );
         assert_eq!(c.privacy.as_ref().and_then(|p| p.auto_accept), None);
+    }
+
+    /// `app-data` is a valid warm-up name but not a default one: macOS forgets
+    /// its Allow when the process that received it is replaced, so asking for it
+    /// up front raises a dialog whose answer cannot last.
+    #[test]
+    fn the_default_warmup_omits_app_data_but_an_explicit_list_may_include_it() {
+        let absent = Config::default();
+        let defaults = absent.privacy_warmup_folders();
+        assert_eq!(defaults, vec!["documents", "desktop", "downloads"]);
+        assert!(
+            !defaults.iter().any(|name| name == "app-data"),
+            "{defaults:?}"
+        );
+        assert!(
+            aterm_containment::Folder::ALL.contains(&aterm_containment::Folder::AppData),
+            "the roster still knows the item (reset, report rows)"
+        );
+        let explicit = aterm_toml::from_str::<Config>(
+            "[privacy]\nwarmup_folders = [\"documents\", \"app-data\"]\n",
+        )
+        .expect("explicit list parses");
+        assert_eq!(
+            explicit.privacy_warmup_folders(),
+            vec!["documents".to_string(), "app-data".to_string()]
+        );
+        let paths = aterm_containment::consent::folder_paths(&explicit.privacy_warmup_folders());
+        assert_eq!(
+            paths.len(),
+            2,
+            "an explicit app-data still resolves to a path"
+        );
     }
 
     /// An EMPTY `[privacy]` table is exactly the absent one: every field is
@@ -16869,26 +14806,22 @@ mod matrix_rain_cfg_tests {
             empty.privacy_probe_interval_ms(),
             absent.privacy_probe_interval_ms()
         );
-        assert_eq!(empty.privacy_observer(), absent.privacy_observer());
+        assert_eq!(
+            empty.privacy_observer_mode(),
+            absent.privacy_observer_mode()
+        );
         assert_eq!(
             empty.privacy_protected_roots(),
             absent.privacy_protected_roots()
         );
     }
 
-    /// An absolute root for the override fixtures below. `/tmp/…` is absolute
-    /// only on Unix: on Windows `Path::is_absolute` needs a drive, so the
-    /// resolver drops it as "neither absolute nor ~-prefixed" — the very rule
-    /// these tests pin — and every expectation built on it came back empty
-    /// (measured, 0.90.0). Forward slashes are a separator on both hosts, so
-    /// `PathBuf::from` of the same text is what the resolver keeps verbatim.
+    /// An absolute root for the fixtures below; on Windows an absolute path
+    /// needs a drive. Forward slashes work on both hosts.
     const ABS_TMP: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
 
-    /// Explicit values win over every default, the whole table round-trips
-    /// through serde, and the two clamped/parsed fields resolve as documented:
-    /// an over-ceiling hold is clamped (it can never become a way to pin a
-    /// build) and an unknown `warmup` spelling falls back rather than failing
-    /// the file.
+    /// Explicit values win, the table round-trips, an over-ceiling hold is
+    /// clamped, and an unknown `warmup` spelling falls back.
     #[test]
     fn privacy_explicit_values_win_over_the_defaults() {
         // Positional `{}`: a format string expanded from `concat!` may not
@@ -16923,9 +14856,10 @@ mod matrix_rain_cfg_tests {
         assert_eq!(c.privacy_warmup_folders(), vec!["desktop".to_string()]);
         assert_eq!(c.privacy_warmup_hold_ms(), 45_000);
         assert_eq!(c.privacy_probe_interval_ms(), 250);
-        assert!(
-            c.privacy_observer(),
-            "the observer is opt-in from config, and config alone"
+        assert_eq!(
+            c.privacy_observer_mode(),
+            crate::consent_observer::ObserverMode::Full,
+            "the full stream is opt-in from config, and config alone"
         );
         assert_eq!(
             c.privacy_protected_roots(),
@@ -16963,10 +14897,8 @@ mod matrix_rain_cfg_tests {
         assert_eq!(PrivacyWarmup::parse(" NEVER "), Some(PrivacyWarmup::Never));
     }
 
-    /// `protected_roots = []` resolves to the CONTAINMENT private set, not to
-    /// "nothing is protected". The two tiers share one list on purpose, and a
-    /// user who empties the key gets the shared default rather than a silently
-    /// unprotected machine.
+    /// `protected_roots = []` resolves to the Containment private set, not to
+    /// "nothing is protected".
     #[test]
     fn privacy_empty_protected_roots_resolve_to_the_containment_private_set() {
         let expected: Vec<std::path::PathBuf> = std::env::var_os("HOME")
@@ -16993,9 +14925,8 @@ mod matrix_rain_cfg_tests {
         );
     }
 
-    /// A `~/`-prefixed override is expanded; an entry that is neither absolute
-    /// nor `~`-prefixed is dropped rather than guessed at (and
-    /// `--validate-config` names it).
+    /// A `~/` override is expanded; an entry that is neither absolute nor
+    /// `~`-prefixed is dropped (and `--validate-config` names it).
     #[test]
     fn privacy_protected_root_overrides_expand_tilde_and_drop_relatives() {
         let c = aterm_toml::from_str::<Config>(&format!(
@@ -17015,9 +14946,8 @@ mod matrix_rain_cfg_tests {
         );
     }
 
-    /// The §12 default column resolves exactly; alpha/head_alpha stay `None`
-    /// (theme-derived in-engine) when the user never set them, and the live
-    /// theme lands as the renderer knows it.
+    /// Defaults resolve exactly; alpha/head_alpha stay `None` (theme-derived)
+    /// when unset, and the live theme passes through.
     #[test]
     fn defaults_resolve_per_design_table() {
         let c = rain("[matrix_rain]\nenabled = true").expect("enabled resolves");
@@ -17080,9 +15010,8 @@ mod matrix_rain_cfg_tests {
         assert_eq!(hi.idle_secs, 120);
     }
 
-    /// `head_alpha` clamps `alpha..=135`: heads are never dimmer than the
-    /// body the user configured; with no body override the floor is the
-    /// global alpha floor.
+    /// `head_alpha` clamps to `alpha..=135`; with no body override the floor is
+    /// the global alpha floor.
     #[test]
     fn head_alpha_floors_at_body_alpha() {
         let c = rain("[matrix_rain]\nenabled = true\nalpha = 120\nhead_alpha = 20").unwrap();
@@ -17093,9 +15022,8 @@ mod matrix_rain_cfg_tests {
         assert_eq!(c.head_alpha_override, Some(RAIN_ALPHA_FLOOR));
     }
 
-    /// The three documented hue spellings parse; malformed hex (wrong length,
-    /// non-hex digits, unknown words) fails CLOSED to the stock matrix green
-    /// — never `None`-ing the resolve and never aborting the config load.
+    /// The three hue spellings parse; malformed hex or words fall back to the
+    /// stock green without failing the resolve or the load.
     #[test]
     fn hue_parses_and_bad_hex_fails_closed() {
         let hue = |h: &str| {
@@ -17133,10 +15061,8 @@ mod matrix_rain_cfg_tests {
         );
     }
 
-    /// The v1-inert knobs (`materialize` / `ink_text` / `phosphor`) PARSE —
-    /// setting them must never abort the config load — but are not forwarded:
-    /// `RainConfig` carries no such fields (compile-time), and the resolve
-    /// still succeeds normally with all three set (deferred, design §14).
+    /// `materialize` / `ink_text` / `phosphor` parse without aborting the load
+    /// but are not forwarded (`RainConfig` has no such fields).
     #[test]
     fn inert_v1_knobs_parse_without_forwarding() {
         let c = rain(concat!(
@@ -17147,9 +15073,8 @@ mod matrix_rain_cfg_tests {
         assert_eq!(c.fps, 30, "the rest of the resolve is unaffected");
     }
 
-    /// Nonzero seeds pass through the resolver unchanged (reproducible
-    /// demos/tests); the 0 sentinel is resolved per window at engine build
-    /// (`rain_config_for_window`), never here.
+    /// Nonzero seeds pass through; the 0 sentinel is resolved per window at
+    /// engine build (`rain_config_for_window`).
     #[test]
     fn seed_passes_through() {
         assert_eq!(
@@ -17175,14 +15100,10 @@ mod matrix_rain_cfg_tests {
 
 #[cfg(test)]
 mod matrix_rain_app_tests {
-    //! PHOSPHOR host-wiring pins: the default-off zero-cost invariant (no
-    //! engine is EVER constructed when nothing enables rain), the per-session
-    //! `toggle_matrix_rain` override dispatch (config-independent, both
-    //! directions, reload-surviving), the `rain` control-verb status face,
-    //! the hot-reload dirty rebuild, the per-window seed derivation, and the
-    //! Reduced-motion emit-nothing law (fp 0 ⇒ the `RepaintKey.rain_fp` term
-    //! stays byte-identical-off; the early-out test builder pins the
-    //! off-value 0 itself).
+    //! Matrix rain host wiring: no engine exists when nothing enables rain; the
+    //! per-session `toggle_matrix_rain` override (both directions,
+    //! reload-surviving); the `rain` verb's status line; hot-reload rebuild;
+    //! per-window seeds; and reduced motion emitting nothing (fp 0).
 
     use super::Config;
     use crate::keybinding::Action;
@@ -17191,11 +15112,8 @@ mod matrix_rain_app_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// Config absent + no session override ⇒ every session's effective state
-    /// is off, no per-window engine exists, and the scratch stays empty — the
-    /// D-1 zero-cost pin: nothing rain-shaped runs (or allocates) on the
-    /// disabled path. The PARAMETER resolve now always exists (a session can
-    /// force rain on at any moment), but parameters alone construct nothing.
+    /// No config and no override: every session is off, no engine exists and
+    /// the scratch stays empty. Parameters resolve but construct nothing.
     #[test]
     fn default_off_constructs_no_engine() {
         let mut app = crate::App::headless_for_test();
@@ -17208,18 +15126,14 @@ mod matrix_rain_app_tests {
             "absent config + no override ⇒ effectively off"
         );
         for ws in app.windows.values() {
-            assert!(ws.matrix_rain.is_none(), "no engine constructed when off");
-            assert!(ws.rain_scratch.is_empty());
-            assert!(ws.rain_add_scratch.is_empty());
+            assert!(ws.fx.rain().is_none(), "no engine constructed when off");
+            assert!(ws.fx.rain_empty());
         }
     }
 
-    /// `toggle_matrix_rain` (dispatched like the real keybinding) is now a
-    /// PER-SESSION override on the window's front session: it turns rain ON
-    /// over an absent/disabled config (the old kill latch never could), OFF
-    /// over an enabled one, and the override WINS over a config reload until
-    /// re-toggled. Engines are NOT dropped on the off flip — the render gate's
-    /// suspended/drain path winds the field down (alt-screen precedent).
+    /// `toggle_matrix_rain` is a per-session override on the front session: on
+    /// over a disabled config, off over an enabled one, and it wins over reloads
+    /// until re-toggled. Engines are not dropped on the off flip.
     #[test]
     fn toggle_dispatch_flips_front_session_override() {
         let mut app = crate::App::headless_for_test();
@@ -17250,13 +15164,12 @@ mod matrix_rain_app_tests {
         // OFF again: the effective state flips; a live engine is retained for
         // the drain path, never dropped in the toggle pass.
         let rc = crate::rain_config_for_window(app.rain.unwrap(), wid);
-        app.windows.get_mut(&wid).unwrap().matrix_rain =
-            Some(Box::new(crate::matrix_rain::MatrixRain::new(rc)));
+        app.windows.get_mut(&wid).unwrap().fx.build_rain(rc);
         app.dispatch_action(wid, Action::ToggleMatrixRain);
         assert_eq!(app.pool.rain_override(0), Some(false));
         assert!(!app.session_rain_enabled(0));
         assert!(
-            app.windows[&wid].matrix_rain.is_some(),
+            app.windows[&wid].fx.rain().is_some(),
             "the engine survives the off flip and drains via the suspend path"
         );
 
@@ -17272,9 +15185,9 @@ mod matrix_rain_app_tests {
         assert_eq!(app.pool.rain_override(999), None, "unknown session: none");
     }
 
-    /// The `rain` control-verb face ([`crate::App::rain_control`]): `status`
-    /// reads without mutating; `on`/`off`/`toggle` write the front session's
-    /// override; every reply carries the full one-line post-state.
+    /// The `rain` verb ([`crate::App::rain_control`]): `status` reads only;
+    /// `on`/`off`/`toggle` write the front session's override; every reply has
+    /// the full post-state line.
     #[test]
     fn rain_control_verb_reads_and_writes_front_session() {
         let mut app = crate::App::headless_for_test();
@@ -17312,11 +15225,9 @@ mod matrix_rain_app_tests {
         );
     }
 
-    /// The `fx` control-verb face ([`crate::App::fx_control`]): `status` is a
-    /// pure read; `celebrate` ARMS once and answers the post-state; a second
-    /// arm is refused with the detector's own sentence; a non-rainbow trail
-    /// refuses the arm outright. Nothing here drives the detector: `live`
-    /// stays false because no keyed edge ever came.
+    /// The `fx` verb ([`crate::App::fx_control`]): `status` is a pure read;
+    /// `celebrate` arms once; a second arm is refused with the detector's
+    /// sentence; a non-rainbow trail refuses. `live` stays false (no keyed edge).
     #[test]
     fn fx_control_verb_arms_once_and_reports() {
         let mut app = crate::App::headless_for_test();
@@ -17402,11 +15313,9 @@ mod matrix_rain_app_tests {
         }
     }
 
-    /// Hot reload: the dirty gate re-resolves; a live engine receives the new
-    /// config via `set_config` (kept, not dropped — no field time-travel).
-    /// A reload that DISABLES the feature also keeps the engine: the render
-    /// gate's suspended/drain path (not the recompute) winds a now-off field
-    /// down, because a session override may legitimately keep raining.
+    /// Hot reload re-resolves and pushes the new config into a live engine via
+    /// `set_config`; a reload that disables rain keeps the engine for the render
+    /// path to drain.
     #[test]
     fn hot_reload_dirty_rebuild() {
         let mut app = crate::App::headless_for_test();
@@ -17416,8 +15325,7 @@ mod matrix_rain_app_tests {
         app.recompute_matrix_rain();
         assert_eq!(app.rain.unwrap().fps, 24);
         let rc = crate::rain_config_for_window(app.rain.unwrap(), wid);
-        app.windows.get_mut(&wid).unwrap().matrix_rain =
-            Some(Box::new(crate::matrix_rain::MatrixRain::new(rc)));
+        app.windows.get_mut(&wid).unwrap().fx.build_rain(rc);
 
         // A reload edits a knob (reload_config sets rain_dirty; mirrored here
         // without the disk round-trip).
@@ -17426,27 +15334,24 @@ mod matrix_rain_app_tests {
         app.recompute_matrix_rain();
         assert_eq!(app.rain.unwrap().fps, 60, "reload re-resolves the knobs");
         assert!(
-            app.windows[&wid].matrix_rain.is_some(),
+            app.windows[&wid].fx.rain().is_some(),
             "a live engine is reconfigured in place, not dropped"
         );
 
-        // A reload that disables the feature flips the effective bit but keeps
-        // the engine — the frame gate drains it (and a session override could
-        // keep it emitting on purpose).
+        // Disabling flips the effective bit but keeps the engine.
         app.config = cfg("");
         app.rain_dirty = true;
         app.recompute_matrix_rain();
         assert!(app.rain.is_some(), "params keep resolving");
         assert!(!app.session_rain_enabled(0), "config off, no override");
         assert!(
-            app.windows[&wid].matrix_rain.is_some(),
+            app.windows[&wid].fx.rain().is_some(),
             "the engine is retained for the suspended/drain wind-down"
         );
     }
 
-    /// The `seed = 0` sentinel derives a STABLE per-window seed (never
-    /// wall-clock): identical across rebuilds of the same window, distinct
-    /// across windows; a pinned nonzero seed passes through untouched.
+    /// `seed = 0` derives a stable per-window seed: equal across rebuilds of a
+    /// window, distinct across windows; a nonzero seed passes through.
     #[test]
     fn zero_seed_derives_stable_per_window() {
         let base = crate::matrix_rain::RainConfig {
@@ -17467,11 +15372,8 @@ mod matrix_rain_app_tests {
         );
     }
 
-    /// W11: under a Reduced policy the engine emits NOTHING — empty channels,
-    /// fp exactly 0 (the `RepaintKey.rain_fp` term equals the off-value, so
-    /// idle frames stay byte-identical), and `is_active()` false (the rain
-    /// timer disarms). Non-vacuity: the same engine reports active again the
-    /// moment reduced lifts.
+    /// Under reduced motion the engine emits nothing (empty channels, fp 0) and
+    /// `is_active()` is false; it becomes active again when reduced lifts.
     #[test]
     fn reduced_motion_emits_nothing() {
         use crate::matrix_rain::{MatrixRain, RainConfig, RainTickInput};
@@ -17567,10 +15469,8 @@ mod agents_auto_prime_tests {
     }
 }
 
-/// The front door's update policy (`aterm_gui::configured_update_settings`):
-/// source and apply policy from ONE parse of the persisted file, and a
-/// malformed existing policy refuses automatic work rather than defaulting it
-/// back on.
+/// `aterm_gui::configured_update_settings`: source and apply policy come from one
+/// parse, and a malformed existing policy refuses automatic work.
 #[cfg(test)]
 mod update_check_settings_tests {
     #[test]
@@ -17594,12 +15494,9 @@ mod update_check_settings_tests {
     }
 }
 
-/// The one enablement gate, exercised from the config string down.
-///
-/// `resolve_cursor_glow` reads `enabled` off `style.style.is_some()`, so the
-/// question these pin is which raw values resolve to no style at all. That set
-/// is EXACTLY the values that mean "draw nothing" — `off`, and a `pack:` naming
-/// no loaded pack. Everything else, a typo included, draws.
+/// The enablement gate from the config string down: only `off` and a `pack:`
+/// naming no loaded pack resolve to no style; everything else, a typo
+/// included, draws.
 #[cfg(test)]
 mod trail_style_resolution_tests {
     use super::*;
@@ -17685,11 +15582,8 @@ mod trail_style_resolution_tests {
         );
     }
 
-    /// Does a FRESH engine, handed this spelling's resolved config, own the
-    /// frame as v2 on its first drawing tick? The host carries no engine
-    /// flag since phase 7, so "engages v2" can only be asked of the engine
-    /// itself — `CursorGlow::v2_status` is `Some` exactly while v2 owns the
-    /// frame.
+    /// Whether a fresh engine given this spelling's config owns the frame as v2
+    /// on its first tick (`CursorGlow::v2_status` is `Some`).
     fn engine_is_v2_for(raw: &str) -> bool {
         use aterm_effects::cursor_glow::{CursorGlow, Geom};
         let cfg = glow(raw, true);
@@ -17715,17 +15609,11 @@ mod trail_style_resolution_tests {
         engine.v2_status().is_some()
     }
 
-    /// THE SPELLING LAW AFTER THE DELETION (§17.3 phase 7, 2026-09-06): every
-    /// `cursor_trail_style` that resolves to `RainbowKitty` — each picker
-    /// entry and each documented alias that is the rainbow kitty, the
-    /// unconfigured default, and a typo's fallback onto it — is v2: the
-    /// engine engages itself from the resolved config alone, and the `auto`
-    /// typing voice is the music box. There is no second rainbow kitty: the
-    /// old `… v1` escape is an unknown spelling that falls back to the
-    /// default with the `Unknown` issue reported, and every other style,
-    /// `off` and a pack stay off v2 and off the music box. `Default` and the
-    /// resolver agree, so the first frame and the first config generation
-    /// draw the same engine.
+    /// Every `cursor_trail_style` resolving to `RainbowKitty` (picker entries,
+    /// aliases, the default, a typo's fallback) engages v2 from the resolved
+    /// config and uses the music box for `auto`. `… v1` is unknown and falls
+    /// back with an `Unknown` issue; other styles, `off` and packs never engage
+    /// v2. `Default` and the resolver agree.
     #[test]
     fn every_rainbow_kitty_spelling_is_v2() {
         use aterm_effects::trail_sound::SoundVoice;
@@ -17854,9 +15742,7 @@ mod trail_style_resolution_tests {
         );
     }
 
-    /// A MISTYPED STYLE FALLS BACK AND SAYS SO. It used to switch the whole
-    /// cursor effect off with nothing on screen to explain it — `trail status`
-    /// printed `effective=false` beside the look that had been asked for.
+    /// A mistyped style falls back to the default and reports the issue.
     #[test]
     fn an_unknown_style_draws_the_default_and_is_reported() {
         let default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE;
@@ -17873,9 +15759,8 @@ mod trail_style_resolution_tests {
             );
             assert!(glow(typo, true).enabled, "{typo:?} must still draw");
 
-            // The COMPANION and the RIBBON travel with the fallback. These are
-            // string predicates over the style token, so asked about the typo
-            // they would answer for a look nothing renders.
+            // The companion and ribbon predicates read the fallback token, not
+            // the typo.
             let token = effective_trail_style_token(typo);
             assert_eq!(token, default, "{typo:?}");
             assert!(GlowStyle::style_names_any_pet(token), "{typo:?}");
@@ -17938,9 +15823,8 @@ mod trail_style_resolution_tests {
         }
     }
 
-    /// [`effective_trail_style_token`] is the resolver's own answer, not a
-    /// second opinion: the raw-token predicates on the draw path must read the
-    /// spelling `resolve_trail_style` settled on.
+    /// [`effective_trail_style_token`] returns what `resolve_trail_style`
+    /// settled on.
     #[test]
     fn the_effective_token_never_disagrees_with_the_resolver() {
         let catalog = TrailPackCatalog::empty();
@@ -17963,11 +15847,8 @@ mod trail_style_resolution_tests {
         }
     }
 
-    /// RAINBOW-KITTY-V2.md §21 row 14 closed: the bloom radius is per-style —
-    /// 1.8 half-res texels for the rainbow kitty (whose stars are already
-    /// haloed), the 2.2 every other style has always had — and the
-    /// `cursor_trail_bloom_radius` knob is the explicit override for all of
-    /// them.
+    /// Bloom radius is per style (1.8 for the rainbow kitty, 2.2 otherwise), and
+    /// `cursor_trail_bloom_radius` overrides all of them.
     #[test]
     fn the_bloom_radius_is_per_style_with_the_knob_as_the_override() {
         fn radius(style: &str, knob: Option<f32>) -> f32 {
@@ -18004,7 +15885,8 @@ mod trail_style_resolution_tests {
 #[cfg(test)]
 mod launch_notice_tests {
     /// The launch-time notice names the path, the problem and the consequence —
-    /// "every setting is running at its default" — for both shapes of failure.
+    /// "every setting is running at its default" (an invalid file still reads its
+    /// `[harness]` lines, `Config::stand_in`, and says so).
     #[test]
     fn launch_config_notice_names_the_consequence_and_the_path() {
         let path = std::path::Path::new("/home/ana/.config/aterm/aterm.toml");
@@ -18033,7 +15915,7 @@ mod launch_notice_tests {
             "{invalid}"
         );
         assert!(
-            invalid.contains("every setting is running at its default"),
+            invalid.contains("the window's settings except [harness] are at their defaults"),
             "{invalid}"
         );
         assert!(

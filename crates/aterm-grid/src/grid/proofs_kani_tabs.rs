@@ -2,19 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kani proofs for tab stop operations (cursor_ops.rs tab functions).
-//!
-//! Verifies the documented REQUIRES/ENSURES contracts for tab stop
-//! functions in `Grid`. Uses `Grid::kani_mock` with fixed 4×8 dimensions.
-//!
-//! Part of #376 (terminal module proof coverage gap).
+//! Kani proofs for tab stop operations: the REQUIRES/ENSURES contracts of
+//! `Grid`'s tab functions on a fixed 4×8 `Grid::kani_mock`.
 
 use super::*;
 use crate::Cell;
 
-// =============================================================================
 // tab / back_tab — cursor movement through tab stops
-// =============================================================================
 
 /// `tab` advances cursor column to next tab stop (or max_col).
 ///
@@ -60,20 +54,11 @@ fn back_tab_retreats_or_stays() {
     );
 }
 
-/// `tab` from column 0 with default tab stops lands at column 7 (max_col)
-/// on an 8-column grid, because the first tab stop at col 8 is at the boundary.
-///
-/// On KANI_MOCK_COLS = 8, max_col = 7. Tab stops at multiples of 8 where c > 0,
-/// so the only stop is at col 8 — which is at max_col (since default tabs are
-/// `c > 0 && c % 8 == 0`). So tab from col 0 should go to col 7 (no stop before max).
-///
-/// Wait — default_tab_stops has a stop at col 8 only if cols > 8. With cols=8,
-/// tab_stops has indices 0..7. The tab at col 8 is the 9th element (index 8)
-/// which doesn't exist. So tab from col 0 on 8-col grid goes to col 7 (max_col).
+/// `tab` from column 0 with default stops lands on max_col (7) of an 8-column
+/// grid: the first default stop, col 8, does not exist.
 // INTENTIONALLY_CONCRETE: tests zero/empty edge case (col=0, 8-col grid specific behavior)
 ///
-/// Also verifies that tab from any column without intervening tab stops
-/// advances to max_col, using symbolic starting column in a cleared-stops grid.
+/// With all stops cleared, tab from any symbolic column advances to max_col.
 #[kani::proof]
 fn tab_from_zero_default_stops() {
     let mut cells = [[Cell::EMPTY; Grid::KANI_MOCK_COLS as usize]; Grid::KANI_MOCK_ROWS as usize];
@@ -103,9 +88,7 @@ fn tab_from_zero_default_stops() {
     );
 }
 
-// =============================================================================
 // tab_n / back_tab_n — multi-stop movement
-// =============================================================================
 
 /// `tab_n` advances through n tab stops monotonically.
 ///
@@ -155,9 +138,7 @@ fn back_tab_n_monotonic() {
     );
 }
 
-// =============================================================================
 // set_tab_stop / clear_tab_stop / clear_all_tab_stops
-// =============================================================================
 
 /// `set_tab_stop` marks current cursor column as a tab stop.
 ///
@@ -246,9 +227,7 @@ fn set_clear_tab_stop_roundtrip() {
     );
 }
 
-// =============================================================================
 // is_tab_stop — bounds safety
-// =============================================================================
 
 /// `is_tab_stop` returns false for out-of-bounds columns.
 ///
@@ -267,12 +246,10 @@ fn is_tab_stop_oob_returns_false() {
     );
 }
 
-// =============================================================================
 // reset_tab_stops — restores default pattern
-// =============================================================================
 
-/// `reset_tab_stops` restores the tab stop vector to the correct length
-/// regardless of how many symbolic tab stops were set/cleared beforehand.
+/// `reset_tab_stops` restores the vector's length whatever stops were set or
+/// cleared before.
 ///
 /// ENSURES: tab_stops.len() == cols
 #[kani::proof]

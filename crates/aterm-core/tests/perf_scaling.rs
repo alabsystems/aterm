@@ -2,19 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Engine complexity guard (M2 PERF-BASELINE) — DETERMINISTIC, machine-independent.
+//! Engine complexity guard, deterministic and machine-independent.
 //!
-//! Wall-clock throughput is flaky on shared/throttled machines, so the regression
-//! gate here measures ALLOCATION COUNT instead: a quantity that is reproducible run
-//! to run and identical across machines. The engine writes into a fixed grid with a
-//! capped (ring-buffer) scrollback, so the number of heap allocations to process a
-//! stream must stay ~constant — NOT grow proportionally with the input. A regression
-//! that allocates per input byte / per line (an accidental per-cell box, a grid
-//! realloc per scroll) shows up as super-linear allocation growth and fails here.
-//!
-//! This complements the parser's O(n) iteration-counter guard
-//! (aterm-parser performance tests) and the retained-heap ceiling (mem_budget.rs).
-//! Run: `cargo test -p aterm-core --test perf_scaling -- --nocapture`.
+//! Counts heap allocation calls rather than wall time. The engine writes into a
+//! fixed grid with a capped scrollback, so allocations to process a stream stay
+//! roughly constant; per-byte or per-line allocation shows up as growth and
+//! fails here. The retained-heap ceiling is in `mem_budget.rs`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,8 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// System allocator that counts allocation CALLS while `ACTIVE` (so only the
-/// measured `process()` span is counted, not test/grid setup).
+/// System allocator that counts allocation calls while `ACTIVE` (only the
+/// measured `process()` span).
 struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
@@ -76,7 +69,7 @@ fn unicode_workload(lines: usize) -> Vec<u8> {
 /// scrolling reuses slots (the steady state we measure).
 const WARM_LINES: usize = 11_000;
 
-/// Allocation calls to `process` `measure_input` on an engine ALREADY warmed to
+/// Allocation calls to `process` `measure_input` on an engine already warmed to
 /// scrollback capacity — i.e. the steady-state allocation cost of that input.
 fn steady_state_alloc_calls(measure_input: &[u8]) -> u64 {
     let mut t = aterm_core::terminal::Terminal::new(24, 80);
@@ -104,7 +97,7 @@ fn render_extras_avoid_temporary_allocations() {
     use std::hint::black_box;
     use std::sync::Arc;
 
-    // Materialized history may contain BOTH a complete complex string and
+    // Materialized history may contain both a complete complex string and
     // separately stored combining marks. The borrowed view must keep both,
     // in order, without constructing a temporary Vec<char> for every read.
     let mut extra = CellExtra::default();
@@ -138,9 +131,8 @@ fn render_extras_avoid_temporary_allocations() {
         "the allocating negative control must fire"
     );
 
-    // The caller-owned frame buffers are already warm. Only the required
-    // owned cluster strings may allocate; reserving scalar counts as bytes
-    // used to grow each string repeatedly and then shrink it into its Box.
+    // The caller-owned frame buffers are already warm; only the owned cluster
+    // strings may allocate, each sized once.
     const CLUSTERS: [&str; 5] = [
         "👨\u{200D}👩\u{200D}👧",
         "👍🏽",
@@ -187,13 +179,12 @@ fn render_extras_avoid_temporary_allocations() {
     );
 }
 
-// Orders of magnitude below the line count, far above the observed handful: noise
-// never flaps, but a per-line/per-cell regression (≈ thousands of allocs) is caught.
+// Orders of magnitude below the line count: a per-line or per-cell allocation
+// (thousands) is caught.
 const CEILING: u64 = 64;
 
-// ONE test: the global allocation counter is process-wide, so the measured spans
-// must not overlap. Running both workloads sequentially in a single test keeps them
-// serialized (cargo runs separate #[test] fns on parallel threads).
+// One test: the allocation counter is process-wide, so the measured spans must
+// not run on parallel test threads.
 #[test]
 fn engine_steady_state_processing_is_allocation_free() {
     let measure = 2_000;
@@ -207,12 +198,9 @@ fn engine_steady_state_processing_is_allocation_free() {
          {CEILING}) — the engine is allocating per line/cell instead of reusing the ring"
     );
 
-    // CJK/EMOJI floor (M2 SIMD-UTF8): multi-byte text drives the bulk UTF-8 decode
-    // path. Unlike ASCII, the wide/grapheme write path DOES allocate (grapheme
-    // storage), so "allocation-free" is the wrong bar. Instead assert it scales
-    // LINEARLY with input — 2x the lines must not cost ~4x the allocations — which
-    // catches a quadratic regression while tolerating the honest per-grapheme cost.
-    // Ratio is machine-independent + deterministic (same content, same allocator).
+    // CJK/emoji: the wide/grapheme write path allocates grapheme storage, so
+    // assert linear scaling instead: 2x the lines must not cost ~4x the
+    // allocations.
     let u_n = steady_state_alloc_calls(&unicode_workload(measure));
     let u_2n = steady_state_alloc_calls(&unicode_workload(measure * 2));
     eprintln!(
@@ -220,8 +208,7 @@ fn engine_steady_state_processing_is_allocation_free() {
         measure * 2,
         u_2n as f64 / u_n.max(1) as f64
     );
-    // Linear is 2.0x; a quadratic regression is ~4x. Ceiling 3x catches quadratic
-    // with headroom for the fixed per-call overhead amortizing differently.
+    // Linear is 2.0x, quadratic ~4x; 3x leaves headroom for fixed per-call cost.
     assert!(
         u_2n <= u_n.max(1) * 3,
         "unicode allocation scaled super-linearly: {u_n} -> {u_2n} for 2x input (ceiling {}) \

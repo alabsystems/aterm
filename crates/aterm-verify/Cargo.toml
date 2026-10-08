@@ -7,15 +7,30 @@ version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 publish = false
+# ONE integration-test binary (2026-09-28): tests/contract.rs mounts every
+# tests/*.rs suite as a module. Listed explicitly because autotests is off, so
+# a new suite compiles once it is a `mod` line of tests/contract.rs.
+autotests = false
 description = "aterm's merge gate — the ok/FAIL/skip ladder, its scheduler, and the verdict discipline, as a testable Rust driver"
 
 [[bin]]
 name = "aterm-verify"
 path = "src/main.rs"
+# No test lives in main.rs (no #[test], no cfg(test), no `mod`); its libtest
+# harness ran 0 tests in every gate. Integration tests still get the binary.
+test = false
 
 [lib]
 name = "aterm_verify"
 path = "src/lib.rs"
+
+# The gate's own suites in one binary — one link and one process start where
+# there were nine. It measured no wall-time gain (tests/contract.rs says what
+# was measured, and what to watch in the gate's pool). The files keep their
+# paths (docs and comments cite them); each is a module of tests/contract.rs.
+[[test]]
+name = "contract"
+path = "tests/contract.rs"
 
 # NO DEPENDENCIES, AND THIS IS LOAD-BEARING — not taste.
 #

@@ -5,16 +5,10 @@
 //! Callback types and infrastructure for terminal events.
 //!
 //! Callback type aliases live in the `aterm-types` crate.
-//! This module re-exports them, normalizes protocol events for callback
-//! consumers, and keeps crate-internal sink adapters (Part of #5663 Phase 2).
+//! This module re-exports them and keeps crate-internal sink adapters.
 
 pub use aterm_types::ColorChangeOp;
 use aterm_types::Rgb;
-pub use aterm_types::callback_events::{SshConductorCallbackEvent, TmuxCallbackEvent};
-
-// ----------------------------------------------------------------------------
-// Re-export callback type aliases from aterm-types (Part of #5663 Phase 2)
-// ----------------------------------------------------------------------------
 
 pub(super) use aterm_types::{
     AdvancedNotificationCallback, ClipboardCallback, NotificationCallback, WindowCallback,
@@ -24,10 +18,8 @@ pub(super) use aterm_types::{
 // Crate-internal callback types (depend on aterm-core modules)
 // ----------------------------------------------------------------------------
 
-/// Target of a dynamic color change (OSC 10-19, palette).
-///
-/// Replaces the magic `u8` indices previously used in color change callbacks.
-/// See [`ColorChangeCallback`] for callback signature.
+/// Target of a dynamic color change (OSC 10-19, palette). See
+/// [`ColorChangeCallback`] for the callback signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ColorTarget {
@@ -49,38 +41,26 @@ pub enum ColorTarget {
 /// 104, 110-112, 117, and 119).
 pub(super) type ColorChangeCallback = Box<dyn FnMut(ColorTarget, Rgb, ColorChangeOp) + Send>;
 
-/// Callback type for dynamic color queries (OSC 10/11/12 with `?`).
-///
-/// Called when an application queries the terminal's foreground, background, or
-/// cursor color. The callback receives the [`ColorTarget`] and may return an
-/// override `Rgb` value to use in the response instead of the terminal's
-/// internal palette. Returning `None` uses the palette color.
+/// Callback type for dynamic color queries (OSC 10/11/12 with `?`): `Some`
+/// overrides the palette color in the reply, `None` keeps it.
 pub(super) type ColorQueryCallback = Box<dyn FnMut(ColorTarget) -> Option<Rgb> + Send>;
 
 // ----------------------------------------------------------------------------
 // Constants
 // ----------------------------------------------------------------------------
 
-/// Global maximum DCS memory budget (10 MB).
-///
-/// This limits total memory used by all active DCS operations across the terminal.
-/// If exceeded, new DCS data is silently dropped until existing operations complete.
-/// Enforced in `handler_dcs.rs` via `dcs.total_bytes` tracking.
+/// Most bytes all active DCS operations may hold (`dcs.total_bytes`); past it
+/// new DCS data is dropped until existing operations complete. Enforced in
+/// `handler_dcs.rs` and `handler_actions.rs`.
 pub(super) const MAX_DCS_GLOBAL_BUDGET: usize = 10 * 1024 * 1024;
 
-/// Maximum depth of the title stack.
-///
-/// Prevents unbounded memory growth from malicious sequences.
+/// Maximum depth of the title stack, so hostile pushes cannot grow memory
+/// without bound (likewise the two stacks below).
 pub(super) const TITLE_STACK_MAX_DEPTH: usize = 10;
 
-/// Maximum depth of the SGR attribute stack (XTPUSHSGR/XTPOPSGR).
-///
-/// Prevents unbounded memory growth from malicious sequences.
-/// Same depth as xterm's implementation.
+/// Maximum depth of the SGR attribute stack (XTPUSHSGR/XTPOPSGR), as in xterm.
 pub(super) const SGR_STACK_MAX_DEPTH: usize = 10;
 
-/// Maximum depth of the color stack (OSC 30001/30101 - Kitty protocol).
-///
-/// Prevents unbounded memory growth from malicious sequences.
-/// Kitty specifies minimum 16 entries; we use exactly 16.
+/// Maximum depth of the Kitty color stack (OSC 30001/30101): the protocol's
+/// minimum of 16.
 pub(super) const COLOR_STACK_MAX_DEPTH: usize = 16;

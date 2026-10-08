@@ -4,10 +4,10 @@
 //! Tier-1 conformance for the presented-destination capture lifecycles.
 //!
 //! The tests drive the pure transition gates used by the shipping GPU taps,
-//! project each decision onto the corresponding Rust-derived model, and require
-//! its exact deterministic successor. Explicit old-behavior mutants prove that
-//! failed maps cannot publish pixels/leak slots and accepted invalid metadata
-//! cannot disappear without incrementing `dropped`.
+//! project each decision onto the Rust-derived model, and require its exact
+//! successor. Mutant controls show a failed map cannot publish pixels or leak
+//! a slot, and accepted invalid metadata cannot vanish without incrementing
+//! `dropped`.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -156,8 +156,8 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
         None
     );
 
-    // NEGATIVE CONTROL: the old fail-open decision published a frame on map
-    // failure. It is not the modeled successor and violates the proof invariant.
+    // Negative control: a fail-open decision publishing a frame on map failure
+    // is not the modeled successor and violates the invariant.
     let mut fail_open = map_error;
     fail_open.insert("result", 1);
     assert!(
@@ -171,8 +171,8 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
         "negative control must expose a frame without a successful map"
     );
 
-    // NEGATIVE CONTROL: the reject arm copied from EnqueueValid. Projected like
-    // any shipping decision, it reserves the staging buffer with no copy.
+    // Negative control: a reject arm copied from EnqueueValid reserves the
+    // staging buffer with no copy.
     let copied_arm = project_presented(
         &initial,
         PresentedFrameEvent::RejectEnqueue,
@@ -188,7 +188,7 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
     );
     assert!(!model.check_invariant("ReservedPhaseRequiresAcceptedCopy", &copied_arm));
 
-    // NEGATIVE CONTROL: a failed map whose arm forgot its outcome ends the
+    // Negative control: a failed map whose arm forgot its outcome ends the
     // one-shot with no error for the waiter to take.
     let silent = project_presented(
         &in_flight,
@@ -299,7 +299,7 @@ fn video_slot_shipping_gate_conforms_and_invalid_metadata_is_counted() {
         None
     );
 
-    // NEGATIVE CONTROL 1: map failure counted a loss but leaked the slot.
+    // Negative control 1: map failure counted a loss but leaked the slot.
     let mut leaked = failed_free.clone();
     leaked.insert("phase", 2);
     assert!(
@@ -311,9 +311,8 @@ fn video_slot_shipping_gate_conforms_and_invalid_metadata_is_counted() {
         "negative control must expose the slot leak"
     );
 
-    // NEGATIVE CONTROL 2: accepted invalid metadata disappeared as though it had
-    // been client decimation, so coverage was understated — also after a map
-    // error the take had already counted.
+    // Negative control 2: accepted invalid metadata disappears as client
+    // decimation, understating coverage (also after a counted map error).
     for before in [initial, failed_free] {
         let mut silent_invalid = before.clone();
         silent_invalid.insert("invalid", 1);
@@ -386,9 +385,8 @@ fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     assert_eq!((state["store_first"], state["store_second"]), (2, 3));
     assert_eq!(state["evicted"], 1);
 
-    // NEGATIVE CONTROLS: the same arrival through the push written wrong, one
-    // line each, projected exactly like the shipping one. Each lands on no
-    // model successor and is refused by its own law.
+    // Negative controls: the same arrival through a push with one wrong line
+    // each lands on no model successor and is refused by its own law.
     let three = model.successors("HarvestThree", &model.init_state())[0].clone();
     let one = model.successors("HarvestOne", &three)[0].clone();
 

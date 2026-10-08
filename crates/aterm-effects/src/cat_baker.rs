@@ -1,42 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The sparkle-words v2 **CatBaker** (docs/sparkle-words-v2-design.md §5.3–§5.5):
-//! bakes full-color RGBA peeking cats at EXACT destination pixel size — the
-//! NEAREST-1:1 contract of the `cat_quads` render stream — into one
-//! `SceneAtlas`-compatible texture, using `aterm-scene`'s [`Tile`] rasterizer
-//! (the same 4×4-supersampled coverage the scene sprites bake with).
+//! The `CatBaker`: bakes full-colour RGBA tiles at exact destination pixel size
+//! (the nearest-1:1 contract of the `cat_quads` render stream) into one
+//! `SceneAtlas`-compatible texture shared by the word cats, the animals, the
+//! kitty cursor, the pet, the dog and Robi. Rasterized with `aterm-scene`'s
+//! [`Tile`] filler (4×4-supersampled coverage).
 //!
-//! * **Key** (§5.5): `(art-relevant gkey bits, magic class, pose, eyes_frame,
-//!   W, Hart)`. `eyes_frame ∈ {open, closed, twitch}` plus the 3 Fortune wave
-//!   frames and the 2 v2.2 Butterfly flutter frames; the **open and twitch
-//!   bakes are iris-only** — pupils become live quads in the gaze stage —
-//!   with a pupil + catch-light patch baked at this identity's exact pupil
-//!   size into the v2.2 [`PATCH_STRIP`] x-strip at `(W, 0)` of the same tile,
-//!   in the same pass (§5.8 texel provenance; body quads sample only
-//!   `[ax, ax + W)`, so no reveal state can ever show the strip).
-//! * **Cache**: LRU by last-used frame over `slots = min(32, ⌊1 MiB /
-//!   slot_bytes⌋)` slots with `slot_bytes = (4·ch)·ch·4` — the 1 MiB bound is
-//!   structural at ANY cell height, never assumed. ≤ 2 bakes per frame (the
-//!   entrance tolerates the delay; a screen of new cats fills over a few
-//!   frames at near-zero reveal height).
-//! * **Invalidation**: wholesale clear + version bump on cell-metric change
-//!   (detected in [`CatBaker::begin_frame`]) and on config reload / toggle
+//! * **Tiles**: authored glyphs (`cat_glyphs_gen::GLYPHS`) keyed by
+//!   [`BakeKeyV4`] with genome-driven fills and a context-contrast outline, or
+//!   host-authored RGBA via [`CatBaker::host_tile`]. Each tile is baked
+//!   `W + PATCH_STRIP` wide; quads sample only `[ax, ax + W)`.
+//! * **Cache**: LRU by last-used frame over `slots = min(32, ⌊2 MiB /
+//!   slot_bytes⌋)`, so the memory bound holds at any cell height. At most
+//!   [`MAX_BAKES_PER_FRAME`] bakes per frame; a miss retries next frame.
+//! * **Invalidation**: wholesale clear and version bump on a cell-metric change
+//!   (detected in [`CatBaker::begin_frame`]) and on config reload or toggle
 //!   (`WordDecorations::reset` → [`CatBaker::clear`]).
-//!
-//! Art is the sparkle-words **v3 kawaii style contract** (v3 design §2.1) over
-//! the v2 mechanics (§2.2): bold warm-near-black outlines (`max(2, ch/9)` px,
-//! 1 px snapped at small cells; interiors 0.7×) replacing the v2 rim-light
-//! system, a wider rounded face with rounded-tri ears + tip discs, big round
-//! PUPIL **button eyes** with a dark-coat rescue (forced iris ring + belly
-//! rim), the gaze catch-light living in the patch strip (a white dot the gaze
-//! stage drifts — open bakes keep only a static 1 px sparkle), rose nose + ω
-//! mouth + outline-color whiskers + blush, the 8 pattern classes redrawn
-//! inside the outline + the longhair ruff (gkey bits 55–56 == 3), the 3-bit
-//! expression field (gkey bits 52–54: Normal / HappyClosed / Wink / Grumpy),
-//! and the rare accessories (Bow / Sunglasses / WitchHat / Crown — magic-word
-//! window, plain cats only). Fortune / Nebula / Butterfly / Sakura keep their
-//! v2 recipes under the new outline system.
 
 use std::sync::Arc;
 
@@ -49,19 +29,14 @@ use crate::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
 
 /// Structural slot ceiling (§5.5): the LRU never exceeds 32 tiles.
 pub const MAX_SLOTS: usize = 32;
-/// Structural memory ceiling for the whole atlas (§5.5): 2 MiB at any cell
-/// size. v2.9 (2-band head): the tile grew from `ch` to `2·ch` rows tall (the
-/// head now spans rows r−2, r−1 and the chin slice in r), doubling
-/// `slot_bytes`; the bound is raised 1 → 2 MiB so the slot count stays 32
-/// across the whole working range (ch ≤ 40) and degrades gracefully above it.
+/// Structural memory ceiling for the whole atlas: 2 MiB at any cell size. Slots
+/// are `2·ch` rows tall, so this keeps 32 slots up to `ch = 40` and fewer above.
 pub const MAX_ATLAS_BYTES: usize = 2 << 20;
 /// Bake-rate cap (§5.5): at most 2 tiles baked per presented frame.
 pub const MAX_BAKES_PER_FRAME: u32 = 2;
 
-/// v2.2 pupil-patch x-strip (§5.5): every tile is baked `W + PATCH_STRIP`
-/// texels wide — the art occupies x ∈ [0, W) and the reserved gaze catch-light
-/// dot is baked at `(W, 0)`, horizontally OUTSIDE every sampled quad (quads
-/// sample only `[ax, ax + W)`), so no reveal state can ever expose it.
+/// Every tile is baked `W + PATCH_STRIP` texels wide: art in `[0, W)` and a
+/// catch-light dot at `(W, 0)`, outside every sampled quad.
 pub const PATCH_STRIP: u16 = 4;
 
 /// A resolved cache hit: where the tile lives in the baker's atlas.
@@ -73,15 +48,18 @@ pub struct CatTile {
     pub ay: u16,
 }
 
-/// What a [`CatBaker`] atlas slot holds — the cat-art v4 authored-glyph key
-/// ([`BakeKeyV4`]).
+/// What a [`CatBaker`] atlas slot holds.
 struct Slot {
-    key: BakeKeyV4,
+    key: SlotKey,
     last_used: u64,
-    /// `Some(id)` for a HOST-authored tile ([`CatBaker::host_tile`], e.g. the
-    /// kitty cursor) rather than a generated cat: keyed by `id`, not by `key`, so
-    /// the two key spaces never alias in the shared atlas.
-    host: Option<u64>,
+}
+
+/// A slot's identity: a generated cat's glyph key or the stable id of a
+/// host-authored tile ([`CatBaker::host_tile`]); the two never alias.
+#[derive(Clone, Copy, PartialEq)]
+enum SlotKey {
+    Cat(BakeKeyV4),
+    Host(u64),
 }
 
 /// Host-side LRU bake cache + the published `Arc<SceneAtlas>` (§5.5).
@@ -89,19 +67,6 @@ struct Slot {
 pub struct CatBaker {
     cell_w: u16,
     cell_h: u16,
-    /// Free-overlay Phase 3 (FREE_OVERLAY_LAYER_DESIGN §7 / v3 §5): publish
-    /// EXACT-SIZE tiles — `(W + PATCH_STRIP) × Hart` with the art at tile top
-    /// (row 0) — instead of the legacy v2.9 `2·ch`-tall band tile whose art
-    /// occupies the bottom `Hart` rows. The rasterization itself stays in the
-    /// one proven `2·ch` frame; the exact-size tile is CUT from it at blit
-    /// time (art rows shifted up by `2·ch − Hart`, the patch x-strip kept at
-    /// its `(W, 0)` anchor), so the stored texels are byte-identical to the
-    /// legacy bake's revealed rows by construction. The slot band stays
-    /// `2·ch` tall (`Hart = round(1.7·ch) ≤ 2·ch`), so the atlas layout, slot
-    /// count, and memory bound are unchanged. Flipped via
-    /// [`CatBaker::set_free_tiles`], which wholesale-clears on change (the
-    /// two shapes must never alias in one atlas).
-    free_tiles: bool,
     /// Slot (and atlas) width: `4·ch` — the §5.2 `W ≤ 4·ch` cap made structural.
     slot_w: u16,
     /// `min(32, ⌊1 MiB / slot_bytes⌋)` occupied-or-free slots, single column.
@@ -114,21 +79,17 @@ pub struct CatBaker {
     /// The last published snapshot; rebuilt only when `dirty` (≤ 2 bakes/frame
     /// transient — zero steady-state allocation).
     published: Option<Arc<SceneAtlas>>,
-    /// The snapshot published BEFORE [`CatBaker::published`], kept so the next
-    /// dirty publish can recycle its buffer instead of cloning the whole atlas
-    /// (see [`CatBaker::atlas`]). A consumer that keeps only the newest snapshot
-    /// (the renderer's `ensure_free_atlas` holds exactly one) has released this
-    /// one by the time it is reused, so `Arc::get_mut` succeeds; if anything is
-    /// still holding it the publish falls back to today's full clone. Invariant:
-    /// `spare.is_some()` implies `published.is_some()` (it is only ever filled
-    /// from `published`), so [`CatBaker::clear`]'s already-empty early-out stays
-    /// exact.
+    /// The snapshot published before [`CatBaker::published`], kept so the next
+    /// dirty publish can recycle its buffer instead of cloning the atlas. A
+    /// consumer that keeps only the newest snapshot has released it by then, so
+    /// `Arc::get_mut` succeeds; otherwise the publish falls back to a full clone.
+    /// Invariant: `spare.is_some()` implies `published.is_some()`, which keeps
+    /// [`CatBaker::clear`]'s empty early-out exact.
     spare: Option<Arc<SceneAtlas>>,
     dirty: bool,
-    /// Per-slot write stamp: the `version` this slot's band in `rgba` was last
-    /// baked at, parallel to `slots`. A recycled snapshot carries the `version`
-    /// its bytes were synced at, so every band stamped ABOVE that is exactly the
-    /// set of bands that have changed since — the rest are already byte-equal.
+    /// Per-slot write stamp (parallel to `slots`): the `version` this slot's
+    /// band in `rgba` was last baked at. Bands stamped above a recycled
+    /// snapshot's synced `version` are exactly the ones that changed.
     slot_version: Vec<u64>,
     /// LRU clock, advanced once per tick by [`CatBaker::begin_frame`].
     clock: u64,
@@ -136,11 +97,9 @@ pub struct CatBaker {
 }
 
 impl CatBaker {
-    /// The §5.5 structural slot count for a cell height: `min(32, ⌊2 MiB /
-    /// ((4·ch)·(2·ch)·4)⌋)`, floored at 1 so a pathological cell size still
-    /// bakes. v2.9: the slot is now `2·ch` rows tall (the 2-band head), so
-    /// `slot_bytes = (4·ch)·(2·ch)·4 = 32·ch²`; at ch = 40 that is 51.2 KB and
-    /// 2 MiB still holds 32 slots (§5.5).
+    /// Structural slot count for a cell height: `min(32, ⌊2 MiB / (32·ch²)⌋)`
+    /// (slot is `4·ch` wide, `2·ch` tall, RGBA), floored at 1 so a pathological
+    /// cell size still bakes.
     pub fn slot_count(cell_h: u16) -> usize {
         let ch = usize::from(cell_h.max(1));
         let slot_bytes = (4 * ch) * (2 * ch) * 4;
@@ -174,21 +133,8 @@ impl CatBaker {
         }
     }
 
-    /// Select the free-overlay EXACT-SIZE tile shape (see
-    /// [`CatBaker::free_tiles`]) vs the legacy `2·ch` band tile. Wholesale
-    /// clear + version bump on an actual flip — cached tiles of the other
-    /// shape would be sampled at the wrong y origin. Idempotent per frame
-    /// (the emitter calls it every tick with the config flag).
-    pub fn set_free_tiles(&mut self, free: bool) {
-        if self.free_tiles != free {
-            self.clear();
-            self.free_tiles = free;
-        }
-    }
-
-    /// Wholesale clear + version bump (config reload / toggle / metric change).
-    /// A no-op when already empty, so the per-frame master-off `reset()` path
-    /// costs nothing.
+    /// Wholesale clear and version bump (config reload, toggle, metric change).
+    /// A no-op when already empty, so the per-frame master-off `reset()` is free.
     pub fn clear(&mut self) {
         if self.slots.iter().all(Option::is_none) && self.published.is_none() {
             return;
@@ -211,35 +157,27 @@ impl CatBaker {
     }
 
     /// The LRU / bake-budget frame clock, advanced once per
-    /// [`begin_frame`](CatBaker::begin_frame). Diagnostic: it is how a host
-    /// that ticks several panes into ONE presented frame proves the two-bake
-    /// budget stayed per-FRAME instead of multiplying with the pane count.
+    /// [`begin_frame`](CatBaker::begin_frame). Diagnostic: lets a host ticking
+    /// several panes into one frame check the bake budget stays per-frame.
     #[doc(hidden)]
     #[cfg(test)]
     pub fn frame_clock(&self) -> u64 {
         self.clock
     }
 
-    /// The published atlas snapshot, rebuilt lazily after any bake. `None`
-    /// until the first bake (and after [`CatBaker::clear`]) — cat-free frames
-    /// carry no atlas (byte-identical off).
+    /// The published atlas snapshot, rebuilt lazily after any bake. `None` until
+    /// the first bake and after [`CatBaker::clear`]: cat-free frames carry no atlas.
     pub fn atlas(&mut self) -> Option<Arc<SceneAtlas>> {
         if self.dirty {
             let width = u32::from(self.slot_w);
             // v2.9 (2-band head): each slot band is `2·ch` rows tall.
             let height = (self.slots.len() * 2 * usize::from(self.cell_h)) as u32;
             let band = 2 * usize::from(self.cell_h) * usize::from(self.slot_w) * 4;
-            // Steady-state publish: recycle the buffer published two frames ago
-            // and patch ONLY the slot bands baked since it was last synced. The
-            // published bytes are IDENTICAL to the full clone below — `rgba` is
-            // written in exactly two places (the `get_v4` / `host_tile` bake
-            // blits, each of which rewrites one whole band and stamps it) plus
-            // `clear`, which drops both snapshots — so a band whose stamp is at
-            // or below the buffer's own synced `version` still holds byte-equal
-            // texels. Width, height and the byte count never move (only `clear`
-            // / a metric change resize `rgba`, and both drop the buffers), so
-            // nothing downstream of the atlas sees anything but the same pixels
-            // it would have seen from a fresh clone.
+            // Recycle the buffer published two frames ago and patch only the
+            // slot bands baked since it was synced. The result equals a full
+            // clone: `rgba` is written only by `install` (one whole band,
+            // stamped) and `clear` (which drops both snapshots), and its size
+            // changes only on `clear` or a metric change.
             let spare = self.spare.take();
             let recycled = spare.and_then(|mut arc| {
                 let synced = arc.version;
@@ -284,14 +222,11 @@ impl CatBaker {
         self.published.clone()
     }
 
-    /// cat-art v4 (design §2): look up a [`BakeKeyV4`] authored-glyph tile,
-    /// baking on a miss when the per-frame budget allows. The generated tile is
-    /// baked exact-size (`w + PATCH_STRIP` wide, `h` tall, art at row 0 via
-    /// [`bake_variant_with`]) and blitted at the slot origin so the free-overlay
-    /// sprite path samples it with the art top at atlas row `i·2·ch`. The authored
-    /// glyph bakes its own eyes + catch-light, so there is no live pupil patch.
-    /// `None` = budget exhausted / degenerate metrics — the caller retries next
-    /// frame (§5.5).
+    /// Look up a [`BakeKeyV4`] glyph tile, baking on a miss when the per-frame
+    /// budget allows. The tile is baked `w + PATCH_STRIP` wide, `h` tall, art at
+    /// row 0 (via [`bake_variant_with`]), and blitted at the slot origin (atlas
+    /// row `i·2·ch`). `None` means budget exhausted or degenerate metrics; the
+    /// caller retries next frame.
     pub fn get_v4(&mut self, key: &BakeKeyV4) -> Option<CatTile> {
         // The whole baked tile is `key.w + PATCH_STRIP` wide and must fit the slot.
         if self.cell_h == 0
@@ -307,79 +242,92 @@ impl CatBaker {
         if key.h == 0 || usize::from(key.h) > slot_h {
             return None;
         }
-        if let Some(i) = self.slots.iter().position(|s| {
-            s.as_ref()
-                .is_some_and(|s| s.host.is_none() && s.key == *key)
-        }) {
-            let slot = self.slots[i].as_mut().expect("position() found it");
-            slot.last_used = self.clock;
-            return Some(CatTile {
-                ax: 0,
-                ay: (i * slot_h) as u16,
-            });
+        let slot_key = SlotKey::Cat(*key);
+        if let Some(tile) = self.touch(slot_key) {
+            return Some(tile);
         }
+        let i = self.bake_slot()?;
+        // Bake the authored tile exact-size (art at row 0, catch-light in the strip).
+        let tile = key.bake();
+        let tw = tile.width() as usize; // == key.w + PATCH_STRIP
+        Some(self.install(i, slot_key, tile.pixels(), tw, usize::from(key.h)))
+    }
+
+    /// The cache hit: find `key`'s slot and stamp it used this frame (the LRU
+    /// touch), returning its atlas placement.
+    fn touch(&mut self, key: SlotKey) -> Option<CatTile> {
+        let slot_h = 2 * usize::from(self.cell_h);
+        let (i, slot) = self
+            .slots
+            .iter_mut()
+            .enumerate()
+            .find_map(|(i, s)| s.as_mut().filter(|s| s.key == key).map(|s| (i, s)))?;
+        slot.last_used = self.clock;
+        Some(CatTile {
+            ax: 0,
+            ay: (i * slot_h) as u16,
+        })
+    }
+
+    /// Spend one bake from this frame's budget and pick the slot to bake into:
+    /// a free slot first, else the least-recently-used (lowest index on ties).
+    /// A refused pick still spends the bake.
+    ///
+    /// Never a slot already served this frame: its tile is already queued as a
+    /// quad at that `(ax, ay)`, and re-baking would make that quad draw the new
+    /// art. `last_used == self.clock` means served since `begin_frame`. Refusal
+    /// yields `None`, which callers read as "retry next frame".
+    fn bake_slot(&mut self) -> Option<usize> {
         if self.bakes_left == 0 {
             return None;
         }
         self.bakes_left -= 1;
-        // Free slot first; else evict the least-recently-used (lowest index
-        // tiebreak — deterministic).
-        //
-        // NEVER A SLOT ALREADY SERVED THIS FRAME. One atlas is published per
-        // frame, so a tile handed out earlier in THIS frame is already queued
-        // as a quad pointing at that `(ax, ay)`; re-baking over it makes that
-        // quad sample the new art and the caller draws a sprite it never
-        // asked for. `last_used == self.clock` is exactly "served since the
-        // last `begin_frame`". Refusing yields `None`, which every caller
-        // already reads as "retry next frame" behind its last-good tile.
-        let i = self.slots.iter().position(Option::is_none).or_else(|| {
+        self.slots.iter().position(Option::is_none).or_else(|| {
             self.slots
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| s.as_ref().is_none_or(|s| s.last_used != self.clock))
                 .min_by_key(|(idx, s)| (s.as_ref().map_or(0, |s| s.last_used), *idx))
                 .map(|(idx, _)| idx)
-        })?;
-        // Bake the authored tile exact-size (art at row 0, catch-light in the strip).
-        let tile = key.bake();
-        let tw = tile.width() as usize; // == key.w + PATCH_STRIP
+        })
+    }
+
+    /// Blit `rows` rows of a `tw`-texel-wide RGBA tile into slot `i`'s `2·ch`
+    /// band (rest zeroed), install `key`, and stamp the band with a fresh version.
+    fn install(&mut self, i: usize, key: SlotKey, src: &[u8], tw: usize, rows: usize) -> CatTile {
+        let slot_h = 2 * usize::from(self.cell_h);
         let atlas_w = usize::from(self.slot_w);
         let y0 = i * slot_h;
-        let stored_rows = usize::from(key.h);
         for row in 0..slot_h {
-            let d = ((y0 + row) * atlas_w) * 4;
+            let d = (y0 + row) * atlas_w * 4;
             self.rgba[d..d + atlas_w * 4].fill(0);
-            if row < stored_rows {
+            if row < rows {
                 let s = row * tw * 4;
-                self.rgba[d..d + tw * 4].copy_from_slice(&tile.pixels()[s..s + tw * 4]);
+                self.rgba[d..d + tw * 4].copy_from_slice(&src[s..s + tw * 4]);
             }
         }
         self.slots[i] = Some(Slot {
-            key: *key,
+            key,
             last_used: self.clock,
-            host: None,
         });
         self.version = self.version.wrapping_add(1);
         if let Some(stamp) = self.slot_version.get_mut(i) {
             *stamp = self.version;
         }
         self.dirty = true;
-        Some(CatTile {
+        CatTile {
             ax: 0,
             ay: y0 as u16,
-        })
+        }
     }
 
-    /// Bake a HOST-AUTHORED straight-alpha RGBA tile into a slot of the SAME
-    /// atlas the cats share, keyed by a stable `host_id` so it bakes once and is
-    /// then a pure cache hit. `rgba` is `w·h·4` bytes, row-major; the tile must
-    /// fit a slot (`w ≤ slot_w`, `h ≤ 2·ch`). Returns the atlas placement
-    /// (`ax = 0`, `ay = slot·2·ch`), or `None` if the baker is uninitialised,
-    /// the tile doesn't fit, or the ≤2-bakes/frame budget is spent (retry next
-    /// frame). Metric changes clear it exactly like a cat tile, so a caller that
-    /// re-paints `rgba` at the new cell scale gets a fresh bake automatically.
-    /// Used by the kitty cursor ([`crate::word_decorations::WordDecorations::kitty_cursor`]),
-    /// whose host-provided sprite ([`crate::kitty_cursor`]) is not a generated glyph.
+    /// Bake a host-authored straight-alpha RGBA tile into the shared atlas,
+    /// keyed by a stable `host_id` so later calls are cache hits. `rgba` is
+    /// `w·h·4` bytes, row-major, and must fit a slot (`w ≤ slot_w`, `h ≤ 2·ch`).
+    /// Returns the placement (`ax = 0`, `ay = slot·2·ch`), or `None` if the baker
+    /// is uninitialised, the tile does not fit, or the frame's bake budget is
+    /// spent. Metric changes clear it like a cat tile. Used by the kitty cursor
+    /// ([`crate::word_decorations::WordDecorations::kitty_cursor`]).
     pub fn host_tile(&mut self, host_id: u64, w: u16, h: u16, rgba: &[u8]) -> Option<CatTile> {
         if self.cell_h == 0 || w == 0 || h == 0 {
             return None;
@@ -391,105 +339,27 @@ impl CatBaker {
         {
             return None;
         }
-        if let Some(i) = self
-            .slots
-            .iter()
-            .position(|s| s.as_ref().is_some_and(|s| s.host == Some(host_id)))
-        {
-            let slot = self.slots[i].as_mut().expect("position() found it");
-            slot.last_used = self.clock;
-            return Some(CatTile {
-                ax: 0,
-                ay: (i * slot_h) as u16,
-            });
+        let slot_key = SlotKey::Host(host_id);
+        if let Some(tile) = self.touch(slot_key) {
+            return Some(tile);
         }
-        if self.bakes_left == 0 {
-            return None;
-        }
-        self.bakes_left -= 1;
-        // Same law as `get_v4`: a slot served THIS frame is already queued as
-        // a quad and may not be re-baked under it.
-        let i = self.slots.iter().position(Option::is_none).or_else(|| {
-            self.slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.as_ref().is_none_or(|s| s.last_used != self.clock))
-                .min_by_key(|(idx, s)| (s.as_ref().map_or(0, |s| s.last_used), *idx))
-                .map(|(idx, _)| idx)
-        })?;
-        let atlas_w = usize::from(self.slot_w);
-        let y0 = i * slot_h;
-        let tw = usize::from(w);
-        let th = usize::from(h);
-        for row in 0..slot_h {
-            let d = (y0 + row) * atlas_w * 4;
-            self.rgba[d..d + atlas_w * 4].fill(0);
-            if row < th {
-                let s = row * tw * 4;
-                self.rgba[d..d + tw * 4].copy_from_slice(&rgba[s..s + tw * 4]);
-            }
-        }
-        // Host slots carry a placeholder key (never matched — the lookup guards
-        // on `host.is_none()`); `host: Some(id)` is the real identity.
-        self.slots[i] = Some(Slot {
-            key: BakeKeyV4 {
-                variant: CatGlyphId::S100,
-                accessory: None,
-                coat: 0,
-                iris: 0,
-                colors: CatColorKey::default(),
-                w: 0,
-                h: 0,
-                eyes: EyesFrame::Open,
-            },
-            last_used: self.clock,
-            host: Some(host_id),
-        });
-        self.version = self.version.wrapping_add(1);
-        if let Some(stamp) = self.slot_version.get_mut(i) {
-            *stamp = self.version;
-        }
-        self.dirty = true;
-        Some(CatTile {
-            ax: 0,
-            ay: y0 as u16,
-        })
+        let i = self.bake_slot()?;
+        Some(self.install(i, slot_key, rgba, usize::from(w), usize::from(h)))
     }
 
-    /// Peek [`CatBaker::host_tile`]'s cache WITHOUT supplying texels: the
-    /// exact hit branch of `host_tile` — same lookup, same `last_used` LRU
-    /// touch (dropping the touch would change which slot a later miss
-    /// evicts, which CAN change a pixel: a still-alive tile silently gone
-    /// for a frame) — returning `None` on a miss instead of baking.
-    ///
-    /// Exists for callers whose tile bytes are EXPENSIVE to produce yet a
-    /// pure function of the id itself (the pet's mote lane in
-    /// [`crate::word_decorations::WordDecorations::pet_cursor`]):
-    /// `host_tile` discards `rgba` on every hit, so pre-baking the bytes
-    /// just to look the slot up is discarded work on every warm frame.
-    /// Peek first; rasterize and call `host_tile` only on the miss. No
-    /// version bump and no bake-budget spend here — both belong exclusively
-    /// to the miss path, exactly as inside `host_tile` today (its hit
-    /// branch touches neither).
+    /// Peek [`CatBaker::host_tile`]'s cache without supplying texels: the same
+    /// lookup and `last_used` touch as its hit branch (the touch affects later
+    /// eviction), returning `None` on a miss. For callers whose bytes are
+    /// expensive but a pure function of the id (the pet's motes in
+    /// [`crate::word_decorations::WordDecorations::pet_cursor`]): peek first and
+    /// rasterize only on a miss. No version bump or budget spend.
     pub fn host_peek(&mut self, host_id: u64) -> Option<CatTile> {
-        // The uninitialised-baker refusal, mirrored from `host_tile`. Also
-        // unreachable-with-a-match in practice: `begin_frame` wholesale-
-        // clears the slots on any metric change, so a zero cell height has
-        // no populated slot for the lookup below to find.
+        // Mirrors `host_tile`'s uninitialised refusal; `begin_frame` clears the
+        // slots on any metric change, so nothing could match anyway.
         if self.cell_h == 0 {
             return None;
         }
-        let slot_h = 2 * usize::from(self.cell_h);
-        let i = self
-            .slots
-            .iter()
-            .position(|s| s.as_ref().is_some_and(|s| s.host == Some(host_id)))?;
-        let slot = self.slots[i].as_mut().expect("position() found it");
-        slot.last_used = self.clock;
-        Some(CatTile {
-            ax: 0,
-            ay: (i * slot_h) as u16,
-        })
+        self.touch(SlotKey::Host(host_id))
     }
 }
 
@@ -516,10 +386,8 @@ pub const COAT_RAMP: [u32; 16] = [
     0x00FA_F4E8,
 ];
 
-/// EYE_RAMP — 16 low-chroma natural stops. The original saturated gold ramp
-/// made large terminal eyes read as glowing or predatory; these hazel, moss,
-/// storm-blue, and rose-grey tones keep the iris visible without becoming the
-/// entire expression (§5.3; `eyes` samples 8 positions `ord/7` along it).
+/// Sixteen low-chroma natural iris stops (hazel, moss, storm blue, rose grey),
+/// visible without dominating the expression; `eyes` samples 8 at `ord/7`.
 pub const EYE_RAMP: [u32; 16] = [
     0x007A_5146,
     0x0087_5D50,
@@ -541,10 +409,9 @@ pub const EYE_RAMP: [u32; 16] = [
 
 const CATCH_LIGHT: u32 = 0x00FF_FFFF;
 
-// Cursor-head reflection LOD. The authored catch-light remains the primary art
-// direction; these device-sized passes make it survive the ~31 px settings/
-// shipping bake and add one quiet lower echo. Large heads stay restrained by
-// the radius ceilings, while truly tiny word cats keep their authored pixels.
+// Cursor-head reflection LOD: device-sized passes that keep the authored
+// catch-light visible at the ~31 px bake and add a quiet lower echo. Radius
+// ceilings restrain large heads; tiny word cats keep their authored pixels.
 const OPEN_EYE_REFLECTION_MIN_PX: f32 = 3.0;
 /// Authored eyes flatter than this are arcs/lids, not open pupils. Keep their
 /// existing catch-light art, but never synthesize a glossy pupil pass over it.
@@ -554,13 +421,13 @@ const OPEN_EYE_PRIMARY_MIN_RADIUS_PX: f32 = 0.62;
 const OPEN_EYE_PRIMARY_MAX_RADIUS_PX: f32 = 1.08;
 const OPEN_EYE_ECHO_MIN_PX: f32 = 4.5;
 const OPEN_EYE_ECHO_FRAC: f32 = 0.075;
-// A pixel-centred 4x4 sample's far corner is ~0.53 px away. Clearing that
-// distance gives the echo one genuinely pale centre texel instead of four
-// weak gray flecks, while the ceiling keeps it subordinate at large sizes.
+// A pixel-centred 4x4 sample's far corner is ~0.53 px away; clearing it gives
+// the echo one pale centre texel instead of four grey flecks.
 const OPEN_EYE_ECHO_MIN_RADIUS_PX: f32 = 0.55;
 const OPEN_EYE_ECHO_MAX_RADIUS_PX: f32 = 0.72;
 
-fn rgb(hex: u32) -> (f32, f32, f32) {
+/// Unpack an authored `0x00RR_GGBB` fill into `0..=1` float channels.
+pub(crate) fn rgb(hex: u32) -> (f32, f32, f32) {
     (
         ((hex >> 16) & 0xff) as f32 / 255.0,
         ((hex >> 8) & 0xff) as f32 / 255.0,
@@ -568,13 +435,10 @@ fn rgb(hex: u32) -> (f32, f32, f32) {
     )
 }
 
-/// Paint a supersampled reflection disc, but only over an already-opaque dark
-/// eye texel covered by `eye_mask`. This is the hard containment seam shared by
-/// the flying head and resident pet: a reflection can replace dark eye/pupil
-/// ink, never a dark coat or outline merely because it happens to share the
-/// same colour range. The differential tests independently rasterize the eye
-/// geometry and prove every changed texel has coverage, including anti-aliased
-/// boundary texels.
+/// Paint a supersampled reflection disc only over opaque dark eye texels
+/// covered by `eye_mask`, so a reflection never lands on a dark coat or outline
+/// of similar colour. Shared by the flying head and the resident pet; tests
+/// rasterize the eye geometry independently and check every changed texel.
 pub(crate) fn paint_dark_masked_disc(
     tile: &mut Tile,
     eye_mask: &Tile,
@@ -589,11 +453,8 @@ pub(crate) fn paint_dark_masked_disc(
     }
     debug_assert_eq!(tile.width(), eye_mask.width());
     debug_assert_eq!(tile.height(), eye_mask.height());
-    // Catch-lights this small are visual punctuation, not soft shading. Snap
-    // their centre to a device pixel so the 4x4 coverage pass leaves one crisp
-    // high point instead of distributing the same energy over four gray
-    // pixels. The dark-eye destination mask below still provides the hard
-    // silhouette boundary.
+    // Snap tiny catch-lights to a device pixel so the 4x4 pass leaves one crisp
+    // high point rather than four grey pixels.
     let cx = cx.floor() + 0.5;
     let cy = cy.floor() + 0.5;
     let rr = r * r;
@@ -635,33 +496,29 @@ pub(crate) fn paint_dark_masked_disc(
 
 // ═══════════════════════════ cat-art v4 bake path ═══════════════════════════
 //
-// Additive to the procedural baker above (docs/cat-art-v4-design.md §2): semantic
-// reference glyphs (`cat_glyphs_gen::GLYPHS`) rasterized by the `aterm-scene` vector
-// filler, with genome-driven fills, a pale outline lift on dark backgrounds, and no
-// paws. Built ALONGSIDE the procedural path — the old baker/genome/word_decorations
-// stay live until the Cleanup phase.
+// Authored glyphs (`cat_glyphs_gen::GLYPHS`) rasterized by the `aterm-scene`
+// vector filler with genome-driven fills and a pale outline lift on dark
+// backgrounds (docs/cat-art-v4-design.md §2).
 
 /// v4 §2.1 pale outline lift for the darkest background-luminance band.
 pub const OUTLINE_PALE: u32 = 0x00F4_E6DD;
 
-// Eye ink is selected once per resolved fill set. The authored ink remains the
-// default; these two restrained anchors are only used when it would disappear
-// into a recolored coat.
+// Eye ink is chosen once per resolved fill set: the authored ink by default,
+// these anchors only when it would disappear into a recoloured coat.
 const EYE_INK_DARK: u32 = 0x0018_1520;
 const EYE_INK_PALE: u32 = 0x00FF_F2E8;
 const MIN_EYE_CONTRAST: f32 = 3.0;
 
-/// Quantized local terminal palette carried in every cat bake key. Twelve hue
-/// families plus neutral, crossed with four uniform background-luminance bands
-/// and one dark+light mixed class, bound the context surface to 65 possibilities
-/// instead of fragmenting the atlas on arbitrary 24-bit cell colors.
+/// Quantized local terminal palette carried in every cat bake key: twelve hue
+/// families plus neutral, crossed with four background-luminance bands and one
+/// mixed class, so the atlas sees at most 65 contexts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CatColorKey {
     /// `0..=11` = 30-degree hue family, `12` = neutral foreground.
     pub accent: u8,
-    /// Background WCAG-luminance band, darkest `0` through lightest `3`; `4`
-    /// means the sampled footprint spans both sides of the crossover and uses
-    /// the dual pale-underlay/dark-keyline treatment.
+    /// Background WCAG-luminance band, darkest `0` to lightest `3`; `4` means
+    /// the footprint spans the crossover and gets the dual underlay/keyline
+    /// treatment.
     pub background: u8,
 }
 
@@ -688,19 +545,17 @@ impl CatColorKey {
         let accent = if s < 0.12 {
             12
         } else {
-            // Round to the nearest 30-degree family. Adding half a bucket
-            // before the modulo also closes the red seam: 359° and 1° share
-            // family 0 instead of fragmenting into opposite ends of the key.
+            // Round to the nearest 30° family; the half-bucket offset makes 359°
+            // and 1° share family 0.
             (((h + 15.0) / 30.0).floor() as u8) % 12
         };
         let background = background_band(background);
         Self { accent, background }
     }
 
-    /// Resolve the same bounded key while retaining one bit of footprint
-    /// structure lost by RGB averaging. A span that crosses the dark/light
-    /// outline boundary uses the mixed class; uniform spans remain byte-exact
-    /// with [`Self::from_rgb`].
+    /// Like [`Self::from_rgb`], plus one bit of footprint structure that RGB
+    /// averaging loses: a span crossing the dark/light outline boundary gets
+    /// the mixed class. Uniform spans match `from_rgb` exactly.
     #[must_use]
     pub fn from_rgb_span(
         background: u32,
@@ -710,16 +565,12 @@ impl CatColorKey {
         max_background_band: u8,
     ) -> Self {
         let mut key = Self::from_rgb(background, foreground, surrounding);
-        // The mixed (dual pale-underlay/dark-keyline) treatment applies when
-        // the averaged background has left the darkest band, OR when the span
-        // contains a genuinely BRIGHT (band 3) region — the callers average
-        // gamma-space bytes, so a black footprint can hide a sizeable white
-        // strip inside a "band 0" average, and a pale outline would vanish
-        // over it (the dual treatment carries ≥3:1 on both halves). What a
-        // decisively dark average DOES veto is the mixed class for mere
-        // mid-luminance clips: freezing the dark-keyline mix for a whole
-        // flight over a dark terminal drew the cat as an outline-less dark
-        // blob (the "kitty looks too dark" report).
+        // Use the mixed treatment when the averaged background left the darkest
+        // band, or when the span holds a bright (band 3) region: gamma-space
+        // averaging can hide a white strip in a band-0 average, and a pale
+        // outline would vanish over it. A decisively dark average with only
+        // mid-luminance clips keeps the pale outline, so the cat does not turn
+        // into an outline-less dark blob over a dark terminal.
         if (key.background >= 1 || max_background_band.min(3) >= 3)
             && min_background_band.min(3) <= 1
             && max_background_band.min(3) >= 2
@@ -753,9 +604,8 @@ fn background_band(background: u32) -> u8 {
     }
 }
 
-/// Restrained anchors at exact 30-degree hue steps. They tint, rather than
-/// replace, the genome coat; the cat keeps its collectible identity while
-/// belonging to the surrounding terminal palette.
+/// Anchors at 30° hue steps. They tint the genome coat rather than replace it,
+/// so the cat keeps its identity while matching the terminal palette.
 const CONTEXT_ACCENTS: [u32; 13] = [
     0x00E8_6F6F,
     0x00E8_AC6F,
@@ -772,9 +622,9 @@ const CONTEXT_ACCENTS: [u32; 13] = [
     0x0096_98A6,
 ];
 
-/// v4 §2.1 resolved genome fills for one bake: coat, iris, adaptive eye ink,
-/// and a background-contrast outline. Floats are bake-time only;
-/// [`BakeKeyV4`] carries only integer ramp and context indices.
+/// Resolved genome fills for one bake: coat, iris, adaptive eye ink and a
+/// background-contrast outline. Floats are bake-time only; [`BakeKeyV4`]
+/// carries integer ramp and context indices.
 #[derive(Clone, Copy, Debug)]
 pub struct ResolvedFills {
     /// Coat colourway (a [`COAT_RAMP`] stop) applied to `Recolor::Coat` layers.
@@ -802,17 +652,17 @@ impl ResolvedFills {
         Self::from_context(coat, iris, colors)
     }
 
-    /// Resolve genome fills through a bounded local terminal palette. Coat is
-    /// nudged only 12%, preserving identity; iris gets a stronger 28% echo of
-    /// nearby text; outline uses a warm high-contrast base plus a quiet tint.
+    /// Resolve genome fills through the local palette: coat nudged 12%
+    /// (identity kept), iris a 28% echo of nearby text, outline a warm
+    /// high-contrast base plus a quiet tint.
     #[must_use]
     pub fn from_context(coat: u8, iris: u8, colors: CatColorKey) -> Self {
         let accent = CONTEXT_ACCENTS[usize::from(colors.accent.min(12))];
         let coat = COAT_RAMP[usize::from(coat).min(COAT_RAMP.len() - 1)];
         let iris = EYE_RAMP[usize::from(iris).min(EYE_RAMP.len() - 1)];
-        // The light/dark crossover is deliberately at WCAG luminance 0.18.
-        // With the 10% accent tint below, every outline clears 3:1 against
-        // the worst endpoint of its entire quantization band (pinned in tests).
+        // Light/dark crossover at WCAG luminance 0.18: with the 10% accent tint
+        // every outline clears 3:1 against the worst background of its band
+        // (pinned in tests).
         let outline_base = match colors.background {
             0 => OUTLINE_PALE,
             1 => 0x00FF_F2E8,
@@ -821,17 +671,12 @@ impl ResolvedFills {
             4 => EYE_INK_DARK,
             _ => OUTLINE_PALE,
         };
-        // DARK-COAT RESCUE (the body's version of the §2.1 outline lift): on
-        // the DARKEST band a charcoal/black coat is nearly invisible — the
-        // pale outline draws a ring around a void (the "kitty looks too dark"
-        // report). Lift such coats toward a pale same-hue tone until the body
-        // clears the band's backgrounds. Bounded (≤6 bisection steps at bake
-        // time, the §6.5 luminance-bisection idiom) and identity-preserving:
-        // hue is untouched and coats already at/above the floor are bit-exact
-        // — the lift engages only below it. Band 0 and the mixed class only:
-        // band 1's own backgrounds SPAN the floor (0.04..0.18), so lifting
-        // there would converge the coat onto mid-dark themes — on band 1 a
-        // dark coat already reads as a silhouette against the brighter ground.
+        // Dark-coat rescue: on band 0 and the mixed class a charcoal or black
+        // coat would be a void inside its pale outline, so lift it toward a pale
+        // same-hue tone until it clears the floor (at most 6 bisection steps,
+        // hue untouched, coats already above the floor bit-exact). Band 1 is
+        // excluded: its backgrounds span the floor, and a dark coat already
+        // reads as a silhouette there.
         let coat = rgb(mix_rgb(coat, accent, 0.12));
         let coat = if matches!(colors.background, 0 | 4) {
             lift_coat_luminance(coat, COAT_MIN_LUM_DARK_BG)
@@ -861,11 +706,9 @@ fn packed_rgb((r, g, b): (f32, f32, f32)) -> u32 {
     (channel(r) << 16) | (channel(g) << 8) | channel(b)
 }
 
-/// Minimum WCAG relative luminance for a coat BODY over the dark background
-/// bands (0/1/mixed): high enough that the darkest ramp stops read as a dark
-/// grey cat instead of a void (~2.5:1 over a black terminal), low enough that
-/// the collectible still reads as a dark coat. Coats already at/above it are
-/// untouched.
+/// Minimum WCAG relative luminance for a coat body on the dark background
+/// classes: the darkest stops read as a dark grey cat (~2.5:1 over black)
+/// rather than a void. Coats at or above it are untouched.
 const COAT_MIN_LUM_DARK_BG: f32 = 0.10;
 
 /// Component-wise linear mix of two float colours, `t` from a → b.
@@ -877,10 +720,9 @@ fn mix3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32) {
     )
 }
 
-/// Lift `coat` toward a pale same-hue tone until its relative luminance
-/// reaches `floor`. Identity-preserving no-op when the coat is already
-/// at/above the floor; otherwise ≤6 bisection steps at bake time (luminance
-/// is monotone along the mix but gamma-curved, so closed-form t would drift).
+/// Lift `coat` toward a pale same-hue tone until its relative luminance reaches
+/// `floor`; a no-op when already there. At most 6 bisection steps (luminance
+/// is monotone but gamma-curved along the mix).
 fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
     let lum = |c: (f32, f32, f32)| relative_luminance(packed_rgb(c));
     if lum(coat) >= floor {
@@ -905,14 +747,11 @@ fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
     mix3(coat, pale, hi)
 }
 
-/// The coat stop as it resolves on the DARK background classes (bands 0 and
-/// the mixed band 4): `COAT_RAMP[coat]` through [`lift_coat_luminance`] at
-/// [`COAT_MIN_LUM_DARK_BG`] — exactly the rescue `from_context` applies
-/// there, minus the 12 % accent nudge (context-local and identity-
-/// preserving, so it cancels out of any two-coat comparison). Test-only and
-/// crate-private on purpose: it exists so `kitty_registry`'s pinned
-/// `coat_distance` table can be verified against the LIVE lift math without
-/// exporting the lift itself — this baker stays the single colour authority.
+/// The coat stop as it resolves on the dark background classes:
+/// `COAT_RAMP[coat]` lifted to [`COAT_MIN_LUM_DARK_BG`], without the 12% accent
+/// nudge (which cancels out of any two-coat comparison). Test-only, so
+/// `kitty_registry`'s `coat_distance` table can be checked against the live
+/// lift without exporting it.
 #[cfg(test)]
 pub(crate) fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
     let stop = rgb(COAT_RAMP[usize::from(coat).min(COAT_RAMP.len() - 1)]);
@@ -925,21 +764,19 @@ fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-/// v4 §2.1 fill resolution for one glyph layer → its baked `(rgb, alpha)`:
-/// `Recolor::Coat`→the coat colourway, `Recolor::Iris`→the iris stop,
-/// `Recolor::Fixed`→the source `layer.fill` (unpacked `0x00RR_GGBB`). `Outline` and
-/// exterior `Whisker` roles use the context-resolved contrast ink, keyed off the
-/// painter role so it wins over the recolor arm. Layers bake opaque (alpha 1.0);
-/// authored coverage carries the shape.
+/// Fill resolution for one glyph layer to its baked `(rgb, alpha)`:
+/// `Recolor::Coat` → the coat, `Recolor::Iris` → the iris stop,
+/// `Recolor::Fixed` → the source `layer.fill` (`0x00RR_GGBB`). `Outline` and
+/// `Whisker` roles use the context contrast ink, overriding the recolor arm.
+/// Layers bake opaque; authored coverage carries the shape.
 ///
-/// `coat_shade` is forward-compat (no current asset triggers it): when a `CoatShade`
-/// recolor ever appears in the roster it resolves to `mix(coat, #000, 0.28)`.
+/// A `CoatShade` recolor resolves to `mix(coat, #000, 0.28)`; no current asset
+/// uses it.
 #[must_use]
 pub fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, f32), f32) {
-    // Whiskers extend beyond the coat onto the terminal background, so they
-    // need the same context contrast guarantee as the outer silhouette.
-    // Internal face ink stays fixed; lifting eyes/mouth with the outline would
-    // erase expressions on pale coats.
+    // Whiskers reach onto the terminal background, so they need the outline's
+    // contrast guarantee. Internal face ink stays fixed so expressions survive
+    // on pale coats.
     if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {
         return (fills.outline, 1.0);
     }
@@ -968,11 +805,41 @@ fn resolve_glyph_layer(
     }
 }
 
-/// v4 §2 overlay-accessory attachment: the normalized head-frame point where the
-/// accessory glyph's OWN centre `(0.5, 0.5)` lands, plus its size relative to the
-/// head box (~0.4×). Bow → left-ear base, crown → dome crest, bell → collar/chin
-/// (the resolved-blocker overlay set). A non-accessory id centres head-sized
-/// (defensive — callers pass the three `Acc*` ids).
+/// The mixed-background keyline under an outline layer: when
+/// [`ResolvedFills::outline_underlay`] is `Some` (band 4), paint `layer` four
+/// times in the pale ink, nudged one halo band along each axis, before the
+/// caller fills the dark ink on top. Neither ink alone clears 3:1 across such a
+/// footprint; the pair does. The band is clamped sub-pixel so it never reads as
+/// a second outline. Runs only on a cache-miss bake.
+pub(crate) fn paint_outline_halo(
+    tile: &mut Tile,
+    layer: &Layer,
+    fills: &ResolvedFills,
+    alpha: f32,
+    xform: PathTransform,
+) {
+    let Some(underlay) = fills.outline_underlay else {
+        return;
+    };
+    let halo = (xform.scale_x.min(xform.scale_y) * 0.04).clamp(0.75, 1.25);
+    for (dx, dy) in [(halo, 0.0), (-halo, 0.0), (0.0, halo), (0.0, -halo)] {
+        fill_path_fixed(
+            tile,
+            layer.paths,
+            underlay,
+            alpha,
+            PathTransform {
+                dx: xform.dx + dx,
+                dy: xform.dy + dy,
+                ..xform
+            },
+        );
+    }
+}
+
+/// Accessory attachment: the normalized head-frame point where the accessory's
+/// own centre lands, plus its size relative to the head box (~0.4×). Bow →
+/// left-ear base, crown → dome crest, bell → collar. Other ids centre head-sized.
 #[must_use]
 pub fn accessory_attach(acc: CatGlyphId) -> (f32, f32, f32) {
     match acc {
@@ -983,10 +850,8 @@ pub fn accessory_attach(acc: CatGlyphId) -> (f32, f32, f32) {
     }
 }
 
-/// Fit an accessory into its attachment box without changing the authored
-/// viewbox aspect. The attachment scale remains the maximum box fraction; a
-/// wide bow becomes shorter and a tall bell becomes narrower instead of being
-/// stretched to the head's proportions.
+/// Fit an accessory into its attachment box, keeping the authored viewbox
+/// aspect: a wide bow gets shorter, a tall bell narrower.
 fn accessory_transform(acc: CatGlyphId, w: u32, h: u32) -> PathTransform {
     let (cx, cy, s) = accessory_attach(acc);
     let max_w = s * w as f32;
@@ -1005,12 +870,10 @@ fn accessory_transform(acc: CatGlyphId, w: u32, h: u32) -> PathTransform {
     }
 }
 
-/// v4 §2 blink/expression bake axis: the eye state baked into a cursor-cat tile.
-/// A pure frame-selection input (not per-pixel work) — the animating cursor cat
-/// ([`crate::kitty_cursor::CursorCat`]) blinks and squints by selecting a distinct
-/// `eyes` value, which bakes a distinct (but cache-cheap) tile. `Open` keeps the
-/// authored eye geometry and primary catch-light, then adds a resolution-aware
-/// glossy finish at shipping sizes; expression geometry stays authored.
+/// The eye state baked into a cursor-cat tile. The animating cursor cat
+/// ([`crate::kitty_cursor::CursorCat`]) blinks and squints by selecting a
+/// distinct `eyes` value, each its own cached tile. `Open` keeps the authored
+/// eyes and adds a resolution-aware glossy finish at shipping sizes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EyesFrame {
     /// Eyes as authored (round button eyes / open arcs).
@@ -1023,9 +886,8 @@ pub enum EyesFrame {
 }
 
 impl EyesFrame {
-    /// Vertical openness the eye layers keep: `1.0` = as authored, small = shut.
-    /// The eye family (Eye/Iris/CatchLight) is squashed toward its shared eye
-    /// line by this factor, so a round eye becomes a lidded slit or a closed line.
+    /// Vertical openness of the eye layers: `1.0` as authored, small is shut.
+    /// The eye family is squashed toward its shared eye line by this factor.
     fn openness(self) -> f32 {
         match self {
             EyesFrame::Open => 1.0,
@@ -1035,10 +897,8 @@ impl EyesFrame {
     }
 }
 
-/// The eye line (mid-y in the glyph's 0..1 frame) of an `Eye`-role layer — the
-/// midpoint of every path coordinate's y. Blink/squint squashes the eye family
-/// toward this shared line, so the closure reads at the exact authored height for
-/// ANY head or coat. `None` for an empty layer.
+/// The eye line (mean path y in the 0..1 frame) of an `Eye`-role layer, which
+/// blink and squint squash toward. `None` for an empty layer.
 fn layer_eye_line(layer: &Layer) -> Option<f32> {
     let mut lo = u16::MAX;
     let mut hi = 0u16;
@@ -1064,10 +924,10 @@ fn layer_eye_line(layer: &Layer) -> Option<f32> {
     seen.then(|| (f32::from(lo) + f32::from(hi)) * 0.5 / f32::from(FIXED_ONE))
 }
 
-/// Normalized control-hull bounds of one authored path. Bézier curves remain
-/// inside their control hull, so this can overestimate an eye by a fraction but
-/// can never put a reflection outside geometry the path could occupy.
-fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
+/// Normalized control-hull bounds `(x0, y0, x1, y1)` of one subpath. Béziers
+/// stay inside their hull, so this may overestimate but never places a
+/// reflection outside the path. `None` for an empty subpath.
+pub(crate) fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
     let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0u16, 0u16);
     let mut seen = false;
     let mut take = |x: u16, y: u16| {
@@ -1092,9 +952,8 @@ fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
     seen.then(|| (norm(x0), norm(y0), norm(x1), norm(y1)))
 }
 
-/// Pair one authored catch-light centre with its closest authored eye path.
-/// Returning the path index lets the roster-wide differential test use the
-/// exact same ownership decision as the production painter.
+/// Pair a catch-light centre with its closest eye path. Returns the path index
+/// so the roster-wide test uses the same pairing as the painter.
 fn closest_eye_path(eyes: &Layer, pcx: f32, pcy: f32) -> Option<(usize, (f32, f32, f32, f32))> {
     eyes.paths
         .iter()
@@ -1119,10 +978,8 @@ fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransfo
 }
 
 /// Reinforce the authored upper catch-light and add a smaller lower-right echo
-/// to each genuinely open eye. Each catch-light is paired to the nearest eye,
-/// so asymmetric/winking heads do not depend on two independently-authored path
-/// lists having identical ordering. A head without authored catch-lights opts
-/// out: its blank/closed expression stays exactly as the artist drew it.
+/// to each open eye. Catch-lights pair with their nearest eye, so path order
+/// does not matter. A head with no authored catch-lights is left as drawn.
 fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTransform) {
     let Some(eyes) = layers.iter().find(|layer| layer.role == GlyphRole::Eye) else {
         return;
@@ -1172,9 +1029,8 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
             let echo_r = (minor * OPEN_EYE_ECHO_FRAC)
                 .clamp(OPEN_EYE_ECHO_MIN_RADIUS_PX, OPEN_EYE_ECHO_MAX_RADIUS_PX);
             let (ecx, ecy) = ((ex0 + ex1) * 0.5, (ey0 + ey1) * 0.5);
-            // Continue the authored primary→eye-centre ray just past the
-            // centre. This lands in the lower pupil, unlike a percentage of
-            // the whole aperture (which can land out in the coloured iris).
+            // Continue the catch-light→eye-centre ray just past the centre, into
+            // the lower pupil rather than the iris.
             let echo_x = (pcx + 1.55 * (ecx - pcx))
                 .clamp(ex0 + 0.25 * (ex1 - ex0), ex1 - 0.25 * (ex1 - ex0));
             let echo_y = (pcy + 1.55 * (ecy - pcy))
@@ -1192,10 +1048,9 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
     }
 }
 
-/// Fill every layer of `GLYPHS[id]` in painter order through `xform`, resolving each
-/// layer's colour with [`resolve_layer`]. `eyes` selects a blink/squint frame: the
-/// eye family is squashed toward the shared eye line, and a full blink drops the
-/// iris + catch-light (a shut eye shows neither).
+/// Fill every layer of `GLYPHS[id]` in painter order through `xform`, colours
+/// via [`resolve_layer`]. `eyes` squashes the eye family toward the eye line; a
+/// full blink drops iris and catch-light.
 fn paint_glyph(
     tile: &mut Tile,
     id: CatGlyphId,
@@ -1227,9 +1082,8 @@ fn paint_glyph(
         {
             continue;
         }
-        // Squash the eye family vertically toward the shared eye line (fixing the
-        // line, compressing everything above/below it): scale_y·k, with dy lifted
-        // so the line stays put. Only the eye family moves; the silhouette holds.
+        // Scale the eye family by k about the eye line (dy adjusted so the line
+        // stays put); the silhouette is unchanged.
         let lxform = match eye_line {
             Some(yc)
                 if matches!(
@@ -1246,28 +1100,8 @@ fn paint_glyph(
             _ => xform,
         };
         let (col, alpha) = resolve_glyph_layer(layer, fills, coat_recolored);
-        if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker)
-            && let Some(underlay) = fills.outline_underlay
-        {
-            // A mixed terminal footprint cannot be served by one solid ink at
-            // every luminance. Paint a compact pale halo beneath the dark
-            // keyline: one of the two has >=3:1 contrast at every WCAG
-            // luminance. This runs only on a bounded atlas cache miss (at most
-            // two bakes per frame), never in the steady-state render loop.
-            let halo = (lxform.scale_x.min(lxform.scale_y) * 0.04).clamp(0.75, 1.25);
-            for (dx, dy) in [(halo, 0.0), (-halo, 0.0), (0.0, halo), (0.0, -halo)] {
-                fill_path_fixed(
-                    tile,
-                    layer.paths,
-                    underlay,
-                    alpha,
-                    PathTransform {
-                        dx: lxform.dx + dx,
-                        dy: lxform.dy + dy,
-                        ..lxform
-                    },
-                );
-            }
+        if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {
+            paint_outline_halo(tile, layer, fills, alpha, lxform);
         }
         fill_path_fixed(tile, layer.paths, col, alpha, lxform);
     }
@@ -1276,21 +1110,16 @@ fn paint_glyph(
     }
 }
 
-/// v4 §2: bake one authored glyph variant to an exact-size RGBA [`Tile`]. The glyph's
-/// `0..1` frame fills a `w × h` art box at the tile origin; the tile is baked
-/// `w + PATCH_STRIP` wide with a white gaze catch-light dot in the reserved strip at
-/// `(w, 0)` — the §2 patch-strip contract preserved from the procedural baker (the
-/// live gaze quads sample only `[0, w)`, so no reveal state exposes the strip).
-/// Painter order, per-layer fills via [`resolve_layer`]. Deterministic: the const
-/// integer drawlist + the fixed filler give byte-identical tiles for one key.
+/// Bake one authored glyph variant to an exact-size RGBA [`Tile`]: the glyph's
+/// 0..1 frame fills a `w × h` box at the origin, and the tile is `w + PATCH_STRIP`
+/// wide with a white catch-light dot at `(w, 0)`. Deterministic for one key.
 #[must_use]
 pub fn bake_variant(id: CatGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
     bake_variant_with(id, None, fills, w, h, EyesFrame::Open)
 }
 
-/// [`bake_variant`] with an optional overlay accessory glyph composited over the head
-/// at its [`accessory_attach`] anchor (bow left-ear, crown crest, bell collar), scaled
-/// ~0.4× the head box. `accessory = None` bakes the bare variant.
+/// [`bake_variant`] with an optional accessory composited at its
+/// [`accessory_attach`] anchor. `None` bakes the bare variant.
 #[must_use]
 pub fn bake_variant_with(
     id: CatGlyphId,
@@ -1306,10 +1135,8 @@ pub fn bake_variant_with(
     }
     // Base variant: its 0..1 frame fills the w×h art box at the tile origin.
     paint_glyph(&mut tile, id, fills, PathTransform::fit(w, h), eyes, true);
-    // Overlay accessory: map its own frame into a scaled box centred on the attach
-    // point (its centre 0.5,0.5 lands on (cx·w, cy·h)) while preserving the
-    // accessory's authored viewbox aspect. An accessory carries no eye family, so
-    // it always bakes open.
+    // Map the accessory's frame into a box centred on the attach point, keeping
+    // its viewbox aspect. Accessories have no eyes, so they bake open.
     if let Some(acc) = accessory {
         paint_glyph(
             &mut tile,
@@ -1327,12 +1154,10 @@ pub fn bake_variant_with(
     tile
 }
 
-/// v4 §2 bake-cache key: everything that changes the baked texels, all integer so it
-/// is `Eq`/`Hash`-safe (the [`BakeKey`] discipline). The coat/iris ramp INDICES (not
-/// the resolved floats) plus the local color key drive the fills. Exact `w × h`
-/// dimensions already encode any caller-side age scaling, so age is deliberately
-/// not a second cache axis. An accessory overlay is a DISTINCT key — a bow cat
-/// never aliases its bare twin.
+/// Bake-cache key: everything that changes the baked texels, all integer so it
+/// is `Eq`/`Hash`. Coat/iris ramp indices plus the local colour key drive the
+/// fills; exact `w × h` already encodes age scaling. An accessory is a distinct
+/// key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BakeKeyV4 {
     /// The authored variant/special glyph.
@@ -1382,12 +1207,9 @@ struct SlotV4 {
     last_used: u64,
 }
 
-/// v4 §2 host-side LRU bake cache: a compact parallel to [`CatBaker`] keyed on
-/// [`BakeKeyV4`], honouring the same structural budgets ([`MAX_SLOTS`] slot ceiling,
-/// [`MAX_BAKES_PER_FRAME`] bake-rate cap). Holds exact-size authored tiles (each
-/// `w + PATCH_STRIP` wide); the wire phase reads them into the scene atlas. The
-/// [`MAX_ATLAS_BYTES`] bound is enforced by the procedural baker's slot sizing; here
-/// the slot COUNT ceiling caps residency.
+/// Test-only LRU bake cache keyed on [`BakeKeyV4`], with the same
+/// [`MAX_SLOTS`] and [`MAX_BAKES_PER_FRAME`] budgets as [`CatBaker`]. Tiles are
+/// `w + PATCH_STRIP` wide.
 #[derive(Default)]
 #[cfg(test)]
 pub struct CatBakerV4 {
@@ -1412,9 +1234,9 @@ impl CatBakerV4 {
         self.slots.len()
     }
 
-    /// Look `key` up, baking on a miss when the per-frame budget allows. `None` =
-    /// budget exhausted this frame (retry next frame — the entrance tolerates the
-    /// delay, §5.5). The returned tile is `key.w + PATCH_STRIP` wide, art in `[0, w)`.
+    /// Look `key` up, baking on a miss when the frame's budget allows. `None`
+    /// means retry next frame. The tile is `key.w + PATCH_STRIP` wide, art in
+    /// `[0, w)`.
     #[cfg(test)]
     pub fn get(&mut self, key: &BakeKeyV4) -> Option<&Tile> {
         if let Some(i) = self.slots.iter().position(|s| s.key == *key) {
@@ -1475,18 +1297,10 @@ mod tests {
         }
     }
 
-    /// A SLOT SERVED THIS FRAME MAY NOT BE RE-BAKED UNDER ITS OWN QUAD.
-    ///
-    /// One atlas is published per frame, so a tile handed out earlier in this
-    /// frame is already queued as a quad pointing at that `(ax, ay)`. Evicting
-    /// it for a later bake in the SAME frame makes that quad sample the new
-    /// art — the caller draws a sprite it never asked for (the pet wearing a
-    /// word-cat's coat for one frame, and the strobe that follows when the
-    /// two keys trade the slot back and forth every frame).
-    ///
-    /// Reachable at ordinary HiDPI: `slot_count` falls to 8 at `ch = 90`
-    /// while the shared atlas serves the word cats, the animals, the kitty
-    /// cursor, the pet body, its ghosts and motes, the dog and Robi.
+    /// A slot served this frame may not be re-baked under its own quad, or the
+    /// quad would draw another key's art for a frame (and strobe if two keys
+    /// trade the slot). Reachable at HiDPI: `slot_count` is 8 at `ch = 90`
+    /// while many sprite kinds share the atlas.
     #[test]
     fn a_slot_served_this_frame_is_never_evicted_under_its_own_quad() {
         const CH: u16 = 90;
@@ -1581,9 +1395,9 @@ mod tests {
         assert_eq!(read(&mut a), read(&mut b), "same key must bake byte-equal");
     }
 
-    /// LRU eviction at the cap: the least-recently-used slot is replaced; a
-    /// re-request of the evicted key re-bakes; the version bumps on every bake
-    /// and on wholesale clear.
+    /// LRU eviction at the cap: the least-recently-used slot is replaced, the
+    /// evicted key re-bakes on request, and the version bumps on every bake and
+    /// on clear.
     #[test]
     fn lru_evicts_oldest_and_version_bumps() {
         let mut b = CatBaker::default();
@@ -1603,7 +1417,10 @@ mod tests {
         assert!(b.get_v4(&vk(200)).is_some(), "cap-full insert evicts");
         assert_eq!(b.slots.iter().flatten().count(), cap, "cap never exceeded");
         assert!(
-            !b.slots.iter().flatten().any(|s| s.key == vk(1)),
+            !b.slots
+                .iter()
+                .flatten()
+                .any(|s| s.key == SlotKey::Cat(vk(1))),
             "the least-recently-used entry was evicted"
         );
         let v1 = b.version();
@@ -1670,16 +1487,10 @@ mod tests {
         assert!(a3.version > a1.version, "bake bumps the published version");
     }
 
-    /// CB-1: the RECYCLED publish is byte-equal to the full clone it replaces.
-    ///
-    /// Two bakers are driven with identical inputs. `fast` drops each published
-    /// snapshot immediately, so its spare is uniquely owned and `atlas()` takes
-    /// the recycle-and-patch path; `mirror` RETAINS every snapshot, so its spare
-    /// is never uniquely owned and it always falls back to the full
-    /// `rgba.clone()`. Every published field must match, on every frame, across
-    /// bakes, host tiles, hits, eviction and the metric-change clear — a stale
-    /// or torn band (the one way this optimization could regress invisibly)
-    /// shows up here as a byte diff, not as a wrong pixel three months later.
+    /// The recycled publish is byte-equal to a full clone. `fast` drops each
+    /// snapshot so it always recycles; `mirror` retains every snapshot so it
+    /// always clones. Every published field must match on every frame across
+    /// bakes, host tiles, hits, eviction and the metric-change clear.
     #[test]
     fn recycled_publish_is_byte_equal_to_full_clone() {
         let mut fast = CatBaker::default();
@@ -1726,11 +1537,9 @@ mod tests {
         );
     }
 
-    /// CB-1: the publish really does recycle — the third dirty publish lands in
-    /// the buffer the FIRST one allocated — and a snapshot a consumer is still
-    /// holding is NEVER mutated (the one hazard of an in-place publish). Pointer
-    /// identity is sound here: every snapshot stays alive inside the baker or in
-    /// a local for the whole test, so no address can be recycled underneath us.
+    /// The third dirty publish reuses the first one's buffer, and a snapshot a
+    /// consumer still holds is never mutated. Every snapshot stays alive for the
+    /// test, so pointer identity is sound.
     #[test]
     fn dirty_publish_recycles_and_never_mutates_a_held_snapshot() {
         let mut b = CatBaker::default();
@@ -1873,9 +1682,8 @@ mod tests {
         }
     }
 
-    /// v4 §7: an inherently-patterned variant whose patches are all `Recolor::Fixed`
-    /// (the tuxedo — its coat layers are tagged `fixed`) is INVARIANT under a coat
-    /// change; recoloring it would betray the reference.
+    /// A variant whose patches are all `Recolor::Fixed` (the tuxedo) is
+    /// invariant under a coat change.
     #[test]
     fn v4_fixed_patterned_variant_is_coat_invariant() {
         // No `Recolor::Coat` layer ⇒ the coat index cannot move any texel.
@@ -1903,10 +1711,8 @@ mod tests {
         );
     }
 
-    /// DARK-COAT RESCUE: on the dark background bands the darkest coat stops
-    /// are lifted to the luminance floor (a dark-grey cat, not a void), coats
-    /// already above the floor are bit-exact, hue survives the lift, and the
-    /// light bands never rescue (dark-on-light reads fine).
+    /// Dark-coat rescue: on dark bands the darkest coats lift to the floor,
+    /// coats above it are bit-exact, hue survives, and light bands never lift.
     #[test]
     fn dark_coats_are_lifted_on_dark_backgrounds_only() {
         let lum = |c: (f32, f32, f32)| relative_luminance(packed_rgb(c));
@@ -1934,9 +1740,7 @@ mod tests {
                 lum(unlifted.coat) < COAT_MIN_LUM_DARK_BG,
                 "coat {coat} keeps its authored darkness on light bands"
             );
-            // Band 1 must NOT lift: its own backgrounds span the floor
-            // (0.04..0.18), so a lifted coat would converge onto mid-dark
-            // themes — the authored dark coat reads as a silhouette there.
+            // Band 1 must not lift: its backgrounds span the floor.
             let band1 = ResolvedFills::from_context(coat, 4, band1_ctx);
             let raw = rgb(mix_rgb(
                 COAT_RAMP[usize::from(coat)],
@@ -1975,12 +1779,8 @@ mod tests {
         }
     }
 
-    /// A footprint whose AVERAGE is decisively dark keeps the dark-band pale
-    /// outline when it clipped a MID-luminance region — but a genuinely BRIGHT
-    /// (band 3) clip keeps the mixed dual treatment (gamma-space averaging can
-    /// hide a sizeable white strip inside a band-0 average, and a pale outline
-    /// would vanish over it). (The old rule froze the dark-keyline mix for a
-    /// whole flight over a dark terminal — the "kitty looks too dark" report.)
+    /// A decisively dark average keeps the pale outline over a mid-luminance
+    /// clip, but a bright (band 3) clip gets the mixed dual treatment.
     #[test]
     fn dark_average_footprint_keeps_the_pale_outline() {
         let dark_bg = 0x000A_0A10; // band 0
@@ -2011,9 +1811,8 @@ mod tests {
         );
     }
 
-    /// Local RGB is deliberately quantized before it reaches the LRU: nearby
-    /// reds share one tile, a blue context selects another, and the key remains
-    /// exactly two bytes regardless of arbitrary terminal colors.
+    /// Local RGB is quantized before the LRU: nearby reds share a tile, blue
+    /// selects another, and the key stays two bytes.
     #[test]
     fn context_palette_is_bounded_and_color_aware() {
         assert_eq!(std::mem::size_of::<CatColorKey>(), 2);
@@ -2266,10 +2065,8 @@ mod tests {
         assert_eq!(cache.len(), 2, "two distinct keys ⇒ two slots");
     }
 
-    /// The blink/squint axis bakes distinct tiles (open ≠ happy ≠ blink) while
-    /// `Open` is byte-identical to the default open bake (authored geometry plus
-    /// its bounded glossy finish), and each `eyes` value is a distinct BakeKeyV4
-    /// (its own cache slot) so a live blink never aliases the open cat.
+    /// Open, happy and blink bake distinct tiles; `Open` equals the default open
+    /// bake; each `eyes` value is its own `BakeKeyV4`.
     #[test]
     fn eyes_frame_bakes_distinct_but_open_is_authored() {
         let f = fills(5, 3, false);
@@ -2305,12 +2102,10 @@ mod tests {
         assert_eq!(cache.len(), 2, "open and blink occupy distinct slots");
     }
 
-    /// Exact settings-preview size (18 px cell × 1.70 rows ≈ 31 px): the
-    /// glossy pass must visibly change the default flying head, and every one
-    /// of those changes must replace a fully-opaque dark texel inside the
-    /// authored eye silhouette. Most of the original dark eye/pupil pixels must
-    /// remain. Happy, blink, and an authored shallow-eye head are byte-identical
-    /// with the pass toggled, proving no floating reflections land on closures.
+    /// At the settings-preview size (~31 px) the glossy pass changes the default
+    /// head only on opaque dark texels inside the authored eyes, and most dark
+    /// eye pixels remain. Happy, blink and a shallow-eye head are unchanged with
+    /// the pass toggled.
     #[test]
     fn flying_cursor_reflections_are_contained_and_expression_aware() {
         const W: u32 = 38;
@@ -2397,9 +2192,8 @@ mod tests {
                 "{state:?} must never receive open-eye reflections"
             );
         }
-        // Use a large bake so the shallow-expression assertion exercises the
-        // aspect gate itself, rather than passing incidentally through the
-        // tiny-eye size floor.
+        // A large bake, so the shallow-expression check exercises the aspect
+        // gate rather than the tiny-eye size floor.
         const SHALLOW_H: u32 = 120;
         let shallow_w =
             (f32::from(GLYPHS[CatGlyphId::S101 as usize].aspect_x1000) * SHALLOW_H as f32 / 1000.0)
@@ -2427,18 +2221,12 @@ mod tests {
         );
     }
 
-    /// The glossy pass sits in the generic v4 baker, so its safety proof must
-    /// cover the generic authored roster rather than only the default S100
-    /// preview. Sweep tiny word-cat, settings-preview, enlarged cursor and
-    /// reference-art sizes on both grounds. Every changed texel must belong to
-    /// the exact authored path production paired with a catch-light, every eye
-    /// the pass actually affects is checked independently, and at least half
-    /// of its dark pupil/core must remain. Glyphs with no eligible open eye
-    /// must remain byte-identical when the pass is toggled. Non-vacuity is
-    /// pinned to both the settings-preview head and the live cursor's authored
-    /// tongue-out/oops expression; several authored heads already paint the entire
-    /// candidate glint area white and are intentionally byte-identical under
-    /// reinforcement.
+    /// The glossy pass across the authored roster at word-cat, settings-preview,
+    /// enlarged-cursor and reference sizes on both grounds: every changed texel
+    /// lies in the path paired with a catch-light, each affected eye keeps at
+    /// least half its dark core, and glyphs with no eligible open eye are
+    /// unchanged. Non-vacuity is pinned on the preview head and the cursor's
+    /// tongue-out expression.
     #[test]
     fn flying_reflection_roster_is_contained_and_nonvacuous() {
         let mut failures = Vec::new();
@@ -2643,53 +2431,5 @@ mod tests {
         );
         cache.begin_frame();
         assert!(cache.get(&mk(200)).is_some(), "budget resets next frame");
-    }
-
-    /// v4 perf gate (§7): one `bake_variant` at a working size must stay under
-    /// 1.5 ms. Manual-timing idiom (matches `bench_cat_bake`):
-    ///
-    /// ```sh
-    /// cargo test -p aterm-effects --release v4_bench_bake_variant -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
-    fn v4_bench_bake_variant() {
-        use std::time::Instant;
-        let f = ResolvedFills::from_context(
-            5,
-            3,
-            CatColorKey {
-                accent: 12,
-                background: 4,
-            },
-        );
-        for _ in 0..8 {
-            assert!(
-                bake_variant(CatGlyphId::SpecTabbybell, &f, 156, 156)
-                    .pixels()
-                    .iter()
-                    .any(|&b| b != 0)
-            );
-        }
-        let iters = 64usize;
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let start = Instant::now();
-            let t = bake_variant(CatGlyphId::SpecTabbybell, &f, 156, 156);
-            samples.push(start.elapsed());
-            assert!(t.pixels().iter().any(|&b| b != 0));
-        }
-        samples.sort();
-        let median = samples[iters / 2];
-        println!(
-            "v4_bench_bake_variant: median {median:?} over {iters} bakes of the \
-             densest mixed-background glyph (SpecTabbybell, 156x156; min {:?}, max {:?})",
-            samples[0],
-            samples[iters - 1]
-        );
-        assert!(
-            median < std::time::Duration::from_micros(1500),
-            "§7 gate: median {median:?} >= 1.5 ms"
-        );
     }
 }

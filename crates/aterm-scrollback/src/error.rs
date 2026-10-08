@@ -90,9 +90,9 @@ pub(crate) fn dec_string(v: usize) -> String {
     out
 }
 
-// Manual `Display`/`Error`/`From` impls (previously `derive(aterm_error::Error)`).
+// Manual `Display`/`Error`/`From` impls.
 //
-// The derive's Display arms expand `write!(f, "... {0}", ...)`, whose
+// A derived Display's arms would expand `write!(f, "... {0}", ...)`, whose
 // `format_args!` expansion embeds an unsafe `fmt::Arguments` construction the
 // strict Trust gate cannot lower and therefore fails closed on. These impls
 // produce byte-identical Display output, the identical `source()` chain, and
@@ -167,8 +167,7 @@ mod tests {
         }
     }
 
-    /// The manual `Display` impl must render byte-identically to the strings
-    /// the previous `derive(aterm_error::Error)` produced.
+    /// The manual `Display` impl renders the pinned strings.
     #[test]
     fn display_messages_are_stable() {
         let io = ScrollbackError::Io(std::io::Error::new(

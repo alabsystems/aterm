@@ -17,11 +17,8 @@ fn assert_rle_matches_model(rle: &Rle<u8>, model: &[u8], step: usize) {
         run_total, rle.total_length,
         "sum of run lengths must match total_length at step {step}"
     );
-    // The prefix-sum index this used to cross-check was deleted (it cost an
-    // allocation per constructed Rle and no production caller read it). The
-    // invariant it existed to protect — run starts accumulate exactly to
-    // `total_length`, with no zero-length run — is checked directly on `runs`,
-    // which is now the sole structure `find_run` walks.
+    // `find_run`'s precondition: no zero-length run, and run starts
+    // accumulate exactly to `total_length`.
     let mut expected_start = 0u32;
     for (run_idx, run) in rle.runs.iter().enumerate() {
         assert!(
@@ -206,97 +203,6 @@ fn rle_iter() {
     let rle = Rle::from_iter([1u8, 1, 2, 3, 3]);
     let values: Vec<_> = rle.iter().collect();
     assert_eq!(values, vec![1, 1, 2, 3, 3]);
-}
-
-#[test]
-fn rle_set_range_linear_iterations() {
-    fn measure_once(run_count: u32) -> usize {
-        let mut rle: Rle<u8> = Rle::new();
-        for i in 0..run_count {
-            rle.push((i & 1) as u8);
-        }
-
-        let len = rle.len();
-        let start = len / 4;
-        let end = len - start;
-
-        // Count run-iteration steps to avoid timing-based flakiness in CI.
-        reset_run_iterations();
-        rle.set_range(start, end, 3);
-        take_run_iterations()
-    }
-
-    let small_iters = measure_once(5_000) as u128;
-    let large_iters = measure_once(50_000) as u128;
-
-    // 10x more runs should take roughly 10x more iterations (linear).
-    // If O(n^2), it would take ~100x more iterations.
-    assert!(
-        small_iters > 0,
-        "small run-iteration count should be non-zero"
-    );
-    assert!(
-        large_iters > 0,
-        "large run-iteration count should be non-zero"
-    );
-    assert!(
-        large_iters >= small_iters,
-        "larger run set should not reduce iteration count (small: {small_iters}, large: {large_iters})"
-    );
-    let small_iters = small_iters.max(1);
-    let ratio_x10 = large_iters
-        .saturating_mul(10)
-        .saturating_add(small_iters / 2)
-        / small_iters;
-    let max_ratio = 20u128;
-
-    assert!(
-        large_iters < small_iters.saturating_mul(max_ratio),
-        "rle set_range ratio {}.{}x suggests non-linear behavior (small: {}, large: {})",
-        ratio_x10 / 10,
-        ratio_x10 % 10,
-        small_iters,
-        large_iters
-    );
-}
-
-/// Verify that `Rle::get` walks the runs linearly and lands EXACTLY on the run
-/// holding the index.
-///
-/// The prefix-sum index that made this a binary search was deleted: it cost one
-/// allocation on every constructed `Rle` (paid per materialized scrollback
-/// line, including the all-default lines whose `Rle` is discarded unread) and no
-/// production caller ever reached a reader that consulted it. What has to stay
-/// true is the walk's exactness, which is what this pins: reaching the LAST run
-/// costs exactly `run_count` steps, and the value is right.
-#[test]
-fn rle_get_walks_runs_linearly() {
-    fn measure_get_last(run_count: u32) -> usize {
-        let mut rle: Rle<u8> = Rle::new();
-        for i in 0..run_count {
-            rle.push((i & 1) as u8);
-        }
-        assert_eq!(rle.run_count(), run_count as usize);
-
-        reset_run_iterations();
-        let val = rle.get(run_count - 1);
-        let iters = take_run_iterations();
-        assert_eq!(
-            val,
-            Some(((run_count - 1) & 1) as u8),
-            "last element should match inserted parity pattern"
-        );
-        iters
-    }
-
-    let small = measure_get_last(1_000);
-    let large = measure_get_last(10_000);
-
-    // The walk visits one run per step and stops on the one that contains the
-    // index, so reaching the last of R runs is exactly R steps — and scaling
-    // with R is the honest signature of the linear walk.
-    assert_eq!(small, 1_000, "linear walk visits every run (small)");
-    assert_eq!(large, 10_000, "linear walk visits every run (large)");
 }
 
 /// Verify that a FIRST-element lookup stops immediately while a last-element

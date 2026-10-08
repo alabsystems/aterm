@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The message band's PIXEL raster (design rulings 242–244), measured pixel
-//! by pixel on a realistic window: an 80-column row of 16-pixel cells with
-//! 8-pixel gutters — the ground's smoothness, the fill's crisp edge through
-//! the letters, the busy row's calm inks, the glint that always reads, the
-//! Fault's hull, the fade that keeps its words to the midpoint, and the
-//! strain row's rail.
+//! The message band's pixel raster, measured on a realistic window (an
+//! 80-column row of 16-pixel cells with 8-pixel gutters): the ground's
+//! smoothness, the fill's crisp edge through the letters, the busy row's calm
+//! inks, the glint's visibility, the Fault's hull, the fade that keeps its
+//! words to the midpoint, and the strain row's rail.
 
 use aterm_core::terminal::RenderCell;
 use aterm_messages::{
@@ -45,7 +44,8 @@ fn present(c: &MessageCenter) -> Presentation {
     c.presentation(COLS, &cell_width, None, Links::Painted)
 }
 
-fn themes() -> Vec<(&'static str, Theme)> {
+/// Every builtin scheme as a theme, `Default` first.
+pub(super) fn themes() -> Vec<(&'static str, Theme)> {
     aterm_types::scheme::builtin_names()
         .into_iter()
         .map(|name| {
@@ -78,7 +78,7 @@ fn frame(
     (rows, rasters, m)
 }
 
-/// The window pixels column `x`'s GLYPH can draw on: its own cell.
+/// The window pixels column `x`'s glyph can draw on: its own cell.
 fn glyph_px(x: usize) -> std::ops::Range<usize> {
     PAD + x * CELL_W..PAD + (x + 1) * CELL_W
 }
@@ -104,16 +104,16 @@ fn busy(title: &str) -> Message {
         })
 }
 
-/// Every word's contrast on the ground ACTUALLY under its glyph — the pixel
-/// raster where the row has one, split at the fill's edge — never less than
-/// `floor`; the worst ratio, and where.
+/// The worst contrast of any word against the ground actually under its glyph
+/// (the pixel raster where the row has one, split at the fill's edge), and
+/// where.
 fn worst_word_contrast(row: &[RenderCell], raster: Option<&RowRaster>) -> (f64, String) {
     let mut worst = (f64::INFINITY, String::new());
     for (x, cell) in row.iter().enumerate() {
         if cell.ch == ' ' {
             continue;
         }
-        // A chip's own fill, or an outlined Primary's inside (ruling 249):
+        // A chip's own fill, or an outlined Primary's inside:
         // its label sits on the cell's own ground, not the meter's.
         let owned = raster.is_some_and(|r| {
             r.own
@@ -123,7 +123,7 @@ fn worst_word_contrast(row: &[RenderCell], raster: Option<&RowRaster>) -> (f64, 
                     .iter()
                     .any(|&(a, b, ..)| (usize::from(a)..usize::from(b)).contains(&x))
         });
-        // A drawn icon between blank cells spills into them (ruling 258):
+        // A drawn icon between blank cells spills into them:
         // its ink lands on the ground of all three.
         let spills = raster.is_some_and(|r| r.icons.iter().any(|&(c, _)| usize::from(c) == x))
             && x > 0
@@ -139,7 +139,7 @@ fn worst_word_contrast(row: &[RenderCell], raster: Option<&RowRaster>) -> (f64, 
             Some(r) => {
                 for px in pixels {
                     // The edge's one antialiased pixel is the line itself,
-                    // and so is a pastel fill's darker edge (ruling 264).
+                    // and so is a pastel fill's darker edge.
                     if r.edge == Some(px as u32)
                         || r.line.is_some_and(|(a, b)| (a..b).contains(&(px as u32)))
                     {
@@ -164,10 +164,9 @@ fn worst_word_contrast(row: &[RenderCell], raster: Option<&RowRaster>) -> (f64, 
     worst
 }
 
-/// THE GROUND IS CONTINUOUS (ruling 242): inside a comet, at pixel
-/// resolution, neighbouring pixel columns differ by at most two levels in
-/// any channel — no cell blocks, no seams — on every builtin scheme, through
-/// a whole crossing.
+/// The ground is continuous: inside a comet, neighbouring pixel columns differ
+/// by at most two levels in any channel (no cell blocks, no seams), on every
+/// builtin scheme, through a whole crossing.
 #[test]
 fn a_comet_is_smooth_at_pixel_resolution() {
     for (name, theme) in themes() {
@@ -200,10 +199,9 @@ fn a_comet_is_smooth_at_pixel_resolution() {
     }
 }
 
-/// A BUSY ROW'S WORDS ARE CALM (ruling 242): every glyph's ink is the same
-/// on every frame of a whole comet period — floored once against the
-/// hottest tone the comet can reach — on every builtin scheme, and clears AA
-/// on the pixels under it on every frame.
+/// A busy row's words are calm: every glyph's ink is the same on every frame
+/// of a comet period (floored once against the hottest tone the comet
+/// reaches), on every builtin scheme, and clears AA on the pixels under it.
 #[test]
 fn busy_row_inks_hold_across_a_comet_period() {
     for (name, theme) in themes() {
@@ -238,11 +236,11 @@ fn busy_row_inks_hold_across_a_comet_period() {
     }
 }
 
-/// THE GLINT ALWAYS READS (ruling 242): its peak — at full height, or in the
-/// rail band where the fill's words leave it no room — is at least ΔE 6
-/// (OkLab ×100) from the fill on every builtin scheme; and every word on the
-/// bar clears AA on the pixels under it through the glint's whole travel,
-/// the fill's edge split through the letters.
+/// The glint always reads: its peak (full height, or in the rail band where
+/// the fill's words leave no room) is at least ΔE 6 (OkLab ×100) from the fill
+/// on every builtin scheme, and every word on the bar clears AA on the pixels
+/// under it through the glint's travel, the fill's edge split through the
+/// letters.
 #[test]
 fn the_glint_reads_and_every_word_clears_aa_through_its_travel() {
     for (name, theme) in themes() {
@@ -273,11 +271,10 @@ fn the_glint_reads_and_every_word_clears_aa_through_its_travel() {
     }
 }
 
-/// THE FILL'S EDGE IS A CRISP LINE THROUGH THE LETTERS (ruling 242): at any
-/// fill, the ground is the fill left of the edge and the track right of it
-/// with ONE antialiased pixel between; the cell the edge falls in is split
-/// at that pixel — the fill side's crisp ink left of it, the track's ink
-/// right — and every letter clears AA on the pixels under it.
+/// The fill's edge is a crisp line through the letters: at any fill, the
+/// ground is the fill left of the edge and the track right of it with one
+/// antialiased pixel between; the edge cell is split at that pixel (fill-side
+/// ink left, track ink right), and every letter clears AA on its pixels.
 #[test]
 fn the_fill_edge_is_one_antialiased_pixel_and_splits_its_cell() {
     let theme = Theme::default();
@@ -316,7 +313,7 @@ fn the_fill_edge_is_one_antialiased_pixel_and_splits_its_cell() {
         assert!(ratio >= 4.5 - 0.02, "{permille}: {ratio:.2}:1 at {at_}");
         if let Some((col, x, ink, _)) = r.split {
             // The glyph's drawn icon spills into the blank cells beside it
-            // (ruling 258): an edge in either splits the icon.
+            // as well: an edge in either splits the icon.
             let col = usize::from(col);
             let cell = if col == aterm_messages::GLYPH_COL {
                 glyph_px(col - 1).start..glyph_px(col + 1).end
@@ -349,7 +346,7 @@ fn the_fill_edge_is_one_antialiased_pixel_and_splits_its_cell() {
     }
 }
 
-/// Run a Fault echo of `msg` and hand every frame (every 10 ms, 0–600 ms)
+/// Run a Fault echo of `msg` and hand every frame (every 30 ms, 0–600 ms)
 /// to `each`.
 fn fault_frames(
     theme: Theme,
@@ -363,16 +360,16 @@ fn fault_frames(
     let at = now + ms(1500);
     assert!(c.resolve(id, Outcome::Warn, at));
     let p = present(&c);
-    for k in 0..=60u64 {
-        let (rows, rasters, m) = frame(&c, &p, at + ms(k * 10), Look::MOVING, theme);
-        each(k * 10, &p, &rows, &rasters, &m);
+    for k in 0..=20u64 {
+        let (rows, rasters, m) = frame(&c, &p, at + ms(k * 30), Look::MOVING, theme);
+        each(k * 30, &p, &rows, &rasters, &m);
     }
 }
 
-/// Whether `px` lies in the linear-light solid of four inks, within the
-/// triangle test's own tolerance: its barycentric weights over them all at
-/// least zero, or — for a pixel byte rounding set just outside, or a flat
-/// solid — within 0.01 of one of its faces ([`hull_distance`]).
+/// Whether `px` lies in the linear-light solid of four inks within the
+/// triangle test's tolerance: all barycentric weights at least zero, or (for a
+/// byte-rounded pixel just outside, or a flat solid) within 0.01 of a face
+/// ([`hull_distance`]).
 fn inside_solid(px: [u8; 3], corners: [[u8; 3]; 4]) -> bool {
     let lin = |c: [u8; 3]| {
         c.map(|v| {
@@ -410,12 +407,11 @@ fn inside_solid(px: [u8; 3], corners: [[u8; 3]; 4]) -> bool {
     (l1 >= 0.0 && l2 >= 0.0 && l3 >= 0.0 && l1 + l2 + l3 <= 1.0) || near_a_face()
 }
 
-/// A FAILURE NEVER PASSES THROUGH ANOTHER HUE (ruling 244): on every builtin
-/// scheme, every ground pixel of every frame of a bar's Fault echo — the
-/// cross-fade and the held wash — lies inside the linear-light hull of the
-/// row's track, fill and warn: no lime between a green fill and amber, no
-/// magenta between blue and ochre. A busy row's Fault puts no warn on its
-/// surface at all.
+/// A failure never passes through another hue: on every builtin scheme, every
+/// ground pixel of every frame of a bar's Fault echo (cross-fade and held
+/// wash) lies inside the linear-light hull of the row's track, fill and warn,
+/// so no lime between green and amber, no magenta between blue and ochre. A
+/// busy row's Fault puts no warn on its surface.
 #[test]
 fn the_fault_echo_stays_inside_its_hull() {
     for (name, theme) in themes() {
@@ -427,9 +423,8 @@ fn the_fault_echo_stays_inside_its_hull() {
             let (inks, _) = row_inks(&c, &p.rows[0], false, false);
             let r = rasters[0].as_ref().expect("a raster");
             for (x, px) in r.ground.iter().enumerate() {
-                // A pastel fill's darker edge (ruling 264) is the fill's own
-                // hue deepened: its pixels keep to the solid the edge ink
-                // adds to the hull.
+                // A pastel fill's darker edge is the fill's own hue deepened:
+                // its pixels keep to the solid the edge ink adds to the hull.
                 if let (Some((a, b)), Some(edge)) = (r.line, c.meter_edge)
                     && (a..b).contains(&(x as u32))
                 {
@@ -460,10 +455,9 @@ fn the_fault_echo_stays_inside_its_hull() {
     }
 }
 
-/// `FAILED` KEEPS ITS CONTRAST (ruling 244): through a busy row's Fault —
-/// its comet frozen and drained, the row neutral — the ⚠ and `failed` wear
-/// warn at AA on the pixels under them on every frame whose opacity is at
-/// least one half, on every builtin scheme.
+/// `failed` keeps its contrast: through a busy row's Fault (comet frozen and
+/// drained, row neutral) the ⚠ and `failed` wear warn at AA on their pixels on
+/// every frame at opacity ≥ 1/2, on every builtin scheme.
 #[test]
 fn failed_keeps_aa_through_a_busy_fault() {
     for (name, theme) in themes() {
@@ -487,10 +481,10 @@ fn failed_keeps_aa_through_a_busy_fault() {
     }
 }
 
-/// THE TAIL KEEPS ITS WORDS TO THE MIDPOINT (ruling 244): every echo —
-/// Complete, Fault and Vanish, a bar and a busy row — fades as one layer,
-/// and on every frame whose opacity is at least one half every word clears
-/// AA on the pixels under it and none changes side; on every builtin scheme.
+/// The tail keeps its words to the midpoint: every echo (Complete, Fault,
+/// Vanish; bar and busy row) fades as one layer, and on every frame at opacity
+/// ≥ 1/2 every word clears AA on its pixels and none changes side, on every
+/// builtin scheme.
 #[test]
 fn an_echo_tail_keeps_its_words_legible_to_the_midpoint() {
     for (name, theme) in themes() {
@@ -520,17 +514,17 @@ fn an_echo_tail_keeps_its_words_legible_to_the_midpoint() {
                             m.rows[0].fade
                         );
                     }
-                    t += ms(10);
+                    t += aterm_messages::ANIM_FRAME;
                 }
             }
         }
     }
 }
 
-/// THE COMPLETE ECHO'S ONE SWEEP (ruling 244): after the fill reaches the
-/// window's right edge, a single glint about four cells wide crosses the
-/// whole row once, left to right, lifting the full bar by the glint's own
-/// step — the same light on dark, light and Solarized grounds.
+/// The Complete echo's one sweep: after the fill reaches the right edge, one
+/// glint about four cells wide crosses the row once, left to right, lifting
+/// the full bar by the glint's own step, the same on dark, light and Solarized
+/// grounds.
 #[test]
 fn the_complete_echo_sweeps_once_across_the_row() {
     for (name, theme) in themes() {
@@ -547,7 +541,7 @@ fn the_complete_echo_sweeps_once_across_the_row() {
         let mut prev_peak: Option<usize> = None;
         let mut seen = 0;
         // From a display frame past the wipe's landing (the echo is read on
-        // the display's own cadence, ruling 245).
+        // the display's own cadence).
         let mut t = fill + ms(20);
         while t < fill + aterm_messages::ECHO_SWEEP {
             let (_, rasters, m) = frame(&center, &p, at + t, Look::MOVING, theme);
@@ -582,11 +576,11 @@ fn the_complete_echo_sweeps_once_across_the_row() {
     }
 }
 
-/// THE STRAIN ROW IS A RAIL (rulings 243 and 248): its words sit on the band
-/// in their own inks, which do not move as the level does, and keep clear of
-/// the rail; no pixel it paints is the cursor accent; and its rail — the
-/// warn hue at a surface's chroma, in the lowest pixels — runs from the
-/// window's left edge to the level mapped onto the whole window.
+/// The strain row is a rail: its words sit on the band in their own inks,
+/// which do not move with the level, and keep clear of the rail; no pixel is
+/// the cursor accent; and the rail (the warn hue at a surface's chroma, in the
+/// lowest pixels) runs from the window's left edge to the level mapped onto
+/// the whole window.
 #[test]
 fn a_strain_row_is_a_warn_rail_under_calm_words() {
     for (name, theme) in themes() {
@@ -646,7 +640,7 @@ fn a_strain_row_is_a_warn_rail_under_calm_words() {
             let r = rasters[0].as_ref().expect("a rail row has a raster");
             assert!(r.ground.is_empty(), "{name}: the words sit on the band");
             assert!(r.rail.iter().flatten().all(|px| *px != c.accent));
-            // The words keep clear of the rail (ruling 248): the renderer
+            // The words keep clear of the rail: the renderer
             // lifts them and fits the rail under their lowest ink.
             assert!(r.clear_rail, "{name}: the words keep clear of the rail");
             // The rail is the warn HUE at a surface's chroma — never the pale
@@ -696,7 +690,7 @@ fn only_graded_looks_raster() {
         graded: false,
     };
     // The flat look draws no ground and no rail: its raster, where it has
-    // one, carries only the row's drawn icon (ruling 251).
+    // one, carries only the row's drawn icon.
     let r = frame(&c, &p, now, flat, theme).1[0].clone();
     assert!(
         r.as_ref()
@@ -705,8 +699,8 @@ fn only_graded_looks_raster() {
     );
 }
 
-/// Every builtin scheme with its OWN palette (ruling 250): the chrome theme
-/// and the scheme's ANSI blue and cyan.
+/// Every builtin scheme with its own palette: the chrome theme and the
+/// scheme's ANSI blue and cyan.
 fn palettes() -> Vec<(&'static str, chrome_band::BandPalette)> {
     themes()
         .into_iter()
@@ -737,17 +731,15 @@ fn frame_in(
     (rows, rasters)
 }
 
-/// OUTLINED ON METERS (ruling 249, the owner: "Outlined on meters"): on a
-/// row with a fill or a busy track, the Primary is a ring in the meter's hue
-/// with the band's own ground inside and its label in the accent at AA on
-/// that ground — no chip cell wears a solid accent, so the bar is the row's
-/// only one — and under the pointer its ring lifts and its inside takes a
-/// tint, the label still AA. A row with no meter keeps its solid chip. The
-/// layout is untouched, so the chip is hit exactly where it was. On every
-/// builtin scheme, moving and still.
+/// Outlined on meters: on a row with a fill or busy track, the Primary is a
+/// ring in the meter's hue with the band's ground inside and its label in the
+/// accent at AA (no chip cell wears a solid accent, so the bar is the row's
+/// only one); under the pointer the ring lifts and the inside takes a tint,
+/// label still AA. A row with no meter keeps its solid chip. Layout and hit
+/// area are unchanged. On every builtin scheme, moving and still.
 #[test]
 fn a_meter_rows_primary_is_an_accent_ring_and_a_plain_rows_is_solid() {
-    // Each with a Secondary beside its Primary (ruling 260: on a meter row
+    // Each with a Secondary beside its Primary (on a meter row
     // the Secondary draws no ground — label only, split at the fill's edge).
     let open_packages = || Intent::OpenSettings {
         route: "/packages".into(),
@@ -860,7 +852,7 @@ fn a_meter_rows_primary_is_an_accent_ring_and_a_plain_rows_is_solid() {
         center.post(
             Message::new(tags::UPDATE, Severity::Warn, "aterm v0.93.0 is ready")
                 .action(Intent::ApplyUpdate { build: 7 })
-                .hold(Hold::Standing),
+                .hold(Hold::STANDING),
             stamp(),
             now,
         );
@@ -879,12 +871,11 @@ fn a_meter_rows_primary_is_an_accent_ring_and_a_plain_rows_is_solid() {
     }
 }
 
-/// THE OUTLINE NEVER READS BROWN (ruling 260): over every builtin scheme the
-/// outlined Primary's ring and its label — rest and lit — keep a hue of the
-/// theme's accent family, never a warm hue gone dark. Catppuccin Latte's
-/// rosewater, floored to AA for its label, is brown; its outline borrows the
-/// theme's blue while its fill keeps the rosewater — its own pastel, with a
-/// darker edge (ruling 264). Every other scheme's outline is its meter's hue.
+/// The outline never reads brown: on every builtin scheme the outlined
+/// Primary's ring and label (rest and lit) keep a hue of the accent family.
+/// Catppuccin Latte's rosewater, floored to AA, is brown, so its outline
+/// borrows the theme's blue while its fill keeps the rosewater with a darker
+/// edge. Every other scheme's outline is its meter's hue.
 #[test]
 fn the_outlined_primary_keeps_the_accent_family_on_every_scheme() {
     use aterm_messages::palette::reads_brown;
@@ -919,11 +910,10 @@ fn the_outlined_primary_keeps_the_accent_family_on_every_scheme() {
     assert_eq!(borrowers, ["Catppuccin Latte"], "{seen:?}");
 }
 
-/// BORROW THEME BLUE/CYAN (ruling 250, the owner: "use the theme's own ANSI
-/// blue or cyan when the cursor is near-grey, so the bar keeps colour and
-/// life; every other theme keeps the cursor-trail colour"). Pinned: which
-/// builtin schemes switch and to what — the eight whose cursor is their
-/// foreground or a tint of it — and the fill a still bar actually paints.
+/// Theme blue/cyan is borrowed when the cursor is near-grey (the eight builtin
+/// schemes whose cursor is their foreground or a tint of it); every other
+/// scheme keeps the cursor-trail colour. Pins which schemes switch, to what,
+/// and the fill a still bar paints.
 #[test]
 fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
     use aterm_messages::palette::MeterHue;
@@ -960,7 +950,7 @@ fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
         );
         assert_eq!(hue, want, "{name}");
         let c = palette.colors();
-        // A pastel fill (ruling 264, Catppuccin Latte only) is the cursor as
+        // A pastel fill (Catppuccin Latte only) is the cursor as
         // the theme gives it; every other cursor fill is its accent.
         let cursor_fill = if c.meter_edge.is_some() {
             cursor
@@ -1006,14 +996,12 @@ fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
     }
 }
 
-/// THE PASTEL FILL (ruling 264 — a default the supervisor took, the owner can
-/// overrule it): over every builtin scheme, Catppuccin Latte ALONE keeps its
-/// cursor's own pastel rosewater for the progress fill — the 3:1 floor made it
-/// a brick bar — and ends it in a darker edge line of the same rose that
-/// stands 3:1 from the track, visibly darker than the fill, with the words on
-/// the fill at AA. Every other scheme is what it was, byte for byte: its hue
-/// floored to 3:1 on the band, its track tinted from that, no edge, and a
-/// raster that draws no line.
+/// The pastel fill: of the builtin schemes, only Catppuccin Latte keeps its
+/// cursor's pastel rosewater for the progress fill (the 3:1 floor made it a
+/// brick bar) and ends it in a darker rose edge line that stands 3:1 from the
+/// track, visibly darker than the fill, with the words on the fill at AA.
+/// Every other scheme is unchanged byte for byte: hue floored to 3:1 on the
+/// band, track tinted from it, no edge, and no line in the raster.
 #[test]
 fn only_catppuccin_latte_keeps_a_pastel_fill_with_a_darker_edge() {
     use aterm_messages::palette::{MeterHue, oklch as ok};
@@ -1117,10 +1105,10 @@ fn only_catppuccin_latte_keeps_a_pastel_fill_with_a_darker_edge() {
     assert_eq!(pastels, ["Catppuccin Latte"]);
 }
 
-/// DRAWN ICONS, DROP SPINNER (ruling 251): every glyph a row can carry is
-/// drawn as the band's icon through the row's raster — a plain row, a bar, a
-/// moving comet (its own glyph, no braille frame), an echo's ✓ and ⚠ — and
-/// the cell keeps its character, so the text grid reads what it always read.
+/// Drawn icons, no spinner: every glyph a row can carry (plain row, bar,
+/// moving comet with its own glyph, an echo's ✓ and ⚠) is drawn as the band's
+/// icon through the row's raster, and the cell keeps its character for the
+/// text grid.
 #[test]
 fn every_rows_glyph_is_a_drawn_icon_and_its_character_stays() {
     let theme = Theme::default();

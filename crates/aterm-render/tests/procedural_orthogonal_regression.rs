@@ -22,7 +22,8 @@
 //!
 //! The fixtures are INTENTIONALLY hard to regenerate by accident: bless with
 //! `ATERM_BLESS_GOLDEN=1 targo --unverified test -p aterm-render --test
-//! procedural_orthogonal_regression` and justify the diff in review.
+//! render_suite -- procedural_orthogonal_regression::` and justify the diff in
+//! review.
 
 use aterm_render::procedural;
 

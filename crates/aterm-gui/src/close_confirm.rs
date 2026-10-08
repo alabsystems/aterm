@@ -64,6 +64,7 @@ use aterm_core::terminal::RenderCell;
 use aterm_render::Theme;
 
 use crate::chrome_band;
+use crate::paste_banner::ellipsized;
 use crate::quit_safety::ConfirmPrompt;
 use crate::session_store::ExitActor;
 use crate::settings::{blank_row, write_str};
@@ -102,7 +103,8 @@ pub(crate) struct PendingClose {
     pub(crate) asked_by: ExitActor,
 }
 
-/// The banner is two rows: the question with the answer keys, then the body.
+/// The banner is two rows: the question with the answer keys, then the body (three
+/// when the keys do not fit beside the question and take a row of their own).
 pub(crate) const BANNER_ROWS: usize = 2;
 /// Left margin, in cells (mirrors `paste_banner`).
 const MARGIN: usize = 2;
@@ -138,9 +140,10 @@ fn gesture(prompt: &ConfirmPrompt) -> &'static str {
     }
 }
 
-/// The QUESTION row's text: the prompt's title behind the warn mark.
+/// The QUESTION's words: the prompt's title. The painted warn mark is added by
+/// [`banner_rows`], so the accessible alert does not read it aloud.
 pub(crate) fn question(prompt: &ConfirmPrompt) -> String {
-    format!("!  {}", prompt.title)
+    prompt.title.to_string()
 }
 
 /// The two keys that answer the question, right-aligned on the title row and
@@ -154,6 +157,24 @@ pub(crate) fn answer_keys(prompt: &ConfirmPrompt) -> String {
         _ => "closes",
     };
     format!("Enter {verb} \u{00b7} Esc cancels")
+}
+
+/// [`answer_keys`] for a window too narrow to carry the verbs beside the question.
+const ANSWER_KEYS_SHORT: &str = "Enter \u{00b7} Esc";
+
+/// Row 0's title and the answer keys that fit beside it in `cols`: the verbs
+/// first, then the short keys; `None` when neither fits, and the keys take a row of
+/// their own. [`banner_rows`] paints by it and [`PendingClose::wanted_rows`] sizes
+/// by it, so the two agree.
+fn title_row(prompt: &ConfirmPrompt, cols: usize) -> (String, Option<String>) {
+    let title = format!("!  {}", question(prompt));
+    let fits = |keys: &str| {
+        cols.saturating_sub(keys.chars().count() + MARGIN) > MARGIN + title.chars().count() + 2
+    };
+    let keys = [answer_keys(prompt), ANSWER_KEYS_SHORT.to_string()]
+        .into_iter()
+        .find(|keys| fits(keys));
+    (title, keys)
 }
 
 impl PendingClose {
@@ -179,9 +200,10 @@ impl PendingClose {
         }
     }
 
-    /// Rows the banner wants (the splice clamps to the frame).
-    pub(crate) fn wanted_rows(&self) -> usize {
-        BANNER_ROWS
+    /// Rows the banner wants in a window `cols` wide (the splice clamps to the
+    /// frame): one more when the answer keys need a row of their own.
+    pub(crate) fn wanted_rows(&self, cols: usize) -> usize {
+        BANNER_ROWS + usize::from(title_row(&self.prompt, cols).1.is_none())
     }
 
     /// Whether the wire's `confirm yes|no` answers this question: only when a
@@ -279,25 +301,12 @@ pub(crate) fn parse_wire_answer(rest: &str) -> Result<bool, String> {
     }
 }
 
-/// `s` cut to `max` cells with a trailing ellipsis when it does not fit (the
-/// `paste_banner` shape: a hard cut reads like corruption, an ellipsis says "there
-/// is more").
-fn ellipsized(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('\u{2026}');
-    out
-}
-
 /// PURE grid-cell row builder: exactly `panel_rows` rows, each exactly `cols` wide,
-/// so the splice overwrites frame rows in place (the `config_notice` contract).
+/// so the splice overwrites frame rows in place (the `paste_banner` contract).
 /// Row 0 carries the question ([`question`]) with the two answer keys
-/// ([`answer_keys`]) right-aligned; row 1 the prompt's body, ellipsized to fit.
+/// ([`answer_keys`]) right-aligned, then the prompt's body, ellipsized to fit; in a
+/// window too narrow for the keys beside the question they take row 1 and the
+/// body row 2.
 pub(crate) fn banner_rows(
     prompt: &ConfirmPrompt,
     cols: usize,
@@ -311,19 +320,46 @@ pub(crate) fn banner_rows(
     if panel_rows == 0 {
         return rows;
     }
-    let title = ellipsized(&question(prompt), cols.saturating_sub(MARGIN));
-    write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
+    let (title, row0_keys) = title_row(prompt, cols);
     // `value` (not the dim `label`): the answer keys are not an aside — they are
-    // the only way to answer, so they read at full tone.
-    let keys = answer_keys(prompt);
-    let keys_col = cols.saturating_sub(keys.chars().count() + MARGIN);
-    if keys_col > MARGIN + title.chars().count() + 2 {
-        write_str(&mut rows[0], cols, keys_col, &keys, c.value, c.bar_bg, true);
+    // the only way to answer (every other key is swallowed), so they read at full
+    // tone and never drop.
+    let mut body_row = 1;
+    if let Some(keys) = &row0_keys {
+        write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
+        let keys_col = cols.saturating_sub(keys.chars().count() + MARGIN);
+        write_str(&mut rows[0], cols, keys_col, keys, c.value, c.bar_bg, true);
+    } else if panel_rows > 1 {
+        let title = ellipsized(&title, cols.saturating_sub(2 * MARGIN));
+        write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
+        let full = answer_keys(prompt);
+        let keys = if full.chars().count() + 2 * MARGIN <= cols {
+            full.as_str()
+        } else {
+            ANSWER_KEYS_SHORT
+        };
+        write_str(&mut rows[1], cols, MARGIN, keys, c.value, c.bar_bg, true);
+        body_row = 2;
+    } else {
+        // One row and no room for both: the keys keep their place at the right
+        // and the question is cut to what is left.
+        let keys_col = cols.saturating_sub(ANSWER_KEYS_SHORT.chars().count() + MARGIN);
+        let title = ellipsized(&title, keys_col.saturating_sub(MARGIN + 1));
+        write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
+        write_str(
+            &mut rows[0],
+            cols,
+            keys_col,
+            ANSWER_KEYS_SHORT,
+            c.value,
+            c.bar_bg,
+            true,
+        );
     }
-    if panel_rows > 1 {
+    if panel_rows > body_row {
         let text_w = cols.saturating_sub(BODY_INDENT + MARGIN);
         write_str(
-            &mut rows[1],
+            &mut rows[body_row],
             cols,
             BODY_INDENT,
             &ellipsized(prompt.body, text_w),
@@ -348,11 +384,11 @@ mod tests {
     }
 
     fn quit_prompt() -> ConfirmPrompt {
-        crate::quit_safety::confirm_prompt(true, true).expect("a busy quit always prompts")
+        crate::quit_safety::confirm_prompt(true, true, true).expect("a busy quit always prompts")
     }
 
     fn close_prompt() -> ConfirmPrompt {
-        crate::quit_safety::confirm_prompt(false, true).expect("a busy close prompts")
+        crate::quit_safety::confirm_prompt(false, true, true).expect("a busy close prompts")
     }
 
     /// The banner stands in for the native dialog, so it must show what the dialog
@@ -373,7 +409,7 @@ mod tests {
         assert!(row0.contains("Enter quits"), "{row0}");
         assert!(row0.contains("Esc cancels"), "{row0}");
         let row1 = text_of(&rows[1]);
-        assert!(row1.contains("A process is still running."), "{row1}");
+        assert!(row1.contains("A running process ends"), "{row1}");
 
         let rows = banner_rows(&close_prompt(), 100, BANNER_ROWS, Theme::default());
         let row0 = text_of(&rows[0]);
@@ -406,6 +442,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A NARROW WINDOW STILL SHOWS THE ANSWER: the band swallows every other key,
+    /// so a destructive question without its keys has no visible way out.
+    #[test]
+    fn a_narrow_band_keeps_the_answer_keys() {
+        let multi = crate::quit_safety::ConfirmPrompt {
+            title: "Close all tabs?",
+            body: "A running process ends.",
+            proceed: "Close",
+        };
+        let pending = PendingClose::new(
+            crate::WindowId(0),
+            multi,
+            CloseReplay::Window(crate::WindowId(0)),
+            ExitActor::Human,
+        );
+        assert_eq!(pending.wanted_rows(100), BANNER_ROWS);
+        // Short keys beside the question.
+        let row0 = text_of(&banner_rows(&multi, 40, BANNER_ROWS, Theme::default())[0]);
+        assert!(row0.contains("Enter \u{00b7} Esc"), "{row0:?}");
+        // Narrower still: the keys take row 1, the band grows, the body follows.
+        assert_eq!(pending.wanted_rows(24), BANNER_ROWS + 1);
+        let rows = banner_rows(&multi, 24, BANNER_ROWS + 1, Theme::default());
+        assert!(
+            text_of(&rows[1]).contains("Enter"),
+            "{:?}",
+            text_of(&rows[1])
+        );
+        assert!(
+            text_of(&rows[2]).contains("A running"),
+            "{:?}",
+            text_of(&rows[2])
+        );
+        // One row: the keys keep their place.
+        let row0 = text_of(&banner_rows(&multi, 24, 1, Theme::default())[0]);
+        assert!(row0.contains("Enter") && row0.contains("Esc"), "{row0:?}");
     }
 
     /// The wire kind follows what the answer DOES — a last-tab close of the last

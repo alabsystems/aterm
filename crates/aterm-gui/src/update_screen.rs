@@ -87,6 +87,11 @@ pub(crate) struct UpdateState {
     /// Event-loop state (`App::automatic_apply_retry_scheduled`), not ledger state —
     /// and the half of the story that decides whether the reader has to act.
     apply_retry: ApplyRetry,
+    /// The staged build is ON HOLD (`App::latched_activation_trial_spent`, the
+    /// fact the Version menu's press refuses on): its next start is the one its
+    /// boot trial rolls back. Event-loop state like [`Self::apply_retry`], and
+    /// true whether or not the ledger still names the failures.
+    staged_on_hold: bool,
     /// This launch has a bundle the updater could replace at all.
     installable: bool,
     /// The STRANDED verdict: checks complete but the release channel cannot be
@@ -106,6 +111,10 @@ pub(crate) struct UpdateState {
     /// A DEV-MARKED copy (`tools/dev-app.sh`), which the updater leaves alone on
     /// purpose; `None` for every other copy ([`Self::with_dev_build`], gap #30).
     dev_build: Option<DevBuildPage>,
+    /// Where this copy runs from (`aterm_update::which_copy::running_posture`),
+    /// read once at launch: why a copy that can't update itself can't. `None`
+    /// when unread ([`Self::with_install_posture`]).
+    install_posture: Option<aterm_update::which_copy::InstallPosture>,
 }
 
 /// A dev-marked copy as the page says it (gap #30). The updater leaves it alone on
@@ -212,6 +221,10 @@ pub(crate) struct UpdateProjection {
     /// has simply not been attempted yet — a deferral or a block records a refusal
     /// and advances no streak, and that state must keep reading as ready.
     pub(crate) apply_trouble: Option<ApplyTrouble>,
+    /// The staged build is ON HOLD (`App::latched_activation_trial_spent`): its
+    /// next start is the one its boot trial rolls back, so the page says it is
+    /// on hold at every width, and its button sends nothing and says so.
+    pub(crate) staged_on_hold: bool,
     /// Whether a replacement could be installed here AT ALL — false for a copy run
     /// from the mounted disk image, a Gatekeeper-translocated download, or a
     /// dev-marked build. EVERY surface on the page has to read it. Round five gave
@@ -325,12 +338,14 @@ impl UpdateState {
             apply_failure_build: snapshot.apply_failure_build,
             apply_attempts_for_stage: snapshot.apply_failures_for_target,
             apply_retry,
+            staged_on_hold: false,
             installable: snapshot.installable,
             channel_unreadable: snapshot.channel_unreadable,
             checking,
             checked_at: snapshot.checked_at,
             downloading: None,
             dev_build: None,
+            install_posture: None,
         }
         .without_inapplicable_stage()
     }
@@ -394,6 +409,7 @@ impl UpdateState {
             // The conservative default: claiming a retry that is not scheduled is the
             // one error that costs the reader real time.
             apply_retry: ApplyRetry::ManualOnly,
+            staged_on_hold: false,
             installable: status.is_none_or(|s| s.installable),
             channel_unreadable: status.is_some_and(|s| s.enabled && s.channel_unreadable),
             checking,
@@ -401,6 +417,7 @@ impl UpdateState {
                 .and_then(|s| aterm_update_core::pkg_check::rfc3339_to_unix(&s.updated_at)),
             downloading: None,
             dev_build: None,
+            install_posture: None,
         }
         .without_inapplicable_stage()
     }
@@ -427,6 +444,28 @@ impl UpdateState {
     pub(crate) fn with_dev_build(mut self, dev_build: Option<DevBuildPage>) -> Self {
         self.dev_build = dev_build;
         self
+    }
+
+    /// Where this copy runs from (`App::install_posture`): a copy that can't update
+    /// itself is told its one cause and remedy, not a guess between three.
+    pub(crate) fn with_install_posture(
+        mut self,
+        posture: Option<aterm_update::which_copy::InstallPosture>,
+    ) -> Self {
+        self.install_posture = posture;
+        self
+    }
+
+    /// The staged build is on hold (`App::latched_activation_trial_spent`): the
+    /// page says so, and its button starts nothing.
+    pub(crate) fn with_staged_on_hold(mut self, on_hold: bool) -> Self {
+        self.staged_on_hold = on_hold;
+        self
+    }
+
+    /// A build on offer that is on hold ([`Self::staged_on_hold`]).
+    fn on_hold(&self) -> bool {
+        self.enabled && self.staged.is_some() && self.staged_on_hold
     }
 
     /// The quiet download, where the page may say it: macOS, an installable copy
@@ -551,6 +590,7 @@ impl UpdateState {
             // in flight owns the surface, and a verdict from before it started must
             // not argue with the "Checking…" the user is looking at.
             apply_trouble: (!self.checking).then(|| self.apply_trouble()).flatten(),
+            staged_on_hold: self.on_hold(),
             installable: self.installable,
             dev_build: self.dev_build.is_some(),
             channel_unreadable: self.channel_unreadable && self.enabled && !self.checking,
@@ -619,6 +659,11 @@ impl UpdateState {
             } else {
                 "No update staged.".to_string()
             }
+        } else if self.on_hold() {
+            // Not "ready": no surface starts a build on hold (the band's record
+            // says "is on hold" too). The count and the cause, when the ledger
+            // still has them, ride the detail line below.
+            "Update on hold".to_string()
         } else if self.staged.is_some() && self.enabled && self.apply_is_failing() {
             // A stage that is persistently FAILING TO APPLY (the APPLY class: the
             // handoff keeps ending badly) is not "Update ready" — the health notice
@@ -626,7 +671,7 @@ impl UpdateState {
             // apply class earns this sentence: a `manifest`/`pipeline` streak is
             // about ACQUIRING the NEXT build and says nothing about the stage in
             // hand, which is verified and will install (round-4 audit).
-            "Update ready, but it keeps failing to apply.".to_string()
+            "Update keeps failing to install.".to_string()
         } else if self.apply_trouble().is_some() {
             // BELOW THE ESCALATION THRESHOLD IS STILL NOT "READY". `PERSISTENT_AFTER`
             // decides when the machine complains LOUDLY; it was never meant to decide
@@ -635,7 +680,7 @@ impl UpdateState {
             // `failing_applies=2` for hours under a plain "Update ready", while the
             // engine had watched the successor die twice. The count and the cause
             // ride the detail line below.
-            "Update ready, but applying it failed.".to_string()
+            "Update didn\u{2019}t install.".to_string()
         } else if self.staged.is_some() {
             "Update ready".to_string()
         } else if let Some(quiet) = self.quiet_download() {
@@ -809,13 +854,17 @@ impl UpdateState {
             return (!detail.is_empty()).then_some(detail);
         }
         if !self.installable {
-            return Some(match &self.dev_build {
-                Some(dev) => dev.detail(),
-                None => "Move aterm.app to your Applications folder and open it from there. \
-                         A copy running from a disk image, a quarantined download, or a \
-                         local build is never replaced in place."
-                    .to_string(),
-            });
+            // The one cause, never a guess between the disk image, a translocated
+            // download and a local build (which has no aterm.app to move); and never
+            // "only Applications" — any bundle outside a disk image updates.
+            use aterm_update::which_copy::InstallPosture;
+            return match (&self.dev_build, self.install_posture) {
+                (Some(dev), _) => Some(dev.detail()),
+                (None, Some(InstallPosture::NotABundle)) => {
+                    Some("A plain binary never updates itself.".to_string())
+                }
+                (None, posture) => posture.and_then(InstallPosture::remedy).map(str::to_string),
+            };
         }
         if let Some((_, v)) = self.staged.as_ref() {
             // Not the ledger `outcome`: the check lane rewrites that every cycle with
@@ -846,6 +895,14 @@ impl UpdateState {
                 // below would be a lie about which half is broken.
                 return Some(format!(
                     "Version {v} \u{00b7} every try to install it failed.{LOG_POINTER}"
+                ));
+            }
+            if self.on_hold() {
+                // On hold with no record left to name (another aterm cleared the
+                // streak): still never "ready to install".
+                return Some(format!(
+                    "Version {v} is on hold. Starting it again would roll it back; {}.",
+                    crate::update_words::NEWER_RELEASE_REPLACES
                 ));
             }
             if self.enabled && self.failing_persistent {
@@ -905,7 +962,7 @@ impl UpdateState {
             let trouble = if self.failing_kind == "apply" {
                 "The last updates didn\u{2019}t install".to_string()
             } else {
-                sentence_start(check_trouble_words(&self.failing_kind))
+                crate::update_words::capitalize_first(check_trouble_words(&self.failing_kind))
             };
             return Some(format!("{trouble}; aterm keeps trying.{LOG_POINTER}"));
         }
@@ -931,14 +988,6 @@ fn check_trouble_words(kind: &str) -> &'static str {
     }
 }
 
-/// `the newest …` → `The newest …`.
-fn sentence_start(text: &str) -> String {
-    let mut chars = text.chars();
-    chars.next().map_or_else(String::new, |first| {
-        first.to_uppercase().chain(chars).collect()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,6 +1009,7 @@ mod tests {
     fn linux_facts() -> aterm_update::LinuxUpdateStatus {
         aterm_update::LinuxUpdateStatus {
             installed_build: 828,
+            installed_version: String::new(),
             staged_build: Some(830),
             staged_version: Some("0.5.15".into()),
             staged_commit: Some("ab".repeat(20)),
@@ -1444,14 +1494,28 @@ mod tests {
         st.staged_dmg_sha256 = None;
         st.changelog = None;
         st.installable = false;
-        let s = UpdateState::from_status(828, "0.5.14", Some(&st), false);
-        let p = s.projection();
+        use aterm_update::which_copy::InstallPosture;
+        let page = |posture: Option<InstallPosture>| {
+            UpdateState::from_status(828, "0.5.14", Some(&st), false)
+                .with_install_posture(posture)
+                .projection()
+        };
+        let p = page(Some(InstallPosture::MountedImage));
         assert_eq!(p.headline, "This copy of aterm can\u{2019}t update itself.");
-        let detail = p.detail.expect("detail");
-        assert!(
-            detail.contains("Applications"),
-            "…and how to fix it: {detail}"
+        // The one cause's remedy, never a guess between three.
+        assert_eq!(p.detail.as_deref(), InstallPosture::MountedImage.remedy());
+        assert_eq!(
+            page(Some(InstallPosture::Translocated)).detail.as_deref(),
+            InstallPosture::Translocated.remedy()
         );
+        // A plain binary has no aterm.app to move.
+        let binary = page(Some(InstallPosture::NotABundle)).detail;
+        assert_eq!(
+            binary.as_deref(),
+            Some("A plain binary never updates itself.")
+        );
+        // Unread: the headline alone, no guessed remedy.
+        assert_eq!(page(None).detail, None);
         // The same state WITH a replaceable bundle is the ordinary healthy line.
         st.installable = true;
         let ok = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
@@ -1532,8 +1596,11 @@ mod tests {
             crate::native_settings::compact_update_headline(&behind),
             "Dev build"
         );
-        // The control: the same copy without the dev mark keeps the move-it remedy.
-        let plain = UpdateState::from_status(828, "0.91.0", Some(&st), false).projection();
+        // The control: the same copy without the dev mark, run from the disk image,
+        // keeps the move-it remedy.
+        let plain = UpdateState::from_status(828, "0.91.0", Some(&st), false)
+            .with_install_posture(Some(aterm_update::which_copy::InstallPosture::MountedImage))
+            .projection();
         assert!(!plain.dev_build);
         assert_eq!(
             crate::native_settings::compact_update_headline(&plain),
@@ -1546,7 +1613,7 @@ mod tests {
         assert!(
             plain
                 .detail
-                .is_some_and(|d| d.contains("Applications folder"))
+                .is_some_and(|d| d.contains("Drag aterm to Applications"))
         );
     }
 
@@ -1566,7 +1633,7 @@ mod tests {
             p.failing_persistent,
             "the projection no longer masks a failure while staged"
         );
-        assert_eq!(p.headline, "Update ready, but it keeps failing to apply.");
+        assert_eq!(p.headline, "Update keeps failing to install.");
         let detail = p.detail.expect("detail");
         assert!(
             detail.contains("0.5.15") && detail.contains("3 times"),
@@ -1710,7 +1777,7 @@ mod tests {
     /// THE SOFTWARE UPDATE PAGE ON 2026-09-14. The pull-down said "Run `aterm-ctl
     /// update status` … — see Settings ▸ Software Update", and this is what Settings
     /// showed for six failed applies of a staged v0.85.0 refused by an ad-hoc-signed
-    /// `/Applications/aterm.app`: "Update ready, but it keeps failing to apply." over
+    /// `/Applications/aterm.app`: "Update keeps failing to install." over
     /// "aterm tried to update 6 times and the handover could not be set up. It will
     /// try again by itself. See aterm.log". While the App still reports a current
     /// installed-source block, the page must carry that repair advice. A historical
@@ -1727,7 +1794,9 @@ mod tests {
                  /Applications/aterm.app cannot be the rollback source the swap installs: \
                  bundle policy: codesign --verify (team-pinned requirement) failed; the \
                  terminal was left untouched",
-                ApplyRetry::NeedsPerson,
+                ApplyRetry::NeedsPerson(
+                    crate::update_apply_trouble::PersonRemedy::InstallSignedRelease,
+                ),
             )
             .projection();
         let detail = p.detail.expect("detail");

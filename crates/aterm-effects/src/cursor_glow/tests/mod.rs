@@ -52,9 +52,9 @@ mod resident_cap;
 mod review;
 /// Landing rings and halo culling: `cursor_glow/tests/rings.rs`.
 mod rings;
-/// The seam's licence-class laws — one-shots spend once, a glyph
-/// supersedes nothing whose echo is owed, one kill one `Kill`, a held
-/// park is a wake source: `cursor_glow/tests/seam_laws.rs`.
+/// The seam's licence-class laws (one-shots spend once, a glyph supersedes
+/// nothing whose echo is owed, one kill one `Kill`, a held park is a wake
+/// source).
 mod seam_laws;
 /// Typing sound cues and the key-time ledger: `cursor_glow/tests/sound.rs`.
 mod sound;
@@ -91,10 +91,9 @@ fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
-/// Type `text` at the owner's measured cadence (85 ms per key) from the
-/// caret at `(row, col)`, each key echoed 3 ms after its press (a Space
-/// carries its class, so the ribbon's moved-word relay has the witness
-/// it keys on). Returns the clock of the last echo.
+/// Type `text` at 85 ms per key from the caret at `(row, col)`, each key echoed
+/// 3 ms after its press (a Space carries its class, for the ribbon's moved-word
+/// relay). Returns the clock of the last echo.
 fn type_echoed(
     glow: &mut CursorGlow,
     row: u16,
@@ -121,15 +120,13 @@ fn type_echoed(
     t + ms(3)
 }
 
-// C5 ("single source"): the test pinning `prefs::CURSOR_TRAIL_STYLES` to
-// `GlowStyle::parse` lives beside the list in aterm-gui's `prefs.rs` — the
-// list is a GUI picker domain, so the pin moved with it at extraction time.
+// The test pinning `prefs::CURSOR_TRAIL_STYLES` to `GlowStyle::parse` lives
+// beside the list in aterm-gui's `prefs.rs`.
 
-/// Press one plain Backspace and let its one-column retreat be seen — the
-/// LICENSE-era shape of what used to be an exact delete candidate: the
-/// press stamps `quench_hint` (which licenses the retreat AND classifies it
-/// as a deletion) and `bs_poof_hint` (the poof's own license), and the row
-/// probe carries the erase evidence the poof lane reads directly.
+/// Press one plain Backspace and let its one-column retreat be seen: the press
+/// stamps `quench_hint` (licensing the retreat and classifying it as a
+/// deletion) and `bs_poof_hint`, and the row probe carries the erase evidence
+/// the poof lane reads.
 fn arm_exact_backspace(
     glow: &mut CursorGlow,
     now: Instant,
@@ -147,9 +144,8 @@ fn arm_exact_backspace(
 }
 
 fn geom() -> Geom {
-    // Identity layout: origin 0 + win == grid extents (320×96) ⇒ every
-    // emission is byte-identical to the historical pad-relative contract,
-    // so this whole suite doubles as the window-space identity proof.
+    // Identity layout: origin 0 + win == grid extents (320×96), so the suite
+    // also checks window-space identity.
     Geom {
         cw: 8,
         ch: 16,
@@ -163,12 +159,10 @@ fn geom() -> Geom {
     }
 }
 
-// ---- LIVING FLOW ------------------------------------------------------
+// ---- Living flow ------------------------------------------------------
 //
-// The channel's own gates. Four claims, and they are the four things the
-// owner's ask and this file's standing rulings between them require:
-// it MOVES, it does not FLICKER, it does not RE-COLOUR, and it SPENDS NO
-// LIGHT — plus the reduced-motion stand-down.
+// The channel's own gates: it moves, does not flicker, does not re-colour, and
+// spends no light, plus the reduced-motion stand-down.
 
 fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
     GlowConfig {
@@ -190,18 +184,13 @@ fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
         audible: true,
         radius: 0.6,
         ring: true,
-        // Water and rainbow kitty are beam-less (WATER-1 / the kitty draws its
-        // own continuous body);
-        // every other enum style shows its beam. (The comet/lumen raw-string
-        // distinction only exists in the GUI resolver, not at this enum helper.)
+        // Water and rainbow kitty are beam-less (the kitty draws its own
+        // continuous body); every other enum style shows its beam.
         beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
         head_dx: 0.5,
         pack: None,
-        // This enum-only fixture has no raw spelling to resolve, so it
-        // starts on the DEFAULT tall presentation. Tests of shipping
-        // presentation resolution use
-        // `cfg_for_style_name`; body-specific tests set the field
-        // deliberately.
+        // No raw spelling to resolve here, so start on the default tall
+        // presentation; spelling tests use `cfg_for_style_name`.
         ribbon_tall: true,
         ribbon_flat: false,
     }
@@ -236,10 +225,9 @@ fn assert_invariants(out: &[GlowQuad], g: Geom) {
     }
 }
 
-/// Codex's 57-row screen (`ESC[{vt};57r`), 0-based: the measured
-/// viewport tops (11, 16, 18, 22, 24, …, 51), the composer at row 13
-/// after the first Enter, the pinned composer at row 54 — the band
-/// tests are stated on it.
+/// Codex's 57-row screen (`ESC[{vt};57r`), 0-based: viewport tops (11, 16, 18,
+/// 22, 24, …, 51), the composer at row 13 after the first Enter, the pinned
+/// composer at row 54. The band tests are stated on it.
 fn geom_codex() -> Geom {
     Geom {
         cw: 8,
@@ -291,8 +279,7 @@ fn three_visible_echoes(glow: &mut CursorGlow, t0: Instant, out: &mut Vec<GlowQu
 }
 
 /// A retina-scale geometry: the strip's short axis is wide enough in device
-/// pixels for the bloomed stack to carry all six anchors, so the streak's
-/// slab law can be measured rather than inferred.
+/// pixels to carry all six anchors, so the slab law can be measured.
 fn retina_geom() -> Geom {
     Geom {
         cw: 16,
@@ -307,29 +294,12 @@ fn retina_geom() -> Geom {
     }
 }
 
-/// **THE SHARED TEST COMPOSITOR** — the renderer's real painter order, its
-/// real `add_sat` saturation, and its real opaque caret, in one place both
-/// on-glass gates read.
+/// The shared test compositor: the renderer's painter order, `add_sat`
+/// saturation and opaque caret, used by the on-glass gates. A linear rescale
+/// cannot represent `add_sat` clipping, and the caret is painted last over its
+/// own halo, so gates must composite the real way.
 ///
-/// **WHY IT EXISTS.** Two gates in this file each grew their OWN compositor
-/// and each of them was structurally unable to see the defect it was
-/// standing guard over.
-///
-/// * The ledge gate composited the ribbon's `under` stream ALONE — held to
-///   [`RAINBOW_UNDER_COV_CAP`] — discarded `out` and `halos`, and then
-///   multiplied every measured delta by `RAINBOW_FRAME_PEAK / cap`. **A
-///   LINEAR RESCALE CANNOT REPRESENT `add_sat` CLIPPING**: the on-glass
-///   frame reaches `255` and STOPS, so the shoulder a rescale predicts at
-///   `238 · |p'|` is on glass a step down from a flat plateau, and the two
-///   numbers are unrelated. Its `assert_eq!(ledges, 0)` really asserted "no
-///   raw delta ≥ 18".
-/// * The brightest-pixel gate composed the caret's own halo ON TOP of the
-///   opaque block. Glass paints the block LAST ([`draw_cursor`] is the final
-///   pass, and at the default opacity the fill REPLACES the cell), so that
-///   halo is invisible where the gate was crediting it to the caret.
-///
-/// **THE ORDER IS THE RENDERER'S**, read off `composite_free` and the
-/// post-passes that follow it:
+/// The order, as in `composite_free` and its post-passes:
 ///
 /// ```text
 ///   ground                                   the theme background
@@ -340,10 +310,8 @@ fn retina_geom() -> Geom {
 ///   the caret         REPLACE, opaque        draw_cursor — LAST
 /// ```
 ///
-/// Nothing here is a model of the renderer: `add_sat`, `premul_rgb`,
-/// `over_rgb`, `halo_row_ny` and `halo_weight` are the renderer's own
-/// exported functions, so a change to how light composites moves this with
-/// it.
+/// `add_sat`, `premul_rgb`, `over_rgb`, `halo_row_ny` and `halo_weight` are the
+/// renderer's own exported functions, so this moves with the renderer.
 struct Glass {
     px: Vec<u32>,
     w: usize,
@@ -376,16 +344,10 @@ impl Glass {
         (((p >> 16) & 0xff).max((p >> 8) & 0xff).max(p & 0xff)) as i32
     }
 
-    /// A [`GlowQuad`] stream — `draw_flat_add`'s contract, PER QUAD.
-    ///
-    /// [`aterm_render::over_premul`] is the one equation both modes are and
-    /// is byte-identical to `add_sat` at `alpha == 0`, so this is the
-    /// renderer's own walk for an additive stream AND for the rainbow bed's
-    /// source-over one. Reading `q.alpha` here is not a refinement: with
-    /// `add_sat` hardcoded, every oracle in this file that composites the
-    /// bed would be measuring a frame the renderer does not draw — brighter
-    /// than the real one by the ground the bed displaces — and would go on
-    /// certifying ink lift, plateaus and whites against it.
+    /// A [`GlowQuad`] stream, per quad as `draw_flat_add` does.
+    /// [`aterm_render::over_premul`] covers both modes (it equals `add_sat` at
+    /// `alpha == 0`), so the rainbow bed's source-over quads composite as
+    /// drawn rather than brighter.
     fn add_quads(&mut self, qs: &[GlowQuad]) {
         for q in qs {
             for y in q.y as usize..(q.y as usize + q.h as usize).min(self.h) {
@@ -397,9 +359,8 @@ impl Glass {
         }
     }
 
-    /// A [`RainHalo`] stream — `draw_radial_add`'s contract, including its
-    /// Add-before-Over mode split and the integer elliptical falloff both
-    /// presenters compute byte-for-byte.
+    /// A [`RainHalo`] stream as `draw_radial_add` draws it: Add-before-Over mode
+    /// split and the integer elliptical falloff both presenters share.
     fn add_halos(&mut self, hs: &[RainHalo]) {
         for mode in [HaloMode::Add, HaloMode::Over] {
             for q in hs.iter().filter(|q| q.mode == mode) {
@@ -439,11 +400,9 @@ impl Glass {
         (x0, y0, x0 + self.g.cw as i32, y0 + self.g.ch as i32)
     }
 
-    /// Phase C — the GLYPH INK, laid over the finished under-ink stack and
-    /// UNDER every additive stream that follows. A solid block of `fg`
-    /// across the cell's x-height is the worst case the composition rule is
-    /// stated against: whatever an ink pixel reads afterwards, the effect
-    /// put it there.
+    /// Phase C, the glyph ink, over the under-ink stack and under every later
+    /// additive stream. A solid `fg` block across the x-height is the worst
+    /// case: whatever an ink pixel reads afterwards, the effect put it there.
     fn stamp_ink(&mut self, row: u16, col: u16, fg: u32) {
         let (x0, y0, x1, y1) = self.cell_rect(row, col);
         let top = y0 + (self.g.ch as i32 * 3) / 10;
@@ -456,10 +415,8 @@ impl Glass {
         let _ = y1;
     }
 
-    /// `draw_cursor`, LAST: at the default opacity the block cursor's fill
-    /// REPLACES the cell's pixels, so nothing the effect laid inside the
-    /// caret cell survives and the caret's own halo lights only what hangs
-    /// OUTSIDE it.
+    /// `draw_cursor`, last: at default opacity the block fill replaces the
+    /// cell, so only light outside the caret cell survives.
     fn stamp_caret(&mut self, row: u16, col: u16, fill: u32) {
         let (x0, y0, x1, y1) = self.cell_rect(row, col);
         for y in y0.max(0)..y1.min(self.h as i32) {
@@ -470,17 +427,10 @@ impl Glass {
     }
 }
 
-/// A quad is a RIBBON row (v0.31 smooth gradient) if it is a SATURATED
-/// SPECTRUM colour: max−min channel above a floor AND a genuinely low
-/// channel. This distinguishes the rainbow gradient (every spectrum hue has
-/// a channel near 0) from BOTH the pure-white starfield (R≈G≈B) and the
-/// warm-white sparkle stars (0xFFF2C0 — all channels high), neither of which
-/// is ribbon or subject to the ribbon coverage cap. The chroma floor is a
-/// modest 12: the calmer cold birth-brightness curve (`0.45 + 0.85·disp`)
-/// plus the near-cursor head ramp mean a FRESHLY-laid cold ribbon cell (u≈0)
-/// renders faint at the test-config intensity (0.7) — it is still a saturated
-/// spectrum quad, just dim — so the floor stays below that to detect PRESENCE
-/// while a pure/warm white (chroma 0, or all channels ≥100) is still excluded.
+/// Whether a quad is a ribbon quad: a saturated spectrum colour (chroma above a
+/// floor and one channel genuinely low). This excludes the white starfield
+/// (R≈G≈B) and warm-white sparkles (0xFFF2C0). The floor of 12 still detects a
+/// freshly laid, dim cold ribbon cell at the test intensity (0.7).
 fn is_ribbon_quad(color: u32) -> bool {
     let (r, g, b) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
     let hi = r.max(g).max(b);
@@ -488,14 +438,8 @@ fn is_ribbon_quad(color: u32) -> bool {
     hi.saturating_sub(lo) > 12 && lo < 100
 }
 
-/// The distinct cell columns (`(x - origin_x) / cw`) a ribbon occupies on
-/// `row` — the smooth-gradient replacement for the old crisp-band cell
-/// count. Origin-aware (quads are window-absolute); identity-safe at
-/// `origin_x == 0`.
-/// The columns of `row` that own v2 ribbon light — a laid glyph cell
-/// (`Engine::field_at`), which is what "the ribbon lit this cell" means
-/// since v1's per-cell sparks went. v2 lays the GLYPH cells, never the
-/// caret's own.
+/// The columns of `row` that own v2 ribbon light: laid glyph cells
+/// (`Engine::field_at`), never the caret's own.
 fn v2_cols(glow: &CursorGlow, row: u16) -> std::collections::BTreeSet<u16> {
     (0..256u16)
         .filter(|&col| glow.v2.field_at(row, col).is_some())
@@ -510,7 +454,7 @@ fn ribbon_cols(out: &[GlowQuad], row: u16, g: Geom) -> std::collections::BTreeSe
 }
 
 // ===================================================================
-// Trail Packs (the `GlowStyle::Custom` DATA path).
+// Trail Packs (the `GlowStyle::Custom` data path).
 // ===================================================================
 
 /// Every built-in style. Adding `Custom` must not change any of these.
@@ -532,22 +476,20 @@ fn typed_scratch() -> Vec<GlowQuad> {
 }
 
 // ===================================================================
-// RAINBOW KITTY v2 — the seam (`RAINBOW-KITTY-V2.md` §17.2, D14).
+// Rainbow Kitty v2: the seam (`docs/design/RAINBOW-KITTY-V2.md` §17.2, D14).
 // ===================================================================
 
-/// THE DELETION ORACLE'S SCRIPT (§17.3 phase 7): one scripted session
-/// rich enough to reach every v2 producer — a probed row so stardust can
-/// be born, ten typed keys at human cadence, an end-of-line fling, three
-/// more keys, two backspaces, a kill, a home fling, a Return, four keys
-/// on the new row, a five-cell word hop, and the decay tail out to 5 s —
-/// folding EVERY observable the host reads each frame: the fingerprint,
-/// the `out` / `under` quad bytes, every halo field, every cue kind, the
-/// caret seam (`caret_paint`, `caret_flare_at`, `rainbow_field`,
-/// `rainbow_head_rgb`), the spine (`momentum_display`, `rainbow_phase`,
-/// `typing_momentum`), the scheduler (`needs_frame_cadence`,
-/// `next_change_deadline`, `is_active`), the companion impulse and the
-/// motion pulse, and the v2 status row. `reduced` drives the posture
-/// seam. Deterministic given the relative schedule.
+/// The deletion oracle's script: one session reaching every v2 producer (a
+/// probed row for stardust, ten keys at human cadence, an end-of-line fling,
+/// three more keys, two backspaces, a kill, a home fling, a Return, four keys
+/// on the new row, a five-cell word hop, and a decay tail to 5 s), folding
+/// every observable the host reads each frame: fingerprint, `out` / `under`
+/// quad bytes, halo fields, cue kinds, the caret seam (`caret_paint`,
+/// `caret_flare_at`, `rainbow_field`, `rainbow_head_rgb`), the spine
+/// (`momentum_display`, `rainbow_phase`, `typing_momentum`), the scheduler
+/// (`needs_frame_cadence`, `next_change_deadline`, `is_active`), the companion
+/// impulse, the motion pulse and the v2 status row. `reduced` drives the
+/// posture seam. Deterministic given the relative schedule.
 fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
     let mut glow = CursorGlow::default();
     glow.set_reduced_motion(reduced);
@@ -567,10 +509,10 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
         glow.observe_row(row, caret, cols, at);
         glow.observe_neighbor_rows(Some(&blank), Some(&blank));
         let fp = glow.tick(Some(cell), at, cfg, g, &mut out);
-        acc = fp_fold(acc, fp);
+        acc = fnv_mix_u64(acc, fp);
         for q in out.iter().chain(glow.under_quads()) {
             for w in q.damage_words() {
-                acc = fp_fold(acc, w);
+                acc = fnv_mix_u64(acc, w);
             }
         }
         for h in glow.halos() {
@@ -587,40 +529,40 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
                 u64::from(h.ry),
                 u64::from(matches!(h.mode, aterm_core::render::HaloMode::Over)),
             ] {
-                acc = fp_fold(acc, w);
+                acc = fnv_mix_u64(acc, w);
             }
         }
-        acc = fp_fold(acc, glow.sound_cues.len() as u64);
+        acc = fnv_mix_u64(acc, glow.sound_cues.len() as u64);
         for cue in glow.drain_sound_cues() {
             for b in format!("{cue:?}").bytes() {
-                acc = fp_fold(acc, u64::from(b));
+                acc = fnv_mix_u64(acc, u64::from(b));
             }
         }
-        acc = fp_fold(acc, u64::from(glow.caret_paint(at).to_bits()));
-        acc = fp_fold(
+        acc = fnv_mix_u64(acc, u64::from(glow.caret_paint(at).to_bits()));
+        acc = fnv_mix_u64(
             acc,
             glow.caret_flare_at().map_or(u64::MAX, |f| {
                 at.saturating_duration_since(f).as_micros() as u64
             }),
         );
-        acc = fp_fold(acc, u64::from(glow.rainbow_field().to_bits()));
-        acc = fp_fold(
+        acc = fnv_mix_u64(acc, u64::from(glow.rainbow_field().to_bits()));
+        acc = fnv_mix_u64(
             acc,
             u64::from(glow.rainbow_head_rgb(cfg).unwrap_or(u32::MAX)),
         );
-        acc = fp_fold(acc, u64::from(glow.momentum_display().to_bits()));
-        acc = fp_fold(acc, u64::from(glow.rainbow_phase().to_bits()));
-        acc = fp_fold(acc, u64::from(glow.typing_momentum(at).to_bits()));
-        acc = fp_fold(acc, u64::from(glow.needs_frame_cadence()));
-        acc = fp_fold(
+        acc = fnv_mix_u64(acc, u64::from(glow.momentum_display().to_bits()));
+        acc = fnv_mix_u64(acc, u64::from(glow.rainbow_phase().to_bits()));
+        acc = fnv_mix_u64(acc, u64::from(glow.typing_momentum(at).to_bits()));
+        acc = fnv_mix_u64(acc, u64::from(glow.needs_frame_cadence()));
+        acc = fnv_mix_u64(
             acc,
             glow.next_change_deadline(at, Duration::from_millis(8))
                 .map_or(u64::MAX, |d| {
                     d.saturating_duration_since(at).as_micros() as u64
                 }),
         );
-        acc = fp_fold(acc, u64::from(glow.is_active()));
-        acc = fp_fold(
+        acc = fnv_mix_u64(acc, u64::from(glow.is_active()));
+        acc = fnv_mix_u64(
             acc,
             match glow.take_companion_impulse() {
                 None => 0,
@@ -629,15 +571,15 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
                 Some(CompanionImpulse::Delight) => 3,
                 Some(CompanionImpulse::Meteor { dir, t0, t_flight }) => {
                     let age = at.saturating_duration_since(t0).as_micros() as u64;
-                    fp_fold(
-                        fp_fold(fp_fold(4, dir as u64), age),
+                    fnv_mix_u64(
+                        fnv_mix_u64(fnv_mix_u64(4, dir as u64), age),
                         t_flight.as_micros() as u64,
                     )
                 }
             },
         );
         for b in format!("{:?}", glow.take_cursor_cat_motion_pulse().map(|p| p.kind)).bytes() {
-            acc = fp_fold(acc, u64::from(b));
+            acc = fnv_mix_u64(acc, u64::from(b));
         }
         if let Some(st) = glow.v2_status() {
             for w in [
@@ -650,7 +592,7 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
                 u64::from(st.tokens.to_bits()),
                 st.fp,
             ] {
-                acc = fp_fold(acc, w);
+                acc = fnv_mix_u64(acc, w);
             }
         }
     };
@@ -694,16 +636,13 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
     acc
 }
 
-/// THE DELETION GOLDENS: [`deletion_script`]'s fold for every variant —
-/// the nine built-ins dark, then rainbow kitty light, underline and
-/// reduced-motion — with v2 unconditional for the kitty. The EIGHT
-/// non-kitty rows are the pre-seam engine's bytes, captured on
-/// `19ffec73a` and never moved since: v2 never engages for those styles,
-/// and `the_other_nine_styles_are_byte_identical_with_v2_unconditional`
-/// is the hard law that says so. The FOUR kitty rows (dark, light,
-/// underline, reduced) are the current v2's bytes on the merged tree,
-/// pinned by `rainbow_kitty_is_byte_identical_to_the_seam_era_v2` so any
-/// drift is a decision, not a surprise.
+/// The deletion goldens: [`deletion_script`]'s fold for every variant (the
+/// nine built-ins dark, then rainbow kitty light, underline and reduced
+/// motion). The eight non-kitty rows never move: v2 does not engage for those
+/// styles (`the_other_nine_styles_are_byte_identical_with_v2_unconditional`).
+/// The four kitty rows are pinned by
+/// `rainbow_kitty_is_byte_identical_to_the_seam_era_v2`, so any drift is a
+/// decision.
 ///
 /// NOT RE-BAKED AT THE 0.86 CANDIDATE'S FINAL CATCH-UP WITH MAIN
 /// (2026-09-15), and that is a measurement, not an omission. These four
@@ -800,6 +739,14 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
 /// quads whose two words are the pre-gradient pair bit for bit, and
 /// `the_other_nine_styles_are_byte_identical_with_v2_unconditional` held
 /// them unchanged on the same run.
+/// **RE-BAKED 2026-09-30: a typed lay schedules the tick that judges it**
+/// (`CursorGlow::TORN_REST_S`, the torn-redisplay recall): 32 ms after
+/// each typed echo the engine asks for one wake to see where the caret
+/// rests. Only the reduced row moved (`13_592_174_565_784_071_210` →
+/// `8_179_550_295_111_973_776`): the others already ask for frame
+/// cadence, which is earlier. Decomposed: with the wake arm and its
+/// `is_active` term removed the row reads its previous number, so the
+/// move is the deadline reading and no light; the script recalls nothing.
 const DELETION_GOLDENS: [(&str, u64); 12] = [
     ("Lumen dark", 1_264_411_311_373_267_895),
     ("Phaser dark", 2_726_566_909_586_900_035),
@@ -812,18 +759,16 @@ const DELETION_GOLDENS: [(&str, u64); 12] = [
     ("Comet dark", 14_523_124_226_784_523_753),
     ("RainbowKitty light", 5_202_336_454_404_496_754),
     ("RainbowKitty underline", 544_488_007_139_041_733),
-    ("RainbowKitty reduced", 13_592_174_565_784_071_210),
+    ("RainbowKitty reduced", 8_179_550_295_111_973_776),
 ];
 
-/// THE FLAT SPELLING'S GOLDENS: the four RainbowKitty rows of
-/// [`DELETION_GOLDENS`] under the `rainbow kitty flat` spelling
-/// (`GlowConfig::ribbon_flat`) — the owner's A/B control for the comet
-/// body. Every comet branch in `ribbon.rs` (the comet profile, the vivid
-/// rail, the from-the-hand wipe) collapses to the flat expression under
-/// the flag, so
-/// `the_flat_spelling_collapses_every_comet_branch_byte_for_byte` reads
-/// these four with the flag on, and its `assert_ne!` proves the default
-/// body moves every row away from them — the pin is never vacuous.
+/// The flat spelling's goldens: the four kitty rows of [`DELETION_GOLDENS`]
+/// under `rainbow kitty flat` (`GlowConfig::ribbon_flat`). Every comet branch
+/// in `ribbon.rs` (comet profile, vivid rail, from-the-hand wipe) collapses to
+/// the flat expression under the flag;
+/// `the_flat_spelling_collapses_every_comet_branch_byte_for_byte` reads these
+/// with the flag on, and its `assert_ne!` shows the default body moves every
+/// row away from them.
 ///
 /// These rows move with [`DELETION_GOLDENS`] on every change that is NOT
 /// a comet branch — the seam feeds both spellings the same events, and
@@ -894,36 +839,32 @@ const DELETION_GOLDENS: [(&str, u64); 12] = [
 /// `6_430_388_712_169_283_571`, underline `18_121_524_929_398_043_921` →
 /// `15_379_506_098_573_732_577`, reduced `9_256_275_961_493_287_119` →
 /// `3_073_631_414_449_164_399`. The `assert_ne!` control still holds.
+/// **RE-BAKED 2026-09-30 with [`DELETION_GOLDENS`]** (the typed lay's
+/// rest wake): reduced `3_073_631_414_449_164_399` →
+/// `12_943_034_956_261_997_624`, the other three unchanged.
 const FLAT_GOLDENS: [(&str, u64); 4] = [
     ("RainbowKitty dark", 17_890_278_511_770_188_755),
     ("RainbowKitty light", 6_430_388_712_169_283_571),
     ("RainbowKitty underline", 15_379_506_098_573_732_577),
-    ("RainbowKitty reduced", 3_073_631_414_449_164_399),
+    ("RainbowKitty reduced", 12_943_034_956_261_997_624),
 ];
 
 // =======================================================================
-// THE STALL (the owner's "I t" screenshot, attributed by
-// measurement). Real Claude Code 2.1.268 in a private headless instance
-// of the 0.82.0 build: keys typed into a 2.7 s event-loop stall came back
-// as ONE merged frame, judged `declined no-credits origin=27,5
-// target=27,35`, the ledger bridged nothing, and the glass read
-// `..###..............................+######` — "I t" lit, thirty dark
-// cells, the caret lit. Every dark cell was a key the owner pressed. A
-// press is IN FLIGHT until its row echoes or an observed edge it cannot
-// explain forgets it; it does not expire on a 2 s wall clock while its
-// row stays silent.
+// The stall: keys typed into an event-loop stall come back as one merged
+// frame. A press is in flight until its row echoes or an observed edge it
+// cannot explain forgets it; it does not expire on a wall clock while its row
+// stays silent.
 // =======================================================================
 
-/// One beat PAST THE PARK WINDOW: a held park ([`HeldPark`]) is judged on
-/// the first tick more than [`CursorGlow::TYPE_HINT_FRESH`] after it, so
-/// a verdict a park defers — a keyless backward hop's refusal and its
-/// forget, a re-anchor's flush — lands on a tick this far after the move.
+/// One beat past the park window: a held park ([`HeldPark`]) is judged on the
+/// first tick more than [`CursorGlow::TYPE_HINT_FRESH`] after it, so a verdict
+/// a park defers (a refusal and its forget, a re-anchor's flush) lands this far
+/// after the move.
 fn past_park_window() -> Duration {
     Duration::from_secs_f32(CursorGlow::TYPE_HINT_FRESH) + Duration::from_millis(50)
 }
 
-/// A 100-column grid — the measured instance's width — so a 50-cell
-/// batch fits one row.
+/// A 100-column grid, so a 50-cell batch fits one row.
 fn wide_geom() -> Geom {
     Geom {
         cw: 8,
@@ -938,10 +879,9 @@ fn wide_geom() -> Geom {
     }
 }
 
-/// The harness's pre-roll: a seating tick at `(row, 2)`, then three
-/// glyphs typed and echoed per key ([`type_echoed`]), leaving the caret
-/// at `(row, 5)` on a live three-cell cohort. Returns the clock of the
-/// last echo.
+/// Pre-roll: a seating tick at `(row, 2)`, then three glyphs typed and echoed
+/// per key ([`type_echoed`]), leaving the caret at `(row, 5)` on a live
+/// three-cell cohort. Returns the clock of the last echo.
 fn pre_roll(glow: &mut CursorGlow, row: u16, t0: Instant, c: &GlowConfig, g: Geom) -> Instant {
     let mut out = Vec::new();
     glow.tick(Some((row, 2)), t0, c, g, &mut out);
@@ -969,11 +909,8 @@ fn bridged(glow: &CursorGlow) -> u32 {
 }
 
 // =======================================================================
-// THE FOLD AFTER A STALL (S8): a key whose echo WRAPS the
-// row, observed after a stall. Measured on c45b13300 (tui model): the
-// stalled wrap `11,99 -> 12,0` declined `no-fresh-hint` (the unpaid arm
-// needed `cr == pr`), the row change cleared the ledger, and the last
-// column stayed dark for good.
+// The fold after a stall: a key whose echo wraps the row, observed after a
+// stall (`11,99 -> 12,0`), must still light the last column.
 // =======================================================================
 
 /// Keys echoed on time up to `(row, col)` on a 100-column row, from
@@ -1004,13 +941,9 @@ fn roll_to(
 }
 
 // =======================================================================
-// THE PARK: Ink's rewrite observed as TWO sync brackets ~40 ms apart —
-// the caret parked at the start of the input,
-// then the row rewritten to its end plus the new glyph. Measured on
-// c45b13300: the park licensed as a typed re-anchor (the stamp spent,
-// the mirror moved to col 2, the key's `Typed` replay laying the PROMPT
-// cell), the return refused `no-credits` / `no-fresh-hint`, six forgets,
-// half the row dark.
+// The park: Ink's rewrite seen as two sync brackets ~40 ms apart, the caret
+// parked at the start of the input, then the row rewritten to its end plus
+// the new glyph.
 // =======================================================================
 
 /// One ring row as `(reason, licence, origin, target)`.
@@ -1022,19 +955,16 @@ fn ring_rows(glow: &CursorGlow) -> Vec<RingRow> {
         .collect()
 }
 
-// ---- THE WORD MOVE SOUNDS EVERY TIME ----------------------
+// ---- The word move sounds every time ----------------------
 //
-// Option+Left / Option+Right (and Ctrl+arrow, Alt-b/f) have NO key-time
-// cue: the keyed seam opens only for a typed glyph, and D11 vetoes a nav
-// pre-cue because a no-op Ctrl-E must stay silent. So a word move's WHOLE
-// sound is echo-born — minted when this seam licenses the observed caret
-// delta — and every refusal in the seam is a word hop the owner heard as
-// "sometimes it just doesn't play".
+// Option+Left / Option+Right (and Ctrl+arrow, Alt-b/f) have no key-time cue:
+// the keyed seam opens only for a typed glyph, and D11 vetoes a nav pre-cue
+// because a no-op Ctrl-E must stay silent. A word move's whole sound is minted
+// when this seam licenses the observed caret delta, so every refusal is a
+// silent word hop.
 //
-// The five shapes below are the owner's two shells plus the controls the
-// anti-stray law demands: zsh (a caret-only echo), an Ink-style TUI (hide,
-// rewrite the line, place the caret, show), a fast pair, a program move
-// with NO key behind it, and the word KILL.
+// Shapes: zsh (caret-only echo), an Ink-style TUI (hide, rewrite, place,
+// show), a fast pair, a program move with no key behind it, and the word kill.
 
 /// Nav ticks / meteors / word-kill voices drained since the last call.
 #[derive(Default, PartialEq, Eq, Debug)]

@@ -60,34 +60,20 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 
 use aterm_objc::{class, sel_uncached, strip_method_offsets};
 
+use crate::appkit;
+use crate::appkit::load_appkit;
+
 unsafe extern "C" {
-    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
-/// `RTLD_LAZY`.
-const RTLD_LAZY: c_int = 0x1;
 /// `RTLD_DEFAULT`, as the pointer value dlfcn.h defines it on Darwin.
 const RTLD_DEFAULT: *mut c_void = (-2_isize) as *mut c_void;
-
-/// Load AppKit into this test process, once.
-fn load_appkit() -> bool {
-    use std::sync::OnceLock;
-    static LOADED: OnceLock<bool> = OnceLock::new();
-    *LOADED.get_or_init(|| {
-        let path = CString::new("/System/Library/Frameworks/AppKit.framework/AppKit")
-            .expect("no interior NUL");
-        // SAFETY: `dlopen` with a valid C path and `RTLD_LAZY`; the handle is
-        // deliberately never closed — AppKit is process-lifetime once loaded.
-        let handle = unsafe { dlopen(path.as_ptr(), RTLD_LAZY) };
-        !handle.is_null()
-    })
-}
 
 /// The files whose whole Objective-C surface W13 wrote. Relative to the repo.
 const SCOPE: &[&str] = &[
@@ -96,18 +82,9 @@ const SCOPE: &[&str] = &[
     "crates/aterm-gui/src/lib.rs",
 ];
 
-/// The Objective-C type encoding a helper's name implies, as
-/// `<return><self><_cmd><args…>`.
+/// [`appkit::shape_of`] over this census's vocabulary, [`token`].
 fn shape_of(helper: &str) -> String {
-    let rest = helper.strip_prefix("send").expect("a send helper");
-    let mut parts = rest.split('_').filter(|p| !p.is_empty());
-    let ret = parts.next().expect("a return token");
-    let mut out = String::from(token(ret));
-    out.push_str("@:");
-    for a in parts {
-        out.push_str(token(a));
-    }
-    out
+    appkit::shape_of(helper, token)
 }
 
 /// One name from a helper's `send_a_b_c` spelling, as its encoding.
@@ -182,7 +159,7 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("NSToolbar", "displayMode", "send_usize"),
     ("NSToolbarItem", "itemIdentifier", "send_id"),
     ("NSToolbarItem", "label", "send_id"),
-    // ---- NSArray: the enumeration `objc2`'s iterators used to hide ----
+    // ---- NSArray enumeration ----
     ("NSArray", "count", "send_usize"),
     ("NSArray", "objectAtIndex:", "send_id_usize"),
     // ---- The menu bar, read back ----
@@ -466,7 +443,7 @@ fn the_out_of_scope_rows_argue_for_themselves() {
 /// ```text
 /// $ cargo check -p aterm-gui --lib     # send_usize -> send_isize
 ///     Finished `dev` profile in 14.45s
-/// $ cargo test -p aterm-objc --test gui_sent_prototypes
+/// $ targo --unverified test -p aterm-objc --test objc_static_suite -- gui_sent_prototypes::
 ///     alert_keys.rs:258: the site sends modifierFlags with send_isize,
 ///     the census says ["send_usize"]
 /// ```
@@ -620,13 +597,8 @@ fn the_untyped_block_sends_name_their_sites() {
     );
 }
 
-/// `NSBeep` is a C FUNCTION, and the port binding it as one is checked here
-/// rather than asserted in a comment.
-///
-/// `lib.rs` used to call `objc2_app_kit::NSBeep()`; W13 replaced it with
-/// `appkit::beep`, a plain `extern "C"` call. If it were really a message the
-/// symbol would not be in the dynamic symbol table at all, and a reader has no
-/// way to tell those two apart by looking.
+/// `NSBeep` is a C function, so `appkit::beep` may bind it as a plain
+/// `extern "C"` call: the symbol must be in the dynamic symbol table.
 #[test]
 fn nsbeep_is_a_c_function_not_a_message() {
     assert!(load_appkit(), "AppKit is not present");

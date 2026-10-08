@@ -2,11 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! XTSMGRAPHICS - xterm graphics capability query.
-//!
-//! Implements the `CSI ? Pi ; Pa ; Pv S` control sequence for querying
-//! terminal graphics capabilities. This is used by image-capable tools
-//! to discover Sixel/ReGIS limits before rendering.
+//! XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`): the graphics-capability query
+//! image tools use to discover Sixel/ReGIS limits before rendering.
 //!
 //! Reference: xterm control sequences (Thomas E. Dickey)
 //! <https://invisible-island.net/xterm/ctlseqs/ctlseqs.txt>
@@ -45,7 +42,7 @@ use super::handler::TerminalHandler;
 #[cfg(not(feature = "sixel"))]
 const MAX_COLOR_REGISTERS: usize = 1024;
 /// Default max sixel dimension when sixel is disabled. Must match the value
-/// in aterm-sixel (4096) to avoid reporting inconsistent limits (#7263).
+/// in aterm-sixel (4096) to avoid reporting inconsistent limits.
 #[cfg(not(feature = "sixel"))]
 const SIXEL_MAX_DIMENSION: usize = 4096;
 #[cfg(feature = "sixel")]
@@ -104,10 +101,8 @@ impl XtsmgraphicsAction {
 }
 
 impl TerminalHandler<'_> {
-    /// Handle XTSMGRAPHICS query: `CSI ? Pi ; Pa ; Pv S`
-    ///
-    /// This is a read-only implementation that reports terminal graphics
-    /// capabilities without allowing modification.
+    /// Handle XTSMGRAPHICS `CSI ? Pi ; Pa ; Pv S`. Read-only: set and reset
+    /// answer Failure.
     pub(super) fn handle_xtsmgraphics(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -116,40 +111,34 @@ impl TerminalHandler<'_> {
         let pi = params.first().copied().unwrap_or(0);
         let pa = params.get(1).copied().unwrap_or(0);
 
-        // Parse item and action
         let Some(item) = XtsmgraphicsItem::from_u16(pi) else {
-            // Invalid Pi - respond with status 1
             self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::ErrorPi, &[0]);
             return;
         };
 
         let Some(action) = XtsmgraphicsAction::from_u16(pa) else {
-            // Invalid Pa - respond with status 2
             self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::ErrorPa, &[0]);
             return;
         };
 
         match (item, action) {
-            // Color registers - read current/max
+            // The palette is always its maximum size: current == max.
             (
                 XtsmgraphicsItem::ColorRegisters,
                 XtsmgraphicsAction::Read | XtsmgraphicsAction::ReadMax,
             ) => {
-                // Report MAX_COLOR_REGISTERS for both current and max
-                // (current palette size equals max in our implementation)
                 let count = u16::try_from(MAX_COLOR_REGISTERS).unwrap_or(u16::MAX);
                 self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Success, &[count]);
             }
 
-            // Sixel geometry - read current text area pixel size
             (XtsmgraphicsItem::SixelGeometry, XtsmgraphicsAction::Read) => {
                 // Per xterm, Pa=1 (Read) returns the current text area in
                 // pixels, not the maximum; lsix and img2sixel size their output
-                // from it (#7470). That is the fact CSI 14 t reports, so it
-                // rides the same window-ops capability (policy engine, then
+                // from it. That is the fact CSI 14 t reports, so it rides the
+                // same window-ops capability (policy engine, then
                 // `allow_window_ops`) and the same answer. Without the
                 // capability, or before a host has reported a cell box, it
-                // answers the maximum dimension, as it always has.
+                // answers the maximum dimension.
                 let max_dim = u16::try_from(SIXEL_MAX_DIMENSION).unwrap_or(u16::MAX);
                 let window_cap = super::window_auth::WindowMintAuthority::new()
                     .try_mint_with_engine(
@@ -164,18 +153,16 @@ impl TerminalHandler<'_> {
                 self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Success, &[w, h]);
             }
 
-            // Sixel geometry - read maximum
             (XtsmgraphicsItem::SixelGeometry, XtsmgraphicsAction::ReadMax) => {
                 let dim = u16::try_from(SIXEL_MAX_DIMENSION).unwrap_or(u16::MAX);
                 self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Success, &[dim, dim]);
             }
 
-            // ReGIS - not supported
+            // ReGIS is not supported.
             (XtsmgraphicsItem::RegisGeometry, _) => {
                 self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Failure, &[0]);
             }
 
-            // Set/Reset operations - read-only, report failure
             (_, XtsmgraphicsAction::Set | XtsmgraphicsAction::Reset) => {
                 self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Failure, &[0]);
             }
@@ -192,18 +179,10 @@ impl TerminalHandler<'_> {
     ) {
         use std::fmt::Write;
 
-        let mut response = String::with_capacity(32);
-        // CSI ?
-        response.push_str("\x1b[?");
-        // Pi
-        write!(response, "{pi}").ok();
-        // ; Ps
-        write!(response, ";{}", status as u16).ok();
-        // ; Pv... (one or more values)
+        let mut response = format!("\x1b[?{pi};{}", status as u16);
         for value in values {
             write!(response, ";{value}").ok();
         }
-        // S
         response.push('S');
 
         self.send_response(cap, response.as_bytes());
@@ -233,8 +212,7 @@ mod tests {
     }
 
     /// Without window ops the read never reaches the host: a callback that
-    /// WOULD answer is not consulted, and the reply is the maximum dimension.
-    /// (The old unconditional mint consulted it.)
+    /// would answer is not consulted, and the reply is the maximum dimension.
     #[test]
     fn sixel_geometry_read_does_not_reach_the_host_without_window_ops() {
         let mut term = Terminal::new(24, 80);
@@ -248,7 +226,7 @@ mod tests {
         });
         assert_eq!(geometry_read(&mut term), "\x1b[?2;0;4096;4096S");
 
-        // Negative control: the same host IS consulted once window ops are on.
+        // Negative control: the same host is consulted once window ops are on.
         term.modes_mut().allow_window_ops = true;
         assert_eq!(geometry_read(&mut term), "\x1b[?2;0;222;111S");
     }

@@ -2,36 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kani proofs for HAS_EXTRAS invariants: StyleId mutual exclusion,
-//! Cell::EMPTY guarantee, set/clear roundtrip, AC7 iff invariant
-//! (flag matches extras map entry), and ring_extras push/pop.
+//! Kani proofs for HAS_EXTRAS invariants (split from `proofs_kani_extras.rs`):
 //!
-//! Split from `proofs_kani_extras.rs` for file-size compliance.
-//!
-//! ## Verification Targets
-//!
-//! 7. **StyleId mutual exclusion**: u16 StyleId cast to PackedColors
-//!    can never accidentally set bit 16 (HAS_EXTRAS).
-//! 8. **Cell::EMPTY guarantee**: erase operations via Cell::EMPTY always
-//!    produce cells with HAS_EXTRAS cleared.
-//! 9. **set/clear roundtrip**: set_has_extras(true) then (false) preserves
-//!    all color data (models remove_cell_extra bit-level correctness).
-//! 10. **AC7 iff invariant**: HAS_EXTRAS flag matches extras map entry
-//!     presence through create→mutate→remove lifecycle (call-site contract).
-//! 11. **ring_extras roundtrip**: Option<Box<ScrolledRowExtras>> push/pop
-//!     preserves data through the ring buffer scrollback path.
-//!
-//! Part of memory_verification phase, #5445 epic.
+//! 7. A u16 StyleId cast into PackedColors never sets bit 16 (HAS_EXTRAS).
+//! 8. Cell::EMPTY, which erases write, has HAS_EXTRAS clear.
+//! 9. set_has_extras(true) then (false) preserves all colour data.
+//! 10. AC7: the HAS_EXTRAS flag matches extras-entry presence through a
+//!     create→mutate→remove lifecycle.
+//! 11. ring_extras push/pop of `Option<Box<ScrolledRowExtras>>` preserves data.
 
 use super::scroll_convert::ScrolledRowExtras;
 use crate::{Cell, CellExtra, PackedColors};
 
-/// StyleId-as-PackedColors can never set HAS_EXTRAS accidentally.
-///
-/// When USES_STYLE_ID is active, PackedColors stores a StyleId (u16) cast
-/// to u32 in its low bits. Since u16::MAX is 65535 (bit 15 is the highest),
-/// bit 16 (HAS_EXTRAS_BIT) can never be set from a StyleId value.
-/// This proves the implicit mutual exclusion between the two features.
+/// A StyleId (u16, highest bit 15) stored in PackedColors can never set bit 16
+/// (HAS_EXTRAS_BIT).
 #[kani::proof]
 fn style_id_as_packed_colors_never_sets_has_extras() {
     let style_id_val: u16 = kani::any();
@@ -52,12 +36,8 @@ fn style_id_as_packed_colors_never_sets_has_extras() {
     );
 }
 
-/// Cell::EMPTY never has HAS_EXTRAS set.
-///
-/// This is the foundational invariant for erase operations: clearing a cell
-/// to EMPTY must also clear the HAS_EXTRAS bit. Since erase paths reset cells
-/// via `row.clear()` / `row.clear_range()` which fill with `Cell::EMPTY`,
-/// this proof guarantees they never leave stale HAS_EXTRAS flags.
+/// Cell::EMPTY never has HAS_EXTRAS set, so erases (`row.clear()`,
+/// `row.clear_range()`) leave no stale flags.
 #[kani::proof]
 fn cell_empty_has_no_extras_flag() {
     let empty = Cell::EMPTY;
@@ -92,12 +72,8 @@ fn cell_empty_has_no_extras_flag() {
     );
 }
 
-/// set_has_extras(true) then set_has_extras(false) roundtrip on Cell.
-///
-/// Models the `remove_cell_extra` pattern: after setting has_extras and
-/// then clearing it, the cell must report has_extras() == false and color
-/// data must be preserved. This proves the remove path is correct at the
-/// bit level.
+/// set_has_extras(true) then (false) reports has_extras() == false and keeps
+/// the colour data (the `remove_cell_extra` pattern).
 #[kani::proof]
 fn set_has_extras_roundtrip_preserves_colors() {
     let raw: u32 = kani::any();
@@ -142,23 +118,15 @@ fn set_has_extras_roundtrip_preserves_colors() {
     );
 }
 
-/// HAS_EXTRAS flag set iff CellExtras entry exists (AC7 invariant).
+/// HAS_EXTRAS is set iff a CellExtras entry exists (AC7), through a
+/// create→mutate→remove lifecycle with symbolic RGB data.
 ///
-/// Models the call-site contract from `cell_extra_mut` (accessors.rs:296) and
-/// `remove_cell_extra` (accessors.rs:316). These are the two Grid accessors
-/// that maintain the "flag iff entry" invariant:
-///
-/// - `cell_extra_mut`: sets `cell.set_has_extras(true)` then `extras.get_or_create(coord)`
-/// - `remove_cell_extra`: calls `extras.remove(coord)` then `cell.set_has_extras(false)`
-///
-/// The proof verifies the iff invariant holds through a full create→mutate→remove
-/// lifecycle using a real `CellExtra` with symbolic RGB color data.
-/// The "entry exists" state is modeled as an `Option<CellExtra>` rather than a map,
-/// avoiding HashMap/BTreeMap allocator complexity that causes CBMC state explosion.
-///
-/// Note: bulk operations (clear_row, shift_rows_up_by) may leave stale flags;
-/// the rendering path's `|| is_complex()` safety net handles this. This proof
-/// covers the per-cell accessor contract, not the bulk approximation.
+/// Models the accessor contract: `cell_extra_mut` sets the flag then
+/// `get_or_create`s the entry; `remove_cell_extra` removes the entry then
+/// clears the flag. The entry is an `Option<CellExtra>` rather than a map to
+/// avoid allocator state explosion. Bulk operations (clear_row,
+/// shift_rows_up_by) may leave stale flags, which the render path's
+/// `|| is_complex()` tolerates.
 #[kani::proof]
 fn has_extras_iff_entry_exists() {
     let mut cell = Cell::EMPTY;
@@ -219,11 +187,8 @@ fn has_extras_iff_entry_exists() {
     );
 }
 
-/// Option<Box<ScrolledRowExtras>> roundtrip with real types.
-///
-/// Verifies the ring_extras push/pop pattern preserves data:
-/// empty extras → None (saves allocation), non-empty → Some(Box).
-/// The pop path reconstructs the original via Default::default() or unboxing.
+/// ring_extras push/pop round trip: empty extras become None, non-empty
+/// `Some(Box)`, and pop reconstructs the original.
 #[kani::proof]
 fn ring_extras_option_box_real_roundtrip() {
     let has_data: bool = kani::any();

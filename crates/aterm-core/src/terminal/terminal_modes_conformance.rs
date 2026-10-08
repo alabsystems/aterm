@@ -3,30 +3,19 @@
 // Author: Andrew Yates
 
 //! Tier-1 bind for `TerminalModes` (`aterm_spec::derive::terminal_modes_model`):
-//! drive every `#[refines(machine = "terminal_modes", …)]` action through REAL
-//! `Terminal::process_at` bytes, project the real [`TerminalModes`] onto the
-//! model with [`project_modes`], and validate each step against the model (the
-//! in-process interpreter always, `ty trace validate` wherever installed).
+//! drives every `#[refines(machine = "terminal_modes", …)]` action through real
+//! `Terminal::process_at` bytes, projects the real [`TerminalModes`] with
+//! [`project_modes`], and validates each step against the model (the in-process
+//! interpreter always, `ty trace validate` where installed).
 //!
-//! It lives in aterm-core's own unit-test build because that is where the
-//! anchors expand (`cfg_attr(any(test, feature = "spec-anchors"), …)`), so each
-//! step also runs inside a [`StepEvidence`] window and the audit proves the
-//! window entered the action's OWN anchored function — every site of it, for
-//! the multi-site actions (the four mouse-tracking enables, the alt-screen
-//! entries and exits of modes 47/1047/1049, DECSCUSR and mode 12 for both
-//! cursor-shape actions, and the three encodings that replace SGR 1006).
+//! It lives in aterm-core's unit-test build, where the anchors expand, so each
+//! step runs inside a [`StepEvidence`] window proving it entered every anchored
+//! site of its own action. Every action sets its variable to an exact value, so
+//! a handler that does nothing is rejected. The host's default cursor shape is
+//! set to a non-factory style so shape steps and resets are checked against it.
 //!
-//! Every action sets its own variable to an exact value, so a handler that
-//! entered its function and did nothing is a step the model rejects, not only
-//! one that disturbed some other mode.
-//!
-//! The host's default cursor shape is set to a NON-factory style first, so the
-//! cursor-shape steps and both resets are checked against the HOST's shape
-//! rather than `CursorStyle::default()`.
-//!
-//! NEGATIVE CONTROL: the model's defect is a DECSTR that forgets the
-//! synchronized-output hold (a frozen screen). From a real held state, that
-//! step is rejected by the committed model and admitted by `Buggy = 1`.
+//! Negative control: a DECSTR that forgets the synchronized-output hold is
+//! rejected by the committed model and admitted by `Buggy = 1`.
 
 use std::collections::BTreeMap;
 
@@ -105,7 +94,7 @@ const STEPS: &[(&str, &[u8])] = &[
     ("ResetMouseMode", b"\x1b[?1003l"),
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
     ("ResetSgrMouseEncoding", b"\x1b[?1006l"),
-    // Every other encoding REPLACES SGR 1006.
+    // Every other encoding replaces SGR 1006.
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
     ("ResetSgrMouseEncoding", b"\x1b[?1005h"),
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
@@ -121,7 +110,7 @@ const STEPS: &[(&str, &[u8])] = &[
     ("RestoreCursorStyle", b"\x1b[?12l"),
     ("SetCursorStyle", b"\x1b[0 q"),
     // Move every restorable mode off its default, inside the alternate screen,
-    // then soft-reset: DECSTR must restore all of them and KEEP the screen.
+    // then soft-reset: DECSTR must restore all of them and keep the screen.
     ("SetAlternateScreen", b"\x1b[?1049h"),
     ("SetApplicationCursorKeys", b"\x1b[?1h"),
     ("SetOriginMode", b"\x1b[?6h"),
@@ -221,7 +210,7 @@ fn real_mode_handlers_conform_to_terminal_modes_model() {
     assert_eq!(driven, modelled, "every model action was driven");
 }
 
-/// The modelled defect from a REAL held state: DECSTR that keeps the
+/// The modelled defect from a real held state: DECSTR that keeps the
 /// synchronized-output hold.
 #[test]
 fn a_soft_reset_that_keeps_the_sync_hold_is_the_buggy_step() {

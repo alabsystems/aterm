@@ -1,26 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! OFFLINE trainer for the tone-of-typing classifier
-//! (`aterm_effects::tone`). Run MANUALLY when the corpus or architecture
-//! changes — never part of any build:
+//! Offline trainer for the tone-of-typing classifier (`aterm_effects::tone`).
+//! Run manually when the corpus or architecture changes; never part of a
+//! build:
 //!
 //! ```sh
 //! cargo run -p aterm-effects --example tone_train --release
 //! ```
 //!
-//! Reads `data/tone_corpus.tsv`, trains the fastText-style bag model with
-//! plain SGD (deterministic seed — the same corpus always yields the same
-//! bytes), quantizes through the SAME `encode_model`/`from_bytes` pair the
-//! runtime uses, audits the QUANTIZED model against the held-out
-//! expectations file, and only then overwrites `data/tone_model.atn`.
-//! Floors here are stricter than the conformance tests' (train ≥ 0.95,
-//! holdout ≥ 0.78 overall, ≥ 0.70 per focus language vs the tests' 0.70 /
-//! 0.60) so the committed asset always carries margin over the pins.
+//! Reads `data/tone_corpus.tsv`, trains the fastText-style bag model with plain
+//! SGD (deterministic seed), quantizes through the same `encode_model` /
+//! `from_bytes` pair the runtime uses, audits the quantized model against the
+//! held-out expectations file, and only then overwrites `data/tone_model.atn`.
+//! Floors here are stricter than the conformance tests' (train ≥ 0.95, holdout
+//! ≥ 0.78 overall, ≥ 0.70 per focus language vs the tests' 0.70 / 0.60), so the
+//! committed asset carries margin over the pins.
 //!
-//! Featurization is `tone::for_each_ngram_bucket` — the exact runtime
-//! function — so trained weights can never drift from the runtime's view of
-//! the text.
+//! Featurization is `tone::for_each_ngram_bucket`, the runtime function, so
+//! trained weights match the runtime's view of the text.
 
 use aterm_effects::tone::{self, BUCKETS, EMBED, HIDDEN, TONE_COUNT, Tone, ToneModel, ToneScratch};
 
@@ -271,8 +269,8 @@ fn main() {
         }
     }
 
-    // Quantize through the runtime's exact encode/decode pair, then audit
-    // THAT model — what ships is what was measured.
+    // Quantize through the runtime's encode/decode pair, then audit that
+    // model: what ships is what was measured.
     let bytes = tone::encode_model(&net.emb, &net.w1, &net.b1, &net.w2, &net.b2);
     let model = ToneModel::from_bytes(&bytes).expect("round trip");
     let (train_acc, _, _) = accuracy(&model, &train_labeled);

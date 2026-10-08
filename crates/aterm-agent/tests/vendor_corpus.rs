@@ -1,45 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The VENDOR CORPUS replay: every fixture under `tests/testdata/vendor/` is
-//! bytes a real Claude Code really sent or really painted, and this suite
-//! drives the shipping harness readers over them offline.
+//! The vendor corpus replay: every fixture under `tests/testdata/vendor/` is
+//! bytes a real Claude Code sent or painted, and this suite drives the shipping
+//! harness readers over them offline.
 //!
-//! # Why this suite exists, in one paragraph
+//! Every other test hands the harness a payload its author wrote; the corpus
+//! is the vendor's own. `tools/harness-capture.sh` drives a live vendor build,
+//! records which build sent what, and checks the result in; this suite replays
+//! it with no vendor installed. When the vendor changes shape, re-capture and
+//! this suite says whether the harness still holds.
 //!
-//! We do not control Claude Code, and the owner asked the question this suite
-//! answers: *how would you know for sure that these situations are handled?*
-//! Every other test in this tree hands the harness a payload its author
-//! wrote, so a green run says the harness handles what its author imagined.
-//! The corpus is the other half. `tools/harness-capture.sh` drives a live
-//! vendor build, tees the bytes it sends into files, records WHICH build sent
-//! them, and checks the result in; this suite replays them with no vendor
-//! installed, in every clone, on every gate run. When the vendor changes
-//! shape, re-capture and this suite says whether the harness still holds.
+//! A green run means: every Bash command the vendor build was observed to ask
+//! a permission for is pressed at full power when drawn into its box, and the
+//! painted `/usage` panel yields its windows. The hook payloads are data, not
+//! a channel: the vendor's record of the commands a session runs.
 //!
-//! # What a green run here does and does not mean
-//!
-//! It means: every Bash command this vendor build was OBSERVED to ask a
-//! permission for is pressed at full power when drawn into its box, and the
-//! painted `/usage` panel yields its windows. (The statusLine payloads and
-//! their HUD replay went 2026-09-27 with the reader they fed, which nothing
-//! live had fed since decision "B".) It does NOT
-//! mean the vendor will not send something else tomorrow — nothing can mean
-//! that. It means the day it does, re-capturing makes this suite say so.
-//!
-//! The hook payloads are DATA now, not a channel: decision "B" (2026-09-22)
-//! retired the hook bridge, and its reply builder went with the second
-//! harness stack on 2026-09-23. They stay because they are the vendor's own
-//! record of the commands a session runs and of its rate-limit windows.
-//!
-//! # Non-vacuity
-//!
-//! An empty corpus would make every assertion below true of nothing, which is
-//! the exact failure this suite is here to prevent elsewhere. So
-//! [`the_corpus_is_not_empty_and_covers_the_events_that_decide`] fails on a
-//! corpus that is missing, empty, or missing either event that carries the
-//! Bash command a permission box asks about. Deleting the fixtures does not
-//! make this suite pass.
+//! Non-vacuity: [`the_corpus_is_not_empty_and_covers_the_events_that_decide`]
+//! fails on a corpus that is missing, empty, or missing either event that
+//! carries the Bash command a permission box asks about.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -200,7 +179,7 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<Fixture>) {
 // The non-vacuity floor
 // ---------------------------------------------------------------------------
 
-/// THE FLOOR. Every assertion in this file is over the corpus, so an absent or
+/// The floor. Every assertion in this file is over the corpus, so an absent or
 /// empty corpus would make all of them vacuously true — the failure mode this
 /// suite exists to prevent. This is the one test that fails when there is
 /// nothing to replay.
@@ -221,13 +200,10 @@ fn the_corpus_is_not_empty_and_covers_the_events_that_decide() {
             "{}: the capture directory holds no payloads",
             cap.version
         );
-        // EVERY PAYLOAD MUST BE A PAYLOAD. Without this, `touch
-        // PermissionRequest/0.json` plus a regenerated manifest satisfies the
-        // whole suite: the kinds below are DIRECTORY names, and an empty file
-        // has a perfectly good digest. So each hook fixture must parse, must
-        // carry the session id every vendor payload carries, and must name in
-        // its own body the event its directory claims — which is also what
-        // catches a payload filed under the wrong directory.
+        // Every payload must be a payload: the kinds are directory names and
+        // an empty file has a good digest, so each hook fixture must parse,
+        // carry the session id, and name in its own body the event its
+        // directory claims (which also catches a misfiled payload).
         for f in &cap.fixtures {
             if f.kind == "screen" {
                 continue;
@@ -319,17 +295,12 @@ fn every_fixture_is_the_bytes_the_manifest_recorded() {
 // The replay
 // ---------------------------------------------------------------------------
 
-/// FULL POWER OVER THE COMMANDS THE VENDOR REALLY ASKED ABOUT (the owner's
-/// direction of 2026-09-24: every box its answer unless the owner limits it).
-///
-/// Every `PermissionRequest` payload the vendor sent carries the command its
-/// Bash box asked about. Drawn into that box — HAND-BUILT around the
-/// MEASURED command, on the 2.1.280 Bash box's measured geometry (the rule,
-/// ` Bash command`, the command row, the question, `1. Yes` / `2. No`, the
-/// `Esc to cancel · Tab to amend` footer) — the owner's default presses its
-/// `1`, and the safe rules alone (`approve = "safe"`) press nothing full
-/// power would not. Non-vacuity: at least one box is pressed that the safe
-/// rules hand over — the reason the default changed.
+/// Full power over the commands the vendor really asked about. Every
+/// `PermissionRequest` payload carries the command its Bash box asked about;
+/// drawn into that box (hand-built around the recorded command on the 2.1.280
+/// Bash box's geometry), the default presses its `1`, and the safe rules alone
+/// (`approve = "safe"`) press nothing full power would not. Non-vacuity: at
+/// least one box is pressed that the safe rules hand over (owner, 2026-09-24).
 #[test]
 fn every_captured_permission_request_is_pressed_at_full_power() {
     use aterm_agent::supervise::config::Approve;
@@ -410,18 +381,13 @@ fn every_captured_permission_request_is_pressed_at_full_power() {
     );
 }
 
-/// THE PAINTED SCREEN IS RANK-1 EVIDENCE, and here it is a real paint.
+/// The painted screen is rank-1 evidence, and here it is a real paint: the
+/// `/usage` panel is the only place some windows (the model bucket among them)
+/// appear, and `harness limits`' reader over the vendor's paint yields every
+/// window the panel painted.
 ///
-/// The design ranks aterm's own view of the grid above every vendor hook
-/// (§5.8.1), and the `/usage` panel is the only place some windows — the
-/// model bucket among them — appear at all. So the corpus carries what the
-/// vendor DREW, and `harness limits`' reader runs over it: every window the
-/// panel painted is a window of its view, on bytes nobody wrote by hand.
-///
-/// The negative control is in the same test rather than a separate one: the
-/// same reader over the session's own `status` line — a real capture of
-/// something that is NOT a usage panel — must yield nothing, so a reader that
-/// found windows everywhere could not pass this.
+/// Negative control: the same reader over the session's own `status` line (a
+/// real capture that is not a usage panel) yields nothing.
 #[test]
 fn the_painted_usage_panel_yields_its_windows() {
     use aterm_agent::harness::cli::limits_view;
@@ -432,7 +398,7 @@ fn the_painted_usage_panel_yields_its_windows() {
     for cap in captures() {
         for f in cap.fixtures.iter().filter(|f| f.kind == "screen") {
             let text = f.text();
-            let got = limits_view(&rows(&text), 1_790_000_000, 0, zone_none).windows;
+            let got = limits_view(&rows(&text), 1_790_000_000, 0, &|z, _| zone_none(z)).windows;
             if f.rel.ends_with("usage.txt") {
                 let kinds: Vec<&str> = got.iter().map(|(w, _)| w.name.as_str()).collect();
                 assert!(
@@ -443,12 +409,9 @@ fn the_painted_usage_panel_yields_its_windows() {
                     cap.version,
                     f.rel
                 );
-                // THE MODEL BUCKET IS THE POINT. The panel reader gives only
-                // a MEASURED title its vendor key, so a vendor rename of
-                // `Current week (Fable)` would silently remove the one window that
-                // exists on NO other source — while `five_hour` and
-                // `seven_day` kept the old assertion green. This panel painted
-                // it, so this panel must still yield it.
+                // The model bucket is the point: it exists on no other source,
+                // and the reader keys only a known title, so a vendor rename of
+                // `Current week (Fable)` must fail here.
                 assert!(
                     text.contains("Current week (Fable)"),
                     "{}/{}: this corpus's panel no longer carries the Fable row — re-capture",

@@ -2,23 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Performance scaling proofs for CellExtras operations.
+//! Scaling tests for CellExtras operations, using deterministic op counters.
 //!
-//! Uses deterministic test counters to verify that shift/clear operations
-//! have the expected algorithmic complexity.
-//!
-//! ## Row-Offset Amortization (#4542)
-//!
-//! `shift_rows_up_by(0, n)` uses O(1) offset bumps for full-screen scrolls.
-//! A single O(E) compaction pass runs every COMPACT_THRESHOLD (256) scrolls.
-//! The tests below verify both the O(1) fast path and the periodic compaction.
+//! `shift_rows_up_by(0, n)` bumps a row offset in O(1) for full-screen scrolls,
+//! with one O(E) compaction every COMPACT_THRESHOLD (256) scrolls.
 
 use super::*;
 
-/// Prove that `shift_rows_up_by(0, n)` is O(1) via row-offset amortization.
-///
-/// Individual full-screen shifts register 0 shift ops (just an offset bump).
-/// This replaces the former O(E) drain-rebuild per shift (#4542).
+/// `shift_rows_up_by(0, n)` registers 0 shift ops (an offset bump).
 #[test]
 fn shift_rows_up_by_full_screen_is_o1() {
     use crate::test_counters::take_extras_shift_ops;
@@ -48,9 +39,8 @@ fn shift_rows_up_by_full_screen_is_o1() {
     // Original row 0 scrolled off and is stale.
 }
 
-/// Prove that `shift_rows_up_by(start > 0, n)` is still O(E).
-///
-/// Non-zero start_row can't use offset amortization (only some rows shift).
+/// `shift_rows_up_by(start > 0, n)` is O(E): only some rows shift, so no
+/// offset amortization.
 #[test]
 fn shift_rows_up_by_partial_is_o_e() {
     use crate::test_counters::take_extras_shift_ops;
@@ -75,11 +65,7 @@ fn shift_rows_up_by_partial_is_o_e() {
     );
 }
 
-/// Prove that `clear_row` cost is O(E) using deterministic counters.
-///
-/// `clear_row` uses `retain()` which scans ALL entries regardless of which
-/// row is being cleared. This means clearing row 0 in a map with E entries
-/// across many rows still does O(E) work.
+/// `clear_row` is O(E): `retain()` scans every entry whichever row is cleared.
 #[test]
 fn clear_row_cost_linear_in_total_extras() {
     use crate::test_counters::take_extras_clear_ops;
@@ -105,11 +91,8 @@ fn clear_row_cost_linear_in_total_extras() {
     assert_eq!(ops, 500, "clear_row should scan all entries (got {ops})");
 }
 
-/// Prove that repeated full-screen scrolls are amortized O(1) per scroll.
-///
-/// With row-offset amortization (#4542), N scrolls below the compact
-/// threshold cost 0 shift ops total. A single compaction at the threshold
-/// costs O(E). Amortized cost per scroll: O(E / COMPACT_THRESHOLD).
+/// Full-screen scrolls cost 0 shift ops below the threshold and one O(E)
+/// compaction at it: amortized O(E / COMPACT_THRESHOLD) per scroll.
 #[test]
 fn scroll_compound_cost_amortized_o1() {
     use crate::test_counters::take_extras_shift_ops;

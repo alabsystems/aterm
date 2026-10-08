@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The `ty_model!` light-annotation surface (docs/RFC-ty-embed-derived-tla.md):
+//! The `ty_model!` light-annotation surface (`aterm_spec::derive`'s module docs):
 //! a model written as near-plain Rust must produce the EXACT same derived spec as
 //! the hand-built `ring_model()` (the `Expr`-constructor form that Tier-0 + Tier-1
 //! already verify). This pins the macro as pure sugar over the proven derivation —
@@ -45,7 +45,7 @@ fn macro_surface_equals_hand_built_model() {
     assert_eq!(
         macro_built.transition_spec(),
         hand_built.transition_spec(),
-        "parameterized-Init (conformance) form must match too"
+        "open-Init (conformance) form must match too"
     );
 }
 

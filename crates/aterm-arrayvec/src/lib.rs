@@ -1,26 +1,22 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `arrayvec` — aterm's first-party replacement for the upstream `arrayvec`
+//! `arrayvec`: aterm's first-party replacement for the upstream `arrayvec`
 //! crate. It contains no implementation: every item is a re-export of
-//! [`aterm_alloc`], which has carried `ArrayVec` since long before this shim
-//! existed.
+//! [`aterm_alloc`].
 //!
 //! This crate is published into the build under the package name `arrayvec`
 //! (the directory is `crates/aterm-arrayvec`; see the manifest for why the two
-//! names differ) so that `[patch.crates-io]` can redirect the six third-party
-//! consumers in aterm's graph — `naga`, `wgpu`, `wgpu-core`, `wgpu-hal`,
-//! `tiny-skia` (Linux only, under `sctk-adwaita`) and `vte` (dev edges only) —
-//! at code we own.
-//!
-//! # Why this replacement is safe, and how that was established
+//! names differ) so that `[patch.crates-io]` can redirect the five third-party
+//! consumers in aterm's graph — `naga`, `wgpu`, `wgpu-core`, `wgpu-hal` and
+//! `tiny-skia` (Linux only, under `sctk-adwaita`) — at code we own.
 //!
 //! The claim is narrower and more checkable than "our ArrayVec is as good as
-//! theirs". It is: **every item the six consumers name resolves, with the same
+//! theirs". It is: **every item the five consumers name resolves, with the same
 //! signature and the same behaviour.** Three things back it up.
 //!
 //! 1. **The surface was enumerated from the consumers' source, not guessed.**
-//!    62 distinct `ArrayVec<…>` uses across the six crates were read out of the
+//!    62 distinct `ArrayVec<…>` uses across the consumers were read out of the
 //!    registry copies and reduced to a list of methods, trait impls and syntactic
 //!    forms. Seven impls were MISSING from `aterm_alloc::ArrayVec` and were
 //!    written for this swap: `Hash`, `Extend`, `IntoIterator` by value, by `&`
@@ -36,20 +32,16 @@
 //!    consumers write — and it has to be, because no cell compiles all of what
 //!    they write, and this one compiles least of all. On macOS the four wgpu-
 //!    family crates do build, but with the feature sets that switch most of
-//!    their `ArrayVec` sites off; `tiny-skia` never enters the graph at all
-//!    (it arrives under Linux's `sctk-adwaita`); and `vte`'s single use is
-//!    `cfg`'d out by the `std` feature it resolves with. See the per-cell note
+//!    their `ArrayVec` sites off; and `tiny-skia` never enters the graph at
+//!    all (it arrives under Linux's `sctk-adwaita`). See the per-cell note
 //!    below for exactly which impls that leaves untested here.
 //!
-//! 3. **A differential oracle runs this type and the real crates.io `arrayvec`
-//!    through the same operation scripts and asserts they agree**, element by
-//!    element, hash by hash, panic by panic — including a deterministic-LCG
-//!    op-sequence fuzz. It lives at
-//!    `crates/aterm-alloc/tests/arrayvec_differential.rs` rather than here,
-//!    because a dev-dependency on the registry `arrayvec` declared by the
-//!    package that is itself *named* `arrayvec` makes `cargo test -p arrayvec`
-//!    ambiguous; the manifests on both sides carry the measurement. The oracle
-//!    is a dev-dependency either way, so it is invisible to the shipped graph.
+//! 3. **A differential runs this type and a `Vec`-backed model of upstream's
+//!    contract through the same operation scripts and asserts they agree**,
+//!    element by element, hash by hash, panic by panic — including a
+//!    deterministic-LCG op-sequence fuzz. It lives at
+//!    `crates/aterm-alloc/tests/arrayvec_differential.rs`, beside the
+//!    implementation it exercises.
 //!
 //!    Re-check the whole claim with:
 //!
@@ -57,12 +49,6 @@
 //!    cargo test -p arrayvec                    # the consumer forms
 //!    cargo test -p aterm-alloc                 # the differential + unit tests
 //!    ```
-//!
-//!    Both in one command needs the disambiguated spec —
-//!    `cargo test -p arrayvec@0.7.8 -p aterm-alloc` — because the oracle keeps
-//!    a second `arrayvec` in the graph. Bare `-p arrayvec` on its own is
-//!    unambiguous; bare `-p arrayvec -p aterm-alloc` is not. Measured both
-//!    ways.
 //!
 //! ## The per-cell scope, stated plainly
 //!
@@ -96,8 +82,7 @@
 //!   IDENTICAL — which covers the `Arc<TextureView>` / handle-carrying vectors
 //!   that dominate the wgpu side. The growth is real only for small, weakly
 //!   aligned `T`. No consumer puts an `ArrayVec` in a `#[repr(C)]` type either,
-//!   so this is not an ABI break. `crates/aterm-alloc/tests/arrayvec_differential.rs`
-//!   pins the relation so a future layout change cannot widen it unnoticed.
+//!   so this is not an ABI break.
 //! * **`Drain` under `mem::forget`.** Upstream shortens the vector up front and
 //!   restores the tail in `Drop`, so forgetting a `Drain` loses the un-drained
 //!   elements; ours removes as it yields, so forgetting one keeps them. Ours is
@@ -113,7 +98,7 @@
 //!
 //! `#![no_std]` holds for the whole graph under this crate: `aterm-alloc` is
 //! `#![no_std]` too (it needs only `core` and `alloc`), so a consumer taking
-//! this crate with `default-features = false` — which all six do — links no
+//! this crate with `default-features = false` — which all of them do — links no
 //! `std` through it.
 //!
 //! # Surface

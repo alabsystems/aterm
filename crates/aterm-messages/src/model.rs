@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use crate::glass::Fnv;
+use crate::need::{Ask, LaterAsk, MAX_TRANSIENT, Need, NoticeKind, Persist};
 use crate::text::clip;
 use crate::{
     DETAIL_LINE_CAP, DETAIL_LINES_CAP, Duration, HOLD_ERROR, HOLD_INFO, HOLD_SUCCESS, HOLD_WARN,
@@ -290,9 +291,9 @@ impl Glyph {
 /// What a `Not now` answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// The Full Disk Access question. (The elevated-install question went with the
-    /// OS-installer protocols, 2026-09-24; a carried `not-now:admin-step:` decodes to
-    /// nothing and the loader drops it.)
+    /// The Full Disk Access question. (A carried `not-now:admin-step:`, the
+    /// retired elevated-install question, decodes to nothing and the loader
+    /// drops it.)
     FileAccess,
 }
 
@@ -428,9 +429,8 @@ pub enum Intent {
         word: UpgradeWord,
     },
     /// THE OWNER'S WORD ON SEVERAL TABS' UPGRADES AT ONCE, pressed on the one
-    /// row that stands for an agent's stalled upgrades (2026-09-28, the owner:
-    /// "also fix this stacking failures of claude upgrades!" — three stalled
-    /// tabs were three rows, the whole band): `word` written for each listed
+    /// row that stands for an agent's stalled upgrades (one row, not one per
+    /// tab, so stalled tabs never fill the band): `word` written for each listed
     /// tab, for the build the row named it with (`moves`: `(tab, to)`), exactly
     /// as an [`Intent::AgentUpgrade`] press of each would. The tabs are the ones
     /// the row SHOWED, never whatever stalls when the press lands. Not
@@ -471,6 +471,30 @@ const TAB_N: [&str; 10] = [
 ];
 
 impl Intent {
+    /// A press that only silences a row or opens its words: `Details`, a
+    /// declined decision (`Not now`) and the upgrade's `Not today` and `Skip
+    /// version`. It fixes nothing, so it is never "the one action": a row
+    /// that stands past a glance and whose only capsules decline is a record
+    /// ([`Message::admit`]).
+    /// A decline may ride BESIDE a real action (a button that moves the
+    /// outcome, or a sentence that says it).
+    #[must_use]
+    pub const fn is_snooze(&self) -> bool {
+        matches!(
+            self,
+            Self::Details
+                | Self::NotNow { .. }
+                | Self::AgentUpgrade {
+                    word: UpgradeWord::NotToday | UpgradeWord::Skip,
+                    ..
+                }
+                | Self::AgentUpgradeTabs {
+                    word: UpgradeWord::NotToday | UpgradeWord::Skip,
+                    ..
+                }
+        )
+    }
+
     /// The full capsule label — the words a screen reader says.
     #[must_use]
     pub fn label(&self) -> &'static str {
@@ -520,8 +544,8 @@ impl Intent {
             Self::StopPaste { .. } => "Stop",
             Self::ShowTab { tab, .. } => TAB_N[usize::from(*tab).min(10) % 10],
             Self::AgentUpgrade { word, .. } | Self::AgentUpgradeTabs { word, .. } => match word {
-                // What the press does, not when (round 18, day four, D6: a
-                // bare `Now` beside `Tomorrow` said neither what nor to whom).
+                // What the press does, not when: a bare `Now` beside
+                // `Tomorrow` says neither what nor to whom (D6).
                 UpgradeWord::Now => "Upgrade",
                 // A day off, in the eight cells a short form has — said as
                 // the choice it is (ruling 305: `Tomorrow` alone read as a
@@ -569,9 +593,8 @@ impl Intent {
     /// these, as the accent-filled Primary chip; a navigation
     /// (`OpenSettings`, `OpenPath`, `OpenConfigEditor`) or a decline
     /// (`NotNow`, an upgrade's `Not today` and `Skip version`) is the quiet
-    /// Secondary chip, so a toolchain row's
-    /// `Packages` no longer shouts and the launch pass never stacks two
-    /// accent chips (Phase 1 review ruling 18, 2026-09-22). `Details` is
+    /// Secondary chip, so a toolchain row's `Packages` never shouts and the
+    /// launch pass never stacks two accent chips (ruling 18). `Details` is
     /// neither: it wears its own role.
     #[must_use]
     pub const fn is_consequential(&self) -> bool {
@@ -880,6 +903,12 @@ impl ActionIndex {
 }
 
 /// How long a row stays and what ends it.
+///
+/// [`Hold::Standing`] and [`Hold::Ask`] are PERSISTENT and SEALED: they carry
+/// a [`Persist`] token that only an [`Ask`] (and the carry decoder) can mint,
+/// so a reporter cannot write one — the rule at the door ([`crate::need`]) is
+/// a type, not a test. A message classed by the rule ([`Message::now`]) earns
+/// one from its ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hold {
     /// The severity's hold, anchored at FIRST glass
@@ -893,15 +922,18 @@ pub enum Hold {
         /// How long the row may go without a restate.
         stale_after: Duration,
     },
-    /// Until resolve, or until read (update health, GPU lost, a11y dead):
-    /// Details, a body press or a navigation capsule folds it (design §10.4.3,
-    /// E3), because the person has seen it and gone to fix it.
-    Standing,
-    /// A decision row (Full Disk Access): ranks first; leaves on `NotNow`,
-    /// supersede or expiry.
+    /// Until resolve, or until read (an agent that is down, GPU lost, a11y
+    /// dead): Details, a body press or a navigation capsule folds it (design
+    /// §10.4.3, E3), because the person has seen it and gone to fix it.
+    /// Sealed: built by [`Ask::standing`] only.
+    Standing(Persist),
+    /// A decision row: ranks first; leaves on `NotNow`, supersede or expiry.
+    /// Sealed like [`Hold::Standing`]: built by [`Ask::question`] only.
     Ask {
         /// The question's patience.
         for_: Duration,
+        /// The proof the decision row was asked for.
+        seal: Persist,
     },
     /// Recorded, never on glass (managed-current repeats).
     LogOnly,
@@ -916,24 +948,29 @@ impl Hold {
             Self::Default => "default".to_string(),
             Self::For(d) => format!("for:{}", d.as_secs()),
             Self::Live { stale_after } => format!("live:{}", stale_after.as_secs()),
-            Self::Standing => "standing".to_string(),
-            Self::Ask { for_ } => format!("ask:{}", for_.as_secs()),
+            Self::Standing(_) => "standing".to_string(),
+            Self::Ask { for_, .. } => format!("ask:{}", for_.as_secs()),
             Self::LogOnly => "log-only".to_string(),
         }
     }
 
-    /// The inverse of [`Hold::encode`]; unknown ⇒ `None`.
+    /// The inverse of [`Hold::encode`]; unknown ⇒ `None`. Crate only: a
+    /// decoded `standing` is a persistent hold, and only the carry may read
+    /// one (a parent admitted the row).
     #[must_use]
-    pub fn decode(s: &str) -> Option<Self> {
+    pub(crate) fn decode(s: &str) -> Option<Self> {
         let (kind, secs) = s.split_once(':').unwrap_or((s, ""));
         let dur = || secs.parse::<u64>().ok().map(Duration::from_secs);
         match kind {
             "default" if secs.is_empty() => Some(Self::Default),
-            "standing" if secs.is_empty() => Some(Self::Standing),
+            "standing" if secs.is_empty() => Some(Self::Standing(Persist::mint())),
             "log-only" if secs.is_empty() => Some(Self::LogOnly),
             "for" => dur().map(Self::For),
             "live" => dur().map(|stale_after| Self::Live { stale_after }),
-            "ask" => dur().map(|for_| Self::Ask { for_ }),
+            "ask" => dur().map(|for_| Self::Ask {
+                for_,
+                seal: Persist::mint(),
+            }),
             _ => None,
         }
     }
@@ -943,6 +980,50 @@ impl Hold {
     pub const fn is_held(self) -> bool {
         matches!(self, Self::Default | Self::For(_) | Self::Ask { .. })
     }
+
+    /// `true` for the holds that outlast a look (Standing, Ask): the ones
+    /// only a [`Need::Now`] may carry.
+    #[must_use]
+    pub const fn persists(self) -> bool {
+        matches!(self, Self::Standing(_) | Self::Ask { .. })
+    }
+
+    /// `true` for [`Hold::Standing`].
+    #[must_use]
+    pub const fn is_standing(self) -> bool {
+        matches!(self, Self::Standing(_))
+    }
+}
+
+/// What the engine's own tests, and a host's tests through the
+/// `test-fixtures` feature, build bare persistent rows from. Never in a
+/// shipped build: the token cannot be minted outside this crate, so a
+/// fixture that needs a persistent hold takes one of these, and
+/// [`Message::hold`] lends it an adopted ask so it stands exactly as the
+/// hand-written spelling did.
+#[cfg(any(test, feature = "test-fixtures"))]
+impl Hold {
+    /// A standing hold.
+    pub const STANDING: Hold = Hold::Standing(Persist::mint());
+
+    /// A decision hold of `for_`.
+    #[must_use]
+    pub const fn asking(for_: Duration) -> Hold {
+        Hold::Ask {
+            for_,
+            seal: Persist::mint(),
+        }
+    }
+}
+
+/// What the door ([`Message::admit`]) did with a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Let through as it stands.
+    Kept,
+    /// Made a record, words kept: the class could not stand. A defect of the
+    /// reporter, counted ([`crate::MessageCenter::demotions`]).
+    Demoted,
 }
 
 /// A row's progress: a fill, a volatile stats string (≤ [`STATS_CAP`]
@@ -1359,9 +1440,10 @@ impl Origin {
     }
 
     /// The wire OWNS a message minted by it or keyed in its namespace (a
-    /// carried wire row's origin is `Carried`, its key is still
-    /// [`crate::WIRE_KEY_PREFIX`]'s): the one class the duplicate test and
-    /// the log ring's wire share both use (design rulings 167, 192, 194).
+    /// carried keyed wire row's origin is `Carried`, its key is still
+    /// [`crate::WIRE_KEY_PREFIX`]'s; a carried keyless one keeps `Wire`, round
+    /// 43, ruling 415 (h)): the one class the duplicate test and the log
+    /// ring's wire share both use (design rulings 167, 192, 194).
     #[must_use]
     pub fn wire_owned(self, key: Option<&str>) -> bool {
         self == Self::Wire || key.is_some_and(|k| k.starts_with(crate::WIRE_KEY_PREFIX))
@@ -1438,10 +1520,21 @@ pub struct Message {
     /// of something happening now. Set by the builder that knows it
     /// ([`Message::retrospective`]); never inferred from the words.
     pub retrospective: bool,
+    /// What the message IS to the person ([`Need`]): the engine derives the
+    /// hold, the band's eligibility and the channel from it. Not a public
+    /// field — only the class constructors ([`Message::record`],
+    /// [`Message::working`], [`Message::notice`], [`Message::now`],
+    /// [`Message::later`]) write it, and [`Message::new`] leaves it
+    /// [`Need::Unclassified`].
+    pub(crate) need: Need,
 }
 
 impl Message {
-    /// A message with the severity's glyph and [`Hold::Default`].
+    /// A message with the severity's glyph and [`Hold::Default`], not yet
+    /// classified ([`Need::Unclassified`]): a transient row or a record. A
+    /// persistent hold cannot be written on one (the seal, [`Persist`]); the
+    /// class that earns persistence is [`Message::now`], and the digest is
+    /// [`Message::later`].
     #[must_use]
     pub fn new(tag: Tag, severity: Severity, title: impl AsRef<str>) -> Self {
         Self {
@@ -1461,7 +1554,222 @@ impl Message {
             loads: Loads::NONE,
             primary: None,
             retrospective: false,
+            need: Need::Unclassified,
         }
+    }
+
+    /// A RECORD: the log only, never on any glass.
+    #[must_use]
+    pub fn record(mut self) -> Self {
+        self.need = Need::Record;
+        self.hold = Hold::LogOnly;
+        self
+    }
+
+    /// WORK IN FLIGHT: a live row that ends with the work (`stale_after` is
+    /// its silence cap). Declare its indicator with [`Message::in_flight`] or
+    /// a [`Meter`].
+    #[must_use]
+    pub fn working(mut self, stale_after: Duration) -> Self {
+        self.need = Need::Working;
+        self.hold = Hold::Live { stale_after };
+        self
+    }
+
+    /// One of the closed list of transient rows that ask nothing
+    /// ([`NoticeKind`]).
+    #[must_use]
+    pub fn notice(mut self, kind: NoticeKind) -> Self {
+        self.need = Need::Notice(kind);
+        self.hold = Hold::For(kind.span());
+        self
+    }
+
+    /// THE OWNER IS NEEDED NOW: a band row. The ask's reason and its one
+    /// action lead the detail (the band's excerpt is the reason), the ask's
+    /// button is the first capsule, and the hold is derived from the ask —
+    /// [`Hold::Standing`] only for a standing one.
+    #[must_use]
+    pub fn now(mut self, ask: Ask) -> Self {
+        self.hold = ask.hold();
+        // A standing row is born late (the Row Law, clause 2): a row that is
+        // posted and withdrawn inside the progress grace never reaches the
+        // glass and costs no re-grid of any window.
+        if ask.is_standing() && self.reveal_after.is_none() {
+            self.reveal_after = Some(crate::PROGRESS_GRACE);
+        }
+        self.lead_with(&ask.why().words(), ask.then().words());
+        if let Some(mover) = ask.then().mover() {
+            self.actions.retain(|a| a != mover.intent());
+            self.actions.insert(0, mover.intent().clone());
+            self.actions.truncate(MAX_ACTIONS);
+        }
+        self.need = Need::Now(ask);
+        self
+    }
+
+    /// THE OWNER IS NEEDED, BUT NOT NOW: an entry of the digest. It is never
+    /// seated on the band. Its key is the ask's fingerprint.
+    #[must_use]
+    pub fn later(mut self, ask: LaterAsk) -> Self {
+        self.hold = Hold::LogOnly;
+        self.lead_with(&ask.why_words(), ask.then().words());
+        if let Some(mover) = ask.then().mover() {
+            self.actions.retain(|a| a != mover.intent());
+            self.actions.insert(0, mover.intent().clone());
+            self.actions.truncate(MAX_ACTIONS);
+        }
+        self.key = Some(ask.fingerprint().as_str().to_string());
+        self.need = Need::Later(ask);
+        self
+    }
+
+    /// What the message is to the person.
+    #[must_use]
+    pub fn need(&self) -> &Need {
+        &self.need
+    }
+
+    /// `true` when the message keeps a band row past a glance: a persistent
+    /// hold ([`Hold::persists`]).
+    #[must_use]
+    pub fn persists(&self) -> bool {
+        self.hold.persists()
+    }
+
+    /// `true` when the row shows work in flight: a fill or `busy` on its
+    /// meter (design ruling 139: the indicator is the meter's state).
+    #[must_use]
+    pub(crate) fn has_indicator(&self) -> bool {
+        self.meter
+            .as_ref()
+            .is_some_and(|m| m.fill_permille.is_some() || m.busy)
+    }
+
+    /// The reason and the action as the first two detail lines, so the
+    /// band's excerpt IS the reason and Details opens on the action — but only
+    /// for a message that brought no detail of its own. A builder that already
+    /// wrote its lines wrote them to be read in that order (`gpu_lost`, the
+    /// screen-reader row): prepending would move its own `retry` line and
+    /// change what its tests and its readers pin. Rows built new for the rule
+    /// pass their ask alone and get the shape.
+    fn lead_with(&mut self, why: &str, then: &str) {
+        if !self.detail.is_empty() {
+            return;
+        }
+        let why = clip(why, DETAIL_LINE_CAP);
+        let then = clip(then, DETAIL_LINE_CAP);
+        self.detail.retain(|l| *l != why && *l != then);
+        self.detail.insert(0, then);
+        self.detail.insert(0, why);
+        self.detail.truncate(DETAIL_LINES_CAP);
+    }
+
+    /// THE DOOR: make `hold` and `need` agree, and say what it did
+    /// ([`Admission`]). A CLASSIFIED message that cannot stand as written — a
+    /// standing ask with no key or with a fault, a `Working` row with no
+    /// indicator, a row whose only capsules decline — becomes a record with
+    /// its words kept ([`Admission::Demoted`]). An UNCLASSIFIED one (what
+    /// [`Message::new`] makes) cannot persist: the seal ([`Persist`]) keeps a
+    /// reporter from writing a persistent hold, so the only one the door meets
+    /// is an older parent's carry, which it adopts; a transient hold past
+    /// [`MAX_TRANSIENT`] is cut to it and counted, and a row that shows no
+    /// work at Warn or above is a record. The door does not guess a class for
+    /// a builder that has not declared one.
+    #[must_use]
+    pub(crate) fn admit(&mut self) -> Admission {
+        let demote = |m: &mut Self| {
+            m.hold = Hold::LogOnly;
+            m.need = Need::Record;
+            Admission::Demoted
+        };
+        match &self.need {
+            Need::Record => {
+                self.hold = Hold::LogOnly;
+                Admission::Kept
+            }
+            // Never seated: an inert hold, so a Later that reached the live
+            // path by mistake is recorded, not shown. One that says nothing
+            // (no reason or no action) is a record.
+            Need::Later(ask) => {
+                self.hold = Hold::LogOnly;
+                if ask.is_complete() {
+                    Admission::Kept
+                } else {
+                    self.need = Need::Record;
+                    Admission::Demoted
+                }
+            }
+            // WORK IN FLIGHT carries its indicator (a fill or `busy`, design
+            // ruling 139): a Live row with neither is a row blocked on a
+            // person, which is a claim on the owner and belongs to `.now()`.
+            Need::Working => {
+                if !matches!(self.hold, Hold::Live { .. }) || !self.has_indicator() {
+                    return demote(self);
+                }
+                Admission::Kept
+            }
+            Need::Notice(kind) => {
+                self.hold = Hold::For(kind.span());
+                Admission::Kept
+            }
+            Need::Now(ask) => {
+                // A standing row's identity is its key: without one the
+                // reporter can neither supersede nor resolve it, and the
+                // once-only rule has nothing to remember it by.
+                let keyed = !ask.is_standing() || ask.is_adopted() || self.key.is_some();
+                // A decline is not an action (owner rule R-4): a row that
+                // stands past a glance and whose only capsules are declines
+                // (`Not today`, `Skip version`, `Not now`, `Details`) offers
+                // no action, however good its sentence. A decline BESIDE a
+                // real capsule, or a row with no capsule (the sentence is the
+                // action), is fine.
+                let declines_only =
+                    ask.hold().persists() && !ask.is_adopted() && self.declines_only();
+                if ask.is_complete() && keyed && !declines_only {
+                    if !ask.is_adopted() {
+                        self.hold = ask.hold();
+                    }
+                    Admission::Kept
+                } else {
+                    demote(self)
+                }
+            }
+            Need::Unclassified => {
+                let carried = self.origin == Origin::Carried;
+                match self.hold {
+                    // An older parent's row: it decided; reporters re-assert.
+                    Hold::Standing(_) | Hold::Ask { .. } if carried => {
+                        self.need =
+                            Need::Now(Ask::adopted(self.detail.get(1).map_or("", String::as_str)));
+                        Admission::Kept
+                    }
+                    // A persistent hold with no ask behind it: a token copied
+                    // from another message. Nothing stands on it.
+                    Hold::Standing(_) | Hold::Ask { .. } => demote(self),
+                    // A transient hold past two minutes is a persistent one
+                    // in all but name: cut to the longest a row may hold.
+                    Hold::For(d) if d > MAX_TRANSIENT && !carried => {
+                        self.hold = Hold::For(MAX_TRANSIENT);
+                        Admission::Demoted
+                    }
+                    // A Live row that shows no indicator at Warn or above is
+                    // blocked on a person: it PERSISTS without saying why.
+                    Hold::Live { .. }
+                        if !carried && self.severity >= Severity::Warn && !self.has_indicator() =>
+                    {
+                        demote(self)
+                    }
+                    _ => Admission::Kept,
+                }
+            }
+        }
+    }
+
+    /// `true` when the message has capsules and every one of them declines
+    /// ([`Intent::is_snooze`]): they fix nothing.
+    fn declines_only(&self) -> bool {
+        !self.actions.is_empty() && self.actions.iter().all(Intent::is_snooze)
     }
 
     /// The loads this row may show over its life (design ruling 221): its
@@ -1587,10 +1895,17 @@ impl Message {
         self
     }
 
-    /// The hold.
+    /// The hold. A persistent one cannot be written outside this crate (the
+    /// token); test builds (the engine's own, and a host's through the
+    /// `test-fixtures` feature) lend such a fixture an adopted ask so a bare
+    /// persistent row still stands, byte for byte as it did.
     #[must_use]
     pub fn hold(mut self, h: Hold) -> Self {
         self.hold = h;
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if h.persists() && matches!(self.need, Need::Unclassified) {
+            self.need = Need::Now(Ask::adopted("test"));
+        }
         self
     }
 
@@ -1732,8 +2047,8 @@ mod tests {
     /// ≤ 16 chars and a short ≤ 8, and the two differ only where the table
     /// says they do. The row predicates walk the same table: only `NotNow`
     /// closes, the two decision intents ask, and exactly the four
-    /// machine-changing intents are consequential (the Primary chip —
-    /// ruling 18, 2026-09-22).
+    /// machine-changing intents are consequential (the Primary chip,
+    /// ruling 18).
     #[test]
     fn labels_are_one_table() {
         let same_short: &[&str] = &[
@@ -1870,7 +2185,7 @@ mod tests {
             Intent::decode("open-config-editor:-"),
             Some(Intent::OpenConfigEditor { line: None })
         );
-        // The retired admin step's intents (2026-09-24), carried by an older window,
+        // The retired admin step's intents, carried by an older window,
         // decode to nothing: the loader drops them.
         for retired in ["not-now:admin-step:clt,brew", "install-elevated:clt,brew"] {
             assert_eq!(Intent::decode(retired), None, "{retired:?}");
@@ -1881,10 +2196,8 @@ mod tests {
             Hold::Live {
                 stale_after: Duration::from_secs(30),
             },
-            Hold::Standing,
-            Hold::Ask {
-                for_: Duration::from_secs(600),
-            },
+            Hold::STANDING,
+            Hold::asking(Duration::from_secs(600)),
             Hold::LogOnly,
         ] {
             assert_eq!(Hold::decode(&hold.encode()), Some(hold));
@@ -2033,6 +2346,7 @@ mod tests {
             loads: Loads::NONE,
             primary: None,
             retrospective: false,
+            need: Need::Unclassified,
         }
         .normalized();
         assert_eq!(literal.finished.as_deref(), Some("Done"));

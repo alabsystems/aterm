@@ -160,9 +160,8 @@ impl DocumentStore {
         }
     }
 
-    /// A store whose write cap comes from a test-local authority — unit tests,
-    /// and the `bench-support` headless fixture (`App::headless_for_test_with_sink`).
-    #[cfg(any(test, feature = "bench-support"))]
+    /// A store whose write cap comes from a test-local authority.
+    #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self::new(test_authority().grant(aterm_cap::Tier::Trusted))
     }
@@ -612,9 +611,9 @@ impl DocumentStore {
     }
 }
 
-/// Test-only mint (unit tests and the `bench-support` fixture): a test or bench
-/// process that handles no untrusted input is its own trusted launcher.
-#[cfg(any(test, feature = "bench-support"))]
+/// Test-only mint: a test process that handles no untrusted input is its own
+/// trusted launcher.
+#[cfg(test)]
 fn test_authority() -> aterm_cap::Authority {
     // SAFETY: see above — the `root_authority` contract is "trusted launcher,
     // before untrusted input", which a unit test satisfies.

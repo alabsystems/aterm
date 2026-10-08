@@ -25,11 +25,13 @@
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu};
 
-fn renderer_px(px: f32) -> Option<Renderer> {
-    Renderer::from_system(px, Theme::default()).map(|mut r| {
-        r.debug_block_on_lazy_fallbacks();
-        r
-    })
+fn renderer_px(px: f32) -> Renderer {
+    Renderer::from_system(px, Theme::default())
+        .map(|mut r| {
+            r.debug_block_on_lazy_fallbacks();
+            r
+        })
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// Render through the warm damage cache, assert byte-identity against a fresh
@@ -54,7 +56,7 @@ fn render_both(
         DamageOutcome::GateHit => 0,
         _ => wc.dirty_rows().iter().filter(|&&d| d).count(),
     };
-    let mut fresh = renderer_px(px).expect("font (checked by caller)");
+    let mut fresh = renderer_px(px);
     let full = fresh.render_input(&input);
     assert_eq!((w, h), (full.width, full.height), "dims @ {label}");
     assert_eq!(pixels, full.pixels, "flood frame != full repaint @ {label}");
@@ -70,10 +72,7 @@ fn render_both(
 #[test]
 fn bottom_pinned_flood_repaints_the_exposed_strip_not_the_screen() {
     for px in [13.0f32, 14.0, 16.0] {
-        let Some(mut warm) = renderer_px(px) else {
-            eprintln!("SKIP: no system monospace font");
-            return;
-        };
+        let mut warm = renderer_px(px);
         for rate in [1usize, 2, 4, 8, 16] {
             let mut wc = WindowCpu::new();
             let (rows, cols) = (50usize, 60usize);
@@ -141,10 +140,7 @@ fn bottom_pinned_flood_repaints_the_exposed_strip_not_the_screen() {
 #[test]
 fn flood_with_shade_and_overshoot_content_is_byte_exact() {
     for px in [13.0f32, 14.0, 16.0] {
-        let Some(mut warm) = renderer_px(px) else {
-            eprintln!("SKIP: no system monospace font");
-            return;
-        };
+        let mut warm = renderer_px(px);
         for rate in [1usize, 3] {
             let mut wc = WindowCpu::new();
             let (rows, cols) = (16usize, 30usize);
@@ -196,10 +192,7 @@ fn flood_with_shade_and_overshoot_content_is_byte_exact() {
 #[test]
 fn a_changed_row_mid_screen_rides_the_flood_byte_exact() {
     for px in [13.0f32, 16.0] {
-        let Some(mut warm) = renderer_px(px) else {
-            eprintln!("SKIP: no system monospace font");
-            return;
-        };
+        let mut warm = renderer_px(px);
         let mut wc = WindowCpu::new();
         let (rows, cols) = (24usize, 40usize);
         let mut term = Terminal::new(rows as u16, cols as u16);

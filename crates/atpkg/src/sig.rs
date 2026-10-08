@@ -572,6 +572,26 @@ pub(crate) mod testkit {
         admit_roster(&anchor(), bytes, &sig, NOW).expect("the synthetic chain admits")
     }
 
+    /// The index `raw`, signed by the test machine and authorized under the test roster
+    /// re-issued at generation `seq` — the real chain end to end. Panics if the chain
+    /// refuses.
+    pub(crate) fn trusted_index_at(seq: u64, raw: Vec<u8>) -> super::TrustedIndex {
+        let bytes = Roster {
+            roster_seq: seq,
+            ..roster()
+        }
+        .to_toml()
+        .expect("a valid roster emits")
+        .into_bytes();
+        let roster_sig = sign(&MASTER_SEED, &bytes);
+        let sig = sign(&MACHINE_SEED, &raw);
+        admit_roster(&anchor(), bytes, &roster_sig, NOW)
+            .expect("the synthetic chain admits")
+            .authorize_index(raw, &sig)
+            .expect("the roster's own machine signed this index")
+            .0
+    }
+
     /// `raw`, machine-signed and taken through the REAL authorization path. Panics if the
     /// chain refuses — a test fixture that cannot be signed is a broken fixture.
     pub(crate) fn machine_signed(raw: Vec<u8>) -> VerifiedBytes {
@@ -912,9 +932,7 @@ impl Floor {
         }
         // Best-effort directory sync so the rename itself survives a power loss. The
         // floor value is already safe either way (old value or new, never torn).
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        crate::store::sync_dir(parent);
         Ok(())
     }
 
@@ -935,7 +953,7 @@ impl Floor {
             // in the page cache can, after a power loss, expose a correctly-named empty
             // file — which reads as first contact and silently reopens the rollback
             // window the write existed to close.
-            f.sync_all()?;
+            crate::platform::sync_durable(&f)?;
         }
         // Publish the floor WORLD-READABLE (0644), not 0600.
         //
@@ -1070,13 +1088,8 @@ mod tests {
 
     const PKG: &[u8] = b"schema = 2\nprogram = \"ay\"\nbuild_number = 18\n";
 
-    fn private_tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("atpkg-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        dir
+    fn private_tmp_dir(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-{label}-"))
     }
 
     // ---------------------------------------------------------------------------------
@@ -1838,7 +1851,7 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         file.set_len((MAX_FLOOR_BYTES + 1) as u64).unwrap();
         assert_eq!(Floor::new(path).current(), 0);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1857,7 +1870,7 @@ mod tests {
         std::fs::write(&target, "99\n").unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert_eq!(Floor::new(path).current(), 0, "floor links are refused");
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The post-verify parsers live in `crate::manifest`; the "parser never runs on

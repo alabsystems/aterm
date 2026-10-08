@@ -1,38 +1,31 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! The host-facing SUB-ROW scroll input API on [`AtermGpuTerminal`]:
-//! fractional / pixel wheel deltas accumulate here, whole rows flip into the
-//! engine's `scroll_display`, and the banked sub-row residual is presented at
-//! render time through the existing M1b grid-band translate (aterm-gpu's
-//! `shift_offscreen_band`, the GPU twin of `aterm_render::scroll_translate`) —
-//! pixel-true trackpad scrolling for web hosts instead of `scroll_lines`'
-//! whole-row jumps. Mirrors aterm-wasm's `scroll_input_api` so the GPU and CPU
-//! bindings expose ONE contract; both stamp the same `RenderInput` fields,
-//! whose CPU==GPU pixel parity the aterm-gpu suite gates.
+//! The host-facing sub-row scroll input API on [`AtermGpuTerminal`]:
+//! fractional/pixel wheel deltas accumulate here, whole rows flip into the
+//! engine's `scroll_display`, and the sub-row residual is presented at render
+//! time by the grid-band translate (aterm-gpu's `shift_offscreen_band`, the
+//! GPU counterpart of `aterm_render::scroll_translate`). Mirrors aterm-wasm's
+//! `scroll_input_api`; both stamp the same `RenderInput` fields.
 //!
 //! ## Contract
 //!
-//! * Deltas ACCUMULATE: two `scroll_px(cell_height / 2)` calls reveal exactly
-//!   one older row. The residual banks in ROW units, so it survives a font
-//!   zoom (`set_px`) unscaled.
-//! * A row FLIPS at ±1.0 accumulated rows (truncation toward zero — the
-//!   engine's `display_offset` only ever moves by whole rows).
-//! * The residual RESETS on every whole-row navigation (`scroll_lines`,
-//!   `scroll_to_bottom`, `scroll_to_top`): row-aligned jumps land row-aligned.
-//! * At a history end the residual CLAMPS to zero on the empty side (no
-//!   sub-row position exists past the live bottom or the oldest retained
-//!   line); with no scrollback at all (the alternate screen) nothing banks.
+//! * Deltas accumulate: two `scroll_px(cell_height / 2)` calls reveal exactly
+//!   one older row. The residual is kept in row units, so it survives a font
+//!   zoom (`set_px`).
+//! * A row flips at ±1.0 accumulated rows (truncation toward zero).
+//! * The residual resets on every whole-row navigation (`scroll_lines`,
+//!   `scroll_to_bottom`, `scroll_to_top`).
+//! * At a history end the residual clamps to zero on the empty side; with no
+//!   scrollback (the alternate screen) nothing banks.
 //!
-//! Sign convention matches [`AtermGpuTerminal::scroll_lines`]: POSITIVE input
-//! reveals OLDER lines. The presented shift is the NEGATED residual — partway
-//! toward an older row the band shifts DOWN (`scroll_frac_px < 0`, the
-//! incoming older row's strip exposed at the top), partway toward a newer row
-//! it shifts UP — continuous with the whole-row flip on both sides.
+//! Positive input reveals older lines, as in
+//! [`AtermGpuTerminal::scroll_lines`]. The presented shift is the negated
+//! residual: partway toward an older row the band shifts down
+//! (`scroll_frac_px < 0`), toward a newer row up.
 //!
-//! Float accumulation is outside the ty `Expr` language (the same documented
-//! waiver as `aterm-gui`'s scroll kinematics), so the semantics are proven by
-//! the unit lattice below, not a derived spec.
+//! Float accumulation is outside the ty `Expr` language, so the semantics are
+//! pinned by the unit tests below rather than a derived spec.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -41,20 +34,18 @@ use crate::AtermGpuTerminal;
 use aterm_render::RenderInput;
 
 /// The banked sub-row scroll state: a signed fractional-row residual in
-/// `(-1.0, 1.0)`, relative to the engine's whole-row `display_offset`
-/// (positive = partway toward OLDER lines). Pure accumulation/rounding logic —
-/// no engine, no clock — so the semantics are unit-tested exhaustively below.
+/// `(-1.0, 1.0)` relative to the engine's `display_offset` (positive =
+/// toward older lines). Pure logic, no engine or clock.
 #[derive(Debug, Default)]
 pub(crate) struct ScrollInputState {
     frac_rows: f64,
 }
 
 impl ScrollInputState {
-    /// Accumulate a fractional row delta and return the WHOLE rows that
-    /// flipped (truncation toward zero: a flip happens exactly at ±1.0
-    /// accumulated). The sub-row remainder stays banked. Non-finite deltas (a
-    /// hostile JS `NaN`/`Infinity`) are ignored. The return saturates to
-    /// `i32` — the engine clamps to the real history bound anyway.
+    /// Accumulate a fractional row delta and return the whole rows that
+    /// flipped (truncation toward zero). The remainder stays banked.
+    /// Non-finite deltas are ignored. The return saturates to `i32`; the
+    /// engine clamps to the history bound.
     pub(crate) fn add_rows(&mut self, delta_rows: f64) -> i32 {
         if !delta_rows.is_finite() {
             return 0;
@@ -65,11 +56,10 @@ impl ScrollInputState {
         whole.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
     }
 
-    /// Zero the residual on a side with no content: nothing sub-row exists
-    /// below the live bottom (`display_offset == 0`, negative residual) or
-    /// above the oldest retained line (`display_offset >= history_lines`,
-    /// positive residual). With no history at all BOTH sides clamp, so the
-    /// alternate screen can never bank a shift.
+    /// Zero the residual on a side with no content: below the live bottom
+    /// (`display_offset == 0`, negative residual) or above the oldest line
+    /// (`display_offset >= history_lines`, positive). With no history both
+    /// sides clamp.
     pub(crate) fn clamp_at_history_edges(&mut self, display_offset: usize, history_lines: usize) {
         if display_offset == 0 && self.frac_rows < 0.0 {
             self.frac_rows = 0.0;
@@ -89,10 +79,8 @@ impl ScrollInputState {
         self.frac_rows
     }
 
-    /// The SIGNED device-px shift presenting this residual through the M1b
-    /// grid-band translate: the NEGATED residual (partway toward older ⇒ band
-    /// shifts DOWN ⇒ negative), rounded to whole px and clamped inside the
-    /// translate's domain `(-cell_h, cell_h)`.
+    /// The signed device-px shift for this residual: the negated residual,
+    /// rounded to whole px and clamped inside `(-cell_h, cell_h)`.
     pub(crate) fn frac_px(&self, cell_h: usize) -> i32 {
         if cell_h == 0 {
             return 0;
@@ -102,11 +90,9 @@ impl ScrollInputState {
         px.clamp(-max, max)
     }
 
-    /// Stamp this residual onto a frame snapshot: the presented
-    /// `scroll_frac_px` plus the grid band. The web canvas has NO spliced
-    /// app-chrome rows in the framebuffer, so the band is
-    /// the whole grid `[0, grid_rows)`. Called EVERY frame — a kept scratch
-    /// would otherwise carry a stale shift after the residual resets.
+    /// Stamp this residual onto a frame snapshot: `scroll_frac_px` plus the
+    /// grid band, which is the whole grid `[0, grid_rows)` on the web canvas.
+    /// Called every frame so a kept scratch never carries a stale shift.
     // The present paths (`render`/`render_offscreen`) are wasm-only; on the
     // native verification target only the tests drive this.
     pub(crate) fn stamp(&self, input: &mut RenderInput, grid_rows: usize, cell_h: usize) {
@@ -118,13 +104,10 @@ impl ScrollInputState {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl AtermGpuTerminal {
-    /// Sub-row scroll input in device PIXELS — the wheel/trackpad `deltaY` at
-    /// `deltaMode == DOM_DELTA_PIXEL`, sign-adjusted by the host so POSITIVE
-    /// reveals older lines (the [`scroll_lines`](Self::scroll_lines)
-    /// convention). Fractions accumulate across calls; each whole
-    /// `cell_height` of accumulation flips one engine row, and the sub-row
-    /// remainder is presented by the next `render()` as a pixel shift of the
-    /// grid band — the host only needs to redraw afterwards.
+    /// Sub-row scroll input in device pixels (`deltaY` at
+    /// `DOM_DELTA_PIXEL`), signed so positive reveals older lines. Each whole
+    /// `cell_height` accumulated flips one row; the remainder is presented by
+    /// the next `render()` as a pixel shift of the grid band.
     pub fn scroll_px(&mut self, delta_px: f64) {
         let cell_h = self.cell_height();
         if cell_h == 0 {
@@ -133,27 +116,23 @@ impl AtermGpuTerminal {
         self.scroll_rows_input(delta_px / cell_h as f64);
     }
 
-    /// Sub-row scroll input in fractional LINES (`deltaMode ==
-    /// DOM_DELTA_LINE` hosts, or a host that scales pixels itself). Same
-    /// accumulation contract as [`scroll_px`](Self::scroll_px): whole rows
-    /// flip at ±1.0 accumulated, the remainder banks.
+    /// Sub-row scroll input in fractional lines (`DOM_DELTA_LINE`, or a host
+    /// that scales pixels itself). Same accumulation contract as
+    /// [`scroll_px`](Self::scroll_px).
     pub fn scroll_lines_frac(&mut self, delta_rows: f64) {
         self.scroll_rows_input(delta_rows);
     }
 
-    /// The banked sub-row residual in ROWS — signed, in `(-1.0, 1.0)`,
-    /// positive = partway toward OLDER lines. `0` whenever the viewport is
-    /// row-aligned (after a flip, a whole-row navigation, or at a clamped
-    /// history end).
+    /// The banked residual in rows, in `(-1.0, 1.0)`, positive = toward older
+    /// lines. `0` whenever the viewport is row-aligned.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
     pub fn scroll_frac_rows(&self) -> f64 {
         self.scroll_input.frac_rows()
     }
 
-    /// The SIGNED device-px band shift the next `render()` presents for the
-    /// banked residual (negative = band shifted DOWN, toward older). Exposed
-    /// so hosts/harnesses can assert the CPU and GPU bundles present the same
-    /// sub-row frame.
+    /// The signed device-px band shift the next `render()` presents (negative
+    /// = shifted down, toward older), so harnesses can compare the CPU and GPU
+    /// bundles.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
     pub fn scroll_frac_px(&self) -> i32 {
         self.scroll_input.frac_px(self.cell_height())
@@ -387,14 +366,10 @@ mod tests {
         assert_eq!(fresh.scroll_frac_rows(), 0.0);
     }
 
-    /// The GPU present paths need a browser WebGL surface (`init` is
-    /// wasm-only), so the render smoke here drives `build_frame` — the
-    /// engine-side half both `render` and `render_offscreen` run before they
-    /// touch aterm-gpu (the damage-scoped refill, the effects pass, `stamp`) —
-    /// and checks the snapshot it leaves carries the banked residual, and that
-    /// a kept scratch is re-stamped to zero after a snap. That the scoped
-    /// refill equals a full extraction is
-    /// `build_frame_scoped_refill_matches_a_full_extraction_over_a_mutation_stream`'s.
+    /// `init` is wasm-only, so this drives `build_frame` (the engine-side half
+    /// of `render`/`render_offscreen`) and checks the snapshot carries the
+    /// banked residual, and that a kept scratch is re-stamped to zero after a
+    /// snap.
     #[test]
     fn render_snapshot_carries_the_banked_residual() {
         let Some(mut t) = terminal_with_history() else {

@@ -8,37 +8,33 @@
 //! spawn-seam actuator that enforces it.
 //!
 //! It maps a [`ContainmentMode`] to a [`Capabilities`] set, records the chosen
-//! mode at the spawn seam, and — for `Containment` — actuates a real OS sandbox
-//! (macOS Seatbelt via `sandbox-exec`) or refuses to start. What each mode
-//! enforces is stated ONCE, in [`actuator`]'s module doc; in short:
+//! mode at the spawn seam, and for `Containment` actuates an OS sandbox (macOS
+//! Seatbelt via `sandbox-exec`) or refuses to start. What each mode enforces is
+//! stated in [`actuator`]'s module doc; in short:
 //!
 //! | Mode | Trust | Enforced |
 //! |------|-------|----------|
 //! | **Master** | Full | Nothing beyond the capability-gated spawn. |
 //! | **User** | Normal (default) | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
 //! | **Safety** | Reduced | Hardened resource limits; no OS sandbox. |
-//! | **Containment** | Hostile | macOS Seatbelt: no network, writes confined to the temp roots, no read or write of the credential and private-data stores — plus the hardened limits. Refuses to start where no OS sandbox exists. |
+//! | **Containment** | Hostile | macOS Seatbelt: no network, no task port but a process's own (no debugger attach), writes confined to the temp roots, no read or write of the credential and private-data stores — plus the hardened limits. Refuses to start where no OS sandbox exists. |
 //!
-//! ## Core Axiom
-//!
-//! **ALL DATA IS CODE.** Any byte crossing a trust boundary is a potential
-//! instruction to an AI agent. The containment system treats all external
-//! data as untrusted by default.
+//! Core axiom: all data is code. Any byte crossing a trust boundary is a
+//! potential instruction to an AI agent, so external data is untrusted by
+//! default.
 //!
 //! ## Properties of the policy mapping
 //!
-//! These are properties of the mode→capability mapping, pinned by the unit tests
-//! in `policy.rs` and `mode.rs` (default test lane) and re-checked by the opt-in
-//! Kani harnesses in `kani_proofs` (`scripts/verify-kani-proofs.sh`, trust-mc).
-//! They are properties of the data model, NOT of any OS enforcement:
+//! Pinned by the unit tests in `policy.rs` and `mode.rs` and re-checked by the
+//! opt-in Kani harnesses in `kani_proofs` (`scripts/verify-kani-proofs.sh`,
+//! trust-mc). They concern the data model, not OS enforcement:
 //!
-//! - **`NonEscalation`** — mode never increases in capability
-//! - **`CapabilitiesMatchMode`** — capabilities always consistent with mode
-//! - **`ModeImmutableAfterInit`** — runtime immutability comes from `OnceLock`
-//!   plus `NonEscalation`
-//! - **`ContainmentMinimal`** — Containment mode is the minimal POLICY (every
-//!   capability value at its floor)
-//! - **`MonotonicCapabilities`** — capabilities only decrease over time
+//! - **`NonEscalation`**: mode never increases in capability
+//! - **`CapabilitiesMatchMode`**: capabilities always consistent with mode
+//! - **`ModeImmutableAfterInit`**: from `OnceLock` plus `NonEscalation`
+//! - **`ContainmentMinimal`**: Containment is the minimal policy (every
+//!   capability at its floor)
+//! - **`MonotonicCapabilities`**: capabilities only decrease over time
 //!
 //! ## Usage
 //!
@@ -49,7 +45,7 @@
 //! init_mode(ContainmentMode::User).expect("mode already set");
 //!
 //! // Anywhere in aterm:
-//! let mode = aterm_containment::current_mode();
+//! let mode = aterm_containment::mode_or_containment();
 //! let caps = ContainmentPolicy::capabilities(mode);
 //! ```
 
@@ -79,15 +75,11 @@ pub(crate) mod mode;
 pub(crate) mod policy;
 pub mod sbpl;
 
-// `audit` is declared LAST on purpose (module declaration order is
-// semantically neutral in Rust): the Trust strict gate verifies items
-// roughly in declaration order and ABORTS the per-crate sweep at the first
-// fail-closed native error. `audit::forward::{closure#0}` necessarily
-// carries the unsafe `fmt::Arguments::new` from its runtime `format_args!`
-// (see audit.rs — `aterm_log::__log` requires a `fmt::Arguments`, which has
-// no safe runtime constructor), so it is the one unavoidable fail-closed
-// item; putting it last lets every other module's obligations be verified
-// and reported before the abort instead of being silently skipped.
+// `audit` is declared last: the Trust strict gate verifies roughly in
+// declaration order and stops the crate sweep at the first fail-closed error.
+// `audit::forward::{closure#0}` must carry the unsafe `fmt::Arguments::new`
+// (`aterm_log::__log` takes a `fmt::Arguments`), so placing it last lets every
+// other module be verified first.
 pub(crate) mod audit;
 
 pub use actuator::{
@@ -96,28 +88,23 @@ pub use actuator::{
 };
 pub use audit::{log_denial, log_posture};
 pub use capability::{FsCapability, NetworkCapability, ProcessCapability};
-// The consent tier's types and its three FDA/responsibility OS entry points.
-// Every PURE helper — `classify_probe`, `classify_responsible`,
-// `probe_fda_with`, `display_name`, `readable_info_plist`,
-// `is_under_protected_root`, `protected_roots_in`, `folder_paths`,
-// `tccutil_reset_command`, `classify_tccutil`, `bundle_id_is_usable`,
-// `reset_offer`, `reset_outcome`, `folders_reset`, `folders_declined`,
-// `cache_bundle_for` — stays behind `aterm_containment::consent::` rather than
-// being hoisted into the crate root, where names like `display_name` would read
-// as the crate's own. So does `tccutil_presence`, the §3.7 stat: a destructive
-// repair's entry points are found by reading the consent module, not by tab
-// completion on the crate root.
+// The consent tier's types and its FDA, Developer Tools and responsibility OS
+// entry points. Pure helpers (`classify_probe`, `display_name`,
+// `tccutil_reset_command`, `reset_offer`, …) and `tccutil_presence` stay under
+// `aterm_containment::consent::` rather than the crate root, so generic names
+// do not read as the crate's own and a destructive repair's entry points are
+// found by reading the consent module.
 pub use consent::{
-    Attribution, ConsentKey, ConsentPosture, DrClass, FdaProbe, FdaScope, FdaState, Folder,
-    FsConsent, ImageAnchor, PostureInputs, ProbeGate, ProbeLabel, ProbeOutcome, ResetAttempt,
-    ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus, Responsible,
-    ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr,
-    classify_image_anchor, image_anchor, probe_fda, protected_roots, responsible_app,
-    responsible_pid,
+    Attribution, ConsentKey, ConsentPosture, DevToolProbe, DevToolProbeLabel, DevToolState,
+    DrClass, FdaProbe, FdaScope, FdaState, Folder, FsConsent, ImageAnchor, PostureInputs,
+    ProbeGate, ProbeLabel, ProbeOutcome, ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome,
+    ResetPlan, ResetStatus, Responsible, ResponsibleApp, ResponsibleError, SpikeEvidence,
+    TccutilPresence, classify_dr, classify_image_anchor, image_anchor, probe_devtool, probe_fda,
+    protected_roots, responsible_app, responsible_pid,
 };
 pub use mode::{ContainmentMode, ParseModeError};
 pub use policy::{Capabilities, ContainmentPolicy};
-pub use sbpl::{NETWORK_DENY_PROFILE, SANDBOX_EXEC_PATH, profile_for as sbpl_profile_for};
+pub use sbpl::{BASE_PROFILE, SANDBOX_EXEC_PATH};
 
 use std::sync::OnceLock;
 
@@ -137,13 +124,10 @@ pub enum InitError {
     },
 }
 
-// Hand-written `Display`/`Error` (was `#[derive(aterm_error::Error)]` with
-// `#[error("containment mode already set to {existing}, cannot change to
-// {attempted}")]`): the derive's generated `fmt` expands a runtime-argument
+// Hand-written `Display`/`Error`: a derived `fmt` would expand a runtime-argument
 // `format_args!`, whose unsafe `fmt::Arguments::new` constructor the Trust
 // strict gate's native lowering fails closed on. `ContainmentMode::name()` IS
-// the mode's `Display` rendering, so the piece-wise `write_str` output is
-// byte-identical. `source()` returns `None` exactly like the derive.
+// the mode's `Display` rendering.
 impl std::fmt::Display for InitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -169,11 +153,7 @@ impl std::error::Error for InitError {
 /// Initialize the containment mode for this process.
 ///
 /// Must be called exactly once at startup, before any subsystem queries the
-/// mode. The mode is immutable after this call — subsequent calls return
-/// [`InitError::AlreadyInitialized`].
-///
-/// This function establishes runtime immutability directly through
-/// `OnceLock` single-init semantics.
+/// mode. The mode is immutable afterwards (`OnceLock` single-init).
 ///
 /// # Errors
 ///
@@ -181,9 +161,8 @@ impl std::error::Error for InitError {
 ///
 /// # Panics
 ///
-/// Panics (unreachable) if `OnceLock::set` fails but `OnceLock::get`
-/// returns `None`. This cannot happen with a correctly functioning
-/// `OnceLock`.
+/// Unreachable: only if `OnceLock::set` fails while `OnceLock::get` returns
+/// `None`.
 pub fn init_mode(mode: ContainmentMode) -> Result<(), InitError> {
     MODE.set(mode).map_err(|_| {
         let existing = *MODE.get().expect("set failed but value exists");
@@ -192,20 +171,6 @@ pub fn init_mode(mode: ContainmentMode) -> Result<(), InitError> {
             attempted: mode,
         }
     })
-}
-
-/// Get the current containment mode.
-///
-/// # Panics
-///
-/// Panics if [`init_mode`] has not been called. This is a programmer
-/// error — the launcher must set the mode before any subsystem runs.
-#[inline(always)]
-#[must_use]
-pub fn current_mode() -> ContainmentMode {
-    *MODE
-        .get()
-        .expect("containment mode not initialized — call init_mode() at startup")
 }
 
 /// Get the current containment mode, if initialized.
@@ -217,29 +182,24 @@ pub fn try_current_mode() -> Option<ContainmentMode> {
     MODE.get().copied()
 }
 
-/// Get the current containment mode, defaulting to [`ContainmentMode::Containment`]
-/// if not initialized.
-///
-/// **Fail-closed behavior:** if [`init_mode`] was never called, this returns
-/// the most restrictive mode (`Containment`), which denies all operations.
-/// Library consumers must explicitly call [`init_mode`] at startup to get
-/// the access level they need.
+/// Get the current containment mode, defaulting to
+/// [`ContainmentMode::Containment`] (fail-closed, the most restrictive) if
+/// [`init_mode`] was never called.
 #[inline(always)]
 #[must_use]
 pub fn mode_or_containment() -> ContainmentMode {
     try_current_mode().unwrap_or(ContainmentMode::Containment)
 }
 
-/// Initialize the mode from the launcher's `--containment` flag (`None` = no flag
-/// given: `default`). The flag is the one spelling — no environment variable
-/// selects the mode (2026-09-24) — and its value is parsed by the same
-/// [`ContainmentMode::from_str`](std::str::FromStr) every launcher shares.
-/// Returns the resolved mode on success.
+/// Initialize the mode from the launcher's `--containment` flag (`None` = no
+/// flag: `default`). No environment variable selects the mode; the value is
+/// parsed by the shared [`ContainmentMode::from_str`](std::str::FromStr).
+/// Returns the resolved mode.
 ///
 /// # Errors
 ///
-/// Returns error if the flag's value is not a mode (the caller fails CLOSED) or
-/// the mode was already initialized.
+/// Returns error if the value is not a mode (the caller fails closed) or the
+/// mode was already initialized.
 pub fn init_mode_from_flag(
     flag: Option<&str>,
     default: ContainmentMode,
@@ -264,16 +224,9 @@ pub enum InitModeFromFlagError {
     Init(InitError),
 }
 
-// Hand-written `Display`/`Error`/`From` (was `#[derive(aterm_error::Error)]`
-// with `#[error("invalid containment mode: {0}")]` / `#[error("{0}")]`
-// and `#[from]` on both fields): the derive's generated `fmt` expands a
-// runtime-argument `format_args!`, whose unsafe `fmt::Arguments::new`
-// constructor the Trust strict gate's native lowering fails closed on.
-// Delegating to the inner errors' `Display` directly is byte-identical: both
-// inner `Display` impls in this crate render through verbatim `write_str`
-// pieces (plus str's options-insensitive `Debug`), so the `{0}` placeholder's
-// default-options rendering and the delegated rendering emit the same bytes.
-// `source()` and the two `From` impls mirror the derive's `#[from]` output.
+// Hand-written `Display`/`Error`/`From`, delegating to the inner errors'
+// `Display`: no runtime-argument `format_args!`, whose unsafe
+// `fmt::Arguments::new` constructor the Trust strict gate fails closed on.
 impl std::fmt::Display for InitModeFromFlagError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -311,9 +264,8 @@ impl From<InitError> for InitModeFromFlagError {
 mod tests {
     use super::*;
 
-    // Note: Because OnceLock is process-global, we can't test init_mode
-    // isolation across tests in the same binary. Policy tests are pure
-    // and don't touch global state — those are the primary verification.
+    // `OnceLock` is process-global, so init isolation is not testable within
+    // one binary; the pure policy tests carry the verification.
 
     /// Verify InitError::AlreadyInitialized error message includes both modes.
     #[test]

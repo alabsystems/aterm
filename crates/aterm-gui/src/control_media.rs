@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aterm_containment::log_denial;
-use aterm_core::grid::extra::{ImageData, ImageFormat};
+use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
 use aterm_core::terminal::Terminal;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 
@@ -39,7 +39,7 @@ pub(crate) enum MainHopError {
     /// A fixed reason: a dialog stands, the event loop is gone, the deadline
     /// passed, the reply was dropped.
     Reason(&'static str),
-    /// `main thread stalled <N>s since <root>; retry`.
+    /// `main thread stalled <N>s; retry`.
     Stalled(crate::watchdog::MainStall),
 }
 
@@ -51,6 +51,11 @@ impl std::fmt::Display for MainHopError {
         }
     }
 }
+
+/// The refusal of a main-thread request whose client closed its socket before
+/// the hop was posted ([`main_thread_refusal`]). It is written to a socket
+/// nobody reads, so its words are for a trace, not a driver.
+pub(crate) const CLIENT_HUNG_UP: &str = "client hung up before the request reached the main thread";
 
 /// The main-thread hops in flight: posted by [`call_main`] or
 /// [`call_main_within`], not yet TAKEN by the main thread and not given up on,
@@ -120,12 +125,6 @@ impl Hops {
             0 => None,
             since => Some(since),
         }
-    }
-}
-
-impl Default for Hops {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -297,12 +296,30 @@ pub(crate) fn call_main_within<T>(
 /// heartbeat already showed the thread stuck
 /// ([`crate::watchdog::main_stall_now`], at the shipped stall bar in every
 /// build), so such a verb is now answered at once with
-/// `ERR main thread stalled <N>s since <root>; retry`, which the harness rides
+/// `ERR main thread stalled <N>s; retry`, which the harness rides
 /// out as it does `ERR control server busy`. Then a standing dialog
 /// ([`dialog_refusal`]); a dialog is a designed freeze and never reads as a
 /// stall.
 pub(crate) fn main_thread_refusal() -> Option<MainHopError> {
+    // A client that hung up is asked about before anything else: nothing is
+    // posted for a request nobody will read the answer to, so it neither holds
+    // a worker lane for the reply deadline nor runs late after its client has
+    // asked again. `caller_hung_up` is the blocking verbs' check — the lane's
+    // own connection, a full close only, never a half-close (2026-09-28).
+    // A verb committed to finishing input it began is the one exception
+    // ([`crate::control::CommittedInput`]: a `turn` whose text is typed still
+    // gets its Enter, or the text sits unsubmitted in the composer).
+    if crate::control::caller_hung_up() && !crate::control::input_committed() {
+        aterm_log::debug!("control: a main-thread request was dropped; its client hung up");
+        return Some(MainHopError::Reason(CLIENT_HUNG_UP));
+    }
     if let Some(stall) = crate::watchdog::main_stall_now(HOPS.since_ns()) {
+        let returned = if stall.returned { " (returned)" } else { "" };
+        aterm_log::debug!(
+            "control: main-thread request refused; stalled {}s at {}{returned}",
+            stall.stalled.as_secs(),
+            stall.root.name()
+        );
         return Some(MainHopError::Stalled(stall));
     }
     dialog_refusal().map(MainHopError::Reason)
@@ -410,8 +427,9 @@ pub(crate) fn image_read_line(
 /// `image` rasterize verb). With no args it reports every DISTINCT image on the
 /// grid (deduplicated by payload identity), one line per image at its top-left
 /// anchor; `image read <r>` restricts to images intersecting row `r`; `image read
-/// <r> <c>` returns the single image tile covering that exact cell (`ERR none` if
-/// the cell has no image). Framed `OK <nlines>\n` + one line per image.
+/// <r> <c>` returns the tile of the TOP image covering that exact cell — the one
+/// drawn over any others stacked there (`ERR none` if the cell has no image).
+/// Framed `OK <nlines>\n` + one line per image.
 ///
 /// GATHER-THEN-SERIALIZE, like the styled-frame path: everything the reply needs
 /// (anchors, tile indices, and an `Arc` clone of each payload) is collected under
@@ -435,14 +453,18 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
             return "ERR bad args\n".to_string();
         };
         if r >= rows || c >= cols {
-            return "ERR out of range\n".to_string();
+            return format!(
+                "ERR out of range: rows 0-{}, cols 0-{}\n",
+                rows.saturating_sub(1),
+                cols.saturating_sub(1)
+            );
         }
-        // Gather only: the FIRST tile at that column (what the old early `return`
-        // picked), carried out of the lock scope as an `Arc` clone.
+        // Gather only: the LAST tile at that column — a cell's layers come
+        // bottom first — carried out of the lock scope as an `Arc` clone.
         let hit = t
             .images_row(r)
             .into_iter()
-            .find(|(col, _)| *col == c)
+            .rfind(|(col, _)| *col == c)
             .map(|(col, iref)| {
                 let anchor_r = r.saturating_sub(iref.cell_row as usize);
                 let anchor_c = col.saturating_sub(iref.cell_col as usize);
@@ -459,26 +481,38 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
     }
 
     // Row mode (one row) or screen mode (all rows): distinct images, anchored.
-    let row_range: Vec<usize> = match r_tok {
+    // Screen mode reads every row's placements in ONE pass over the extras map
+    // (`images_frame`, pinned equal to `images_row` for every row by
+    // `images_frame_into_matches_per_row`), not `rows` per-row scans that each
+    // probe `cols` cells whenever any extra exists anywhere. Rows keep their
+    // index, so the walk order — rows ascending, then columns — is unchanged.
+    let placements: Vec<(usize, Vec<(usize, ImageRef)>)> = match r_tok {
         Some(rs) => match rs.parse::<usize>() {
-            Ok(r) if r < rows => vec![r],
-            Ok(_) => return "ERR out of range\n".to_string(),
+            Ok(r) if r < rows => vec![(r, t.images_row(r))],
+            Ok(_) => {
+                return format!(
+                    "ERR out of range: rows 0-{}, cols 0-{}\n",
+                    rows.saturating_sub(1),
+                    cols.saturating_sub(1)
+                );
+            }
             Err(_) => return "ERR bad args\n".to_string(),
         },
-        None => (0..rows).collect(),
+        None => t.images_frame(rows).into_iter().enumerate().collect(),
     };
-    let mut seen: Vec<*const ImageData> = Vec::new();
+    // Identity dedup by SET: a `Vec::contains` scan made the dedup
+    // O(placed cells x distinct images) — quadratic on a tiled screen, where
+    // every covered cell carries a ref to one of a few images.
+    let mut seen: std::collections::HashSet<*const ImageData> = std::collections::HashSet::new();
     // Anchor + payload handle per distinct image, in the same walk order the reply
     // uses. Holding the `Arc` keeps each payload alive (and keeps the `seen`
     // pointer-identity dedup valid) after the guard drops.
     let mut hits: Vec<(usize, usize, Arc<ImageData>)> = Vec::new();
-    for r in row_range {
-        for (col, iref) in t.images_row(r) {
-            let ptr = std::sync::Arc::as_ptr(&iref.image);
-            if seen.contains(&ptr) {
+    for (r, row) in placements {
+        for (col, iref) in row {
+            if !seen.insert(std::sync::Arc::as_ptr(&iref.image)) {
                 continue;
             }
-            seen.push(ptr);
             let anchor_r = r.saturating_sub(iref.cell_row as usize);
             let anchor_c = col.saturating_sub(iref.cell_col as usize);
             hits.push((anchor_r, anchor_c, iref.image));
@@ -4306,14 +4340,7 @@ mod wire_tab_close_guard_tests {
     use crate::session_store::{ExitActor, ExitReason, RosterChange};
     use crate::{App, TabAction, WindowId};
 
-    /// Feed shell-integration bytes to `session`'s engine, the way its PTY
-    /// reader would.
-    fn feed(app: &App, session: u64, bytes: &[u8]) {
-        let term = app.pool.get(session).expect("live session").term.clone();
-        term.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .process(bytes);
-    }
+    use crate::feed_session_for_test as feed;
 
     /// The `Start-Sleep 60` shape: a command the shell reports running
     /// (133;C, no 133;D) with no child process — the stub session's PTY says
@@ -5302,12 +5329,7 @@ mod video_parse_tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn video_frame_reply_handles_stay_bounded() {
-        const CHILD: &str = "ATERM_TEST_VIDEO_FRAMES_NOFILE";
-        if !super::control_auth::enter_low_nofile_test_child(
-            CHILD,
-            "control::control_media::video_parse_tests::video_frame_reply_handles_stay_bounded",
-            128,
-        ) {
+        if !super::control_auth::enter_low_nofile_test_child(128) {
             return;
         }
 
@@ -5419,9 +5441,13 @@ mod video_parse_tests {
         // this reply beside `ERR busy` as a TRANSIENT class where "existing
         // back-off code already does the right thing"; this is that back-off,
         // doing the right thing.
-        let mut reply = {
-            let mut tries = 0;
-            loop {
+        // A hang detector, not a 10 s budget: a sibling's hold ends, so a slot
+        // that never frees within the minute is a leak.
+        let mut last = String::new();
+        let mut reply = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(50),
+            || {
                 let r = video_frames_for_instance(
                     &tmp,
                     super::control_auth::process_instance_id(),
@@ -5429,18 +5455,19 @@ mod video_parse_tests {
                 );
                 let transient = r.contains("retention sweep is in progress")
                     || r.contains(crate::control::ARTIFACT_HANDOFF_BUSY);
-                if !transient {
-                    break r;
+                if transient {
+                    last = format!("{r:?}");
+                    return None;
                 }
-                tries += 1;
-                assert!(
-                    tries < 200,
-                    "the retention budget never freed in 10s — that is a leak, \
-                     not the race this loop absorbs: {r:?}"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        };
+                Some(r)
+            },
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "the retention budget never freed — that is a leak, not the race this \
+                 loop absorbs: {last}"
+            )
+        });
         assert!(reply.starts_with("OK 1\n"), "{reply:?}");
         assert!(reply.contains(oldest_path.to_string_lossy().as_ref()));
 
@@ -6230,7 +6257,7 @@ mod call_main_within_tests {
         };
         assert_eq!(
             format!("ERR {}\n", super::MainHopError::Stalled(stall)),
-            "ERR main thread stalled 12s since `NewEvents` returned; retry\n"
+            "ERR main thread stalled 12s; retry\n"
         );
         assert_eq!(
             super::MainHopError::Reason("event loop gone").to_string(),

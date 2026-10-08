@@ -2,18 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal state transition methods for `TerminalHandler`.
+//! Terminal state transition methods for `TerminalHandler`: parsed operations
+//! applied to the grid and mode state, using `grid`, `bidi`, `config` and
+//! `vt_level` but never platform services, callbacks or I/O.
 //!
-//! This module implements the **state transition layer** of the terminal handler
-//! concern separation (#2157). Methods here apply parsed operations to the
-//! terminal grid and mode state. They depend on `grid`, `bidi`, `config`, and
-//! `vt_level` — but never invoke platform services, callbacks, or I/O.
+//! Layers:
 //!
-//! ## Concern layers
-//!
-//! - **Parser actions** (`handler_actions.rs`): `ActionSink` dispatch from parser events
-//! - **State transitions** (this file): grid/mode mutations from typed operations
-//! - **Side-effects**: callbacks and external service activation (inline in handler files)
+//! - Parser actions (`handler_actions.rs`): `ActionSink` dispatch from parser events
+//! - State transitions (this file): grid/mode mutations from typed operations
+//! - Side effects: callbacks and external services (inline in handler files)
 
 use super::handler::CursorStateHandler;
 use super::types::CurrentStyle;
@@ -48,16 +45,12 @@ impl CursorStateHandler<'_> {
         });
     }
 
-    /// Restore cursor state (DECRC).
+    /// Restore cursor state (DECRC): position, style, origin mode and charset
+    /// state. DECAWM is never touched (xterm's DECSC_FLAGS excludes
+    /// wraparound). With nothing saved, the cursor goes home.
     ///
-    /// Restores cursor position, style, origin mode, and charset state.
-    /// DECAWM is never touched (xterm DECSC_FLAGS excludes WRAPAROUND).
-    /// If no cursor was saved, moves cursor to home position.
-    ///
-    /// Per VT510 specification: When origin mode is restored as enabled, the cursor
-    /// position is clamped to the current scroll region. The saved cursor position
-    /// is always absolute (not relative to scroll region), but when origin mode is
-    /// active the cursor must remain within the scroll region bounds.
+    /// The saved position is absolute; when origin mode is restored as
+    /// enabled it is clamped to the current scroll region (VT510).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
@@ -71,19 +64,16 @@ impl CursorStateHandler<'_> {
             &mut self.cursor_save.main
         };
         if let Some(state) = *saved_cursor {
-            // Restore modes first so we know if origin mode will be active.
-            // NOTE: DECAWM is deliberately NOT restored — xterm's
-            // CursorRestoreFlags only applies DECSC_FLAGS =
-            // (ATTRIBUTES|ORIGIN|PROTECTED) (cursor.c); WRAPAROUND is
-            // untouched by DECSC/DECRC. The VT510 "wrap flag" DECSC saves is
-            // the PENDING-wrap state (xterm sc->wrap_flag = do_wrap), which
-            // IS restored below.
+            // Restore modes first so origin mode is known for clamping. DECAWM is
+            // not restored (xterm's CursorRestoreFlags applies only
+            // ATTRIBUTES|ORIGIN|PROTECTED, cursor.c). The VT510 "wrap flag" DECSC
+            // saves is the pending-wrap state, restored below.
             self.modes.origin_mode = state.origin_mode;
             *self.style = state.style;
             *self.charset = state.charset;
             *self.underline_color = state.underline_color;
             // Refresh the cached extras flag — the restored underline_color
-            // may differ from the pre-restore value (#7403).
+            // may differ from the pre-restore value.
             *self.has_transient_extras = self.has_hyperlink || self.underline_color.is_some();
 
             // Clamp cursor position to scroll region if origin mode is enabled.
@@ -103,34 +93,30 @@ impl CursorStateHandler<'_> {
                 (state.cursor.row, state.cursor.col)
             };
             self.grid.set_cursor(row, col);
-            // Restore pending_wrap after set_cursor (which clears it) (#7283).
-            // Only restore if cursor is still at the right edge — after terminal
-            // resize the saved position may no longer be at the margin, making
-            // a deferred wrap invalid (#7645).
+            // Restore pending_wrap after set_cursor (which clears it), only if
+            // the cursor is still at the right edge: after a resize the saved
+            // position may no longer be at the margin.
             if state.pending_wrap {
                 let max_col = self.grid.effective_cols_for_row(row).saturating_sub(1);
                 self.grid.set_pending_wrap(col >= max_col);
             }
-            // Update BCE cursor template from restored style (#7522).
+            // Update BCE cursor template from restored style.
             self.style.update_cached_colors();
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),
                 self.style.bce_bg_rgb(),
             );
         } else {
-            // Per VT510 spec (DEC STD 070): if no cursor was previously
-            // saved, DECRC moves to home position, resets origin mode,
-            // and turns off all character attributes (#7493).
-            // DECAWM is left UNCHANGED: xterm CursorRestoreFlags clears only
-            // DECSC_FLAGS = (ATTRIBUTES|ORIGIN|PROTECTED) — WRAPAROUND is
-            // not part of the DECSC/DECRC state.
+            // With nothing saved, DECRC homes the cursor, resets origin mode and
+            // clears character attributes (DEC STD 070). DECAWM is unchanged:
+            // wraparound is not part of the DECSC/DECRC state in xterm.
             self.modes.origin_mode = false;
             *self.style = CurrentStyle::default();
             *self.charset = CharacterSetState::default();
             *self.underline_color = None;
             *self.has_transient_extras = self.has_hyperlink;
             self.grid.set_cursor(0, 0);
-            // Reset BCE cursor template to default (#7522).
+            // Reset BCE cursor template to default.
             self.grid
                 .set_cursor_template(crate::grid::Cell::EMPTY, None);
         }
@@ -179,10 +165,8 @@ impl CursorStateHandler<'_> {
                     .carriage_return_margin(self.modes.left_right_margin_mode);
             }
             b'G' => {
-                // Cursor Character Absolute (CHA).
-                // Per xterm: CHA is NOT affected by DECLRMM — it always
-                // uses absolute column positions regardless of origin mode
-                // and horizontal margins (#7498).
+                // Cursor Character Absolute (CHA): absolute column regardless of
+                // origin mode and horizontal margins, as in xterm.
                 let col = params.first().copied().unwrap_or(1).saturating_sub(1);
                 self.grid.set_cursor(self.grid.cursor_row(), col);
             }
@@ -218,17 +202,11 @@ impl CursorStateHandler<'_> {
         }
     }
 
-    /// Move cursor forward by n grapheme clusters (Mode 2027).
+    /// Move the cursor forward by n grapheme clusters (mode 2027), skipping
+    /// WIDE_CONTINUATION spacers; the COMPLEX flag does not affect movement.
     ///
-    /// Instead of moving by n cells, moves to the start of the n-th next grapheme.
-    /// A grapheme cluster includes wide characters and their continuation cells.
-    ///
-    /// Implementation: Skip over WIDE_CONTINUATION cells (spacers after wide chars).
-    /// The COMPLEX flag indicates multi-codepoint storage but doesn't affect movement.
-    ///
-    /// Note: WIDE_CONTINUATION and PROTECTED share bit 10 in CellFlags.
-    /// To disambiguate, we check that the preceding cell has WIDE set — a true
-    /// continuation cell is always to the right of a WIDE cell.
+    /// WIDE_CONTINUATION and PROTECTED share bit 10 in CellFlags; a true
+    /// continuation is identified by a WIDE cell to its left.
     pub(super) fn cursor_forward_graphemes(&mut self, n: u16) {
         use crate::grid::CellFlags;
 
@@ -251,9 +229,8 @@ impl CursorStateHandler<'_> {
         // Move forward, counting graphemes (non-continuation cells)
         while graphemes_passed < n && col < max_col {
             col += 1;
-            // Check if this is a true wide continuation cell (not just PROTECTED).
-            // WIDE_CONTINUATION and PROTECTED share bit 10 — disambiguate by
-            // verifying the cell to the left has the WIDE flag.
+            // A true wide continuation (not just PROTECTED, which shares bit 10)
+            // has a WIDE cell to its left.
             if let Some(cell) = self.grid.cell(row, col) {
                 let is_continuation = cell.flags().contains(CellFlags::WIDE_CONTINUATION)
                     && col > 0
@@ -273,12 +250,9 @@ impl CursorStateHandler<'_> {
         self.grid.set_cursor(row, col);
     }
 
-    /// Move cursor backward by n grapheme clusters (Mode 2027).
-    ///
-    /// Instead of moving by n cells, moves to the start of the n-th previous grapheme.
-    ///
-    /// Implementation: Skip over WIDE_CONTINUATION cells when counting graphemes.
-    /// See `cursor_forward_graphemes` for the WIDE_CONTINUATION/PROTECTED disambiguation.
+    /// Move the cursor backward by n grapheme clusters (mode 2027), skipping
+    /// WIDE_CONTINUATION cells (see `cursor_forward_graphemes` for the
+    /// PROTECTED disambiguation).
     pub(super) fn cursor_backward_graphemes(&mut self, n: u16) {
         use crate::grid::CellFlags;
 
@@ -297,8 +271,7 @@ impl CursorStateHandler<'_> {
         };
         let mut graphemes_passed = 0u16;
 
-        // Move backward, counting graphemes (non-continuation cells)
-        // Loop exits when we've passed N graphemes or hit left bound
+        // Move backward, counting graphemes (non-continuation cells).
         while graphemes_passed < n && col > min_col {
             col -= 1;
             // Check if this is a true wide continuation cell (not just PROTECTED).
@@ -321,10 +294,8 @@ impl CursorStateHandler<'_> {
         self.grid.set_cursor(row, col);
     }
 
-    /// Handle erase CSI sequences.
-    ///
-    /// Updates the BCE cursor template from current SGR background before
-    /// dispatching to the grid, per VT420/xterm BCE spec (#7522).
+    /// Handle erase CSI sequences, first updating the BCE cursor template from
+    /// the current SGR background.
     #[inline]
     pub(super) fn handle_erase(&mut self, params: &[u16], final_byte: u8) {
         let mode = params.first().copied().unwrap_or(0);
@@ -359,17 +330,10 @@ impl CursorStateHandler<'_> {
         }
     }
 
-    /// Handle scroll operations.
-    ///
-    /// CSI Ps S (SU) - Scroll Up: Scroll text within scroll region up by Ps lines.
-    /// CSI Ps T (SD) - Scroll Down: Scroll text within scroll region down by Ps lines.
-    ///
-    /// Per VT510: These sequences scroll within the scroll region, not the entire screen.
-    /// New blank lines appear at the bottom (SU) or top (SD) of the scroll region.
-    /// Per VT420: When DECLRMM is active with horizontal margins, only the cells
-    /// within the margin region are scrolled (rectangular scroll).
-    ///
-    /// Updates the BCE cursor template before dispatching (#7522).
+    /// Handle scroll operations: SU (`CSI Ps S`) and SD (`CSI Ps T`) scroll
+    /// within the scroll region, inserting blank lines at its bottom or top
+    /// (VT510). With DECLRMM margins only the cells inside them move
+    /// (rectangular scroll, VT420). Updates the BCE cursor template first.
     #[inline]
     pub(super) fn handle_scroll(&mut self, params: &[u16], final_byte: u8) {
         let n = params.first().copied().unwrap_or(1).max(1) as usize;
@@ -403,10 +367,8 @@ impl CursorStateHandler<'_> {
         }
     }
 
-    /// Handle insert/delete operations.
-    ///
-    /// ICH/DCH respect horizontal margins when DECLRMM is active (#7320).
-    /// Updates the BCE cursor template before dispatching (#7522).
+    /// Handle insert/delete operations. ICH/DCH respect horizontal margins when
+    /// DECLRMM is active. Updates the BCE cursor template first.
     #[inline]
     pub(super) fn handle_insert_delete(&mut self, params: &[u16], final_byte: u8) {
         let n = params.first().copied().unwrap_or(1).max(1);
@@ -420,33 +382,28 @@ impl CursorStateHandler<'_> {
 
         match final_byte {
             b'@' => {
-                // Insert characters (ICH) — margin-aware (#7320)
+                // Insert characters (ICH) — margin-aware
                 self.grid.insert_chars_margin(n, lrmm);
             }
             b'P' => {
-                // Delete characters (DCH) — margin-aware (#7320)
+                // Delete characters (DCH) — margin-aware
                 self.grid.delete_chars_margin(n, lrmm);
             }
             b'L' => {
-                // Insert lines (IL) — margin-aware (#7408)
+                // Insert lines (IL) — margin-aware
                 self.grid.insert_lines_margined(n as usize, lrmm);
             }
             b'M' => {
-                // Delete lines (DL) — margin-aware (#7408)
+                // Delete lines (DL) — margin-aware
                 self.grid.delete_lines_margined(n as usize, lrmm);
             }
             _ => {}
         }
     }
 
-    /// Handle DECIC — Insert Column (VT420+).
-    ///
-    /// CSI Pn ' }
-    /// Insert Pn blank columns at cursor column for each row in the scroll
-    /// region. Content shifts right within horizontal margins; rightmost
-    /// columns at the margin are lost.
-    ///
-    /// Updates the BCE cursor template before dispatching (#7522).
+    /// Handle DECIC, Insert Column (`CSI Pn ' }`, VT420+): insert Pn blank
+    /// columns at the cursor column in each scroll-region row; content shifts
+    /// right within the horizontal margins. Updates the BCE template first.
     #[inline]
     pub(super) fn handle_decic(&mut self, params: &[u16]) {
         let n = params.first().copied().unwrap_or(1).max(1);
@@ -460,14 +417,9 @@ impl CursorStateHandler<'_> {
         self.grid.insert_columns(n);
     }
 
-    /// Handle DECDC — Delete Column (VT420+).
-    ///
-    /// CSI Pn ' ~
-    /// Delete Pn columns at cursor column for each row in the scroll
-    /// region. Content shifts left within horizontal margins; blank
-    /// columns appear at the right margin.
-    ///
-    /// Updates the BCE cursor template before dispatching (#7522).
+    /// Handle DECDC, Delete Column (`CSI Pn ' ~`, VT420+): delete Pn columns at
+    /// the cursor column in each scroll-region row; content shifts left and
+    /// blanks appear at the right margin. Updates the BCE template first.
     #[inline]
     pub(super) fn handle_decdc(&mut self, params: &[u16]) {
         let n = params.first().copied().unwrap_or(1).max(1);
@@ -514,39 +466,27 @@ impl CursorStateHandler<'_> {
         self.style.update_cached_colors();
     }
 
-    /// Handle DECSCL - Set Conformance Level.
+    /// Handle DECSCL, Set Conformance Level (`CSI Pl ; Pc " p`).
+    /// - Pl: level (61=VT100, 62=VT200, 63=VT300, 64=VT400, 65=VT500)
+    /// - Pc: C1 mode (0/2=8-bit, 1=7-bit), ignored
     ///
-    /// CSI Pl ; Pc " p
-    /// - Pl: Level (61=VT100, 62=VT200, 63=VT300, 64=VT400, 65=VT500)
-    /// - Pc: C1 mode (0/2=8-bit, 1=7-bit), ignored for VT100
-    ///
-    /// Per VT510 spec, changing conformance level performs a soft reset.
-    /// We follow xterm's behavior: just update the level without full reset.
+    /// VT510 performs a soft reset on a level change; like xterm, this only
+    /// updates the level.
     pub(super) fn handle_decscl(&mut self, params: &[u16]) {
-        // Get first parameter (level)
-        let level_param = match params.first().copied() {
-            Some(p) => match u8::try_from(p) {
-                Ok(v) => v,
-                Err(_) => return,
-            },
-            _ => return, // Required parameter
+        let Some(&first) = params.first() else {
+            return;
         };
-
-        // Parse level
+        let Ok(level_param) = u8::try_from(first) else {
+            return;
+        };
         let Some(level) = VtLevel::from_decscl_param(level_param) else {
             return; // Invalid level, ignore
         };
-
-        // Update conformance level
         self.modes.vt_level = level;
 
-        // Second parameter (C1 control transmission mode) is deliberately ignored:
-        // aterm has a FIXED 7-bit (S7C1T) transmission policy and never emits 8-bit
-        // C1 bytes, regardless of what's requested. This is the safe posture (8-bit
-        // C1 interpretation is off by default for injection safety; transmitting
-        // 8-bit C1 would be the mirror hazard). The DECRQSS DECSCL report mirrors
-        // this exactly — it reports 7-bit (see handler_decrqss.rs's
-        // DECSCL_C1_TRANSMISSION_7BIT), so the set-side and report-side agree.
+        // The C1 transmission parameter is ignored: aterm always transmits
+        // 7-bit (S7C1T) and never emits 8-bit C1 bytes. The DECRQSS DECSCL report
+        // says the same (DECSCL_C1_TRANSMISSION_7BIT in handler_decrqss.rs).
     }
 
     /// Handle DECSED (Selective Erase in Display).
@@ -607,18 +547,14 @@ impl CursorStateHandler<'_> {
         if let Some(style) = CursorStyle::from_param(mode) {
             let changed = self.modes.cursor_style != style;
             self.modes.cursor_style = style;
-            // DECSCUSR carries the blink bit too (1/3/5 blink, 2/4/6 steady), so
-            // it moves DEC mode 12 with it — otherwise `CSI ? 12 $ p` answers a
-            // stale flag while the cursor on screen blinks (or does not).
+            // DECSCUSR carries the blink bit (1/3/5 blink, 2/4/6 steady), so it
+            // moves DEC mode 12 with it and `CSI ? 12 $ p` stays accurate.
             self.modes.cursor_blink = style.blinks();
             if changed {
-                // A cursor-shape change repaints the cursor cell without changing any
-                // cell's content; mark that CELL's damage so `damage_epoch` advances
-                // and the new shape isn't swallowed by the frontend's redraw early-out
-                // (cf. DECTCEM `show_cursor`, which carries the audit note). The
-                // blink-class transition (steady<->blinking) already self-heals via the
-                // frontend blink timer; this covers a within-class change (e.g. steady
-                // block -> steady bar) with no grid write.
+                // A shape change repaints only the cursor cell: mark that cell's
+                // damage so `damage_epoch` advances and the change is presented
+                // (steady<->blinking transitions are also covered by the blink
+                // timer; this covers e.g. steady block -> steady bar).
                 self.grid.mark_cursor_damage();
             }
         }
@@ -649,28 +585,25 @@ impl CursorStateHandler<'_> {
 
         if self.modes.bidi_direction != new_direction {
             self.modes.bidi_direction = new_direction;
-            // Direction is applied at render-snapshot time to already-stored
-            // cells, so the narrow cursor-state handler invalidates the full
-            // presented grid directly.
+            // Direction is applied at render-snapshot time to stored cells, so
+            // mark the whole grid damaged.
             self.grid.damage_mut().mark_full();
         }
     }
 }
 
-/// Terminal-level goldens for the deferred wrap at an erase.
-///
-/// Each feeds real bytes, so the grid rule (`aterm-grid` `grid/erase.rs`) is
-/// exercised through the CSI / VT52 / DECSET dispatch that reaches it. The
-/// expected screens are xterm's: `util.c` `ClearRight`, `ClearInLine2` and
-/// `ClearScreen` all call `ResetWrap`, so the glyph printed after the erase
-/// overwrites the parked last column instead of wrapping. Several are Ghostty's
-/// own goldens (`Terminal.zig` "eraseLine resets pending wrap", "eraseLine left
-/// resets wrap").
+/// Terminal-level goldens for the deferred wrap at an erase, fed as real bytes
+/// through the CSI / VT52 / DECSET dispatch to the grid rule
+/// (`aterm-grid` `grid/erase.rs`). Expected screens are xterm's: `ClearRight`,
+/// `ClearInLine2` and `ClearScreen` (util.c) call `ResetWrap`, so the glyph
+/// after the erase overwrites the parked last column instead of wrapping.
+/// Several are Ghostty's goldens (`Terminal.zig` "eraseLine resets pending
+/// wrap", "eraseLine left resets wrap").
 #[cfg(test)]
 mod erase_pending_wrap_tests {
     use crate::terminal::Terminal;
 
-    /// The glyphs of visible row `row` of the ACTIVE screen, one char per column.
+    /// The glyphs of visible row `row` of the active screen, one char per column.
     fn row_glyphs(term: &Terminal, row: u16) -> String {
         let grid = term.grid();
         (0..grid.cols())
@@ -741,7 +674,7 @@ mod erase_pending_wrap_tests {
     #[test]
     fn ed_at_pending_wrap_then_print_overwrites_last_column() {
         // ED 0, 1 and 2 each reset the deferred wrap, so the next print lands
-        // on the parked last column instead of wrapping. One row per former test.
+        // on the parked last column instead of wrapping.
         for ed in [b"\x1b[J".as_slice(), b"\x1b[1J", b"\x1b[2J"] {
             let mut term = Terminal::new(24, 80);
             term.process(b"\x1b[1;80H!");
@@ -788,8 +721,8 @@ mod erase_pending_wrap_tests {
 
     #[test]
     fn el1_at_pending_wrap_four_columns_is_xterms_result_not_xterm_js() {
-        // Commit 4f27c52af's repro claimed `Z` lands on row 1; that was xterm.js.
-        // Real xterm resets the wrap in ClearInLine2, so `Z` overwrites col 3.
+        // xterm resets the wrap in ClearInLine2, so `Z` overwrites col 3
+        // (xterm.js differs and wraps to row 1).
         let mut term = Terminal::new(2, 4);
         term.process(b"ABCD\x1b[1KZ");
         assert_eq!(row_glyphs(&term, 0), "   Z");
@@ -866,19 +799,14 @@ mod erase_pending_wrap_tests {
         );
     }
 
-    /// A SECOND `CSI ?1049h` CLEARS THE SCREEN IT FINDS.
+    /// A second `CSI ?1049h` clears the screen it finds: xterm runs
+    /// `CursorSave; ToAlternate; ClearScreen` (charproc.c
+    /// `srm_OPT_ALTBUF_CURSOR`) and only `ToAlternate` stands down when alt is
+    /// already up.
     ///
-    /// xterm's arm is three calls — `CursorSave(xw); ToAlternate(xw, True);
-    /// ClearScreen(xw);` (charproc.c `srm_OPT_ALTBUF_CURSOR`) — and only the
-    /// MIDDLE one stands down when the alt screen is already up
-    /// (`ToAlternate`: `if (screen->whichBuf == 0)`). aterm returned early from
-    /// the whole arm, so a full-screen app restarting, or one that re-arms 1049
-    /// defensively, inherited the previous app's screen.
-    ///
-    /// The exit assertion is the other half: `CursorSave` writes the CURRENT
-    /// buffer's slot (`screen->sc[whichBuf]`), so the second enter saves into
-    /// the ALT slot and the main cursor 1049 RESET restores is still the one
-    /// the FIRST enter recorded.
+    /// The exit assertion: `CursorSave` writes the current (alt) buffer's slot,
+    /// so the main cursor 1049 reset restores is the one the first enter
+    /// recorded.
     #[test]
     fn a_second_1049_enter_clears_the_alt_screen_it_finds() {
         let mut term = Terminal::new(24, 80);

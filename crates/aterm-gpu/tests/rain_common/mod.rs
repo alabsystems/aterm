@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared PHOSPHOR rain fixture for the GPU parity/dirty-gate/scissor suites:
-//! drives a REAL `MatrixRain` engine (aterm-effects) over a frame snapshot's
-//! empty default-bg cells until it produces a genuine emission — glyph quads
-//! carrying non-trivial ramp tints plus at least one bright-head halo — under
-//! a deterministic seed. Consuming tests therefore exercise the exact channels
-//! the gui host feeds (`rain_quads` / `rain_atlas` / `rain_add`), not
-//! hand-built approximations of them.
+//! Shared phosphor rain fixture for the GPU parity/dirty-gate/scissor suites:
+//! drives a real `MatrixRain` engine over a frame's empty default-bg cells
+//! under a deterministic seed until it emits glyph quads with non-trivial
+//! ramp tints plus at least one head halo, so tests exercise the channels
+//! the gui feeds (`rain_quads` / `rain_atlas` / `rain_add`).
 
 use std::sync::Arc;
 
@@ -17,14 +15,12 @@ use aterm_render::{RainHalo, RenderInput, SceneAtlas, SpriteQuad};
 /// Deterministic replay seed (any fixed value; pinned so failures reproduce).
 pub const RAIN_SEED: u64 = 0xA7E2_11D3;
 
-/// CALM engine tick period in ms (the engine's 12 Hz weather gate). Advancing
-/// exactly one period per [`RainScene::tick`] keeps the drive one engine tick
-/// per call, so tick counts in tests mean what they say.
+/// Calm engine tick period in ms (the 12 Hz weather gate); each
+/// [`RainScene::tick`] advances exactly one engine tick.
 const CALM_TICK_MS: u64 = 83;
 
-/// [`RainScene::drive_until_raining`] gives up after this many ticks — the
-/// deterministic seed reaches a tinted, haloed frame far sooner, so hitting
-/// the cap means the engine (not the test) broke.
+/// [`RainScene::drive_until_raining`] gives up after this many ticks; the
+/// seed reaches a rich frame far sooner, so hitting it means the engine broke.
 const DRIVE_CAP: usize = 2000;
 
 /// A live rain field over a fixed grid snapshot.
@@ -39,9 +35,9 @@ pub struct RainScene {
 }
 
 impl RainScene {
-    /// Build an enabled engine over `base` (an already-extracted frame
-    /// snapshot whose empty default-bg cells are the eligible field) and run
-    /// the Tier-A occupancy scan once — the grid never changes in these tests.
+    /// Build an enabled engine over `base` (a frame snapshot whose empty
+    /// default-bg cells are the eligible field) and run the occupancy scan once
+    /// (the grid never changes in these tests).
     pub fn new(rows: usize, cols: usize, cell: (usize, usize), base: &RenderInput) -> Self {
         let cfg = RainConfig {
             enabled: true,
@@ -49,9 +45,8 @@ impl RainScene {
             density: 12,
             seed: RAIN_SEED,
             default_bg: base.default_bg,
-            // This fixture validates renderer atlas/quads, not the material
-            // sampler. Literal mode requires a sampled output table before it
-            // can emit; classic mode keeps the renderer fixture self-contained.
+            // Literal mode needs a sampled output table before it emits;
+            // classic mode keeps this renderer fixture self-contained.
             output_material: false,
             ..RainConfig::default()
         };
@@ -78,9 +73,8 @@ impl RainScene {
         }
     }
 
-    /// The Tier-B live inputs every test uses: cursor hidden (DECTCEM off in
-    /// the consuming terminals), no recently-damaged band, no selection, at
-    /// the scrollback bottom, main screen — nothing masked.
+    /// Live inputs every test uses: cursor hidden, no damaged band, no
+    /// selection, at the scrollback bottom, main screen.
     fn tick_input() -> RainTickInput<'static> {
         RainTickInput {
             cursor: None,
@@ -91,18 +85,16 @@ impl RainScene {
         }
     }
 
-    /// One engine tick: a keystroke first (so CALM never decays to SLEEP
-    /// mid-test), one CALM period of clock, then emit. Returns the frame
-    /// fingerprint.
+    /// One engine tick: a keystroke (so calm never decays to sleep), one calm
+    /// period of clock, then emit. Returns the frame fingerprint.
     pub fn tick(&mut self) -> u64 {
         self.engine.note_keystroke();
         self.engine.advance_ms(CALM_TICK_MS);
         self.emit()
     }
 
-    /// Re-emit WITHOUT advancing the clock: the field is a pure function of
-    /// `(seed, tick)`, so the same engine tick reproduces the identical
-    /// (settled, fp-stable) emission — the dirty gate's steady state.
+    /// Re-emit without advancing the clock: the field is a pure function of
+    /// `(seed, tick)`, so this reproduces the same settled emission.
     pub fn emit(&mut self) -> u64 {
         let fp = self.engine.emit(
             self.geom,
@@ -110,18 +102,15 @@ impl RainScene {
             &mut self.quads,
             &mut self.add,
         );
-        // `compute_dirty_rows`' per-row merge-diff requires `rain_quads` to
-        // arrive row-sorted; the engine emits column-major (hash-stride
-        // order). Stable sort keeps the deterministic within-row order, so
-        // settled re-emissions stay byte-equal frame over frame.
+        // `compute_dirty_rows` needs `rain_quads` row-sorted; the engine emits
+        // column-major. A stable sort keeps within-row order deterministic.
         self.quads.sort_by_key(|q| q.row);
         fp
     }
 
-    /// Tick until a genuinely rich frame: non-empty glyph quads carrying
-    /// non-trivial ramp tints AND at least one bright-head halo, with the
-    /// 64-tile atlas fully baked (>= 8 progressive bake ticks). Deterministic
-    /// under [`RAIN_SEED`]; panics past [`DRIVE_CAP`] rather than skipping.
+    /// Tick until a rich frame: glyph quads with non-trivial ramp tints, at
+    /// least one head halo, and the 64-tile atlas fully baked (>= 8 bake
+    /// ticks). Panics past [`DRIVE_CAP`] rather than skipping.
     pub fn drive_until_raining(&mut self) -> u64 {
         for i in 0..DRIVE_CAP {
             let fp = self.tick();
@@ -149,9 +138,8 @@ impl RainScene {
         self.engine.rain_atlas()
     }
 
-    /// Load the current emission into `input`'s rain channels, honoring the
-    /// gui host contract: the atlas Arc rides ONLY alongside non-empty quads,
-    /// so a rain-free frame is byte-identical to the pre-feature input.
+    /// Load the current emission into `input`'s rain channels. The atlas Arc
+    /// is set only alongside non-empty quads, as the gui does.
     pub fn apply(&mut self, input: &mut RenderInput) {
         input.rain_quads.clone_from(&self.quads);
         input.rain_add.clone_from(&self.add);

@@ -1,55 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// W1 READBACK PIN — kill the compositor stretch (audit sin 1).
+// Swapchain band placement: the swapchain is sized to the window's raw
+// physical pixels (not the grid-quantized frame, which would make
+// CAMetalLayer rescale it non-integrally), and the frame is placed at the
+// centred remainder offset (`aterm_render::band_offset`) with the leftover
+// bands painted theme-bg in the same blit pass.
 //
-// The sin: the swapchain was sized to the grid-quantized frame (`cols*cell_w +
-// 2*pad`), never the window's raw physical pixels, so CAMetalLayer's default
-// resize gravity non-integrally rescaled the whole frame after nearly any
-// drag/tile/zoom (~1.005x, permanent softness). The fix sizes the swapchain to
-// the RAW window pixels and places the frame at the centred remainder offset
-// (`aterm_render::band_offset`), painting the leftover bands theme-bg in the
-// same blit pass.
+// A window of grid-fit + 7 px must render the exact-fit content byte-identical
+// at the pad-split offset, unscaled, with every band pixel the theme
+// background.
 //
-// THE PIN (from the brief): a window of exactly grid-fit + 7px must render
-// BYTE-IDENTICAL to the exact-fit content, offset by the pad split, with ZERO
-// scaling — and every band pixel must be exactly the theme background.
+// Drives the real blit pipeline (`vs_blit`/`fs_blit`, `BlitUniform`) into a
+// readable stand-in via `blit_to_sized_for_test` and compares against the
+// offscreen readback. The CPU counterpart `aterm_render::place_frame_bands`
+// over the same source must equal the GPU output byte-for-byte.
 //
-// Drives the REAL present blit pipeline (`vs_blit`/`fs_blit` + the real
-// `BlitUniform`) into a readable swapchain stand-in via the test-only
-// `blit_to_sized_for_test` (the swapchain itself isn't readable headless), and
-// asserts against the offscreen readback (the single source of truth). Also
-// pins CPU/GPU agreement: `aterm_render::place_frame_bands` (the softbuffer
-// twin) over the same source must equal the GPU blit output byte-for-byte.
-//
-// Gated: no GPU or no system font => the test no-ops (returns).
+// No GPU or no system font: no-op.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{DropOverlay, GpuRenderer, PresentCrop};
 use aterm_render::{RenderInput, Theme, band_offset, band_offset_y, place_frame_bands};
 
+use crate::common;
+
 const ROWS: usize = 6;
 const COLS: usize = 24;
 
+/// This suite drives the wgpu oracle arm's blit seams (they read the wgpu
+/// offscreen).
 fn fresh_gpu() -> Option<GpuRenderer> {
-    match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(g) => {
-            // THE FLIP: this suite drives the WGPU ORACLE arm's blit seams
-            // (they read the wgpu offscreen); post-flip the oracle must be
-            // asked for by name.
-            #[cfg(target_os = "macos")]
-            let g = {
-                let mut g = g;
-                g.disarm_metal_for_oracle();
-                g
-            };
-            Some(g)
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            None
-        }
-    }
+    common::wgpu_oracle_or_skip(18.0, Theme::default())
 }
 
 /// A representative changed frame: a prompt, coloured text and a glyph, so the
@@ -62,17 +43,16 @@ fn representative_input() -> RenderInput {
     term.cell_frame(ROWS, COLS)
 }
 
-/// THE PIN: exact grid fit + 7px per axis => content byte-identical at the
-/// centred offset (3 leading / 4 trailing), bands exactly the theme bg, zero
-/// scaling — and the CPU placement twin agrees with the GPU blit byte-for-byte.
+/// Grid fit + 7 px per axis: content byte-identical at the centred offset (3
+/// leading / 4 trailing), bands exactly theme bg, no scaling, and the CPU
+/// placement agrees with the GPU blit.
 #[test]
 fn window_seven_px_past_grid_fit_offsets_content_without_scaling() {
     let Some(mut gpu) = fresh_gpu() else { return };
     let mut win = aterm_gpu::WindowGpu::new();
     let input = representative_input();
 
-    // The offscreen readback IS the exact-fit content (the single source of
-    // truth the exact-fit present blits 1:1 — proven byte-identical by
+    // The offscreen readback is the exact-fit content (blitted 1:1; see
     // tests/blit_invert.rs).
     let source = gpu.render_input(&mut win, &input, None);
     let (fw, fh) = (source.width, source.height);
@@ -193,8 +173,8 @@ fn undersized_swapchain_crops_centred_never_scales() {
     }
 }
 
-/// The asymmetric frontend crop is enforced by the REAL present shader before
-/// bell inversion and the drop overlay.  With an odd five-row removal, three
+/// The asymmetric frontend crop is enforced by the present shader before
+/// bell inversion and the drop overlay. With an odd five-row removal, three
 /// raw rows above and two below become chrome; the overlay border is measured
 /// against the shorter visible interval, including its trailing edge.
 #[test]
@@ -260,13 +240,11 @@ fn asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay() {
     );
 }
 
-/// CHROME REACHES THE WINDOW EDGE (the message band's full-width meter,
-/// ruling 55, 2026-09-23). With two chrome rows declared — the second a
-/// METERED row whose gutters wear its own fill and track tones — a window 7 px
-/// past grid fit continues each chrome row's edge pixels through the leftover
-/// bands (so the meter's fill reaches the true window edge), keeps every other
-/// band pixel the theme background, and agrees with the CPU twin
-/// (`place_frame_bands` with the same `edge_rows`) byte for byte.
+/// Chrome reaches the window edge: with two chrome rows (the second a metered
+/// row whose gutters use its fill and track tones), a window 7 px past grid
+/// fit continues each chrome row's edge pixels through the leftover bands,
+/// keeps every other band pixel theme bg, and matches `place_frame_bands`
+/// with the same `edge_rows`.
 #[test]
 fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -357,15 +335,12 @@ fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
     }
 }
 
-/// `ChromeBleed::first` REACHES THE PRESENTERS (second audit, 2026-09-24). A
-/// band below a strip row with no surface of its own (macOS's in-grid strip)
-/// continues ITS edge pixels only: beside the strip row the leftover bands
-/// stay the theme background, as they did before the band existed, even where
-/// that row's own edge pixel is something else (here a red cell at pad 0; in
-/// the field, a wallpaper texel). The chrome extent used to be a prefix from
-/// row 0, so the strip row's edge column was stretched across the bands. GPU
-/// and CPU agree byte for byte, so the shader's `chrome_y0` bound and
-/// `place_frame_bands`' range are the same law.
+/// `ChromeBleed::first` reaches the presenters: a band below a strip row with
+/// no surface of its own (macOS's in-grid strip) continues only its own edge
+/// pixels; beside the strip row the leftover bands stay theme bg even where
+/// that row's edge pixel differs (a red cell at pad 0 here). GPU and CPU
+/// agree, so the shader's `chrome_y0` bound and `place_frame_bands`' range
+/// match.
 #[test]
 fn rows_above_the_chrome_start_keep_the_flat_leftover_band() {
     let Some(mut gpu) = fresh_gpu() else { return };

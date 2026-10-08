@@ -1,0 +1,27 @@
+# claude-code 2.1.292 · MEASURED 2026-10-06, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the full-context wall (a turn the stub answered with `prompt is too long`) the moment after the loop typed `/compact`: in 2.1.291 and 2.1.292 the slash menu opens under the composer's bottom rule and the highlighted entry carries the Select's pointer, `  ❯ /compact   Free up context …` over `    /autocompact …` (2.1.287 drew the entries alone, all indented two columns); the pointer row is the last `❯` row of the screen and the caret row (`❯ /compact`) the one between the rules · the rows end at the last drawn row
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Baked for 0s · done 4:58 PM
+
+❯ second normal turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Churned for 0s · done 4:58 PM
+
+❯ third normal turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 3)
+
+✻ Cogitated for 0s · done 4:58 PM
+
+❯ fourth turn: the stub says the prompt is too long
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Brewed for 0s · done 4:58 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /compact
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ❯ /compact                    Free up context by summarizing the conversation so far
+    /autocompact                Set how full the context gets before auto-summarizing

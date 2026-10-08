@@ -41,16 +41,11 @@ pub(crate) const MAX_VIRTUAL_TEXT_RANGE: u64 = 1024 * 1024;
 /// A collision inside one projected tree is detected and fails the whole projection.
 #[cfg(test)]
 pub(crate) fn stable_node_id(key: &UiKey) -> NodeId {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in b"aterm/native-a11y/v1\0"
-        .iter()
-        .chain(key.as_str().as_bytes())
-    {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let mut hash = aterm_hash::Fnv1a64::new();
+    hash.write(b"aterm/native-a11y/v1\0");
+    hash.write(key.as_str().as_bytes());
     // Keep zero available to legacy root trees and ensure every native key has a concrete id.
-    NodeId(hash.max(1))
+    NodeId(hash.finish().max(1))
 }
 
 /// Deterministically namespace a semantic identity by its stable native view.
@@ -59,25 +54,15 @@ pub(crate) fn stable_node_id(key: &UiKey) -> NodeId {
 /// same `UiKey`s).  A view-qualified id keeps those independently actionable
 /// trees stable without making sibling order or focus part of identity.
 pub(crate) fn stable_node_id_for_view(view: ViewId, key: &UiKey) -> NodeId {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in b"aterm/native-a11y/view/v1\0"
-        .iter()
-        .chain(view.get().to_le_bytes().iter())
-        .chain(key.as_str().as_bytes())
-    {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    NodeId(hash.max(1))
+    let mut hash = aterm_hash::Fnv1a64::new();
+    hash.write(b"aterm/native-a11y/view/v1\0");
+    hash.write(&view.get().to_le_bytes());
+    hash.write(key.as_str().as_bytes());
+    NodeId(hash.finish().max(1))
 }
 
 fn composite_root_id() -> NodeId {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in b"aterm/native-a11y/window/v1" {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    NodeId(hash.max(1))
+    NodeId(aterm_hash::fnv1a_64(b"aterm/native-a11y/window/v1").max(1))
 }
 
 /// Lifecycle stamp attached to every route in a published native leaf.
@@ -178,7 +163,6 @@ pub(crate) struct NativeAccessibilityProjection {
     update: TreeUpdate,
     routes: Vec<AccessibilityRoute>,
     virtual_text: Vec<VirtualTextTarget>,
-    source_nodes_visited: usize,
 }
 
 impl NativeAccessibilityProjection {
@@ -211,12 +195,6 @@ impl NativeAccessibilityProjection {
     #[cfg(test)]
     pub(crate) fn virtual_text(&self) -> &[VirtualTextTarget] {
         &self.virtual_text
-    }
-
-    /// Diagnostic witness that the canonical semantic vector was consumed once.
-    #[cfg(test)]
-    pub(crate) fn source_nodes_visited(&self) -> usize {
-        self.source_nodes_visited
     }
 
     #[cfg(test)]
@@ -928,7 +906,6 @@ pub(crate) fn compose_native_accessibility(
     let mut nodes = Vec::new();
     let mut routes = Vec::new();
     let mut virtual_text = Vec::new();
-    let mut source_nodes_visited = 0usize;
     let mut focused_node = None;
 
     for (owner, mut projection) in projections {
@@ -958,7 +935,6 @@ pub(crate) fn compose_native_accessibility(
         }
         routes.append(&mut projection.routes);
         virtual_text.append(&mut projection.virtual_text);
-        source_nodes_visited = source_nodes_visited.saturating_add(projection.source_nodes_visited);
     }
 
     let mut window = Node::new(Role::Window);
@@ -980,7 +956,6 @@ pub(crate) fn compose_native_accessibility(
         },
         routes,
         virtual_text,
-        source_nodes_visited,
     })
 }
 
@@ -1035,11 +1010,9 @@ fn project_with_transform_and_ids(
     let mut explicit_focus = None;
     let mut state_focus = None;
     let mut state_focus_ambiguous = false;
-    let mut source_nodes_visited = 0;
 
     // This is the sole traversal of the canonical semantic source.
     for semantic in &compiled.semantics {
-        source_nodes_visited += 1;
         if by_key.contains_key(&semantic.key) {
             return Err(AccessibilityProjectionError::DuplicateKey(
                 semantic.key.clone(),
@@ -1228,7 +1201,6 @@ fn project_with_transform_and_ids(
         },
         routes,
         virtual_text,
-        source_nodes_visited,
     })
 }
 
@@ -1438,21 +1410,11 @@ fn rect_to_accesskit(rect: LogicalRect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_ui::tests::button;
     use crate::native_ui::{
         ButtonSpec, Control, Flow, GroupSpec, Insets, Layout, Length, SliderSpec, StyleRef,
         SwitchSpec, TextFieldSpec, TextSpec, TextViewportSpec, UiContent, UiNode, UiTree,
     };
-
-    fn button(key: &str, label: &str) -> UiNode {
-        UiNode::new(
-            key,
-            UiContent::Button(Control::new(
-                ButtonSpec::new(label),
-                ActionId::new(format!("activate/{key}")),
-            )),
-        )
-        .layout(Layout::default().height(Length::Fixed(40.0)))
-    }
 
     fn compiled_form(order: &[&str]) -> CompiledUi {
         let children = order
@@ -1573,7 +1535,6 @@ mod tests {
     fn projection_consumes_compiled_semantics_once_and_preserves_hierarchy() {
         let compiled = compiled_form(&["alpha", "beta"]);
         let projection = project_native_accessibility(&compiled, None).unwrap();
-        assert_eq!(projection.source_nodes_visited(), compiled.semantics.len());
         assert_eq!(projection.update().nodes.len(), compiled.semantics.len());
         assert_eq!(projection.routes().len(), compiled.semantics.len());
 
@@ -2274,7 +2235,6 @@ mod tests {
         assert_eq!(target.lines.len(), 7);
         assert_eq!(target.lines.last().unwrap().source, 12..13);
         assert_eq!(projection.update().nodes.len(), 2 + target.lines.len());
-        assert_eq!(projection.source_nodes_visited(), 2);
 
         let paint = compiled
             .paint

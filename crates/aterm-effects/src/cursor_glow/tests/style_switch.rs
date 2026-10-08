@@ -5,11 +5,9 @@
 
 use super::*;
 
-/// The visible LIGHT MASS of one ticked frame — every merged stream's
-/// colour energy weighted coarsely by area. A crude photometer, but the
-/// crossfade proofs only need MONOTONE-IN-AMPLITUDE: the ramp-down scales
-/// every emitted colour linearly, so a falling envelope must read as a
-/// falling mass.
+/// The visible light mass of one ticked frame: every merged stream's colour
+/// energy weighted coarsely by area. Crude, but the crossfade proofs only need
+/// it monotone in amplitude.
 fn frame_mass(out: &[GlowQuad], glow: &CursorGlow) -> u64 {
     let rgb = |c: u32| ((c >> 16) & 0xff) as u64 + ((c >> 8) & 0xff) as u64 + (c & 0xff) as u64;
     let mut m: u64 = out.iter().map(|q| rgb(q.color)).sum();
@@ -23,13 +21,11 @@ fn frame_mass(out: &[GlowQuad], glow: &CursorGlow) -> u64 {
     m
 }
 
-/// STYLE SWITCH mid-animation CROSSFADES the foreign light instead of hard-
-/// cutting to black: the old style's in-flight state moves into an outgoing
-/// fade that keeps emitting under its OLD config with a DECREASING
-/// amplitude, `is_active()` holds through the switch (the animation train
-/// never disarms mid-fade), the NEW style's live state never inherits the
-/// foreign light (the audited hot-swap artifact stays fixed), and the
-/// typing WARMTH carries so the incoming style does not start cold.
+/// A style switch mid-animation crossfades the foreign light: the old style's
+/// in-flight state moves into an outgoing fade emitting under its old config
+/// with decreasing amplitude, `is_active()` holds through the switch, the new
+/// style's live state never inherits the foreign light, and typing warmth
+/// carries over.
 #[test]
 fn style_switch_crossfades_the_old_light_and_stays_active() {
     let g = geom();
@@ -84,7 +80,7 @@ fn style_switch_crossfades_the_old_light_and_stays_active() {
     );
     assert!(glow.is_active(), "is_active holds while the fade lives");
     // Past the whole envelope (and every spark/bolt lifetime): the fade is
-    // retired and the engine settles back to idle-zero — no leaked wakes.
+    // retired and the engine settles to idle-zero.
     let fp = glow.tick(
         Some((0, 30)),
         t0 + Duration::from_secs(10),
@@ -100,10 +96,8 @@ fn style_switch_crossfades_the_old_light_and_stays_active() {
     );
 }
 
-/// The no-switch path is PROVABLY INERT for the crossfade machinery: a
-/// single-style run never arms a fade or a ramp, so every built-in style's
-/// output stays byte-identical (the whole-frame golden proof pins the
-/// bytes; this pins the mechanism).
+/// The no-switch path is inert for the crossfade machinery: a single-style run
+/// never arms a fade or a ramp (the whole-frame golden proof pins the bytes).
 #[test]
 fn no_switch_keeps_the_crossfade_machinery_inert() {
     let g = geom();
@@ -126,11 +120,9 @@ fn no_switch_keeps_the_crossfade_machinery_inert() {
     assert!(glow.fading.is_empty() && glow.ramp_in_at.is_none());
 }
 
-/// RAPID SEQUENTIAL SWITCHES chain gracefully: each outgoing style hands
-/// off into its own fade (bounded at FADE_CAP, oldest shed), and NO frame
-/// inside the chain shows zero cursor-effect output while any fade lives —
-/// the product gesture is flipping through the style menu and watching the
-/// trails morph live, never blink.
+/// Rapid sequential switches chain: each outgoing style hands off into its own
+/// fade (bounded at FADE_CAP, oldest shed), and no frame in the chain shows
+/// zero cursor-effect output while any fade lives.
 #[test]
 fn chained_switches_cap_fades_and_never_go_dark() {
     let g = geom();
@@ -164,9 +156,8 @@ fn chained_switches_cap_fades_and_never_go_dark() {
             "no dark frame right after a chained switch to {style:?}"
         );
     }
-    // Ride the tail out frame-by-frame: while ANY fade lives, the frame
-    // shows output (a retained fade that painted nothing is a contract
-    // violation — tick_fades retires such a fade the same frame).
+    // While any fade lives, the frame shows output (`tick_fades` retires a fade
+    // that painted nothing in the same frame).
     let lumen = cfg(GlowStyle::Lumen, true);
     for _ in 0..30 {
         t += Duration::from_millis(16);
@@ -184,10 +175,9 @@ fn chained_switches_cap_fades_and_never_go_dark() {
     );
 }
 
-/// SOUND does not cross styles: a cue recorded under the outgoing style is
-/// dropped at the switch edge (the host maps cues -> sounds by the CURRENT
-/// style when it drains, so a stale cue would play the wrong palette), and
-/// the fade residue never records cues of its own.
+/// Sound does not cross styles: a cue recorded under the outgoing style is
+/// dropped at the switch edge (the host maps cues to sounds by the current
+/// style), and the fade residue records no cues.
 #[test]
 fn style_switch_drops_pending_sound_cues() {
     use crate::trail_sound::SoundKind;
@@ -219,11 +209,9 @@ fn style_switch_drops_pending_sound_cues() {
     assert_eq!(cues[0].kind, SoundKind::Typed);
 }
 
-/// The non-fire crown is RADIAL light now, not the retired box-stack of nested
-/// rectangles: a hot run's crown lands as RainHalos around the head (falloff
-/// radii ≥ 1) for every non-fire style — the audited laser posterized squares
-/// (with a detached dim quad below) and the lumen/sparkle/water stepped banding
-/// are gone. Both backends render the RainHalo identically.
+/// The non-fire crown is radial light: a hot run's crown lands as RainHalos
+/// around the head (falloff radii ≥ 1) for every non-fire style, rendered
+/// identically by both backends.
 #[test]
 fn non_fire_crown_is_radial_halos_not_squares() {
     let g = geom();
@@ -266,23 +254,9 @@ fn non_fire_crown_is_radial_halos_not_squares() {
     }
 }
 
-/// "beam" is a first-class style now (the steady power-down TUBE), no longer
-/// an alias folded into `Lumen` — while `comet`/`lumen` keep parsing to the
-/// default and `laser` stays its own style.
-/// **THE JAG'S REUSED BUFFERS CARRY NOTHING BETWEEN STRIKES.**
-///
-/// `spawn_bolt` used to build a fresh `Vec` per midpoint-displacement round
-/// — `vec![from, to]` plus one `Vec::with_capacity` per round, two rounds
-/// for a crackle and four for a jump — so every strike cost three or five
-/// heap buffers to describe a polyline five points long, and hot typing
-/// crackles several a second. They are pooled on the engine now, which
-/// introduces exactly one hazard worth a test: a reused buffer that is not
-/// cleared carries the PREVIOUS strike's points into this one.
-///
-/// So: the same seed must produce the same polyline, strike after strike.
-/// Laser has no other behavioural coverage in this crate — the only other
-/// mention is the style-name parse below — so this is also the only thing
-/// standing between the pooling and a silent shape regression.
+/// The pooled bolt-jag buffers carry nothing between strikes: the same seed
+/// produces the same polyline strike after strike. The only behavioural
+/// coverage of laser in this crate.
 #[test]
 fn a_pooled_bolt_jag_is_deterministic_across_strikes() {
     let mut g = CursorGlow::default();

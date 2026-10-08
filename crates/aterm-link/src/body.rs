@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FABRIC BODY (§4.1) — one ASCII line of `key=value` tokens, optionally
+//! The fabric body (§4.1) — one ASCII line of `key=value` tokens, optionally
 //! followed by `len=<n>` raw bytes.
 //!
 //! ```text
@@ -10,12 +10,12 @@
 //! ["\n" ‖ <n> raw bytes]
 //! ```
 //!
-//! WHAT IS NOT IN IT is the design's point: no `from=` a sender chooses, no
-//! `to=`, no `kind=`, no `id=`, no `trust=`. Those are the subject's segments,
-//! the record's offset, and a label the RECEIVER computes. The one attested
-//! exception is `from=<sid>`, which a NODE adds on behalf of a session it hosts —
-//! and it is attested precisely because the node's `<src>` segment is cap-forced,
-//! so the node could type as that session anyway (§8.3).
+//! What is NOT in it is the point: no sender-chosen `from=`, no `to=`, no
+//! `kind=` (except a broadcast's, see [`Body::kind`]), no `id=`, no `trust=`.
+//! Those are the subject's segments, the record's offset, and a label the
+//! receiver computes. The one attested exception is `from=<sid>`: a node adds it
+//! for a session it hosts, and the node's `<src>` segment is cap-forced, so it
+//! could type as that session anyway (§8.3).
 //!
 //! The parser is TOTAL over arbitrary bytes: an unknown token is ignored, a
 //! malformed number is `None`, and nothing here can panic on a hostile body.
@@ -65,30 +65,16 @@ pub fn is_verdict(v: &str) -> bool {
 /// The most relay hops a `via=` chain may name, and the most bytes it may spend
 /// on them.
 ///
-/// ## THE FIELD THAT EVERY COMPONENT BOUNDED DIFFERENTLY
+/// [`Body::decode`] is total, so `via=` arrives unbounded; every consumer must
+/// bound it, and they must agree. A record head runs to the broker's 16 MiB, so
+/// an unbounded chain on a `deliver` line overruns the request-line bound and
+/// the record is lost with no verdict. This is the one place the bound lives;
+/// the byte cap is computed from the hop cap and
+/// [`crate::subject::PRINCIPAL_MAX`].
 ///
-/// `via=` is decoded here with no length, count or shape check — deliberately,
-/// because [`Body::decode`] is TOTAL and a parser that dropped a record on a
-/// hostile token would lose a message on a policy. Every consumer therefore has
-/// to bound it, and three of them each had their own idea of the limit: the
-/// endpoint checks each comma element against its principal grammar and the
-/// element COUNT against nothing; aterm's control server drops any request line
-/// at 64 KiB; and the bridge built a `deliver` line carrying the chain verbatim.
-/// A record head runs to the broker's 16 MiB ceiling, so a stranger's chain went
-/// past the request-line bound, the writer refused the line, and the record was
-/// lost with no verdict at all. That is the same shape as the round-1 wound, one
-/// field over — three implicit limits for one value and no place where they met.
-///
-/// THIS IS THAT PLACE. It lives beside the parser rather than beside any one
-/// consumer, so every consumer — today the inbound side, [`crate::bridge`]'s
-/// `deliver` line — bounds the same field by the same number. The byte cap is COMPUTED from the hop cap and
-/// [`crate::subject::PRINCIPAL_MAX`], so those two cannot drift either.
-///
-/// Sixteen is past any relay §6.7 describes, and the whole is three orders of
-/// magnitude under the request-line bound: a relay chain is a path through a
-/// fleet, not a payload. It buys a sender nothing — a chain is a CLAIM on the
-/// relayer's word, never authority, and `via.is_some()` alone already demotes
-/// the record's kind.
+/// Sixteen is past any relay §6.7 describes, and the whole is far under the
+/// request-line bound. A chain is a claim on the relayer's word, never
+/// authority: `via.is_some()` alone already demotes the record's kind.
 pub const VIA_MAX_HOPS: usize = 16;
 
 /// The byte cap [`VIA_MAX_HOPS`] implies, separators included.
@@ -100,13 +86,11 @@ pub const VIA_MAX_BYTES: usize = VIA_MAX_HOPS * (crate::subject::PRINCIPAL_MAX +
 /// bounds the endpoint does not have. An EMPTY chain is refused too: it is a
 /// relay claim naming no relay, and it still demotes the record's kind.
 ///
-/// IT IS NOT APPLIED IN [`Body::decode`], and that is deliberate. `via.is_some()`
-/// is what makes [`crate::bridge::Bridge::classify_kind`] demote a `task` to a
-/// `note` and what makes `trust_of` answer `relayed`; a parser that dropped an
-/// over-long chain would turn a relayed `task` into a DIRECT one, so bounding the
-/// field at the door would hand a stranger the undemoted kind that bounding it
-/// was meant to deny them. The chain is bounded where it is USED, and a record
-/// that fails this earns a verdict rather than a quieter delivery.
+/// Not applied in [`Body::decode`], deliberately: `via.is_some()` is what makes
+/// [`crate::bridge::Bridge::classify_kind`] demote a `task` and `trust_of`
+/// answer `relayed`, so dropping an over-long chain at the door would hand a
+/// stranger the undemoted kind. It is bounded where used, and a failing record
+/// earns a verdict.
 #[must_use]
 pub fn via_ok(via: &str) -> bool {
     !via.is_empty()
@@ -115,17 +99,8 @@ pub fn via_ok(via: &str) -> bool {
         && via.split(',').all(crate::subject::is_principal)
 }
 
-// THERE IS NO DEMOTION LIST HERE, DELIBERATELY.
-//
-// This module used to export `ACCEPTED_ONLY_KINDS = ["task", "control",
-// "answer"]`, documented as the kinds an unlisted principal may not speak as.
-// Nothing read it, and it disagreed with the list that IS read —
-// `bridge::DEMOTE_UNLESS_ACCEPTED = ["task", "control"]`, which is §8.4's rule
-// and whose own doc argues the opposite about the third entry: an `answer`'s
-// authority is the `re=` the receiver itself minted, so it is answerable by
-// whoever the asker asked. Two `pub` constants stating two policies is a
-// dead-code lint that never fires and a reader who believes the wrong one; the
-// demotion policy lives in one place, beside the code that applies it.
+// No demotion list here: the policy lives in `bridge::DEMOTE_UNLESS_ACCEPTED`,
+// beside the code that applies it.
 
 /// One decoded fabric body.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -148,27 +123,21 @@ pub struct Body {
     /// on the `ask`/`task` at `re=`. One of [`VERDICTS`]; anything else is left
     /// in `unknown` by the decoder and never reaches a `deliver` line.
     pub verdict: Option<String>,
-    /// The target session's public launch nonce (§7). §6.6 made it MANDATORY on
-    /// `term/in` and `control` and fenced on it; round 21 cut the drive face, so
-    /// nothing in this crate checks it any more — the codec carries it
-    /// losslessly and `ls` renders it. A freshness fence, not a secret.
+    /// The target session's public launch nonce (§7). Carried losslessly and
+    /// rendered by `ls`; nothing in this crate checks it.
     pub epoch: Option<String>,
     /// The `<seq>:<fp16>` freshness fence §6.6 defined for `term/in`. Carried
-    /// and rendered since round 21, never checked.
+    /// and rendered, never checked.
     pub gen: Option<String>,
     /// The relay chain. Any `via=` at all makes the message `trust=relayed` and
     /// `kind=note demoted=<k>`, whatever the recipient's allowlist says (§6.7).
     pub via: Option<String>,
     /// A BROADCAST's kind, carried IN THE BODY.
     ///
-    /// A directed message puts its kind in the subject's last segment, and the
-    /// `in/` tree can afford that: one leaf per kind, per recipient. A
-    /// BROADCAST cannot — `say/<topic>/<kind>` multiplies the fleet's topics by
-    /// the kind set on a subject budget round 23 has not reclaimed (the bridge
-    /// header counts what each session already costs), and the topic is the
-    /// thing subscribers name. So `say` spends its last segment on the topic
-    /// and the kind rides here. Closed to [`crate::fabric::KINDS`] at the
-    /// decoder, like `verdict`.
+    /// A directed message's kind is the subject's last segment; a broadcast's
+    /// last segment is the topic (`say/<topic>/<kind>` would multiply topics by
+    /// kinds on the subject budget), so its kind rides here. Closed to
+    /// [`KINDS`] at the decoder, like `verdict`.
     pub kind: Option<String>,
     /// The message text, already pct-DECODED.
     pub text: String,
@@ -188,14 +157,12 @@ impl Body {
         }
     }
 
-    /// Render the body: the one line, then — when `raw` is `Some` — a `len=` and
-    /// that many bytes after a newline.
+    /// Render the body: the one line, its message in `text=`.
     ///
-    /// `text=` and the raw tail are alternatives, not both: the design gives
-    /// `len=` its own meaning (raw bytes follow) and a body that set both would
-    /// leave a reader to guess which one is the message.
+    /// The `len=` raw-tail form has no writer; [`Body::decode`] still clamps a
+    /// `len=` a stranger puts on the bus.
     #[must_use]
-    pub fn encode(&self, raw: Option<&[u8]>) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let mut line = format!("v={} t={}", self.v, self.t);
         for (key, value) in [
             ("from", self.from.clone()),
@@ -220,25 +187,12 @@ impl Body {
         for (k, v) in &self.unknown {
             line.push_str(&format!(" {k}={v}"));
         }
-        match raw {
-            Some(bytes) => {
-                line.push_str(&format!(" len={}", bytes.len()));
-                let mut out = line.into_bytes();
-                out.push(b'\n');
-                out.extend_from_slice(bytes);
-                out
-            }
-            None => {
-                line.push_str(&format!(" text={}", crate::pct::encode(&self.text)));
-                line.into_bytes()
-            }
-        }
+        line.push_str(&format!(" text={}", crate::pct::encode(&self.text)));
+        line.into_bytes()
     }
 
-    /// Parse a body. TOTAL: never fails, never panics. A body that is not even
-    /// UTF-8 decodes lossily and yields whatever tokens survive, because the
-    /// alternative — dropping the record — would lose a message on a peer's
-    /// encoding bug rather than on a policy.
+    /// Parse a body. Total: never fails, never panics; non-UTF-8 decodes lossily
+    /// so a peer's encoding bug never loses a message.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> (Self, Option<Vec<u8>>) {
         #[cfg(test)]
@@ -267,9 +221,7 @@ impl Body {
                 "epoch" => body.epoch = Some(val.to_string()),
                 "gen" => body.gen = Some(val.to_string()),
                 "via" => body.via = Some(val.to_string()),
-                // CLOSED at the decoder, for `verdict`'s reason: a `kind=` a
-                // publisher invented is an unknown field, not a kind, so no
-                // reader downstream has to re-check it.
+                // Closed at the decoder, as `verdict` is.
                 "kind" if KINDS.contains(&val) => {
                     body.kind = Some(val.to_string());
                 }
@@ -293,16 +245,15 @@ impl Body {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    /// **A BROADCAST'S KIND RIDES IN THE BODY**, round-trips, and is CLOSED to
-    /// the known set — a `kind=` a publisher invented stays an unknown field,
-    /// exactly as `verdict=` does, so no reader downstream re-checks it.
+    /// A broadcast's kind round-trips in the body and is closed to [`KINDS`].
     #[test]
     fn a_broadcast_kind_round_trips_and_is_closed() {
         let mut b = Body::new(7);
         b.kind = Some("task".to_string());
         b.text = "go".to_string();
-        let wire = b.encode(None);
+        let wire = b.encode();
         let line = String::from_utf8_lossy(&wire).into_owned();
         assert!(line.contains(" kind=task"), "{line}");
         let (back, _) = Body::decode(&wire);
@@ -320,11 +271,8 @@ mod tests {
         let (plain, _) = Body::decode(b"v=1 t=1 text=hi");
         assert_eq!(plain.kind, None);
     }
-    use super::*;
 
-    /// The line round-trips, and the fields the design forbids stay absent: a
-    /// body has no `to=`, no `kind=`, no `id=`, no `trust=`, because every one of
-    /// those is either the address, the offset, or the receiver's own verdict.
+    /// The line round-trips, and the forbidden fields stay absent.
     #[test]
     fn a_text_body_round_trips_and_names_no_forbidden_field() {
         let mut b = Body::new(1_756_389_000_123);
@@ -332,7 +280,7 @@ mod tests {
         b.re = Some(90_312);
         b.dl = Some(240_000);
         b.text = "which branch has the fixture?".into();
-        let wire = b.encode(None);
+        let wire = b.encode();
         let line = String::from_utf8(wire.clone()).expect("ascii line");
         assert!(line.starts_with("v=1 t=1756389000123 from=s-abc re=90312 dl=240000 text="));
         for forbidden in [" to=", " kind=", " id=", " trust=", " demoted="] {
@@ -343,16 +291,15 @@ mod tests {
         assert_eq!(got, b);
     }
 
-    /// A RECEIPT'S VERDICT IS A CLOSED WORD (R8). `verdict=` round-trips for the
-    /// three words `inbox seen` accepts, and anything else decodes as an unknown
-    /// token — so no `deliver` line downstream can carry a stranger's spelling.
+    /// A receipt's `verdict=` (R8) round-trips for the three words; anything
+    /// else decodes as an unknown token.
     #[test]
     fn a_verdict_round_trips_and_an_unknown_one_is_not_a_verdict() {
         let mut b = Body::new(9);
         b.re = Some(41);
         b.verdict = Some("refused".into());
         b.text = "ack re=41 verdict=refused".into();
-        let wire = b.encode(None);
+        let wire = b.encode();
         let line = String::from_utf8(wire.clone()).expect("ascii line");
         assert!(line.contains(" re=41 verdict=refused text="), "{line}");
         let (got, _) = Body::decode(&wire);
@@ -370,24 +317,7 @@ mod tests {
         );
     }
 
-    /// The `len=` form carries arbitrary bytes — newlines, NULs, invalid UTF-8 —
-    /// which is what the drive face needs and what `text=` cannot express.
-    #[test]
-    fn a_raw_body_carries_any_byte() {
-        let mut b = Body::new(7);
-        b.epoch = Some("0123456789abcdef0123456789abcdef".into());
-        b.gen = Some("42:beefbeefbeefbeef".into());
-        let raw: Vec<u8> = vec![0x00, b'\n', 0xff, b'y', 0x1b, b'[', b'A'];
-        let wire = b.encode(Some(&raw));
-        let (got, back) = Body::decode(&wire);
-        assert_eq!(back.as_deref(), Some(&raw[..]));
-        assert_eq!(got.epoch, b.epoch);
-        assert_eq!(got.gen, b.gen);
-    }
-
-    /// TOTAL over hostile input: a truncated tail, a lying `len=`, a body that is
-    /// not UTF-8, an empty record. None of these may panic, because every one of
-    /// them is a byte string a stranger can put on the bus.
+    /// Decoding is total over hostile bytes.
     #[test]
     fn decoding_is_total_over_hostile_bytes() {
         for bytes in [
@@ -407,13 +337,12 @@ mod tests {
         }
     }
 
-    /// An unknown token survives the round trip. A newer publisher's field must
-    /// be visible in a diagnostic, not silently erased by an older bridge.
+    /// An unknown token survives the round trip.
     #[test]
     fn an_unknown_token_survives() {
         let (body, _) = Body::decode(b"v=1 t=3 lang=en text=hi");
         assert_eq!(body.unknown.get("lang").map(String::as_str), Some("en"));
-        let line = String::from_utf8(body.encode(None)).expect("ascii");
+        let line = String::from_utf8(body.encode()).expect("ascii");
         assert!(line.contains(" lang=en"), "{line}");
     }
 }

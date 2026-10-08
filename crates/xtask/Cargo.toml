@@ -16,26 +16,26 @@ path = "src/main.rs"
 [dependencies]
 # `aterm_spec::harness_manifest`, behind the `harness-manifest` verb.
 aterm-spec = { workspace = true }
-# THE workspace's one lock-scoped environment helper (`aterm_log::env`), for the
-# single `$CARGO` handoff in driver.rs. A direct edge to the dependency-free leaf
-# that is already in this binary's graph — the point of the shared helper is that
-# the binary has ONE lock, which a per-crate copy would not give (see that
-# module's docs). Nothing here uses aterm-log as a logger.
+# `aterm_log::env`, the binary's one env lock, for driver.rs's `$CARGO` handoff.
+# Not used as a logger.
 aterm-log = { workspace = true }
-# ONE definition of "which directory is THE toolchain" (`aterm_verify::Toolchain`),
-# shared with tools/verify.sh's driver, so a verb the gate runs cannot resolve a
-# different toolchain than the gate did.
+# `aterm_verify::Toolchain`, shared with tools/verify.sh's driver, so a verb the
+# gate runs resolves the same toolchain the gate did.
 aterm-verify = { workspace = true }
-# aterm-forge: the third-party surface policy (`gate forge`) and the cell list
-# (`gate cells`), one implementation shared with `targo --unverified forge check`. A PATH dep:
-# the root [workspace.dependencies] table has no `aterm-forge` row.
+# The third-party surface policy (`gate forge`) and the cell list (`gate cells`),
+# shared with `targo --unverified forge check`. A path dep: the root
+# [workspace.dependencies] table has no `aterm-forge` row.
 aterm-forge = { path = "../aterm-forge" }
-# `gate cells` reads cargo's `--message-format=json` stream, because that is the
-# only channel that reports a FRESH unit: a warm re-run prints no `Checking`
-# line at all, so a coverage count parsed from the human output would read as a
-# collapse to zero. First-party, and already resolved in this graph through
-# aterm-forge — net-new third-party packages: ZERO.
+# `gate cells` reads cargo's `--message-format=json`, the only channel that
+# reports a FRESH unit (a warm re-run prints no `Checking` line).
 aterm-json = { workspace = true }
+# The workspace's one FNV-1a/64 (the gate's per-checkout cache key, `perf`'s
+# machine fingerprint). First-party, dependency-free.
+aterm-hash = { workspace = true }
+
+[dev-dependencies]
+# Test scratch directories removed on drop.
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

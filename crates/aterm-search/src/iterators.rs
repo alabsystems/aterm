@@ -185,8 +185,7 @@ pub(crate) fn next_literal_match(
             .and_then(|suffix| suffix.chars().next())
             .map_or(1, char::len_utf8);
         next_byte = abs_pos.checked_add(step)?;
-        let start_col = col_map.byte_to_column(abs_pos);
-        let end_col = col_map.byte_to_column(match_end);
+        let (start_col, end_col) = col_map.span(abs_pos, match_end);
         if start_col != end_col {
             return Some((SearchMatch::new(line, start_col, end_col), next_byte));
         }
@@ -266,11 +265,8 @@ impl Iterator for SearchMatchIterator<'_> {
 pub(crate) struct SearchMatchReverseIterator<'a> {
     /// The search index.
     index: &'a SearchIndex,
-    /// The query, prepared once for the whole walk.
-    ///
-    /// One preparation per query, not per match: this iterator calls
-    /// [`Searcher::rfind_in`] once for every occurrence on a line, and each of
-    /// those used to re-derive the needle's critical factorization.
+    /// The query, prepared once for the whole walk: [`Searcher::rfind_in`]
+    /// runs once per occurrence on a line.
     searcher: Searcher<'a>,
     /// Candidate line numbers source (yields in descending order).
     candidates: CandidateSource,
@@ -322,8 +318,7 @@ impl Iterator for SearchMatchReverseIterator<'_> {
                             &fallback
                         }
                     };
-                    let start_col = col_map.byte_to_column(abs_pos);
-                    let end_col = col_map.byte_to_column(match_end);
+                    let (start_col, end_col) = col_map.span(abs_pos, match_end);
                     if start_col != end_col {
                         return Some(SearchMatch::new(line_num, start_col, end_col));
                     }

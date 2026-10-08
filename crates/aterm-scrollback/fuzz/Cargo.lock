@@ -13,39 +13,27 @@ dependencies = [
 
 [[package]]
 name = "aterm-alloc"
-version = "0.98.0"
+version = "0.101.0"
 
 [[package]]
-name = "aterm-error"
-version = "0.98.0"
-dependencies = [
- "aterm-error-derive",
-]
-
-[[package]]
-name = "aterm-error-derive"
-version = "0.98.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
+name = "aterm-hash"
+version = "0.101.0"
 
 [[package]]
 name = "aterm-log"
-version = "0.98.0"
+version = "0.101.0"
 
 [[package]]
 name = "aterm-lz4"
-version = "0.98.0"
+version = "0.101.0"
 
 [[package]]
 name = "aterm-rle"
-version = "0.98.0"
+version = "0.101.0"
 
 [[package]]
 name = "aterm-scrollback"
-version = "0.98.0"
+version = "0.101.0"
 dependencies = [
  "aterm-alloc",
  "aterm-log",
@@ -65,17 +53,17 @@ dependencies = [
 
 [[package]]
 name = "aterm-time"
-version = "0.98.0"
+version = "0.101.0"
 dependencies = [
  "wasm-bindgen",
 ]
 
 [[package]]
 name = "aterm-types"
-version = "0.98.0"
+version = "0.101.0"
 dependencies = [
  "aterm-alloc",
- "aterm-error",
+ "aterm-hash",
  "aterm-log",
  "aterm-time",
 ]

@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Grid tests — migrated from aterm-core as part of #6556 Batch 1.
+//! Grid tests.
 
 use super::*;
 

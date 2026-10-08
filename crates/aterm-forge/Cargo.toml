@@ -18,26 +18,19 @@ name = "aterm_forge"
 path = "src/lib.rs"
 
 [dependencies]
-# NET-NEW THIRD-PARTY PACKAGES: ZERO. Every dependency below is already resolved
-# in the shipped graph, so the tool that measures the surface does not enlarge it.
-# `aterm-toml`'s comment-preserving document model is the ONE parser here: the
-# policy file carries load-bearing comments, and a round-trip that eats them
-# would delete the reasons this program exists to record. First-party, so this
-# tool's own parser is not a third-party package it would have to count.
+# No third-party dependencies: the tool that measures the surface does not
+# enlarge it. `aterm-toml`'s comment-preserving document model reads the policy
+# file, whose comments carry the fork reasons.
 aterm-toml = { workspace = true }
-# The shared source-walk (`collect_rs_files`/`is_test_file`) every scan gate
-# uses, and `REVIEWED_VENDORED_CRATES` itself — read directly rather than
-# re-parsed, so the vendor registry has exactly one definition.
+# The shared source walk and `REVIEWED_VENDORED_CRATES`, read directly so the
+# vendor registry has one definition.
 aterm-census = { workspace = true }
-# The mirror generator's one hash: sha256 over `.crate` bytes, compared
-# against `Cargo.lock` and the emitted index rows. First-party — the plan
-# (docs/THIRD_PARTY_SURFACE_PLAN.md, Lane 1 build order) names this exact
-# addition; the `sha2` this crate once declared-but-never-used is long gone.
-aterm-digest = { workspace = true }
-# Parse cargo's registry metadata as JSON before trusting any identity or
-# checksum field. The raw row is still emitted byte-for-byte (apart from the
-# deliberate yanked rewrite), so this is validation rather than regeneration.
+# Parses cargo's metadata JSON.
 aterm-json = { workspace = true }
+
+[dev-dependencies]
+# Fixture workspaces removed on drop.
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

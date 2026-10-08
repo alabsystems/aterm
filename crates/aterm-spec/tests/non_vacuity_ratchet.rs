@@ -299,10 +299,48 @@ fn quietly<T>(probe: impl FnOnce() -> T) -> Result<T, ()> {
 fn no_model_grows_a_ghost_invariant() {
     let models = aterm_spec::xref::model_registry();
 
+    // The models are independent, so they are swept on every core: each worker
+    // takes the next unclaimed model, and each model runs under its own
+    // `quietly` — a panic is that model's `Err`, never a lost worker, and the
+    // silence is per thread, so it holds on every worker without touching the
+    // hook other tests' threads report through. Results are re-sorted into
+    // REGISTRY order before anything reads them, so the tables below see exactly
+    // what the serial loop produced.
+    let workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(1, models.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut swept: Vec<(usize, Result<Vec<&'static str>, ()>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(m) = models.get(i) else {
+                            break done;
+                        };
+                        done.push((i, quietly(|| aterm_spec::verify::uncaught_invariants(m))));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("a sweep worker died outside its probe"))
+            .collect()
+    });
+    swept.sort_by_key(|(i, _)| *i);
+    assert_eq!(
+        swept.len(),
+        models.len(),
+        "the parallel sweep lost or duplicated a model"
+    );
     let mut actual: BTreeSet<(&str, &str)> = BTreeSet::new();
     let mut ineligible: Vec<&str> = Vec::new();
-    for m in &models {
-        match quietly(|| aterm_spec::verify::uncaught_invariants(m)) {
+    for (i, result) in swept {
+        let m = &models[i];
+        match result {
             Ok(names) => actual.extend(names.into_iter().map(|inv| (m.name, inv))),
             Err(()) => ineligible.push(m.name),
         }

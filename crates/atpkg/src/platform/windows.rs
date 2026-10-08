@@ -1,14 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Windows backend of [`crate::platform`]. Each function is the honest Windows
-//! analogue of the Unix primitive (see the module docs on [`crate::platform`]): a
+//! The Windows backend of [`crate::platform`] (its module docs list the analogues): a
 //! directory **junction** for the activation indirection, a `.cmd` batch wrapper for
-//! bin shims and the `agents/` twin (every `.cmd` behind the resume-proof frame
-//! [`super::CMD_FRAME_HEAD`], 2026-09-18), per-user `%LOCALAPPDATA%`-ACL privacy (no
-//! POSIX mode/owner bits), `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` +
-//! `exit` for exec, behind a console control handler that leaves Ctrl-C to the child
-//! ([`add_ctrl_handler`], `SetConsoleCtrlHandler`; 2026-09-17).
+//! bin shims and the `agents/` twin (behind the resume-proof frame
+//! [`super::CMD_FRAME_HEAD`]), per-user `%LOCALAPPDATA%`-ACL privacy,
+//! `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` + `exit` for exec, behind
+//! a console control handler that leaves Ctrl-C to the child ([`add_ctrl_handler`]).
 //!
 //! This backend has not been exercised on a real Windows host. `mod windows` is
 //! `#[cfg(windows)]`, so every line below is type-checked on all three Windows cells
@@ -16,9 +14,9 @@
 //! [`crate::platform`] — but no shim, junction or `GetDiskFreeSpaceExW` call here has ever run.
 //!
 //! A Windows triple absent from `aterm-libc`'s cell list stops the build rather than falling
-//! back to an empty cell. Guards: `crates/atpkg/tests/shipped_triples_have_an_abi_cell.rs`
-//! (a shipped triple `aterm-libc` refuses) and `crates/aterm-libc/tests/target_gate.rs`
-//! (a configured build lane it refuses).
+//! back to an empty cell. Guards: `crates/aterm-libc/tests/target_gate.rs` (a configured
+//! build lane it refuses) and `crates/atpkg/tests/shipped_triples_have_a_compile_cell.rs`
+//! (a shipped triple no build lane compiles).
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -36,8 +34,8 @@ pub fn dir_writable_by_caller(_dir: &Path) -> bool {
 }
 
 /// Appended to a tool name to form the concrete executable name. Applied ONLY by
-/// [`crate::store::ToolName::exe_file`]: here the two suffixes name two DIFFERENT files, so
-/// every hand-written append was a chance to build `bin/ay.cmd` when `bin\ay.exe` was meant.
+/// [`crate::store::ToolName::exe_file`]: here the two suffixes name two DIFFERENT files
+/// (`bin/ay.cmd` vs `bin\ay.exe`).
 pub const EXE_SUFFIX: &str = ".exe";
 /// Appended to a tool name to form the concrete `bin/` shim filename (a batch wrapper).
 /// Applied ONLY by [`crate::store::ToolName::shim_file`] and stripped ONLY by
@@ -177,12 +175,17 @@ pub fn open_create_write(path: &Path, _mode: u32) -> io::Result<File> {
         .open(path)
 }
 
+/// Create `path` for writing, failing [`io::ErrorKind::AlreadyExists`] when the NAME
+/// already resolves to anything (`CREATE_NEW`, answered by NTFS's own case-insensitive
+/// name equality). `mode` is ignored (no POSIX bits).
+pub fn open_create_new_write(path: &Path, _mode: u32) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
 /// Open `path` the way [`sync_file_contents`] needs it: WITH write access.
 /// `FlushFileBuffers` is documented to require `GENERIC_WRITE` on the handle, and it
-/// refuses a read-only one with `ERROR_ACCESS_DENIED` (5) — measured 2026-09-22: every
-/// stage on this platform died in `sync_tree` with `io: Access is denied.` the moment the
-/// digest gates let it through, and 18 `install::tests` failed the same way at HEAD.
-/// Nothing is created or truncated: `write(true)` alone on an existing file.
+/// refuses a read-only one with `ERROR_ACCESS_DENIED` (5), which failed every stage in
+/// `sync_tree`. Nothing is created or truncated: `write(true)` alone on an existing file.
 pub fn open_for_sync(path: &Path) -> io::Result<File> {
     OpenOptions::new().write(true).open(path)
 }
@@ -198,9 +201,8 @@ pub fn sync_file_contents(f: &File) -> io::Result<()> {
 
 /// No permission bits on Windows — reports `0` (callers mask/treat it as not-applicable).
 /// The tree-root hash does NOT fold this: a signed `tree_root` is folded from the modes
-/// the stage declared, and a client folding `0` could never reproduce one (measured
-/// 2026-09-22, `crate::tree`'s module docs) — see [`folded_mode`] and
-/// [`HAS_POSIX_MODES`].
+/// the stage declared, and a client folding `0` could never reproduce one
+/// (`crate::tree`'s module docs) — see [`folded_mode`] and [`HAS_POSIX_MODES`].
 #[must_use]
 pub fn permission_mode(_meta: &Metadata) -> u32 {
     0
@@ -392,9 +394,14 @@ fn backslashed(p: &Path) -> std::ffi::OsString {
 /// apply lock). Used for `store/<program>/current` and the sysroot/toolchain dir links.
 /// Both paths are normalized to `\` separators first — `mklink` (unlike the Win32 API)
 /// rejects `/`-separated paths, reading path segments as switches.
+///
+/// `cmd.exe` is a console image: built through `aterm_uds::spawnfd::command`, it shares this
+/// process's console (a pass the window starts has a windowless one), or gets a
+/// windowless one of its own when there is none, where a bare `cmd` would open a
+/// visible console window per activated link.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     remove_link(link);
-    let out = Command::new("cmd")
+    let out = aterm_uds::spawnfd::command("cmd")
         .arg("/C")
         .arg("mklink")
         .arg("/J")
@@ -414,12 +421,11 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
 /// Windows `rename` does not replace an existing file, so `dest` is removed first (a brief
 /// non-atomic window, documented — the state files this backs are per-user and serialized).
 ///
-/// A `.cmd` shim this replaces may be EXECUTING (2026-09-17): `cmd.exe` runs a batch file
-/// by re-reading it at a remembered byte offset after every line, so what the shim text
-/// does about a re-lay mid-run is the shim's own business — every line that runs a
-/// program ends the batch on that line ([`super::CMD_FORWARD_TAIL`]), and every file
-/// starts with the frame ([`super::CMD_FRAME_HEAD`], 2026-09-18) that a file from
-/// before that tail resumes into harmlessly.
+/// A `.cmd` shim this replaces may be EXECUTING: `cmd.exe` re-reads a batch file at a
+/// remembered byte offset after every line, so the shim text itself makes a mid-run
+/// re-lay safe — every line that runs a program ends the batch on that line
+/// ([`super::CMD_FORWARD_TAIL`]), and every file starts with the frame
+/// ([`super::CMD_FRAME_HEAD`]) a legacy file resumes into harmlessly.
 fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp_name = String::from(".");
@@ -441,19 +447,13 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Install a bin shim at `shim` (a `.cmd`) forwarding to `target` (`…\<tool>.exe`),
-/// setting `env` first (design S7; an empty `env` is the plain shim — the form without
-/// an environment is [`super::install_shim_to`]).
-/// Fail-closed: refuse a target that could break out of the `@"<target>" %* & @exit /b`
-/// quoting (a `"`/`%`/CR/LF/NUL) rather than write an injectable batch wrapper — a managed
-/// store path never contains these, so this only ever rejects a pathological path —
-/// and, the same way, an env entry that could break out of `@set "NAME=VALUE"`
-/// (already refused at manifest parse; this is the I/O site's own refusal).
-pub fn install_shim_to_env(
-    shim: &Path,
-    target: &Path,
-    env: &crate::shim_env::ShimEnv,
-) -> io::Result<()> {
+/// The two injection refusals every `.cmd` shim renderer makes, fail-closed: a target
+/// that could break out of the `@"<target>" %* & @exit /b` quoting (a `"`/`%`/CR/LF/NUL)
+/// rather than write an injectable batch wrapper — a managed store path never contains
+/// these, so this only ever rejects a pathological path — and, the same way, an env entry
+/// that could break out of `@set "NAME=VALUE"` (already refused at manifest parse; this is
+/// the I/O site's own refusal).
+fn refuse_injectable(target: &Path, env: &crate::shim_env::ShimEnv) -> io::Result<()> {
     if !super::cmd_target_is_injection_safe(target) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -469,7 +469,20 @@ pub fn install_shim_to_env(
             "refusing to shim an unsafe shim_env entry (quote/%/newline)",
         ));
     }
-    atomic_write(shim, super::cmd_shim_content_env(target, env).as_bytes())
+    Ok(())
+}
+
+/// Install a bin shim at `shim` (a `.cmd`) forwarding to `target` (`…\<tool>.exe`),
+/// setting `env` first (design S7; an empty `env` is the plain shim — the form without
+/// an environment is [`super::install_shim_to`]): [`shim_executable_to_env`]'s body,
+/// its refusals ([`refuse_injectable`]) and all, written through [`atomic_write`].
+pub fn install_shim_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+) -> io::Result<()> {
+    let body = shim_executable_to_env(shim, target, env)?.body;
+    atomic_write(shim, &body)
 }
 
 /// The shim [`install_shim_to_env`] lays, RENDERED but not written — the same two
@@ -480,21 +493,7 @@ pub fn shim_executable_to_env(
     target: &Path,
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<crate::lay::Executable> {
-    if !super::cmd_target_is_injection_safe(target) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "refusing to shim an unsafe target path (quote/%/newline): {}",
-                target.display()
-            ),
-        ));
-    }
-    if !super::cmd_env_is_injection_safe(env) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to shim an unsafe shim_env entry (quote/%/newline)",
-        ));
-    }
+    refuse_injectable(target, env)?;
     Ok(crate::lay::Executable::new(
         shim,
         super::cmd_shim_content_env(target, env),
@@ -512,21 +511,7 @@ pub fn twin_executable_to_env(
     env: &crate::shim_env::ShimEnv,
     prelude: &str,
 ) -> io::Result<crate::lay::Executable> {
-    if !super::cmd_target_is_injection_safe(target) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "refusing to shim an unsafe target path (quote/%/newline): {}",
-                target.display()
-            ),
-        ));
-    }
-    if !super::cmd_env_is_injection_safe(env) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to shim an unsafe shim_env entry (quote/%/newline)",
-        ));
-    }
+    refuse_injectable(target, env)?;
     Ok(crate::lay::Executable::new(
         shim,
         super::cmd_shim_content_twin(target, env, prelude),
@@ -552,9 +537,8 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
 }
 
 /// Resolve the store/checkout target a `bin/<tool>.cmd` shim forwards to, or `None`.
-/// Parses the batch wrapper's `@"<target>" %* & @exit /b` line (or the `@"<target>" %*`
-/// line of a shim laid before 2026-09-17, until it is re-laid) — the Windows inverse of
-/// `read_link`. A tombstone `.cmd` (no forward target) yields `None`.
+/// Parses the batch wrapper's `@"<target>" %* & @exit /b` line (or a legacy shim's
+/// `@"<target>" %*` line). A tombstone `.cmd` (no forward target) yields `None`.
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
     super::read_cmd_shim_target(shim)
@@ -590,8 +574,7 @@ unsafe extern "system" {
 /// called (on its own thread) for every Ctrl-C / Ctrl-Break / close event for the rest of
 /// the process. `false` when the call failed; the caller then has the default behaviour
 /// (the process ends on Ctrl-C), never a wrong claim. The Windows analogue of
-/// `signal(SIGINT, …)`, armed by [`exec_or_run`] for its child's lifetime (2026-09-17;
-/// unverified on a Windows host).
+/// `signal(SIGINT, …)`, armed by [`exec_or_run`] for its child's lifetime.
 pub fn add_ctrl_handler(handler: CtrlHandler) -> bool {
     // SAFETY: `handler` is a plain `extern "system"` function that lives for the whole
     // program; kernel32 keeps only its address. No memory of ours is handed over.
@@ -613,35 +596,28 @@ unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> i32 {
 /// `exec`'d image would; the code is the child's REAL one (`exit /b <n>` from a `.cmd`
 /// included), `1` only when the child died with no code.
 ///
-/// **Ctrl-C belongs to the child** (2026-09-17, review finding): the console delivers
-/// `CTRL_C_EVENT` to EVERY process attached to it, and a process with no handler ends on
-/// it. Before the spawn this wrapper installs [`swallow_ctrl_c`] — the shape rustup's
-/// proxies and cargo's runners use — so the first Ctrl-C typed inside an agent (which
-/// `claude` treats as "stop this turn", not "exit") no longer kills the wrapper, loses the
-/// exit code and orphans the agent; the child gets the event as before and answers it
-/// its own way. Installed for the rest of this process's life (it ends with the child's
-/// code). NOT the `NULL`-routine ignore flag, which children inherit.
+/// **Ctrl-C belongs to the child**: the console delivers `CTRL_C_EVENT` to EVERY process
+/// attached to it, and a process with no handler ends on it. Before the spawn this
+/// wrapper installs [`swallow_ctrl_c`] — the shape rustup's proxies and cargo's runners
+/// use — so a Ctrl-C typed inside an agent (which `claude` treats as "stop this turn")
+/// does not kill the wrapper, lose the exit code and orphan the agent. Installed for the
+/// rest of this process's life. NOT the `NULL`-routine ignore flag, which children
+/// inherit.
 ///
 /// A `.cmd` program (the `bin/<program>.cmd` shim `cli::cmd_landing` runs through here)
-/// is routed by std through its own `cmd.exe /d /c` lane with batch-safe
-/// quoting — std may refuse arguments it cannot quote safely, the same as for any `.cmd`
-/// shim today. That lane is std's; it shares only the `cmd.exe` binary with
-/// [`atomic_symlink`]'s explicit `cmd /C mklink`, and nothing in this crate has exercised
-/// it. While a batch file is the child, `cmd.exe` itself may ask `Terminate batch job
-/// (Y/N)?` after a Ctrl-C — its own prompt for every `.cmd` shim, in any shell, since
-/// before this lane. And on the landing path — an older twin's hand-over — there are
-/// TWO batch levels, not one (review, 2026-09-17): the `agents\<program>.cmd` twin the
-/// user's shell is running,
-/// and the `bin\<program>.cmd` shim this function spawns through `cmd.exe /d /c` — each
-/// `cmd.exe` that received the Ctrl-C asks its own question once the agent exits, so a
-/// Ctrl-C typed inside the agent (which `claude` treats as "stop this turn" and keeps
-/// running through) can raise the prompt up to TWICE, in turn, when the agent finally
-/// ends — where the plain `bin\` shim asks once. Unverified on a Windows host, like
-/// everything here.
+/// goes through std's own `cmd.exe /d /c` lane with batch-safe quoting; std may refuse
+/// arguments it cannot quote safely. `cmd.exe` may ask `Terminate batch job (Y/N)?` after
+/// a Ctrl-C — once per batch level, so up to TWICE on a legacy twin's landing hand-over
+/// (`agents\<program>.cmd`, then `bin\<program>.cmd`). Unverified on a Windows host.
+///
+/// Every caller builds `command` through `aterm_uds::spawnfd::command`, or raw (B27's
+/// transparent rows) with `aterm_uds::spawn::set_flags`, both `Console::Quiet`, which
+/// adds nothing from a console: typed at a prompt the tool shares that console, its
+/// Ctrl-C and its code page, exactly as a bare child did.
 pub fn exec_or_run(command: &mut Command) -> io::Error {
-    // Best effort: when the install fails the wrapper simply keeps the default
-    // disposition (it ends on Ctrl-C, as it did before 2026-09-17), and the child still
-    // runs — nothing here may stand between the user and the tool.
+    // Best effort: when the install fails the wrapper keeps the default disposition (it
+    // ends on Ctrl-C), and the child still runs — nothing here may stand between the
+    // user and the tool.
     let _ = add_ctrl_handler(swallow_ctrl_c);
     match command.spawn() {
         Ok(mut child) => match child.wait() {
@@ -660,7 +636,7 @@ pub fn exec_or_run(command: &mut Command) -> io::Error {
 /// # Errors
 /// The wait's.
 pub fn wait_standing_aside(
-    child: &mut std::process::Child,
+    child: &mut aterm_uds::spawnfd::TransparentChild,
 ) -> io::Result<std::process::ExitStatus> {
     let _ = add_ctrl_handler(swallow_ctrl_c);
     child.wait()

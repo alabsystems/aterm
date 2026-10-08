@@ -3,31 +3,25 @@
 
 //! Tier-1 conformance of the window show carry (`crate::window_show`) to
 //! `aterm_spec::derive::native_update_window_show_model`
-//! (`NativeUpdateWindowShow`, gap #29).
+//! (`NativeUpdateWindowShow`).
 //!
-//! Each schedule of the model is replayed on the SHIPPING App carry: a
-//! headless App with the bootstrap window and two windows a rebuild created,
-//! the real `CarriedShow` the rebuild records, and the four seams production
-//! drives it through — `settle_carried_window_show` (what the event loop runs
-//! after every event batch), the REAL proof path `maybe_signal_handoff_ready`
-//! (over real ready and Commit pipes; it writes a real adoption proof, and it
-//! is where the update lane's stack goes on), `commit_carried_window_show`
-//! (the Commit arm) and `carried_window_show_focus_event` (the `Focused` arm,
-//! after `on_focus`).
-//! The test plays the OS: it reveals a window, activates and deactivates
-//! aterm, moves the keyboard and types, and it delivers the focus events a raise
-//! produces while aterm is in front — the way AppKit's `makeKeyAndOrderFront:`
-//! does. Every real step is projected onto the model and checked: the
-//! environment's move and every App action the real code took in the same
-//! step, in order, each admitted by the committed model (interpreter, and `ty`
-//! wherever installed). And the real code must be EAGER: after every step the
-//! model may not still allow `Stack` or `EnterFullScreen` — a carry that
-//! could act and did not is a stall the user sees as a window left wrong.
+//! Each model schedule is replayed on the shipping App carry: a headless App
+//! with the bootstrap window and two rebuilt windows, the real `CarriedShow`,
+//! and the four seams production drives it through —
+//! `settle_carried_window_show` (after every event batch), the real proof path
+//! `maybe_signal_handoff_ready` (over real ready and Commit pipes; the stack goes
+//! on there), `commit_carried_window_show` (the Commit arm) and
+//! `carried_window_show_focus_event` (the `Focused` arm, after `on_focus`).
+//! The test plays the OS: it reveals windows, activates and deactivates aterm,
+//! moves the keyboard, types, and delivers the focus events a raise produces
+//! while aterm is in front. Each real step is projected onto the model and
+//! checked action by action (interpreter, and `ty` where installed). The code
+//! must be eager: after every step the model may not still allow `Stack` or
+//! `EnterFullScreen`.
 //!
-//! NEGATIVE CONTROL: the same real steps against `Buggy = 1` — a stack before
-//! the reveal or the proof, full screen at the stack, the reveal order's key, a
-//! Commit that re-keys over typing — must be rejected, so a pass is never
-//! vacuous.
+//! Negative control: the same real steps against `Buggy = 1` (a stack before the
+//! reveal or the proof, full screen at the stack, the reveal order's key, a
+//! Commit that re-keys over typing) must be rejected.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -49,7 +43,7 @@ struct Rig {
     /// The carried key window (window 1, carried in full screen).
     key: WindowId,
     lane: i64,
-    /// TRUTH: aterm is the active app.
+    /// Ground truth: aterm is the active app.
     front: bool,
     /// The window AppKit keys when aterm is active: the reveal order left the
     /// last window revealed (2) there, and every raise moves it.
@@ -115,8 +109,8 @@ impl Rig {
         }
     }
 
-    /// The update lane's successor OWES the adoption proof: the channels the
-    /// outgoing process launched it with, as `main_entry` installs them.
+    /// The successor owes the adoption proof: install the channels the outgoing
+    /// process launched it with, as `main_entry` does.
     fn owe_the_proof(&mut self) {
         let (proof_read, proof_write) = pipe();
         let (commit_read, commit_write) = pipe();
@@ -234,12 +228,10 @@ impl Rig {
             }
             "Prove" => {
                 performed.push(action);
-                // The shipping proof path. It returns nothing, so what its stack
-                // performed is read as the plan's `stacking_ops` as it went on —
-                // exactly the list `settle_carried_window_show_as` performs
-                // (pinned at that seam by `window_show`'s unit tests). Read AFTER
-                // the proof: the stack keys a window typed into before it (round
-                // six, finding 45), which re-orders the plan it performs.
+                // The shipping proof path returns nothing, so its stack is read as
+                // the plan's `stacking_ops` (the list `settle_carried_window_show_as`
+                // performs). Read after the proof: the stack keys a window typed
+                // into before it, which re-orders the plan.
                 self.app.maybe_signal_handoff_ready();
                 let stack = self
                     .app
@@ -368,8 +360,8 @@ const SCHEDULES: &[&[&str]] = &[
         "Activate",
     ],
     &["Launch", "Reveal", "Activate", "Prove", "Commit"],
-    // Typed into BEFORE the proof (round six, finding 45): the window the
-    // reveal order keyed keeps the keyboard through the stack and Commit.
+    // Typed into before the proof: the window the reveal order keyed keeps the
+    // keyboard through the stack and Commit.
     &["Launch", "Reveal", "Type", "Prove", "Commit", "Activate"],
     &["Launch", "Reveal", "Activate", "Type", "Prove", "Commit"],
     &["ColdLaunch", "Activate", "Reveal"],
@@ -443,12 +435,9 @@ fn the_real_window_show_carry_conforms_to_the_model() {
     }
 }
 
-/// NEGATIVE CONTROL: `Buggy = 1` is rejected by the real steps — the model
-/// that raises before the reveal, or on glass before the proof, finds the real
-/// code did not (it waited for the proof path); the one that leaves the reveal
-/// order's key finds the real stack keyed the carried window; and the one
-/// that re-keys over typing at Commit finds the real Commit left the keyboard
-/// where the user typed.
+/// Negative control: every `Buggy = 1` variant is rejected by the real steps
+/// (early raise, full screen before the proof, the reveal order's key, re-keying
+/// over typing at Commit).
 #[test]
 fn the_defective_design_rejects_the_real_steps() {
     let buggy = interp::with_buggy(&native_update_window_show_model(), 1);

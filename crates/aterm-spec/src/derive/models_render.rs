@@ -8,6 +8,51 @@
 
 use super::*;
 
+/// Two native leaves' retained rasters across full-native, split and terminal
+/// routes. Binding a new visible plan synchronously drops hidden allocations;
+/// successful painting materializes only its visible leaves. Buggy restores the historical
+/// pruning restricted to mixed compose, leaving hidden full-native rasters alive.
+/// Tier-1 drives real App plans, native paints and terminal captures.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_leaf_cache_lifetime_model() -> Model {
+    crate::ty_model! {
+        NativeLeafCacheLifetime {
+            const Buggy = 0;
+            var first_visible = 0;
+            var second_visible = 0;
+            var first_cached = 0;
+            var second_cached = 0;
+            action BindTerminal {
+                first_visible = 0;
+                second_visible = 0;
+                first_cached = if Buggy == 1 { first_cached } else { 0 };
+                second_cached = if Buggy == 1 { second_cached } else { 0 };
+            }
+            action BindFirst {
+                first_visible = 1;
+                second_visible = 0;
+                second_cached = if Buggy == 1 { second_cached } else { 0 };
+            }
+            action BindSecond {
+                first_visible = 0;
+                second_visible = 1;
+                first_cached = if Buggy == 1 { first_cached } else { 0 };
+            }
+            action BindSplit {
+                first_visible = 1;
+                second_visible = 1;
+            }
+            action Paint {
+                first_cached = if first_visible == 1 { 1 } else { first_cached };
+                second_cached = if second_visible == 1 { 1 } else { second_cached };
+            }
+            invariant OnlyVisibleLeavesRetainRasters:
+                first_cached <= first_visible && second_cached <= second_visible;
+        }
+    }
+}
+
 /// A composed cursor frame may read any requested ribbon witness row from the
 /// same snapshot as its extracted cells, even if the live PTY advances
 /// afterward. A row first requested after a content-scroll translation may
@@ -227,7 +272,7 @@ pub fn presentation_gate_model() -> Model {
 /// admits EXACTLY the two grid-mappable shape forms and rejects everything else.
 /// The real decision is aterm-render's pure
 /// [`aterm_render::ligature_shaping::classify_shape`] (the shaping seam in
-/// `shape_ligature_run`); the Tier-1 binding is aterm-render's
+/// `map_shaped_run`); the Tier-1 binding is aterm-render's
 /// `tests/ligature_slice.rs::classify_shape_conforms_to_ligature_gate_model`,
 /// which replays this model's `Classify` step with `accept'` taken from the real
 /// verdict over the whole `0..=8` lattice and shows the flag-blind gate is the
@@ -1639,7 +1684,7 @@ pub fn grid_translate_model() -> Model {
 
 /// DECORATION BAND CONTAINMENT (cross-cutting theorem (c), W7) — the ordering
 /// policy behind `aterm_render::deco::clamp_band` and every decoration WRITE
-/// emitter (`underline_rects`, `strike_overline_rects`): a decoration band never
+/// emitter (`underline_rects_into`, `strike_rect`, `overline_rect`): a decoration band never
 /// leaves its cell. The band `(top, thickness)` is clamped in a SPECIFIC ORDER —
 /// thickness into `[1, cell_h]` FIRST, then top into `[0, cell_h − thickness]` —
 /// which guarantees `top + thickness <= cell_h` for ANY raw input. This is the

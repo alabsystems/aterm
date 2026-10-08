@@ -5,6 +5,7 @@
 //! The history carry's grid half: the fence, the fenced read, and the import.
 
 use super::super::Grid;
+use super::super::test_support::history_trimmed;
 use super::{HistoryFenceBroken, OlderHistory, OlderHistoryRefusal};
 use aterm_scrollback::{Line, Scrollback};
 
@@ -28,16 +29,6 @@ fn write_lines(grid: &mut Grid, prefix: &str, from: usize, count: usize) {
 
 fn text(line: &Line) -> String {
     line.to_string().trim_end().to_string()
-}
-
-fn history(grid: &Grid) -> Vec<String> {
-    (0..grid.scrollback_lines())
-        .map(|i| {
-            grid.get_history_line(i)
-                .map(|l| l.to_string().trim_end().to_string())
-                .unwrap_or_default()
-        })
-        .collect()
 }
 
 /// Read the whole fenced history the way the exporter does: short chunks by
@@ -67,7 +58,7 @@ fn a_fenced_export_reads_every_history_line_in_order_across_every_tier() {
     let exported = export(&grid, 7).expect("nothing moved");
     assert_eq!(
         exported.iter().map(text).collect::<Vec<_>>(),
-        history(&grid),
+        history_trimmed(&grid),
         "the export is the history, oldest first"
     );
 }
@@ -77,7 +68,7 @@ fn output_after_the_fence_leaves_it_standing_and_stays_outside_it() {
     let mut grid = tiered(4, 20);
     write_lines(&mut grid, "h", 0, 100);
     let fence = grid.history_fence();
-    let before = history(&grid);
+    let before = history_trimmed(&grid);
     write_lines(&mut grid, "late", 0, 30);
     let now = grid.history_fence();
     assert!(fence.holds_at(&now), "plain output never breaks the fence");
@@ -126,14 +117,10 @@ fn a_scrollback_clear_breaks_the_fence() {
     );
 }
 
-/// A ROWS-GROW THAT REVEALS HISTORY BREAKS THE FENCE (2026-09-26 review).
-/// The reveal hands the newest history lines back to the screen under their
-/// own keys; rewritten there and pushed back by later output, they name other
-/// text under the SAME keys, and before `reveal_gen` the fence still held
-/// (measured on a terminal first: rows 31 to 35 read `NEW1..NEW5` where the
-/// export had read `old31..old35`).
-/// NEGATIVE CONTROL: a rows-shrink (a top-demote, the reveal's inverse) and
-/// later output leave the fence standing.
+/// A rows grow that reveals history breaks the fence: revealed lines return to
+/// the screen under their own keys and, rewritten and pushed back, name other
+/// text under the same keys. Negative control: a rows shrink and later output
+/// leave the fence standing.
 #[test]
 fn a_rows_grow_that_reveals_history_breaks_the_fence() {
     let mut grid = tiered(5, 30);
@@ -205,7 +192,7 @@ fn older_history_lands_before_the_oldest_line_and_keeps_every_key() {
     write_lines(&mut grid, "carried", 0, 6);
     let claim = grid.reserve_older_history_keys(exported.len() as u64);
     let base_before = grid.base_y();
-    let history_before = history(&grid);
+    let history_before = history_trimmed(&grid);
     let epoch_before = grid.history_renumber_epoch();
 
     let older = OlderHistory::build(&exported, 20, 20);
@@ -216,7 +203,7 @@ fn older_history_lands_before_the_oldest_line_and_keeps_every_key() {
     let mut expected: Vec<String> = exported.iter().map(text).collect();
     expected.extend(history_before);
     assert_eq!(
-        history(&grid),
+        history_trimmed(&grid),
         expected,
         "imported first, then what was there"
     );
@@ -227,12 +214,9 @@ fn older_history_lands_before_the_oldest_line_and_keeps_every_key() {
     );
 }
 
-/// A grid that CONTINUES the source's numbering (the checkpoint restore) has
-/// the imported lines' own keys free below its oldest row, so the reserve
-/// raises nothing and a key recorded before the handoff (a carried shell
-/// mark) keeps naming its line through the import. Past the free keys only
-/// the shortfall is raised (2026-09-27 review: raising by the whole import
-/// renumbered every restored row while the carried marks stayed put).
+/// A grid continuing the source's numbering (checkpoint restore) has the
+/// imported lines' keys free below its oldest row, so the reserve raises only
+/// the shortfall and a carried key (a shell mark) keeps naming its line.
 #[test]
 fn a_continued_numbering_reserves_only_the_shortfall() {
     let mut grid = tiered(4, 20);
@@ -252,7 +236,7 @@ fn a_continued_numbering_reserves_only_the_shortfall() {
     assert_eq!(grid.base_y(), marked, "the top row keeps its key");
     assert_eq!(grid.row_text(0).unwrap_or_default(), marked_text);
     assert_eq!(grid.oldest_absolute_row(), oldest - lines.len() as u64);
-    assert_eq!(history(&grid)[0], "old0");
+    assert_eq!(history_trimmed(&grid)[0], "old0");
 
     // Fewer free keys than lines: only the difference is raised.
     let mut short = tiered(4, 20);
@@ -282,7 +266,7 @@ fn an_unreserved_import_raises_the_counter_and_says_it_renumbered() {
         "the counter covers every retained line"
     );
     assert!(grid.history_renumber_epoch() > epoch_before);
-    assert_eq!(history(&grid)[0], "old0");
+    assert_eq!(history_trimmed(&grid)[0], "old0");
 }
 
 #[test]
@@ -290,14 +274,14 @@ fn the_grids_own_retention_decides_what_an_import_keeps() {
     let mut grid = tiered(4, 20);
     grid.set_scrollback_line_limit(Some(30));
     write_lines(&mut grid, "carried", 0, 6);
-    let ring_history = history(&grid);
+    let ring_history = history_trimmed(&grid);
     let lines: Vec<Line> = (0..100)
         .map(|i| Line::from(format!("old{i}").as_str()))
         .collect();
     let claim = grid.reserve_older_history_keys(100);
     grid.attach_older_history(OlderHistory::build(&lines, 20, 20), claim)
         .expect("attached");
-    let kept = history(&grid);
+    let kept = history_trimmed(&grid);
     assert!(
         kept.len() <= 30,
         "the limit holds after the import: {kept:?}"
@@ -357,12 +341,10 @@ fn a_ring_only_grid_has_nothing_to_place_history_in_front_of() {
     ));
 }
 
-/// A SCROLLBACK CLEARED AFTER THE RESERVE STAYS CLEARED (2026-09-26 review):
-/// the successor imports on a worker after Commit, while the adopted shell and
-/// the output it replays already run, and an attach that ignored an ED3 in
-/// that window put back the lines the clear had just removed. The refusal
-/// hands the built history back untouched. NEGATIVE CONTROL: the same attach
-/// with no clear in between lands.
+/// A scrollback cleared after the reserve stays cleared: the import runs on a
+/// worker after Commit while the shell already runs, and an attach after an ED3
+/// is refused, handing the built history back. Negative control: the same
+/// attach with no clear lands.
 #[test]
 fn a_scrollback_cleared_after_the_reserve_refuses_the_import() {
     let lines: Vec<Line> = (0..40)
@@ -378,7 +360,7 @@ fn a_scrollback_cleared_after_the_reserve_refuses_the_import() {
         Err(OlderHistoryRefusal::Cleared(older)) => assert_eq!(older.lines(), 40),
         other => panic!("expected Cleared, got {other:?}"),
     }
-    assert!(history(&grid).is_empty(), "nothing came back");
+    assert!(history_trimmed(&grid).is_empty(), "nothing came back");
 
     let mut control = tiered(4, 20);
     write_lines(&mut control, "carried", 0, 6);

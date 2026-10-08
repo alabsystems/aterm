@@ -17,8 +17,22 @@ use std::time::{Duration, Instant};
 /// request starts over.
 pub(crate) const CLOSE_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
-/// The titlebar hint shown while the confirm window is armed.
-pub(crate) const CLOSE_WARNING_TITLE: &str = "job running — press again to close";
+/// The titlebar hint shown while a refused CLOSE keeps the confirm window armed.
+pub(crate) const CLOSE_WARNING_TITLE: &str = "job running — close again within 2s to end it";
+
+/// The titlebar hint shown while a refused QUIT keeps the confirm window armed: a
+/// repeat ends the whole program, not this window.
+pub(crate) const QUIT_WARNING_TITLE: &str = "job running — quit again within 2s to end it";
+
+/// The titlebar hint for an armed confirm window: the quit's when the gesture was a
+/// quit, the close's otherwise (closing the last window included).
+pub(crate) fn warning_title(quit_gesture: bool) -> &'static str {
+    if quit_gesture {
+        QUIT_WARNING_TITLE
+    } else {
+        CLOSE_WARNING_TITLE
+    }
+}
 
 /// What a close/quit request should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,21 +72,32 @@ pub(crate) struct ConfirmPrompt {
 /// Decide whether a close/quit gesture needs a confirmation dialog, and with what
 /// copy. `exits_app` = the gesture quits the WHOLE program (Cmd-Q / app-menu Quit, or
 /// a close that would remove the last window); `busy` = closing now would SIGHUP a
-/// foreground job.
+/// foreground job; `reopens` = the layout is restored at the next start
+/// (`restore_session`, on by default), so a quit loses the shells and their
+/// scrollback, not the windows.
 ///
 /// * A whole-app quit ALWAYS confirms — the iTerm-style "are you sure you want to
 ///   quit?" prompt the user expects from ⌘Q — with copy that notes a running job.
 /// * A window/tab close that LEAVES the app running confirms only while a job is
 ///   running, so an idle close stays instant.
 /// * An idle close that leaves the app running needs no confirmation (`None`).
-pub(crate) fn confirm_prompt(exits_app: bool, busy: bool) -> Option<ConfirmPrompt> {
+pub(crate) fn confirm_prompt(exits_app: bool, busy: bool, reopens: bool) -> Option<ConfirmPrompt> {
     if exits_app {
         Some(ConfirmPrompt {
             title: "Are you sure you want to quit aterm?",
-            body: if busy {
-                "A process is still running. Quitting will end it and close every window."
-            } else {
-                "This will close every window and end your terminal sessions."
+            body: match (busy, reopens) {
+                (true, true) => {
+                    "A running process ends and every shell's scrollback is lost; windows and \
+                     tabs come back when aterm starts."
+                }
+                (false, true) => {
+                    "Every shell ends and its scrollback is lost; windows and tabs come back \
+                     when aterm starts."
+                }
+                (true, false) => {
+                    "A process is still running. Quitting will end it and close every window."
+                }
+                (false, false) => "This will close every window and end your terminal sessions.",
             },
             proceed: "Quit",
         })
@@ -107,11 +132,12 @@ pub(crate) fn confirm_prompt_windows(
     exits_app: bool,
     tabs_closing: usize,
     busy: bool,
+    reopens: bool,
 ) -> Option<ConfirmPrompt> {
     if !busy && tabs_closing <= 1 {
         return None; // a single idle tab: instant, per the WT convention
     }
-    confirm_prompt(exits_app, busy).or(Some(ConfirmPrompt {
+    confirm_prompt(exits_app, busy, reopens).or(Some(ConfirmPrompt {
         title: "Close all tabs?",
         body: "This window has several tabs open. Closing it will end all of their sessions.",
         proceed: "Close",
@@ -669,8 +695,13 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
+/// `pid`'s `proc_pidinfo(PROC_PIDTBSDINFO)` record: an exact-size read, and
+/// only a record that names `pid` — one about some OTHER pid could only
+/// mislead whatever reads it, so a kernel that disagrees about the pid it was
+/// asked about is no witness at all. `None` concludes nothing; each caller
+/// keeps its own meaning (and failure direction) for it.
 #[cfg(target_os = "macos")]
-fn platform_session_root(pid: i32) -> Option<SessionRoot> {
+pub(crate) fn pid_bsdinfo(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
     // SAFETY: `info` points at `size` writable bytes of exactly the structure
@@ -689,23 +720,33 @@ fn platform_session_root(pid: i32) -> Option<SessionRoot> {
     }
     // SAFETY: the exact-size success above initialized the whole record.
     let info = unsafe { info.assume_init() };
-    if u32::try_from(pid).ok()? != info.pbi_pid {
-        return None;
-    }
+    (u32::try_from(pid).ok()? == info.pbi_pid).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_session_root(pid: i32) -> Option<SessionRoot> {
+    let info = pid_bsdinfo(pid)?;
     let comm: String = info
         .pbi_comm
         .iter()
         .take_while(|c| **c != 0)
         .map(|c| char::from(c.to_ne_bytes()[0]))
         .collect();
+    let children = child_pids(pid)?;
+    Some(SessionRoot { comm, children })
+}
+
+/// `pid`'s live children, at most [`ROOT_CHILDREN_MAX`], from libproc, or
+/// `None` when the table cannot answer.
+#[cfg(target_os = "macos")]
+pub(crate) fn child_pids(pid: libc::pid_t) -> Option<Vec<libc::pid_t>> {
     let mut pids = [0 as libc::pid_t; ROOT_CHILDREN_MAX];
     let bytes = i32::try_from(std::mem::size_of_val(&pids)).ok()?;
     // SAFETY: `pids` is `bytes` writable bytes of pid_t slots; libproc writes
     // at most that many and answers how many pids it wrote, or -1.
     let found = unsafe { proc_listchildpids(pid, pids.as_mut_ptr().cast(), bytes) };
     let found = usize::try_from(found).ok()?.min(ROOT_CHILDREN_MAX);
-    let children = pids[..found].iter().copied().filter(|p| *p > 0).collect();
-    Some(SessionRoot { comm, children })
+    Some(pids[..found].iter().copied().filter(|p| *p > 0).collect())
 }
 
 #[cfg(target_os = "linux")]
@@ -946,14 +987,46 @@ mod tests {
     fn quit_always_prompts_and_notes_a_running_job() {
         // ⌘Q confirms whether or not a job is running (the user asked for an
         // always-on "are you sure?"), and the affirmative button reads "Quit".
-        let idle = confirm_prompt(true, false).expect("a whole-app quit always confirms");
-        assert_eq!(idle.proceed, "Quit");
-        let busy = confirm_prompt(true, true).expect("a whole-app quit always confirms");
-        assert_eq!(busy.proceed, "Quit");
-        assert_ne!(
-            idle.body, busy.body,
-            "the busy-quit copy must mention the running process"
-        );
+        for reopens in [false, true] {
+            let idle =
+                confirm_prompt(true, false, reopens).expect("a whole-app quit always confirms");
+            assert_eq!(idle.proceed, "Quit");
+            let busy =
+                confirm_prompt(true, true, reopens).expect("a whole-app quit always confirms");
+            assert_eq!(busy.proceed, "Quit");
+            assert_ne!(
+                idle.body, busy.body,
+                "the busy-quit copy must mention the running process"
+            );
+            assert!(busy.body.contains("process"), "{}", busy.body);
+        }
+    }
+
+    /// With restore on (the default) a quit loses the shells and their
+    /// scrollback while the windows and tabs come back, so the body names what
+    /// is lost and never says every window closes; with restore off it does.
+    #[test]
+    fn quit_copy_names_what_is_lost_and_what_comes_back() {
+        for busy in [false, true] {
+            let kept = confirm_prompt(true, busy, true).expect("a quit confirms");
+            assert!(kept.body.contains("scrollback is lost"), "{}", kept.body);
+            assert!(kept.body.contains("come back"), "{}", kept.body);
+            assert!(!kept.body.contains("close every window"), "{}", kept.body);
+            let gone = confirm_prompt(true, busy, false).expect("a quit confirms");
+            assert!(gone.body.contains("close every window"), "{}", gone.body);
+        }
+    }
+
+    /// The Linux titlebar warning names the gesture a repeat completes and how
+    /// long the window stays armed.
+    #[test]
+    fn the_titlebar_warning_names_the_gesture_and_the_window() {
+        assert!(warning_title(true).contains("quit again"));
+        assert!(warning_title(false).contains("close again"));
+        let secs = format!("{}s", CLOSE_CONFIRM_WINDOW.as_secs());
+        for title in [warning_title(true), warning_title(false)] {
+            assert!(title.contains(&secs), "{title}");
+        }
     }
 
     #[test]
@@ -961,10 +1034,10 @@ mod tests {
         // Closing one window/tab while the app keeps running: instant when idle,
         // confirmed (with a "Close" button) only while a job is running.
         assert!(
-            confirm_prompt(false, false).is_none(),
+            confirm_prompt(false, false, true).is_none(),
             "an idle window/tab close needs no confirmation"
         );
-        let busy = confirm_prompt(false, true).expect("a busy window/tab close confirms");
+        let busy = confirm_prompt(false, true, true).expect("a busy window/tab close confirms");
         assert_eq!(busy.proceed, "Close");
     }
 
@@ -974,12 +1047,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_single_idle_tab_closes_without_a_prompt() {
-        assert!(confirm_prompt_windows(false, 1, false).is_none());
+        assert!(confirm_prompt_windows(false, 1, false, true).is_none());
         assert!(
-            confirm_prompt_windows(true, 1, false).is_none(),
+            confirm_prompt_windows(true, 1, false, true).is_none(),
             "an idle one-tab last window must quit instantly on Windows"
         );
-        assert!(confirm_prompt_windows(false, 0, false).is_none());
+        assert!(confirm_prompt_windows(false, 0, false, true).is_none());
     }
 
     /// Busy always prompts, with the shared macOS copy: "Quit" for a whole-app
@@ -987,9 +1060,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_busy_prompts_with_the_real_verbs() {
-        let busy_close = confirm_prompt_windows(false, 1, true).expect("busy close confirms");
+        let busy_close = confirm_prompt_windows(false, 1, true, true).expect("busy close confirms");
         assert_eq!(busy_close.proceed, "Close");
-        let busy_quit = confirm_prompt_windows(true, 1, true).expect("busy quit confirms");
+        let busy_quit = confirm_prompt_windows(true, 1, true, true).expect("busy quit confirms");
         assert_eq!(busy_quit.proceed, "Quit");
     }
 
@@ -999,9 +1072,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_multi_tab_close_prompts_when_idle() {
-        let quit = confirm_prompt_windows(true, 4, false).expect("multi-tab quit confirms");
+        let quit = confirm_prompt_windows(true, 4, false, true).expect("multi-tab quit confirms");
         assert_eq!(quit.proceed, "Quit");
-        let close = confirm_prompt_windows(false, 4, false).expect("multi-tab close confirms");
+        let close =
+            confirm_prompt_windows(false, 4, false, true).expect("multi-tab close confirms");
         assert_eq!(close.proceed, "Close");
         assert!(
             close.title.contains("all tabs"),
@@ -1095,8 +1169,7 @@ mod tests {
     }
 
     fn now_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        aterm_time::since_epoch()
             .expect("clock after 1970")
             .as_millis() as u64
     }
@@ -1387,10 +1460,10 @@ mod tests {
     fn windows_child_walk_detects_a_live_child() {
         // A long-lived, childless child of THIS process (killed below); ping is
         // present on every Windows install.
-        let mut child = std::process::Command::new("ping")
+        let mut child = aterm_uds::spawnfd::command("ping")
             .args(["-n", "30", "127.0.0.1"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("spawn ping");
         let me = std::process::id();

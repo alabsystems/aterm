@@ -24,11 +24,11 @@ impl Row {
         if self.flags.contains(RowFlags::HAS_WIDE_CHARS)
             && let Some(current_flags) = self.cells.get(col_usize).map(|c| c.flags())
         {
-            // Overwriting a genuine wide continuation orphans its head at col-1. Use
-            // the context-aware check: WIDE_CONTINUATION (bit 10) aliases PROTECTED, so a
-            // raw `contains(WIDE_CONTINUATION)` blanks col-1 when overwriting a DECSCA-
-            // protected cell (round-8 bit-10 write-path fix). is_cell_wide_continuation
-            // returns false for col==0, so (col-1) below cannot underflow.
+            // Overwriting a genuine wide continuation orphans its head at col-1.
+            // Context-aware check: bit 10 aliases PROTECTED, so a raw
+            // `contains(WIDE_CONTINUATION)` would blank col-1 when overwriting a
+            // protected cell. is_cell_wide_continuation is false for col==0, so
+            // col-1 cannot underflow.
             if self.is_cell_wide_continuation(col)
                 && let Some(prev_cell) = self.cells.get_mut((col - 1) as usize)
             {
@@ -51,15 +51,12 @@ impl Row {
             && old_len > 0
             && self.cells[old_len - 1].is_empty()
         {
-            // Single-width write overwrote a WIDE head at the tail: the fixup
-            // above cleared its continuation at col+1, and if that pair was the
-            // row's last content (old_len == col+2) `col >= self.len` is false so
-            // len would be left stale-high, surfacing a phantom trailing space in
-            // row_text/search/scrollback (all slice through self.len). This is the
-            // #7522 len class already closed on the clear/erase paths; the write
-            // path was the remaining gap. recalculate_len_up_to rescans the prefix
-            // and never over-shrinks, so gating only on "the old tail is now empty"
-            // is correct and touches nothing on the ASCII (no-wide) hot path.
+            // A single-width write over a WIDE head at the tail: the fixup above
+            // cleared its continuation at col+1, and if that pair was the row's
+            // last content (old_len == col+2) len would stay stale-high (a
+            // phantom trailing space in row_text/search/scrollback).
+            // recalculate_len_up_to never over-shrinks, and this path is off the
+            // ASCII (no-wide) hot path.
             self.recalculate_len_up_to(old_len);
         }
         self.flags |= RowFlags::DIRTY;
@@ -133,12 +130,9 @@ impl Row {
             && self.cells[old_len - 1].is_empty()
         {
             // Interior single-width write over a WIDE head at the tail:
-            // fixup_wide_char_overwrite cleared the continuation at col+1, which for
-            // old_len == col+2 was the row's last content, so `col >= self.len` is
-            // false and len would be left stale-high (phantom trailing space in
-            // row_text/search/scrollback). #7522 len class, now closed on the write
-            // path; recalculate_len_up_to never over-shrinks and the HAS_WIDE_CHARS
-            // gate keeps the ASCII hot path branch-free.
+            // fixup_wide_char_overwrite cleared the continuation at col+1, the
+            // row's last content when old_len == col+2, so len must be
+            // recalculated. The HAS_WIDE_CHARS gate keeps ASCII branch-free.
             self.recalculate_len_up_to(old_len);
         }
         self.flags |= RowFlags::DIRTY;
@@ -155,11 +149,10 @@ impl Row {
         current_flags: CellFlags,
         cells_len: usize,
     ) {
-        // If overwriting a genuine wide continuation (second half), clear the orphaned
-        // first half. Context-aware: WIDE_CONTINUATION (bit 10) aliases PROTECTED, so a
-        // raw check blanks col-1 when overwriting a DECSCA-protected cell (round-8
-        // write-path fix). The cell at col_usize is not overwritten until after this
-        // fixup returns, so is_cell_wide_continuation reads the correct pre-write state.
+        // Overwriting a genuine wide continuation: clear the orphaned head.
+        // Context-aware check (bit 10 aliases PROTECTED); the cell at col_usize
+        // is written only after this fixup, so the check reads the pre-write
+        // state.
         if self.is_cell_wide_continuation(col_usize as u16) {
             self.cells[col_usize - 1] = Cell::EMPTY;
         }
@@ -194,7 +187,9 @@ impl Row {
         let old_len = self.len as usize;
 
         // Wide character fixup before overwriting the range.
-        self.fixup_wide_chars_in_range(col, count);
+        if self.flags.contains(RowFlags::HAS_WIDE_CHARS) {
+            self.fixup_wide_chars_in_range(col, count);
+        }
 
         let end = start.saturating_add(usize::from(count)).min(cells_len);
         let actual = end - start;
@@ -209,13 +204,11 @@ impl Row {
             && old_len > 0
             && self.cells[old_len - 1].is_empty()
         {
-            // fixup_wide_chars_in_range cleared the continuation at index `end`
-            // (one column past the fill) when the last filled cell is a WIDE head.
-            // If that orphan was the row's last content (old_len == end+1) the
-            // grow above never fires and len is left stale-high — the #7522 len
-            // class, previously closed only on the clear/erase paths. This is the
-            // fast REP/padding path (write_cell_run), so the HAS_WIDE_CHARS gate
-            // keeps ASCII runs branch-free; recalculate_len_up_to never over-shrinks.
+            // fixup_wide_chars_in_range cleared the continuation at `end` (one
+            // past the fill) when the last filled cell is a WIDE head; if that was
+            // the row's last content (old_len == end+1) the grow above never
+            // fires and len stays stale-high. This is the REP/padding path, so the
+            // HAS_WIDE_CHARS gate keeps ASCII runs branch-free.
             self.recalculate_len_up_to(old_len);
         }
         self.flags |= RowFlags::DIRTY;
@@ -249,11 +242,10 @@ impl Row {
         let end = usize::from(start_col.saturating_add(count));
         let actual_end = end.min(cells_len);
 
-        // Check if the start cell is a genuine wide continuation - clear the orphaned
-        // head. Context-aware: WIDE_CONTINUATION (bit 10) aliases PROTECTED, so a raw
-        // check blanks start-1 when the fill range begins on a DECSCA-protected cell
-        // (round-8 write-path fix). is_cell_wide_continuation returns false for start==0,
-        // so start-1 cannot underflow. The cell at `start` is not filled until after this.
+        // A genuine wide continuation at the start: clear the orphaned head.
+        // Context-aware check (bit 10 aliases PROTECTED); false for start==0, so
+        // start-1 cannot underflow. The cell at `start` is filled only after
+        // this.
         if self.is_cell_wide_continuation(start_col) {
             self.cells[start - 1] = Cell::EMPTY;
         }
@@ -332,13 +324,11 @@ impl Row {
         unsafe {
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::from_raw_parts(char_data, colors, flags.union(CellFlags::WIDE));
-            // The spacer carries the LEAD'S rendition, not a bare role bit. A
-            // rendition belongs to the character, and a double-width character is
-            // one character in two columns; `wide_continuation_of` states that law
-            // and the measurement behind it. Built with WIDE_CONTINUATION alone,
-            // this cell resolved un-inverted while the lead resolved swapped, and
-            // since lead.fg == spacer.bg under that split the glyph's right half
-            // was painted invisible — 153/153 flat pixels under `\033[7m漢`.
+            // The spacer carries the lead's rendition, not a bare role bit: a
+            // double-width character is one character in two columns (see
+            // `wide_continuation_of`). With WIDE_CONTINUATION alone, under SGR 7
+            // the lead would resolve swapped and the spacer not, painting the
+            // glyph's right half invisible.
             *self.cells.get_unchecked_mut(col_usize + 1) =
                 Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
         }
@@ -346,13 +336,11 @@ impl Row {
         if col + 1 >= self.len {
             self.len = col.saturating_add(2);
         } else if old_len > 0 && self.cells[old_len - 1].is_empty() {
-            // Interior wide write orphaned a pre-existing wide char's continuation
-            // at col+2 (fixup_wide_char_write cleared it); if that was the row's
-            // last content (old_len == col+3), `col+1 >= self.len` is false so len
-            // would be left stale-high, surfacing a phantom trailing space in
-            // row_text/search/scrollback. #7522 len class, now closed on the write
-            // path. recalculate_len_up_to rescans and never over-shrinks; the
-            // orphan can only exist when a prior wide char set HAS_WIDE_CHARS.
+            // An interior wide write orphaned an existing wide char's
+            // continuation at col+2 (cleared by fixup_wide_char_write); if that
+            // was the row's last content (old_len == col+3), len would stay
+            // stale-high. recalculate_len_up_to never over-shrinks; the orphan
+            // can only exist when HAS_WIDE_CHARS was set.
             self.recalculate_len_up_to(old_len);
         }
         self.flags |= RowFlags::DIRTY | RowFlags::HAS_WIDE_CHARS;
@@ -362,27 +350,23 @@ impl Row {
     /// Write a wide character without fixup checks.
     ///
     /// Used by emoji/CJK batch run paths that already ensure sequential layout.
-    /// This is the unchecked counterpart to [`Self::write_wide_char_packed`] —
-    /// it skips bounds checks and wide-char orphan fixup in exchange for speed.
+    /// The unchecked counterpart to [`Self::write_wide_char_packed`]: it skips
+    /// bounds checks and wide-char orphan fixup.
     ///
     /// # Safety
     ///
-    /// The caller MUST uphold all of the following invariants:
+    /// The caller must uphold:
     ///
-    /// (a) `(col as usize) + 1 < self.cells_len()` — both `col` and `col + 1`
-    ///     must be valid indices into the row's cell buffer. Violating this
-    ///     triggers out-of-bounds UB via `get_unchecked_mut`.
+    /// (a) `(col as usize) + 1 < self.cells_len()`: both `col` and `col + 1`
+    ///     are valid indices (otherwise `get_unchecked_mut` is UB).
     ///
-    /// (b) `col` is on a wide-cell boundary — i.e. sequential writes land at
-    ///     `col, col+2, col+4, ...` on a freshly sized run. Writing to an odd
-    ///     offset inside an existing wide pair leaves a torn WIDE /
-    ///     WIDE_CONTINUATION cell that downstream code does not expect.
+    /// (b) `col` is on a wide-cell boundary: sequential writes land at
+    ///     `col, col+2, col+4, ...` on a freshly sized run. An odd offset inside
+    ///     an existing pair leaves a torn WIDE / WIDE_CONTINUATION cell.
     ///
-    /// (c) The caller guarantees sequential non-overlapping writes so that no
-    ///     WIDE / WIDE_CONTINUATION conflicts exist with cells already present
-    ///     in the row. This function intentionally skips the orphan fixup that
-    ///     [`Self::write_wide_char_packed`] performs; any pre-existing wide
-    ///     pair overlap will produce a malformed row.
+    /// (c) Writes are sequential and non-overlapping, so no WIDE /
+    ///     WIDE_CONTINUATION conflicts exist with cells already in the row; the
+    ///     orphan fixup of [`Self::write_wide_char_packed`] is skipped.
     #[inline]
     pub unsafe fn write_wide_char_packed_no_fixup(
         &mut self,
@@ -411,9 +395,8 @@ impl Row {
         unsafe {
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::from_raw_parts(char_data, colors, flags.union(CellFlags::WIDE));
-            // Same law as `write_wide_char_packed`: the spacer inherits the lead's
-            // rendition. This is the emoji/CJK batch-run path, so a divergence here
-            // would show as a run that highlights correctly only when it was slow.
+            // As in `write_wide_char_packed`, the spacer inherits the lead's
+            // rendition.
             *self.cells.get_unchecked_mut(col_usize + 1) =
                 Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
         }
@@ -429,11 +412,9 @@ impl Row {
         second_flags: CellFlags,
         cells_len: usize,
     ) {
-        // If the first position overwrites a genuine wide continuation (second half),
-        // clear the orphaned first half. Context-aware: WIDE_CONTINUATION (bit 10) aliases
-        // PROTECTED, so a raw check blanks col-1 when the new wide char starts on a
-        // DECSCA-protected cell (round-8 write-path fix). is_cell_wide_continuation returns
-        // false for col==0. The cells are not written until after this fixup returns.
+        // If the first position overwrites a genuine wide continuation, clear
+        // the orphaned head. Context-aware check (bit 10 aliases PROTECTED);
+        // false for col==0. Cells are written only after this fixup.
         if self.is_cell_wide_continuation(col_usize as u16) {
             self.cells[col_usize - 1] = Cell::EMPTY;
         }

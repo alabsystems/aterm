@@ -7,8 +7,7 @@
 //! ## Spec of record: the DERIVED `StreamingSearch` machine
 //!
 //! `aterm_spec::derive::streaming_search_model()` — a drift-free `ty_model!`
-//! twin registered in the global spec/ledger closure. It SUPERSEDES the
-//! never-committed hand `StreamingSearch.tla` these docs used to reference.
+//! twin registered in the global spec/ledger closure.
 //! Tier-0 prove-and-catch: `aterm-spec/tests/derived_streaming_search_ty.rs`
 //! (+ the compile-time gate in this crate's `build.rs`); Tier-1 lockstep over a
 //! bounded unit-effect alphabet against this real engine:

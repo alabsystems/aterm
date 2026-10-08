@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The alt-screen scroll-off archive against a SYNTHETIC Claude-Code-shaped byte
-//! stream (never a real capture: those carry private content).
+//! The alt-screen scroll-off archive against a synthetic Claude-Code-shaped
+//! byte stream (never a real capture, which would carry private content).
 //!
-//! Claude Code runs on the alternate screen and repaints inside DEC 2026
-//! synchronized updates with absolute cursor moves and erases only — no scroll
-//! sequence of any kind — so a transcript row that leaves the top of the screen
-//! is gone from the grid. This file builds that shape: `?1049h`, then frames of
-//! `?2026h ?25l`, the changed rows painted with CUP/VPA+CHA + text + EL (a
-//! transcript window shifted by k rows, a ticking spinner row, a fixed composer
-//! box and footer), `?25h ?2026l`. It checks the archive holds EXACTLY the rows
-//! that scrolled off, that feeding the same bytes in 1..=17-byte chunks (and with
-//! an ESU cut in two) changes neither the archive nor the grid, that a frame the
-//! sync timeout closes is committed, that main-screen output archives nothing,
-//! and that the alt grid itself still keeps zero scrollback.
+//! Claude Code repaints the alternate screen inside DEC 2026 synchronized
+//! updates using only absolute cursor moves and erases, so a row leaving the
+//! top is gone from the grid. The stream is `?1049h`, then frames of `?2026h
+//! ?25l`, changed rows painted with CUP/VPA+CHA + text + EL (a transcript
+//! shifted by k rows, a spinner row, a fixed composer and footer), `?25h
+//! ?2026l`. Checked: the archive holds exactly the rows that scrolled off;
+//! 1..=17-byte chunking (and a split ESU) changes neither archive nor grid; a
+//! frame the sync timeout closes is committed; main-screen output archives
+//! nothing; the alt grid keeps zero scrollback.
 
 use std::time::Duration;
 

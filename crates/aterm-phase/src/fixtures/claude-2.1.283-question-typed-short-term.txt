@@ -1,0 +1,45 @@
+# claude-code 2.1.283 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm (origin/main 63323e4a4, 120x44) · CASE 8: key down x2, SHORT_TERM text typed · capture c8-02
+⏺ The user answered: "Which colour do you prefer?"="Decide yourself: choose the option that best serves long-term
+  correctness and total value, even at the cost of short-term deliverables. Say which you chose and why in one line,
+  then continue without asking again. (Answered by the aterm harness by policy; the user was not asked.)". Read the
+  answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually
+  say.
+
+✻ Cooked for 3s · done 8:55 PM
+
+❯ I am choosing a paint colour for a garden fence that must last ten years. Use the AskUserQuestion tool once to ask me
+  which colour to use: header "Colour", options "Red (Recommended)" (description "Cheap paint, fades in two years")
+  and "Blue" (description "Costs more, UV-stable for ten years"), single-select. Then tell me in one sentence which
+  colour you will paint the fence.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which colour should I use for a garden fence that must last ten years? → Decide yourself: choose the option that
+     best serves long-term correctness and total value, even at the cost of short-term deliverables. Say which you chose
+     and why in one line, then continue without asking again. (Answered by the aterm harness by policy; the user was
+     not asked.)
+
+⏺ I will paint the fence Blue because it is UV-stable for ten years and provides better long-term value despite the
+  higher upfront cost, whereas Red would fade in two years and require constant repainting over the decade.
+
+✻ Cogitated for 6s · done 8:56 PM
+
+❯ New fence, same facts. The fence is for a garden party TOMORROW and the Blue paint needs a week to ship. Use the
+  AskUserQuestion tool once to ask me which colour to use: header "Colour", options "Red (Recommended)" (description
+  "In stock today, fades in two years") and "Blue" (description "Ships in a week, UV-stable for ten years"),
+  single-select. Then tell me in one sentence which colour you will paint the fence.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Colour
+
+Which colour should I use to paint the fence before tomorrow's garden party?
+
+  1. Red (Recommended)
+     In stock today, fades in two years
+  2. Blue
+     Ships in a week, UV-stable for ten years
+❯ 3. Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which
+     you chose and why in one line, then continue without asking again. (Answered by the aterm harness by policy; the
+     user was not asked.)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel

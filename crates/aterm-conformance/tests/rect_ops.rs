@@ -128,8 +128,8 @@ fn decfra_fill_carries_current_decsca_protection() {
     // decfra_default_coords_fill_full_screen).
     decaln(&mut s);
     // DEC STD 070 / xterm: DECFRA writes the fill character with the current
-    // rendition AND the current DECSCA protection state (xterm keeps
-    // PROTECTED in its ATTRIBUTES mask applied by ScrnFillRectangle).
+    // rendition and the current DECSCA protection state (xterm keeps
+    // PROTECTED in its attributes mask applied by ScrnFillRectangle).
     // Protected fill at cols 1-3, unprotected fill at cols 5-6:
     s.feed(b"\x1b[1\"q\x1b[88;1;1;1;3$x\x1b[0\"q\x1b[88;1;5;1;6$x");
     assert_eq!(s.row(0), "XXXEXXEEEE");
@@ -280,7 +280,7 @@ fn deccra_overlapping_copy_behaves_as_if_buffered() {
     s.feed(b"\x1b[1;1HABCDEF");
     // DEC STD 070 / xterm: DECCRA reads the source rectangle before writing
     // the destination (xterm copies via a temporary buffer), so an
-    // overlapping copy must reproduce the ORIGINAL source content.
+    // overlapping copy must reproduce the original source content.
     // Copy row 1 cols 1-4 ("ABCD") to destination (1;3): cols 3-6 <- "ABCD".
     s.feed(b"\x1b[1;1;1;4;1;1;3;1$v");
     // A naive in-place forward copy would produce "ABABAB" instead.
@@ -352,7 +352,7 @@ fn deccara_rect_extent_decsace2_changes_exact_rectangle() {
     decaln(&mut s);
     // xterm ctlseqs (DECSACE): "Ps = 2 -> rectangle (exact)." VT520
     // (DECSACE): Ps=2 -> DECCARA affects all character positions in the
-    // rectangular area. So bold must land on rows 2-4 x cols 3-6 ONLY.
+    // rectangular area. So bold must land on rows 2-4 x cols 3-6 only.
     s.feed(b"\x1b[2*x\x1b[2;3;4;6;1$r");
     for r in 1..=3 {
         assert!(
@@ -488,7 +488,7 @@ fn decrqss_decsace_roundtrips_current_extent() {
 /// Write `text` at row `r` (1-based), column 1, wrapped in `sgr` … SGR 0.
 ///
 /// DECALN paints its backdrop with default attributes, so a test that needs
-/// cells which ALREADY carry an attribute has to write them itself.
+/// cells which already carry an attribute has to write them itself.
 fn styled_row(s: &mut Screen, r: u16, sgr: &str, text: &str) {
     s.feed(format!("\x1b[{r};1H\x1b[{sgr}m{text}\x1b[0m").as_bytes());
 }
@@ -561,7 +561,7 @@ fn decrara_leaves_every_cell_outside_the_rectangle_alone() {
 #[test]
 fn decrara_default_pm_reverses_modes_1_4_5_7() {
     // xterm ctlseqs: "Reversing SGR 0 reverses modes 1, 4, 5, 7" — and Pm
-    // defaults to 0, exactly as DECCARA's attribute list does. SGR 8 is NOT in
+    // defaults to 0, exactly as DECCARA's attribute list does. SGR 8 is not in
     // that list: it is xterm's extension and only reverses when named.
     let mut s = Screen::new(3, 6);
     styled_row(&mut s, 1, "8", "AAAAAA"); // HIDDEN, nothing else

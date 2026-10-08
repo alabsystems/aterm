@@ -4,9 +4,7 @@
 
 use super::super::*;
 
-// ========================================================================
 // Alignment and pointer correctness tests (MIRI-exercised)
-// ========================================================================
 
 #[test]
 fn alloc_slice_alignment_u8() {
@@ -141,18 +139,11 @@ fn reset_three_pages_all_zeroed_on_reuse() {
     }
 }
 
-// ========================================================================
-// Memory safety tests: pointer stability and alignment
-// ========================================================================
-//
-// These tests target the unsafe invariants that the PageStore must uphold:
-// - Pointers from alloc_slice remain valid after subsequent allocations
-// - Cell (the production type) gets correct alignment from alloc_slice
+// Pointer stability and alignment: alloc_slice pointers stay valid across later
+// allocations, and Cell gets correct alignment.
 
-/// Verify that PageSlice<Cell> pointers are valid and properly aligned.
-///
-/// Cell is `repr(C, packed)` (align 1), but this test exercises the actual
-/// production allocation path rather than proxy types (u8, u64).
+/// PageSlice<Cell> pointers are valid and aligned on the production allocation
+/// path (Cell is `repr(C, packed)`, align 1).
 #[test]
 fn alloc_slice_cell_alignment_and_access() {
     use crate::Cell;
@@ -176,10 +167,7 @@ fn alloc_slice_cell_alignment_and_access() {
     }
 }
 
-/// Verify zero-length allocations are stable and do not consume page capacity.
-///
-/// This exercises the `from_raw_parts` / `from_raw_parts_mut` boundary where
-/// `len == 0` and ensures later allocations are unaffected.
+/// Zero-length allocations are stable and consume no page capacity.
 #[test]
 fn alloc_zero_length_slice_is_stable_and_non_consuming() {
     let mut store = PageStore::new();
@@ -207,13 +195,8 @@ fn alloc_zero_length_slice_is_stable_and_non_consuming() {
     assert_eq!(filled.as_slice(), &[1, 2, 3, 4]);
 }
 
-/// Verify that earlier PageSlice pointers remain valid after subsequent
-/// allocations on the same page.
-///
-/// This is the core safety property of the arena allocator: alloc_slice
-/// returns a NonNull<T> derived from a Box<Page> that stays pinned in
-/// the pages Vec. If the Vec reallocated or pages moved, these pointers
-/// would dangle.
+/// Earlier PageSlice pointers stay valid after later allocations on the same
+/// page: each page is a `Box<Page>` that never moves.
 #[test]
 fn alloc_slice_pointer_stability_across_allocations() {
     let mut store = PageStore::new();
@@ -263,12 +246,8 @@ fn alloc_slice_pointer_stability_across_allocations() {
     }
 }
 
-/// Verify that PageSlice pointers remain valid when allocations span
-/// multiple pages.
-///
-/// When the first page fills up, alloc_slice creates a new page. The old
-/// page must not be moved or freed; the NonNull<T> from the first
-/// allocation must still point to valid memory.
+/// PageSlice pointers stay valid when allocations span pages: a full page is
+/// neither moved nor freed when the next one is created.
 #[test]
 fn alloc_slice_pointer_stability_across_pages() {
     use crate::Cell;

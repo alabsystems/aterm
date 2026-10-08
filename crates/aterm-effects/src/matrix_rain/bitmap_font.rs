@@ -1,58 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The 8x8 bitmap glyph table PHOSPHOR's literal material mode draws with.
+//! The 8x8 bitmap glyph table phosphor's literal material mode draws with.
 //!
-//! # Provenance: this is DATA, and the data is PUBLIC DOMAIN
+//! # Provenance
 //!
-//! These 499 glyphs come from the classic `font8x8` collection — Marcel
-//! Sondaar's 8x8 monochrome bitmap font, packaged as `dhepper/font8x8` — whose
-//! author released it to the PUBLIC DOMAIN. Public-domain data carries no
-//! license obligation and no attribution requirement; the citation here is
-//! honesty about where the numbers came from, not a legal condition. Nothing
-//! else was taken: the lookup below, and every line of PHOSPHOR that reads it,
-//! is original.
+//! These 499 glyphs come from the classic `font8x8` collection (Marcel
+//! Sondaar's 8x8 monochrome bitmap font, packaged as `dhepper/font8x8`),
+//! released to the public domain; no license obligation applies. The lookup
+//! and everything that reads it are original.
 //!
-//! # Why it is a table here instead of a dependency
+//! # Why a table, not a dependency
 //!
-//! PHOSPHOR reached seven separate font8x8 tables through a trait, to answer
-//! ONE question — "what does this character look like at 8x8?" — for the
-//! handful of scripts the material sampler supports. The crate is ~10.6k lines
-//! of Rust to carry that data, in the shipped graph, on every platform
-//! including wasm. So the answer moved in-tree and the dependency left.
+//! The sampler needs only "what does this character look like at 8x8" for a
+//! handful of scripts; the crate is ~10.6k lines in the shipped graph on
+//! every platform including wasm.
 //!
-//! # Exactly the same answers, provably and permanently
+//! # Same answers as the crate
 //!
 //! The table is the FIRST-HIT union of the seven tables the previous lookup
 //! consulted, in the same order — Basic, Latin, Greek, box drawing, block
 //! elements, Hiragana, misc — with blank glyphs omitted, because the old
 //! lookup filtered those out anyway and an omitted entry and a filtered one
-//! are the same `None`. `tests/font8x8_oracle.rs` keeps the retired crate as a
-//! dev-dependency and asserts the two agree for EVERY code point in Unicode,
-//! so this is not a claim that was true once at copy time: it is a claim the
-//! test suite re-proves on every run, for as long as the oracle is there.
+//! are the same `None`. The copy was checked against the retired crate for
+//! EVERY code point in Unicode, and `the_table_is_pinned` holds it there.
 //!
-//! # One entry that "first hit" does NOT reproduce: U+00B2
+//! # The U+00B2 exception
 //!
-//! The recipe above has exactly one exception, and it is in the retired crate,
-//! not here. `font8x8`'s `LATIN_UNICODE` table carries THREE consecutive
-//! entries all keyed `U+00B2` — `LATIN_LEGACY[18]`, `[19]` and `[20]` — because
-//! U+00B3 and U+00B4 are simply missing from the crate and the keys slid. Its
-//! `UnicodeFonts::get_font` resolves them with `binary_search_by_key`, whose
-//! result on duplicate keys is EXPLICITLY UNSPECIFIED by std; on the current
-//! std it lands on index 20, so index 20's glyph is what the old lookup
-//! actually drew and index 20's glyph is what is pinned below.
-//!
-//! A naive first-hit regeneration would emit `LATIN_LEGACY[18]`
-//! (`[0x1C, 0x30, 0x18, 0x0C, 0x3C, …]`) instead. The oracle would catch that
-//! loudly — which is why this is a note and not a bug — but nobody should have
-//! to rediscover it from a failing assert.
+//! The crate's `LATIN_UNICODE` table has three consecutive entries keyed
+//! `U+00B2` (`LATIN_LEGACY[18]`, `[19]`, `[20]`; U+00B3/U+00B4 are missing and
+//! the keys slid). `UnicodeFonts::get_font` resolves them with
+//! `binary_search_by_key`, which on duplicate keys is unspecified and on the
+//! current std lands on index 20, so index 20's glyph is pinned here, not the
+//! first hit (`[0x1C, 0x30, 0x18, 0x0C, 0x3C, …]`).
 
-/// Every glyph, SORTED by code point so a lookup is a binary search rather
-/// than a scan of a seven-table fallback chain.
+/// Every glyph, sorted by code point for binary search.
 ///
 /// Each entry is `(code point, 8 rows)`; row 0 is the top scanline and bit 0
-/// of a row is its LEFTMOST pixel — the orientation
+/// of a row is its leftmost pixel, the orientation
 /// [`super::rom::author_material_glyph`] expands from.
 static GLYPHS: [(u32, [u8; 8]); 499] = [
     (0x0021, [0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00]),
@@ -165,9 +150,8 @@ static GLYPHS: [(u32, [u8; 8]); 499] = [
     (0x00AF, [0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     (0x00B0, [0x1C, 0x36, 0x36, 0x1C, 0x00, 0x00, 0x00, 0x00]),
     (0x00B1, [0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x7E, 0x00]),
-    // The crate's LATIN table keys THREE entries U+00B2 (U+00B3/U+00B4 are
-    // missing and the keys slid); this is the one `binary_search_by_key`
-    // returns, NOT the first hit. See the module header.
+    // The crate keys three entries U+00B2; this is the one
+    // `binary_search_by_key` returns, not the first hit (see the module docs).
     (0x00B2, [0x18, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     (0x00B5, [0x00, 0x00, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x03]),
     (0x00B6, [0xFE, 0xDB, 0xDB, 0xDE, 0xD8, 0xD8, 0xD8, 0x00]),
@@ -559,12 +543,9 @@ static GLYPHS: [(u32, [u8; 8]); 499] = [
     (0x309E, [0x20, 0x40, 0x14, 0x24, 0x08, 0x18, 0x06, 0x00]),
 ];
 
-/// The 8x8 bitmap for `c`, or `None` when no supported family covers it.
-///
-/// `None` is a real answer, not a failure: the material sampler SKIPS an
-/// unsupported code point rather than substituting a different-looking
-/// character, which is what keeps literal mode's "these are your actual
-/// characters" contract honest.
+/// The 8x8 bitmap for `c`, or `None` when no supported family covers it. The
+/// material sampler skips an unsupported code point rather than substituting
+/// a different-looking character.
 #[must_use]
 pub(crate) fn bitmap(c: char) -> Option<[u8; 8]> {
     let cp = c as u32;
@@ -576,6 +557,20 @@ pub(crate) fn bitmap(c: char) -> Option<[u8; 8]> {
 mod tests {
     use super::{GLYPHS, bitmap};
 
+    /// The table, pinned by an FNV-1a digest recorded when it matched the
+    /// `font8x8` crate for every code point in Unicode.
+    #[test]
+    fn the_table_is_pinned() {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (cp, rows) in &GLYPHS {
+            for b in cp.to_le_bytes().iter().chain(rows) {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        assert_eq!(format!("{h:016x}"), "b0ad38513edb5cea");
+    }
+
     /// The binary search is only correct on a sorted table, and the table is
     /// generated — so the ordering is asserted here rather than trusted.
     #[test]
@@ -586,8 +581,8 @@ mod tests {
         }
     }
 
-    /// No blank glyphs: the old lookup filtered them, so an entry that is all
-    /// zeros would be a `Some` where the retired crate answered `None`.
+    /// No blank glyphs: an all-zero entry would be `Some` where the crate
+    /// answers `None`.
     #[test]
     fn no_glyph_is_blank() {
         for &(cp, rows) in &GLYPHS {

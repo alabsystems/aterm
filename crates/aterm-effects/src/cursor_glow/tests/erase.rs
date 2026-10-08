@@ -5,11 +5,10 @@
 
 use super::*;
 
-/// KILL-HINT TIMER PACING: a pending kill hint with NO moving light keeps
-/// the engine active (the caret fallback needs ticked frames) but paces at
-/// the COARSE ~40 ms poll — never the per-frame cadence, which would pin
-/// ~21 full recomposes per kill press. Moving light restores full cadence,
-/// and an expired hint disarms entirely.
+/// Kill-hint pacing: a pending kill hint with no moving light keeps the engine
+/// active (the caret fallback needs ticks) at the coarse ~40 ms poll, never the
+/// per-frame cadence. Moving light restores full cadence; an expired hint
+/// disarms.
 #[test]
 fn kill_hint_paces_coarse() {
     let frame = Duration::from_millis(16);
@@ -51,18 +50,9 @@ fn kill_hint_paces_coarse() {
     );
 }
 
-/// A PLAIN BACKSPACE WAKES THE HOST TOO — the scheduling half of "bring
-/// back the sparkle poof of deleting characters".
-///
-/// `poof_scan` has always ORed the two poof licences into one gate, but the
-/// two SCHEDULING seams named `kill_hint` alone. So from a QUIET screen a
-/// lone Backspace armed a licence the host was never told to wake for: no
-/// tick, no row probe, no shrink witnessed, hint expired — silence. A held
-/// delete run still puffed (its own particles keep the frame train alive),
-/// which is exactly the shape of the report: single characters lost their
-/// poof while runs kept theirs.
-///
-/// Both hints must arm both seams, at the same coarse poll.
+/// A plain Backspace wakes the host too: both poof licences arm both scheduling
+/// seams at the same coarse poll, so a lone Backspace from a quiet screen gets
+/// the ticks and row probes its poof needs.
 #[test]
 fn a_plain_backspace_arms_the_host_exactly_like_a_kill() {
     let frame = Duration::from_millis(16);
@@ -134,15 +124,11 @@ fn cadence_predicate_separates_brisk_rainbow_from_coarse_ember() {
     );
 }
 
-/// RESPONSIVENESS: THE GRACE IS A CAP, NOT A FLOOR. Once the probe shows
-/// the erase is already on glass, the caret fallback answers on THAT frame
-/// instead of sitting out the rest of [`CursorGlow::POOF_FALLBACK_GRACE`] —
-/// the span branch ran on the same probe and declined, so the remaining
-/// wait bought nothing but latency the user is staring at.
-///
-/// Shape: a reflowing TUI (the case the fallback exists for) replaces the
-/// caret row with a SHORTER one, so no stable prefix/suffix survives and
-/// the precise branch cannot answer at any delay.
+/// The grace is a cap, not a floor: once the probe shows the erase on glass, the
+/// caret fallback answers on that frame rather than waiting out
+/// [`CursorGlow::POOF_FALLBACK_GRACE`] (the span branch already declined on the
+/// same probe). Shape: a reflowing TUI replaces the caret row with a shorter
+/// one, so no stable prefix/suffix survives for the precise branch.
 #[test]
 fn a_witnessed_erase_releases_the_fallback_grace_early() {
     let g = geom();
@@ -187,11 +173,9 @@ fn a_witnessed_erase_releases_the_fallback_grace_early() {
     );
 }
 
-/// …and the release is a WITNESS, not a deletion of the grace. A kill whose
-/// row has NOT shrunk since the key (an echo-less kill, a repaint that
-/// changed nothing) still serves the full grace before the caret fallback
-/// answers — the span branch keeps its first shot exactly where it always
-/// had one.
+/// The release is a witness, not a removal of the grace: a kill whose row has
+/// not shrunk since the key (an echo-less kill, a repaint that changed nothing)
+/// still waits the full grace before the caret fallback answers.
 #[test]
 fn an_unwitnessed_kill_still_serves_the_full_grace() {
     let g = geom();
@@ -226,12 +210,10 @@ fn an_unwitnessed_kill_still_serves_the_full_grace() {
     );
 }
 
-/// ERASE POOF — REFLOW KILL (live-verified against Claude Code): killing a
-/// line of a WRAPPED input box reflows the TUI — the row below moves UP,
-/// so the caret row's content is REPLACED (no stable survivors), not
-/// shrunk in place. The kill still poofs, MODESTLY, at the CARET; and the
-/// same replacement WITHOUT a kill hint stays silent (the repaint-storm
-/// gate).
+/// Reflow kill: killing a line of a wrapped input box (Claude Code) moves the
+/// row below up, so the caret row is replaced rather than shrunk. The kill still
+/// poofs, modestly, at the caret; the same replacement without a kill hint stays
+/// silent.
 #[test]
 fn reflow_kill_poofs_at_the_caret() {
     let g = geom();
@@ -279,10 +261,9 @@ fn reflow_kill_poofs_at_the_caret() {
     }
 }
 
-/// ERASE POOF LAW: a kill key + a same-row NET SHRINK of the probed row
-/// puffs smoke off the exact vanished span, exactly ONCE (the hint is
-/// consumed by the poof) — and the vapor decays to exactly empty
-/// (idle-zero law).
+/// Erase poof: a kill key plus a same-row net shrink of the probed row puffs
+/// smoke off the exact vanished span, exactly once (the poof consumes the hint),
+/// and the vapor decays to exactly empty.
 #[test]
 fn ctrl_k_shrink_poofs_once() {
     let g = geom(); // cols:40, cw:8
@@ -332,13 +313,11 @@ fn ctrl_k_shrink_poofs_once() {
     assert!(!glow.is_active());
 }
 
-/// A causally confirmed plain Backspace poofs. The timestamp schedules and
-/// classifies the gesture, while the exact one-cell row proof identifies the
-/// vanished cell. CAT-INDEPENDENT by construction: `poof_scan` runs unconditionally
-/// and never consults the cursor cat (there is no cat in a `CursorGlow` at
-/// all), so the burst fires whether or not the cat is flying. On rainbow kitty/dark
-/// the poof is the momentum-independent GLITTER burst — round sparks with
-/// one hero '+' since the sparkle rebalance.
+/// A confirmed plain Backspace poofs: the timestamp schedules and classifies the
+/// gesture, and the exact one-cell row proof names the vanished cell.
+/// Independent of the cursor cat (`poof_scan` never consults it). On rainbow
+/// kitty over a dark theme the poof is the momentum-independent glitter burst,
+/// round sparks with one hero '+'.
 #[test]
 fn exact_plain_backspace_poofs_cat_independent() {
     let g = geom(); // cols 40, cw 8
@@ -369,22 +348,10 @@ fn exact_plain_backspace_poofs_cat_independent() {
     );
 }
 
-/// THE CLOUD, ON THE SHIPPED DEFAULT — the owner's whole report, as a gate:
-/// *"there used to be a cloud poof on delete … can you bring something like
-/// that back?"*
-///
-/// WHY THE GREEN SUITE MISSED IT. Every test that asserted a delete puffs
-/// SMOKE (`ctrl_k_shrink_poofs_once`, `reflow_kill_poofs_at_the_caret`) built
-/// `cfg(GlowStyle::Lumen, true)`, and the default-style test
-/// (`exact_plain_backspace_poofs_cat_independent`) asserted only on
-/// `particles`. So "the machinery is green" and "the owner sees a cloud" were
-/// different claims and nothing tied them together: on RAINBOW KITTY over a
-/// DARK theme — the shipping default, `prefs::DEFAULT_CURSOR_TRAIL_STYLE` —
-/// the smoke was gated behind `!cfg.dark_theme` and `vapor` measured EMPTY
-/// for every delete shape on a live window.
-///
-/// This asserts the pairing directly, for the four shapes a shell user
-/// actually deletes with, in the configuration they actually run.
+/// On the default style (rainbow kitty, dark theme,
+/// `prefs::DEFAULT_CURSOR_TRAIL_STYLE`) every delete shape a shell user uses
+/// puffs smoke: `vapor` is non-empty alongside the particles, for the four
+/// shapes below.
 #[test]
 fn the_shipping_default_puffs_a_cloud_on_every_delete_shape() {
     let g = geom();
@@ -433,7 +400,7 @@ fn the_shipping_default_puffs_a_cloud_on_every_delete_shape() {
             "{label}: the cloud is the neutral erase poof"
         );
     }
-    // …and the PLAIN BACKSPACE, whose licence is the other one.
+    // The plain Backspace, the other licence.
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
@@ -449,26 +416,15 @@ fn the_shipping_default_puffs_a_cloud_on_every_delete_shape() {
     );
 }
 
-/// THE CLOUD IS A CLOUD BECAUSE ITS PUFFS OVERLAP — the weight law, which
-/// [`CursorGlow::spawn_poof_smoke`] used to invert.
-///
-/// It computed `puffs` from the erased width and then spread them EVENLY
-/// over that same width, so the two cancelled: a 44-column Ctrl-U dealt its
-/// 8 puffs one every 5 columns — a dotted rule, measurably fainter on glass
-/// than the 2 tightly overlapping puffs a one-character Backspace got. A
-/// BIGGER erase produced a FAINTER cloud.
-///
-/// The law now: more erased ⇒ NOT FEWER puffs, and the cloud's own width is
-/// capped at [`ERASE_POOF_SPREAD_CELLS`] however wide the span, so the
-/// billow lands where the text COLLAPSED rather than tracing where it was.
-/// Both halves are asserted, and the second is the one that refutes the
-/// even-spread implementation.
+/// The cloud is a cloud because its puffs overlap: a bigger erase gives no fewer
+/// puffs, and the cloud's width is capped at [`ERASE_POOF_SPREAD_CELLS`] however
+/// wide the span, so the billow lands where the text collapsed. Spreading the
+/// puffs evenly over the span would make a wide erase a faint dotted rule.
 #[test]
 fn a_bigger_erase_makes_a_bigger_cloud_not_a_thinner_one() {
     let t0 = Instant::now();
-    // Drive `spawn_poof_smoke` directly across a ladder of erase widths;
-    // the cell metrics are `geom()`'s (cw 8, ch 16).
-    // the span starts at x=80 (col 10) and grows rightward.
+    // Drive `spawn_poof_smoke` over a ladder of erase widths with `geom()`'s
+    // metrics (cw 8, ch 16); the span starts at x=80 (col 10) and grows right.
     let clouds: Vec<(u16, usize, f32)> = [1u16, 4, 12, 38]
         .into_iter()
         .map(|n| {
@@ -504,15 +460,11 @@ fn a_bigger_erase_makes_a_bigger_cloud_not_a_thinner_one() {
     );
 }
 
-/// THE POOF CUE LAW, both halves against the same poof machinery:
+/// Poof cue law, both halves on the same machinery:
 ///
-/// * a PLAIN BACKSPACE never throws the TIER-3 `Kill` SWOOSH over the
-///   erase POOF it already spoke on its cursor retreat (both `spawn_poof`
-///   call sites passed a literal `cue_kill = true` until 2026-08-28, so
-///   this law was documented and not enforced — 7 dB of falling noise
-///   burying the one sound the owner asked to hear). Its cloud instead
-///   cues [`SoundKind::Poof`], the puff's own little air.
-/// * a kill CHORD still swooshes — that is the cue's whole purpose.
+/// * a plain Backspace never adds the tier-3 `Kill` swoosh over the poof it
+///   already spoke on its retreat; its cloud cues [`SoundKind::Poof`];
+/// * a kill chord still swooshes.
 #[test]
 fn a_plain_backspace_never_throws_the_kill_swoosh() {
     use crate::trail_sound::SoundKind;
@@ -523,7 +475,7 @@ fn a_plain_backspace_never_throws_the_kill_swoosh() {
         v.resize(40, ' ');
         v
     };
-    // PLAIN BACKSPACE: the poof fires, cues its Puff, and no swoosh.
+    // Plain Backspace: the poof fires and cues its Puff, no swoosh.
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
@@ -553,7 +505,7 @@ fn a_plain_backspace_never_throws_the_kill_swoosh() {
         "…and the cloud carries its own little Puff cue (cued {cues:?})"
     );
 
-    // KILL CHORD: same poof machinery, and the swoosh IS its voice.
+    // Kill chord: same poof machinery, and the swoosh is its voice.
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
@@ -571,8 +523,8 @@ fn a_plain_backspace_never_throws_the_kill_swoosh() {
         "a kill chord's erase puff still earns the swoosh (cued {cues:?})"
     );
 
-    // WORD KILL (^W): the same machinery armed by `note_word_kill` speaks
-    // the WORD POOF — one word going, not a clause — and never the swoosh.
+    // Word kill (^W): armed by `note_word_kill`, speaks the word poof (one
+    // word, not a clause) and never the swoosh.
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
@@ -607,13 +559,10 @@ fn a_plain_backspace_never_throws_the_kill_swoosh() {
     );
 }
 
-/// A NO-OP Backspace poofs NOTHING. A plain Backspace at column 0 /
-/// on an empty row erases no cell, so the caret-anchored fallback must NOT
-/// fire — an unconditional `bs_poof_hint` fallback lets autorepeat at the
-/// left margin puff over text it never touched. The
-/// bs-only fallback demands the SAME real-shrink proof (`cur.fill <
-/// prev.fill`) the span branch does. A Backspace that genuinely erases a
-/// glyph still poofs (the span branch), so feedback is unaffected.
+/// A no-op Backspace poofs nothing: at column 0 or on an empty row it erases no
+/// cell, so the caret-anchored fallback demands the same real-shrink proof
+/// (`cur.fill < prev.fill`) as the span branch, and autorepeat at the margin
+/// puffs nothing. A Backspace that erases a glyph still poofs.
 #[test]
 fn no_op_backspace_poofs_nothing_but_a_real_one_does() {
     let g = geom();
@@ -705,10 +654,9 @@ fn scroll_fence_retires_plain_backspace_poof_provenance() {
     assert!(switched.bs_baseline.is_none() && switched.bs_poof_hint.is_none());
 }
 
-/// FALSE-POSITIVE FAMILY 1: repaints. An Ink repaint that rewrites the
-/// SAME text produces an identical probe (no net shrink) — silent with or
-/// without a kill hint — and even a real shrink with NO hint is silent
-/// (row diffs alone never poof; that's the engine-hook trap).
+/// Repaints: an Ink repaint of the same text gives an identical probe (no net
+/// shrink) and stays silent with or without a kill hint; a real shrink with no
+/// hint is silent too (row diffs alone never poof).
 #[test]
 fn ink_repaint_same_text_is_silent() {
     let g = geom();
@@ -734,10 +682,9 @@ fn ink_repaint_same_text_is_silent() {
     assert!(glow.vapor.is_empty(), "no hint, no poof — ever");
 }
 
-/// FALSE-POSITIVE FAMILY 1b: a kill whose echo never shows still earns
-/// exactly ONE (caret-anchored, post-grace) poof — and once the hint is
-/// consumed, a LATE shrink (0.6 s on) is some other edit: it attributes
-/// NOTHING to the long-gone kill.
+/// A kill whose echo never shows earns exactly one poof (caret-anchored, after
+/// the grace); once the hint is consumed, a late shrink (0.6 s on) is another
+/// edit and attributes nothing to the kill.
 #[test]
 fn repaint_same_text_with_stale_hint_is_silent() {
     let g = geom();
@@ -777,16 +724,12 @@ fn repaint_same_text_with_stale_hint_is_silent() {
     );
 }
 
-/// KILL FEEDBACK CONTRACT: an observed stable-row shrink earns a precise
-/// poof, and a stationary echo-less kill may use the bounded caret
-/// fallback — INCLUDING when the survivor row is replaced and re-rowed at
-/// once, which is the exact shape the fallback was written for (Claude
-/// Code's bottom-anchored Ink box reflows on a kill). The universal move
-/// gate used to silence that case by revoking the kill hint on the
-/// unproven relocation; the license does not, because a kill KEY was
-/// pressed and "did a human touch the keyboard just now" is the whole
-/// question (`docs/design/EFFECTS-LICENSE-REDESIGN.md`). What still bounds
-/// it: one kill, one poof — and a stale hint answers nothing.
+/// Kill feedback: an observed stable-row shrink earns a precise poof, and a
+/// stationary echo-less kill may use the bounded caret fallback, including when
+/// the survivor row is replaced and re-rowed at once (Claude Code's
+/// bottom-anchored box reflowing on a kill). A kill key was pressed, which is
+/// the licence (`docs/design/EFFECTS-LICENSE-REDESIGN.md`). Bounded by one kill,
+/// one poof; a stale hint answers nothing.
 #[test]
 fn a_re_rowed_kill_answers_once_and_a_stale_hint_never_does() {
     let g = geom();
@@ -798,9 +741,8 @@ fn a_re_rowed_kill_answers_once_and_a_stale_hint_never_does() {
         v.resize(40, ' ');
         v
     };
-    // Row identity broken (Claude Code's bottom-anchored reflow, or a
-    // scroll racing the hint): no row diff can name the vanished span, so
-    // the bounded caret fallback answers — once.
+    // Row identity broken (bottom-anchored reflow, or a scroll racing the hint):
+    // no row diff can name the span, so the caret fallback answers once.
     let mut moved = CursorGlow::default();
     moved.observe_row(2, 7, &row("$ hello world"), t0);
     moved.tick(Some((2, 7)), t0, &c, g, &mut out);
@@ -819,9 +761,8 @@ fn a_re_rowed_kill_answers_once_and_a_stale_hint_never_does() {
         moved.kill_hint.is_none(),
         "the fallback consumed the hint — one kill, one poof"
     );
-    // …and the consumed hint is the bound: later frames of the same
-    // re-rowed survivor buy no second puff, and a shrink arriving after
-    // the freshness window is not this kill's echo at all.
+    // The consumed hint bounds it: later frames of the re-rowed survivor buy no
+    // second puff, and a shrink after the freshness window is not this kill's.
     let poofed_at = moved.last_poof;
     let t = t0 + Duration::from_millis(700);
     moved.observe_row(3, 2, &row("$ h"), t);
@@ -848,17 +789,10 @@ fn a_re_rowed_kill_answers_once_and_a_stale_hint_never_does() {
     );
 }
 
-/// STYLE DISPATCH: a rainbow kitty kill sheds star-power SPARKLES over its
-/// grey CLOUD ([`VaporKind::Poof`] — never fire's [`VaporKind::Steam`]); a
-/// Fire kill flashes QUENCH STEAM instead and visibly escalates the quench
-/// meter (the standing blaze dies down at the same moment the steam rises).
-///
-/// The rainbow half asserted `vapor.is_empty()` until 2026-08-28, which
-/// pinned the ABSENCE the owner reported as a loss ("there used to be a
-/// cloud poof on delete") rather than the style-dispatch discrimination this
-/// test exists for. It now asserts the sharper claim — the rainbow kill's
-/// vapor is ALL Poof and no Steam — which still refutes any confusion of the
-/// two thermal languages and additionally refutes an empty cloud.
+/// Style dispatch: a rainbow kitty kill sheds star sparkles over a grey cloud
+/// (all [`VaporKind::Poof`], never [`VaporKind::Steam`]); a Fire kill flashes
+/// quench steam and visibly escalates the quench meter (the standing blaze dies
+/// as the steam rises).
 #[test]
 fn rainbow_kill_poofs_fire_kill_steams() {
     let g = geom();
@@ -878,12 +812,9 @@ fn rainbow_kill_poofs_fire_kill_steams() {
     let t = t0 + Duration::from_millis(20);
     rainbow.observe_row(2, 2, &row("> "), t);
     rainbow.tick(Some((2, 2)), t, &cn, g, &mut out);
-    // RETUNED 2026-08-29: the rainbow kill now sheds a few NEUTRAL grey
-    // puffs on dark themes too (owner: "I'm still not seeing the cloud
-    // poof for backspace") — the same `VaporKind::Poof` light themes
-    // always shed, drawn through the renderer's existing dark-ground arm.
-    // What this pins is the KIND: removal reads as grey smoke, never as
-    // the fire style's warm steam below.
+    // The rainbow kill sheds neutral grey `VaporKind::Poof` puffs on dark
+    // themes too, drawn through the renderer's dark-ground arm: removal reads
+    // as grey smoke, never the fire style's warm steam.
     assert!(
         rainbow.vapor.iter().all(|v| v.kind == VaporKind::Poof),
         "the rainbow kill sheds only neutral poof, never steam"
@@ -907,8 +838,8 @@ fn rainbow_kill_poofs_fire_kill_steams() {
     assert!(fire.quench > 0.4, "a kill is a big douse ({})", fire.quench);
 }
 
-/// RATE LIMIT: a held kill-key repeat billows at a readable cadence — two
-/// kills 50 ms apart yield exactly ONE poof (POOF_MIN_GAP).
+/// Rate limit: a held kill-key repeat billows at a readable cadence; two kills
+/// 50 ms apart give exactly one poof (POOF_MIN_GAP).
 #[test]
 fn kill_repeat_rate_limits_to_one_poof() {
     let g = geom();
@@ -941,12 +872,10 @@ fn kill_repeat_rate_limits_to_one_poof() {
     );
 }
 
-/// THE ERASE POOF's ENERGY LAW (owner: bring the delete poof back "with a
-/// similar momentum as forward typing and also include some weight for the
-/// size of what is deleted"). Both terms must bite, INDEPENDENTLY: a faster
-/// run poofs harder at the same span, and a bigger span poofs harder at the
-/// same speed — and a cold single character still clears the floor the
-/// shipping poof always threw.
+/// The erase poof's energy law: momentum and erased size each bite
+/// independently (a faster run poofs harder at the same span, a bigger span
+/// harder at the same speed), and a cold single character still clears the
+/// floor.
 #[test]
 fn erase_poof_drive_grows_with_momentum_and_weight() {
     // MOMENTUM bites at a fixed span.
@@ -984,11 +913,10 @@ fn erase_poof_drive_grows_with_momentum_and_weight() {
         erase_poof_drive(1.0, u16::MAX) <= ERASE_WEIGHT_CAP + 1e-6,
         "the energy law is bounded at the top"
     );
-    // And the FLOOR: a cold single character still throws a few grains.
-    // The fewer-sparkles ruling (owner via 0405571c, 2026-08-08) cut the
-    // poof back to ERASE_POOF_STARS = 7 — the erase's WEIGHT lives in the
-    // hero grain's size and the debris speed now, not the count — so the
-    // cold floor is a visible three, not the old six-grain cloud.
+    // The floor: a cold single character still throws a few grains. With
+    // ERASE_POOF_STARS = 7 the erase's weight is in the hero grain's size and
+    // debris speed, so the cold floor is three visible grains
+    // (owner, 2026-08-08).
     assert!(
         (ERASE_POOF_STARS * erase_poof_drive(0.0, 1)) as usize >= 3,
         "a cold single-character erase still throws a visible few sparkles"

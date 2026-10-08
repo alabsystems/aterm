@@ -13,8 +13,6 @@
 //! terminal), every mutator repaints + refreshes the a11y tree, and the
 //! pointer follows the palette's claim/hover/arm discipline.
 
-use winit::window::CursorIcon;
-
 use aterm_session::SessionId;
 
 use crate::App;
@@ -127,49 +125,18 @@ impl App {
     /// Put `state` in `wid`'s one overlay slot and arm the pointer, as every
     /// picker intent opens.
     fn install_session_picker(&mut self, wid: WindowId, state: SessionPickerState) -> bool {
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return false;
-        };
-        // Structural mutual exclusion: the one overlay slot.
-        ws.overlay = Some(crate::overlay::Overlay::SessionPicker(state));
-        ws.scroll_residual = 0.0;
-        if let Some(w) = &ws.os_window {
-            w.request_redraw();
-        }
-        self.settle_pointer_drags(wid);
-        let _ = self.session_picker_claims_pointer(wid);
-        if let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
-            self.session_picker_pointer_motion(wid, x, y);
-        }
-        self.overlay_a11y_update();
-        true
+        self.install_overlay_card(
+            wid,
+            crate::overlay::Overlay::SessionPicker(state),
+            false,
+            Self::session_picker_claims_pointer,
+            Self::session_picker_pointer_motion,
+        )
     }
 
     /// Close the picker on `wid` (no-op unless it is the open variant).
     pub(crate) fn session_picker_exit(&mut self, wid: WindowId) {
-        let mut closed = false;
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.session_picker().is_some()
-        {
-            ws.overlay = None;
-            ws.scroll_residual = 0.0;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-            closed = true;
-        }
-        self.overlay_a11y_update();
-        if closed && let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
-            self.on_cursor_moved(wid, x, y);
-        }
-    }
-
-    fn session_picker_repaint(&mut self, wid: WindowId) {
-        self.sync_session_picker_pointer_cursor(wid);
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
-        }
-        self.overlay_a11y_update();
+        self.close_overlay_card(wid, |ws| ws.session_picker().is_some());
     }
 
     /// Move the picker cursor by `delta` over the filtered set.
@@ -181,7 +148,7 @@ impl App {
         {
             p.move_selection(delta);
         }
-        self.session_picker_repaint(wid);
+        self.repaint_session_picker_pointer(wid, true);
     }
 
     /// Append a filter character.
@@ -193,7 +160,7 @@ impl App {
         {
             p.push_char(c);
         }
-        self.session_picker_repaint(wid);
+        self.repaint_session_picker_pointer(wid, true);
     }
 
     /// Delete the last filter character.
@@ -205,7 +172,7 @@ impl App {
         {
             p.backspace();
         }
-        self.session_picker_repaint(wid);
+        self.repaint_session_picker_pointer(wid, true);
     }
 
     /// Settle the chosen session (Enter / a pointer activation): close the
@@ -407,48 +374,22 @@ impl App {
     // ---- Pointer boundary (the palette_claims_pointer discipline) ----------
 
     /// Modal pointer boundary: whether the open picker owns the gesture on
-    /// `wid`. Mirrors [`Self::tab_menu_claims_pointer`].
+    /// `wid`. Shares [`Self::overlay_card_claims_pointer`] with the other modal
+    /// cards.
     pub(crate) fn session_picker_claims_pointer(&mut self, wid: WindowId) -> bool {
-        if self
-            .windows
-            .get(&wid)
-            .is_none_or(|ws| ws.session_picker().is_none())
-        {
-            return false;
-        }
-        let mut changed = None;
-        if let Some((_, view)) = self.active_native_view(wid)
-            && let Some(state) = self.native_runtime.view_state_mut(view)
-        {
-            let common = state.common_mut();
-            let hovered = common.hovered.take().is_some();
-            let pressed = common.pressed.take().is_some();
-            if hovered || pressed {
-                changed = Some(view);
-            }
-        }
-        if let Some(view) = changed {
-            self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
-            self.request_redraw_all_windows();
-        }
-        self.sync_session_picker_pointer_cursor(wid);
-        true
+        self.overlay_card_claims_pointer(
+            wid,
+            |ws| ws.session_picker().is_some(),
+            Self::sync_session_picker_pointer_cursor,
+        )
     }
 
     /// The FILTERED row index under a window-space point, through the same
     /// zoom-aware transform the card was composited with.
     fn session_picker_row_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
         let picker = self.windows.get(&wid)?.session_picker()?;
-        let transform = self.overlay_coordinate_transform(wid)?;
-        let (frame_x, frame_y) = self.window_to_frame(wid, x, y);
-        let local_x = (frame_x - transform.origin_x) / f64::from(transform.scale);
-        let local_y = (frame_y - transform.origin_y) / f64::from(transform.scale);
-        crate::session_picker::picker_row_hit(
-            picker,
-            &transform.geom,
-            local_x as f32,
-            local_y as f32,
-        )
+        let (transform, x, y) = self.overlay_card_point(wid, x, y)?;
+        crate::session_picker::picker_row_hit(picker, &transform.geom, x, y)
     }
 
     /// Keep the OS cursor aligned with the picker's row hover.
@@ -458,30 +399,12 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.session_picker())
             .is_some_and(SessionPickerState::pointer_over_row);
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && (ws.hover_pointer != pointer || ws.native_text_cursor)
-        {
-            ws.hover_pointer = pointer;
-            ws.native_text_cursor = false;
-            if let Some(w) = &ws.os_window {
-                w.set_cursor(if pointer {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                });
-            }
-        }
+        self.set_overlay_card_cursor(wid, pointer);
     }
 
     fn repaint_session_picker_pointer(&mut self, wid: WindowId, changed: bool) {
         self.sync_session_picker_pointer_cursor(wid);
-        if !changed {
-            return;
-        }
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
-        }
-        self.overlay_a11y_update();
+        self.redraw_overlay_card(wid, changed);
     }
 
     /// Hover-select the row under a pointer motion.
@@ -586,6 +509,7 @@ impl App {
                             if configure { "configure" } else { "disconnect" },
                             subject.as_str()
                         );
+                        self.post_message(crate::message_reporters::no_connection(configure));
                     }
                     [peer] => {
                         // Unambiguous: one peer acts directly (§2.3 — the
@@ -856,6 +780,26 @@ mod tests {
         assert!(app.windows[&wid].overlay().is_none());
         app.open_connection_ui(wid, sids[0].clone(), MenuAction::DisconnectSession);
         assert!(app.windows[&wid].overlay().is_none());
+        // ... and say why nothing opened: one row per press.
+        let mut titles: Vec<&str> = app
+            .messages
+            .live_rows()
+            .filter(|l| {
+                l.msg.title == "This tab has no connection"
+                    || l.msg.detail.first().map(String::as_str)
+                        == Some(crate::message_reporters::NO_CONNECTION)
+            })
+            .map(|l| l.msg.title.as_str())
+            .collect();
+        titles.sort_unstable();
+        assert_eq!(
+            titles,
+            [
+                "Couldn't configure a connection",
+                "This tab has no connection"
+            ],
+            "one row per refused press"
+        );
 
         // ONE peer: configure opens the sheet directly, prefilled.
         connect(&app, &sids[0], &sids[1]);
@@ -911,8 +855,9 @@ mod tests {
         assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Configure));
         let lines = app.windows[&wid].session_picker().unwrap().controls_lines();
         assert!(lines[0].contains("rows=2"));
+        // Every row is a connection, so none repeats ` · connected`.
         assert!(
-            lines.iter().skip(1).all(|l| l.contains("connected")),
+            lines.iter().skip(1).all(|l| !l.contains("connected")),
             "{lines:?}"
         );
     }

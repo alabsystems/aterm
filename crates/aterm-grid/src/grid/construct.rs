@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Grid construction and initialization.
-//!
-//! Constructors for creating [`Grid`] instances with various scrollback
-//! configurations. The Kani build uses a verification-optimized constructor
-//! to avoid CBMC state explosion from symbolic loop bounds.
+//! Grid construction. The Kani build uses a constructor without symbolic loop
+//! bounds to avoid CBMC state explosion.
 
 use aterm_scrollback::ScrollbackStorage;
 
@@ -29,20 +26,16 @@ impl Grid {
         Self::with_scrollback(rows, cols, 10_000)
     }
 
-    /// Create a new grid with custom ring buffer scrollback limit.
-    ///
-    /// Kani builds route through a verification-optimized constructor to avoid
-    /// CBMC state explosion from symbolic loop bounds in row/cell initialization.
+    /// Create a grid with a custom ring scrollback limit (Kani variant without
+    /// initialization loops).
     #[cfg(kani)]
     #[must_use]
     pub fn with_scrollback(rows: u16, cols: u16, max_scrollback: usize) -> Self {
         Self::kani_stub_with_scrollback(rows, cols, max_scrollback)
     }
 
-    /// Create a new grid with custom ring buffer scrollback limit.
-    ///
-    /// This sets the size of the in-memory ring buffer. For unlimited
-    /// scrollback with tiered storage, use [`Grid::with_tiered_scrollback`].
+    /// Create a grid with a custom ring scrollback limit. For tiered storage,
+    /// use [`Grid::with_tiered_scrollback`].
     #[cfg(not(kani))]
     #[must_use]
     pub fn with_scrollback(rows: u16, cols: u16, max_scrollback: usize) -> Self {
@@ -50,22 +43,14 @@ impl Grid {
         let rows = rows.clamp(1, MAX_GRID_ROWS);
         let cols = cols.clamp(1, MAX_GRID_COLS);
 
-        // Pre-heat pages based on initial grid size.
-        // Each row needs cols * size_of::<Cell>() bytes.
-        // PAGE_SIZE = 64KB = 65536 bytes.
-        // Preheat only enough pages for the initial visible rows; extra pages
-        // are allocated lazily on first real need (the page store grows on
-        // demand in `alloc_slice`). The `max_scrollback` cap is unchanged — only
-        // the eager pre-allocation timing differs.
+        // Preheat only enough pages for the visible rows; the page store grows
+        // on demand in `alloc_slice`.
         let bytes_per_row = (cols as usize) * std::mem::size_of::<Cell>();
         let initial_bytes = (rows as usize) * bytes_per_row;
         let pages_needed = (initial_bytes / PAGE_SIZE).max(1);
         let mut pages = PageStore::with_capacity(pages_needed);
-        // Reserve only the VISIBLE rows. The scrollback ring grows lazily as
-        // lines scroll off (see `grow_scrollback_ring`), so pre-sizing the full
-        // `rows + max_scrollback` ring up front is pure wasted startup memory.
-        // `row_index` uses `% rows.len()`, which always reflects the current
-        // length, so correctness is independent of pre-reserved capacity.
+        // Reserve only the visible rows; the scrollback ring grows lazily
+        // (`grow_scrollback_ring`), and `row_index` uses the current length.
         let mut row_storage = Vec::with_capacity(rows as usize);
         for _ in 0..rows {
             // SAFETY: `row_storage` and `pages` are moved into the same
@@ -140,28 +125,13 @@ impl Grid {
         }
     }
 
-    /// Create a new grid with tiered scrollback storage.
+    /// Create a grid with tiered scrollback: the ring holds `ring_buffer_size`
+    /// lines and older lines go to `scrollback` (memory or disk-backed).
     ///
-    /// The ring buffer holds `ring_buffer_size` lines for fast access.
-    /// Older lines are pushed to the tiered scrollback for memory-efficient
-    /// long-term storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `rows` - Number of visible rows
-    /// * `cols` - Number of columns
-    /// * `ring_buffer_size` - Size of the fast ring buffer (e.g., 1000)
-    /// * `scrollback` - Tiered scrollback for long-term storage (memory or disk-backed)
-    ///
-    /// A store that arrives PRE-FILLED — a restored checkpoint's history, a
-    /// reopened disk tier — holds lines this grid's lineage already pushed, so
-    /// the absolute row counter starts past them: the live top is numbered
-    /// `carried` and the oldest carried line `0`. Starting it at `rows` put the
-    /// live top at `0` with the whole carried history below it, where
-    /// [`Grid::oldest_absolute_row`] saturates onto the live top: every
-    /// history-anchored reader then took the carried lines for evicted ones (a
-    /// selection in them was dropped by the first retention re-floor), and each
-    /// history line shared its absolute number with a visible row.
+    /// A pre-filled store (a restored checkpoint, a reopened disk tier) holds
+    /// lines this grid's lineage already pushed, so the absolute row counter
+    /// starts past them: the oldest carried line is `0` and the live top
+    /// `carried`, as [`Grid::oldest_absolute_row`] expects.
     #[must_use]
     pub fn with_tiered_scrollback(
         rows: u16,
@@ -181,9 +151,8 @@ impl Grid {
         let initial_bytes = (rows as usize) * bytes_per_row;
         let pages_needed = (initial_bytes / PAGE_SIZE).max(1);
         let mut pages = PageStore::with_capacity(pages_needed);
-        // Reserve only the VISIBLE rows; the ring buffer grows lazily as lines
-        // scroll off. `ring_buffer_size` (the cap) is unchanged — only the eager
-        // pre-allocation timing differs.
+        // Reserve only the visible rows; the ring grows lazily up to
+        // `ring_buffer_size`.
         let mut row_storage = Vec::with_capacity(rows as usize);
         for _ in 0..rows {
             // SAFETY: `row_storage` and `pages` are moved into the same
@@ -268,9 +237,7 @@ impl Default for Grid {
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Grid::new() clamps its dimensions
-    // =========================================================================
 
     #[test]
     fn test_new_clamps_zero_rows_to_one() {
@@ -298,9 +265,7 @@ mod tests {
         assert_eq!(grid.cols(), MAX_GRID_COLS);
     }
 
-    // =========================================================================
     // Grid::with_tiered_scrollback()
-    // =========================================================================
 
     #[test]
     fn test_with_tiered_scrollback_clamps_zero() {
@@ -310,9 +275,7 @@ mod tests {
         assert_eq!(grid.cols(), 1);
     }
 
-    // =========================================================================
     // Invariant checks after construction
-    // =========================================================================
 
     #[test]
     fn test_new_invariants_hold() {

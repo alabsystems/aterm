@@ -70,11 +70,10 @@ fn vi_marks_set_get_remove() {
 }
 
 /// Under `cfg(kani)` `ViMarks` stores its marks in
-/// `aterm_types::verification::stubs::VerifyMap`, a build no ordinary compile
-/// reads — so nothing but this test tells a dead-code sweep that `ViMarks` needs
-/// every one of these calls (one such sweep deleted four of them, 2026-09-25, and
-/// the Kani build stopped compiling). The same operations `ViMarks` makes, on
-/// the type it makes them on under Kani, with the answers `HashMap` gives.
+/// `aterm_types::verification::stubs::VerifyMap`, which no ordinary build
+/// compiles; this test is what keeps a dead-code sweep from deleting the
+/// `VerifyMap` calls `ViMarks` needs there. It runs those operations and
+/// checks they answer as `HashMap` does.
 #[test]
 fn kani_marks_map_carries_the_marks_surface() {
     let mut marks = aterm_types::verification::stubs::VerifyMap::<char, ViPoint>::default();

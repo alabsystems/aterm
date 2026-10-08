@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for display-offset damage computation (#6072).
+//! Tests for display-offset damage computation.
 
 use super::Damage;
 use super::display_offset::{DisplayOffsetDamage, compute_display_offset_damage};

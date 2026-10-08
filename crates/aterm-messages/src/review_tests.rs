@@ -7,6 +7,8 @@
 //! and a 6000-step flood asserts every bound after every step. The
 //! defect-pinning tests from the same review live beside their code.
 
+use std::collections::BTreeMap;
+
 use crate::center::{MessageCenter, Outcome};
 use crate::glass::Links;
 use crate::glass::tests::{chars, render};
@@ -164,6 +166,7 @@ fn codec_survives_random_bytes_and_truncations() {
             retired_unix_ms: None,
             retired_at: None,
             last_action: None,
+            later: false,
         };
         valid.push(LogLine::Posted(rec));
         valid.push(LogLine::Retired {
@@ -263,9 +266,9 @@ fn notice_lines_never_panic_and_never_forge_a_row() {
     let mut c = fresh(now);
     let mut gate = WireGate::default();
     let forms = [
-        "post system ",
-        "post system sev=warn key=k ",
-        "post fabric sev=error ",
+        "post script ",
+        "post script sev=warn key=k ",
+        "post peers sev=error ",
         "progress k ",
         "progress k pct=4",
         "progress k2 done=3/9 unit=bytes load=disk ",
@@ -409,6 +412,7 @@ fn a_flood_keeps_every_bound() {
     ];
     let pool = every_intent();
     let mut posted = 0usize;
+    let mut vetted: BTreeMap<MessageId, (String, Vec<String>)> = BTreeMap::new();
     for step in 0..6000 {
         t += rng.below(300) as u64;
         let at = now + ms(t);
@@ -422,10 +426,8 @@ fn a_flood_keeps_every_bound() {
                     3 => Hold::Live {
                         stale_after: Duration::from_secs(1 + rng.below(60) as u64),
                     },
-                    4 => Hold::Standing,
-                    5 => Hold::Ask {
-                        for_: Duration::from_secs(u64::MAX / 2),
-                    },
+                    4 => Hold::STANDING,
+                    5 => Hold::asking(Duration::from_secs(u64::MAX / 2)),
                     _ => Hold::LogOnly,
                 };
                 let title = if rng.chance(50) {
@@ -455,7 +457,7 @@ fn a_flood_keeps_every_bound() {
                 if let Some(id) = ids.get(rng.below(ids.len().max(1))) {
                     let holds = [
                         Hold::Default,
-                        Hold::Standing,
+                        Hold::STANDING,
                         Hold::LogOnly,
                         Hold::Live {
                             stale_after: Duration::from_secs(5),
@@ -563,17 +565,31 @@ fn a_flood_keeps_every_bound() {
             );
         }
         assert_eq!(c.queued(), c.live_rows().count() - glass.len());
+        // The words of every live row are within their caps and control-free.
+        // A row whose title and detail are the ones already vetted at an
+        // earlier step (the same words, which the checks read alone) is not
+        // walked character by character again.
+        let mut still_vetted = BTreeMap::new();
         for l in c.live_rows() {
-            assert!(l.msg.title.chars().count() <= TITLE_CAP);
-            assert!(
-                l.msg.title.chars().all(|ch| !ch.is_control()),
-                "step {step}: {:?}",
-                l.msg.title
-            );
-            assert!(l.msg.detail.len() <= DETAIL_LINES_CAP);
-            assert!(l.msg.detail.iter().all(|d| {
-                d.chars().count() <= DETAIL_LINE_CAP && d.chars().all(|ch| !ch.is_control())
-            }));
+            let words = match vetted.remove(&l.id) {
+                Some((title, detail)) if title == l.msg.title && detail == l.msg.detail => {
+                    (title, detail)
+                }
+                _ => {
+                    assert!(l.msg.title.chars().count() <= TITLE_CAP);
+                    assert!(
+                        l.msg.title.chars().all(|ch| !ch.is_control()),
+                        "step {step}: {:?}",
+                        l.msg.title
+                    );
+                    assert!(l.msg.detail.len() <= DETAIL_LINES_CAP);
+                    assert!(l.msg.detail.iter().all(|d| {
+                        d.chars().count() <= DETAIL_LINE_CAP && d.chars().all(|ch| !ch.is_control())
+                    }));
+                    (l.msg.title.clone(), l.msg.detail.clone())
+                }
+            };
+            still_vetted.insert(l.id, words);
             assert!(l.msg.actions.len() <= MAX_ACTIONS);
             assert!(!l.msg.actions.contains(&Intent::Details));
             assert!(
@@ -588,6 +604,7 @@ fn a_flood_keeps_every_bound() {
             assert!(l.msg.hold != Hold::LogOnly);
             assert!(l.patience_at >= l.posted_at);
         }
+        vetted = still_vetted;
         if rng.chance(20) {
             let cols = rng.below(220);
             let p = c.presentation(cols, &chars, Some("/Users//w"), Links::Painted);

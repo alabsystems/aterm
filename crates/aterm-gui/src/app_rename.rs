@@ -556,17 +556,7 @@ mod tests {
     use super::*;
     use crate::session_timeline::MetaWriteError;
 
-    /// Read one session's stored pin (the raw slot, not the label chain).
-    fn pin(app: &App, session: u64) -> Option<String> {
-        app.pool
-            .get(session)?
-            .ctx
-            .meta
-            .lock()
-            .unwrap()
-            .user_title
-            .clone()
-    }
+    use crate::session_pin_for_test as pin;
 
     /// The recorded `meta-change` payloads, oldest-first.
     fn meta_events(app: &App, session: u64) -> Vec<String> {

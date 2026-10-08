@@ -4,21 +4,12 @@
 
 //! Packed color types for 8-byte terminal cells.
 
-/// Packed color representation for 8-byte cells.
+/// Foreground and background colours packed into 4 bytes of an 8-byte cell.
 ///
-/// Encodes both foreground and background in 4 bytes.
-///
-/// ## Color Modes (bits 24-27 for FG, bits 28-31 for BG)
-/// - 0x0: Default color
-/// - 0x1: Indexed color (index in low bits)
-/// - 0x2: RGB color (lookup in overflow table)
-///
-/// ## Indexed Colors (when mode = 0x1)
-/// - FG index in bits 0-7
-/// - BG index in bits 8-15
-///
-/// ## RGB Colors (when mode = 0x2)
-/// Colors are stored in CellExtra overflow tables, keyed by (row, col).
+/// ## Colour modes (bits 24-27 for FG, bits 28-31 for BG)
+/// - 0x0: default
+/// - 0x1: indexed (FG index in bits 0-7, BG index in bits 8-15)
+/// - 0x2: RGB (values in the CellExtra overflow, keyed by (row, col))
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct PackedColors(pub u32);
@@ -207,9 +198,8 @@ impl PackedColors {
         self.fg_is_default() && self.bg_is_default()
     }
 
-    // --- Per-cell HAS_EXTRAS flag (bit 16) ---
-    // Indicates this cell has an entry in the CellExtras HashMap.
-    // Eliminates hash probes for cells without extras in the rendering path.
+    // Bit 16: the cell has a CellExtras entry, so the renderer skips hash
+    // probes for cells without one.
 
     const HAS_EXTRAS_BIT: u32 = 1 << 16;
 
@@ -235,12 +225,10 @@ impl PackedColors {
     }
 }
 
-/// Legacy PackedColor for compatibility during transition.
-///
-/// Format: `0xTT_RRGGBB` where TT is the type:
-/// - `0x00_INDEX__`: Indexed color (0-255)
-/// - `0x01_RRGGBB`: True color RGB
-/// - `0xFF_______`: Default color
+/// Single-colour packed form, `0xTT_RRGGBB` where TT is the type:
+/// - `0x00_INDEX__`: indexed colour (0-255)
+/// - `0x01_RRGGBB`: truecolor RGB
+/// - `0xFF_______`: default colour
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct PackedColor(pub u32);
@@ -384,11 +372,9 @@ mod tests {
 
     #[test]
     fn packed_colors_every_fg_bg_and_extras_state() {
-        // One walk in place of 30 one-state tests here and 6 twins in
-        // cell_tests.rs: the default value, indexed fg/bg/both at 0, mid and 255,
-        // the RGB markers, a mode switch clearing the previous mode, index round
-        // trips, fg/bg independence, and the HAS_EXTRAS bit leaving the colours
-        // alone.
+        // The default value, indexed fg/bg/both at 0, mid and 255, the RGB
+        // markers, a mode switch clearing the previous mode, index round trips,
+        // fg/bg independence, and the HAS_EXTRAS bit leaving the colours alone.
         assert_eq!(PackedColors::DEFAULT.0, 0);
         assert_eq!(PackedColors::new(), PackedColors::DEFAULT);
         assert_eq!(PackedColors::default(), PackedColors::DEFAULT);
@@ -410,9 +396,9 @@ mod tests {
             }
         }
 
-        // Every (fg, bg) state reached by the setters from every kind of starting
-        // value, in both orders, so each setter must clear the mode it replaces
-        // and leave the other side untouched.
+        // Every (fg, bg) state reached by the setters from every kind of start,
+        // in both orders: each setter clears the mode it replaces and leaves the
+        // other side untouched.
         let starts = [
             PackedColors::DEFAULT,
             PackedColors::with_indexed(100, 200),
@@ -448,10 +434,7 @@ mod tests {
 
     #[test]
     fn packed_color_every_mode() {
-        // One walk in place of 8 one-value tests here and 3 twins in
-        // cell_tests.rs. #6704: DEFAULT_FG/BG must carry type byte 0xFF
-        // ("default"), never 0x00 ("indexed"); zero-initialised cells with an
-        // indexed-black background drew dark bands on light themes.
+        // DEFAULT_FG/BG carry type byte 0xFF (default), never 0x00 (indexed).
         for d in [PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG] {
             assert!(d.is_default(), "{d:?}");
             assert!(!d.is_indexed(), "{d:?}");

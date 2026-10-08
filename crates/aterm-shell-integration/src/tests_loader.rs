@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-// ─── The loader and the body (2026-09-26) ───
+// ─── The loader and the body ───
 //
 // `include!`d into lib.rs's `#[cfg(test)] mod tests` after tests.rs, whose
 // helpers (`LiveShell`, `LiveFixture`, `shell_command`, `shell_function_body`,
-// the re-key probes) it uses.
+// the re-key probes and `deliver`) it uses.
 
 /// A folder address this suite's builds never write: the NEWER build the live
 /// tests point a running shell at.
@@ -71,10 +71,10 @@ fn every_posix_script_is_a_loader_around_one_body() {
             "unset ATERM_INTEGRATION_POINTER",
             "set -e ATERM_INTEGRATION_POINTER",
             "PROMPT_COMMAND=",
-            "trap '__aterm_preexec' DEBUG",
+            "trap '__aterm_preexec \"$_\"' DEBUG",
             "add-zsh-hook precmd __aterm_precmd",
-            "zle -N zle-line-init",
-            "functions -c fish_prompt",
+            "zle -N zle-line-init __aterm_zle_line_init",
+            "functions -c fish_prompt __aterm_original_fish_prompt",
             "shell.d\"/*",
             "shell.d/*",
             "export ATERM_SHELL_INTEGRATION_INSTALLED",
@@ -215,7 +215,8 @@ impl BodyFixture {
 
 /// An interactive zsh started as a tab is, from the scripts in `dir` (the
 /// ZDOTDIR wrapper there sources the loader there), with an empty `.zshrc`.
-#[cfg(unix)]
+/// Its callers are the macOS-only zsh rows (macOS ships `/bin/zsh`).
+#[cfg(target_os = "macos")]
 fn spawn_live_zsh_from(
     zsh: &str,
     fx: &LiveFixture,
@@ -237,7 +238,7 @@ fn spawn_live_zsh_from(
     for (key, value) in extra {
         cmd.env(key, value);
     }
-    LiveShell::spawn("zsh", &mut cmd)
+    LiveShell::spawn("zsh", &mut cmd).holding(cmd.into_home())
 }
 
 /// An interactive bash started as a tab is, on the `--rcfile` wrapper in `dir`
@@ -263,7 +264,7 @@ fn spawn_live_bash_from(fx: &LiveFixture, dir: &Path, extra: &[(&str, &str)]) ->
     for (key, value) in extra {
         cmd.env(key, value);
     }
-    LiveShell::spawn("bash", &mut cmd)
+    LiveShell::spawn("bash", &mut cmd).holding(cmd.into_home())
 }
 
 /// The probe function the NEWER body carries (POSIX function syntax, so the
@@ -271,9 +272,12 @@ fn spawn_live_bash_from(fx: &LiveFixture, dir: &Path, extra: &[(&str, &str)]) ->
 #[cfg(unix)]
 const BODY_PROBE_FN: &str = "__aterm_body_probe() { printf '%s\\n' PROBE-NEWER; }";
 
-/// [`BODY_PROBE_FN`] in fish.
+/// [`BODY_PROBE_FN`] in fish. It reads the last command's status as every
+/// earlier body's custom prompt does (`test $__aterm_last_status -ne 0`): a
+/// list there stopped an older body a shell was pointed back to with a `test`
+/// error at its first prompt.
 #[cfg(unix)]
-const BODY_PROBE_FN_FISH: &str = "function __aterm_body_probe; printf '%s\\n' PROBE-NEWER; end";
+const BODY_PROBE_FN_FISH: &str = "function __aterm_body_probe; test $__aterm_last_status -ge 0; and printf '%s\\n' PROBE-NEWER; end";
 
 /// A command that prints `RAN<n>` in `label`'s own arithmetic, so the echoed
 /// command line never carries the marker.
@@ -293,12 +297,14 @@ fn ran(label: &str, n: u32) -> String {
 fn body_probe(label: &str, n: u32) -> (String, String) {
     if label == "fish" {
         // fish's hooks are its event handlers: a body re-sourced must not
-        // register one twice.
+        // register one twice. Sorted: fish lists one event's handlers in the
+        // order they were defined, and a body re-sourced defines its own again
+        // after the one the body before it defined at a prompt.
         return (
             format!(
                 "printf 'REV=%s\\n' \"$__aterm_body_rev\"; functions -q __aterm_body_probe; \
                  and __aterm_body_probe; or printf '%s\\n' PROBE-NONE; \
-                 printf 'HOOKS=%s\\n' (functions --handlers-type generic | string join ,); \
+                 printf 'HOOKS=%s\\n' (functions --handlers-type generic | sort | string join ,); \
                  printf 'PATHV=%s\\n' (string join : -- $PATH); \
                  printf 'PENV=%s\\n' (env | grep -c ATERM_INTEGRATION_POINTER); echo BP(math 300 + {n})"
             ),
@@ -328,6 +334,28 @@ fn stdout_between(sh: &LiveShell, from: usize, to: usize) -> String {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     String::from_utf8_lossy(&out[from.min(out.len())..to.min(out.len())]).into_owned()
+}
+
+/// The prompt strings in `text` a shell signed with `key`, each from a signed
+/// 133;A to the signed 133;B after it — or None when its signed marks do not
+/// alternate A, B (a mark written twice, or one missing).
+#[cfg(unix)]
+fn signed_prompts(text: &str, key: &str) -> Option<Vec<String>> {
+    let (a, b) = (format!("133;A;id={key}"), format!("133;B;id={key}"));
+    let mut marks: Vec<(usize, bool)> = text
+        .match_indices(&a)
+        .map(|(i, _)| (i, true))
+        .chain(text.match_indices(&b).map(|(i, _)| (i, false)))
+        .collect();
+    marks.sort_unstable();
+    let mut out = Vec::new();
+    for pair in marks.chunks(2) {
+        match pair {
+            [(i, true), (j, false)] => out.push(text[i + a.len()..*j].to_string()),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Drive one live shell through the body pointer: spawned from this build's
@@ -364,7 +392,7 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
     // Malformed, and a folder that is not there: consumed, nothing changes.
     let mut at = at;
     for (n, bad) in [(2, "../../../etc/passwd"), (3, "fedcba9876543210")] {
-        std::fs::write(&bf.pointer, format!("{bad}\n")).unwrap();
+        deliver(&bf.pointer, bad);
         sh.send("true");
         let (line, marker) = body_probe(label, n);
         sh.send(&line);
@@ -379,8 +407,12 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
         let _ = std::fs::remove_file(&bf.pointer);
     }
 
-    // The newer build, pointed at while the shell idles.
-    std::fs::write(&bf.pointer, format!("{NEWER_REV}\n")).unwrap();
+    // The newer build, pointed at while the shell idles: at the prompt after the
+    // last probe, once its 133;A — which follows that prompt's own body check —
+    // is out. Written as soon as the probe's output appeared, the pointer was at
+    // times read by that very prompt, before the command below ran.
+    let at = sh.wait_for_after(&format!("133;A;id={REKEY_OLD}"), at);
+    deliver(&bf.pointer, NEWER_REV);
     let from = at;
     sh.send("true");
     let (line, marker) = body_probe(label, 4);
@@ -520,13 +552,15 @@ fn preloader_folder(fx: &LiveFixture) -> PathBuf {
 
 /// A LIVE SHELL FROM BEFORE LOADERS — spawned from main's pre-loader script,
 /// with its nonce — takes the typed upgrade: before the line it signs no
-/// revision (the negative control); the window's one-use file holds the key it
-/// already signs with, this build's folder and its body pointer; after the line
-/// (whose command still runs) the file is gone, the shell signs THIS build's
-/// revision with the SAME key, its prompt hooks are the ones it had, and — the
-/// point of it — a body pointer written later is taken at its next prompt like
-/// any loader shell's. A second line naming a file that is gone changes
-/// nothing, prints nothing, and the command after it runs.
+/// revision (the negative control); the window's one-use file holds a FRESH
+/// key (the heal of a DEGRADED tab, whose key the engine lost; a healthy tab's
+/// file hands back the key it already signs with), this build's folder and its
+/// body pointer; after the line (whose command still runs) the file is gone,
+/// the shell signs THIS build's revision with the FILE'S key, its prompt hooks
+/// are the ones it had, and — the point of it — a body pointer written later is
+/// taken at its next prompt like any loader shell's. A second line naming a
+/// file that is gone changes nothing, prints nothing, and the command after it
+/// runs.
 #[cfg(unix)]
 fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &BodyFixture) {
     let (line, marker) = body_probe(label, 1);
@@ -547,7 +581,7 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     std::fs::write(
         &file,
         format!(
-            "{REKEY_OLD}\n{}\n{}\n",
+            "{REKEY_NEW}\n{}\n{}\n",
             bf.ours.display(),
             bf.pointer.display()
         ),
@@ -555,15 +589,42 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     .unwrap();
     let typed = typed_rekey_with_loader(shell, &posix_quoted(&file)).expect("scripted");
     let sent = at;
-    sh.send(&format!("{typed} {}", ran(label, 201)));
+    // Under the user's `set -x`: the trace names the path, never the key — the
+    // commands that expand it traced it in plain text, and so did bash's loader,
+    // which the line sources. (fish traces through `fish_trace`; not asserted.)
+    let (trace, untrace) = if matches!(shell, ShellType::Zsh | ShellType::Bash) {
+        ("set -x; ", "set +x; ")
+    } else {
+        ("", "")
+    };
+    sh.send(&format!("{trace}{typed} {untrace}{}", ran(label, 201)));
     let at = sh.wait_for_after("RAN201", at);
-    // SIGNED AT THE UPGRADE, before the command the line carries runs (review
-    // finding 2026-09-26): that command is the relaunched agent, which holds the
-    // terminal for hours — and until the shell's next prompt the window read
-    // `integration_rev=frozen` for a shell that now has a loader, and the next
-    // update carried no revision to point it by.
+    if !trace.is_empty() {
+        // The trace's own last line, `set +x`, ends it on stderr.
+        let started = std::time::Instant::now();
+        while !sh.stderr_text().contains("set +x") {
+            assert!(
+                started.elapsed() < LiveShell::TIMEOUT,
+                "{label}: no trace\n{}",
+                sh.stderr_text()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        // bash writes its prompt, and the signed 133;B in it, on stderr too.
+        assert!(
+            !cut_osc(&sh.stderr_text()).contains(REKEY_NEW),
+            "{label}: the key in the trace\n{}",
+            sh.stderr_text()
+        );
+    }
+    // SIGNED AT THE UPGRADE, before the command the line carries runs: that
+    // command is the relaunched agent, which holds the terminal for hours, and
+    // until the next prompt the window would read `integration_rev=frozen`. And
+    // signed with the FILE'S key: signed with the one the shell held — the key a
+    // degraded tab's engine lost — the mark is dropped and the shell stays
+    // degraded.
     let signed = format!(
-        "633;P;{INTEGRATION_REV_KEY}={};id={REKEY_OLD}",
+        "633;P;{INTEGRATION_REV_KEY}={};id={REKEY_NEW}",
         bf.ours_rev()
     );
     assert!(
@@ -580,8 +641,12 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
         "{label}: upgraded"
     );
     assert!(!file.exists(), "{label}: the one-use file is gone");
+    // The hooks it had, and in fish the loader's prompt-event check and the
+    // body's prompt give-back (defined after the command) beside them.
     assert_eq!(
-        sh.value_before("HOOKS=", at),
+        sh.value_before("HOOKS=", at)
+            .replace(",fish_prompt __aterm_fish_prompt_event", "")
+            .replace(",fish_preexec __aterm_prompt_give_back", ""),
         hooks,
         "{label}: the same hooks"
     );
@@ -591,17 +656,17 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     let after = stdout_between(sh, at, end);
     for mark in [
         format!(
-            "633;P;{INTEGRATION_REV_KEY}={};id={REKEY_OLD}",
+            "633;P;{INTEGRATION_REV_KEY}={};id={REKEY_NEW}",
             bf.ours_rev()
         ),
-        format!("133;A;id={REKEY_OLD}"),
-        format!("133;C;id={REKEY_OLD}"),
+        format!("133;A;id={REKEY_NEW}"),
+        format!("133;C;id={REKEY_NEW}"),
     ] {
         assert!(after.contains(&mark), "{label}: {mark} after:\n{after:?}");
     }
 
     // The pointer it was handed works like any loader shell's.
-    std::fs::write(&bf.pointer, format!("{NEWER_REV}\n")).unwrap();
+    deliver(&bf.pointer, NEWER_REV);
     sh.send("true");
     let (line, marker) = body_probe(label, 4);
     sh.send(&line);
@@ -689,70 +754,74 @@ fn the_key_only_line_takes_the_first_line_of_a_three_line_file() {
     sh.finish();
 }
 
-/// A NESTED SHELL is never integrated by the typed line (review finding
-/// 2026-09-26). A shell started from an integrated tab — a `bash` or `zsh`
-/// typed there, a `nix develop` / `pipenv shell` — inherits the EXPORTED guard,
-/// so its own load stopped at the guard, and it holds no
-/// `__aterm_shell_nonce`. When the agent it launched is relaunched, the harness
-/// types the upgrade line into IT (it leads the tab's foreground group), with
-/// the file the window issued for the tab's OWN shell. The line used to assign
-/// the key to `__aterm_shell_nonce` BEFORE sourcing the loader — which then
-/// read that very variable as proof the shell was its own, and upgraded the
-/// nested shell "in place": a zsh got every hook wired, a bash had the body run
-/// at its top level (its PATH re-fronted to the reroute dir, ahead of what the
-/// nested environment put first), and the first revision the nested zsh signed
-/// read `integration_rev=current` for a tab whose own shell was still frozen —
-/// which also shut the window's upgrade off for it for good. The loader is
-/// sourced only by a shell that held the nonce BEFORE the line ran.
+/// A NESTED SHELL is never integrated by the typed line, at its first line or
+/// any later one. A shell started
+/// from an integrated tab — a `bash` or `zsh` typed there, a `nix develop` /
+/// `pipenv shell` — inherits the EXPORTED guard, so its own load stopped at the
+/// guard. When the agent it launched is relaunched, the harness types the
+/// upgrade line into IT (it leads the tab's foreground group), with the file
+/// the window issued for the tab's OWN shell — at every live agent upgrade of
+/// that agent. The line assigns the key to `__aterm_shell_nonce`, and a loader
+/// that took that variable as proof the shell was its own upgraded the nested
+/// shell "in place" (at the first line while the key went first, at the second
+/// once the loader went first): a zsh got every hook wired, a bash had the body
+/// run at its top level (its PATH re-fronted to the reroute dir, ahead of what
+/// the nested environment put first), and the first revision the nested shell
+/// signed read `integration_rev=current` for a tab whose own shell was still
+/// frozen — which also shut the window's upgrade off for it for good. The proof
+/// is a hook function the shell's own integration defined, which no child shell
+/// inherits and no typed line defines.
 #[cfg(unix)]
 fn nested_shell_is_left_alone(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &BodyFixture) {
     let (line, marker) = body_probe(label, 1);
     sh.send(&line);
-    let at = sh.wait_for_after(&marker, 0);
+    let mut at = sh.wait_for_after(&marker, 0);
     let (hooks, path) = (sh.value_before("HOOKS=", at), sh.value_before("PATHV=", at));
     assert_eq!(sh.value_before("REV=", at), "", "{label}: nested, no body");
 
-    let file = bf.fx.home.join("tab's key");
-    std::fs::write(
-        &file,
-        format!(
-            "{REKEY_OLD}\n{}\n{}\n",
-            bf.ours.display(),
-            bf.pointer.display()
-        ),
-    )
-    .unwrap();
-    let typed = typed_rekey_with_loader(shell, &posix_quoted(&file)).expect("scripted");
-    sh.send(&format!("{typed} {}", ran(label, 201)));
-    let at = sh.wait_for_after("RAN201", at);
-    let (line, marker) = body_probe(label, 2);
-    sh.send(&line);
-    let at = sh.wait_for_after(&marker, at);
-    assert!(
-        !file.exists(),
-        "{label}: the one-use file is still consumed"
-    );
-    assert_eq!(
-        sh.value_before("REV=", at),
-        "",
-        "{label}: no body sourced into a nested shell\n{}",
-        sh.transcript()
-    );
-    assert_eq!(
-        sh.value_before("HOOKS=", at),
-        hooks,
-        "{label}: no hook wired"
-    );
-    assert_eq!(
-        sh.value_before("PATHV=", at),
-        path,
-        "{label}: PATH as the nested environment set it"
-    );
-    assert!(
-        !stdout_between(sh, 0, at).contains(INTEGRATION_REV_KEY),
-        "{label}: no revision signed\n{}",
-        sh.transcript()
-    );
+    for round in 0..2 {
+        let file = bf.fx.home.join("tab's key");
+        std::fs::write(
+            &file,
+            format!(
+                "{REKEY_OLD}\n{}\n{}\n",
+                bf.ours.display(),
+                bf.pointer.display()
+            ),
+        )
+        .unwrap();
+        let typed = typed_rekey_with_loader(shell, &posix_quoted(&file)).expect("scripted");
+        sh.send(&format!("{typed} {}", ran(label, 201 + round)));
+        at = sh.wait_for_after(&format!("RAN{}", 201 + round), at);
+        let (line, marker) = body_probe(label, 2 + round);
+        sh.send(&line);
+        at = sh.wait_for_after(&marker, at);
+        assert!(
+            !file.exists(),
+            "{label}: the one-use file is still consumed (line {round})"
+        );
+        assert_eq!(
+            sh.value_before("REV=", at),
+            "",
+            "{label}: no body sourced into a nested shell (line {round})\n{}",
+            sh.transcript()
+        );
+        assert_eq!(
+            sh.value_before("HOOKS=", at),
+            hooks,
+            "{label}: no hook wired (line {round})"
+        );
+        assert_eq!(
+            sh.value_before("PATHV=", at),
+            path,
+            "{label}: PATH as the nested environment set it (line {round})"
+        );
+        assert!(
+            !stdout_between(sh, 0, at).contains(INTEGRATION_REV_KEY),
+            "{label}: no revision signed (line {round})\n{}",
+            sh.transcript()
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -795,7 +864,7 @@ fn a_nested_bash_is_not_integrated_by_the_typed_line() {
     sh.finish();
 }
 
-// ─── fish (2026-09-26 review: the lanes above, in fish) ───
+// ─── fish: the lanes above, in fish ───
 
 /// An interactive fish started as a tab is — its conf.d on XDG_DATA_DIRS from
 /// the folder `dir` — on a pty (`spawn_live_fish` says why), with `extra` in
@@ -830,7 +899,7 @@ fn spawn_live_fish_from(
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("ATERM_CHILD", "1");
-    let data = hermetic_home().join("data");
+    let data = hermetic.home().join("data");
     match dir {
         Some(dir) => {
             let InjectionEnv { env_add, .. } = injection_for(ShellType::Fish, dir).expect("fish");
@@ -852,7 +921,7 @@ fn spawn_live_fish_from(
     for (key, value) in extra {
         cmd.env(key, value);
     }
-    LiveShell::spawn("fish", &mut cmd)
+    LiveShell::spawn("fish", &mut cmd).holding(hermetic.into_home())
 }
 
 /// The fish lanes need fish and a pty. Like every other live fish test in this
@@ -924,7 +993,7 @@ fn a_nested_fish_is_not_integrated_by_the_typed_line() {
     sh.finish();
 }
 
-// ─── A body re-sourced keeps the user's key bindings (2026-09-26 review) ───
+// ─── A body re-sourced keeps the user's key bindings ───
 
 /// The line that binds Ctrl+Right to a widget of the USER's choosing, and the
 /// probe that prints what it is bound to now, in `label`'s own syntax.
@@ -973,7 +1042,7 @@ fn live_pickup_keeps_user_bindings(label: &str, sh: &mut LiveShell, bf: &BodyFix
         mine.contains("forward-word") && mine != "forward-word",
         "{label}: the user's own binding is in place: {mine:?}"
     );
-    std::fs::write(&bf.pointer, format!("{NEWER_REV}\n")).unwrap();
+    deliver(&bf.pointer, NEWER_REV);
     sh.send("true");
     let (line, marker) = body_probe(label, 2);
     sh.send(&line);
@@ -1028,7 +1097,7 @@ fn a_live_fish_keeps_the_users_key_bindings_across_a_newer_body() {
     sh.finish();
 }
 
-// ─── An upgrade in place leaves the zle-line-init chain alone (2026-09-26 review) ───
+// ─── An upgrade in place leaves the zle-line-init chain alone ───
 
 /// A LIVE zsh WITH ZLE — on a pty (`script`), from the PRE-LOADER script in
 /// `old`, whose `.zshrc` hooks `zle-line-init` the way modern plugins do
@@ -1119,13 +1188,22 @@ fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
 }
 
 /// A LIVE fish from before loaders whose config.fish defines its OWN prompt
-/// keeps it through the typed upgrade (review finding 2026-09-26). fish reads
+/// keeps it through the typed upgrade. fish reads
 /// the vendor conf.d — aterm's wrapper — BEFORE config.fish, so a prompt the
 /// user defines there (a framework's, `starship init fish | source`) replaced
 /// aterm's wrapper for that shell's whole life. The upgrade in place used to
 /// redefine `fish_prompt` as the loader's trampoline regardless, and the user's
 /// prompt was gone: the trampoline draws the prompt aterm copied at its first
-/// load, before config.fish ran. It replaces only a prompt that is aterm's own.
+/// load, before config.fish ran. It replaces only a prompt that is aterm's own,
+/// and the prompt drawn after the upgrade is the user's. This one keeps a copy of
+/// the prompt it replaced, as conda's hook and a venv's activate.fish do — here
+/// the pre-loader build's prompt wrapper, which writes its own marks: the prompt
+/// drawn after the upgrade carries one signed 133;A and one signed 133;B (the
+/// copy's marks inside the wrapped prompt doubled both at every prompt). And
+/// the prompt that copy draws reads the status the wrapper put back before
+/// calling it — here `$status` and a `$pipestatus` of its own, as a venv's
+/// activate.fish puts them back — not the command's, which it read until that
+/// copy, which captures nothing itself, had its first call keep them.
 #[cfg(unix)]
 #[test]
 fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
@@ -1133,10 +1211,18 @@ fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
     let bf = BodyFixture::new();
     let old = preloader_folder(&bf.fx);
     let config = bf.fx.home.join("config").join("fish");
-    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::create_dir_all(config.join("functions")).expect("config dir");
+    std::fs::write(
+        config.join("functions").join("fish_prompt.fish"),
+        "function fish_prompt\n    printf 'IN[%s|%s]> ' $status \"$pipestatus\"\nend\n",
+    )
+    .expect("fish_prompt.fish");
     std::fs::write(
         config.join("config.fish"),
-        "function fish_prompt\n    echo -n 'MYPROMPT> '\nend\n",
+        "functions -c fish_prompt __my_prev_prompt\n\
+         function __my_back\n    return $argv[1]\nend\n\
+         function fish_prompt\n    set -l st $status\n    echo -n 'MYPROMPT> '\n\
+         __my_back 0 | __my_back $st\n    __my_prev_prompt\nend\n",
     )
     .expect("config.fish");
     let mut sh = spawn_live_fish_from(
@@ -1145,18 +1231,13 @@ fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
         Some(&old),
         &[("ATERM_SHELL_NONCE", REKEY_OLD)],
     );
-    let probe = |n: u32| {
-        (
-            format!(
-                "functions fish_prompt | string match -q '*MYPROMPT*'; \
-                 and echo MINE(math {n} + 500); or echo OTHER(math {n} + 500)"
-            ),
-            (format!("MINE{}", n + 500), format!("OTHER{}", n + 500)),
-        )
-    };
-    let (line, (mine, _)) = probe(1);
-    sh.send(&line);
-    let at = sh.wait_for_after(&mine, 0);
+    sh.send("echo MINE(math 500 + 1)");
+    let at = sh.wait_for_after("MINE501", 0);
+    assert!(
+        stdout_between(&sh, 0, at).contains("MYPROMPT> "),
+        "before: the user's own prompt\n{}",
+        sh.transcript()
+    );
     let file = bf.fx.home.join("key");
     std::fs::write(
         &file,
@@ -1170,15 +1251,370 @@ fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
     let typed = typed_rekey_with_loader(ShellType::Fish, &posix_quoted(&file)).expect("scripted");
     sh.send(&format!("{typed} {}", ran("fish", 201)));
     let at = sh.wait_for_after("RAN201", at);
-    let (line, (mine, other)) = probe(2);
-    sh.send(&line);
+    sh.send("false");
     sh.send("echo DONE(math 600 + 1)");
     let end = sh.wait_for_after("DONE601", at);
-    let after = stdout_between(&sh, at, end);
+    // fish under TERM=dumb draws the prompt again, whole, as typed-ahead text
+    // arrives: every draw is the user's, between one signed 133;A and one 133;B,
+    // and the last, after `false`, reads what the wrapper put back.
+    let drawn = signed_prompts(&stdout_between(&sh, at, end), REKEY_OLD);
     assert!(
-        after.contains(&mine) && !after.contains(&other),
-        "the user's own prompt survives the upgrade:\n{}",
+        drawn.as_ref().is_some_and(|p| {
+            !p.is_empty()
+                && p.iter().all(|s| s.contains("MYPROMPT> "))
+                && p.last().is_some_and(|s| s.contains("IN[1|0 1]> "))
+        }),
+        "the user's own prompt is the one drawn after the upgrade, between one signed \
+         133;A and one signed 133;B, reading the status its wrapper put back: {drawn:?}\n{}",
         sh.transcript()
     );
+    sh.finish();
+}
+
+/// A LIVE fish whose config.fish defines its OWN prompt — piped to `source`,
+/// as `starship init fish | source` defines it — takes a newer body at its next
+/// prompt and signs the revision it then runs. fish
+/// reads the vendor conf.d before config.fish, so that prompt replaces the
+/// loader's trampoline for the shell's life, and with it the trampoline's body
+/// check: such a shell left every update's pointer unread and never signed a
+/// revision. The check rides the `fish_prompt` EVENT, which fish emits before
+/// every prompt whoever draws it — and the prompt drawn is still the user's,
+/// reading the status of the command before it.
+#[cfg(unix)]
+#[test]
+fn a_live_fish_with_its_own_prompt_takes_a_newer_body() {
+    let Some(fish) = live_fish() else { return };
+    let bf = BodyFixture::new();
+    let config = bf.fx.home.join("config").join("fish");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(
+        config.join("config.fish"),
+        "printf '%s\\n' 'function fish_prompt' 'printf \"MYPROMPT[%s]> \" $status' end | source\n",
+    )
+    .expect("config.fish");
+    let pointer = bf.pointer.to_str().unwrap().to_string();
+    let mut sh = spawn_live_fish_from(
+        fish,
+        &bf.fx,
+        Some(&bf.ours),
+        &[
+            ("ATERM_SHELL_NONCE", REKEY_OLD),
+            (BODY_POINTER_VAR, pointer.as_str()),
+        ],
+    );
+    let (line, marker) = body_probe("fish", 1);
+    sh.send(&line);
+    let at = sh.wait_for_after(&marker, 0);
+    assert_eq!(sh.value_before("REV=", at), bf.ours_rev(), "spawned rev");
+
+    deliver(&bf.pointer, NEWER_REV);
+    sh.send("false");
+    let (line, marker) = body_probe("fish", 2);
+    sh.send(&line);
+    let from = at;
+    let at = sh.wait_for_after(&marker, at);
+    assert_eq!(
+        sh.value_before("REV=", at),
+        NEWER_REV,
+        "taken at the next prompt\n{}",
+        sh.transcript()
+    );
+    assert_eq!(sh.value_before("PROBE-", at), "NEWER", "the newer body");
+    assert!(!bf.pointer.exists(), "the pointer is removed once read");
+    let switch = stdout_between(&sh, from, at);
+    let signed = format!("633;P;{INTEGRATION_REV_KEY}={NEWER_REV};id={REKEY_OLD}");
+    assert!(
+        switch.contains(&signed),
+        "the revision it runs is signed:\n{switch:?}"
+    );
+    assert!(
+        switch.contains("MYPROMPT[1]> "),
+        "the user's prompt, with the status of `false`:\n{switch:?}"
+    );
+    sh.finish();
+}
+
+// ─── The user's prompt: handed what fish hands it, and kept wrapped ───
+
+/// A LIVE fish's prompt that the integration WRAPS (one in functions/, wrapped
+/// at load — fish's own default prompt is wrapped the same way) reads the
+/// `$status` and `$pipestatus` of the command before it exactly as fish hands
+/// them to an unwrapped prompt — after `not` too, which inverts the status and
+/// leaves `$pipestatus`. Every command the trampoline ran before the prompt used
+/// to replace both: fish's default prompt never showed `[1]` after `false`. And
+/// draws a Ctrl-C cancels — four in a row, with no command between them (this
+/// prompt cancels itself, as a job killed by SIGINT cancels fish's whole
+/// evaluation) — leave the next prompt the user's, and marked: a count of prompts
+/// being drawn that a cancelled draw never counted back down left every prompt
+/// unmarked until the next command, and four of them drew aterm's fallback
+/// prompt in place of the user's.
+#[cfg(unix)]
+#[test]
+fn a_live_fish_wrapped_prompt_reads_the_commands_status() {
+    let Some(fish) = live_fish() else { return };
+    let fx = LiveFixture::new();
+    let ours = install_script_set(&fx.base).expect("install");
+    let functions = fx.home.join("config").join("fish").join("functions");
+    std::fs::create_dir_all(&functions).expect("functions dir");
+    std::fs::write(
+        functions.join("fish_prompt.fish"),
+        "function fish_prompt\n    printf 'ST[%s|%s]> ' \"$status\" \"$pipestatus\"\n\
+         if set -q MYCANCEL[1]\n        set -e MYCANCEL[1]\n        sh -c 'kill -INT $$'\n    end\nend\n",
+    )
+    .expect("fish_prompt.fish");
+    let mut sh = spawn_live_fish_from(fish, &fx, Some(&ours), &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
+    let mut at = 0;
+    for (n, (cmd, want)) in [
+        ("false", "ST[1|1]> "),
+        ("sh -c 'exit 7'", "ST[7|7]> "),
+        ("false | true", "ST[0|1 0]> "),
+        ("not true", "ST[1|0]> "),
+        ("not false", "ST[0|1]> "),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let from = at;
+        sh.send(cmd);
+        sh.send(&format!("echo PS(math {} + 1)", 600 + n));
+        at = sh.wait_for_after(&format!("PS{}", 601 + n), at);
+        assert!(
+            stdout_between(&sh, from, at).contains(want),
+            "the wrapped prompt after `{cmd}` reads {want:?}\n{}",
+            sh.transcript()
+        );
+    }
+    // The prompt after `set` is cancelled, and each Enter draws it again: three
+    // more cancelled, then the one the `echo` is typed at.
+    sh.send("set -g MYCANCEL 1 2 3 4");
+    for _ in 0..4 {
+        sh.send("");
+    }
+    sh.send("echo PS(math 700 + 1)");
+    let end = sh.wait_for_after("PS701", at);
+    let text = stdout_between(&sh, at, end);
+    let redrawn = text
+        .rsplit(&format!("133;A;id={REKEY_OLD}"))
+        .next()
+        .unwrap_or("");
+    assert!(
+        redrawn
+            .find("ST[")
+            .zip(redrawn.find(&format!("133;B;id={REKEY_OLD}")))
+            .is_some_and(|(p, b)| p < b),
+        "the prompt drawn after a cancelled one is marked: {redrawn:?}\n{}",
+        sh.transcript()
+    );
+    sh.finish();
+}
+
+/// A LIVE fish that draws aterm's own prompt (`ATERM_PROMPT_STYLE`) still gives
+/// the user's prompt back for a command. The shim that makes the load's prompt
+/// the one given back ran only on the way to the user's prompt, so under a
+/// style `fish_prompt` stayed the loader's trampoline for the shell's life, and
+/// `funcsave fish_prompt` wrote it over functions/fish_prompt.fish: a fish
+/// without aterm then printed `Unknown command: __aterm_body_check` at every
+/// prompt (measured, fish 4.9.3).
+#[cfg(unix)]
+#[test]
+fn a_live_fish_with_a_prompt_style_gives_the_users_prompt_back() {
+    let Some(fish) = live_fish() else { return };
+    let fx = LiveFixture::new();
+    let ours = install_script_set(&fx.base).expect("install");
+    let functions = fx.home.join("config").join("fish").join("functions");
+    std::fs::create_dir_all(&functions).expect("functions dir");
+    let saved = functions.join("fish_prompt.fish");
+    std::fs::write(&saved, "function fish_prompt\n    printf 'MINE> '\nend\n")
+        .expect("fish_prompt.fish");
+    let mut sh = spawn_live_fish_from(
+        fish,
+        &fx,
+        Some(&ours),
+        &[
+            ("ATERM_SHELL_NONCE", REKEY_OLD),
+            ("ATERM_PROMPT_STYLE", "minimal"),
+        ],
+    );
+    sh.send("false");
+    sh.send(
+        "functions fish_prompt | string match -q '*MINE*'; and echo SEEN=own; or echo SEEN=other; \
+         funcsave fish_prompt; echo PY(math 950 + 1)",
+    );
+    let at = sh.wait_for_after("PY951", 0);
+    assert!(
+        !stdout_between(&sh, 0, at).contains("MINE> "),
+        "the style's prompt is the one drawn\n{}",
+        sh.transcript()
+    );
+    assert_eq!(
+        sh.value_before("SEEN=", at),
+        "own",
+        "a command sees the user's own prompt\n{}",
+        sh.transcript()
+    );
+    let kept = std::fs::read_to_string(&saved).unwrap_or_default();
+    assert!(
+        kept.contains("MINE> ") && !kept.contains("__aterm"),
+        "funcsave writes the user's prompt back: {kept:?}\n{}",
+        sh.transcript()
+    );
+    sh.finish();
+}
+
+/// A LIVE fish whose config.fish defines its OWN prompt keeps the prompt marks:
+/// every prompt, the first one too, is a 133;A signed with the shell's key, the
+/// user's prompt (reading the status of the command before it), a signed 133;B.
+/// fish reads the vendor conf.d before config.fish, so such a prompt — what
+/// `starship init fish | source` defines — replaced the trampoline for the
+/// shell's life, and no prompt carried either mark. This one also keeps a COPY
+/// of the trampoline and calls it only some of the time: wrapped, it must never
+/// reach itself again through that copy (which recursed to fish's call stack
+/// limit, dozens of marks per prompt), and the prompt the copy draws carries
+/// its marks once — the signed marks of every prompt string alternate A, B —
+/// in German too: a fish built with its message catalogs (a distro's) words its
+/// stack trace in German, and the copy, told from the wrapper by that trace,
+/// drew its marks again. A prompt written through `string` (fish-async-prompt's,
+/// tide's) is drawn on one line with its marks: fish draws each piece written
+/// apart on a line of its own, and the command line went below the prompt. A
+/// command still sees the user's own `fish_prompt`, the one config.fish defined,
+/// which `funced` edits in place. And the prompt is handed what fish hands it:
+/// fish 4.1's transient prompt draws it once more as a command starts, with
+/// `--final-rendering`, which drew the full prompt again when the wrapper
+/// dropped it.
+#[cfg(unix)]
+#[test]
+fn a_live_fish_with_its_own_prompt_keeps_its_prompt_marks() {
+    let Some(fish) = live_fish() else { return };
+    let fx = LiveFixture::new();
+    let ours = install_script_set(&fx.base).expect("install");
+    let config = fx.home.join("config").join("fish");
+    std::fs::create_dir_all(config.join("functions")).expect("config dir");
+    std::fs::write(
+        config.join("functions").join("fish_prompt.fish"),
+        "function fish_prompt\n    printf 'BASE> '\nend\n",
+    )
+    .expect("fish_prompt.fish");
+    std::fs::write(
+        config.join("config.fish"),
+        "set -g MYMINI 1\nfunctions -c fish_prompt __my_prev_prompt\nfunction fish_prompt\n\
+         set -l st $status\nif contains -- --final-rendering $argv\nprintf 'FINAL> '\n\
+         else if set -q MYMINI\nstring join '' -- 'MINI[' $st ']> '\n\
+         else\n__my_prev_prompt\nend\nend\n",
+    )
+    .expect("config.fish");
+    // The editor `funced` runs below: it renames the prompt in the file it is given.
+    let editor = fx.home.join("edit-prompt");
+    aterm_tempfile::stand_in(
+        &editor,
+        "#!/bin/sh\nsed 's/MINI\\[/MINJ[/' \"$1\" >\"$1.new\" && cat \"$1.new\" >\"$1\" && rm -f \"$1.new\"\n",
+    )
+    .expect("editor");
+    let editor = editor.to_str().expect("utf-8").to_string();
+    let mut sh = spawn_live_fish_from(
+        fish,
+        &fx,
+        Some(&ours),
+        &[
+            ("ATERM_SHELL_NONCE", REKEY_OLD),
+            ("LC_ALL", "de_DE.UTF-8"),
+            ("LANGUAGE", "de"),
+            ("EDITOR", &editor),
+        ],
+    );
+    let a = format!("133;A;id={REKEY_OLD}");
+    let mut at = 0;
+    for (n, (cmd, want)) in [
+        ("true", "MINI[0]> "),
+        ("false", "MINI[1]> "),
+        ("set -e MYMINI", "BASE> "),
+        ("false", "BASE> "),
+        ("set -g MYMINI 1", "MINI[0]> "),
+        ("sh -c 'exit 7'", "MINI[7]> "),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let from = at;
+        sh.send(cmd);
+        sh.send(&format!("echo PM(math {} + 1)", 700 + n));
+        at = sh.wait_for_after(&format!("PM{}", 701 + n), at);
+        let text = stdout_between(&sh, from, at);
+        let drawn = signed_prompts(&text, REKEY_OLD);
+        // The last prompt string is the one drawn after `cmd`; the first row's
+        // first is the shell's first prompt, drawn before any command started.
+        let first_drawn = text.find(&a).is_some_and(|i| {
+            text.find(&format!("133;C;id={REKEY_OLD}"))
+                .is_some_and(|c| i < c)
+        });
+        let ok = drawn.as_ref().is_some_and(|p| {
+            p.last()
+                .is_some_and(|last| last.contains(want) && !last.contains('\n'))
+                && (n > 0 || first_drawn && p[0].contains("MINI[0]> "))
+        });
+        assert!(
+            ok && !text.contains("call stack"),
+            "prompt after `{cmd}`: a signed 133;A, {want:?}, a signed 133;B: {drawn:?}\n{}",
+            sh.transcript()
+        );
+    }
+    // A command runs with the user's own prompt: what `funcsave fish_prompt`
+    // writes is theirs, never a trampoline every later shell would draw.
+    sh.send(
+        "functions fish_prompt | string match -q '*MINI*'; and echo SEEN=own; or echo SEEN=other; \
+         echo FV=$FISH_VERSION; echo PM(math 800 + 1)",
+    );
+    let at = sh.wait_for_after("PM801", at);
+    assert_eq!(
+        sh.value_before("SEEN=", at),
+        "own",
+        "a command sees the user's own prompt\n{}",
+        sh.transcript()
+    );
+    let version = sh.value_before("FV=", at);
+    let v: Vec<u32> = version.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+    // ... the one config.fish defined, so `funced` edits config.fish in place, as
+    // in a fish without aterm: the prompt given back once named the integration's
+    // file as where it was copied, which fish 4's funced reads as a prompt with no
+    // file of its own, and it wrote functions/fish_prompt.fish instead. (fish 3
+    // drops the file from every copy, so no prompt given back keeps it there.)
+    let mut at = at;
+    if v.first().copied() >= Some(4) {
+        sh.send("funced -s fish_prompt; echo PM(math 850 + 1)");
+        at = sh.wait_for_after("PM851", at);
+        let edited = std::fs::read_to_string(config.join("config.fish")).unwrap_or_default();
+        assert!(
+            edited.contains("'MINJ['"),
+            "funced edits the user's config.fish in place: {edited:?}\n{}",
+            sh.transcript()
+        );
+    } else {
+        eprintln!(
+            "fish {version} copies a function without its file (3.x): the funced row did not run"
+        );
+    }
+    // The transient prompt (fish 4.1): the prompt drawn last as `true` starts is
+    // the user's `--final-rendering` one.
+    sh.send("set -g fish_transient_prompt 1; echo PM(math 900 + 1)");
+    let at = sh.wait_for_after("PM901", at);
+    if (v.first().copied(), v.get(1).copied()) >= (Some(4), Some(1)) {
+        sh.send("true");
+        sh.send("echo PM(math 900 + 2)");
+        let end = sh.wait_for_after("PM902", at);
+        let text = stdout_between(&sh, at, end);
+        let started = text
+            .find(&format!("133;C;id={REKEY_OLD}"))
+            .unwrap_or(text.len());
+        let drawn = signed_prompts(&text[..started], REKEY_OLD);
+        assert!(
+            drawn
+                .as_ref()
+                .and_then(|p| p.last())
+                .is_some_and(|s| s.contains("FINAL> ")),
+            "the transient prompt is the user's: {drawn:?}\n{}",
+            sh.transcript()
+        );
+    } else {
+        eprintln!("fish {version} has no transient prompt (4.1+): that row did not run");
+    }
     sh.finish();
 }

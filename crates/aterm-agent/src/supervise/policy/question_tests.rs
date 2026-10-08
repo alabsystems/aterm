@@ -2,9 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The question answer over aterm-phase's fixtures of Claude Code 2.1.282's
-//! question dialog (the live captures of 2026-09-25 and the hand-built shapes
-//! the critique of that day named): which row is chosen, how the focus gets
-//! there, and every shape that is the person's.
+//! question dialog (live captures and hand-built shapes): which row is chosen,
+//! how the focus gets there, and every shape that is the person's.
 
 use std::path::PathBuf;
 
@@ -12,16 +11,31 @@ use aterm_phase::prompt::fixtures::{self as f, screen};
 use aterm_phase::{PromptKind, parse_prompt_v2};
 
 use super::super::super::config::Approve;
-use super::super::approval::{Answer, AnswerTarget, ApprovalCtx, Choice, Decision, decide};
+use super::super::approval::{
+    Answer, AnswerTarget, ApprovalCtx, Choice, Decision, QuestionPriority, decide,
+};
 use super::super::guard::row_guard;
 use super::*;
+
+/// The decision under [`QuestionPriority::Recommended`] (main's), the pane
+/// as wide as its widest row.
+fn recommended_answer(p: &aterm_phase::PromptV2, rows: &[String]) -> Decision {
+    answer_question(
+        p,
+        rows,
+        QuestionPriority::Recommended,
+        None,
+        false,
+        Pane::of(rows),
+    )
+}
 
 /// A fixture's rows and the decision on its question.
 fn decided(text: &str) -> (Vec<String>, Decision) {
     let rows = screen(text);
     let p = parse_prompt_v2(&rows).unwrap_or_else(|| panic!("no box: {rows:#?}"));
     assert_eq!(p.kind, PromptKind::Question, "{rows:#?}");
-    let d = answer_question(&p, &rows);
+    let d = recommended_answer(&p, &rows);
     (rows, d)
 }
 
@@ -57,14 +71,14 @@ fn reason(d: &Decision) -> &str {
 }
 
 /// The row whose trimmed text is `text`.
-fn row_of(rows: &[String], text: &str) -> usize {
+pub(super) fn row_of(rows: &[String], text: &str) -> usize {
     rows.iter()
         .position(|r| r.trim() == text)
         .unwrap_or_else(|| panic!("no row {text:?}"))
 }
 
 /// `rows` with the `❯` focus moved from wherever it is onto row `to`.
-fn with_focus(rows: &[String], to: usize) -> Vec<String> {
+pub(super) fn with_focus(rows: &[String], to: usize) -> Vec<String> {
     rows.iter()
         .enumerate()
         .map(|(k, r)| {
@@ -87,13 +101,12 @@ fn with_focus(rows: &[String], to: usize) -> Vec<String> {
 /// The decision on edited rows.
 fn decide_rows(rows: &[String]) -> Decision {
     let p = parse_prompt_v2(rows).unwrap_or_else(|| panic!("no box: {rows:#?}"));
-    answer_question(&p, rows)
+    recommended_answer(&p, rows)
 }
 
-/// F2: the incident's screen (S6-01) is answered with its recommended
-/// option by one Enter where the vendor put the focus, guarded on the
-/// question's first row as drawn; the ledger names the question and the
-/// label.
+/// A recorded screen (S6-01) is answered with its recommended option by one
+/// Enter where the vendor put the focus, guarded on the question's first row
+/// as drawn; the ledger names the question and the label.
 #[test]
 fn the_incident_question_is_answered_with_its_recommended_option() {
     let (rows, d) = decided(f::QUESTION_TABS_INCIDENT);
@@ -123,6 +136,11 @@ fn the_recommended_option_wins_over_the_focus() {
 }
 
 /// Nothing marked: option 1, and the journal says so.
+/// An unmarked question is answered with option 1 — unless option 1 is kept
+/// for every later ask: Claude Code's own model-switch preference (MEASURED,
+/// 2.1.287), whose `1. Switch automatically` is described `… switch without
+/// asking from now on` and writes `switchModelsOnFlag` into the user's
+/// settings, is a person's.
 #[test]
 fn no_marked_option_answers_option_one() {
     let (_, d) = decided(f::QUESTION_NO_RECOMMENDATION);
@@ -130,6 +148,14 @@ fn no_marked_option_answers_option_one() {
     assert_eq!((steps, target), (0, AnswerTarget::Option(1)));
     assert!(subject.ends_with("→ Top"), "{subject}");
     assert_eq!(unproven, "no option is marked (Recommended): option 1");
+    let (_, d) = decided(f::QUESTION_MODEL_SWITCH_PREFERENCE);
+    assert!(
+        reason(&d).starts_with(
+            "a question whose answer `Switch automatically` (Continue on Sonnet 5 now, and switch \
+             without asking from now on) is kept for every later ask"
+        ),
+        "{d:?}"
+    );
 }
 
 /// A recommended label that wraps (S5-01 at 80 columns: `(Recommended)` on
@@ -148,7 +174,7 @@ fn a_wrapped_recommended_label_is_chosen_and_said() {
     assert_eq!(answer(&d).4, "answered with its recommended option");
 }
 
-/// The free-text row focused (S1-03, pristine): the focus is moved UP off it
+/// The free-text row focused (S1-03, pristine): the focus is moved up off it
 /// to the recommended option, and the journal says it was moved. Never the
 /// row itself.
 #[test]
@@ -171,7 +197,7 @@ fn focus_on_the_chat_row_is_moved_up() {
     assert!(unproven.contains("the chat row"), "{unproven}");
 }
 
-/// R2 (d): text a person typed into the free-text row — focused or not, and
+/// Text a person typed into the free-text row — focused or not, and
 /// in a multi-select — is theirs: escalated, nothing keyed.
 #[test]
 fn a_persons_text_hands_the_question_over() {
@@ -188,11 +214,11 @@ fn a_persons_text_hands_the_question_over() {
     }
 }
 
-/// NEVER `Type something.`, `Chat about this` or the review's cancel: over
-/// every live and hand-built fixture aterm-phase reads whole, and every
-/// variant with the `❯` moved onto each of its focusable rows, an answer's
-/// Enter goes to one of the model's options, the multi-select button or
-/// `Submit answers` — and a focus moved off a row counts the rows right.
+/// Never `Type something.`, `Chat about this` or the review's cancel: over
+/// every fixture aterm-phase reads whole, and every variant with the `❯` moved
+/// onto each focusable row, an answer's Enter goes to one of the model's
+/// options, the multi-select button or `Submit answers`, and a focus moved
+/// off a row counts the rows right.
 #[test]
 fn neither_type_something_nor_chat_is_ever_chosen() {
     use aterm_phase::{QuestionFocus, QuestionForm};
@@ -277,6 +303,7 @@ fn neither_type_something_nor_chat_is_ever_chosen() {
                 AnswerTarget::ReviewSubmit => {
                     assert!(matches!(dialog.form, QuestionForm::Review { .. }))
                 }
+                AnswerTarget::OwnText(p) => panic!("{text:.60}: a policy text under {p:?}"),
             }
             let from = focus_position(&dialog, at).expect("in the order");
             let to = focus_position(&dialog, target_focus(target)).expect("in the order");
@@ -336,7 +363,7 @@ fn multiselect_with_a_foreign_check_hands_over() {
 
 /// The preview form: the focus moved to the option, then Enter (a digit
 /// only moves the focus there, S4-03/04). A revisited tab whose option is
-/// ticked ` ✔` is a person's answer: escalated (R8, R2 (c)).
+/// ticked ` ✔` is a person's answer: escalated.
 #[test]
 fn the_preview_form_is_focused_then_entered() {
     let (rows, d) = decided(f::QUESTION_PREVIEW);
@@ -381,14 +408,12 @@ fn the_review_tab_submits() {
     );
 }
 
-/// R10 under D2: a question with NO recommended option whose words name a
-/// destructive act is answered only by its ONE refusing option (`No`), which
-/// consents to nothing — option 1 of "Drop the table?" would be `Yes` — and
-/// with none it is the person's; the same question with a marked
-/// recommendation is answered (the owner's directive: the model's own
-/// labelled option). Control: the measured Yes/No with nothing destructive
-/// is answered with option 1. NEGATIVE CONTROLS: no refusing option, two of
-/// them, and a "refusal" that names an act itself — each the person's.
+/// A question with no recommended option whose words name a destructive act
+/// is answered only by its one refusing option (`No`), which consents to
+/// nothing, and with none it is the person's; the same question with a marked
+/// recommendation is answered. Control: a Yes/No with nothing destructive is
+/// answered with option 1. Negative controls: no refusing option, two of
+/// them, and a "refusal" that names an act itself, each the person's.
 #[test]
 fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons() {
     let rows = screen(f::QUESTION_DO_YOU_WANT_LIVE);
@@ -434,8 +459,8 @@ fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons
             "{to}"
         );
     }
-    // An inflected act on a DESCRIPTION row (the adversarial review of
-    // 2026-09-25), with no option that refuses it: the person's.
+    // An inflected act on a description row, with no option that refuses it:
+    // the person's.
     let rows = screen(f::QUESTION_NO_RECOMMENDATION);
     assert!(matches!(decide_rows(&rows), Decision::Approve { .. }));
     let drops: Vec<String> = rows
@@ -450,13 +475,11 @@ fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons
     );
 }
 
-/// The never-block design's incident (§4 of
-/// `DESIGN-harness-never-block-2026-09-24.md`): `Want me to publish this
-/// now?` with `Deploy and push` / `Push only` / `Hold everything` and no
-/// `(Recommended)`. Option 1 is NOT pressed — the question names an act and
-/// no option refuses it (`Hold everything` does not start `No`), so it is the
-/// person's. Control: the same labels on a question that names nothing are
-/// answered; and with `Hold everything` spelled `No, hold everything` that
+/// `Want me to publish this now?` with `Deploy and push` / `Push only` /
+/// `Hold everything` and no `(Recommended)`: option 1 is not pressed, since
+/// the question names an act and no option refuses it (`Hold everything`
+/// does not start `No`), so it is the person's. Control: the same labels on a
+/// question that names nothing are answered; with `No, hold everything` that
 /// one refusal is the answer.
 #[test]
 fn the_incidents_unmarked_publish_question_is_escalated() {
@@ -502,7 +525,7 @@ fn the_incidents_unmarked_publish_question_is_escalated() {
     assert_eq!(answer(&decide_rows(&refused)).1, AnswerTarget::Option(3));
 }
 
-/// D2's refusal is `No` itself or `No` then a separator — never a word that
+/// The refusal is `No` itself or `No` then a separator — never a word that
 /// merely starts with it.
 #[test]
 fn a_refusal_is_no_and_never_a_word_that_starts_with_it() {
@@ -521,9 +544,9 @@ fn a_refusal_is_no_and_never_a_word_that_starts_with_it() {
     }
 }
 
-/// D2 for Codex's question (by its answers' roles, its digit): an unmarked
-/// question that would delete is answered by its one `No` answer, and one
-/// with no refusing answer is the person's.
+/// The destructive-question rule for Codex's question (by its answers' roles,
+/// its digit): an unmarked question that would delete is answered by its one
+/// `No` answer, and one with no refusing answer is the person's.
 #[test]
 fn codexs_unmarked_destructive_question_is_answered_by_its_refusal() {
     let rows = screen(aterm_phase::codex::fixtures::QUESTION);
@@ -548,7 +571,7 @@ fn codexs_unmarked_destructive_question_is_answered_by_its_refusal() {
     assert_ne!(q, rows, "PRECONDITION: the edits landed");
     let reading = aterm_phase::read(Some("codex"), &q, None);
     let p = reading.prompt.as_ref().expect("the dialog");
-    match answer_question(p, &q) {
+    match recommended_answer(p, &q) {
         Decision::Approve {
             choice, unproven, ..
         } => {
@@ -562,19 +585,19 @@ fn codexs_unmarked_destructive_question_is_answered_by_its_refusal() {
         }
         other => panic!("not answered: {other:?}"),
     }
-    // NEGATIVE CONTROL: no answer refuses it.
+    // Negative control: no answer refuses it.
     let q = edit(&rows, &asked[..2]);
     let reading = aterm_phase::read(Some("codex"), &q, None);
     let p = reading.prompt.as_ref().expect("the dialog");
     assert!(
-        reason(&answer_question(p, &q)).contains("no one option that refuses it"),
+        reason(&recommended_answer(p, &q)).contains("no one option that refuses it"),
         "{q:#?}"
     );
 }
 
 /// What aterm-phase did not read whole is never answered: the column-1
 /// shapes 2.1.282 does not draw, a scrolled list, the dialog withheld
-/// behind a draft in the composer (R5).
+/// behind a draft in the composer.
 #[test]
 fn an_unread_question_is_escalated() {
     for text in [
@@ -585,16 +608,16 @@ fn an_unread_question_is_escalated() {
     ] {
         let rows = screen(text);
         let p = parse_prompt_v2(&rows).expect("a box");
-        let d = answer_question(&p, &rows);
+        let d = recommended_answer(&p, &rows);
         assert!(
-            reason(&d).starts_with("a question (AskUserQuestion) aterm-phase did not read whole"),
+            reason(&d).starts_with("a question aterm could not read whole"),
             "{d:?}"
         );
     }
     let rows = screen(f::QUESTION_DEFERRED);
     let p = parse_prompt_v2(&rows).expect("a box");
     assert!(
-        reason(&answer_question(&p, &rows)).ends_with("withheld behind a draft in the composer"),
+        reason(&recommended_answer(&p, &rows)).ends_with("withheld behind a draft in the composer"),
         "the badge names the draft"
     );
 }
@@ -614,7 +637,7 @@ fn decide_with(text: &str, approve: Approve, answer_questions: bool) -> Decision
 
 /// `answer_questions = false` hands every question over, whatever `approve`
 /// says; on, questions are answered whatever `approve` says — a question is
-/// no permission, and `approve` limits permission boxes only (D5).
+/// no permission, and `approve` limits permission boxes only.
 #[test]
 fn answer_questions_off_hands_every_question_over() {
     for approve in [Approve::All, Approve::Safe, Approve::None] {
@@ -636,7 +659,7 @@ fn answer_questions_is_independent_of_approve() {
             "{approve:?}: {d:?}"
         );
     }
-    // NEGATIVE CONTROL: full power still never answers one by itself.
+    // Negative control: full power still never answers one by itself.
     let d = decide_with(f::QUESTION_TABS_INCIDENT, Approve::All, false);
     assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
 }
@@ -655,12 +678,12 @@ fn a_cut_question_is_escalated() {
     let reading = aterm_phase::read(Some("claude"), &tail, None);
     let d = decide(&reading, &tail, &ctx(Approve::All, true));
     assert!(
-        reason(&d).starts_with("a question (AskUserQuestion) aterm-phase did not read whole"),
+        reason(&d).starts_with("a question aterm could not read whole"),
         "{d:?}"
     );
 }
 
-/// R11: no visible focus is no answer. aterm-phase reads such a dialog as
+/// No visible focus is no answer. aterm-phase reads such a dialog as
 /// unknown; the decider refuses it whichever way it arrives.
 #[test]
 fn no_visible_focus_is_never_answered() {
@@ -753,13 +776,12 @@ fn decision_of(model: &aterm_spec::derive::Model, st: &ModelState) -> Verdict {
     }
 }
 
-/// The dialog a model read stands for, drawn from the live captures of the
-/// incident's last two tabs (S6-03, S6-04: two options, the first
-/// recommended, the free-text row 3, the chat row 4) and its review
-/// (S6-05): `focus` 0 the `❯` on the chosen row (option 1, `1. Submit
-/// answers`), 1 elsewhere — on a question tab the free-text row at `row`
-/// parity 0, option 2 (or, `on_chat`, the chat row) at parity 1; on the
-/// review its cancel — and `typed` a person's `2` in the free-text row.
+/// The dialog a model read stands for, drawn from live captures (S6-03,
+/// S6-04: two options, the first recommended, the free-text row 3, the chat
+/// row 4) and a review (S6-05): `focus` 0 the `❯` on the chosen row, 1
+/// elsewhere (on a question tab the free-text row at `row` parity 0, option 2
+/// or, `on_chat`, the chat row at parity 1; on the review its cancel), and
+/// `typed` a person's `2` in the free-text row.
 fn drawn(tab: i64, tabs: i64, focus: i64, row: i64, typed: i64, on_chat: bool) -> Vec<String> {
     if tab == tabs {
         let rows = screen(f::QUESTION_REVIEW);
@@ -793,18 +815,15 @@ fn drawn(tab: i64, tabs: i64, focus: i64, row: i64, typed: i64, on_chat: bool) -
     with_focus(&rows, to)
 }
 
-/// TIER-1 for `SupervisorQuestionAnswer` (aterm-spec
-/// `supervisor_question_answer_model`), the DECISION: at every reachable
-/// state of the model where the loop holds a fresh read of the dialog, the
-/// real [`answer_question`] — over the live captures drawn as that read
-/// showed them ([`drawn`]) — presses Enter exactly where the model's
-/// `HarnessEnter` is enabled, moves the focus up exactly where `HarnessMove`
-/// is, and hands the question over everywhere else (a person's text in the
-/// free-text row), the loop's own guards granted ([`decision_of`]). Every
-/// verdict occurs, on the question tabs and on the review. NEGATIVE
-/// CONTROL: the decider before R2 (d) — Enter on the chosen row whatever
-/// the free-text row holds — is caught by this very comparison at the
-/// typed-away state, where the real one escalates.
+/// Tier-1 for `SupervisorQuestionAnswer` (aterm-spec
+/// `supervisor_question_answer_model`), the decision: at every reachable state
+/// where the loop holds a fresh read of the dialog, the real
+/// [`answer_question`] over the captures drawn as that read showed them
+/// ([`drawn`]) presses Enter exactly where `HarnessEnter` is enabled, moves
+/// the focus up exactly where `HarnessMove` is, and hands the question over
+/// everywhere else, the loop's own guards granted ([`decision_of`]). Every
+/// verdict occurs. Negative control: a decider pressing Enter on the chosen
+/// row whatever the free-text row holds is caught at the typed-away state.
 #[test]
 fn tier1_the_question_decider_chooses_only_what_the_model_enables() {
     let model = aterm_spec::derive::supervisor_question_answer_model();
@@ -860,7 +879,7 @@ fn tier1_the_question_decider_chooses_only_what_the_model_enables() {
     }
     // Negative control: the typed-away read (a person's `2` in the field,
     // the focus back on option 1). The model and the real decider hand it
-    // over; a decider blind to the free-text row's text (the one before R2
+    // over; a decider blind to the free-text row's text (one
     // (d): it decides as on the pristine rows) presses Enter there — and the
     // comparison above tells the two apart.
     let typed_away = model

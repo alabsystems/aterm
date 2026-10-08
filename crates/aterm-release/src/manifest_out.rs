@@ -54,11 +54,10 @@ pub struct ManifestInputs<'a> {
     /// configured, NOT the private publish repo.
     ///
     /// The manifest bytes are published on the channel, so this single string has
-    /// to name the repository a reader can actually fetch from. Naming the private
-    /// repo (when the cut still published there first) produced a public appcast
-    /// whose `url` 404s for everyone without a credential.
+    /// to name the repository a reader can actually fetch from: a private repo's
+    /// `url` 404s for everyone without a credential.
     ///
-    /// LOAD-BEARING on the credential-less update lane (since 2026-09-03): the
+    /// LOAD-BEARING on the credential-less update lane: the
     /// web-lane client (`aterm_update::github::web_container_url_agrees`)
     /// REFUSES a manifest whose `url` is absent or does not name exactly
     /// `https://github.com/<slug>/releases/download/v<version>/<dmg_name>` for
@@ -115,10 +114,9 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
         linux_aarch64: None,
         linux_aarch64_sha256: None,
         linux_aarch64_size: None,
-        // RETIRED 2026-08-26: the Intel `aterm-<v>-x86_64.dmg` variant. The two
-        // wire keys stay in the shared `Manifest` type so already-published
-        // manifests keep parsing on every client, but this cutter never emits
-        // them again — absent keys are byte-for-byte the pre-pair manifest.
+        // The retired Intel `aterm-<v>-x86_64.dmg` variant. The two wire keys stay in the shared
+        // `Manifest` type so already-published manifests keep parsing on every client, but this
+        // cutter never emits them again — absent keys are byte-for-byte the pre-pair manifest.
         dmg_x86_64: None,
         dmg_x86_64_sha256: None,
         min_os: Some(i.min_os.to_string()),
@@ -131,9 +129,7 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
         // every field above is derived from the build, while these two are derived from
         // the machine's own minted identity and the master-signed roster that authorizes
         // it — inputs this pure, fixture-testable assembler deliberately does not resolve.
-        // With the paper master unpinned — a fork, or this tree before 2026-08-15, when
-        // this comment called it "the shipped state" — they stay `None`, and the emitted
-        // bytes are byte-identical to what this cutter has always produced.
+        // With the paper master unpinned (a fork) they stay `None`.
         machine_id: None,
         roster_seq: None,
         changelog: Some(body),
@@ -143,18 +139,11 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
 /// Serialize + prove the bytes BEFORE they can ship: the emitted text must
 /// round-trip through the shared `Manifest::parse` back to the exact value.
 /// Returns the proven bytes.
-///
-/// This used to ALSO parse the bytes under a struct vendored verbatim from
-/// v0.25, standing in for binaries already on users' machines. That bridge is
-/// gone: the two-component lineage it protected (v0.25-v0.61) is retired and
-/// cannot elect a `vMAJOR.MINOR.PATCH` release at all, so the check constrained
-/// the emitter on behalf of clients that could never install the result. The
-/// client-side round-trip above is the real gate.
 pub fn emit(m: &Manifest) -> Result<String> {
     let text = m.to_toml().map_err(Error::new)?;
-    // Round-trip through the CLIENT's parser (the same type the v0.26 updater
-    // compiles): an emission bug can never ship bytes the client reads back
-    // differently (spec decision 7).
+    // Round-trip through the CLIENT's parser (the same type the updater compiles):
+    // an emission bug can never ship bytes the client reads back differently (spec
+    // decision 7).
     let back = Manifest::parse(&text).map_err(|e| {
         Error::new(format!(
             "emitted manifest does not parse under the shared type: {e}"

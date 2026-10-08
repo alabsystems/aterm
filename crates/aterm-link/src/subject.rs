@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SUBJECT TAXONOMY (§3.3), as construction and as REFUSAL.
+//! The subject taxonomy (§3.3), as construction and as refusal.
 //!
 //! Every subject the bridge publishes is built here, and every subject it
 //! receives is parsed here. The parsing half is the load-bearing one: the `in`
@@ -17,9 +17,8 @@
 //! > segments, a `<src>` without an `s-|n-|h-|a-` prefix, or a `<sid>` it does
 //! > not host.
 //!
-//! The broker's own cap check already refuses the 8-segment publish (R4). This
-//! is the SECOND wall, and it is not redundant: the first is a property of the
-//! grant a sender happens to hold, the second a property of the receiver.
+//! The broker's cap check already refuses the 8-segment publish (R4); this is
+//! the second wall, a property of the receiver rather than of the sender's grant.
 
 /// The principal classes a `<src>` segment may carry (§3.2). A reserved literal
 /// segment (`node`, `presence`, `ev`, …) can never collide with one, which is
@@ -29,12 +28,8 @@ const CLASSES: [&str; 4] = ["s-", "n-", "h-", "a-"];
 /// The most bytes a principal can occupy: the two-byte class prefix plus the
 /// 32-byte name [`is_principal`] admits.
 ///
-/// EXPORTED BECAUSE A CALLER THAT BOUNDS A LIST OF PRINCIPALS MUST DERIVE ITS
-/// BOUND FROM THIS ONE. `via=` is a comma list of principals whose total length
-/// decides whether a `deliver` line fits, and a second number kept beside this
-/// one is exactly the disagreement §11.2's request-line bound exists to make
-/// impossible: three components each holding their own implicit limit for one
-/// value, with no place where they meet.
+/// A caller bounding a list of principals (`via=`) derives its bound from this,
+/// never from a second number.
 pub const PRINCIPAL_MAX: usize = CLASS_PREFIX_LEN + NAME_MAX;
 
 /// The class prefix every principal carries (`s-`, `n-`, `h-`, `a-`).
@@ -49,10 +44,9 @@ const TOPIC_MAX: usize = 32;
 
 /// Whether `t` is a well-formed BROADCAST TOPIC: `[a-z0-9][a-z0-9._-]{0,31}`.
 ///
-/// It is ONE subject segment, so it may not hold a `/`, and it must open with
-/// an alphanumeric so a topic can never be read as a flag or a relative path.
-/// `.` and `-` and `_` are allowed inside because a topic is a name people
-/// choose (`build.failed`, `sat-comp`), not an identifier this crate mints.
+/// One subject segment (no `/`), opening alphanumeric so it never reads as a
+/// flag or relative path; `.`, `-`, `_` inside because people choose topics
+/// (`build.failed`, `sat-comp`).
 #[must_use]
 pub fn is_topic(t: &str) -> bool {
     let mut cs = t.chars();
@@ -200,12 +194,10 @@ pub fn fleet_filter(fleet: &str) -> String {
 
 /// EVERY BROADCAST FACE IN THE FLEET, as one filter.
 ///
-/// One subscription, not one per topic: the receiver-side opt-in is a LOCAL
-/// decision (`topic add`), so subscribing per topic would put every session's
-/// topic set on the bus as subscription churn and would re-attach the face
-/// every time an agent changed its mind. The bridge reads the whole `say`
-/// subtree and fans in to the sessions that asked — which is also what makes
-/// "one record per broadcast, however many subscribers" true on the log.
+/// One subscription, not one per topic: opt-in (`topic add`) is local, so
+/// per-topic subscriptions would put every session's topic set on the bus as
+/// churn. The bridge reads the whole `say` subtree and fans in to the sessions
+/// that asked.
 #[must_use]
 pub fn say_filter(fleet: &str) -> String {
     format!("/f/{fleet}/pub/*/*/say/>")
@@ -222,11 +214,9 @@ pub struct SayAddr {
     pub topic: String,
 }
 
-/// Parse a broadcast subject, LEFT-ANCHORED AND BY POSITION — seven segments,
-/// `f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>` — exactly like
-/// [`parse_in`], and for the same reason: a filter is a wildcard match, so the
-/// only thing that makes an eight-segment forgery detectable is a parse that
-/// counts.
+/// Parse a broadcast subject left-anchored and by position — seven segments,
+/// `f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>` — like [`parse_in`]: a
+/// filter is a wildcard match, so only a counting parse detects a forgery.
 ///
 /// `None` for anything else, including a `pub` face that is not `say` — the
 /// filter cannot express "the sixth segment is `say`" on its own.
@@ -252,11 +242,9 @@ pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
 
 #[cfg(test)]
 mod tests {
-    /// **A TOPIC IS ONE SUBJECT SEGMENT.** `[a-z0-9][a-z0-9._-]{0,31}`: it must
-    /// open alphanumeric so it can never read as a flag or a relative path, it
-    /// may not hold a `/` because it IS a segment, and it is bounded for the
-    /// reason a principal's name is — a subject segment must not be able to
-    /// carry a sentence into an agent's context.
+    use super::*;
+
+    /// A topic is one bounded lowercase subject segment.
     #[test]
     fn a_topic_is_one_bounded_lowercase_segment() {
         for good in [
@@ -286,12 +274,8 @@ mod tests {
             assert!(!is_topic(bad), "{bad:?} must not be a topic");
         }
     }
-    use super::*;
 
-    /// [`PRINCIPAL_MAX`] IS THE GRAMMAR'S OWN CEILING, not a second number
-    /// beside it — a caller that bounds a comma LIST of principals (`via=` on the
-    /// `deliver` line) derives its byte cap from this constant, and a drift
-    /// between the two is how the round-1 request-line fix leaked.
+    /// [`PRINCIPAL_MAX`] is the longest principal the grammar admits.
     #[test]
     fn the_principal_ceiling_is_the_longest_principal_the_grammar_admits() {
         let longest = format!("n-{}", "a".repeat(NAME_MAX));
@@ -301,11 +285,8 @@ mod tests {
         assert!(!is_principal("n-"));
     }
 
-    /// THE 8-SEGMENT FORGERY, refused at the receiver. `…/in/n-a/s-b/s-1/h-andrew/answer`
-    /// has a right-anchored reading in which `h-andrew` is the sender — which is
-    /// exactly the sentence a compromised peer wants the endpoint to believe.
-    /// Parsing from the left makes it a malformed 8-segment subject and nothing
-    /// else, whatever its tail spells.
+    /// The 8-segment forgery is malformed, though a right-anchored reading
+    /// would name `h-andrew` as the sender.
     #[test]
     fn an_eight_segment_subject_is_malformed_however_its_tail_reads() {
         let forged = "/f/f1/in/n-a/s-b/s-1/h-andrew/answer";
@@ -324,10 +305,7 @@ mod tests {
         );
     }
 
-    /// Every other way the shape can be wrong, and each is the same refusal:
-    /// a foreign fleet or node, a `<sid>` that is not a session principal, a
-    /// `<src>` with no class prefix, an unknown kind, six segments, a missing
-    /// leading slash.
+    /// Every other wrong shape is the same refusal.
     #[test]
     fn the_shape_is_pinned_at_every_position() {
         for bad in [
@@ -346,8 +324,7 @@ mod tests {
         }
     }
 
-    /// Principals are bounded and class-prefixed, so nothing a sender chooses can
-    /// carry a sentence into an agent's context through an address.
+    /// Principals are bounded and class-prefixed.
     #[test]
     fn a_principal_is_bounded_and_class_prefixed() {
         assert!(is_principal("h-andrew") && is_principal("s-0123456789abcdef0123"));

@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOST SIDE OF A SESSION'S WAITS (design rulings 231–234): a large paste
-//! on its way to a program, and the scrollback rewrap after a width change.
-//! The policy, the words and the rows are the engine's
-//! ([`aterm_messages::waits`]); this module only MEASURES and PERFORMS:
+//! The host side of a session's waits: a large paste on its way to a program,
+//! and the scrollback rewrap after a width change. Policy, words and rows are
+//! the engine's ([`aterm_messages::waits`]); this module measures and performs:
 //!
-//! * **Measures.** A paste's bytes come from the writer side
-//!   ([`BulkMeter`], one relaxed store per `write(2)` slice); a rewrap's lines
-//!   from the worker ([`RewrapGauge`], one store per 50 000-line step). The
-//!   loop reads them when a sample falls due — [`aterm_messages::waits::WAIT_SAMPLE`]
-//!   while a row is up, [`aterm_messages::waits::WAIT_SAMPLE_IDLE`] otherwise —
-//!   and only while something is watched; with nothing watched it arms no
-//!   deadline at all (`DeadlineOwner::SessionWaits`, slot 41).
+//! * **Measures.** A paste's bytes come from the writer ([`BulkMeter`], one
+//!   relaxed store per `write(2)` slice); a rewrap's lines from the worker
+//!   ([`RewrapGauge`], one store per 50 000-line step). The loop reads them
+//!   when a sample falls due ([`aterm_messages::waits::WAIT_SAMPLE`] while a
+//!   row is up, [`aterm_messages::waits::WAIT_SAMPLE_IDLE`] otherwise), and
+//!   arms no deadline (`DeadlineOwner::SessionWaits`) while nothing is watched.
 //! * **Says who waits.** A paste's person waits while its session is on
 //!   screen; a rewrap's once they scroll back into the missing history or
 //!   search it (`App::note_history_wanted`).
@@ -25,16 +23,15 @@ use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use aterm_messages::waits::{self, SessionWait, WaitEnd, WaitSample, WaitStep};
-use aterm_messages::{Hold, Message, MessageId, Severity, tags};
+use aterm_messages::{Message, MessageId, Severity, tags};
 use aterm_session::sink::{BulkMeter, BulkState, SinkWriter};
 
 use crate::App;
 
 /// A session's rewrap progress, written by the reflow worker and read by the
 /// loop's sampler: plain atomics, neither side waits. One job at a time per
-/// session (the grid detaches nothing while a rewrap is in flight), plus the
-/// convergence passes that job may run (RFL-3), whose lines are added to the
-/// total so the fill never runs backwards.
+/// session, plus the convergence passes that job may run, whose lines are
+/// added to the total so the fill never runs backwards.
 #[derive(Debug, Default)]
 pub(crate) struct RewrapGauge {
     /// Lines of the passes already finished.
@@ -45,28 +42,28 @@ pub(crate) struct RewrapGauge {
     total: AtomicU64,
     /// Jobs in flight (0 or 1).
     running: AtomicUsize,
+    /// Jobs ever begun: a reader that sees it move between two readings knows
+    /// a rewrap overlapped them, even one that began and ended in between.
+    begun: AtomicU64,
     /// The job could not re-attach its history (a panicking rewrap).
     failed: AtomicBool,
     /// The job was cancelled with its session.
     cancelled: AtomicBool,
 }
 
-/// ONE REWRAP JOB'S HOLD ON ITS SESSION'S GAUGE (design ruling 236): minted
-/// by [`RewrapGauge::begin_job`] where the job is detached, carried with the
-/// job to whoever runs it, and ended exactly once. [`Self::finish`] says how
-/// the job ended; on EVERY other exit — an unwind outside the rewrap's own
-/// `catch_unwind` (the re-attach, the gauge's pass accounting), or a job that
-/// no thread ever took — its `Drop` ends the gauge `Failed`. A job left
-/// running would leave `rewrap_in_flight` true for the rest of the session:
-/// every search there a floor, and a rewrap row sampled at 4 Hz forever.
+/// One rewrap job's hold on its session's gauge: minted by
+/// [`RewrapGauge::begin_job`] where the job is detached, carried with the job
+/// and ended exactly once. [`Self::finish`] says how the job ended; on every
+/// other exit (an unwind outside the rewrap's own `catch_unwind`, or a job no
+/// thread took) `Drop` ends the gauge `Failed`. A job left running would keep
+/// `rewrap_in_flight` true for the rest of the session.
 #[derive(Debug)]
 pub(crate) struct RewrapJob {
     gauge: Arc<RewrapGauge>,
     end: WaitEnd,
 }
 
-/// A stopped paste's record (design ruling 231): its words, and ONE entry
-/// (ruling 265).
+/// A stopped paste's record: its words, as one entry.
 const PASTE_STOPPED: &str = "Paste stopped";
 
 impl RewrapJob {
@@ -88,7 +85,7 @@ impl Drop for RewrapJob {
 }
 
 /// One reading of a [`RewrapGauge`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RewrapReading {
     /// Lines rewrapped.
     pub(crate) done: u64,
@@ -96,13 +93,17 @@ pub(crate) struct RewrapReading {
     pub(crate) total: u64,
     /// A rewrap is in flight.
     pub(crate) running: bool,
+    /// Jobs begun over the session's life.
+    pub(crate) jobs: u64,
     /// How the last one ended, once it has.
     pub(crate) end: Option<WaitEnd>,
 }
 
 impl RewrapGauge {
-    /// A job of `lines` detached lines was handed to a worker (the loop
-    /// thread, at the hand-off).
+    /// A job of `lines` detached lines was handed to a worker. The resize
+    /// paths call it inside the term-lock hold that detached them, so a reader
+    /// that saw the detached grid under that lock sees `jobs` moved once it
+    /// lets go.
     pub(crate) fn begin(&self, lines: usize) {
         if self.running.fetch_add(1, Ordering::AcqRel) == 0 {
             self.base.store(0, Ordering::Relaxed);
@@ -112,6 +113,9 @@ impl RewrapGauge {
             self.cancelled.store(false, Ordering::Relaxed);
         }
         self.total.fetch_add(lines as u64, Ordering::Relaxed);
+        // After `running`, and read before it (`reading`): a reading that
+        // counts this job also sees it running, or ended.
+        self.begun.fetch_add(1, Ordering::AcqRel);
     }
 
     /// [`Self::begin`], held by a [`RewrapJob`] that ends it on every exit.
@@ -153,6 +157,7 @@ impl RewrapGauge {
     /// Now. Not named `read`: the lock-order census identifies a lock by that
     /// name, and this is a snapshot of atomics, not a guard.
     pub(crate) fn reading(&self) -> RewrapReading {
+        let jobs = self.begun.load(Ordering::Acquire);
         let running = self.running.load(Ordering::Acquire) > 0;
         let total = self.total.load(Ordering::Relaxed);
         let done = self
@@ -173,6 +178,7 @@ impl RewrapGauge {
             done,
             total,
             running,
+            jobs,
             end,
         }
     }
@@ -293,12 +299,11 @@ impl App {
         self.schedule_session_waits(now);
     }
 
-    /// `Stop paste` (design ruling 231): every watched paste into `session`
-    /// drops what it has not yet sent — one still queued sends nothing, the
-    /// one being written is cut into a well-formed frame
-    /// (`SinkWriter::write_frame_metered_with_receipt`) — and input queued
-    /// after them goes through in order. The row fades at once; the record
-    /// says how much went. `false` when nothing was pasting there.
+    /// `Stop paste`: every watched paste into `session` drops what it has not
+    /// sent (a queued one sends nothing; the one being written is cut into a
+    /// well-formed frame by `SinkWriter::write_frame_metered_with_receipt`),
+    /// and input queued after them goes through in order. The row fades at
+    /// once; the record says how much went. `false` when nothing was pasting.
     pub(crate) fn stop_paste(&mut self, session: u64) -> bool {
         let Some(mut watch) = self.session_waits.pastes.remove(&session) else {
             return false;
@@ -320,11 +325,10 @@ impl App {
             waits::size_words(sent),
             waits::size_words(total)
         )];
-        // ONE ENTRY PER PASTE (design ruling 265): the row that stood on the
-        // band BECOMES the record `Paste stopped` (it fades, as a stop claims
-        // nothing) — never a withdrawn `Pasting 4.2 MB` that read as still
-        // running beside a second record saying it stopped. A paste stopped
-        // before its row was posted is written down alone.
+        // One entry per paste: the row on the band becomes the `Paste stopped`
+        // record (it fades, as a stop claims nothing), never a withdrawn
+        // `Pasting 4.2 MB` beside a second record. A paste stopped before its
+        // row was posted is written down alone.
         match watch.row.take() {
             Some(id)
                 if self
@@ -337,7 +341,7 @@ impl App {
                 self.record_message(
                     Message::new(tags::SESSION, Severity::Info, PASTE_STOPPED)
                         .lines(detail)
-                        .hold(Hold::LogOnly),
+                        .record(),
                 );
             }
         }
@@ -345,8 +349,8 @@ impl App {
     }
 
     /// The person scrolled back into `session`'s history or searched it: if
-    /// its scrollback is being rewrapped they are waiting on that (design
-    /// ruling 233), and its row is wanted from now.
+    /// its scrollback is being rewrapped they are waiting on that, and its row
+    /// is wanted from now.
     pub(crate) fn note_history_wanted(&mut self, session: u64) {
         let Some(gauge) = self.pool.get(session).map(|s| s.ctx.rewrap_gauge.clone()) else {
             return;
@@ -367,8 +371,8 @@ impl App {
         self.sample_session_waits(now);
     }
 
-    /// Whether `session`'s scrollback is detached for a rewrap now (the
-    /// search's honesty, ruling 234).
+    /// Whether `session`'s scrollback is detached for a rewrap now (searches
+    /// then report a floor).
     pub(crate) fn rewrap_in_flight(&self, session: u64) -> bool {
         self.pool
             .get(session)
@@ -538,7 +542,7 @@ mod tests {
     fn app_with_reader() -> (App, Arc<SinkWriter>, UnixStream) {
         let (reader, writer) = UnixStream::pair().expect("socketpair");
         reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
             .expect("timeout");
         let sink = Arc::new(SinkWriter::new_owned(writer.into()));
         let mut app = App::headless_for_test_with_sink(sink.clone());
@@ -559,15 +563,15 @@ mod tests {
     }
 
     fn drained(sink: &SinkWriter) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while sink.ordered_egress_count() != 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(sink.ordered_egress_count(), 0, "the ordered queue drains");
     }
 
-    /// A SMALL PASTE NEVER SHOWS A ROW (ruling 231): under 64 KiB it is not
-    /// even watched, so it arms no sample and posts nothing.
+    /// A small paste (under 64 KiB) is not watched: it arms no sample and
+    /// posts nothing.
     #[test]
     fn a_small_paste_never_shows_a_row() {
         let (mut app, sink, mut reader) = app_with_reader();
@@ -582,10 +586,9 @@ mod tests {
         assert_eq!(app.messages.live_rows().count(), 0);
     }
 
-    /// A REWRAP JOB ENDS ON EVERY EXIT (ruling 236): finished, it ends as it
-    /// says; unwound past the rewrap's own guard (a panicking re-attach), or
-    /// never taken by any thread, its hold ends the gauge `Failed` — never a
-    /// gauge left running, which would make every later search a floor.
+    /// A rewrap job ends on every exit: finished, it ends as it says; unwound
+    /// past the rewrap's own guard or never taken by any thread, its hold ends
+    /// the gauge `Failed`, never left running.
     #[test]
     fn a_rewrap_job_ends_on_every_exit() {
         use aterm_messages::WaitEnd;
@@ -620,12 +623,16 @@ mod tests {
         assert!(gauge.reading().running);
         drop(slot);
         assert_eq!(gauge.reading().end, Some(WaitEnd::Failed));
+        assert_eq!(
+            gauge.reading().jobs,
+            3,
+            "every job counted, however it ended"
+        );
     }
 
-    /// A LARGE PASTE THE SANITIZER EMPTIES ENDS AT ONCE (ruling 236): 64 KiB
-    /// of controls, unbracketed, comes to no byte on the wire. Its meter is
-    /// settled by the seam, so the watch ends at the next sample with no row,
-    /// no echo and no deadline left armed.
+    /// A large paste the sanitizer empties (64 KiB of controls, unbracketed)
+    /// puts no byte on the wire; its meter is settled by the seam, so the watch
+    /// ends at the next sample with no row, no echo and no deadline armed.
     #[test]
     fn a_large_paste_the_sanitizer_empties_ends_with_no_row() {
         let (mut app, sink, _reader) = app_with_reader();
@@ -647,13 +654,12 @@ mod tests {
         assert!(app.messages.echoes().is_empty(), "no echo");
     }
 
-    /// THE PASTE'S ROW AND ITS STOP (rulings 231, 232): a large paste into a
-    /// program that is not reading is watched; its row is progress with the
-    /// one `Stop paste` capsule, posted inside the grace from the paste's
-    /// start and filled by the bytes the program has taken. `Stop paste`
-    /// fades the row, drops the unsent middle, closes the bracketed paste,
-    /// and the key typed after the paste — queued behind it, never ahead —
-    /// arrives next.
+    /// A large paste into a program that is not reading is watched; its row is
+    /// progress with the one `Stop paste` capsule, posted within the grace from
+    /// the paste's start and filled by the bytes the program has taken. `Stop
+    /// paste` fades the row, drops the unsent middle, closes the bracketed
+    /// paste, and the key typed after the paste (queued behind it) arrives
+    /// next.
     #[test]
     fn a_large_paste_takes_its_row_and_stop_drops_only_its_rest() {
         let (mut app, sink, mut reader) = app_with_reader();
@@ -661,15 +667,9 @@ mod tests {
         paste(&mut app, body);
         app.input(WindowId(0), InputEvent::Text("K".into()), Source::Human);
         assert_eq!(app.session_waits.pastes.len(), 1, "watched");
-        // THE FIRST SAMPLE IS DATED FROM THE PASTE, NOT READ OFF THE CLOCK AFTER
-        // IT (the load-sensitive test audit of 2026-09-27). `t0` was
-        // `Instant::now()` taken after the 1 MiB paste and a key had been
-        // queued, so a test thread stalled a second in between left less than
-        // half the grace and failed a correct tree. The sample's instant is the
-        // loop's to choose — the tests above pass `now + grace * 5` — so it is
-        // placed a quarter of the grace after the paste's own `started`, and
-        // what the row must say is then exact: three quarters of the grace
-        // left, which a grace counted from the sample (all of it) cannot say.
+        // Date the first sample from the paste's own `started`, not from the
+        // clock after it, so a stalled test thread cannot eat the grace: a
+        // quarter of the grace after `started` leaves exactly three quarters.
         let started = app.session_waits.pastes[&0].started;
         let t0 = started + PROGRESS_GRACE / 4;
         assert!(
@@ -698,7 +698,7 @@ mod tests {
         // The program takes a prefix; the row follows the writer's count.
         let mut got = vec![0u8; 256 * 1024];
         reader.read_exact(&mut got).expect("a prefix");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let stats = loop {
             app.sample_session_waits(Instant::now());
             let meter = app
@@ -713,7 +713,6 @@ mod tests {
         };
         assert!(stats.ends_with("/ 1.0 MB"), "{stats}");
         assert!(!stats.trim_start().starts_with("0 B"), "{stats}");
-        // Stop paste.
         assert!(app.perform_intent(WindowId(0), id, Intent::StopPaste { session: 0 }));
         assert!(app.session_waits.pastes.is_empty(), "no longer watched");
         assert_eq!(app.messages.live_rows().count(), 0, "the row fades");
@@ -747,8 +746,8 @@ mod tests {
                 .any(|l| l.contains("Paste%20stopped") || l.contains("Paste stopped")),
             "{log:?}"
         );
-        // ONE entry (ruling 265): the row became the record; no withdrawn
-        // `Pasting 1.0 MB` beside it, and its dead `Stop paste` is not offered.
+        // One entry: the row became the record; no withdrawn `Pasting 1.0 MB`
+        // beside it, and its dead `Stop paste` is not offered.
         let state = app.messages_state();
         assert_eq!(state.entries.len(), 1, "{:?}", state.entries);
         let entry = &state.entries[0];
@@ -797,8 +796,8 @@ mod tests {
         let echo = app.messages.echoes().first().expect("the echo");
         assert_eq!(echo.kind, EchoKind::Complete);
         assert_eq!(echo.msg.finished_title(), "Pasted 1.0 MB");
-        // Its record (ruling 265): the finished words under ✓ Success, no
-        // in-flight frame, and no `Stop paste` left to press.
+        // Its record: the finished words under ✓ Success, no in-flight frame,
+        // and no `Stop paste` left to press.
         let state = app.messages_state();
         let entry = &state.entries[0];
         assert_eq!(entry.title, "Pasted 1.0 MB");
@@ -812,10 +811,10 @@ mod tests {
         );
     }
 
-    /// THE REWRAP'S TRIGGER (ruling 233): a width change's rewrap nobody
-    /// scrolls back into takes no row and arms nothing; a scroll toward
-    /// history while it runs posts `Rewrapping scrollback` after the grace,
-    /// restated with the lines done, and the re-attach ends it Complete.
+    /// A width change's rewrap nobody scrolls back into takes no row and arms
+    /// nothing; a scroll toward history while it runs posts `Rewrapping
+    /// scrollback` after the grace, restated with the lines done, and the
+    /// re-attach ends it Complete.
     #[test]
     fn a_rewrap_takes_a_row_only_when_the_person_reaches_for_history() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -826,7 +825,7 @@ mod tests {
         app.sample_session_waits(Instant::now());
         assert!(app.session_waits.rewraps.is_empty());
         assert_eq!(app.session_waits_deadline(), None, "nothing armed");
-        // Scrolling DOWN is not reaching for history.
+        // Scrolling down is not reaching for history.
         app.input(
             WindowId(0),
             InputEvent::ScrollView(ScrollIntent::Down),
@@ -847,7 +846,7 @@ mod tests {
         );
         let live = app.messages.live_rows().next().expect("the rewrap's row");
         let id = live.id;
-        // The wait's size, said once (ruling 246): `Rewrapping N lines`.
+        // The wait's size, said once: `Rewrapping N lines`.
         assert!(
             live.msg.title.starts_with("Rewrapping ") && live.msg.title.ends_with(" lines"),
             "{}",
@@ -889,11 +888,10 @@ mod tests {
         assert_eq!(echo.msg.finished_title(), REWRAPPED);
     }
 
-    /// THE SEARCH'S HONESTY (rulings 234, 237): a search while the history is
-    /// detached is a floor — `truncated` on the wire — and the bar and the
-    /// title say `none yet, history rewrapping` (never `no matches`); the
-    /// person searching is waiting on the rewrap, so its row is posted; and
-    /// at the re-attach the search runs again by itself.
+    /// A search while the history is detached is a floor (`truncated` on the
+    /// wire); the bar and the title say `none yet, history rewrapping` (never
+    /// `no matches`); the searcher is waiting on the rewrap, so its row is
+    /// posted; and at the re-attach the search runs again by itself.
     #[test]
     fn a_search_during_a_rewrap_says_partial_history_and_runs_again() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -911,7 +909,7 @@ mod tests {
             .as_ref()
             .expect("search")
             .window_title();
-        // Ruling 237: the history is away, not empty of the text.
+        // The history is away, not empty of the text.
         assert!(title.ends_with("(none yet, history rewrapping)"), "{title}");
         assert!(!title.contains("no matches"), "{title}");
         assert_eq!(
@@ -946,11 +944,10 @@ mod tests {
         assert_eq!(plain.messages.live_rows().count(), 0);
     }
 
-    /// A TORN RERUN DOES NOT KEEP SAYING `rewrapping` (ruling 240): the
-    /// re-attach runs the search again, and under streaming output both
-    /// full-history passes can come back inconsistent. The stale result is
-    /// kept (dirty, still a floor), but the history is home, so the bar and
-    /// the title stop saying the history is away.
+    /// A torn rerun stops saying `rewrapping`: under streaming output both
+    /// full-history passes of the re-attach rerun can come back inconsistent.
+    /// The stale result is kept (dirty, still a floor), but the history is
+    /// home, so the bar and the title stop saying it is away.
     #[test]
     fn a_torn_rerun_after_the_rewrap_does_not_keep_saying_rewrapping() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -980,18 +977,15 @@ mod tests {
         let title = search.window_title();
         assert!(!title.contains("rewrapping"), "{title}");
         assert!(
-            title.ends_with("(no matches+…)"),
+            title.ends_with("(no matches, partial history, stale)"),
             "an ordinary stale floor: {title}"
         );
     }
 
-    /// A GLIDE NEVER COMPOUNDS INTO THE AIM (ruling 240): a notch glide in
-    /// flight when a width change detaches the history used to re-issue its
-    /// unfinished distance on every wake (the viewport rests at the attached
-    /// top, so the glide never reached its row), and the aim grew by the
-    /// sum. The resize now lands the glide first, so the detach restores the
-    /// place it was going to; and a glide that meets a detach it did not see
-    /// coming (a `ctl resize` off the loop) settles once.
+    /// A notch glide in flight when a width change detaches the history does
+    /// not compound into the aim: the resize lands the glide first, so the
+    /// detach restores the place it was going to, and a glide that meets an
+    /// unforeseen detach (a `ctl resize` off the loop) settles once.
     #[test]
     fn a_glide_across_a_rewrap_lands_on_its_target_not_the_sum_of_its_ticks() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -1019,7 +1013,7 @@ mod tests {
             app.windows[&wid].scroll_glide.is_none(),
             "the glide landed before the detach"
         );
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while crate::term_lock(&term).grid().reflow_offload_in_flight() {
             assert!(Instant::now() < deadline, "the rewrap re-attaches");
             std::thread::sleep(Duration::from_millis(2));
@@ -1066,12 +1060,9 @@ mod tests {
         );
     }
 
-    /// THE FINGER MOVES THE VIEW ONCE DURING A REWRAP (ruling 240): a
-    /// trackpad's sub-row deltas used to arm the tracked band, whose rows
-    /// landed on the reader primitive while the same pixels also banked into
-    /// the whole rows the ruling-238 route applies — every row twice. Now the
-    /// bank alone carries the finger while the history is away: 3.3 rows of
-    /// finger over the rows output attached during the window is 3 rows.
+    /// A trackpad moves the view once during a rewrap: while the history is
+    /// away, sub-row deltas bank into whole rows and nothing else lands them,
+    /// so 3.3 rows of finger over the rows output attached is 3 rows.
     #[test]
     fn a_trackpad_swipe_during_a_rewrap_moves_the_view_by_the_finger_once() {
         use winit::dpi::PhysicalPosition;
@@ -1229,11 +1220,10 @@ mod tests {
         app.sample_session_waits(Instant::now() + WAIT_SAMPLE_IDLE);
     }
 
-    /// THE ASK SURVIVES THE REWRAP (ruling 238): a wheel up while the history
-    /// is away moves nothing — there is nothing above to show — but the view
-    /// lands where it was asked to at the re-attach, with no second scroll and
-    /// no jump the person did not ask for. A keystroke in between is them
-    /// coming back to the prompt, and the re-attach leaves them there.
+    /// A wheel up while the history is away moves nothing (there is nothing
+    /// above to show), but the view lands where it was asked at the re-attach,
+    /// with no second scroll or unasked jump. A keystroke in between returns
+    /// the person to the prompt, and the re-attach leaves them there.
     #[test]
     fn a_scroll_up_during_a_rewrap_lands_where_it_asked_at_the_reattach() {
         use aterm_types::mouse::WheelDir;

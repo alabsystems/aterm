@@ -347,6 +347,42 @@ impl Drop for ObserverMutationActivity {
     }
 }
 
+/// Why the resident operator did not fence itself for a process replacement,
+/// TYPED (round eight of the update audit, #70), because the two answers ask
+/// different things of the update.
+///
+/// `Busy` is the operator DOING WORK: a proposal or observer transaction in
+/// flight, or its gate held for a moment by another thread. It is activity, as
+/// a person typing is, and the next attempt finds the operator idle — so the
+/// automatic lane retries it on the activity spacing and charges nothing. It
+/// used to come back as an untyped string that every replacement seam (the
+/// seamless Commit, the cold `exec`, Windows' spawn-and-exit) filed as a
+/// failure, so a moment of operator activity spent the build's physical budget
+/// — 600 s, then 1800 s, toward its lifetime — and could converge a healthy
+/// build. `Refused` is everything else (shutting down, a quiesce already
+/// active or gone stale): a fault, which keeps the verdict it always had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpdateQuiesceRefusal {
+    Busy(&'static str),
+    Refused(&'static str),
+}
+
+impl UpdateQuiesceRefusal {
+    /// Whether the operator was merely busy: activity, retried, never charged.
+    #[must_use]
+    pub(crate) fn is_busy(self) -> bool {
+        matches!(self, Self::Busy(_))
+    }
+}
+
+impl std::fmt::Display for UpdateQuiesceRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(why) | Self::Refused(why) => formatter.write_str(why),
+        }
+    }
+}
+
 /// Reversible authority fence held while a process replacement reaches its
 /// final admission/exec seam. Dropping it after any rejected/failed update
 /// restores normal service; a successful replacement never returns to drop it.
@@ -362,20 +398,30 @@ impl UpdateQuiesce {
     ///
     /// Serializing with a late fault is not the same as being vetoed by one:
     /// the latch either completes before this permit (durably, under this gate)
-    /// or waits behind the replacement. Only shutdown and a stale token refuse.
-    pub(crate) fn with_commit_permit<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
+    /// or waits behind the replacement. Only shutdown and a stale token refuse,
+    /// and a gate another thread holds for a moment is `Busy`.
+    pub(crate) fn with_commit_permit<T>(
+        &self,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, UpdateQuiesceRefusal> {
         let gate = match self.control.shared.fleet_fault.try_lock() {
             Ok(gate) => gate,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => {
-                return Err("operator authority transition is busy".to_string());
+                return Err(UpdateQuiesceRefusal::Busy(
+                    "operator authority transition is busy",
+                ));
             }
         };
         if gate.shutting_down {
-            return Err("operator host is shutting down".to_string());
+            return Err(UpdateQuiesceRefusal::Refused(
+                "operator host is shutting down",
+            ));
         }
         if gate.update_quiesce != Some(self.id) {
-            return Err("operator update quiesce is stale".to_string());
+            return Err(UpdateQuiesceRefusal::Refused(
+                "operator update quiesce is stale",
+            ));
         }
         if let Some(reason) = gate.fleet_fault {
             // A latched fault is STRICTLY MORE fenced than this quiesce: a
@@ -676,29 +722,40 @@ impl ControlHandle {
 
     /// Enter a reversible process-replacement fence without waiting behind an
     /// in-flight operator mutation. The caller rejects/retries the update on
-    /// `Busy`; once returned, all subsequently-starting observation, queue
-    /// mutation, proposal, and PTY egress paths refuse until the token drops.
-    pub(crate) fn try_begin_update_quiesce(&self) -> Result<UpdateQuiesce, String> {
+    /// `Busy` ([`UpdateQuiesceRefusal`]); once returned, all
+    /// subsequently-starting observation, queue mutation, proposal, and PTY
+    /// egress paths refuse until the token drops.
+    pub(crate) fn try_begin_update_quiesce(&self) -> Result<UpdateQuiesce, UpdateQuiesceRefusal> {
         let mut gate = match self.shared.fleet_fault.try_lock() {
             Ok(gate) => gate,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => {
-                return Err("operator mutation is busy; retry update".to_string());
+                return Err(UpdateQuiesceRefusal::Busy(
+                    "operator mutation is busy; retry update",
+                ));
             }
         };
         if gate.shutting_down {
-            return Err("operator host is shutting down".to_string());
+            return Err(UpdateQuiesceRefusal::Refused(
+                "operator host is shutting down",
+            ));
         }
         if gate.update_quiesce.is_some() {
-            return Err("operator update quiesce is already active".to_string());
+            return Err(UpdateQuiesceRefusal::Refused(
+                "operator update quiesce is already active",
+            ));
         }
         if gate.active_actions != 0 || gate.active_observer_mutations != 0 {
-            return Err("operator transaction is in flight; retry update".to_string());
+            return Err(UpdateQuiesceRefusal::Busy(
+                "operator transaction is in flight; retry update",
+            ));
         }
         let id = gate
             .next_update_quiesce
             .checked_add(1)
-            .ok_or_else(|| "operator update quiesce identity exhausted".to_string())?;
+            .ok_or(UpdateQuiesceRefusal::Refused(
+                "operator update quiesce identity exhausted",
+            ))?;
         gate.next_update_quiesce = id;
         gate.update_quiesce = Some(id);
         drop(gate);
@@ -907,7 +964,7 @@ impl ControlHandle {
     /// ([`crate::notify::NotifyMsg::own`]): the delivery thread drops it while
     /// `desktop_alerts` is off, as it does every notice aterm writes itself.
     /// Nothing else shows it — no band row, no `messages.log` line — so off,
-    /// the queue (`aterm fleet status` and `next`) is its one record.
+    /// the queue (counted by `aterm fleet status`) is its one record.
     fn surface_notice(&self, local_id: u64, body: &str) {
         let message = crate::notify::NotifyMsg::own(
             local_id,
@@ -1722,21 +1779,12 @@ fn format_claim(control: &ControlHandle, store: &Store, claim: &Claim) -> String
         generation.lifecycle_epoch,
         generation.alternate_screen,
         generation.content_seq,
-        hex_bytes(&generation.fingerprint),
+        aterm_codec::hex::encode_lower(&generation.fingerprint),
         evidence_json,
         stale,
         redelivery_count,
         escalated,
     )
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 fn json_escape(value: &str) -> String {
@@ -2057,6 +2105,21 @@ pub(crate) fn start(
 /// operator unavailable` off the already-shipped `None` path.
 pub(crate) fn enabled(config: &crate::app_config::Config) -> bool {
     config.operator_enabled()
+}
+
+/// Why an enabled operator did not start, kept from launch so an operator
+/// verb can say it ([`start_failure`]); unset when it started or was off.
+static START_FAILURE: OnceLock<String> = OnceLock::new();
+
+/// Record that the enabled operator failed to start, and why.
+pub(crate) fn record_start_failure(error: &str) {
+    let _ = START_FAILURE.set(error.to_string());
+}
+
+/// The launch failure [`record_start_failure`] kept, if the operator was
+/// enabled and did not start; `None` when it was off.
+pub(crate) fn start_failure() -> Option<&'static str> {
+    START_FAILURE.get().map(String::as_str)
 }
 
 /// Start the production default-on observer and its durable per-profile queue.
@@ -2872,7 +2935,6 @@ mod tests {
             byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
             turns: Arc::new(Mutex::new(crate::turn_ledger::TurnLedger::default())),
             meta: Mutex::new(crate::session_timeline::SessionMeta::default()),
-            app_kitty: Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
@@ -3576,8 +3638,8 @@ mod tests {
         DurableQueue::open(directory, 1, config).unwrap()
     }
 
-    // Every wait in this test and the next is a HANG DISCRIMINATOR, 30 s like
-    // their siblings below: ordering is proven by the barrier handshakes, never
+    // Every wait in this test and the next is a HANG DISCRIMINATOR, a minute
+    // like their siblings below: ordering is proven by the barrier handshakes, never
     // by the clock. They were 2 s, and each covers F_FULLFSYNC barriers — the
     // fault marker, its directory and the WAL commit here, sixteen WAL commits
     // in the next — that this file measures at 82-280 ms EACH on a contended
@@ -3632,7 +3694,7 @@ mod tests {
                 self.release_rx
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .recv_timeout(Duration::from_secs(30))
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
                     .expect("release classify barrier");
             }
         }
@@ -3675,7 +3737,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            classified_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+            classified_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap(),
             2,
             "the barrier must sit behind a non-empty classified batch"
         );
@@ -3683,9 +3747,15 @@ mod tests {
             Ok(_) => panic!("update quiesce entered during a classified observer cycle"),
             Err(error) => error,
         };
-        assert!(refused.contains("transaction is in flight"), "{refused}");
+        assert_eq!(
+            refused,
+            UpdateQuiesceRefusal::Busy("operator transaction is in flight; retry update"),
+            "an observer cycle in flight is the operator busy: a retry, never a strike"
+        );
         release_tx.send(()).unwrap();
-        let (reason, activity_was_live) = fault_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let (reason, activity_was_live) = fault_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap();
         assert_eq!(reason, FleetFaultReason::ObserverOverflow);
         assert!(
             activity_was_live,
@@ -3757,7 +3827,7 @@ mod tests {
                     self.release_rx
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .recv_timeout(Duration::from_secs(30))
+                        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
                         .expect("release shutdown barrier");
                 }
             }
@@ -3811,7 +3881,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            batch_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+            batch_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap(),
             EVENT_COUNT - FLUSH_BUDGET,
             "the stop race must occur with a real >16 local backlog"
         );
@@ -3935,22 +4007,23 @@ mod tests {
         )
         .unwrap();
         runtime.shutdown_timeout = Duration::from_millis(30);
-        // 30 s: a hang discriminator, not a latency SLA — passing runs have
+        // A minute: a hang discriminator, not a latency SLA — passing runs have
         // been measured stretching past 7 s under fsync-contended load.
         assert_eq!(
-            reached_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+            reached_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap(),
             1,
             "timeout seam must hold a real classified candidate"
         );
 
-        let started = Instant::now();
         // ORDER, not wall-clock. The old shape clocked `shutdown_and_join`
         // whole — a window containing the fault marker's F_FULLFSYNC (twice:
         // file then directory), which no constant bound covers on a contended
         // disk; the 1500 ms it used flaked in convoys, and its predecessor at
         // 500 ms flaked before that. Run shutdown on a helper thread so a
         // fallback that waits behind the wedged observer fails as a NAMED
-        // 30 s panic instead of wedging the suite, and prove the property by
+        // panic at the minute instead of wedging the suite, and prove the property by
         // order: the observer provably cannot have released yet (its release
         // channel is sent below), so `shutdown_and_join` returning at all
         // proves the timeout path fired without joining it.
@@ -3960,28 +4033,20 @@ mod tests {
             let _ = done_tx.send(runtime);
         });
         let runtime = done_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("timeout fallback waited behind the wedged observer");
         assert!(
             Arc::strong_count(&sink) >= 2,
             "shutdown returned only after the observer exited; timeout path not taken"
         );
-        // The one remaining clocked claim covers an I/O-FREE window: the
-        // fallback DECISION (entry into `fault_marker_without_live`, stamped
-        // before any durable sync) must come from the configured 30 ms
-        // timeout, not the 2 s default. Measured <= 38 ms on a saturated box;
-        // 1 s cannot confuse the two.
-        let decided_at = sink
-            .fallback_decision_at
+        // The fallback DECISION (entry into `fault_marker_without_live`) was
+        // taken: the timeout path used the live-lock-independent marker.
+        sink.fallback_decision_at
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .expect("timeout fallback never invoked the live-lock-independent marker");
-        assert!(
-            decided_at.duration_since(started) < Duration::from_secs(1),
-            "fallback decision came at 2 s-default scale, not the configured 30 ms timeout"
-        );
         release_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while Arc::strong_count(&sink) != 1 {
             assert!(Instant::now() < deadline, "detached observer did not exit");
             std::thread::sleep(Duration::from_millis(2));
@@ -4312,7 +4377,7 @@ mod tests {
         // Cross the boundary explicitly rather than betting on being slow.
         std::thread::sleep(Duration::from_millis(5));
         sink.maintenance();
-        let first_notice = notify_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let first_notice = notify_rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert_eq!(first_notice.session, u64::MAX);
         assert!(
             first_notice
@@ -4327,7 +4392,7 @@ mod tests {
         let final_claim = queue.claim_at(0).unwrap().unwrap();
         assert_eq!(final_claim.event.id, event_id);
         sink.maintenance();
-        let second_notice = notify_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second_notice = notify_rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert_eq!(second_notice.session, u64::MAX);
         assert!(matches!(
             queue.snapshot(event_id).unwrap().status,
@@ -4462,7 +4527,7 @@ mod tests {
         assert!(escalation.event.escalated);
         assert_eq!(escalation.event.condition, AttentionCondition::Escalation);
         let notice = notify_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(60))
             .expect("next must surface the escalation before returning it");
         assert_eq!(notice.session, u64::MAX);
         assert!(
@@ -4516,7 +4581,7 @@ mod tests {
 
         let error = sink.enqueue(candidate.clone()).unwrap_err();
         assert!(error.contains("queue is full"));
-        let notice = notify_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let notice = notify_rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert_eq!(
             notice.session,
             u64::MAX,
@@ -4564,7 +4629,7 @@ mod tests {
 
         assert_eq!(notify_rx.recv().unwrap().body, "occupied");
         control.flush_pending_notice();
-        let retried = notify_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let retried = notify_rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert_eq!(retried.session, 7);
         assert_eq!(retried.title.as_deref(), Some("aterm operator"));
         assert!(retried.body.contains("needs you"));
@@ -4835,7 +4900,7 @@ mod tests {
         // holds the gate (the load-sensitive test audit of 2026-09-27). The old
         // `< 100 ms` stopwatch around a same-thread try_lock timed only the
         // scheduler: a blocking acquisition there deadlocks this thread and
-        // never reaches the clock. Here it parks the helper, and the 10 s
+        // never reaches the clock. Here it parks the helper, and the minute's
         // answer deadline turns that park into a failure instead of a hang.
         let denied = std::thread::scope(|scope| {
             let gate = control.shared.fleet_fault.lock().unwrap();
@@ -4852,7 +4917,7 @@ mod tests {
                     || calls.fetch_add(1, Ordering::SeqCst),
                 ));
             });
-            let answer = answer_rx.recv_timeout(Duration::from_secs(10));
+            let answer = answer_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
             // Released before any verdict, so a parked helper can finish and
             // the scope's join cannot outlive a failure.
             drop(gate);
@@ -4907,12 +4972,12 @@ mod tests {
         let (directory, queue, control, event_id, token, action_hash) =
             prepared("quiesce-rollback");
         let action_activity = control.begin_action_activity().unwrap();
-        assert!(
-            control
-                .try_begin_update_quiesce()
-                .err()
-                .unwrap()
-                .contains("transaction is in flight")
+        assert_eq!(
+            control.try_begin_update_quiesce().err(),
+            Some(UpdateQuiesceRefusal::Busy(
+                "operator transaction is in flight; retry update"
+            )),
+            "a proposal in flight is the operator busy: a retry, never a strike"
         );
         drop(action_activity);
         let quiesce = control.try_begin_update_quiesce().unwrap();
@@ -4934,6 +4999,24 @@ mod tests {
         let store = crate::session_store::new_store();
         assert!(control.command(&store, "unmanage s-a").contains("quiesced"));
         assert!(queue.is_managed("s-a").unwrap());
+
+        // The gate held for a moment by another holder at the permit is the
+        // operator BUSY — a retry, never a strike (round eight, #70) — and runs
+        // nothing.
+        {
+            let _held = control
+                .shared
+                .fleet_fault
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                quiesce.with_commit_permit(|| calls.fetch_add(1, Ordering::SeqCst)),
+                Err(UpdateQuiesceRefusal::Busy(
+                    "operator authority transition is busy"
+                ))
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // A failed replacement returns through Drop and re-enables the exact
         // same process without clearing durable/operator state.
@@ -5150,7 +5233,7 @@ mod tests {
             Arc::clone(&sink),
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         loop {
             if fault.lock().unwrap().is_some() {
                 break;

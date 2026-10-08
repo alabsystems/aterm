@@ -7,7 +7,8 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_core::selection::{SelectionSide, SelectionType};
+use aterm_core::render::RenderInput;
+use aterm_core::selection::{SelectionSide, SelectionType, TextSelection};
 use aterm_core::terminal::Terminal;
 use aterm_effects::kitty_pet::{PetAction, PetBrain, PetFrame, PetInputKind, PetSense, art_cols};
 use aterm_effects::pet_world::{PetCell, PetPane, PetRect, PetWorld, PetWorldFacts};
@@ -16,6 +17,26 @@ use aterm_lexicon::Lexicon;
 
 const ROWS: u16 = 58;
 const COLS: u16 = 116;
+
+/// A tick's snapshot of the terminal, keyed by everything it is read from.
+///
+/// WHY (2026-10-05): the particles test ticks 5,746 frames and the program
+/// writes on one in 32, yet every tick took a full `cell_frame`, 30% of the
+/// file's CPU (`sample`). The snapshot is a pure function of the terminal:
+/// output (`screen_mutations`, the product's "nothing reached the screen"
+/// witness), the selection and the facts. A tick whose key is unchanged
+/// hands the brain and the scanner the last one; both still run every frame.
+/// Checked at every tick of the file's three scene tests before the checks
+/// were removed: equal to a fresh `cell_frame` (content and every metadata
+/// field but `row_rev`, the per-read revision lane neither reads), and the
+/// facts, read first now because the key needs them, equal to the facts read
+/// after a `cell_frame`. The file, alone on one thread: 2.34 -> 1.75 CPU-s.
+struct Seen {
+    mutations: u64,
+    selection: TextSelection,
+    facts: PetWorldFacts,
+    input: RenderInput,
+}
 
 struct Scene {
     term: Terminal,
@@ -26,6 +47,7 @@ struct Scene {
     now: Instant,
     rows: u16,
     cols: u16,
+    seen: Option<Seen>,
 }
 
 impl Scene {
@@ -52,6 +74,7 @@ impl Scene {
             now: Instant::now(),
             rows,
             cols,
+            seen: None,
         }
     }
 
@@ -79,12 +102,26 @@ impl Scene {
 
     fn tick(&mut self) -> PetFrame {
         self.now += Duration::from_millis(16);
-        let input = self
-            .term
-            .cell_frame(usize::from(self.rows), usize::from(self.cols));
         let facts = PetWorldFacts::read(&self.term, 7);
+        let mutations = self.term.screen_mutations();
+        if !self.seen.as_ref().is_some_and(|s| {
+            s.mutations == mutations
+                && s.facts == facts
+                && &s.selection == self.term.text_selection()
+        }) {
+            let input = self
+                .term
+                .cell_frame(usize::from(self.rows), usize::from(self.cols));
+            self.seen = Some(Seen {
+                mutations,
+                selection: self.term.text_selection().clone(),
+                facts,
+                input,
+            });
+        }
+        let input = &self.seen.as_ref().expect("read above").input;
         self.brain
-            .observe_console(&input, &facts, PetPane::full(&input));
+            .observe_console(input, &facts, PetPane::full(input));
         self.brain.set_console_presentable(true);
         // This is the shipping scanner, not a test-side approximation of its
         // ink spans. As on glass, the brain reads the last completed scan.
@@ -120,59 +157,25 @@ impl Scene {
     }
 }
 
+/// One mode's 35 s idle ladder: its summary line and the two counts the law
+/// asserts, `(line, movement, sleeps, frames)`.
+type Ladder = (String, usize, usize, usize);
+
 #[test]
 fn nearby_output_particles_allow_uninterrupted_sleep_after_the_idle_ladder() {
-    for mode in ["far-output", "near-particles"] {
-        let mut s = Scene::new();
-        s.particles(33);
-        for _ in 0..60 {
-            s.tick();
-        }
-        s.brain.note_console_input(s.now, PetInputKind::Text);
-        let mut sleeps = 0;
-        let mut wakes = 0;
-        let mut airborne = 0;
-        let mut movement = 0;
-        let mut frames = 0;
-        let mut min_x = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut prior = None;
-        let mut actions = std::collections::BTreeMap::new();
-        for tick in 0..2813 {
-            if tick % 32 == 0 {
-                match mode {
-                    "near-particles" => s.particles([2, 5, 33][tick / 32 % 3]),
-                    _ => {
-                        let glyph = if tick % 64 == 0 { '⠁' } else { '⠂' };
-                        s.term.process(
-                            format!("\x1b[?2026h\x1b[54;1HWorking {glyph}\x1b[56;3H\x1b[?2026l")
-                                .as_bytes(),
-                        );
-                    }
-                }
-            }
-            let frame = s.tick();
-            if tick >= 2188 {
-                assert!(frame.alpha > 0, "{mode}: the sleeping pet stays visible");
-                frames += 1;
-                sleeps += usize::from(frame.action == PetAction::Sleep);
-                wakes += usize::from(frame.action == PetAction::Waking);
-                airborne += usize::from(frame.action.airborne());
-                if let Some((col, row)) = prior {
-                    movement += usize::from(frame.col != col || frame.row != row);
-                }
-                min_x = min_x.min(frame.col);
-                max_x = max_x.max(frame.col);
-                *actions.entry(s.brain.pose_name()).or_insert(0) += 1;
-            }
-            prior = Some((frame.col, frame.row));
-        }
-        eprintln!(
-            "{mode}: after35s frames={frames} sleep={sleeps} waking={wakes} airborne={airborne} moved={movement} xspan={} actions={actions:?} input={} reason={}",
-            max_x - min_x,
-            s.brain.console_input_seq(),
-            s.brain.console_reason()
-        );
+    // Each mode builds its own scene on its own clock, so the two run on the
+    // binary's threads (`par_map`), 2026-10-05. Each is caught in its pool
+    // thread and judged here in the original order: the far-output line
+    // prints and its law is asserted before the near-particles take's own
+    // panic, if any, is raised, as the loop did.
+    let modes = ["far-output", "near-particles"];
+    let ladders = crate::common::par_map(&modes, |&mode| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ladder(mode)))
+    });
+    for (mode, ladder) in modes.into_iter().zip(ladders) {
+        let (line, movement, sleeps, frames) =
+            ladder.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        eprintln!("{line}");
         assert_eq!(
             movement, 0,
             "{mode}: a quiet pet with a clear nearby seat must not chase background particles"
@@ -182,6 +185,60 @@ fn nearby_output_particles_allow_uninterrupted_sleep_after_the_idle_ladder() {
             "{mode}: background redraws must allow uninterrupted sleep"
         );
     }
+}
+
+fn ladder(mode: &str) -> Ladder {
+    let mut s = Scene::new();
+    s.particles(33);
+    for _ in 0..60 {
+        s.tick();
+    }
+    s.brain.note_console_input(s.now, PetInputKind::Text);
+    let mut sleeps = 0;
+    let mut wakes = 0;
+    let mut airborne = 0;
+    let mut movement = 0;
+    let mut frames = 0;
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut prior = None;
+    let mut actions = std::collections::BTreeMap::new();
+    for tick in 0..2813 {
+        if tick % 32 == 0 {
+            match mode {
+                "near-particles" => s.particles([2, 5, 33][tick / 32 % 3]),
+                _ => {
+                    let glyph = if tick % 64 == 0 { '⠁' } else { '⠂' };
+                    s.term.process(
+                        format!("\x1b[?2026h\x1b[54;1HWorking {glyph}\x1b[56;3H\x1b[?2026l")
+                            .as_bytes(),
+                    );
+                }
+            }
+        }
+        let frame = s.tick();
+        if tick >= 2188 {
+            assert!(frame.alpha > 0, "{mode}: the sleeping pet stays visible");
+            frames += 1;
+            sleeps += usize::from(frame.action == PetAction::Sleep);
+            wakes += usize::from(frame.action == PetAction::Waking);
+            airborne += usize::from(frame.action.airborne());
+            if let Some((col, row)) = prior {
+                movement += usize::from(frame.col != col || frame.row != row);
+            }
+            min_x = min_x.min(frame.col);
+            max_x = max_x.max(frame.col);
+            *actions.entry(s.brain.pose_name()).or_insert(0) += 1;
+        }
+        prior = Some((frame.col, frame.row));
+    }
+    let line = format!(
+        "{mode}: after35s frames={frames} sleep={sleeps} waking={wakes} airborne={airborne} moved={movement} xspan={} actions={actions:?} input={} reason={}",
+        max_x - min_x,
+        s.brain.console_input_seq(),
+        s.brain.console_reason()
+    );
+    (line, movement, sleeps, frames)
 }
 
 fn sleeping_scene() -> (Scene, PetFrame) {

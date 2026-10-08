@@ -11,6 +11,7 @@ mod decdwl;
 mod performance;
 mod protected_cells;
 mod regressions;
+mod rgb_across_resize;
 mod rows_only_cost_bound;
 mod rows_only_identity;
 mod rows_only_ring_retention;

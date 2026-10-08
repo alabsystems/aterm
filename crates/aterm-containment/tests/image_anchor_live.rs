@@ -1,17 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The image anchor, bound to a REAL process whose bundle moves under it.
+//! The image anchor, bound to a real process whose bundle moves under it.
 //!
-//! The table test proves the classification; this binds its INPUT — the
-//! kernel's path for the image, see [`aterm_containment::ImageAnchor`] — to a
-//! child running out of a real `.app`, through the updater's two moves: the
-//! atomic swap that leaves the running bundle at `A.app.rollback`, then the
-//! boot-health delete. Step 1 reads `live` before anything moves, so a detector
-//! that always answered `displaced` fails; a second child launched through a
-//! symlink that is retargeted mid-run must stay `live`.
+//! The table test proves the classification; this binds its input (the
+//! kernel's path for the image, see [`aterm_containment::ImageAnchor`]) to a
+//! child running from a real `.app`, through the updater's two moves: the
+//! atomic swap to `A.app.rollback`, then the boot-health delete. Step 1 reads
+//! `live` before anything moves; a second child launched through a symlink
+//! retargeted mid-run must stay `live`.
 //!
-//! The child is this same test binary, re-entered through the `#[ignore]`d
+//! The child is this test binary, re-entered through the `#[ignore]`d
 //! `anchor_probe_child`.
 
 #![cfg(target_os = "macos")]
@@ -25,7 +24,8 @@ use std::time::Duration;
 const CHILD_MARKER: &str = "ATERM_ANCHOR_PROBE_CHILD";
 /// Readings are tagged: `--nocapture` interleaves the harness's own output.
 const TAG: &str = "ANCHOR=";
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// A hang detector, not a latency budget: every reading the child is nudged for must come.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The child, killed and reaped on every exit path, including a failed assert.
 struct Probe {

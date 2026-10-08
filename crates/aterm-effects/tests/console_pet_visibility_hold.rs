@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OWNER'S FLASHING BUG, pinned at crate level.
+//! The pet must not strobe while the user types.
 //!
-//! v0.81.0 (commit 27739d0c6) made the cursor pet's visibility a PER-FRAME
-//! BOOLEAN function of screen content: `finish_console_frame` cut
-//! `frame.alpha` to 0 whenever the current snapshot could not certify the
-//! sprite rectangle clear, with no hysteresis, no dwell, no fade and no
-//! memory. Typing flips that predicate at the keystroke rate — the caret's
-//! own protection halo alone was enough — so the pet strobed.
-//!
-//! These tests measure the strobe on a real `Terminal` snapshot stream:
-//! blackout frames, on->off cuts, and the largest single-frame drop in
-//! opacity, which is what separates a FADE from a CUT. The last two are the
-//! guard, not the bug: the veto exists because a pet drawn IN FRONT OF the
-//! user's text is a real defect, and a protected surface must still take it
-//! to zero. Reconciled 2026-09-11 with the cursor-home lane, which rules that
-//! ordinary ink moves the resident BEHIND the glyphs rather than switching it
-//! off; the guard is stated against that rule rather than against the older
-//! one it replaced.
+//! The pet's visibility is held rather than a per-frame boolean of screen
+//! content, so keystrokes (even the caret's own protection halo) cannot flip
+//! it at the key rate. These tests measure a real `Terminal` snapshot stream:
+//! blackout frames, on->off cuts, and the largest single-frame opacity drop
+//! (which separates a fade from a cut). The guard remains: a protected surface
+//! must still take the pet to zero, and ordinary ink moves the resident behind
+//! the glyphs rather than switching it off.
 
 use std::time::{Duration, Instant};
 
@@ -104,9 +95,9 @@ impl Fixture {
         })
     }
 
-    /// Real glyph occupancy under the sprite — `ink_at`, which is deliberately
-    /// independent of caret and selection PROTECTION. `None` (unobserved) is
-    /// read as inked, so this oracle never accuses the veto unfairly.
+    /// Real glyph occupancy under the sprite (`ink_at`, independent of caret
+    /// and selection protection). `None` (unobserved) reads as inked, so this
+    /// oracle never accuses the veto unfairly.
     fn ink_under(&self, frame: &PetFrame) -> bool {
         let rect = body(frame.col, frame.row);
         let r1 = (rect.row + rect.rows).ceil() as usize;
@@ -149,9 +140,8 @@ impl Strobe {
     }
 }
 
-/// THE OWNER'S GESTURE: the pangram, one key at a time, at a fast human rate
-/// (125 ms/key), with the prompt already on screen so the pet starts from a
-/// settled station — exactly the on-glass acceptance run.
+/// The pangram typed one key at a time at 125 ms/key, with the prompt already
+/// on screen so the pet starts from a settled station.
 #[test]
 fn typing_never_blanks_the_pet() {
     let mut f = Fixture::new(true);
@@ -174,9 +164,8 @@ fn typing_never_blanks_the_pet() {
     assert_eq!(strobe.cuts, 0, "typing cuts the pet: {strobe:?}");
 }
 
-/// THE CARET IS NOT AN OBSTRUCTION TO ITS OWN ESCORT. Nothing is typed here
-/// at all: the caret simply walks across a blank line. There is no ink
-/// anywhere near the sprite, so no frame may be blank.
+/// The caret is not an obstruction to its own escort: the caret walks across
+/// a blank line with no ink near the sprite, so no frame may be blank.
 #[test]
 fn the_caret_alone_never_blanks_its_escort() {
     let mut f = Fixture::new(true);
@@ -200,10 +189,9 @@ fn the_caret_alone_never_blanks_its_escort() {
     );
 }
 
-/// 10 lines/s of output for 1.44 s at 16 ms — 90 presented frames. The pet's
-/// natural station is one cell right of the caret, which is where output
-/// lands, so a REAL obstruction here is expected and legitimate. What is not
-/// legitimate is reaching it by a CUT, or blanking the pet over blank cells.
+/// 10 lines/s of output for 1.44 s at 16 ms (90 frames). The pet's station is
+/// one cell right of the caret, where output lands, so a real obstruction is
+/// legitimate; reaching it by a cut, or blanking over blank cells, is not.
 #[test]
 fn an_output_burst_yields_by_fading_never_by_cutting() {
     let mut f = Fixture::new(true);
@@ -235,21 +223,12 @@ fn an_output_burst_yields_by_fading_never_by_cutting() {
     );
 }
 
-/// THE VETO'S REASON TO EXIST, and the 2026-09-11 reconciliation that moved
-/// what it means.
-///
-/// This test used to assert that a completely full screen of ordinary `#`
-/// drove the pet to `alpha == 0`. That is no longer the rule and the change
-/// is deliberate, not a regression: ordinary terminal ink in front of the
-/// body is now a Z-ORDER fact, not an identity one — the resident stays whole
-/// and the renderer puts it UNDER the glyphs (`PetFrame::under_ink`), which
-/// is what `console_cursor_home.rs` measures from the other side
-/// (`ordinary_dense_output_does_not_make_an_idle_resident_blink_out`).
-///
-/// So the guard is restated at the thing that did not move: a held verdict
-/// must never become a licence to paint IN FRONT OF the user's text, and a
-/// genuinely PROTECTED surface must still take the pet to zero. Dense text
-/// gets the first; a full-screen selection gets the second.
+/// The veto's reason to exist: ordinary ink in front of the body is a z-order
+/// fact (the resident stays whole and renders under the glyphs,
+/// `PetFrame::under_ink`; see `console_cursor_home.rs`'s
+/// `ordinary_dense_output_does_not_make_an_idle_resident_blink_out`). A held
+/// verdict never licenses painting in front of the user's text, and a
+/// protected surface (a full-screen selection) still takes the pet to zero.
 #[test]
 fn a_full_screen_of_text_goes_under_the_ink_and_a_protected_one_still_yields() {
     use aterm_core::selection::{SelectionSide, SelectionType};

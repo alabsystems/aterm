@@ -66,9 +66,7 @@ mod imp;
 // (the snapshot override that also named it was deleted, 2026-09-24).
 #[cfg(all(unix, test))]
 use imp::our_uid;
-pub(crate) use imp::{
-    ensure_private_dir, lock_socket_file, peer_check, provision_token, publish_latest_link,
-};
+pub(crate) use imp::{ensure_private_dir, lock_socket_file, peer_check, provision_token};
 // Whether a pid is alive: the stale sweeps' one test, shared with the handoff's
 // sweep of a dead sender's `seamless-<pid>-…` leftovers (`crate::seamless`).
 pub(crate) use imp::pid_alive;
@@ -80,11 +78,29 @@ pub(crate) use imp::pid_alive;
 // below calls it — the re-export rides exactly its consumers.
 #[cfg(all(unix, any(target_os = "macos", test)))]
 pub(crate) use imp::peer_uid;
-// Test-only import: `random_token_hex`'s production callers live inside the
-// per-platform `imp` modules (`provision_token`); only the unit tests below
-// draw a token directly.
-#[cfg(test)]
-use imp::random_token_hex;
+
+/// Atomically (re)point the `latest` alias at this instance's socket: a
+/// symlink on Unix, a regular POINTER FILE on Windows (contents = the relative
+/// instance sock name). Either is written under a temp name and renamed over
+/// the alias, so a client never observes a missing link and the newest
+/// instance always wins. Best-effort: on failure clients can still target the
+/// instance socket directly (`aterm-ctl --pid`). The one implementation is
+/// [`aterm_uds::latest::publish`].
+pub(crate) fn publish_latest_link(link: &Path, sock_path: &str) {
+    aterm_uds::latest::publish(link, sock_path);
+}
+
+/// Generate 32 random bytes and return them as a 64-char lowercase hex string,
+/// via the workspace's ONE audited entropy surface ([`aterm_uds::rand`]:
+/// `getentropy(2)` with a BOUNDED `/dev/urandom` `read_exact` fallback on Unix,
+/// `BCryptGenRandom` on Windows — never a hand-rolled device read, which is
+/// exactly the pattern that caused the 2026-07 kernel panics). Returns `None`
+/// when no entropy source is available; the caller MUST then refuse to start
+/// the socket rather than serve a guessable token (fail closed).
+#[must_use]
+pub(crate) fn random_token_hex() -> Option<String> {
+    aterm_uds::rand::hex_token::<32>().ok()
+}
 
 /// Filename of the `latest` symlink in the per-user directory, pointing at
 /// the newest instance's `aterm-<pid>.sock`.
@@ -119,24 +135,14 @@ fn confinement_open_error(error: std::io::Error) -> ArtifactConfinementError {
     }
 }
 
+/// Run the calling test alone in a child of the test binary
+/// ([`crate::test_alone::alone`]) whose soft `RLIMIT_NOFILE` leaves exactly
+/// `spare_descriptors` free: `true` in that child, which runs the body, and
+/// `false` in the lib-test process, whose limit — process-wide — is untouched.
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn enter_low_nofile_test_child(
-    environment: &str,
-    exact_test: &str,
-    spare_descriptors: usize,
-) -> bool {
-    if std::env::var_os(environment).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", exact_test, "--nocapture", "--test-threads=1"])
-            .env(environment, "1")
-            .output()
-            .expect("spawn isolated low-NOFILE test");
-        assert!(
-            output.status.success(),
-            "low-NOFILE child failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+#[track_caller]
+pub(crate) fn enter_low_nofile_test_child(spare_descriptors: usize) -> bool {
+    if !crate::test_alone::alone() {
         return false;
     }
 
@@ -196,11 +202,10 @@ const CAPTURE_NAMESPACE_WAIT: std::time::Duration = std::time::Duration::from_se
 pub(crate) fn process_instance_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
-        let nonce = imp::random_token_hex()
+        let nonce = random_token_hex()
             .map(|token| token[..24].to_string())
             .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                aterm_time::since_epoch()
                     .map_or(0, |duration| duration.as_nanos())
                     .to_string()
             });
@@ -232,7 +237,7 @@ pub(crate) fn automatic_capture_name(stem: &str) -> String {
 #[derive(Debug)]
 pub(crate) struct ArtifactPathLease {
     key: Option<PathBuf>,
-    os_lock: Option<std::fs::File>,
+    os_lock: Option<crate::native_document_host::HeldAdvisoryLock>,
     /// Capability local to this lease. It shares the lease owner's admitted
     /// directory chain and therefore can never outlive that owner's capacity
     /// charge. The final lease uses its own capability for convergence.
@@ -956,7 +961,7 @@ pub(crate) fn wait_for_artifact_cleanup_for_test(path: &Path) {
             })
         })
         .unwrap_or_else(|| path.to_path_buf());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let (leases, changed) = artifact_path_leases();
     let mut held = leases
         .lock()
@@ -1005,7 +1010,7 @@ fn wait_for_best_effort_cleanup_barrier_for_test() {
         done
     )));
     completed
-        .recv_timeout(std::time::Duration::from_secs(10))
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("artifact best-effort cleanup barrier timed out");
 }
 
@@ -1308,9 +1313,9 @@ fn acquire_capture_name_lease_with_wait(
         // locks a child file reached through the deny-delete pinned directory;
         // its share mode prevents replacement for the full lock lifetime.
         #[cfg(unix)]
-        let file = target.pinned()?.open_directory_lock()?;
+        let mut file = target.pinned()?.open_directory_lock()?;
         #[cfg(windows)]
-        let file = {
+        let mut file = {
             let lock_dir = target
                 .pinned()?
                 .ensure_child(std::ffi::OsStr::new(CAPTURE_LOCK_DIR))?;
@@ -1325,12 +1330,13 @@ fn acquire_capture_name_lease_with_wait(
         // a raw-socket driver's `image <name>` left the next instance's
         // capture refused with no word of why).
         loop {
-            match file.try_lock() {
-                Ok(()) => {
-                    lease.os_lock = Some(file);
+            match crate::native_document_host::HeldAdvisoryLock::try_lock_keeping(file) {
+                Ok(held) => {
+                    lease.os_lock = Some(held);
                     break;
                 }
-                Err(std::fs::TryLockError::WouldBlock) => {
+                Err((refused, std::fs::TryLockError::WouldBlock)) => {
+                    file = refused;
                     if cancelled() {
                         return Ok(None);
                     }
@@ -1345,7 +1351,7 @@ fn acquire_capture_name_lease_with_wait(
                     }
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+                Err((_, std::fs::TryLockError::Error(error))) => return Err(error),
             }
         }
     }
@@ -1571,15 +1577,14 @@ fn mutate_unleased_artifact<T>(path: &Path, mutate: impl FnOnce() -> T) -> Optio
 
 impl Drop for ArtifactPathLease {
     fn drop(&mut self) {
-        // Release the cross-process fence before waking a local waiter. An
-        // explicit unlock matters on Unix: `flock` follows the open-file
-        // description into duplicated/fork-inherited descriptors, so merely
-        // dropping this process's handle can leave a transient lock behind in a
-        // child between fork and exec. Crashes still release the lock when every
-        // inherited handle closes, without a pathname deletion/recreation race.
-        if let Some(os_lock) = self.os_lock.take() {
-            let _ = os_lock.unlock();
-        }
+        // Release the cross-process fence before waking a local waiter. The
+        // guard's drop unlocks, which matters on Unix: `flock` follows the
+        // open-file description into duplicated/fork-inherited descriptors, so
+        // merely dropping this process's handle can leave a transient lock behind
+        // in a child between fork and exec. Crashes still release the lock when
+        // every inherited handle closes, without a pathname deletion/recreation
+        // race.
+        drop(self.os_lock.take());
         let Some(key) = self.key.take() else {
             return;
         };
@@ -1700,7 +1705,7 @@ fn load_or_create_network_drive_token_with_hooks(
     // First run: race all creators with CREATE_NEW. One winner publishes and
     // fsyncs the directory; every loser re-reads that winner. A pre-existing
     // corrupt/nonregular target fails closed instead of being overwritten.
-    let hex = imp::random_token_hex()?;
+    let hex = random_token_hex()?;
     match pinned.write_new_private_with_hooks(
         std::ffi::OsStr::new(NETWORK_DRIVE_TOKEN_FILE),
         hex.as_bytes(),
@@ -1951,7 +1956,8 @@ fn open_instance_lease(namespace: &Path, create: bool) -> std::io::Result<std::f
 /// an automatic-image and a video namespace, so the static owns one locked file
 /// per canonical namespace rather than one global file.
 fn hold_current_instance_lease(namespace: &Path) -> std::io::Result<()> {
-    static LEASES: std::sync::OnceLock<std::sync::Mutex<Vec<(PathBuf, std::fs::File)>>> =
+    type Held = crate::native_document_host::HeldAdvisoryLock;
+    static LEASES: std::sync::OnceLock<std::sync::Mutex<Vec<(PathBuf, Held)>>> =
         std::sync::OnceLock::new();
     let namespace = std::fs::canonicalize(namespace)?;
     let leases = LEASES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
@@ -1961,15 +1967,15 @@ fn hold_current_instance_lease(namespace: &Path) -> std::io::Result<()> {
     if leases.iter().any(|(path, _)| path == &namespace) {
         return Ok(());
     }
-    let file = open_instance_lease(&namespace, true)?;
-    file.try_lock().map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "this process instance namespace is already leased",
-        ),
-        std::fs::TryLockError::Error(error) => error,
-    })?;
-    leases.push((namespace, file));
+    let held =
+        Held::try_lock(open_instance_lease(&namespace, true)?).map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "this process instance namespace is already leased",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+    leases.push((namespace, held));
     Ok(())
 }
 
@@ -2113,11 +2119,25 @@ impl DeadNamespaceSweep {
                 continue;
             }
             before_lease_probe();
+            // An acquired lease is held by a GUARD, which lets go by `LOCK_UN`
+            // before the close on every way out of this iteration — the
+            // `continue`s below included. `flock` lives on the open file
+            // description: a child any thread of this process forks (a tab's pty
+            // fork) or posix_spawns (Darwin hands the spawned child the whole
+            // table, close-on-exec entries too) between this lock and its release
+            // holds a copy of it until it execs, and a lease let go by the close
+            // alone stayed locked in that copy — the next sweep read the dead
+            // instance as live and kept its namespace (Trust M2's
+            // `instance_sweep_main` refutation, 2026-10-01).
             let (lease_state, acquired_lease) = match namespace
                 .open_existing_namespace_lock_at_retained(std::ffi::OsStr::new(INSTANCE_LEASE_FILE))
             {
-                Ok(lease) => match lease.try_lock() {
-                    Ok(()) => (InstanceLeaseState::Acquirable, Some(lease)),
+                Ok(lease) => match crate::native_document_host::HeldAdvisoryLock::try_lock(lease) {
+                    Ok(held) => {
+                        #[cfg(all(test, unix))]
+                        crate::parked_fork::fork_if_armed();
+                        (InstanceLeaseState::Acquirable, Some(held))
+                    }
                     Err(std::fs::TryLockError::WouldBlock) => (InstanceLeaseState::Held, None),
                     Err(std::fs::TryLockError::Error(_)) => (InstanceLeaseState::Invalid, None),
                 },
@@ -3273,13 +3293,31 @@ fn prune_video_dirs(
 /// [`aterm_uds::control_socket_dir`] so server and client can never drift; the
 /// server additionally hardens the dir (owner-check + DACL) below.
 ///
-/// Returns `None` only when the per-user base cannot be resolved from the
-/// environment, which should not happen for an interactive session.
+/// Returns `None` when the per-user base cannot be resolved from the
+/// environment, which should not happen for an interactive session, or when it
+/// cannot be made private ([`ensure_private_dir`]); [`resolve_socket_plan`]
+/// tells the two apart.
 #[must_use]
 pub(crate) fn socket_dir() -> Option<PathBuf> {
     let dir = aterm_uds::control_socket_dir()?;
     ensure_private_dir(&dir).ok()?;
     Some(dir)
+}
+
+/// `<control dir>/<name>`, created `0700`: where the shell integration's
+/// per-session files live (`integration`, `rekey`). `None` when there is no
+/// private control dir.
+pub(crate) fn private_subdir(name: &str) -> Option<PathBuf> {
+    let dir = socket_dir()?.join(name);
+    ensure_private_dir(&dir).ok()?;
+    Some(dir)
+}
+
+/// Session `sid`'s file in `dir`. Only a server-minted sid
+/// ([`crate::keeper_link::valid_sid`]) is accepted, so no carried value can steer
+/// a write out of the directory.
+pub(crate) fn sid_file_in(dir: &Path, sid: &aterm_session::SessionId) -> Option<PathBuf> {
+    crate::keeper_link::valid_sid(sid.as_str()).then(|| dir.join(sid.as_str()))
 }
 
 /// Everything the server needs to provision one instance's control socket.
@@ -3302,6 +3340,10 @@ pub(crate) enum SocketResolution {
     Disabled,
     /// No per-user directory and no override resolvable; do not bind.
     NoDir,
+    /// The per-user directory resolved, but it cannot be made private to this
+    /// user ([`ensure_private_dir`]: not creatable, not ours, or shared); do
+    /// not bind. `error` is that refusal's text, for the log.
+    DirUnusable { dir: PathBuf, error: String },
     /// `--control-sock` names a path too long for `sun_path`; do not bind.
     /// Both `bind` and `connect` on such a path fail `EINVAL` — and the fail-safe
     /// liveness probe must treat an unexpected connect error as "maybe live", so
@@ -3361,20 +3403,28 @@ pub(crate) fn resolve_socket_plan() -> SocketResolution {
                 latest_link: None,
             })
         }
-        SocketDirective::PerInstance => match socket_dir() {
-            Some(dir) => {
-                let pid = std::process::id();
-                SocketResolution::Enabled(SocketPlan {
-                    sock_path: dir
-                        .join(control_socket::instance_sock_name(pid))
-                        .to_string_lossy()
-                        .into_owned(),
-                    token_path: dir.join(control_socket::instance_token_name(pid)),
-                    latest_link: Some(dir.join(SOCK_FILE)),
-                })
+        // `socket_dir`'s two refusals, told apart: no folder to resolve, and a
+        // folder that cannot be made private.
+        SocketDirective::PerInstance => {
+            let Some(dir) = aterm_uds::control_socket_dir() else {
+                return SocketResolution::NoDir;
+            };
+            if let Err(error) = ensure_private_dir(&dir) {
+                return SocketResolution::DirUnusable {
+                    dir,
+                    error: error.to_string(),
+                };
             }
-            None => SocketResolution::NoDir,
-        },
+            let pid = std::process::id();
+            SocketResolution::Enabled(SocketPlan {
+                sock_path: dir
+                    .join(control_socket::instance_sock_name(pid))
+                    .to_string_lossy()
+                    .into_owned(),
+                token_path: dir.join(control_socket::instance_token_name(pid)),
+                latest_link: Some(dir.join(SOCK_FILE)),
+            })
+        }
     }
 }
 
@@ -4111,12 +4161,38 @@ fn lexically_normalize(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_document_host::HeldAdvisoryLock;
+
+    #[test]
+    fn a_session_file_is_named_only_for_a_server_minted_sid() {
+        let dir = Path::new("/c/integration");
+        let sid = aterm_session::SessionId::new("s-09035e075d6ee9388965".to_string());
+        assert_eq!(
+            sid_file_in(dir, &sid),
+            Some(dir.join("s-09035e075d6ee9388965"))
+        );
+        for bad in ["../x", "s-", "s-zz", "s-12/../../etc", "abc"] {
+            assert_eq!(
+                sid_file_in(dir, &aterm_session::SessionId::new(bad.to_string())),
+                None,
+                "{bad}"
+            );
+        }
+    }
 
     /// ITEM 5: `socket_is_live` is true for a bound listener and false for an
     /// absent OR stale (file present, nobody listening) socket — so the bind gate
     /// removes stale files but never unlinks a live listener.
+    ///
+    /// ALONE IN ITS OWN PROCESS: `drop(listener)` stops the listening only
+    /// with its LAST descriptor, and a child a sibling test forks holds a copy
+    /// until it execs (macOS 26.6 honors no `FD_CLOFORK`) — the "asynchronous
+    /// teardown" this used to poll out for a second.
     #[test]
     fn socket_is_live_true_for_bound_false_for_stale() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("aterm-live-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("s.sock");
@@ -4126,24 +4202,13 @@ mod tests {
         let listener = aterm_uds::CtlListener::bind(&path).expect("bind");
         assert!(socket_is_live(&ps), "bound socket is live");
         drop(listener); // file remains, nobody listens -> becomes stale
-        // Socket teardown is ASYNCHRONOUS: under heavy parallel load there is a brief
-        // window after the listener fd closes where a connect to the now-orphaned path
-        // returns something OTHER than ECONNREFUSED/NotFound, which `socket_is_live`
-        // (deliberately fail-SAFE: any ambiguous error => "live", so we never unlink a
-        // maybe-live socket) reports as live. Poll until the kernel has fully torn the
-        // listener down — it must report stale within a bounded window; never doing so
-        // is a real regression, not the teardown race.
-        let mut went_stale = false;
-        for _ in 0..200 {
-            if !socket_is_live(&ps) {
-                went_stale = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            went_stale,
-            "stale socket file (no listener) must become not-live"
+        // A transient connect error (EMFILE in a saturated process, EINTR) reads as
+        // "maybe live" — `socket_is_live` is deliberately fail-SAFE — so poll, with
+        // a hang detector: never going stale is a real regression.
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "stale socket file (no listener) becomes not-live",
+            || (!socket_is_live(&ps)).then_some(()),
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -4179,7 +4244,9 @@ mod tests {
             }
             let _ = tx.send(initially_live);
         });
-        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // The probe's answer MUST arrive: a hang detector, not a 2 s budget. A
+        // regressed blocking dial is still named, at the minute.
+        let result = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
         // Close before asserting: this also releases a regressed blocking dial.
         drop(listener);
         probe.join().unwrap();
@@ -4618,6 +4685,10 @@ mod tests {
         let second = ConfinedImage::for_test(&dir, "second.png");
         let observed_wait = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_observed_wait = std::sync::Arc::clone(&observed_wait);
+        // The waiter's bound is a hang detector: it counts from the waiter's
+        // start, and the release below comes whenever this thread runs again.
+        // A 1 s bound failed a correct tree as `WouldBlock` whenever this
+        // thread stalled past it after the waiter queued.
         let waiter = std::thread::spawn(move || {
             acquire_capture_name_lease_with_wait(
                 &second,
@@ -4625,18 +4696,17 @@ mod tests {
                     worker_observed_wait.store(true, std::sync::atomic::Ordering::Release);
                     false
                 },
-                std::time::Duration::from_secs(1),
+                aterm_spec::wait::MUST_HAPPEN,
             )
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while !observed_wait.load(std::sync::atomic::Ordering::Acquire)
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(
-            observed_wait.load(std::sync::atomic::Ordering::Acquire),
-            "the successor observed the retained reply lease"
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the successor observes the retained reply lease",
+            || {
+                observed_wait
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .then_some(())
+            },
         );
 
         drop(first_lease);
@@ -4666,6 +4736,8 @@ mod tests {
         let observed_wait = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_cancelled = std::sync::Arc::clone(&cancelled);
         let worker_observed_wait = std::sync::Arc::clone(&observed_wait);
+        // A hang detector, as in the waiter test above: the cancellation
+        // must win whenever this thread gets to set it.
         let waiter = std::thread::spawn(move || {
             acquire_capture_name_lease_with_wait(
                 &second,
@@ -4673,18 +4745,17 @@ mod tests {
                     worker_observed_wait.store(true, std::sync::atomic::Ordering::Release);
                     worker_cancelled.load(std::sync::atomic::Ordering::Acquire)
                 },
-                std::time::Duration::from_secs(1),
+                aterm_spec::wait::MUST_HAPPEN,
             )
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while !observed_wait.load(std::sync::atomic::Ordering::Acquire)
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(
-            observed_wait.load(std::sync::atomic::Ordering::Acquire),
-            "the cancellation probe reached the wait"
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the cancellation probe reaches the wait",
+            || {
+                observed_wait
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .then_some(())
+            },
         );
         cancelled.store(true, std::sync::atomic::Ordering::Release);
 
@@ -4740,12 +4811,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         ensure_private_dir(&dir).unwrap();
         let image = ConfinedImage::for_test(&dir, "sibling.png");
-        let sibling = image
-            .pinned()
-            .unwrap()
-            .open_directory_lock()
-            .expect("the sibling's own description of the directory");
-        sibling.try_lock().expect("the sibling holds the namespace");
+        let sibling = HeldAdvisoryLock::try_lock(
+            image
+                .pinned()
+                .unwrap()
+                .open_directory_lock()
+                .expect("the sibling's own description of the directory"),
+        )
+        .expect("the sibling holds the namespace");
         let error = acquire_capture_name_lease_with_wait(
             &image,
             || false,
@@ -4757,21 +4830,31 @@ mod tests {
             error.to_string().contains("not acknowledged"),
             "the refusal names the cause: {error}"
         );
-        // Released inside the wait: the capture queues and then proceeds.
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            sibling.unlock().expect("the sibling lets go");
-            sibling
-        });
+        // Released inside the wait: the capture queues and then proceeds. The
+        // sibling lets go on a FACT, not a clock: the capture asks its
+        // cancellation probe once before it first tries the lock, and again
+        // each time it finds the lock held, so the second ask is a capture
+        // already queued behind the sibling. The wait is a hang detector: a
+        // capture that never proceeds fails at the minute.
+        let asks = std::sync::atomic::AtomicUsize::new(0);
         let lease = acquire_capture_name_lease_with_wait(
             &image,
-            || false,
-            std::time::Duration::from_secs(2),
+            || {
+                if asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+                    sibling.file().unlock().expect("the sibling lets go");
+                }
+                false
+            },
+            aterm_spec::wait::MUST_HAPPEN,
         )
         .expect("the queued capture proceeds once the sibling lets go")
         .expect("not cancelled");
+        assert!(
+            asks.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "the capture queued behind the sibling before it proceeded"
+        );
         drop(lease);
-        drop(releaser.join().expect("releaser"));
+        drop(sibling);
         drop(image);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4792,6 +4875,7 @@ mod tests {
             .os_lock
             .as_ref()
             .expect("explicit Unix lease owns an OS lock")
+            .file()
             .try_clone()
             .expect("duplicate the descriptor as fork would");
         drop(first_lease);
@@ -5078,12 +5162,12 @@ mod tests {
         ensure_private_dir(&dir).unwrap();
         // A certainly-dead pid: a reaped child cannot be signalled any more.
         #[cfg(unix)]
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("0")
             .spawn()
             .unwrap();
         #[cfg(windows)]
-        let mut child = std::process::Command::new("cmd")
+        let mut child = aterm_uds::spawnfd::command("cmd")
             .args(["/c", "exit"])
             .spawn()
             .unwrap();
@@ -5138,20 +5222,28 @@ mod tests {
     /// listener's leftover goes once the kernel has torn it down, and the bound
     /// listener survives every pass. The socket the alias names is kept only
     /// where a bind will move the alias on.
+    ///
+    /// ALONE IN ITS OWN PROCESS: the orphan's listener stops only with its LAST
+    /// descriptor, and a child a sibling test forks holds a copy until it execs
+    /// — the "asynchronous teardown" the bounded pass loop below absorbed for a
+    /// second, and on a loaded machine did not.
     #[test]
     fn launch_sweep_removes_only_aged_empty_socks_nobody_listens_on() {
         use std::time::{Duration, SystemTime};
+        if !crate::test_alone::alone() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("aterm-socksweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         ensure_private_dir(&dir).unwrap();
         // A certainly-dead pid: a reaped child cannot be signalled any more.
         #[cfg(unix)]
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("0")
             .spawn()
             .unwrap();
         #[cfg(windows)]
-        let mut child = std::process::Command::new("cmd")
+        let mut child = aterm_uds::spawnfd::command("cmd")
             .args(["/c", "exit"])
             .spawn()
             .unwrap();
@@ -5205,10 +5297,10 @@ mod tests {
             "younger than the margin: neither real socket is probed or touched"
         );
 
-        // No margin: the orphan goes once the kernel has torn its listener down
-        // (asynchronous — poll, bounded, as `socket_is_live`'s own test does).
-        // Each pass dials `live.sock` once and the test listener never accepts,
-        // so the cap keeps the probes well inside its backlog.
+        // No margin: the orphan goes once the kernel has torn its listener down.
+        // Alone, that is the first pass; the passes stay capped because each one
+        // dials `live.sock` once and the test listener never accepts, so the cap
+        // keeps the probes well inside its backlog.
         let mut orphan_gone = false;
         for _ in 0..40 {
             let report = sweep_stale_socket_files(&dir, Duration::ZERO, true).expect("dir listed");
@@ -5706,7 +5798,7 @@ mod tests {
         while completed.len() < 2 {
             completed.push(
                 done_rx
-                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
                     .expect("both retention workers finish after the shared gate opens"),
             );
         }
@@ -5947,12 +6039,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn automatic_image_gc_waits_for_final_capability_under_low_nofile() {
-        const CHILD: &str = "ATERM_TEST_AUTO_IMAGE_DEFERRED_GC_NOFILE";
-        if !enter_low_nofile_test_child(
-            CHILD,
-            "control_auth::tests::automatic_image_gc_waits_for_final_capability_under_low_nofile",
-            16,
-        ) {
+        if !enter_low_nofile_test_child(16) {
             return;
         }
 
@@ -6021,12 +6108,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn video_prune_directory_handles_stay_bounded() {
-        const CHILD: &str = "ATERM_TEST_VIDEO_PRUNE_NOFILE";
-        if !enter_low_nofile_test_child(
-            CHILD,
-            "control_auth::tests::video_prune_directory_handles_stay_bounded",
-            16,
-        ) {
+        if !enter_low_nofile_test_child(16) {
             return;
         }
 
@@ -6192,18 +6274,17 @@ mod tests {
         // PID-reuse case: the embedded PID is reported alive, but the exact
         // launch's lease is unlocked. Exclusive acquisition proves abandonment.
         let reused = ensure_canonical_direct_child(&root, "p424242-reused").unwrap();
-        let lease = open_instance_lease(&reused, true).unwrap();
-        lease.try_lock().unwrap();
-        // EXPLICIT `unlock()`, not just `drop`. `flock` rides the open-file-
-        // description, and a concurrent test's `fork()` (any `pre_exec`
-        // Command) that lands between our open and the drop hands the child a
-        // duplicate that keeps the lock alive until its execve — hundreds of
-        // milliseconds under load — so a sweep racing that window classified
-        // this lease Held and kept the namespace. `LOCK_UN` strips the lock
-        // from the shared description itself, every duplicate included, so the
-        // sweep below deterministically sees the state this scenario names:
-        // "the exact launch's lease is unlocked".
-        lease.unlock().unwrap();
+        let lease =
+            HeldAdvisoryLock::try_lock(open_instance_lease(&reused, true).unwrap()).unwrap();
+        // Released by `LOCK_UN` (the guard's drop), not by the close alone.
+        // `flock` rides the open-file-description, and a concurrent test's
+        // `fork()` (any `pre_exec` Command) that lands between our open and the
+        // drop hands the child a duplicate that keeps the lock alive until its
+        // execve — hundreds of milliseconds under load — so a sweep racing that
+        // window classified this lease Held and kept the namespace. `LOCK_UN`
+        // strips the lock from the shared description itself, every duplicate
+        // included, so the sweep below deterministically sees the state this
+        // scenario names: "the exact launch's lease is unlocked".
         drop(lease);
         sweep_dead_instance_namespaces_with(&root, "p1-current", |_| true);
         assert!(
@@ -6214,8 +6295,7 @@ mod tests {
         // PID false-negative case: a held exact-instance lease is authoritative
         // and survives even when the compatibility liveness probe says dead.
         let held = ensure_canonical_direct_child(&root, "p424243-held").unwrap();
-        let lease = open_instance_lease(&held, true).unwrap();
-        lease.try_lock().unwrap();
+        let lease = HeldAdvisoryLock::try_lock(open_instance_lease(&held, true).unwrap()).unwrap();
         sweep_dead_instance_namespaces_with(&root, "p1-current", |_| false);
         assert!(
             held.is_dir(),
@@ -6237,8 +6317,9 @@ mod tests {
 
         let name = "p424244-held";
         let original_namespace = ensure_canonical_direct_child(&root, name).unwrap();
-        let held_lease = open_instance_lease(&original_namespace, true).unwrap();
-        held_lease.try_lock().unwrap();
+        let held_lease =
+            HeldAdvisoryLock::try_lock(open_instance_lease(&original_namespace, true).unwrap())
+                .unwrap();
 
         // The replacement advertises the same namespace name but an unlocked
         // lease. A lexical lease reopen after the swap would misclassify the
@@ -6275,8 +6356,80 @@ mod tests {
         drop(sweep);
         std::fs::rename(&root, &replacement).unwrap();
         std::fs::rename(&moved, &root).unwrap();
-        held_lease.unlock().unwrap();
         drop(held_lease);
+    }
+
+    /// THE SWEEP LETS GO OF A DEAD INSTANCE'S LEASE BY `LOCK_UN`, on every way
+    /// out — here the `continue` after the identity re-check that follows the
+    /// take, which let the lease go by DROPPING its `File`. `flock` lives on the
+    /// open file description, and a child any thread forks between the sweep's
+    /// lock and its release holds a copy until it execs; a lease released by the
+    /// close alone stayed locked in that copy, so the next sweep read the dead
+    /// instance as live and kept its namespace (Trust M2's `instance_sweep_main`
+    /// refutation of 2026-10-01: a pty fork, or the log tool's `posix_spawn`).
+    ///
+    /// The fork is made for real, from inside the sweep's hold of the lease
+    /// ([`crate::parked_fork`]), and parked short of its exec while the lease is
+    /// probed and the next sweep runs. The hook moves the namespace out of the
+    /// root after the sweep pinned it, so the sweep takes the lease through its
+    /// retained handle and then leaves by that `continue`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_instances_lease_is_free_while_a_child_forked_under_the_sweep_has_yet_to_exec() {
+        let temp = aterm_tempfile::tempdir().expect("temporary namespace root");
+        let root = temp.path().join("root");
+        let aside = temp.path().join("aside");
+        ensure_private_dir(&root).unwrap();
+        ensure_private_dir(&aside).unwrap();
+        let name = "p424245-dead";
+        let namespace = ensure_canonical_direct_child(&root, name).unwrap();
+        // A launch that is gone: its lease exists and nobody holds it.
+        drop(open_instance_lease(&namespace, true).unwrap());
+        let moved = aside.join(name);
+
+        let queue = ArtifactCleanupQueuePermit::unmetered();
+        let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
+            .expect("test cleanup admission");
+        let mut sweep = DeadNamespaceSweep::begin(&root, "p1-current".into(), queue, admission)
+            .expect("pinned sweep");
+        let armed = crate::parked_fork::arm_at(1); // the sweep's take of the lease
+        let mut moved_aside = false;
+        assert!(sweep.run_batch_with_hook(
+            |_| true,
+            || {
+                if !moved_aside {
+                    std::fs::rename(&namespace, &moved).unwrap();
+                    moved_aside = true;
+                }
+            }
+        ));
+        drop(sweep);
+        assert!(moved_aside, "the hook ran before the lease was taken");
+        let child = armed.child();
+        assert!(child.still_parked(), "forked under the sweep's lease");
+        assert!(
+            moved.is_dir(),
+            "the identity re-check failed, so the sweep left the namespace alone"
+        );
+
+        let probe = HeldAdvisoryLock::try_lock(open_instance_lease(&moved, false).unwrap());
+        assert!(
+            probe.is_ok(),
+            "the sweep's lease stayed locked in the child forked under it: the sweep \
+             let it go by the close alone"
+        );
+        drop(probe);
+
+        // What that residue cost: the next sweep, while the child is still short
+        // of its exec, must read the gone launch as gone.
+        std::fs::rename(&moved, root.join(name)).unwrap();
+        sweep_dead_instance_namespaces_with(&root, "p1-current", |_| true);
+        assert!(
+            !root.join(name).exists(),
+            "a dead instance's namespace is swept while the forked child has yet to exec"
+        );
+        assert!(child.still_parked(), "…while the child had yet to exec");
+        child.release();
     }
 
     #[test]
@@ -6827,7 +6980,7 @@ mod tests {
         });
         assert!(
             loaded_rx
-                .recv_timeout(std::time::Duration::from_secs(30))
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
                 .expect("the token loader must never block on a planted FIFO"),
             "a planted FIFO is refused, never read as a token"
         );

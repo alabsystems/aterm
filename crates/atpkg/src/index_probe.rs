@@ -17,14 +17,9 @@
 //! (`aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS`) remains the fallback.
 //!
 //! Every request this module makes is a HEAD of a download URL on the release host,
-//! which is unmetered; it has no API transport at all, and that is the point (owner ruling
-//! R3). Until 2026-09-23 a probe whose HEADs all missed also fetched the first page of the
-//! anonymous Releases listing on a five-minute stamp — in the steady state every five
-//! minutes on every probing machine (measured: every 5m07s), about twelve an hour of the
-//! sixty anonymous requests GitHub grants one IP, shared with the signed pass and the
-//! release cut, which had died on that budget three times the day before (audit
-//! 2026-09-23, PK-2). Two more HEADs beyond the pair, every five minutes, went with it: the
-//! publisher's contiguous builds left them nothing to find.
+//! which is unmetered; it has no API transport at all, and that is the point: GitHub grants
+//! one IP sixty anonymous API requests an hour, shared with the signed pass and the release
+//! cut.
 //!
 //! Only GitHub's own answer for a published asset — a 302 or 307 to an https URL on its
 //! user-content storage ([`is_release_asset_host`]) — reads as published ([`classify`]).
@@ -33,8 +28,8 @@
 //! intermediary can never wake a full pass at every cooldown.
 //!
 //! A store whose `update` would answer "nothing to update" — nothing installed, the set
-//! not being completed, no vendor program tombstoned in place — is not probed at all
-//! (audit PK-7): a published index could wake nothing there but that line.
+//! not being completed, no vendor program tombstoned in place — is not probed at all: a
+//! published index could wake nothing there but that line.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
@@ -62,11 +57,9 @@ const OFFSETS: [u64; 2] = [1, 2];
 /// user-content storage, a host under `githubusercontent.com` — `release-assets.` today,
 /// `objects.` before it.
 ///
-/// The DOMAIN, not a list of its hosts. GitHub has moved the asset host once already, and
-/// until 2026-09-23 the rule was exactly those two names: the day it moved again, every tag
-/// would have read as unpublished, every client's index discovery failed on every pass, and
-/// only an app release naming the new host would have mended it. The domain still refuses
-/// what the rule is for — a captive portal's or a proxy's redirect to a login page — and it
+/// The DOMAIN, not a list of its hosts: GitHub has moved the asset host once already, and
+/// a fixed list would read every tag as unpublished the day it moves again. The domain still
+/// refuses what the rule is for — a captive portal's or a proxy's redirect to a login page — and it
 /// is no trust boundary: every byte a discovery then fetches must verify. The release
 /// cutter's readability check (`aterm_release::publish::classify_asset_head`) reads the
 /// same host by this same rule.
@@ -228,15 +221,22 @@ fn highest_or_deferred(a: Probe, b: Probe) -> Probe {
 /// A [`crate::lock::Flock`], never a bare `File`: the lock is released by `LOCK_UN` on
 /// every return, so the next probe finds it free at once. Released by the close alone, a
 /// child another thread is mid-spawning keeps a copy of the descriptor until its exec, and
-/// the next probe reads the lock as a sibling's and defers — the full-suite flake of
-/// 2026-09-23. Pinned by `the_probe_lock_is_free_the_moment_its_probe_releases_it`.
+/// the next probe reads the lock as a sibling's and defers. Pinned by
+/// `the_probe_lock_is_free_the_moment_its_probe_releases_it`.
 fn take_probe_lock(path: &Path) -> Option<crate::lock::Flock> {
-    crate::lock::Flock::try_lock(open_probe_lock(path)?).ok()
+    crate::lock::Flock::try_lock(open_private(path, true)?).ok()
 }
 
-fn open_probe_lock(path: &Path) -> Option<File> {
+/// Open one of the store's private rendezvous files — this probe's lock and stamps, the
+/// vendor-head watch's shared file and seat — without following a link and without
+/// blocking on a planted FIFO: read-write and created (0600) when `create`, read-only and
+/// never created otherwise. `None`: not openable, or not a plain file.
+pub(crate) fn open_private(path: &Path, create: bool) -> Option<File> {
     let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
+    options.read(true);
+    if create {
+        options.write(true).create(true).truncate(false);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -252,10 +252,7 @@ fn open_probe_lock(path: &Path) -> Option<File> {
     }
     let file = options.open(path).ok()?;
     let metadata = file.metadata().ok()?;
-    if !metadata.file_type().is_file() || crate::platform::is_reparse(&metadata) {
-        return None;
-    }
-    Some(file)
+    (metadata.file_type().is_file() && !crate::platform::is_reparse(&metadata)).then_some(file)
 }
 
 fn stamp_remaining(file: &mut File, floor: u64, now: SystemTime) -> Option<Duration> {
@@ -321,9 +318,9 @@ pub enum RangeAnswer {
 /// The probe's last answer for the store's CURRENT floor — what the window's
 /// thirty-second cadence (or any process that ran [`successor_reporting_near_with`])
 /// already learned, read back without a request, a lock or a write. `near` is
-/// `(answer, when it was written)` for the next two tags, and is `None` when there is no stamp for this floor — never probed, or
-/// probed before the floor last moved (a stamp recorded under an older floor answers a
-/// question nobody is asking now).
+/// `(answer, when it was written)` for the next two tags, and is `None` when there is no stamp for
+/// this floor — never probed, or probed before the floor last moved (a stamp recorded under an
+/// older floor answers a question nobody is asking now).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachedProbe {
     pub floor: u64,
@@ -337,7 +334,7 @@ pub struct CachedProbe {
 pub fn cached_answer(layout: &Layout) -> CachedProbe {
     let floor = verified_floor(layout);
     let read = |name: &str| {
-        let mut file = open_stamp_read_only(&layout.prefix.join(name))?;
+        let mut file = open_private(&layout.prefix.join(name), false)?;
         let (recorded, marker, written) = read_stamp(&mut file)?;
         (recorded == floor).then_some(())?;
         let answer = match marker {
@@ -377,28 +374,6 @@ pub fn held_index_builds(layout: &Layout) -> Option<Vec<u64>> {
     )
 }
 
-fn open_stamp_read_only(path: &Path) -> Option<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.file_type().is_file() || crate::platform::is_reparse(&metadata) {
-        return None;
-    }
-    Some(file)
-}
-
 fn stamp(file: &mut File, floor: u64, marker: char) -> std::io::Result<()> {
     file.set_len(0)?;
     file.seek(std::io::SeekFrom::Start(0))?;
@@ -409,10 +384,8 @@ fn stamp(file: &mut File, floor: u64, marker: char) -> std::io::Result<()> {
 /// GitHub's user-content storage ([`is_release_asset_host`]) is the asset, a 404 its absence,
 /// and everything else — a 200 (GitHub never serves the asset itself, so that is an
 /// intermediary's page), a permanent redirect, a redirect anywhere else, a transport
-/// failure — says nothing. Found in review of Phase 3's parallel probe (p3/sched,
-/// 2026-09-22) and true of this one until 2026-09-23: any 200 or 3xx read as a
-/// publication, so a captive portal or a filtering proxy that answers every URL woke a
-/// signed pass at every five-minute published cooldown, for good. The signed pass's index
+/// failure — says nothing, so a captive portal or a filtering proxy that answers every URL
+/// cannot wake a signed pass at every cooldown. The signed pass's index
 /// discovery (`net::GithubFetcher::walk_candidates`) reads its HEADs with this same rule.
 pub(crate) fn classify(next: u64, answer: Result<HeadAnswer, HttpError>) -> Probe {
     match answer {
@@ -436,12 +409,9 @@ mod tests {
     use std::cell::Cell;
     use std::collections::BTreeMap;
 
-    // ONE ATTEMPT, NEVER A RETRY. These fixtures used to retry a deferred probe, because a
-    // child a sibling test was mid-spawning kept a copy of the probe lock's descriptor
-    // after the probe closed it, so the next probe read the lock as held and deferred. The
-    // lock releases by `LOCK_UN` since 2026-09-24 ([`take_probe_lock`], pinned by
-    // `the_probe_lock_is_free_the_moment_its_probe_releases_it`), so a deferral here is a
-    // finding, and the retry loops that absorbed one are gone.
+    // ONE ATTEMPT, NEVER A RETRY. The lock releases by `LOCK_UN` ([`take_probe_lock`],
+    // pinned by `the_probe_lock_is_free_the_moment_its_probe_releases_it`), so a deferral
+    // here is a finding.
 
     struct ModeledCase {
         label: &'static str,
@@ -515,21 +485,15 @@ mod tests {
         assert!(model.check_invariant("NoDuplicateRangeInsideCooldown", state));
     }
 
-    fn layout(name: &str) -> Layout {
-        let prefix =
-            std::env::temp_dir().join(format!("atpkg-index-probe-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&prefix);
-        std::fs::create_dir_all(&prefix).unwrap();
-        Layout { prefix }
+    fn layout(name: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-index-probe-{name}-"))
     }
 
     /// A stamp's age is read from its file's REAL mtime, and these tests drive the probe on
     /// a synthetic clock from `t0`: so the stamp a probe just wrote is pinned to the
     /// synthetic instant it was written at, and the clock's ticks are its age exactly.
-    /// Unpinned, a loaded machine that stalled the test for more than a case's margin
-    /// between `t0` and the write left the stamp younger than the clock said — the cooldown
-    /// "over" at `t0 + 70 s` still ran — and the derived-model conformance went red at
-    /// random (found in review of p3/reconciled, 2026-09-23).
+    /// Unpinned, a loaded machine that stalled the test between `t0` and the write would
+    /// leave the stamp younger than the clock says, and the conformance would flake.
     fn stamped_at(layout: &Layout, at: SystemTime) {
         File::options()
             .write(true)
@@ -594,7 +558,7 @@ mod tests {
                 2,
                 "only the stamp expiry spends a HEAD pair"
             );
-            std::fs::remove_dir_all(layout.prefix).unwrap();
+            std::fs::remove_dir_all(&layout.prefix).unwrap();
         }
     }
 
@@ -678,7 +642,7 @@ mod tests {
                     true,
                 );
             }
-            std::fs::remove_dir_all(layout.prefix).unwrap();
+            std::fs::remove_dir_all(&layout.prefix).unwrap();
         }
     }
 
@@ -739,7 +703,7 @@ mod tests {
             "a newer tag behind an unlanded 44 is found on the next probe"
         );
         assert_eq!(asked(), 4);
-        std::fs::remove_dir_all(layout.prefix).unwrap();
+        std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
     /// THE EARLY HINT: the first HEAD to find a published index reports it before the
@@ -783,7 +747,7 @@ mod tests {
             hint44 < head45,
             "44 is reported before 45 is asked: {order:?}"
         );
-        std::fs::remove_dir_all(layout.prefix).unwrap();
+        std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
     #[test]
@@ -792,8 +756,11 @@ mod tests {
         std::fs::write(layout.floor(), "43").unwrap();
         let model = atpkg_index_probe_cooldown_model();
         let mut state = model.init_state();
-        let held = open_probe_lock(&layout.prefix.join(NEAR_LOCK)).unwrap();
-        held.try_lock().unwrap();
+        // A sibling's hold, let go by `LOCK_UN` when it drops ([`crate::lock::Flock`]).
+        let held = crate::lock::Flock::try_lock(
+            open_private(&layout.prefix.join(NEAR_LOCK), true).unwrap(),
+        )
+        .unwrap();
         assert!(model.fire("Acquire", &mut state));
         assert!(!model.action_enabled("Acquire", &state));
         let mut head = |_: &str| -> Result<HeadAnswer, HttpError> {
@@ -812,14 +779,14 @@ mod tests {
         drop(held);
         assert!(model.fire("Abort", &mut state));
         assert!(model.action_enabled("Acquire", &state));
-        std::fs::remove_dir_all(layout.prefix).unwrap();
+        std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
     /// THE PROBE LOCK IS FREE THE MOMENT ITS PROBE RELEASES IT, whatever copies of its
     /// descriptor live on. `copy` stands in for a child another test thread is mid-spawning,
     /// which holds every descriptor until its exec. Were the lock released by the close
     /// alone, the copy would keep it held and the next probe would defer with nothing on the
-    /// wire — the 2026-09-23 full-suite flake. A regression of [`take_probe_lock`] to a bare
+    /// wire. A regression of [`take_probe_lock`] to a bare
     /// `File` fails both assertions after the release. Negative control first: a lock
     /// actually held defers the probe, so the pass after the release is not vacuous.
     #[test]
@@ -922,7 +889,7 @@ mod tests {
             *requested.borrow(),
             vec![tag(45), tag(46), tag(45), tag(46), tag(46), tag(47)]
         );
-        std::fs::remove_dir_all(layout.prefix).unwrap();
+        std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
     /// THE PAIR'S ANSWER REFINES `AtpkgIndexSuccessorSelection`: for every pair of answers
@@ -1000,7 +967,7 @@ mod tests {
                 if chosen(&buggy) != real {
                     disagreed += 1;
                 }
-                std::fs::remove_dir_all(layout.prefix).unwrap();
+                std::fs::remove_dir_all(&layout.prefix).unwrap();
             }
         }
         assert!(disagreed > 0, "the historical choice must differ somewhere");
@@ -1035,7 +1002,7 @@ mod tests {
         assert_eq!(cached.near, Some((RangeAnswer::Missing, t0)));
         std::fs::write(layout.floor(), "44").unwrap();
         assert_eq!(cached_answer(&layout).near, None, "an older floor's stamp");
-        std::fs::remove_dir_all(layout.prefix).unwrap();
+        std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
     /// A request on GitHub's metered REST API: the anonymous budget of sixty an hour per IP
@@ -1044,12 +1011,10 @@ mod tests {
         url.starts_with("https://api.github.com/")
     }
 
-    /// PK-2 (audit 2026-09-23): in the steady state — the floor current and the next tags
-    /// absent — the probe once fetched a Releases listing at every five-minute stamp, about
-    /// twelve anonymous API requests an hour per machine. Drive the real probe for a hundred
-    /// ticks, thirty-one seconds apart, with every HEAD answering 404 on a recording
-    /// transport, the probe's only one: it asked exactly the next two index tags per tick —
-    /// and nothing on api.github.com.
+    /// NO API REQUEST IN THE STEADY STATE (the floor current and the next tags absent). Drive the
+    /// real probe for a hundred ticks, thirty-one seconds apart, with every HEAD answering 404 on a
+    /// recording transport, the probe's only one: it asked exactly the next two index tags per tick
+    /// — and nothing on api.github.com.
     #[test]
     fn a_hundred_steady_state_ticks_spend_only_unmetered_heads() {
         // The negative control: the predicate names the request the retired listing made,
@@ -1094,7 +1059,7 @@ mod tests {
             "only the next two tags, and never a metered request: {:?}",
             requested.iter().find(|url| metered(url))
         );
-        std::fs::remove_dir_all(layout.prefix).unwrap();
+        std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
     #[test]

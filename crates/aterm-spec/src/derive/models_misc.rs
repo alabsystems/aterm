@@ -324,7 +324,7 @@ pub fn trail_audio_start_latency_model() -> Model {
 /// `CursorGlow::cue_keystroke_shifted`, which records nothing unless the
 /// seam is open) and the `aterm ctl tone` verb (`sound_seam`, which names the
 /// gate that closed it). Each tick action is one CLASS of host config, as
-/// `tick_cursor_fx` folds it (`sound_seam::fold_window_audibility`):
+/// `App::cursor_frame` folds it (`sound_seam::fold_window_audibility`):
 ///
 /// * `TickLit` — master on, the window focused, amplitude nonzero.
 /// * `TickDarkMotion` — dark ONLY because of a motion policy: macOS Reduce
@@ -2693,8 +2693,9 @@ pub fn input_release_pairing_model() -> Model {
 /// Full two-phase overlap handoff shared by native-update parent and child.
 ///
 /// The parent parks its readers, a readerless child paints and proves the exact
-/// adoption/layout/session set, the parent rechecks every mutable admission fact,
-/// and one atomic Commit+exit grants ownership. The child releases its prebuilt
+/// adoption/layout/session set, the parent rechecks every mutable admission fact
+/// (the resident operator's quiesce among them since round eight's #70), and one
+/// atomic Commit+exit grants ownership. The child releases its prebuilt
 /// reader gate directly from Commit; the later UI wake is diagnostic only. Every
 /// pre-Commit failure signals the candidate's entire process group and then reaps
 /// the direct child before parent readers resume or deferred teardown replays —
@@ -2705,6 +2706,12 @@ pub fn input_release_pairing_model() -> Model {
 /// linearization point. It does not claim power-loss durability, and physical
 /// input arriving after Commit linearizes belongs to the replacement process's
 /// normal input path rather than this parent's pre-Commit admission snapshot.
+/// Input that reaches this parent while its main thread holds the claim
+/// (`arbiter == 1`) is the parent's: what the claim answers before the write
+/// (a live `video` request, the messages flush) can take real time, so the
+/// Commit drains that input through one more dispatch fence before it writes,
+/// or, undrained, gives the claim to the rejection (round eight of the update
+/// audit, #18).
 ///
 /// `Buggy=1` admits the regression family: partial/stale proof Commit, reader
 /// release on ProofReady, legacy ACK for ambiguous/scrolled state, parent resume
@@ -2713,7 +2720,9 @@ pub fn input_release_pairing_model() -> Model {
 /// write without checking the result (an EPIPE from a child already gone still ends
 /// the parent, and nobody owns the terminal), and a reject sweep whose signal
 /// reaches only the leader — `kill(pid)` where `kill(-pgid)` was meant, the mirror
-/// of 4a660aded's group-only sweep that missed a candidate outside its own group.
+/// of 4a660aded's group-only sweep that missed a candidate outside its own group;
+/// and a Commit written over input queued to the parent after its claim, which
+/// dies with the parent's `_exit` (round eight of the update audit, #18).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_overlap_handoff_model() -> Model {
@@ -2756,6 +2765,12 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var input_queue_quiet = 1;
             var native_safe = 1;
             var commit_channel = 1;
+            // THE RESIDENT OPERATOR IS FENCED FOR THE REPLACEMENT (round eight
+            // of the update audit, #70): its quiesce is one of the admission's
+            // facts, not a precondition kept beside them. A transaction in
+            // flight at the Commit refuses it — as activity, retried — and the
+            // rollback is the one every other refusal takes.
+            var operator_quiesced = 1;
             // Shared atomic linearization point after ProofReady:
             // 0 Waiting, 1 Committing, 2 Rejecting, 3 Committed.
             var arbiter = 0;
@@ -2788,11 +2803,12 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var launched_early = 0;
             var granted = 0;
             var retired = 0;
-            // A revoked successor is proven gone one of two ways, and the
-            // difference is exactly who forgives its counted trial launch: it
-            // EXITS on the closed rendezvous by its own rule (this flag), or it
-            // ignores the EOF for the whole grace and we kill it. Both reach
-            // `child_reaped`; only the second is a kill of ours.
+            // A revoked successor is proven gone one of two ways: with no
+            // signal of ours (this flag) — it EXITS on the closed rendezvous by
+            // its own rule, or it had died before it — or it ignores the EOF
+            // for the whole grace and we kill it. Both reach `child_reaped`;
+            // only the second is a kill of ours. Who gives its counted trial
+            // launch back is the death's evidence's to decide, not modelled here.
             var successor_exited = 0;
 
             action SelectLegacyBridge when (
@@ -2857,7 +2873,9 @@ pub fn native_update_overlap_handoff_model() -> Model {
             // closed rendezvous is a zero-byte `recv` it already maps to "the
             // parent closed the rendezvous", so it forgives its own trial launch
             // and exits before any window. Nothing of ours signalled it, so
-            // `group_signaled` stays 0 and the parent forgives nothing.
+            // `group_signaled` stays 0. A successor already dead when the
+            // revoke lands (a hang-up, the machine's kill during the hold) takes
+            // this action too, having run no such exit.
             action SuccessorExitsOnRevoke when (
                 phase == 0 && launched_early == 1 && child_live == 1 &&
                 granted == 0 && failure == 1 && arbiter == 2 &&
@@ -2969,13 +2987,16 @@ pub fn native_update_overlap_handoff_model() -> Model {
             // Hardware input queued in the OS is no longer a failure — it
             // parks Commit (the admission guard requires the queue drained)
             // until the run loop delivers it to the persistent masters.
+            // Input queues to the parent until it exits: while the Commit is
+            // admitted too, and while its claim is held (`arbiter == 1`), since
+            // what the claim answers before the write takes real time (#18).
             action QueueHardwareInput when (
-                phase == 3 && input_queue_quiet == 1 && arbiter == 0
+                phase == 3 && input_queue_quiet == 1 && arbiter <= 1
             ) {
                 input_queue_quiet = 0;
             }
             action DrainQueuedHardwareInput when (
-                phase == 3 && input_queue_quiet == 0 && arbiter == 0
+                phase == 3 && input_queue_quiet == 0 && arbiter <= 1
             ) {
                 input_queue_quiet = 1;
             }
@@ -2984,6 +3005,15 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 arbiter == 0 && failure == 0
             ) {
                 native_safe = 0;
+                failure = 1;
+            }
+            // The embedded fleet operator holds a proposal or observer
+            // transaction (or its gate) when the Commit asks it to quiesce.
+            action ResidentOperatorBusyAtCommit when (
+                protocol == 0 && phase == 3 && operator_quiesced == 1 &&
+                arbiter == 0 && failure == 0
+            ) {
+                operator_quiesced = 0;
                 failure = 1;
             }
             action ParentReaderResumesBeforeCommit when (
@@ -3030,7 +3060,7 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 epoch_exact == 1 &&
                 teardown_allows == 1 && sessions_alive == 1 &&
                 input_queue_quiet == 1 && native_safe == 1 &&
-                failure == 0
+                operator_quiesced == 1 && failure == 0
             ) {
                 arbiter = 1;
                 commit_admission_exact = 1;
@@ -3064,14 +3094,29 @@ pub fn native_update_overlap_handoff_model() -> Model {
             ) {
                 late_cancel = 1;
             }
+            // The write waits for the input queued under the claim to drain
+            // into the masters: the dispatch fence the held claim goes through
+            // (`App::finish_proven_handoff`, `HeldCommit`; #18).
             action CommitModern when (
                 protocol == 0 && phase == 3 && child_live == 1 &&
-                arbiter == 1 && commit_admission_exact == 1
+                arbiter == 1 && commit_admission_exact == 1 && input_queue_quiet == 1
             ) {
                 phase = 4;
                 arbiter = 3;
                 commit = 1;
                 parent_exited = 1;
+            }
+            // The held claim's fence ran out with input still undelivered (its
+            // drain deadline, a sink that never settles), or its admission, read
+            // again after the fence, refused it: the claim goes to the
+            // rejection, as a failed Commit write's does, and grants nothing.
+            action HeldClaimRefused when (
+                protocol == 0 && phase == 3 && arbiter == 1 &&
+                commit_admission_exact == 1 && commit == 0 && input_queue_quiet == 0
+            ) {
+                arbiter = 2;
+                failure = 1;
+                commit_admission_exact = 0;
             }
             // Shipping never reaps (`try_wait`) after ProofReady. A child that
             // exits before Commit is seen by the worker's NON-REAPING liveness
@@ -3129,6 +3174,18 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 phase = 4;
                 parent_exited = 1;
                 commit_write_failed = 1;
+            }
+            // Round eight's #18 as it stood: the Commit written at once after
+            // what its claim answered, over the input queued to the parent
+            // meanwhile, which then dies with the `_exit`.
+            action BuggyCommitOverQueuedInput when (
+                Buggy == 1 && protocol == 0 && phase == 3 && child_live == 1 &&
+                arbiter == 1 && commit_admission_exact == 1 && input_queue_quiet == 0
+            ) {
+                phase = 4;
+                arbiter = 3;
+                commit = 1;
+                parent_exited = 1;
             }
             action BuggyReleaseReadersOnProof when (
                 Buggy == 1 && phase == 3 && proof_complete == 1 && proof_exact == 1
@@ -3246,7 +3303,7 @@ pub fn native_update_overlap_handoff_model() -> Model {
                     proof_complete == 1 && proof_exact == 1 && sessions_exact == 1 &&
                     layout_exact == 1 && epoch_exact == 1 && teardown_allows == 1 &&
                     sessions_alive == 1 && input_queue_quiet == 1 && native_safe == 1 &&
-                    commit_channel == 1 && failure == 0 &&
+                    commit_channel == 1 && operator_quiesced == 1 && failure == 0 &&
                     commit_admission_exact == 1 && arbiter == 3
                 } else {
                     commit == 0
@@ -6570,7 +6627,7 @@ pub fn native_preview_font_convergence_model() -> Model {
 ///   `InstallCurrent` arm's `cache_active_semantic()`: a superseded result parks
 ///   the active renderer and leaves nothing painting (`NoncurrentPreservesActive`).
 ///
-/// Tier-1 is in aterm-gui, in two halves: `tests/semantic_prewarm_conformance.rs`
+/// Tier-1 is in aterm-gui, in two halves: `src/semantic_prewarm_conformance.rs`
 /// enumerates the pure `semantic_prewarm_result_decision` over the lattice, and
 /// `tray_raster`'s `semantic_prewarm_poll_conforms_to_the_handshake_slot_effects`
 /// lands every lattice point through the real `poll_semantic_renderer` and reads
@@ -6939,8 +6996,8 @@ pub fn session_chrome_expiry_model() -> Model {
 /// drift-free twin of `aterm-search::streaming::StreamingSearch`
 /// (`crates/aterm-search/src/streaming/engine/`). SUPERSEDES the never-committed
 /// hand `StreamingSearch.tla` the module docs used to reference — this derived
-/// model is the spec of record; if the missing hand `.tla` ever surfaces it goes
-/// to `aterm-spec-models/specs/legacy/`, never into the active checked set.
+/// model is the spec of record; a hand `.tla` never joins the checked set beside
+/// it.
 ///
 /// Variable encoding (all scalar; projections are the engine's public accessors):
 ///   * `state`  — 0 Idle, 1 Searching, 2 HasResults, 3 NoResults

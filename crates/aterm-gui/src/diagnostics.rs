@@ -46,6 +46,12 @@ pub(crate) struct DiagInfo {
     /// full_disk_access=unknown`: no report may reach tccd from a path a test
     /// can construct. See [`privacy_line`].
     pub privacy: String,
+    /// The macOS debugger rule (developer mode) — ONLY when a probe was
+    /// injected — plus whether this aterm is hardened against a same-user
+    /// debugger. [`collect`] passes the inert arm, so this reads
+    /// `mode=unknown … probe=none`: `--diagnose` spawns no `DevToolsSecurity`.
+    /// See [`debugger_line`].
+    pub debugger: String,
     pub features: Vec<(&'static str, bool)>,
     pub capabilities: Vec<(&'static str, bool)>,
     /// Of the Objective-C protocols the window layer's declared classes claim
@@ -179,6 +185,7 @@ impl DiagInfo {
         let _ = writeln!(s, "shell-int: {}", self.shell_integration_runtime);
         let _ = writeln!(s, "primer:    {}", self.agent_primer);
         let _ = writeln!(s, "privacy:   {}", self.privacy);
+        let _ = writeln!(s, "debugger:  {}", self.debugger);
         if !cfg!(target_os = "macos") {
             let _ = writeln!(s, "objc:      n/a (not macOS)");
         } else if self.objc_protocols_absent.is_empty() {
@@ -381,6 +388,46 @@ pub(crate) fn privacy_line(
     )
 }
 
+/// The `debugger:` line: the macOS debugger rule (developer mode, the
+/// Authorization Services right `system.privilege.taskport.debug` — not TCC),
+/// the account's membership, and this aterm's own hardening — the rule only if
+/// a probe was handed in.
+///
+/// THE PROBE IS A PARAMETER, for the reason [`privacy_line`]'s is: the probe
+/// spawns `DevToolsSecurity -status`, and `--diagnose` is headless-constructible
+/// and runs in test binaries. [`collect`] passes `None`, which renders
+/// `mode=unknown member=unknown … probe=none`; `unknown` means aterm did not
+/// look, never that developer mode is off. The hardening fact is a parameter
+/// too, so a test can render every posture; `collect` reads it with one
+/// `csops` about its own image, which spawns nothing and raises nothing.
+///
+/// Both switches gate it as they gate the Full Disk Access probe (design §3.9):
+/// `enabled = false` collapses the line to one sentence, and `check = false`
+/// names the configuration (`probe=off`) instead of a state.
+pub(crate) fn debugger_line(
+    config: &crate::app_config::Config,
+    probe: Option<aterm_containment::consent::DebuggerProbe>,
+    hardening: aterm_containment::consent::SelfHardening,
+) -> String {
+    use aterm_containment::consent::{DebuggerMember, DebuggerMode, TASKPORT_DEBUG_RIGHT};
+
+    if !config.privacy_enabled() {
+        return "off ([privacy] enabled = false) — every debugger field reads unknown".to_string();
+    }
+    let (mode, member, probe_label) = match (config.privacy_probe_gate().permits(), probe) {
+        (false, _) => (DebuggerMode::Unknown, DebuggerMember::Unknown, "off"),
+        (true, None) => (DebuggerMode::Unknown, DebuggerMember::Unknown, "none"),
+        (true, Some(probe)) => (probe.mode, probe.member, probe.label.as_str()),
+    };
+    format!(
+        "mode={mode} member={member} self_hardened={hardened} right={TASKPORT_DEBUG_RIGHT} \
+         probe={probe_label}",
+        mode = mode.as_str(),
+        member = member.as_str(),
+        hardened = hardening.as_str(),
+    )
+}
+
 /// Collect diagnostics from the live build + environment.
 pub(crate) fn collect() -> DiagInfo {
     let config = crate::app_config::load_config();
@@ -403,8 +450,8 @@ pub(crate) fn collect() -> DiagInfo {
 
     DiagInfo {
         version: crate::build_info::version_display().to_string(),
-        git_commit: crate::build_info::GIT_COMMIT,
-        build_time: crate::build_info::BUILD_TIME,
+        git_commit: crate::build_info::git_commit(),
+        build_time: crate::build_info::build_time(),
         target_os: std::env::consts::OS,
         target_arch: std::env::consts::ARCH,
         profile: if cfg!(debug_assertions) {
@@ -418,6 +465,7 @@ pub(crate) fn collect() -> DiagInfo {
         shell_integration_runtime: shell_integration_runtime(&config),
         agent_primer: agent_primer_line(&config),
         privacy: privacy_line(&config, None),
+        debugger: debugger_line(&config, None, aterm_containment::consent::self_hardening()),
         features: vec![
             ("sixel", cfg!(feature = "sixel")),
             ("a11y-appkit", cfg!(feature = "a11y-appkit")),
@@ -547,6 +595,58 @@ fn keybinding_row_warning(
     })
 }
 
+/// `[update] owner/repo` and `[packages] account` point aterm at another release
+/// channel or package index. Only a development build reads them
+/// (`update_dev`/`packages_dev`: `aterm_update_core::REPOINT_IS_A_DEV_SEAM`,
+/// `atpkg::config::DEV_SEAMS`); a shipped build ignores any value, so there the
+/// warning is that the key does nothing, and only a development build gets the
+/// name check.
+fn repoint_warnings(
+    config: &crate::app_config::Config,
+    update_dev: bool,
+    packages_dev: bool,
+) -> Vec<ConfigSemanticWarning> {
+    let mut warnings = Vec::new();
+    let mut check = |key: &'static str, value: Option<&str>, dev: bool, fallback: &str| {
+        // A blank value reads as unset in every build: nothing to say.
+        let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+            return;
+        };
+        let message = if !dev {
+            format!("{key}: a development setting this build does not read; remove it")
+        } else if !aterm_update_core::is_valid_slug(value.trim()) {
+            format!("{key}: {value:?} is not a GitHub name; {fallback}")
+        } else {
+            return;
+        };
+        warnings.push(ConfigSemanticWarning { key, message });
+    };
+    if let Some(update) = config.update.as_ref() {
+        check(
+            "update.owner",
+            update.owner.as_deref(),
+            update_dev,
+            "the default owner is used",
+        );
+        check(
+            "update.repo",
+            update.repo.as_deref(),
+            update_dev,
+            "the default repo is used",
+        );
+    }
+    if let Some(packages) = config.packages.as_ref() {
+        let account = packages.account.as_deref();
+        check(
+            "packages.account",
+            account,
+            packages_dev,
+            "the default index is used",
+        );
+    }
+    warnings
+}
+
 /// Semantic checks that require no filesystem, platform service, or ambient
 /// capability. Keeping this subset separate lets the config editor stay pure
 /// and responsive while sharing the exact keybinding/sequence and palette
@@ -622,37 +722,11 @@ pub(crate) fn config_semantic_warnings(
         }
     }
 
-    if let Some(update) = config.update.as_ref() {
-        for (key, value) in [
-            ("update.owner", update.owner.as_deref()),
-            ("update.repo", update.repo.as_deref()),
-        ] {
-            if let Some(value) = value
-                && !aterm_update_core::is_valid_slug(value.trim())
-            {
-                warnings.push(ConfigSemanticWarning {
-                    key,
-                    message: format!(
-                        "{key} value {value:?} is not a safe GitHub slug and is ignored; the compiled default is used"
-                    ),
-                });
-            }
-        }
-    }
-
-    if let Some(account) = config
-        .packages
-        .as_ref()
-        .and_then(|packages| packages.account.as_deref())
-        && !aterm_update_core::is_valid_slug(account.trim())
-    {
-        warnings.push(ConfigSemanticWarning {
-            key: "packages.account",
-            message: format!(
-                "packages.account value {account:?} is not a safe GitHub owner slug and is ignored; atpkg uses the compiled index account"
-            ),
-        });
-    }
+    warnings.extend(repoint_warnings(
+        config,
+        aterm_update_core::REPOINT_IS_A_DEV_SEAM,
+        atpkg::config::DEV_SEAMS,
+    ));
     if let Some(privacy) = config.privacy.as_ref() {
         // RESERVED AND UNIMPLEMENTED, said out loud. aterm has no supported way
         // to answer a macOS consent dialog and would not want one — a terminal
@@ -661,13 +735,20 @@ pub(crate) fn config_semantic_warnings(
         // an unknown key says nothing, and a key that quietly does nothing is
         // the exact failure `--validate-config` exists to catch. The message
         // names the grant that DOES work, and stops there — it does not promise
-        // the grant removes every prompt.
+        // the grant removes every prompt. Its second sentence covers the other
+        // dialog a reader of this key has in mind: the debugger's administrator
+        // password (Developer Tools Access) is not TCC and no grant reaches it,
+        // so it points at the Debugger access row on the same Settings page,
+        // where the owner's own press changes the rule — aterm still answers no
+        // dialog (docs/DESIGN-macos-debugger-access-2026-09-29.md §3.9, O7).
         if privacy.auto_accept == Some(true) {
             warnings.push(ConfigSemanticWarning {
                 key: "privacy.auto_accept",
                 message: "privacy.auto_accept is reserved and not implemented: aterm does not \
                           answer macOS consent dialogs; grant Full Disk Access instead \
-                          (Settings \u{25b8} Security)"
+                          (Settings \u{25b8} Security). It does not answer macOS password \
+                          dialogs either; for the debugger password, see Debugger access on \
+                          the same page (Settings \u{25b8} Security)"
                     .to_string(),
             });
         }
@@ -2466,7 +2547,11 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     let tab_strip_rows = crate::app_config::resolve_tab_strip_rows(&config);
     let themes = crate::app_config::ThemeCatalog::discover();
     let theme_name = show_config_theme(&config, &themes);
-    let tc = config.applied_terminal_config_for_with_assets(aterm_types::Appearance::Dark, &themes);
+    let [dark, light] = [
+        aterm_types::Appearance::Dark,
+        aterm_types::Appearance::Light,
+    ]
+    .map(|appearance| config.applied_terminal_config_for_with_assets(appearance, &themes));
     // The same effective resolution and admission the renderer uses (`--font` >
     // config > platform default), so `--show-config` reports the face that actually
     // loads — on a pristine config, or a family that does not load, that is
@@ -2535,15 +2620,26 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     );
     let _ = writeln!(
         s,
-        "foreground:     #{:02X}{:02X}{:02X}",
-        tc.default_foreground.r, tc.default_foreground.g, tc.default_foreground.b
+        "foreground:     {}",
+        appearance_colours(dark.default_foreground, light.default_foreground)
     );
     let _ = writeln!(
         s,
-        "background:     #{:02X}{:02X}{:02X}",
-        tc.default_background.r, tc.default_background.g, tc.default_background.b
+        "background:     {}",
+        appearance_colours(dark.default_background, light.default_background)
     );
     s
+}
+
+/// One `--show-config` colour row: a single `#RRGGBB` when both OS appearances
+/// draw the same colour, else both, labelled (a `dark:…,light:…` theme split).
+fn appearance_colours(dark: aterm_types::Rgb, light: aterm_types::Rgb) -> String {
+    let hex = |c: aterm_types::Rgb| format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b);
+    if dark == light {
+        hex(dark)
+    } else {
+        format!("{} (dark) / {} (light)", hex(dark), hex(light))
+    }
 }
 
 /// `--show-face`: the resolved font FACE for `family` — the file aterm would
@@ -2776,6 +2872,32 @@ mod tests {
     }
 
     #[test]
+    fn repoint_keys_say_a_shipped_build_does_not_read_them() {
+        let config =
+            parsed("[update]\nowner = \"me\"\nrepo = \"\"\n[packages]\naccount = \"me/x\"\n");
+        let shipped: Vec<String> = repoint_warnings(&config, false, false)
+            .into_iter()
+            .map(|warning| warning.message)
+            .collect();
+        assert_eq!(
+            shipped,
+            [
+                "update.owner: a development setting this build does not read; remove it",
+                "packages.account: a development setting this build does not read; remove it",
+            ],
+            "a valid name is still ignored by a shipped build; a blank one is harmless"
+        );
+        let dev: Vec<String> = repoint_warnings(&config, true, true)
+            .into_iter()
+            .map(|warning| warning.message)
+            .collect();
+        assert_eq!(
+            dev,
+            ["packages.account: \"me/x\" is not a GitHub name; the default index is used",]
+        );
+    }
+
+    #[test]
     fn pure_semantics_report_runtime_fallbacks_instead_of_false_green() {
         let source = r##"
 font_px = 201
@@ -2783,7 +2905,7 @@ font_variation = ["wght=450", "not-an-axis"]
 font_features = ["+ss01 toolong", "cv01=2"]
 
 [update]
-owner = ""
+owner = "bad owner"
 repo = "bad/repo"
 
 [packages]
@@ -3349,17 +3471,7 @@ ink = "rainbow"
 
     #[test]
     fn host_validation_reports_only_authored_launch_flag_masking() {
-        const CHILD: &str = "ATERM_HOST_OVERRIDE_WARNING_CHILD";
-        const EXACT: &str =
-            "diagnostics::tests::host_validation_reports_only_authored_launch_flag_masking";
-        if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", EXACT, "--nocapture"])
-                .env(CHILD, "1")
-                .env("RUST_TEST_THREADS", "1")
-                .status()
-                .expect("launch isolated launch-flag precedence validation");
-            assert!(status.success());
+        if !crate::test_alone::alone() {
             return;
         }
         // The child process's own launch flags: `--columns 120` (process-wide, so
@@ -4106,6 +4218,9 @@ ink = "rainbow"
                       warmup=on-request folders=documents,desktop,downloads hold_ms=120000 \
                       probe_interval_ms=5000 protected_roots=17 notice=on report_attribution=on"
                 .into(),
+            debugger: "mode=unknown member=unknown self_hardened=yes \
+                       right=system.privilege.taskport.debug probe=none"
+                .into(),
             features: vec![("sixel", true), ("accessibility", false)],
             capabilities: vec![("kitty_graphics", true), ("soft_fonts", false)],
             objc_protocols_absent: vec!["NSApplicationDelegate"],
@@ -4491,6 +4606,93 @@ ink = "rainbow"
         );
     }
 
+    /// The `debugger:` line renders the debugger rule only from an injected
+    /// probe, and the headless report never spawns `DevToolsSecurity`: the
+    /// inert arm (`None`, what [`collect`] passes) reads `mode=unknown
+    /// probe=none`, which is "aterm did not look", never "disabled".
+    #[test]
+    fn the_debugger_line_reports_unknown_from_the_inert_arm_and_never_probes() {
+        use aterm_containment::consent::{
+            DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, SelfHardening,
+        };
+
+        let config = parsed("");
+        let inert = debugger_line(&config, None, SelfHardening::NotHardened);
+        assert_eq!(
+            inert,
+            "mode=unknown member=unknown self_hardened=no \
+             right=system.privilege.taskport.debug probe=none"
+        );
+
+        // The live arm renders exactly what it was handed.
+        let observed = DebuggerProbe {
+            mode: DebuggerMode::Disabled,
+            member: DebuggerMember::Admin,
+            label: DebuggerProbeLabel::StatusOk,
+        };
+        let live = debugger_line(&config, Some(observed), SelfHardening::Hardened);
+        assert!(
+            live.starts_with("mode=disabled member=admin self_hardened=yes ")
+                && live.ends_with(" probe=status_ok"),
+            "{live}"
+        );
+        // A refusal carried by the probe is its own label, never a mode.
+        let refused = debugger_line(
+            &config,
+            Some(DebuggerProbe::refused(
+                DebuggerProbeLabel::RefusedOutOfBundle,
+            )),
+            SelfHardening::Unknown,
+        );
+        assert!(
+            refused.starts_with("mode=unknown member=unknown self_hardened=unknown ")
+                && refused.ends_with(" probe=refused_out_of_bundle"),
+            "{refused}"
+        );
+
+        // `check = false` names the CONFIGURATION, and the injected probe is
+        // ignored because the gate refuses first.
+        let unchecked = debugger_line(
+            &parsed("[privacy]\ncheck = false\n"),
+            Some(observed),
+            SelfHardening::Hardened,
+        );
+        assert!(
+            unchecked.starts_with("mode=unknown member=unknown ")
+                && unchecked.ends_with(" probe=off"),
+            "{unchecked}"
+        );
+
+        // The master switch collapses the whole line to one honest sentence.
+        let disabled = debugger_line(
+            &parsed("[privacy]\nenabled = false\n"),
+            Some(observed),
+            SelfHardening::Hardened,
+        );
+        assert!(
+            disabled.starts_with("off ([privacy] enabled = false)")
+                && disabled.contains("reads unknown"),
+            "{disabled}"
+        );
+
+        // The rendered report carries the line under its own label, and the
+        // REAL collection never carries a probe outcome.
+        assert!(
+            sample()
+                .render()
+                .contains("\ndebugger:  mode=unknown member=unknown "),
+            "the section is rendered under its own label"
+        );
+        let live_collect = collect().debugger;
+        assert!(
+            live_collect.starts_with("off ([privacy]")
+                || (live_collect.starts_with("mode=unknown member=unknown ")
+                    && (live_collect.ends_with(" probe=none")
+                        || live_collect.ends_with(" probe=off"))),
+            "collect() must never perform the probe: {live_collect}"
+        );
+    }
+
     /// `collect` reads the REAL home read-only and the real config's knob: the
     /// line always names every registry agent and states the knob either way.
     #[test]
@@ -4838,6 +5040,16 @@ ink = "rainbow"
                 "the paste alert is macOS's to name, and only macOS's: {message}"
             );
         }
+    }
+
+    #[test]
+    fn show_config_colour_rows_name_both_appearances_when_they_differ() {
+        let rgb = |r, g, b| aterm_types::Rgb { r, g, b };
+        assert_eq!(appearance_colours(rgb(1, 2, 3), rgb(1, 2, 3)), "#010203");
+        assert_eq!(
+            appearance_colours(rgb(0, 0, 0), rgb(255, 255, 254)),
+            "#000000 (dark) / #FFFFFE (light)"
+        );
     }
 
     #[test]

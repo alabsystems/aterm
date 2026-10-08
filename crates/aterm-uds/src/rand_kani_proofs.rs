@@ -1,41 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Kani proofs — the hex-token encoding behind every single-use auth token
-//! and handoff nonce in the workspace ([`crate::rand::hex_encode`]).
+//! Kani proofs for [`crate::rand::hex_encode`], the encoding behind every
+//! single-use auth token and handoff nonce in the workspace.
 //!
-//! These proofs verify **non-trivial** properties (per `design doc` "Kani
-//! proof quality rule"). No stubs, no `assert!(true)`, no constructor-echo.
+//! 1. [`hex_encode_roundtrips_every_input`]: for every 16-byte input (the
+//!    seamless-handoff nonce width) the output is exactly 32 lowercase ASCII
+//!    hex bytes, and an independent decoder recovers the input, so encoding is
+//!    injective and two distinct nonces never print alike.
+//! 2. [`hex_encode_width_is_invariant`]: the `2N` length contract at a second
+//!    width (8 bytes, the tempfile-suffix shape), so the const-generic
+//!    arithmetic is proved per width rather than assumed.
 //!
-//! # Two harnesses
+//! Runner: `KANI_CRATE=aterm-uds scripts/verify-kani-proofs.sh` (run by
+//! `tools/verify.sh --full`), not stock `cargo kani`.
 //!
-//!   1. [`hex_encode_roundtrips_every_input`] — for ALL 2^128 symbolic
-//!      16-byte inputs (the seamless-handoff nonce width), the output is
-//!      exactly 32 bytes, every byte is lowercase ASCII hex, and an
-//!      independently-written inline decoder recovers the input byte-for-byte
-//!      (encode is exact, hence injective, hence collision-free at the token
-//!      layer — two distinct nonces can never print alike).
-//!   2. [`hex_encode_width_is_invariant`] — the `2N` output-length contract
-//!      holds at a second, non-nonce width (8 bytes, the tempfile-suffix
-//!      shape), so the const-generic arithmetic is proved per-width rather
-//!      than assumed to generalize.
-//!
-//! Why this module exists at all: the 2026-07-04/05 kernel-panic incident was
-//! a hand-rolled entropy reader (`fs::read` pointed at `/dev/urandom`,
-//! read-to-EOF on a never-EOF device). The retirement plan is one audited surface
-//! (`rand::fill`/`rand::hex_token`) whose I/O is bounded by construction and
-//! whose pure half is PROVED here; `tools/grep_guard.sh` bans the literal
-//! elsewhere so the class cannot quietly return.
-//!
-//! Runner: `KANI_CRATE=aterm-uds scripts/verify-kani-proofs.sh` (the trust-mc
-//! floor stage of `tools/verify.sh --full` runs exactly that). Never invoke
-//! stock `cargo kani` directly — verification is discharged by trust-mc + ay.
-//!
-//! Each harness directly binds `kani::any()` calls in its body (not via a
-//! helper function) so the content-quality classifier (`aterm formal mc`,
-//! #7954 — `trust-mc`'s substantive-proof check, folded into the Trust
-//! compiler) sees the symbolic inputs and classifies the proof as
-//! `substantive`.
+//! Each harness binds its `kani::any()` calls directly in its body, not via a
+//! helper, so trust-mc's proof-quality check classifies it as substantive.
 
 #![cfg(kani)]
 
@@ -48,13 +29,13 @@ fn undigit(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
         b'a'..=b'f' => c - b'a' + 10,
-        // The harness asserts the charset BEFORE decoding, so this arm being
+        // The harness asserts the charset before decoding, so this arm being
         // reached is itself a proof failure.
         _ => unreachable!("non-hex byte escaped the charset assertion"),
     }
 }
 
-/// Property 1: over ALL 16-byte inputs, `hex_encode` emits exactly 32
+/// Property 1: over all 16-byte inputs, `hex_encode` emits exactly 32
 /// lowercase-ASCII-hex bytes that decode back to the input.
 #[kani::proof]
 fn hex_encode_roundtrips_every_input() {
@@ -84,8 +65,8 @@ fn hex_encode_roundtrips_every_input() {
 }
 
 /// Property 2: the `2N` width contract holds at a second const width, so the
-/// const-generic length arithmetic is proved rather than pattern-matched from
-/// the 16-byte case.
+/// const-generic length arithmetic is proved rather than inferred from the
+/// 16-byte case.
 #[kani::proof]
 fn hex_encode_width_is_invariant() {
     let bytes: [u8; 8] = kani::any();

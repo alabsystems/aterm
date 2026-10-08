@@ -86,18 +86,14 @@ pub fn build_label(build: u64) -> String {
 
 /// 64 lowercase hex digits: a sha256 as every vendor file spells it.
 fn is_hex64(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    aterm_codec::hex::is_lower(s, 64)
 }
 
 /// The index-program words no line about a vendor-direct program may carry (design
 /// §1.7): the index pin itself and the index as its update source. This crate still
 /// prints both for index programs — `managed <build> — pinned by index <N>`
 /// (`state::managed`) and doctor's fix-line `… (updates arrive with the ALab index)` — so
-/// a vendor row routed through either renderer would say them. (The index-update era's
-/// "within about an hour" and "pinned by aterm's signed index" have no writer left in
-/// this crate and are not screened.)
+/// a vendor row routed through either renderer would say them.
 #[cfg(test)]
 pub(crate) const INDEX_PROGRAM_WORDS: &[&str] =
     &["pinned by index", "updates arrive with the ALab index"];

@@ -9,9 +9,8 @@
 //! Its whole surface is `new`/`insert`/`get`/`remove`/`contains_key`/`clear`
 //! (plus `Clone`/`Default`/`Debug` for the struct's derives), and
 //! `aterm-vi`'s `kani_marks_map_carries_the_marks_surface` test drives exactly
-//! that set in the ordinary build. A dead-code sweep deleted four of those
-//! methods on 2026-09-25 and broke the Kani build of `aterm-vi`; the test is
-//! what keeps that from recurring.
+//! that set in the ordinary build, so a dead-code sweep that deletes one fails
+//! there instead of only in the Kani build.
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;

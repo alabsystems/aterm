@@ -1,21 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the Observation Kernel (L0) — exercise the REAL engine
-//! against the BEHAVIOR the abstract `watcher_latch_model` /
-//! `idle_deadline_model` (`aterm-spec`) prove: drive a genuine [`Terminal`]
-//! through [`Terminal::process_at`] with armed watchers and check the real latch
-//! decisions, plus a negative control so a pass is never vacuous. (These are
-//! behavioral conformance tests — they do not import or trace-validate the
-//! abstract `Model`; that lives in `aterm-spec`'s own `ty` checks.)
+//! Tier-1 conformance for the Observation Kernel (L0): drives a real
+//! [`Terminal`] through [`Terminal::process_at`] with armed watchers and checks
+//! the real latch decisions against what `aterm-spec`'s `watcher_latch_model` /
+//! `idle_deadline_model` prove, with negative controls. These are behavioural
+//! tests; the models' own checks live in `aterm-spec`.
 //!
-//! The headline property is **IdleFor-under-replay determinism**: feeding the
-//! same `(bytes, ClockReading)` schedule and expiring at *different* instants (a
-//! prompt live wake vs a lazy replay tick) latches the byte-identical
-//! [`Satisfaction`](aterm_core::terminal::Satisfaction) — because the kernel
-//! latches at the computed deadline, never the observation instant, and reads no
-//! wall clock. This is what lets the kernel coexist with the hydratable temporal
-//! buffer without perturbing `conformance_recording`.
+//! Headline property, IdleFor-under-replay determinism: the same
+//! `(bytes, ClockReading)` schedule expired at different instants (a live wake
+//! vs a lazy replay tick) latches the byte-identical
+//! [`Satisfaction`](aterm_core::terminal::Satisfaction), because the kernel
+//! latches at the computed deadline and reads no wall clock.
 
 use std::time::{Duration, Instant};
 
@@ -54,20 +50,15 @@ fn seq_advanced_latches_on_real_engine_output() {
 
 #[test]
 fn seq_advanced_latches_at_arm_when_content_already_moved() {
-    // REGRESSION: `SeqAdvanced` was edge-triggered — it was evaluated only from
-    // `post_process` after the NEXT batch, so a watcher armed against a STALE
-    // seq reported "nothing changed" while the advance was already on screen.
-    // Observed over the control socket as:
-    //     seq before = 2; send 'echo MARKER-A\n' -> seq after = 6
-    //     await seq 2 timeout 2000  ->  OK timeout   (WRONG)
-    // That is exactly a turn-based agent's dirty check ("did anything change
-    // since the seq I recorded last turn?"), and on a quiet session no further
-    // batch ever arrives, so it hung until the timeout and answered "no".
+    // `SeqAdvanced` is level-triggered: a watcher armed against a stale seq
+    // latches at arm time, not only after the next batch. That is a turn-based
+    // agent's dirty check ("did anything change since the seq I recorded?"), and
+    // on a quiet session no further batch may ever arrive.
     let base = Instant::now();
     let mut t = Terminal::new(24, 80);
     let stale = t.content_seq();
 
-    // Content advances BEFORE the watcher is armed.
+    // Content advances before the watcher is armed.
     t.process_at(b"MARKER-A\r\n", clock_at(base, 10));
     let after_output = t.content_seq();
     assert!(
@@ -75,7 +66,7 @@ fn seq_advanced_latches_at_arm_when_content_already_moved() {
         "precondition: real output advanced content_seq ({stale} -> {after_output})"
     );
 
-    // Arming against the pre-output seq must latch AT ARM — no further batch.
+    // Arming against the pre-output seq must latch at arm — no further batch.
     let id = t
         .watch(WatcherSpec::SeqAdvanced { after: stale }, base)
         .expect("arm");
@@ -90,10 +81,10 @@ fn seq_advanced_latches_at_arm_when_content_already_moved() {
 
 #[test]
 fn seq_advanced_arm_eval_does_not_disturb_a_concurrent_idle_deadline() {
-    // The arm-time evaluation runs `observe_at`, which must stay ACTIVITY-NEUTRAL:
+    // The arm-time evaluation runs `observe_at`, which must stay activity-neutral:
     // `Terminal::watch` seeds the activity baseline first, so the pass sees
     // `advanced == false` and cannot stamp phantom activity that would push out a
-    // concurrently-armed `IdleFor` deadline.
+    // concurrently armed `IdleFor` deadline.
     let base = Instant::now();
     let mut t = Terminal::new(24, 80);
     t.process_at(b"prior output\r\n", clock_at(base, 5));
@@ -103,7 +94,7 @@ fn seq_advanced_arm_eval_does_not_disturb_a_concurrent_idle_deadline() {
     let idle = t.watch(WatcherSpec::IdleFor { dur }, arm_at).expect("arm");
     let deadline_before = t.watch_next_deadline().expect("idle deadline armed");
 
-    // Arm a SeqAdvanced that WILL latch at arm (stale anchor) — the interesting case.
+    // Arm a SeqAdvanced that will latch at arm (stale anchor) — the interesting case.
     let _seq_watch = t
         .watch(WatcherSpec::SeqAdvanced { after: 0 }, arm_at)
         .expect("arm");
@@ -121,7 +112,7 @@ fn seq_advanced_arm_eval_does_not_disturb_a_concurrent_idle_deadline() {
 
 #[test]
 fn negative_control_non_content_batch_does_not_latch() {
-    // A batch that produces NO content mutation must NOT latch a SeqAdvanced
+    // A batch that produces no content mutation must not latch a SeqAdvanced
     // watcher — proving the kernel is bound to the real `content_seq` clock, not
     // merely to "a process_at happened". (Vacuity guard.)
     let base = Instant::now();
@@ -144,7 +135,7 @@ fn negative_control_non_content_batch_does_not_latch() {
 
 #[test]
 fn idle_latches_identically_live_vs_replay_on_the_real_engine() {
-    // THE determinism property, end-to-end through the real engine: same
+    // The determinism property, end-to-end through the real engine: same
     // (bytes, clock) schedule, two different expire instants -> identical latch.
     let base = Instant::now();
     let schedule: &[(&[u8], u64)] = &[(b"a", 10), (b"b", 20), (b"cc", 35)];
@@ -179,7 +170,7 @@ fn idle_latches_identically_live_vs_replay_on_the_real_engine() {
 #[test]
 fn idle_does_not_fire_before_the_deadline() {
     // Negative control for IdleFor: still-streaming output keeps pushing the
-    // deadline out, so an expire mid-stream must NOT latch.
+    // deadline out, so an expire mid-stream must not latch.
     let base = Instant::now();
     let dur = Duration::from_millis(100);
     let mut t = Terminal::new(24, 80);
@@ -199,7 +190,7 @@ fn idle_does_not_fire_before_the_deadline() {
 #[test]
 fn watchers_are_excluded_from_checkpoint_hydration() {
     // The replay-safety keystone: a checkpoint carries no watcher state, so a
-    // hydrated engine starts with an EMPTY kernel — armed watchers never travel
+    // hydrated engine starts with an empty kernel — armed watchers never travel
     // through a keyframe and so cannot perturb replay determinism.
     let base = Instant::now();
     let mut t = Terminal::new(6, 20);
@@ -221,7 +212,7 @@ fn watchers_are_excluded_from_checkpoint_hydration() {
 #[test]
 fn idle_baseline_is_arm_relative_not_reset_by_a_phantom_advance() {
     // Regression: the activity clock's `last_seq` defaults to 0. Arming an
-    // `IdleFor` against a surface whose `content_seq` is ALREADY > 0 must NOT make
+    // `IdleFor` against a surface whose `content_seq` is already > 0 must not make
     // the first post-arm batch look like a fresh content advance and reset the
     // idle deadline. `Terminal::watch` seeds the baseline at arm to close this.
     let base = Instant::now();
@@ -237,11 +228,11 @@ fn idle_baseline_is_arm_relative_not_reset_by_a_phantom_advance() {
     let arm_at = base + Duration::from_millis(10);
     let id = t.watch(WatcherSpec::IdleFor { dur }, arm_at).expect("arm");
 
-    // A content-LESS batch (a DSR cursor query paints no cells, so content_seq
-    // does NOT advance) must not phantom-reset the idle deadline.
+    // A content-less batch (a DSR cursor query paints no cells, so content_seq
+    // does not advance) must not phantom-reset the idle deadline.
     t.process_at(b"\x1b[6n", clock_at(base, 50));
 
-    // The deadline is ARM-relative: it fires at arm+dur, not at (50ms batch)+dur.
+    // The deadline is arm-relative: it fires at arm+dur, not at (50ms batch)+dur.
     assert!(
         t.watch_expire(arm_at + dur),
         "idle must latch at arm+dur — a phantom advance would have pushed it later"
@@ -249,12 +240,10 @@ fn idle_baseline_is_arm_relative_not_reset_by_a_phantom_advance() {
     assert_eq!(t.watch_poll(id).expect("latched").at, arm_at + dur);
 }
 
-/// REGRESSION (alt-screen blindness): `content_seq` is a **per-grid** counter, so
-/// a 1049 swap makes it incomparable — entering restarts it at 1, leaving restores
-/// the main grid's stale-but-higher value. The kernel used to compare it as if it
-/// were a session clock, so for the entire alt-screen lifetime `advanced` was
-/// false and EVERY predicate starved. That is precisely the advertised case: an
-/// alt-screen agent TUI (Claude, vim, htop).
+/// `content_seq` is a per-grid counter, so a 1049 swap makes it incomparable:
+/// entering restarts it at 1, leaving restores the main grid's higher value.
+/// The kernel must not compare it as a session clock, or every predicate
+/// starves for the whole alt-screen lifetime of an agent TUI (Claude, vim, htop).
 #[test]
 fn row_match_still_latches_after_entering_the_alt_screen() {
     let base = Instant::now();
@@ -272,7 +261,7 @@ fn row_match_still_latches_after_entering_the_alt_screen() {
     t.watch_disarm(seeded);
     assert!(main_seq > 1, "precondition: main grid counter is high");
 
-    // Enter the alt screen: a FRESH grid whose content_gen restarts near 1.
+    // Enter the alt screen: a fresh grid whose content_gen restarts near 1.
     t.process_at(b"\x1b[?1049h", clock_at(base, 100));
     assert!(t.is_alternate_screen(), "precondition: on the alt screen");
     assert!(
@@ -293,14 +282,12 @@ fn row_match_still_latches_after_entering_the_alt_screen() {
 
     assert!(
         t.watch_poll(id).is_some(),
-        "a row painted on the ALT grid must latch; the kernel used to compare the \
-         alt counter against the main grid's watermark and never scan at all"
+        "a row painted on the ALT grid must latch"
     );
 }
 
-/// The idle deadline must be reset by alt-screen output. Before the fix,
-/// `advanced` was false for every alt batch, so `await idle`/`turn` reported
-/// `settled` while the TUI was still streaming.
+/// Alt-screen output resets the idle deadline, so `await idle`/`turn` does not
+/// report `settled` while a TUI is still streaming.
 #[test]
 fn idle_deadline_is_reset_by_alt_screen_output() {
     let base = Instant::now();
@@ -333,7 +320,7 @@ fn idle_deadline_is_reset_by_alt_screen_output() {
     }
     let last_out = base + Duration::from_millis(150 + 9 * 50);
 
-    // At the ORIGINAL deadline the watcher must NOT have fired: output kept
+    // At the original deadline the watcher must not have fired: output kept
     // pushing it out.
     t.watch_expire(arm_at + dur);
     assert!(
@@ -342,7 +329,7 @@ fn idle_deadline_is_reset_by_alt_screen_output() {
          never reset because the alt counter looked like it never advanced"
     );
 
-    // It fires only after real quiescence past the LAST output.
+    // It fires only after real quiescence past the last output.
     t.watch_expire(last_out + dur + Duration::from_millis(1));
     assert!(
         t.watch_poll(idle).is_some(),
@@ -401,15 +388,12 @@ impl aterm_core::terminal::RowMatch for ContainsBoxB {
     }
 }
 
-/// REGRESSION (the equal-seq re-entry): a TUI that leaves and re-enters the
-/// alternate screen and draws a second dialog with the same number of writes
-/// lands on the SAME `content_seq` on the SAME grid flag — box A `ls-box-A`
-/// and box B `rm-box-B` both read `seq=15` on a private headless aterm. The
-/// kernel keyed change on `(seq, alt)`, neither of which moved, so an `await
-/// match` armed while box A showed answered `OK timeout` while `text` showed
-/// box B. The screen GENERATION (`invalidation_epoch`, advanced by every screen
-/// switch) is what moved; the kernel now keys on it. Both shapes: the whole
-/// re-entry in ONE batch, and the switch and the paint split across two.
+/// Equal-seq re-entry: a TUI that leaves and re-enters the alternate screen and
+/// draws a second dialog with the same number of writes lands on the same
+/// `content_seq` with the same alt flag. The kernel keys change on the screen
+/// generation (`invalidation_epoch`, advanced by every switch), so an `await
+/// match` armed on the first dialog latches on the second. Both shapes: the
+/// re-entry in one batch, and the switch and paint split across two.
 #[test]
 fn a_row_match_latches_across_an_equal_seq_alt_screen_re_entry() {
     for split in [false, true] {
@@ -466,9 +450,8 @@ fn a_row_match_latches_across_an_equal_seq_alt_screen_re_entry() {
     }
 }
 
-/// NEGATIVE CONTROL for the above: with no screen switch, a repaint that keeps
-/// the seq and the text latches nothing — the generation is not a clock that
-/// fires on every batch.
+/// Negative control: with no screen switch, a repaint that keeps the seq and
+/// the text latches nothing; the generation is not a per-batch clock.
 #[test]
 fn an_unmoved_generation_latches_nothing() {
     let base = Instant::now();
@@ -493,16 +476,13 @@ fn an_unmoved_generation_latches_nothing() {
     assert!(t.watch_poll(seq_watch).is_none());
 }
 
-/// TIER-1 for `aterm_spec`'s `ObservationScreenGeneration`: drive the real
-/// engine through real batches — writes, and leave-and-re-enter switches with
-/// and without a paint in the same batch — and before each one arm a fresh
-/// `SeqAdvanced` at the current seq (the kernel's own view of "unchanged").
-/// Project the real `content_seq` / `invalidation_epoch` before and after the
-/// batch onto the model's `seen_seq`/`seen_epoch` and `seq`/`epoch`, fire the
-/// model's `Observe`, and require the real latch to agree with it: latched
-/// exactly when the model reads an advance. NEGATIVE CONTROL: the old
-/// `(seq, alt)` test (`Buggy=1`) disagrees with the real kernel on the
-/// equal-seq re-entry this schedule contains, so the bind is not vacuous.
+/// Tier-1 for `aterm_spec`'s `ObservationScreenGeneration`: drive real batches
+/// (writes, and leave-and-re-enter switches with and without a paint in the
+/// same batch), arming a fresh `SeqAdvanced` at the current seq before each.
+/// Project `content_seq` / `invalidation_epoch` before and after onto the
+/// model's `seen_seq`/`seen_epoch` and `seq`/`epoch`, fire `Observe`, and
+/// require the real latch to agree. Negative control: the `(seq, alt)` key
+/// (`Buggy=1`) disagrees with the real kernel on the equal-seq re-entry.
 #[test]
 fn the_kernel_change_test_conforms_to_the_screen_generation_model() {
     use aterm_spec::derive::observation_screen_generation_model;

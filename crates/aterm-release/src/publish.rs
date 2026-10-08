@@ -2,9 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Publish (release spec §7 steps 5–6) + the whole `cut` pipeline. A cut publishes
-//! ONCE, straight onto the release channel installed copies read (owner ruling R4,
-//! 2026-09-23; the private-origin draft/flip/archive/verify leg and the mirror that
-//! copied it are gone since 2026-09-26): the annotated tag goes to origin, then
+//! ONCE, straight onto the release channel installed copies read (owner ruling R4):
+//! the annotated tag goes to origin, then
 //! `publish` ([`step_publish`], [`channel::publish_on_channel`]) checks the fleet's
 //! floors, binds the channel's release for this tag — the engine's source prerelease,
 //! adopted, or a draft it creates — uploads every asset once by immutable release ID
@@ -101,11 +100,10 @@ pub enum CutKind {
 }
 
 /// How an operator runs a cut — the ONE spelling every cutter remedy that says
-/// "resume", "abandon" or "cut again" names (2026-09-23). The documented launcher,
-/// never a bare `targo --unverified ship cut`: from a shell under the installed app
-/// that dies post-claim on `com.apple.provenance`, and under `launchctl submit` it
-/// starves its own paint smoke (docs/RELEASING.md). Thirty-seven remedies used to
-/// name `cargo ship cut`, the one spelling the runbook forbids.
+/// "resume", "abandon" or "cut again" names. The documented launcher, never a bare
+/// `targo --unverified ship cut`: from a shell under the installed app that dies
+/// post-claim on `com.apple.provenance`, and under `launchctl submit` it starves its
+/// own paint smoke (docs/RELEASING.md).
 pub const CUT_COMMAND: &str = "tools/cut-launch.sh";
 
 /// How an operator runs the cutter's other verbs — `recover`, `yank`, `status`,
@@ -117,31 +115,23 @@ pub const SHIP_COMMAND: &str = "targo --unverified ship";
 // ---------------------------------------------------------------------------
 
 /// The column every value starts in: two spaces of indent, the label, then one
-/// HARD space. Thirteen is what the transcript already rendered, so nothing moves.
-///
-/// The hard space is the whole point. The old primitive was `"  {label:<11}"`, and
-/// `{:<11}` pads only when the label is SHORTER than 11 — an 11-character label got
-/// no separator at all and ran straight into its own value. That is not theoretical:
-/// `print_check("seed source", …)` printed `seed source10 program(s) staged at …`
-/// in a real provisioning run. A pad that can vanish is not a gutter.
+/// HARD space: a `{:<11}` pad alone vanishes for an 11-character label, gluing the
+/// label to its value.
 pub const VALUE_COL: usize = 13;
 
 /// The longest label the grid can carry: 2 indent + 10 + 1 hard space = [`VALUE_COL`].
 ///
-/// Enforced by a `debug_assert` in [`grid_block`]. A longer label can no longer glue
-/// two facts together — the hard space after the pad is unconditional — but it still
-/// pushes its value off [`VALUE_COL`], out of line with every row around it.
+/// Enforced by a `debug_assert` in [`grid_block`]: a longer label pushes its value
+/// off [`VALUE_COL`], out of line with every row around it.
 pub const LABEL_MAX: usize = VALUE_COL - 3;
 
 /// How wide a transcript line may be.
 ///
 /// `COLUMNS` when the shell exports it, else 100: wide enough for the transcript's
 /// natural line, narrow enough that an 80-column window only wraps the tail. It is
-/// deliberately NOT a tty probe — a piped run wraps exactly the way the terminal
-/// does, so a transcript pasted into an issue reads like the screen it came from.
-/// That matters here more than in most tools: the thing an operator sends for help
-/// is `provision 2>&1 | tee`, and a wall of unwrapped 600-column paragraphs is the
-/// form in which the warnings that cost a certificate slot went unread.
+/// deliberately NOT a tty probe — a piped run (`provision 2>&1 | tee`) wraps exactly
+/// the way the terminal does, so a transcript pasted into an issue reads like the
+/// screen it came from.
 fn width() -> usize {
     std::env::var("COLUMNS")
         .ok()
@@ -152,7 +142,7 @@ fn width() -> usize {
 
 /// Break one message into value-column rows.
 ///
-/// The rules, in order, and each one exists because a message needed it:
+/// The rules, in order:
 ///
 /// 1. **Segment on `'\n'` first.** An author-supplied newline is honoured absolutely.
 ///    It is how a block gets a verdict line, then an act line, then bullets — the
@@ -175,11 +165,8 @@ fn wrapped(msg: &str, width: usize) -> Vec<String> {
             out.push(String::new());
             continue;
         }
-        // A segment's leading spaces are its hanging indent — and so is a LIST MARKER.
-        // `· it does NOT fall back…` wrapping flush under the bullet turns a five-item
-        // warning into a paragraph with dots in it; hanging the continuation under the
-        // item's TEXT is what keeps the items countable at a glance, which is the whole
-        // reason it is a list.
+        // A segment's leading spaces are its hanging indent — and so is a list marker,
+        // so a wrapped item's continuation hangs under the item's text.
         let lead = seg.len() - seg.trim_start_matches(' ').len();
         let body = &seg[lead..];
         let marker = &body[..bullet_marker(body)];
@@ -189,10 +176,8 @@ fn wrapped(msg: &str, width: usize) -> Vec<String> {
         let mut filled = false;
         let mut rest = &body[marker.len()..];
         while !rest.is_empty() {
-            // The run of spaces BEFORE this word is kept, not collapsed. A double space
-            // is the transcript's mini-column separator — `key  <path>  0600, stays on
-            // this machine  (pub …)` is three fields, and a wrapper that normalises
-            // whitespace turns them into one sentence.
+            // The run of spaces BEFORE this word is kept, not collapsed: a double space
+            // is the transcript's mini-column separator (`key  <path>  0600`).
             let gap = rest.len() - rest.trim_start_matches(' ').len();
             rest = &rest[gap..];
             if rest.is_empty() {
@@ -246,11 +231,8 @@ fn bullet_marker(body: &str) -> usize {
 /// Exactly what [`step`] prints, as a `String` with NO trailing newline.
 ///
 /// It is a separate function so a PROMPT can be written to `/dev/tty` in the
-/// transcript's own grid. There used to be three hand-rolled gutters — a
-/// `" ".repeat(13)`, a `{:<11}`, and a hand-counted `"\n  notary   "` that was
-/// three columns shy — printing questions about permanent, irreversible acts in a
-/// layout that did not match the lines around them. A question that arrives under a
-/// different gutter reads as a different subject.
+/// transcript's own grid: a question under a different gutter reads as a different
+/// subject.
 pub fn grid_block(label: &str, msg: &str) -> String {
     grid_block_at(width(), label, msg)
 }
@@ -264,12 +246,7 @@ pub fn grid_block_at(width: usize, label: &str, msg: &str) -> String {
          (a longer one eats its own separator — see VALUE_COL)",
         label.chars().count()
     );
-    // Nothing to say prints NOTHING — not a labelled empty row, and not thirteen
-    // spaces of invisible gutter. `step("signing", "")` used to render as the word
-    // `signing` followed by emptiness, twice, bracketing the loudest warning the
-    // tool can print; at a labelled empty row the operator's first thought is that
-    // output was lost, at exactly the moment they are being told they are about to
-    // wedge an installed base forever.
+    // Nothing to say prints NOTHING — a labelled empty row reads as lost output.
     if msg.trim().is_empty() {
         return String::new();
     }
@@ -527,7 +504,7 @@ pub fn unix_now() -> u64 {
 // gh plumbing (3 retries with backoff — spec §7)
 // ---------------------------------------------------------------------------
 
-/// The release-org token, read from disk. Without it `targo --unverified ship cut` authenticates
+/// The release-org token, read from disk. Without it the cut authenticates
 /// EVERY call with `gh auth token` — the dev account, which has no push on the public
 /// release channel, so the cut refuses at [`preflight_channel_target`] before its claim.
 ///
@@ -550,9 +527,9 @@ pub(crate) fn channel_token() -> Option<String> {
 /// Is a channel-scoped credential in force for the current operation?
 ///
 /// Set only by [`ChannelCred`], around work whose every `gh` call talks to the release
-/// channel — which, since the cut publishes once, is every release-object call a real
-/// cut, a resume, a recovery, an abandon, a yank, `status` and `verify` make. (The
-/// ledger, the lease, the fence and the tag go through `git`, which never reads it.)
+/// channel — every release-object call a real cut, a resume, a recovery, an abandon,
+/// a yank, `status` and `verify` make. (The ledger, the lease, the fence and the tag
+/// go through `git`, which never reads it.)
 /// A rehearsal's scratch channel is the operator's own and never enters it.
 static CHANNEL_CRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -669,13 +646,10 @@ pub const RECOVERY_STOPPED_PROCESS_FLAG: &str = "--old-publisher-stopped";
 /// The operator's assertion that NO draft was ever posted for this tag, for the one
 /// recovery state nothing else can answer.
 ///
-/// A publisher that died with its journal takes `create_intent_knowledge` to `None`,
+/// A publisher that died with its journal takes `durable_create_intent` to `None`,
 /// and an ABSENT release object then means one of two things a machine cannot tell
 /// apart: no create POST was ever issued, or one was issued and has not become
-/// visible yet. Refusing (the safe reading) left no command that could release
-/// `refs/tags/aterm-release-lease`, so every later `targo --unverified ship cut` refused on every
-/// machine and the refs had to be deleted by hand — the pipeline stayed wedged by a
-/// safety rule protecting against a draft that did not exist.
+/// visible yet. Refusing alone would leave no command that releases the lease.
 ///
 /// Only a human can close that gap, by looking at the releases page. This flag is
 /// that answer, and it is deliberately SEPARATE from
@@ -866,16 +840,8 @@ pub fn publisher_fence(git: &dyn GitRunner) -> Result<Option<PublisherFence>> {
 // gone?
 // ---------------------------------------------------------------------------
 //
-// The fence itself is correct and stays: two concurrent publishers would
-// corrupt a release, and Git fencing cannot cancel an already in-flight GitHub
-// REST request. What was wrong is that the fence recorded nothing about its
-// holder, so every refusal was identical and unactionable — an operator who
-// killed a resume had to hand-assemble
-// `ship recover vX.Y.Z <40-char-claim-sha> --old-publisher-stopped`, looking up
-// BOTH arguments, once per kill. On the v0.87.0 cut that produced a livelock:
-// a retry loop that retried without ever performing the remedy.
-//
-// The fix has two halves and only two:
+// Two concurrent publishers would corrupt a release, and Git fencing cannot
+// cancel an already in-flight GitHub REST request, so:
 //   1. The fence RECORDS who wrote it (pid + host + boot session + executable +
 //      version), so a refusal can say whether that publisher is alive, dead, or
 //      unprovable, and can print the recover command already filled in.
@@ -890,15 +856,11 @@ pub fn publisher_fence(git: &dyn GitRunner) -> Result<Option<PublisherFence>> {
 /// A fence carrying NO block (every binary before this one) parses to an empty
 /// [`FenceIdentity`], which is deliberately unprovable and never auto-stolen.
 ///
-/// FORMAT 2 (2026-09-18) ADDS `fence-pgid`. Format 1 recorded the publisher's
-/// pid alone, and a refuter showed that is proof of death for the WRONG
-/// process: no GitHub mutation in this pipeline happens in the publisher
-/// itself — every one runs in a spawned `gh` or `curl` child (the draft-create
-/// POST, `--upload-file` streams of assets over a gigabyte), and a SIGKILL of
-/// the parent stops none of them. A format-1 fence whose pid is gone is
-/// therefore UNPROVABLE to this binary, never dead: the child may still be
-/// uploading. Proof of death is about the process GROUP, which the publisher
-/// and everything it spawned share.
+/// FORMAT 2 adds `fence-pgid`. A pid alone proves death of the WRONG process:
+/// every GitHub mutation runs in a spawned `gh` or `curl` child, and a SIGKILL of
+/// the parent stops none of them. A format-1 fence whose pid is gone is therefore
+/// UNPROVABLE, never dead. Proof of death is about the process GROUP, which the
+/// publisher and everything it spawned share.
 pub const FENCE_IDENTITY_FORMAT: u32 = 2;
 
 /// The version THIS process is publishing, recorded into any fence it creates
@@ -907,9 +869,7 @@ pub const FENCE_IDENTITY_FORMAT: u32 = 2;
 ///
 /// Process-global because the rest of the recorded identity (pid, host, boot
 /// session, executable) is process-global by nature, and because it is set once
-/// at cut/resume entry, before any fence can be created. Threading it through
-/// the fence API instead would have changed a dozen call signatures to carry a
-/// value that never varies within a process.
+/// at cut/resume entry, before any fence can be created.
 static FENCE_SELF_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Record what this invocation publishes. Called once from `run_cut`, and again
@@ -1438,16 +1398,9 @@ impl FenceLiveness {
 /// probe that failed, pid 0/1, a group this process is itself inside — is
 /// [`FenceLiveness::Unprovable`] and keeps refusing.
 ///
-/// WHY THE GROUP, NOT THE PID. The publisher process performs no GitHub
-/// mutation itself: the draft-create POST, the release edits and every asset
-/// upload run in a spawned `gh` or `curl`, and a SIGKILL of the parent stops
-/// none of them — a `--upload-file` of a gigabyte carries on. So "the recorded
-/// pid is gone" proved death of the wrong process, and a resume that reclaimed
-/// on it could run beside a request still in flight. The children share the
-/// publisher's process group; an empty group is the local fact that says the
-/// whole tree is gone. A live member — a `curl`, or a wrapper shell still
-/// waiting — reads [`FenceLiveness::Alive`] and the refusal names it, which is
-/// the conservative direction and the actionable one.
+/// WHY THE GROUP, NOT THE PID: see [`FENCE_IDENTITY_FORMAT`]. A live member — a
+/// `curl`, or a wrapper shell still waiting — reads [`FenceLiveness::Alive`] and
+/// the refusal names it.
 ///
 /// On the differing-boot case specifically: a differing boot session under a
 /// matching hostname USUALLY means this machine rebooted, which would prove the
@@ -1456,15 +1409,10 @@ impl FenceLiveness {
 /// and "another machine with our name wrote this" are not separable here. The
 /// refusal says exactly that, and prints the recover command.
 ///
-/// NO HEARTBEAT, NO EXPIRY — considered and rejected. An expiry would have to
-/// evict a fence whose holder is still RUNNING, and a running publisher can have
-/// a GitHub REST request in flight that no Git operation can cancel
-/// (`RECOVERY_STOPPED_PROCESS_REFUSAL` states exactly this). It would also have
-/// to separate "wedged" from "slow", which is not decidable from outside: a
-/// universal build, a notarization wait and a large asset upload all legitimately
-/// exceed any threshold that would have helped. The wedged-but-alive publisher is
-/// handled instead by making the refusal NAME THE PID: kill it, and the very next
-/// `--resume` reclaims on its own, because it has become provably dead.
+/// NO HEARTBEAT, NO EXPIRY. An expiry would evict a fence whose holder is still
+/// RUNNING, possibly with a REST request in flight no Git operation can cancel, and
+/// "wedged" is not separable from "slow" (a universal build, a notarization wait).
+/// Instead the refusal NAMES THE PID: kill it, and the next `--resume` reclaims.
 pub fn fence_liveness(identity: &FenceIdentity, probe: &dyn PublisherProbe) -> FenceLiveness {
     if let Some(reason) = &identity.unreadable {
         return FenceLiveness::Unprovable(format!(
@@ -1606,9 +1554,7 @@ pub fn fence_liveness(identity: &FenceIdentity, probe: &dyn PublisherProbe) -> F
     }
 }
 
-/// The EXACT command an operator must run, already filled in. Nothing about it
-/// is a template: version and claim sha are substituted HERE so that nobody
-/// assembles it by hand again.
+/// The EXACT recover command an operator must run, version and claim sha filled in.
 pub fn fence_recover_command(version: Option<&str>, owner: &str) -> String {
     format!(
         "{SHIP_COMMAND} recover v{} {owner} {RECOVERY_STOPPED_PROCESS_FLAG}",
@@ -1896,10 +1842,8 @@ fn new_publisher_fence_token(git: &dyn GitRunner, owner: &str) -> Result<String>
         "aterm-release-fence-candidate-{}-{nonce}-{sequence}",
         std::process::id(),
     );
-    // The human line is unchanged so that an older binary reading this tag sees
-    // exactly what it always did; the `fence-*` block below it is additive, and
-    // its absence (an older writer) is what makes an old fence UNPROVABLE
-    // rather than a crash or a free steal.
+    // The `fence-*` block is additive below the human line; its absence (an older
+    // writer) makes a fence UNPROVABLE rather than a crash or a free steal.
     let message = format!(
         "aterm publisher fence for claim {owner}; pid {}; nonce {nonce}; sequence {sequence}\n\n{}",
         std::process::id(),
@@ -2264,11 +2208,9 @@ pub const STEPS: [&str; 6] = ["lock", "build", "selfcheck", "tag", "publish", "u
 /// The one journal format this cutter reads and writes: exactly [`STEPS`], and
 /// every authority the current publisher/signing/release-ID protocol records.
 ///
-/// Format 11 (2026-09-26) is the publish-once cut: the private-origin leg
-/// (`draft`, `upload`, `preflip`, `flip`, `archive`, `verify`) and the `mirror`
-/// that copied it are gone, `publish` replaces both, and the one release capability
-/// the journal holds is the channel's. A step list that changes gets a number no
-/// other cutter has written.
+/// Format 11 is the publish-once cut: one `publish` step, and the one release
+/// capability the journal holds is the channel's. A step list that changes gets a
+/// number no other cutter has written.
 ///
 /// This cutter interprets no other format, and never needs to: every entry point reads
 /// the [`JournalHeader`] every format has written before anything else. A FINISHED
@@ -2412,15 +2354,10 @@ pub struct Journal {
     /// The key the PUBLISHED artifacts must verify UNDER, when that is not this
     /// machine's own signing key.
     ///
-    /// `signature_pubkey` was doing both jobs, and for an ordinary cut they are the
-    /// same value, so nothing showed. They come apart in exactly the case the
-    /// plural-publisher design exists for: machine A publishes a release signed with
-    /// Ka and dies; machine B recovers it. B's `signature_pubkey` is Kb — correctly,
-    /// because that is what its local guards compare against — and `archive`/`verify`
-    /// then tried to verify A's manifest under B's key and failed. The release was
-    /// live but unmirrored, `unlock` was never reached, the lease stayed held by the
-    /// dead publisher, and no supported command could free it: `--abandon` refuses a
-    /// published release and `yank` wants a finished journal (2026-08-19 round-6 audit).
+    /// For an ordinary cut it equals `signature_pubkey`. They differ when machine A
+    /// publishes a release signed with Ka and dies and machine B recovers it: B's
+    /// `signature_pubkey` is Kb (its local guards compare against it), but A's
+    /// manifest verifies only under Ka.
     ///
     /// `None` means "the same key this machine signs with", which is every journal a
     /// normal cut writes. Set only by a recovery, and only from the RELEASE's own
@@ -2429,17 +2366,14 @@ pub struct Journal {
     pub verify_pubkey: Option<String>,
     /// WHICH MACHINE signed, when the machine-roster tier is armed — the id the
     /// master-signed roster maps [`Self::signature_pubkey`] to. `None` with an
-    /// unpinned paper master — a fork or a pre-v0.21.0 build, NOT this tree, whose
-    /// master has been armed since 2026-08-15.
+    /// unpinned paper master (a fork).
     ///
     /// It rides beside the public key rather than replacing it because the two
     /// answer different questions on resume: the key is what the published
     /// signature must verify under, the id is what the published manifest CLAIMS.
     /// A resume that re-authorizes to a DIFFERENT machine must abort, and this is
-    /// the recorded value that makes the comparison possible — without it a second
-    /// machine could finish the first machine's cut, and the manifest already
-    /// carries (and is signed over) the first machine's id, so the release would
-    /// ship an attribution its own signer contradicts.
+    /// the recorded value that makes the comparison possible: the manifest already
+    /// carries (and is signed over) the first machine's id.
     ///
     /// Public identity only, exactly like [`Self::signature_pubkey`]: nothing
     /// secret is ever journaled.
@@ -2518,11 +2452,9 @@ impl Journal {
         let text = aterm_toml::to_string(self)
             .map_err(|e| Error::new(format!("serialize journal: {e}")))?;
         // The journal's directory (dist/, git-ignored) may not exist yet: the
-        // FIRST save happens the moment the claim is verified — before the
-        // build step's create_dir_all ever runs — and a fresh clone (the spec
-        // §5 cross-machine recut state) has no dist/ at all. Failing here
-        // would burn the just-pushed ledger number with nothing built, and
-        // every retry would recut and burn another.
+        // FIRST save happens the moment the claim is verified, before the build
+        // step creates it, and a fresh clone (spec §5 recut) has none. Failing
+        // here would burn the just-pushed ledger number with nothing built.
         let mut newly_created_dirs = Vec::new();
         if let Some(dir) = path.parent()
             && !dir.as_os_str().is_empty()
@@ -2552,7 +2484,7 @@ impl Journal {
             .map_err(|e| Error::new(format!("create {}: {e}", tmp.display())))?;
         file.write_all(text.as_bytes())
             .map_err(|e| Error::new(format!("write {}: {e}", tmp.display())))?;
-        file.sync_all()
+        crate::durable::sync_all(&file)
             .map_err(|e| Error::new(format!("fsync {}: {e}", tmp.display())))?;
         drop(file);
         fs::rename(&tmp, path).map_err(|e| {
@@ -2565,14 +2497,12 @@ impl Journal {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|e| {
-                    Error::new(format!(
-                        "fsync journal parent directory {}: {e}",
-                        parent.display()
-                    ))
-                })?;
+            crate::durable::sync_dir(parent).map_err(|e| {
+                Error::new(format!(
+                    "fsync journal parent directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
         }
         // If this was the first journal write in a fresh clone, syncing dist/
         // is insufficient: its own directory entry also has to survive in the
@@ -2585,14 +2515,12 @@ impl Journal {
                     created.display()
                 ))
             })?;
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|e| {
-                    Error::new(format!(
-                        "fsync newly-created journal directory parent {}: {e}",
-                        parent.display()
-                    ))
-                })?;
+            crate::durable::sync_dir(parent).map_err(|e| {
+                Error::new(format!(
+                    "fsync newly-created journal directory parent {}: {e}",
+                    parent.display()
+                ))
+            })?;
         }
         Ok(())
     }
@@ -2776,14 +2704,10 @@ pub enum DraftCleanupDecision {
 ///
 /// # A LOST JOURNAL IS NOT AN UNKNOWN OBJECT
 ///
-/// `None` intent is correctly as unsafe as `Some(true)` when nothing else can speak
-/// for the object. But a recovery on a second machine always has `None` (the journal
-/// died with the publisher), and refusing on that alone made the pipeline
-/// unrecoverable rather than merely careful: a publisher that died between creating
-/// its draft and publishing it left a draft no machine could clean and
-/// `refs/tags/aterm-release-lease` held by a process that no longer exists. Every
-/// later `targo --unverified ship cut` refused at `preflight_release_lease`, `--abandon` refused
-/// for want of the same journal, and the only remedy was deleting refs by hand.
+/// `None` intent is as unsafe as `Some(true)` when nothing else can speak for the
+/// object. But a recovery on a second machine always has `None` (the journal died
+/// with the publisher), and refusing on that alone would leave its draft and the
+/// lease uncleanable by any command.
 ///
 /// When the remote binds the draft to this claim, the missing local intent adds
 /// nothing: only the lease holder writes this tag's release, the lease names this
@@ -2996,13 +2920,9 @@ const CURL_EXIT_HTTP_ERROR: i32 = 22;
 /// delivered request entirely; both keep the conservative reading. So does a
 /// timeout, a reset, and a killed process, none of which reach this function.
 ///
-/// MEASURED, 2026-09-15, the v0.86.0 cut: the draft-create POST was answered `422`
-/// seconds after the release commit was pushed — GitHub had not converged on the
-/// commit yet — and the journal recorded only that an intent had been ISSUED. The
-/// cut could then neither retry (the intent says "discover, never post") nor
-/// abandon (that verb requires the claim commit, which a fix for the failure moves),
-/// and it took a hand-edited journal to get out. The outcome of the POST is
-/// knowledge the journal was throwing away.
+/// MEASURED (v0.86.0): the draft-create POST was answered `422` seconds after the
+/// release commit was pushed, before GitHub converged on the commit. Recording only
+/// "intent issued" left the cut able neither to retry nor to abandon.
 fn server_refused_without_creating(out: &RunOut) -> bool {
     if out.status != CURL_EXIT_HTTP_ERROR {
         return false;
@@ -3017,6 +2937,91 @@ fn http_status_from_curl_failure(stderr: &str) -> Option<u16> {
     let tail = stderr.rsplit_once("returned error: ")?.1;
     let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+/// What a FAILED one-shot POST proves about the object it asked for — the two local,
+/// provable facts ([`transport_never_started`], [`server_refused_without_creating`])
+/// and everything else, in the one place every caller of them reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostOutcome {
+    /// curl refused its own arguments: nothing left this machine.
+    NeverSent,
+    /// The server answered with a 4xx: it understood the request and created nothing.
+    Refused,
+    /// A 5xx, a timeout, a reset, a killed process, a curl message this code has never
+    /// seen — or a success. Each can hide a delivered request, so the intent stands.
+    Unknown,
+}
+
+/// Classify one finished one-shot POST. Pure, so the table is a test.
+pub(crate) fn post_outcome(out: &RunOut) -> PostOutcome {
+    if transport_never_started(out) {
+        PostOutcome::NeverSent
+    } else if server_refused_without_creating(out) {
+        PostOutcome::Refused
+    } else {
+        PostOutcome::Unknown
+    }
+}
+
+/// What `upload_channel_asset` does next, once its POST has finished and
+/// [`CutCtx::settle_upload_intent`] has spent (or kept) the intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterUploadPost {
+    /// curl never sent it and nothing of that name is visible: fail, naming the local
+    /// cause. The intent is retracted.
+    NeverSent,
+    /// The server refused it and nothing of that name is visible: fail, with GitHub's
+    /// words. The intent is retracted.
+    Refused,
+    /// An object of this name is visible: prove its bytes against `dist/` and converge
+    /// on it — never POST again. `journal` is true when the intent was retracted first
+    /// (a refused POST), so the journal must be made to NAME the object again: an app
+    /// asset on the release that no intent names is one `--abandon` cannot withdraw.
+    Converge { journal: bool },
+    /// The outcome is unknowable and nothing is visible: fail without a retry. The
+    /// intent stands, and a resume waits for the object.
+    Ambiguous,
+}
+
+/// Decide [`AfterUploadPost`] from what the POST proved ([`PostOutcome`]) and a probe
+/// for the exact-name asset. Pure over `visible`, so the table is a test, and the fake
+/// GitHub in `tests/it/channel_latest.rs` reads this one function instead of copying it.
+///
+/// * **Never sent** asks nothing: it is a local fact, and the probe is a network call
+///   that can fail under exactly the conditions that produce it.
+/// * **Refused** probes ONCE, best-effort. A 4xx created nothing *from this POST*, but
+///   `422 already_exists` — the refusal a stored object earns — is a 4xx too, and an
+///   object nobody journaled (one the earlier probe could not see yet, or another
+///   process's) would otherwise sit on the source release beyond `--abandon`'s reach
+///   and make a recut refuse the release as carrying an app asset. A probe that fails
+///   changes nothing: the refusal stands as reported.
+/// * **Unknown** probes, and a probe that fails fails the step: the intent stands, and
+///   a resume converges on the object.
+///
+/// # Errors
+/// The probe's own, for an unknown outcome only.
+pub(crate) fn after_upload_post(
+    outcome: PostOutcome,
+    visible: impl FnOnce() -> Result<bool>,
+) -> Result<AfterUploadPost> {
+    Ok(match outcome {
+        PostOutcome::NeverSent => AfterUploadPost::NeverSent,
+        PostOutcome::Refused => {
+            if visible().unwrap_or(false) {
+                AfterUploadPost::Converge { journal: true }
+            } else {
+                AfterUploadPost::Refused
+            }
+        }
+        PostOutcome::Unknown => {
+            if visible()? {
+                AfterUploadPost::Converge { journal: false }
+            } else {
+                AfterUploadPost::Ambiguous
+            }
+        }
+    })
 }
 
 /// GitHub's "I understood you and I refuse the CONTENT" — the code a release
@@ -3089,18 +3094,11 @@ fn github_refusal_summary(response: &[u8]) -> Option<String> {
 
 /// **WHAT THE FAILING RELEASE POST ACTUALLY SAID**, in place of the bare number.
 ///
-/// `curl: (22) The requested URL returned error: 422` is the whole of what the
-/// v0.87.0 cut printed, for hours, while the cause sat in the request the
-/// caller still had in its hand: a 225,061-byte body against GitHub's
-/// 125,000-character limit. A 422 means the server UNDERSTOOD the request and
-/// refused its content, so the two things worth saying are the size of the body
-/// this process posted — measured against the limit, in BOTH directions, so the
-/// diagnosis cannot lie by only ever accusing the body — and whatever GitHub
-/// named in its own `errors[]`.
-///
-/// Every other failure is passed through as curl reported it: a timeout, a
-/// reset and a 5xx are not this, and dressing them up as this would be worse
-/// than the number.
+/// A bare `curl: (22) … returned error: 422` hid a 225,061-byte body against
+/// GitHub's 125,000-character limit (v0.87.0). A 422 means the server refused the
+/// CONTENT, so this adds the posted body's size against the limit — in BOTH
+/// directions — and whatever GitHub named in its own `errors[]`. Every other
+/// failure is passed through as curl reported it.
 fn release_post_failure_detail(out: &RunOut, posted_body_len: usize) -> String {
     let mut detail = out.stderr_utf8().trim().to_string();
     if http_status_from_curl_failure(&out.stderr_utf8()) == Some(HTTP_UNPROCESSABLE_CONTENT) {
@@ -3130,17 +3128,11 @@ fn release_post_failure_detail(out: &RunOut, posted_body_len: usize) -> String {
 
 /// **THE RELEASE BODY, READ AND BOUNDED AT THE POST ITSELF.**
 ///
-/// [`changelog::release_notes_document`] bounds what it writes, and that is not
-/// the guard this operation needs: the file read here can have been written by
-/// an older binary, carried into a `--resume` from a cut that ran before the
-/// bound existed, or hand-regenerated by an operator — which is exactly how
-/// v0.87.0's notes came to be on disk. Each of those still posts over the limit
-/// and still comes back as an opaque 422. Guard the OPERATION, not the call
-/// site that happens to precede it.
+/// [`changelog::release_notes_document`] bounds what it writes, but the file read
+/// here can come from an older binary, a resumed cut, or an operator's hand; each
+/// would still post over the limit as an opaque 422. Guard the OPERATION.
 ///
-/// Idempotent by construction, which is what lets both guards stand: a body
-/// already within the limit is returned verbatim, so a file this binary wrote
-/// passes through untouched and is never cut twice.
+/// Idempotent: a body already within the limit is returned verbatim.
 fn release_body_for_post(label: &str, path: &Path) -> Result<String> {
     let raw = fs::read_to_string(path)
         .map_err(|error| Error::new(format!("read {label} release notes: {error}")))?;
@@ -3218,13 +3210,10 @@ impl OneShotPost {
 
     /// Raw file-body POST (asset uploads). `subject` names the file in errors.
     ///
-    /// STREAMED FROM DISK, never buffered. `--data-binary @file` reads the whole
-    /// payload into memory before it opens the socket, and the batteries-included
-    /// DMG is over a gigabyte: the first seeded cut died here with
-    /// `curl: option --data-binary: out of memory`, after building, signing and
-    /// notarizing both containers. `--upload-file` streams the same bytes with a
-    /// `Content-Length` taken from the file's size, so the transport cost is
-    /// independent of the asset (2026-08-19). `--request POST` still fixes the
+    /// STREAMED FROM DISK, never buffered: `--data-binary @file` reads the whole
+    /// payload into memory, and the batteries-included DMG is over a gigabyte
+    /// (`curl: option --data-binary: out of memory`). `--upload-file` streams it with
+    /// a `Content-Length` from the file's size. `--request POST` still fixes the
     /// method — `--upload-file` would otherwise PUT — and the endpoint carries a
     /// query string rather than a trailing `/`, so curl appends no file name of
     /// its own.
@@ -3283,9 +3272,8 @@ impl OneShotPost {
     }
 }
 
-/// Canonical release-channel floor. Zero has the same semantics as absence,
-/// so cuts never start emitting `min_build = 0` into a channel that previously
-/// omitted the optional key.
+/// Canonical release-channel floor. Zero means the same as absence, so a cut
+/// never emits `min_build = 0`.
 fn canonical_min_build(floor: Option<u64>) -> Option<u64> {
     floor.filter(|floor| *floor != 0)
 }
@@ -3357,7 +3345,7 @@ pub fn channel_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) 
 /// is the steady state. Machine B mints or revokes, publishing `roster_seq` 5; every
 /// live client ratchets its floor to 5. Machine A, still on its seq-4 copy, passes
 /// freshness, passes the deny-list, and publishes — and every client that saw B's
-/// release refuses A's with `Rollback`. `select_authoritative_release` picks exactly
+/// release refuses A's with `Rollback`. `fetch_authoritative_release` picks exactly
 /// one candidate with no fallback to an older release, so those clients do not get a
 /// later update, they get NO update, and the cut reports success.
 ///
@@ -3368,11 +3356,9 @@ pub fn channel_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) 
 ///
 /// # Shape
 ///
-/// `None` on either side means "no roster in play" — a cut on an unarmed build, or by a
-/// machine the roster does not name; not this tree, armed since 2026-08-15
-/// and must therefore be `Ok`. An unattributed cut against a rostered head is NOT
-/// silently allowed: dropping the tier is a downgrade the client would refuse
-/// structurally, so it is named here while naming it is free.
+/// `None` on the channel side means "no roster in play" (an unarmed fork), and is
+/// `Ok`. An unattributed cut against a rostered head is NOT silently allowed:
+/// dropping the tier is a downgrade the client would refuse structurally.
 pub fn roster_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) -> Result<()> {
     // A LOWER floor than the client's, deliberately, and by exactly one generation:
     // the client ratchets on OBSERVATION, so its floor is the head's `roster_seq`, and
@@ -3381,11 +3367,7 @@ pub fn roster_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) -
     match (carried, newest_channel) {
         (_, None) => Ok(()),
         (Some(carried), Some(newest)) if carried >= newest => Ok(()),
-        // Headline, the two numbers that DIAGNOSE the machine set side by side where
-        // they can be compared, then the fix, then the mechanism that justifies it.
-        // The remedy used to be one clause at the end of an 82-word paragraph whose first
-        // sixty words were `RosterReject::Rollback` internals — and the two generations
-        // were embedded in prose, which is the one place two numbers cannot be compared.
+        // Headline, the two generations side by side, the fix, then the mechanism.
         (Some(carried), Some(newest)) => Err(Error::new(format!(
             "this machine's roster is older than the channel's, so publishing would stop \
              every up-to-date client from updating at all.\n\
@@ -3603,30 +3585,13 @@ pub fn unrostered_signature_policy(material_pubkey: Option<&str>) -> Result<Sign
 /// What a pipeline entry will still DO with the signing material, and therefore how
 /// much of the roster chain it has any business re-proving.
 ///
-/// The distinction exists because the roster answers a question that stops being
-/// askable once the bytes exist. A cut that will still assemble, stamp and SIGN a
-/// manifest is choosing an attribution, so it must prove the roster still authorizes
-/// this machine. A cut that is finishing already-signed bytes has no such choice
-/// left: the attribution is inside a signature, the roster document is frozen in
-/// `dist/`, and re-reading today's roster file says nothing about either.
-///
-/// Treating the second case like the first is not a harmless extra check, it is a
-/// wrong one, and it fails in the direction that costs the most:
-///
-/// * It can only ever fail SPURIOUSLY. Satisfying it — re-signing the roster from the
-///   paper master — does not change one byte of what the cut will publish, because
-///   `publish` serves the `dist/` bytes the self-check proved. So the gate blocks on a
-///   condition whose remedy fixes nothing.
-/// * It fires on the path taken when something has ALREADY gone wrong. A roster whose
-///   window lapses between `build` and a resumed `publish` would otherwise make a cut
-///   that is one upload from done into one that can never be finished, with the lease
-///   still held.
-/// * It refuses cross-machine recovery outright — the one path designed for a dead
-///   publisher, in the one design where publishers are plural.
-///
-/// This is the same trade `resume_apple_tier` makes for an expired certificate, for
-/// the same reason, and `resume_cut` already stated it in a comment; [`RosterDuty`] is
-/// what makes the statement true at every entry rather than one of them.
+/// A cut that will still SIGN a manifest is choosing an attribution, so it must prove
+/// the roster still authorizes this machine. A cut finishing already-signed bytes has
+/// no such choice: the attribution is inside a signature and the roster document is
+/// frozen in `dist/`. Re-proving there could only fail SPURIOUSLY (its remedy changes
+/// no published byte), would strand a cut one upload from done when a roster window
+/// lapses, and would refuse cross-machine recovery outright. Same trade as
+/// [`resume_apple_tier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterDuty {
     /// This entry may still produce and sign new manifest bytes. The full chain runs.
@@ -3643,8 +3608,7 @@ pub enum RosterDuty {
 /// `master_pubkeys` EMPTY is the whole two-state switch: the tier is absent, and
 /// [`channel_signature_policy`] is [`unrostered_signature_policy`].
 pub struct RosterEvidence<'a> {
-    /// The pinned paper master(s) — `pins::PAPER_MASTER_PUBKEYS` in production,
-    /// armed in this tree since 2026-08-15 (`atpkg-keys setup --id m3`).
+    /// The pinned paper master(s) — `pins::PAPER_MASTER_PUBKEYS` in production.
     pub master_pubkeys: &'a [&'a str],
     /// The master-signed roster this cut claims authority from, read once,
     /// pre-claim. `None` means the profile named none — which is a refusal on the
@@ -3673,7 +3637,7 @@ pub struct RosterEvidence<'a> {
 /// will: does the roster name this key's machine, unrevoked and in its window? There
 /// is no compiled-in key any client falls back to, so there is nobody a rostered key
 /// could strand — clients older than v0.21.0, which verified under the retired channel
-/// keyset, are abandoned (owner ruling, 2026-09-23).
+/// keyset, are abandoned (owner ruling).
 ///
 /// Every armed failure is a refusal. There is no arrangement of arguments that
 /// returns a policy while the anchor is armed and the roster did not authorize.
@@ -3686,18 +3650,15 @@ pub fn channel_signature_policy(
     }
     let Some(material) = material_pubkey else {
         return Err(Error::new(
-            "the paper master (aterm-update-core::pins, PAPER_MASTER_PUBKEYS) is pinned, \
-             so every cut must be authorized by the master-signed machine roster — but no \
-             signing material was supplied. A keyless machine may not cut for a rostered \
-             channel; no ledger claim was made",
+            "no signing material, and the release channel takes only a rostered machine's \
+             key: cut with --release-credentials ~/.aterm/release-credentials.toml (`targo \
+             --unverified ship provision --id <id>` writes it)",
         ));
     };
     let material = canonical_update_pubkey(material)?;
-    // A FINISH entry stops here, with the key decision made and no attribution
-    // claimed. It has nothing left to sign, so it has no roster question to answer;
-    // see [`RosterDuty`] for why asking anyway is a wrong check rather than a spare
-    // one. Returning `None` for the attribution is the honest answer and is what stops
-    // a caller comparing a fresh local claim against bytes that already shipped.
+    // A FINISH entry stops here: nothing left to sign, so no roster question (see
+    // [`RosterDuty`]). `None` attribution stops a caller comparing a fresh local
+    // claim against bytes that already shipped.
     if evidence.duty == RosterDuty::Finish {
         return Ok((
             SignaturePolicy {
@@ -3709,10 +3670,9 @@ pub fn channel_signature_policy(
     }
     let Some(document) = evidence.roster else {
         return Err(Error::new(
-            "the paper master is pinned but the release-credentials profile names no \
-             `machine_roster`. An armed anchor never degrades to an unrostered cut: \
-             name the master-signed aterm-machines.toml (its <path>.sig must sit beside \
-             it), or unpin the master in a tracked commit",
+            "the signing profile names no `machine_roster`: add `machine_roster = \
+             \"<path>/aterm-machines.toml\"` (its .sig beside it), or move the profile aside \
+             and re-run `targo --unverified ship provision --id <id>`, which writes it",
         ));
     };
     let who = machines::authorize_cut(
@@ -3762,10 +3722,7 @@ pub fn channel_signature_policy(
 /// use one canonical identity rather than textual base64 aliases.
 ///
 /// The key arrives as an ARGUMENT — from the signing material, the release
-/// journal, or the machine roster. These messages used to name
-/// `ATERM_UPDATE_PUBKEY`, which sent an operator hunting for an environment
-/// variable this function has never consulted and that was retired along with
-/// the ambient `release.conf` (docs/RELEASING.md).
+/// journal, or the machine roster — never from the environment.
 pub fn canonical_update_pubkey(encoded: &str) -> Result<String> {
     let encoded = encoded.trim();
     let bytes = aterm_codec::base64::decode_strict(encoded.as_bytes())
@@ -3937,22 +3894,9 @@ fn download_snapshot_appcast_asset(
     Ok(bytes)
 }
 
-// `signer_tool` lived here: it searched PATH and target/release for an
-// `atpkg-keys` binary to shell out to for manifest signing. It is DELETED rather
-// than revived, because reviving it would undo the credentials redesign. Signing
-// is in-process now (`load_signing_material` below, docs/RELEASE-KEYS.md: "no
-// spawning atpkg-keys... no second binary required to cut"), so the function had
-// no caller, and its error text still instructed the operator to fix
-// `~/.aterm/release.conf` — a file the same redesign retired. Searching `$PATH`
-// for the thing that signs releases is exactly the ambient discovery that
-// `--release-credentials` exists to abolish; there is no honest way to make this
-// reachable again.
-
-/// The loaded signing identity. There is no longer a `tool` or a `key_path`: the
-/// key is held in memory by [`sign::ReleaseCredentials`], loaded once from the path
-/// given to `--release-credentials`, and signing happens in-process. The old shape
-/// carried a PATH and shelled out to `atpkg-keys pubkey`, which meant a release could
-/// not be cut without a second binary built and present.
+/// The loaded signing identity. The key is held in memory by
+/// [`sign::ReleaseCredentials`], loaded once from `--release-credentials`, and
+/// signing happens in-process (docs/RELEASE-KEYS.md).
 struct SigningMaterial {
     pubkey: String,
 }
@@ -3962,7 +3906,7 @@ struct SigningMaterial {
 /// `None` means no `--release-credentials` was given — legal only for an unpinned
 /// channel, which `channel_signature_policy` decides, not this function.
 /// Nothing here reads the filesystem or the environment: whether a machine can cut
-/// is now a property of the command that ran, not of ambient state.
+/// is a property of the command that ran, not of ambient state.
 fn load_signing_material(
     creds: Option<&sign::ReleaseCredentials>,
 ) -> Result<Option<SigningMaterial>> {
@@ -3980,25 +3924,13 @@ fn load_signing_material(
 /// exactly the same rule every other consumer of the anchor uses — the updater,
 /// atpkg, and `tools/install.sh` alike.
 ///
-/// The anchor is a PARAMETER, not a read. The two cut entry points ([`run_cut`]
-/// and [`resume_cut`]) are the only places that name `pins::APPLE_TEAM_ID` for
-/// the purpose of deciding anything (`step_build` also names it, but only to copy
-/// it verbatim into the manifest), and they pass it inward from there. That is
-/// what makes every decision below this line drivable by a test with a
-/// placeholder team: a resolver that read the constant itself could not be driven by
-/// a test with a placeholder team at all, because the anchor is ARMED
-/// (`APPLE_TEAM_ID` = the real team since 2026-08-15) — every such test would either
-/// sign for real or skip. Passing it inward is what keeps these rules drivable now
-/// that they are live.
+/// The anchor is a PARAMETER, not a read: only [`run_cut`] and [`resume_cut`] name
+/// `pins::APPLE_TEAM_ID` to decide anything, so a test can drive every rule below
+/// with a placeholder team instead of the armed real one.
 ///
-/// Note that this deliberately does NOT vary by [`CutKind`]. A dry run or a
-/// rehearsal with the anchor set signs and notarizes for real, which costs a
-/// submission and several minutes. That is the point: a rehearsal that skips the
-/// slowest, most failure-prone, most externally-dependent step in the pipeline
-/// rehearses the easy part, and the self-check it then runs would fail anyway —
-/// `spctl` rejects a bundle that was never notarized. One path, exercised the
-/// same way every time, beats a second path that only runs when it is least
-/// wanted.
+/// Deliberately NOT varied by [`CutKind`]: a dry run or rehearsal signs and
+/// notarizes for real. Skipping the most failure-prone step would rehearse the easy
+/// part, and `spctl` rejects a never-notarized bundle at the self-check anyway.
 fn resolve_apple_tier(
     team_id: &str,
     credentials: Option<&sign::ReleaseCredentials>,
@@ -4007,9 +3939,7 @@ fn resolve_apple_tier(
         return Ok(sign::AppleTier::Inactive);
     }
     let tier = sign::resolve_apple_tier(team_id, credentials).map_err(Error::new)?;
-    // Announced only when ACTIVE. The inactive tier must add zero steps and zero
-    // transcript lines: a cut that signs ad-hoc, as every shipped cut does, looks
-    // exactly as it did before Tier APPLE was wired.
+    // Announced only when ACTIVE: the inactive tier adds zero transcript lines.
     println!("{}", tier.describe());
     Ok(tier)
 }
@@ -4017,34 +3947,22 @@ fn resolve_apple_tier(
 /// The tier a RESUME must resolve — which is nothing at all unless `build` is
 /// still going to run.
 ///
-/// A resume is the path taken when something has already gone wrong, and the
-/// cost of demanding a credential it will never use is that a cut which is one
-/// upload away from finished cannot be finished at all. Only [`step_build`]
-/// reads `ctx.apple`; every later step re-proves the artifacts ON DISK against
-/// the MANIFEST's `team_id` (see [`selfcheck_signing`]), which is the claim that
-/// actually ships and is independent of whatever the keychain holds today. So a
-/// resume past `build` needs no certificate, and asking for one only converts a
-/// recoverable cut into an unrecoverable one when a certificate expires between
-/// the build and the upload.
+/// Only [`step_build`] reads `ctx.apple`; every later step re-proves the artifacts
+/// ON DISK against the MANIFEST's `team_id` (see [`selfcheck_signing`]). Demanding a
+/// certificate past `build` would only make a cut unfinishable when the certificate
+/// expires between build and upload.
 ///
-/// The fail-closed property is untouched where it bites: when `build` WILL run,
-/// this resolves exactly as [`run_cut`] does, from the same anchor, with the same
-/// hard failure if the machine cannot keep the anchor's promise. The gate is
-/// deliberately the same predicate as the signing-key re-proof immediately above
-/// its call site — "is this resume going to bake artifact bytes?" — so the two
-/// credentials a rebuild needs are demanded under one rule rather than two that
-/// can drift apart.
+/// When `build` WILL run this resolves exactly as [`run_cut`] does. The predicate is
+/// the same as the signing-key re-proof beside its call site ("will this resume bake
+/// artifact bytes?"), so both credentials a rebuild needs follow one rule.
 pub fn resume_apple_tier(
     team_id: &str,
     journal: &Journal,
     credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<sign::AppleTier> {
     if journal.is_done("build") {
-        // Not a claim that the tier is off — the build that already ran resolved
-        // the real tier, and its artifacts carry whatever it did. It is the
-        // statement that nothing REMAINING will sign or notarize, and
-        // `AppleTier::Inactive` is precisely "no identity, no auth, every hook a
-        // no-op", which is what must happen if one were somehow reached.
+        // Not a claim that the tier is off: nothing REMAINING will sign or notarize,
+        // and `Inactive` makes every hook a no-op if one were somehow reached.
         return Ok(sign::AppleTier::Inactive);
     }
     resolve_apple_tier(team_id, credentials)
@@ -4055,16 +3973,10 @@ pub fn resume_apple_tier(
 ///
 /// The fresh cut runs [`gates::provenance_gate`] before the claim, so a tagged
 /// toolchain or a tracked cutter process costs nothing. A resume starts AFTER the
-/// claim: the build number is already burned, and a resume that still has to bake
-/// artifacts (`build` not journaled — a cut that died in the gate ladder's shadow, or
-/// during the build itself) would produce tagged object files and a tagged proof
-/// snapshot and die where v0.83.0 did. So it re-runs the same gate, over the toolchain
-/// it will resolve and its own executable, before the pipeline is entered. A resume
-/// past `build` compiles nothing — every later step uploads, flips and verifies bytes
-/// already on disk — and is NOT blocked by it: the tag on a compiler that will not run
-/// cannot reach a file, and refusing there would turn a cut one upload from finished
-/// into one that cannot be finished, the trade [`resume_apple_tier`] refuses for the
-/// same reason under the same predicate.
+/// claim, so a resume that still has to bake artifacts (`build` not journaled)
+/// re-runs the same gate over the toolchain it will resolve and its own executable.
+/// A resume past `build` compiles nothing and is NOT blocked — the same trade and
+/// predicate as [`resume_apple_tier`].
 ///
 /// `gate` is the filesystem half, injected so the rule is testable without a
 /// toolchain: in production it is [`toolchain_provenance_gate`].
@@ -4323,15 +4235,10 @@ fn split_release_object_and_asset_rows(rows: &str) -> Result<(String, String)> {
 /// The immutable release-object identity AND the exact-name asset binding, from
 /// ONE read of `repos/{slug}/releases/{id}`.
 ///
-/// Both facts live in the same JSON document, so the authoritative manifest scan
-/// used to spawn two `gh` processes — two cold starts and two HTTPS round trips
-/// — per end of every download bracket. Worse, the pair was SKEWED in time: a
-/// mutation landing between the two reads was invisible to both checks. Fusing
-/// them is therefore strictly tighter as well as strictly cheaper: each bracket
-/// end is now a single point-in-time snapshot.
+/// One read, so each bracket end is a single point-in-time snapshot: two reads
+/// would cost two `gh` spawns and miss a mutation landing between them.
 ///
-/// The checks a caller runs on the result, and their order, are deliberately
-/// left to the caller so the existing scan's error precedence is unchanged.
+/// The checks on the result, and their order, are left to the caller.
 pub fn release_object_and_asset_identity(
     slug: &str,
     release_id: u64,
@@ -4344,11 +4251,8 @@ pub fn release_object_and_asset_identity(
         "--jq",
         RELEASE_OBJECT_AND_ASSETS_JQ,
     ];
-    // A 404 is an ANSWER here, not a failure, so it must not burn the retry
-    // budget (seven seconds of backoff to re-learn an absent release) — that is
-    // `release_object_by_id`'s rule, and this call inherits it. Any OTHER
-    // non-zero exit is the transient flake the asset-identity read absorbed
-    // here has always retried through `gh_retry`, so it still retries.
+    // A 404 is an ANSWER, not a failure, so it must not burn the retry budget
+    // (`release_object_by_id`'s rule). Any OTHER non-zero exit retries.
     let out = gh_raw(&args)?;
     let out = if out.success() {
         out
@@ -4564,28 +4468,13 @@ fn exact_release_asset_download(slug: &str, id: u64) -> Result<std::process::Chi
 }
 
 // ---------------------------------------------------------------------------
-// THE TRANSPORT HICCUP THAT KILLED TWO CUTS
+// asset transfer retry
 //
-// Twice in the week of 2026-09-08 the cutter built BOTH architectures, signed,
-// notarized, stapled and passed its paint self-check — and then died on
-//
-//   download exact release asset aterm-appcast.toml from alabsystems/aterm
-//   failed: unexpected end of JSON input
-//
-// `ship cut --resume` cleared it in 1m37s with no rebuild, which is the whole
-// diagnosis: nothing was wrong with the release, the tree or the credential.
-// A truncated HTTP body ended a run that had already done every expensive
-// thing it would ever do.
-//
-// The download could not simply be routed through `gh_retry`, and that is the
-// point of the classifier below rather than a bare loop. `gh_retry` repeats on
-// ANY non-zero exit, so it cannot tell a lost body from a server that answered
-// "no": pointed at this call it would spend seven seconds of backoff re-asking
-// for an asset that is genuinely absent and then report the 404 as an
-// exhausted retry — which is exactly the confusion this fix exists to remove.
-// A 404, a 401 and a permission refusal are ANSWERS. Only a failure of the
-// transport itself is worth repeating, because only that one can come out
-// differently the second time.
+// MEASURED: a truncated body (`gh`: "unexpected end of JSON input") killed cuts
+// after every expensive step; a resume cleared it with no rebuild. `gh_retry`
+// repeats on ANY non-zero exit and so cannot tell a lost body from a server that
+// answered "no". A 404, a 401 and a permission refusal are ANSWERS; only a
+// transport failure can come out differently the second time.
 // ---------------------------------------------------------------------------
 
 /// Whether repeating a bounded asset transfer can possibly change its outcome.
@@ -4812,18 +4701,9 @@ fn attempt_exact_release_asset_transfer(
 
 #[cfg(test)]
 mod asset_transport_retry_tests {
-    //! THE PIN for the two cuts that died after all the expensive work.
-    //!
-    //! Both times the cutter had already built both architectures, signed,
-    //! notarized, stapled and passed its paint self-check, and then reported
-    //!
-    //!   download exact release asset aterm-appcast.toml from alabsystems/aterm
-    //!   failed: unexpected end of JSON input
-    //!
-    //! `ship cut --resume` cleared it in 1m37s with no rebuild — proof that the
-    //! body, not the release, was what went missing. The transfer is injected
-    //! here so the LOOP is measured without a network: how many times it asks,
-    //! how long it waits, and above all WHICH failures it declines to repeat.
+    //! The transfer is injected so the retry LOOP is measured without a network:
+    //! how many times it asks, how long it waits, and WHICH failures it declines
+    //! to repeat.
 
     use super::*;
     use std::cell::RefCell;
@@ -5002,10 +4882,8 @@ pub struct VerifiedReleaseAsset {
     pub sha256: String,
 }
 
-// The shared bound in aterm-update-core is what the CLIENT actually enforces;
-// publishing against a private copy is how the two drifted (2026-08-02 raised
-// this side to 2 GiB, the client's container site kept 512 MiB, and 0.15.0
-// installs could accept a manifest whose payload they could never download).
+// The bound the CLIENT enforces, shared from aterm-update-core: a private copy
+// here once drifted and published payloads clients could not download.
 const UPDATER_MAX_DMG_BYTES: u64 = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND;
 
 /// The most a LEAN `aterm-<v>.dmg` may weigh, in decimal bytes — the units the
@@ -5014,11 +4892,9 @@ const UPDATER_MAX_DMG_BYTES: u64 = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOU
 ///
 /// This is a different question from [`UPDATER_MAX_DMG_BYTES`], which is the
 /// CLIENT's 2 GiB download bound: the one asks "can a client fetch this at
-/// all", the other "is this the one lean download we promised". A seeded image
-/// answers yes to the first and no to the second, which is precisely why
-/// v0.63.0 sailed through — 1.07 GB is comfortably inside 2 GiB. The lean image
-/// was 40.6 MB at v0.98.0, so 200 MB is about five times it: loose enough that
-/// ordinary growth never trips it, tight enough that a seeded container cannot.
+/// all", the other "is this the one lean download we promised" (v0.63.0's
+/// 1.07 GB seeded image passed the first). The lean image was 40.6 MB at v0.98.0,
+/// so 200 MB leaves room for growth but not for a seeded container.
 ///
 /// Deliberately no environment opt-out, for the reason recorded on
 /// `channel_version_gate`: an exported variable disables the check for a real
@@ -5056,11 +4932,9 @@ pub fn validate_lean_dmg_size(version: &str, size: u64) -> Result<()> {
 
 /// Apply the lean-image contract to the bytes that actually exist on disk.
 ///
-/// `step_build` knows the packager's returned size, but every resumable suffix
-/// must distrust that historical observation: `dist/` is mutable, and a
-/// published recovery downloads a fresh object. Reading metadata at each
-/// publication boundary makes the ceiling stable across both paths without
-/// hashing or buffering a potentially gigabyte-sized seeded image first.
+/// Every resumable suffix distrusts the packager's earlier size: `dist/` is
+/// mutable, and a published recovery downloads a fresh object. Metadata is read
+/// at each publication boundary, without hashing a possibly gigabyte image first.
 ///
 /// `fix` is the checkpoint's own next step, when it has one.
 fn validate_lean_dmg_on_disk(path: &Path, checkpoint: &str, fix: Option<&str>) -> Result<()> {
@@ -5147,11 +5021,7 @@ pub fn copy_bounded_release_asset(
     writer
         .flush()
         .map_err(|error| Error::new(format!("flush streamed release asset: {error}")))?;
-    let sha256 = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let sha256 = aterm_codec::hex::encode_lower(&digest.finalize());
     Ok((total, sha256))
 }
 
@@ -5329,23 +5199,16 @@ pub fn release_asset_inventory_for_release_id(
 }
 
 /// Refuse a manifest that still names the RETIRED Intel DMG pair
-/// (`dmg_x86_64` / `dmg_x86_64_sha256`, retired 2026-08-26 with the
-/// batteries-included seed).
+/// (`dmg_x86_64` / `dmg_x86_64_sha256`).
 ///
-/// The two wire keys stay in the shared `Manifest` type so every client keeps
-/// parsing the manifests already published under them; this cutter simply
-/// never emits them, and every gate that judges a manifest — the draft
-/// exact-set gate, the self-check, post-publish verify and a killed-machine
-/// recovery — runs this first so a manifest from the retired contract is
-/// refused by name rather than half-honoured by a set that no longer carries
-/// the container it names.
+/// The wire keys stay in the shared `Manifest` so clients keep parsing published
+/// manifests; this cutter never emits them, and every gate that judges a manifest
+/// runs this first so the retired contract is refused by name.
 pub fn refuse_retired_intel_dmg(manifest: &Manifest) -> Result<()> {
     if manifest.dmg_x86_64.is_some() || manifest.dmg_x86_64_sha256.is_some() {
         return Err(Error::new(format!(
-            "manifest names the Intel DMG variant ({:?}) — retired 2026-08-26: aterm ships \
-             ONE lean macOS DMG and this cutter neither produces nor mirrors an \
-             `aterm-<v>-x86_64.dmg`. Finish or retire the cut that staged this manifest \
-             with the cutter version that started it",
+            "manifest names the retired Intel DMG ({:?}); aterm ships one macOS DMG. \
+             Finish or retire this cut with the cutter version that started it",
             manifest
                 .dmg_x86_64
                 .as_deref()
@@ -5608,13 +5471,9 @@ pub fn expected_embedded_update_pin(master_pubkeys: &[&str]) -> Result<Option<St
 /// Unix seconds for the roster's freshness window — fail-closed in the OPPOSITE
 /// direction from [`unix_now`], and deliberately so.
 ///
-/// `unix_now` returns 0 on an unreadable clock, which is right where it is used (a
-/// zero timestamp reads as "long ago" and makes every deadline look passed). Here 0
-/// would read as 1970, which is before every conceivable `valid_until`, so a LAPSED
-/// roster would sail through the gate and the cut would publish a release the whole
-/// fleet refuses. A clock we cannot read must therefore look like the far future,
-/// which makes every window look expired and refuses the cut. This is the same
-/// reasoning, and the same value, as `aterm_update::github::unix_now`.
+/// Here 0 would read as 1970, before every `valid_until`, so a LAPSED roster would
+/// pass. An unreadable clock reads as the far future instead, which expires every
+/// window and refuses the cut — the same value as `aterm_update_core::roster::now_unix`.
 fn roster_now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5629,19 +5488,14 @@ fn roster_now_unix() -> i64 {
 /// client refuses a release whose roster assets are absent), and roster bytes
 /// without an attribution would be assets nobody is authorized by.
 ///
-/// `Debug` is derived rather than hand-written, and that is safe by construction:
-/// every field is public information — a public key, a machine id, a published
-/// roster and a detached signature. The redaction discipline lives where a secret
-/// actually is, on `sign::ReleaseCredentials`, and this type deliberately does not
-/// hold one.
+/// `Debug` is derived safely: every field is public (a public key, a machine id, a
+/// published roster, a detached signature). No secret lives here.
 #[derive(Debug)]
 pub struct SigningVerdict {
     /// The verdict the pipeline has always carried.
     pub policy: SignaturePolicy,
     /// WHICH machine the roster says this key is, when the tier is armed. `None`
-    /// with an unpinned master — a FORK or a pre-v0.21.0 build, never this tree, whose
-    /// master has been armed since 2026-08-15. (WRONG BEFORE: "which is every cut this
-    /// tree can make".)
+    /// with an unpinned master (a fork).
     pub attribution: Option<roster::Attribution>,
     /// The exact roster bytes that authorized the cut, to be published as assets so
     /// clients can check the same document. `None` exactly when `attribution` is.
@@ -5657,11 +5511,8 @@ impl SigningVerdict {
 
     /// The three attribution-shaped fields a [`CutCtx`] carries, derived together.
     ///
-    /// Together, because they are only correct together and the ways they can be wrong
-    /// are silent: an id with no roster bytes stages no assets and publishes a release
-    /// an armed client refuses structurally; roster bytes with no id attach a document
-    /// nothing is authorized by. Handing the cut ONE value it destructures is what
-    /// stops a future edit setting two of the three.
+    /// Together, because they are only correct together (see [`SigningVerdict`]):
+    /// ONE value stops an edit setting two of the three.
     fn cut_attribution(self) -> CutAttribution {
         CutAttribution {
             machine_id: self.machine_id(),
@@ -5680,10 +5531,8 @@ struct CutAttribution {
 }
 
 impl CutAttribution {
-    /// Nothing to stamp and nothing to stage — a FORK's cut (this tree's master has been
-    /// armed since 2026-08-15, so its cuts stamp; WRONG BEFORE this said "every cut this
-    /// tree makes"), and every resume past `build`, where the manifest already carries its
-    /// attribution and the roster assets are already on disk.
+    /// Nothing to stamp and nothing to stage — a fork's cut, and every resume past
+    /// `build`, where the manifest and roster assets are already on disk.
     const fn none() -> Self {
         Self {
             machine_id: None,
@@ -5696,9 +5545,8 @@ impl CutAttribution {
 /// May a resume that re-authorized as `observed` continue a cut the journal says was
 /// started by `journaled`?
 ///
-/// Only if they are the same machine — including "both nameless", which is every cut made
-/// while the paper master is unpinned: a fork, or this tree before 2026-08-15. The
-/// asymmetric cases are the interesting ones and both must refuse:
+/// Only if they are the same machine — including "both nameless" (an unpinned paper
+/// master: a fork). Both asymmetric cases refuse:
 ///
 /// * journaled `Some`, observed `None` — the cut was authorized by a roster and this
 ///   resume has none. Continuing would rebuild and re-sign a manifest whose
@@ -5706,12 +5554,6 @@ impl CutAttribution {
 /// * journaled `None`, observed `Some` — the anchor was armed mid-cut. The already
 ///   published (or already built) bytes carry no attribution, so finishing under one
 ///   would produce a release whose halves disagree.
-///
-/// A pure rule with a name, rather than an inline `!=`, because a FORK's empty anchor
-/// makes it the one part of the resume path that never runs there — and an unreachable
-/// rule with no test is a rule that rots for exactly as long as nobody would notice.
-/// WRONG BEFORE: "the only part of the resume path the empty anchor makes unreachable",
-/// as if this tree's anchor were empty; armed since 2026-08-15, every resume here runs it.
 pub fn resume_attribution_agrees(journaled: Option<&str>, observed: Option<&str>) -> Result<()> {
     if journaled == observed {
         return Ok(());
@@ -5725,13 +5567,9 @@ pub fn resume_attribution_agrees(journaled: Option<&str>, observed: Option<&str>
 
 /// The pipeline's entry point into the verdict: [`signing_verdict`] with THE anchors.
 ///
-/// The anchors are named here and nowhere below, exactly as [`resolve_apple_tier`]
-/// names `pins::APPLE_TEAM_ID` at the two cut entry points and passes it inward. That
-/// is what makes the armed path drivable by a test with a SYNTHETIC master: a resolver
-/// that read the constants itself could only ever be driven with the REAL master, whose
-/// secret half is on paper and belongs in no test. WRONG BEFORE: it said such a resolver
-/// "would be inert in this tree — the master is unpinned"; armed since 2026-08-15, the
-/// resolver would be live, and untestable, which is the stronger reason for the parameter.
+/// The anchors are named here and nowhere below (as with [`resolve_apple_tier`]), so
+/// a test can drive the armed path with a SYNTHETIC master: the real one's secret
+/// half is on paper.
 fn preflight_signature_policy(
     creds: Option<&sign::ReleaseCredentials>,
     duty: RosterDuty,
@@ -5754,9 +5592,8 @@ fn preflight_signature_policy(
 /// and signs it (`stage_manifest` → `sign_manifest_with_policy`), and the only step
 /// that stages the roster assets. Every step after it moves bytes that already exist.
 ///
-/// A named function rather than an inline `if` because three entry points must agree
-/// on it — `resume_cut`, `run_recover_lost` and `revalidate_ctx_signature_policy` —
-/// and the bug this closes was exactly those three disagreeing.
+/// Named because three entry points must agree on it: `resume_cut`,
+/// `run_recover_lost` and `revalidate_ctx_signature_policy`.
 const fn roster_duty(build_done: bool) -> RosterDuty {
     if build_done {
         RosterDuty::Finish
@@ -5793,15 +5630,9 @@ pub fn signing_verdict(
     // `channel_signature_policy` stays a pure decision a test can drive with a
     // synthetic master.
     //
-    // With `PAPER_MASTER_PUBKEYS` empty the roster document is not even READ: an
-    // unarmed anchor must cost nothing and must not fail a cut because a profile
-    // mentions a file that has since moved. THIS tree is ARMED (2026-08-15), so a
-    // `Sign` duty DOES read it — a moved or unreadable `machine_roster` path is a
-    // real cut failure here, not the impossibility this comment used to describe.
-    //
-    // A `Finish` duty does not read it either, and for a related reason: the roster it
-    // would read is not the roster the cut is publishing (that one is frozen in
-    // `dist/`), so reading it could only produce a verdict about the wrong document.
+    // The roster document is READ only when armed with a `Sign` duty: an unarmed
+    // anchor must cost nothing, and a `Finish` duty would read a roster other than
+    // the one frozen in `dist/` that the cut publishes.
     let armed = !anchors.master_pubkeys.is_empty() && anchors.duty == RosterDuty::Sign;
     let document = match (
         armed,
@@ -5861,9 +5692,7 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
              refusing key substitution",
         ));
     }
-    // Signed IN-PROCESS. This used to spawn `atpkg-keys sign` with the private key's
-    // PATH on the command line — visible in a process listing, and unusable unless a
-    // second binary happened to be built.
+    // Signed IN-PROCESS: no key path in a process listing, no second binary.
     let signature = manifest.with_extension("toml.sig");
     let manifest_bytes = fs::read(manifest)
         .map_err(|error| Error::new(format!("read {}: {error}", manifest.display())))?;
@@ -5885,16 +5714,11 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
 /// them — in that order, which is the entire security property.
 ///
 /// `machine_id` and `roster_seq` are worth nothing unless they are inside what the
-/// signature covers. The signature is produced by `sign_manifest_with_policy`, which
-/// reads the FILE this function wrote; so as long as the stamp happens before the
-/// write, it is inside the signed bytes by construction. Stamp after the write and
-/// the release ships an attribution any attacker can rewrite; stamp after the
-/// SIGNATURE and the release ships a signature that does not verify at all, which
-/// `sign_manifest_with_policy`'s own read-back check catches.
+/// signature covers. `sign_manifest_with_policy` signs the FILE this function wrote,
+/// so stamping before the write puts them inside the signed bytes by construction.
 ///
-/// It exists as a named function rather than four lines inside `step_build` because
-/// `step_build` needs a real universal build to run and this ordering therefore had
-/// no covering test — the one property most in need of one.
+/// A named function (not inline in `step_build`, which needs a real universal build)
+/// so this ordering has a covering test.
 pub fn stage_manifest(
     dist: &Path,
     inputs: &manifest_out::ManifestInputs<'_>,
@@ -5906,9 +5730,7 @@ pub fn stage_manifest(
         linux.verify_staged(dist, inputs.version, inputs.build_number, inputs.commit)?;
         linux.stamp(&mut manifest)?;
     }
-    // With an unpinned paper master `who` is `None` on every cut, both keys stay
-    // absent, and the emitted bytes are identical to what this cutter has always
-    // produced. That is the fleet-safety requirement, not a nicety.
+    // With an unpinned paper master `who` is `None` and both keys stay absent.
     if let Some(who) = who {
         machines::attribute(&mut manifest, who);
     }
@@ -5922,12 +5744,11 @@ pub fn stage_manifest(
 /// rather than re-read: publishing a roster other than the one that authorized the
 /// cut is the producer-side version of checking one document and using another.
 ///
-/// `None` — a FORK's cut, or one of this tree's from before 2026-08-15, when this doc
-/// still called it "the shipped state" — writes nothing and removes nothing, so an unarmed
-/// cut's `dist/` is exactly what it was. There is no "clean up a stale roster" branch
-/// on purpose: `publish` uploads only the names `CutCtx::channel_asset_names` derives,
-/// and `channel::validate_channel_asset_set` refuses any asset outside that exact set,
-/// so a leftover file in `dist/` cannot become a published asset.
+/// `None` (a fork's cut) writes nothing and removes nothing. There is no "clean up a
+/// stale roster" branch on purpose: `publish` uploads only the names
+/// `CutCtx::channel_asset_names` derives, and `channel::validate_channel_asset_set`
+/// refuses any asset outside that exact set, so a leftover file in `dist/` cannot
+/// become a published asset.
 pub fn stage_roster_assets(dist: &Path, document: Option<&machines::RosterDocument>) -> Result<()> {
     let Some(document) = document else {
         return Ok(());
@@ -5952,10 +5773,7 @@ pub fn stage_roster_assets(dist: &Path, document: Option<&machines::RosterDocume
 }
 
 pub fn sha256_bytes(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    aterm_codec::hex::encode_lower(&Sha256::digest(bytes))
 }
 
 /// Immutable identity expected from the release under the journal's tag.
@@ -6023,8 +5841,6 @@ pub fn validate_live_release_identity(
             "published manifest names zip {zip:?}, expected exact {expected_zip:?}"
         )));
     }
-    // RETIRED 2026-08-26: the optional Intel DMG. A published manifest naming
-    // one was not emitted by this cutter and is not a shape it can verify.
     refuse_retired_intel_dmg(&manifest)?;
     match (signature_required, live_signature, signature_pubkey) {
         (true, Some(signature), Some(pubkey)) => {
@@ -6141,9 +5957,7 @@ pub struct CutCtx {
     /// is still free — a claim burns a single-use build number, and discovering
     /// an empty keychain after that costs one.
     ///
-    /// `AppleTier::Inactive` whenever `pins::APPLE_TEAM_ID` is empty, which is a FORK's
-    /// build — not this tree's, whose anchor has been armed ("A66A9P66Z7") since
-    /// 2026-08-15. WRONG BEFORE: "which is every build that ships today".
+    /// `AppleTier::Inactive` whenever `pins::APPLE_TEAM_ID` is empty (a fork).
     pub apple: sign::AppleTier,
     /// The operator's checkout: `dist/`, the journal and the website hook's working
     /// directory. The cut never builds from it and never moves it.
@@ -6188,10 +6002,8 @@ pub struct CutCtx {
     /// The full attribution (id + key + `roster_seq`) for the one step that stamps
     /// it into the manifest, and the roster bytes that authorized it, to be
     /// published as assets. Both are `Some` only when a build will actually run
-    /// under an armed anchor; a resume that will not rebuild neither stamps nor
-    /// re-stages, and asking it for a roster it cannot use would convert a
-    /// recoverable cut into an unrecoverable one — the same rule
-    /// [`resume_apple_tier`] applies to the Developer-ID certificate.
+    /// under an armed anchor — the same rule [`resume_apple_tier`] applies to the
+    /// Developer-ID certificate.
     pub attribution: Option<roster::Attribution>,
     pub roster: Option<machines::RosterDocument>,
     /// The channel release's immutable GitHub ID, persisted in the real-cut journal
@@ -6401,6 +6213,18 @@ impl CutCtx {
     }
 
     pub(crate) fn persist_upload_intent(&mut self, name: &str) -> Result<DurablePostPermit> {
+        self.record_upload_intent(name)?;
+        Ok(DurablePostPermit(()))
+    }
+
+    /// Journal `name` as an asset this cut owns on the release, WITHOUT minting a POST
+    /// permit — [`Self::persist_upload_intent`] is this plus the permit, and the only
+    /// door to a POST. This one serves an object that is already there: the journal's
+    /// upload-intent list is what `--abandon` withdraws from
+    /// ([`channel::withdrawable_assets`]), so an app asset on the release that no intent
+    /// names is one no supported command can take back, and a recut refuses the release
+    /// that carries it.
+    fn record_upload_intent(&mut self, name: &str) -> Result<()> {
         if self.upload_intent_issued(name) {
             return Err(Error::new(format!(
                 "upload intent for {name} already exists; refusing to mint another process-local POST permit"
@@ -6416,24 +6240,20 @@ impl CutCtx {
             journal.upload_intents.push(name.to_string());
             journal.save(&self.journal_path)?;
         }
-        Ok(DurablePostPermit(()))
+        Ok(())
     }
 
-    /// Undo an upload intent for a POST that PROVABLY never reached the network.
+    /// Undo an upload intent for a POST that PROVABLY created nothing: one that never
+    /// reached the network, or that the server answered with a 4xx.
     ///
-    /// The one-shot rule — record the intent, then never repeat a POST whose
-    /// response was lost — is right, and it is why a resume refuses to re-upload an
-    /// asset it cannot see. But it treats "the response was lost" and "the request
-    /// was never sent" as the same state, and on 2026-08-19 the second one wedged a
-    /// cut permanently: curl refused its own arguments (`--data-binary: out of
-    /// memory` on a gigabyte DMG), so no socket was ever opened, yet every later
-    /// resume declined to retry a POST that had never happened. The draft had zero
-    /// assets; no supported command could finish the release; the number had to be
-    /// abandoned.
+    /// The one-shot rule never repeats a POST whose response was lost, but "never
+    /// sent" is a different state: keeping the intent there wedges every resume on a
+    /// POST that never happened.
     ///
-    /// Only [`transport_never_started`] may lead here. That is a local, provable
-    /// fact — curl's exit 2 is argument/initialisation failure, before connect — and
-    /// nothing about it depends on what a server did or did not receive.
+    /// Only [`Self::settle_upload_intent`] leads here: [`transport_never_started`]
+    /// (curl exit 2, before connect) or [`server_refused_without_creating`] (a 4xx).
+    /// A 5xx, a timeout, a reset or a killed process can each hide a stored object,
+    /// and keep the intent.
     fn retract_upload_intent(&mut self, name: &str) -> Result<()> {
         self.upload_intents.retain(|issued| issued != name);
         if let Some(journal) = &mut self.journal {
@@ -6441,6 +6261,53 @@ impl CutCtx {
             journal.save(&self.journal_path)?;
         }
         Ok(())
+    }
+
+    /// Settle the durable intent of an upload POST that has just finished: retract it
+    /// exactly when the POST PROVABLY created nothing ([`post_outcome`]), keep it
+    /// otherwise, and say which. The one place an upload intent is ever spent.
+    ///
+    /// The answered 4xx counts, as it does for the release create
+    /// ([`Self::release_release_intent`]): a token that expired mid-cut (401), a
+    /// throttle (403, 429), a refused upload (422) created no object, and keeping the
+    /// intent would leave every resume at "refusing a duplicate POST" for an asset that
+    /// was never stored. It cannot mint a duplicate either: GitHub holds
+    /// one asset per name on a release (`422 already_exists`), so a POST that repeats a
+    /// stored object is refused the same way, and the resume converges on the object
+    /// once it is visible ([`after_upload_post`] is what a 422 whose object turns out to
+    /// be there does about it, in this same invocation).
+    ///
+    /// # The answered 4xx re-proves the lease; the never-sent exit does not
+    ///
+    /// The POST that just finished may have run for minutes (a gigabyte DMG), and the
+    /// retraction rewrites the journal from this process's copy of it. A process that
+    /// was fenced out while it uploaded — a recovery took its claim over — would wake
+    /// on the 4xx and overwrite the successor's journal, dropping the intents
+    /// `--abandon` reads. So a 4xx proves the session first ([`ensure_ctx_release_lease`],
+    /// the proof every remote step makes) and, when it cannot, KEEPS the intent: the
+    /// fail-closed direction, at the price that a lease which cannot be read right now
+    /// leaves this asset at `--abandon`. Curl's exit 2 does not: it is reached under
+    /// memory pressure, where one more fallible call (the lease read is a
+    /// `git ls-remote`) before the retraction would restore the permanent wedge.
+    pub(crate) fn settle_upload_intent(&mut self, name: &str, out: &RunOut) -> Result<PostOutcome> {
+        let outcome = post_outcome(out);
+        match outcome {
+            PostOutcome::Unknown => {}
+            PostOutcome::NeverSent => self.retract_upload_intent(name)?,
+            PostOutcome::Refused => {
+                ensure_ctx_release_lease(self).map_err(|error| {
+                    Error::new(format!(
+                        "upload of {name} was answered with a 4xx, which created nothing, but \
+                         this process could not re-prove it still owns the release ({error}); \
+                         the durable intent was KEPT rather than rewrite a journal a successor \
+                         may own. If this process is still the cut's owner, `--abandon` \
+                         withdraws the cut and a recut starts clean"
+                    ))
+                })?;
+                self.retract_upload_intent(name)?;
+            }
+        }
+        Ok(outcome)
     }
 
     /// Local paths of exactly the assets this cut publishes, in a stable order.
@@ -6735,7 +6602,8 @@ pub fn withdraw_unpublished_release(
     if state == verify::ReleaseState::Published {
         return Err(Error::new(format!(
             "{tag} is the channel's PUBLISHED app release on {slug} — withdrawing it is not \
-             an abandon; retire a published build with `{SHIP_COMMAND} yank <build>`"
+             an abandon; retire a published build with `{SHIP_COMMAND} yank <build> \
+             --release-credentials <profile.toml> --mac-only|--linux-artifacts DIRECTORY`"
         )));
     }
     let Some(release) = unique_release_object_by_tag(slug, tag)? else {
@@ -6957,9 +6825,7 @@ pub fn ordinary_resume_claim_preflight(
         )));
     }
     // No HEAD clause: nothing an abandon or a retire does reads a tree, and a resume
-    // or a recovery puts the cut tree at the claim itself (`gates::place_cut_tree`)
-    // before it gets here — an operator instruction to check the claim out by hand
-    // is exactly what that placement replaced.
+    // or a recovery puts the cut tree at the claim itself (`gates::place_cut_tree`).
     Ok(())
 }
 
@@ -7125,13 +6991,9 @@ pub fn run_recover_lost(
     // Validate the immutable signing identity before rotating a killed
     // process's token.  Missing key recovery therefore leaves the old fence
     // untouched and the channel visibly blocked, never silently unsigned.
-    // A recovery's duty is read off the journal it found, not assumed: a journal that
-    // never reached `build` will rebuild and re-sign, so it must re-prove the roster;
-    // one that is past `build` — and the no-journal case, which is a PUBLISHED release
-    // being finished — has nothing left to sign. Demanding a still-fresh roster from
-    // the second kind would make recovery fail for a reason unrelated to recovering,
-    // which is the trade the `AppleTier::Inactive` decision below already refuses to
-    // make for an expired certificate.
+    // The duty is read off the journal found: one that never reached `build` will
+    // re-sign and must re-prove the roster; one past `build` — or no journal, a
+    // PUBLISHED release being finished — has nothing left to sign (see [`RosterDuty`]).
     let duty = roster_duty(journal.as_ref().is_none_or(|j| j.is_done("build")));
     let signature_verdict = preflight_signature_policy(credentials, duty)?;
     let signature_policy = signature_verdict.policy.clone();
@@ -7143,15 +7005,9 @@ pub fn run_recover_lost(
             "recovery journal signing policy/key differs from the current signing configuration",
         ));
     }
-    // Attribution is compared on exactly the same terms as the key — and ONLY when this
-    // recovery will rebuild. A recovery that will re-assemble and re-sign a manifest is
-    // choosing an attribution, and choosing a different one than the journal records
-    // would publish a claim the cut's own history contradicts; that is what this
-    // refuses. A recovery that is finishing already-signed bytes chooses nothing, so
-    // there is nothing to disagree about, and refusing there would kill the one path
-    // designed for a DEAD PUBLISHER in the one design where publishers are plural. The
-    // rule is the shared pure one so that recovery and resume cannot state it
-    // differently; the old inline `is_some()` guard was one-sided and did.
+    // Attribution is compared ONLY when this recovery will re-sign (it then chooses
+    // an attribution); finishing already-signed bytes chooses nothing. The shared
+    // rule keeps recovery and resume from stating it differently.
     if duty == RosterDuty::Sign
         && let Some(journal) = &journal
     {
@@ -7300,60 +7156,13 @@ fn recovered_roster_asset_names(manifest: &Manifest) -> Vec<&'static str> {
     vec![roster::ROSTER_ASSET, roster::ROSTER_SIG_ASSET]
 }
 
-/// Rebuild `dist/`'s roster pair from the published release, for a recovery that found
-/// an attributed manifest.
-///
-/// # Why this is not optional
-///
-/// `recover_published_cut` sets `signature_machine_id` from the recovered manifest —
-/// correctly, out of bytes a signature covers — and that makes `CutCtx::attaches_roster`
-/// true, which puts both roster names into `channel_asset_paths`. `publish` hard-errors
-/// on any release asset that is not a local file. Reconstructing the DMG, the zip, the
-/// appcast, its signature and the provenance but not these two therefore left
-/// `targo --unverified ship recover-lost` unable to complete on the armed path: it failed with
-/// "…dist/ artifacts are gone… recover the cut rather than mirroring different bytes",
-/// whose advice is the command that was already running. The release stayed live on the
-/// publish repo and absent from the public channel the fleet actually reads.
-///
-/// # What binds them, given the manifest's signature does not
-///
-/// There is no SHA-256 for these two in the manifest — the MASTER signs them, not the
-/// release key — so they are bound cryptographically instead, by
-/// `machines::verify_published_roster`: the master signature proves authorship, and the
-/// `roster_seq`/`machine_id` pair proves it is THIS release's roster. That is strictly
-/// stronger than the digest check the other assets get.
-/// Refuse to reconstruct a roster OLDER than the one this machine is already
-/// authorized by.
-///
-/// `dist/aterm-machines.toml` is not a build artifact. It is the machine's
-/// AUTHORIZING roster — the same file `atpkg-keys` writes and
-/// `ReleaseCredentials::resolve` adopts — and `dist/` is gitignored, so it is the
-/// only copy on the machine. Recovery used to overwrite it unconditionally with
-/// whatever generation the recovered release happened to carry, which silently
-/// DOWNGRADES it: revoke a stolen machine (seq N+1, written locally, not yet
-/// published), then recover an older cut made under seq N, and the revocation is
-/// gone — recreatable only by re-entering the 52-character paper master.
-///
-/// Nothing reported it, either. `roster_floor_covered` compares the carried
-/// generation against the published head, and after such a recovery both are N, so
-/// the next cut from this machine re-publishes a roster that still authorizes the
-/// machine the owner had just revoked.
-///
-/// A recovery may reconstruct the release's roster. It may not retire a newer one.
 /// The public key a PUBLISHED release's manifest signature must actually verify
 /// under.
 ///
 /// Recovery validates bytes that ALREADY SHIPPED, so the verification key is a
-/// property of the release, not of the machine running the command. A
-/// [`RosterDuty::Finish`] policy carries this machine's own key — right for an entry
-/// that will still sign something, wrong here — and using it made cross-machine
-/// recovery structurally impossible: m3 cuts v0.24.0 and dies after the flip, the
-/// owner runs `recover` on m11, and m3's shipped signature is checked against m11's
-/// key. It fails with "manifest signature does not verify under the channel public
-/// key", the release never reaches the public channel, and
-/// `refs/tags/aterm-release-lease` stays held by the dead machine — so every later
-/// `targo --unverified ship cut` refuses at `preflight_release_lease` with no command able to
-/// un-wedge it.
+/// property of the release, not of the machine running the command: a
+/// [`RosterDuty::Finish`] policy carries this machine's own key, and checking another
+/// machine's shipped signature against it makes cross-machine recovery impossible.
 ///
 /// On the armed path the release names its own signer and the master-signed roster
 /// beside it maps that name to a key: the same binding a client checks
@@ -7411,6 +7220,15 @@ fn published_manifest_signature_pubkey(
     Ok(Some(machine.pubkey.clone()))
 }
 
+/// Refuse to reconstruct a roster OLDER than the one this machine is already
+/// authorized by.
+///
+/// `dist/aterm-machines.toml` is not a build artifact: it is the machine's
+/// AUTHORIZING roster (what `atpkg-keys` writes and `ReleaseCredentials::resolve`
+/// adopts), and `dist/` is gitignored, so it is the only copy. Overwriting a newer
+/// generation (say, a local revocation not yet published) with an older release's
+/// would silently undo it, and `roster_floor_covered` would not notice. A recovery
+/// may reconstruct the release's roster; it may not retire a newer one.
 fn refuse_roster_downgrade(dist: &Path, incoming_seq: u64) -> Result<()> {
     let local = dist.join(roster::ROSTER_ASSET);
     let (Ok(bytes), Ok(sig)) = (
@@ -7433,12 +7251,10 @@ fn refuse_roster_downgrade(dist: &Path, incoming_seq: u64) -> Result<()> {
     };
     if existing.roster_seq > incoming_seq {
         return Err(Error::new(format!(
-            "{} already holds roster_seq {}, which is NEWER than the roster_seq \
-             {incoming_seq} carried by the release being recovered. Overwriting it \
-             would destroy the only copy of a master-signed generation — including \
-             any revocation it carries — and it can be recreated only from the paper \
-             master. Publish the newer roster first (so the channel head carries it), \
-             or move the pair aside deliberately if you really do mean to go back",
+            "{} holds roster_seq {}, NEWER than the recovered release's {incoming_seq}; \
+             overwriting it would destroy the only copy of that generation (and any \
+             revocation in it). Publish the newer roster first, or move the pair aside \
+             to go back on purpose",
             local.display(),
             existing.roster_seq
         )));
@@ -7446,6 +7262,17 @@ fn refuse_roster_downgrade(dist: &Path, incoming_seq: u64) -> Result<()> {
     Ok(())
 }
 
+/// Rebuild `dist/`'s roster pair from the published release, for a recovery that found
+/// an attributed manifest.
+///
+/// Not optional: an attributed manifest makes `CutCtx::attaches_roster` true, which
+/// puts both roster names into `channel_asset_paths`, and `publish` hard-errors on any
+/// release asset that is not a local file.
+///
+/// The manifest carries no SHA-256 for these two (the MASTER signs them, not the
+/// release key), so `machines::verify_published_roster` binds them instead: the master
+/// signature proves authorship, and the `roster_seq`/`machine_id` pair proves it is
+/// THIS release's roster.
 fn reconstruct_roster_assets(
     slug: &str,
     release_id: u64,
@@ -7604,8 +7431,7 @@ fn recover_published_cut(
         )));
     }
     // The claim identity is the SIGNED manifest's: `validate_live_release_identity`
-    // above bound its version, build and full commit to this claim. (The provenance
-    // record that once restated them never leaves the cutting machine's `dist/`.)
+    // above bound its version, build and full commit to this claim.
 
     // Reconstruct only authoritative, remotely validated bytes. The journal resumes
     // at `publish`: nothing is rebuilt or re-uploaded from guesses, and `publish` finds
@@ -7627,9 +7453,8 @@ fn recover_published_cut(
     })?;
     // Regenerate the stable download twins from the digest-verified canonical
     // containers: recovery must leave dist/ able to satisfy the channel asset set,
-    // and each twin is by definition a byte copy of
-    // its canonical asset: `aterm.dmg` is a byte copy of manifest.dmg, the ONE
-    // DMG (RETIRED 2026-08-26: the lean/seeded split the alias once tracked).
+    // and each twin is a byte copy of its canonical asset (`aterm.dmg` of
+    // manifest.dmg).
     fs::copy(&recovered_dmg, dist.join(channel::stable_dmg_asset_name()))
         .map_err(|error| Error::new(format!("reconstruct stable dmg twin: {error}")))?;
     verify_release_asset_digest_for_release_id_to(
@@ -7645,10 +7470,9 @@ fn recover_published_cut(
         dist.join(channel::stable_zip_asset_name()),
     )
     .map_err(|error| Error::new(format!("reconstruct stable zip twin: {error}")))?;
-    // RETIRED 2026-08-26: the Intel DMG pair. A published release whose
-    // manifest still names one was cut by a previous cutter under a container
-    // contract this one no longer produces or publishes — refuse the takeover
-    // rather than reconstruct a dist/ the exact-set gate would then refuse anyway.
+    // A manifest that still names the retired Intel DMG pair was cut under a
+    // container contract this cutter does not publish: refuse the takeover rather
+    // than reconstruct a dist/ the exact-set gate would refuse anyway.
     refuse_retired_intel_dmg(&manifest)?;
     // The `.sha256` sidecars are pure functions of the manifest digests just
     // proved against the downloaded bytes, so a recovery REGENERATES them
@@ -7705,7 +7529,7 @@ fn recover_published_cut(
         // FROM THE RELEASE, not from this machine: the artifacts being recovered are
         // already signed, by a machine that may not be this one. `signature_pubkey`
         // above stays this machine's own key so the local guards keep comparing like
-        // with like (2026-08-19 round-6 audit).
+        // with like.
         verify_pubkey: recovered_pubkey.clone(),
         // FROM THE PUBLISHED BYTES, not from this machine. The manifest being
         // recovered is already signed, and `machine_id` is inside what that
@@ -7783,10 +7607,7 @@ fn recover_published_cut(
 }
 
 /// The transcript's `signature` line: the key this cut ACTUALLY signs with, and the
-/// machine the master-signed roster says that key is.
-///
-/// It used to compare the key against the retired channel head and print "configured
-/// key matches" without comparing anything; now it names only facts the gate decided.
+/// machine the master-signed roster says that key is: only facts the gate decided.
 #[must_use]
 pub fn signature_transcript_line(signing_key: Option<&str>, machine_id: Option<&str>) -> String {
     match (signing_key, machine_id) {
@@ -7814,12 +7635,21 @@ pub fn ungated_range_lines(receipts: &gates::ReceiptReport) -> Vec<String> {
         text
     };
     // A commit gated BY ITS TREE says whose run vouched: the receipt is about the
-    // bytes, and the few gates that read history ran on that other commit.
+    // bytes, and the few gates that read history ran on that other commit. A
+    // receipt read from another clone's store (`gates::Stores`) names the store.
+    let from = receipts
+        .gated_from
+        .as_ref()
+        .map(|store| format!(" (from the receipt store {})", store.display()))
+        .unwrap_or_default();
     let by_tree = receipts
         .gated_by_tree
         .as_deref()
         .map(|run| {
-            format!(", by its tree — the passing receipt is {run}'s, a commit with the same bytes")
+            format!(
+                ", by its tree — the passing receipt is {run}'s{from}, a commit with the same \
+                 bytes"
+            )
         })
         .unwrap_or_default();
     lines.push(match &receipts.newest_gated {
@@ -7846,7 +7676,8 @@ pub fn ungated_range_lines(receipts: &gates::ReceiptReport) -> Vec<String> {
     {
         lines.push(format!(
             "gate receipts: {sha} passed the merge contract with {} red(s) inherited from \
-             main — red there with the same failure, so not that change's, and still red: {}",
+             main — red there with the same failure, so not that change's, and still \
+             red: {}",
             receipts.inherited.len(),
             named(&receipts.inherited)
         ));
@@ -8121,7 +7952,7 @@ pub enum Cutter {
     HandedOff,
 }
 
-/// THE TREE IS CUT BY ITS OWN CUTTER (2026-09-23). The rules a cutter enforces must
+/// THE TREE IS CUT BY ITS OWN CUTTER. The rules a cutter enforces must
 /// be the rules the tree it cuts declares ([`gates::cutter_identity_gate`] — v0.63.0
 /// is why), and the cut tree holds the published commit (or, for a resume or a
 /// recovery, the release commit), usually OLDER than the checkout the launcher
@@ -8390,7 +8221,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         let _ = fs::remove_file(&journal_path);
     }
     // ---- the published commit (before the tier, the version and the claim) -
-    // THE CUT BUILDS WHAT `pub publish` PUBLISHED (2026-09-23, owner ruling R2): the
+    // THE CUT BUILDS WHAT `pub publish` PUBLISHED (owner ruling R2): the
     // newest aterm row of the engine's ledger, whatever main's tip is, in the cut
     // tree — this checkout never moves. When this binary is not that commit's own
     // cutter, the cut is handed to the one built there.
@@ -8453,9 +8284,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // Every `gh` call a real cut makes from here on is a release-channel call.
     let _cred = (kind == CutKind::Real).then(ChannelCred::enter);
     // THE version this cut publishes: the workspace version as written. The
-    // ledger is still read (below) for the BUILD NUMBER claim, but it is no
-    // longer a version lineage — its historical two-component lines are
-    // retired-scheme accounting history.
+    // ledger supplies only the build number (below).
     let release_version = release_version_from_workspace(&full)?;
     // Recorded into any fence this process creates, and used as the fallback
     // version when a refusal has to print the recover command for a fence that
@@ -8561,9 +8390,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         ),
     );
 
-    // RETIRED 2026-08-26: the pre-claim toolchain-seed gate (`dist/toolchain-seed`
-    // validation, `ATERM_SEEDLESS=1`). aterm ships ONE lean self-provisioning
-    // download; there is nothing to seal and nothing to gate.
     step(
         "",
         &format!(
@@ -8643,19 +8469,19 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     if opts.gate {
         run_gate_script(&tree)?;
     }
-    // NOTHING SHIPS UNMEASURED (2026-09-26): the merge contract no longer runs
-    // the gate's MEASURE tier, so a real cut requires a MEASURE receipt saying
-    // `measured yes` for the tree it builds, taken with the compiler it builds
-    // with (2026-09-27) and with no build environment of its caller's (third
-    // review, the same day) — after the optional deep gate, whose `--full` files
-    // one — and refuses pre-claim without one. A dry run or rehearsal states
+    // NOTHING SHIPS UNMEASURED: the merge contract does not run the gate's MEASURE
+    // tier, so a real cut requires a MEASURE receipt saying `measured yes` for the
+    // tree it builds, taken with the compiler it builds with and with no build
+    // environment of its caller's — after the optional deep gate, whose `--full`
+    // files one — and refuses pre-claim without one. A dry run or rehearsal states
     // the answer.
     step("gate", &gates::measure_gate(&git, kind == CutKind::Real)?);
-    // NOTHING SHIPS UNVERIFIED BY THE WHOLE-TREE TRUST LANE (2026-09-27): the
+    // NOTHING SHIPS UNVERIFIED BY THE WHOLE-TREE TRUST LANE: the
     // merge contract verifies only the libraries a change touched, the heaviest
-    // excepted, so a real cut requires a PASS trust receipt for the tree it
-    // builds, from the prover it builds with — the deep gate's whole-tree run
-    // files one — and refuses pre-claim without one.
+    // excepted, so a real cut requires the whole-tree lane's facts for the tree
+    // it builds (its floors aside), from the prover it builds with, to pass this
+    // commit's floors — the deep gate's whole-tree run files them — and refuses
+    // pre-claim without that.
     step(
         "gate",
         &gates::trust_receipt_gate(&git, kind == CutKind::Real)?,
@@ -8686,14 +8512,11 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let head_scan = verify::scan_published(&publish_slug, true)?;
     let newest_channel = head_scan.first();
     let newest_min_build = newest_channel.and_then(|published| published.min_build);
-    // THE MACHINE-ROSTER GATE RUNS HERE, inside this call, and here is deliberate:
-    // it is the last of the pre-claim gates and it sits BEFORE the ledger claim a few
-    // lines below. A claim burns a single-use build number and is pushed to origin, so
-    // a refusal after it costs a number that can never be reused and leaves a dangling
-    // claim for `targo --unverified ship status` to explain. Everything the roster gate needs is
-    // local — a file, a signature, a clock — so there is no reason for it to happen
-    // one line later than the cheapest gates, and every reason for it not to.
-    let signature_verdict = preflight_signature_policy(credentials, RosterDuty::Sign)?;
+    // THE MACHINE-ROSTER GATE, the last pre-claim gate: a refusal after the ledger
+    // claim below burns a single-use build number and leaves a dangling claim, and
+    // everything this gate needs is local (a file, a signature, a clock).
+    let signature_verdict = preflight_signature_policy(credentials, RosterDuty::Sign)
+        .map_err(|e| Error::new(format!("{}; nothing was claimed", e.0)))?;
     let signature_policy = signature_verdict.policy.clone();
     step(
         "signature",
@@ -8768,9 +8591,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             .map(|who| who.roster_seq),
         newest_roster_seq,
     )?;
-    // Announced only when the tier is ARMED. An inert anchor must add zero transcript
-    // lines, exactly as Tier APPLE does — a cut from this tree has to look precisely
-    // as it did before the roster existed.
+    // Announced only when the tier is ARMED: an inert anchor adds no transcript
+    // lines, as Tier APPLE does.
     if let Some(who) = &signature_verdict.attribution {
         step(
             "roster",
@@ -8947,9 +8769,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     run_pipeline(&mut ctx, t0)
 }
 
-/// The PATHS a resume works over, bundled because they always travel together —
-/// passing them singly is what pushed [`resume_cut`]'s signature past the
-/// argument-count bar. `tree` is the cut tree, already at the journaled release
+/// The PATHS a resume works over, bundled because they always travel together.
+/// `tree` is the cut tree, already at the journaled release
 /// commit ([`gates::place_cut_tree`]); the other three are the operator's checkout.
 struct ResumePaths<'a> {
     repo: &'a Path,
@@ -9000,14 +8821,11 @@ fn resume_cut(
     // lease/fence. The worktree is the cut tree: the caller put it at the claim.
     ordinary_resume_claim_preflight(tree, &git, &journal)?;
 
-    // THE INTERRUPTED-RESUME FIX. A killed resume leaves its fence behind, and
-    // before this every later resume refused with a message that named neither
-    // the holder nor the remedy — v0.87.0 spent hours, and 88 iterations of a
-    // retry loop, on a hand-assembled `ship recover`. A resume may now take a
-    // fence back, but ONLY when it can PROVE the recorded publisher is dead:
-    // same host, same boot session, and that pid either gone or reused by
-    // another program. Anything unprovable is kept and refused below, with a
-    // message that states which and prints the exact recover command.
+    // A killed resume leaves its fence behind. A resume may take a fence back,
+    // but ONLY when it can PROVE the recorded publisher is dead: same host, same
+    // boot session, and that pid either gone or reused by another program.
+    // Anything unprovable is kept and refused below, with a message that states
+    // which and prints the exact recover command.
     //
     // A recovery lane arrives with its session already rotated
     // (`recovered_session`); it has its own explicit operator proof and must
@@ -9018,12 +8836,9 @@ fn resume_cut(
     // acquire is deliberately skipped for an unlock-only resume: the lease may
     // already be CAS-deleted by this cut's own `unlock`, and re-acquiring would
     // mint state nothing later deletes. On exactly that resume a fence on the
-    // remote can belong to a DIFFERENT claim — the successor cut's — so probing
-    // it here took the `Kept` arm and printed that cut's full refusal into this
-    // cut's transcript, for a fence this resume was never going to touch, before
-    // proceeding and exiting 0. (The post-unlock `site` step this also skipped left
-    // the journal on 2026-09-23 — see [`STEPS`].) The predicate is
-    // `run_pipeline`'s, spelled the same way on purpose.
+    // remote can belong to a DIFFERENT claim — the successor cut's — and probing
+    // it would print that cut's refusal into this cut's transcript. The predicate
+    // is `run_pipeline`'s, spelled the same way on purpose.
     if recovered_session.is_none() && next != "unlock" {
         match reclaim_dead_publisher_fence(&git, &journal.commit, &LocalProbe) {
             Ok(FenceReclaim::NoFence) => {}
@@ -9079,12 +8894,9 @@ fn resume_cut(
     // machine finishing the first machine's cut would publish a claim the artifact
     // contradicts.
     //
-    // The `roster_tier_armed()` guard is what makes the unarmed resume path provably
-    // unchanged: with `PAPER_MASTER_PUBKEYS` empty this block is not entered at all,
-    // so a resume performs exactly the calls, in exactly the order, that it always
-    // has. The RULE inside it is a pure function ([`resume_attribution_agrees`]) so that
-    // a fork, where this guard is never entered, still tests it. WRONG BEFORE: "being
-    // unreachable in this tree" — armed since 2026-08-15, it runs on every resume here.
+    // With `PAPER_MASTER_PUBKEYS` empty (a fork) this block is not entered at all.
+    // The RULE inside it is a pure function ([`resume_attribution_agrees`]) so that a
+    // fork still tests it.
     let resumed = if aterm_update_core::pins::roster_tier_armed() && !journal.is_done("build") {
         let verdict = preflight_signature_policy(credentials, RosterDuty::Sign)?;
         resume_attribution_agrees(
@@ -9346,10 +9158,8 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
 
 /// A real cut's closing transcript line. It states no delivery deadline: how soon
 /// an install stages a release is the updater's cadence, which lives in another
-/// crate and moves (it once said "fleet stages within 6h" while every install
-/// checked every 30 minutes). What it states instead is where the cut left things —
-/// the journal, and the cut tree at the release commit. The operator's checkout
-/// has nothing to report: the cut never moved it.
+/// crate and moves. It states where the cut left things — the journal, and the cut
+/// tree at the release commit.
 #[must_use]
 pub fn real_cut_done_line(
     version: &str,
@@ -9399,15 +9209,10 @@ fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
         return Ok(());
     }
     ensure_ctx_release_lease(ctx)?;
-    // The DUTY, from the same fact `resume_cut` and `run_recover_lost` read it from.
-    // This used to be unconditional, and `resume_cut`'s own comment promised otherwise:
-    // it guards its roster re-derivation with `!is_done("build")` and says demanding a
-    // still-fresh roster from a later resume "would turn a cut that is one upload from
-    // done into one that can never be finished". That promise was defeated here, four
-    // hundred lines away, because `run_pipeline` calls this on every real entry whose
-    // first incomplete step is not `unlock`. See [`RosterDuty`] for why the post-build
-    // check is not merely inconvenient but wrong: the roster it would read is not the
-    // roster the cut will publish.
+    // The DUTY, from the same fact `resume_cut` and `run_recover_lost` read it from:
+    // `run_pipeline` calls this on every real entry but an unlock-only one, and a
+    // post-build entry must not demand a still-fresh roster (see [`RosterDuty`]: the
+    // roster it would read is not the roster the cut will publish).
     let duty = roster_duty(ctx.is_done("build"));
     let observed = preflight_signature_policy(ctx.credentials.as_ref(), duty)?;
     if observed.policy.required != ctx.signature_required
@@ -9555,8 +9360,7 @@ impl SiteFollow {
         } = self
         else {
             return vec![format!(
-                "{SITE_HOOK} is not in this tree — no public website follows this channel; \
-                 skipped"
+                "{SITE_HOOK} is not in this tree — no website follows this channel; skipped"
             )];
         };
         match outcome {
@@ -9564,28 +9368,26 @@ impl SiteFollow {
                 "alab.systems synced to v{version} (or deferred with instructions above)"
             )],
             SiteHookOutcome::NoSiteCheckout => vec![format!(
-                "WARNING: NO SITE CHECKOUT ON THIS MACHINE — alab.systems still links the \
-                 PREVIOUS release's DMG. The cut is complete and unaffected; from a machine \
-                 with the site checkout run: {}   (set SITE_DIR if it is not at \
-                 ~/company-life/companies/ferrite/workspace-alab); v{version} will then be \
-                 the download",
+                "WARNING: no site checkout on this machine — alab.systems still links the \
+                 previous DMG; the cut is complete. From a machine with the site checkout \
+                 (SITE_DIR, default ~/company-life/companies/ferrite/workspace-alab): {}",
                 site_retry_command(version)
             )],
             SiteHookOutcome::LiveLagging => vec![
-                "deployed, but the live site still served the old bytes after the settle loop \
-                 (CDN lag or a concurrent deploy) — re-check https://alab.systems in a minute"
+                "deployed; the live site still serves the old bytes (CDN lag or a concurrent \
+                 deploy) — re-check https://alab.systems in a minute"
                     .to_string(),
             ],
             SiteHookOutcome::Failed => vec![
                 format!(
-                    "WARNING: THE WEBSITE DID NOT FOLLOW THE CUT — {SITE_HOOK} failed ({}). \
-                     alab.systems may still link the previous release's DMG.",
+                    "WARNING: the website did not follow the cut — {SITE_HOOK} failed ({}); \
+                     alab.systems may still link the previous DMG",
                     failure.as_deref().unwrap_or("unknown failure")
                 ),
                 format!(
-                    "the release v{version} is COMPLETE — live, proved, the channel head and \
-                     unlocked, and its journal is finished, so the next cut is not blocked by \
-                     this. Retry the website by hand, from the repository root: {}",
+                    "v{version} is COMPLETE (live, proved, unlocked; journal finished, next cut \
+                     unblocked). Retry \
+                     the website from the repository root: {}",
                     site_retry_command(version)
                 ),
             ],
@@ -9593,24 +9395,19 @@ impl SiteFollow {
     }
 }
 
-/// THE WEBSITE FOLLOWS THE CUT — best-effort, after the pipeline, NOT journaled
-/// (2026-09-23). alab.systems' download button names the `aterm-<version>.dmg` the
-/// cut just made the channel head, with its true size, and `/releases` carries the notes.
-/// The mechanism is the SAME hook a `pub promote` runs (`publish/post-promote`,
-/// byte transforms in `publish/site-sync.py`, tested hermetically by
-/// `tools/test-site-sync.sh`). Since 2026-09-23 the promote-time run of that hook
-/// does nothing (it defers to the cut), so this is the site's sync, and the
-/// release's first `/terminal` engine build.
+/// THE WEBSITE FOLLOWS THE CUT — best-effort, after the pipeline, NOT journaled.
+/// alab.systems' download button names the `aterm-<version>.dmg` the cut just made
+/// the channel head, with its true size, and `/releases` carries the notes. The
+/// mechanism is the SAME hook a `pub promote` runs (`publish/post-promote`, byte
+/// transforms in `publish/site-sync.py`, tested hermetically by
+/// `tools/test-site-sync.sh`); the promote-time run of that hook defers to the cut,
+/// so this is the site's sync, and the release's first `/terminal` engine build.
 ///
-/// WHY NOT A JOURNAL STEP ANY MORE. It was one (`site`, after `unlock`, in format 8
-/// and in `main`'s format 9 — the reason [`JOURNAL_FORMAT`] is 10),
-/// so a hook failure parked the journal at `site` — and a parked journal refuses
-/// the next fresh cut outright (a cut is already in progress … at step "site"),
-/// which made a website deploy a blocker for a release that had nothing to do with
-/// it. 0.91 ended exactly there. The release is complete before this runs, so the
-/// honest outcome of a failure is a loud WARNING and the exact command that retries
-/// it ([`site_retry_command`]), with the journal left COMPLETE. The outcome split is
-/// [`site_hook_outcome`]:
+/// NOT A JOURNAL STEP: a parked journal refuses the next fresh cut, which would make
+/// a website deploy block a release that has nothing to do with it. The release is
+/// complete before this runs, so a failure is a loud WARNING and the exact retry
+/// command ([`site_retry_command`]), with the journal left COMPLETE. The outcome
+/// split is [`site_hook_outcome`]:
 ///
 /// - exit 0 — synced, or the hook's own deliberate deferrals (no Firebase login:
 ///   "SITE NOT DEPLOYED — committed and pushed; deploy later with deploy.sh"),
@@ -9634,8 +9431,8 @@ pub fn site_follows_the_cut(
     step(
         "site",
         &format!(
-            "alab.systems follows the cut: {} (download button \u{2192} aterm-{version}.dmg \
-             on the public channel; best-effort — the cut is already complete)",
+            "alab.systems follows the cut: {} (download \u{2192} aterm-{version}.dmg; \
+             best-effort, the cut is complete)",
             site_retry_command(version)
         ),
     );
@@ -9668,26 +9465,19 @@ pub fn site_follows_the_cut(
 /// the compile on any violation.
 ///
 /// WHY THIS IS NOT OPT-IN, when `tools/verify.sh --full` deliberately is. Spec
-/// decisions 15/22 make the DEEP gate opt-in, and that is right: it is minutes
-/// long and it is the merge contract's job, not the cutter's. This is a
-/// different thing — one build of one dependency-free crate, MEASURED at 8.71 s
-/// from scratch and ~3.8 s warm (that crate's manifest carries the numbers) —
-/// and it is the only mechanical link between "the census exists" and "what
-/// users run was checked by it".
+/// decisions 15/22 make the DEEP gate opt-in: it is minutes long and it is the
+/// merge contract's job. This is one build of one dependency-free crate, MEASURED
+/// at 8.71 s from scratch and ~3.8 s warm (that crate's manifest carries the
+/// numbers), and it is the only mechanical link between "the census exists" and
+/// "what users run was checked by it".
 ///
-/// The gap it closes was walked, not imagined: the merge contract DOES run the
-/// censuses (an unconditional stage, in `--fast`), but nothing makes a commit on
-/// main have passed it — there is no CI and no git hook, by owner decision ("I
-/// DONT WANT HOOKS! NO HOOKS NO CI", 2026-07-06). A `.githooks/pre-push` re-added
-/// without that sign-off was advisory from 2026-08-24 (the window in which v0.65.0
-/// shipped a self-recursive `OnceLock` that froze the main thread on the first
-/// automatic update apply), refused receipt-less pushes from 2026-09-17 behind a
-/// named bypass that all four 0.91 pushes used, and was deleted on 2026-09-25. So
-/// a commit can reach origin/main ungated, `pub publish` can export it, and the cut
-/// builds exactly that published commit. This gate is the one proof that runs on
-/// every cut regardless — INLINE, in the tool being run, which is where the owner
-/// puts every quality gate; the ungated range itself is stated in the transcript
-/// from the gate receipts the cutter reads itself ([`gates::receipt_report`]).
+/// The merge contract runs the censuses, but nothing makes a commit on main have
+/// passed it — there is no CI and no git hook, by owner decision — so a commit can
+/// reach origin/main ungated, `pub publish` can export it, and the cut builds
+/// exactly that commit (v0.65.0 shipped a self-recursive `OnceLock` that way). This
+/// gate is the one proof that runs on every cut regardless, INLINE in the tool being
+/// run; the ungated range itself is stated in the transcript from the gate receipts
+/// ([`gates::receipt_report`]).
 ///
 /// It runs BEFORE the ledger claim, so a failure costs seconds and burns no
 /// build number — the same posture as every other gate in `gates.rs`.
@@ -9727,31 +9517,105 @@ fn run_freeze_safety_gate(repo: &Path) -> Result<()> {
 /// receipt for the tree, so green runs satisfy [`gates::measure_gate`] and
 /// [`gates::trust_receipt_gate`], which run right after.
 fn run_gate_script(repo: &Path) -> Result<()> {
-    for (script, args, what) in [
-        ("tools/verify.sh", &["--full"][..], "tools/verify.sh --full"),
-        (
-            "tools/trust-gate-all.sh",
-            &[][..],
-            "tools/trust-gate-all.sh (the whole-tree Trust advisory lane)",
-        ),
-    ] {
-        step("gate", &format!("{what} (opt-in deep gate)"));
-        // The trust lane's self-test seam turns off its refused-path check
-        // (COULD NOT RUN, never NOT-VERIFIED); an exported one must not reach a cut.
-        let status = Command::new(repo.join(script))
-            .args(args)
-            .env_remove("ATERM_GATE_NO_PATH_CHECK")
-            .current_dir(repo)
-            .stdin(std::process::Stdio::null())
+    for gate in DEEP_GATES {
+        step("gate", &format!("{} (opt-in deep gate)", gate.what));
+        let status = deep_gate_cmd(repo, &gate)
             .status()
-            .map_err(|e| Error::new(format!("spawn {script}: {e}")))?;
-        if !status.success() {
-            return Err(Error::new(format!(
-                "{what} FAILED — fix the tree; nothing was claimed or committed"
-            )));
-        }
+            .map_err(|e| Error::new(format!("spawn {}: {e}", gate.script)))?;
+        deep_gate_verdict(&gate, status.code())?;
     }
     Ok(())
+}
+
+/// One script of the opt-in deep gate, the exit status it answers when it decided
+/// nothing about the tree, and the one it answers when this machine was too small
+/// to verify every library.
+struct DeepGate {
+    script: &'static str,
+    args: &'static [&'static str],
+    what: &'static str,
+    could_not_run: i32,
+    narrowed_by_memory: Option<i32>,
+}
+
+const DEEP_GATES: [DeepGate; 2] = [
+    DeepGate {
+        script: "tools/verify.sh",
+        args: &["--full"],
+        what: "tools/verify.sh --full",
+        could_not_run: 3,
+        narrowed_by_memory: None,
+    },
+    DeepGate {
+        script: "tools/trust-gate-all.sh",
+        args: &[],
+        what: "tools/trust-gate-all.sh (the whole-tree Trust advisory lane)",
+        could_not_run: 2,
+        narrowed_by_memory: Some(4),
+    },
+];
+
+/// Every input `tools/trust-gate-all.sh` reads from its environment. A cut runs
+/// the lane on the tree's own files, the machine's trustd and the script's own
+/// wait, so each is pinned empty (the script's default), as the verify stage
+/// pins them: an exported one narrows the run, moves its memory record, aims its
+/// trustd probe and keeper at another socket, shortens its wait, turns off its
+/// refused-path check, or moves how often it samples the load.
+const TRUST_LANE_INPUTS: [&str; 13] = [
+    "ATERM_GATE_ONLY",
+    "ATERM_GATE_RATCHET",
+    "ATERM_GATE_FORKS",
+    "ATERM_GATE_SCOPE",
+    "ATERM_GATE_MEMORY",
+    "ATERM_GATE_HOST_MEMORY",
+    "ATERM_GATE_LOGDIR",
+    "ATERM_GATE_COSTS",
+    "ATERM_GATE_LOAD_EVERY",
+    "ATERM_GATE_MACHINE",
+    "ATERM_GATE_TRUSTD",
+    "ATERM_GATE_TRUSTD_WAIT",
+    "ATERM_GATE_NO_PATH_CHECK",
+];
+
+fn deep_gate_cmd(repo: &Path, gate: &DeepGate) -> Command {
+    let mut cmd = Command::new(repo.join(gate.script));
+    cmd.args(gate.args)
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null());
+    for k in TRUST_LANE_INPUTS {
+        cmd.env(k, "");
+    }
+    cmd
+}
+
+/// A script that decided nothing — its COULD NOT RUN exit, or no exit at all —
+/// is never a finding about the tree: machine contention (another build's
+/// trustd on the socket, one too loaded to answer) reads as what it is. Nor is
+/// the trust lane's NARROWED BY MEMORY: nothing failed, but this
+/// machine's verifier ceiling (`targo trust`: RAM / 8) could not reproduce every
+/// library's floor — a machine too small for the release's whole-tree run.
+fn deep_gate_verdict(gate: &DeepGate, code: Option<i32>) -> Result<()> {
+    let what = gate.what;
+    match code {
+        Some(0) => Ok(()),
+        Some(c) if Some(c) == gate.narrowed_by_memory => Err(Error::new(format!(
+            "{what} NARROWED: this machine cannot verify every library (its MEMORY lines name \
+             them and the RAM that does); run cut --gate on a machine with that much memory; \
+             nothing was claimed or committed"
+        ))),
+        Some(c) if c == gate.could_not_run => Err(Error::new(format!(
+            "{what} COULD NOT RUN — nothing was decided about the tree (its COULD NOT RUN \
+             line above says why); nothing was claimed or committed: re-run the cut when \
+             it can run"
+        ))),
+        None => Err(Error::new(format!(
+            "{what} was ended by a signal — nothing was decided about the tree; nothing was \
+             claimed or committed"
+        ))),
+        Some(_) => Err(Error::new(format!(
+            "{what} FAILED — fix the tree; nothing was claimed or committed"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9766,15 +9630,8 @@ fn run_gate_script(repo: &Path) -> Result<()> {
 /// notarizing after the zip is built, or skipping the post-hook re-hash, both
 /// produce a green cut and a broken artifact. This seam is what lets
 /// [`notarize_and_package`] be driven end to end, offline, by a fake that records
-/// what happened in what order.
-///
-/// It wraps `dmg.rs` rather than changing it: the real implementation is four
-/// one-line delegations, so nothing about how a DMG is actually built moved.
-///
-/// RETIRED 2026-08-26: the `dmg_arch` (Intel `-x86_64` restage) and `dmg_lite`
-/// (seed-stripped `-lite` twin) lanes, and the `notarized`/`seeded` facts the
-/// zip lane took to judge its restage — there is no seed and no restage; the
-/// zip archives the bundle exactly as the DMG images it.
+/// what happened in what order. The real implementation is four one-line
+/// delegations to `dmg.rs`; the zip archives the bundle exactly as the DMG images it.
 pub trait Packager {
     fn dmg(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
     fn zip(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
@@ -9854,7 +9711,7 @@ pub fn notarize_notice(kind: CutKind) -> String {
 ///
 /// On the inactive tier (the shipped one) both hooks do nothing, no re-hash
 /// happens, and this is `dmg::create` + `dmg::create_zip` with the digests they
-/// minted — byte-for-byte the pipeline as it has always run.
+/// minted.
 pub fn notarize_and_package(
     app: &Path,
     dist: &Path,
@@ -9895,7 +9752,7 @@ pub fn notarize_and_package(
     // bytes only. The manifest sha256 must be the digest of the exact bytes
     // clients download — a stale one would hard-abort the self-check after the
     // whole build+notarize, and (were the self-check ever skipped) fail the
-    // sha256 gate on every v0.25 client.
+    // sha256 gate on every client.
     let (dmg_sha256, dmg_size) = if dmg_notarized {
         (pack.sha256(&dmg_out.path)?, pack.size(&dmg_out.path)?)
     } else {
@@ -9932,7 +9789,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // No ambient credentials, and no trust anchors injected into the child build.
     // Both anchors are committed constants (`aterm_update_core::pins`) that the
     // child compiles in directly, so exporting them here would only create a second
-    // source that could disagree with the first — the exact bug 068a6e2c removed.
+    // source that could disagree with the first.
 
     step(
         "build",
@@ -10007,10 +9864,9 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         ),
     );
 
-    // Tier APPLE, resolved once at the entry point. Inactive — a FORK's tier, not this
-    // tree's, ARMED since 2026-08-15 (WRONG BEFORE: "the shipped tier") — means
-    // `identity()` is None and every hook below is a no-op, leaving this region
-    // byte-for-byte the ad-hoc path it has always been.
+    // Tier APPLE, resolved once at the entry point. Inactive (a FORK's tier, not this
+    // tree's) means `identity()` is None and every hook below is a no-op: the ad-hoc
+    // path.
     let sign_id = ctx.apple.identity();
     let signed_by = sign::sign_app(
         &app,
@@ -10049,9 +9905,8 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     )?;
     // The DMG must clear the client's own download bound before anything is
     // hashed into a manifest: a cut that packages past it publishes a release
-    // no client can download. (The seeded dual-arch image once reached 97.3%
-    // of the 2 GiB `RELEASE_ASSET_DOWNLOAD_BOUND`; the lean one was 40.6 MB at v0.98.0,
-    // and the check stays because the bound is the client's, not ours.)
+    // no client can download. The bound is the client's
+    // (`RELEASE_ASSET_DOWNLOAD_BOUND`), not ours.
     validate_release_asset_download_size(dmg_size)?;
     // ...and the SHAPE question the bound above cannot answer: a seeded image is
     // perfectly downloadable and still the wrong artifact. Checked here, on the
@@ -10064,13 +9919,8 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // the bytes its in-process digest covers. required_asset_names() lists
     // every one of them, so `publish` uploads them and refuses a channel head
     // without them. The twins are the PERMANENT download names the README
-    // publishes and readers bookmark. (They are no longer what alab.systems
-    // links: since 2026-08-28 the site's button is the VERSIONED
-    // `aterm-<v>.dmg`, rewritten on every promote by `publish/post-promote`,
-    // so the button downloads exactly the file it names.) The DMG twin `aterm.dmg` is a
-    // byte copy of manifest.dmg — the ONE lean DMG (RETIRED 2026-08-26: the
-    // `-lite` twin it used to alias, and the `aterm-offline.dmg` alias of the
-    // seeded image).
+    // publishes and readers bookmark (alab.systems links the VERSIONED
+    // `aterm-<v>.dmg`). The DMG twin `aterm.dmg` is a byte copy of manifest.dmg.
     for (source, twin) in [
         (&dout.path, ctx.stable_dmg_path()),
         (&zout.path, ctx.stable_zip_path()),
@@ -10148,9 +9998,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             zout.sha256.as_str(),
             channel::zip_asset_name(&ctx.version),
         ),
-        // The alias sidecars restate their SOURCE artifact's digest under the
-        // alias filename — each twin above is a byte copy of exactly the
-        // artifact whose digest it restates.
         (
             ctx.stable_dmg_sha256_path(),
             dmg_sha.as_str(),
@@ -10292,19 +10139,15 @@ pub fn selfcheck_signing(
     tools: &dyn sign::AppleTools,
 ) -> Result<&'static str> {
     // The hard gate (sign.rs's inline verify print is advisory), on EVERY tier
-    // including the ad-hoc one a FORK ships. WRONG BEFORE: "that ships today" —
-    // `pins::APPLE_TEAM_ID` has been armed since 2026-08-15.
+    // including the ad-hoc one a FORK ships.
     tools.codesign_verify_strict(app).map_err(|e| {
         Error::new(format!(
             "self-check failed: codesign --verify --deep --strict: {e}"
         ))
     })?;
     if team.is_empty() {
-        // A cut that claims no team has no notarization promise to keep and nothing
-        // further to prove — a FORK's tier, not this tree's, armed since 2026-08-15
-        // (WRONG BEFORE: "the shipped tier claims no team"). Note what is NOT done here:
-        // no Apple tool is spawned at all, so an inactive cut costs exactly what it did
-        // before Tier APPLE was wired.
+        // A cut that claims no team (a FORK's tier) has no notarization promise to
+        // keep and nothing further to prove: no Apple tool is spawned.
         return Ok("");
     }
     // Evidence gathered here, verdict passed in sign.rs — so the rules are
@@ -10328,7 +10171,7 @@ pub fn selfcheck_signing(
 
 // ---------------------------------------------------------------------------
 // The cut's PAINT SMOKE — a 29-key typed line against the just-built bundle
-// (2026-08-24 blackout audit, docs/RELEASE-PROOF-DISCIPLINE.md)
+// (docs/RELEASE-PROOF-DISCIPLINE.md)
 // ---------------------------------------------------------------------------
 
 /// `--no-paint-smoke`: the emergency escape from the self-check's paint smoke.
@@ -10375,7 +10218,7 @@ pub const PAINT_VERDICT_UNPROVED: &str = "verdict=UNPROVED";
 /// Exit 3 of `paint_probe.sh`: UNPROVED — the take ran and is not evidence.
 pub const PAINT_EXIT_UNPROVED: i32 = 3;
 /// The remedy a refusal must name, because a refusal nobody can act on gets
-/// switched off. MEASURED 2026-09-12: the sampler's worst tick reads 5.0 ms
+/// switched off. MEASURED: the sampler's worst tick reads 5.0 ms
 /// from an interactive shell or a `ProcessType=Interactive` LaunchAgent, and
 /// 75 ms under `launchctl submit` — whose QoS the launched SUBJECT inherits.
 /// `tools/cut-launch.sh` is that LaunchAgent, and the one the runbook documents. The
@@ -10388,14 +10231,10 @@ pub const PAINT_EVIDENCE_REMEDY: &str = "retake it under `tools/cut-launch.sh` (
 /// Why a paint smoke did not hand back a green take — and the two arms are
 /// NOT the same claim about the artifact.
 ///
-/// THE DEFECT THIS TYPE EXISTS FOR (2026-09-17). The probe used to answer with
-/// one string, and the caller printed "the shipped artifact does not paint its
-/// flagship effect" over all of it. That was wrong in both directions: a take
-/// that could not run said the artifact was dark, and — far worse — a take
-/// that had already printed "This take is not evidence about paint" exited 0
-/// and was recorded by the cut as a SATISFIED paint obligation. A gate that
-/// cannot refute anything proves nothing by going green, so "not evidence" now
-/// has its own word here and its own refusal at the seam.
+/// A take that could not run is not a dark artifact, and a take that is not
+/// evidence must never be recorded as a SATISFIED paint obligation: a gate that
+/// cannot refute anything proves nothing by going green, so "not evidence" has
+/// its own arm here and its own refusal at the seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaintRefusal {
     /// The instrument got its time, and the shape's expectation failed anyway.
@@ -10425,9 +10264,8 @@ impl PaintRefusal {
 /// FAIL-CLOSED, AND SEPARATELY FROM THE EXIT CODE, on purpose. `paint_probe.sh`
 /// already refuses a starved take with exit 3, so in the normal case this
 /// agrees with it twice. It exists for the case an exit code cannot cover: a
-/// probe script that predates the downgrade, or a future edit that loses it,
-/// hands this seam a `starved=yes … verdict=PASS` line and an exit of 0 —
-/// precisely the line every take of the v0.87.0 cut printed. The release
+/// probe script that loses the downgrade hands this seam a `starved=yes …
+/// verdict=PASS` line and an exit of 0. The release
 /// obligation is owned HERE, so it is re-derived here from the words on the
 /// line, and a line with no evidence token at all is unproven, never sound.
 ///
@@ -10495,13 +10333,10 @@ impl PaintProbe for RealPaintProbe {
             .args(["--capture", "image", "--focus", "out"])
             .args(["--record", "3", "--expect", "ink", "--budget", "25"])
             // THE BACKEND FENCE, stated rather than inherited. The bundle this
-            // smoke judges ships with the GPU renderer, and
-            // `App::ensure_pixel_backend` used to fall back to CPU SILENTLY —
-            // into a `gui.log` the probe dumps only when the socket never
-            // appears — so a bundle whose GPU backend could not initialize at
-            // all produced a GREEN paint smoke drawn entirely on the CPU, and
-            // the cut proceeded. The probe now makes that a COULD-NOT-RUN,
-            // which `paint_probe_disposition` below already refuses.
+            // smoke judges ships with the GPU renderer; a bundle whose GPU
+            // backend cannot initialize must not pass on a take drawn on the
+            // CPU. The probe makes that a COULD-NOT-RUN, which
+            // `paint_probe_disposition` below refuses.
             .args(["--backend", "gpu"])
             .output()
             .map_err(|e| {
@@ -10529,13 +10364,11 @@ impl PaintProbe for RealPaintProbe {
 /// | 3 | ran, and is not evidence | [`PaintRefusal::NotEvidence`] |
 /// | anything else | the protocol broke | [`PaintRefusal::NotEvidence`] |
 ///
-/// A GREEN EXIT IS NOT ENOUGH, and 2026-09-17 is why. Exit 0 says the pixels
-/// cleared the shape's floors; it does not say the take was in a position to
-/// look. Every take of the v0.87.0 cut exited 0 while printing, on that same
-/// line, "This take is not evidence about paint". `paint_probe.sh` refuses such
-/// a take itself now (exit 3) — and this function ALSO re-derives it from the
-/// words on the line, so the release obligation never rests on an exit code
-/// alone.
+/// A GREEN EXIT IS NOT ENOUGH. Exit 0 says the pixels cleared the shape's
+/// floors; it does not say the take was in a position to look.
+/// `paint_probe.sh` refuses such a take itself (exit 3), and this function
+/// ALSO re-derives it from the words on the line, so the release obligation
+/// never rests on an exit code alone.
 ///
 /// NOTHING ACCUMULATES HERE, which is the answer to "just take it again": the
 /// disposition is a function of ONE take's exit code and ONE take's line, so
@@ -10585,10 +10418,10 @@ pub fn paint_smoke_policy(
     if kind == CutKind::Real && notarized_claim {
         if ack != Some(NO_PAINT_SMOKE_ACK_VALUE) {
             return Err(Error::new(format!(
-                "{NO_PAINT_SMOKE_FLAG} on a notarized real cut is refused: this is the check \
-                 that would have stopped v0.48.0/v0.49.0 shipping the rainbow trail dark \
-                 (docs/RELEASE-PROOF-DISCIPLINE.md). If this is a genuine emergency, say so \
-                 explicitly: {NO_PAINT_SMOKE_ACK_VAR}={NO_PAINT_SMOKE_ACK_VALUE}"
+                "{NO_PAINT_SMOKE_FLAG} on a notarized real cut is refused: the paint smoke \
+                 is the only pixel proof of the shipped artifact \
+                 (docs/RELEASE-PROOF-DISCIPLINE.md). For an emergency: \
+                 {NO_PAINT_SMOKE_ACK_VAR}={NO_PAINT_SMOKE_ACK_VALUE}"
             )));
         }
         return Ok(Some(format!(
@@ -10631,17 +10464,13 @@ pub fn selfcheck_paint_then_signing(
     let paint_note = match paint_smoke_policy(kind, !team.is_empty(), skip_requested, ack)? {
         Some(skip_words) => skip_words,
         None => match probe.paint(&app.join("Contents/MacOS/aterm")) {
-            // 29, not 10: the key list at [`ScriptPaintProbe::paint`] is 29
-            // long, and it was lengthened on purpose — a 10-key take sat on the
-            // `ribbon_hue_bands >= 4` cliff and measured 0 and 12 across runs of
-            // the SAME binary. This line is printed into the cut's own record,
-            // so a stale count here is a false entry in the release ledger.
+            // 29: the key list at [`RealPaintProbe::paint`]. This line is
+            // printed into the cut's own record, so a stale count here is a
+            // false entry in it.
             Ok(report) => format!("29 keys, fake-Claude shape, ink asserted \u{2014} {report}"),
             // TWO REFUSALS, TWO SENTENCES. Both stop the cut; neither is a
             // warning. But "it did not paint" is a claim about the artifact
-            // and "this take is not evidence" is a claim about the take, and
-            // printing the first over the second is how a starved instrument
-            // used to get away with being read as a verdict about paint.
+            // and "this take is not evidence" is a claim about the take.
             Err(refusal) => {
                 let report = refusal.report();
                 return Err(Error::new(match &refusal {
@@ -10651,13 +10480,11 @@ pub fn selfcheck_paint_then_signing(
                     ),
                     PaintRefusal::NotEvidence(_) => format!(
                         "self-check failed: NOTHING WAS PROVEN about the shipped artifact's \
-                         flagship effect \u{2014} this take is UNPROVED, which is neither a \
-                         pass nor a paint failure, and an unproven obligation is not a \
-                         satisfied one (docs/RELEASE-PROOF-DISCIPLINE.md). Remedy: \
-                         {PAINT_EVIDENCE_REMEDY}. If this cut truly must ship with no pixel \
-                         proof, say so out loud with {NO_PAINT_SMOKE_FLAG} + \
-                         {NO_PAINT_SMOKE_ACK_VAR}={NO_PAINT_SMOKE_ACK_VALUE} \u{2014} there is \
-                         no quiet way past this ({report})"
+                         flagship effect \u{2014} this take is UNPROVED, neither a pass nor a \
+                         paint failure (docs/RELEASE-PROOF-DISCIPLINE.md). Remedy: \
+                         {PAINT_EVIDENCE_REMEDY}. To ship with no pixel proof: \
+                         {NO_PAINT_SMOKE_FLAG} + \
+                         {NO_PAINT_SMOKE_ACK_VAR}={NO_PAINT_SMOKE_ACK_VALUE} ({report})"
                     ),
                 }));
             }
@@ -10676,11 +10503,9 @@ pub fn selfcheck_paint_then_signing(
 ///
 /// The BEHAVIOURAL proof — the shipped binary's own reports, the paint smoke,
 /// `codesign` and Tier APPLE — runs ONCE per cut, in [`step_selfcheck`], over
-/// exactly these bytes. Until 2026-09-23 upload, preflip and flip each re-ran the
-/// whole self-check, paint smoke included: five paint passes per cut, four of them
-/// after the claim (audit BC-5), each able to go red on scheduler noise with the
-/// release half-published. A byte that changes after the behavioural pass fails
-/// the digest here instead.
+/// exactly these bytes: a paint pass after the claim could go red on scheduler
+/// noise with the release half-published. A byte that changes after the
+/// behavioural pass fails the digest here instead.
 ///
 /// Returns the parsed on-disk manifest.
 fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
@@ -10843,10 +10668,8 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
         }
     };
 
-    // RETIRED 2026-08-26: the Intel DMG pair and the `-lite` twin with its
-    // journaled digest record. The manifest names ONE DMG, proved above; a
-    // manifest that still names an Intel variant was not staged by this
-    // cutter.
+    // The manifest names ONE DMG, proved above; a manifest that still names a
+    // retired Intel variant was not staged by this cutter.
     refuse_retired_intel_dmg(&manifest)?;
 
     // The stable download twins are byte copies of containers already proved
@@ -10860,11 +10683,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     // is a pre-twin journal's resume shape and is regenerated from the proven
     // canonical bytes (same reasoning as the sidecars below); a twin PRESENT
     // with different bytes is refused, not repaired — this cutter only writes
-    // byte copies, so something else wrote it. (A journal from the retired
-    // lite lane, resumed here, has an `aterm.dmg` that aliases the OLD lean
-    // twin's bytes, not manifest.dmg's — that is exactly the divergent case
-    // this refuses; a human re-cuts rather than the channel serving two
-    // contracts under one evergreen name.)
+    // byte copies, so something else wrote it.
     for (twin, source, expected_sha, what) in [
         (
             ctx.stable_dmg_path(),
@@ -11080,16 +10899,12 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     Ok(())
 }
 
-/// Replay the client selection against the publish target and apply both the
-/// monotonic-build gate and the carried-floor gate; returns the selected live
-/// build for the transcript.
 /// The `roster_seq` a published channel head was cut under, read out of its own
 /// manifest bytes.
 ///
 /// `verify::Published` already carries the exact downloaded manifest text, so the
 /// generation the channel is standing on costs a parse rather than a fetch. `None`
-/// means the head carries no attribution — an unarmed channel, which is every channel
-/// this tree publishes to.
+/// means the head carries no attribution — an unarmed channel.
 fn published_roster_seq(newest: Option<&verify::Published>) -> Result<Option<u64>> {
     let Some(published) = newest else {
         return Ok(None);
@@ -11134,6 +10949,9 @@ fn cut_roster_seq(ctx: &CutCtx) -> Result<Option<u64>> {
         .roster_seq)
 }
 
+/// Replay the client selection against the publish target and apply both the
+/// monotonic-build gate and the carried-floor gate; returns the selected live
+/// build for the transcript.
 fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     let scanned = verify::scan_published(&ctx.slug, true)?;
     let best = scanned.first();
@@ -11149,9 +10967,9 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     // the new pair to already-published releases WITHOUT re-signing their manifests,
     // and every client ratchets on the asset it observed — so a join that lands
     // between this cut's pre-claim and its flip moves the fleet's floor while the
-    // manifest number stays put. Reading only the manifest here let such a cut go
-    // live under the old generation and strand every client that had ratcheted
-    // (2026-08-19 audit). A channel that cannot be read fails closed: a wrong answer
+    // manifest number stays put. Reading only the manifest would let such a cut go
+    // live under the old generation and strand every client that had ratcheted.
+    // A channel that cannot be read fails closed: a wrong answer
     // here burns a build number and strands the fleet. A rehearsal's scratch channel
     // has no fleet, and keeps the manifest-only floor.
     let manifest_roster_seq = published_roster_seq(best)?;
@@ -11378,8 +11196,7 @@ fn validate_channel_release_capability(
 
 /// Step "publish" — THE publication, and the step that makes auto-update work.
 ///
-/// A cut publishes ONCE (owner ruling R4; the private-origin draft, flip, archive
-/// and verify, and the mirror that copied them, are gone since 2026-09-26). It runs
+/// A cut publishes ONCE (owner ruling R4). It runs
 /// [`channel::publish_on_channel`] over this cut's release on the channel: `dist/`
 /// re-proved against the signed appcast ([`prove_publication_on_disk`]) and the roster
 /// pair against the master signature ([`prove_roster_on_disk`]) — there is no earlier
@@ -11574,8 +11391,14 @@ fn bind_channel_release(ctx: &mut CutCtx, slug: &str) -> Result<(u64, bool)> {
 /// intent for? Only as the engine's source release
 /// ([`channel::unclaimed_is_source_release`]), decided from its asset listing.
 ///
+/// And only while it is still a PRERELEASE ([`channel::unclaimed_source_is_prerelease`]):
+/// the cutter checks that itself rather than trusting the engine to have read
+/// `BINARY_CUT_FOLLOWS_DEFAULT`, because the prerelease flag is what keeps this cut's
+/// uploads — the appcast included — from any client until the head PATCH.
+///
 /// # Errors
-/// Another cut's release, naming it and why; and any listing failure.
+/// Another cut's release, naming it and why; a FULL source release; and any listing
+/// failure.
 fn adoptable_channel_release(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
     let names: Vec<String> = release_asset_inventory_for_release_id(slug, release_id)?
         .into_iter()
@@ -11589,7 +11412,39 @@ fn adoptable_channel_release(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
              inspect it by hand.",
             ctx.tag
         ))
-    })
+    })?;
+    channel::unclaimed_source_is_prerelease(release_prerelease_by_id(slug, release_id)?).map_err(
+        |why| {
+            Error::new(format!(
+                "{tag} on {slug} (release ID {release_id}) {why}. Refusing to adopt it: every \
+                 upload would land on the channel's live head, where a client can elect the \
+                 appcast before the asset proof and the second floor read, and `--abandon` \
+                 could no longer withdraw it. Nothing was bound or uploaded. Mark it a \
+                 prerelease (`gh release edit {tag} --prerelease --repo {slug}`), confirm the \
+                 evergreen pointer names the previous app release again, fix the engine side \
+                 so the next source release is created as one, then `{CUT_COMMAND} --resume`.",
+                tag = ctx.tag
+            ))
+        },
+    )
+}
+
+/// The `prerelease` flag of release `id` on `slug`, from one exact-ID read.
+fn release_prerelease_by_id(slug: &str, id: u64) -> Result<bool> {
+    let endpoint = format!("repos/{slug}/releases/{id}");
+    let out = gh_retry(&["api", &endpoint, "--jq", ".prerelease | tostring"])?;
+    parse_prerelease_flag(&out.stdout_utf8())
+        .map_err(|why| Error::new(format!("release ID {id} on {slug}: {why}")))
+}
+
+/// `"true"` / `"false"` (one trailing newline allowed), and nothing else: an absent or
+/// garbled flag (`null`, an empty read) is an error, never an answer either way.
+pub(crate) fn parse_prerelease_flag(text: &str) -> std::result::Result<bool, String> {
+    match text.strip_suffix('\n').unwrap_or(text) {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("invalid prerelease flag {other:?}")),
+    }
 }
 
 /// [`channel::ChannelRelease`] against GitHub: this cut's bound release on the channel.
@@ -11642,10 +11497,9 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
         step(
             "publish",
             &format!(
-                "{tag} ID {release_id} on {slug} is already the channel's published app \
-                 release — this cut's head PATCH landed on an earlier pass, so nothing is \
-                 uploaded and no roster floor is read; re-asserting `latest` and proving \
-                 what a stranger sees"
+                "{tag} ID {release_id} on {slug} is already the published app release (its \
+                 head PATCH landed on an earlier pass): nothing to upload; re-asserting \
+                 `latest` and proving what a stranger sees"
             ),
         );
         Ok(true)
@@ -11778,8 +11632,8 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
 /// What is NOT retried is a REFUSAL — a 403 or a 429 ([`anon_probe_refusal`]).
 /// Neither is convergence: a 403 on the download host is something between this
 /// machine and GitHub, a 429 is GitHub throttling this address, and asking again
-/// six seconds later only asks to be refused again. The v0.91.0 cut retried a 403
-/// ten times per attempt and held the release lease for ~48 minutes over it.
+/// six seconds later only asks to be refused again (retrying one held the release
+/// lease for ~48 minutes).
 const ANON_PROBE_ATTEMPTS: u32 = 10;
 
 /// Gap between anonymous probe attempts.
@@ -11787,7 +11641,7 @@ const ANON_PROBE_DELAY: Duration = Duration::from_secs(6);
 
 /// Attempts for the evergreen pointer to name this cut once its head PATCH is sent
 /// ([`prove_pointer_serves`]). GitHub recomputes `releases/latest` behind a cache, and
-/// that is slower than an asset's CDN: measured on v0.93.0 (2026-09-24), the pointer still
+/// that is slower than an asset's CDN: measured on v0.93.0, the pointer still
 /// named v0.92.0 after the whole anonymous budget (10 × 6 s) and named v0.93.0 when read a
 /// minute later, so a cut whose release was already live failed and needed `--resume`.
 /// Five minutes, and still a bound: a pointer that never moves is refused as before.
@@ -11801,17 +11655,13 @@ pub const POINTER_PROBE_DELAY: Duration = Duration::from_secs(10);
 /// in its message, the same shape the client's `download_bytes` reads), or `None`
 /// for anything else.
 ///
-/// A refusal is not retried, and — the half this replaced — it is NOT called a
-/// rate limit. It used to be: MEASURED 2026-08-19, a cut that had spent the hour's
-/// anonymous API budget failed the readability probe with advice to make an
-/// already-public repo public, so this classifier was added to say "rate limited"
-/// instead. That answer was only ever true of `api.github.com`, which is where the
-/// probe it classified went. Since 2026-09-23 no anonymous probe of this step goes
-/// there ([`prove_channel_assets_download_anonymously`]): every one is addressed to
+/// A refusal is not retried, and it is NOT called a rate limit: no anonymous probe
+/// of this step goes to `api.github.com`
+/// ([`prove_channel_assets_download_anonymously`]); every one is addressed to
 /// `github.com/…/releases/…`, which answers without `x-ratelimit-*` headers at all
 /// (`aterm_update_core::cdn`), so a 403 there is a proxy, a firewall or an abuse
 /// block, and a 429 is GitHub's own throttle on the web host — never the 60/hour
-/// budget whose remedy ("wait for the hour") the old wording printed.
+/// API budget.
 #[must_use]
 pub fn anon_probe_refusal(stderr: &str) -> Option<u16> {
     let idx = stderr.find("returned error: ")?;
@@ -11917,16 +11767,13 @@ pub fn classify_asset_head(
 /// asset's tag-specific download URL, `https://github.com/<slug>/releases/download/
 /// <tag>/<name>`, and by nothing addressed to `api.github.com`.
 ///
-/// WHY IT CHANGED (2026-09-23). This proof used to be an anonymous
-/// `GET api.github.com/repos/<slug>/releases/tags/<tag>` plus a HEAD of the DMG.
-/// That GET was the cut's only METERED request: GitHub's anonymous API budget is 60
-/// per hour per IP, shared by every tool on the address, and the 0.91 cut died on it
-/// three times after the release was already public (the probe retried a 403 ten
-/// times per attempt), holding the release lease for ~48 minutes. It also proved the
-/// wrong thing — that the release was LISTED, while the property a client depends on
-/// is that each asset DOWNLOADS. The download host is unmetered (measured: it answers
-/// without any `x-ratelimit-*` header — `aterm_update_core::cdn`), so asking it
-/// about every asset is both cheaper and the stronger proof.
+/// WHY THE DOWNLOAD HOST. GitHub's anonymous API budget is 60 per hour per IP,
+/// shared by every tool on the address, so a metered probe can die on it after the
+/// release is already public. An API read also proves the wrong thing — that the
+/// release is LISTED, while a client depends on each asset DOWNLOADING. The download
+/// host is unmetered (measured: it answers without any `x-ratelimit-*` header —
+/// `aterm_update_core::cdn`), so asking it about every asset is both cheaper and the
+/// stronger proof.
 ///
 /// The HEAD attaches no credential by construction (`aterm_update_core::
 /// head_no_redirect` accepts none — `github.com` must never be shown one), so an
@@ -11979,14 +11826,11 @@ pub fn prove_assets_download_anonymously(
                 AssetHead::Refused(code) => {
                     return Err(Error::new(format!(
                         "GitHub's download host answered HTTP {code} to an unauthenticated \
-                         HEAD of {url}. That host carries no API rate limit, so this is not \
-                         the 60/hour budget and waiting an hour will not change it: a 403 \
-                         there is a proxy, a firewall or an abuse block between this machine \
-                         and GitHub, a 429 is GitHub throttling this address. It was asked \
-                         once and not retried, and it says nothing about whether {slug} is \
-                         public. Check from another network (`curl -sI {url}` answers 302 \
-                         when the asset is served), then `{CUT_COMMAND} --resume`, which \
-                         converges without re-uploading anything."
+                         HEAD of {url} — not the API budget (that host has none): a 403 is a \
+                         proxy, a firewall or an abuse block, a 429 is GitHub throttling this \
+                         address. Asked once; it says nothing about whether {slug} is public. \
+                         Check from another network (`curl -sI {url}` answers 302 when the \
+                         asset is served), then `{CUT_COMMAND} --resume` (re-uploads nothing)."
                     )));
                 }
                 AssetHead::NotServed | AssetHead::Inconclusive(_) => {
@@ -12002,12 +11846,10 @@ pub fn prove_assets_download_anonymously(
                 return Err(Error::new(format!(
                     "the public channel {slug} does not serve {name} to a client with no \
                      credential: an unauthenticated HEAD of {url} still answered 404 after \
-                     {ANON_PROBE_ATTEMPTS} attempts over ~{}s. Every authenticated check \
-                     above passed, so the release and its assets exist — they are simply \
-                     invisible to real installs (GitHub answers 404 on this host for a \
-                     private repository), or the upload never completed. That is the silent \
-                     never-updates state the pointer gate exists to prevent. Make {slug} public, \
-                     then `{CUT_COMMAND} --resume`.",
+                     {ANON_PROBE_ATTEMPTS} attempts over ~{}s. The authenticated checks \
+                     passed, so the repository is private (GitHub answers 404 on this host \
+                     for one) or the upload never completed. Make {slug} public, then \
+                     `{CUT_COMMAND} --resume`.",
                     u64::from(ANON_PROBE_ATTEMPTS) * ANON_PROBE_DELAY.as_secs(),
                 )));
             }
@@ -12016,8 +11858,7 @@ pub fn prove_assets_download_anonymously(
                     "cannot prove a credential-less client can download {name} from {slug}: \
                      the last of {ANON_PROBE_ATTEMPTS} unauthenticated HEADs of {url} \
                      answered {detail} — not a redirect into GitHub's release-asset storage. \
-                     Nothing is known from that either way; check the network, then \
-                     `{CUT_COMMAND} --resume`."
+                     Check the network, then `{CUT_COMMAND} --resume`."
                 )));
             }
             AssetHead::Refused(_) => unreachable!("a refusal returns inside the loop"),
@@ -12040,13 +11881,13 @@ pub enum PointerProbe {
     /// which GitHub renders identically on this host.
     NoRelease,
     /// A 403 or a 429 — the host (or something in front of it) REFUSED this client.
-    /// Split out of `Other` on 2026-09-23 so the gate asks it once: it is not the
+    /// Its own arm so the gate asks it once: it is not the
     /// convergence the retry budget exists for, and on this unmetered host it is not
     /// the API rate limit either ([`anon_probe_refusal`]). Worded as the client words it.
     Refused { code: u16, reason: String },
     /// A release of THIS repository under a tag the client does not install from (a
     /// retired two-component tag, a suffixed tag, an `atpkg-index-<n>` cut): the
-    /// pointer names no app release at all. Split out of `Other` on 2026-09-23 because
+    /// pointer names no app release at all. Its own arm because
     /// the head ratchet reads it differently: there is no app head to protect, so a
     /// cut may take `latest` from it — while the pointer gate, which requires the
     /// pointer to name THIS cut, still refuses it.
@@ -12098,7 +11939,7 @@ fn pointer_probe_from(
         Err(PointerError::UnsafeName) => Err(Error::new(format!(
             "{slug} is not a URL-safe release source"
         ))),
-        // `OtherTag` (2026-09-14): the pointer names a release of THIS repository
+        // `OtherTag`: the pointer names a release of THIS repository
         // under a tag the client does not install from (an `atpkg-index-<n>` cut
         // holding `latest`). The pointer gate's law is that the pointer NAMES this
         // cut, so it stays a failing verdict there; the head ratchet reads it as "no
@@ -12490,8 +12331,7 @@ fn create_channel_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIde
         ctx.release_release_intent()?;
         return Err(Error::new(format!(
             "release create for {} was REFUSED by {slug} ({}); nothing was created, so the \
-             release intent has been released and `--resume` may post once more. If this \
-             keeps happening the refusal itself is the thing to read, not the intent.",
+             release intent has been released and `--resume` may post once more.",
             ctx.tag,
             release_post_failure_detail(&out, posted_body_len)
         )));
@@ -12599,29 +12439,65 @@ fn upload_channel_asset(
     // BEFORE ANY REMOTE PROBE. This verdict is local and provable, and the probe below
     // is a network call that can fail — under exactly the conditions that produce a
     // curl exit 2 in the first place (memory pressure kills the gh spawn; a hammered
-    // API answers 5xx three times). A failed probe used to return early and leave the
-    // intent standing, restoring the permanent wedge this retraction exists to prevent
-    // (2026-08-19 round-7 audit). The pre-POST probe above already answered "did this
-    // asset exist beforehand".
-    if transport_never_started(&out) {
-        ctx.retract_upload_intent(name)?;
-        return Err(Error::new(format!(
+    // API answers 5xx three times). A failed probe must not leave the intent standing:
+    // that is the permanent wedge this retraction exists to prevent. The pre-POST probe
+    // above already answered "did this asset exist beforehand".
+    //
+    // THE ANSWERED 4xx IS THE OTHER VERDICT THAT IS SPENT BEFORE ANY PROBE, and it
+    // follows the release create's rule exactly: nothing was created, so the intent is
+    // spent on nothing and must not wedge every resume at "refusing a duplicate POST" —
+    // a token that expired mid-cut, a throttle, a refused upload. One best-effort probe
+    // follows it ([`after_upload_post`]): `422 already_exists` is a 4xx too, and an
+    // object that is there must stay named by the journal. A 5xx, a timeout or a reset
+    // is neither verdict: each can hide a stored object, so each keeps the conservative
+    // intent and goes on to the probe.
+    let outcome = ctx.settle_upload_intent(name, &out)?;
+    let visible = || {
+        release_asset_identity_for_release_id_optional(slug, release_id, name)
+            .map(|found| found.is_some())
+    };
+    match after_upload_post(outcome, visible)? {
+        AfterUploadPost::Converge { journal } => {
+            verify_release_asset_id_matches_local(slug, release_id, name, file)?;
+            if journal {
+                // The POST was refused, its intent retracted — and yet this cut's own
+                // bytes are there (a `422 already_exists` for an object nobody
+                // journaled). Name it again, so `--abandon` withdraws it.
+                step(
+                    "publish",
+                    &format!(
+                        "upload of {name} was refused ({}) but the asset is on {slug} with this \
+                         cut's bytes; converging on it and journaling it",
+                        out.stderr_utf8().trim()
+                    ),
+                );
+                ctx.record_upload_intent(name)?;
+            }
+            Ok(())
+        }
+        AfterUploadPost::NeverSent => Err(Error::new(format!(
             "upload of {name} never reached the network (curl exit {}): {}. The durable \
              intent was retracted, so a resume will retry it once the local cause is fixed",
             out.status,
             out.stderr_utf8().trim()
-        )));
+        ))),
+        AfterUploadPost::Refused => {
+            let said = github_refusal_summary(&out.stdout)
+                .map(|said| format!(" — GitHub said: {said}"))
+                .unwrap_or_default();
+            Err(Error::new(format!(
+                "upload of {name} was REFUSED by {slug} ({}{said}); nothing was created, so \
+                 the durable intent was retracted and `--resume` may post it once more.",
+                out.stderr_utf8().trim()
+            )))
+        }
+        AfterUploadPost::Ambiguous => Err(Error::new(format!(
+            "upload of {name} returned {} but no asset is visible on {slug}; refusing an \
+             ambiguous duplicate retry in this invocation (resume after GitHub converges): {}",
+            if out.success() { "success" } else { "failure" },
+            out.stderr_utf8().trim()
+        ))),
     }
-    if release_asset_identity_for_release_id_optional(slug, release_id, name)?.is_some() {
-        verify_release_asset_id_matches_local(slug, release_id, name, file)?;
-        return Ok(());
-    }
-    Err(Error::new(format!(
-        "upload of {name} returned {} but no asset is visible on {slug}; refusing an ambiguous \
-         duplicate retry in this invocation (resume after GitHub converges): {}",
-        if out.success() { "success" } else { "failure" },
-        out.stderr_utf8().trim()
-    )))
 }
 
 /// Prove the bound release carries EXACTLY the asset set this cut publishes (beside
@@ -12759,12 +12635,11 @@ pub fn exact_release_upload_url(slug: &str, release_id: u64, name: &str) -> Resu
 mod release_body_post_tests {
     //! THE BODY THE POST ACTUALLY CARRIES, and what a refusal of it says.
     //!
-    //! The v0.87.0 cut spent hours on `curl: (22) The requested URL returned
-    //! error: 422` because two facts never met: the body was 225,061 bytes, and
-    //! GitHub takes 125,000 characters. Both were in this process's hands at the
-    //! moment of the POST. Bounding where the notes are WRITTEN does not close
-    //! it — the file read here can come from an older binary, a resumed cut, or
-    //! an operator's hand-regeneration — so the bound is taken on the operation.
+    //! GitHub takes 125,000 characters; a 225,061-byte body was refused with a
+    //! bare `curl: (22) … 422`. Bounding where the notes are WRITTEN does not
+    //! close it — the file read here can come from an older binary, a resumed
+    //! cut, or an operator's hand-regeneration — so the bound is taken on the
+    //! operation.
 
     use super::*;
 
@@ -12782,9 +12657,8 @@ mod release_body_post_tests {
 
     /// An over-limit file ON DISK — whatever wrote it — is posted BOUNDED.
     ///
-    /// THE TWIN: read the file with `fs::read_to_string` (what shipped until
-    /// today) and the length assertion goes red on the very fixture that
-    /// reproduces the v0.87.0 refusal.
+    /// THE TWIN: read the file with `fs::read_to_string` and the length
+    /// assertion goes red on this fixture.
     #[test]
     fn an_oversized_notes_file_on_disk_is_bounded_at_the_post() {
         let oversized = "### Section\n\n- an entry long enough to matter\n\n".repeat(6000);
@@ -12844,8 +12718,7 @@ mod release_body_post_tests {
     /// GitHub's actual refusal document for an over-length release body.
     const TOO_LONG: &str = r#"{"message":"Validation Failed","errors":[{"resource":"Release","code":"custom","field":"body","message":"body is too long (maximum is 125000 characters)"}],"documentation_url":"https://docs.github.com/rest"}"#;
 
-    /// **A 422 NAMES THE SIZE**, in bytes, against the limit — the two numbers
-    /// whose absence cost the v0.87.0 cut its afternoon.
+    /// **A 422 NAMES THE SIZE**, in bytes, against the limit.
     #[test]
     fn a_422_on_a_release_create_names_the_size_and_githubs_own_words() {
         let detail = release_post_failure_detail(&refusal(22, CURL_422, TOO_LONG), 225_061);
@@ -12947,11 +12820,10 @@ mod release_body_post_tests {
 #[cfg(test)]
 mod transport_body_tests {
     //! THE ASSET LEG'S MEMORY COST. `--data-binary @file` buffers the whole
-    //! payload before the socket opens; the batteries-included DMG is over a
-    //! gigabyte, so the first seeded cut died with `curl: option --data-binary:
-    //! out of memory` AFTER building, signing and notarizing both containers —
-    //! the most expensive possible place to learn it. These assert the argv
-    //! itself, because that is the only artifact of the decision.
+    //! payload before the socket opens, and an asset can be gigabytes: a
+    //! buffered upload dies with `out of memory` AFTER building, signing and
+    //! notarizing. These assert the argv itself, because that is the only
+    //! artifact of the decision.
 
     use super::*;
 
@@ -12987,13 +12859,15 @@ mod transport_body_tests {
     /// probe — a probe that fails would otherwise return early and leave the intent
     /// standing, which is the permanent wedge the retraction exists to prevent. This
     /// asserts the ordering as source, because there is nothing else to observe: the
-    /// probe needs a live GitHub release (2026-08-19 round-7 audit).
+    /// probe needs a live GitHub release. What the settle
+    /// itself decides is a table over the real journal, in
+    /// `tests/it/durable_post_intent_model.rs`.
     #[test]
     fn the_retraction_is_decided_before_any_remote_probe() {
         let src = include_str!("publish.rs");
         let (func, retract) = (
             "fn upload_channel_asset",
-            "ctx.retract_upload_intent(name)?",
+            "ctx.settle_upload_intent(name, &out)?",
         );
         let body = &src[src.find(func).expect("function present")..];
         let issue = body.find("post.issue(permit)?").expect("the POST");
@@ -13039,14 +12913,10 @@ mod transport_body_tests {
         }
     }
 
-    /// A SERVER REFUSAL IS KNOWLEDGE, and the one-shot intent must spend it.
-    ///
-    /// The v0.86.0 cut wedged here: the draft-create POST was answered `422`
-    /// seconds after the release commit was pushed, and because the journal
-    /// recorded only that an intent had been ISSUED, every later invocation chose
-    /// "discover, never post" against an object that did not exist. This pins the
-    /// discrimination that fixes it — an answered 4xx created nothing, everything
-    /// else may have.
+    /// A SERVER REFUSAL IS KNOWLEDGE, and the one-shot intent must spend it: a
+    /// journal that records only that an intent was ISSUED chooses "discover, never
+    /// post" forever against an object a `422` never created. An answered 4xx
+    /// created nothing; everything else may have.
     #[test]
     fn a_four_hundred_is_a_refusal_and_everything_else_is_unknown() {
         let out = |status: i32, stderr: &str| RunOut {
@@ -13136,18 +13006,16 @@ mod roster_wiring_tests {
     //! every property below is a private method of [`CutCtx`], and every one of them
     //! failed silently: a regression on any of them produces a WELL-FORMED release with
     //! no `machine_id` or no `aterm-machines.toml`, which an armed client refuses
-    //! structurally before any artifact crypto. `select_authoritative_release` picks one
+    //! structurally before any artifact crypto. `fetch_authoritative_release` picks one
     //! candidate with no fallback to an older release, so that is a fleet wedge, not a
-    //! delay — and until these tests existed nothing in the tree would have failed.
+    //! delay.
 
     use super::*;
 
     /// A cut signs with THIS machine's key and verifies published bytes under the
-    /// key that actually signed them. Those are the same value on an ordinary cut,
-    /// which is why one field did both jobs — until a machine recovered another
-    /// machine's published release and `archive` tried to verify a manifest signed
-    /// with Ka under Kb. The release went live, unmirrored, with its lease held by a
-    /// dead publisher and no supported command able to free it.
+    /// key that actually signed them. Those are the same value on an ordinary cut;
+    /// a cross-machine recovery verifies a manifest signed with Ka while this
+    /// machine's key is Kb.
     #[test]
     fn a_recovery_verifies_under_the_release_key_and_signs_under_its_own() {
         let mut ctx = ctx(Some("m3"));
@@ -13217,10 +13085,8 @@ mod roster_wiring_tests {
             .collect()
     }
 
-    /// AN ATTRIBUTED CUT attaches the roster to everything that carries assets — which is
-    /// every cut this tree makes, its master armed since 2026-08-15 — and an UNATTRIBUTED
-    /// one (a fork's, or a resume past `build`) attaches it to nothing. WRONG BEFORE: this
-    /// had it backwards, calling the unattributed cut "every cut this tree makes".
+    /// AN ATTRIBUTED CUT attaches the roster to everything that carries assets, and an
+    /// UNATTRIBUTED one (a fork's, or a resume past `build`) attaches it to nothing.
     ///
     /// Kills the mutations that were all silent: `attaches_roster()` returning false,
     /// and dropping the roster from the channel set — the one set a cut uploads and
@@ -13443,8 +13309,6 @@ mod roster_wiring_tests {
     ///
     /// `build` is the only step that assembles, stamps and signs a manifest, so it is
     /// the only fact that can decide whether an entry has a roster question to answer.
-    /// The bug this closes was `resume_cut` guarding on it, `revalidate_ctx_signature_policy`
-    /// not, and `run_recover_lost` stating a third rule.
     #[test]
     fn the_duty_is_decided_by_one_fact_and_shared_by_every_entry() {
         assert_eq!(roster_duty(false), RosterDuty::Sign);
@@ -13508,12 +13372,11 @@ mod roster_wiring_tests {
     ///
     /// `dist/aterm-machines.toml` is the machine's AUTHORIZING roster — the file
     /// `atpkg-keys` writes and `ReleaseCredentials::resolve` adopts — and `dist/` is
-    /// gitignored, so it is the only copy. Recovery used to overwrite it in place with
-    /// whatever generation the recovered release carried, which silently destroys a
-    /// newer master-signed document and any revocation inside it, recreatable only from
-    /// the paper master. Nothing downstream noticed: `roster_floor_covered` compares the
-    /// carried generation against the published head, and after the downgrade both
-    /// agree.
+    /// gitignored, so it is the only copy. Overwriting it with an older recovered
+    /// generation would silently destroy a newer master-signed document and any
+    /// revocation inside it, recreatable only from the paper master — and nothing
+    /// downstream would notice: `roster_floor_covered` compares the carried generation
+    /// against the published head, and after the downgrade both agree.
     ///
     /// The fixture is the real generation-2 pair published on the channel, so the guard
     /// is exercised against bytes that genuinely verify under the pinned paper master.
@@ -13776,7 +13639,7 @@ mod lean_dmg_ceiling_tests {
                 PointerProbe::Other(text)
             );
         }
-        // The pointer captured by a non-app release of this same channel (2026-09-14):
+        // The pointer captured by a non-app release of this same channel:
         // its own arm, so the head ratchet can read "no app head" while the pointer gate
         // still refuses to call it this cut.
         assert_eq!(
@@ -13791,7 +13654,7 @@ mod lean_dmg_ceiling_tests {
                 tag: "atpkg-index-30".into()
             }
         );
-        // A 429 and a 403 are REFUSALS (2026-09-23): the gate asks them once, and the
+        // A 429 and a 403 are REFUSALS: the gate asks them once, and the
         // arm carries the status so the message can say which. A 5xx and a bare 200
         // stay `Other` above — the negative control that this is not "every 4xx/5xx".
         for (code, refused) in [
@@ -13862,15 +13725,10 @@ mod lean_dmg_ceiling_tests {
 
 #[cfg(test)]
 mod anonymous_readability_tests {
-    //! THE PUBLISH STEP SPENDS NOTHING OF THE ANONYMOUS API BUDGET (2026-09-23).
-    //!
-    //! The 0.91 cut died three times at its post-flip readability probe — an anonymous
-    //! `GET api.github.com/repos/<slug>/releases/tags/<tag>` — after the release was
-    //! already public: the IP's 60/hour anonymous budget was spent, the probe retried the
-    //! 403 ten times per attempt, and the lease was held ~48 minutes. The proof is now one
-    //! credential-free HEAD per required asset on the unmetered download host. These pin
-    //! the three properties by recording every request the proof makes: WHERE each goes,
-    //! how often a refusal is asked, and what a 404 costs.
+    //! THE PUBLISH STEP SPENDS NOTHING OF THE ANONYMOUS API BUDGET: the readability
+    //! proof is one credential-free HEAD per required asset on the unmetered download
+    //! host. These pin three properties by recording every request the proof makes:
+    //! WHERE each goes, how often a refusal is asked, and what a 404 costs.
 
     use super::*;
     use aterm_update_core::{HeadAnswer, HttpError};
@@ -13949,7 +13807,7 @@ mod anonymous_readability_tests {
     }
 
     /// A 403 or a 429 is asked ONCE: no retry, no sleep, and not called a rate limit
-    /// (the download host has none — the old wording sent the operator to wait an hour).
+    /// (the download host has none).
     #[test]
     fn a_refusal_is_asked_once_and_is_not_called_a_rate_limit() {
         for code in [403_u16, 429] {
@@ -14085,9 +13943,7 @@ mod anonymous_readability_tests {
 
 #[cfg(test)]
 mod ungated_range_statement_tests {
-    //! The transcript's statement of the ungated range. 0.91 was cut 136
-    //! first-parent commits past the newest receipted commit and the transcript said
-    //! nothing; the replay below is that shape.
+    //! The transcript's statement of the ungated range.
 
     use super::*;
 
@@ -14104,6 +13960,7 @@ mod ungated_range_statement_tests {
             head_receipt: verdict.map(|_| PathBuf::from("/repo/.git/aterm-verify/receipts/head")),
             head_verdict: verdict.map(str::to_string),
             gated_by_tree: None,
+            gated_from: None,
             inherited: Vec::new(),
         }
     }
@@ -14160,6 +14017,18 @@ mod ungated_range_statement_tests {
         );
         let own = ungated_range_lines(&report(0, Some("PASS")));
         assert!(!own[0].contains("by its tree"), "{own:?}");
+        // From another clone's store: the store is named.
+        let foreign = ungated_range_lines(&gates::ReceiptReport {
+            gated_from: Some(PathBuf::from("/main/.git/aterm-verify/receipts")),
+            ..by_tree(0)
+        });
+        assert!(
+            foreign[0].contains(
+                "the passing receipt is 7f00ba1d2's (from the receipt store \
+                 /main/.git/aterm-verify/receipts), a commit with the same bytes"
+            ),
+            "{foreign:?}"
+        );
     }
 
     /// A commit gated WITH main's reds — the gate's differential verdict — has
@@ -14184,8 +14053,87 @@ mod ungated_range_statement_tests {
 }
 
 #[cfg(test)]
+mod deep_gate_tests {
+    //! THE DEEP GATE'S TRUST LANE IS THE TREE'S: a cut pins
+    //! every input the lane reads, and a lane that decided nothing is never read
+    //! as a finding about the tree.
+
+    use super::*;
+
+    fn gate(script: &str) -> &'static DeepGate {
+        DEEP_GATES.iter().find(|g| g.script == script).unwrap()
+    }
+
+    /// Every `ATERM_GATE_*` name the script mentions is pinned empty for both
+    /// scripts, so a knob added to the lane cannot reach a cut unpinned.
+    #[test]
+    fn a_cut_pins_every_input_the_trust_lane_reads() {
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/trust-gate-all.sh"),
+        )
+        .unwrap();
+        let mut read: Vec<&str> = script
+            .match_indices("ATERM_GATE_")
+            .map(|(at, _)| {
+                let rest = &script[at..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        read.sort_unstable();
+        read.dedup();
+        assert!(read.contains(&"ATERM_GATE_TRUSTD_WAIT"), "{read:?}");
+        for g in &DEEP_GATES {
+            let cmd = deep_gate_cmd(Path::new("/repo"), g);
+            let envs: Vec<_> = cmd.get_envs().collect();
+            for k in &read {
+                assert!(
+                    envs.contains(&(std::ffi::OsStr::new(k), Some(std::ffi::OsStr::new("")))),
+                    "{}: {k} is pinned empty: {envs:?}",
+                    g.script
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lane_that_decided_nothing_is_not_a_finding_about_the_tree() {
+        let (verify, trust) = (gate("tools/verify.sh"), gate("tools/trust-gate-all.sh"));
+        assert!(deep_gate_verdict(trust, Some(0)).is_ok());
+        for (g, code) in [(trust, Some(2)), (verify, Some(3)), (trust, None)] {
+            let e = deep_gate_verdict(g, code).unwrap_err().to_string();
+            assert!(
+                e.contains("nothing was decided about the tree"),
+                "{code:?}: {e}"
+            );
+            assert!(!e.contains("fix the tree"), "{code:?}: {e}");
+        }
+        for (g, code) in [
+            (trust, Some(1)),
+            (verify, Some(1)),
+            (verify, Some(2)),
+            (verify, Some(4)),
+        ] {
+            let e = deep_gate_verdict(g, code).unwrap_err().to_string();
+            assert!(e.contains("FAILED — fix the tree"), "{code:?}: {e}");
+        }
+        // The trust lane's exit 4 is a machine too small, said as that.
+        let e = deep_gate_verdict(trust, Some(4)).unwrap_err().to_string();
+        assert!(
+            e.contains("NARROWED: this machine cannot verify every library")
+                && e.contains("its MEMORY lines name them and the RAM that does")
+                && e.contains("nothing was claimed or committed")
+                && !e.contains("fix the tree"),
+            "{e}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod remedy_tests {
-    //! ONE OPERATOR SURFACE (2026-09-23, audit item 18): the cutter's remedies name
+    //! ONE OPERATOR SURFACE: the cutter's remedies name
     //! the launcher the runbook documents, and the closing line states no deadline
     //! the updater does not keep.
 
@@ -14458,58 +14406,42 @@ mod handoff_run_tests {
     //! recording how IT was called.
 
     use super::*;
+    use crate::ledger::testing::standin;
     use std::ffi::OsString;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    struct Scratch(PathBuf);
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn scratch() -> Scratch {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-release-handoff-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("tree")).unwrap();
-        Scratch(root)
-    }
-
-    fn executable(path: &Path, body: &str) {
-        fs::write(path, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+    /// A scratch root holding an empty `tree/`, removed on drop.
+    fn scratch() -> aterm_tempfile::TempDir {
+        let root = aterm_tempfile::Builder::new()
+            .prefix("aterm-release-handoff-")
+            .tempdir()
+            .unwrap();
+        fs::create_dir_all(root.path().join("tree")).unwrap();
+        root
     }
 
     /// A `targo` that logs its cwd, argv and CARGO_TARGET_DIR, then "builds" a
-    /// cutter that logs ITS cwd, argv and marker and exits `code`.
+    /// cutter that logs ITS cwd, argv and marker and exits `code`. Both texts hold
+    /// no path of their own, so every scratch shares their files
+    /// ([`crate::ledger::testing::standin`]): `targo` logs beside itself and links
+    /// `cutter` where the build would put it, naming the scratch in a file beside
+    /// it for the cutter to log into.
     fn stub_targo(root: &Path, code: i32) -> PathBuf {
         let targo = root.join("targo");
-        executable(
+        standin(
             &targo,
+            "{ echo \"cwd=$(pwd -P)\"; echo \"args=$*\"; echo \"target=$CARGO_TARGET_DIR\"; } \
+             >> \"${0%/*}/targo.log\"\n\
+             mkdir -p \"$CARGO_TARGET_DIR/release\"\n\
+             ln -f \"${0%/*}/cutter\" \"$CARGO_TARGET_DIR/release/aterm-release\"\n\
+             printf '%s\\n' \"${0%/*}\" > \"$CARGO_TARGET_DIR/release/aterm-release.root\"\n",
+        );
+        standin(
+            &root.join("cutter"),
             &format!(
-                "#!/bin/sh\n\
-                 {{ echo \"cwd=$(pwd -P)\"; echo \"args=$*\"; echo \"target=$CARGO_TARGET_DIR\"; }} \
-                 >> '{log}/targo.log'\n\
-                 mkdir -p \"$CARGO_TARGET_DIR/release\"\n\
-                 cat > \"$CARGO_TARGET_DIR/release/aterm-release\" <<'CUTTER'\n\
-                 #!/bin/sh\n\
+                "read -r root < \"$0.root\"\n\
                  {{ echo \"cwd=$(pwd -P)\"; echo \"args=$*\"; echo \"marker=$ATERM_CUT_REBUILT_FOR\"; }} \
-                 >> '{log}/cutter.log'\n\
-                 exit {code}\n\
-                 CUTTER\n\
-                 chmod +x \"$CARGO_TARGET_DIR/release/aterm-release\"\n",
-                log = root.display()
+                 >> \"$root/cutter.log\"\n\
+                 exit {code}\n"
             ),
         );
         targo
@@ -14518,12 +14450,12 @@ mod handoff_run_tests {
     #[test]
     fn the_handoff_builds_once_in_the_tree_and_runs_the_verb_once_here() {
         let root = scratch();
-        let targo = stub_targo(&root.0, 0);
-        let tree = root.0.join("tree");
+        let targo = stub_targo(root.path(), 0);
+        let tree = root.path().join("tree");
         let args: Vec<OsString> = vec!["cut".into(), "--resume".into()];
         run_handoff(&targo, &handoff(&tree, "ab".repeat(20).as_str(), args)).unwrap();
 
-        let targo_log = fs::read_to_string(root.0.join("targo.log")).unwrap();
+        let targo_log = fs::read_to_string(root.path().join("targo.log")).unwrap();
         let canonical_tree = fs::canonicalize(&tree).unwrap();
         assert_eq!(
             targo_log,
@@ -14534,7 +14466,7 @@ mod handoff_run_tests {
             ),
             "one build, in the cut tree, into its own target dir"
         );
-        let cutter_log = fs::read_to_string(root.0.join("cutter.log")).unwrap();
+        let cutter_log = fs::read_to_string(root.path().join("cutter.log")).unwrap();
         let here = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert_eq!(
             cutter_log,
@@ -14550,8 +14482,8 @@ mod handoff_run_tests {
     #[test]
     fn a_failing_tree_cutter_is_a_failure_here() {
         let root = scratch();
-        let targo = stub_targo(&root.0, 3);
-        let tree = root.0.join("tree");
+        let targo = stub_targo(root.path(), 3);
+        let tree = root.path().join("tree");
         let error = run_handoff(&targo, &handoff(&tree, PUBLISHED, vec!["cut".into()]))
             .expect_err("the child's failure is the cut's failure")
             .to_string();
@@ -14559,16 +14491,16 @@ mod handoff_run_tests {
         assert!(error.contains("3"), "{error}");
         // NEGATIVE CONTROL: the build ran and the child ran — the failure is the
         // child's own exit, not a spawn that never happened.
-        assert!(root.0.join("targo.log").exists());
-        assert!(root.0.join("cutter.log").exists());
+        assert!(root.path().join("targo.log").exists());
+        assert!(root.path().join("cutter.log").exists());
     }
 
     #[test]
     fn a_failed_build_never_runs_a_cutter() {
         let root = scratch();
-        let targo = root.0.join("targo");
-        executable(&targo, "#!/bin/sh\nexit 101\n");
-        let tree = root.0.join("tree");
+        let targo = root.path().join("targo");
+        standin(&targo, "exit 101\n");
+        let tree = root.path().join("tree");
         let error = run_handoff(&targo, &handoff(&tree, PUBLISHED, vec!["cut".into()]))
             .expect_err("a failed build")
             .to_string();
@@ -14614,8 +14546,7 @@ mod rehearsal_source_tests {
 #[cfg(test)]
 mod signature_line_tests {
     //! The `signature` transcript line names only what the gate decided: the signing key
-    //! and the roster machine it belongs to. It used to print "configured key matches"
-    //! against the retired channel head without comparing anything.
+    //! and the roster machine it belongs to.
 
     use super::*;
 
@@ -14646,7 +14577,7 @@ mod signature_line_tests {
 
 #[cfg(test)]
 mod artifact_proof_tests {
-    //! ONE BEHAVIOURAL PASS PER CUT (2026-09-23, audit BC-5). `publish` re-proves
+    //! ONE BEHAVIOURAL PASS PER CUT. `publish` re-proves
     //! `dist/` by digest ([`prove_publication_on_disk`]) and runs nothing; only
     //! `selfcheck` runs the shipped binary, the paint smoke and `codesign`.
 
@@ -14655,26 +14586,16 @@ mod artifact_proof_tests {
     const VERSION: &str = "0.5.0";
     const BUILD: u64 = 500;
 
-    struct Fixture {
-        root: PathBuf,
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
     /// A `dist/` holding everything a finished `build` leaves — plist, provenance,
     /// DMG, zip and the manifest naming their digests — but an app bundle with NO
     /// executable in it: a proof that spawns the binary cannot pass here, and one
     /// that only reads bytes must.
-    fn fixture(label: &str) -> (Fixture, CutCtx) {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-artifact-proof-{label}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+    fn fixture(label: &str) -> (aterm_tempfile::TempDir, CutCtx) {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-artifact-proof-{label}-"))
+            .tempdir()
+            .unwrap();
+        let root = dir.path().to_path_buf();
         let dist = root.join("dist");
         let app = bundle::staged_app_path(&dist, BUILD);
         fs::create_dir_all(app.join("Contents")).unwrap();
@@ -14726,7 +14647,7 @@ mod artifact_proof_tests {
             credentials: None,
             apple: sign::AppleTier::Inactive,
             repo: root.clone(),
-            tree: root.clone(),
+            tree: root,
             dist: dist.clone(),
             journal_path: dist.join("cut-state.toml"),
             slug: "owner/repo".to_string(),
@@ -14754,7 +14675,7 @@ mod artifact_proof_tests {
             journal: None,
             linux: None,
         };
-        (Fixture { root }, ctx)
+        (dir, ctx)
     }
 
     #[test]
@@ -14763,12 +14684,11 @@ mod artifact_proof_tests {
         let manifest = prove_artifacts_on_disk(&ctx).expect("the bytes are the manifest's");
         assert_eq!(manifest.build_number, BUILD);
         // The twins and sidecars a resume may lack are regenerated from the proven
-        // digests, exactly as before.
+        // digests.
         assert!(ctx.stable_dmg_path().is_file() && ctx.dmg_sha256_path().is_file());
 
         // NEGATIVE CONTROL: the self-check proper is BEHAVIOURAL — it runs the
         // shipped binary — so on the same bytes, with no binary to run, it refuses.
-        // The publication steps called this until 2026-09-23.
         let error = step_selfcheck(&mut ctx)
             .expect_err("the behavioural pass must run the binary")
             .to_string();

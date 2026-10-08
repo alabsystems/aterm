@@ -5,9 +5,9 @@
 //! Shared interface for scrollback storage backends.
 //!
 //! [`ScrollbackAccess`] unifies the methods that both [`Scrollback`] and
-//! [`DiskBackedScrollback`] implement with compatible signatures, replacing 38
-//! match arms in [`ScrollbackStorage`] with a single `inner()`/`inner_mut()`
-//! dispatch pair.
+//! [`DiskBackedScrollback`] implement with compatible signatures;
+//! [`ScrollbackStorage`] dispatches to it by matching on the concrete backend
+//! (see `storage.rs` for why it is not `dyn`).
 //!
 //! Part of #6274.
 

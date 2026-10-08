@@ -342,9 +342,7 @@ fn who_line(who: &str) -> String {
 fn holder_tag() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
+    let nanos = aterm_time::since_epoch().map_or(0, |d| d.subsec_nanos());
     format!("{}-{nanos:x}{n:x}", std::process::id())
 }
 
@@ -372,7 +370,12 @@ pub fn take(
     let gate: std::fs::File = open_rendezvous(&d.join(format!("{stem}{GATE_SUFFIX}")))?;
     let deadline = Instant::now() + wait;
     loop {
-        match gate.try_lock_shared() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the gate, SHARED: let go by unlock() once the lease is laid"
+        )]
+        let taken = gate.try_lock_shared();
+        match taken {
             Ok(()) => break,
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(GATE_POLL);
@@ -397,6 +400,11 @@ pub fn take(
         let mut file: std::fs::File = options.open(&taking)?;
         // A file this process just created cannot be held by anyone else; an error here is
         // a filesystem without advisory locks, which is no place to promise a lease.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the laid lease's lock goes to a Lease, whose Drop releases by LOCK_UN; \
+                      a failed laying lets go by unlock() below"
+        )]
         file.try_lock().map_err(|e| match e {
             std::fs::TryLockError::Error(e) => e,
             std::fs::TryLockError::WouldBlock => io::Error::new(
@@ -406,8 +414,15 @@ pub fn take(
         })?;
         let mut line = who_line(who);
         line.push('\n');
-        file.write_all(line.as_bytes())?;
-        std::fs::rename(&taking, &path)?;
+        let laid = file
+            .write_all(line.as_bytes())
+            .and_then(|()| std::fs::rename(&taking, &path));
+        if let Err(e) = laid {
+            // Let go by LOCK_UN before the close, not by the close alone (the
+            // flock release rule); the caller unlinks the `.taking` name.
+            let _ = file.unlock();
+            return Err(e);
+        }
         Ok(file)
     })();
     let _ = gate.unlock();
@@ -454,10 +469,14 @@ pub enum Hold {
     NotTaken(Subject, LeaseError),
 }
 
-/// The directory a holder was asked to hold is not there — never there, or reclaimed after
-/// its caller resolved it and before the lease was laid ([`take`] cannot say which).
+/// The directory a holder was asked to hold is not there. `managed`: a subject names it, so
+/// it was reclaimed after its caller resolved it or never installed ([`take`] cannot say
+/// which); otherwise it is outside what atpkg manages and simply does not exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Missing(pub PathBuf);
+pub struct Missing {
+    pub dir: PathBuf,
+    pub managed: bool,
+}
 
 /// THE HOLDER VERB's lease (`aterm pkg lease <dir> -- <command…>`): the subject `dir`
 /// belongs to, leased as `who` under `prefix` for as long as the returned [`Hold`] lives,
@@ -474,7 +493,10 @@ pub fn hold_for(prefix: &Path, dir: &Path, who: &str, wait: Duration) -> Result<
         return if there() {
             Ok(Hold::Unmanaged)
         } else {
-            Err(Missing(dir.to_path_buf()))
+            Err(Missing {
+                dir: dir.to_path_buf(),
+                managed: false,
+            })
         };
     };
     let held = match take(prefix, &subject, who, wait) {
@@ -486,7 +508,10 @@ pub fn hold_for(prefix: &Path, dir: &Path, who: &str, wait: Duration) -> Result<
     if there() {
         Ok(held)
     } else {
-        Err(Missing(dir.to_path_buf()))
+        Err(Missing {
+            dir: dir.to_path_buf(),
+            managed: true,
+        })
     }
 }
 
@@ -530,7 +555,12 @@ fn probe_file(path: &Path, reap: bool) -> io::Result<Option<String>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    match file.try_lock() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a probe: a dead holder's file it locks is let go by unlock() before its close"
+    )]
+    let taken = file.try_lock();
+    match taken {
         Ok(()) => {
             if reap {
                 let _ = std::fs::remove_file(path);
@@ -673,7 +703,13 @@ pub fn reclaim(prefix: &Path, subject: &Subject) -> Reclaim {
         Ok(f) => f,
         Err(e) => return Reclaim::Keep(Holders::Unknown(e.to_string())),
     };
-    match gate.try_lock() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the gate goes to a ReclaimGuard, whose Drop releases by LOCK_UN, or is \
+                  let go by unlock() below"
+    )]
+    let taken = gate.try_lock();
+    match taken {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
             return Reclaim::Keep(Holders::Held(vec![
@@ -728,7 +764,12 @@ pub fn sweep(prefix: &Path, exists: &dyn Fn(&Subject) -> bool) {
             continue;
         };
         let gate: std::fs::File = gate;
-        if gate.try_lock().is_err() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a gate it locks is let go by unlock() below, before its close"
+        )]
+        let taken = gate.try_lock();
+        if taken.is_err() {
             continue;
         }
         let free = subject
@@ -757,9 +798,12 @@ fn reap_taking(prefix: &Path, laying: &str, path: &Path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(_) => return,
     };
-    if let Some(gate) = &gate
-        && gate.try_lock().is_err()
-    {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the gate it locks is let go by unlock() below, before its close"
+    )]
+    let refused = gate.as_ref().is_some_and(|gate| gate.try_lock().is_err());
+    if refused {
         return;
     }
     let _ = probe_file(path, true);
@@ -772,15 +816,8 @@ fn reap_taking(prefix: &Path, laying: &str, path: &Path) {
 mod tests {
     use super::*;
 
-    fn prefix(label: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "atpkg-lease-{label}-{}-{}",
-            std::process::id(),
-            holder_tag()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn prefix(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-lease-{label}-"))
     }
 
     fn trust(build: u64) -> Subject {
@@ -920,7 +957,7 @@ mod tests {
         // …and a second reclaim of the same subject keeps it (someone is at the gate).
         assert!(matches!(reclaim(&p, &trust(4)), Reclaim::Keep(_)));
         drop(guard);
-        let after = take(&p, &trust(4), "after", Duration::from_millis(250)).unwrap();
+        let after = take(&p, &trust(4), "after", aterm_spec::wait::MUST_HAPPEN).unwrap();
         drop(after);
         let _ = std::fs::remove_dir_all(&p);
     }
@@ -934,7 +971,7 @@ mod tests {
         };
         let p2 = p.clone();
         let waiter = std::thread::spawn(move || {
-            take(&p2, &trust(5), "waiter", Duration::from_secs(30)).map(|l| l.path().exists())
+            take(&p2, &trust(5), "waiter", aterm_spec::wait::MUST_HAPPEN).map(|l| l.path().exists())
         });
         std::thread::sleep(Duration::from_millis(300));
         drop(guard);
@@ -984,6 +1021,10 @@ mod tests {
         let p = prefix("sweep-laying");
         let d = ensure_dir(&p).unwrap();
         let gate = open_rendezvous(&d.join("store-trust-6.gate")).unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's stand-in holder: it lets go of the gate by unlock() below"
+        )]
         gate.try_lock_shared().unwrap();
         let laying = d.join("store-trust-6@1-1.taking");
         std::fs::write(&laying, b"").unwrap();

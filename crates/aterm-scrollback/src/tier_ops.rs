@@ -333,12 +333,12 @@ impl Scrollback {
         // Compress and add to warm tier
         self.warm.push_block(&lines);
 
-        // If warm tier is over limit, evict to cold.
+        // While the warm tier is over its limit, evict to cold: a batch can
+        // arrive as several blocks (see `WarmTier::push_block`), and the block
+        // evicted can be shorter than the batch.
         // Failure is OK here — handle_memory_pressure will retry or fall through
         // to cold eviction.
-        if self.warm.line_count() > self.warm_limit {
-            let _ = self.evict_warm_to_cold();
-        }
+        while self.warm.line_count() > self.warm_limit && self.evict_warm_to_cold() {}
 
         self.sync_accounting();
         self.assert_bytes_used_invariant();
@@ -359,11 +359,29 @@ impl Scrollback {
             // decompress() already incremented the failure counter when it
             // failed inside cold.push_block → to_cold_compressed → decompress.
             if block.is_quarantined() {
-                // Permanent corruption — drop the block and adjust line count.
+                // Permanent corruption: the block's text is lost, and counted
+                // as the loss it is (`truncated_lines` in the grid reads it).
                 let lost = block.line_count();
-                self.line_count = self.line_count.saturating_sub(lost);
+                self.pressure_evicted_lines =
+                    self.pressure_evicted_lines.saturating_add(lost as u64);
+                // Its ROWS stay, blank (what every reader showed for them),
+                // when older history sits in cold: dropping them from the
+                // middle would hand each older line the absolute row of the
+                // line `lost` rows newer, a renumbering no fence or mark sees.
+                // With nothing older, dropping them is the oldest history
+                // going, as any eviction goes. The one other drop is cold
+                // refusing the blank block itself (its LZ4 or zstd step
+                // failing on a page of empty lines): then the rows leave the
+                // middle after all, the renumbering above, with no epoch bump.
+                let kept = self.cold.line_count() > 0 && {
+                    let blank = super::tier::WarmBlock::from_lines(&vec![Line::default(); lost]);
+                    self.cold.push_block(&blank) != 0
+                };
+                if !kept {
+                    self.line_count = self.line_count.saturating_sub(lost);
+                }
                 aterm_log::warn!(
-                    "quarantined corrupt warm block: {lost} lines dropped \
+                    "quarantined corrupt warm block: {lost} lines lost \
                      after {} consecutive decompression failures",
                     super::tier::QUARANTINE_THRESHOLD,
                 );

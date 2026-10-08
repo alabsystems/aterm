@@ -32,9 +32,8 @@ pub(super) fn encode_character_legacy(
     // SHIFTED glyph arrives here as the base plus SHIFT — Ctrl-`_` is
     // `Ctrl+Shift+'-'`. `ctrl_character('-')` is None (the table holds `'_'`,
     // not `'-'`), so the chord fell through to the plain-glyph path below and
-    // emitted a literal `_` instead of 0x1F: readline/emacs `undo` did nothing
-    // (owner, 2026-07-28: "does control-_ work as undo like in emacs now? it
-    // doesn't seem to work"). Its siblings only escaped the bug by accident —
+    // emitted a literal `_` instead of 0x1F: readline/emacs `undo` did nothing.
+    // Its siblings only escaped the bug by accident —
     // `Ctrl+Shift+'/'`, `'2'`, `'6'` all have their UNSHIFTED char in the table
     // too, so the lookup hit before shift ever mattered.
     //

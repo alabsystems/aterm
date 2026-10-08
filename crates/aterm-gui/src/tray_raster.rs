@@ -378,9 +378,6 @@ fn build_semantic_candidate(
     (Some(renderer), resolution)
 }
 
-#[cfg(test)]
-use std::ops::{Deref, DerefMut};
-
 use aterm_render::Renderer;
 use aterm_render::chrome_metrics::{baseline_in_row_q, px_to_q, q_round_to_px, q_to_px};
 
@@ -763,54 +760,54 @@ fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// TEST-ONLY WORK CENSUS: how many times THIS thread has entered the font store.
+// Every text measure — `ui_text_width_for`, `measure_text`, a wrap — enters it
+// once, so the count a view's render adds is its text work in a unit that a
+// loaded machine cannot stretch, as a stopwatch's (wall or thread CPU) reading
+// of the same render is stretched. Read through `font_store_visits`.
+#[cfg(test)]
+thread_local! {
+    static FONT_STORE_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The font-store entries this thread has made so far (test-only; see
+/// `FONT_STORE_VISITS`): a render's text work is the difference across it.
+#[cfg(test)]
+pub(crate) fn font_store_visits() -> u64 {
+    FONT_STORE_VISITS.with(std::cell::Cell::get)
+}
+
 /// Unit tests construct independent `App`s in parallel. Each app may install a
 /// different resolved terminal face, while layout assertions measure and paint
 /// in separate calls. Production has one process-global renderer context, but a
 /// process-global test font lets an unrelated worker swap the face between those
-/// calls. Keep the production shape and isolate only libtest workers by thread.
+/// calls. Keep the production shape and isolate only libtest workers by thread:
+/// each thread's chrome fonts are a mutex of their own, created cold on that
+/// thread's first lock and, like the production store, never freed.
+///
+/// ONE MUTEX PER THREAD, not one map of every thread's fonts behind one mutex
+/// (2026-09-30, gate speed). The guard of the map was held for the whole of
+/// every measure and raster, so every test thread that laid out text waited
+/// for every other one, each on fonts it never shared: measured the same day
+/// by `sample` across the `-p aterm-gui --lib` run at `RUST_TEST_THREADS=7`,
+/// test threads parked on that lock in 14,172 of 253,425 samples (5.6%) — the
+/// largest single lock the binary waited on. Only the owning thread ever takes
+/// its mutex, so each lock is uncontended, and what each thread sees is what
+/// its map entry held.
 #[cfg(test)]
-struct TestChromeFontsGuard {
-    fonts: std::sync::MutexGuard<
-        'static,
-        std::collections::HashMap<std::thread::ThreadId, ChromeFonts>,
-    >,
-    thread: std::thread::ThreadId,
-}
-
-#[cfg(test)]
-impl Deref for TestChromeFontsGuard {
-    type Target = ChromeFonts;
-
-    fn deref(&self) -> &Self::Target {
-        self.fonts
-            .get(&self.thread)
-            .expect("test thread font context was installed")
+fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
+    thread_local! {
+        // Keep the per-thread test store production-cold. Tests that construct
+        // a semantic view without backend startup cross the same explicit
+        // preparation boundary via `prepare_ui_fonts_for_direct_view_test`.
+        static FONTS: &'static Mutex<ChromeFonts> =
+            Box::leak(Box::new(Mutex::new(default_chrome_fonts())));
     }
-}
-
-#[cfg(test)]
-impl DerefMut for TestChromeFontsGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.fonts
-            .get_mut(&self.thread)
-            .expect("test thread font context was installed")
-    }
-}
-
-#[cfg(test)]
-fn lock_fonts() -> TestChromeFontsGuard {
-    static FONTS: OnceLock<Mutex<std::collections::HashMap<std::thread::ThreadId, ChromeFonts>>> =
-        OnceLock::new();
-    let mut fonts = FONTS
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+    FONT_STORE_VISITS.with(|visits| visits.set(visits.get() + 1));
+    FONTS
+        .with(|fonts| *fonts)
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let thread = std::thread::current().id();
-    // Keep the per-thread test store production-cold. Tests that construct a
-    // semantic view without backend startup cross the same explicit preparation
-    // boundary via `prepare_ui_fonts_for_direct_view_test`.
-    fonts.entry(thread).or_insert_with(default_chrome_fonts);
-    TestChromeFontsGuard { fonts, thread }
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Install the renderer-resolved chrome faces — `(bytes, collection index)` of
@@ -2115,7 +2112,7 @@ pub(crate) fn warm_chrome_font_assets() {
     drop(lock_fonts());
 }
 
-/// Tests keep chrome fonts per-thread (see [`TestChromeFontsGuard`]), so a
+/// Tests keep chrome fonts per-thread (see the test [`lock_fonts`]), so a
 /// process-global warm would be meaningless there — and the production warm is a
 /// pure startup optimisation with no observable effect to test.
 #[cfg(test)]
@@ -3860,25 +3857,38 @@ mod tests {
     use crate::widget::DrawPrim;
     use aterm_render::Theme;
 
-    /// The Settings preview resolves a BUNDLED family (`JetBrains Mono` on a
-    /// non-macOS build, when none is installed) to its compiled-in bytes. It
-    /// used to hand the resolved `bundled:` identity to the filesystem and
-    /// report the owner's default font as unreadable.
+    /// The Settings preview resolves a BUNDLED family (the default — `Cascadia
+    /// Mono PL` on Windows, `JetBrains Mono` on Linux — and `JetBrains Mono` on
+    /// Windows too, when none is installed) to its compiled-in bytes. It used
+    /// to hand the resolved `bundled:` identity to the filesystem and report the
+    /// owner's default font as unreadable.
     #[test]
     fn the_settings_preview_resolves_the_bundled_default_family() {
-        if !aterm_render::bundled::ACTIVE
-            || aterm_render::resolve_font_family(aterm_render::bundled::PRIMARY_FAMILY).is_some()
-        {
+        use aterm_render::bundled;
+        if !bundled::ACTIVE {
             return;
         }
-        let mut cache = CandidateFaceCache::new();
-        for (family, id) in [
-            ("JetBrains Mono", aterm_render::bundled::PRIMARY_ID),
+        let mut cases = Vec::new();
+        for (family, id, bold_id) in [
             (
-                "JetBrains Mono Bold",
-                aterm_render::bundled::PRIMARY_BOLD_ID,
+                bundled::PRIMARY_FAMILY,
+                bundled::PRIMARY_ID,
+                bundled::PRIMARY_BOLD_ID,
+            ),
+            (
+                bundled::JETBRAINS_FAMILY,
+                bundled::JETBRAINS_ID,
+                bundled::JETBRAINS_BOLD_ID,
             ),
         ] {
+            if aterm_render::resolve_font_family(family).is_none() {
+                cases.push((family.to_string(), id));
+                cases.push((format!("{family} Bold"), bold_id));
+            }
+        }
+        let mut cache = CandidateFaceCache::new();
+        for (family, id) in cases {
+            let family = family.as_str();
             let face = resolve_candidate_face(family, &mut cache)
                 .unwrap_or_else(|error| panic!("{family}: {error}"));
             assert_eq!(face.path, id);
@@ -4611,15 +4621,17 @@ mod tests {
         // the epoch does not move. That is a race, not a verdict, and it failed
         // exactly that way in a loaded full-suite run while passing six times
         // standalone. The bound keeps the test's teeth: a landing that never
-        // arrives still fails, it just no longer fails on scheduling.
-        let mut after = strip_band_font_epoch();
-        for _ in 0..200 {
-            if after != before {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            after = strip_band_font_epoch();
-        }
+        // arrives still fails, it just no longer fails on scheduling. A hang
+        // detector, never a latency budget.
+        let after = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(5),
+            || {
+                let now = strip_band_font_epoch();
+                (now != before).then_some(now)
+            },
+        )
+        .unwrap_or_else(strip_band_font_epoch);
         assert_ne!(after, before, "the band key witnesses the landing");
         {
             let mut fonts = lock_fonts();
@@ -4954,7 +4966,7 @@ mod tests {
     }
 
     /// TIER-1 (`SemanticPrewarmHandshake`, the slot half of `DecideResult`).
-    /// The integration bind (`tests/semantic_prewarm_conformance.rs`) holds the
+    /// The pure bind (`src/semantic_prewarm_conformance.rs`) holds the
     /// pure `semantic_prewarm_result_decision`; this one holds what
     /// `poll_semantic_renderer` DOES with it. Every point of the identity ×
     /// readiness × active-slot lattice lands one result through the real poll,

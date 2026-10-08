@@ -4,12 +4,9 @@
 //! THE RECOVERY LEDGER — how each run of the installed app ended. The product half of
 //! the PTY keeper's P0 census (`docs/DESIGN-pty-keeper-2026-09-26.md` §7).
 //!
-//! WHY IT EXISTS. The keeper design rests on a frequency it could not measure: how
-//! often the daily driver dies without an exit path, and whether it was wedged or
-//! starved of memory when it did (§2 F19: the kill census began only on 2026-09-25,
-//! and nothing recorded a CLEAN end at all, so there was no denominator). Owner
-//! decision 4's alternative — relaunch only when the census shows a stall or critical
-//! memory pressure at death — needs exactly these rows.
+//! WHY IT EXISTS. The keeper design rests on a frequency: how often the daily driver
+//! dies without an exit path, and whether it was wedged or starved of memory when it
+//! did. Clean ends are recorded too, so the count has a denominator.
 //!
 //! WHAT A ROW IS. One per windowed launch of the installed app, and one per update
 //! successor at its Commit. A row records the launch itself (pid, birth, build,
@@ -536,7 +533,12 @@ fn lock_briefly(file: &std::fs::File) -> Option<LedgerLock<'_>> {
     use std::os::unix::io::AsRawFd as _;
     for _ in 0..50 {
         // SAFETY: `file` owns a live descriptor for the call; LOCK_NB never waits.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the take lands in a LedgerLock, whose Drop releases by LOCK_UN"
+        )]
+        let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if taken {
             return Some(LedgerLock(file));
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -669,8 +671,7 @@ pub fn doctor_lines(rows: &[Row], path: &Path) -> (Vec<String>, bool) {
     if summary.rows == 0 {
         return (
             vec![format!(
-                "no windowed launch of the installed app is recorded yet; the \
-                 census starts with the next one ({})",
+                "no windowed launch recorded yet (installed app only): {}",
                 path.display()
             )],
             false,
@@ -693,7 +694,7 @@ pub fn doctor_lines(rows: &[Row], path: &Path) -> (Vec<String>, bool) {
             .iter()
             .map(|(class, n)| format!("{n} {}", class.describe()))
             .collect();
-        format!("the runs before them ended: {}", parts.join(", "))
+        format!("prior runs ended: {}", parts.join(", "))
     };
     let mut lines = vec![format!("{launches} since {since}; {ends}")];
     if let Some(row) = &summary.last_unexpected {
@@ -712,7 +713,7 @@ pub fn doctor_lines(rows: &[Row], path: &Path) -> (Vec<String>, bool) {
             ));
         }
         words.push(match prev.stall {
-            Tri::Yes => "the main thread was stalled at its end".to_string(),
+            Tri::Yes => "main thread stalled at its end".to_string(),
             Tri::No => "no stall at its end".to_string(),
             Tri::Unknown => "stall not known".to_string(),
         });
@@ -723,14 +724,14 @@ pub fn doctor_lines(rows: &[Row], path: &Path) -> (Vec<String>, bool) {
             Pressure::Unknown => "memory pressure not known".to_string(),
         });
         lines.push(format!(
-            "the last unexpected end, found at the {} launch: {}",
+            "last unexpected end, found at the {} launch: {}",
             aterm_types::rfc3339::format_rfc3339(row.at),
             words.join("; ")
         ));
         if summary.unexpected_stalled + summary.unexpected_critical > 0 {
             lines.push(format!(
-                "of the unexpected ends, {} had a stalled main thread and {} \
-                 critical memory pressure at the end",
+                "unexpected ends: {} with a stalled main thread, {} with critical \
+                 memory pressure",
                 summary.unexpected_stalled, summary.unexpected_critical
             ));
         }
@@ -874,7 +875,7 @@ mod tests {
     fn an_empty_or_all_clean_ledger_is_no_note() {
         let (lines, unexpected) = doctor_lines(&[], Path::new("/x/l"));
         assert!(!unexpected);
-        assert!(lines[0].contains("no windowed launch"));
+        assert!(lines[0].starts_with("no windowed launch recorded yet (installed app only)"));
         let rows = vec![row(1, 1, PrevRun::none()), row(2, 2, prev(EndClass::Clean))];
         let (lines, unexpected) = doctor_lines(&rows, Path::new("/x/l"));
         assert!(!unexpected);
@@ -894,9 +895,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "aterm-recovery-ledger-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
+            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -967,16 +966,25 @@ mod tests {
         };
         let file = open();
         let held = lock_briefly(&file).expect("a free ledger locks");
-        assert!(
-            open().try_lock().is_err(),
-            "a held ledger lock refuses a second description"
-        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a probe of a fresh description that is refused: it never holds the lock"
+        )]
+        let refused = open().try_lock().is_err();
+        assert!(refused, "a held ledger lock refuses a second description");
         let childs_copy = file.try_clone().expect("dup the ledger's descriptor");
         // Released by `LOCK_UN` (the guard's drop), then closed, while the copy lives.
         drop(held);
         drop(file);
+        let probe = open();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a probe of a fresh description, let go by unlock() below"
+        )]
+        let free = probe.try_lock().is_ok();
+        let _ = probe.unlock();
         assert!(
-            open().try_lock().is_ok(),
+            free,
             "a released ledger lock must be free while a copy of its descriptor lives"
         );
         drop(childs_copy);

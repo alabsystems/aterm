@@ -1,0 +1,45 @@
+# claude-code 2.1.283 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm (origin/main 63323e4a4, 120x44) · CASE 11 preview: Enter at once on the focused recommended option, no arrow move, no notes (main recommended-driver path) · capture c11-01
+❯ Use the AskUserQuestion tool again exactly once with ONE single-select question: question "Which layout do you
+  prefer?", header "Layout", options: label "Stacked (Recommended)" with description "Rows on top of each other" and
+  preview "+-----+\n| A   |\n+-----+\n| B   |\n+-----+"; label "Side by side" with description "Columns next to each
+  other" and preview "+---+---+\n| A | B |\n+---+---+". Use the options preview field exactly as given. After I answer,
+  reply with the exact tool result text you received, verbatim, and nothing else.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which layout do you prefer? → Stacked (Recommended)
+
+⏺ The user answered: "Which layout do you prefer?"="Stacked (Recommended)" selected preview:
+  +-----+
+  | A   |
+  +-----+
+  | B   |
+  +-----+ notes: short note. Read the answers carefully — they may request clarification, changes, or that you not
+  proceed — and follow what they actually say.
+
+✻ Crunched for 3s · done 9:00 PM
+
+❯ Use the AskUserQuestion tool again exactly once with ONE single-select question: question "Which layout do you
+  prefer?", header "Layout", options: label "Stacked (Recommended)" with description "Rows on top of each other" and
+  preview "+-----+\n| A   |\n+-----+\n| B   |\n+-----+"; label "Side by side" with description "Columns next to each
+  other" and preview "+---+---+\n| A | B |\n+---+---+". Use the options preview field exactly as given. After I answer,
+  reply with the exact tool result text you received, verbatim, and nothing else.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Layout
+
+Which layout do you prefer?
+
+❯ 1. Stacked (Recommended)        ┌──────────────────────────────────────────┐
+  2. Side by side                 │ +-----+                                  │
+                                  │ | A   |                                  │
+                                  │ +-----+                                  │
+                                  │ | B   |                                  │
+                                  │ +-----+                                  │
+                                  └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel

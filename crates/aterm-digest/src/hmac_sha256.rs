@@ -17,12 +17,7 @@ const IPAD: u8 = 0x36;
 const OPAD: u8 = 0x5c;
 
 /// Returned by [`HmacSha256::new_from_slice`] for API compatibility with the
-/// `hmac` crate.
-///
-/// HMAC accepts a key of **any** length by construction, so this crate never
-/// actually produces one -- long keys are hashed down, short keys are
-/// zero-padded. The type exists so call sites keep their
-/// `.expect("HMAC-SHA256 accepts a key of any length")` and read the same.
+/// `hmac` crate. Never produced: HMAC accepts a key of any length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidLength;
 
@@ -36,8 +31,7 @@ impl std::error::Error for InvalidLength {}
 
 /// A MAC did not verify.
 ///
-/// Deliberately carries nothing. Reporting *how* a tag was wrong -- which byte,
-/// what length -- is the same oracle [`ct_eq`] exists to close.
+/// Carries nothing: reporting how a tag was wrong would be a forgery oracle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MacError;
 
@@ -51,10 +45,7 @@ impl std::error::Error for MacError {}
 
 /// HMAC-SHA256 (RFC 2104), keyed with SHA-256.
 ///
-/// Drop-in for `hmac::Hmac<sha2::Sha256>` across aterm's call sites, except
-/// that [`finalize`](HmacSha256::finalize) hands back a plain `[u8; 32]`
-/// instead of a `CtOutput`, so a call site that wrote
-/// `mac.finalize().into_bytes()` drops the `.into_bytes()`.
+/// [`finalize`](HmacSha256::finalize) returns a plain `[u8; 32]`.
 ///
 /// # Example
 ///
@@ -82,10 +73,8 @@ pub struct HmacSha256 {
 impl HmacSha256 {
     /// Creates a MAC over the given key.
     ///
-    /// Every key length is accepted, per RFC 2104: keys longer than the
-    /// 64-byte block are replaced by their SHA-256 digest, shorter keys are
-    /// zero-padded to the block. The `Result` is API compatibility with the
-    /// `hmac` crate and is always `Ok`.
+    /// Keys longer than the 64-byte block are replaced by their SHA-256
+    /// digest; shorter keys are zero-padded.
     ///
     /// # Errors
     ///
@@ -130,18 +119,12 @@ impl HmacSha256 {
         outer.finalize()
     }
 
-    /// Checks `tag` against the computed MAC in constant time.
-    ///
-    /// The comparison runs through [`ct_eq`], which folds every byte rather
-    /// than returning at the first mismatch. Comparing tags with `==` here
-    /// would hand an attacker a byte-at-a-time forgery oracle; see the [`ct_eq`]
-    /// docs for the full argument.
+    /// Checks `tag` against the computed MAC in constant time (via [`ct_eq`]).
     ///
     /// # Errors
     ///
     /// [`MacError`] when `tag` is not the MAC of the message fed in, including
-    /// when it is the right bytes at the wrong length (a truncated tag never
-    /// verifies).
+    /// a truncated tag.
     pub fn verify_slice(self, tag: &[u8]) -> Result<(), MacError> {
         if ct_eq(&self.finalize(), tag) {
             Ok(())
@@ -162,7 +145,7 @@ impl std::fmt::Debug for HmacSha256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{hex, unhex};
+    use crate::hex;
 
     fn mac(key: &[u8], data: &[u8]) -> [u8; OUTPUT_LEN] {
         let mut m = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
@@ -190,7 +173,7 @@ mod tests {
                 &b"Hi There"[..],
                 "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
             ),
-            // A key SHORTER than the digest, exercising the zero-pad path.
+            // A key shorter than the digest, exercising the zero-pad path.
             (
                 2,
                 b"Jefe",
@@ -216,14 +199,14 @@ mod tests {
                 b"Test With Truncation",
                 "a3b6167473100ee06e0c796c2955552b",
             ),
-            // 131-byte key: LONGER than the 64-byte block, so it is hashed first.
+            // 131-byte key: longer than the 64-byte block, so it is hashed first.
             (
                 6,
                 &[0xaa; 131],
                 b"Test Using Larger Than Block-Size Key - Hash Key First",
                 "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
             ),
-            // Over-block-size key AND over-block-size data.
+            // Over-block-size key and over-block-size data.
             (
                 7,
                 &[0xaa; 131],
@@ -242,8 +225,6 @@ mod tests {
 
     #[test]
     fn every_key_length_is_accepted() {
-        // The call sites assert exactly this with
-        // `.expect("HMAC-SHA256 accepts a key of any length")`.
         for len in [0usize, 1, 31, 32, 33, 63, 64, 65, 127, 128, 1000] {
             let key = vec![0x5au8; len];
             assert!(
@@ -255,9 +236,8 @@ mod tests {
 
     #[test]
     fn exactly_block_size_key_is_not_hashed() {
-        // A 64-byte key is used verbatim; a 65-byte key is hashed. The two must
-        // therefore differ even when the 65th byte is the zero that padding
-        // would have supplied.
+        // A 64-byte key is used verbatim, a 65-byte key is hashed, so they
+        // differ even when the 65th byte is the zero padding would supply.
         let mut k64 = [0u8; 64];
         k64[0] = 0x91;
         let mut k65 = [0u8; 65];
@@ -298,15 +278,13 @@ mod tests {
         let key = b"k";
         let mut tag = mac(key, b"payload");
 
-        // Flip the LAST byte -- the case a first-mismatch loop would answer
-        // slowest, and the one a timing attacker walks toward one byte at a
-        // time.
+        // Flip the last byte, the case a first-mismatch loop answers slowest.
         tag[31] ^= 0x01;
         let mut m = HmacSha256::new_from_slice(key).expect("any key length");
         m.update(b"payload");
         assert_eq!(m.verify_slice(&tag), Err(MacError));
 
-        // Flip the FIRST byte instead.
+        // Flip the first byte instead.
         tag[31] ^= 0x01;
         tag[0] ^= 0x80;
         let mut m = HmacSha256::new_from_slice(key).expect("any key length");
@@ -349,11 +327,5 @@ mod tests {
         let rendered = format!("{m:?}");
         assert!(!rendered.contains("secret"), "{rendered}");
         assert!(rendered.starts_with("HmacSha256"), "{rendered}");
-    }
-
-    #[test]
-    fn hex_vectors_decode_as_expected() {
-        // Guards the test helper itself: RFC 4231 case 2's key in hex.
-        assert_eq!(unhex("4a656665"), b"Jefe".to_vec());
     }
 }

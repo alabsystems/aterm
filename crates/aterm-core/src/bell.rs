@@ -9,10 +9,9 @@
 //! current [`Instant`] as a parameter instead of reading the clock, so the
 //! full transition space is unit-testable without sleeping.
 
-// aterm_time::Instant is std::time::Instant on native (byte-identical) and a JS-clock
-// instant on wasm32, where Instant::now() panics. Every Instant in the engine's clock
-// seam (transient.process_now, last_bell_time, ClockReading) must be this same type so
-// they interoperate. Duration is unaffected by wasm and stays std::time.
+// aterm_time::Instant is std's on native and a JS-clock instant on wasm32
+// (where Instant::now() panics); every Instant in the engine's clock seam must
+// be this type.
 use aterm_time::Instant;
 use std::time::Duration;
 
@@ -190,7 +189,7 @@ mod tests {
         let t0 = Instant::now();
         assert!(gate.try_fire(t0));
         assert!(gate.try_fire(t0 + Duration::from_secs(1)));
-        // The boundary fire re-arms the gate from ITS timestamp.
+        // The boundary fire re-arms the gate from its timestamp.
         assert!(!gate.try_fire(t0 + Duration::from_millis(1500)));
         assert!(gate.try_fire(t0 + Duration::from_secs(2)));
     }

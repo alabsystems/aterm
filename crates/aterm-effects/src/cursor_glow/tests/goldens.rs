@@ -52,11 +52,10 @@ fn kitty_rows(flat: bool) -> [(&'static str, u64); 4] {
     ]
 }
 
-/// **THE GATE IS BYTE-EXACT** (§30): the `rainbow kitty flat` spelling
-/// folds every kitty row to its own pinned number, and the default body
-/// folds none of them to it — the comet moves all four, light and
-/// reduced included (the comet is a shape on both grounds; the reduced
-/// row keeps the shape and the rail and drops only the wipe).
+/// The gate is byte-exact (§30): the `rainbow kitty flat` spelling folds every
+/// kitty row to its own pinned number, and the default body folds none of them
+/// to it (the comet moves all four; the reduced row keeps the shape and rail
+/// and drops only the wipe).
 #[test]
 fn the_flat_spelling_collapses_every_comet_branch_byte_for_byte() {
     assert!(
@@ -97,11 +96,8 @@ fn the_flat_spelling_collapses_every_comet_branch_byte_for_byte() {
     }
 }
 
-/// THE ONE HARD LAW OF THE DELETION (§17.3 phase 7): with v2
-/// unconditional for the style and v1's rainbow arms gone, every
-/// built-in style except rainbow kitty emits the same bytes it emitted
-/// with v1 in the tree — v2 never engages for them, and the code the
-/// deletion removed was never on their path.
+/// Every built-in style except rainbow kitty emits its pinned bytes: v2
+/// never engages for them.
 #[test]
 fn the_other_nine_styles_are_byte_identical_with_v2_unconditional() {
     let rows = deletion_goldens();
@@ -125,75 +121,14 @@ fn the_other_nine_styles_are_byte_identical_with_v2_unconditional() {
     }
 }
 
-/// v2 IS the rainbow kitty, and the deletion moved none of its bytes:
-/// dark, light, underline and reduced-motion each fold to the seam-era
-/// golden — the v1 bookkeeping that used to run beside v2 fed nothing
-/// v2 draws, reads or schedules. The kitty rows are re-pinned whenever
-/// v2 changes its own bytes — the re-bake law on [`DELETION_GOLDENS`];
-/// this pin is what makes any later drift a decision instead of a
-/// surprise.
-///
-/// RE-BAKED 2026-09-15, THE EDIT ROUND'S ANSWER LANE, AND THE WALK IS
-/// THE WHOLE OF IT. All four kitty rows move, and what moved them is
-/// ONE law: [`rk::ribbon::CROSS_PACE`], the re-pace of the walk across
-/// the green→blue leg (the owner: *"some blending smoothness in green
-/// to blue where the gradient sometimes looked blocky"*). The script
-/// draws the band on every frame, so a change to WHICH STOP a walk
-/// position resolves to reaches every one of them.
-///
-/// **DECOMPOSED, NOT ASSUMED** (measured 2026-09-15 by switching each
-/// of the round's laws off in turn and re-reading this table):
-///
-/// * with [`rk::ribbon::walk_pace`] forced to the IDENTITY and every
-///   other law of the round left in place, these four rows read
-///   `4_461_815_233_714_909_726`, `15_435_435_340_954_993_666`,
-///   `7_623_959_890_164_863_941` and `380_128_264_356_753_282` — the
-///   bytes v0.86.0 shipped (`de9846727`), to the bit. The round's other
-///   laws — the fold that keeps its row, the repaint's home, the
-///   witness's blank cells, the erase (which is v0.86.0's own
-///   `retract_suffix` again, the slide having been dropped after
-///   measurement) — move NO byte of this script.
-/// * the green→blue confinement is `rk::ribbon::tests::`
-///   `the_crossing_is_smoothed_out_of_its_own_legs_cells_and_nothing_else_moves`:
-///   every step the shipped walk placed outside green→blue is unchanged
-///   to the bit (`moved_off_leg == 0`), all seven anchors keep their
-///   residency, and cells 0–4 — the warm end the owner asked to see
-///   more of — sit on exactly the stops they shipped with.
-/// * THE EIGHT NON-KITTY ROWS ARE UNTOUCHED
-///   (`the_other_nine_styles_are_byte_identical_with_v2_unconditional`
-///   is green over them), and `licensed_typed_parity`'s nine-style
-///   golden moved ONLY its entry 2: no other trail style moved.
-///
-/// The bake was taken AFTER a defect it would otherwise have pinned was
-/// fixed. `Ribbon::typed_landing` — the round's "a key lays where the
-/// hand is" — read [`Ribbon::caret`] as the hand, and that field is
-/// seeded from the engine's caret MIRROR, which is `(0, 0)` until a
-/// caret has been observed at all. Traced on this very script, the
-/// FIRST key of the session (`caret=(2, 5)`, mirror `(0, 0)`) was
-/// redirected to `(0, 1)`: a stray on a row the hand has never been on,
-/// which is the defect the law exists to prevent. The law now requires
-/// the hand's row to be a row this ribbon holds a cell on, and with
-/// that guard it moves no byte here.
-///
-/// At the 0.86 candidate's final catch-up with main (2026-09-15) this
-/// pin was read and NOT re-baked: main's incoming round moved none of
-/// the four, so the numbers on [`DELETION_GOLDENS`] are the merged
-/// tree's own — measured on its run, `checked == 4`. (The stray `)` a
-/// previous hand-merge left on "surprise.)" is gone with it: main's
-/// spelling of the sentence was the whole one.)
-///
-/// RE-BAKED 2026-09-16, THE EXHAUST (§33) — five laws, each landed as
-/// its own commit and each decomposed by switching it off and reading
-/// the previous number; the paragraph on [`DELETION_GOLDENS`] names them
-/// and which rows each moved. The control that held throughout:
-/// **reduced did not move one byte** — the exhaust's first gate is
-/// `cfg.reduced_motion` and the slipstream is a position law `Star::pos`
-/// ignores under it — and the light row moved by a DIFFERENT number
-/// from dark, which is `light_keeps` thinning the population to
-/// [`rk::stardust::LIGHT_COUNT_SCALE`]; a bake that moved light and dark
-/// by one law would have been the tell that something other than the
-/// exhaust moved. The eight non-kitty rows are untouched
-/// (`the_other_nine_styles_are_byte_identical_with_v2_unconditional`).
+/// The rainbow kitty's dark, light, underline and reduced-motion rows each fold
+/// to their pinned golden. The rows are re-pinned whenever v2 deliberately
+/// changes its bytes (the re-bake law on [`DELETION_GOLDENS`]), so any drift is
+/// a decision. The reduced row is independent of stardust position laws, and
+/// light and dark move by different amounts when the stardust population
+/// changes (`light_keeps` thins to [`rk::stardust::LIGHT_COUNT_SCALE`]). The
+/// non-kitty rows are pinned by
+/// `the_other_nine_styles_are_byte_identical_with_v2_unconditional`.
 #[test]
 fn rainbow_kitty_is_byte_identical_to_the_seam_era_v2() {
     let rows = deletion_goldens();

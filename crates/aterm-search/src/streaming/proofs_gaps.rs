@@ -3,7 +3,6 @@
 // Author: Andrew Yates
 
 //! Kani proofs for algorithmic gaps: content_invalidated, update_pattern.
-//! Split from proofs.rs for file size compliance. Part of #2875.
 //!
 //! ## Scope honesty (what these harnesses do and do not prove)
 //!

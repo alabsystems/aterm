@@ -82,6 +82,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::sdk_consts;
+use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_const_decl};
+
 /// `(Rust constant, the SDK spelling it claims to equal)`.
 ///
 /// The SDK name is written out rather than derived from the Rust name by
@@ -184,29 +187,6 @@ impl Gate {
     }
 }
 
-/// A `const` declaration's body, whatever VISIBILITY it is spelled with.
-///
-/// Lifted verbatim from `winit_seam_constants.rs`, including its finding: the
-/// first version matched `pub(crate) const ` alone, which armed the guard at the
-/// one SPELLING the file happens to use rather than at the rule, and a `pub
-/// const` carrying a wrong value passed every test. This is written against the
-/// GRAMMAR — `pub`, `pub(crate)`, `pub(super)`, `pub(in path)` or nothing — and
-/// [`the_parser_reads_every_visibility_spelling`] proves it reads all of them.
-fn strip_const_decl(line: &str) -> Option<&str> {
-    let mut s = line.trim();
-    if let Some(rest) = s.strip_prefix("pub") {
-        s = match rest.strip_prefix('(') {
-            Some(q) => q.split_once(')')?.1,
-            None => rest,
-        };
-        if !s.is_empty() && !s.starts_with(char::is_whitespace) {
-            return None;
-        }
-        s = s.trim_start();
-    }
-    s.strip_prefix("const ")
-}
-
 /// The `#[cfg]` an attribute line states, if it is an arch gate.
 ///
 /// Anything else — `#[cfg(test)]`, a doc attribute, a lint allow — answers
@@ -245,14 +225,8 @@ fn gui_constants() -> Vec<(String, Gate, String)> {
             let closes = trimmed.matches('}').count() as i32;
             if let Some(g) = arch_gate(line) {
                 gate = g;
-            } else if let Some(rest) = strip_const_decl(line) {
-                let (name, rest) = rest.split_once(':').expect("a typed const");
-                let (_ty, value) = rest.split_once('=').expect("an initialised const");
-                out.push((
-                    name.trim().to_owned(),
-                    gate,
-                    value.trim().trim_end_matches(';').trim().to_owned(),
-                ));
+            } else if let Some((name, value)) = parse_const_decl(line) {
+                out.push((name, gate, value));
                 gate = Gate::Always;
             } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
                 // A non-comment, non-const line ends any pending gate: an
@@ -269,204 +243,9 @@ fn gui_constants() -> Vec<(String, Gate, String)> {
     out
 }
 
-/// A Rust integer literal as C: only `_` separators differ (`0x7fff_ffff…`).
-fn as_c_literal(rust: &str) -> String {
-    rust.replace('_', "")
-}
-
-/// Compile `body` as Objective-C for `arch`, syntax only. `Ok(())` if clang
-/// accepted it, `Err(stderr)` if it did not.
-///
-/// A `cc` that cannot even be started panics: a missing compiler is a broken
-/// box, and an oracle that cannot run on a broken box is not a pass. A `cc`
-/// that runs but cannot fold a `static const` is a narrower case with its own
-/// rule, on one measured host only: [`green_verdict`] and [`inverted_verdict`].
+/// [`sdk_consts::compile`] in this census's own scratch directory.
 fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
-    let dir = std::env::temp_dir().join(format!("aterm-gui-consts-{tag}-{arch}"));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    let path = dir.join("c.m");
-    std::fs::write(&path, body).expect("the probe is writable");
-    let out = Command::new("cc")
-        .args(["-arch", arch, "-fsyntax-only"])
-        // A wrong-but-vacuous assertion WARNS before it passes, so THAT
-        // warning is made fatal — and only that one. A blanket `-Werror` makes
-        // the probe fail on unrelated diagnostics (a deprecated enumerator in
-        // the seam's twin did exactly that), which would be a green arm going
-        // red for a reason that is not a constant's value. `-Wparentheses` is
-        // the exact diagnostic clang emits for `SDK == a | b`, which is the
-        // shape this file parenthesises against.
-        .arg("-Werror=parentheses")
-        .arg(&path)
-        .output()
-        .expect(
-            "`cc` must be runnable: this test IS the oracle that replaced the \
-             objc2 diff, and a compiler that cannot even start is a broken box, \
-             not a pass",
-        );
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).into_owned())
-    }
-}
-
-/// The diagnostic Apple clang 14.0.3 gives for every `static const` row —
-/// `NSNotFound`, `NSModalResponseOK`, `NSAppKitVersionNumber10_12`,
-/// `NSVariableStatusItemLength`, `NSAlertFirstButtonReturn`,
-/// `NSWindowFullScreenButton` — when asked to fold it into `_Static_assert`.
-/// It is the HOST compiler's limit, not the target's: the fold fails for both
-/// `-arch` arms on that clang (measured 2026-09-06 and again 2026-09-16 on an
-/// Intel MacBook Pro running macOS 13.7.8 with the Command Line Tools' clang
-/// 14.0.3; the enum rows fold fine). A newer clang folds them all.
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-const FOLD_DIAGNOSTIC: &str = "static_assert expression is not an integral constant expression";
-
-/// The rows clang could not fold, in the order it named them — `Some` only
-/// when EVERY `error:` line in `stderr` is [`FOLD_DIAGNOSTIC`]. Any other
-/// error (a value disagreement reads `static assertion failed due to
-/// requirement`), or no `error:` line at all, is `None`: not classified, so
-/// the caller keeps its verdict. The row is the quoted name on the source line
-/// clang prints under the diagnostic.
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-fn unfolded_rows(stderr: &str) -> Option<Vec<String>> {
-    let lines: Vec<&str> = stderr.lines().collect();
-    let mut rows = Vec::new();
-    let mut saw_error = false;
-    for (i, line) in lines.iter().enumerate() {
-        if !line.contains("error:") {
-            continue;
-        }
-        saw_error = true;
-        if !line.contains(FOLD_DIAGNOSTIC) {
-            return None;
-        }
-        let row = lines
-            .iter()
-            .skip(i + 1)
-            .take(3)
-            .find_map(|l| {
-                let (_, rest) = l.split_once('"')?;
-                let (name, _) = rest.split_once('"')?;
-                Some(name.to_owned())
-            })
-            .unwrap_or_else(|| "<a row clang did not print>".to_owned());
-        rows.push(row);
-    }
-    saw_error.then_some(rows)
-}
-
-/// The green arm's verdict on `compile`'s answer — `assert!`-shaped: a clean
-/// compile is the pass, anything else is `what` on `arch` with clang's text.
-/// On every target but x86_64 macOS that is the whole function.
-#[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
-#[track_caller]
-fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
-    if let Err(stderr) = result {
-        panic!("{what} on {arch}:\n{stderr}");
-    }
-}
-
-/// x86_64 macOS — the one host measured with a clang that cannot fold a
-/// `static const` (see [`FOLD_DIAGNOSTIC`]): a compile whose every error is that
-/// diagnostic is REPORTED, one stderr line naming the rows, and is not a
-/// failure; every other row in the same probe was asserted by the same
-/// compile. An error that is not the fold diagnostic, or an unclassifiable
-/// failure, panics exactly as on every other target. The waiver keys on clang's
-/// text, never on the cfg: an Intel Mac with a folding clang asserts every
-/// row, and an Apple silicon Mac with clang 14.0.3 stays red by design — only
-/// this host was measured.
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-#[track_caller]
-fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
-    let Err(stderr) = result else {
-        return;
-    };
-    match unfolded_rows(&stderr) {
-        Some(rows) => report_unfolded(arch, &rows),
-        None => panic!("{what} on {arch}:\n{stderr}"),
-    }
-}
-
-/// The inverted arm's verdict: the probe with one row flipped must FAIL for
-/// that row's VALUE on `arch`. On every target but x86_64 macOS any failure is
-/// the pass, as it always was.
-#[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
-#[track_caller]
-fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuous: &str) {
-    let _ = (arch, row);
-    assert!(result.is_err(), "{vacuous}");
-}
-
-/// x86_64 macOS: a clang that cannot fold makes the inverted probe fail
-/// whatever the values are, so "it failed" proves nothing here. The pass is
-/// clang's value diagnostic — `static_assert failed due to requirement …` (`static assertion` on a newer clang) —
-/// on the inverted `row` itself; the fold errors on the other rows are reported
-/// and never counted.
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-#[track_caller]
-fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuous: &str) {
-    let Err(stderr) = result else {
-        panic!("{vacuous}");
-    };
-    let lines: Vec<&str> = stderr.lines().collect();
-    let failed_for_its_value = lines.iter().enumerate().any(|(i, l)| {
-        l.contains("failed due to requirement")
-            && lines
-                .iter()
-                .skip(i)
-                .take(4)
-                .any(|s| s.contains(&format!("\"{row}\"")))
-    });
-    assert!(
-        failed_for_its_value,
-        "the INVERTED row {row} did not fail for its value on {arch} — this clang's fold \
-         errors alone would make any inverted probe fail, which proves nothing:\n{stderr}"
-    );
-    let fold_only: Vec<String> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.contains(FOLD_DIAGNOSTIC))
-        .filter_map(|(i, _)| {
-            lines.iter().skip(i + 1).take(3).find_map(|l| {
-                let (_, rest) = l.split_once('"')?;
-                let (name, _) = rest.split_once('"')?;
-                Some(name.to_owned())
-            })
-        })
-        .collect();
-    if !fold_only.is_empty() {
-        report_unfolded(arch, &fold_only);
-    }
-}
-
-/// The one line an x86_64 macOS run prints per probe with unfolded rows: which
-/// rows, which clang, and why they are not asserted here. Written to the
-/// stderr handle rather than through `eprintln!`, which libtest captures and
-/// drops for a passing test: a waived row must show in every run.
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-fn report_unfolded(arch: &str, rows: &[String]) {
-    use std::io::Write as _;
-    let version = Command::new("cc")
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .next()
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".to_owned());
-    let line = format!(
-        "{}: {arch}: {} row(s) not asserted on x86_64 macOS — this host's `cc` ({version}) \
-         cannot fold their `static const` into `_Static_assert` (the fold fails for both \
-         -arch arms on Apple clang 14.0.3, measured 2026-09-16); every other row was \
-         asserted by the same compile: {}\n",
-        file!(),
-        rows.len(),
-        rows.join(", ")
-    );
-    let _ = std::io::stderr().write_all(line.as_bytes());
+    sdk_consts::compile("aterm-gui-consts", arch, body, tag)
 }
 
 /// The probe source: one `_Static_assert` per constant, using `appkit.rs`'s own
@@ -571,39 +350,6 @@ fn every_gui_constant_has_a_row_and_every_row_names_a_gui_constant() {
             && split.iter().any(|(_, g, _)| *g == Gate::NotX86_64),
         "both arms of the arch-split constant must be seen: {split:?}"
     );
-}
-
-/// THE PARSER READS EVERY VISIBILITY SPELLING, not just the one `consts` uses.
-///
-/// All 33 live declarations are `pub(crate) const`, so without this the parser
-/// could regress to a single `strip_prefix` and every other test here would stay
-/// green: a constant it never parsed is not "missing", it is invisible. The
-/// spellings are therefore exercised against a synthetic source.
-#[test]
-fn the_parser_reads_every_visibility_spelling() {
-    let cases = [
-        ("const A: usize = 1;", Some(("A", "1"))),
-        ("pub const B: usize = 2;", Some(("B", "2"))),
-        ("    pub(crate) const C: usize = 3;", Some(("C", "3"))),
-        ("pub(super) const D: usize = 4;", Some(("D", "4"))),
-        ("pub(in crate::x) const E: usize = 5;", Some(("E", "5"))),
-        // …and things that are NOT a constant declaration stay unparsed.
-        ("let id = (r as *const T).cast_mut();", None),
-        ("pub(super) static F: Id;", None),
-        ("pubconst G: usize = 7;", None),
-    ];
-    for (line, want) in cases {
-        let got = strip_const_decl(line).map(|rest| {
-            let (name, rest) = rest.split_once(':').expect("a typed const");
-            let (_ty, value) = rest.split_once('=').expect("an initialised const");
-            (
-                name.trim().to_owned(),
-                value.trim().trim_end_matches(';').trim().to_owned(),
-            )
-        });
-        let got = got.as_ref().map(|(n, v)| (n.as_str(), v.as_str()));
-        assert_eq!(got, want, "the parser disagreed on {line:?}");
-    }
 }
 
 /// THE ARCH GATE IS READ FROM THE SOURCE, and only an arch gate is.
@@ -724,9 +470,11 @@ fn an_unparenthesised_compound_literal_would_be_vacuous() {
     );
     // Unparenthesised: clang warns, and WITHOUT `-Werror` it would compile —
     // which is the vacuity. Compiled here with a plain `cc` to show that.
-    let dir = std::env::temp_dir().join("aterm-gui-consts-vacuity");
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    let path = dir.join("c.m");
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-gui-consts-vacuity-")
+        .tempdir()
+        .expect("a scratch directory");
+    let path = dir.path().join("c.m");
     std::fs::write(&path, &bare).expect("writable");
     let out = Command::new("cc")
         .args(["-arch", "arm64", "-fsyntax-only"])

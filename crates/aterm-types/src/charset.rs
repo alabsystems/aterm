@@ -4,8 +4,7 @@
 
 //! Character set support (G0-G3, GL/GR, SI/SO, SS2/SS3).
 //!
-//! Extracted from `aterm-core::terminal::charset` to `aterm-types` (Part of #5663).
-//! These are pure data types with no dependencies on aterm-core internals.
+//! Pure data types with no dependencies on aterm-core internals.
 
 // CharacterSet (1 byte) and CharsetState (6 bytes) are trivially copyable
 // but use &self for consistency with the rest of the terminal API.
@@ -634,7 +633,8 @@ impl CharacterSetState {
 
     /// Get the effective character set for translation.
     ///
-    /// If a single shift is active, returns that G-set and clears the shift.
+    /// If a single shift is active, returns that G-set (the caller clears the
+    /// shift with `clear_single_shift`).
     /// Otherwise returns the GL-mapped G-set.
     #[must_use]
     pub fn effective_charset(&self) -> CharacterSet {

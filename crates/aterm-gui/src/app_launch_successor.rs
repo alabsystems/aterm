@@ -260,7 +260,7 @@ pub(crate) enum LaunchError {
     /// Foundation refused to mint one of the objects the launch needs.
     ///
     /// Only reachable on an allocation failure: every string reaching
-    /// `launch_validated` has already passed the text validation above, so an
+    /// `begin_launch_validated` has already passed the text validation above, so an
     /// interior NUL or a bad encoding cannot get this far. It exists because
     /// the first-party layer returns `Option` where the binding crate returned
     /// an infallible constructor, and the honest answer to "Foundation said no"
@@ -271,10 +271,36 @@ pub(crate) enum LaunchError {
     /// answers `-1` when it does not know one.
     #[cfg(target_os = "macos")]
     PidUnknown(i32),
+    /// LaunchServices answered with an application that had ALREADY TERMINATED
+    /// and whose pid it no longer knows (`-1`): the launched process ran and
+    /// exited before it ever checked in (2026-09-29, measured on macOS 26.6.2
+    /// against an ad-hoc-signed stand-in bundle launched exactly as
+    /// [`begin_launch`] launches). A process that dies before it creates its
+    /// `NSApplication` — for a successor, before its rendezvous dial — was
+    /// answered this way 26–251 ms after its death (median 145 ms), however
+    /// long it had lived: 23 of 23 runs — an immediate `_exit`, `_exit` after
+    /// 0.5, 2 and 8 s, `SIGKILL` after 0.3 and 1 s, and, after a same-pid
+    /// re-exec, an immediate `_exit`, `_exit` after 1 s and `SIGKILL` after
+    /// 0.3 s. A process that is ALIVE was never answered this way:
+    /// the 8 that checked in (3 after a re-exec) were answered with their pid
+    /// when they did, and the 2 that never did were answered with their pid, not
+    /// terminated, at LaunchServices' own check-in timeout (30.06 s, 30.08 s). So
+    /// this one answer is POSITIVE EVIDENCE OF DEATH, the only one this module
+    /// produces ([`launch_answer_proves_exit`]). A launch refused before any
+    /// process exists (a missing or non-executable binary) is answered with an
+    /// `NSError` instead, which is never read as death. After a dial it
+    /// contradicts any dialer that is still alive, which cannot be the dead
+    /// process (`app_update_handoff::LaunchCorroboration`).
+    #[cfg(target_os = "macos")]
+    ExitedBeforeCheckIn,
     /// The answer names THIS process: LaunchServices substituted the
     /// already-running instance instead of starting a new one, so no successor
-    /// exists and no dial can ever arrive. Caught here so the caller refuses in
-    /// milliseconds instead of stalling for its whole dial budget.
+    /// exists and no dial can ever arrive. Not expected at all — [`begin_launch`]
+    /// asks for a new instance and forbids substitution — and never driven.
+    /// Nothing refuses on it: the wait for the dial reads it as naming no
+    /// process and waits out its budget (`app_update_handoff::await_launched_dial`),
+    /// and after a dial the corroboration proceeds past it, as past every error
+    /// but [`Self::ExitedBeforeCheckIn`], on the attested dialer.
     #[cfg(target_os = "macos")]
     SubstitutedRunningInstance(i32),
 }
@@ -332,6 +358,10 @@ impl std::fmt::Display for LaunchError {
                     "LaunchServices reported the launched instance as pid {pid}"
                 )
             }
+            #[cfg(target_os = "macos")]
+            Self::ExitedBeforeCheckIn => f.write_str(
+                "LaunchServices reports the launched application terminated before it checked in",
+            ),
             #[cfg(target_os = "macos")]
             Self::SubstitutedRunningInstance(pid) => write!(
                 f,
@@ -523,6 +553,28 @@ impl LaunchInFlight {
             Err(LaunchError::Unsupported)
         }
     }
+
+    /// Has LaunchServices already answered that the launched process EXITED
+    /// before it checked in ([`launch_answer_proves_exit`])? A PEEK, polled by
+    /// the outgoing process's wait for the successor's dial (2026-09-29): it
+    /// never takes the answer, so the corroboration after a dial
+    /// ([`Self::wait`]) still reads whatever LaunchServices said.
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn exited_before_check_in(&self) -> bool {
+        self.watch.slot.peek(launch_answer_proves_exit)
+    }
+
+    /// The pid LaunchServices' answer NAMES for the launched process, once it
+    /// has answered with one ([`launch_answer_names_pid`]). A PEEK, like
+    /// [`Self::exited_before_check_in`]: the wait for the dial asks the kernel
+    /// about that pid (`app_update_handoff::NamedSuccessorWatch`) and leaves
+    /// the answer for the corroboration after a dial.
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn named_pid(&self) -> Option<i32> {
+        self.watch.slot.peek(launch_answer_names_pid)
+    }
 }
 
 /// The pure half: everything that can be refused without asking the system
@@ -694,7 +746,8 @@ fn begin_launch_validated(
         // both classes are thread-safe — see the module docs.
         // `-domain` and `-localizedDescription` are `-(NSString *)`,
         // `-code` is `-(NSInteger)` and `-processIdentifier` is `-(pid_t)`,
-        // i.e. `int` and NOT `NSInteger`, which is why it is written out.
+        // i.e. `int` and NOT `NSInteger`, which is why it is written out;
+        // `-isTerminated` is `-(BOOL)`.
         let answer = unsafe {
             if !error.is_null() {
                 // An error is authoritative even if an application also
@@ -713,7 +766,12 @@ fn begin_launch_validated(
                 Err(LaunchError::NoApplication)
             } else {
                 let pid_of: unsafe extern "C-unwind" fn(Id, Sel) -> i32 = aterm_objc::msg();
-                admit_launched_pid(pid_of(app, sel!(processIdentifier)), own_pid)
+                let terminated_of: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = aterm_objc::msg();
+                admit_launch_answer(
+                    pid_of(app, sel!(processIdentifier)),
+                    terminated_of(app, sel!(isTerminated)).as_bool(),
+                    own_pid,
+                )
             }
         };
         slot.deliver(answer);
@@ -880,6 +938,112 @@ fn admit_launched_pid(pid: i32, own_pid: i32) -> Result<LaunchedSuccessor, Launc
     Ok(LaunchedSuccessor { pid })
 }
 
+/// The whole of the completion's reading of an `NSRunningApplication`: its
+/// `processIdentifier` and whether LaunchServices already reports it
+/// `isTerminated`.
+///
+/// ONE shape changes meaning, and only it: an unknown pid on an application
+/// that has terminated is [`LaunchError::ExitedBeforeCheckIn`] — the measured
+/// answer for a process that died before it checked in. It was
+/// [`LaunchError::PidUnknown`] before, and after a dial the corroboration
+/// proceeded on the attested dialer for both until round eight of the update
+/// audit (U36): since 2026-10-02 this answer, LaunchServices' word that the
+/// process it launched is dead, refuses a dialer that is still alive, which
+/// cannot be that process (`app_update_handoff::LaunchCorroboration`). A known pid
+/// is admitted exactly as before whatever `terminated` says: the corroboration
+/// compares it with the dialer, and before the dial the wait asks the KERNEL
+/// whether that pid's process is gone (`app_update_handoff::NamedSuccessorWatch`),
+/// which knows exactly, rather than this flag.
+#[cfg(target_os = "macos")]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "native_update_launched_dial_wait",
+        action = "AnswerExited",
+        project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "native_update_launched_dial_wait",
+        action = "AnswerNamed",
+        project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "native_update_launched_dial_wait",
+        action = "AnswerOther",
+        project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
+    )
+)]
+fn admit_launch_answer(
+    pid: i32,
+    terminated: bool,
+    own_pid: i32,
+) -> Result<LaunchedSuccessor, LaunchError> {
+    if pid <= 0 && terminated {
+        return Err(LaunchError::ExitedBeforeCheckIn);
+    }
+    admit_launched_pid(pid, own_pid)
+}
+
+/// Does LaunchServices' answer PROVE the launched process is gone — so no dial
+/// can ever come, and the outgoing process may stop waiting for one?
+///
+/// `true` for exactly one answer, [`LaunchError::ExitedBeforeCheckIn`]. Every
+/// other answer is `false`, and that is the point of this function: an answer
+/// naming a pid is a process that checked in, or one LaunchServices stopped
+/// waiting for while it lived (whether it has died SINCE is the kernel's to
+/// say: [`launch_answer_names_pid`]); an error is not death (the corroboration
+/// after a dial logs LaunchServices answering an error about a launch whose
+/// successor had already dialled, and a dialler is alive); no answer yet is no
+/// answer. Only the pre-dial wait reads it
+/// (`app_update_handoff::await_launched_dial`).
+#[must_use]
+#[cfg(target_os = "macos")]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "native_update_launched_dial_wait",
+        action = "EndOnExit",
+        project = "aterm_gui::app_update_handoff::launched_dial_wait_conformance::project"
+    )
+)]
+pub(crate) fn launch_answer_proves_exit(
+    answer: Option<&Result<LaunchedSuccessor, LaunchError>>,
+) -> bool {
+    matches!(answer, Some(Err(LaunchError::ExitedBeforeCheckIn)))
+}
+
+/// Which pid does LaunchServices' answer NAME as the launched process — the
+/// one process the outgoing process may watch, before the dial, for a death
+/// LaunchServices will not report?
+///
+/// `Some` for exactly an admitted application ([`LaunchedSuccessor`]):
+/// positive, and never this process's own ([`admit_launched_pid`]). Measured
+/// 2026-09-29 on stand-in bundles launched as [`begin_launch`] launches, such
+/// an answer comes when the process checks in — during its
+/// `+sharedApplication`, before it can go on (6 of 6 that checked in and then
+/// exited or `SIGKILL`ed themselves, the answer first) — or at
+/// LaunchServices' own ~30 s check-in timeout for one that lives without
+/// checking in, and a process that dies after it is answered nothing more.
+/// Every other answer names nothing: an error names no process, an unknown
+/// pid is no pid, and a substituted running instance is this process. Only
+/// the pre-dial wait reads it (`app_update_handoff::await_launched_dial`).
+#[must_use]
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_answer_names_pid(
+    answer: Option<&Result<LaunchedSuccessor, LaunchError>>,
+) -> Option<i32> {
+    match answer {
+        Some(Ok(successor)) => Some(successor.pid()),
+        _ => None,
+    }
+}
+
 /// The one-slot answer the completion block fills and the caller waits on.
 #[cfg(target_os = "macos")]
 #[derive(Default)]
@@ -900,6 +1064,17 @@ impl LaunchSlot {
             *slot = Some(answer);
             self.answered.notify_all();
         }
+    }
+
+    /// Apply `read` to the answer IN PLACE — delivered or not — and never take
+    /// it: whatever reads the slot this way leaves the answer for the one
+    /// [`LaunchWatch::wait`] that consumes it.
+    fn peek<T>(
+        &self,
+        read: impl FnOnce(Option<&Result<LaunchedSuccessor, LaunchError>>) -> T,
+    ) -> T {
+        let slot = self.answer.lock().unwrap_or_else(|p| p.into_inner());
+        read(slot.as_ref())
     }
 }
 
@@ -932,6 +1107,23 @@ impl LaunchInFlight {
             watch.slot.deliver(Ok(LaunchedSuccessor { pid }));
         }
         Self { watch }
+    }
+
+    /// Deliver `answer` as the completion block would — at once, or from
+    /// another thread while the caller waits.
+    pub(crate) fn answer_for_test(&self, answer: Result<LaunchedSuccessor, LaunchError>) {
+        self.watch.slot.deliver(answer);
+    }
+
+    /// The completion's own reading of an `NSRunningApplication`
+    /// (`processIdentifier`, `isTerminated`), for a Tier-1 to script
+    /// LaunchServices with the answers it actually gives.
+    pub(crate) fn admitted_for_test(
+        pid: i32,
+        terminated: bool,
+        own_pid: i32,
+    ) -> Result<LaunchedSuccessor, LaunchError> {
+        admit_launch_answer(pid, terminated, own_pid)
     }
 }
 
@@ -995,15 +1187,17 @@ mod tests {
     /// validation can ask of a bundle. NOTHING in this file's tests launches an
     /// application: the AppKit call is exercised by the ignored end-to-end guard
     /// in `tests/handoff_launchd_job.rs`, which owns a real bundle.
-    fn scratch_bundle(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-launch-successor-{}-{name}",
-            std::process::id()
-        ));
-        let bundle = root.join("Successor.app");
-        let _ = std::fs::remove_dir_all(&root);
+    ///
+    /// The bundle lives as long as the returned guard: keep it bound for the
+    /// test's whole body.
+    fn scratch_bundle(name: &str) -> (aterm_tempfile::TempDir, PathBuf) {
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-launch-successor-{name}-"))
+            .tempdir()
+            .expect("create the scratch root");
+        let bundle = root.path().join("Successor.app");
         std::fs::create_dir_all(&bundle).expect("create the scratch bundle directory");
-        bundle
+        (root, bundle)
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
@@ -1057,7 +1251,7 @@ mod tests {
     /// does not need to do, because the environment merges.
     #[test]
     fn a_well_formed_request_carries_exactly_the_keys_it_was_given() {
-        let bundle = scratch_bundle("well-formed");
+        let (_root, bundle) = scratch_bundle("well-formed");
         let request = validate_request(
             &bundle,
             &[OsString::from("--headless"), OsString::from("-e")],
@@ -1085,7 +1279,7 @@ mod tests {
 
     #[test]
     fn an_environment_key_that_no_shell_could_carry_is_refused() {
-        let bundle = scratch_bundle("bad-keys");
+        let (_root, bundle) = scratch_bundle("bad-keys");
         for (pairs, expected) in [
             (
                 env(&[("", "value")]),
@@ -1119,7 +1313,7 @@ mod tests {
     /// falling back.
     #[test]
     fn a_nul_inside_an_environment_value_is_refused() {
-        let bundle = scratch_bundle("nul-value");
+        let (_root, bundle) = scratch_bundle("nul-value");
         assert_eq!(
             validate_request(&bundle, &[], &env(&[("ATERM_SEAMLESS_NONCE", "ab\0cd")])),
             Err(LaunchError::EnvValue {
@@ -1134,7 +1328,7 @@ mod tests {
     /// handoff depend on the order the caller happened to build its vector in.
     #[test]
     fn a_repeated_environment_key_is_refused_rather_than_silently_collapsed() {
-        let bundle = scratch_bundle("duplicate-key");
+        let (_root, bundle) = scratch_bundle("duplicate-key");
         assert_eq!(
             validate_request(
                 &bundle,
@@ -1156,7 +1350,7 @@ mod tests {
     fn text_that_is_not_utf8_is_refused_wherever_it_appears() {
         use std::os::unix::ffi::OsStringExt;
 
-        let bundle = scratch_bundle("not-utf8");
+        let (_root, bundle) = scratch_bundle("not-utf8");
         let invalid = || OsString::from_vec(vec![0x61, 0xff, 0x62]);
 
         assert_eq!(
@@ -1201,7 +1395,7 @@ mod tests {
         use super::launch_app_bundle;
         use std::time::Duration;
 
-        let bundle = scratch_bundle("unsupported");
+        let (_root, bundle) = scratch_bundle("unsupported");
         assert_eq!(
             launch_app_bundle(&bundle, &[], &[], Duration::from_millis(10)),
             Err(LaunchError::Unsupported),
@@ -1224,8 +1418,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     mod macos {
         use super::super::{
-            CONDVAR_PARKS, LaunchError, LaunchWatch, LaunchedSuccessor, admit_launched_pid,
-            remaining_budget,
+            CONDVAR_PARKS, LaunchError, LaunchWatch, LaunchedSuccessor, admit_launch_answer,
+            admit_launched_pid, launch_answer_proves_exit, remaining_budget,
         };
         use std::cell::Cell;
         use std::time::{Duration, Instant};
@@ -1272,7 +1466,8 @@ mod tests {
         /// poll measured only whether the scheduler paused this thread, and it
         /// passed a zero budget that parked on the condvar for anything under
         /// 50 ms. The park count separates a poll from a park of any length;
-        /// the loose wall bound is kept only for a sleep of some other form.
+        /// the wall bound is only a hang detector (a minute), for a zero budget
+        /// read as "no budget" that waits on in some other form forever.
         #[test]
         fn a_zero_budget_wait_is_a_poll_that_never_sleeps() {
             let parks = CONDVAR_PARKS.with(Cell::get);
@@ -1287,8 +1482,8 @@ mod tests {
                 "a zero budget parked on the condvar instead of polling"
             );
             assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "{:?}",
+                started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+                "a zero budget waited on (a hang detector): {:?}",
                 started.elapsed()
             );
             assert_eq!(
@@ -1338,9 +1533,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 slot.deliver(admit_launched_pid(4321, 4322));
             });
-            // A generous budget: the assertion is that the ANSWER ends the wait,
-            // so a slow machine must not be able to turn this into a timeout.
-            let answer = watch.wait(Duration::from_secs(10));
+            // A hang detector, never a latency budget: the assertion is that the
+            // ANSWER ends the wait, so a slow machine must not be able to turn
+            // this into a timeout.
+            let answer = watch.wait(aterm_spec::wait::MUST_HAPPEN);
             completion.join().expect("the completion thread finishes");
             assert_eq!(answer.map(LaunchedSuccessor::pid), Ok(4321));
         }
@@ -1381,6 +1577,73 @@ mod tests {
             assert_eq!(
                 admit_launched_pid(901, 900).map(LaunchedSuccessor::pid),
                 Ok(901),
+            );
+        }
+
+        /// The measured death answer — an application LaunchServices already
+        /// reports terminated, with no pid — is the one answer that reads as
+        /// death; every other shape reads as it did before `isTerminated` was
+        /// consulted.
+        #[test]
+        fn only_a_terminated_application_with_no_pid_reads_as_death() {
+            assert_eq!(
+                admit_launch_answer(-1, true, 900),
+                Err(LaunchError::ExitedBeforeCheckIn)
+            );
+            assert_eq!(
+                admit_launch_answer(-1, false, 900),
+                Err(LaunchError::PidUnknown(-1)),
+                "an unknown pid on a live application is not death"
+            );
+            assert_eq!(
+                admit_launch_answer(901, true, 900).map(LaunchedSuccessor::pid),
+                Ok(901),
+                "a known pid is admitted as before; the corroboration compares it"
+            );
+            assert_eq!(
+                admit_launch_answer(900, false, 900),
+                Err(LaunchError::SubstitutedRunningInstance(900))
+            );
+            assert!(launch_answer_proves_exit(Some(&Err(
+                LaunchError::ExitedBeforeCheckIn
+            ))));
+            for alive in [
+                None,
+                Some(admit_launch_answer(901, false, 900)),
+                Some(admit_launch_answer(901, true, 900)),
+                Some(Err(LaunchError::PidUnknown(-1))),
+                Some(Err(LaunchError::NoApplication)),
+                Some(Err(LaunchError::Timeout(Duration::ZERO))),
+                Some(Err(LaunchError::Rejected {
+                    domain: "NSCocoaErrorDomain".to_string(),
+                    code: 256,
+                    message: "a miscellaneous error occurred".to_string(),
+                })),
+            ] {
+                assert!(!launch_answer_proves_exit(alive.as_ref()), "{alive:?}");
+            }
+        }
+
+        /// The pre-dial poll is a PEEK: the answer it reads is still there for
+        /// the one `wait` that consumes it, the corroboration after a dial.
+        #[test]
+        fn the_exit_peek_leaves_the_answer_for_the_corroboration() {
+            let in_flight = crate::app_launch_successor::LaunchInFlight::scripted(None);
+            assert!(!in_flight.exited_before_check_in(), "no answer is no death");
+            in_flight.answer_for_test(Err(LaunchError::ExitedBeforeCheckIn));
+            for _ in 0..3 {
+                assert!(in_flight.exited_before_check_in());
+            }
+            assert_eq!(
+                in_flight.wait(Duration::ZERO),
+                Err(LaunchError::ExitedBeforeCheckIn),
+                "the peeks took nothing"
+            );
+            let live = crate::app_launch_successor::LaunchInFlight::scripted(Some(4321));
+            assert!(!live.exited_before_check_in());
+            assert_eq!(
+                live.wait(Duration::ZERO).map(LaunchedSuccessor::pid),
+                Ok(4321)
             );
         }
     }

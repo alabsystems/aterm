@@ -2,11 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Scrollback tests — tiered storage, attach/detach, content preservation.
-//!
-//! Migrated from aterm-core as part of #6556 Batch 2.
+//! Scrollback tests: tiered storage, attach/detach, content preservation.
 
 use super::super::*;
+use crate::grid::test_support::feed_numbered_lines;
 
 #[test]
 fn grid_scroll_display() {
@@ -90,11 +89,9 @@ fn grid_with_tiered_scrollback() {
     assert!(grid.scrollback_lines() > grid.storage.ring_buffer_scrollback());
 }
 
-/// A store that arrives PRE-FILLED (a restored checkpoint's history) numbers
-/// its carried lines from `0` and the live top past them — the identity
-/// `oldest_absolute_row()` documents. The counter used to start at `rows`
-/// whatever the store held, so the oldest row saturated onto the live top and
-/// every carried line read as evicted.
+/// A pre-filled store (a restored checkpoint's history) numbers its carried
+/// lines from `0` and the live top past them, as `oldest_absolute_row()`
+/// documents.
 #[test]
 fn a_prefilled_tiered_store_is_numbered_below_the_live_top() {
     let mut scrollback = Scrollback::new(100, 1000, 10_000_000);
@@ -210,9 +207,8 @@ fn grid_scrollback_wrapped_lines() {
 
 #[test]
 fn ring_buffer_scrollback_preserves_hyperlinks() {
-    // Regression test for #4149: hyperlinks are preserved when rows scroll from
-    // the visible area into ring buffer scrollback (max_scrollback > 0).
-    // Before the fix, row_to_line_static used empty CellExtras, losing hyperlinks.
+    // Hyperlinks survive rows scrolling from the screen into the ring
+    // scrollback (max_scrollback > 0).
     use std::sync::Arc;
 
     let mut grid = Grid::with_scrollback(4, 10, 10);
@@ -250,10 +246,8 @@ fn ring_buffer_scrollback_preserves_hyperlinks() {
     assert_eq!(&*spans[0].url, "https://example.com");
 }
 
-/// Verify invariant: ring_extras.len() == ring_buffer_scrollback() after
-/// scroll_up, across both growth phase (under capacity) and reuse phase (at
-/// capacity). This invariant is critical for correct extras display in
-/// ring buffer scrollback (#4149, #4215).
+/// ring_extras.len() == ring_buffer_scrollback() after scroll_up, both while
+/// the ring grows and once it reuses slots.
 #[test]
 fn ring_extras_len_equals_ring_buffer_scrollback() {
     // Grid with 4 visible rows and max_scrollback=6.
@@ -296,7 +290,7 @@ fn ring_extras_len_equals_ring_buffer_scrollback() {
 }
 
 /// Verify that complex chars, RGB colors, and combining marks survive
-/// scrollback transit through the ring buffer (#4215).
+/// scrollback transit through the ring buffer.
 #[test]
 fn scrollback_preserves_complex_chars_rgb_and_combining() {
     use std::sync::Arc;
@@ -539,14 +533,8 @@ fn scroll_up_n_exceeds_capacity() {
     }
 }
 
-/// Regression test for #7783: extras (hyperlinks, RGB colors) on visible rows
-/// must be preserved when those rows are pushed to scrollback during terminal
-/// height decrease.
-///
-/// Before the fix, `adjust_row_count` used `u16::MAX` as `row_idx` for
-/// `extract_row_extras`, causing HashMap-keyed extras (hyperlinks, combining
-/// marks) to be orphaned because `CellCoord::new(u16::MAX, col)` never matches
-/// any entry stored at the actual visible row index.
+/// Extras (hyperlinks, RGB colours) on visible rows survive being pushed to
+/// scrollback by a height decrease: they are extracted by their real row index.
 #[test]
 fn height_decrease_preserves_extras_on_pushed_rows() {
     use std::sync::Arc;
@@ -556,11 +544,8 @@ fn height_decrease_preserves_extras_on_pushed_rows() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(6, 10, 2, scrollback);
 
-    // Write "Hello" on row 0 with a hyperlink on columns 0-4, cursor at the
-    // bottom. The shrink anchors at the cursor (audit-2 item 1), so the TOP
-    // rows — the linked one included — are what transit into scrollback now;
-    // the #7783 keying rule this test exists for (extras extracted by their
-    // REAL visible row index, never u16::MAX) guards that transit the same.
+    // "Hello" hyperlinked on row 0, cursor at the bottom. The shrink anchors at
+    // the cursor, so the top rows (the linked one included) go to scrollback.
     let url: Arc<str> = Arc::from("https://example.com/7783");
     grid.set_cursor(0, 0);
     for c in "Hello".chars() {
@@ -615,23 +600,9 @@ fn height_decrease_preserves_extras_on_pushed_rows() {
     grid.assert_invariants();
 }
 
-// =========================================================================
-// Ring-only retention limit — set_scrollback_line_limit WITHOUT a tiered
-// store (the wasm engines' configuration). The ring IS retention there, so
-// the limit must re-cap the ring: lazy growth, immediate oldest-first
-// eviction on shrink, `None` = unlimited.
-// =========================================================================
-
-/// Write `n` numbered lines `L{start}..L{start+n-1}` (CR + text + LF each).
-fn write_numbered_lines(grid: &mut Grid, start: usize, n: usize) {
-    for i in start..start + n {
-        grid.carriage_return();
-        for c in format!("L{i}").chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-    }
-}
+// Ring-only retention limit: set_scrollback_line_limit without a tiered store
+// (the wasm engines' configuration). The ring is the retention there: lazy
+// growth, immediate oldest-first eviction on shrink, `None` = unlimited.
 
 fn history_text(grid: &Grid, idx: usize) -> String {
     grid.get_history_line(idx)
@@ -642,7 +613,7 @@ fn history_text(grid: &Grid, idx: usize) -> String {
 #[test]
 fn ring_only_limit_shrink_evicts_oldest_immediately() {
     let mut grid = Grid::with_scrollback(5, 20, 10_000);
-    write_numbered_lines(&mut grid, 0, 300);
+    feed_numbered_lines(&mut grid, 0, 300);
     let sb_before = grid.scrollback_lines();
     assert!(sb_before > 100, "precondition: deep ring history");
     let newest_before = history_text(&grid, sb_before - 1);
@@ -671,7 +642,7 @@ fn ring_only_limit_shrink_evicts_oldest_immediately() {
     grid.assert_invariants();
 
     // The new cap also governs future retention.
-    write_numbered_lines(&mut grid, 300, 50);
+    feed_numbered_lines(&mut grid, 300, 50);
     assert_eq!(grid.scrollback_lines(), 100);
     grid.assert_invariants();
 }
@@ -679,7 +650,7 @@ fn ring_only_limit_shrink_evicts_oldest_immediately() {
 #[test]
 fn ring_only_limit_grow_extends_retention_lazily() {
     let mut grid = Grid::with_scrollback(3, 20, 50);
-    write_numbered_lines(&mut grid, 0, 100);
+    feed_numbered_lines(&mut grid, 0, 100);
     assert_eq!(grid.scrollback_lines(), 50, "precondition: at the old cap");
 
     grid.set_scrollback_line_limit(Some(120));
@@ -691,7 +662,7 @@ fn ring_only_limit_grow_extends_retention_lazily() {
         "raising the limit allocates nothing up front"
     );
 
-    write_numbered_lines(&mut grid, 100, 200);
+    feed_numbered_lines(&mut grid, 100, 200);
     assert_eq!(
         grid.scrollback_lines(),
         120,
@@ -707,7 +678,7 @@ fn ring_only_limit_grow_extends_retention_lazily() {
 fn ring_only_limit_none_is_unlimited() {
     let mut grid = Grid::with_scrollback(3, 20, 10);
     grid.set_scrollback_line_limit(None);
-    write_numbered_lines(&mut grid, 0, 500);
+    feed_numbered_lines(&mut grid, 0, 500);
     assert_eq!(
         grid.scrollback_lines(),
         498,
@@ -720,7 +691,7 @@ fn ring_only_limit_none_is_unlimited() {
 #[test]
 fn ring_only_limit_shrink_clamps_scrolled_back_viewport() {
     let mut grid = Grid::with_scrollback(5, 20, 10_000);
-    write_numbered_lines(&mut grid, 0, 300);
+    feed_numbered_lines(&mut grid, 0, 300);
     grid.scroll_display(200);
     assert_eq!(grid.display_offset(), 200);
 
@@ -747,16 +718,14 @@ fn ring_only_limit_reflects_in_the_getter() {
     assert_eq!(grid.scrollback_line_limit(), None);
 }
 
-/// Retention shrink IS a content change: evicting lines removes them from the
-/// indexed/addressable set, so `content_gen` must bump exactly like a write —
-/// on BOTH arms (the ring-only eviction and the tiered store truncation; the
-/// tiered arm was the introspection-harness stale-search finding). A re-apply
-/// that evicts nothing must NOT bump (no cache thrash on config re-applies).
+/// A retention shrink that evicts lines bumps `content_gen` like a write, on
+/// both the ring-only and the tiered arm; a re-apply that evicts nothing does
+/// not bump.
 #[test]
 fn retention_shrink_bumps_content_gen_only_when_lines_evict() {
     // Ring-only arm.
     let mut grid = Grid::with_scrollback(5, 20, 10_000);
-    write_numbered_lines(&mut grid, 0, 300);
+    feed_numbered_lines(&mut grid, 0, 300);
     let g0 = grid.content_gen();
     grid.set_scrollback_line_limit(Some(100));
     assert!(
@@ -774,7 +743,7 @@ fn retention_shrink_bumps_content_gen_only_when_lines_evict() {
     // Tiered arm (store truncation).
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(5, 20, 8, scrollback);
-    write_numbered_lines(&mut grid, 0, 300);
+    feed_numbered_lines(&mut grid, 0, 300);
     let sb_before = grid.scrollback_lines();
     let g0 = grid.content_gen();
     grid.set_scrollback_line_limit(Some(50));
@@ -796,18 +765,14 @@ fn retention_shrink_bumps_content_gen_only_when_lines_evict() {
     grid.assert_invariants();
 }
 
-// =========================================================================
-// Unified TOTAL retention limit on tiered grids (audit E1, Codex-required):
-// `set_scrollback_line_limit(L)` caps ring + lazy + store TOGETHER. The old
-// contract ("the limit lands on the store, the ring rides on top") silently
-// retained L + ring-cap lines; these tests pin the ONE-total replacement.
-// =========================================================================
+// Total retention limit on tiered grids: `set_scrollback_line_limit(L)` caps
+// ring + lazy + store together.
 
 #[test]
 fn tiered_limit_is_one_total_across_ring_and_store() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
-    write_numbered_lines(&mut grid, 0, 100);
+    feed_numbered_lines(&mut grid, 0, 100);
     let ring_sb = grid.storage.ring_buffer_scrollback();
     assert!(ring_sb > 0, "precondition: the hot ring holds history");
 
@@ -836,7 +801,7 @@ fn tiered_limit_is_one_total_across_ring_and_store() {
     );
 
     // The total keeps governing future retention at steady state.
-    write_numbered_lines(&mut grid, 100, 50);
+    feed_numbered_lines(&mut grid, 100, 50);
     let _ = grid.scrollback_mut(); // quiescent point: drain staged lazy lines
     assert_eq!(
         grid.scrollback_lines(),
@@ -855,7 +820,7 @@ fn tiered_limit_is_one_total_across_ring_and_store() {
 fn tiered_limit_below_ring_cap_recaps_the_ring() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
-    write_numbered_lines(&mut grid, 0, 100);
+    feed_numbered_lines(&mut grid, 0, 100);
     assert!(grid.storage.ring_buffer_scrollback() > 5);
 
     grid.set_scrollback_line_limit(Some(5));
@@ -882,7 +847,7 @@ fn tiered_limit_below_ring_cap_recaps_the_ring() {
     // construction decision and does not grow back.
     grid.set_scrollback_line_limit(Some(30));
     assert_eq!(grid.scrollback_line_limit(), Some(30));
-    write_numbered_lines(&mut grid, 100, 60);
+    feed_numbered_lines(&mut grid, 100, 60);
     let _ = grid.scrollback_mut();
     assert_eq!(grid.scrollback_lines(), 30, "raised total governs");
     assert!(
@@ -897,16 +862,15 @@ fn tiered_limit_equal_to_ring_cap_discards_evictions_without_store_churn() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
     grid.set_scrollback_line_limit(Some(8)); // total == ring cap → store share 0
-    write_numbered_lines(&mut grid, 0, 100);
+    feed_numbered_lines(&mut grid, 0, 100);
 
     assert_eq!(
         grid.scrollback_lines(),
         8,
         "total == ring cap: the ring is the whole retention"
     );
-    // Evicted ring rows are discarded directly (stages_evicted_rows): a
-    // per-line materialize+push+truncate cycle through a zero-share store
-    // would tax the PTY-drain hot path for nothing.
+    // Evicted ring rows are discarded directly (stages_evicted_rows), not
+    // materialized and pushed through a zero-share store.
     assert_eq!(
         grid.storage.lazy_buffer_lines() + grid.tiered_scrollback_lines(),
         0,
@@ -916,32 +880,28 @@ fn tiered_limit_equal_to_ring_cap_discards_evictions_without_store_churn() {
     grid.assert_invariants();
 }
 
-// =========================================================================
-// Truncation accounting: retention loss the user did not ask for is COUNTED
-// (out of band, for `metrics`/`lines`) AND marked in band by one row at the
-// cut naming the same count (2026-09-22: the count alone reached no surface,
-// and a 91k-line hole went unnoticed).
-// =========================================================================
+// Truncation accounting: retention loss the user did not ask for is counted
+// (for `metrics`/`lines`) and marked in band by one row at the cut naming the
+// same count.
 
 #[test]
 fn flood_backpressure_drops_are_counted_and_marked() {
-    // A 2 MiB memory budget holds fewer staged `L<n>` rows (each weighed at
-    // its few occupied cells plus the deferred-line header) than the 20k
-    // floor, so the staging cap IS the floor; the store's 100k line limit is
-    // far away, so every drop is a real loss.
+    // A 2 MiB budget holds fewer staged `L<n>` rows than the 20k floor, so the
+    // staging cap is the floor; the 100k store limit is far away, so every drop
+    // is a real loss.
     let scrollback = Scrollback::new(100, 1000, 2 * 1024 * 1024);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
     // A compress worker owns the drain but never runs (the starved-worker
     // flood): staged lines accumulate to the staging cap, then the oldest drop.
     grid.set_compress_offload_active(true);
     let over = 500;
-    write_numbered_lines(&mut grid, 0, Grid::ASYNC_COMPRESS_BACKPRESSURE + over + 8);
+    feed_numbered_lines(&mut grid, 0, Grid::ASYNC_COMPRESS_BACKPRESSURE + over + 8);
     let counted = grid.truncated_lines();
     assert!(
         counted > 0,
         "backpressure drops must register in the loss counter"
     );
-    // The oldest retained row is the marker, and it names EXACTLY the counter;
+    // The oldest retained row is the marker, and it names exactly the counter;
     // the first content row after it is the first line that survived.
     let oldest = history_text(&grid, 0);
     let marked: u64 = oldest
@@ -956,7 +916,7 @@ fn flood_backpressure_drops_are_counted_and_marked() {
         "lines L0..L{} were dropped and nothing else",
         counted - 1
     );
-    // A user-requested shrink is NOT loss: the counter must not move.
+    // A user-requested shrink is not loss: the counter must not move.
     grid.set_scrollback_line_limit(Some(5));
     assert_eq!(
         grid.truncated_lines(),
@@ -971,7 +931,7 @@ fn ring_watermark_reports_pressure_only_when_configured() {
     use aterm_scrollback::WatermarkLevel;
     let mut grid = Grid::with_scrollback(3, 20, 50_000);
     grid.set_scrollback_line_limit(None); // ring-only "unlimited" mode
-    write_numbered_lines(&mut grid, 0, 2_000);
+    feed_numbered_lines(&mut grid, 0, 2_000);
     assert_eq!(
         grid.ring_watermark_level(),
         WatermarkLevel::Green,
@@ -996,17 +956,14 @@ fn ring_watermark_reports_pressure_only_when_configured() {
     );
 }
 
-/// Staged lazy-buffer bytes count toward `memory_used` — and hence toward the
-/// ring byte watermark (Wave-3 adversarial review): under flood backpressure
-/// the deferred scroll-off lines are real memory the store has not absorbed
-/// yet. Pins the inclusion exactly: clearing the staged lines (capacity
-/// retained) removes exactly their per-line heap from the estimate.
+/// Staged lazy-buffer bytes count toward `memory_used` (and so the ring byte
+/// watermark): clearing the staged lines removes exactly their per-line heap.
 #[test]
 fn staged_lazy_buffer_bytes_count_toward_memory_used() {
     let scrollback = Scrollback::new(100, 10_000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
     // Stage well below the drain threshold so the deferred lines stay parked.
-    write_numbered_lines(&mut grid, 0, 500);
+    feed_numbered_lines(&mut grid, 0, 500);
     assert!(
         grid.storage.lazy_buffer.len() >= 400,
         "precondition: scroll-off lines are STAGED, not yet drained"
@@ -1043,7 +1000,7 @@ fn tiered_limit_none_is_unlimited_total() {
         None,
         "None = unlimited total (store unlimited, ring stays its fixed cap)"
     );
-    write_numbered_lines(&mut grid, 0, 100);
+    feed_numbered_lines(&mut grid, 0, 100);
     let _ = grid.scrollback_mut();
     assert_eq!(
         grid.scrollback_lines(),
@@ -1053,14 +1010,10 @@ fn tiered_limit_none_is_unlimited_total() {
     grid.assert_invariants();
 }
 
-// ---------------------------------------------------------------------------
-// DENSE HISTORY WALK (`Grid::history_lines_from`) — conformance against the
-// per-line oracle `get_history_line`, across all three history sources
-// (tiered store, lazy buffer, ring), at every start, with and without a
-// corrupt tiered segment. Product readers key line `k` of the walk as
-// absolute row `oldest + start + k`, so item-for-item equality with the
-// oracle IS the absolute-coordinate guarantee.
-// ---------------------------------------------------------------------------
+// Dense history walk (`Grid::history_lines_from`) against the per-line oracle
+// `get_history_line`, across tiered store, lazy buffer and ring, at every
+// start, with and without a corrupt tiered segment. Item-for-item equality is
+// the absolute-coordinate guarantee (line `k` is row `oldest + start + k`).
 
 /// A grid whose history spans every source: a pre-filled tiered store (cold +
 /// warm + hot, optionally with a corrupt warm block between cold and warm),
@@ -1094,9 +1047,7 @@ fn three_source_history_grid(corrupt_lines: usize) -> Grid {
     grid
 }
 
-/// Lines compare by their full `Debug` rendering — text, attribute runs,
-/// hyperlinks, underline colours, image spans and the wrap flag (`Line` has no
-/// `PartialEq`, and its codec is test-private to its own crate).
+/// Lines compare by their `Debug` rendering (`Line` has no `PartialEq`).
 fn history_oracle(grid: &Grid, start: usize) -> Vec<Option<String>> {
     (start..grid.scrollback_lines())
         .map(|i| grid.get_history_line(i).map(|l| format!("{:?}", *l)))

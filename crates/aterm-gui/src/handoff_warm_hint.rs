@@ -1,48 +1,37 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE ADVISORY LAUNCH-TIME WARM HINT (docs/DESIGN-warm-successor-2026-09-29.md
-//! §3, phase P2).
+//! Advisory launch-time warm hint (docs/DESIGN-warm-successor-2026-09-29.md).
 //!
-//! A successor on the launched lane now runs its warm prologue — config,
-//! theme, fonts and the backend worker — BEFORE it dials (`main_entry`'s
-//! `WarmOrder::BeforeDial`), so the one carried fact that prologue used to read
-//! from the authenticated window carry, the outgoing window's FONT ZOOM, is not
-//! known yet when the backend is built. The outgoing process therefore names
-//! it in the launch environment, beside the grant capabilities, as
-//! [`ENV_WARM_HINT`]: the zoom pair the carry will hold, plus the window and
-//! session counts and window 0's grid, for the log's hit/miss line.
+//! A successor runs its warm prologue (config, theme, fonts, backend worker)
+//! before it dials (`main_entry`'s `WarmOrder::BeforeDial`), so the outgoing
+//! window's font zoom is not yet known from the authenticated carry. The
+//! outgoing process names it in the launch environment as [`ENV_WARM_HINT`]:
+//! the zoom pair, plus window and session counts and window 0's grid for the
+//! log's hit/miss line.
 //!
-//! ADVISORY, NEVER AUTHENTICATED. The hint is a guess about a capture that has
-//! not happened yet (the automatic lane can hold a dialled successor up to its
-//! park cap before it captures), written by a process that is not yet proven
-//! to be anything. So:
+//! The hint is advisory and never authenticated:
 //!
-//! * it decides only WHICH px the backend worker builds and pre-warms at;
-//! * the authenticated manifest wins at the intake: the launch font is derived
-//!   from the carry exactly as before (`app_config::successor_font_px`), and a
-//!   build px that differs is re-selected at the backend join
-//!   (`App::warm_miss_px`, the light `activate_px` switch every zoom uses) —
-//!   a stale or hostile hint costs a warm miss and says so in the log, nothing
-//!   else;
-//! * it lives in its own type, disjoint from `seamless::IncomingHandoff`, and
-//!   no digest, proof or admission ever reads it (`HintNotInProof` in
-//!   `NativeUpdateSuccessorWarmBeforeClaim`; the Tier-1 in
-//!   `seamless::handoff_env_conformance` proves the adoption proof is the
-//!   parent's expectation with a stale and a hostile hint present).
+//! * it decides only which px the backend worker builds and pre-warms at;
+//! * the authenticated manifest wins at intake: the launch font is derived from
+//!   the carry (`app_config::successor_font_px`), and a differing build px is
+//!   re-selected at the backend join (`App::warm_miss_px`), so a stale or
+//!   hostile hint costs a logged warm miss and nothing else;
+//! * it is its own type, disjoint from `seamless::IncomingHandoff`, and no
+//!   digest, proof or admission reads it (`HintNotInProof` in
+//!   `NativeUpdateSuccessorWarmBeforeClaim`; `seamless::handoff_env_conformance`
+//!   checks the adoption proof with a stale and a hostile hint present).
 //!
-//! REVERSIBLE. Absent (an older parent, or the fork lane), the successor warms
-//! at its config's size — today's behaviour for every unzoomed window — and
-//! `main_entry`'s `warm_order` is the one switch that puts the prologue back
-//! after the intake.
+//! Without a hint (the fork lane) the successor warms at its config's size;
+//! `main_entry`'s `warm_order` is the one switch that moves the prologue back
+//! after intake.
 
 /// The launch-environment name. Captured (read and cleared) with every other
 /// handoff name by `HandoffEnv::capture`; read only from that snapshot.
 pub(crate) const ENV_WARM_HINT: &str = "ATERM_HANDOFF_WARM_HINT";
 
-/// The only wire version this build writes or reads. A different one is
-/// ignored whole: a newer parent's hint is a guess this build cannot read,
-/// and ignoring a guess is always safe.
+/// The only wire version written or read; any other is ignored whole, which is
+/// always safe for a guess.
 const VERSION: &str = "w1";
 
 /// Longest value read. The encoded hint is under 80 bytes; anything longer is

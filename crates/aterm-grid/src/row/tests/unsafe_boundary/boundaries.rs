@@ -5,9 +5,7 @@
 use super::*;
 use crate::{CellFlags, PackedColor};
 
-// ========================================================================
 // write_char_styled boundary tests
-// ========================================================================
 
 #[test]
 fn write_char_styled_first_col() {
@@ -53,9 +51,7 @@ fn write_char_styled_single_col_row() {
     assert!(!row.write_char_styled(1, 'B', fg, bg, CellFlags::empty()));
 }
 
-// ========================================================================
 // write_wide_char boundary tests
-// ========================================================================
 
 #[test]
 fn write_wide_char_first_col() {

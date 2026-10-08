@@ -120,20 +120,30 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
         let result = match self.node {
             Node::Missing => return self.mismatch("a value"),
             Node::Table(t) => visitor.visit_map(TableAccess::new(self.source, t.items.iter())),
-            Node::ArrayOfTables(a) => visitor.visit_seq(TableSeqAccess {
-                source: self.source,
-                tables: a.values.iter(),
-            }),
+            Node::ArrayOfTables(a) => {
+                let mut seq = TableSeqAccess {
+                    source: self.source,
+                    tables: a.values.iter(),
+                };
+                visitor
+                    .visit_seq(&mut seq)
+                    .and_then(|out| drained(seq.tables.len(), a.values.len()).map(|()| out))
+            }
             Node::Value(value) => match value {
                 EValue::String(v) => visitor.visit_str(v.value()),
                 EValue::Integer(v) => visitor.visit_i64(*v.value()),
                 EValue::Float(v) => visitor.visit_f64(*v.value()),
                 EValue::Boolean(v) => visitor.visit_bool(*v.value()),
                 EValue::Datetime(v) => visitor.visit_map(DatetimeAccess::new(v.value())),
-                EValue::Array(a) => visitor.visit_seq(ValueSeqAccess {
-                    source: self.source,
-                    values: a.iter(),
-                }),
+                EValue::Array(a) => {
+                    let mut seq = ValueSeqAccess {
+                        source: self.source,
+                        values: a.values.iter(),
+                    };
+                    visitor
+                        .visit_seq(&mut seq)
+                        .and_then(|out| drained(seq.values.len(), a.values.len()).map(|()| out))
+                }
                 EValue::InlineTable(t) => {
                     visitor.visit_map(TableAccess::new(self.source, t.items.iter()))
                 }
@@ -221,7 +231,9 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
 struct TableAccess<'a, I> {
     source: Option<&'a str>,
     entries: I,
-    pending: Option<&'a Item>,
+    /// The entry whose key was just handed out, held for `next_value_seed`.
+    /// The key rides along because the value may have no span of its own.
+    pending: Option<(&'a Key, &'a Item)>,
 }
 
 impl<'a, I> TableAccess<'a, I> {
@@ -241,7 +253,7 @@ impl<'de, 'a, I: Iterator<Item = (&'a Key, &'a Item)>> MapAccess<'de> for TableA
         let Some((key, item)) = self.entries.next() else {
             return Ok(None);
         };
-        self.pending = Some(item);
+        self.pending = Some((key, item));
         seed.deserialize(KeyDeserializer {
             source: self.source,
             key,
@@ -250,13 +262,47 @@ impl<'de, 'a, I: Iterator<Item = (&'a Key, &'a Item)>> MapAccess<'de> for TableA
         .map_err(|e| e.with_span(self.source, key.span()))
     }
 
+    /// An error with no span of its own is located on the value, and failing
+    /// that on the KEY. A table made by a dotted key or implied by a deeper
+    /// header, and an array of tables, have no span, so without the key a
+    /// `missing field` in `net.listen = "x"` or a too-long `[[rows]]` came
+    /// back unlocated and the config editor underlined line 1.
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
-        let item = self
+        let (key, item) = self
             .pending
             .take()
             .expect("serde asks for a value only after a key");
         seed.deserialize(Deserializer::item(self.source, item))
-            .map_err(|e| e.with_span(self.source, item.span()))
+            .map_err(|e| e.with_span(self.source, item.span().or_else(|| key.span())))
+    }
+}
+
+/// A sequence the visitor stopped reading early is an ERROR, not a truncation.
+///
+/// serde's array and tuple visitors take their N elements and return; whether
+/// anything was left is the deserializer's to say, and serde's own
+/// `SeqDeserializer::end` says it this way. Without the check, `[1, 2, 3]` read
+/// into a `[u32; 2]` as `[1, 2]`, the third value gone without a word. A
+/// visitor that drains (`Vec`, `Value`) always leaves `0`.
+fn drained(left: usize, total: usize) -> Result<()> {
+    if left == 0 {
+        return Ok(());
+    }
+    Err(serde::de::Error::invalid_length(
+        total,
+        &ElementCount(total.saturating_sub(left)),
+    ))
+}
+
+/// How many elements the visitor took, for the `invalid length` message.
+struct ElementCount(usize);
+
+impl serde::de::Expected for ElementCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            1 => f.write_str("1 element"),
+            n => write!(f, "{n} elements"),
+        }
     }
 }
 
@@ -458,14 +504,19 @@ impl<'de, 'a> EnumAccess<'de> for TableVariant<'a> {
     type Error = Error;
     type Variant = VariantValue<'a>;
 
+    /// An unknown variant is a fault in the KEY that names it, so the error is
+    /// located there: `background_material.glass = {}` points at `glass`.
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
-        let name = seed.deserialize(StrDeserializer {
-            text: self.key.get(),
-        })?;
+        let name = seed
+            .deserialize(StrDeserializer {
+                text: self.key.get(),
+            })
+            .map_err(|e| e.with_span(self.source, self.key.span()))?;
         Ok((
             name,
             VariantValue {
                 source: self.source,
+                key: self.key,
                 item: self.item,
             },
         ))
@@ -474,22 +525,52 @@ impl<'de, 'a> EnumAccess<'de> for TableVariant<'a> {
 
 struct VariantValue<'a> {
     source: Option<&'a str>,
+    key: &'a Key,
     item: &'a Item,
+}
+
+impl VariantValue<'_> {
+    /// Where an error in the variant's body points: the body, or, when it has
+    /// no span (a dotted or implied table), the variant's key — the same
+    /// fallback a table entry takes.
+    fn span(&self) -> Option<Range<usize>> {
+        self.item.span().or_else(|| self.key.span())
+    }
 }
 
 impl<'de> VariantAccess<'de> for VariantValue<'_> {
     type Error = Error;
 
+    /// The table spelling of a unit variant (`{ bar = {} }`) must carry
+    /// NOTHING. Anything else under the key is a value with nowhere to go, and
+    /// reading `{ bar = 99 }` as plain `bar` dropped it silently — the retired
+    /// `toml` refused it, and so does this.
     fn unit_variant(self) -> Result<()> {
-        Ok(())
+        let empty = match self.item {
+            Item::Table(t) => t.items.len() == 0,
+            Item::Value(EValue::InlineTable(t)) => t.items.len() == 0,
+            Item::Value(EValue::Array(a)) => a.values.is_empty(),
+            Item::None | Item::Value(_) | Item::ArrayOfTables(_) => false,
+        };
+        if empty {
+            return Ok(());
+        }
+        Err(Error::message(format!(
+            "`{}` is a unit variant: expected an empty table, found {}",
+            self.key.get(),
+            self.item.type_name()
+        ))
+        .with_span(self.source, self.span()))
     }
 
     fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value> {
         seed.deserialize(Deserializer::item(self.source, self.item))
+            .map_err(|e| e.with_span(self.source, self.span()))
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value> {
         serde::Deserializer::deserialize_any(Deserializer::item(self.source, self.item), visitor)
+            .map_err(|e| e.with_span(self.source, self.span()))
     }
 
     fn struct_variant<V: Visitor<'de>>(
@@ -498,6 +579,7 @@ impl<'de> VariantAccess<'de> for VariantValue<'_> {
         visitor: V,
     ) -> Result<V::Value> {
         serde::Deserializer::deserialize_any(Deserializer::item(self.source, self.item), visitor)
+            .map_err(|e| e.with_span(self.source, self.span()))
     }
 }
 

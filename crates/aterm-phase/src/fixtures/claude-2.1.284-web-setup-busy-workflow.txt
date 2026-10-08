@@ -1,0 +1,12 @@
+# claude-code 2.1.284 · HAND-BUILT 2026-09-28 (no live capture yet): the web-setup offer, rows from the render code (kde) and the store binary's literals; the framing rows are the real captures' (wait_bg6.out)
+⏺ Second-pass reviewers are out and the build is running. Nothing else can start until one of those returns.
+✻ Waiting for 1 dynamic workflow to finish
+
+
+⏺ Pushed to GitHub. Connect GitHub to claude.ai so you can work on this repo even when this machine is offline?
+  1: Yes, run /web-setup   2: Not now   3: Don't ask again
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active

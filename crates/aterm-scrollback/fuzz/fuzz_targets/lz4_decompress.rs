@@ -68,17 +68,17 @@ fuzz_target!(|data: &[u8]| {
     //
     // Craft a 4-byte size prefix claiming a huge decompressed size followed
     // by the fuzzer payload as the "block". The decompressor must reject
-    // sizes above the 16 MiB safety cap without allocating.
+    // sizes above the 64 MiB page cap without allocating.
     // -----------------------------------------------------------------------
     if data.len() >= 4 {
-        // Inject an oversized size prefix (17 MiB) before the rest of the data.
-        let bomb_size: u32 = 17 * 1024 * 1024;
+        // Inject an oversized size prefix (65 MiB) before the rest of the data.
+        let bomb_size: u32 = 65 * 1024 * 1024;
         let mut bomb_input = bomb_size.to_le_bytes().to_vec();
         bomb_input.extend_from_slice(&data[4..]);
         let result = decompress_size_prepended(&bomb_input);
         assert!(
             result.is_err(),
-            "allocation bomb: 17 MiB size prefix must be rejected"
+            "allocation bomb: 65 MiB size prefix must be rejected"
         );
     }
 

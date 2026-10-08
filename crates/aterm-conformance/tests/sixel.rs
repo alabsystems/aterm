@@ -1,26 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Sixel graphics — behavioral locks for what the engine ACTUALLY implements.
+// Sixel graphics: behavioral locks for what the engine implements.
 //
-// HONEST SUPPORT STATEMENT (verified against source, 2026-06):
-// aterm's sixel support is DECODED and RENDERED. With the `sixel` feature on
-// (which aterm-conformance enables), the DCS dispatcher recognizes
-// `DCS Ps q <data> ST` (handler_dcs.rs), feeds the body to the `aterm-sixel`
-// decoder, and at ST routes the decoded RGBA raster into the SAME inline-image
-// placement/blit path the iTerm2 OSC 1337 `File=` protocol uses
-// (handler_osc_1337.rs `place_sixel_image` -> `place_image`). The image lands
-// in per-cell image EXTRAS (observable via `Terminal::images_row`), not in
-// glyph cells, so `screen()`/`row()` stay empty for it. DA1 advertises sixel
-// (code 4). XTSMGRAPHICS reports 1024 color registers / 4096 max geometry from
-// the decoder's exported constants.
+// With the `sixel` feature on (which aterm-conformance enables), the DCS
+// dispatcher recognizes `DCS Ps q <data> ST` (handler_dcs.rs), feeds the body
+// to the `aterm-sixel` decoder, and at ST routes the RGBA raster into the
+// inline-image placement path the iTerm2 OSC 1337 `File=` protocol uses
+// (handler_osc_1337.rs `place_sixel_image` -> `place_image`). The image lives
+// in per-cell image extras (`Terminal::images_row`), not glyph cells, so
+// `screen()`/`row()` stay empty for it. DA1 advertises sixel (code 4).
+// XTSMGRAPHICS reports 1024 color registers / 4096 max geometry from the
+// decoder's exported constants.
 //
-// What IS live, and what this file locks:
-//   * Decode + placement: a valid sixel DCS produces an inline image whose
-//     footprint, format (RawRgba8), and pixels are observable; the cursor moves
-//     per the sixel mode (scrolling: below the image; display/DECSDM: unmoved).
+// Locked here:
+//   * Decode + placement: footprint, format (RawRgba8) and pixels are
+//     observable; the cursor moves per the sixel mode (scrolling: below the
+//     image; display/DECSDM: unmoved).
 //   * Graceful consumption: payloads (truncated, garbage, huge DECGRI repeats)
-//     never leak onto the GLYPH grid, never panic, never corrupt parser state.
+//     never leak onto the glyph grid, panic, or corrupt parser state.
 //   * DECSDM (DEC private mode 80) set/reset tracking, observable via DECRQM
 //     (VT510: CSI ? Ps $ p -> CSI ? Ps ; Pm $ y), and its reset on DECSTR.
 //   * XTSMGRAPHICS (CSI ? Pi ; Pa ; Pv S), read-only: 1024 color registers and
@@ -39,7 +37,7 @@ const SIXEL_4X6: &[u8] = b"\x1bP0;0;8q\"1;1;4;6#0;2;0;0;0#1;2;100;0;0#1~~~~$-\x1
 #[test]
 fn sixel_dcs_renders_image_then_text_flows_below() {
     // A valid sixel DCS is decoded into an inline image. No payload byte
-    // ('~', '#', '"', digits...) leaks onto the GLYPH grid, and the DCS itself
+    // ('~', '#', '"', digits...) leaks onto the glyph grid, and the DCS itself
     // generates no reply. In scrolling mode (DECSDM reset, the default) the
     // image occupies row 0 and the cursor advances to the line below it, so
     // following text lands on row 1.
@@ -104,9 +102,9 @@ fn sixel_dcs_split_across_feeds_renders_identically() {
 #[test]
 fn truncated_sixel_consumes_following_text_until_escape_breaks_out() {
     // Missing ST: per the VT500 parser model the terminal stays in
-    // DCS-passthrough, so following printable text is payload, NOT display
+    // DCS-passthrough, so following printable text is payload, not display
     // text. The next ESC (here: starting CSI 6 n) terminates the string via
-    // the "anywhere" ESC transition — which is EXACTLY how a real `ESC \` ST
+    // the "anywhere" ESC transition — which is exactly how a real `ESC \` ST
     // terminates DCS — so the DCS unhooks normally and the (declared 4x6)
     // image IS placed, then the CSI executes.
     let mut s = Screen::new(24, 80);
@@ -229,7 +227,7 @@ fn decsdm_mode80_set_reset_roundtrip_via_decrqm() {
 
 #[test]
 fn decsdm_is_reset_by_decstr_soft_reset() {
-    // Engine behavior (handler_report.rs, #7496), matching xterm: DECSTR
+    // Engine behavior (handler_report.rs), matching xterm: DECSTR
     // (CSI ! p) resets sixel display mode.
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1b[?80h\x1b[!p\x1b[?80$p");
@@ -252,11 +250,10 @@ fn xtsmgraphics_color_registers_read_and_read_max() {
 
 #[test]
 fn xtsmgraphics_sixel_geometry_read_falls_back_to_max_without_window_callback() {
-    // Pi=2 Pa=1 reads the current text-area pixel size (#7470) behind the
-    // same window-ops capability as CSI 14 t; the conformance harness grants
-    // no window ops and reports no cell box, so the engine's documented
-    // fallback is the max dimension on both axes. The granted case is pinned
-    // in aterm-core's handler_xtsmgraphics tests.
+    // Pi=2 Pa=1 reads the current text-area pixel size behind the same
+    // window-ops capability as CSI 14 t; the harness grants no window ops and
+    // reports no cell box, so the fallback is the max dimension on both axes.
+    // The granted case is pinned in aterm-core's handler_xtsmgraphics tests.
     assert_eq!(run(b"\x1b[?2;1S").response_string(), "\x1b[?2;0;4096;4096S");
 }
 
@@ -291,10 +288,9 @@ fn xtsmgraphics_invalid_item_and_action_report_errors() {
 }
 
 // --- D. cursor position after sixel, both DECSDM states ----------------------
-// Spec (VT340 / xterm): in sixel SCROLLING mode (DECSDM reset) the cursor
-// moves to the line after the image; in DISPLAY mode (DECSDM set) the image is
-// painted and the cursor does NOT move. aterm now renders the image and matches
-// both behaviors via `place_sixel_image`.
+// Spec (VT340 / xterm): in sixel scrolling mode (DECSDM reset) the cursor
+// moves to the line after the image; in display mode (DECSDM set) the image is
+// painted and the cursor does not move (`place_sixel_image`).
 
 #[test]
 fn cursor_moves_after_sixel_with_decsdm_reset() {
@@ -334,7 +330,7 @@ fn cursor_unmoved_after_sixel_with_decsdm_set() {
 }
 
 // --- D2. mid-line column anchoring -------------------------------------------
-// Spec (VT340 / xterm): a sixel image anchors at the CURRENT cursor column, NOT
+// Spec (VT340 / xterm): a sixel image anchors at the current cursor column, not
 // at the left margin like iTerm2's OSC 1337 inline images. A sixel emitted after
 // some text must paint starting at the cursor's column and must not overprint the
 // cells to its left.
@@ -371,7 +367,7 @@ fn sixel_anchors_at_cursor_column_mid_line() {
 fn sixel_mid_line_does_not_overprint_cells_to_its_left() {
     // Text "ABCDE" occupies columns 0..5; the cursor is then at column 5. A sixel
     // emitted there must anchor at column 5 and leave the five glyph cells intact
-    // (image cells live in EXTRAS, not glyph cells, so the text also survives).
+    // (image cells live in extras, not glyph cells, so the text also survives).
     let mut s = Screen::new(24, 80);
     s.feed(b"ABCDE");
     assert_eq!(s.cursor(), (0, 5), "cursor sits just past the text");
@@ -390,7 +386,7 @@ fn sixel_mid_line_does_not_overprint_cells_to_its_left() {
 
 #[test]
 fn sixel_mid_line_anchors_at_cursor_in_display_mode() {
-    // Display mode (DECSDM set): the image anchors at the cursor column AND the
+    // Display mode (DECSDM set): the image anchors at the cursor column and the
     // cursor is restored to where it was. Position at row 2, column 7.
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1b[?80h\x1b[3;8H");
@@ -425,7 +421,7 @@ fn sixel_image_decodes_to_expected_raster_and_is_placed() {
     let row = s.images_row(0);
     assert_eq!(row.len(), 1, "one image cell on row 0");
     let (col, ref iref) = row[0];
-    // The cursor was at column 0 (fresh screen) and sixel anchors at the CURRENT
+    // The cursor was at column 0 (fresh screen) and sixel anchors at the current
     // cursor column, so the image lands at column 0 here. The mid-line case (a
     // nonzero cursor column) is locked by `sixel_anchors_at_cursor_column_mid_line`.
     assert_eq!(
@@ -440,7 +436,7 @@ fn sixel_image_decodes_to_expected_raster_and_is_placed() {
     assert_eq!(data.cols, 1, "1-column footprint");
     assert_eq!(data.rows, 1, "1-row footprint");
 
-    // The stored payload is the DECODED raster, tagged RawRgba8 with the
+    // The stored payload is the decoded raster, tagged RawRgba8 with the
     // post-clamp pixel dimensions (4x6 — the sixel raster, not the footprint).
     match data.format {
         ImageFormat::RawRgba8 { width, height } => {
@@ -469,15 +465,10 @@ fn sixel_image_decodes_to_expected_raster_and_is_placed() {
 
 #[test]
 fn sixel_placement_is_pixel_exact_not_scaled_to_its_footprint() {
-    // SIXEL NAMES PIXELS. The footprint is DERIVED from the raster by rounding
-    // each axis up to whole cells, so the placement must be `PixelExact`:
-    // draw the raster 1:1 from the footprint's top-left and leave the rounded-up
-    // remainder unpainted. Without it the renderer applied the iTerm2
-    // OSC 1337 policy — scale to fill the footprint, aspect preserved, centred —
-    // which magnified every raster whose size was not a cell multiple (measured
-    // on a live window at cell 9x17: a 40x12 plot drawn 45x14, a 4x6 sprite
-    // drawn 9x14, a 2.25x blow-up) and blurred it through an interpolating
-    // resample. SIXEL_4X6 is exactly that case: 4x6 px in an 8x16 cell.
+    // Sixel names pixels. The footprint is the raster rounded up to whole
+    // cells, so the placement must be `PixelExact`: draw the raster 1:1 from
+    // the footprint's top-left and leave the remainder unpainted, rather than
+    // the OSC 1337 scale-to-fill policy. SIXEL_4X6 is 4x6 px in an 8x16 cell.
     let mut s = Screen::new(24, 80);
     s.feed(SIXEL_4X6);
     let row = s.images_row(0);

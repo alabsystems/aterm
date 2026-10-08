@@ -57,11 +57,9 @@ impl Snapshot {
         }
     }
 
-    /// The ladder phase the automatic lane is in for the staged build —
-    /// `apply_phase=` on the wire — while that lane is the one that will apply
-    /// it (`automatic` / `automatic-idle`). Every other posture answers `None`:
-    /// a phase is a promise about WHEN the automatic lane lands, and no other
-    /// posture makes one.
+    /// The automatic lane's ladder phase for the staged build (`apply_phase=` on
+    /// the wire), while that lane will apply it (`automatic` /
+    /// `automatic-idle`); `None` for every other posture.
     pub(crate) fn apply_phase(&self, status: &aterm_update::UpdateStatus) -> Option<&'static str> {
         match self.apply_posture(status) {
             "automatic" | "automatic-idle" => self.phase.map(ApplyPhase::as_str),
@@ -69,12 +67,9 @@ impl Snapshot {
         }
     }
 
-    /// What is holding the automatic lane past its ladder — `apply_held=` on the
-    /// wire — while that lane is the one that will apply the staged build: today
-    /// only the restored agents' hold (`restored-agents`), the one hold that
-    /// refuses the `land` phase too. Without it `apply_phase=land` read as
-    /// "lands at the next poll" for up to the hold's bound with nothing on the
-    /// line to say why it did not (the round-four review).
+    /// What holds the automatic lane past its ladder (`apply_held=` on the wire)
+    /// while that lane will apply the staged build: only the restored agents'
+    /// hold (`restored-agents`), which also refuses the `land` phase.
     pub(crate) fn apply_held(&self, status: &aterm_update::UpdateStatus) -> Option<&'static str> {
         (matches!(self.apply_posture(status), "automatic" | "automatic-idle") && self.restored_hold)
             .then_some("restored-agents")
@@ -129,7 +124,11 @@ impl Snapshot {
             Some(ApplyPosture::ManualByConfig) => "manual-config",
             Some(ApplyPosture::VetoedByEnv { .. }) => "disabled-env",
             Some(ApplyPosture::ManualOnlyLatched { lapses: true }) => "retry-wait",
-            Some(ApplyPosture::ManualOnlyLatched { lapses: false }) => "manual-only",
+            // A spent boot trial is still the manual-only latch; `apply_refusal=`
+            // says a start would roll it back.
+            Some(ApplyPosture::ManualOnlyLatched { lapses: false } | ApplyPosture::TrialSpent) => {
+                "manual-only"
+            }
             Some(ApplyPosture::HandoffDisabled { .. }) => "handoff-unavailable",
             None => "unknown",
         }
@@ -269,6 +268,62 @@ mod tests {
         assert!(admit_check_settings(settings(true), Some(repointed)).is_none());
     }
 
+    /// THE WINDOW HANDS THE BACKGROUND CHECK ITS CUE (round eight of the update
+    /// audit, the review of finding 87). A Linux pass that changed the copy's
+    /// update state is the window's only word to re-read it once the health
+    /// hook was narrowed to failures that persist; the loop calls the hook it is
+    /// given (`aterm_update`'s `linux_notice::Reporter`, pinned there), and the
+    /// window's half is this argument: passed `None`, a healthy pass that
+    /// installed a newer executable left Settings ▸ Software Update as it was,
+    /// and every test stayed green. The wiring runs only with an event loop, so
+    /// it is pinned in the source, whitespace dropped: the call's last argument
+    /// sends [`Wake::UpdateCheckCompleted`] on its own proxy, and that wake
+    /// asks for the reconcile that re-reads the state.
+    #[test]
+    fn the_window_hands_the_background_check_its_checked_cue() {
+        let src: String = include_str!("lib.rs").split_whitespace().collect();
+        let call = src
+            .find("aterm_update::spawn_background_check_with_settings(")
+            .expect("the window's background check");
+        assert!(
+            src[..call].contains("letchecked_proxy=event_loop.create_proxy();"),
+            "the cue's own proxy"
+        );
+        // The call's text, to its matching close.
+        let open = call + src[call..].find('(').expect("its arguments");
+        let mut depth = 0usize;
+        let close = src[open..]
+            .char_indices()
+            .find_map(|(i, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(open + i);
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            })
+            .expect("the call's close");
+        let args = &src[open + 1..close];
+        let cue =
+            "Some(Box::new(move||{let_=checked_proxy.send_event(Wake::UpdateCheckCompleted);})),";
+        assert!(
+            args.ends_with(cue),
+            "the call's last argument, `on_checked`, cues the window: {args}"
+        );
+        assert!(
+            src.contains(
+                "Wake::UpdateCheckCompleted=>{self.request_native_update_reconcile(\
+                 app_native::NativeUpdateReconcilePurpose::StageAvailable,);}"
+            ),
+            "the cue re-reads the copy's update state"
+        );
+    }
+
     #[test]
     fn control_check_announces_every_completion_without_inventing_a_stage() {
         let mut status = status();
@@ -349,12 +404,8 @@ mod tests {
         assert_eq!(snapshot.apply_posture(&status), "unreconciled");
     }
 
-    /// THE RESTORED AGENTS' HOLD IS NAMED ON THE STATUS LINE (the round-four
-    /// review), beside an automatic posture and nowhere else, and so is its start
-    /// and end in the log, once each way. Before, the hold refused even the
-    /// `land` phase for up to seven minutes with nothing on either to say so.
-    ///
-    /// FAILS WITHOUT THE FIX: neither the token nor the line existed.
+    /// The restored agents' hold is named on the status line beside an
+    /// automatic posture only, and its start and end are logged once each.
     #[test]
     fn the_restored_agents_hold_is_named_while_it_holds() {
         let status = status();

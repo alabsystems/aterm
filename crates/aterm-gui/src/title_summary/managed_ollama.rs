@@ -37,7 +37,7 @@ struct ManagedOllamaState {
 }
 
 struct OwnedOllamaChild {
-    child: std::process::Child,
+    child: aterm_uds::spawnfd::Child,
     process: ManagedProcessIdentity,
     endpoint: String,
     authority_epoch: u64,
@@ -98,6 +98,17 @@ impl ManagedOllamaController {
 
     pub(super) fn stop(&self) {
         self.transition_to(None);
+    }
+
+    /// Whether a daemon is installed for [`Self::reap`] to watch. Only the
+    /// worker thread installs one, so while it is false the worker has nothing
+    /// to reap until its next job.
+    pub(super) fn owns_daemon(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owned
+            .is_some()
     }
 
     pub(super) fn reap(&self) -> Option<ManagedRuntimeExit> {
@@ -192,7 +203,7 @@ impl ManagedOllamaController {
     #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(super) fn install(
         &self,
-        child: std::process::Child,
+        child: aterm_uds::spawnfd::Child,
         endpoint: String,
         authority_epoch: u64,
         private_home: Option<std::path::PathBuf>,
@@ -338,7 +349,7 @@ fn unix_session_id(pid: u32) -> Result<u32, String> {
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn finish_unadmitted_managed_child(
-    mut child: std::process::Child,
+    mut child: aterm_uds::spawnfd::Child,
     private_home: Option<std::path::PathBuf>,
     #[cfg(unix)] dedicated_group: Option<u32>,
 ) {
@@ -368,7 +379,7 @@ fn finish_unadmitted_managed_child(
 /// never send a negative-PID signal when the child joined the caller's group.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(super) fn terminate_unadmitted_managed_child(
-    mut child: std::process::Child,
+    mut child: aterm_uds::spawnfd::Child,
     private_home: Option<std::path::PathBuf>,
 ) {
     #[cfg(unix)]
@@ -1008,74 +1019,108 @@ pub(super) fn managed_ollama_command(
     bind: &str,
     models: &std::path::Path,
     home: &std::path::Path,
-) -> std::process::Command {
-    let mut command = std::process::Command::new(binary);
+) -> ManagedOllamaCommand {
+    let mut command = aterm_uds::spawnfd::command(binary);
     command.arg("serve");
     configure_managed_ollama_environment(&mut command, bind, models, home);
     command.current_dir(home);
     #[cfg(unix)]
     configure_dedicated_process_session(&mut command);
-    // BELOW THE TYPING BAND (2026-09-15). The daemon's answer is a tab label, yet
-    // it started at pri 31 — the band of the program being typed into — because
-    // the worker thread's `Role::Background` does not cross the spawn. It cannot
-    // take `qos::command`'s `taskpolicy` wrapper: `attest_running_managed_ollama`
-    // checks this pid's code the moment `spawn` returns, when a wrapped pid may
-    // still be running taskpolicy's image. So the forked child demotes itself
-    // before exec, and every runner it starts inherits that.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        // SAFETY: `demote_forked_child` is one async-signal-safe syscall and
-        // allocates nothing.
-        unsafe {
-            command.pre_exec(|| {
-                crate::qos::demote_forked_child();
-                Ok(())
-            });
-        }
+    // IT INHERITS NOTHING ABOVE STDIO (2026-09-30 review). The daemon lives as
+    // long as the window, and a plain fork copied every descriptor this process
+    // held; the ones without close-on-exec (Metal's shader-cache files, a fabric
+    // bridge lane caught between its `socketpair` and its `F_SETFD`) rode its
+    // `exec` and every runner it starts. `spawnfd::command` hands it its stdio
+    // and nothing else — on Darwin one `posix_spawn` with
+    // `POSIX_SPAWN_CLOEXEC_DEFAULT`, the session a spawn attribute, so no copy
+    // of aterm ever exists to hold them. Its band is set by its parent after the
+    // spawn ([`ManagedOllamaCommand::spawn`]), never before it: a forked child
+    // demoted before its exec held every descriptor of aterm's, starved, for
+    // seconds on a loaded host.
+    command
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    ManagedOllamaCommand(command)
+}
+
+/// The managed daemon's staged `Command`, which starts only through
+/// [`Self::spawn`] — so no launch of the daemon can forget its band.
+///
+/// BELOW THE TYPING BAND (2026-09-15). The daemon's answer is a tab label, yet it
+/// started at pri 31 — the band of the program being typed into — because the
+/// worker thread's `Role::Background` does not cross the spawn. It cannot take
+/// `qos::command`'s `taskpolicy` wrapper: `attest_running_managed_ollama` checks
+/// this pid's code the moment `spawn` returns, when a wrapped pid may still be
+/// running taskpolicy's image. Nor is it demoted before it starts: until
+/// 2026-09-30 the forked child demoted itself before its exec, and that copy
+/// of aterm held every descriptor aterm had open while, in the background
+/// band, its exec ran seconds late under load
+/// ([`crate::qos::demote_process_tree`]). Today there is no copy at all — the
+/// spawn is one `posix_spawn` — and the band lands once it returns.
+#[cfg(any(target_os = "macos", test))]
+pub(super) struct ManagedOllamaCommand(aterm_uds::spawnfd::Command);
+
+#[cfg(any(target_os = "macos", test))]
+impl ManagedOllamaCommand {
+    /// Start the daemon at the band it inherits, and put it — with anything it
+    /// has started already — in the Darwin background band the moment `spawn`
+    /// returns, which is after its exec. Every runner it starts later inherits
+    /// the band. macOS only: the daemon is launched nowhere else.
+    #[cfg(target_os = "macos")]
+    pub(super) fn spawn(mut self) -> std::io::Result<aterm_uds::spawnfd::Child> {
+        let child = self.0.spawn()?;
+        crate::qos::demote_process_tree(child.id());
+        Ok(child)
     }
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    command
+
+    /// The staged command, to read what it will run.
+    #[cfg(test)]
+    pub(super) fn staged(&self) -> &aterm_uds::spawnfd::Command {
+        &self.0
+    }
+
+    /// The staged command, to add a test probe; still started by [`Self::spawn`].
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn staged_mut(&mut self) -> &mut aterm_uds::spawnfd::Command {
+        &mut self.0
+    }
+
+    /// The staged command WITHOUT the band, for a test whose subject is what
+    /// the command stages (its environment), not where the daemon runs.
+    #[cfg(test)]
+    pub(super) fn into_undemoted(self) -> aterm_uds::spawnfd::Command {
+        self.0
+    }
 }
 
 #[cfg(all(unix, any(target_os = "macos", test)))]
-pub(super) fn configure_dedicated_process_session(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt as _;
-
-    // SAFETY: setsid is async-signal-safe and is the only operation performed
-    // in the post-fork/pre-exec callback. Failure aborts exec, fail-closed.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
+pub(super) fn configure_dedicated_process_session(command: &mut aterm_uds::spawnfd::Command) {
+    // A spawn attribute (`POSIX_SPAWN_SETSID` on Darwin): the child leads a new
+    // session, and a spawn whose `setsid` fails fails, fail-closed.
+    command.setsid(true);
 }
 
-/// The SHORT-LIVED probe's isolation: its own process GROUP, and no `pre_exec`.
+/// The SHORT-LIVED probe's isolation: its own process GROUP, and no session of
+/// its own.
 ///
 /// [`configure_dedicated_process_session`] is correct for the long-lived model
 /// daemon, which must leave the session entirely. It is the wrong tool for a
-/// sub-second `lsof`/`codesign` probe, and expensively so: any `pre_exec`
-/// closure disqualifies `Command` from the `posix_spawn` fast path and forces a
-/// real `fork()`. Forking copies the parent's page tables, so the cost scales
-/// with how large aterm's address space happens to be — which is why a probe
-/// whose actual work takes ~90 ms could blow a 250 ms budget on a loaded host,
-/// fail the attestation closed, and silently switch smart titles off on exactly
-/// the busy machine where they help most.
+/// sub-second `lsof`/`codesign` probe: the probe must stay killable as a group
+/// within its bounded wait, and a session buys it nothing.
 ///
 /// `process_group(0)` asks for the same thing the group-kill actually needs —
 /// PGID == the child's own PID, so `kill(-pid)` still reaps the whole subtree,
-/// a re-parented grandchild included — but expresses it as a spawn ATTRIBUTE
-/// (`POSIX_SPAWN_SETPGROUP`) rather than as code that must run between fork
-/// and exec. `posix_spawn` is preserved, and the probe costs a spawn instead of
-/// a copy of aterm.
+/// a re-parented grandchild included — as a spawn ATTRIBUTE rather than as code
+/// of ours between fork and exec.
+///
+/// THE PROBE DOES NOT FORK. It was kept on `posix_spawn` for fear that a fork,
+/// which copies aterm's address-space map, could blow the probe's 250 ms budget
+/// on a loaded host; for a day (2026-10-01) every probe forked anyway, because
+/// `aterm_uds::spawnfd::command`'s inheritance strip was a `pre_exec` hook.
+/// That `Command` is now one `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`
+/// on Darwin (`aterm_uds::spawnfd`'s module docs carry the measurements), so
+/// the probe is spawned again, holding its stdio and nothing else.
 ///
 /// The deliberate difference from the daemon path is the SESSION: this child
 /// keeps the parent's. That is the right trade for a probe that runs a fixed
@@ -1088,17 +1133,16 @@ pub(super) fn configure_dedicated_process_session(command: &mut std::process::Co
 /// branch's base and nothing in it applies textually; this function and its
 /// use in [`run_command_bounded`] are re-expressed against today's file.
 #[cfg(any(target_os = "macos", all(unix, test)))]
-pub(super) fn configure_dedicated_process_group(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt as _;
+pub(super) fn configure_dedicated_process_group(command: &mut aterm_uds::spawnfd::Command) {
     command.process_group(0);
 }
 
 /// The environment surface [`configure_managed_ollama_environment`] writes
-/// through: a real [`std::process::Command`] in production.
+/// through: a real [`aterm_uds::spawnfd::Command`] in production.
 ///
 /// The indirection exists because the minimal set has TWO halves and
-/// `std::process::Command` only exposes one of them.
-/// [`std::process::Command::get_envs`] reports the explicit *changes* staged on
+/// `aterm_uds::spawnfd::Command` only exposes one of them.
+/// [`aterm_uds::spawnfd::Command::get_envs`] reports the explicit *changes* staged on
 /// the command and can never tell you whether the inherited environment was
 /// dropped — yet dropping it is the entire point (no terminal/session secrets,
 /// no proxy overrides, no injection variables reach the model daemon). The old
@@ -1115,7 +1159,7 @@ pub(super) trait ChildEnvironment {
 }
 
 #[cfg(any(target_os = "macos", test))]
-impl ChildEnvironment for std::process::Command {
+impl ChildEnvironment for aterm_uds::spawnfd::Command {
     fn clear_inherited(&mut self) {
         self.env_clear();
     }
@@ -1265,9 +1309,9 @@ pub(super) fn ollama_designated_requirement(
 }
 
 #[cfg(target_os = "macos")]
-fn ollama_codesign_command(all_architectures: bool) -> Result<std::process::Command, String> {
+fn ollama_codesign_command(all_architectures: bool) -> Result<aterm_uds::spawnfd::Command, String> {
     let requirement = ollama_designated_requirement(OLLAMA_TEAM_ID, OLLAMA_CODE_IDENTIFIER)?;
-    let mut command = std::process::Command::new("/usr/bin/codesign");
+    let mut command = aterm_uds::spawnfd::command("/usr/bin/codesign");
     command
         .env_clear()
         .args(["--verify", "--strict", "--verbose=2"]);
@@ -1290,7 +1334,7 @@ pub(super) struct BoundedCommandOutput {
 /// process group, and timeout paths never wait for an inherited stdout pipe.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(super) fn run_command_bounded(
-    command: &mut std::process::Command,
+    command: &mut aterm_uds::spawnfd::Command,
     timeout: Duration,
     stdout_limit: usize,
     label: &str,
@@ -1298,16 +1342,15 @@ pub(super) fn run_command_bounded(
     use std::io::Read as _;
 
     command
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .stdout(if stdout_limit == 0 {
-            std::process::Stdio::null()
+            aterm_uds::spawnfd::Stdio::null()
         } else {
-            std::process::Stdio::piped()
+            aterm_uds::spawnfd::Stdio::piped()
         });
-    // Own process group (for the group-kill below) WITHOUT a `pre_exec`, so this
-    // bounded probe keeps the `posix_spawn` fast path instead of forking a copy
-    // of aterm's address space. See `configure_dedicated_process_group`.
+    // Own process group, for the group-kill below. See
+    // `configure_dedicated_process_group`.
     #[cfg(unix)]
     configure_dedicated_process_group(command);
     let mut child = command
@@ -1325,7 +1368,7 @@ pub(super) fn run_command_bounded(
         })
     });
     let deadline = Instant::now() + timeout;
-    let terminate = |child: &mut std::process::Child| {
+    let terminate = |child: &mut aterm_uds::spawnfd::Child| {
         #[cfg(unix)]
         if let Ok(group) = i32::try_from(child.id()) {
             // SAFETY: `process_group(0)` above (POSIX_SPAWN_SETPGROUP) made the
@@ -1494,32 +1537,21 @@ pub(super) fn parse_established_server_pid(
     }
 }
 
+/// What [`established_server_pid`] answers when no lsof in its total budget
+/// named the owner: a slow machine, never a finding about the socket.
+#[cfg(target_os = "macos")]
+pub(super) const OWNER_PROBE_EXHAUSTED: &str =
+    "could not identify the connected Ollama server process";
+
+#[cfg(target_os = "macos")]
+pub(super) const OWNER_PROBE_LABEL: &str = "managed Ollama listener inspection";
+
 #[cfg(target_os = "macos")]
 pub(super) fn established_server_pid(stream: &std::net::TcpStream) -> Result<u32, String> {
-    let server = stream
-        .peer_addr()
-        .map_err(|error| format!("managed Ollama peer address: {error}"))?;
-    let client = stream
-        .local_addr()
-        .map_err(|error| format!("managed Ollama client address: {error}"))?;
-    let selector = match server {
-        std::net::SocketAddr::V4(address) => {
-            format!("-iTCP@{}:{}", address.ip(), address.port())
-        }
-        std::net::SocketAddr::V6(address) => {
-            format!("-iTCP@[{}]:{}", address.ip(), address.port())
-        }
-    };
-    // connect(2) can complete while the server-side socket is still queued for
-    // accept(2), in which case lsof briefly sees only the client half. A process
-    // concurrently between fork(2) and exec(2) can likewise expose a second,
-    // inherited view of that exact FD for one snapshot. Retry both transient
-    // shapes, but still require one unique server owner within the tight bound.
-    //
     // BOUNDS SIZED FOR A BUSY MACHINE, not an idle one (port of 61a6c8b62). These
     // cap how long the OWNER LOOKUP may take; they are not part of the trust
-    // decision, which is the unique-owner requirement below plus the ancestry
-    // and codesign checks the caller runs. Loosening them cannot admit an
+    // decision, which is the unique-owner requirement plus the ancestry and
+    // codesign checks the caller runs. Loosening them cannot admit an
     // unverified process — it only stops a slow answer from being read as no
     // answer.
     //
@@ -1535,41 +1567,96 @@ pub(super) fn established_server_pid(stream: &std::net::TcpStream) -> Result<u32
     // ~90 ms but intermittently exceeds half a second, so a bound picked from the
     // typical cost turns a busy machine into a silent feature outage. 2 s per
     // attempt × 6 s overall is sized for the tail instead, still admits three
-    // FULL-TIMEOUT attempts (the loop below is deadline-driven, retrying every
-    // 10 ms until the total elapses) for the connect/accept race above, and
-    // still fails closed.
+    // FULL-TIMEOUT attempts (`observe_established_server_pid`'s loop is
+    // deadline-driven: an attempt that times out is retried every 10 ms until
+    // the total elapses) for the connect/accept race it names, and still fails
+    // closed.
     //
     // Being generous here is cheap: this runs on the smart-title WORKER thread
     // (`qos::Role::Background`), never the UI thread, so a slow answer delays a
     // tab label and nothing else.
     const OWNER_PROBE_ATTEMPT: Duration = Duration::from_secs(2);
     const OWNER_PROBE_TOTAL: Duration = Duration::from_secs(6);
-    let deadline = Instant::now() + OWNER_PROBE_TOTAL;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err("could not identify the connected Ollama server process".to_string());
+    established_server_pid_within(stream, OWNER_PROBE_ATTEMPT, OWNER_PROBE_TOTAL)
+}
+
+/// [`established_server_pid`] with its budget named: each `lsof` bounded by
+/// `attempt`, the whole lookup by `total`. The production budget is the
+/// wrapper's; a test that is about the ATTRIBUTION, not the budget, passes a
+/// hang detector here instead.
+#[cfg(target_os = "macos")]
+pub(super) fn established_server_pid_within(
+    stream: &std::net::TcpStream,
+    attempt: Duration,
+    total: Duration,
+) -> Result<u32, String> {
+    let server = stream
+        .peer_addr()
+        .map_err(|error| format!("managed Ollama peer address: {error}"))?;
+    let client = stream
+        .local_addr()
+        .map_err(|error| format!("managed Ollama client address: {error}"))?;
+    let selector = match server {
+        std::net::SocketAddr::V4(address) => {
+            format!("-iTCP@{}:{}", address.ip(), address.port())
         }
-        let output = run_command_bounded(
-            std::process::Command::new("/usr/sbin/lsof")
+        std::net::SocketAddr::V6(address) => {
+            format!("-iTCP@[{}]:{}", address.ip(), address.port())
+        }
+    };
+    observe_established_server_pid(server, client, attempt, total, |budget| {
+        run_command_bounded(
+            aterm_uds::spawnfd::command("/usr/sbin/lsof")
                 .env_clear()
                 .args(["-nP", "-a"])
                 .arg(&selector)
                 .args(["-sTCP:ESTABLISHED", "-FpnT"]),
-            remaining.min(OWNER_PROBE_ATTEMPT),
+            budget,
             64 * 1024,
-            "managed Ollama listener inspection",
-        )?;
-        if output.status.success() {
-            match parse_established_server_pid(&output.stdout, server, client) {
-                Ok(pid) => return Ok(pid),
-                Err(error)
-                    if socket_owner_observation_is_transient(&error)
-                        && Instant::now() < deadline => {}
-                Err(error) => return Err(error),
+            OWNER_PROBE_LABEL,
+        )
+    })
+}
+
+/// The owner lookup's retry loop, over `probe` (one bounded `lsof` given its
+/// budget). connect(2) can complete while the server-side socket is still
+/// queued for accept(2), in which case lsof briefly sees only the client half.
+/// A process concurrently between fork(2) and exec(2) can likewise expose a
+/// second, inherited view of that exact FD for one snapshot. Retry both
+/// transient shapes — and an `lsof` that ran out its per-attempt budget, the
+/// loaded machine's variance the budget is sized for — but still require one
+/// unique server owner within `total`, and answer [`OWNER_PROBE_EXHAUSTED`]
+/// when it runs out. Every other probe failure ends the lookup at once.
+#[cfg(target_os = "macos")]
+pub(super) fn observe_established_server_pid(
+    server: std::net::SocketAddr,
+    client: std::net::SocketAddr,
+    attempt: Duration,
+    total: Duration,
+    mut probe: impl FnMut(Duration) -> Result<BoundedCommandOutput, String>,
+) -> Result<u32, String> {
+    let timed_out = format!("{OWNER_PROBE_LABEL} timed out");
+    let deadline = Instant::now() + total;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(OWNER_PROBE_EXHAUSTED.to_string());
+        }
+        match probe(remaining.min(attempt)) {
+            Ok(output) if output.status.success() => {
+                match parse_established_server_pid(&output.stdout, server, client) {
+                    Ok(pid) => return Ok(pid),
+                    Err(error)
+                        if socket_owner_observation_is_transient(&error)
+                            && Instant::now() < deadline => {}
+                    Err(error) => return Err(error),
+                }
             }
-        } else if Instant::now() >= deadline {
-            return Err("could not identify the connected Ollama server process".to_string());
+            Ok(_) => {}
+            // One slow `lsof` is not the answer "no owner": the next attempt
+            // gets what is left of the total, and the total says when to stop.
+            Err(error) if error == timed_out => {}
+            Err(error) => return Err(error),
         }
         std::thread::sleep(Duration::from_millis(10));
     }

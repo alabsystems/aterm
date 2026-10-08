@@ -25,11 +25,9 @@ aterm-containment = { workspace = true }
 # diagnostic subcommand that prints and exits before any PTY spawn.
 aterm-render = { workspace = true }
 aterm-types = { workspace = true }
-# `aterm help rust` calls the REAL toolchain discovery (`Toolchain::discover`)
-# rather than restating it: a second copy of "which toolchain wins" would
-# disagree with the first inside a year. aterm-verify has zero dependencies by
-# charter, so this costs the one binary nothing at link time.
-aterm-verify = { workspace = true }
+# `aterm help rust` calls the REAL toolchain discovery (`atpkg::toolchain`) rather
+# than restating it. The one `aterm` binary links atpkg already.
+atpkg = { workspace = true }
 # `aterm agents`: the coding-agent primer installer. Its own std-only crate so the
 # GUI (auto-prime on every session) and this CLI verb drive ONE installer.
 aterm-primer = { workspace = true }
@@ -52,6 +50,19 @@ aterm-lexicon = { workspace = true }
 # disagree about what is reachable. Reached only by that print-and-exit path; the
 # one binary links aterm-ctl already, and it brings only aterm-types and aterm-uds.
 aterm-ctl = { path = "../aterm-ctl" }
+# `aterm exceptions` and `aterm doctor`'s `exceptions:` row: what needs a look but not
+# now, read from `messages.log` with NO window running, decoded and replayed by the
+# SAME engine the window loads its log with (`LogLine::decode`, `MessageLog::replay_all`)
+# and worded by its pure `exceptions_report`, so the terminal, Settings ▸ Messages and
+# `aterm ctl messages need=later` cannot disagree. Reached only by those print-and-exit
+# paths; the one binary links it already (through aterm-render and the window).
+aterm-messages = { workspace = true }
+# `aterm_uds::spawnfd::command`: the `Command` every child here is built with, so
+# none inherits a descriptor of this process above stdio (`tools/grep_guard.sh`
+# B27), and on Windows a caller with no console gives it a WINDOWLESS console,
+# where a bare console child opened a visible one (measured 2026-09-30; B28). A
+# dependency-free leaf the one binary links already.
+aterm-uds = { workspace = true }
 
 # The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
 # the Windows driver is kernel32 console FFI with no libc.
@@ -70,8 +81,6 @@ aterm-toml = { workspace = true }
 workspace = true
 
 [dev-dependencies]
-# TEST ONLY. `manual.rs` documents atpkg's verbs, and the prose gate in its
-# test module pins what the manual PRESCRIBES against `atpkg::dispatch_roster()`
-# — the dispatch table itself. Not a runtime dependency: the router composes
-# these crates, aterm-cli does not call atpkg.
-atpkg = { workspace = true }
+# The tests' scratch-directory stamp: the workspace's one epoch-clock read, already
+# in the graph via aterm-types.
+aterm-time = { workspace = true }

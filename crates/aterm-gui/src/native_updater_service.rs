@@ -182,13 +182,7 @@ pub(crate) fn installed_activation_digest(build: u64, commit: &str) -> String {
     hasher.update(build.to_string().as_bytes());
     hasher.update(b"\0");
     hasher.update(commit.trim().to_ascii_lowercase().as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    aterm_codec::hex::encode_lower(&hasher.finalize())
 }
 
 /// The outcome for a newer build already installed under the executable, whose
@@ -532,9 +526,17 @@ impl ApplyAttemptTicket {
         service.snapshot.generation = self.generation;
         service.snapshot.phase = UpdaterPhase::Applying;
         service.snapshot.reexec_count = 1;
+        // A production ticket is minted from the staged entry, so a build
+        // already staged keeps its version.
+        let version = service
+            .snapshot
+            .staged
+            .as_ref()
+            .filter(|staged| staged.build == self.artifact_build)
+            .map_or_else(|| "0.0.0".to_string(), |staged| staged.version.clone());
         service.snapshot.staged = Some(StagedUpdate {
             build: self.artifact_build,
-            version: "0.0.0".to_string(),
+            version,
             commit: Some(self.artifact_commit.clone()),
             dmg_sha256: self.artifact_dmg_sha256.clone(),
             changelog: None,
@@ -748,7 +750,7 @@ impl NativeUpdaterService {
             close_preflight_ready: false,
             pending_preflight: None,
             active_apply: None,
-            last_transitions: Vec::with_capacity(3),
+            last_transitions: Vec::new(),
         }
     }
 
@@ -971,7 +973,7 @@ impl NativeUpdaterService {
     /// unrelated reconcile happened to land. Settings self-healed on open; the
     /// Version menu and the palette row went on offering a clean "apply now".
     ///
-    /// `attempts_for_target` / `target_build` come from
+    /// `failures_for_target` / `target_build` come from
     /// [`aterm_update::RecordedApplyFailure`], read back inside the same lock scope
     /// that wrote them, so this cannot disagree with the file. Returns whether
     /// anything changed — the caller republishes on `true`.
@@ -1586,12 +1588,16 @@ impl NativeUpdaterService {
         Some(operation)
     }
 
+    /// Log one reducer step for Tier-1 (`native_updater_conformance`), the only
+    /// reader: a shipping build records nothing and never allocates the log.
     fn record(&mut self, action: UpdaterTransitionAction, before: UpdaterModelState) {
-        self.last_transitions.push(UpdaterTransition {
-            action,
-            before,
-            after: self.model_state(),
-        });
+        if cfg!(test) {
+            self.last_transitions.push(UpdaterTransition {
+                action,
+                before,
+                after: self.model_state(),
+            });
+        }
     }
 
     fn publish(&mut self) {
@@ -1656,7 +1662,7 @@ fn staged_from_status(
         .staged_dmg_sha256
         .as_deref()
         .map(str::trim)
-        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))?
+        .filter(|digest| aterm_codec::hex::is_hex(digest, 64))?
         .to_ascii_lowercase();
     // A DOWNLOAD stage's commit is the manifest's full 40-char sha and nothing
     // shorter mints stage authority (`missing_or_unsealed_commit_never_mints_…`).
@@ -1840,6 +1846,7 @@ mod tests {
         durable.linux_host = true;
         durable.linux = Some(aterm_update::LinuxUpdateStatus {
             installed_build: 10,
+            installed_version: String::new(),
             staged_build: Some(12),
             staged_version: Some("1.0.12".into()),
             staged_commit: Some(TEST_COMMIT.into()),

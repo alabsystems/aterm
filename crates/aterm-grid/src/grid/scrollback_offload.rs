@@ -2,65 +2,51 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Off-thread width-change scrollback reflow (the L0 whole-Mac-freeze fix).
+//! Off-thread width-change scrollback reflow.
 //!
-//! [`Grid::resize`]'s width branch rewraps the ENTIRE off-screen scrollback
-//! synchronously (`scrollback_reflow`), cost O(session history). On the GUI main
-//! thread, under the per-session `term` mutex, that is the 42s freeze this
-//! module exists to remove.
+//! [`Grid::resize`]'s width branch rewraps the entire off-screen scrollback
+//! synchronously (`scrollback_reflow`), costing O(session history) on the GUI
+//! main thread under the per-session `term` mutex. This module moves that
+//! work off the lock.
 //!
-//! The lever: a real session keeps its unbounded, disk-tiered history in the
-//! tiered [`ScrollbackStorage`] (`storage.scrollback`), separate from the fixed
-//! in-memory ring. [`Grid::resize_offloading_scrollback`] DETACHES that store in
-//! O(1) *before* resizing — and (RFL-1) lifts the ring's scrollback rows into the
-//! job as materialized [`Line`]s in the same breath — so the synchronous reflow
-//! touches only the VISIBLE VIEWPORT, and hands the detached history back as a
-//! `Send` [`PendingScrollbackReflow`].
-//! The expensive decompress + rewrap ([`PendingScrollbackReflow::reflow`], or
-//! the budgeted [`PendingScrollbackReflow::reflow_step`] increments for a
-//! caller with no worker thread — the wasm cooperative offload) then runs off
-//! the lock; the result is re-attached under a brief lock via
-//! [`Grid::reattach_reflowed_scrollback`]. History is preserved (detached,
-//! not dropped), and the main-thread cost becomes O(viewport) plus one O(ring)
-//! row-to-[`Line`] materialization — the ring-sized REWRAP and the ring-sized
-//! row REBUILD both left the synchronous phase (the rewrap to the worker, the
-//! rebuild to the brief re-attach lock) — independent of session lifetime.
+//! A real session keeps its unbounded, disk-tiered history in the tiered
+//! [`ScrollbackStorage`] (`storage.scrollback`), separate from the fixed
+//! in-memory ring. [`Grid::resize_offloading_scrollback`] detaches that store
+//! in O(1) before resizing and lifts the ring's scrollback rows into the job
+//! as materialized [`Line`]s, so the synchronous reflow touches only the
+//! visible viewport; the detached history is returned as a `Send`
+//! [`PendingScrollbackReflow`]. The decompress + rewrap
+//! ([`PendingScrollbackReflow::reflow`], or budgeted
+//! [`PendingScrollbackReflow::reflow_step`] increments for a caller with no
+//! worker thread, like the wasm cooperative offload) runs off the lock, and
+//! the result is re-attached under a brief lock via
+//! [`Grid::reattach_reflowed_scrollback`]. Main-thread cost is O(viewport)
+//! plus one O(ring) row-to-[`Line`] materialization.
 //!
-//! MEMORY (RFL-2): the job's rewrap STREAMS. Input is read from the front of
-//! the detached store and front-truncated out of it as it is consumed (whole
-//! warm blocks / cold pages free in flight); completed logical runs are
-//! rewrapped and immediately re-compressed onto the same store's back. Peak
-//! transient usage is O(step budget + one logical run) uncompressed — never
-//! the O(total-history-uncompressed) cliff of materializing every line before
-//! refilling, which for the multi-million-line disk-tier histories this
-//! offload exists for meant transiently inflating GBs of RAM per resize.
+//! Memory: the rewrap streams. Input is read from the front of the detached
+//! store and truncated out as consumed; completed logical runs are rewrapped
+//! and re-compressed onto the same store's back. Peak transient usage is
+//! O(step budget + one logical run) uncompressed, never the whole history.
 //!
 //! Ordering: while a reflow is in flight the grid has no tiered store and no
 //! ring scrollback (both ride the job), so new scroll-off accumulates in the
-//! now-empty ring; re-attaching the rewrapped tiered store as
-//! `storage.scrollback` and returning the rewrapped ring history to the ring
-//! (or, where flight content already claimed its seat, to the store — see
-//! [`Grid::reattach_ring_history`]) restores the correct
-//! [old history | old ring history | window output | live ring] order. The "one detach, tiered = None until re-attach" invariant serialises
-//! reflows: a resize that races an in-flight reflow detaches nothing and only
-//! rewraps the ring, so the in-flight store is never lost or double-detached.
+//! empty ring. Re-attaching the store and returning the ring history (to the
+//! ring, or to the store where flight content took its seat; see
+//! [`Grid::reattach_ring_history`]) restores [old history | old ring history |
+//! window output | live ring]. Only one detach can be in flight: a resize
+//! racing it detaches nothing and only rewraps the ring.
 //!
-//! Detach-window integrity (audited): output that scrolls off during the window is
-//! kept via `scrollback_detached_for_reflow` (staged to the lazy buffer, flushed on
-//! re-attach); a scrollback erase during the window is honored via
-//! `scrollback_clear_gen` (the stale store is dropped, not resurrected); and the
-//! reader's scroll position is carried through `prev_offset`, restored unless the
-//! `detach_live_bottom_gen` baseline shows the READER themselves brought the viewport
-//! down to the live bottom during the window (without that baseline the detach's own
-//! clamp reads as the reader's choice, and every width change threw a scrolled-back
-//! reader at the prompt). One ACCEPTED
-//! TRANSIENT remains: a concurrent control-socket reader (`search`/`text`/`lines`)
-//! during the window sees only the ring, not the detached tiered history, so it can
-//! momentarily report not-found for text that is in off-screen scrollback. It
-//! self-heals on re-attach (the `content_gen` bump invalidates the read cache); no
-//! durable state persists the truncated view (there is no concurrent checkpoint
-//! writer). Making the detached store readable mid-reflow would require a second
-//! live snapshot — not worth the memory for a self-healing read anomaly.
+//! Detach-window integrity: output scrolling off during the window is staged
+//! to the lazy buffer (`scrollback_detached_for_reflow`) and flushed on
+//! re-attach; a scrollback erase during the window is honoured via
+//! `scrollback_clear_gen` (the stale store is dropped); and the reader's
+//! scroll position rides `prev_offset`, restored unless
+//! `detach_live_bottom_gen` shows the reader themselves went to the live
+//! bottom meanwhile. One accepted transient: a concurrent control-socket
+//! reader (`search`/`text`/`lines`) during the window sees only the ring, so
+//! it can briefly miss text in off-screen history. It self-heals on
+//! re-attach (the `content_gen` bump invalidates the read cache); a second
+//! live snapshot is not worth the memory.
 
 use aterm_scrollback::{Line, ScrollbackStorage};
 
@@ -70,7 +56,7 @@ use super::state::{DetachedReaderAim, PendingScrollbackSettings};
 use crate::Damage;
 
 /// One reader-facing viewport gesture, as the detach window records it
-/// (design ruling 238; see [`Grid::note_detached_reader_motion`]).
+/// (see [`Grid::note_detached_reader_motion`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReaderMotion {
     /// `scroll_display(delta)`: up positive, toward the live bottom negative.
@@ -82,9 +68,9 @@ pub(crate) enum ReaderMotion {
 }
 
 /// A live-relative aim of `rows`, taken at `at_counter`, grown by the lines
-/// that scrolled into history since (`counter`) — the SCR-1 repin's rule: a
-/// reader off the live bottom rides up with the content they were reading; a
-/// reader AT the live bottom stays there.
+/// that scrolled into history since (`counter`): a reader off the live bottom
+/// rides up with the content they were reading; a reader at the live bottom
+/// stays there.
 fn grown_from_live(rows: usize, at_counter: u64, counter: u64) -> usize {
     if rows == 0 {
         return 0;
@@ -94,11 +80,9 @@ fn grown_from_live(rows: usize, at_counter: u64, counter: u64) -> usize {
 
 impl DetachedReaderAim {
     /// The `display_offset` this aim names once the whole history (`sb` lines)
-    /// is back with the row counter at `counter`, given `restored` — where the
-    /// re-attach's own rule would put the reader. An aim ABOVE the attached
-    /// rows lands at least as far up as the reader asked and never below the
-    /// place the restore gives them: they reached UP for history, and the
-    /// restore is already their place in it.
+    /// is back with the row counter at `counter`, given `restored` (where the
+    /// re-attach's own rule would put the reader). An aim above the attached
+    /// rows lands at least as far up as asked and never below `restored`.
     fn resolve(self, counter: u64, sb: usize, restored: usize) -> usize {
         match self {
             DetachedReaderAim::Above { rows, at_counter } => {
@@ -115,62 +99,51 @@ impl DetachedReaderAim {
 }
 
 /// The off-screen scrollback of a grid, detached and awaiting off-thread rewrap
-/// to `new_cols`. `Send`, so the expensive decompress + rewrap runs on a worker
-/// off the caller's lock. Produced by [`Grid::resize_offloading_scrollback`].
+/// to `new_cols`. `Send`, so the decompress + rewrap runs on a worker off the
+/// caller's lock. Produced by [`Grid::resize_offloading_scrollback`].
 ///
-/// Off-screen history lives in THREE places, all extracted here without touching
-/// the compressor/decompressor on the caller's thread: the tiered `store`
-/// (compressed, oldest), `lazy_lines` (uncompressed staging, newer — these
-/// would be silently discarded by a plain resize once the store is detached, see
-/// `drain_lazy_buffer`), and `ring_lines` (the ring's scrollback rows
-/// materialized as [`Line`]s, newest — RFL-1: pre-RFL-1 these were rewrapped AND
-/// rebuilt synchronously under the caller's lock; now only the O(ring)
-/// materialization is synchronous). Age order: `store`, then `lazy_lines`, then
-/// `ring_lines`.
+/// Off-screen history lives in three places, all extracted without
+/// (de)compressing on the caller's thread, in age order: the tiered `store`
+/// (compressed, oldest), `lazy_lines` (uncompressed staging, which a plain
+/// resize would discard once the store is detached; see
+/// `drain_lazy_buffer`), and `ring_lines` (the ring's scrollback rows as
+/// [`Line`]s, newest).
 ///
 /// `[store | lazy_lines]` rewrap as one logical sequence back into the store;
-/// `ring_lines` rewrap as a SEPARATE sequence (the ring phase) whose output
-/// returns to the ring at re-attach — the same seam the pre-RFL-1 design had,
-/// where the ring was rewrapped by the synchronous resize while the job
-/// rewrapped the store, so under [`ResizePolicy::Native`] a soft-wrapped run
-/// straddling the lazy/ring boundary re-splits exactly as it always did. Under
-/// [`ResizePolicy::ConPty`] that run is handed to the ring phase whole.
+/// `ring_lines` rewrap as a separate sequence (the ring phase) returned to the
+/// ring at re-attach. Under [`ResizePolicy::Native`] a soft-wrapped run
+/// straddling the lazy/ring boundary re-splits at that seam; under
+/// [`ResizePolicy::ConPty`] it is handed to the ring phase whole.
 ///
 /// Two ways to run the rewrap, identical results:
-/// * [`reflow`](Self::reflow) — one shot, for a caller with a whole thread to
-///   burn (the native worker).
-/// * [`reflow_step`](Self::reflow_step) — budgeted increments, for a caller
+/// * [`reflow`](Self::reflow): one shot, for a worker thread.
+/// * [`reflow_step`](Self::reflow_step): budgeted increments, for a caller
 ///   that must keep every task short (the single-threaded wasm event loop).
 ///
-/// Either way the job OWNS its data for the whole rewrap: stepping happens
-/// outside the grid/term lock exactly like the one-shot, the grid never sees
-/// partial progress, and re-attach still takes only a COMPLETED
-/// [`ReflowedScrollback`] (partial re-attach is deliberately not a thing).
+/// Either way the job owns its data: the grid never sees partial progress, and
+/// re-attach takes only a completed [`ReflowedScrollback`].
 #[must_use = "a detached scrollback store must be reflowed and re-attached, or history is lost"]
 pub struct PendingScrollbackReflow {
     store: ScrollbackStorage,
     lazy_lines: Vec<Line>,
-    /// The ring's scrollback rows, materialized at detach (RFL-1). Rewrapped
-    /// off-thread in [`ReflowPhase::RingRewrap`]; the result rides
-    /// [`ReflowedScrollback::ring_out`] back to the ring. Dies with a dropped
-    /// job exactly like the store (the abort path's bounded-loss semantics now
-    /// cover the ring history too).
+    /// The ring's scrollback rows, materialized at detach. Rewrapped in
+    /// [`ReflowPhase::RingRewrap`]; the result rides
+    /// [`ReflowedScrollback::ring_out`] back to the ring. Lost with a dropped
+    /// job, like the store.
     ring_lines: Vec<Line>,
     new_cols: u16,
-    /// The reader's scroll position at detach, restored on re-attach (audit bug D).
+    /// The reader's scroll position at detach, restored on re-attach.
     prev_offset: usize,
-    /// `GridStorage::reader_live_bottom_gen` sampled at detach — the baseline that
-    /// lets the re-attach ask "did the READER bring the viewport down to live while
-    /// this job was out?" and get an answer no reading of `display_offset` can give
-    /// (audit #7): the detach's own clamp, a retention clamp, a rows-only resize's
-    /// re-anchor, an output batch's pin dance and the reader's End all write the same
-    /// 0 to the same field. A generation separates them by provenance — only
-    /// reader-facing primitives advance it, and only on a real descent.
+    /// `GridStorage::reader_live_bottom_gen` sampled at detach, so re-attach can
+    /// tell whether the reader brought the viewport to the live bottom while
+    /// this job was out. `display_offset` cannot: the detach's own clamp, a
+    /// retention clamp, a rows-only re-anchor, an output batch's repin and the
+    /// reader's End all write the same 0. Only reader-facing primitives advance
+    /// the generation, and only on a real descent.
     detach_live_bottom_gen: u64,
     /// The scrollback-erase generation at detach; if it advanced by re-attach an
-    /// erase happened during the window and the reflowed store is dropped (bug C).
-    /// Captured once PER JOB at detach — stepping never re-samples it, so a
-    /// chunked rewrap keeps exactly the one-shot's staleness semantics.
+    /// erase happened during the window and the reflowed store is dropped.
+    /// Captured once per job, never re-sampled per step.
     clear_gen: u64,
     /// Incremental-rewrap progress (`reflow_step`). Starts at the beginning of
     /// the input; the one-shot [`reflow`](Self::reflow) is just "step until
@@ -188,40 +161,35 @@ pub struct PendingScrollbackReflow {
     /// The seam policy of the resize that detached this job. Under
     /// [`ResizePolicy::ConPty`] a logical line straddling the store/ring seam
     /// rewraps whole (see the Stream phase's exhaustion arm); under `Native`
-    /// it re-splits there as it did in 0.94.0, which that policy pins.
+    /// it re-splits there.
     policy: ResizePolicy,
 }
 
 /// Where an incrementally-stepped rewrap currently is. Private: callers only
 /// see [`ReflowStep`].
 enum ReflowPhase {
-    /// The streaming rewrap (RFL-2): read input from the FRONT of the store
-    /// (front-truncating it as it is consumed), then from the newer
-    /// `lazy_lines` tail; rewrap every COMPLETED logical line and push it
-    /// straight onto the BACK of the SAME store (re-compressing immediately).
-    /// The tier pipeline is a FIFO, so at any instant the store holds
-    /// [unread input | rewrapped output] in age order and the indices
-    /// `0..store_input_left` address exactly the input.
+    /// The streaming rewrap: read input from the front of the store
+    /// (truncating it as consumed), then from the newer `lazy_lines`; rewrap
+    /// every completed logical line and push it onto the back of the same
+    /// store. The tier pipeline is a FIFO, so the store holds [unread input |
+    /// rewrapped output] and `0..store_input_left` addresses exactly the input.
     Stream {
         /// Input lines still unread at the store's front.
         store_input_left: usize,
         /// Next `lazy_lines` index to read once the store input is consumed.
         next_lazy: usize,
-        /// The wrap state carried across steps: the trailing logical line
-        /// (a non-wrapped head plus its soft-wrapped continuations) whose run
-        /// may continue into not-yet-read input, held back so a step boundary
-        /// can NEVER split a logical line. Invariant: only `carry[0]` can be
-        /// non-wrapped. This is the job's ONLY unbounded-ish uncompressed
-        /// holding, and it is bounded by one logical run
+        /// The trailing logical line (a non-wrapped head plus its soft-wrapped
+        /// continuations) that may continue into unread input, held back so a
+        /// step boundary never splits a logical line. Invariant: only
+        /// `carry[0]` can be non-wrapped. Bounded by one logical run
         /// (`streaming_step_carry_stays_bounded`).
         carry: Vec<Line>,
     },
     /// Store streaming complete: rewrapping the job-carried ring history
-    /// (`ring_lines`, RFL-1) as its own logical sequence — same budgeted
-    /// carve, same never-split-a-run carry — into `out`, which becomes
-    /// [`ReflowedScrollback::ring_out`]. Runs LAST because the ring history is
-    /// newer than everything in the store and never enters the store's
-    /// line-limit accounting.
+    /// (`ring_lines`) as its own logical sequence, with the same budgeted carve
+    /// and carry, into `out`, which becomes [`ReflowedScrollback::ring_out`].
+    /// Runs last because the ring history is newer than the store and never
+    /// enters the store's line-limit accounting.
     RingRewrap {
         /// Next `ring_lines` index to read.
         next_input: usize,
@@ -245,54 +213,38 @@ impl ReflowPhase {
 }
 
 /// The store's own eviction limits (total-line cap and byte budget), lifted at
-/// the first [`PendingScrollbackReflow::reflow_step`] and restored — with one
-/// final enforcement pass — by the step that finishes the store's output.
+/// the first [`PendingScrollbackReflow::reflow_step`] and restored, with one
+/// enforcement pass, by the step that finishes the store's output.
 ///
-/// WHY: both limits enforce by evicting the store's OLDEST lines, which
-/// mid-stream is the UNREAD INPUT at the store's front. An eviction there
-/// would silently drop history the materialize-everything rewrap would have
-/// kept. Lifting for the flight and enforcing once at the end is safe, and
-/// for the LINE limit it lands on the identical final state: truncation keeps
-/// the newest `limit` lines, exactly the survivors of push-time eviction
-/// (`streaming_matches_materialize_all_reference` pins that, tight-limit
-/// corpus included).
+/// Both limits evict the store's oldest lines, which mid-stream are the unread
+/// input at its front. Enforcing once at the end is safe. For the line limit
+/// it gives the identical final state (the newest `limit` lines;
+/// `streaming_matches_materialize_all_reference`).
 ///
-/// The BYTE budget is the honest exception, and it is a difference of
-/// eviction DEPTH, never of content: push-time enforcement runs while the
-/// newest output is still uncompressed in the hot tier, end-of-flight
-/// enforcement runs once the whole result has been re-tiered, so the two stop
-/// at "under budget" after evicting different numbers of the OLDEST lines.
-/// Every line that survives is byte-identical and in order — the historical
-/// shape's result is exactly the newest suffix of this one — and end-of-flight
-/// enforcement never keeps FEWER lines (measured: 377 vs 277 retained at a
-/// 10 KB budget, i.e. MORE history for the same bytes).
-/// `streaming_under_byte_budget_pressure_keeps_a_longer_suffix` pins that
-/// boundary in both directions.
+/// For the byte budget, end-of-flight enforcement (after re-tiering) and
+/// push-time enforcement (with the newest output still uncompressed) stop at
+/// different eviction depths: surviving lines are identical and in order,
+/// and end-of-flight never keeps fewer
+/// (`streaming_under_byte_budget_pressure_keeps_a_longer_suffix`).
 ///
-/// Transient cost of the lift, stated plainly: while the budget is off the
-/// output side does not evict, so a store that was already AT its byte budget
-/// can end the flight over it (by the rewrap's own growth) until the
-/// restoring step trims it. The per-tier `hot_limit` / `warm_limit`
-/// promotions are NOT lifted, so hot+warm RAM stays bounded throughout and
-/// the excess lives in the compressed cold tier (on disk for the disk-backed
-/// store) — several orders below the O(total-history-UNCOMPRESSED) cliff this
-/// design exists to delete.
+/// While lifted, a store already at its byte budget can end the flight over it
+/// until the restoring step trims it. The per-tier `hot_limit` / `warm_limit`
+/// promotions are not lifted, so hot+warm RAM stays bounded and the excess
+/// sits in the compressed cold tier.
 struct LiftedStoreLimits {
     line_limit: Option<usize>,
     memory_budget: usize,
 }
 
-/// The outcome of one [`PendingScrollbackReflow::reflow_step`] call — a
-/// consuming-iterator design so an exhausted job cannot be stepped again and a
-/// half-stepped job cannot be re-attached: the ONLY way to a
-/// [`ReflowedScrollback`] is through `Done`, i.e. a completed rewrap.
+/// The outcome of one [`PendingScrollbackReflow::reflow_step`] call. An
+/// exhausted job cannot be stepped again and a half-stepped job cannot be
+/// re-attached: the only way to a [`ReflowedScrollback`] is through `Done`.
 #[must_use = "keep stepping InProgress (or re-attach Done), or history is lost"]
 pub enum ReflowStep {
-    /// More work remains — call [`PendingScrollbackReflow::reflow_step`] again.
-    /// Dropping this instead has the same bounded-loss semantics as dropping a
-    /// never-started job: the detached history is lost with it, and the grid
-    /// must be recovered via [`Grid::abort_reflow_offload`] (or superseded, as
-    /// the wasm modules' newest-wins overwrite does).
+    /// More work remains; call [`PendingScrollbackReflow::reflow_step`] again.
+    /// Dropping this loses the detached history, like dropping a never-started
+    /// job; recover the grid via [`Grid::abort_reflow_offload`] (or supersede
+    /// it, as the wasm modules' newest-wins overwrite does).
     InProgress(PendingScrollbackReflow),
     /// The rewrap is complete and re-filled into the store, ready for
     /// [`Grid::reattach_reflowed_scrollback`]. Identical to what the one-shot
@@ -306,15 +258,14 @@ pub enum ReflowStep {
 #[must_use = "a reflowed scrollback store must be re-attached, or history is lost"]
 pub struct ReflowedScrollback {
     store: ScrollbackStorage,
-    /// The ring history rewrapped to `new_cols` (RFL-1), returned to the ring
-    /// (or the store, where flight content claimed its seat) by
+    /// The ring history rewrapped to `new_cols`, returned to the ring (or the
+    /// store, where flight content took its seat) by
     /// [`Grid::reattach_ring_history`].
     ring_out: Vec<Line>,
     new_cols: u16,
     prev_offset: usize,
-    /// See [`PendingScrollbackReflow::detach_live_bottom_gen`] — carried through the
-    /// rewrap unchanged, so every chunked schedule re-attaches on the same
-    /// baseline the one-shot does.
+    /// See [`PendingScrollbackReflow::detach_live_bottom_gen`]; carried through
+    /// unchanged, so every chunked schedule re-attaches on the same baseline.
     detach_live_bottom_gen: u64,
     clear_gen: u64,
 }
@@ -336,9 +287,8 @@ impl PendingScrollbackReflow {
     }
 
     /// How far the rewrap is: input lines read so far, of
-    /// [`Self::lines_total`]. Monotone, and equal to the total once the last
-    /// step has read everything (the step that returns `Done`). The progress
-    /// a watcher shows (design ruling 233); O(1), no store access.
+    /// [`Self::lines_total`]. Monotone, and equal to the total on the step that
+    /// returns `Done`. O(1), no store access.
     #[must_use]
     pub fn lines_done(&self) -> usize {
         self.lines_read.min(self.lines_total)
@@ -353,27 +303,25 @@ impl PendingScrollbackReflow {
     }
 
     /// The number of history lines to rewrap (for logging / progress) —
-    /// tiered + lazy-staged + ring (RFL-1).
+    /// tiered + lazy-staged + ring.
     #[must_use]
     pub fn line_count(&self) -> usize {
         self.store.line_count() + self.lazy_lines.len() + self.ring_lines.len()
     }
 
-    /// The EXPENSIVE step — run this OFF the caller's thread and lock. It
-    /// decompresses every stored line, rewraps the whole history to `new_cols`
-    /// (`reflow_scrollback_lines`, O(total cells)), and STREAMS the result
-    /// back into the same store: input is front-truncated out as it is read,
-    /// completed runs re-compress immediately onto the back (RFL-2), so even
-    /// this one-shot holds only O(one logical run) of history uncompressed at
-    /// a time. The store keeps its identity and tier configuration; its
-    /// `line_limit` / memory budget are lifted for the flight and re-enforced
-    /// when the store's output completes ([`LiftedStoreLimits`]). This is the
-    /// work that, run synchronously on the main thread, froze the Mac.
+    /// The expensive step; run it off the caller's thread and lock. Decompresses
+    /// every stored line, rewraps the whole history to `new_cols`
+    /// (`reflow_scrollback_lines`, O(total cells)), and streams the result back
+    /// into the same store (input truncated as read, completed runs
+    /// re-compressed onto the back), so only O(one logical run) is held
+    /// uncompressed. The store keeps its identity and tier configuration; its
+    /// `line_limit` and memory budget are lifted for the flight and re-enforced
+    /// when the store's output completes ([`LiftedStoreLimits`]).
     ///
     /// Exactly [`reflow_step`](Self::reflow_step) with an unlimited budget,
-    /// driven until `Done` — the one-shot and every chunked schedule produce
-    /// the identical [`ReflowedScrollback`].
-    // Cost: O(session history) in ONE call, honestly — the whole job. Callers
+    /// driven until `Done`; every chunked schedule produces the identical
+    /// [`ReflowedScrollback`].
+    // Cost: O(session history) in ONE call — the whole job. Callers
     // that must bound per-call latency use `reflow_step` instead.
     pub fn reflow(self) -> ReflowedScrollback {
         let mut job = self;
@@ -385,56 +333,41 @@ impl PendingScrollbackReflow {
         }
     }
 
-    /// Advance the rewrap by a BOUNDED increment: read and rewrap up to
-    /// `max_lines` INPUT history lines (a `max_lines` of 0 is treated as 1 so a
-    /// step always makes progress), then yield. Call again on
-    /// [`ReflowStep::InProgress`]; [`ReflowStep::Done`] carries the completed
-    /// [`ReflowedScrollback`] — byte-identical to the one-shot
-    /// [`reflow`](Self::reflow) for ANY schedule of budgets (the
-    /// `reflow_step_any_schedule_matches_one_shot` property).
+    /// Advance the rewrap by a bounded increment: read and rewrap up to
+    /// `max_lines` input history lines (0 is treated as 1), then yield. Call
+    /// again on [`ReflowStep::InProgress`]; [`ReflowStep::Done`] carries the
+    /// completed [`ReflowedScrollback`], byte-identical to the one-shot
+    /// [`reflow`](Self::reflow) for any schedule
+    /// (`reflow_step_any_schedule_matches_one_shot`).
     ///
-    /// Chunks are carved ONLY at unwrapped-logical-line boundaries: a logical
+    /// Chunks are carved only at unwrapped-logical-line boundaries: a logical
     /// line (a row plus its soft-wrapped continuations) is never split across
-    /// steps — its trailing, possibly-still-continuing run is carried to the
-    /// next step instead (a wrong carve here would corrupt scrollback content,
-    /// the exact thing the offload protocol's NoLoss/ErasedStaysErased
-    /// obligations exist to prevent).
+    /// steps; its trailing run is carried to the next step.
     ///
-    /// Safety invariants while stepping (all unchanged from the one-shot):
-    /// the job owns its data — the store is detached, so stepping runs outside
-    /// the term lock and the grid never observes partial progress; re-attach
-    /// still takes only a COMPLETED result (partial-progress re-attach is
-    /// explicitly out of scope); the `clear_gen` staleness capture is per-JOB,
-    /// taken at detach, never re-sampled per step; and dropping a half-stepped
-    /// job has the same bounded-loss semantics as dropping the one-shot job
-    /// (the detached history goes with it — recover the grid via
+    /// The job owns its data, so stepping runs outside the term lock and the
+    /// grid never observes partial progress; re-attach takes only a completed
+    /// result; `clear_gen` is captured per job at detach; and dropping a
+    /// half-stepped job loses the detached history (recover via
     /// [`Grid::abort_reflow_offload`]).
-    // COST: O(max_lines × cols) per step — ≤ max_lines input-line reads
-    // (tiered decompress, lazy take, or ring-line move), plus rewrap + push
-    // (re-compress) of the completed logical lines among them. MEMORY:
-    // O(max_lines + one logical run) uncompressed — input is front-truncated
-    // out of the store as it is consumed and output re-compresses immediately
-    // (RFL-2), so the job never holds the history materialized. NOT UNBOUNDED
-    // in the census sense — the caller's budget bounds it — with two honest
-    // caveats: (1) a logical line is never split, so the single step that
-    // completes a soft-wrapped run longer than max_lines rewraps that whole
-    // run at once (runs are capped at MAX_LOGICAL_WIDTH accumulated display
-    // cells); (2) a step's front truncation may land mid-block, so the next
-    // step re-decodes at most one warm/cold block — bounded, amortized by the
-    // block caches.
+    // COST: O(max_lines × cols) per step: ≤ max_lines input-line reads (tiered
+    // decompress, lazy take, or ring-line move) plus rewrap and re-compress of
+    // the completed runs among them. Memory: O(max_lines + one logical run)
+    // uncompressed. Bounded by the caller's budget, with two caveats: a
+    // logical line is never split, so the step completing a run longer than
+    // max_lines rewraps it whole (runs are capped at MAX_LOGICAL_WIDTH
+    // cells); and a front truncation landing mid-block makes the next step
+    // re-decode at most one warm/cold block, amortized by the block caches.
     pub fn reflow_step(mut self, max_lines: usize) -> ReflowStep {
         let budget = max_lines.max(1);
-        // First step of the STREAM phase: move the store's own eviction limits
-        // out of the way for the flight (see `LiftedStoreLimits`); the step
-        // that finishes the store's output restores and enforces them.
+        // First step of the stream phase: lift the store's eviction limits for
+        // the flight (see `LiftedStoreLimits`); the step finishing the store's
+        // output restores them.
         //
-        // The gate is the PHASE, not `is_none()` alone: the store phase clears
-        // `lifted_limits` when it restores them, and the ring phase (RFL-1)
-        // runs afterwards — an `is_none()`-only guard would re-lift on the
-        // first ring step and, with no second restore to follow, hand back a
-        // store whose line limit and byte budget were gone for good.
-        // `streaming_matches_materialize_all_reference`'s limit round-trip
-        // assertions are the regression guard.
+        // Gated on the phase, not just `is_none()`: the store phase clears
+        // `lifted_limits` when restoring, and the ring phase runs afterwards,
+        // so an `is_none()`-only guard would re-lift on the first ring step and
+        // never restore. `streaming_matches_materialize_all_reference`'s limit
+        // round-trip assertions guard this.
         if self.lifted_limits.is_none() && matches!(self.phase, ReflowPhase::Stream { .. }) {
             let lifted = LiftedStoreLimits {
                 line_limit: self.store.line_limit(),
@@ -461,11 +394,10 @@ impl PendingScrollbackReflow {
                 carry.reserve(read);
                 let from_store = read.min(*store_input_left);
                 for i in 0..from_store {
-                    // Tiered store lines first (older), decompressed here off
-                    // the lock. The store's FRONT is the oldest unread input;
-                    // output pushed by earlier steps lives BEHIND the input
-                    // region (the tier pipeline is a FIFO), so
-                    // `0..store_input_left` addresses exactly the input.
+                    // Tiered store lines first (older), decompressed off the
+                    // lock. Output from earlier steps sits behind the input
+                    // region (FIFO), so `0..store_input_left` is exactly the
+                    // input.
                     let line = match self.store.get_line(i) {
                         Ok(Some(line)) => line.into_owned(),
                         // A decode failure must not silently truncate older
@@ -476,20 +408,17 @@ impl PendingScrollbackReflow {
                     carry.push(line);
                 }
                 if from_store > 0 {
-                    // Release the consumed input NOW — the memory lever of the
-                    // streaming design (RFL-2): whole warm blocks / cold pages
-                    // free as the front offset crosses them, so the store never
-                    // holds [full input | full output] at once and the job
-                    // never holds the input materialized.
+                    // Release the consumed input now: whole warm blocks / cold
+                    // pages free as the front offset crosses them, so the store
+                    // never holds full input plus full output.
                     if let Err(error) = self.store.truncate_oldest(from_store) {
                         aterm_log::warn!("offload reflow: input front-truncation failed: {error}");
                     }
                     *store_input_left -= from_store;
                 }
                 for _ in from_store..read {
-                    // Then the (newer) lazy-staged lines that had not yet been
-                    // compressed (blank left behind; freed when the input
-                    // exhausts).
+                    // Then the newer lazy-staged lines (blank left behind,
+                    // freed when the input exhausts).
                     carry.push(std::mem::replace(
                         &mut self.lazy_lines[*next_lazy],
                         Line::new(),
@@ -498,14 +427,12 @@ impl PendingScrollbackReflow {
                 }
 
                 if read == total_left {
-                    // Input exhausted: every carried run is complete — unless
-                    // the newest one CONTINUES into the job-carried ring
-                    // history (its head left the ring for the store while its
-                    // tail is still ring-resident). Under ConPTY that run goes
-                    // to the ring phase whole: rewrapped here it would come
-                    // back as a head plus a tail line of its own — measured on
-                    // an 8-line ring, `col-test 26` (102 columns) split into
-                    // its 80-column head and a 22-column orphan at every widen.
+                    // Input exhausted: every carried run is complete, unless the
+                    // newest continues into the job-carried ring history (its
+                    // head left the ring for the store, its tail is still in the
+                    // ring). Under ConPTY that run goes to the ring phase whole;
+                    // rewrapped here it would come back as a head plus an orphan
+                    // tail line.
                     let straddling = if self.policy == ResizePolicy::ConPty
                         && self.ring_lines.first().is_some_and(Line::is_wrapped)
                     {
@@ -527,15 +454,13 @@ impl PendingScrollbackReflow {
                             );
                         }
                     }
-                    // Restore the store's own limits, in the enforcing
-                    // direction: the line limit first (front-truncates to the
-                    // newest `limit` lines — the same survivors push-time
-                    // eviction leaves), then the byte budget (re-tiers and, if
-                    // still over, FIFO-evicts from the front of the finished
-                    // output). Only now is enforcement safe: mid-flight it
-                    // would have evicted the store's FRONT, i.e. unread INPUT.
-                    // The ring phase never touches the store, so restoring
-                    // here — not at Done — keeps eviction ordering exact.
+                    // Restore the store's limits, enforcing: the line limit
+                    // first (keeping the newest `limit` lines, as push-time
+                    // eviction would), then the byte budget (re-tier, then FIFO
+                    // evict from the front of the finished output). Mid-flight
+                    // this would have evicted unread input. The ring phase never
+                    // touches the store, so restoring here keeps eviction order
+                    // exact.
                     if let Some(limits) = self.lifted_limits.take() {
                         self.store.set_line_limit(limits.line_limit);
                         if let Err(error) = self.store.set_memory_budget(limits.memory_budget) {
@@ -544,23 +469,20 @@ impl PendingScrollbackReflow {
                             );
                         }
                     }
-                    // The ring history (RFL-1) rewraps next, as its own
-                    // budgeted phase, carrying the straddling run as the head
-                    // of its first logical line (the carry invariant: only
-                    // `carry[0]` is not a continuation).
+                    // The ring history rewraps next as its own budgeted phase,
+                    // carrying the straddling run as the head of its first
+                    // logical line (only `carry[0]` is not a continuation).
                     self.phase = ReflowPhase::RingRewrap {
                         next_input: 0,
                         carry: straddling,
                         out: Vec::new(),
                     };
                 } else {
-                    // Carve at the LAST unwrapped-logical-line boundary among
-                    // the newly read lines (older carry is all continuations
-                    // of its head by the `carry` invariant): completed runs
-                    // are rewrapped and re-compressed onto the store NOW; the
-                    // trailing run stays carried. No boundary in this chunk:
-                    // the whole chunk continues the carried run — keep
-                    // carrying (never split a logical line).
+                    // Carve at the last unwrapped-logical-line boundary among the
+                    // newly read lines (older carry is all continuations of its
+                    // head): completed runs are rewrapped and re-compressed onto
+                    // the store now; the trailing run stays carried. With no
+                    // boundary, the whole chunk continues the carried run.
                     if let Some(rel) = carry[appended_from..]
                         .iter()
                         .rposition(|line| !line.is_wrapped())
@@ -595,9 +517,8 @@ impl PendingScrollbackReflow {
                 carry.reserve(end - *next_input);
                 self.lines_read = self.lines_read.saturating_add(end - *next_input);
                 for line in &mut self.ring_lines[*next_input..end] {
-                    // Take by replace (blank left behind, freed below): the
-                    // ring lines are already materialized, so a "read" here is
-                    // a move, not a decompress.
+                    // Take by replace: ring lines are already materialized, so
+                    // this is a move, not a decompress.
                     carry.push(std::mem::replace(line, Line::new()));
                 }
                 *next_input = end;
@@ -627,15 +548,12 @@ impl PendingScrollbackReflow {
     }
 }
 
-/// Carve `carry` at the LAST unwrapped-logical-line boundary among the lines
-/// appended this step (older carry is all continuations of its head by the
-/// `carry` invariant, so scanning the appended region is exhaustive):
-/// everything before the boundary is completed runs — rewrapped into `out` —
-/// while the trailing, possibly-still-continuing run stays carried. No boundary
-/// in the appended region means the whole chunk continues the carried run:
-/// keep carrying (never split a logical line). Used by the ring phase; the
-/// store phase streams its completed runs straight into the store instead of
-/// accumulating them (RFL-2), so its carve is inlined there.
+/// Carve `carry` at the last unwrapped-logical-line boundary among the lines
+/// appended this step (older carry is all continuations of its head, so
+/// scanning the appended region suffices): completed runs before it are
+/// rewrapped into `out`; the trailing run stays carried. With no boundary the
+/// whole chunk keeps carrying. Used by the ring phase; the store phase inlines
+/// its carve and streams completed runs straight into the store.
 fn carve_completed_runs(
     carry: &mut Vec<Line>,
     appended_from: usize,
@@ -666,7 +584,7 @@ impl ReflowedScrollback {
     }
 
     /// The number of rewrapped history lines ready to re-attach (store +
-    /// ring history, RFL-1).
+    /// ring history).
     #[must_use]
     pub fn line_count(&self) -> usize {
         self.store.line_count() + self.ring_out.len()
@@ -675,31 +593,22 @@ impl ReflowedScrollback {
 
 impl Grid {
     /// Resize like [`Grid::resize`], but move the unbounded tiered off-screen
-    /// scrollback OFF the synchronous path.
+    /// scrollback off the synchronous path.
     ///
-    /// On a WIDTH change with reflow enabled and a tiered store attached: detach
-    /// the tiered store (O(1)) and lift the ring's scrollback rows into the job
-    /// (O(ring) materialization, RFL-1) BEFORE resizing, so the synchronous
-    /// reflow inside [`Grid::resize`] finds no off-screen history at all and
-    /// costs O(viewport), then return the detached history as a `Send`
-    /// [`PendingScrollbackReflow`]. The caller must
+    /// On a width change with reflow enabled and a tiered store attached:
+    /// detach the store (O(1)) and lift the ring's scrollback rows into the job
+    /// (O(ring) materialization) before resizing, so the synchronous reflow
+    /// inside [`Grid::resize`] costs O(viewport), then return the detached
+    /// history as a `Send` [`PendingScrollbackReflow`]. The caller must
     /// [`reflow`](PendingScrollbackReflow::reflow) it off-thread and
     /// [`reattach`](Grid::reattach_reflowed_scrollback) the result, or history is
     /// lost.
     ///
     /// Returns `None` (and is exactly [`Grid::resize`]) when the width is
-    /// unchanged, reflow is disabled, or no tiered store is attached — in those
-    /// cases the resize is already bounded by the viewport.
-    ///
-    /// That last clause is load-bearing and was, for the width-unchanged arm,
-    /// FALSE until `adjust_row_count` grew its rows-only branch: the plain
-    /// resize compared the whole ring against the new VISIBLE row target and
-    /// migrated every ring-resident history row into the store, so a
-    /// window-height drag on a 10,000-line ring cost ~9,999 rows per pane per
-    /// event on this same synchronous path. It is true now because
-    /// `adjust_row_count_rows_only` reclassifies in place; the obligation is
-    /// gated by `tests/reflow/rows_only_cost_bound.rs`, the rows-only sibling of
-    /// the width gate in `tests/reflow/cost_bound.rs`.
+    /// unchanged, reflow is disabled, or no tiered store is attached; those
+    /// resizes are already bounded by the viewport (for the width-unchanged
+    /// case because `adjust_row_count_rows_only` reclassifies in place, gated
+    /// by `tests/reflow/rows_only_cost_bound.rs`).
     pub fn resize_offloading_scrollback(
         &mut self,
         new_rows: u16,
@@ -711,8 +620,8 @@ impl Grid {
     /// [`Self::resize_offloading_scrollback`] under an explicit
     /// [`ResizePolicy`]. `Native` is exactly that method; `ConPty` skips the
     /// two bottom-anchoring moves conhost's post-resize repaint would paint
-    /// over — the boundary-continuation lift into the job and the deficit fill
-    /// at re-attach (see `ResizePolicy` for the measurements).
+    /// over: the boundary-continuation lift into the job and the deficit fill
+    /// at re-attach (see `ResizePolicy`).
     pub fn resize_offloading_scrollback_with_policy(
         &mut self,
         new_rows: u16,
@@ -728,15 +637,14 @@ impl Grid {
             return None;
         }
 
-        // Extract the off-screen history cheaply, WITHOUT (de)compressing on this
-        // thread — all three layers, in age order:
-        //  1. lazy_lines: uncompressed staged lines (mid-age). Must be taken BEFORE
-        //     detaching the store, else the resize's `drain_lazy_buffer` discards
-        //     them (it drops staged lines when no store is attached).
+        // Extract the off-screen history without (de)compressing on this
+        // thread, all three layers in age order:
+        //  1. lazy_lines: uncompressed staged lines (mid-age), taken before
+        //     detaching the store, else the resize's `drain_lazy_buffer` drops
+        //     them.
         //  2. store: the compressed tiered/disk history (oldest), detached O(1).
-        //  3. ring_lines: the ring's scrollback rows (newest), materialized below
-        //     — the ONLY ring-sized synchronous cost left (RFL-1): the rewrap and
-        //     the row rebuild ride the job instead of running under this lock.
+        //  3. ring_lines: the ring's scrollback rows (newest), materialized
+        //     below; the only ring-sized synchronous cost.
         let prev_offset = self.storage.display_offset; // bug D: reader's scroll pos pre-resize
         let clear_gen = self.storage.scrollback_clear_gen; // bug C: erase generation at detach
         let lazy_lines: Vec<Line> = self.storage.lazy_buffer.drain_all().collect();
@@ -759,62 +667,47 @@ impl Grid {
             .scrollback
             .take()
             .expect("scrollback.is_none() early-returned above");
-        // RFL-1: lift the ring history into the job too. Materializing rows →
-        // Lines is the whole remaining synchronous ring cost — no rewrap, no
-        // row rebuild. The ring is left EMPTY, so the resize below finds
-        // nothing off-screen and its synchronous rewrap count is ZERO
-        // (`offloaded_resize_synchronous_rewrap_is_zero` pins this).
+        // Lift the ring history into the job too; materializing rows → Lines is
+        // the only remaining synchronous ring cost. The ring is left empty, so
+        // the resize below rewraps nothing off-screen
+        // (`offloaded_resize_synchronous_rewrap_is_zero`).
         //
-        // Bottom-anchor bookkeeping (fixwave5): capture the pre-resize
-        // trailing-blank count FIRST — the deficit fill cannot run inside the
-        // synchronous resize (the history is out with the worker), so it runs
-        // at re-attach against this target instead.
+        // Capture the pre-resize trailing-blank count first: the deficit fill
+        // cannot run inside the synchronous resize (the history is with the
+        // worker), so it runs at re-attach against this target.
         let pending_fill_target = self.trailing_blank_rows_below_cursor();
         let mut ring_lines = self.take_ring_scrollback_lines();
         // Lift the viewport's leading soft-wrap continuation rows into the
-        // job's ring sequence (fixwave5): their logical line's HEAD is the
-        // newest ring history line, so joining them here lets the off-thread
-        // rewrap process the boundary-straddling line as ONE unit; the
-        // re-attach deficit fill pulls the rewrapped tail back into view.
+        // job's ring sequence: their head is the newest ring history line, so
+        // the straddling line rewraps as one unit, and the re-attach deficit
+        // fill pulls the tail back into view.
         //
-        // Neither under ConPTY. The fill runs at re-attach, which is AFTER
-        // conhost's repaint has already painted the viewport row-0-anchored
-        // with the freed rows `CSI K` (measured, `ResizePolicy`): it would
-        // re-seat the newest history line on top of an already-complete frame
-        // and shift conhost's rows down under it — the audit's duplicated
-        // 80-col wrap fragment, and the 58-not-57 history line count after
-        // narrowing back. With no fill, the lift would strand the tail in
-        // history while conhost keeps painting it at row 0; so the seam stays
-        // where conhost keeps it (`reflow.rs`, the synchronous twin). The
-        // synchronous resize below then severs that fragment from its head
-        // (`sever_top_row_continuation`) — AFTER the take above has read the
-        // head at the full width autowrap filled it to, which is the order the
-        // sever needs.
+        // Not under ConPTY: the fill would run after conhost has repainted the
+        // viewport row-0-anchored, re-seating a line on top of a complete frame
+        // and duplicating it; and without the fill the lift would strand the
+        // tail in history while conhost keeps painting it at row 0. The
+        // synchronous resize below severs that fragment from its head
+        // (`sever_top_row_continuation`) after the take above read the head at
+        // its full width.
         if policy == ResizePolicy::Native {
             ring_lines.extend(self.take_boundary_continuation_lines());
             self.storage.pending_fill_target = Some(pending_fill_target);
         }
 
         // With the store detached, the lazy buffer emptied and the ring history
-        // lifted into the job, the resize's `take_scrollback_lines` rewraps
-        // NOTHING — the synchronous cost is the visible-grid reflow,
-        // O(viewport), the budget the bounded-cost obligation checks.
+        // in the job, the resize's `take_scrollback_lines` rewraps nothing: the
+        // synchronous cost is the visible-grid reflow, O(viewport).
         self.resize_with_policy(new_rows, new_cols, policy);
-        // This window's reader-descent baseline. The resize above just clamped
-        // `display_offset` to `prev_offset.min(scrollback_lines())` with all three
-        // history layers already in this job, so the VALUE it left is worthless as a
-        // baseline — measured, 0 on every widen and on short-line content in either
-        // direction, whatever the reader had been doing. The generation is not:
-        // machine motion (that clamp included) leaves it alone, so any advance seen
-        // at re-attach is the reader's own hand on the viewport. Sampled AFTER the
-        // resize so the resize's own clamp sits inside the baseline rather than being
-        // counted against it. Read the guard in `reattach_reflowed_scrollback` for
-        // what it buys.
+        // This window's reader-descent baseline. The resize just clamped
+        // `display_offset` against an empty history, so its value says nothing
+        // about the reader; the generation does, because machine motion (that
+        // clamp included) never advances it. Sampled after the resize so the
+        // resize's own clamp is inside the baseline. See the guard in
+        // `reattach_reflowed_scrollback`.
         let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
 
-        // Enter the reflow window AFTER resize (so the resize itself runs exactly as
-        // the plain path): from here until re-attach, scroll-off keeps being staged
-        // to the lazy buffer instead of dropped (audit bug B).
+        // Enter the reflow window after the resize, so the resize runs as the
+        // plain path; until re-attach, scroll-off is staged to the lazy buffer.
         self.storage.scrollback_detached_for_reflow = true;
         self.storage.pending_scrollback_settings = Some(pending_settings);
         // Ruling 238: the window opens with no reader aim.
@@ -842,55 +735,48 @@ impl Grid {
     /// history, after [`resize_offloading_scrollback`](Self::resize_offloading_scrollback)
     /// detached it and a worker [`reflow`](PendingScrollbackReflow::reflow)ed it.
     ///
-    /// If a tiered store already exists (e.g. a terminal reset raced the reflow),
-    /// the rewrapped history is dropped rather than clobber current state. If the
-    /// grid width changed again while the reflow ran, the store is still attached
-    /// — its content is valid; the stale wrapping self-heals on the next width
-    /// change (which re-detaches and re-reflows it).
+    /// If a tiered store already exists (e.g. a terminal reset raced the
+    /// reflow), the rewrapped history is dropped rather than clobber current
+    /// state. If the width changed again meanwhile, the store is still attached
+    /// with valid content; the stale wrapping heals on the next width change.
     ///
     /// Shipping drivers use
-    /// [`reattach_reflowed_scrollback_or_redetach`](Self::reattach_reflowed_scrollback_or_redetach)
-    /// (RFL-3), which turns that "next width change" self-heal into an
-    /// immediate convergence pass; this non-converging entry point keeps the
-    /// exact one-window semantics and remains the Tier-1 conformance binding
-    /// (the spec models one detach window at a time).
+    /// [`reattach_reflowed_scrollback_or_redetach`](Self::reattach_reflowed_scrollback_or_redetach),
+    /// which converges immediately instead; this entry point keeps one-window
+    /// semantics and is the Tier-1 conformance binding (the spec models one
+    /// detach window at a time).
     pub fn reattach_reflowed_scrollback(&mut self, reflowed: ReflowedScrollback) {
         // The reflow window is over: stop staging scroll-off as "detached" — the
         // store (old or freshly attached below) is authoritative again.
         self.storage.scrollback_detached_for_reflow = false;
-        // Ruling 238: where the reader asked to go while the history was away,
-        // and the row counter the aim's growth is measured to — sampled BEFORE
-        // this re-attach moves any line. Taken on every branch; applied only on
-        // the normal one (an erase resets the viewport, a replacement store was
-        // never the history the reader aimed into).
+        // Where the reader asked to go while the history was away, and the row
+        // counter the aim's growth is measured against, sampled before this
+        // re-attach moves any line. Applied only on the normal branch (an erase
+        // resets the viewport; a replacement store is not the history aimed at).
         let reader_aim = self.storage.detached_reader_aim.take();
         let counter_at_reattach = self.storage.absolute_row_counter;
 
         if self.storage.scrollback.is_some() {
-            // A terminal reset re-created the tiered store during the reflow; don't
-            // clobber it (would corrupt history ordering). The reflowed store drops.
-            // The job-carried ring history is NOT part of the store the
-            // replacement supersedes — it re-enters the ring (capped), the same
-            // seat the pre-RFL-1 design kept it in across a replacement race.
-            // The reset also superseded the deficit-fill debt (fixwave5).
+            // A terminal reset re-created the tiered store during the reflow;
+            // don't clobber it. The reflowed store drops; the job-carried ring
+            // history re-enters the ring (capped). The reset also supersedes the
+            // deficit-fill debt.
             self.storage.pending_fill_target = None;
             self.reconcile_pending_scrollback_settings();
             self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
             return;
         }
 
-        // Audit bug C: scrollback was ERASED (ED3 / `clear` / reset) during the
-        // window. Do NOT resurrect the pre-erase history — attach an EMPTY store and
-        // keep only the post-erase output the ring/lazy captured after the clear.
-        // The job-carried ring history predates the erase too: `ring_out` drops
-        // with the store content (ErasedStaysErased — pre-RFL-1 the erase wiped
-        // those rows in the ring; in flight they die here, same outcome).
+        // Scrollback was erased (ED3 / `clear` / reset) during the window: do
+        // not resurrect pre-erase history. Attach an empty store and keep only
+        // the post-erase output the ring/lazy captured. The job-carried ring
+        // history predates the erase too, so `ring_out` drops as well.
         if reflowed.clear_gen != self.storage.scrollback_clear_gen {
             let mut store = reflowed.store;
             let _ = store.clear();
             self.storage.scrollback = Some(store);
             // An erase means the pre-erase blanks are GENUINE now: never fill
-            // them from (erased) history (fixwave5).
+            // them from (erased) history.
             self.storage.pending_fill_target = None;
             self.reconcile_pending_scrollback_settings();
             self.drain_lazy_buffer(); // post-erase window output (erase cleared the pre-erase lazy)
@@ -902,88 +788,58 @@ impl Grid {
 
         self.storage.scrollback = Some(reflowed.store);
         self.reconcile_pending_scrollback_settings();
-        // RFL-1: the ring history returns BEFORE the lazy drain below, so the
-        // final order is [old history | old ring history | window output | live
-        // ring] — see `reattach_ring_history` for the seat arithmetic.
+        // The ring history returns before the lazy drain below, so the final
+        // order is [old history | old ring history | window output | live
+        // ring]; see `reattach_ring_history` for the seat arithmetic.
         self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
-        // Audit bug B: flush the lines that scrolled off during the window (staged in
-        // the lazy buffer) into the store AFTER the reflowed old history — yielding
-        // the documented order [old history | window output | live ring].
+        // Flush the lines that scrolled off during the window (staged in the
+        // lazy buffer) into the store after the reflowed old history.
         self.drain_lazy_buffer();
-        // Bottom-anchor the viewport (fixwave5): the width-grow that opened
-        // this window unwrapped content into fewer rows, and the synchronous
-        // resize could not pull history back in — it was out with THIS job.
-        // Now the rewrapped history is home, fill the reflow-created blank
-        // band from it, re-seating the boundary line's tail under the content
-        // it belongs to. Only when the job's width still matches (a stale
-        // width re-detaches instead — see
-        // `reattach_reflowed_scrollback_or_redetach` — and fills on ITS
-        // re-attach); the target survives until a width-matched re-attach.
+        // Bottom-anchor the viewport: the width-grow that opened this window
+        // unwrapped content into fewer rows, and the synchronous resize could not
+        // pull history back (it was with this job). Fill the blank band now,
+        // re-seating the boundary line's tail. Only when the job's width still
+        // matches; a stale width re-detaches instead
+        // (`reattach_reflowed_scrollback_or_redetach`) and fills on its own
+        // re-attach, so the target survives until then.
         if reflowed.new_cols == self.storage.cols
             && let Some(target) = self.storage.pending_fill_target.take()
         {
             self.fill_viewport_deficit_from_history(target);
         }
         let sb = self.storage.scrollback_lines();
-        // Audit bug D: restore the reader's pre-detach scroll position clamped to the
-        // regrown full history (the synchronous resize had clamped it to the ring-only
-        // count while the store was detached). EXCEPT when the reader followed output
-        // to the live bottom during the window (display_offset DESCENDED to 0, e.g.
-        // pressed End to watch streaming output) — honor that instead of yanking the
-        // viewport back up to the stale deep position (audit #7).
+        // Restore the reader's pre-detach scroll position, clamped to the
+        // regrown history (the synchronous resize clamped it against an empty
+        // history while the store was out), unless the reader went to the live
+        // bottom during the window (e.g. pressed End to follow output).
         //
-        // "The READER did it" is the whole law, and no reading of `display_offset`
-        // can establish it. This guard used to take a bare `display_offset == 0` as
-        // the reader's choice, but the detach lifts ALL THREE history layers into the
-        // job before the synchronous resize runs, so that resize clamps the reader
-        // against an EMPTY history: measured, a reader 150 rows up in a 300-line log
-        // went to 0 on an 80->100 widen (pixels: ROW0128 on the top row before, the
-        // live `$` prompt after), and with ordinary short lines — which rewrap into
-        // nothing at either width — every width change did it, in both directions.
-        // The guard read that self-inflicted 0 as "the reader pressed End" and
-        // skipped the restore, so the commonest gesture on this surface (scroll back,
-        // widen to see the long lines) silently lost the reader's place with no undo.
+        // Only the reader's own action counts, and `display_offset` cannot
+        // show it: the detach's clamp writes the same 0 as an End press, so a
+        // bare `display_offset == 0` test would lose every scrolled-back
+        // reader's place on a width change. A high-water of the offset during
+        // the window fails the other way, counting machine raises (per-batch
+        // repin, rows-only re-anchor) as something to descend from.
         //
-        // No VALUE can fix that, because the 0 the detach writes and the 0 the reader
-        // chooses are the same 0. Measured on all four axes, `display_offset` sampled
-        // at the detach is 0 on every widen and on short-line content in either
-        // direction, which would leave the exception unable to fire AT ALL for most
-        // real sessions. And a high-water of the offset taken DURING the window fails
-        // the other way: it counts the machine's own raises — SCR-1's per-batch repin,
-        // a rows-only resize re-anchoring the viewport — as "somewhere to descend
-        // from", so the machine could manufacture the reader's consent.
+        // `reader_live_bottom_gen` advances on exactly one event: a
+        // reader-facing scroll primitive taking `display_offset` from non-zero
+        // to zero; machine paths never advance it. So an advance since the
+        // detach is the reader's choice, including scrolling up over output
+        // that streamed in during the window and then pressing End.
         //
-        // The window has to be OBSERVED, and observed by PROVENANCE.
-        // `reader_live_bottom_gen` advances on exactly one event: a reader-facing
-        // scroll primitive taking `display_offset` from non-zero to zero. Nothing the
-        // machine does advances it — each machine path has its own non-bumping entry
-        // (see the field's doc). So a generation that moved while this job was out is
-        // the reader's hand on the wheel and nothing else's, and it sees the case a
-        // detach-time baseline is blind to: a reader who scrolls up over the output
-        // that STREAMED IN during the window and then presses End, descending from a
-        // position that did not exist at the detach (measured against a detach-time
-        // baseline: that reader was yanked 150 rows back up into history).
+        // Residual: where the detach already pinned the viewport to the live
+        // bottom, an End press moves nothing and records nothing, so the
+        // restore wins, which is the right default.
         //
-        // Accepted residual, now for the stated reason rather than by coincidence:
-        // where the detach had already pinned the viewport to the live bottom, an End
-        // press moves nothing, so it records nothing and the restore wins. That is the
-        // right default — the 0 such a reader would be "confirming" is one the resize
-        // inflicted on them, not one they chose.
+        // This is offset identity, not line identity: `prev_offset` is a
+        // distance from the live bottom, so output arriving during the window
+        // shifts the restored view by that much. A width reflow has no
+        // pre→post absolute-row map to do better with.
         //
-        // Still offset-identity, not line-identity: `prev_offset` is a distance from
-        // the live bottom, so when output arrived during the window the restored
-        // viewport lands that many rows above the NEW bottom, not on the line the
-        // reader left. Unchanged by this fix and strictly better than the snap it
-        // replaces; a width reflow has no pre→post absolute-row map to do better with
-        // (see `reflow.rs`'s note on the missing anchor).
-        //
-        // THE READER'S AIM (design ruling 238). A reader who asked, while the
-        // history was away, for more than the attached rows could show — a
-        // scroll up over a history that was not there moved nothing — is owed
-        // that place now it is back, so they need not scroll again: at least
-        // as far up as they asked (never below the restore), the top if they
-        // asked for the top, the live bottom if they came back to it. Gestures
-        // that fit the attached rows record no aim, and the rule stands.
+        // The reader's aim: a reader who asked during the window for more than
+        // the attached rows could show gets that place now: at least as far up
+        // as asked (never below the restore), the top if they asked for the
+        // top, the live bottom if they came back to it. Gestures that fit the
+        // attached rows record no aim.
         let reader_descended_to_live =
             self.storage.reader_live_bottom_gen != reflowed.detach_live_bottom_gen;
         if !(reader_descended_to_live && self.storage.display_offset == 0) {
@@ -995,28 +851,24 @@ impl Grid {
         }
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
+        // The rewrapped history can hold more rows than the counter covers.
+        self.cover_retained_rows();
     }
 
-    /// Re-attach, then CONVERGE (RFL-3): if the grid's width changed while the
-    /// reflow ran (a superseding drag step — the one-detach-in-flight throttle
-    /// meant it detached nothing at the time), the store that just re-attached
-    /// is wrapped at the job's STALE width (its ring history included — the
-    /// mismatch case routes it into the store, see `reattach_ring_history`).
-    /// Instead of parking that staleness until "the next width change" — which
-    /// after a settled drag never comes — immediately re-detach the store for
-    /// one more off-thread rewrap at the CURRENT width and hand the job to the
-    /// caller's existing worker/pump loop.
+    /// Re-attach, then converge: if the width changed while the reflow ran (a
+    /// superseding drag step, which detached nothing), the re-attached store
+    /// (ring history included, routed there by `reattach_ring_history`) is
+    /// wrapped at the job's stale width. Instead of waiting for a next width
+    /// change that may never come, immediately re-detach it for one more
+    /// off-thread rewrap at the current width and return the job.
     ///
-    /// Termination: each returned job carries the width observed at ITS
-    /// detach, so once the width stops moving at most ONE extra pass runs. The
-    /// zero-data-loss supersede semantics are unchanged — nothing is
-    /// cancelled, content re-attaches before every re-detach. The
-    /// erase-during-window and replacement-store races re-attach exactly as
-    /// [`reattach_reflowed_scrollback`](Self::reattach_reflowed_scrollback)
-    /// and never re-detach: an erased store is empty (nothing is mis-wrapped)
-    /// and a replacement store was never rewrapped by this job at all. The
-    /// follow-up job carries no `ring_lines`: the superseding resize already
-    /// rewrapped the live ring synchronously at the settled width.
+    /// Termination: each job carries the width seen at its detach, so once the
+    /// width settles at most one extra pass runs. Nothing is cancelled; content
+    /// re-attaches before every re-detach. The erase-during-window and
+    /// replacement-store races re-attach as
+    /// [`reattach_reflowed_scrollback`](Self::reattach_reflowed_scrollback) and
+    /// never re-detach. The follow-up job carries no `ring_lines`: the
+    /// superseding resize already rewrapped the live ring at the settled width.
     #[must_use = "a returned job is a re-detached store: drive it and re-attach it (or abort), or history is lost"]
     pub fn reattach_reflowed_scrollback_or_redetach(
         &mut self,
@@ -1029,17 +881,14 @@ impl Grid {
         if was_erased || had_replacement || stale_cols == self.storage.cols {
             return None;
         }
-        // Defensive: the normal-path re-attach above always installs a store;
-        // without one there is nothing to converge on. Written as `?` on the
-        // borrow rather than an `if`/`return None` — `clippy::question_mark`
-        // rejects the long form, and the crate denies `clippy::all`.
+        // Defensive: the normal re-attach above always installs a store.
+        // Written as `?` because `clippy::question_mark` rejects the long form.
         self.storage.scrollback.as_ref()?;
 
         // Width mismatch on a normal re-attach: open one more detach window at
-        // the settled width. Same capture set as
-        // `resize_offloading_scrollback`, minus the resize — the grid is
-        // already AT the target geometry (the superseding resize ran it) and
-        // its ring was already rewrapped synchronously by that same resize.
+        // the settled width. Same captures as `resize_offloading_scrollback`
+        // minus the resize: the grid already has the target geometry and its
+        // ring was rewrapped by the superseding resize.
         let prev_offset = self.storage.display_offset;
         let clear_gen = self.storage.scrollback_clear_gen;
         let lazy_lines: Vec<Line> = self.storage.lazy_buffer.drain_all().collect();
@@ -1059,20 +908,14 @@ impl Grid {
             .scrollback
             .take()
             .expect("scrollback.is_none() early-returned above");
-        // The first detach gets this for free from the synchronous resize's own
-        // clamp; this one has no resize behind it, so it must clamp for itself.
-        // Draining the lazy buffer and taking the store above removed history from
-        // UNDER `display_offset` — and the re-attach that just ran restored the
-        // reader to their full-history depth, which the ring alone cannot honor. Left
-        // unclamped the viewport spends the whole converging window addressing
-        // history that is out with the worker (blank rows, and a broken
-        // `display_offset <= scrollback_lines()`). `prev_offset` above was captured
-        // BEFORE the clamp, so the reader's real depth still rides the job home.
+        // Clamp: taking the lazy buffer and store removed history under
+        // `display_offset`, which the re-attach just restored to full-history
+        // depth. Unclamped, the viewport would address history that is with the
+        // worker. `prev_offset` was captured before the clamp, so the reader's
+        // real depth still rides the job.
         self.clamp_display_offset();
-        // This window's own gesture baseline, sampled exactly as the first detach
-        // samples its own. The clamp above is machine motion and does not advance
-        // the generation, so either side of it would read the same; it is taken here
-        // to keep the two detach sites the same shape.
+        // This window's gesture baseline, sampled like the first detach's. The
+        // clamp above does not advance the generation.
         let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
         self.storage.scrollback_detached_for_reflow = true;
         self.storage.pending_scrollback_settings = Some(pending_settings);
@@ -1097,35 +940,25 @@ impl Grid {
         })
     }
 
-    /// Return the job-carried ring history (already rewrapped to `new_cols`,
-    /// RFL-1) to the grid at re-attach.
+    /// Return the job-carried ring history (already rewrapped to `new_cols`)
+    /// to the grid at re-attach.
     ///
-    /// Seat arithmetic: the newest lines re-enter the ring as scrollback rows
-    /// ahead of any flight scroll-off (the pre-RFL-1 placement), via
-    /// `prepend_ring_scrollback_lines` — the O(ring × cols) row rebuild that
-    /// used to run synchronously under the resize now runs here, under the
-    /// brief re-attach lock on the worker's thread. Lines that no longer fit —
-    /// rewrap growth, or a ring that partially refilled during the flight — are
-    /// pushed into the tiered store BEFORE the caller drains the staged window
-    /// output, preserving [old store history | old ring history | window
-    /// output | live ring]; that is exactly where the pre-RFL-1 design's
-    /// over-cap staging landed them too. When staged window output exists (the
-    /// ring filled AND spilled during the flight, or a mid-window height
-    /// shrink staged rows), the WHOLE ring history takes the store route: the
-    /// ring's current rows and the staged spill are both newer, so the front
-    /// of the store is the only order-correct seat left. The store route is
-    /// also taken when the job's width is STALE (a superseding resize landed
-    /// mid-flight): ring rows can only be rebuilt at the grid's CURRENT
-    /// width — a narrower rebuild would truncate the stale-wrapped lines —
-    /// while the store already tolerates over-wide stale lines (its own
-    /// content is equally stale in that race, and the next width change
-    /// re-detaches and rewraps them together).
+    /// The newest lines re-enter the ring as scrollback rows ahead of any
+    /// flight scroll-off, via `prepend_ring_scrollback_lines` (the O(ring ×
+    /// cols) row rebuild, run here under the brief re-attach lock). Lines that
+    /// no longer fit (rewrap growth, or a ring that partly refilled during the
+    /// flight) go into the tiered store before the caller drains the staged
+    /// window output, preserving [old store history | old ring history |
+    /// window output | live ring]. The whole ring history takes the store
+    /// route when staged window output exists (the ring's current rows and the
+    /// spill are both newer, so the store's front is the only order-correct
+    /// seat), and when the job's width is stale (ring rows can only be rebuilt
+    /// at the current width, while the store tolerates over-wide stale lines
+    /// until the next width change rewraps them).
     ///
-    /// Retention note (honest): with the store at its line limit, lines routed
-    /// to the store are subject to its push-time eviction exactly like the
-    /// pre-RFL-1 staging route was; only the rare all-to-store case (flight
-    /// spill) can evict a few lines the old design would have briefly kept in
-    /// the ring — bounded by the ring cap, self-healing as output arrives.
+    /// With the store at its line limit, lines routed there are subject to its
+    /// push-time eviction; the all-to-store case can evict a few lines, bounded
+    /// by the ring cap.
     fn reattach_ring_history(&mut self, mut ring_out: Vec<Line>, new_cols: u16) {
         if ring_out.is_empty() {
             return;
@@ -1150,9 +983,9 @@ impl Grid {
                     }
                 }
             } else {
-                // No store to route into (unreachable from the normal re-attach,
-                // which just attached one): the ring cap is the retention bound —
-                // oldest evicted, the configured ring-only behavior.
+                // No store to route into (unreachable from the normal
+                // re-attach): the ring cap is the retention bound, oldest
+                // evicted.
                 drop(ring_out.drain(..skip));
             }
         }
@@ -1183,24 +1016,19 @@ impl Grid {
         }
     }
 
-    /// RULING 238: a reader-facing viewport gesture made while the history is
-    /// away for a reflow, called by the primitive AFTER it moved the viewport
-    /// over what is attached; `before` is the offset it moved from. Outside a
-    /// detach window this does nothing.
+    /// Record a reader-facing viewport gesture made while the history is away
+    /// for a reflow; called by the primitive after it moved the viewport over
+    /// what is attached, with `before` the offset it moved from. No-op outside
+    /// a detach window.
     ///
     /// A gesture that fits the attached rows records nothing: the re-attach's
-    /// restore rule (audit #7 and its tests) is the law for those. A gesture
-    /// that asks for MORE — up past the attached top, which while the tiered
-    /// history is out is usually the live bottom itself — is kept as the
-    /// reader's aim, which the re-attach applies, so a scroll up over a history
-    /// that is not there yet is not lost. The viewport meanwhile rests at the
-    /// attached top, and a scroll back down spends the aim first (the view
-    /// does not move until the aim is back inside what is attached), after
-    /// which the reader's exact place is kept (`At`). `Top` aims at the top of
-    /// the whole history. `Live` — the End press, a keystroke's snap — brings
-    /// an aim back to the live bottom; with no aim it records nothing (the
-    /// audit-#7 residual: an End that moved nothing is not evidence of a
-    /// choice).
+    /// restore rule covers those. A gesture asking for more (up past the
+    /// attached top) is kept as the reader's aim and applied at re-attach. The
+    /// viewport meanwhile rests at the attached top; scrolling back down spends
+    /// the aim first, after which the reader's exact place is kept (`At`).
+    /// `Top` aims at the top of the whole history. `Live` (End, a keystroke's
+    /// snap) brings an aim back to the live bottom; with no aim it records
+    /// nothing (an End that moved nothing is not evidence of a choice).
     pub(crate) fn note_detached_reader_motion(&mut self, motion: ReaderMotion, before: usize) {
         if !self.storage.scrollback_detached_for_reflow {
             return;
@@ -1242,9 +1070,8 @@ impl Grid {
                             })
                         } else if aim.is_some() {
                             // Back inside the attached rows after aiming past
-                            // them: the viewport goes exactly there, and that
-                            // is where the reader is — the live bottom
-                            // included, which is them choosing it.
+                            // them: the viewport goes exactly there, the live
+                            // bottom included.
                             self.set_display_offset_in_window(want);
                             Some(DetachedReaderAim::At {
                                 rows: want,
@@ -1265,9 +1092,9 @@ impl Grid {
         self.storage.detached_reader_aim = next;
     }
 
-    /// Put the viewport at `offset` (clamped to what is attached) with the
-    /// targeted display-offset damage — the aim's own correction of where a
-    /// primitive left it (ruling 238). Not a gesture record of its own.
+    /// Put the viewport at `offset` (clamped to what is attached) with targeted
+    /// display-offset damage: the aim's own correction of where a primitive
+    /// left it. Not a gesture record.
     fn set_display_offset_in_window(&mut self, offset: usize) {
         let target = offset.min(self.storage.scrollback_lines());
         let old = self.storage.display_offset;
@@ -1279,8 +1106,8 @@ impl Grid {
         self.storage.damage.apply_display_offset_damage(dmg);
     }
 
-    /// Whether the reader has aimed the viewport inside the open detach window
-    /// (ruling 238) — a keystroke's snap to the live bottom must then reach
+    /// Whether the reader has aimed the viewport inside the open detach window;
+    /// a keystroke's snap to the live bottom must then reach
     /// [`Grid::scroll_to_bottom`] even though the viewport already sits at 0.
     #[must_use]
     pub fn reader_aim_held(&self) -> bool {
@@ -1288,58 +1115,30 @@ impl Grid {
     }
 
     /// True while a detach window is open: the tiered store is out for an
-    /// off-thread reflow and scroll-off is being staged for re-attach. MUST be
-    /// false again after [`reattach_reflowed_scrollback`](Self::reattach_reflowed_scrollback)
-    /// or [`abort_reflow_offload`](Self::abort_reflow_offload) — a `true` that
-    /// outlives them is the wedge (un-drainable lazy growth) the abort path exists
-    /// to prevent. Projected as the spec's `detached` variable by the Tier-1
-    /// conformance binding (`tests/conformance_offload.rs`), which is what makes a
-    /// wedged flag a RED test instead of a silent leak (mutation-proven).
+    /// off-thread reflow and scroll-off is staged for re-attach. Must be false
+    /// again after [`reattach_reflowed_scrollback`](Self::reattach_reflowed_scrollback)
+    /// or [`abort_reflow_offload`](Self::abort_reflow_offload); a lingering
+    /// `true` means un-drainable lazy growth. Projected as the spec's `detached`
+    /// variable by `tests/conformance_offload.rs`.
     #[must_use]
     pub fn reflow_offload_in_flight(&self) -> bool {
         self.storage.scrollback_detached_for_reflow
     }
 
-    /// Recover from a reflow that will NEVER re-attach — the worker panicked or the
-    /// thread died mid-rewrap. The detached tiered history — and, since RFL-1,
-    /// the ring history riding the same job — is unrecoverable (it was
-    /// owned by the lost [`PendingScrollbackReflow`]); the job here is to return the
-    /// grid to a BOUNDED state rather than leave it wedged. Without this,
-    /// `scrollback_detached_for_reflow` stays `true` for the rest of the session, so
-    /// every future scroll-off stages into an un-drainable `lazy_buffer` (unbounded
-    /// growth) and all tiered history stays invisible (audit #5). No-op if not
+    /// Recover from a reflow that will never re-attach (the worker panicked or
+    /// its thread died). The detached tiered and ring history, owned by the
+    /// lost [`PendingScrollbackReflow`], is unrecoverable; this returns the grid
+    /// to a bounded state. Without it `scrollback_detached_for_reflow` would
+    /// stay `true`, every scroll-off would stage into an un-drainable
+    /// `lazy_buffer`, and tiered history would stay invisible. No-op if not
     /// mid-window (already re-attached, or a reset re-created the store).
     ///
-    /// The wedge guard — on EVERY exit, including the no-op early return, the
-    /// detach window is closed.
-    ///
-    /// This was stated as a compiler obligation (`ensures
-    /// !self.storage.scrollback_detached_for_reflow`, provable since trust
-    /// stage2 51bf8a270; `tools/test-trust-contract-probe.sh` pins the shape, and
-    /// its copy proves on trustc 450403669). It was first withdrawn because an August
-    /// trustc ICEd on it under `-Ztrust-verify=off`, which is fixed. It stays
-    /// WITHDRAWN because stock rustc cannot PARSE `ensures` — `#[cfg]` strips after
-    /// parsing, so gating would not help — and stock rustc compiles this crate on
-    /// every lane the Trust sysroot cannot serve (it carries only its host std):
-    /// the wasm32 lane (`publish/config.sh`'s wasm32 clause),
-    /// the release's x86_64-apple-darwin compat slice (`RUSTUP_TOOLCHAIN=stable`
-    /// in aterm-release's `buildplan.rs`), and the cross cells of `xtask gate
-    /// cells` and `gate cells-foreign`. Measured 2026-09-27 with the clause
-    /// restored: the stock wasm32 cell stops at "expected one of `->`, `where`, or
-    /// `{`, found `ensures`", and xtask's
-    /// `a_foreign_cell_under_its_floor_fails_the_cells_verb` goes red. The
-    /// `#[cfg_attr(trust_verify, trust::ensures(..))]` respelling parses on both
-    /// compilers and needs no `trust` dependency, but it is not the same
-    /// obligation. Measured 2026-09-28 on trustc 450403669 with a two-line probe
-    /// of this shape (`pub fn clear(&mut self)` setting `self.flag = false`): the
-    /// native `ensures !self.flag` proves 2 of 2 obligations, one kernel-certified;
-    /// the attribute spelling proves 0 of 2 (2 unknown: "compiler contract
-    /// predicate `!self.flag` was not lowered into a typed verifier formula").
-    ///
-    /// The obligation is kept as debug assertions on both exits. RESTORE THE
-    /// CLAUSE once every lane that compiles this crate parses contracts (a Trust
-    /// sysroot with std for those triples); the public export can then strip it
-    /// in `publish/transforms.sh`, which no other lane runs.
+    /// Every exit, including the no-op early return, closes the detach window.
+    /// That postcondition is checked by debug assertions rather than an
+    /// `ensures` clause: stock rustc cannot parse contracts, and it compiles
+    /// this crate for the wasm32 lane, the x86_64 compat slice and the cross
+    /// cells, while the `#[cfg_attr(trust_verify, ...)]` spelling does not
+    /// lower to the same obligation.
     pub fn abort_reflow_offload(&mut self) {
         if !self.storage.scrollback_detached_for_reflow {
             debug_assert!(
@@ -1350,8 +1149,7 @@ impl Grid {
         }
         self.storage.scrollback_detached_for_reflow = false;
         // The job (and the history a deficit fill would have pulled) is lost:
-        // drop the debt with it (fixwave5) — and the reader's aim into it
-        // (ruling 238): the history they aimed at is gone.
+        // drop the fill debt and the reader's aim with it.
         self.storage.pending_fill_target = None;
         self.storage.detached_reader_aim = None;
         if self.storage.scrollback.is_some() {
@@ -1365,11 +1163,9 @@ impl Grid {
             // the lazy buffer's window output can no longer be tiered — discard
             // it (bounded) rather than leave it un-drainable.
             self.storage.lazy_buffer.clear();
-            // Third site of the one law the re-attach guard states: history just
-            // went away under `display_offset`, so re-clamp. A reader who scrolled
-            // up during the window was clamped against a total that COUNTED those
-            // staged lines (`scrollback_lines()` sums ring + lazy + tiered); the
-            // clear leaves them addressing rows no layer holds any more.
+            // History just went away under `display_offset`, so re-clamp: a
+            // reader who scrolled up during the window was clamped against a
+            // total that counted the staged lines.
             self.clamp_display_offset();
 
             // A LOWER requested total still tightens the surviving ring. Never
@@ -1475,9 +1271,9 @@ mod tests {
             .collect()
     }
 
-    /// Deep fingerprint of a COMPLETED rewrap: the store's decoded content
-    /// plus the job-carried ring history (RFL-1) — the whole result surface
-    /// any step schedule must reproduce byte-for-byte.
+    /// Deep fingerprint of a completed rewrap: the store's decoded content plus
+    /// the job-carried ring history, the whole result any step schedule must
+    /// reproduce.
     fn reflowed_fingerprint(reflowed: &ReflowedScrollback) -> Vec<String> {
         let mut fp = store_fingerprint(&reflowed.store);
         fp.extend(reflowed.ring_out.iter().map(|line| format!("{line:?}")));
@@ -1853,7 +1649,7 @@ mod tests {
     /// Measurement harness for the per-line rewrap cost — the number the wasm
     /// modules' `REFLOW_STEP_BUDGET_LINES` default is derived from. Run
     /// manually in release:
-    /// `cargo test -p aterm-grid --release --lib reflow_step_timing -- --ignored --nocapture`
+    /// `targo --unverified test -p aterm-grid --release --lib reflow_step_timing -- --ignored --nocapture`
     ///
     /// Measured 2026-07-14 (Apple Silicon, release): one-shot 49_969 near-full
     /// 80-col input lines in ~69ms = ~1.4 µs/input-line; stepped @4000/step:
@@ -1974,10 +1770,9 @@ mod tests {
         }
     }
 
-    /// A logical line is NEVER split mid-run: with the most adversarial
-    /// schedule (budget 1 — every step reads ONE input line) a soft-wrapped run
-    /// many rows long crosses step boundaries intact, matches the one-shot
-    /// byte-for-byte, and its text round-trips through the re-attached grid.
+    /// A logical line is never split mid-run: with budget 1 a soft-wrapped run
+    /// many rows long crosses step boundaries intact, matches the one-shot and
+    /// round-trips through the re-attached grid.
     #[test]
     fn reflow_step_budget_one_never_splits_a_soft_wrapped_run() {
         let (rows, cols, new_cols) = (10u16, 20u16, 33u16);
@@ -2078,11 +1873,9 @@ mod tests {
         g.assert_invariants();
     }
 
-    /// THE REWRAP'S PROGRESS (design ruling 233): `lines_done` of the fixed
-    /// `lines_total` climbs monotonically step by step, through both the
-    /// store and the ring phase, and has read every detached line by the
-    /// step that returns `Done`; the total never moves while the store
-    /// swaps input for output underneath it.
+    /// `lines_done` of the fixed `lines_total` climbs monotonically through
+    /// both phases and reaches the total on the step returning `Done`; the
+    /// total never moves while the store swaps input for output.
     #[test]
     fn reflow_progress_climbs_to_the_detached_total() {
         let (rows, cols) = (10u16, 30u16);
@@ -2122,11 +1915,10 @@ mod tests {
         g.assert_invariants();
     }
 
-    /// Dropping a HALF-STEPPED job keeps the one-shot's bounded-loss semantics:
-    /// the detached history is gone with the job (the grid NEVER sees partial
-    /// progress — re-attach only accepts a completed [`ReflowedScrollback`]),
-    /// and [`Grid::abort_reflow_offload`] returns the grid to a bounded,
-    /// non-wedged state — the same recovery as a dead one-shot worker.
+    /// Dropping a half-stepped job loses the detached history (re-attach only
+    /// accepts a completed [`ReflowedScrollback`]), and
+    /// [`Grid::abort_reflow_offload`] returns the grid to a bounded, non-wedged
+    /// state.
     #[test]
     fn dropping_a_half_stepped_job_recovers_via_abort() {
         let (rows, cols) = (10u16, 40u16);
@@ -2151,10 +1943,8 @@ mod tests {
         g.assert_invariants();
     }
 
-    /// Output that scrolls off BETWEEN steps stages exactly like it does under
-    /// the one-shot window (audit bug B) and lands AFTER the rewrapped old
-    /// history on re-attach — the documented [old history | window output]
-    /// order, unchanged by stepping.
+    /// Output scrolling off between steps is staged as in the one-shot window
+    /// and lands after the rewrapped old history on re-attach.
     #[test]
     fn stepping_interleaved_with_window_output_keeps_history_and_order() {
         let (rows, cols) = (10u16, 40u16);
@@ -2203,12 +1993,10 @@ mod tests {
         g.assert_invariants();
     }
 
-    /// Single-row logical lines only: blanks, short ASCII, medium ASCII, and
-    /// wide (CJK) lines capped under one row. Deliberately NO multi-row
-    /// soft-wrapped runs: a run straddling the store/ring detach seam re-splits
-    /// differently on the offload path than on the plain path (a PRE-EXISTING
-    /// seam — the pre-RFL-1 design rewrapped the ring separately too), and this
-    /// corpus isolates the RFL-1 claim (placement/order identity) from it.
+    /// Single-row logical lines only (blanks, short/medium ASCII, wide CJK
+    /// under one row). No multi-row runs: a run straddling the store/ring seam
+    /// re-splits differently on the offload and plain paths, and this corpus
+    /// isolates placement/order identity.
     fn feed_single_row_history(grid: &mut Grid, seed: u64, logical_lines: usize, cols: u16) {
         let mut rng = Rng(seed);
         for i in 0..logical_lines {
@@ -2232,15 +2020,12 @@ mod tests {
         }
     }
 
-    /// RFL-1 DIFFERENTIAL ORACLE: with the ring history riding the job, the
-    /// offloaded round trip must still produce EXACTLY the history sequence the
-    /// plain synchronous `Grid::resize` produces — same texts, same wrap
-    /// flags, same order, same count — over deep single-row synthetic history
-    /// and several random step schedules. Tier PLACEMENT legitimately differs
-    /// (the plain path migrates ring content into the store; the offload
-    /// returns it to the ring), so the comparison reads the unified
-    /// `get_history_line` view, not the tiers. Mid-flight the ring must be
-    /// EMPTY — that is the synchronous cost this design removes.
+    /// With the ring history riding the job, the offloaded round trip produces
+    /// exactly the history sequence the plain synchronous `Grid::resize` does
+    /// (texts, wrap flags, order, count) over deep single-row history and random
+    /// step schedules. Tier placement differs (the plain path migrates ring
+    /// content into the store), so the unified `get_history_line` view is
+    /// compared. Mid-flight the ring history must be in the job.
     #[test]
     fn offload_round_trip_matches_plain_resize_history_sequence() {
         for seed in [3u64, 11, 0xFEED] {
@@ -2258,10 +2043,9 @@ mod tests {
             let job = offloaded
                 .resize_offloading_scrollback(rows, new_cols)
                 .expect("width change with a tiered store detaches");
-            // Reach guard (two-sided with the precondition above): the ring
-            // history really rides the job. The grid's ring is NOT asserted
-            // empty here — the visible-grid shrink legitimately spills fresh
-            // overflow rows into the ring during the synchronous resize.
+            // Reach guard: the ring history rides the job. The grid's ring is
+            // not asserted empty: the visible-grid shrink may spill fresh
+            // overflow rows into it during the synchronous resize.
             assert!(
                 !job.ring_lines.is_empty(),
                 "seed {seed}: detach lifts the ring history into the job (RFL-1)"
@@ -2296,12 +2080,11 @@ mod tests {
         }
     }
 
-    /// The HISTORICAL materialize-everything rewrap, reproduced verbatim as
-    /// the RFL-2 reference: read ALL store+lazy input into a Vec, rewrap in
-    /// one pass, `clear()` the store, push every output line with the store's
-    /// own limits active throughout. Takes an UNSTEPPED job (its limits are
-    /// still the store's own). The job's `ring_lines` are ignored on both
-    /// sides — the streaming path routes them to `ring_out`, never the store.
+    /// A materialize-everything reference rewrap: read all store+lazy input
+    /// into a Vec, rewrap in one pass, `clear()` the store, and push every
+    /// output line with the store's limits active. Takes an unstepped job.
+    /// `ring_lines` are ignored on both sides (the streaming path routes them to
+    /// `ring_out`).
     fn reference_materialize_all(job: PendingScrollbackReflow) -> ScrollbackStorage {
         let mut store = job.store;
         let mut input: Vec<Line> = Vec::with_capacity(store.line_count() + job.lazy_lines.len());
@@ -2334,17 +2117,13 @@ mod tests {
         g
     }
 
-    /// RFL-2 PARITY ORACLE: the streaming rewrap (front-consuming,
-    /// immediately re-filling, limits lifted in flight) must be
-    /// content-identical to the historical materialize-everything shape.
-    /// Corpora include a TIGHT line limit so the end-of-flight re-enforcement
-    /// is compared against push-time enforcement — the exact seam the limit
-    /// lift could get wrong — plus a staged lazy tail, one-shot AND chunked
-    /// schedules.
+    /// The streaming rewrap (front-consuming, re-filling, limits lifted in
+    /// flight) is content-identical to the materialize-everything reference,
+    /// including a tight line limit (end-of-flight vs push-time enforcement), a
+    /// staged lazy tail, and one-shot and chunked schedules.
     ///
-    /// The TIGHT-BYTE-BUDGET regime is the one place the two shapes are NOT
-    /// bit-identical (they evict to different depths, same content); it has
-    /// its own oracle, `streaming_under_byte_budget_pressure_keeps_a_longer_suffix`.
+    /// Under a tight byte budget the two evict to different depths; see
+    /// `streaming_under_byte_budget_pressure_keeps_a_longer_suffix`.
     #[test]
     fn streaming_matches_materialize_all_reference() {
         for (limit, budget_bytes) in [
@@ -2392,19 +2171,13 @@ mod tests {
         }
     }
 
-    /// RFL-2, the honest BOUNDARY of the parity claim. With a tight byte
-    /// budget the two shapes enforce it at different moments — push-time,
-    /// while the newest output is still uncompressed in the hot tier, versus
-    /// once at the end, when the whole result has been re-tiered — so they
-    /// stop at "under budget" after evicting different numbers of the OLDEST
-    /// lines.
-    ///
-    /// What must hold, and what this pins in BOTH directions, is that the
-    /// difference is eviction DEPTH only: every line the historical shape kept
-    /// is present byte-for-byte, in order, as the NEWEST SUFFIX of the
-    /// streamed store; the streamed store never keeps FEWER lines; and the
-    /// divergence is real for at least one corpus (otherwise this test would
-    /// silently degrade into a duplicate of the exact-parity oracle above).
+    /// Under a tight byte budget the two shapes enforce at different moments
+    /// (push-time with the newest output still hot, versus once after
+    /// re-tiering), so they evict different numbers of the oldest lines. The
+    /// difference must be depth only: every line the reference kept is present,
+    /// in order, as the newest suffix of the streamed store; the streamed store
+    /// never keeps fewer lines; and the divergence is real for at least one
+    /// corpus.
     #[test]
     fn streaming_under_byte_budget_pressure_keeps_a_longer_suffix() {
         const BUDGET_BYTES: usize = 10_000;
@@ -2475,13 +2248,10 @@ mod tests {
         );
     }
 
-    /// RFL-2 MEMORY GUARD: while streaming, the job's only growing
-    /// uncompressed holding is the carry — one trailing logical run plus the
-    /// current chunk — never the materialized history. The old shape held
-    /// EVERY input line in `carry`/`out` at once (peak O(total uncompressed));
-    /// this pins the new bound so a refactor cannot quietly reintroduce the
-    /// cliff. (The ring phase's `out` holds the rewrapped ring history — that
-    /// is bounded by the ring capacity, a construction constant, by design.)
+    /// While streaming, the job's only growing uncompressed holding is the
+    /// carry (one trailing logical run plus the current chunk), never the
+    /// materialized history. The ring phase's `out` holds the rewrapped ring
+    /// history, bounded by the ring capacity.
     #[test]
     fn streaming_step_carry_stays_bounded() {
         let (rows, cols) = (10u16, 30u16);
@@ -2529,13 +2299,11 @@ mod tests {
         g.assert_invariants();
     }
 
-    /// RFL-3: a width change that lands while a job is in flight (detaching
-    /// nothing, by the one-in-flight throttle) used to leave the re-attached
-    /// store wrapped at the job's stale width until "the next width change" —
-    /// which after a settled drag never comes. The converging re-attach closes
-    /// the loop: attach, detect the mismatch, re-detach at the settled width;
-    /// one more driver pass leaves the store genuinely wrapped at the CURRENT
-    /// width and returns no further job.
+    /// A width change landing while a job is in flight (detaching nothing)
+    /// would leave the re-attached store wrapped at a stale width; the
+    /// converging re-attach detects the mismatch and re-detaches at the
+    /// settled width, and one more driver pass leaves it wrapped at the
+    /// current width with no further job.
     #[test]
     fn converging_reattach_rewraps_to_the_settled_width() {
         let (rows, w0, w1, w2) = (10u16, 80u16, 40u16, 60u16);
@@ -2570,9 +2338,8 @@ mod tests {
         );
         assert!(!g.reflow_offload_in_flight());
 
-        // The store's content is genuinely wrapped at the settled width now —
-        // the near-full 80-col fill would exceed it if the stale result had
-        // been parked (the pre-RFL-3 behavior).
+        // The store is wrapped at the settled width now: the near-full 80-col
+        // fill would exceed it if the stale result had been kept.
         let store = g.scrollback().expect("store re-attached");
         let max_len = (0..store.line_count())
             .filter_map(|i| {
@@ -2591,10 +2358,9 @@ mod tests {
         g.assert_invariants();
     }
 
-    /// A line whose head scrolled past the ring (into the store's lazy
-    /// staging) while its continuation is still the ring's oldest row: a
-    /// ConPTY job rewraps it whole; a Native job re-splits it at the seam, as
-    /// 0.94.0 did (that policy is pinned byte for byte).
+    /// A line whose head scrolled past the ring (into lazy staging) while its
+    /// continuation is still the ring's oldest row: a ConPTY job rewraps it
+    /// whole; a Native job re-splits it at the seam.
     #[test]
     fn conpty_job_rewraps_a_line_straddling_the_store_ring_seam_whole() {
         for (policy, expected) in [

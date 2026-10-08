@@ -3,32 +3,25 @@
 
 //! Resource sandbox for spawned children (ATERM_DESIGN WS-G).
 //!
-//! aterm spawns a child `$SHELL`; this confines that child's resource use with
-//! POSIX `setrlimit` bounds, applied in the child after `fork` and before `exec`
-//! (so the limits are inherited by the shell and everything it runs). Installing
-//! a sandbox is a privileged effect, so [`Limits::apply`] requires a
-//! [`Cap<Sandbox>`] from `aterm-cap` (capability-gated; the cap cannot be
-//! struct-literal-forged outside `aterm-cap`, and its root mint is sealed behind
-//! `aterm-cap`'s `launcher-mint` feature — see that crate for the scope).
+//! Confines the child `$SHELL` with POSIX `setrlimit` bounds, applied in the
+//! child after `fork` and before `exec` so the shell and everything it runs
+//! inherit them. [`Limits::apply`] requires a [`Cap<Sandbox>`] from `aterm-cap`,
+//! whose root mint is sealed behind its `launcher-mint` feature.
 //!
-//! This is the portable resource-limit layer only. OS filesystem/network scoping
-//! is `aterm-containment`'s Seatbelt lane (`actuator.rs`), not this crate.
+//! Resource limits only: filesystem/network scoping is `aterm-containment`'s
+//! Seatbelt lane.
 //!
-//! Platform split: the cap gate and the `Limits` policy surface are shared; the
-//! actuator is per-platform. `src/unix.rs` is the POSIX `setrlimit` loop.
-//! `src/windows.rs` has two lanes: [`Limits::apply`] is a capability-gated no-op
-//! (Windows has no rlimits), and `Limits::apply_to_job` is the real Job Object
-//! lane, which `aterm-pty`'s ConPTY seam calls on the suspended child's job.
+//! The cap gate and [`Limits`] are shared; the actuator is per-platform.
+//! `src/unix.rs` is the `setrlimit` loop. On Windows [`Limits::apply`] is a
+//! cap-gated no-op and `Limits::apply_to_job` is the Job Object lane, which
+//! `aterm-pty`'s ConPTY seam calls on the suspended child's job.
 //!
-//! STATUS (per §0.1): the cap gate and `setrlimit` application are tested (the
-//! application is verified by reading the limit back); not yet Trust-proven.
+//! STATUS (§0.1): tested (limits are read back); not yet Trust-proven.
 
 use std::io;
 
 use aterm_cap::{Cap, Tier};
 
-// Per-platform actuator behind one module name (module split, not inline cfg):
-// unix = the real setrlimit loop; windows = the no-op `apply` + the Job Object lane.
 #[cfg(unix)]
 #[path = "unix.rs"]
 mod imp;
@@ -39,12 +32,11 @@ mod imp;
 /// The effect a capability authorizes here: installing a resource sandbox.
 pub enum Sandbox {}
 
-/// POSIX resource limits to apply. `None` leaves the corresponding limit
-/// unchanged. Each value is installed as the **soft** limit; the inherited
-/// **hard** ceiling is PRESERVED (never lowered) so the spawned `$SHELL` can
-/// still raise its own soft limit from its rc — see `set_limit` in the unix
-/// actuator. (On Windows these values are inert — no rlimit analogue is
-/// installed; [`Limits::apply_to_job`] is the Windows lane.)
+/// Resource limits to apply; `None` leaves a limit unchanged. On POSIX each
+/// value is installed as the soft limit and the inherited hard ceiling is kept,
+/// so the `$SHELL` can still raise its soft limit from its rc (`set_limit` in
+/// the unix actuator). On Windows `apply` installs nothing;
+/// `Limits::apply_to_job` is the Windows lane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
     /// CPU seconds (`RLIMIT_CPU`).
@@ -55,31 +47,25 @@ pub struct Limits {
     pub file_size: Option<u64>,
     /// Max open file descriptors (`RLIMIT_NOFILE`).
     pub open_files: Option<u64>,
-    /// Max number of concurrently-active processes in the sandbox **Job Object**
-    /// (Windows `ActiveProcessLimit` / `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`) — a
-    /// spawn-storm / fork-bomb bound the kernel enforces on the child and
-    /// everything it spawns. `None` leaves the process count unbounded.
-    /// Windows-actuated only (via [`Limits::apply_to_job`]); inert on POSIX,
-    /// whose `setrlimit` lane has no matching per-job class (symmetric to how
-    /// `open_files` / `file_size` are inert on Windows).
+    /// Max concurrently-active processes in the sandbox Job Object (Windows
+    /// `ActiveProcessLimit`): a fork-bomb bound on the child and its
+    /// descendants. Windows only; inert on POSIX, which has no per-job class.
     pub active_processes: Option<u32>,
-    /// Windows only: install Job Object **UI restrictions** on the sandbox job
-    /// (deny clipboard read/write, desktop switch, display / system-parameter
-    /// changes, global atoms, and `ExitWindows`) so a hostile child cannot break
-    /// out through the shared window station — log the user off, scrape the
-    /// clipboard, or change the display. `false` leaves the job's UI access
-    /// unrestricted (the daily-driver default). Inert off Windows.
+    /// Windows only: install Job Object UI restrictions (clipboard, desktop
+    /// switch, display / system parameters, global atoms, `ExitWindows`) so a
+    /// hostile child cannot act through the shared window station. `false`
+    /// (the daily-driver default) leaves UI access unrestricted.
     pub restrict_ui: bool,
 }
 
 impl Limits {
-    /// A generous default for an interactive shell: cap address space and fds, but
-    /// leave CPU and file size unbounded (an interactive shell legitimately runs
-    /// long and writes large files).
+    /// The hardened default for an interactive shell: caps fds, address space
+    /// (not on macOS) and, on Windows, active processes and UI access; CPU and
+    /// file size stay unbounded (a shell legitimately runs long and writes large
+    /// files).
     #[must_use]
-    // #[inline] so the MIR crosses the crate boundary: callers' Trust gates
-    // (aterm-pty) bundle and VERIFY this body instead of assuming an absent
-    // callee. Semantics unchanged.
+    // #[inline] so the MIR crosses the crate boundary and callers' Trust gates
+    // (aterm-pty) verify this body instead of assuming an absent callee.
     #[inline]
     pub fn shell_default() -> Self {
         Limits {
@@ -89,8 +75,7 @@ impl Limits {
             // before it runs a line (measured 2026-09-23, macOS 26.6: python3
             // and zsh alike), so the 16 GiB cap below cannot be expressed
             // there, and a value large enough to be accepted bounds nothing
-            // real. Leave the address space unbounded on macOS and rely on the
-            // other limits.
+            // real.
             address_space: if cfg!(target_os = "macos") {
                 None
             } else {
@@ -98,26 +83,20 @@ impl Limits {
             },
             file_size: None,
             open_files: Some(8192),
-            // Bound concurrently-active processes so a runaway or hostile child
-            // cannot fork-bomb the box — generous enough for a parallel build,
-            // low enough to matter. Windows Job Object only; inert on POSIX.
+            // Enough for a parallel build, low enough to stop a fork bomb.
             active_processes: Some(512),
-            // Hardened modes are for confining an untrusted shell, so lock the
-            // job's window-station access (Windows only; inert on POSIX).
+            // Hardened modes confine an untrusted shell: lock its window-station
+            // access.
             restrict_ui: true,
         }
     }
 
-    /// The PERMISSIVE limits for the daily-driver modes (Master / User): every
-    /// limit `None`, so the spawned shell INHERITS the launching login shell's
-    /// `rlimit`s unchanged — a terminal must not constrain the programs you run more
-    /// than the shell that started it would. In particular it imposes NO `RLIMIT_AS`:
-    /// that caps VIRTUAL address space, which CUDA/ML runtimes, the JVM, Go, and the
-    /// sanitizers all RESERVE far in excess of resident use, so any finite cap breaks
-    /// legitimate programs while bounding nothing real. Confinement in these modes is
-    /// the capability gate (what the shell may DO), not a blanket memory cap. The
-    /// hardened [`Self::shell_default`] caps (opted into via Safety / Containment)
-    /// are unchanged.
+    /// The daily-driver limits (Master / User modes): every limit `None`, so the
+    /// shell inherits the login shell's `rlimit`s unchanged. No `RLIMIT_AS` in
+    /// particular: it caps VIRTUAL address space, which CUDA/ML runtimes, the JVM,
+    /// Go and the sanitizers reserve far beyond resident use, so any finite cap
+    /// breaks real programs while bounding nothing. These modes confine through
+    /// the capability gate; [`Self::shell_default`] is the hardened opt-in.
     #[must_use]
     pub fn inherit() -> Self {
         Limits::default()
@@ -126,39 +105,27 @@ impl Limits {
     /// Apply these limits to the CURRENT process. Call in the child, after
     /// `fork`, before `exec`. Requires a `Trusted`+ [`Cap<Sandbox>`].
     ///
-    /// The cap gate hard-fails, but the individual `setrlimit` calls are applied
-    /// BEST-EFFORT: a limit the OS refuses (e.g. a 16 GiB `RLIMIT_AS` on macOS,
-    /// which is below the address space every process already maps) must NOT
-    /// prevent the limits that DO work (`RLIMIT_NOFILE`) from being installed. Every limit is attempted; the first per-limit error is
-    /// returned only after all have been tried, so one unsupported resource can
-    /// never silently leave the child unconfined.
+    /// The cap gate hard-fails; the `setrlimit` calls are best-effort: every
+    /// limit is attempted, so one the OS refuses (a 16 GiB `RLIMIT_AS` on macOS)
+    /// cannot keep the others from installing, and the first error is returned
+    /// after all were tried.
     ///
-    /// The returned `Result` MUST NOT be discarded by a forking spawn seam: an
-    /// `Err` here means confinement did not fully install, and the caller is
-    /// required to fail closed (do NOT exec an unconfined child). `aterm-pty`'s
-    /// child does exactly this — it `_exit(126)`s before `execve` on `Err`
-    /// (ATERM_DESIGN §5.6, exit-before-exec).
+    /// An `Err` means confinement did not fully install and the caller must fail
+    /// closed: `aterm-pty`'s child `_exit(126)`s before `execve` (ATERM_DESIGN
+    /// §5.6, exit-before-exec).
     ///
     /// # Errors
     /// `PermissionDenied` if the capability tier is too low; otherwise the first
     /// `setrlimit` OS error encountered (after attempting every limit).
     ///
-    /// SPEC: this is the real implementation of the `Apply` action of the external
-    /// `Sandbox.tla` model (TRUST_NATIVE_TLA Phase 2, CONFINEMENT family). The spec's
-    /// `AllSupportedApplied` invariant — once apply has run, EVERY restriction the
-    /// policy *requested* that the OS *supports* is actually installed — is exactly
-    /// the macOS no-op regression this best-effort-per-limit loop fixes: a requested
-    /// limit the OS supports is never silently skipped because an earlier refused
-    /// one (e.g. a 16 GiB `RLIMIT_AS` on macOS) errored. There is NO Tier-1
-    /// binding: the one that existed drove a pure per-slot rule this loop never
-    /// called (the loop runs post-fork and may not allocate), so it bound a model to
-    /// code that did not ship and was retired (2026-09-25).
-    /// `apply_actually_sets_the_limit` reads the installed limit back.
-    // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): `Apply` projects the real
-    // best-effort-per-limit apply loop onto the spec's `<<requested, supported,
-    // applied, done>>`. The L2 obligation requires the projection NAME be present
-    // (Trust does not execute it); `aterm_sandbox::Sandbox::project_apply` is that
-    // witness.
+    /// SPEC: the `Apply` action of the external `Sandbox.tla` model
+    /// (TRUST_NATIVE_TLA Phase 2). Its `AllSupportedApplied` invariant (every
+    /// requested limit the OS supports is installed) is what the best-effort loop
+    /// guarantees. No Tier-1 binding: the loop runs post-fork and may not
+    /// allocate; `apply_actually_sets_the_limit` reads the limit back instead.
+    // PROJECTION (TRUST_VACUITY_GATE §2.2): the L2 obligation needs only the
+    // projection NAME (Trust does not execute it) onto the spec's
+    // `<<requested, supported, applied, done>>`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -173,26 +140,19 @@ impl Limits {
         imp::apply_limits(self)
     }
 
-    /// Apply these limits to a child's Windows **Job Object** so the kernel
-    /// enforces them on the child and everything it spawns — the Windows analog
-    /// of [`Self::apply`]'s POSIX `setrlimit` lane. Windows has no `fork` seam to
-    /// run `setrlimit` in before exec, so resource confinement is installed on
-    /// the job the ConPTY spawn assigns the (still-suspended) child to, BEFORE it
-    /// resumes. Requires a `Trusted`+ [`Cap<Sandbox>`] — SEC-2: a weak cap can
-    /// never actuate, exactly like [`Self::apply`].
+    /// Apply these limits to the Job Object of a still-suspended ConPTY child, so
+    /// the kernel enforces them on it and its descendants: the Windows analog of
+    /// [`Self::apply`] (Windows has no pre-exec `fork` seam). Requires a
+    /// `Trusted`+ [`Cap<Sandbox>`] (SEC-2).
     ///
-    /// This is query-modify-write over the job's extended-limit info, so any
-    /// `LimitFlags` the spawn seam already installed (`KILL_ON_JOB_CLOSE`) are
-    /// preserved. See the Windows actuator for the exact [`Limits`] → job-limit
-    /// mapping and its honest scope: memory, CPU-time, the active-process cap,
-    /// and (when [`Limits::restrict_ui`] is set) Job Object UI restrictions are
-    /// enforced; `open_files` / `file_size` have no Job Object analog and stay
-    /// unactuated.
+    /// Query-modify-write: `LimitFlags` already on the job (`KILL_ON_JOB_CLOSE`)
+    /// are kept. Memory, CPU time, the active-process cap and
+    /// [`Limits::restrict_ui`] are enforced; `open_files` / `file_size` have no
+    /// Job Object analog.
     ///
     /// # Errors
     /// `PermissionDenied` if the capability tier is too low; otherwise the first
-    /// Job Object OS error. Like [`Self::apply`], an `Err` here means confinement
-    /// did not install and the caller MUST fail closed (terminate the
+    /// Job Object OS error; the caller must fail closed (terminate the
     /// never-resumed child, ATERM_DESIGN §5.6).
     #[cfg(windows)]
     pub fn apply_to_job(
@@ -213,12 +173,8 @@ mod tests {
     #[cfg(unix)]
     use imp::{RlimitResource, set_limit};
 
-    /// Why: `RLIMIT_*` is PROCESS-wide, but cargo runs these tests concurrently in
-    /// ONE process — so a test that mutates NOFILE is observed by another's
-    /// read-back. `apply_preserves_the_hard_ceiling…` finishes by RAISING soft
-    /// NOFILE to 1024, which surfaced as `apply_actually_sets_the_limit` reading
-    /// 1024 where it had just set 256. It only flakes under load (a loaded machine
-    /// interleaves them differently), so it survived many green runs.
+    /// `RLIMIT_*` is process-wide and the tests run concurrently in one process,
+    /// so tests that mutate NOFILE would see each other's read-backs.
     #[cfg(unix)]
     static NOFILE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -229,11 +185,9 @@ mod tests {
         NOFILE_TESTS.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    // `RlimitResource` (not a bare `c_int`): on Linux the libc RLIMIT_* constants
-    // and `getrlimit`'s first arg are `__rlimit_resource_t` (u32), so a `c_int`
-    // parameter mismatches and the test build does not compile there.
+    /// The current `rlimit` of `resource`.
     #[cfg(unix)]
-    fn current(resource: RlimitResource) -> u64 {
+    fn rlimit(resource: RlimitResource) -> libc::rlimit {
         let mut lim = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -241,23 +195,19 @@ mod tests {
         // SAFETY: valid resource id + out-param.
         let rc = unsafe { libc::getrlimit(resource, &mut lim) };
         assert_eq!(rc, 0, "getrlimit failed");
-        lim.rlim_cur
+        lim
     }
 
-    /// The current HARD ceiling (`rlim_max`) of `resource`.
-    // `RlimitResource` (not a bare `c_int`): the libc RLIMIT_* constants and
-    // `getrlimit`'s arg are `__rlimit_resource_t` (u32) on Linux, so a `c_int`
-    // parameter mismatches and the test build does not compile there.
+    /// The current soft limit of `resource`.
+    #[cfg(unix)]
+    fn current(resource: RlimitResource) -> u64 {
+        rlimit(resource).rlim_cur
+    }
+
+    /// The current hard ceiling of `resource`.
     #[cfg(unix)]
     fn current_hard(resource: RlimitResource) -> u64 {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: valid resource id + out-param.
-        let rc = unsafe { libc::getrlimit(resource, &mut lim) };
-        assert_eq!(rc, 0, "getrlimit failed");
-        lim.rlim_max
+        rlimit(resource).rlim_max
     }
 
     #[test]
@@ -298,7 +248,6 @@ mod tests {
     fn none_limits_are_a_no_op() {
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
-        // All None -> Ok and nothing changed.
         let before = current(libc::RLIMIT_CPU);
         Limits::default().apply(&cap).unwrap();
         assert_eq!(current(libc::RLIMIT_CPU), before);
@@ -308,20 +257,14 @@ mod tests {
     #[test]
     fn unsupported_limit_does_not_block_the_working_ones() {
         let _serialized = nofile_guard();
-        // Regression: `shell_default()`'s 16 GiB `RLIMIT_AS` EINVALed on macOS;
-        // the old `?`-early-return there skipped the `RLIMIT_NOFILE` that DOES
-        // work, so the child got ZERO confinement. Applying a REFUSED AS
-        // alongside a small NOFILE must STILL install NOFILE — best-effort per
-        // limit.
+        // A refused RLIMIT_AS must not keep NOFILE from installing.
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
         let target = 256u64;
         // macOS refuses any AS below the process's current mapped size, and a
         // 64-bit Mach-O maps a 4 GiB `__PAGEZERO` before anything else, so 1 GiB
-        // is refused on every Mac — the path under test. (This used 64 TiB and
-        // claimed macOS rejects it; macOS ACCEPTS 64 TiB, so on macOS the test
-        // never reached the refused path it exists for.) Off macOS keep 64 TiB:
-        // accepted and harmless, where 1 GiB would cap this test process itself.
+        // is refused on every Mac (macOS accepts 64 TiB). Off macOS 64 TiB is
+        // accepted and harmless, where 1 GiB would cap this test process.
         let address_space: u64 = if cfg!(target_os = "macos") {
             1024 * 1024 * 1024
         } else {
@@ -349,11 +292,8 @@ mod tests {
 
     #[test]
     fn shell_default_omits_unsupported_address_space_on_macos() {
-        // The REAL production value: macOS must NOT request RLIMIT_AS (16 GiB is
-        // below what every process already maps, so it would EINVAL and — before
-        // the best-effort fix — abort the whole apply, so the child was
-        // unconfined). Construction-only: no setrlimit, no
-        // process-wide fd-limit side effect / test-ordering hazard.
+        // macOS must not request RLIMIT_AS: 16 GiB is below what every process
+        // already maps, so it would EINVAL. Construction-only: no setrlimit.
         let d = Limits::shell_default();
         #[cfg(target_os = "macos")]
         assert_eq!(
@@ -376,10 +316,7 @@ mod tests {
     #[test]
     fn apply_actually_sets_the_limit() {
         let _serialized = nofile_guard();
-        // Lower RLIMIT_NOFILE to a value still far above what a test needs, then
-        // read it back to prove `apply` performed the syscall. Lowering NOFILE is
-        // safe (we only need a handful of fds) and is reversible up to the hard
-        // limit if anything later raises it.
+        // 256 fds is far above what a test needs, and the hard ceiling is kept.
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Certified); // >= Trusted
         let target = 256u64;
@@ -396,16 +333,9 @@ mod tests {
     #[test]
     fn apply_preserves_the_hard_ceiling_so_a_shell_can_raise_its_soft_limit() {
         let _serialized = nofile_guard();
-        // REGRESSION GUARD — `/Users/.../.zshrc:ulimit:N: value exceeds hard limit`.
-        // The User-mode sandbox runs the user's $SHELL transparently, so it must
-        // install its limit as a SOFT default and LEAVE THE HARD CEILING ALONE.
-        // The old code set both soft AND hard to the requested value, clamping the
-        // hard NOFILE to 8192; a `.zshrc` doing `ulimit -n 65536` then aborted shell
-        // startup. This guard fails if anyone reintroduces a hard-limit clamp: it
-        // proves (1) the hard ceiling is unchanged by apply, and (2) the soft limit
-        // is still raisable above the applied value, up to that preserved ceiling —
-        // exactly the `.zshrc` case. The earlier tests only checked the soft limit,
-        // which is why the regression slipped through.
+        // A hard-limit clamp makes a `.zshrc` `ulimit -n 65536` abort shell
+        // startup with `value exceeds hard limit`: apply must leave the hard
+        // ceiling alone, and the soft limit must stay raisable up to it.
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
 
@@ -429,8 +359,7 @@ mod tests {
             "apply must NOT lower the hard NOFILE ceiling (the `ulimit: value exceeds hard limit` regression)"
         );
 
-        // Emulate the shell rc raising its soft limit above the applied default —
-        // this must SUCCEED now that the ceiling is preserved.
+        // The shell rc raising its soft limit above the applied default.
         let raise = core::cmp::min(applied * 4, hard_before);
         set_limit(libc::RLIMIT_NOFILE, Some(raise)).expect("raising the soft limit must succeed");
         assert!(

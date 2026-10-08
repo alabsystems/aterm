@@ -2,18 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! DEC private mode handler for the terminal.
-//!
-//! This module contains handlers for DEC private mode escape sequences:
-//! - DECSET/DECRST (CSI ? Ps h/l) - Enable/disable DEC private modes
-//! - DECRQM (CSI ? Ps $ p) - Request DEC mode state
-//! - Standard ANSI modes (CSI Ps h/l)
-//!
-//! Modes include: cursor keys, VT52 mode, column mode, reverse video,
-//! origin mode, auto-wrap, cursor visibility, alternate screen buffer,
-//! mouse tracking, bracketed paste, synchronized output, and more.
-//!
-//! Extracted from handler.rs as part of large files refactor.
+//! DEC private mode handler: DECSET/DECRST (`CSI ? Ps h/l`), DECRQM
+//! (`CSI ? Ps $ p`), ANSI modes (`CSI Ps h/l`), the alternate screen and the
+//! VT420 rectangular operations.
 
 use crate::grid::{CellFlags, Grid};
 
@@ -43,11 +34,10 @@ impl TerminalHandler<'_> {
                     self.set_vt52_mode(!set);
                 }
                 3 => {
-                    // DECCOLM — flag only, host resizes if desired.
-                    // Per xterm spec, DECCOLM is only honored when mode 40
-                    // (deccolm_enable) is set. Otherwise CSI ?3h/l is ignored.
-                    // Arm-local `if`, not a match guard (which would couple this
-                    // to the unknown-mode default arm's fallthrough).
+                    // DECCOLM: flag only, the host resizes if desired. Honored
+                    // only while mode 40 (deccolm_enable) is set, per xterm.
+                    // Arm-local `if`, not a match guard, to stay independent of
+                    // the unknown-mode arm's fallthrough.
                     #[allow(clippy::collapsible_match)]
                     if self.modes.deccolm_enable {
                         self.set_column_mode_132(set);
@@ -78,20 +68,13 @@ impl TerminalHandler<'_> {
                     if set {
                         self.show_cursor();
                     } else {
-                        // REPAINT-BLINK epoch: a DECTCEM hide issued INSIDE a
-                        // DEC-2026 synchronized update is the per-keystroke
-                        // full-redraw choreography (Claude Code brackets every
-                        // repaint in `?2026h · ?25l · … · ?25h · ?2026l`).
-                        // vim/less hide WITHOUT sync and ConPTY hides per echo
-                        // without sync — neither bumps. MULTIPLEXERS (negative
-                        // law, source+capture-verified in review): tmux 3.x
-                        // never probes DECRQM 2026 and coalesces cursor
-                        // visibility per event-loop pass, so vim-inside-tmux
-                        // yields at most one-off edges, never a per-keystroke
-                        // blink — its jumps keep their meteors. Counted on
-                        // every processed hide (not just visible→hidden edges)
-                        // so a burst that re-hides an already-hidden cursor
-                        // still registers as repaint choreography.
+                        // Repaint-blink epoch: a DECTCEM hide inside a DEC 2026
+                        // synchronized update is per-keystroke full-redraw
+                        // choreography (`?2026h ?25l … ?25h ?2026l`). vim/less and
+                        // ConPTY hide without sync and do not bump; tmux coalesces
+                        // cursor visibility and never probes 2026. Counted on every
+                        // hide, not just visible->hidden edges, so re-hides in a
+                        // burst still register.
                         if self.modes.synchronized_output {
                             *self.repaint_blink_epoch += 1;
                         }
@@ -250,15 +233,12 @@ impl TerminalHandler<'_> {
                 2048 => {
                     let was = self.modes.in_band_size_reports;
                     self.modes.in_band_size_reports = set;
-                    // Emit the geometry ONLY on a real disabled->enabled transition
-                    // (idempotent enable, matching xterm/ghostty) AND only while the
-                    // response buffer is under its cap. This path writes the buffer
-                    // DIRECTLY rather than via the capped/rate-limited send_response
-                    // sink, so without both guards a PTY `?2048h` flood — or a
-                    // `?2048l?2048h` toggle flood that defeats the transition guard
-                    // alone — would grow response_buffer without bound, bypassing
-                    // MAX_RESPONSE_BUFFER_SIZE. The report is <= 48 bytes (the
-                    // StackResponse capacity in push_in_band_size_report).
+                    // Emit only on a real disabled->enabled transition (as xterm
+                    // and ghostty do) and only while the response buffer is under
+                    // its cap: this path writes the buffer directly, bypassing the
+                    // rate-limited send_response, so a `?2048h` or `?2048l?2048h`
+                    // flood must not grow it past MAX_RESPONSE_BUFFER_SIZE. The
+                    // report is <= 48 bytes (push_in_band_size_report's capacity).
                     const IN_BAND_SIZE_REPORT_MAX_LEN: usize = 48;
                     if set && !was && self.can_append_response_bytes(IN_BAND_SIZE_REPORT_MAX_LEN) {
                         let (rows, cols) = (self.grid.rows(), self.grid.cols());
@@ -319,14 +299,11 @@ impl TerminalHandler<'_> {
                         self.cursor_state().restore_cursor_state();
                     }
                 }
-                // ConPTY win32-input-mode (microsoft/terminal spec #4999). conhost
-                // requests it at every ConPTY start; until it was honoured the
-                // request fell into the unknown-mode arm below, so no key could
-                // ever carry a Windows modifier and aterm's legacy Shift+Enter LF
-                // reached PowerShell as Ctrl+Enter (measured 2026-09-22). Folded
-                // into the keyboard encoding as `KeyboardMode::WIN32_INPUT`; the
-                // encoder decides which keys need a win32 record (Enter chords)
-                // and which stay legacy VT — conhost accepts the mixed stream.
+                // ConPTY win32-input-mode (microsoft/terminal spec 4999), which
+                // conhost requests at every ConPTY start. Folded into the keyboard
+                // encoding as `KeyboardMode::WIN32_INPUT`; the encoder picks which
+                // keys need a win32 record (Enter chords) and which stay legacy VT,
+                // and conhost accepts the mixed stream.
                 9001 => {
                     self.modes.win32_input_mode = set;
                 }
@@ -338,53 +315,37 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// SELECTION CUSTODY Phase 3 — record the MAIN grid's absolute row counter at
-    /// the instant this batch parks it (smcup), for the SCR-1 epilogue's re-pin.
-    ///
-    /// The epilogue used to re-pin the parked grid with `lines_added = 0`, on the
-    /// stated invariant that "a grid that has been swapped out stopped receiving
-    /// output". It stopped receiving it only AFTER the swap: a read that delivers
-    /// `"a\r\nb\r\nc\r\n\x1b[?1049h"` — job output followed by an app's smcup, and
-    /// batch boundaries are just `read()` boundaries — pushed three lines into the
-    /// MAIN grid's scrollback first. Dropping that advance left the restored reading
-    /// position three rows off the line the user was reading, while the selection
-    /// (whose `content_scroll_delta` IS drained on the exit batch) moved with the
-    /// content, so highlight and viewport disagreed.
+    /// Record the main grid's absolute row counter at the moment this batch
+    /// parks it (smcup), for the epilogue's re-pin. Output earlier in the same
+    /// batch (e.g. `"a\r\nb\r\n\x1b[?1049h"`) already advanced the main grid, and
+    /// the re-pin must include that advance or the restored reading position
+    /// lands off the line the selection moved with.
     ///
     /// Called before the swap, while `self.grid` is still the main grid.
     fn park_main_row_counter(&mut self) {
         self.transient.alt_park_main_row_counter = Some(self.grid.absolute_row_counter());
     }
 
-    /// SELECTION CUSTODY Phase 3 — take the parked reading position OFF a grid that
-    /// has just been swapped back in mid-batch, and hand it to the SCR-1 epilogue.
-    ///
-    /// A parked main grid carries the user's `display_offset` (that is how the
-    /// reading position survives a pager), and an rmcup makes it active again with
-    /// the rest of the batch still to process. Every write and erase after that
-    /// point goes through `row_index`, which SUBTRACTS `display_offset` — so
-    /// `\x1b[?1049l\r\x1b[KHELLO\n` in one read erased and wrote 40 rows back in the
-    /// user's history instead of on the live screen, recorded its damage band
-    /// against the LIVE rows it never touched, and tripped `row_index_base`'s
-    /// `debug_assert_eq!(display_offset, 0)` on the first region scroll.
-    ///
-    /// This is the batch prologue's rule applied at the second place a grid can
-    /// become active: processing runs at offset 0, and the epilogue re-pins.
+    /// Take the parked reading position off a grid swapped back in mid-batch
+    /// and hand it to the epilogue's re-pin. Writes and erases go through
+    /// `row_index`, which subtracts `display_offset`, so the rest of the batch
+    /// must run at offset 0 or it edits scrollback instead of the live screen.
+    /// This is the batch prologue's rule applied where a grid becomes active
+    /// mid-batch.
     fn flatten_restored_display_offset(&mut self) {
-        // Every exit path funnels here, so this is also the one place that learns the
-        // alt screen was left — `post_process` needs it for a batch that exits and
-        // re-enters, where its start/end comparison sees no change at all.
+        // Every exit path funnels here, so this is where the batch learns the alt
+        // screen was left; `post_process` needs it when a batch exits and
+        // re-enters, which its start/end comparison cannot see.
         self.transient.alt_screen_left_in_batch = true;
         let restored = self.grid.display_offset();
         if restored > 0 {
-            // The batch prologue's entry point, for the batch prologue's reason: this
-            // forced 0 is the machine's, undone by the epilogue's re-pin, and must not
-            // register as a reader gesture in `reader_live_bottom_gen`. See
-            // `Terminal::process`'s prologue.
+            // The prologue's entry point, for the prologue's reason: this forced 0
+            // is undone by the epilogue's re-pin and must not register as a reader
+            // gesture in `reader_live_bottom_gen`.
             self.grid.pin_viewport_to_live_for_output_batch();
             self.transient.alt_restore_pin = Some((restored, self.grid.absolute_row_counter()));
         }
-        // The rest of the batch writes against THIS grid now, so it owes the same
+        // The rest of the batch writes against this grid now, so it owes the same
         // precondition the batch prologue forces on the one it found active.
         debug_assert_eq!(
             self.grid.display_offset(),
@@ -413,14 +374,12 @@ impl TerminalHandler<'_> {
         // A live app owns the alternate screen now, on both sides of conhost.
         self.transient.conhost_alt_screen_left_up = false;
         self.kitty_keyboard.switch_screen(true);
-        // Clear hyperlink state — hyperlinks should not leak across screen
-        // boundaries. A hyperlink opened on main should not apply to alt
-        // screen text and vice versa. (#7414)
+        // Hyperlink state does not carry across screen buffers.
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         // Clear pending Sixel image — a Sixel rendered on main should not
-        // leak into the alt screen context (#7484).
+        // leak into the alt screen context.
         #[cfg(feature = "sixel")]
         {
             self.sixel.pending_image = None;
@@ -440,7 +399,7 @@ impl TerminalHandler<'_> {
         // (`Grid::drop_resize_undo`) must not hand rows back into it.
         new_grid.drop_resize_undo();
         // Per xterm: tab stops are global, shared between main and alt screens.
-        // Copy main screen tab stops to the new alt screen (#7494).
+        // Copy main screen tab stops to the new alt screen.
         new_grid.restore_tab_stops(self.grid.tab_stops(), self.grid.tab_defaults_suppressed());
         // Per xterm the cursor is shared by both screen buffers: modes 47 and
         // 1047 swap the buffer without moving it (only 1048/1049 save/restore).
@@ -456,10 +415,9 @@ impl TerminalHandler<'_> {
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
         self.note_screen_replaced();
-        // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
-        // do NOT record `SelectionDamage::All`. A switch no longer destroys the
-        // outgoing screen's selection — `post_process` parks it — and the `All` this
-        // used to record would clear it on the way back in.
+        // Bump the host-coordinate epoch on the incoming grid without recording
+        // `SelectionDamage::All`: `post_process` parks the outgoing screen's
+        // selection, and `All` would clear it on the way back.
         self.grid.invalidate_host_coordinates();
     }
 
@@ -468,6 +426,7 @@ impl TerminalHandler<'_> {
     /// is gone, so a displacement a resize left on it is gone too.
     fn note_screen_replaced(&mut self) {
         self.transient.screen_replaced = self.transient.screen_replaced.wrapping_add(1);
+        self.transient.render_debt = (0, 0);
     }
 
     /// Copy the scroll region and horizontal margins from one grid to
@@ -498,18 +457,18 @@ impl TerminalHandler<'_> {
         }
 
         self.kitty_keyboard.switch_screen(false);
-        // Clear hyperlink state on screen exit (#7414).
+        // Clear hyperlink state on screen exit.
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         // Clear pending Sixel image — a Sixel rendered on alt should not
-        // leak back to the main screen context (#7484).
+        // leak back to the main screen context.
         #[cfg(feature = "sixel")]
         {
             self.sixel.pending_image = None;
         }
         // Per xterm: tab stops are global. Preserve alt screen tab stop
-        // changes back to the main screen (#7494).
+        // changes back to the main screen.
         let tab_stops = self.grid.tab_stops().to_vec();
         let tab_suppressed = self.grid.tab_defaults_suppressed();
         if let Some(mut main_grid) = self.alt_grid.take() {
@@ -536,10 +495,9 @@ impl TerminalHandler<'_> {
         self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
         self.modes.alternate_screen = false;
         self.note_screen_replaced();
-        // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
-        // do NOT record `SelectionDamage::All`. A switch no longer destroys the
-        // outgoing screen's selection — `post_process` parks it — and the `All` this
-        // used to record would clear it on the way back in.
+        // Bump the host-coordinate epoch on the incoming grid without recording
+        // `SelectionDamage::All`: `post_process` parks the outgoing screen's
+        // selection, and `All` would clear it on the way back.
         self.grid.invalidate_host_coordinates();
     }
 
@@ -560,7 +518,7 @@ impl TerminalHandler<'_> {
         }
 
         // Clear the alt screen (current grid) before switching back.
-        // Set BCE template so erased cells inherit SGR background (#7522).
+        // Set BCE template so erased cells inherit SGR background.
         self.grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
             self.style.bce_bg_rgb(),
@@ -571,17 +529,14 @@ impl TerminalHandler<'_> {
         self.exit_alternate_screen_raw();
     }
 
-    /// Enter alternate screen for mode 1049 — save cursor + clear alt screen
-    /// on enter.
+    /// Enter the alternate screen for mode 1049: save the cursor and clear the
+    /// alt screen.
     ///
-    /// SPEC: also the real `Enter` action of the external `AltScreen.tla` model
-    /// (TRUST_NATIVE_TLA Phase 2, terminal-emulator CORRECTNESS family). It saves the
-    /// cursor (`savedCursor' = cursor`), switches the active buffer to alt
-    /// (`active' = "alt"`), and clears alt to blanks (`altCell' = Blank`) — exactly
-    /// the spec's `Enter`. Its lossless round-trip with `Leave`
-    /// (`MainRestoredAfterRoundTrip`) is Tier-1 conformance-checked by driving the
-    /// real `Terminal` through `process(b"\x1b[?1049h … \x1b[?1049l")`
-    /// (`aterm-core/tests/conformance_altscreen.rs`).
+    /// This is the altscreen model's `Enter` action (save cursor, switch to alt,
+    /// clear alt). Its lossless round-trip with `Leave`
+    /// (`MainRestoredAfterRoundTrip`) is conformance-checked by driving
+    /// `process(b"\x1b[?1049h … \x1b[?1049l")` in
+    /// `aterm-core/tests/conformance_altscreen.rs`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -590,11 +545,8 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
-    // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): `conformance_altscreen.rs`
-    // projects the real `Terminal` onto the spec's `<<active, mainCell, altCell,
-    // cursor, savedCursor, entered, mainSaved>>` (named `aterm_core::terminal::
-    // project_altscreen`). L2 requires the projection NAME be present; Trust does not
-    // execute it (the per-transition ty validation is the aterm-side Tier-1 binding).
+    // Projection: `conformance_altscreen.rs` projects the real `Terminal` onto
+    // the model's state via `aterm_core::terminal::project_altscreen`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -605,16 +557,12 @@ impl TerminalHandler<'_> {
     )]
     fn enter_alternate_screen(&mut self) {
         if self.modes.alternate_screen {
-            // A SECOND 1049 SET IS NOT A NO-OP. xterm's arm is three calls —
-            // `CursorSave(xw); ToAlternate(xw, True); ClearScreen(xw);`
-            // (charproc.c `srm_OPT_ALTBUF_CURSOR`) — and only the MIDDLE one
-            // stands down when the alt screen is already up (`ToAlternate`:
-            // `if (screen->whichBuf == 0)`). The save still runs, into the
-            // CURRENT buffer's slot (`screen->sc[whichBuf]`, the alt slot), so
-            // the main slot that 1049 RESET restores is left alone; and the
-            // clear still runs. Returning early here left a second smcup
-            // showing the PREVIOUS app's screen — a full-screen app restarting,
-            // or one that re-arms 1049 defensively, inherited the old content.
+            // A second 1049 set is not a no-op. xterm runs `CursorSave;
+            // ToAlternate; ClearScreen` (charproc.c `srm_OPT_ALTBUF_CURSOR`) and
+            // only `ToAlternate` stands down when alt is already up. The save goes
+            // into the current (alt) buffer's slot, leaving the main slot 1049
+            // reset restores untouched, and the clear still runs so a restarting
+            // app does not inherit the previous screen.
             self.cursor_save.alt = Some(self.snapshot_cursor_state());
             // `ClearScreen` is an ordinary BCE clear that ends in `ResetWrap`
             // and moves no cursor — the same shape the fresh-grid path below
@@ -628,51 +576,44 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Save main cursor state, swap to fresh alt grid.
-        // xterm srm_OPT_ALTBUF_CURSOR SET does CursorSave(xw) into the SAME
-        // per-buffer slot DECSC uses (screen->sc[whichBuf]) — 1049's save IS
-        // the DECSC save, observable by a later bare DECRC on the main
-        // screen restoring the position 1049 saved.
+        // Save the main cursor and swap to a fresh alt grid. xterm's 1049 save
+        // uses the same per-buffer slot as DECSC, so a later bare DECRC on the
+        // main screen restores the position 1049 saved.
         self.cursor_save.main = Some(self.snapshot_cursor_state());
         self.transient.alt_entered_without_cursor_save = false;
         self.transient.conhost_alt_screen_left_up = false;
         self.kitty_keyboard.switch_screen(true);
         // Clear pending Sixel image to prevent in-progress images from
-        // leaking into the alt screen context (#7469).
+        // leaking into the alt screen context.
         #[cfg(feature = "sixel")]
         {
             self.sixel.pending_image = None;
         }
         // Clear hyperlink state — hyperlinks should not leak across screen
-        // boundaries (#7451).
+        // boundaries.
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         // Alt screen has no scrollback per xterm spec — lines scrolled off the top
         // of the alternate buffer are discarded, not accumulated.
         let mut new_grid = Grid::with_scrollback(self.grid.rows(), self.grid.cols(), 0);
-        // Honor background-color-erase (BCE): xterm's ClearScreen on 1049-enter
-        // fills the alt screen with the CURRENT SGR background, just like every
-        // other clear. A fresh Grid is default-bg blank, so set the BCE template
-        // and erase to apply the active background (#7522 parity with the
-        // 1047-exit clear in exit_alternate_screen_1047).
+        // Background-color erase: xterm's 1049-enter ClearScreen fills with the
+        // current SGR background, like the 1047-exit clear in
+        // exit_alternate_screen_1047.
         new_grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
             self.style.bce_bg_rgb(),
         );
         new_grid.erase_screen();
         // Per xterm: tab stops are global, shared between main and alt screens.
-        // Copy main screen tab stops to the new alt screen (#7494).
+        // Copy main screen tab stops to the new alt screen.
         new_grid.restore_tab_stops(self.grid.tab_stops(), self.grid.tab_defaults_suppressed());
-        // Per xterm the cursor is shared by both screen buffers and 1049 SET
-        // is CursorSave + ToAlternate + ClearScreen — none of which moves the
-        // cursor (charproc.c `srm_OPT_ALTBUF_CURSOR`). Entering must NOT home it.
-        // ClearScreen runs LAST and calls `ResetWrap` (util.c `ClearScreen`), so
-        // the alt screen starts with NO pending wrap even when the main screen had
-        // one: the wrap is deliberately not copied here (modes 47/1047, which do
-        // not clear, still carry it over in `enter_alternate_screen_raw`). The
-        // main screen's wrap is not lost — `snapshot_cursor_state` above saved it
-        // (xterm `CursorSave` records `do_wrap`), and 1049 RESET restores it.
+        // Per xterm the cursor is shared by both buffers and 1049 set moves no
+        // cursor, so entering does not home it. ClearScreen runs last and calls
+        // `ResetWrap`, so the alt screen starts with no pending wrap; the main
+        // screen's wrap is kept in `snapshot_cursor_state` above and restored by
+        // 1049 reset. (47/1047 do not clear and carry the wrap over in
+        // `enter_alternate_screen_raw`.)
         let cursor = self.grid.cursor();
         new_grid.set_cursor(cursor.row, cursor.col);
         debug_assert!(
@@ -687,21 +628,16 @@ impl TerminalHandler<'_> {
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
         self.note_screen_replaced();
-        // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
-        // do NOT record `SelectionDamage::All`. A switch no longer destroys the
-        // outgoing screen's selection — `post_process` parks it — and the `All` this
-        // used to record would clear it on the way back in.
+        // Bump the host-coordinate epoch on the incoming grid without recording
+        // `SelectionDamage::All`: `post_process` parks the outgoing screen's
+        // selection, and `All` would clear it on the way back.
         self.grid.invalidate_host_coordinates();
     }
 
-    /// Exit alternate screen for mode 1049 — restore cursor on exit.
+    /// Exit the alternate screen for mode 1049: restore the cursor.
     ///
-    /// SPEC: also the real `Leave` action of the external `AltScreen.tla` model. It
-    /// switches the active buffer back to main (`active' = "main"`) and RESTORES the
-    /// cursor to the saved value (`cursor' = savedCursor`) — exactly the spec's
-    /// `Leave`. The whole point of `MainRestoredAfterRoundTrip` is that this restore
-    /// is not dropped and the alt scribbles never aliased main; Tier-1 conformance
-    /// drives the real round-trip and validates it.
+    /// This is the altscreen model's `Leave` action: switch back to main and
+    /// restore the saved cursor. Conformance-checked with `Enter`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -710,10 +646,8 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
-    // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): the same `Terminal` →
-    // `<<active, mainCell, altCell, cursor, savedCursor, entered, mainSaved>>`
-    // projection as `Enter` (`aterm_core::terminal::project_altscreen`); L2 requires
-    // a non-empty projection NAME, executed by `conformance_altscreen.rs` (Tier-1).
+    // Projection: the same `aterm_core::terminal::project_altscreen` as `Enter`,
+    // executed by `conformance_altscreen.rs`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -729,20 +663,20 @@ impl TerminalHandler<'_> {
         }
 
         // Swap back to the main grid. xterm 1049 RESET (FromAlternate +
-        // CursorRestore) does NOT save the alt-screen cursor anywhere.
+        // CursorRestore) does not save the alt-screen cursor anywhere.
         self.kitty_keyboard.switch_screen(false);
         // Clear pending Sixel image to prevent in-progress images from
-        // leaking back to the main screen context (#7469).
+        // leaking back to the main screen context.
         #[cfg(feature = "sixel")]
         {
             self.sixel.pending_image = None;
         }
-        // Clear hyperlink state on screen exit (#7451).
+        // Clear hyperlink state on screen exit.
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         self.transient.update_has_transient_extras();
         // Per xterm: tab stops are global. Preserve alt screen tab stop
-        // changes back to the main screen (#7494).
+        // changes back to the main screen.
         let tab_stops = self.grid.tab_stops().to_vec();
         let tab_suppressed = self.grid.tab_defaults_suppressed();
         if let Some(mut main_grid) = self.alt_grid.take() {
@@ -750,111 +684,42 @@ impl TerminalHandler<'_> {
             // DECSLRM set while in the alt screen stays in force after exit.
             Self::copy_margins(self.grid, &mut main_grid);
             *self.grid = main_grid;
-            // THE RESTORED GRID IS A WHOLE-SCREEN CHANGE. Its damage tracker
-            // was consumed by the last present before the program entered the
-            // alt screen and has recorded nothing since, so without this mark
-            // `has_damage()` read false and `damage_epoch()` did not advance
-            // on the swap back — and every consumer that keys a repaint on the
-            // epoch (both browser hosts' WF-1 frame gates) kept the ALT screen
-            // on glass until some later write happened to damage the main
-            // grid. Entering already marks full (the alt buffer is erased or
-            // fresh); leaving must too.
+            // The restored grid is a whole-screen change. Its damage tracker was
+            // consumed before the app entered the alt screen, so without this
+            // mark `has_damage()` is false, `damage_epoch()` does not advance and
+            // epoch-gated hosts keep showing the alt screen.
             self.grid.damage_mut().mark_full();
         }
         self.flatten_restored_display_offset();
         self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
-        // Restore from the shared DECSC slot WITHOUT consuming it: xterm
+        // Restore from the shared DECSC slot without consuming it: xterm
         // CursorRestore leaves sc->saved set, so a later bare DECRC restores
         // the same state again.
         let saved = self.cursor_save.main;
         self.restore_cursor_snapshot(saved);
         self.modes.alternate_screen = false;
         self.note_screen_replaced();
-        // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
-        // do NOT record `SelectionDamage::All`. A switch no longer destroys the
-        // outgoing screen's selection — `post_process` parks it — and the `All` this
-        // used to record would clear it on the way back in.
+        // Bump the host-coordinate epoch on the incoming grid without recording
+        // `SelectionDamage::All`: `post_process` parks the outgoing screen's
+        // selection, and `All` would clear it on the way back.
         self.grid.invalidate_host_coordinates();
     }
 
-    /// Leave an alternate screen NO APP IS BEHIND any more — the `?1049l` that
-    /// should have ended it never came. A no-op on the primary screen.
+    /// Leave an alternate screen no app is behind any more: the `?1049l` never
+    /// came (a full-screen app killed under ConPTY or by SIGKILL). A no-op on
+    /// the primary screen. Called for a shell prompt painted on the alt screen
+    /// and for the host's `mainscreen` recovery (`Terminal::leave_alternate_screen`).
     ///
-    /// MEASURED (2026-09-22, Windows 11, ConPTY, the `cast` tap): `less` from Git
-    /// for Windows entered with a lone `ESC[?1049h` frame; killed from another tab
-    /// (`Stop-Process`), conhost sent NO `?1049l` and no repaint — the next bytes
-    /// were pwsh's `133;D;-1`, `133;A`, its prompt and `133;B`, painted onto the
-    /// pager rows. Commands typed there scrolled the alt grid, which has no
-    /// scrollback, and a later `less` + `q` restored a main screen that never held
-    /// them. A bare ConPTY probe reproduces it without aterm (2026-09-27):
-    /// conhost forwards ANY client's switch, as `?1049h` plus its own full
-    /// repaint of the new buffer — MSYS `printf`, cmd's `echo`, .NET's
-    /// `Console.Out` alike — and a killed client leaves its alt buffer up for
-    /// good. `Write-Host` from pwsh never switches only because PowerShell strips
-    /// the sequence first: `$PSStyle.OutputRendering` read `PlainText` in an
-    /// aterm tab. On unix the same happens to a full-screen app that gets
-    /// SIGKILL: nothing emits rmcup on its behalf.
+    /// Commits the alt grid and flushes it whole to the archive, then performs
+    /// the exit the dead app would have: the 1049 exit after `?1049h`, the 1047
+    /// exit after `?47h`/`?1047h` (a 1049 exit there could restore an earlier
+    /// app's save), then `release_dead_app_modes`.
     ///
-    /// Two callers name the same fact: the shell painting a PROMPT on the alt
-    /// screen (`prompt_leaves_orphaned_alt_screen` — a prompt there is never
-    /// intended, the shell believes it is on the main screen), and the host's
-    /// explicit recovery (`Terminal::leave_alternate_screen`, the `mainscreen`
-    /// verb) for a shell that paints no integration marks.
-    ///
-    /// In order: commit the alt grid as its final frame and flush it WHOLE to the
-    /// archive (`AltArchiveState::leave_orphaned` — everything typed on the stuck
-    /// screen stays readable through `offscreen`), then the exit the dead app's
-    /// own reset would have been. After `?1049h`: the 1049 exit — the main grid,
-    /// its scrollback and the cursor `?1049h` saved come back, so the prompt paints
-    /// where it would have after a clean exit. After `?47h`/`?1047h`, which save no
-    /// cursor: the 1047 exit — the cursor stays where the alt screen had it, as
-    /// both modes' exits leave it, and the dead screen is blanked rather than kept
-    /// for a later `?47h` to show again (its rows are in the archive). The 1049
-    /// exit there would restore the main slot, which can still hold an earlier
-    /// app's save. Then the modes the dead app owned go (`release_dead_app_modes`).
-    ///
-    /// Under conhost (`win32_input_mode`) the primary screen is laid out the way
-    /// conhost sees it instead, because conhost never leaves ITS alternate buffer
-    /// (`TransientState::conhost_alt_screen_left_up`): everything the shell prints
-    /// from here on is conhost's alternate buffer, rendered with ABSOLUTE cursor
-    /// moves. MEASURED (2026-09-27, 80x24, `less` killed after four history
-    /// rows): with the prompt put back on the row `?1049h` saved (row 8) while
-    /// conhost's cursor was on row 23, a command typed there that wrapped showed
-    /// its head on the prompt's row and a second, prompt-less copy on rows 19-20
-    /// (conhost re-anchors a wrap with `ESC[23;80H`, the `cast` tap); and a
-    /// resize (`resize 24 90`, `resize 24 80`) made conhost repaint its whole
-    /// alternate buffer over the primary screen, erasing the history rows the
-    /// 1049 exit had put back on it (`search 'history row'`: no results). So the
-    /// cursor stays where the alternate screen had it — conhost's cursor, both
-    /// sides parsed the same bytes — and every used primary row goes into the
-    /// scrollback first: a later conhost repaint can only overwrite rows conhost
-    /// itself painted, and the history is out of its reach. The same two runs
-    /// with this layout: the wrapped command is one line under its prompt, and
-    /// after the resize every history row is in the scrollback, with the dead
-    /// pager's rows repainted on the blank rows above the prompt.
-    ///
-    /// What stays wrong after that is conhost's, and no byte a terminal can send
-    /// corrects it. MEASURED (2026-09-27, 80x24, the re-verifier's recipe: 40
-    /// history rows, `less`, `Stop-Process`, two commands, `less` on win.ini,
-    /// `q`; `conpty_dead_alt_screen_replay_tests` replays the reads): conhost's
-    /// next `?1049h` REPLACES the dead buffer, and everything the shell printed
-    /// on it goes with it; its `?1049l` returns to the primary buffer it froze
-    /// when the dead app entered, repainted in full, with the cursor on the row
-    /// that app's `?1049h` saved. So that exit shows the screen from before the
-    /// kill, the rows printed since are in our scrollback just above it
-    /// (`keep_screen_from_conhost_repaint`), and the frozen rows are in the
-    /// history twice: once from this leave, once from that repaint. Our half of
-    /// the ConPTY pipe carries input — keys, focus, the replies to conhost's
-    /// queries — and none of it switches conhost's buffers; a console CLIENT
-    /// writing `?1049l` does. `[Console]::Write` of it from the shell brought
-    /// conhost back at once (its primary repainted, the shell's next prompt
-    /// under it), and the next pager's exit then repainted the live screen; a
-    /// separate process attached with `AttachConsole` that read the dead buffer,
-    /// wrote `?1049l` and put the prompt's row and the cursor back on the
-    /// primary did the same with PSReadLine's pending prompt left where it was.
-    /// Painting our own rows over conhost's frozen repaint instead would hold
-    /// only until conhost's next full repaint (any resize, the next full-screen
-    /// exit), and rows taken off the scrollback to do it would be lost to it.
+    /// Under conhost (`win32_input_mode`) conhost never leaves its own alternate
+    /// buffer (`TransientState::conhost_alt_screen_left_up`) and keeps painting
+    /// with absolute moves, so the cursor stays put and every used primary row
+    /// moves into the scrollback first, out of reach of conhost's later full
+    /// repaints. Only a console client writing `?1049l` switches conhost's buffers.
     pub(super) fn leave_orphaned_alternate_screen(&mut self) {
         if !self.modes.alternate_screen {
             return;
@@ -876,23 +741,17 @@ impl TerminalHandler<'_> {
             self.grid.set_pending_wrap(pending_wrap);
         }
         // Under conhost our leave is ours alone: its own alternate buffer stays
-        // up, and its next switch repaints over this screen (the field has the
-        // measurement). Unix has no such second screen to fall out of step with.
+        // up and its next switch repaints over this screen. Unix has no second
+        // screen to fall out of step with.
         self.transient.conhost_alt_screen_left_up = conhost;
     }
 
-    /// The modes a dead full-screen app owned, which its own exit would have
-    /// reset and the exits above carry over (xterm keeps them across a switch
-    /// for a LIVE app): its scroll region and horizontal margins — the shell's
-    /// output would scroll inside them and never reach the scrollback the leave
-    /// brought back; mouse tracking — the wheel and clicks would go on feeding a
-    /// dead app instead of scrolling that scrollback; application cursor keys
-    /// and keypad — `less` sends `?1h` and `ESC =`, and conhost forwarded both
-    /// (the `cast` tap, 2026-09-27); and an open 2026 window, which would hold
-    /// every present until its timeout. The shell set none of them. Focus
-    /// reporting stays (conhost asks for it at every ConPTY start, beside
-    /// `?9001h`), and so do bracketed paste and the keyboard protocols, which a
-    /// shell sets for itself — the kitty flags are per screen already.
+    /// Reset the modes a dead full-screen app owned, which its own exit would
+    /// have reset and the exits above carry over: scroll region and horizontal
+    /// margins (shell output would never reach the scrollback), mouse tracking,
+    /// application cursor keys and keypad, and an open 2026 window. Focus
+    /// reporting (conhost asks for it at ConPTY start), bracketed paste and the
+    /// keyboard protocols stay: the shell sets those itself.
     fn release_dead_app_modes(&mut self) {
         self.grid.reset_scroll_region();
         self.modes.left_right_margin_mode = false;
@@ -906,12 +765,11 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// conhost is about to repaint over our primary screen — it is switching the
-    /// alternate buffer it was left on (`TransientState::conhost_alt_screen_left_up`
-    /// has the measurement) — so move the screen's rows into the scrollback
-    /// first: the rows the shell printed since the recovery live nowhere else.
-    /// No-op unless that state is set, which this consumes. The screen is left
-    /// blank with the cursor where it was: both repaints start by homing it.
+    /// conhost is about to repaint over our primary screen (it is switching the
+    /// alternate buffer it was left on, `TransientState::conhost_alt_screen_left_up`),
+    /// so move the screen's rows into the scrollback first. No-op unless that
+    /// state is set, which this consumes. The screen is left blank with the
+    /// cursor in place: both repaints start by homing it.
     pub(super) fn keep_screen_from_conhost_repaint(&mut self) {
         if std::mem::take(&mut self.transient.conhost_alt_screen_left_up) {
             self.scroll_screen_into_scrollback();
@@ -1057,25 +915,20 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Restore cursor position, style, and mode flags from a snapshot (if any).
-    ///
-    /// When origin mode is restored as enabled, the cursor row is clamped to
-    /// the current scroll region — matching the DECRC behavior in
-    /// `restore_cursor_state`. Without this, a cursor saved outside the
-    /// scroll region would be placed outside it on restore, violating VT510.
+    /// Restore cursor position, style and mode flags from a snapshot (if any).
+    /// With origin mode restored on, the row is clamped to the scroll region,
+    /// as DECRC does in `restore_cursor_state`.
     fn restore_cursor_snapshot(&mut self, state: Option<SavedCursorState>) {
         if let Some(state) = state {
-            // Restore modes first so origin_mode is known for clamping.
-            // DECAWM is deliberately NOT restored — 1049 exit restores "as in
-            // DECRC", and xterm's CursorRestoreFlags only applies DECSC_FLAGS
-            // = (ATTRIBUTES|ORIGIN|PROTECTED) (cursor.c): WRAPAROUND is never
-            // part of the saved-cursor state.
+            // Restore modes first so origin_mode is known for clamping. DECAWM
+            // is not restored: xterm's CursorRestoreFlags applies only
+            // ATTRIBUTES|ORIGIN|PROTECTED (cursor.c).
             self.modes.origin_mode = state.origin_mode;
             *self.style = state.style;
             *self.charset = state.charset;
             self.transient.current_underline_color = state.underline_color;
             // Refresh the cached extras flag — the restored underline_color
-            // may differ from the pre-restore value (#7311).
+            // may differ from the pre-restore value.
             self.transient.update_has_transient_extras();
             // Update BCE cursor template from restored style's background color.
             // Without this, the first scroll after mode 1049 exit uses the alt
@@ -1103,17 +956,15 @@ impl TerminalHandler<'_> {
                 (state.cursor.row, state.cursor.col)
             };
             self.grid.set_cursor(row, col);
-            // Restore pending_wrap after set_cursor (which clears it) (#7283).
-            // Only restore if cursor is still at the right edge — after terminal
-            // resize the saved position may no longer be at the margin, making
-            // a deferred wrap invalid (#7645).
+            // Restore pending_wrap after set_cursor (which clears it), only if
+            // the cursor is still at the right edge: after a resize the saved
+            // position may no longer be at the margin.
             if state.pending_wrap {
                 let max_col = self.grid.effective_cols_for_row(row).saturating_sub(1);
                 self.grid.set_pending_wrap(col >= max_col);
             }
-            // Update BCE cursor template from restored style so that the first
-            // scroll after returning to the main screen uses the correct
-            // background colors (#7658).
+            // Refresh the BCE template so the first scroll on the main screen
+            // uses the restored background.
             self.style.update_cached_colors();
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -1152,7 +1003,7 @@ impl TerminalHandler<'_> {
             5 => state(self.modes.reverse_video),
             6 => state(self.modes.origin_mode),
             7 => state(self.modes.auto_wrap),
-            // Mode 12 is the blink bit of the cursor STYLE (see
+            // Mode 12 is the blink bit of the cursor style (see
             // `set_cursor_blink`): report the fact the renderer acts on, so the
             // answer cannot disagree with the cursor the user is looking at.
             12 => state(self.modes.cursor_style.blinks()),
@@ -1196,8 +1047,7 @@ impl TerminalHandler<'_> {
             2026 => state(self.modes.synchronized_output),
             2027 => state(self.modes.grapheme_cluster_mode),
             2031 => state(self.modes.report_color_scheme),
-            // 2048 (in-band size reports) is now implemented (emits on enable +
-            // every resize), so DECRQM reports its real state honestly.
+            // 2048 (in-band size reports) emits on enable and every resize.
             2048 => state(self.modes.in_band_size_reports),
             2500 => state(self.modes.bidi_box_mirroring),
             2501 => state(self.modes.bidi_autodetection),
@@ -1210,10 +1060,7 @@ impl TerminalHandler<'_> {
             _ => 0,       // Unknown mode
         };
 
-        // Send response: CSI ? <mode> ; <state> $ y
-        // Build off the heap like the sibling DA/DSR/CPR probe responders.
-        // mode is u16 (≤5 digits), mode_state is single-digit (0-4), so the
-        // worst case `ESC[?` + 5 + `;` + 1 + `$y` = 12 bytes fits in 16.
+        // `ESC[?` + mode (<= 5 digits) + `;` + state + `$y` <= 12 bytes.
         let mut response = StackResponse::<16>::new();
         let _ = write!(response, "\x1b[?{mode};{mode_state}$y");
         self.send_response(cap, response.as_bytes());
@@ -1250,9 +1097,7 @@ impl TerminalHandler<'_> {
             _ => 0, // Unknown ANSI mode
         };
 
-        // Response format: CSI <mode> ; <state> $ y (no `?` — ANSI, not DEC).
-        // Allocation-free build, matching the sibling probe responders. Same
-        // bound as DEC DECRQM minus the `?`, so 16 bytes is ample.
+        // Same bound as DEC DECRQM minus the `?`.
         let mut response = StackResponse::<16>::new();
         let _ = write!(response, "\x1b[{mode};{mode_state}$y");
         self.send_response(cap, response.as_bytes());
@@ -1582,11 +1427,9 @@ impl TerminalHandler<'_> {
         for &param in sgr_params {
             match param {
                 0 => {
-                    // SGR 0 = reset all SGR attributes.
-                    // Must NOT clear structural WIDE (bit 9) or WIDE_CONTINUATION (bit 10)
-                    // flags — those track cell geometry, not visual attributes.
-                    // VISUAL_FLAGS_MASK (0x3FFF) includes those bits; use the
-                    // narrower SGR_ATTRIBUTE_MASK that excludes them.
+                    // SGR 0 resets all SGR attributes but not the structural
+                    // WIDE (bit 9) / WIDE_CONTINUATION (bit 10) flags, which
+                    // VISUAL_FLAGS_MASK includes.
                     flags_to_clear = CellFlags::from_bits(CellFlags::VISUAL_FLAGS_MASK & !0x0600);
                     flags_to_set = CellFlags::empty();
                 }
@@ -1595,7 +1438,7 @@ impl TerminalHandler<'_> {
                 3 => flags_to_set = flags_to_set.union(CellFlags::ITALIC),
                 4 => {
                     // SGR 4 = single underline — must clear other underline
-                    // styles first, matching apply_sgr_param behavior (#7464).
+                    // styles first, matching apply_sgr_param behavior.
                     flags_to_clear = flags_to_clear.union(CellFlags::ALL_UNDERLINES);
                     flags_to_set = flags_to_set.union(CellFlags::UNDERLINE);
                 }
@@ -1609,8 +1452,8 @@ impl TerminalHandler<'_> {
                 }
                 23 => flags_to_clear = flags_to_clear.union(CellFlags::ITALIC),
                 24 => {
-                    // SGR 24 = remove underline — must clear ALL underline
-                    // styles, matching apply_sgr_param behavior (#7464).
+                    // SGR 24 = remove underline — must clear all underline
+                    // styles, matching apply_sgr_param behavior.
                     flags_to_clear = flags_to_clear.union(CellFlags::ALL_UNDERLINES);
                 }
                 25 => flags_to_clear = flags_to_clear.union(CellFlags::BLINK),
@@ -1659,11 +1502,9 @@ impl TerminalHandler<'_> {
         };
         let fill = crate::grid::Cell::from_raw_parts(ch_code, colors, flags);
 
-        // Truecolor fg/bg are stored out-of-line: `cached_colors()` only sets
-        // the RGB *markers*, so resolve the actual bytes and hand them to
-        // fill_rect, which repopulates the CellExtras RGB ring (otherwise the
-        // filled cells report bg_is_rgb()/fg_is_rgb() but read back no color).
-        // Indexed/default colors are inline in the cell, so these stay None.
+        // Truecolor fg/bg live out-of-line (`cached_colors()` sets only the RGB
+        // markers), so resolve the bytes for fill_rect to write the CellExtras
+        // ring. Indexed/default colors are inline, so these stay None.
         let fg_rgb = self.style.fg.is_rgb().then(|| {
             let (r, g, b) = self.style.fg.rgb_components();
             [r, g, b]
@@ -1687,7 +1528,7 @@ impl TerminalHandler<'_> {
     ///
     /// CSI Pt ; Pl ; Pb ; Pr $ {
     ///
-    /// Erases characters in the rectangular area that are NOT protected by DECSCA:
+    /// Erases characters in the rectangular area that are not protected by DECSCA:
     /// - Pt: top row (1-indexed, default: 1)
     /// - Pl: left column (1-indexed, default: 1)
     /// - Pb: bottom row (1-indexed, default: number of rows)
@@ -1708,22 +1549,14 @@ impl TerminalHandler<'_> {
 mod cursor_damage_scope_tests {
     use crate::terminal::Terminal;
 
-    /// THE FIX THE 2026-09-21 RESPONSIVENESS AUDIT ASKED FOR, as a law: a
-    /// cursor-only change damages the CURSOR CELL and not the grid.
-    ///
-    /// Both halves matter. It must still damage SOMETHING — a bare DECTCEM with
-    /// no grid write is otherwise swallowed by the frontend's redraw early-out
-    /// and the cursor does not appear until the next write (the regression
-    /// `mark_full` was taken for). And it must not damage EVERYTHING: a TUI that
-    /// brackets each repaint in `?25l` … `?25h` — Claude Code does, ten times a
-    /// second — handed the frontend a `Damage::Full` on every frame, so 99 % of
-    /// the owner's content frames took the full-refill arm and re-extracted the
-    /// whole viewport (measured: 8403 of 8431 full refills were `full_damage`).
+    /// A cursor-only change damages the cursor cell, not the whole grid. It must
+    /// damage something (a bare DECTCEM is otherwise swallowed by the frontend's
+    /// redraw early-out), and must not damage everything (TUIs that bracket every
+    /// repaint in `?25l … ?25h` would force a full refill per frame).
     #[test]
     fn a_cursor_only_change_damages_the_cursor_cell_not_the_whole_grid() {
-        // Each case must be a real TRANSITION: a mode already in the requested
-        // state damages nothing at all (the handlers early-return), which is
-        // correct and is not what this test is about.
+        // Each case must be a real transition: a mode already in the requested
+        // state damages nothing (the handlers early-return).
         for (name, setup, seq) in [
             ("DECTCEM hide", &b""[..], &b"\x1b[?25l"[..]),
             ("DECTCEM show", &b"\x1b[?25l"[..], &b"\x1b[?25h"[..]),
@@ -1760,13 +1593,9 @@ mod cursor_damage_scope_tests {
         }
     }
 
-    /// Leaving the alternate screen swaps the whole visible surface back to the
-    /// main buffer, so the restored grid must carry FULL damage and the damage
-    /// epoch must advance — for every exit mode. Before this, the restored
-    /// grid's tracker was still the one consumed before the program entered
-    /// the alt screen: `has_damage()` read false, the epoch stood still, and
-    /// an epoch-gated host (the browser hosts' WF-1 frame gates) kept
-    /// presenting the alt screen after `vim`/`less` had quit.
+    /// Leaving the alternate screen swaps the whole visible surface back, so
+    /// the restored grid carries full damage and the damage epoch advances for
+    /// every exit mode.
     #[test]
     fn leaving_the_alternate_screen_marks_the_restored_grid_fully_damaged() {
         for (enter, exit) in [
@@ -1795,10 +1624,8 @@ mod cursor_damage_scope_tests {
         }
     }
 
-    /// The control: a change that really does repaint every cell still marks the
-    /// whole grid. Reverse video (DECSCNM) and the bidi direction are resolved at
-    /// render-snapshot time over cells already stored, so they own the full mark
-    /// — this test is what keeps the narrowing above from spreading to them.
+    /// Control: a change that repaints every cell (reverse video, bidi
+    /// direction, resolved at render-snapshot time) still marks the whole grid.
     #[test]
     fn a_whole_screen_change_still_marks_the_whole_grid() {
         let mut term = Terminal::new(24, 80);
@@ -1860,15 +1687,10 @@ mod xterm_keyboard_mode_tests {
     // --- DECSET/DECRST -> KeyboardMode projection ---
 
     #[test]
-    fn mode_1039_alt_send_escape_default_set() {
-        let term = Terminal::new(24, 80);
-        // altSendsEscape is ON by default, so ALT_NO_ESC must be absent.
-        assert!(!term.keyboard_mode().contains(KeyboardMode::ALT_NO_ESC));
-    }
-
-    #[test]
     fn mode_1039_reset_sets_alt_no_esc_flag() {
         let mut term = Terminal::new(24, 80);
+        // altSendsEscape is on by default, so ALT_NO_ESC is absent.
+        assert!(!term.keyboard_mode().contains(KeyboardMode::ALT_NO_ESC));
         term.process(b"\x1b[?1039l");
         assert!(term.keyboard_mode().contains(KeyboardMode::ALT_NO_ESC));
         term.process(b"\x1b[?1039h");
@@ -1888,7 +1710,7 @@ mod xterm_keyboard_mode_tests {
     #[test]
     fn mode_1035_special_modifiers_toggles_flag() {
         let mut term = Terminal::new(24, 80);
-        // numLock special modifiers ON by default -> NO_SPECIAL_MODIFIERS absent.
+        // numLock special modifiers on by default -> NO_SPECIAL_MODIFIERS absent.
         assert!(
             !term
                 .keyboard_mode()
@@ -2003,9 +1825,8 @@ mod win32_input_mode_tests {
 
     #[test]
     fn mode_9001_is_consumed_not_echoed_to_the_grid() {
-        // conhost sends it at session start, before the prompt: the sequence
-        // must be consumed whole and leave nothing on the grid — pinned so the
-        // mode arm can never regress to printing any part of it.
+        // conhost sends it at session start, before the prompt: the sequence is
+        // consumed whole and leaves nothing on the grid.
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[?9001h");
         let cursor = term.cursor();
@@ -2046,8 +1867,7 @@ mod win32_input_mode_tests {
 
     #[test]
     fn mode_9001_survives_decstr() {
-        // DECSTR is the application's soft reset (cursor keys, keypad, margins,
-        // SGR — the xterm list `soft_reset` walks); the console host's input
+        // DECSTR is the application's soft reset; the console host's input
         // negotiation is not the application's to undo, so only RIS clears it.
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[?9001h");
@@ -2057,16 +1877,15 @@ mod win32_input_mode_tests {
 }
 
 impl super::Terminal {
-    /// Force the PRIMARY screen: the host's recovery for an alternate screen a
-    /// killed app left up (`TerminalHandler::leave_orphaned_alternate_screen` has
-    /// the measurement). `true` when the alternate screen was active; its last
-    /// frame is then in the archive ([`Self::alt_archive`]), whole.
+    /// Force the primary screen: the host's recovery for an alternate screen a
+    /// killed app left up (see `TerminalHandler::leave_orphaned_alternate_screen`).
+    /// `true` when the alternate screen was active; its last frame is then in the
+    /// archive ([`Self::alt_archive`]), whole.
     ///
-    /// Runs as an EMPTY output batch rather than swapping the grids here: the
-    /// batch prologue and epilogue own the viewport pin, the selection park and
-    /// restore, the archive's boundary, the observation kernel and the mode
-    /// mirror, and every one of them keys on a swap that happens INSIDE the
-    /// batch — the road a `?1049l` from the app takes.
+    /// Runs as an empty output batch rather than swapping grids here: the batch
+    /// prologue and epilogue own the viewport pin, selection park/restore, the
+    /// archive boundary, the observation kernel and the mode mirror, all keyed on
+    /// a swap inside the batch.
     pub fn leave_alternate_screen(&mut self) -> bool {
         if !self.modes.alternate_screen {
             return false;
@@ -2084,10 +1903,9 @@ impl super::Terminal {
 
 #[cfg(test)]
 mod orphaned_alt_screen_tests {
-    //! A killed full-screen app leaves the alternate screen up with no `?1049l`
-    //! (measured 2026-09-22: `less` under ConPTY, `Stop-Process` from another tab).
-    //! The prompt half is in `handler_osc_shell.rs`; this is the host's recovery
-    //! and the mode-table facts both halves rest on.
+    //! A killed full-screen app leaves the alternate screen up with no `?1049l`.
+    //! The prompt half is in `handler_osc_shell.rs`; this covers the host's
+    //! recovery and the mode-table facts both halves rest on.
     use crate::terminal::Terminal;
 
     fn on_alt_with_history() -> Terminal {
@@ -2152,9 +1970,8 @@ mod orphaned_alt_screen_tests {
     #[test]
     fn host_leave_of_a_mode_47_screen_keeps_the_cursor_where_the_app_had_it() {
         // `?47h` saves no cursor, so the leave restores none: the cursor stays
-        // where the alt screen left it, as the app's own `?47l` would leave it —
-        // even with the main slot still holding an EARLIER 1049 app's save (a
-        // 1049 exit restores without consuming it).
+        // where the alt screen left it, even with the main slot still holding an
+        // earlier 1049 app's save.
         let mut term = Terminal::new(5, 40);
         term.process(b"one\r\n\x1b[?1049h\x1b[5;9Hpager\x1b[?1049l");
         assert_eq!(
@@ -2183,7 +2000,7 @@ mod orphaned_alt_screen_tests {
 
     #[test]
     fn host_leave_of_a_1049_screen_entered_after_a_47_one_restores_its_save() {
-        // The entry mode is the LATEST entry's: a 47 app that exited cleanly does
+        // The entry mode is the latest entry's: a 47 app that exited cleanly does
         // not turn the next 1049 app's leave into a 47 one.
         let mut term = Terminal::new(5, 40);
         term.process(b"one\r\n\x1b[?47hx\x1b[?47l\r\ntwo\r\n");
@@ -2200,11 +2017,8 @@ mod orphaned_alt_screen_tests {
     #[test]
     fn a_dead_apps_scroll_region_and_input_modes_do_not_outlive_it() {
         // An editor killed mid-session leaves its scroll region, mouse tracking,
-        // cursor-key and keypad modes and an open 2026 window behind; the exit
-        // carries the region over (xterm does, for a live app), so without the
-        // release the shell's output scrolled inside rows 1-5 and never reached
-        // the scrollback — commands lost again. Focus reporting is conhost's
-        // (and the shell's) and stays.
+        // cursor-key and keypad modes and an open 2026 window behind; the release
+        // lets the shell's output reach the scrollback. Focus reporting stays.
         use crate::terminal::{MouseEncoding, MouseMode};
         let mut term = Terminal::new(10, 40);
         term.process(b"\x1b[?1004hhistory\r\n$ vim file\r\n");
@@ -2263,11 +2077,10 @@ mod orphaned_alt_screen_tests {
 
 #[cfg(test)]
 mod conhost_left_alt_screen_tests {
-    //! After an orphaned leave under conhost, conhost itself is still on the
-    //! alternate buffer the dead app entered, and its next buffer switch repaints
-    //! over our primary screen. The streams are the `cast` tap's, measured
-    //! 2026-09-27 on Windows 11 (`less` from Git for Windows, `Stop-Process`,
-    //! then two commands, a second `less` and `q`), scaled to a 10-row grid.
+    //! After an orphaned leave under conhost, conhost is still on the alternate
+    //! buffer the dead app entered, and its next buffer switch repaints over our
+    //! primary screen. The streams are ConPTY captures (`less` killed, two
+    //! commands, a second `less` and `q`) scaled to a 10-row grid.
     use crate::terminal::Terminal;
 
     const ROWS: u16 = 10;
@@ -2292,7 +2105,7 @@ mod conhost_left_alt_screen_tests {
         rows.iter().filter(|r| *r == want).count()
     }
 
-    /// conhost's blank repaint of the viewport and its `?1049h`, in ONE read.
+    /// conhost's blank repaint of the viewport and its `?1049h`, in one read.
     fn blank_repaint_then_enter() -> Vec<u8> {
         let mut read = b"\x1b[?25l\x1b[H".to_vec();
         for _ in 1..ROWS {
@@ -2302,7 +2115,7 @@ mod conhost_left_alt_screen_tests {
         read
     }
 
-    /// conhost's repaint of its PRIMARY buffer after `?1049l`: frozen at the
+    /// conhost's repaint of its primary buffer after `?1049l`: frozen at the
     /// dead pager's start, so it knows nothing typed since.
     fn stale_primary_repaint() -> Vec<u8> {
         let mut read = b"\x1b[?25l\x1b[H".to_vec();
@@ -2376,9 +2189,8 @@ mod conhost_left_alt_screen_tests {
 
     #[test]
     fn without_conhost_the_same_bytes_move_nothing() {
-        // Negative control: the loss the state exists to prevent. With no console
-        // host in between, no orphaned leave marks one, and the blank repaint
-        // overwrites the rows in place — on unix nothing sends those bytes.
+        // Negative control: with no console host no orphaned leave marks the
+        // state, and the blank repaint overwrites the rows in place.
         let mut term = recovered_with_two_commands(false);
         term.process(&blank_repaint_then_enter());
         assert!(term.modes().alternate_screen);
@@ -2414,10 +2226,9 @@ mod conhost_left_alt_screen_tests {
     #[test]
     fn the_host_forced_leave_under_conhost_keeps_the_rows_too() {
         // cmd.exe paints no marks: the `mainscreen` verb is the recovery, and
-        // conhost is left on the dead app's buffer exactly the same way. The
-        // shape is the `cast` tap's for cmd (2026-09-27): after the kill, cmd's
-        // `\r\n` and its prompt under the pager's last row, a command typed
-        // there, and only then the verb.
+        // conhost is left on the dead app's buffer the same way. After the kill:
+        // cmd's `\r\n` and prompt under the pager's last row, a command, then the
+        // verb.
         let mut term = Terminal::new(ROWS, 40);
         term.process(b"\x1b[?9001h");
         term.process(b"C:\\>less file\r\n\x1b[?1049h\x1b[H\x1b[2J");
@@ -2448,11 +2259,9 @@ mod conhost_left_alt_screen_tests {
         assert_eq!(count(&rows, "    echo after"), 1, "{rows:?}");
     }
 
-    /// A pager that filled the screen after a short history, killed, and the
-    /// shell's prompt: conhost scrolled its alternate buffer for the prompt's
-    /// `\r\n`, so its cursor is on the BOTTOM row, far below the row `?1049h`
-    /// saved — the geometry the reviewer measured (conhost on row 23, the 1049
-    /// save on row 8).
+    /// A pager that filled the screen after a short history, killed, then the
+    /// shell's prompt: conhost scrolled its alternate buffer for the prompt, so
+    /// its cursor is on the bottom row, far below the row `?1049h` saved.
     fn recovered_on_the_bottom_row(conhost: bool) -> Terminal {
         let mut term = Terminal::new(ROWS, 40);
         if conhost {
@@ -2480,9 +2289,9 @@ mod conhost_left_alt_screen_tests {
         assert_eq!((cursor.row, cursor.col), (ROWS - 1, 4), "after `PS> `");
         assert_eq!(term.grid().scrollback_lines(), 3);
         assert_eq!(all_rows(&term)[..3], HISTORY);
-        // A command that wraps, as conhost renders it (the `cast` tap: `\r\n
-        // ESC[23;80H` on 24 rows): fill the row, scroll, re-anchor on the head's
-        // row by ABSOLUTE position and re-print its last cell, so the tail wraps.
+        // A command that wraps, as conhost renders it (`\r\n ESC[23;80H` on 24
+        // rows): fill the row, scroll, re-anchor on the head's row by absolute
+        // position and re-print its last cell, so the tail wraps.
         let head = format!("echo {}", "x".repeat(31));
         term.process(head.as_bytes());
         term.process(format!("\r\n\x1b[{};40Hx", ROWS - 1).as_bytes());
@@ -2500,10 +2309,8 @@ mod conhost_left_alt_screen_tests {
 
     #[test]
     fn a_conhost_repaint_after_the_recovery_cannot_reach_the_history() {
-        // A resize makes conhost repaint its whole ALTERNATE buffer — the dead
-        // pager's rows and everything the shell printed since — over our
-        // primary screen (measured by the reviewer: `resize 24 90`, `resize 24
-        // 80`, and no history row was findable). These are those rows.
+        // A resize makes conhost repaint its whole alternate buffer (the dead
+        // pager's rows and everything printed since) over our primary screen.
         let mut term = recovered_on_the_bottom_row(true);
         term.process(b"echo one\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07");
         term.process(PROMPT);
@@ -2597,9 +2404,8 @@ mod in_band_size_tests {
 
     #[test]
     fn mode_2048_repeated_enable_emits_once() {
-        // `?2048h` is idempotent (xterm/ghostty semantics): only the disabled->
-        // enabled transition emits. A `?2048h` flood must NOT emit a report per
-        // sequence (that was an uncapped response-buffer amplification DoS).
+        // `?2048h` is idempotent: only the disabled->enabled transition emits, so
+        // a flood cannot amplify into the response buffer.
         let mut term = Terminal::new(24, 80);
         let mut input = Vec::new();
         for _ in 0..10_000 {
@@ -2615,9 +2421,8 @@ mod in_band_size_tests {
 
     #[test]
     fn mode_2048_toggle_flood_is_capped() {
-        // A `?2048l?2048h` toggle flood defeats the transition guard (each `h`
-        // is a real re-enable), so the emit must also honor the response-buffer
-        // cap — this path writes the buffer directly, not via send_response.
+        // A `?2048l?2048h` toggle flood defeats the transition guard, so the emit
+        // also honors the response-buffer cap (this path bypasses send_response).
         let mut term = Terminal::new(24, 80);
         let mut input = Vec::new();
         for _ in 0..200_000 {
@@ -2680,15 +2485,10 @@ mod mode_and_query_agreement_tests {
         term.take_response().unwrap_or_default()
     }
 
-    /// DEC MODE 12 IS THE BLINK BIT OF THE CURSOR STYLE.
-    ///
-    /// The renderer arms its blink clock off the `Blinking*` styles and nothing
-    /// else, so a mode 12 that only moved a flag beside them reached the code
-    /// and never the glass — while `CSI ? 12 $ p` answered that flag. Both
-    /// halves are checked here, and they matter on the most ordinary path
-    /// there is: aterm spawns shells with `TERM=xterm-256color`, whose terminfo
-    /// spells `cnorm` as `\E[?12l\E[?25h` and `cvvis` as `\E[?12;25h`, so every
-    /// ncurses `curs_set()` drives this mode.
+    /// DEC mode 12 is the blink bit of the cursor style: the renderer blinks only
+    /// for `Blinking*` styles, and `CSI ? 12 $ p` must answer the same fact.
+    /// `xterm-256color`'s `cnorm`/`cvvis` drive this mode on every ncurses
+    /// `curs_set()`.
     #[test]
     fn mode_12_moves_the_cursor_the_user_sees_and_reports_it() {
         let mut term = Terminal::new(24, 80);
@@ -2706,7 +2506,7 @@ mod mode_and_query_agreement_tests {
         assert!(term.cursor_visible());
         assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;2$y");
 
-        // terminfo `cvvis`: blink again. The SHAPE is untouched by mode 12, so
+        // terminfo `cvvis`: blink again. The shape is untouched by mode 12, so
         // a bar stays a bar.
         term.process(b"\x1b[6 q"); // DECSCUSR steady bar
         assert_eq!(term.cursor_style(), CursorStyle::SteadyBar);
@@ -2720,9 +2520,7 @@ mod mode_and_query_agreement_tests {
         assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;1$y");
     }
 
-    /// The other direction: DECSCUSR carries the blink bit too, so it moves
-    /// mode 12 with it. Otherwise a `vim` that set a steady bar left the query
-    /// claiming the cursor blinks.
+    /// DECSCUSR carries the blink bit too, so it moves mode 12 with it.
     #[test]
     fn decscusr_moves_mode_12_with_the_style() {
         for (param, style, want_set) in [
@@ -2754,11 +2552,8 @@ mod mode_and_query_agreement_tests {
         }
     }
 
-    /// A mode DECRQM can REPORT is a mode XTSAVE/XTRESTORE must be able to
-    /// CARRY. The two tables are two spellings of one fact (`query_dec_mode`
-    /// and `handle_decrqm`) and had drifted by seven modes, each of which made
-    /// `CSI ? Ps s` / `CSI ? Ps r` a silent no-op that looked exactly like a
-    /// working one.
+    /// Every mode DECRQM can report is one XTSAVE/XTRESTORE can carry: the two
+    /// tables (`query_dec_mode`, `handle_decrqm`) must agree.
     #[test]
     fn xtsave_covers_every_mode_decrqm_reports() {
         // Every mode `handle_decrqm` answers 1/2 for (the 3/4 "permanently

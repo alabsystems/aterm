@@ -3,10 +3,8 @@
 
 //! The POSIX console driver for the `aterm` passthrough binary: termios raw
 //! mode, a `poll(2)` I/O loop over stdin + the PTY master, SIGWINCH resize
-//! forwarding, and the `waitpid`/`WIFEXITED` exit-status epilogue. All code
-//! here is moved VERBATIM from `main.rs` (the shared parser/diagnostics stay
-//! there); `driver_windows.rs` is this file's ConPTY console twin behind the
-//! same four-function surface.
+//! forwarding, and the `waitpid`/`WIFEXITED` exit-status epilogue.
+//! `driver_windows.rs` is its ConPTY twin behind the same surface.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,26 +26,38 @@ fn host_winsize_raw() -> libc::winsize {
     ws
 }
 
-/// The host terminal size as `(rows, cols)` — the platform-neutral surface
-/// `main.rs` consumes (the raw `winsize` stays private to this driver).
+/// The host terminal size as `(rows, cols)` (the raw `winsize` stays private).
 pub(crate) fn host_winsize() -> (u16, u16) {
     let ws = host_winsize_raw();
     (ws.ws_row, ws.ws_col)
 }
 
-/// Whether stdout is a terminal (`doctor`'s tty check).
-pub(crate) fn stdout_is_tty() -> bool {
-    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
-}
-
-/// Whether `path` exists and is executable (`X_OK`). Conservative: any `access(2)`
-/// error (missing, not executable, embedded NUL) → `false` — a non-runnable shell
-/// is a failed check.
-pub(crate) fn shell_is_executable(path: &str) -> bool {
+/// Whether `path` names a shell this session can start: a regular file that
+/// `access(2)` grants `X_OK`. A path that does not exist is
+/// `Missing`; anything else that cannot run is `NotExecutable`.
+pub(crate) fn shell_check(path: &str) -> crate::ShellCheck {
+    use crate::ShellCheck;
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return ShellCheck::Missing;
+        }
+        // A directory, or a path this user cannot reach.
+        _ => return ShellCheck::NotExecutable,
+    }
     let Ok(c) = std::ffi::CString::new(path) else {
-        return false;
+        return ShellCheck::Missing;
     };
-    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+    if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+        ShellCheck::Runs
+    } else {
+        ShellCheck::NotExecutable
+    }
 }
 
 fn set_raw(fd: libc::c_int) -> libc::termios {
@@ -86,34 +96,29 @@ fn eintr() -> bool {
 
 /// Whether `poll(2)` says a stream fd must be read now.
 ///
-/// `POLLHUP` is deliberately included even without `POLLIN`: Unix variants may
-/// report the buffered tail and final EOF as either `POLLIN|POLLHUP` or a bare
-/// hangup. Reading every observation preserves the tail and turns the final one
-/// into `read == 0`; ignoring a terminal-only event leaves the fd registered and
-/// can make `poll` return immediately forever. Error/invalid-fd readiness has the
-/// same terminal shape and must reach the existing read-error path instead.
+/// Includes `POLLHUP` without `POLLIN`: platforms report the buffered tail and
+/// final EOF as either `POLLIN|POLLHUP` or a bare hangup, and ignoring a
+/// terminal-only event would make `poll` return immediately forever.
+/// Error/invalid-fd readiness goes to the read-error path the same way.
 const fn poll_must_read(revents: libc::c_short) -> bool {
     revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
 /// Raw mode, the passthrough `poll(2)` loop, resize forwarding, restore, reap:
-/// returns the shell's exit status (non-exit or a failed wait → 1). The body is the parent-side
-/// session loop moved verbatim from `main()`. Nothing here models the screen: the
-/// host terminal draws the bytes, and the PTY is the one thing told the geometry.
+/// returns the shell's exit status (non-exit or a failed wait → 1). Nothing
+/// here models the screen; the PTY is the one thing told the geometry.
 pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let master = shell.master;
     let shell_pid = shell.pid;
 
-    // PARENT.
     let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     let orig = if stdin_is_tty {
         Some(set_raw(libc::STDIN_FILENO))
     } else {
         None
     };
-    // Cast through a function pointer (not a direct fn-item-to-int cast) so the
-    // `fn_to_numeric_cast` lint is satisfied while still yielding the address
-    // libc::signal expects as its sighandler_t.
+    // Cast through a function pointer to satisfy `fn_to_numeric_cast` while
+    // yielding the `sighandler_t` address.
     unsafe {
         libc::signal(
             libc::SIGWINCH,
@@ -140,9 +145,7 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let mut buf = [0u8; 8192];
 
     loop {
-        // Apply a pending resize before blocking: tell the PTY, which is what
-        // every full-screen app reads its geometry from. Nothing else in this
-        // process holds a size.
+        // Apply a pending resize before blocking.
         if GOT_WINCH.swap(false, Ordering::Relaxed) {
             let mut nws = host_winsize_raw();
             unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &mut nws) };
@@ -197,13 +200,10 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         restore(libc::STDIN_FILENO, &t);
     }
     let mut status = 0;
-    // Reap the SHELL by its pid, never `waitpid(-1)`: this process is not the
-    // shell's only parent-of-record. `aterm` can start a detached `aterm pkg
-    // update` before the session, and the update checker runs codesign/curl; any
-    // of those that has already exited would otherwise be reaped in place of the
-    // shell and hand the session ITS exit status. The pid is the forked session
-    // leader, which may exec the sandbox-exec wrapper (it exits with the shell's
-    // status) and then the shell — the same pid either way.
+    // Reap the shell by its pid, never `waitpid(-1)`: this process may have
+    // other children (a detached `aterm pkg update`, the update checker's
+    // codesign/curl) whose status would be mistaken for the shell's. The pid
+    // is the session leader whether or not it execs the sandbox-exec wrapper.
     let reaped = unsafe {
         libc::close(master);
         loop {
@@ -231,16 +231,10 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
 
-    /// THE SESSION'S EXIT STATUS IS THE SHELL'S (2026-09-12). The session
-    /// process is not the shell's only parent-of-record: `aterm` can start a
-    /// detached `aterm pkg update` before the session, and the update checker
-    /// runs codesign/curl. The closing reap was `waitpid(-1)`, so a child that
-    /// had already exited could be reaped in place of the shell and hand the
-    /// session its status.
-    ///
-    /// The body runs in a re-exec of this test binary with stdin at /dev/null,
-    /// so raw mode never touches a real terminal and no parallel test's children
-    /// are in reach of the reap.
+    /// The session's exit status is the shell's, even when another child of
+    /// this process has already exited. Runs in a re-exec of this test binary
+    /// with stdin at /dev/null, isolated from real terminals and other tests'
+    /// children.
     #[test]
     fn run_returns_the_shells_status_not_an_older_zombie_childs() {
         const CHILD: &str = "ATERM_TEST_DRIVER_REAPS_THE_SHELL";
@@ -267,22 +261,44 @@ mod tests {
             );
             return;
         }
-        // A decoy child that exits non-zero and is surely a zombie before the
-        // shell is.
+        // A decoy child that exits non-zero and is a zombie before the shell
+        // is spawned: `waitid(WNOWAIT)` blocks until it has exited and leaves
+        // it unreaped.
         let decoy = std::process::Command::new("/bin/sh")
             .args(["-c", "exit 7"])
             .spawn()
             .expect("decoy");
         let decoy_pid = libc::pid_t::try_from(decoy.id()).expect("pid");
         std::mem::forget(decoy);
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let decoy_id = libc::id_t::try_from(decoy_pid).expect("id");
+        loop {
+            // SAFETY: `info` is a zeroed out-parameter owned by this frame.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: waits on this process's own child; `info` is valid.
+            let r = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    decoy_id,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if r == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted,
+                "waitid on the decoy: {e}"
+            );
+        }
 
-        // Use the same protected spawn seam as the session. The shell closes
-        // the slave so the master sees EOF while it is still alive, then exits
-        // 3. Ignore the hangup from the driver closing the master on EOF so the
-        // fixture's planned exit status survives on Linux. The older zombie
-        // still distinguishes waitpid(-1) from waiting for
-        // this particular shell, without introducing a second raw PTY spawn.
+        // The same protected spawn seam as the session. The shell closes the
+        // slave so the master sees EOF while it lives, then exits 3; the
+        // hangup from the driver closing the master is ignored so that status
+        // survives on Linux. The older zombie distinguishes `waitpid(-1)` from
+        // waiting for this shell.
         // SAFETY: this is the isolated test child's trusted launch point.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
@@ -313,11 +329,9 @@ mod tests {
         assert_eq!(code, 3, "the session took another child's exit status");
     }
 
-    /// THE SHELL'S FIRST OUTPUT IS A SESSION'S PROOF OF A HEALTHY START (2026-09-28):
-    /// the launcher confirms a replaced Linux executable's trial on it
-    /// ([`crate::on_first_shell_output`]). The hook runs once, after the first bytes
-    /// reached the terminal, however many more follow. A re-exec, like the test above:
-    /// the hook is process-wide, and raw mode must not touch a real terminal.
+    /// The first-shell-output hook ([`crate::on_first_shell_output`]) runs
+    /// once, after the first bytes reach the terminal. A re-exec like the test
+    /// above, since the hook is process-wide.
     #[test]
     fn the_shells_first_output_runs_the_hook_once() {
         use std::sync::atomic::AtomicUsize;
@@ -399,18 +413,15 @@ mod tests {
         assert!(!poll_must_read(libc::POLLOUT));
     }
 
-    /// A real pipe closes with buffered bytes still readable, then becomes a
-    /// terminal readiness (bare `POLLHUP` on some Unix variants,
-    /// `POLLIN|POLLHUP` on others). Driving every observation through
-    /// `poll_must_read` must recover the complete tail and finally observe EOF;
-    /// the former POLLIN-only loop could ignore terminal-only readiness forever.
+    /// A pipe closed with buffered bytes becomes terminal readiness (bare
+    /// `POLLHUP` or `POLLIN|POLLHUP`); driving every observation through
+    /// `poll_must_read` recovers the full tail and then EOF.
     #[test]
     fn closed_pipe_drains_buffered_bytes_then_consumes_hangup() {
         let mut raw = [-1; 2];
         assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0);
-        // pipe(2) opens both ends inheritable: a child another test in this
-        // binary spawns meanwhile would keep the write end open past its exec,
-        // for its whole life, and the hang-up below would never come.
+        // Mark both ends close-on-exec so another test's child cannot hold the
+        // write end open.
         for fd in raw {
             // SAFETY: `fd` is a live descriptor `pipe` just returned.
             assert_eq!(
@@ -436,10 +447,8 @@ mod tests {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // 10 s, not 1: the hang-up comes only once every copy of the write
-            // end is closed, and a child another test is forking holds one until
-            // it execs (the fd-copy sweep of 2026-09-27). A ready pipe answers at
-            // once either way.
+            // 10 s: the hang-up needs every copy of the write end closed, and
+            // a concurrently forking test may hold one until it execs.
             assert_eq!(unsafe { libc::poll(&mut event, 1, 10_000) }, 1);
             assert!(
                 poll_must_read(event.revents),

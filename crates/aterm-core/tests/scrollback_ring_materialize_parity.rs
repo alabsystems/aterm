@@ -1,28 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! SCR-2 PARITY: the ring-tier fast materializer against the `Line` round trip.
+//! Parity: the ring-tier fast materializer against the `Line` round trip.
 //!
-//! `Grid::materialize_scrollback_row_full` now reads a RING-tier history row
-//! straight out of its stored `Row` + `ScrolledRowExtras` instead of
-//! serializing those cells into a `Line` (text + RLE attrs + hyperlink clone)
-//! and immediately parsing them back into cells. The two must produce the SAME
-//! materialized row — including the round trip's NORMALIZATIONS, which are not
-//! obvious and are what every consumer of a materialized history row is written
-//! against: combining marks fold into the cell's complex string, a "complex"
-//! cell holding a single BMP scalar demotes to an inline char, a wide unit is
-//! re-created with its spacer beside it.
+//! `Grid::materialize_scrollback_row_full` reads a ring-tier history row
+//! straight from its stored `Row` + `ScrolledRowExtras` rather than serializing
+//! to a `Line` and parsing back. Both must produce the same row, including the
+//! round trip's normalizations that consumers rely on: combining marks fold into
+//! the cell's complex string, a complex cell holding one BMP scalar demotes to
+//! an inline char, and a wide unit is re-created with its spacer.
 //!
-//! This lives in aterm-core because that is the only place a corpus can be
-//! driven through the REAL parser: OSC 8 hyperlinks, SGR 58 underline colours,
-//! truecolor, ZWJ/VS16/skin-tone/flag emoji and CJK all reach the grid the way
-//! a program would send them, not the way a unit test would hand-build them.
+//! It lives in aterm-core so the corpus goes through the real parser (OSC 8,
+//! SGR 58, truecolor, ZWJ/VS16/skin-tone/flag emoji, CJK).
 //!
-//! TWO-SIDED. `take_ring_fast_materialize` is asserted NON-ZERO on the ring
-//! corpus (the fast path really fired, so the equality assertions below are not
-//! vacuously comparing the round trip with itself) and ZERO on a read that
-//! lands in the tiered store (it never over-fires onto a tier whose bytes it
-//! cannot see).
+//! `take_ring_fast_materialize` is asserted non-zero on the ring corpus (the
+//! fast path fired) and zero on a read from the tiered store.
 
 use aterm_core::grid::materialize_from_line;
 use aterm_core::scrollback::Scrollback;
@@ -39,33 +31,33 @@ fn corpus() -> Vec<String> {
         // Plain ASCII — the common cell, and the closed-form fast path.
         "plain ascii row 0123456789".to_owned(),
         // Trailing coloured blanks (a status bar / `\x1b[K` fill): the cells are
-        // spaces but NOT default, so `len` must keep them.
+        // spaces but not default, so `len` must keep them.
         "\x1b[44mstatus\x1b[K\x1b[0m".to_owned(),
-        // Wide CJK: WIDE main cells with spacers the serializer omits and the
+        // Wide CJK: wide main cells with spacers the serializer omits and the
         // parser re-creates.
         "cjk 日本語テキスト end".to_owned(),
         // Non-BMP emoji (complex cells), plus a ZWJ family and a skin tone.
         "emoji 🎉 👨‍👩‍👧 👍🏽".to_owned(),
         // Presentation selectors: VS16 widens, VS15 narrows.
         "vs ❤\u{FE0F} ⌚\u{FE0E} done".to_owned(),
-        // A regional-indicator flag pair (folds into ONE cell).
+        // A regional-indicator flag pair (folds into one cell).
         "flag 🇯🇵 tail".to_owned(),
-        // Combining marks — these FOLD into the complex string on the way back.
+        // Combining marks — these fold into the complex string on the way back.
         "combining e\u{0301} a\u{0308} o\u{0302}".to_owned(),
-        // Truecolor foreground AND background (RGB overflow on both channels).
+        // Truecolor foreground and background (RGB overflow on both channels).
         "\x1b[38;2;255;100;50m\x1b[48;2;10;20;30mtruecolor\x1b[0m".to_owned(),
         // 256-colour indexed + the SGR attribute family.
         "\x1b[38;5;123m\x1b[1;3;4;9;53mattrs\x1b[0m".to_owned(),
         // OSC 8 hyperlink with an id, then unlinked text after it.
         "\x1b]8;id=x1;https://example.com/a\x1b\\linked\x1b]8;;\x1b\\ after".to_owned(),
-        // SGR 58 underline colour: explicit RGB, then INDEXED (which must stay
+        // SGR 58 underline colour: explicit RGB, then indexed (which must stay
         // indexed so it re-resolves against the live palette).
         "\x1b[4;58;2;10;200;30munder\x1b[59m \x1b[4;58;5;9midx\x1b[0m".to_owned(),
         // Mixed: a hyperlink over CJK with truecolor under it.
         "\x1b[38;2;9;9;9m\x1b]8;;https://e.x/b\x1b\\日本\x1b]8;;\x1b\\\x1b[0m".to_owned(),
         // A row that fills the grid width exactly.
         "X".repeat(COLS as usize),
-        // A row whose last cell is WIDE (the row-edge case).
+        // A row whose last cell is wide (the row-edge case).
         format!("{}日", "y".repeat(COLS as usize - 2)),
         // Empty row (zero length).
         String::new(),
@@ -128,9 +120,7 @@ fn ring_rows_materialize_identically_to_the_line_round_trip() {
         "fixture pushed only {depth} lines into history"
     );
 
-    // Per ROW, not in aggregate: a decline names the row that caused it, which
-    // is the difference between "the fast path declines something realistic"
-    // (a finding) and "one of these fifteen lines" (a puzzle).
+    // Per row, so a decline names the row that caused it.
     let _ = take_ring_fast_materialize();
     for rev_idx in 0..depth {
         assert_row_parity(&term, rev_idx);
@@ -148,7 +138,7 @@ fn ring_rows_materialize_identically_to_the_line_round_trip() {
     }
 }
 
-/// The mirror image: a row that has left the ring for the tiered store is NOT
+/// The mirror image: a row that has left the ring for the tiered store is not
 /// claimed by the fast path, and still materializes identically.
 #[test]
 fn tiered_rows_fall_back_to_the_line_path() {
@@ -163,7 +153,7 @@ fn tiered_rows_fall_back_to_the_line_path() {
         "fixture history ({depth}) does not reach past the {RING}-line ring"
     );
 
-    // The OLDEST rows are the tiered ones (the ring holds the newest).
+    // The oldest rows are the tiered ones (the ring holds the newest).
     let _ = take_ring_fast_materialize();
     let deepest = depth - 1;
     for rev_idx in [deepest, deepest - 1, deepest - 2] {

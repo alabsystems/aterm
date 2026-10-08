@@ -38,7 +38,10 @@
 //!   carries the turn-id counter. It is in NEITHER adoption-proof digest and
 //!   no schema moved: an older receiver skips both keys and adopts exactly as
 //!   before, and the sender unlinks the sidecar once the proof checks out — so
-//!   a receiver reads its sidecars BEFORE it publishes its proof.
+//!   a receiver reads its sidecars BEFORE it publishes its proof. A HELD pane
+//!   (`--hold`, its command ended) is carried the same way, its sidecar
+//!   `seamless-<pid>-<nonce>.h<id>.ctl` named on its `HeldPaneCarry::control`
+//!   (round eight of the update audit, finding 730).
 //! * `take_incoming` reads and deletes it, checks its length and sha, and
 //!   [`decode`]s it; `spawn_session` installs it into the adopted engine and
 //!   ledger ([`ControlCarry::ledger`], [`ControlCarry::install`]). Anything
@@ -82,8 +85,8 @@ pub(crate) const MAX_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
 /// every session — the receiver decodes them in early `main`, inside the
 /// freeze the user sees. Every session's ledger and counters are set aside
 /// first; past it, sessions carry fewer rows (then no differ state) — and
-/// only a desk whose ledgers alone overflow it sheds ledger records
-/// ([`export`]).
+/// only a desk whose ledgers alone overflow it sheds ledger records, every
+/// session its oldest, the longest ledgers alike ([`export`]).
 pub(crate) const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 /// How many of the newest SUBMITTED turns' marks the carried tail reaches back
 /// to: `aterm drive report` reads `history 8` and starts from the newest
@@ -172,9 +175,120 @@ pub(crate) fn capture_head(
     }
 }
 
+/// Which turn-status words the receiving build reads, so [`export_for`]
+/// spells every record in its vocabulary (round eight of the update audit,
+/// finding 714). A receiver leaves out a record whose word it does not know.
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StatusWords {
+    /// This build's: `settled`, `timeout` and `hangup`. Every build from
+    /// [`READS_HANGUP_FROM_BUILD`] on reads all three.
+    Current,
+    /// A build from before `hangup` — a rollback, an older bundle put back, a
+    /// channel switch. 53bc0f2f7 added the word after v0.98.0 was cut: v0.98.0
+    /// and every build before it read `settled` and `timeout` alone, and leave
+    /// a `hangup` record out while still vouching for its id.
+    PreHangup,
+}
+
+/// The first build whose turn ledger reads `hangup`: v0.100.0's claim in
+/// `RELEASES.ledger`. No v0.99.0 was cut, and v0.98.0 (1790607299) predates
+/// 53bc0f2f7, which added the word. A development build's number is its
+/// HEAD's commit time, so one built between 53bc0f2f7 and this claim is
+/// handed `timeout`, a word it also reads.
+#[cfg(any(unix, test))]
+pub(crate) const READS_HANGUP_FROM_BUILD: u64 = 1_790_807_622;
+
+#[cfg(any(unix, test))]
+impl StatusWords {
+    /// The words of the successor at `target_build`, keyed on the first build
+    /// that reads `hangup` and not on whether the target is older than this
+    /// build, as the screen carry's ceilings (`seamless::WireCaps::for_hop`)
+    /// and the history carry (`handoff_history::exports_for_target`) are: a
+    /// rollback to v0.100.0 or later reads `hangup`, carried it as it is
+    /// before this export respelled any word, and still does.
+    #[must_use]
+    pub(crate) fn for_target(target_build: u64) -> Self {
+        if target_build < READS_HANGUP_FROM_BUILD {
+            Self::PreHangup
+        } else {
+            Self::Current
+        }
+    }
+
+    /// `status` in these words. A build from before `hangup` has no word for a
+    /// turn whose caller hung up during its settle (that build never recorded
+    /// one); its nearest is `timeout`, a settle nobody saw end. The record —
+    /// submitted, its text, its archive mark — is what `aterm drive report`
+    /// anchors on, and that crosses whole.
+    fn spell(self, status: &'static str) -> &'static str {
+        match (self, status) {
+            (Self::PreHangup, "hangup") => "timeout",
+            _ => status,
+        }
+    }
+}
+
+/// What a session's carry left behind on its way out of [`export_noting`],
+/// for the log line that names it (round eight of the update audit, finding
+/// 731): every other export, write and adoption loss is logged by session and
+/// cause, and these two lock arms were not.
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CarryLoss {
+    /// Another thread kept the session's turn ledger past the export's
+    /// patience: it hands off without its ledger, every id below `unvouched`
+    /// said as unheld.
+    LedgerBusy { unvouched: u64 },
+    /// Another thread kept the session's engine past the export's patience:
+    /// its archive crosses as counters alone.
+    TerminalBusy,
+    /// The archive moved after the freeze took its fence: its counters alone.
+    ArchiveMoved,
+}
+
+#[cfg(any(unix, test))]
+impl CarryLoss {
+    /// The WARN line naming this loss for session `local_id`, one sentence
+    /// read in aterm.log.
+    fn line(self, local_id: u64) -> String {
+        match self {
+            Self::LedgerBusy { unvouched } => format!(
+                "update apply: session {local_id}'s turn ledger was held by another thread past \
+                 the export's {LOCK_PATIENCE:?}; it hands off without its ledger, and says every \
+                 turn id below {unvouched} as one it cannot vouch for"
+            ),
+            Self::TerminalBusy => format!(
+                "update apply: session {local_id}'s terminal was held by another thread past the \
+                 export's {LOCK_PATIENCE:?}; its archive crosses as counters alone, its rows \
+                 counted lost"
+            ),
+            Self::ArchiveMoved => format!(
+                "update apply: session {local_id}'s archive moved after the freeze took it; it \
+                 crosses as counters alone, its rows counted lost"
+            ),
+        }
+    }
+
+    fn log(self, local_id: u64) {
+        aterm_log::warn!("{}", self.line(local_id));
+    }
+}
+
+/// [`export_for`] in this build's own words: what a successor at least as new
+/// as this build reads.
+#[cfg(test)]
+pub(crate) fn export(sources: &[CarrySource], turn_id_ceiling: u64) -> Vec<(u64, Vec<u8>)> {
+    export_for(sources, turn_id_ceiling, StatusWords::Current)
+}
+
 /// THE WORKER'S SHARE, just before the manifest is written: one sidecar per
-/// session, `(local_id, JSON)`. Never fails the handoff — a session whose
-/// sidecar would not fit carries less, and in the end nothing.
+/// session, `(local_id, JSON)`, its records spelled in `words`, the receiving
+/// build's. Never fails the handoff — a session whose sidecar would not fit
+/// carries less, and in the end nothing.
+/// `turn_id_ceiling` is the turn-id count the manifest carries: the most
+/// this process mints before it exits, so the most a record that lands here
+/// after the export can be numbered.
 ///
 /// THE AGGREGATE IS SPENT BY PRIORITY, not first come, first served (round
 /// seven, finding 37): every session's CORE — its ledger and the archive's
@@ -182,25 +296,59 @@ pub(crate) fn capture_head(
 /// stand on — is set aside first, and the differ's state and the archive's
 /// rows share what is left, in pool order. Spent greedily, a crowded desk's
 /// first sessions carried their optional rows and its last ones lost their
-/// whole ledger, the same sessions on every update.
+/// whole ledger, the same sessions on every update. When the cores ALONE
+/// overflow it, they share it ([`core_shares`]): every session keeps its
+/// newest records, the longest ledgers are cut alike, and each carry names
+/// the turn ids it shed (round eight, finding 41).
 #[cfg(any(unix, test))]
-pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
+pub(crate) fn export_for(
+    sources: &[CarrySource],
+    turn_id_ceiling: u64,
+    words: StatusWords,
+) -> Vec<(u64, Vec<u8>)> {
+    export_noting(sources, turn_id_ceiling, words, |local_id, loss| {
+        loss.log(local_id);
+    })
+}
+
+/// [`export_for`], each [`CarryLoss`] handed to `noted` with its session.
+#[cfg(any(unix, test))]
+pub(crate) fn export_noting(
+    sources: &[CarrySource],
+    turn_id_ceiling: u64,
+    words: StatusWords,
+    mut noted: impl FnMut(u64, CarryLoss),
+) -> Vec<(u64, Vec<u8>)> {
     let patience = Instant::now() + LOCK_PATIENCE;
+    // Every id this process may still number a record with.
+    let unvouched = turn_id_ceiling
+        .max(crate::control::turn_ids_minted())
+        .saturating_add(1);
     let mut taken = Vec::with_capacity(sources.len());
     for source in sources {
         // A ledger another thread keeps is carried as NOTHING it vouches for:
-        // every turn id this process minted may have named a record of it.
-        let (turns, unheld_below) = patiently(patience, || source.turns.try_lock()).map_or_else(
-            || {
-                (
-                    Vec::new(),
-                    crate::control::turn_ids_minted().saturating_add(1),
-                )
-            },
+        // every turn id this process minted, or still mints, may name a
+        // record of it. SAID, as every other carry loss is.
+        let (turns, unheld_below) = match patiently(patience, || source.turns.try_lock()) {
             // A turn still open here records into THIS process after the
-            // export: the carry does not vouch for its id either.
-            |ledger| (ledger.records().cloned().collect(), ledger.carry_floor()),
-        );
+            // export: the carry does not vouch for the id it lands under.
+            // Each record in the receiver's words.
+            Some(ledger) => (
+                ledger
+                    .records()
+                    .cloned()
+                    .map(|mut record| {
+                        record.status = words.spell(record.status);
+                        record
+                    })
+                    .collect(),
+                ledger.carry_floor(turn_id_ceiling),
+            ),
+            None => {
+                noted(source.local_id, CarryLoss::LedgerBusy { unvouched });
+                (Vec::new(), unvouched)
+            }
+        };
         let mut archive = source.head.clone();
         if let Some(terminal) = patiently(patience, || source.term.try_lock()) {
             // The differ's state, when the freeze had no time for it — only
@@ -213,31 +361,39 @@ pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
             let from = tail_from(&turns, source.fence, archive.differ.as_ref());
             // `false` (the archive moved since the freeze) leaves the head:
             // counters only, the rows counted lost.
-            let _ = terminal.alt_archive_carry_rows(
+            if !terminal.alt_archive_carry_rows(
                 &mut archive,
                 source.fence,
                 from,
                 CARRY_ARCHIVE_BYTES,
-            );
+            ) {
+                noted(source.local_id, CarryLoss::ArchiveMoved);
+            }
+        } else {
+            noted(source.local_id, CarryLoss::TerminalBusy);
         }
         let core = core_len(&turns, unheld_below, &archive);
         taken.push((source.local_id, turns, unheld_below, archive, core));
     }
-    let cores = taken
-        .iter()
-        .fold(0_u64, |sum, (.., core)| sum.saturating_add(*core));
-    // What the differs and the rows may spend, over every session's core.
-    let mut spare = MAX_AGGREGATE_BYTES.saturating_sub(cores);
+    let cores: Vec<u64> = taken.iter().map(|(.., core)| *core).collect();
+    let shares = core_shares(&cores, MAX_AGGREGATE_BYTES);
+    // What the differs and the rows may spend, over every session's share.
+    let mut spare = MAX_AGGREGATE_BYTES.saturating_sub(shares.iter().sum());
     let mut total = 0_u64;
+    let (mut shed_sessions, mut shed_records) = (0_usize, 0_usize);
     let mut out = Vec::with_capacity(taken.len());
-    for (local_id, turns, unheld_below, archive, core) in taken {
+    for ((local_id, turns, unheld_below, archive, _), share) in taken.into_iter().zip(shares) {
         let room = MAX_SIDECAR_BYTES
-            .min(core.saturating_add(spare))
+            .min(share.saturating_add(spare))
             .min(MAX_AGGREGATE_BYTES.saturating_sub(total));
-        if let Some(bytes) = encode_within(turns, unheld_below, archive, room) {
+        if let Some((bytes, shed)) = encode_within(turns, unheld_below, archive, room) {
             let len = bytes.len() as u64;
             total = total.saturating_add(len);
-            spare = spare.saturating_sub(len.saturating_sub(core));
+            spare = spare.saturating_sub(len.saturating_sub(share));
+            if shed > 0 {
+                shed_sessions += 1;
+                shed_records += shed;
+            }
             out.push((local_id, bytes));
         } else {
             // SAID, not silent (round seven, finding 44): the session adopts
@@ -249,7 +405,38 @@ pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
             );
         }
     }
+    if shed_sessions > 0 {
+        // COUNTED, and said: each of these carries names the ids it shed
+        // (`history`'s `unheld_below=`, a resumed `since-turn=`'s GAP).
+        aterm_log::warn!(
+            "update apply: {shed_sessions} sessions' turn ledgers do not fit the handoff's \
+             {MAX_AGGREGATE_BYTES}-byte control budget whole; they hand off their newest \
+             records, {shed_records} older ones in all left behind"
+        );
+    }
     out
+}
+
+/// Each session's share of `budget` for its CORE ([`core_len`], `cores` in
+/// pool order): the whole core while every core fits; past that, the most
+/// every session can have alike — a core under that keeps all of it, and
+/// what it leaves goes to the longer ones, cut alike (max-min fair). The
+/// shares never sum past `budget`, and pool order buys nothing.
+#[cfg(any(unix, test))]
+fn core_shares(cores: &[u64], budget: u64) -> Vec<u64> {
+    if cores.iter().fold(0_u64, |sum, c| sum.saturating_add(*c)) <= budget {
+        return cores.to_vec();
+    }
+    let mut order: Vec<usize> = (0..cores.len()).collect();
+    order.sort_by_key(|&i| cores[i]);
+    let mut shares = vec![0; cores.len()];
+    let mut left = budget;
+    for (k, &i) in order.iter().enumerate() {
+        let alike = left / (cores.len() - k) as u64;
+        shares[i] = cores[i].min(alike);
+        left -= shares[i];
+    }
+    shares
 }
 
 /// The size of a session's CORE sidecar — its whole ledger and the archive's
@@ -341,37 +528,57 @@ fn patiently<G>(
 }
 
 /// Encode, shedding what does not fit `room`: the rows first (counters
-/// only), then the differ's state, then the ledger's older half at a time
-/// (the ids shed are ones the carried ledger no longer vouches for).
+/// only), then the differ's state, then the ledger's OLDEST records, no more
+/// of them than the room needs (the ids shed are ones the carried ledger no
+/// longer vouches for). With the records shed, if any.
+///
+/// Each record's bytes are measured once, and the cut moves past as many as
+/// the last encode ran over (at least one): an encode or two, where shedding
+/// half the ledger at a time left up to half the room unspent.
 #[cfg(any(unix, test))]
 fn encode_within(
-    mut turns: Vec<TurnRecord>,
-    mut unheld_below: u64,
+    turns: Vec<TurnRecord>,
+    unheld_below: u64,
     archive: AltArchiveCarry,
     room: u64,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, usize)> {
     let fits = |b: &Vec<u8>| b.len() as u64 <= room;
     let mut archive = archive;
     if let Some(bytes) = encode(&turns, unheld_below, &archive).filter(fits) {
-        return Some(bytes);
+        return Some((bytes, 0));
     }
     archive = counters_only(archive);
     if let Some(bytes) = encode(&turns, unheld_below, &archive).filter(fits) {
-        return Some(bytes);
+        return Some((bytes, 0));
     }
     archive.differ = None;
+    let mut lens: Option<Vec<u64>> = None;
+    let mut cut = 0_usize;
     loop {
-        if let Some(bytes) = encode(&turns, unheld_below, &archive).filter(fits) {
-            return Some(bytes);
+        let floor = cut
+            .checked_sub(1)
+            .and_then(|newest_shed| turns.get(newest_shed))
+            .map_or(unheld_below, |t| unheld_below.max(t.id.saturating_add(1)));
+        let bytes = encode(&turns[cut..], floor, &archive)?;
+        let over = (bytes.len() as u64).saturating_sub(room);
+        if over == 0 {
+            return Some((bytes, cut));
         }
-        if turns.is_empty() {
+        if cut == turns.len() {
             return None;
         }
-        let shed = turns.len().div_ceil(2);
-        if let Some(newest_shed) = turns.get(shed - 1) {
-            unheld_below = unheld_below.max(newest_shed.id.saturating_add(1));
+        // A record's bytes in the array: its own JSON and a comma.
+        let lens = lens.get_or_insert_with(|| {
+            turns
+                .iter()
+                .map(|t| aterm_json::to_vec(&turn_wire(t)).map_or(1, |b| b.len() as u64 + 1))
+                .collect()
+        });
+        let mut freed = 0_u64;
+        while cut < turns.len() && (freed == 0 || freed < over) {
+            freed = freed.saturating_add(lens[cut]);
+            cut += 1;
         }
-        turns.drain(..shed);
     }
 }
 
@@ -464,26 +671,29 @@ struct FrameWire {
     rows: Vec<String>,
 }
 
+/// One record as the sidecar carries it.
+#[cfg(any(unix, test))]
+fn turn_wire(t: &TurnRecord) -> TurnWire {
+    TurnWire {
+        id: t.id,
+        started_ms: t.started_ms,
+        dur_ms: t.dur_ms,
+        submitted: t.submitted,
+        status: t.status.to_string(),
+        text: t.text.clone(),
+        screen_hash: t.screen_hash,
+        seq: t.seq,
+        arch_origin: t.arch.origin,
+        arch_last: t.arch.last,
+    }
+}
+
 #[cfg(any(unix, test))]
 fn encode(turns: &[TurnRecord], unheld_below: u64, archive: &AltArchiveCarry) -> Option<Vec<u8>> {
     let wire = Wire {
         version: WIRE_VERSION,
         unheld_below,
-        turns: turns
-            .iter()
-            .map(|t| TurnWire {
-                id: t.id,
-                started_ms: t.started_ms,
-                dur_ms: t.dur_ms,
-                submitted: t.submitted,
-                status: t.status.to_string(),
-                text: t.text.clone(),
-                screen_hash: t.screen_hash,
-                seq: t.seq,
-                arch_origin: t.arch.origin,
-                arch_last: t.arch.last,
-            })
-            .collect(),
+        turns: turns.iter().map(turn_wire).collect(),
         archive: Some(ArchiveWire {
             origin: archive.origin,
             first: archive.first,
@@ -568,26 +778,35 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<ControlCarry> {
 
 /// Decode a sidecar, or say why it is not one this build reads. A record
 /// with a status word this build does not print, or an id past
-/// [`MAX_TURN_ID`], is left out; a gap of a kind it does not know is left out.
+/// [`MAX_TURN_ID`], is left out — and the carry no longer vouches for its id
+/// (`unheld_below` rises past it, as for a record the sender shed), so a
+/// resumed `since-turn=` below it is told and `history` says it (round eight,
+/// finding 714). A gap of a kind it does not know is left out.
 pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
     let wire: Wire =
         aterm_json::from_slice(bytes).map_err(|_| "its sidecar is not the carry's JSON")?;
     if wire.version != WIRE_VERSION {
         return Err("its sidecar is a layout version this build does not read");
     }
+    let mut unheld_below = wire.unheld_below;
     let turns = wire
         .turns
         .into_iter()
         .filter_map(|t| {
-            if t.id > MAX_TURN_ID {
+            let status = (t.id <= MAX_TURN_ID)
+                .then(|| crate::turn_ledger::status_word(&t.status))
+                .flatten();
+            let Some(status) = status else {
+                // Held to the range below, with the sender's own floor.
+                unheld_below = unheld_below.max(t.id.saturating_add(1));
                 return None;
-            }
+            };
             Some(TurnRecord {
                 id: t.id,
                 started_ms: t.started_ms,
                 dur_ms: t.dur_ms,
                 submitted: t.submitted,
-                status: crate::turn_ledger::status_word(&t.status)?,
+                status,
                 text: crate::turn_ledger::clamp_text(&t.text),
                 screen_hash: t.screen_hash,
                 seq: t.seq,
@@ -635,7 +854,7 @@ pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
     });
     Ok(ControlCarry {
         turns,
-        unheld_below: wire.unheld_below.min(MAX_TURN_ID.saturating_add(1)),
+        unheld_below: unheld_below.min(MAX_TURN_ID.saturating_add(1)),
         archive,
     })
 }
@@ -643,7 +862,11 @@ pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
 /// `"<len> <sha256hex>"`: the manifest's name for a sidecar's exact bytes.
 #[cfg(any(unix, test))]
 pub(crate) fn stamp(bytes: &[u8]) -> String {
-    format!("{} {}", bytes.len(), hex(&sha256(bytes)))
+    format!(
+        "{} {}",
+        bytes.len(),
+        aterm_codec::hex::encode_lower(&sha256(bytes))
+    )
 }
 
 /// Whether `bytes` are exactly what `stamp` names.
@@ -651,16 +874,15 @@ pub(crate) fn stamp_matches(stamp: &str, bytes: &[u8]) -> bool {
     stamp_len(stamp).is_some_and(|len| len == bytes.len() as u64)
         && stamp
             .split_once(' ')
-            .is_some_and(|(_, h)| h == hex(&sha256(bytes)))
+            .is_some_and(|(_, h)| h == aterm_codec::hex::encode_lower(&sha256(bytes)))
 }
 
 /// The length a stamp names (`None` for a malformed stamp).
 pub(crate) fn stamp_len(stamp: &str) -> Option<u64> {
     let (len, h) = stamp.split_once(' ')?;
-    (h.len() == 64
-        && h.bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
-    .then_some(())?;
+    if !aterm_codec::hex::is_lower(h, 64) {
+        return None;
+    }
     len.parse().ok()
 }
 
@@ -668,16 +890,6 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = aterm_digest::Sha256::new();
     hasher.update(bytes);
     hasher.finalize()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }
 
 #[cfg(test)]

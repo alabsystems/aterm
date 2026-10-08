@@ -65,15 +65,20 @@ impl AppKind {
             Self::Recovery => "Recovery",
         }
     }
+
+    /// The tab icon this app kind wears.
+    pub(crate) const fn icon(self) -> AppIcon {
+        match self {
+            Self::Settings => AppIcon::Settings,
+            Self::Markdown => AppIcon::Markdown,
+            Self::Editor => AppIcon::Editor,
+            Self::Recovery => AppIcon::Recovery,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AppIcon {
-    Settings,
-    Markdown,
-    Editor,
-    Recovery,
-}
+/// An app's icon is the tab icon it wears: one enum, no mapping between them.
+pub(crate) use crate::tab_model::TabIconKind as AppIcon;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AppIndicators {
@@ -344,7 +349,10 @@ pub(crate) struct RecoveryApp {
 }
 
 pub(crate) enum NativeApp {
-    Settings(crate::native_settings::SettingsApp),
+    /// Boxed: the one Settings controller carries every page's projection and
+    /// dwarfs the document apps, which are the many instances (as its view
+    /// state is boxed in [`AppViewState::Settings`]).
+    Settings(Box<crate::native_settings::SettingsApp>),
     Markdown(MarkdownApp),
     Editor(EditorApp),
     Recovery(RecoveryApp),
@@ -680,15 +688,11 @@ fn recovery_page_projection_at_scale(
         scale,
     );
     let capability = match &app.capability {
-        Some(RecoveryCapability::Settings { .. }) => {
-            "A validated Settings route is retained; Retry is available."
-        }
+        Some(RecoveryCapability::Settings { .. }) => "Retry reopens this Settings page.",
         Some(RecoveryCapability::Document { .. }) => {
-            "A validated local-document capability is retained; Retry and Open Original are available."
+            "Retry reopens the document; Open Original opens the file in the editor."
         }
-        None => {
-            "Retry unavailable: this record contains diagnostics only, not executable restore authority."
-        }
+        None => "This view cannot be reopened.",
     };
     recovery_push_wrapped(
         &mut all,
@@ -1019,9 +1023,9 @@ impl NativeAppModel for RecoveryApp {
                 "recovery/retry",
                 "Retry",
                 if self.capability.is_some() {
-                    "Retry the validated restore request".to_string()
+                    "Reopen this view".to_string()
                 } else {
-                    "Retry unavailable: no retained executable restore capability".to_string()
+                    "This view cannot be reopened".to_string()
                 },
                 "recovery/retry".to_string(),
                 retry_enabled,
@@ -1036,9 +1040,9 @@ impl NativeAppModel for RecoveryApp {
                     "Open Original"
                 },
                 if matches!(self.capability, Some(RecoveryCapability::Document { .. })) {
-                    "Open the retained local document in the native editor".to_string()
+                    "Open the file in the editor".to_string()
                 } else {
-                    "Open Original unavailable: no validated local-document capability".to_string()
+                    "No file to open".to_string()
                 },
                 "recovery/open-original".to_string(),
                 original_enabled,
@@ -1052,7 +1056,7 @@ impl NativeAppModel for RecoveryApp {
                 } else {
                     "Copy Diagnostics"
                 },
-                "Copy bounded recovery diagnostics".to_string(),
+                "Copy recovery diagnostics".to_string(),
                 "recovery/copy".to_string(),
                 !pending,
             )
@@ -1280,13 +1284,19 @@ mod recovery_tests {
     use aterm_spec::derive::{Model, native_recovery_interaction_model};
     use aterm_spec::interp::{State, admits};
 
+    /// A recovery page whose diagnostics span several pages at every target
+    /// size (`recovery_pages_keep_actions_and_every_diagnostic_reachable_at_all_target_sizes`
+    /// asserts at least three), with one unbroken token wider than the widest
+    /// column (1,200pt at 0.85×) so it must hard-break mid-token everywhere.
+    /// Sized to do that and no more: every page is re-projected per size, so
+    /// the page walk costs pages × content.
     fn recovery(capability: Option<RecoveryCapability>) -> RecoveryApp {
-        let mut metadata = (0..240)
+        let mut metadata = (0..60)
             .map(|line| format!("diagnostic-{line:03}=bounded detail\n"))
             .collect::<String>();
         metadata.push_str("unicode=e\u{301} · 👨‍👩‍👧‍👦 · 日本語 · مرحبًا\n");
         metadata.push_str("unbroken=");
-        metadata.push_str(&"opaque-token-🦀".repeat(240));
+        metadata.push_str(&"opaque-token-🦀".repeat(40));
         RecoveryApp {
             restore_tag: "markdown".to_string(),
             reason: "The original reader state could not be restored safely".to_string(),
@@ -1358,7 +1368,11 @@ mod recovery_tests {
                 scale,
             );
             assert!(!first.lines.is_empty());
-            assert!(first.pages > 1);
+            assert!(
+                first.pages >= 3,
+                "{width}x{height}@{scale}: the fixture spans {} page(s), not the several this walk needs",
+                first.pages
+            );
             let available_width = width - first.padding * 2.0;
             for line in &first.lines {
                 let (face, px) = recovery_line_typography(line.style, scale);
@@ -1393,6 +1407,7 @@ mod recovery_tests {
             assert!(!final_page.lines.is_empty());
 
             let mut displayed = String::new();
+            let mut token_lines = 0usize;
             for page in 0..first.pages {
                 let projection = recovery_page_projection_at_scale(
                     &app,
@@ -1407,9 +1422,14 @@ mod recovery_tests {
                     let (face, px) = recovery_line_typography(line.style, scale);
                     let required = crate::tray_raster::ui_text_width_for(face, &line.text, px);
                     assert!(required <= available_width + 0.5, "wrapped line must fit");
+                    token_lines += usize::from(line.text.contains("opaque-token"));
                     displayed.push_str(&line.text);
                 }
             }
+            assert!(
+                token_lines >= 2,
+                "{width}x{height}@{scale}: the unbroken token hard-breaks across lines ({token_lines})"
+            );
             assert!(displayed.contains("👨‍👩‍👧‍👦"), "ZWJ grapheme stays whole");
             assert!(displayed.contains("日本語"));
         }
@@ -1520,7 +1540,7 @@ mod recovery_tests {
                 AppEvent::RecoveryFinished {
                     operation,
                     outcome: RecoveryOutcome::Opened {
-                        message: "Opened original in markdown".to_string(),
+                        message: "Opened in Markdown".to_string(),
                     },
                 },
             )
@@ -1530,7 +1550,7 @@ mod recovery_tests {
             _ => unreachable!(),
         };
         assert_eq!(state.pending, None);
-        assert_eq!(state.notice.as_deref(), Some("Opened original in markdown"));
+        assert_eq!(state.notice.as_deref(), Some("Opened in Markdown"));
 
         let commands = runtime.commands(instance, view).unwrap();
         assert!(
@@ -3429,8 +3449,10 @@ fn display_uri_segment(segment: &str) -> String {
     while index < bytes.len() {
         if bytes[index] == b'%'
             && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) =
-                (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+            && let (Some(high), Some(low)) = (
+                aterm_codec::hex::nibble(bytes[index + 1]),
+                aterm_codec::hex::nibble(bytes[index + 2]),
+            )
         {
             decoded.push((high << 4) | low);
             index += 3;
@@ -3450,15 +3472,6 @@ fn display_uri_segment(segment: &str) -> String {
             }
         })
         .collect()
-}
-
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn document_parent_suffix(uri: &str, depth: usize) -> String {
@@ -3486,12 +3499,7 @@ fn shortest_unique_document_parent(uri: &str, group: &[(AppInstanceId, String)])
 fn stable_uri_tag(uri: &str) -> u64 {
     // Explicit FNV-1a keeps presentation stable across runs/toolchains. This is
     // a disambiguating display tag, never authority or a security decision.
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in uri.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    aterm_hash::fnv1a_64(uri.as_bytes())
 }
 
 fn bounded_document_parent_label(label: &str, uri: &str) -> String {
@@ -6598,6 +6606,14 @@ fn editor_prompt_projection(
     )
 }
 
+/// What a document whose file changed under an unsaved draft says: the
+/// editor's default recovery line, the file watcher's and the save refusal's.
+pub(crate) const DISK_CONFLICT_RECOVERY: &str = "File changed on disk; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’";
+/// The recovery line for a draft whose file was deleted, or appeared, on
+/// disk since it was opened (the file watcher's and the save refusal's).
+pub(crate) const DISK_EXISTENCE_RECOVERY: &str =
+    "File was deleted or replaced on disk; Save is blocked. Copy any local edits you need to keep.";
+
 fn editor_status_message(
     app: &EditorApp,
     view: &EditorViewState,
@@ -6611,22 +6627,21 @@ fn editor_status_message(
             .recovery_status
             .as_deref()
             .filter(|status| status.contains("Save is blocked"))
-            .unwrap_or(
-                "File changed on disk; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’",
-            );
-        format!("Recovery · {recovery}")
-    } else if let Some(recovery) = app.recovery_status.as_deref() {
+            .unwrap_or(DISK_CONFLICT_RECOVERY);
         format!("Recovery · {recovery}")
     } else if app.checkpoint_pending {
-        "Saving checkpoint...".to_string()
+        "Saving…".to_string()
     } else if app.config_editor && app.config_analysis.is_none() {
         "Validating aterm.toml…".to_string()
     } else if let Some(blocked) = view
         .status
         .as_deref()
-        .filter(|status| status.starts_with("Save blocked"))
+        .filter(|status| status.starts_with("Save "))
     {
+        // The answer to the person's own Save outranks a standing recovery note.
         blocked.to_string()
+    } else if let Some(recovery) = app.recovery_status.as_deref() {
+        format!("Recovery · {recovery}")
     } else if let Some(summary) = app
         .config_analysis
         .as_ref()
@@ -8131,6 +8146,30 @@ mod markdown_reader_tests {
         assert!(recovered.contains("Ln 1, Col"));
         assert!(!recovered.contains("Reload warning"));
         assert_eq!(view.status.as_deref(), Some("Saved"));
+    }
+
+    #[test]
+    fn a_recovered_draft_note_never_hides_why_save_was_refused() {
+        let source = "font_px = \"huge\"\n";
+        let (mut app, mut view, _snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.recovery_status = Some(crate::app_documents::CARRIED_DRAFT_NOTICE.to_string());
+        // Before any Save, the standing recovery note is the line.
+        let before = editor_status_message(&app, &view, None, false).unwrap();
+        assert!(before.starts_with("Recovery · "), "{before}");
+
+        view.status = Some("Save blocked · Config error · Ln 1, Col 11 · bad".to_string());
+        let refused = editor_status_message(&app, &view, None, false).unwrap();
+        assert!(refused.starts_with("Save blocked"), "{refused}");
+
+        // An in-flight save also outranks it.
+        view.status = None;
+        app.checkpoint_pending = true;
+        assert_eq!(
+            editor_status_message(&app, &view, None, false).as_deref(),
+            Some("Saving…")
+        );
     }
 
     #[test]

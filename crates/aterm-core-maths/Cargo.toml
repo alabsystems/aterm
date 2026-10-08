@@ -20,10 +20,11 @@ name = "core_maths"
 #
 # It must ALSO be >= every other `0.1.x` this workspace forces into the graph —
 # the rule crates/aterm-arrayvec learned the expensive way, when a shim at 0.7.6
-# left the registry copy satisfying all six consumers and the patch row silently
+# left the registry copy satisfying all five consumers and the patch row silently
 # did nothing. Nothing pins `core_maths` here (no dev-dep oracle holds it; see
-# the ORACLE note in src/lib.rs for why there cannot be one), and 0.1.1 is
-# upstream's own latest, so the shim is the highest candidate in the graph.
+# the NO `[dev-dependencies]` ORACLE note below for why there cannot be one),
+# and 0.1.1 is upstream's own latest, so the shim is the highest candidate in
+# the graph.
 version = "0.1.1"
 edition.workspace = true
 license.workspace = true
@@ -36,6 +37,10 @@ description = "First-party `core_maths` replacement for aterm (forwards CoreFloa
 [lib]
 name = "core_maths"
 path = "src/lib.rs"
+# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
+# gate while still being linked and executed. Off; doctests are governed
+# separately and still run.
+test = false
 
 [dependencies]
 # NONE, AND THAT IS THE ENTIRE POINT. Upstream's one dependency is `libm`, and

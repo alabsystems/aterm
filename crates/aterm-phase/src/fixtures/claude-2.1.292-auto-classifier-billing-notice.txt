@@ -1,0 +1,22 @@
+# claude-code 2.1.292 · MEASURED 2026-10-06, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · auto mode's classifier-billing notice behind a gateway (here the stub, 127.0.0.1:<port>), at the first command auto mode must classify: a dialog with no options and NO composer frame (one rule, then four paragraphs and `Enter to continue · Esc to cancel`), over the pending `Bash` tool row; the title rests on `✳` and the server's agent verdict is unknown (`agent=unknown`), so nothing names it
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.AHDK/proj
+
+
+❯ toolstart
+
+⏺ Bash(python3 -c "print(1)")
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  We're changing auto mode to no longer charge for classifier requests in Claude Code.
+
+  However, this session isn't eligible because your requests go through 127.0.0.1:57123, which isn't compatible with this update.
+
+  Nothing breaks: auto mode keeps working, and its classifier requests are billed as before.
+
+  To fix it and access the new version of auto mode, ask your gateway to implement:
+  https://code.claude.com/docs/en/auto-mode-classifier-billing
+
+  Enter to continue · Esc to cancel

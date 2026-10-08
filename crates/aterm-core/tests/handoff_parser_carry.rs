@@ -1,20 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A seamless update carries the parser's partial state (the round-five plan's
-//! item 12).
+//! A seamless update carries the parser's partial state.
 //!
-//! The outgoing engine is parked wherever the last PTY read ended, and a read
-//! can end anywhere: inside an SGR, between the bytes of a glyph, halfway
-//! through an OSC title. The rest of that sequence is still queued on the PTY
-//! and reaches the SUCCESSOR's parser. Before the carry the successor started
-//! at Ground, so the tail of a split `ESC [ 38;5;196 m` printed `6m`, a split
-//! glyph printed replacement characters and a half-arrived title was lost.
+//! The outgoing engine stops wherever the last PTY read ended (inside an SGR,
+//! mid-glyph, halfway through an OSC title) and the rest of that sequence
+//! reaches the successor's parser, which must continue from the same state.
 //!
-//! These drive the seamless path the GUI takes — the capture's
-//! `checkpoint_carry_abandoning_partial` on the outgoing engine,
-//! `restore_checkpoint` into a fresh successor, then the queued tail fed to
-//! the successor — and compare against one engine fed the whole stream.
+//! These drive the GUI's seamless path (`checkpoint_carry_abandoning_partial`
+//! on the outgoing engine, `restore_checkpoint` into a fresh successor, then
+//! the queued tail) and compare against one engine fed the whole stream.
 
 use aterm_core::terminal::Terminal;
 
@@ -29,6 +24,18 @@ fn handed_over(head: &[u8], tail: &[u8]) -> Terminal {
     let (carry, _) = outgoing.checkpoint_carry_abandoning_partial(0);
     let mut successor = Terminal::new(ROWS, COLS);
     successor.restore_checkpoint(&carry);
+    successor.process(tail);
+    successor
+}
+
+/// As [`handed_over`], but the successor is rebuilt whole from the checkpoint
+/// (`Terminal::from_checkpoint`, the other restore door) rather than adopted
+/// into a configured engine.
+fn rebuilt_from_carry(head: &[u8], tail: &[u8]) -> Terminal {
+    let mut outgoing = Terminal::new(ROWS, COLS);
+    outgoing.process(head);
+    let (carry, _) = outgoing.checkpoint_carry_abandoning_partial(0);
+    let mut successor = Terminal::from_checkpoint(&carry);
     successor.process(tail);
     successor
 }
@@ -141,3 +148,149 @@ fn a_refused_carry_resumes_at_ground() {
         "today's Ground behaviour, no worse"
     );
 }
+
+/// ENGINE STATE OUTPUT STILL TO COME RELIES ON (round eight of the update
+/// audit, finding 502). The parser carry continues a sequence split at the
+/// park, but these states a program sets live in the engine, not the parser:
+/// the character REP (`CSI b`) repeats, an open OSC 8 link, an SGR 58
+/// underline colour, a VT52 `ESC Y` waiting for its address bytes, a ZWJ
+/// waiting for the emoji it joins, the XTPUSHSGR stack and the XTSAVE'd
+/// modes. A successor that resumed without them painted nothing for the REP,
+/// wrote the rest of the link's text unlinked, drew the default underline
+/// colour, printed the VT52 address as text, wrote the joined emoji as a
+/// glyph of its own (the rest of the line two columns off), left the
+/// pushed-over pen in force at the XTPOPSGR and the mode as the program set it
+/// at the XTRESTORE. A park right after a complete flag kept no state but lost
+/// a fact of the screen: the restored flag read as a lone regional indicator
+/// and took the next one into its cell, the rest of the line two columns off.
+/// Each split, handed over the seamless way through either restore door, now
+/// lands on the screen one engine fed the whole stream draws: the same cells
+/// (underline colour included), the same text, the same link on every cell,
+/// the same cursor.
+#[test]
+fn split_at_park_matches_unsplit() {
+    let mut lost = Vec::new();
+    for (state, head, tail) in [
+        ("the REP character", &b"X"[..], &b"\x1b[5b"[..]),
+        (
+            "an open OSC 8 link",
+            b"\x1b]8;id=p;http://a\x1b\\ab",
+            b"cd\x1b]8;;\x1b\\",
+        ),
+        (
+            "an SGR 58 underline colour",
+            b"\x1b[58:2::255:0:0m\x1b[4m",
+            b"err",
+        ),
+        ("a VT52 address", b"\x1b[?2l\x1bY", b"%%"),
+        ("a ZWJ", ZWJ_HEAD.as_bytes(), ZWJ_TAIL.as_bytes()),
+        ("a flag", FLAG.as_bytes(), "\u{1F1EC}\u{1F1E7}x".as_bytes()),
+        (
+            "a flag, then one RI",
+            FLAG.as_bytes(),
+            "\u{1F1EC}x".as_bytes(),
+        ),
+        (
+            "the XTPUSHSGR stack",
+            b"\x1b[31m\x1b[#{\x1b[32mA",
+            b"\x1b[#}B",
+        ),
+        (
+            "a selective XTPUSHSGR of the underline",
+            b"\x1b[58:2::0:0:255m\x1b[4m\x1b[4#{\x1b[58:2::255:0:0mA",
+            b"\x1b[#}B",
+        ),
+        (
+            "an XTSAVE'd mode",
+            b"\x1b[?7s\x1b[?7l",
+            b"\x1b[?7rABCDEFGHIJKLMNOPQRSTUVWXY",
+        ),
+    ] {
+        let mut reference = never_handed_over(head, tail);
+        let links = |t: &Terminal| -> Vec<(Option<String>, Option<String>)> {
+            (0..ROWS)
+                .flat_map(|r| (0..COLS).map(move |c| (r, c)))
+                .map(|(r, c)| {
+                    (
+                        t.hyperlink_at(r, c).map(str::to_owned),
+                        t.hyperlink_id_at(r, c).map(str::to_owned),
+                    )
+                })
+                .collect()
+        };
+        let text = |t: &Terminal| {
+            (0..usize::from(ROWS))
+                .map(|r| row(t, r))
+                .collect::<Vec<_>>()
+        };
+        for (door, mut successor) in [
+            ("restore_checkpoint", handed_over(head, tail)),
+            ("from_checkpoint", rebuilt_from_carry(head, tail)),
+        ] {
+            if frame(&mut successor).cells != frame(&mut reference).cells
+                || text(&successor) != text(&reference)
+                || links(&successor) != links(&reference)
+                || successor.cursor() != reference.cursor()
+            {
+                lost.push((state, door));
+            }
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "the handed-over screen differs from the unsplit one for: {lost:?}"
+    );
+
+    // NON-VACUITY: each reference really shows the state the split must keep.
+    assert_eq!(row(&never_handed_over(b"X", b"\x1b[5b"), 0), "XXXXXX");
+    let link = never_handed_over(b"\x1b]8;id=p;http://a\x1b\\ab", b"cd\x1b]8;;\x1b\\");
+    assert_eq!(link.hyperlink_at(0, 3), Some("http://a"), "d is linked");
+    assert_eq!(link.hyperlink_id_at(0, 3), Some("p"));
+    let mut tinted = never_handed_over(b"\x1b[58:2::255:0:0m\x1b[4m", b"err");
+    assert_eq!(
+        frame(&mut tinted).cells[0][0].underline_color,
+        Some([255, 0, 0])
+    );
+    let addressed = never_handed_over(b"\x1b[?2l\x1bY", b"%%");
+    assert_eq!(row(&addressed, 0), "", "the address prints nothing");
+    assert_eq!(addressed.cursor().col, 5, "it moves the cursor");
+    let joined = never_handed_over(ZWJ_HEAD.as_bytes(), ZWJ_TAIL.as_bytes());
+    assert_eq!(
+        joined.cursor().col,
+        3,
+        "one two-cell glyph, then the x: {:?}",
+        row(&joined, 0)
+    );
+    for tail in ["\u{1F1EC}\u{1F1E7}x", "\u{1F1EC}x"] {
+        let flags = never_handed_over(FLAG.as_bytes(), tail.as_bytes());
+        assert_eq!(
+            (row(&flags, 0), flags.cursor().col),
+            (format!("{FLAG}{tail}"), 5),
+            "the flag stays whole, the next RI starts a glyph of its own"
+        );
+    }
+    let mut popped = never_handed_over(b"\x1b[31m\x1b[#{\x1b[32mA", b"\x1b[#}B");
+    let cells = &frame(&mut popped).cells[0];
+    assert_ne!(cells[1].fg, cells[0].fg, "B is red again, A green");
+    let mut underline = never_handed_over(
+        b"\x1b[58:2::0:0:255m\x1b[4m\x1b[4#{\x1b[58:2::255:0:0mA",
+        b"\x1b[#}B",
+    );
+    let cells = &frame(&mut underline).cells[0];
+    assert_eq!(cells[0].underline_color, Some([255, 0, 0]), "A's is red");
+    assert_eq!(
+        cells[1].underline_color,
+        Some([0, 0, 255]),
+        "B has the pushed underline colour back, blue"
+    );
+    let wrapped = never_handed_over(b"\x1b[?7s\x1b[?7l", b"\x1b[?7rABCDEFGHIJKLMNOPQRSTUVWXY");
+    assert_eq!(row(&wrapped, 1), "UVWXY", "autowrap is back on");
+}
+
+/// 👨 then a ZWJ (U+200D); the tail's 💻 joins them into one glyph.
+const ZWJ_HEAD: &str = "\u{1F468}\u{200D}";
+const ZWJ_TAIL: &str = "\u{1F4BB}x";
+
+/// A complete flag, two regional indicators (U+1F1FA U+1F1F8): an RI after it
+/// starts a pair of its own.
+const FLAG: &str = "\u{1F1FA}\u{1F1F8}";

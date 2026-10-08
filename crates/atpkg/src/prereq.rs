@@ -269,9 +269,7 @@ const PROBE_SOURCE: &str = "#include <stdio.h>\nint main(void) { return 0; }\n";
 /// exits 0 AND wrote a non-empty program, which is never run. The directory is removed on
 /// every path.
 fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
+    let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
     let dir = host
         .tmp_root
         .join(format!("atpkg-cc-{}-{nanos}", std::process::id()));
@@ -293,7 +291,7 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
             why: format!("could not write {}: {error}", source.display()),
         };
     }
-    let mut cmd = std::process::Command::new(cc);
+    let mut cmd = aterm_uds::spawnfd::command(cc);
     cmd.arg("-o").arg(&program).arg(&source).current_dir(&dir);
     if let Some(path) = path_var {
         cmd.env("PATH", path);
@@ -365,7 +363,7 @@ fn first_stderr_line(out: &std::process::Output) -> String {
 /// answer as a verdict about `driver`: exit 0 is ready (naming the path `xcrun` printed,
 /// when it printed one), any other exit is broken with the first non-empty stderr line.
 fn ask(bin: &Path, driver: &Path, args: &[&str], bound: Duration) -> CcVerdict {
-    let mut cmd = std::process::Command::new(bin);
+    let mut cmd = aterm_uds::spawnfd::command(bin);
     cmd.args(args);
     match crate::doctor::output_bounded_capturing(&mut cmd, bound) {
         None => CcVerdict::Unanswered {
@@ -414,11 +412,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("atpkg-prereq-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-prereq-{name}-"))
     }
 
     fn script(path: &Path, body: &str) {
@@ -738,21 +733,47 @@ mod tests {
     }
 
     /// A compiler that hangs is unknown, not broken, and the probe returns inside its
-    /// bound — and this machine's bound is the production one.
+    /// bound — and this machine's bound is the production one. The compiler is a
+    /// driver that forks the real work, as `cc` forks `cc1`: the bound's kill ends the
+    /// driver and leaves its ten-minute `sleep` holding the probe's pipes. The probe's
+    /// return is held to a minute's hang detector, never a latency budget: a probe that
+    /// ignores its bound, or drains those pipes after the kill, waits out all ten.
     #[test]
     fn a_wedged_compiler_is_unanswered_not_broken() {
         assert_eq!(CcHost::this_machine().bound, PROBE_TIMEOUT);
         let root = scratch("wedged");
         let dir = root.join("slow");
-        script(&dir.join("cc"), "sleep 30");
-        let bound = Duration::from_secs(2);
+        let pid_file = root.join("worker.pid");
+        script(
+            &dir.join("cc"),
+            &format!("sleep 600 & echo $! > '{}'; wait", pid_file.display()),
+        );
+        // Half a second, not less: the driver is a new file (on macOS it pays the
+        // first-exec assessment), and a bound that fires before it forks its `sleep`
+        // skips the orphaned-pipe case.
+        let bound = Duration::from_millis(500);
         let host = CcHost {
             bound,
             ..plain_host(&root)
         };
         let started = std::time::Instant::now();
         let verdict = probe_with(Some(dir.as_os_str()), &host);
-        assert!(started.elapsed() < bound + Duration::from_secs(5));
+        let took = started.elapsed();
+        // The driver's kill orphaned its `sleep`: end it here, so no run leaves one
+        // holding a pipe for ten minutes.
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+        {
+            // SAFETY: kill(2) of the background `sleep` this test's driver started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            took < aterm_spec::wait::MUST_HAPPEN,
+            "not the ten-minute hang: {took:?}"
+        );
         assert_eq!(
             verdict,
             CcVerdict::Unanswered {

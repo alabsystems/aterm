@@ -36,6 +36,8 @@ mod changelog;
 mod channel;
 mod cli;
 mod dmg;
+// The cutter's durability flushes, in one place (and a plain fsync under its tests).
+mod durable;
 mod gates;
 mod ledger;
 // The producer half of the machine-roster tier: this machine's public identity, the
@@ -48,6 +50,19 @@ mod manifest_out;
 mod provision;
 mod publish;
 mod sign;
+// The whole-tree Trust lane's facts and their ONE judge: the lane's end, the
+// cutter's and `ship check`'s TRUST gate, and `ship trust verdict` for the
+// release scripts (FACTS, NOT VERDICTS).
+mod trust_facts;
+// Per gated library, a key over what its check read: recorded in the facts
+// for measuring, never judged (W4, docs/measured/RETRO-release-0.96-0.100-2026-09-30.md).
+mod trust_closure;
+// The candidate gate (D27): a candidate toolchain's whole-tree run against the
+// published seal's, library by library, from what each measured.
+mod trust_compare;
+// Its per-obligation records (the lane reduces each check's report.ndjson), keys
+// and retraction ledger: every obligation the seal proved, not a count.
+mod trust_oblig;
 mod verify;
 
 fn main() {

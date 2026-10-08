@@ -2,48 +2,35 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests for the `aterm harness` command: the four read views, the retired
-//! hook-bridge tombstones, and the refusal of the verbs deleted with the
-//! second harness stack.
+//! hook-bridge tombstones, the refusal of the verbs deleted with the second
+//! harness stack, and the `accounts` verbs.
 //!
 //! Every path and clock is injected through [`Env`]; the one verb that opens
-//! a control connection (`limits`) is driven through a scripted [`Ctl`].
+//! a control connection (`limits`) is driven through a scripted [`Ctl`], and
+//! the two `accounts` verbs that run `claude` (`check`, `login`) through a
+//! scripted [`AccountsHost`], its clock after a login flow included: no verb
+//! here runs a `claude`. The two runners behind that host are tested on their
+//! own, each over a `/bin/sh` stand-in written under a temp dir. Every account
+//! label is invented (`main`, `work-2`, `pool-a`) and every login directory is
+//! under a temp dir.
 
 use aterm_phase::prompt::fixtures::{composer, rows};
+use aterm_tempfile::TempDir as Tmp;
 
 use super::*;
 use crate::supervise::run::CtlReply;
 
 /// A fresh, empty directory under the system temp dir, removed on drop.
-struct Tmp(PathBuf);
-
-impl Tmp {
-    fn new(tag: &str) -> Tmp {
-        let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "aterm-harness-cli-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        dir.push(unique);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        Tmp(dir)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
+fn tmp_dir(tag: &str) -> Tmp {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("aterm-harness-cli-{tag}-"))
+        .tempdir()
+        .expect("temp dir")
 }
 
-impl Drop for Tmp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// An [`Env`] rooted in `tmp`, with every clock and path injected.
+/// An [`Env`] rooted in `tmp`, with every clock and path injected, including a
+/// control socket no instance listens on (so `--status` never asks a live
+/// window).
 fn env_at(tmp: &Tmp) -> Env {
     Env {
         state: tmp.path().join("state"),
@@ -56,8 +43,12 @@ fn env_at(tmp: &Tmp) -> Env {
         claude_pid: None,
         now: 1_758_412_800, // 2025-09-21T00:00:00Z — fixed, never `now()`.
         sid: "s-test".to_string(),
-        sock: None,
+        sock: Some(tmp.path().join("no.sock").to_string_lossy().into_owned()),
         config: Some(tmp.path().join("aterm.toml")),
+        claude_tmp: Some(tmp.path().join("claude-tmp")),
+        cells: Some(tmp.path().join("cells")),
+        // The test's universe: no process names another Claude Code directory.
+        claude_running: Some(Ok(disk::discover::Running::default())),
     }
 }
 
@@ -157,6 +148,55 @@ fn the_grammar_parses_what_the_help_text_advertises() {
                 json: true,
             },
         ),
+        (
+            "ledger accounts 7 --json",
+            Cmd::Ledger {
+                file: LedgerFile::Accounts,
+                count: 7,
+                json: true,
+            },
+        ),
+        (
+            "accounts",
+            Cmd::Accounts(AccountsCmd::Report { json: false }),
+        ),
+        (
+            "accounts --json",
+            Cmd::Accounts(AccountsCmd::Report { json: true }),
+        ),
+        (
+            "accounts add work-2",
+            Cmd::Accounts(AccountsCmd::Add {
+                label: "work-2".to_string(),
+                class: Class::Dedicated,
+            }),
+        ),
+        (
+            "accounts add pool-a --shared",
+            Cmd::Accounts(AccountsCmd::Add {
+                label: "pool-a".to_string(),
+                class: Class::Shared,
+            }),
+        ),
+        (
+            "accounts login work-2",
+            Cmd::Accounts(AccountsCmd::Login {
+                label: "work-2".to_string(),
+            }),
+        ),
+        ("accounts check", Cmd::Accounts(AccountsCmd::Check)),
+        (
+            "accounts use work-2",
+            Cmd::Accounts(AccountsCmd::Use {
+                label: "work-2".to_string(),
+            }),
+        ),
+        ("accounts use --auto", Cmd::Accounts(AccountsCmd::Auto)),
+        // `help` is this command's help word wherever it stands, so it is
+        // never taken as a label: `add help` adds nothing.
+        // The page it prints is the verb's own.
+        ("accounts add help", Cmd::Help(HelpPage::Accounts)),
+        ("accounts --help", Cmd::Help(HelpPage::Accounts)),
         ("upgrade models", Cmd::UpgradeModels { set: None }),
         (
             "upgrade models set claude-opus-5-5,claude-fable-5-1",
@@ -164,18 +204,56 @@ fn the_grammar_parses_what_the_help_text_advertises() {
                 set: Some("claude-opus-5-5,claude-fable-5-1".to_string()),
             },
         ),
-        ("--help", Cmd::Help),
+        ("--help", Cmd::Help(HelpPage::Verbs)),
+        ("disk --help", Cmd::Help(HelpPage::Disk)),
+        ("upgrade s-1 --help", Cmd::Help(HelpPage::Upgrade)),
+        ("upgrade --status -h", Cmd::Help(HelpPage::UpgradeStatus)),
     ];
     for (line, want) in cases {
         let (got, _) = parse(&words(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
         assert_eq!(got, want, "{line}");
     }
-    assert_eq!(parse(&[]).expect("empty").0, Cmd::Help);
+    assert_eq!(parse(&[]).expect("empty").0, Cmd::Help(HelpPage::Verbs));
     let (_, over) = parse(&words("usage --state /s --config /c.toml --sock /a.sock"))
         .expect("the environment flags parse");
     assert_eq!(over.state, Some(PathBuf::from("/s")));
     assert_eq!(over.config, Some(PathBuf::from("/c.toml")));
     assert_eq!(over.sock.as_deref(), Some("/a.sock"));
+}
+
+/// `--help` is the verb list; `<verb> --help` is that verb's USAGE lines and
+/// its own paragraphs, and no other verb's.
+#[test]
+fn help_is_scoped_to_the_verb_named() {
+    let verbs = help_page(HelpPage::Verbs);
+    assert!(verbs.contains("OPTIONS:"), "{verbs}");
+    assert!(!verbs.contains("`disk` REPORTS"), "{verbs}");
+    let disk = help_page(HelpPage::Disk);
+    assert!(
+        disk.starts_with("USAGE:\n    aterm harness disk [<build-dir> ...]"),
+        "{disk}"
+    );
+    assert!(
+        disk.contains("\n`disk` REPORTS AND REMOVES NOTHING"),
+        "{disk}"
+    );
+    assert!(!disk.contains("`upgrade` MOVES"), "{disk}");
+    assert!(!disk.contains("aterm harness ledger"), "{disk}");
+    let upgrade = help_page(HelpPage::Upgrade);
+    assert!(upgrade.contains("upgrade models [set"), "{upgrade}");
+    assert!(
+        upgrade.contains("move live Claude Code sessions"),
+        "{upgrade}"
+    );
+    assert!(upgrade.contains("THE OWNER'S WORD"), "{upgrade}");
+    assert!(!upgrade.contains("`upgrade --status` READS"), "{upgrade}");
+    let status = help_page(HelpPage::UpgradeStatus);
+    assert!(
+        status.starts_with("USAGE:\n    aterm harness upgrade [<sid>] --status [--json]\n"),
+        "{status}"
+    );
+    assert!(status.contains("`upgrade --status` READS"), "{status}");
+    assert!(!status.contains("THE OWNER'S WORD"), "{status}");
 }
 
 /// What it does not know is refused, and the hook-era ring names are gone.
@@ -194,19 +272,73 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "ledger statusline",
         "disk --apply everything",
         "usage --bogus",
-        // Retired 2026-09-27 with the windows it placed on the clock.
         "usage --utc-offset 3600",
         "usage --state",
         "upgrade abc",
         // The loop is gone: the window's host takes the steps, on a push.
         "upgrade --every 60",
+        // accounts: an unknown form, a missing or extra operand.
+        "accounts frob",
+        "accounts discover",
+        "accounts add",
+        "accounts add work-2 extra",
+        "accounts login",
+        "accounts check extra",
+        "accounts use",
+        // One of a label and --auto.
+        "accounts use work-2 --auto",
+        // --shared is `accounts add`'s and --auto is `accounts use`'s, as the
+        // owner's flags are `upgrade`'s.
+        "accounts --shared",
+        "accounts login work-2 --shared",
+        "accounts --auto",
+        "accounts check --auto",
+        "usage --shared",
+        "upgrade --auto",
+        // --json is the report's form.
+        "accounts add work-2 --json",
+        "accounts check --json",
+        "accounts use work-2 --json",
+        "ledger account",
+        // --dry-run and --sock are not `accounts`': a flag the verb does
+        // not take is refused, never swallowed by a verb that then writes.
+        "accounts --dry-run",
+        "accounts --json --dry-run",
+        "accounts add work-2 --dry-run",
+        "accounts add pool-a --shared --dry-run",
+        "accounts login work-2 --dry-run",
+        "accounts check --dry-run",
+        "accounts use work-2 --dry-run",
+        "accounts use --auto --dry-run",
+        "accounts --sock /a.sock",
+        "accounts add work-2 --sock /a.sock",
+        "accounts login work-2 --sock /a.sock",
+        "accounts check --sock /a.sock",
+        "accounts use work-2 --sock /a.sock",
+        "accounts use --auto --sock /a.sock",
     ] {
         assert!(parse(&words(line)).is_err(), "{line} should be refused");
     }
+    // The refusal names the flag and the verb.
+    let said = |line: &str| parse(&words(line)).expect_err(line);
+    assert!(said("accounts use work-2 --dry-run").contains("accounts takes no --dry-run"));
+    assert!(said("accounts check --sock /a.sock").contains("accounts takes no --sock"));
+    // The front door's exit for it is 2, before the environment is read or
+    // anything is written.
+    for line in [
+        "accounts use work-2 --dry-run",
+        "accounts check --sock /a.sock",
+    ] {
+        let argv = words(line).into_iter().map(OsString::from).collect();
+        assert_eq!(format!("{:?}", main_entry(argv)), exit(2), "{line}");
+    }
+    // NEGATIVE CONTROL: where the two flags belong they still parse.
+    assert!(parse(&words("upgrade --dry-run")).is_ok());
+    assert!(parse(&words("limits --sock /a.sock")).is_ok());
 }
 
 /// THE DELETED VERBS are refused BY NAME, and the refusal says where the
-/// capability went. Negative control: the four kept verbs still parse, so the
+/// capability went. Negative control: the kept verbs still parse, so the
 /// refusal is the deleted set and not the front door.
 #[test]
 fn the_deleted_verbs_are_refused_by_name_and_point_at_the_engine() {
@@ -221,15 +353,17 @@ fn the_deleted_verbs_are_refused_by_name_and_point_at_the_engine() {
             "{verb}: {e}"
         );
         assert!(e.contains("aterm drive"), "{verb}: {e}");
-        assert!(
-            USAGE.contains(&format!("`{verb}`")),
-            "the usage names {verb} as deleted"
-        );
     }
-    for kept in ["usage", "limits", "disk", "ledger", "upgrade"] {
+    for kept in ["usage", "limits", "disk", "ledger", "upgrade", "accounts"] {
         assert!(parse(&words(kept)).is_ok(), "{kept}");
         assert!(!DELETED.contains(&kept));
     }
+    // `accounts` came back (2026-10-01); the verbs that would act on a
+    // session by hand did not.
+    for gone in ["switch", "status"] {
+        assert!(DELETED.contains(&gone), "{gone} is refused by name");
+    }
+    assert!(parse(&words("switch account work-2")).is_err());
     // The flags only the deleted verbs took are gone from the grammar too.
     for flag in [
         "--commands",
@@ -245,22 +379,20 @@ fn the_deleted_verbs_are_refused_by_name_and_point_at_the_engine() {
             parse(&words(&format!("usage {flag}"))).is_err(),
             "{flag} is still accepted"
         );
-        assert!(!USAGE.contains(flag), "the usage still offers {flag}");
     }
 }
 
 // ---------------------------------------------------------------------------
-// install / uninstall / hook / statusline — retired (decision "B")
+// install / uninstall / hook / statusline: refused
 // ---------------------------------------------------------------------------
 
-/// `install` and `uninstall` refuse with the one decision-"B" sentence, exit
-/// 2, and write nothing — whatever flags precede the verb. `hook` and
-/// `statusline` are silent successes, the answer an old install's bridge
-/// script needs so it can never block a turn. Negative control: a read verb
-/// on the same env still answers normally.
+/// `install` and `uninstall` refuse with one sentence, exit 2, and write
+/// nothing, whatever flags precede the verb. `hook` and `statusline` are silent
+/// successes, so an old install's bridge script never blocks a turn. Negative
+/// control: a read verb on the same env still answers.
 #[test]
 fn the_retired_verbs_refuse_or_answer_silently_and_write_nothing() {
-    let tmp = Tmp::new("retired");
+    let tmp = tmp_dir("retired");
     let env = env_at(&tmp);
     for line in ["install", "uninstall", "--state /nowhere install"] {
         let (cmd, _) = parse(&words(line)).expect("parses to the refusal");
@@ -288,12 +420,10 @@ fn the_retired_verbs_refuse_or_answer_silently_and_write_nothing() {
     assert!(ok, "a read verb still answers");
 }
 
-/// The front door's own answer, stdin injected. From a pipe (the vendor's
-/// shape) `hook` and `statusline` read the payload to the end, print nothing
-/// and exit 0. Typed at a terminal they read NOTHING — a reader that panics
-/// on use proves it — and say in one stderr line that the verb is retired,
-/// still exit 0. Negative control: `install` refuses (exit 2) on either
-/// stdin, so the silence is the two tombstones and not every retired verb.
+/// From a pipe, `hook` and `statusline` read the payload to the end, print
+/// nothing and exit 0. At a terminal they read nothing (a panicking reader
+/// proves it), print a one-line retirement note, and exit 0. Negative control:
+/// `install` refuses (exit 2) on either stdin.
 #[test]
 fn the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal() {
     struct NeverRead;
@@ -303,9 +433,8 @@ fn the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal() {
         }
     }
     for verb in ["hook", "statusline"] {
-        // Over the 1 MiB the live hook once read: a `PostToolUse` for a Write
-        // carries the whole file, and a drain that stopped short would close
-        // the pipe on the vendor's write.
+        // Over 1 MiB: a `PostToolUse` for a Write carries the whole file, and a
+        // drain that stopped short would close the pipe on the writer.
         let len = (1 << 20) * 3 + 17;
         let mut pipe = io::Cursor::new(vec![b'x'; len]);
         let mut err = Vec::new();
@@ -331,14 +460,6 @@ fn the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal() {
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
         assert!(String::from_utf8_lossy(&err).contains(RETIRED));
     }
-    for gone in [
-        "harness hook",
-        "harness statusline",
-        "harness install",
-        "harness uninstall",
-    ] {
-        assert!(!USAGE.contains(gone), "the usage still offers `{gone}`");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -347,8 +468,7 @@ fn the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal() {
 
 #[test]
 fn the_project_directory_name_reproduces_the_two_measured_ones() {
-    // MEASURED 2026-09-21 by listing `~/.claude/projects` (the home prefix is
-    // anonymised; the fold is the same for any path).
+    // Real `~/.claude/projects` naming, home prefix anonymized.
     assert_eq!(
         project_dir_name(Path::new("/home/me/repo")),
         "-home-me-repo"
@@ -361,13 +481,12 @@ fn the_project_directory_name_reproduces_the_two_measured_ones() {
     );
 }
 
-/// `usage` folds the NEWEST transcript in this directory's project directory
-/// and says that is what it did — the rung that names a session arrived on
-/// the retired hook bridge. Negative control first: no transcript is
-/// `source=none` and says so, never a row of zeros dressed as a reading.
+/// `usage` folds the newest transcript in this directory's project directory
+/// and says so. Negative control: no transcript is `source=none`, never a row
+/// of zeros.
 #[test]
 fn usage_folds_the_newest_transcript_and_says_what_that_costs() {
-    let tmp = Tmp::new("usage");
+    let tmp = tmp_dir("usage");
     let env = env_at(&tmp);
     let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
     assert!(ok);
@@ -396,9 +515,8 @@ fn usage_folds_the_newest_transcript_and_says_what_that_costs() {
 
     let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
     assert!(ok);
-    // The HUD line, whole: the model the newest row names, and no window —
-    // nothing here reads one (the statusLine reader went 2026-09-27; every
-    // live `harness usage` printed `?%` before it did too).
+    // The HUD line, whole: the model the newest row names, and no window
+    // (nothing here reads one).
     assert_eq!(
         out.lines().next(),
         Some("fable ?%/5h · ?%/7d · acct account · resets ? · none  [source=transcript-newest]"),
@@ -424,14 +542,13 @@ fn usage_folds_the_newest_transcript_and_says_what_that_costs() {
     assert!(json.contains("\"model\":\"claude-fable-5-1\""), "{json}");
 }
 
-/// A `CLAUDE_CONFIG_DIR` set to a RELATIVE path names a directory relative
-/// to Claude Code's own working directory, which this command cannot know:
-/// `usage` folds nothing and says why, rather than folding `~/.claude`'s
-/// newest transcript — another configuration's sessions. Control: unset, the
-/// same `~/.claude` transcript folds.
+/// A relative `CLAUDE_CONFIG_DIR` is relative to Claude Code's working
+/// directory, which this command cannot know: `usage` folds nothing and says
+/// why rather than folding another configuration's transcript. Control: unset,
+/// the `~/.claude` transcript folds.
 #[test]
 fn usage_with_a_relative_claude_config_dir_folds_nothing_and_says_so() {
-    let tmp = Tmp::new("usage-relative-config");
+    let tmp = tmp_dir("usage-relative-config");
     let mut env = env_at(&tmp);
     let dir = env
         .transcripts_root()
@@ -466,16 +583,14 @@ fn usage_with_a_relative_claude_config_dir_folds_nothing_and_says_so() {
     );
 }
 
-/// Run from a Claude Code session, `usage` folds THAT session's transcript —
-/// the one `CLAUDE_CODE_SESSION_ID` names — and its subagents', never the
-/// newer file another session in the same directory wrote. Named but not yet
-/// written is nothing, not the neighbour's file. `CLAUDE_PID`'s sessions
-/// file names it too, and `CLAUDE_CONFIG_DIR` is where it is looked for.
-/// Negative control: without a name, the newest (the neighbour's) is what
-/// folds, labelled so. The JSON only ADDS keys to schema 1.
+/// Run from a Claude Code session, `usage` folds that session's transcript
+/// (named by `CLAUDE_CODE_SESSION_ID`, or `CLAUDE_PID`'s sessions file, under
+/// `CLAUDE_CONFIG_DIR`) and its subagents', never a newer neighbour's. Named
+/// but not yet written folds nothing. Negative control: without a name the
+/// newest folds, labelled so. The JSON only adds keys to schema 1.
 #[test]
 fn usage_folds_the_session_claude_code_names_not_the_newest() {
-    let tmp = Tmp::new("usage-named");
+    let tmp = tmp_dir("usage-named");
     let mut env = env_at(&tmp);
     // A Claude directory of its own (`CLAUDE_CONFIG_DIR`), not `~/.claude`.
     env.claude_dir = Some(tmp.path().join("claude-config"));
@@ -501,13 +616,14 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
         ),
     )
     .expect("subagent");
-    // The neighbour wrote LAST: newest-by-mtime would pick it.
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    std::fs::write(
-        dir.join("theirs-2.jsonl"),
-        row("t1", "claude-opus-5-5", 99_999),
-    )
-    .expect("theirs");
+    // The neighbour wrote last: newest-by-mtime would pick it.
+    let theirs = dir.join("theirs-2.jsonl");
+    std::fs::write(&theirs, row("t1", "claude-opus-5-5", 99_999)).expect("theirs");
+    std::fs::File::open(&theirs)
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        })
+        .expect("the neighbour's mtime");
 
     env.claude_session = Some("mine-1".to_owned());
     let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
@@ -516,11 +632,11 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
     assert!(out.contains("mine-1.jsonl"), "the path is named: {out}");
     assert!(out.contains("+1 subagent transcripts"), "{out}");
     assert!(
-        out.contains("opus 1 in 1.2k out"),
+        out.contains("opus \u{2191}1 \u{2193}1.2k"),
         "this session's opus: {out}"
     );
     assert!(
-        out.contains("haiku 1 in 40 out"),
+        out.contains("haiku \u{2191}1 \u{2193}40"),
         "its subagent's haiku, at its final figures: {out}"
     );
     let token_lines: String = out
@@ -547,7 +663,7 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
     let haiku = &doc["usage"]["accounts"][0]["spend"]["claude-haiku-4-5"];
     assert_eq!(haiku["out"].as_u64(), Some(40), "{json}");
 
-    // A subagent transcript that exists and cannot be read is NOT in the
+    // A subagent transcript that exists and cannot be read is not in the
     // totals, and the output says so.
     #[cfg(unix)]
     {
@@ -614,6 +730,218 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
     assert!(out.contains("source=transcript-newest"), "{out}");
 }
 
+/// A Claude Code process as the kernel would answer for it ([`ClaudeProcess`]):
+/// `started` and `env` for the one pid [`FakeClaude::PID`], and how often
+/// each was asked.
+struct FakeClaude {
+    started: Option<u64>,
+    env: Option<Vec<String>>,
+    asked: std::cell::Cell<(usize, usize)>,
+}
+
+impl FakeClaude {
+    const PID: u32 = 4242;
+    /// The second the kernel started it.
+    const STARTED: u64 = 1_788_466_435;
+
+    /// The live process, started with `env`.
+    fn with(env: &[(&str, &str)]) -> FakeClaude {
+        FakeClaude {
+            started: Some(FakeClaude::STARTED),
+            env: Some(env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+            asked: std::cell::Cell::default(),
+        }
+    }
+}
+
+impl ClaudeProcess for FakeClaude {
+    fn started(&self, pid: u32) -> Option<u64> {
+        assert_eq!(pid, FakeClaude::PID, "the process CLAUDE_PID names");
+        let (started, env) = self.asked.get();
+        self.asked.set((started + 1, env));
+        self.started
+    }
+
+    fn exec_env(&self, pid: u32) -> Option<Vec<String>> {
+        assert_eq!(pid, FakeClaude::PID, "the process CLAUDE_PID names");
+        let (started, env) = self.asked.get();
+        self.asked.set((started, env + 1));
+        self.env.clone()
+    }
+}
+
+/// `usage` names its account by the roster's label for the login the Claude
+/// Code it runs under was started with, where two or more are listed: the
+/// HUD's `acct <label>` and the JSON's `label`, `active` true and no `dir`.
+/// The login is read from the process `CLAUDE_PID` names and from nothing
+/// else — [`run_usage`] has no other source for it — once, and only when a
+/// roster of two or more and a named session ask for it.
+///
+/// NEGATIVE CONTROLS, each `acct account`: what the process's environment
+/// says (not read, empty, a login no row names, a home of its own, a
+/// credential, a route); what the roster says (refused, missing, empty, one
+/// row: the process is not read at all); the newest-transcript pick, which
+/// may be another session's (not read either); and a pid that is not proven
+/// to be the Claude Code of the session folded — no registry row, a row that
+/// names another session, a row for a process born at another second (the
+/// pid was reused), a row or a kernel with no start to compare.
+#[test]
+fn usage_names_the_account_its_claude_code_runs_under() {
+    let tmp = tmp_dir("usage-account");
+    let mut env = env_at(&tmp);
+    let dir = env
+        .transcripts_root()
+        .expect("home is injected")
+        .join(project_dir_name(&env.cwd));
+    std::fs::create_dir_all(&dir).expect("project dir");
+    std::fs::write(
+        dir.join("mine-1.jsonl"),
+        r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":5}}}
+"#,
+    )
+    .expect("transcript");
+    env.claude_session = Some("mine-1".to_owned());
+    env.claude_pid = Some(FakeClaude::PID);
+    // The registry row Claude Code keeps for its own pid.
+    let sessions = env.claude_dir().expect("home is injected").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    let registry = sessions.join(format!("{}.json", FakeClaude::PID));
+    let row = |session: &str, proc_start: Option<u64>| {
+        let start = proc_start.map_or(String::new(), |s| {
+            format!(r#","procStart":"{}""#, footer::lstart_utc(s))
+        });
+        format!(
+            r#"{{"pid":{},"sessionId":"{session}","cwd":"{}"{start}}}"#,
+            FakeClaude::PID,
+            env.cwd.display()
+        )
+    };
+    let mine = row("mine-1", Some(FakeClaude::STARTED));
+    std::fs::write(&registry, &mine).expect("registry row");
+
+    let roster = env.accounts_roster().expect("a config dir");
+    let work = tmp.path().join("logins").join("work-2");
+    let work = work.to_str().expect("utf-8");
+    let one = accounts::append_row("", "main", Class::Dedicated, None).expect("the row admits");
+    let two =
+        accounts::append_row(&one, "work-2", Class::Dedicated, Some(work)).expect("the row admits");
+    std::fs::write(&roster, &two).expect("write");
+
+    // The HUD line and the JSON's label, which always agree; `active` stays
+    // true and no `dir` is added.
+    let shown = |env: &Env, process: &FakeClaude| {
+        let run = |json: bool| {
+            let mut out = Vec::new();
+            let code = run_usage(env, process, json, &mut out);
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+            String::from_utf8(out).expect("utf-8")
+        };
+        let hud = run(false).lines().next().unwrap_or_default().to_owned();
+        let json = run(true);
+        let doc: Value = aterm_json::from_str(&json).expect("json");
+        let account = doc["usage"]["accounts"][0].clone();
+        assert_eq!(account["active"].as_bool(), Some(true), "{json}");
+        assert!(account.get("dir").is_none(), "no `dir` is added: {json}");
+        let label = account["label"].as_str().expect("a label").to_owned();
+        assert!(hud.contains(&format!(" acct {label} ")), "{hud} / {label}");
+        hud
+    };
+    let named = |label: &str| {
+        format!("opus ?%/5h · ?%/7d · acct {label} · resets ? · none  [source=transcript]")
+    };
+    let home = ("HOME", "/home/someone");
+
+    // The default login is the row with no `dir`; a login names its row.
+    // Each of the two runs reads the process once.
+    let main = FakeClaude::with(&[home]);
+    assert_eq!(shown(&env, &main), named("main"));
+    assert_eq!(main.asked.get(), (2, 2), "one read a run");
+    let on_work = FakeClaude::with(&[home, (accounts::LOGIN_ENV, work)]);
+    assert_eq!(shown(&env, &on_work), named("work-2"));
+
+    // NEGATIVE CONTROLS: what the process's environment says.
+    let slashed = format!("{work}/");
+    let not_named: [FakeClaude; 6] = [
+        FakeClaude {
+            env: None,
+            ..FakeClaude::with(&[])
+        },
+        FakeClaude::with(&[]),
+        FakeClaude::with(&[home, (accounts::LOGIN_ENV, slashed.as_str())]),
+        FakeClaude::with(&[home, (accounts::HOME_ENV, "/elsewhere")]),
+        FakeClaude::with(&[home, ("ANTHROPIC_API_KEY", "k")]),
+        FakeClaude::with(&[home, ("ANTHROPIC_BASE_URL", "https://gateway.invalid")]),
+    ];
+    for process in &not_named {
+        assert_eq!(shown(&env, process), named("account"), "{:?}", process.env);
+    }
+
+    // NEGATIVE CONTROLS: the pid is not proven to be this session's Claude
+    // Code. The environment says `main` in each.
+    let other = row("another-1", Some(FakeClaude::STARTED));
+    let reused = row("mine-1", Some(FakeClaude::STARTED - 60));
+    let unstamped = row("mine-1", None);
+    for (what, text) in [
+        ("no registry row", None),
+        ("the row names another session", Some(other.as_str())),
+        (
+            "the row is of a process born earlier",
+            Some(reused.as_str()),
+        ),
+        ("the row carries no start", Some(unstamped.as_str())),
+    ] {
+        match text {
+            Some(text) => std::fs::write(&registry, text).expect("write"),
+            None => std::fs::remove_file(&registry).expect("remove"),
+        }
+        assert_eq!(shown(&env, &main), named("account"), "{what}");
+    }
+    std::fs::write(&registry, &mine).expect("registry row");
+    let no_start = FakeClaude {
+        started: None,
+        ..FakeClaude::with(&[home])
+    };
+    assert_eq!(shown(&env, &no_start), named("account"), "no kernel start");
+    assert_eq!(shown(&env, &main), named("main"), "the row is back");
+
+    // NEGATIVE CONTROLS: what the roster says. The process is not read.
+    let refused = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+                   [[account]]\nlabel = \"main\"\nclass = \"shared\"\ndir = \"/logins/x\"\n";
+    let unread = FakeClaude::with(&[home]);
+    for (what, text) in [
+        ("refused", Some(refused)),
+        ("no file", None),
+        ("no rows", Some("# nothing listed yet\n")),
+        ("one row", Some(one.as_str())),
+    ] {
+        match text {
+            Some(text) => std::fs::write(&roster, text).expect("write"),
+            None => std::fs::remove_file(&roster).expect("remove"),
+        }
+        assert_eq!(shown(&env, &unread), named("account"), "{what}");
+    }
+
+    // NEGATIVE CONTROLS: no pid named; and the newest transcript, which may
+    // be another session's, is not named by this process's login.
+    std::fs::write(&roster, &two).expect("write");
+    assert_eq!(shown(&env, &main), named("main"), "the roster is back");
+    env.claude_pid = None;
+    assert_eq!(shown(&env, &unread), named("account"), "no CLAUDE_PID");
+    env.claude_pid = Some(FakeClaude::PID);
+    env.claude_session = None;
+    assert_eq!(
+        shown(&env, &main),
+        named("main"),
+        "the session the row names"
+    );
+    std::fs::remove_file(&registry).expect("remove");
+    assert_eq!(
+        shown(&env, &unread),
+        "opus ?%/5h · ?%/7d · acct account · resets ? · none  [source=transcript-newest]"
+    );
+    assert_eq!(unread.asked.get(), (0, 0), "never read");
+}
+
 // ---------------------------------------------------------------------------
 // limits
 // ---------------------------------------------------------------------------
@@ -678,23 +1006,6 @@ fn scripted(stdout: String, code: i32, stderr: &str) -> Scripted {
     }
 }
 
-/// The wall is the engine's own reading (`aterm_phase::wall`) and its reset
-/// is placed by the supervisor's clock — nothing is re-parsed here. NEGATIVE
-/// CONTROL: the same frame without the notice shows no wall.
-#[test]
-fn the_view_is_the_engines_wall_and_the_painted_windows() {
-    let now = 1_758_412_800;
-    let zone_none = |_: &str| -> Option<i64> { None };
-    let v = limits_view(&limited_screen(), now, 0, zone_none);
-    let wall = v.wall.as_ref().expect("a wall is read");
-    assert_eq!(wall.kind, aterm_phase::WallKind::UsageSession);
-    assert_eq!(v.resets_at, Some(now + 3 * 3600));
-    assert!(v.windows.is_empty(), "{v:?}");
-    let idle = limits_view(&idle_screen(), now, 0, zone_none);
-    assert_eq!(idle.wall, None);
-    assert!(idle.windows.is_empty());
-}
-
 /// Claude Code's critical-memory banner (2026-09-24) is the engine's own
 /// wall, `wall=memory`, and no limit: a restart ends it, not a wait, so it
 /// has no reset. Its words say `usage` and `continue`, and neither the wall
@@ -704,7 +1015,9 @@ fn the_view_is_the_engines_wall_and_the_painted_windows() {
 fn the_memory_banner_is_its_own_wall_and_no_limit() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
     let zone_none = |_: &str| -> Option<i64> { None };
-    let v = limits_view(&screen(MEMORY_BANNER_IDLE), 1_758_412_800, 0, zone_none);
+    let v = limits_view(&screen(MEMORY_BANNER_IDLE), 1_758_412_800, 0, &|z, _| {
+        zone_none(z)
+    });
     let wall = v.wall.as_ref().expect("the banner is read");
     assert_eq!(wall.kind, aterm_phase::WallKind::Memory);
     assert!(!wall.kind.reads_limited(), "a restart ends it, not a reset");
@@ -723,12 +1036,14 @@ fn the_memory_banner_is_its_own_wall_and_no_limit() {
 }
 
 /// `limits` makes ONE screen read of the named session and prints its wall
-/// at `source=grid`. NEGATIVE CONTROLS: an idle screen is `wall=none`, and a
-/// read that fails is exit 1 naming the session — never `wall=none`, which
-/// would read as "measured, nothing wrong".
+/// — the engine's own reading (`aterm_phase::wall`), its reset placed by the
+/// supervisor's clock, nothing re-parsed — at `source=grid`. NEGATIVE
+/// CONTROLS: an idle screen is `wall=none` with no window, and a read that
+/// fails is exit 1 naming the session — never `wall=none`, which would read
+/// as "measured, nothing wrong".
 #[test]
 fn limits_reads_the_sessions_screen_once_and_names_its_wall() {
-    let tmp = Tmp::new("limits");
+    let tmp = tmp_dir("limits");
     let env = env_at(&tmp);
     let run_with = |ctl: &mut Scripted, sid: Option<&str>, json: bool| {
         let mut out = Vec::new();
@@ -771,7 +1086,7 @@ fn limits_reads_the_sessions_screen_once_and_names_its_wall() {
     let mut ctl = scripted(text_json(&idle_screen()), 0, "");
     let (code, out, _) = run_with(&mut ctl, Some("@s-worker"), false);
     assert_eq!(code, ok);
-    assert!(out.starts_with("wall=none source=grid"), "{out}");
+    assert!(out.starts_with("wall=none source=grid windows=- "), "{out}");
 
     let mut ctl = scripted(String::new(), 1, "ERR no such session @s-gone");
     let (code, out, err) = run_with(&mut ctl, Some("@s-gone"), false);
@@ -780,15 +1095,13 @@ fn limits_reads_the_sessions_screen_once_and_names_its_wall() {
     assert!(err.contains("@s-gone"), "{err}");
 }
 
-/// **NO SESSION, NO READ.** Outside an aterm session (`$ATERM_PARENT_SESSION_ID`
-/// empty) and with no `@<sid>` on the line, `limits` used to send an
-/// unaddressed read — classifying whichever session the socket defaults to —
-/// and print `wall=… source=grid` naming nobody. It refuses, exit 2, and
-/// reads nothing. NEGATIVE CONTROL: the same env with a sid on the line reads
-/// that session.
+/// Outside an aterm session (`$ATERM_PARENT_SESSION_ID` empty) and with no
+/// `@<sid>`, `limits` refuses with exit 2 and reads nothing rather than
+/// classifying whichever session the socket defaults to. Negative control: a
+/// sid on the line reads that session.
 #[test]
 fn limits_with_no_session_to_read_refuses_and_reads_nothing() {
-    let tmp = Tmp::new("limits-nosid");
+    let tmp = tmp_dir("limits-nosid");
     let mut env = env_at(&tmp);
     env.sid = String::new();
     let mut ctl = scripted(text_json(&limited_screen()), 0, "");
@@ -832,7 +1145,7 @@ fn limits_with_no_session_to_read_refuses_and_reads_nothing() {
 /// disk ledger `ledger disk` reads back.
 #[test]
 fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
-    let tmp = Tmp::new("disk");
+    let tmp = tmp_dir("disk");
     let env = env_at(&tmp);
     let cmd = Cmd::Disk {
         targets: vec![tmp.path().join("no-such-target")],
@@ -843,10 +1156,10 @@ fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
     assert!(ok, "{err}");
     assert!(out.contains("kind=disk"), "{out}");
     assert!(out.contains("apply=off"), "{out}");
-    assert!(out.contains("report only"), "{out}");
+    assert!(out.contains("nothing to reclaim"), "{out}");
     assert!(
-        !out.contains("report only: report only"),
-        "said twice: {out}"
+        !out.contains("report only"),
+        "no class to offer with nothing removable: {out}"
     );
     // A path that is not a directory is not a row — and not an error either.
     assert!(!out.contains("no-such-target"), "{out}");
@@ -875,13 +1188,12 @@ fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
     assert_eq!(rows.lines().count(), 2, "{rows}");
 }
 
-/// **THE DISK JOURNAL IS BOUNDED.** A journal past the bound is cut back to
-/// its newest rows before the run appends, so a verb that exists to act on a
-/// full disk never grows its own file for ever. NEGATIVE CONTROL: a journal
-/// under the bound is left byte-for-byte alone.
+/// The disk journal is bounded: a journal past the bound is cut back to its
+/// newest rows before the run appends. Negative control: a journal under the
+/// bound is left byte-for-byte alone.
 #[test]
 fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
-    let tmp = Tmp::new("disk-bound");
+    let tmp = tmp_dir("disk-bound");
     let env = env_at(&tmp);
     let path = env.disk_ledger();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -945,25 +1257,19 @@ fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
     assert!(!after.lines().last().unwrap().contains("\"seq\""));
     assert!(!path.with_file_name("disk.jsonl.tmp").exists());
 
-    // NEGATIVE CONTROL: under the bound nothing is cut, and the pure cut
-    // says so.
+    // Negative control: under the bound nothing is cut, and the pure cut says
+    // so.
     let before = std::fs::read(&path).unwrap();
     assert!(!bound_ledger(&path, DISK_LEDGER_MAX_BYTES, DISK_LEDGER_KEEP_ROWS).unwrap());
     assert_eq!(std::fs::read(&path).unwrap(), before);
     // A missing journal is not an error.
     assert!(!bound_ledger(&tmp.path().join("none.jsonl"), 1, 1).unwrap());
-    // The help states the bound the code applies.
-    assert!(USAGE.contains(&format!("newest {DISK_LEDGER_KEEP_ROWS} rows")));
-    assert!(USAGE.contains(&format!("{} MiB", DISK_LEDGER_MAX_BYTES / (1024 * 1024))));
 }
 
 /// `now` far enough past the files a test just wrote that every profile in
 /// them is idle.
 fn idle_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap())
-        .unwrap()
+    i64::try_from(aterm_time::unix_secs().unwrap()).unwrap()
         + (disk::DEFAULT_TARGET_STALE_DAYS + 1) * 86_400
 }
 
@@ -976,19 +1282,16 @@ fn real_remover(now: i64) -> impl FnMut(&disk::Row) -> io::Result<disk::Removed>
     })
 }
 
-/// THE HOST'S TICK, ON A BUILD DIRECTORY LAID OUT AS CARGO LAYS ONE: at or
-/// above the automatic floor it reads nothing and writes nothing; below it
-/// the idle profile's `incremental/` — and nothing else of the build
-/// directory — is reclaimed, and the report, the intent row (BEFORE the
-/// removal) and the outcome row (with its witness, the bytes actually
-/// released and the unit that went) land in the disk ledger, in that order.
-/// `[disk] auto_free_gib` moves the floor; `0` turns it off.
-///
-/// The fixture plants NO root `.cargo-lock` (cargo never writes one); the
-/// witness that dated a build directory by one could never pass here.
+/// The host's tick on a cargo-shaped build directory: at or above the
+/// automatic floor it reads and writes nothing; below it only the idle
+/// profile's `incremental/` is reclaimed, and the report, the intent row
+/// (before the removal) and the outcome row (witness, bytes released, unit)
+/// land in the disk ledger in that order. `[disk] auto_free_gib` moves the
+/// floor; `0` turns it off. The fixture plants no root `.cargo-lock` (cargo
+/// never writes one).
 #[test]
 fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
-    let tmp = Tmp::new("disk-tick");
+    let tmp = tmp_dir("disk-tick");
     let state = tmp.path().join("state");
     let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
     let now = idle_now();
@@ -1001,6 +1304,7 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
         volume: tmp.path(),
         free,
         targets: &targets,
+        discover: None,
         transcripts: None,
         now,
     };
@@ -1027,7 +1331,7 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
     );
     assert_eq!(tick, DiskTick::Plenty);
 
-    let DiskTick::Reclaimed(done) = disk_tick(
+    let DiskTick::Reclaimed(done, _) = disk_tick(
         &look(Some(gib)),
         cfg,
         &mut real_remover(now),
@@ -1068,43 +1372,6 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
     assert!(rows[2].contains("debug/incremental"), "{}", rows[2]);
 }
 
-/// `aterm harness disk --help` states the idle window's shipped default, one
-/// day, where it defines idle and again where it says what the tick takes
-/// under the floor: least recently used first, the stop (the floor plus
-/// [`disk::PRESSURE_MARGIN_GIB`], or the counted bytes), the minutes every
-/// reclaim leaves alone ([`disk::PRESSURE_MIN_IDLE_S`]), the headline's
-/// upper bound, and what the window still means.
-#[test]
-fn the_disk_help_states_the_one_day_window() {
-    let flat = USAGE.split_whitespace().collect::<Vec<_>>().join(" ");
-    let days = disk::DEFAULT_TARGET_STALE_DAYS;
-    for said in [
-        format!("`disk.target_stale_days` (default {days} day:"),
-        format!("within `disk.target_stale_days` ({days} day), measuring free space again"),
-        // The rule under pressure, and what the window still means.
-        "LEAST RECENTLY USED FIRST: every idle profile's cache, then, one profile at a time \
-         and oldest first"
-            .to_owned(),
-        format!(
-            "stopping once it is back at the floor plus {} GiB",
-            disk::PRESSURE_MARGIN_GIB
-        ),
-        // The second stop: the counted bytes, for a figure that does not
-        // rise (review follow-up, 2026-09-28).
-        "or once the bytes those removals released cover what free space was short".to_owned(),
-        format!(
-            "No reclaim, the tick's or this verb's, takes a profile written into within the last {} min",
-            disk::PRESSURE_MIN_IDLE_S / 60
-        ),
-        "not even at `target_stale_days = 0`".to_owned(),
-        "`under_pressure_up_to=` is what every one of them would free, an upper bound".to_owned(),
-        "no longer keeps a recently built checkout's cache once the volume is under the floor"
-            .to_owned(),
-    ] {
-        assert!(flat.contains(&said), "missing {said:?}:\n{USAGE}");
-    }
-}
-
 /// Set the mtime of the directory at `path` to `at` (unix seconds).
 fn set_mtime(path: &Path, at: i64) {
     let when = std::time::UNIX_EPOCH
@@ -1125,9 +1392,8 @@ fn two_day_old_release(tmp: &Tmp, name: &str, now: i64) -> PathBuf {
     target
 }
 
-/// One tick below the floor over `target`, under `cfg` and on the real
-/// remover judging by `cfg`'s own window, as the window's host runs it, free
-/// space measured again through `measure`.
+/// One tick below the floor over `target` under `cfg`, on the real remover
+/// with `cfg`'s window, free space re-measured through `measure`.
 fn tick_below_floor(
     tmp: &Tmp,
     target: &Path,
@@ -1142,6 +1408,7 @@ fn tick_below_floor(
         volume: tmp.path(),
         free: Some(1024 * 1024 * 1024),
         targets: &targets,
+        discover: None,
         transcripts: None,
         now,
     };
@@ -1150,34 +1417,26 @@ fn tick_below_floor(
         threshold_days: cfg.target_stale_days,
         device: None,
     });
-    let DiskTick::Reclaimed(done) = disk_tick(&look, cfg, &mut remover, measure) else {
+    let DiskTick::Reclaimed(done, _) = disk_tick(&look, cfg, &mut remover, measure) else {
         panic!("below the floor, the tick applies");
     };
     done
 }
 
-/// THE SHIPPED WINDOW IS ONE DAY, AND IT REACHES THE CACHES AN AGENT LEFT.
-/// The tick reads `[disk]` with no file (the default the window runs with),
-/// on the real clock: one build directory holds a profile no compile has
-/// written into for two days (`release/`) and one built just now
-/// (`debug/`). Below the floor the idle one's `incremental/` goes and the
-/// fresh one's stays. At the old default, 14 days, the two-day profile was
-/// not idle and the tick took nothing: the agents' build directories are
-/// written into daily (measured 2026-09-27), so it never freed a byte.
-/// An explicit `target_stale_days = 14` is still read as written: the
-/// two-day profile is not idle, so it is kept once free space measured
-/// again is back — and, since 2026-09-28, taken (least recently used first)
-/// while the volume is still short. The profile built just now is kept
-/// either way: it is inside the ten minutes every build keeps.
+/// The shipped idle window is one day. With no config file, on the real clock,
+/// one build directory holds a profile untouched for two days (`release/`) and
+/// one built just now (`debug/`): below the floor the idle one's
+/// `incremental/` goes and the fresh one's stays. An explicit
+/// `target_stale_days = 14` is read as written: the two-day profile is kept
+/// once free space is back, and taken least-recently-used first while the
+/// volume is still short. A profile built in the last ten minutes is never
+/// taken.
 #[test]
 fn the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today() {
-    let tmp = Tmp::new("disk-window");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap())
-        .unwrap();
+    let tmp = tmp_dir("disk-window");
+    let now = i64::try_from(aterm_time::unix_secs().unwrap()).unwrap();
     let target = two_day_old_release(&tmp, "repo/target", now);
-    let cfg = disk_config_at(None);
+    let cfg = disk_config_read(None).config;
     assert_eq!(cfg.target_stale_days, 1, "the shipped idle window");
     let done = tick_below_floor(&tmp, &target, now, cfg, &mut disk::tests::no_pressure);
     assert_eq!(done.removed.len(), 1, "{done:?}");
@@ -1203,14 +1462,13 @@ fn the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today
     assert_eq!(units.len(), 1, "{units:?}");
     assert!(units[0].ends_with("release/incremental"), "{units:?}");
 
-    // An explicit setting is read as written: at 14 the same two-day
-    // profile is not idle. Free space measured again is back above the
-    // floor: the pressure pass stops before it, and nothing goes.
-    let tmp = Tmp::new("disk-window-explicit");
+    // An explicit 14 days: the two-day profile is not idle, and free space
+    // re-measured is above the floor, so the pressure pass takes nothing.
+    let tmp = tmp_dir("disk-window-explicit");
     let target = two_day_old_release(&tmp, "repo/target", now);
     let config = tmp.path().join("aterm.toml");
     std::fs::write(&config, "[disk]\ntarget_stale_days = 14\n").expect("write");
-    let cfg = disk_config_at(Some(&config));
+    let cfg = disk_config_read(Some(&config)).config;
     assert_eq!(cfg.target_stale_days, 14);
     let done = tick_below_floor(&tmp, &target, now, cfg, &mut || Some(u64::MAX));
     assert!(done.removed.is_empty(), "{done:?}");
@@ -1228,17 +1486,15 @@ fn the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today
     assert!(target.join("debug/incremental").exists());
 }
 
-/// THE HOST'S TICK UNDER PRESSURE, END TO END: every profile in the agents'
-/// build directories is hours old (the machine measured 2026-09-27/28, where
-/// the idle window alone took nothing). Below the floor the least recently
-/// used profile gives up its `incremental/`; free space measured again is
-/// back above the floor plus the margin, so the pass stops, and the disk
-/// ledger holds the report, the intent, the outcome (its witness and the
-/// bytes released) and the stop, in that order.
+/// The host's tick under pressure, end to end: every profile is hours old, so
+/// the idle window alone takes nothing. Below the floor the least recently
+/// used profile gives up its `incremental/`; free space re-measured is above
+/// floor plus margin, so the pass stops, and the ledger holds the report,
+/// intent, outcome (witness, bytes) and stop, in that order.
 #[cfg(unix)]
 #[test]
 fn the_disk_tick_under_pressure_takes_the_oldest_profile_and_stops_when_free() {
-    let tmp = Tmp::new("disk-pressure-tick");
+    let tmp = tmp_dir("disk-pressure-tick");
     let state = tmp.path().join("state");
     let (a, b, now) = disk::pressure_tests::three_recent(tmp.path());
     let gib = 1024 * 1024 * 1024;
@@ -1249,6 +1505,7 @@ fn the_disk_tick_under_pressure_takes_the_oldest_profile_and_stops_when_free() {
         volume: tmp.path(),
         free: Some(gib),
         targets: &targets,
+        discover: None,
         transcripts: None,
         now,
     };
@@ -1258,7 +1515,7 @@ fn the_disk_tick_under_pressure_takes_the_oldest_profile_and_stops_when_free() {
         reads.push(free);
         Some(free)
     };
-    let DiskTick::Reclaimed(done) = disk_tick(&look, cfg, &mut real_remover(now), &mut measure)
+    let DiskTick::Reclaimed(done, _) = disk_tick(&look, cfg, &mut real_remover(now), &mut measure)
     else {
         panic!("below the floor, the tick applies");
     };
@@ -1288,17 +1545,16 @@ fn the_disk_tick_under_pressure_takes_the_oldest_profile_and_stops_when_free() {
     assert!(rows[3].contains("\"left\":2"), "{}", rows[3]);
 }
 
-/// THE OWNER'S VERB SAYS WHAT IT WOULD TAKE UNDER PRESSURE, AND TAKES IT.
-/// With the floor set above the scratch volume's free space (so `df` reads
-/// it as short), `aterm harness disk <dirs>` lists every recent profile as
-/// a least-recently-used row, OLDEST FIRST — not in path order — and says
-/// the pass measures again before each; with `disk.apply = true`,
-/// `--apply cargo-targets` takes them in that order while the volume stays
-/// short, and journals each.
+/// The owner's verb says what it would take under pressure, and takes it.
+/// With the floor above the scratch volume's free space, `aterm harness disk
+/// <dirs>` lists every recent profile as a least-recently-used row, oldest
+/// first, to be taken in that order until the shortfall is covered; with
+/// `disk.apply = true`, `--apply cargo-targets` takes them in that order while
+/// the volume stays short, journalling each.
 #[cfg(unix)]
 #[test]
 fn the_verb_says_what_it_would_take_under_pressure_in_order() {
-    let tmp = Tmp::new("disk-pressure-verb");
+    let tmp = tmp_dir("disk-pressure-verb");
     let (a, b, now) = disk::pressure_tests::three_recent(tmp.path());
     let env = Env {
         now,
@@ -1332,7 +1588,11 @@ fn the_verb_says_what_it_would_take_under_pressure_in_order() {
         "{out}"
     );
     assert!(
-        out.contains("under pressure: the least-recently-used rows above go in that order"),
+        out.contains(
+            "under pressure: the least-recently-used rows go in the order listed, \
+             until free space is back or what they freed covers the shortfall; \
+             under_pressure_up_to= is the most they would free"
+        ),
         "{out}"
     );
     for p in [a.join("debug"), a.join("release"), b.join("debug")] {
@@ -1369,13 +1629,12 @@ fn the_verb_says_what_it_would_take_under_pressure_in_order() {
     );
 }
 
-/// A PASS CUT SHORT STILL LEAVES ITS RECORD: the intent row is journalled
-/// BEFORE a removal starts, so a remover that dies mid-pass (a panic here; a
-/// quit or an update in the window) leaves the report and the intent on
-/// record, naming the build directory it was working in.
+/// The intent row is journalled before a removal starts, so a remover that
+/// dies mid-pass leaves the report and the intent on record, naming the build
+/// directory.
 #[test]
 fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
-    let tmp = Tmp::new("disk-cut");
+    let tmp = tmp_dir("disk-cut");
     let state = tmp.path().join("state");
     let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
     let targets = [target.clone()];
@@ -1384,6 +1643,7 @@ fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
         volume: tmp.path(),
         free: Some(1),
         targets: &targets,
+        discover: None,
         transcripts: None,
         now: idle_now(),
     };
@@ -1409,15 +1669,14 @@ fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
     );
 }
 
-/// A CHECKOUT'S `target -> target.noindex` LINK STILL RESOLVES AFTER A TICK:
-/// the window names `target.noindex` (a real directory; the link is not a
-/// candidate), and the reclaim never removes the directory the link needs —
-/// cargo can build through the link again, and the tag that keeps the twin
-/// out of backups is still there.
+/// A checkout's `target -> target.noindex` link still resolves after a tick:
+/// the window names `target.noindex` (the link is not a candidate), and the
+/// reclaim never removes the directory the link needs or the tag that keeps it
+/// out of backups.
 #[cfg(unix)]
 #[test]
 fn a_target_noindex_twin_survives_the_tick_and_its_link_resolves() {
-    let tmp = Tmp::new("disk-twin");
+    let tmp = tmp_dir("disk-twin");
     let state = tmp.path().join("state");
     let repo = tmp.path().join("repo");
     let twin = disk::tests::lay_target(&repo.join("target.noindex"));
@@ -1429,10 +1688,11 @@ fn a_target_noindex_twin_survives_the_tick_and_its_link_resolves() {
         volume: tmp.path(),
         free: Some(1),
         targets: &targets,
+        discover: None,
         transcripts: None,
         now,
     };
-    let DiskTick::Reclaimed(done) = disk_tick(
+    let DiskTick::Reclaimed(done, _) = disk_tick(
         &look,
         disk::Config::default(),
         &mut real_remover(now),
@@ -1450,18 +1710,14 @@ fn a_target_noindex_twin_survives_the_tick_and_its_link_resolves() {
     assert!(!repo.join("target/debug/incremental").exists());
 }
 
-/// THE TICK FREES THE VOLUME IT MEASURED. The free figure is the home
-/// volume's, but the targets come from every agent's working directory: a
-/// build directory on another volume (an external disk, a second APFS
-/// volume) is not looked at when home runs short, since reclaiming it frees
-/// nothing there. The fixture measures `/dev` (devfs / devtmpfs: a volume of
-/// its own on macOS and Linux) against an idle build directory in the
-/// scratch dir; the control is the same look measuring the scratch dir's own
-/// volume.
+/// The tick frees only the volume it measured: a build directory on another
+/// volume is not looked at when home runs short. The fixture measures `/dev`
+/// (its own volume on macOS and Linux) against an idle build directory in the
+/// scratch dir; the control measures the scratch dir's own volume.
 #[cfg(unix)]
 #[test]
 fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
-    let tmp = Tmp::new("disk-volume");
+    let tmp = tmp_dir("disk-volume");
     let state = tmp.path().join("state");
     let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
     let now = idle_now();
@@ -1477,10 +1733,11 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
         volume,
         free: Some(1),
         targets: &targets,
+        discover: None,
         transcripts: None,
         now,
     };
-    let DiskTick::Reclaimed(done) = disk_tick(
+    let DiskTick::Reclaimed(done, _) = disk_tick(
         &look(elsewhere),
         disk::Config::default(),
         &mut |row| panic!("removed {} to free another volume", row.path.display()),
@@ -1491,7 +1748,7 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
     assert!(done.removed.is_empty(), "{done:?}");
     assert!(target.join("debug/incremental").exists());
     // CONTROL: measured on its own volume, the same idle cache goes.
-    let DiskTick::Reclaimed(done) = disk_tick(
+    let DiskTick::Reclaimed(done, _) = disk_tick(
         &look(tmp.path()),
         disk::Config::default(),
         &mut real_remover(now),
@@ -1506,11 +1763,12 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
 
 /// THE OWNER'S VERB USES THE SAME UNIT: `aterm harness disk <dir> --apply
 /// cargo-targets`, with `disk.apply = true`, reclaims the idle profile's
-/// `incremental/` and nothing else, prints what went and what it freed, and
+/// `incremental/` and nothing else, prints what went and what it freed —
+/// "freed about": a count of the blocks it unlinked, not a measurement — and
 /// journals the intent and the outcome.
 #[test]
 fn the_verb_applies_cargo_targets_with_the_same_unit() {
-    let tmp = Tmp::new("disk-verb");
+    let tmp = tmp_dir("disk-verb");
     let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
     let env = Env {
         now: idle_now(),
@@ -1530,6 +1788,7 @@ fn the_verb_applies_cargo_targets_with_the_same_unit() {
     assert!(ok, "{err}");
     assert!(out.contains("removed=1"), "{out}");
     assert!(out.contains("went: "), "{out}");
+    assert!(out.contains("; freed about "), "{out}");
     assert!(out.contains("debug/incremental"), "{out}");
     assert!(!target.join("debug/incremental").exists());
     assert!(target.join("debug/deps/liblay.rlib").exists());
@@ -1546,6 +1805,106 @@ fn the_verb_applies_cargo_targets_with_the_same_unit() {
     assert_eq!(kinds, [true, true, true], "{ledger}");
 }
 
+/// THE REPORT OFFERS WHAT IT COULD REMOVE AND WHAT THAT NEEDS: the class with
+/// a removable row, the `--apply` flag, and — with `disk.apply` off — the
+/// switch, named where it lives; the refused `--apply` names it too.
+#[test]
+fn the_report_names_the_flag_and_the_switch_a_removal_needs() {
+    let tmp = tmp_dir("disk-offer");
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let env = Env {
+        now: idle_now(),
+        ..env_at(&tmp)
+    };
+    let config = env.config.clone().expect("config");
+    let report = |apply| Cmd::Disk {
+        targets: vec![target.clone()],
+        apply,
+        json: false,
+    };
+    let (ok, out, err) = go(&report(None), &env);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!(
+            "report only: to remove, add --apply <class> (cargo-targets); also set `[disk] \
+             apply = true` in {}\n",
+            config.display()
+        )),
+        "{out}"
+    );
+    let (_, out, _) = go(&report(Some(disk::Class::CargoTargets)), &env);
+    assert!(
+        out.contains(&format!(
+            "disk.apply is off, so `cargo-targets` removed nothing; set `[disk] apply = true` in \
+             {}\n",
+            config.display()
+        )),
+        "{out}"
+    );
+    assert!(target.join("debug/incremental").exists());
+    std::fs::write(&config, "[disk]\napply = true\n").expect("write");
+    let (_, out, _) = go(&report(None), &env);
+    assert!(
+        out.contains("report only: to remove, add --apply <class> (cargo-targets)\n"),
+        "{out}"
+    );
+}
+
+/// WHERE A FAULT TURNED REMOVAL OFF, THE ADVICE NAMES THE FAULT. The file
+/// sets `disk.apply = true` and says nothing the owner meant by another
+/// removal knob (one of another type, one TOML files under another table, a
+/// text the parser refuses), so the reading's `apply` is off. The report and
+/// the refused `--apply` name the config file, the stderr note says which
+/// value, and neither tells the owner to set the switch the file already
+/// sets: that frees nothing, and a second `apply = true` is a key said twice,
+/// which the parser refuses. The fault fixed, the report asks for nothing.
+#[test]
+fn removal_off_by_a_fault_never_advises_the_switch_already_set() {
+    let tmp = tmp_dir("disk-offer-fault");
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let env = Env {
+        now: idle_now(),
+        ..env_at(&tmp)
+    };
+    let config = env.config.clone().expect("config");
+    let named = config.display().to_string();
+    let report = |apply| Cmd::Disk {
+        targets: vec![target.clone()],
+        apply,
+        json: false,
+    };
+    let line = |out: &str, label: &str| {
+        out.lines()
+            .find(|l| l.trim_start().starts_with(label))
+            .unwrap_or_else(|| panic!("no {label:?} line: {out}"))
+            .to_owned()
+    };
+    for text in [
+        "[disk]\napply = true\nauto_free_gib = \"off\"\n",
+        "[disk]\napply = true\n[theme]\ndisk.target_stale_days = 0\n",
+        "[disk]\napply = true\nfont_px = \n",
+    ] {
+        std::fs::write(&config, text).expect("write");
+        let (ok, out, err) = go(&report(None), &env);
+        assert!(ok, "{err}");
+        assert!(!err.trim().is_empty(), "{text:?}: the note says why");
+        assert!(
+            line(&out, "report only:").contains(&named),
+            "{text:?}: {out}"
+        );
+        assert!(!out.contains("`[disk] apply = true`"), "{text:?}: {out}");
+        let (_, out, _) = go(&report(Some(disk::Class::CargoTargets)), &env);
+        assert!(line(&out, "denied:").contains(&named), "{text:?}: {out}");
+        assert!(!out.contains("`[disk] apply = true`"), "{text:?}: {out}");
+        assert!(target.join("debug/incremental").exists(), "{text:?}");
+    }
+    std::fs::write(&config, "[disk]\napply = true\nauto_free_gib = 5\n").expect("write");
+    let (ok, out, err) = go(&report(None), &env);
+    assert!(ok, "{err}");
+    assert!(err.trim().is_empty(), "read as written: {err}");
+    assert!(!line(&out, "report only:").contains(&named), "{out}");
+}
+
 /// NOTHING IS REMOVED WITHOUT ITS INTENT ON RECORD. When the disk journal
 /// cannot take a row — the state directory cannot be made (here a FILE sits
 /// where it should be), or the append fails on a full disk — the tick removes
@@ -1553,7 +1912,7 @@ fn the_verb_applies_cargo_targets_with_the_same_unit() {
 /// could not be journalled, and the cache stays.
 #[test]
 fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
-    let tmp = Tmp::new("disk-unjournalled");
+    let tmp = tmp_dir("disk-unjournalled");
     let state = tmp.path().join("state");
     std::fs::write(&state, b"not a directory").expect("a file where the state dir goes");
     let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
@@ -1564,10 +1923,11 @@ fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
         volume: tmp.path(),
         free: Some(1),
         targets: &targets,
+        discover: None,
         transcripts: None,
         now,
     };
-    let DiskTick::Reclaimed(done) = disk_tick(
+    let DiskTick::Reclaimed(done, _) = disk_tick(
         &look,
         disk::Config::default(),
         &mut real_remover(now),
@@ -1585,11 +1945,11 @@ fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
     assert!(target.join("debug/incremental").exists(), "the cache stays");
 }
 
-/// THE VERB, TOO: with the disk journal unopenable (a directory sits at its
+/// The verb, too: with the disk journal unopenable (a directory sits at its
 /// path), `--apply cargo-targets` removes nothing and says why.
 #[test]
 fn the_verb_removes_nothing_whose_intent_it_cannot_journal() {
-    let tmp = Tmp::new("disk-verb-unjournalled");
+    let tmp = tmp_dir("disk-verb-unjournalled");
     let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
     let env = Env {
         now: idle_now(),
@@ -1613,17 +1973,15 @@ fn the_verb_removes_nothing_whose_intent_it_cannot_journal() {
     assert!(target.join("debug/incremental").exists(), "the cache stays");
 }
 
-/// `--json` CARRIES WHAT EACH ROW KEPT AND WHY, as the text form does: a
-/// profile a build holds (skipped) and an entry that could not be deleted
-/// (trouble) are in the disk-apply object, beside what went and what it
-/// freed — a caller reading the JSON sees a partial reclaim as partial.
-/// Unix-only: it holds a profile's cargo lock and makes an entry undeletable
-/// by mode bits, and the reclaim it drives refuses on every other OS.
+/// `--json` carries what each row kept and why: a profile a build holds
+/// (skipped) and an undeletable entry (trouble) sit beside what went and what
+/// it freed, so a partial reclaim reads as partial. Unix-only: it holds a
+/// cargo lock and uses mode bits, and the reclaim refuses on other OSes.
 #[cfg(unix)]
 #[test]
 fn the_verb_json_carries_what_each_row_went_kept_and_why() {
     use std::os::unix::fs::PermissionsExt as _;
-    let tmp = Tmp::new("disk-verb-json");
+    let tmp = tmp_dir("disk-verb-json");
     let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
     disk::tests::lay_profile(&target.join("release"));
     let target = std::fs::canonicalize(&target).expect("canonical");
@@ -1693,34 +2051,6 @@ fn the_verb_json_carries_what_each_row_went_kept_and_why() {
     );
 }
 
-/// THE FREED FIGURE IS SAID TO BE A COUNT, NOT A MEASUREMENT: the verb
-/// prints "freed about", and its help says what the count is — the blocks
-/// of each unlinked file that was its last name, an APFS clone's shared
-/// blocks included, a file it could not open left out.
-#[test]
-fn the_verb_says_what_its_freed_figure_counts() {
-    assert!(USAGE.contains("APFS clone"), "{USAGE}");
-    let tmp = Tmp::new("disk-verb-about");
-    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
-    let env = Env {
-        now: idle_now(),
-        ..env_at(&tmp)
-    };
-    std::fs::write(
-        env.config.as_ref().expect("config"),
-        "[disk]\napply = true\n",
-    )
-    .expect("write");
-    let cmd = Cmd::Disk {
-        targets: vec![target],
-        apply: Some(disk::Class::CargoTargets),
-        json: false,
-    };
-    let (ok, out, err) = go(&cmd, &env);
-    assert!(ok, "{err}");
-    assert!(out.contains("; freed about "), "{out}");
-}
-
 /// [`on_volume`] keeps the targets whose volume id is the measured one's, and
 /// nothing when an id cannot be read.
 #[test]
@@ -1750,15 +2080,15 @@ fn only_the_measured_volumes_targets_are_candidates() {
 
 #[test]
 fn the_disk_knobs_are_read_from_aterm_toml() {
-    let tmp = Tmp::new("disk-knobs");
+    let tmp = tmp_dir("disk-knobs");
     let env = env_at(&tmp);
     let path = env.config.clone().expect("a config path");
-    std::fs::write(
-        &path,
-        "[disk]\napply = false\nwarn_free_gib = 5\ntarget_stale_days = 30\n",
-    )
-    .expect("write");
-    let cfg = disk_config(&env);
+    let read = |text: &str| {
+        std::fs::write(&path, text).expect("write");
+        let reading = disk_config(&env);
+        (reading.config, reading.notes)
+    };
+    let (cfg, notes) = read("[disk]\napply = false\nwarn_free_gib = 5\ntarget_stale_days = 30\n");
     assert_eq!(cfg.warn_free_gib, 5);
     assert_eq!(cfg.target_stale_days, 30);
     assert!(!cfg.apply);
@@ -1767,185 +2097,369 @@ fn the_disk_knobs_are_read_from_aterm_toml() {
         disk::DEFAULT_AUTO_FREE_GIB,
         "the default floor"
     );
-    std::fs::write(&path, "[disk]\nauto_free_gib = 0\n").expect("write");
-    assert_eq!(disk_config(&env).auto_free_gib, 0, "the floor switched off");
-    // A floor below zero is never crossed: `-1` written to stop the removal
-    // stops it (it read as the default, 10, and left the removal ON).
-    std::fs::write(&path, "[disk]\nauto_free_gib = -3\n").expect("write");
+    assert!(notes.is_empty(), "{notes:?}");
     assert_eq!(
-        disk_config(&env).auto_free_gib,
+        read("[disk]\nauto_free_gib = 0\n").0.auto_free_gib,
         0,
+        "the floor switched off"
+    );
+    // A floor below zero is never crossed: `-1` written to stop the removal
+    // stops it (it read as the default, 10, and left the removal on).
+    let (cfg, notes) = read("[disk]\nauto_free_gib = -3\n");
+    assert_eq!(
+        cfg.auto_free_gib, 0,
         "a negative floor is off, never the default"
     );
-    assert!(!disk_config(&env).below_auto_floor(Some(0)));
-    // A value of the wrong type is the default, not a guess.
-    std::fs::write(&path, "[disk]\nauto_free_gib = \"off\"\n").expect("write");
-    assert_eq!(disk_config(&env).auto_free_gib, disk::DEFAULT_AUTO_FREE_GIB);
-    std::fs::write(
-        &path,
-        "[disk]\napply = false\nwarn_free_gib = 5\ntarget_stale_days = 30\n",
-    )
-    .expect("write");
-    // The dotted spelling, in a file TOML reads.
-    std::fs::write(&path, "disk.apply = true\n").expect("write");
-    assert!(disk_config(&env).apply);
-    // A numeric knob's last assignment wins (its line reader, [`toml_int`]);
-    // the same file is not TOML, so it grants no removal consent.
-    std::fs::write(
-        &path,
-        "[disk]\napply = true\ntarget_stale_days = 3 # a comment\ntarget_stale_days = 4\n",
-    )
-    .expect("write");
-    let cfg = disk_config(&env);
-    assert!(!cfg.apply);
-    assert_eq!(cfg.target_stale_days, 4);
+    assert!(!cfg.below_auto_floor(Some(0)));
+    assert!(
+        notes.iter().any(|n| n.contains("disk.auto_free_gib")),
+        "{notes:?}"
+    );
+    // The dotted spelling.
+    assert!(read("disk.apply = true\n").0.apply);
 
-    // NEGATIVE CONTROLS, each breaking to the shipped default rather than to
-    // a guess: a value of the wrong TYPE, a NEGATIVE stale window (which
-    // would make every directory a candidate at once), a key with no value,
-    // and the same key under ANOTHER table.
+    // Each read as its default and said, none turning the removal off: a
+    // negative stale window, a warning threshold of another type (it removes
+    // nothing), and a key `[disk]` does not have.
     let d = disk::Config::default();
-    for text in [
-        "[disk]\nwarn_free_gib = \"lots\"\ntarget_stale_days = -1\napply = yes\n",
-        "[disk]\ntarget_stale_days\n",
-        "[harness]\ntarget_stale_days = 9\nwarn_free_gib = 9\napply = true\n",
-    ] {
-        std::fs::write(&path, text).expect("write");
-        let cfg = disk_config(&env);
-        assert_eq!(cfg.target_stale_days, d.target_stale_days, "{text}");
-        assert_eq!(cfg.warn_free_gib, d.warn_free_gib, "{text}");
-        assert_eq!(cfg.apply, disk::DEFAULT_APPLY, "{text}");
-    }
-    // A key said twice is not TOML: the boolean reader answers only a
-    // `false` out of such a file, never consent (main, 2026-09-24); the
-    // integer reader keeps its last valid assignment.
-    assert_eq!(
-        toml_bool("[disk]\napply = true\napply = maybe\n", "disk", "apply"),
-        None
+    let (cfg, notes) = read(
+        "[disk]\napply = true\nwarn_free_gib = \"lots\"\ntarget_stale_days = -1\nauto_free_gb = 0\n",
     );
-    assert_eq!(toml_int("[disk]\nn = 2\nn = x\n", "disk", "n"), Some(2));
+    assert_eq!(cfg, disk::Config { apply: true, ..d });
+    for key in [
+        "disk.warn_free_gib",
+        "disk.target_stale_days",
+        "disk.auto_free_gb",
+    ] {
+        assert!(notes.iter().any(|n| n.contains(key)), "{key}: {notes:?}");
+    }
+    // The same keys under another table are not the knobs.
+    let (cfg, notes) = read("[harness]\ntarget_stale_days = 9\nwarn_free_gib = 9\napply = true\n");
+    assert_eq!(cfg, d);
+    assert!(notes.is_empty(), "{notes:?}");
+    // No file is every default, unremarked.
+    std::fs::remove_file(&path).expect("remove");
+    assert_eq!(
+        disk_config(&env),
+        DiskReading {
+            config: d,
+            floor_gib: Some(disk::DEFAULT_AUTO_FREE_GIB),
+            notes: Vec::new(),
+            off_by_fault: false,
+        }
+    );
+}
+
+/// Every spelling the window's TOML parser reads a `[disk]` knob in reads the
+/// same here: the inline table, quoted keys and table names, spaced and quoted
+/// dotted keys, and integers with `_` separators, a sign or a base prefix. The
+/// line reader this replaced read none of them, so `auto_free_gib = 0` written
+/// inline left the automatic removal on at the 10 GiB default, and
+/// `target_stale_days = 3_0` read as one day.
+#[test]
+fn every_spelling_the_window_parser_reads_reads_the_same_knobs() {
+    for text in [
+        "disk = { apply = true, auto_free_gib = 0, target_stale_days = 30, \
+         dead_build_dirs = false }\n",
+        "disk = {apply=true,auto_free_gib=0,target_stale_days=30,dead_build_dirs=false}\n",
+        "[disk]\napply = true\n\"auto_free_gib\" = 0\ntarget_stale_days = 3_0\n\
+         'dead_build_dirs' = false\n",
+        "[\"disk\"]\napply = true\nauto_free_gib = 0x0\ntarget_stale_days = 0o36\n\
+         dead_build_dirs = false\n",
+        "disk . apply = true\ndisk . auto_free_gib = 0\n\"disk\".target_stale_days = +30\n\
+         'disk'.\"dead_build_dirs\" = false\n",
+        // Where TOML reads them, then another table.
+        "disk.apply = true\ndisk.auto_free_gib = 0\ndisk.target_stale_days = 30\n\
+         disk.dead_build_dirs = false\n[theme]\nname = \"x\"\n",
+    ] {
+        let DiskReading {
+            config: cfg,
+            floor_gib,
+            notes,
+            off_by_fault,
+        } = disk_config_from(text);
+        assert!(!off_by_fault, "{text:?}");
+        assert_eq!(floor_gib, Some(0), "{text:?}");
+        assert_eq!(
+            (
+                cfg.apply,
+                cfg.auto_free_gib,
+                cfg.target_stale_days,
+                cfg.dead_build_dirs
+            ),
+            (true, 0, 30, false),
+            "{text:?}"
+        );
+        assert!(notes.is_empty(), "{text:?}: {notes:?}");
+    }
+}
+
+/// A removal knob that cannot be read turns every removal off — `apply`, the
+/// automatic floor and the whole-directory reclaim — whatever the rest of the
+/// file grants, and the reading names it: a file the parser refuses (a typo
+/// elsewhere, a key said twice, a key with no value), a `disk` that is not a
+/// table, a removal knob of another type, and one TOML files under another
+/// table. The line reader read `[theme] disk.target_stale_days = 0` as the
+/// knob; the parser files it as `theme.disk.target_stale_days`, and a
+/// misplaced off switch must not become the default by being ignored. A
+/// misplaced warning threshold removes nothing, so it only says so. The floor
+/// the file sets is unknown where the file or `auto_free_gib` itself cannot be
+/// read, and read as written where another knob cannot.
+#[test]
+fn a_disk_knob_that_cannot_be_read_turns_every_removal_off() {
+    const GRANT: &str = "[disk]\napply = true\nauto_free_gib = 20\ndead_build_dirs = true\ntarget_stale_days = 30\n";
+    let grant = disk_config_from(GRANT);
+    assert_eq!(
+        (
+            grant.config.apply,
+            grant.config.auto_free_gib,
+            grant.config.dead_build_dirs
+        ),
+        (true, 20, true),
+        "the grant alone"
+    );
+    assert_eq!(grant.floor_gib, Some(20));
+    assert!(grant.notes.is_empty(), "{:?}", grant.notes);
+    assert!(!grant.off_by_fault);
+    let refused = format!("{GRANT}font_px = \n");
+    let default = Some(disk::DEFAULT_AUTO_FREE_GIB);
+    // Each: the text, what its one note names (the line where the parser
+    // stopped, or the key's whole path; for a `disk` that is not a table,
+    // only that there is one note), and the floor read.
+    let off = [
+        // The parser refuses these: no floor is read.
+        (refused.as_str(), Some("line 6"), None),
+        (
+            "[disk]\napply = true\ntarget_stale_days = 3\ntarget_stale_days = 4\n",
+            Some("line 4"),
+            None,
+        ),
+        ("[disk]\napply = yes\n", Some("line 2"), None),
+        (
+            "[disk]\napply = true\ntarget_stale_days\n",
+            Some("line 3"),
+            None,
+        ),
+        // Refused at the end of the input, which is on the last line.
+        (
+            "[disk]\napply = true\nauto_free_gib = [0\n",
+            Some("line 3"),
+            None,
+        ),
+        // Not a table.
+        ("disk = 5\n", None, None),
+        ("[[disk]]\napply = true\n", None, None),
+        // A removal knob of another type: the floor is unknown only where it
+        // is that knob.
+        (
+            "[disk]\napply = true\nauto_free_gib = \"off\"\n",
+            Some("disk.auto_free_gib"),
+            None,
+        ),
+        (
+            "[disk]\napply = true\nauto_free_gib = 2.5\n",
+            Some("disk.auto_free_gib"),
+            None,
+        ),
+        ("disk = { apply = \"yes\" }\n", Some("disk.apply"), default),
+        (
+            "[disk]\napply = true\ndead_build_dirs = \"no\"\n",
+            Some("disk.dead_build_dirs"),
+            default,
+        ),
+        (
+            "[disk]\napply = true\nauto_free_gib = 20\ntarget_stale_days = 30.0\n",
+            Some("disk.target_stale_days"),
+            Some(20),
+        ),
+        // Filed by TOML under another table.
+        (
+            "[disk]\napply = true\nauto_free_gib = 20\n[theme]\ndisk.target_stale_days = 0\n",
+            Some("theme.disk.target_stale_days"),
+            Some(20),
+        ),
+        (
+            "[disk]\napply = true\n[theme]\nname = \"x\"\ndisk.auto_free_gib = 0\n",
+            Some("theme.disk.auto_free_gib"),
+            None,
+        ),
+        (
+            "[disk]\napply = true\n[theme.dark]\ndisk = { dead_build_dirs = false }\n",
+            Some("theme.dark.disk.dead_build_dirs"),
+            default,
+        ),
+        (
+            "[disk]\napply = true\n[[keybind]]\nkey = \"a\"\ndisk.apply = true\n",
+            Some("keybind[0].disk.apply"),
+            default,
+        ),
+    ];
+    for (text, named, floor) in off {
+        let DiskReading {
+            config: cfg,
+            floor_gib,
+            notes,
+            off_by_fault,
+        } = disk_config_from(text);
+        assert!(off_by_fault, "{text:?}");
+        assert_eq!(
+            (cfg.apply, cfg.auto_free_gib, cfg.dead_build_dirs),
+            (false, 0, false),
+            "{text:?}"
+        );
+        assert!(!cfg.below_auto_floor(Some(0)), "{text:?}");
+        assert_eq!(floor_gib, floor, "{text:?}");
+        assert_eq!(notes.len(), 1, "{text:?}: {notes:?}");
+        if let Some(named) = named {
+            assert!(
+                notes[0].contains(named),
+                "{text:?} names {named}: {notes:?}"
+            );
+        }
+    }
+    // Misplaced, the stale window is not read as the knob.
+    let misplaced = disk_config_from(
+        "[disk]\napply = true\nauto_free_gib = 20\n[theme]\ndisk.target_stale_days = 0\n",
+    );
+    assert_eq!(
+        misplaced.config.target_stale_days,
+        disk::DEFAULT_TARGET_STALE_DAYS
+    );
+
+    let DiskReading {
+        config: cfg,
+        floor_gib,
+        notes,
+        off_by_fault,
+    } = disk_config_from("[disk]\napply = true\n[theme]\ndisk.warn_free_gib = 5\n");
+    assert!(
+        !off_by_fault,
+        "a misplaced warning threshold removes nothing"
+    );
+    assert_eq!(
+        cfg,
+        disk::Config {
+            apply: true,
+            ..disk::Config::default()
+        }
+    );
+    assert_eq!(floor_gib, default);
+    assert!(
+        notes.iter().any(|n| n.contains("theme.disk.warn_free_gib")),
+        "{notes:?}"
+    );
+}
+
+/// The window's disk watch ends a `disk.low` line only on a volume at or
+/// above the floor the file sets ([`DiskReading::at_or_above_floor`]). Where
+/// the reading turned the removal off because the file could not be read, the
+/// effective floor is `0`, which no figure is below; the floor the owner wrote
+/// is unknown, so no figure is at or above it, and a short volume is never
+/// said to have space back. Where the floor was read, the answer is the one
+/// [`disk::Config::below_auto_floor`] gives for it, whatever else turned the
+/// removal off.
+#[test]
+fn a_floor_the_file_does_not_say_never_reads_as_space_back() {
+    const GIB: u64 = 1 << 30;
+    let tmp = tmp_dir("disk-floor");
+    let env = env_at(&tmp);
+    let path = env.config.clone().expect("a config path");
+    std::fs::create_dir_all(&path).expect("a directory where the file goes");
+    let unread = [
+        disk_config_from("[disk]\nauto_free_gib = 20\nfont_px = \n"),
+        disk_config_from("disk = 5\n"),
+        disk_config_from("[disk]\nauto_free_gib = \"off\"\n"),
+        disk_config_from("[theme]\ndisk.auto_free_gib = 50\n"),
+        disk_config(&env),
+    ];
+    for reading in &unread {
+        assert_eq!(reading.floor_gib, None, "{reading:?}");
+        for free in [Some(GIB), Some(500 * GIB), Some(u64::MAX), None] {
+            // The control: the effective floor alone reads as space back.
+            assert!(!reading.config.below_auto_floor(free), "{reading:?}");
+            assert!(!reading.at_or_above_floor(free), "{reading:?} at {free:?}");
+        }
+    }
+    std::fs::remove_dir(&path).expect("remove");
+
+    // The floor read, the removal off for another knob: the floor decides.
+    let reading = disk_config_from("[disk]\nauto_free_gib = 20\napply = \"yes\"\n");
+    assert_eq!(reading.config.auto_free_gib, 0, "the removal is off");
+    assert!(!reading.at_or_above_floor(Some(5 * GIB)));
+    assert!(reading.at_or_above_floor(Some(20 * GIB)));
+    // Read as written, the answer is the effective floor's.
+    for text in [
+        "",
+        "[disk]\nauto_free_gib = 20\n",
+        "[disk]\nauto_free_gib = 0\n",
+        "[disk]\nauto_free_gib = -3\n",
+        "disk = { auto_free_gib = 30, target_stale_days = 3_0 }\n",
+    ] {
+        let reading = disk_config_from(text);
+        for free in [Some(0), Some(5 * GIB), Some(25 * GIB), Some(u64::MAX), None] {
+            assert_eq!(
+                reading.at_or_above_floor(free),
+                !reading.config.below_auto_floor(free),
+                "{text:?} at {free:?}"
+            );
+        }
+    }
+}
+
+/// An aterm.toml that exists and cannot be read as text — not UTF-8, or not
+/// a file — grants no removal, and the reading names it; the hand-run verb
+/// prints each note on stderr, its `--json` stdout untouched.
+#[test]
+fn an_unreadable_aterm_toml_grants_no_removal_and_the_verb_says_so() {
+    let tmp = tmp_dir("disk-unreadable");
+    let env = env_at(&tmp);
+    let path = env.config.clone().expect("a config path");
+    std::fs::write(&path, b"[disk]\napply = true\n# \xff\n").expect("write");
+    let DiskReading {
+        config: cfg,
+        floor_gib,
+        notes,
+        off_by_fault,
+    } = disk_config(&env);
+    assert!(off_by_fault);
+    assert_eq!(floor_gib, None);
+    assert_eq!(
+        (cfg.apply, cfg.auto_free_gib, cfg.dead_build_dirs),
+        (false, 0, false)
+    );
+    let named = path.display().to_string();
+    assert!(notes.iter().any(|n| n.contains(&named)), "{notes:?}");
+    std::fs::remove_file(&path).expect("remove");
+    std::fs::create_dir_all(&path).expect("a directory where the file goes");
+    let DiskReading {
+        config: cfg, notes, ..
+    } = disk_config(&env);
+    assert_eq!(cfg.auto_free_gib, 0);
+    assert!(notes.iter().any(|n| n.contains(&named)), "{notes:?}");
+    std::fs::remove_dir(&path).expect("remove");
+
+    std::fs::write(&path, "disk = { auto_free_gib = \"off\" }\n").expect("write");
+    let cmd = Cmd::Disk {
+        targets: vec![disk::tests::lay_target(&tmp.path().join("repo/target"))],
+        apply: None,
+        json: true,
+    };
+    let (ok, out, err) = go(&cmd, &env);
+    assert!(ok, "{err}");
+    assert!(err.contains("disk.auto_free_gib"), "{err}");
+    assert!(!out.contains("disk.auto_free_gib"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
-// The boolean reader and the hand-run upgrade (ported from main, 2026-09-24)
+// The hand-run upgrade
 // ---------------------------------------------------------------------------
 
-/// EVERY spelling TOML — and so the GUI's own parser, which seeds Settings ▸
-/// Harness — reads as `harness.enabled = false` reads OFF here too, and one
-/// TOML reads as some OTHER key does not.
-///
-/// The GUI's Settings writer keeps whatever spelling the file already has, so
-/// `harness = { enabled = true }` switched off in Settings is written back
-/// as `harness = { enabled = false }`. The line reader this used to be
-/// answered `None` — ON — for that, for a quoted key and for a spaced dotted
-/// key: the switch read OFF on the glass while the harness read it ON (main's
-/// audit 2026-09-24, measured against `aterm_toml::from_str::<Value>`, which
-/// reads all three `false`). Ported with main's key: on this branch the
-/// boolean reader answers `disk.apply`, and the `[harness]` switches are the
-/// supervisor policy's own reader (`crate::supervise::config`'s tests).
-#[test]
-fn the_boolean_reader_reads_every_spelling_the_gui_parser_reads() {
-    for text in [
-        "harness = { enabled = false }\n",
-        "harness = {enabled=false}\n",
-        "harness = { other = 1, enabled = false }\n",
-        "harness . enabled = false\n",
-        "[harness]\n\"enabled\" = false\n",
-        "[\"harness\"]\nenabled = false\n",
-        "'harness'.'enabled' = false\n",
-        // The right table, then an inline table of the same name under
-        // ANOTHER header: that one is `profile.harness.enabled`.
-        "[harness]\nenabled = false\n[profile]\nharness = { enabled = true }\n",
-    ] {
-        assert_eq!(
-            toml_bool(text, "harness", "enabled"),
-            Some(false),
-            "{text:?}"
-        );
-    }
-    assert_eq!(
-        toml_bool("harness = { enabled = true }\n", "harness", "enabled"),
-        Some(true)
-    );
-    // NOT the switch: a sub-table, an array of tables, a near-miss key, a
-    // string, a nested inline table, and a misplaced `true` — which TOML
-    // files under `[profile]`, and which is not a `false`, so it cannot turn
-    // anything off. (A misplaced `false` does:
-    // `a_kill_switch_written_below_another_header_still_reads_off`.)
-    for text in [
-        "[harness.sub]\nenabled = false\n",
-        "[[harness]]\nenabled = false\n",
-        "harness = { enabledx = false }\n",
-        "harness = { enabled = \"false\" }\n",
-        "harness = { sub = { enabled = false } }\n",
-        "[profile]\nharness.enabled = true\n",
-    ] {
-        assert_eq!(toml_bool(text, "harness", "enabled"), None, "{text:?}");
-    }
-}
-
-/// A file the TOML parser REFUSES — a typo three tables away — still reads
-/// a `false` the owner wrote, and it reads nothing else. Every spelling the
-/// parser path admits is salvaged, one `false` beats any `true`, and a
-/// refused file never answers `true`: `false` is the safe side, so a refused
-/// `disk.apply = true` is not consent to remove anything.
-#[test]
-fn a_file_the_parser_refuses_can_only_read_off() {
-    const TYPO: &str = "font_px = \n";
-    for tail in [
-        "[harness]\nenabled = false\n",
-        "harness = { enabled = false }\n",
-        "harness . \"enabled\" = false # off\n",
-        "[harness]\nenabled = true\nenabled = false\n",
-        "[harness]\nenabled = false\nenabled = true\n",
-        // Misplaced below another header, as in the parsed reading.
-        "[profile]\nharness = { enabled = false }\n",
-        "[theme]\nname = \"x\"\nharness.enabled = false\n",
-        "[[keybind]]\nharness.enabled = false\n",
-    ] {
-        let text = format!("{TYPO}{tail}");
-        assert!(
-            aterm_toml::from_str::<aterm_toml::Value>(&text).is_err(),
-            "the fixture must be one the parser refuses: {text:?}"
-        );
-        assert_eq!(
-            toml_bool(&text, "harness", "enabled"),
-            Some(false),
-            "{text:?}"
-        );
-    }
-    for tail in [
-        "[harness]\nenabled = true\n",
-        "harness = { enabled = true }\n",
-        "[profile]\nharness = { enabled = true }\n",
-        "[[harness]]\nenabled = false\n",
-        "[harness]\nnote = \"enabled = false\"\n",
-        "\"harness.enabled\" = false\n",
-        "# harness.enabled = false\n",
-    ] {
-        let text = format!("{TYPO}{tail}");
-        assert_eq!(toml_bool(&text, "harness", "enabled"), None, "{text:?}");
-    }
-    // A byte-order mark in front of a refused file does not hide its header.
-    let text = format!("\u{feff}[harness]\nenabled = false\n{TYPO}");
-    assert_eq!(toml_bool(&text, "harness", "enabled"), Some(false));
-    let text = format!("{TYPO}[disk]\napply = true\n");
-    assert_eq!(toml_bool(&text, "disk", "apply"), None, "{text:?}");
-}
-
-/// `harness.enabled = false` APPENDED to a file whose last header is some
-/// other table still switches the harness off, and the verb that acts under
-/// the switch says where it found it.
-///
-/// That line is what an owner appends, and TOML files it under the last
-/// header (`theme.harness.enabled`), so a root-key-only reader reads the
-/// switch unset: ON. A kill switch may not stop working because of where in
-/// the file it was written (main's review of 2026-09-24): the policy's reader
-/// limits on it and names it (`crate::supervise::config`'s tests), and a
-/// refused `upgrade` prints that note on stderr — and says nothing of it when
-/// the switch sits where TOML reads it. The boolean reader keeps the same
-/// rule for `disk.apply`: a misplaced `false` is no consent, a misplaced
-/// `true` is not consent either.
+/// `harness.enabled = false` appended below another table's header still
+/// switches the harness off, and the verb says where it found it. TOML files
+/// that line under the last header (`theme.harness.enabled`), but a kill
+/// switch must work wherever it is written: the policy's reader honours it and
+/// names it, and a refused `upgrade` prints that note on stderr (and says
+/// nothing when the switch sits where TOML reads it).
 #[test]
 fn a_kill_switch_written_below_another_header_still_reads_off() {
     for text in [
@@ -1954,22 +2468,13 @@ fn a_kill_switch_written_below_another_header_still_reads_off() {
         "[theme.dark]\nharness = { enabled = false }\n",
         "[[keybind]]\nkey = \"a\"\nharness.enabled = false\n",
     ] {
-        assert_eq!(
-            toml_bool(text, "harness", "enabled"),
-            Some(false),
+        assert!(
+            !SupervisorConfig::from_aterm_toml(text).0.enabled,
             "{text:?}"
         );
     }
-    assert_eq!(
-        toml_bool("[other]\ndisk.apply = false\n", "disk", "apply"),
-        Some(false)
-    );
-    assert_eq!(
-        toml_bool("[other]\ndisk.apply = true\n", "disk", "apply"),
-        None
-    );
 
-    let tmp = Tmp::new("master-misplaced");
+    let tmp = tmp_dir("master-misplaced");
     let env = env_at(&tmp);
     std::fs::create_dir_all(tmp.path().join("home/.claude/sessions")).expect("home");
     let config = env.config.clone().expect("config path");
@@ -1987,7 +2492,7 @@ fn a_kill_switch_written_below_another_header_still_reads_off() {
         "{err}"
     );
     assert!(err.contains("limits all the same"), "{err}");
-    // NEGATIVE CONTROL: the switch where TOML reads it is off, and unremarked.
+    // Negative control: the switch where TOML reads it is off, unremarked.
     std::fs::write(&config, "[harness]\nenabled = false\n").expect("write config");
     assert!(!SupervisorConfig::from_path(Some(&config)).0.enabled);
     let (_, out, err) = go(&upgrade_cmd(true, false), &env);
@@ -2019,12 +2524,10 @@ fn upgrade_cmd(dry_run: bool, json: bool) -> Cmd {
 }
 
 /// A hand-run `upgrade` stands down under `[harness] enabled = false` as the
-/// window's host does: one `refused:bypassed` line, no lock taken, exit 1. Until 2026-09-24 it never read the switch — measured
-/// then: exit 0, `sweep.lock` created, and against a fake socket it typed a
-/// relaunch line into a tab.
+/// window's host does: one `refused:bypassed` line, no lock taken, exit 1.
 #[test]
 fn a_hand_run_upgrade_stands_down_while_the_master_switch_is_off() {
-    let tmp = Tmp::new("upgrade-master");
+    let tmp = tmp_dir("upgrade-master");
     let env = env_at(&tmp);
     std::fs::create_dir_all(tmp.path().join("home/.claude/sessions")).expect("home");
     let lock = env.state.join("upgrade").join("sweep.lock");
@@ -2050,7 +2553,7 @@ fn a_hand_run_upgrade_stands_down_while_the_master_switch_is_off() {
     assert!(err.contains("with the switch on"), "{err}");
     assert!(!lock.exists(), "a dry run takes no lock");
 
-    // POSITIVE CONTROL: the same scratch home with the switch on sweeps.
+    // Positive control: the same scratch home with the switch on sweeps.
     std::fs::write(&config, "[harness]\nenabled = true\n").expect("write config");
     let (ok, out, err) = go(&upgrade_cmd(false, false), &env);
     assert!(ok, "{out}{err}");
@@ -2058,18 +2561,16 @@ fn a_hand_run_upgrade_stands_down_while_the_master_switch_is_off() {
     assert!(lock.exists(), "a sweep that ran takes the lock");
 }
 
-/// A refused `upgrade` NAMES the restarts it strands. An earlier sweep that
-/// already sent SIGTERM left `<state>/upgrade/<session>.json` between the
-/// exit and the relaunch; with the switch off nothing carries it on — this
-/// sweep or the window's host — so the conversation stays stopped, and until
-/// review on 2026-09-24 the refusal did not say so. Only the restarts a sweep
-/// told this tab would resume are named, and a finished one never is.
+/// A refused `upgrade` names the restarts it strands: an earlier sweep's
+/// SIGTERM left `<state>/upgrade/<session>.json` between exit and relaunch,
+/// and with the switch off nothing carries it on. Only restarts a sweep told
+/// this tab would resume are named, never a finished one.
 #[test]
 fn a_refused_upgrade_names_the_restarts_it_leaves_in_flight() {
     const EXITING: &str = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
     const RELAUNCHED: &str = "1b32f22d-0000-4000-8000-000000000002";
     const DONE: &str = "b8d973ad-0000-4000-8000-000000000003";
-    let tmp = Tmp::new("upgrade-stranded");
+    let tmp = tmp_dir("upgrade-stranded");
     let env = env_at(&tmp);
     std::fs::create_dir_all(tmp.path().join("home/.claude/sessions")).expect("home");
     let config = env.config.clone().expect("config path");
@@ -2108,7 +2609,7 @@ fn a_refused_upgrade_names_the_restarts_it_leaves_in_flight() {
         "{err}"
     );
     assert!(!err.contains(RELAUNCHED), "{err}");
-    // NEGATIVE CONTROL: nothing in flight, nothing named.
+    // Negative control: nothing in flight, nothing named.
     std::fs::remove_file(dir.join(format!("{EXITING}.json"))).expect("rm");
     std::fs::remove_file(dir.join(format!("{RELAUNCHED}.json"))).expect("rm");
     let (_, _, err) = go_code(&upgrade_cmd(false, false), &env);
@@ -2116,14 +2617,12 @@ fn a_refused_upgrade_names_the_restarts_it_leaves_in_flight() {
     assert!(!err.contains("restart"), "{err}");
 }
 
-/// A one-shot `upgrade` whose sweep never RAN does not exit 0: it decided
-/// nothing about any session. The lock held by another actor — the
-/// window's own host, at a session's step — exits 75, atpkg's "try again
-/// later"; a state directory that cannot hold the lock exits 1. Measured
-/// before the fix: `step=busy:…` and exit 0 for all three.
+/// A one-shot `upgrade` whose sweep never ran does not exit 0: the lock held by
+/// another actor (the window's host) exits 75, atpkg's "try again later"; a
+/// state directory that cannot hold the lock exits 1.
 #[test]
 fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
-    let tmp = Tmp::new("upgrade-busy");
+    let tmp = tmp_dir("upgrade-busy");
     let env = env_at(&tmp);
     std::fs::create_dir_all(tmp.path().join("home/.claude/sessions")).expect("home");
     let dir = env.state.join("upgrade");
@@ -2134,6 +2633,10 @@ fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
         .write(true)
         .open(dir.join("sweep.lock"))
         .expect("lock file");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test's stand-in sweep: it lets go by unlock() before its drop"
+    )]
     held.try_lock().expect("the test holds the sweep lock");
     let (code, out, _) = go_code(&upgrade_cmd(false, false), &env);
     assert!(out.contains("step=busy:another-sweep"), "{out}");
@@ -2143,10 +2646,10 @@ fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
         "{out}"
     );
     assert_eq!(atpkg::lock::CONTENDED_EXIT, 75, "USAGE names the number");
-    // POSITIVE CONTROL: the lock released, the same sweep runs and exits 0.
-    // Released by `LOCK_UN`, as the sweep's own guard releases it — the sweep
-    // takes ONE try (`upgrade_drive::sweep_lock`), and a lock released by the
-    // close alone stays held while any test thread's child has yet to exec.
+    // Positive control: the lock released, the same sweep runs and exits 0.
+    // Released by `LOCK_UN` as the sweep's guard does: the sweep takes one try
+    // (`upgrade_drive::sweep_lock`), and a lock released only by close stays
+    // held while any test thread's child has yet to exec.
     held.unlock().expect("the test releases the sweep lock");
     drop(held);
     let (ok, out, err) = go(&upgrade_cmd(false, false), &env);
@@ -2171,13 +2674,12 @@ fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
 // ledger
 // ---------------------------------------------------------------------------
 
-/// `ledger` reads the ENGINE's approval ledger — the file the supervisor's
-/// approval loop writes — for one session, newest last. NEGATIVE CONTROLS:
-/// another session's rows never appear, and a session with no ledger says so
-/// rather than printing nothing.
+/// `ledger` reads the engine's approval ledger (written by the supervisor's
+/// approval loop) for one session, newest last. Negative controls: another
+/// session's rows never appear, and a session with no ledger says so.
 #[test]
 fn the_ledger_verb_reads_the_supervisors_approval_ledger() {
-    let tmp = Tmp::new("ledger");
+    let tmp = tmp_dir("ledger");
     let env = env_at(&tmp);
     let root = env.aterm_state.clone().expect("injected");
     let mut warn = Vec::new();
@@ -2234,7 +2736,7 @@ fn the_ledger_verb_reads_the_supervisors_approval_ledger() {
 /// rows rather than an error.
 #[test]
 fn a_ledger_tail_keeps_only_the_newest_rows() {
-    let tmp = Tmp::new("tail");
+    let tmp = tmp_dir("tail");
     let path = tmp.path().join("l.jsonl");
     assert!(tail_lines(&path, 5).expect("missing is empty").is_empty());
     let body: String = (0..10_000).map(|i| format!("{{\"n\":{i}}}\n\n")).collect();
@@ -2249,13 +2751,11 @@ fn a_ledger_tail_keeps_only_the_newest_rows() {
 }
 
 // ---------------------------------------------------------------------------
-// the live upgrade: the owner's view and word
+// The live upgrade: the owner's view and word
 // ---------------------------------------------------------------------------
 
-/// The owner's grammar (gap audit 2026-09-24): `ledger upgrade`, `upgrade
-/// [<sid>] --status`, `upgrade <sid> --now|--defer <dur>|--skip`. Before that
-/// day `ledger upgrade` answered `ledger takes disk, an @<sid> and a row
-/// count, not "upgrade"` and there was no word to say at all.
+/// The owner's grammar: `ledger upgrade`, `upgrade [<sid>] --status`,
+/// `upgrade <sid> --now|--defer <dur>|--skip`.
 #[test]
 fn the_owners_upgrade_grammar_parses_and_refuses_what_it_cannot_mean() {
     let cases = [
@@ -2329,7 +2829,7 @@ fn the_owners_upgrade_grammar_parses_and_refuses_what_it_cannot_mean() {
     ] {
         assert!(parse(&words(line)).is_err(), "{line} should be refused");
     }
-    // NEGATIVE CONTROL: the sweep's own grammar is untouched.
+    // Negative control: the sweep's own grammar is untouched.
     assert!(matches!(
         parse(&words("upgrade s-abc --dry-run"))
             .expect("the sweep")
@@ -2382,17 +2882,33 @@ fn live_holder(
     tab: &str,
     version: &str,
 ) -> std::process::Child {
-    let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
-        .args(["harness::upgrade_drive::tests::park_when_asked", "--exact"])
-        .env("UPGRADE_DRIVE_TEST_PARK", "1")
-        .env("ATERM_PARENT_SESSION_ID", tab)
+    live_holder_in(home, session, Some(tab), version)
+}
+
+/// [`live_holder`] in `tab`, or — `None` — in no aterm tab at all: no tab in
+/// its environment, as a conversation resumed in another terminal app runs.
+#[cfg(unix)]
+fn live_holder_in(
+    home: &std::path::Path,
+    session: &str,
+    tab: Option<&str>,
+    version: &str,
+) -> std::process::Child {
+    let mut park = std::process::Command::new(std::env::current_exe().expect("exe"));
+    park.args(["harness::upgrade_drive::tests::park_when_asked", "--exact"])
+        .env("UPGRADE_DRIVE_TEST_PARK", "1");
+    match tab {
+        Some(tab) => park.env("ATERM_PARENT_SESSION_ID", tab),
+        None => park.env_remove("ATERM_PARENT_SESSION_ID"),
+    };
+    let mut child = park
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("the stand-in agent");
     let pid = child.id();
-    let started = (0..500).any(|_| {
+    let started = (0..3_000).any(|_| {
         let read = atpkg::caller_shell::process_args(pid)
             .is_some_and(|a| a.env_var("UPGRADE_DRIVE_TEST_PARK").is_some());
         if !read {
@@ -2431,12 +2947,10 @@ fn live_holder(
     child
 }
 
-/// A GIVE-UP ROW IN THE LEDGER VIEW NAMES WHAT HELD IT (the review of
-/// 2026-09-27): `ledger upgrade` cuts each row's detail at 200 bytes, and the
-/// give-up's own words ran past that before the list of what still ran under
-/// the agent — the one thing that row is for — so the view showed none of
-/// it: not the widowed `tail -f`, and not the `grep -m1` that made it a wait
-/// that can never end. NEGATIVE CONTROL: any other row is still cut.
+/// A give-up row in `ledger upgrade` shows what held it: other rows are cut at
+/// 200 bytes, but a give-up's list of what still ran under the agent (the
+/// widowed `tail -f`, the `grep -m1` waiting forever) is the point of the row.
+/// Negative control: any other row is still cut.
 #[test]
 fn a_give_up_row_in_the_ledger_view_names_what_held_it() {
     let held = [super::super::upgrade::Held {
@@ -2447,8 +2961,11 @@ fn a_give_up_row_in_the_ledger_view_names_what_held_it() {
                   -m1 -F 'agentId' > /dev/null; echo \"closer finished\""
             .to_string(),
     }];
-    let detail =
-        super::super::upgrade_drive::gave_up_words(super::super::upgrade::Agent::Claude, &held);
+    let detail = super::super::upgrade_drive::gave_up_words(
+        super::super::upgrade::Agent::Claude,
+        &held,
+        false,
+    );
     let row = |step: &str| {
         let mut o = Map::new();
         o.insert("t".into(), Value::from(1_790_000_000_u64));
@@ -2473,22 +2990,17 @@ fn a_give_up_row_in_the_ledger_view_names_what_held_it() {
     );
     // The round's rest before the next asks is said whole too.
     assert!(line.contains("a new round asks again in 2h"), "{line}");
-    // NEGATIVE CONTROL: another row's detail is cut as it was.
+    // Negative control: another row's detail is still cut.
     let other = row("drain-expired:box");
     assert!(!other.contains("grep -m1"), "{other}");
 }
 
-/// THE WORST GIVE-UP ROW FITS ITS CUT WHOLE ([`GAVE_UP_DETAIL_BYTES`], whose
-/// const assertion counts on the give-up's own words staying under 512
-/// bytes): more processes than are named, each with a longest name and a
-/// longest command of four-byte characters, and the count of the rest still
-/// ends the row.
+/// The worst give-up row fits its cut whole ([`GAVE_UP_DETAIL_BYTES`]): more
+/// processes than are named, each with a longest name and command of four-byte
+/// characters, and the count of the rest still ends the row.
 #[test]
 fn the_worst_give_up_row_fits_its_cut_whole() {
     use super::super::upgrade::{HELD_COMMAND_CHARS, HELD_NAMED, Held};
-    let lead =
-        super::super::upgrade_drive::gave_up_words(super::super::upgrade::Agent::Claude, &[]);
-    assert!(lead.len() < 512, "{} bytes: {lead}", lead.len());
     let held: Vec<Held> = (0..HELD_NAMED + 2)
         .map(|i| Held {
             pid: u32::MAX - u32::try_from(i).expect("small"),
@@ -2497,32 +3009,43 @@ fn the_worst_give_up_row_fits_its_cut_whole() {
             command: "𝔷".repeat(HELD_COMMAND_CHARS * 2),
         })
         .collect();
-    let detail =
-        super::super::upgrade_drive::gave_up_words(super::super::upgrade::Agent::Claude, &held);
-    assert!(
-        detail.len() <= GAVE_UP_DETAIL_BYTES,
-        "{} bytes",
-        detail.len()
-    );
-    assert_eq!(
-        super::super::one_line(&detail, GAVE_UP_DETAIL_BYTES),
-        detail
-    );
-    assert!(detail.ends_with("; and 2 more"), "{detail}");
+    // Both flows' words (round eight, #4: the quiet flow's give-up says
+    // what comes next in its own, longer words).
+    for quiet in [false, true] {
+        let lead = super::super::upgrade_drive::gave_up_words(
+            super::super::upgrade::Agent::Claude,
+            &[],
+            quiet,
+        );
+        assert!(lead.len() < 512, "{quiet}: {} bytes: {lead}", lead.len());
+        let detail = super::super::upgrade_drive::gave_up_words(
+            super::super::upgrade::Agent::Claude,
+            &held,
+            quiet,
+        );
+        assert!(
+            detail.len() <= GAVE_UP_DETAIL_BYTES,
+            "{quiet}: {} bytes",
+            detail.len()
+        );
+        assert_eq!(
+            super::super::one_line(&detail, GAVE_UP_DETAIL_BYTES),
+            detail
+        );
+        assert!(detail.ends_with("; and 2 more"), "{quiet}: {detail}");
+    }
 }
 
-/// `upgrade --status` PRINTS WHAT THE SWEEP RECORDED — how long behind, what
-/// it waits on, the owner's word, whether it is stalled — sweeping nothing:
-/// no lock is taken — for each upgrade a live Claude Code still holds behind
-/// its target in its tab. The owner's word then lands under the lock and
-/// shows in the next `--status`, with its ledger line in `ledger upgrade`.
-/// NEGATIVE CONTROLS: the same recorded upgrade with NO live holder (review
-/// of 2026-09-25: a state file outlives its conversation) is not listed; a
+/// `upgrade --status` prints what the sweep recorded (how long behind, what it
+/// waits on, the owner's word, whether stalled) for each upgrade a live Claude
+/// Code still holds behind its target, taking no lock. The owner's word lands
+/// under the lock and shows in the next `--status` and in `ledger upgrade`.
+/// Negative controls: a recorded upgrade with no live holder is not listed; a
 /// tab with nothing recorded is refused (exit 1), writing nothing.
 #[cfg(unix)]
 #[test]
 fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
-    let tmp = Tmp::new("upgrade-owner");
+    let tmp = tmp_dir("upgrade-owner");
     let env = env_at(&tmp);
     let tab = "s-b5cf2faabac5ce5127bd";
     record_upgrade(&env, "03396a15", tab, "");
@@ -2534,7 +3057,7 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
     let (ok, out, err) = go(&status(""), &env);
     assert!(ok, "{out}{err}");
     assert_eq!(
-        out, "no upgrade is recorded\n",
+        out, "no session waits for an upgrade\n",
         "no live holder: nothing to show"
     );
     assert!(err.is_empty(), "no sessions at all is a verdict: {err}");
@@ -2547,7 +3070,9 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
         format!(
             "upgrade tab={tab} session=03396a15 from=2.1.281 to=2.1.282(managed) phase=pending \
              pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- \
-             stalled=overdue held_by=- release=- rung=land looked=- by=- point=- guard=- watch_at=due\n"
+             stalled=overdue held_by=- release=- rung=land looked=- by=- point=- guard=- watch_at=due \
+             cause=own-work told=no-progress\n  Claude Code 2.1.281 → 2.1.282: held by its own \
+             work\n"
         )
     );
     assert!(
@@ -2557,7 +3082,7 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
     let (ok, out, _) = go(&status("s-0000"), &env);
     assert!(ok);
     assert!(
-        out.starts_with("no upgrade is recorded for tab s-0000"),
+        out.starts_with("no session waits for an upgrade in tab s-0000"),
         "{out}"
     );
 
@@ -2605,16 +3130,212 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
     let _ = agent.wait();
 }
 
-/// THE OWNER'S WORD SAYS WHICH SWITCH IT WAITS ON (review of 2026-09-25): the
-/// window takes upgrade steps only while BOTH `[harness] enabled` and
-/// `[harness] upgrade` read on (the one `[harness]` reader), and the word only
-/// noted the first — under `upgrade = false` it printed `request=now`, exited
-/// 0 and said nothing, while nothing in the window would ever read it. Each
-/// switch off is named, the word is written either way. NEGATIVE CONTROL: both
-/// on, nothing is said.
+/// A record no look has read shows `stalled=unwatched` and `told=unwatched` in
+/// `--status` once the Mac has been awake past the wake grace. With `[harness]
+/// enabled` or `upgrade` off no window watches anything, and stderr names the
+/// switch as the reason. Negative controls: both switches on, nothing else is
+/// said; within the wake grace the record shows its last look; with no
+/// `unwatched` row no switch is named (owner, 2026-09-29).
+#[cfg(unix)]
+#[test]
+fn an_unwatched_upgrade_says_so_and_a_switch_off_says_why() {
+    use crate::harness::upgrade_drive::pin_awake_since;
+    let tmp = tmp_dir("upgrade-unwatched");
+    let env = env_at(&tmp);
+    let tab = "s-b5cf2faabac5ce5127bd";
+    let config = env.config.clone().expect("config path");
+    record_upgrade(&env, "03396a15", tab, "");
+    let home = env.home.clone().expect("home");
+    let mut agent = live_holder(&home, "03396a15", tab, "2.1.281");
+    let status = Cmd::UpgradeOwner {
+        sid: String::new(),
+        ask: OwnerAsk::Status,
+        json: false,
+    };
+    let now = u64::try_from(env.now).expect("now");
+    pin_awake_since(now - 86_400);
+    for (toml, says) in [
+        ("[harness]\nenabled = true\nupgrade = true\n", None),
+        (
+            "[harness]\nupgrade = false\n",
+            Some("`[harness] upgrade` reads off"),
+        ),
+        (
+            "[harness]\nenabled = false\n",
+            Some("`[harness] enabled` reads off"),
+        ),
+    ] {
+        std::fs::write(&config, toml).expect("write config");
+        let (ok, out, err) = go(&status, &env);
+        assert!(ok, "{toml}: {out}{err}");
+        assert!(out.contains(" stalled=unwatched "), "{toml}: {out}");
+        assert!(out.contains(" told=unwatched"), "{toml}: {out}");
+        match says {
+            None => assert!(!err.contains("reads off"), "{toml}: {err}"),
+            Some(words) => {
+                assert!(err.contains(words), "{toml}: {err}");
+                assert!(err.contains("not a fault"), "{toml}: {err}");
+            }
+        }
+    }
+    // Woken a minute ago: inside the grace, the record's last look stands.
+    pin_awake_since(now - 60);
+    let (_, out, err) = go(&status, &env);
+    assert!(out.contains(" stalled=overdue "), "{out}");
+    assert!(
+        !err.contains("reads off"),
+        "no unwatched row, no switch named: {err}"
+    );
+    pin_awake_since(0);
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+/// A tab held by another supervisor's claim reads so in `--status` (from the
+/// instance's `sessions` `supervisor=`), not `stalled=unwatched`. Negative
+/// controls: with `[harness] enabled` or `upgrade` off the instance is not
+/// asked, and `unwatched` with the switch's note stands; with no instance
+/// answering, see `an_unwatched_upgrade_says_so_and_a_switch_off_says_why`.
+#[cfg(unix)]
+#[test]
+fn a_tab_another_supervisor_claims_reads_so_unless_a_switch_is_off() {
+    use crate::harness::upgrade_drive::pin_awake_since;
+    use std::io::BufRead as _;
+    let tmp = tmp_dir("upgrade-claimed");
+    let tab = "s-b5cf2faabac5ce5127bd";
+    // A unix-socket path must fit in 103 bytes: the instance's is under /tmp.
+    let short = aterm_tempfile::Builder::new()
+        .prefix("at-")
+        .tempdir_in("/tmp")
+        .expect("socket dir");
+    let sock = short.path().join("a.sock").to_string_lossy().into_owned();
+    let token = aterm_uds::latest::token_path_for_sock(&sock).expect("token path");
+    std::fs::write(token, "0badf00d\n").expect("token");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = std::sync::Arc::clone(&asked);
+    // The instance: its one tab claimed by an external loop. Its accept loop
+    // ends with the test process.
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { break };
+            let Ok(mut out) = conn.try_clone() else {
+                continue;
+            };
+            for line in std::io::BufReader::new(conn).lines().skip(1) {
+                let Ok(line) = line else { break };
+                let reply = if line == "sessions" {
+                    format!("OK 1\n1 {tab} - live claude supervisor=aterm-supervise:42 upgrade=-")
+                } else {
+                    "ERR usage".to_string()
+                };
+                log.lock().expect("log").push(line);
+                if writeln!(out, "{reply}").is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let env = Env {
+        sock: Some(sock),
+        ..env_at(&tmp)
+    };
+    let config = env.config.clone().expect("config path");
+    record_upgrade(&env, "03396a15", tab, "");
+    let mut agent = live_holder(&env.home.clone().expect("home"), "03396a15", tab, "2.1.281");
+    let status = Cmd::UpgradeOwner {
+        sid: String::new(),
+        ask: OwnerAsk::Status,
+        json: false,
+    };
+    let now = u64::try_from(env.now).expect("now");
+    pin_awake_since(now - 86_400);
+    std::fs::write(&config, "[harness]\nenabled = true\nupgrade = true\n").expect("config");
+    let (ok, out, err) = go(&status, &env);
+    assert!(ok, "{out}{err}");
+    for field in [
+        " wait=claimed wait_for=- ",
+        " stalled=overdue ",
+        " cause=person ",
+    ] {
+        assert!(out.contains(field), "{field}: {out}");
+    }
+    assert!(!err.contains("reads off"), "{err}");
+    assert_eq!(*asked.lock().expect("asked"), vec!["sessions"]);
+    for (toml, switch) in [
+        (
+            "[harness]\nupgrade = false\n",
+            "`[harness] upgrade` reads off",
+        ),
+        (
+            "[harness]\nenabled = false\n",
+            "`[harness] enabled` reads off",
+        ),
+    ] {
+        std::fs::write(&config, toml).expect("config");
+        let (ok, out, err) = go(&status, &env);
+        assert!(ok, "{toml}: {out}{err}");
+        assert!(out.contains(" stalled=unwatched "), "{toml}: {out}");
+        assert!(err.contains(switch), "{toml}: {err}");
+        assert_eq!(
+            asked.lock().expect("asked").len(),
+            1,
+            "{toml}: asked nothing"
+        );
+    }
+    pin_awake_since(0);
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+/// A conversation resumed outside aterm (`claude --resume` in another terminal)
+/// is never `unwatched`: its holder is in no tab, so no aterm host will look at
+/// it, and blaming aterm would be wrong. The row shows its own stall
+/// (`overdue`). Negative control: the same record held in its tab is
+/// `unwatched` after a day awake.
+#[cfg(unix)]
+#[test]
+fn a_conversation_resumed_outside_aterm_is_never_told_unwatched() {
+    use crate::harness::upgrade_drive::pin_awake_since;
+    let tmp = tmp_dir("upgrade-outside");
+    let env = env_at(&tmp);
+    let tab = "s-b5cf2faabac5ce5127bd";
+    let config = env.config.clone().expect("config path");
+    std::fs::write(&config, "[harness]\nenabled = true\nupgrade = true\n").expect("config");
+    record_upgrade(&env, "03396a15", tab, "");
+    let home = env.home.clone().expect("home");
+    let status = Cmd::UpgradeOwner {
+        sid: String::new(),
+        ask: OwnerAsk::Status,
+        json: false,
+    };
+    let now = u64::try_from(env.now).expect("now");
+    pin_awake_since(now - 86_400);
+    let mut outside = live_holder_in(&home, "03396a15", None, "2.1.281");
+    let (ok, out, err) = go(&status, &env);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains(&format!("upgrade tab={tab} ")), "shown: {out}");
+    assert!(!out.contains("unwatched"), "no host watches it: {out}");
+    assert!(out.contains(" stalled=overdue "), "its own stall: {out}");
+    let _ = outside.kill();
+    let _ = outside.wait();
+    // Negative control: held in its tab, a host's to watch.
+    let mut inside = live_holder(&home, "03396a15", tab, "2.1.281");
+    let (ok, out, err) = go(&status, &env);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains(" stalled=unwatched "), "{out}");
+    pin_awake_since(0);
+    let _ = inside.kill();
+    let _ = inside.wait();
+}
+
+/// The owner's word names which switch it waits on: the window takes upgrade
+/// steps only while both `[harness] enabled` and `[harness] upgrade` read on.
+/// Each switch that is off is named; the word is written either way. Negative
+/// control: both on, nothing is said.
 #[test]
 fn an_owners_word_names_the_switch_that_keeps_the_window_off() {
-    let tmp = Tmp::new("upgrade-owner-switch");
+    let tmp = tmp_dir("upgrade-owner-switch");
     let env = env_at(&tmp);
     let tab = "s-b5cf2faabac5ce5127bd";
     let config = env.config.clone().expect("config path");
@@ -2656,7 +3377,7 @@ fn an_owners_word_names_the_switch_that_keeps_the_window_off() {
 /// code — and writes nothing.
 #[test]
 fn an_owners_word_kept_out_by_a_sweep_exits_75_and_writes_nothing() {
-    let tmp = Tmp::new("upgrade-owner-busy");
+    let tmp = tmp_dir("upgrade-owner-busy");
     let env = env_at(&tmp);
     let tab = "s-b5cf2faabac5ce5127bd";
     record_upgrade(&env, "03396a15", tab, "");
@@ -2667,6 +3388,10 @@ fn an_owners_word_kept_out_by_a_sweep_exits_75_and_writes_nothing() {
         .write(true)
         .open(env.state.join("upgrade/sweep.lock"))
         .expect("lock file");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test's stand-in sweep: it lets go by unlock() before its drop"
+    )]
     held.try_lock().expect("the test holds the sweep lock");
     let (code, _, err) = go_code(
         &Cmd::UpgradeOwner {
@@ -2727,9 +3452,8 @@ fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
     );
     assert!(lines[2].contains(r#""wait_for_s":30000"#), "{}", lines[2]);
 
-    // A FINISHED upgrade is history, not "behind": a session that caught up
-    // reads `pending_for=-` (and `null`), never the age of an upgrade that
-    // landed long ago. Seen live 2026-09-27: `step=current pending_for=1d19h`.
+    // A finished upgrade is not "behind": a session that caught up reads
+    // `pending_for=-` (and `null`).
     let current = super::super::upgrade_drive::Report {
         step: "current".to_string(),
         ..report.clone()
@@ -2752,15 +3476,2386 @@ fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
     assert!(lines[1].contains(r#""pending_for_s":null"#), "{}", lines[1]);
 }
 
-/// `disk` reads the aterm.toml the window writes: `default_config_path` IS
-/// `aterm_types::dirs::aterm_config_path` over the live environment. It was a
-/// hand copy of the Unix arms, so on Windows it named `$HOME\.config\…`, or
-/// nothing, while the window wrote `%APPDATA%\aterm\aterm.toml` (review,
-/// 2026-09-27).
+/// `harness limits` says the
+/// time the supervisor will continue at. A weekly wall hit at 8 pm that says
+/// `resets 9am` resets tomorrow, 13 hours off — the print is the done row's
+/// clock — where the session window's rule (a five-hour window) put it 11
+/// hours in the past; a SESSION window's `9am` is still today's.
 #[test]
-fn default_config_path_is_the_window_config_path() {
+fn the_view_places_a_weekly_walls_bare_clock_after_its_print() {
+    use aterm_phase::prompt::fixtures::{composer, rows};
+    // 2026-09-28 20:00 PDT.
+    let now = 1_790_650_800;
+    let pdt = |z: &str| -> Option<i64> { (z == "America/Los_Angeles").then_some(-7 * 3600) };
+    let wall = |limit: &str, done: &str| {
+        let mut r = rows(&[
+            "⏺ Running the suite.",
+            &format!("  ⎿  {limit} · resets 9am (America/Los_Angeles)"),
+            "",
+            &format!("✻ Worked for 3m 2s · done {done}"),
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ bypass permissions on"));
+        r
+    };
+    let weekly = limits_view(
+        &wall("You've hit your weekly limit", "8:00 PM"),
+        now,
+        -7 * 3600,
+        &|z, _| pdt(z),
+    );
+    assert_eq!(weekly.resets_at, Some(now + 13 * 3600));
+    // A session window: the five-hour rule, today's, passed.
+    let session = limits_view(
+        &wall("You've hit your session limit", "8:00 PM"),
+        now,
+        -7 * 3600,
+        &|z, _| pdt(z),
+    );
+    assert_eq!(session.resets_at, Some(now - 11 * 3600));
+    // No done row: no evidence of the print — the session rule, as before.
+    let mut bare = wall("You've hit your weekly limit", "8:00 PM");
+    bare.retain(|r| !r.contains("done"));
     assert_eq!(
-        default_config_path(),
-        aterm_types::dirs::aterm_config_path()
+        limits_view(&bare, now, -7 * 3600, &|z, _| pdt(z)).resets_at,
+        Some(now - 11 * 3600)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// accounts (docs/DESIGN-claude-accounts-2026-10-01.md §4, §8)
+// ---------------------------------------------------------------------------
+
+/// An exit code as a test compares it.
+fn exit(code: u8) -> String {
+    format!("{:?}", ExitCode::from(code))
+}
+
+/// A scripted [`AccountsHost`]. `auth status` is answered by `status`, keyed
+/// by the login string it was handed; every call is recorded, so a test can
+/// say what was run and with which string. Nothing is spawned. Its clock
+/// reads `now`: 0, behind every [`Env::now`], until a test moves it. A login
+/// can be asked unless `unaskable` says why not. With `writes_home` a flow
+/// that starts writes `.claude.json` into the home it is handed, whatever it
+/// then exits, as the vendor's start does (MEASURED on 2.1.287).
+struct FakeHost<'a> {
+    tty: bool,
+    status: &'a dyn Fn(&str) -> Result<Captured, String>,
+    login: Result<i32, String>,
+    writes_home: bool,
+    now: i64,
+    unaskable: Option<String>,
+    asked: std::cell::RefCell<Vec<String>>,
+    logins: std::cell::RefCell<Vec<Option<String>>>,
+}
+
+impl<'a> FakeHost<'a> {
+    fn new(status: &'a dyn Fn(&str) -> Result<Captured, String>) -> FakeHost<'a> {
+        FakeHost {
+            tty: false,
+            status,
+            login: Ok(0),
+            writes_home: false,
+            now: 0,
+            unaskable: None,
+            asked: std::cell::RefCell::new(Vec::new()),
+            logins: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl AccountsHost for FakeHost<'_> {
+    fn stdin_is_terminal(&self) -> bool {
+        self.tty
+    }
+
+    fn auth_status(&self, login: &str) -> Result<Captured, String> {
+        self.asked.borrow_mut().push(login.to_string());
+        (self.status)(login)
+    }
+
+    fn unaskable(&self) -> Option<String> {
+        self.unaskable.clone()
+    }
+
+    fn login(&self, dir: Option<&str>) -> Result<i32, String> {
+        self.logins.borrow_mut().push(dir.map(str::to_string));
+        if self.writes_home
+            && self.login.is_ok()
+            && let Some(dir) = dir
+        {
+            std::fs::write(Path::new(dir).join(".claude.json"), "{}").expect("write");
+        }
+        self.login.clone()
+    }
+
+    fn now(&self) -> i64 {
+        self.now
+    }
+}
+
+/// The `auth status` of a verb that must run nothing.
+fn never_asked(login: &str) -> Result<Captured, String> {
+    panic!("this verb runs no `claude` (asked under {login:?})");
+}
+
+/// What `claude auth status --json` prints and exits with, MEASURED on
+/// 2.1.286 for the one key read here (design §1): `loggedIn: true` and exit
+/// 0, or `loggedIn: false` and exit 1.
+fn said(logged_in: bool) -> Result<Captured, String> {
+    Ok(Captured {
+        stdout: format!(r#"{{"loggedIn":{logged_in},"authMethod":"claude.ai"}}"#).into_bytes(),
+        code: Some(i32::from(!logged_in)),
+    })
+}
+
+/// Run one `accounts` form against `host`: `(exit, stdout, stderr)`.
+fn acc(form: AccountsCmd, env: &Env, host: &dyn AccountsHost) -> (String, String, String) {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_accounts(&form, env, host, &mut out, &mut err);
+    (
+        format!("{code:?}"),
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    )
+}
+
+/// One `accounts` form that runs no `claude`.
+fn acc_quiet(form: AccountsCmd, env: &Env) -> (String, String, String) {
+    acc(form, env, &FakeHost::new(&never_asked))
+}
+
+fn add(label: &str, class: Class) -> AccountsCmd {
+    AccountsCmd::Add {
+        label: label.to_string(),
+        class,
+    }
+}
+
+/// A LOGIN MADE in the login directory `dir`: the directory, and one file in
+/// it — what the vendor's flow leaves when it is run with the directory as
+/// its home. A directory that holds nothing is not enrolled
+/// ([`accounts::login_made`]).
+fn login_made_in(dir: impl AsRef<Path>) {
+    let dir = dir.as_ref();
+    std::fs::create_dir_all(dir).expect("mkdir");
+    std::fs::write(dir.join("a-login-file"), "{}").expect("write");
+}
+
+/// The design's own roster under `env`: `main` (this machine's login),
+/// `work-2` (dedicated, a login made in its directory) and `pool-a` (shared,
+/// its directory NOT made: not enrolled here). Answers the two directory
+/// strings.
+fn three_accounts(tmp: &Tmp, env: &Env) -> (String, String) {
+    let work = tmp.path().join("logins").join("work-2");
+    login_made_in(&work);
+    let work = work.to_str().expect("utf-8").to_string();
+    let pool = tmp.path().join("logins").join("pool-a");
+    let pool = pool.to_str().expect("utf-8").to_string();
+    let mut text = String::new();
+    for (label, class, dir) in [
+        ("main", Class::Dedicated, None),
+        ("work-2", Class::Dedicated, Some(work.as_str())),
+        ("pool-a", Class::Shared, Some(pool.as_str())),
+    ] {
+        text = accounts::append_row(&text, label, class, dir).expect("the row admits");
+    }
+    std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
+    (work, pool)
+}
+
+/// Every file under `dir`, read whole.
+fn every_file(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(every_file(&path));
+        } else {
+            let bytes = std::fs::read(&path).expect("read");
+            found.push((path, bytes));
+        }
+    }
+    found
+}
+
+/// The roster is `accounts.toml` in the directory of the config file, and
+/// the store is `<state>/accounts`. With no config path there is no roster:
+/// the report says so and exits 1 rather than read some other place.
+#[test]
+fn the_roster_lives_beside_the_config_file_and_the_store_under_the_state() {
+    let tmp = tmp_dir("accounts-paths");
+    let mut env = env_at(&tmp);
+    assert_eq!(
+        env.accounts_roster(),
+        Some(tmp.path().join("accounts.toml"))
+    );
+    assert_eq!(env.accounts_store().dir, env.state.join("accounts"));
+    env.config = None;
+    assert_eq!(env.accounts_roster(), None);
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(1));
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("no config directory is known"), "{err}");
+}
+
+/// THE PACKAGED STATE: no roster. The report says no account is listed,
+/// names the file it read and the one line that lists one — and writes
+/// nothing: no state directory, no roster file. `check` says the same and
+/// runs nothing.
+#[test]
+fn with_no_roster_the_report_names_the_file_and_the_add_line_and_writes_nothing() {
+    let tmp = tmp_dir("accounts-none");
+    let env = env_at(&tmp);
+    let roster = env.accounts_roster().expect("a config dir");
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(out.starts_with("no accounts listed\n"), "{out}");
+    assert!(
+        out.contains(&format!("roster: {} (no such file)", roster.display())),
+        "{out}"
+    );
+    assert!(out.contains("aterm harness accounts add <label>"), "{out}");
+    assert!(err.is_empty(), "{err}");
+
+    let (code, out, _) = acc_quiet(AccountsCmd::Check, &env);
+    assert_eq!(code, exit(0));
+    assert!(out.starts_with("no accounts listed\n"), "{out}");
+
+    // A file with no rows is the same roster, and is said to exist.
+    std::fs::write(&roster, "# nothing listed yet\n").expect("write");
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(out.contains("(no rows)"), "{out}");
+
+    // The JSON form of the same: a document with no accounts, not a refusal.
+    let (code, out, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    assert_eq!(code, exit(0));
+    let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+    assert_eq!(doc.get("refused"), Some(&Value::Null));
+    assert_eq!(
+        doc.get("accounts").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+
+    assert!(!env.state.exists(), "the report made no state directory");
+}
+
+/// A ROSTER THAT DOES NOT ADMIT is refused whole, by name, exit 1 — by the
+/// report (text and JSON, whose `refused` carries the reason), and by every
+/// verb that would act on it, none of which writes anything or runs
+/// anything. Negative control: the same file with the bad row fixed is read
+/// and exits 0.
+#[test]
+fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
+    let tmp = tmp_dir("accounts-refused");
+    let env = env_at(&tmp);
+    let roster = env.accounts_roster().expect("a config dir");
+    let bad = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+               [[account]]\nlabel = \"main\"\nclass = \"shared\"\ndir = \"/logins/x\"\n";
+    std::fs::write(&roster, bad).expect("write");
+
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(1));
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("REFUSED"), "{err}");
+    assert!(err.contains("label `main` is listed twice"), "{err}");
+    assert!(err.contains(&roster.display().to_string()), "{err}");
+
+    let (code, out, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    assert_eq!(code, exit(1));
+    let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+    assert!(
+        doc.get("refused")
+            .and_then(Value::as_str)
+            .is_some_and(|why| why.contains("listed twice")),
+        "{out}"
+    );
+    assert_eq!(doc.get("kind").and_then(Value::as_str), Some("accounts"));
+
+    for form in [
+        AccountsCmd::Check,
+        AccountsCmd::Login {
+            label: "main".to_string(),
+        },
+        AccountsCmd::Use {
+            label: "main".to_string(),
+        },
+        add("work-2", Class::Dedicated),
+    ] {
+        let (code, out, err) = acc_quiet(form.clone(), &env);
+        assert_eq!(code, exit(1), "{form:?}");
+        assert!(out.is_empty(), "{form:?}: {out}");
+        assert!(err.contains("REFUSED"), "{form:?}: {err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&roster).expect("read"),
+        bad,
+        "a refused roster is never rewritten"
+    );
+    assert!(
+        !env.accounts_store().state_file().exists(),
+        "nothing was recorded"
+    );
+
+    // NEGATIVE CONTROL: the second row renamed, the file admits.
+    std::fs::write(
+        &roster,
+        bad.replacen(
+            "\"main\"\nclass = \"shared\"",
+            "\"pool-a\"\nclass = \"shared\"",
+            1,
+        ),
+    )
+    .expect("write");
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(out.contains("pool-a"), "{out}");
+}
+
+/// `accounts add`: the FIRST add on a machine with no roster lists this
+/// machine's own login as `main` (dedicated, no dir) before the new row and
+/// says so; the row's dir is the login directory it made, 0700; the line to
+/// run next is printed. A second add appends one row and no second `main`;
+/// `--shared` is the class. The file it writes is one the reader admits.
+#[test]
+fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
+    let tmp = tmp_dir("accounts-add");
+    let env = env_at(&tmp);
+    let roster = env.accounts_roster().expect("a config dir");
+    let store = env.accounts_store();
+
+    let (code, out, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(0), "{err}");
+    let dir = store.login_dir("work-2").expect("a label");
+    assert!(out.contains("listed `main` (dedicated)"), "{out}");
+    assert!(out.contains("this machine's own login"), "{out}");
+    assert!(out.contains("listed `work-2` (dedicated)"), "{out}");
+    assert!(out.contains(&dir.display().to_string()), "{out}");
+    assert_eq!(
+        out.lines().last(),
+        Some("run: aterm harness accounts login work-2"),
+        "{out}"
+    );
+    assert!(err.is_empty(), "{err}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| std::fs::metadata(p).expect("made").permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "the login directory is private");
+        assert_eq!(mode(&store.logins_dir()), 0o700);
+        assert_eq!(mode(&roster), 0o600, "and so is the roster it wrote");
+    }
+    assert_eq!(std::fs::read_dir(&dir).expect("read").count(), 0, "empty");
+    let read = Roster::load(&roster).expect("what add wrote admits");
+    assert_eq!(
+        read.rows,
+        vec![
+            accounts::Row {
+                label: "main".to_string(),
+                class: Class::Dedicated,
+                dir: None,
+            },
+            accounts::Row {
+                label: "work-2".to_string(),
+                class: Class::Dedicated,
+                dir: Some(dir.to_str().expect("utf-8").to_string()),
+            },
+        ]
+    );
+
+    let (code, out, err) = acc_quiet(add("pool-a", Class::Shared), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(!out.contains("`main`"), "the roster had rows: {out}");
+    assert!(out.contains("listed `pool-a` (shared)"), "{out}");
+    let read = Roster::load(&roster).expect("still admits");
+    assert_eq!(
+        read.rows
+            .iter()
+            .map(|r| r.label.as_str())
+            .collect::<Vec<_>>(),
+        ["main", "work-2", "pool-a"]
+    );
+    assert_eq!(read.row("pool-a").map(|r| r.class), Some(Class::Shared));
+
+    // The report now lists all three — and the two new ones NOT ENROLLED:
+    // `add` made their directories and nobody has signed in under them.
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(out.contains("active: none chosen yet"), "{out}");
+    let row = |out: &str, label: &str| {
+        out.lines()
+            .find(|l| l.starts_with(label))
+            .unwrap_or_else(|| panic!("{label}: {out}"))
+            .to_string()
+    };
+    assert!(row(&out, "main").contains("  unseen  "), "{out}");
+    for label in ["work-2", "pool-a"] {
+        assert!(row(&out, label).contains("  not-enrolled  "), "{out}");
+    }
+}
+
+/// A ROW JUST ADDED IS LISTED, NOT SIGNED IN (the live check of 2026-10-02:
+/// `accounts add` makes the login directory, the report read the row
+/// `unseen` and named it `next:` with no login behind it). With its
+/// directory empty the row is `not-enrolled` in the report and its JSON, is
+/// never `next:`, and its reason names the line that signs it in; `accounts
+/// check` runs nothing for it; `accounts use` refuses it with that same
+/// line; and `accounts login` STILL RUNS on it — it is what fills the
+/// directory — but a flow that exits 0 and leaves nothing there made no
+/// login: the row is said `not enrolled`, exit 1, with nothing asked. Once
+/// the flow has written there the row is `unseen`, the report's `next:`, and
+/// `check` asks it.
+///
+/// NEGATIVE CONTROL: `main`, the row with no directory, is enrolled through
+/// all of it — asked by `check`, never told to log in.
+#[test]
+fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
+    let tmp = tmp_dir("accounts-empty-dir");
+    let env = env_at(&tmp);
+    let (code, _, err) = acc_quiet(add("check-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(0), "{err}");
+    let dir = env.accounts_store().login_dir("check-2").expect("a label");
+    let dir_text = dir.to_str().expect("utf-8").to_string();
+    assert_eq!(std::fs::read_dir(&dir).expect("made").count(), 0, "empty");
+    let login_line = "aterm harness accounts login check-2";
+
+    // The report: not enrolled, never `next:`, and the remedy by name.
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(
+        out.contains("\ncheck-2  dedicated  not-enrolled  "),
+        "{out}"
+    );
+    assert!(
+        out.contains("\nnext: none (no other account can be run on)\n"),
+        "{out}"
+    );
+    assert!(!out.contains("next: check-2"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "not next: main: the account in use; check-2: not-enrolled (no login made yet: run \
+             `{login_line}`)\n"
+        )),
+        "{out}"
+    );
+    let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    let doc: Value = aterm_json::from_str(json.trim()).expect("json");
+    let next = doc.get("next").expect("next");
+    assert_eq!(next.get("to"), Some(&Value::Null), "{json}");
+    let not = next.get("not").and_then(Value::as_array).expect("not");
+    let word = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+    assert_eq!(
+        (word(&not[1], "label"), word(&not[1], "why")),
+        (
+            Some("check-2".to_string()),
+            Some("not-enrolled".to_string())
+        ),
+        "the word alone, for a reader that matches it: {json}"
+    );
+    let rows = doc
+        .get("accounts")
+        .and_then(Value::as_array)
+        .expect("accounts");
+    assert_eq!(rows[0].get("enrolled"), Some(&Value::from(true)), "main");
+    assert_eq!(rows[1].get("enrolled"), Some(&Value::from(false)), "{json}");
+    assert_eq!(word(&rows[1], "condition").as_deref(), Some("not-enrolled"));
+
+    // `check` runs nothing for it; `main` is asked.
+    let signed_in = |_: &str| said(true);
+    let host = FakeHost::new(&signed_in);
+    let (code, out, _) = acc(AccountsCmd::Check, &env, &host);
+    assert_eq!(code, exit(0));
+    assert_eq!(out, "main: signed in\ncheck-2: not enrolled\n");
+    assert_eq!(*host.asked.borrow(), vec![String::new()], "main alone");
+
+    // `use` refuses it, and says how it is signed in.
+    let (code, _, err) = acc_quiet(
+        AccountsCmd::Use {
+            label: "check-2".to_string(),
+        },
+        &env,
+    );
+    assert_eq!(code, exit(1));
+    assert!(err.contains("`check-2` is not-enrolled"), "{err}");
+    assert!(err.contains(login_line), "{err}");
+
+    // `login` still runs on it: the flow is what fills the directory. This
+    // one exits 0 and leaves nothing there, so there is no login to ask.
+    let mut tty = FakeHost::new(&never_asked);
+    tty.tty = true;
+    let (code, out, _) = acc(
+        AccountsCmd::Login {
+            label: "check-2".to_string(),
+        },
+        &env,
+        &tty,
+    );
+    assert_eq!(code, exit(1));
+    assert!(out.starts_with("CLAUDE_CONFIG_DIR="), "{out}");
+    assert!(out.ends_with("\ncheck-2: not enrolled\n"), "{out}");
+    assert_eq!(*tty.logins.borrow(), vec![Some(dir_text.clone())]);
+
+    // The flow wrote its home there: enrolled, unseen, and `next:`.
+    login_made_in(&dir);
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(out.contains("\ncheck-2  dedicated  unseen  "), "{out}");
+    assert!(out.contains("\nnext: check-2\n"), "{out}");
+    assert!(!out.contains(login_line), "{out}");
+    let host = FakeHost::new(&signed_in);
+    let (_, out, _) = acc(AccountsCmd::Check, &env, &host);
+    assert_eq!(out, "main: signed in\ncheck-2: signed in\n");
+    assert_eq!(*host.asked.borrow(), vec![String::new(), dir_text]);
+}
+
+/// NEGATIVE CONTROL for the first-add rule: a roster that already has a row
+/// — here one written by hand, with a dir — is not a new roster, and `add`
+/// lists no `main` into it.
+#[test]
+fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
+    let tmp = tmp_dir("accounts-add-existing");
+    let env = env_at(&tmp);
+    let roster = env.accounts_roster().expect("a config dir");
+    let hand = "# written by hand\n[[account]]\nlabel = \"pool-a\"\nclass = \"shared\"\ndir = \"/logins/pool-a\"\n";
+    std::fs::write(&roster, hand).expect("write");
+    let (code, out, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(!out.contains("main"), "{out}");
+    let text = std::fs::read_to_string(&roster).expect("read");
+    assert!(text.starts_with(hand), "what was there is kept: {text}");
+    assert_eq!(
+        Roster::load(&roster)
+            .expect("admits")
+            .rows
+            .iter()
+            .map(|r| r.label.clone())
+            .collect::<Vec<_>>(),
+        ["pool-a", "work-2"]
+    );
+}
+
+/// `accounts add` REFUSES, exit 1, by name, and leaves the roster as it was:
+/// a label already listed (the second add of one label), a label outside the
+/// grammar, `main` as the first label of a new roster, and a state directory
+/// that is not absolute (the row's dir would be relative).
+#[test]
+fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
+    let tmp = tmp_dir("accounts-add-refused");
+    let env = env_at(&tmp);
+    let roster = env.accounts_roster().expect("a config dir");
+
+    for label in ["Work", "-x", "a/b", "", "with space"] {
+        let (code, out, err) = acc_quiet(add(label, Class::Dedicated), &env);
+        assert_eq!(code, exit(1), "{label:?}");
+        assert!(out.is_empty(), "{label:?}: {out}");
+        assert!(err.contains("is not a label"), "{label:?}: {err}");
+        assert!(err.contains("is outside [a-z0-9]"), "{label:?}: {err}");
+    }
+    // `help` is in that grammar and is no label: this command's help word.
+    // (Typed, `accounts add help` is the help; the verb itself refuses it by
+    // name, for whoever calls it another way.)
+    let (code, out, err) = acc_quiet(add("help", Class::Dedicated), &env);
+    assert_eq!(code, exit(1));
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("`help` is not a label") && err.contains("help word"),
+        "{err}"
+    );
+    let (code, _, err) = acc_quiet(add("main", Class::Dedicated), &env);
+    assert_eq!(code, exit(1));
+    assert!(err.contains("this machine's own login"), "{err}");
+    assert!(!roster.exists(), "no refusal made a roster");
+    assert!(
+        !env.accounts_store().logins_dir().exists(),
+        "no refusal made a login directory"
+    );
+
+    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(0), "{err}");
+    let before = std::fs::read_to_string(&roster).expect("read");
+    let (code, out, err) = acc_quiet(add("work-2", Class::Shared), &env);
+    assert_eq!(code, exit(1));
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("`work-2` is already listed"), "{err}");
+    assert!(err.contains("aterm harness accounts login work-2"), "{err}");
+    // `main` is listed now, so it is refused as any listed label is.
+    let (code, _, err) = acc_quiet(add("main", Class::Dedicated), &env);
+    assert_eq!(code, exit(1));
+    assert!(err.contains("`main` is already listed"), "{err}");
+    assert_eq!(std::fs::read_to_string(&roster).expect("read"), before);
+
+    let mut relative = env_at(&tmp);
+    relative.state = PathBuf::from("relative-state");
+    let (code, _, err) = acc_quiet(add("pool-a", Class::Shared), &relative);
+    assert_eq!(code, exit(1));
+    assert!(err.contains("is relative"), "{err}");
+    assert_eq!(std::fs::read_to_string(&roster).expect("read"), before);
+    assert!(
+        !Path::new("relative-state").exists(),
+        "and it made nothing where the test happens to run"
+    );
+}
+
+/// `accounts login`: the line is `CLAUDE_CONFIG_DIR='<dir>' claude auth
+/// login` with the dir VERBATIM from the roster (a trailing slash and a quote
+/// survive, the quote escaped for the shell). With stdin not a terminal the
+/// line is printed and NOTHING is run, exit 0, and what is said to run is this
+/// verb at a terminal (it records; the printed line alone does not); at a
+/// terminal the flow is run under exactly that string. The row with no dir is
+/// this machine's own login: its line is `claude auth login`, and piped it
+/// runs nothing either. An unlisted label is refused by name.
+#[test]
+fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
+    let tmp = tmp_dir("accounts-login");
+    let env = env_at(&tmp);
+    let odd = format!("{}/it's here/", tmp.path().display());
+    let text = accounts::append_row("", "main", Class::Dedicated, None)
+        .and_then(|t| accounts::append_row(&t, "work-2", Class::Dedicated, Some(&odd)))
+        .expect("the rows admit");
+    std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
+    let login = |label: &str| AccountsCmd::Login {
+        label: label.to_string(),
+    };
+    let line = format!(
+        "CLAUDE_CONFIG_DIR='{}' claude auth login\n",
+        odd.replace('\'', r"'\''")
+    );
+
+    let piped = FakeHost::new(&never_asked);
+    let (code, out, err) = acc(login("work-2"), &env, &piped);
+    assert_eq!(code, exit(0));
+    assert_eq!(out, line);
+    assert!(err.contains("not run"), "{err}");
+    assert!(
+        err.contains("Run `aterm harness accounts login work-2` in a terminal"),
+        "{err}"
+    );
+    assert!(piped.logins.borrow().is_empty(), "nothing was run");
+    assert!(!Path::new(&odd).exists(), "and nothing was made");
+
+    // This flow exits 0 and leaves nothing in the directory, so there is no
+    // login to ask (the tests below ask one).
+    let mut tty = FakeHost::new(&never_asked);
+    tty.tty = true;
+    let (code, out, err) = acc(login("work-2"), &env, &tty);
+    assert_eq!(code, exit(1));
+    assert_eq!(out, format!("{line}work-2: not enrolled\n"));
+    assert!(
+        err.contains("exited 0 and left no login in `work-2`'s directory"),
+        "{err}"
+    );
+    assert_eq!(
+        *tty.logins.borrow(),
+        vec![Some(odd.clone())],
+        "the dir, verbatim"
+    );
+    assert!(
+        Path::new(&odd).is_dir(),
+        "the flow has a directory to write"
+    );
+
+    // A `claude` that cannot be started, and one that exits non-zero.
+    tty.login = Err("No such file or directory (os error 2)".to_string());
+    let (code, _, err) = acc(login("work-2"), &env, &tty);
+    assert_eq!(code, exit(1));
+    assert!(err.contains("`claude` could not be run"), "{err}");
+    tty.login = Ok(3);
+    let (code, _, err) = acc(login("work-2"), &env, &tty);
+    assert_eq!(code, exit(1));
+    assert!(err.contains("exited 3"), "{err}");
+
+    let before = tty.logins.borrow().len();
+    let (code, out, err) = acc(login("main"), &env, &piped);
+    assert_eq!(code, exit(0));
+    assert_eq!(out, "claude auth login\n");
+    assert!(err.contains("not run"), "{err}");
+    assert!(
+        err.contains("Run `aterm harness accounts login main` in a terminal"),
+        "{err}"
+    );
+    assert!(piped.logins.borrow().is_empty(), "nothing was run");
+    let (code, out, err) = acc(login("nobody"), &env, &tty);
+    assert_eq!(code, exit(1));
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("`nobody` is not in the roster"), "{err}");
+    assert_eq!(tty.logins.borrow().len(), before, "neither ran anything");
+}
+
+/// A FLOW THAT FAILS is said, exit 1. One that left nothing in the row's
+/// directory — a `claude` that could not be started, a flow that wrote
+/// nothing — asks NO login (this host's `auth status` panics) and records
+/// nothing, and the row with no `dir` is never asked after a failed flow.
+/// One that left its start-up files there, as the vendor's start does
+/// (MEASURED on 2.1.287), enrolled the row: that login is asked once under
+/// its own string and its `signed out` recorded, so the row is no longer
+/// `unseen` — not the report's `next:`, refused by `use`.
+///
+/// NEGATIVE CONTROL: the same failed flow over the empty directory `add`
+/// made asked nothing, and the row read `not-enrolled` until the flow wrote.
+#[test]
+fn a_flow_that_fails_asks_only_a_login_it_left_files_for() {
+    let tmp = tmp_dir("accounts-login-failed");
+    let env = env_at(&tmp);
+    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(0), "{err}");
+    let work = env.accounts_store().login_dir("work-2").expect("a label");
+    let work = work.to_str().expect("utf-8").to_string();
+    let login = |label: &str| AccountsCmd::Login {
+        label: label.to_string(),
+    };
+    let store = env.accounts_store();
+
+    let mut tty = FakeHost::new(&never_asked);
+    tty.tty = true;
+    for (flow, words) in [
+        (Ok(3), "`claude auth login` exited 3"),
+        (
+            Err("No such file or directory (os error 2)".to_string()),
+            "`claude` could not be run: No such file or directory (os error 2)",
+        ),
+    ] {
+        tty.login = flow;
+        for label in ["work-2", "main"] {
+            let (code, out, err) = acc(login(label), &env, &tty);
+            assert_eq!(code, exit(1), "{label}: {words}");
+            assert_eq!(out.lines().count(), 1, "the line, and no answer: {out}");
+            assert!(err.contains(words), "{label}: {err}");
+        }
+    }
+    assert_eq!(
+        *tty.logins.borrow(),
+        vec![Some(work.clone()), None, Some(work.clone()), None],
+        "each flow was run"
+    );
+    assert!(!store.state_file().exists(), "nothing was recorded");
+    assert!(!store.ledger_path().exists());
+    assert!(!store.wake_path().exists());
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(out.contains("\nwork-2  dedicated  not-enrolled  "), "{out}");
+
+    // A flow the terminal's Ctrl-C ended (130) after the start wrote.
+    let signed_out = |_: &str| said(false);
+    let mut tty = FakeHost::new(&signed_out);
+    tty.tty = true;
+    tty.writes_home = true;
+    tty.login = Ok(130);
+    let (code, out, err) = acc(login("work-2"), &env, &tty);
+    assert_eq!(code, exit(1), "{err}");
+    assert_eq!(
+        out,
+        format!("CLAUDE_CONFIG_DIR='{work}' claude auth login\nwork-2: signed out\n")
+    );
+    assert!(err.contains("`claude auth login` exited 130"), "{err}");
+    assert!(Path::new(&work).join(".claude.json").is_file(), "it wrote");
+    assert_eq!(*tty.asked.borrow(), vec![work.clone()], "that login, once");
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(state.account("work-2").auth, Auth::SignedOut);
+    let rows = store.tail(20).expect("ledger");
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.kind, r.account.as_str(), r.why.as_str()))
+            .collect::<Vec<_>>(),
+        [(accounts::Kind::Auth, "work-2", "signed-out")]
+    );
+    assert!(!store.wake_path().exists(), "nobody is woken");
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(out.contains("\nwork-2  dedicated  signed-out  "), "{out}");
+    assert!(!out.contains("next: work-2"), "{out}");
+    let (code, _, err) = acc_quiet(
+        AccountsCmd::Use {
+            label: "work-2".to_string(),
+        },
+        &env,
+    );
+    assert_eq!(code, exit(1));
+    assert!(err.contains("`work-2` is signed-out"), "{err}");
+
+    // The row with no dir, after the same failed flow: nothing asked.
+    let (code, out, _) = acc(login("main"), &env, &tty);
+    assert_eq!(code, exit(1));
+    assert_eq!(out, "claude auth login\n");
+    assert_eq!(tty.asked.borrow().len(), 1, "`main` was not asked");
+
+    // A failed flow whose login answers signed in all the same: recorded as
+    // it answered, and still exit 1 — the flow itself failed.
+    let signed_in = |_: &str| said(true);
+    let mut tty = FakeHost::new(&signed_in);
+    tty.tty = true;
+    tty.writes_home = true;
+    tty.login = Ok(130);
+    let (code, out, err) = acc(login("work-2"), &env, &tty);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(out.ends_with("\nwork-2: signed in\n"), "{out}");
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(state.account("work-2").auth, Auth::Ok);
+}
+
+/// The wake marker's file identity — what a waiting session's watcher wakes
+/// on — or `None` where there is no marker.
+#[cfg(unix)]
+fn wake_id(store: &accounts::Store) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(store.wake_path()).ok().map(|m| m.ino())
+}
+
+/// `accounts login` AT A TERMINAL WAITS FOR THE FLOW AND RECORDS WHAT THE
+/// LOGIN THEN ANSWERS: the flow exits 0, that ONE login is asked under its
+/// own string, its line is printed after the flow's, and a login that works
+/// is recorded — the state's word, a ledger `auth` row `ok`, the wake marker
+/// replaced — exit 0. The answer is stamped by the host's clock, read after
+/// the flow, where that is ahead of the command's own.
+///
+/// NEGATIVE CONTROL: before it the state said `signed-out` (a check found it
+/// so), and no other login was asked or recorded.
+#[test]
+fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
+    let tmp = tmp_dir("accounts-login-records");
+    let env = env_at(&tmp);
+    let (work, _) = three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let found_out = |login: &str| said(login != work);
+    acc(AccountsCmd::Check, &env, &FakeHost::new(&found_out));
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(state.account("work-2").auth, Auth::SignedOut);
+    assert_eq!(store.tail(20).expect("ledger").len(), 2);
+    #[cfg(unix)]
+    let woken = wake_id(&store);
+
+    let signed_in = |_: &str| said(true);
+    let mut tty = FakeHost::new(&signed_in);
+    tty.tty = true;
+    tty.now = env.now + 600;
+    let (code, out, err) = acc(
+        AccountsCmd::Login {
+            label: "work-2".to_string(),
+        },
+        &env,
+        &tty,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    assert_eq!(
+        out,
+        format!("CLAUDE_CONFIG_DIR='{work}' claude auth login\nwork-2: signed in\n")
+    );
+    assert_eq!(*tty.logins.borrow(), vec![Some(work.clone())]);
+    assert_eq!(*tty.asked.borrow(), vec![work], "that login, and no other");
+
+    let later = env.now + 600;
+    let (state, _) = store.load(later).expect("this build's state");
+    assert_eq!(state.account("work-2").auth, Auth::Ok);
+    assert_eq!(state.account("work-2").auth_at, Some(later));
+    assert_eq!(state.account("main").auth_at, Some(env.now), "not touched");
+    let rows = store.tail(20).expect("ledger");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        (
+            rows[2].kind,
+            rows[2].account.as_str(),
+            rows[2].why.as_str(),
+            rows[2].t
+        ),
+        (accounts::Kind::Auth, "work-2", "ok", later)
+    );
+    #[cfg(unix)]
+    assert_ne!(wake_id(&store), woken, "a login that works wakes");
+}
+
+/// A FLOW THAT EXITS 0 IS NOT A LOGIN THAT WORKS. One whose login then
+/// answers signed out is exit 1, and the state says so with a ledger row;
+/// one whose login could not be asked is exit 1 with its reason, nothing is
+/// recorded, and what asks it again with no browser is said. Neither replaces
+/// the wake marker: nothing became usable. The answer is never stamped behind
+/// the command's own clock: this host's reads 0, a clock set back.
+///
+/// NEGATIVE CONTROL: the same flow over a login that answers signed in is
+/// exit 0 and wakes (the test above), and the state here said `ok` first.
+#[test]
+fn a_flow_that_ends_signed_out_is_recorded_so_and_exits_1() {
+    let tmp = tmp_dir("accounts-login-signed-out");
+    let env = env_at(&tmp);
+    let (work, _) = three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let all_in = |_: &str| said(true);
+    acc(AccountsCmd::Check, &env, &FakeHost::new(&all_in));
+    let login = AccountsCmd::Login {
+        label: "work-2".to_string(),
+    };
+    #[cfg(unix)]
+    let woken = wake_id(&store);
+
+    let unasked =
+        |_: &str| -> Result<Captured, String> { Err("it ran past its 20000 ms deadline".into()) };
+    let mut tty = FakeHost::new(&unasked);
+    tty.tty = true;
+    let (code, out, err) = acc(login.clone(), &env, &tty);
+    assert_eq!(code, exit(1));
+    assert!(
+        out.ends_with("\nwork-2: could not run (it ran past its 20000 ms deadline)\n"),
+        "{out}"
+    );
+    assert!(
+        err.contains("nothing was recorded; `aterm harness accounts check` asks it again"),
+        "{err}"
+    );
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(state.account("work-2").auth, Auth::Ok, "nothing recorded");
+    assert_eq!(store.tail(20).expect("ledger").len(), 2);
+
+    let signed_out = |_: &str| said(false);
+    let mut tty = FakeHost::new(&signed_out);
+    tty.tty = true;
+    let (code, out, err) = acc(login, &env, &tty);
+    assert_eq!(code, exit(1), "{err}");
+    assert!(out.ends_with("\nwork-2: signed out\n"), "{out}");
+    assert!(
+        !err.contains("exited 0"),
+        "an answer that was recorded: {err}"
+    );
+    assert_eq!(*tty.asked.borrow(), vec![work]);
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(state.account("work-2").auth, Auth::SignedOut);
+    assert_eq!(state.account("main").auth, Auth::Ok);
+    let rows = store.tail(20).expect("ledger");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        (
+            rows[2].kind,
+            rows[2].account.as_str(),
+            rows[2].why.as_str(),
+            rows[2].t
+        ),
+        (accounts::Kind::Auth, "work-2", "signed-out", env.now)
+    );
+    assert_eq!(state.account("work-2").auth_at, Some(env.now));
+    #[cfg(unix)]
+    assert_eq!(wake_id(&store), woken, "nobody is woken");
+}
+
+/// AN ANSWER THAT CANNOT BE RECORDED IS SAID, EXIT 1: the login answers
+/// signed in, but the state file is another build's (a schema this one does
+/// not read), which no transaction saves over. The answer's line is printed,
+/// stderr says it was NOT recorded, and the file is byte for byte as it was.
+///
+/// NEGATIVE CONTROL: the same flow and answer over a state this build reads
+/// is exit 0 (`login_at_a_terminal_asks_that_one_login_and_records_that_it_works`).
+#[test]
+fn a_login_whose_answer_cannot_be_recorded_says_so_and_exits_1() {
+    let tmp = tmp_dir("accounts-login-unrecorded");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let state_file = store.state_file();
+    std::fs::create_dir_all(state_file.parent().expect("a directory")).expect("mkdir");
+    let theirs = "{\"schema\": 999}";
+    std::fs::write(&state_file, theirs).expect("write");
+
+    let signed_in = |_: &str| said(true);
+    let mut tty = FakeHost::new(&signed_in);
+    tty.tty = true;
+    let (code, out, err) = acc(
+        AccountsCmd::Login {
+            label: "work-2".to_string(),
+        },
+        &env,
+        &tty,
+    );
+    assert_eq!(code, exit(1), "{err}");
+    assert!(out.ends_with("\nwork-2: signed in\n"), "{out}");
+    assert!(err.contains("the answer above was NOT recorded"), "{err}");
+    assert_eq!(std::fs::read_to_string(&state_file).expect("read"), theirs);
+    assert!(!store.wake_path().exists(), "nobody is woken");
+}
+
+/// WHERE NO LOGIN CAN BE ASKED, THE FLOW IS NOT STARTED: with neither USER
+/// nor LOGNAME set the login could not be asked afterwards (and would read
+/// signed out), so the owner is not sent through a browser sign-in that
+/// records nothing. Said with its reason, exit 1; the line is still printed.
+///
+/// NEGATIVE CONTROL: the same host, able to ask, runs the flow.
+#[test]
+fn a_login_nobody_could_ask_afterwards_is_not_started() {
+    let tmp = tmp_dir("accounts-login-unaskable");
+    let env = env_at(&tmp);
+    let (work, _) = three_accounts(&tmp, &env);
+    let signed_in = |_: &str| said(true);
+    let mut tty = FakeHost::new(&signed_in);
+    tty.tty = true;
+    tty.unaskable = Some(AUTH_CHECK_NO_USER.to_string());
+    for label in ["work-2", "main"] {
+        let (code, out, err) = acc(
+            AccountsCmd::Login {
+                label: label.to_string(),
+            },
+            &env,
+            &tty,
+        );
+        assert_eq!(code, exit(1), "{label}");
+        assert_eq!(out.lines().count(), 1, "the line, and no answer: {out}");
+        assert!(err.contains("not run: USER is not set"), "{label}: {err}");
+    }
+    assert!(tty.logins.borrow().is_empty(), "no flow was started");
+    assert!(tty.asked.borrow().is_empty());
+    assert!(!env.accounts_store().state_file().exists());
+
+    tty.unaskable = None;
+    let (code, _, err) = acc(
+        AccountsCmd::Login {
+            label: "work-2".to_string(),
+        },
+        &env,
+        &tty,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    assert_eq!(*tty.logins.borrow(), vec![Some(work)]);
+}
+
+/// THE ROW WITH NO DIR is served: at a terminal the flow is run for this
+/// machine's own login (`login(None)`: the default home), that login is
+/// asked under the empty string, and its answer is recorded, exit 0. And
+/// `accounts use` names this verb as the remedy for that row too.
+///
+/// NEGATIVE CONTROL: a row with a dir is run under its dir (the tests
+/// above); here no directory is named, made or asked under.
+#[test]
+fn the_row_with_no_dir_is_signed_in_in_the_default_home() {
+    let tmp = tmp_dir("accounts-login-own");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let all_out = |_: &str| said(false);
+    acc(AccountsCmd::Check, &env, &FakeHost::new(&all_out));
+    let (code, _, err) = acc_quiet(
+        AccountsCmd::Use {
+            label: "main".to_string(),
+        },
+        &env,
+    );
+    assert_eq!(code, exit(1));
+    assert!(err.contains("`main` is signed-out"), "{err}");
+    assert!(
+        err.contains("sign it in with `aterm harness accounts login main`"),
+        "{err}"
+    );
+
+    let signed_in = |_: &str| said(true);
+    let mut tty = FakeHost::new(&signed_in);
+    tty.tty = true;
+    let (code, out, err) = acc(
+        AccountsCmd::Login {
+            label: "main".to_string(),
+        },
+        &env,
+        &tty,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    assert_eq!(out, "claude auth login\nmain: signed in\n");
+    assert_eq!(*tty.logins.borrow(), vec![None], "the default home");
+    assert_eq!(*tty.asked.borrow(), vec![String::new()]);
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(state.account("main").auth, Auth::Ok);
+    assert_eq!(state.account("work-2").auth, Auth::SignedOut, "not touched");
+    let (code, _, err) = acc_quiet(
+        AccountsCmd::Use {
+            label: "main".to_string(),
+        },
+        &env,
+    );
+    assert_eq!(code, exit(0), "the remedy took: {err}");
+}
+
+/// THE ONE RUNNER OF THE LOGIN FLOW ([`login_flow_of`]) STARTS A CHILD AND
+/// WAITS FOR IT — it answers the child's exit, so this process is still here
+/// to ask and record — under the home it is given and with the login
+/// variable removed; for this machine's own login the home's variable is
+/// removed too. A flow a signal ended answers 128 plus the signal, never 0.
+/// THE TERMINAL'S CTRL-C reaches this process too, and it waits through it:
+/// the stand-in sends SIGINT to its parent — this test process, which
+/// that signal would end — then exits 130 as an interrupted flow does, and
+/// the runner answers 130 with SIGINT and SIGQUIT put back as they were.
+///
+/// NEGATIVE CONTROL: a program that does not exist is an error, not an exit.
+#[cfg(unix)]
+#[test]
+fn the_login_runner_waits_for_the_program_it_is_given_under_the_home() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tmp_dir("login-runner");
+    let program = tmp.path().join("claude");
+    let saw = tmp.path().join("saw");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho \"$1 $2 home=${{{home}-unset}} login=${{{login}-unset}}\" >> \
+             '{saw}'\ncase \"${{{home}-unset}}\" in */kill) kill -KILL $$ ;; */three) exit 3 ;; \
+             */interrupt) [ \"$PPID\" = {pid} ] && kill -INT \"$PPID\" && echo sent >> '{saw}'; \
+             exit 130 ;; esac\nexit 0\n",
+            saw = saw.display(),
+            pid = std::process::id(),
+            home = accounts::HOME_ENV,
+            login = accounts::LOGIN_ENV,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |dir: Option<&str>| login_flow_of(program.as_os_str(), dir);
+    let disposition = |sig: libc::c_int| {
+        // SAFETY: `sigaction` is plain data for which all-zero is a valid
+        // value.
+        let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null `act` only reads the current disposition into `now`.
+        let read = unsafe { libc::sigaction(sig, std::ptr::null(), &mut now) };
+        assert_eq!(read, 0);
+        now.sa_sigaction
+    };
+    let dispositions = || [disposition(libc::SIGINT), disposition(libc::SIGQUIT)];
+    let before = dispositions();
+
+    // The non-zero exit first: were this process replaced by the flow, the
+    // test run would end there with that exit and not with a silent 0.
+    assert_eq!(run(Some("/logins/three")), Ok(3));
+    assert_eq!(run(Some("/logins/work-2")), Ok(0));
+    assert_eq!(run(Some("/logins/kill")), Ok(128 + 9));
+    assert_eq!(run(Some("/logins/interrupt")), Ok(130));
+    assert_eq!(dispositions(), before, "put back");
+    assert_eq!(run(None), Ok(0));
+    assert_eq!(
+        std::fs::read_to_string(&saw).unwrap(),
+        "auth login home=/logins/three login=unset\nauth login home=/logins/work-2 \
+         login=unset\nauth login home=/logins/kill login=unset\nauth login \
+         home=/logins/interrupt login=unset\nsent\nauth login home=unset login=unset\n"
+    );
+    // What is removed, whatever this process's own environment holds.
+    let edits = |dir: Option<&str>| {
+        login_command(program.as_os_str(), dir)
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        edits(None),
+        [
+            (accounts::HOME_ENV.to_string(), None),
+            (accounts::LOGIN_ENV.to_string(), None)
+        ]
+    );
+    assert_eq!(
+        edits(Some("/logins/work-2")),
+        [
+            (
+                accounts::HOME_ENV.to_string(),
+                Some("/logins/work-2".to_string())
+            ),
+            (accounts::LOGIN_ENV.to_string(), None)
+        ]
+    );
+    // NEGATIVE CONTROL: no such program.
+    let missing = tmp.path().join("nowhere").join("claude");
+    assert!(login_flow_of(missing.as_os_str(), None).is_err());
+}
+
+/// `accounts check`: each ENROLLED login is asked under its own string — the
+/// empty one for this machine's login, the roster's dir verbatim for another
+/// — and a row with no directory here is not asked at all. The lines are
+/// `<label>: signed in | signed out | not enrolled`, the answers are recorded
+/// with a ledger `auth` row each, and the report shows them. Asking again
+/// with the same answers writes no new row.
+#[test]
+fn check_asks_each_enrolled_login_and_records_what_it_answered() {
+    let tmp = tmp_dir("accounts-check");
+    let env = env_at(&tmp);
+    let (work, pool) = three_accounts(&tmp, &env);
+    let status = |login: &str| said(login.is_empty());
+    let host = FakeHost::new(&status);
+    let (code, out, err) = acc(AccountsCmd::Check, &env, &host);
+    assert_eq!(code, exit(0), "{err}");
+    assert_eq!(
+        out,
+        "main: signed in\nwork-2: signed out\npool-a: not enrolled\n"
+    );
+    assert_eq!(*host.asked.borrow(), vec![String::new(), work.clone()]);
+    assert!(!host.asked.borrow().contains(&pool), "never asked");
+
+    let store = env.accounts_store();
+    let (state, note) = store.load(env.now).expect("this build's state");
+    assert_eq!(note, None);
+    assert_eq!(state.account("main").auth, Auth::Ok);
+    assert_eq!(state.account("main").auth_at, Some(env.now));
+    assert_eq!(state.account("work-2").auth, Auth::SignedOut);
+    assert_eq!(
+        state.account("pool-a").auth,
+        Auth::Unseen,
+        "nothing recorded"
+    );
+    let rows = store.tail(20).expect("ledger");
+    assert_eq!(
+        rows.iter()
+            .map(|e| (e.kind, e.account.as_str(), e.why.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (accounts::Kind::Auth, "main", "ok"),
+            (accounts::Kind::Auth, "work-2", "signed-out"),
+        ]
+    );
+    assert!(store.wake_path().exists(), "a login that works wakes");
+
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    let row = |label: &str| {
+        out.lines()
+            .find(|l| l.starts_with(label))
+            .unwrap_or_else(|| panic!("{label}: {out}"))
+            .to_string()
+    };
+    assert!(row("main").contains("  usable  "), "{out}");
+    assert!(row("work-2").contains("  signed-out  "), "{out}");
+    assert!(row("pool-a").contains("  not-enrolled  "), "{out}");
+    assert!(
+        out.contains("work-2: signed-out"),
+        "its reason by name: {out}"
+    );
+    assert!(out.contains("pool-a: not-enrolled"), "{out}");
+
+    let (code, _, _) = acc(AccountsCmd::Check, &env, &host);
+    assert_eq!(code, exit(0));
+    assert_eq!(store.tail(20).expect("ledger").len(), 2, "no word changed");
+}
+
+/// A login that COULD NOT BE ASKED is said with the reason, recorded as
+/// nothing, and the exit is 1: `claude` not on PATH or past its deadline (the
+/// runner's own sentence), an exit with no answer, an answer that disagrees
+/// with its exit. Negative control: the login beside it that did answer is
+/// still recorded.
+#[test]
+fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
+    let tmp = tmp_dir("accounts-check-failed");
+    let env = env_at(&tmp);
+    let (work, _) = three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let cases: [(Result<Captured, String>, &str); 5] = [
+        (
+            Err("it will not run: No such file or directory (os error 2)".to_string()),
+            "work-2: could not run (it will not run: No such file or directory (os error 2))",
+        ),
+        (
+            Err("it ran past its 20000 ms deadline".to_string()),
+            "work-2: could not run (it ran past its 20000 ms deadline)",
+        ),
+        (
+            Ok(Captured {
+                stdout: b"Usage: claude auth [options]".to_vec(),
+                code: Some(2),
+            }),
+            "work-2: could not run (exit 2, with no `loggedIn` answer)",
+        ),
+        (
+            Ok(Captured {
+                stdout: br#"{"loggedIn":true}"#.to_vec(),
+                code: Some(1),
+            }),
+            "work-2: could not run (it said loggedIn, and exit 1)",
+        ),
+        (
+            Ok(Captured {
+                stdout: Vec::new(),
+                code: None,
+            }),
+            "work-2: could not run (ended by a signal, with no `loggedIn` answer)",
+        ),
+    ];
+    for (answer, line) in cases {
+        let status = |login: &str| {
+            if login == work {
+                answer.clone()
+            } else {
+                said(true)
+            }
+        };
+        let (code, out, _) = acc(AccountsCmd::Check, &env, &FakeHost::new(&status));
+        assert_eq!(code, exit(1), "{line}");
+        assert!(out.lines().any(|l| l == line), "{line}: {out}");
+        let (state, _) = store.load(env.now).expect("this build's state");
+        assert_eq!(state.account("work-2").auth, Auth::Unseen, "{line}");
+        assert_eq!(state.account("main").auth, Auth::Ok, "{line}");
+    }
+    // The answers themselves, as the one reader takes them.
+    assert_eq!(login_check(said(true)), LoginCheck::SignedIn);
+    assert_eq!(login_check(said(false)), LoginCheck::SignedOut);
+    assert_eq!(LoginCheck::NotEnrolled.auth(), None);
+}
+
+/// THE SECRECY CONTROL. `claude auth status --json` names an email and an
+/// organization. The fake host's output carries both — in a document that
+/// answers, in plain text that does not parse, and inside the `loggedIn` key
+/// itself — and no byte of them reaches stdout, stderr, the ledger, the state
+/// file or any other file this verb wrote, nor the report or the ledger view
+/// read afterwards.
+///
+/// NEGATIVE CONTROL: the strings ARE in what the host handed over (asserted
+/// on the fake's own output), and the document that carried them was still
+/// read for its one key (`main: signed in`), so their absence is the reader's
+/// doing and not an empty fixture.
+#[test]
+fn check_keeps_no_byte_of_the_vendors_output() {
+    let tmp = tmp_dir("accounts-secrecy");
+    let env = env_at(&tmp);
+    let (work, pool) = three_accounts(&tmp, &env);
+    login_made_in(&pool);
+    // Invented, and shaped like what the vendor prints.
+    const SECRETS: [&str; 4] = ["zq.nobody", "example.invalid", "Invented", "Org-9"];
+    let document = r#"{"loggedIn":true,"authMethod":"claude.ai","email":"zq.nobody@example.invalid","orgName":"Invented Org-9"}"#;
+    let plain = "Not logged in as zq.nobody@example.invalid (Invented Org-9)";
+    let in_the_key = r#"{"loggedIn":"zq.nobody@example.invalid of Invented Org-9"}"#;
+    let status = |login: &str| {
+        let (stdout, code) = if login.is_empty() {
+            (document, 0)
+        } else if login == work {
+            (plain, 1)
+        } else {
+            (in_the_key, 0)
+        };
+        Ok(Captured {
+            stdout: stdout.as_bytes().to_vec(),
+            code: Some(code),
+        })
+    };
+    for handed in [document, plain, in_the_key] {
+        for secret in SECRETS {
+            assert!(handed.contains(secret), "the fixture carries {secret:?}");
+        }
+    }
+    let host = FakeHost::new(&status);
+    let (code, out, err) = acc(AccountsCmd::Check, &env, &host);
+    assert_eq!(code, exit(1), "two of the three gave no answer");
+    assert_eq!(host.asked.borrow().len(), 3, "all three were run");
+    assert!(
+        out.contains("main: signed in"),
+        "the document was read: {out}"
+    );
+    assert!(out.contains("work-2: could not run"), "{out}");
+    assert!(out.contains("pool-a: could not run"), "{out}");
+
+    let (_, report, report_err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    let (_, ledger, _) = go(
+        &Cmd::Ledger {
+            file: LedgerFile::Accounts,
+            count: 20,
+            json: false,
+        },
+        &env,
+    );
+    let (_, raw, _) = go(
+        &Cmd::Ledger {
+            file: LedgerFile::Accounts,
+            count: 20,
+            json: true,
+        },
+        &env,
+    );
+    assert!(
+        ledger.contains("auth main"),
+        "the answer is in the ledger: {ledger}"
+    );
+    let files = every_file(tmp.path());
+    assert!(
+        files.iter().any(|(p, _)| p.ends_with("state.json"))
+            && files.iter().any(|(p, _)| p.ends_with("ledger.jsonl")),
+        "the state and the ledger were written"
+    );
+    for secret in SECRETS {
+        for (what, text) in [
+            ("stdout", &out),
+            ("stderr", &err),
+            ("the report", &report),
+            ("the report's stderr", &report_err),
+            ("the JSON report", &json),
+            ("the ledger view", &ledger),
+            ("the raw ledger", &raw),
+        ] {
+            assert!(!text.contains(secret), "{secret:?} reached {what}: {text}");
+        }
+        for (path, bytes) in &files {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains(secret),
+                "{secret:?} reached {}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// `accounts use <label>` records the owner's pin — `active`, `proven`,
+/// `pinned`, a ledger `use` row, the wake marker replaced — and says that it
+/// is recorded ([`ACCOUNTS_USE_RECORDED`]); the report ends on
+/// [`ACCOUNTS_ROTATION`]. `use --auto` ends the pin with an `unpin` row; with
+/// no pin standing it writes nothing.
+#[test]
+fn use_records_the_owners_pin_and_claims_no_move() {
+    let tmp = tmp_dir("accounts-use");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let using = |label: &str| AccountsCmd::Use {
+        label: label.to_string(),
+    };
+
+    let (code, out, _) = acc_quiet(AccountsCmd::Auto, &env);
+    assert_eq!(code, exit(0));
+    assert_eq!(out, "no pin holds: nothing to end\n");
+    assert!(!store.state_file().exists(), "nothing to write");
+    assert!(!store.ledger_path().exists());
+
+    let (code, out, err) = acc_quiet(using("work-2"), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert_eq!(
+        out,
+        format!("work-2: the active account, pinned\n{ACCOUNTS_USE_RECORDED}\n")
+    );
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(state.active.as_deref(), Some("work-2"));
+    assert!(state.proven && state.pinned);
+    assert!(store.wake_path().exists());
+    let rows = store.tail(20).expect("ledger");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].kind, rows[0].account.as_str(), rows[0].t),
+        (accounts::Kind::Use, "work-2", env.now)
+    );
+
+    let (_, report, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(
+        report.starts_with("active: work-2, 0 of 0 sessions on it\n"),
+        "{report}"
+    );
+    assert!(
+        report
+            .lines()
+            .any(|l| l.starts_with("work-2") && l.contains("  pinned  ")),
+        "{report}"
+    );
+    assert!(
+        report.ends_with(&format!("{ACCOUNTS_ROTATION}\n")),
+        "{report}"
+    );
+
+    let (code, out, _) = acc_quiet(AccountsCmd::Auto, &env);
+    assert_eq!(code, exit(0));
+    assert!(out.starts_with("work-2: no longer pinned\n"), "{out}");
+    assert_eq!(
+        out,
+        "work-2: no longer pinned\nrecorded: it stays the active account; a session leaves it \
+         only at a usage limit, for the account the report names `next`\n"
+    );
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert!(!state.pinned);
+    assert_eq!(
+        state.active.as_deref(),
+        Some("work-2"),
+        "still the active one"
+    );
+    let rows = store.tail(20).expect("ledger");
+    assert_eq!(
+        rows.iter()
+            .map(|e| (e.kind, e.why.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (accounts::Kind::Use, "the owner's word"),
+            (accounts::Kind::Unpin, "auto"),
+        ]
+    );
+    let (_, out, _) = acc_quiet(AccountsCmd::Auto, &env);
+    assert_eq!(out, "no pin holds: nothing to end\n");
+    assert_eq!(store.tail(20).expect("ledger").len(), 2);
+}
+
+/// `accounts use` REFUSES BY NAME, exit 1, with nothing changed: a label the
+/// roster does not list, one with no login directory here, and one the last
+/// check found signed out — each with what to run. Negative control: the
+/// signed-out label is accepted once a check says it is signed in.
+#[test]
+fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
+    let tmp = tmp_dir("accounts-use-refused");
+    let env = env_at(&tmp);
+    let (work, _) = three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let using = |label: &str| AccountsCmd::Use {
+        label: label.to_string(),
+    };
+    let signed_out = |login: &str| said(login != work);
+    let (code, _, _) = acc(AccountsCmd::Check, &env, &FakeHost::new(&signed_out));
+    assert_eq!(code, exit(0));
+    let before = std::fs::read_to_string(store.state_file()).expect("state");
+    let rows = store.tail(20).expect("ledger").len();
+
+    for (label, refusal, remedy) in [
+        ("nobody", "`nobody` is not in the roster", "accounts add"),
+        (
+            "pool-a",
+            "`pool-a` is not-enrolled",
+            "accounts login pool-a",
+        ),
+        ("work-2", "`work-2` is signed-out", "accounts login work-2"),
+    ] {
+        let (code, out, err) = acc_quiet(using(label), &env);
+        assert_eq!(code, exit(1), "{label}");
+        assert!(out.is_empty(), "{label}: {out}");
+        assert!(err.contains(refusal), "{label}: {err}");
+        assert!(err.contains(remedy), "{label}: {err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(store.state_file()).expect("state"),
+        before,
+        "a refusal changes nothing"
+    );
+    assert_eq!(store.tail(20).expect("ledger").len(), rows);
+
+    // NEGATIVE CONTROL: signed in again, the same label is taken.
+    let signed_in = |_: &str| said(true);
+    let (code, _, _) = acc(AccountsCmd::Check, &env, &FakeHost::new(&signed_in));
+    assert_eq!(code, exit(0));
+    let (code, out, err) = acc_quiet(using("work-2"), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(out.contains(ACCOUNTS_USE_RECORDED), "{out}");
+}
+
+/// `ledger accounts` reads the store's ledger through the one tail: a line a
+/// person reads per row (time, kind, account, the reason), the newest `n`
+/// only, the rows verbatim under `--json`, and "no rows" for a ledger that
+/// does not exist yet.
+#[test]
+fn the_accounts_ledger_is_read_through_the_ledger_verb() {
+    let tmp = tmp_dir("accounts-ledger");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let ledger = |count: usize, json: bool| {
+        go(
+            &Cmd::Ledger {
+                file: LedgerFile::Accounts,
+                count,
+                json,
+            },
+            &env,
+        )
+    };
+    let (ok, out, _) = ledger(20, false);
+    assert!(ok);
+    assert!(out.starts_with("no rows in "), "{out}");
+    assert!(out.contains("accounts/ledger.jsonl"), "{out}");
+
+    let all_in = |_: &str| said(true);
+    acc(AccountsCmd::Check, &env, &FakeHost::new(&all_in));
+    acc_quiet(
+        AccountsCmd::Use {
+            label: "work-2".to_string(),
+        },
+        &env,
+    );
+    // A row of every shape the line has: a move with its session.
+    env.accounts_store()
+        .append(&[
+            accounts::Event::new(env.now, accounts::Kind::Rotate, "main")
+                .with_to("work-2")
+                .with_sid("s-a1"),
+        ])
+        .expect("append");
+
+    let (ok, out, _) = ledger(20, false);
+    assert!(ok);
+    let when = rfc3339_utc(env.now);
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            format!("{when} auth main — ok"),
+            format!("{when} auth work-2 — ok"),
+            format!("{when} use work-2 — the owner's word"),
+            format!("{when} rotate main -> work-2 session=s-a1"),
+        ]
+    );
+    let (_, out, _) = ledger(1, false);
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(out.contains("rotate main -> work-2"), "{out}");
+
+    let (_, out, _) = ledger(20, true);
+    let rows: Vec<accounts::Event> = out
+        .lines()
+        .map(|l| accounts::Event::of_json_line(l).expect("a ledger row, verbatim"))
+        .collect();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[2].kind, accounts::Kind::Use);
+    // A line that is no row of this ledger is shown folded, never dropped.
+    assert_eq!(accounts_ledger_line("not\ta row"), "not a row");
+}
+
+/// A state with something of everything, written through the store: `main`
+/// sampled five minutes ago with its session window read and its week NOT
+/// read, a reset offer, a session on it; `work-2` at a wall, with a session
+/// that could not move; `pool-a` never observed and not enrolled here.
+fn reported_state(env: &Env) {
+    let now = env.now;
+    let mut state = accounts::State {
+        machine: "0a0b".to_string(),
+        ..accounts::State::default()
+    };
+    accounts::note_sample(
+        &mut state,
+        "main",
+        accounts::Sample {
+            session_pct: Some(42),
+            session_reset: Some(now + 2 * 3600),
+            at: now - 300,
+            ..accounts::Sample::default()
+        },
+        now,
+    );
+    assert!(accounts::note_offer(
+        &mut state,
+        "main",
+        1,
+        Some(now + 3 * 86_400),
+        now - 3600,
+        now,
+    ));
+    accounts::note_auth(&mut state, "main", Auth::Ok, now - 60);
+    accounts::note_wall(
+        &mut state,
+        "work-2",
+        "five_hour",
+        Some(now + 3600),
+        now - 10,
+        now,
+    );
+    accounts::note_session(&mut state, "s-a1", "main", None, now - 5);
+    accounts::note_session(&mut state, "s-b2", "work-2", Some("jobs"), now - 5);
+    state.active = Some("main".to_string());
+    state.proven = true;
+    env.accounts_store().save(&state).expect("save");
+}
+
+/// THE REPORT, as text: the header counts the sessions on the active
+/// account; each row carries its class, its condition (a limit with its
+/// instant), its mark, THE LIMIT-RESET OFFER on record (its count, and its
+/// deadline where one was read) and its sessions with why one is held — no
+/// usage figure; then `next:` and every non-candidate's reason by name.
+/// NEGATIVE CONTROL: a row with no offer on record carries no offer column,
+/// and with none on any account the report is the one printed before offers
+/// were read.
+#[test]
+fn the_report_rows_carry_condition_sessions_and_the_reasons() {
+    let tmp = tmp_dir("accounts-report");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    reported_state(&env);
+    let now = env.now;
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "active: main, 1 of 2 sessions on it");
+    assert_eq!(
+        lines[1],
+        format!(
+            "main    dedicated  usable  active  offer: 1 left, use by {}  on: @s-a1",
+            rfc3339_utc(now + 3 * 86_400)
+        )
+    );
+    let stands = rfc3339_utc(now + 3600 + accounts::RESET_GRACE_S);
+    assert_eq!(
+        lines[2],
+        format!("work-2  dedicated  limited until {stands}  -  on: @s-b2 (held: jobs)")
+    );
+    assert_eq!(lines[3], "pool-a  shared     not-enrolled  -  on: -");
+    assert_eq!(lines[4], "next: none (no other account can be run on)");
+    assert_eq!(
+        lines[5],
+        format!(
+            "not next: main: the account in use; work-2: limited until {stands}; pool-a: \
+             not-enrolled (no login made yet: run `aterm harness accounts login pool-a`)"
+        )
+    );
+    assert_eq!(lines[6], ACCOUNTS_ROTATION);
+    assert_eq!(lines.len(), 7, "{out}");
+    assert_eq!(
+        out.matches("offer:").count(),
+        1,
+        "only the account that has one"
+    );
+
+    // An offer whose deadline nobody read (a reset used: the line names the
+    // count alone) is the count; and with no offer the column is gone.
+    let store = env.accounts_store();
+    let (mut state, _) = store.load(env.now).expect("this build's state");
+    assert!(accounts::note_offer(&mut state, "main", 0, None, now, now));
+    store.save(&state).expect("save");
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(
+        out.lines().nth(1),
+        Some("main    dedicated  usable  active  offer: 0 left  on: @s-a1")
+    );
+    let (mut state, _) = store.load(env.now).expect("this build's state");
+    state.accounts.get_mut("main").expect("main").offer = None;
+    store.save(&state).expect("save");
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(
+        out.lines().nth(1),
+        Some("main    dedicated  usable  active  on: @s-a1"),
+        "NEGATIVE CONTROL: the row as it was before offers were read"
+    );
+    assert!(!out.contains("offer:"), "{out}");
+    reported_state(&env);
+
+    // `next:` names an account when one can be run on: `pool-a` enrolled.
+    let (_, pool) = three_accounts(&tmp, &env);
+    login_made_in(&pool);
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(out.contains("\nnext: pool-a\n"), "{out}");
+    assert!(out.contains("pool-a  shared     unseen  "), "{out}");
+    std::fs::remove_dir_all(&pool).expect("unenroll");
+
+    // And the time to wait until when the account in use is at a wall too:
+    // the earliest instant of the two.
+    let store = env.accounts_store();
+    let (mut state, _) = store.load(env.now).expect("this build's state");
+    accounts::note_wall(
+        &mut state,
+        "main",
+        "seven_day",
+        Some(now + 2 * 3600),
+        now,
+        now,
+    );
+    store.save(&state).expect("save");
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(
+        out.contains(&format!("\nnext: wait until {stands} (in 1h2m)\n")),
+        "{out}"
+    );
+}
+
+/// THE REPORT, as JSON: one line, schema 1, kind `accounts`; every key of a
+/// row present whatever is known; an unknown is `null`, never `0`; every
+/// instant in Unix seconds with its UTC form beside it; `dir` absent for
+/// this machine's own login.
+#[test]
+fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
+    let tmp = tmp_dir("accounts-json");
+    let env = env_at(&tmp);
+    let (work, pool) = three_accounts(&tmp, &env);
+    reported_state(&env);
+    let now = env.now;
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert_eq!(out.lines().count(), 1, "one line: {out}");
+    let doc: Value = aterm_json::from_str(out.trim()).expect("JSON");
+    let int = |v: &Value, key: &str| v.get(key).and_then(Value::as_i64);
+    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+    let null = |v: &Value, key: &str| v.get(key) == Some(&Value::Null);
+
+    assert_eq!(int(&doc, "schema"), Some(1));
+    assert_eq!(text(&doc, "kind").as_deref(), Some("accounts"));
+    assert_eq!(int(&doc, "as_of"), Some(now));
+    assert_eq!(text(&doc, "as_of_rfc3339"), Some(rfc3339_utc(now)));
+    assert_eq!(
+        text(&doc, "roster"),
+        Some(env.accounts_roster().expect("path").display().to_string())
+    );
+    assert!(null(&doc, "refused"));
+    // What acts on this state in this build, as six facts: the pin is
+    // followed, a usage limit moves a session, `early` moves one ahead of a
+    // limit and probes `/usage` for it; a limit reset is built (it ships
+    // off, which this command does not read); and none of it has been
+    // observed — with two real accounts, or a reset against a real wall.
+    let rotation = doc.get("rotation").expect("the rotation facts");
+    for (fact, want) in [
+        ("follows_use", true),
+        ("at_limit", true),
+        ("ahead_of_limit", true),
+        ("probe", true),
+        ("limit_reset", true),
+        ("observed", false),
+    ] {
+        assert_eq!(rotation.get(fact), Some(&Value::from(want)), "{fact}");
+    }
+    assert_eq!(
+        rotation.as_object().map(Map::len),
+        Some(6),
+        "and nothing more is claimed: {rotation:?}"
+    );
+    assert_eq!(text(&doc, "active").as_deref(), Some("main"));
+    assert_eq!(doc.get("proven"), Some(&Value::from(true)));
+    assert_eq!(doc.get("pinned"), Some(&Value::from(false)));
+    assert_eq!(int(&doc, "sessions"), Some(2));
+    let next = doc.get("next").expect("next");
+    assert!(null(next, "to") && null(next, "wait_until") && null(next, "wait_until_rfc3339"));
+    let not: Vec<(String, String)> = next
+        .get("not")
+        .and_then(Value::as_array)
+        .expect("not")
+        .iter()
+        .map(|n| {
+            (
+                text(n, "label").expect("label"),
+                text(n, "why").expect("why"),
+            )
+        })
+        .collect();
+    assert_eq!(not.len(), 3);
+    assert_eq!(
+        not[0],
+        ("main".to_string(), "the account in use".to_string())
+    );
+    assert_eq!(not[2], ("pool-a".to_string(), "not-enrolled".to_string()));
+
+    let rows = doc.get("accounts").and_then(Value::as_array).expect("rows");
+    assert_eq!(rows.len(), 3);
+    const KEYS: [&str; 22] = [
+        "label",
+        "class",
+        "enrolled",
+        "condition",
+        "limited_until",
+        "limited_until_rfc3339",
+        "auth",
+        "auth_at",
+        "auth_at_rfc3339",
+        "active",
+        "pinned",
+        "session_pct",
+        "session_reset",
+        "session_reset_rfc3339",
+        "week_pct",
+        "week_reset",
+        "week_reset_rfc3339",
+        "sampled_at",
+        "sampled_at_rfc3339",
+        "offer",
+        "walls",
+        "sessions",
+    ];
+    for row in rows {
+        for key in KEYS {
+            assert!(row.get(key).is_some(), "{key} is absent from {row:?}");
+        }
+    }
+    let (main, work_2, pool_a) = (&rows[0], &rows[1], &rows[2]);
+
+    assert_eq!(text(main, "label").as_deref(), Some("main"));
+    assert_eq!(text(main, "class").as_deref(), Some("dedicated"));
+    assert!(
+        main.get("dir").is_none(),
+        "this machine's own login names none"
+    );
+    assert_eq!(text(main, "condition").as_deref(), Some("usable"));
+    assert_eq!(main.get("active"), Some(&Value::from(true)));
+    assert_eq!(text(main, "auth").as_deref(), Some("ok"));
+    assert_eq!(int(main, "auth_at"), Some(now - 60));
+    assert_eq!(int(main, "session_pct"), Some(42));
+    assert_eq!(int(main, "session_reset"), Some(now + 2 * 3600));
+    assert_eq!(
+        text(main, "session_reset_rfc3339"),
+        Some(rfc3339_utc(now + 2 * 3600))
+    );
+    // The week was not read: null, in every one of its three keys.
+    assert!(null(main, "week_pct") && null(main, "week_reset"));
+    assert!(null(main, "week_reset_rfc3339"));
+    assert!(null(main, "limited_until") && null(main, "limited_until_rfc3339"));
+    assert_eq!(int(main, "sampled_at"), Some(now - 300));
+    let offer = main.get("offer").expect("offer");
+    assert_eq!(int(offer, "left"), Some(1));
+    assert_eq!(int(offer, "use_by"), Some(now + 3 * 86_400));
+    assert_eq!(text(offer, "at_rfc3339"), Some(rfc3339_utc(now - 3600)));
+    let on_main = main.get("sessions").and_then(Value::as_array).expect("on");
+    assert_eq!(text(&on_main[0], "sid").as_deref(), Some("s-a1"));
+    assert!(null(&on_main[0], "held"));
+
+    assert_eq!(text(work_2, "dir"), Some(work));
+    assert_eq!(text(work_2, "condition").as_deref(), Some("limited"));
+    assert_eq!(
+        int(work_2, "limited_until"),
+        Some(now + 3600 + accounts::RESET_GRACE_S)
+    );
+    let wall = work_2
+        .get("walls")
+        .and_then(|w| w.get("five_hour"))
+        .expect("the wall, by the vendor's limit type");
+    assert_eq!(int(wall, "until"), Some(now + 3600));
+    assert_eq!(int(wall, "attempts"), Some(0));
+    let on_work = work_2
+        .get("sessions")
+        .and_then(Value::as_array)
+        .expect("on");
+    assert_eq!(text(&on_work[0], "held").as_deref(), Some("jobs"));
+
+    // NEVER 0 FOR AN UNKNOWN: the account nobody observed is nulls throughout.
+    assert_eq!(text(pool_a, "dir"), Some(pool));
+    assert_eq!(pool_a.get("enrolled"), Some(&Value::from(false)));
+    assert_eq!(text(pool_a, "condition").as_deref(), Some("not-enrolled"));
+    assert_eq!(text(pool_a, "auth").as_deref(), Some("unseen"));
+    for key in [
+        "auth_at",
+        "session_pct",
+        "session_reset",
+        "week_pct",
+        "week_reset",
+        "sampled_at",
+        "sampled_at_rfc3339",
+        "limited_until",
+        "offer",
+    ] {
+        assert!(
+            null(pool_a, key),
+            "{key} of an unobserved account: {pool_a:?}"
+        );
+    }
+    assert_eq!(
+        pool_a
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+}
+
+/// `accounts check` IS NOT RUN WITH NEITHER USER NOR LOGNAME SET. Claude Code
+/// then answers `loggedIn: false`, exit 1, for a login that works (MEASURED,
+/// 2.1.286), and the check would record a signed-in account as signed out —
+/// ending a pin on it, and keeping it out of every rotation until the next
+/// check. So the question is not asked: `could not run (USER is not set)`,
+/// nothing recorded, exit 1.
+#[test]
+fn check_is_not_run_when_neither_user_nor_logname_is_set() {
+    type Vars = &'static [(&'static str, &'static str)];
+    let var = |vars: Vars| {
+        move |name: &str| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    };
+    let names = |vars: Vars| {
+        auth_check_env(&var(vars))
+            .map(|pass| pass.iter().map(|(name, _)| *name).collect::<Vec<_>>())
+    };
+    let refused = Err(AUTH_CHECK_NO_USER.to_string());
+    assert_eq!(AUTH_CHECK_NO_USER, "USER is not set");
+    // The cleared environment a service or an `env -i` shell hands down.
+    assert_eq!(names(&[("PATH", "/bin"), ("HOME", "/h")]), refused);
+    assert_eq!(names(&[("ATERM_CHILD", "1")]), refused);
+    // Set and empty names nobody.
+    assert_eq!(names(&[("USER", ""), ("LOGNAME", "")]), refused);
+    // NEGATIVE CONTROLS: either one is enough, and what goes through is
+    // those two and the reroute markers — never anything else that is set.
+    assert_eq!(names(&[("USER", "u")]), Ok(vec!["USER"]));
+    assert_eq!(names(&[("LOGNAME", "u")]), Ok(vec!["LOGNAME"]));
+    assert_eq!(
+        names(&[
+            ("USER", "u"),
+            ("LOGNAME", "u"),
+            ("ATERM_CHILD", "1"),
+            ("CLAUDE_CONFIG_DIR", "/elsewhere"),
+            ("PATH", "/bin"),
+        ]),
+        Ok(vec!["USER", "LOGNAME", "ATERM_CHILD"])
+    );
+
+    // What the verb makes of that answer: every enrolled login could not be
+    // asked, nothing is recorded, and the exit is 1.
+    let tmp = tmp_dir("accounts-check-no-user");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let no_user = |_: &str| Err(AUTH_CHECK_NO_USER.to_string());
+    let (code, out, _) = acc(AccountsCmd::Check, &env, &FakeHost::new(&no_user));
+    assert_eq!(code, exit(1));
+    assert_eq!(
+        out,
+        "main: could not run (USER is not set)\nwork-2: could not run (USER is not set)\n\
+         pool-a: not enrolled\n"
+    );
+    let store = env.accounts_store();
+    assert!(!store.state_file().exists(), "nothing was recorded");
+    assert!(!store.ledger_path().exists());
+}
+
+/// A STATE FILE THAT IS NOT OURS IS NEVER SAVED OVER. A `state.json` of
+/// another schema — a newer build's, with this older one still on the
+/// machine — used to load as the empty state and be written over by the next
+/// `check` or `use`: the pin, every wall and every signed-out word gone.
+///
+/// Every writing verb REFUSES, exit 1, naming the file, and leaves it byte
+/// for byte; the report shows an empty state beside the reason and exits 0.
+/// NEGATIVE CONTROL: a file that is not JSON at all holds nothing, and the
+/// same `check` replaces it, saying so.
+#[test]
+fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() {
+    let tmp = tmp_dir("accounts-not-ours");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    store.ensure().expect("the store's directory");
+    let newer = r#"{"schema":2,"active":"work-2","pinned":true,"accounts":{}}"#;
+    std::fs::write(store.state_file(), newer).expect("write");
+    let all_in = |_: &str| said(true);
+
+    let writes: [(AccountsCmd, &dyn AccountsHost); 3] = [
+        (AccountsCmd::Check, &FakeHost::new(&all_in)),
+        (
+            AccountsCmd::Use {
+                label: "work-2".to_string(),
+            },
+            &FakeHost::new(&never_asked),
+        ),
+        (AccountsCmd::Auto, &FakeHost::new(&never_asked)),
+    ];
+    for (form, host) in writes {
+        let (code, out, err) = acc(form.clone(), &env, host);
+        assert_eq!(code, exit(1), "{form:?}: {out}");
+        assert!(err.contains("schema 2; this build reads schema 1"), "{err}");
+        assert!(
+            err.contains(&store.state_file().display().to_string()),
+            "{form:?} names the file: {err}"
+        );
+        assert!(err.contains("nothing was written"), "{form:?}: {err}");
+        assert!(!out.contains("pinned"), "{form:?} claims nothing: {out}");
+        assert_eq!(
+            std::fs::read_to_string(store.state_file()).expect("read"),
+            newer,
+            "{form:?}: the file is as the newer build left it"
+        );
+        assert!(!store.ledger_path().exists(), "{form:?}: no row");
+        assert!(!store.wake_path().exists(), "{form:?}: nobody is woken");
+    }
+
+    // The report reads it, changes nothing, and says what it could not use.
+    for json in [false, true] {
+        let (code, out, err) = acc_quiet(AccountsCmd::Report { json }, &env);
+        assert_eq!(code, exit(0), "{err}");
+        assert!(err.contains("schema 2"), "{err}");
+        assert!(err.contains("shown as an empty state"), "{err}");
+        assert!(out.contains("main"), "the roster is still listed: {out}");
+        // An empty state: no active account, no pin — never the newer
+        // build's, half understood.
+        if json {
+            let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+            assert_eq!(doc.get("active"), Some(&Value::Null), "{out}");
+            assert_eq!(doc.get("pinned"), Some(&Value::from(false)), "{out}");
+        } else {
+            assert!(out.starts_with("active: none chosen yet"), "{out}");
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(store.state_file()).expect("read"),
+        newer
+    );
+
+    // NEGATIVE CONTROL: a torn file is replaced, with a note.
+    std::fs::write(store.state_file(), &newer[..newer.len() / 2]).expect("write");
+    let (code, out, err) = acc(AccountsCmd::Check, &env, &FakeHost::new(&all_in));
+    assert_eq!(code, exit(0), "{err}");
+    assert!(out.contains("main: signed in"), "{out}");
+    assert!(err.contains("read as an empty state"), "{err}");
+    let (state, note) = store.load(env.now).expect("this build's state now");
+    assert_eq!(note, None);
+    assert_eq!(state.account("main").auth, Auth::Ok);
+}
+
+/// `accounts add` ON A ROSTER THAT IS A SYMLINK (a dotfiles checkout) writes
+/// THROUGH the link: the link survives and the file it points at gets the
+/// row. Renamed over the link, the roster became a regular file the checkout
+/// knew nothing of, and the linked file never got the row.
+///
+/// The file it points at KEEPS ITS MODE: it is replaced by a rename, and the
+/// replacement used to be 0600 whatever the owner had made the file.
+#[cfg(unix)]
+#[test]
+fn add_writes_a_symlinked_roster_through_the_link() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tmp_dir("accounts-add-symlink");
+    let env = env_at(&tmp);
+    let link = env.accounts_roster().expect("a config dir");
+    let dotfiles = tmp.path().join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).expect("mkdir");
+    let target = dotfiles.join("accounts.toml");
+    let hand = "# kept in dotfiles\n[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n";
+    std::fs::write(&target, hand).expect("write");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let is_link = |p: &Path| p.symlink_metadata().expect("lstat").is_symlink();
+    let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    let chmod = |p: &Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    chmod(&target, 0o644);
+
+    let (code, out, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(out.contains("listed `work-2` (dedicated)"), "{out}");
+    assert!(is_link(&link), "the link is still a link");
+    assert!(!is_link(&target));
+    assert_eq!(mode(&target), 0o644, "the target keeps the mode it had");
+    // …whatever that was: it is the file's own, not a constant.
+    chmod(&target, 0o640);
+    let (code, _, err) = acc_quiet(add("pool-a", Class::Shared), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert_eq!(mode(&target), 0o640);
+    assert!(
+        std::fs::read_to_string(&target)
+            .expect("read")
+            .contains("label = \"pool-a\"")
+    );
+    let text = std::fs::read_to_string(&target).expect("read");
+    assert!(text.starts_with(hand), "what was there is kept: {text}");
+    assert!(
+        text.contains("label = \"work-2\""),
+        "the target got the row: {text}"
+    );
+    assert_eq!(
+        Roster::load(&link)
+            .expect("read through the link")
+            .rows
+            .iter()
+            .map(|r| r.label.clone())
+            .collect::<Vec<_>>(),
+        ["main", "work-2", "pool-a"]
+    );
+    assert_eq!(
+        std::fs::read_dir(&dotfiles).expect("list").count(),
+        1,
+        "no temp file is left beside the target"
+    );
+    // NEGATIVE CONTROL: a roster that is no link is this command's to keep
+    // private, whatever mode it had.
+    let plain = tmp_dir("accounts-add-plain");
+    let env = env_at(&plain);
+    let roster = env.accounts_roster().expect("a config dir");
+    std::fs::write(&roster, hand).expect("write");
+    chmod(&roster, 0o644);
+    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert_eq!(mode(&roster), 0o600);
+
+    // A link whose target cannot be resolved is refused by name, and nothing
+    // is made in its place.
+    let other = tmp_dir("accounts-add-dangling");
+    let env = env_at(&other);
+    let link = env.accounts_roster().expect("a config dir");
+    std::os::unix::fs::symlink(other.path().join("gone").join("accounts.toml"), &link)
+        .expect("symlink");
+    let (code, out, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    assert_eq!(code, exit(1));
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("is a symlink whose target cannot be resolved"),
+        "{err}"
+    );
+    assert!(is_link(&link), "the link is as it was");
+    assert!(!other.path().join("gone").exists());
+    assert!(!env.accounts_store().logins_dir().exists());
+}
+
+/// A ROSTER THAT DEFINES `account` INLINE (`account = [ { … } ]`) admits, is
+/// reported — and cannot be appended to: an `[[account]]` table cannot
+/// extend an array written that way. `add` used to blame the owner's file as
+/// `not valid TOML`, at a line it had itself appended. It says what is so,
+/// prints the row to add by hand, and writes nothing.
+#[test]
+fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
+    let tmp = tmp_dir("accounts-add-inline");
+    let env = env_at(&tmp);
+    let roster = env.accounts_roster().expect("a config dir");
+    let inline = "account = [ { label = \"main\", class = \"dedicated\" } ]\n";
+    std::fs::write(&roster, inline).expect("write");
+    let (code, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(0));
+    assert!(out.contains("main"), "the report reads it: {out}");
+
+    let (code, out, err) = acc_quiet(add("work-2", Class::Shared), &env);
+    assert_eq!(code, exit(1));
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("defines `account` inline"), "{err}");
+    assert!(!err.contains("not valid TOML"), "{err}");
+    let dir = env.accounts_store().login_dir("work-2").expect("a label");
+    let row = accounts::row_inline("work-2", Class::Shared, dir.to_str()).expect("a row");
+    assert!(
+        err.trim_end().ends_with(&row),
+        "the row, to add by hand: {err}"
+    );
+    assert_eq!(std::fs::read_to_string(&roster).expect("read"), inline);
+    assert!(!dir.exists(), "a refusal makes no login directory");
+
+    // The row put where the refusal says is the account that was asked for.
+    std::fs::write(&roster, inline.replace(" ]", &format!(", {row} ]"))).expect("write");
+    let read = Roster::load(&roster).expect("admits");
+    assert_eq!(
+        read.row("work-2").map(|r| (r.class, r.dir.clone())),
+        Some((Class::Shared, dir.to_str().map(str::to_owned)))
+    );
+
+    // THE EMPTY INLINE ARRAY (`account = []`) is a roster with no rows, so a
+    // first `add` lists this machine's own login before the one asked for.
+    // The refusal prints BOTH rows, in that order, and says whose the first
+    // is; it used to print the row for `main` alone, and never the one that
+    // was asked for.
+    let empty = "account = []\n";
+    std::fs::write(&roster, empty).expect("write");
+    let (code, out, err) = acc_quiet(add("work-2", Class::Shared), &env);
+    assert_eq!(code, exit(1));
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("defines `account` inline"), "{err}");
+    let own = accounts::row_inline(ACCOUNTS_OWN_LABEL, Class::Dedicated, None).expect("a row");
+    assert!(
+        err.trim_end().ends_with(&format!("{own}, {row}")),
+        "both rows, to add by hand: {err}"
+    );
+    assert!(
+        err.contains("this machine's own login") && err.contains("these rows"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(&roster).expect("read"), empty);
+    assert!(!dir.exists(), "a refusal makes no login directory");
+    // The two put where the refusal says are the roster a first `add` makes.
+    std::fs::write(&roster, format!("account = [ {own}, {row} ]\n")).expect("write");
+    let read = Roster::load(&roster).expect("admits");
+    assert_eq!(
+        read.rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.class, r.dir.is_some()))
+            .collect::<Vec<_>>(),
+        [
+            (ACCOUNTS_OWN_LABEL, Class::Dedicated, false),
+            ("work-2", Class::Shared, true)
+        ]
+    );
+}
+
+/// A CHECK AFTER THE CLOCK WAS SET BACK IS STILL RECORDED. A word stamped
+/// ahead of the clock used to make every later answer "older than the one
+/// held": `check` printed `signed in` and recorded nothing, for as long as
+/// the clock was behind the stamp, and the account stayed signed-out to
+/// `use` and to every rotation.
+#[test]
+fn a_check_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
+    let tmp = tmp_dir("accounts-check-clock");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let store = env.accounts_store();
+    let mut state = accounts::State {
+        machine: "0a0b".to_string(),
+        ..accounts::State::default()
+    };
+    // Recorded while the clock ran a day fast.
+    accounts::note_auth(&mut state, "main", Auth::SignedOut, env.now + 86_400);
+    store.save(&state).expect("save");
+
+    let all_in = |_: &str| said(true);
+    let (code, out, err) = acc(AccountsCmd::Check, &env, &FakeHost::new(&all_in));
+    assert_eq!(code, exit(0), "{err}");
+    assert!(out.contains("main: signed in"), "{out}");
+    let (state, _) = store.load(env.now).expect("this build's state");
+    assert_eq!(
+        (state.account("main").auth, state.account("main").auth_at),
+        (Auth::Ok, Some(env.now))
+    );
+    let (code, _, err) = acc_quiet(
+        AccountsCmd::Use {
+            label: "main".to_string(),
+        },
+        &env,
+    );
+    assert_eq!(code, exit(0), "no longer refused as signed-out: {err}");
+}
+
+/// THE ONE RUNNER OF `auth status --json` ([`auth_status_of`]) runs THE
+/// PROGRAM IT IS GIVEN, by its path — a window's supervisor hands it the
+/// session's own — under the login it is given, with USER handed through:
+/// a stand-in that answers `loggedIn: true` only with USER set and the login
+/// variable set-and-empty reads signed in for the default login and signed
+/// out for a directory. NEGATIVE CONTROLS: with neither USER nor LOGNAME it
+/// is NOT RUN (the vendor then reports a login that works as signed out) —
+/// the stand-in leaves no mark of having run; and a program that does not
+/// exist could not run, with no word of any output.
+#[cfg(unix)]
+#[test]
+fn the_auth_runner_runs_the_program_it_is_given_under_the_login() {
+    let tmp = tmp_dir("auth-runner");
+    let program = tmp.path().join("claude");
+    let ran = tmp.path().join("ran");
+    // `ran` is read off `$0`, so the body is the same on every run and
+    // `stand_in` hands back an inode already assessed.
+    aterm_tempfile::stand_in(
+        &program,
+        &format!(
+            "#!/bin/sh\necho x >> \"${{0%/*}}/ran\"\nif [ -n \"$USER\" ] && [ \"${{{var}+set}}\" = set ] && [ -z \"${var}\" ]; \
+             then echo '{{\"loggedIn\":true,\"email\":\"nobody\"}}'; exit 0; fi\necho \
+             '{{\"loggedIn\":false}}'; exit 1\n",
+            var = accounts::LOGIN_ENV,
+        ),
+    )
+    .unwrap();
+    let user = |name: &str| (name == "USER").then(|| OsString::from("someone"));
+    // The runner under a hang detector, not the product's 20 s: a stand-in's
+    // first exec on a machine can wait out the system's code-policy check.
+    let auth_status =
+        |program: &std::ffi::OsStr, login: &str, var: &dyn Fn(&str) -> Option<OsString>| {
+            auth_status_within(program, login, var, aterm_spec::wait::MUST_HAPPEN)
+        };
+    let none = |_: &str| None;
+
+    // NEGATIVE CONTROL: no USER, not run.
+    assert_eq!(
+        auth_status(program.as_os_str(), "", &none).err(),
+        Some(AUTH_CHECK_NO_USER.to_string())
+    );
+    assert!(!ran.exists(), "the program was not started");
+
+    assert_eq!(
+        login_check(auth_status(program.as_os_str(), "", &user)),
+        LoginCheck::SignedIn,
+        "the default login, named by the empty value"
+    );
+    assert_eq!(
+        login_check(auth_status(program.as_os_str(), "/logins/work-2", &user)),
+        LoginCheck::SignedOut
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap().lines().count(),
+        2,
+        "it was this program that ran, once an ask"
+    );
+    // NEGATIVE CONTROL: no such program.
+    let missing = tmp.path().join("nowhere").join("claude");
+    assert!(matches!(
+        login_check(auth_status(missing.as_os_str(), "", &user)),
+        LoginCheck::CouldNotRun(_)
+    ));
+}
+
+/// `harness limits` places a dated reset as the loop that waits for it does: with
+/// the offset its zone has WHERE IT FALLS. Read on 2026-10-30 12:00 PDT, `Nov 2 at
+/// 9am` is PST (the change was on the 1st), 17:00Z; one offset for the whole of it,
+/// today's, said 16:00Z, an hour before the supervisor continues.
+#[test]
+fn the_view_places_a_dated_reset_across_a_dst_change_with_the_offset_there() {
+    use aterm_phase::prompt::fixtures::{composer, rows};
+    const NOW: i64 = 1_793_386_800; // 2026-10-30 12:00 PDT
+    const DST_ENDS: i64 = 1_793_523_600; // 2026-11-01 02:00 PDT = 09:00Z
+    let la = |zone: &str, at: i64| -> Option<i64> {
+        (zone == "America/Los_Angeles").then_some(if at >= DST_ENDS {
+            -8 * 3600
+        } else {
+            -7 * 3600
+        })
+    };
+    let mut wall = rows(&[
+        "⏺ Running the suite.",
+        "  ⎿  You've hit your weekly limit · resets Nov 2 at 9am (America/Los_Angeles)",
+        "",
+        "✻ Worked for 3m 2s · done 12:00 PM",
+        "",
+    ]);
+    wall.extend(composer("  ⏵⏵ bypass permissions on"));
+    let view = limits_view(&wall, NOW, -7 * 3600, &la);
+    assert_eq!(view.resets_at, Some(1_793_638_800), "Nov 2 17:00Z, PST");
+    assert!(
+        limits_text(&view).contains("resets_at=2026-11-02T17:00:00Z"),
+        "{}",
+        limits_text(&view)
     );
 }

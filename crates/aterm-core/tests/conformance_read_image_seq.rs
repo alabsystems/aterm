@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Conformance (Tier-1): the REAL `Terminal::cell_frame` + `damage_epoch` /
-//! `take_damage` path obeys the DERIVED snapshot-seq protocol (REARCH A-3).
+//! Conformance (Tier-1): the real `Terminal::cell_frame` + `damage_epoch` /
+//! `take_damage` path obeys the derived snapshot-seq protocol.
 //!
 //! `aterm_spec::derive::read_image_seq_model()` is the drift-free model of the
 //! read_image snapshot-seq contract: monotone seq, snapshot internal-consistency
@@ -13,14 +13,14 @@
 //!   * a `cell_frame` snapshot is stamped with `damage_epoch()` (its `snapshot_seq`)
 //!     captured under the one lock — the "value of seq" at snapshot time;
 //!   * subsequent `process()` advances the engine (the live `damage_epoch()` grows)
-//!     but does NOT mutate the already-emitted snapshot's `snapshot_seq` OR its
+//!     but does not mutate the already-emitted snapshot's `snapshot_seq` or its
 //!     rendered cells (no torn read / snapshot isolation);
 //!   * the consumer can always tell its snapshot is behind (`damage_epoch() >
 //!     snap.snapshot_seq`), i.e. staleness is detectable.
 //!
 //! The observed state is projected onto the model's `<<epoch, snapped, snap_seq,
-//! torn>>` and checked against its actual invariants. A NEGATIVE CONTROL (a forced
-//! retro-mutation of the captured seq) is shown to VIOLATE `NoTornRead`, so the
+//! torn>>` and checked against its actual invariants. A negative control (a forced
+//! retro-mutation of the captured seq) is shown to violate `NoTornRead`, so the
 //! pass is never vacuous. The run-ahead stamp (`SeqIsStaleOrCurrent`'s mutant) is
 //! driven on the real engine: a host bump, then a real epoch advance that
 //! collides with it. Pure Rust + real engine code, so it always runs.
@@ -39,7 +39,7 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
 
     // Some net-new damage, then advance the engine's monotone epoch by observing
     // it (the latch bumps once per damage session) and consuming the damage so the
-    // NEXT write opens a fresh session — exactly the gui's lock-held discipline.
+    // next write opens a fresh session — exactly the gui's lock-held discipline.
     term.process(b"hello");
     let _ = term.damage_epoch();
     term.take_damage();
@@ -52,7 +52,7 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
     let snap_seq = snap.snapshot_seq;
     let snap_cells = snap.cells.clone();
     // The live epoch equals the captured seq right after the snapshot (the engine
-    // is idempotent within a damage session): the snapshot is CURRENT, not stale.
+    // is idempotent within a damage session): the snapshot is current, not stale.
     assert_eq!(
         term.damage_epoch(),
         snap_seq,
@@ -65,7 +65,7 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
     term.process(b"\r\nmore output on a new line");
     let live_after = term.damage_epoch();
 
-    // 1. MONOTONE SEQ + STALENESS-DETECTABLE: the live epoch advanced past the held
+    // 1. monotone seq + STALENESS-DETECTABLE: the live epoch advanced past the held
     //    snapshot, so a consumer comparing them sees its snapshot is behind.
     assert!(
         live_after > snap_seq,
@@ -73,7 +73,7 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
          (monotone seq; staleness is observable as live > snap)"
     );
 
-    // 2. SNAPSHOT INTERNAL-CONSISTENCY / NO TORN READ: the already-emitted snapshot
+    // 2. snapshot INTERNAL-CONSISTENCY / no torn read: the already-emitted snapshot
     //    is frozen — neither its seq stamp nor its rendered cells changed despite
     //    the later writes.
     assert_eq!(
@@ -85,7 +85,7 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
         "held snapshot's cells must not change after later writes"
     );
 
-    // Project the observed outcome onto the model vars and check its REAL
+    // Project the observed outcome onto the model vars and check its real
     // invariants. `snapped = 1` (a snapshot was taken), `torn = 0` (no leak),
     // `epoch = live_after`, `snap_seq = snap_seq`.
     let observed: BTreeMap<&'static str, i64> = [
@@ -108,8 +108,8 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
         "the real monotone/staleness outcome must satisfy SeqIsStaleOrCurrent"
     );
 
-    // NEGATIVE CONTROL (non-vacuity): a TORN read — the captured seq retro-mutated
-    // to the later epoch — MUST violate the model's NoTornRead invariant. If this
+    // Negative control (non-vacuity): a torn read — the captured seq retro-mutated
+    // to the later epoch — must violate the model's NoTornRead invariant. If this
     // ever passed, the invariant would be trivially true and the above pass empty.
     let torn_state: BTreeMap<&'static str, i64> = [
         ("epoch", i64::try_from(live_after).expect("epoch fits i64")),
@@ -140,8 +140,8 @@ fn seq_state(epoch: u64, snap_seq: u64) -> BTreeMap<&'static str, i64> {
     .collect()
 }
 
-/// The model's `snap_seq` is the ENGINE stamp (`engine_fill_seq`), and its
-/// `Buggy = 1` run-ahead capture is a HOST-bumped `snapshot_seq` read in its
+/// The model's `snap_seq` is the engine stamp (`engine_fill_seq`), and its
+/// `Buggy = 1` run-ahead capture is a host-bumped `snapshot_seq` read in its
 /// place. The engine cannot produce a run-ahead stamp itself (the epoch latch only
 /// lags), so this drives the one real way a scratch gets one — the ghost-paint
 /// bump every host mutator performs after writing cells — and then the real
@@ -187,8 +187,8 @@ fn host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is() {
     ));
 }
 
-/// A no-op `process()` (input that leaves the grid undamaged) does NOT advance the
-/// epoch, so a held snapshot stays CURRENT — the model's `snap_seq <= epoch` holds
+/// A no-op `process()` (input that leaves the grid undamaged) does not advance the
+/// epoch, so a held snapshot stays current — the model's `snap_seq <= epoch` holds
 /// with equality and no false staleness is reported.
 #[test]
 fn noop_process_does_not_advance_snapshot_seq() {

@@ -1,49 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A TORN READ IS NOT A CLEARED LINE** (2026-09-22 — the owner, on the
-//! shipped 0.89, a Claude Code composer under a running agent: *"There is a
-//! rainbow trail gap in 0.89. I'm not sure what is causing it but it seems
-//! like some kind of back cursor movement bug."* — a three-cell black hole
-//! under `TO ` of `INTO `, the settled body left of it, the hot `MAIN!!!!`
-//! run to the caret right of it).
+//! A torn read is not a cleared line. A Claude Code frame (spinner, rules,
+//! composer) is over 1 KiB and the macOS PTY delivers it in 1024-byte reads
+//! (owner, 2026-09-22).
+//! When the host presents between two reads of one frame (the `?2026` hold is
+//! capped, and the frame hold samples every present), the composer row has
+//! been `CSI 2K`-cleared and rewritten only up to the read boundary, caret
+//! hidden, and the identical text returns 2 to 30 ms later. The band must show
+//! no hole:
 //!
-//! A Claude Code frame — spinner, rules, composer — is over 1 KiB, and the
-//! macOS PTY hands it over in 1024-byte reads. When the host presents between
-//! two reads of one frame (the `?2026` hold is capped, the frame hold samples
-//! on every present), the composer row has been `CSI 2K`-cleared and rewritten only up
-//! to the read boundary, the caret hidden. The content witness read every
-//! recorded cell right of the boundary as glyph → BLANK, and the identical
-//! text back 2 to 30 ms later found the light already committed to leave:
+//! * moved-text arm: a blanked fragment still standing in place in its run has
+//!   not moved, even if the same letters appear elsewhere on the line; it is
+//!   released and the identical text lifts it on the next present;
+//! * restore arm: the restore counts the cohort without the held key's cell the
+//!   pre-witness tick just laid, so it succeeds;
+//! * the comb: a released run does not release the spaces of its standing text
+//!   with it.
 //!
-//! * the MOVED-TEXT arm: a one- or two-glyph blanked fragment (`TO`, `N`)
-//!   stands somewhere else on any line of English, so the fragment was ruled
-//!   moved text and RETIRED — the fast melt no restore reaches, inside the
-//!   hand's own live run (the owner's hole);
-//! * the RESTORE arm: a unique fragment was released in part, but the tick
-//!   that runs before the witness lays the held key's cell into the same
-//!   cohort, so the restore counted one cell too many and refused, on every
-//!   frame after it too — the released cells retracted under a typing hand;
-//! * THE COMB: the released run released every space of its standing text
-//!   with it, a one-cell hole at each word boundary when it did not come back.
-//!
-//! Every take here drives the real seam: an `aterm_core` [`Terminal`] fed the
-//! composer's bytes, its rows sampled as `app_render.rs`'s frame hold samples
-//! them, [`CursorGlow`] ticked on a 16 ms train with the hints the app stamps
-//! for each key. The census is the PLAN's coverage on the typed row: a HOLE is
-//! a dark column strictly between two lit ones. Measured on the same takes
-//! before the fix (HEAD `e05d7860e`): the owner's line torn under `TO` — a
-//! two-cell hole from the torn present to the end of the take; plain typing
-//! over a boundary at text column 60 — a 45-cell hole for 4.35 s; the spinner
-//! twin — the same hole with no key in flight; the comb — every space of the
-//! standing text dark for the retract.
+//! Every take drives the real seam: an `aterm_core` [`Terminal`] fed the
+//! composer's bytes, rows sampled as `app_render.rs`'s frame hold does, and
+//! [`CursorGlow`] ticked on a 16 ms train with the app's hints per key. The
+//! census is the plan's coverage on the typed row; a hole is a dark column
+//! strictly between two lit ones.
 
+use crate::common::{
+    LIT_COV, Rec, caret_sample, class_of, coverage, holes_of, is_key, note_blink,
+    observe_caret_row, observe_ribbon_rows, rainbow_cfg, recording,
+};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::rainbow_kitty::TypedClass;
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::ribbon::{RETIRE_MELT_S, RETRACT_DUR_S, RETRACT_FADE_S};
-use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
 const CW: usize = 8;
@@ -61,8 +49,6 @@ const FRAME_MS: u64 = 16;
 const SPINNER_MS: u64 = 100;
 /// macOS PTY reads.
 const PTY_READ: usize = 1024;
-/// A column is LIT at this planned coverage (the glass census's 20/255).
-const LIT_COV: u8 = 20;
 
 /// The owner's line.
 const LINE: &str = "zoom out. first of all, STOP LANDING BRANCHES AND PATCHES! YOU NEED TO FUCKING MERGE ALL BEST WORK INTO MAIN!!!!";
@@ -89,61 +75,16 @@ const SPIN: [char; 4] = ['✻', '✶', '✳', '✢'];
 enum Split {
     /// The whole frame in one read.
     Whole,
-    /// ONE present right after text column `j` of the composer row was
-    /// written, the rest of the row still blank from `CSI 2K`, the caret
-    /// hidden: the torn read.
+    /// One present right after text column `j` of the composer row was written,
+    /// the rest of the row still blank from `CSI 2K`, the caret hidden: the torn
+    /// read.
     TextCol(usize),
     /// A present after every [`PTY_READ`]-byte chunk of the frame.
     Chunks,
 }
 
 fn geom() -> Geom {
-    Geom {
-        cw: CW,
-        ch: CH,
-        rows: ROWS,
-        cols: COLS,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (COLS * CW) as u16,
-        win_h: (ROWS * CH) as u16,
-        head: 0,
-    }
-}
-
-/// The owner's config: rainbow kitty, tall body, intensity 0.70, dark.
-fn cfg() -> GlowConfig {
-    GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
-    }
-}
-
-/// The host's `typed_class_for` and `glyph_shifted && !spacebar`.
-fn class_of(ch: char) -> (bool, TypedClass) {
-    match ch {
-        ' ' => (false, TypedClass::Space),
-        '!' => (true, TypedClass::Bang),
-        c if c.is_uppercase() => (true, TypedClass::Capital),
-        _ => (false, TypedClass::Glyph),
-    }
+    crate::common::geom(ROWS, COLS, CW, CH)
 }
 
 /// Interior dark runs of one row as `(first col, len)`.
@@ -172,46 +113,6 @@ struct Census {
     live: Vec<u16>,
 }
 
-/// Plan coverage per column of `row`.
-fn coverage(glow: &CursorGlow, row: u16, cw: usize, ch: usize, cols: usize) -> Vec<u8> {
-    let mut cov = vec![0u8; cols];
-    let rib = glow.v2_ribbon().expect("rainbow kitty owns the frame");
-    for sg in rib.plan_segments() {
-        let r = ((sg.spine / ch as f32) - 0.5).floor();
-        let c = (sg.x / cw as f32).floor();
-        if r >= 0.0 && c >= 0.0 && r as usize == usize::from(row) && (c as usize) < cols {
-            let i = c as usize;
-            cov[i] = cov[i].max(sg.cov);
-        }
-    }
-    cov
-}
-
-/// Interior dark runs of a coverage lane.
-fn holes_of(cov: &[u8]) -> Vec<(usize, usize)> {
-    let lit: Vec<usize> = (0..cov.len()).filter(|&i| cov[i] >= LIT_COV).collect();
-    let mut holes = Vec::new();
-    if lit.len() < 2 {
-        return holes;
-    }
-    let mut start = None;
-    for (i, &v) in cov
-        .iter()
-        .enumerate()
-        .take(lit[lit.len() - 1] + 1)
-        .skip(lit[0])
-    {
-        if v >= LIT_COV {
-            if let Some(s) = start.take() {
-                holes.push((s, i - s));
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    holes
-}
-
 /// The host: one terminal, the kitty, one clock, the composer's state.
 struct Host {
     term: Terminal,
@@ -232,9 +133,9 @@ struct Host {
     /// How every key repaint is delivered, and every spinner repaint.
     key_split: Split,
     spin_split: Split,
-    /// Extra bytes at the head of every frame — SGR no-ops, so nothing
-    /// wraps or scrolls — that move every PTY read boundary by that much, as
-    /// the transcript streaming above the box does.
+    /// Extra bytes at the head of every frame (SGR no-ops, so nothing wraps or
+    /// scrolls) that shift every PTY read boundary, as the transcript streaming
+    /// above the box does.
     pad: usize,
     /// Presents that showed the composer row torn inside its text.
     torn: Vec<usize>,
@@ -255,7 +156,7 @@ impl Host {
         let mut h = Self {
             term,
             glow,
-            cfg: cfg(),
+            cfg: rainbow_cfg(),
             t0: now,
             now,
             last_event: now,
@@ -284,32 +185,19 @@ impl Host {
     /// EXACTLY the frame hold — the caret's row probe and every ribbon row, whether
     /// or not the caret is visible — then the tick, then the census.
     fn frame(&mut self) {
-        let c = self.term.cursor();
-        let cur = self.term.cursor_visible().then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink {
-            self.blink = epoch;
-            self.glow.note_repaint_blink(self.now);
-        }
+        let (c, cur) = caret_sample(&self.term);
+        note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
         let alt = self.term.is_alternate_screen();
         self.glow.note_context(alt);
-        self.term
-            .row_cols_into(usize::from(c.row), &mut self.row_buf);
-        self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            self.glow.observe_ribbon_row(r, &self.row_buf);
-        }
+        observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+        observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow
             .tick(cur, self.now, &self.cfg, geom(), &mut self.out);
         self.record(ROW);
     }
 
     fn record(&mut self, row: u16) {
-        let cov = coverage(&self.glow, row, CW, CH, COLS);
+        let cov = coverage(&self.glow, geom(), row);
         self.term.row_cols_into(usize::from(row), &mut self.row_buf);
         let text: String = self
             .row_buf
@@ -389,8 +277,8 @@ impl Host {
 
     /// Claude Code's frame: the dynamic region (transcript, spinner, a blank,
     /// the box, the hint row) rewritten row by row inside `?2026h` / `?25l`,
-    /// then the caret's CUP, `?25h`, `?2026l`. Returns the bytes and the
-    /// byte offset of the composer text's first char.
+    /// then the caret's CUP, `?25h`, `?2026l`. Returns the bytes and the offset
+    /// of the composer text's first char.
     fn frame_bytes(&self) -> (Vec<u8>, usize) {
         let mut rows: Vec<String> = FILLER.iter().map(|s| (*s).to_string()).collect();
         rows.push(format!(
@@ -468,8 +356,8 @@ impl Host {
 
     /// A word hop (Option+Left / Option+Right as Claude Code moves: to the
     /// previous word's start, past the next word's end) `ms` after the last
-    /// event: the seam stamps the navigation hint, the composer moves the
-    /// caret and repaints.
+    /// event: the navigation hint is stamped, the composer moves the caret and
+    /// repaints.
     fn hop_after(&mut self, left: bool, ms: u64, split: Split) {
         self.schedule(ms);
         self.label = if left { "opt-left" } else { "opt-right" }.into();
@@ -581,13 +469,11 @@ fn assert_whole(h: &Host, what: &str) {
     );
 }
 
-/// **THE OWNER'S HOLE.** The owner's line typed at the end of the composer,
-/// every key from `M` on repainted in two reads with a present between them
-/// after `…WORK IN`: `TO` is blanked on each torn present, and `TO` stands at
-/// two other places on the line (`STOP`, `NEED TO`). It was ruled MOVED TEXT
-/// and melted, and nothing ever re-lays an interior column. A run with a
-/// recorded glyph still standing in place has not moved: the fragment is
-/// released and the identical text lifts it on the very next present.
+/// The line typed at the end of the composer, every key from `M` on repainted in
+/// two reads with a present between them after `…WORK IN`: `TO` is blanked on
+/// each torn present, and `TO` also stands elsewhere on the line (`STOP`, `NEED
+/// TO`). A run with a recorded glyph still standing in place has not moved, so
+/// the fragment is released and the identical text lifts it on the next present.
 #[test]
 fn the_owners_line_torn_under_to_of_into_keeps_its_band_whole() {
     let mut h = Host::new(false);
@@ -612,12 +498,11 @@ fn the_owners_line_torn_under_to_of_into_keeps_its_band_whole() {
     assert_whole(&h, "the owner's line torn under TO");
 }
 
-/// **THE RESTORE ARM.** A fragment found nowhere else was released in part,
-/// and the tick that runs before the witness laid the key's own cell into
-/// the same cohort: the restore compared the cohort's whole pool against the
-/// count saved at the release and refused on the new key, and on every frame
-/// after it. The line here has no twin for the torn tail, so only the
-/// restore decides; every key from col 90 on is torn there.
+/// The restore arm: a fragment found nowhere else is released in part, and the
+/// tick before the witness lays the key's own cell into the same cohort. The
+/// restore must still succeed on that key and every later frame. The line has
+/// no twin for the torn tail, so only the restore decides; every key from col
+/// 90 on is torn there.
 #[test]
 fn a_released_tail_is_restored_although_the_key_is_laid_before_the_restore() {
     let line = "the quick brown fox jumps over the lazy dog while seven wizards quietly hex jumbo pyramids";
@@ -647,10 +532,9 @@ fn a_released_tail_is_restored_although_the_key_is_laid_before_the_restore() {
     assert_whole(&h, "a unique tail torn under every key");
 }
 
-/// **PLAIN TYPING OVER A READ BOUNDARY** (the reproducer's Take C). No hop,
-/// no insert: from the 61st key on, every key's frame is torn at text column
-/// 60 (and, second take, 90). Measured before: the band dark from the
-/// boundary to the head — 45 cells for 4.35 s, 32 cells for 2.0 s.
+/// Plain typing over a read boundary: no hop, no insert; from the 61st key on,
+/// every key's frame is torn at text column 60 (and, second take, 90). The band
+/// stays lit from the boundary to the head.
 #[test]
 fn plain_typing_at_the_end_of_the_line_over_a_read_boundary_keeps_the_band_whole() {
     for j in [60usize, 90] {
@@ -663,10 +547,9 @@ fn plain_typing_at_the_end_of_the_line_over_a_read_boundary_keeps_the_band_whole
     }
 }
 
-/// Exactly `n` bytes of SGR no-ops (`n` is 0 or at least 3): a pad that
-/// moves the frame's read boundaries without writing a cell — a padded
-/// transcript ROW would wrap across the screen and scroll the whole frame,
-/// which moves the composer's text for real.
+/// Exactly `n` bytes of SGR no-ops (`n` is 0 or at least 3): a pad that moves the
+/// read boundaries without writing a cell (a padded transcript row would wrap
+/// and scroll the frame, moving the composer's text for real).
 fn sgr_pad(n: usize) -> String {
     assert!(n == 0 || n >= 3, "an SGR pad is 0 or at least 3 bytes");
     if n == 0 {
@@ -686,10 +569,10 @@ fn pad_for_boundary_at(j: usize) -> usize {
     if n < 3 { n + PTY_READ } else { n }
 }
 
-/// The same with the frame chunked exactly as macOS PTY reads chunk it — a
-/// present after every 1024 bytes of every key's frame and every spinner
-/// repaint, ten a second — the transcript padded so a boundary falls inside
-/// the composer's text at column 30, 60, 90 and under `TO`.
+/// The same with each frame chunked as macOS PTY reads chunk it: a present after
+/// every 1024 bytes of every key's frame and every spinner repaint (ten a
+/// second), the transcript padded so a boundary falls inside the composer's text
+/// at column 30, 60, 90 and under `TO`.
 #[test]
 fn claude_code_frames_in_1024_byte_reads_keep_the_band_whole_while_the_hand_types() {
     for j in [30usize, 60, 90, AT_TO] {
@@ -707,16 +590,12 @@ fn claude_code_frames_in_1024_byte_reads_keep_the_band_whole_while_the_hand_type
     }
 }
 
-/// **THE OWNER'S OWN GUESS — "SOME KIND OF BACK CURSOR MOVEMENT".** The line
-/// typed without `INTO `, Option+Left to the start of `MAIN`, `INTO `
-/// inserted there (every key shifts `MAIN!!!!` one column right), Option+Right
-/// back to the end — with the insert keys' and the hop's frames torn by a
-/// read boundary around the insert point, one present between the reads.
-/// Measured before at the same seam: a 2- to 4-cell hole under `INTO` for
-/// 590 to 1240 ms, and 42 to 72 cells from a boundary left of the insert.
-/// The insert's own verdicts stand — the tail it pushes past the run's end
-/// is replaced text and may melt, exactly as with no torn read — so only the
-/// band's continuity is asserted.
+/// A back cursor movement: the line typed without `INTO `, Option+Left to the
+/// start of `MAIN`, `INTO ` inserted (each key shifts `MAIN!!!!` one column
+/// right), Option+Right back to the end, with the insert keys' and hop's frames
+/// torn around the insert point. The insert's own verdicts stand (the tail it
+/// pushes past the run's end is replaced text and may melt), so only the band's
+/// continuity is asserted.
 #[test]
 fn an_insert_through_word_hops_under_torn_reads_keeps_the_band_whole() {
     let head = &LINE[..99];
@@ -735,7 +614,10 @@ fn an_insert_through_word_hops_under_torn_reads_keeps_the_band_whole() {
             ));
         }
     }
-    for (what, split, pad, spinner) in takes {
+    // Each take builds its own host on its own clock: the takes run on the
+    // binary's threads (`par_map`); a failing take's panic propagates in order.
+    crate::common::par_map(&takes, |(what, split, pad, spinner)| {
+        let (split, pad, spinner) = (*split, *pad, *spinner);
         let mut h = Host::with_pad(spinner, pad);
         h.type_str(head);
         h.type_str(tail);
@@ -750,15 +632,13 @@ fn an_insert_through_word_hops_under_torn_reads_keeps_the_band_whole() {
         assert_eq!(h.caret, LINE.len(), "the hop landed at the end");
         h.idle(600);
         assert_no_hole(&h, &format!("insert through hops, {what}"));
-    }
+    });
 }
 
-/// **THE SPINNER TWIN.** No key in flight: every key's own frame arrives
-/// whole, but the agent's spinner repaints the region ten times a second and
-/// one read of every repaint ends after `…WORK IN`. Between two keys, the
-/// newest glyphs right of the boundary — `T`, then `TO` — are blanked by a
-/// spinner frame alone, found elsewhere on the line, and were melted exactly
-/// as under a key's torn frame.
+/// The spinner twin: no key in flight; each key's own frame arrives whole, but
+/// the agent's spinner repaints the region ten times a second and one read of
+/// each repaint ends after `…WORK IN`. The newest glyphs right of the boundary
+/// (`T`, then `TO`), blanked by a spinner frame alone, must not melt.
 #[test]
 fn a_spinner_repaint_torn_under_to_with_no_key_in_flight_keeps_the_band_whole() {
     let mut h = Host::new(true);
@@ -773,13 +653,10 @@ fn a_spinner_repaint_torn_under_to_with_no_key_in_flight_keeps_the_band_whole() 
     assert_whole(&h, "the spinner torn under TO");
 }
 
-/// **THE COMB, AND THE CONTROL.** A program REALLY clears the tail of a typed
-/// line (the caret hidden, the tail never written back): the tail is
-/// released and leaves through the retract, as a cleared line always did —
-/// but only the tail. The spaces of the text still standing left of it are
-/// not released with it: before, every never-armed cell of the run went, and
-/// the standing text read as word-shaped blocks with a hole at each space
-/// for the whole retract.
+/// The comb, and the control: a program really clears the tail of a typed line
+/// (caret hidden, tail never rewritten). The tail is released and leaves through
+/// the retract, as a cleared line does, but only the tail: the spaces of the
+/// text still standing left of it stay lit.
 #[test]
 fn a_really_cleared_tail_leaves_and_takes_only_its_own_spaces() {
     let mut h = Host::new(false);
@@ -834,22 +711,14 @@ fn a_really_cleared_tail_leaves_and_takes_only_its_own_spaces() {
     );
 }
 
-/// **THE OTHER CONTROL — the band FOLLOWS its text now** (re-pinned
-/// 2026-09-22, the fold-flow merge). A whole run genuinely re-laid
-/// elsewhere — the composer's text moved to another row, its old row
-/// blanked — used to melt fast after its text: nothing of it stood in
-/// place, so the moved-text search ruled it and `RETIRE_MELT_S` took it.
-/// The owner ruled that exit out on 2026-09-21 (*"when typing wraps to a
-/// new line the previous row's rainbow vanishes suddenly"*), and the
-/// FOLLOW PASS answers it: where the run's glyphs stand as a block one or
-/// two rows away ([`rk::witness::Witness::follow_runs`]), the cells are
-/// carried there with their clocks ([`Ribbon::translate_run`]) instead of
-/// being melted where the text no longer is. So the LAW THIS CONTROL
-/// STATES IS UNCHANGED in what the owner sees — no light is left standing
-/// under moved text — and what changed is where the light goes: onto its
-/// own glyphs, not into a 0.12 s melt. The melt is still the verdict when
-/// the text is GONE rather than moved: `a_cleared_tail_releases_and_the_
-/// standing_text_keeps_its_spaces` above, and the witness's own unit laws.
+/// The other control: the band follows its text. A whole run re-laid elsewhere
+/// (the composer's text moved to another row, its old row blanked) is carried
+/// with its clocks ([`Ribbon::translate_run`]) to where its glyphs stand as a
+/// block one or two rows away ([`rk::witness::Witness::follow_runs`]), so no
+/// light is left under moved text. The melt is still the verdict when the text
+/// is gone rather than moved
+/// (`a_cleared_tail_releases_and_the_standing_text_keeps_its_spaces`, and the
+/// witness's unit laws).
 #[test]
 fn a_whole_run_re_laid_on_another_row_follows_its_text() {
     let mut h = Host::new(false);
@@ -870,9 +739,8 @@ fn a_whole_run_re_laid_on_another_row_follows_its_text() {
     );
     let moved = h.census.len() - 1;
     let c = &h.census[moved];
-    // NOTHING IS LEFT BEHIND: the old row owns no cell at all — neither a
-    // live one nor one on the melt — because every one of them went up with
-    // its glyphs on the tick the repaint landed.
+    // Nothing is left behind: the old row owns no cell, live or melting; every
+    // one went up with its glyphs on the repaint's tick.
     assert!(
         c.live.is_empty() && c.retiring.is_empty(),
         "the old row keeps no cell: live {:?}, retiring {:?}",
@@ -880,7 +748,7 @@ fn a_whole_run_re_laid_on_another_row_follows_its_text() {
         c.retiring
     );
     // …and the band is on the row the text moved to, under its own glyphs.
-    let up = coverage(&h.glow, ROW - 2, CW, CH, COLS);
+    let up = coverage(&h.glow, geom(), ROW - 2);
     let lit_up: Vec<usize> = (0..COLS).filter(|&i| up[i] >= LIT_COV).collect();
     assert!(
         lit_up.len() >= text.len() / 2,
@@ -900,11 +768,11 @@ fn a_whole_run_re_laid_on_another_row_follows_its_text() {
 // Claude Code's real bytes.
 // ---------------------------------------------------------------------------
 
-/// The four takes recorded under a PTY wrapper inside a headless aterm with
-/// real Claude Code (2026-09-21): the owner's line typed at 12 cps with
-/// Option+Left, `INTO ` inserted, Option+Right / End back (`-end`), three
-/// hops each way (`-scrub3`), an `@`-mention popup open while typing
-/// (`-popup`). Every `O` line is one PTY read, at most 1024 bytes.
+/// Four takes recorded under a PTY wrapper in a headless aterm with real Claude
+/// Code: a line typed at 12 cps with Option+Left, `INTO ` inserted, Option+Right
+/// / End back (`-end`), three hops each way (`-scrub3`), an `@`-mention popup
+/// open while typing (`-popup`). Every `O` line is one PTY read, at most 1024
+/// bytes.
 const FIXTURES: [(&str, &str); 4] = [
     (
         "insert",
@@ -930,38 +798,6 @@ const REC_CW: usize = 7;
 const REC_CH: usize = 14;
 const REC_ROW: u16 = 37;
 
-enum Rec {
-    Out(Vec<u8>),
-    In(Vec<u8>),
-}
-
-fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex"))
-        .collect()
-}
-
-/// `(ms from the first line, event)`; the stamps are nanoseconds.
-fn recording(src: &str) -> Vec<(u64, Rec)> {
-    let mut t0 = None;
-    src.lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            let mut it = l.splitn(3, ' ');
-            let ns: u64 = it.next().expect("stamp").parse().expect("stamp");
-            let kind = it.next().expect("kind");
-            let bytes = unhex(it.next().expect("bytes"));
-            let t0 = *t0.get_or_insert(ns);
-            let ms = (ns - t0) / 1_000_000;
-            match kind {
-                "O" => (ms, Rec::Out(bytes)),
-                "I" => (ms, Rec::In(bytes)),
-                k => panic!("bad kind {k}"),
-            }
-        })
-        .collect()
-}
-
 /// Replay one recording: every read presented on its own (and, `torn`, every
 /// read split in half with a present between the halves — a torn read of
 /// every frame), the hints the app stamps for the keys, a 16 ms train
@@ -972,25 +808,15 @@ fn replay(src: &str, torn: bool) -> (Vec<HoleFrame>, usize) {
     let mut term = Terminal::new(REC_ROWS as u16, REC_COLS as u16);
     let mut glow = CursorGlow::default();
     glow.note_pane_columns(0, REC_COLS);
-    let g = Geom {
-        cw: REC_CW,
-        ch: REC_CH,
-        rows: REC_ROWS,
-        cols: REC_COLS,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (REC_COLS * REC_CW) as u16,
-        win_h: (REC_ROWS * REC_CH) as u16,
-        head: 0,
-    };
-    let cfg = cfg();
+    let g = crate::common::geom(REC_ROWS, REC_COLS, REC_CW, REC_CH);
+    let cfg = rainbow_cfg();
     let mut out = Vec::new();
     let mut row_buf = Vec::new();
     let mut blink = 0u64;
     let mut now = now0;
-    let rec = recording(src);
+    // The stamps are nanoseconds.
+    let rec = recording(src, 1_000_000);
     // Typing runs from the first printable key to the exit chord.
-    let is_key = |b: &[u8]| matches!(b, [c] if (0x20..0x7f).contains(c));
     let first_key = rec
         .iter()
         .find(|(_, e)| matches!(e, Rec::In(b) if is_key(b)))
@@ -1009,28 +835,16 @@ fn replay(src: &str, torn: bool) -> (Vec<HoleFrame>, usize) {
     let mut holes = Vec::new();
     let mut frames = 0usize;
     let mut frame = |term: &Terminal, glow: &mut CursorGlow, now: Instant, frames: &mut usize| {
-        let c = term.cursor();
-        let cur = term.cursor_visible().then_some((c.row, c.col));
-        let epoch = term.repaint_blink_epoch();
-        if epoch != blink {
-            blink = epoch;
-            glow.note_repaint_blink(now);
-        }
+        let (c, cur) = caret_sample(term);
+        note_blink(term, glow, &mut blink, now);
         glow.note_context(term.is_alternate_screen());
-        term.row_cols_into(usize::from(c.row), &mut row_buf);
-        glow.observe_row(c.row, c.col, &row_buf, now);
-        glow.observe_ribbon_row(c.row, &row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            term.row_cols_into(usize::from(r), &mut row_buf);
-            glow.observe_ribbon_row(r, &row_buf);
-        }
+        observe_caret_row(term, glow, &mut row_buf, c, now);
+        observe_ribbon_rows(term, glow, &mut row_buf);
         glow.tick(cur, now, &cfg, g, &mut out);
         *frames += 1;
         let ms = now.saturating_duration_since(now0).as_millis() as u64;
         if ms >= first_key && ms <= last_key {
-            let cov = coverage(glow, REC_ROW, REC_CW, REC_CH, REC_COLS);
+            let cov = coverage(glow, g, REC_ROW);
             let found = holes_of(&cov);
             if !found.is_empty() {
                 let map: String = cov
@@ -1075,14 +889,12 @@ fn replay(src: &str, torn: bool) -> (Vec<HoleFrame>, usize) {
     (holes, frames)
 }
 
-/// **THE REAL BYTES.** Claude Code's own recorded frames, each PTY read
-/// presented as it came (the 1024-byte reads of the recording), and again
-/// with every read torn in half: the composer row carries no interior hole
-/// from the first typed key to the last. A GUARD, not a reproducer — it held
-/// before the fix too: with nothing submitted there is no spinner, and the
-/// recorded composer frames are one-glyph diffs with no `CSI 2K`, so a torn
-/// read of them blanks nothing. It pins that the custody changes leave the
-/// real composer's own frames exactly as whole as they were.
+/// The real bytes: Claude Code's recorded frames, each read presented as it came
+/// and again torn in half, leave no interior hole on the composer row from the
+/// first typed key to the last. A guard: with nothing submitted there is no
+/// spinner and the composer frames are one-glyph diffs with no `CSI 2K`, so a
+/// torn read blanks nothing; it pins that the custody laws keep those frames
+/// whole.
 #[test]
 fn claude_code_s_recorded_bytes_read_whole_or_torn_keep_the_band_whole_while_typing() {
     for (name, src) in FIXTURES {

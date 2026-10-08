@@ -1,59 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Tier-1 conformance: bind the REAL subscription cursor to the DERIVED
-//! `Cursor` model (`aterm_spec::derive::cursor_model()`).
+//! Tier-1 conformance: binds the real subscription cursor to the derived
+//! `Cursor` model (`aterm_spec::derive::cursor_model()`). `Grow` advances the
+//! writer's `seq`; `Deliver` (enabled while the reader is behind) catches
+//! `cursor` up to `seq`; `CursorBounded` says the reader never passes the
+//! writer. `Buggy = 1` is an off-by-one delivery that parks the cursor one past
+//! the head, silently skipping the next event.
 //!
-//! The model is the writer/reader pair in miniature: `Grow` advances the
-//! writer's `seq` and leaves the reader alone; `Deliver` (enabled only while the
-//! reader is behind) catches the reader's `cursor` up to `seq`;
-//! `CursorBounded` says the reader never passes the writer. Its `Buggy = 1`
-//! member is the off-by-one class a cursor API can ship with (not a defect this
-//! one is known to have had) — a delivery that parks the cursor one PAST the
-//! head, so the next event written is silently skipped.
-//!
-//! This drives aterm-buffer's real `Surface::apply` (Grow) and
-//! `Surface::subscribe`/`poll` (Deliver), projects each state onto
-//! `<<seq, cursor>>`, and validates every real transition against the model
-//! (in-process interpreter, plus `ty trace validate` wherever installed).
-//! `subscribe`/`poll` are the library's public read face and no product crate
-//! calls them today — aterm-gui, the only dependent, never opens a subscription
-//! — so this binds the library API, not a product path.
-//!
-//! It is not a second copy of `conformance_subscribe`, which binds the same API
-//! to `subscribe_model`'s no-silent-loss discipline but tracks the cursor itself
-//! ("the head at poll time"): a `poll` that parks the cursor one past the head
-//! passes that bind and fails this one.
-//!
-//! PROJECTION — `cursor` is READ BACK THROUGH THE REAL `poll`, never tracked by
-//! the test: [`cursor_position`] clones the surface, writes a few probe events
-//! past the head, and polls the cursor under test; the first event the real
-//! `poll` delivers is `cursor + 1`. So a cursor the shipping code parks in the
-//! wrong place projects to the wrong place — the property a caller-tracked
-//! cursor (the "it is the head at poll time" shortcut) would assume away.
-//!
-//! NEGATIVE CONTROL — the modelled overshoot, projected from a real state, is
-//! rejected by the committed model and admitted by `Buggy = 1`, so a pass is
-//! never vacuous.
+//! The test drives `Surface::apply` (Grow) and `Surface::subscribe`/`poll`
+//! (Deliver), a library API no product crate calls, and validates every real
+//! transition. Unlike `conformance_subscribe`, `cursor` is read back through the
+//! real `poll` ([`cursor_position`]), never tracked by the test, so an overshoot
+//! in the code projects as one. Negative control: the modelled overshoot from a
+//! real state is rejected by the model and admitted by `Buggy`.
 
+use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Cursor, Edit, SubUpdate, Surface};
-mod support;
 use aterm_spec::derive::cursor_model;
 use aterm_spec::{interp, verify};
 use std::collections::BTreeMap;
-use support::{read_cap, write_cap};
 
 type State = BTreeMap<&'static str, i64>;
 
-/// Probe events written past the head on a CLONE, enough to see an overshoot of
-/// up to two positions (the model's defect is one).
+/// Probe events written past the head on a clone: enough to see an overshoot of
+/// up to two positions.
 const PROBE: u64 = 3;
 
-/// Where the real `cursor` stands, observed through the real `poll`: on a clone
-/// of `s`, write [`PROBE`] events past the head and poll `cur`. The first
-/// delivered event is `cursor + 1`; nothing delivered means the cursor is at or
-/// past `head + PROBE`, which is reported as that bound (a projection the model
-/// then rejects).
+/// Where the real cursor stands, observed through `poll`: on a clone of `s`,
+/// write [`PROBE`] events and poll `cur`; the first delivered event is
+/// `cursor + 1`. Nothing delivered reports `head + PROBE`, which the model rejects.
 fn cursor_position(s: &Surface, cur: Cursor) -> u64 {
     let mut probe = s.clone();
     for i in 0..PROBE {
@@ -106,8 +82,8 @@ fn real_subscription_cursor_conforms_to_cursor_model() {
 
     let mut grows = 0;
     let mut delivers = 0;
-    // Bursts of writes separated by polls, including a poll with nothing new
-    // (Deliver disabled: the real poll must deliver nothing and stay put).
+    // Bursts of writes between polls, including an empty poll (Deliver disabled:
+    // nothing delivered, cursor stays put).
     for burst in [1u64, 3, 0, 2, 5, 0, 1] {
         for i in 0..burst {
             let edit = match i % 3 {
@@ -152,8 +128,8 @@ fn real_subscription_cursor_conforms_to_cursor_model() {
     }
     assert!(grows > 0 && delivers > 0, "both actions were driven");
 
-    // NEGATIVE CONTROL — the modelled defect from this real state: one more
-    // write, then a delivery that parks the cursor one past the head.
+    // Negative control: one more write, then a delivery that parks the cursor
+    // one past the head.
     s.apply(&write_cap(), Edit::AppendLine("tail".into()));
     let behind = project(&s, cur);
     let mut overshoot = behind.clone();

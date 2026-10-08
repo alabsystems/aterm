@@ -114,17 +114,12 @@ struct Edge {
 /// Reusable working memory for [`fill_path`]'s scanline core — one set per
 /// thread, length-reset per call, never returned to the allocator.
 ///
-/// The old body allocated all six of these fresh on EVERY call (edge list,
-/// active-edge list, crossing + span buffers, the two row-coverage
-/// accumulators). That is fine for a bake-once glyph, but this rasterizer also
-/// sits on per-frame lanes: the pet's mote tiles and the sing-along notes fill
-/// small squares (~11–20 px) every presented frame — up to four mote tiles at
-/// once (`PET_MOTES_MAX`) — and at that tile size the malloc/free pairs cost as
-/// much as the scanline work they wrap. Thread-local rather than caller-passed
-/// so no public signature changes and every caller (cat/pet/robi bakers, note
-/// and mote bakes) gets the reuse for free; same discipline as the
-/// `word_decorations` ease-out memo. The retained footprint is a few hundred
-/// `Edge`s plus two rows of `i32` at the widest tile ever filled on the thread.
+/// Per-frame callers (pet motes, sing-along notes) fill ~11–20 px tiles every
+/// frame, where per-call malloc/free costs as much as the scanline work.
+/// Thread-local rather than caller-passed, so no public signature changes and
+/// every caller gets the reuse.
+/// Retained footprint: a few hundred `Edge`s plus two `i32` rows at the widest
+/// tile filled on the thread.
 struct FillScratch {
     edges: Vec<Edge>,
     active: Vec<Edge>,
@@ -176,13 +171,9 @@ pub fn fill_path(
 
 /// The scanline core of [`fill_path`], with its working memory handed in.
 ///
-/// The raster is UNTOUCHED by the split: capacity is the only thing reuse
-/// changes. Every buffer is length-reset here exactly where the old code
-/// created it, the coverage accumulators are rebuilt zeroed at the same
-/// call-exact lengths the old `vec![0; ..]`s had (`add_span` reads
-/// `extra.len()` as the row width, so those lengths are load-bearing), and the
-/// values pushed, sorted and blended are bit-identical to the allocating form
-/// — sorts depend on contents, never on capacity.
+/// Reuse changes capacity only: every buffer is length-reset before use, and
+/// the coverage accumulators are rebuilt zeroed at exact lengths (`add_span`
+/// reads `extra.len()` as the row width, so those lengths are load-bearing).
 fn fill_scanline(
     tile: &mut Tile,
     paths: &[&[PathCmd]],
@@ -201,15 +192,9 @@ fn fill_scanline(
     } = scratch;
     // Flatten every path to device-space edges; track the union bbox.
     let mut bbox = BBox::empty();
-    // Size the edge list up front. It otherwise doubles from empty to several
-    // hundred entries on EVERY call — one call per glyph layer per bake, ×5 for the
-    // haloed outline/whisker layers — paying a realloc+memcpy at each doubling step.
-    // Every command contributes at most one edge except `Cubic`, which flattens to
-    // `n` segments (`flatten_cubic` bounds `n` at 64; it is small single digits at
-    // glyph curvature and FLATTEN_TOL), so 4-per-cubic is a cheap first fit that
-    // costs at most one growth on a big layer. `reserve` is a pure allocation hint:
-    // it cannot change which edges get pushed, only how often the `Vec` grows, so
-    // the raster is untouched.
+    // Allocation hint only. Each command yields at most one edge except `Cubic`
+    // (`flatten_cubic` emits 1..=64, single digits at glyph curvature), so
+    // 4-per-cubic costs at most one growth on a big layer.
     let est = paths.iter().fold(0usize, |n, p| {
         p.iter().fold(n, |n, cmd| {
             let e = match *cmd {
@@ -231,14 +216,12 @@ fn fill_scanline(
     edges.sort_unstable_by(|a, b| a.ytop.total_cmp(&b.ytop));
     active.clear();
     let mut next = 0usize;
-    // Per-sub-scanline scratch (`xs`, `spans`): cleared at every use inside the
-    // loop, exactly as before, so no reset is needed here.
+    // `xs` and `spans` are cleared at each use inside the loop.
     // Row coverage accumulators (reset in the flush pass, so rows cost O(touched)):
     // `diff` takes ±4 at full-pixel span boundaries (prefix sum = interior coverage),
     // `extra` takes the per-subsample counts of the few partial boundary pixels.
-    // clear+resize is the same zero-fill the old `vec![0; ..]`s did, minus the
-    // malloc/free pair — and it re-zeroes unconditionally, so the flush-pass
-    // invariant is re-established even after an unwound fill.
+    // clear+resize re-zeroes unconditionally, so the flush-pass invariant holds
+    // even after an unwound fill.
     diff.clear();
     diff.resize(width + 1, 0);
     extra.clear();
@@ -346,8 +329,7 @@ fn fill_scanline(
 /// — the u16 counterpart of [`fill_path`]. Each coordinate in the glyph's `0..=FIXED_ONE`
 /// frame is mapped to its `0..1` normalized position (`v / FIXED_ONE`) and then through
 /// the same [`PathTransform`]/scanline core, so the raster is byte-identical to filling
-/// the equivalent [`PathCmd`] paths. This is the `fill_path` overload the bake path calls
-/// on `PathSeg` slices directly (docs/cat-art-v4-design.md §1).
+/// the equivalent [`PathCmd`] paths (docs/cat-art-v4-design.md §1).
 pub fn fill_path_fixed(
     tile: &mut Tile,
     paths: &[&[PathSeg]],
@@ -360,19 +342,10 @@ pub fn fill_path_fixed(
     }
     const INV_FIXED: f32 = 1.0 / FIXED_ONE as f32;
     let c = |v: u16| f32::from(v) * INV_FIXED;
-    // Lower each fixed-point path to `PathCmd`s in the shared 0..1 frame, then reuse
-    // the exact `fill_path` core (the drawlists are const, so this stays off any
-    // `Eq`'d key path).
-    //
-    // The lowering is 1:1 — exactly one `PathCmd` per `PathSeg` — so it goes into ONE
-    // exactly-sized flat buffer and the per-path slices are cut back out of it by
-    // offset: two allocations per call instead of one `Vec` per path plus the outer
-    // `Vec` plus the ref list. The per-path GROUPING is preserved exactly (each `refs`
-    // entry is still one whole path, in the original order) — `fill_path` fills
-    // even-odd PER PATH and unions ACROSS paths, so handing it one merged slice would
-    // turn overlapping subpaths into holes. Same `f32` expression applied to the same
-    // values in the same order as before, so the commands are bit-identical and the
-    // raster is unchanged.
+    // Lower 1:1 into one flat buffer, then cut per-path slices back out by offset.
+    // The per-path grouping is load-bearing: `fill_path` fills even-odd PER PATH and
+    // unions ACROSS paths, so one merged slice would turn overlapping subpaths into
+    // holes.
     let total = paths.iter().fold(0usize, |n, p| n.saturating_add(p.len()));
     let mut flat: Vec<PathCmd> = Vec::with_capacity(total);
     for p in paths {

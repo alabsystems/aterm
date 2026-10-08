@@ -3,52 +3,6 @@
 // Author: Andrew Yates
 
 use super::*;
-use aterm_hash::FxHashMap;
-
-// =============================================================================
-// Test-only helpers (moved from extra.rs to reduce #[cfg(test)] in production)
-// =============================================================================
-
-impl CellExtra {
-    /// Clear all combining characters.
-    fn clear_combining(&mut self) {
-        self.combining.clear();
-    }
-}
-
-impl CellExtras {
-    /// Shift rows down (for scroll up).
-    ///
-    /// Rows >= start_row are shifted down by 1.
-    /// Used when inserting a row at start_row.
-    fn shift_rows_down(&mut self, start_row: u16, max_row: u16) {
-        // Compact first so we operate on external coordinates.
-        self.compact();
-        let mut new_data =
-            FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
-        for (coord, extra) in self.data.drain() {
-            if coord.row >= start_row && coord.row < max_row {
-                new_data.insert(
-                    CellCoord::new(coord.row.saturating_add(1), coord.col),
-                    extra,
-                );
-            } else if coord.row < start_row {
-                new_data.insert(coord, extra);
-            }
-            // Rows >= max_row are dropped (scrolled off)
-        }
-        self.data = new_data;
-    }
-}
-
-/// Check if a character is a zero-width character.
-#[must_use]
-fn is_zero_width(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
-    )
-}
 
 #[test]
 fn cell_extra_default_is_empty() {
@@ -129,16 +83,8 @@ fn cell_extra_extended_flags() {
 #[test]
 fn cell_extra_size_optimized() {
     let size = std::mem::size_of::<CellExtra>();
-    assert!(
-        size <= 64,
-        "CellExtra should be <= 64 bytes, got {size} bytes"
-    );
-    // 64 bytes: 56 (after boxing the rare complex_char Arc<str>) plus the
-    // niche-optimized `image: Option<Box<ImageRef>>` field (8 bytes) for inline
-    // images (iTerm2 OSC 1337). A Kitty Unicode placeholder costs no field: it
-    // is decoded from the cell's char, marks and colours (the never-written
-    // `kitty_placeholder` box it once had is gone). CellExtra is allocated only
-    // for cells that have extras at all (rare).
+    // 56 bytes plus the niche-optimized `image` box (8 bytes). CellExtra is
+    // allocated only for cells that have extras.
     assert_eq!(size, 64, "CellExtra should be exactly 64 bytes");
 }
 
@@ -166,6 +112,7 @@ fn cell_extra_with_image() {
         rows: 2,
         z_index: 0,
         band_lift_px: 0,
+        cell_offset_px: (0, 0),
         scaling: ImageScaling::Fit,
         source_rect: None,
     });
@@ -189,6 +136,75 @@ fn cell_extra_with_image() {
     extra.set_image(None);
     assert!(extra.image().is_none());
     assert!(!extra.has_data());
+}
+
+/// Kitty layers stack in draw order (z, then first-send time, then placement
+/// order), at most `MAX_IMAGE_LAYERS` deep with the lowest dropped first;
+/// `set_image` makes one image the only layer and `retain_images` drops layers
+/// without reordering the rest.
+#[test]
+fn cell_extra_stacks_image_layers_in_draw_order() {
+    use crate::KittyPlacementTag;
+    use crate::extra::MAX_IMAGE_LAYERS;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    let layer = |z: i32, id: u32, serial: u32| ImageRef {
+        image: Arc::new(ImageData {
+            bytes: Vec::new(),
+            format: ImageFormat::Png,
+            cols: 1,
+            rows: 1,
+            z_index: z,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Fit,
+            source_rect: None,
+        }),
+        cell_row: 0,
+        cell_col: 0,
+        kitty: NonZeroU32::new(serial).map(|serial| KittyPlacementTag {
+            image_id: id,
+            placement_id: 0,
+            // Each image here was first sent in the order of its id.
+            image_serial: NonZeroU32::new(id).unwrap_or(NonZeroU32::MIN),
+            serial,
+        }),
+    };
+    let order = |extra: &CellExtra| -> Vec<(i32, u32, u32)> {
+        extra.images().iter().map(ImageRef::draw_key).collect()
+    };
+    let mut extra = CellExtra::default();
+    for (z, id, serial) in [(0, 5, 1), (0, 2, 2), (-3, 9, 3), (0, 5, 4), (7, 1, 5)] {
+        extra.stack_image(layer(z, id, serial));
+    }
+    assert_eq!(
+        order(&extra),
+        [(-3, 9, 3), (0, 2, 2), (0, 5, 1), (0, 5, 4), (7, 1, 5)]
+    );
+    assert_eq!(
+        extra.image().map(ImageRef::draw_key),
+        Some((7, 1, 5)),
+        "the top"
+    );
+
+    extra.retain_images(|image| image.draw_key().1 != 5);
+    assert_eq!(order(&extra), [(-3, 9, 3), (0, 2, 2), (7, 1, 5)]);
+
+    for serial in 10..10 + MAX_IMAGE_LAYERS as u32 {
+        extra.stack_image(layer(1, 3, serial));
+    }
+    assert_eq!(extra.images().len(), MAX_IMAGE_LAYERS);
+    assert_eq!(
+        extra.images().first().map(ImageRef::draw_key),
+        Some((1, 3, 11)),
+        "the three lowest went: (-3, 9, 3), (0, 2, 2) and (1, 3, 10)"
+    );
+    assert_eq!(extra.image().map(ImageRef::draw_key), Some((7, 1, 5)));
+
+    extra.set_image(Some(layer(0, 0, 0)));
+    assert_eq!(order(&extra), [(0, 0, 0)], "an image that owns the cell");
+    extra.retain_images(|_| false);
+    assert!(!extra.has_data(), "no layer left, no image");
 }
 
 #[test]
@@ -256,67 +272,6 @@ fn cell_extras_clear_row() {
         .get(CellCoord::new(1, 0))
         .expect("row 1 should survive clear_row(0)");
     assert_eq!(r1.combining(), &['\u{0303}'], "row 1 content preserved");
-}
-
-#[test]
-fn cell_extras_clear_rows_basic() {
-    let mut extras = CellExtras::new();
-
-    extras
-        .get_or_create(CellCoord::new(0, 0))
-        .add_combining('\u{0301}');
-    extras
-        .get_or_create(CellCoord::new(1, 0))
-        .add_combining('\u{0302}');
-    extras
-        .get_or_create(CellCoord::new(2, 0))
-        .add_combining('\u{0303}');
-    extras
-        .get_or_create(CellCoord::new(3, 0))
-        .add_combining('\u{0304}');
-
-    extras.clear_rows(1..3);
-
-    assert!(extras.get(CellCoord::new(0, 0)).is_some(), "row 0 survives");
-    assert!(extras.get(CellCoord::new(1, 0)).is_none(), "row 1 cleared");
-    assert!(extras.get(CellCoord::new(2, 0)).is_none(), "row 2 cleared");
-    assert!(extras.get(CellCoord::new(3, 0)).is_some(), "row 3 survives");
-}
-
-#[test]
-fn cell_extras_shift_rows_down() {
-    let mut extras = CellExtras::new();
-
-    extras
-        .get_or_create(CellCoord::new(0, 0))
-        .add_combining('\u{0301}');
-    extras
-        .get_or_create(CellCoord::new(1, 0))
-        .add_combining('\u{0302}');
-    extras
-        .get_or_create(CellCoord::new(2, 0))
-        .add_combining('\u{0303}');
-
-    extras.shift_rows_down(1, 3);
-
-    let r0 = extras.get(CellCoord::new(0, 0)).unwrap();
-    assert_eq!(r0.combining(), &['\u{0301}'], "row 0 content preserved");
-
-    assert!(extras.get(CellCoord::new(1, 0)).is_none());
-
-    let r2 = extras.get(CellCoord::new(2, 0)).unwrap();
-    assert_eq!(
-        r2.combining(),
-        &['\u{0302}'],
-        "row 1 content shifted to row 2"
-    );
-
-    let r3 = extras.get(CellCoord::new(3, 0)).unwrap();
-    assert_eq!(
-        r3.combining(),
-        &['\u{0303}'],
-        "row 2 content shifted to row 3"
-    );
 }
 
 #[test]
@@ -397,19 +352,6 @@ fn is_combining_mark_all_ranges() {
 }
 
 #[test]
-fn is_zero_width_basic() {
-    assert!(is_zero_width('\u{200B}'));
-    assert!(is_zero_width('\u{200C}'));
-    assert!(is_zero_width('\u{200D}'));
-    assert!(is_zero_width('\u{2060}'));
-    assert!(is_zero_width('\u{FEFF}'));
-    assert!(!is_zero_width('a'));
-    assert!(!is_zero_width(' '));
-    assert!(!is_zero_width('\u{200A}'));
-    assert!(!is_zero_width('\u{200E}'));
-}
-
-#[test]
 fn complex_char_roundtrip() {
     let mut extra = CellExtra::default();
     assert!(extra.complex_char().is_none());
@@ -428,20 +370,6 @@ fn complex_char_roundtrip() {
 
     extra.set_complex_char(None);
     assert!(extra.complex_char().is_none());
-    assert!(!extra.has_data());
-}
-
-#[test]
-fn clear_combining_removes_all() {
-    let mut extra = CellExtra::default();
-    extra.add_combining('\u{0301}');
-    extra.add_combining('\u{0308}');
-    extra.add_combining('\u{0327}');
-    assert_eq!(extra.combining().len(), 3);
-    assert!(extra.has_data());
-
-    extra.clear_combining();
-    assert!(extra.combining().is_empty());
     assert!(!extra.has_data());
 }
 
@@ -529,12 +457,8 @@ fn underline_color_u32_roundtrip() {
     assert_eq!(extra.underline_color(), None);
     assert!(!extra.has_data());
 
-    // The INDEXED form (0x02) must survive the round trip as an index, not be
-    // flattened to a resolved triple — an indexed SGR 58 colour re-resolves
-    // against the live palette at draw time, and the wide-spacer mirror copies
-    // this packed value so both halves of one character keep re-resolving
-    // together. Until this test stopped shadowing the production getter with an
-    // RGB-only helper, nothing covered this branch.
+    // The indexed form (0x02) round-trips as an index, not a resolved triple:
+    // an indexed SGR 58 colour re-resolves against the live palette at draw time.
     extra.set_underline_color_u32(Some(0x02_000005));
     assert_eq!(extra.underline_color_u32(), Some(0x02_000005));
     assert_eq!(extra.underline_color_index(), Some(5));
@@ -573,9 +497,7 @@ fn row_has_hyperlinks_detection() {
     assert!(!extras.row_has_hyperlinks(0));
 }
 
-/// Behavioral test for #5816: after dead hyperlink_row_cache removal,
-/// verify `row_has_hyperlinks` correctly handles partial removal of
-/// multiple hyperlinks on the same row.
+/// `row_has_hyperlinks` handles partial removal of several hyperlinks on one row.
 #[test]
 fn row_has_hyperlinks_partial_removal() {
     let mut extras = CellExtras::new();
@@ -608,7 +530,7 @@ fn row_has_hyperlinks_partial_removal() {
     );
 }
 
-/// Behavioral test for #5816: `clear_range` removes hyperlinks within
+/// `clear_range` removes hyperlinks within
 /// the column span but preserves hyperlinks outside it.
 #[test]
 fn row_has_hyperlinks_after_clear_range() {
@@ -676,9 +598,7 @@ fn set_hyperlink_clears_stale_id_on_url_replacement() {
     assert_eq!(extra.hyperlink_id().map(Arc::as_ref), Some("link-b"));
 }
 
-// =============================================================================
 // Batch clear tests (clear_rows, clear_rect)
-// =============================================================================
 
 #[test]
 fn cell_extras_clear_rows_batch() {
@@ -741,7 +661,7 @@ fn cell_extras_clear_rect_empty_cols() {
     assert_eq!(extras.len(), 1, "empty col range should be no-op");
 }
 
-// --- Column shift tests (ICH/DCH extras support, #4057) ---
+// Column shift tests (ICH/DCH)
 
 #[test]
 fn cell_extras_shift_cols_right() {
@@ -815,14 +735,8 @@ fn cell_extras_shift_cols_zero_count_is_noop() {
     assert_eq!(extras.len(), 1, "shift_cols_left with count=0 is no-op");
 }
 
-// =============================================================================
-// Column shift no-realloc tests (#5550)
-// =============================================================================
-
-/// Verify `shift_cols_right` correctness and that non-target rows are untouched.
-///
-/// The fix extracts only target-row entries and reinserts shifted versions
-/// in-place. Non-target-row entries are never removed or reinserted.
+/// `shift_cols_right` shifts target-row entries in place and leaves other rows
+/// untouched.
 #[test]
 fn shift_cols_right_preserves_non_target_rows() {
     let mut extras = CellExtras::new();
@@ -923,9 +837,8 @@ fn shift_cols_left_preserves_non_target_rows() {
     assert_eq!(extras.len(), 197, "3 entries should have been deleted");
 }
 
-/// Verify `shift_cols_left` respects the `max_col` boundary when DECLRMM is
-/// active.  Extras at or beyond `max_col` must be preserved in their original
-/// positions — only columns in `[start_col, max_col)` participate in the shift.
+/// `shift_cols_left` honours `max_col` (DECLRMM): extras at or beyond it stay
+/// put; only `[start_col, max_col)` shifts.
 #[test]
 fn shift_cols_left_respects_max_col_boundary() {
     let mut extras = CellExtras::new();
@@ -937,10 +850,8 @@ fn shift_cols_left_respects_max_col_boundary() {
     }
     assert_eq!(extras.len(), 6);
 
-    // Delete 2 columns starting at col 3, margin boundary at col 10.
-    // Deletion range: [3, 5) — col 4 is deleted.
-    // Shift range: [5, 10) — col 5 shifts left by 2 → col 3, col 8 → col 6.
-    // Cols >= 10 (12, 15) must be preserved at original positions.
+    // Delete 2 columns at col 3 with the margin at col 10: col 4 is deleted,
+    // cols 5 and 8 move to 3 and 6, cols 12 and 15 stay.
     extras.shift_cols_left(0, 3, 2, 10);
 
     // col 2: before start_col, preserved
@@ -989,9 +900,7 @@ fn shift_cols_left_respects_max_col_boundary() {
     );
 }
 
-// =============================================================================
-// Memory shrink tests (#4376)
-// =============================================================================
+// Memory shrink tests
 
 #[test]
 fn cell_extras_clear_releases_capacity() {
@@ -1051,9 +960,7 @@ fn cell_extras_retain_no_shrink_on_small_map() {
     assert_eq!(extras.capacity(), cap_before, "small map should not shrink");
 }
 
-// =============================================================================
-// Hyperlink limit enforcement tests (#7172)
-// =============================================================================
+// Hyperlink limit enforcement tests
 
 /// Hyperlinks work normally when under the limit.
 #[test]
@@ -1148,13 +1055,8 @@ fn test_hyperlink_limit_evicts_oldest_rows_first() {
 
     extras.enforce_hyperlink_limit();
 
-    // ORDER, not batch size. Entries were inserted so their (row, col) sort key is
-    // monotonic in `i`, so "oldest first" means the SURVIVORS are exactly the
-    // newest suffix and the evicted set is a clean prefix — no younger entry may
-    // outlive an older one. Asserting the whole surviving set is strictly stronger
-    // than the old row-0 headcount, and unlike that headcount it does not silently
-    // re-encode how much ONE pass trims (which changed when the pass gained its
-    // low-water mark).
+    // Eviction is oldest first: entries sort monotonically in `i`, so the
+    // survivors are exactly the newest suffix.
     let low_water = MAX_HYPERLINK_ENTRIES * 3 / 4;
     let mut surviving: Vec<usize> = extras
         .data
@@ -1261,24 +1163,16 @@ fn test_hyperlink_limit_large_map_few_hyperlinks_no_eviction() {
     assert_eq!(hyperlink_count, 100, "no hyperlinks should be evicted");
 }
 
-/// The O(1) guard must test the HYPERLINK population, not the whole map.
-///
-/// `hyperlink_screen/mixed_extras_under_limit` in miniature: 14_600 entries of
-/// which only 600 carry a link. The guard used to read `data.len()`, so EVERY
-/// call fell into the cold path, walked all 14_600 entries and evicted nothing
-/// (measured on that bench at 1_835 futile walks per MiB). Now the first call
-/// repairs the bound to the true population and every later call takes the O(1)
-/// early-out — while the OUTCOME (nothing evicted) is unchanged, which is what
-/// makes this a pure cost deletion rather than a behaviour change.
+/// The O(1) guard tests the hyperlink population, not the whole map: with
+/// 14_600 entries of which 600 carry a link, the first call repairs the bound
+/// and later calls take the early-out, evicting nothing.
 #[test]
 fn hyperlink_guard_counts_links_not_total_entries() {
     use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
     use crate::test_counters::take_hyperlink_walk_ops;
 
     let mut extras = CellExtras::new();
-    // 14_000 non-hyperlink entries. The bench uses SGR 58 underline colours;
-    // an fg RGB is the same shape here (a map entry with no link) and cheaper
-    // to build.
+    // 14_000 entries without a link (an fg RGB stands in for SGR 58).
     for i in 0..14_000u32 {
         extras
             .get_or_create(CellCoord::new((i / 200) as u16, (i % 200) as u16))
@@ -1322,19 +1216,12 @@ fn hyperlink_guard_counts_links_not_total_entries() {
     assert_eq!(extras.len(), 14_600);
 }
 
-/// A map that is UNDER the limit must never walk, however inflated the counter.
+/// A map under the limit never walks, however inflated the counter.
 ///
-/// `hyperlink_upper_bound` over-charges: `get_or_create` charges on every handout
-/// to a link-free entry, and the per-cell write path hands out an entry for every
-/// extras cell — SGR 58 underlines here, exactly as
-/// `extras_erase/status_line_redraw` does. Repainting 1_600 such cells drives the
-/// counter past MAX_HYPERLINK_ENTRIES on entries that hold no link at all.
-///
-/// `data.len()` is the second, independent upper bound (links <= entries), and it
-/// says 1_600 — so the walk is provably pointless and must not happen. Without
-/// that clause this workload buys a cold walk every MAX_HYPERLINK_ENTRIES
-/// handouts: walks the ORIGINAL `data.len()` guard never took, which is how a
-/// hyperlink-free redraw loop regressed 1.45%.
+/// `hyperlink_upper_bound` over-charges on every handout to a link-free entry,
+/// so repainting 1_600 SGR 58 cells drives it past MAX_HYPERLINK_ENTRIES.
+/// `data.len()` is a second upper bound (links <= entries) and says 1_600, so
+/// no walk happens.
 #[test]
 fn small_map_never_walks_however_inflated_the_counter() {
     use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
@@ -1386,14 +1273,10 @@ fn small_map_never_walks_however_inflated_the_counter() {
     assert_eq!(extras.hyperlink_entries_slow(), 0);
 }
 
-/// The bound must never sit BELOW the true hyperlink population, through every
-/// shape of mutation the map supports — that inequality IS the memory bound.
-///
-/// Drift upward is legal (it costs one self-repairing cold walk); drift downward
-/// would silently switch eviction off. Each stage below is a distinct mutation
-/// family: per-cell handout, batch run, whole-value set, single removal, row
-/// clear, O(1) offset scroll + compaction, drain-rebuild region scroll, and the
-/// column shifts.
+/// The bound never sits below the true hyperlink population, through every
+/// mutation family: per-cell handout, batch run, whole-value set, removal, row
+/// clear, offset scroll + compaction, region scroll, and column shifts. Upward
+/// drift costs one self-repairing walk; downward drift would disable eviction.
 #[test]
 fn hyperlink_upper_bound_never_under_counts() {
     fn check(extras: &CellExtras, stage: &str) {
@@ -1428,7 +1311,7 @@ fn hyperlink_upper_bound_never_under_counts() {
     };
     extras.set_range_uniform(1, 0, 10, &vals, 24, 80);
     check(&extras, "batch run");
-    // Re-painting the SAME run must not charge again: the cells already carry
+    // Re-painting the same run must not charge again: the cells already carry
     // the link, so the population is unchanged.
     let before = extras.hyperlink_upper_bound();
     extras.set_range_uniform(1, 0, 10, &vals, 24, 80);
@@ -1448,7 +1331,7 @@ fn hyperlink_upper_bound_never_under_counts() {
     assert!(extras.remove(CellCoord::new(2, 0)));
     check(&extras, "single removal");
 
-    // 5. Row clear (retain-based; no refund by design — must stay ABOVE).
+    // 5. Row clear (retain-based; no refund by design — must stay above).
     extras.clear_row(1);
     check(&extras, "row clear");
 
@@ -1475,8 +1358,6 @@ fn hyperlink_upper_bound_never_under_counts() {
 
 #[path = "extra_tests/overflow.rs"]
 mod overflow;
-#[path = "extra_tests/remap_reflow_tests.rs"]
-mod remap_reflow_tests;
 #[path = "extra_tests/scaling_proofs.rs"]
 mod scaling_proofs;
 #[path = "extra_tests/shift_region_tests.rs"]

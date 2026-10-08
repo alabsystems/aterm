@@ -75,10 +75,8 @@ fn emit_color(s: &mut u64, buf: &mut Vec<u8>, sel: &[u8]) {
 
 #[test]
 fn render_adversarial_engine_states_never_panics() {
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let mut s = 0x5EED_1337_C0DE_FACEu64;
     let mut term = Terminal::new(24, 80);
 

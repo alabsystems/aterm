@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Wall-clock THROUGHPUT harness for the `xtask perf` baseline (PERF-WALLCLOCK
-// -BASELINE lane). Feeds a deterministic, sizeable, representative VT workload
-// through the engine's parse/process hot path (`Terminal::process`) and reports a
-// median-of-N throughput in MB/s as a single JSON line on stdout.
+// Wall-clock throughput harness for the `xtask perf` baseline: feeds a
+// deterministic, representative VT workload through `Terminal::process` and
+// prints a median-of-N throughput in MB/s as one JSON line. A release binary
+// so timing reflects the shipped build; the gate owns compare/threshold/record.
 //
-// This is a RELEASE binary on purpose: `xtask perf` spawns it with
-// `cargo run --release` so timing reflects the shipped build, never the debug
-// xtask interpreter. The gate owns the compare/threshold/record logic; this
-// harness owns only the measurement (warmup, N timed iters, median).
-//
-//   cargo run --release -q -p aterm-bench --example perf_harness
+//   targo --unverified run --release -q -p aterm-bench --example perf_harness
 //   -> {"median_mbps":3142.0,"min_mbps":...,"max_mbps":...,"workload_bytes":...,"n":...,"warmup":...}
 //
-// The constants below (WORKLOAD_BYTES, N_ITERS, WARMUP) are the workload knobs;
-// they MUST match the metadata the gate records in tools/golden/perf-baseline.json
-// (the gate reads them back from this harness's JSON, not from a duplicate).
+// The workload knobs (WORKLOAD_BYTES, N_ITERS, WARMUP) are echoed in the JSON,
+// which the gate records in tools/golden/perf-baseline.json.
 
 use std::time::Instant;
 
@@ -28,7 +22,7 @@ use aterm_core::terminal::Terminal;
 /// setup/teardown. ~32 MiB.
 const WORKLOAD_BYTES: usize = 32 << 20;
 
-/// Number of TIMED iterations. The gate uses the MEDIAN of these (not mean/min)
+/// Number of timed iterations. The gate uses the median of these (not mean/min)
 /// to reject outliers from a single scheduler hiccup. Odd so the median is a
 /// single sample, not an average of two. N >= 5 per the lane requirement.
 const N_ITERS: usize = 7;

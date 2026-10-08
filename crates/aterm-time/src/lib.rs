@@ -1,101 +1,97 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm's clock — `std::time` everywhere it exists, and a browser clock where
+//! aterm's clock: `std::time` everywhere it exists, and a browser clock where
 //! it does not.
 //!
-//! # Why this crate exists
-//!
-//! `std::time::Instant::now()` PANICS on `wasm32-unknown-unknown` ("time not
-//! implemented on this platform"): the target has no clock syscall, and the
+//! `std::time::Instant::now()` panics on `wasm32-unknown-unknown` ("time not
+//! implemented on this platform"): the target has no clock syscall and the
 //! browser's clocks are JS functions. The engine samples a monotonic clock
-//! everywhere — the VT processing loop, the effects tick, the predictive-echo
-//! ledger, the present pacing — so a terminal compiled to wasm would trap on
-//! its first frame.
+//! everywhere (VT processing, the effects tick, predictive echo, present
+//! pacing), so a wasm build would trap on its first frame.
 //!
-//! # The shape of the fix
+//! On every target with `std::time`, this crate is a plain re-export:
+//! [`Instant`] is `std::time::Instant`. On `wasm32-unknown-unknown` it swaps
+//! in an [`Instant`] over `performance.now()` (monotonic, sub-millisecond) and
+//! a [`SystemTime`] over `Date.now()` (wall clock, ms since the Unix epoch).
+//! [`Duration`] is `core::time::Duration` on both arms.
 //!
-//! On every target that HAS `std::time`, this module is a re-export and
-//! nothing else. There is no wrapper type, no conversion, no `#[inline]` to
-//! hope the optimizer honours: [`Instant`] IS `std::time::Instant`, so the
-//! native engine is byte-identical to one written against `std` directly and
-//! this crate compiles to nothing.
+//! [`since_epoch`], [`unix_secs`] and [`unix_millis`] are the workspace's one
+//! spelling of "the wall clock as a Unix timestamp", correct on both arms.
 //!
-//! On `wasm32-unknown-unknown` — the ONE target in this workspace that has no
-//! `std::time` — it swaps in an [`Instant`] over `performance.now()` (monotonic,
-//! sub-millisecond, and the browser's own definition of "since this document's
-//! time origin") and a [`SystemTime`] over `Date.now()` (wall clock, ms since
-//! the Unix epoch). [`Duration`] is `core::time::Duration` on both arms —
-//! duration arithmetic has never needed a platform.
+//! # Precision on the wasm arm
 //!
-//! # Precision, on the wasm arm
+//! Both browser clocks return `f64` milliseconds, which may be negative,
+//! non-finite or clamped. The conversion is total (non-finite and negative
+//! floor to zero) and splits whole milliseconds from the fraction before
+//! scaling, so an old time origin keeps sub-microsecond resolution.
 //!
-//! `performance.now()` and `Date.now()` both return `f64` milliseconds.
-//! Converting through `Duration::from_secs_f64` would inherit that method's
-//! panics on a negative or non-finite input, and a browser is not obliged to
-//! hand back a sane number: cross-origin isolation, clock clamping for Spectre
-//! mitigation and a suspended tab all perturb it. So the conversion is explicit
-//! and total — non-finite and negative both floor to zero — and it splits whole
-//! milliseconds from the fraction before scaling, so a multi-hour-old time
-//! origin keeps sub-microsecond resolution instead of spending the mantissa on
-//! the integer part.
+//! # Testing the wasm arm
 //!
-//! # How the wasm arm is tested without running a browser
-//!
-//! The Trust toolchain has no `wasm32` std, so the wasm arm is cross-compiled
-//! on rustup's `stable`: the `wasm-cpu` and `wasm-gpu` cells of `xtask gate
-//! cells-foreign` (a stage of every `tools/verify.sh` run; `xtask gate cells`
-//! runs them too) type-check `aterm-wasm` and `aterm-gpu-web`, whose closures
-//! carry this crate, for `wasm32-unknown-unknown`, and a cell that stops
-//! compiling FAILS the gate. A box without the `wasm32` std reports the cells
-//! SKIPPED, never passed. What a cross-compile still cannot do is RUN the
-//! module, and that is what the rest of this section is about. The shim is
-//! written so that everything except two `extern` declarations and the two
-//! one-line `now()` bodies is target-independent, and it is compiled into the
-//! NATIVE test build: the millisecond conversion, the saturating differences,
-//! the checked arithmetic and the backwards-clock error are all driven by
-//! ordinary `cargo test` on this machine.
+//! The Trust toolchain has no `wasm32` std, so the `wasm-cpu` and `wasm-gpu`
+//! cells of `xtask gate cells-foreign` type-check the wasm arm on rustup's
+//! `stable` (a box without the `wasm32` std reports them skipped). To run it,
+//! the shim is also compiled into the native test build: everything except two
+//! `extern` declarations and the two one-line `now()` bodies is
+//! target-independent and covered by ordinary tests.
 
-// A clock is a leaf: no allocation tricks, no platform pointers, nothing to
-// justify an escape hatch. The wasm arm's JS bindings are generated by
-// wasm-bindgen, which emits its own (audited) unsafe.
+// A clock needs no unsafe; on the wasm arm the JS bindings' unsafe is
+// generated by wasm-bindgen.
 #![cfg_attr(
     not(all(target_arch = "wasm32", target_os = "unknown")),
     forbid(unsafe_code)
 )]
 
-/// A span of time, platform-independent. Identical on every target — this is
-/// `core::time::Duration`, re-exported so callers need only one import.
+/// A span of time, platform-independent: `core::time::Duration`, re-exported
+/// so callers need only one import.
 pub use core::time::Duration;
 
-// The arm predicate is `wasm32-unknown-unknown` EXACTLY, not `target_arch =
-// "wasm32"`. `wasm32-wasip1` and `wasm32-unknown-emscripten` are wasm targets
-// that DO have a working `std::time`, and handing them the browser shim would
-// bind `performance.now()` in a runtime that has no `performance` object. This
-// is the predicate the retired `web-time` keyed on, and it is what makes this
-// crate's headline claim — `std::time` on every target that HAS `std::time` —
-// literally true rather than approximately true.
+// The arm predicate is exactly `wasm32-unknown-unknown`, not `target_arch =
+// "wasm32"`: `wasm32-wasip1` and `wasm32-unknown-emscripten` have a working
+// `std::time` and no `performance` object.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod native {
-    /// The platform monotonic clock — `std::time::Instant` itself.
+    /// The platform monotonic clock: `std::time::Instant` itself.
     pub use std::time::Instant;
-    /// The platform wall clock — `std::time::SystemTime` itself.
+    /// The platform wall clock: `std::time::SystemTime` itself.
     pub use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use native::{Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-// The browser clock. Compiled into the NATIVE test build as well
-// (`cfg(test)`): the `wasm-cpu` and `wasm-gpu` cells of `xtask gate
-// cells-foreign` type-check this module on rustup's `stable`, but a compile
-// check executes nothing, so a browser-only module would still be code no
-// local TEST could reach. See `shim`'s own docs.
+// The browser clock, also compiled into the native test build so its
+// arithmetic is exercised by tests (see `shim`'s docs).
 #[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), test))]
 mod shim;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use shim::{Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
+
+/// The wall clock's distance past the Unix epoch, or `None` when it reads
+/// before 1970.
+///
+/// `SystemTime::now().duration_since(UNIX_EPOCH)` through this crate's
+/// [`SystemTime`], so it is also correct on `wasm32-unknown-unknown`. A clock
+/// before the epoch has no one right answer, so each caller writes its own
+/// fallback.
+#[must_use]
+pub fn since_epoch() -> Option<Duration> {
+    SystemTime::now().duration_since(UNIX_EPOCH).ok()
+}
+
+/// Whole seconds since the Unix epoch ([`since_epoch`]), `None` before it.
+#[must_use]
+pub fn unix_secs() -> Option<u64> {
+    since_epoch().map(|d| d.as_secs())
+}
+
+/// Milliseconds since the Unix epoch ([`since_epoch`]), saturating at
+/// `u64::MAX`; `None` before it.
+#[must_use]
+pub fn unix_millis() -> Option<u64> {
+    since_epoch().map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
 
 #[cfg(test)]
 mod tests {
@@ -115,9 +111,8 @@ mod tests {
         );
     }
 
-    /// `duration_since` on a LATER instant saturates to zero rather than
-    /// panicking — the contract `std` has had since 1.60 and the one every
-    /// caller in the workspace relies on.
+    /// `duration_since` on a later instant saturates to zero rather than
+    /// panicking, as `std` does.
     #[test]
     fn duration_since_saturates_rather_than_panicking() {
         let t0 = Instant::now();
@@ -138,9 +133,8 @@ mod tests {
         assert!(t1 > t0);
     }
 
-    /// The wall clock is anchored at the Unix epoch and is plausibly "now" —
-    /// after 2020 and before 2200, which is all a clock shim can honestly
-    /// promise.
+    /// The wall clock is anchored at the Unix epoch and plausibly "now" (after
+    /// 2020 and before 2200).
     #[test]
     fn system_time_is_anchored_at_the_unix_epoch() {
         let since = SystemTime::now()
@@ -154,5 +148,29 @@ mod tests {
             since.as_secs() < 7_258_118_400,
             "wall clock reads after 2200: {since:?}"
         );
+    }
+
+    /// The accessors are the same reading in three units, bracketed by two
+    /// direct reads taken around them.
+    #[test]
+    fn the_epoch_accessors_read_the_wall_clock() {
+        let direct = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("wall clock is at or after the Unix epoch")
+        };
+        let before = direct();
+        let (since, secs, millis) = (
+            super::since_epoch().expect("after the epoch"),
+            super::unix_secs().expect("after the epoch"),
+            super::unix_millis().expect("after the epoch"),
+        );
+        let after = direct();
+        assert!(
+            (before..=after).contains(&since),
+            "{before:?} {since:?} {after:?}"
+        );
+        assert!((before.as_secs()..=after.as_secs()).contains(&secs));
+        assert!((before.as_millis()..=after.as_millis()).contains(&u128::from(millis)));
     }
 }

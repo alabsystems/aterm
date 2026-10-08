@@ -6,13 +6,7 @@
 
 use super::*;
 
-// cell_coord_hash_consistent removed (#5887): derived PartialEq reflexivity is a
-// language guarantee — symbolic row/col adds no verification value.
-
-/// is_combining_mark returns true for all codepoints in U+0300..U+036F.
-///
-/// Uses symbolic codepoint with kani::assume to verify the combining mark
-/// detection function covers the entire diacritical marks range.
+/// is_combining_mark returns true for every codepoint in U+0300..U+036F.
 #[kani::proof]
 fn combining_mark_range_valid() {
     let codepoint: u32 = kani::any();
@@ -25,9 +19,6 @@ fn combining_mark_range_valid() {
         );
     }
 }
-
-// hyperlink_data_box_niche removed (#5887): size_of is a compile-time constant;
-// Kani bounded model checking adds nothing over a const_assert.
 
 /// FNV-1a hash used for hyperlink grouping never returns 0 for any
 /// single-byte input.

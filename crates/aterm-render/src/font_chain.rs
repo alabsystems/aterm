@@ -95,7 +95,7 @@ impl Tier {
 
 /// The chain-narrowing policy: two INDEPENDENT switches plus the code point's
 /// Unicode presentation. Keeping them separate fields (never one merged flag) is
-/// the fix the tofu bug demanded, and [`kani_proofs::seal_never_hides_an_io_free_tier`]
+/// the fix the tofu bug demanded, and `kani_proofs::sealing_never_hides_an_io_free_tier`
 /// is what holds them apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChainPolicy {
@@ -121,6 +121,18 @@ pub struct ChainPolicy {
     /// symbol face silently became arial's dot. Consulting Symbol first for PUA
     /// stops a broad face winning a range it covers only incidentally, and
     /// changes nothing for any assigned code point.
+    ///
+    /// It is not the whole fix, measured 2026-09-30 on Windows 11: the Nerd Font
+    /// now answers from the RUNTIME tier, so a symbol-tier miss still handed
+    /// U+F301 back to arial, and Segoe UI Symbol — the Windows symbol face,
+    /// which maps 204 of the Nerd Font's private points — answered them with
+    /// Microsoft's own glyphs. Those faces
+    /// now decline such a point inside their tier's probe
+    /// (`FOREIGN_PRIVATE_USE_FACES` in the crate root), which leaves this
+    /// order, and every proof below, unchanged. The bundled Windows primary,
+    /// Cascadia Mono PL, declines its own private-use points the same way,
+    /// inside the PRIMARY probe (`bundled::yields_private_use`): to this module
+    /// that is only a primary that does not cover them.
     pub prefers_symbol: bool,
 }
 
@@ -157,7 +169,7 @@ pub enum Resolution {
     Runtime(RuntimeLane),
     /// `.notdef` for THIS FRAME ONLY while a lazy face parses. The caller MUST
     /// NOT memoize it; the parse's completion bumps `font_epoch` and the forced
-    /// repaint re-resolves (see P5 in `aterm_spec::derive::fallback_convergence_model`).
+    /// repaint re-resolves (aterm-gui's `fallback_convergence_action` re-arms it).
     Provisional,
     /// The honest give-up: nothing in the reachable chain covers the code point.
     Notdef,

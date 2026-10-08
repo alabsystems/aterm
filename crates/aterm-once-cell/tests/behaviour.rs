@@ -1,71 +1,30 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The CONTRACTS this shim has to keep, asserted directly.
+//! The contracts the third-party consumers rely on (the liveness table in
+//! `src/lib.rs` says who relies on which).
 //!
-//! `crates/aterm-core-maths` needs no behaviour tests: nothing calls it. This
-//! crate is called on four of the five cells, so the bodies have to be right,
-//! and "it compiles" is not the same claim. What is checked here is the set of
-//! properties the third-party consumers actually depend on — see the liveness
-//! table in `src/lib.rs` for who depends on which.
-//!
-//! # The one that matters most, and its CONTROL
-//!
-//! `wgpu-core 29.0.3`'s `ResourcePool` (src/pool.rs) decides whether it won an
-//! initialisation race by whether its closure ran:
-//!
-//! ```text
-//! let mut strong = None;
-//! let weak = entry.get_or_try_init(|| { strong = Some(constructor(..)?); Ok(weak) })?;
-//! if let Some(strong) = strong { return Ok(strong); }
-//! ```
-//!
-//! If two threads both run the closure, both believe they won and each returns
-//! a different `Arc` for one key — two bind group layouts where the pool exists
-//! to guarantee one. So [`sync::OnceCell::get_or_try_init`] must call its
-//! closure EXACTLY ONCE, and
+//! The one that matters most: `wgpu-core`'s `ResourcePool` decides it won an
+//! initialisation race by whether its closure ran, so
+//! [`sync::OnceCell::get_or_try_init`] must call it EXACTLY ONCE.
 //! [`get_or_try_init_runs_the_closure_exactly_once_under_contention`] asserts
-//! it with the same two-thread barrier shape wgpu-core uses in its own test.
+//! that with wgpu-core's two-thread barrier shape, and
+//! [`the_exactly_once_test_catches_a_racy_cell`] runs the same race against an
+//! ungated control cell and requires it to be caught, so the first test cannot
+//! go toothless.
 //!
-//! A tripwire nobody has seen fire is a tripwire nobody knows is connected, and
-//! this one is easy to write in a way that can never fail. So
-//! [`the_exactly_once_test_catches_a_racy_cell`] runs the SAME race against
-//! `RacyCell` — a check-compute-set cell with no gate, which is the obvious
-//! wrong implementation and the one a "thin wrapper over `OnceLock`" would
-//! produce for the fallible path — and requires it to be caught. If that
-//! control ever passes, the exactly-once test above has stopped meaning
-//! anything.
+//! Each of these plants in `src/lib.rs` was compiled, run and caught:
 //!
-//! # ARMED — each plant was compiled and run, not argued
-//!
-//! Four defects were planted in `src/lib.rs`, each VERIFIED TO COMPILE first (a
-//! plant that does not build proves nothing about the test), run, and restored.
-//! The evidence is what the test actually printed:
-//!
-//! * `sync::OnceCell::get_or_try_init` loses its `gate` ->
-//!   [`get_or_try_init_runs_the_closure_exactly_once_under_contention`] exits
-//!   101 with `left: 2, right: 1` and the wgpu-core explanation. This is the
-//!   plant that matters: it is precisely the "thin wrapper over `OnceLock`"
-//!   implementation. An earlier draft of this line said it "passes every other
-//!   test in this file"; re-measured, it fails THREE of them — the other two
-//!   being `lazy_forced_concurrently_runs_its_initialiser_once` and
-//!   `once_box_runs_its_initialiser_once_under_contention`, which route through
-//!   the same gate. The suite is stronger than that sentence claimed, but the
-//!   sentence was still a number nobody had run.
-//! * `sync::OnceCell::get_or_try_init` drops the fallible path (`f().unwrap…`)
-//!   -> [`a_failed_initialiser_leaves_the_cell_empty_and_retryable`] exits 101.
-//! * `sync::Lazy::get` forces instead of peeking ->
-//!   [`lazy_does_not_run_its_initialiser_until_forced`] exits 101 with
-//!   `left: Some(11), right: None`.
-//! * `race::OnceBox::get_or_init` drops to check-compute-set ->
-//!   [`once_box_runs_its_initialiser_once_under_contention`] exits 101 with
-//!   `left: 3, right: 1`.
-//!
-//! [`lazy_new_is_unbounded_in_f_the_way_wasm_bindgen_needs`] needs no plant: it
-//! is a COMPILE-TIME reproduction of wasm-bindgen's unbounded `impl<T, F>`, so
-//! a regression in that signature stops the test crate building. The remaining
-//! tests are direct value assertions over one thread, where the assertion IS
-//! the demonstration.
+//! * `sync::OnceCell::get_or_try_init` without its gate -> the exactly-once
+//!   test (`left: 2, right: 1`), plus
+//!   [`lazy_forced_concurrently_runs_its_initialiser_once`] and
+//!   [`once_box_runs_its_initialiser_once_under_contention`], which share the gate.
+//! * `get_or_try_init` without the fallible path ->
+//!   [`a_failed_initialiser_leaves_the_cell_empty_and_retryable`].
+//! * `sync::Lazy::get` forcing instead of peeking ->
+//!   [`lazy_does_not_run_its_initialiser_until_forced`].
+//! * `race::OnceBox::get_or_init` as check-compute-set ->
+//!   [`once_box_runs_its_initialiser_once_under_contention`].
 
 use once_cell::{race, sync, unsync};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,9 +35,8 @@ use std::thread;
 // sync::OnceCell — the exactly-once contract
 // ---------------------------------------------------------------------------
 
-/// How long the initialiser sleeps so both threads are provably inside
-/// `get_or_try_init` at the same time. wgpu-core's own test uses 250 ms; the
-/// barrier does the real synchronising, and the sleep only widens the window.
+/// How long the initialiser sleeps to widen the race window; the barrier does
+/// the synchronising. wgpu-core's own test uses 250 ms.
 const RACE_WINDOW: std::time::Duration = std::time::Duration::from_millis(120);
 
 #[test]
@@ -111,8 +69,8 @@ fn get_or_try_init_runs_the_closure_exactly_once_under_contention() {
     assert_eq!(
         runs.load(Ordering::SeqCst),
         1,
-        "{} threads ran the initialiser; wgpu-core's ResourcePool decides it won the race by \
-         whether its closure ran, so a second run hands out a second Arc for one key",
+        "{} threads ran the initialiser; wgpu-core's ResourcePool would hand out two Arcs for \
+         one key",
         runs.load(Ordering::SeqCst)
     );
     assert_eq!(
@@ -126,11 +84,8 @@ fn get_or_try_init_runs_the_closure_exactly_once_under_contention() {
 }
 
 /// A `sync::OnceCell` written the obvious wrong way: check, compute, set,
-/// re-read, with nothing serialising the middle. It is a correct
-/// single-assignment cell — every reader still sees one value — and it is what
-/// a plain wrapper over `OnceLock` gives you for the FALLIBLE path, since
-/// `OnceLock::get_or_init` cannot fail out. Only the exactly-once property is
-/// missing, which is exactly the property wgpu-core needs.
+/// re-read, ungated. Every reader still sees one value; only exactly-once is
+/// missing. It is what a plain `OnceLock` wrapper gives the fallible path.
 struct RacyCell<T>(std::sync::OnceLock<T>);
 
 impl<T> RacyCell<T> {
@@ -186,10 +141,8 @@ fn the_exactly_once_test_catches_a_racy_cell() {
     }
     assert!(
         caught,
-        "THE CONTROL FAILED. Twenty two-thread races against a deliberately racy cell never \
-         observed a double initialisation, so \
-         `get_or_try_init_runs_the_closure_exactly_once_under_contention` is not testing what it \
-         claims and would pass against a broken shim. Fix the harness before trusting it."
+        "control not caught: 20 races against the racy cell never double-initialised, so the \
+         exactly-once test cannot detect a broken shim"
     );
 }
 
@@ -300,14 +253,9 @@ fn unsync_lazy_forces_once_and_derefs() {
     assert_eq!(runs.get(), 1);
 }
 
-/// THE SIGNATURE CONSTRAINT that a wrapper over `core::cell::LazyCell` would
-/// fail, reproduced from `wasm-bindgen-0.2.108/src/rt/mod.rs`.
-///
-/// wasm-bindgen builds its own `LazyCell` inside an `impl<T, F>` with NO
-/// `F: FnOnce() -> T` bound, so `unsync::Lazy::new` must be callable there.
-/// `core::cell::LazyCell::new` IS bounded, which is why this shim hand-rolls
-/// the type instead of forwarding to it. If that ever regresses, this fails to
-/// COMPILE — which is the point of writing it as a type rather than a check.
+/// wasm-bindgen's shape (`wasm-bindgen-0.2.108/src/rt/mod.rs`): `unsync::Lazy::new`
+/// called inside an `impl<T, F>` with no `F: FnOnce() -> T` bound. Fails to
+/// compile if `new` gains that bound.
 struct WasmBindgenShapedCell<T, F = fn() -> T>(unsync::Lazy<T, F>);
 
 impl<T, F> WasmBindgenShapedCell<T, F> {
@@ -316,16 +264,9 @@ impl<T, F> WasmBindgenShapedCell<T, F> {
     }
 }
 
-/// The same construction in a CONST CONTEXT, which is where wasm-bindgen puts
-/// it (a `static` behind its own `unsafe impl Sync` wrapper — sound on a
-/// single-threaded wasm target, and not reproduced here because this test
-/// binary is threaded). A const block asks for const evaluation without asking
-/// for `Sync`, and without declaring a named constant whose type has interior
-/// mutability, which is a thing to be linted for rather than to write.
-///
-/// This item is the assertion: it fails to COMPILE if `unsync::Lazy::new` stops
-/// being a `const fn`, or gains an `F: FnOnce() -> T` bound that
-/// `WasmBindgenShapedCell::new` cannot satisfy.
+/// The same construction in a const context, where wasm-bindgen puts it (a
+/// `static` behind its own `unsafe impl Sync`). A const block needs no `Sync`.
+/// Fails to compile if `unsync::Lazy::new` stops being `const fn`.
 const _: () = {
     let _ = WasmBindgenShapedCell::<u32>::new(|| 42);
 };
@@ -336,37 +277,21 @@ fn lazy_new_is_unbounded_in_f_the_way_wasm_bindgen_needs() {
     assert_eq!(*cell.0, 42);
 }
 
-/// THE AUTO-TRAIT SURFACE, pinned because two of these were WRONG.
-///
-/// `RefUnwindSafe` is an auto trait with a NEGATIVE impl on `UnsafeCell`.
-/// Upstream's `unsync` cells contain one and therefore spell the impl out by
-/// hand (`once_cell-1.21.4/src/lib.rs:430` and `:729`); the first draft of this
-/// shim wrapped `core::cell::OnceCell` and `Cell` and inherited neither, so
-/// `unsync::OnceCell<T>` and `unsync::Lazy<T, F>` were `!RefUnwindSafe` where
-/// upstream's are. Nothing in the graph asks for it today — `wasm-bindgen`
-/// feeds `maybe_catch_unwind` an `AssertUnwindSafe` at
-/// `wasm-bindgen-0.2.108/src/convert/closures.rs:74` — so it never failed a
-/// build. It also never could have failed one HERE: the three `unsync`
-/// consumers are `js-sys`, `wasm-bindgen` and `wasm-bindgen-futures`, all of
-/// them wasm-only, and no wasm target is installed on the machine that runs
-/// this suite. That is exactly why it is a test and not a comment.
-///
-/// Sixteen bounds were measured against real upstream 1.21.4 side by side; the
-/// other fourteen — every `Send`, every `Sync`, and the whole of `sync` and
-/// `race` — were already identical. `sync::Lazy` is deliberately WIDER than
-/// upstream (its `Mutex<Option<F>>` is unconditionally `RefUnwindSafe`, so it
-/// does not need `F: RefUnwindSafe`); wider accepts every program upstream
-/// accepts, and narrowing it back would need a `PhantomData` for no consumer.
+/// The auto-trait surface. Without hand-written impls, `unsync::OnceCell` and
+/// `unsync::Lazy` are `!RefUnwindSafe` where upstream's are not (its
+/// `lib.rs:430`, `:729`). No consumer asks for the bound (`wasm-bindgen` wraps
+/// its argument in `AssertUnwindSafe`), so no consumer build can catch losing
+/// it and this test is the only check. `sync::Lazy` is deliberately wider than
+/// upstream (no `F: RefUnwindSafe` needed).
 #[test]
 fn the_unwind_safety_surface_matches_upstream() {
     fn rus<T: std::panic::RefUnwindSafe>() {}
     fn us<T: std::panic::UnwindSafe>() {}
 
-    // The two that regressed. `unsync::OnceCell` is upstream's lib.rs:430,
-    // `unsync::Lazy` its lib.rs:729.
+    // The two that need hand-written impls.
     rus::<unsync::OnceCell<u32>>();
     rus::<unsync::Lazy<u32>>();
-    // The rest of the surface, which was already right and must stay so.
+    // The rest of the surface.
     us::<unsync::OnceCell<u32>>();
     us::<unsync::Lazy<u32>>();
     rus::<sync::OnceCell<u32>>();
@@ -376,13 +301,8 @@ fn the_unwind_safety_surface_matches_upstream() {
     rus::<race::OnceBox<u32>>();
     us::<race::OnceBox<u32>>();
 
-    // NO NEGATIVE HALF, AND THE ABSENCE IS DELIBERATE. The impls above are
-    // bounded exactly as upstream bounds them, but "`unsync::OnceCell<Cell<u32>>`
-    // is NOT RefUnwindSafe" cannot be asserted on stable — a negative trait
-    // bound is a compile error, and the obvious workaround (a helper returning
-    // a hardcoded `false`) asserts nothing at all. What guards the widening
-    // direction is the bound written on each impl, which a reader can diff
-    // against once_cell-1.21.4/src/lib.rs:430 and :729 in one line each.
+    // No negative half: stable Rust cannot assert `!RefUnwindSafe`. The impl
+    // bounds themselves guard against widening.
 }
 
 #[test]
@@ -450,9 +370,7 @@ fn once_box_is_a_single_assignment_cell_over_a_box() {
 
 #[test]
 fn once_box_runs_its_initialiser_once_under_contention() {
-    // Upstream's `race` module permits more than one run; this shim gives the
-    // stricter guarantee (divergence 2 in src/lib.rs). Asserting the stronger
-    // property is what makes that documented claim checkable.
+    // Divergence 2 in src/lib.rs: stricter than upstream's `race`.
     let cell: Arc<race::OnceBox<u32>> = Arc::new(race::OnceBox::new());
     let runs = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(3));
@@ -501,9 +419,8 @@ fn unsync_once_cell_matches_its_sync_sibling() {
 
 #[test]
 fn a_panicking_initialiser_leaves_the_cell_usable() {
-    // Upstream has no locks and therefore no poisoning: after a panic in `f`
-    // the cell is simply still empty. The private `Mutex` here must not turn
-    // that into a poisoned lock that panics every later caller.
+    // Upstream has no locks: after a panic in `f` the cell is still empty.
+    // The private `Mutex` must not turn that into a poisoned lock.
     let cell: Arc<sync::OnceCell<u32>> = Arc::new(sync::OnceCell::new());
     let c = Arc::clone(&cell);
     let panicked = thread::spawn(move || {

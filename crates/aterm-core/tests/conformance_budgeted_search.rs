@@ -63,16 +63,13 @@ fn snapshot_matches(terminal: &mut Terminal, query: &str) -> usize {
         .len()
 }
 
-/// Project one returned shipping step. `prior_id` and `stream_id` are the trace
-/// ghosts: `prior_id` records the previously observed logical stream when the
-/// real `reset` bit says this call replaced it, and `stream_id` is the identity
-/// the host last saw a `reset` announce — what a host accumulating deltas keys
-/// on. `delivery` counts the turns of a result BACKLOG, read from the host's
-/// delivery ledger against `snapshot_matches` rather than from `complete`: a
-/// finished scan whose deltas have not yet covered the snapshot holds a
-/// backlog, whatever the step says about completion. On the shipping code the
-/// two agree (`complete` is `scan done && emitted >= result_count`), so a step
-/// that reports complete while its backlog is held projects as exactly that.
+/// Project one returned step. `prior_id` and `stream_id` are the trace ghosts:
+/// `prior_id` is the logical stream a real `reset` replaced, and `stream_id` is
+/// the identity the host last saw a `reset` announce (what a host accumulating
+/// deltas keys on). `delivery` counts backlog turns from the host's delivery
+/// ledger against `snapshot_matches`, not from `complete`: a finished scan
+/// whose deltas do not yet cover the snapshot holds a backlog. The real code's
+/// `complete` is `scan done && emitted >= result_count`, so the two agree.
 fn project_step(
     step: &BudgetedSearchStep,
     host: &mut HostTrace,
@@ -368,10 +365,9 @@ fn real_terminal_reset_identity_resume_and_retirement_refine_the_model() {
     assert_eq!(completed.search_id, after_cancel.search_id);
     assert_eq!(completed.rows_fed, usize::from(ROWS));
 
-    // Completion RETIRES the owner cursor (the completed index is retained for
-    // search_summary to read, fed E-1, but is no longer resumable). Presenting
-    // the completed search_id cannot resurrect it: this is a new reset-marked
-    // logical stream.
+    // Completion retires the owner cursor (the completed index stays for
+    // search_summary to read but is not resumable). Presenting the completed
+    // search_id starts a new reset-marked logical stream.
     let after_completion = terminal
         .search_budgeted("y", true, false, Some(completed.search_id), 0)
         .expect("completed identity is retired");
@@ -509,13 +505,11 @@ fn dense_result_backlog_drains_without_rescanning_or_replaying_deltas() {
     assert_eq!(first.cursor, Some(first.search_id));
     assert_eq!(first.results.matches.len(), MAX_MATCHES_PER_STEP);
 
-    // Negative control: the same real scan turn as `complete =
-    // engine.is_complete()` returns it — the completion rule `f7a2ca812`
-    // shipped, without the delivery term `809076ce2` added with the delta
-    // bound. It reports complete with no cursor while 4,904 of the 9,000
-    // matches are still held. The host's ledger against the snapshot projects
-    // it as exactly the `BuggyScanOnlyCompletion` successor, which the healthy
-    // model admits under no action and which breaks `DeliveryShape` alone.
+    // Negative control: a step reporting `complete = engine.is_complete()`,
+    // without the delivery term: complete with no cursor while 4,904 of the
+    // 9,000 matches are still held. The host's ledger projects it as the
+    // `BuggyScanOnlyCompletion` successor, which the healthy model admits under
+    // no action and which breaks `DeliveryShape` alone.
     let scan_only = BudgetedSearchStep {
         results: first.results.clone(),
         complete: true,
@@ -700,7 +694,7 @@ fn stale_identity_and_early_or_stuttering_drain_negative_controls_are_rejected()
 
 /// The model's other `Buggy=1` slips (the scan-only completion and the
 /// gate-free final drain are replayed in the dense test above), replayed on
-/// REAL steps: each is the step a slipped `search_budgeted` would return,
+/// real steps: each is the step a slipped `search_budgeted` would return,
 /// projected through the same `project_step`, equal to the mutant's successor,
 /// and refused by the healthy model.
 #[test]

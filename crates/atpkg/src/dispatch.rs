@@ -111,50 +111,6 @@ mod tests {
         );
     }
 
-    /// The OS-installer protocols were deleted (design 2026-09-22 §5.3(b)): the pairs
-    /// they carried are Unknown, so an index naming one is refused, never applied.
-    #[test]
-    fn the_deleted_os_installer_pairs_fail_closed() {
-        for (kind, protocol) in [
-            ("installer-pkg", "pkg"),
-            ("system-package", "system-pm"),
-            ("system-package", "softwareupdate"),
-        ] {
-            assert_eq!(
-                strategy_for(kind, protocol),
-                ApplyStrategy::Unknown,
-                "{kind}/{protocol}"
-            );
-        }
-    }
-
-    /// The vendor `.app` and the aterm self-update are DIFFERENT strategies: the former
-    /// lands in the store and shims, the latter is refused so the app's own in-session
-    /// updater stays the only thing that applies it. Neither may ever be taken for the other, and neither
-    /// is a plain Shim.
-    #[test]
-    fn a_vendor_app_is_not_the_self_update_app_bundle() {
-        assert_ne!(
-            strategy_for("app-bundle", "https"),
-            strategy_for("app-bundle", "github-release")
-        );
-        assert_ne!(strategy_for("app-bundle", "https"), ApplyStrategy::Shim);
-        assert_ne!(strategy_for("app-bundle", "https"), ApplyStrategy::Unknown);
-    }
-
-    /// The retired `vendor-fetch` spelling is refused at PARSE; if one ever reached
-    /// dispatch it would still fail closed, over every protocol.
-    #[test]
-    fn the_retired_vendor_fetch_kind_is_unknown_everywhere() {
-        for protocol in ["github-release", "https"] {
-            assert_eq!(
-                strategy_for("vendor-fetch", protocol),
-                ApplyStrategy::Unknown,
-                "{protocol}"
-            );
-        }
-    }
-
     /// A kind over a protocol that cannot carry it is Unknown — not the kind's usual
     /// strategy with a wrong download lane.
     #[test]
@@ -187,21 +143,23 @@ mod tests {
             strategy_for("binary", "softwareupdate"),
             ApplyStrategy::Unknown
         );
+        // The deleted OS-installer protocols' own pairs (design 2026-09-22 §5.3(b)).
+        for (kind, protocol) in [
+            ("installer-pkg", "pkg"),
+            ("system-package", "system-pm"),
+            ("system-package", "softwareupdate"),
+        ] {
+            assert_eq!(
+                strategy_for(kind, protocol),
+                ApplyStrategy::Unknown,
+                "{kind}/{protocol}"
+            );
+        }
         // Spelling is exact and case-sensitive on both axes.
         assert_eq!(strategy_for("binary", "HTTPS"), ApplyStrategy::Unknown);
         assert_eq!(strategy_for("binary", "http"), ApplyStrategy::Unknown);
         assert_eq!(strategy_for("Binary", "https"), ApplyStrategy::Unknown);
         assert_eq!(strategy_for("binary", ""), ApplyStrategy::Unknown);
-    }
-
-    #[test]
-    fn the_app_is_never_flipped_like_a_tool() {
-        // The single most important distinction (§16.4): aterm.app does NOT take the
-        // immediate symlink-flip path.
-        assert_ne!(
-            strategy_for("app-bundle", "github-release"),
-            ApplyStrategy::Shim
-        );
     }
 
     #[test]

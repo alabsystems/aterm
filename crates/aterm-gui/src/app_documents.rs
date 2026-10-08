@@ -228,6 +228,11 @@ pub(crate) struct HeldJournalReseat {
     plan: JournalReseatPlan,
 }
 
+/// The status a save shows when its completion could not be recorded: the
+/// write may or may not have landed, so the person saves again. The cause is
+/// logged, never painted.
+const SAVE_UNCONFIRMED: &str = "Save could not be confirmed; choose Save again";
+
 /// The status a successor gives a document whose unsaved draft it restored
 /// during an update: the draft is the buffer, and the file is as it was.
 pub(crate) const CARRIED_DRAFT_NOTICE: &str =
@@ -811,9 +816,14 @@ impl App {
                     query: requested.clone(),
                     origin,
                 };
-                state.status = Some(format!(
-                    "{requested} is not authored yet · search is ready; completion can insert it"
-                ));
+                state.status = Some(match target {
+                    crate::native_app::ConfigEditorTarget::Key(_) => {
+                        format!("{requested} is not set in aterm.toml · completion can add it")
+                    }
+                    crate::native_app::ConfigEditorTarget::Search(_) => {
+                        "No match in aterm.toml · search is open".to_string()
+                    }
+                });
             }
         }
         Ok(())
@@ -2011,7 +2021,7 @@ impl App {
                 if let Some(AppViewState::Editor(state)) =
                     self.native_runtime.view_state_mut(source_view)
                 {
-                    state.status = Some("No command is bound to that key".to_string());
+                    state.status = None;
                 }
             }
             EditorEffect::SwitchBuffer { query } => {
@@ -2224,21 +2234,20 @@ impl App {
                     "Reloaded changes from disk",
                 )?;
             }
-            crate::native_document_io::FileWatchReduction::ConflictDirty { .. } => {
+            crate::native_document_io::FileWatchReduction::ConflictDirty { change } => {
                 self.set_document_disk_conflict(document, true);
-                self.set_document_recovery_status(
-                    document,
-                    Some(
-                        "File changed on disk; local edits are preserved and Save is blocked to prevent an overwrite. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’"
-                            .to_string(),
-                    ),
-                );
+                // The same words as the save refusal for the same conflict.
+                let line = match change {
+                    crate::native_document_io::VersionConflict::Existence => {
+                        crate::native_app::DISK_EXISTENCE_RECOVERY
+                    }
+                    _ => crate::native_app::DISK_CONFLICT_RECOVERY,
+                };
+                self.set_document_recovery_status(document, Some(line.to_string()));
             }
-            crate::native_document_io::FileWatchReduction::DeferredSaving { .. } => {
-                for (_, _, view) in self.document_native_views(document) {
-                    self.set_editor_view_status(view, "Disk refresh deferred until save completes");
-                }
-            }
+            // The in-flight save's "Saving…" and then its own outcome are what
+            // the person sees; the deferred refresh runs after it.
+            crate::native_document_io::FileWatchReduction::DeferredSaving { .. } => {}
         }
         Ok(reduction)
     }
@@ -2405,7 +2414,6 @@ impl App {
                     }
                 })
                 .or_insert(intent);
-            self.set_editor_view_status(source_view, "Save queued after current checkpoint");
             return Ok(());
         }
         if let Some(proxy) = self.proxy.clone() {
@@ -2501,7 +2509,8 @@ impl App {
         {
             Ok(reduction) => reduction,
             Err(error) => {
-                let message = format!("could not finish document save: {error:?}");
+                aterm_log::warn!("could not finish document save: {error:?}");
+                let message = SAVE_UNCONFIRMED.to_string();
                 let _ = self.document_store.checkpoint_fail(document);
                 self.native_documents.pending_saves.remove(&document);
                 self.native_runtime.set_document_saving(document, false);
@@ -2511,13 +2520,15 @@ impl App {
             }
         };
         let mut prepared_config = None;
+        let stale = matches!(reduction, crate::native_document_io::SaveReduction::Stale);
         let outcome = match reduction {
             crate::native_document_io::SaveReduction::Durable(checkpoint) => {
                 (|| -> Result<(), String> {
                     self.document_store
                         .checkpoint_ack(document, checkpoint.seq)
                         .map_err(|error| {
-                            format!("could not publish durable checkpoint: {error:?}")
+                            aterm_log::warn!("could not publish durable checkpoint: {error:?}");
+                            SAVE_UNCONFIRMED.to_string()
                         })?;
                     let saved_text = std::str::from_utf8(&saved_bytes)
                         .map_err(|_| "saved document bytes were not UTF-8".to_string())?;
@@ -2554,15 +2565,21 @@ impl App {
             crate::native_document_io::SaveReduction::Conflict(conflict) => {
                 let _ = self.document_store.checkpoint_fail(document);
                 self.set_document_disk_conflict(document, true);
-                let message = format!(
-                    "File changed on disk ({conflict:?}); local edits are preserved and Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’"
-                );
+                aterm_log::warn!("document save refused: file changed on disk ({conflict:?})");
+                let message = match conflict {
+                    crate::native_document_io::VersionConflict::Existence => {
+                        crate::native_app::DISK_EXISTENCE_RECOVERY
+                    }
+                    _ => crate::native_app::DISK_CONFLICT_RECOVERY,
+                }
+                .to_string();
                 self.set_document_recovery_status(document, Some(message.clone()));
                 Err(message)
             }
             crate::native_document_io::SaveReduction::Failed { stage, message } => {
                 let _ = self.document_store.checkpoint_fail(document);
-                Err(format!("document save failed at {stage:?}: {message}"))
+                aterm_log::warn!("document save failed at {stage:?}: {message}");
+                Err(format!("Save failed: {message}"))
             }
             crate::native_document_io::SaveReduction::ReconcileRequired {
                 stage,
@@ -2572,9 +2589,20 @@ impl App {
             } => {
                 let _ = self.document_store.checkpoint_fail(document);
                 self.set_document_disk_conflict(document, true);
-                let recovery = format!(
-                    "Document publication is indeterminate at {stage:?}; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’: {message} (observed: {observed:?})"
+                aterm_log::warn!(
+                    "document save indeterminate at {stage:?}: {message} (observed: {observed:?})"
                 );
+                let landed = observed.is_some_and(|observed| {
+                    observed.exists
+                        && observed.content
+                            == crate::native_document_io::ContentFingerprint::of(&saved_bytes)
+                });
+                let recovery = if landed {
+                    "Saved, but the disk did not confirm it; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’"
+                } else {
+                    "Save may not have reached the disk; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’"
+                }
+                .to_string();
                 self.set_document_recovery_status(document, Some(recovery.clone()));
                 Err(recovery)
             }
@@ -2582,6 +2610,8 @@ impl App {
                 let _ = self.document_store.checkpoint_fail(document);
                 Err("document save was cancelled".to_string())
             }
+            // A newer save replaced this one; nothing failed for the person,
+            // so the completion is logged by the caller and never painted.
             crate::native_document_io::SaveReduction::Stale => {
                 Err("stale document save completion".to_string())
             }
@@ -2627,7 +2657,9 @@ impl App {
             self.set_document_recovery_status(document, Some(message));
         }
         if let Err(message) = &outcome {
-            self.mark_document_shutdown_failure(document, message);
+            if !stale {
+                self.mark_document_shutdown_failure(document, message);
+            }
         } else {
             self.mark_document_save_success(document);
             self.finish_pending_document_closes(document)?;
@@ -3679,12 +3711,7 @@ impl App {
             .ok_or_else(|| "canonical document disappeared".to_string())?;
         let presentation = crate::tab_model::TabPresentation {
             title: title.clone(),
-            icon: Some(match kind {
-                AppKind::Markdown => crate::tab_model::TabIconKind::Markdown,
-                AppKind::Editor => crate::tab_model::TabIconKind::Editor,
-                AppKind::Settings => crate::tab_model::TabIconKind::Settings,
-                AppKind::Recovery => crate::tab_model::TabIconKind::Recovery,
-            }),
+            icon: Some(kind.icon()),
             indicators: crate::tab_model::TabIndicators::default(),
             conn: None,
             closable: true,
@@ -3724,8 +3751,10 @@ impl App {
                 };
                 self.install_new_native_tab(wid, app, state, presentation)
             };
-        let (instance, tab, view) =
-            install.map_err(|error| format!("could not install native document tab: {error:?}"))?;
+        let (instance, tab, view) = install.map_err(|error| {
+            aterm_log::warn!("could not install native document tab: {error:?}");
+            "This document could not be reopened".to_string()
+        })?;
 
         if let Err(error) = self.attach_document_view(kind, document, view) {
             self.rollback_document_tab(wid, tab);
@@ -3737,7 +3766,7 @@ impl App {
             // let the update start, so say what happened rather than suggest a
             // crash.
             let message = match notice {
-                crate::native_document_journal::RecoveryNotice::Recovered { .. }
+                crate::native_document_journal::RecoveryNotice::Recovered
                     if self.incoming_handoff_pending =>
                 {
                     CARRIED_DRAFT_NOTICE.to_string()
@@ -3948,12 +3977,12 @@ mod tests {
     /// thread. A genuine failure of that property blocks FOREVER, so any finite
     /// bound catches it and the exact value only decides how fast the report comes.
     ///
-    /// It must therefore be immune to machine load, not tuned to a fast machine: a
+    /// It is therefore a HANG DETECTOR, a minute, and never a latency budget: a
     /// saturated host stretches this suite ~2x, and a bound picked for an idle one
     /// turns a correctness guard into a flake. (Measured: the same class of tight
     /// deadline in `control.rs`'s `read_until` failed exactly this way.) One second
-    /// looked generous and was not; this does not, and is.
-    const REFUSES_WITHOUT_BLOCKING: std::time::Duration = std::time::Duration::from_secs(30);
+    /// looked generous and was not.
+    const REFUSES_WITHOUT_BLOCKING: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
     /// Tier-1 guard binding: the exact generic admission primitive used by the
     /// shipping document worker agrees with the derived bounded-queue model at
@@ -3971,10 +4000,7 @@ mod tests {
         let journal_root = std::env::temp_dir().join(format!(
             "aterm-document-queue-retry-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            aterm_time::since_epoch().unwrap().as_nanos()
         ));
         let mut journals = DocumentJournalStore::for_test(journal_root.clone()).unwrap();
         let decision = journals.inspect_open(uri, disk.text.as_bytes()).unwrap();
@@ -4510,12 +4536,32 @@ mod tests {
         pending
     }
 
+    /// Replays the in-flight save and panics with the save's own error text.
+    ///
+    /// NOT decoration. When this replay fails, the panic used to read only
+    /// `called Result::unwrap() on an Err value`, which names neither the stage
+    /// nor the cause — and this call is the ONE fallible step in these tests, so
+    /// an intermittent failure here left nothing to diagnose. On-disk forensics
+    /// of four leaked fixtures showed the replay reaching `open_write_lock`'s
+    /// `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
+    /// before any temp file existed (fixture dir mtime still equal to the
+    /// rename's ctime). That narrows the failure to the FIVE exits between those
+    /// two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
+    /// them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
+    /// acquire save lock"), the post-lock `validate_atomic_target` ("could not
+    /// canonicalize the process temporary root" / TargetRetargeted /
+    /// SymlinkComponent), `observe_file` ("target changed while it was being
+    /// observed"), or `detect_version_conflict` ("File changed on disk"). A
+    /// bounded WouldBlock retry has since been added for the proven
+    /// flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
+    /// for THIS flake. Surface the message so the next occurrence names its own
+    /// exit. (Root-cause record: git log --grep save-latch-flake)
     fn finish_inflight_save_for_test(
         app: &mut App,
         document: DocumentId,
         source_view: crate::tab_model::ViewId,
         pending: crate::native_document_host::PendingDocumentSave,
-    ) -> Result<(), String> {
+    ) {
         let grant = app
             .native_documents
             .grants
@@ -4537,6 +4583,7 @@ mod tests {
             result,
             config_observation,
         )
+        .unwrap_or_else(|error| panic!("inflight replay save failed: {error}"));
     }
 
     #[cfg(unix)]
@@ -4599,14 +4646,16 @@ mod tests {
             ".{}.lock",
             journal.file_name().unwrap().to_string_lossy()
         ));
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .unwrap();
-        held.lock().unwrap();
+        let held = crate::native_document_host::HeldAdvisoryLock::lock(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap(),
+        )
+        .unwrap();
 
         let started = std::time::Instant::now();
         let error = app
@@ -4624,10 +4673,10 @@ mod tests {
         assert!(error.contains("retry opening Manual"), "{error}");
         assert!(app.active_native_view(WindowId(0)).is_none());
 
-        // Released by LOCK_UN, not by the close alone: a child another test is
-        // forking holds this descriptor until it execs, and the retry below has
-        // the event loop's 25 ms journal-lock budget (the fd-copy sweep of 2026-09-27).
-        held.unlock().expect("release the journal lock");
+        // Released by LOCK_UN (the guard's drop), not by the close alone: a child
+        // another test is forking holds this descriptor until it execs, and the
+        // retry below has the event loop's 25 ms journal-lock budget (the fd-copy
+        // sweep of 2026-09-27).
         drop(held);
         app.ensure_and_open_config_editor_path_in_window(WindowId(0), &config)
             .expect("Manual retry succeeds after the lock is released");
@@ -4635,57 +4684,61 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    fn assert_focused_config_completion_activates(named_key: NamedKey, suffix: &str) {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-config-editor-focused-completion-{}-{suffix}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aterm.toml");
-        fs::write(&path, "win").unwrap();
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.ensure_and_open_config_editor_path_in_window(wid, &path)
-            .unwrap();
-        let (instance, view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(instance).unwrap();
-        app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::MoveLineEnd))
-            .unwrap();
+    #[test]
+    fn focused_config_completion_enter_and_space_activate_its_semantic_button() {
+        for (suffix, named_key) in [("enter", NamedKey::Enter), ("space", NamedKey::Space)] {
+            let dir = std::env::temp_dir().join(format!(
+                "aterm-config-editor-focused-completion-{}-{suffix}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("aterm.toml");
+            fs::write(&path, "win").unwrap();
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.ensure_and_open_config_editor_path_in_window(wid, &path)
+                .unwrap();
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::MoveLineEnd))
+                .unwrap();
 
-        assert!(app.prepare_native_input_scratch(wid));
-        let focus = app
-            .retained_native_leaf_artifact(wid, view, false)
-            .expect("compiled native config editor")
-            .compiled
-            .semantics
-            .iter()
-            .find(|node| {
-                node.key.as_str().starts_with("editor/config-completion/")
-                    && node.label.starts_with("Insert window_theme")
-            })
-            .expect("window theme completion semantic button")
-            .key
-            .clone();
-        let context = app
-            .editor_config_completion_context(instance, view)
-            .expect("exact rendered completion context");
-        let state = app
-            .native_runtime
-            .view_state_mut(view)
-            .expect("config editor view state");
-        state.common_mut().last_focus = Some(focus);
-        let AppViewState::Editor(state) = state else {
-            panic!("config editor view state");
-        };
-        state.config_completion_interaction = Some(context);
+            assert!(app.prepare_native_input_scratch(wid));
+            let focus = app
+                .retained_native_leaf_artifact(wid, view, false)
+                .expect("compiled native config editor")
+                .compiled
+                .semantics
+                .iter()
+                .find(|node| {
+                    node.key.as_str().starts_with("editor/config-completion/")
+                        && node.label.starts_with("Insert window_theme")
+                })
+                .expect("window theme completion semantic button")
+                .key
+                .clone();
+            let context = app
+                .editor_config_completion_context(instance, view)
+                .expect("exact rendered completion context");
+            let state = app
+                .native_runtime
+                .view_state_mut(view)
+                .expect("config editor view state");
+            state.common_mut().last_focus = Some(focus);
+            let AppViewState::Editor(state) = state else {
+                panic!("config editor view state");
+            };
+            state.config_completion_interaction = Some(context);
 
-        drive_native(&mut app, key(Key::Named(named_key), Modifiers::empty()));
-        assert_eq!(
-            app.document_store.snapshot(document).unwrap().text.as_ref(),
-            "window_theme = \"auto\""
-        );
-        let _ = fs::remove_dir_all(dir);
+            drive_native(&mut app, key(Key::Named(named_key), Modifiers::empty()));
+            assert_eq!(
+                app.document_store.snapshot(document).unwrap().text.as_ref(),
+                "window_theme = \"auto\"",
+                "{suffix}"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
@@ -4848,144 +4901,85 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Swapping the config's final symlink, or its parent directory's, between
+    /// open and Save is a conflict: the draft never lands behind the new link.
     #[cfg(unix)]
     #[test]
-    fn manual_final_config_symlink_swap_conflicts_without_redirecting_save() {
+    fn manual_config_symlink_swap_conflicts_without_redirecting_save() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-config-editor-final-link-swap-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let first = dir.join("first.toml");
-        let second = dir.join("second.toml");
-        let logical = dir.join("aterm.toml");
-        fs::write(&first, "theme = \"Default\"\n").unwrap();
-        fs::write(&second, "theme = \"Dracula\"\n").unwrap();
-        symlink("first.toml", &logical).unwrap();
+        // (swapped link, its first and second destinations, the logical path)
+        for (link, first_dest, second_dest, logical) in [
+            ("aterm.toml", "first.toml", "second.toml", "aterm.toml"),
+            ("config", "first", "second", "config/aterm.toml"),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "aterm-config-editor-link-swap-{link}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let behind = |dest: &str| dir.join(logical.replacen(link, dest, 1));
+            let (first, second) = (behind(first_dest), behind(second_dest));
+            for (path, text) in [
+                (&first, "theme = \"Default\"\n"),
+                (&second, "theme = \"Dracula\"\n"),
+            ] {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+            let alias = dir.join(link);
+            let logical = dir.join(logical);
+            symlink(first_dest, &alias).unwrap();
 
-        let mut app = App::headless_for_test();
-        app.native_config_service =
-            crate::native_config_service::VersionedConfigService::load_path(&logical).unwrap();
-        let wid = WindowId(0);
-        app.ensure_and_open_config_editor_path_in_window(wid, &logical)
+            let mut app = App::headless_for_test();
+            app.native_config_service =
+                crate::native_config_service::VersionedConfigService::load_path(&logical).unwrap();
+            let wid = WindowId(0);
+            app.ensure_and_open_config_editor_path_in_window(wid, &logical)
+                .unwrap();
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            app.dispatch_native_event(wid, AppEvent::TextInput(TextInputEvent::SelectAll))
+                .unwrap();
+            app.dispatch_native_event(
+                wid,
+                AppEvent::TextInput(TextInputEvent::Commit("theme = \"Nord\"\n".to_string())),
+            )
             .unwrap();
-        let (instance, view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(instance).unwrap();
-        app.dispatch_native_event(wid, AppEvent::TextInput(TextInputEvent::SelectAll))
-            .unwrap();
-        app.dispatch_native_event(
-            wid,
-            AppEvent::TextInput(TextInputEvent::Commit("theme = \"Nord\"\n".to_string())),
-        )
-        .unwrap();
 
-        fs::remove_file(&logical).unwrap();
-        symlink("second.toml", &logical).unwrap();
-        let error = app.save_document_checkpoint(document, view).unwrap_err();
-        assert!(error.contains("changed on disk"), "{error}");
-        assert_eq!(fs::read_to_string(&first).unwrap(), "theme = \"Default\"\n");
-        assert_eq!(
-            fs::read_to_string(&second).unwrap(),
-            "theme = \"Dracula\"\n"
-        );
-        assert_eq!(
-            fs::read_link(&logical).unwrap(),
-            std::path::PathBuf::from("second.toml")
-        );
-        assert_eq!(app.document_store.dirty(document), Some(true));
-        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
-            panic!("Manual editor remains installed after link conflict");
-        };
-        assert!(
-            state
-                .status
-                .as_deref()
-                .is_some_and(|status| status.contains("changed on disk")),
-            "conflict must be visible: {:?}",
-            state.status
-        );
-        assert_eq!(
-            app.native_config_service.snapshot().text.as_ref(),
-            "theme = \"Default\"\n",
-            "a conflicted draft must leave the admitted live config unchanged"
-        );
-        let _ = fs::remove_dir_all(dir);
-    }
+            fs::remove_file(&alias).unwrap();
+            symlink(second_dest, &alias).unwrap();
+            let error = app.save_document_checkpoint(document, view).unwrap_err();
 
-    #[cfg(unix)]
-    #[test]
-    fn manual_parent_config_symlink_swap_conflicts_without_redirecting_save() {
-        use std::os::unix::fs::symlink;
-
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-config-editor-parent-link-swap-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let first_dir = dir.join("first");
-        let second_dir = dir.join("second");
-        let alias = dir.join("config");
-        fs::create_dir_all(&first_dir).unwrap();
-        fs::create_dir_all(&second_dir).unwrap();
-        let first = first_dir.join("aterm.toml");
-        let second = second_dir.join("aterm.toml");
-        let logical = alias.join("aterm.toml");
-        fs::write(&first, "theme = \"Default\"\n").unwrap();
-        fs::write(&second, "theme = \"Dracula\"\n").unwrap();
-        symlink("first", &alias).unwrap();
-
-        let mut app = App::headless_for_test();
-        app.native_config_service =
-            crate::native_config_service::VersionedConfigService::load_path(&logical).unwrap();
-        let wid = WindowId(0);
-        app.ensure_and_open_config_editor_path_in_window(wid, &logical)
-            .unwrap();
-        let (instance, view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(instance).unwrap();
-        app.dispatch_native_event(wid, AppEvent::TextInput(TextInputEvent::SelectAll))
-            .unwrap();
-        app.dispatch_native_event(
-            wid,
-            AppEvent::TextInput(TextInputEvent::Commit("theme = \"Nord\"\n".to_string())),
-        )
-        .unwrap();
-
-        fs::remove_file(&alias).unwrap();
-        symlink("second", &alias).unwrap();
-        let error = app.save_document_checkpoint(document, view).unwrap_err();
-
-        assert!(error.contains("changed on disk"), "{error}");
-        assert_eq!(fs::read_to_string(&first).unwrap(), "theme = \"Default\"\n");
-        assert_eq!(
-            fs::read_to_string(&second).unwrap(),
-            "theme = \"Dracula\"\n"
-        );
-        assert_eq!(
-            fs::read_link(&alias).unwrap(),
-            std::path::PathBuf::from("second")
-        );
-        assert_eq!(app.document_store.dirty(document), Some(true));
-        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
-            panic!("Manual editor remains installed after parent-link conflict");
-        };
-        assert!(
-            state
-                .status
-                .as_deref()
-                .is_some_and(|status| status.contains("changed on disk")),
-            "conflict must be visible: {:?}",
-            state.status
-        );
-        assert_eq!(
-            app.native_config_service.snapshot().text.as_ref(),
-            "theme = \"Default\"\n",
-            "a conflicted draft must leave the admitted live config unchanged"
-        );
-        let _ = fs::remove_dir_all(dir);
+            assert!(error.contains("changed on disk"), "{link}: {error}");
+            assert_eq!(fs::read_to_string(&first).unwrap(), "theme = \"Default\"\n");
+            assert_eq!(
+                fs::read_to_string(&second).unwrap(),
+                "theme = \"Dracula\"\n"
+            );
+            assert_eq!(
+                fs::read_link(&alias).unwrap(),
+                std::path::PathBuf::from(second_dest)
+            );
+            assert_eq!(app.document_store.dirty(document), Some(true));
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                panic!("Manual editor remains installed after {link} conflict");
+            };
+            assert!(
+                state
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("changed on disk")),
+                "conflict must be visible: {:?}",
+                state.status
+            );
+            assert_eq!(
+                app.native_config_service.snapshot().text.as_ref(),
+                "theme = \"Default\"\n",
+                "a conflicted draft must leave the admitted live config unchanged"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
@@ -5132,14 +5126,16 @@ mod tests {
         )
         .unwrap();
         let lock_path = dir.join(".aterm.toml.aterm-write.lock");
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .unwrap();
-        held.lock().unwrap();
+        let held = crate::native_document_host::HeldAdvisoryLock::lock(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap(),
+        )
+        .unwrap();
 
         let started = std::time::Instant::now();
         let error = app.save_document_checkpoint(document, view).unwrap_err();
@@ -5157,10 +5153,10 @@ mod tests {
             .expect("Manual Save command");
         assert!(save.enabled, "busy failure remains explicitly retryable");
 
-        // Released by LOCK_UN, not by the close alone: a fork's copy outlives the
-        // close until its exec (measured up to 523 ms here), and the retry's
-        // preflight gives up after 500 ms (the fd-copy sweep of 2026-09-27).
-        held.unlock().expect("release the write lock");
+        // Released by LOCK_UN (the guard's drop), not by the close alone: a fork's
+        // copy outlives the close until its exec (measured up to 523 ms here), and
+        // the retry's preflight gives up after 500 ms (the fd-copy sweep of
+        // 2026-09-27).
         drop(held);
         app.save_document_checkpoint(document, view)
             .expect("Manual Save retry succeeds after lock release");
@@ -5501,40 +5497,6 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_config_observation_leaves_manual_and_live_service_unchanged() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-config-editor-unreadable-observation-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aterm.toml");
-        let initial = "font_px = 12.0\n";
-        fs::write(&path, initial).unwrap();
-        let mut app = App::headless_for_test();
-        app.native_config_service =
-            crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
-        let wid = WindowId(0);
-        app.ensure_and_open_config_editor_path_in_window(wid, &path)
-            .unwrap();
-        let document = app.native_runtime.config_editor_document().unwrap();
-        let before_document = app.document_store.snapshot(document).unwrap();
-        let before_service = app.native_config_service.snapshot();
-
-        fs::write(&path, [0xff]).unwrap();
-        let error =
-            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
-                .unwrap_err();
-
-        assert!(error.contains("not valid UTF-8"), "{error}");
-        let after_document = app.document_store.snapshot(document).unwrap();
-        assert_eq!(after_document.seq, before_document.seq);
-        assert_eq!(after_document.text, before_document.text);
-        assert_eq!(app.native_config_service.snapshot(), before_service);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn config_publication_reloads_clean_manual_bytes_and_preserves_dirty_drafts() {
         let dir = std::env::temp_dir().join(format!(
             "aterm-config-editor-publication-{}",
@@ -5593,9 +5555,10 @@ mod tests {
         let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
             panic!("config editor must remain installed");
         };
-        assert!(editor.recovery_status.as_deref().is_some_and(|status| {
-            status.contains("changed on disk") && status.contains("preserved")
-        }));
+        assert_eq!(
+            editor.recovery_status.as_deref(),
+            Some(crate::native_app::DISK_CONFLICT_RECOVERY)
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -5800,16 +5763,6 @@ mod tests {
     }
 
     #[test]
-    fn focused_config_completion_enter_activates_its_semantic_button() {
-        assert_focused_config_completion_activates(NamedKey::Enter, "enter");
-    }
-
-    #[test]
-    fn focused_config_completion_space_activates_its_semantic_button() {
-        assert_focused_config_completion_activates(NamedKey::Space, "space");
-    }
-
-    #[test]
     fn presented_config_assist_does_not_steal_enter_or_vertical_motion() {
         let dir = std::env::temp_dir().join(format!(
             "aterm-config-editor-ordinary-keys-{}",
@@ -5962,121 +5915,53 @@ mod tests {
     }
 
     #[test]
-    fn exact_analysis_drives_first_tab_before_any_assist_render() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-config-editor-unrendered-tab-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aterm.toml");
-        let source = "window_theme = ";
-        fs::write(&path, source).unwrap();
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.ensure_and_open_config_editor_path_in_window(wid, &path)
-            .unwrap();
-        let (instance, view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(instance).unwrap();
-        app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::MoveLineEnd))
-            .unwrap();
-        let context = app
-            .editor_config_completion_context(instance, view)
-            .unwrap();
-        clear_exact_config_assist_cache(&app, instance, context);
-        let before = app.document_store.snapshot(document).unwrap();
-        let caret = editor_buffer(&app, view).primary_selection().head;
+    fn exact_analysis_drives_tab_and_ctrl_space_before_any_assist_render() {
+        for (suffix, trigger) in [
+            ("tab", key(Key::Named(NamedKey::Tab), Modifiers::empty())),
+            (
+                "ctrl-space",
+                key(Key::Named(NamedKey::Space), Modifiers::CTRL),
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "aterm-config-editor-unrendered-{suffix}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("aterm.toml");
+            fs::write(&path, "window_theme = ").unwrap();
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.ensure_and_open_config_editor_path_in_window(wid, &path)
+                .unwrap();
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::MoveLineEnd))
+                .unwrap();
+            let context = app
+                .editor_config_completion_context(instance, view)
+                .unwrap();
+            clear_exact_config_assist_cache(&app, instance, context);
+            let before = app.document_store.snapshot(document).unwrap();
+            let caret = editor_buffer(&app, view).primary_selection().head;
 
-        drive_native(&mut app, key(Key::Named(NamedKey::Tab), Modifiers::empty()));
+            drive_native(&mut app, trigger);
 
-        let after = app.document_store.snapshot(document).unwrap();
-        assert_eq!((after.seq, &after.text), (before.seq, &before.text));
-        assert_eq!(editor_buffer(&app, view).primary_selection().head, caret);
-        let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
-            panic!("config editor view");
-        };
-        assert_eq!(state.config_completion_interaction, Some(context));
-        assert_eq!(state.config_completion_selected, 0);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn exact_analysis_drives_ctrl_space_before_any_assist_render() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-config-editor-unrendered-ctrl-space-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aterm.toml");
-        let source = "window_theme = ";
-        fs::write(&path, source).unwrap();
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.ensure_and_open_config_editor_path_in_window(wid, &path)
-            .unwrap();
-        let (instance, view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(instance).unwrap();
-        app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::MoveLineEnd))
-            .unwrap();
-        let context = app
-            .editor_config_completion_context(instance, view)
-            .unwrap();
-        clear_exact_config_assist_cache(&app, instance, context);
-        let before = app.document_store.snapshot(document).unwrap();
-        let caret = editor_buffer(&app, view).primary_selection().head;
-
-        drive_native(&mut app, key(Key::Named(NamedKey::Space), Modifiers::CTRL));
-
-        let after = app.document_store.snapshot(document).unwrap();
-        assert_eq!((after.seq, &after.text), (before.seq, &before.text));
-        assert_eq!(editor_buffer(&app, view).primary_selection().head, caret);
-        let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
-            panic!("config editor view");
-        };
-        assert_eq!(state.config_completion_interaction, Some(context));
-        assert_eq!(state.config_completion_selected, 0);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn exact_help_only_analysis_dismisses_on_escape_without_an_assist_render() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-config-editor-unrendered-help-escape-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aterm.toml");
-        let source = "matrix_rain.density = 12";
-        fs::write(&path, source).unwrap();
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.ensure_and_open_config_editor_path_in_window(wid, &path)
-            .unwrap();
-        let (instance, view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(instance).unwrap();
-        app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::MoveLineEnd))
-            .unwrap();
-        let context = app
-            .editor_config_completion_context(instance, view)
-            .unwrap();
-        clear_exact_config_assist_cache(&app, instance, context);
-        let before = app.document_store.snapshot(document).unwrap();
-
-        drive_native(
-            &mut app,
-            key(Key::Named(NamedKey::Escape), Modifiers::empty()),
-        );
-
-        let after = app.document_store.snapshot(document).unwrap();
-        assert_eq!((after.seq, &after.text), (before.seq, &before.text));
-        let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
-            panic!("config editor view");
-        };
-        assert_eq!(state.config_completion_dismissed, Some(context));
-        assert!(state.config_completion_interaction.is_none());
-        let _ = fs::remove_dir_all(dir);
+            let after = app.document_store.snapshot(document).unwrap();
+            assert_eq!((after.seq, &after.text), (before.seq, &before.text));
+            assert_eq!(editor_buffer(&app, view).primary_selection().head, caret);
+            let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
+                panic!("config editor view");
+            };
+            assert_eq!(
+                state.config_completion_interaction,
+                Some(context),
+                "{suffix}"
+            );
+            assert_eq!(state.config_completion_selected, 0);
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
@@ -6492,10 +6377,27 @@ mod tests {
                 .status
                 .as_deref()
                 .unwrap()
-                .contains("not authored yet"),
+                .contains("gpu is not set in aterm.toml"),
             "absent target explains the ready search/completion fallback"
         );
         assert!(app.native_runtime.config_editor_enabled(instance));
+
+        // A free-text Settings search is not a key: nothing to add, only no match.
+        app.ensure_and_open_config_editor_path_at_in_window(
+            wid,
+            &path,
+            Some(&crate::native_app::ConfigEditorTarget::Search(
+                "Nord".to_string(),
+            )),
+        )
+        .unwrap();
+        let AppViewState::Editor(state) = app.native_runtime.view_state(view).unwrap() else {
+            panic!("config editor view")
+        };
+        assert_eq!(
+            state.status.as_deref(),
+            Some("No match in aterm.toml · search is open")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -6571,7 +6473,7 @@ mod tests {
             })
             .unwrap();
         let semantic = status.semantic_status.as_deref().unwrap();
-        assert!(semantic.contains("Problem 2 of 2"));
+        assert!(semantic.contains(" · 2 of 2 · "));
         assert!(semantic.contains(&long_key));
         assert_ne!(status.status.as_deref(), Some(semantic));
 
@@ -6888,34 +6790,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_and_editor_share_document_but_not_view_state() {
-        let dir = std::env::temp_dir().join(format!("aterm-app-cross-mode-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("shared.md");
-        fs::write(&path, "shared\n").unwrap();
-        let uri = file_uri(&path);
-        let mut app = App::headless_for_test();
-        app.open_document_tab(AppKind::Markdown, &uri).unwrap();
-        let markdown = app
-            .native_runtime
-            .document_id(app.active_native_view(WindowId(0)).unwrap().0)
-            .unwrap();
-        app.open_document_tab(AppKind::Editor, &uri).unwrap();
-        let (editor_instance, editor_view) = app.active_native_view(WindowId(0)).unwrap();
-        assert_eq!(
-            app.native_runtime.document_id(editor_instance),
-            Some(markdown)
-        );
-        assert!(matches!(
-            app.native_runtime.view_state(editor_view),
-            Some(AppViewState::Editor(state)) if state.buffer.is_some()
-        ));
-        assert_eq!(app.document_store.view_count(markdown), Some(2));
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn markdown_edit_action_completes_its_reader_status_after_editor_focus() {
         let dir =
             std::env::temp_dir().join(format!("aterm-app-edit-handoff-{}", std::process::id()));
@@ -7072,27 +6946,7 @@ mod tests {
         )
         .unwrap();
 
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
-            // NOT decoration. When this replay fails, the panic used to read only
-            // `called Result::unwrap() on an Err value`, which names neither the stage
-            // nor the cause — and this call is the ONE fallible step in these tests, so
-            // an intermittent failure here left nothing to diagnose. On-disk forensics
-            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
-            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
-            // before any temp file existed (fixture dir mtime still equal to the
-            // rename's ctime). That narrows the failure to the FIVE exits between those
-            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
-            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
-            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
-            // canonicalize the process temporary root" / TargetRetargeted /
-            // SymlinkComponent), `observe_file` ("target changed while it was being
-            // observed"), or `detect_version_conflict` ("File changed on disk"). A
-            // bounded WouldBlock retry has since been added for the proven
-            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
-            // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. (Root-cause record: git log --grep save-latch-flake)
-            panic!("inflight replay save failed: {error}");
-        });
+        finish_inflight_save_for_test(&mut app, document, view, first);
 
         assert_eq!(app.document_store.dirty(document), Some(true));
         assert_eq!(fs::read_to_string(&path).unwrap(), "saved base\n");
@@ -7148,27 +7002,7 @@ mod tests {
             Some(latest.seq)
         );
 
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
-            // NOT decoration. When this replay fails, the panic used to read only
-            // `called Result::unwrap() on an Err value`, which names neither the stage
-            // nor the cause — and this call is the ONE fallible step in these tests, so
-            // an intermittent failure here left nothing to diagnose. On-disk forensics
-            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
-            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
-            // before any temp file existed (fixture dir mtime still equal to the
-            // rename's ctime). That narrows the failure to the FIVE exits between those
-            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
-            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
-            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
-            // canonicalize the process temporary root" / TargetRetargeted /
-            // SymlinkComponent), `observe_file` ("target changed while it was being
-            // observed"), or `detect_version_conflict` ("File changed on disk"). A
-            // bounded WouldBlock retry has since been added for the proven
-            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
-            // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. (Root-cause record: git log --grep save-latch-flake)
-            panic!("inflight replay save failed: {error}");
-        });
+        finish_inflight_save_for_test(&mut app, document, view, first);
 
         assert!(!app.native_documents.inflight.contains(&document));
         assert!(!app.native_documents.pending_saves.contains_key(&document));
@@ -7182,83 +7016,6 @@ mod tests {
             panic!("editor view must remain installed");
         };
         assert_eq!(state.status.as_deref(), Some("Saved"));
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn close_during_inflight_save_pumps_the_frozen_close_sequence() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-app-close-save-latch-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("close.md");
-        fs::write(&path, "base\n").unwrap();
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.open_document_tab(AppKind::Editor, &file_uri(&path))
-            .unwrap();
-        let (instance, view) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(instance).unwrap();
-
-        app.dispatch_native_event(
-            wid,
-            AppEvent::TextInput(TextInputEvent::Commit("first ".into())),
-        )
-        .unwrap();
-        let first = begin_inflight_save_for_test(&mut app, document);
-        app.dispatch_native_event(
-            wid,
-            AppEvent::TextInput(TextInputEvent::Commit("latest ".into())),
-        )
-        .unwrap();
-        let latest = app.document_store.snapshot(document).unwrap();
-
-        assert!(
-            !app.prepare_window_document_shutdown_inner(wid, true)
-                .unwrap()
-        );
-        assert!(app.native_documents.pending_saves.contains_key(&document));
-        assert!(
-            app.native_documents
-                .pending_window_closes
-                .contains_key(&wid)
-        );
-        assert_eq!(app.document_store.view_count(document), Some(1));
-
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
-            // NOT decoration. When this replay fails, the panic used to read only
-            // `called Result::unwrap() on an Err value`, which names neither the stage
-            // nor the cause — and this call is the ONE fallible step in these tests, so
-            // an intermittent failure here left nothing to diagnose. On-disk forensics
-            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
-            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
-            // before any temp file existed (fixture dir mtime still equal to the
-            // rename's ctime). That narrows the failure to the FIVE exits between those
-            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
-            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
-            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
-            // canonicalize the process temporary root" / TargetRetargeted /
-            // SymlinkComponent), `observe_file` ("target changed while it was being
-            // observed"), or `detect_version_conflict` ("File changed on disk"). A
-            // bounded WouldBlock retry has since been added for the proven
-            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
-            // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. (Root-cause record: git log --grep save-latch-flake)
-            panic!("inflight replay save failed: {error}");
-        });
-
-        assert_eq!(app.document_store.view_count(document), Some(1));
-        assert_eq!(
-            app.take_ready_document_shutdowns().unwrap(),
-            (false, vec![wid])
-        );
-        assert_eq!(app.document_store.view_count(document), Some(0));
-        assert!(
-            !app.native_documents
-                .pending_window_closes
-                .contains_key(&wid)
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), latest.text.as_ref());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7698,27 +7455,7 @@ mod tests {
         assert_eq!(aterm_spec::interp::admits(&model, &state, &early), None);
         assert!(!model.check_invariant("ClosedSequenceIsDurable", &early));
 
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
-            // NOT decoration. When this replay fails, the panic used to read only
-            // `called Result::unwrap() on an Err value`, which names neither the stage
-            // nor the cause — and this call is the ONE fallible step in these tests, so
-            // an intermittent failure here left nothing to diagnose. On-disk forensics
-            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
-            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
-            // before any temp file existed (fixture dir mtime still equal to the
-            // rename's ctime). That narrows the failure to the FIVE exits between those
-            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
-            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
-            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
-            // canonicalize the process temporary root" / TargetRetargeted /
-            // SymlinkComponent), `observe_file` ("target changed while it was being
-            // observed"), or `detect_version_conflict` ("File changed on disk"). A
-            // bounded WouldBlock retry has since been added for the proven
-            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
-            // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. (Root-cause record: git log --grep save-latch-flake)
-            panic!("inflight replay save failed: {error}");
-        });
+        finish_inflight_save_for_test(&mut app, document, view, first);
         controller.target = controller.requested;
         controller.settled = true;
         let after = project(&model, &app, document, controller);
@@ -7732,6 +7469,61 @@ mod tests {
         let after = project(&model, &app, document, controller);
         assert_action(&model, &state, &after, "CommitClose");
         assert_eq!(fs::read_to_string(&path).unwrap(), "first latest base\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stale_save_completion_is_not_painted_as_a_failure() {
+        let dir = std::env::temp_dir().join(format!("aterm-app-stale-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("late.md");
+        fs::write(&path, "base\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("edit ".into())),
+        )
+        .unwrap();
+        let first = begin_inflight_save_for_test(&mut app, document);
+        let generation = first.plan.generation;
+        let bytes = std::sync::Arc::clone(&first.plan.bytes);
+        finish_inflight_save_for_test(&mut app, document, view, first);
+
+        // A late completion for the generation that already landed.
+        let error = app
+            .finish_native_document_save(
+                document,
+                view,
+                generation,
+                bytes,
+                crate::native_document_io::AtomicSaveResult::Cancelled,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("stale"), "{error}");
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor view");
+        };
+        assert_eq!(state.status.as_deref(), Some("Saved"));
+        let tab = app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .find(|tab| tab.root.leaves().contains(&view))
+            .expect("document tab");
+        assert!(!tab.presentation.indicators.attention);
+        assert!(
+            tab.presentation
+                .tooltip
+                .as_deref()
+                .is_none_or(|tooltip| !tooltip.contains("stale document save"))
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7765,27 +7557,7 @@ mod tests {
 
         assert!(!app.prepare_quit_document_shutdown_inner(true).unwrap());
         assert!(app.native_documents.pending_saves.contains_key(&document));
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
-            // NOT decoration. When this replay fails, the panic used to read only
-            // `called Result::unwrap() on an Err value`, which names neither the stage
-            // nor the cause — and this call is the ONE fallible step in these tests, so
-            // an intermittent failure here left nothing to diagnose. On-disk forensics
-            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
-            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
-            // before any temp file existed (fixture dir mtime still equal to the
-            // rename's ctime). That narrows the failure to the FIVE exits between those
-            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
-            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
-            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
-            // canonicalize the process temporary root" / TargetRetargeted /
-            // SymlinkComponent), `observe_file` ("target changed while it was being
-            // observed"), or `detect_version_conflict` ("File changed on disk"). A
-            // bounded WouldBlock retry has since been added for the proven
-            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
-            // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. (Root-cause record: git log --grep save-latch-flake)
-            panic!("inflight replay save failed: {error}");
-        });
+        finish_inflight_save_for_test(&mut app, document, view, first);
 
         assert_eq!(app.take_ready_document_shutdowns().unwrap(), (true, vec![]));
         assert!(!app.native_documents.pending_saves.contains_key(&document));
@@ -7865,9 +7637,8 @@ mod tests {
             .recovery_status
             .get(&document)
             .expect("conflict recovery guidance");
-        assert!(recovery.contains("Save is blocked"), "{recovery}");
-        assert!(recovery.contains("Discard Changes and Reload from Disk"));
-        assert!(!recovery.to_ascii_lowercase().contains("retry"));
+        // The watcher's words for the conflict are the save conflict's.
+        assert_eq!(recovery, crate::native_app::DISK_CONFLICT_RECOVERY);
 
         app.dispatch_native_event(
             wid,
@@ -8251,35 +8022,6 @@ mod tests {
     }
 
     #[test]
-    fn final_dirty_document_view_is_saved_before_its_tab_detaches() {
-        let dir = std::env::temp_dir().join(format!("aterm-app-close-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("close.md");
-        fs::write(&path, "before\n").unwrap();
-        let uri = file_uri(&path);
-        let mut app = App::headless_for_test();
-        app.open_document_tab(AppKind::Editor, &uri).unwrap();
-        let wid = WindowId(0);
-        let (instance, _) = app.active_native_view(wid).unwrap();
-        let document = app.native_runtime.document_id(instance).unwrap();
-        app.dispatch_native_event(
-            wid,
-            AppEvent::TextInput(TextInputEvent::Commit("safe ".to_string())),
-        )
-        .unwrap();
-        let before_tabs = app.windows[&wid].tab_set.len();
-
-        // A real event-loop save may report pending. The headless lane executes the
-        // identical durability proof inline, then commits the all-document detach batch.
-        app.close_active_native_tab(wid).unwrap();
-        assert_eq!(app.windows[&wid].tab_set.len(), before_tabs - 1);
-        assert_eq!(app.document_store.view_count(document), Some(0));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "safe before\n");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn final_dirty_document_leaf_is_saved_before_only_that_split_leaf_detaches() {
         let dir = std::env::temp_dir().join(format!("aterm-app-leaf-close-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -8295,11 +8037,11 @@ mod tests {
 
         let settings_instance = app
             .native_runtime
-            .insert_instance(NativeApp::Settings(
+            .insert_instance(NativeApp::Settings(Box::new(
                 crate::native_settings::SettingsApp::new(
                     crate::update_screen::UpdateState::from_status(1, "test", None, false),
                 ),
-            ))
+            )))
             .unwrap();
         let settings_view = app
             .split_active_with_native(
@@ -8362,7 +8104,11 @@ mod tests {
         assert_eq!(app.document_store.dirty(document), Some(true));
         assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
 
+        // The final dirty view: a real event-loop save may report pending; the
+        // headless lane runs the identical durability proof inline, then detaches.
+        let before_tabs = app.windows[&wid].tab_set.len();
         app.close_active_native_tab(wid).unwrap();
+        assert_eq!(app.windows[&wid].tab_set.len(), before_tabs - 1);
         assert_eq!(app.document_store.view_count(document), Some(0));
         assert_eq!(fs::read_to_string(&path).unwrap(), "dirty before\n");
         let _ = fs::remove_dir_all(dir);

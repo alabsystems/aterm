@@ -1,0 +1,13 @@
+# claude-code 2.1.284 · HAND-BUILT 2026-09-28 (no live capture yet): the transcript-share ask that follows a rating, rows from the render code (Ele: the question at column 0 after the ⏺ glyph, the docs URL and the options at column 2, the key cells 10 wide) checked against the store binary's literals; the framing rows are the real captures' (wait_bg6.out)
+⏺ Second-pass reviewers are out and the build is running. Nothing else can start until one of those returns.
+✻ Waiting for 1 dynamic workflow to finish
+
+
+⏺ Can Anthropic look at your session transcript to help us improve Claude Code?
+  https://code.claude.com/docs/en/data-usage#session-quality-surveys
+  y: Yes    n: No     d: Don't ask again
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active

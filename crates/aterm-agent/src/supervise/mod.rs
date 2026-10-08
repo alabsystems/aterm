@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor: what a manager agent needs to keep a WORKER (an agent
-//! session — Claude Code or Codex — in another aterm tab) moving without
-//! rubber-stamping it. Three pure,
-//! unit-tested judgments and one loop:
+//! The supervisor: what a manager agent needs to keep a worker (a Claude Code
+//! or Codex session in another aterm tab) moving without rubber-stamping it.
 //!
 //! * [`classify::classify_command`] — is this shell line read-only? (The
 //!   corpus that shaped it is the test.)
 //! * [`policy::approval::decide`] — THE approval decider: which option, if
 //!   any, to press on an approval box, under which rule and behind which
 //!   guard ([`policy`]); a question dialog it hands to
-//!   [`policy::question::answer_question`], which answers it with its
-//!   recommended option under `[harness] answer_questions`.
+//!   [`policy::question::answer_question`], which answers it under
+//!   `[harness] answer_questions` — with its recommended option, or, under
+//!   `question_priority` `long-term` / `short-term`, by the worker from that
+//!   word's policy text ([`QuestionPriority`]).
 //! * [`prompt::parse_prompt`] — the approval box on the screen, parsed.
 //! * [`phase::worker_phase`] — busy / prompt / limited / idle / question,
 //!   from one read (busy only from the live zone around the composer);
@@ -30,7 +30,8 @@
 //!   worker's report comes by mail, one line per worker turn.
 //! * [`limit`] — when a limit notice says it resets, as a Unix time: the
 //!   watcher waits for it, stretches its budget past it and continues the
-//!   worker a minute past its reset (the turn-end policy's usage resume).
+//!   worker 150 s past its reset, and a share of a minute more per session
+//!   (the turn-end policy's usage resume).
 //! * [`codex_usage`] — what Codex's own rollouts say of a session: how much
 //!   of its usage window is spent (the rate-limit nudge is answered by it),
 //!   and whether its thread fell into a sandbox its launch bypassed.
@@ -45,15 +46,15 @@ pub mod classify;
 pub mod codex_usage;
 pub mod config;
 pub mod ladder;
-// THE PHASE READER AND THE PROMPT PARSER LIVE IN `aterm-phase` since round 13
-// (the fabric bridge publishes `phase=` from the same reader `aterm drive phase`
-// prints), re-exported here under the paths they always had.
+// The phase reader and the prompt parser live in `aterm-phase` (the fabric
+// bridge publishes `phase=` from the same reader), re-exported here.
 pub use aterm_phase::{phase, prompt};
 pub mod journal;
 pub mod ledger;
 pub mod ledger_html;
 pub mod limit;
 pub mod mail;
+pub mod memory;
 pub mod policy;
 pub mod report;
 pub mod run;
@@ -73,33 +74,25 @@ pub use phase::{
     Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,
     transcript_end, worker_phase,
 };
+pub use policy::approval::QuestionPriority;
 pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
     ATTENTION_OWNER, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl, CtlReply,
     EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT, Fold, Guard, HostStep, IdleHost,
-    Interrupter, NoLane, ReportBrief, Session, SuperviseOpts, Turn, UNBOUNDED, WaitPlan,
-    WorkerSource, event_line, exit_reason, render_phase, render_phase_and_survey, render_result,
-    render_result_mail, reported_event_line,
+    Interrupter, NoLane, ProbeMiss, ReportBrief, Session, StuckSurvey, SuperviseOpts, Turn,
+    UNBOUNDED, WaitPlan, WorkerSource, event_line, exit_reason, render_phase,
+    render_phase_and_survey, render_result, render_result_mail, reported_event_line,
 };
 pub use transport::{Endpoint, RelayCtl, Transport};
 
-/// A scratch path of ONE call's own, for a test:
+/// A scratch path of one call's own, for a test:
 /// `<tmp>/aterm-<kind>-<tag>-<pid>-<n>`, `<n>` a per-process call count.
 ///
-/// A test's scratch file is unique by construction, never by its callers
-/// agreeing to pass distinct tags: the harness runs tests on parallel threads
-/// of one process, and a shared helper hands every caller its own tag. Measured
-/// 2026-09-28 (main `37b992a3c`): `run_engine_tests.rs`'s `hosted_with_host`,
-/// behind 19 hosted-loop tests, named each one's approval ledger
-/// `aterm-ledger-idle-host-<pid>` and cleared it with `remove_dir_all`, so one
-/// test deleted another's ledger under its running loop (3 of 8 runs of the
-/// engine module: `…/aterm-ledger-idle-host-<pid>/s-1.jsonl: cannot open it`),
-/// and under load `create_dir_all` lost the race outright — its `mkdir` saw
-/// the other test's directory, a third test removed it before the `is_dir`
-/// check, and it returned `AlreadyExists` (`a_turn_the_host_typed_is_no_short_turn_of_the_workers`
-/// failed on that `expect`). `harness/upgrade_codex_drive_tests.rs`'s
-/// `scratch` paid for the same lesson first. Nothing is created here: the
-/// caller makes, and removes, what it needs.
+/// Unique by construction rather than by callers passing distinct tags: tests
+/// run on parallel threads of one process, and a shared helper would hand
+/// every caller the same tag, letting one test's clean-up delete another's
+/// files. Nothing is created here: the caller makes, and removes, what it
+/// needs.
 #[cfg(test)]
 pub(crate) fn test_scratch_path(kind: &str, tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,15 +101,57 @@ pub(crate) fn test_scratch_path(kind: &str, tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("aterm-{kind}-{tag}-{}-{n}", std::process::id()))
 }
 
+/// A scratch directory of ONE call's own, CREATED, and removed when this drops:
+/// the guard form of [`test_scratch_path`] (`aterm-<kind>-<tag>-…`), for a
+/// helper whose callers hold the directory for the length of a test — a test
+/// that fails, or returns early, leaves nothing behind. Dereferences to its
+/// path.
+///
+/// Under `/tmp` on unix rather than `$TMPDIR`: these directories hold the
+/// stand-in instances' control sockets, and a unix-socket path must fit in 104
+/// bytes, which macOS's per-user temp dir (49 of them) plus a unique name and
+/// a label can exceed.
+#[cfg(test)]
+pub(crate) struct ScratchDir(aterm_tempfile::TempDir);
+
+#[cfg(test)]
+impl ScratchDir {
+    pub(crate) fn new(kind: &str, tag: &str) -> Self {
+        #[cfg(unix)]
+        let base = std::path::PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let base = std::env::temp_dir();
+        Self(
+            aterm_tempfile::Builder::new()
+                .prefix(&format!("aterm-{kind}-{tag}-"))
+                .tempdir_in(base)
+                .expect("scratch dir"),
+        )
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for ScratchDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for ScratchDir {
+    fn as_ref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
 #[cfg(test)]
 mod scratch_tests {
-    /// THE LOSING INTERLEAVING, forced: two tests hand one helper the same tag
-    /// (as every hosted-loop test did through `hosted_with_host`). The second
-    /// one's set-up (`remove_dir_all` + `create_dir_all`) runs while the first
-    /// holds rows in its file, then the first cleans up while the second still
-    /// runs. Each keeps what it wrote, and the other's clean-up leaves its
-    /// directory standing. NEGATIVE CONTROL: the per-tag name the helpers used
-    /// before (`aterm-<kind>-<tag>-<pid>`) loses both.
+    /// Two tests hand one helper the same tag; the second one's set-up
+    /// (`remove_dir_all` + `create_dir_all`) runs while the first holds rows
+    /// in its file, then the first cleans up while the second still runs.
+    /// Each keeps what it wrote. Negative control: a per-tag name
+    /// (`aterm-<kind>-<tag>-<pid>`) loses both.
     #[test]
     fn two_callers_of_one_tag_never_share_a_scratch_path() {
         let set_up = |dir: &std::path::Path| {

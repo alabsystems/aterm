@@ -14,17 +14,18 @@ use crate::line::{deserialize_lines, serialize_lines};
 // =========================================================================
 //
 // The real Scrollback uses SmallVec/Vec/VecDeque which cause CBMC state
-// explosion. This stub tracks only line counts, matching the tier promotion
-// logic exactly but without storing actual Lines.
+// explosion. This stub tracks only line counts: a model of the tier
+// promotion logic, abstracted as `push_line_with_cold_acceptance` states,
+// without storing actual Lines.
 //
 // This enables verification of counting invariants that would otherwise
 // timeout (8+ hours) or exhaust memory (20+ GB).
 
 /// Counter-only scrollback for Kani proofs.
 ///
-/// Matches the tier promotion logic of the real Scrollback but uses
-/// simple counters instead of collections. This avoids SmallVec/Vec
-/// allocation paths that explode CBMC's state space.
+/// Models the tier promotion logic of the real Scrollback with simple
+/// counters instead of collections. This avoids SmallVec/Vec allocation
+/// paths that explode CBMC's state space.
 struct StubScrollback {
     hot_count: usize,
     warm_count: usize,
@@ -68,12 +69,20 @@ impl StubScrollback {
 
     /// Push a line while choosing whether warm→cold eviction succeeds.
     ///
-    /// This matches the real `Scrollback::push_line` control flow:
+    /// A count-level model of the real `Scrollback::push_line` control flow:
     /// 1. promote hot→warm when hot is full
-    /// 2. evict warm→cold if warm exceeds its limit
+    /// 2. evict one block warm→cold if warm exceeds its limit
     /// 3. if cold rejects the block, drop those lines from `line_count`
     /// 4. append the new hot line
     /// 5. enforce line_limit via `truncate`
+    ///
+    /// What it abstracts: every block is full-size (`block_size` lines; the
+    /// real warm tier also splits a batch at the byte page cap), so the one
+    /// eviction step of 2 stands for the real loop that evicts until warm is
+    /// within its limit. The rejecting arm of 3 is only the drop, the real
+    /// quarantine of a block with nothing older in cold: with older history
+    /// the real code keeps the rows, blank, in cold (the accepting arm's
+    /// counts), and a failure it restores to warm for retry is not modelled.
     fn push_line_with_cold_acceptance(&mut self, cold_accepts: bool) {
         // Promote if hot tier is full (matches real logic)
         if self.hot_count >= self.hot_limit {
@@ -89,7 +98,8 @@ impl StubScrollback {
         }
     }
 
-    /// Promote hot->warm (matches real logic in promote_hot_to_warm).
+    /// Promote hot->warm: `promote_hot_to_warm` with the batch as one
+    /// full-size block.
     fn promote_hot_to_warm(&mut self, cold_accepts: bool) {
         if self.hot_count < self.block_size {
             return;
@@ -98,16 +108,18 @@ impl StubScrollback {
         self.hot_count -= self.block_size;
         self.warm_count += self.block_size;
 
-        // Evict warm->cold if over limit (matches real logic)
+        // One eviction step: with full-size blocks it brings warm back
+        // within its limit, as the real loop does.
         if self.warm_count > self.warm_limit {
             self.evict_warm_to_cold(cold_accepts);
         }
     }
 
-    /// Evict warm->cold (matches real logic in `evict_warm_to_cold`).
+    /// Evict one block warm->cold (`evict_warm_to_cold`, abstracted as
+    /// `push_line_with_cold_acceptance` states).
     fn evict_warm_to_cold(&mut self, cold_accepts: bool) {
-        // Real implementation pops one WarmBlock at a time
-        // WarmBlock contains block_size lines
+        // Real implementation pops one WarmBlock at a time; the model's
+        // blocks all hold block_size lines
         if self.warm_count >= self.block_size {
             self.warm_count -= self.block_size;
             if cold_accepts {

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `SinkWriter::input_backlog` against a REAL pty — the reading built for the
-//! 2026-09-24 incident, where a frozen Claude Code left the owner's Enter
+//! incident where a frozen Claude Code left the owner's Enter
 //! unread in its slave's input queue for hours and a supervisor's
 //! screen-fenced key queued behind it.
 //!
@@ -15,9 +15,9 @@
 //!
 //! macOS-only: the queue probes answer `None` everywhere else (on Linux a
 //! master's `FIONREAD` counts output — aterm-pty's `input_queue_len` says
-//! why). The pairs come from `openpty`, whose slave is inheritable; that is
-//! harmless here because this test binary spawns no child that could inherit
-//! it (aterm-pty's own tests, which do spawn, use its close-on-exec opener).
+//! why). The pairs come from aterm-pty's `open_pty_pair`, both ends
+//! close-on-exec from birth, as every test's pair does: `openpty(3)`'s are
+//! inheritable, and a child spawned meanwhile keeps them.
 #![cfg(target_os = "macos")]
 
 use std::sync::Arc;
@@ -26,31 +26,17 @@ use std::time::{Duration, Instant};
 
 use aterm_session::input_backlog::InputBacklog;
 use aterm_session::sink::{BulkMeter, Discard, SinkWriter};
+use aterm_spec::wait::MUST_HAPPEN;
 
 /// A pty pair with the slave raw (`VMIN = 1`, `VTIME = 0`, a key-at-a-time
 /// reader like every agent TUI) or canonical without echo.
 fn pty_pair(raw: bool) -> (i32, i32) {
-    // One `openpty` at a time. The harness runs these tests on parallel
-    // threads, and unserialised, `openpty` failed here with `-1` about once
-    // in thirty runs of this file (2026-09-25, once it had eight tests), and
-    // under three concurrent runs of the binary six times in forty-five.
-    // Serialised, forty-five runs at that concurrency failed none. The cause
-    // inside libc was not traced; only the in-process race is measured.
-    static OPENPTY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = OPENPTY.lock().unwrap_or_else(|p| p.into_inner());
-    let (mut master, mut slave) = (-1, -1);
-    // SAFETY: both out-params are live `c_int`s on this stack; the name,
-    // termios and winsize pointers may be null.
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty");
+    // No lock: the harness's parallel threads open their pairs at once. The
+    // failures `openpty` (which this opener replaced) once had here were the
+    // kernel's: concurrent `/dev/ptmx` clone opens can be handed the same pty
+    // minor, and every loser gets XNU's `EREDRIVEOPEN` (errno -6) once the
+    // kernel's own ten redrives run out. `open_pty_pair` redrives it.
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     // SAFETY: `libc::termios` is plain integer fields and a byte array; all
     // zeros is a valid value, overwritten by `tcgetattr` below.
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
@@ -111,15 +97,13 @@ fn nonblocking_sink(master: i32) -> SinkWriter {
 /// kernel's count moves under the test), panicking with the last reading
 /// after a minute — a hang detector, never a latency budget.
 fn settle(sink: &SinkWriter, done: impl Fn(&InputBacklog) -> bool) -> InputBacklog {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
+    let mut last = None;
+    let hit = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
         let b = sink.input_backlog().expect("a pty master is measured");
-        if done(&b) {
-            return b;
-        }
-        assert!(Instant::now() < deadline, "never settled: {b:?}");
-        thread::sleep(Duration::from_millis(10));
-    }
+        last = Some(b);
+        done(&b).then_some(b)
+    });
+    hit.unwrap_or_else(|| panic!("never settled: {:?}", last.expect("probed")))
 }
 
 /// Wait until a parked paste's first bytes are in the queue AND DATED. The
@@ -267,10 +251,8 @@ fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
 /// reads 500 bytes, the drainer hands the kernel about 500 more from the
 /// middle of that chunk, and parks again. Those bytes are now in the queue
 /// FIONREAD counts, so the spill must stop counting them: `unread()` is
-/// exactly 4000 - 500. Before the spill tracked how far into its chunk the
-/// drainer had got, this read `queued: 1022, spilled: Some(2978)` — 4000 —
-/// the 500 counted twice (reviewer finding on S2, 2026-09-24; the S6 status
-/// field `input_bytes` is this sum). A second episode on the same sink reads
+/// exactly 4000 - 500, not 4000 with the 500 counted twice (the status field
+/// `input_bytes` is this sum). A second episode on the same sink reads
 /// the first one's figure again, so the mark is cleared with its chunk.
 #[test]
 fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
@@ -311,7 +293,9 @@ fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
 
         assert_eq!(read_exactly(slave, FRAME - READ), vec![b'p'; FRAME - READ]);
         assert!(sink.wait_egress_drained_to_kernel());
-        let drained = sink.input_backlog().expect("measured");
+        // The drainer can still hold the spill mutex as the fence returns, and
+        // the probe only tries it (`spilled: None`): read until it took it.
+        let drained = settle(&sink, |b| b.spilled.is_some());
         assert_eq!(
             (drained.queued, drained.spilled),
             (0, Some(0)),
@@ -322,14 +306,12 @@ fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
     close_pair(master, slave);
 }
 
-/// A METERED PASTE IS DATED BY ITS OWN WRITE. origin/main's large-paste
-/// meter (`SinkWriter::write_frame_metered_with_receipt`) arrived with a
-/// write loop of its own that called `aterm_pty::write_some_blocking`
-/// directly; merged over this branch on 2026-09-25 it wrote around the
-/// ledger. Bytes the ledger never saw read as older than the sink itself
-/// (`InputLedger::oldest_unread_at` dates them from its birth), so a paste
-/// into a frozen program was dated by whenever the SESSION started, not by
-/// the paste. The sink is aged first so the two dates are far apart: the
+/// A METERED PASTE IS DATED BY ITS OWN WRITE. A paste write loop
+/// (`SinkWriter::write_frame_metered_with_receipt`) that bypasses the ledger
+/// leaves bytes it never saw, which read as older than the sink itself
+/// (`InputLedger::oldest_unread_at` dates them from its birth): a paste into
+/// a frozen program would be dated by when the SESSION started, not by the
+/// paste. The sink is aged first so the two dates are far apart: the
 /// parked paste must read at least the time it has been parked, and no more
 /// than the time since its paster was spawned — the sink's birth is `AGE`
 /// older than that.
@@ -405,7 +387,7 @@ fn read_within(fd: i32, max: usize) -> Vec<u8> {
 }
 
 /// A DISCARD DROPS THE SPILL WITH THE QUEUE, AND THE SINK STILL REACHES THE
-/// PROGRAM (whole-branch review, second round, 2026-09-25). The shape of a
+/// PROGRAM. The shape of a
 /// paste into a frozen raw program: 1118 bytes, of which the queue takes
 /// 1022 and the sink spills 96, with the drainer parked in `poll(POLLOUT)`
 /// holding the fd lock. The first cut of the restart remedy flushed only
@@ -465,14 +447,13 @@ fn a_discard_ends_a_writer_parked_mid_frame() {
     );
 
     assert_eq!(sink.discard_unread_input(Discard::Restart), Some(1022));
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !paster.is_finished() {
-        assert!(
-            Instant::now() < deadline,
-            "the parked writer never looked again: it sleeps on the flushed queue"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    let finished = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
+        paster.is_finished().then_some(())
+    });
+    assert!(
+        finished.is_some(),
+        "the parked writer never looked again: it sleeps on the flushed queue"
+    );
     let accepted = paster.join().expect("paster");
     assert_eq!(accepted, 1022, "the rest of the frame was not written");
 
@@ -494,8 +475,7 @@ fn a_discard_off_a_tty_drops_nothing() {
     drop((a, b));
 }
 
-/// A FLUSH IS NOT A RESTART (robustness review of the manual reset,
-/// 2026-09-26). `reset flush` and the drop before `signal term` empty the
+/// A FLUSH IS NOT A RESTART. `reset flush` and the drop before `signal term` empty the
 /// same queue and both move the discard epoch — a frame in flight belongs to
 /// the input that went, whichever drop took it. Only the restart's drop moves
 /// `restart_discards`, the count aterm-gui's input watch starts a published
@@ -537,8 +517,7 @@ fn a_flush_moves_the_discard_epoch_and_not_the_restart_count() {
     drop((a, b));
 }
 
-/// A READ AFTER A DISCARD IS TOLD FROM THE DISCARD (whole-branch review,
-/// fourth round, 2026-09-25). The discard's empty queue is what a reader
+/// A READ AFTER A DISCARD IS TOLD FROM THE DISCARD. The discard's empty queue is what a reader
 /// leaves too, so aterm-gui holds a stall through it; this is the evidence
 /// that lets the hold go when the program reads again. Nothing written since
 /// the discard is no read. A byte written and still queued is no read. The
@@ -591,8 +570,7 @@ fn a_read_after_a_discard_is_told_from_the_discard() {
     drop((a, b));
 }
 
-/// A CBREAK PROGRAM'S CONTROL KEY IS NOT A READ (review of the restart hold's
-/// read evidence, 2026-09-25). With ICANON off but ISIG, IEXTEN and IXON on
+/// A CBREAK PROGRAM'S CONTROL KEY IS NOT A READ. With ICANON off but ISIG, IEXTEN and IXON on
 /// — Python's `tty.setcbreak`, ncurses `cbreak()` — the line discipline
 /// consumes `^C`, `^O` and `^S` as they are written: the ledger counts the
 /// byte and the queue never holds it. The held gate admits a lone `^C` on

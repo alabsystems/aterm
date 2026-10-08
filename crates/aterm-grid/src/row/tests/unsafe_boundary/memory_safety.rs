@@ -5,18 +5,11 @@
 use super::*;
 use crate::{CellFlags, PackedColor};
 
-// ========================================================================
-// Memory safety: Row operations across page boundaries (MIRI-exercised)
-// ========================================================================
-//
-// These tests verify that Row's unsafe write paths remain sound when
-// multiple rows share a PageStore and allocations span page boundaries.
+// Row's unsafe write paths stay sound when rows share a PageStore and
+// allocations span pages (exercised under Miri).
 
-/// Multiple rows sharing a PageStore: writes to one row must not corrupt another.
-///
-/// This exercises the core invariant that PageSlice pointers derived from
-/// the same PageStore are independent — writing through one doesn't alias
-/// or invalidate another.
+/// Rows sharing a PageStore are independent: writing one does not alias or
+/// invalidate another.
 #[test]
 fn multiple_rows_independent_writes() {
     let mut pages = PageStore::new();
@@ -50,11 +43,8 @@ fn multiple_rows_independent_writes() {
     }
 }
 
-/// Row resize reallocates cells into a new PageSlice. Verify the old
-/// content is correctly copied and the new slice is independently valid.
-///
-/// This exercises resize()'s alloc_slice + copy_from_slice path, which
-/// creates a new NonNull<Cell> pointer and abandons the old one.
+/// Row resize copies content into a new PageSlice that is independently valid
+/// (resize()'s alloc_slice + copy_from_slice path).
 #[test]
 fn resize_preserves_content_across_reallocation() {
     let (mut pages, mut row) = make_row(40);
@@ -90,11 +80,8 @@ fn resize_preserves_content_across_reallocation() {
     }
 }
 
-/// Wide char writes at every valid position in a row.
-///
-/// This exercises the two-cell unsafe path (get_unchecked at col and
-/// col+1) at every valid boundary, including col 0 and the last valid
-/// position. Catches off-by-one errors in bounds checks.
+/// Wide char writes (unchecked access at col and col+1) at every valid
+/// position, including col 0 and the last.
 #[test]
 fn write_wide_char_every_valid_position() {
     let (_pages, mut row) = make_row(20);

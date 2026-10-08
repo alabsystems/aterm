@@ -2,31 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Resize under ConPTY: the seam accounting `ResizePolicy::ConPty` selects,
-//! driven exactly as conhost drives it.
+//! driven as conhost drives it.
 //!
-//! conhost repaints the WHOLE viewport after every `ResizePseudoConsole`,
-//! row-0-anchored, from its own buffer (measured on Windows 11 26200 with
-//! `cmd.exe` under a bare `CreatePseudoConsole`, 2026-09-22 — the byte shape
-//! [`conhost_repaint`] reproduces is the captured one). Every test here feeds
-//! that repaint after the resize, because that is the sequence the installed
-//! 0.90.0 lost history to (audit 2026-09-22): a rows-grow 24→40 dropped the 16
-//! lines the native reveal had re-labelled into the top of the viewport, a
-//! widen duplicated the 80-col wrap fragment the deficit fill re-seated under
-//! conhost's paint, and the search index kept reporting the overwritten rows
-//! by their old text.
+//! conhost repaints the whole viewport after every `ResizePseudoConsole`,
+//! row-0-anchored, from its own buffer ([`conhost_repaint`] reproduces the
+//! captured byte shape). Every test feeds that repaint after the resize and
+//! checks that no history line is lost (a rows grow), duplicated (a widen) or
+//! left stale in the search index.
 
 use super::Terminal;
+// The from-scratch oracle `search_index.rs` pins its cache against, and the
+// cached path it is compared with.
 use crate::grid::ResizePolicy;
+use crate::terminal::search_index::tests::{cached_results, legacy_results};
 use aterm_scrollback::Scrollback;
 
-/// The bytes conhost emits after a resize (measured shape): hide cursor, an
-/// optional `CSI 8 ; rows ; cols t` (seen on the first resize of a session),
-/// `CSI H`, then one `<text> CSI K` per viewport row joined by CR LF, then a
-/// CUP to conhost's cursor and show cursor. Rows past `rows.len()` are blank.
-/// Every row here is shorter than the width, which is the shape conhost
-/// sends for such rows; a logical line spanning several rows goes out as one
-/// autowrapping run instead — the pwsh captures at the end of this file
-/// replay that shape byte for byte.
+/// The bytes conhost emits after a resize: hide cursor, an optional
+/// `CSI 8 ; rows ; cols t` (on the first resize of a session), `CSI H`, one
+/// `<text> CSI K` per viewport row joined by CR LF, then a CUP to conhost's
+/// cursor and show cursor. Rows past `rows.len()` are blank. Every row here is
+/// shorter than the width; a logical line spanning rows goes out as one
+/// autowrapping run instead (the pwsh fixtures below replay that).
 fn conhost_repaint(rows: &[String], visible_rows: u16, cursor_1based: (u16, u16)) -> Vec<u8> {
     let mut out = b"\x1b[?25l\x1b[H".to_vec();
     for r in 0..visible_rows {
@@ -44,10 +40,9 @@ fn conhost_repaint(rows: &[String], visible_rows: u16, cursor_1based: (u16, u16)
     out
 }
 
-/// Every retained row in reading order — history (oldest first) then the
-/// viewport — trimmed of trailing blanks. This is the buffer a reader scrolls
-/// through, so a lost line is missing from it and a duplicated one is in it
-/// twice.
+/// Every retained row in reading order (history oldest first, then the
+/// viewport), trimmed of trailing blanks: a lost line is missing, a
+/// duplicated one appears twice.
 fn retained_rows(t: &Terminal) -> Vec<String> {
     let grid = t.grid();
     let mut rows: Vec<String> = (0..grid.scrollback_lines())
@@ -81,46 +76,6 @@ fn visible_rows(t: &Terminal) -> Vec<String> {
         .collect()
 }
 
-fn cached_results(t: &mut Terminal, pat: &str) -> Vec<(usize, usize, usize)> {
-    let res = t
-        .indexed_search()
-        .search_results_opts(pat, false, false)
-        .expect("search ok");
-    res.matches
-        .iter()
-        .map(|m| (m.line, m.start_col, m.len()))
-        .collect()
-}
-
-/// The from-scratch oracle `search_index.rs` pins its cache against — a fresh
-/// index over the current retained rows, keyed by absolute row.
-fn legacy_results(t: &Terminal, pat: &str) -> Vec<(usize, usize, usize)> {
-    use crate::search::TerminalSearch;
-    let grid = t.grid();
-    let oldest = usize::try_from(grid.oldest_absolute_row()).unwrap_or(usize::MAX);
-    let scrollback = grid.scrollback_lines();
-    let history: Vec<String> = (0..scrollback)
-        .map(|i| {
-            grid.get_history_line(i)
-                .map(|l| l.to_string())
-                .unwrap_or_default()
-        })
-        .collect();
-    let mut search = TerminalSearch::new();
-    search.index_visible_content(oldest, &history);
-    let visible: Vec<String> = (0..t.rows())
-        .map(|r| t.get_line_text(i32::from(r), None).unwrap_or_default())
-        .collect();
-    search.index_visible_content(oldest.saturating_add(scrollback), &visible);
-    let res = search
-        .search_results_opts(pat, false, false)
-        .expect("search ok");
-    res.matches
-        .iter()
-        .map(|m| (m.line, m.start_col, m.len()))
-        .collect()
-}
-
 /// A tiered-store terminal like the GUI's (small ring, so history really
 /// lives in the store and the offloaded resize really detaches it).
 fn tiered(rows: u16, cols: u16) -> Terminal {
@@ -128,27 +83,26 @@ fn tiered(rows: u16, cols: u16) -> Terminal {
     Terminal::with_scrollback(rows, cols, 8, sb)
 }
 
-/// The audit's grow case: 60 numbered lines on a 24-row screen (37 in
-/// history, `grow 38..60` + a blank prompt row on screen), then a rows-only
-/// grow to 40.
+/// The grow case: 60 numbered lines on a 24-row screen (37 in history,
+/// `grow 38..60` plus a blank prompt row on screen), then a rows-only grow to
+/// 40.
 fn sixty_lines(t: &mut Terminal) {
     for i in 1..=60 {
         t.process(format!("grow {i:02}\r\n").as_bytes());
     }
 }
 
-/// The measured repaint for that grow: conhost keeps old row 0 at row 0 and
-/// paints the 16 grown rows `CSI K`; its cursor stays on the prompt row.
+/// conhost's repaint for that grow: old row 0 stays at row 0, the 16 grown
+/// rows are painted `CSI K`, and its cursor stays on the prompt row.
 fn grow_repaint(pre_resize_viewport: &[String]) -> Vec<u8> {
     conhost_repaint(pre_resize_viewport, 40, (24, 1))
 }
 
 // ---- rows-grow ----------------------------------------------------------
 
-/// The core claim: under ConPTY a rows-grow appends blank rows at the bottom,
-/// reveals nothing, and conhost's repaint then changes NOTHING — every one of
-/// the 60 lines is still retained exactly once, in order, and the cursor row is
-/// where conhost's CUP puts it.
+/// Under ConPTY a rows grow appends blank rows at the bottom and reveals
+/// nothing, so conhost's repaint changes nothing: all 60 lines are retained
+/// once, in order, and the cursor row is where conhost's CUP puts it.
 #[test]
 fn conpty_rows_grow_keeps_every_history_line_across_the_conhost_repaint() {
     for (label, mut t) in [
@@ -160,7 +114,7 @@ fn conpty_rows_grow_keeps_every_history_line_across_the_conhost_repaint() {
         assert_eq!(
             t.grid().scrollback_lines(),
             37,
-            "{label}: precondition (audit shape)"
+            "{label}: precondition: 37 history lines"
         );
         assert_eq!(before[0], "grow 38", "{label}: precondition: old row 0");
         assert_eq!(
@@ -218,11 +172,10 @@ fn conpty_rows_grow_keeps_every_history_line_across_the_conhost_repaint() {
     }
 }
 
-/// TEETH for the test above: the same sequence on the Native policy is the
-/// audit's defect — the reveal re-labels `grow 22..37` into the viewport, the
-/// repaint paints `grow 38..` over them, and they are gone from the buffer.
-/// If this ever stops failing on Native, the policy's premise has changed and
-/// the measurements in `ResizePolicy` need redoing.
+/// Negative control: the same sequence under the Native policy loses lines
+/// (the reveal re-labels `grow 22..37` into the viewport and the repaint
+/// paints over them). If this stops failing on Native, the premise behind
+/// `ResizePolicy` has changed.
 #[test]
 fn native_rows_grow_under_a_conhost_repaint_loses_the_revealed_lines() {
     let mut t = Terminal::new(24, 80);
@@ -232,7 +185,7 @@ fn native_rows_grow_under_a_conhost_repaint_loses_the_revealed_lines() {
     assert_eq!(
         t.grid().scrollback_lines(),
         21,
-        "precondition: the native grow revealed 16 lines (37 -> 21, the audit's numbers)"
+        "precondition: the native grow revealed 16 lines (37 -> 21)"
     );
     t.process(&grow_repaint(&before));
     let rows = retained_rows(&t);
@@ -247,10 +200,9 @@ fn native_rows_grow_under_a_conhost_repaint_loses_the_revealed_lines() {
     );
 }
 
-/// The search index after the grow + repaint: every line found, at the row a
-/// from-scratch index gives it, and the overwritten-band staleness the audit
-/// saw (`grow 22` reported at the row that holds `grow 38`) cannot happen — the
-/// cached index equals the oracle after the resize AND after the repaint.
+/// After the grow and repaint the search index finds every line at the row a
+/// from-scratch index gives it: the cached index equals the oracle after the
+/// resize and after the repaint.
 #[test]
 fn conpty_rows_grow_search_index_matches_a_fresh_build_after_the_repaint() {
     let mut t = Terminal::new(24, 80);
@@ -296,10 +248,9 @@ fn conpty_rows_grow_search_index_matches_a_fresh_build_after_the_repaint() {
     }
 }
 
-/// A reader scrolled back into history keeps the same line under the eye
-/// across a ConPTY grow: the viewport grew downward (blanks appended) and the
-/// counter moved with those rows, so the line under the eye kept its absolute
-/// key and the anchor re-seats the reader on it.
+/// A reader scrolled back keeps the same line in view across a ConPTY grow:
+/// the viewport grew downward and the counter moved with those rows, so the
+/// line keeps its absolute key and the anchor re-seats the reader on it.
 #[test]
 fn conpty_rows_grow_keeps_a_scrolled_back_reader_on_the_same_line() {
     let mut t = Terminal::new(24, 80);
@@ -349,15 +300,11 @@ fn abs_text(t: &Terminal, abs: u64) -> String {
 }
 
 /// OSC 133 command marks are keyed by absolute row and never consult the
-/// renumber epoch, so they are only as good as the keys under them. A ConPTY
-/// height drag — grow, conhost's repaint, shrink back, repaint — must leave a
-/// completed command's prompt and output rows naming the same text, in a
-/// session whose retention has already evicted history and in a young one.
-/// The first is where the old bookkeeping (counter fixed while rows were
-/// appended) slid every key: with nothing evicted, `oldest_absolute_row()`
-/// saturates at 0 and hides the slide, which is why the audit-era probe
-/// needed 30,000 lines to see the prompt row read `""`, 16 rows off, after a
-/// 24→40 grow. A 100-line limit reaches the same state in 300.
+/// renumber epoch. A ConPTY height drag (grow, repaint, shrink back, repaint)
+/// must leave a completed command's prompt and output rows naming the same
+/// text, both after retention has evicted history and in a young session.
+/// With nothing evicted, `oldest_absolute_row()` saturates at 0 and would
+/// hide a key slide; a 100-line limit reaches the evicting state quickly.
 #[test]
 fn conpty_height_drag_keeps_command_marks_on_their_rows() {
     for (label, lead) in [("evicting", 300usize), ("young", 2)] {
@@ -417,7 +364,7 @@ fn conpty_offloaded_rows_grow_is_the_synchronous_policy() {
 }
 
 /// The alt screen gets the same policy: a grow while a TUI is up must not
-/// reveal the SAVED primary's history into a viewport conhost then repaints.
+/// reveal the saved primary's history into a viewport conhost then repaints.
 #[test]
 fn conpty_rows_grow_under_an_alt_screen_keeps_the_saved_primary_intact() {
     let mut t = Terminal::new(24, 80);
@@ -445,10 +392,9 @@ fn conpty_rows_grow_under_an_alt_screen_keeps_the_saved_primary_intact() {
 
 // ---- rows-shrink --------------------------------------------------------
 
-/// Rows-shrink is unchanged by the policy: conhost's repaint after a shrink
-/// (measured 24→16 on a full screen: old row 8 at row 0, i.e. a top-demote;
-/// trailing blanks simply dropped) is what the native shape already produces,
-/// so the two policies must agree row for row.
+/// A rows shrink is unchanged by the policy: conhost's repaint after a shrink
+/// (24->16 on a full screen: old row 8 at row 0, trailing blanks dropped) is
+/// what the native shape produces, so the two policies agree row for row.
 #[test]
 fn conpty_rows_shrink_is_the_native_shape() {
     let mut native = Terminal::new(24, 80);
@@ -463,9 +409,8 @@ fn conpty_rows_shrink_is_the_native_shape() {
         native.grid().scrollback_lines(),
         conpty.grid().scrollback_lines()
     );
-    // And the measured repaint is a no-op on it: with the cursor on the blank
-    // prompt row (row 23 -> row 15 after an 8-row demote), old rows 8.. sit
-    // at rows 0..16.
+    // conhost's repaint is a no-op on it: with the cursor on the blank prompt
+    // row (row 23 -> 15 after an 8-row demote), old rows 8.. sit at rows 0..16.
     let before = visible_rows(&conpty);
     conpty.process(&conhost_repaint(&before, 16, (16, 1)));
     assert_eq!(visible_rows(&conpty), before);
@@ -476,10 +421,10 @@ fn conpty_rows_shrink_is_the_native_shape() {
 
 const UNIT: &str = "abcdefghij";
 
-/// The audit's widen case: a logical line longer than the width whose HEAD is
-/// the newest history line and whose TAIL (a soft-wrap continuation) is the
-/// viewport's row 0. Built as: the 150-char line, 22 short lines, a prompt —
-/// 25 rows on a 24-row screen, so exactly the head scrolls into history.
+/// The widen case: a logical line longer than the width whose head is the
+/// newest history line and whose tail (a soft-wrap continuation) is viewport
+/// row 0. Built as the 150-char line, 22 short lines and a prompt: 25 rows on
+/// a 24-row screen.
 fn belt_setup(t: &mut Terminal) {
     t.process(format!("{}\r\n", UNIT.repeat(15)).as_bytes());
     for i in 1..=22 {
@@ -498,10 +443,9 @@ fn unit_count(t: &Terminal) -> usize {
         .sum()
 }
 
-/// conhost's measured repaint after a width change with a continuation at row
-/// 0, at 120 and at 80 columns alike: the SAME 24 rows (the 70-char fragment
-/// stays at row 0 as a standalone row, the line is not rejoined with its
-/// head), cursor after the prompt.
+/// conhost's repaint after a width change with a continuation at row 0, at 120
+/// and 80 columns alike: the same 24 rows (the 70-char fragment stays at row 0
+/// as a standalone row), cursor after the prompt.
 fn belt_repaint(rows_before: &[String]) -> Vec<u8> {
     conhost_repaint(rows_before, 24, (24, 2))
 }
@@ -526,10 +470,9 @@ fn belt_setup_puts_the_continuation_at_row_zero() {
     assert_eq!(unit_count(&t), 15);
 }
 
-/// Widen with the continuation at row 0: the fragment stays where conhost
-/// keeps it, the head stays the one history line, conhost's repaint is a no-op,
-/// and narrowing back leaves the history count where it started (the audit's
-/// 58-not-57 came from the re-seated tail).
+/// Widen with the continuation at row 0: the fragment stays where conhost keeps
+/// it, the head stays the one history line, conhost's repaint is a no-op, and
+/// narrowing back leaves the history count unchanged.
 #[test]
 fn conpty_widen_keeps_the_boundary_fragment_where_conhost_paints_it() {
     let mut t = Terminal::new(24, 80);
@@ -573,10 +516,9 @@ fn conpty_widen_keeps_the_boundary_fragment_where_conhost_paints_it() {
     assert_eq!(visible_rows(&t), before);
 }
 
-/// Same, on the OFFLOADED path with a tiered store, in BOTH orders conhost's
-/// repaint can arrive relative to the worker's re-attach. The audit's
-/// duplicate was born here: the native re-attach fill re-seated the rewrapped
-/// tail on top of a viewport conhost had already repainted.
+/// Same, on the offloaded path with a tiered store, with conhost's repaint
+/// before and after the worker's re-attach (a native re-attach fill would
+/// re-seat the tail over a viewport conhost already repainted).
 #[test]
 fn conpty_offloaded_widen_is_duplicate_free_whichever_side_of_the_reattach_the_repaint_lands() {
     for repaint_before_reattach in [true, false] {
@@ -617,10 +559,9 @@ fn conpty_offloaded_widen_is_duplicate_free_whichever_side_of_the_reattach_the_r
     }
 }
 
-/// TEETH: the native offloaded path with the repaint landing before re-attach
-/// is the audit's duplicate — the fill re-seats the rewrapped tail above the
-/// fragment conhost already painted at row 0, so the long line's text is in
-/// the buffer more than once.
+/// Negative control: the native offloaded path with the repaint before
+/// re-attach duplicates the long line's text (the fill re-seats the rewrapped
+/// tail above the fragment conhost painted at row 0).
 #[test]
 fn native_offloaded_widen_under_a_conhost_repaint_duplicates_the_fragment() {
     let mut t = tiered(24, 80);
@@ -637,9 +578,9 @@ fn native_offloaded_widen_under_a_conhost_repaint_duplicates_the_fragment() {
     );
 }
 
-/// Search after the widen + repaint finds every short line at the row that
-/// really holds it — the index is keyed by absolute row and a width reflow
-/// renumbers wholesale, so this pins that the rebuild fence still fires.
+/// Search after the widen and repaint finds every short line at the row that
+/// holds it: a width reflow renumbers wholesale, so the rebuild fence must
+/// fire.
 #[test]
 fn conpty_widen_search_finds_every_line_at_its_row() {
     let mut t = Terminal::new(24, 80);
@@ -675,9 +616,9 @@ fn fnv(h: &mut u64, bytes: &[u8]) {
     }
 }
 
-/// Everything a reader or a key-holding consumer can observe after a resize:
-/// the retained rows in reading order, the cursor, the reading position, and
-/// the absolute-row bookkeeping (oldest key, counter, renumber epoch).
+/// Everything observable after a resize: retained rows in reading order, the
+/// cursor, the reading position and the absolute-row bookkeeping (oldest key,
+/// counter, renumber epoch).
 fn fold_state(h: &mut u64, t: &Terminal) {
     for row in retained_rows(t) {
         fnv(h, row.as_bytes());
@@ -697,13 +638,12 @@ fn fold_state(h: &mut u64, t: &Terminal) {
     }
 }
 
-/// 120 steps of output, an occasional scrollback erase, a reader scrolling
-/// back on a quarter of them, and a resize after each — a third keep the
-/// width, the rest change it too — resized synchronously (`native`) or
-/// through the offloaded detach/re-attach. Measured on the ring-only run: 74
-/// width changes, 13 revealing grows, 7 blank-appending grows, 25 shrinks,
-/// and 19 rows-only resizes under a scrolled-back reader (the anchor arm).
-/// Returns the digest of every step.
+/// 120 steps of output, an occasional scrollback erase, a reader scrolling back
+/// on a quarter of them, and a resize after each (a third keep the width),
+/// applied synchronously (`native`) or through the offloaded detach/re-attach.
+/// Covers width changes, revealing and blank-appending grows, shrinks and
+/// rows-only resizes under a scrolled-back reader. Returns the digest of every
+/// step.
 fn native_script(mut t: Terminal, offload: bool, native: impl Fn(&mut Terminal, u16, u16)) -> u64 {
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -744,20 +684,20 @@ fn native_script(mut t: Terminal, offload: bool, native: impl Fn(&mut Terminal, 
     h
 }
 
-/// The Native policy is 0.94.0's resize, byte for byte: the script above
-/// through the policy entry points, on a ring-only and on a tiered terminal,
-/// digests to exactly what the same script gave through the plain `resize` /
-/// `resize_offloading_scrollback` of origin/main at 0.94.0 (`fe5d19198`),
-/// captured with a probe linked against that build's `aterm_core`. The
-/// digest covers the retained rows, cursor, reading position, counter,
-/// oldest key and renumber epoch at every step, so a ConPTY arm leaking into
-/// the Native path moves it. A deliberate change to the native resize moves
-/// it too: re-capture it then, from the script above run on the build that
-/// predates the change.
+/// The Native policy is 0.94.0's resize (`fe5d19198`, which digested to
+/// `0xc06f_0e9d_2a8d_b94e` / `0x01a9_2c38_01ae_30cc`) but for the key
+/// bookkeeping of its two bottom arms (`keep_keys_across_bottom_rows`,
+/// `cover_retained_rows`), re-captured 2026-10-01: they move the counter and a
+/// scrolled-back reader's anchor but, measured with the key fields left out of
+/// the digest, leave the retained rows, cursor and scrollback identical. The
+/// digest covers the retained rows, cursor, reading position, counter, oldest
+/// key and renumber epoch at every step, so a ConPTY arm leaking into the
+/// Native path moves it. A deliberate change to the native resize moves it
+/// too: re-capture it then, saying what moved.
 #[test]
 fn native_policy_matches_the_0_94_0_resize() {
-    const RING: u64 = 0xc06f_0e9d_2a8d_b94e;
-    const TIERED: u64 = 0x01a9_2c38_01ae_30cc;
+    const RING: u64 = 0xb706_f513_99e0_6395;
+    const TIERED: u64 = 0xc4cc_9a06_602e_98ee;
     let plain = |t: &mut Terminal, r: u16, c: u16| t.resize(r, c);
     let native = |t: &mut Terminal, r: u16, c: u16| {
         t.resize_with_policy(r, c, ResizePolicy::Native);
@@ -771,10 +711,9 @@ fn native_policy_matches_the_0_94_0_resize() {
 
 /// The offloaded twin of the width round trip in
 /// `conpty_widen_keeps_the_boundary_fragment_where_conhost_paints_it`: after
-/// the first re-attach the head's ring row is rebuilt 120 wide, so a
+/// the first re-attach the head's ring row is rebuilt 120 wide, and a
 /// continuation flag left on the row-0 fragment would make the next detach
-/// read the head's trailing blanks as content (an extra blank history line
-/// per width change).
+/// add a blank history line per width change.
 #[test]
 fn conpty_offloaded_width_round_trip_keeps_the_history_line_count() {
     let mut t = tiered(24, 80);
@@ -807,10 +746,9 @@ fn conpty_offloaded_width_round_trip_keeps_the_history_line_count() {
     }
 }
 
-/// The audit's combined case, 20x60 -> 40x120 with history: conhost keeps the
-/// old viewport at the top and paints the rest blank (measured 80x24 ->
-/// 120x40, `ResizePolicy`), so every history line must still be history after
-/// its repaint.
+/// The combined case, 20x60 -> 40x120 with history: conhost keeps the old
+/// viewport at the top and paints the rest blank, so every history line must
+/// still be history after its repaint.
 fn combined_setup(t: &mut Terminal) {
     for i in 1..=38 {
         t.process(format!("row {i:02}\r\n").as_bytes());
@@ -842,9 +780,9 @@ fn conpty_combined_grow_and_widen_keeps_every_history_line() {
     );
 }
 
-/// TEETH for the combined case: the Native widen's deficit fill pulls the whole
-/// history into the grown viewport, and conhost's repaint then writes the old
-/// viewport over it — the audit's "all scrollback lines vanished".
+/// Negative control for the combined case: the Native widen's deficit fill
+/// pulls the history into the grown viewport and conhost's repaint then
+/// overwrites it.
 #[test]
 fn native_combined_grow_and_widen_under_a_conhost_repaint_loses_the_history() {
     let mut t = Terminal::new(20, 60);
@@ -860,12 +798,11 @@ fn native_combined_grow_and_widen_under_a_conhost_repaint_loses_the_history() {
     );
 }
 
-/// The bottom-push corner, measured 2026-09-27: a full screen with the cursor
-/// on row 3 shrunk 24 -> 16. conhost repaints the cursor's row at row 0 and
-/// old rows 4..18 below it, cursor on row 0; the grow back paints the grown
-/// rows blank. The native shrink leaves exactly that viewport (so both
-/// repaints are no-ops) and keeps the cut-off rows in history: nothing is
-/// lost and nothing is retained twice.
+/// The bottom-push corner: a full screen with the cursor on row 3 shrunk
+/// 24 -> 16. conhost repaints the cursor's row at row 0 and old rows 4..18
+/// below it, cursor on row 0; the grow back paints the grown rows blank. The
+/// native shrink leaves exactly that viewport and keeps the cut-off rows in
+/// history: nothing lost, nothing retained twice.
 #[test]
 fn conpty_rows_shrink_in_the_bottom_push_corner_leaves_the_viewport_conhost_paints() {
     let mut t = Terminal::new(24, 80);
@@ -880,7 +817,7 @@ fn conpty_rows_shrink_in_the_bottom_push_corner_leaves_the_viewport_conhost_pain
     assert_eq!(t.grid().cursor_row(), 3);
 
     t.resize_with_policy(16, 80, ResizePolicy::ConPty);
-    // conhost's measured repaint: old rows 3..18, cursor on row 0 col 1.
+    // conhost's repaint: old rows 3..18, cursor on row 0 col 1.
     let conhost_view: Vec<String> = screen[3..19].to_vec();
     assert_eq!(
         visible_rows(&t),
@@ -911,20 +848,17 @@ fn conpty_rows_shrink_in_the_bottom_push_corner_leaves_the_viewport_conhost_pain
     );
 }
 
-// ---- pwsh under conhost, byte for byte (captured 2026-09-27) --------------
+// ---- pwsh under conhost, byte for byte -------------------------------------
 //
-// The fixtures below replay the shapes `aterm ctl cast` recorded from pwsh 7.6
-// in an aterm 0.95.0 tab on Windows 11 26200, 23x80 (the presence band had
-// taken a row). The prompt's text is replaced by a stand-in of the same length
-// (116 columns: it wraps at 80), so every row and every CUP lands where the
-// capture put it. The re-verification of 2026-09-27 saw, on this exact
-// sequence, a widen to 120 staircase older history rows (40 blanks, then
-// `col-test 02`) and a narrow to 60 put a shifted copy of the screen's top
-// row into history. Both came from continuation links that outlived the text
-// they described: conhost's `cls` erases row by row with `CSI K`, and EL did
-// not break the link into the row below (see `Grid::clear_wrap_into_next_row`).
+// These fixtures replay byte shapes recorded with `aterm ctl cast` from pwsh
+// under conhost at 23x80. The prompt text is replaced by a stand-in of the
+// same length (116 columns, wrapping at 80), so every row and CUP lands where
+// the capture put it. conhost's `cls` erases row by row with `CSI K`, and EL
+// must break the continuation link into the row below
+// (`Grid::clear_wrap_into_next_row`), or a later widen or narrow shifts
+// history rows.
 
-/// A stand-in for the measured 116-column pwsh prompt.
+/// A stand-in for the 116-column pwsh prompt.
 fn pwsh_prompt() -> String {
     format!("PS C:\\{}>", "w".repeat(109))
 }
@@ -937,8 +871,8 @@ fn col_test(n: usize) -> String {
 /// The 22-column tail a `col-test` line leaves on its second row at 80.
 const COL_TEST_TAIL: &str = "ijabcdefghijabcdefghij";
 
-/// conhost's `cls` for pwsh (measured): two passes of `CSI K` down every
-/// row from the top, the second after `CSI 3J`.
+/// conhost's `cls` for pwsh: two passes of `CSI K` down every row from the
+/// top, the second after `CSI 3J`.
 fn conhost_cls(rows: u16) -> Vec<u8> {
     let mut out = Vec::new();
     for lead in [&b"\x1b[?25l\x1b[H"[..], &b"\x1b[?25l\x1b[3J"[..]] {
@@ -954,10 +888,9 @@ fn conhost_cls(rows: u16) -> Vec<u8> {
     out
 }
 
-/// How conhost writes a run wider than 80 columns that starts on the BOTTOM
-/// row (measured): the first 80 columns, CR LF (which scrolls), then
-/// `CSI <rows-1>;80 H` re-writing the 80th character so that the rest
-/// autowraps onto the new bottom row.
+/// How conhost writes a run wider than 80 columns that starts on the bottom
+/// row: the first 80 columns, CR LF (which scrolls), then `CSI <rows-1>;80 H`
+/// re-writing the 80th character so the rest autowraps onto the new bottom row.
 fn bottom_row_run(text: &str, rows: u16) -> Vec<u8> {
     let mut out = text[..80].as_bytes().to_vec();
     out.extend_from_slice(format!("\r\n\x1b[{};80H", rows - 1).as_bytes());
@@ -966,10 +899,9 @@ fn bottom_row_run(text: &str, rows: u16) -> Vec<u8> {
 }
 
 /// pwsh printing `col-test 01..=40` from the top of a cleared 23x80 screen,
-/// then its next prompt (measured): a line that fits goes out as one
-/// autowrapping run and CR LF; from `col-test 12` on every line starts on the
-/// bottom row and takes the `bottom_row_run` shape, then CR, LF; the prompt
-/// takes it too and ends with `CSI 1 C`.
+/// then its next prompt: a line that fits is one autowrapping run and CR LF;
+/// from `col-test 12` on every line starts on the bottom row and takes the
+/// `bottom_row_run` shape, then CR, LF; the prompt too, ending with `CSI 1 C`.
 fn pwsh_col_test_fill() -> Vec<u8> {
     let mut out = Vec::new();
     for n in 1..=40 {
@@ -1023,9 +955,9 @@ fn col_test_history_at_80() -> Vec<(String, bool)> {
     rows
 }
 
-/// conhost's measured repaint after the widen to 23x120: the tail at row 0 as
-/// a line of its own, `col-test 31..=40` one row each, the prompt padded to
-/// the full 120 columns, ten blank rows, and the cursor after the prompt.
+/// conhost's repaint after the widen to 23x120: the tail at row 0 as a line of
+/// its own, `col-test 31..=40` one row each, the prompt padded to 120 columns,
+/// ten blank rows, and the cursor after the prompt.
 fn widen_to_120_repaint() -> Vec<u8> {
     let mut out = format!("\x1b[?25l\x1b[H{COL_TEST_TAIL}\x1b[K\r\n").into_bytes();
     for n in 31..=40 {
@@ -1039,8 +971,8 @@ fn widen_to_120_repaint() -> Vec<u8> {
     out
 }
 
-/// conhost's measured repaint after narrowing back to 23x80: the tail at row
-/// 0, `col-test 31..=40` as autowrapping runs, the prompt, `CSI 1 C`.
+/// conhost's repaint after narrowing back to 23x80: the tail at row 0,
+/// `col-test 31..=40` as autowrapping runs, the prompt, `CSI 1 C`.
 fn narrow_to_80_repaint() -> Vec<u8> {
     let mut out = format!("\x1b[?25l\x1b[H{COL_TEST_TAIL}\x1b[K\r\n").into_bytes();
     for n in 31..=40 {
@@ -1082,13 +1014,12 @@ fn conpty_resize(t: &mut Terminal, rows: u16, cols: u16, repaint: &[u8], before_
     }
 }
 
-/// The verifier's widen, replayed: after conhost's `cls` the fill leaves exact
-/// history (no continuation link survived from the prompt that sat on those
-/// rows); the widen to 120 gives each of `col-test 01..=29` ONE row with no
-/// history row shifted, and the boundary line's head stays the newest history
-/// line (conhost repaints its 22-column tail at row 0 as a line of its own —
-/// the measured `widen_to_120_repaint`); narrowing back restores the 59 rows
-/// exactly, three times over.
+/// Widen and narrow replayed: after conhost's `cls` the fill leaves exact
+/// history (no continuation link survives from the prompt that sat there);
+/// the widen to 120 gives each of `col-test 01..=29` one row with no history
+/// row shifted, the boundary line's head stays the newest history line
+/// (conhost repaints its 22-column tail at row 0, `widen_to_120_repaint`), and
+/// narrowing back restores the 59 rows exactly, three times over.
 #[test]
 fn conpty_widen_after_conhost_cls_rewraps_history_with_no_row_shifted() {
     for before_reattach in [true, false] {
@@ -1137,9 +1068,8 @@ fn conpty_widen_after_conhost_cls_rewraps_history_with_no_row_shifted() {
     }
 }
 
-/// pwsh's `cls; 1..30 | % {'pad {0:D2}' -f $_}` at 23x80 (measured: `pad
-/// 01..=23` each followed by `CSI K`, the rest scrolled in bare), the prompt
-/// at the bottom.
+/// pwsh's `cls; 1..30 | % {'pad {0:D2}' -f $_}` at 23x80 (`pad 01..=23` each
+/// followed by `CSI K`, the rest scrolled in bare), the prompt at the bottom.
 fn pwsh_pad_fill() -> Vec<u8> {
     let mut out = conhost_cls(23);
     for n in 1..=30 {
@@ -1154,8 +1084,8 @@ fn pwsh_pad_fill() -> Vec<u8> {
     out
 }
 
-/// conhost's measured repaint after that screen shrank to 20x60: `pad 13` at
-/// row 0 (it demoted `pad 10..=12`), the prompt padded to two full rows.
+/// conhost's repaint after that screen shrank to 20x60: `pad 13` at row 0
+/// (`pad 10..=12` demoted), the prompt padded to two full rows.
 fn shrink_to_60_repaint() -> Vec<u8> {
     let mut out = b"\x1b[?25l\x1b[H".to_vec();
     for n in 13..=30 {
@@ -1165,11 +1095,9 @@ fn shrink_to_60_repaint() -> Vec<u8> {
     out
 }
 
-/// The verifier's stray row, replayed: short lines written over rows that
-/// held wrapped lines, then a shrink to 20x60. History holds exactly the three
-/// lines conhost demoted, nothing is retained twice and no row is shifted
-/// right — the re-verification saw `pad 03, 05, .., 13` each 20 columns right
-/// and a copy of `pad 13` in history while conhost painted it at row 0.
+/// Short lines written over rows that held wrapped lines, then a shrink to
+/// 20x60: history holds exactly the three lines conhost demoted, nothing is
+/// retained twice and no row is shifted right.
 #[test]
 fn conpty_column_shrink_after_conhost_cls_pushes_no_stray_row() {
     let pad = |range: std::ops::RangeInclusive<usize>| -> Vec<(String, bool)> {
@@ -1225,26 +1153,23 @@ fn conpty_column_shrink_after_conhost_cls_pushes_no_stray_row() {
     }
 }
 
-// ---- a shrink with a non-blank row under the cursor (captured 2026-09-27) --
+// ---- a shrink with a non-blank row under the cursor -------------------------
 //
-// The round-2 review's recipe, replayed from its `aterm ctl cast` (pwsh 7.6,
-// aterm 0.95.0, a 24x80 tab): `cls; 1..30 | % { "pad {0:D2}" -f $_ }` went in
-// as two input lines, so PSReadLine drew its `>>` continuation prompt, and the
-// fill ended with the prompt drawn twice and `>>` on a fresh bottom row, the
-// cursor back on the prompt ABOVE it (`CR LF >> CSI 23;38 H`). Every resize the
-// review then made is replayed with conhost's repaint for it. The round-3
-// review found the widths where the cell after the prompt starts a row of its
-// own (58, 39, 29) and a one-line fill with the prompt alone on the bottom
-// rows; those runs are replayed too. The captures' OSC marks and SGR changes
-// are left out and the prompt is the 116-column stand-in, which is the
-// measured prompt's length.
+// Replays a pwsh capture at 24x80: `cls; 1..30 | % { "pad {0:D2}" -f $_ }`
+// entered as two input lines, so PSReadLine drew its `>>` continuation prompt
+// and the fill ended with the prompt drawn twice, `>>` on a fresh bottom row
+// and the cursor back on the prompt above it (`CR LF >> CSI 23;38 H`). Each
+// resize is replayed with conhost's repaint for it, including the widths where
+// the cell after the prompt starts a row of its own (58, 39, 29) and a
+// one-line fill with the prompt alone on the bottom rows. OSC marks and SGR
+// changes are left out; the prompt is the 116-column stand-in.
 
 /// The two pad fills the reviews captured at 24x80.
 #[derive(Clone, Copy, Debug)]
 enum PadPrompt {
     /// The command went in as two input lines, so PSReadLine drew the prompt
-    /// twice and its `>>` on a fresh bottom row, and put the cursor back on
-    /// the prompt above it (`CR LF >> CSI 23;38 H`). History `pad 01..=11`;
+    /// twice with `>>` on a fresh bottom row and put the cursor back on the
+    /// prompt above it (`CR LF >> CSI 23;38 H`). History `pad 01..=11`;
     /// `pad 12..=30` on rows 0..=18, the prompts on rows 19..=22, `>>` on row
     /// 23, the cursor on row 22 one column past the prompt.
     AboveContinuation,
@@ -1253,9 +1178,9 @@ enum PadPrompt {
     Alone,
 }
 
-/// The capture's pad fill: conhost's `cls` (`CSI K` down every row, then
-/// `CSI 3J`), `pad 01..=30` (the first 24 with `CSI K`), then the prompt in
-/// the bottom-row shape ending in pwsh's `CSI 1 C` — twice with `>>` under the
+/// The pad fill: conhost's `cls` (`CSI K` down every row, then `CSI 3J`),
+/// `pad 01..=30` (the first 24 with `CSI K`), then the prompt in the
+/// bottom-row shape ending in pwsh's `CSI 1 C`; twice with `>>` under the
 /// second for `PadPrompt::AboveContinuation`.
 fn pwsh_pad_fill_24(fill: PadPrompt) -> Vec<u8> {
     let mut out = b"\x1b[?25l\x1b[H".to_vec();
@@ -1283,9 +1208,9 @@ fn pwsh_pad_fill_24(fill: PadPrompt) -> Vec<u8> {
     out
 }
 
-/// Every resize the review made after the fill, in order, with the pad line
-/// conhost repainted at row 0: 20x60 demoted `pad 12..=15` and 20x50 `pad
-/// 16..=17`; no other step demoted anything.
+/// The resize steps after the fill, in order, with the pad line conhost
+/// repainted at row 0: 20x60 demoted `pad 12..=15` and 20x50 `pad 16..=17`;
+/// no other step demoted anything.
 const PAD_RESIZES: [(u16, u16, usize); 14] = [
     (20, 60, 16),
     (24, 80, 16),
@@ -1303,11 +1228,11 @@ const PAD_RESIZES: [(u16, u16, usize); 14] = [
     (24, 80, 18),
 ];
 
-/// Does the cursor's copy of the prompt take a row more than its text? conhost
-/// keeps the cursor's row through the cursor's cell when it rewraps (the prompt
-/// and its `CSI 1 C`: 118 cells), so at a width that fits the 116 columns of
-/// text in one row fewer than those 118 cells — 58, 39 and 29 measured — the
-/// cursor's cell is a row of its own, painted `CSI K`.
+/// Whether the cursor's copy of the prompt takes a row more than its text.
+/// conhost keeps the cursor's row through the cursor's cell when it rewraps
+/// (prompt plus `CSI 1 C`: 118 cells), so at a width that fits the 116 text
+/// columns in one row fewer than those 118 cells (58, 39 and 29) the cursor's
+/// cell is a row of its own, painted `CSI K`.
 fn cursor_row_of_its_own(cols: u16) -> bool {
     let cols = usize::from(cols);
     let text = pwsh_prompt().len();
@@ -1362,13 +1287,13 @@ fn pad_cursor(fill: PadPrompt, first: usize, cols: u16) -> (u16, u16) {
     )
 }
 
-/// conhost's repaint bytes for that screen (the measured shape): each row's
-/// text, a prompt's last row ended by its blanks as spaces when it has four
-/// or fewer (at 60, 40 and 39 columns) and by `CSI K` otherwise, the cursor's
-/// own row as `CSI K`, `>>` for `AboveContinuation`, rows joined by CR LF,
-/// `CSI K` rows to the bottom, then the cursor: a CUP, or — when the paint
-/// ended on the cursor's own row at the bottom (`Alone` at 58, 39, 29) — the
-/// `CSI n C` from column 0 conhost sends there, or nothing at column 0.
+/// conhost's repaint bytes for that screen: each row's text, a prompt's last
+/// row ended by its blanks as spaces when it has four or fewer (at 60, 40 and
+/// 39 columns) and by `CSI K` otherwise, the cursor's own row as `CSI K`, `>>`
+/// for `AboveContinuation`, rows joined by CR LF, `CSI K` rows to the bottom,
+/// then the cursor: a CUP, or, when the paint ended on the cursor's own row at
+/// the bottom (`Alone` at 58, 39, 29), `CSI n C` from column 0, or nothing at
+/// column 0.
 fn pad_repaint(fill: PadPrompt, first: usize, rows: u16, cols: u16) -> Vec<u8> {
     let prompt = pwsh_prompt();
     let width = usize::from(cols);
@@ -1487,26 +1412,21 @@ fn replay_pad_resizes(fill: PadPrompt, steps: &[(u16, u16, usize)]) {
     }
 }
 
-/// The review's lost line, replayed: a ConPTY shrink with `>>` under the
-/// cursor demotes every row conhost demotes, so after conhost's repaint the
-/// history is `pad 01..=15` (the review saw `pad 01..=14`, and `pad 15` in
-/// neither history nor screen), the screen is the one conhost painted, and no
-/// pad line is lost or doubled at any of the fourteen steps — including
-/// 20x50, which lost `pad 17` the same way.
+/// A ConPTY shrink with `>>` under the cursor demotes every row conhost
+/// demotes, so after the repaint the history is `pad 01..=15`, the screen is
+/// the one conhost painted, and no pad line is lost or doubled at any of the
+/// fourteen steps (including 20x50).
 #[test]
 fn conpty_shrink_with_a_row_below_the_cursor_keeps_every_line() {
     replay_pad_resizes(PadPrompt::AboveContinuation, &PAD_RESIZES);
 }
 
-/// The round-3 review's widths, captured 2026-09-27 (pwsh 7.6 in a debug
-/// aterm 0.95.0 of this tree, `aterm ctl cast`; `pad_repaint` reproduces every
-/// one of these repaints byte for byte, less the SGR bytes and the first
-/// resize's `CSI 8;20;58 t`). At 58, 39 and 29 columns conhost's rewrap puts
-/// the cell after the prompt (the cursor's, past pwsh's `CSI 1 C`) on a row of
-/// its own, so it demotes one row more than a rewrap that clamps the cursor to
-/// the prompt's last glyph: with `>>` below, 20x58 demoted `pad 12..=16`
-/// (row 0 `pad 17`), 20x39 `pad 17..=18` and 20x29 `pad 19..=20`; the review
-/// saw `pad 16` lost at 20x58, in neither history nor screen.
+/// Widths where conhost's rewrap puts the cell after the prompt (the cursor's,
+/// past pwsh's `CSI 1 C`) on a row of its own, so it demotes one row more than
+/// a rewrap that clamps the cursor to the prompt's last glyph. With `>>`
+/// below, 20x58 demoted `pad 12..=16` (row 0 `pad 17`), 20x39 `pad 17..=18`
+/// and 20x29 `pad 19..=20`. `pad_repaint` reproduces these repaints byte for
+/// byte, less SGR bytes and the first resize's `CSI 8;20;58 t`.
 const PAD_RESIZES_EXACT_WIDTHS: [(u16, u16, usize); 6] = [
     (20, 58, 17),
     (24, 80, 17),
@@ -1516,9 +1436,8 @@ const PAD_RESIZES_EXACT_WIDTHS: [(u16, u16, usize); 6] = [
     (24, 80, 21),
 ];
 
-/// The same capture's run with ONE prompt and nothing under it: 20x58
-/// demoted `pad 09..=13` (the review saw `pad 13` lost), 20x60 nothing,
-/// 20x39 `pad 14`, 20x29 `pad 15`.
+/// The same widths with one prompt and nothing under it: 20x58 demoted
+/// `pad 09..=13`, 20x60 nothing, 20x39 `pad 14`, 20x29 `pad 15`.
 const PAD_RESIZES_EXACT_WIDTHS_ALONE: [(u16, u16, usize); 7] = [
     (20, 58, 14),
     (24, 80, 14),
@@ -1555,10 +1474,9 @@ fn conpty_rows_only_shrink_with_a_row_below_the_cursor_demotes_the_same_rows() {
     );
 }
 
-/// TEETH: the same first step on the Native policy is the review's defect —
-/// the width shrink pushes only the three rows that bring the cursor on
-/// screen and cuts `>>`, conhost paints `pad 16` over the `pad 15` it left at
-/// row 0, and `pad 15` is gone from history and screen alike.
+/// Negative control: the same first step under the Native policy pushes only
+/// the three rows that bring the cursor on screen and cuts `>>`; conhost then
+/// paints `pad 16` over the `pad 15` left at row 0, losing it.
 #[test]
 fn native_shrink_with_a_row_below_the_cursor_under_a_conhost_repaint_loses_a_line() {
     let fill = PadPrompt::AboveContinuation;
@@ -1573,10 +1491,9 @@ fn native_shrink_with_a_row_below_the_cursor_under_a_conhost_repaint_loses_a_lin
     );
 }
 
-/// TEETH for the exact widths: the Native rewrap clamps the cursor to the
-/// prompt's last glyph, so at 20x58 it keeps the cursor on the prompt's
-/// second row and pushes one row fewer than conhost demoted; conhost's repaint
-/// then paints `pad 14` over the `pad 13` left at row 0.
+/// Negative control for the exact widths: the Native rewrap clamps the cursor
+/// to the prompt's last glyph, so at 20x58 it pushes one row fewer than
+/// conhost demoted, and the repaint paints `pad 14` over `pad 13` at row 0.
 #[test]
 fn native_shrink_to_a_width_the_prompt_fills_exactly_loses_a_line() {
     let fill = PadPrompt::Alone;

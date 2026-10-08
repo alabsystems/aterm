@@ -19,7 +19,7 @@
 //! `on`, `off` and `doctor` are [`crate::enable`]: turning the fabric on in
 //! one command, proving it, and naming the fix for each warning below.
 //! `mint-for` and `join` are [`crate::join`]: a second host joins the fleet
-//! over the sealed transport (round 16).
+//! over the sealed transport.
 //!
 //! THE OWNER'S COMMAND, AND IT TAKES NO ARGUMENTS. Everything it needs is in the
 //! `[fabric] command` aterm launches its bridge from: the fleet, the broker, the
@@ -43,21 +43,17 @@
 //!   state dir, and how many grants each cap file holds.
 //! * BROKER — a REAL reachability check: a connect, the broker's `Hello`, every
 //!   cap attached, and the head query (`Fetch max=0`). A socket FILE is not a
-//!   broker. `fabric=connected` IS a statement about one since round 13 — the
-//!   bridge reports its own broker link and the endpoint says `connected` only
-//!   while that link's last exchange was acked, `stalled` while a bridge is
-//!   attached but its link is down (measured 2026-09-12, before that: a bridge
-//!   pointed at a socket nothing served reported `connected` all the same) —
-//!   but it is the BRIDGE's last observation, as old as `link_age_ms=` says,
-//!   and this probe is the report's own, made now.
-//!   `stale` is the third case and the one the other two cannot see (round 21):
-//!   the endpoint gave the bridge a post and has had nothing back since — no
-//!   ack, no landing, no `link` record. A dead helper closes its fds
-//!   (`disconnected`) and a dead BROKER is reported within the bridge's own 5 s
-//!   ack deadline (`stalled`); a WEDGED helper does neither, and before round 21
-//!   its instance read `connected` for as long as it hung. It is not read off
-//!   the ack's age alone: a quiet link's age grows without bound by design, so
-//!   the clock runs only while an answer is owed.
+//!   broker. The endpoint's `fabric=connected` means the bridge's link had its
+//!   last exchange acked, `stalled` that a bridge is attached but its link is
+//!   down — but that is the BRIDGE's last observation, as old as
+//!   `link_age_ms=` says; this probe is the report's own, made now.
+//!   `stale` is the case the other two cannot see: the endpoint gave the
+//!   bridge a post and has had nothing back since — no ack, no landing, no
+//!   `link` record. A dead helper closes its fds (`disconnected`) and a dead
+//!   BROKER is reported within the bridge's own 5 s ack deadline (`stalled`);
+//!   a WEDGED helper does neither. It is not read off the ack's age alone: a
+//!   quiet link's age grows without bound by design, so the clock runs only
+//!   while an answer is owed.
 //!   The pid is the process serving `link broker <socket>` in the process table,
 //!   and on macOS the launchd job whose pid that is. THE HEAD QUERY IS PART OF
 //!   THE CHECK ([`BrokerView::read_ok`]): a broker that acknowledges the `Hello`
@@ -76,20 +72,19 @@
 //!   joined by sid with what each local instance says about its own sessions:
 //!   `meta` for the title and role, and `inbox --peek --meta` for the inbox
 //!   numbers — `--peek` so no row becomes listed, `--meta` so no text is read.
-//!   The row's own `detail=` and `phase=` (round 13's presence with meaning:
-//!   the running program, and busy | idle | prompt | question | limited |
-//!   survey — the server's agent verdict the bridge relays) are the bridge's,
-//!   so a remote session shows them too; a local instance's `meta` wins for the
-//!   title and role, the bus row fills them in for a remote one.
+//!   The row's own `detail=` and `phase=` (the running program, and busy |
+//!   idle | prompt | question | limited | survey — the server's agent verdict
+//!   the bridge relays) are the bridge's, so a remote session shows them too;
+//!   a local instance's `meta` wins for the title and role, the bus row fills
+//!   them in for a remote one.
 //!   A HELD session's `timeline` is read for the hold's reason and origin, which
 //!   no other read verb reports; an unhandled task's or ask's age is the `t=` of
 //!   its record on the bus.
 //! * NODES — every node row on the presence roster, as the node published it
 //!   (`host=`, `state=`, `fabric=`), with its live-session count, `this` for
 //!   the node the command's state dir names, `local` for another instance on
-//!   this machine, and `remote` for one only the bus knows — the second host
-//!   of round 16. Before round 16 a remote node was a row of BRIDGES, a table
-//!   whose header says it is this machine's instances.
+//!   this machine, and `remote` for one only the bus knows. A remote node is
+//!   never a BRIDGES row: that table is this machine's instances.
 //! * TRAFFIC — the last ten records under `/f/<F>/>`, metadata only.
 //!
 //! A GUARDED BROKER is read through the caps' own faces. A node's ring never
@@ -101,11 +96,11 @@
 //! reads what this node may read, and BROKER's `reads` line says so.
 //! * WARNINGS — every condition found above that makes `connected` a lie or
 //!   loses mail. A `stalled` bridge is one: its instance's mail queues and none
-//!   arrives until the link is back. Among them: a node the bus's OWN roster calls `state=gone`
-//!   while the instance whose node it is says `fabric=connected` — measured on
-//!   this machine 2026-09-14, after a second bridge that had shared the state
-//!   dir exited and fired its will, every peer reading the fleet's directory saw
-//!   a live node as dead.
+//!   arrives until the link is back. Another is a node the bus's OWN roster
+//!   calls `state=gone` while the instance whose node it is says
+//!   `fabric=connected` — a second bridge sharing the state dir exited and
+//!   fired its will, so every peer reading the fleet's directory saw a live
+//!   node as dead.
 //!
 //! ## Privacy
 //!
@@ -123,10 +118,11 @@
 //! `0` healthy; `1` at least one WARNING was printed; `2` the fabric is off, its
 //! config cannot be read, or the command line is wrong.
 
+use aterm_uds::spawnfd::Stdio;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use crate::body::Body;
@@ -228,8 +224,7 @@ instance control sockets (fabric.toml) is read when the file has no command.
                    that no local instance hosts and, after a y/N (or --yes), publishes
                    `exited` for each. DRY by default. With a local bridge UP the rows
                    are retired THROUGH it (`aterm ctl fabric retire`, then the bus is
-                   read back); with none, this command publishes them itself — and a
-                   bridge from 0.91.0 or earlier answers `ERR usage`, which is reported.
+                   read back); with none, this command publishes them itself.
   mint-for <node>  on the FIRST host (a `sealed` build): mint that node's 8 grants
                    (the node ring) on this host's fleet under this host's mint
                    secret, which never leaves it and is never printed. <node> is
@@ -515,10 +510,8 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
         "on" => Cmd::On(on),
         "off" => Cmd::Off(off),
         "doctor" => {
-            // `--yes` ANSWERS A QUESTION ONLY `--retire-ghosts` ASKS. Parsed
-            // silently it read as "yes to whatever doctor does", which is
-            // nothing, and an operator who meant to retire would see a clean
-            // report and believe it had run.
+            // `--yes` answers a question only `--retire-ghosts` asks; accepted
+            // alone, an operator who meant to retire would believe it had run.
             if yes && !retire_ghosts {
                 return Err("--yes means nothing without --retire-ghosts".to_string());
             }
@@ -626,6 +619,25 @@ pub fn config_path() -> Option<PathBuf> {
 /// that is not a string: the app would not start a bridge from any of those,
 /// and the report cannot say what it would start.
 pub fn command_in_toml(text: &str) -> Result<Option<String>, String> {
+    fabric_key(text, "command", |v| match v.as_str() {
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => Ok(Some(s.to_string())),
+        None => Err("`[fabric] command` is not a string".to_string()),
+    })
+}
+
+/// `[fabric] <key>` out of an aterm.toml's TEXT, read by `value`: `Ok(None)`
+/// when the table or the key is absent.
+///
+/// # Errors
+///
+/// A file that is not TOML, a `fabric` that is not a table, or what `value`
+/// says of the key.
+fn fabric_key<T>(
+    text: &str,
+    key: &str,
+    value: impl FnOnce(&aterm_toml::Value) -> Result<Option<T>, String>,
+) -> Result<Option<T>, String> {
     let table: aterm_toml::Table =
         aterm_toml::from_str(text).map_err(|e| format!("not valid TOML: {e}"))?;
     let Some(fabric) = table.get("fabric") else {
@@ -634,14 +646,7 @@ pub fn command_in_toml(text: &str) -> Result<Option<String>, String> {
     let Some(fabric) = fabric.as_table() else {
         return Err("`fabric` is not a table".to_string());
     };
-    match fabric.get("command") {
-        None => Ok(None),
-        Some(v) => match v.as_str() {
-            Some(s) if s.trim().is_empty() => Ok(None),
-            Some(s) => Ok(Some(s.to_string())),
-            None => Err("`[fabric] command` is not a string".to_string()),
-        },
-    }
+    fabric.get(key).map_or(Ok(None), value)
 }
 
 /// `[fabric] presence` out of an aterm.toml's TEXT: `Ok(None)` when the table
@@ -652,23 +657,12 @@ pub fn command_in_toml(text: &str) -> Result<Option<String>, String> {
 /// A file that is not TOML, a `fabric` that is not a table, a `presence` that
 /// is not a string, or a spelling that is neither `meta` nor `minimal`.
 pub fn presence_in_toml(text: &str) -> Result<Option<crate::presence::Mode>, String> {
-    let table: aterm_toml::Table =
-        aterm_toml::from_str(text).map_err(|e| format!("not valid TOML: {e}"))?;
-    let Some(fabric) = table.get("fabric") else {
-        return Ok(None);
-    };
-    let Some(fabric) = fabric.as_table() else {
-        return Err("`fabric` is not a table".to_string());
-    };
-    match fabric.get("presence") {
-        None => Ok(None),
-        Some(v) => match v.as_str() {
-            Some(s) => crate::presence::Mode::parse(s).map(Some).ok_or_else(|| {
-                format!("`[fabric] presence = {s:?}` is neither \"meta\" nor \"minimal\"")
-            }),
-            None => Err("`[fabric] presence` is not a string".to_string()),
-        },
-    }
+    fabric_key(text, "presence", |v| match v.as_str() {
+        Some(s) => crate::presence::Mode::parse(s).map(Some).ok_or_else(|| {
+            format!("`[fabric] presence = {s:?}` is neither \"meta\" nor \"minimal\"")
+        }),
+        None => Err("`[fabric] presence` is not a string".to_string()),
+    })
 }
 
 /// `[fabric] presence` from the aterm.toml [`config_path`] resolves, for a
@@ -679,28 +673,41 @@ pub fn presence_in_toml(text: &str) -> Result<Option<crate::presence::Mode>, Str
 /// `fabric-lost`, which is the worse outcome by far.
 #[must_use]
 pub fn presence_from_config() -> crate::presence::Mode {
+    key_from_config(
+        presence_in_toml,
+        crate::presence::Mode::Meta,
+        "presence defaults to meta",
+    )
+}
+
+/// One `[fabric]` key from the aterm.toml [`config_path`] resolves, read by
+/// `in_toml`: `default` when there is no file or no key, and ALSO — said on
+/// stderr (`fallback` names it), not fatal — when the file cannot be read or
+/// the value is wrong.
+fn key_from_config<T>(
+    in_toml: fn(&str) -> Result<Option<T>, String>,
+    default: T,
+    fallback: &str,
+) -> T {
     let Some(path) = config_path() else {
-        return crate::presence::Mode::Meta;
+        return default;
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return crate::presence::Mode::Meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return default,
         Err(e) => {
             eprintln!(
-                "aterm-link: {} could not be read ({e}); presence defaults to meta",
+                "aterm-link: {} could not be read ({e}); {fallback}",
                 path.display()
             );
-            return crate::presence::Mode::Meta;
+            return default;
         }
     };
-    match presence_in_toml(&text) {
-        Ok(mode) => mode.unwrap_or_default(),
+    match in_toml(&text) {
+        Ok(v) => v.unwrap_or(default),
         Err(e) => {
-            eprintln!(
-                "aterm-link: {}: {e}; presence defaults to meta",
-                path.display()
-            );
-            crate::presence::Mode::Meta
+            eprintln!("aterm-link: {}: {e}; {fallback}", path.display());
+            default
         }
     }
 }
@@ -713,21 +720,11 @@ pub fn presence_from_config() -> crate::presence::Mode {
 /// A file that is not TOML, a `fabric` that is not a table, or a `receipts`
 /// that is not a boolean.
 pub fn receipts_in_toml(text: &str) -> Result<Option<bool>, String> {
-    let table: aterm_toml::Table =
-        aterm_toml::from_str(text).map_err(|e| format!("not valid TOML: {e}"))?;
-    let Some(fabric) = table.get("fabric") else {
-        return Ok(None);
-    };
-    let Some(fabric) = fabric.as_table() else {
-        return Err("`fabric` is not a table".to_string());
-    };
-    match fabric.get("receipts") {
-        None => Ok(None),
-        Some(v) => v
-            .as_bool()
+    fabric_key(text, "receipts", |v| {
+        v.as_bool()
             .map(Some)
-            .ok_or_else(|| "`[fabric] receipts` is not a boolean".to_string()),
-    }
+            .ok_or_else(|| "`[fabric] receipts` is not a boolean".to_string())
+    })
 }
 
 /// `[fabric] receipts` from the aterm.toml [`config_path`] resolves, for a
@@ -738,52 +735,18 @@ pub fn receipts_in_toml(text: &str) -> Result<Option<bool>, String> {
 /// the reason [`presence_from_config`] gives: a bridge that refused to start
 /// over a config typo would hold every session of its instance.
 ///
-/// THE DEFAULT IS ONE THING NOW, AND IT IS THIS ONE (round 21). It used to be
-/// off here while `aterm fabric on` wrote `receipts = true` into the file, so
-/// whether a node acked depended on which door its operator came through: a
-/// `fabric on` node acked, and a hand-written `[fabric] command`, a bridge
-/// started by hand, or a different `XDG_CONFIG_HOME` did not. The owner's own
-/// machine was the second kind — its `[fabric]` table was written by
-/// `tools/fabric-enable.sh` and carries no `receipts` key — so `aterm fabric
-/// status` there read `receipts off`.
-///
-/// OFF WAS THE WRONG ONE TO SETTLE ON because it breaks `ask`: with no ack,
-/// `post --wait-ack` has nothing that can ever release it and every `ask`
-/// burns its whole deadline before answering. The catalog says as much in as
-/// many words — "a recipient whose bridge runs without receipts never acks, so
-/// bound it". The cost of the other direction is one ack record and one `ev`,
-/// about 200 bytes, per ask or task a recipient actually DECIDES — not per
-/// message, and nothing at all on a fleet that sends only notes.
+/// ON because OFF breaks `ask`: with no ack, `post --wait-ack` has nothing
+/// that can release it and every `ask` burns its whole deadline. The cost is
+/// one ack record and one `ev` (about 200 bytes) per ask or task a recipient
+/// DECIDES — nothing on a fleet that sends only notes. One default for every
+/// door, so a hand-written `[fabric] command` acks like a `fabric on` one.
 ///
 /// `--no-receipts`, and `[fabric] receipts = false`, still turn it off; an
 /// operator's explicit `false` is never overwritten by a later `aterm fabric
 /// on`.
 #[must_use]
 pub fn receipts_from_config() -> bool {
-    let Some(path) = config_path() else {
-        return true;
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
-        Err(e) => {
-            eprintln!(
-                "aterm-link: {} could not be read ({e}); receipts default to on",
-                path.display()
-            );
-            return true;
-        }
-    };
-    match receipts_in_toml(&text) {
-        Ok(on) => on.unwrap_or(true),
-        Err(e) => {
-            eprintln!(
-                "aterm-link: {}: {e}; receipts default to on",
-                path.display()
-            );
-            true
-        }
-    }
+    key_from_config(receipts_in_toml, true, "receipts default to on")
 }
 
 /// The configured command, env first — the app's own precedence.
@@ -829,11 +792,11 @@ fn basename(word: &str) -> &str {
 
 /// Whether `words[i]` is the `aterm link <verb>` / `aterm-link <verb>` verb.
 ///
-/// BOTH SPELLINGS, because the shipped binary answers to both — `aterm link` is
-/// the front-door verb and `aterm-link` its argv0 alias — and they are both in
-/// use: `tools/fabric-enable.sh` writes the first, the design and every test
-/// harness the second. The program before `link` is not checked, so a renamed
-/// or bundled binary (`…/aterm.app/Contents/MacOS/aterm link serve`) still reads.
+/// BOTH SPELLINGS: `aterm link` is the front-door verb (`aterm fabric on`
+/// writes it) and `aterm-link` its argv0 alias (the design and the test
+/// harnesses use it). The program before
+/// `link` is not checked, so a renamed or bundled binary
+/// (`…/aterm.app/Contents/MacOS/aterm link serve`) still reads.
 fn is_link_verb(words: &[&str], i: usize, verb: &str) -> bool {
     i >= 1 && words[i] == verb && (words[i - 1] == "link" || basename(words[i - 1]) == "aterm-link")
 }
@@ -856,13 +819,6 @@ pub(crate) fn bridge_config(command: &str) -> Result<Config, String> {
         )
     })?;
     crate::cli::parse(&flags).map(|p| p.cfg)
-}
-
-/// The node id a bridge with this state dir answers as, if one is provisioned.
-fn read_node(state_dir: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(Path::new(state_dir).join("node")).ok()?;
-    let node = raw.trim();
-    (node.starts_with("n-") && crate::subject::is_principal(node)).then(|| node.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -900,7 +856,7 @@ pub fn parse_ps(text: &str) -> Vec<Proc> {
 /// The machine's process table, or empty when `ps` cannot be run (a sandbox) —
 /// every consumer then says "not found" rather than guessing.
 pub(crate) fn process_table() -> Vec<Proc> {
-    Command::new("ps")
+    aterm_uds::spawnfd::command("ps")
         .args(["-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -965,13 +921,7 @@ pub fn parse_launchctl(text: &str, pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn launchd_label(pid: u32) -> Option<String> {
-    let out = Command::new("launchctl")
-        .arg("list")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    parse_launchctl(&String::from_utf8_lossy(&out.stdout), pid)
+    parse_launchctl(&crate::enable::launchctl_list(), pid)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1006,7 +956,7 @@ pub struct BrokerView {
     pub rtt_ms: Option<u64>,
     /// `None` when the report reads the whole fleet (`/f/<F>/>`); `Some(faces)`
     /// when the broker is GUARDED and the cap files do not grant that — the
-    /// sealed cross-host broker (round 16) always is — so every read is made
+    /// sealed cross-host broker always is — so every read is made
     /// over the faces the caps DO grant, and TRAFFIC says so.
     pub faces: Option<Vec<String>>,
     /// The sealed TCP endpoint this host's broker serves BESIDE the socket
@@ -1031,6 +981,17 @@ impl BrokerView {
     #[must_use]
     pub fn read_ok(&self) -> bool {
         self.reachable && self.attached && self.head.is_some()
+    }
+
+    /// Name the pid serving [`Self::endpoint`] in `procs`, and the launchd
+    /// job running it.
+    pub(crate) fn locate(&mut self, procs: &[Proc]) {
+        self.pid = if self.transport == Transport::Unix.name() {
+            broker_pid(procs, &self.endpoint)
+        } else {
+            broker_pid_tcp(procs, &self.endpoint)
+        };
+        self.launchd = self.pid.and_then(launchd_label);
     }
 }
 
@@ -1086,12 +1047,7 @@ pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<
         transport: cfg.transport.name(),
         ..BrokerView::default()
     };
-    view.pid = if matches!(cfg.transport, Transport::Unix) {
-        broker_pid(procs, &cfg.broker)
-    } else {
-        broker_pid_tcp(procs, &cfg.broker)
-    };
-    view.launchd = view.pid.and_then(launchd_label);
+    view.locate(procs);
     let started = Instant::now();
     let mut conn = match connect_bounded(&cfg.transport, &cfg.broker) {
         Ok(c) => c,
@@ -1209,7 +1165,11 @@ fn render_from(src: &str, body_from: Option<&str>) -> String {
 /// as its face with the most conservative label.
 #[must_use]
 pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Traffic {
-    let (body, _) = Body::decode(raw);
+    traffic_of_body(fleet, off, subject, Body::decode(raw).0)
+}
+
+/// [`traffic_of`] over a body already decoded.
+fn traffic_of_body(fleet: &str, off: u64, subject: &str, body: Body) -> Traffic {
     let relayed = body.via.is_some();
     let segs: Vec<&str> = subject.split('/').collect();
     let seg = |i: usize| safe(segs.get(i).copied().unwrap_or("-"), 128);
@@ -1316,15 +1276,28 @@ fn last_records(
     // has to hold `n` records, so a face that is quiet (a node's screen face,
     // say) does not widen its own scan to the ceiling while the busy faces
     // already filled the table — the cost stays one window's worth per face.
+    //
+    // EACH RECORD IS DECODED ONCE. The table is kept across widenings (a window
+    // is widened only while it held fewer than `n`, so it popped nothing and
+    // the wider one re-reads all of it), and a record it already holds — the
+    // one two faces both match, or one read by a narrower window — or one
+    // older than the `n` it holds is skipped before its body is decoded.
+    let mut merged: BTreeMap<u64, Traffic> = BTreeMap::new();
     let mut window: u64 = 256;
     loop {
         let start = head.saturating_sub(window);
-        let mut merged: BTreeMap<u64, Traffic> = BTreeMap::new();
         for filter in &filters {
             let mut next = start;
             loop {
                 let (page, (after, now_head)) = conn.fetch(next, filter, 256)?;
                 for (off, subject, raw) in &page {
+                    let older = merged.len() >= n
+                        && merged
+                            .first_key_value()
+                            .is_none_or(|(first, _)| off < first);
+                    if older || merged.contains_key(off) {
+                        continue;
+                    }
                     merged.insert(*off, traffic_of(fleet, *off, subject, raw));
                     if merged.len() > n {
                         merged.pop_first();
@@ -1383,12 +1356,10 @@ const OVERDUE_SCAN_SPAN: u64 = 1 << 16;
 /// Every overdue ask on the bus, oldest first, over the last
 /// [`OVERDUE_SCAN_SPAN`] offsets.
 ///
-/// FOLDED PAGE BY PAGE. The scan used to collect every raw record in the window
-/// — up to 65,536 of them, BODIES included — before reading any; a report is a
-/// one-shot command, but a window of large bodies made it a memory spike of
-/// the whole window's text. Each page is reduced to the few fields the rule
-/// needs ([`OverdueScan`]) and dropped, so the scan holds one page of bodies at
-/// a time and the rest as offsets and addresses.
+/// FOLDED PAGE BY PAGE: each page is reduced to the few fields the rule needs
+/// ([`OverdueScan`]) and dropped, so the scan holds one page of bodies at a
+/// time — never the whole window's text — and the rest as offsets and
+/// addresses.
 ///
 /// On a guarded broker the `in` faces the caps grant are scanned instead of
 /// `/f/<F>/in/>` — a node's own inbox lanes and its own posts, which are the
@@ -1460,32 +1431,33 @@ pub(crate) fn overdue_of(
 struct OverdueScan {
     settled: BTreeSet<u64>,
     expired: BTreeSet<u64>,
-    asks: Vec<(Traffic, u64, u64)>,
+    asks: Vec<(Traffic, u64)>,
 }
 
 impl OverdueScan {
     fn feed(&mut self, fleet: &str, off: u64, subject: &str, raw: &[u8]) {
-        let t = traffic_of(fleet, off, subject, raw);
         let (body, _) = Body::decode(raw);
+        let (dl, re) = (body.dl, body.re);
+        let t = traffic_of_body(fleet, off, subject, body);
         match t.kind.as_str() {
             k if WORK_KINDS.contains(&k) => {
-                if let Some(dl) = body.dl {
+                if let Some(dl) = dl {
                     // The addresses, never the text: an overdue row names who
                     // asked whom, and only `tail --bodies` prints a body.
                     let t = Traffic {
                         text: String::new(),
                         ..t
                     };
-                    self.asks.push((t, body.t, dl));
+                    self.asks.push((t, dl));
                 }
             }
             "answer" | "report" | "ack" => {
-                if let Some(re) = body.re {
+                if let Some(re) = re {
                     self.settled.insert(re);
                 }
             }
             "expired" => {
-                if let Some(re) = body.re {
+                if let Some(re) = re {
                     self.expired.insert(re);
                 }
             }
@@ -1500,8 +1472,9 @@ impl OverdueScan {
             asks,
         } = self;
         asks.into_iter()
-            .filter(|(t, _, _)| !settled.contains(&t.off))
-            .filter_map(|(t, at, dl)| {
+            .filter(|(t, _)| !settled.contains(&t.off))
+            .filter_map(|(t, dl)| {
+                let at = t.t_ms;
                 let due = at.saturating_add(dl);
                 (at > 0 && now_ms > due).then(|| Overdue {
                     off: t.off,
@@ -1562,10 +1535,8 @@ pub struct LocalSession {
     /// The last recorded hold transition's `(reason, origin)`, when held.
     pub hold_why: Option<(String, String)>,
     /// The BROADCAST TOPICS this session has opted into (`topic ls`), in topic
-    /// order. Empty is the default and means the session receives no broadcast
-    /// at all — which is a fact an operator reading this report wants, because
-    /// "the shout went out and nobody heard it" and "the shout never went out"
-    /// look identical from the sender's side.
+    /// order. Empty (the default) means it receives no broadcast at all — which
+    /// the sender cannot tell from a broadcast that never went out.
     pub topics: Vec<String>,
     /// A ctl read that failed for this session.
     pub error: Option<String>,
@@ -1617,11 +1588,8 @@ pub fn fabric_cell(i: &InstanceView) -> String {
     let state = safe(i.fabric.as_deref().unwrap_or("-"), 32);
     match (i.fabric.as_deref(), &i.reason, i.rtt_ms, i.link_age_ms) {
         (Some("stalled"), Some(reason), _, _) => format!("{state} ({})", safe(reason, 32)),
-        // `stale` CARRIES THE AGE FOR THE SAME REASON `connected` DOES — it is
-        // the same number, and it is the whole evidence for the word. The
-        // endpoint only says `stale` while a post it handed over is still
-        // unanswered, so unlike a large age on `connected` this one is not a
-        // quiet link.
+        // The age is the whole evidence for `stale`; the endpoint says it only
+        // while a handed-over post is unanswered, so it is not a quiet link.
         (Some("stale"), _, _, Some(age_ms)) => {
             format!("{state} (owed, last ack {} ago)", age(age_ms))
         }
@@ -1728,11 +1696,8 @@ fn read_session(ctl: &mut Ctl, sid: &str) -> LocalSession {
                 s.hold_why = last_hold(t.rows());
             }
         }
-        // AN OLDER INSTANCE DOES NOT KNOW THE VERB, and that is not a read
-        // failure: this report is run against whatever is on the machine, and
-        // an `ERR unknown verb` here would mark the whole session `error=` and
-        // hide its inbox numbers. An empty list is what an instance without
-        // broadcast has, which is also what it reports.
+        // An older instance answers `ERR unknown verb`: not a read failure
+        // (it would hide the inbox numbers), just no topics.
         if let Ok(t) = ask(ctl, &format!("@{sid} topic ls")) {
             s.topics = t
                 .rows()
@@ -1765,28 +1730,14 @@ fn read_instance(pid: u32, sock: &str, procs: &[Proc], sessions: bool) -> Option
         .filter(|p| p.ppid == pid && pid != 0 && serve_flags(&p.cmd).is_some())
         .map(|p| p.pid)
         .collect();
-    let token = match aterm_ctl::instance_token(sock) {
-        Ok(t) => t,
+    let mut ctl = match open_instance(pid, sock, IO_TIMEOUT) {
+        Ok(Some(c)) => c,
+        Ok(None) => return None,
         Err(e) => {
-            if !aterm_uds::process::pid_alive(pid) {
-                return None;
-            }
-            v.error = Some(format!("no Owner token: {e}"));
+            v.error = Some(e);
             return Some(v);
         }
     };
-    let mut ctl = match Ctl::connect(sock, &token) {
-        Ok(c) => c,
-        Err(e) => {
-            if e.kind() == io::ErrorKind::ConnectionRefused && !aterm_uds::process::pid_alive(pid) {
-                return None;
-            }
-            v.error = Some(format!("connect: {e}"));
-            return Some(v);
-        }
-    };
-    let _ = ctl.get_ref().set_read_timeout(Some(IO_TIMEOUT));
-    let _ = ctl.get_ref().set_write_timeout(Some(IO_TIMEOUT));
     match ask(&mut ctl, "fabric status") {
         Ok(r) => {
             let h = r.header();
@@ -1805,30 +1756,70 @@ fn read_instance(pid: u32, sock: &str, procs: &[Proc], sessions: bool) -> Option
         }
     }
     if let Some(cfg) = v.command.as_deref().and_then(|c| bridge_config(c).ok()) {
-        v.node = read_node(&cfg.state_dir);
+        v.node = crate::enable::read_node(Path::new(&cfg.state_dir));
         v.state_dir = Some(cfg.state_dir);
     }
     if !sessions {
         return Some(v);
     }
     let rows = match ask(&mut ctl, "sessions") {
-        Ok(r) => r.rows().to_vec(),
+        Ok(r) => r,
         Err(e) => {
             v.error = Some(e);
             return Some(v);
         }
     };
-    for row in &rows {
-        let Some(sid) = row
-            .split(' ')
-            .nth(1)
-            .filter(|s| crate::subject::is_principal(s))
-        else {
-            continue;
-        };
+    for sid in session_ids(rows.rows()) {
         v.sessions.push(read_session(&mut ctl, sid));
     }
     Some(v)
+}
+
+/// One instance's control socket, opened with its Owner token and bounded by
+/// [`IO_TIMEOUT`]. `Ok(None)` for a STALE socket — nothing accepts on it and
+/// the pid it names is gone — which is a leftover file, not an instance.
+///
+/// # Errors
+///
+/// A live instance whose token cannot be read or whose socket refused.
+pub(crate) fn open_instance(
+    pid: u32,
+    sock: &str,
+    timeout: Duration,
+) -> Result<Option<Ctl>, String> {
+    // The token is read once the connect succeeded, so it is the listener's
+    // that took it — never one an update's successor at this socket refuses.
+    let (stream, token) = match aterm_ctl::connect_then_read_token(sock) {
+        Ok(connected) => connected,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) && !aterm_uds::process::pid_alive(pid) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("connect: {e}")),
+    };
+    let token = match token {
+        Ok(t) => t,
+        Err(_) if !aterm_uds::process::pid_alive(pid) => return Ok(None),
+        Err(e) => return Err(format!("no Owner token: {e}")),
+    };
+    let ctl = Ctl::authenticate(stream, &token).map_err(|e| format!("connect: {e}"))?;
+    let _ = ctl.get_ref().set_read_timeout(Some(timeout));
+    let _ = ctl.get_ref().set_write_timeout(Some(timeout));
+    Ok(Some(ctl))
+}
+
+/// The session ids in a `sessions` reply's rows (`local <sid> …`), in the
+/// instance's order.
+pub(crate) fn session_ids(rows: &[String]) -> impl Iterator<Item = &str> {
+    rows.iter().filter_map(|row| {
+        row.split(' ')
+            .nth(1)
+            .filter(|s| crate::subject::is_principal(s))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1900,7 +1891,7 @@ pub struct Report {
     /// `[fabric] presence` in the config file, else `meta`.
     pub presence: crate::presence::Mode,
     /// Whether the bridge publishes receipts (R8): `--receipts`/`--no-receipts`
-    /// on the command, else `[fabric] receipts` in the config file, else off.
+    /// on the command, else `[fabric] receipts` in the config file, else on.
     pub receipts: bool,
     /// The node id in the command's state dir.
     pub node: Option<String>,
@@ -2021,7 +2012,7 @@ pub fn gather() -> Result<Report, Off> {
     } else {
         receipts_from_config()
     };
-    let node = read_node(&cfg.state_dir);
+    let node = crate::enable::read_node(Path::new(&cfg.state_dir));
     let caps = cfg
         .cap_files
         .iter()
@@ -2116,10 +2107,7 @@ pub fn gather() -> Result<Report, Off> {
 
 /// Whether `program` lies in a cargo target directory, whose root cargo marks
 /// with `CACHEDIR.TAG`: a development build, which the next build there
-/// replaces and a `targo clean` removes. On 2026-09-29 the owner's Mac ran its
-/// bridge and its launchd broker from a checkout's `target/debug/aterm`, which
-/// an `aterm fabric on` made from that build on 2026-09-10 had recorded, and
-/// nothing in this report said so.
+/// replaces and a `targo clean` removes.
 fn in_cargo_target_dir(program: &Path) -> bool {
     program.is_absolute()
         && program
@@ -2148,7 +2136,6 @@ fn fleet_halts(conn: &mut Conn, fleet: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Join the bus roster with the local instances, by sid.
 /// How long a retired session row is still shown as `gone` before it becomes
 /// one of the `exited` count.
 ///
@@ -2158,6 +2145,7 @@ fn fleet_halts(conn: &mut Conn, fleet: &str) -> Vec<(String, String)> {
 /// instance die to see what became of its sessions.
 const GONE_SHOW_MS: u64 = 60 * 60 * 1000;
 
+/// Join the bus roster with the local instances, by sid.
 fn join_sessions(report: &mut Report, roster: Option<&crate::glance::Glance>) {
     let mut bus: BTreeMap<String, Vec<&crate::glance::Row>> = BTreeMap::new();
     if let Some(g) = roster {
@@ -2194,18 +2182,13 @@ fn join_sessions(report: &mut Report, roster: Option<&crate::glance::Glance>) {
                     .unwrap_or_else(|| "-".to_string()),
                 bus: row.map_or_else(|| "-".to_string(), |r| r.field("state").to_string()),
                 local: Some(s.clone()),
-                bus_hold: row.map(|r| r.field("hold").to_string()),
-                bus_role: row.and_then(|r| bus_field(r, "role")),
-                bus_title: row.and_then(|r| bus_field(r, "title")),
-                detail: row.and_then(|r| bus_field(r, "detail")),
-                phase: row.and_then(|r| bus_field(r, "phase")),
-                context: row.and_then(|r| bus_field(r, "context")),
+                ..bus_fields(row.copied())
             });
         }
     }
-    // WHOSE NODES THESE ARE. A retired row under THIS machine's node is the
-    // answer to a warning this report used to repeat forever, so it is shown;
-    // one under a remote node is somebody else's history and stays a number.
+    // A retired row under THIS machine's node answers a ghost warning, so it
+    // is shown; one under a remote node is somebody else's history and stays
+    // a number.
     let local_nodes: BTreeSet<String> = report
         .instances
         .iter()
@@ -2218,18 +2201,11 @@ fn join_sessions(report: &mut Report, roster: Option<&crate::glance::Glance>) {
             continue;
         }
         for row in rows {
-            if row.field("state") != "live" {
-                // A GHOST THAT WAS RETIRED IS SHOWN AS `gone`, ONCE IT IS
-                // OVER AND WHILE IT IS STILL NEWS.
-                //
-                // The bridge's own token on a session face is `exited`
-                // (`bridge.rs`'s `publish_session_presence`); `gone` is what
-                // this table prints, because it is the word the fleet already
-                // uses for "this is over" on the node face and the reader's
-                // question is reachability, not vocabulary. Bounded by the
-                // row's own `t=`: presence is retained per subject forever, so
-                // one row per session ever run on this machine would be the
-                // whole history, not a report.
+            let live = row.field("state") == "live";
+            if !live {
+                // A retired row is shown as `gone` (the node face's word for
+                // "over"; the bridge publishes `exited`) while its own `t=` is
+                // within GONE_SHOW_MS — presence is retained forever.
                 let recent = row
                     .field("t")
                     .parse::<u64>()
@@ -2239,35 +2215,28 @@ fn join_sessions(report: &mut Report, roster: Option<&crate::glance::Glance>) {
                     report.exited += 1;
                     continue;
                 }
-                report.sessions.push(SessionRow {
-                    sid: sid.clone(),
-                    pid: None,
-                    node: row.node.clone(),
-                    bus: "gone".to_string(),
-                    local: None,
-                    bus_hold: Some(row.field("hold").to_string()),
-                    bus_role: bus_field(row, "role"),
-                    bus_title: bus_field(row, "title"),
-                    detail: bus_field(row, "detail"),
-                    phase: bus_field(row, "phase"),
-                    context: bus_field(row, "context"),
-                });
-                continue;
             }
             report.sessions.push(SessionRow {
                 sid: sid.clone(),
-                pid: None,
                 node: row.node.clone(),
-                bus: "live".to_string(),
-                local: None,
-                bus_hold: Some(row.field("hold").to_string()),
-                bus_role: bus_field(row, "role"),
-                bus_title: bus_field(row, "title"),
-                detail: bus_field(row, "detail"),
-                phase: bus_field(row, "phase"),
-                context: bus_field(row, "context"),
+                bus: if live { "live" } else { "gone" }.to_string(),
+                ..bus_fields(Some(*row))
             });
         }
+    }
+}
+
+/// A SESSIONS row's presence-row columns — `hold=`, `role=`, `title=`,
+/// `detail=`, `phase=`, `context=` — from `row`, every other field unset.
+fn bus_fields(row: Option<&crate::glance::Row>) -> SessionRow {
+    SessionRow {
+        bus_hold: row.map(|r| r.field("hold").to_string()),
+        bus_role: row.and_then(|r| bus_field(r, "role")),
+        bus_title: row.and_then(|r| bus_field(r, "title")),
+        detail: row.and_then(|r| bus_field(r, "detail")),
+        phase: row.and_then(|r| bus_field(r, "phase")),
+        context: row.and_then(|r| bus_field(r, "context")),
+        ..SessionRow::default()
     }
 }
 
@@ -2377,21 +2346,15 @@ fn warnings(
                 safe(inst.fabric.as_deref().unwrap_or("-"), 32)
             )),
             (Some("disconnected"), _) => w.push(format!(
-                "instance {pid}'s bridge is down (fabric=disconnected): the sessions it \
-                 governed are held until a relaunched bridge attaches and lifts the hold"
+                "instance {pid}'s bridge is down (fabric=disconnected): its sessions get no \
+                 mail and their posts queue; aterm relaunches the bridge"
             )),
-            // THE BRIDGE IS UP AND ITS LINK IS NOT (round 13). The bridge dials
-            // again with back-off (100 ms to 5 s) and says nothing in between,
-            // so this is the state a killed broker, a wrong socket path or a
-            // wedged broker leaves an instance in — and every post from it
-            // queues while no mail arrives.
-            // ATTACHED AND SILENT ABOUT ITS LINK: `reason=starting` is the
-            // token between the attach and the bridge's first report. A
-            // round-13 bridge reports within its dial; a bridge from before
-            // the link report (0.85 and earlier) never does, and its
-            // instance reads `connected` at the first record it delivers —
-            // its mail moves (measured 2026-09-14: the note landed at off=3
-            // under `stalled (starting)`), so this is not "no mail arrives".
+            // THE BRIDGE IS UP AND ITS LINK IS NOT: it redials with back-off
+            // (100 ms to 5 s) and says nothing in between — a killed, wedged or
+            // misnamed broker. `reason=starting` is the token between the
+            // attach and the bridge's first link report; a bridge that predates
+            // the link report never sends one yet its mail moves, so that case
+            // is not "no mail arrives".
             (Some("stalled"), _) if inst.reason.as_deref() == Some("starting") => {
                 w.push(format!(
                     "instance {pid}'s bridge is attached and has not reported its broker link \
@@ -2402,24 +2365,18 @@ fn warnings(
             (Some("stalled"), _) => w.push(format!(
                 "instance {pid}'s bridge is attached but its broker link is down \
                  (fabric=stalled reason={}, last ack {}): its posts queue and no mail \
-                 arrives until the link is back — the bridge redials with back-off, so \
-                 check the broker at {broker}",
+                 arrives from the broker at {broker}",
                 safe(inst.reason.as_deref().unwrap_or("-"), 32),
                 inst.link_age_ms
                     .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
             )),
-            // OWED AND SILENT. The endpoint handed this bridge a post and has
-            // had nothing back since — not an ack, not a landing, not a link
-            // report. A bridge whose BROKER died says `link down reason=no-ack`
-            // within its own 5 s deadline and reads `stalled`; one that closed
-            // its fds reads `disconnected`. This is the third case and the one
-            // neither of those can see: the helper process itself is wedged,
-            // holding both lanes open and answering nothing.
+            // OWED AND SILENT: the helper itself is wedged, holding both lanes
+            // open and answering nothing (a dead broker reads `stalled`, a dead
+            // helper `disconnected`).
             (Some("stale"), _) => w.push(format!(
                 "instance {pid}'s bridge has not answered for the work it was given \
                  (fabric=stale, last ack {}): its posts queue and `post --wait` from its \
-                 sessions fails fast rather than waiting — the bridge process is attached \
-                 but not moving mail, so kill the bridge pid and let the instance relaunch it",
+                 sessions fails fast",
                 inst.link_age_ms
                     .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
             )),
@@ -2468,13 +2425,11 @@ fn warnings(
                 r.source.describe()
             ));
         }
-        // What the FLEET'S OWN DIRECTORY says about this instance's node. A
-        // bridge that says `fabric=connected` while the bus retains
-        // `state=gone fabric=disconnected` for its node is invisible to every
-        // peer: they read the roster, not this machine. Measured on this
-        // machine 2026-09-14 — a second bridge sharing the state dir exited and
-        // its will fired `state=gone` for the node id both were using, and the
-        // surviving bridge never republishes presence unprompted.
+        // What the FLEET'S OWN DIRECTORY says about this instance's node: a
+        // `connected` bridge whose node the bus retains as `state=gone` is
+        // invisible to every peer (e.g. a second bridge on the same state dir
+        // exited and its will fired; the survivor never republishes presence
+        // unprompted).
         if inst.fabric.as_deref() == Some("connected") {
             if let Some(row) = inst
                 .node
@@ -2583,14 +2538,9 @@ fn warnings(
     let answered = every_instance_answered(r);
     let local_nodes = local_nodes(&r.instances, r.node.as_deref());
     if answered {
-        // ON THE `bus` COLUMN, NOT ON `pid` ALONE. A row with no local host used
-        // to mean exactly one thing — the bus advertises it LIVE and nobody
-        // serves it — because a row whose `state=` was anything else was counted
-        // into `exited` and never listed. Round 21 started LISTING a retired one
-        // as `gone` (see [`join_sessions`]), so `pid.is_none()` now also matches
-        // every session that ended normally in the last hour, and this warning
-        // fired for all of them: the sentence says "advertises @<sid> live",
-        // which for a `gone` row is simply false.
+        // ON THE `bus` COLUMN, NOT ON `pid` ALONE: a row with no local host
+        // may be a recently retired one listed as `gone` ([`join_sessions`]),
+        // which the bus does not advertise live.
         for s in ghost_rows(&r.sessions, &local_nodes) {
             w.push(format!(
                 "the bus advertises @{} live on {} — this machine's node — but no \
@@ -2619,7 +2569,7 @@ fn warnings(
 fn local_offset() -> Option<i64> {
     static OFFSET: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
     *OFFSET.get_or_init(|| {
-        let out = Command::new("date")
+        let out = aterm_uds::spawnfd::command("date")
             .arg("+%z")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -2765,6 +2715,42 @@ pub fn node_where(r: &Report, node: &str) -> &'static str {
     }
 }
 
+/// Attach every cap in `cfg`'s cap files to `conn`.
+///
+/// # Errors
+///
+/// A cap file that cannot be read, or a cap the broker refused.
+pub(crate) fn attach_caps(conn: &mut Conn, cfg: &Config) -> io::Result<()> {
+    for path in &cfg.cap_files {
+        for cap in read_cap_file(path)? {
+            conn.attach(&cap.grant, &cap.tag)?;
+        }
+    }
+    Ok(())
+}
+
+/// The report's node, and a broker connection with its caps attached: what a
+/// doctor action on this node's presence rows starts from.
+fn node_conn(report: &Report) -> io::Result<(&str, Conn)> {
+    let node = report_node(report)?;
+    Ok((node, connect_attached(&report.cfg)?))
+}
+
+/// The node id the state dir recorded.
+fn report_node(report: &Report) -> io::Result<&str> {
+    report
+        .node
+        .as_deref()
+        .ok_or_else(|| io::Error::other("this state dir has no node id"))
+}
+
+/// A broker connection with this node's caps attached.
+fn connect_attached(cfg: &Config) -> io::Result<Conn> {
+    let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
+    attach_caps(&mut conn, cfg)?;
+    Ok(conn)
+}
+
 /// Publish `state=exited` for each `(sid, node)`, by REWRITING the row that is
 /// already there.
 ///
@@ -2783,17 +2769,11 @@ pub fn node_where(r: &Report, node: &str) -> &'static str {
 /// The broker, the caps, the state dir, or a row that is no longer on the bus.
 pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Result<usize> {
     let cfg = &report.cfg;
-    let node = report
-        .node
-        .as_deref()
-        .ok_or_else(|| io::Error::other("this state dir has no node id"))?;
+    // The state dir before the broker: a retirement reserves its sequences
+    // there, so a state dir that cannot open never costs a connection.
+    let node = report_node(report)?;
     let state = crate::state::StateDir::open(&cfg.state_dir)?;
-    let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
-    for path in &cfg.cap_files {
-        for cap in read_cap_file(path)? {
-            conn.attach(&cap.grant, &cap.tag)?;
-        }
-    }
+    let mut conn = connect_attached(cfg)?;
     // The rows as they stand, so the retirement carries their own fields.
     let mut live: BTreeMap<String, String> = BTreeMap::new();
     let filter = format!("/f/{}/pub/{}/*/presence", cfg.fleet, node);
@@ -2815,11 +2795,9 @@ pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Resul
         seq += 1;
         state.reserve_sequence(seq)?;
         let (off, deduped) = conn.publish(producer_id, seq, &subject, rewritten.as_bytes())?;
-        // A DEDUPED PUBLISH IS A FAILURE HERE. The broker answers a re-sent
-        // `(producer_id, seq)` with the original offset and appends nothing, so
-        // the row would still read `live` while this reported success — the
-        // exact silent no-op the running-bridge refusal exists to prevent, and
-        // it must not pass quietly if some other writer got there anyway.
+        // A DEDUPED PUBLISH IS A FAILURE: the broker answers a re-sent
+        // `(producer_id, seq)` with the original offset and appends nothing,
+        // so the row would still read `live` while this reported success.
         if deduped {
             return Err(io::Error::other(format!(
                 "the broker deduped the retirement of @{sid} at @{off}: this node's \
@@ -2862,16 +2840,7 @@ pub fn retire_progress(
     since: Option<u64>,
 ) -> io::Result<RetireProgress> {
     let cfg = &report.cfg;
-    let node = report
-        .node
-        .as_deref()
-        .ok_or_else(|| io::Error::other("this state dir has no node id"))?;
-    let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
-    for path in &cfg.cap_files {
-        for cap in read_cap_file(path)? {
-            conn.attach(&cap.grant, &cap.tag)?;
-        }
-    }
+    let (node, mut conn) = node_conn(report)?;
     let mut out = BTreeMap::new();
     let filter = format!("/f/{}/pub/{}/*/presence", cfg.fleet, node);
     transport::walk_last(&mut conn, &filter, |(_, subject, raw)| {
@@ -2996,12 +2965,11 @@ pub(crate) fn unanswered(r: &Report) -> Vec<String> {
 /// THE GHOSTS: presence rows this machine's node advertises LIVE that no local
 /// instance hosts.
 ///
-/// ONE DEFINITION, because two things act on it — the `status` warning that
-/// names them and `aterm fabric doctor --retire-ghosts` that retires them — and
-/// a doctor that retired a row the warning did not name (or the reverse) would
-/// be the worst kind of repair tool. `bus == "live"` is load-bearing: round 21
-/// started LISTING a retired row as `gone`, and a predicate on `pid.is_none()`
-/// alone would sweep up every session that ended normally in the last hour.
+/// ONE DEFINITION, because the `status` warning names them and `aterm fabric
+/// doctor --retire-ghosts` retires them, and the two must agree. `bus ==
+/// "live"` is load-bearing: a retired row is listed as `gone`, and
+/// `pid.is_none()` alone would sweep up every session that ended normally in
+/// the last hour.
 pub(crate) fn ghost_rows<'r>(
     sessions: &'r [SessionRow],
     local: &BTreeSet<&str>,
@@ -3020,32 +2988,14 @@ pub(crate) fn node_hosted() -> Result<BTreeMap<String, u32>, String> {
     let listed = aterm_ctl::local_instances().map_err(|e| e.reason)?;
     let mut hosted = BTreeMap::new();
     for (pid, sock) in listed {
-        let token = match aterm_ctl::instance_token(&sock) {
-            Ok(t) => t,
-            Err(_) if !aterm_uds::process::pid_alive(pid) => continue,
-            Err(e) => return Err(format!("instance {pid}: no Owner token: {e}")),
+        let Some(mut ctl) =
+            open_instance(pid, &sock, IO_TIMEOUT).map_err(|e| format!("instance {pid}: {e}"))?
+        else {
+            continue;
         };
-        let mut ctl = match Ctl::connect(&sock, &token) {
-            Ok(c) => c,
-            Err(e)
-                if e.kind() == io::ErrorKind::ConnectionRefused
-                    && !aterm_uds::process::pid_alive(pid) =>
-            {
-                continue;
-            }
-            Err(e) => return Err(format!("instance {pid}: connect: {e}")),
-        };
-        let _ = ctl.get_ref().set_read_timeout(Some(IO_TIMEOUT));
-        let _ = ctl.get_ref().set_write_timeout(Some(IO_TIMEOUT));
         let reply = ask(&mut ctl, "sessions").map_err(|e| format!("instance {pid}: {e}"))?;
-        for row in reply.rows() {
-            if let Some(sid) = row
-                .split(' ')
-                .nth(1)
-                .filter(|s| crate::subject::is_principal(s))
-            {
-                hosted.insert(sid.to_string(), pid);
-            }
+        for sid in session_ids(reply.rows()) {
+            hosted.insert(sid.to_string(), pid);
         }
     }
     Ok(hosted)
@@ -3094,7 +3044,7 @@ pub fn live_sessions_on(r: &Report, node: &str) -> usize {
         .count()
 }
 
-/// The NODES section (round 16): every node on the bus's presence roster —
+/// The NODES section: every node on the bus's presence roster —
 /// its `host=`, `state=` and `fabric=` as the node itself published them, and
 /// how many live sessions it advertises — `this` node first. A second host
 /// joined over the sealed wire is a `remote` row here, and its sessions are in
@@ -3176,10 +3126,9 @@ pub fn render_text(r: &Report) -> String {
             "program",
             if r.program_in_target_dir {
                 format!(
-                    "{program} — a DEVELOPMENT build in a cargo target dir: the bridge, and a \
-                     broker enabled from it, run whatever is built there next and nothing after \
-                     a `targo clean`; `aterm fabric on` run from the installed aterm records \
-                     that one instead"
+                    "{program} — a DEVELOPMENT build in a cargo target dir: the next build \
+                     replaces it, `targo clean` removes it; run `aterm fabric on` from the \
+                     installed aterm"
                 )
             } else {
                 program
@@ -3429,10 +3378,7 @@ pub fn render_text(r: &Report) -> String {
             num(l.and_then(|l| l.dropped)),
             num(l.and_then(|l| l.seen)),
             num(l.and_then(|l| l.posts)),
-            // THE BROADCAST OPT-INS. `-` is "this session hears no broadcast",
-            // which is the default and the answer an operator needs when a
-            // shout reached nobody: the topic set is the only thing that
-            // decides, and it is invisible everywhere else in this report.
+            // THE BROADCAST OPT-INS: `-` (the default) hears no broadcast.
             l.filter(|l| !l.topics.is_empty())
                 .map_or_else(|| "-".to_string(), |l| safe(&l.topics.join(","), 48)),
             safe(session_role(s), 48),
@@ -3507,7 +3453,7 @@ pub fn render_text(r: &Report) -> String {
     }
 
     if r.warnings.is_empty() {
-        out.push_str("\nWARNINGS  none — the broker answers, every bridge is supervised and connected, and no mail is dropped, held or waiting\n");
+        out.push_str("\nWARNINGS  none\n");
     } else {
         out.push_str(&format!(
             "\nWARNINGS  {} — fixes: `aterm fabric doctor`\n",
@@ -3867,9 +3813,7 @@ fn status_main(json: bool) -> ExitCode {
 /// One `tail` line. The widths are fixed, because a live tail cannot know the
 /// widest row to come; the principals are last so a long one only pushes
 /// what follows it. With `--bodies` the text comes LAST, after the trust label
-/// — what a record IS must reach the reader before what it says. (`tui.rs`
-/// ordered its transcript the same way and for the same reason, until round 21
-/// deleted the module; `aterm-gui`'s presence band still does.)
+/// — what a record IS must reach the reader before what it says.
 #[must_use]
 pub fn tail_line(t: &Traffic, now_ms: u64, offset: i64, bodies: bool) -> String {
     let c = traffic_cells(t, now_ms, offset);
@@ -3963,23 +3907,13 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io
     let broker = safe(&cfg.broker, 256);
     let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)
         .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
-    for path in &cfg.cap_files {
-        for cap in read_cap_file(path)? {
-            conn.attach(&cap.grant, &cap.tag)?;
-        }
-    }
+    attach_caps(&mut conn, cfg)?;
     let whole = match want {
-        // A FILTER NARROWS THE SUBSCRIPTION, it does not widen the CAPS.
-        //
-        // What it must not do is leave the fleet: this command reads one
-        // fleet's bus, its config names which, and a filter pointing at another
-        // one would print records under a heading that says otherwise. What it
-        // may freely do is name a subtree the caps do not cover — the broker
-        // refuses that, which is the broker's job and its answer is the honest
-        // one. The guarded-broker fallback below is NOT taken for a narrowed
-        // tail: a refusal there means the filter is outside the grant, and
-        // silently following the granted faces instead would answer a different
-        // question than the one asked.
+        // A FILTER NARROWS THE SUBSCRIPTION, it does not widen the CAPS. It
+        // must stay in the configured fleet (the heading names it); a subtree
+        // the caps do not cover is the broker's to refuse, and the
+        // guarded-broker fallback below is NOT taken for a narrowed tail —
+        // following the granted faces instead would answer another question.
         Some(f) => {
             let root = fleet_root(&cfg.fleet);
             let prefix = root.trim_end_matches('>');
@@ -4082,11 +4016,7 @@ fn tail_faces(
     let (tx, rx) = mpsc::channel::<io::Result<(u64, String, Vec<u8>)>>();
     for face in faces {
         let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
-        for path in &cfg.cap_files {
-            for cap in read_cap_file(path)? {
-                conn.attach(&cap.grant, &cap.tag)?;
-            }
-        }
+        attach_caps(&mut conn, cfg)?;
         let mut sub = conn.subscribe(start, face)?;
         let tx = tx.clone();
         std::thread::spawn(move || loop {
@@ -4134,11 +4064,8 @@ fn tail_faces(
 
 #[cfg(test)]
 mod tests {
-    /// **THE GHOSTS ARE EXACTLY THE LIVE-BUT-UNHOSTED ROWS ON OUR OWN NODE.**
-    /// A `gone` row is not one (round 21 started listing those, and a predicate
-    /// on `pid.is_none()` alone would sweep up every session that ended in the
-    /// last hour); a row on a REMOTE node is not one (we cannot speak for it);
-    /// and a row a local instance hosts is not one.
+    use super::*;
+
     /// The door is per-instance and the ghost list per-node: a sid a SIBLING
     /// instance hosts is refused with that instance's pid, and a node that
     /// could not be asked refuses everything.
@@ -4163,6 +4090,9 @@ mod tests {
         );
     }
 
+    /// **THE GHOSTS ARE EXACTLY THE LIVE-BUT-UNHOSTED ROWS ON OUR OWN NODE**:
+    /// not a `gone` row, not a row on a REMOTE node (we cannot speak for it),
+    /// not a row a local instance hosts.
     #[test]
     fn ghost_rows_are_live_unhosted_and_ours() {
         let row = |sid: &str, pid: Option<u32>, node: &str, bus: &str| SessionRow {
@@ -4212,7 +4142,6 @@ mod tests {
             "{bare}"
         );
     }
-    use super::*;
 
     fn argv(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_string).collect()
@@ -4326,7 +4255,7 @@ mod tests {
             })),
             "parsed here; `on` itself refuses them in a default build, naming the feature"
         );
-        // ROUND 16: `mint-for` and `join`, each with its own flags only.
+        // `mint-for` and `join`, each with its own flags only.
         use crate::join::{JoinOpts, MintForOpts};
         assert_eq!(
             parse_args(&argv("mint-for n-m7 --out /tmp/m7.cap")),
@@ -4391,10 +4320,7 @@ mod tests {
         // The flags are the DOCTOR's, not every verb's.
         assert!(parse_args(&argv("status --retire-ghosts")).is_err());
         assert!(parse_args(&argv("tail --yes")).is_err());
-        // AND `--yes` ANSWERS A QUESTION ONLY `--retire-ghosts` ASKS. Parsed
-        // silently it read as "yes to whatever doctor does", which is nothing:
-        // an operator who meant to retire would read a clean report and
-        // believe it had run.
+        // `--yes` answers a question only `--retire-ghosts` asks.
         assert!(
             parse_args(&argv("doctor --yes")).is_err(),
             "--yes alone must be a usage error, not a silent no-op"
@@ -4480,15 +4406,9 @@ mod tests {
         }
     }
 
-    /// **THE TOPICS COLUMN IS WHY A BROADCAST REACHED NOBODY.**
-    ///
-    /// A `post to=say:<t>` that lands on the bus and is delivered to nobody
-    /// looks, from the sender's side, exactly like one that was never sent: the
-    /// `post` answers `OK`, the record is on the log, and no inbox grew. The
-    /// receiver-side opt-in is the only thing that decides, and this column is
-    /// the only place in the report that shows it. `-` is a session that hears
-    /// no broadcast at all, which is the default and is the answer an operator
-    /// is looking for most of the time.
+    /// **THE TOPICS COLUMN IS WHY A BROADCAST REACHED NOBODY**: the
+    /// receiver-side opt-in alone decides delivery, and `-` (the default)
+    /// hears none.
     #[test]
     fn sessions_show_the_broadcast_topics_and_a_dash_for_none() {
         let mut r = healthy();
@@ -4614,7 +4534,6 @@ mod tests {
         assert!(json.contains("\"title\":\"bus title\""), "{json}");
     }
 
-    /// The `ATERM_FABRIC_COMMAND` seam WINS over the file, as it does for the app
     /// THE PROGRAM ROW names the bridge's binary, and says DEVELOPMENT BUILD only
     /// for one under a directory cargo tagged (`CACHEDIR.TAG`) — never for an
     /// untagged tree, a bare name, or a relative path.
@@ -4646,8 +4565,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (a development build's; a shipped one never passes it); a blank one is
-    /// absent; a missing file is "off", not an error.
+    /// The `ATERM_FABRIC_COMMAND` seam WINS over the file, as it does for the
+    /// app (a development build's; a shipped one never passes it); a blank one
+    /// is absent; a missing file is "off", not an error.
     #[test]
     fn the_env_overrides_the_file_and_a_missing_file_is_off() {
         let dir = std::env::temp_dir().join(format!("atfab-cfg-{}", std::process::id()));
@@ -4682,9 +4602,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// BOTH SPELLINGS OF THE BRIDGE: `aterm link serve` (what
-    /// tools/fabric-enable.sh writes) and `aterm-link serve` (the argv0 alias
-    /// every harness writes) — with any program path in front.
+    /// BOTH SPELLINGS OF THE BRIDGE: `aterm link serve` (what `aterm fabric on`
+    /// writes; tools/fabric-enable.sh is a shim onto it) and `aterm-link serve`
+    /// (the argv0 alias every harness writes) — with any program path in front.
     #[test]
     fn both_spellings_of_the_bridge_command_parse_with_the_bridges_own_parser() {
         let tail = "--fleet lab --broker /tmp/b.sock --cap-file /c --state /s --accept-from n-1";
@@ -4860,7 +4780,7 @@ mod tests {
         assert_eq!(n.from, "n-a");
         // A BROADCAST: eight segments, `to=` is the face a reader subscribes
         // to, and the kind comes out of the body — so a `task` shout is not a
-        // note. (The old arm expected seven segments and never matched.)
+        // note.
         let s = traffic_of(
             "lab",
             150,
@@ -4885,9 +4805,8 @@ mod tests {
             ),
             ("h-andrew", "fleet", "halt", "human")
         );
-        // The seven-segment `/pub/<owner>/say/<kind>` this used to pin was a
-        // shape nothing ever published; it renders through the generic `pub`
-        // arm like any other unknown leaf.
+        // A seven-segment `/pub/<owner>/say/<kind>` renders through the
+        // generic `pub` arm like any other unknown leaf.
         let odd = traffic_of("lab", 9, "/f/lab/pub/h-andrew/say/note", b"v=1 t=2");
         assert_eq!((odd.to.as_str(), odd.kind.as_str()), ("-", "note"));
         let key = traffic_of("lab", 10, "/f/lab/term/n-a/s-w/in/h-andrew", b"v=1");
@@ -4993,13 +4912,12 @@ mod tests {
         warnings(r, &BTreeMap::new(), &[])
     }
 
-    /// **ROUND 16: NODES LISTS EVERY NODE AND SAYS WHICH ONE THIS IS.** A
+    /// **NODES LISTS EVERY NODE AND SAYS WHICH ONE THIS IS.** A
     /// second host joined over the sealed wire is a `remote` row with its own
     /// `host=`, `state=` and `fabric=` and its live-session count; this node
     /// is `this` and first; another instance of this machine is `local`; and
     /// this node with NO row on the bus is a row saying so. BRIDGES keeps to
-    /// this machine's instances — the remote node is not a row there any more
-    /// — and SESSIONS names every row's node.
+    /// this machine's instances, and SESSIONS names every row's node.
     #[test]
     fn nodes_lists_every_node_and_marks_this_one() {
         let mut r = healthy();
@@ -5141,23 +5059,10 @@ mod tests {
 
     /// **A BROKER THAT ANSWERS AND REFUSES THE READ IS NOT `reachable yes`.**
     ///
-    /// MEASURED 2026-09-14 against a broker that answers `Hello` and `Attach`
-    /// and errors the `Fetch` — what `Broker::open_guarded` does when the cap
-    /// file's grants do not cover `/f/<fleet>/>` (a `--fleet` typo), and what a
-    /// broker that dies between the attach and the head query does too. Before
-    /// the fix the report said:
-    ///
-    /// ```text
-    ///   reachable  yes — connect, hello, attach and head query answered in 0 ms
-    ///   bus head   -
-    /// TRAFFIC ... (the bus could not be read)
-    /// WARNINGS  none — the broker answers, ...          exit=0
-    /// ```
-    ///
-    /// `probe_broker` sets `attached = true` BEFORE the head query, so neither
-    /// `!reachable` nor `!attached` fired; the roster, the traffic and the
-    /// standing fleet halts were skipped in silence and `broker.error` — which
-    /// `--json` carried all along — was printed NOWHERE in the text.
+    /// A broker that answers `Hello` and `Attach` and errors the `Fetch` (a cap
+    /// file whose grants do not cover `/f/<fleet>/>`, or a broker that dies
+    /// between the attach and the head query) leaves `attached = true` and
+    /// `head = None`: a warning, exit 1, and the broker's error in the text.
     #[test]
     fn a_head_query_that_failed_is_not_a_broker_that_answered() {
         let mut r = healthy();
@@ -5187,14 +5092,8 @@ mod tests {
 
     /// **A NODE THE BUS SAYS IS `gone` IS `connected` BEING A LIE.**
     ///
-    /// MEASURED 2026-09-14 on this machine's live fleet: instance 66439 said
-    /// `fabric=connected`, its bridge (pid 48224) had run since 09:39, the
-    /// broker answered — and the roster `aterm link ls` prints said
-    /// `n-1b631315bf5cae35 - node state=gone ... fabric=disconnected`. The
-    /// report put both on one BRIDGES row (`ON THE BUS  state=gone
-    /// fabric=disconnected`) and warned about neither: every peer reading the
-    /// fleet's own directory saw this node as dead. (`warnings` never read
-    /// `report.nodes` at all.)
+    /// Every peer reading the fleet's own directory sees that node as dead,
+    /// whatever its instance says.
     #[test]
     fn a_node_the_bus_calls_gone_is_a_warning_while_its_instance_says_connected() {
         let mut r = healthy();
@@ -5257,7 +5156,7 @@ mod tests {
              broker at /tmp/b.sock does not answer this report's own probe",
         );
 
-        // A bridge whose broker link is DOWN (round 13): its reason and the
+        // A bridge whose broker link is DOWN: its reason and the
         // age of its last ack are in the warning, and `never` when there was
         // none.
         let mut r = healthy();
@@ -5506,12 +5405,9 @@ mod tests {
 
         // A LIVE presence row for this machine's node that no instance hosts.
         let mut r = healthy();
-        // `s-gone` CARRIES A FRESH `t=` ON PURPOSE. The listing is bounded by
-        // [`GONE_SHOW_MS`], so a row stamped `t=1` is an hour past it, is
-        // counted into `exited` and never reaches the warning filter at all —
-        // which would make the assertion below pass whether that filter checks
-        // the bus state or not. A retired row is only interesting to this test
-        // while it is still shown.
+        // `s-gone` CARRIES A FRESH `t=` ON PURPOSE: a row past [`GONE_SHOW_MS`]
+        // is only counted, never reaches the warning filter, and would make
+        // the assertion below vacuous.
         let fresh_gone = format!("v=1 t={} state=exited hold=0", crate::now_ms());
         let rows: [(&str, &[u8]); 5] = [
             (
@@ -5567,11 +5463,7 @@ mod tests {
                 .any(|l| l.contains("the bus advertises @s-ghost live on n-a")),
             "{w:#?}"
         );
-        // AND THE RETIRED ROW EARNS NO WARNING, which is the whole of the fix.
-        // Listing a `gone` row gave it `pid: None`, and the warning selected on
-        // that alone — so every session that ended normally in the last hour was
-        // reported as "advertised live and undeliverable", which is false twice
-        // over: nothing advertises it, and its `state=` says `exited`.
+        // AND THE RETIRED ROW EARNS NO WARNING, though it too has `pid: None`.
         assert!(
             !w.iter().any(|l| l.contains("@s-gone")),
             "a retired row is not advertised live and must not be warned about: {w:#?}"

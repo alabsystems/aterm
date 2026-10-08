@@ -1,23 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Style deduplication (Ghostty pattern).
-//!
-//! Most cells share styles. We store unique styles once and reference by ID.
-//! This provides significant memory savings when many cells share the same
-//! color/attribute combination.
-//!
-//! ## Memory Savings
-//!
-//! Without deduplication: Each cell stores colors + attributes inline (6 bytes).
-//! With deduplication: Each cell stores a 2-byte style ID, styles are shared.
-//!
-//! For a typical terminal with 10K lines × 200 cols = 2M cells:
-//! - Without: 2M × 6 = 12 MB for style data
-//! - With: 2M × 2 + 100 styles × 12 = 4 MB + 1.2 KB ≈ 4 MB
-//! - Savings: ~67% (or 3x better)
-//!
-//! Real-world terminals typically have 50-200 unique styles, not millions.
+//! Style deduplication: unique styles are stored once in a `StyleTable` and
+//! cells reference them by a 2-byte `StyleId` instead of carrying 6 bytes of
+//! colours and attributes inline.
 
 use std::fmt;
 
@@ -29,22 +15,15 @@ use super::cell::PackedColor;
 mod style_color;
 pub use style_color::Color;
 
-/// A style identifier.
+/// Index into a `StyleTable`; 0 is always the default style.
 ///
-/// Style IDs are indices into a `StyleTable`. The ID 0 is always the default
-/// style (white on black, no attributes).
-///
-/// The inner `u16` is private; use [`new`](Self::new) / [`raw`](Self::raw)
-/// for construction and access.
+/// The inner `u16` is private; use [`new`](Self::new) / [`raw`](Self::raw).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(transparent)]
 pub struct StyleId(u16);
 
 impl StyleId {
-    /// The default style ID (index 0).
-    ///
-    /// This is always valid and represents the default terminal style
-    /// (white foreground, black background, no attributes).
+    /// The default style ID (index 0), always valid.
     pub const DEFAULT: StyleId = StyleId(0);
 
     /// Create a `StyleId` from a raw `u16` index.
@@ -90,17 +69,10 @@ impl From<u16> for StyleId {
     }
 }
 
-/// Text style combining colors and attributes.
+/// Text style: foreground, background and attributes.
 ///
-/// A Style represents the visual appearance of a cell, including:
-/// - Foreground color (text color)
-/// - Background color
-/// - Text attributes (bold, italic, underline, etc.)
-///
-/// Styles are immutable value types designed for efficient hashing and comparison.
-/// The `StyleTable` interns styles so identical combinations share memory.
-///
-/// The default style is white text on black background with no attributes.
+/// Immutable value type; `StyleTable` interns styles so identical combinations
+/// share one entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct Style {
@@ -112,29 +84,18 @@ pub struct Style {
     pub attrs: StyleAttrs,
 }
 
-/// Hand-written `Hash`: two hasher rounds instead of nine.
+/// Hand-written `Hash`: the 10 bytes of plain data in two hasher writes instead
+/// of nine serially dependent field writes.
 ///
-/// `#[derive(Hash)]` hashes field by field, so a `Style` (two 4-byte `Color`s
-/// plus a `u16` bitflag) issued eight `write_u8` calls plus one `write_u16`.
-/// `FxHasher::add_to_hash` is `hash = (hash + i) * K` — a serially dependent
-/// multiply — so that was a 9-long dependency chain of ~3-cycle multiplies
-/// before the SwissTable probe on `StyleTable`'s L3 map even started. The
-/// struct is 10 bytes of plain data, so two writes carry exactly the same
-/// information.
-///
-/// Behaviour-neutral: this hashes precisely the bytes the derived `PartialEq`
-/// compares (no field dropped, no two distinct keys collapsed), so `Hash` stays
-/// consistent with `Eq`. The only consumer is `StyleTable`'s intern map, which
-/// is never iterated (`compact()` rebuilds it from the order-stable `styles`
-/// Vec), and no `Style` hash is persisted or asserted anywhere.
+/// It hashes exactly the bytes the derived `PartialEq` compares, so `Hash`
+/// stays consistent with `Eq`. The only consumer is `StyleTable`'s intern map,
+/// which is never iterated, and no `Style` hash is persisted.
 impl std::hash::Hash for Style {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Exhaustive destructuring is LOAD-BEARING: adding a field to `Style`
-        // or to `Color` must fail to compile here rather than silently drop it
-        // from the hash. A Hash/Eq inconsistency would break intern dedup, walk
-        // the table toward `u16::MAX`, and make `insert_new_style` degrade new
-        // styles to `StyleId::DEFAULT` — a visible colour bug.
+        // Exhaustive destructuring: a new field on `Style` or `Color` fails to
+        // compile here instead of dropping out of the hash (a Hash/Eq mismatch
+        // would break intern dedup and degrade new styles to DEFAULT).
         let Self { fg, bg, attrs } = *self;
         let Color {
             r: fg_r,
@@ -162,9 +123,7 @@ impl Default for Style {
     }
 }
 
-/// Color type for style storage.
-///
-/// Used to track whether a color is default, indexed (palette), or RGB.
+/// Colour kind for style storage: default, indexed (palette) or RGB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 #[repr(u8)]
@@ -178,10 +137,7 @@ pub enum ColorType {
     Rgb = 2,
 }
 
-/// Extended style with color type information.
-///
-/// This struct stores the full style information including color types,
-/// allowing conversion back to `PackedColors + CellFlags` format.
+/// Style with colour kinds, convertible back to `PackedColors + CellFlags`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ExtendedStyle {
     /// Core style (colors + attrs).
@@ -215,10 +171,8 @@ impl ExtendedStyle {
         bg_index: 0,
     };
 
-    /// Create from separate foreground and background PackedColor values.
-    ///
-    /// Used by Terminal's CurrentStyle which stores fg/bg as separate
-    /// PackedColor values rather than the combined PackedColors format.
+    /// Create from separate foreground and background `PackedColor`s (as
+    /// Terminal's CurrentStyle stores them).
     #[must_use]
     #[cfg(test)]
     pub fn from_packed_colors_separate(fg: PackedColor, bg: PackedColor, flags: CellFlags) -> Self {
@@ -256,10 +210,8 @@ impl ExtendedStyle {
         }
     }
 
-    /// Bidirectional mapping between CellFlags and StyleAttrs.
-    ///
-    /// Adding a new style attribute requires only a single entry here;
-    /// both conversion directions are derived from this table.
+    /// Mapping between CellFlags and StyleAttrs; both conversion directions
+    /// derive from this table.
     const FLAG_ATTR_MAP: [(CellFlags, StyleAttrs); 15] = [
         (CellFlags::BOLD, StyleAttrs::BOLD),
         (CellFlags::DIM, StyleAttrs::DIM),
@@ -273,10 +225,8 @@ impl ExtendedStyle {
         (CellFlags::CURLY_UNDERLINE, StyleAttrs::CURLY_UNDERLINE),
         (CellFlags::SUPERSCRIPT, StyleAttrs::SUPERSCRIPT),
         (CellFlags::SUBSCRIPT, StyleAttrs::SUBSCRIPT),
-        // Compound styles: CellFlags uses bit combinations while StyleAttrs
-        // has dedicated bits. Without these entries, cell_flags_to_style_attrs
-        // only sets the individual component bits, causing dotted/dashed
-        // underlines to be misidentified as curly in StyleAttrs consumers.
+        // Compound styles: CellFlags uses bit combinations, StyleAttrs dedicated
+        // bits; without these, dotted/dashed underlines read as curly.
         (CellFlags::DOTTED_UNDERLINE, StyleAttrs::DOTTED_UNDERLINE),
         (CellFlags::DASHED_UNDERLINE, StyleAttrs::DASHED_UNDERLINE),
         (CellFlags::OVERLINE, StyleAttrs::OVERLINE),
@@ -295,10 +245,8 @@ impl ExtendedStyle {
         attrs
     }
 
-    /// Convert StyleAttrs back to CellFlags.
-    ///
-    /// Only style-related flags are set; cell-specific flags like
-    /// WIDE, WIDE_CONTINUATION, COMPLEX are not affected.
+    /// Convert StyleAttrs back to CellFlags. Only style flags are set; WIDE,
+    /// WIDE_CONTINUATION and COMPLEX are untouched.
     #[must_use]
     pub fn attrs_to_cell_flags(attrs: StyleAttrs) -> CellFlags {
         let mut flags = CellFlags::empty();

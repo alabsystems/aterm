@@ -1,81 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The differential oracle: `rustls-platform-verifier` as the reference.
-//!
-//! The retired crate is kept as a `[dev-dependencies]` oracle (see this crate's
-//! manifest) and every chain below is driven through BOTH implementations, with
-//! the same anchors and the same pinned instant, and their verdicts compared.
-//! This is the same discipline
-//! `crates/aterm-gui/src/net_connections/keychain.rs:472` uses at the same OS
-//! boundary, and the same skip rule: if the ORACLE fails first, the test skips
-//! rather than reporting a defect in the reimplementation.
-//!
-//! # What this proves, and — read this part — what it does not
-//!
-//! On macOS both implementations end up inside the SAME `SecTrust` engine. So
-//! this is a PLUMBING differential, not an independent PKI oracle. It pins the
-//! things a reimplementation actually gets wrong — policy construction, the
-//! verify date, the anchor set, certificate ORDER in the array, the server-name
-//! string, the shape of the evaluation result, error translation — and in
-//! particular it catches the failure mode that matters most here: misreading
-//! `SecTrustEvaluateWithError`'s `bool` and turning a rejection into an
-//! acceptance. It does NOT independently validate macOS's trust decision, and
-//! nobody should describe it as proving the certificates are "correctly"
-//! verified.
+//! The platform verifier over a locally minted fixture corpus, each case with
+//! its MEASURED verdict per platform.
 //!
 //! Coverage, stated plainly:
 //!
 //! * **Apple arm** — fully exercised here, accept and reject, offline.
 //! * **Unix arm** — its CHAIN MATH is exercised here
 //!   ([`the_webpki_chain_math_matches_its_recorded_expectations`]) because
-//!   `WebPkiServerVerifier` is portable and runs natively on this machine. Its
-//!   `/etc/ssl/certs` DISCOVERY half is NOT exercised anywhere: that needs a
-//!   Linux host.
-//! * **Windows arm** — NOT exercised at all, by anything, on any machine that
-//!   has run this suite.
+//!   `WebPkiServerVerifier` is portable. Its `/etc/ssl/certs` DISCOVERY half
+//!   needs a Linux host.
+//! * **Windows arm** — not exercised here.
 //!
 //! # Two places the platforms genuinely disagree
 //!
-//! A corpus asserted as "both arms must reach the same verdict" would be wrong
-//! on two inputs, so each case records BOTH expectations and the assertion picks
-//! by platform:
+//! Each case records BOTH expectations and the assertion picks by platform:
 //!
 //! * a leaf with **no `extendedKeyUsage` at all** — RFC 5280 reads an absent EKU
 //!   as unconstrained and webpki follows it; Apple requires an explicit
 //!   `id-kp-serverAuth`;
 //! * a leaf whose `keyUsage` lacks `digitalSignature`.
 //!
-//! Both are properties of the PLATFORMS, not of this code:
-//! `rustls-platform-verifier` has them today too, which is exactly why the
-//! mine-vs-oracle assertion still holds on every case — it compares two
-//! implementations on ONE platform, while the recorded expectations describe
-//! what each platform does.
-//!
-//! # This suite was checked by MUTATION, not by passing
-//!
-//! A green certificate-verification suite proves nothing on its own; the only
-//! question worth answering is whether it goes RED when the verifier is wrong.
-//! Six defects were injected into `verifier::apple` one at a time and the suite
-//! re-run. Every one was caught, and the table records which test caught it and
-//! how many of the eleven failed:
-//!
-//! | injected defect | result |
-//! | --- | --- |
-//! | accept unconditionally, ignoring `SecTrustEvaluateWithError` | 5 tests fail |
-//! | read the `bool` inverted — the `OSStatus`-habit trap | 4 tests fail |
-//! | pass a NULL hostname to `SecPolicyCreateSSL` | 4 tests fail |
-//! | skip `SecTrustSetVerifyDate` and judge against the wall clock | 2 tests fail |
-//! | reverse the certificate order in the array | 3 tests fail |
-//! | `SecTrustSetAnchorCertificatesOnly(true)` instead of `false` | 1 test fails |
-//!
-//! The last row is the reason
-//! [`extra_anchors_add_to_the_system_set_rather_than_replacing_it`] exists. That
-//! mutation was invisible to every LOCAL fixture — none of them chains to a
-//! public root, so add-semantics and replace-semantics agree across the whole
-//! offline corpus — and it was caught only after a case was added that runs the
-//! captured real chain through the extra-roots verifier. Re-run the mutations
-//! before believing any future change to this file.
+//! [`extra_anchors_add_to_the_system_set_rather_than_replacing_it`] exists
+//! because `SecTrustSetAnchorCertificatesOnly(true)` instead of `false` is
+//! invisible to every LOCAL fixture: none of them chains to a public root.
 //!
 //! # Time is pinned, and that is not optional
 //!
@@ -93,6 +42,7 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use super::PlatformVerifier;
+use super::test_platform::{notice_once, trust_service_silent};
 
 // --- fixtures --------------------------------------------------------------
 // See `src/testdata/tls/README.md` for what each one is and `mint.sh` for how
@@ -159,9 +109,8 @@ const T_GH: u64 = 1_787_986_773;
 
 // --- outcomes --------------------------------------------------------------
 
-/// One verification's result, reduced to a shape BOTH implementations produce.
-///
-/// Accept/reject plus the four error kinds the incumbent actually maps. It
+/// One verification's result, reduced to accept/reject plus the mapped error
+/// kinds. It
 /// deliberately stops there: every other platform failure arrives as an opaque
 /// `Other(..)` carrying the OS's own words, and asserting on those strings would
 /// be asserting on a macOS release note.
@@ -190,9 +139,17 @@ impl Outcome {
     }
 }
 
+/// A trustd that stopped answering is the machine's, not a verdict: once one
+/// evaluation in the process is past its suspect age, every later one is
+/// refused at once, so it is never counted as `Rejected` (or as a failed
+/// `Accept`). The gate's own deadline is the only hang detector.
+const TRUSTD_SILENT: &str =
+    "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
+
 fn reduce(result: &Result<rustls::client::danger::ServerCertVerified, rustls::Error>) -> Outcome {
     use rustls::CertificateError as Ce;
     match result {
+        Err(e) if super::is_service_unanswered(e) => panic!("{TRUSTD_SILENT}: {e}"),
         Ok(_) => Outcome::Accept,
         Err(rustls::Error::InvalidCertificate(inner)) => match inner {
             Ce::BadEncoding => Outcome::BadEncoding,
@@ -200,10 +157,8 @@ fn reduce(result: &Result<rustls::client::danger::ServerCertVerified, rustls::Er
             Ce::UnknownIssuer => Outcome::UnknownIssuer,
             Ce::BadSignature => Outcome::BadSignature,
             Ce::Revoked => Outcome::Revoked,
-            // Both implementations render "the EKU is wrong" as an `Other`
-            // carrying an error whose `Display` is this exact string — the
-            // incumbent's `EkuError`, and `super::EkuError` written to match.
-            // Neither type is nameable from here, so the text is the seam.
+            // "The EKU is wrong" arrives as an `Other` carrying
+            // `super::EkuError`, whose `Display` is this exact string.
             Ce::Other(other) if other.to_string() == "certificate had invalid extensions" => {
                 Outcome::Eku
             }
@@ -213,7 +168,7 @@ fn reduce(result: &Result<rustls::client::danger::ServerCertVerified, rustls::Er
     }
 }
 
-// --- driving both implementations -----------------------------------------
+// --- driving the verifier ---------------------------------------------------
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     crate::tls::init_crypto();
@@ -465,46 +420,24 @@ const CORPUS: &[Case] = &[
 
 // --- the tests -------------------------------------------------------------
 
-/// Build both implementations over the fixture root. `None` when the ORACLE
-/// could not be constructed, which is the skip signal.
-fn pair() -> Option<(PlatformVerifier, rustls_platform_verifier::Verifier)> {
-    let anchors = vec![der(ROOT)];
-    let oracle =
-        rustls_platform_verifier::Verifier::new_with_extra_roots(anchors.clone(), provider())
-            .ok()?;
-    let mine = PlatformVerifier::new_with_extra_roots(anchors, provider())
-        .expect("the first-party verifier must construct wherever the oracle does");
-    Some((mine, oracle))
-}
-
-#[test]
-fn the_first_party_verifier_agrees_with_the_incumbent_on_every_chain() {
-    let Some((mine, oracle)) = pair() else {
-        eprintln!("SKIP: the oracle verifier could not be constructed on this platform");
-        return;
+/// The verifier over the fixture root. `None`, after printing why, where no
+/// platform verifier exists or the platform's certificate service does not
+/// answer: the skip signal, and the caller just returns.
+fn mine() -> Option<PlatformVerifier> {
+    let Ok(mine) = PlatformVerifier::new_with_extra_roots(vec![der(ROOT)], provider()) else {
+        notice_once("SKIP: no platform verifier on this target");
+        return None;
     };
-    let mut disagreements = Vec::new();
-    for case in CORPUS {
-        let got = case.run(&mine);
-        let want = case.run(&oracle);
-        if got != want {
-            disagreements.push(format!("{}: mine={got:?} oracle={want:?}", case.what));
-        }
+    if trust_service_silent() {
+        return None;
     }
-    assert!(
-        disagreements.is_empty(),
-        "the reimplementation and the incumbent disagree:\n  {}",
-        disagreements.join("\n  ")
-    );
+    Some(mine)
 }
 
 #[test]
 fn the_first_party_verifier_matches_its_recorded_expectations() {
-    // Independent of the oracle ON PURPOSE. If `rustls-platform-verifier` is
-    // ever dropped from the dev-dependencies, this table is what still says what
-    // each input must do — and it was measured, not predicted.
-    let Some((mine, _oracle)) = pair() else {
-        eprintln!("SKIP: no platform verifier on this target");
+    // The table was measured, not predicted.
+    let Some(mine) = mine() else {
         return;
     };
     let mut wrong = Vec::new();
@@ -552,6 +485,9 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
     // The stronger half of this guarantee is structural rather than behavioural:
     // `new_with_extra_roots` is `#[cfg(test)]`, so no non-test caller can name
     // it and the compiler enforces that. This is the behavioural half.
+    if trust_service_silent() {
+        return;
+    }
     let shipped = match PlatformVerifier::new(provider()) {
         Ok(verifier) => verifier,
         Err(_) => {
@@ -576,7 +512,7 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
     // ...and the SAME chain accepts once the anchor is supplied, which proves
     // the rejection above is about the anchor set and not about the fixture
     // being broken in some other way.
-    if let Some((mine, _)) = pair() {
+    if let Some(mine) = mine() {
         assert!(
             case.run(&mine).accepted(),
             "the fixture chain must be good; only its anchor is missing"
@@ -612,37 +548,21 @@ fn the_system_trust_store_is_actually_consulted() {
         webpki: Outcome::NotValidForName,
     };
 
-    let (Ok(mine), Ok(oracle)) = (
-        PlatformVerifier::new(provider()),
-        rustls_platform_verifier::Verifier::new(provider()),
-    ) else {
+    let Ok(mine) = PlatformVerifier::new(provider()) else {
         eprintln!("SKIP: no system trust store on this target");
         return;
     };
-
-    // Equality holds unconditionally: a machine with a broken or empty trust
-    // store flips BOTH implementations the same way, and that is still a fact
-    // worth asserting.
-    assert_eq!(
-        real.run(&mine),
-        real.run(&oracle),
-        "system-anchored verdicts diverge"
+    if trust_service_silent() {
+        return;
+    }
+    assert!(
+        !wrong_name.run(&mine).accepted(),
+        "a real chain was accepted for a name it does not carry"
     );
-    assert_eq!(wrong_name.run(&mine), wrong_name.run(&oracle));
-
-    // The hard "must ACCEPT" is gated on the oracle having accepted, so a
-    // machine whose trust store cannot validate this chain reports a skip rather
-    // than a defect in the reimplementation. Same rule as
-    // `net_connections/keychain.rs`.
-    if real.run(&oracle).accepted() {
-        assert!(
-            real.run(&mine).accepted(),
-            "the system trust store validated this chain for the oracle but not for us"
-        );
-        assert!(
-            !wrong_name.run(&mine).accepted(),
-            "a real chain was accepted for a name it does not carry"
-        );
+    // Hard only on Apple, whose store always carries the anchor; elsewhere the
+    // distro store may not, which is a skip and not a defect.
+    if cfg!(target_vendor = "apple") || real.run(&mine).accepted() {
+        assert_eq!(real.run(&mine), real.expected(), "system-anchored verdict");
     } else {
         eprintln!(
             "SKIP (hard assertion only): this machine's trust store did not validate the \
@@ -672,18 +592,8 @@ fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
         apple: Outcome::Accept,
         webpki: Outcome::Accept,
     };
-    let Some((mine, oracle)) = pair() else {
-        eprintln!("SKIP: no platform verifier on this target");
-        return;
-    };
-    // Equality unconditionally; the hard assertion only where the oracle agrees
-    // the machine's trust store can validate this chain at all.
-    assert_eq!(
-        chain.run(&mine),
-        chain.run(&oracle),
-        "extra-anchor semantics diverge"
-    );
-    if chain.run(&oracle).accepted() {
+    let Some(mine) = mine() else { return };
+    if cfg!(target_vendor = "apple") || chain.run(&mine).accepted() {
         assert!(
             chain.run(&mine).accepted(),
             "supplying an extra anchor DISABLED the system anchors"
@@ -701,10 +611,7 @@ fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
     // If `BadEncoding` were reported as an ordinary rejection, a future change
     // that broke DER handling would look like a suite full of healthy reject
     // cases. It is called out separately for exactly that reason.
-    let Some((mine, oracle)) = pair() else {
-        eprintln!("SKIP: no platform verifier on this target");
-        return;
-    };
+    let Some(mine) = mine() else { return };
     for (what, bytes) in [
         ("nine bytes of garbage", MALFORMED),
         ("no bytes at all", &[] as &[u8]),
@@ -721,9 +628,7 @@ fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
         let name = ServerName::try_from(HOST).unwrap();
         let at = UnixTime::since_unix_epoch(std::time::Duration::from_secs(case.now));
         let got = reduce(&mine.verify_server_cert(&chain[0], &[], &name, &[], at));
-        let want = reduce(&oracle.verify_server_cert(&chain[0], &[], &name, &[], at));
         assert_eq!(got, Outcome::BadEncoding, "{what} must be a PARSE failure");
-        assert_eq!(got, want, "{what}: parse-failure reporting diverges");
     }
 }
 
@@ -750,8 +655,7 @@ fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
     // What is asserted here is the adjacent value a refactor is most likely to
     // let through — the EMPTY name — plus the fact that name checking is on at
     // all. Neither may accept.
-    let Some((mine, _oracle)) = pair() else {
-        eprintln!("SKIP: no platform verifier on this target");
+    let Some(mine) = mine() else {
         return;
     };
 
@@ -781,6 +685,11 @@ fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
         let at = UnixTime::since_unix_epoch(std::time::Duration::from_secs(T26));
         for degenerate in ["", "\u{0}"] {
             let result = arm.verify(&der(GOOD), &[], &name, degenerate, None, at);
+            if let Err(e) = &result
+                && super::is_service_unanswered(e)
+            {
+                panic!("{TRUSTD_SILENT}: {degenerate:?}: {e}");
+            }
             assert!(
                 result.is_err(),
                 "the arm accepted a chain against the server name {degenerate:?}"
@@ -877,8 +786,9 @@ fn handshake_signature_verification_is_delegated_to_the_provider() {
     // Not platform work: the three signature methods must expose exactly the
     // provider's algorithms, the way `crates/aterm-net/src/tls.rs:157` does.
     // A verifier that narrowed this set would break handshakes in a way no
-    // certificate fixture can catch.
-    let Some((mine, _oracle)) = pair() else {
+    // certificate fixture can catch. No evaluation happens, so this runs even
+    // where the platform's certificate service does not answer.
+    let Ok(mine) = PlatformVerifier::new(provider()) else {
         eprintln!("SKIP: no platform verifier on this target");
         return;
     };

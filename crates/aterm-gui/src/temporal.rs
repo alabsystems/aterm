@@ -22,7 +22,7 @@
 //!   B.8.2 `tier_residency_model` obligation). The warm tier is itself bounded by
 //!   a byte budget; anything dropped past the budget is **counted**
 //!   ([`dropped_events`](Self::dropped_events)), never silently lost. No cold
-//!   (disk) tier exists — parked 2026-09-25: recording is opt-in, and R19's
+//!   (disk) tier exists, by design (OPEN-B4): recording is opt-in, and R19's
 //!   re-keyframing keeps a bounded replay window reachable.
 //! - **No fs / no lock / no wall-clock-as-state.** Ticks come from one epoch
 //!   captured at construction; the GUI feeds bursts off the reader hot path on a
@@ -316,7 +316,7 @@ pub(crate) struct TemporalRecorder {
     /// was recorded.
     keyframes: VecDeque<RetainedKeyframe>,
     /// Warm tier: events evicted from the live ring (spill-not-forget), bounded by
-    /// `budget`. Nothing drains it to disk: there is no cold tier (parked 2026-09-25).
+    /// `budget`. Nothing drains it to disk: there is no cold tier, by design (OPEN-B4).
     spilled: VecDeque<Event>,
     /// Monotone blob-id source.
     next_blob: u64,
@@ -592,7 +592,7 @@ impl TemporalRecorder {
     // after one build log — no longer holds; the self-replayed keyframe seeds the
     // `nearest keyframe <= at` fold correctly because it is stamped at its replay
     // instant, not `now()`.) Deep history beyond the RAM budget (a COLD/on-disk
-    // tier) is not built and not scheduled — parked 2026-09-25.
+    // tier) is not built, by design (OPEN-B4); archival is the `cast` export.
     fn enforce_budget(&mut self) {
         while self.used > self.budget {
             // Prefer dropping the oldest blob (largest, most reclaimable) first.

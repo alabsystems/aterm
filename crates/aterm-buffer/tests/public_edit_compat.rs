@@ -10,8 +10,8 @@ fn require_string(value: String) -> usize {
 }
 
 fn payload_len(edit: Edit) -> usize {
-    // Exhaustive on purpose: the CLOSED algebra and its String payloads are the
-    // public source contract, not merely an internal representation detail.
+    // Exhaustive on purpose: the closed algebra and its String payloads are the
+    // public source contract.
     match edit {
         Edit::AppendLine(text) => require_string(text),
         Edit::SetLine(_, text) => require_string(text),

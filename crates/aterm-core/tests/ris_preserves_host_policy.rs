@@ -1,24 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Regression: byte-stream RIS (ESC c) must preserve HOST policy flags.
+//! Byte-stream RIS (ESC c) preserves host policy flags.
 //!
-//! RIS (`\x1b c`) is a full terminal reset reachable from the untrusted PTY
-//! byte stream. The host can independently arm security policy that lives in
-//! `TerminalModes` — most critically the shell-integration nonce requirement
-//! (`require_shell_integration_nonce`). If RIS cleared that flag, a rogue
-//! program could write `\x1b c` and then forge OSC 133/633 prompt/command
-//! marks WITHOUT a nonce (the gate fails open once the flag is false),
-//! defeating the anti-spoofing control entirely (#7937 F01-2 / #7960).
-//!
-//! `Terminal::reset()` (the programmatic path) already preserved this; the
-//! byte-stream RIS path in `handler_esc::reset_terminal_state` had drifted and
-//! dropped it. This test pins BOTH reset paths to the same contract so they
-//! cannot diverge again.
+//! RIS is reachable from the untrusted PTY stream. If it cleared
+//! `require_shell_integration_nonce`, a program could send `\x1b c` and then
+//! forge OSC 133/633 marks without a nonce. Both reset paths,
+//! `Terminal::reset()` and `handler_esc::reset_terminal_state`, keep the flag.
 
 use aterm_core::terminal::Terminal;
 
-/// Byte-stream RIS must NOT clear the host shell-integration nonce requirement.
+/// Byte-stream RIS must not clear the host shell-integration nonce requirement.
 #[test]
 fn byte_stream_ris_preserves_shell_integration_nonce_requirement() {
     let mut t = Terminal::new(24, 80);
@@ -39,9 +31,8 @@ fn byte_stream_ris_preserves_shell_integration_nonce_requirement() {
     );
 }
 
-/// The two reset entry points agree: programmatic `reset()` and byte-stream
-/// RIS both preserve the nonce requirement. (Guards against future drift in
-/// either direction.)
+/// Programmatic `reset()` and byte-stream RIS both preserve the nonce
+/// requirement.
 #[test]
 fn reset_paths_agree_on_nonce_preservation() {
     let mut via_api = Terminal::new(24, 80);

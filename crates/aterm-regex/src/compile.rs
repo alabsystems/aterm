@@ -221,7 +221,7 @@ impl Compiler {
     /// body, which reorders the exit against the body's own alternatives when a
     /// thread resumes mid-body — `(.*?){2,}\b` on `" ab"` starts matching at 0
     /// either way, but ends at 1 with the right shape and at 3 with the wrong
-    /// one. Two shapes, chosen by nullability, is what the oracle does too.
+    /// one. Two shapes, chosen by nullability, is what `regex` does too.
     ///
     /// ## The mandatory copies stop at their fixed point
     ///
@@ -728,71 +728,6 @@ mod tests {
         match compile(&ast, limit) {
             Err(Error::CompiledTooBig(reported)) => assert_eq!(reported, limit),
             other => panic!("expected the ceiling, got {other:?}"),
-        }
-    }
-
-    /// A body that compiles to *no* instructions must not be able to walk past
-    /// the ceiling.
-    ///
-    /// `size_limit` is charged inside [`Compiler::push`] and
-    /// [`Compiler::add_class`], so a mandatory-copy loop that replays a body
-    /// emitting nothing never consults the budget at all. Measured through the
-    /// exact gate the call sites build with — `aterm_observe::row_matcher` and
-    /// `SearchIndex::compile_regex` both say
-    /// `.size_limit(1 << 20).dfa_size_limit(1 << 20)` — the sixteen-byte
-    /// `(?:){4294967295}` returned `Ok` after 6.377 seconds, and the nested form
-    /// is quadratic in the two counts and would not have finished this century.
-    /// Every pattern here is far under the callers' `MAX_REGEX_PATTERN_LEN` of
-    /// 1024 bytes, so the length gate lets them all through and the ceiling is
-    /// the only defence there is.
-    #[test]
-    fn a_body_that_emits_nothing_cannot_outrun_the_ceiling() {
-        use std::time::{Duration, Instant};
-
-        // The two call sites' bound, verbatim.
-        fn gate(pattern: &str) -> Result<crate::Regex, Error> {
-            crate::RegexBuilder::new(pattern)
-                .size_limit(1 << 20)
-                .dfa_size_limit(1 << 20)
-                .build()
-        }
-
-        // The real cost of each of these is a parse and two instructions —
-        // microseconds. A second is orders of magnitude above that and orders of
-        // magnitude below the 6.377 s the flat case took before the fixed-point
-        // break, so it separates "fixed" from "broken" without being fragile on
-        // a loaded machine.
-        let budget = Duration::from_secs(1);
-        for pattern in [
-            "(?:){4294967295}",                 // the measured case
-            "(?:(?:){4294967295}){4294967295}", // nested: quadratic before
-            "(?:){4294967295,}",                // the `{n,}` arm's own loop
-            "(){4294967295}",
-            "(?:a{0}){4294967295}",
-            r"(?:\b{0}){4294967295}",
-        ] {
-            let started = Instant::now();
-            let re = gate(pattern).expect("a no-op body is a legal, tiny program");
-            let elapsed = started.elapsed();
-            assert!(
-                elapsed < budget,
-                "{pattern:?} took {elapsed:?}: a body that emits nothing is \
-                 being replayed instead of recognised as a fixed point"
-            );
-            assert!(
-                re.is_match(""),
-                "{pattern:?} still matches the empty string"
-            );
-            assert!(re.is_match("abc"), "{pattern:?} still matches anywhere");
-        }
-
-        // And the break must not have disarmed the ceiling: a body that *does*
-        // emit still gets stopped, with the ordinary error carrying the limit.
-        for pattern in ["(?:a){4294967295}", "(?:a?){4294967295}", "a{100000000}"] {
-            match gate(pattern) {
-                Err(Error::CompiledTooBig(reported)) => assert_eq!(reported, 1 << 20),
-                other => panic!("{pattern:?} must still hit the ceiling, got {other:?}"),
-            }
         }
     }
 

@@ -5,13 +5,12 @@
 //! The parser's partial state on the seamless-handoff wire
 //! ([`CheckpointMeta::parser`](super::CheckpointMeta::parser)).
 //!
-//! [`ParserRepr`] is [`ParserCarry`] in serde-friendly shape: the state by
-//! NAME (a later build may renumber the enum, never rename a state it still
-//! has), the byte strings as lowercase hex, every empty field left out. It is
-//! a pure data mirror: turning it back into a [`ParserCarry`] checks only that
-//! it reads (a known state name, hex that decodes); whether the carry is one a
-//! parser may take is [`aterm_parser::Parser::restore_carry`]'s question,
-//! asked where the carry lands (`Terminal::restore_checkpoint`).
+//! [`ParserRepr`] is [`ParserCarry`] in serde shape: the state by name (a
+//! later build may renumber the enum, never rename a state it still has), byte
+//! strings as lowercase hex, empty fields omitted. Converting back checks only
+//! that it reads; whether a parser may take the carry is
+//! [`aterm_parser::Parser::restore_carry`]'s decision, made in
+//! `Terminal::restore_checkpoint`.
 
 use aterm_parser::{ParserCarry, State};
 
@@ -50,6 +49,11 @@ pub struct ParserRepr {
     /// The length of the character `utf8_tail` begins.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub utf8_expected: u8,
+    /// The head of a split UTF-8 character a DCS or APC string's payload
+    /// ends in, hex. A build before it ignores it (and reads the string's
+    /// next `0x9C` as its ST); one after it reads its absence as no head.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub string_utf8_tail: String,
 }
 
 #[allow(
@@ -118,12 +122,12 @@ impl ParserRepr {
             osc_overflowed: carry.osc_overflowed,
             utf8_tail: to_hex(&carry.utf8_tail),
             utf8_expected: carry.utf8_expected,
+            string_utf8_tail: to_hex(&carry.string_utf8_tail),
         }
     }
 
-    /// The carry this names, or `None` when it does not read: a state name
-    /// this build does not know, or a byte string that is not hex. NOT a
-    /// validation of the carry (see the module docs).
+    /// The carry this names, or `None` for an unknown state name or non-hex
+    /// bytes. Not a validation of the carry (see the module docs).
     #[must_use]
     pub fn to_carry(&self) -> Option<ParserCarry> {
         Some(ParserCarry {
@@ -138,14 +142,14 @@ impl ParserRepr {
             osc_overflowed: self.osc_overflowed,
             utf8_tail: from_hex(&self.utf8_tail)?,
             utf8_expected: self.utf8_expected,
+            string_utf8_tail: from_hex(&self.string_utf8_tail)?,
         })
     }
 }
 
-/// Read a carried [`ParserRepr`], or `None` when the value is not one — for
-/// the reason `lenient_title` gives: `CheckpointMeta` is parsed whole, and a
-/// parser carry is not worth the screen. A value that does not read restores
-/// a Ground parser, which is what every handoff before this field did.
+/// Read a carried [`ParserRepr`], or `None` when the value is not one:
+/// `CheckpointMeta` is parsed whole (as with `lenient_title`), and a bad parser
+/// carry must not cost the screen. `None` restores a Ground parser.
 pub(super) fn lenient_parser<'de, D>(deserializer: D) -> Result<Option<ParserRepr>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -189,6 +193,14 @@ mod tests {
             ..ParserCarry::default()
         };
         assert_eq!(ParserRepr::from_carry(&osc).to_carry(), Some(osc));
+        let string = ParserCarry {
+            state: State::SosPmApcString,
+            string_utf8_tail: vec![0xE6],
+            ..ParserCarry::default()
+        };
+        let repr = ParserRepr::from_carry(&string);
+        assert_eq!(repr.string_utf8_tail, "e6");
+        assert_eq!(repr.to_carry(), Some(string));
     }
 
     #[test]

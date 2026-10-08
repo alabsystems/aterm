@@ -1,45 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// SEARCH-BENCH harness (E0): committed floors for the trigram search engine —
-// the audit's "search had ZERO in-tree benchmarks" gap. Measures, per corpus:
+// Search harness: floors for the trigram search engine, per corpus:
 //
 //   build    full index fallback through the PRODUCT path
 //            (`Terminal::release_search_index` + `indexed_search`), in thousand
 //            lines/s. Ordinary appended-output churn takes the incremental refresh
-//            path and is measured separately by `search_churn_harness`.
+//            path, which this harness does not measure.
 //   query    per-query cost on the CACHED index (unchanged content), queries/s.
 //   memory   net heap RETAINED by the built index (counting global allocator),
 //            reported bigger-is-better as lines-per-MiB for the gate, plus the
 //            human-facing bytes/line.
 //
-// plus the engine's incremental primitive (`index_scrollback_line`, the E2
-// destination) as `index_line_klps`, so the rework's before/after is measurable.
+// plus the incremental primitive (`index_scrollback_line`) as
+// `index_line_klps`.
 //
-// TWO corpora, per the audit's rotating-alphabet caveat (§5.2): `rotating` is
-// trigram-DIVERSE (worst case for the trigram map), `replog` is a repetitive
-// service log — few templates, digits-only variation — where the trigram map
-// shrinks but the dominant per-line postings/String costs do not. A regression
-// that only shows on one shape cannot hide behind the other.
+// Three corpora: `rotating` is trigram-diverse (worst case for the trigram map),
+// `replog` a repetitive service log, where the map shrinks but per-line
+// postings do not, and `linkheavy` OSC 8 URLs that soft-wrap, so a regression
+// on one shape cannot hide behind another.
 //
-//   cargo run --release -q -p aterm-bench --example search_harness
+//   targo --unverified run --release -q -p aterm-bench --example search_harness
 //   -> {"rotating_build_klps":...,"rotating_query_qps":...,"rotating_lines_per_mib":...,
 //       "replog_build_klps":...,"replog_query_qps":...,"replog_lines_per_mib":...,
 //       "index_line_klps":...,"rotating_bytes_per_line":...,"replog_bytes_per_line":...,
 //       "tiered_build_klps":...,"corpus_lines":...,"n":...,"warmup":...}
 //
-// Same non-flake discipline as the sibling harnesses: deterministic corpora
-// (no RNG/clock), release subprocess, median-of-N, generous gate ratio.
+// Deterministic corpora (no RNG or clock), release subprocess, median-of-N.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
+use aterm_bench::{linkheavy_corpus, replog_corpus, rotating_corpus};
 use aterm_core::search::TerminalSearch;
 use aterm_core::terminal::{Terminal, TerminalBuilder};
 
-/// Net-live-bytes counting allocator, the `tests/memory.rs` pattern: the
+/// Net-live-bytes counting allocator, as in `aterm-core/tests/mem_budget.rs`: the
 /// retained-index measurement needs REAL heap deltas, not estimates. Two relaxed
 /// atomics per alloc are noise next to the index build's own allocation traffic.
 static NET: AtomicI64 = AtomicI64::new(0);
@@ -70,7 +68,7 @@ const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
 /// Ring big enough to retain the whole corpus (ring-only, the shipping config —
-/// the index covers every retained line, so retention IS the indexed set).
+/// the index covers every retained line, so retention is the indexed set).
 const RING_LINES: usize = 60_000;
 
 /// Corpus height. 50k lines matches the product's scrollback cap and keeps a
@@ -79,7 +77,7 @@ const RING_LINES: usize = 60_000;
 const CORPUS_LINES: usize = 50_000;
 
 /// Median-of-N + warmup: identical discipline to the other perf lanes. N=5 keeps
-/// the whole harness (two corpora x full rebuilds) inside a few seconds.
+/// the whole harness (every corpus x full rebuilds) inside a few seconds.
 const N_ITERS: usize = 5;
 const WARMUP: usize = 1;
 
@@ -87,14 +85,9 @@ const WARMUP: usize = 1;
 /// ms depending on match count; a batch dominates timer granularity).
 const QUERY_BATCH: usize = 20;
 
-/// Shared deterministic corpora (aterm-bench lib): the floor lane and the
-/// posting-container decision bench must measure the SAME bytes.
-use aterm_bench::{linkheavy_corpus, replog_corpus, rotating_corpus};
-
-/// LINK-HEAVY corpus height in LOGICAL lines (Wave-4A P7). Each logical line
-/// soft-wraps to 2 grid rows at 80 columns, so 25k logical lines occupy ~50k
-/// rows — the same indexed depth as the other corpora, fully retained inside
-/// `RING_LINES` (no eviction: the lane measures indexing, not retention).
+/// Link-heavy corpus height in logical lines. Each soft-wraps to 2 grid rows at
+/// 80 columns, so 25k logical lines occupy ~50k rows, the same indexed depth as
+/// the other corpora, fully retained inside `RING_LINES`.
 const LINKHEAVY_LINES: usize = 25_000;
 
 /// Fill a fresh ring-only terminal (no tiered store) with the corpus, so the
@@ -108,7 +101,7 @@ fn filled_terminal(corpus: &[u8]) -> Terminal {
     term
 }
 
-/// Fill a terminal with the TIERED store the GUI session runs (default ring
+/// Fill a terminal with the tiered store the GUI session runs (default ring
 /// cap, the rest of history in hot/warm/cold tiers), so the build walks the
 /// compressed tiers — the path the dense history walk
 /// (`Grid::history_lines_from`) exists for. Informational lane
@@ -149,14 +142,14 @@ struct CorpusReport {
     match_count: usize,
 }
 
-/// Measure one corpus. `query` must HIT (a no-match query would measure the
+/// Measure one corpus. `query` must hit (a no-match query would measure the
 /// bloom/trigram early-out, not verification).
 fn measure_corpus(corpus: &[u8], query: &str) -> CorpusReport {
     measure_terminal(filled_terminal(corpus), query)
 }
 
 fn measure_terminal(mut term: Terminal, query: &str) -> CorpusReport {
-    // -- retained index memory: net heap across the FIRST build (cache empty) --
+    // -- retained index memory: net heap across the first build (cache empty) --
     let before = net();
     let index = term.indexed_search();
     let indexed_lines = index.indexed_line_count();
@@ -168,9 +161,8 @@ fn measure_terminal(mut term: Terminal, query: &str) -> CorpusReport {
     let mut build = Vec::with_capacity(N_ITERS);
     let rebuild_pass = |term: &mut Terminal| -> f64 {
         // Bump content_gen so every pass has a real content change, then drop
-        // the cache explicitly. Appended-output misses normally take the
-        // O(churn) refresh lane now; a missing cache is the product fallback
-        // that still owes the full-build performance floor.
+        // the cache: appended output takes the O(churn) refresh path, and a
+        // missing cache is the fallback that owes the full-build floor.
         term.process(b"x");
         term.release_search_index();
         let refreshes_before = term.search_index_refreshes();
@@ -242,9 +234,9 @@ fn measure_terminal(mut term: Terminal, query: &str) -> CorpusReport {
     }
 }
 
-/// The incremental primitive (`index_scrollback_line`) in thousand lines/s —
-/// the E2 destination's unit cost, measured on the rotating corpus so the
-/// trigram map takes its worst-case shape.
+/// The incremental primitive (`index_scrollback_line`) in thousand lines/s,
+/// measured on the rotating corpus so the trigram map takes its worst-case
+/// shape.
 fn measure_index_line(corpus: &[u8]) -> f64 {
     let lines: Vec<&str> = std::str::from_utf8(corpus)
         .expect("corpus is ASCII")
@@ -279,10 +271,10 @@ fn main() {
     let linkheavy = linkheavy_corpus(LINKHEAVY_LINES);
 
     // "jkl" rides the rotating alphabet through most lines; "ERROR" is a real
-    // log level hitting 1-in-8 replog lines. Both HIT (verification measured).
+    // log level hitting 1 in 8 replog lines. Both hit.
     let rot = measure_corpus(&rotating, "jkl");
     let rep = measure_corpus(&replog, "ERROR");
-    // ".tgz" hits inside every logical line's visible URL (P7 lane).
+    // ".tgz" hits inside every logical line's visible URL.
     let link = measure_corpus(&linkheavy, "tgz");
     let index_line_klps = measure_index_line(&rotating);
     let tiered = measure_terminal(filled_tiered_terminal(&rotating), "jkl");

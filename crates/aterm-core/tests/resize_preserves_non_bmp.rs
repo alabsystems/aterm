@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Regression: resizing must not strand on-screen non-BMP (emoji / CJK-SMP)
-//! cells as U+FFFD, including bases stored separately from cluster tails.
+//! Resizing must not turn on-screen non-BMP cells (emoji, CJK-SMP) into
+//! U+FFFD, including bases stored apart from their cluster tails.
 //!
-//! The hot write path stores a non-BMP codepoint in a per-viewport ComplexCharRing
-//! (O(1), no alloc); the column-reflow resize path migrates those into the
-//! persistent HashMap extras (#7447), but the rows-only / no-reflow paths used to
-//! drop BOTH rings via `invalidate_rings` WITHOUT migrating — so every visible
-//! emoji became U+FFFD. Lazy mid-session font injection made this fire in the wild:
-//! installing a fallback/emoji face changes cell metrics, the host re-fits the grid
-//! (a rows-only resize), and every emoji already on screen was corrupted.
+//! The hot write path stores a non-BMP codepoint in a per-viewport
+//! ComplexCharRing; every resize path, including rows-only and no-reflow ones,
+//! migrates it into the persistent extras before invalidating the rings. A
+//! rows-only resize is what a host does after a lazy font injection changes
+//! cell metrics.
 
 use aterm_core::terminal::Terminal;
 
@@ -31,7 +29,7 @@ fn rows_only_grow_preserves_non_bmp_cell() {
     t.process(EMOJI_LINE);
     assert_eq!(t.row_text(0).as_deref().map(str::trim_end), Some("Q😀Z"));
 
-    // Rows GROW, cols UNCHANGED (the path that used to skip complex-ring migration).
+    // Rows grow, columns unchanged.
     t.resize(48, 80);
     assert_eq!(
         emoji_row(&t, 48).as_deref(),
@@ -73,7 +71,7 @@ fn font_refit_style_resize_preserves_non_bmp_cell() {
 
 #[test]
 fn column_reflow_still_preserves_non_bmp_cell() {
-    // Guard the pre-existing column-reflow migration (#7447) still works.
+    // Column reflow also keeps the non-BMP cell.
     let mut t = Terminal::new(24, 80);
     t.process(EMOJI_LINE);
     t.resize(50, 200); // cols change -> column reflow path
@@ -81,8 +79,8 @@ fn column_reflow_still_preserves_non_bmp_cell() {
 }
 
 /// The parser stores the non-BMP base in a dense ring while skin-tone/ZWJ
-/// suffixes live in the map. A map-only copy keeps the suffix and loses the
-/// base, producing the observed `�🏽‍💻` after even a non-wrapping resize.
+/// suffixes live in the map; a map-only copy would keep the suffix and lose
+/// the base (`�🏽‍💻`).
 #[test]
 fn column_reflow_preserves_parser_clusters_and_render_payloads() {
     const TEXT: &str = "Q👩🏽‍💻👍🏽🇯🇵🐈‍⬛e\u{0301}Z";

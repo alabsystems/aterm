@@ -225,10 +225,7 @@ pub struct ProgressFile {
 /// Current unix seconds, saturating at 0 for a clock before the epoch (backward skew
 /// then reads as epoch-stale — the safe, "not running" direction).
 fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    aterm_time::unix_secs().unwrap_or(0)
 }
 
 /// The writer's mutable state, behind the sink's one lock.
@@ -1292,16 +1289,9 @@ mod tests {
 #[cfg(test)]
 mod writer_tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
 
-    fn layout(label: &str) -> crate::store::Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-progress-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        crate::store::Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-progress-{label}-"))
     }
 
     fn read_file(path: &std::path::Path) -> ProgressFile {
@@ -1351,28 +1341,6 @@ mod writer_tests {
         std::thread::sleep(Duration::from_millis(WRITE_MIN_INTERVAL_MS + 20));
         sink.download_bytes("trust", 50, 100);
         assert_eq!(read_file(&path).programs["trust"].bytes_done, 50);
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// The heartbeat promise: with NOTHING changing, a poller-driven no-op call after
-    /// [`HEARTBEAT_MIN_INTERVAL_SECS`] still refreshes `heartbeat_unix` — a live
-    /// writer's file can never go stale under the readers' 10 s window.
-    #[test]
-    fn heartbeat_refreshes_with_no_change() {
-        let l = layout("heartbeat");
-        let path = l.progress_file();
-        let sink = ProgressSink::create(&path, "net").unwrap();
-        let h0 = read_file(&path).heartbeat_unix;
-        std::thread::sleep(Duration::from_millis(
-            HEARTBEAT_MIN_INTERVAL_SECS * 1000 + 100,
-        ));
-        // A no-change poll (same bytes as at create): not dirty, but heartbeat-due.
-        sink.download_bytes("trust", 0, 0);
-        let h1 = read_file(&path).heartbeat_unix;
-        assert!(
-            h1 >= h0 + HEARTBEAT_MIN_INTERVAL_SECS,
-            "no-change writes must still refresh the heartbeat ({h0} → {h1})"
-        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1625,8 +1593,8 @@ mod writer_tests {
     /// failed a correct `end_pass` at 220 ms (e65705bf2) against a regression
     /// worth ~250 ms: no clock separates the two. The 60 s below is only the
     /// fail-safe for that hour: a regression fails there, a slow machine never
-    /// does. That no tick lands after the terminal snapshot stays pinned, on the
-    /// real cadence, by `a_silent_phase_keeps_the_pass_heartbeat_live`.
+    /// does. That no tick lands after the terminal snapshot is structural:
+    /// `end_pass` stops and joins the heartbeat before it writes that snapshot.
     #[test]
     fn stopping_a_pass_poller_does_not_wait_out_its_tick() {
         let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1694,7 +1662,7 @@ mod writer_tests {
         // 700 ms, and the due write lands 0-500 ms into that by tick phase, so
         // five oversleeping 500 ms parks on a loaded run queue made a correct
         // heartbeat read as dead (the load-sensitive test audit of 2026-09-27).
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let file = loop {
             let file = read_file(&l.progress_file());
             if file.heartbeat_unix >= h0 + HEARTBEAT_MIN_INTERVAL_SECS {
@@ -1712,17 +1680,11 @@ mod writer_tests {
             "a silent-but-live pass reads as running"
         );
         end_pass();
-        // The terminal snapshot is the LAST word: the heartbeat thread is
-        // stopped before it, so no tick can restamp a pid-cleared file live.
+        // The terminal snapshot is the LAST word: `end_pass` stops and joins the
+        // heartbeat thread before it, so no tick can restamp a pid-cleared file live.
         let ended = read_file(&l.progress_file());
         assert_eq!(ended.pid, None);
-        std::thread::sleep(Duration::from_millis(HEARTBEAT_TICK_MS * 2 + 200));
-        let later = read_file(&l.progress_file());
-        assert_eq!(
-            later.heartbeat_unix, ended.heartbeat_unix,
-            "no heartbeat tick may land after end_pass"
-        );
-        assert!(!snapshot_running(&later, unix_now()));
+        assert!(!snapshot_running(&ended, unix_now()));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

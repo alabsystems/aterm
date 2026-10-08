@@ -1,43 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Tier-1 conformance: bind the REAL event-log spine to the DERIVED `Kernel`
-//! model (`aterm_spec::derive::kernel_model()`).
+//! Tier-1 conformance: binds the real event-log spine to the derived `Kernel`
+//! model (`aterm_spec::derive::kernel_model()`): every `Emit` bumps `count` by
+//! one and assigns the next contiguous `seq`, so `SeqIsCount` holds. `Buggy = 1`
+//! opens a gap (an append that advances `seq` by two).
 //!
-//! The model is the spine's gap-free law: every `Emit` bumps `count` by one and
-//! assigns the next contiguous `seq`, so `SeqIsCount` (`seq = count`) holds in
-//! every state. Its `Buggy = 1` member opens a gap (an append that advances
-//! `seq` by two).
+//! The two projected variables come from different sides of the code, so the
+//! law is checked rather than restated: `count` is how many edits the test handed
+//! `Surface::apply` / `Surface::transact` / `EventLog::append_at`, and `seq` is
+//! the seq stored on each event read back off the ring (never the log's own
+//! counter). The seq a call returns and the log's head must be the newest stored.
 //!
-//! The two projected variables come from DIFFERENT sides of the real code, so
-//! the law is checked rather than restated:
-//!
-//! * `count` is the WRITER'S side — how many edits this test handed the
-//!   shipping `Surface::apply` / `Surface::transact` / `EventLog::append_at`;
-//! * `seq` is the SPINE'S side — the seq stamped on each event the real log
-//!   STORED, the one every reader is handed, read back off the ring (never the
-//!   log's own counter). Each stored event is one `Emit`, so a call that stored
-//!   events with a gap between their seqs is a step the model rejects even when
-//!   the counter itself kept counting. The seq a call returns and the log's
-//!   reported head must both be the newest stored one.
-//!
-//! Every real edit is validated as an `Emit` (in-process interpreter on every
-//! step, `ty trace validate` on a spread wherever installed), across every edit
-//! kind, a committed multi-edit transaction (its events read back one by one),
-//! a refused one (no events, so no step), the temporal `append_at` seam, and the
-//! eviction regime past `MAX_LOG_EVENTS` — the spine keeps counting after the
-//! ring forgets, and the live window stays contiguous at the eviction edge
-//! (what `append_at` spills is exactly the event that fell off).
-//!
-//! NEGATIVE CONTROL — the modelled gap, projected from a real state, is rejected
-//! by the committed model and admitted by `Buggy = 1`.
+//! Covered: every edit kind, a committed multi-edit transaction, a refused one
+//! (no step), the temporal `append_at` seam, and eviction past
+//! `MAX_LOG_EVENTS`, where the live window stays contiguous and `append_at`
+//! spills exactly the event that fell off. Negative control: the modelled gap,
+//! projected from a real state, is rejected by the model and admitted by `Buggy`.
 
+use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Edit, EventLog, LineId, MAX_LOG_EVENTS, Op, Seq, Surface, Ticks, TxnOutcome};
-mod support;
 use aterm_spec::derive::{Model, kernel_model};
 use aterm_spec::{interp, verify};
 use std::collections::BTreeMap;
-use support::{read_cap, write_cap};
 
 type State = BTreeMap<&'static str, i64>;
 
@@ -54,7 +39,7 @@ fn state(seq: u64, count: u64) -> State {
 }
 
 /// Is `prev -> next` the model's `Emit`? The interpreter answers every step;
-/// `tiered` additionally asks `ty` (spawned per call, so used on a spread).
+/// `tiered` also asks `ty` (spawned per call, so used on a spread).
 fn emits(m: &Model, prev: &State, next: &State, tiered: bool) -> (bool, String) {
     if tiered {
         return verify::validate_transition_tiered(
@@ -73,8 +58,7 @@ fn emits(m: &Model, prev: &State, next: &State, tiered: bool) -> (bool, String) 
     )
 }
 
-/// The seqs of the `n` NEWEST events the log stored, oldest first — read back
-/// off the ring, which is what every reader sees.
+/// The seqs of the `n` newest stored events, oldest first, read off the ring.
 fn newest_stored(log: &EventLog, n: usize) -> Vec<u64> {
     if n == 1 {
         return vec![log.newest_live().expect("an event was stored").seq.0];
@@ -116,9 +100,8 @@ impl Spine {
         }
     }
 
-    /// Record that ONE real call handed the spine `n` events: each of the `n`
-    /// events it stored is one `Emit`, projected from the seq stored on it. The
-    /// seq the call returned and the log's head must be the newest of them.
+    /// Record that one real call stored `n` events, each one `Emit` projected
+    /// from its stored seq; the returned seq and the log's head must be the newest.
     fn emitted(&mut self, log: &EventLog, n: usize, returned: Seq, tiered: bool) {
         let stored = newest_stored(log, n);
         let newest = *stored.last().expect("n > 0");
@@ -169,8 +152,7 @@ fn real_surface_spine_conforms_to_kernel_model() {
         spine.emitted(s.log(), 1, assigned, true);
     }
 
-    // A committed transaction: its body lands atomically, one event per edit, so
-    // ONE real call stores that many events, each read back as one `Emit`.
+    // A committed transaction stores one event per edit in one call.
     let base = s.seq();
     let body = vec![
         Edit::AppendLine("t1".into()),
@@ -183,8 +165,7 @@ fn real_surface_spine_conforms_to_kernel_model() {
     };
     spine.emitted(s.log(), n, committed, true);
 
-    // A refused transaction appends nothing: no event, so no step — the head
-    // must not move.
+    // A refused transaction appends nothing, so the head must not move.
     let stale = Seq(base.0);
     let head = s.seq();
     assert_eq!(
@@ -203,8 +184,7 @@ fn real_surface_spine_conforms_to_kernel_model() {
     let _ = s.poll(s.subscribe(&read_cap()));
     assert_eq!(s.seq(), head, "reads are not events");
 
-    // EVICTION REGIME: past MAX_LOG_EVENTS the ring forgets its oldest entries
-    // but the spine keeps counting — `seq = count` must survive eviction.
+    // Eviction: the ring forgets its oldest entries but `seq = count` holds.
     let cap = MAX_LOG_EVENTS as u64;
     let target = cap + 16;
     while spine.count < target {
@@ -229,8 +209,7 @@ fn real_surface_spine_conforms_to_kernel_model() {
     assert!(spine.steps as u64 >= target, "every real event was a step");
 }
 
-/// The temporal seam (`EventLog::append_at`) rides the same spine — including
-/// across its own spill point, where it hands back the evicted event.
+/// `EventLog::append_at` rides the same spine, including across its spill point.
 #[test]
 fn real_append_at_spine_conforms_to_kernel_model() {
     let mut log = EventLog::default();
@@ -261,7 +240,7 @@ fn real_append_at_spine_conforms_to_kernel_model() {
     assert_eq!(log.total(), spine.count);
 }
 
-/// The modelled defect from a REAL state: an append that jumps the head by two.
+/// The modelled defect from a real state: an append that jumps the head by two.
 #[test]
 fn a_gapped_append_is_the_buggy_step_the_bind_rejects() {
     let m = kernel_model();

@@ -4,6 +4,7 @@
 
 //! Grapheme width calculation, emoji detection, and classification.
 
+use crate::emoji_presentation::is_vs16_emoji_capable;
 use crate::grapheme_iter::GraphemeClusters;
 use crate::tables::width as unicode_tables;
 use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
@@ -17,9 +18,6 @@ use crate::types::{Grapheme, GraphemeInfo};
 /// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
 /// ENSURES: `result.byte_count == s.len()` and width/count fields are derived from grapheme iteration of `s`.
 ///
-/// This is an efficient single-pass analysis that computes all grapheme
-/// metrics at once.
-///
 /// # Example
 ///
 /// ```
@@ -30,25 +28,24 @@ use crate::types::{Grapheme, GraphemeInfo};
 /// assert_eq!(info.display_width, 11); // 7 ASCII + 2 wide chars
 /// ```
 pub fn grapheme_width(s: &str) -> GraphemeInfo {
+    grapheme_width_inner(s, false)
+}
+
+fn grapheme_width_inner(s: &str, cjk: bool) -> GraphemeInfo {
     let mut info = GraphemeInfo {
         byte_count: s.len(),
         ..Default::default()
     };
-
     for g in s.graphemes() {
-        let codepoints: usize = g.chars().count();
-        let width = grapheme_display_width(g);
-        let has_combining = codepoints > 1 && width <= 1;
-        let is_emoji = is_emoji_grapheme(g);
-
+        let codepoints = g.chars().count();
+        let width = grapheme_display_width_inner(g, cjk);
         info.grapheme_count += 1;
         info.display_width += width;
         info.codepoint_count += codepoints;
-        info.has_emoji |= is_emoji;
-        info.has_combining |= has_combining;
+        info.has_emoji |= is_emoji_grapheme(g);
+        info.has_combining |= codepoints > 1 && width <= 1;
         info.has_wide |= width == 2;
     }
-
     info
 }
 
@@ -57,25 +54,14 @@ pub fn grapheme_width(s: &str) -> GraphemeInfo {
 /// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns a terminal cell width in the inclusive range `0..=2`.
 ///
-/// Returns 0, 1, or 2 based on the grapheme's visual width in a terminal.
-///
-/// # Rules
-///
-/// - Control characters: 0 width
-/// - Most ASCII: 1 width
-/// - CJK ideographs: 2 width
-/// - Most emoji: 2 width
-/// - Zero-width joiners/combining marks: 0 width (but counted in cluster)
-///
+/// A lone C0/C1 control is 1 (terminals advance past a rendered control); a
+/// cluster takes its first character's width, except that an emoji base with
+/// VS16, a skin tone or a ZWJ is 2.
 pub fn grapheme_display_width(grapheme: &str) -> usize {
     grapheme_display_width_inner(grapheme, false)
 }
 
-/// Inner implementation of grapheme display width calculation.
-///
-/// Handles emoji presentation sequences, ZWJ sequences, keycap sequences,
-/// and VS16 modifiers that make grapheme clusters width 2.
-/// When `cjk` is true, ambiguous-width characters are treated as width 2.
+/// [`grapheme_display_width`]; `cjk` makes ambiguous-width characters 2.
 fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
     let char_width_fn = if cjk {
         unicode_tables::char_width_cjk
@@ -91,12 +77,9 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
 
     let first_cp = first as u32;
 
-    // Single-character grapheme: fast path
     let second = match chars.next() {
         Some(c) => c,
         None => {
-            // Control chars (C0/C1): return 1 for terminal display compatibility
-            // (terminals typically advance cursor by 1 for rendered control chars)
             if first_cp <= 0x1F || (0x7F..=0x9F).contains(&first_cp) {
                 return 1;
             }
@@ -104,48 +87,27 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
         }
     };
 
-    // Multi-codepoint grapheme cluster
-    let first_is_emoji = is_emoji_char(first) || is_emoji_presentation_base(first_cp);
+    // Multi-codepoint grapheme cluster. VS16 (U+FE0F) widens a text-default
+    // emoji, and only that: the grid's rule (`is_vs16_emoji_capable`), so `a️`
+    // and `✓️` stay one cell, as the grid draws them.
+    if is_vs16_emoji_capable(first) && grapheme.contains('\u{FE0F}') {
+        return 2;
+    }
+    let first_is_emoji = is_emoji_char(first) || is_vs16_emoji_capable(first);
 
-    // Check for VS16 (U+FE0F) emoji presentation: base + FE0F = width 2
-    if second as u32 == 0xFE0F {
+    // An emoji base with a skin tone, or an emoji ZWJ sequence, is wide.
+    if first_is_emoji
+        && (is_skin_tone_modifier(second) || second == '\u{200D}' || chars.any(|c| c == '\u{200D}'))
+    {
         return 2;
     }
 
-    // Check for emoji modifier (skin tone): emoji + modifier = width 2
-    if first_is_emoji && (0x1F3FB..=0x1F3FF).contains(&(second as u32)) {
-        return 2;
-    }
-
-    // Check for ZWJ (U+200D): only emoji ZWJ sequences are width 2
-    if second as u32 == 0x200D && first_is_emoji {
-        return 2;
-    }
-
-    // Check remaining chars for ZWJ or VS16 (keycap sequences, extended emoji)
-    for c in chars {
-        let cp = c as u32;
-        if cp == 0xFE0F {
-            return 2;
-        }
-        if cp == 0x200D && first_is_emoji {
-            return 2;
-        }
-    }
-
-    // For other multi-codepoint clusters (e.g. base + combining marks),
-    // use the first char's width
-    let width = char_width_fn(first);
-
-    // Clamp to max 2 for terminal display
-    width.min(2)
+    // Base + combining marks: the base's width.
+    char_width_fn(first).min(2)
 }
 
-/// Calculate aggregate grapheme information for a string using a text shaping config.
-///
-/// This is the config-aware equivalent of [`grapheme_width`]. It uses
-/// `grapheme_display_width_with_config` for each grapheme, so ambiguous-width
-/// characters respect the `AmbiguousWidth` setting.
+/// [`grapheme_width`] with ambiguous-width characters sized by
+/// `config.ambiguous_width`.
 ///
 /// # Example
 ///
@@ -159,260 +121,70 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
 /// assert_eq!(info.display_width, 6); // degree(2) + t(1) + e(1) + s(1) + t(1)
 /// ```
 pub fn grapheme_width_with_config(s: &str, config: &TextShapingConfig) -> GraphemeInfo {
-    let mut info = GraphemeInfo {
-        byte_count: s.len(),
-        ..Default::default()
-    };
-
-    for g in s.graphemes() {
-        let codepoints: usize = g.chars().count();
-        let width = grapheme_display_width_with_config(g, config);
-        let has_combining = codepoints > 1 && width <= 1;
-        let is_emoji = is_emoji_grapheme(g);
-
-        info.grapheme_count += 1;
-        info.display_width += width;
-        info.codepoint_count += codepoints;
-        info.has_emoji |= is_emoji;
-        info.has_combining |= has_combining;
-        info.has_wide |= width == 2;
-    }
-
-    info
+    grapheme_width_inner(s, is_cjk(config))
 }
 
-/// Iterator over grapheme clusters with metadata, using a text shaping config.
-///
-/// This is the config-aware equivalent of [`split_graphemes`]. Ambiguous-width
-/// characters respect the `AmbiguousWidth` setting when computing per-grapheme
-/// display widths.
+/// [`split_graphemes`] with ambiguous-width characters sized by
+/// `config.ambiguous_width`.
 pub fn split_graphemes_with_config<'a>(
     s: &'a str,
-    config: &'a TextShapingConfig,
-) -> impl Iterator<Item = Grapheme<'a>> {
-    s.grapheme_indices().map(move |(offset, g)| {
-        let codepoint_count = g.chars().count();
-        let width = grapheme_display_width_with_config(g, config);
-        let has_combining = codepoint_count > 1 && width <= 1;
-        let is_emoji = is_emoji_grapheme(g);
-
-        Grapheme {
-            text: g,
-            byte_offset: offset,
-            width,
-            codepoint_count,
-            is_emoji,
-            has_combining,
-        }
-    })
+    config: &TextShapingConfig,
+) -> impl Iterator<Item = Grapheme<'a>> + use<'a> {
+    split_graphemes_inner(s, is_cjk(config))
 }
 
-/// Calculate the display width of a grapheme with text shaping config.
-///
-/// Uses `width_cjk()` when `ambiguous_width == Double` (CJK mode).
-/// This affects characters with Unicode East Asian Width property "Ambiguous"
-/// like degree sign (deg), em-dash, and some box drawing characters.
+/// [`grapheme_display_width`] with East Asian Ambiguous characters (degree
+/// sign, em dash, some box drawing) 2 cells wide when
+/// `config.ambiguous_width` is `Double`.
 pub fn grapheme_display_width_with_config(grapheme: &str, config: &TextShapingConfig) -> usize {
-    #[allow(unreachable_patterns)] // AmbiguousWidth is #[non_exhaustive]; wildcard required
-    let cjk = matches!(config.ambiguous_width, AmbiguousWidth::Double);
-    grapheme_display_width_inner(grapheme, cjk)
+    grapheme_display_width_inner(grapheme, is_cjk(config))
+}
+
+fn is_cjk(config: &TextShapingConfig) -> bool {
+    matches!(config.ambiguous_width, AmbiguousWidth::Double)
 }
 
 /// Iterator over grapheme clusters with metadata.
 ///
 /// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
 /// ENSURES: iterator yields graphemes in byte order with non-overlapping byte ranges that cover `s`.
-///
-/// This provides detailed information about each grapheme, including
-/// byte offset, width, and composition.
 pub fn split_graphemes(s: &str) -> impl Iterator<Item = Grapheme<'_>> {
-    s.grapheme_indices().map(|(offset, g)| {
-        let codepoint_count = g.chars().count();
-        let width = grapheme_display_width(g);
-        let has_combining = codepoint_count > 1 && width <= 1;
-        let is_emoji = is_emoji_grapheme(g);
+    split_graphemes_inner(s, false)
+}
 
+fn split_graphemes_inner(s: &str, cjk: bool) -> impl Iterator<Item = Grapheme<'_>> {
+    s.grapheme_indices().map(move |(offset, g)| {
+        let codepoint_count = g.chars().count();
+        let width = grapheme_display_width_inner(g, cjk);
         Grapheme {
             text: g,
             byte_offset: offset,
             width,
             codepoint_count,
-            is_emoji,
-            has_combining,
+            is_emoji: is_emoji_grapheme(g),
+            has_combining: codepoint_count > 1 && width <= 1,
         }
     })
 }
 
-/// THE NUMBER OF GRID CELLS A TERMINAL LAYS `grapheme` OUT IN.
-///
-/// This is NOT [`grapheme_display_width`], and the difference is the whole
-/// point. That function answers "how wide does this cluster look", is
-/// documented to return 0, 1 or 2, and is right about emoji. The terminal grid
-/// answers a different question, because it does not allocate cells per
-/// CLUSTER — it advances the cursor per CHARACTER as it writes
-/// (`aterm_core`'s `handler_write`), with a stateful exception for emoji, where
-/// VS16 widens, VS15 narrows, and ZWJ and skin-tone modifiers fold back into the
-/// preceding cell.
-///
-/// So the rule, measured against the real grid rather than derived:
-///
-/// * an EMOJI cluster occupies its cluster display width — the folding cases;
-/// * everything else occupies the SUM of its characters' widths.
-///
-/// The second half is what three separate call sites got wrong. A Devanagari
-/// conjunct `na + virama + da + vowel-II` is ONE cluster under UAX#29 GB9c, and
-/// the grid paints it in THREE cells (`न्`, `द`, `ी`) because it advances per
-/// character. Every model that charged the cluster 1 or 2 put every later column
-/// on that row to the LEFT of the text actually painted — so a find-bar
-/// highlight covered a blank cell and dropped the match's last character, and a
-/// copied selection extracted a different run of cells than the one highlighted.
-///
-/// Measured agreement with the grid, 2026-09-16, on ASCII, CJK, Latin+combining,
-/// Devanagari `ka+II`, Devanagari and Bengali conjuncts, keycap, ZWJ family,
-/// skin-tone, regional-indicator flag, VS15 text and VS16 emoji — see
-/// `aterm-core/tests/grid_column_agreement.rs`, which drives the REAL grid and
-/// is the authority this function is checked against.
-///
-/// Unlike its neighbour this can exceed 2, because the grid can.
-#[must_use]
-pub fn grapheme_grid_columns(grapheme: &str) -> usize {
-    // A KEYCAP IS A FOLDING SEQUENCE THAT `is_emoji_grapheme` DOES NOT CLAIM.
-    // `1 + VS16 + U+20E3` is painted in 2 cells like any other emoji, but the
-    // classifier answers `false` for it, so it fell to the per-character sum and
-    // was charged 1 — measured against the grid, not assumed. U+20E3 COMBINING
-    // ENCLOSING KEYCAP appears in no other construction, so naming it here is
-    // exact rather than a heuristic.
-    let folds = is_emoji_grapheme(grapheme) || grapheme.contains('\u{20E3}');
-    if folds {
-        grapheme_display_width(grapheme)
-    } else {
-        grapheme.chars().map(unicode_tables::char_width).sum()
-    }
-}
-
-/// [`grapheme_grid_columns`] summed over `s`'s grapheme clusters: the number of
-/// grid cells a terminal lays the whole string out in.
-#[must_use]
-pub fn str_grid_columns(s: &str) -> usize {
-    use crate::GraphemeClusters;
-    s.graphemes().map(grapheme_grid_columns).sum()
-}
-
-/// Check if a grapheme cluster is primarily an emoji.
-///
-/// This detects emoji including:
-/// - Basic emoji
-/// - Emoji with modifiers
-/// - Emoji ZWJ sequences
-/// - Regional indicator pairs
+/// Whether the cluster's first character [`is_emoji_char`].
 fn is_emoji_grapheme(grapheme: &str) -> bool {
-    let first_char = grapheme.chars().next();
-    match first_char {
-        Some(c) => is_emoji_char(c),
-        None => false,
-    }
+    grapheme.chars().next().is_some_and(is_emoji_char)
 }
 
-/// Check if a codepoint is an emoji presentation base.
-///
-/// These are characters that can appear as text by default but become emoji
-/// with VS16 (U+FE0F). Includes keycap bases (#, *, 0-9), miscellaneous
-/// symbols, and dingbats.
-fn is_emoji_presentation_base(cp: u32) -> bool {
-    // Keycap bases: #, *, 0-9
-    if cp == 0x23 || cp == 0x2A || (0x30..=0x39).contains(&cp) {
-        return true;
-    }
-    // Common text-presentation emoji that become emoji with VS16
-    // Information source, trade mark, copyright, registered
-    if matches!(cp, 0x00A9 | 0x00AE | 0x2122 | 0x2139) {
-        return true;
-    }
-    // Arrows and misc
-    if matches!(cp, 0x2194..=0x2199 | 0x21A9..=0x21AA) {
-        return true;
-    }
-    // Misc symbols that have emoji variants
-    if (0x2300..=0x23FF).contains(&cp) {
-        return true;
-    }
-    // Misc technical
-    if (0x2460..=0x24FF).contains(&cp) {
-        return true;
-    }
-    // Dingbats and misc symbols (including sun U+2600, etc.)
-    if (0x2600..=0x27BF).contains(&cp) {
-        return true;
-    }
-    // Supplemental arrows
-    if (0x2934..=0x2935).contains(&cp) {
-        return true;
-    }
-    // CJK symbols
-    if matches!(cp, 0x3030 | 0x303D | 0x3297 | 0x3299) {
-        return true;
-    }
-    false
-}
-
-/// Check if a character is an emoji or emoji component.
+/// Whether `c` is in an emoji-heavy block, a regional indicator or VS16: a
+/// coarse block test for width clustering, not the `Emoji` property (see
+/// [`crate::is_emoji_presentation`]).
 pub fn is_emoji_char(c: char) -> bool {
-    let cp = c as u32;
-
-    // Common emoji ranges (simplified for performance)
-    // See Unicode Emoji specification for complete list
-
-    // Dingbats (some emoji)
-    if (0x2600..=0x26FF).contains(&cp) {
-        return true;
-    }
-
-    // Misc symbols
-    if (0x2700..=0x27BF).contains(&cp) {
-        return true;
-    }
-
-    // Supplemental symbols and pictographs
-    if (0x1F300..=0x1F5FF).contains(&cp) {
-        return true;
-    }
-
-    // Emoticons
-    if (0x1F600..=0x1F64F).contains(&cp) {
-        return true;
-    }
-
-    // Transport and map symbols
-    if (0x1F680..=0x1F6FF).contains(&cp) {
-        return true;
-    }
-
-    // Supplemental symbols
-    if (0x1F900..=0x1F9FF).contains(&cp) {
-        return true;
-    }
-
-    // Symbols and pictographs extended-A
-    if (0x1FA00..=0x1FA6F).contains(&cp) {
-        return true;
-    }
-
-    // Symbols and pictographs extended-B
-    if (0x1FA70..=0x1FAFF).contains(&cp) {
-        return true;
-    }
-
-    // Regional indicator symbols
-    if (0x1F1E0..=0x1F1FF).contains(&cp) {
-        return true;
-    }
-
-    // Variation selectors (emoji presentation)
-    if cp == 0xFE0F {
-        return true;
-    }
-
-    false
+    matches!(
+        c as u32,
+        0x2600..=0x27BF // Miscellaneous Symbols, Dingbats
+        | 0x1F1E0..=0x1F1FF // Regional indicators
+        | 0x1F300..=0x1F64F // Misc Symbols and Pictographs, Emoticons
+        | 0x1F680..=0x1F6FF // Transport and Map Symbols
+        | 0x1F900..=0x1FAFF // Supplemental Symbols and Pictographs through Extended-A
+        | 0xFE0F // VS16
+    )
 }
 
 /// Zero Width Joiner (ZWJ) character.
@@ -432,36 +204,29 @@ pub fn has_zwj(grapheme: &str) -> bool {
 /// Check if a character is a skin tone modifier.
 ///
 /// Skin tone modifiers (Fitzpatrick scale) are U+1F3FB through U+1F3FF.
-#[cfg(any(test, kani))]
 #[inline]
 pub fn is_skin_tone_modifier(c: char) -> bool {
     matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
 }
 
-/// Check if a character is an emoji modifier base — i.e., can accept a
-/// Fitzpatrick skin-tone modifier (U+1F3FB..=U+1F3FF).
+/// Whether `c` takes a Fitzpatrick skin-tone modifier (U+1F3FB..=U+1F3FF).
 ///
-/// Covers the common subset of `Emoji_Modifier_Base` from Unicode emoji-data.txt
-/// (UTS #51): people, hand gestures, body parts, and person activities. Both the
-/// live write path (`try_combine_skin_tone_modifier`) and the scrollback
-/// materializer gate skin-tone folding on this, so a skin-toned emoji renders as
-/// one cell whether it is live or scrolled back — single source of truth.
+/// Exactly `Emoji_Modifier_Base` from Unicode 16.0.0 emoji-data.txt (UTS #51;
+/// 134 code points), the UCD version of [`crate::tables`]. The live write path
+/// (`try_combine_skin_tone_modifier`) and the scrollback materializer both
+/// fold skin tones on this, so a skin-toned emoji is one cell either way.
 #[must_use]
 #[inline]
 pub fn is_emoji_modifier_base(c: char) -> bool {
     let cp = c as u32;
     matches!(
         cp,
-        // People and body parts (U+261D, U+26F9)
-        0x261D | 0x26F9
-        // Dingbats: raised hand, victory hand, writing hand
-        | 0x270A..=0x270D
-        // Miscellaneous Symbols and Pictographs
+        0x261D | 0x26F9 // Index Pointing Up, Person Bouncing Ball
+        | 0x270A..=0x270D // Raised Fist through Writing Hand
         | 0x1F385 // Santa Claus
-        | 0x1F3C2..=0x1F3C4 // Snowboarder, Horse Racing, Surfer
+        | 0x1F3C2..=0x1F3C4 // Snowboarder, Runner, Surfer
         | 0x1F3C7 // Horse Racing
         | 0x1F3CA..=0x1F3CC // Swimmer, Lifter, Golfer
-        // People emoji block (U+1F442-U+1F4AA)
         | 0x1F442..=0x1F443 // Ear, Nose
         | 0x1F446..=0x1F450 // Pointing up through open hands
         | 0x1F466..=0x1F478 // Boy through Princess
@@ -471,24 +236,23 @@ pub fn is_emoji_modifier_base(c: char) -> bool {
         | 0x1F48F // Kiss
         | 0x1F491 // Couple with Heart
         | 0x1F4AA // Flexed Biceps
-        // Additional people and activities
         | 0x1F574..=0x1F575 // Man in Business Suit Levitating, Sleuth
         | 0x1F57A // Man Dancing
         | 0x1F590 // Raised Hand with Fingers Splayed
         | 0x1F595..=0x1F596 // Reversed Hand with Middle Finger, Vulcan Salute
         | 0x1F645..=0x1F647 // Face No Good through Person Bowing
         | 0x1F64B..=0x1F64F // Happy Person Raising Hand through Person Praying
-        // Supplemental Symbols and Pictographs
         | 0x1F6A3 // Rowboat
         | 0x1F6B4..=0x1F6B6 // Bicyclist through Pedestrian
         | 0x1F6C0 // Bath
         | 0x1F6CC // Sleeping Accommodation
-        // Hand gestures and people (Supplemental Symbols block)
-        | 0x1F90C..=0x1F90F // Pinched Fingers through Pinching Hand + extras
+        | 0x1F90C // Pinched Fingers
+        | 0x1F90F // Pinching Hand
         | 0x1F918..=0x1F91F // Sign of the Horns through I Love You Gesture
         | 0x1F926 // Face Palm
         | 0x1F930..=0x1F939 // Pregnant Woman through Juggling
         | 0x1F93C..=0x1F93E // Wrestlers through Handball
+        | 0x1F977 // Ninja
         | 0x1F9B5..=0x1F9B6 // Leg, Foot
         | 0x1F9B8..=0x1F9B9 // Superhero, Supervillain
         | 0x1F9BB // Ear with Hearing Aid
@@ -511,7 +275,6 @@ pub fn has_skin_tone(grapheme: &str) -> bool {
 /// Check if a character is a regional indicator.
 ///
 /// Regional indicators (A-Z) are used in pairs to create flag emoji.
-#[cfg(any(test, kani))]
 #[inline]
 pub fn is_regional_indicator(c: char) -> bool {
     matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
@@ -543,7 +306,6 @@ pub fn classify_grapheme(grapheme: &str) -> GraphemeType {
         .expect("invariant: checked !is_empty()");
     let codepoint_count = grapheme.chars().count();
 
-    // Check for ASCII
     if grapheme.len() == 1 && first.is_ascii() {
         return if first.is_control() {
             GraphemeType::Control
@@ -552,27 +314,22 @@ pub fn classify_grapheme(grapheme: &str) -> GraphemeType {
         };
     }
 
-    // Check for ZWJ sequence
     if has_zwj(grapheme) {
         return GraphemeType::ZwjSequence;
     }
 
-    // Check for flag emoji
     if is_flag_emoji(grapheme) {
         return GraphemeType::Flag;
     }
 
-    // Check for combining marks
     if codepoint_count > 1 && grapheme_display_width(grapheme) <= 1 {
         return GraphemeType::Combining;
     }
 
-    // Check for emoji
     if is_emoji_char(first) {
         return GraphemeType::Emoji;
     }
 
-    // Check for wide character
     if grapheme_display_width(grapheme) == 2 {
         return GraphemeType::Wide;
     }

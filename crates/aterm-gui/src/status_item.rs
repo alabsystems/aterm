@@ -65,6 +65,13 @@ pub(crate) enum OperatorAction {
     /// Open the §5 connection map on the frontmost window, raising it (the
     /// [`Self::Show`] host+raise shape; design §5.1 macOS entry).
     ShowConnectionMap,
+    /// File the exceptions digest: every fact it stands on goes to the log as
+    /// one dismissal (owner rule 2026-09-28) — what `Dismiss all` does on
+    /// Settings ▸ Messages, the same press.
+    DismissExceptions,
+    /// Open Settings ▸ Messages at one digest entry (payload: its log id) —
+    /// what a click on a "To look at" line does.
+    ShowException(u64),
 }
 
 /// The packed-tag band width for payload-carrying actions: `tag = kind × BAND +
@@ -92,9 +99,11 @@ impl OperatorAction {
             OperatorAction::Show => 2,
             OperatorAction::Stop => 3,
             OperatorAction::ShowConnectionMap => 4,
+            OperatorAction::DismissExceptions => 5,
             OperatorAction::FocusWindow(id) => packed(1, id),
             OperatorAction::FocusSession(id) => packed(2, id),
             OperatorAction::RaiseInstance(pid) => packed(3, u64::from(pid)),
+            OperatorAction::ShowException(id) => packed(4, id),
         }
     }
 
@@ -106,6 +115,7 @@ impl OperatorAction {
             2 => Some(OperatorAction::Show),
             3 => Some(OperatorAction::Stop),
             4 => Some(OperatorAction::ShowConnectionMap),
+            5 => Some(OperatorAction::DismissExceptions),
             t if t >= TAG_BAND => {
                 let payload = t % TAG_BAND;
                 let payload_u64 = u64::try_from(payload).ok()?;
@@ -115,6 +125,7 @@ impl OperatorAction {
                     3 => u32::try_from(payload_u64)
                         .ok()
                         .map(OperatorAction::RaiseInstance),
+                    4 => Some(OperatorAction::ShowException(payload_u64)),
                     _ => None,
                 }
             }
@@ -376,9 +387,7 @@ pub(crate) fn fold_clip(s: &str, max: usize) -> String {
 
 /// FNV-1a 64 of `s` — the key of a text escalation.
 fn text_key(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+    aterm_hash::fnv1a_64(s.as_bytes())
 }
 
 /// The agent-verdict half of [`escalation`]: `(kind, what)` for a verdict
@@ -439,15 +448,16 @@ fn agent_escalation(fact: &AgentFact, resume: Option<&str>) -> Option<(Escalatio
 
 /// The memory wall's remedy (`wall:memory`, unsupervised): the restart, then
 /// the tab's own resume line ([`SessionRow::resume`]) — whole, never cut: the
-/// line with its carried flags where it fits [`STALL_TEXT_MAX`], else the
-/// bare `claude --resume <id>`, else the restart alone. Never the banner's
-/// `claude --continue` (2026-09-26).
+/// line with its carried flags where it fits [`STALL_TEXT_MAX`], else its
+/// shorter forms (its permission mode alone, then the bare `claude --resume
+/// <id>`: [`aterm_agent::harness::resume::shorter`]), else the restart
+/// alone. Never the banner's `claude --continue` (2026-09-26).
 fn memory_remedy(resume: Option<&str>) -> String {
     const HEAD: &str = "memory critical \u{2014} restart it";
     resume
         .into_iter()
         .flat_map(|line| {
-            std::iter::once(line.to_string()).chain(aterm_agent::harness::resume::bare_of(line))
+            std::iter::once(line.to_string()).chain(aterm_agent::harness::resume::shorter(line))
         })
         .map(|cmd| format!("{HEAD}, then {cmd}"))
         .find(|what| what.len() <= STALL_TEXT_MAX)
@@ -500,6 +510,18 @@ const STOPPED_HEADLINE: &str = "aterm \u{00b7} program stopped";
 /// agent still runs, so "agent stopped" would be false.
 const MEMORY_HEADLINE: &str = "aterm \u{00b7} agent memory critical";
 
+/// A banner body about one tab: `<tab title>: <what>`, the title stripped of
+/// status glyphs and clipped like a menu row; `what` alone when the title is
+/// empty. Every banner aterm posts for a tab leads with it.
+pub(crate) fn tab_body(title: &str, what: &str) -> String {
+    let title = fold_clip(stripped_title(title), ROW_TITLE_MAX);
+    if title.is_empty() {
+        what.to_string()
+    } else {
+        format!("{title}: {what}")
+    }
+}
+
 /// The ONE escalation a session row carries, or `None`. A published input
 /// stall wins over everything, supervised or not
 /// ([`EscalationKind::Unresponsive`]: whatever a box or a badge asks, the
@@ -514,14 +536,7 @@ const MEMORY_HEADLINE: &str = "aterm \u{00b7} agent memory critical";
 /// supervisor never sees ([`outlives_supervision`]): its row is raised
 /// supervised or not.
 pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
-    let title = fold_clip(stripped_title(&row.title), ROW_TITLE_MAX);
-    let body_for = |what: &str| {
-        if title.is_empty() {
-            what.to_string()
-        } else {
-            format!("{title}: {what}")
-        }
-    };
+    let body_for = |what: &str| tab_body(&row.title, what);
     if let Some(stall) = &row.input_stall {
         // The whole remedy, never clipped to a row's `<kind> <command>`
         // budget: `signal term` and what follows it — the tab's own resume
@@ -613,12 +628,15 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     }
     let stripped = stripped_title(&row.title);
     if stripped.starts_with('⚠') || row.title.trim_start().starts_with('⚠') {
-        let text = row.title.trim().to_string();
+        // The title is program-written (OSC 0/2, up to 1 KiB): its label is
+        // folded and clipped like every other row's, so no newline, no
+        // invisible format character and no kilobyte reaches the menu item.
+        let text = fold_clip(&row.title, ROW_WHAT_MAX);
         return Some(Escalation {
             session: row.id,
             kind: EscalationKind::Title,
             key: text_key(&text),
-            body: fold_clip(&text, ROW_WHAT_MAX),
+            body: text.clone(),
             label: text,
             headline: EscalationKind::Title.headline(),
             shared: false,
@@ -1306,6 +1324,12 @@ pub(crate) struct FleetGlance {
     /// Escalating sessions, most severe first: `(local_id, display text)`,
     /// one per session ([`escalation`]). Non-empty ⇒ the bar icon badges.
     pub warnings: Vec<(u64, String)>,
+    /// The digest's entries — what needs a look but not now (owner rule
+    /// 2026-09-28) — `(log id, glass-title subject)` per entry, worst first. Not a
+    /// session fact: [`classify`] leaves it empty and the glance builder fills
+    /// it from the digest. Non-empty ⇒ a `•` beside the mark (never the `⚠`:
+    /// nothing here needs the owner NOW) and a "To look at" section.
+    pub exceptions: Vec<(u64, String)>,
     /// This instance's windows, in id order.
     pub windows: Vec<WindowRow>,
     /// Sibling instances from the last background fleet scan, in pid order.
@@ -1321,6 +1345,9 @@ impl FleetGlance {
     pub(crate) fn button_title(&self) -> &'static str {
         if !self.warnings.is_empty() || self.instances.iter().any(|i| i.warnings > 0) {
             "❯⚠"
+        } else if !self.exceptions.is_empty() {
+            // Something to look at, nothing to do now: a dot, never an alarm.
+            "❯•"
         } else {
             "❯"
         }
@@ -1347,11 +1374,12 @@ impl FleetGlance {
         )
     }
 
-    /// A cheap change fingerprint: the caller refreshes AppKit only when this
-    /// string differs from the previous glance's (title drift is frequent; menu
-    /// rebuilds should not be). Covers EVERY rendered fact — windows and
-    /// sibling instances included — and its inputs arrive pre-sorted (windows
-    /// in id order, instances in pid order), so it is deterministic.
+    /// A cheap change fingerprint: the caller hands the status item a new
+    /// glance only when this string differs from the previous glance's (title
+    /// drift is frequent; handing over a glance should not be). Covers EVERY
+    /// rendered fact — windows and sibling instances included — and its inputs
+    /// arrive pre-sorted (windows in id order, instances in pid order), so it
+    /// is deterministic.
     pub fn fingerprint(&self) -> String {
         let mut fp = self.header_line();
         fp.push('\u{1f}');
@@ -1371,6 +1399,13 @@ impl FleetGlance {
             fp.push_str(&id.to_string());
             fp.push('=');
             fp.push_str(title);
+        }
+        for (id, line) in &self.exceptions {
+            fp.push('\u{1f}');
+            fp.push('x');
+            fp.push_str(&id.to_string());
+            fp.push('=');
+            fp.push_str(line);
         }
         for w in &self.windows {
             fp.push('\u{1f}');
@@ -1478,6 +1513,7 @@ pub(crate) fn classify(rows: &[SessionRow]) -> FleetGlance {
         // Not a title fact — the glance builder fills it from the edge fold.
         connections: 0,
         warnings,
+        exceptions: Vec::new(),
         windows: Vec::new(),
         instances: Vec::new(),
     }
@@ -1502,6 +1538,10 @@ pub(crate) enum StatusRow {
         enabled: bool,
     },
 }
+
+/// The most digest lines the menu spells out; the rest are counted.
+#[cfg(any(target_os = "macos", test))]
+const EXCEPTION_LINES_SHOWN: usize = 4;
 
 /// Compose the whole status menu from a glance — pure, deterministic, and
 /// unit-testable off macOS. Layout: operator header + management actions,
@@ -1573,6 +1613,41 @@ pub(crate) fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
             enabled: true,
         });
     }
+    // WHAT NEEDS A LOOK, NOT NOW (owner rule 2026-09-28): the digest's entries
+    // as clickable lines (each opens Settings ▸ Messages at that entry, where
+    // the whole sentence and its button are) and ONE way to file them all. A menu is a pull
+    // surface, so this costs the terminal nothing and interrupts nobody.
+    if !glance.exceptions.is_empty() {
+        rows.push(StatusRow::Info(format!(
+            "To look at ({})",
+            glance.exceptions.len()
+        )));
+        for (id, line) in glance.exceptions.iter().take(EXCEPTION_LINES_SHOWN) {
+            rows.push(StatusRow::Action {
+                label: line.clone(),
+                action: OperatorAction::ShowException(*id),
+                enabled: true,
+            });
+        }
+        if glance.exceptions.len() > EXCEPTION_LINES_SHOWN {
+            rows.push(StatusRow::Info(format!(
+                "and {} more",
+                glance.exceptions.len() - EXCEPTION_LINES_SHOWN
+            )));
+        }
+        rows.push(StatusRow::Action {
+            // The count is on the item: the menu spells out four lines, the
+            // dismissal files them ALL (the page's own `Dismiss` / `Dismiss
+            // all` words), and a dismissed entry stays readable in Messages.
+            label: match glance.exceptions.len() {
+                1 => "Dismiss \u{2014} kept in Messages".to_string(),
+                n => format!("Dismiss all {n} \u{2014} kept in Messages"),
+            },
+            action: OperatorAction::DismissExceptions,
+            enabled: true,
+        });
+        rows.push(StatusRow::Separator);
+    }
     rows.push(StatusRow::Info(glance.sessions_line()));
     // The map entry rides beside the count it summarizes (design §5.1); always
     // present — an empty fabric still opens an honest empty map.
@@ -1608,6 +1683,21 @@ pub(crate) fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
     rows
 }
 
+/// The bar-button title to set for `glance`, or `None` when the button already
+/// shows it. `shown` is what the AppKit half last set (`None` before the first
+/// set, or after a set that did not take). Pure, so "only a real change
+/// retitles the button" is testable off macOS: the fingerprint moves with every
+/// menu fact, but [`FleetGlance::button_title`] has only three values (`❯`,
+/// `❯•`, `❯⚠`).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn button_title_change(
+    shown: Option<&str>,
+    glance: &FleetGlance,
+) -> Option<&'static str> {
+    let next = glance.button_title();
+    (shown != Some(next)).then_some(next)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{StatusItemHandle, install, update};
 
@@ -1619,10 +1709,12 @@ pub(crate) type StatusItemHandle = ();
 
 /// Non-macOS stub: nothing to refresh.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn update(_handle: &StatusItemHandle, _glance: &FleetGlance) {}
+pub(crate) fn update(_handle: &StatusItemHandle, _glance: FleetGlance) {}
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::cell::{Cell, RefCell};
+
     use aterm_objc::{Id, Obj, Retained, Sel, autoreleasepool, class, sel};
     use winit::event_loop::EventLoopProxy;
 
@@ -1631,46 +1723,72 @@ mod macos {
     use crate::appkit::consts::NS_VARIABLE_STATUS_ITEM_LENGTH;
     use crate::appkit::{self, MainThread};
 
-    /// What [`install`] returns. BOTH fields are load-bearing retentions:
-    /// releasing an `NSStatusItem` REMOVES it from the menu bar, and AppKit holds
-    /// a menu item's target only weakly — so `App` keeps this handle in a field
-    /// for the process lifetime (the `MenuHandle` rule).
+    /// What [`install`] returns. `target` and `item` are load-bearing
+    /// retentions: releasing an `NSStatusItem` REMOVES it from the menu bar, and
+    /// AppKit holds a menu item's target and a menu's delegate only weakly — so
+    /// `App` keeps this handle in a field for the process lifetime (the
+    /// `MenuHandle` rule). The item holds its one menu itself
+    /// (`NSStatusItem`'s `menu` is a strong property).
     pub(crate) struct StatusItemHandle {
-        /// The single `statusAction:` relay target every item is wired to.
+        /// The single `statusAction:` relay target every item is wired to, and
+        /// the menu's delegate, which holds the glance the menu is painted from.
         target: Retained<StatusTarget>,
         /// The bar item itself; dropping it would vanish the icon.
         item: Obj,
+        /// The bar-button title last set, so [`update`] sends `-setTitle:` only
+        /// when [`FleetGlance::button_title`] really changes. `None` until a set
+        /// has taken.
+        shown_title: Cell<Option<&'static str>>,
+    }
+
+    /// The Rust state a [`StatusTarget`] carries. A `RefCell` because AppKit
+    /// messages the target through a shared `&self` (the `toolbar.rs` ivar
+    /// rule).
+    pub(crate) struct StatusIvars {
+        /// The `Wake` channel a click or a menu open relays through.
+        proxy: EventLoopProxy<Wake>,
+        /// The latest glance [`update`] handed over; `menuNeedsUpdate:` paints
+        /// the menu from it just before the menu opens.
+        glance: RefCell<FleetGlance>,
     }
 
     aterm_objc::declare_class! {
-        /// The target object for every status-menu item. Owns the
-        /// `EventLoopProxy<Wake>` and exposes one `statusAction:` selector that
-        /// decodes the sender's tag to an [`OperatorAction`] and posts
-        /// [`Wake::OperatorAction`] — a pure relay from AppKit into the `Wake`
-        /// channel, exactly like `menu.rs`'s `MenuTarget`.
+        /// The target object for every status-menu item, and the menu's
+        /// delegate. Owns the `EventLoopProxy<Wake>` and the latest glance, and
+        /// exposes three selectors: `statusAction:` decodes the sender's tag to
+        /// an [`OperatorAction`] and posts [`Wake::OperatorAction`] — a pure
+        /// relay from AppKit into the `Wake` channel, exactly like `menu.rs`'s
+        /// `MenuTarget`; `menuNeedsUpdate:` paints the menu from the stored
+        /// glance; `menuWillOpen:` relays the open.
         ///
         /// Declared with [`aterm_objc::declare_class!`]. The class name, the
-        /// superclass, the two selectors, the declared protocols and the
-        /// behaviour are unchanged from the `objc2` declaration this replaces;
+        /// superclass, `statusAction:` and `menuWillOpen:`, the declared
+        /// protocols and their behaviour are unchanged from the `objc2`
+        /// declaration this replaces; `menuNeedsUpdate:` was added on
+        /// 2026-09-28 (see [`update`]).
         /// `a_real_menu_and_a_real_notification_reach_the_declared_class`
-        /// drives both selectors — through `-performSelector:withObject:` and
-        /// `NSNotificationCenter`, i.e. the runtime's and Foundation's own
-        /// dispatch, on a probe class. NOT AppKit's: a status item's menu
-        /// needs a modal menu-tracking run loop, which libtest cannot start
-        /// (a judge measured `popUpMenuPositioningItem:` hanging, and that
-        /// `pthread_main_np()` is 0 inside a `#[test]` even under
-        /// `--test-threads=1`). An earlier version of this sentence named a
-        /// test that does not exist and claimed AppKit's dispatch; in a
-        /// campaign whose stated trap is "compiles, does nothing, reports
-        /// success", an overstated proof is the defect that matters.
+        /// drives all three selectors — through `-performSelector:withObject:`
+        /// and `NSNotificationCenter`, i.e. the runtime's and Foundation's own
+        /// dispatch, on a probe class whose bodies only count. NOT AppKit's: a
+        /// status item's menu needs a modal menu-tracking run loop, which
+        /// libtest cannot start (a judge measured `popUpMenuPositioningItem:`
+        /// hanging, and that `pthread_main_np()` is 0 inside a `#[test]` even
+        /// under `--test-threads=1`). The real `menuNeedsUpdate:` body is not
+        /// run by any test either: it paints through `+[NSMenuItem
+        /// separatorItem]`, which opens a WindowServer connection from a test
+        /// binary (`tools/grep_guard.sh` B9f). An earlier version of this
+        /// sentence named a test that does not exist and claimed AppKit's
+        /// dispatch; in a campaign whose stated trap is "compiles, does
+        /// nothing, reports success", an overstated proof is the defect that
+        /// matters.
         ///
         /// What objc2 spelled `type Mutability = MainThreadOnly` is carried by
-        /// [`MainThread`] at the two entry points plus
+        /// [`MainThread`] at the entry points plus
         /// [`aterm_objc::Retained`]'s unconditional `!Send` — see the note on
         /// [`MainThread`].
         pub(crate) struct StatusTarget: NSObject {
             const NAME: &str = "ATermStatusTarget";
-            type Ivars = EventLoopProxy<Wake>;
+            type Ivars = StatusIvars;
             protocols: [NSObject, NSMenuDelegate];
 
             /// `statusAction:` — the one selector wired to every actionable item.
@@ -1686,8 +1804,33 @@ mod macos {
                 if let Some(action) = OperatorAction::from_tag(tag) {
                     // Fire-and-forget: a closed loop (app shutting down) just
                     // drops the event — mirrors menu.rs.
-                    let _ = self.ivars().send_event(Wake::OperatorAction { action });
+                    let _ = self.ivars().proxy.send_event(Wake::OperatorAction { action });
                 }
+            }
+
+            /// The menu is about to be displayed: PAINT it from the stored
+            /// glance — `-removeAllItems`, then exactly the rows
+            /// [`super::compose_status_menu`] composes, painted as [`install`]
+            /// paints them. AppKit sends this on the main thread at the start of
+            /// a tracking session, before the menu shows, so the menu opens as
+            /// current as the last glance [`update`] stored. It touches only
+            /// this target's own glance and the menu AppKit passed — never
+            /// `App` (the `menuWillOpen:` discipline below).
+            @sel(menuNeedsUpdate:)
+            fn menu_needs_update(&self, menu: Id) {
+                if menu.is_null() || MainThread::new().is_none() {
+                    return;
+                }
+                // Compose under the borrow and paint after it ends, so no
+                // AppKit send runs while the cell is borrowed. `update` borrows
+                // it on this same thread and never across a call out, so it is
+                // free here; were it somehow held, the menu keeps what it last
+                // showed rather than panicking inside AppKit's tracking loop.
+                let rows = match self.ivars().glance.try_borrow() {
+                    Ok(glance) => super::compose_status_menu(&glance),
+                    Err(_) => return,
+                };
+                autoreleasepool(|_| paint_menu(menu, self, rows));
             }
 
             /// The menu is about to track: RELAY ONLY. This runs inside
@@ -1697,29 +1840,40 @@ mod macos {
             /// `toolbar.rs` mid-track discipline).
             @sel(menuWillOpen:)
             fn menu_will_open(&self, _menu: Id) {
-                let _ = self.ivars().send_event(Wake::OperatorMenuOpening);
+                let _ = self.ivars().proxy.send_event(Wake::OperatorMenuOpening);
             }
         }
     }
 
-    /// Create the menu-bar status item and its menu, rendered from `glance`.
+    /// Create the menu-bar status item and its ONE menu, painted from `glance`.
     /// Called once when the first OS window attaches (never headless). Returns
     /// the retained handle for `App` to keep alive; best-effort `None` off the
-    /// main thread — never a panic (the `menu::install` contract).
+    /// main thread, or when AppKit gives no item or no menu — never a panic
+    /// (the `menu::install` contract).
+    ///
+    /// The menu is built, painted, given its delegate and set on the item here
+    /// and nowhere else: after this, `-setMenu:` is never sent again (see
+    /// [`update`]).
     pub(crate) fn install(
         proxy: &EventLoopProxy<Wake>,
         glance: &FleetGlance,
     ) -> Option<StatusItemHandle> {
         let main = MainThread::new()?;
-        let target = StatusTarget::alloc_init(main, proxy.clone())?;
-        let item = autoreleasepool(|_| {
+        let target = StatusTarget::alloc_init(
+            main,
+            StatusIvars {
+                proxy: proxy.clone(),
+                glance: RefCell::new(glance.clone()),
+            },
+        )?;
+        let handle = autoreleasepool(|_| -> Option<StatusItemHandle> {
             // SAFETY: `+systemStatusBar` is a `-(id)` singleton accessor and
             // `-statusItemWithLength:` is `-(id)(CGFloat)`; both are main-thread
             // AppKit calls (proved by `main`). The item comes back AUTORELEASED
             // (+0), so it is retained into the handle here — releasing an
             // `NSStatusItem` removes it from the menu bar, which is why the
             // handle owns one.
-            unsafe {
+            let item = unsafe {
                 let bar = appkit::send_id(class(c"NSStatusBar").as_id(), sel!(systemStatusBar));
                 if bar.is_null() {
                     return None;
@@ -1730,68 +1884,122 @@ mod macos {
                     NS_VARIABLE_STATUS_ITEM_LENGTH,
                 );
                 Obj::retain(raw)
+            }?;
+            let menu = new_menu()?;
+            paint_menu(menu.id(), &target, super::compose_status_menu(glance));
+            // SAFETY: `-setDelegate:` and `-setMenu:` are `-(void)(id)` on live
+            // receivers, on the main thread. The delegate is the retained
+            // target, which outlives the menu because the handle owns it; the
+            // item retains the menu, so `menu` may drop at the end of this
+            // scope, inside the pool.
+            unsafe {
+                appkit::send_v_id(menu.id(), sel!(setDelegate:), target.as_id());
+                appkit::send_v_id(item.id(), sel!(setMenu:), menu.id());
             }
+            Some(StatusItemHandle {
+                target,
+                item,
+                shown_title: Cell::new(None),
+            })
         })?;
-        let handle = StatusItemHandle { target, item };
-        update(&handle, glance);
+        show_title(&handle, glance.button_title());
         Some(handle)
     }
 
-    /// Re-render the bar button title and rebuild the menu wholesale from
-    /// `glance` — the `update_version_menu` mutation pattern. Main-thread
+    /// Hand the status item a new glance. After [`install`], only a real
+    /// change touches the `NSStatusItem`: `-button`/`-setTitle:` run only when
+    /// [`FleetGlance::button_title`] changes (it has two values), and the menu
+    /// is never replaced — the glance is stored in the menu's delegate, which
+    /// repaints the ONE menu from it in `menuNeedsUpdate:`, just before the
+    /// menu opens. What the menu shows, row for row, is unchanged. Main-thread
     /// guarded: a call off the main thread is a silent no-op.
-    pub(crate) fn update(handle: &StatusItemHandle, glance: &FleetGlance) {
+    ///
+    /// Why (2026-09-28, aterm 0.98.0): this used to rebuild the whole menu and
+    /// send `-setMenu:` and `-setTitle:` on every fingerprint change —
+    /// including each move of an input-stall row, whose text carries queued
+    /// bytes and memory, which move most when the Mac is short of memory. On a
+    /// Mac saturated by other work the whole app went unscheduled for 3h22m,
+    /// and its main thread's last stack was inside
+    /// `-[NSSceneStatusItem _setupScene:]`, a synchronous scene activation
+    /// under the status item. This reduces aterm's own calls into the status
+    /// item's scene machinery while the Mac is under pressure. It is NOT a
+    /// proven cure for that freeze, whose cause is not established.
+    pub(crate) fn update(handle: &StatusItemHandle, glance: FleetGlance) {
         let Some(_main) = MainThread::new() else {
             return;
         };
-        autoreleasepool(|_| {
-            // SAFETY: all sends are plain AppKit accessors/setters on live
-            // receivers, on the main thread. `-button` is `-(id)` and returns
-            // the bar button for an item created with a variable length;
-            // `-setTitle:`/`-setDelegate:`/`-setMenu:` are `-(void)(id)`. The
-            // delegate is the retained target, which outlives the menu because
-            // the handle owns it.
-            unsafe {
-                let button = appkit::send_id(handle.item.id(), sel!(button));
-                if !button.is_null()
-                    && let Some(title) = appkit::nsstring(glance.button_title())
-                {
-                    appkit::send_v_id(button, sel!(setTitle:), title.id());
-                }
-                let Some(menu) = build_menu(&handle.target, glance) else {
-                    return;
-                };
-                appkit::send_v_id(menu.id(), sel!(setDelegate:), handle.target.as_id());
-                appkit::send_v_id(handle.item.id(), sel!(setMenu:), menu.id());
-            }
-        });
+        if let Some(title) = super::button_title_change(handle.shown_title.get(), &glance) {
+            show_title(handle, title);
+        }
+        // `try_borrow_mut`: `menuNeedsUpdate:` borrows the cell only while it
+        // composes rows, on this same thread, so it is free here; were it
+        // somehow held, the menu keeps the previous glance for one open rather
+        // than the event loop panicking.
+        if let Ok(mut stored) = handle.target.ivars().glance.try_borrow_mut() {
+            *stored = glance;
+        }
     }
 
-    /// Build the status menu for `glance` by PAINTING the pure model from
-    /// `compose_status_menu` — native code renders rows, never decides them.
-    /// Auto-enable is off so the model's `enabled` flags are authoritative.
-    fn build_menu(target: &Retained<StatusTarget>, glance: &FleetGlance) -> Option<Obj> {
+    /// Set the bar button's title to `title` and remember it for
+    /// [`super::button_title_change`]. A title that did not take (no button,
+    /// or Foundation refused the string) is not remembered, so the next
+    /// [`update`] tries again.
+    fn show_title(handle: &StatusItemHandle, title: &'static str) {
+        let set = autoreleasepool(|_| {
+            // SAFETY: plain AppKit sends on live receivers, on the main thread
+            // (both callers checked `MainThread::new()`). `-button` is `-(id)`
+            // and returns the bar button for an item created with a variable
+            // length; `-setTitle:` is `-(void)(id)`.
+            unsafe {
+                let button = appkit::send_id(handle.item.id(), sel!(button));
+                if button.is_null() {
+                    return false;
+                }
+                let Some(text) = appkit::nsstring(title) else {
+                    return false;
+                };
+                appkit::send_v_id(button, sel!(setTitle:), text.id());
+                true
+            }
+        });
+        if set {
+            handle.shown_title.set(Some(title));
+        }
+    }
+
+    /// The status menu: a fresh `NSMenu` with auto-enable off, so the model's
+    /// `enabled` flags are authoritative. Built once, by [`install`].
+    fn new_menu() -> Option<Obj> {
         // SAFETY: `+alloc` on `NSMenu` gives a +1 uninitialised instance and
         // `-init` consumes it, so `Obj::from_owned` adopts exactly one +1;
         // `-setAutoenablesItems:` is `-(void)(BOOL)` on the fresh menu.
-        let menu = unsafe {
+        unsafe {
             let raw = appkit::send_id(appkit::alloc(class(c"NSMenu")), sel!(init));
             let menu = Obj::from_owned(raw)?;
             appkit::send_v_bool(menu.id(), sel!(setAutoenablesItems:), false);
-            menu
-        };
-        for row in super::compose_status_menu(glance) {
+            Some(menu)
+        }
+    }
+
+    /// Paint `rows` — the pure model from [`super::compose_status_menu`] —
+    /// into `menu`, replacing every item it held: native code renders rows,
+    /// never decides them. Runs on the main thread inside a pool, from
+    /// [`install`] and from `menuNeedsUpdate:`.
+    fn paint_menu(menu: Id, target: &StatusTarget, rows: Vec<super::StatusRow>) {
+        // SAFETY: `-removeAllItems` is `-(void)` on the live menu, on the main
+        // thread.
+        unsafe { appkit::send_v(menu, sel!(removeAllItems)) };
+        for row in rows {
             match row {
-                super::StatusRow::Info(text) => add_info(&menu, &text),
-                super::StatusRow::Separator => add_separator(&menu),
+                super::StatusRow::Info(text) => add_info(menu, &text),
+                super::StatusRow::Separator => add_separator(menu),
                 super::StatusRow::Action {
                     label,
                     action,
                     enabled,
-                } => add_action(&menu, target, &label, action, enabled),
+                } => add_action(menu, target, &label, action, enabled),
             }
         }
-        Some(menu)
     }
 
     /// `[[NSMenuItem alloc] initWithTitle:action:keyEquivalent:]`, +1, or `None`
@@ -1819,8 +2027,8 @@ mod macos {
 
     /// Append an actionable item wired to `target` carrying `action`'s tag.
     fn add_action(
-        menu: &Obj,
-        target: &Retained<StatusTarget>,
+        menu: Id,
+        target: &StatusTarget,
         title: &str,
         action: OperatorAction,
         enabled: bool,
@@ -1836,31 +2044,31 @@ mod macos {
             appkit::send_v_id(item.id(), sel!(setTarget:), target.as_id());
             appkit::send_v_isize(item.id(), sel!(setTag:), action.tag());
             appkit::send_v_bool(item.id(), sel!(setEnabled:), enabled);
-            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
+            appkit::send_v_id(menu, sel!(addItem:), item.id());
         }
     }
 
     /// Append a disabled information row (explicit — auto-enable is off).
-    fn add_info(menu: &Obj, title: &str) {
+    fn add_info(menu: Id, title: &str) {
         let Some(item) = new_item(title, Sel::NULL) else {
             return;
         };
         // SAFETY: as `add_action`, on an item with no action.
         unsafe {
             appkit::send_v_bool(item.id(), sel!(setEnabled:), false);
-            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
+            appkit::send_v_id(menu, sel!(addItem:), item.id());
         }
     }
 
     /// Append a separator line.
-    fn add_separator(menu: &Obj) {
+    fn add_separator(menu: Id) {
         // SAFETY: `+separatorItem` is `-(id)` and returns a shared,
         // AUTORELEASED item — borrowed here for the length of `-addItem:`,
         // which retains it into the menu, inside the caller's pool.
         unsafe {
             let sep = appkit::send_id(class(c"NSMenuItem").as_id(), sel!(separatorItem));
             if !sep.is_null() {
-                appkit::send_v_id(menu.id(), sel!(addItem:), sep);
+                appkit::send_v_id(menu, sel!(addItem:), sep);
             }
         }
     }
@@ -1875,19 +2083,21 @@ mod macos {
 
         use super::{StatusTarget, new_item};
         use crate::appkit;
-        use crate::appkit::consts::NS_VARIABLE_STATUS_ITEM_LENGTH;
 
-        /// How many `statusAction:` / `menuWillOpen:` deliveries the probe saw.
+        /// How many `statusAction:` / `menuNeedsUpdate:` / `menuWillOpen:`
+        /// deliveries the probe saw.
         ///
-        /// A real `StatusTarget`'s ivar is an `EventLoopProxy<Wake>`, and one of
-        /// those can only be minted from a live winit `EventLoop`, which on
+        /// A real `StatusTarget`'s ivars hold an `EventLoopProxy<Wake>`, and one
+        /// of those can only be minted from a live winit `EventLoop`, which on
         /// macOS must be built on the process main thread and only once — so it
         /// cannot exist on a libtest thread. The probe is a SECOND
         /// `declare_class!` expansion of the identical shape (same superclass,
-        /// same two selectors, same declared protocols, same trampoline
-        /// generation) whose bodies count instead of posting, which is what
-        /// makes it a fair stand-in: everything under test is the macro's
-        /// output, not the relay.
+        /// same three selectors, same declared protocols, same trampoline
+        /// generation) whose bodies count instead of posting or painting, which
+        /// is what makes it a fair stand-in: everything under test is the
+        /// macro's output, not the relay. (The real `menuNeedsUpdate:` paints
+        /// through `+separatorItem`, which a unit test may not reach:
+        /// `tools/grep_guard.sh` B9f.)
         static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
 
         aterm_objc::declare_class! {
@@ -1906,6 +2116,11 @@ mod macos {
                     DISPATCHES.fetch_add(1 + usize::try_from(tag).unwrap_or(0), Ordering::SeqCst);
                 }
 
+                @sel(menuNeedsUpdate:)
+                fn menu_needs_update(&self, _menu: aterm_objc::Id) {
+                    DISPATCHES.fetch_add(100, Ordering::SeqCst);
+                }
+
                 @sel(menuWillOpen:)
                 fn menu_will_open(&self, _menu: aterm_objc::Id) {
                     DISPATCHES.fetch_add(1000, Ordering::SeqCst);
@@ -1913,19 +2128,8 @@ mod macos {
             }
         }
 
-        /// The sentinel is the SDK header's value, exactly. It cannot be
-        /// linked (see the constant's own note), so this is the only check
-        /// available and it is a pin rather than a proof.
-        #[test]
-        fn status_item_length_sentinel_matches_the_sdk() {
-            assert!(
-                (NS_VARIABLE_STATUS_ITEM_LENGTH + 1.0).abs() < f64::EPSILON,
-                "NSVariableStatusItemLength is -1.0 in AppKit/Headers/NSStatusBar.h"
-            );
-        }
-
         /// The registered class is what the RUNTIME says it is: right name,
-        /// right superclass, both selectors present on instances, and it
+        /// right superclass, all three selectors present on instances, and it
         /// CONFORMS to `NSMenuDelegate` — the property objc2 spelled
         /// `unsafe impl NSMenuDelegate for StatusTarget`, and the one
         /// `-[NSMenu setDelegate:]` reads before it will ever call back.
@@ -1965,6 +2169,11 @@ mod macos {
                 assert!(appkit::send_bool_sel(
                     cls.as_id(),
                     sel!(instancesRespondToSelector:),
+                    sel!(menuNeedsUpdate:)
+                ));
+                assert!(appkit::send_bool_sel(
+                    cls.as_id(),
+                    sel!(instancesRespondToSelector:),
                     sel!(menuWillOpen:)
                 ));
             }
@@ -1972,9 +2181,9 @@ mod macos {
 
         /// THE PROOF for the ENCODINGS: what `class_addMethod` actually
         /// registered, read back out of the runtime with
-        /// `method_getTypeEncoding`, against the verified table. Both selectors
-        /// are `- (void)x:(id)y`, so both are `"v@:@"`; the generated `-dealloc`
-        /// is `"v@:"`.
+        /// `method_getTypeEncoding`, against the verified table. All three
+        /// selectors are `- (void)x:(id)y`, so all three are `"v@:@"`; the
+        /// generated `-dealloc` is `"v@:"`.
         #[test]
         fn the_runtime_reports_the_encodings_the_table_says() {
             let cls = StatusTarget::class();
@@ -1982,6 +2191,10 @@ mod macos {
             unsafe {
                 assert_eq!(
                     method_types(cls, sel!(statusAction:)).as_deref(),
+                    Some("v@:@")
+                );
+                assert_eq!(
+                    method_types(cls, sel!(menuNeedsUpdate:)).as_deref(),
                     Some("v@:@")
                 );
                 assert_eq!(
@@ -2008,12 +2221,13 @@ mod macos {
         ///    exactly as `platform.rs`'s W1 test does for the reduce-motion
         ///    target. Registration itself is a check: the centre reads the
         ///    encoding to build the call.
-        /// 3. **The runtime dispatches the other.** `-performSelector:
+        /// 3. **The runtime dispatches the other two.** `-performSelector:
         ///    withObject:` is `objc_msgSend` off the class's method table —
         ///    what `-[NSApplication sendAction:to:from:]` ultimately performs
         ///    for a menu click — handed the REAL `NSMenuItem`, so the body's
         ///    `-tag` read is exercised against a real item that AppKit itself
-        ///    tagged.
+        ///    tagged; and `menuNeedsUpdate:` is sent the same way with the
+        ///    REAL menu as its argument.
         ///
         /// `-[NSMenu performActionForItemAtIndex:]` is deliberately NOT the
         /// leg used, and the reason is measured rather than assumed: it routes
@@ -2105,7 +2319,8 @@ mod macos {
                     );
 
                     // (3) the runtime's dispatch of `statusAction:`, with the
-                    // REAL tagged NSMenuItem as the sender.
+                    // REAL tagged NSMenuItem as the sender, then of
+                    // `menuNeedsUpdate:`, with the REAL menu.
                     let perform_sel: unsafe extern "C-unwind" fn(
                         aterm_objc::Id,
                         Sel,
@@ -2119,13 +2334,20 @@ mod macos {
                         sel!(statusAction:),
                         item.id(),
                     );
+                    perform_sel(
+                        probe.as_id(),
+                        sel!(performSelector:withObject:),
+                        sel!(menuNeedsUpdate:),
+                        menu.id(),
+                    );
                 }
             });
             assert_eq!(
                 DISPATCHES.load(Ordering::SeqCst),
-                1008,
+                1108,
                 "the declared class did not receive menuWillOpen: exactly once \
-                 (1000) and statusAction: with the item's tag 7 (1 + 7)"
+                 (1000), menuNeedsUpdate: exactly once (100) and statusAction: \
+                 with the item's tag 7 (1 + 7)"
             );
         }
 
@@ -3531,6 +3753,7 @@ mod tests {
             OperatorAction::Show,
             OperatorAction::Stop,
             OperatorAction::ShowConnectionMap,
+            OperatorAction::DismissExceptions,
         ] {
             assert_eq!(OperatorAction::from_tag(a.tag()), Some(a));
         }
@@ -3581,6 +3804,31 @@ mod tests {
         ]));
         assert_eq!(g.warnings, vec![(4, "⚠ needs human: approval".to_string())]);
         assert_eq!(g.button_title(), "❯⚠");
+        // A program-written `⚠` title reaches the menu folded and clipped:
+        // no line break, no invisible character, no kilobyte of text.
+        let long = format!("⚠ a\u{2028}b\u{200b}c\n{}", "x".repeat(1000));
+        let g = classify(&rows(&[(4, long.as_str())]));
+        let label = &g.warnings[0].1;
+        assert!(label.starts_with("⚠ a bc x"), "{label:?}");
+        assert!(label.len() <= ROW_WHAT_MAX && label.ends_with('\u{2026}'));
+    }
+
+    /// Only a real change retitles the bar button. The first update always
+    /// sets; after that a glance whose menu moved but whose title did not —
+    /// a second warning's text, a stall row's growing numbers — sends no
+    /// `-setTitle:`, and each flip between the two titles sends one.
+    #[test]
+    fn the_bar_button_is_retitled_only_when_its_title_changes() {
+        let calm = classify(&rows(&[(1, "operator: fleet idle"), (2, "zsh")]));
+        let stuck = classify(&rows(&[(1, "operator: fleet idle"), (2, "⚠ stuck")]));
+        let stuck_longer = classify(&rows(&[(1, "operator: fleet idle"), (2, "⚠ stuck 5m")]));
+        assert_ne!(stuck.fingerprint(), stuck_longer.fingerprint());
+
+        assert_eq!(button_title_change(None, &calm), Some("❯"));
+        assert_eq!(button_title_change(Some("❯"), &calm), None);
+        assert_eq!(button_title_change(Some("❯"), &stuck), Some("❯⚠"));
+        assert_eq!(button_title_change(Some("❯⚠"), &stuck_longer), None);
+        assert_eq!(button_title_change(Some("❯⚠"), &calm), Some("❯"));
     }
 
     #[test]
@@ -3745,6 +3993,76 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// THE DIGEST IN THE MENU (owner rule 2026-09-28): a "To look at" section
+    /// whose lines open Settings ▸ Messages at their entry, ONE way to file them all, and a dot
+    /// (never the warning) beside the mark while nothing needs the owner now.
+    #[test]
+    fn the_menu_lists_the_digest_and_offers_to_file_it() {
+        let mut g = classify(&[]);
+        g.start_available = true;
+        assert_eq!(g.button_title(), "❯");
+        g.exceptions = vec![
+            (11, "macOS keeps asking for access".into()),
+            (12, "Claude in tab 1 is still on 2.1.283".into()),
+        ];
+        assert_eq!(g.button_title(), "❯•", "a dot: something to look at");
+        let rows = compose_status_menu(&g);
+        let at = rows
+            .iter()
+            .position(|r| *r == StatusRow::Info("To look at (2)".into()))
+            .expect("the section");
+        assert_eq!(
+            &rows[at + 1..at + 4],
+            &[
+                StatusRow::Action {
+                    label: "macOS keeps asking for access".into(),
+                    action: OperatorAction::ShowException(11),
+                    enabled: true,
+                },
+                StatusRow::Action {
+                    label: "Claude in tab 1 is still on 2.1.283".into(),
+                    action: OperatorAction::ShowException(12),
+                    enabled: true,
+                },
+                StatusRow::Action {
+                    label: "Dismiss all 2 \u{2014} kept in Messages".into(),
+                    action: OperatorAction::DismissExceptions,
+                    enabled: true,
+                },
+            ]
+        );
+        // More than fit are counted, not spelled.
+        g.exceptions = (0..7).map(|n| (n, format!("thing {n}"))).collect();
+        let rows = compose_status_menu(&g);
+        assert!(rows.contains(&StatusRow::Info("To look at (7)".into())));
+        assert!(rows.contains(&StatusRow::Info("and 3 more".into())));
+        // The dismissal says how many it files, the hidden ones included.
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            StatusRow::Action { label, action: OperatorAction::DismissExceptions, .. }
+                if label == "Dismiss all 7 \u{2014} kept in Messages"
+        )));
+        assert_ne!(g.fingerprint(), classify(&[]).fingerprint());
+        // One entry is one `Dismiss`, the page's word for it.
+        g.exceptions.truncate(1);
+        assert!(compose_status_menu(&g).iter().any(|r| matches!(
+            r,
+            StatusRow::Action { label, action: OperatorAction::DismissExceptions, .. }
+                if label == "Dismiss \u{2014} kept in Messages"
+        )));
+    }
+
+    /// The dot yields to the alarm: an escalation wins the title, so the dot
+    /// only ever means "nothing needs you now".
+    #[test]
+    fn the_dot_never_hides_an_alarm() {
+        let mut g = classify(&[]);
+        g.exceptions = vec![(11, "macOS keeps asking for access".into())];
+        assert_eq!(g.button_title(), "❯•");
+        g.warnings = vec![(3, "Claude stopped in tab 3".into())];
+        assert_eq!(g.button_title(), "❯⚠", "an alarm wins the title");
     }
 
     #[test]
@@ -3920,6 +4238,7 @@ mod tests {
             OperatorAction::FocusWindow(7),
             OperatorAction::FocusSession(3),
             OperatorAction::RaiseInstance(4242),
+            OperatorAction::ShowException(41),
         ] {
             assert_eq!(OperatorAction::from_tag(a.tag()), Some(a));
         }
@@ -3927,7 +4246,7 @@ mod tests {
         assert_eq!(OperatorAction::FocusWindow(u64::MAX).tag(), 0);
         assert_eq!(OperatorAction::from_tag(0), None);
         // An unknown packed kind decodes to None.
-        assert_eq!(OperatorAction::from_tag(4 * 1_000_000_000_000 + 5), None);
+        assert_eq!(OperatorAction::from_tag(5 * 1_000_000_000_000 + 5), None);
     }
 
     #[test]

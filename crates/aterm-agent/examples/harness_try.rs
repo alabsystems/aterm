@@ -22,14 +22,13 @@
 //! targo --unverified run -p aterm-agent --example harness_try -- limit "You've reached your Fable limit"
 //! ```
 
-use std::io::BufReader;
-
-use aterm_agent::harness::usage::{AccountView, PriceTable, TranscriptUsage, UsageView, hud_line};
+use aterm_agent::harness::session_usage::TranscriptCursor;
+use aterm_agent::harness::usage::{AccountView, PriceTable, UsageView, hud_line};
 
 const USAGE: &str = "\
 harness_try — read the harness core's real verdicts, by hand
 
-  usage [file]           a Claude Code transcript (file, or stdin) → spend per model and the HUD line
+  usage <file>           a Claude Code transcript → spend per model and the HUD line
   limit <notice text>    a vendor notice → the wall it names
 
 Nothing is wired to Claude Code. No hook is answered and no key is typed.
@@ -49,17 +48,19 @@ fn main() {
 }
 
 fn cmd_usage(args: &[String]) {
-    let mut fold = TranscriptUsage::new();
-    let read = match args.first() {
-        Some(p) => std::fs::File::open(p).and_then(|f| fold.fold_reader(BufReader::new(f))),
-        None => fold.fold_reader(std::io::stdin().lock()),
+    let Some(path) = args.first() else {
+        print!("{USAGE}");
+        return;
     };
-    if let Err(e) = read {
+    // The reader the footer and `harness usage` fold through.
+    let mut cursor = TranscriptCursor::new(path);
+    if let Err(e) = cursor.advance(u64::MAX) {
         println!("could not read the transcript: {e}");
         return;
     }
+    let fold = cursor.fold();
     let mut acct = AccountView::new("work", true);
-    acct.add_transcript(&fold, &PriceTable::new());
+    acct.add_transcript(fold, &PriceTable::new());
     println!(
         "rows      {} ({} assistant, {} unparsed, {} without usage)",
         fold.rows, fold.assistant_rows, fold.rows_unparsed, fold.rows_without_usage

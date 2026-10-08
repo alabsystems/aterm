@@ -44,12 +44,26 @@ fn source_is_automatic(source: &str) -> bool {
 #[cfg(test)]
 pub(crate) static UPDATE_LEDGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Take [`UPDATE_LEDGER_TEST_LOCK`] for the rest of the calling test.
+/// Take [`UPDATE_LEDGER_TEST_LOCK`] for the rest of the calling test, on the
+/// scratch ledger and with it quiet:
+///
+/// - the scratch root is primed first ([`crate::prime_test_update_root`]): a
+///   test that writes the ledger before it builds its first headless `App`
+///   would otherwise write the developer's REAL per-user ledger and read back
+///   a scratch one that never saw the write;
+/// - then, lock held, it waits until no detached ledger writer is in flight
+///   ([`crate::app_update_handoff::ledger_writers`]): every one was started by
+///   an earlier holder that has let go, and could otherwise land between this
+///   test's write and its read-back.
 #[cfg(test)]
 pub(crate) fn hold_update_ledger_for_test() -> std::sync::MutexGuard<'static, ()> {
-    UPDATE_LEDGER_TEST_LOCK
+    crate::prime_test_update_root();
+    let held = UPDATE_LEDGER_TEST_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(unix)]
+    crate::app_update_handoff::ledger_writers::wait_until_landed();
+    held
 }
 
 #[cfg(test)]
@@ -235,14 +249,19 @@ impl App {
         // The retry disposition is EVENT-LOOP state, so only the host can answer it —
         // and the answer is half of what a person needs from a failed apply ("wait" vs
         // "press this").
-        let retry = self.apply_retry_for(snapshot.staged.as_ref().map(|staged| staged.build));
+        let staged_build = snapshot.staged.as_ref().map(|staged| staged.build);
+        let retry = self.apply_retry_for(staged_build);
+        // The one on-hold fact, the one the Version menu's press refuses on.
+        let on_hold = staged_build.is_some_and(|build| self.latched_activation_trial_spent(build));
         UpdateState::from_service(snapshot, checking, retry)
+            .with_staged_on_hold(on_hold)
             .with_automatic_checks(
                 self.update_checks_running,
                 crate::app_config::update_checks_automatic(&self.config),
             )
             .with_download(self.update_quiet.clone())
             .with_dev_build(self.dev_build.clone())
+            .with_install_posture(self.install_posture)
     }
 
     /// Whether a PERSON is waiting on the update's work right now (design ruling
@@ -302,7 +321,7 @@ impl App {
                 title: crate::update_words::flow_title("Downloading", version),
                 progress: String::new(),
             },
-            P::Staged { .. } | P::Failed { .. } | P::Deferred { .. } => {
+            P::Staged { .. } | P::Failed { .. } | P::Deferred { .. } | P::Withheld { .. } => {
                 // Over: the page reads the stage (or the ledger) from here on.
                 if self.update_quiet.take().is_some() {
                     self.publish_native_update_state();
@@ -380,7 +399,10 @@ impl App {
     /// [`Self::automatic_apply_retry_scheduled`] as the typed value the wording law
     /// reads. `None` — no build on offer — answers `ManualOnly`, the conservative
     /// half: promising a retry that is not scheduled is the one error that costs the
-    /// reader real time.
+    /// reader real time. A latched activation whose boot trial is spent answers
+    /// `NewerRelease`: the press "try again now" asks for is the start the trial
+    /// rolls back ([`crate::update_words::ApplyPosture::TrialSpent`], the band
+    /// row's twin).
     pub(crate) fn apply_retry_for(
         &self,
         staged_build: Option<u64>,
@@ -388,13 +410,31 @@ impl App {
         use crate::update_apply_trouble::ApplyRetry;
         // The historical failure describes the previous attempt. A current
         // environmental block can require repair; a later verified repair can
-        // restore scheduling without rewriting that history.
-        if staged_build.is_some_and(|build| self.auto_apply_environment_blocked(build)) {
-            return ApplyRetry::NeedsPerson;
+        // restore scheduling without rewriting that history. The remedy is the
+        // BLOCK's (round eight, finding 14's review): the ledger's latest reason
+        // may be an ordinary failure booked while it stands.
+        if let Some(remedy) =
+            staged_build.and_then(|build| self.auto_apply_environment_remedy(build))
+        {
+            return ApplyRetry::NeedsPerson(remedy);
         }
         match staged_build {
             Some(build) if self.automatic_apply_retry_scheduled(build) => ApplyRetry::Scheduled,
+            Some(build) if self.latched_activation_trial_spent(build) => ApplyRetry::NewerRelease,
             _ => ApplyRetry::ManualOnly,
+        }
+    }
+
+    /// The remedy [`Self::apply_retry_for`] names for `staged_build`, when it
+    /// answers [`crate::update_apply_trouble::ApplyRetry::NeedsPerson`]: the
+    /// standing block's, for a row that says what the person does next.
+    fn person_remedy_for(
+        &self,
+        staged_build: u64,
+    ) -> Option<crate::update_apply_trouble::PersonRemedy> {
+        match self.apply_retry_for(Some(staged_build)) {
+            crate::update_apply_trouble::ApplyRetry::NeedsPerson(remedy) => Some(remedy),
+            _ => None,
         }
     }
 
@@ -458,6 +498,9 @@ impl App {
                                 == Some(manual.dmg_sha256)
                     })
         }) {
+            if self.latched_activation_trial_spent(build) {
+                return P::TrialSpent;
+            }
             return P::ManualOnlyLatched {
                 lapses: manual.retry_at.is_some(),
             };
@@ -488,6 +531,9 @@ impl App {
             aterm_update::Progress::Deferred { detail } => {
                 aterm_log::info!("update download postponed: {detail}");
             }
+            aterm_update::Progress::Withheld { detail } => {
+                aterm_log::info!("update download withheld: {detail}");
+            }
             _ => {}
         }
         let posture = if let aterm_update::Progress::Staged { build, .. } = progress {
@@ -506,7 +552,9 @@ impl App {
             aterm_update::Progress::Staged { .. } => {
                 self.heal_update_health(crate::messages_host::HealthProof::Downloaded);
             }
-            aterm_update::Progress::Deferred { .. } | aterm_update::Progress::Failed { .. } => {}
+            aterm_update::Progress::Deferred { .. }
+            | aterm_update::Progress::Failed { .. }
+            | aterm_update::Progress::Withheld { .. } => {}
         }
         // The version a failed or postponed report does not carry: the live
         // download's, else the quiet one's (read before the quiet lane clears it).
@@ -577,8 +625,10 @@ impl App {
             aterm_update::Progress::Staged { version, build } => {
                 (version.clone(), FlowPhase::Staged { build: *build })
             }
-            // Both are records, answered above.
-            aterm_update::Progress::Failed { .. } | aterm_update::Progress::Deferred { .. } => {
+            // All three are records, answered above.
+            aterm_update::Progress::Failed { .. }
+            | aterm_update::Progress::Deferred { .. }
+            | aterm_update::Progress::Withheld { .. } => {
                 return;
             }
         };
@@ -773,7 +823,9 @@ impl App {
     /// us) it opens the Software Update route in the native Settings tab: honest
     /// details, never a dead click or a legacy modal — and nothing on this path
     /// ever restarts the app: a staged build is applied IN PLACE by the seamless
-    /// overlap handoff, and the shells keep running.
+    /// overlap handoff, and the shells keep running. A staged build ON HOLD
+    /// ([`Self::latched_activation_trial_spent`]: its next start is the one its
+    /// boot trial rolls back) opens those details too, never that start.
     pub(crate) fn apply_update_or_details(&mut self) {
         let debug_seamless = crate::app_update_screen::debug_seamless_reexec_armed();
         let staged_ready = self.staged_update_ready();
@@ -783,12 +835,19 @@ impl App {
     /// Exact menu-action reducer with environment/disk observations supplied once.
     /// Keeping mechanics behind this seam lets tests drive the genuinely blocked
     /// click path without mutating process-global environment or fabricating a ledger.
-    fn apply_update_or_details_with_facts(
+    pub(crate) fn apply_update_or_details_with_facts(
         &mut self,
         staged_ready: bool,
         debug_seamless: bool,
     ) -> Option<crate::native_app::UpdateOutcome> {
-        if staged_ready {
+        let on_hold = !debug_seamless
+            && self
+                .native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .is_some_and(|staged| self.latched_activation_trial_spent(staged.build));
+        if staged_ready && !on_hold {
             let outcome = if debug_seamless {
                 self.apply_debug_seamless_update()
             } else {
@@ -935,7 +994,7 @@ impl App {
     ///
     /// THE QA SEAM ENTERS HERE, AND THAT IS THE WHOLE POINT. Under
     /// `ATERM_DEBUG_SEAMLESS_REEXEC` the handoff runs with no
-    /// `ApplyAttemptTicket` (`start_native_update_handoff` refuses a `None` ticket
+    /// `ApplyAttemptTicket` (`App::apply_staged_update_now` refuses a `None` ticket
     /// in every other case), so a failed debug handoff describes a SIMULATED apply
     /// of the running binary — not a staged build that could not be made to run.
     /// Routing it through [`Self::surface_update_apply_outcome`] recorded it as a
@@ -1054,6 +1113,12 @@ impl App {
                 // very fact) and not "Update paused" either: the lane is still
                 // coming back by itself, and what it is waiting for is the desk.
                 aterm_log::warn!("update apply ({source}) could not carry a session: {message}");
+                // The switch this attempt put on record stops here, in this
+                // record when the lane retries (one record per attempt).
+                #[cfg(unix)]
+                if open_details || !retry_scheduled {
+                    self.record_update_switch_stopped(retry_scheduled, &message);
+                }
                 if open_details {
                     self.retire_charging_surge();
                     let _ = self
@@ -1062,14 +1127,28 @@ impl App {
                     // The lane retries when the desk changes: the flow row is
                     // re-stated to the lane's words and the fact is a RECORD
                     // (ruling 143) — never a row for a retry nobody can hurry.
+                    // A refusal that came back says how long its spacing holds
+                    // the next try (round eight, U43 review). Titled by the
+                    // switch it stops, which it closes on record; a later
+                    // attempt at the same build opened none (one fact, one
+                    // entry: `note_update_switch_started`) and is still that
+                    // switch, so it is titled by the staged build all the same.
                     self.retire_charging_surge();
                     if let Some((staged_build, _)) = &staged {
                         self.restate_staged_bar_posture(*staged_build);
                     }
+                    let spacing_left = self.capture_refusal_spacing_left(std::time::Instant::now());
+                    #[cfg(unix)]
+                    let switch = self.update_switch_on_record.take();
+                    #[cfg(not(unix))]
+                    let switch: Option<Option<String>> = None;
+                    let switch = switch
+                        .or_else(|| staged.as_ref().map(|(_, version)| Some(version.clone())));
                     self.note_update_outcome(crate::update_words::outcome(
-                        "Update waiting",
-                        "one tab couldn't move to the new version \u{b7} tries again when \
-                         that tab changes",
+                        &crate::update_words::waiting_to_install(
+                            switch.as_ref().map(Option::as_deref),
+                        ),
+                        &crate::update_words::capture_refused_waiting(&message, spacing_left),
                         aterm_messages::Severity::Info,
                     ));
                 } else {
@@ -1127,11 +1206,33 @@ impl App {
                         }
                     } else {
                         // The failure's few words, where they change what the
-                        // person does before `Install now` (ruling 246).
+                        // person does before `Install now` (ruling 246) — and a
+                        // refusal only a person can clear says what they do
+                        // first (round eight, finding 14): "install it from the
+                        // Version menu" over a folder this user cannot write, or
+                        // an installed copy that is not the signed release, named
+                        // a press that refuses the same way until they act. A
+                        // standing block's remedy outranks this attempt's own
+                        // message, which may be an ordinary failure met before
+                        // the refusal was reached (finding 14's review).
+                        let detail = self
+                            .person_remedy_for(staged_build)
+                            .or_else(|| {
+                                crate::update_apply_trouble::ApplyTrouble::needs_person(&message)
+                                    .then(|| {
+                                        crate::update_apply_trouble::PersonRemedy::of_refusal(
+                                            &message,
+                                        )
+                                    })
+                            })
+                            .map_or(
+                                crate::update_words::INSTALL_FROM_MENU,
+                                crate::update_apply_trouble::PersonRemedy::sentence,
+                            );
                         self.note_update_outcome(crate::update_words::needs_install_because(
                             &format!("Couldn't install aterm v{version}"),
                             crate::update_words::short_cause(&message),
-                            crate::update_words::INSTALL_FROM_MENU,
+                            detail,
                             aterm_messages::Severity::Warn,
                             staged_build,
                         ));
@@ -1150,7 +1251,10 @@ impl App {
                     if source_is_automatic(source) {
                         self.note_update_outcome(crate::update_words::outcome(
                             UPDATE_DIDNT_FINISH,
-                            &format!("the next check downloads it again \u{b7} {message}"),
+                            &crate::update_words::with_named_cause(
+                                "the next check downloads it again",
+                                &message,
+                            ),
                             aterm_messages::Severity::Warn,
                         ));
                     } else {
@@ -1173,24 +1277,126 @@ impl App {
     /// A close preflight refused the install: name the one blocker a PERSON can
     /// clear ([`App::update_blocker_for_person`] — unsaved editor or Settings
     /// work) as an outcome row — and say nothing else while the lane will try
-    /// again by itself; a lane that has stopped points at the Version menu.
+    /// again by itself; a lane that has stopped points at the Version menu. A
+    /// build ON HOLD ([`App::latched_activation_trial_spent`]) is moved by no
+    /// press and no cleared blocker: a staged row up for it takes the on-hold
+    /// words ([`crate::update_words::ApplyPosture::TrialSpent`], the fact the
+    /// refusal read), and no row offers `Install now`. Not
+    /// [`App::apply_posture_for`]: it ranks the handoff and `[update]
+    /// auto_apply` first, and under either would restate the build as ready
+    /// or raise its `Install now` again.
     pub(crate) fn note_update_blockers(&mut self, reasons: &[String], retry_scheduled: bool) {
-        if let Some(blocker) = Self::update_blocker_for_person(reasons) {
-            // The blocker IS what the person does: painted (ruling 77).
-            self.note_update_outcome(crate::update_words::failed(
-                UPDATE_WAITS_FOR_YOU,
-                blocker,
-                true,
-            ));
+        if let Some(held) = self
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map(|stage| stage.build)
+            .filter(|&build| self.latched_activation_trial_spent(build))
+        {
+            self.restate_staged_bar_posture_in(held, crate::update_words::ApplyPosture::TrialSpent);
+        } else if let Some(blocker) = Self::update_blocker_for_person(reasons) {
+            // The blocker IS what the person does: painted (ruling 77). Where the
+            // lane retries by itself it STANDS (round eight, lead U38): the lane
+            // lands once the work is saved and says nothing else meanwhile, the
+            // overdue notice included, so this row is the wait's one notice.
+            if retry_scheduled {
+                self.say_update_waits_for_you(blocker);
+            } else {
+                self.note_update_outcome(crate::update_words::failed(
+                    UPDATE_WAITS_FOR_YOU,
+                    blocker,
+                    true,
+                ));
+            }
         } else if !retry_scheduled {
             let msg = self.stopped_lane_outcome(UPDATE_DIDNT_INSTALL);
             self.note_update_outcome(msg);
         }
     }
 
+    /// THE WAIT'S ONE NOTICE ([`crate::update_words::waits_for_you`], round eight
+    /// of the update audit, lead U38): the standing row that says a person's
+    /// unsaved work holds the automatic lane. Its key is one for every wait, and
+    /// a standing row the person read, dismissed or answered stays quiet for a
+    /// day (`aterm_messages::need::STANDING_QUIET`) — about THAT wait. So the
+    /// first raise of a wait in this process is news (the review of U38): the
+    /// quiet an earlier wait's row earned — this process's, or one before an
+    /// update or a relaunch — is ended first
+    /// ([`aterm_messages::MessageCenter::end_standing_quiet`]), or a later build,
+    /// or the same one held again after the work was saved once, waited with no
+    /// row and the overdue notice off (L5). A raise later in the same wait keeps
+    /// the quiet a read of this wait's row earned.
+    pub(crate) fn say_update_waits_for_you(&mut self, blocker: &str) {
+        if !self.update_wait_said {
+            let _ = self.messages.end_standing_quiet(
+                crate::update_words::KEY_WAITS_FOR_YOU,
+                crate::messages_host::wall_stamp_now(),
+                std::time::Instant::now(),
+            );
+            self.update_wait_said = true;
+        }
+        self.note_update_outcome(crate::update_words::waits_for_you(blocker));
+    }
+
+    /// Nothing a person must save holds the update any more (round eight of the
+    /// update audit, lead U38): the standing "Update waits for you" row
+    /// ([`crate::update_words::waits_for_you`]) leaves, WITHDRAWN — no ✓ stands on
+    /// a wait's words, and the record keeps what it said — and the wait it said
+    /// is over, so the next one is news ([`Self::say_update_waits_for_you`]).
+    pub(crate) fn withdraw_update_waits_for_you(&mut self) {
+        self.update_wait_said = false;
+        if let Some(id) = self
+            .messages
+            .live_by_key(crate::update_words::KEY_WAITS_FOR_YOU)
+            .map(|l| l.id)
+        {
+            self.withdraw_message(id);
+        }
+    }
+
+    /// THE WAIT ON A PERSON ENDS WITH THE LANE THAT WAITED (round eight of the
+    /// update audit, the review of lead U38). The wait — the standing row and the
+    /// overdue notice's exemption ([`Self::update_lands_by_itself`]) — stands on
+    /// the automatic lane's promise to land the build once the work is saved
+    /// ([`Self::automatic_apply_retry_scheduled`], the very fact the row was
+    /// raised on), and only an attempt answered that. A lane that stopped trying
+    /// (`[update] auto_apply` turned off, the stage retired, yanked or consumed,
+    /// the intent cleared, a newer build staged) returns before any attempt, so
+    /// the row said "Save the work in the open editor" under Problems for its
+    /// day's patience, and saving changed nothing. Read on every loop turn
+    /// (`about_to_wait`) and where the lane drops its intent: with no automatic
+    /// retry scheduled for the waited build, the wait ends. Idempotent, and free
+    /// while no wait stands.
+    pub(crate) fn settle_update_wait_on_person(&mut self) {
+        // The row is up only while the wait is said (`say_update_waits_for_you`
+        // sets it; every withdrawal clears it).
+        if self.update_waits_on_person.is_none() && !self.update_wait_said {
+            return;
+        }
+        let waited = self.update_waits_on_person.or_else(|| {
+            self.native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .map(|stage| stage.build)
+        });
+        if waited.is_some_and(|build| self.automatic_apply_retry_scheduled(build)) {
+            return;
+        }
+        aterm_log::info!(
+            "update: the automatic lane no longer retries build {waited:?} by itself; the \
+             notice that it waits for unsaved work leaves"
+        );
+        self.update_waits_on_person = None;
+        self.withdraw_update_waits_for_you();
+    }
+
     /// A lane that STOPPED, titled `title` (ruling 143): a decision row whose
-    /// `Install now` is the Version menu's press for the staged build — or,
-    /// with no build staged to press for, the same words on record.
+    /// `Install now` is the Version menu's press for the staged build — its
+    /// detail the standing block's remedy where a person's block stopped it
+    /// ([`Self::person_remedy_for`]) — or, with no build staged to press for,
+    /// the same words on record.
     fn stopped_lane_outcome(&self, title: &str) -> aterm_messages::Message {
         let staged = self
             .native_updater_service
@@ -1201,7 +1407,10 @@ impl App {
         match staged {
             Some(build) => crate::update_words::needs_install(
                 title,
-                crate::update_words::INSTALL_FROM_MENU,
+                self.person_remedy_for(build).map_or(
+                    crate::update_words::INSTALL_FROM_MENU,
+                    crate::update_apply_trouble::PersonRemedy::sentence,
+                ),
                 aterm_messages::Severity::Warn,
                 build,
             ),
@@ -1258,7 +1467,7 @@ impl App {
         if source_is_automatic(source) {
             self.note_update_outcome(crate::update_words::outcome(
                 UPDATE_DIDNT_FINISH,
-                &format!("another download has replaced it \u{b7} {message}"),
+                &crate::update_words::with_named_cause("another download replaced it", message),
                 aterm_messages::Severity::Warn,
             ));
         } else {
@@ -1391,17 +1600,26 @@ impl App {
     }
 
     /// APPLY BEGINS (before the carry is built, before the readers park): the
-    /// update bar says "installing" and the border surge starts charging. With
-    /// the row already up its WORDS change — a repaint, not a re-grid. With no
-    /// row up, an EXPLICIT apply (`explicit`: the Version menu, Software Update,
-    /// a clean quit) ADDS the row and commits the re-grid at once, so the carry
-    /// built next reads the rows the successor must reproduce; the automatic
-    /// lane adds none — its own re-check reads the re-grid's SIGWINCH as
-    /// activity and stands down — and there the surge alone explains the frozen
-    /// frame. What the row said before is kept so a refusal can put it back
-    /// (`retire_update_installing`).
+    /// update bar says "installing". With the row already up its WORDS change — a
+    /// repaint, not a re-grid. With no row up, an EXPLICIT apply (`explicit`: the
+    /// Version menu, Software Update, a clean quit) ADDS the row and commits the
+    /// re-grid at once, so the carry built next reads the rows the successor must
+    /// reproduce; the automatic lane adds none — its own re-check reads the
+    /// re-grid's SIGWINCH as activity and stands down — and there the upgrade rim
+    /// alone explains the frozen frame. What the row said before is kept so a
+    /// refusal can put it back (`retire_update_installing`) — across a press held
+    /// for the candidate's read and run again too, whose second begin finds the
+    /// row installing already and leaves it as it is.
+    ///
+    /// The rim is NOT started here (round eight of the update audit, leads U60
+    /// and U40): it explains a FREEZE, and on the launched lane the readers park
+    /// only after the successor's boot, its dial and the park gate's hold — up
+    /// to two and a half minutes during which the terminal is live. Started here,
+    /// it pulsed around a working terminal for all of that, and its cap could run
+    /// out before the freeze it is the one explanation of. Each lane starts it
+    /// where its readers park ([`Self::charge_upgrade_rim_at_park`]).
     #[cfg(any(unix, test))]
-    pub(crate) fn begin_update_installing(&mut self, build: u64, explicit: bool) {
+    pub(crate) fn begin_update_installing(&mut self, explicit: bool) {
         use crate::messages_host::FlowPhase;
         let version = self
             .native_updater_service
@@ -1411,6 +1629,30 @@ impl App {
             .map(|staged| staged.version.clone())
             .unwrap_or_default();
         let installing = crate::update_words::installing(&version);
+        // The preflight passed, so no unsaved work holds the lane: its standing
+        // row is answered (round eight, lead U38), and left out of the carry
+        // built next — an older successor would adopt it with nothing to answer
+        // it. The band settles it with the rest; nothing re-grids here. The wait
+        // it said is over: a later one is news.
+        self.update_wait_said = false;
+        if let Some(id) = self
+            .messages
+            .live_by_key(crate::update_words::KEY_WAITS_FOR_YOU)
+            .map(|l| l.id)
+        {
+            self.messages.withdraw(id, std::time::Instant::now());
+        }
+        // A HELD PRESS RUNNING AGAIN (`App::run_held_person_apply`, round eight
+        // of the update audit, U35's review): the row already says it installs,
+        // and what it said before the press is what a refusal puts back — kept,
+        // never re-read from the installing words, which a refusal would then
+        // restore and leave up. The rim keeps charging from where it was.
+        if self
+            .live_update_flow()
+            .is_some_and(|flow| flow.phase == FlowPhase::Installing)
+        {
+            return;
+        }
         self.update_row_before_install = None;
         let live = self
             .live_update_flow()
@@ -1433,8 +1675,26 @@ impl App {
             // Posted through the seam that commits the re-grid at once.
             self.post_update_row(installing, &version, FlowPhase::Installing);
         }
-        self.spawn_upgrade_surge(build);
         self.request_redraw_all_windows();
+    }
+
+    /// THE READERS PARK: the upgrade rim starts charging for `build`. Called by
+    /// each lane at its reader park, the instant the terminal stops echoing — the
+    /// freeze the rim explains, whose cap (`level_up::CHARGE_TTL`) is counted from
+    /// here. A rim an earlier park of the same attempt started (one that missed
+    /// its budget and re-parks at once) runs on, continuous, with its cap counted
+    /// again from this park (`LevelUp::re_anchor`; the review of round eight's
+    /// leads U60 and U40): a park first missed early and admitted late froze the
+    /// terminal on a cap counted from the first. A miss that sends the launched
+    /// lane back to its gate's wait takes the rim away there
+    /// (`park_and_transfer_to_prelaunched_successor`). The attempt's end retires
+    /// it (`retire_update_installing`, `retire_charging_surge`).
+    #[cfg(any(unix, test))]
+    pub(crate) fn charge_upgrade_rim_at_park(&mut self, build: u64) {
+        match self.level_up.as_mut() {
+            Some(rim) => rim.re_anchor(std::time::Instant::now()),
+            None => self.spawn_upgrade_surge(build),
+        }
     }
 
     /// The handoff did not take over — a synchronous refusal before the park, or
@@ -1511,10 +1771,16 @@ impl App {
             let trouble = staged
                 .as_ref()
                 .and_then(|(build, _)| self.apply_trouble_for(*build));
+            // A build on hold reads "on hold" whether or not the ledger still
+            // names its failures: the same fact the press refuses on.
+            let on_hold = staged
+                .as_ref()
+                .is_some_and(|(build, _)| self.latched_activation_trial_spent(*build));
             crate::menu::update_version_menu(
                 handle,
                 staged.as_ref().map(|(b, v)| (*b, v.as_str())),
                 trouble.as_ref(),
+                on_hold,
                 realized,
             );
         }
@@ -1719,10 +1985,11 @@ pub(crate) mod tests {
     }
 
     /// THE RIM AND THE ROW AT THE APP'S SEAMS (2026-09-07): apply-begins
-    /// charges the rim and rewrites the row; a refusal restores both, and is
-    /// idempotent; an explicit apply with no row up adds one and a refusal
-    /// removes it; the automatic lane never adds one; the rim ends with the
-    /// outcome posted over the attempt.
+    /// rewrites the row and the reader park charges the rim (round eight, leads
+    /// U60 and U40: apply begin no longer does — nothing is frozen yet); a
+    /// refusal restores both, and is idempotent; an explicit apply with no row up
+    /// adds one and a refusal removes it; the automatic lane never adds one; the
+    /// rim ends with the outcome posted over the attempt.
     #[test]
     fn apply_begins_charges_the_rim_and_a_refusal_restores_the_row() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -1739,8 +2006,13 @@ pub(crate) mod tests {
         );
         assert!(app.update_row_text().unwrap().contains("is ready"));
 
-        app.begin_update_installing(41, false);
-        assert!(phase(&app));
+        app.begin_update_installing(false);
+        assert!(!phase(&app), "no rim over a terminal that still echoes");
+        app.charge_upgrade_rim_at_park(41);
+        assert!(
+            phase(&app),
+            "the readers parked: the rim explains the freeze"
+        );
         // (No staged VERSION in the test ledger: the title says "update".)
         assert_eq!(
             app.update_row_text().unwrap(),
@@ -1767,17 +2039,18 @@ pub(crate) mod tests {
         // and a refusal takes it away again.
         app.clear_messages_for_test();
         assert_eq!(app.message_band_rows, 0);
-        app.begin_update_installing(41, false);
+        app.begin_update_installing(false);
         assert_eq!(
             app.messages.live_rows().count(),
             0,
             "the automatic lane never adds a row"
         );
         assert_eq!(app.message_band_rows, 0);
-        assert!(phase(&app), "…but the rim still charges");
+        app.charge_upgrade_rim_at_park(41);
+        assert!(phase(&app), "…but the rim still charges at the park");
         app.retire_update_installing();
         assert!(!phase(&app));
-        app.begin_update_installing(41, true);
+        app.begin_update_installing(true);
         assert_eq!(
             app.messages.live_rows().count(),
             1,
@@ -1819,7 +2092,8 @@ pub(crate) mod tests {
             "9.9.9",
             crate::messages_host::FlowPhase::Staged { build: 41 },
         );
-        app.begin_update_installing(41, false);
+        app.begin_update_installing(false);
+        app.charge_upgrade_rim_at_park(41);
         app.note_update_outcome(crate::update_words::failed(
             super::UPDATE_WAITS_FOR_YOU,
             App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
@@ -2030,7 +2304,7 @@ pub(crate) mod tests {
                     app.staged_update_row().is_some(),
                     "{case}: PRECONDITION: its ready row"
                 );
-                app.begin_update_installing(tried, !super::source_is_automatic(source));
+                app.begin_update_installing(!super::source_is_automatic(source));
                 // The attempt at `tried` returns after a sibling published
                 // `replacement`: the shipping return retires the stage it tried,
                 // and the reconcile imports the replacement.
@@ -2116,6 +2390,12 @@ pub(crate) mod tests {
                     told.as_deref()
                         .is_some_and(|t| t.starts_with(super::UPDATE_DIDNT_FINISH)),
                     "{case}: the failure is said: {told:?}"
+                );
+                // In a person's words: the ledger's own text is aterm.log's.
+                assert!(
+                    told.as_deref()
+                        .is_some_and(|t| !t.contains("failed safely")),
+                    "{case}: {told:?}"
                 );
                 // How the new stage installs: its own ready row, with its
                 // own press, where a press is how; nothing where the lane
@@ -2680,7 +2960,8 @@ pub(crate) mod tests {
                 "\u{2191}",
                 build,
                 "9.9.9",
-                app.apply_trouble_for(build).as_ref()
+                app.apply_trouble_for(build).as_ref(),
+                false,
             ),
             "\u{2191} Install aterm v9.9.9 now"
         );
@@ -2701,7 +2982,7 @@ pub(crate) mod tests {
             .apply_trouble_for(build)
             .expect("the failure that just happened is standing trouble for this build");
         assert_eq!(
-            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&trouble)),
+            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&trouble), false),
             "\u{2191} Install aterm v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
              will try again"
         );
@@ -2732,9 +3013,9 @@ pub(crate) mod tests {
         assert_eq!(
             projection.headline,
             if projection.apply_is_failing {
-                "Update ready, but it keeps failing to apply."
+                "Update keeps failing to install."
             } else {
-                "Update ready, but applying it failed."
+                "Update didn\u{2019}t install."
             },
             "one failure is already below `PERSISTENT_AFTER` and already news"
         );
@@ -2759,14 +3040,14 @@ pub(crate) mod tests {
         );
         assert_eq!(
             crate::native_settings::compact_update_headline(&projection),
-            "Not applying"
+            "Not installing"
         );
 
         // AND NOT ONE OF THEM LEAKS THE LEDGER'S OWN PROSE. "overlap handoff failed
         // safely" in a menu item is worse than the plain "Update ready" it replaced:
         // it tells the reader the failure succeeded.
         for surfaced in [
-            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&trouble)),
+            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&trouble), false),
             projection.detail.clone().expect("detail"),
             crate::native_settings::compact_update_detail(&projection),
             crate::native_settings::compact_update_detail_minimum(&projection),
@@ -2787,7 +3068,7 @@ pub(crate) mod tests {
             .apply_trouble_for(build)
             .expect("still standing trouble");
         assert_eq!(
-            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&latched)),
+            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&latched), false),
             "\u{2191} Install aterm v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
              try again now"
         );
@@ -2810,7 +3091,7 @@ pub(crate) mod tests {
     /// there is `app_native::durable_update_status`, which reads
     /// `aterm_update::apply_lane_report` beside the check lane's status, and nothing
     /// else in this crate reads it at all: without this test, deleting that read
-    /// leaves every surface saying "it did not finish applying" and the whole suite
+    /// leaves every surface saying "it did not finish installing" and the whole suite
     /// green.
     #[cfg(target_os = "macos")]
     #[test]
@@ -2839,7 +3120,7 @@ pub(crate) mod tests {
             .apply_trouble_for(staged)
             .expect("the ledger remembers what this process never saw");
         assert_eq!(
-            crate::menu::staged_apply_label("\u{2191}", staged, "9.9.9", Some(&trouble)),
+            crate::menu::staged_apply_label("\u{2191}", staged, "9.9.9", Some(&trouble), false),
             "\u{2191} Install aterm v9.9.9 \u{2014} tried once, didn\u{2019}t take over; \
              try again now",
             "the CAUSE came off the disk, and so did the fact that nothing is scheduled"
@@ -2911,7 +3192,8 @@ pub(crate) mod tests {
                 "\u{2191}",
                 fresh,
                 "9.9.9",
-                app.apply_trouble_for(fresh).as_ref()
+                app.apply_trouble_for(fresh).as_ref(),
+                false,
             ),
             "\u{2191} Install aterm v9.9.9 now"
         );
@@ -2934,7 +3216,7 @@ pub(crate) mod tests {
         );
         let trouble = app.apply_trouble_for(fresh).expect("its own failure");
         assert_eq!(
-            crate::menu::staged_apply_label("\u{2191}", fresh, "9.9.9", Some(&trouble)),
+            crate::menu::staged_apply_label("\u{2191}", fresh, "9.9.9", Some(&trouble), false),
             "\u{2191} Install aterm v9.9.9 \u{2014} tried once, too slow to start; \
              will try again",
             "the count restarted with the artifact, and the CAUSE moved with it"
@@ -3359,21 +3641,36 @@ pub(crate) mod tests {
         let blocked = |reasons: &[&str]| UpdateOutcome::Blocked {
             reasons: reasons.iter().map(|r| (*r).to_string()).collect(),
         };
-        for reason in [
-            App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
-            "Review Settings Drafts: 1 Settings view(s) have unsaved text",
-            "Checkpoint Drafts: 2 document(s) have uncheckpointed edits",
-            "Retry: 1 document checkpoint(s) previously failed",
+        // Named by the work that holds it: Settings text is no open editor.
+        const SETTINGS: &str = "Review Settings Drafts: 1 Settings view(s) have unsaved text";
+        for (reasons, said) in [
+            (
+                &[App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY][..],
+                App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+            ),
+            (&[SETTINGS][..], App::UNSAVED_SETTINGS_BLOCKS_APPLY),
+            (
+                &["Checkpoint Drafts: 2 document(s) have uncheckpointed edits"][..],
+                App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+            ),
+            (
+                &["Retry: 1 document checkpoint(s) previously failed"][..],
+                App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+            ),
+            (
+                &[
+                    "Checkpoint Drafts: 2 document(s) have uncheckpointed edits",
+                    SETTINGS,
+                ][..],
+                App::UNSAVED_EDITOR_AND_SETTINGS_BLOCK_APPLY,
+            ),
         ] {
             app.clear_messages_for_test();
-            app.react_to_update_apply_outcome("automatic", blocked(&[reason]), false);
+            app.react_to_update_apply_outcome("automatic", blocked(reasons), false);
             assert_eq!(
                 app.update_row_text(),
-                Some(format!(
-                    "{UPDATE_WAITS_FOR_YOU} \u{2014} {}",
-                    App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY
-                )),
-                "{reason}"
+                Some(format!("{UPDATE_WAITS_FOR_YOU} \u{2014} {said}")),
+                "{reasons:?}"
             );
         }
         // Clears by itself, and nothing is scheduled here (no stage): the lane
@@ -3828,7 +4125,24 @@ pub(crate) mod tests {
             said.starts_with("Couldn't finish the update \u{2014} "),
             "{said}"
         );
-        assert!(said.contains("the staged artifact was retired"), "{said}");
+        assert!(said.contains("the next check downloads it again"), "{said}");
+        // A reason the apply lane cannot name is aterm.log's, never spliced
+        // (audit 2026-09-29); one it can name is said in a person's words.
+        assert!(!said.contains("the staged artifact was retired"), "{said}");
+        let mut named = App::headless_for_test();
+        named.react_to_update_apply_outcome(
+            "automatic handoff",
+            UpdateOutcome::Failed {
+                message: "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
+            },
+            false,
+        );
+        let said = named.update_record_text().expect("on record");
+        assert!(
+            said.contains("\u{b7} the new version did not finish starting")
+                && !said.contains("failed safely"),
+            "{said}"
+        );
 
         let mut pressed = App::headless_for_test();
         pressed.react_to_update_apply_outcome("manual", failed(), false);

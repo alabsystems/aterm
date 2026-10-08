@@ -58,10 +58,10 @@ fn create_test_page(line_count: usize, prefix: &str) -> (Vec<u8>, usize) {
 
 #[test]
 fn disk_cold_cache_byte_limit_is_enforced() {
-    // Round-10: the cold LRU cache used to evict by page COUNT only, ignoring the
-    // documented (and Kani-"proven") cache_byte_limit. cache_size here is large so
-    // ONLY the byte budget can bind; reading more distinct pages than the budget
-    // holds must keep cache_bytes <= cache_byte_limit at all times.
+    // The cold LRU cache must evict by bytes, not only by page count.
+    // cache_size here is large so ONLY the byte budget can bind; reading more
+    // distinct pages than the budget holds must keep cache_bytes <=
+    // cache_byte_limit at all times.
     let dir = tempdir().unwrap();
     let path = dir.path().join("cold.dtrm");
     let config = DiskColdConfig::new(&path)

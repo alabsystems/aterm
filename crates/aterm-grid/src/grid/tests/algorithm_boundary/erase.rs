@@ -3,9 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-// Erase display modes (ED): erase_to_end_of_screen (ED 0),
-// erase_from_start_of_screen (ED 1), erase_screen (ED 2)
-// ========================================================================
+// Erase display modes: ED 0 (erase_to_end_of_screen), ED 1
+// (erase_from_start_of_screen), ED 2 (erase_screen)
 
 #[test]
 fn erase_to_end_of_screen_cursor_at_last_row() {

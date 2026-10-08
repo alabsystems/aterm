@@ -9,28 +9,56 @@
 //! pure decision + formatting helpers; the actual prompt and the free-space query are the
 //! CLI/OS edge.
 
-/// Format a byte count as a short human string (`B`/`KiB`/`MiB`/`GiB`, one decimal) for
-/// the cost surface.
-#[must_use]
-pub fn human_bytes(n: u64) -> String {
+/// The largest unit `n` fills at least once, as its size and name; `(1, "B")` below a KiB.
+fn unit_of(n: u64) -> (u64, &'static str) {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     if n >= GIB {
-        format!("{:.1} GiB", n as f64 / GIB as f64)
+        (GIB, "GiB")
     } else if n >= MIB {
-        format!("{:.1} MiB", n as f64 / MIB as f64)
+        (MIB, "MiB")
     } else if n >= KIB {
-        format!("{:.1} KiB", n as f64 / KIB as f64)
+        (KIB, "KiB")
     } else {
-        format!("{n} B")
+        (1, "B")
     }
+}
+
+/// `n` written in `unit`: whole bytes as an integer, a larger unit to one decimal.
+fn in_unit(n: u64, (size, name): (u64, &str)) -> String {
+    if size == 1 {
+        format!("{n} B")
+    } else {
+        format!("{:.1} {name}", n as f64 / size as f64)
+    }
+}
+
+/// Format a byte count as a short human string (`B`/`KiB`/`MiB`/`GiB`, one decimal) for
+/// the cost surface.
+#[must_use]
+pub fn human_bytes(n: u64) -> String {
+    in_unit(n, unit_of(n))
+}
+
+/// Two byte counts a sentence sets side by side (a need and what is free), each by
+/// [`human_bytes`] unless the two round alike: 1174 MiB needed on 1147 MiB free both read
+/// `1.1 GiB`. Then both are written in the unit of their difference, in which they are at
+/// least one whole unit apart, so unequal counts never print as one figure.
+#[must_use]
+pub fn human_bytes_apart(a: u64, b: u64) -> (String, String) {
+    let (ha, hb) = (human_bytes(a), human_bytes(b));
+    if ha != hb {
+        return (ha, hb);
+    }
+    let unit = unit_of(a.abs_diff(b));
+    (in_unit(a, unit), in_unit(b, unit))
 }
 
 /// Disk preflight (§9/§10.2): whether `required` installed bytes fit in `available` while
 /// still leaving at least `free_floor` bytes free afterward. Saturating — a colossal
-/// `required` can never wrap to "fits". For a coherence group, pass the **sum** of every
-/// staged member's signed `disk_installed`.
+/// `required` can never wrap to "fits". An install's gate passes its unit's archives and
+/// trees together (`flow::LandingBytes::need`, summed over a coherence group's members).
 #[must_use]
 pub fn disk_ok(required: u64, available: u64, free_floor: u64) -> bool {
     available >= required.saturating_add(free_floor)
@@ -55,6 +83,25 @@ mod tests {
         // `{:.1}` rounds half to even on the tenths digit: exactly 1.25 MiB is "1.2".
         assert_eq!(human_bytes(1_310_720), "1.2 MiB");
         assert_eq!(human_bytes(u64::MAX), "17179869184.0 GiB");
+    }
+
+    #[test]
+    fn human_bytes_apart_never_prints_unequal_counts_alike() {
+        let mib = 1u64 << 20;
+        // Figures that already differ keep `human_bytes`'s words.
+        assert_eq!(
+            human_bytes_apart(1400 * mib, 900 * mib),
+            (human_bytes(1400 * mib), human_bytes(900 * mib))
+        );
+        // Both round to `1.1 GiB`: written in MiB, the unit of their 27 MiB gap.
+        assert_eq!(human_bytes(1174 * mib), human_bytes(1147 * mib));
+        assert_eq!(
+            human_bytes_apart(1174 * mib, 1147 * mib),
+            ("1174.0 MiB".to_string(), "1147.0 MiB".to_string())
+        );
+        // A gap under a KiB falls to whole bytes.
+        let (a, b) = human_bytes_apart(1174 * mib, 1174 * mib - 100);
+        assert_eq!((a.as_str(), b.as_str()), ("1231028224 B", "1231028124 B"));
     }
 
     #[test]

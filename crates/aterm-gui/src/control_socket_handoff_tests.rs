@@ -7,7 +7,9 @@ use super::*;
 use aterm_spec::derive::{
     Model, native_update_control_socket_handoff_model, native_update_handoff_bind_retry_model,
 };
+use aterm_spec::wait::{MUST_HAPPEN, until_within};
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -22,9 +24,6 @@ fn fixture() -> (aterm_tempfile::TempDir, control_auth::SocketPlan) {
     };
     (dir, plan)
 }
-
-/// How long a wait for an event may take before the test calls it a hang.
-const EVENT_WAIT: Duration = Duration::from_secs(30);
 
 /// The instance that bound `plan` leaves: its socket and token go. By path,
 /// because the fixture's files are that instance's own; the identity rule an
@@ -85,8 +84,29 @@ fn incoming_control_preparation_requires_both_real_service_lanes() {
     assert!(!control_lanes_prepared(0, 0));
 }
 
+/// The successor binds the fixed path only after the Commit, its predecessor's
+/// exit AND the close of the predecessor's listener — each judged at a FACT:
+/// the worker parked on the closed gate, then asking again about a parent it
+/// was told is alive, then probing again a listener it found live. A window
+/// ("nothing done within 30 ms") passes vacuously whenever the worker is slow
+/// to get there, which a loaded machine makes the common case.
+///
+/// ALONE IN ITS OWN PROCESS. `drop(parent)` closes the predecessor's listener
+/// only when it closes its LAST descriptor, and a child that any sibling test
+/// forks holds a copy until it execs (macOS 26.6 honors no `FD_CLOFORK`): the
+/// copy kept the listener listening, the worker kept finding its predecessor,
+/// and past its 2 s handoff deadline it stood down without binding.
+///
+/// The handoff wait is a HANG DETECTOR here ([`bind_control_listener_within`]):
+/// production's 2 s runs from the release, and every step of this test between
+/// the release and `drop(parent)` had to fit inside it — a test thread stalled
+/// past it made a correct worker stand down, read as "ended over a live
+/// parent". Production's own bound is not this test's subject.
 #[test]
 fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let (_dir, plan) = fixture();
     let (parent, parent_token) = bind_control_listener(&plan, None, || false, |_| false, None)
         .unwrap()
@@ -100,69 +120,85 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     .unwrap();
     let gate = crate::spawn::DeferredReaderGate::closed();
     let parent_live = Arc::new(AtomicBool::new(true));
-    let observed_parent = Arc::new(AtomicBool::new(false));
-    let (began_tx, began_rx) = mpsc::sync_channel(1);
+    let parent_asked = Arc::new(AtomicUsize::new(0));
     let (done_tx, done_rx) = mpsc::sync_channel(1);
     let child = {
         let plan = plan.clone();
         let gate = gate.clone();
         let live = parent_live.clone();
-        let observed = observed_parent.clone();
+        let asked = parent_asked.clone();
         std::thread::spawn(move || {
-            began_tx.send(()).unwrap();
-            let result = bind_control_listener(
+            let result = bind_control_listener_within(
                 &plan,
                 Some(&gate),
                 || {
-                    observed.store(true, Ordering::Release);
+                    asked.fetch_add(1, Ordering::AcqRel);
                     live.load(Ordering::Acquire)
                 },
                 |pid| pid == std::process::id(),
                 Some(&identity),
+                MUST_HAPPEN,
             );
             done_tx.send(result).unwrap();
         })
     };
-    // Every wait below is for an EVENT, bounded only against a hang: under
-    // the merge contract's parallel run on a loaded machine the successor's
-    // bind took longer than the 3 s this used to allow (2026-09-26, load
-    // average 32), and a short bound on an event is a flake, not a check.
-    // The negative checks — nothing done within 30 ms — keep their windows.
-    began_rx.recv_timeout(EVENT_WAIT).unwrap();
+    let asked = || parent_asked.load(Ordering::Acquire);
     let model = native_update_control_socket_handoff_model();
     let mut state = model.init_state();
+
+    // Before the Commit: the worker parks on the closed gate. Parked there it
+    // can leave only by the release, so what it has not done yet — asked
+    // about its parent, finished, touched the token — is judged now.
+    until_within(MUST_HAPPEN, "the worker parks on the closed gate", || {
+        (gate.parked() == 1 || asked() > 0 || child.is_finished()).then_some(())
+    });
+    assert_eq!(asked(), 0, "the worker crossed the Commit gate");
+    assert!(!child.is_finished(), "the worker ended before the Commit");
     assert!(model.successors("Bind", &state).is_empty());
-    assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
-    assert!(
-        !observed_parent.load(Ordering::Acquire),
-        "the worker crossed the Commit gate"
-    );
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), token_before);
 
+    // Committed, its parent alive: asked twice is told twice, so it is
+    // holding at the parent witness rather than moving on.
     gate.release();
     step(&model, &mut state, "Commit");
-    let deadline = std::time::Instant::now() + EVENT_WAIT;
-    while !observed_parent.load(Ordering::Acquire) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "worker did not reach parent witness"
-        );
-        std::thread::yield_now();
-    }
+    until_within(
+        MUST_HAPPEN,
+        "the worker asks again about a live parent",
+        || (asked() >= 2 || child.is_finished()).then_some(()),
+    );
+    assert!(!child.is_finished(), "the worker ended over a live parent");
     assert!(model.successors("Bind", &state).is_empty());
-    assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), token_before);
 
-    // Darwin can publish the death witness before closing the listener.
+    // Darwin can publish the death witness before closing the listener. The
+    // worker then probes the listener it attested, finds it live, and probes
+    // again: its probes are accepted here, two of them, as the fact.
     parent_live.store(false, Ordering::Release);
     step(&model, &mut state, "Exit");
-    assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+    parent.set_nonblocking(true).unwrap();
+    let mut probes = Vec::new();
+    until_within(
+        MUST_HAPPEN,
+        "the worker probes the live listener twice",
+        || {
+            match parent.accept() {
+                Ok((probe, _)) => probes.push(probe),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("accept the worker's probe: {error}"),
+            }
+            (probes.len() >= 2 || child.is_finished()).then_some(())
+        },
+    );
+    assert!(
+        !child.is_finished(),
+        "the worker ended while its predecessor's listener was live"
+    );
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), token_before);
-    drop(parent);
+    drop((probes, parent));
     let (successor, successor_token) = done_rx
-        .recv_timeout(EVENT_WAIT)
+        .recv_timeout(MUST_HAPPEN)
         .unwrap()
-        .unwrap()
+        .expect("the successor binds once its predecessor's listener closed")
         .into_parts();
     child.join().unwrap();
     step(&model, &mut state, "Bind");
@@ -291,7 +327,10 @@ fn a_failed_handoff_bind_never_retries_over_a_foreign_full_backlog() {
             let _ = send.send(result);
         })
     };
-    let result = received.recv_timeout(Duration::from_secs(2));
+    // The bind's answer MUST arrive: a hang detector, never a 2 s budget a
+    // loaded machine overruns. A regressed probe that blocks on the full
+    // backlog is still named — at the minute, as a timeout below.
+    let result = received.recv_timeout(MUST_HAPPEN);
     let untouched = identity.matches_current(&plan)
         && std::fs::read(&plan.token_path).is_ok_and(|after| after == before);
     // Release even a regressed blocking probe before asserting, so a failing

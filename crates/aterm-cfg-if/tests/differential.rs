@@ -7,9 +7,7 @@
 //! # What it is differential against, and why not the upstream crate
 //!
 //! The obvious reference is a `[dev-dependencies]` on the real crates.io
-//! `cfg-if` — the pattern `crates/aterm-grapheme` uses against
-//! `unicode-width`. It does not work here, and the way it fails is the worst
-//! kind. `[patch.crates-io]` rewrites EVERY crates-io edge in the workspace,
+//! `cfg-if`. It does not work here, and the way it fails is the worst kind. `[patch.crates-io]` rewrites EVERY crates-io edge in the workspace,
 //! dev edges included, so once the patch entry lands a `cfg-if` dev-dependency
 //! resolves to this very crate. Measured with the patch in place:
 //!

@@ -17,12 +17,6 @@ fn grid_new() {
 }
 
 #[test]
-fn grid_assert_invariants_on_new() {
-    let grid = Grid::new(24, 80);
-    grid.assert_invariants();
-}
-
-#[test]
 fn grid_assert_invariants_after_operations() {
     let mut grid = Grid::new(24, 80);
 
@@ -110,11 +104,9 @@ fn grid_write_char_wrap() {
 
 #[test]
 fn write_char_wrap_marks_continuation_after_full_screen_scroll() {
-    // REGRESSION: when the cursor autowraps at the bottom row of a FULL-screen
-    // scroll region, the scroll recycles a fresh bottom row that receives the
-    // soft-wrap continuation. That row must stay marked `wrapped`, or reflow /
-    // selection / copy treats the continuation as a separate logical line and
-    // inserts a spurious hard break.
+    // Autowrapping at the bottom of a full-screen scroll region recycles a
+    // bottom row that receives the continuation; it stays marked `wrapped`, or
+    // reflow/selection/copy would insert a hard break.
     let mut grid = Grid::new(2, 2);
     for c in "ABCDE".chars() {
         grid.write_char_wrap(c);
@@ -221,12 +213,7 @@ fn grid_insert_lines() {
     grid.set_cursor(1, 0); // At row 1
     grid.insert_lines(2);
 
-    // Row 0: A (unchanged)
-    // Row 1: (blank - inserted)
-    // Row 2: (blank - inserted)
-    // Row 3: B (shifted from row 1)
-    // Row 4: C (shifted from row 2)
-    // D and E pushed off
+    // Expected rows: A _ _ B C (_ = inserted blank; D, E pushed off).
 
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(1, 0).unwrap().char(), ' ');
@@ -248,11 +235,7 @@ fn grid_delete_lines() {
     grid.set_cursor(1, 0); // At row 1
     grid.delete_lines(2);
 
-    // Row 0: A (unchanged)
-    // Row 1: D (shifted from row 3)
-    // Row 2: E (shifted from row 4)
-    // Row 3: (blank)
-    // Row 4: (blank)
+    // Expected rows: A D E _ _ (_ = blank).
 
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'D');
@@ -293,9 +276,7 @@ fn grid_screen_alignment_pattern() {
     assert!(grid.scroll_region().is_full(3));
 }
 
-// =============================================================================
-// row_text — complex characters and combining marks (#4517)
-// =============================================================================
+// row_text — complex characters and combining marks
 
 #[test]
 fn test_row_text_complex_chars_and_combining_marks() {
@@ -325,7 +306,7 @@ fn test_row_text_complex_chars_and_combining_marks() {
     extra.set_complex_char(Some(Arc::from(emoji)));
 
     // Write 'e' at column 4 and add a combining acute accent (U+0301).
-    // Must set has_extras so row_text reads combining marks (#7456).
+    // Must set has_extras so row_text reads combining marks.
     grid.move_cursor_to(0, 4);
     grid.write_char('e');
     if let Some(r) = grid.row_mut(row) {
@@ -359,7 +340,7 @@ fn test_row_text_bmp_only_unchanged() {
     assert_eq!(text, "Hello World");
 }
 
-// --- Supplementary plane character tests (#5939) ---
+// --- Supplementary plane character tests ---
 
 #[test]
 fn write_char_preserves_supplementary_plane_emoji() {

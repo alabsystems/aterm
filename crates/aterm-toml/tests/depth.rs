@@ -95,6 +95,63 @@ fn ordinary_nesting_is_untouched() {
     }
 }
 
+/// Inline tables nested 128 deep, each entry a dotted key as long as the budget
+/// left at its depth allows: `k = { a.a.….a = { a.….a = { … } } }`. Every
+/// construct stays inside the limit on its own, yet the TREE is
+/// 128 + 127 + … + 1 = 8,256 tables deep — from a 17 KB document.
+fn dotted_staircase(limit: usize) -> String {
+    let mut out = String::from("k = ");
+    for depth in 0..limit {
+        out.push_str("{ ");
+        out.push_str(&vec!["a"; limit - depth].join("."));
+        out.push_str(" = ");
+    }
+    out.push('1');
+    out.push_str(&" }".repeat(limit));
+    out.push('\n');
+    out
+}
+
+/// The bound is on the depth of the TREE, not on each construct alone: header
+/// segments, dotted-key segments and array/inline-table nesting all deepen the
+/// same tree that `Drop`, the encoder and the deserializer walk recursively.
+/// Budgeting them separately let the staircase above through, and
+/// `from_str::<Value>` on it overflowed the stack — an abort from inside a
+/// config load.
+#[test]
+fn constructs_that_each_fit_the_limit_cannot_stack_past_it() {
+    let path = (0..64)
+        .map(|i| format!("k{i}"))
+        .collect::<Vec<_>>()
+        .join(".");
+    for (name, source) in [
+        ("dotted keys in nested inline tables", dotted_staircase(128)),
+        (
+            "a header, a dotted key, then nested arrays",
+            format!(
+                "[{path}]\n{path} = {}1{}\n",
+                "[".repeat(100),
+                "]".repeat(100)
+            ),
+        ),
+    ] {
+        let parsed = source.parse::<aterm_toml::edit::DocumentMut>();
+        let refused = parsed.is_err();
+        // An accepted tree is thousands of levels deep and even DROPPING it
+        // recurses, so it is leaked: the assertion, not a stack overflow, has
+        // to be what reports the failure.
+        core::mem::forget(parsed);
+        assert!(refused, "{name}: the document half accepted it");
+        let error = aterm_toml::from_str::<aterm_toml::Value>(&source)
+            .err()
+            .unwrap_or_else(|| panic!("{name}: from_str accepted it"));
+        assert!(
+            error.to_string().contains("limit"),
+            "{name}: the error should name the limit, got {error}"
+        );
+    }
+}
+
 /// A rejected deep document must not leave a half-built tree that overflows on
 /// the way out — the error path drops everything it allocated.
 #[test]

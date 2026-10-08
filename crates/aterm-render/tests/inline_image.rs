@@ -46,10 +46,8 @@ fn osc_1337_file(args: &str, payload: &[u8]) -> Vec<u8> {
 
 #[test]
 fn red_image_paints_red_pixels_over_the_grid() {
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = r.cell_size();
     let mut term = Terminal::new(6, 10);
     // A 4×2 cell red image, sized in pixels so the footprint matches exactly.
@@ -89,10 +87,8 @@ fn image_cell_skips_its_glyph() {
     // show the glyph: the image owns the cell. We compare the image region of an
     // image-covered frame against a control where the same green image covers a
     // BLANK grid — they must be pixel-identical (the prior glyph left no trace).
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = r.cell_size();
     let png = solid_png(2 * cw as u32, ch as u32, [0, 200, 0]);
 
@@ -129,10 +125,8 @@ fn negative_z_images_composite_before_base_and_combining_glyphs() {
     // CPU-only z-order pin (runs even when no GPU adapter is available). For
     // both opaque and semitransparent Kitty z<0 tiles, image-over-cell-bg then
     // glyph must equal a no-image oracle whose cell bg is that exact composite.
-    let Some(mut r) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
     r.set_text_blending(aterm_render::TextBlending::Linear);
     let (cw, ch) = r.cell_size();
@@ -156,6 +150,7 @@ fn negative_z_images_composite_before_base_and_combining_glyphs() {
             rows: 1,
             z_index: -1,
             band_lift_px: 0,
+            cell_offset_px: (0, 0),
             scaling: aterm_core::grid::extra::ImageScaling::Fit,
             source_rect: None,
         });
@@ -202,10 +197,8 @@ fn negative_z_images_composite_before_base_and_combining_glyphs() {
 
 #[test]
 fn kitty_extreme_negative_z_sits_below_non_default_cell_backgrounds() {
-    let Some(mut renderer) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found");
-        return;
-    };
+    let mut renderer = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = renderer.cell_size();
     let (rows, cols) = (2usize, 4usize);
     let frame_default_bg = [1, 2, 3];
@@ -239,6 +232,7 @@ fn kitty_extreme_negative_z_sits_below_non_default_cell_backgrounds() {
             rows: 1,
             z_index,
             band_lift_px: 0,
+            cell_offset_px: (0, 0),
             scaling: aterm_core::grid::extra::ImageScaling::Fit,
             source_rect: None,
         });
@@ -287,10 +281,8 @@ fn chrome_band_lift_paints_the_lip_above_the_grid() {
     // lip `[grid_top - lift, grid_top)` from its own top rows, seat its cell
     // rows exactly where an unlifted image sits, and leave every pixel outside
     // its columns untouched. A lift of 0 must remain byte-identical.
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = r.cell_size();
     let (rows, cols) = (3usize, 6usize);
     let (pad, pad_top, head) = (4usize, 2usize, 9usize);
@@ -324,6 +316,7 @@ fn chrome_band_lift_paints_the_lip_above_the_grid() {
             rows: 1,
             z_index: 0,
             band_lift_px,
+            cell_offset_px: (0, 0),
             scaling: aterm_core::grid::extra::ImageScaling::Fit,
             source_rect: None,
         })
@@ -408,10 +401,8 @@ fn oversized_inline_image_png_draws_nothing_without_huge_alloc() {
     // End-to-end: a remote peer sends an OSC 1337 inline image whose PNG IHDR
     // claims 30000×30000 (≈3.4 GiB if honored) in a sub-1KB payload. The render
     // path must skip it (draw nothing) rather than allocate — no panic, no OOM.
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = r.cell_size();
     let bomb = png_with_declared_dims(30_000, 30_000);
     assert!(
@@ -471,10 +462,8 @@ fn text_only_frame_is_unaffected_by_the_image_path() {
     // built before any image plumbing existed. We assert internal consistency:
     // the same input renders identically twice (the image pass is a strict no-op
     // for an image-free row, allocating nothing and touching no pixels).
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let mut term = Terminal::new(4, 8);
     term.process(b"\x1b[31mhi\x1b[0m world");
     let a = r.render_input(&term.cell_frame(4, 8)).pixels;
@@ -809,10 +798,8 @@ fn aspect_fit_box_picks_the_binding_axis() {
 ///      byte-equal to the same frame with no image in it.
 #[test]
 fn sixel_draws_one_sixel_pixel_per_device_pixel() {
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = r.cell_size();
     let (rows, cols) = (6usize, 10usize);
 

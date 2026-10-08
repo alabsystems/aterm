@@ -23,9 +23,8 @@
 //!   is a separate store, and an item written to one is invisible to the
 //!   other).
 //!
-//! [`tests`] holds the differential test that pins that equality: the retired
-//! crate is kept as a `[dev-dependencies]` ORACLE and every operation is
-//! cross-checked against it, in both directions, on a live keychain.
+//! Items written by that crate and by this module were cross-read in both
+//! directions on a live keychain when it was retired.
 //!
 //! **Error discipline.** Every entry point returns the raw `OSStatus` in
 //! [`Error`] rather than collapsing failures into an `Option`. The caller
@@ -444,8 +443,8 @@ pub(crate) fn set_generic_password(
 /// Remove the generic-password item under (`service`, `account`).
 ///
 /// `Err` with [`Error::code`] == [`ERR_SEC_ITEM_NOT_FOUND`] when there was
-/// nothing to remove. The differential oracle's cleanup path, so test-only:
-/// aterm itself never revokes a stored drive token.
+/// nothing to remove. The live round trip's cleanup path, so test-only: aterm
+/// itself never revokes a stored drive token.
 #[cfg(test)]
 pub(crate) fn delete_generic_password(service: &str, account: &str) -> Result<(), Error> {
     let (_service, _account, key) = generic_password_key(service, account)?;
@@ -459,401 +458,13 @@ pub(crate) fn delete_generic_password(service: &str, account: &str) -> Result<()
     }
 }
 
-// ---------------------------------------------------------------------------
-// The differential test: `security-framework` as the ORACLE
-// ---------------------------------------------------------------------------
-
-/// `security-framework` is kept as a `[dev-dependencies]` oracle (see this
-/// crate's manifest) and every operation above is cross-checked against it.
-///
-/// Two shapes of check, because they catch different mistakes:
-///
-/// * **Parallel scripts** — the same sequence of operations is driven through
-///   both implementations against two SEPARATE items, and every outcome
-///   (returned bytes, or the exact `OSStatus`) must be equal. This is the check
-///   that pins the add-then-update-on-duplicate branch, the not-found status,
-///   and the empty/binary payload edges: whatever the OS does, the two must do
-///   the same thing.
-/// * **Cross reads** — one implementation writes and the OTHER reads the SAME
-///   item. This is the check that pins the query itself: class, service and
-///   account attributes, and (crucially) that both target the file-based login
-///   keychain rather than one of them silently landing in the data-protection
-///   keychain, where the other would never find it. That equality is what keeps
-///   already-provisioned installs working across this change.
-///
-/// These tests touch the REAL login keychain, so: every item is created under a
-/// service name unique to this process and this instant, the reads happen in the
-/// process that created the item (so the creating application always has ACL
-/// access and no interaction is required), and both items are deleted on every
-/// exit path. If the keychain is unusable — no login session, locked keychain —
-/// the ORACLE fails first and the test skips rather than reporting a defect in
-/// the reimplementation.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// One operation's result, in a shape both implementations can be reduced
-    /// to, so that comparing them compares EVERYTHING: the bytes on success and
-    /// the raw `OSStatus` on failure.
-    #[derive(Debug, PartialEq, Eq)]
-    enum Outcome {
-        Bytes(Vec<u8>),
-        Stored,
-        Deleted,
-        Failed(OSStatus),
-    }
-
-    fn mine_get(service: &str, account: &str) -> Outcome {
-        match get_generic_password(service, account) {
-            Ok(b) => Outcome::Bytes(b),
-            Err(e) => Outcome::Failed(e.code()),
-        }
-    }
-
-    fn mine_set(service: &str, account: &str, password: &[u8]) -> Outcome {
-        match set_generic_password(service, account, password) {
-            Ok(()) => Outcome::Stored,
-            Err(e) => Outcome::Failed(e.code()),
-        }
-    }
-
-    fn mine_delete(service: &str, account: &str) -> Outcome {
-        match delete_generic_password(service, account) {
-            Ok(()) => Outcome::Deleted,
-            Err(e) => Outcome::Failed(e.code()),
-        }
-    }
-
-    fn oracle_get(service: &str, account: &str) -> Outcome {
-        match security_framework::passwords::get_generic_password(service, account) {
-            Ok(b) => Outcome::Bytes(b),
-            Err(e) => Outcome::Failed(e.code()),
-        }
-    }
-
-    fn oracle_set(service: &str, account: &str, password: &[u8]) -> Outcome {
-        match security_framework::passwords::set_generic_password(service, account, password) {
-            Ok(()) => Outcome::Stored,
-            Err(e) => Outcome::Failed(e.code()),
-        }
-    }
-
-    fn oracle_delete(service: &str, account: &str) -> Outcome {
-        match security_framework::passwords::delete_generic_password(service, account) {
-            Ok(()) => Outcome::Deleted,
-            Err(e) => Outcome::Failed(e.code()),
-        }
-    }
-
-    /// A service name no other run — or the user's real config — can collide
-    /// with. `tag` separates the two items a parallel script needs.
-    fn unique_service(tag: &str) -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!(
-            "aterm-keychain-difftest-{tag}-{}-{nanos}",
-            std::process::id()
-        )
-    }
-
-    /// Deletes its item on every exit path, including a panicking assert.
-    struct Scratch(String, String);
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = delete_generic_password(&self.0, &self.1);
-        }
-    }
-
-    /// Whether this machine's keychain can be written at all, decided by the
-    /// ORACLE — so a skip can never hide a defect in the reimplementation.
-    /// Returns the failing status when it cannot.
-    fn oracle_can_write(service: &str, account: &str) -> Result<(), OSStatus> {
-        match oracle_set(service, account, b"probe") {
-            Outcome::Stored => {
-                let _ = oracle_delete(service, account);
-                Ok(())
-            }
-            Outcome::Failed(code) => Err(code),
-            other => panic!("oracle set returned {other:?}"),
-        }
-    }
-
-    /// The payloads the sequential add-then-update script is run over: the
-    /// ordinary 64-char hex token aterm actually stores, plus the edges
-    /// (embedded NULs and high bytes, a value long enough to leave the
-    /// small-item path, multi-byte UTF-8, and a single byte).
-    ///
-    /// The EMPTY payload is deliberately absent and tested on its own in
-    /// [`empty_password_update_is_ignored_by_both`]: macOS does not honour it
-    /// as an update, so it cannot take part in a "what went in comes out"
-    /// script.
-    fn payloads() -> Vec<Vec<u8>> {
-        vec![
-            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec(),
-            vec![0x00, 0xFF, 0x01, 0x00, 0x80, 0x7F],
-            (0u16..=511).map(|b| (b & 0xFF) as u8).collect(),
-            "ünïcøde password — ✅".as_bytes().to_vec(),
-            b"0".to_vec(),
-        ]
-    }
-
-    /// Drive both implementations through the SAME operation script against two
-    /// separate items and require identical outcomes at every step.
-    /// WRITES TO THE REAL LOGIN KEYCHAIN, so it is `#[ignore]`d and does not run
-    /// in an ordinary `cargo test`.
-    ///
-    /// This is a differential test against `security-framework`, and the only way
-    /// to compare two Keychain implementations is to have both talk to a real
-    /// Keychain — there is no injectable backend behind `SecItemAdd`. On a
-    /// developer's machine that means the default run was creating and deleting
-    /// items in the user's own login Keychain, and macOS answered with a modal
-    /// `Keychain "login" cannot be found to store "difftest-empty"` dialog
-    /// offering to RESET IT TO DEFAULTS. A test suite must never put that
-    /// dialog in front of anyone, and must never be one mis-click away from
-    /// resetting a user's Keychain.
-    ///
-    /// Run it deliberately when the FFI changes:
-    ///     cargo test -p aterm-gui --lib net_connections::keychain -- --ignored --test-threads=1
-    ///
-    /// `--test-threads=1` is not optional: these scripts share service names, so
-    /// in parallel they race each other and fail for reasons that have nothing to
-    /// do with the code under test.
+    /// A failure keeps its exact `OSStatus`, and renders as something.
     #[test]
-    #[ignore = "writes to the real login Keychain; run with --ignored --test-threads=1"]
-    fn parallel_script_outcomes_match_the_oracle() {
-        let account = "difftest-account";
-        let mine_service = unique_service("mine");
-        let oracle_service = unique_service("oracle");
-        let _mine_scratch = Scratch(mine_service.clone(), account.to_owned());
-        let _oracle_scratch = Scratch(oracle_service.clone(), account.to_owned());
-
-        if let Err(code) = oracle_can_write(&oracle_service, account) {
-            crate::logging::stderr_line!(
-                "SKIP keychain differential: the oracle itself cannot write to this \
-                 machine's keychain (OSStatus {code}) — no login session, or it is locked"
-            );
-            return;
-        }
-
-        // 1. Absent item: both must report errSecItemNotFound, not a generic
-        //    failure — `resolve_token` branches on exactly this code.
-        assert_eq!(
-            mine_get(&mine_service, account),
-            Outcome::Failed(ERR_SEC_ITEM_NOT_FOUND),
-        );
-        assert_eq!(
-            mine_get(&mine_service, account),
-            oracle_get(&oracle_service, account),
-        );
-        assert_eq!(
-            mine_delete(&mine_service, account),
-            oracle_delete(&oracle_service, account),
-        );
-
-        // 2. First write is an ADD; every later write hits errSecDuplicateItem
-        //    inside and must become an UPDATE. Walking the payload list without
-        //    deleting in between is what exercises that branch.
-        for payload in payloads() {
-            assert_eq!(
-                mine_set(&mine_service, account, &payload),
-                oracle_set(&oracle_service, account, &payload),
-                "set disagreed on a {}-byte payload",
-                payload.len(),
-            );
-            let mine = mine_get(&mine_service, account);
-            assert_eq!(
-                mine,
-                oracle_get(&oracle_service, account),
-                "get disagreed after a {}-byte payload",
-                payload.len(),
-            );
-            // And the value that came back is the value that went in — an
-            // agreement on the WRONG bytes would otherwise pass.
-            assert_eq!(mine, Outcome::Bytes(payload));
-        }
-
-        // 3. Delete, then the absent-item statuses again.
-        assert_eq!(
-            mine_delete(&mine_service, account),
-            oracle_delete(&oracle_service, account),
-        );
-        assert_eq!(
-            mine_delete(&mine_service, account),
-            Outcome::Failed(ERR_SEC_ITEM_NOT_FOUND),
-        );
-        assert_eq!(
-            mine_delete(&mine_service, account),
-            oracle_delete(&oracle_service, account),
-        );
-        assert_eq!(
-            mine_get(&mine_service, account),
-            oracle_get(&oracle_service, account),
-        );
-    }
-
-    /// The compatibility check: an item written by one implementation must be
-    /// readable by the other. This is what proves the query attributes and the
-    /// keychain SELECTION are identical, so tokens provisioned by a build that
-    /// used `security-framework` still resolve after this change.
-    /// WRITES TO THE REAL LOGIN KEYCHAIN, so it is `#[ignore]`d and does not run
-    /// in an ordinary `cargo test`.
-    ///
-    /// This is a differential test against `security-framework`, and the only way
-    /// to compare two Keychain implementations is to have both talk to a real
-    /// Keychain — there is no injectable backend behind `SecItemAdd`. On a
-    /// developer's machine that means the default run was creating and deleting
-    /// items in the user's own login Keychain, and macOS answered with a modal
-    /// `Keychain "login" cannot be found to store "difftest-empty"` dialog
-    /// offering to RESET IT TO DEFAULTS. A test suite must never put that
-    /// dialog in front of anyone, and must never be one mis-click away from
-    /// resetting a user's Keychain.
-    ///
-    /// Run it deliberately when the FFI changes:
-    ///     cargo test -p aterm-gui --lib net_connections::keychain -- --ignored --test-threads=1
-    ///
-    /// `--test-threads=1` is not optional: these scripts share service names, so
-    /// in parallel they race each other and fail for reasons that have nothing to
-    /// do with the code under test.
-    #[test]
-    #[ignore = "writes to the real login Keychain; run with --ignored --test-threads=1"]
-    fn each_implementation_reads_what_the_other_wrote() {
-        let account = "difftest-cross";
-        let service = unique_service("cross");
-        let _scratch = Scratch(service.clone(), account.to_owned());
-
-        if let Err(code) = oracle_can_write(&service, account) {
-            crate::logging::stderr_line!(
-                "SKIP keychain cross-read differential: the oracle itself cannot write \
-                 to this machine's keychain (OSStatus {code})"
-            );
-            return;
-        }
-
-        let first = b"aaaa1111bbbb2222cccc3333dddd4444".to_vec();
-        let second = b"ffff9999eeee8888dddd7777cccc6666".to_vec();
-
-        // Mine writes (an ADD) -> the oracle must find it.
-        assert_eq!(mine_set(&service, account, &first), Outcome::Stored);
-        assert_eq!(oracle_get(&service, account), Outcome::Bytes(first.clone()));
-
-        // The oracle overwrites (its UPDATE branch) -> mine must see the new
-        // value, not a stale or duplicated item.
-        assert_eq!(oracle_set(&service, account, &second), Outcome::Stored);
-        assert_eq!(mine_get(&service, account), Outcome::Bytes(second.clone()));
-
-        // Mine overwrites (MY update branch) -> the oracle must see it, and
-        // exactly one item must exist: if the update had instead added a second
-        // item, the delete below would leave one behind for the final get to
-        // find.
-        assert_eq!(mine_set(&service, account, &first), Outcome::Stored);
-        assert_eq!(oracle_get(&service, account), Outcome::Bytes(first));
-
-        // The oracle deletes -> mine must report absence, not a stale hit.
-        assert_eq!(oracle_delete(&service, account), Outcome::Deleted);
-        assert_eq!(
-            mine_get(&service, account),
-            Outcome::Failed(ERR_SEC_ITEM_NOT_FOUND),
-        );
-
-        // And the reverse: mine deletes what the oracle wrote.
-        assert_eq!(oracle_set(&service, account, &second), Outcome::Stored);
-        assert_eq!(mine_delete(&service, account), Outcome::Deleted);
-        assert_eq!(
-            oracle_get(&service, account),
-            Outcome::Failed(ERR_SEC_ITEM_NOT_FOUND),
-        );
-    }
-
-    /// A macOS behaviour the oracle CONFIRMED rather than a divergence, pinned
-    /// here so a future rewrite cannot quietly turn it into a difference:
-    ///
-    /// * `SecItemAdd` with an empty `kSecValueData` stores an empty item, and
-    ///   reading it back yields zero bytes.
-    /// * `SecItemUpdate` with an empty `kSecValueData` returns `errSecSuccess`
-    ///   and leaves the PREVIOUS password in place. The write is silently
-    ///   dropped — by the OS, in both implementations identically.
-    ///
-    /// aterm never reaches this: `store_token` validates 64-char hex before it
-    /// calls [`set_generic_password`], so an empty drive token cannot be
-    /// written. The test exists because the first cut of the differential
-    /// script assumed "set then get returns what was set", and this is the one
-    /// input for which the platform says otherwise.
-    /// WRITES TO THE REAL LOGIN KEYCHAIN, so it is `#[ignore]`d and does not run
-    /// in an ordinary `cargo test`.
-    ///
-    /// This is a differential test against `security-framework`, and the only way
-    /// to compare two Keychain implementations is to have both talk to a real
-    /// Keychain — there is no injectable backend behind `SecItemAdd`. On a
-    /// developer's machine that means the default run was creating and deleting
-    /// items in the user's own login Keychain, and macOS answered with a modal
-    /// `Keychain "login" cannot be found to store "difftest-empty"` dialog
-    /// offering to RESET IT TO DEFAULTS. A test suite must never put that
-    /// dialog in front of anyone, and must never be one mis-click away from
-    /// resetting a user's Keychain.
-    ///
-    /// Run it deliberately when the FFI changes:
-    ///     cargo test -p aterm-gui --lib net_connections::keychain -- --ignored --test-threads=1
-    ///
-    /// `--test-threads=1` is not optional: these scripts share service names, so
-    /// in parallel they race each other and fail for reasons that have nothing to
-    /// do with the code under test.
-    #[test]
-    #[ignore = "writes to the real login Keychain; run with --ignored --test-threads=1"]
-    fn empty_password_update_is_ignored_by_both() {
-        let account = "difftest-empty";
-        let mine_add = unique_service("empty-add-mine");
-        let oracle_add = unique_service("empty-add-oracle");
-        let mine_upd = unique_service("empty-upd-mine");
-        let oracle_upd = unique_service("empty-upd-oracle");
-        let _s1 = Scratch(mine_add.clone(), account.to_owned());
-        let _s2 = Scratch(oracle_add.clone(), account.to_owned());
-        let _s3 = Scratch(mine_upd.clone(), account.to_owned());
-        let _s4 = Scratch(oracle_upd.clone(), account.to_owned());
-
-        if let Err(code) = oracle_can_write(&oracle_add, account) {
-            crate::logging::stderr_line!(
-                "SKIP keychain empty-password differential: the oracle itself cannot \
-                 write to this machine's keychain (OSStatus {code})"
-            );
-            return;
-        }
-
-        // ADD with an empty value: stored, and it reads back empty.
-        assert_eq!(mine_set(&mine_add, account, b""), Outcome::Stored);
-        assert_eq!(oracle_set(&oracle_add, account, b""), Outcome::Stored);
-        assert_eq!(mine_get(&mine_add, account), Outcome::Bytes(Vec::new()));
-        assert_eq!(
-            mine_get(&mine_add, account),
-            oracle_get(&oracle_add, account),
-        );
-
-        // UPDATE with an empty value: reports success, changes nothing.
-        assert_eq!(mine_set(&mine_upd, account, b"abc"), Outcome::Stored);
-        assert_eq!(oracle_set(&oracle_upd, account, b"abc"), Outcome::Stored);
-        assert_eq!(mine_set(&mine_upd, account, b""), Outcome::Stored);
-        assert_eq!(oracle_set(&oracle_upd, account, b""), Outcome::Stored);
-        assert_eq!(
-            mine_get(&mine_upd, account),
-            Outcome::Bytes(b"abc".to_vec())
-        );
-        assert_eq!(
-            mine_get(&mine_upd, account),
-            oracle_get(&oracle_upd, account),
-        );
-    }
-
-    /// The `Display`/`Debug` text a keychain failure reaches the user through
-    /// (`resolve_token` formats `{e}` into its hint) must be the same text the
-    /// retired crate produced, for every status aterm can plausibly surface.
-    /// This needs no keychain at all.
-    #[test]
-    fn error_rendering_matches_the_oracle() {
-        // errSecItemNotFound, errSecDuplicateItem, errSecParam,
-        // errSecInteractionNotAllowed, errSecAuthFailed, userCanceledErr,
-        // errSecNotAvailable, plus a code the system has no message for.
+    fn error_codes_survive_and_render() {
         for code in [
             ERR_SEC_ITEM_NOT_FOUND,
             ERR_SEC_DUPLICATE_ITEM,
@@ -865,22 +476,51 @@ mod tests {
             1,
             123_456_789,
         ] {
-            let mine = Error::from_code(code);
-            let oracle = security_framework::base::Error::from_code(code);
-            assert_eq!(mine.code(), oracle.code(), "code {code}");
-            assert_eq!(mine.message(), oracle.message(), "message for {code}");
-            assert_eq!(mine.to_string(), oracle.to_string(), "Display for {code}");
+            let e = Error::from_code(code);
+            assert_eq!(e.code(), code);
+            assert!(!e.to_string().is_empty(), "code {code}");
         }
     }
 
-    /// A zero status is not a failure: both implementations refuse to build an
-    /// `Error` that would compare equal to `errSecSuccess`.
+    /// A zero status is not a failure: it is never carried as one.
     #[test]
     fn zero_status_is_never_a_success_shaped_error() {
+        assert_eq!(Error::from_code(0).code(), 1);
+    }
+
+    /// Add, update (on duplicate), read back, delete and the not-found statuses
+    /// on the REAL login keychain, so `#[ignore]`d: a default `cargo test` must
+    /// never touch a user's keychain. Run it deliberately when the FFI changes:
+    ///     cargo test -p aterm-gui --lib net_connections::keychain -- --ignored --test-threads=1
+    #[test]
+    #[ignore = "writes to the real login Keychain; run with --ignored --test-threads=1"]
+    fn live_round_trip() {
+        let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
+        let service = format!("aterm-keychain-test-{}-{nanos}", std::process::id());
+        let account = "test-account";
+        let code = |r: Result<Vec<u8>, Error>| r.map_err(Error::code);
+
         assert_eq!(
-            Error::from_code(0).code(),
-            security_framework::base::Error::from_code(0).code(),
+            code(get_generic_password(&service, account)),
+            Err(ERR_SEC_ITEM_NOT_FOUND)
         );
-        assert_ne!(Error::from_code(0).code(), 0);
+        for payload in [
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec(),
+            vec![0x00, 0xFF, 0x01, 0x00, 0x80, 0x7F],
+            (0u16..=511).map(|b| (b & 0xFF) as u8).collect(),
+            "ünïcøde password — ✅".as_bytes().to_vec(),
+        ] {
+            assert!(set_generic_password(&service, account, &payload).is_ok());
+            assert_eq!(code(get_generic_password(&service, account)), Ok(payload));
+        }
+        assert!(delete_generic_password(&service, account).is_ok());
+        assert_eq!(
+            delete_generic_password(&service, account).map_err(Error::code),
+            Err(ERR_SEC_ITEM_NOT_FOUND)
+        );
+        assert_eq!(
+            code(get_generic_password(&service, account)),
+            Err(ERR_SEC_ITEM_NOT_FOUND)
+        );
     }
 }

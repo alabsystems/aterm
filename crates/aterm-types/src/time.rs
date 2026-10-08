@@ -14,7 +14,7 @@ use core::time::Duration;
 #[must_use]
 #[inline]
 // Skip: `Duration` is `core::time::Duration`, and the arithmetic below is
-// saturating. Measured without this skip on trust seal 321aaeda7 (2026-09-27):
+// saturating. Measured without this skip on trust seal 321aaeda7:
 // the one obligation stays runtime-checked, because the native trust-mc
 // bundle refuses the by-value `Duration` argument ("Alloca without an
 // internally bound extent, pointee-type, and alignment derivation"). Needed

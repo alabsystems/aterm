@@ -2,26 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The damage-scoped refill is ALLOCATION-FREE once warm (typing-to-pixels
-//! audit, P2 "remove avoidable typing-frame work").
+//! The damage-scoped refill allocates nothing once warm.
 //!
 //! `Terminal::cell_frame_damage_scoped_into` is the per-frame extraction every
-//! native echo frame rides. It used to build a fresh `Vec<u64>` row mask on
-//! every scoped refill (and SCR-2's scrolled arm built another), so a typing
-//! burst paid one heap allocation per frame for a mask whose size never
-//! changes. The mask now lives in resident terminal scratch; this file pins
-//! that the extraction of 10,000 one-row echoes allocates NOTHING after the
-//! warm-up frame, and that the frames really took the scoped arm (a run that
-//! silently fell back to full refills would be allocation-free for a
-//! different reason and prove nothing about the mask).
+//! native echo frame rides; its row mask lives in resident terminal scratch.
+//! This pins that extracting 10,000 one-row echoes allocates nothing after the
+//! warm-up frame, and that the frames took the scoped arm (a silent fallback to
+//! full refills would prove nothing about the mask).
 //!
-//! SCR-2's scrolled arm shares the same resident mask, but it is not measured
-//! here: its debug-build net (`render_cells.rs`, "SCR-2 DEBUG NET") clones the
-//! scratch for a full-extraction oracle on every scrolled step by design, so a
-//! test build cannot observe that arm allocation-free.
+//! The scrolled arm shares the mask but is not measured: its debug-build
+//! oracle in `render_cells.rs` clones the scratch on every scrolled step.
 //!
-//! The counter is THREAD-LOCAL so the measured span counts only this test
-//! thread's allocations — the harness and any sibling test are invisible.
+//! The counter is thread-local, so only this test thread's allocations count.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -33,9 +25,8 @@ thread_local! {
 
 struct Counting;
 
-// SAFETY: every method forwards to `System` with the caller's own layout and
-// pointer; the only addition is a const-initialised thread-local counter,
-// which never allocates.
+// SAFETY: every method forwards to `System` with the caller's layout and
+// pointer; the thread-local counter never allocates.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let _ = ACTIVE.try_with(|active| {

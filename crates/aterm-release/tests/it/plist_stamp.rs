@@ -3,7 +3,7 @@
 
 //! Golden tests for the Info.plist template substitution (release spec §6
 //! `bundle.rs`), including the `-dirty` rule that must match
-//! crates/aterm-gui/build.rs byte-for-byte — the plist's ATermGitCommit and
+//! crates/aterm/build.rs byte-for-byte — the plist's ATermGitCommit and
 //! the binary's ATERM_GIT_COMMIT are compared by humans and scripts, so any
 //! drift between the two stamps is a provenance bug.
 
@@ -240,7 +240,7 @@ fn stamped_values_are_xml_escaped() {
     assert!(out.contains("<string>a&amp;b&lt;c&gt;</string>"), "{out}");
 }
 
-// --- the -dirty rule (must match crates/aterm-gui/build.rs) ------------------
+// --- the -dirty rule (must match crates/aterm/build.rs) ----------------------
 
 #[test]
 fn dirty_rule_matches_build_rs() {

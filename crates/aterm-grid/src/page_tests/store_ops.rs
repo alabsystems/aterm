@@ -7,8 +7,8 @@ use super::super::*;
 #[test]
 fn page_is_zeroed() {
     let page = Page::new();
-    // SAFETY: We have exclusive access to the page data in this test.
-    // Use data_ptr() and read through the raw pointer.
+    // SAFETY: We have exclusive access to the page data in this test; read
+    // through data_ptr().
     let data = unsafe { std::slice::from_raw_parts(page.data_ptr(), PAGE_SIZE) };
     assert!(data.iter().all(|&b| b == 0));
 }
@@ -251,9 +251,7 @@ fn page_used_bytes_tracked_correctly() {
     let _s2 = store.alloc_slice::<u32>(100); // 400 more bytes
     // next_offset should be 800
 
-    // Force new page - need allocation that exceeds remaining space
-    // PAGE_SIZE = 65536, used = 800, remaining = 64736
-    // 16384 u32s = 65536 bytes, which exceeds remaining 64736 bytes
+    // 800 bytes used leaves 64736; 16384 u32s (65536 bytes) need a new page.
     let _s3 = store.alloc_slice::<u32>(16384); // Forces new page
     // First page's used bytes should be tracked in page_used_bytes
 

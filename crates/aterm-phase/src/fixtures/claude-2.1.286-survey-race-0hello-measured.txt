@@ -1,0 +1,16 @@
+# claude-code 2.1.286 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50), the managed 2.1.286 launched by path against a local stub of the API · the rating card's aftermath when a person's key lands inside the ~0.44 s the harness's `0` spends pending in the composer (`hello` typed 1.84-2.15 s after the card, the `0` having been written at 1.82-1.87 s): the card is abandoned, not dismissed, and the `0` heads the person's text (13 of 13 runs); the scratch folder is redacted at equal width
+ ▐▛███▛█   Claude Code v2.1.286
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.XXXX/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Churned for 0s · done 1:37 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 0hello
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -1671,7 +1671,7 @@ notes    = "سگ = dog; توله / توله سگ = puppy; سگ کوچولو = li
 # gate's unambiguous set stays clean; the default languages = ["en"]
 # un-gates them for everyone. Homograph law: profanity > feline > canine >
 # animal, so cat/kitty keep the cat. One surface -> one species, pinned by
-# animal_surface_species_are_unique.
+# the conflicts channel (embedded_lexicon_parses_and_has_no_conflicts).
 # (2026-08-10: the ambiguous=true law above is the ENGLISH group's — the
 # animal-multilingual group at the end of this file extends the roster to
 # zh/ja/ko/hi/th/vi/id under its own load laws; see that header.)

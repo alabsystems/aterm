@@ -29,6 +29,8 @@
 //!    arm NO timer, so an idle page costs 0 % CPU), then ticks and renders.
 //! 4. [`set_band_motion`](AtermTerminal::set_band_motion) — the page's
 //!    `prefers-reduced-motion`: `false` draws the still look;
+//!    [`set_frame_period_ms`](AtermTerminal::set_frame_period_ms) — the
+//!    display's measured frame period, which glides and echoes are read on;
 //!    [`set_band_visible`](AtermTerminal::set_band_visible) — the page's
 //!    visibility: a hidden page's band is off screen, and a hidden page arms
 //!    no timer at all (ruling 337, F2).
@@ -44,7 +46,9 @@
 //! 6. [`band_hover`](AtermTerminal::band_hover) and
 //!    [`band_press`](AtermTerminal::band_press) — the pointer over the band,
 //!    in frame pixels: the chip under it lights, and a press does what the
-//!    `notice act` verb does; [`set_details_view`](AtermTerminal::set_details_view)
+//!    `notice act` verb does; [`band_press_acts`](AtermTerminal::band_press_acts)
+//!    — whether a press there does anything (the pointer's shape);
+//!    [`set_details_view`](AtermTerminal::set_details_view)
 //!    — the page has a Details view, so every row ends in its link.
 //! 7. [`set_forced_colors`](AtermTerminal::set_forced_colors) — CSS
 //!    `forced-colors`: the five system colours own the band, ungraded.
@@ -121,7 +125,7 @@ use aterm_messages::page::{self, MessagesFilter, MessagesState};
 use aterm_messages::paint::{Geometry, Hover, HoverTarget};
 use aterm_messages::wire::{self, NoticeRequest, Paint, ReadQuery, WireGate};
 use aterm_messages::{
-    ActionIndex, Hit, Intent, Links, LogLine, Look, MessageCenter, MessageId, MessageLog, Shelf,
+    ActionIndex, Hit, Intent, LogLine, Look, MessageCenter, MessageId, MessageLog, Shelf,
     UpgradeWord, WallStamp, LOG_CAP, MAX_ROWS,
 };
 use aterm_render::band::{self as band_frame, BandFrame};
@@ -207,7 +211,7 @@ pub(crate) struct WebBand {
     /// look — and it arms no timer (ruling 337, F2).
     visible: bool,
     /// The page has a Details view: every row ends in its link, and a press
-    /// on a row opens it ([`Links::Painted`]).
+    /// on a row opens it ([`aterm_messages::Links::Painted`]).
     details: bool,
     /// The chip the pointer lights, `None` off the band.
     hover: Option<Hover>,
@@ -298,18 +302,10 @@ impl WebBand {
         })
     }
 
-    /// How a `cols`-wide page lays the band out: links withheld until the page
-    /// has a Details view, and no `$HOME` to abbreviate (ruling 332).
+    /// How a `cols`-wide page lays the band out ([`Lay::web`]): links withheld
+    /// until the page has a Details view, and no `$HOME` to abbreviate.
     fn lay(&self, cols: usize) -> Lay {
-        Lay {
-            cols,
-            links: if self.details {
-                Links::Painted
-            } else {
-                Links::Withheld
-            },
-            home: || None,
-        }
+        Lay::web(cols, self.details)
     }
 
     /// The inks the rows are painted with (the field's doc).
@@ -390,15 +386,22 @@ impl WebBand {
     /// on a hidden page: it arms no timer at all (the owner's 0 % CPU rule;
     /// ruling 337, F2), and whatever fell due while it was hidden is settled
     /// by the first tick once it is visible again.
-    pub(crate) fn next_wake(&self) -> Option<Instant> {
+    ///
+    /// The motion term is the native window's rule (ruling 435, F4): from the
+    /// prepared frame's instant, over a fresh layout when the grid is now
+    /// `cols` wide or the center moved since, and never a past instant.
+    pub(crate) fn next_wake(&self, now: Instant, cols: usize) -> Option<Instant> {
         if !self.visible {
             return None;
         }
-        // The kept layout's next change from the last tick's instant — this
-        // module's own rule, kept exact by the drive (ruling 337, F4).
-        let motion = (self.committed() > 0)
-            .then(|| self.view.deadline_from(&self.center, self.now, self.look()))
-            .flatten();
+        let reserved = u16::try_from(self.committed()).unwrap_or(u16::MAX);
+        let motion = drive::motion_deadline_over(
+            &self.center,
+            reserved,
+            false,
+            now,
+            [(&self.view, self.lay(cols), self.look())],
+        );
         [
             drive::state_deadline(&self.center, &self.gate, false),
             motion,
@@ -839,6 +842,9 @@ impl AtermTerminal {
                 frozen: false,
                 afford,
                 reserved: before,
+                // The band is this page's only chrome row: no other source
+                // rises to space its shrink against (ruling 414).
+                floor: None,
             },
         );
         // No log file on the web: the drained lines wait in the journal for
@@ -857,7 +863,7 @@ impl AtermTerminal {
 
     /// [`Self::messages_next_wake_ms`] at `now`.
     pub(crate) fn messages_next_wake_ms_at(&self, now: Instant) -> f64 {
-        match self.band.next_wake() {
+        match self.band.next_wake(now, self.cols) {
             None => -1.0,
             Some(t) => (t.saturating_duration_since(now).as_secs_f64() * 1000.0).ceil(),
         }
@@ -981,6 +987,26 @@ impl AtermTerminal {
         }
     }
 
+    /// [`Self::band_press_acts`]: the arms [`Self::band_press_at`] performs.
+    pub(crate) fn band_press_acts_at(&self, x: f64, y: f64) -> bool {
+        let m = self.band_metrics();
+        self.band
+            .cell_under(x, y, self.cols, m)
+            .is_some_and(|(row, col)| match self.band.hit(row, col, self.cols) {
+                Hit::Capsule(..) => true,
+                Hit::Details(_) | Hit::Body(_) | Hit::Overflow => self.band.details,
+                Hit::Nothing => false,
+            })
+    }
+
+    /// [`Self::set_frame_period_ms`]: a positive, finite period only.
+    pub(crate) fn set_frame_period(&mut self, ms: f64) {
+        if ms.is_finite() && ms > 0.0 {
+            let period = aterm_messages::Duration::from_secs_f64(ms.min(1000.0) / 1000.0);
+            self.band.center.set_refresh(period);
+        }
+    }
+
     /// [`Self::messages_log_since`]: the center's shelved lines join the
     /// journal first, so a record posted since the last tick is in it.
     pub(crate) fn messages_log_since_at(&mut self, cursor: f64) -> String {
@@ -1051,6 +1077,9 @@ impl AtermTerminal {
             lo: 0,
             frame_w: self.cols * m.cell_w + 2 * m.pad,
             grid_top: m.grid_top,
+            // No measured room: the web keeps the cell-height rule alone
+            // (`seam_can_rail`), as it always drew.
+            room: None,
         };
         let n = self.band.compose(&mut self.frame_scratch, at);
         self.frame_scratch.grid_top_row += n;
@@ -1063,14 +1092,14 @@ impl AtermTerminal {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl AtermTerminal {
     /// One `notice` line — the words after `notice`: `post <tag> [sev=…]
-    /// [key=…] [hold=1..3600] <title>[ -- <detail>]`, `progress key=<key>
+    /// [key=…] [hold=1..120] <title>[ -- <detail>]`, `progress key=<key>
     /// [pct=…|done=n/total|busy] <title>`, `done <key> <ok|warn|withdraw>
     /// [words]`, `dismiss <id>` or `act <id> <index|label|details>`. Returns
     /// the reply line the control socket's `notice` verb answers, without its
     /// newline: `OK …`, or `ERR …` for every refusal (usage, caps — three
     /// live wire rows, 60 mints / 16 KiB / 10 presses a minute, a 120-char
-    /// title, a 2 KiB / 24-line / 240-char detail, `hold` 1–3600 s, `wire.`
-    /// keys up to 40 chars — and aterm's own lanes). A success or info `post`
+    /// title, a 2 KiB / 24-line / 240-char detail, `hold` 1–120 s, `wire.`
+    /// keys up to 40 chars — and aterm's own tags). A success or info `post`
     /// is a record: it lands in the log, never on the band. `act` answers
     /// `performed=1` only for `details` on a page with a Details view: the
     /// web performs no other intent. When
@@ -1163,6 +1192,15 @@ impl AtermTerminal {
         self.set_band_motion_at(allowed, Instant::now());
     }
 
+    /// The page's display frame period in ms, measured from its
+    /// `requestAnimationFrame` timestamps: a glide and an echo in flight are
+    /// read on it, as the native window reads them on its display's (ruling
+    /// 436). Clamped to 240 Hz … 30 Hz; a page that never calls this reads
+    /// them at 60 Hz, and a value that is not a positive number is ignored.
+    pub fn set_frame_period_ms(&mut self, ms: f64) {
+        self.set_frame_period(ms);
+    }
+
     /// Whether the page is visible (`!document.hidden`): a hidden page's band
     /// is off screen — the still look, and NO wake at all:
     /// [`messages_next_wake_ms`](Self::messages_next_wake_ms) answers `-1`
@@ -1213,6 +1251,14 @@ impl AtermTerminal {
     /// changed — render; moving along one chip changes nothing.
     pub fn band_hover(&mut self, x: f64, y: f64) -> bool {
         self.band_hover_at(x, y, Instant::now())
+    }
+
+    /// Whether a press at frame pixel `(x, y)` would DO something — the page's
+    /// pointer is a hand there (`cursor: pointer`) and nowhere else on the
+    /// band, as the native window's is (ruling 436): a capsule, and with a
+    /// Details view a row's body, its link and the overflow row.
+    pub fn band_press_acts(&self, x: f64, y: f64) -> bool {
+        self.band_press_acts_at(x, y)
     }
 
     /// A press at frame pixel `(x, y)`: `OK none` off the band or where a
@@ -1457,6 +1503,91 @@ mod tests {
         t.set_band_motion_at(false, at);
         let still = t.messages_next_wake_ms_at(at);
         assert!(still < 0.0 || still > 33.0, "{still}");
+    }
+
+    /// F4 (ruling 435): the wake is the native window's rule, so a resize
+    /// between a tick and a render is read at the NEW width — the same answer
+    /// the page gets once it renders. A busy row in the still look ticks its
+    /// elapsed words at 80 columns and has none at 20. NEGATIVE CONTROL: the
+    /// kept layout read from the last tick (the old web rule) slept 108 s past
+    /// the words the grown page shows.
+    #[test]
+    fn a_resize_before_the_render_wakes_for_the_new_width() {
+        let (mut t, t0) = clocked(20, 20);
+        let _ = t.notice_at("progress b busy Indexing the tree", t0, stamp());
+        let at = t0 + aterm_messages::PROGRESS_GRACE + ms(12_100);
+        let _ = t.messages_tick_at(t0 + aterm_messages::PROGRESS_GRACE + ms(100));
+        let _ = t.messages_tick_at(at);
+        t.set_band_motion_at(false, at);
+        let narrow = t.messages_next_wake_ms_at(at);
+        assert!(narrow > 60_000.0, "no words tick at 20 columns: {narrow}");
+        t.resize(20, 80);
+        let before_render = t.messages_next_wake_ms_at(at);
+        assert!(
+            (0.0..=1000.0).contains(&before_render),
+            "the grown page's elapsed words tick: {before_render}"
+        );
+        t.render();
+        assert_eq!(t.messages_next_wake_ms_at(at), before_render);
+    }
+
+    /// Ruling 436: a glide in flight is read on the page's measured frame
+    /// period — a 120 Hz page wakes every ~8 ms where the default reads 60 Hz
+    /// — and a period that is not a positive number changes nothing.
+    #[test]
+    fn a_glide_is_read_on_the_pages_frame_period() {
+        let glide_wake = |period: Option<f64>| {
+            let (mut t, t0) = clocked(20, 80);
+            if let Some(p) = period {
+                t.set_frame_period_ms(p);
+            }
+            let _ = t.notice_at("progress b pct=10 Building aterm", t0, stamp());
+            let at = t0 + aterm_messages::PROGRESS_GRACE + ms(100);
+            let _ = t.messages_tick_at(at);
+            let _ = t.notice_at("progress b pct=90 Building aterm", at, stamp());
+            let _ = t.messages_tick_at(at + ms(1));
+            t.messages_next_wake_ms_at(at + ms(1))
+        };
+        let default = glide_wake(None);
+        let fast = glide_wake(Some(1000.0 / 120.0));
+        assert!((0.0..=9.0).contains(&fast), "{fast}");
+        assert!(default > 9.0 && default <= 17.0, "{default}");
+        for junk in [f64::NAN, -5.0, 0.0, f64::INFINITY] {
+            assert_eq!(glide_wake(Some(junk)), default, "{junk}");
+        }
+    }
+
+    /// Ruling 436: the page's pointer is a hand exactly where a press acts —
+    /// `band_press_acts` agrees with what `band_press` does on every cell of
+    /// a row, with and without a Details view — and never off the band.
+    #[test]
+    fn the_pointer_is_a_hand_exactly_where_a_press_acts() {
+        let fresh = |details: bool| {
+            let (mut t, t0) = clocked(12, 60);
+            let _ = t.notice_at(
+                "post ci sev=warn Disk nearly full -- 2 GB left",
+                t0,
+                stamp(),
+            );
+            t.set_details_view_at(details, t0);
+            (t, t0)
+        };
+        for details in [false, true] {
+            let (t, _) = fresh(details);
+            let mut hands = 0;
+            for col in 0..60 {
+                let (x, y) = band_px(&t, 0, col);
+                let acts = t.band_press_acts(x, y);
+                let (mut twin, t0) = fresh(details);
+                let pressed = twin.band_press_at(x, y, t0 + ms(1));
+                assert_eq!(acts, pressed != "OK none", "col {col}: {pressed}");
+                hands += usize::from(acts);
+            }
+            assert_eq!(hands > 0, details, "{hands} cells act");
+            let (x, _) = band_px(&t, 0, 3);
+            assert!(!t.band_press_acts(x, -1.0), "off the frame");
+            assert!(!t.band_press_acts(x, 400.0), "on the grid");
+        }
     }
 
     /// WF-1: once the band's frame is rendered, nothing asks for another.
@@ -2133,7 +2264,7 @@ mod tests {
     fn a_restored_log_is_records_and_never_the_glass() {
         let (mut a, t0) = clocked(20, 80);
         let _ = a.notice_at("post ci Build finished", t0, stamp());
-        let _ = a.notice_at("post ci sev=warn hold=600 Disk nearly full", t0, stamp());
+        let _ = a.notice_at("post ci sev=warn hold=100 Disk nearly full", t0, stamp());
         let _ = a.notice_at("progress p pct=28 Downloading assets", t0, stamp());
         let _ = a.messages_tick_at(t0 + ms(2500));
         // The negative control: on the visit that posted them, the warning

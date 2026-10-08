@@ -6,7 +6,6 @@
 
 use aterm_types::{ColorPalette, CursorStyle, ParagraphDirection, Rgb};
 
-// BiDi mode extracted to aterm-types crate (#2440).
 pub use aterm_types::BiDiMode;
 
 // ============================================================================
@@ -22,28 +21,13 @@ pub struct BiDiConfig {
     pub direction: ParagraphDirection,
     /// Whether to reorder non-spacing marks according to UBA rule L3.
     pub reorder_nsm: bool,
-    /// Whether to apply BiDi processing in alternate screen mode.
-    ///
-    /// When true, BiDi reordering is applied to the alternate screen buffer
-    /// (used by fullscreen applications like vim, less, etc.).
-    /// When false, alternate screen content is displayed without BiDi reordering.
-    ///
-    /// Default: true (matching aTerm.app's alternateScreenBidi setting).
+    /// Whether to apply BiDi reordering on the alternate screen (vim, less, …).
+    /// Default: true.
     pub alternate_screen: bool,
-    /// Whether to apply Arabic contextual text shaping.
+    /// Whether to apply Arabic contextual shaping (initial, medial, final and
+    /// isolated forms, LAM-ALEF ligatures).
     ///
-    /// When true, Arabic characters are transformed to their contextual forms
-    /// (initial, medial, final, isolated) based on surrounding characters.
-    /// This includes LAM-ALEF ligatures and proper joining behavior.
-    ///
-    /// Requires the `arabic-shaping` feature to be enabled.
-    /// When the feature is disabled, this setting has no effect.
-    ///
-    /// Default: false (opt-in to avoid overhead for non-Arabic users).
-    ///
-    /// # References
-    /// - Issue #1861
-    /// - mintty's Arabic shaping implementation
+    /// Has no effect without the `arabic-shaping` feature. Default: false.
     pub arabic_shaping: bool,
 }
 
@@ -78,24 +62,12 @@ impl BiDiConfig {
     }
 }
 
-/// Terminal configuration settings.
+/// Terminal configuration that can change at runtime without recreating the
+/// terminal: display (cursor style, color, visibility), colors and palette,
+/// behavior (scrollback, auto-wrap, focus reporting), performance (memory
+/// budget, sync timeout) and BiDi.
 ///
-/// This struct bundles all configurable aspects of a terminal that can be
-/// changed at runtime without recreating the terminal instance.
-///
-/// # Configuration Categories
-///
-/// - **Display**: Cursor style, cursor blink, cursor color and visibility
-/// - **Colors**: Foreground, background, cursor color, palette
-/// - **Behavior**: Scrollback limit, auto-wrap, focus reporting
-/// - **Performance**: Memory budget, sync timeout
-/// - **BiDi**: Bidirectional text mode, paragraph direction, security
-///
-/// # Thread Safety
-///
-/// `TerminalConfig` is `Send + Sync` and can be safely shared between threads.
-/// The actual application of configuration to a terminal requires mutable
-/// access to the terminal.
+/// `Send + Sync`; applying it to a terminal needs `&mut Terminal`.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -108,12 +80,9 @@ pub struct TerminalConfig {
 
     /// Whether the cursor should blink.
     ///
-    /// MIRROR, NOT AUTHORITY: the blink the renderer acts on — and that DEC
-    /// private mode 12 reports — is the blink bit of [`Self::cursor_style`]
-    /// (`BlinkingBlock`/`BlinkingBar`/`BlinkingUnderline` vs their `Steady`
-    /// twins). `apply_config` applies the style and then sets this to match, so
-    /// a caller asking for a steady cursor must spell it in `cursor_style`;
-    /// setting this alone changes nothing. [`CursorStyle::with_blink`] folds a
+    /// A mirror, not the authority: the renderer and DEC mode 12 use the blink
+    /// bit of [`Self::cursor_style`], and `apply_config` sets this to match.
+    /// Setting this alone changes nothing; [`CursorStyle::with_blink`] folds a
     /// blink preference into a shape.
     pub cursor_blink: bool,
 
@@ -145,12 +114,9 @@ pub struct TerminalConfig {
     // === Behavior Settings ===
     /// Maximum number of scrollback lines to retain.
     ///
-    /// `None` means unlimited scrollback (limited only by `memory_budget`).
-    /// When the scrollback exceeds this limit, older lines are discarded
-    /// (or moved to cold storage if configured).
-    ///
-    /// Default: `Some(100_000)` (see [`aterm_scrollback::DEFAULT_LINE_LIMIT`],
-    /// #7929).
+    /// `None` means unlimited (bounded only by `memory_budget`). Older lines
+    /// are discarded, or moved to cold storage if configured. Default:
+    /// `Some(100_000)` ([`aterm_scrollback::DEFAULT_LINE_LIMIT`]).
     pub scrollback_limit: Option<usize>,
 
     /// Auto-wrap mode (DECAWM mode 7).
@@ -171,40 +137,28 @@ pub struct TerminalConfig {
     /// does not invoke the clipboard callback or emit a response.
     pub allow_osc52_query: bool,
 
-    /// Allow CSI t window operations 1 through 21 (#7139).
+    /// Allow CSI t window operations 1 through 21.
     ///
     /// When disabled (default), the gated manipulation and report operations
     /// are silently ignored. Title-stack operations 22 and 23 remain available;
     /// hosts still need a window callback for operations that require the OS.
     pub allow_window_ops: bool,
 
-    /// Allow desktop notification OSC sequences (#7878 CF-009, #7918).
+    /// Allow desktop notification OSC sequences.
     ///
-    /// Gates OSC 9 (Terminal), OSC 99 (kitty), and OSC 777 (Konsole/Contour)
-    /// desktop notifications. When disabled, the notification callback is
-    /// not invoked and the OSC 99 `p=?` capability response is not written.
+    /// Gates OSC 9, OSC 99 (kitty) and OSC 777 notifications; when disabled the
+    /// callback is not invoked and the OSC 99 `p=?` response is not written.
     ///
-    /// **Default: `false` (fail-closed, #7918).** Hosts must explicitly opt
-    /// in after wiring a notification callback. The prior default (`true`)
-    /// left the CF-009 gate cosmetic: any runtime that accepted the default
-    /// exposed OSC 9/99/777 dispatch without ever making a conscious policy
-    /// decision. Parallels `allow_window_ops` (default false) rather than
-    /// `allow_osc52_set` (default true) because notifications reach a
-    /// user-visible surface, not just the wire.
+    /// Default: `false` (fail-closed). Hosts opt in after wiring a notification
+    /// callback, since notifications reach a user-visible surface.
     pub allow_notifications: bool,
 
-    /// Allow OSC 4 / OSC 21 indexed palette SET operations (#7937 F01-3).
+    /// Allow OSC 4 / OSC 21 indexed palette set operations.
     ///
-    /// Gates `OSC 4;N;spec` and `OSC 21;N=spec` (numeric-index) SET requests.
-    /// Query operations are always allowed; OSC 21 named-slot sets
-    /// (`foreground`, `background`, `cursor`, `selection_background`,
-    /// `selection_foreground`) are
-    /// unaffected — those go through dynamic-color callbacks, not the
-    /// indexed palette.
-    ///
-    /// **Default: `false` (fail-closed, #7937).** Hosts that want programs to
-    /// recolor the 256-entry palette opt in explicitly. Parallels
-    /// `allow_window_ops`, `allow_osc52_query`, and `allow_notifications`.
+    /// Gates numeric-index sets (`OSC 4;N;spec`, `OSC 21;N=spec`). Queries are
+    /// always allowed; OSC 21 named-slot sets (`foreground`, `background`,
+    /// `cursor`, `selection_*`) go through dynamic-color callbacks and are
+    /// unaffected. Default: `false` (fail-closed).
     pub allow_palette_reconfigure: bool,
 
     // === Performance Settings ===
@@ -225,20 +179,18 @@ pub struct TerminalConfig {
     pub ambiguous_width_double: bool,
 
     /// SGR 1 (bold) promotes indexed colors 0–7 to their bright 8–15 siblings
-    /// (the classic xterm behavior). Default `true` — byte-identical to the
-    /// historical unconditional promotion; `false` keeps bold a pure weight
-    /// change (config `bold_is_bright`, W5f).
+    /// (the classic xterm behavior). Default `true`; `false` keeps bold a pure
+    /// weight change (config `bold_is_bright`).
     pub bold_is_bright: bool,
 
     /// SGR 2 (dim/faint): the fraction of the foreground retained, `0.0..=1.0`.
-    /// The fg is blended TOWARD THE CELL BACKGROUND in linear light by this
-    /// fraction (see `color_resolve::dim_toward_bg`), so faint text recedes on
-    /// both dark and light themes. Default `0.5` (config `faint_opacity`, W5e).
+    /// The fg is blended toward the cell background in linear light
+    /// (`color_resolve::dim_toward_bg`), so faint text recedes on dark and light
+    /// themes. Default `0.5` (config `faint_opacity`).
     pub faint_opacity: f32,
 
     // === BiDi Settings ===
-    /// Bidirectional text configuration.
-    /// Controls how RTL text (Arabic, Hebrew, etc.) is displayed.
+    /// Bidirectional text configuration (how RTL text is displayed).
     pub bidi: BiDiConfig,
 }
 
@@ -250,9 +202,6 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             cursor_color: None,
             cursor_visible: true,
-            // Colors — single source of truth (was 255,255,255 here vs 229,229,229
-            // in the runtime terminal state; unified to avoid the divergence the
-            // color audit flagged). See aterm_types::DEFAULT_FOREGROUND.
             default_foreground: aterm_types::DEFAULT_FOREGROUND,
             default_background: aterm_types::DEFAULT_BACKGROUND,
             selection_background: None,
@@ -265,17 +214,11 @@ impl Default for TerminalConfig {
             bracketed_paste: false,
             allow_osc52_query: false,
             allow_window_ops: false,
-            // #7918 HN-P1: fail-closed. Hosts must explicitly opt in
-            // (e.g. via `Terminal::set_allow_notifications(true)`) after
-            // wiring a notification callback.
             allow_notifications: false,
-            // #7937 HN-P1 F01-3: fail-closed palette reconfigure. Hosts that
-            // ship a themeable palette opt in explicitly.
             allow_palette_reconfigure: false,
             // Performance
             memory_budget: 100 * 1024 * 1024, // 100 MB
             sync_timeout_ms: 1000,            // 1 second
-            // Scrollback
             // Text
             ambiguous_width_double: false,
             bold_is_bright: true,
@@ -286,10 +229,8 @@ impl Default for TerminalConfig {
     }
 }
 
-/// Types of configuration changes.
-///
-/// Used to identify what aspects of the terminal configuration have changed,
-/// enabling efficient UI updates.
+/// One aspect of the terminal configuration that changed, so a host updates
+/// only what it must.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ConfigChange {
@@ -321,12 +262,12 @@ pub enum ConfigChange {
     BiDi,
     /// CSI t window manipulation policy changed.
     WindowOps,
-    /// Desktop notification policy (OSC 9/99/777) changed (#7878).
+    /// Desktop notification policy (OSC 9/99/777) changed.
     Notifications,
-    /// OSC 4 / OSC 21 indexed palette reconfigure policy changed (#7937).
+    /// OSC 4 / OSC 21 indexed palette reconfigure policy changed.
     PaletteReconfigure,
     /// Ambiguous-width character mode changed.
     AmbiguousWidth,
-    /// Style-attribute policy changed (`bold_is_bright` / `faint_opacity`, W5).
+    /// Style-attribute policy changed (`bold_is_bright` / `faint_opacity`).
     StylePolicy,
 }

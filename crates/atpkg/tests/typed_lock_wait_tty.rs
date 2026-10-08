@@ -24,22 +24,23 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aterm_spec::wait::MUST_HAPPEN;
+
 const WAITING: &str = "Waiting for aterm's background update to finish";
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     layout: atpkg::store::Layout,
 }
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "atpkg-typed-lock-tty-{}-{case}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-typed-lock-tty-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let prefix = atpkg::store::default_prefix(&home);
         assert!(prefix.starts_with(&home), "{}", prefix.display());
@@ -62,10 +63,10 @@ impl Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.arg("seed")
             .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env(
                 "ATPKG_REGISTRY",
-                format!("dir:{}", self.root.join("registry").display()),
+                format!("dir:{}", self.root.path().join("registry").display()),
             )
             .env("TERM", "xterm-256color")
             .env("LANG", "en_US.UTF-8")
@@ -74,36 +75,14 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
 /// A pseudo-terminal: the master end (read by the test) and the slave end (the child's
 /// terminal).
 fn pty() -> (std::fs::File, OwnedFd) {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let mut size = libc::winsize {
-        ws_row: 24,
-        ws_col: 100,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: `openpty` writes two descriptors it opened into the two ints; the name
-    // and termios arguments are null (not wanted), and the window size is read only.
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        )
-    };
-    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-    // SAFETY: both descriptors were just opened by `openpty` and are owned by nothing else.
+    // Both ends close-on-exec from birth: the verb holds its terminal and never a
+    // copy of its master, and no sibling test's child inherits either end.
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    aterm_pty::resize(master, 24, 100);
+    // SAFETY: both descriptors were just opened above and are owned by nothing else.
     unsafe {
         (
             std::fs::File::from(OwnedFd::from_raw_fd(master)),
@@ -173,7 +152,7 @@ fn a_verb_typed_on_a_terminal_waits_behind_a_spinner_then_runs() {
         .expect("spawn dev atpkg on a pseudo-terminal");
 
     // The spinner arrives, and not before the grace.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + MUST_HAPPEN;
     let seen = loop {
         if let Some(at) = first_seen(&screen, WAITING) {
             break at;
@@ -186,7 +165,7 @@ fn a_verb_typed_on_a_terminal_waits_behind_a_spinner_then_runs() {
         }
         assert!(
             Instant::now() < deadline,
-            "no spinner within 15 s: {:?}",
+            "no spinner within a minute: {:?}",
             text(&screen)
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -204,7 +183,7 @@ fn a_verb_typed_on_a_terminal_waits_behind_a_spinner_then_runs() {
 
     // The holder lets go: the verb runs and ends as it would have with a free store.
     drop(guard);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + MUST_HAPPEN;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -272,7 +251,7 @@ fn the_same_verb_off_a_terminal_still_refuses_at_once() {
     );
     // The reader may still be draining; give it a moment to see the refusal
     // (a poll for text already written: generous costs nothing when it is there).
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + MUST_HAPPEN;
     while !text(&screen).contains("holds the store lock") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }

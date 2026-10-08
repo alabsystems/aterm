@@ -47,8 +47,7 @@ use aterm_render::{RenderInput, Renderer, SpillBand, Theme, WindowCpu};
 // logical-line boundaries; any step schedule is content-identical to the
 // one-shot rewrap — aterm-grid's `reflow_step_any_schedule_matches_one_shot`
 // property). So the offload bounds LATENCY per task, not just scheduling:
-// no single event-loop task grows with session history. (The pre-seam
-// honest label — "one long, host-schedulable task" — is retired.)
+// no single event-loop task grows with session history.
 // ---------------------------------------------------------------------------
 
 /// Histories at or below this many lines are rewrapped INLINE by `resize`
@@ -72,8 +71,7 @@ const REFLOW_PUMP_GRACE_RENDERS: u32 = 120;
 /// completes within ceil(history / `REFLOW_STEP_BUDGET_LINES`) × 2 further
 /// process calls and the window closes. The backlog past the cap is bounded
 /// by the output those finitely-many calls themselves feed — amortized
-/// convergence with every task still short, instead of the pre-seam single
-/// unbounded catch-up pump.
+/// convergence with every task still short.
 const REFLOW_BACKLOG_MAX_LINES: usize = 20_000;
 
 /// Default per-pump rewrap budget, in INPUT history lines, for
@@ -324,7 +322,7 @@ impl AtermTerminal {
     /// DECSCNM remain one coherent terminal snapshot either way.
     ///
     /// The effects pipeline closes a damage session only when one is still
-    /// open (`EffectsPipeline::apply`), so it no longer re-takes the session
+    /// open (`EffectsPipeline::apply`), so it does not re-take the session
     /// this call consumed — a second `take_damage` would bump the extraction
     /// generation and force the full arm on every frame with sparkle words or
     /// rain on.
@@ -834,6 +832,18 @@ impl AtermTerminal {
         self.term.drain_bell()
     }
 
+    /// Play the Kitty graphics animations up to now: a frame that came due is
+    /// shown, and the next `render` draws it. Returns the milliseconds until
+    /// the next frame is due — the host's one timer for them — or `undefined`
+    /// while nothing plays on screen, so an idle page schedules nothing.
+    pub fn advance_kitty_animations(&mut self) -> Option<f64> {
+        let now = aterm_time::Instant::now();
+        self.term
+            .advance_kitty_animations(now)
+            .next_frame_at
+            .map(|at| at.saturating_duration_since(now).as_secs_f64() * 1000.0)
+    }
+
     /// Drain the missing-font CLASS bits (1 = text/mono fallback, 2 = colour
     /// emoji) accumulated by renders since the last call. The host polls this
     /// after a frame and lazily injects ONLY the face class actually missed —
@@ -1115,7 +1125,7 @@ impl AtermTerminal {
 
     /// Safety net #1 (see `REFLOW_PUMP_GRACE_RENDERS`): called by `render`.
     /// After the grace window, ONE budgeted step per frame — never the whole
-    /// job in a single frame (that was the point of the stepping seam).
+    /// job in a single frame.
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
             return;
@@ -1768,7 +1778,7 @@ impl AtermTerminal {
     /// WF-1 gate, and the ONE exception to the unconditional-bump rule above:
     /// this is the only `note_host_visual_change` caller a host invokes at
     /// POINTER cadence. A pointer moving sub-cell re-asserts the SAME cell
-    /// across consecutive frames, and each such re-assertion used to reopen the
+    /// across consecutive frames, and each such re-assertion would reopen the
     /// gate for a frame whose only outcome was a `DamageOutcome::GateHit` and
     /// zero present bands — a full `cell_frame_into` resolve plus a full
     /// `compute_dirty_rows` row walk, to conclude nothing changed. So bump only
@@ -1886,97 +1896,20 @@ impl AtermTerminal {
     }
 
     /// Serialize the terminal to a REPLAYABLE ANSI string — the aterm-native
-    /// replacement for `@xterm/addon-serialize`'s `serialize({scrollback})`, so the
-    /// renderer no longer needs a shadow xterm.js buffer to snapshot/restore/fork a
-    /// pane. Layout: SGR reset, then the capped recent history (text + CRLF), then
-    /// `CSI H`, then each visible row placed with absolute CUP + erase-line (so a
-    /// full-width row can't autowrap on replay) emitted via the engine's
-    /// `row_ansi_text_screen` (minimal change-based SGR, wide-char aware), then the cursor
-    /// restored. `scrollback_rows` = `None` prepends ALL history, `Some(n)` the last
-    /// `n`, `Some(0)` viewport-only. Ported from the daemon's proven `serialize_ansi`
-    /// (orca-terminal headless) so the output stays byte-compatible with the existing
-    /// string-based replay pipeline.
+    /// replacement for `@xterm/addon-serialize`'s `serialize({scrollback})`.
+    /// `scrollback_rows` = `None` prepends ALL history, `Some(n)` the last `n`,
+    /// `Some(0)` viewport-only. The body is `aterm_core`'s
+    /// `Terminal::serialize_ansi`, shared with aterm-gpu-web.
     pub fn serialize(&self, scrollback_rows: Option<u32>) -> String {
-        use std::fmt::Write as _;
-        let grid = self.term.grid();
-        let cap = scrollback_rows.map(|n| n as usize);
-        let active_history = grid.scrollback_lines();
-        let take = cap.map_or(active_history, |n| n.min(active_history));
-        // Pre-size: `take` reaches the construction default of 100k lines, and a
-        // doubling `String` would re-copy the whole (multi-megabyte) output ~two
-        // dozen times on the way there.
-        let mut out = String::with_capacity(
-            take.saturating_mul(8)
-                .saturating_add(self.rows.saturating_mul(16)),
-        );
-        out.push_str("\x1b[0m");
-        for i in (active_history - take)..active_history {
-            // Bind the `Cow<'_, Line>` so `as_str`'s borrow outlives the read:
-            // the old `.and_then(|l| l.as_str().map(|s| s.trim_end().to_string()))`
-            // allocated, copied and freed one owned `String` per history line
-            // purely because the `Cow` died inside the closure. A missing or
-            // non-UTF-8 line contributes nothing before its CRLF, exactly as the
-            // old `unwrap_or_default()` did.
-            let line = grid.get_history_line(i);
-            if let Some(s) = line.as_ref().and_then(|l| l.as_str()) {
-                out.push_str(s.trim_end());
-            }
-            out.push_str("\r\n");
-        }
-        if take > 0 {
-            // Scroll the printed history OFF the screen so it lands in the replay
-            // target's scrollback: the trailing printed lines are still on the
-            // visible grid here, and the absolute-CUP viewport paint below would
-            // ERASE them — losing a viewport-sized chunk of history on every
-            // replay (all of it when take < rows). One LF per resident text line
-            // (at most rows-1: the final CRLF left the bottom row blank) from the
-            // bottom row scrolls each top line into history and leaves a clean
-            // screen for the viewport paint.
-            let _ = write!(out, "\x1b[{};1H", self.rows);
-            for _ in 0..take.min(self.rows.saturating_sub(1)) {
-                out.push('\n');
-            }
-        }
-        out.push_str("\x1b[H");
-        for r in 0..self.rows as u16 {
-            // `write!` straight into `out` — `push_str(&format!(…))` allocated a
-            // throwaway `String` per visible row.
-            let _ = write!(out, "\x1b[{};1H\x1b[K", r + 1);
-            if let Some(row_ansi) = grid.row_ansi_text_screen(r) {
-                out.push_str(&row_ansi);
-            }
-            out.push_str("\x1b[0m");
-        }
-        let c = self.term.cursor();
-        let _ = write!(out, "\x1b[{};{}H", c.row as usize + 1, c.col as usize + 1);
-        out
+        self.term.serialize_ansi(self.rows, scrollback_rows)
     }
 
-    /// Scrollback HISTORY ONLY (the off-screen lines above the viewport) as flowing
-    /// text + CRLF, no cursor/grid framing. Reads the MAIN buffer's scrollback (aterm
-    /// keeps it in the inactive grid while the alt screen is active) so an in-alt
-    /// (vim/htop/less) snapshot still recovers the pre-TUI history — the only
-    /// recoverable history on cold-restore of an alt-screen session. `max_rows` caps
-    /// to the last `n` lines (`None` = all). Mirrors the daemon's serialize_scrollback_ansi.
+    /// Scrollback HISTORY ONLY (the main buffer's off-screen lines, even while
+    /// the alt screen is active) as flowing text + CRLF; `max_rows` caps to the
+    /// last `n` lines (`None` = all). The body is `aterm_core`'s
+    /// `Terminal::serialize_scrollback_ansi`, shared with aterm-gpu-web.
     pub fn serialize_scrollback(&self, max_rows: Option<u32>) -> String {
-        let grid = self.term.main_grid();
-        let history = grid.scrollback_lines();
-        if history == 0 {
-            return String::new();
-        }
-        let take = max_rows.map_or(history, |n| (n as usize).min(history));
-        let mut out = String::with_capacity(take.saturating_mul(8));
-        for i in (history - take)..history {
-            // Same borrow-don't-copy discipline as `serialize`: one owned
-            // `String` per history line, allocated and immediately freed, was
-            // pure churn over a scrollback that defaults to 100k lines.
-            let line = grid.get_history_line(i);
-            if let Some(s) = line.as_ref().and_then(|l| l.as_str()) {
-                out.push_str(s.trim_end());
-            }
-            out.push_str("\r\n");
-        }
-        out
+        self.term.serialize_scrollback_ansi(max_rows)
     }
 
     /// The last completed OSC-133 block's output as JSON, following the
@@ -1991,9 +1924,8 @@ impl AtermTerminal {
     ///     yet (incl. a snapshot-rehydrated pane — blocks are excluded from
     ///     checkpoints), or the block never reached its output phase.
     ///
-    /// `&self` — the read rides `Terminal::last_completed_block`, which was added
-    /// alongside this binding precisely so the facade does not need the `&mut`
-    /// `output_blocks()` (`make_contiguous`) path.
+    /// `&self`: the read rides `Terminal::last_completed_block`, so the facade
+    /// avoids the `&mut` `output_blocks()` (`make_contiguous`) path.
     pub fn last_command_output(&self) -> Option<String> {
         let block = self.term.last_completed_block()?;
         match self.term.block_output_text(block) {
@@ -3482,11 +3414,10 @@ mod tests {
         );
     }
 
-    /// JS hands the binding raw u16 rows/cols; the grid clamps them to 1..=4096,
-    /// but the binding used to store the RAW args and feed them to `cell_frame`,
-    /// sizing the framebuffer from an unclamped 65535×65535 → unbounded alloc /
-    /// wasm32 u32 overflow → OOB. Construction and `resize` must both re-sync
-    /// `self.rows`/`self.cols` to the CLAMPED grid dims.
+    /// JS hands the binding raw u16 rows/cols; the grid clamps them to 1..=4096.
+    /// Construction and `resize` must both re-sync `self.rows`/`self.cols` to the
+    /// CLAMPED grid dims: sizing the framebuffer from the raw 65535×65535 is an
+    /// unbounded alloc / wasm32 u32 overflow → OOB.
     #[test]
     fn oversized_dims_are_clamped_to_the_grid_bound() {
         let Some(mut t) = AtermTerminal::new_from_system(u16::MAX, u16::MAX, 16.0) else {
@@ -5367,8 +5298,8 @@ mod tests {
         t.resize(24, 40);
         assert!(t.reflow_pending());
 
-        // Blow past the backlog cap in one burst (no pump can close the
-        // window in a single call any more — that was the point)…
+        // Blow past the backlog cap in one burst (no single pump can close
+        // the window)…
         let mut buf = Vec::new();
         for i in 0..(REFLOW_BACKLOG_MAX_LINES + 2_000) {
             buf.extend_from_slice(format!("W{i}-window\r\n").as_bytes());
@@ -5500,9 +5431,9 @@ mod tests {
     /// damage-reading effect on. The host extracts through
     /// `cell_frame_damage_scoped_into` (which consumes the damage session),
     /// and the effects pipeline closes a session only when one is still open,
-    /// so sparkle words and rain no longer re-take it. Before that fold the
-    /// pipeline's second `take_damage` bumped the extraction generation on
-    /// every frame and the next echo took `Full { cause: DamageTaken }`.
+    /// so sparkle words and rain do not re-take it. A second `take_damage`
+    /// would bump the extraction generation every frame and the next echo
+    /// would take `Full { cause: DamageTaken }`.
     #[test]
     fn echo_frames_refill_one_row_with_sparkle_and_rain_on() {
         use aterm_core::render::FrameRefill;

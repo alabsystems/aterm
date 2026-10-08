@@ -1,0 +1,46 @@
+# claude-code 2.1.292 · MEASURED 2026-10-06, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · default (manual) mode: the owner's 2026-09-26 shape (`owner-rm-breaker-subagent-2026-09-26.txt`, 2.1.285: `Dangerous rm operation on possibly-empty variable path: $SP/*.log`) re-driven: a background general-purpose agent's Bash `SP=<dir>; rm -f $SP/cast0.txt $SP/*.log`. 2.1.292 words its note `Glob patterns are not allowed in write operations. Please specify an exact file path.`; at `approve = "all"` the harness pressed `1` (`allow-once@v1`, unproven: the vendor note) about a second after the call and the files went; at `"none"` it escalated
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.v4LY/proj
+
+
+❯ toolstart
+
+⏺ Agent(Clean scratch logs)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+⏺ Agent "Clean scratch logs" finished · 1s
+
+⏺ Tool call done.
+
+✻ Sautéed for 1s · done 10:17 PM
+
+❯ toolstart
+
+⏺ Agent(Clean scratch logs)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command · from the general-purpose agent
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Remove the scratch logs
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ SP=/private/tmp/at.v4LY/proj/scratch; rm -f $SP/cast0.txt $SP/*.log; ls $SP
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Glob patterns are not allowed in write operations. Please specify an exact file path.
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /private/tmp/at.v4LY/proj/scratch from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents

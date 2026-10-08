@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! `row_has_hyperlinks` correctness proof across all mutation types.
-//!
-//! Proves that `row_has_hyperlinks` returns correct results after every
-//! mutation type. Filed as part of performance_proofs phase.
+//! `row_has_hyperlinks` returns correct results after every mutation type.
 
 use super::*;
 use std::sync::Arc;
@@ -37,7 +34,7 @@ fn correct_after_get_or_create() {
     extras
         .get_or_create(CellCoord::new(3, 0))
         .add_combining('\u{0301}');
-    // Row 3 has extras but NOT hyperlinks
+    // Row 3 has extras but not hyperlinks
     assert!(!extras.row_has_hyperlinks(3));
     assert!(extras.row_has_hyperlinks(5));
 }

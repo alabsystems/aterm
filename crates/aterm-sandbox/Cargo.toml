@@ -10,17 +10,14 @@ description = "Resource sandbox for spawned children (ATERM_DESIGN WS-G): POSIX 
 
 [features]
 default = []
-# TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]`/`#[spec_unmodeled]`
-# anchors that bind this crate's sandbox-apply code to the external `Sandbox.tla`
-# spec. OFF by default so the production build is byte-identical (no `aterm-spec`
-# dependency, no `inventory` submission); the workspace `spec_xref_closure` gate
-# (aterm-gui's test build) enables it to COLLECT the anchors cross-crate.
+# Compiles the `#[refines]` anchors binding `Limits::apply` to `Sandbox.tla`.
+# Off by default, so production builds carry no `aterm-spec`; the workspace
+# `spec_xref_closure` gate (aterm-gui's test build) enables it.
 spec-anchors = ["dep:aterm-spec"]
 
 [dependencies]
 aterm-cap = { workspace = true }
-# Optional: only pulled in by the off-by-default `spec-anchors` feature (the macro
-# emits `::aterm_spec::inventory::submit!` anchor records; nothing else uses it).
+# Only for `spec-anchors`.
 aterm-spec = { workspace = true, optional = true }
 
 # POSIX-only: the setrlimit actuator (src/unix.rs). The Windows actuator is a

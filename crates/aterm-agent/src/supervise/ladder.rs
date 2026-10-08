@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ONE BACK-OFF LADDER: a schedule of pauses, the `n`-th retry's pause
-//! its `n`-th step, and every retry past the table its LAST step — never a
-//! give-up. Every schedule the supervisor and its host wait on reads through
-//! it (the elegance review of 2026-09-25: six hand-rolled copies of the same
-//! `TABLE[n.min(len - 1)]` clamp): the host's supervisor restarts, the
-//! relaunch's attempts, the upgrade's looks, the session survey's tries, and
-//! the turn-end policy's API-error and usage-limit ladders. Its one
-//! geometric form, [`doubling`], is every back-off that doubles to a cap: a
-//! box's press retries, a re-asked question's pause and the short-turn
-//! streak.
+//! The one back-off ladder: a schedule of pauses, the `n`-th retry's pause its
+//! `n`-th step, and every retry past the table its last step, never a give-up.
+//! Every schedule the supervisor and its host wait on reads through it (host
+//! restarts, relaunch attempts, upgrade looks, survey tries, the turn-end
+//! policy's API-error and usage-limit ladders). [`doubling`] is every back-off
+//! that doubles to a cap (press retries, a re-asked question's pause, the
+//! short-turn streak).
 
 use std::time::Duration;
 
-/// THE ONE DOUBLING BACK-OFF: `base` at step 0, twice the last at each next
+/// The one doubling back-off: `base` at step 0, twice the last at each next
 /// step, at most `max` — for every `n`, never a give-up and never an
 /// overflow.
 #[must_use]
@@ -63,7 +60,7 @@ mod tests {
     }
 
     /// Doubling from the base, then the cap for ever — past a shift or a
-    /// multiplication that would overflow too. NEGATIVE CONTROL: a cap under
+    /// multiplication that would overflow too. Negative control: a cap under
     /// the base is the cap.
     #[test]
     fn a_doubling_back_off_doubles_to_its_cap() {

@@ -14,12 +14,13 @@
 //! | `inc` | the incarnation | the bus's own last presence row is consulted too — `max(local, Last) + 1` |
 //! | `seq` | the producer sequence, written BEFORE each publish | a lost `seq` still can't dup: the incarnation moved, and every sequence of `inc+1` is above `inc`'s reserved top |
 //! | `seen/<sid>` | the endpoint's handled watermark, one file per session ever delivered to (see [`StateDir::seen_off`]) | the refill starts lower and the ring dedups on `off=` |
-//! | `acked` | the highest offset this bridge has a `PublishAck` for on its OWN lanes | the self-lane check gets more conservative, never less |
+//! | `acked` | every offset (newest `keep`) this bridge has a `PublishAck` for on its OWN lanes (see [`StateDir::self_acked`]) | the self-lane check gets more conservative, never less |
 //! | `pins` | the TOFU `sid → node` map, newest [`PINS_KEEP`] | a re-pin on next sight, which is the TOFU rule anyway |
 //! | `halt-acked` | the highest fleet-halt offset this node has answered | the node re-acks a barrier it already answered: one extra retained row, never a new subject |
 //! | `sent/<sid>.<id>` | the producer sequence reserved for one queued post, and whether a `key=` table entry chose it | a fresh sequence is a second copy — this one IS load-bearing, and it is written BEFORE the publish |
 //! | `keys/<sid>` | `post key=` → the producer sequence it reserved, newest [`KEYS_KEEP`] per session | a re-post under a lost key is a second record; the bound is stated and the newest keys are the ones a retry names |
 //! | `acks/<sid>.<rid>` | the producer sequence reserved for one OWED receipt (R8), written BEFORE the publish, removed at retirement | a fresh sequence is a second `ack` on the sender's lane after a crash between the publish and the retirement |
+//! | `asked` | the recipient principal of each `ask`/`task` this node published, newest [`ASKED_KEEP`] | a reply to a forgotten ask is judged without its recipient (a deadline's own `to` still counts) |
 //! | `deadlines` | every `ask`/`task` this node published with `dl=` and has not seen answered, newest [`DEADLINES_KEEP`] | a lost table records no `expired` for those asks — the bus is checked before any verdict is published, so it can never record a false one |
 //! | `topics/<sid>` | one `<topic> <next>` line per broadcast opt-in: the offset the topic resumes from (see [`StateDir::topics`]) | the topic is re-resolved from the session's `since=` at the next attach — `head` skips whatever was published while the bridge was down, which is why this one is written on every step |
 
@@ -45,8 +46,8 @@ pub struct Deadline {
     /// The advisory `dl=` the ask carried, echoed onto the verdict.
     pub dl: u64,
     /// The principal whose reply settles it — the node (or `p/` principal)
-    /// owning the lane the ask went to ([`Asked`]). `None` for a line written
-    /// before round 16's review, which any reply settles, as it always did.
+    /// owning the lane the ask went to ([`Asked`]). `None` for an older line,
+    /// which any reply settles.
     pub to: Option<String>,
 }
 
@@ -101,9 +102,8 @@ impl Deadline {
 /// the node that owns the lane it went to (`/f/<F>/in/<node>/<sid>/…`), or the
 /// principal of a `p/` lane (`/f/<F>/in/p/<principal>/…`). The broker's grant
 /// binds a reply's `<src>` segment to its publisher, so this is what tells the
-/// recipient's receipt from anybody else's record that merely names the same
-/// offset (round 16 review: a third node's `ack re=<off>` settled the asker's
-/// `--wait-ack` and its deadline).
+/// recipient's receipt from a third node's record that merely names the same
+/// offset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asked {
     /// The bus offset of the ask.
@@ -147,27 +147,16 @@ pub const DEADLINES_KEEP: usize = 4096;
 
 /// How many TOFU pins the table keeps, oldest-first-out.
 ///
-/// THE ONE DURABLE STRUCTURE HERE THAT HAD NO BOUND. Every sibling states one —
-/// `acked` at `SELF_ACK_KEEP`, notify's journal at `JOURNAL_KEEP`, `RETIRED_KEEP`,
-/// `RING_CAP` — the discipline in four words: nothing durable and unbounded. `pins`
-/// grew one line per REMOTE sid ever addressed by a bare `@s-<sid>`, sids are
-/// per-session and never reused, and the node id that owns the file is minted
-/// once and kept forever; meanwhile `Bridge::pinned_node_for` re-reads and
-/// re-parses the whole file on every such post and `pin` rewrites and `fsync`s
-/// it whenever a new sid appears. A busy orchestrator reached six figures of
-/// lines in a month. (§11.2's `aterm-link pin` override was cut unbuilt in
-/// 622e40af6: deleting `<state>/pins` is the operator's remedy, and the TOFU rule
-/// makes it safe — the next sight of each peer re-pins it.)
+/// Nothing durable here is unbounded: `pins` gains one line per REMOTE sid ever
+/// addressed by a bare `@s-<sid>`, sids are never reused, and
+/// `Bridge::pinned_node_for` re-reads the whole file on every such post.
+/// Deleting `<state>/pins` is the operator's remedy; the TOFU rule makes it
+/// safe.
 ///
 /// EVICTION IS BY FIRST SIGHT, NOT BY USE, and the file is kept in first-sight
-/// order to make that possible. Recency would mean a durable rewrite per post
-/// — trading an unbounded file for an unbounded write rate — where the eviction
-/// order the file already has costs nothing: a re-pin on next sight IS the TOFU
-/// rule, and it is the answer this table's own row has always given for losing
-/// the file entirely. What an evicted pin costs is the T15 protection for a sid
-/// that has not been addressed in the last [`PINS_KEEP`] fresh ones; four
-/// thousand distinct newer peers is a long way past the sid churn the bound
-/// exists to survive.
+/// order to make that possible. Recency would mean a durable rewrite per post;
+/// a re-pin on next sight IS the TOFU rule. An evicted pin costs the T15
+/// protection for a sid not addressed in the last [`PINS_KEEP`] fresh ones.
 pub const PINS_KEEP: usize = 4096;
 
 /// ONE SESSION'S POSITION ON ONE BROADCAST TOPIC: the offset it resumes from —
@@ -314,19 +303,13 @@ impl StateDir {
     /// The endpoint's `seen=` watermark for one session, persisted from the
     /// `EVENT <local> inbox-seen` digest. The refill (§6.2) starts at `+1`.
     ///
-    /// ONE SMALL FILE PER SESSION EVER DELIVERED TO, AND NOTHING PRUNES THEM —
-    /// stated rather than fixed, because the fix is worse than the growth.
-    /// Sids are per-session and never reused, so the directory grows with
-    /// sessions that have received mail (not with traffic), at one inode of a
-    /// few bytes each. Deleting a departed session's file would be free ONLY if
-    /// "departed" were knowable here, and it is not: the sid a seamless update
-    /// preserves is absent from aterm's roster for the whole window between the
-    /// re-exec and adoption, and a sweep that ran in that window would delete
-    /// the watermark of a live session and refill it from
-    /// `REFILL_FLOOR_SPAN` — re-offering thousands of old offsets — which is
-    /// the exact case §6.2's refill exists to serve. `pins` is bounded
-    /// ([`PINS_KEEP`]) because eviction there costs a re-pin; here it would
-    /// cost the guarantee.
+    /// ONE SMALL FILE PER SESSION EVER DELIVERED TO, AND NOTHING PRUNES THEM:
+    /// the directory grows with sessions that received mail, not with traffic.
+    /// "Departed" is not knowable here — a seamless update's sid is absent from
+    /// aterm's roster between the re-exec and adoption — and a sweep in that
+    /// window would refill a live session from `REFILL_FLOOR_SPAN`, re-offering
+    /// thousands of old offsets. `pins` is bounded ([`PINS_KEEP`]) because
+    /// eviction there costs only a re-pin.
     #[must_use]
     pub fn seen_off(&self, sid: &str) -> Option<u64> {
         self.read(&format!("seen/{sid}"))
@@ -462,14 +445,11 @@ impl StateDir {
     ///
     /// THE OPT-IN LIVES IN ATERM; THE CURSOR LIVES HERE, and the split is the
     /// point. The session owns the set (`topic add`/`topic drop`) and answers
-    /// `since=head|@<off>`, which is an INTENT, not a position — resolving
-    /// `head` needs the bus. The bridge resolves it ONCE, against the broker's
-    /// head at the moment it first learns the entry, and writes the resolved
-    /// offset here. A bridge that restarts therefore RESUMES each topic from
-    /// where the last one left off instead of re-reading `head` and silently
-    /// swallowing every broadcast published while it was down — which is the
-    /// failure the persistence exists to prevent, and it is invisible from the
-    /// session, which asked for a topic and simply never heard about it.
+    /// `since=head|@<off>`, which is an INTENT, not a position. The bridge
+    /// resolves it ONCE, against the broker's head when it first learns the
+    /// entry, and writes the offset here, so a restarted bridge RESUMES each
+    /// topic instead of re-reading `head` and silently swallowing every
+    /// broadcast published while it was down.
     ///
     /// Keyed by sid, one file per session, so a session that exits takes its
     /// cursors with it ([`StateDir::forget_topics`]).
@@ -484,12 +464,11 @@ impl StateDir {
                 Some((topic, cursor)) => {
                     out.insert(topic, cursor);
                 }
-                // Said out loud, naming the file and the fallback: a dropped
-                // cursor is a dropped delivery guarantee, and the session it
-                // belonged to has no other way to learn it.
+                // Reported: a dropped cursor is a dropped delivery guarantee,
+                // and the session has no other way to learn it.
                 None => eprintln!(
                     "aterm-link: {}: `{}` is not a broadcast cursor; that topic \
-                     resumes from the bus head and whatever it missed is lost",
+                     resumes from the bus head; what it missed is lost",
                     self.path(&format!("topics/{sid}")).display(),
                     safe_line(line)
                 ),
@@ -1044,19 +1023,12 @@ mod tests {
 
     /// THE PIN TABLE IS BOUNDED, oldest first sight out, and the bound does not
     /// disturb what is inside it.
-    ///
-    /// It was the one durable structure in the crate with no cap and no prune,
-    /// growing one line per remote sid ever addressed while `pinned_node_for`
-    /// re-read and re-parsed the whole file before every post. (The operator's
-    /// remedy is deleting the file — §11.2's `aterm-link pin` override was cut
-    /// unbuilt in 622e40af6 — and the next sight of each peer re-pins it.)
     #[test]
     fn the_pin_table_is_bounded_and_evicts_the_oldest_first_sight() {
         let dir = scratch("pins-bound");
         let st = StateDir::open(&dir).expect("open");
-        // A FULL TABLE, WRITTEN AS ONE FILE. `pin` rewrites the whole file per
-        // call, so filling it a line at a time would be quadratic — the very
-        // cost the bound exists to stop growing.
+        // A full table, written as one file: filling it via `pin` would be
+        // quadratic.
         let full: Vec<String> = (0..PINS_KEEP)
             .map(|n| format!("s-{n:016x} n-{:016x}", n % 3))
             .collect();

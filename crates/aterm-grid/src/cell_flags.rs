@@ -4,25 +4,19 @@
 
 //! Cell attribute flags (16-bit packed bitfield).
 
-/// Cell flags packed into the Cell's flags field.
-///
-/// The Cell struct stores flags in 16 bits.
+/// Cell flags, packed into the Cell's 16-bit flags field.
 ///
 /// ## Bit allocation
-/// - Bits 0-7: Visual attributes (bold, dim, italic, underline, blink, inverse, hidden, strikethrough)
-/// - Bit 8: Double underline
-/// - Bit 9: Wide character
-/// - Bit 10: Wide continuation / Protected (shared bit - mutually exclusive)
-/// - Bit 11: Superscript (SGR 73)
-/// - Bit 12: Subscript (SGR 74)
-/// - Bit 11+12: Overline (SGR 53) - combo encoding, mutually exclusive with super/subscript
-/// - Bit 13: Curly underline
+/// - Bits 0-7: visual attributes (bold, dim, italic, underline, blink, inverse, hidden, strikethrough)
+/// - Bit 8: double underline
+/// - Bit 9: wide character
+/// - Bit 10: wide continuation / protected (shared; a spacer's protection is its lead's)
+/// - Bit 11: superscript (SGR 73)
+/// - Bit 12: subscript (SGR 74)
+/// - Bits 11+12: overline (SGR 53), exclusive with super/subscript
+/// - Bit 13: curly underline
 /// - Bit 14: USES_STYLE_ID (colors field stores a StyleId)
-/// - Bit 15: COMPLEX (char_data is overflow table index)
-///
-/// Note: WIDE_CONTINUATION and PROTECTED share the same bit. Wide continuation
-/// cells (spacers after wide characters) cannot be protected independently;
-/// protection applies to the main wide character cell.
+/// - Bit 15: COMPLEX (char_data is an overflow table index)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct CellFlags(pub u16);
@@ -51,9 +45,8 @@ impl CellFlags {
     /// Wide character continuation (spacer cell).
     /// Shares bit with PROTECTED - mutually exclusive.
     pub const WIDE_CONTINUATION: Self = Self(1 << 10);
-    /// Protected from selective erase (DECSCA).
-    /// Shares bit with WIDE_CONTINUATION - mutually exclusive.
-    /// A non-wide cell uses this for protection status.
+    /// Protected from selective erase (DECSCA). Shares bit 10 with
+    /// WIDE_CONTINUATION; only non-spacer cells use it for protection.
     pub const PROTECTED: Self = Self(1 << 10);
     /// Superscript text (SGR 73).
     pub const SUPERSCRIPT: Self = Self(1 << 11);
@@ -66,13 +59,9 @@ impl CellFlags {
     /// Curly underline.
     pub const CURLY_UNDERLINE: Self = Self(1 << 13);
 
-    // Underline style encoding for cells:
-    // - UNDERLINE alone = single underline
-    // - DOUBLE_UNDERLINE alone = double underline
-    // - CURLY_UNDERLINE alone = curly underline
-    // - UNDERLINE + CURLY_UNDERLINE = dotted underline (SGR 4:4)
-    // - DOUBLE_UNDERLINE + CURLY_UNDERLINE = dashed underline (SGR 4:5)
-    // These combinations use bitwise OR of existing flags to encode additional styles.
+    // Underline styles: UNDERLINE, DOUBLE_UNDERLINE and CURLY_UNDERLINE alone are
+    // single, double and curly; UNDERLINE | CURLY is dotted (SGR 4:4) and
+    // DOUBLE | CURLY is dashed (SGR 4:5).
 
     /// Dotted underline (SGR 4:4) - encoded as UNDERLINE | CURLY_UNDERLINE.
     pub const DOTTED_UNDERLINE: Self = Self((1 << 3) | (1 << 13)); // UNDERLINE | CURLY_UNDERLINE
@@ -85,9 +74,7 @@ impl CellFlags {
     /// Complex character - char_data is an index into the overflow string table.
     pub const COMPLEX: Self = Self(1 << 15);
 
-    // Alacritty compatibility aliases
-    // These alternative names remain available only for consumers that opt into
-    // the compatibility surface explicitly.
+    // Alacritty compatibility aliases, for consumers that opt into them.
 
     /// All underline style flags combined (Alacritty compatibility).
     #[cfg(feature = "alacritty-compat")]
@@ -192,8 +179,7 @@ impl CellFlags {
         Self(self.0 & Self::VISUAL_FLAGS_MASK)
     }
 
-    /// Mask for extended flags (bits 11-13) that were previously in CellExtra.
-    /// These are now stored directly in Cell.
+    /// Mask for the extended flags (bits 11-13).
     pub const EXTENDED_FLAGS_MASK: u16 = 0x3800; // bits 11-13
 
     /// Get only the extended flags (bits 11-13).
@@ -210,37 +196,23 @@ impl CellFlags {
         (self.0 & Self::EXTENDED_FLAGS_MASK) != 0
     }
 
-    /// Mask of the rendition a wide character's continuation spacer inherits
-    /// from its lead: bits 0-8 and 11-13, every visual attribute and nothing else.
+    /// Rendition a wide character's continuation spacer inherits from its lead:
+    /// bits 0-8 and 11-13, every visual attribute and nothing else.
     ///
-    /// Deliberately excluded, each for its own reason:
-    /// - `WIDE` (bit 9) — the spacer is the tail of the pair, never a lead;
-    /// - `WIDE_CONTINUATION`/`PROTECTED` (bit 10) — the spacer's own role bit, and
-    ///   it aliases PROTECTED, so a blind union of the lead's flags would smuggle
-    ///   DECSCA protection into a cell that cannot carry it independently;
-    /// - `USES_STYLE_ID` (bit 14) and `COMPLEX` (bit 15) — storage discriminants of
-    ///   the spacer's OWN colors/char fields, which its constructor owns.
+    /// Excluded: `WIDE` (bit 9, the spacer is never a lead); bit 10 (the
+    /// spacer's own role bit, which aliases PROTECTED); `USES_STYLE_ID` and
+    /// `COMPLEX` (bits 14-15, storage discriminants the spacer's constructor
+    /// owns).
     pub const SPACER_RENDITION_MASK: u16 =
         Self::VISUAL_FLAGS_MASK & !(Self::WIDE.0 | Self::WIDE_CONTINUATION.0);
 
     /// The flags for the continuation spacer of a wide character written with `self`.
     ///
-    /// **The law: a rendition belongs to the CHARACTER, not to the column.** ECMA-48
-    /// SGR sets an attribute on a character, and a double-width character is one
-    /// character occupying two columns — there is no such thing as half a character
-    /// carrying half a rendition. The spacer therefore inherits the lead's visual
-    /// attributes and keeps only its own role bit.
-    ///
-    /// Measured reason (2026-09-16): a spacer built with `WIDE_CONTINUATION` alone
-    /// discarded every rendition bit, and under SGR 7 that erased the right half of
-    /// every double-width glyph. `resolve_both` swaps fg/bg for the lead only, so
-    /// `lead.resolved_fg == spacer.resolved_bg` for EVERY colour pair — an identity,
-    /// not a coincidence — and the glyph's spilled right half was composited
-    /// invisibly. `\033[7m[漢字]` on a 9x17 cell measured 153 of 153 pixels of flat
-    /// `#111318` in each spacer, distinct=1, zero glyph ink; the same line under
-    /// `\033[31;44;7m` measured 153/153 of the un-swapped blue `#3b8eea`. A CJK user
-    /// could not read a `less` search match. Underline, strikethrough and overline
-    /// rules gapped under every right half for the same reason.
+    /// A rendition belongs to the character, not the column: a double-width
+    /// character is one character over two columns, so the spacer inherits the
+    /// lead's visual attributes and keeps only its own role bit. Without this,
+    /// SGR 7 (swapped for the lead only) paints the glyph's right half invisibly,
+    /// and underline/strikethrough/overline gap under every right half.
     #[must_use]
     #[inline]
     pub const fn wide_continuation_of(self) -> Self {
@@ -296,10 +268,8 @@ impl std::ops::Not for CellFlags {
 mod tests {
     use super::*;
 
-    // ---- Bit layout ----
-    //
-    // Persisted: checkpoints and the render path read these bits raw, so every
-    // position is pinned. One row per former `*_flag_bit`, combo and mask test.
+    // Bit layout: checkpoints and the render path read these bits raw, so every
+    // position is pinned.
 
     #[test]
     fn bit_layout_is_pinned() {
@@ -371,12 +341,9 @@ mod tests {
 
     #[test]
     fn methods_agree_with_raw_bit_arithmetic() {
-        // One loop in place of the one-case tests of default/empty, from_bits,
-        // contains, intersects, union, difference, insert/remove, is_complex,
-        // uses_style_id, core_flags, extended_flags, has_extended_flags and Copy:
-        // each method is checked against the u16 arithmetic it stands for, for
-        // every pair drawn from the sixteen single bits, the combos, the masks,
-        // a few mixes, 0 and 0xFFFF.
+        // Each method is checked against the u16 arithmetic it stands for, over
+        // every pair drawn from the single bits, combos, masks, a few mixes, 0
+        // and 0xFFFF.
         assert!(CellFlags::default().is_empty());
         assert_eq!(CellFlags::empty(), CellFlags::default());
 

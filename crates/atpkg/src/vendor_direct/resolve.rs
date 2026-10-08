@@ -599,7 +599,7 @@ fn parse_sums(text: &[u8]) -> Option<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for line in text.lines().filter(|l| !l.is_empty()) {
         let (digest, rest) = (line.get(..64)?, line.get(64..)?);
-        if !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !aterm_codec::hex::is_hex(digest, 64) {
             return None;
         }
         let name = rest
@@ -638,7 +638,7 @@ fn json_asset_digest(release: &aterm_json::Value, name: &str) -> Result<String, 
         .get("digest")
         .and_then(aterm_json::Value::as_str)
         .and_then(|d| d.strip_prefix("sha256:"))
-        .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|d| aterm_codec::hex::is_hex(d, 64))
         .map(str::to_ascii_lowercase)
         .ok_or_else(|| format!("the release JSON carries no sha256 digest for {name}"))
 }

@@ -258,8 +258,13 @@ pub trait ActionSink {
 
     /// End of an APC sequence.
     ///
+    /// `canceled` is `true` when the string was aborted by CAN (0x18) or SUB
+    /// (0x1A) rather than terminated by ST / `ESC \`: the sink should DISCARD
+    /// the accumulated payload (a truncated kitty graphics command) instead
+    /// of acting on it, as [`dcs_unhook`](Self::dcs_unhook) does for a DCS.
+    ///
     /// Default: no-op.
-    fn apc_end(&mut self) {}
+    fn apc_end(&mut self, _canceled: bool) {}
 }
 
 /// Extended trait for batch-optimized action handling.
@@ -296,7 +301,7 @@ impl ActionSink for NullSink {
     fn dcs_unhook(&mut self, _: bool) {}
     fn apc_start(&mut self) {}
     fn apc_put(&mut self, _: u8) {}
-    fn apc_end(&mut self) {}
+    fn apc_end(&mut self, _: bool) {}
 }
 
 #[cfg(test)]

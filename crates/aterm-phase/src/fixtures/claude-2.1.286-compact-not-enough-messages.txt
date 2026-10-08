@@ -1,0 +1,15 @@
+# claude-code 2.1.286 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50) on origin/main 9215c99b1, the managed 2.1.286 launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL` pointing at a local stub of the API · a `/compact` on a conversation with nothing to summarise (typed right after `/clear`): `⎿  Not enough messages to compact.` — a plain vendor row, no API request made · scratch path redacted at equal length
+ ▐▛███▛█   Claude Code v2.1.286
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

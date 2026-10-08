@@ -8,12 +8,8 @@ struct VsOut {
 
 // Oversized triangle covering the whole clip rect; UVs map the framebuffer 1:1.
 //
-// NAMED `vs_fs`, not `vs_fs_bloom`: this is the twin of `renderer.rs::BLOOM_SHADER`'s
-// `vs_fs`, and THE PIPELINE TABLE (`Pipeline::Bloom`) names ONE entry point for both
-// backends. The MSL used to rename it, `shaders::libraries`'s roster listed the NEW
-// name, and the roster test was self-consistent with the rename — so nothing could
-// see that `renderer.rs` was asking for an entry point the MSL did not define. The
-// roster is derived from the table now, and the name is the WGSL's.
+// Named `vs_fs`, the WGSL's name: the pipeline table (`Pipeline::Bloom`) names
+// one entry point for both backends.
 vertex VsOut vs_fs(uint vi [[vertex_id]]) {
     const float2 uv[3] = { float2(0.0, 0.0), float2(2.0, 0.0), float2(0.0, 2.0) };
     VsOut o;

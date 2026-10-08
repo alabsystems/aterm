@@ -418,17 +418,8 @@ fn printable(c: char) -> bool {
 mod tests {
     use super::*;
 
-    fn layout(label: &str) -> Layout {
-        let p =
-            std::env::temp_dir().join(format!("atpkg-vendor-stamp-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-vendor-stamp-{label}-"))
     }
 
     fn v(text: &str) -> Version {
@@ -516,7 +507,7 @@ mod tests {
     /// Writers in parallel (threads here; processes take the same `flock`) lose no update.
     /// A writer the lock's bounded wait refuses writes again: 32 durable writes (each a
     /// file and a directory flush) queue behind one lock, and on a loaded disk the queue
-    /// alone took 0.8–4.9 s (measured 2026-09-23) against the 5 s bound — the claim is that
+    /// alone took 0.8–4.9 s against the 5 s bound — the claim is that
     /// no write is lost, not how long the queue is, and a refusal is never a lost write.
     #[test]
     fn concurrent_writers_lose_no_update() {
@@ -706,8 +697,7 @@ mod tests {
     }
 
     /// A key this build does not know — one a newer build writes — survives every rewrite
-    /// this build makes. Builds that rewrote the file from their own fields alone dropped
-    /// what a newer one kept: the legacy root, to every build before 2026-09-23.
+    /// this build makes.
     #[test]
     fn a_key_this_build_does_not_know_survives_its_rewrites() {
         let l = layout("unknown-key");

@@ -18,17 +18,17 @@
 //! * **No controlling terminal** — `setsid(2)` in a `pre_exec` hook. `open("/dev/tty")`
 //!   then fails with ENXIO no matter what the harness inherited, so the refusals are
 //!   deterministic instead of environmental.
-//! * **A real controlling terminal** — a pseudo-terminal pair (`posix_openpt`/`grantpt`/
-//!   `unlockpt`), with the child doing `setsid` and `TIOCSCTTY` on the slave so the pty
-//!   becomes its controlling terminal. `/dev/tty` inside the child then resolves to
+//! * **A real controlling terminal** — a pseudo-terminal pair (the suite's `crate::pty`),
+//!   with the child doing `setsid` and `TIOCSCTTY` on the slave so the pty becomes its
+//!   controlling terminal. `/dev/tty` inside the child then resolves to
 //!   something this test holds the other end of, which is what makes it possible to assert
 //!   the two things that matter most: the phrase APPEARS on the terminal, and it appears
 //!   NOWHERE else — not on the captured stdout, not on stderr, not in any file.
 //!
 //! `/dev/tty` resolves through the controlling terminal, not through fd 0, which is why
 //! the child's stdout can be a pipe at the same time. That is not a trick to make the test
-//! work; it is exactly the shape of `atpkg-keys setup > setup.log`, and the reason that
-//! invocation can no longer put a master into a file.
+//! work; it is exactly the shape of `atpkg-keys setup > setup.log`, which must not put a
+//! master into a file.
 //!
 //! Nothing here needs a network, an Apple account, or a real key: the masters are
 //! obviously synthetic and the machine keys are generated on the spot.
@@ -39,12 +39,13 @@ use aterm_update_core::roster::{Roster, verify_roster};
 use atpkg_keys::master::parse_master;
 use atpkg_keys::pins_edit::{MASTER_ANCHOR, read_anchor};
 use atpkg_keys::roster_ops::{add, empty};
-use std::io::Read as _;
-use std::io::Write as _;
-use std::os::unix::io::FromRawFd as _;
 use std::os::unix::process::CommandExt as _;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+
+use crate::pty::Pty;
+
+use aterm_spec::wait::MUST_HAPPEN;
 
 /// An obviously synthetic master. It appears nowhere outside tests.
 const PAPER: &str = "0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0";
@@ -74,12 +75,12 @@ fn pins_fixture(master_entry: &str) -> String {
     s
 }
 
-/// A private scratch tree for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("atpkg-keys-cli").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+/// A private scratch tree for one test, removed when the test ends however it ends.
+fn scratch(name: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("atpkg-keys-cli-{name}-"))
+        .tempdir()
+        .expect("scratch dir")
 }
 
 fn p(dir: &Path, name: &str) -> String {
@@ -152,108 +153,8 @@ fn armed_tree(dir: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// A REAL TERMINAL, built rather than inherited.
+// A REAL TERMINAL, built rather than inherited: the suite's pty fixture (`crate::pty`).
 // ---------------------------------------------------------------------------
-
-/// The master side of a pseudo-terminal, and what the child must open to get the slave.
-struct Pty {
-    master: std::fs::File,
-    slave: String,
-}
-
-/// `ptsname(3)` returns a pointer into a static buffer, so two tests calling it at the same
-/// time can read each other's answer. `cargo test` runs tests in threads by default, so the
-/// open-and-name sequence is serialised here rather than left to luck — a flaky terminal
-/// fixture would discredit every assertion built on it.
-static PTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-impl Pty {
-    /// Open a pty pair and return the master end plus the slave's path.
-    fn open() -> Self {
-        let _guard = PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the three calls are the POSIX pty-opening sequence, each checked. They
-        // take no pointers from us except in `ptsname`, whose result is copied out before
-        // the lock is released.
-        unsafe {
-            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(fd >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
-            assert_eq!(libc::grantpt(fd), 0, "grantpt");
-            assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
-            let name = libc::ptsname(fd);
-            assert!(!name.is_null(), "ptsname");
-            let slave = std::ffi::CStr::from_ptr(name)
-                .to_str()
-                .expect("a pty path is ASCII")
-                .to_string();
-            // Non-blocking, so the drain loop below can poll with a deadline instead of
-            // parking forever if the child never says anything.
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            Self {
-                master: std::fs::File::from_raw_fd(fd),
-                slave,
-            }
-        }
-    }
-
-    /// Spawn the binary with this pty as its CONTROLLING TERMINAL, while stdout and stderr
-    /// stay pipes.
-    ///
-    /// That split is the whole point: `/dev/tty` resolves through the controlling terminal,
-    /// so the child has one even though its stdout is a pipe — which is precisely the shape
-    /// of `atpkg-keys setup | tee log`, the invocation that used to write a master into a
-    /// file.
-    fn spawn(&self, dir: &Path, args: &[&str]) -> Child {
-        let slave = std::ffi::CString::new(self.slave.clone()).expect("no NUL in a pty path");
-        let mut cmd = base_command(dir, args);
-        cmd.stdin(Stdio::null());
-        // SAFETY: everything in the hook is async-signal-safe (`setsid`, `open`, `ioctl`)
-        // and touches no state shared with the parent. `slave` is a CString that lives in
-        // the closure, so its pointer is valid for the call.
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let fd = libc::open(slave.as_ptr(), libc::O_RDWR);
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Make it the controlling terminal of this brand-new session. The
-                // descriptor is deliberately left open: the association survives a close,
-                // but keeping it costs nothing and makes the intent obvious.
-                if libc::ioctl(fd, libc::c_ulong::from(libc::TIOCSCTTY), 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        cmd.spawn().expect("the atpkg-keys binary runs")
-    }
-
-    /// Read whatever the child has written to the terminal so far, appending to `into`.
-    fn drain(&mut self, into: &mut String) {
-        let mut buf = [0u8; 4096];
-        loop {
-            match self.master.read(&mut buf) {
-                Ok(0) => return,
-                Ok(n) => into.push_str(&String::from_utf8_lossy(&buf[..n])),
-                // EAGAIN: nothing more right now. EIO: the slave closed, i.e. the child is
-                // gone — both mean "stop reading", neither is a failure.
-                Err(_) => return,
-            }
-        }
-    }
-
-    /// Type a line at the terminal, the way a human would.
-    fn type_line(&mut self, line: &str) {
-        self.master
-            .write_all(line.as_bytes())
-            .and_then(|()| self.master.write_all(b"\n"))
-            .and_then(|()| self.master.flush())
-            .expect("typing at the terminal");
-    }
-}
 
 /// What a pty-driven run produced: the child's exit status, its captured stdout/stderr, and
 /// everything that appeared ON THE TERMINAL.
@@ -273,10 +174,10 @@ struct TtyRun {
 /// too.
 fn run_on_a_terminal(dir: &Path, args: &[&str], reply: Option<(&str, &str)>) -> TtyRun {
     let mut pty = Pty::open();
-    let mut child = pty.spawn(dir, args);
+    let mut child = pty.spawn(base_command(dir, args));
     let mut terminal = String::new();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + MUST_HAPPEN;
     let mut replied = reply.is_none();
     loop {
         pty.drain(&mut terminal);
@@ -328,10 +229,10 @@ fn phrase_on(terminal: &str) -> Option<String> {
 /// equivalent of an operator reading their own paper.
 fn run_on_a_terminal_retyping_phrase(dir: &Path, args: &[&str]) -> TtyRun {
     let mut pty = Pty::open();
-    let mut child = pty.spawn(dir, args);
+    let mut child = pty.spawn(base_command(dir, args));
     let mut terminal = String::new();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + MUST_HAPPEN;
     let mut replied = false;
     loop {
         pty.drain(&mut terminal);
@@ -397,7 +298,8 @@ fn assert_nothing_on_disk_holds(dir: &Path, needle: &str) -> usize {
 /// variables, stdin, and a file — and must take it from none of them.
 #[test]
 fn join_refuses_the_phrase_from_env_stdin_or_a_file() {
-    let dir = scratch("join-leak-vectors");
+    let tmp = scratch("join-leak-vectors");
+    let dir = tmp.path().to_path_buf();
     armed_tree(&dir);
     let phrase_file = p(&dir, "phrase.txt");
     std::fs::write(&phrase_file, PAPER).expect("the file the operator must not be able to use");
@@ -444,8 +346,7 @@ fn join_refuses_the_phrase_from_env_stdin_or_a_file() {
         before_roster
     );
 
-    // ...and with stdin at /dev/null, which is the shape the retired `machine-mint`
-    // property is stated in, the refusal is the same one.
+    // ...and with stdin at /dev/null the refusal is the same one.
     let out = run(
         &dir,
         None,
@@ -468,13 +369,12 @@ fn join_refuses_the_phrase_from_env_stdin_or_a_file() {
 
 /// A FLAG THAT WOULD CARRY THE MASTER IS REFUSED BY NAME, AND SAYS WHY IT MATTERS.
 ///
-/// It used to be accepted and ignored, which is the worst of the three options: the run
-/// proceeded, so nothing told the operator that the phrase they had just typed on a command
-/// line was now in their shell history and had been visible to every process on the machine
-/// via `ps`. Ignoring a secret is not the same as refusing one.
+/// Accepting and ignoring it would leave the operator unaware that the phrase is now in
+/// their shell history and was visible to every process via `ps`.
 #[test]
 fn a_flag_that_would_carry_the_master_is_refused_and_calls_it_compromised() {
-    let dir = scratch("master-flag");
+    let tmp = scratch("master-flag");
+    let dir = tmp.path().to_path_buf();
     armed_tree(&dir);
     let before = std::fs::read(p(&dir, "pins.rs")).unwrap();
 
@@ -539,14 +439,13 @@ fn a_flag_that_would_carry_the_master_is_refused_and_calls_it_compromised() {
 /// SETUP WITHOUT A TERMINAL REFUSES, AND GENERATES NOTHING.
 ///
 /// This is the redirect case: `setup > setup.log`, `| tee`, `| head -0`, or a wrapper that
-/// captures stdout. It used to succeed — writing the 64 hex characters into whatever was on
-/// fd 1, which is a permanent plaintext copy of the fleet's root key if the stream was a
-/// file and a total loss of it if the stream was discarded, WHILE ARMING THE ANCHOR either
-/// way. There is no terminal here, so there is nowhere to deliver a master, so no master is
-/// generated at all.
+/// captures stdout. On fd 1 the phrase would be a plaintext copy of the fleet's root key
+/// in a file, or lost if the stream was discarded. There is no terminal here, so there is
+/// nowhere to deliver a master, so no master is generated at all.
 #[test]
 fn setup_without_a_terminal_refuses_and_writes_nothing() {
-    let dir = scratch("setup-headless");
+    let tmp = scratch("setup-headless");
+    let dir = tmp.path().to_path_buf();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
     let before = std::fs::read(p(&dir, "pins.rs")).unwrap();
 
@@ -604,7 +503,8 @@ fn setup_without_a_terminal_refuses_and_writes_nothing() {
 /// the file the operator named; the checkout is what the tool would have edited instead.
 #[test]
 fn an_unread_flag_spelling_is_refused_rather_than_silently_replaced_by_a_default() {
-    let dir = scratch("flag-equals");
+    let tmp = scratch("flag-equals");
+    let dir = tmp.path().to_path_buf();
     let checkout = dir.join("checkout/crates/aterm-update-core/src");
     std::fs::create_dir_all(&checkout).expect("fake checkout");
     let discovered = checkout.join("pins.rs");
@@ -663,7 +563,8 @@ fn an_unread_flag_spelling_is_refused_rather_than_silently_replaced_by_a_default
 /// with a message that names them.
 #[test]
 fn unknown_and_malformed_arguments_are_refused_by_name() {
-    let dir = scratch("bad-args");
+    let tmp = scratch("bad-args");
+    let dir = tmp.path().to_path_buf();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).unwrap();
 
     let out = run(
@@ -714,7 +615,8 @@ fn unknown_and_malformed_arguments_are_refused_by_name() {
 /// from — and writes nothing where the operator is standing.
 #[test]
 fn machine_revoke_with_no_roster_refuses_before_asking_for_the_phrase() {
-    let dir = scratch("revoke-no-roster");
+    let tmp = scratch("revoke-no-roster");
+    let dir = tmp.path().to_path_buf();
     let roster = p(&dir, "dist/aterm-machines.toml");
     let out = run(
         &dir,
@@ -765,7 +667,8 @@ fn machine_revoke_with_no_roster_refuses_before_asking_for_the_phrase() {
 /// it cannot attribute.
 #[test]
 fn join_without_a_roster_refuses_instead_of_forking_one() {
-    let dir = scratch("join-no-roster");
+    let tmp = scratch("join-no-roster");
+    let dir = tmp.path().to_path_buf();
     let master_pub = armed_tree(&dir);
     // The roster does not travel with the checkout — remove it to model machine #2.
     std::fs::remove_file(p(&dir, "roster.toml")).unwrap();
@@ -797,7 +700,7 @@ fn join_without_a_roster_refuses_instead_of_forking_one() {
         err.contains("will not start a second roster"),
         "and why it will not do it for you: {err}"
     );
-    // The refusal comes BEFORE the prompt: the operator is not asked to type 64 characters
+    // The refusal comes BEFORE the prompt: the operator is not asked to type 52 characters
     // only to be told the file is missing.
     assert!(!err.contains("/dev/tty"), "{err}");
     assert!(
@@ -848,7 +751,8 @@ fn join_without_a_roster_refuses_instead_of_forking_one() {
 /// every byte written to disk.
 #[test]
 fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
-    let dir = scratch("setup-tty");
+    let tmp = scratch("setup-tty");
+    let dir = tmp.path().to_path_buf();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
 
     let run = run_on_a_terminal_retyping_phrase(
@@ -989,17 +893,17 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
     );
 }
 
-/// A WRONG RETYPE ARMS NOTHING AND RE-SHOWS THE PHRASE; a correct one then arms. The gate
-/// exists because of the 2026-08-14 ceremony failure — a shown-but-never-copied master —
-/// and this proves the loop is survivable: mistype, fix the paper, proceed.
+/// A WRONG RETYPE ARMS NOTHING AND RE-SHOWS THE PHRASE; a correct one then arms. The loop
+/// is survivable: mistype, fix the paper, proceed.
 #[test]
 fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
     const RETYPE_PROMPT: &str = "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; Ctrl-C aborts, nothing is armed): ";
-    let dir = scratch("setup-retype-mismatch");
+    let tmp = scratch("setup-retype-mismatch");
+    let dir = tmp.path().to_path_buf();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
 
     let mut pty = Pty::open();
-    let mut child = pty.spawn(
+    let mut child = pty.spawn(base_command(
         &dir,
         &[
             "setup",
@@ -1012,9 +916,9 @@ fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
             "--key",
             &p(&dir, "m3.key"),
         ],
-    );
+    ));
     let mut terminal = String::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + MUST_HAPPEN;
     let mut typed_wrong = false;
     let mut typed_right = false;
     loop {
@@ -1088,12 +992,13 @@ fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
 
 /// `join` END TO END, WITH THE PHRASE TYPED AT THE TERMINAL.
 ///
-/// The second machine's whole experience: type the 64 characters, and the tool proves them
+/// The second machine's whole experience: type the 52 characters, and the tool proves them
 /// against the committed anchor and the roster the real master signed before it writes
 /// anything. A wrong phrase is refused here too, with the tree untouched.
 #[test]
 fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
-    let dir = scratch("join-tty");
+    let tmp = scratch("join-tty");
+    let dir = tmp.path().to_path_buf();
     let master_pub = armed_tree(&dir);
     let before_pins = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
 
@@ -1200,7 +1105,8 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
 /// recoverable at all.
 #[test]
 fn a_setup_that_cannot_write_the_anchor_leaves_it_unarmed_and_says_so() {
-    let dir = scratch("setup-unwritable");
+    let tmp = scratch("setup-unwritable");
+    let dir = tmp.path().to_path_buf();
     let anchor_dir = dir.join("anchor");
     std::fs::create_dir_all(&anchor_dir).unwrap();
     let pins = anchor_dir.join("pins.rs").to_str().unwrap().to_string();
@@ -1255,7 +1161,8 @@ fn a_setup_that_cannot_write_the_anchor_leaves_it_unarmed_and_says_so() {
 /// of the refusal above, so neither verb can be used where the other belongs.
 #[test]
 fn join_on_an_unarmed_tree_refuses_before_the_prompt() {
-    let dir = scratch("join-unarmed");
+    let tmp = scratch("join-unarmed");
+    let dir = tmp.path().to_path_buf();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).unwrap();
     let out = run(
         &dir,
@@ -1283,7 +1190,8 @@ fn join_on_an_unarmed_tree_refuses_before_the_prompt() {
 /// `setup` on an already-armed tree refuses, and never considers a supplied phrase.
 #[test]
 fn setup_refuses_on_an_armed_tree() {
-    let dir = scratch("setup-armed-refusal");
+    let tmp = scratch("setup-armed-refusal");
+    let dir = tmp.path().to_path_buf();
     armed_tree(&dir);
     let phrase_file = p(&dir, "phrase.txt");
     std::fs::write(&phrase_file, PAPER).unwrap();
@@ -1324,7 +1232,8 @@ fn setup_refuses_on_an_armed_tree() {
 /// The verbs are discoverable: an unknown verb and a bare invocation both name them.
 #[test]
 fn the_usage_line_names_the_two_verbs_an_owner_actually_runs() {
-    let dir = scratch("usage");
+    let tmp = scratch("usage");
+    let dir = tmp.path().to_path_buf();
     let out = run(&dir, None, &[]);
     assert!(!out.status.success());
     let err = stderr_of(&out);

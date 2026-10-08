@@ -26,10 +26,11 @@
 //!
 //! THE GATE READS NO ENVIRONMENT KNOB OF ITS OWN (2026-09-24). Every setting a
 //! person gives the gate is a flag here — `--stage-timeout`, `--test-threads`,
-//! `--test-jobs`, `--snapshot`, `--log`/`--no-log`, `--skip-gui-smoke`,
-//! `--machine-lock-dir` — because this crate links into the shipped `aterm`
-//! (`aterm help rust`), where the owner's rule admits no environment variable
-//! that changes what it does (`aterm-update-core`'s `env_reads` gate).
+//! `--test-jobs`, `--snapshot`, `--log`/`--no-log`, `--no-windows`,
+//! `--machine-lock-dir`, `--compile-qos` — because this crate links into the
+//! shipped `aterm` (`aterm help rust`), where the owner's rule admits no
+//! environment variable that changes what it does (`aterm-update-core`'s
+//! `env_reads` gate).
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -104,36 +105,38 @@ pub struct Args {
     /// `--test-threads <n>`: the `RUST_TEST_THREADS` every child is pinned to.
     /// `None` pins the machine's parallelism ([`crate::Ctx::with_pinned_child_facts`]).
     pub test_threads: Option<NonZeroU32>,
-    /// `--test-jobs <n>`: how many test binaries the test stage runs at once,
-    /// splitting the pinned `RUST_TEST_THREADS` between them ([`crate::testrun`]).
-    /// `None` keeps [`crate::testrun::DEFAULT_JOBS`]; `1` is one at a time.
+    /// `--test-jobs <n>`: the most test binaries the test stage runs at once,
+    /// each with the whole pinned `RUST_TEST_THREADS`
+    /// ([`crate::testrun::Limits::by_load`]). `None` keeps
+    /// [`crate::testrun::DEFAULT_JOBS`]; `1` is one at a time.
     pub test_jobs: Option<NonZeroU32>,
     /// `--snapshot <dir>`: where the snapshot lives, in place of
-    /// `<root>-verify.noindex` ([`crate::snapshot`]).
+    /// `<main checkout>-verify.noindex` ([`crate::snapshot::snapshot_home`]).
     pub snapshot: Option<PathBuf>,
     /// `--log <path>`: where the gate writes its own copy of the ladder, in
-    /// place of `<root>/.aterm-verify/logs/verify-<pid>.log`.
+    /// place of the snapshot's `.aterm-verify/logs/verify-<pid>.log`.
     pub log: Option<PathBuf>,
     /// `--no-log`: the gate keeps no copy of the ladder.
     pub no_log: bool,
-    /// `--skip-gui-smoke`: the GUI smoke SKIPS — a named skip, so the run is
+    /// `--no-windows` (2026-09-29): every stage that puts a window on the
+    /// desktop ([`crate::plan::WINDOWED`]) SKIPS — a named skip, so the run is
     /// refused the merge-contract verdict and its receipt vouches for nothing.
-    pub skip_gui_smoke: bool,
+    /// It replaced `--skip-gui-smoke`, which skipped the GUI smoke alone and
+    /// left the objc drives and the redraw conformance opening windows.
+    pub no_windows: bool,
     /// `--machine-lock-dir <dir>`: where the one-gate-per-machine lock lives, in
     /// place of the per-user one ([`crate::snapshot::machine_lock_dir`]). The
     /// gate's own fixture tests give every throwaway repo its own.
     pub machine_lock_dir: Option<PathBuf>,
+    /// `--compile-qos <utility|inherited>` (2026-09-30): the tier of every
+    /// compile-only child ([`crate::exec::CompileQos`]). `inherited` is a
+    /// release's MEASURE run (`tools/release.sh` step 7), admitted only with
+    /// `--measure`: every other run's compiles yield to the desktop.
+    pub compile_qos: crate::exec::CompileQos,
     /// `--baseline`: record MAIN's own reds — HEAD a clean commit of
     /// `origin/main`, the whole tree — and publish the receipt for branches to
     /// be judged against ([`crate::differential`]).
     pub baseline: bool,
-    /// `--nearest-base` (2026-09-28): OPT-IN, off by default, pending the
-    /// owner's decision — when the merge-base has no receipt that serves, the
-    /// run may be judged against its nearest ancestor's, for the failed tests
-    /// whose blast radius did not change between the two
-    /// ([`crate::nearest`]). A flag, never an environment variable (the gate
-    /// reads no knob of its own from the environment, above).
-    pub nearest_base: bool,
     pub help: bool,
 }
 
@@ -172,9 +175,11 @@ pub enum ParseError {
     /// `--baseline` with `--measure`: a baseline is main's reds for the merge
     /// contract, and a `--measure` run runs no stage of it.
     BaselineMeasure,
-    /// `--nearest-base` with `--baseline` or `--measure`, which are judged by
-    /// the absolute rule and have no base to be near.
-    NearestBaseAbsolute(&'static str),
+    /// `--compile-qos` with no value, or one that names no tier.
+    CompileQosNeedsTier,
+    /// `--compile-qos inherited` without `--measure`: only a release's MEASURE
+    /// run keeps its compiles off UTILITY.
+    CompileQosInheritedNeedsMeasure,
     Unknown(String),
 }
 
@@ -216,10 +221,14 @@ impl ParseError {
                                             contract; --measure runs the MEASURE tier alone, \
                                             which is not part of it"
                 .to_string(),
-            ParseError::NearestBaseAbsolute(other) => format!(
-                "verify: --nearest-base chooses the base a branch is judged against; a {other} \
-                 run is judged by the absolute rule and has none"
-            ),
+            ParseError::CompileQosNeedsTier => {
+                "verify: --compile-qos needs utility or inherited".to_string()
+            }
+            ParseError::CompileQosInheritedNeedsMeasure => {
+                "verify: --compile-qos inherited is a release's MEASURE run (--measure); every \
+                 other run's compiles yield to the desktop at utility"
+                    .to_string()
+            }
             ParseError::Unknown(a) => format!("verify: unknown argument: {a}"),
         }
     }
@@ -243,9 +252,8 @@ where
             "--measure" => out.mode = Mode::Measure,
             "--changed" => out.changed = true,
             "--no-log" => out.no_log = true,
-            "--skip-gui-smoke" => out.skip_gui_smoke = true,
+            "--no-windows" => out.no_windows = true,
             "--baseline" => out.baseline = true,
-            "--nearest-base" => out.nearest_base = true,
             "-h" | "--help" => out.help = true,
             "--scope" => {
                 let v = it.next().unwrap_or_default();
@@ -279,6 +287,9 @@ where
             }
             "--test-jobs" => {
                 out.test_jobs = Some(parse_jobs(&it.next().unwrap_or_default())?);
+            }
+            "--compile-qos" => {
+                out.compile_qos = parse_compile_qos(&it.next().unwrap_or_default())?;
             }
             "--snapshot" | "--log" | "--machine-lock-dir" => {
                 let v = path_value(&a, it.next().unwrap_or_default())?;
@@ -317,6 +328,8 @@ where
                     out.test_threads = Some(parse_threads(v)?);
                 } else if let Some(v) = a.strip_prefix("--test-jobs=") {
                     out.test_jobs = Some(parse_jobs(v)?);
+                } else if let Some(v) = a.strip_prefix("--compile-qos=") {
+                    out.compile_qos = parse_compile_qos(v)?;
                 } else if let Some((flag, v)) =
                     a.split_once('=').filter(|(f, _)| PATH_FLAGS.contains(f))
                 {
@@ -345,11 +358,8 @@ where
     if out.baseline && out.mode == Mode::Measure {
         return Err(ParseError::BaselineMeasure);
     }
-    if out.nearest_base && out.baseline {
-        return Err(ParseError::NearestBaseAbsolute("--baseline"));
-    }
-    if out.nearest_base && out.mode == Mode::Measure {
-        return Err(ParseError::NearestBaseAbsolute("--measure"));
+    if out.compile_qos == crate::exec::CompileQos::Inherited && out.mode != Mode::Measure {
+        return Err(ParseError::CompileQosInheritedNeedsMeasure);
     }
     Ok(out)
 }
@@ -398,6 +408,11 @@ fn parse_jobs(v: &str) -> Result<NonZeroU32, ParseError> {
         .map_err(|_| ParseError::TestJobsNeedsCount)
 }
 
+/// A `--compile-qos` value: `utility` or `inherited`, nothing else.
+fn parse_compile_qos(v: &str) -> Result<crate::exec::CompileQos, ParseError> {
+    crate::exec::CompileQos::parse(v).ok_or(ParseError::CompileQosNeedsTier)
+}
+
 /// The `--help` text: the script's own header, kept as the contract it
 /// documents. `{CEILING}` is substituted by [`usage`] from
 /// [`crate::exec::DEFAULT_CHILD_CEILING`] — print [`usage`], never this. The
@@ -406,29 +421,25 @@ fn parse_jobs(v: &str) -> Result<NonZeroU32, ParseError> {
 /// preflight's two numbers, `{DISK_COLD_NEED}` and `{DISK_LANE_CAP}`, are
 /// substituted from [`crate::disk::Budget::MEASURED`] the same way.
 pub const USAGE_TEMPLATE: &str = "\
-verify — the single local gate entrypoint for aterm.
-
-aterm has NO CI by owner decision (docs/AUDIT.md, docs/PROCESS.md): the merge
-contract is *this gate passing locally* before a slice enters the ff-only
-main merge-queue. There is exactly one way to verify, so there is exactly one
-way for a reviewer (human or AI) to be wrong about it: run this.
+verify — the merge contract: run it, green, before landing on main.
 
   tools/verify.sh                   # the per-commit gate (the merge contract)
   tools/verify.sh --measure         # the MEASURE tier (a release cut requires it)
   tools/verify.sh --full            # both tiers + trust-mc + cross-cells
                                     #   + the Codex live upgrade
-  tools/verify.sh --changed         # change-scoped tier (NOT the merge contract)
+  tools/verify.sh --changed         # change-scoped pre-flight (NOT the merge contract)
   tools/verify.sh --scope <crate>   # narrow the test compile, test run,
-                                    #   deadline and measuring tests, doctests
-                                    #   and lint to one crate (+ guards)
+                                    #   measuring tests, doctests and lint
+                                    #   to one crate (+ guards)
   tools/verify.sh --scope aterm-grid
   tools/verify.sh --baseline        # on a commit of main: record + publish main's reds
-  tools/verify.sh --nearest-base    # OPT-IN: judge against the nearest main receipt
+  tools/verify.sh --no-windows      # a desktop in use: no stage opens a window
+                                    #   (NOT the merge contract)
 
 (no flag) : THE GATE, and the merge contract: the LAND tier — targo test
-            --workspace and its doctests + the deadline tests (run alone) +
-            tippy + formatting + the zero-tolerance grep guards and license
-            headers + the delivery-tooling suites (installer, cargo pin,
+            --workspace and its doctests + tippy + formatting + the
+            zero-tolerance grep guards and license headers + the
+            delivery-tooling suites (installer, cargo pin,
             export policy, release preflight, site sync, dev signing identity,
             the atpkg index and publish producers) + the atpkg end-to-end pack
             + the L0 temporal-safety gate + gate forge and gate cells-foreign
@@ -453,18 +464,20 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             skipped; a release cut refuses to claim a build number without one
             for the tree it cuts.
 --full    : both tiers — everything the default and --measure run — PLUS the
-            sealed fabric rung (aterm-link --features sealed, a transport no
+            sealed fabric build (aterm-link --features sealed, a transport no
             shipped binary carries), the lint of the required-features
             targets, the trust-mc / Kani BMC
-            harnesses *when those tools are installed* (skipped-not-failed when
-            absent — see docs/PROCESS.md), the cross-cell type-check (every
-            forge cell, each for its own triple; ~19 s warm and ~106 s cold
-            when the matrix had five cells) and the startup-comparison
+            harnesses when those tools are installed (a named skip when
+            absent), the cross-cell type-check (every forge cell, each for its
+            own triple) and the startup-comparison
             harness's own test, PLUS — last, run alone, ~10 min — the Codex
             live upgrade, which reads THIS machine's managed store and the
             vendor's current Codex, so it is not in the per-commit contract (a
             named skip when the store holds no older Codex). Its receipt is
-            filed as a merge-contract receipt AND as a MEASURE one.
+            filed as a merge-contract receipt AND as a MEASURE one. On a host
+            whose RAM cannot hold every workspace build at once, the release
+            build waits for the land tier's builds, and the run's first lines
+            say so and name the RAM that runs them together.
 --scope   : restrict the targo test/doctest/lint to `-p <crate>`; the guards
             and the socket smoke always run whole-tree (they are cheap and
             global).
@@ -512,31 +525,10 @@ JUDGED AGAINST MAIN: a run's reds are compared with main's receipt for its
             contract.
             A --measure run is judged by the absolute rule: nothing is
             inherited into the MEASURE tier.
---nearest-base: OPT-IN, OFF BY DEFAULT, pending the owner's decision
-            (docs/PROCESS.md §7); without it the base is exactly the
-            merge-base, as above. With it, and only when the merge-base has no
-            receipt that serves the run, the run is judged against the NEWEST
-            main commit before it that has one, within 200 commits and 24 h
-            of committer time (else the absolute rule, saying so). Through such
-            a base a red is inherited only when it is a failed test of a crate
-            (`-p <crate>`) none of whose files — nor any file of a crate it
-            builds on (its path dependencies, dev and build included, read from
-            main's manifests at the merge-base, none in a submodule) —
-            changed between the two, when no Cargo.toml anywhere (features
-            unify across the workspace), Cargo.lock, the toolchain pin,
-            .cargo/, a [patch] path nor the gate itself changed, and when none
-            of those crates names a path outside its own directory (a lexical
-            scan: `../`, `.parent()`, `CARGO_MANIFEST_DIR`, `\"git\"`, a
-            symlink out, …). A whole-row red (lint, guards, a
-            suite, a build) is never inherited through it, and anything the
-            gate cannot read is NEW. The `verify: base` line names both commits
-            and how many crates qualify, the verdict says why each inherited
-            red qualified, and the receipt adds `base-mode nearest <commit>`;
-            the release cutter reads it as any other receipt. A usage error
-            with --baseline or --measure.
-
 --snapshot <dir>: every run verifies a SNAPSHOT — a git worktree at
-            <root>-verify.noindex (or this dir) synced to this checkout's HEAD,
+            <main checkout>-verify.noindex (one per repository, shared by every
+            worktree's run, so its builds stay warm; or this dir) synced to this
+            checkout's HEAD,
             uncommitted diff and untracked files — so a pull, an edit or
             another build in this checkout cannot change what the run is
             verifying. A root git cannot open is COULD NOT RUN (exit 3). A
@@ -548,8 +540,9 @@ JUDGED AGAINST MAIN: a run's reds are compared with main's receipt for its
 --disk-floor <GiB>: before anything is built the run budgets what it will
             write and answers COULD NOT RUN (exit 3), with no receipt, when the
             volume holding its root has less free than max(cold footprint -
-            what a snapshot's build dirs already hold, warm growth) + a reserve
-            — {DISK_COLD_NEED} from empty build dirs. A snapshot's build dirs over
+            what a snapshot's build dirs already hold, warm growth) + the trust
+            check's in-flight bytes + a reserve — {DISK_COLD_NEED} from empty
+            build dirs. A snapshot's build dirs over
             {DISK_LANE_CAP} are removed first and the run is budgeted cold. The
             ladder's `verify: disk …` line prints the free space, the build dirs
             and the requirement with its terms. --disk-floor replaces the estimate
@@ -563,26 +556,41 @@ JUDGED AGAINST MAIN: a run's reds are compared with main's receipt for its
             invoking shell's, so the contract measures the same thing whoever
             typed the command. The run's notes say which.
 
---test-jobs <n>: how many test binaries the test stage runs at once (default
-            {TEST_JOBS}), each with RUST_TEST_THREADS divided between them; the
-            few that cannot share the machine run alone first with all of it.
-            cargo records how it would start each binary and the gate runs
+--test-jobs <n>: the most test binaries the test stage runs at once (default
+            {TEST_JOBS}); two always, more one at a time 2 s apart while
+            fewer than three quarters of the machine's cores read busy, and
+            never more than the host's memory holds beside the builds (2 on
+            8 GiB). Each gets the whole
+            RUST_TEST_THREADS, and the longest (by the last run's times) start
+            first. cargo records how it would start each binary and the gate runs
             them, printing their logs in cargo's order; 1 is one at a time.
 
---log <path> | --no-log: the gate keeps its own copy of the ladder under
-            <root>/.aterm-verify/logs (the newest 20); --log moves it and
+--log <path> | --no-log: the gate keeps its own copy of the ladder in the
+            snapshot's .aterm-verify/logs (the newest 20); --log moves it and
             --no-log keeps none.
 
---skip-gui-smoke: skip the windowed latency smoke, a MEASURE-tier stage (the
-            default gate does not run it). A NAMED skip: a --full run is refused
-            the merge-contract verdict, and no receipt it leaves says `measured
-            yes`.
+--no-windows: every stage that puts a window, a full-screen change or an
+            alert on the desktop — the redraw conformance, the objc drives
+            and (under --measure or --full) the gui smoke — answers a NAMED
+            skip (`--no-windows: opens a window on the desktop`) before it
+            builds or launches anything. An agent gating on a machine a person
+            is using runs this; the run is refused the merge-contract verdict
+            and no receipt it leaves says `measured yes`, so the windowed
+            stages run in a full claim on an idle desktop or when the owner
+            asks.
 
 --machine-lock-dir <dir>: one gate runs per machine — a second waits (up to
             three hours) on a per-user lock under ~/Library/Caches/aterm-verify
             (macOS) or the XDG cache directory. This moves the lock; the gate's
             own tests give each throwaway repo its own, so a fixture gate never
             queues behind the gate that is running it.
+
+--compile-qos <utility|inherited>: the tier every compile-only child runs at.
+            utility (the default) lets a person's typing win the CPU from the
+            gate's compiles; the children that RUN code keep the gate's own
+            tier either way. inherited, with --measure only, is a release's
+            MEASURE run (tools/release.sh passes it): its fat-LTO build is the
+            release's critical path and must not yield to peers' builds.
 
 A skip is an honest \"tool absent\", never a silent pass: skips are counted and
 NAMED, and any run that skipped a stage or narrowed its scope is refused the
@@ -598,7 +606,7 @@ exit 0  nothing NEW failed: everything that ran was green, or every red was
         inherited from main's receipt (the verdict says which)
 exit 1  a gate FAILED — a real finding about the tree (against main: a NEW red)
 exit 2  usage error
-exit 3  COULD NOT RUN — the environment is broken; nothing was decided
+exit 3  COULD NOT RUN — nothing was decided; each row says why
 ";
 
 /// A `--disk-floor` value: a whole number of GiB, nothing else — an empty or
@@ -720,6 +728,48 @@ mod tests {
                 ParseError::NeedsPath("--machine-lock-dir".into()),
             ),
             (vec!["--log", "/l", "--no-log"], ParseError::LogAndNoLog),
+        ] {
+            assert_eq!(parse(bad.iter().copied()), Err(err), "{bad:?}");
+        }
+    }
+
+    /// `--compile-qos`: utility by default and when named; `inherited` in both
+    /// spellings with `--measure` (the release's MEASURE run, tools/release.sh);
+    /// refused without `--measure`, and a missing or unknown tier is a usage
+    /// error, never the default.
+    #[test]
+    fn the_compile_qos_is_utility_unless_a_measure_run_names_inherited() {
+        use crate::exec::CompileQos;
+        assert_eq!(ok(&[]).compile_qos, CompileQos::Utility);
+        assert_eq!(
+            ok(&["--compile-qos", "utility"]).compile_qos,
+            CompileQos::Utility
+        );
+        assert_eq!(
+            ok(&["--measure", "--compile-qos", "inherited"]).compile_qos,
+            CompileQos::Inherited
+        );
+        assert_eq!(
+            ok(&["--compile-qos=inherited", "--measure"]).compile_qos,
+            CompileQos::Inherited
+        );
+        for (bad, err) in [
+            (
+                vec!["--compile-qos", "inherited"],
+                ParseError::CompileQosInheritedNeedsMeasure,
+            ),
+            (
+                vec!["--full", "--compile-qos=inherited"],
+                ParseError::CompileQosInheritedNeedsMeasure,
+            ),
+            (
+                vec!["--measure", "--compile-qos"],
+                ParseError::CompileQosNeedsTier,
+            ),
+            (
+                vec!["--measure", "--compile-qos=background"],
+                ParseError::CompileQosNeedsTier,
+            ),
         ] {
             assert_eq!(parse(bad.iter().copied()), Err(err), "{bad:?}");
         }
@@ -872,7 +922,7 @@ mod tests {
             full.baseline && full.mode == Mode::Full,
             "either tier may baseline"
         );
-        assert!(ok(&["--baseline", "--skip-gui-smoke"]).baseline);
+        assert!(ok(&["--baseline", "--no-windows"]).baseline);
         for narrowed in [
             vec!["--baseline", "--scope", "aterm-grid"],
             vec!["--scope=aterm-grid", "--baseline"],
@@ -897,30 +947,33 @@ mod tests {
         );
     }
 
-    /// `--nearest-base` is OPT-IN: off unless typed, a flag and never an
-    /// environment variable, and a usage error where there is no base to be
-    /// near (`--baseline`, `--measure`). The help says it is opt-in pending
-    /// the owner's decision.
+    /// `--no-windows` is off unless typed, composes with every mode and
+    /// narrowing, and is the ONE switch: `--skip-gui-smoke`, which it
+    /// replaced, is an unknown argument, never a quiet synonym.
     #[test]
-    fn the_nearest_base_is_opt_in_and_only_where_a_base_is_resolved() {
-        assert!(!ok(&[]).nearest_base, "off unless asked");
-        assert!(ok(&["--nearest-base"]).nearest_base);
-        assert!(ok(&["--full", "--nearest-base"]).nearest_base);
-        assert!(ok(&["--nearest-base", "--changed"]).nearest_base);
-        for (args, other) in [
-            (vec!["--nearest-base", "--baseline"], "--baseline"),
-            (vec!["--measure", "--nearest-base"], "--measure"),
+    fn no_windows_is_one_opt_in_flag_and_the_old_spelling_is_gone() {
+        assert!(!ok(&[]).no_windows, "off unless asked");
+        for args in [
+            vec!["--no-windows"],
+            vec!["--full", "--no-windows"],
+            vec!["--no-windows", "--measure"],
+            vec!["--changed", "--no-windows"],
+            vec!["--no-windows", "--scope", "aterm-grid"],
         ] {
-            let err = parse(args.clone()).expect_err("no base to be near");
-            assert_eq!(err, ParseError::NearestBaseAbsolute(other), "{args:?}");
-            assert!(err.message().contains(other), "{}", err.message());
+            assert!(ok(&args).no_windows, "{args:?}");
         }
+        let a = ok(&["--no-windows", "--full"]);
+        assert_eq!((a.mode, a.scope, a.changed), (Mode::Full, None, false));
+        assert_eq!(
+            parse(["--skip-gui-smoke"]),
+            Err(ParseError::Unknown("--skip-gui-smoke".into()))
+        );
         let help = usage();
         assert!(
-            help.contains("--nearest-base: OPT-IN, OFF BY DEFAULT, pending the owner's decision"),
-            "{help}"
+            help.contains(crate::plan::NO_WINDOWS_REASON),
+            "the help quotes the skip's own words: {help}"
         );
-        assert!(help.contains("within 200 commits and 24 h"), "{help}");
+        assert!(!help.contains("--skip-gui-smoke"), "{help}");
     }
 
     #[test]
@@ -1002,6 +1055,7 @@ mod tests {
             "--scope <crate>",
             "--changed",
             "--base",
+            "--no-windows",
         ] {
             assert!(text.contains(flag), "usage must document {flag}");
         }

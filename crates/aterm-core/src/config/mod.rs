@@ -2,10 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration management for aterm-core terminals.
-//!
-//! This module provides runtime configuration hot-reload support, allowing
-//! integrators to change terminal settings without recreating the terminal.
+//! Runtime terminal configuration: settings a host changes without
+//! recreating the terminal.
 //!
 //! # Example
 //!
@@ -15,16 +13,12 @@
 //!
 //! let mut term = Terminal::new(24, 80);
 //!
-//! // Create a new configuration
 //! let mut config = TerminalConfig::default();
 //! config.scrollback_limit = Some(50_000);
 //! config.cursor_style = CursorStyle::SteadyBar;
 //! config.cursor_blink = false;
 //!
-//! // Apply configuration changes
 //! let changes = term.apply_config(&config);
-//!
-//! // Check what changed
 //! for change in changes {
 //!     println!("Changed: {:?}", change);
 //! }

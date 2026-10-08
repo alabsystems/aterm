@@ -39,10 +39,8 @@ const PROBES: &[char] = &[
 
 #[test]
 fn a_sealed_system_generation_never_builds_or_queries_the_coverage_index() {
-    let Some(mut r) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     assert!(
         !aterm_render::font_coverage_index_built(),
         "precondition: building a renderer must not build the coverage index"

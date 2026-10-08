@@ -3,11 +3,11 @@
 
 //! SHA-256 of a file. Linux streams bytes through the existing ring dependency,
 //! so native update verification does not depend on Perl's optional `shasum`.
-//! Other Unix hosts use `/usr/bin/shasum`; Windows uses `certutil -hashfile`.
+//! Other Unix hosts use `/usr/bin/shasum`; Windows uses `certutil -hashfile`,
+//! built through `aterm_uds::spawnfd::command` so a caller with no console (the
+//! window) does not flash one for it.
 
 use std::path::Path;
-#[cfg(not(target_os = "linux"))]
-use std::process::Command;
 
 /// Lowercase SHA-256 of the complete file. Native Linux reads the file directly;
 /// other hosts use their existing system hash command. Callers establish path
@@ -34,38 +34,20 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
             }
             context.update(&buffer[..count]);
         }
-        let digest = context.finish();
-        Ok(digest
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect())
+        Ok(aterm_codec::hex::encode_lower(context.finish().as_ref()))
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        let out = Command::new("/usr/bin/shasum")
-            .args(["-a", "256"])
-            .arg(path)
+        let out = shasum_command(path)
             .output()
             .map_err(|e| format!("spawn shasum: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "shasum failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        stdout
-            .split_whitespace()
-            .next()
-            .map(|h| h.to_ascii_lowercase())
-            .ok_or_else(|| "shasum produced no digest".to_string())
+        shasum_digest(&out)
     }
 
     #[cfg(windows)]
     {
-        let out = Command::new("certutil")
+        let out = aterm_uds::spawnfd::command("certutil")
             .arg("-hashfile")
             .arg(path)
             .arg("SHA256")
@@ -88,9 +70,41 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
                     .collect::<String>()
                     .to_ascii_lowercase()
             })
-            .find(|l| l.len() == 64 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+            .find(|l| aterm_codec::hex::is_hex(l, 64))
             .ok_or_else(|| "certutil produced no digest".to_string())
     }
+}
+
+/// The `shasum -a 256 <path>` [`sha256_file`] runs, for a caller that must bound
+/// it: the update checker hashes a downloaded container on its own thread while it
+/// holds the check lane and the stage lock, and runs this through its bounded
+/// helper (`aterm-update`'s `output_within`), so a read that never returns (a
+/// wedged volume) cannot keep both for good. [`shasum_digest`] reads its output.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[must_use]
+pub fn shasum_command(path: &Path) -> aterm_uds::spawnfd::Command {
+    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/shasum");
+    cmd.args(["-a", "256"]).arg(path);
+    cmd
+}
+
+/// The lowercase digest a finished [`shasum_command`] printed, or its refusal.
+// Skip: from_utf8_lossy/format over `shasum` OUTPUT, as `sha256_file` above.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn shasum_digest(out: &std::process::Output) -> Result<String, String> {
+    if !out.status.success() {
+        return Err(format!(
+            "shasum failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .split_whitespace()
+        .next()
+        .map(|h| h.to_ascii_lowercase())
+        .ok_or_else(|| "shasum produced no digest".to_string())
 }
 
 #[cfg(test)]

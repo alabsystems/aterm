@@ -9,8 +9,6 @@
 //! sessions. This module contains the canonical deny-prefix list used by
 //! all PTY spawn paths (Swift, Rust aterm-pty, aterm-core, Alacritty bridge),
 //! and public callers reach it through `aterm_types::domain`.
-//!
-//! Part of #5400.
 
 /// Prefixes for environment variables that should not leak into child shells.
 ///
@@ -26,7 +24,7 @@ pub const ENV_DENY_PREFIXES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// Recursion-provisioning env vars (Item 4): the contract by which a launching
+// Recursion-provisioning env vars: the contract by which a launching
 // aterm hands a child its fabric identity + per-op capability edges, so an outer
 // agent automatically holds read/write/signal authority over the inner session
 // it spawned. ALL of these are deny-listed (below) so an INHERITED copy never
@@ -42,14 +40,11 @@ pub const ENV_SESSION_ID: &str = "ATERM_SESSION_ID";
 /// preminted edges bind to it, so a connection presenting a stale edge token must
 /// match this nonce to authorize.
 ///
-/// CAVEAT (honest scope — see audit finding F2): on the RECURSION path this nonce
-/// is PINNED, not fresh. The child adopts the injected constant, so a child that
-/// exits and is re-exec'd in the SAME shell (re-inheriting this env) adopts the
-/// IDENTICAL nonce — the cross-relaunch protection the bare `LaunchNonce` doc
-/// describes does NOT hold here. The same-uid trust boundary + edge-token secrecy
-/// are what bound authority on this path; the nonce is a binding key, not a
-/// relaunch guard. (A true relaunch guard would require the child to mint a FRESH
-/// nonce at adopt time and re-handshake it to the parent.)
+/// CAVEAT: on the recursion path this nonce is PINNED, not fresh: a child
+/// re-exec'd in the same shell adopts the identical nonce, so the cross-relaunch
+/// protection `LaunchNonce` describes does NOT hold here. The same-uid boundary
+/// and edge-token secrecy bound authority; the nonce is a binding key, not a
+/// relaunch guard.
 pub const ENV_LAUNCH_NONCE: &str = "ATERM_LAUNCH_NONCE";
 /// The parent session id (`s-<20hex>`) — becomes the `src` of the child's edges.
 pub const ENV_PARENT_SESSION_ID: &str = "ATERM_PARENT_SESSION_ID";
@@ -60,33 +55,24 @@ pub const ENV_PARENT_SESSION_ID: &str = "ATERM_PARENT_SESSION_ID";
 /// Deny-listed like the other provisioning vars: an inherited copy must never
 /// survive a hop, or a fresh session would answer for its parent's birth.
 pub const ENV_MUX_BASE: &str = "ATERM_MUX_BASE";
-/// Path to the 0600 file holding the parent→child edge-token SECRETS (audit
-/// finding F1). The bearer tokens are NOT placed in env — only this PATH is, which
-/// is non-secret: a same-uid peer that cannot read 0600 files (a sandboxed
-/// confused-deputy) cannot open it, restoring the same-uid/0600-file trust
-/// boundary that env-inherited tokens would have defeated. File format: three lines
+/// Path to the 0600 file holding the parent→child edge-token SECRETS. Only this
+/// non-secret PATH is in env: a same-uid peer that cannot read 0600 files (a
+/// sandboxed confused deputy) cannot open it. File format: three lines
 /// `read <64hex>` / `write <64hex>` / `signal <64hex>`.
 ///
-/// LIFECYCLE (F1, revised): the file PERSISTS for the parent session — the child
-/// reads it NON-destructively at startup and does NOT delete it. This is required
-/// for the SAME-SHELL relaunch: this var is deny-listed (below), so it is never
-/// INHERITED across a new aterm hop, but a child aterm that exits and is re-exec'd
-/// in the SAME shell re-inherits this PINNED path and must re-read the same secrets
-/// to re-install the parent edges. A consume-once delete broke every such relaunch
-/// (the outer's `@child` proxy answered `ERR auth` after the first inner exited).
-/// The secret now lives on disk for the parent's session lifetime — the SAME window
-/// as the per-launch AUTH token file (`aterm-<pid>.token`), also 0600 in the same
-/// 0700 same-uid dir — so the trust boundary (same-uid + 0600) is unchanged. The
-/// PARENT owns removal (on child/session teardown); a crash leftover is inert (its
-/// tokens bind a random `(sid, nonce)` never reissued, so it authorizes nothing).
-/// Deny-listing keeps cross-hop inheritance stripped; only the same-shell relaunch
-/// re-reads it.
+/// LIFECYCLE: the file PERSISTS for the parent session; the child reads it
+/// non-destructively and never deletes it, because a child re-exec'd in the same
+/// shell re-inherits this path and must re-read the secrets to re-install the
+/// parent edges (a consume-once delete made the outer's `@child` proxy answer
+/// `ERR auth` after the first inner exited). It lives as long as, and beside,
+/// the per-launch auth token file (`aterm-<pid>.token`, 0600 in a 0700 dir). The
+/// PARENT removes it; a crash leftover is inert (its tokens bind a random
+/// `(sid, nonce)` never reissued).
 pub const ENV_EDGE_TOKENS: &str = "ATERM_EDGE_TOKENS";
-/// The RETIRED env channel for a `ReadScreen` `EdgeToken` (`<64hex>`). No aterm
-/// writes or reads it any more — the secrets travel only through the
-/// [`ENV_EDGE_TOKENS`] file (audit finding F1; the env fallback was deleted
-/// 2026-09-25) — but a value an older aterm injected is still a bearer secret,
-/// so the name stays deny-listed and never propagates past one hop.
+/// The RETIRED env channel for a `ReadScreen` `EdgeToken` (`<64hex>`). Nothing
+/// reads it (the secrets travel only in the [`ENV_EDGE_TOKENS`] file), but a
+/// value an older aterm injected is still a bearer secret, so the name stays
+/// deny-listed.
 pub const ENV_EDGE_READ: &str = "ATERM_EDGE_READ";
 /// The retired env channel for a `WriteInput` `EdgeToken`; see [`ENV_EDGE_READ`].
 pub const ENV_EDGE_WRITE: &str = "ATERM_EDGE_WRITE";
@@ -105,10 +91,9 @@ pub const ENV_OBSERVE_SESSION_ID: &str = "ATERM_OBSERVE_SESSION_ID";
 /// The shell program THIS TAB runs, as the window resolved it for the spawn
 /// (Windows: an absolute path, e.g. `C:\Windows\system32\cmd.exe`), handed to
 /// every shell tab the window spawns so a CLI typed in the tab can report the
-/// tab's own shell. `aterm doctor` / `show-config` cannot see the window's
-/// per-launch `--shell` flag: measured 2026-09-27 on 0.95.0, inside a window
-/// started with `--shell cmd`, both named pwsh — the default a new window
-/// would get — as "the window's shell". Deny-listed (below) so it describes
+/// tab's own shell: `aterm doctor` / `show-config` cannot see the window's
+/// per-launch `--shell` flag (under `--shell cmd` both named pwsh, a new
+/// window's default). Deny-listed (below) so it describes
 /// only the tab it was handed to: a `-e` session gets none, and an inherited
 /// copy never survives a hop into a nested window's tabs.
 pub const ENV_TAB_SHELL: &str = "ATERM_TAB_SHELL";
@@ -121,26 +106,12 @@ pub const ENV_TAB_SHELL: &str = "ATERM_TAB_SHELL";
 /// INHERITED across a hop (each direct child is re-injected a fresh set; see the
 /// consts above and `build_child_env`), and the retired edge-secret names so a
 /// value an older aterm injected stops at the hop.
-///
-/// The launch KNOBS that used to sit here — `ATERM_CONTAINMENT_MODE`, the
-/// control-socket selectors (now `--control-sock`/`--no-control-sock`), the
-/// network listener's `ATERM_NET_LISTEN`/`_CERT`/`_KEY` — are gone (2026-09-24):
-/// each is a launch flag or an aterm.toml key now, read by nothing from the
-/// environment, so there is no decision of a nested aterm to protect.
 pub const ENV_DENY_VARS: &[&str] = &[
     // The update DEVELOPMENT SEAMS (`dev_seam!`): never inherit into child SHELLS,
     // for the same one-hop reason as the provisioning vars below — an aterm launched from an
     // aterm shell makes its own update decisions, never under a QA seam the parent's
-    // environment happened to carry. The 2026-09-01 field bug was exactly this shape:
-    // an inherited-but-empty selector rerouted the updater of a daily driver for its
-    // whole process lifetime. A shipped binary reads none of these (they compile only
-    // in a dev build); a dev build still does, so they still stop at the hop.
-    //
-    // The update KNOBS that used to sit here — `ATERM_NO_AUTO_UPDATE`,
-    // `ATERM_NO_AUTO_APPLY`, `ATERM_NO_SEAMLESS_UPDATE`, `ATERM_UPDATE_INTERVAL_SECS`,
-    // `ATERM_UPDATE_OWNER`/`_REPO` — are gone (2026-09-23, R2: "NOT ENV VARS those are
-    // for development"). Nothing reads them, so there is no decision of a nested aterm
-    // to protect; `[update]` in aterm.toml is the one spelling.
+    // environment happened to carry (an inherited-but-empty selector once rerouted a
+    // daily driver's updater for its whole lifetime). Only a dev build reads these.
     "ATERM_DEBUG_SEAMLESS_REEXEC",
     "ATERM_DEBUG_RELAUNCH_NUDGE",
     "ATERM_DEBUG_STATUS_BARS",
@@ -158,15 +129,19 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_UPDATE_ROOT",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
-    // RETIRED CREDENTIALS STAY DENIED (2026-09-14 audit LT-7; kept 2026-09-23). Nothing
-    // reads `ATERM_UPDATE_TOKEN` or `ATPKG_TOKEN` any more, but that was never the only
-    // reason to stop them at the hop: the value is a SECRET. The old install.sh told
-    // people to export the first for the app (`launchctl setenv`), and a token set at
-    // GUI launch reached every child process of every shell — every agent and program
-    // run in a tab. Deleting a knob does not delete the export already sitting in a
-    // launchd environment or an rc file, so dropping these names from this list would
-    // have handed the secret to every shell of every machine that followed the old
-    // instructions. A token a shell should carry belongs in that shell's own rc.
+    // The render epoch's class seam (resize_epoch.rs `EpochBook::class`): the lane's
+    // stand-in reads as the agent class, so a nested aterm never inherits it.
+    "ATERM_NUDGE_CLASS",
+    // A launched successor that dies before its rendezvous dial
+    // (handoff_rendezvous.rs `debug_die_before_dial`): a nested aterm's update
+    // applies are its own, never ones whose successors die by its parent's seam.
+    // The successor itself still receives it: LaunchServices merges the launching
+    // process's environment, and no child shell stands between them.
+    "ATERM_DEBUG_DIE_BEFORE_DIAL",
+    // RETIRED CREDENTIALS STAY DENIED. Nothing reads these, but the value is a SECRET
+    // that an old install.sh told people to export (`launchctl setenv`); that export
+    // outlives the knob, and without this entry would reach every program in every
+    // tab. A token a shell should carry belongs in that shell's own rc.
     "ATERM_UPDATE_TOKEN",
     "ATPKG_TOKEN",
     // Recursion provisioning (re-injected fresh per direct child via env_add).
@@ -175,10 +150,7 @@ pub const ENV_DENY_VARS: &[&str] = &[
     ENV_PARENT_SESSION_ID,
     ENV_MUX_BASE,
     ENV_EDGE_TOKENS,
-    // The RETIRED edge-secret env channel (2026-09-25): nothing injects or reads
-    // these any more — the secrets travel only in the `ENV_EDGE_TOKENS` file — but
-    // a value an older aterm injected is still a bearer secret, so, like the
-    // retired credentials above, the names stay denied.
+    // The RETIRED edge-secret env channel: still bearer secrets (see ENV_EDGE_READ).
     ENV_EDGE_READ,
     ENV_EDGE_WRITE,
     ENV_EDGE_SIGNAL,
@@ -196,25 +168,15 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_LINK_BROKER",
     "ATERM_LINK_CAP_FILE",
     "ATERM_LINK_FLEET",
-    // And the LAUNCH knob itself (A3), for the sharper version of the same
-    // reason: an inner aterm that inherited `$ATERM_FABRIC_COMMAND` would start
-    // its own bridge from the OUTER instance's command line — the outer node's
-    // id, the outer node's cap file, the outer node's state dir — and hand it
-    // `Scope::Bridge` over the INNER instance's sessions. Two bridges publishing
-    // as one node, each believing it owns the incarnation.
+    // And the fabric LAUNCH knob: an inner aterm that inherited it would start a
+    // second bridge from the OUTER node's command line, cap file and state dir,
+    // publishing as the outer node over the inner's sessions.
     //
-    // THIS CLOSES THE ENV ROUTE ONLY, AND THE ENV ROUTE IS THE OVERRIDE, NOT THE
-    // ORDINARY ONE. `fabric_launch::configured_command` reads this variable
-    // first and falls back to `[fabric] command` in the per-user config file,
-    // which a nested aterm reads identically because it is the SAME file — so a
-    // nested instance still launches a second `aterm-link serve` from the outer
-    // node's command line, cap file and state dir, and `StateDir::open` takes no
-    // lock that would refuse it. A deny-list entry is not a gate: the gate for
-    // the config route would have to be in the launcher (spawn only from a ROOT
-    // instance — no `ATERM_PARENT_SESSION_ID` — the way the net-listen selectors
-    // are gated by never being inherited) or in the state dir (an exclusive
-    // lock). Neither exists yet; this entry is named honestly rather than read
-    // as closing a door that is still open.
+    // THIS CLOSES THE ENV ROUTE ONLY. `fabric_launch::configured_command` falls
+    // back to `[fabric] command` in the per-user config, which a nested aterm
+    // reads identically, and `StateDir::open` takes no lock that would refuse a
+    // second bridge. Closing that route needs a launcher gate (spawn only from a
+    // ROOT instance) or an exclusive state-dir lock; neither exists yet.
     "ATERM_FABRIC_COMMAND",
 ];
 
@@ -254,9 +216,7 @@ pub fn is_ai_env_var(key: &str) -> bool {
 /// let through unread. Every exact deny-listed name is ASCII and U+FFFD never
 /// equals one; but the [`ENV_DENY_PREFIXES`] match a key's leading bytes, and a
 /// lossy conversion keeps every ASCII byte, so `ANTHROPIC_\xffX` keeps its
-/// `ANTHROPIC_` and is denied. (Both seams used to pass every non-UTF-8 key
-/// because "every deny-listed name is ASCII" — true of the names, not of the
-/// prefixes; closed 2026-09-27.)
+/// `ANTHROPIC_` and is denied.
 ///
 /// Windows environment names are case-insensitive, so there the key is
 /// ASCII-uppercased first (every deny-listed name and prefix is uppercase
@@ -320,32 +280,30 @@ mod tests {
         assert!(!is_ai_env_var("ATERM_UNSET_ZDOTDIR"));
     }
 
-    /// OSC 133/633 capability nonce (#7937 F01-2, #7960, #8006) must survive
-    /// environment sanitization so the shell-integration preamble can emit
+    /// The OSC 133/633 capability nonce must survive sanitization so the
+    /// shell-integration preamble can emit
     /// `id=<hex>` on every 133/633 sequence.
     #[test]
     fn test_aterm_shell_nonce_survives_sanitization() {
         assert!(!is_ai_env_var("ATERM_SHELL_NONCE"));
     }
 
-    /// The reroute seam's two variables (`atpkg::reroute`, 2026-09-07) must reach
-    /// EVERY child: `ATERM_REROUTE_DIR` is what the shell integration re-asserts
-    /// first on PATH after the rc files ran; `__ATERM_REROUTE_PASSTHROUGH` is the
-    /// internal marker `aterm --no-reroute` establishes for its session — an upstream
-    /// `cargo` exec'd under it hands it to its own `rustc`/`rustdoc` spawns, or they
-    /// are announced again. A deny-list hit here would silently strip the escape from
-    /// a `--no-reroute` session's children — the update seams above ARE denied by
-    /// name, so this pin keeps the family from being deny-listed by prefix.
+    /// The reroute seam's two variables (`atpkg::reroute`) must reach EVERY
+    /// child: `ATERM_REROUTE_DIR` is re-asserted first on PATH after the rc files
+    /// ran; `__ATERM_REROUTE_PASSTHROUGH` is `aterm --no-reroute`'s marker, which
+    /// an upstream `cargo` hands to its own `rustc`/`rustdoc` spawns. The update
+    /// seams ARE denied by name, so this pin keeps the `ATERM_*` family from being
+    /// deny-listed by prefix, which would strip `--no-reroute` from its children.
     #[test]
     fn test_reroute_seam_vars_survive_sanitization() {
         assert!(!is_ai_env_var("__ATERM_REROUTE_PASSTHROUGH"));
         assert!(!is_ai_env_var("ATERM_REROUTE_DIR"));
     }
 
-    /// Item 4/5: the recursion-provisioning identity/edge vars are denied by
-    /// exact name, so an INHERITED copy never leaks past one hop (each direct
-    /// child is re-injected a fresh set) — and so are the retired edge-secret
-    /// names, which nothing injects any more but an older aterm did.
+    /// The recursion-provisioning identity/edge vars (and the retired
+    /// edge-secret names) are denied by exact name, so an INHERITED copy never
+    /// leaks past one hop. `ATERM_EDGE_TOKENS` stays denied although its file
+    /// persists for the session: only a same-shell relaunch re-reads it.
     #[test]
     fn test_recursion_provisioning_vars_are_denied_by_name() {
         for v in [
@@ -365,16 +323,9 @@ mod tests {
         assert!(!is_ai_env_var("ATERM_SHELL_INTEGRATION_DIR"));
     }
 
-    /// The update development seams are denied by exact name (2026-09-01): a
-    /// nested aterm launched from an aterm shell makes its own update decisions —
-    /// no inherited QA seam. Each name here has a reader in a dev build (`dev_seam!`):
-    /// debug_seamless_reexec_armed (ATERM_DEBUG_SEAMLESS_REEXEC), relaunch_nudge_seam
-    /// (ATERM_DEBUG_RELAUNCH_NUDGE), the status-bar seeding (ATERM_DEBUG_STATUS_BARS),
-    /// the strain row's fake load (ATERM_DEBUG_STRAIN), the clipboard's stand-in file
-    /// (ATERM_DEBUG_CLIPBOARD_FILE),
-    /// seal_guard's updates_root (ATERM_UPDATE_ROOT) and the handoff deadlines
-    /// (ATERM_HANDOFF_READY_TIMEOUT_MS, ATERM_HANDOFF_PROOF_TIMEOUT_MS). The retired
-    /// update knobs are NOT listed: nothing reads them any more.
+    /// The development seams (`dev_seam!`) and the retired credentials are
+    /// denied by exact name: a nested aterm never runs under its parent's QA seam,
+    /// and a token an old export still carries never reaches a tab.
     #[test]
     fn test_update_contract_vars_are_denied_by_name() {
         for v in [
@@ -387,62 +338,17 @@ mod tests {
             "ATERM_UPDATE_ROOT",
             "ATERM_HANDOFF_READY_TIMEOUT_MS",
             "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
+            "ATERM_DEBUG_DIE_BEFORE_DIAL",
+            "ATERM_NUDGE_CLASS",
         ] {
             assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
         }
-        for retired in [
-            "ATERM_NO_AUTO_UPDATE",
-            "ATERM_NO_AUTO_APPLY",
-            "ATERM_NO_SEAMLESS_UPDATE",
-            "ATERM_UPDATE_INTERVAL_SECS",
-            "ATERM_UPDATE_OWNER",
-            "ATERM_UPDATE_REPO",
-        ] {
-            assert!(
-                !ENV_DENY_VARS.contains(&retired),
-                "{retired} is read by nothing, so it has no inheritance to stop"
-            );
-        }
-        // …except a CREDENTIAL: read by nothing, and still a secret that an old
-        // `launchctl setenv` or rc export would otherwise hand to every tab's shell and
-        // every program run there (audit LT-7). Removing a name from this list is not a
-        // no-op when its value is a token.
         for credential in ["ATERM_UPDATE_TOKEN", "ATPKG_TOKEN"] {
             assert!(
                 is_ai_env_var(credential),
                 "{credential} is a retired CREDENTIAL and must stay deny-listed"
             );
         }
-    }
-
-    /// The launch knobs retired on 2026-09-24 are read by nothing, so they have
-    /// no inheritance to stop: none stays on the list.
-    #[test]
-    fn retired_launch_knobs_are_not_deny_listed() {
-        for retired in [
-            "ATERM_CONTAINMENT_MODE",
-            "ATERM_CONTROL_SOCK",
-            "ATERM_NO_CONTROL_SOCK",
-            "ATERM_NET_LISTEN",
-            "ATERM_NET_CERT",
-            "ATERM_NET_KEY",
-        ] {
-            assert!(!ENV_DENY_VARS.contains(&retired), "{retired}");
-        }
-    }
-
-    /// F1 (revised): the edge-token file now PERSISTS for the session so a child
-    /// re-launched in the SAME shell can re-read it. That MUST NOT relax the
-    /// inheritance strip: `ATERM_EDGE_TOKENS` stays deny-listed so a NEW aterm hop
-    /// never inherits the path — only a same-shell relaunch (which re-inherits the
-    /// pinned var because no new aterm sanitized it) re-reads it.
-    #[test]
-    fn test_edge_tokens_path_still_stripped_on_inheritance() {
-        assert!(
-            is_ai_env_var(ENV_EDGE_TOKENS),
-            "ATERM_EDGE_TOKENS must stay deny-listed even though the file persists \
-             for the session (cross-hop inheritance must still be stripped)"
-        );
     }
 
     #[test]

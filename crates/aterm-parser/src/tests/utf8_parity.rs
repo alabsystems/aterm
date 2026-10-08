@@ -176,3 +176,57 @@ fn incomplete_trailing_lead_after_complete_char_matches_bytewise() {
         vec!['中', char::REPLACEMENT_CHARACTER, 'A']
     );
 }
+
+/// Ill-formed UTF-8 is replaced with one U+FFFD per MAXIMAL SUBPART (Unicode
+/// §3.9, "U+FFFD Substitution of Maximal Subparts", which the WHATWG Encoding
+/// Standard's UTF-8 decoder mandates and `String::from_utf8_lossy` implements):
+/// a byte that can begin no well-formed sequence (`C0`, `C1`, `F5..=FF`, a stray
+/// continuation) is one subpart on its own, and a second byte outside its lead's
+/// range (`E0` takes `A0..=BF`, `ED` `80..=9F`, `F0` `90..=BF`, `F4` `80..=8F`)
+/// ends the subpart before it. Taking any `80..=BF` as a continuation would
+/// draw `E0 80 80` as one cell where every other decoder draws three.
+///
+/// The oracle is `from_utf8_lossy` over every printable-or-high byte string,
+/// fed whole and one byte at a time (a trailing `Z` flushes a pending lead).
+#[test]
+fn ill_formed_utf8_is_replaced_per_maximal_subpart() {
+    let cases: [&[u8]; 10] = [
+        b"\xC0\x80Z",                         // overlong 2-byte lead: never valid
+        b"\xC1\xBFZ",                         // overlong 2-byte lead: never valid
+        b"\xE0\x80\x80Z",                     // overlong 3-byte: E0 needs A0..=BF
+        b"\xED\xA0\x80Z",                     // surrogate U+D800: ED needs 80..=9F
+        b"\xF0\x80\x80\x80Z",                 // overlong 4-byte: F0 needs 90..=BF
+        b"\xF4\x90\x80\x80Z",                 // U+110000: F4 needs 80..=8F
+        b"\xF5\x80\x80\x80Z",                 // F5 begins nothing
+        b"\xE0\x80AZ",                        // a broken overlong prefix, then ASCII
+        b"\xED\xA0\xBD\xED\xB8\x80Z",         // CESU-8 U+1F600 (two surrogates)
+        b"\xE4\xB8\xAD\xE0\x9F\xE6\x96\x87Z", // 中, a broken prefix, 文
+    ];
+    for bytes in cases {
+        let want: Vec<char> = String::from_utf8_lossy(bytes).chars().collect();
+        assert_eq!(print_whole(bytes), want, "whole {bytes:02x?}");
+        assert_eq!(print_byte_by_byte(bytes), want, "byte by byte {bytes:02x?}");
+    }
+
+    let mut state = 0x5DEE_CE66_D1CE_4E5Bu64;
+    for _ in 0..20_000 {
+        let mut bytes = Vec::new();
+        for _ in 0..(state % 12) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Printable ASCII or a high byte: no C0 control and no DEL, which
+            // the parser executes or ignores rather than prints.
+            let b = (state >> 24) as u8;
+            bytes.push(if b < 0x20 || b == 0x7F { b | 0x80 } else { b });
+        }
+        bytes.push(b'Z');
+        let want: Vec<char> = String::from_utf8_lossy(&bytes).chars().collect();
+        assert_eq!(print_whole(&bytes), want, "whole {bytes:02x?}");
+        assert_eq!(
+            print_byte_by_byte(&bytes),
+            want,
+            "byte by byte {bytes:02x?}"
+        );
+    }
+}

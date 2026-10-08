@@ -310,7 +310,10 @@ impl ScrollbackStorage {
     /// Lines DROPPED by memory-pressure eviction — real retention loss, the
     /// out-of-band truncation signal (audit E10a). The disk-backed store
     /// relieves pressure by SPILLING warm blocks to its disk cold tier
-    /// (retained, not lost), so it reports 0 here.
+    /// (retained, not lost), so it reports 0 here. The in-memory store also
+    /// counts the lines of a quarantined warm block, whose rows stay in
+    /// [`line_count`](Self::line_count) as blank rows when older history sits
+    /// before them, so the two can overlap.
     #[must_use]
     pub fn pressure_evicted_lines(&self) -> u64 {
         match self {

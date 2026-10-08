@@ -35,15 +35,16 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
-
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
+use crate::{headless_boot, launch_isolation};
 
 use headless_boot::MAX_SOCK_PATH;
+
+/// How long a wait for something that MUST happen — a reply, a marker going —
+/// may take before it is read as a hang (AGENTS.md: a hang detector is a
+/// minute, never a latency budget).
+const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// One scratch world every instance of the test shares; removed on drop.
 struct World(PathBuf);
@@ -151,9 +152,7 @@ fn markers_of(root: &Path, pid: u32) -> Vec<String> {
 fn request(sock: &Path, line: &str) -> String {
     let token = std::fs::read_to_string(format!("{}.token", sock.display())).unwrap();
     let mut stream = UnixStream::connect(sock).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    stream.set_read_timeout(Some(HANG)).unwrap();
     write!(stream, "AUTH {}\n{line}\n", token.trim()).unwrap();
     let mut reply = String::new();
     BufReader::new(&stream).read_line(&mut reply).unwrap();
@@ -164,9 +163,7 @@ fn request(sock: &Path, line: &str) -> String {
 fn first_sid(sock: &Path) -> String {
     let token = std::fs::read_to_string(format!("{}.token", sock.display())).unwrap();
     let mut stream = UnixStream::connect(sock).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    stream.set_read_timeout(Some(HANG)).unwrap();
     write!(stream, "AUTH {}\nsessions\n", token.trim()).unwrap();
     let mut reader = BufReader::new(&stream);
     let mut status = String::new();
@@ -181,11 +178,8 @@ fn first_sid(sock: &Path) -> String {
 
 /// Wait until `pred` holds (a bounded poll on an EVENT, not a sleep verdict).
 fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !pred() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let seen = aterm_spec::wait::within(HANG, Duration::from_millis(25), || pred().then_some(()));
+    assert!(seen.is_some(), "timed out waiting for {what}");
 }
 
 #[test]

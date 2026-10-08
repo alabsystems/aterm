@@ -48,8 +48,7 @@ graph_method = "cargo-tree-normal-no-dedupe-locked-offline-v1"
 # wasm rows and not one because aterm ships two separate .wasm artifacts — `xtask gate
 # web` and tools/wasm-bench/run.sh each build `-p aterm-wasm -p aterm-gpu-web` — and they
 # are not the same surface: 27 third-party packages / 255,826 lines against 64 / 984,913,
-# a 37-package gap inside wgpu's subtree (dom(wgpu) there: 33 / 523,700 -- web-sys is direct). The third web cdylib, aterm-effects-web, needs no
-# cell: its wasm32 closure is a strict subset of aterm-wasm's, and a test holds it there.
+# a 37-package gap inside wgpu's subtree (dom(wgpu) there: 33 / 523,700 -- web-sys is direct).
 cells = [
     { name = "mac-arm", triple = "aarch64-apple-darwin", package = "aterm" },
     { name = "linux", triple = "x86_64-unknown-linux-gnu", package = "aterm" },

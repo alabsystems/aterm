@@ -1,0 +1,23 @@
+# claude-code 2.1.284 · MEASURED 2026-10-06 by the boxrev-safety review, `aterm ctl text` of a private headless aterm (144x50) running the real Claude Code through tools/real-claude-lab (stub model, tool mode), default permission mode, `permissions.ask = ["Bash"]` (a bare tool-name rule) in the scratch settings · the command's first line is a row of `╌` (a program name the vendor cannot check): the vendor stacks `This command requires approval` DIRECTLY over `Permission rule Bash requires confirmation for this command.` (no blank row between them). The OLD layout's note rows are joined into one block that does not start with `Permission rule `: owner_review() is None, approve=all pressed it (tool ran)
+❯ toolstart
+
+⏺ Bash(╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+      touch w-hs)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+   │ touch w-hs
+   Create w-hs
+
+ This command requires approval
+ Permission rule Bash requires confirmation for this command.
+ /permissions to update rules
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

@@ -2,12 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Search surface for aterm-core.
+//! Search surface for aterm-core; the logic lives in `aterm-search`.
 //!
-//! Pure search logic lives in `aterm-search`.
-//!
-//! `Scrollback*` adapters live in `aterm-scrollback`, where those types are
-//! local and can satisfy Rust's orphan rules.
+//! The `SearchContent` impls live beside their types (orphan rules): `Grid`'s
+//! in `aterm-grid`, the `Scrollback*` adapters in `aterm-scrollback`.
 
 pub use aterm_search::streaming;
 pub use aterm_search::{
@@ -15,5 +13,3 @@ pub use aterm_search::{
     SearchDirection, SearchIndex, SearchMatch, SearchOptionsError, SearchResults, TerminalSearch,
     max_cached_for_retained,
 };
-
-// SearchContent impl for Grid moved to aterm-grid (#6554, orphan rules).

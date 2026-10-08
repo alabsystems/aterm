@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Operations xterm reaches under a SECOND final byte.
+// Operations xterm reaches under a second final byte.
 //
 // Each sequence here names an operation the engine already implements under its
 // primary spelling; the alternate spelling is not a different feature but the
@@ -118,7 +118,7 @@ fn xtpushsgr_spelled_hash_p_takes_the_same_pm_selection_as_hash_brace() {
     let primary = style_after(b"\x1b[1;4m\x1b[1#{\x1b[0m\x1b[#}");
     assert_eq!(aliased, primary, "Pm is read identically under both finals");
     // The selection has to actually bite, or the comparison above would hold
-    // for an alias that threw its parameters away: pushing only bold must NOT
+    // for an alias that threw its parameters away: pushing only bold must not
     // bring the underline back the way an unparameterized push does.
     assert_ne!(
         aliased,

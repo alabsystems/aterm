@@ -1,80 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PRESENT → GLASS: the span after application present-return that the
-//! frontend's `metrics` ledger could not see.
+//! Present to glass: the span after application present-return that the
+//! frontend's `metrics` ledger cannot see.
 //!
-//! `aterm-gui`'s `present_latency` and `input_present` both stop at application
-//! present-return: `Frame::present` registers `presentDrawable:`, commits, and
-//! returns. Whether a slow reading was the window server holding the drawable
-//! or a parked main thread was structurally unanswerable — the 2026-09 audit's
-//! 560 ms `max_present_latency_ms` beside `present_drops=0` could not be
-//! attributed to either.
+//! `aterm-gui`'s `present_latency` and `input_present` stop when
+//! `Frame::present` returns, so they cannot tell a window server holding the
+//! drawable from a parked main thread. On the macOS Metal path,
+//! `Frame::present` hangs an `addPresentedHandler:` on the drawable whenever a
+//! sink is installed. The handler reads `-[MTLDrawable presentedTime]` (on the
+//! `CACurrentMediaTime` clock) and reports the interval from the
+//! `presentDrawable:` registration to that instant. A drawable the compositor
+//! never showed (occluded window, replaced before its vsync, unparented layer)
+//! reports `presentedTime == 0`, delivered as [`GlassSample::Skipped`].
 //!
-//! On the shipped macOS Metal path, `Frame::present` hangs an
-//! `addPresentedHandler:` on the drawable whenever a sink is installed. The
-//! handler reads `-[MTLDrawable presentedTime]` — the host time the frame
-//! reached the display, on CoreAnimation's `CACurrentMediaTime` clock — and
-//! reports the interval from the `presentDrawable:` registration (read on the
-//! same clock immediately before it) to that instant. A drawable the compositor
-//! skipped or never showed (an occluded window, a frame replaced before its
-//! vsync, an unparented layer) reports `presentedTime == 0`, delivered as
-//! [`GlassSample::Skipped`] rather than as a fabricated duration.
+//! # Attributing skips
 //!
-//! # The second audit: WHICH skips
+//! With display sync off, a burst presented faster than the refresh (such as
+//! the `input_hot` pacing bypass after a keystroke) makes the compositor show
+//! the newer drawable and drop the older one. Each present is therefore tagged
+//! at registration, on the registration clock: the presenting thread arms the
+//! pacing facts ([`arm_present`]: bypass state, occlusion hint, refresh period,
+//! previous registration instant), and [`registration_begin`] reads the
+//! registration time, decides whether it is within one refresh of the previous
+//! registration, and mints a serial. Deciding at registration rather than at
+//! arm time matters because a present can park in `nextDrawable` in between.
 //!
-//! The first handler answered "how long to glass"; it could not answer "why
-//! was this one never shown". Measured on the owner's A18 Pro daily driver
-//! (2026-09-21, 60 Hz panel, `displaySyncEnabled = NO`): 1,310 of 69,836
-//! frames skipped over 16 h, and they tracked TYPING — 21 keystroke-free
-//! minutes of streaming output (10,434 frames) produced 4, the next 224
-//! keystrokes produced 119. The mechanism is the keystroke pacing bypass:
-//! `input_hot` halves the content pace floor to `interval / 2` for the 50 ms
-//! after a key, so a TUI repaint burst inside that window presents at 2× the
-//! refresh rate, and with display sync off the compositor shows the newer
-//! drawable and drops the older one — a full render, encode and present spent
-//! on pixels no one saw.
+//! A skipped frame is charged to its successor, the registration with the next
+//! serial (from a serial-indexed ring), whichever order handlers fire in. With
+//! several windows the successor may belong to another window; the
+//! process-wide instrument accepts that rather than keeping per-layer state in
+//! a handler that must not allocate. A skip whose successor is `Spaced` (or
+//! that is itself `Occluded`) was not a replacement.
 //!
-//! One addition makes that attributable without a second handler: **a tag per
-//! present, decided at registration, on the registration clock.** The
-//! presenting thread arms the pacing FACTS ([`arm_present`]: the bypass state,
-//! the occlusion hint, the refresh period, and this window's previous
-//! registration instant) immediately before the present that registers the
-//! handler; [`registration_begin`] reads `CACurrentMediaTime` for the
-//! registration, decides "within one refresh of the previous registration"
-//! from it, and mints a serial. Deciding at registration rather than at arm
-//! time matters exactly where skips happen: under GPU contention a present can
-//! park for tens of milliseconds in `nextDrawable` between the two, and a tag
-//! taken at arm time would then call a well-spaced present a burst.
-//!
-//! A skipped frame is charged to its SUCCESSOR — the registration with the
-//! NEXT serial, looked up in a serial-indexed ring, so it is the same frame
-//! whether the handler fires before or after further registrations. For a
-//! single window that is the frame that replaced it. With several windows open
-//! the next serial can be another window's present, which shares no layer and
-//! replaced nothing; that attribution is then wrong by one lane, and the
-//! process-wide instrument accepts it rather than carrying per-layer state
-//! into a handler that must not allocate. A skip whose successor is `Spaced`
-//! (or its own `Occluded` tag) was not a replacement: the compositor dropped
-//! it, or nobody could have seen it.
-//!
-//! A pacing GATE on this signal — hold a content present until the previous
-//! drawable settles, fail open at one refresh — was implemented and measured
-//! on 2026-09-21 against this build over the control socket: no latency
-//! regression in four paired runs, and no measurable gain either, because the
-//! skip condition did not reproduce under synthetic load (spin hogs leave the
-//! compositor responsive; glass p50 fell to 2.9 ms). It was dropped as
-//! unproven complexity. The attribution here is what decides whether it is
-//! ever worth re-adding: `present_glass_skipped_by=hot_burst` on a daily
-//! driver under its real workload.
-//!
-//! This crate publishes nothing itself: the frontend installs one sink with
-//! [`install_sink`] and folds the reports into its ledger. No sink, no handler —
-//! a process that never installs one pays nothing per present.
-//!
-//! The handler runs on a Metal/CoreAnimation-owned thread, so a sink must be
-//! lock-free and must not block or unwind (the frontend's is a histogram bucket
-//! increment).
+//! The frontend installs one sink with [`install_sink`]; with no sink no
+//! handler is registered. The handler runs on a Metal/CoreAnimation thread, so
+//! a sink must be lock-free and must not block or unwind.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -101,9 +62,8 @@ pub enum PresentTag {
     /// At least one refresh period after this window's previous registration,
     /// window visible. A skip attributed here was not a replacement.
     Spaced = 0,
-    /// Within one refresh period of the previous registration while the
-    /// keystroke pacing bypass (`input_hot`) was live — the 2× lane the audit
-    /// measured.
+    /// Within one refresh of the previous registration while the keystroke
+    /// pacing bypass (`input_hot`) was live.
     HotBurst = 1,
     /// Within one refresh period of the previous registration with no bypass
     /// live — two lanes colliding (an effect-lane frame beside a content frame).
@@ -247,12 +207,11 @@ static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
 static TAKEABLE_SERIAL: AtomicU64 = AtomicU64::new(0);
 static TAKEABLE_NS: AtomicU64 = AtomicU64::new(0);
 
-/// The tag ring: slot `serial % TAG_RING` holds that serial's tag, published to
-/// the handler thread by `REGISTERED` (Release at registration, Acquire in the
-/// handler): a handler that observes `REGISTERED >= s` observes `TAGS[s]`. A
-/// layer holds at most three drawables and the frontend opens few windows, so a
-/// slot is reused only after sixteen further registrations — long after any
-/// handler that could ask about it has fired.
+/// The tag ring: slot `serial % TAG_RING` holds that serial's tag, published
+/// via `REGISTERED` (Release at registration, Acquire in the handler), so a
+/// handler that sees `REGISTERED >= s` sees `TAGS[s]`. A layer holds at most
+/// three drawables and windows are few, so a slot is reused only long after
+/// any handler that could read it has fired.
 #[cfg(any(target_os = "macos", test))]
 const TAG_RING: usize = 16;
 #[cfg(any(target_os = "macos", test))]
@@ -499,10 +458,9 @@ mod tests {
         );
     }
 
-    /// The tag is decided AT REGISTRATION on the registration clock: the same
-    /// armed facts read `Spaced` when the registration lands a full period
-    /// after the previous one and `HotBurst` when it lands inside it — and the
-    /// registration is takeable exactly once, carrying its instant.
+    /// The tag is decided at registration on the registration clock: the same
+    /// armed facts read `Spaced` a full period after the previous registration
+    /// and `HotBurst` inside it, and the registration is takeable exactly once.
     #[test]
     fn the_tag_is_decided_at_registration_against_the_previous_registration() {
         let _turn = SERIAL

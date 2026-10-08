@@ -1,91 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared live-conformance artifact preparation.
+//! Shared live-conformance artifact resolution.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
+use std::path::PathBuf;
 
-/// Resolve a caller-supplied artifact or freshen the shared RELEASE build.
+/// The release `aterm` a measuring row times, or `None` (said on stderr) when
+/// none was handed over.
 ///
-/// Under the gate the first arm answers: the measuring stage builds the
-/// release `aterm` itself and hands it over in `ATERM_PAINT_BIN` and
-/// `ATERM_SPIN_BIN` (`aterm-verify`'s `measuring_cmd`), so the suites judge
-/// the artifact that stage just built and never build one of their own. The
-/// build below is a hand run's. Its dedicated target avoids repeatedly
-/// rebuilding dependencies with the outer integration test's different feature
-/// set; paint and spin intentionally share it, and since the package-identity
-/// sweep below they really do: after the first build the other gets a
-/// freshness check measured at 0.2 s, where an alternation between two
-/// packages used to relink for 208 s.
-pub(crate) fn release_bin(root: &Path, overrides: &[&str]) -> PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        for var in overrides {
-            if let Ok(path) = std::env::var(var) {
-                let path = PathBuf::from(path);
-                assert!(path.is_file(), "{var}={} does not exist", path.display());
-                return path;
-            }
+/// The MEASURE tier's `measuring tests` stage builds it and passes it in
+/// `ATERM_PAINT_BIN` / `ATERM_SPIN_BIN` (`aterm-verify`'s `measuring_cmd`). A
+/// plain `targo test` names neither and its rows do not run, since they time a
+/// live window against a release build. By hand, build the release `aterm`
+/// and name it in the variable.
+pub(crate) fn release_bin(overrides: &[&str]) -> Option<PathBuf> {
+    for var in overrides {
+        if let Some(path) = std::env::var_os(var).map(PathBuf::from) {
+            assert!(path.is_file(), "{var}={} does not exist", path.display());
+            return Some(path);
         }
-
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        let target = root.join("target/conformance-release");
-        // Under the branded driver a nested invocation must name its own lane:
-        // the outer authorization does not propagate to child Cargo processes.
-        let mut command = Command::new(&cargo);
-        // THE NESTED BUILD MUST NOT INHERIT THIS TEST BINARY'S PACKAGE IDENTITY.
-        // Cargo sets `CARGO_MANIFEST_DIR` and the `CARGO_PKG_*` family for the
-        // test it is running, and a build script that reads one of them tracks
-        // it in its fingerprint: `ring` tracks `CARGO_MANIFEST_DIR`,
-        // `CARGO_PKG_NAME` and the version triple, `aterm-update-core` tracks
-        // `CARGO_PKG_REPOSITORY`. Forwarded, they make this shared target
-        // directory package-specific — so `paint`/`spin` (aterm-conformance)
-        // and atpkg's since-deleted `untracked_stage` invalidated each other's
-        // copy of the ring → rustls → aterm-update → atpkg → aterm-gui subtree on
-        // every run: MEASURED 2026-09-22, 208.9 s of relinking per alternation, and
-        // the reason the helper's "the other suite is warm" held only within
-        // one package. Removed here, every caller — and the gate stage that
-        // primes the same artifact, which has none of these set — spells the
-        // same fingerprint.
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("CARGO_PKG_")
-                || name == "CARGO_MANIFEST_DIR"
-                || name == "CARGO_MANIFEST_LINKS"
-                || name == "CARGO_MANIFEST_PATH"
-            {
-                command.env_remove(&key);
-            }
-        }
-        if Path::new(&cargo)
-            .file_stem()
-            .is_some_and(|name| name.to_string_lossy().starts_with("targo"))
-        {
-            command.arg("--unverified");
-        }
-        let status = command
-            .args(["build", "--locked", "--release", "-p", "aterm"])
-            .env("CARGO_TARGET_DIR", &target)
-            .current_dir(root)
-            .status()
-            .unwrap_or_else(|error| {
-                panic!("could not spawn `{cargo} build --release -p aterm`: {error}")
-            });
-        assert!(
-            status.success(),
-            "`{cargo} build --release -p aterm` failed ({status}) — live conformance judges the \
-             RELEASE binary and refuses to run without one (set {} to drive a prebuilt artifact)",
-            overrides.join(" or "),
-        );
-        let binary = target.join("release/aterm");
-        assert!(
-            binary.is_file(),
-            "built the release profile but {} is missing",
-            binary.display(),
-        );
-        binary
-    })
-    .clone()
+    }
+    eprintln!(
+        "not measured: no {} — this row times the release aterm the MEASURE tier \
+         (tools/verify.sh --measure) hands it",
+        overrides.join(" or ")
+    );
+    None
 }

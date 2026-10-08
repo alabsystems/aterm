@@ -120,7 +120,7 @@
 //! responsiveness audit items 2, 3 and 5).
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 static FRAMES_PRESENTED: AtomicU64 = AtomicU64::new(0);
@@ -239,10 +239,10 @@ static SHED_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
 // `INPUT_STAMP_NS` survives only for input that names a SESSION, not a window (a
 // control `send`/`feed` to a background session, a controller host write): which
 // window presents that session is not known at the stamp, so any window's content
-// present closes it and, under concurrent output elsewhere, it can still read LOW,
-// never high. Within one window, concurrent streaming output in the SAME window
-// can still close the slice on a log-line frame rather than the echo (the same
-// low-never-high bound); the cross-window case is the one this split removes.
+// present closes it and, under concurrent output elsewhere, it can read low.
+// Within one window, concurrent streaming output in the SAME window can still
+// close the slice on a log-line frame rather than the echo (reads low); the
+// cross-window case is the one this split removes.
 static INPUT_STAMP_NS: AtomicU64 = AtomicU64::new(0);
 /// `now_ns` at the last [`reset`]. A window's [`PendingInputStamp`] lives in its
 /// `WindowState`, not here, so `reset` cannot clear it; a stamp ARMED before this
@@ -268,11 +268,24 @@ static TYPING_HOT_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
 /// round-trip cost only while a human is actually at the keyboard.
 pub(crate) const TYPING_HOT_TAIL_NS: u64 = 250_000_000;
 
-// Lost-wake heals (the self-expiring `gated_output_wake` latch re-armed after a
-// `Wake::Output` was consumed without a handler pass). ANY non-zero value means
-// a wake was lost and healed — worth investigating even though the user only
-// saw a ≤100 ms hiccup.
+// Lost-wake heals: the watchdog found a `Wake::Output` latch still armed after a
+// user-event drain that began after its post (`spawn::judge_output_wake`), i.e.
+// the event was consumed without a handler pass. ANY non-zero value means a wake
+// was lost and healed — worth investigating even though the user saw only a
+// hiccup (one expiry after the loop turn that saw the arm).
 static WAKE_HEALS: AtomicU64 = AtomicU64::new(0);
+// Late wakes: a posted `Wake::Output` older than `spawn::WAKE_LATCH_EXPIRY_NS`
+// still waiting for its handler because the main thread's turn (a long frame)
+// ran past it. A measurement of main-thread lateness, never a loss and never
+// acted on — before 2026-09-29 each of these was booked (and healed) as a loss.
+static OUTPUT_WAKE_LATE: AtomicU64 = AtomicU64::new(0);
+// Stranded wakes re-posted by a PTY reader: a `Wake::Output` posted after the
+// event loop went idle, with no loop turn since, older than the latch expiry —
+// lost together with its loop wake-up, which no watchdog pass can see
+// (`spawn::wake_stranded`). Not a heal (nothing was proven lost, nothing is
+// repainted). ANY non-zero value means a posted event failed to wake an idle
+// loop for 100 ms — worth investigating.
+static OUTPUT_WAKE_REPOSTS: AtomicU64 = AtomicU64::new(0);
 
 // Whole-redraw wall time (redraw entry → present done). `frame_render` excludes
 // surface acquisition and the final present, so a main-thread
@@ -320,7 +333,7 @@ static PET_WORLD_CELLS: AtomicU64 = AtomicU64::new(0);
 // owed" item 6): what the cursor-effect tick handed the frame, read off a live
 // instance without a pixel capture. Every tick — the live single-pane and
 // composed presents and the explicit capture — goes through
-// `App::tick_cursor_fx`, so these see all three. The three `_last` readings
+// `App::cursor_frame`, so these see all three. The three `_last` readings
 // are momentary, like every `last_*`: the additive `glow_add` quads (every
 // style's halo, the momentum glow on ANY style, the rod, the bodies), the
 // `glow_under` quads, and the comet's trail cells. `fx_under_frames` (reset
@@ -435,7 +448,7 @@ static SLOW_EPISODE_RESET: AtomicBool = AtomicBool::new(false);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 45;
+const DEADLINE_OWNER_SLOTS: usize = 49;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
@@ -679,7 +692,10 @@ pub(crate) enum DeadlineOwner {
     Retired11 = 11,
     CursorEffect = 12,
     Rain = 13,
-    SettingsDemo = 14,
+    /// Retired Settings-card demo-tick slot. The numeric tombstone is retained
+    /// because deadline-owner discriminants are an append-only diagnostics wire
+    /// contract.
+    Retired14 = 14,
     NativePreview = 15,
     /// Retired native Settings Diagnostics refresh slot. Preserve both the
     /// numeric value and legacy wire label for recorded-metrics compatibility.
@@ -710,7 +726,7 @@ pub(crate) enum DeadlineOwner {
     TitleSummary = 30,
     SessionChrome = 31,
     TitleDrift = 32,
-    /// The program cat's tenure gate (`app_kitty::KittyTenure`): one wake at
+    /// The program cat's tenure gate (`aterm_effects::companion_look::KittyTenure`): one wake at
     /// the instant a pending claim earns or releases the cursor.
     KittyTenure = 33,
     /// The macOS access card's watch (`consent_card::CardState::next_wake`):
@@ -796,6 +812,35 @@ pub(crate) enum DeadlineOwner {
     /// main's `SystemStrain` (40) through `CrashJournal` (43) reached main
     /// first. The table is an APPEND-ONLY WIRE CONTRACT, so this one moves.
     UpdateChecker = 44,
+    /// THE SPLIT'S TAKE-BACK HOLD (`crate::split_regrid_hold`): one wake at
+    /// the end of the quiet that withheld a collapse's grow of a pane back to
+    /// its pre-split grid. Its own slot, not `ResizeSettle`'s, so the settle's
+    /// same-owner heal and its attribution never mix the two.
+    SplitRegridHold = 45,
+    /// KITTY ANIMATION PLAYBACK (`crate::kitty_animation`): one wake at the
+    /// soonest frame a shown session's Kitty graphics animation has due. A
+    /// still image, a stopped animation or a session no window shows arms
+    /// nothing.
+    KittyAnimation = 46,
+    /// A RENDER EPOCH's look (`crate::resize_epoch`, 2026-09-29): ONE wake at
+    /// the instant a session's open epoch (rows the engine owes its program)
+    /// has waited out the risk window since its last resize, or its short retry
+    /// when the terminal was locked. The ledger books every resize at one funnel
+    /// and registers the look there; an idle machine, and a session whose
+    /// screen is not displaced, arm nothing.
+    ///
+    /// 47 and not 46: this was written against a tree where 46 was free, and
+    /// main's `KittyAnimation` (46) reached main first. The table is an
+    /// APPEND-ONLY WIRE CONTRACT, so this one moves.
+    RenderEpoch = 47,
+    /// The owner's debugger-access change (`debugger_access`, design
+    /// `docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.4 step 4): the
+    /// park's `RESULT_RECHECK` re-read while the lane `wants_poll`: the
+    /// worker's shared result slot while a change is under way, and the
+    /// shared records while a read is out or due again (an unsettled read, a
+    /// drift re-read). An idle lane arms nothing. 48 and not 47:
+    /// main's `RenderEpoch` reached 47 first, and the table is append-only.
+    DebuggerChange = 48,
 }
 
 impl DeadlineOwner {
@@ -814,7 +859,7 @@ impl DeadlineOwner {
             11 => Self::Retired11,
             12 => Self::CursorEffect,
             13 => Self::Rain,
-            14 => Self::SettingsDemo,
+            14 => Self::Retired14,
             15 => Self::NativePreview,
             16 => Self::RetiredNativeDiagnostics16,
             17 => Self::Predictor,
@@ -845,6 +890,10 @@ impl DeadlineOwner {
             42 => Self::InputWatch,
             43 => Self::CrashJournal,
             44 => Self::UpdateChecker,
+            45 => Self::SplitRegridHold,
+            46 => Self::KittyAnimation,
+            47 => Self::RenderEpoch,
+            48 => Self::DebuggerChange,
             _ => Self::None,
         }
     }
@@ -866,7 +915,7 @@ impl DeadlineOwner {
             Self::Retired11 => "retired-11",
             Self::CursorEffect => "cursor_effect",
             Self::Rain => "rain",
-            Self::SettingsDemo => "settings_demo",
+            Self::Retired14 => "retired-14",
             Self::NativePreview => "native_preview",
             Self::RetiredNativeDiagnostics16 => "native_diagnostics",
             Self::Predictor => "predictor",
@@ -897,6 +946,10 @@ impl DeadlineOwner {
             Self::InputWatch => "input_watch",
             Self::CrashJournal => "crash_journal",
             Self::UpdateChecker => "update_checker",
+            Self::SplitRegridHold => "split_regrid_hold",
+            Self::KittyAnimation => "kitty_animation",
+            Self::RenderEpoch => "render_epoch",
+            Self::DebuggerChange => "debugger_change",
         }
     }
 }
@@ -2979,11 +3032,10 @@ static INPUT_REFUSED: AtomicU64 = AtomicU64::new(0);
 static REPLY_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Book one output → redraw-request span (see `H_OUTPUT_REDRAW_REQUEST`).
-/// Spans past the honesty cap are discarded, never booked.
+/// Spans past the honesty cap are discarded, never booked: the one caller,
+/// `App::note_output_redraw_request`, tests `OUTPUT_REDRAW_REQUEST_CAP_NS`
+/// before it books.
 pub(crate) fn note_output_redraw_request(ns: u64) {
-    if ns > OUTPUT_REDRAW_REQUEST_CAP_NS {
-        return;
-    }
     H_OUTPUT_REDRAW_REQUEST.record(ns);
     LAST_OUTPUT_REDRAW_REQUEST_NS.store(ns, Ordering::Relaxed);
     MAX_OUTPUT_REDRAW_REQUEST_NS.fetch_max(ns, Ordering::Relaxed);
@@ -3658,12 +3710,6 @@ impl SyncHoldingGauge {
     }
 }
 
-impl Default for SyncHoldingGauge {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for SyncHoldingGauge {
     fn drop(&mut self) {
         transition_sync_holding(&mut self.held, false, &SYNC_HOLDING_WINDOWS);
@@ -3707,9 +3753,21 @@ pub(crate) fn note_shed_transition(reduced: bool) {
     SHED_TRANSITIONS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A lost `Wake::Output` was healed by the self-expiring latch.
+/// A lost `Wake::Output` was proven lost and healed by the watchdog.
 pub(crate) fn note_wake_heal() {
     WAKE_HEALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A posted `Wake::Output` waited past the latch expiry behind the main
+/// thread's own turn (booked once per wake; no action follows).
+pub(crate) fn note_output_wake_late() {
+    OUTPUT_WAKE_LATE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A PTY reader re-posted a `Wake::Output` stranded with its loop wake-up
+/// (see `OUTPUT_WAKE_REPOSTS`).
+pub(crate) fn note_output_wake_repost() {
+    OUTPUT_WAKE_REPOSTS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record one redraw pass's TOTAL wall time (entry → present done OR failed
@@ -4288,6 +4346,71 @@ pub(crate) fn handoff_input_fields_json() -> String {
     format!(",\"input_dropped\":{dropped},\"input_incoherent\":{incoherent}")
 }
 
+/// How many live sessions hold a PTY of their own: one per [`PtyCensus`]
+/// alive, i.e. per `Session` a real spawn or adoption built and nothing has
+/// dropped yet (a test stub, whose sink borrows or has no master, holds none).
+static PTY_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// One live session's place in [`PTY_SESSIONS`]: taken by `spawn_session` for
+/// the `Session` it builds, given back when that `Session` drops. The session
+/// closes its master only through its sink's last clone, so a count of masters
+/// the sinks still own (`aterm_session::sink::owned_masters_open`) above this
+/// one, once the closing sessions' readers have wound down, is a master a
+/// closed tab left open ([`pty_census_fields_text`]).
+#[derive(Debug)]
+pub(crate) struct PtyCensus(bool);
+
+impl PtyCensus {
+    /// A session that owns a PTY master: counted until it drops.
+    pub(crate) fn counted() -> Self {
+        PTY_SESSIONS.fetch_add(1, Ordering::AcqRel);
+        Self(true)
+    }
+
+    /// A session with no PTY of its own (a stub, a held pane): not counted.
+    pub(crate) const fn none() -> Self {
+        Self(false)
+    }
+}
+
+impl Drop for PtyCensus {
+    fn drop(&mut self) {
+        if std::mem::take(&mut self.0) {
+            PTY_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// `(pty_masters, pty_sessions)`: the PTY masters this process's session sinks
+/// hold open, and the live sessions that own one ([`PtyCensus`]).
+#[must_use]
+pub(crate) fn pty_census() -> (usize, usize) {
+    (
+        aterm_session::sink::owned_masters_open(),
+        PTY_SESSIONS.load(Ordering::Acquire),
+    )
+}
+
+/// The summary line's PTY census, leading space included:
+/// ` pty_masters=<n> pty_sessions=<m>`. Equal at rest. A closing session's
+/// master stays open until its reader has wound down (a hang-up and a wake,
+/// normally well under a second), so `pty_masters` may lead briefly after a
+/// close; a lead that STAYS is a master nothing will close — the leak of
+/// 2026-09-29, where a closed tab 0's master outlived it for the window's life.
+#[must_use]
+pub(crate) fn pty_census_fields_text() -> String {
+    let (masters, sessions) = pty_census();
+    format!(" pty_masters={masters} pty_sessions={sessions}")
+}
+
+/// Field-for-field JSON twin of [`pty_census_fields_text`], with a leading
+/// comma.
+#[must_use]
+pub(crate) fn pty_census_fields_json() -> String {
+    let (masters, sessions) = pty_census();
+    format!(",\"pty_masters\":{masters},\"pty_sessions\":{sessions}")
+}
+
 /// Zero the measurement-window stats (frame count, maxima, slow count) so a driver
 /// can time a SPECIFIC operation: `metrics reset`, run the workload, then `metrics`.
 /// Keeps `backend` and legacy momentary `last_*` readings. The redraw-audit
@@ -4316,6 +4439,8 @@ pub(crate) fn reset() {
     INPUT_EDGES_DROPPED.store(0, Ordering::Relaxed);
     MAX_KEY_WRITE_NS.store(0, Ordering::Relaxed);
     WAKE_HEALS.store(0, Ordering::Relaxed);
+    OUTPUT_WAKE_LATE.store(0, Ordering::Relaxed);
+    OUTPUT_WAKE_REPOSTS.store(0, Ordering::Relaxed);
     MAX_REDRAW_TOTAL_NS.store(0, Ordering::Relaxed);
     REDRAW_ATTEMPTS.store(0, Ordering::Relaxed);
     REDRAW_EARLY_OUTS.store(0, Ordering::Relaxed);
@@ -4511,6 +4636,12 @@ pub(crate) struct Snapshot {
     pub last_resize_reflow_ns: u64,
     pub max_resize_reflow_ns: u64,
     pub wake_heals: u64,
+    /// Wakes that waited past the latch expiry behind a long main-thread turn
+    /// (see `note_output_wake_late`): lateness, not loss.
+    pub output_wake_late: u64,
+    /// Wakes a PTY reader re-posted because they were stranded with their loop
+    /// wake-up (see `note_output_wake_repost`): not heals.
+    pub output_wake_reposts: u64,
     pub last_redraw_total_ns: u64,
     pub max_redraw_total_ns: u64,
     pub redraw_attempts: u64,
@@ -4806,6 +4937,8 @@ pub(crate) fn snapshot() -> Snapshot {
         last_resize_reflow_ns: LAST_RESIZE_REFLOW_NS.load(Ordering::Relaxed),
         max_resize_reflow_ns: MAX_RESIZE_REFLOW_NS.load(Ordering::Relaxed),
         wake_heals: WAKE_HEALS.load(Ordering::Relaxed),
+        output_wake_late: OUTPUT_WAKE_LATE.load(Ordering::Relaxed),
+        output_wake_reposts: OUTPUT_WAKE_REPOSTS.load(Ordering::Relaxed),
         last_redraw_total_ns: LAST_REDRAW_TOTAL_NS.load(Ordering::Relaxed),
         max_redraw_total_ns: MAX_REDRAW_TOTAL_NS.load(Ordering::Relaxed),
         redraw_attempts: REDRAW_ATTEMPTS.load(Ordering::Relaxed),
@@ -4930,6 +5063,26 @@ pub(crate) fn snapshot() -> Snapshot {
 /// `startup_phase_tests` (reset) and `histogram_tests` (record_deadline).
 #[cfg(test)]
 static SCHEDULER_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`SCHEDULER_STATE`] for a `record_deadline` driver outside this module.
+#[cfg(test)]
+pub(crate) fn scheduler_state_serial() -> std::sync::MutexGuard<'static, ()> {
+    SCHEDULER_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `(stale_arm_heals, past arms booked against owner, windowed streak heals
+/// of owner)` — the three ways `record_deadline` answers a past arm.
+#[cfg(test)]
+pub(crate) fn past_arm_books(owner: DeadlineOwner) -> (u64, u64, u64) {
+    let slot = owner as usize;
+    (
+        STALE_ARM_HEALS.load(Ordering::Relaxed),
+        PAST_DEADLINE_ARMS_BY_OWNER[slot].load(Ordering::Relaxed),
+        PAST_ARM_STREAK_HEALS_BY_OWNER[slot].load(Ordering::Relaxed),
+    )
+}
 
 #[cfg(test)]
 mod claim_timeline_tests {
@@ -6019,6 +6172,21 @@ mod histogram_tests {
         // the heartbeat's stale instant is never charged to another owner.
         assert_eq!(DeadlineOwner::from_raw(44), DeadlineOwner::UpdateChecker);
         assert_eq!(DeadlineOwner::UpdateChecker.as_str(), "update_checker");
+        // Slot 45 is the split's take-back hold: its wake is never charged to
+        // the resize settle it used to fold under.
+        assert_eq!(DeadlineOwner::from_raw(45), DeadlineOwner::SplitRegridHold);
+        assert_eq!(DeadlineOwner::SplitRegridHold.as_str(), "split_regrid_hold");
+        // Slot 46 is Kitty animation playback: a frame's wake is its own.
+        assert_eq!(DeadlineOwner::from_raw(46), DeadlineOwner::KittyAnimation);
+        assert_eq!(DeadlineOwner::KittyAnimation.as_str(), "kitty_animation");
+        // Slot 47 is a render epoch's look (`resize_epoch`): the wake at which a
+        // displaced screen has waited out the risk window, never charged to the
+        // status observer that only reads the verdict.
+        assert_eq!(DeadlineOwner::from_raw(47), DeadlineOwner::RenderEpoch);
+        assert_eq!(DeadlineOwner::RenderEpoch.as_str(), "render_epoch");
+        // Slot 48 is the debugger-access change's result re-read.
+        assert_eq!(DeadlineOwner::from_raw(48), DeadlineOwner::DebuggerChange);
+        assert_eq!(DeadlineOwner::DebuggerChange.as_str(), "debugger_change");
         // Slot 22 is a tombstone (2026-09-22): the config banner's owner
         // retired with `config_notice.rs`, and the number stays taken under a
         // label no live owner wears, so an older wire reader never attributes

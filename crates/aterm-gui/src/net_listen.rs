@@ -13,7 +13,8 @@
 //! does [`maybe_spawn`] stand up a TLS listener. The table is the one spelling:
 //! the `ATERM_NET_*` environment overrides are gone (2026-09-24). Each accepted connection must
 //! present a capability **channel-bound** to the TLS session
-//! ([`aterm_net::channel_bind`]) keyed by THIS instance's control token; only then
+//! ([`aterm_net::channel_bind`]) keyed by the persistent network-drive token
+//! (`aterm-network-drive.token` beside the `key`); only then
 //! is it relayed to the local control socket, where it authenticates again with
 //! the ordinary `AUTH <token>` handshake. The TLS capability is the network-
 //! specific gate that replaces the local same-uid `SO_PEERCRED` check — which has
@@ -35,7 +36,7 @@ use aterm_uds::CtlStream;
 
 /// The single op the network capability authorizes: driving this instance's
 /// control socket. A remote driver presents `channel_bind(token, exporter)` for
-/// this op; `src` is informational (logged), authority comes from the token.
+/// this op; `src` is not checked: authority comes from the token.
 const NET_OP: &str = "drive";
 
 /// Upper bound on a cert/key file read. A real DER cert or PKCS#8 key is a few
@@ -250,9 +251,10 @@ pub(crate) fn launched_inside_aterm() -> bool {
 /// `aterm.toml` (`listen`/`cert`/`key`). Any unset ⇒ no network port (the secure
 /// default).
 ///
-/// `token_hex` is this instance's 64-char control token; it is the HMAC key for
-/// the network capability binding, so a remote driver must hold the same token it
-/// would use for the local `AUTH` handshake — no new secret, no weaker gate.
+/// `token_hex` is this instance's 64-char control token. The listener sends it
+/// on the relay's local `AUTH` line; the network capability is keyed by the
+/// PERSISTENT drive token instead (R37), and by `token_hex` only when that
+/// token's file can be neither read nor created.
 pub(crate) fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::Config) {
     if launched_inside_aterm() {
         return;
@@ -262,7 +264,7 @@ pub(crate) fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_c
         return; // secure default: no network port
     }
 
-    // The control token IS the channel-binding key. 64-char hex => 32 bytes.
+    // The per-launch stand-in for the channel-binding key. 64-char hex => 32 bytes.
     let Some(token) = EdgeToken::from_hex(token_hex) else {
         crate::logging::stderr_line!(
             "aterm-gui: control token is not 32-byte hex; network drive disabled"
@@ -288,19 +290,26 @@ pub(crate) fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_c
     // PERSISTENT drive token (R37): the channel-binding secret a `dial` peer presents.
     // Stored beside the operator's TLS key, so a saved dial credential SURVIVES a
     // remote restart — provisioned ONCE, not re-copied after every restart. Falls
-    // back to the per-launch control token if the file can't be created (network
-    // drive still works, it just needs re-provisioning per restart — pre-R37).
-    let (drive_hex, drive_minted) = key_path
-        .parent()
-        .and_then(crate::control_auth::load_or_create_network_drive_token)
-        .unwrap_or_else(|| {
-            crate::logging::stderr_line!(
-                "aterm-gui: persistent network-drive token unavailable; using the \
-                 per-launch token (re-provision the client after each restart)"
-            );
-            (token_hex.to_string(), true)
-        });
+    // back to the per-launch control token if the file can't be read or created
+    // (network drive still works, it just needs re-provisioning per restart —
+    // pre-R37).
+    let token_dir = key_path.parent().unwrap_or(std::path::Path::new(""));
+    let token_file = token_dir.join(crate::control_auth::NETWORK_DRIVE_TOKEN_FILE);
+    let (drive_hex, token_source) =
+        match crate::control_auth::load_or_create_network_drive_token(token_dir) {
+            Some((hex, true)) => (hex, DriveTokenSource::Minted),
+            Some((hex, false)) => (hex, DriveTokenSource::Loaded),
+            None => (
+                token_hex.to_string(),
+                DriveTokenSource::PerLaunch {
+                    file_exists: std::fs::symlink_metadata(&token_file).is_ok(),
+                },
+            ),
+        };
     let drive_token = EdgeToken::from_hex(&drive_hex).unwrap_or(token);
+    // What every client's `fingerprint` must say, printed in the spelling it takes.
+    let fingerprint =
+        aterm_codec::hex::encode_lower(&aterm_net::tls::cert_fingerprint(&cert_bytes));
     // Preflight already compiled this exact byte pair. Rebuilding the cheap
     // rustls value here avoids exposing rustls as a second direct GUI dependency.
     let config = match aterm_net::tls::server_config(cert_bytes, key_bytes) {
@@ -321,31 +330,28 @@ pub(crate) fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_c
     };
 
     let sock_path = sock_path.to_owned();
-    let addr_owned = addr;
     // The local control socket is token-gated; the listener authenticates it on the
     // driver's behalf with a bare `AUTH <token>` line, so the raw token NEVER
     // crosses the network (only the channel-bound HMAC does). The remote driver then
     // speaks raw control verbs over the already-authenticated relay.
     let auth_line = format!("AUTH {token_hex}\n");
-    crate::logging::stderr_line!(
-        "aterm-gui: network drive listening at {addr_owned} \
-         (TLS, channel-bound capability, relays to the local control socket)"
+    note(
+        &format!("network drive listening on {addr}; certificate sha256:{fingerprint}"),
+        false,
     );
-    // Reveal the raw PERSISTENT capability token to the operator's log ONLY on the
-    // boot that mints it (provisioning time) — it is a full-authority bearer secret,
-    // so echoing it on EVERY restart needlessly multiplies its exposure in logs
-    // (CWE-532). On later boots emit only a stable fingerprint + the file location.
-    if drive_minted {
-        crate::logging::stderr_line!(
-            "aterm-gui: network-drive capability token (provision the client ONCE): {drive_hex}"
-        );
-        crate::logging::stderr_line!("aterm-gui:   aterm-ctl dial-token <name> {drive_hex}");
+    // The raw token reaches stderr ONLY when a client must be provisioned with it
+    // (a freshly minted file, or this launch's stand-in) — it is a full-authority
+    // bearer secret, so echoing it on EVERY restart would multiply its exposure
+    // (CWE-532) — and aterm.log never: there the line names the file instead.
+    crate::logging::stderr_line!(
+        "aterm-gui: {}",
+        drive_token_line(token_source, &token_file, Some(&drive_hex))
+    );
+    let logged = drive_token_line(token_source, &token_file, None);
+    if matches!(token_source, DriveTokenSource::PerLaunch { .. }) {
+        aterm_log::warn!("{logged}");
     } else {
-        let fp: String = drive_hex.chars().take(8).collect();
-        crate::logging::stderr_line!(
-            "aterm-gui: network-drive token loaded (fingerprint {fp}…, stored 0600 beside the TLS key); \
-             re-run with a fresh key dir to re-provision"
-        );
+        aterm_log::info!("{logged}");
     }
     std::thread::spawn(move || {
         // Process-lifetime listener: aterm has no partial "stop just the network
@@ -356,10 +362,11 @@ pub(crate) fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_c
         aterm_net::drive::serve(
             &listener,
             &config,
-            // Authority is the channel-bound PERSISTENT drive token; `op` must be the
-            // drive op. (The per-launch `token` is used only for the local-socket
-            // AUTH below — it never gates the network handshake now, so a saved
-            // credential is not invalidated by a restart, R37.)
+            // Authority is `drive_token`, channel-bound: the PERSISTENT drive token,
+            // or the per-launch control token only when that file is unusable
+            // (`DriveTokenSource::PerLaunch`); `op` must be the drive op. With a
+            // usable file the per-launch token serves only the local-socket AUTH
+            // below, so a saved credential survives a restart (R37).
             move |_src, op| (op == NET_OP).then_some(drive_token),
             // Authorized connections are bridged to the local control socket, which
             // we authenticate here (the driver never sends the raw token).
@@ -371,27 +378,110 @@ pub(crate) fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_c
                 Ok(s)
             },
             &running,
-            move |ev| match ev {
-                NetEvent::Relayed(g) => {
-                    // `src`/`op` come from the peer's AUTH line (only emptiness is
-                    // rejected upstream), so raw ESC/CR/BEL/C1 could survive and forge
-                    // a log record boundary or smuggle a terminal escape to whoever
-                    // `cat`s the operator's log (CWE-117). Sanitize both before print.
-                    crate::logging::stderr_line!(
-                        "aterm-gui: network drive relayed a verified peer (src={}, op={})",
-                        aterm_log::sanitize_record(&g.src),
-                        aterm_log::sanitize_record(&g.op)
-                    );
-                }
-                NetEvent::Rejected(why) => {
-                    crate::logging::stderr_line!(
-                        "aterm-gui: network drive rejected a connection: {}",
-                        aterm_log::sanitize_record(&why)
-                    );
-                }
+            move |ev| {
+                let (line, refusal) = event_line(&ev);
+                note(&line, refusal);
             },
         );
     });
+}
+
+/// How this launch got its network-drive token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriveTokenSource {
+    /// Minted and saved this launch: clients must be provisioned with it.
+    Minted,
+    /// Read from the saved file: clients provisioned earlier keep working.
+    Loaded,
+    /// The file could not be read (`file_exists`) or created: this launch uses
+    /// its per-launch token, which changes at every restart.
+    PerLaunch { file_exists: bool },
+}
+
+/// The listener's startup line about its drive token. `secret` is the token,
+/// printed with the one command a client runs when one must be provisioned now;
+/// `None` (aterm.log) names only the file.
+fn drive_token_line(
+    source: DriveTokenSource,
+    file: &std::path::Path,
+    secret: Option<&str>,
+) -> String {
+    let file = file.display();
+    match source {
+        DriveTokenSource::Minted => {
+            let provision = secret
+                .map(|hex| format!("; on the client run: aterm ctl dial-token <name> {hex}"))
+                .unwrap_or_default();
+            format!("network drive token (new) saved to {file}{provision}")
+        }
+        DriveTokenSource::Loaded => {
+            format!("network drive token: {file} (delete it and restart to issue a new one)")
+        }
+        DriveTokenSource::PerLaunch { file_exists } => {
+            let provision = secret
+                .map(|hex| format!(": aterm ctl dial-token <name> {hex}"))
+                .unwrap_or_default();
+            if file_exists {
+                format!(
+                    "network drive token file {file} is unusable; until it is removed and aterm \
+                     restarts, clients use this launch's token{provision}"
+                )
+            } else {
+                format!(
+                    "network drive token file {file} cannot be created; until aterm can create \
+                     it, clients use this launch's token and re-provision after each \
+                     restart{provision}"
+                )
+            }
+        }
+    }
+}
+
+/// One listener event's line, and whether it is a refusal (logged as a
+/// warning). Every connection line names the peer's address. `reason`/`error`
+/// text can carry peer-influenced bytes (a rustls message about what it sent),
+/// so it is sanitized: raw ESC/CR/BEL/C1 could forge a log record boundary or
+/// smuggle a terminal escape to whoever `cat`s the log (CWE-117).
+fn event_line(event: &NetEvent) -> (String, bool) {
+    match event {
+        NetEvent::Admitted { peer, .. } => (format!("network drive: {peer} connected"), false),
+        NetEvent::Closed { peer, error: None } => {
+            (format!("network drive: {peer} disconnected"), false)
+        }
+        NetEvent::Closed {
+            peer,
+            error: Some(error),
+        } => (
+            format!(
+                "network drive: {peer} disconnected: {}",
+                aterm_log::sanitize_record(error)
+            ),
+            true,
+        ),
+        NetEvent::Refused { peer, reason } => (
+            format!(
+                "network drive: {peer} not admitted: {}",
+                aterm_log::sanitize_record(reason)
+            ),
+            true,
+        ),
+        NetEvent::Stopped(why) => (
+            format!("network drive stopped: {}", aterm_log::sanitize_record(why)),
+            true,
+        ),
+    }
+}
+
+/// A listener line to stderr AND aterm.log: a Dock-launched app's stderr goes
+/// nowhere, and these lines are the listener's audit trail (drive.rs's
+/// `NetEvent` mirrors the local socket's `log_denial`, which writes aterm.log).
+fn note(line: &str, refusal: bool) {
+    crate::logging::stderr_line!("aterm-gui: {line}");
+    if refusal {
+        aterm_log::warn!("{line}");
+    } else {
+        aterm_log::info!("{line}");
+    }
 }
 
 #[cfg(test)]
@@ -564,5 +654,102 @@ mod tests {
         assert_eq!(prepared.key_bytes, TEST_KEY_DER);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The token line names the file every time; the secret appears only where
+    /// a client must be provisioned now, and never beside a claim that the
+    /// per-launch stand-in is provisioned "once".
+    #[test]
+    fn the_drive_token_line_names_its_file_and_never_calls_the_stand_in_permanent() {
+        let file = std::path::Path::new("/k/aterm-network-drive.token");
+        let hex = "ab".repeat(32);
+        assert_eq!(
+            drive_token_line(DriveTokenSource::Minted, file, Some(&hex)),
+            format!(
+                "network drive token (new) saved to /k/aterm-network-drive.token; on the client \
+                 run: aterm ctl dial-token <name> {hex}"
+            )
+        );
+        assert_eq!(
+            drive_token_line(DriveTokenSource::Minted, file, None),
+            "network drive token (new) saved to /k/aterm-network-drive.token"
+        );
+        assert_eq!(
+            drive_token_line(DriveTokenSource::Loaded, file, Some(&hex)),
+            "network drive token: /k/aterm-network-drive.token (delete it and restart to issue \
+             a new one)"
+        );
+        let stand_in = drive_token_line(
+            DriveTokenSource::PerLaunch { file_exists: true },
+            file,
+            Some(&hex),
+        );
+        assert_eq!(
+            stand_in,
+            format!(
+                "network drive token file /k/aterm-network-drive.token is unusable; until it is \
+                 removed and aterm restarts, clients use this launch's token: aterm ctl \
+                 dial-token <name> {hex}"
+            )
+        );
+        assert!(!stand_in.contains("ONCE") && !stand_in.contains("once"));
+        assert_eq!(
+            drive_token_line(
+                DriveTokenSource::PerLaunch { file_exists: false },
+                file,
+                None
+            ),
+            "network drive token file /k/aterm-network-drive.token cannot be created; until \
+             aterm can create it, clients use this launch's token and re-provision after each \
+             restart"
+        );
+    }
+
+    /// Every connection line names the peer; refusals say why, and a listener
+    /// that stops says so rather than reading as a rejected connection.
+    #[test]
+    fn listener_event_lines_name_the_peer() {
+        let peer: SocketAddr = "203.0.113.5:51234".parse().unwrap();
+        let granted = aterm_net::Granted {
+            src: "dial".into(),
+            op: "drive".into(),
+        };
+        assert_eq!(
+            event_line(&NetEvent::Admitted { peer, granted }),
+            (
+                "network drive: 203.0.113.5:51234 connected".to_owned(),
+                false
+            )
+        );
+        assert_eq!(
+            event_line(&NetEvent::Closed { peer, error: None }),
+            (
+                "network drive: 203.0.113.5:51234 disconnected".to_owned(),
+                false
+            )
+        );
+        assert_eq!(
+            event_line(&NetEvent::Refused {
+                peer,
+                reason: "wrong drive token".into()
+            }),
+            (
+                "network drive: 203.0.113.5:51234 not admitted: wrong drive token".to_owned(),
+                true
+            )
+        );
+        assert_eq!(
+            event_line(&NetEvent::Refused {
+                peer,
+                reason: "evil\u{1b}]0;x\u{7}".into()
+            })
+            .0,
+            "network drive: 203.0.113.5:51234 not admitted: evil\u{fffd}]0;x\u{fffd}",
+            "peer-influenced text is sanitized"
+        );
+        assert_eq!(
+            event_line(&NetEvent::Stopped("no poll".into())),
+            ("network drive stopped: no poll".to_owned(), true)
+        );
     }
 }

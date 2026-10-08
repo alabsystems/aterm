@@ -18,17 +18,21 @@
 //! untrusted input: the pattern picks the first, the haystack picks the second.
 //! Linear in the haystack still means 30 seconds when the constant is sixteen
 //! thousand instructions (see the crate docs for the measured pair). So
-//! [`search`] takes a `step_limit` and charges every unit of work against it —
-//! one per input position visited, one per byte the prefilter skips, one per
+//! [`search`] takes a budget and charges every unit of work against it — one
+//! per input position visited, one per byte the prefilter skips, one per
 //! instruction entered in the epsilon closure, and one per live thread stepped.
 //! That sum *is* the `positions × live threads` product the paragraph above
-//! bounds only in theory, counted for real.
+//! bounds only in theory, counted for real. The budget is taken by `&mut` and
+//! left holding what remains, because one search is not the unit a caller
+//! pays for: a `find_iter` runs one search per match, and leftmost-first
+//! iteration can re-walk the rest of the haystack in every one of them.
 //!
-//! When the budget runs out the search returns [`StepLimitExceeded`] and no
-//! span at all. It deliberately does not return the best match found so far:
-//! a truncated search has not established that an earlier or longer match does
-//! not exist, so any span it could hand back might be the wrong one, and a
-//! wrong answer is worse than a refusal. The check runs once per input position
+//! When the budget runs out the search returns [`Exhausted`] — surfaced as
+//! [`StepLimitExceeded`](crate::StepLimitExceeded) — and no span at all. It
+//! deliberately does not return the best match found so far: a truncated
+//! search has not established that an earlier or longer match does not exist,
+//! so any span it could hand back might be the wrong one, and a wrong answer
+//! is worse than a refusal. The check runs once per input position
 //! rather than once per work unit, so the overshoot is bounded by one
 //! position's worth of work (at most the program size) and the inner loops stay
 //! branch-free.
@@ -51,7 +55,6 @@
 //!   threads survive and may still overwrite it with a longer match — which is
 //!   exactly how a greedy `a+` keeps going.
 
-use crate::StepLimitExceeded;
 use crate::compile::{Inst, Prefilter, Program};
 use crate::parse::Assertion;
 use crate::unicode;
@@ -138,17 +141,44 @@ impl Cache {
 /// [`Inst::Match`]. The span it reports is then not necessarily the leftmost
 /// -first one, so this is only for `is_match`, which asks a yes/no question.
 ///
-/// `step_limit` bounds the work — see the module docs. Exhausting it returns
-/// `Err(StepLimitExceeded)` and never a span: a search that was cut short has
-/// not established which match is leftmost-first, or whether one exists at all.
+/// `budget` is the work this search may still charge — see the module docs —
+/// and is left holding what remains, so the searches of one `find_iter` can
+/// share a single budget rather than each starting from a full one. Exhausting
+/// it returns `Err(Exhausted)` and never a span: a search that was cut short
+/// has not established which match is leftmost-first, or whether one exists.
 pub(crate) fn search(
     prog: &Program,
     cache: &mut Cache,
     text: &str,
     start: usize,
     earliest: bool,
+    budget: &mut u64,
+) -> Result<Option<(usize, usize)>, Exhausted> {
+    let mut spent = 0;
+    let outcome = simulate(prog, cache, text, start, earliest, *budget, &mut spent);
+    *budget = budget.saturating_sub(spent);
+    outcome
+}
+
+/// A search that ran out of budget before it could answer. The public face of
+/// this is [`StepLimitExceeded`](crate::StepLimitExceeded), which carries the
+/// configured limit; a search only knows what was left of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Exhausted;
+
+/// [`search`]'s simulation, charging every unit of work to `steps` and giving
+/// up once more than `step_limit` have been charged. Saturating everywhere: a
+/// `u64` of work units is unreachable in this universe, and saturation keeps
+/// the accounting from wrapping back under the limit if one ever were.
+fn simulate(
+    prog: &Program,
+    cache: &mut Cache,
+    text: &str,
+    start: usize,
+    earliest: bool,
     step_limit: u64,
-) -> Result<Option<(usize, usize)>, StepLimitExceeded> {
+    steps: &mut u64,
+) -> Result<Option<(usize, usize)>, Exhausted> {
     let Cache {
         clist,
         nlist,
@@ -157,15 +187,10 @@ pub(crate) fn search(
     clist.resize(prog.insts.len());
     nlist.resize(prog.insts.len());
 
-    // Work charged so far. Saturating everywhere: a `u64` of work units is
-    // unreachable in this universe, and saturation keeps the accounting from
-    // wrapping back under the limit if one ever were.
-    let mut steps: u64 = 0;
     let mut matched: Option<(usize, usize)> = None;
     // `\A` holds at offset 0 of the text and nowhere else, so a start-anchored
     // program asked to search from any later offset has already been answered.
-    // This is the case `find_iter` walks into: having taken the match at 0, it
-    // asks again from its end, and every such ask used to re-scan the row.
+    // `find_iter` asks again from the end of a match at 0; this saves the rescan.
     if prog.start_anchored && start > 0 {
         return Ok(None);
     }
@@ -173,7 +198,7 @@ pub(crate) fn search(
     loop {
         // One unit for arriving at this position at all, so a haystack that
         // keeps no thread alive is still charged for being walked.
-        steps = steps.saturating_add(1);
+        *steps = steps.saturating_add(1);
         if matched.is_none() {
             if prog.start_anchored {
                 // An anchored program starts threads at offset 0 and nowhere
@@ -193,7 +218,7 @@ pub(crate) fn search(
                     // it is charged by the byte: cheap per unit, but not free,
                     // and a 3 MB haystack of nothing but skipped bytes is real
                     // work the budget has to see.
-                    steps = steps.saturating_add(u64::try_from(skipped - pos).unwrap_or(u64::MAX));
+                    *steps = steps.saturating_add(u64::try_from(skipped - pos).unwrap_or(u64::MAX));
                     pos = skipped;
                     // The list's visited marks describe the closure at the
                     // position we just left. Empty of threads it may be, but a
@@ -206,7 +231,7 @@ pub(crate) fn search(
                     clist.begin();
                 }
             }
-            steps = steps.saturating_add(add(clist, stack, prog, prog.start, pos, pos, text));
+            *steps = steps.saturating_add(add(clist, stack, prog, prog.start, pos, pos, text));
         }
         let ch = text.get(pos..).and_then(|rest| rest.chars().next());
         nlist.begin();
@@ -215,12 +240,12 @@ pub(crate) fn search(
             i += 1;
             // One unit per live thread stepped. Summed over the loop this is
             // the `positions × live threads` product the budget exists to cap.
-            steps = steps.saturating_add(1);
+            *steps = steps.saturating_add(1);
             match prog.insts.get(t.pc) {
                 Some(&Inst::Char { c, next }) => {
                     if Some(c) == ch {
                         let at = pos + c.len_utf8();
-                        steps =
+                        *steps =
                             steps.saturating_add(add(nlist, stack, prog, next, t.start, at, text));
                     }
                 }
@@ -229,7 +254,7 @@ pub(crate) fn search(
                         && class_matches(prog, class, c)
                     {
                         let at = pos + c.len_utf8();
-                        steps =
+                        *steps =
                             steps.saturating_add(add(nlist, stack, prog, next, t.start, at, text));
                     }
                 }
@@ -254,8 +279,8 @@ pub(crate) fn search(
         // cost being refused. The one search that outruns the budget and still
         // answers is the `earliest` one above, which returned already: a
         // positive answer is complete evidence and needs no more work.
-        if steps > step_limit {
-            return Err(StepLimitExceeded::new(step_limit));
+        if *steps > step_limit {
+            return Err(Exhausted);
         }
         let Some(c) = ch else { break };
         pos += c.len_utf8();
@@ -457,7 +482,10 @@ mod tests {
     fn find(pattern: &str, text: &str, start: usize) -> Option<(usize, usize)> {
         let ast = parse(pattern, Flags::default()).expect("parses");
         let prog = compile(&ast, usize::MAX).expect("compiles");
-        search(&prog, &mut Cache::new(), text, start, false, u64::MAX).expect("budget is unbounded")
+        search(&prog, &mut Cache::new(), text, start, false, &mut {
+            u64::MAX
+        })
+        .expect("budget is unbounded")
     }
 
     /// Every assertion, at every position of a haystack that exercises it.
@@ -545,8 +573,10 @@ mod tests {
         let ast = parse(r"\d+|[a-c]+", Flags::default()).expect("parses");
         let prog = compile(&ast, usize::MAX).expect("compiles");
         for text in ["", "x", "abc", "x42", "42abc", "zzz"] {
-            let full = search(&prog, &mut Cache::new(), text, 0, false, u64::MAX).expect("budget");
-            let quick = search(&prog, &mut Cache::new(), text, 0, true, u64::MAX).expect("budget");
+            let full = search(&prog, &mut Cache::new(), text, 0, false, &mut { u64::MAX })
+                .expect("budget");
+            let quick =
+                search(&prog, &mut Cache::new(), text, 0, true, &mut { u64::MAX }).expect("budget");
             assert_eq!(full.is_some(), quick.is_some(), "{text:?}");
         }
     }
@@ -564,7 +594,7 @@ mod tests {
         for pad in 0..40usize {
             let text = format!("{}needle{}", "x".repeat(pad), "y".repeat(pad));
             assert_eq!(
-                search(&prog, &mut cache, &text, 0, false, u64::MAX),
+                search(&prog, &mut cache, &text, 0, false, &mut { u64::MAX }),
                 Ok(Some((pad, pad + 6))),
                 "pad {pad}"
             );
@@ -604,14 +634,17 @@ mod tests {
         let big = "abc".repeat(20);
         for _ in 0..50 {
             assert_eq!(
-                search(&small, &mut cache, "zza", 0, false, u64::MAX),
+                search(&small, &mut cache, "zza", 0, false, &mut { u64::MAX }),
                 Ok(Some((2, 3)))
             );
             assert_eq!(
-                search(&large, &mut cache, &big, 0, false, u64::MAX),
+                search(&large, &mut cache, &big, 0, false, &mut { u64::MAX }),
                 Ok(Some((0, 60)))
             );
-            assert_eq!(search(&small, &mut cache, "", 0, false, u64::MAX), Ok(None));
+            assert_eq!(
+                search(&small, &mut cache, "", 0, false, &mut { u64::MAX }),
+                Ok(None)
+            );
         }
     }
 
@@ -625,13 +658,13 @@ mod tests {
         let mut cache = Cache::new();
 
         assert_eq!(
-            search(&prog, &mut cache, &text, 0, false, u64::MAX),
+            search(&prog, &mut cache, &text, 0, false, &mut { u64::MAX }),
             Ok(None),
             "with budget to spare the answer is a completed no-match"
         );
         assert_eq!(
-            search(&prog, &mut cache, &text, 0, false, 100),
-            Err(StepLimitExceeded::new(100)),
+            search(&prog, &mut cache, &text, 0, false, &mut 100),
+            Err(Exhausted),
             "and a hundred units cannot cross ten thousand positions"
         );
         // The refusal is about the work, not the outcome: the same starved
@@ -639,11 +672,11 @@ mod tests {
         // reporting the span it was about to find.
         let matching = format!("{}b", "a".repeat(10_000));
         assert_eq!(
-            search(&prog, &mut cache, &matching, 0, false, 100),
-            Err(StepLimitExceeded::new(100))
+            search(&prog, &mut cache, &matching, 0, false, &mut 100),
+            Err(Exhausted)
         );
         assert_eq!(
-            search(&prog, &mut cache, &matching, 0, false, u64::MAX),
+            search(&prog, &mut cache, &matching, 0, false, &mut { u64::MAX }),
             Ok(Some((0, 10_001)))
         );
     }
@@ -660,12 +693,12 @@ mod tests {
         let text = "x".repeat(100_000);
         let mut cache = Cache::new();
         assert_eq!(
-            search(&prog, &mut cache, &text, 0, false, 1_000),
-            Err(StepLimitExceeded::new(1_000)),
+            search(&prog, &mut cache, &text, 0, false, &mut 1_000),
+            Err(Exhausted),
             "100,000 skipped bytes are 100,000 units of real work"
         );
         assert_eq!(
-            search(&prog, &mut cache, &text, 0, false, u64::MAX),
+            search(&prog, &mut cache, &text, 0, false, &mut { u64::MAX }),
             Ok(None)
         );
     }

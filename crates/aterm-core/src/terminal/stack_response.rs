@@ -4,17 +4,11 @@
 
 //! Inline (stack-allocated) builder for small terminal query replies.
 //!
-//! Most terminal responses (DA/DSR/cursor-position-report/DECRQSS/…) are a
-//! handful of bytes. Building them with `format!`/`String`/`Vec` heap-allocates
-//! a throwaway buffer on every query. [`StackResponse`] formats into a fixed
-//! `[u8; N]` on the stack instead, so the common small case is allocation-free.
-//!
-//! The output bytes are identical to the `format!` path: the same
-//! `core::fmt::Write` machinery formats the same arguments. If a response ever
-//! exceeds `N` bytes the surplus is dropped at the boundary — but the callers
-//! here only emit bounded numeric replies (a few `u16` fields plus fixed
-//! punctuation) that fit `N` with wide headroom, and a debug assertion guards
-//! against silent truncation in test builds.
+//! [`StackResponse`] formats DA/DSR/CPR/DECRQSS-sized replies into a fixed
+//! `[u8; N]` with `core::fmt::Write`, producing the same bytes as `format!`
+//! without a heap allocation. Surplus past `N` is dropped; callers emit bounded
+//! numeric replies that fit with headroom, and a debug assertion catches
+//! truncation in test builds.
 
 use core::fmt::{self, Write};
 
@@ -70,9 +64,8 @@ impl<const N: usize> Write for StackResponse<N> {
             "StackResponse<{N}> overflow: response exceeded inline capacity",
         );
         if end > N {
-            // Release-build safety net: never write out of bounds. Truncating
-            // is preferable to panicking in the hot parser path; callers size
-            // `N` so this branch is unreachable in practice.
+            // Never write out of bounds: truncate rather than panic in the parser
+            // hot path. Callers size `N` so this is unreachable.
             let avail = N - self.len;
             self.buf[self.len..N].copy_from_slice(&bytes[..avail]);
             self.len = N;

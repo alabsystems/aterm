@@ -26,11 +26,9 @@ impl GridStorage {
         self.scrollback.as_mut()
     }
 
-    /// Set the tiered store's RAW line limit (the store SHARE, not the user's
-    /// total). The unified total-retention split — total = store share + ring
-    /// cap (audit E1) — lives in [`Grid::set_scrollback_line_limit`], which
-    /// also drains the lazy buffer and re-caps the ring; this low-level writer
-    /// is for callers that already did that arithmetic.
+    /// Set the tiered store's raw line limit (the store share, not the user's
+    /// total). [`Grid::set_scrollback_line_limit`] does the total = share + ring
+    /// cap split, drains the lazy buffer and re-caps the ring.
     ///
     /// [`Grid::set_scrollback_line_limit`]: crate::Grid::set_scrollback_line_limit
     #[cfg(test)]
@@ -40,14 +38,12 @@ impl GridStorage {
         }
     }
 
-    /// Get the effective scrollback line limit (`None` = unlimited).
+    /// The effective total scrollback line limit (`None` = unlimited).
     ///
-    /// ONE TOTAL retention count (audit E1): tiered grids report the store's
-    /// limit PLUS the ring cap — the inverse of the unified split
-    /// `Grid::set_scrollback_line_limit` applies — so a set/get round-trips
-    /// the same number. During an off-thread reflow the store's detach-time
-    /// value (or the newest deferred mutation) remains observable. Ring-only
-    /// grids have no store — the ring cap IS retention.
+    /// Tiered grids report the store's limit plus the ring cap, so a set/get
+    /// round-trips. During an off-thread reflow the detach-time value (or the
+    /// newest deferred mutation) is reported. Ring-only grids report the ring
+    /// cap.
     #[must_use]
     pub fn scrollback_line_limit(&self) -> Option<usize> {
         if self.scrollback_detached_for_reflow
@@ -81,16 +77,10 @@ impl GridStorage {
             .map(ScrollbackStorage::memory_budget)
     }
 
-    /// True when evicted ring rows must be STAGED for tiered retention
-    /// (`scroll_up`'s reuse path): a store is attached and can retain at
-    /// least one line, or the store is temporarily detached for an
-    /// off-thread reflow (staged lines flush on re-attach — dropping them
-    /// would punch a gap in history, audit bug B). A store capped at ZERO
-    /// retains nothing — staging every evicted row only for `push_line` to
-    /// immediately truncate it would put a per-line materialize+push+drop
-    /// cycle on the PTY-drain hot path (the unified-limit `total == ring
-    /// cap` default, audit E1), so those rows are discarded directly,
-    /// exactly like the no-store path.
+    /// Whether evicted ring rows are staged for tiered retention (`scroll_up`'s
+    /// reuse path): a store is attached that retains at least one line, or the
+    /// store is detached for reflow (staged lines flush on re-attach). With a
+    /// zero-capacity store, rows are discarded directly, as without a store.
     #[must_use]
     #[inline]
     pub(crate) fn stages_evicted_rows(&self) -> bool {
@@ -149,11 +139,8 @@ impl GridStorage {
         self.lazy_buffer.len()
     }
 
-    /// Lines in the tiered scrollback plus lazy buffer (if any).
-    ///
-    /// Lazy buffer lines are deferred scrollback lines that have not yet been
-    /// materialized. From the caller's perspective, they are scrollback lines
-    /// pending promotion to the tiered storage.
+    /// Lines in the tiered scrollback plus the lazy buffer (deferred lines
+    /// pending promotion to the store).
     #[must_use]
     #[inline]
     pub fn tiered_scrollback_lines(&self) -> usize {

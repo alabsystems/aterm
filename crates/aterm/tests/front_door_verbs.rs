@@ -19,25 +19,25 @@
 
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-/// One private HOME/XDG/TMPDIR root for every launch in this binary. Without it a
-/// verb that dials (`aterm ctl …`) finds the LIVE aterm on the machine running the
-/// suite and sends it the probe line — measured 2026-09-25: every run typed
-/// `--aterm-front-door-routing-probe` into the owner's session and waited on it.
-fn isolated(cmd: &mut Command) -> &mut Command {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    let root = ROOT.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!("aterm-front-door-{}", std::process::id()));
-        launch_isolation::prepare(&root).expect("prepare an isolated root");
-        root
-    });
+/// One private HOME/XDG/TMPDIR root for every launch of one test — the pair the
+/// parity test compares included, so both see one world — removed when the test's
+/// guard drops. Without it a verb that dials (`aterm ctl …`) finds the LIVE aterm on
+/// the machine running the suite and sends it the probe line — measured 2026-09-25:
+/// every run typed `--aterm-front-door-routing-probe` into the owner's session and
+/// waited on it.
+fn private_root() -> aterm_tempfile::TempDir {
+    launch_isolation::scratch_root("aterm-front-door")
+}
+
+/// `cmd` launched in `root` ([`private_root`]).
+fn isolated<'a>(cmd: &'a mut Command, root: &Path) -> &'a mut Command {
     launch_isolation::apply(cmd, root);
     cmd
 }
@@ -51,25 +51,15 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// Run `aterm <args…>` with a REAL terminal on all three streams and return
 /// everything it wrote. This is the operator's situation, and the one the
 /// regression depended on.
-fn on_a_terminal(args: &[&str]) -> String {
-    let (mut master, mut slave) = (-1, -1);
-    // SAFETY: `openpty` writes the two fds through its out-params; the trailing
-    // three are NULL, which the API defines as "default termios and window size".
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
-    // SAFETY: both fds come from the successful `openpty` above and are owned
+fn on_a_terminal(root: &Path, args: &[&str]) -> String {
+    // Both ends close-on-exec from birth: the verb holds its terminal and never
+    // a copy of its master, and no sibling test's child inherits either end.
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    // SAFETY: both fds come from the successful open above and are owned
     // here — nothing else holds or closes them.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
 
-    let mut child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")))
+    let mut child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")), root)
         .args(args)
         .stdin(Stdio::from(slave.try_clone().expect("dup pty slave")))
         .stdout(Stdio::from(slave.try_clone().expect("dup pty slave")))
@@ -117,8 +107,8 @@ fn on_a_terminal(args: &[&str]) -> String {
 
 /// The same invocation with stdio PIPED — the route the broken build happened to
 /// get right, kept here only so the parity test below can compare the two.
-fn through_a_pipe(args: &[&str]) -> String {
-    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")))
+fn through_a_pipe(root: &Path, args: &[&str]) -> String {
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")), root)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -145,8 +135,9 @@ fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
     // A flag no verb's tool defines: it provokes each tool's own usage error
     // without asking any of them to DO anything.
     const PROBE: &str = "--aterm-front-door-routing-probe";
+    let root = private_root();
     for verb in aterm_cli::Verb::ALL {
-        let out = on_a_terminal(&[verb.name(), PROBE]);
+        let out = on_a_terminal(root.path(), &[verb.name(), PROBE]);
         assert!(
             !out.contains(&format!("aterm: unknown command {}", verb.name())),
             "`aterm {}` fell through to the SESSION parser at a terminal — the verb is \
@@ -169,9 +160,10 @@ fn every_verb_answers_the_same_with_or_without_a_terminal() {
             .trim()
             .to_string()
     };
+    let root = private_root();
     for verb in aterm_cli::Verb::ALL {
-        let tty = on_a_terminal(&[verb.name(), PROBE]);
-        let pipe = through_a_pipe(&[verb.name(), PROBE]);
+        let tty = on_a_terminal(root.path(), &[verb.name(), PROBE]);
+        let pipe = through_a_pipe(root.path(), &[verb.name(), PROBE]);
         assert_eq!(
             first(&tty),
             first(&pipe),
@@ -189,7 +181,8 @@ fn every_verb_answers_the_same_with_or_without_a_terminal() {
 /// arguments after it were forwarded verbatim, while publishing nothing.
 #[test]
 fn ship_is_a_front_door_verb_at_a_terminal() {
-    let out = on_a_terminal(&["ship", "--help"]);
+    let root = private_root();
+    let out = on_a_terminal(root.path(), &["ship", "--help"]);
     assert!(
         !out.contains("unknown option") && !out.contains("aterm: unknown command ship"),
         "`aterm ship` fell through to a parser that does not know the verb — the \
@@ -207,7 +200,11 @@ fn ship_is_a_front_door_verb_at_a_terminal() {
 /// never a parser's "unknown command".
 #[test]
 fn an_uninstalled_roster_tool_names_the_install_not_an_unknown_command() {
-    for out in [on_a_terminal(&["ty"]), through_a_pipe(&["ty"])] {
+    let root = private_root();
+    for out in [
+        on_a_terminal(root.path(), &["ty"]),
+        through_a_pipe(root.path(), &["ty"]),
+    ] {
         assert!(
             out.contains("ty is not installed (fix: aterm pkg install ty)"),
             "{out:?}"

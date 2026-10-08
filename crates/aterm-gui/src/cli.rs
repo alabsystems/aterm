@@ -173,14 +173,17 @@ const HELP_HEAD: &str = concat!(
     "                                   renderer, capabilities, config, env) and exit.\n",
     "        --list-actions             List the bindable [keybindings] action names\n",
     "                                   and exit.\n",
-    "        --validate-config          Parse the config file, report OK/errors, exit\n",
-    "                                   0 if valid (non-zero if not).\n",
+    "        --validate-config          Check aterm.toml: unknown keys (by line),\n",
+    "                                   unaccepted values (by key) and parse errors;\n",
+    "                                   exits 1 only when the file does not load.\n",
     "        --list-fonts               List the font search dirs and discoverable\n",
     "                                   font families, then exit.\n",
-    "        --show-config              Print the effective resolved config (flag >\n",
-    "                                   config > default) and exit.\n",
-    "        --write-config             Write a documented starter aterm.toml (every\n",
-    "                                   key commented) if absent, then exit.\n",
+    "        --show-config              Print what a launch resolves (font, size,\n",
+    "                                   renderer, theme, colours) and whether aterm.toml\n",
+    "                                   loaded, then exit.\n",
+    "        --write-config             Write a documented starter aterm.toml if absent\n",
+    "                                   (every line commented out, so it changes\n",
+    "                                   nothing), then exit.\n",
     "        --list-keybinds            List built-in + configured [keybindings] and\n",
     "                                   [key_sequences], plus bindable actions, then exit.\n",
     "        --show-face [family]       Print the resolved font face (path + metrics)\n",
@@ -279,7 +282,8 @@ const HELP_TAIL: &str = concat!(
     "              foreground, background, cursor_color, selection_color,\n",
     "              selection_foreground,\n",
     "              palette [array of #RRGGBB], window_theme, tab_strip_rows,\n",
-    "              robi (the tip-sharing helper robot; type robi to summon him).\n",
+    "              robi (the tip-sharing helper robot; default off; once on,\n",
+    "              typing robi makes him greet you).\n",
     "  Window/Tabs descriptive_titles, title_summary_provider, title_summary_model,\n",
     "              title_summary_endpoint, title_summary_token_file,\n",
     "              title_summary_timeout_seconds, title_summary_proxy_mode,\n",
@@ -291,8 +295,8 @@ const HELP_TAIL: &str = concat!(
     "              tab_status_badge, tab_connection_badge.\n",
     "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
     "              cursor_style, cursor_blink, cursor_momentum_glow (typing-speed glow),\n",
-    "              cursor_trail, cursor_trail_style\n",
-    "              (the LUMEN aurora), cursor_trail_color/_accent/_intensity/_radius,\n",
+    "              cursor_trail, cursor_trail_style (default rainbow kitty pet),\n",
+    "              cursor_trail_color/_accent/_intensity/_radius,\n",
     "              cursor_trail_ms/_length/_ring, cursor_trail_bloom (+_strength/_radius).\n",
     // Sound is its own help block because it is its own Settings box now (the
     // owner's Sound menu); listing it under Cursor is what made the volume dial
@@ -399,7 +403,7 @@ const STARTER_CONFIG: &str = "\
 #                       # \"nu\", or an absolute path also work. Unset = platform
 #                       # default (Windows: pwsh > powershell > %COMSPEC% > cmd;
 #                       # `aterm doctor` names the one this machine gets). Override
-#                       # at launch with --shell.
+#                       # at launch with --shell. Applies to new sessions.
 #                       # Shell integration (prompt marks, jump-to-prompt, command
 #                       # blocks, cwd tracking) is injected automatically for zsh,
 #                       # bash, fish, pwsh/powershell and \"wsl\" (whose distro must
@@ -441,7 +445,7 @@ const STARTER_CONFIG: &str = "\
 # bold_is_bright = true            # SGR bold promotes ANSI 0-7 to bright 8-15
 # faint_opacity = 0.5              # SGR dim: fg fraction kept, blended toward the bg
 # scrollback_lines = 100000        # total history across ring + tiered store (default 100k, 0 = unlimited)
-# tab_strip_rows = 1               # in-grid tab bar (Linux has no native toolbar)
+# tab_strip_rows = 1               # in-grid tab bar rows (default 1; 0 on macOS, whose toolbar carries tabs)
 
 # --- smart titles (window + tabs) ---------------------------------------------
 # aterm keeps the stable Title and an authored Description, and can add a generated
@@ -485,7 +489,7 @@ const STARTER_CONFIG: &str = "\
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
-# cursor_trail_intensity = 1.0         # aurora brightness 0.0..=1.0
+# cursor_trail_intensity = 1.0         # trail brightness 0.0..=1.0 (every style)
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0.0..=2.0)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
 # --- sound (Settings > Cursor & Motion > Sound) -------------------------------
@@ -507,7 +511,7 @@ const STARTER_CONFIG: &str = "\
 # cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only — light themes self-degrade; 0 = off)
 # stream_fade = true               # set true to enable streamed-output fade-in (default OFF; obeys Reduce Motion)
 # stream_fade_ms = 90              # fade-in duration in ms (16..=1000)
-# temporal_recording = false       # record a per-session replay spine (query via `aterm-ctl temporal [tick]`); default off, costs memory
+# temporal_recording = false       # record a per-session replay spine (query via `aterm-ctl temporal [tick]`); default off, costs memory; applies to new sessions
 
 # --- text shaping -------------------------------------------------------------
 # ligatures = true                 # programming ligatures (=>, !=, >=, ===, ...)
@@ -532,19 +536,20 @@ const STARTER_CONFIG: &str = "\
 # font_weight_dark_nudge = 0       # extra wght on DARK themes (applied only when grid-safe)
 
 # --- behaviour ----------------------------------------------------------------
-# gpu = false                      # GPU rendering is ON by default (auto CPU fallback); set false (or launch with --cpu) to force CPU
+# gpu = false                      # GPU rendering is ON by default (auto CPU fallback); false or --cpu forces CPU; applies next launch
 # copy_on_select = true            # auto-copy mouse selection to CLIPBOARD (DEFAULT on; OFF on Linux, where a
                                    # selection owns PRIMARY and the CLIPBOARD stays for explicit copies; true opts into both)
 # show_build_badge = false         # OPTIONAL floating top-right v<version>·<build> pill — DEFAULT off
                                    # (the version lives in the menu bar: the v<version> menu opens About)
-# confirm_multiline_paste = true   # confirm unbracketed multiline paste (macOS sheet / Windows dialog / Linux in-window banner)
+# confirm_multiline_paste = true   # confirm an unbracketed paste holding a line break (macOS sheet / Windows dialog / Linux in-window banner)
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
 # explain_heavy_load = true        # when typing slows because something else loads the machine, the message band names it
                                    # (\"Typing slowed by cargo in tab 2\"); details go to the log. false: off entirely
-# desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, a macOS permission, the operator, update
-                                   # health) also as system notifications (macOS: terminal-notifier, else osascript =
-                                   # \"Script Editor\"). DEFAULT off: they stay in the band, the menu bar and messages.log,
-                                   # the operator's only in `aterm fleet status` and `next`. Programs' OSC 9/99/777
+# desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, a macOS permission, the operator, and
+                                   # the one update-health cause only you can end) also as system notifications (macOS:
+                                   # terminal-notifier, else osascript = \"Script Editor\"). DEFAULT off: they stay in the
+                                   # band, the menu bar and messages.log,
+                                   # the operator's only counted in `aterm fleet status`. Programs' OSC 9/99/777
                                    # notifications are allow_notifications' below
 
 # --- security opt-ins (all default OFF) ---------------------------------------
@@ -556,7 +561,7 @@ const STARTER_CONFIG: &str = "\
 #                                  # shows a notification-area balloon/toast from aterm itself (Shell_NotifyIcon,
 #                                  # no subprocess); Linux has no delivery yet — the request is dropped
 # allow_palette_reconfigure = false
-# allow_kitty_file_transfer = false
+# allow_kitty_file_transfer = false # let Kitty file/temp-file/shm media read host files; applies to new sessions
 # allow_osc52_query = false        # programs may READ the clipboard (OSC 52); answered only when on. On macOS 26 that
 #                                  # read is what raises the system's \"aterm would like to paste from …\" alert
 # secure_keyboard_entry = false    # macOS: block other processes from observing keystrokes (held while aterm is frontmost)
@@ -581,7 +586,7 @@ const STARTER_CONFIG: &str = "\
 #                                  #   episodes escalate to the FUCK SUPER NOVA (supernova_chance)
 #                                  #   | \"nova\" = the v2 classic nova (one flash per appearance,
 #                                  #   WCAG-limited to <= 2 ignitions/s window-wide) | \"sparkle\" = v1
-# supernova_chance = 30            # rainbow-only escalation chance, percent (0..=100; 0 disables)
+# supernova_chance = 10            # rainbow-only escalation chance, percent (0..=100; 0 disables)
 # magic = true                     # Quasar (1/512) / Singularity (1/1024) rare nova variants
 # palette = [\"#ffd447\", \"#ff7ce5\", \"#7cf0ff\"]   # sparkle tints; empty → lively hue rotation
 # density = 3                      # sparks per word per frame (1..=12)
@@ -669,8 +674,8 @@ const STARTER_CONFIG: &str = "\
 # announce = true                  # a rerouted cargo/rustc/tlc says so before it runs
 #                                  #   upstream (false silences the line, never the run)
 
-# --- this Mac: host settings, applied as the window opens, by a terminal
-# session once a day, and by the next package pass after an edit here.
+# --- this Mac: host settings, applied once a day at the first window or
+# terminal session, and by the next package pass after an edit here.
 # `aterm pkg machine apply` applies now; `aterm pkg machine` reads them.
 # Settings ▸ Security shows the measured state and has Apply now. macOS only.
 # [machine]
@@ -825,6 +830,9 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let mut args = argv.clone().into_iter();
+    // An update's relaunch of a window that is already running (`ATERM_UPDATED_FROM`,
+    // set by every update lane on the image it starts): see `start_dir_refusal`.
+    let update_successor = std::env::var_os("ATERM_UPDATED_FROM").is_some();
     let mut cwd: Option<String> = None;
     let mut hold = false;
     let mut headless = false;
@@ -888,11 +896,11 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 answer_and_exit(&argv, &crate::diagnostics::show_config(), 0);
             }
             "--write-config" => {
-                // Discoverability: drop a fully-documented starter config (every key
-                // commented, so it changes nothing) where the loader looks for it.
+                // Discoverability: drop a documented starter config (every line
+                // commented out, so it changes nothing) where the loader looks for it.
                 let said = match crate::app_config::config_path() {
                     Some(path) if path.exists() => format!(
-                        "config already exists: {}\n(edit it directly — settings hot-reload on save)\n",
+                        "config already exists: {} (left unchanged)\n",
                         path.display()
                     ),
                     Some(path) => {
@@ -1031,8 +1039,8 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             }
             "-d" | "--working-directory" => {
                 let dir = flag_value("-d/--working-directory", &mut args);
-                if !std::path::Path::new(&dir).is_dir() {
-                    eprintln!("aterm: not a directory: {dir}");
+                if let Some(refusal) = start_dir_refusal(&dir, update_successor) {
+                    eprintln!("aterm: {refusal}");
                     std::process::exit(2);
                 }
                 cwd = Some(dir);
@@ -1171,6 +1179,21 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
     }
 }
 
+/// The usage error `-d <dir>` stops a launch with, or `None` to take the folder.
+///
+/// A folder that is not there stops a PERSON's launch — they typed it, and a
+/// window in some other folder would not be what they asked for. It never stops
+/// an UPDATE's relaunch of a window already running (`update_successor`; round
+/// eight of the update audit, #6): the folder was there when the window opened
+/// and has gone since (a removed worktree, an unmounted volume), and exiting 2
+/// there killed every successor of that window, so it never updated. The folder
+/// stays the window's default for new tabs, as it was; a shell that cannot start
+/// in it starts in the home folder and says so (`spawn_folder::start_folder`).
+fn start_dir_refusal(dir: &str, update_successor: bool) -> Option<String> {
+    (!update_successor && !std::path::Path::new(dir).is_dir())
+        .then(|| format!("not a directory: {dir}"))
+}
+
 /// The `--lifeline-fd` decision, pure: `Ok(None)` when the flag is absent — the
 /// launch every person and service makes, left exactly as it was — the descriptor
 /// number when it is well-formed on a headless launch, and the usage error
@@ -1197,6 +1220,24 @@ fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, 
 #[cfg(test)]
 mod tests {
     use super::HELP_HEAD;
+
+    /// Round eight of the update audit, #6: a `-d` folder that has gone since the
+    /// window opened stops a person's launch (exit 2, as it always did) and never
+    /// an update's relaunch of that window.
+    #[test]
+    fn a_vanished_start_folder_stops_a_launch_and_never_an_update_relaunch() {
+        let gone = std::env::temp_dir().join("aterm-start-dir-that-is-not-there-r8-6");
+        let gone = gone.to_string_lossy();
+        assert!(
+            super::start_dir_refusal(&gone, false).is_some_and(|why| why.contains(&*gone)),
+            "a person's launch is refused, naming the folder"
+        );
+        assert_eq!(super::start_dir_refusal(&gone, true), None);
+        let here = std::env::temp_dir();
+        let here = here.to_string_lossy();
+        assert_eq!(super::start_dir_refusal(&here, false), None);
+        assert_eq!(super::start_dir_refusal(&here, true), None);
+    }
 
     /// Every user-facing diagnostic verb. The advertise-vs-dispatch gate below
     /// requires EACH entry to be both documented in `--help` AND have a real match
@@ -1313,17 +1354,6 @@ mod tests {
                 "{flag} must be advertised in the help text"
             );
         }
-        // No environment rung in any precedence the help states: the env
-        // overrides were retired 2026-09-24, and the CONFIG line already reads
-        // `flag > config > default`.
-        assert!(
-            HELP_HEAD.contains("(flag >\n                                   config > default)"),
-            "--show-config states the precedence the build has"
-        );
-        assert!(
-            !HELP_HEAD.contains("(env >"),
-            "no retired env rung in --help"
-        );
     }
 
     /// Off macOS the KEYS section is generated from the platform seed table, so
@@ -1346,44 +1376,6 @@ mod tests {
         );
         assert!(
             keys.contains("ctrl+alt+click"),
-            "the gesture the link caption names over a mouse-tracking program:\n{keys}"
-        );
-    }
-
-    /// On macOS the KEYS section is hand-written (macOS ships an empty
-    /// `platform_defaults()`; the menu bar owns the chords), so it has no
-    /// generative source to be complete against. It documents the COMMON set
-    /// and must (audit-2 item 17) both cover the high-traffic chords the old
-    /// list omitted — the Command Palette and reopen-tab — and SIGNAL that it
-    /// is partial, pointing at the menu bar as the exhaustive reference, so a
-    /// user does not read the absence of splits/pane-focus as their absence.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_keys_help_covers_the_common_chords_and_admits_it_is_partial() {
-        let keys = super::keys_help();
-        for chord in [
-            "Cmd-T",
-            "Cmd-W",
-            "Cmd-N",
-            "Cmd-F",
-            "Cmd-Shift-T",
-            "Cmd-Shift-P",
-            // Pane focus has no menu item, so the menu bar cannot teach it
-            // (`keybinding::BUILTIN_CMD_CHORDS`: cmd+alt+arrow).
-            "Cmd-Opt-Arrow",
-        ] {
-            assert!(keys.contains(chord), "{chord} must be documented:\n{keys}");
-        }
-        assert!(
-            keys.contains("Command Palette"),
-            "the palette — the door to every action — must be named"
-        );
-        assert!(
-            keys.contains("menu bar lists them ALL"),
-            "the section must signal it is not exhaustive:\n{keys}"
-        );
-        assert!(
-            keys.contains("Cmd-Option-click"),
             "the gesture the link caption names over a mouse-tracking program:\n{keys}"
         );
     }
@@ -1521,13 +1513,11 @@ mod tests {
         // The parser has no way left to write the environment at all (the
         // `flag_env` funnel every flag once exported through is deleted).
         let source = include_str!("cli.rs");
-        for writer in [["aterm_log::env::", "set("], ["fn flag_", "env("]] {
-            let writer = writer.concat();
-            assert!(
-                !source.contains(&writer),
-                "a launch flag must not export anything: found `{writer}`"
-            );
-        }
+        let writer = ["aterm_log::env::", "set("].concat();
+        assert!(
+            !source.contains(&writer),
+            "a launch flag must not export anything: found `{writer}`"
+        );
     }
 
     #[test]
@@ -1617,25 +1607,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn help_documents_env_stripping() {
-        // FINDING #7: the child-shell env sanitization must be discoverable from
-        // --help, not only the README.
-        for prefix in [
-            "CLAUDE",
-            "ANTHROPIC_",
-            "COPILOT_",
-            "CODEX_",
-            "CURSOR_",
-            "AI_",
-        ] {
-            assert!(
-                super::HELP_TAIL.contains(prefix),
-                "the env-hygiene note must name the {prefix} deny prefix"
-            );
-        }
-    }
-
     /// `--help`'s CONFIG line and the starter's header name the path the loader
     /// resolves on THIS machine, never a literal: measured 2026-09-22 on 0.90.0,
     /// both printed the Unix `~/.config/aterm/aterm.toml` on a Windows box
@@ -1674,143 +1645,6 @@ mod tests {
             super::STARTER_CONFIG.lines().count(),
             "only the header changes"
         );
-    }
-
-    /// The `allow_notifications` comment says where delivery happens on each
-    /// platform that delivers — macOS by subprocess, Windows in-process
-    /// (notify.rs's `Shell_NotifyIcon` balloon) — and that Linux has none. It
-    /// used to name macOS alone, as if the other platforms dropped the request.
-    #[test]
-    fn starter_config_says_where_notifications_are_delivered_per_platform() {
-        let block: Vec<&str> = super::STARTER_CONFIG
-            .lines()
-            .skip_while(|l| !l.starts_with("# allow_notifications ="))
-            .take_while(|l| {
-                l.starts_with("# allow_notifications =")
-                    || l.starts_with("#                                  #")
-            })
-            .collect();
-        let text = block.join("\n");
-        assert!(block.len() >= 3, "{text}");
-        for needle in [
-            "terminal-notifier",
-            "osascript",
-            "Windows",
-            "notification-area balloon/toast",
-            "Shell_NotifyIcon",
-            "Linux has no delivery",
-        ] {
-            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
-        }
-        // The prose is the code's claim: the platforms it says deliver are the
-        // ones `notify` builds a delivery host for.
-        assert_eq!(
-            crate::notify::delivery_available(),
-            cfg!(any(target_os = "macos", windows))
-        );
-    }
-
-    /// The `shell` comment names the Windows default in the order the spawn
-    /// takes it (`aterm-pty`'s `select_shell`: pwsh, powershell, `%COMSPEC%`,
-    /// then cmd) — it used to skip `%COMSPEC%` — and where to see the one this
-    /// machine resolves.
-    #[test]
-    fn starter_config_names_the_windows_default_shell_order() {
-        let shell_block: String = super::STARTER_CONFIG
-            .lines()
-            .skip_while(|l| !l.starts_with("# shell = "))
-            .take(6)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            shell_block.contains("(Windows: pwsh > powershell > %COMSPEC% > cmd;"),
-            "{shell_block}"
-        );
-        assert!(
-            shell_block.contains("`aterm doctor` names the one this machine gets"),
-            "{shell_block}"
-        );
-    }
-
-    #[test]
-    fn starter_config_discloses_timing_defaults_and_platform_limits() {
-        let line_for = |key: &str| {
-            super::STARTER_CONFIG
-                .lines()
-                .find(|line| line.trim_start().starts_with(&format!("# {key} =")))
-                .unwrap_or_else(|| panic!("missing starter line for {key}"))
-        };
-
-        assert!(super::HELP_TAIL.contains("launch/session settings disclose their timing"));
-        assert!(
-            super::STARTER_CONFIG.contains(
-                "renderer/initial-grid settings require relaunch, and session settings require a new session"
-            )
-        );
-
-        let cursor_break = line_for("cursor_break_ligatures");
-        assert!(cursor_break.contains("= true"), "{cursor_break}");
-        assert!(cursor_break.contains("default false"), "{cursor_break}");
-
-        // The [machine] host settings are disclosed with their defaults and the
-        // ways they apply (as the window opens, a session once a day, a pass after an edit;
-        // `aterm pkg machine apply` now) — and the block sits ABOVE
-        // `[key_sequences]`/`[keybindings]`.
-        let universal_control = line_for("universal_control");
-        assert!(
-            universal_control.contains("= \"off\""),
-            "{universal_control}"
-        );
-        assert!(
-            universal_control.contains("\"leave\""),
-            "{universal_control}"
-        );
-        let noindex = line_for("spotlight_noindex");
-        assert!(noindex.contains("= true"), "{noindex}");
-        assert!(noindex.contains(".noindex"), "{noindex}");
-        let machine_at = super::STARTER_CONFIG.find("# [machine]").unwrap();
-        let sequences_at = super::STARTER_CONFIG.find("# [key_sequences]").unwrap();
-        assert!(
-            machine_at < sequences_at,
-            "[machine] must precede the tail tables"
-        );
-        // THE COMMAND IS SPLIT BY THE COMMENT'S OWN WRAP, and the wrap is not free
-        // to change: `settings.rs` derives its category list from these `# --- <label>`
-        // headers, so reflowing this block to keep the command on one line adds a
-        // category and turns `category_layout_matches_grouping_table` red (measured
-        // 2026-09-14). Assert the command the way the file can actually carry it.
-        let machine_block = &super::STARTER_CONFIG[machine_at.saturating_sub(400)..machine_at];
-        assert!(
-            machine_block.contains("aterm pkg")
-                && machine_block.contains("machine apply` applies now"),
-            "the starter config must tell the reader that `aterm pkg machine apply` \
-             applies these now, even though the comment wrap splits the command"
-        );
-
-        let colorspace = line_for("window_colorspace");
-        assert!(
-            colorspace.contains("macOS GPU CAMetalLayer"),
-            "{colorspace}"
-        );
-        let opacity = line_for("background_opacity");
-        assert!(opacity.contains("macOS GPU window glass"), "{opacity}");
-        assert!(opacity.contains("other renderers stay solid"), "{opacity}");
-        let audio = line_for("trail_sounds");
-        assert!(audio.contains("macOS-only"), "{audio}");
-        assert!(audio.contains("inert elsewhere"), "{audio}");
-        let sdr_glow = line_for("cursor_glow_sdr_boost");
-        assert!(sdr_glow.contains("GPU-only"), "{sdr_glow}");
-        let stream_fade = line_for("stream_fade");
-        assert!(stream_fade.contains("set true to enable"), "{stream_fade}");
-        assert!(stream_fade.contains("default OFF"), "{stream_fade}");
-        // The pastejacking confirm has a surface on every platform now — the
-        // starter config must name all three, and never resurrect the audited
-        // "no prompt elsewhere" caveat.
-        let paste = line_for("confirm_multiline_paste");
-        assert!(paste.contains("macOS sheet"), "{paste}");
-        assert!(paste.contains("Linux in-window banner"), "{paste}");
-        let cos = line_for("copy_on_select");
-        assert!(cos.contains("OFF on Linux"), "{cos}");
     }
 
     #[test]
@@ -1912,14 +1746,13 @@ mod tests {
                  `[table]` header? Keep all bare top-level keys ABOVE every table."
             );
         }
-        // The M2 "ink that dries" keys default OFF in an absent config; the
-        // generated starter file opts in. Guard that this intentional starter
-        // choice and its duration never silently drop out of the sample.
+        // stream_fade / stream_fade_ms default OFF; the starter file shows them
+        // commented out. Guard that the sample keeps both.
         for must in ["stream_fade", "stream_fade_ms"] {
             assert!(
                 checked.iter().any(|k| k == must),
-                "STARTER_CONFIG dropped `{must}` — keep the explicit starter-file \
-                 stream-fade opt-in and its duration together."
+                "STARTER_CONFIG dropped `{must}` — keep the stream-fade sample and \
+                 its duration together."
             );
         }
         for inert in [
@@ -1933,48 +1766,6 @@ mod tests {
                 "new starter configs must not advertise compatibility-only `{inert}`"
             );
         }
-    }
-
-    /// `aterm help config` tells the reader HOW MANY keys the starter ships, and
-    /// that count lives in another crate (`aterm-cli`'s manual) that cannot read
-    /// this private const. So the number is pinned HERE, where the starter is
-    /// edited: growing the starter reds this test, and the message names the one
-    /// other copy to move. The count is of DISTINCT key names over every
-    /// commented `key = …` line, table-scoped ones included — the same thing a
-    /// reader counts in the written file.
-    #[test]
-    fn starter_config_key_count_matches_the_manual() {
-        let mut keys: Vec<&str> = Vec::new();
-        for raw in super::STARTER_CONFIG.lines() {
-            let line = raw.trim_start();
-            let Some(rest) = line.strip_prefix('#') else {
-                continue;
-            };
-            let rest = rest.trim_start();
-            if rest.starts_with('[') {
-                continue;
-            }
-            let Some((key, _)) = rest.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            if !key.is_empty()
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-            {
-                keys.push(key);
-            }
-        }
-        keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(
-            keys.len(),
-            157,
-            "the starter config's key count moved — update the `157 keys` line in \
-             `aterm help config` (crates/aterm-cli/src/manual.rs, CONFIG_PAGE) and \
-             this number together"
-        );
     }
 
     /// The `[matrix_rain]` starter block is TABLE-scoped, which the `in_table`

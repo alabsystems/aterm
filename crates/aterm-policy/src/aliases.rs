@@ -3,23 +3,20 @@
 
 //! Named selector aliases (§3.4).
 //!
-//! These aliases are the human-readable names used in the TOML policy; the
-//! engine translates them to concrete `SequenceSelector` tokens.
+//! Human-readable names usable in a rule's `sequence`; the selector parser
+//! translates them to concrete selector syntax.
 
 /// One row of the alias table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AliasEntry {
     /// The alias token that appears in a `Rule::sequence` string.
     pub alias: &'static str,
-    /// Human-readable expansion — what the alias stands for. Kept as a doc
-    /// comment on the TOML schema; the compiled form is derived inside the
-    /// engine crate from the concrete alias name.
+    /// What the alias stands for. The compiled form lives in the selector
+    /// parser.
     pub expansion: &'static str,
 }
 
 /// The full alias table from design §3.4.
-///
-/// Order is preserved for determinism (tests assert each row by index).
 pub const ALIAS_TABLE: &[AliasEntry] = &[
     AliasEntry {
         alias: "OSC 52 set",

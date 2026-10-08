@@ -1,77 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE HAND TAKES THE WAKE IT BRIDGED — FROM EITHER SIDE** (2026-09-16).
+//! A typed key takes the hop wake it lands in, from either side.
 //!
-//! A word hop across the dark stretch a mid-line edit left lays a wake; the
-//! key typed at its landing used to join whichever cohort `join_cohort`
-//! found first. When the landing lay past the line's old end that was the
-//! wake, and the first cut of `Ribbon::fold_wakes_into_band` folded it into
-//! the band it touched. When the landing lay INSIDE the typed cohort's
-//! bounds — which never shrink when the witness retires the cells under
-//! them — the key joined the typed cohort instead, the wake stayed a wake
-//! no key holds, and its cells expired on the hop's 0.55 s under a typing
-//! hand: `###########..########` (the adversarial review of the first cut,
-//! 540 ms after the hop). Every wake at the cell a typed key lays is folded
-//! now, from either side; a band already on its way out is not taken back
-//! by a key in a wake beside it; and no column ends up with two owners of
-//! one cohort.
+//! A word hop across the dark stretch a mid-line edit left lays a wake. The
+//! key typed at its landing joins a cohort via `join_cohort`; a landing past
+//! the line's old end meets the wake, while a landing inside the typed
+//! cohort's bounds (which never shrink when the witness retires cells under
+//! them) meets the typed cohort. Either way, `Ribbon::fold_wakes_into_band`
+//! folds every wake at the key's cell into the band, so no wake cell expires
+//! on the hop's 0.55 s under a typing hand. A band already on its way out is
+//! not taken back by a key in a wake beside it, and no column ends up with
+//! two owners of one cohort.
 //!
 //! Driven at the host seam through a real [`Terminal`], as
 //! `tests/abandoned_ribbon.rs` drives it, with the plan census of
 //! `tests/codex_particle_replay.rs`.
 
+use crate::common::{
+    LIT_COV, caret_sample, coverage, holes_of, note_blink, observe_caret_row, observe_ribbon_rows,
+    rainbow_cfg,
+};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use std::time::{Duration, Instant};
 
 const ROWS: usize = 24;
 const COLS: usize = 80;
 const CW: usize = 8;
 const CH: usize = 16;
-/// A cell counts as LIT at this planned coverage (`tests/codex_particle_replay.rs`).
-const LIT_COV: u8 = 20;
-
-fn geom() -> Geom {
-    Geom {
-        cw: CW,
-        ch: CH,
-        rows: ROWS,
-        cols: COLS,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (COLS * CW) as u16,
-        win_h: (ROWS * CH) as u16,
-        head: 0,
-    }
-}
-
-fn cfg() -> GlowConfig {
-    GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
-    }
-}
-
 struct Host {
     term: Terminal,
     glow: CursorGlow,
@@ -90,8 +48,8 @@ impl Host {
         let mut h = Self {
             term,
             glow: CursorGlow::default(),
-            cfg: cfg(),
-            g: geom(),
+            cfg: rainbow_cfg(),
+            g: crate::common::geom(ROWS, COLS, CW, CH),
             now: Instant::now(),
             out: Vec::new(),
             row_buf: Vec::new(),
@@ -102,24 +60,11 @@ impl Host {
     }
 
     fn frame(&mut self) {
-        let c = self.term.cursor();
-        let cur = self.term.cursor_visible().then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink_seen {
-            self.blink_seen = epoch;
-            self.glow.note_repaint_blink(self.now);
-        }
+        let (c, cur) = caret_sample(&self.term);
+        note_blink(&self.term, &mut self.glow, &mut self.blink_seen, self.now);
         self.glow.note_context(self.term.is_alternate_screen());
-        self.term
-            .row_cols_into(usize::from(c.row), &mut self.row_buf);
-        self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            self.glow.observe_ribbon_row(r, &self.row_buf);
-        }
+        observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+        observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
     }
@@ -155,40 +100,16 @@ impl Host {
     }
 
     /// The plan's coverage per column of `row`, as the glass shows it.
-    fn plan_cov(&self, row: u16) -> [u8; COLS] {
-        let mut cov = [0u8; COLS];
-        let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
-        for sg in rib.plan_segments() {
-            let r = ((sg.spine / CH as f32) - 0.5).floor();
-            let c = (sg.x / CW as f32).floor();
-            if r >= 0.0 && c >= 0.0 && r as usize == usize::from(row) && (c as usize) < COLS {
-                let i = c as usize;
-                cov[i] = cov[i].max(sg.cov);
-            }
-        }
-        cov
+    fn plan_cov(&self, row: u16) -> Vec<u8> {
+        coverage(&self.glow, self.g, row)
     }
 
-    /// The interior dark runs of the row's planned band.
+    /// The lengths of the interior dark runs of the row's planned band.
     fn plan_holes(&self, row: u16) -> Vec<usize> {
-        let cov = self.plan_cov(row);
-        let lit: Vec<usize> = (0..COLS).filter(|&i| cov[i] >= LIT_COV).collect();
-        let mut holes = Vec::new();
-        if lit.len() < 2 {
-            return holes;
-        }
-        let mut run = 0usize;
-        for &v in &cov[lit[0]..=lit[lit.len() - 1]] {
-            if v >= LIT_COV {
-                if run > 0 {
-                    holes.push(run);
-                }
-                run = 0;
-            } else {
-                run += 1;
-            }
-        }
-        holes
+        holes_of(&self.plan_cov(row))
+            .into_iter()
+            .map(|(_, len)| len)
+            .collect()
     }
 
     fn cohort_count(&self, row: u16) -> usize {
@@ -209,13 +130,11 @@ impl Host {
     }
 }
 
-/// **THE LANDING INSIDE THE BAND'S STALE BOUNDS** (the review's finding 1).
-/// A line, the caret scrubbed back into it, one glyph inserted (the witness
-/// retires the shifted suffix; the cohort's bounds still span the old line),
-/// a word hop across the dark stretch, a key at the landing, and typing on.
-/// RED before this: the key joined the typed cohort by its bounds, the wake
-/// at the landing stayed a wake, and its cells expired under the typing
-/// hand — `###########..########` from 540 ms after the hop.
+/// A landing inside the band's stale bounds: a line, the caret scrubbed back
+/// into it, one glyph inserted (the witness retires the shifted suffix; the
+/// cohort's bounds still span the old line), a word hop across the dark
+/// stretch, a key at the landing, and typing on. The wake at the landing must
+/// fold into the band instead of expiring under the typing hand.
 #[test]
 fn a_word_hop_landing_inside_the_band_s_stale_bounds_folds_its_wake() {
     let mut h = Host::at_row(5);
@@ -257,11 +176,10 @@ fn a_word_hop_landing_inside_the_band_s_stale_bounds_folds_its_wake() {
     );
 }
 
-/// **A BAND ON ITS WAY OUT IS NOT TAKEN BACK BY A KEY IN A WAKE** (the
-/// review's finding 3). `hello`, rested into its retract, three Right
-/// arrows off its end (a hop wake), a key inside the wake: the fold would
-/// have put the key's hold on the fading band and brought its spent cells
-/// back to full in one frame — `Ribbon::scrub`'s own measured defect.
+/// A band on its way out is not taken back by a key in a wake: `hello`,
+/// rested into its retract, three Right arrows off its end (a hop wake), a
+/// key inside the wake. Folding would put the key's hold on the fading band
+/// and snap its spent cells back to full in one frame.
 #[test]
 fn a_key_in_a_hop_wake_does_not_revive_a_retracting_band() {
     let mut h = Host::at_row(5);
@@ -291,10 +209,10 @@ fn a_key_in_a_hop_wake_does_not_revive_a_retracting_band() {
     );
 }
 
-/// **ONE OWNER PER COLUMN PER COHORT** (the review's finding 4). The hand's
-/// own spent cells are still resident; a hop lays wake cells over them; the
-/// key in the wake folds it into the band — and the band's cells under the
-/// wake's go with it, so `place`'s law holds.
+/// One owner per column per cohort: the hand's spent cells are still
+/// resident, a hop lays wake cells over them, and the key in the wake folds
+/// it into the band together with the band's cells under it, so `place`'s law
+/// holds.
 #[test]
 fn the_wake_fold_keeps_one_owner_per_column_per_cohort() {
     let mut h = Host::at_row(5);

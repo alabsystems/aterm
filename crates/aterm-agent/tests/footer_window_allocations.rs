@@ -3,23 +3,17 @@
 
 //! One test binary and one test (as `transcript_allocations.rs`, so no other
 //! test pollutes the global allocator): the Claude Code footer's reader
-//! allocates each [`footer::TAIL_BYTES`] window of a transcript it walks
-//! back ONCE.
-//!
-//! Both of its window walks — the tail read afresh (`TailCache`'s fresh
-//! read) and the walk back to a resumed conversation's answer (`rows_back`,
-//! under `conversation_model`) — join each window to the head of the row the
-//! newer window cut. Until 2026-09-29 the window's buffer was sized to the
-//! window alone and that head appended after the read, so every window but
-//! the newest was allocated and then grown: a second block of twice the
-//! window, and the first copied into it (measured read-only on 2026-09-29
-//! over a real 12 MB transcript: `rows_back` over the whole file allocated
-//! 31.5 MB for 11.8 MB of transcript).
+//! allocates each [`footer::TAIL_BYTES`] window of a transcript it walks back
+//! once. Both window walks (`TailCache`'s fresh read and `rows_back` under
+//! `conversation_model`) join each window to the head of the row the newer
+//! window cut, so the buffer must be sized for both up front rather than
+//! grown.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::SystemTime;
 
 use aterm_agent::harness::footer::{self, TailCache};
 
@@ -83,7 +77,7 @@ unsafe impl GlobalAlloc for Allocator {
 #[global_allocator]
 static ALLOCATOR: Allocator = Allocator;
 
-/// The process's start (the owner's session, 2026-09-28): the floor.
+/// The process's start: the floor.
 const START: u64 = 1_790_607_848;
 const PID: u32 = 4242;
 const SESSION: &str = "00000000-0000-4000-8000-000000000001";
@@ -103,12 +97,11 @@ fn user_row(n: usize, at: u64) -> String {
 }
 
 /// A Claude directory holding process [`PID`]'s registry entry and its
-/// session's transcript: a conversation RESUMED from before the process's
-/// start — its first rows, a question and an answer by `claude-opus-5-5`,
-/// stamped an hour before [`START`] — then about 3.75 windows of the
-/// process's own messages. The process was launched with `--resume` onto
-/// it, so the footer names the model Claude restored: the answer at the
-/// file's very head, which both walks reach only through every window.
+/// session's transcript: a conversation resumed from before the process's
+/// start (a question and an answer by `claude-opus-5-5`, an hour before
+/// [`START`]), then about 3.75 windows of the process's own messages. The
+/// footer names the restored model: the answer at the file's head, which both
+/// walks reach only through every window.
 fn resumed_conversation(root: &Path) -> (std::path::PathBuf, u64) {
     let claude = root.join("claude");
     let project = claude.join("projects").join("-w-repo");
@@ -159,13 +152,14 @@ fn each_window_the_footer_walks_back_is_allocated_once() {
     ]);
 
     COUNTING.store(true, Ordering::Relaxed);
-    let facts = footer::facts_for_entry_cached(
+    let facts = footer::facts_for_entry_at(
         &claude,
         PID,
         Some(START),
         &entry,
         &launch,
         &mut TailCache::default(),
+        SystemTime::now(),
     );
     COUNTING.store(false, Ordering::Relaxed);
     let (fresh, grown, bytes) = (

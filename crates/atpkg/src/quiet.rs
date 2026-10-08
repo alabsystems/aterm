@@ -834,11 +834,8 @@ pub fn woken_move_still_stands(layout: &Layout, recheck: &Recheck) -> bool {
 mod tests {
     use super::*;
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-quiet-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-quiet-{label}-"))
     }
 
     const T0: i64 = 1_790_000_000;

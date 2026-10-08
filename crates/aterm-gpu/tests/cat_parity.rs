@@ -1,33 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Peeking-cat sprite (Sparkle Words v2 `cat_quads` + `cat_atlas`) CPU/GPU parity.
-// The cat is a NEAREST 1:1 regime (bake == dest size; shared RGBA texels; CPU
-// linear-light `blend` vs GPU ALPHA_BLENDING on the sRGB view), so its
-// effect-only delta is pinned at the tightest measured bar — target <= 1, hard
-// bar <= 2 — so the suite-wide <= 8 can never mask decay. Also covered:
-//   * an opaque SIXEL inline image hides the sprite on BOTH backends (the
-//     pass-1c / emit_base_pre under-image slot);
-//   * empty cat fields are byte-identical on the GPU, also after clear_overlays
-//     (the cat row of `tests/empty_channels_gpu.rs`);
-//   * the damaged/cached path repaints a moved cat with no ghosting (cached ==
-//     fresh, byte-for-byte per backend) and a SETTLED cat (equal quads + same
-//     atlas version) takes the dirty gate.
+// Peeking-cat sprite (`cat_quads` + `cat_atlas`) CPU/GPU parity. The cat is a
+// NEAREST 1:1 regime (bake == dest size; shared RGBA texels), so its
+// effect-only delta is held to target <= 1, hard bar <= 2. Also covered:
+//   * an opaque sixel image hides the sprite on both backends;
+//   * empty cat fields are byte-identical on the GPU, also after clear_overlays;
+//   * the cached path repaints a moved cat without ghosting (cached == fresh
+//     per backend) and a settled cat takes the dirty gate.
 //
-// Gated: no GPU or no font -> the test no-ops (returns), like the other parity gates.
+// No GPU or no font: the tests no-op.
 
+use crate::common;
 use std::sync::Arc;
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{SceneAtlas, SpriteQuad, Theme, WindowCpu};
+use aterm_render::{SceneAtlas, SpriteQuad, Theme};
 
-mod common;
-use common::{backends, max_channel_delta};
+use crate::common::{backends, max_channel_delta};
 
-/// A deterministic patterned RGBA cat atlas: per-texel distinct colours (a
-/// wrong NEAREST index shows up), mixed alpha in the bottom half (real src-over
-/// blending happens, not just opaque replacement). Power-of-two dims keep the
-/// GPU's normalized-UV NEAREST math exact at texel centres.
+/// A patterned RGBA cat atlas: distinct per-texel colours (a wrong NEAREST
+/// index shows), mixed alpha in the bottom half (real src-over). Power-of-two
+/// dims keep the GPU's NEAREST UV math exact at texel centres.
 fn cat_atlas(version: u64) -> SceneAtlas {
     let (w, h) = (64u32, 64u32);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -75,11 +69,10 @@ fn quad_1to1(row: u16, dest: [u16; 4], src_xy: [u16; 2], alpha: u8) -> SpriteQua
     }
 }
 
-/// THE cat parity pin. The base frame is procedural full-block glyphs +
-/// background — byte-exact CPU==GPU (delta 0) — so the measured delta on the
-/// cat frame is the CAT's alone (effect-only). Quads cover: 1:1 over blank bg
-/// (opaque + partial-alpha texels), 1:1 over text, a quad-level alpha
-/// multiplier, and a flipped quad. Target <= 1, hard bar <= 2.
+/// Cat parity. The base frame (full-block glyphs + background) is byte-exact
+/// CPU==GPU, so the measured delta is the cat's alone. Quads cover 1:1 over
+/// blank bg (opaque and partial-alpha texels), 1:1 over text, a quad-level
+/// alpha multiplier and a flipped quad. Target <= 1, hard bar <= 2.
 #[test]
 fn cat_effect_only_parity_pinned_over_bg_and_text() {
     let theme = Theme::default();
@@ -144,17 +137,11 @@ fn cat_effect_only_parity_pinned_over_bg_and_text() {
     );
 }
 
-/// An OPAQUE sixel inline image hides the cat sprite on BOTH backends: the CPU
-/// stamps sprites in pass 1c BEFORE the inline-image stamp; the GPU draws the
-/// cat stream in `emit_base_pre` before the inline-image stream — so with-cat
-/// and without-cat frames are byte-identical per backend when the image fully
-/// covers the quad.
-///
-/// "WHEN THE IMAGE FULLY COVERS THE QUAD" is now a checked precondition, not a
-/// sentence. It stopped being true under the fixture (see the DCS below) and
-/// the test went red on a claim it was not making; and had it gone the other
-/// way — image and cat both absent — the equality would have passed while
-/// nothing was drawn at all.
+/// An opaque sixel image hides the cat on both backends (the CPU stamps
+/// sprites before the inline image, the GPU draws the cat stream in
+/// `emit_base_pre` before it), so with-cat and without-cat frames are
+/// byte-identical per backend. Full coverage of the quad is checked, so the
+/// equality cannot pass on a frame that draws nothing.
 #[test]
 fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let theme = Theme::default();
@@ -165,27 +152,14 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
-    // A REAL sixel DCS (the aterm-gpu test build enables the engine's `sixel`
-    // feature): raster 2*cw px wide x ch px TALL, every pixel opaque red — a
-    // decoded RawRgba8 image that fills a 2x1-cell footprint edge to edge.
+    // A real sixel DCS: raster 2*cw px wide x ch px tall, all opaque red,
+    // filling the 2x1-cell footprint. Images paint at their own pixel size,
+    // so the raster is built to the live cell height and `red_px` checks the
+    // coverage.
     //
-    // IT USED TO BE ONE SIXEL BAND — six pixel rows — and the comment said the
-    // decode "scales to a fully-opaque 2x1-cell footprint". That was true while
-    // the renderer STRETCHED an inline image to its cell footprint, and
-    // `6c6f6a94` ("an inline image survives a resize, reports its pixels, and
-    // stops being stretched") deliberately ended that: an image now paints at
-    // its own pixel size inside the footprint. So the fixture's 22x6 raster
-    // covered 6 of the cell's 21 rows, the 21-px-tall cat quad stuck out of the
-    // top of it, and the CPU arm went red — not because the z-order this test
-    // is about had moved, but because the premise it never checked had.
-    // MEASURED at that point: 132 red pixels in the base frame (22 x 6), not
-    // the 2*cw*ch a cover owes. The raster is now built to the LIVE cell height
-    // so the premise holds on any font metric, and `red_px` below CHECKS it
-    // rather than assuming it.
-    //
-    // Sixel writes six pixel rows per data char, so `ch` rows is `ch / 6` full
-    // bands (`~` = all six bits) plus, when `ch` is not a multiple of six, one
-    // partial band whose low `ch % 6` bits are set (`?` + (2^rem - 1)).
+    // Sixel writes six pixel rows per data char: `ch / 6` full bands (`~`)
+    // plus, when `ch` is not a multiple of six, one partial band with the low
+    // `ch % 6` bits set (`?` + (2^rem - 1)).
     let mut dcs: Vec<u8> = Vec::new();
     dcs.extend_from_slice(format!("\x1bP0;0;8q\"1;1;{};{ch}#1;2;100;0;0#1", 2 * cw).as_bytes());
     for _ in 0..ch / 6 {
@@ -216,10 +190,8 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
 
     let cpu_base = cpu.render_input(&base_input);
     let cpu_cat = cpu.render_input(&input);
-    // THE PREMISE, CHECKED. `assert_eq!(base, cat)` is satisfied just as well by
-    // a renderer that draws neither the image nor the cat, so the cover has to
-    // be measured or the whole test can pass while painting nothing. The
-    // opaque red must fill exactly the 2x1-cell footprint.
+    // `assert_eq!(base, cat)` also holds when nothing is drawn, so check that
+    // the opaque red fills exactly the 2x1-cell footprint.
     let red_px = |f: &aterm_render::Frame| {
         f.pixels
             .iter()
@@ -267,25 +239,20 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     );
 }
 
-/// Damaged/cached-path no-ghosting + the dirty gate, on BOTH backends: frame A
-/// primes the caches with a cat at row 1; frame B moves it to row 2 (a real
-/// change — the GPU gate must MISS and both cached repaints must equal a fresh
-/// full render byte-for-byte, proving the vacated band re-cleared); frame C
-/// repeats B unchanged (settled cat: equal quads, same atlas version) and must
-/// take the GPU dirty gate.
+/// Cached-path no-ghosting and the dirty gate on both backends: frame A
+/// primes caches with a cat at row 1; frame B moves it to row 2 (gate misses,
+/// cached repaints equal a fresh render); frame C repeats B (equal quads, same
+/// atlas version) and takes the dirty gate.
 #[test]
 fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
     let theme = Theme::default();
     let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    let mut win_cpu = WindowCpu::new();
-    let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 12usize);
-    // Glyph-free terminal (all background) like damaged_path_glow_parity: a
-    // glyph AA overhang across a band boundary is a pre-existing damaged-vs-full
-    // divergence unrelated to the cat (see cat_sprites.rs for the note).
+    // Glyph-free terminal: glyph AA overhang across a band boundary is an
+    // unrelated damaged-vs-full divergence.
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     let atlas = Arc::new(cat_atlas(3));
@@ -301,68 +268,25 @@ fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
         )];
         input
     };
-    let in_a = make(1);
-    let in_b = make(2);
-
-    let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
-    let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
-
-    let misses_before = gpu.gate_misses();
-    let cpu_b_cached = cpu
-        .render_input_cached(&mut win_cpu, &in_b)
-        .pixels()
-        .to_vec();
-    let gpu_b_cached = gpu
-        .render_input_cached(&mut win_gpu, &in_b)
-        .pixels()
-        .to_vec();
-    assert!(
-        gpu.gate_misses() > misses_before,
-        "a moved cat must MISS the GPU dirty gate (real re-render)"
-    );
-
-    // Fresh ground truths (throwaway caches / a fresh GPU renderer).
-    let cpu_b_fresh = cpu.render_input(&in_b).pixels;
-    assert_eq!(
-        cpu_b_cached, cpu_b_fresh,
-        "CPU damaged path must repaint the moved cat with no ghosting"
-    );
-    let mut gpu2 = common::independent_gpu(18.0, theme);
-    let mut win2 = aterm_gpu::WindowGpu::new();
-    let gpu_b_fresh = gpu2.render_input(&mut win2, &in_b, None).pixels;
-    assert_eq!(
-        gpu_b_cached, gpu_b_fresh,
-        "GPU dirty-row path must repaint the moved cat with no ghosting"
-    );
-
-    // Settled: byte-equal quads + same atlas version ⇒ the GPU gate HITS.
-    let in_c = make(2);
-    let hits_before = gpu.gate_hits();
-    let _ = gpu.render_input_cached(&mut win_gpu, &in_c);
-    assert!(
-        gpu.gate_hits() > hits_before,
-        "a settled cat (equal quads, same atlas version) must take the dirty gate"
+    // Cat at row 1, moved to row 2, then row 2 again (equal quads, same atlas).
+    let (in_a, in_b, in_c) = (make(1), make(2), make(2));
+    common::assert_moved_then_settled(
+        (&mut cpu, &mut gpu),
+        (18.0, theme),
+        [&in_a, &in_b, &in_c],
+        "cat",
+        "cat (equal quads, same atlas version)",
     );
 }
 
-/// A SOURCE RECT THAT OVERRUNS THE ATLAS is refused by BOTH backends, and a
-/// quad tagged PAST THE GRID'S LAST ROW is dropped by both.
+/// A source rect overrunning the atlas is refused, and a quad tagged past the
+/// grid's last row is dropped, by both backends. The CPU naturally skips both
+/// (`stamp_cat_quad` bounds check; per-row stamping); the GPU needs explicit
+/// guards, since its ClampToEdge samplers would smear the atlas edge across
+/// the quad. `cat_quads` and `rain_quads` share the GPU builder.
 ///
-/// Both are host bugs, and the CPU is the side that silently absorbs them —
-/// `stamp_cat_quad` returns early on `ax + aw > atlas.width` (the NEAREST index
-/// math is only in-bounds when the rect is), and the per-row stamp only fires
-/// under `q.row as usize == r` for `r` in `0..rows`, while `build_rain_row_csr`
-/// drops an out-of-grid row outright. A parity run on the CPU therefore cannot
-/// see either one; the GPU had neither guard, and its samplers are
-/// ClampToEdge, so an overrunning rect SMEARED the atlas's edge row/column
-/// across the whole quad. Measured before the guards, on a 64x64 atlas with
-/// `ay = 40, ah = 34`: cpu painted 0 px, gpu painted 1360 px; with `row = 99`
-/// on a 6-row grid: cpu 0 px, gpu 800 px. Identical for `cat_quads` and
-/// `rain_quads`, which share the one GPU builder.
-///
-/// The IN-BOUNDS control in each arm is what keeps this from passing
-/// vacuously: the same quad with a legal rect must paint, and paint the same
-/// on both backends.
+/// The in-bounds control in each arm (same quad, legal rect) must paint, and
+/// paint the same on both backends.
 #[test]
 fn a_malformed_sprite_quad_is_refused_on_both_backends() {
     let theme = Theme::default();

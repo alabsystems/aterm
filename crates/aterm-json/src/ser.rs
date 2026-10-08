@@ -115,37 +115,48 @@ pub(crate) fn write_i128(out: &mut Vec<u8>, value: i128) {
     write_u128(out, value.unsigned_abs());
 }
 
-/// The shortest decimal digit string that reads back as `value`, correctly
-/// rounded, with the power of ten it is scaled by.
+/// The shortest decimal digit string that reads back as `value`, and of those
+/// the closest, with the power of ten it is scaled by — what `ryu`, which
+/// `serde_json` formats with, produces.
 ///
-/// "Shortest" alone is not enough to match `serde_json`. Rust's own shortest
-/// formatter (`{:e}`) guarantees the digits ROUND-TRIP but not that they are
-/// the closest decimal of that length: for `0x42ea3c464c15f354` it emits
-/// `...29063` where the closest 17-digit decimal is `...29062`. `ryu`, which
-/// `serde_json` formats with, always picks the closest. Asking `{:.*e}` for an
-/// explicit precision gives correctly-rounded digits, so walking the precision
-/// up from one digit and stopping at the first that round-trips yields the
-/// shortest correctly-rounded form — which is exactly what `ryu` produces.
+/// Two facts from the standard library, each half right on its own:
+///
+/// * Rust's shortest formatter (`{:e}`) gets the LENGTH right — it is exactly
+///   shortest — but not always the closest digits of that length: for
+///   `0x42ea3c464c15f354` it emits `...29063` where the closest 17-digit
+///   decimal is `...29062`.
+/// * `{:.*e}` at an explicit precision gives the CLOSEST decimal of that
+///   length, but the closest is not always inside the rounding interval. At an
+///   exact power of two the interval is lopsided (the next double down is half
+///   as far as the next one up), so `2^-24`'s closest 16-digit decimal misses
+///   it while `...063` above it does not. Walking the precision up until the
+///   closest round-tripped therefore wrote 17 digits there, not ryu's 16.
+///
+/// So: the length from the shortest form, and the closest decimal of that
+/// length whenever it reads back — otherwise the shortest form's own digits,
+/// the only decimal of that length the interval holds.
 fn shortest_f64(value: f64) -> (String, i32) {
-    for precision in 0..=17usize {
-        let text = format!("{value:.precision$e}");
-        if text.parse::<f64>() == Ok(value) {
-            return split_exp(&text);
-        }
+    let shortest = format!("{value:e}");
+    let precision = split_exp(&shortest).0.len().saturating_sub(1);
+    let closest = format!("{value:.precision$e}");
+    if closest.parse::<f64>() == Ok(value) {
+        split_exp(&closest)
+    } else {
+        split_exp(&shortest)
     }
-    split_exp(&format!("{value:.17e}"))
 }
 
 /// As [`shortest_f64`], at `f32` width: `0.1f32` must print as `0.1`, not as
 /// the `f64` it widens to.
 fn shortest_f32(value: f32) -> (String, i32) {
-    for precision in 0..=9usize {
-        let text = format!("{value:.precision$e}");
-        if text.parse::<f32>() == Ok(value) {
-            return split_exp(&text);
-        }
+    let shortest = format!("{value:e}");
+    let precision = split_exp(&shortest).0.len().saturating_sub(1);
+    let closest = format!("{value:.precision$e}");
+    if closest.parse::<f32>() == Ok(value) {
+        split_exp(&closest)
+    } else {
+        split_exp(&shortest)
     }
-    split_exp(&format!("{value:.9e}"))
 }
 
 /// Split `d.ddde±X` into its digits (decimal point removed) and its exponent.
@@ -168,8 +179,8 @@ fn split_exp(text: &str) -> (String, i32) {
 /// `kk = 13` for a single, and below `kk = -4` for a double but `kk = -5` for a
 /// single. Both boundaries were read off the reference rather than guessed
 /// (`1e15` is fixed and `1e16` is not; `1e12f32` is fixed and `1e13f32` is
-/// not), and `tests/oracle.rs` re-checks them over tens of thousands of random
-/// bit patterns in each width.
+/// not), and `tests/json.rs` pins them over tens of thousands of random bit
+/// patterns in each width.
 fn write_layout(
     out: &mut Vec<u8>,
     negative: bool,
@@ -196,12 +207,10 @@ fn write_layout(
             }
             out.extend_from_slice(b".0");
         } else {
-            // `0 < kk < n`, so both halves are non-empty.
+            // `0 < kk < n`, so both halves are non-empty. Split the bytes:
+            // `str::split_at` could also panic off a char boundary, which the
+            // verifier cannot rule out.
             let split = kk.max(0) as usize;
-            // Split the BYTES: the output is bytes, and a byte split can only
-            // fail on length (guarded), where `str::split_at` also panics off
-            // a char boundary — impossible for these ASCII digits, but not
-            // something the verifier (or a future caller) can see.
             let digits = digits.as_bytes();
             let (head, tail) = digits.split_at(split.min(digits.len()));
             out.extend_from_slice(head);

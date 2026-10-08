@@ -2,22 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal input processing.
-//!
-//! Handles the main `process()` entry point.
+//! Terminal input processing: the `process()` entry point and its batch
+//! prologue/epilogue.
 
 use super::Terminal;
 
 use aterm_types::duration_to_nanos;
 
-/// A single reading of the clocks the terminal pipeline depends on, captured
-/// once per [`Terminal::process_at`] batch.
-///
-/// Folding both clocks into one snapshot makes the time the pipeline observes
-/// an explicit input: [`Terminal::process`] captures it live, while replay
-/// feeds back the recorded reading so the same `(bytes, ClockReading)` schedule
-/// reproduces identical grid/cursor/mode state and shell-integration mark
-/// timestamps — the determinism the hydratable temporal buffer relies on.
+/// One reading of the clocks the terminal pipeline depends on, captured once
+/// per [`Terminal::process_at`] batch. Making time an explicit input lets replay
+/// of a `(bytes, ClockReading)` schedule reproduce identical grid, mode and mark
+/// state.
 #[derive(Debug, Clone, Copy)]
 pub struct ClockReading {
     /// Monotonic instant — drives the bell rate-limit and mode-2026 timeout
@@ -42,14 +37,13 @@ impl ClockReading {
     }
 }
 
-/// Whether one retained splice accounts for the complete monotonic-row advance
-/// observed during a [`Terminal::process_at`] batch.
+/// Whether one retained splice accounts for the whole monotonic-row advance of
+/// a [`Terminal::process_at`] batch.
 ///
-/// Selection boundary recovery is sound only under this coupling invariant:
-/// every mutation that advances `absolute_row_counter` without recording that
-/// advance in `record_absolute_row_splice` must also make
-/// `content_scroll_delta` nonzero. The latter routes a mixed batch to the
-/// fail-closed selection-clear arm instead of the piecewise splice projection.
+/// Selection boundary recovery relies on this: every mutation that advances
+/// `absolute_row_counter` without `record_absolute_row_splice` also makes
+/// `content_scroll_delta` nonzero, which routes a mixed batch to the
+/// fail-closed selection-clear arm.
 #[inline]
 fn splice_accounts_for_batch_row_advance(before: u64, after: u64, inserted: u64) -> bool {
     after
@@ -57,55 +51,84 @@ fn splice_accounts_for_batch_row_advance(before: u64, after: u64, inserted: u64)
         .is_some_and(|advance| advance == inserted)
 }
 
+/// What one [`Terminal::advance_kitty_animations`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KittyAnimationStep {
+    /// A frame changed on screen: the host owes a redraw.
+    pub advanced: bool,
+    /// When the next frame is due, `None` when nothing plays on screen.
+    pub next_frame_at: Option<aterm_time::Instant>,
+}
+
 impl Terminal {
-    /// Process input bytes through the parser, reading the live clocks for any
-    /// time-dependent state (bell rate-limit, mode-2026 sync timeout, shell
-    /// command-mark timestamps).
-    ///
-    /// This is the production entry point. It is exactly
-    /// [`process_at`](Self::process_at) with [`ClockReading::now()`], so its
-    /// observable output is unchanged from before the clock seam existed.
+    /// Process input bytes through the parser, reading the live clocks for
+    /// time-dependent state (bell rate-limit, mode-2026 timeout, shell mark
+    /// timestamps). Equivalent to [`process_at`](Self::process_at) with
+    /// [`ClockReading::now()`].
     #[inline]
     pub fn process(&mut self, input: &[u8]) {
         self.process_at(input, ClockReading::now());
     }
 
+    /// Play the Kitty graphics animations up to `now`: every running animation
+    /// shown on screen whose frame gap has run out steps to its next frame
+    /// everywhere the image shows (damaging those cells). Returns what changed
+    /// and when the next frame is due; with nothing playing on screen it returns
+    /// no deadline and touches nothing.
+    pub fn advance_kitty_animations(&mut self, now: aterm_time::Instant) -> KittyAnimationStep {
+        if self.transient.kitty_frames.is_empty() {
+            return KittyAnimationStep::default();
+        }
+        let (_, mut handler) = self.split_for_process();
+        let (advanced, next_frame_at) = handler.advance_kitty_animations(now);
+        if advanced {
+            // A frame step changes what the screen shows with no output fed
+            // and no content seq moved (it damages, it does not write a cell).
+            self.transient.screen_mutations = self.transient.screen_mutations.wrapping_add(1);
+        }
+        KittyAnimationStep {
+            advanced,
+            next_frame_at,
+        }
+    }
+
+    /// Whether a Kitty graphics animation is running, shown on screen or not;
+    /// an animation in an unshown session waits until it is drawn again.
+    #[must_use]
+    pub fn kitty_animation_playing(&self) -> bool {
+        self.transient
+            .kitty_frames
+            .values()
+            .any(super::transient_state::KittyAnimation::plays)
+    }
+
     /// Process input bytes through the parser at a caller-supplied clock reading.
     ///
-    /// Every state-affecting time read in the pipeline — the bell rate-limiter,
-    /// `sync_start` arming, the mode-2026 timeout, and the OSC 133/633 command
-    /// and output marks — observes `clock` (stashed in `transient.process_now`
-    /// / `transient.process_wall_ms`) instead of reading the host clock
-    /// independently. Feeding a fixed `(bytes, ClockReading)` schedule therefore
-    /// reproduces identical grid/cursor/mode state and mark timestamps
-    /// regardless of real wall-clock pacing — the determinism the hydratable
-    /// temporal buffer relies on for faithful replay. [`process`](Self::process)
-    /// is the live wrapper that passes [`ClockReading::now()`].
+    /// Every state-affecting time read (bell rate-limiter, `sync_start`, the
+    /// mode-2026 timeout, OSC 133/633 marks) observes `clock` via
+    /// `transient.process_now` / `transient.process_wall_ms`, so a fixed
+    /// `(bytes, ClockReading)` schedule reproduces identical state.
+    /// [`process`](Self::process) passes [`ClockReading::now()`].
     ///
-    /// Diagnostic-only wall-clock reads (the gated pipeline profiling
-    /// timestamps) and peer-facing rate limiting (response-buffer token
-    /// bucket) intentionally still read real time: neither feeds hydrated
-    /// terminal state.
+    /// Diagnostic profiling timestamps and the response-buffer token bucket
+    /// still read real time: neither feeds terminal state.
     #[allow(
         clippy::too_many_lines,
         reason = "main entry point with sequential processing stages"
     )]
     pub fn process_at(&mut self, input: &[u8], clock: ClockReading) {
-        // MODE-MIRROR OBLIGATION: the lock-free word the input seam encodes
-        // against must still equal the live fold when a batch begins. Every
-        // host mutator outside this function refreshes it; one that forgot
-        // fails HERE, on the next byte of output, in every debug/test build.
+        // Mode-mirror obligation: the lock-free word the input seam encodes
+        // against must equal the live fold when a batch begins. A host mutator
+        // that forgot to refresh it fails here in debug/test builds.
         #[cfg(debug_assertions)]
         self.debug_assert_mode_mirror_in_sync();
-        // THE RESIZE UNDO (`aterm_grid`'s `resize_undo`): a rows-only shrink of
-        // the alternate screen keeps the rows it took off for a grow back that
-        // nothing drew in front of. ANY output between the halves ends that:
-        // the app may have painted at the smaller size (its SIGWINCH repaint,
-        // which heals it), and a few mutation paths mark damage without moving
-        // `content_gen` (VS15/VS16 width fixes, OSC 1337), so the grid's own
-        // generation check is not the whole guard. Both grids: the parked one
-        // was resized too.
+        // Resize undo (`aterm_grid`'s `resize_undo`): a rows-only alt-screen shrink
+        // keeps the rows it removed for a grow back that nothing drew in front of.
+        // Any output ends that: the app may have painted at the smaller size, and
+        // some mutation paths mark damage without moving `content_gen` (VS15/VS16
+        // width fixes, OSC 1337). Both grids: the parked one was resized too.
         if !input.is_empty() {
+            self.transient.screen_mutations = self.transient.screen_mutations.wrapping_add(1);
             self.grid.drop_resize_undo();
             if let Some(parked) = self.alt_grid.as_mut() {
                 parked.drop_resize_undo();
@@ -115,59 +138,41 @@ impl Terminal {
         // time-dependent read observes. Set before the parser/post_process run.
         self.transient.process_now = clock.monotonic;
         self.transient.process_wall_ms = clock.wall_ms;
-        // SCR-1: if the user has scrolled back into history (display_offset > 0),
-        // PIN the viewport across this batch of output instead of yanking it to
-        // the live bottom (the old unconditional scroll_to_bottom). VT row
-        // arithmetic and write targeting require display_offset == 0 during
-        // processing (row_index maps visible rows through display_offset), so we
-        // reset to 0 for the duration, then RE-PIN afterward by the number of
-        // lines that entered scrollback while processing. This keeps `tail -f`
-        // and similar live output from disrupting a user reading scrollback.
-        //
-        // The "start typing snaps to bottom" behavior is unaffected: that path
-        // calls Terminal::scroll_to_bottom() explicitly on keyboard input, not
-        // through process().
+        // If the user is scrolled back (display_offset > 0), pin the viewport
+        // across this batch instead of yanking it to the live bottom. VT row
+        // arithmetic requires display_offset == 0 during processing (row_index
+        // maps through it), so reset to 0 now and re-pin afterwards by the number
+        // of lines that entered scrollback. Keyboard input snaps to the bottom
+        // separately, via Terminal::scroll_to_bottom().
         let pinned_offset = self.grid.display_offset();
         let lines_before = self.grid.absolute_row_counter();
-        // SELECTION CUSTODY Phase 3: remember which screen this batch STARTED on.
-        // If it ends on the other one, `self.grid` at the epilogue is no longer the
-        // grid whose offset was pinned here — see the re-pin below.
+        // Which screen this batch started on: if it ends on the other one,
+        // `self.grid` at the epilogue is not the grid whose offset was pinned.
         let was_alt = self.modes.alternate_screen;
         if pinned_offset > 0 {
-            // `pin_viewport_to_live_for_output_batch`, not `scroll_to_bottom`: the
-            // motion is identical, but this half of the dance is the MACHINE forcing
-            // a precondition it undoes at the epilogue, and the grid's
-            // `reader_live_bottom_gen` must not record it as the reader pressing End.
-            // Something downstream reads that generation to decide whether a 0
-            // display_offset was chosen or inflicted (the reflow-offload window's
-            // audit-#7 guard), and with the reader's entry point here every batch of
-            // output arriving under a scrolled-back reader would file a gesture.
+            // Not `scroll_to_bottom`: the motion is identical, but this is the
+            // machine forcing a precondition it undoes at the epilogue, and
+            // `reader_live_bottom_gen` must not record it as a reader gesture
+            // (downstream code uses it to tell a chosen 0 offset from a forced one).
             self.grid.pin_viewport_to_live_for_output_batch();
         }
-        // PRESS CUSTODY, site 1 of 3 is `pinned_offset` above — the pre-batch reading
-        // position, read one statement before the line that forces it to 0. It is the
-        // ONLY discriminator between output that arrived at LIVE and output that
-        // arrived while the user was reading history, and nothing downstream can
-        // reconstruct it: by `post_process` the offset is 0 whichever it was. Site 2
-        // fills this in (the damage classification); site 3, after the re-pin below,
-        // emits. Deferred rather than `= None`-initialised so the compiler, not a
-        // convention, holds both `post_process` arms to assigning it.
+        // Press custody, site 1 of 3 is `pinned_offset` above: the pre-batch
+        // reading position, the only way to tell output that arrived at live from
+        // output that arrived while reading history. Site 2 (`post_process`)
+        // classifies the damage; site 3, after the re-pin, emits. Left
+        // uninitialised so the compiler holds both `post_process` arms to
+        // assigning it.
         let damage_class: super::custody::OutputDamage;
-        // …and whether a selection was alive when the batch began. `post_process` has
-        // FIVE ways to destroy one that are not damage overlap (a malformed splice
-        // projection, a splice mixed with another scroll, an alt exit mid-batch, the
-        // `left_alt` upper-bound re-check, and a whole-interval eviction at the floor),
-        // and a record that could not see them would report an ordinary output step
-        // for a batch that took the user's highlight. One enum-discriminant read.
+        // Whether a selection was alive when the batch began: `post_process` can
+        // destroy one in ways other than damage overlap (bad splice projection,
+        // splice mixed with scroll, alt exit, the `left_alt` re-check, eviction
+        // at the floor), and the custody record must see them.
         let selection_before = self.text_selection.has_selection();
 
         // split_for_process() is generated by define_terminal_handler! in
-        // handler.rs — struct definition and construction stay in sync (#3560).
-        //
-        // Pipeline timestamps are gated behind a runtime check to eliminate
-        // 6 × Instant::now() calls (~150ns) from the hot path. The profiling
-        // data is useful for development but not worth the overhead in
-        // production throughput. Part of throughput optimization Wave 1.
+        // handler.rs, which keeps struct definition and construction in sync.
+        // Pipeline timestamps are gated behind a runtime check to keep
+        // Instant::now() calls off the hot path.
         if self.transient.pipeline_timestamps.profiling_enabled {
             let entry = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), measures real latency, not grid state (aterm_time = std on native, JS clock on wasm)
             let parse_start = entry;
@@ -175,11 +180,9 @@ impl Terminal {
             // so the alt-screen archive sees each committed frame; otherwise one
             // `advance_fast` over the whole input (see `alt_archive.rs`).
             self.advance_parser_archiving(input);
-            // RIS side effects the handler cannot reach (#7153). The parser is NOT
-            // reset here: ESC c is an EscDispatch that already left it in Ground, so
-            // a reset after the WHOLE slice (to 2026-09-12) only wiped the half-parsed
-            // CSI / UTF-8 / DCS that bytes after the RIS left at the chunk's end, and
-            // the next chunk printed that sequence's tail as text.
+            // RIS side effects the handler cannot reach. The parser is not reset
+            // here: ESC c already left it in Ground, and a reset after the slice
+            // would drop a half-parsed sequence that bytes after the RIS began.
             if self.transient.pending_parser_reset {
                 self.finish_ris_batch();
             }
@@ -190,9 +193,9 @@ impl Terminal {
             // Alt-screen archive: a sync-timeout close `post_process` just forced,
             // and the rate-limited commit for apps that never use 2026.
             self.alt_archive_epilogue();
-            // Observation Kernel (L0): evaluate + latch armed watchers at the one
-            // seam where this batch's mutation has landed. `process_now` is the
-            // injected clock (never read here), so this is replay-deterministic.
+            // Observation kernel: evaluate and latch armed watchers where this
+            // batch's mutation has landed. `process_now` is the injected clock, so
+            // this is replay-deterministic.
             self.observe_at(self.transient.process_now);
             let grid_end = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (aterm_time = std on native, JS clock on wasm)
 
@@ -207,11 +210,9 @@ impl Terminal {
             // so the alt-screen archive sees each committed frame; otherwise one
             // `advance_fast` over the whole input (see `alt_archive.rs`).
             self.advance_parser_archiving(input);
-            // RIS side effects the handler cannot reach (#7153). The parser is NOT
-            // reset here: ESC c is an EscDispatch that already left it in Ground, so
-            // a reset after the WHOLE slice (to 2026-09-12) only wiped the half-parsed
-            // CSI / UTF-8 / DCS that bytes after the RIS left at the chunk's end, and
-            // the next chunk printed that sequence's tail as text.
+            // RIS side effects the handler cannot reach. The parser is not reset
+            // here: ESC c already left it in Ground, and a reset after the slice
+            // would drop a half-parsed sequence that bytes after the RIS began.
             if self.transient.pending_parser_reset {
                 self.finish_ris_batch();
             }
@@ -228,49 +229,26 @@ impl Terminal {
             ts.process_sequence = ts.process_sequence.wrapping_add(1);
         }
 
-        // SCR-1 re-pin: if the user was scrolled back, restore the viewport to
-        // the same content by advancing display_offset by the number of lines
-        // that entered scrollback during processing (the rise in the monotonic
-        // absolute row counter). Clamped to scrollback_lines() so the invariant
-        // display_offset <= scrollback_lines() holds even if eviction discarded
-        // some of those lines. If no new lines scrolled in, the offset is simply
-        // restored unchanged.
+        // Re-pin: if the user was scrolled back, advance display_offset by the
+        // lines that entered scrollback during processing (the rise of the
+        // absolute row counter), clamped to scrollback_lines().
         //
-        // SELECTION CUSTODY Phase 3 — THE RE-PIN MUST TARGET THE GRID IT PINNED.
+        // The re-pin targets the grid that was pinned. A batch that enters alt
+        // leaves `self.grid` as the fresh alt grid while the pinned main grid sits
+        // in `alt_grid`; re-pinning `self.grid` would lose the reading position.
+        // `repin_display_offset` clamps to that grid's own scrollback, so
+        // `DisplayOffsetValid` holds either way.
         //
-        // The old code always repinned `self.grid`, with the note "the alt screen
-        // has no scrollback, so on alt the counter does not rise and the offset
-        // stays 0 — correct." That reasoning holds for a batch that was ALREADY on
-        // alt. It is wrong for the batch that ENTERS alt, and that batch is the
-        // whole bug: `enter_alternate_screen_raw` does
-        // `mem::replace(self.grid, new_grid)` (`handler_dec.rs`), so by the time we
-        // get here `self.grid` is the fresh ALT grid — whose `scrollback_lines()` is
-        // 0, so the repin clamps to 0 and does nothing — while the user's MAIN grid
-        // is sitting in `alt_grid` carrying the zero the prologue forced on it.
-        //
-        // Net effect before this fix: running `less`, `man`, `vim`, `fzf` or
-        // `git log` while scrolled back into history destroyed the reading position
-        // PERMANENTLY. Exit restored the main grid wholesale — including its
-        // display_offset of 0.
-        //
-        // So repin the grid that was actually pinned. `repin_display_offset` clamps
-        // to that grid's own `scrollback_lines()`, so `DisplayOffsetValid` still
-        // holds for whichever grid we touch.
-        //
-        // Its `lines_added` is the advance of the SAME grid's counter, measured to
-        // the moment it was parked — NOT 0. The comment that used to justify 0 said
-        // "a grid that has been swapped out stopped receiving output"; it stopped
-        // receiving it only AFTER the swap, and output before the smcup in the same
-        // read is routine (`"a\r\nb\r\nc\r\n\x1b[?1049h"`). See
-        // `park_main_row_counter`.
+        // `lines_added` is the parked grid's counter advance up to the moment it
+        // was parked: output before the smcup in the same read still scrolled it
+        // (see `park_main_row_counter`).
         let parked_main_counter = self.transient.alt_park_main_row_counter.take();
         if pinned_offset > 0 {
             let entered_alt = !was_alt && self.modes.alternate_screen;
             if entered_alt {
-                // `lines_before` and the parked counter are BOTH the main grid's, so
-                // their difference is a statement about one coordinate space. The
-                // fallback keeps the old behaviour if no park was recorded (it always
-                // is: every enter path records one before its swap).
+                // `lines_before` and the parked counter are both the main grid's.
+                // The fallback is unreachable in practice: every enter path records
+                // a park before its swap.
                 let lines_added = parked_main_counter
                     .unwrap_or(lines_before)
                     .saturating_sub(lines_before);
@@ -286,18 +264,13 @@ impl Terminal {
             }
         }
 
-        // The OTHER pin this batch can hold: one an rmcup took off a grid it swapped
-        // back in mid-batch (`flatten_restored_display_offset`). That grid processed
-        // the rest of the batch at offset 0, as everything downstream of `row_index`
-        // requires, so the reading position is restored HERE — advanced by whatever
-        // entered its scrollback after the swap, exactly like the prologue's pin.
-        //
-        // The two are mutually exclusive in practice (a batch that starts scrolled
-        // back on main parks that grid at the forced 0, so its rmcup restores 0 and
-        // records nothing), but if both ever fired this one is the later, more
-        // specific reading and must win.
+        // The other pin a batch can hold: one an rmcup took off a grid swapped
+        // back in mid-batch (`flatten_restored_display_offset`). That grid ran the
+        // rest of the batch at offset 0, so its reading position is restored here,
+        // advanced by what entered its scrollback after the swap. The two pins are
+        // exclusive in practice; if both fired, this later one wins.
         if let Some((restored_offset, counter_at_swap)) = self.transient.alt_restore_pin.take() {
-            // The restored grid is the one the batch ENDED on, unless the batch went
+            // The restored grid is the one the batch ended on, unless the batch went
             // on to re-enter alt — then it is parked again and lives in `alt_grid`.
             let restored_grid = if self.modes.alternate_screen {
                 self.alt_grid.as_mut()
@@ -310,18 +283,10 @@ impl Terminal {
             }
         }
 
-        // PRESS CUSTODY, site 3 of 3: EMIT. The first moment at which the pre-batch
-        // reading position (`pinned_offset`, latched before the prologue forced it to
-        // 0), the damage verdict (`damage_class`, classified inside `post_process`)
-        // and the FINAL post-re-pin offset are all simultaneously true. An emit one
-        // block earlier would report offset 0 for every batch, producing a trace that
-        // is uniformly consistent and worthless.
-        //
-        // SUPPRESSED on a screen-SWITCHING batch. When the batch ends on the other
-        // screen, `pinned_offset` belongs to the outgoing grid and `self.grid`'s
-        // offset belongs to the incoming one, so a before/after pair would relate two
-        // unrelated coordinate spaces. Recording nothing is honest; recording a step
-        // across the swap would not be.
+        // Press custody, site 3 of 3: emit, now that the pre-batch offset, the
+        // damage class and the final re-pinned offset are all known. Suppressed on
+        // a screen-switching batch: before and after would belong to unrelated
+        // grids.
         if was_alt == self.modes.alternate_screen {
             let lines_added = self
                 .grid
@@ -330,19 +295,14 @@ impl Terminal {
             self.note_output_custody(pinned_offset, damage_class, lines_added, selection_before);
         }
 
-        // Note: tmux DCS passthrough (`ESC P tmux; ... ST`) works via natural
-        // parser breakout -- the parser's "anywhere" ESC transition breaks DCS
-        // before escaped content accumulates, so inner sequences parse normally
-        // without re-injection. The former pending_passthrough drain loop was
-        // dead code and was removed in #7776.
+        // tmux DCS passthrough (`ESC P tmux; ... ST`) works through the parser's
+        // "anywhere" ESC transition, which breaks the DCS before escaped content
+        // accumulates, so inner sequences parse normally.
 
-        // INTEGRITY-SELFCHECK (M7): in debug builds, validate the active grid's
-        // structural invariants (CursorInBounds / ScrollRegionValid /
-        // DisplayOffsetValid / ring-buffer) at this public processing boundary —
-        // the exact, fuzz-validated checks `fuzz_process_never_panics` asserts,
-        // now continuously on every `process` batch in development. Free in release
-        // (compiled out). The whole test suite exercises it, so any change that
-        // corrupts the grid trips here immediately.
+        // Integrity self-check: in debug builds, validate the active grid's
+        // structural invariants (CursorInBounds, ScrollRegionValid,
+        // DisplayOffsetValid, ring buffer) at every batch boundary, the same
+        // checks `fuzz_process_never_panics` asserts.
         #[cfg(debug_assertions)]
         self.grid.assert_structural_invariants();
 
@@ -352,7 +312,7 @@ impl Terminal {
         self.refresh_mode_mirror();
     }
 
-    /// Store per-stage pipeline durations in transient state (#5560).
+    /// Store per-stage pipeline durations in transient state.
     #[inline]
     fn record_pipeline_timestamps(
         &mut self,
@@ -369,31 +329,23 @@ impl Terminal {
         ts.process_sequence = ts.process_sequence.wrapping_add(1);
     }
 
-    /// RIS side effects the handler cannot reach (#7153), run after the parser
-    /// and BEFORE `post_process`.
+    /// RIS side effects the handler cannot reach, run after the parser and
+    /// before `post_process`.
     ///
-    /// Both selection slots die HERE, not by leaning on the park/restore in
-    /// `post_process` and not on the `All` that the reset's `erase_scrollback`
-    /// happens to record on the way past: the reason they must go is the reset
-    /// itself, which erased every grid either one names. That `All` is recorded on
-    /// the MAIN grid, and a batch that ends on the alt screen never drains it —
-    /// which is the whole difficulty, because RIS then a re-entry in ONE batch
-    /// (`\x1bc\x1b[?1049h`) is exactly such a batch:
+    /// Both selection slots are cleared here because the reset erased every grid
+    /// either one names. The reset's `SelectionDamage::All` is recorded on the
+    /// main grid and is not drained by a batch that ends on alt, which is the
+    /// case for RIS plus re-entry in one batch (`\x1bc\x1b[?1049h`):
     ///
-    /// * from the ALT screen, `was_alt` and `modes.alternate_screen` are both true
-    ///   at `post_process`, so neither the park nor the restore runs, and the
-    ///   parked pre-RIS main selection would wait in the slot for the NEXT
-    ///   `?1049l` to restore it over a grid the reset already erased;
-    /// * from the MAIN screen, the batch is an ordinary enter, so the park runs
-    ///   and takes whatever the LIVE slot holds into the parked one — the same
-    ///   stale selection, parked instead of left behind. (`Terminal::reset` clears
-    ///   the live slot for the same reason; RIS left it to the `All`, which this
-    ///   batch never reads.)
+    /// * from the alt screen, neither park nor restore runs, and the parked
+    ///   pre-RIS main selection would wait to be restored over an erased grid;
+    /// * from the main screen, the park moves the stale live selection into the
+    ///   parked slot.
     ///
     /// Pinned by `AltSelectionPark`'s conformance, which drives that batch from
-    /// both screens and reads the slot.
+    /// both screens.
     fn finish_ris_batch(&mut self) {
-        // Clear session-only state not accessible from the handler (#7336).
+        // Clear session-only state not accessible from the handler.
         self.secure_keyboard_entry = false;
         self.text_selection.clear();
         self.parked_text_selection.clear();
@@ -402,34 +354,24 @@ impl Terminal {
 
     /// Post-processing after parser advances: selection adjustment and BiDi sync.
     ///
-    /// `was_alt` is which screen the batch STARTED on, captured by the caller
-    /// before the parser ran — the batch may have switched screens since, and this
-    /// is the only place that can tell.
+    /// `was_alt` is the screen the batch started on, captured before the parser
+    /// ran.
     ///
-    /// SELECTION CUSTODY — this is the `SelectionCustody` machine's ENGINE half, and
-    /// it carries FOUR spec actions because it asks four different questions of the
-    /// one selection in one pass (the macro's `write_all` precedent: one method may
-    /// legitimately implement more than one spec action):
+    /// This is the engine half of the `SelectionCustody` model and implements
+    /// four of its actions in one pass:
     ///
-    /// * `UniformScroll` — the `(None, delta)` arm's `adjust_for_scroll`. The anchors
-    ///   ride the content, so in the ABSOLUTE space the interval does not move.
-    /// * `RegionDamageLow` / `RegionDamageHigh` — the damage test
-    ///   (`SelectionDamage::clears_selection` over `intersects_absolute_band`). The two
-    ///   model arms are the two halves of the lattice — damage that MISSED must spare
-    ///   the selection, damage that HIT must clear it — and one seam decides both.
-    /// * `WholesaleInvalidate` — the `SelectionDamage::All` arm of the SAME damage
-    ///   test. ED 3, RIS and a Kitty unscroll destroy the coordinate space the anchors
-    ///   are stated in, and this is where that reaches the selection.
+    /// * `UniformScroll`: the `(None, delta)` arm's `adjust_for_scroll`; anchors
+    ///   ride the content, so the interval is fixed in absolute space.
+    /// * `RegionDamageLow` / `RegionDamageHigh`: the damage test
+    ///   (`SelectionDamage::clears_selection` over `intersects_absolute_band`);
+    ///   damage that missed spares the selection, damage that hit clears it.
+    /// * `WholesaleInvalidate`: the `SelectionDamage::All` arm of the same test
+    ///   (ED 3, RIS, Kitty unscroll).
     ///
-    /// `Evict` is deliberately NOT anchored here. The tail's `truncate_to_floor` is an
-    /// unconditional RE-clamp against a floor something else raised, so it runs on every
-    /// batch and discriminates nothing; an anchor on it would name code no test could
-    /// falsify. `Evict`'s one anchor is [`Terminal::set_scrollback_line_limit`], the
-    /// entry point that actually raises the floor.
-    ///
-    /// This is the CONSUMER, deliberately: `Grid` records bands and deltas but owns no
-    /// `text_selection`, so a grid-layer anchor could not witness `alive` at all. Tier-1
-    /// drives these through real `Terminal::process` batches in
+    /// `Evict` is anchored on [`Terminal::set_scrollback_line_limit`], which
+    /// raises the floor; the unconditional `truncate_to_floor` here discriminates
+    /// nothing. The anchors live on this consumer because `Grid` owns no
+    /// `text_selection`. Conformance drives real `Terminal::process` batches in
     /// `aterm_gui::selection_custody_conformance`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
@@ -482,42 +424,24 @@ impl Terminal {
             );
         }
 
-        // SELECTION CUSTODY, screen-scoped selection (the Phase-3 remainder).
-        // A selection belongs to the SCREEN it was made on. Park the outgoing
-        // screen's on the batch that leaves it; restore the incoming screen's on
+        // A selection belongs to the screen it was made on: park the outgoing
+        // screen's on the batch that leaves it, restore the incoming screen's on
         // the batch that comes back.
         //
-        // This is the top of `post_process` on purpose, and neither of the two more
-        // obvious homes works:
+        // This must be at the top of `post_process`: the VT handler runs
+        // mid-batch, so parking there hands the rest of the batch's splice,
+        // scroll-delta and damage drain (read from the incoming `self.grid`) to
+        // the wrong selection; after that drain is too late, because a 1049
+        // enter's erase band (from the fresh alt grid's counter) would already
+        // have been compared against main-screen anchors. `SelectionDamage::Band`
+        // carries no grid identity. Here, `self.grid` and `self.text_selection`
+        // belong to the same screen for the rest of the function.
         //
-        // - The VT handler runs MID-batch. Parking there would hand the rest of the
-        //   batch's row-splice / scroll-delta / damage drain below to the wrong
-        //   selection, and those signals are drained from `self.grid`, which by then
-        //   is already the incoming grid.
-        // - The SCR-1 epilogue runs AFTER that drain. By then a 1049 enter has
-        //   already compared the band `enter_alternate_screen`'s `new_grid
-        //   .erase_screen()` recorded — computed from the FRESH ALT grid's
-        //   `absolute_row_counter`, so `[0, rows-1]` — against MAIN-screen anchors.
-        //   `SelectionDamage::Band` carries no grid identity, so that comparison
-        //   type-checks, runs, and silently relates two unrelated coordinate spaces:
-        //   a main LIVE selection is destroyed and a main SCROLLBACK selection (whose
-        //   absolutes are negative) survives, for no reason either one could name.
-        //
-        // Placed here, `self.grid` and `self.text_selection` are the same screen's
-        // for the whole rest of the function.
-        //
-        // `mem::take` in both directions, deliberately NOT a swap: the alt screen's
-        // own selection dies at exit rather than becoming a second durable selection
-        // with its own lifetime. See the field doc for why that asymmetry is what
-        // keeps the clear-site list finite.
-        //
-        // Both arms compare the batch's START screen with its END screen, so a batch
-        // that EXITS and RE-ENTERS (`\x1b[?1049l\x1b[?47h` — one destroys the alt
-        // buffer, the other allocates a fresh blank one) runs NEITHER, and the dead
-        // alt screen's anchors would stay live over a buffer that never held the
-        // selected text. `alt_screen_left_in_batch` is the exit paths' report that
-        // this happened; the 47-family re-entry records no damage of its own, so
-        // nothing else would clear it.
+        // `mem::take` both ways, not a swap: the alt screen's selection dies at
+        // exit (see the field doc). Both arms compare start and end screens, so a
+        // batch that exits and re-enters (`\x1b[?1049l\x1b[?47h`) runs neither;
+        // `alt_screen_left_in_batch` reports that case so the dead alt
+        // selection is cleared.
         let left_alt = was_alt && !self.modes.alternate_screen;
         let exited_mid_batch = std::mem::take(&mut self.transient.alt_screen_left_in_batch);
         if left_alt {
@@ -528,33 +452,22 @@ impl Terminal {
             self.text_selection.clear();
         }
 
-        // Adjust selection coordinates after content scroll (#4056). A
-        // top-anchored archival region is the one non-uniform case we can map
-        // exactly: rows before the protected footer move toward history while
-        // footer rows stay fixed on screen. The grid retains this update
-        // independently because parser-order metadata handling may already
+        // Adjust selection coordinates after content scroll. A top-anchored
+        // archival region is the one non-uniform case mapped exactly: rows above
+        // the protected footer move toward history while the footer stays. The
+        // grid keeps this update separately because metadata handling may already
         // have drained `take_absolute_row_update()` above.
         let selection_row_update = self.grid.take_selection_row_update();
         let scroll_delta = self.grid.take_content_scroll_delta();
-        // Preserve the grid's precise, per-batch coordinate-motion verdict in
-        // a cumulative read-only projection before selection handling consumes
-        // it. A positive finite delta is composable on either active screen:
-        // `Grid` emits it only for an exact full-grid upward translation. Alt
-        // applications own their buffer, but ownership does not make this
-        // coordinate transform ambiguous; treating it as invalidation erased
-        // cursor trails at every bottom-row wrap in fullscreen TUIs. Screen
-        // switches independently invalidate, as do splices, region/down/erase
-        // sentinels, and any future negative delta.
-        // SELECTION CUSTODY Phase 4: `scroll_delta == i32::MAX` used to carry this.
-        // That sentinel had TWO jobs — invalidate host coordinate caches, and clear
-        // the selection — and Phase 4 split them, because they are different
-        // questions (see `coordinates_invalidated` in the grid state). The selection
-        // half moved to the damage lattice; this half is now an explicit flag the
-        // row-MOVING ops set. Without it, removing the sentinel would have silently
-        // broken the documented `ContentScrollState::invalidation_epoch` contract for
-        // every host caching grid coordinates.
-        // The NUMBERS behind the flag: which screen-row bands moved, and by how
-        // much. Drained with the flag so neither can speak for a previous batch.
+        // Preserve the grid's per-batch coordinate-motion verdict in a cumulative
+        // read-only projection before selection handling consumes it. A positive
+        // finite delta is composable on either screen: `Grid` emits it only for an
+        // exact full-grid upward translation. Screen switches, splices,
+        // region/down/erase sentinels and any negative delta invalidate.
+        // Host-coordinate invalidation is an explicit flag set by row-moving ops
+        // (`coordinates_invalidated`), separate from selection damage; it backs
+        // the `ContentScrollState::invalidation_epoch` contract. `bands` records
+        // which screen-row bands moved and by how much, drained with the flag.
         let bands = self.grid.take_row_band_moves();
         // Drain independently: a splice is already an invalidation, but must
         // not short-circuit the flag's take and carry it into a later batch.
@@ -565,17 +478,12 @@ impl Terminal {
             || scroll_delta < 0;
         if invalidates_coordinates {
             self.content_scroll_state.invalidate();
-            // The epoch bumped exactly as before. ADDITIONALLY, when the grid's band
-            // record fully explains this batch's row motion, publish it: a consumer
-            // that can translate bands (the cursor effects under a Codex composer)
-            // keeps its marks on their lines; every other consumer still reads the
-            // epoch step as "discard". The conditions are each a way the record
-            // could be true but incomplete: an EXACT non-empty record; no
-            // whole-screen scroll in the same batch (`scroll_delta == 0` — a uniform
-            // translation mixed with a band is not one transform, the pin
-            // `content_scroll_state_coalesces_uniform_rows_and_invalidates_mixed_batches`);
-            // the batch did not switch screens (the record was drained from the
-            // INCOMING grid and says nothing about the outgoing one); and no
+            // The epoch bumps as always. When the band record fully explains the
+            // batch's row motion, also publish it so a band-translating consumer
+            // keeps its marks on their lines. Required: an exact non-empty record;
+            // no whole-screen scroll in the same batch (`scroll_delta == 0`, pinned
+            // by `content_scroll_state_coalesces_uniform_rows_and_invalidates_mixed_batches`);
+            // no screen switch (the record came from the incoming grid); and no
             // non-composable splice degraded to `Invalidate`.
             let explained = bands.len > 0
                 && !bands.inexact
@@ -600,11 +508,10 @@ impl Terminal {
             }
         }
         let max_rows = i32::from(self.grid.rows());
-        // Lower clear bound is the retained-history floor, not the visible
-        // height: a scrollback selection has rows down to -scrollback_lines
-        // and stays on screen across output (SCR-1 view pinning), so it must
-        // survive ordinary content scroll and only clear once an endpoint is
-        // truly evicted below the floor (or pushed above the live bottom).
+        // The lower clear bound is the retained-history floor, not the visible
+        // height: a scrollback selection stays on screen across output (view
+        // pinning), so it clears only once an endpoint is evicted below the floor
+        // or pushed above the live bottom.
         let floor = i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
         match (selection_row_update, scroll_delta) {
             (None, 0) => {}
@@ -613,37 +520,20 @@ impl Terminal {
                     .adjust_for_scroll(delta, max_rows, floor);
             }
             (Some(aterm_grid::AbsoluteRowUpdate::Splice { at, inserted }), 0) => {
-                // With no other selection-affecting operation in this batch,
-                // the live top advanced exactly by `inserted`. Recover the
-                // pre-splice footer boundary in terminal-relative coordinates.
-                // This branch relies on every OTHER absolute-row advance also
-                // setting `content_scroll_delta`, which would select the mixed-
-                // operation clear arm below. Enforce that cross-field contract
-                // at the process boundary in every debug/test build.
+                // With no other selection-affecting operation in this batch, the
+                // live top advanced exactly by `inserted`; recover the pre-splice
+                // footer boundary in terminal-relative coordinates. Every other
+                // absolute-row advance also sets `content_scroll_delta` (selecting
+                // the mixed-operation arm below); asserted in debug builds.
                 let absolute_rows_after = self.grid.absolute_row_counter();
-                // EXEMPT a batch that switched screens. `absolute_rows_before` was read
-                // from the OUTGOING grid and `absolute_rows_after` from the INCOMING
-                // one; the two counters are unrelated (a fresh alt grid restarts at
-                // `rows`), so the accounting identity is not merely violated, it is not
-                // even a statement about one coordinate space. The projection below is
-                // unaffected: `at`, `inserted` and `absolute_rows_after` all come from
-                // the incoming grid, so it stays self-consistent.
-                //
-                // The EXIT direction is live today: a top-anchored DECSTBM archival
-                // scroll on main strands a splice on the main grid — nothing drains a
-                // parked grid — and the batch that swaps it back drains it. This arm was
-                // unreachable on a switching batch until now only because
-                // `force_selection_invalidation` forced `scroll_delta == i32::MAX` into
-                // the fail-closed `(Some(_), _)` arm.
-                //
-                // The guard is symmetric anyway. The ENTER direction cannot reach it as
-                // the code stands — `enter_alternate_screen_raw` reuses the persistent
-                // alt buffer, but that buffer can never RECORD a splice: the archival
-                // top-anchored path needs `max_scrollback > 0 || scrollback.is_some() ||
-                // scrollback_detached_for_reflow` and the alt grid is always
-                // `Grid::with_scrollback(rows, cols, 0)` with no tiered store. That is a
-                // property of the alt grid's construction, not of this arm, so do not
-                // narrow the guard to match it.
+                // Exempt a screen-switching batch: `absolute_rows_before` came from
+                // the outgoing grid and `absolute_rows_after` from the incoming one,
+                // so the identity does not apply. The projection below uses only
+                // incoming-grid values and stays consistent. The exit direction is
+                // reachable (a top-anchored DECSTBM archival scroll on main strands a
+                // splice that the swap-back batch drains); the enter direction is
+                // not, since the alt grid has no scrollback, but the guard stays
+                // symmetric.
                 debug_assert!(
                     was_alt != self.modes.alternate_screen
                         || splice_accounts_for_batch_row_advance(
@@ -672,38 +562,23 @@ impl Terminal {
                 }
             }
             // Multiple non-composable splices, or a splice mixed with another
-            // scroll/edit in one parser batch, cannot be represented by one
-            // piecewise boundary. Preserve the historical fail-closed behavior.
+            // scroll/edit in one batch, cannot be represented by one piecewise
+            // boundary: fail closed.
             (Some(_), _) => self.text_selection.clear(),
         }
 
-        // SELECTION CUSTODY Phase 4 — the DAMAGE TEST, after the geometric
-        // transform above and before eviction below.
-        //
-        // The transform moves the selection with the content. This asks the separate
-        // question the old `i32::MAX` sentinel could not: did anything this batch
-        // actually REPLACE the rows the selection is sitting on? Only then is the
-        // highlight meaningless and only then must it go.
-        //
-        // Tested in ABSOLUTE rows because that is the one space both sides agree on
-        // regardless of where the viewport is. `live_top_abs` is
-        // `absolute_row_counter - rows`, the same base `Grid::visible_to_absolute`
-        // uses when recording, so a band recorded mid-batch and an anchor tested
-        // post-transform are directly comparable.
-        //
-        // Asked through `clears_selection` rather than by matching the variants:
-        // damage can name SEVERAL disjoint bands (a TUI repainting its title row and
-        // its composer box in one batch), and a caller that matched `Band` by hand
-        // could only ever see their hull — clearing a selection in the gap that
-        // nothing rewrote.
+        // The damage test, after the geometric transform and before eviction:
+        // did this batch replace the rows the selection sits on? Tested in
+        // absolute rows; `live_top_abs` is `absolute_row_counter - rows`, the base
+        // `Grid::visible_to_absolute` records with. Asked through
+        // `clears_selection` rather than matching variants, because damage can
+        // name several disjoint bands and a selection in the gap between them
+        // must survive.
         let damage = self.grid.take_selection_damage();
-        // PRESS CUSTODY, site 2 of 3: the damage CLASSIFICATION this batch will be
-        // recorded under. This is the only place in the process that holds both the
-        // drained variant and the overlap verdict, and it holds neither for longer
-        // than this block. Classifying by the VARIANT first is load-bearing:
-        // `clears_selection` short-circuits `All` to `true` without consulting the
-        // predicate, so the bool alone cannot tell "output replaced the selected
-        // rows" from "the coordinate space is gone" — see `OutputDamage`.
+        // Press custody, site 2 of 3: the damage class this batch is recorded
+        // under. Classify by variant first: `clears_selection` short-circuits
+        // `All` to `true`, so the bool alone cannot tell "output replaced the
+        // selected rows" from "the coordinate space is gone" (see `OutputDamage`).
         let mut damage_class = super::custody::OutputDamage::None;
         if damage != aterm_grid::SelectionDamage::None {
             let live_top_abs = self
@@ -726,38 +601,22 @@ impl Terminal {
             }
         }
 
-        // A grid can lose scrollback WHILE PARKED — `drain_lazy_bounded` and
-        // retention eviction both run against it through `Terminal`'s alt-aware
-        // accessors — and it does so with no `content_scroll_delta` and no damage,
-        // so the `(None, 0)` arm above performed no range check at all. Re-floor the
-        // restored selection against the grid it has just come back to, or an anchor
-        // now below that grid's floor survives pointing at evicted rows.
-        //
-        // Kept ALONGSIDE the unconditional eviction re-floor below, not replaced by
-        // it: `adjust_for_scroll` also range-checks the UPPER bound and clears an
-        // anchor above the live bottom, which `truncate_to_floor` deliberately does
-        // not — it only knows about the floor. A selection parked while alt was up
-        // and restored to a grid whose row count shrank needs exactly that upper
-        // check.
+        // A grid can lose scrollback while parked (lazy drain, retention
+        // eviction) with no scroll delta or damage, so the `(None, 0)` arm did no
+        // range check. Re-floor the restored selection against the grid it just
+        // returned to. Kept alongside the eviction re-floor below because
+        // `adjust_for_scroll` also checks the upper bound (a restored grid whose
+        // row count shrank), which `truncate_to_floor` does not.
         if left_alt {
             self.text_selection.adjust_for_scroll(0, max_rows, floor);
         }
 
-        // SELECTION CUSTODY Phase 4 — EVICTION, the third and last question, after
-        // motion and damage.
-        //
-        // Retention pressure can drop the oldest history in a batch that scrolled by
-        // ZERO — a memory-budget trim, or a splice that archived rows past the ring
-        // cap — and neither the transform above (which only runs on a delta or a
-        // splice) nor the damage test (which is about REPLACED rows, not vanished
-        // ones) asks about it. Re-flooring unconditionally here makes "no anchor sits
-        // below `oldest_absolute_row()`" true on exit from every batch, and it is a
-        // no-op on the ordinary path because `adjust_for_scroll` was already handed
-        // the same floor.
-        //
-        // An evicted endpoint CLAMPS rather than clearing: the copy walk has read
-        // `adj_start_row.max(-history)` for years, so this only makes the anchor
-        // agree with the text a copy already returns.
+        // Eviction: retention pressure can drop the oldest history in a batch
+        // that scrolled by zero (memory trim, a splice archiving past the ring
+        // cap), which neither the transform nor the damage test sees. Re-flooring
+        // unconditionally keeps every anchor at or above `oldest_absolute_row()`
+        // on exit from every batch; a no-op on the ordinary path. An evicted
+        // endpoint clamps rather than clears, matching what a copy already reads.
         let live_top_abs = self
             .grid
             .absolute_row_counter()
@@ -773,11 +632,9 @@ impl Terminal {
         // Without this, consumers must independently reimplement timeout logic.
         if self.modes.synchronized_output {
             if let Some(start) = self.transient.sync_start {
-                // checked_add: bare `Instant + Duration` panics on overflow.
-                // An unrepresentable deadline can only mean "never expires",
-                // which is exactly the frozen-screen hang this timeout exists
-                // to prevent — so treat overflow as already expired (fail
-                // open: disable sync) rather than panic or hang.
+                // checked_add: `Instant + Duration` panics on overflow. An
+                // unrepresentable deadline is treated as already expired (fail
+                // open) rather than never, which would freeze the screen.
                 let expired = start
                     .checked_add(self.sync_timeout_duration)
                     .is_none_or(|deadline| self.transient.process_now >= deadline);
@@ -817,19 +674,18 @@ impl Terminal {
     }
 }
 
-/// Exhaustive destructure of all `Terminal` fields — compile-time guard (#3560).
+/// Exhaustive destructure of all `Terminal` fields: a compile-time guard.
 ///
-/// If a new field is added to `Terminal`, this function will fail to compile,
-/// forcing the developer to decide whether it should be forwarded to
-/// `TerminalHandler` (add to `define_terminal_handler!` in handler.rs) or is
-/// session-only (add here with `_` binding and a comment).
+/// A new `Terminal` field fails to compile here until it is either forwarded to
+/// `TerminalHandler` (`define_terminal_handler!` in handler.rs) or listed here
+/// as session-only with a `_` binding and a comment.
 ///
-/// Session-only fields (not forwarded to handler during VT processing):
-/// - `parser` — drives the handler, not passed into it
-/// - `font` — rendering config, not VT protocol state
-/// - `text_selection` / `parked_text_selection` — UI-layer state adjusted
+/// Session-only fields (not forwarded to the handler during VT processing):
+/// - `parser`: drives the handler, not passed into it
+/// - `font`: rendering config, not VT protocol state
+/// - `text_selection` / `parked_text_selection`: UI state adjusted
 ///   post-process
-/// - `vi` — vi-mode navigation (not VT protocol)
+/// - `vi`: vi-mode navigation
 fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
     let Terminal {
         // --- Forwarded via define_terminal_handler! (handler.rs) ---
@@ -870,9 +726,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         evidence_asserted: _,
         absolute_row_revision: _,
         // --- Session-only (not forwarded to handler) ---
-        // Host config's last-applied values for the app-negotiated modes. Kept
-        // out of the handler on purpose: an escape sequence moves `modes`, never
-        // the host setting the reload diffs against (see `ConfiguredModes`).
+        // Host config's last-applied values for the app-negotiated modes: an
+        // escape sequence moves `modes`, never the host setting the reload diffs
+        // against (see `ConfiguredModes`).
         configured_modes: _,
         content_scroll_state: _,
         // The resize journal: written by the resize entry points, never by a VT
@@ -880,18 +736,15 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         resize_journal: _,
         parser: _,
         text_selection: _,
-        // The OTHER screen's selection, parked across an alt switch. Session-only
-        // for the same reason `text_selection` is, and additionally kept out of the
-        // handler by design: the park/restore is a post_process decision (see
-        // there), never a VT-dispatch one.
+        // The other screen's selection, parked across an alt switch; the
+        // park/restore is a post_process decision, never a VT-dispatch one.
         parked_text_selection: _,
         // The selection a grid resize undo will put back: resize-owned,
         // session-only like the selection it copies.
         resize_undo_selection: _,
-        // PRESS CUSTODY: the last recorded custody transition. Session-only and
-        // kept out of the handler on purpose — the transition is decided by the
-        // press/mouse seams and by `process_at`'s three-site output protocol, never
-        // by a VT dispatch, so a handler that could write it could forge one.
+        // Press custody: the last recorded custody transition, decided by the
+        // press/mouse seams and `process_at`'s output protocol, never by VT
+        // dispatch.
         last_custody: _,
         last_custody_change: _,
         last_selection_taker: _,
@@ -904,11 +757,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         policy: _,
         damage_epoch: _,
         damage_epoch_counted: _,
-        // DMG-1 damage carrier: extraction-continuity tokens (engine identity
-        // nonce + take-generation). Session-only — they describe who last
-        // extracted a render snapshot and whether the damage session has been
-        // consumed since, never any VT protocol state, so the handler must not
-        // see them.
+        // Damage carrier: extraction-continuity tokens (engine identity nonce and
+        // take-generation), describing who last extracted a render snapshot; not
+        // VT protocol state.
         extract_identity: _,
         extract_gen: _,
         // Cached search index + rebuild counter: session-only, not VT state.
@@ -927,7 +778,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // never VT state.
         refill_mask_scratch: _,
         // Lock-free publication of the encoder fold for the input seam:
-        // derived FROM VT state under the lock, never an input to the handler.
+        // derived from VT state under the lock, never an input to the handler.
         mode_mirror: _,
         // Alt-screen scroll-off archive: observation-only, driven by `process_at`
         // between parser slices and at the epilogue, never by a VT dispatch.
@@ -941,22 +792,14 @@ mod tests {
     use crate::terminal::TerminalBuilder;
     use std::time::Duration;
 
-    /// The RIS clear of the PARKED slot (`finish_ris_batch`), ISOLATED.
+    /// The RIS clear of the parked slot (`finish_ris_batch`), in isolation.
     ///
-    /// `scroll_pin_across_alt_screen::ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight`
-    /// pins the user-visible property and cannot isolate this line, and no black-box
-    /// test can: RIS's own `erase_scrollback` records `SelectionDamage::All` on the
-    /// main grid, that band is not drained while the alt grid is active, and the exit
-    /// batch drains it in `post_process` immediately AFTER the restore — so a parked
-    /// selection that survived the reset is destroyed on arrival anyway. Deleting
-    /// this clear leaves the property test green for that reason alone.
-    ///
-    /// What the line is actually for is the FIELD invariant documented on
-    /// `parked_text_selection` — "empty whenever `alternate_screen` is false", and
-    /// more sharply, never outliving the reset that erased the grid it names. That is
-    /// observable from inside the crate, one batch earlier than any restore, and it
-    /// is where this belongs: a future grid whose restore path does not happen to
-    /// carry an `All` moves the whole load onto this line.
+    /// No black-box test can isolate it: RIS's `erase_scrollback` records
+    /// `SelectionDamage::All` on the main grid and the exit batch drains it
+    /// right after the restore, destroying a surviving parked selection anyway.
+    /// This pins the field invariant on `parked_text_selection` (empty whenever
+    /// `alternate_screen` is false, and never outliving the reset that erased
+    /// its grid) one batch before any restore.
     #[test]
     fn ris_empties_the_parked_selection_slot_in_the_batch_that_resets() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -977,9 +820,8 @@ mod tests {
             "precondition: entering alt parked the main selection in the slot"
         );
 
-        // RIS and re-enter alt in ONE batch. `was_alt` and `modes.alternate_screen`
-        // are both true at `post_process`, so neither the park nor the restore runs:
-        // nothing but the reset itself can retire the slot.
+        // RIS and re-enter alt in one batch: neither park nor restore runs, so
+        // only the reset itself can retire the slot.
         term.process(b"\x1bc\x1b[?1049h");
 
         assert!(
@@ -989,12 +831,10 @@ mod tests {
         );
     }
 
-    /// The same batch from the MAIN screen, where the RIS clear of the LIVE slot
-    /// is what is load-bearing. `\x1bc\x1b[?1049h` there is an ordinary enter at
-    /// `post_process`, so the park runs and takes whatever the live slot holds —
-    /// and the reset's `All`, recorded on the main grid, is not drained by a batch
-    /// that ends on alt. Before `finish_ris_batch` cleared the live slot this
-    /// parked the pre-RIS selection over the grid the reset had just erased.
+    /// The same batch from the main screen, where the RIS clear of the live slot
+    /// matters: `\x1bc\x1b[?1049h` is an ordinary enter at `post_process`, so the
+    /// park would take the pre-RIS live selection, and the reset's `All` on the
+    /// main grid is not drained by a batch that ends on alt.
     #[test]
     fn ris_then_enter_from_main_parks_nothing() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -1021,11 +861,9 @@ mod tests {
         assert!(!term.text_selection().has_selection());
     }
 
-    /// RIS followed by bytes the PTY read cut mid-sequence: the tail of the chunk
-    /// must survive into the next `process` call. The RIS parser reset used to run
-    /// after the WHOLE slice, so it wiped the half-parsed CSI / UTF-8 / DCS that the
-    /// bytes AFTER `ESC c` had built, and the next chunk printed its tail as text.
-    /// Both `advance_fast` branches are exercised (profiling off and on).
+    /// RIS followed by bytes the PTY read cut mid-sequence: the tail survives
+    /// into the next `process` call. Both `advance_fast` branches (profiling off
+    /// and on).
     fn ris_then_split_tail(profiling: bool, first: &[u8], second: &[u8]) -> Terminal {
         let mut t = Terminal::new(24, 80);
         t.transient.pipeline_timestamps.profiling_enabled = profiling;
@@ -1091,10 +929,9 @@ mod tests {
         }
     }
 
-    /// Negative control for the cross-field contract behind piecewise selection
-    /// recovery: the retained splice is sufficient only when it explains the
-    /// ENTIRE counter advance. One unreported ordinary scroll must reject the
-    /// projection (and therefore trip the production debug assertion).
+    /// Negative control for piecewise selection recovery: the retained splice
+    /// must explain the entire counter advance, so one unreported ordinary
+    /// scroll rejects the projection (and trips the debug assertion).
     #[test]
     fn selection_splice_must_account_for_the_entire_batch_row_advance() {
         let before = 40;
@@ -1192,7 +1029,7 @@ mod tests {
             after_interior.invalidation_epoch,
             before_interior.invalidation_epoch + 1
         );
-        // ...and the epoch step is EXPLAINED: the 0-based band [1..=2] went up one.
+        // ...and the epoch step is explained: the 0-based band [1..=2] went up one.
         assert_eq!(
             after_interior.band_batches,
             before_interior.band_batches + 1
@@ -1225,7 +1062,7 @@ mod tests {
             term.grid().scrollback_lines() > 0,
             "the top-anchored case closes the scrollback-growth false positive"
         );
-        // The archival splice is ALSO an explained band: rows [0..=2] up by one,
+        // The archival splice is also an explained band: rows [0..=2] up by one,
         // the footer row 3 untouched.
         assert_eq!(
             after_top_anchored.band_batches,
@@ -1270,25 +1107,12 @@ mod tests {
         );
     }
 
-    /// SELECTION CUSTODY — the epoch survives the split of
-    /// `force_selection_invalidation`.
-    ///
-    /// The four alt-switch call sites now use `invalidate_host_coordinates`, which
-    /// drops the `SelectionDamage::All` half (the selection is parked, not
-    /// destroyed) and KEEPS the `coordinates_invalidated` half. That half is the
-    /// public `ContentScrollState::invalidation_epoch` contract: consumers with
-    /// cached grid coordinates TRANSLATE rather than rebuild while the epoch is
-    /// unchanged, so losing the bump would leave cursor-effect state attached to
-    /// cells from the other buffer. One batch per spelling, so each bump is
-    /// attributable.
-    ///
-    /// Delete the four calls instead of replacing them and ALL SIX fail. That was
-    /// five of six until 2026-09-10: 1049-ENTER used to survive on its
-    /// `new_grid.erase_screen()`, which bumped the epoch by itself. It no longer
-    /// does — an erase rewrites cells in place and moves nothing
-    /// (`an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`) —
-    /// so the switch's own explicit call is now the only thing holding this up,
-    /// which is exactly what the test is for.
+    /// The host-coordinate epoch still bumps on every alt switch spelling: the
+    /// switch sites call `invalidate_host_coordinates`, which keeps
+    /// `coordinates_invalidated` (the `ContentScrollState::invalidation_epoch`
+    /// contract) without `SelectionDamage::All`. One batch per spelling, so each
+    /// bump is attributable; 1049 enter relies on the explicit call because its
+    /// erase moves nothing.
     #[test]
     fn every_alt_screen_switch_advances_the_host_coordinate_epoch_exactly_once() {
         let mut term = TerminalBuilder::new()
@@ -1318,27 +1142,15 @@ mod tests {
         }
     }
 
-    /// **D2 — the owner, 2026-09-10: "when the screen is refreshed the rainbow
-    /// disapears".** An ERASE REWRITES CELLS IN PLACE AND MOVES NOTHING, so it
-    /// invalidates no host-cached grid COORDINATE.
+    /// An erase rewrites cells in place and moves nothing, so it invalidates no
+    /// host-cached grid coordinate (see `damage_selection_visible_rows_ext`'s
+    /// `moves_coordinates`). `invalidation_epoch` drives the effects pipeline's
+    /// cursor-glow reset, so a bare `ESC[J` from a prompt redraw must not bump it
+    /// (owner, 2026-09-10).
     ///
-    /// That is not a new rule; it is the rule `damage_selection_visible_rows_ext`
-    /// already documents at its `moves_coordinates` parameter ("A scroll or
-    /// line-edit moves rows; an erase or a rectangle op rewrites cells in place
-    /// and moves nothing"). Every ED spelling passed `true` anyway. The flag sets
-    /// `coordinates_invalidated`, which this function folds into
-    /// `invalidates_coordinates`, which bumps `ContentScrollState::invalidation_epoch`
-    /// — and `invalidation_epoch` is exactly what the GUI's
-    /// `cursor_effect_scroll_decision` reads to call `cursor_glow.reset()`. So a
-    /// bare `ESC[J` from a zsh prompt redraw (measured: four per interaction)
-    /// annihilated the whole earned rainbow ribbon with the caret still, the grid
-    /// unchanged and the terminal the same one.
-    ///
-    /// Row `r`, column `c` names the same cell before and after every sequence
-    /// below, which is the whole content of the claim. The EL family and DECERA
-    /// are the built-in refutation controls — they erase the same cells and were
-    /// always honest — and the scroll at the end is the vacuity control: the epoch
-    /// must still move when rows really do move.
+    /// Row `r`, column `c` names the same cell before and after every sequence.
+    /// EL and DECERA are refutation controls; the scroll at the end is the
+    /// vacuity control (the epoch still moves when rows move).
     #[test]
     fn an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate() {
         // ED and its selective twin, every spelling, plus DECALN — which
@@ -1371,10 +1183,9 @@ mod tests {
             );
         }
 
-        // THE REFUTATION CONTROLS: the neighbouring erases that were always
-        // honest. If the assertion above ever passes for the wrong reason (the
-        // epoch stops moving at all), these still pass and the vacuity control
-        // below fails, which is how the pin stays readable.
+        // Refutation controls: neighbouring erases that never bumped. If the
+        // epoch stopped moving altogether these still pass and the vacuity
+        // control below fails.
         for spelling in [
             &b"\x1b[K"[..],          // EL 0
             &b"\x1b[2K"[..],         // EL 2
@@ -1394,9 +1205,7 @@ mod tests {
             );
         }
 
-        // VACUITY CONTROL: a line-edit really does move rows, so the epoch must
-        // still move. Delete the fix and this passes; delete the SIGNAL and this
-        // is the test that catches it.
+        // Vacuity control: a line edit moves rows, so the epoch still moves.
         let mut term = TerminalBuilder::new()
             .size(4, 12)
             .ring_buffer_size(8)
@@ -1411,43 +1220,19 @@ mod tests {
         );
     }
 
-    /// **D2's residual — the `clear` COMMAND.** DISCARDING SCROLLBACK EVICTS
-    /// HISTORY; IT MOVES NO LIVE COORDINATE.
+    /// ED 3 (the `clear` command's leading `ESC[3J`) discards scrollback: it
+    /// evicts history and moves no live coordinate.
     ///
-    /// Ctrl-L was fixed by
-    /// `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`:
-    /// zsh's Ctrl-L sends terminfo's `clear=`, `ESC[H ESC[2J`, and an ED moves
-    /// nothing. The `clear` COMMAND sends `ESC[3J ESC[H ESC[2J`, and the leading
-    /// ED 3 kept cliffing the ribbon on its own.
+    /// `erase_scrollback` keeps the visible rows as the new ring with
+    /// `ring_head = 0`; with `display_offset` 0 (guaranteed during a batch)
+    /// `row_index(i)` and `visible_to_absolute(i)` name the same row before and
+    /// after, and `absolute_row_counter` is untouched; both are asserted. Only
+    /// `oldest_absolute_row()` rises. Renumbering history is the Kitty unscroll's
+    /// `history_renumber_epoch`, not this.
     ///
-    /// ED 3 reached `Grid::erase_scrollback`, which called
-    /// `force_selection_invalidation` — three signals under one name:
-    /// `SelectionDamage::All`, the `content_scroll_delta == i32::MAX` sentinel,
-    /// and `coordinates_invalidated`. The last two each independently force
-    /// `invalidates_coordinates` in `post_process`, which bumps
-    /// `ContentScrollState::invalidation_epoch`, which is what the GUI's
-    /// `cursor_effect_scroll_decision` reads to call `cursor_glow.reset()`.
-    ///
-    /// **The live viewport does not move, and the code says so.**
-    /// `erase_scrollback` copies visible rows `[live_top, live_top + visible_rows)`
-    /// into `new_rows[0..visible_rows]` and sets `ring_head = 0`, `total_lines =
-    /// visible_rows`. With `display_offset` at 0 — which the SCR-1 prologue
-    /// guarantees for the whole of a processing batch (`processing.rs`: "we reset
-    /// to 0 for the duration") — `row_index(i)` reads `(ring_head + total_lines -
-    /// visible_rows + i)`, i.e. `(live_top + i)` before and `i` after: the SAME
-    /// row. It never touches `absolute_row_counter` or `visible_rows`, so
-    /// `visible_to_absolute(i)` is unchanged too. Both are asserted below, because
-    /// they are the whole content of the claim.
-    ///
-    /// What genuinely changes is `oldest_absolute_row()`, which rises to the top
-    /// visible row: history is EVICTED. Eviction is not renumbering — the Kitty
-    /// unscroll that really does renumber retained history has its own
-    /// `history_renumber_epoch` (`scroll_unscroll.rs`) and is untouched here.
-    ///
-    /// So ED 3 keeps `SelectionDamage::All` — no band can describe history that no
-    /// longer exists — and stops claiming a coordinate move. The selection control
-    /// below is not decoration: it is what stops this pin passing because the
-    /// signal was deleted rather than corrected.
+    /// So ED 3 keeps `SelectionDamage::All` (no band describes history that is
+    /// gone) and does not bump `invalidation_epoch`. The selection control below
+    /// stops this pin passing because the signal was deleted.
     #[test]
     fn discarding_scrollback_evicts_history_and_moves_no_live_coordinate() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -1489,9 +1274,8 @@ mod tests {
                 0,
                 "{spelling:?} really did discard the scrollback"
             );
-            // ED 2 in the second spelling blanks the live rows, so compare TEXT
-            // only for the spelling that leaves them alone. The absolute
-            // numbering is compared for both — that is the coordinate claim.
+            // ED 2 in the second spelling blanks the live rows, so text is compared
+            // only for the other spelling; absolute numbering is compared for both.
             let live_after: Vec<(u64, Option<String>)> = (0..rows)
                 .map(|r| (term.grid().visible_to_absolute(r), term.row_text(r.into())))
                 .collect();
@@ -1509,12 +1293,9 @@ mod tests {
             }
         }
 
-        // THE CONTROL THAT STOPS THIS PIN GOING VACUOUS. ED 3 must still destroy
-        // the selection: the coordinate space it was anchored in is gone, and
-        // `SelectionDamage::All` is deliberately KEPT. Delete the whole
-        // `force_selection_invalidation` call rather than correcting it and this
-        // is what fails (and with it the selection-custody conformance's
-        // `WholesaleInvalidate`, driven with these same bytes).
+        // Control: ED 3 still destroys the selection, since its coordinate space
+        // is gone (`SelectionDamage::All` is kept; the selection-custody
+        // conformance's `WholesaleInvalidate` drives the same bytes).
         let mut term = TerminalBuilder::new()
             .size(4, 12)
             .ring_buffer_size(64)
@@ -1538,8 +1319,7 @@ mod tests {
             "ED 3 discards the coordinate space the selection named: it must still clear"
         );
 
-        // VACUITY CONTROL: an op that really does move rows must still bump the
-        // epoch. Delete the SIGNAL instead of the lie and this is the failure.
+        // Vacuity control: an op that moves rows still bumps the epoch.
         let mut term = TerminalBuilder::new()
             .size(4, 12)
             .ring_buffer_size(64)
@@ -1603,7 +1383,7 @@ mod tests {
         assert_eq!(uniform.uniform_up_rows, initial.uniform_up_rows + 3);
         assert_eq!(uniform.invalidation_epoch, initial.invalidation_epoch);
 
-        // A later partial-region shift in the SAME batch turns the grid verdict
+        // A later partial-region shift in the same batch turns the grid verdict
         // into the fail-closed sentinel. Do not publish the earlier scroll as a
         // composable translation: one invalidation covers the whole batch.
         term.process(b"\x1b[3;1H\n\x1b[2;3r\x1b[3;1H\n");
@@ -1616,12 +1396,12 @@ mod tests {
         );
     }
 
-    /// The real Codex Enter (capture byte records 112–113: `ESC[?2026h ESC[12;1H
-    /// ESC[J` then `ESC[12;57r ESC[12;1H (ESC M)x5 ESC[r ESC[1;16r ESC[11;1H \r\n`)
-    /// on a 57x151 terminal is ONE explained epoch step whose single band is the
-    /// 0-based region `[11..=56]` moved down five rows: the five reverse indices
-    /// compose in the grid, the ED is inert, and the trailing LF starts above the
-    /// `[0..=15]` region's bottom so it scrolls nothing.
+    /// A Codex Enter (`ESC[?2026h ESC[12;1H ESC[J` then `ESC[12;57r ESC[12;1H
+    /// (ESC M)x5 ESC[r ESC[1;16r ESC[11;1H \r\n`) on a 57x151 terminal is one
+    /// explained epoch step whose single band is the 0-based region `[11..=56]`
+    /// moved down five rows: the reverse indices compose, the ED is inert, and the
+    /// trailing LF starts above the `[0..=15]` region's bottom so it scrolls
+    /// nothing.
     #[test]
     fn a_codex_enter_batch_is_one_composed_band_batch() {
         let mut term = TerminalBuilder::new()
@@ -1659,10 +1439,9 @@ mod tests {
         );
     }
 
-    /// The real Codex streamed line with the viewport pinned at the bottom
-    /// (capture byte record 720: `ESC[1;52r ESC[52;1H \r\n`) is the top-anchored
-    /// archival scroll — one explained epoch step whose band is the transcript
-    /// `[0..=51]` moved up one row while the footer rows 52..=56 stay, and one
+    /// A Codex streamed line with the viewport at the bottom (`ESC[1;52r ESC[52;1H
+    /// \r\n`) is the top-anchored archival scroll: one explained epoch step whose
+    /// band is `[0..=51]` moved up one row while footer rows 52..=56 stay, and one
     /// line enters history.
     #[test]
     fn a_codex_phase_b_line_is_an_explained_top_anchored_band() {
@@ -1696,9 +1475,8 @@ mod tests {
     }
 
     /// Every coordinate move the band record cannot describe still bumps the
-    /// epoch and is NOT counted as a band batch, so a band-translating host falls
-    /// back to today's discard: a margined (DECLRMM) SU is a rectangle, RIS is a
-    /// wholesale reset, an alt-screen switch replaces the coordinate space.
+    /// epoch and is not counted as a band batch: a margined (DECLRMM) SU, RIS, an
+    /// alt-screen switch.
     #[test]
     fn a_poisoned_or_mixed_batch_advances_the_epoch_without_a_band_batch() {
         let mut term = TerminalBuilder::new()
@@ -1741,10 +1519,9 @@ mod tests {
         );
     }
 
-    /// SCR-1: while the user is scrolled back into history, live output (e.g.
-    /// `tail -f`) must NOT yank the viewport to the bottom. The display_offset is
-    /// re-pinned by the number of lines entering scrollback so the SAME content
-    /// stays in view.
+    /// While the user is scrolled back, live output (e.g. `tail -f`) does not
+    /// yank the viewport: display_offset is re-pinned by the lines entering
+    /// scrollback so the same content stays in view.
     #[test]
     fn scrolled_back_viewport_pins_during_live_output() {
         let mut term = TerminalBuilder::new()
@@ -1766,7 +1543,7 @@ mod tests {
             "precondition: a scrollback line is visible at the top, got {top_before:?}",
         );
 
-        // Feed MORE live output (simulating tail -f). The viewport must stay put.
+        // Feed more live output (simulating tail -f). The viewport must stay put.
         for i in 20..30 {
             term.process(format!("live-{i}\r\n").as_bytes());
         }
@@ -1794,7 +1571,7 @@ mod tests {
         }
     }
 
-    /// SCR-1: when the user is at the live bottom (display_offset == 0), output
+    /// when the user is at the live bottom (display_offset == 0), output
     /// still flows normally and the viewport tracks the bottom (no pin).
     #[test]
     fn live_viewport_tracks_bottom_when_not_scrolled_back() {
@@ -1820,10 +1597,8 @@ mod tests {
         );
     }
 
-    /// Mode 2026 must time out (fail open) when the timer jumps past the
-    /// deadline — the backdated start simulates a forward clock jump after
-    /// `CSI ?2026h` (e.g. suspend/resume), the exact scenario the timeout
-    /// exists for: an application enables sync and never disables it.
+    /// Mode 2026 times out (fails open) when the clock jumps past the deadline
+    /// after `CSI ?2026h`, e.g. across suspend/resume.
     #[test]
     fn sync_output_disables_after_backdated_start() {
         let mut term = Terminal::new(24, 80);
@@ -1853,17 +1628,13 @@ mod tests {
     }
 
     /// The close counter alone cannot authorize a close+immediate-reopen
-    /// present: once the new open episode has accepted output, the mutable grid
-    /// already contains a prefix of the next frame. Pin the exact episode
-    /// boundary and the redundant-DECSET anti-laundering rule in the real
-    /// parser/terminal path.
+    /// present: once the new episode has accepted output, the grid holds a prefix
+    /// of the next frame. Pins the episode boundary and the redundant-DECSET
+    /// anti-laundering rule through the real parser.
     #[test]
     fn sync_open_dirty_tracks_the_current_episode_only() {
-        // ONE clock reading for every batch: an episode opened here must stay
-        // open across the steps however long the scheduler parks this thread
-        // between them — the 1 s mode-2026 timeout is not this test's subject,
-        // and on the live clock a stall of over a second between two `process`
-        // calls expires the episode, which reads as a dirty bit that never set.
+        // One clock reading for every batch, so a scheduler stall between steps
+        // cannot expire the episode via the 1 s mode-2026 timeout.
         let clock = super::ClockReading::now();
         let mut term = Terminal::new(24, 80);
         assert!(!term.sync_open_dirty());
@@ -1933,15 +1704,12 @@ mod tests {
         }
     }
 
-    /// THE PROGRAM'S UNFINISHED FRAME OUTLIVES THE TERMINAL'S TIMEOUT
-    /// (2026-09-28, the owner's tab-2 trail gap, review round 1). The
-    /// timeout force-clear ends the MODE so a crashed app cannot freeze the
-    /// screen; it does not finish the program's frame, whose partial writes
-    /// and hidden write cursor are still on the grid. `sync_frame_unfinished`
-    /// keeps the program's account: open and written-into, until the
-    /// program's own `?2026l`, DECSTR or RIS. NEGATIVE CONTROL: the mode-level
-    /// signals the first fix read (`synchronized_output`, `sync_open_dirty`)
-    /// both read `false` at the same instant, which is the regression.
+    /// The program's unfinished frame outlives the terminal's timeout. The
+    /// timeout force-clear ends the mode so a crashed app cannot freeze the
+    /// screen, but the partial frame is still on the grid:
+    /// `sync_frame_unfinished` stays set until the program's own `?2026l`,
+    /// DECSTR or RIS. Negative control: the mode-level signals
+    /// (`synchronized_output`, `sync_open_dirty`) read `false` at that instant.
     #[test]
     fn sync_frame_unfinished_is_the_programs_account_and_survives_the_timeout() {
         let mut term = Terminal::new(24, 80);
@@ -2013,10 +1781,9 @@ mod tests {
         assert!(!term.sync_open_dirty(), "RIS closes and clears the episode");
     }
 
-    /// A forward-dated start (timer skew in the other direction, e.g.
-    /// checkpoint restore) must neither panic in the deadline math nor
-    /// wedge the terminal permanently: processing continues, and once the
-    /// skewed deadline is behind `now`, sync output still disables.
+    /// A forward-dated start (clock skew, e.g. checkpoint restore) neither
+    /// panics in the deadline math nor wedges the terminal: once the deadline is
+    /// behind `now`, sync output still disables.
     #[test]
     fn sync_output_survives_forward_dated_start_without_panic() {
         let mut term = Terminal::new(24, 80);
@@ -2039,10 +1806,8 @@ mod tests {
         );
     }
 
-    /// REPAINT-BLINK epoch, the positive law: the EXACT per-keystroke byte
-    /// pattern Claude Code emits (ground truth captured live over the control
-    /// socket) — `?2026h · ?25l · redraw · ?25h · ?2026l` — bumps the epoch
-    /// exactly ONCE per burst, monotonically.
+    /// Repaint-blink epoch, positive: the per-keystroke pattern
+    /// `?2026h ?25l redraw ?25h ?2026l` bumps the epoch exactly once per burst.
     #[test]
     fn repaint_blink_epoch_bumps_once_per_claude_burst() {
         let mut term = Terminal::new(24, 80);
@@ -2062,10 +1827,8 @@ mod tests {
         }
     }
 
-    /// REPAINT-BLINK epoch, the negative laws: a bare DECTCEM hide with NO
-    /// synchronized update active (ConPTY's per-echo hide, and any plain
-    /// hide/show pair) never bumps — and neither does vim-style output, which
-    /// parks the cursor hidden while it draws WITHOUT ever entering sync.
+    /// Repaint-blink epoch, negative: a DECTCEM hide outside a synchronized
+    /// update (ConPTY's per-echo hide, vim-style drawing) never bumps.
     #[test]
     fn bare_hide_and_vim_style_output_never_bump_the_blink_epoch() {
         let mut term = Terminal::new(24, 80);
@@ -2083,7 +1846,7 @@ mod tests {
             0,
             "vim-style hide-while-drawing (no DEC-2026) never bumps"
         );
-        // Sync WITHOUT a hide inside it doesn't bump either (the pairing is
+        // Sync without a hide inside it doesn't bump either (the pairing is
         // the discriminator, not either half alone).
         term.process(b"\x1b[?2026htear-free write\x1b[?2026l");
         assert_eq!(term.repaint_blink_epoch(), 0, "sync alone never bumps");
@@ -2094,22 +1857,16 @@ mod tests {
             0,
             "show-inside-sync never bumps"
         );
-        // Positive control on the same terminal: the pairing DOES bump.
+        // Positive control on the same terminal: the pairing does bump.
         term.process(b"\x1b[?2026h\x1b[?25lredraw\x1b[?25h\x1b[?2026l");
         assert_eq!(term.repaint_blink_epoch(), 1);
     }
 
-    /// Clock-seam determinism (docs/design/HIERARCHICAL_SESSIONS.md Addendum B,
-    /// GREEN-ORDER step 2): `process_at` must be a pure function of
-    /// `(bytes, ClockReading)`. Every state-affecting time read — the bell
-    /// throttle, the mode-2026 timeout, and the OSC 133 command-mark
-    /// timestamps — must observe the injected reading, never the host clock.
-    ///
-    /// We replay one fixed schedule on two fresh terminals and assert the
-    /// observable state is bit-identical, AND that it equals the values the
-    /// *injected* clock dictates rather than wall-clock time. Each pinned value
-    /// is exactly what would change if its site regressed to `Instant::now()`
-    /// or `current_time_ms()`, so this is the regression tripwire for the seam.
+    /// `process_at` is a pure function of `(bytes, ClockReading)`: the bell
+    /// throttle, the mode-2026 timeout and OSC 133 mark timestamps observe the
+    /// injected reading. One schedule replayed on two terminals yields identical
+    /// state equal to what the injected clock dictates, so a site regressing to
+    /// `Instant::now()` or `current_time_ms()` fails.
     #[test]
     fn process_at_is_deterministic_under_injected_clock() {
         use super::ClockReading;
@@ -2184,7 +1941,7 @@ mod tests {
             "process_at must be deterministic for a fixed (bytes, clock) schedule"
         );
 
-        // Pin each observable to what the INJECTED clock dictates.
+        // Pin each observable to what the injected clock dictates.
         let (content, sync_on, bell_count, marks) = a;
         assert!(content.contains("helloz"), "grid content: {content:?}");
         assert_eq!(

@@ -166,7 +166,7 @@ fn an_unrevealed_row_moves_neither_the_overflow_row_nor_the_plus_count() {
     let mut c = fresh(now);
     let ids: Vec<MessageId> = (0..3)
         .map(|i| {
-            c.post(warn(&format!("w{i}")).hold(Hold::Standing), stamp(), now)
+            c.post(warn(&format!("w{i}")).hold(Hold::STANDING), stamp(), now)
                 .id
         })
         .collect();
@@ -180,7 +180,7 @@ fn an_unrevealed_row_moves_neither_the_overflow_row_nor_the_plus_count() {
     assert_eq!(c.on_glass().map(|l| l.id).collect::<Vec<_>>(), ids);
     // At one row, no `+1 ›` for a row nobody may see yet.
     let mut one = fresh(now);
-    one.post(warn("w").hold(Hold::Standing), stamp(), now);
+    one.post(warn("w").hold(Hold::STANDING), stamp(), now);
     one.commit_rows(now, 1);
     let before = present(&one, 80);
     one.post(download(1).reveal_after(PROGRESS_GRACE), stamp(), now);
@@ -220,7 +220,7 @@ fn mark_seen_folds_a_standing_row() {
     let mut c = fresh(now);
     let standing = c
         .post(
-            warn("Auto-update failing").hold(Hold::Standing),
+            warn("Auto-update failing").hold(Hold::STANDING),
             stamp(),
             now,
         )
@@ -232,9 +232,7 @@ fn mark_seen_folds_a_standing_row() {
                 .action(Intent::NotNow {
                     decision: crate::model::Decision::FileAccess,
                 })
-                .hold(Hold::Ask {
-                    for_: crate::HOLD_ASK,
-                }),
+                .hold(Hold::asking(crate::HOLD_ASK)),
             stamp(),
             now,
         )
@@ -376,7 +374,10 @@ fn the_indicator_is_the_meters_state_never_the_holds() {
     let mut c = fresh(now);
     let blocked = c
         .post(
-            Message::new(tags::UPDATE, Severity::Warn, "Close the editor to finish").hold(
+            // Info, not Warn: a Live row blocked on the person that is a WARNING
+            // persists without saying why, and the door records it
+            // (`door_tests::a_blocked_live_row_at_warn_is_a_record_and_work_needs_its_indicator`).
+            Message::new(tags::UPDATE, Severity::Info, "Close the editor to finish").hold(
                 Hold::Live {
                     stale_after: STALE_UPDATE,
                 },
@@ -432,8 +433,8 @@ fn the_indicator_is_the_meters_state_never_the_holds() {
 // ---- the center's motion state ---------------------------------------------
 
 /// A row POSTED heavy shows its load words from the first frame — it is on
-/// the glass because it is heavy (review round 2, 2026-09-23: the latch at
-/// +5 s laid the live row out again mid-animation) — and its layout reserves
+/// the glass because it is heavy (a later latch would lay the live row out
+/// again mid-animation) — and its layout reserves
 /// ONE slot for them for the row's life: a resource change swaps the words
 /// at once (the machine stayed busy), the load ending takes them, a load
 /// declared after none waits [`LOAD_AFTER`], and none of it moves the meter
@@ -646,10 +647,9 @@ fn a_resolved_live_row_echoes_in_its_slot_then_frees_it() {
 /// A Fault echo SAYS it failed for its whole life — ⚠ in the glyph cell and
 /// `failed` in the row's time slot (the ETA slot of a determinate row, the
 /// elapsed slot of a comet) — and a Complete echo says it is DONE there
-/// under its ✓ (review round 2, 2026-09-23: a bar that turned yellow and
-/// faded read as a render glitch; review round 3, 2026-09-24: `✓
-/// Downloading aterm … 100%` said done with its glyph and working with its
-/// words). A Vanish claims no outcome and says neither. The slots are the
+/// under its ✓ (a bar that turned yellow and faded reads as a render
+/// glitch, and `✓ Downloading aterm … 100%` says done with its glyph and
+/// working with its words). A Vanish claims no outcome and says neither. The slots are the
 /// row's own: nothing re-grids.
 #[test]
 fn a_fault_echo_wears_the_warn_glyph_and_says_failed() {
@@ -734,14 +734,13 @@ fn a_fault_echo_wears_the_warn_glyph_and_says_failed() {
 fn echoes_never_change_the_row_count() {
     let now = t0();
     // The same script with a LIVE row (it echoes) and a HELD one (no echo).
-    let run = |live: bool| -> Vec<Option<u16>> {
+    let run = |row: Message, echoes: usize| -> Vec<Option<u16>> {
         let mut c = fresh(now);
-        let row = if live { busy("work") } else { warn("held") };
         let id = c.post(row, stamp(), now).id;
-        let other = c.post(warn("other").hold(Hold::Standing), stamp(), now).id;
+        let other = c.post(warn("other").hold(Hold::STANDING), stamp(), now).id;
         let mut answers = vec![c.commit_rows(now, 3)];
         c.resolve(id, Outcome::Ok, now + ms(10));
-        assert_eq!(c.echoes().len(), usize::from(live));
+        assert_eq!(c.echoes().len(), echoes);
         for step in 0..40u64 {
             let at = now + ms(10 + step * 50);
             c.settle(at, true);
@@ -753,10 +752,21 @@ fn echoes_never_change_the_row_count() {
         answers.push(c.commit_rows(now + ms(3000) + SHRINK_QUIET, 3));
         answers
     };
-    assert_eq!(run(true), run(false));
+    let held = run(warn("held"), 0);
+    assert_eq!(held[31], Some(1), "the held run shrinks at step 30 (+1510)");
+    // A bar at 70 %: its Complete echo (a 390 ms glide, the sweep and the
+    // fade, 1440 ms) fits inside the quiet — the held row's timeline exactly.
+    assert_eq!(run(download(51_800_000), 1), held);
+    // A busy row's Complete echo runs 1650 ms (the longest glide), past the
+    // 1500 ms quiet, and a quiet shrink waits it out (ruling 415 (b)): the same counts in the same
+    // order — no extra re-grid — with the
+    // shrink at the first step past the echo's end (+1660), not inside it.
+    let mut late = held.clone();
+    late.swap(31, 34);
+    assert_eq!(run(busy("work"), 1), late);
     // The window's own shrink drops an echo past the new count.
     let mut c = fresh(now);
-    c.post(warn("top").hold(Hold::Standing), stamp(), now);
+    c.post(warn("top").hold(Hold::STANDING), stamp(), now);
     let id = c.post(busy("work"), stamp(), now).id;
     c.commit_rows(now, 3);
     c.resolve(id, Outcome::Ok, now + ms(1));
@@ -789,13 +799,11 @@ fn only_live_revealed_rows_on_glass_echo() {
         .post(warn("held").hold(Hold::For(HOLD_WARN)), stamp(), now)
         .id;
     let standing = c
-        .post(warn("standing").hold(Hold::Standing), stamp(), now)
+        .post(warn("standing").hold(Hold::STANDING), stamp(), now)
         .id;
     let ask = c
         .post(
-            warn("ask").hold(Hold::Ask {
-                for_: crate::HOLD_ASK,
-            }),
+            warn("ask").hold(Hold::asking(crate::HOLD_ASK)),
             stamp(),
             now,
         )
@@ -1006,15 +1014,9 @@ fn frame_sequence_is_bit_stable() {
     assert_eq!(h.finish(), FRAME_SEQUENCE_FNV, "{:#x}", h.finish());
 }
 
-/// The pinned hash of [`frame_sequence_is_bit_stable`]'s 120 frames
-/// (re-pinned 2026-09-24 on the merge with main's full-width meter, design
-/// rulings 136–141: the surfaces are fractions of the whole row now; and
-/// again the same day when the comet's lead widened to 4 %,
-/// [`crate::COMET_LEAD_PERMILLE`]; and again when the comet's tail took 32
-/// chords in place of 8, its faint end rounded up — design ruling 157; and
-/// on 2026-09-25 for round 12: the raised-cosine glint, the echo timeline of
-/// ruling 244, the distance-scaled glide of ruling 245, and the comet's
-/// quarter-row length and 8 % lead of ruling 242).
+/// The pinned hash of [`frame_sequence_is_bit_stable`]'s 120 frames (design
+/// rulings 136–141, 157, 242, 244, 245): any change to the surfaces, the
+/// comet or the echo timeline moves it.
 const FRAME_SEQUENCE_FNV: u64 = 0x097b_515c_d4e8_488d;
 
 /// The comet's head moves forward on every frame of a crossing and never
@@ -1328,11 +1330,9 @@ fn no_motion_deadline_when_idle() {
     // Held, ask and standing rows: no motion.
     let mut c = fresh(now);
     c.post(warn("held"), stamp(), now);
-    c.post(warn("standing").hold(Hold::Standing), stamp(), now);
+    c.post(warn("standing").hold(Hold::STANDING), stamp(), now);
     c.post(
-        warn("ask").hold(Hold::Ask {
-            for_: crate::HOLD_ASK,
-        }),
+        warn("ask").hold(Hold::asking(crate::HOLD_ASK)),
         stamp(),
         now,
     );
@@ -1344,7 +1344,7 @@ fn no_motion_deadline_when_idle() {
     // (with two rows or more the glass keeps a row for live progress,
     // ruling 259, so no progress row waits behind the overflow row alone).
     let mut c = fresh(now);
-    c.post(warn("fourth").hold(Hold::Standing), stamp(), now);
+    c.post(warn("fourth").hold(Hold::STANDING), stamp(), now);
     c.post(busy("queued"), stamp(), now);
     c.commit_rows(now, 1);
     let p = present(&c, 80);
@@ -1698,8 +1698,9 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
 
 /// AN ECHO SAYS NOTHING FALSE ABOUT THE LOAD (ruling 229): the work ended,
 /// so `✓ ALab tools updated  100% done · network busy` was a lie for the
-/// echo's ~850 ms. Every echo kind draws no load words and keeps the slot
-/// they sat in — declared or not — so nothing on the row reflows.
+/// echo's span (up to 1.65 s since rulings 244/245). Every echo kind draws
+/// no load words and keeps the slot they sat in — declared or not — so
+/// nothing on the row reflows.
 #[test]
 fn an_echo_keeps_the_load_slot_but_draws_no_load_words() {
     let filled = |m: Message| {

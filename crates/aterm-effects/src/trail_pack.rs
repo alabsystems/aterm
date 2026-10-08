@@ -1,38 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Trail Packs — user-generated **cursor trails as data** (the guide is
-//! `docs/trail-packs.md`). A Trail Pack is one versioned, bounded,
-//! fail-closed TOML file that SELECTS among the engine's EXISTING cursor-glow
-//! emitters/channels: the additive [`aterm_render::custom_beam_quads`] beam,
-//! the [`aterm_render::RainHalo`] crown, ≤3 particle populations, and a colour
-//! ramp. It introduces NO new compositing and NO new output channel — the
-//! per-pixel fire field, the rainbow ribbon/exit-swoosh state machine, the cursor
-//! cat, and the forge fill stay BUILTIN-ONLY (simulations, not parameters).
+//! Trail Packs: user-generated cursor trails as data (`docs/trail-packs.md`).
+//! A pack is one versioned, bounded, fail-closed TOML file that selects among
+//! the engine's existing cursor-glow emitters: the additive
+//! [`aterm_render::custom_beam_quads`] beam, the [`aterm_render::RainHalo`]
+//! crown, up to 3 particle populations, and a colour ramp. It adds no new
+//! compositing or output channel; the fire field, rainbow ribbon, cursor cat
+//! and forge fill stay builtin-only.
 //!
 //! ## The safety envelope (mirrors the sparkle Toy Pack lane in `spec.rs`)
 //!
-//! Compilation happens only when a host loads/reloads a pack; the render path
-//! sees only the copied [`TrailParams`] value (a ~Copy blob of clamped scalars,
-//! fixed arrays, and enums — no heap, so [`crate::cursor_glow::GlowConfig`]
-//! stays `Copy`). Like the Toy Pack compiler this fails closed:
+//! Compilation happens only when a host loads a pack; the render path sees
+//! only the copied [`TrailParams`] (clamped scalars, fixed arrays and enums, no
+//! heap, so [`crate::cursor_glow::GlowConfig`] stays `Copy`). It fails closed:
 //!
-//! * a **byte cap** is checked BEFORE the TOML parse ([`MAX_TRAIL_PACK_BYTES`]);
-//! * every struct is `#[serde(deny_unknown_fields)]`, so an unknown field /
-//!   effect / version is rejected;
-//! * every scalar is **clamped into an engine-proven range** at compile and any
-//!   out-of-range value ALSO records a diagnostic (nothing is silently dropped);
-//! * every stored `f32` is **quantized** to the [`QUANT`] grid, so the emitted
-//!   premultiplied-`u8` path and the fingerprint fold stay bit-exact and
-//!   CPU==GPU parity holds across reloads;
-//! * all independent diagnostics are collected in ONE pass into a
-//!   [`TrailPackError`] (the same multi-diagnostic posture as
-//!   [`crate::spec::ToyPackError`]) so `--validate-config`, the config notice
-//!   lane, and the web FFI all speak one surface.
+//! * a byte cap is checked before the TOML parse ([`MAX_TRAIL_PACK_BYTES`]);
+//! * every struct is `#[serde(deny_unknown_fields)]`, so an unknown field,
+//!   effect or version is rejected;
+//! * every scalar is clamped into an engine-proven range, and an out-of-range
+//!   value also records a diagnostic;
+//! * every stored `f32` is quantized to the [`QUANT`] grid, so the
+//!   premultiplied-`u8` path and the fingerprint stay bit-exact and CPU==GPU
+//!   across reloads;
+//! * all diagnostics are collected in one pass into a [`TrailPackError`] (like
+//!   [`crate::spec::ToyPackError`]), shared by `--validate-config`, config
+//!   notices and the web FFI.
 //!
-//! The structural legibility ceiling (the occupied-glyph coverage cap) is NOT a
-//! pack field: it is enforced downstream in the interpreter's sole emission
-//! funnel (`cursor_glow::CursorGlow::emit_custom`), so a pack cannot opt out.
+//! The occupied-glyph coverage cap is not a pack field: it is enforced in the
+//! interpreter's sole emission funnel (`cursor_glow::CursorGlow::emit_custom`),
+//! so a pack cannot opt out.
 
 #[cfg(test)]
 use std::path::Path;
@@ -44,16 +41,7 @@ pub const TRAIL_PACK_SCHEMA_V1: u32 = 1;
 /// handful of tables) versus sparkle Toy Packs, so the cap is far smaller.
 pub const MAX_TRAIL_PACK_BYTES: usize = 64 * 1024;
 
-/// Maximum beam bloom layers — the renderer's own budget, not a copy of it.
-///
-/// This used to be a second `6` beside [`aterm_render::MAX_CUSTOM_BEAM_LAYERS`],
-/// with a doc comment asserting the two were equal. They were, so nothing was
-/// broken — but a number whose agreement is maintained by a comment is one edit
-/// away from disagreeing, and this pair is the exact shape that hid a real
-/// drift elsewhere in this crate (a threshold with three spellings, two of them
-/// comparing differently at the boundary). The dependency points the legal way:
-/// aterm-effects already depends on aterm-render, so the enforced cap can BE the
-/// contract rather than promise to match it.
+/// Maximum beam bloom layers: the renderer's own budget.
 pub const MAX_TRAIL_LAYERS: usize = aterm_render::MAX_CUSTOM_BEAM_LAYERS;
 /// Maximum live particle populations in one pack.
 pub const MAX_TRAIL_POPS: usize = 3;
@@ -88,10 +76,9 @@ const MAX_LICENSE_BYTES: usize = 64;
 /// toward white, exactly as the single-tone built-in stacks do.
 pub const CUSTOM_MIX_WHITE: u32 = 0x00FF_FFFF;
 
-/// One resolved Trail Pack, ready for the engine. Fully `Copy` (fixed arrays /
-/// enums / scalars — no heap), so it rides the `Copy` `GlowConfig` inline. NOT
-/// `Eq` — it carries `f32` fields (matching `GlowConfig`, which is likewise
-/// `PartialEq` but never `Eq`). Size ≈ 0.5 KiB.
+/// One resolved Trail Pack, ready for the engine. `Copy` (no heap), so it
+/// rides `GlowConfig` inline; `PartialEq` but not `Eq` (it carries `f32`s).
+/// About 0.5 KiB.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrailParams {
     /// Compile-time fingerprint of `(id, source bytes)` — the style-switch /
@@ -431,10 +418,9 @@ impl CompiledTrailPack {
     }
 }
 
-/// One or more actionable Trail Pack diagnostics — the same multi-diagnostic
-/// posture as [`crate::spec::ToyPackError`], so every surface (validate-config,
-/// config notices, web FFI) speaks one shape and an artist fixes all fields in
-/// one pass rather than one-at-a-time.
+/// One or more actionable Trail Pack diagnostics, the same multi-diagnostic
+/// shape as [`crate::spec::ToyPackError`], so an artist fixes all fields in
+/// one pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrailPackError {
     diagnostics: Vec<String>,
@@ -660,11 +646,9 @@ struct RawTheme {
 struct RawPop {
     #[serde(default)]
     spawn_weight: Option<f32>,
-    // `[min, max]` pairs are deserialized into a `Vec` (NOT a fixed `[f32; 2]`):
-    // serde's fixed-array impl silently TRUNCATES a too-long TOML array to the
-    // first N, so `vy = [1.0, 2.0, 3.0]` would sail through as `[1.0, 2.0]`. A
-    // `Vec` preserves the real length so `bounded_pair` can fail closed on any
-    // arity other than 2 (the fail-closed lever the rest of the schema relies on).
+    // `[min, max]` pairs deserialize into a `Vec`, not `[f32; 2]`: serde's
+    // fixed-array impl silently truncates a longer TOML array, and
+    // `bounded_pair` must fail closed on any arity other than 2.
     #[serde(default)]
     vx: Option<Vec<f32>>,
     #[serde(default)]
@@ -1286,9 +1270,7 @@ fn bounded_pair(
             ));
             (quant(default.0), quant(default.1))
         }
-        // FAIL CLOSED on a wrong-length pair (the reason the raw field is a
-        // `Vec`, not a truncating `[f32; 2]`): a `[min, max]` pair must have
-        // EXACTLY two entries — reject one/three/… with a diagnostic.
+        // Fail closed on a wrong-length pair: exactly two entries.
         Some(other) => {
             diag.push(format!(
                 "{field}: expected exactly 2 values [min, max], got {}",
@@ -1580,9 +1562,8 @@ vy = [-9.0, -0.5]
 
     #[test]
     fn wrong_length_velocity_or_life_pair_is_rejected() {
-        // A 3-entry velocity pair used to TRUNCATE to two via serde's fixed
-        // `[f32; 2]` impl (silently dropping the 3rd) — now it fails closed with a
-        // diagnostic that names the field and the actual length.
+        // A 3-entry velocity pair fails closed with a diagnostic naming the
+        // field and the actual length.
         let three = "pack = 1\nid = \"trip\"\n[[particles]]\nvy = [-1.0, -0.5, -0.2]\n";
         let err = compile_trail_pack_toml(three).expect_err("3-entry pair rejected");
         let joined = err.diagnostics().join("\n");

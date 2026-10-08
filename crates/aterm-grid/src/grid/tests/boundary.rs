@@ -2,21 +2,13 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Boundary condition tests — min dimensions, zero counts, edge cases, write
-//! consistency, and history line API ordering. Sourced from algorithm audit #1920.
+//! Boundary condition tests: min dimensions, zero counts, edge cases, write
+//! consistency, and history line API ordering.
 
 use super::super::*;
+use crate::grid::test_support::write_marker_line;
 
-fn write_marker_line(grid: &mut Grid, marker: char) {
-    grid.carriage_return();
-    grid.write_char(marker);
-    grid.carriage_return();
-    grid.line_feed();
-}
-
-// =========================================================================
 // Minimum dimension / clamping
-// =========================================================================
 
 #[test]
 fn grid_write_char_1x1_stays_at_origin() {
@@ -33,9 +25,7 @@ fn grid_write_char_1x1_stays_at_origin() {
     grid.assert_invariants();
 }
 
-// =========================================================================
 // Zero-count / no-op operations
-// =========================================================================
 
 #[test]
 fn grid_resize_to_same_size_is_noop() {
@@ -105,9 +95,7 @@ fn grid_scroll_down_zero() {
     grid.assert_invariants();
 }
 
-// =========================================================================
 // Exceeding-count operations
-// =========================================================================
 
 #[test]
 fn grid_insert_lines_exceeding_available() {
@@ -200,9 +188,7 @@ fn grid_delete_lines_exceeding_available() {
     );
 }
 
-// =========================================================================
 // Edge-position operations
-// =========================================================================
 
 #[test]
 fn grid_delete_chars_at_last_column() {
@@ -248,15 +234,10 @@ fn grid_cursor_at_max_position_then_resize_down() {
     grid.assert_invariants();
 }
 
-// =========================================================================
-// Write consistency — ascii_blast vs char_wrap (#2046)
-// =========================================================================
+// Write consistency — ascii_blast vs char_wrap
 
-/// Verify that write_ascii_blast and write_char_wrap produce identical cursor
-/// positions after filling a line to column width.
-///
-/// Both paths use immediate wrap (no deferred/pending wrap in the grid layer).
-/// Regression test for #2046 MEDIUM finding: wrap consistency.
+/// write_ascii_blast and write_char_wrap leave the cursor at the same position
+/// after filling a line (both wrap immediately in the grid layer).
 #[test]
 fn write_ascii_blast_and_char_wrap_cursor_consistency() {
     // Test 1: Fill exactly one full line via both paths
@@ -340,9 +321,7 @@ fn write_ascii_blast_and_char_wrap_cursor_consistency() {
     );
 }
 
-// =========================================================================
 // History line API ordering
-// =========================================================================
 
 #[test]
 fn grid_history_line_api_covers_ring_buffer_ordering() {
@@ -379,9 +358,7 @@ fn grid_history_line_api_covers_ring_buffer_ordering() {
     assert!(grid.history_line_rev(3).is_none());
 }
 
-// =========================================================================
 // row_u16 / clamp_u16 saturation
-// =========================================================================
 
 /// `row_u16` saturates to `u16::MAX` for values above the u16 range.
 #[test]

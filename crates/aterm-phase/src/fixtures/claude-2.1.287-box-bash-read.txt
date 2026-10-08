@@ -1,0 +1,50 @@
+# claude-code 2.1.287 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · default (manual) mode, a read-only command outside the working directory (wc -l /etc/hosts) that Claude Code still asks about: the Tip row, the description, the command at column one, option 2 allowing reads of /private/etc; approve=none
+❯ toolstart
+
+⏺ Write(lab-write-hook.txt)
+  ⎿  User rejected write to lab-write-hook.txt
+      1 x
+
+✻ Crunched for 0s · done 2:58 PM
+
+❯ toolstart
+
+⏺ Write(lab-write-hook2.txt)
+  ⎿  User rejected write to lab-write-hook2.txt
+      1 x
+
+✻ Worked for 0s · done 2:59 PM
+
+❯ toolstart
+
+⏺ Bash(rm -rf ./lab-doomed)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 2:59 PM
+
+❯ toolstart
+
+⏺ Bash(python3 -c "open('lab-pwned.txt','w').write('x')")
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Brewed for 0s · done 3:08 PM
+
+❯ toolstart
+
+⏺ Reading 1 file… (ctrl+o to expand)
+  ⎿  $ wc -l /etc/hosts
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Count the lines of the hosts file
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ wc -l /etc/hosts
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from /private/etc from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend

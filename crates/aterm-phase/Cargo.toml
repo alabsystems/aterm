@@ -3,6 +3,9 @@
 
 [package]
 name = "aterm-phase"
+# Integration tests are declared below, not discovered. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,3 +21,12 @@ workspace = true
 # and `aterm-link` (the fabric bridge, whose presence rows carry `phase=`)
 # both link it, and neither should pull the other. See src/lib.rs.
 [dependencies]
+
+[[test]]
+name = "phase_suite"
+path = "tests/phase_suite.rs"
+
+# Alone: installs a process-wide panic hook for the length of its sweep.
+[[test]]
+name = "panic_sweep"
+path = "tests/panic_sweep.rs"

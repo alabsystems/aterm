@@ -19,17 +19,18 @@ use atpkg::lease::{Holders, Subject};
 
 /// A temp `HOME`, and the store build `store/trust/9192/bin` under its default prefix.
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     home: PathBuf,
     prefix: PathBuf,
 }
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-lease-verb-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-lease-verb-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
         let prefix = atpkg::store::default_prefix(&home);
         std::fs::create_dir_all(prefix.join("store/trust/9192/bin")).expect("fixture build");
         Self { root, home, prefix }
@@ -41,12 +42,6 @@ impl Fixture {
 
     fn holders(&self) -> Holders {
         atpkg::lease::holders(&self.prefix, &Subject::build("trust", 9192).unwrap())
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -79,7 +74,7 @@ fn alive(pid: libc::pid_t) -> bool {
 fn a_sigterm_to_the_holder_ends_the_command_it_holds_for() {
     use std::os::unix::process::ExitStatusExt as _;
     let fx = Fixture::new("term");
-    let pidfile = fx.root.join("child.pid");
+    let pidfile = fx.root.path().join("child.pid");
     let mut holder = Command::new(env!("CARGO_BIN_EXE_atpkg"))
         .arg("lease")
         .arg(fx.bin())
@@ -88,7 +83,7 @@ fn a_sigterm_to_the_holder_ends_the_command_it_holds_for() {
         .arg("sh")
         .arg(&pidfile)
         .env("HOME", &fx.home)
-        .env("XDG_CONFIG_HOME", fx.root.join("config"))
+        .env("XDG_CONFIG_HOME", fx.root.path().join("config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

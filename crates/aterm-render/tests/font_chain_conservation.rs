@@ -6,12 +6,8 @@
 //! COMPLETE input space, plus a prove-and-catch mutant and a real-renderer
 //! binding.
 //!
-//! ## Three tiers, one property set
+//! ## Two tiers, one property set
 //!
-//! * **Tier-0 (abstract, `ty` + the in-process interpreter)** —
-//!   `aterm_spec::derive::{font_chain_seal_independence_model,
-//!   font_key_recovery_lane_model, fallback_convergence_model}`, discharged by
-//!   `cargo test -p aterm-spec --test derived_ring_ty`.
 //! * **Tier-1 (concrete, this file)** — the chain's inputs are 8 coverage bits ×
 //!   2 lazy-parse bits × 4 policy bools = 16384 cases. That is not a sample: it is
 //!   the entire domain, so this is a complete proof of P1–P4 for the real policy.
@@ -262,6 +258,7 @@ fn dejavu() -> Vec<u8> {
 }
 
 /// A Nerd Font PUA icon: covered by the bundled symbol face, absent from DejaVu.
+#[cfg(feature = "embedded-symbols")]
 const NERD_PUA: char = '\u{E0A0}';
 /// A noncharacter no font covers — the honest `.notdef` control.
 const NONCHARACTER: char = '\u{FFFF}';
@@ -276,6 +273,7 @@ fn ink(r: &mut Renderer, ch: char) -> (FaceId, usize) {
     (key.source, img.bytes().iter().filter(|&&b| b > 0).count())
 }
 
+#[cfg(feature = "embedded-symbols")]
 #[test]
 fn every_resolved_key_rasterizes_on_both_runtime_lanes() {
     // Pathname lane (unsealed) and I/O-free lane (sealed) must BOTH produce a key

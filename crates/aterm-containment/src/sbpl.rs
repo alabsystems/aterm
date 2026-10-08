@@ -4,86 +4,86 @@
 
 //! macOS Seatbelt (SBPL) profile generation for the OS-sandbox actuator.
 //!
-//! This is the enforcing OS-level sandbox [`crate::actuator`] applies. Given a
-//! resolved containment [`Capabilities`](crate::Capabilities) set
-//! whose [`NetworkCapability`](crate::NetworkCapability) is
-//! [`None`](crate::NetworkCapability::None) (i.e. `Containment` mode), it returns an
-//! SBPL string that the spawn seam hands to `/usr/bin/sandbox-exec -p <sbpl>` so the
-//! kernel Seatbelt enforces it on the child shell and everything it runs.
+//! The enforcing OS-level sandbox [`crate::actuator`] applies. For a resolved
+//! [`Capabilities`](crate::Capabilities) set whose
+//! [`NetworkCapability`](crate::NetworkCapability) is
+//! [`None`](crate::NetworkCapability::None) (`Containment` mode), it returns an
+//! SBPL string the spawn seam hands to `/usr/bin/sandbox-exec -p <sbpl>`, so the
+//! kernel enforces it on the child shell and everything it runs.
 //!
 //! ## What the profile enforces (`ATERM_DESIGN` §0.1 / §5.6)
 //!
-//! Only a network-denied capability set gets a profile, and today that is only
-//! `Containment` ([`NetworkCapability::None`](crate::NetworkCapability::None) with
+//! Only a network-denied set gets a profile: `Containment`
+//! ([`NetworkCapability::None`](crate::NetworkCapability::None) with
 //! [`FsCapability::TmpOnly`](crate::FsCapability::TmpOnly)). Its rules, in order
-//! (Seatbelt lets the LATER matching rule win):
+//! (the later matching rule wins):
 //!
 //! 1. **`(allow default)`** — the base, so dyld, `path_helper`, the user's rc
 //!    files, `/dev/tty` and every READ outside the deny sets keep working. A
 //!    blanket `(deny file-read*)` breaks `$SHELL`, so reads are scoped by deny
-//!    sets, not by an allowlist.
+//!    sets, not by an allowlist (owner, 2026-09-26).
 //! 2. **`(deny network*)`** — every socket domain, outbound and inbound.
+//!    **`(deny mach-priv-task-port)`**, then `(allow … (target self))`: no task
+//!    port but the caller's own, so a contained `lldb`/`debugserver` cannot take
+//!    control of (or read) a same-user process outside the sandbox — silently, once
+//!    macOS developer mode is on (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
+//!    O4). The one operation covers all four flavors — `task_for_pid`,
+//!    `task_read_for_pid`, `task_inspect_for_pid` and `task_name_for_pid` — and
+//!    a contained process's own children too (measured on macOS 26.6).
+//!    **`(deny mach-lookup …)`** over [`DENIED_LAUNCH_BROKERS`]: under
+//!    `(allow default)` every mach service is reachable, and Launch Services
+//!    (`open`) and the Apple Events daemon start code OUTSIDE the sandbox for
+//!    whoever asks — a contained process could hand itself to them. With these
+//!    four names denied each lookup fails (`kr` 1100), measured with no UI on
+//!    macOS 26.6, while git, python3, targo, make, clang/xcrun, `security`, an
+//!    interactive zsh and ad-hoc `codesign` then exec behave exactly as before
+//!    (the Launch Services database and trust-cache names stay allowed: codesign
+//!    uses them). `launchctl submit` from inside the profile is already refused
+//!    by launchd (measured). Other brokers (`com.apple.xpc.smd`) stay reachable;
+//!    a deny-by-default `mach-lookup` allowlist is the general follow-up.
 //! 3. **WRITE confinement** (`TmpOnly` only) — `(deny file-write*)` then
 //!    `(allow file-write* …)` for [`WRITABLE_ROOTS`] (`/private/tmp`,
-//!    `/private/var/tmp` and `/dev`), the user's own `$TMPDIR` under
-//!    [`USER_TEMP_PARENT`] (see [`admitted_user_temp`]) and the shell's own
-//!    history files
-//!    ([`HISTORY_FILES`]: each name a `literal` at its lexical path, held to the
-//!    one file type its shell makes there). Everything else, `$HOME` included,
-//!    is read-only to the contained shell: it cannot plant `~/.zshrc`,
-//!    `~/Library/LaunchAgents/*.plist`, a git hook or a `$PATH` binary that
-//!    would later run OUTSIDE the sandbox.
-//!    Decided 2026-09-26 under the owner's standing direction: `TmpOnly` means
-//!    what its name says, with no carve-out for the session's working directory
-//!    or `$HOME`; a contained tool that must build a project builds a copy under
-//!    `$TMPDIR`. Reads are not confined the same way — a read allowlist breaks
-//!    `$SHELL` (rule 1).
-//! 4. **`(deny file-read* file-write* …)` over the SECRET SET** — the
-//!    credential stores ([`SECRET_SUBDIRS`], [`SECRET_LITERAL_FILES`]), so they
-//!    cannot even be READ.
-//! 5. **`(deny file-read* file-write* …)` over the PRIVATE-DATA SET**
-//!    (`TmpOnly` only) — [`PRIVATE_SUBDIRS`]: personal documents, downloads,
-//!    media, and the local Mail / Messages / keychain / cookies / browser-profile
-//!    stores. Each is one `subpath` under `$HOME` — never `~` and never all of
-//!    `~/Library` — so none of it is sourced at shell startup.
-//! 6. **Ancestor-node write denies** for the nested entries of 4 and 5 (see
+//!    `/private/var/tmp`, `/dev`), the user's `$TMPDIR` under
+//!    [`USER_TEMP_PARENT`] ([`admitted_user_temp`]) and the shell's history
+//!    files ([`HISTORY_FILES`], each a `literal` at its lexical path, held to
+//!    the one file type its shell makes). Everything else, `$HOME` and the
+//!    working directory included, is read-only, so the shell cannot plant
+//!    `~/.zshrc`, a `LaunchAgent`, a git hook or a `$PATH` binary that would run
+//!    outside the sandbox; a contained build works on a copy under `$TMPDIR`.
+//! 4. `(deny file-read* file-write* …)` over the secret set ([`SECRET_SUBDIRS`],
+//!    [`SECRET_LITERAL_FILES`]): credential stores cannot even be read.
+//! 5. The same over the private-data set (`TmpOnly` only, [`PRIVATE_SUBDIRS`]):
+//!    documents, downloads, media, and the Mail / Messages / keychain / cookies
+//!    / browser-profile stores. Each is one `subpath` under `$HOME`, never `~`
+//!    or all of `~/Library`, and none is sourced at shell startup.
+//! 6. Ancestor-node write denies for the nested entries of 4 and 5 (see
 //!    [`profile_for_home`]), closing the rename-the-parent relocation bypass.
 //!
-//! The actuator's enforcement-proof tests run each of these against the live
-//! kernel.
+//! The actuator's enforcement-proof tests run each rule against the live kernel.
 //!
-//! ## Canonicalization (the `/tmp` → `/private/tmp` footgun)
+//! ## Canonicalization
 //!
-//! Seatbelt matches the CANONICAL path. On macOS `/tmp` is a symlink to
-//! `/private/tmp`, and `$HOME` itself can be reached via a symlinked prefix. A
-//! non-canonical literal/subpath would simply NOT match the real path and the deny
-//! would silently do nothing (security theater). So [`profile_for_home`]
-//! canonicalizes `$HOME` once (via [`std::fs::canonicalize`]) and joins the secret
-//! components onto the CANONICAL home. The secret dirs themselves need not exist
-//! (canonicalizing a non-existent `~/.gnupg` would fail), but the deny is still
-//! emitted for them — Seatbelt matches by path, so a deny that pre-exists the
-//! directory still fires the moment it is created.
+//! Seatbelt matches the canonical path (`/tmp` is a symlink to `/private/tmp`,
+//! and `$HOME` can sit behind a symlinked prefix), and a non-canonical rule
+//! would silently not match. [`profile_for_home`] canonicalizes `$HOME` once and
+//! joins the entries onto it. Entries need not exist: a deny matches by path and
+//! fires as soon as the directory is created.
 //!
-//! ## Per-user / dynamic profile (no longer a static const)
+//! ## Per-user profile
 //!
 //! Because the secret paths depend on `$HOME`, the Containment profile is now
 //! per-user and built at profile-generation time; it is therefore an owned
-//! `String`, not a `&'static str`. The network-only fallback
-//! ([`NETWORK_DENY_PROFILE`]) is still a const, used verbatim when `$HOME` is unset
+//! `String`, not a `&'static str`. The homeless fallback
+//! ([`BASE_PROFILE`]) is still a const, used verbatim when `$HOME` is unset
 //! or empty (we refuse to emit denies for bogus paths).
 //!
-//! ## Why a pure string generator (no `sandbox_init`)
+//! ## A string generator, not `sandbox_init`
 //!
-//! The profile is applied by `exec`ing `/usr/bin/sandbox-exec -p <profile>` rather
-//! than calling `sandbox_init(3)` in the post-`fork` child. aterm's spawn child is
-//! async-signal-only (the frontend is multi-threaded; only async-signal-safe calls
-//! are legal between `fork` and `exec` — see `aterm-pty`). `sandbox_init` is NOT
-//! async-signal-safe (it allocates, parses, talks to the sandbox daemon), so
-//! calling it in that child is unsound. `sandbox-exec` does that work in a FRESH
-//! process image before it `exec`s the real target, which is the supported,
-//! async-signal-safe path. This module's only job is to produce the profile
-//! STRING; it resolves/canonicalizes `$HOME` in the PARENT (at generation time),
-//! performs no post-fork syscalls, and is trivially testable.
+//! The profile is applied by exec'ing `/usr/bin/sandbox-exec -p <profile>`: the
+//! spawn child between `fork` and `exec` may only make async-signal-safe calls
+//! (see `aterm-pty`), and `sandbox_init(3)` is not. `sandbox-exec` does that
+//! work in a fresh process image before exec'ing the target. This module only
+//! produces the string, resolving `$HOME` in the parent.
 
 use crate::capability::{FsCapability, NetworkCapability};
 use crate::policy::Capabilities;
@@ -95,15 +95,35 @@ use std::path::{Path, PathBuf};
 /// than silently resolved to something else.
 pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
-/// The network-only SBPL profile — the fallback used when `$HOME` is unset/empty.
+/// The base SBPL profile — rules 1 and 2, and the whole profile when `$HOME` is
+/// unset/empty.
 ///
 /// `(allow default)` keeps the shell working; `(deny network*)` removes all
-/// network access. This is the exact profile emitted when there is no resolvable
-/// home to scope secrets under: we deny network (always safe and shell-compatible)
-/// but emit NO file denies rather than deny bogus paths. The full Containment
-/// profile ([`profile_for_home`]) is this PLUS the write confinement and the
+/// network access; the task-port pair refuses every task port but the caller's
+/// own; the `mach-lookup` deny keeps the launch brokers ([`DENIED_LAUNCH_BROKERS`])
+/// from starting code outside the sandbox. None of it names a path, so it is
+/// emitted even with no resolvable home to scope secrets under (we emit NO file
+/// denies rather than deny bogus paths). The full Containment profile
+/// ([`profile_for_home`]) is this PLUS the write confinement and the
 /// secret/private-set file denies.
-pub const NETWORK_DENY_PROFILE: &str = "(version 1)(allow default)(deny network*)";
+pub const BASE_PROFILE: &str = "(version 1)(allow default)(deny network*)\
+(deny mach-priv-task-port)(allow mach-priv-task-port (target self))\
+(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\")\
+(global-name \"com.apple.lsd.open\")(global-name \"com.apple.lsd.openurl\")\
+(global-name \"com.apple.coreservices.appleevents\"))";
+
+/// The launch brokers [`BASE_PROFILE`] denies a contained process a port to:
+/// The Launch Services daemon and its open/open-URL endpoints, and the Apple Events
+/// daemon. Each starts or drives a process that does NOT inherit the caller's
+/// sandbox. The proof (`actuator::tests::enforcement_proof_launch_brokers_denied`)
+/// asks bootstrap for each of these under the real profile, so a name listed here
+/// but missing from the profile fails it.
+pub const DENIED_LAUNCH_BROKERS: &[&str] = &[
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.lsd.open",
+    "com.apple.lsd.openurl",
+    "com.apple.coreservices.appleevents",
+];
 
 /// The canonical roots a Containment ([`FsCapability::TmpOnly`]) shell may still
 /// WRITE under, as `subpath`s, whoever the user is. Canonical on purpose — `/tmp`
@@ -139,11 +159,11 @@ fn admitted_user_temp(temp: &Path) -> Option<PathBuf> {
 /// row is the history file itself; zsh's save-by-copy temp file (`.new`) and its
 /// lock (`.LOCK`, which zsh makes with `symlink(2)`) follow it.
 ///
-/// Each name is allowed as a `literal` at its LEXICAL path — never resolved,
+/// Each name is allowed as a `literal` at its lexical path — never resolved,
 /// never a `prefix` — and only for the one vnode type its shell makes there.
 /// That is what keeps the allowance from reaching anything else:
 ///
-/// - a history file that is ITSELF a symlink would, resolved, allow its target
+/// - a history file that is itself a symlink would, resolved, allow its target
 ///   (a contained shell that points `~/.zsh_history` at `$HOME` would hand the
 ///   next session all of `$HOME`); a lexical `literal` allows only the name, and
 ///   Seatbelt judges a write through a symlink at the file it resolves to;
@@ -233,15 +253,15 @@ fn single_link(_meta: &std::fs::Metadata) -> bool {
     true
 }
 
-/// CONSERVATIVE secret-directory set, denied (read+write) as `subpath`s under the
+/// Conservative secret-directory set, denied (read+write) as `subpath`s under the
 /// canonical `$HOME`. Each entry is a credential/secret store an untrusted agent
-/// shell has no business reading or tampering with. Kept SMALL and fixed on
+/// shell has no business reading or tampering with. Kept small and fixed on
 /// purpose: every entry must be both (a) genuinely secret and (b) safe to deny
 /// without breaking a normal `$SHELL` (none of these are sourced by the shell at
 /// startup, unlike `~/.zshrc`).
 ///
 /// Each path component is joined onto the canonical home, so e.g. `.config/gh`
-/// becomes `<canonical-home>/.config/gh` (denying gh's token WITHOUT denying the
+/// becomes `<canonical-home>/.config/gh` (denying gh's token without denying the
 /// rest of `~/.config`).
 pub const SECRET_SUBDIRS: &[&str] = &[
     ".ssh",           // SSH private keys / known_hosts / config
@@ -255,7 +275,7 @@ pub const SECRET_SUBDIRS: &[&str] = &[
     ".azure",         // Azure CLI tokens (accessTokens.json)
 ];
 
-/// CONSERVATIVE secret FILE set, denied (read+write) as `literal`s under the
+/// Conservative secret FILE set, denied (read+write) as `literal`s under the
 /// canonical `$HOME`. Unlike [`SECRET_SUBDIRS`] these are single files, not
 /// directories, so they are emitted as `(literal …)` not `(subpath …)`.
 pub const SECRET_LITERAL_FILES: &[&str] = &[
@@ -265,18 +285,18 @@ pub const SECRET_LITERAL_FILES: &[&str] = &[
     ".pypirc",          // PyPI upload credentials
 ];
 
-/// CONSERVATIVE private-user-data set, denied (read+write) as `subpath`s under the
-/// canonical `$HOME`. This is the Containment FS policy BEYOND credentials: not
+/// Conservative private-user-data set, denied (read+write) as `subpath`s under the
+/// canonical `$HOME`. This is the Containment FS policy beyond credentials: not
 /// secrets per se, but the user's private personal data and local app databases an
 /// untrusted Containment agent has no legitimate need to read or alter.
 ///
 /// Every entry must be both (a) genuinely private user data and (b) safe to deny
 /// without breaking a normal `$SHELL` (none of these is sourced at shell startup,
-/// and each is a SPECIFIC subpath — in particular the `Library/*` entries deny
+/// and each is a specific subpath — in particular the `Library/*` entries deny
 /// individual stores, never the whole `~/Library`, so the tool caches/preferences/
 /// application-support state the shell and its tools actually touch keep working).
 ///
-/// Applied ONLY to Containment ([`FsCapability::TmpOnly`](crate::FsCapability::TmpOnly)).
+/// Applied only to Containment ([`FsCapability::TmpOnly`](crate::FsCapability::TmpOnly)).
 /// Browser/profile and `Library/*` entries need not exist — Seatbelt matches by
 /// path, so a deny pre-arms the moment such a store is created. This is the set the
 /// owner extends safely by appending.
@@ -302,22 +322,18 @@ pub const PRIVATE_SUBDIRS: &[&str] = &[
     "Library/Application Support/Microsoft Edge",
 ];
 
-/// Generate the SBPL profile string for the given resolved capability set, or
-/// `None` if no OS sandbox is required for it.
+/// Generate the SBPL profile for the given resolved capability set, or `None`
+/// if no OS sandbox is required.
 ///
-/// Returns `Some(profile)` exactly when the capability set DENIES network
-/// ([`NetworkCapability::None`](crate::NetworkCapability::None)) — i.e. for
-/// `Containment` mode. The returned profile is the one [`profile_for_home`]
-/// builds for the current `$HOME` and the set's filesystem capability. For every
-/// other capability set (network
-/// `Full` — `Safety`/`User`/`Master`) it returns `None`, meaning
-/// "no `sandbox-exec` wrap; spawn exactly as before". This is the load-bearing
-/// safety property: the OS sandbox is applied ONLY when the policy denies network,
-/// never otherwise, so the default User-mode spawn is byte-identical.
+/// `Some(profile)` exactly when the set denies network
+/// ([`NetworkCapability::None`](crate::NetworkCapability::None), i.e.
+/// `Containment`): the profile [`profile_for_home`] builds for the current
+/// `$HOME` and the set's filesystem capability. Every other set (network
+/// `Full`: `Safety`/`User`/`Master`) returns `None`, meaning no `sandbox-exec`
+/// wrap, so the default spawn is unchanged.
 ///
-/// `$HOME` and `$TMPDIR` ([`std::env::temp_dir`]) are read from the process
-/// environment here (parent side, at generation time). The profile is therefore
-/// per-user and an owned `String`.
+/// `$HOME` and `$TMPDIR` ([`std::env::temp_dir`]) are read here, in the
+/// parent.
 #[must_use]
 pub fn profile_for(caps: &Capabilities) -> Option<String> {
     profile_for_scoped(*caps, home_dir().as_deref()).map(|(profile, _)| profile)
@@ -330,15 +346,12 @@ pub fn profile_for(caps: &Capabilities) -> Option<String> {
 #[must_use]
 pub(crate) fn profile_for_scoped(caps: Capabilities, home: Option<&str>) -> Option<(String, bool)> {
     match caps.network {
-        // Containment: network fully denied → the Seatbelt profile, scoped under
-        // `home`.
-        //
-        // The write confinement and the private-user-data set are gated on the
-        // FILESYSTEM capability, not the network one (see `profile_for_home`): if a
-        // future mode ever paired `network == None` with a broader FS tier, it
-        // would get the network and credential deny but NOT the `TmpOnly` rules.
-        // Today only Containment reaches this arm, and Containment is
-        // `network == None ∧ fs == TmpOnly`, so the full set applies.
+        // Containment: network denied → the Seatbelt profile scoped under
+        // `home`. Write confinement and the private-data set are gated on the
+        // filesystem capability (see `profile_for_home`), so a mode pairing
+        // `network == None` with a broader FS tier would get only the network
+        // and credential denies. Containment is `None ∧ TmpOnly`, so the full
+        // set applies.
         NetworkCapability::None => Some(profile_scoped(home, Some(&std::env::temp_dir()), caps.fs)),
         // Safety / User / Master (Full): no OS network sandbox. Spawn unchanged.
         NetworkCapability::Full => None,
@@ -359,23 +372,18 @@ pub(crate) fn home_dir() -> Option<String> {
 /// Build the full Containment SBPL profile for a given (optional) `$HOME` and
 /// `$TMPDIR`.
 ///
-/// Pure with respect to its arguments: it does NOT read the environment (the
-/// caller passes the home and the temp directory), so it is exhaustively
-/// unit-testable. It DOES touch the
-/// filesystem to resolve symlinks via [`std::fs::canonicalize`] — both the home
-/// directory AND each existing secret/private entry — because Seatbelt matches the
-/// kernel-resolved canonical path (the `/tmp` → `/private/tmp` footgun, and the
-/// symlinked-credential-store footgun; see [`push_resolved_clause`]). The secret
-/// subdirectories/files need not exist (a non-existent entry falls back to the
-/// lexical join, pre-arming the deny before the dir is created).
+/// Reads no environment (the caller passes home and temp dir), but does
+/// canonicalize the home and each existing secret/private entry, since
+/// Seatbelt matches the resolved path (see [`push_resolved_clause`]). Absent
+/// entries use the lexical join, pre-arming the deny.
 ///
-/// - `fs == TmpOnly` ⇒ the WRITE confinement (`(deny file-write*)` plus the
+/// - `fs == TmpOnly` ⇒ the write confinement (`(deny file-write*)` plus the
 ///   [`WRITABLE_ROOTS`], admitted `user_temp` and [`HISTORY_FILES`] allows)
-///   follows the network deny. It needs no home to be meaningful, so it is
+///   follows the base profile. It needs no home to be meaningful, so it is
 ///   emitted even when there is none.
 /// - `home == None` (or canonicalization of a present home fails) ⇒ nothing else:
 ///   we do NOT deny bogus paths. For a broader `fs` that is exactly
-///   [`NETWORK_DENY_PROFILE`].
+///   [`BASE_PROFILE`].
 /// - `home == Some(h)` ⇒ canonicalizes `h`, joins each [`SECRET_SUBDIRS`] entry as
 ///   a `(subpath …)` and each [`SECRET_LITERAL_FILES`] entry as a `(literal …)`,
 ///   and — for `TmpOnly` — each [`PRIVATE_SUBDIRS`] entry as a `(subpath …)`, then
@@ -384,16 +392,12 @@ pub(crate) fn home_dir() -> Option<String> {
 ///   EXISTING ancestor directory node, closing the relocate-the-writable-parent
 ///   bypass (see [`push_existing_ancestor_write_denies`]).
 ///
-/// `fs` is the Containment FS-policy gate: only
-/// [`FsCapability::TmpOnly`](crate::FsCapability::TmpOnly) gets the write
-/// confinement and the private-data deny. Any broader tier gets exactly the
-/// network + credential deny, so the `TmpOnly` rules can never leak into a
-/// less-restrictive mode.
+/// Only [`FsCapability::TmpOnly`](crate::FsCapability::TmpOnly) gets the write
+/// confinement and private-data deny; broader tiers get network + credential
+/// denies only.
 ///
-/// SBPL string-escaping: path components here are aterm-fixed ASCII literals joined
-/// onto a canonicalized home, so the only metacharacter that can appear is a
-/// backslash or double-quote in a pathological home path; both are backslash-escaped
-/// before emission so the emitted SBPL literal is always well-formed.
+/// Backslashes and double quotes in a pathological home path are escaped, so
+/// the emitted SBPL literal is always well-formed.
 #[must_use]
 pub fn profile_for_home(home: Option<&str>, user_temp: Option<&Path>, fs: FsCapability) -> String {
     profile_scoped(home, user_temp, fs).0
@@ -407,19 +411,17 @@ fn profile_scoped(
     fs: FsCapability,
 ) -> (String, bool) {
     let tmp_only = fs == FsCapability::TmpOnly;
-    // Canonicalize the HOME itself (it must exist). Seatbelt matches the canonical
-    // path; a non-canonical prefix would silently fail to match (security theater).
-    // No home, or one that does not canonicalize ⇒ no home-scoped rule at all:
-    // we do NOT deny (or allow) bogus paths.
+    // Canonicalize the home (it must exist); Seatbelt matches canonical paths.
+    // No home, or one that does not canonicalize, means no home-scoped rule.
     let canon_home = home
         .filter(|h| !h.is_empty())
         .and_then(|h| std::fs::canonicalize(h).ok());
 
-    // Assembled without `format!`: the runtime-capture `format_args!` expansion
-    // places the unsafe `fmt::Arguments::new` in this function's MIR, which the
-    // Trust strict gate's native lowering fails closed on.
+    // Assembled without `format!`: `format_args!` puts the unsafe
+    // `fmt::Arguments::new` in this MIR, which the Trust strict gate fails
+    // closed on.
     let mut profile = String::new();
-    profile.push_str(NETWORK_DENY_PROFILE);
+    profile.push_str(BASE_PROFILE);
     if tmp_only {
         push_write_confinement(&mut profile, user_temp, canon_home.as_deref());
     }
@@ -434,34 +436,27 @@ fn profile_scoped(
     for file in SECRET_LITERAL_FILES {
         push_resolved_clause(&mut clauses, &canon_home, file, push_literal_clause);
     }
-    // Containment FS policy: deny the private-user-data set too (read AND write).
+    // Containment FS policy: deny the private-user-data set too (read and write).
     if tmp_only {
         for sub in PRIVATE_SUBDIRS {
             push_resolved_clause(&mut clauses, &canon_home, sub, push_subpath_clause);
         }
     }
 
-    // Ancestor-node rename guard (closes the relocate-the-writable-parent bypass).
+    // Ancestor-node rename guard.
     //
-    // A leaf deny `(subpath "<home>/.config/gh")` covers the node and its descendants
-    // but NOT its ancestor `<home>/.config`, which `(allow default)` leaves writable.
-    // Seatbelt does not recurse into descendants on a rename, so a hostile Containment
-    // shell could `mv <home>/.config <home>/stolen` — one write op on the UNDENIED
-    // ancestor NODE — and relocate the whole protected subtree to a path no deny
-    // covers, then read `stolen/gh/…`. This defeats the credential/private-data deny
-    // for every NESTED entry (`.config/*`, all `Library/*`, the browser profiles).
-    // Top-level entries (`.ssh`, `.aws`, …) are unaffected: their own node is
-    // write-denied, so renaming it is a write to a denied path.
+    // A leaf deny `(subpath "<home>/.config/gh")` does not cover the ancestor
+    // `<home>/.config`, which `(allow default)` leaves writable, and Seatbelt
+    // does not check descendants on rename, so `mv <home>/.config <home>/stolen`
+    // would relocate the protected subtree past every deny. This affects nested
+    // entries (`.config/*`, `Library/*`, browser profiles); a top-level entry's
+    // own node is already write-denied.
     //
-    // Close it by additionally write-denying each EXISTING ancestor directory NODE as
-    // a `literal` (NOT a `subpath`): a literal matches only the node itself, so
-    // rename/unlink/replace of the node is blocked while writes to files strictly
-    // UNDER it (e.g. `echo … > <home>/.config/nvimrc`, `mkdir <home>/.config/new`)
-    // still succeed — the shell keeps working. Only EXISTING nodes are denied: a
-    // literal write-deny on a not-yet-existing intermediate would block a legitimate
-    // `mkdir -p`, and a not-yet-existing ancestor has no protected subtree to
-    // relocate anyway. `file-write*` only (not `file-read*`) — reads of files under
-    // the ancestor must keep working; we are blocking relocation, not listing.
+    // Each existing ancestor node gets a write deny as a `literal` (the node
+    // only), so rename/unlink/replace is blocked while writes under it still
+    // work. Only existing nodes: a deny on a missing intermediate would block
+    // `mkdir -p`, and there is nothing to relocate. `file-write*` only; reads
+    // are unaffected.
     let mut ancestor_clauses = String::new();
     let mut denied_ancestors: Vec<PathBuf> = Vec::new();
     let mut nested: Vec<&str> = SECRET_SUBDIRS
@@ -481,10 +476,9 @@ fn profile_scoped(
         );
     }
 
-    // The secret-set (+ private-set) file deny (read AND write), then the ancestor
-    // node write-deny clause (only when there is at least one existing nested
-    // ancestor to guard). Both come AFTER the write confinement, so they win over
-    // its allows.
+    // The secret (+ private) set deny, then the ancestor-node write deny (when
+    // any nested ancestor exists). Both follow the write confinement, so they
+    // win over its allows.
     profile.push_str("(deny file-read* file-write*");
     profile.push_str(&clauses);
     profile.push(')');
@@ -497,36 +491,19 @@ fn profile_scoped(
 }
 
 /// Emit the deny clause(s) for the secret/private entry `<canon_home>/<entry>`,
-/// resolving symlinks the way Seatbelt does.
+/// resolving symlinks as Seatbelt does.
 ///
-/// Seatbelt authorizes a file op against the kernel-RESOLVED (canonical) path, so
-/// a secret store that is ITSELF a symlink — extremely common with dotfile
-/// managers (GNU Stow, chezmoi, yadm) that symlink `~/.aws`, `~/.ssh`, `~/.gnupg`,
-/// `~/.netrc`, … into a tracked store — would slip past a deny written only
-/// against the lexical `<home>/<entry>` path: the kernel resolves the access to
-/// the real target, which does not prefix-match the lexical `(subpath …)`, and
-/// `(allow default)` then permits the read/write. Canonicalizing only the home
-/// prefix (done by the caller) does not cover this, because the LEAF is the
-/// symlink.
+/// Seatbelt checks the kernel-resolved path, so a store that is itself a
+/// symlink (common with dotfile managers: GNU Stow, chezmoi, yadm) would escape
+/// a deny written only against the lexical path.
 ///
-/// So, mirroring the home-canonicalization:
-/// - entry exists ⇒ emit the canonical (symlink-resolved) clause, and ALSO the
-///   lexical clause when it differs (belt-and-suspenders; harmless duplicate when
-///   it doesn't);
-/// - entry does not exist ⇒ emit the lexical clause (pre-arming the deny before
-///   the dir is created — preserves the documented "secret dirs need not exist"
-///   property and keeps the profile byte-identical for the non-symlinked / not-
-///   yet-created cases) AND, when an INTERMEDIATE component is a symlink, the
-///   clause for the resolved-ancestor path too (see below).
-///
-/// The leaf-absent case still has a footgun: an INTERMEDIATE component can be a
-/// symlink even when the leaf does not exist yet — e.g. `~/.config` → `~/dotfiles/
-/// config` with `~/.config/gh` not yet created. `canonicalize` of the full path
-/// fails (leaf absent), so a lexical-only clause would let the kernel resolve an
-/// access through the symlinked ancestor to a path the deny does not cover — it
-/// would fail OPEN. So on failure we additionally resolve the deepest EXISTING
-/// ancestor and re-append the trailing not-yet-existing components, emitting that
-/// resolved-prefix clause. Purely additive.
+/// - Entry exists ⇒ the canonical clause, plus the lexical clause when it
+///   differs.
+/// - Entry absent ⇒ the lexical clause (pre-arming the deny), plus, when an
+///   intermediate component is a symlink (`~/.config` → `~/dotfiles/config`
+///   with `gh` not yet created), the clause for the deepest existing ancestor
+///   resolved with the missing tail re-appended, so the deny does not fail
+///   open once the leaf appears.
 fn push_resolved_clause(
     out: &mut String,
     canon_home: &Path,
@@ -549,12 +526,9 @@ fn push_resolved_clause(
     }
 }
 
-/// Resolve symlinks in the deepest EXISTING ancestor of `path` and re-append the
-/// remaining (not-yet-existing) trailing components. Used when `path` itself
-/// cannot be canonicalized because its leaf does not exist yet, but an ancestor
-/// may be a symlink whose target the Seatbelt deny must still cover. Returns
-/// `None` if no ancestor canonicalizes (cannot happen for a path under an already-
-/// canonical home, which always has the existing canonical home as an ancestor).
+/// Resolve symlinks in the deepest existing ancestor of `path` and re-append
+/// the missing trailing components, for a path whose leaf does not exist yet.
+/// `None` if no ancestor canonicalizes (impossible under a canonical home).
 fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
     // `ancestors()` yields `path` first; skip it (we already know it fails to
     // canonicalize) and find the deepest ancestor that does.
@@ -567,29 +541,19 @@ fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Append ` (literal "<node>")` write-deny operands for the EXISTING ancestor
-/// directory nodes of `entry` whose rename would relocate the protected leaf,
-/// deduplicating against `denied`. See [`profile_for_home`] for the rename-relocation
-/// threat this closes and why only EXISTING nodes are denied.
+/// Append ` (literal "<node>")` write-deny operands for the existing ancestor
+/// nodes of `entry` whose rename would relocate the protected leaf, deduped
+/// against `denied` (see [`profile_for_home`]).
 ///
-/// Relocation can be performed by renaming an ancestor on the LEXICAL path
-/// (`<home>/<entry>`) OR — when an intermediate component is a symlink — on the
-/// SYMLINK-RESOLVED path. Example: with `~/.config -> ~/dotfiles/config`, the leaf
-/// deny covers `~/dotfiles/config/gh` (resolved) and `~/.config/gh` (lexical), and
-/// denying only the lexical `~/.config` symlink node still lets a contained shell
-/// `mv ~/dotfiles/config ~/stolen` — the REAL writable store — and read the secret
-/// from the new path. So we guard the ancestors of BOTH the lexical path and the
-/// resolved path (resolved exactly as the leaf deny is: canonicalize the full path if
-/// its leaf exists, else the deepest-existing-prefix + tail via
-/// [`resolve_existing_prefix`]).
+/// Ancestors of both the lexical and the resolved path are guarded: with
+/// `~/.config -> ~/dotfiles/config`, denying only the lexical symlink node
+/// would still allow `mv ~/dotfiles/config ~/stolen`. The resolved path is
+/// computed as the leaf deny computes it ([`resolve_existing_prefix`] when the
+/// leaf is absent).
 ///
-/// Ancestor denies are bounded to STRICT DESCENDANTS of the canonical home (never the
-/// home node itself — that would break the shell and is out of scope; never a node
-/// above/outside home). A store symlinked ENTIRELY outside `$HOME` to an externally-
-/// writable location is thus out of scope for the relocation guard — its leaf reads/
-/// writes are still denied, only relocation-via-external-rename is not; that matches
-/// the module's `$HOME`-scoped design and the real-world dotfile-manager layout
-/// (Stow/chezmoi/yadm keep their store under `$HOME`).
+/// Bounded to strict descendants of the canonical home (never home itself or
+/// anything outside it). A store symlinked entirely outside `$HOME` keeps its
+/// leaf denies but has no relocation guard, matching the `$HOME`-scoped design.
 fn push_existing_ancestor_write_denies(
     out: &mut String,
     canon_home: &Path,
@@ -597,9 +561,7 @@ fn push_existing_ancestor_write_denies(
     denied: &mut Vec<PathBuf>,
 ) {
     let lexical = canon_home.join(entry);
-    // The resolved path, computed identically to the leaf deny (push_resolved_clause):
-    // canonicalize the whole path if its leaf exists, else resolve the deepest
-    // existing ancestor and re-append the not-yet-existing tail.
+    // Resolved as the leaf deny resolves it (`push_resolved_clause`).
     let resolved = match std::fs::canonicalize(&lexical) {
         Ok(c) => Some(c),
         Err(_) => resolve_existing_prefix(&lexical),
@@ -612,21 +574,17 @@ fn push_existing_ancestor_write_denies(
     }
 }
 
-/// Write-deny each EXISTING directory node strictly between `canon_home` and `path`'s
-/// leaf — the ancestors under home whose rename would relocate the leaf. Emitted
-/// shallow-first, deduped against `denied`. Bounded to strict descendants of
-/// `canon_home` (never home itself; never a node above/outside it), so `starts_with`
-/// on the deep→shallow ancestor walk terminates cleanly at the home boundary.
+/// Write-deny each existing directory node strictly between `canon_home` and
+/// `path`'s leaf, shallow-first, deduped against `denied`. Never home itself or
+/// a node outside it.
 fn push_ancestor_literals(
     out: &mut String,
     canon_home: &Path,
     path: &Path,
     denied: &mut Vec<PathBuf>,
 ) {
-    // `ancestors()` is leaf-first: [leaf, parent, …, "/", ""]. Skip the leaf (already
-    // covered by its own deny), then keep the CONTIGUOUS run of strict ancestors that
-    // live under home — once the walk reaches home (or steps outside it) it stays
-    // outside, so `take_while` captures exactly the under-home ancestors.
+    // `ancestors()` is leaf-first. Skip the leaf (it has its own deny) and keep
+    // the contiguous run of strict ancestors under home.
     let mut nodes: Vec<&Path> = path
         .ancestors()
         .skip(1)
@@ -638,9 +596,8 @@ fn push_ancestor_literals(
         if denied.iter().any(|d| d == &node) {
             continue;
         }
-        // Only nodes that ACTUALLY EXIST (as a dir OR a symlink — symlink_metadata
-        // does not follow the final link): a literal write-deny on a not-yet-existing
-        // path would break a legitimate `mkdir -p`.
+        // Existing nodes only (dir or symlink; `symlink_metadata` does not
+        // follow): a deny on a missing path would break `mkdir -p`.
         if std::fs::symlink_metadata(&node).is_ok() {
             push_literal_clause(out, &node);
             denied.push(node);
@@ -695,16 +652,6 @@ mod tests {
         s
     }
 
-    #[test]
-    fn network_only_profile_is_the_exact_documented_sbpl() {
-        // The bytes are load-bearing — the network-only fallback and the prefix of
-        // the full profile both depend on this exact string.
-        assert_eq!(
-            NETWORK_DENY_PROFILE,
-            "(version 1)(allow default)(deny network*)"
-        );
-    }
-
     /// The TmpOnly write confinement with no home-scoped allow in it.
     fn homeless_write_confinement() -> String {
         let mut s = String::new();
@@ -715,13 +662,13 @@ mod tests {
     #[test]
     fn home_unset_yields_no_home_scoped_rule() {
         // No resolvable home → no file deny or allow for a bogus path. A broader FS
-        // tier is network-only; TmpOnly keeps its write confinement, which names
+        // tier gets the base profile; TmpOnly keeps its write confinement, which names
         // no home path and so is still meaningful (and strictly tighter).
-        let tmp_only = [NETWORK_DENY_PROFILE, &homeless_write_confinement()].concat();
+        let tmp_only = [BASE_PROFILE, &homeless_write_confinement()].concat();
         for home in [None, Some("")] {
             assert_eq!(
                 profile_for_home(home, None, FsCapability::HomeReadWrite),
-                NETWORK_DENY_PROFILE
+                BASE_PROFILE
             );
             assert_eq!(
                 profile_for_home(home, None, FsCapability::TmpOnly),
@@ -734,9 +681,9 @@ mod tests {
         assert!(profile_scoped(home.path().to_str(), None, FsCapability::TmpOnly).1);
     }
 
-    /// `TmpOnly` confines WRITES (decided 2026-09-26 under the owner's standing
-    /// direction): every write denied, the temp roots, `/dev` and the shell's
-    /// history files allowed back, and nothing of `$HOME` beyond those files.
+    /// `TmpOnly` confines writes: every write denied, the temp roots, `/dev`
+    /// and the shell's history files allowed back, and nothing of `$HOME`
+    /// beyond those files (owner, 2026-09-26).
     #[test]
     fn tmp_only_confines_writes_to_the_writable_roots() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -744,8 +691,8 @@ mod tests {
         let profile = profile_for_home(canon_home.to_str(), None, FsCapability::TmpOnly);
 
         // Deny every write, then allow the roots — in that order, right after the
-        // network deny, so every later deny (secrets, private data) still wins.
-        let confinement = [NETWORK_DENY_PROFILE, "(deny file-write*)(allow file-write*"].concat();
+        // base profile, so every later deny (secrets, private data) still wins.
+        let confinement = [BASE_PROFILE, "(deny file-write*)(allow file-write*"].concat();
         assert!(
             profile.starts_with(&confinement),
             "TmpOnly must open with the write confinement; got {profile}"
@@ -816,11 +763,9 @@ mod tests {
         &profile[at..end]
     }
 
-    /// A history file that is not a plain single-link file gets no allowance:
-    /// resolved, a `~/.zsh_history` symlink to `$HOME` (which a contained shell
-    /// could once plant) put all of `$HOME` in the next session's allows. Here
-    /// the row is dropped whole and nothing it reaches is named; the other
-    /// shell's row is untouched.
+    /// A history file that is not a plain single-link file gets no allowance
+    /// (a `~/.zsh_history` symlink to `$HOME` would otherwise allow all of
+    /// `$HOME`): its row is dropped whole; the other shell's row is untouched.
     #[cfg(unix)]
     #[test]
     fn a_history_file_that_is_not_a_plain_file_gets_no_allowance() {
@@ -968,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn full_profile_starts_with_network_deny_and_denies_each_secret() {
+    fn full_profile_starts_with_the_base_profile_and_denies_each_secret() {
         // Use a real, canonicalizable home so the path-joins resolve. The crate's
         // own temp dir is canonical on the test box. Credential-only (a broader FS tier
         // than TmpOnly): this test pins the secret set independently of the private set.
@@ -977,18 +922,18 @@ mod tests {
         let canon = std::fs::canonicalize(&tmp).expect("canonicalize temp dir");
         let profile = profile_for_home(canon.to_str(), None, FsCapability::HomeReadWrite);
 
-        // (1) It is the network deny PLUS a file deny — never less. (A broader FS
+        // (1) It is the base profile PLUS a file deny — never less. (A broader FS
         // tier: no write confinement, so the file deny follows directly.)
         assert!(
-            profile.starts_with(NETWORK_DENY_PROFILE),
-            "full profile must begin with the exact network deny; got {profile}"
+            profile.starts_with(BASE_PROFILE),
+            "full profile must begin with the exact base profile; got {profile}"
         );
         assert!(
             profile.contains("(deny file-read* file-write*"),
             "full profile must deny read AND write of the secret set; got {profile}"
         );
 
-        // (2) Every secret subdir appears as a CANONICAL subpath.
+        // (2) Every secret subdir appears as a canonical subpath.
         for sub in SECRET_SUBDIRS {
             let expect = format!("(subpath \"{}\")", sbpl_str(&canon.join(sub)));
             assert!(
@@ -996,7 +941,7 @@ mod tests {
                 "profile must deny secret subdir {sub} as canonical subpath {expect}; got {profile}"
             );
         }
-        // (3) Every secret literal file appears as a CANONICAL literal.
+        // (3) Every secret literal file appears as a canonical literal.
         for file in SECRET_LITERAL_FILES {
             let expect = format!("(literal \"{}\")", sbpl_str(&canon.join(file)));
             assert!(
@@ -1035,7 +980,7 @@ mod tests {
                 "credential-only profile must NOT deny private dir {sub}; got {off}"
             );
         }
-        // The secret set is present in BOTH (private is purely additive).
+        // The secret set is present in both (private is purely additive).
         for sub in SECRET_SUBDIRS {
             let expect = format!("(subpath \"{}\")", sbpl_str(&canon.join(sub)));
             assert!(on.contains(&expect) && off.contains(&expect));
@@ -1046,10 +991,9 @@ mod tests {
 
     #[test]
     fn full_profile_does_not_deny_the_whole_home() {
-        // CRITICAL non-breakage invariant: the home itself (and thus ~/.zshrc) must
-        // NOT be denied — only the secret/private subpaths/literals. There must be no
-        // (subpath "<home>") or (literal "<home>") clause for the bare home. Checked
-        // against the FULL profile (TmpOnly) — the broadest deny set.
+        // The home itself (and so ~/.zshrc) is never denied, only the
+        // secret/private entries: no bare-home clause, checked against the
+        // full TmpOnly profile.
         let tmp = std::env::temp_dir();
         let canon = std::fs::canonicalize(&tmp).expect("canonicalize temp dir");
         let profile = profile_for_home(canon.to_str(), None, FsCapability::TmpOnly);
@@ -1070,10 +1014,8 @@ mod tests {
 
     #[test]
     fn secret_paths_are_canonicalized_not_raw() {
-        // The /tmp → /private/tmp footgun: on macOS, a home reached via /tmp
-        // canonicalizes to /private/tmp. Emitting the RAW (non-canonical) prefix
-        // would silently fail to match. Assert the generator emits the CANONICAL
-        // prefix, not the raw one we passed in. (Skipped if /tmp is not a symlink.)
+        // A home reached via /tmp canonicalizes to /private/tmp; the generator
+        // must emit the canonical prefix. Skipped if /tmp is not a symlink.
         let raw = std::path::Path::new("/tmp");
         if let Ok(canon) = std::fs::canonicalize(raw) {
             if canon != raw {
@@ -1096,11 +1038,8 @@ mod tests {
     #[test]
     fn symlinked_secret_store_is_denied_at_its_canonical_target() {
         use std::os::unix::fs::symlink;
-        // A credential store that is ITSELF a symlink (the dotfile-manager footgun:
-        // Stow / chezmoi / yadm symlink ~/.aws, ~/.ssh, … into a tracked store)
-        // must be denied at the kernel-RESOLVED target — Seatbelt matches the
-        // canonical path, so a deny written only against the lexical ~/.aws would
-        // fail open and let a hostile Containment-mode shell read the credentials.
+        // A credential store that is itself a symlink (dotfile managers) is
+        // denied at its resolved target, or the deny would fail open.
         let home = aterm_tempfile::tempdir().unwrap();
         let store = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
@@ -1110,7 +1049,7 @@ mod tests {
 
         let profile = profile_for_home(canon_home.to_str(), None, FsCapability::HomeReadWrite);
 
-        // The deny must cover the REAL target the kernel resolves ~/.aws to.
+        // The deny must cover the real target the kernel resolves ~/.aws to.
         let target_marker = format!("(subpath \"{}\")", canon_store.display());
         assert!(
             profile.contains(&target_marker),
@@ -1128,11 +1067,8 @@ mod tests {
     #[test]
     fn symlinked_ancestor_with_absent_leaf_is_denied_at_resolved_target() {
         use std::os::unix::fs::symlink;
-        // Intermediate-component symlink with the LEAF absent: `~/.config` is a
-        // symlink into a tracked store but `~/.config/gh` has not been created.
-        // canonicalize of the full secret path fails (leaf absent), yet the deny
-        // must still cover the resolved target the kernel reaches THROUGH the
-        // symlinked ancestor — otherwise it fails OPEN once `gh` is created.
+        // `~/.config` is a symlink and `~/.config/gh` does not exist yet: the
+        // deny must still cover the target reached through the symlink.
         let home = aterm_tempfile::tempdir().unwrap();
         let store = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
@@ -1152,26 +1088,25 @@ mod tests {
     }
 
     #[test]
-    fn nonexistent_home_falls_back_to_network_only() {
-        // A home that cannot be canonicalized (does not exist) → network-only, not
+    fn nonexistent_home_falls_back_to_the_base_profile() {
+        // A home that cannot be canonicalized (does not exist) → the base profile, not
         // a deny on a possibly-wrong path.
         let bogus = "/nonexistent/aterm-no-such-home-xyz";
         assert_eq!(
             profile_for_home(Some(bogus), None, FsCapability::HomeReadWrite),
-            NETWORK_DENY_PROFILE
+            BASE_PROFILE
         );
         assert_eq!(
             profile_for_home(Some(bogus), None, FsCapability::TmpOnly),
-            [NETWORK_DENY_PROFILE, &homeless_write_confinement()].concat()
+            [BASE_PROFILE, &homeless_write_confinement()].concat()
         );
     }
 
     #[test]
     fn nested_secret_ancestor_nodes_are_write_denied_to_block_rename_relocation() {
-        // The relocate-the-writable-parent bypass: a leaf deny `(subpath ".../.config/gh")`
-        // does NOT cover the ancestor `.config`, which `(allow default)` leaves writable,
-        // so a contained shell could `mv ~/.config ~/stolen` to move the subtree past the
-        // deny. Every EXISTING nested ancestor NODE must get a `(deny file-write* (literal …))`.
+        // Every existing nested ancestor node gets a
+        // `(deny file-write* (literal …))`, so `mv ~/.config ~/stolen` cannot
+        // move the subtree past the leaf deny.
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
         // Create the ancestor chains for one secret and one private (deep) entry.
@@ -1226,10 +1161,8 @@ mod tests {
 
     #[test]
     fn nonexistent_nested_ancestor_is_not_write_denied() {
-        // Only EXISTING ancestor nodes are denied: a literal write-deny on a
-        // not-yet-existing intermediate would block a legitimate `mkdir -p`, and a
-        // non-existent ancestor has no protected subtree to relocate. A fresh home
-        // with no nested dirs created must emit NO ancestor write-deny clause.
+        // Only existing ancestor nodes are denied: a fresh home with no nested
+        // dirs emits no ancestor clause.
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
         let profile = profile_for_home(canon_home.to_str(), None, FsCapability::TmpOnly);
@@ -1243,14 +1176,11 @@ mod tests {
     #[test]
     fn symlinked_ancestor_store_is_write_denied_at_its_resolved_nodes() {
         use std::os::unix::fs::symlink;
-        // Dotfile-manager case (codex round-5 follow-up to the relocation guard):
-        // `~/.config -> ~/dotfiles/config`. Denying only the LEXICAL `~/.config`
-        // symlink node is insufficient — a contained shell could `mv ~/dotfiles/config
-        // ~/stolen` (the REAL writable store, under home) and read `~/stolen/gh/…`. The
-        // RESOLVED store node AND its parent must also be write-denied.
+        // `~/.config -> ~/dotfiles/config`: the resolved store node and its
+        // parent must be write-denied too, not just the lexical symlink node.
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
-        // Real store UNDER home, with a secret inside it, reached via the ~/.config symlink.
+        // Real store under home, with a secret inside it, reached via the ~/.config symlink.
         let store = canon_home.join("dotfiles/config");
         std::fs::create_dir_all(store.join("gh")).unwrap();
         symlink(&store, canon_home.join(".config")).unwrap();
@@ -1263,7 +1193,7 @@ mod tests {
             profile.contains(&lex),
             "lexical ~/.config symlink node must be write-denied; got {profile}"
         );
-        // (2) AND the resolved real store + its parent — closing the rename-the-real-
+        // (2) and the resolved real store + its parent — closing the rename-the-real-
         // ancestor bypass codex flagged.
         let real_store = format!("(literal \"{}\")", store.display());
         let real_parent = format!("(literal \"{}\")", canon_home.join("dotfiles").display());
@@ -1279,9 +1209,8 @@ mod tests {
 
     #[test]
     fn ancestor_write_deny_dedups_shared_parents() {
-        // All `Library/*` entries share the `Library` node; the browser profiles share
-        // `Library/Application Support`. Each shared ancestor must be emitted EXACTLY
-        // ONCE, not once per entry.
+        // Shared ancestors (`Library`, `Library/Application Support`) are
+        // emitted exactly once.
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
         std::fs::create_dir_all(canon_home.join("Library/Application Support/Google/Chrome"))
@@ -1309,7 +1238,7 @@ mod tests {
     #[test]
     fn containment_caps_yield_a_network_plus_secret_profile() {
         // profile_for reads the real $HOME. Whatever it resolves to, the result for
-        // Containment must be Some and must at least contain the network deny.
+        // Containment must be Some and must at least contain the base profile.
         let caps = ContainmentPolicy::capabilities(ContainmentMode::Containment);
         assert_eq!(caps.network, NetworkCapability::None, "precondition");
         assert_eq!(
@@ -1319,30 +1248,29 @@ mod tests {
         );
         let profile = profile_for(&caps).expect("Containment must yield a profile");
         assert!(
-            profile.starts_with(NETWORK_DENY_PROFILE),
-            "Containment profile must begin with the network deny; got {profile}"
+            profile.starts_with(BASE_PROFILE),
+            "Containment profile must begin with the base profile; got {profile}"
         );
     }
 
     #[test]
     fn private_data_is_gated_on_the_fs_capability_not_network() {
-        // CRITICAL honesty property: the private-user-data deny is keyed on
-        // `fs == TmpOnly`, NOT on `network == None`. Construct a (hypothetical) cap
-        // set with network denied but a broader FS tier and prove it gets the
-        // credential deny but NOT the private-data deny. This requires a resolvable
-        // $HOME with at least one private dir; skip cleanly if neither holds.
+        // The private-data deny is keyed on `fs == TmpOnly`, not on
+        // `network == None`: a hypothetical set with network denied and a
+        // broader FS tier gets the credential deny only. Needs a resolvable
+        // $HOME with a private dir; skipped otherwise.
         let Some(home) = home_dir() else { return };
         let Ok(canon) = std::fs::canonicalize(&home) else {
             return;
         };
-        // A representative private path that must NEVER appear unless fs == TmpOnly.
+        // A representative private path that must never appear unless fs == TmpOnly.
         let private_marker = format!("(subpath \"{}\")", sbpl_str(&canon.join("Documents")));
-        // A representative secret path that must ALWAYS appear when network == None.
+        // A representative secret path that must always appear when network == None.
         let secret_marker = format!("(subpath \"{}\")", sbpl_str(&canon.join(".ssh")));
 
         let base = ContainmentPolicy::capabilities(ContainmentMode::Containment);
 
-        // (a) Real Containment (network None ∧ fs TmpOnly): BOTH present.
+        // (a) Real Containment (network None ∧ fs TmpOnly): both present.
         let full = profile_for(&base).expect("Containment yields a profile");
         assert!(
             full.contains(&secret_marker),
@@ -1369,9 +1297,7 @@ mod tests {
 
     #[test]
     fn non_containment_modes_get_no_sandbox() {
-        // User, Master and Safety have Full network. NONE of them is
-        // sandboxed — profile_for must return None so their spawn is byte-identical
-        // (no sandbox-exec wrap).
+        // User, Master and Safety have full network and are never sandboxed.
         for mode in [
             ContainmentMode::User,
             ContainmentMode::Master,
@@ -1388,9 +1314,7 @@ mod tests {
 
     #[test]
     fn profile_selection_keys_only_on_network_capability_none() {
-        // The contract is precisely "network == None ⇒ Some(profile)". Construct
-        // capability sets directly across the NetworkCapability axis to lock that
-        // it is the network field — and only that field — that decides.
+        // "network == None ⇒ Some(profile)": the network field alone decides.
         let base = ContainmentPolicy::capabilities(ContainmentMode::Containment);
         let mut none = base;
         none.network = NetworkCapability::None;

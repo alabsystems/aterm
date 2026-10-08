@@ -4,27 +4,24 @@
 //! The `latest` alias (`aterm.sock`) that points flagless clients at the
 //! newest instance's `aterm-<pid>.sock`.
 //!
-//! * **Unix**: a relative SYMLINK, published atomically (symlink under a temp
-//!   name, then `rename`). Clients connect THROUGH it (kernel-resolved) and
-//!   `readlink` only to learn the sibling token name. Verbatim the shipping
-//!   `aterm-gui` behavior.
-//! * **Windows**: NTFS symlinks need privilege or developer mode, so the
-//!   alias is a regular POINTER FILE whose contents are the same relative
-//!   instance name a Unix `readlink` returns (`aterm-<pid>.sock\n`), written
-//!   under a temp name then `rename`d (`MoveFileExW` + replace — atomic on
-//!   NTFS). Clients must resolve it themselves ([`resolve`]) before
-//!   connecting; contents are validated against the `aterm-<pid>.sock` shape
-//!   before use, so a same-user-planted junk file degrades to "no alias",
-//!   never to dialing an arbitrary path outside the socket dir. The trust
-//!   boundary is identical to the Unix symlink (also same-user-writable).
+//! * Unix: a relative symlink, published atomically (symlink under a temp name,
+//!   then `rename`). A client that presents a token `readlink`s it once and
+//!   dials the instance socket it names, reading that socket's token; resolving
+//!   the link twice could name two instances if another republished it between.
+//! * Windows: NTFS symlinks need privilege or developer mode, so the alias is a
+//!   regular pointer file holding the relative instance name
+//!   (`aterm-<pid>.sock\n`), written under a temp name then renamed
+//!   (`MoveFileExW` + replace, atomic on NTFS). Clients resolve it themselves
+//!   ([`resolve`]); contents are validated against the `aterm-<pid>.sock` shape,
+//!   so a planted junk file degrades to "no alias", never to dialing a path
+//!   outside the socket dir. The trust boundary matches the Unix symlink.
 
 use std::ffi::OsString;
 use std::path::Path;
 
-/// The pid a SOCKET filename encodes (`aterm-<pid>.sock`) — the `.sock`
-/// spelling only, so a path pointed at a file named `aterm-<pid>.token` is
-/// never told its token is itself. Mirrors
-/// `aterm_types::control_socket::sock_name_pid`.
+/// The pid a socket filename encodes (`aterm-<pid>.sock`); only the `.sock`
+/// spelling, so a file named `aterm-<pid>.token` is never taken for a socket.
+/// Mirrors `aterm_types::control_socket::sock_name_pid`.
 fn sock_name_pid(sock_name: &str) -> Option<u32> {
     sock_name
         .strip_prefix("aterm-")
@@ -35,31 +32,19 @@ fn sock_name_pid(sock_name: &str) -> Option<u32> {
 }
 
 /// The token filename that authenticates the socket named `sock_name`, and the
-/// one name the server writes beside it: a per-instance socket
-/// (`aterm-<pid>.sock`) pairs with its `aterm-<pid>.token`; **everything else**
-/// — an EXPLICIT custom `--control-sock` path — pairs with its OWN
-/// filename plus `.token` (`a.sock` → `a.sock.token`), prefixed `aterm-sock-`
-/// when the name does not end in `.sock` so it can never land on the reserved
-/// `aterm.token` / `aterm-<pid>.token` names.
+/// one name the server writes beside it. A per-instance socket
+/// (`aterm-<pid>.sock`) pairs with `aterm-<pid>.token`; any other (explicit
+/// `--control-sock`) name pairs with its own filename plus `.token`
+/// (`a.sock` → `a.sock.token`), prefixed `aterm-sock-` when it does not end in
+/// `.sock`, so it never lands on the reserved `aterm.token` /
+/// `aterm-<pid>.token` names. Two explicit sockets in one directory thus never
+/// share a token file.
 ///
-/// Mirrors `aterm_types::control_socket::token_name_for_sock`; kept local so
-/// this crate stays dependency-free, exactly as `is_instance_sock_name` mirrors
-/// the `.sock` shape. `aterm-ctl` resolves the token through the canonical
-/// copy, so the two MUST agree — pinned by
-/// `uds_token_name_mirror_matches_aterm_types` in `aterm-ctl`, the one crate
-/// that depends on both.
-///
-/// Load-bearing twice over. Hand-rolling `<stem>.token` instead (the bug this
-/// replaced) derives `/tmp/c.token` for `/tmp/c.sock`, which no server writes.
-/// And collapsing every non-instance name onto the shared `aterm.token` (the
-/// bug this REPLACES) gave two explicit sockets in one directory one token
-/// file, so the second instance to start silently took the first one's
-/// credential and its clients were refused `ERR auth` while it still listened.
-/// Note the pid round-trip: the canonical rule parses the digits to a `u32` and
-/// re-formats, so `aterm-01.sock` pairs with `aterm-1.token` (NOT
-/// `aterm-01.token`) and an out-of-range pid falls through to the explicit
-/// form. Mirroring by string slicing alone silently drifts on both — the
-/// cross-check test caught exactly that.
+/// Mirrors `aterm_types::control_socket::token_name_for_sock`, kept local so
+/// this crate stays dependency-free; `uds_token_name_mirror_matches_aterm_types`
+/// in `aterm-ctl` pins the two together. Like the canonical rule, the pid
+/// round-trips through `u32`: `aterm-01.sock` pairs with `aterm-1.token`, and an
+/// out-of-range pid falls through to the explicit form.
 #[must_use]
 pub fn token_name_for_sock(sock_name: &str) -> String {
     match sock_name_pid(sock_name) {
@@ -77,15 +62,13 @@ pub fn token_name_for_sock(sock_name: &str) -> String {
 }
 
 /// Every token filename a client may read for `sock_name`, most specific
-/// first: the per-socket file this build's server writes, then — for an
-/// explicit socket only — the legacy shared `aterm.token` a server built
-/// BEFORE the per-socket token wrote for that same socket.
+/// first: the per-socket file, then (for an explicit socket only) the legacy
+/// shared `aterm.token` older servers wrote for it.
 ///
-/// Mirrors `aterm_types::control_socket::token_names_for_sock`, including the
-/// reason the fallback is safe: a server compares `AUTH` against the token it
-/// minted in memory, never against a file, so a shared `aterm.token` that
-/// belongs to another instance is refused exactly as no token at all is. A
-/// per-instance socket gets no fallback — its token has never been shared.
+/// Mirrors `aterm_types::control_socket::token_names_for_sock`. The fallback
+/// is safe: a server checks `AUTH` against the token it minted in memory, so
+/// another instance's shared `aterm.token` is refused like no token at all. A
+/// per-instance socket gets no fallback.
 #[must_use]
 pub fn token_names_for_sock(sock_name: &str) -> Vec<String> {
     let mut names = Vec::with_capacity(2);
@@ -96,17 +79,15 @@ pub fn token_names_for_sock(sock_name: &str) -> Vec<String> {
     names
 }
 
-/// The absolute path of the token file authenticating the socket at `sock` —
-/// [`token_names_for_sock`] resolved in the socket's OWN directory, after
-/// following the `latest` alias ([`target_name`]) so a flagless client reads the
-/// pointed-at instance's token rather than the alias's.
+/// The absolute path of the token file authenticating the socket at `sock`:
+/// [`token_names_for_sock`] resolved in the socket's own directory, after
+/// following the `latest` alias ([`target_name`]).
 ///
-/// The first candidate that EXISTS wins; with none on disk the per-socket name
-/// is returned anyway, so a caller's error message names the file this build
-/// expects rather than a legacy one nothing writes. Absent is the only reason
-/// to move on: a per-socket token that exists but cannot be read belongs to the
-/// instance being dialed, and reaching past it for a directory-shared file
-/// would be reaching for someone else's credential.
+/// The first candidate that exists wins; with none on disk the per-socket name
+/// is returned, so an error message names the file this build expects. Only
+/// absence moves on: a per-socket token that exists but cannot be read belongs
+/// to the instance being dialed, and falling back would reach for another
+/// instance's credential.
 #[must_use]
 pub fn token_path_for_sock(sock: &str) -> Option<std::path::PathBuf> {
     let p = Path::new(sock);
@@ -123,13 +104,13 @@ pub fn token_path_for_sock(sock: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Atomically (re)point the `latest` alias at this instance's socket: write
-/// the RELATIVE sock filename under `<target>.lnk`, then rename over `link`,
-/// so a client never observes a missing alias and the newest instance always
-/// wins. Best-effort: on failure clients can still target the instance socket
-/// directly (`aterm-ctl --pid`).
+/// the relative sock filename under `<target>.lnk`, then rename over `link`,
+/// so a client never observes a missing alias and the newest instance wins.
+/// Best-effort: clients can still target the instance socket directly
+/// (`aterm-ctl --pid`).
 #[cfg(unix)]
-// Skip: best-effort alias (re)point bottoms out at std fs syscalls
-// (`remove_file`/`rename`, absent bodies) + OsString alloc.
+// Skip: bottoms out at std fs syscalls (`remove_file`/`rename`) and an
+// OsString allocation.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn publish(link: &Path, sock_path: &str) {
     let Some(target) = Path::new(sock_path).file_name() else {
@@ -147,9 +128,8 @@ pub fn publish(link: &Path, sock_path: &str) {
     }
 }
 
-/// Windows twin of the Unix publish: same temp-name + rename dance, but the
-/// alias is a pointer FILE carrying the relative instance name (see the
-/// module docs).
+/// Windows twin of the Unix publish: the same temp-name + rename, but the
+/// alias is a pointer file carrying the relative instance name.
 #[cfg(windows)]
 pub fn publish(link: &Path, sock_path: &str) {
     let Some(target) = Path::new(sock_path).file_name() else {
@@ -169,10 +149,9 @@ pub fn publish(link: &Path, sock_path: &str) {
     }
 }
 
-/// The alias target's FILE NAME (`aterm-<pid>.sock`), or `None` when `link`
-/// is not a live alias. Unix: `readlink` + final component (the link target
-/// is already the relative name). Windows: the pointer file's trimmed
-/// contents, validated against the instance-name shape first.
+/// The alias target's file name (`aterm-<pid>.sock`), or `None` when `link`
+/// is not a live alias. Unix: `readlink` + final component. Windows: the
+/// pointer file's trimmed contents, validated against the instance-name shape.
 #[must_use]
 // Skip: reads + validates the pointer file via std fs (absent syscall bodies).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -197,11 +176,10 @@ pub fn target_name(link: &Path) -> Option<OsString> {
     }
 }
 
-/// Validate a pointer file's contents as a bare `aterm-<digits>.sock` name —
-/// one path component, nothing else. Mirrors
-/// `aterm_types::control_socket::instance_pid` (+ the `.sock` suffix); kept
-/// local so this crate stays dependency-free, and load-bearing: a planted
-/// alias can only ever redirect WITHIN the socket directory.
+/// Validate a pointer file's contents as a bare `aterm-<digits>.sock` name
+/// (one path component). Mirrors `aterm_types::control_socket::instance_pid`
+/// plus the `.sock` suffix, so a planted alias can only redirect within the
+/// socket directory.
 #[cfg(windows)]
 fn is_instance_sock_name(name: &str) -> bool {
     let Some(stem) = name.strip_prefix("aterm-") else {
@@ -215,10 +193,10 @@ fn is_instance_sock_name(name: &str) -> bool {
 
 /// Client-side alias redirect: on Windows, if `path` is a pointer file whose
 /// validated contents name an instance socket, return
-/// `<parent>/<instance>.sock`; otherwise (and always on Unix, where the
-/// kernel resolves the symlink during `connect`) return `path` unchanged.
-/// A dangling pointer behaves like a dangling symlink — the later connect
-/// reports `NotFound`.
+/// `<parent>/<instance>.sock`; otherwise (and always on Unix, where the kernel
+/// resolves the symlink during `connect`) return `path` unchanged. A dangling
+/// pointer behaves like a dangling symlink: the later connect reports
+/// `NotFound`.
 #[must_use]
 pub fn resolve(path: &str) -> String {
     #[cfg(windows)]
@@ -235,20 +213,19 @@ pub fn resolve(path: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The mirror's own statement of the rule. `aterm-ctl` pins it against the
-    /// canonical `aterm-types` copy; this pins the SHAPE here, in the crate the
-    /// dependency-free `--dial` client actually calls.
+    /// The mirror's own statement of the rule, in the crate the dependency-free
+    /// `--dial` client calls (`aterm-ctl` pins it against `aterm-types`).
     #[test]
     fn token_names_pair_per_socket_and_never_reach_a_reserved_name() {
-        // Per-instance: unchanged since the first release.
+        // Per-instance.
         assert_eq!(token_name_for_sock("aterm-7.sock"), "aterm-7.token");
         assert_eq!(token_name_for_sock("aterm-01.sock"), "aterm-1.token");
         // Explicit sockets carry their own filename, so two in one directory
-        // can never share a credential file (F9).
+        // never share a credential file.
         assert_eq!(token_name_for_sock("a.sock"), "a.sock.token");
         assert_eq!(token_name_for_sock("b.sock"), "b.sock.token");
         assert_eq!(token_name_for_sock("aterm.sock"), "aterm.sock.token");
-        // Names that would otherwise APPEND onto a reserved name are prefixed.
+        // Names that would otherwise append onto a reserved name are prefixed.
         assert_eq!(token_name_for_sock("aterm"), "aterm-sock-aterm.token");
         assert_eq!(token_name_for_sock("aterm-42"), "aterm-sock-aterm-42.token");
         assert_eq!(token_name_for_sock("ctl"), "aterm-sock-ctl.token");
@@ -271,9 +248,8 @@ mod tests {
     }
 
     /// The per-socket file wins whenever it exists; the legacy shared name is
-    /// reached only in its ABSENCE (an instance from a build that wrote it),
-    /// and never for a per-instance socket. With nothing on disk the answer is
-    /// the per-socket name, so a caller's miss names the file this build wants.
+    /// reached only in its absence, and never for a per-instance socket. With
+    /// nothing on disk the answer is the per-socket name.
     #[test]
     fn token_path_prefers_the_per_socket_file_over_the_legacy_shared_one() {
         let dir = test_dir("fallback");
@@ -286,15 +262,15 @@ mod tests {
             dir.join("a.sock.token")
         );
 
-        // Only the legacy file (an older server): the bridge.
+        // Only the legacy file (an older server): the fallback.
         std::fs::write(dir.join("aterm.token"), "beef\n").unwrap();
         assert_eq!(
             token_path_for_sock(&sock).expect("resolves"),
             dir.join("aterm.token")
         );
 
-        // Both present: the per-socket file wins — the instance being dialed
-        // wrote that one, and the shared file may be anybody's.
+        // Both present: the per-socket file wins; the shared file may be
+        // anybody's.
         std::fs::write(dir.join("a.sock.token"), "feed\n").unwrap();
         assert_eq!(
             token_path_for_sock(&sock).expect("resolves"),
@@ -302,7 +278,7 @@ mod tests {
         );
 
         // A per-instance socket never falls back, even with the legacy file
-        // sitting right there: its token has never been shared.
+        // present.
         let inst = dir.join("aterm-77.sock");
         assert_eq!(
             token_path_for_sock(&inst.to_string_lossy()).expect("resolves"),
@@ -312,9 +288,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// F9 in one assertion: two explicit sockets in ONE directory resolve to
-    /// two different token files, so the second instance to start cannot
-    /// overwrite the first one's credential.
+    /// Two explicit sockets in one directory resolve to two different token
+    /// files, so the second instance cannot overwrite the first's credential.
     #[test]
     fn two_explicit_sockets_in_one_directory_never_share_a_token() {
         let dir = test_dir("pair");
@@ -330,9 +305,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The `latest` alias is resolved BEFORE the name rule, so a flagless
-    /// client reads the token of the instance the alias points AT — the
-    /// property that keeps `aterm.sock` working with no flags.
+    /// The `latest` alias is resolved before the name rule, so a flagless
+    /// client reads the token of the instance the alias points at.
     #[cfg(unix)]
     #[test]
     fn the_latest_alias_resolves_to_the_pointed_at_instance_token() {

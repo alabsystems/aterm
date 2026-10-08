@@ -5,38 +5,24 @@
 //! (the menu bar badges it) and, while the fabric is connected, one post to
 //! the manager's inbox.
 //!
-//! The attention text says what the person is asked, not merely that
-//! something waits (audit SUP-8 measured `claude needs approval: Bash
-//! command`): `<program> <kind>: <command, path or question, cut at 64
-//! cells> (<why no rule answered it>)` — `claude rm-breaker: S=$PWD/tmp; for
-//! p in a b; do set -- $p; rm -rf $S/$1; done (rm circuit breaker (newline
-//! reading): …)`, within the server's 200 bytes for a keyed entry — the
-//! reason cut with its closing `)` kept. A box that names no command,
-//! path or question is named by its OWN first row ([`prompt_box_first_row`],
-//! never a transcript row above it — main's round-25 fix, fed20fadf). Every
-//! part is on one line and cut by terminal cells, a wide character two
-//! ([`cut_cells`]). A limit keeps its own `limited: <message>` (the message
-//! names its reset).
+//! The attention text says what the person is asked: `<program> <kind>:
+//! <command, path or question, cut at 64 cells> (<why no rule answered it>)`,
+//! within the server's 200 bytes for a keyed entry, the reason cut with its
+//! closing `)` kept. A box with no command, path or question is named by its
+//! own first row ([`prompt_box_first_row`]). Every part is on one line and cut
+//! by terminal cells ([`cut_cells`]). A limit keeps `limited: <message>`.
 //!
-//! Mail goes only where it can land: `kind=ask` (a box, a question) and
-//! `kind=control` (a limit) are posted only while `status` says
-//! `fabric=connected` (owner decision 4: the badge and its notification are
-//! the human channel; with the fabric absent an `ask` is refused `no-bridge`
-//! and a `control` only queues). Anything else is journaled `mail=skipped: no
-//! fabric (fabric=<state>)`, never a posted `OK` that delivered nothing. An
-//! `ask` is posted `--wait=0` — the loop is single-threaded and a default
-//! `ask` waits up to 30 s for its record to land — and a reply that means
-//! QUEUED is journaled `mail=queued id=<n> (…)` ([`post_word`]).
+//! Mail (`kind=ask` for a box or question, `kind=control` for a limit) is
+//! posted only while `status` says `fabric=connected`; otherwise it is
+//! journaled `mail=skipped: no fabric (fabric=<state>)`. An `ask` is posted
+//! `--wait=0` (the loop is single-threaded), and a queued reply is journaled
+//! `mail=queued id=<n> (…)` ([`post_word`]).
 //!
-//! The attention is KEYED (lane C): this loop writes and clears only its own
-//! entry, `meta set attention owner=supervisor <text>` / `meta unset
-//! attention owner=supervisor` — never the bare form, which is the human's
-//! (owner `-`) — so a badge a person raised is never cleared by the loop,
-//! and the loop's is never hidden by theirs past its own unset. The KEY is
-//! the proof of ownership, never the text: the loop knows its entry's text
-//! ([`Session::attention_ours`]) only to tell a box's badge from a limit's,
-//! so a box closing does not clear the limit it sits over. A loop watching
-//! behind another supervisor's claim writes none.
+//! The attention is keyed: this loop writes and clears only its own entry
+//! (`meta set|unset attention owner=supervisor`), never the bare form, which
+//! is the human's. The key proves ownership; the text
+//! ([`Session::attention_ours`]) only tells a box's badge from a limit's. A
+//! loop watching behind another supervisor's claim writes none.
 
 use super::*;
 
@@ -69,16 +55,12 @@ fn trust_path(rows: &[String]) -> Option<&str> {
         .find(|r| !r.is_empty())
 }
 
-/// The question a dialog asks ABOVE the rows the box parser reads as the
-/// box: Claude Code's question tool draws its options, a rule, then `4. Chat
-/// about this` over the footer, and the box parser starts at that rule — so
-/// the badge quoted `4. Chat about this` (the live E2E of 2026-09-24, D7).
-/// The FALLBACK only, since aterm-phase reads the dialog whole
-/// ([`aterm_phase::QuestionDialog::question`], 2026-09-25): a question it
-/// did not read whole (form `Unknown`) is still named by this scan.
-/// The nearest row ending in `?` above `first`, over rules and option rows,
-/// stopping at the transcript: a `⏺` row or a user's `❯` row that is not an
-/// option's cursor.
+/// The question a dialog asks above the rows the box parser reads as the box
+/// (the parser starts at the rule over `4. Chat about this`). A fallback for a
+/// dialog aterm-phase did not read whole (form `Unknown`;
+/// [`aterm_phase::QuestionDialog::question`] otherwise): the nearest row ending
+/// in `?` above `first`, over rules and option rows, stopping at the
+/// transcript (a `⏺` row or a user's `❯` row that is not an option's cursor).
 fn question_above(rows: &[String], first: usize) -> Option<&str> {
     for r in rows[first.saturating_sub(30)..first].iter().rev() {
         let t = r.trim();
@@ -140,7 +122,7 @@ fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String)
         p.kind.name().to_string()
     };
     // A question dialog read whole names its question, the `│` gutter
-    // stripped and its rows joined (aterm-phase, 2026-09-25).
+    // stripped and its rows joined.
     let asked = (p.kind == PromptKind::Question)
         .then(|| aterm_phase::parse_prompt_v2(rows))
         .flatten()
@@ -154,7 +136,7 @@ fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String)
         p.description.clone()
     } else {
         // An unparsed box: its question row, the nearest row above the
-        // options that asks one, else the box's OWN first row — never a
+        // options that asks one, else the box's own first row — never a
         // transcript row above a headerless box ([`prompt_box_first_row`]).
         let first = prompt_box_first_row(rows);
         let footer = prompt_box_span(rows).map(|(_, b)| b);
@@ -221,15 +203,13 @@ pub(crate) fn point_label(reader: &dyn ScreenReader, point: &Turn) -> String {
 
 /// `<program> <kind>: <subject> (<reason>)` ([`point_label`]), the reason
 /// cut at 120 cells and then to what the label leaves of the server's
-/// [`ATTENTION_BYTES`] — `…` where it was cut and its `)` kept, so the whole
+/// [`ATTENTION_BYTES`], `…` where it was cut and its `)` kept, so the whole
 /// is always one entry the server takes.
 ///
 /// A resume line the reason names (`…, then resume with claude … --resume
-/// <id>`: the memory wall's) is never cut: it is kept whole, else in its
-/// bare form, else dropped with its clause
-/// ([`crate::harness::resume::never_cut`], resume-hint review 2026-09-26 —
-/// the cut left `--resume 5f1c2d3e-…-0a…` in the stored attention, an id
-/// that names no conversation).
+/// <id>`) is never cut: kept whole, else in its bare form, else dropped with
+/// its clause ([`crate::harness::resume::never_cut`]); a cut id names no
+/// conversation.
 pub(crate) fn attention_text(reader: &dyn ScreenReader, point: &Turn, reason: &str) -> String {
     let label = point_label(reader, point);
     crate::harness::resume::never_cut(reason, |reason| fit_reason(&label, reason))
@@ -281,25 +261,16 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The escalation: `meta set attention <text>` on the worker (cut to the
-    /// server's keyed cap, and cut again to the cap a `too long (max <n>
-    /// bytes)` refusal names, once — never a badge silently lost to a
-    /// length), the same text posted from the worker's session
-    /// as `kind=<kind>` to the manager's ([`Self::set_manager`]) — only while
-    /// the fabric is connected — and one journal line, `ESCALATED seq=<n>
-    /// attention=<reply> mail=<reply>`, with the server's first word for
-    /// each; a refusal is recorded, never the loop's end. The same episode
-    /// opened again (`again`: the seq of the escalation it keeps, [`Retry`])
-    /// sets the attention and posts nothing: `mail=skipped: the retry hit
-    /// the wall again, the episode of seq=<m>`; so does one adopted from a
-    /// previous watcher (`mail=skipped: adopted …`). With no manager, or the
-    /// fabric not connected: `mail=skipped: no --inbox and no
-    /// $ATERM_PARENT_SESSION_ID`, `mail=skipped: no fabric (fabric=<state>)`;
-    /// an ask whose fabric read reports the worker not reading its input:
-    /// [`stall::ASK_WITHHELD`] (`stall.rs`). An ask raises no badge at all
-    /// while a stall is in hand, and with no manager it reads `status` first
-    /// for that ([`Self::withhold_badge`]).
-    /// An `ask` is posted `--wait=0` and its reply journaled by
-    /// [`post_word`] (a queued post says `queued id=<n> (…)`).
+    /// server's keyed cap, and once more to the cap a `too long (max <n>
+    /// bytes)` refusal names), the same text posted as `kind=<kind>` to the
+    /// manager ([`Self::set_manager`]) while the fabric is connected, and one
+    /// journal line, `ESCALATED seq=<n> attention=<reply> mail=<reply>`. A
+    /// refusal is recorded, never the loop's end.
+    ///
+    /// The same episode opened again (`again`, [`Retry`]) or adopted from a
+    /// previous watcher sets the attention and posts nothing (`mail=skipped:
+    /// …`), as does a missing manager or fabric. While a stall is in hand an
+    /// ask raises no badge ([`Self::withhold_badge`], [`stall::ASK_WITHHELD`]).
     pub(super) fn escalate(
         &mut self,
         seq: u64,
@@ -343,10 +314,10 @@ impl<C: Ctl> Session<'_, C> {
                 "connected" => {
                     let to = format!("to={to}");
                     let kind_arg = format!("kind={kind}");
-                    // An `ask` WAITS by default — up to 30 s for its record to
-                    // land on the bus — and this loop is single-threaded: a
-                    // starting or stalled bridge held every look behind the
-                    // escalation (round-25 review). `--wait=0` returns at once;
+                    // An `ask` waits by default (up to 30 s for its record to
+                    // land on the bus) and this loop is single-threaded, so a
+                    // stalled bridge would hold every look behind the
+                    // escalation. `--wait=0` returns at once;
                     // the row is recorded before any wait, so the post is
                     // queued whatever the reply ([`post_word`]).
                     let mut args = vec!["post", to.as_str(), kind_arg.as_str()];
@@ -373,10 +344,15 @@ impl<C: Ctl> Session<'_, C> {
     /// `reason`, else the reason the approval policy gave for a box
     /// ([`Session::box_reason`]) — and one `kind=ask` posted to the manager
     /// ([`Self::escalate`]). It is called only where the loop hands a NEW
-    /// point over — the same point on a later look posts nothing again — so
-    /// the same box back after the worker worked (or after an outage) is a
-    /// new point, a new `EVENT prompt` AND a new ask (main's round-25 fix,
-    /// fed20fadf: deduping on the box's key alone left a cleared badge gone).
+    /// point over — a later look at the same point posts nothing: the box
+    /// redrawn, re-wrapped, its focus moved, its countdown ticking, the
+    /// transcript reflowed above it ([`Session::review_key`]; FIX 3, the
+    /// re-alert at seq 94641/95788 of 2026-09-25) — so the same box back
+    /// after the worker worked (or after an outage) is a new point, a new
+    /// `EVENT prompt` AND a new ask (main's round-25 fix, fed20fadf: deduping
+    /// on the box's key alone left a cleared badge gone), and so is another
+    /// box drawn over it with no read between (another command, another diff
+    /// on the same path).
     /// The one exception is the point a previous watcher's badge was
     /// ADOPTED for at the start ([`Self::reconcile`]): its first review
     /// posts nothing, the ask having gone already. The manager's own
@@ -386,11 +362,10 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn escalate_point(
         &mut self,
         point: &Turn,
-        allow: &[String],
         reason: Option<&str>,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        let key = review_key(point, allow);
+        let key = self.review_key(point);
         if std::mem::take(&mut self.adopted_box)
             && self.box_ask.as_ref().is_some_and(|b| b.key == key)
         {
@@ -410,17 +385,16 @@ impl<C: Ctl> Session<'_, C> {
         };
         let text = attention_text(self.reader(&point.screen.rows), point, &reason);
         self.escalate(point.screen.seq, &text, None, "ask", review)?;
-        self.box_ask = Some(BoxAsk { key });
+        self.box_ask = Some(BoxAsk { key, memory: false });
         Ok(())
     }
 
     /// This loop's own attention entry unset (`meta unset attention
     /// owner=supervisor`) when `ours` says its text is the kind being
     /// closed: the unset's reply word, `kept` when the entry holds another
-    /// kind (a box badge over a limit's: the box's close clears it), `none`
-    /// when the loop holds no entry. Another writer's entry is never
-    /// touched, whatever it says. `meta set attention ''` is a usage error
-    /// on the wire (measured), so the clear is `meta unset`.
+    /// kind (a box badge over a limit's), `none` when the loop holds no entry.
+    /// Another writer's entry is never touched. (`meta set attention ''` is a
+    /// usage error, so the clear is `meta unset`.)
     pub(super) fn unset_if_ours(&mut self, ours: fn(&str) -> bool) -> Result<String, Fail> {
         Ok(match self.attention_ours.as_deref() {
             Some(text) if ours(text) => {
@@ -436,8 +410,8 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// The escalated point has left the screen: its badge cleared IF IT IS
-    /// STILL OURS ([`Self::unset_if_ours`]) and journaled `CLEARED seq=<n>
+    /// The escalated point has left the screen: its badge cleared if it is
+    /// still ours ([`Self::unset_if_ours`]) and journaled `CLEARED seq=<n>
     /// box attention=<said>`.
     pub(super) fn close_box(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         self.adopted_box = false;
@@ -449,10 +423,9 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The episode is over: the attention cleared IF IT IS STILL OURS — a
-    /// `limited:` text; another writer may have raised its own badge over
-    /// ours while the episode was open, and that stays — and journaled as
-    /// `CLEARED seq=<n> attention=<said> <why>`, `seq` the read it closed on.
+    /// The episode is over: the `limited:` attention cleared if it is still
+    /// ours (another writer's badge stays) and journaled as `CLEARED seq=<n>
+    /// attention=<said> <why>`, `seq` the read it closed on.
     pub(super) fn close_episode(
         &mut self,
         seq: u64,
@@ -516,10 +489,9 @@ mod tests {
         );
     }
 
-    /// The live E2E's D2 (2026-09-24): an rm-breaker box's attention —
-    /// its command and the vendor's note as the reason — ran past the
-    /// server's 200 bytes for a keyed entry, the server refused it, and no
-    /// one was told. It fits now, its reason cut and closed.
+    /// An rm-breaker box's attention (its command and the vendor's note as the
+    /// reason) fits the server's 200 bytes for a keyed entry, its reason cut
+    /// and closed.
     #[test]
     fn an_rm_breaker_boxs_attention_fits_the_keyed_cap_and_stays_closed() {
         let rows: Vec<String> = include_str!("policy/fixtures/cap-rm.txt")
@@ -536,11 +508,10 @@ mod tests {
         assert!(t.starts_with("claude rm-breaker: "), "{t}");
     }
 
-    /// The live E2E's D7: Claude Code's question tool (AskUserQuestion) as
-    /// drawn — the question, its options, a rule, `4. Chat about this` and
-    /// the footer. The badge names the question, not `4. Chat about this`.
-    /// NEGATIVE CONTROL: a `?` row in the transcript above a user's message
-    /// is never taken.
+    /// Claude Code's question tool (AskUserQuestion) as drawn: the question,
+    /// its options, a rule, `4. Chat about this` and the footer. The badge
+    /// names the question, not `4. Chat about this`. Negative control: a `?`
+    /// row in the transcript above a user's message is never taken.
     #[test]
     fn a_question_dialogs_badge_names_its_question() {
         let rule = "─".repeat(120);
@@ -574,9 +545,8 @@ mod tests {
         assert!(!t.contains("Which one should I do?"), "{t}");
     }
 
-    /// A question aterm-phase reads whole is badged by its QUESTION, the
-    /// `│` gutter stripped (the incident's screen, S6-01): never a transcript
-    /// row, never `4. Chat about this`.
+    /// A question aterm-phase reads whole is badged by its question, the `│`
+    /// gutter stripped: never a transcript row, never `4. Chat about this`.
     #[test]
     fn a_question_read_whole_is_badged_by_its_question() {
         use aterm_phase::prompt::fixtures as f;
@@ -607,17 +577,14 @@ mod tests {
         assert!(t.contains('…'));
     }
 
-    /// THE MEMORY WALL'S ESCALATION NEVER CUTS ITS RESUME LINE (resume-hint
-    /// review, 2026-09-26). Built the way the loop builds it — the memory
-    /// reason with a long flag set, under a label whose subject takes its
-    /// 64 cells, and again behind a failed restart's `the restart could not
-    /// be made (<step>): ` prefix — the stored attention names the
-    /// conversation whole (flagged or bare) or names no command; every
-    /// `--resume` in it is followed by the whole id.
+    /// The memory wall's escalation never cuts its resume line. Built the way
+    /// the loop builds it (a long flag set, a 64-cell subject, and again
+    /// behind a failed restart's prefix), the stored attention names the
+    /// conversation whole or names no command; every `--resume` in it is
+    /// followed by the whole id.
     ///
-    /// NEGATIVE CONTROL: the same label and reason through the cutting
-    /// renderer alone ([`fit_reason`], the old `attention_text`) name the
-    /// command and cut its conversation away.
+    /// Negative control: the cutting renderer alone ([`fit_reason`]) names the
+    /// command and cuts its conversation away.
     #[test]
     fn the_memory_escalation_names_its_conversation_whole_or_not_at_all() {
         const ID: &str = "5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
@@ -671,8 +638,8 @@ mod tests {
             t.contains(&format!("then resume with claude --resume {ID}")),
             "{t}"
         );
-        // THE NEGATIVE CONTROL: the cutting renderer alone cuts the command
-        // — it is named, and its conversation is not.
+        // Negative control: the cutting renderer alone cuts the command; it
+        // is named, and its conversation is not.
         let label = point_label(CLAUDE, &point);
         let old = fit_reason(&label, &reason(&flagged));
         assert!(
@@ -690,10 +657,10 @@ mod tests {
         assert_eq!(status_field(st, "nope"), None);
     }
 
-    /// The 2026-09-24 incident box — the rm breaker's statically-unresolvable
-    /// form from a workflow subagent — is badged `rm-breaker`, like the
-    /// possibly-empty-variable form: the family, not one note's prefix.
-    /// Control: a plain Bash box is badged `bash`.
+    /// The rm breaker's statically-unresolvable form from a workflow subagent
+    /// is badged `rm-breaker`, like the possibly-empty-variable form: the
+    /// family, not one note's prefix. Control: a plain Bash box is badged
+    /// `bash`.
     #[test]
     fn every_rm_breaker_kind_is_badged_rm_breaker() {
         use aterm_phase::prompt::fixtures as f;

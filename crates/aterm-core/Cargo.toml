@@ -8,63 +8,54 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm — lean, headless VT terminal engine core"
+# Integration tests are declared at the end of this file, not discovered: every
+# tests/*.rs is a `mod` of a suite root or its own [[test]] with the hazard that
+# needs a process of its own. With autotests off a file listed nowhere never
+# compiles.
+autotests = false
 
 [features]
 default = ["disk-tier"]
-# Disk-backed scrollback cold tier, forwarded to aterm-grid AND aterm-scrollback
-# (aterm-core conditionally re-exports the latter's disk-tier types). DEFAULT-ON so
-# native builds are byte-identical; a wasm consumer disables it
-# (--no-default-features) to drop libc/zstd-sys.
+# Disk-backed scrollback cold tier, forwarded to aterm-grid and aterm-scrollback.
+# A wasm consumer disables it (--no-default-features) to drop libc/zstd-sys.
 disk-tier = ["aterm-grid/disk-tier", "aterm-scrollback/disk-tier"]
 # Serde on the CheckpointMeta seam (seamless-update screen carry): derives on the
 # checkpoint's scalar projections only — grid bodies stay on the binary Line codec.
 serde = ["dep:serde", "aterm-types/serde"]
-# Opt-in heavyweight stress/stability integration tests (tests/stress_stability.rs).
-# Off by default to keep CI fast: `cargo test -p aterm-core --features long-tests`.
+# Heavyweight stress/stability tests (tests/stress_stability.rs).
 long-tests = []
-# Opt-in deterministic fault injection (src/fault.rs): a thread-local registry so a
-# downstream/release test can force fail-closed branches (alloc/IO failure). OFF by
-# default — production `triggered()` is a const-false the optimizer folds away
-# (unit tests reach the registry via cfg(test) without this feature).
+# Deterministic fault injection (src/fault.rs) for downstream tests; without it
+# `triggered()` is a const false. Unit tests get the registry via cfg(test).
 fault-injection = []
-# Opt-in UAX #9 BiDi visual reordering bridge (terminal/bidi_reorder.rs). OFF by
-# default: with the feature off, `aterm-bidi` is not compiled into the engine and
-# the build is byte-identical. Consumers that render mixed LTR/RTL text enable it
-# to reach `Terminal::bidi_visual_order`. The render-time application of the
-# returned permutation is the renderer's job (the remaining integration step).
+# UAX #9 BiDi visual reordering (terminal/bidi_reorder.rs):
+# `Terminal::bidi_visual_order`. Applying the permutation is the renderer's job.
 bidi = ["dep:aterm-bidi"]
-# TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]`/`#[spec_unmodeled]`
-# anchors as part of the LIBRARY (not just the unit-test build) so a DOWNSTREAM test
-# binary — the relocated `spec_xref_closure` gate in aterm-gui's test build — can
-# COLLECT them via `inventory`. OFF by default: the production `cargo build` is
-# byte-identical (no `aterm-spec` in the closure, no `inventory` submissions). The
-# anchors stay `#[cfg_attr(any(test, feature = "spec-anchors"), …)]`, so aterm-core's
-# OWN unit-test build still expands them (Phase 0 unchanged) AND aterm-gui's gate
-# enables this feature to see them cross-crate.
+# Compile the `#[refines]`/`#[spec_unmodeled]` anchors into the library so
+# aterm-gui's `spec_xref_closure` test can collect them via `inventory`. Off in
+# production: no `aterm-spec` in the closure.
 spec-anchors = ["dep:aterm-spec"]
-# Sixel graphics: compile the `aterm-sixel` decoder into the engine and route a
-# decoded raster into the existing inline-image placement/blit path (the OSC 1337
-# `File=` path). OFF by default: production `cargo build` is byte-identical — no
-# `aterm-sixel`, sixel DCS stays consume-only, and DA1 does NOT advertise code 4.
-# Enabled by the GUI/app crate (and aterm-conformance) where rendering is wanted.
+# Sixel graphics: decode a sixel DCS into an inline image (the OSC 1337 `File=`
+# placement path) and advertise DA1 code 4. Without it sixel DCS is consumed and
+# dropped.
 sixel = ["dep:aterm-sixel"]
 
 [dependencies]
-aterm-error = { workspace = true }
-# Optional: pulled into the LIBRARY only by the off-by-default `spec-anchors`
-# feature (the anchor macros emit `::aterm_spec::inventory::submit!`). Still a
-# dev-dependency below for aterm-core's own test build (Phase 0 gate + conformance).
+# Library dependency only under `spec-anchors` (the anchors emit
+# `::aterm_spec::inventory::submit!`).
 aterm-spec = { workspace = true, optional = true }
 aterm-log = { workspace = true }
 aterm-hash = { workspace = true }
 aterm-codec = { workspace = true }
+# The one hardened PNG → RGBA8 decode (`aterm_png::decode_rgba8`): the engine
+# stores images as delivered, and decodes a PNG only to compose Kitty animation
+# frames, which composes pixels.
+aterm-png = { workspace = true }
 aterm-types = { workspace = true }
 serde = { workspace = true, optional = true }
 aterm-provenance = { workspace = true }
 aterm-grapheme = { workspace = true }
-# Path (not `workspace = true`) so we can set default-features = false here without
-# forcing it on every workspace consumer; disk-tier is re-enabled by default via this
-# crate's own default = ["disk-tier"], so the native closure is unchanged.
+# Path, not `workspace = true`, so default-features = false stays local; this
+# crate's `disk-tier` default re-enables it.
 aterm-grid = { path = "../aterm-grid", default-features = false, features = ["alacritty-compat"] }
 aterm-parser = { workspace = true }
 aterm-scrollback = { workspace = true }
@@ -73,34 +64,61 @@ aterm-vi = { workspace = true }
 aterm-selection = { workspace = true }
 aterm-search = { workspace = true }
 aterm-shell-integration = { workspace = true }
-# Internal clock seam: std::time on native (byte-identical), JS clock on wasm32 so
-# the engine's Instant/SystemTime reads don't panic "time not implemented".
+# Clock seam: std::time on native, the JS clock on wasm32 (where std's panics).
 aterm-time = { workspace = true }
-# Optional: UAX #9 BiDi reordering, pulled in only by the off-by-default `bidi`
-# feature. Not in the default production closure.
 aterm-bidi = { workspace = true, optional = true }
-# Optional: the sixel raster decoder, pulled into the LIBRARY only by the
-# off-by-default `sixel` feature (re-exported as `crate::sixel`). Also a
-# dev-dependency below so aterm-core's own `sixel`-gated proptests can build.
+# No self dev-dependency enables `sixel`: cargo cannot turn a dev-dependency's
+# feature off, so the default no-sixel engine would go untested. aterm-conformance
+# builds it and mounts tests/fuzz_process_never_panics/fresh.rs in its `vt` suite.
 aterm-sixel = { workspace = true, optional = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
 aterm-spec = { workspace = true }
-# Test-only: the `spec_xref_closure` gate (terminal/spec_xref_gate.rs) resolves
-# external `.tla` machine names against the ISOLATION-family specs in this crate
-# (TRUST_NATIVE_TLA §2.2 obligation 4). Test-only, so it stays out of the
-# production closure.
-aterm-spec-models = { workspace = true }
-# Test-only: expose aterm-grid's testing-gated facade items (ExtendedStyleInfo,
-# DamageRect, with_style_id, is_combining_mark, …) re-exported under
-# `#[cfg(any(test, feature = "testing"))]` in `grid/mod.rs`. Resolver 2
-# keeps this out of the production `cargo build`.
+# aterm-grid's testing-gated items (ExtendedStyleInfo, DamageRect,
+# is_combining_mark, …) that `grid/mod.rs` re-exports under cfg(test).
 aterm-grid = { path = "../aterm-grid", default-features = false, features = ["alacritty-compat", "testing"] }
-# Test-only: the scrollback corruption seam (`inject_corrupted_warm_block`) the
-# search index's dense-history conformance tests stage a corrupt tiered
-# segment with. Dev-only, so no product build carries it.
+# The scrollback corruption seam (`inject_corrupted_warm_block`) for the search
+# index's dense-history conformance tests.
 aterm-scrollback = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true
+
+# ---- integration tests (autotests = false above) ----------------------------
+
+[[test]]
+name = "core_suite"
+path = "tests/core_suite.rs"
+
+# The deterministic-LCG fuzzers (the crate's CPU long poles), as one binary,
+# kept off core_suite's clock.
+[[test]]
+name = "core_fuzz"
+path = "tests/core_fuzz.rs"
+
+# Alone: installs a #[global_allocator] and asserts process-wide byte counts.
+[[test]]
+name = "mem_budget"
+path = "tests/mem_budget.rs"
+
+# Alone: installs a #[global_allocator] and asserts process-wide allocation counts.
+[[test]]
+name = "perf_scaling"
+path = "tests/perf_scaling.rs"
+
+# Alone: installs a #[global_allocator] and counts allocations per thread.
+[[test]]
+name = "scoped_extract_alloc"
+path = "tests/scoped_extract_alloc.rs"
+
+# Alone: the scrollback share registry is process-global, and the exact
+# arithmetic needs this binary to own every share it sees.
+[[test]]
+name = "conformance_shared_budget"
+path = "tests/conformance_shared_budget.rs"
+
+# The long stress run, only under `long-tests`.
+[[test]]
+name = "stress_stability"
+path = "tests/stress_stability.rs"
+required-features = ["long-tests"]

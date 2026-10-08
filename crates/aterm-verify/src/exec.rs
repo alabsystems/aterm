@@ -3,21 +3,16 @@
 
 //! Running the stages' children.
 //!
-//! Every stage that shelled out still shells out — to the SAME program with the
-//! same arguments and the same environment. A [`Cmd`] is that invocation as a
-//! VALUE, which is the point: a test can assert the exact argv of the tippy stage
-//! without a Trust toolchain installed, and drift in a ported command is caught
-//! by a unit test instead of by a reviewer reading two files side by side.
+//! A [`Cmd`] is one invocation as a value, so a test can assert the exact argv
+//! of a stage (tippy's, say) without a Trust toolchain installed.
 //!
-//! Output is captured to a file that both stdout and stderr share (via
-//! `File::try_clone`, so the two streams interleave in the order the child wrote
-//! them — the faithful equivalent of the shell's `2>&1`). Capturing rather than
-//! streaming is what lets independent stages run concurrently while the ladder
-//! still prints in its declared order.
+//! Output is captured to one file shared by stdout and stderr (via
+//! `File::try_clone`, so the streams interleave in the order the child wrote
+//! them, like the shell's `2>&1`). Capturing lets independent stages run
+//! concurrently while the ladder prints in declared order.
 //!
-//! Every child also runs under a WALL-CLOCK CEILING ([`DEFAULT_CHILD_CEILING`]),
-//! because the one verdict this gate could not previously reach is "this never
-//! finished" — see that constant for the whole argument.
+//! Every child runs under a wall-clock ceiling ([`DEFAULT_CHILD_CEILING`]) so a
+//! hang ends the run red instead of silent.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -49,23 +44,24 @@ pub struct Cmd {
     /// `env VAR=… cmd` prefixes the script used.
     pub envs: Vec<(OsString, OsString)>,
     pub capture: Capture,
-    /// Spawn under UTILITY QoS rather than the gate's inherited tier — see
+    /// Spawn under utility QoS rather than the gate's inherited tier — see
     /// [`Cmd::demoted`] for which children may, and why the rest may not.
     pub demoted: bool,
     /// The directory the child starts in, in place of [`ExecEnv::cwd`] — a
     /// test binary replayed from cargo's own invocation starts where cargo
     /// started it, in its package's root ([`Cmd::replayed`]).
     pub cwd: Option<PathBuf>,
-    /// [`Cmd::envs`] is the child's WHOLE environment: nothing is inherited, and
+    /// [`Cmd::envs`] is the child's whole environment: nothing is inherited, and
     /// [`ExecEnv`]'s PATH, removals and additions are not applied, because the
     /// environment was recorded from a child that already had them
-    /// ([`Cmd::replayed`]).
+    /// ([`Cmd::replayed`]), or is a scratch one that must carry nothing of the
+    /// gate's ([`crate::first_exec`]).
     pub exact_env: bool,
     /// Text written at the head of the child's captured log before it starts
-    /// ([`Capture::Emit`] only), so a ceiling kill's diagnostic — which reads
-    /// that log — sees it too: cargo's `Running <target> (<path>)` header for a
-    /// test binary the gate runs itself, which is how the TIMEOUT block names
-    /// the binary and the test still running ([`crate::libtest::note`]).
+    /// ([`Capture::Emit`] only), so a ceiling kill's diagnostic, which reads that
+    /// log, sees it too: cargo's `Running <target> (<path>)` header for a test
+    /// binary the gate runs itself, from which the TIMEOUT block names the
+    /// binary and the test still running ([`crate::libtest::note`]).
     pub preamble: Option<String>,
     /// When the gate must end this child early — its ceiling fired, or the
     /// gate itself was interrupted — send its group `SIGTERM` first and give it
@@ -143,8 +139,9 @@ impl Cmd {
         self
     }
 
-    /// Run this child at UTILITY QoS (`taskpolicy -c utility`, where macOS has
+    /// Run this child at utility QoS (`taskpolicy -c utility`, where macOS has
     /// it), so a compile yields the CPU to the programs a person is typing into.
+    /// Utility, not background (`-b`): background also throttles disk I/O hard.
     ///
     /// WHY (2026-09-15). Every stage child used to start at the default band,
     /// the band the user's shell and its programs run in: a `trustc` and the
@@ -168,36 +165,29 @@ impl Cmd {
     /// times in 30. So the test run, the measuring tests (the paint and spin
     /// guards), the smokes, the drives and every other child that RUNS code keep
     /// the inherited tier. That is why this is opt-in per child, not a default.
+    ///
+    /// A RELEASE's MEASURE run keeps even these at the inherited tier
+    /// ([`CompileQos::Inherited`]): there the compile is the release's critical
+    /// path, and UTILITY let a peer's build starve it.
     #[must_use]
     pub fn demoted(mut self) -> Self {
         self.demoted = true;
         self
     }
 
-    /// End this child with `SIGTERM` and a `grace` before the `SIGKILL`
-    /// (2026-09-26), so a shell suite's `trap … EXIT` runs.
+    /// End this child with `SIGTERM` and a `grace` before the `SIGKILL`, so a
+    /// shell suite's `trap … EXIT` runs. Every stage child leads its own process
+    /// group, and both ways the gate ends one early (the ceiling,
+    /// [`kill_and_reap`]; an interrupted gate, [`group::kill_on_interrupt`])
+    /// signal that group; bash runs its EXIT trap on `SIGTERM` but never on
+    /// `SIGKILL`. Suites clean up scratch keychains, private instances' temp
+    /// trees and daemons that left the group only in that trap.
     ///
-    /// WHY. Every stage child leads a process group of its own, and both ways
-    /// the gate ends one early — the wall-clock ceiling ([`kill_and_reap`]) and
-    /// an interrupted gate ([`group::kill_on_interrupt`]) — sent that group
-    /// `SIGKILL`, which no process can catch. A shell suite cleans up in its
-    /// EXIT trap, and bash runs that trap on `SIGTERM` but never on `SIGKILL`
-    /// (measured under /bin/bash 3.2 and bash 5.3: a group `SIGTERM` leaves the
-    /// trap's marker, a group `SIGKILL` does not). So a killed suite left what
-    /// only its trap removes: `tools/test-dev-sign-id.sh` a scratch keychain in
-    /// the owner's real `~/Library/Keychains`, the live lanes their private
-    /// instance's temp tree, and `tools/test-codex-live-upgrade.sh` its
-    /// `/tmp/cxlive.*` tree plus the Codex app-server daemons and background
-    /// terminals that left the group on purpose and that only its pid-walking
-    /// cleanup finds.
-    ///
-    /// OPT-IN, like [`Cmd::demoted`]. A compile has no trap to run and a
-    /// `SIGTERM` would only delay its death, so the default stays the
-    /// immediate `SIGKILL`. The grace is a BOUND, not a wait: the gate moves on
-    /// as soon as the group has emptied, and a child still alive at its end is
-    /// `SIGKILL`ed as before, so a suite that ignores `SIGTERM` costs `grace`
-    /// and nothing more. An interrupted gate waits at most [`TERM_GRACE`],
-    /// whatever a child asked for.
+    /// Opt-in, like [`Cmd::demoted`]: a compile has no trap, so the default is
+    /// the immediate `SIGKILL`. The grace is a bound, not a wait: the gate moves
+    /// on once the group has emptied, and a child still alive at its end is
+    /// `SIGKILL`ed. An interrupted gate waits at most [`TERM_GRACE`], whatever a
+    /// child asked for.
     #[must_use]
     pub fn term_grace(mut self, grace: Duration) -> Self {
         self.term_grace = Some(grace);
@@ -213,51 +203,216 @@ impl Cmd {
     }
 }
 
-/// The invariant part of every invocation: cwd is the repo root (the script
-/// `cd`s there, and several stages pass root-relative manifest paths), PATH is
-/// the stage2-first one.
+/// The invariant part of every invocation: cwd is the repo root (several stages
+/// pass root-relative manifest paths), PATH is the stage2-first one.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecEnv<'a> {
     pub cwd: &'a Path,
     pub path: &'a OsStr,
     pub scratch: &'a Path,
-    /// The wall-clock ceiling on ONE child, or `None` for "wait forever" — the
-    /// behaviour every child had before [`DEFAULT_CHILD_CEILING`] existed.
-    /// Resolved once, from `--stage-timeout` ([`crate::Ctx::exec_env`]); carried
-    /// per invocation rather than read here so a stage's decision stays a
-    /// function of a value a test can construct.
+    /// The wall-clock ceiling on one child, or `None` to wait forever. Resolved
+    /// once from `--stage-timeout` ([`crate::Ctx::exec_env`]) and carried per
+    /// invocation, so a stage's decision is a function of a value a test can
+    /// construct.
     pub child_ceiling: Option<Duration>,
-    /// Variables REMOVED from every child's inherited environment before its
-    /// own [`Cmd::envs`] are applied — so a stage that names a variable
-    /// explicitly still wins. Every run removes `CARGO_TARGET_DIR`
-    /// ([`crate::CHILD_ENV_REMOVED`]): the lanes are the run's own directories,
-    /// and a caller's redirect would put every main-lane cargo child straight
-    /// back into the shared, contended target dir the snapshot exists to get
-    /// away from.
+    /// Variables removed from every child's inherited environment before its own
+    /// [`Cmd::envs`] are applied, so a stage that names a variable still wins.
+    /// Every run removes [`crate::CHILD_ENV_REMOVED`] (e.g. `CARGO_TARGET_DIR`,
+    /// since the lanes are the run's own directories).
     pub remove_env: &'a [&'a str],
-    /// Variables ADDED to every child, after [`Self::remove_env`] and BEFORE the
-    /// stage's own [`Cmd::envs`] — so a stage that names a variable still wins.
-    ///
-    /// This is where a fact the whole run must agree on lives, resolved ONCE on
-    /// the main thread instead of by each child for itself. Three of them today:
-    /// the pinned git stamp (`ATERM_BUILD_GIT_COMMIT` / `ATERM_BUILD_DEV_COMMITS`),
-    /// which stops `aterm-gui`'s build script watching a path in the shared
-    /// common git dir; `RUST_TEST_THREADS`, which the run must PIN rather
-    /// than inherit from whatever shell invoked it; and `CARGO_INCREMENTAL=0`
-    /// (2026-09-21), because the gate builds a commit once and the incremental
-    /// caches it never reused had grown one lane's target dir from 36 GB to
-    /// 55 GB and run the volume to `No space left on device`
-    /// ([`crate::Ctx::with_pinned_child_facts`]).
+    /// Variables added to every child, after [`Self::remove_env`] and before the
+    /// stage's own [`Cmd::envs`], so a stage that names a variable still wins.
+    /// Facts the whole run must agree on, resolved once on the main thread
+    /// ([`crate::CHILD_ENV`], [`crate::Ctx::with_pinned_child_facts`]): the git
+    /// stamp, `RUST_TEST_THREADS`, `TRUST_STAGE2_BIN`, `CARGO_INCREMENTAL=0`.
     pub add_env: &'a [(OsString, OsString)],
+    /// The tier a [`Cmd::demoted`] child runs at this run: UTILITY unless the
+    /// run is a release's MEASURE (`--compile-qos inherited`, [`CompileQos`]).
+    pub compile_qos: CompileQos,
 }
 
-/// THE ONE-MINUTE LOAD AVERAGE (2026-09-26): `/proc/loadavg` where it exists,
-/// else `sysctl -n vm.loadavg` (macOS prints `{ 1.23 2.34 3.45 }`). Read at
-/// each stage's start and end for its `time` line, its receipt `load` line and
-/// the verdict's under-load label ([`crate::ladder::StageLoad`]); `None` when
-/// neither answers, and then the line simply carries no load.
+/// The tier every [`Cmd::demoted`] (compile-only) child of ONE run gets.
+///
+/// `Utility` is every run's default, for the reason [`Cmd::demoted`] measured:
+/// a gate's compiles yield to the programs a person is typing into.
+///
+/// `Inherited` is a RELEASE's MEASURE run, and nothing else's (`--compile-qos
+/// inherited`, which `tools/release.sh` step 7 passes and the parser admits
+/// only with `--measure`). There the compile IS the release's critical path,
+/// and UTILITY hands it to whatever else the machine runs: 0.100.0's MEASURE
+/// (2026-09-29) built its fat-LTO artifact in 3943.6 s (`load 75.84 -> 53.53 on
+/// 18 cores`, its ladder's own line) while a peer's default-QoS build held the
+/// cores — the release's operator saw its compile at 2-4% of one core — and
+/// the step took 4858 s (the release's steps.tsv). The release already owns the
+/// machine's gate lock, so the peers it now competes with as an equal are
+/// builds, not a person's typing; the measured stages keep the inherited tier
+/// in every run, as before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompileQos {
+    #[default]
+    Utility,
+    Inherited,
+}
+
+impl CompileQos {
+    /// The tier a `--compile-qos` value names, `None` for anything else.
+    #[must_use]
+    pub fn parse(v: &str) -> Option<Self> {
+        match v {
+            "utility" => Some(CompileQos::Utility),
+            "inherited" => Some(CompileQos::Inherited),
+            _ => None,
+        }
+    }
+}
+
+/// The one-minute load average, in-process: `getloadavg(3)` (libSystem, glibc
+/// and musl all have it; macOS answers it from the same `vm.loadavg` sysctl the
+/// spawn below prints). Read at each stage's start and end for its `time` line,
+/// its receipt `load` line and the verdict's under-load label
+/// ([`crate::ladder::StageLoad`]); `None` when neither this nor the spawn
+/// answers.
+///
+/// It is a call, not a child, because the ladder asks twice per planned stage,
+/// before it decides whether the stage runs at all: a Fast plan is 22 stages,
+/// so a ladder that ran nothing still spawned `sysctl` 44 times (measured:
+/// 88 spawns for the two lean runs of one `environment_contract` test), each a
+/// fork and an exec on a machine whose load is the very thing being read. A
+/// reading that is not a finite non-negative number is as good as no answer.
 #[must_use]
 pub fn load_average() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        if let Some(load) = getloadavg_one() {
+            return Some(load);
+        }
+    }
+    load_average_by_file_or_spawn()
+}
+
+/// How many cores were busy since the last reading (or over a quarter second,
+/// when there is none from the last ten): the test pool's admission reading
+/// ([`crate::Ctx::test_load`], [`crate::testrun::Limits::may_start`]).
+///
+/// WHY NOT THE LOAD AVERAGE (2026-10-05): the one-minute load is an average
+/// that trails a burst by a minute. A warm gate's test run held two binaries
+/// at a time while the load read 14-18 on 14 cores, though its binaries spent
+/// 1,407 CPU-s in 264 s (5.3 cores) beside one other stage: their walls summed
+/// to 691 s, so the pool averaged 2.6 of its 8 and the cores it was protecting
+/// sat idle after each burst. Busy time over the last second answers what the
+/// pool asks — is a core free now — within a sample.
+///
+/// macOS: `host_statistics(HOST_CPU_LOAD_INFO)`; Linux: `/proc/stat`'s first
+/// line (iowait counts as idle). `None` elsewhere, or when the counters cannot
+/// be read, and the caller falls back to [`load_average`].
+#[must_use]
+pub fn busy_cores() -> Option<f64> {
+    static LAST: std::sync::Mutex<Option<(Instant, u64, u64)>> = std::sync::Mutex::new(None);
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (then, busy0, total0) = match *last {
+        Some(prev) if prev.0.elapsed() < Duration::from_secs(10) => prev,
+        _ => {
+            let (busy, total) = cpu_ticks()?;
+            std::thread::sleep(Duration::from_millis(250));
+            (Instant::now(), busy, total)
+        }
+    };
+    let (busy1, total1) = cpu_ticks()?;
+    let (busy, total) = (busy1.wrapping_sub(busy0), total1.wrapping_sub(total0));
+    if total == 0 {
+        // No tick since the last reading. A caller asking again within one is
+        // answered nothing, and macOS hands a process that asks many times a
+        // second its cached figures (measured 2026-10-05: five readers at once
+        // saw one total for half a second while the counters moved every
+        // 2.5 ms), so it is never asked again here: the pool reads once a
+        // second and falls back to the load average for this sample.
+        *last = Some((then, busy0, total0));
+        return None;
+    }
+    *last = Some((Instant::now(), busy1, total1));
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    #[expect(clippy::cast_precision_loss, reason = "tick counts far below 2^52")]
+    Some(busy as f64 / total as f64 * cores as f64)
+}
+
+/// Cumulative (busy, total) CPU ticks over every core ([`busy_cores`]).
+#[cfg(target_os = "macos")]
+fn cpu_ticks() -> Option<(u64, u64)> {
+    unsafe extern "C" {
+        /// `<mach/mach_init.h>`: this task's send right to its host port.
+        fn mach_host_self() -> u32;
+        /// `<mach/mach_host.h>`; `host_info_t` is `integer_t *`.
+        fn host_statistics(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+    }
+    /// `HOST_CPU_LOAD_INFO` and its `natural_t cpu_ticks[CPU_STATE_MAX]`:
+    /// user, system, idle, nice.
+    const HOST_CPU_LOAD_INFO: i32 = 3;
+    static HOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: no arguments; it returns a port name this task keeps.
+    let host = *HOST.get_or_init(|| unsafe { mach_host_self() });
+    let mut ticks = [0_i32; 4];
+    let mut count: u32 = 4;
+    // SAFETY: `ticks` is four writable `integer_t`s and `count` says so; the
+    // kernel writes at most `count` of them.
+    let kr =
+        unsafe { host_statistics(host, HOST_CPU_LOAD_INFO, ticks.as_mut_ptr(), &raw mut count) };
+    if kr != 0 || count != 4 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "natural_t counters handed back as integer_t"
+    )]
+    let [user, system, idle, nice] = ticks.map(|t| u64::from(t as u32));
+    let busy = user + system + nice;
+    Some((busy, busy + idle))
+}
+
+/// Cumulative (busy, total) CPU ticks over every core ([`busy_cores`]).
+#[cfg(target_os = "linux")]
+fn cpu_ticks() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().next()?.strip_prefix("cpu ")?;
+    let v: Vec<u64> = line
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let total: u64 = v.iter().sum();
+    let idle = v.get(3)? + v.get(4).copied().unwrap_or(0);
+    Some((total - idle, total))
+}
+
+/// Cumulative (busy, total) CPU ticks over every core ([`busy_cores`]).
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn cpu_ticks() -> Option<(u64, u64)> {
+    None
+}
+
+/// `getloadavg(3)` for the one-minute figure; `None` where it cannot say (it
+/// returns -1, or fewer samples than asked, when the host has no load average to
+/// give) or says something that is not a load.
+#[cfg(unix)]
+fn getloadavg_one() -> Option<f64> {
+    unsafe extern "C" {
+        /// `<stdlib.h>`; declared here because this crate has no dependencies
+        /// ([`group`] declares its libc symbols the same way). `int` is `i32`
+        /// on every target this gate runs on.
+        fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+    }
+    let mut load = [0f64; 1];
+    // SAFETY: `load` is a live, writable array of one double, and `getloadavg`
+    // writes at most the count it is given.
+    let n = unsafe { getloadavg(load.as_mut_ptr(), 1) };
+    (n >= 1 && load[0].is_finite() && load[0] >= 0.0).then_some(load[0])
+}
+
+/// The older reading, kept for a host whose `getloadavg` fails and for a host
+/// without one: `/proc/loadavg` where it exists, else `sysctl -n vm.loadavg`
+/// (macOS prints `{ 1.23 2.34 3.45 }`).
+fn load_average_by_file_or_spawn() -> Option<f64> {
     let text = std::fs::read_to_string("/proc/loadavg").ok().or_else(|| {
         let out = Command::new("/usr/sbin/sysctl")
             .args(["-n", "vm.loadavg"])
@@ -280,15 +435,129 @@ pub fn parse_load_average(text: &str) -> Option<f64> {
         .and_then(|t| t.parse().ok())
 }
 
+/// The host's physical memory in bytes, read once per run for
+/// [`crate::plan::measure_overlap`], and whether it is Linux's `MemTotal`
+/// (a few percent under the installed RAM); `None` when the host will not say.
+///
+/// The same two sources `tools/trust-gate-all.sh` reads for the trust lane's
+/// `HOST:` figure: Linux's `MemTotal` from `/proc/meminfo`, else `sysctl -n
+/// hw.memsize` (macOS: the RAM the machine was sold with). Read here and not
+/// through `aterm_sysprobe::physical_memory_mib` because this crate takes no
+/// dependency on any aterm crate (its `Cargo.toml` says why).
+#[must_use]
+pub fn host_memory_bytes() -> Option<(u64, bool)> {
+    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        return parse_meminfo_total(&text).map(|b| (b, true));
+    }
+    let out = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&b: &u64| b > 0)
+        .map(|b| (b, false))
+}
+
+/// The memory this host can GIVE builds now, in bytes, read once per run beside
+/// [`host_memory_bytes`] and held under its `physical` figure: Linux's
+/// `MemAvailable`; on macOS the physical memory less what the kernel holds
+/// wired, which no build can page out. `None` when the host will not say.
+///
+/// WHY (measured 2026-10-06, the 8 GiB Mac): the kernel held 228,350 wired
+/// 16 KiB pages (3.5 GiB) with nothing building — a degraded state a reboot
+/// clears — and three workspace builds sized for 8 GiB thrashed for 3 h 25 min
+/// without finishing the test compile ([`crate::plan::land_builds`]).
+#[must_use]
+pub fn host_usable_bytes(physical: u64) -> Option<u64> {
+    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        return parse_meminfo(&text, "MemAvailable:").map(|b| b.min(physical));
+    }
+    host_wired_bytes().map(|wired| physical.saturating_sub(wired))
+}
+
+/// The memory the kernel holds wired, in bytes: `host_statistics64`'s
+/// `wire_count` times the host page size — `vm_stat`'s "Pages wired down".
+#[cfg(target_os = "macos")]
+fn host_wired_bytes() -> Option<u64> {
+    unsafe extern "C" {
+        /// `<mach/mach_init.h>`: this task's send right to its host port.
+        fn mach_host_self() -> u32;
+        /// `<mach/mach_host.h>`; `host_info64_t` is `integer_t *`.
+        fn host_statistics64(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+        /// `<mach/mach_host.h>`; `vm_size_t` is `uintptr_t`.
+        fn host_page_size(host: u32, size: *mut usize) -> i32;
+    }
+    /// `HOST_VM_INFO64` and `HOST_VM_INFO64_COUNT`: `vm_statistics64` is 152
+    /// bytes, 38 `integer_t`s, and `wire_count` is its fourth `natural_t`.
+    const HOST_VM_INFO64: i32 = 4;
+    const COUNT: u32 = 38;
+    // SAFETY: no arguments; it returns a port name this task keeps.
+    let host = unsafe { mach_host_self() };
+    let mut page: usize = 0;
+    // SAFETY: `page` is one writable `vm_size_t`.
+    if unsafe { host_page_size(host, &raw mut page) } != 0 || page == 0 {
+        return None;
+    }
+    let mut info = [0_i32; COUNT as usize];
+    let mut count = COUNT;
+    // SAFETY: `info` is `COUNT` writable `integer_t`s and `count` says so; the
+    // kernel writes at most `count` of them.
+    let kr = unsafe { host_statistics64(host, HOST_VM_INFO64, info.as_mut_ptr(), &raw mut count) };
+    if kr != 0 || count < 4 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "a natural_t counter handed back as integer_t"
+    )]
+    let wired = u64::from(info[3] as u32);
+    Some(wired.saturating_mul(u64::try_from(page).ok()?))
+}
+
+/// The memory the kernel holds wired: unread off macOS (Linux answers
+/// `MemAvailable` instead, [`host_usable_bytes`]).
+#[cfg(not(target_os = "macos"))]
+fn host_wired_bytes() -> Option<u64> {
+    None
+}
+
+/// `MemTotal:  16303612 kB` from `/proc/meminfo`, in bytes.
+#[must_use]
+pub fn parse_meminfo_total(text: &str) -> Option<u64> {
+    parse_meminfo(text, "MemTotal:")
+}
+
+/// One `<key>  <n> kB` row of `/proc/meminfo`, in bytes; `None` when it is
+/// absent, unreadable or zero.
+#[must_use]
+pub fn parse_meminfo(text: &str, key: &str) -> Option<u64> {
+    let kib: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix(key))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    (kib > 0).then(|| kib.saturating_mul(1024))
+}
+
 /// What a child did.
 #[derive(Clone, Debug)]
 pub struct Run {
     /// True only on exit status 0 — a signal death is a failure, as in the shell.
     pub ok: bool,
     pub output: String,
-    /// The exit code, for the stages whose child says MORE than pass/fail — the
-    /// redraw gate answers `2` for "could not run here", which must not read as
-    /// either. `None` for a signal death or a child that never spawned.
+    /// The exit code, for the stages whose child says more than pass/fail (the
+    /// redraw gate's `2` is "could not run here"). `None` for a signal death or
+    /// a child that never spawned.
     pub code: Option<i32>,
     /// Set when the child could not be spawned at all (tool vanished mid-run).
     pub spawn_error: Option<String>,
@@ -304,34 +573,20 @@ impl Run {
         self.output.trim_end_matches('\n')
     }
 
-    /// Why this child is NOT a finding about the tree: `Some(reason)` when it
-    /// never spawned ([`Run::spawn_error`]) or when it ran out of disk — its
-    /// output carries [`ENOSPC_SENTENCE`]. `None` for a child that ran and
-    /// answered, pass or fail, including one that only PRINTED the sentence on
-    /// its way to passing.
+    /// Why this child is not a finding about the tree: `Some(reason)` when it
+    /// never spawned ([`Run::spawn_error`]), when its output carries
+    /// [`ENOSPC_SENTENCE`] (it ran out of disk), or when every failed test says
+    /// the machine refused it ([`crate::libtest::COULD_NOT_RUN_SENTINEL`], e.g.
+    /// aterm-link's stray-daemon guard or a starved paint take; one failure
+    /// without it keeps the child a finding,
+    /// [`crate::libtest::environment_refusals`]). `None` for a child that ran and
+    /// answered, pass or fail. [`crate::ladder::Report::fail_child`] asks this
+    /// first.
     ///
-    /// MEASURED 2026-09-20, the two contract runs that died on a full volume:
-    /// `aterm-verify: cannot run …/targo: No space left on device (os error 28)`
-    /// (a stage log that could not be created, so a spawn failure) and, inside
-    /// a build child, `error: failed to write …/target/debug/deps/…/lib.rmeta:
-    /// No space left on device (os error 28)`. Both were recorded as `FAIL`
-    /// rows of a FINDING's severity, so a run that had reached its verdict
-    /// would have written `verdict FAIL` into the receipt of a tree nobody
-    /// judged. [`crate::ladder::Report::fail_child`] asks this first.
-    ///
-    /// The sentence is matched anywhere in the output, so a FAILING test that
-    /// prints it for its own reasons is misread as an environment failure —
-    /// COULD NOT RUN instead of FAIL, both red, neither the merge contract; the
-    /// cost is a severity, never a green. A passing child is never asked.
-    ///
-    /// THE THIRD SHAPE (2026-09-23): a `targo test` child whose every failed
-    /// test says the MACHINE refused it — [`crate::libtest::COULD_NOT_RUN_SENTINEL`],
-    /// printed by aterm-link's stray-daemon guard and by a starved paint take.
-    /// 4 of the 13 red full ladders on m3 between 2026-09-18 and 09-22 held no
-    /// finding about the tree at all (the stray guard firing on a leftover
-    /// `aterm-gui --headless` was one shape), and each wrote `verdict FAIL`.
-    /// One failure without the sentinel keeps the whole child a finding
-    /// ([`crate::libtest::environment_refusals`]).
+    /// The disk sentence is matched anywhere in the output, so a failing test
+    /// that prints it for its own reasons reads as COULD NOT RUN instead of FAIL:
+    /// both red, the cost is a severity, never a green. A passing child is never
+    /// asked.
     #[must_use]
     pub fn environment_failure(&self) -> Option<String> {
         if self.ok {
@@ -361,100 +616,25 @@ impl Run {
     }
 }
 
-/// The default wall-clock ceiling on ONE stage child.
+/// The default wall-clock ceiling on one stage child: 3 hours.
 ///
-/// WHY A CEILING AT ALL. This gate's whole vocabulary — `ok`, `FAIL`, `skip` — is
-/// decisions, and it had no way to spell the one failure that matters most to an
-/// unattended run: *the child never came back*. `finish` below waited on
-/// `Command::status()` with no deadline and [`crate::sched`] has no global one,
-/// so a deadlocked stage did not turn `tools/verify.sh --fast` red. It turned it
-/// SILENT — the ladder printed the rungs above the hang and then stopped, which
-/// to a developer who stepped away is indistinguishable from a slow build. THE
-/// MERGE GATE CANNOT GO RED ON A HANG; IT JUST HANGS.
+/// Without a ceiling a deadlocked stage does not turn the gate red, it makes it
+/// silent. The ceiling only tells wedged from slow, so it sits far above the
+/// slowest honest child (a cold full-workspace build or `--no-fail-fast` test
+/// run on a loaded machine): a false kill turns a true green into a false red
+/// and costs a full re-run. It catches a child that never exits; it is not a
+/// performance budget and must not be tuned like one.
 ///
-/// That is not a hypothetical class. The v0.65.0 self-recursive `OnceLock` was
-/// exactly it (an initializer that re-entered itself and blocked forever), and
-/// the regression test pinning it reproduces the defect BY HANGING — so the
-/// tree's own guard against that bug, run through this gate, produced no verdict
-/// at all.
-///
-/// The repo already owns the right backstop and points it elsewhere.
-/// `.config/nextest.toml` kills a test at 180 s wall (`slow-timeout` 60 s,
-/// `terminate-after` 3), and its own body says why that does not help here:
-/// "`tools/verify.sh` still drives stock `cargo test` (its scoping and doctest
-/// stages depend on it)", and stock `cargo test` has no per-test timeout. This
-/// is that backstop for the verify.sh path, one level up — per stage CHILD
-/// rather than per test, because the child is the only thing this crate spawned
-/// and therefore the only thing it can honestly account for.
-///
-/// WHY 45 MINUTES, AND NOT LESS. The ceiling's only job is to tell "wedged" from
-/// "slow", so it must sit far above the slowest HONEST child; a ceiling that
-/// kills real work converts a true green into a false red, which is strictly
-/// worse than the hang it was meant to catch. The measured shape of honest work
-/// in this tree:
-///
-///  * `tools/paint_guard.sh` — 720 s in the pathological run recorded in
-///    docs/RELEASE-PROOF-DISCIPLINE.md, harness-defect item 5 (a four-row
-///    matrix stuck at 4 x its own 180 s budget, before the orphaned-watchdog
-///    defect was fixed); 242 s for the paint matrix as it stands today.
-///  * The ay full-domain SimHash obligation behind `--full`: 129.8 s, with
-///    drafting probes measured at 76 s on other encodings
-///    (docs/sparkle-words-v2-design.md:1748).
-///  * The real ceiling-setter is none of those: it is a COLD full-workspace
-///    `targo build` / `targo test` on the Trust stage2 — a verified-by-default
-///    compiler over ~100 crates — which is a tens-of-minutes child on a loaded
-///    machine, and the `--full` Kani floor spawns three model-checking children
-///    besides.
-///
-/// RAISED 45 min -> 90 min on 2026-09-11, and the PREMISE moved rather than the
-/// tolerance. `--no-fail-fast` landed on every test argv the ladder builds that
-/// day, because `targo test --workspace` stops scheduling at the FIRST failing
-/// binary and three consecutive release gates had therefore reported on 41 of
-/// ~319 test binaries while reading like a statement about all of them. The
-/// stage now runs every binary by design, so "the worst honest child" is a
-/// different child.
-///
-/// MEASURED, not guessed. The first run under the new argv hit the 45-minute
-/// ceiling and was killed. That kill was NOT evidence the stage had outgrown
-/// the ceiling: sixty leaked `while :; do :; done` shells were eating roughly
-/// seventeen cores at the time, and they had been for 27 h 50 m, so every "the
-/// box is loaded" judgement made that day was reasoning from a number nobody
-/// had asked the cause of. On an IDLE machine, with the same argv, the stage
-/// measured ~60 min and the whole ladder 96 min across 402 green stages.
-///
-/// RAISED AGAIN, 90 min -> 3 h, hours later the same night, because 90 min was
-/// set from ONE sample and then tripped by the next run. Measured: the same
-/// stage on the same idle machine took ~60 min once and OVER 90 min the next
-/// time. Two samples an order of magnitude apart in margin is a distribution,
-/// not a number, and 1.5 x the only sample I had was a bound on my own
-/// confidence dressed up as a fact about the workload — the exact move this
-/// file's own history spends three paragraphs warning about.
-///
-/// WHAT THIS CEILING IS FOR, restated because getting it wrong twice in one
-/// night came from forgetting it: it catches a child that NEVER EXITS. It is
-/// not a performance budget and it may not be tuned like one. A false kill
-/// costs a full re-run of a 90-minute ladder and — worse — teaches whoever
-/// hits it to raise the number reflexively, which is how a backstop becomes a
-/// formality. Late detection of a real wedge costs one night. So the factor
-/// belongs on the generous side of the honest worst, and 3 h is ~2 x a
-/// measured worst that has already surprised me once.
-///
-/// A deadlock does not get faster with patience; honest work does finish.
-///
-/// WHAT THE KILL REACHES (2026-09-23). Every stage child leads a process group
-/// of its own ([`group`]), and the ceiling sends `SIGKILL` to that whole group:
-/// the `trustc`s a `targo` forked and the aterms a test harness launched go
-/// with it. Until then the kill reached the DIRECT child only, and those
-/// grandchildren kept running — holding sockets and CPU, and tripping the next
-/// run's stray-daemon guard. What still escapes is a process that left the
-/// group on purpose (one that started its own session, as a PTY-hosted shell
-/// does), and the diagnostic says so where an operator will read it.
+/// The kill reaches the child's whole process group ([`group`]): the `trustc`s
+/// a `targo` forked and the aterms a test harness launched go with it. What
+/// escapes is a process that left the group on purpose (e.g. one that started
+/// its own session), and the diagnostic says so.
 pub const DEFAULT_CHILD_CEILING: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// The `SIGTERM` grace the stage suites ask for ([`Cmd::term_grace`]), and the
 /// longest an interrupted gate waits for any group it sent `SIGTERM` before it
-/// `SIGKILL`s the rest and dies. A bound on the slowest cleanup, never a
-/// sleep: the gate stops waiting the moment every such group has exited.
+/// `SIGKILL`s the rest and dies. A bound, not a sleep: the gate stops waiting
+/// once every such group has exited.
 pub const TERM_GRACE: Duration = Duration::from_secs(10);
 
 /// Anything past a century is not a number of seconds anyone meant, and
@@ -462,15 +642,11 @@ pub const TERM_GRACE: Duration = Duration::from_secs(10);
 const MAX_CEILING_SECS: f64 = 3_153_600_000.0;
 
 /// Parse a `--stage-timeout` value: `Some(Some(d))` moves
-/// [`DEFAULT_CHILD_CEILING`] to `d` (seconds, fractional accepted),
-/// `Some(None)` removes it (`0`, `off`, `none`, `never`) and restores the
-/// unbounded wait, and `None` is a value this cannot read — which the command
-/// line refuses as a usage error. Pure, so every branch is a unit test.
-///
-/// The direction of failure is fixed the way [`crate::changed`] fixes it:
-/// removing the only backstop against a silent gate has to be something an
-/// operator TYPED — `--stage-timeout off` — never something they achieved by
-/// fat-fingering `45m` into a field that wants seconds.
+/// [`DEFAULT_CHILD_CEILING`] to `d` (seconds, fractional accepted), `Some(None)`
+/// removes it (`0`, `off`, `none`, `never`), and `None` is a value this cannot
+/// read, which the command line refuses as a usage error. Removing the ceiling
+/// must be typed (`--stage-timeout off`), never reached by typing `45m` into a
+/// field that wants seconds.
 #[must_use]
 pub fn parse_ceiling(text: &str) -> Option<Option<Duration>> {
     let text = text.trim();
@@ -482,9 +658,8 @@ pub fn parse_ceiling(text: &str) -> Option<Option<Duration>> {
         return Some(None);
     }
     match text.parse::<f64>() {
-        // `is_finite` first, so a NaN never reaches the range test — a NaN
-        // compares false against everything, which would land it in the refused
-        // arm anyway, but only by accident.
+        // `is_finite` first, so a NaN never reaches the range test (it would
+        // land in the refused arm anyway, but only by accident).
         Ok(v) if v.is_finite() && (0.0..=MAX_CEILING_SECS).contains(&v) => {
             // `0.0` (and `0.000`) mean what the bare `0` above means.
             Some((v > 0.0).then(|| Duration::from_secs_f64(v)))
@@ -505,6 +680,15 @@ pub const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 /// reaches its own fail-closed branch.
 #[must_use]
 pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
+    run_measured(cmd, env).0
+}
+
+/// [`run`], and the CPU the child spent: user plus system time of the child and
+/// of every descendant it reaped itself, as `wait4(2)` reports it ([`reap`]).
+/// `None` when the child was never reaped normally (unspawnable, killed at the
+/// ceiling) or off Unix.
+#[must_use]
+pub fn run_measured(cmd: &Cmd, env: ExecEnv<'_>) -> (Run, Option<Duration>) {
     let mut c = spawn_command(cmd, env, Path::new(TASKPOLICY));
     c.current_dir(cmd.cwd.as_deref().unwrap_or(env.cwd));
     if cmd.exact_env {
@@ -525,17 +709,19 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
     match &cmd.capture {
         Capture::Silent => {
             c.stdout(Stdio::null()).stderr(Stdio::null());
-            finish(c, cmd, env.child_ceiling, None).0
+            let (r, _, cpu) = finish(c, cmd, env.child_ceiling, None);
+            (r, cpu)
         }
         Capture::Append(path) => match open_append(path) {
             Ok(f) => match f.try_clone() {
                 Ok(f2) => {
                     c.stdout(f).stderr(f2);
-                    finish(c, cmd, env.child_ceiling, None).0
+                    let (r, _, cpu) = finish(c, cmd, env.child_ceiling, None);
+                    (r, cpu)
                 }
-                Err(e) => spawn_failure(cmd, &e.to_string()),
+                Err(e) => (spawn_failure(cmd, &e.to_string()), None),
             },
-            Err(e) => spawn_failure(cmd, &e.to_string()),
+            Err(e) => (spawn_failure(cmd, &e.to_string()), None),
         },
         Capture::Emit => {
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -544,54 +730,51 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
                 .join(format!("stage.{}.{seq}.log", std::process::id()));
             let mut file = match File::create(&log) {
                 Ok(f) => f,
-                Err(e) => return spawn_failure(cmd, &e.to_string()),
+                Err(e) => return (spawn_failure(cmd, &e.to_string()), None),
             };
             if let Some(text) = &cmd.preamble
                 && let Err(e) = file.write_all(text.as_bytes())
             {
-                return spawn_failure(cmd, &e.to_string());
+                return (spawn_failure(cmd, &e.to_string()), None);
             }
             let file2 = match file.try_clone() {
                 Ok(f) => f,
-                Err(e) => return spawn_failure(cmd, &e.to_string()),
+                Err(e) => return (spawn_failure(cmd, &e.to_string()), None),
             };
             c.stdout(file).stderr(file2);
-            let (mut r, logged) = finish(c, cmd, env.child_ceiling, Some(&log));
+            let (mut r, logged, cpu) = finish(c, cmd, env.child_ceiling, Some(&log));
             // `finish` leaves `output` empty except for a ceiling diagnostic, so
-            // the child's own bytes go IN FRONT of it rather than over it: a
-            // timed-out stage must still show how far it got, and the last line
-            // the child managed to write is usually the whole diagnosis. Those
-            // bytes are `finish`'s single read of the log, which is also what the
-            // ceiling diagnostic's note was computed from.
+            // the child's own bytes go in front of it: a timed-out stage still
+            // shows how far it got. These are `finish`'s single read of the log,
+            // which the diagnostic's note was computed from too.
             r.output
                 .insert_str(0, logged.as_deref().unwrap_or_default());
             std::fs::remove_file(&log).ok();
-            r
+            (r, cpu)
         }
     }
 }
 
 /// The `Command` for `cmd` before its cwd and environment are applied: the
-/// program itself or, for a [`Cmd::demoted`] child, the program behind
+/// program itself or, for a [`Cmd::demoted`] child of a run whose
+/// [`ExecEnv::compile_qos`] is [`CompileQos::Utility`], the program behind
 /// `taskpolicy -c utility`.
 ///
-/// Wrapped only when both are real: `taskpolicy` exists and the program
-/// resolves to an executable. If the program is missing, `taskpolicy` exits 66
-/// on its own ("taskpolicy: posix_spawn: No such file or directory", measured).
-/// The gate would see an ordinary nonzero exit instead of a [`Run::spawn_error`],
-/// losing the fact that the tool could not run. So an unresolvable program is
-/// spawned bare and fails exactly as it always did.
+/// Wrapped only when `taskpolicy` exists and the program resolves to an
+/// executable: for a missing program `taskpolicy` exits 66 itself, which would
+/// hide the [`Run::spawn_error`]. `taskpolicy` execs the program rather than
+/// parenting it, so the pid [`over_ceiling`] kills is the tool's own; the timing
+/// rows and the diagnostic name `cmd`'s argv, never the wrapper.
 ///
-/// `taskpolicy` replaces itself with the program rather than parenting it
-/// (measured: the program's parent is the process that ran `taskpolicy`), so the
-/// pid [`over_ceiling`] kills is the tool's own. The timing rows and the ceiling
-/// diagnostic name `cmd`'s argv, so neither ever mentions the wrapper.
-///
-/// The child LEADS A PROCESS GROUP OF ITS OWN ([`group`]) and reads no stdin:
-/// a process in a background group that reads the terminal is stopped by
-/// `SIGTTIN`, which would be a hang, and no stage child reads stdin anyway.
+/// The child leads its own process group ([`group`]) and reads no stdin: a
+/// background-group process that reads the terminal is stopped by `SIGTTIN`,
+/// which would be a hang.
 fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
-    let mut c = if cmd.demoted && crate::is_executable_file(taskpolicy) && resolves(cmd, env) {
+    let mut c = if cmd.demoted
+        && env.compile_qos == CompileQos::Utility
+        && crate::is_executable_file(taskpolicy)
+        && resolves(cmd, env)
+    {
         let mut c = Command::new(taskpolicy);
         c.args(["-c", "utility"]).arg(&cmd.program);
         c
@@ -624,24 +807,16 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
     std::env::split_paths(path).any(|d| crate::is_executable_file(&cwd.join(d).join(program)))
 }
 
-/// Spawn and wait, under `ceiling`. Returns a [`Run`] whose `output` is EMPTY
-/// unless the ceiling fired — the callers own the captured bytes and splice the
-/// diagnostic onto them.
+/// Spawn and wait, under `ceiling`. Returns a [`Run`] whose `output` is empty
+/// unless the ceiling fired (the callers own the captured bytes and splice the
+/// diagnostic onto them).
 ///
-/// `Command::spawn` + `Child::wait` is exactly what `Command::status` does (the
-/// same inherited stdio defaults, the same `waitpid`), so the no-ceiling path
-/// below is byte-for-byte the behaviour this function had before and costs
-/// nothing.
-///
-/// `log` is the file the child's stdout and stderr are going to, when the
-/// caller has one. It is read back ONCE, here, after the child is reaped, and
-/// returned beside the `Run`: the ceiling diagnostic needs it to name the test a
-/// killed `targo test` child was still running ([`crate::libtest`]) and the
-/// caller needs the same bytes to splice in front of that diagnostic. Reading it
-/// twice would let a surviving grandchild — one that left the child's process
-/// group — append between the reads, and then the note's line numbers would
-/// describe text the ladder does not show. Lossy, so one stray byte costs
-/// neither the log nor the note.
+/// `log` is the file the child's stdout and stderr go to, when the caller has
+/// one. It is read back once, here, after the child is reaped, and returned
+/// beside the `Run`: the ceiling diagnostic uses it to name the test a killed
+/// `targo test` child was running ([`crate::libtest`]), and the caller splices
+/// the same bytes, so a surviving grandchild appending later cannot make the
+/// two disagree. Lossy, so one stray byte costs neither.
 ///
 /// While the child runs, its process group is on [`group`]'s live list, so an
 /// interrupted gate takes it down too.
@@ -650,74 +825,62 @@ fn finish(
     cmd: &Cmd,
     ceiling: Option<Duration>,
     log: Option<&Path>,
-) -> (Run, Option<String>) {
+) -> (Run, Option<String>, Option<Duration>) {
     let read_log = |log: Option<&Path>| {
         log.map(|p| String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned())
     };
-    // An interrupted gate is on its way down: a child spawned now would only
-    // be killed before it could say anything. (The handler raises the flag
-    // before it signals anything, so at most a spawn already past this check
-    // races it — and that child is on the live list for the final SIGKILL.)
+    // An interrupted gate is on its way down: a child spawned now would only be
+    // killed. The handler raises the flag before it signals anything, so at most
+    // a spawn already past this check races it, and that child is on the live
+    // list for the final SIGKILL.
     #[cfg(unix)]
     if group::stopping() {
         return (
             failed_to_wait("the gate was interrupted before this child started"),
             read_log(log),
+            None,
         );
     }
     let mut child = match c.spawn() {
         Ok(ch) => ch,
-        Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
+        Err(e) => return (failed_to_wait(&e.to_string()), read_log(log), None),
     };
     #[cfg(unix)]
     let _live = group::Live::enter(child.id(), cmd.term_grace.is_some());
     let Some(limit) = ceiling else {
-        let r = reaped(child.wait());
-        return (r, read_log(log));
+        return match reap(&mut child, true) {
+            Ok(Some((st, cpu))) => (reaped(Ok(st)), read_log(log), cpu),
+            Ok(None) => unreachable!("a blocking reap returns only once the child exited"),
+            Err(e) => (failed_to_wait(&e.to_string()), read_log(log), None),
+        };
     };
 
-    // POLL, DON'T BLOCK. std offers no wait-with-deadline: `Child::wait` takes
-    // `&mut self` and blocks forever, and handing the `Child` to a helper thread
-    // so the main one could `recv_timeout` would leave the killer holding only a
-    // raw pid — a pid the waiter may already have reaped, which is a pid-reuse
-    // race, i.e. a gate that occasionally SIGKILLs an innocent process. With no
-    // `libc` to reach for (see this crate's Cargo.toml, where the empty
-    // `[dependencies]` is load-bearing), `try_wait` plus a sleep is the only
-    // honest construction.
+    // Poll, don't block: std has no wait-with-deadline, and handing the `Child`
+    // to a helper thread would leave the killer holding a raw pid the waiter may
+    // already have reaped (a pid-reuse race). With no `libc` (this crate has no
+    // dependencies), a non-blocking reap plus a sleep is the construction.
     //
-    // So do not make short children pay for it. Many stage children are
-    // sub-second — the grep guards, the license sweep, the install-channel
-    // harness — so the nap starts at 1 ms and doubles to a 25 ms cap: it has
-    // slept only 15 ms in total by its fifth wake and reaches the cap after
-    // 127 ms, by which point nothing short is still running.
-    //
-    // MEASURED on this tree (release, 200 `/bin/sh -c 'exit 0'` children per arm
-    // per round, arms alternated ABBA, 3 rounds):
-    //     unbounded  4.09 / 3.77 / 4.14 ms per child
-    //     ceiling    5.16 / 4.69 / 5.93 ms per child
-    // so about +1 ms per child, which is one nap of the early schedule and under
-    // 50 ms across a whole gate run's ~25 children — against stage children
-    // measured in seconds to minutes. The steady-state cost at the other extreme
-    // is 40 `waitpid(WNOHANG)` calls per second per running child: ~108k
-    // syscalls across a full 45-minute child, a fraction of a second of CPU
-    // against 45 minutes of compiling.
+    // The nap starts at 1 ms and doubles to a 25 ms cap, so sub-second children
+    // pay about a millisecond, and a long child costs 40 `waitpid(WNOHANG)`
+    // calls a second.
     let started = Instant::now();
     let mut nap = Duration::from_millis(1);
     loop {
-        match child.try_wait() {
-            Ok(Some(st)) => return (reaped(Ok(st)), read_log(log)),
+        match reap(&mut child, false) {
+            Ok(Some((st, cpu))) => return (reaped(Ok(st)), read_log(log), cpu),
             Ok(None) => {}
-            Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
+            Err(e) => return (failed_to_wait(&e.to_string()), read_log(log), None),
         }
         let elapsed = started.elapsed();
         let Some(left) = limit.checked_sub(elapsed) else {
-            // Kill and reap FIRST, then read: the bytes the child wrote before it
+            // Kill and reap first, then read: the bytes the child wrote before it
             // died are the ones the note and the splice both describe.
             let killed = kill_and_reap(&mut child, cmd.term_grace);
             let logged = read_log(log);
             return (
                 over_ceiling(cmd, elapsed, limit, &killed, logged.as_deref()),
                 logged,
+                None,
             );
         };
         // Never sleep past the ceiling: the last nap lands exactly on it.
@@ -726,19 +889,46 @@ fn finish(
     }
 }
 
-/// SIGKILL the child's whole process group and reap the child, reporting only
-/// a kill that itself failed. Separate from [`over_ceiling`] so the log is read
-/// AFTER the processes are gone and the same bytes serve the note and the
-/// ladder.
+/// Reap `child` once it has exited: its status, and the user plus system CPU it
+/// and the descendants it reaped spent. `Ok(None)` while it still runs (never
+/// when `block`ing).
 ///
-/// The group goes FIRST, while the unreaped child still holds its id, so the
+/// On Unix this is `wait4(2)`, std's `wait` with the `rusage` it drops: a test
+/// run's wall time on a saturated machine says how long a binary waited, its CPU
+/// what it cost everything else (measured 2026-10-05: a gate test run at load
+/// 12-20 on 14 cores moved 3 % while summed binary walls moved 7 %). Once this
+/// reaps, the `Child` is never waited on again: [`kill_and_reap`] runs only on
+/// a child that has not exited.
+fn reap(
+    child: &mut std::process::Child,
+    block: bool,
+) -> io::Result<Option<(std::process::ExitStatus, Option<Duration>)>> {
+    #[cfg(unix)]
+    {
+        group::wait_rusage(child.id(), block).map(|r| r.map(|(st, cpu)| (st, Some(cpu))))
+    }
+    #[cfg(not(unix))]
+    {
+        let st = if block {
+            child.wait().map(Some)
+        } else {
+            child.try_wait()
+        };
+        st.map(|st| st.map(|st| (st, None)))
+    }
+}
+
+/// `SIGKILL` the child's whole process group and reap the child, reporting only
+/// a kill that itself failed. Separate from [`over_ceiling`] so the log is read
+/// after the processes are gone.
+///
+/// The group goes first, while the unreaped child still holds its id, so the
 /// signal cannot land on a group some later process was given.
 ///
 /// With a `grace` ([`Cmd::term_grace`]) the group is sent `SIGTERM` first and
-/// given up to `grace` to empty — polled without reaping, so the child's id
-/// stays held and the rule above still holds for the `SIGKILL` that follows
-/// if it did not. A group that emptied in time needs no `SIGKILL`: its EXIT
-/// traps ran, and the note says so.
+/// given up to `grace` to empty, polled without reaping so the id stays held. A
+/// group that emptied in time needs no `SIGKILL`: its EXIT traps ran, and the
+/// note says so.
 fn kill_and_reap(child: &mut std::process::Child, grace: Option<Duration>) -> String {
     #[cfg(unix)]
     let term = match grace {
@@ -787,16 +977,14 @@ fn kill_and_reap(child: &mut std::process::Child, grace: Option<Duration>) -> St
         Ok(()) => String::new(),
         Err(e) => format!("  (SIGKILL itself failed: {e})\n"),
     };
-    // Reap, so the gate does not leave a zombie behind for the rest of the run.
-    // SIGKILL is not maskable, so this returns as soon as the kernel has torn
-    // the process down.
+    // Reap, so no zombie is left for the rest of the run. SIGKILL is not
+    // maskable, so this returns once the kernel has torn the process down.
     let _ = child.wait();
     term + &kill
 }
 
-/// The ceiling fired: a FAILURE that says so out loud — never a skip, never a
-/// pass, and never something a caller could mistake for a child that merely
-/// exited nonzero.
+/// The ceiling fired: a failure that says so, never a skip or a pass, and never
+/// mistakable for a child that merely exited nonzero.
 fn over_ceiling(
     cmd: &Cmd,
     elapsed: Duration,
@@ -804,12 +992,10 @@ fn over_ceiling(
     kill: &str,
     logged: Option<&str>,
 ) -> Run {
-    // NAME THE TEST. A killed `targo test` child's own log says which test
-    // binary never printed its `test result:` line and which test libtest had
-    // reported slow with no verdict after — the whole diagnosis of the 3-hour
-    // hang of 2026-09-16, which this block had left at the argv. The bytes come
-    // from the caller's ONE read of the log, so the note and the log the ladder
-    // shows describe each other.
+    // Name the test: a killed `targo test` child's log says which binary never
+    // printed its `test result:` line and which test libtest reported slow with
+    // no verdict after. The bytes are the caller's one read of the log, so the
+    // note and the ladder's log agree.
     let note = logged.and_then(crate::libtest::note).unwrap_or_default();
     let secs = elapsed.as_secs_f64();
     let limit_secs = limit.as_secs_f64();
@@ -837,29 +1023,20 @@ fn over_ceiling(
     }
 }
 
-/// EVERY STAGE CHILD LEADS A PROCESS GROUP OF ITS OWN (2026-09-23), so the
-/// gate can end everything a stage started rather than only the process it
-/// spawned: the wall-clock ceiling kills the whole group ([`kill_and_reap`]),
-/// and an interrupted gate kills every group still running
-/// ([`group::kill_on_interrupt`]).
+/// Every stage child leads a process group of its own, so the gate can end
+/// everything a stage started: the ceiling kills the whole group
+/// ([`kill_and_reap`]), and an interrupted gate kills every group still running
+/// ([`group::kill_on_interrupt`]). Survivors (a hung test's `aterm-gui
+/// --headless` daemons, say) would otherwise hold sockets and CPU and trip the
+/// next run's stray-daemon guard.
 ///
-/// WHY. A ceiling kill used to reach the DIRECT child only, so a hung `targo
-/// test`'s test binaries and the `aterm-gui --headless` daemons they had
-/// launched survived it; so did every child of a gate stopped with `Ctrl-C` or
-/// `kill`. A survivor of that shape is exactly what aterm-link's stray-daemon
-/// guard refuses the NEXT run over: one leftover `aterm-gui --headless`
-/// (running from `~/aterm/target/release` since 2026-09-22, origin
-/// unrecorded) failed the aterm-link suites of every later gate on m3.
-///
-/// THE INTERRUPT HALF IS WHY THIS NEEDS `unsafe`. A child in a group of its own
-/// no longer receives the terminal's `SIGINT` — the terminal signals its
-/// foreground group, and that is the gate's — so the gate must forward it, and
-/// std has no signal handling. The handler does only async-signal-safe work:
-/// atomic loads and stores, `killpg`, `nanosleep` (the bounded `SIGTERM` grace,
-/// 2026-09-26 — see [`Cmd::term_grace`]), then `signal(SIG_DFL)` and `raise`,
-/// so the gate still dies of the signal it was sent, with the exit status that
-/// says so. This crate has no dependencies on purpose (Cargo.toml), and four
-/// libc symbols declared here are not one.
+/// The interrupt half is why this needs `unsafe`: a child in its own group no
+/// longer receives the terminal's `SIGINT`, so the gate must forward it, and std
+/// has no signal handling. The handler does only async-signal-safe work: atomic
+/// loads and stores, `killpg`, `nanosleep` (the bounded `SIGTERM` grace,
+/// [`Cmd::term_grace`]), then `signal(SIG_DFL)` and `raise`, so the gate still
+/// dies of the signal it was sent. This crate has no dependencies, so its libc
+/// symbols are declared here, with `wait4`, which [`reap`] uses.
 #[cfg(unix)]
 pub mod group {
     use std::ffi::c_long;
@@ -880,31 +1057,51 @@ pub mod group {
         tv_nsec: c_long,
     }
 
+    /// `struct timeval`: `time_t`, then `suseconds_t`, which is an `int` padded
+    /// to eight bytes on macOS and a `long` on Linux. Read as an `i32` it is the
+    /// value either way on these little-endian targets (it is below 10^6).
+    #[repr(C)]
+    #[derive(Default)]
+    struct Timeval {
+        tv_sec: c_long,
+        tv_usec: i32,
+        _pad: i32,
+    }
+
+    /// `struct rusage`: the two times, then fourteen `long` counters this reads
+    /// none of; 144 bytes on every LP64 target this gate runs on.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rusage {
+        utime: Timeval,
+        stime: Timeval,
+        _counters: [c_long; 14],
+    }
+
     unsafe extern "C" {
         fn killpg(pgrp: i32, sig: i32) -> i32;
         fn signal(sig: i32, handler: usize) -> usize;
         fn raise(sig: i32) -> i32;
         fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> i32;
+        fn wait4(pid: i32, status: *mut i32, options: i32, rusage: *mut Rusage) -> i32;
     }
 
-    /// The process groups of the stage children running right now, `0` for a
-    /// free slot. Fixed-size and lock-free because a signal handler reads it.
-    /// Stages run their children one at a time, so a few dozen are ever live;
-    /// a child that finds every slot taken still runs, and only an interrupt
-    /// would miss it.
+    /// The process groups of the stage children running now, `0` for a free
+    /// slot. Fixed-size and lock-free because a signal handler reads it. A few
+    /// dozen are ever live; a child that finds every slot taken still runs, and
+    /// only an interrupt would miss it.
     ///
-    /// A NEGATIVE entry is a group that asked for a `SIGTERM` grace
-    /// ([`crate::exec::Cmd::term_grace`]): one atomic carries both facts, so
-    /// the handler can never read a group with another child's flag.
+    /// A negative entry is a group that asked for a `SIGTERM` grace
+    /// ([`crate::exec::Cmd::term_grace`]): one atomic carries both facts, so the
+    /// handler never reads a group with another child's flag.
     static LIVE: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
 
     /// Raised by the interrupt handler before it signals anything, so no stage
     /// starts a child the gate is about to kill (`finish` asks).
     static STOPPING: AtomicBool = AtomicBool::new(false);
 
-    /// How many stage groups are on the live list right now (a graced group's
-    /// negative entry counts) — what a test waits on before it interrupts, so
-    /// the signal cannot outrun the registration it is testing.
+    /// How many stage groups are on the live list now (a graced group's negative
+    /// entry counts): what a test waits on before it interrupts.
     #[cfg(test)]
     pub(crate) fn live_count() -> usize {
         LIVE.iter()
@@ -965,14 +1162,58 @@ pub mod group {
         signal_group(pgid, SIGTERM)
     }
 
-    /// Does group `pgid` still hold a process that a signal would reach?
-    /// `killpg(g, 0)`, which delivers nothing. On macOS a group whose only
-    /// member is its unreaped, exited leader answers `EPERM` (measured
-    /// 2026-09-26), so this reads it as empty without reaping the leader —
-    /// which keeps the leader's id, and so the group's, from being reused.
+    /// Does group `pgid` still hold a process a signal would reach? `killpg(g,
+    /// 0)`, which delivers nothing. On macOS a group whose only member is its
+    /// unreaped, exited leader answers `EPERM`, so this reads it as empty without
+    /// reaping the leader, whose id (and so the group's) stays reserved.
     #[must_use]
     pub fn alive(pgid: u32) -> bool {
         signal_group(pgid, 0).is_ok()
+    }
+
+    /// `wait4(2)` on `pid` ([`super::reap`]): `Ok(None)` while it runs
+    /// (`WNOHANG` unless `block`), else its status and the user plus system
+    /// CPU of it and the descendants it reaped. Retried on `EINTR`.
+    pub fn wait_rusage(
+        pid: u32,
+        block: bool,
+    ) -> std::io::Result<Option<(std::process::ExitStatus, std::time::Duration)>> {
+        use std::os::unix::process::ExitStatusExt as _;
+        const WNOHANG: i32 = 1;
+        const EINTR: i32 = 4;
+        let pid = i32::try_from(pid).map_err(|_| std::io::Error::other("pid out of range"))?;
+        let since = |t: &Timeval| {
+            std::time::Duration::from_secs(u64::try_from(t.tv_sec).unwrap_or(0))
+                + std::time::Duration::from_micros(u64::try_from(t.tv_usec).unwrap_or(0))
+        };
+        loop {
+            let mut status = 0_i32;
+            let mut ru = Rusage::default();
+            // SAFETY: `status` and `ru` are live, writable, and laid out as
+            // `wait4` writes them (see `Rusage`).
+            let got = unsafe {
+                wait4(
+                    pid,
+                    &raw mut status,
+                    if block { 0 } else { WNOHANG },
+                    &raw mut ru,
+                )
+            };
+            if got == 0 {
+                return Ok(None);
+            }
+            if got < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(EINTR) {
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(Some((
+                std::process::ExitStatus::from_raw(status),
+                since(&ru.utime) + since(&ru.stime),
+            )));
+        }
     }
 
     /// Has an interrupt begun ending the gate?
@@ -995,13 +1236,12 @@ pub mod group {
     }
 
     extern "C" fn on_signal(sig: i32) {
-        // A SECOND interrupt while the first one waits out its grace is the
+        // A second interrupt while the first one waits out its grace is the
         // operator saying "now": it skips straight to the SIGKILLs below.
         let first = !STOPPING.swap(true, Ordering::SeqCst);
-        // Phase 1: SIGKILL every plain group at once, as before; SIGTERM every
-        // group that asked for a grace, and remember which, so none of them is
-        // ever sent a second SIGTERM (bash would take it in the middle of its
-        // EXIT trap, and the trap is the point).
+        // Phase 1: SIGKILL every plain group at once; SIGTERM every group that
+        // asked for a grace and remember which, so none is sent a second SIGTERM
+        // (bash would take it in the middle of its EXIT trap).
         let mut termed = [0_i32; 256];
         let mut n = 0;
         for slot in &LIVE {
@@ -1056,10 +1296,10 @@ pub mod group {
         }
     }
 
-    /// `SIGINT` back at its default action, for a test's stand-in gate that
-    /// models a terminal's Ctrl-C without the handler: a process started as a
-    /// background job with job control off inherits `SIGINT` IGNORED (POSIX),
-    /// and a stand-in that ignores the interrupt measures nothing.
+    /// `SIGINT` back at its default action, for a test's stand-in gate: a process
+    /// started as a background job with job control off inherits `SIGINT`
+    /// ignored (POSIX), and a stand-in that ignores the interrupt measures
+    /// nothing.
     #[cfg(test)]
     pub(crate) fn default_interrupt() {
         // SAFETY: `signal` takes an integer and the `SIG_DFL` value and
@@ -1125,8 +1365,8 @@ fn open_append(path: &Path) -> io::Result<File> {
 }
 
 /// Run a child and return its merged stdout+stderr with trailing newlines
-/// stripped — the shell's `got="$(cmd 2>&1)"`, which is how every control-socket
-/// round trip in the smokes reads its reply.
+/// stripped (the shell's `got="$(cmd 2>&1)"`), how every control-socket round
+/// trip in the smokes reads its reply.
 #[must_use]
 pub fn capture_reply(cmd: &Cmd, env: ExecEnv<'_>) -> String {
     let r = run(&cmd.clone().capture(Capture::Emit), env);
@@ -1137,18 +1377,15 @@ pub fn capture_reply(cmd: &Cmd, env: ExecEnv<'_>) -> String {
 mod tests {
     use super::*;
 
-    /// The default the gate itself runs under, so every test that does not
-    /// say otherwise exercises the POLLING wait rather than a private
-    /// no-ceiling path the real gate never takes.
+    /// The default the gate itself runs under, so every test that does not say
+    /// otherwise exercises the polling wait.
     fn env_in(dir: &Path) -> ExecEnv<'_> {
         ceiled(dir, Some(DEFAULT_CHILD_CEILING))
     }
 
-    /// The ceiling for a hung child whose OWN output a test then asserts: it has
-    /// to outlast `/bin/sh` starting and printing, which a loaded gate can
-    /// stretch past the 300 ms these tests used, killing the child before it
-    /// wrote a byte (sweep 4, 2026-09-29). The child sleeps 600 s after, so the
-    /// ceiling still always fires.
+    /// The ceiling for a hung child whose own output a test then asserts: it has
+    /// to outlast `/bin/sh` starting and printing on a loaded machine. The child
+    /// sleeps 600 s after, so the ceiling always fires.
     const PRINTS_FIRST: Duration = Duration::from_secs(5);
 
     fn ceiled(dir: &Path, child_ceiling: Option<Duration>) -> ExecEnv<'_> {
@@ -1159,15 +1396,74 @@ mod tests {
             child_ceiling,
             remove_env: &[],
             add_env: &[],
+            compile_qos: CompileQos::Utility,
         }
     }
 
-    /// THE GATE'S OWN SETTING REACHES THE CHILD, over whatever the caller's
-    /// shell exported (`Command::env` after inheriting is an override), and a
-    /// stage that names the variable itself still wins — the same precedence
-    /// `remove_env` has. [`crate::Ctx::exec_env`] is what carries the run's
-    /// pinned facts here; `lib.rs` pins that `CARGO_INCREMENTAL=0` is one of
-    /// them.
+    /// The pool's reading is a count of busy cores, between none and every one,
+    /// on both hosts the gate runs on.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn busy_cores_reads_between_none_and_every_core() {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        #[expect(clippy::cast_precision_loss, reason = "a core count")]
+        let every = cores as f64 + 1e-9;
+        // Read the way the pool reads, a sample apart (another test may have
+        // just read, and a reading within a tick of it answers nothing).
+        let mut readings = Vec::new();
+        for _ in 0..20 {
+            if let Some(r) = busy_cores() {
+                readings.push(r);
+                if readings.len() == 2 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        assert_eq!(readings.len(), 2, "the counters read: {readings:?}");
+        for r in readings {
+            assert!((0.0..=every).contains(&r), "{r} of {cores}");
+        }
+    }
+
+    /// A reaped child reports the CPU it and its own reaped children spent,
+    /// through the polling wait and the blocking one alike, with its status
+    /// intact; a child killed at the ceiling reports none. A shell loop that
+    /// spends CPU in a grandchild is counted, which a sleep is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_child_reports_its_cpu_and_a_killed_one_none() {
+        let tmp = crate::mktemp_dir("atv-cpu").expect("mktemp");
+        let burn = Cmd::new("/bin/sh").args([
+            "-c",
+            "/bin/sh -c 'i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done'; exit 3",
+        ]);
+        for env in [env_in(&tmp), ceiled(&tmp, None)] {
+            let (r, cpu) = run_measured(&burn, env);
+            assert_eq!(r.code, Some(3), "{:?}", r.output);
+            let cpu = cpu.expect("a reaped child's CPU");
+            assert!(
+                cpu >= Duration::from_millis(20),
+                "the grandchild's loop: {cpu:?}"
+            );
+        }
+        let (r, cpu) = run_measured(&Cmd::new("/bin/sleep").arg("1"), env_in(&tmp));
+        assert!(r.ok);
+        assert!(
+            cpu.expect("reaped") < Duration::from_millis(500),
+            "a sleep spends none"
+        );
+        let hung = Cmd::new("/bin/sleep").arg("600");
+        let (r, cpu) = run_measured(&hung, ceiled(&tmp, Some(Duration::from_millis(200))));
+        assert!(!r.ok);
+        assert_eq!(cpu, None, "killed at the ceiling: no rusage was reaped");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The gate's own setting reaches the child over whatever the caller's shell
+    /// exported, and a stage that names the variable itself still wins (the same
+    /// precedence `remove_env` has). `lib.rs` pins that `CARGO_INCREMENTAL=0` is
+    /// one of the run's facts.
     #[test]
     fn an_added_variable_reaches_the_child_and_a_stage_naming_it_still_wins() {
         let tmp = crate::mktemp_dir("atv-setenv").expect("mktemp");
@@ -1322,6 +1618,39 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// A RELEASE's MEASURE run (`--compile-qos inherited`) spawns even a demoted
+    /// compile bare, at the gate's own tier, with a real `taskpolicy` and a
+    /// resolvable tool both present — the case that WOULD be wrapped in any
+    /// other run (0.100.0's fat-LTO build, starved at UTILITY by a peer's
+    /// default-QoS build). The negative control is the same child, same env,
+    /// with the run's default tier: wrapped.
+    #[cfg(unix)]
+    #[test]
+    fn a_releases_measure_run_keeps_its_compiles_at_the_inherited_tier() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::mktemp_dir("atv-qos-release").expect("mktemp");
+        let fake = tmp.join("taskpolicy");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let fake_s = fake.to_string_lossy().into_owned();
+        let compile = Cmd::new("/bin/sh").args(["-c", "exit 0"]).demoted();
+        let release = ExecEnv {
+            compile_qos: CompileQos::Inherited,
+            ..env_in(&tmp)
+        };
+        assert_eq!(
+            spawned_argv(&spawn_command(&compile, release, &fake)),
+            ["/bin/sh", "-c", "exit 0"],
+            "a release's MEASURE run: the compile keeps the inherited tier"
+        );
+        assert_eq!(
+            spawned_argv(&spawn_command(&compile, env_in(&tmp), &fake))[..3],
+            [fake_s.as_str(), "-c", "utility"],
+            "negative control: any other run still demotes the same compile"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn a_demoted_child_that_cannot_run_still_says_it_could_not_run() {
         let tmp = crate::mktemp_dir("atv-qos-missing").expect("mktemp");
@@ -1348,7 +1677,7 @@ mod tests {
         let r = run(&cmd, env_in(&tmp));
         assert!(!r.ok);
         assert_eq!(r.trimmed_output(), "why");
-        // The CODE survives too: a child that distinguishes "failed" from "could
+        // The code survives too: a child that distinguishes "failed" from "could
         // not run" says so here and nowhere else.
         assert_eq!(r.code, Some(3));
         std::fs::remove_dir_all(&tmp).ok();
@@ -1378,9 +1707,9 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// THE LOAD READER (2026-09-26): the first number of either spelling —
-    /// macOS's braced `sysctl -n vm.loadavg` and Linux's `/proc/loadavg` —
-    /// and nothing from a line that holds no number.
+    /// The load reader: the first number of either spelling (macOS's braced
+    /// `sysctl -n vm.loadavg`, Linux's `/proc/loadavg`), and nothing from a line
+    /// that holds no number.
     #[test]
     fn the_load_reader_takes_the_one_minute_figure_of_either_spelling() {
         assert_eq!(parse_load_average("{ 74.82 58.31 32.86 }\n"), Some(74.82));
@@ -1390,11 +1719,76 @@ mod tests {
         assert_eq!(parse_load_average("{ busy 1.0 }"), None);
     }
 
-    /// A REPLAYED CHILD IS THE PROCESS CARGO WOULD HAVE STARTED (2026-09-26):
-    /// its own directory, exactly the recorded environment — nothing the gate
-    /// inherited, and none of the gate's PATH, removals or additions, which the
-    /// recorded environment already reflects — and a preamble at the head of its
-    /// log, above its own bytes.
+    /// Linux's `MemTotal` is read in kB and answered in bytes; a file without
+    /// one, or with nothing usable in it, answers nothing.
+    #[test]
+    fn the_meminfo_reader_takes_mem_total_in_bytes() {
+        let text = "MemFree:  100 kB\nMemTotal:       8059140 kB\nSwapTotal: 0 kB\n";
+        assert_eq!(parse_meminfo_total(text), Some(8_059_140 * 1024));
+        assert_eq!(parse_meminfo_total("MemFree: 100 kB\n"), None);
+        assert_eq!(parse_meminfo_total("MemTotal: lots kB\n"), None);
+        assert_eq!(parse_meminfo_total("MemTotal: 0 kB\n"), None);
+        let both = "MemTotal: 8059140 kB\nMemFree: 100 kB\nMemAvailable: 6000000 kB\n";
+        assert_eq!(parse_meminfo(both, "MemAvailable:"), Some(6_000_000 * 1024));
+        assert_eq!(parse_meminfo(text, "MemAvailable:"), None);
+    }
+
+    /// The usable reading is the host's own and sits under its physical
+    /// memory: on macOS, the physical less a nonzero wired figure.
+    #[test]
+    fn the_usable_memory_reading_is_under_the_physical() {
+        let Some((physical, _)) = host_memory_bytes() else {
+            return;
+        };
+        let usable = host_usable_bytes(physical);
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            let usable = usable.expect("a usable figure on macOS and Linux");
+            assert!(usable > 0 && usable <= physical, "{usable} of {physical}");
+        }
+        if cfg!(target_os = "macos") {
+            assert!(usable < Some(physical), "the kernel wires some memory");
+        }
+    }
+
+    /// The in-process reading answers a load, and it is THE load the machine
+    /// reports: it sits between two reads of the older reading
+    /// (`/proc/loadavg`, else `sysctl -n vm.loadavg`) taken either side of it.
+    /// The kernel moves the one-minute figure in one monotone step every five
+    /// seconds, so a read made between two others cannot fall outside them
+    /// except by the two-decimal rounding the printed spelling carries (the
+    /// `0.1` slack): a sample that lands inside the window moves the later read
+    /// to the far side of the bracket, not past it. Only a reader descheduled
+    /// across two samples escapes it, and the retry (three tries) covers that.
+    /// The bound is tight on purpose: a reader that returned the 15-minute
+    /// figure, a scaled one or an unwritten buffer is outside it whenever the
+    /// machine's averages differ at all.
+    /// It calls [`getloadavg_one`] itself, not [`load_average`]: that one falls
+    /// back to the older reading when `getloadavg` says nothing, so a reader
+    /// that is dead (it answers `None` on every call) would still pass here
+    /// while every ladder went back to a spawn per stage.
+    #[cfg(unix)]
+    #[test]
+    fn the_in_process_load_is_a_load_and_agrees_with_the_older_reading() {
+        let older =
+            || load_average_by_file_or_spawn().expect("the older reading answers on a unix host");
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let before = older();
+            let now = getloadavg_one().expect("a unix host answers getloadavg");
+            let after = older();
+            assert!(now.is_finite() && now >= 0.0, "not a load: {now}");
+            if now >= before.min(after) - 0.1 && now <= before.max(after) + 0.1 {
+                return;
+            }
+            seen.push((before, now, after));
+        }
+        panic!("getloadavg never fell between two reads of the older reading: {seen:?}");
+    }
+
+    /// A replayed child is the process cargo would have started: its own
+    /// directory, exactly the recorded environment (none of the gate's PATH,
+    /// removals or additions), and a preamble at the head of its log, above its
+    /// own bytes.
     #[test]
     fn a_replayed_child_starts_where_and_as_it_was_recorded() {
         let tmp = crate::mktemp_dir("atv-replay").expect("mktemp");
@@ -1433,7 +1827,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// THE PREAMBLE IS WHAT A CEILING KILL READS: a test binary the gate runs
+    /// The preamble is what a ceiling kill reads: a test binary the gate runs
     /// itself carries cargo's `Running` header only because the gate wrote it,
     /// and the TIMEOUT block names the binary and its re-run line from it.
     #[test]
@@ -1502,104 +1896,17 @@ mod tests {
     // The wall-clock ceiling.
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn a_fast_child_pays_at_most_one_nap_for_the_ceiling() {
-        // The whole objection to polling is latency, and many stage children are
-        // short. Alternate the arms (unbounded wait vs the real 45-minute
-        // ceiling) over the same trivial child so scheduler noise lands on both.
-        // The measurement quoted in `finish` puts the cost at ~+1 ms per child;
-        // the bound asserted here is 50 ms, loose enough never to flake on a
-        // loaded machine and still two orders of magnitude below what a poll
-        // that had settled at a 1-second tick would cost.
-        let tmp = crate::mktemp_dir("atv-ceil-fast").expect("mktemp");
-        let quick = Cmd::new("/bin/sh").args(["-c", "exit 0"]);
-        const N: u32 = 20;
-
-        // The overhead of each ceilinged child over the unbounded one beside
-        // it, in ms. The MEDIAN decides: a wrong backoff charges EVERY child,
-        // while one exec stall or preemption charges one pair. Two sums against
-        // one 1 s slack let a single slow spawn decide it (the load-sensitive
-        // test audit of 2026-09-27).
-        let mut overhead_ms = Vec::with_capacity(N as usize);
-        for _ in 0..N {
-            let t = Instant::now();
-            assert!(run(&quick, ceiled(&tmp, None)).ok);
-            let unbounded = t.elapsed();
-
-            let t = Instant::now();
-            let r = run(&quick, env_in(&tmp));
-            let ceilinged = t.elapsed();
-            assert!(r.ok, "a child that exits 0 is untouched by the ceiling");
-            assert!(r.output.is_empty(), "and gains no diagnostic");
-            overhead_ms.push((ceilinged.as_secs_f64() - unbounded.as_secs_f64()) * 1e3);
-        }
-        overhead_ms.sort_by(f64::total_cmp);
-        let median = overhead_ms[overhead_ms.len() / 2];
-
-        // A poll loop that had (say) settled at a 1-second tick would blow this
-        // by two orders of magnitude; the real schedule tops out at 25 ms and
-        // reaches that only after 127 ms, which no child here survives.
-        assert!(
-            median <= 50.0,
-            "polling cost a median {median:.1} ms per child over the unbounded wait \
-             ({overhead_ms:.1?}) — more than 50 ms of overhead means the backoff is wrong"
-        );
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn a_child_that_outlives_the_ceiling_is_killed_and_reported_as_a_failure() {
-        // This is the whole point: BEFORE the ceiling this call never returned,
-        // so `tools/verify.sh` printed the rungs above it and sat there forever.
-        // `exec sleep` rather than a bare `sleep` keeps the test hermetic — one
-        // process, so the kill leaves nothing behind to reap by hand.
-        let tmp = crate::mktemp_dir("atv-ceil-hang").expect("mktemp");
-        let hang = Cmd::new("/bin/sh").args(["-c", "echo got-this-far; exec sleep 600"]);
-
-        let t = Instant::now();
-        let r = run(&hang, ceiled(&tmp, Some(PRINTS_FIRST)));
-        let waited = t.elapsed();
-
-        assert!(
-            waited < Duration::from_secs(30),
-            "the ceiling has to END the wait, not merely describe it (waited {waited:?})"
-        );
-        assert!(waited >= PRINTS_FIRST, "and not end it early");
-        assert!(!r.ok, "a child that never finished is a FAILURE");
-        assert!(
-            r.spawn_error.is_none(),
-            "it spawned fine — calling this a spawn failure would blame the environment"
-        );
-        assert_eq!(r.code, None, "killed by a signal, so there is no exit code");
-
-        let out = r.trimmed_output();
-        // The bytes the child DID write survive, in front of the diagnostic: a
-        // timed-out stage's last line is usually the whole diagnosis.
-        let alive = out.find("got-this-far").expect("the child's own output");
-        let verdict = out.find("TIMEOUT").expect("the ceiling diagnostic");
-        assert!(alive < verdict, "the child's bytes come first:\n{out}");
-        // Named: the child, the elapsed time, the override, and the honest limit
-        // of what the kill reached.
-        assert!(
-            out.contains("/bin/sh -c echo got-this-far; exec sleep 600"),
-            "{out}"
-        );
-        // The elapsed figure is a measurement, so only the LIMIT is asserted
-        // exactly; a loaded machine may overshoot the ceiling by a whole tick.
-        assert!(out.contains("child killed after "), "{out}");
-        assert!(out.contains("over the 5.0s wall-clock ceiling"), "{out}");
-        assert!(out.contains("--stage-timeout <seconds>"), "{out}");
-        assert!(out.contains("--stage-timeout off"), "{out}");
-        assert!(out.contains("whole process group"), "{out}");
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// How long a grandchild that MUST be gone gets to go: a hang detector (a
-    /// killed grandchild is reaped by launchd, not by us, and a loaded box
-    /// takes its time). Every such grandchild is a `sleep 600`, so this stays
-    /// far below its own life.
+    /// How long a grandchild that must be gone gets to go: a hang detector (a
+    /// killed grandchild is reaped by launchd, and a loaded machine takes its
+    /// time). Every such grandchild is a `sleep 600`, so this stays far below
+    /// its life.
     #[cfg(unix)]
     const GONE: Duration = Duration::from_secs(60);
+
+    /// A wait for something else that must happen — a trapped group exiting
+    /// inside its grace, a ceiling ending a child — is a hang detector too,
+    /// never a latency budget.
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
     /// How long a negative control's orphan must SURVIVE to count as left
     /// behind. A window that can only go vacuous: kept short.
@@ -1627,9 +1934,9 @@ mod tests {
         }
     }
 
-    /// The pid a stage child's shell wrote for the `sleep` it backgrounded.
-    /// The bound is LIVENESS, not latency: a loaded gate (the aterm-gui suite
-    /// beside it) can take seconds to start a shell.
+    /// The pid a stage child's shell wrote for the `sleep` it backgrounded. The
+    /// bound is liveness, not latency: a loaded gate can take seconds to start a
+    /// shell.
     #[cfg(unix)]
     fn read_pid(file: &Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -1655,9 +1962,8 @@ mod tests {
         ])
     }
 
-    /// THE CEILING ENDS THE WHOLE GROUP (2026-09-23). A grandchild the stage
-    /// child started is gone once the ceiling fires — and the negative control
-    /// is the kill this replaced, `Child::kill` on the direct child, which
+    /// The ceiling ends the whole group: a grandchild the stage child started is
+    /// gone once it fires. Negative control: `Child::kill` on the direct child
     /// leaves the same grandchild running.
     #[cfg(unix)]
     #[test]
@@ -1698,13 +2004,65 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// AN INTERRUPTED GATE TAKES ITS STAGE CHILDREN WITH IT (2026-09-23). The
-    /// test re-executes itself as a stand-in gate that installs
-    /// [`group::kill_on_interrupt`] (or, for the negative control, does not),
-    /// runs a stage child that has a grandchild, and is sent `SIGINT` the way a
-    /// terminal's Ctrl-C would reach it. With the handler the grandchild is
-    /// gone and the stand-in died of `SIGINT`; without it, the child's own
-    /// process group never heard the signal and the grandchild is still there.
+    /// The marker a stand-in gate writes beside `pidfile` once it has armed.
+    #[cfg(unix)]
+    fn armed(pidfile: &Path) -> PathBuf {
+        pidfile.with_extension("armed")
+    }
+
+    /// A stand-in gate's stage: run `child` and write the [`armed`] marker once
+    /// the child's group is on the live list and its grandchild has written
+    /// `pidfile`. The pidfile alone would race the registration.
+    #[cfg(unix)]
+    fn run_armed(child: &Cmd, pidfile: &Path) {
+        let dir = pidfile.parent().expect("a dir");
+        std::thread::scope(|scope| {
+            let stage = scope.spawn(|| run(child, ceiled(dir, None)));
+            while !(group::live_count() > 0
+                && std::fs::read_to_string(pidfile).is_ok_and(|t| t.ends_with('\n')))
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::write(armed(pidfile), "armed\n").expect("the armed marker");
+            let _ = stage.join();
+        });
+    }
+
+    /// Send a stand-in gate `SIGINT` once it has armed (an event, never a guessed
+    /// delay), and answer how it exited, its stage's grandchild, and how long it
+    /// took to exit after the signal. A stand-in that never arms is killed, so a
+    /// failure cannot leave a 600 s `sleep` behind.
+    #[cfg(unix)]
+    fn interrupt_when_armed(
+        mut child: std::process::Child,
+        pidfile: &Path,
+    ) -> (std::process::ExitStatus, String, Duration) {
+        let marker = armed(pidfile);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !marker.exists() {
+            if Instant::now() > deadline || matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the stand-in gate never armed ({})", marker.display());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild = read_pid(pidfile);
+        let t = Instant::now();
+        std::process::Command::new("/bin/kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("kill -INT");
+        let status = child.wait().expect("the stand-in exits");
+        (status, grandchild, t.elapsed())
+    }
+
+    /// An interrupted gate takes its stage children with it. The test re-executes
+    /// itself as a stand-in gate that installs [`group::kill_on_interrupt`] (or,
+    /// for the negative control, does not), runs a stage child with a
+    /// grandchild, and is sent `SIGINT` as a terminal's Ctrl-C would. With the
+    /// handler the grandchild is gone and the stand-in died of `SIGINT`; without
+    /// it the child's group never heard the signal and the grandchild remains.
     #[cfg(unix)]
     #[test]
     fn an_interrupted_gate_kills_every_live_stage_group() {
@@ -1715,35 +2073,15 @@ mod tests {
             if std::env::var_os(NO_HANDLER).is_none() {
                 group::kill_on_interrupt();
             } else {
-                // The Ctrl-C this models meets SIGINT at its default action. Run
-                // as a background job (`cmd &` with job control off, as a gate
-                // lane runs its suites) the stand-in inherits it IGNORED, never
-                // died of the SIGINT, waited out its stage's 600 s `sleep` —
-                // the binary's 600 s run — and its grandchild ended with it,
-                // which the negative control read as "died anyway".
+                // The Ctrl-C this models meets SIGINT at its default action. As
+                // a background job with job control off the stand-in would
+                // inherit it ignored, wait out its stage's `sleep`, and the
+                // negative control would read "died anyway".
                 group::default_interrupt();
             }
             let pidfile = PathBuf::from(pidfile);
-            let dir = pidfile.parent().expect("a dir").to_path_buf();
-            std::thread::scope(|scope| {
-                let stage = scope.spawn(|| run(&with_grandchild(&pidfile), ceiled(&dir, None)));
-                // THE EVENT THE INTERRUPT WAITS ON: the stage child's group is
-                // on the live list AND its grandchild has written its pid. The
-                // pidfile alone raced the registration — the shell can write it
-                // before `run` puts the group on the list — and a SIGINT in that
-                // gap left nothing to kill.
-                while !(group::live_count() > 0
-                    && std::fs::read_to_string(&pidfile).is_ok_and(|t| t.ends_with('\n')))
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                std::fs::write(armed(&pidfile), "armed\n").expect("the armed marker");
-                let _ = stage.join();
-            });
+            run_armed(&with_grandchild(&pidfile), &pidfile);
             return;
-        }
-        fn armed(pidfile: &Path) -> PathBuf {
-            pidfile.with_extension("armed")
         }
         let tmp = crate::mktemp_dir("atv-interrupt").expect("mktemp");
         let me = std::env::current_exe().expect("the test binary");
@@ -1761,26 +2099,8 @@ mod tests {
             if !handler {
                 c.env(NO_HANDLER, "1");
             }
-            let mut child = c.spawn().expect("the stand-in gate starts");
-            // Interrupt only once the stand-in says its stage group is live —
-            // an event, never a guessed delay. A stand-in that never arms is
-            // killed, so a failure here cannot leave a 600 s `sleep` behind.
-            let marker = armed(pidfile);
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while !marker.exists() {
-                if Instant::now() > deadline || matches!(child.try_wait(), Ok(Some(_))) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("the stand-in gate never armed ({})", marker.display());
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let grandchild = read_pid(pidfile);
-            std::process::Command::new("/bin/kill")
-                .args(["-INT", &child.id().to_string()])
-                .status()
-                .expect("kill -INT");
-            let status = child.wait().expect("the stand-in exits");
+            let child = c.spawn().expect("the stand-in gate starts");
+            let (status, grandchild, _) = interrupt_when_armed(child, pidfile);
             (status, grandchild)
         };
 
@@ -1808,14 +2128,17 @@ mod tests {
     }
 
     /// The ceiling for [`suite_with_trap`] runs. The ceiling clock starts at the
-    /// spawn, so it must outlast bash's startup to its traps and the pidfile:
-    /// one that fires first kills a shell with no trap installed, and the
-    /// tests below then read "no marker" or "no pid" for a reason that is not
-    /// about the grace. It was 300-500 ms, 20-60x a quiet startup but
-    /// reachable under a loaded gate (the load-sensitive test audit of
-    /// 2026-09-27); 3 s is still a small fraction of every grace compared.
+    /// spawn, so it must outlast bash's startup to its traps and the pidfile on
+    /// a loaded machine; firing first would kill a shell with no trap installed.
+    /// 3 s is still a small fraction of every grace compared.
     #[cfg(unix)]
     const SUITE_CEILING: Duration = Duration::from_secs(3);
+
+    /// A grace far past [`HANG_DETECTOR`]: a gate that SLEEPS its grace instead
+    /// of moving on when the group empties then takes ten minutes, so a minute's
+    /// hang detector tells the two apart however loaded the machine is.
+    #[cfg(unix)]
+    const LONG_GRACE: Duration = Duration::from_secs(600);
 
     /// A shell SUITE's shape: an EXIT trap that leaves `marker`, and a
     /// grandchild `sleep` (its pid in `pidfile`) the shell waits on. `ignore`
@@ -1834,12 +2157,10 @@ mod tests {
         ])
     }
 
-    /// A GRACEFUL CHILD'S EXIT TRAP RUNS BEFORE THE CEILING KILL (2026-09-26).
-    /// The ceiling fires, the group is sent `SIGTERM`, bash runs its trap, the
-    /// group empties, and the gate moves on without waiting out the grace —
-    /// and the grandchild is gone too. The NEGATIVE CONTROL is the same suite
-    /// with no grace: the `SIGKILL` this replaced, which bash cannot trap, so
-    /// the marker never appears.
+    /// A graceful child's EXIT trap runs before the ceiling kill: the group is
+    /// sent `SIGTERM`, bash runs its trap, the group empties, and the gate moves
+    /// on without waiting out the grace; the grandchild is gone too. Negative
+    /// control: the same suite with no grace gets `SIGKILL`, and no marker.
     #[cfg(unix)]
     #[test]
     fn a_graceful_child_runs_its_exit_trap_before_the_ceiling_kill() {
@@ -1847,7 +2168,7 @@ mod tests {
         let (marker, pidfile) = (tmp.join("trap-ran"), tmp.join("grandchild.pid"));
         let t = Instant::now();
         let r = run(
-            &suite_with_trap(&marker, &pidfile, false).term_grace(Duration::from_secs(20)),
+            &suite_with_trap(&marker, &pidfile, false).term_grace(LONG_GRACE),
             ceiled(&tmp, Some(SUITE_CEILING)),
         );
         let waited = t.elapsed();
@@ -1859,13 +2180,13 @@ mod tests {
         );
         assert!(
             r.output
-                .contains("SIGTERM first, with a 20.0s grace: the group exited within it"),
+                .contains("SIGTERM first, with a 600.0s grace: the group exited within it"),
             "{}",
             r.output
         );
         assert!(
-            waited < SUITE_CEILING + Duration::from_secs(10),
-            "the grace is a bound, not a sleep: {waited:?}"
+            waited < SUITE_CEILING + HANG_DETECTOR,
+            "the grace is a bound, not a sleep: {waited:?} of a {LONG_GRACE:?} grace"
         );
         let grandchild = read_pid(&pidfile);
         assert!(
@@ -1892,8 +2213,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// …AND A CHILD THAT IGNORES `SIGTERM` IS STILL KILLED when its grace runs
-    /// out: the grace delays the `SIGKILL`, it never replaces it.
+    /// …and a child that ignores `SIGTERM` is still killed when its grace runs
+    /// out: the grace delays the `SIGKILL`, never replaces it.
     #[cfg(unix)]
     #[test]
     fn a_graceful_child_that_ignores_sigterm_is_killed_when_its_grace_runs_out() {
@@ -1916,7 +2237,12 @@ mod tests {
             waited >= SUITE_CEILING + Duration::from_millis(700),
             "the ceiling, then the whole grace: {waited:?}"
         );
-        assert!(waited < Duration::from_secs(30), "{waited:?}");
+        // A hang detector: a grace that never ends in the SIGKILL waits out the
+        // deaf group's `sleep 600`.
+        assert!(
+            waited < SUITE_CEILING + HANG_DETECTOR,
+            "the grace ran out and nothing SIGKILLed the group: {waited:?}"
+        );
         let grandchild = read_pid(&pidfile);
         assert!(
             gone_within(&grandchild, GONE),
@@ -1925,12 +2251,11 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// AN INTERRUPTED GATE LETS A GRACEFUL CHILD RUN ITS EXIT TRAP (2026-09-26).
-    /// The stand-in gate of [`an_interrupted_gate_kills_every_live_stage_group`],
-    /// running a suite-shaped child with a grace: `SIGINT` reaches it, its
-    /// handler sends the child's group `SIGTERM`, the trap runs, the
-    /// grandchild is gone, and the stand-in still dies of `SIGINT`. The
-    /// NEGATIVE CONTROL is the same child without a grace: `SIGKILL`, no trap.
+    /// An interrupted gate lets a graceful child run its EXIT trap: the stand-in
+    /// gate of [`an_interrupted_gate_kills_every_live_stage_group`], running a
+    /// suite-shaped child with a grace, gets `SIGINT`, its handler sends the
+    /// child's group `SIGTERM`, the trap runs, the grandchild is gone, and the
+    /// stand-in still dies of `SIGINT`. Negative control: no grace, no trap.
     #[cfg(unix)]
     #[test]
     fn an_interrupted_gate_lets_a_graceful_child_run_its_exit_trap() {
@@ -1944,7 +2269,7 @@ mod tests {
             if std::env::var_os(GRACE).is_some() {
                 child = child.term_grace(TERM_GRACE);
             }
-            let _ = run(&child, ceiled(&dir, None));
+            run_armed(&child, &dir.join("gc.pid"));
             return;
         }
         let tmp = crate::mktemp_dir("atv-grace-interrupt").expect("mktemp");
@@ -1964,20 +2289,9 @@ mod tests {
             if graceful {
                 c.env(GRACE, "1");
             }
-            let mut child = c.spawn().expect("the stand-in gate starts");
-            let grandchild = read_pid(&dir.join("gc.pid"));
-            let t = Instant::now();
-            std::process::Command::new("/bin/kill")
-                .args(["-INT", &child.id().to_string()])
-                .status()
-                .expect("kill -INT");
-            let status = child.wait().expect("the stand-in exits");
-            (
-                status,
-                grandchild,
-                t.elapsed(),
-                dir.join("trap-ran").exists(),
-            )
+            let child = c.spawn().expect("the stand-in gate starts");
+            let (status, grandchild, took) = interrupt_when_armed(child, &dir.join("gc.pid"));
+            (status, grandchild, took, dir.join("trap-ran").exists())
         };
 
         let (status, grandchild, took, trapped) = stand_in(&tmp.join("graceful"), true);
@@ -2011,11 +2325,9 @@ mod tests {
 
     #[test]
     fn a_timed_out_test_child_names_the_test_it_was_still_running() {
-        // The 3-hour hang of 2026-09-16: the ceiling ended it and the block
-        // named the argv, 4,874 tests wide. The child here writes what libtest
-        // writes — cargo's header, the count, one verdict, one slow notice —
-        // then hangs, and the block has to name the slow test, where its
-        // notice is, and how to re-run it alone.
+        // The child writes what libtest writes (cargo's header, the count, one
+        // verdict, one slow notice), then hangs; the block must name the slow
+        // test, where its notice is, and how to re-run it alone.
         let tmp = crate::mktemp_dir("atv-ceil-named").expect("mktemp");
         let script = "printf '     Running unittests src/lib.rs (target/debug/deps/x-abc)\\n\\n\
                       running 2 tests\\ntest a::b ... ok\\n\
@@ -2026,8 +2338,10 @@ mod tests {
         let r = run(&hang, ceiled(&tmp, Some(PRINTS_FIRST)));
         let waited = t.elapsed();
 
-        // Everything the plain ceiling test holds, holds here too.
-        assert!(waited < Duration::from_secs(30), "waited {waited:?}");
+        // The ceiling ENDS the wait, never early, and the child is FAILED by
+        // a signal — never read as a spawn failure. A hang detector: a ceiling
+        // that does not end the wait waits out the child's `sleep 600`.
+        assert!(waited < HANG_DETECTOR, "waited {waited:?}");
         assert!(waited >= PRINTS_FIRST, "and not end it early");
         assert!(!r.ok, "a child that never finished is a FAILURE");
         assert!(r.spawn_error.is_none());
@@ -2146,35 +2460,6 @@ mod tests {
             parse_ceiling("0.25"),
             Some(Some(Duration::from_millis(250)))
         );
-    }
-
-    #[test]
-    fn an_overridden_ceiling_is_the_one_that_actually_fires() {
-        // The parse above is pure; this is the same value threaded through the
-        // path the gate uses — the flag's string, `parse_ceiling`, `ExecEnv` —
-        // ending in a real child that really dies.
-        let tmp = crate::mktemp_dir("atv-ceil-env").expect("mktemp");
-        let ceiling = parse_ceiling("0.4").expect("a ceiling");
-        assert_eq!(ceiling, Some(Duration::from_millis(400)));
-
-        let t = Instant::now();
-        let r = run(
-            &Cmd::new("/bin/sh").args(["-c", "exec sleep 600"]),
-            ceiled(&tmp, ceiling),
-        );
-        let waited = t.elapsed();
-        assert!(!r.ok);
-        assert!(
-            (Duration::from_millis(400)..Duration::from_secs(30)).contains(&waited),
-            "the override, not the 45-minute default, decided when to kill (waited {waited:?})"
-        );
-        assert!(
-            r.trimmed_output()
-                .contains("over the 0.4s wall-clock ceiling"),
-            "{}",
-            r.trimmed_output()
-        );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

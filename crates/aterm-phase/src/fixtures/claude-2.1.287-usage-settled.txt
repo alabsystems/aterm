@@ -1,0 +1,51 @@
+# claude-code 2.1.287 · MEASURED 2026-10-01 by the accounts probe's live check (docs/SPEC-claude-accounts-probe-2026-10-01.md §6): `aterm ctl text --json` rows of a private headless aterm (150x50), 505 ms after the Enter that ran `/usage` (the same run as claude-2.1.287-usage-refreshing.txt) · THE USAGE TAB SETTLED AND WHOLE ON THE GRID: three windows, the contributing block still `Scanning local sessions…`, usage credits, the cancel hint last — read so for six reads (1.5 s), until the scan filled the block and pushed the hint under the fold (claude-2.1.287-usage-fold.txt) · no row names the login
+
+✻ Baked for 0s · done 9:20 PM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.1635
+   Total duration (API):  1s
+   Total duration (wall): 2m 0s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage by model:
+       claude-haiku-4-5:  897 input, 11 output, 0 cache read, 0 cache write ($0.0010)
+        claude-opus-5-5:  2 input, 4 output, 25.1k cache read, 19.7k cache write ($0.1625)
+   Prompt cache (main):   1 request · 56% of input tokens from cache · no misses · warm (1h TTL, last activity 46s ago)
+
+   Current session
+   ▌                                                  1% used
+   Resets 2am (America/Los_Angeles)
+
+   Current week (all models)
+   █████                                              10% used
+   Resets Oct 8 at 9am (America/Los_Angeles)
+
+   Current week (Fable)
+                                                      0% used
+   Resets Oct 8 at 9am (America/Los_Angeles)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Scanning local sessions…
+
+   Usage credits
+   Usage credits are off · /usage-credits to turn them on
+
+   Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+

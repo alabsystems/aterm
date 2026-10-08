@@ -55,7 +55,7 @@ fn application_present_uses_the_phase_aware_overlay_policy() {
     let src = normalized_section(
         "src/app_render.rs",
         "fn redraw_window_with_layout(",
-        "pub(crate) fn redraw_tab_strip_state(",
+        "fn redraw_tab_strip_state(",
     );
     for needle in [
         // bell invert + drag wash read the shared gate once...

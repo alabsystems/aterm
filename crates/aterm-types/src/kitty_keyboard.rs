@@ -4,9 +4,6 @@
 
 //! Kitty keyboard protocol types (CSI u encoding, modifier handling, flag stacks).
 //!
-//! Extracted from `aterm-core::terminal::kitty_keyboard` to break circular
-//! dependencies (Part of #5663, #2341).
-//!
 //! Reference: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
 
 /// Kitty keyboard protocol enhancement flags.
@@ -101,11 +98,10 @@ impl KittyKeyboardFlags {
     pub fn apply(&mut self, bits: u8, mode: u8) {
         let bits = bits & 0b1_1111; // Mask to valid flags
         match mode {
-            // Mode 0 = set: aterm's parser never synthesizes an explicit 0
-            // (a trailing empty param is dropped and the dispatcher defaults
-            // to 1), so this arm only fires for a literal `CSI = f ; 0 u` —
-            // treated as the omitted-default per #7714. kitty no-ops it; the
-            // deviation is deliberate and harmless.
+            // Mode 0 = set: aterm's parser delivers an empty mode
+            // (`CSI = f ; u`) as 0, and an empty parameter is the default, 1.
+            // A literal `CSI = f ; 0 u` reads the same way (#7714); kitty
+            // no-ops that one, and the deviation is deliberate and harmless.
             0 | 1 => self.0 = bits, // Set exactly these bits
             2 => self.0 |= bits,    // OR with current
             3 => self.0 &= !bits,   // Clear specified bits

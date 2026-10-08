@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The workspace clippy.toml fences `libc::flock`, a path that names nothing
+# inside this crate (it cannot call itself `libc`), so every tippy run warned.
+# These declarations take no lock; this crate lints with clippy's defaults.
+# grep_guard B29b refuses any other clippy.toml under crates/ or apps/.

@@ -1,39 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SELECTION CUSTODY §3 row 15 — the width-reflow bump of `history_renumber_epoch`.
+//! The width-reflow bump of `history_renumber_epoch`.
 //!
-//! A width rewrap changes how many rows the SAME history occupies, so every absolute
-//! row number above the splice shifts. That is a wholesale RENUMBERING, and
-//! `history_renumber_epoch` is the one signal absolute-row-keyed caches (the
-//! terminal's incremental search-index refresh, the viewport row cache) have that
-//! their keys went stale. The bump landed at `scrollback_reflow.rs` with no test in
-//! either `aterm-grid/tests` or `aterm-core/tests`: deleting it left every suite
-//! green while the search index carried pre-rewrap keys forward across a
-//! window-width drag.
+//! A width rewrap changes how many rows the same history occupies, so absolute
+//! row numbers shift wholesale. `history_renumber_epoch` is the signal
+//! absolute-row-keyed caches (the search index, the viewport row cache) use to
+//! learn their keys went stale.
 //!
-//! The epoch itself is the honest oracle here, because no CONSUMER can witness the
-//! bump through a width change — but not for the reason a first reading suggests, and
-//! the distinction is worth writing down since it decides what a future test may
-//! assume.
-//!
-//! The two consumers are fenced differently. `refresh_search_index`'s `reusable` guard
-//! (`search_index.rs:265`) does compare `cached.cols == cols`, so a width change
-//! invalidates it whatever the epoch does. `indexed_search`'s hit key
-//! (`search_index.rs:154`) does NOT mention `cols` at all — it is
-//! `(alternate_screen, content_seq, history_renumber_epoch)`. What covers it is that a
-//! width reflow bumps `content_seq` as a side effect (measured: 26 -> 27 across a
-//! 40 -> 20 resize), so the entry misses on the seq term before the epoch term is ever
-//! reached.
-//!
-//! So both are covered on this path, and a behavioural test through either says
-//! nothing about the bump. But `indexed_search` is covered by a COINCIDENCE of the
-//! reflow implementation rather than by a guard that names width, and the epoch's
-//! documented reason for joining that key is the case where the coincidence does not
-//! hold: a Kitty CSI +T unscroll renumbers history WITHOUT the `content_seq`
-//! arithmetic the cache can observe. Should a future reflow stop touching
-//! `content_seq`, `indexed_search` would silently serve pre-rewrap keys and this file
-//! is what still fails.
+//! The epoch is the oracle here because no consumer witnesses the bump through
+//! a width change: `try_refresh_search_index` also compares `cols`, and
+//! `indexed_search`'s key `(alternate_screen, content_seq,
+//! history_renumber_epoch)` currently misses on `content_seq`, which a width
+//! reflow happens to bump. Should reflow stop touching `content_seq`, only
+//! these tests would catch stale keys.
 
 use aterm_grid::Grid;
 
@@ -60,10 +40,8 @@ fn grid_with_wrapping_history(rows: u16, cols: u16, history: usize) -> Grid {
     grid
 }
 
-/// A width change re-wraps retained history and must ADVANCE the renumber epoch.
-/// A rows-only change must not: it splices rows without re-numbering the history
-/// that was already archived, and a spurious bump would throw away every
-/// absolute-keyed cache on an ordinary window-height drag.
+/// A width change advances the renumber epoch; a rows-only change does not (a
+/// spurious bump would discard every absolute-keyed cache on a height drag).
 #[test]
 fn a_width_reflow_advances_the_history_renumber_epoch_and_a_rows_only_resize_does_not() {
     let mut grid = grid_with_wrapping_history(4, 40, 30);
@@ -96,30 +74,13 @@ fn a_width_reflow_advances_the_history_renumber_epoch_and_a_rows_only_resize_doe
     );
 }
 
-/// THE HALF THE BUMP SITES COULD NOT SEE: a width reflow with an EMPTY
-/// scrollback.
-///
-/// The bump used to live only where a rewrap CROSSES the live/history boundary
-/// — `prepend_ring_scrollback_lines`, the deficit pullback,
-/// `note_bottom_end_renumbered` — and every one of those early-returns when
-/// there is nothing to splice. A fresh tab, or any session right after `clear`
-/// whose output still fits on screen, has no off-screen history at all: the
-/// rewrap touches only the live grid, so the epoch stood still while the SAME
-/// logical lines moved from four rows to eight and absolute row N started
-/// naming different text. That is a renumbering by every definition this stamp
-/// carries, and `content_gen`/`absolute_row_revision` cannot see it either
-/// (the first says "content changed", not "keys moved"; the second only ever
-/// moves on a protected-footer splice).
-///
-/// Measured consequence before the repair: the find bar's highlight-all tint,
-/// which fails closed on this stamp, replayed its cached `(row, col, len)` onto
-/// a soft-wrap continuation row while the real hit sat untinted further down
-/// and the bar still read the query.
+/// A width reflow with empty scrollback still advances the epoch: the same
+/// logical lines move from four rows to eight, so absolute row N names
+/// different text even though nothing was spliced into history.
 #[test]
 fn a_width_reflow_with_no_scrollback_still_advances_the_renumber_epoch() {
-    // Three full-width lines in a TWELVE-row viewport: three rows at width 20,
-    // six at width 10 — both totals fit, so nothing is ever pushed off the top
-    // and the rewrap has no history to splice.
+    // Three full-width lines in a 12-row viewport: 3 rows at width 20, 6 at
+    // width 10, so nothing is pushed off the top.
     let mut grid = Grid::with_scrollback(12, 20, 200);
     for row in 0..3u16 {
         for (col, ch) in format!("row {row} text that wraps")

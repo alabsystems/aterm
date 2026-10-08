@@ -6,7 +6,7 @@
 //! The owner's decision, in one sentence: there is ONE master key, written on paper and
 //! present on no computer, and it mints a SEPARATE signing key for every machine that
 //! publishes. A machine key never leaves the machine that minted it. Adding a laptop, or
-//! reformatting one, mints another. See `docs/SIGNING-KEY-DESIGN.md` for the decision and
+//! reformatting one, mints another. See `docs/RELEASE-KEYS.md` for the decision and
 //! why it reverses the one-key record it replaces.
 //!
 //! # This tier authorizes atpkg too
@@ -292,7 +292,7 @@ pub struct Roster {
     /// mint and revocation stamps 9999-12-31 (`crates/atpkg-keys/src/roster_ops.rs`,
     /// decided, not defaulted) — so the gate still checks the date but never fires on a
     /// live channel, and revocation is the only defence against a stolen key. See
-    /// `docs/SIGNING-KEY-DESIGN.md`.
+    /// `docs/RELEASE-KEYS.md`.
     pub valid_until: String,
     /// The authorized machines. `[[machine]]` on the wire.
     #[serde(default, rename = "machine")]
@@ -535,11 +535,10 @@ impl Attribution {
     ///   generation than the roster presented, i.e. an OLD roster paired with a NEW
     ///   release, which is the pairing that could resurrect a since-revoked machine.
     ///
-    ///   Why "≤" and not "==" (changed 2026-08-18): the roster is distributed as an asset
-    ///   on the channel's latest release, so when a machine joins (seq n+1) the new pair is
-    ///   attached to releases whose manifests were attributed under seq n. Under `==` every
-    ///   such release became uninstallable for the whole fleet — MEASURED: v0.23.0 and
-    ///   v0.24.0 refused with `SeqMismatch` for hours after a join — with no security won:
+    ///   Why "≤" and not "==": the roster is distributed as an asset on the channel's
+    ///   latest release, so when a machine joins (seq n+1) the new pair is attached to
+    ///   releases whose manifests were attributed under seq n. Under `==` every such
+    ///   release would be uninstallable for the whole fleet after a join, with no security won:
     ///   verifying under a NEWER roster is strictly stronger (the newer deny-list applies,
     ///   `Revoked` is checked first, and `Rollback` already forbids anything below the
     ///   client's observed floor). A newer roster with an older release is the normal
@@ -564,9 +563,8 @@ impl Attribution {
 
 /// RFC3339 (`YYYY-MM-DDTHH:MM:SSZ`) → unix seconds, or `None` for anything this does not
 /// recognise — which every caller treats as LAPSED, never as absent. The workspace's one
-/// strict parser, `aterm_types::rfc3339::parse_utc` (this crate's private near-twin of
-/// `atpkg::flow`'s was folded into it 2026-09-25, so the two gates cannot disagree about
-/// the same string).
+/// strict parser, `aterm_types::rfc3339::parse_utc`, shared with `atpkg::flow` so the two
+/// gates cannot disagree about the same string.
 ///
 /// The `Z` suffix is REQUIRED and the length exact. A zone-offset stamp (`…+05:30`) names
 /// a DIFFERENT instant than the digits ahead of it do, and reading it as UTC would move a
@@ -587,6 +585,29 @@ impl Roster {
         self.validate()?;
         aterm_toml::to_string(self).map_err(|_| RosterReject::Malformed)
     }
+}
+
+/// Unix seconds now, as the `now_unix` the roster's gates take: its `valid_until`
+/// ([`Roster::admit`]) and each machine's `not_after` ([`Roster::machine`]).
+///
+/// # A clock we cannot read fails CLOSED — `i64::MAX`, never `0`
+///
+/// Zero reads as 1970, before every conceivable deadline, so a roster generation that
+/// lapsed years ago would be ADMITTED and an expired machine treated as live — and roster
+/// freshness is the only defence a fresh install has (it carries no floor). `i64::MAX`
+/// makes every window look already expired, which refuses everything. It is the opposite
+/// of a retry-deadline clock, where "passed" means "retry now" and zero is right.
+// Skip: aterm_time clock accessors (third-party absent bodies).
+#[cfg_attr(trust_verify, trust::skip)]
+#[must_use]
+pub fn now_unix() -> i64 {
+    fail_closed(aterm_time::unix_secs())
+}
+
+/// [`now_unix`]'s decision, apart from the clock read so the fail-closed direction is
+/// tested rather than asserted in prose.
+fn fail_closed(unix_secs: Option<u64>) -> i64 {
+    unix_secs.map_or(i64::MAX, |s| i64::try_from(s).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
@@ -813,6 +834,20 @@ mod tests {
         // Equal is allowed (the gate is seq >= floor), so a re-fetch of the current roster
         // is not mistaken for an attack.
         assert_eq!(old.admit(3, NOW), Ok(()));
+    }
+
+    /// An unreadable clock yields `i64::MAX`, not `0`: every window then reads as EXPIRED,
+    /// so a lapsed roster is refused rather than admitted as if it were 1970.
+    #[test]
+    fn an_unreadable_clock_fails_closed_rather_than_reading_as_1970() {
+        assert_eq!(fail_closed(None), i64::MAX);
+        assert_eq!(fail_closed(Some(u64::MAX)), i64::MAX);
+        let r = roster();
+        assert_eq!(r.admit(0, 0), Ok(()), "1970 is inside every window");
+        assert_eq!(r.admit(0, fail_closed(None)), Err(RosterReject::Stale));
+        // NON-VACUITY: the readable path is unaffected and returns the real second.
+        assert_eq!(fail_closed(Some(1_790_000_000)), 1_790_000_000);
+        assert!(now_unix() > 1_700_000_000);
     }
 
     /// The freshness gate still refuses a lapsed roster (minted rosters say 9999-12-31 by

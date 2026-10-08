@@ -3,79 +3,50 @@
 
 //! The updater's SELF-HEALING ledger (`…/aterm/Updates/health.toml`): a durable record
 //! of check failures by CLASS — the memory that lets a silent background updater
-//! notice it is persistently broken and say so.
+//! notice it is persistently broken and say so. Without classes, "the network
+//! blipped" and "this binary can never download again" look the same.
 //!
-//! Build 826 shipped with a broken download pipeline and reported every failure as
-//! "transient": nothing distinguished "the network blipped" from "this binary can
-//! never download again", so a permanently stranded client looked healthy. The ledger
-//! closes that hole with PER-CLASS failure streaks:
-//!
-//! * `network` — the releases LIST itself failed: GitHub unreachable / auth broken /
-//!   unparseable. Genuinely transient things land here.
+//! * `network` — the channel pointer read (`HEAD …/releases/latest/download/
+//!   aterm-appcast.toml`) failed: unreachable, a refused redirect, an unexpected
+//!   status. Genuinely transient things land here.
 //! * `pipeline` — release metadata was visible but an asset that provably exists
-//!   could not be fetched. The network is fine, so the download machinery itself is
-//!   suspect — the build-826 signature. A `pipeline` streak of [`PERSISTENT_AFTER`]
-//!   is surfaced loudly ([`Health::is_persistent`] drives the status wording and a
-//!   user notification).
-//! * `manifest` — a manifest was FETCHED but rejected (bad signature / unparseable):
-//!   a release-side or under-attack state, visible in status but not the pipeline's
-//!   fault.
+//!   could not be fetched: the download machinery itself is suspect.
+//! * `manifest` — a manifest was FETCHED but rejected (bad signature / unparseable).
 //! * `stage` — the artifact downloaded but failed verification/staging (also
 //!   memoized by `FailedMark`).
-//! * `apply` — a VERIFIED, STAGED build failed to become the running build: the
-//!   seamless in-session handoff was refused/revoked/mismatched, the child died,
-//!   or the swap+re-exec failed. This is the class that used to be missing (see
-//!   SCOPE below); it is recorded by [`Health::record_apply_failure`] from the
-//!   GUI's apply lane, and it is deliberately NOT cleared by a healthy download
-//!   check — only by an apply that actually succeeds
-//!   ([`Health::record_apply_success`]). A check succeeding says nothing about
-//!   whether applying works, and conflating the two is exactly how a 100%-failing
-//!   apply lane read green.
+//! * `apply` — a VERIFIED, STAGED build failed to become the running build (handoff
+//!   refused/revoked/mismatched, the child died, the swap or re-exec failed).
+//!   Recorded by [`Health::record_apply_failure`] from the GUI's apply lane.
 //!
-//! The streaks are PER-CLASS (each cleared only by a fully healthy check), so an
-//! interleaved network blip cannot reset a pipeline streak and suppress the
-//! escalation. (An on-disk ledger from a pre-v0.26 build may carry the retired
-//! rescue-path counters; unknown keys parse fine and are dropped on the next write.)
+//! Streaks are PER-CLASS, so an interleaved network blip cannot reset a pipeline
+//! streak and suppress the escalation. Unknown keys from older ledgers parse and are
+//! dropped on the next write.
 //!
-//! # SCOPE — the apply lane is now covered too (2026-07-28)
-//!
-//! This ledger used to cover the CHECK/DOWNLOAD/STAGE lane ONLY, and said so. The
-//! gap was not hypothetical: through 2026-07 this machine carried an all-zero
-//! `health.toml` — a perfect score — while the seamless apply/handoff lane failed
-//! 100% of the time across three releases and every update had to wait for a cold
-//! launch. Downloading and staging really were healthy; the ledger was telling the
-//! truth about the only thing it measured, and the dashboard read green on a
-//! half-broken updater.
-//!
-//! The `apply` class closes it. Two rules keep it honest:
+//! Two rules keep the `apply` class honest:
 //!
 //! 1. **A healthy CHECK does not clear it.** [`Health::record_success`] resets the
-//!    acquisition streaks and leaves `apply_failures` alone, because "I can see
-//!    and download the release" is not evidence that applying it works. Only
+//!    acquisition streaks and leaves `apply_failures` alone: "I can download the
+//!    release" is no evidence that applying it works. Only
 //!    [`Health::record_apply_success`] clears it.
 //! 2. **It counts toward [`Health::is_persistent`].** A staged build that will not
-//!    apply strands the machine exactly as surely as one that will not download,
-//!    so it escalates to the same loud notification rather than sitting in a file.
+//!    apply strands the machine as surely as one that will not download.
 
 use aterm_update_core::FileLock;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// How long a ledger write waits for `health.toml.lock` before proceeding unlocked
-/// (plan P2-1). Every legitimate holder is one read→mutate→write; five seconds is
+/// How long a ledger write waits for `health.toml.lock` before proceeding unlocked.
+/// Every legitimate holder is one read→mutate→write; five seconds is
 /// hundreds of them, and past it the holder is stopped or wedged.
 const HEALTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Consecutive `pipeline` failures at which the state is called PERSISTENT: the
 /// status wording stops saying "deferred" and the GUI raises a notification.
-/// (Re-exported from the crate root so cross-platform status consumers share the
-/// one threshold.)
 ///
-/// The threshold means "three checks in a row". At the ten-minute cadence
-/// (`cadence::INTERVAL_SECS`, `spawn_background_check_with_settings`) — doubling while
-/// checks fail, so the waits are 10 and then 20 minutes — that is about half an hour of
-/// one failure class, long enough that a flaky network blip never escalates and short
-/// enough that a broken pipeline is named within the hour.
+/// Three checks in a row: at the ten-minute cadence (`cadence::INTERVAL_SECS`,
+/// doubling while checks fail) about half an hour of one failure class — long enough
+/// that a network blip never escalates, short enough that a broken pipeline is named
+/// within the hour.
 pub use crate::PERSISTENT_AFTER;
 
 /// The durable health record. All fields default so an absent/corrupt file reads as
@@ -98,7 +69,7 @@ pub struct Health {
     /// Consecutive `apply`-class failures: a verified, staged build that did not
     /// become the running build (handoff refused/revoked/mismatched, child died,
     /// swap or re-exec failed). Cleared ONLY by a successful apply, never by a
-    /// healthy download check — see the module SCOPE note.
+    /// healthy download check (see the module docs).
     #[serde(default)]
     pub apply_failures: u32,
     /// RFC3339 UTC at which each class's CURRENT streak began (empty when that
@@ -106,13 +77,9 @@ pub struct Health {
     /// [`Self::class_since`].
     ///
     /// [`Self::failing_since`] is any-class by definition: it stamps the moment the
-    /// ledger stopped being clean and does not move again until it is. Reporting a
-    /// per-class streak COUNT beside it therefore splices two different failures
-    /// into one sentence. Observed in the field on 2026-08-17: a machine carrying a
-    /// long-standing `apply` streak from 08-11 met a `manifest` failure on 08-15 and
-    /// `update status` read "FAILING (6 consecutive checks since 2026-08-11…)" — the
-    /// count from one class, the date from another, describing a problem as four
-    /// days older than it was and sending the diagnosis down the wrong lane.
+    /// ledger stopped being clean and does not move again until it is. A per-class
+    /// COUNT printed beside it would splice two different failures into one sentence
+    /// (one class's count, another's date).
     #[serde(default)]
     pub network_since: String,
     /// See [`Self::network_since`].
@@ -151,22 +118,15 @@ pub struct Health {
     pub last_apply_error: String,
     /// The most recent DIAGNOSIS-class failure's reason (`pipeline`,
     /// `manifest`, `stage`), kept apart from [`Self::last_error`] for the same
-    /// reason `last_apply_error` is (2026-09-14): a network blip landing on a
-    /// standing stage streak overwrote the one `last_error`, and every reader
-    /// that pairs the STANDING class with it — `update status`'s
-    /// `failing_checks_kind`, the loud notice's "updates download but will
-    /// not verify or install (…)" — described a bundle that will not verify
-    /// with a DNS error, for the life of the memo. Whenever the ledger
+    /// reason `last_apply_error` is: a network blip on a standing stage streak
+    /// must not leave that streak described by a DNS error. Whenever the ledger
     /// re-labels itself to a standing diagnosis class it restores this.
     #[serde(default)]
     pub last_diagnosis_error: String,
     /// RFC3339 UTC of [`Self::last_apply_error`] (empty when there is none).
     ///
-    /// [`Self::last_failure_at`] is any-class: a DNS blip at 21:53 re-dates a
-    /// ledger whose apply lane last actually failed days earlier, and `update
-    /// status` then presents a long-dead streak as fresh (observed on m3,
-    /// 2026-08-14: the "last failure" was a `curl` resolve error, not an
-    /// apply). The apply lane owns its own clock.
+    /// [`Self::last_failure_at`] is any-class: a DNS blip would re-date an apply
+    /// streak that last failed days earlier. The apply lane owns its own clock.
     #[serde(default)]
     pub last_apply_failure_at: String,
     /// The build that was RUNNING when the last apply failure was recorded
@@ -176,9 +136,8 @@ pub struct Health {
     /// ever the claim "THIS running build cannot be replaced through the
     /// lane", and once a DIFFERENT build is running the machine has moved —
     /// through the channel, a manual install, or a boot swap — so the claim
-    /// is proven stale. Without this, a manually-updated healthy machine
-    /// carried `persistent=true` forever (m3: 2,191 counted failures on an
-    /// up-to-date install).
+    /// is proven stale. Without this, a manually-updated healthy machine would
+    /// carry `persistent=true` forever.
     #[serde(default)]
     pub last_apply_failure_build: u64,
     /// The build the failed apply was TRYING TO REACH (0 when unknown) — the
@@ -186,13 +145,9 @@ pub struct Health {
     /// [`Self::last_apply_failure_build`], which names the build that was
     /// RUNNING.
     ///
-    /// The two are different questions and only one of them was ever recorded.
     /// `apply_failures` is expiry-bound to the RUNNING build, so staging a NEWER
-    /// artifact resets nothing: a stage that failed twice, superseded by a fresh
-    /// download, handed its streak and its reason straight to the successor, and
-    /// every surface decorated a never-attempted build with "tried twice, the new
-    /// version didn't start". This field is what lets a reader ask "is that streak
-    /// about the thing I am looking at?" and get a truthful no.
+    /// artifact resets nothing; this field lets a reader ask whether that streak is
+    /// about the build on offer, so a fresh download never inherits "tried twice".
     #[serde(default)]
     pub last_apply_failure_target_build: u64,
     /// Consecutive failed applies OF [`Self::last_apply_failure_target_build`],
@@ -201,10 +156,8 @@ pub struct Health {
     /// [`Self::apply_failures`] is the ESCALATION streak and is deliberately
     /// running-build-scoped ("this machine cannot be moved through the lane"), so
     /// it must not reset when a new artifact appears or a machine whose every
-    /// stage fails once would never escalate. But "aterm tried to update twice" is
-    /// a claim about the ARTIFACT ON OFFER, and answering it from the escalation
-    /// streak told a person their fresh download had already been attempted three
-    /// times. Two counts because there are two questions.
+    /// stage fails once would never escalate. "aterm tried to update twice" is a
+    /// claim about the ARTIFACT ON OFFER. Two counts because there are two questions.
     #[serde(default)]
     pub apply_failures_for_target: u32,
     /// The most recent apply-lane REFUSAL: a verdict that stopped an apply
@@ -213,12 +166,9 @@ pub struct Health {
     /// Deliberately not a streak and deliberately absent from
     /// [`Self::total_failures`]/[`Self::is_persistent`]: a refusal is a normal,
     /// self-correcting state, and counting one would manufacture a persistent-
-    /// failure escalation out of ordinary terminal use. That reasoning is why
-    /// refusals were recorded NOWHERE — which is the defect this field closes.
-    /// In the field, `update apply` answered "OK apply requested", the reducer
-    /// refused it, and `update status` went on reporting a healthy updater with
-    /// a staged build for hours: a refusal that records nothing is
-    /// indistinguishable from an updater that never ran at all.
+    /// failure escalation out of ordinary terminal use. Still recorded, because a
+    /// refusal that records nothing is indistinguishable from an updater that never
+    /// ran.
     #[serde(default)]
     pub last_apply_refusal: String,
     /// RFC3339 UTC of [`Self::last_apply_refusal`] (empty when there is none).
@@ -241,14 +191,9 @@ pub struct Health {
     /// [`Self::pending_since`], when it was first seen waiting. `0` when
     /// nothing newer is waiting. Written by [`Self::note_pending_update`].
     ///
-    /// THE CLOCK THE UPDATER NEVER HAD (the 2026-09-22/23 update audit, plan
-    /// P1-1(b)). `ready.toml`'s `staged_at` is rewritten by every re-stage (the
-    /// incident's marker said 00:46:48Z for a build first staged at 00:10:45Z)
-    /// and nothing read it anyway, so a machine could run an old build beside a
-    /// verified newer one for 20–25 hours — 0.90 and 0.91 both did — while the
-    /// only trace was the check lane's "the apply lane has failed it 2×" line,
-    /// fifty times over. This one survives re-stages and is read: past
-    /// [`crate::PENDING_UPDATE_OVERDUE_SECS`] the loud notice fires.
+    /// Unlike `ready.toml`'s `staged_at`, which every re-stage rewrites, this clock
+    /// survives re-stages: past [`crate::PENDING_UPDATE_OVERDUE_SECS`] the loud
+    /// notice fires.
     #[serde(default)]
     pub pending_build: u64,
     /// RFC3339 UTC at which [`Self::pending_build`] was first seen waiting
@@ -260,17 +205,11 @@ pub struct Health {
     /// every reader live — in microseconds (0 when none has been measured).
     /// Written by [`Self::record_handoff_capture`].
     ///
-    /// THE MEMORY THE FIRST FREEZE RUNG NEVER HAD (gap #25, 2026-09-26). The
-    /// first automatic park's budget was a constant 20 ms, and on the owner's
-    /// desk the park had grown past it: 0.91 and 0.92 both missed that rung,
-    /// re-parked 500 ms later on the 80 ms rung and landed there in 22 and 20
-    /// ms — a stall, a second park and about half a second of extra wall time
-    /// on every update. The GUI now seeds that rung from measurements —
-    /// `clamp(1.5 × the larger of this and [`Self::handoff_park_us`], 20 ms,
-    /// 80 ms)` — and this is where they outlive the process that took them:
-    /// the next update reads them back ([`crate::handoff_capture_prior`]).
-    /// Observability and a PRIOR, never a gate: an absent or corrupt value is
-    /// the 20 ms default the rung always had.
+    /// The GUI seeds the first freeze rung from measurements — `clamp(1.5 × the
+    /// larger of this and [`Self::handoff_park_us`], 20 ms, 80 ms)` — and this is
+    /// where they outlive the process that took them
+    /// ([`crate::handoff_capture_prior`]). A PRIOR, never a gate: an absent or
+    /// corrupt value is the 20 ms default.
     #[serde(default)]
     pub handoff_capture_us: u64,
     /// How many sessions the timed capture of [`Self::handoff_capture_us`]
@@ -298,11 +237,9 @@ pub struct Health {
     /// [`Self::record_handoff_park`].
     ///
     /// The dry run of [`Self::handoff_capture_us`] cannot time the part of the
-    /// park that IS the freeze — stopping the readers — and on the owner's desk
-    /// that part is most of it: measured 2026-09-26 at opt-level 3, the capture
-    /// of two 50x200 sessions with 10 000 scrollback lines each takes 1.1 ms,
-    /// where 0.91's and 0.92's parks of a two-session desk took 22 and 20 ms.
-    /// So the next update seeds its first rung from the larger of the two.
+    /// park that IS the freeze — stopping the readers — and that part is most of it
+    /// (measured 2026-09-26: a 1.1 ms capture inside a ~20 ms park). So the next
+    /// update seeds its first rung from the larger of the two.
     #[serde(default)]
     pub handoff_park_us: u64,
     /// The build that was RUNNING when [`Self::handoff_park_us`] was recorded
@@ -317,15 +254,10 @@ pub struct Health {
 /// The longest error text the ledger stores, in characters.
 const MAX_STORED_ERROR_CHARS: usize = 400;
 
-/// `error` cut to [`MAX_STORED_ERROR_CHARS`] — WITHOUT CUTTING OFF WHAT IT IS
-/// (round seven, H1 open problem 101). A passing refusal carries its key
-/// ([`crate::PASSING_REFUSAL_KEY`]) at the END of its text, and every reader that
-/// tells a moment from a verdict reads it off the stored string: the persistent
-/// notice's "staging could not finish … nothing is known against the build" arm
-/// among them. A DMG whose four `hdiutil attach` attempts each ran past their limit
-/// joins into one ~456-character refusal; cut at 400 it lost the key, and the
-/// notice then said the build "will not verify or install". Such a text keeps its
-/// head and its key, with the cut marked.
+/// `error` cut to [`MAX_STORED_ERROR_CHARS`] — WITHOUT CUTTING OFF WHAT IT IS. A
+/// passing refusal carries its key ([`crate::PASSING_REFUSAL_KEY`]) at the END of its
+/// text, and readers ([`crate::is_passing_refusal`]) tell a moment from a verdict by
+/// it. Such a text keeps its head and its key, with the cut marked.
 fn capped_error(error: &str) -> String {
     if error.chars().count() <= MAX_STORED_ERROR_CHARS {
         return error.to_string();
@@ -365,19 +297,11 @@ impl Health {
     ///
     /// The apply streak is deliberately excluded. It is reported separately as
     /// `failing_applies` because it answers a different question ("can this machine
-    /// move to an update?" versus "can it fetch one?"), and summing the two made the
-    /// `failing=` field double-count: a machine with two network blips beside a
-    /// standing apply streak of 7 printed `failing=9:network failing_applies=7` —
-    /// nine consecutive failures of class `network` when two checks had failed —
-    /// sending a reader after an acquisition fault that did not exist.
+    /// move to an update?" versus "can it fetch one?").
     ///
-    /// NOT A SUM ACROSS CLASSES (2026-09-10). The four acquisition streaks used to be
-    /// added together, and a ledger that inherited another build's dead `manifest`
-    /// streak of 999 beside this build's 20 `pipeline` failures printed
-    /// `failing=1019:pipeline` — a count no lane ever produced, attached to the one
-    /// class that happened to be standing. The field now reports the STANDING
-    /// class's own count ([`Self::standing_acquisition_class`], the same class the
-    /// `:kind` suffix names), so the number and the label describe one streak.
+    /// Not a sum across classes either: it is the STANDING class's own count
+    /// ([`Self::standing_acquisition_class`], the class the `:kind` suffix names), so
+    /// the number and the label describe one streak.
     #[must_use]
     pub fn acquisition_failures(&self) -> u32 {
         match self.standing_acquisition_class() {
@@ -433,11 +357,7 @@ impl Health {
     /// or `None` while nothing is persistently failing.
     ///
     /// Callers need the CLASS, not just the boolean: the count and the sentence a
-    /// user is shown have to come from the streak that actually escalated. Reporting
-    /// `pipeline_failures` for an `apply`-class escalation printed "0 consecutive
-    /// checks … cannot be downloaded" — a nonsense count attached to the wrong lane —
-    /// because a healthy check zeroes the acquisition streaks and deliberately
-    /// preserves only `apply` ([`Self::record_success`]).
+    /// user is shown have to come from the streak that actually escalated.
     ///
     /// Order is severity-of-diagnosis, not precedence: the earlier a class sits in
     /// the acquire→apply pipeline, the more it explains, so it wins the report.
@@ -471,12 +391,6 @@ impl Health {
     /// `network` is deliberately excluded: it is the one genuinely transient class
     /// (GitHub unreachable, auth blip), and it already slows the cadence rather than
     /// alarming the user.
-    ///
-    /// Omitting `manifest` and `stage` is not hypothetical. On 2026-07-25 a machine
-    /// carried `manifest_failures = 597` — an unsigned release under a pinned channel,
-    /// ~13 hours — and nothing escalated, because this predicate watched only
-    /// `pipeline` and `apply`. That is precisely the silent stranding this ledger
-    /// exists to prevent; see the regression test below.
     #[must_use]
     pub fn is_persistent(&self) -> bool {
         self.persistent_class().is_some()
@@ -510,13 +424,8 @@ impl Health {
                 *since = now.clone();
             } else if since.is_empty() {
                 // A COUNT WITHOUT ITS CLOCK is a streak this ledger cannot vouch
-                // for: it was written by a build that predates per-class clocks
-                // (or by a build on another lane entirely). Carrying it forward
-                // printed "FAILING (20 consecutive checks since <the manifest
-                // streak's date>)" on a build that had failed exactly one check —
-                // the count from one build, the date from another class
-                // (2026-09-10 audit, m21). The streak restarts HERE, dated now,
-                // so the count and the date describe failures this ledger saw.
+                // for (written by a build without per-class clocks). It restarts
+                // HERE, dated now, so the count and the date describe one streak.
                 *count = 0;
                 *since = now.clone();
             }
@@ -527,9 +436,7 @@ impl Health {
         // the artifact would not stage) are mutually exclusive verdicts about the
         // same check, so a failure of one of them means the check did NOT fail the
         // other two — their streaks are no longer consecutive and are cleared here,
-        // with their clocks. Without this a dead `manifest` streak from a previous
-        // build sat beside a live `pipeline` one and the two were summed
-        // (`total_failures`) into a count no lane produced. `network` is left
+        // with their clocks. `network` is left
         // alone on purpose: it is weather, and the module's standing rule is that
         // a blip must not reset a standing diagnosis (nor does a diagnosis need to
         // forget a blip); `apply` is a different lane and is never touched by a
@@ -561,7 +468,7 @@ impl Health {
     /// class's own reason: the apply lane's for `apply`, the diagnosis lane's
     /// for `pipeline`/`manifest`/`stage`, nothing for a bare network blip
     /// (weather has no diagnosis). Every writer that clears some streaks and
-    /// leaves others goes through here (2026-09-14).
+    /// leaves others goes through here.
     fn relabel_by_standing(h: &mut Self) {
         if h.total_failures() == 0 {
             h.kind = String::new();
@@ -595,9 +502,7 @@ impl Health {
     /// `apply_failures` deliberately survives. A check proves the machine can see,
     /// fetch, verify and stage a release; it proves nothing about whether that
     /// staged build can be made to run, which is a different lane with different
-    /// failure modes. Clearing it here would recreate the exact blindness this
-    /// class was added to remove — every 75 s check would wipe the evidence that
-    /// the handoff never completes. Use [`Self::record_apply_success`] for that.
+    /// failure modes. Use [`Self::record_apply_success`] for that.
     pub fn record_success(path: &Path) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
@@ -663,9 +568,6 @@ impl Health {
     /// memo that streak represents, so a full [`Self::record_success`] here would erase
     /// the evidence of the very thing being backed off from, and the machine would
     /// report a clean stage lane for as long as it kept refusing to use it.
-    ///
-    /// Same shape, and the same reasoning, as `record_success` preserving the apply
-    /// streak — see this module's SCOPE note.
     pub fn record_acquisition_success(path: &Path) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
@@ -699,13 +601,9 @@ impl Health {
         target_build: u64,
         reason: &str,
     ) -> Self {
-        // ONE LOCK SCOPE, deliberately. This used to call `record_failure` (which
-        // locks, writes and releases) and then re-lock to mirror the reason. Between
-        // the two scopes another writer could land — `expire_stale_apply_streak` runs
-        // from the check lane on its own cadence — read the just-incremented ledger,
-        // decide the streak was recorded by a different build, zero it, and write. The
-        // increment was then durably gone, and the apply lane under-counted exactly
-        // when it was failing often enough to interleave.
+        // ONE LOCK SCOPE: between two scopes `expire_stale_apply_streak` (check
+        // lane) could read the just-incremented ledger, zero the streak as another
+        // build's, and lose the increment.
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
         Self::advance_failure_streak(&mut h, "apply", reason);
@@ -714,9 +612,7 @@ impl Health {
         h.last_apply_error = capped_error(reason);
         h.last_apply_failure_at = crate::install::now_rfc3339();
         h.last_apply_failure_build = current_build;
-        // A DIFFERENT ARTIFACT STARTS ITS OWN COUNT. Carrying the previous target's
-        // streak forward is what let a freshly-downloaded build inherit "tried
-        // twice" from the one it replaced.
+        // A DIFFERENT ARTIFACT STARTS ITS OWN COUNT.
         if h.last_apply_failure_target_build != target_build {
             h.apply_failures_for_target = 0;
         }
@@ -737,7 +633,7 @@ impl Health {
     /// moved by any means heals within one check interval. A streak whose
     /// recording build is unknown (0 — a pre-field ledger) expires too: the
     /// machine cannot prove it stale, but a pre-field ledger also cannot
-    /// prove it FRESH, and the demo-blocking failure mode is a stale streak
+    /// prove it FRESH, and the worse failure mode is a stale streak
     /// presented as standing (the reverse error self-corrects: a real
     /// failing lane re-records within one apply attempt).
     pub fn expire_stale_apply_streak(path: &Path, current_build: u64) -> Self {
@@ -746,15 +642,10 @@ impl Health {
         if h.apply_failures == 0 || h.last_apply_failure_build == current_build {
             return h;
         }
-        // ONLY A NEWER BUILD PROVES THE MACHINE MOVED (2026-09-14). A process
-        // whose image is OLDER than the recorder — a terminal session launched
-        // before a seamless self-update, running the old build for as long as
-        // its tab lives, its checker loop still ticking — knows nothing about
-        // the apply lane the window is failing on, and its half-hourly check
-        // used to zero the window's live streak: `failing_applies` never
-        // reached the persistent threshold, the notice never fired, and the
-        // freeze budget's per-artifact count restarted from zero. A pre-field
-        // ledger (recorder 0) still expires, as documented above.
+        // ONLY A NEWER BUILD PROVES THE MACHINE MOVED. A process whose image is
+        // OLDER than the recorder (a terminal session launched before a seamless
+        // self-update) knows nothing of the window's apply lane and must not zero
+        // its live streak. A pre-field ledger (recorder 0) still expires.
         if h.last_apply_failure_build != 0 && current_build < h.last_apply_failure_build {
             return h;
         }
@@ -767,10 +658,7 @@ impl Health {
         h.last_apply_failure_target_build = 0;
         if h.total_failures() == 0 || h.kind == "apply" {
             // Some acquisition streak may still stand; let it own the headline
-            // WITH ITS OWN REASON. NAMING it matters: `kind == ""` is the
-            // documented HEALTHY sentinel, so blanking it here reported a healthy
-            // class on a machine with a live streak; blanking `last_error`
-            // printed `failing=N:stage` beside no reason at all.
+            // WITH ITS OWN REASON (`kind == ""` means healthy).
             Self::relabel_by_standing(&mut h);
         }
         h.write(path);
@@ -810,6 +698,22 @@ impl Health {
         self.last_apply_refusal_build = 0;
     }
 
+    /// Withdraw the standing apply refusal when it carries `key` — a refusal whose
+    /// cause the caller has just answered, such as the swap's wait for a roster
+    /// confirmation (`crate::manifest::ROSTER_UNCONFIRMED_KEY`), which the
+    /// confirming check ends. Any other refusal is untouched, and so is every
+    /// streak. No write when nothing matches.
+    pub fn withdraw_apply_refusal_containing(path: &Path, key: &str) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        if key.is_empty() || !h.last_apply_refusal.contains(key) {
+            return h;
+        }
+        h.clear_apply_refusal();
+        h.write(path);
+        h
+    }
+
     /// Record that an apply actually succeeded — the staged build is now the
     /// running build. Clears the `apply` streak only; the acquisition streaks are
     /// owned by [`Self::record_success`].
@@ -834,11 +738,7 @@ impl Health {
             h.apply_failures = 0;
             h.apply_since = String::new();
             h.last_apply_error = String::new();
-            // The dated stamp and its build go with the streak they dated
-            // (2026-09-14): a ledger reading `apply_failures = 0` beside
-            // `last_apply_failure_at = <today>` described a failure that no longer
-            // stands, and `expire_stale_apply_streak` was the only thing that ever
-            // cleared them.
+            // The dated stamp and its build go with the streak they dated.
             h.last_apply_failure_at = String::new();
             h.last_apply_failure_build = 0;
             if h.total_failures() == 0 || h.kind == "apply" {
@@ -857,8 +757,7 @@ impl Health {
     /// observes it (`observed`: the newest of the staged marker and an installed
     /// bundle newer than the running image; `None` when this observation found
     /// neither), and return the ledger with [`Self::pending_build`] /
-    /// [`Self::pending_since`] brought up to date (plan P1-1(b), the
-    /// 2026-09-22/23 update audit).
+    /// [`Self::pending_since`] brought up to date.
     ///
     /// THE FIRST SIGHTING WINS, which is the whole point: re-observing the same
     /// build — every check cycle, every re-stage of the same release — never
@@ -892,10 +791,27 @@ impl Health {
         h
     }
 
+    /// Restart the pending clock for `build`, which could not be installed until now
+    /// and now can: its roster authorization had gone stale (a day with no check,
+    /// most often the app closed) and a check has just confirmed it — and return the
+    /// ledger. The overdue notice promises that "a newer build
+    /// has been here an hour and is not running" is a stuck update; a stage no lane
+    /// was allowed to install says nothing about the lanes, so the hour counts from
+    /// when one was. A clock keyed to another build is left alone.
+    pub fn restart_pending_update(path: &Path, build: u64) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        if h.pending_build == build && build != 0 {
+            h.pending_since = crate::install::now_rfc3339();
+            h.write(path);
+        }
+        h
+    }
+
     /// Drop the pending clock for `build`, which was WITHDRAWN — quarantined or
-    /// yanked, and so never going to be applied (round six, finding 40; the caller
-    /// judges that) — and return the ledger. A clock another observation has since
-    /// re-keyed to a different build is left alone.
+    /// yanked, and so never going to be applied (the caller judges that) — and return
+    /// the ledger. A clock another observation has since re-keyed to a different build
+    /// is left alone.
     pub fn forget_pending_update(path: &Path, build: u64) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
@@ -907,7 +823,7 @@ impl Health {
         h
     }
 
-    /// Record one TIMED handoff capture (gap #25): `capture_us` microseconds to
+    /// Record one TIMED handoff capture: `capture_us` microseconds to
     /// capture `sessions` session(s), measured by `current_build`, which seeded
     /// a first freeze rung of `freeze_seed_ms`. The newest measurement replaces
     /// the last one outright — it is a prior about THIS desk and THIS build,
@@ -958,9 +874,8 @@ impl Health {
     /// health is observability, never a gate, so a missed lock must never drop the
     /// update. Held for the lifetime of the returned guard (i.e. the record_* call).
     ///
-    /// BOUNDED (plan P2-1): the check loop records here every cycle, and a blocking
-    /// `flock` against a holder that was stopped mid-write parked it forever — for a
-    /// lock whose own contract is that missing it must never drop the update. Every
+    /// BOUNDED: the check loop records here every cycle, and a blocking `flock`
+    /// against a holder stopped mid-write would park it forever. Every
     /// real holder is one read→mutate→write, milliseconds long; a holder past
     /// [`HEALTH_LOCK_WAIT`] is wedged, and the unlocked fallback above applies.
     fn lock(path: &Path) -> Option<FileLock> {
@@ -994,19 +909,40 @@ impl Health {
 mod tests {
     use super::*;
 
-    /// Per-TEST scratch dir (tests share one process, so a pid-keyed dir would race
-    /// across the parallel test threads).
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("aterm-health-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.join("health.toml")
+    /// `health.toml` in a per-TEST scratch dir (tests share one process, so a
+    /// pid-keyed dir would race across the parallel test threads). Dereferences to
+    /// the file's path; the dir goes when this does.
+    struct Scratch {
+        file: std::path::PathBuf,
+        _dir: aterm_tempfile::TempDir,
     }
 
-    /// A TIMED HANDOFF CAPTURE IS A PRIOR (gap #25): it survives a re-read, the
-    /// newest measurement replaces the last outright (an older, cheaper desk is
-    /// exactly the number that made the first freeze rung miss), a zero reading
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    fn tmp(name: &str) -> Scratch {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-health-test-{name}-"))
+            .tempdir()
+            .unwrap();
+        Scratch {
+            file: dir.path().join("health.toml"),
+            _dir: dir,
+        }
+    }
+
+    /// A TIMED HANDOFF CAPTURE IS A PRIOR: it survives a re-read, the newest
+    /// measurement replaces the last outright, a zero reading
     /// records nothing, and no streak or standing slot moves for it.
     #[test]
     fn a_timed_handoff_capture_is_kept_as_a_prior_and_moves_no_streak() {
@@ -1440,13 +1376,9 @@ mod tests {
         assert!(Health::read(&p).is_persistent());
     }
 
-    /// THE 2026-07-25 INCIDENT, pinned. A machine carried `manifest_failures = 597`
-    /// with `last_error = "authoritative update v0.61 is unsigned under the pinned
-    /// channel"` for ~13 hours and NOTHING escalated, because `is_persistent` watched
-    /// only `pipeline` and `apply`. The class cannot heal on the client — an unsigned
+    /// A MANIFEST STREAK ESCALATES. The class cannot heal on the client — an unsigned
     /// release stays unsigned until the publisher republishes — so a streak of it
-    /// means this Mac can never update again, which is the loudest thing this ledger
-    /// can be asked to say.
+    /// means this Mac cannot update.
     #[test]
     fn a_manifest_streak_escalates_and_names_its_own_class() {
         let p = tmp("manifest-persistent");
@@ -1586,13 +1518,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// A PASSING REFUSAL LONGER THAN THE CAP IS STILL A PASSING REFUSAL WHEN STORED
-    /// (round seven, H1 open problem 101). `Mounted::attach` joins its four
-    /// timed-out `hdiutil attach` attempts into one message and marks it passing once,
-    /// at the end — about 456 characters, measured. Cut at 400 characters the key was
-    /// gone, and once the stage streak reached `PERSISTENT_AFTER` the notice said
-    /// "updates download but will not verify or install" about a build nothing was
-    /// known against.
+    /// A PASSING REFUSAL LONGER THAN THE CAP IS STILL A PASSING REFUSAL WHEN STORED.
+    /// `Mounted::attach` joins four timed-out `hdiutil attach` attempts into one
+    /// ~456-character message whose passing key is at the end.
     #[test]
     fn a_long_passing_refusal_keeps_its_key_in_the_ledger() {
         let p = tmp("long-passing");
@@ -1634,10 +1562,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// THE SPLICE MEASURED ON m21 (2026-09-10): a ledger carrying a dead `manifest`
-    /// streak of 999 (another build's, clock-less) met this build's `pipeline`
-    /// failures and `update status` printed `failing=1019:pipeline` — the classes
-    /// summed, the date borrowed. A pipeline failure now CLEARS its sibling
+    /// NO SPLICED COUNT: a ledger carrying a dead, clock-less `manifest` streak of 999
+    /// meets this build's `pipeline` failures. A pipeline failure CLEARS its sibling
     /// diagnoses, the reported count is the standing class's own, and a clock-less
     /// count restarts under a clock of its own.
     #[test]
@@ -1712,8 +1638,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// THE REASON-TEXT SPLICE THE 2026-09-10 FIX LEFT BEHIND (stage-verify audit,
-    /// 2026-09-14). Counts and clocks are per class now, but there is ONE
+    /// NO SPLICED REASON. Counts and clocks are per class, but there is ONE
     /// `last_error`, and it belongs to whichever failure landed LAST. Every reader
     /// pairs the STANDING class with it: `UpdateStatus` prints `failing_checks_kind`
     /// beside `last_error`, and the loud notice says "updates download but will not
@@ -1752,7 +1677,7 @@ mod tests {
 
     /// The same splice from the apply-expiry side: `expire_stale_apply_streak` blanks
     /// `last_error` while NAMING a standing acquisition class, so the status line
-    /// reads `failing=1:stage` with no reason at all (stage-verify audit, 2026-09-14).
+    /// would read `failing=1:stage` with no reason at all.
     #[test]
     fn expiring_a_stale_apply_streak_leaves_the_standing_diagnosis_its_reason() {
         let p = tmp("expire-keeps-reason");
@@ -1771,10 +1696,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// THE PENDING CLOCK SURVIVES RE-STAGES (the 2026-09-22/23 update audit, plan
-    /// P1-1(b)). `ready.toml`'s `staged_at` is rewritten by every re-stage — the
-    /// incident's marker said 00:46:48Z for a 0.91 first staged at 00:10:45Z — so
-    /// "how long has this machine been behind?" had no answer. The first sighting
+    /// THE PENDING CLOCK SURVIVES RE-STAGES (`ready.toml`'s `staged_at` does not).
+    /// The first sighting
     /// of a build wins; a different newer build starts its own clock; an
     /// observation that merely found nothing (the stage retired for the very swap
     /// that strands a machine) keeps it; only a running build that caught up

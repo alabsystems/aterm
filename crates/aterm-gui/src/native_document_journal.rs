@@ -20,11 +20,12 @@ use std::sync::Arc;
 use aterm_buffer::Seq;
 
 use crate::document_store::{DocumentId, DocumentSnapshot};
+use crate::native_document_host::{replace_file, sync_directory};
 use crate::native_document_io::{
     ContentFingerprint, DraftJournalReducer, DurableCheckpoint, DurableSource, JournalAppendPlan,
     JournalAppendProof, JournalAppendResult, JournalDocumentKey, JournalEdit, JournalError,
     JournalRecord, JournalReduction, JournalStage, MAX_INSERT_BYTES, MAX_JOURNAL_BYTES,
-    compact_journal, encode_journal, recover_journal_for,
+    StoredJournalRecovery, compact_journal, encode_journal, recover_journal_for,
 };
 
 const COMPACT_RECORDS: usize = 128;
@@ -32,26 +33,22 @@ const COMPACT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryNotice {
-    Recovered { records: usize },
+    Recovered,
     DiskConflict,
-    Corrupt(String),
+    /// The journal did not decode; its cause is logged where it is found.
+    Corrupt,
 }
 
 impl RecoveryNotice {
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::Recovered { records } => format!(
-                "Recovered an unsaved draft from {records} durable journal record{}",
-                if *records == 1 { "" } else { "s" }
-            ),
+            Self::Recovered => "Recovered an unsaved draft — the file on disk is unchanged",
             Self::DiskConflict => {
-                "A recovered draft conflicts with newer disk content; the draft was preserved"
-                    .to_string()
+                "An unsaved draft conflicts with newer disk content; showing the file on disk (the draft is kept)"
             }
-            Self::Corrupt(reason) => {
-                format!("A damaged recovery journal was preserved: {reason}")
-            }
+            Self::Corrupt => "An unsaved draft could not be read; showing the file on disk (it is kept)",
         }
+        .to_string()
     }
 }
 
@@ -167,11 +164,18 @@ struct JournalEntry {
     rewrite_inflight: Option<InflightRewrite>,
     pending_checkpoint: Option<SavedBaseline>,
     /// The first snapshot this store published — the file contents the draft
-    /// was made against (the file at open, or the last verified save) — as a
+    /// was made against (the file at open, or the last verified save), or the
+    /// draft itself after a re-seat found no baseline to copy — as a
     /// fingerprint and a sequence. A re-seat keeps it: the text itself is read
     /// back from the image on disk, never held twice in memory.
     baseline: ContentFingerprint,
     baseline_seq: Seq,
+    /// Whether `baseline` is the file's contents: set by `initialize` and a
+    /// verified checkpoint, cleared by a re-seat that records its target as its
+    /// own baseline, twice. Only while it holds may a re-seat publish a
+    /// lone snapshot, which every later open reads as clean
+    /// ([`holds_no_draft`]).
+    baseline_is_file: bool,
     /// The image on disk may no longer be this store's own. An update's
     /// successor republishes the journal of every document it restores, under
     /// ITS sequence numbers; when that update rolls back, this process owns the
@@ -222,6 +226,8 @@ pub(crate) struct JournalReseatPlan {
     pub(crate) ours: ContentFingerprint,
     pub(crate) baseline: ContentFingerprint,
     pub(crate) baseline_seq: Seq,
+    /// [`JournalEntry::baseline_is_file`].
+    pub(crate) baseline_is_file: bool,
     /// What this store last proved durable, and what it holds now: an image
     /// that recovers to either is one this store already had.
     pub(crate) durable_text: Arc<str>,
@@ -235,14 +241,17 @@ pub(crate) enum JournalReseatResult {
     Unchanged,
     /// A fresh image recovering to the plan's target was published. `baseline`
     /// is its first snapshot: the plan's own when the image found on disk still
-    /// carried it, else the target itself (the file's baseline was not there to
-    /// copy, so a later open reports a disk conflict rather than replaying the
-    /// draft over contents it was not made against). `preserved` says whether
-    /// the image found there was set aside first.
+    /// carried it or the target is that baseline, else the target itself (the
+    /// file's baseline was not there to copy, so a later open reports a disk
+    /// conflict rather than replaying the draft over contents it was not made
+    /// against, and keeps it aside rather than replacing it).
+    /// `baseline_is_file` says whether that snapshot is still the file's
+    /// contents, `preserved` whether the image found there was set aside first.
     Republished {
         image: ContentFingerprint,
         baseline: ContentFingerprint,
         baseline_seq: Seq,
+        baseline_is_file: bool,
         preserved: bool,
     },
     Failed(String),
@@ -354,6 +363,7 @@ impl DocumentJournalStore {
                 pending_checkpoint: None,
                 baseline: ContentFingerprint::of(disk.text.as_bytes()),
                 baseline_seq: disk.seq,
+                baseline_is_file: true,
                 reseat_owed: false,
                 reseat_inflight: None,
                 reseat_failed: false,
@@ -538,6 +548,7 @@ impl DocumentJournalStore {
                 ours: entry.durable_image,
                 baseline: entry.baseline,
                 baseline_seq: entry.baseline_seq,
+                baseline_is_file: entry.baseline_is_file,
                 durable_text: entry.durable_text.clone(),
                 target_seq: entry.desired.seq,
                 target_text: entry.desired.text.clone(),
@@ -749,6 +760,7 @@ impl DocumentJournalStore {
                 // The verified save is the image's first snapshot now.
                 entry.baseline = ContentFingerprint::of(checkpoint.text.as_bytes());
                 entry.baseline_seq = checkpoint.seq;
+                entry.baseline_is_file = true;
                 JournalCompletion::Durable {
                     document,
                     seq: plan.target_seq,
@@ -796,6 +808,7 @@ impl DocumentJournalStore {
                 image,
                 baseline,
                 baseline_seq,
+                baseline_is_file,
                 preserved: _,
             } => {
                 entry.reducer =
@@ -804,6 +817,7 @@ impl DocumentJournalStore {
                 entry.durable_image = image;
                 entry.baseline = baseline;
                 entry.baseline_seq = baseline_seq;
+                entry.baseline_is_file = baseline_is_file;
                 entry.append_failed = false;
                 JournalCompletion::Durable {
                     document,
@@ -882,8 +896,7 @@ pub(crate) fn hold_journal_lock_for_test(
 ) -> crate::native_document_host::HeldAdvisoryLock {
     let lock = open_journal_lock(&journal_lock_path(path).expect("journal lock path"))
         .expect("open journal lock");
-    lock.lock().expect("take journal lock");
-    crate::native_document_host::HeldAdvisoryLock::adopt(lock)
+    crate::native_document_host::HeldAdvisoryLock::lock(lock).expect("take journal lock")
 }
 
 #[cfg(test)]
@@ -973,6 +986,19 @@ pub(crate) fn verify_carried_draft(
     Ok(())
 }
 
+/// Whether a journal image holds no draft: it is its first snapshot alone, the
+/// file as it was opened or last saved, with nothing journaled past it. No
+/// writer leaves a draft as one record: `initialize` and a checkpoint write the
+/// file's snapshot, then the draft's when there is one; an append adds records,
+/// and compaction collapses an image to one only when its latest text is that
+/// snapshot at that sequence; a re-seat writes its target alone only when it is
+/// the file's contents ([`JournalEntry::baseline_is_file`]), and otherwise after
+/// the baseline it copied, or twice when it stands as its own. Such an image is
+/// never kept aside: it holds nothing the file did not once hold.
+fn holds_no_draft(recovered: &StoredJournalRecovery) -> bool {
+    recovered.record_count == 1
+}
+
 /// The first snapshot of a journal image for `key` — the file contents its
 /// draft was made against. `None` for an image that does not decode, belongs
 /// to another document, or does not open with a snapshot.
@@ -990,11 +1016,20 @@ fn journal_baseline_text(key: JournalDocumentKey, bytes: &[u8]) -> Option<String
 
 /// `patience` carries the caller's thread, exactly as in [`execute_journal_append`].
 ///
-/// Under the journal lock: an image that is still this store's is left alone;
-/// anything else is replaced by `[baseline, target]` — the baseline copied from
-/// the image found there when it is still this store's baseline — after that
-/// image is preserved aside unless it holds nothing this store did not have
-/// (its text is the store's durable text, its target, or its own baseline).
+/// Under the journal lock: an image that is still this store's is left alone.
+/// Anything else is preserved aside unless it holds nothing this store did not
+/// have (its text is the store's durable text or its target, or it holds no
+/// draft at all: [`holds_no_draft`]), then replaced by an image recovering to
+/// the target:
+/// - `[baseline, target]` when the image found there still opens with this
+///   store's baseline, copied from it;
+/// - `[target]` when the target is this store's baseline and that baseline is
+///   the file's contents ([`JournalReseatPlan::baseline_is_file`]): a clean
+///   image;
+/// - `[target, target]` otherwise: the target stands as its own baseline, so a
+///   later open over any other file contents reports a conflict and keeps it,
+///   and the second record keeps it from reading as clean.
+///
 /// Nothing is deleted on any path.
 #[cfg_attr(
     test,
@@ -1026,9 +1061,7 @@ pub(crate) fn execute_journal_reseat(
         let holds_nothing_new = recovered.as_ref().is_some_and(|recovered| {
             recovered.text == *plan.durable_text
                 || recovered.text == *plan.target_text
-                || found_baseline
-                    .as_deref()
-                    .is_some_and(|baseline| recovered.text == baseline)
+                || holds_no_draft(recovered)
         });
         let preserved = found.exists && !holds_nothing_new;
         if preserved {
@@ -1037,7 +1070,7 @@ pub(crate) fn execute_journal_reseat(
         let baseline =
             found_baseline.filter(|text| ContentFingerprint::of(text.as_bytes()) == plan.baseline);
         let target = synthetic_snapshot(plan.document, plan.target_seq, plan.target_text.clone());
-        let (records, baseline_fingerprint, baseline_seq) = match baseline {
+        let (records, baseline_fingerprint, baseline_seq, baseline_is_file) = match baseline {
             Some(text) if text.as_str() != &*plan.target_text => {
                 let base = synthetic_snapshot(plan.document, plan.baseline_seq, Arc::from(text));
                 (
@@ -1047,36 +1080,48 @@ pub(crate) fn execute_journal_reseat(
                     ],
                     plan.baseline,
                     plan.baseline_seq,
+                    plan.baseline_is_file,
                 )
             }
-            Some(_) => (
-                vec![JournalRecord::snapshot_for(plan.key, &target)],
-                plan.baseline,
-                plan.target_seq,
-            ),
-            None => (
-                vec![JournalRecord::snapshot_for(plan.key, &target)],
-                ContentFingerprint::of(plan.target_text.as_bytes()),
-                plan.target_seq,
-            ),
+            // The target is the file's contents, copied or not: a clean image.
+            _ if plan.baseline_is_file
+                && ContentFingerprint::of(plan.target_text.as_bytes()) == plan.baseline =>
+            {
+                (
+                    vec![JournalRecord::snapshot_for(plan.key, &target)],
+                    plan.baseline,
+                    plan.target_seq,
+                    true,
+                )
+            }
+            // A draft whose baseline is not there to copy, or is itself a
+            // draft, stands as its own, so a later open over any other file
+            // contents reports a conflict and keeps it. Recorded twice: alone it
+            // would read as a clean image ([`holds_no_draft`]), which that open
+            // replaces.
+            _ => {
+                let draft = JournalRecord::snapshot_for(plan.key, &target);
+                (
+                    vec![draft.clone(), draft],
+                    ContentFingerprint::of(plan.target_text.as_bytes()),
+                    plan.target_seq,
+                    false,
+                )
+            }
         };
         let bytes = encode_journal(&records).map_err(|error| format!("encode: {error:?}"))?;
         atomic_replace_locked(path, &bytes, found).map_err(|error| error.to_string())?;
-        Ok(Some((
-            ContentFingerprint::of(&bytes),
-            baseline_fingerprint,
+        Ok(Some(JournalReseatResult::Republished {
+            image: ContentFingerprint::of(&bytes),
+            baseline: baseline_fingerprint,
             baseline_seq,
+            baseline_is_file,
             preserved,
-        )))
+        }))
     });
     match result {
         Ok(None) => JournalReseatResult::Unchanged,
-        Ok(Some((image, baseline, baseline_seq, preserved))) => JournalReseatResult::Republished {
-            image,
-            baseline,
-            baseline_seq,
-            preserved,
-        },
+        Ok(Some(republished)) => republished,
         Err(message) => JournalReseatResult::Failed(message),
     }
 }
@@ -1147,38 +1192,17 @@ impl DraftJournalHost {
             // unsaved draft — which crash recovery then dutifully replayed into
             // the new test's document (the proven six-tests-at-once
             // app_documents flake: one Enter on "abc" landed on a resurrected
-            // "abc\n" and read back "abc\n\n"). Stamp the root with a
-            // per-process boot nonce so the name is unique per process
-            // INSTANCE, and remove any same-named corpse: a live process cannot
-            // share our pid AND our stamp.
+            // "abc\n" and read back "abc\n\n"). The process root is stamped per
+            // process INSTANCE, and a same-named corpse is removed.
             //
-            // AND THEN TAKE THEM BACK. This comment used to say these roots
-            // "are never cleaned up", and it was true: every call left one
-            // directory in the system temp dir forever. On m17-tower that
-            // reached 224,002 of them — enough that `/tmp`, a RAM-backed tmpfs
-            // there, held them in memory and the box ran itself out of swap.
-            // The leak is invisible per-run (a few empty directories) and lethal
-            // over a few thousand runs, which is exactly the shape that never
-            // gets attributed to the thing causing it. Two changes: every root
-            // for this process now nests under ONE per-process parent, so a run
-            // is a single directory rather than an unbounded family, and the
-            // first call sweeps the parents that dead runs left behind. The
-            // sweep is what makes it self-healing rather than merely tidy: a
-            // test binary that crashes or is killed cleans up on the NEXT run
-            // instead of never.
-            static STAMP: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
-            let stamp = *STAMP.get_or_init(|| {
-                sweep_abandoned_test_draft_roots();
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            });
-            let root = std::env::temp_dir()
-                .join(format!(
-                    "{TEST_DRAFT_ROOT_PREFIX}{}-{stamp:x}",
-                    std::process::id()
-                ))
+            // AND THEN TAKE THEM BACK. Every call used to leave one directory in
+            // the system temp dir forever; on m17-tower that reached 224,002 of
+            // them — enough that `/tmp`, a RAM-backed tmpfs there, held them in
+            // memory and the box ran itself out of swap. So every root for this
+            // process nests under ONE process root, which goes when the process
+            // exits and is swept by the next run when it was killed first
+            // ([`crate::test_scratch::process_root`]).
+            let root = crate::test_scratch::process_root(TEST_DRAFT_ROOT_PREFIX)
                 .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
             let _ = std::fs::remove_dir_all(&root);
             Self::new(root)
@@ -1219,15 +1243,21 @@ impl DraftJournalHost {
         };
         decision.expected_image = JournalImageGeneration::of(&bytes);
         match recover_journal_for(key, &bytes) {
+            // Opened or saved and never edited since: whatever the disk holds
+            // now, there is nothing to recover and nothing to keep aside, and
+            // `initialize` replaces this image with the file as it is.
+            Ok(recovered) if holds_no_draft(&recovered) => {}
             Ok(recovered) => {
                 let disk = ContentFingerprint::of(disk_bytes);
                 let latest = ContentFingerprint::of(recovered.text.as_bytes());
                 if recovered.base_content == disk {
                     if latest != disk {
                         decision.recovered_text = Some(recovered.text);
-                        decision.notice = Some(RecoveryNotice::Recovered {
-                            records: recovered.record_count,
-                        });
+                        aterm_log::info!(
+                            "recovered an unsaved draft from {} journal records",
+                            recovered.record_count
+                        );
+                        decision.notice = Some(RecoveryNotice::Recovered);
                     }
                 } else if latest != disk {
                     decision.notice = Some(RecoveryNotice::DiskConflict);
@@ -1235,7 +1265,8 @@ impl DraftJournalHost {
                 }
             }
             Err(error) => {
-                decision.notice = Some(RecoveryNotice::Corrupt(format!("{error:?}")));
+                aterm_log::warn!("recovery journal did not decode; kept aside: {error:?}");
+                decision.notice = Some(RecoveryNotice::Corrupt);
                 decision.preserve_existing = true;
             }
         }
@@ -1246,14 +1277,15 @@ impl DraftJournalHost {
     /// visible. A conflicting/corrupt prior image is renamed, never deleted.
     ///
     /// ALWAYS ON THE EVENT LOOP, hence no patience parameter: the one production
-    /// caller is `App::open_native_document_in_window` (`app_documents.rs:2555`),
+    /// caller is `App::install_admitted_document` (`app_documents.rs`),
     /// which runs it SYNCHRONOUSLY inside a `&mut self` handler because the
     /// `InitializedJournal` it returns is what the open flow needs to build the
     /// view. There is nowhere to hand it: the document worker's queue carries
     /// appends and rewrites, whose results arrive later through `Wake`, and an
     /// open cannot proceed on a promise. So this path takes the frame-sized
     /// budget and, past it, REPORTS BUSY rather than blocking longer — the
-    /// refusal `app_documents.rs:3143` pins, carrying the "retry opening Manual"
+    /// refusal `manual_open_reports_busy_held_journal_lock_and_retries_cleanly`
+    /// pins, carrying the "retry opening Manual"
     /// guidance that makes the user's retry the recovery path.
     pub(crate) fn initialize(
         &self,
@@ -1346,9 +1378,9 @@ fn preserve_journal_locked(path: &Path, expected: JournalImageGeneration) -> Res
 }
 
 /// `patience` is the CALLER's declaration of which thread it is on, because that
-/// is the only place the answer is known: `app_documents.rs:193` runs this on the
-/// `aterm-native-document` worker, `app_documents.rs:1024` runs it inline on the
-/// thread that owns `App`. See [`JournalLockPatience`].
+/// is the only place the answer is known: `native_document_queue` runs this on the
+/// `aterm-native-document` worker, `App::drive_document_journal_once` runs it
+/// inline on the thread that owns `App`. See [`JournalLockPatience`].
 pub(crate) fn execute_journal_append(
     path: &Path,
     key: JournalDocumentKey,
@@ -1479,92 +1511,6 @@ pub(crate) fn checkpoint_plan(
 /// The one name every test draft root in this process hangs under.
 #[cfg(test)]
 const TEST_DRAFT_ROOT_PREFIX: &str = "aterm-test-drafts-";
-
-/// Reclaim the per-process draft parents that earlier test runs abandoned.
-///
-/// Called once per process, from the `STAMP` initialiser, before this run
-/// creates its own parent. It exists because the previous scheme leaked one
-/// directory per `system_default()` call with no owner and no expiry: 224,002 of
-/// them accumulated in `/tmp` on m17-tower, which is a RAM-backed tmpfs, and the
-/// machine exhausted its swap holding empty directories.
-///
-/// WHAT IT WILL AND WILL NOT DELETE. Only entries directly under the system temp
-/// dir whose name carries this crate's prefix, and only those a run cannot still
-/// be using:
-///
-/// - Same pid as ours but a DIFFERENT stamp: certainly dead, because we are that
-///   pid now. Removed unconditionally.
-/// - A different pid: removed only once we can show the owner is gone. On Linux
-///   that is exact — `/proc/<pid>` either exists or it does not. Everywhere else
-///   there is no dependency-free liveness check, so it falls back to age, and
-///   the threshold is deliberately a whole day: deleting a live run's journal
-///   would resurrect the very flake the stamp was added to kill, so the failure
-///   mode of waiting too long is a few stale directories and the failure mode of
-///   acting too early is a corrupted test. The sweep is best-effort throughout —
-///   every error is discarded, because a test run must not fail over housekeeping.
-#[cfg(test)]
-fn sweep_abandoned_test_draft_roots() {
-    /// Only for hosts with no `/proc`: how long an untouched parent must sit
-    /// before we treat its owner as gone.
-    const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-    let temp = std::env::temp_dir();
-    let Ok(entries) = std::fs::read_dir(&temp) else {
-        return;
-    };
-    let me = std::process::id();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(rest) = name.strip_prefix(TEST_DRAFT_ROOT_PREFIX) else {
-            continue;
-        };
-        // `<pid>-<stamp>`; anything else is not ours to judge.
-        let Some((pid, _stamp)) = rest.split_once('-') else {
-            continue;
-        };
-        let Ok(pid) = pid.parse::<u32>() else {
-            continue;
-        };
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let abandoned = if pid == me {
-            // Our own pid, and the stamp is not this run's (this runs before
-            // ours exists), so it belongs to a dead process we were recycled
-            // from — the exact case the stamp was introduced to survive.
-            true
-        } else {
-            !test_draft_owner_is_alive(pid)
-                || entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .and_then(|m| m.elapsed().map_err(std::io::Error::other))
-                    .is_ok_and(|age| age > ABANDONED_AFTER)
-        };
-        if abandoned {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
-/// Whether a draft-root owner is still running, as far as this host can say.
-///
-/// Linux answers exactly from `/proc`. Every other host has no dependency-free
-/// way to ask, so it answers "alive" and lets the age rule in the caller decide
-/// — erring toward keeping a directory, never toward deleting a live one.
-#[cfg(test)]
-fn test_draft_owner_is_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        Path::new("/proc").join(pid.to_string()).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        true
-    }
-}
 
 /// aterm's shared per-user state root — the ONE rule
 /// ([`aterm_types::dirs::state_dir`]), so the journal, the operator and the
@@ -1724,13 +1670,12 @@ fn with_journal_lock<T>(
         lock.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("protect journal lock {}: {error}", lock_path.display()))?;
     }
-    take_journal_lock(&lock, path, patience.budget())?;
-    #[cfg(test)]
-    copy_held_lock_for_test(&lock);
     // Released by `LOCK_UN` on every exit, not by the close: a shell forked while
     // this runs would otherwise keep the lock until its exec, and the event loop's
     // next take has 25 ms (the product fd-hygiene sweep of 2026-09-27).
-    let _held = crate::native_document_host::HeldAdvisoryLock::adopt(lock);
+    let _held = take_journal_lock(lock, path, patience.budget())?;
+    #[cfg(test)]
+    copy_held_lock_for_test(_held.file());
     operation()
 }
 
@@ -1743,7 +1688,7 @@ fn with_journal_lock<T>(
 /// copy of every lock this process held at fork time — the lock stays taken
 /// after WE close our descriptor, until the child's `O_CLOEXEC` fires. aterm
 /// forks for every shell (`aterm_pty::spawn_shell_with_pid`, a hand-rolled
-/// `forkpty` whose `libc::fork` is `aterm-pty/src/unix.rs:1698`, and whose child
+/// `forkpty` whose child
 /// closes only the pty pair and the status pipe before `execve` — every other
 /// inherited descriptor, this lock included, rides to the exec), from a process
 /// whose document worker takes this lock for every draft append. A single
@@ -1758,7 +1703,7 @@ fn with_journal_lock<T>(
 ///  1. FORK RESIDUE — a child of ours that has not reached `execve`. This is the
 ///     mechanism above and it is self-inflicted: no other process is involved.
 ///     Its duration is a scheduling latency, measured directly in this repo
-///     (`aterm-pty/src/unix.rs:739-744` times fork to the `O_CLOEXEC` status
+///     (`aterm_pty`'s `EXEC_STATUS_BUDGET` doc times fork to the `O_CLOEXEC` status
 ///     pipe's EOF, which IS this window): p50 2.99 ms, p99 6.0 ms, max 12.7 ms
 ///     over n=5000 at ordinary load; p50 4.5 ms, p99 206 ms, MAX 523 ms over
 ///     n=20000 under deliberately pathological load (loadavg 118 on 18 cores).
@@ -1769,15 +1714,16 @@ fn with_journal_lock<T>(
 ///     genuine peers: mechanism 2, and an older aterm sharing the journal that
 ///     still releases by the close.
 ///  2. A PEER'S DEVICE-BARRIER HOLD — a legitimate holder inside the locked
-///     section, which spans `sync_all` on the temporary (`atomic_replace_locked`,
-///     :1255) and `sync_directory` on the parent (:1271). Both are `F_FULLFSYNC`
+///     section, which spans `sync_all` on the temporary (`atomic_replace_locked`)
+///     and `sync_directory` on the parent. Both are `F_FULLFSYNC`
 ///     device-cache barriers on Apple targets, whose latency is bounded by the
 ///     whole machine's I/O and not by the bytes written. Measured for THIS
 ///     locked section: 9.13 ms mean / 13.9 ms p99 / 25.5 ms max over n=200 idle,
 ///     and 20.5 ms mean / 42.9 ms p99 / 69.7 ms max over n=300 at loadavg 17 on
 ///     18 cores with eight concurrent `fsync` writers. The sibling save path,
 ///     whose locked section has the same two-barrier shape, was caught at
-///     82.5-279.7 ms in six leaked fixtures (`native_document_host.rs:2571`).
+///     82.5-279.7 ms in six leaked fixtures (`native_document_host`'s
+///     `PREFLIGHT_RETRY_BUDGET`).
 ///
 /// So the lock is held until the LATER of those clears, and the worst legitimate
 /// hold this repo has ever measured on either mechanism is 523 ms.
@@ -1823,10 +1769,10 @@ pub(crate) enum JournalLockPatience {
     /// The caller is the thread that owns `App` — the event loop. Every
     /// millisecond spent here is a dropped frame, so this budget is deliberately
     /// in the same class as the sibling write lock's, and for the same reason
-    /// spelled out at `native_document_host.rs:1411-1422`. Pinned by
+    /// spelled out on `native_document_host::WRITE_LOCK_RETRY_BUDGET`. Pinned by
     /// `the_event_loop_budget_stays_in_the_sibling_write_lock_class`.
     EventLoop,
-    /// The caller is the `aterm-native-document` worker (`app_documents.rs:149`),
+    /// The caller is the `aterm-native-document` worker (`native_document_queue`),
     /// whose whole job is to keep exactly this work off the event loop. Parking
     /// it costs no frame and drops no input; refusing costs an append.
     Worker,
@@ -1872,8 +1818,15 @@ impl JournalLockPatience {
 ///
 /// Takes `budget` rather than reading a constant so that the value the whole fix
 /// turns on is a parameter a test can pin — see
-/// `a_permanently_held_journal_lock_is_refused_only_after_the_budget_is_spent`.
-fn take_journal_lock(lock: &File, path: &Path, budget: std::time::Duration) -> Result<(), String> {
+/// `a_journal_lock_held_by_a_peer_is_waited_out_not_reported_busy` (the budget is
+/// forwarded and ridden out) and `native_document_host`'s
+/// `a_persistent_save_lock_holder_is_refused_after_the_bounded_budget` (the shared
+/// loop spends the whole budget before it refuses).
+fn take_journal_lock(
+    lock: File,
+    path: &Path,
+    budget: std::time::Duration,
+) -> Result<crate::native_document_host::HeldAdvisoryLock, String> {
     crate::native_document_host::acquire_advisory_lock_within(lock, budget).map_err(|refusal| {
         match refusal {
             crate::native_document_host::AdvisoryLockRefusal::Busy => format!(
@@ -1997,8 +1950,7 @@ fn atomic_replace_locked(
         temporary_file
             .write_all(bytes)
             .map_err(JournalReplaceError::BeforePublication)?;
-        temporary_file
-            .sync_all()
+        crate::durable::sync_all(&temporary_file)
             .map_err(JournalReplaceError::BeforePublication)?;
         drop(temporary_file);
         let before_publication = observe_journal_image(path).map_err(|message| {
@@ -2035,90 +1987,6 @@ fn atomic_replace_locked(
     result
 }
 
-#[cfg(not(windows))]
-fn replace_file(temporary: &Path, target: &Path, target_existed: bool) -> std::io::Result<()> {
-    if target_existed {
-        fs::rename(temporary, target)
-    } else {
-        // A normal rename would overwrite a path planted after the final
-        // missing observation. Hard-linking publishes the synced inode only if
-        // the destination is still absent; removing the temp leaves it visible.
-        fs::hard_link(temporary, target)?;
-        fs::remove_file(temporary)
-    }
-}
-
-#[cfg(windows)]
-fn replace_file(temporary: &Path, target: &Path, target_existed: bool) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-
-    const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn ReplaceFileW(
-            replaced: *const u16,
-            replacement: *const u16,
-            backup: *const u16,
-            flags: u32,
-            exclude: *mut std::ffi::c_void,
-            reserved: *mut std::ffi::c_void,
-        ) -> i32;
-        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
-    }
-
-    let existing = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let replacement = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: both UTF-16 buffers are NUL-terminated and live for the call.
-    let moved = unsafe {
-        if target_existed {
-            ReplaceFileW(
-                replacement.as_ptr(),
-                existing.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        } else {
-            MoveFileExW(
-                existing.as_ptr(),
-                replacement.as_ptr(),
-                MOVEFILE_WRITE_THROUGH,
-            )
-        }
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)?
-        .sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 /// Retry an EVENT-LOOP-patience journal call while it reports the product's
 /// TRANSIENT contention error.
@@ -2134,13 +2002,14 @@ fn sync_directory(_path: &Path) -> std::io::Result<()> {
 ///
 /// It cannot mask the engine fix. The ride-out this change adds is pinned by
 /// [`a_journal_lock_held_by_a_peer_is_waited_out_not_reported_busy`] and
-/// [`a_permanently_held_journal_lock_is_refused_only_after_the_budget_is_spent`],
-/// neither of which goes anywhere near this helper.
+/// `native_document_host`'s
+/// `a_persistent_save_lock_holder_is_refused_after_the_bounded_budget`, neither of
+/// which goes anywhere near this helper.
 ///
 /// Bounded, so a lock that never frees still fails; and only the busy error is
 /// retried — every other error returns on the first attempt.
 pub(crate) fn settle_busy<T>(mut attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
         match attempt() {
             Err(error) if error.contains("is busy") && std::time::Instant::now() < deadline => {
@@ -2206,10 +2075,13 @@ mod tests {
         let error = read_journal_image(&oversized).expect_err("oversized journal is rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains(&MAX_JOURNAL_BYTES.to_string()));
-        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
-        // bound catches it and only the report latency changes. 1s is the bound this
-        // repo has already watched cross under full-suite load (cb8c0cff).
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // A hang detector, never a latency budget: the cap is judged by the error
+        // above, and only a reader that never returns is judged by this clock. 1 s
+        // crossed under full-suite load (cb8c0cff).
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the over-cap read never returned"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2223,10 +2095,13 @@ mod tests {
         make_fifo(&path);
         let started = std::time::Instant::now();
         let fifo_error = host.inspect_open(canonical, b"disk").unwrap_err();
-        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
-        // bound catches it and only the report latency changes. 1s is the bound this
-        // repo has already watched cross under full-suite load (cb8c0cff).
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // Refuses-without-BLOCKING: opening the FIFO parks FOREVER (no writer
+        // comes), so this is a hang detector, never a latency budget. 1 s crossed
+        // under full-suite load (cb8c0cff).
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "inspecting the FIFO journal parked"
+        );
         assert!(fifo_error.contains("regular non-link"), "{fifo_error}");
 
         fs::remove_file(&path).unwrap();
@@ -2258,10 +2133,13 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = host.initialize(decision, &disk, &disk).unwrap_err();
-        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
-        // bound catches it and only the report latency changes. 1s is the bound this
-        // repo has already watched cross under full-suite load (cb8c0cff).
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // Refuses-without-BLOCKING: opening the FIFO lock parks FOREVER, so this is
+        // a hang detector, never a latency budget. 1 s crossed under full-suite
+        // load (cb8c0cff).
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the FIFO journal lock parked initialization"
+        );
         assert!(error.contains("journal lock"), "{error}");
         assert!(fs::symlink_metadata(&lock).unwrap().file_type().is_fifo());
         let _ = fs::remove_dir_all(root);
@@ -2275,15 +2153,22 @@ mod tests {
         let canonical = "file:///tmp/held-lock.md";
         let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
         let lock_path = journal_lock_path(&decision.path).unwrap();
-        let held = open_journal_lock(&lock_path).unwrap();
-        held.lock().unwrap();
+        let held = crate::native_document_host::HeldAdvisoryLock::lock(
+            open_journal_lock(&lock_path).unwrap(),
+        )
+        .unwrap();
 
         let started = std::time::Instant::now();
         let error = host.initialize(decision.clone(), &disk, &disk).unwrap_err();
-        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
-        // bound catches it and only the report latency changes. 1s is the bound this
-        // repo has already watched cross under full-suite load (cb8c0cff).
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // Refuses-without-BLOCKING: a blocking `flock` on a lock nobody releases
+        // parks FOREVER, so this is a hang detector, never a latency budget; the
+        // budget's size is pinned by constants in
+        // `the_event_loop_budget_stays_in_the_sibling_write_lock_class`. 1 s
+        // crossed under full-suite load (cb8c0cff).
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the held journal lock parked initialization"
+        );
         assert!(error.contains("busy"), "{error}");
         assert!(error.contains("retry"), "{error}");
 
@@ -2300,7 +2185,7 @@ mod tests {
     /// `open_journal_lock` in THIS process contends with the first in exactly the
     /// way a descriptor a forked child has not `execve`d away yet does — the
     /// sibling module states and relies on the same equivalence
-    /// (`native_document_host.rs:2575`). A raw `fork()` from the libtest thread
+    /// (`a_lock_held_for_one_stalled_device_barrier_is_waited_out_not_reported_busy`). A raw `fork()` from the libtest thread
     /// pool would buy provenance and cost determinism: the parent has to build a
     /// plan between the fork and the append, so a scheduling stall longer than the
     /// child's hold makes the append succeed on its FIRST `try_lock` and the test
@@ -2312,7 +2197,7 @@ mod tests {
     /// measured, both named on [`JournalLockPatience`]: a peer inside its two
     /// `F_FULLFSYNC` barriers (82.5-279.7 ms in the sibling's leaked fixtures), and
     /// a child of ours between `fork` and `execve` (max 523 ms at n=20000 under
-    /// pathological load, `aterm-pty/src/unix.rs:739-744`).
+    /// pathological load, `aterm_pty`'s `EXEC_STATUS_BUDGET`).
     ///
     /// DETERMINISM comes from the second assertion, not the first: a regression to
     /// a single `try_lock` returns `Failed` in microseconds, so it fails
@@ -2347,9 +2232,8 @@ mod tests {
         // through the product's own primitive, so this setup cannot be more
         // fragile than the thing it sets up for.
         let lock_path = journal_lock_path(&initialized.path).unwrap();
-        let holder = open_journal_lock(&lock_path).unwrap();
-        take_journal_lock(
-            &holder,
+        let holder = take_journal_lock(
+            open_journal_lock(&lock_path).unwrap(),
             &initialized.path,
             JournalLockPatience::Worker.budget(),
         )
@@ -2383,44 +2267,6 @@ mod tests {
                 .text,
             "base newer"
         );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// The budget is SPENT before a refusal, and a holder that never releases is
-    /// still refused. Pins the shrink direction: a regression to a single
-    /// `try_lock` — or to any budget smaller than the one asked for — returns in
-    /// microseconds and fails the `elapsed >= budget` assertion.
-    ///
-    /// Deliberately NO absolute upper bound: that assertion class is the one
-    /// full-suite load has already crossed twice in this crate, and the
-    /// refuses-without-blocking contract is owned by
-    /// `held_journal_lock_returns_busy_and_a_later_retry_succeeds` and by
-    /// [`the_event_loop_budget_stays_in_the_sibling_write_lock_class`], which pins
-    /// the growth direction without consulting a clock at all.
-    #[test]
-    fn a_permanently_held_journal_lock_is_refused_only_after_the_budget_is_spent() {
-        let root = test_root("budget-spent");
-        let host = DraftJournalHost::new(root.clone()).unwrap();
-        let (_store, _id, disk) = snapshots("base");
-        let canonical = "file:///tmp/budget-spent.md";
-        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let lock_path = journal_lock_path(&decision.path).unwrap();
-        let held = open_journal_lock(&lock_path).unwrap();
-        held.lock().unwrap();
-        let probe = open_journal_lock(&lock_path).unwrap();
-
-        let budget = std::time::Duration::from_millis(30);
-        let started = std::time::Instant::now();
-        let message = take_journal_lock(&probe, &decision.path, budget).unwrap_err();
-        let elapsed = started.elapsed();
-
-        assert!(message.contains("busy"), "{message}");
-        assert!(message.contains("retry opening Manual"), "{message}");
-        assert!(
-            elapsed >= budget,
-            "budget must actually be spent, got {elapsed:?}"
-        );
-        drop(held);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2479,9 +2325,11 @@ mod tests {
         })
         .unwrap();
 
-        let next = open_journal_lock(&lock_path).unwrap();
+        let next = crate::native_document_host::HeldAdvisoryLock::try_lock(
+            open_journal_lock(&lock_path).unwrap(),
+        );
         assert!(
-            next.try_lock().is_ok(),
+            next.is_ok(),
             "the lock outlived its operation on the forked copy of its description"
         );
         drop(forked_copy);
@@ -2491,12 +2339,13 @@ mod tests {
     /// The value the whole fix turns on, pinned WITHOUT a clock.
     ///
     /// `DraftJournalHost::initialize` runs synchronously on the thread that owns
-    /// `App` (`app_documents.rs:2555`), so its budget is a frame budget. Growing it
-    /// back toward the 30 s the busy guards assert would freeze the event loop for
-    /// exactly that long and every timing assertion in this file would still pass
-    /// green — which is why this guard compares constants instead of elapsed time.
+    /// `App` (`App::install_admitted_document`), so its budget is a frame budget. Growing it
+    /// toward the minute the busy guards' hang detectors allow would freeze the
+    /// event loop for exactly that long and every timing assertion in this file
+    /// would still pass green — which is why this guard compares constants
+    /// instead of elapsed time.
     /// Tying it to the sibling write lock's budget is the point: one thread, one
-    /// frame argument (`native_document_host.rs:1411-1422`), one number.
+    /// frame argument (`WRITE_LOCK_RETRY_BUDGET`'s doc), one number.
     #[test]
     fn the_event_loop_budget_stays_in_the_sibling_write_lock_class() {
         assert_eq!(
@@ -2617,10 +2466,13 @@ mod tests {
             JournalAppendResult::Failed { message, .. }
                 if message.contains("regular non-link")
         ));
-        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
-        // bound catches it and only the report latency changes. 1s is the bound this
-        // repo has already watched cross under full-suite load (cb8c0cff).
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // Refuses-without-BLOCKING: opening the FIFO journal parks FOREVER, so
+        // this is a hang detector, never a latency budget. 1 s crossed under
+        // full-suite load (cb8c0cff).
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "appending to the FIFO journal parked"
+        );
         assert!(
             fs::symlink_metadata(&initialized.path)
                 .unwrap()
@@ -2672,10 +2524,7 @@ mod tests {
 
         let reopened = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
         assert_eq!(reopened.recovered_text.as_deref(), Some("base draft"));
-        assert!(matches!(
-            reopened.notice,
-            Some(RecoveryNotice::Recovered { .. })
-        ));
+        assert!(matches!(reopened.notice, Some(RecoveryNotice::Recovered)));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2718,10 +2567,64 @@ mod tests {
 
         fs::write(&preserved.path, b"torn").unwrap();
         let corrupt = host.inspect_open(canonical, b"external").unwrap();
-        assert!(matches!(corrupt.notice, Some(RecoveryNotice::Corrupt(_))));
+        assert!(matches!(corrupt.notice, Some(RecoveryNotice::Corrupt)));
         let kept = settle_busy(|| host.initialize(corrupt.clone(), &external, &external)).unwrap();
         assert_eq!(fs::read(preserved_copy(2)).unwrap(), b"torn");
         assert_eq!(kept.path, preserved.path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Opened and never edited, then changed on disk by someone else (a `git
+    /// pull`): the reopen is plain. No draft ever existed, so there is no
+    /// conflict to report and no copy to keep, and the one image is replaced
+    /// by the file as it is now. A re-seat keeps it so: the first process,
+    /// taking the journal back from the second (an update rolled back),
+    /// publishes its clean document as one snapshot again, which the next open
+    /// over the changed file reads as plain too.
+    #[test]
+    fn a_clean_journal_reopened_over_a_changed_file_holds_no_draft() {
+        let root = test_root("clean-reopen");
+        let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
+        let canonical = "file:///tmp/draft.md";
+        let (_store, id, v0) = snapshots("v0");
+        let opened = journals
+            .inspect_open(canonical, v0.text.as_bytes())
+            .unwrap();
+        settle_busy(|| journals.initialize(opened.clone(), &v0, &v0)).unwrap();
+
+        let host = DraftJournalHost::new(root.clone()).unwrap();
+        let reopened = host.inspect_open(canonical, b"v1").unwrap();
+        assert_eq!(reopened.notice, None);
+        assert_eq!(reopened.recovered_text, None);
+        assert!(!reopened.preserve_existing);
+        let (_store, _id, v1) = snapshots("v1");
+        let initialized = settle_busy(|| host.initialize(reopened.clone(), &v1, &v1)).unwrap();
+        assert_eq!(initialized.notice, None);
+        assert!(
+            preserved_images(&root).is_empty(),
+            "a clean image is replaced, not kept aside"
+        );
+        let recovered =
+            recover_journal_for(initialized.key, &fs::read(&initialized.path).unwrap()).unwrap();
+        assert_eq!(recovered.text, "v1");
+
+        let (result, _) = run_reseat(&mut journals, id);
+        assert!(
+            matches!(
+                result,
+                JournalReseatResult::Republished {
+                    preserved: false,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        let recovered =
+            recover_journal_for(initialized.key, &fs::read(&initialized.path).unwrap()).unwrap();
+        assert_eq!((recovered.text.as_str(), recovered.record_count), ("v0", 1));
+        let reopened = host.inspect_open(canonical, b"v1").unwrap();
+        assert_eq!(reopened.notice, None);
+        assert!(!reopened.preserve_existing);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3274,39 +3177,32 @@ mod tests {
             return;
         }
 
-        let test_name = std::thread::current()
-            .name()
-            .expect("test harness names the current test")
-            .to_string();
         let root = test_root("process-race");
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let (_store, _id, disk) = snapshots("base");
         let decision = host.inspect_open(URI, disk.text.as_bytes()).unwrap();
         let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
-        let mut children = Vec::new();
-        for role in ["one", "two"] {
-            children.push(
-                std::process::Command::new(std::env::current_exe().unwrap())
-                    .arg("--exact")
-                    .arg(&test_name)
-                    .arg("--nocapture")
+        // Each racer is this very test as a stand-in, which must run exactly
+        // this test and pass it.
+        let mut children: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|role| {
+                let mut child = crate::test_alone::StandIn::this_test();
+                child
+                    .command()
                     .env(CHILD, role)
-                    .env("ATERM_JOURNAL_COMMIT_TEST_PATH", &initialized.path)
-                    .spawn()
-                    .unwrap(),
-            );
-        }
-        let deadline = std::time::Instant::now() + HANG;
-        while ["one", "two"]
-            .iter()
-            .any(|role| !root.join(format!("ready-{role}")).exists())
-        {
-            assert!(std::time::Instant::now() < deadline, "children timed out");
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+                    .env("ATERM_JOURNAL_COMMIT_TEST_PATH", &initialized.path);
+                child.spawn()
+            })
+            .collect();
+        crate::test_alone::until_or_ended("both racers reach the barrier", &mut children, || {
+            ["one", "two"]
+                .iter()
+                .all(|role| root.join(format!("ready-{role}")).exists())
+        });
         fs::write(root.join("go"), b"go").unwrap();
-        for mut child in children {
-            assert!(child.wait().unwrap().success());
+        for child in children {
+            child.passed();
         }
         let results = ["one", "two"]
             .map(|role| fs::read_to_string(root.join(format!("result-{role}"))).unwrap());
@@ -3612,7 +3508,8 @@ mod tests {
 
     /// An image holding a draft this store never had is preserved aside before
     /// the re-seat replaces it; one whose baseline is not this store's leaves
-    /// the target as its own baseline. Nothing is deleted on either path.
+    /// the target as its own baseline, a draft to every later open and re-seat.
+    /// Nothing is deleted on any path.
     #[test]
     fn a_reseat_preserves_what_it_never_had() {
         let (root, mut journals, store, id, _disk, path, key) = journaled_edit("reseat-foreign");
@@ -3642,26 +3539,117 @@ mod tests {
         assert_eq!(recovered.text, *head.text);
         assert_eq!(recovered.base_content, ContentFingerprint::of(b"disk"));
 
-        // A baseline that is not this store's: the target is the baseline now,
-        // and the image (which holds no draft of its own) is not preserved.
+        // A baseline that is not this store's (another process opened the file
+        // as it now is): the target is the baseline now, and the image (which
+        // holds no draft of its own) is not preserved. That draft is still a
+        // draft to the next open — a conflict kept aside, never a clean image
+        // replaced — and stays one through a second round with no edit between.
+        let other_base = encode_journal(&[JournalRecord::snapshot_for(
+            key,
+            &synthetic_snapshot(id, Seq(1), Arc::from("changed on disk")),
+        )])
+        .unwrap();
+        for round in 1..=2 {
+            fs::write(&path, &other_base).unwrap();
+            let (result, _) = run_reseat(&mut journals, id);
+            let JournalReseatResult::Republished {
+                baseline,
+                preserved,
+                ..
+            } = result
+            else {
+                panic!("round {round}: {result:?}")
+            };
+            assert!(!preserved, "round {round}");
+            assert_eq!(baseline, ContentFingerprint::of(head.text.as_bytes()));
+            let reopened = journals
+                .inspect_open("file:///tmp/draft.md", b"changed on disk")
+                .unwrap();
+            assert_eq!(
+                reopened.notice,
+                Some(RecoveryNotice::DiskConflict),
+                "round {round}"
+            );
+            assert!(reopened.preserve_existing, "round {round}");
+        }
+        assert_eq!(preserved_images(&root).len(), 1);
+
+        // A draft another process re-seated that way — its text twice, its own
+        // baseline — is a draft all the same: kept aside before it is replaced.
+        let reseated = JournalRecord::snapshot_for(
+            key,
+            &synthetic_snapshot(id, Seq(3), Arc::from("their re-seated draft")),
+        );
+        let theirs = encode_journal(&[reseated.clone(), reseated]).unwrap();
+        fs::write(&path, &theirs).unwrap();
+        let (result, _) = run_reseat(&mut journals, id);
+        assert!(
+            matches!(
+                result,
+                JournalReseatResult::Republished {
+                    preserved: true,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        let preserved = preserved_images(&root);
+        assert_eq!(preserved.len(), 2);
+        assert!(preserved.contains(&theirs));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A save after a re-seat that recorded its draft as its own baseline makes
+    /// the baseline the file again: a later clean re-seat writes one snapshot,
+    /// and an open over newer contents reads it as clean (DJ1,
+    /// docs/AUDIT-persisted-state-2026-10-07.md).
+    #[test]
+    fn a_save_after_a_reseat_makes_the_baseline_the_file_again() {
+        let (root, mut journals, store, id, _disk, path, key) = journaled_edit("save-after-reseat");
+        let head = store.snapshot(id).unwrap();
         let other_base = encode_journal(&[JournalRecord::snapshot_for(
             key,
             &synthetic_snapshot(id, Seq(1), Arc::from("changed on disk")),
         )])
         .unwrap();
         fs::write(&path, &other_base).unwrap();
-        let (result, _) = run_reseat(&mut journals, id);
-        let JournalReseatResult::Republished {
-            baseline,
-            preserved,
-            ..
-        } = result
+        let _ = run_reseat(&mut journals, id);
+        journals
+            .request_checkpoint(
+                DurableCheckpoint {
+                    document: id,
+                    seq: head.seq,
+                    source: DurableSource::AtomicFile,
+                },
+                head.text.clone(),
+            )
+            .unwrap();
+        let JournalEffect::Rewrite { path: rpath, plan } =
+            journals.next_effect(id).unwrap().unwrap()
         else {
-            panic!("{result:?}")
+            panic!("the save checkpoints the journal")
         };
-        assert!(!preserved);
-        assert_eq!(baseline, ContentFingerprint::of(head.text.as_bytes()));
-        assert_eq!(preserved_images(&root).len(), 1);
+        let result = execute_journal_rewrite(&rpath, &plan, JournalLockPatience::Worker);
+        assert!(matches!(
+            journals.complete_rewrite(id, plan.generation, result),
+            JournalCompletion::Durable { .. }
+        ));
+        let theirs = encode_journal(&[JournalRecord::snapshot_for(
+            key,
+            &synthetic_snapshot(id, Seq(1), head.text.clone()),
+        )])
+        .unwrap();
+        fs::write(&path, &theirs).unwrap();
+        let _ = run_reseat(&mut journals, id);
+        let recovered = recover_journal_for(key, &fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            recovered.record_count, 1,
+            "a clean re-seat writes one snapshot"
+        );
+        let reopened = journals
+            .inspect_open("file:///tmp/draft.md", b"pulled")
+            .unwrap();
+        assert_eq!(reopened.notice, None, "a saved document holds no draft");
         let _ = fs::remove_dir_all(root);
     }
 

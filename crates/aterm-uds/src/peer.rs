@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Who is on the other end of a connected Unix-domain socket, as the KERNEL
-//! recorded it: the peer's effective uid ([`peer_uid`], moved here from
-//! `aterm-gui`'s `control_auth`) and, on Darwin, its audit token
-//! ([`peer_audit_token`]) — the handle Security.framework checks code identity
-//! by without trusting a pid that may have been recycled since the connect.
+//! Who is on the other end of a connected Unix-domain socket, as the kernel
+//! recorded it: the peer's effective uid ([`peer_uid`]) and, on Darwin, its
+//! audit token ([`peer_audit_token`]), which Security.framework checks code
+//! identity by without trusting a possibly recycled pid.
 //!
-//! Both answer `None` on any failure. Every caller treats "cannot verify" as a
-//! refusal (fail closed), so there is no error to explain beyond that.
+//! Both answer `None` on any failure; every caller treats that as a refusal.
 
 use crate::CtlStream;
 
@@ -98,10 +96,22 @@ pub fn our_uid() -> u32 {
     unsafe { geteuid() }
 }
 
-/// A Darwin `audit_token_t`: eight 32-bit words the kernel records for the
-/// process that `connect(2)`ed (or created the pair). Opaque here; its one use
-/// is Security.framework's guest lookup, which names a process by it rather
-/// than by a pid that may since have been recycled.
+/// A Darwin `audit_token_t`: eight 32-bit words naming a process — its ids,
+/// its pid and its pid version, which changes when the pid is reused or its
+/// image is replaced. Opaque here; its one use is Security.framework's guest
+/// lookup, which names a process by it rather than by a pid that may since
+/// have been recycled.
+///
+/// WHEN IT IS TAKEN. [`peer_audit_token`] answers at the moment it is called,
+/// for the process that last USED the connection, as that process is when
+/// asked — not the one that `connect(2)`ed (measured 2026-10-03:
+/// `the_peer_is_the_connections_last_user_read_live` below; an `exec` at that
+/// pid moves the pid version). So a token names "the process that last used
+/// the other end, as of this read", never "whoever made the connection" nor
+/// "whoever reads what is sent next". A caller that must
+/// know whom it trusted reads it ONCE, checks that one, and compares any later
+/// read with it (`aterm-gui`'s handoff rendezvous does), and still cannot tell
+/// from it who else holds the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditToken(pub [u32; 8]);
 
@@ -122,9 +132,18 @@ impl AuditToken {
     pub fn pid(&self) -> u32 {
         self.0[5]
     }
+
+    /// The pid version the token names (`audit_token_to_pidversion`: word 7):
+    /// the generation of the process at [`Self::pid`].
+    #[must_use]
+    pub fn pid_version(&self) -> u32 {
+        self.0[7]
+    }
 }
 
-/// The connected peer's audit token (`LOCAL_PEERTOKEN`), or `None`.
+/// The connected peer's audit token (`LOCAL_PEERTOKEN`), or `None`: the
+/// process on the other end AS OF THIS CALL (see [`AuditToken`] for why a
+/// caller that trusts it reads it once).
 ///
 /// Darwin only; every other platform answers `None`, which a code-identity
 /// check reads as "cannot verify".
@@ -143,8 +162,7 @@ pub fn peer_audit_token(stream: &CtlStream) -> Option<AuditToken> {
             len: *mut u32,
         ) -> i32;
     }
-    // sys/un.h, measured with the SDK 2026-09-28: SOL_LOCAL 0, LOCAL_PEERTOKEN 6,
-    // sizeof(audit_token_t) 32.
+    // sys/un.h: SOL_LOCAL 0, LOCAL_PEERTOKEN 6, sizeof(audit_token_t) 32.
     const SOL_LOCAL: i32 = 0;
     const LOCAL_PEERTOKEN: i32 = 6;
     let mut raw = [0u8; 32];
@@ -197,7 +215,89 @@ mod tests {
             let token = super::peer_audit_token(&a).expect("LOCAL_PEERTOKEN answers");
             assert_eq!(token.pid(), std::process::id());
             assert_eq!(&token.to_bytes()[20..24], &std::process::id().to_ne_bytes());
+            assert_eq!(
+                &token.to_bytes()[28..32],
+                &token.pid_version().to_ne_bytes()
+            );
+            // Nothing touched the connection between two reads, and the process
+            // did not change: the answer is the same, word for word.
+            assert_eq!(super::peer_audit_token(&a), Some(token));
         }
         let _ = a;
+    }
+
+    /// MEASURED (2026-10-03, Darwin 25.6): `LOCAL_PEERPID` and
+    /// `LOCAL_PEERTOKEN` name the connection's LAST USER, read live — not the
+    /// process that made the connection. This process makes a pair and is its
+    /// only user; a child given one end as its
+    /// fd 3 writes on it, and from then the kernel names the CHILD on the other
+    /// end; this process writes on that end again, and the kernel names it once
+    /// more. So a peer's identity is "whoever last used the connection, as it is
+    /// now": a caller that trusts it must read it once and compare any later
+    /// read with that one, and still cannot tell from it who will READ what it
+    /// sends next (`aterm-gui`'s handoff rendezvous, "Whom the code gate
+    /// judges"). Were the answer fixed at `connect(2)`/`socketpair(2)`, the
+    /// kernel would name this process throughout.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_peer_is_the_connections_last_user_read_live() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        unsafe extern "C" {
+            fn dup2(from: i32, to: i32) -> i32;
+        }
+        let ours_pid = std::process::id();
+        let named = |stream: &crate::CtlStream| {
+            (
+                crate::fdpass::peer_pid(stream).ok(),
+                super::peer_audit_token(stream).map(|token| token.pid()),
+            )
+        };
+        let (mut ours, theirs) = crate::CtlStream::pair().expect("socketpair");
+        assert_eq!(
+            named(&ours),
+            (Some(ours_pid), Some(ours_pid)),
+            "the pair's maker, its only user so far"
+        );
+        let shared = theirs.as_raw_fd();
+        let mut command = std::process::Command::new("/bin/sh");
+        // Writes once on the shared end, then waits (never reading it) until
+        // it is killed.
+        command.args(["-c", "printf x >&3; exec /bin/sleep 60"]);
+        // SAFETY: `dup2` is async-signal-safe; it puts the shared end at fd 3
+        // in the child (clearing close-on-exec there) and touches nothing else.
+        unsafe {
+            command.pre_exec(move || {
+                if dup2(shared, 3) == 3 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = command.spawn().expect("spawn the child");
+        let mut byte = [0u8; 1];
+        ours.read_exact(&mut byte).expect("the child's write");
+        assert_eq!(&byte, b"x");
+        let child_pid = child.id();
+        let seen = named(&ours);
+        // This process writes on that end again: the kernel names it once more.
+        (&theirs).write_all(b"y").expect("write on the shared end");
+        ours.read_exact(&mut byte).expect("this process's write");
+        let after = named(&ours);
+        // `Child::kill` is SIGKILL (AGENTS.md rule 6).
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            seen,
+            (Some(child_pid), Some(child_pid)),
+            "the child that wrote last is the peer, by pid and by audit token"
+        );
+        assert_eq!(
+            after,
+            (Some(ours_pid), Some(ours_pid)),
+            "the peer follows each use: this process again"
+        );
     }
 }

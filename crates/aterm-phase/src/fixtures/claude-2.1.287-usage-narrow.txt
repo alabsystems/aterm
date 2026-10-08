@@ -1,0 +1,51 @@
+# claude-code 2.1.287 · MEASURED 2026-10-01 by the accounts probe's live check (docs/SPEC-claude-accounts-probe-2026-10-01.md §6): `aterm ctl text --json` rows of a private headless aterm (60x50), 255 ms after the Enter that ran `/usage` · THE USAGE TAB IN THE NARROW LAYOUT (a window's reset on its title row, wrapped where it is long; the meter, a blank, the figure), settled and whole, the Fable window's empty meter a blank row · no row names the login
+
+✻ Sautéed for 0s · done 9:26 PM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.0813
+   Total duration (API):  1s
+   Total duration (wall): 15s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage by model:
+        claude-opus-5-5:  2 input, 4 output, 35.6k cache
+   read, 9.1k cache write ($0.0803)
+       claude-haiku-4-5:  897 input, 9 output, 0 cache
+   read, 0 cache write ($0.0009)
+   Prompt cache (main):   1 request · 80% of input tokens
+   from cache · no misses · warm (1h TTL, last activity
+   10s ago)
+
+   Current session · Resets 2am (America/Los_Angeles)
+   █▏
+
+   2% used
+
+   Current week (all models) · Resets Oct 8 at 9am
+   (America/Los_Angeles)
+   █████▊
+
+   10% used
+
+   Current week (Fable) · Resets Oct 8 at 9am
+   (America/Los_Angeles)
+
+
+   0% used
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine —
+   does not include other devices or claude.ai
+
+   Scanning local sessions…
+
+   Usage credits
+   Usage credits are off · /usage-credits to turn them on
+
+   Esc to cancel
+
+
+

@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The roster asset-dir reader the five `gen_*_glyphs` generators share
-//! (`#[path]`-included, so it compiles into each example binary and into the
-//! drift tests, never into the library): every `.toml` under one roster dir as
-//! `(file name, text)` pairs ordered by file name — the shape
-//! `aterm_effects::cat_glyphs_codegen` consumes.
+//! The roster asset-dir reader the `gen_*_glyphs` generators share
+//! (`#[path]`-included into each example binary and the drift tests, never the
+//! library): every `.toml` under one roster dir as `(file name, text)` pairs
+//! ordered by file name, the shape `aterm_effects::cat_glyphs_codegen`
+//! consumes.
 //!
-//! It lives beside the examples rather than in the crate because the SHIPPED
-//! engine names no `std::fs` (docs/ATERM_DESIGN.md §2.7; `tools/grep_guard.sh`
-//! lane 6a fences aterm-effects since 2026-08-30, the design's Phase 0):
-//! reading files is the generator BINARY's job, the generator itself is a pure
-//! function of the texts, and the drift tests regenerate from this same reader
-//! so what they compare is exactly what the example would write.
+//! It lives beside the examples because the shipped engine names no `std::fs`
+//! (docs/ATERM_DESIGN.md §2.7; fenced by `tools/grep_guard.sh` lane 6a):
+//! reading files is the generator binary's job, and the drift tests regenerate
+//! through this same reader.
 
 use std::path::Path;
 

@@ -2,10 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! HarnessModelPriority, Tier-1: the live upgrade's model priority list
-//! (`aterm_agent::harness::upgrade_models`) — its writers (`Priority::admit`,
-//! the owner's `set`) and its reader (`upgrade_models::target`) — driven over
+//! (`aterm_agent::harness::upgrade_models`), its writers (`Priority::admit`,
+//! the owner's `set`) and its reader (`upgrade_models::target`), driven over
 //! every reachable state of the derived model and projected back onto it,
-//! with a pre-fix writer and a head-of-list reader as the caught negative
+//! with a defective writer and a head-of-list reader as the caught negative
 //! controls.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -284,7 +284,8 @@ fn reader_disagreements(model: &Model, states: &[Vars], reader: &Reader) -> Vec<
 fn shipped_reader(list: &Priority, ev: &Evidence) -> Option<String> {
     // The live upgrade's model half asks exactly this, once per sweep
     // (`upgrade_drive`'s `ModelCtx::read`; `None`: no `availableModels`).
-    models::target_allowed(list, "2.1.300", ev, Some(&baked_all()), None)
+    let offered = models::offered(list, "2.1.300", ev, Some(&baked_all()), None);
+    models::list_target(list, &offered).map(str::to_string)
 }
 
 #[test]
@@ -385,7 +386,7 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
         "select the first available",
     );
 
-    // NEGATIVE CONTROLS on the model: a forged downgrade and a forged
+    // Negative controls on the model: a forged downgrade and a forged
     // cross-family write offered as the writer's own steps are refused.
     let mut down = with_list(
         &known,
@@ -424,7 +425,7 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
     assert!(!model.check_invariant("AutoInsertIsNewerThanTheFamilysBest", &down));
 }
 
-/// NEGATIVE CONTROLS for the priority binds: the writer as it was before the
+/// Negative controls for the priority binds: the writer as it was before the
 /// newest-listed check, and a reader that answers the head of the list, are
 /// each caught by the same enumeration that passes the shipped code.
 #[test]

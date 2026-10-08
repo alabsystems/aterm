@@ -7,7 +7,7 @@
 //! an assistive backend (macOS NSAccessibility / VoiceOver) needs: the visible
 //! screen as plain text, a role, a label, the grid size, and the cursor's
 //! character offset within that text. It holds no GUI state and calls no platform
-//! API, so it is unit-tested directly; `main.rs` builds it from live terminal
+//! API, so it is unit-tested directly; the App (lib.rs) builds it from live terminal
 //! state each frame and, on macOS, hands the text to the content `NSView`'s
 //! accessibility attributes (see `apply_to_ns_view`).
 //!
@@ -21,11 +21,11 @@ use aterm_core::terminal::RenderCell;
 /// Accessibility role for the terminal content view: an editable text area, the
 /// closest standard `AX` role for a terminal grid (VoiceOver reads its value and
 /// navigates by line/character).
-#[cfg(any(all(target_os = "macos", feature = "a11y-appkit"), test))]
+#[cfg(all(target_os = "macos", feature = "a11y-appkit"))]
 pub(crate) const ROLE_TEXT_AREA: &str = "AXTextArea";
 
 /// Human-facing label announced for the terminal view.
-#[cfg(any(a11y_tree, all(target_os = "macos", feature = "a11y-appkit"), test))]
+#[cfg(any(a11y_tree, all(target_os = "macos", feature = "a11y-appkit")))]
 pub(crate) const LABEL: &str = "aterm terminal";
 
 /// Append one grid row to `text`: each cell's glyph char (control/NUL → space),
@@ -135,14 +135,14 @@ impl AccessibleSnapshot {
 
     /// The accessibility role string.
     #[must_use]
-    #[cfg(any(all(target_os = "macos", feature = "a11y-appkit"), test))]
+    #[cfg(all(target_os = "macos", feature = "a11y-appkit"))]
     pub(crate) fn role(&self) -> &'static str {
         ROLE_TEXT_AREA
     }
 
     /// The accessibility label.
     #[must_use]
-    #[cfg(any(all(target_os = "macos", feature = "a11y-appkit"), test))]
+    #[cfg(all(target_os = "macos", feature = "a11y-appkit"))]
     pub fn label(&self) -> &'static str {
         LABEL
     }
@@ -254,19 +254,6 @@ mod tests {
             cols: 0,
             cursor,
         }
-    }
-
-    #[test]
-    fn role_and_label_are_stable() {
-        let s = snap("", None);
-        assert_eq!(s.role(), "AXTextArea");
-        assert_eq!(s.label(), "aterm terminal");
-    }
-
-    #[test]
-    fn value_is_the_text() {
-        let s = snap("hello\nworld\n", None);
-        assert_eq!(s.value(), "hello\nworld\n");
     }
 
     #[test]

@@ -1,23 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration hot-reload API for Terminal.
-//!
-//! Contains `apply_config()`.
-//! Extracted from mod.rs to reduce file size.
+//! Configuration hot-reload: `Terminal::apply_config`.
 
 use super::Terminal;
 
-/// Push ONE host-config value into a mode an application also negotiates over
-/// the wire, and report whether the live mode actually moved.
+/// Push one host-config value into a mode an application also negotiates over
+/// the wire, and report whether the live mode moved.
 ///
-/// The diff is against `seed` — the host value last applied
-/// ([`ConfiguredModes`](super::state::ConfiguredModes)) — never against `live`,
-/// because a live value that disagrees with the config normally means the
-/// running program set the mode. A `live` diff cannot tell "the host changed its
-/// mind" from "the shell set the mode", so it re-asserts the power-on value on
-/// every reload — which for mode 2004 strips a running shell's bracketed-paste
-/// guards the moment the user edits an unrelated setting.
+/// Diffs against `seed`, the host value last applied
+/// ([`ConfiguredModes`](super::state::ConfiguredModes)), never against `live`:
+/// a live value that disagrees usually means the program set it, and diffing
+/// live would re-assert the power-on value on every reload (for mode 2004,
+/// stripping a shell's bracketed-paste guards).
 #[inline]
 fn apply_negotiated_mode(live: &mut bool, seed: &mut bool, configured: bool) -> bool {
     if *seed == configured {
@@ -34,11 +29,8 @@ impl Terminal {
     // Configuration Hot-Reload API
     // =========================================================================
 
-    /// Apply configuration changes to the terminal.
-    ///
-    /// This method allows runtime modification of terminal settings without
-    /// recreating the terminal instance. It returns a list of configuration
-    /// aspects that were changed, which can be used for efficient UI updates.
+    /// Apply configuration changes to the terminal at runtime and return the
+    /// aspects that changed.
     ///
     /// # Example
     ///
@@ -59,23 +51,16 @@ impl Terminal {
     /// assert!(changes.contains(&ConfigChange::CursorBlink));
     /// ```
     ///
-    /// # Change Detection
+    /// # Change detection
     ///
-    /// Most settings apply when they differ from the current terminal state, and
-    /// the returned `Vec<ConfigChange>` names those that actually moved.
+    /// Most settings apply when they differ from the current state. The
+    /// program-negotiated modes (`auto_wrap`/DECAWM, `bracketed_paste`/DEC 2004,
+    /// `focus_reporting`/DEC 1004) are instead diffed against the host's last
+    /// applied value, so a live mode moves only when the host's own value moves
+    /// and an unrelated reload never strips a shell's paste guards. See
+    /// `apply_negotiated_mode`.
     ///
-    /// THE NEGOTIATED MODES ARE NOT AMONG THEM. `auto_wrap` (DECAWM),
-    /// `bracketed_paste` (DEC 2004) and `focus_reporting` (DEC 1004) belong to
-    /// the running PROGRAM, which sets them over the wire and is never told when
-    /// something else changes them. Diffing those against the live mode makes
-    /// every reload re-assert the host's value: a host that never sets
-    /// `bracketed_paste` carries the `false` default, so an unrelated settings
-    /// edit would silently strip the paste guards from a shell that had
-    /// negotiated them and still believed it had them. They are compared against
-    /// the host's LAST APPLIED value instead, so a live mode moves only when the
-    /// host's own value moves. See `apply_negotiated_mode`.
-    ///
-    /// # Settings Applied
+    /// # Settings applied
     ///
     /// - **Cursor**: style, blink, color, visibility
     /// - **Font**: descriptor (family, size, weight, italic)
@@ -102,23 +87,17 @@ impl Terminal {
         // an old frame after a config reload.
         let mut visual_repaint = false;
 
-        // Cursor style. apply_config is host configuration (not an app escape), so it
-        // also persists the DEFAULT — otherwise a config-set cursor would revert to
-        // BlinkingBlock on the next RIS/DECSTR (parity with set_default_cursor_style).
-        //
-        // `config.cursor_style` CARRIES THE BLINK: `CursorStyle` names a shape and
-        // a blink together, and the blink the renderer acts on — and that DEC
-        // mode 12 reports — is that bit (see `set_cursor_blink`). So the style is
-        // applied verbatim and `modes.cursor_blink` follows it below; the caller
-        // states the blink by choosing `Blinking*`/`Steady*`, which is what the
-        // GUI's config resolver already does.
+        // Cursor style. Host configuration, so it also persists the default a
+        // later RIS/DECSTR restores. `CursorStyle` carries the blink bit the
+        // renderer and DEC mode 12 use, so the style is applied verbatim and
+        // `modes.cursor_blink` follows it below.
         self.default_cursor_style = config.cursor_style;
         if self.modes.cursor_style != config.cursor_style {
             self.modes.cursor_style = config.cursor_style;
             changes.push(ConfigChange::CursorStyle);
         }
 
-        // Cursor blink — the blink BIT of the style applied just above, not a
+        // Cursor blink — the blink bit of the style applied just above, not a
         // second flag beside it. Kept as a mirror so `TerminalModes::cursor_blink`
         // and DEC mode 12 cannot drift from the cursor the user is looking at.
         if self.modes.cursor_blink != self.modes.cursor_style.blinks() {
@@ -148,7 +127,7 @@ impl Terminal {
             self.color.default_foreground = config.default_foreground;
         }
         // Always update configured defaults so OSC 110/111 reset to theme
-        // colors, not hardcoded constants (#7443).
+        // colors, not hardcoded constants.
         self.color.configured_foreground = config.default_foreground;
         self.color.frame_foreground_authoritative = true;
 
@@ -158,7 +137,7 @@ impl Terminal {
             self.color.default_background = config.default_background;
         }
         // Always update configured defaults so OSC 110/111 reset to theme
-        // colors, not hardcoded constants (#7443).
+        // colors, not hardcoded constants.
         self.color.configured_background = config.default_background;
         self.color.frame_background_authoritative = true;
 
@@ -176,10 +155,8 @@ impl Terminal {
         }
         self.color.configured_selection_foreground = config.selection_foreground;
 
-        // Custom palette
-        // Always update configured_palette so OSC 104 resets to theme
-        // colors, not hardcoded xterm defaults (matching #7443 pattern
-        // for configured_foreground/configured_background).
+        // Custom palette. Always update configured_palette so OSC 104 resets
+        // to the theme's colors, not xterm defaults.
         self.color
             .configured_palette
             .clone_from(&config.custom_palette);
@@ -205,8 +182,8 @@ impl Terminal {
             visual_repaint = true;
         }
 
-        // The three APP-NEGOTIATED modes (DECAWM, focus reporting, bracketed
-        // paste): each moves only when the HOST's value moved, so a reload for
+        // The three APP-negotiated modes (DECAWM, focus reporting, bracketed
+        // paste): each moves only when the host's value moved, so a reload for
         // an unrelated setting cannot re-assert the power-on value over what the
         // running program negotiated. See [`ConfiguredModes`].
         if apply_negotiated_mode(
@@ -233,7 +210,7 @@ impl Terminal {
 
         // OSC 52 clipboard query policy — sync both the mirror bit on
         // `modes` and the authoritative `clipboard_auth` capability state
-        // (#7874, #7878 CF-005).
+        //.
         if self.modes.allow_osc52_query != config.allow_osc52_query {
             self.modes.allow_osc52_query = config.allow_osc52_query;
             if config.allow_osc52_query {
@@ -244,19 +221,19 @@ impl Terminal {
             changes.push(ConfigChange::Osc52ClipboardQuery);
         }
 
-        // CSI t window manipulation policy (#7139)
+        // CSI t window manipulation policy
         if self.modes.allow_window_ops != config.allow_window_ops {
             self.modes.allow_window_ops = config.allow_window_ops;
             changes.push(ConfigChange::WindowOps);
         }
 
-        // Desktop notification policy (OSC 9/99/777) — #7878 CF-009.
+        // Desktop notification policy (OSC 9/99/777).
         if self.modes.allow_notifications != config.allow_notifications {
             self.modes.allow_notifications = config.allow_notifications;
             changes.push(ConfigChange::Notifications);
         }
 
-        // OSC 4 / OSC 21 indexed palette reconfigure policy — #7937 F01-3.
+        // OSC 4 / OSC 21 indexed palette reconfigure policy.
         if self.modes.allow_palette_reconfigure != config.allow_palette_reconfigure {
             self.modes.allow_palette_reconfigure = config.allow_palette_reconfigure;
             changes.push(ConfigChange::PaletteReconfigure);
@@ -268,9 +245,9 @@ impl Terminal {
             changes.push(ConfigChange::AmbiguousWidth);
         }
 
-        // Style-attribute policy (W5): bold-to-bright promotion + faint opacity.
+        // Style-attribute policy: bold-to-bright promotion + faint opacity.
         // This is resolved at render time, so existing cells do not need to be
-        // rewritten. They DO need to be repainted: without full damage the
+        // rewritten. They do need to be repainted: without full damage the
         // frontend's damage-epoch early-out can swallow a style-only reload.
         let new_faint = if config.faint_opacity.is_finite() {
             config.faint_opacity.clamp(0.0, 1.0)
@@ -298,7 +275,7 @@ impl Terminal {
                      budget stored but not fully enforced"
                 );
             }
-            // set_memory_budget clamps display_offset internally (#7233).
+            // set_memory_budget clamps display_offset internally.
             changes.push(ConfigChange::MemoryBudget);
         }
 
@@ -316,7 +293,7 @@ impl Terminal {
         }
 
         // Scrollback limit - apply immediately by truncating if needed. Routed
-        // through the Terminal-level setter so it reaches the PRIMARY-content
+        // through the Terminal-level setter so it reaches the primary-content
         // grid (never the alt buffer's spec'd zero-scrollback ring) and clamps
         // display_offset itself.
         let current_limit = self.scrollback_line_limit();
@@ -333,14 +310,8 @@ impl Terminal {
             changes.push(ConfigChange::SyncTimeout);
         }
 
-        // THE HOST IS A MUTATION SITE TOO. The three app-negotiated modes applied
-        // above include DEC 1004, which the tab/pane focus-report gate now reads
-        // from the lock-free `ModeMirror` rather than from `modes`. Applying a
-        // config that arms focus reporting therefore moves an input of that word
-        // outside `process()`, and without this the mirror stays stale until the
-        // next byte of output — at which point the mirror's own debug obligation
-        // fires. Republished once at the end: cheaper to keep correct than a call
-        // inside the `FocusReporting` branch.
+        // The focus-report gate reads DEC 1004 from the lock-free `ModeMirror`,
+        // and apply_config can change it outside `process()`: republish.
         self.refresh_mode_mirror();
 
         if visual_repaint {
@@ -357,15 +328,9 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
 
-    /// THE SEED AND THE HOST DEFAULTS ARE ONE FACT, so they are compared rather
-    /// than spelled twice.
-    ///
-    /// `ConfiguredModes::default` claims to hold the values a default
-    /// `TerminalConfig` carries. If that ever stopped being true, the first
-    /// `apply_config` of a default config would look like a host CHANGING a
-    /// negotiated mode and would drive it over the program's own — which is the
-    /// whole failure this seam exists to prevent, arriving silently through a
-    /// field nobody thought to re-check.
+    /// `ConfiguredModes::default` must equal the modes a default
+    /// `TerminalConfig` carries; otherwise the first `apply_config` of a
+    /// default config would override modes the program negotiated.
     #[test]
     fn the_mode_seed_holds_exactly_what_a_default_host_config_carries() {
         let host = crate::config::TerminalConfig::default();
@@ -669,13 +634,9 @@ mod tests {
         );
     }
 
-    /// A CONFIG RELOAD MUST NOT UN-NEGOTIATE DEC 2004. Bracketed paste is an
-    /// app-owned input protocol mode: the shell sets it, the shell relies on
-    /// aterm to keep framing pastes, and nothing about editing a colour scheme
-    /// says otherwise. Treating the host's power-on value as a live override
-    /// silently strips the `ESC[200~`/`ESC[201~` guards from every later paste
-    /// while the shell still believes it is protected — which is the whole
-    /// pastejacking exposure the mode exists to close.
+    /// A config reload must not un-negotiate DEC 2004: bracketed paste belongs
+    /// to the shell, and dropping it strips the `ESC[200~`/`ESC[201~` guards
+    /// from later pastes while the shell believes it is protected.
     #[test]
     fn a_config_reload_leaves_an_app_negotiated_bracketed_paste_alone() {
         let mut term = Terminal::new(4, 16);
@@ -725,7 +686,7 @@ mod tests {
         assert!(!changes.contains(&ConfigChange::FocusReporting));
     }
 
-    /// The other half of the contract: a host that GENUINELY changes one of
+    /// The other half of the contract: a host that genuinely changes one of
     /// these settings still reaches the terminal, and still reports the change
     /// exactly once. Without it the seam would be indistinguishable from
     /// deleting the three settings outright.
@@ -736,13 +697,13 @@ mod tests {
         term.apply_config(&config);
         term.process(b"\x1b[?2004h");
 
-        // The host now wants pastes UNFRAMED, over the app's own request.
+        // The host now wants pastes unframed, over the app's own request.
         config.bracketed_paste = false;
         config.auto_wrap = false;
         config.focus_reporting = true;
         // `bracketed_paste` held the same value in the previous config, so its
         // seed did not move and the app's mode 2004 survives; only the two
-        // settings the HOST really changed are announced.
+        // settings the host really changed are announced.
         let changes = term.apply_config(&config);
         assert!(changes.contains(&ConfigChange::AutoWrap));
         assert!(changes.contains(&ConfigChange::FocusReporting));
@@ -767,11 +728,9 @@ mod tests {
         assert!(term.apply_config(&config).is_empty());
     }
 
-    /// A RESET RETURNS THESE MODES TO THE DEC POWER-ON STATE, not to the host's
-    /// configured seed — which is already what `handle_decstr` does for mode
-    /// 2004 and what `TerminalModes::new` does for RIS. The seed is the value a
-    /// reload diffs against, so pin that a reset does not resurrect it: the two
-    /// halves of "what a reset means" must not drift apart.
+    /// A reset returns these modes to the DEC power-on state, not the host's
+    /// configured seed (as `handle_decstr` and RIS do), and does not resurrect
+    /// the seed.
     #[test]
     fn a_reset_returns_a_negotiated_mode_to_the_power_on_value_not_the_config_seed() {
         let mut term = Terminal::new(4, 16);

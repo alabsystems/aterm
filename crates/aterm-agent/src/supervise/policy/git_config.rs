@@ -1,124 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a git READ would load that can run a program — the check behind the
+//! What a git read would load that can run a program: the check behind the
 //! read-only rule's git reads ([`super::approval::RULE_READ_ONLY`]).
 //!
-//! **The ruling** (owner, 2026-09-25): git reads under `[harness] approve =
-//! "safe"` are NOT blanket-escalated — that would interrupt the person on every
-//! `git status`. Instead a git read is approved only when no configuration it
-//! would load can execute a program. The classifier
-//! ([`crate::supervise::classify`]) judges the LINE; this module judges the
-//! MACHINE the line runs on: a worker in accept-edits mode can write the
-//! repository's `.git/config`, and `git status` then runs whatever
-//! `core.fsmonitor` names.
+//! Git reads under `approve = "safe"` are approved only when no configuration
+//! they would load can execute a program. The classifier
+//! ([`crate::supervise::classify`]) judges the line; this module judges the
+//! machine: an accept-edits worker can write `.git/config`, and `git status`
+//! then runs whatever `core.fsmonitor` names (owner, 2026-09-25).
 //!
-//! **Where a git read runs** ([`git_reads`]): the command of each segment is
-//! found as the classifier's head check finds it
-//! ([`crate::supervise::classify::runs`] — through assignments, redirects,
-//! `timeout`, `time`, `env` and `xargs`), so no wrapper the classifier sees
-//! through hides a git from this check. It runs in the session's cwd, the
-//! directory the session's Bash tool stands in as Claude Code's transcript
-//! under the worker's own Claude Code directory last recorded it
-//! ([`WorkerEnv::claude_dir`], [`crate::harness::footer::shell_cwds`] — the
-//! box does not say, and an earlier `cd sub`, which Claude Code runs unasked,
-//! moves it), every `cd` / `pushd` target on the line, an `env -C` / `--chdir`
-//! directory, and every `-C` target resolved against each of those (a
-//! superset — a `cd` inside a subshell is counted as if it were not). A directory this check
-//! cannot resolve (an expansion, `cd -`, `~user`, a `-C` that `xargs` input
-//! supplies, a relative `cd` a loop repeats) escalates. `--git-dir`/`--work-tree` and `-c` are refused by the
-//! classifier before this runs, and so are `GIT_*=` assignments and `env -P`.
+//! **Where** ([`git_reads`]): each segment's command is found as
+//! [`crate::supervise::classify::runs`] finds it, and runs in the session's cwd
+//! as the worker's transcript last recorded it ([`WorkerEnv::claude_dir`],
+//! [`crate::harness::footer::shell_cwds`]), every `cd`/`pushd` target, an
+//! `env -C` directory, and every `-C` target against each (a superset). An
+//! unresolvable directory escalates.
 //!
-//! **What is checked** ([`hazard`]) — the effective configuration git itself
-//! reports in each directory (`git config --list --show-scope`: system,
-//! global, the repository's local and worktree config, anything
-//! `include.path` / `includeIf` pulls in, and `GIT_CONFIG_*`), plus the one
-//! hook a read runs, and the same again in every populated submodule,
-//! recursively (a `status` or `diff` runs git in each, with that submodule's
-//! own `.git/modules/<name>/config`):
+//! **What** ([`hazard`]): the effective configuration (`git config --list
+//! --show-scope`, includes and `GIT_CONFIG_*`) in each directory and every
+//! populated submodule, recursively:
 //!
-//! * `core.fsmonitor` naming a program (a boolean is git's built-in daemon);
-//! * `diff.external`, `diff.<driver>.textconv`, `diff.<driver>.command`, and
-//!   `GIT_EXTERNAL_DIFF` in the worker's environment;
-//! * `filter.<driver>.clean` / `smudge` / `process` when the attributes select
-//!   that driver for a tracked path (`git status` runs the clean filter on a
-//!   modified file; a driver no path selects never runs — `git lfs install`
-//!   puts one in every global config);
-//! * a partial clone (`extensions.partialClone`, a `remote.<name>.promisor`):
-//!   a read may fetch a missing object from the promisor remote, where
-//!   credential helpers, ssh and the remote's programs run;
-//! * `gpg.program` / `gpg.<format>.program`, when the read displays
-//!   signatures (`--show-signature`, a `%G` format, `tag -v`, or
-//!   `log.showSignature` on a `log`/`show`);
-//! * an executable `post-index-change` hook where the read would run it
-//!   (`git status` and `git diff` write the refreshed index).
+//! * `core.fsmonitor` naming a program;
+//! * `diff.external`, `diff.<driver>.textconv`/`command`, `GIT_EXTERNAL_DIFF`;
+//! * `filter.<driver>.*` when the attributes select it for a tracked path;
+//! * a partial clone (a read may fetch from the promisor remote);
+//! * `gpg.program` when the read displays signatures;
+//! * an executable `post-index-change` hook where the read would run it.
 //!
-//! A read that contacts a remote (`git remote show` without `-n`) escalates
-//! outright: `credential.helper`, `core.sshCommand`, `core.askPass` and the
-//! remote's own programs all run there.
+//! A read that contacts a remote escalates outright. `core.pager`/`pager.*`
+//! are exempt (decided 2026-09-26 under the owner's standing direction):
+//! Claude Code's Bash tool gives git no terminal, and the classifier refuses
+//! the reads that start a pager or viewer without one (`git grep -O`,
+//! `git <cmd> --help`).
 //!
-//! **Read as the WORKER reads it** ([`WorkerEnv`]). Every probe runs the git
-//! the worker's own `PATH` finds, with the worker process's environment at
-//! exec — its `HOME` and `XDG_CONFIG_HOME` (the global config),
-//! `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_NOSYSTEM`,
-//! `GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS`, `GIT_DIR` and the rest of
-//! repository discovery — which the supervisor reads from the kernel, bound
-//! to the session (`Session::worker_env`), and which every command the
-//! worker's Bash tool runs starts from. aterm's own environment is never the
-//! stand-in: a window started from the Dock has neither the worker's `PATH`
-//! (and so not its git, whose compiled-in system config may differ) nor its
-//! variables. Escalated instead, naming why:
+//! **As the worker reads it** ([`WorkerEnv`]): every probe runs the git the
+//! worker's `PATH` finds with the worker process's environment, read from the
+//! kernel (`Session::worker_env`), never aterm's own. Escalated instead: an
+//! unreadable environment; a `PATH` entry ahead of git the worker could write
+//! ([`WorkerEnv::view`]); a git-relevant variable Claude Code's settings give
+//! the Bash tool but not the process ([`WorkerEnv::settings_env`]).
 //!
-//! * a worker whose environment cannot be read;
-//! * a `PATH` with an entry ahead of git that the worker could have put a git
-//!   in ([`WorkerEnv::view`]): a relative one, or one the worker writes
-//!   without approval — its project (a virtualenv's `bin`, `node_modules/.bin`),
-//!   a directory its Bash tool stands in, a scratch directory. The probe runs
-//!   that git in the supervisor before anything is approved, so it is never
-//!   run;
-//! * a variable Claude Code's settings give the Bash tool and not the process
-//!   ([`WorkerEnv::settings_env`]): a `GIT_*` (but the pager and the editor),
-//!   `HOME`, `XDG_CONFIG_HOME` or `PATH` in the `env` of the managed settings,
-//!   a `--settings` the worker was launched with, the project's
-//!   `.claude/settings.json` / `settings.local.json` (repository content an
-//!   accept-edits worker writes), or the user's `settings.json`.
-//!
-//! **Decided (2026-09-26, under the owner's standing direction), two
-//! refinements of the 2026-09-25 ruling:**
-//!
-//! * **`core.pager` / `pager.*` are exempt.** git starts a pager only when its
-//!   stdout is a terminal, and the boxes this rule judges are Claude Code Bash
-//!   commands, which have none to give it — measured 2026-09-27 from inside the
-//!   Bash tool: stdin is `/dev/null`, stdout and stderr are pipes, and there is
-//!   no controlling terminal (`/dev/tty` answers ENXIO), so not even a redirect
-//!   or a descriptor copy can hand git one. Two reads start a program without
-//!   a terminal, and the classifier refuses both before this runs: `git grep
-//!   -O` / `--open-files-in-pager` in every spelling git's option parser
-//!   accepts (`-nO`, `-iOless`, `--open`, `--op`), which runs the pager on the
-//!   matching files; and `git <cmd> --help` (`git --help <cmd>`, `git -h
-//!   <cmd>`), which is `git help` and runs the man or web viewer
-//!   (`man.<tool>.cmd`, `browser.<tool>.cmd`) a repository's config may name.
-//!   Escalating on a pager (`delta`, `less -R`, common in global configs)
-//!   would be the blanket escalation the ruling refused. (`GIT_PAGER` /
-//!   `PAGER` in the worker's environment likewise.)
-//! * **`filter.<driver>.*` counts only where the repository's attributes
-//!   select it** for a tracked path (`git check-attr filter`); an unreadable
-//!   attribute set counts every configured filter.
-//!
-//! **What stays open.** A box that runs on another machine (`(runs on <m>)`)
-//! escalates: its configuration is that machine's. And the Bash tool's
-//! environment is more than the process's and the settings': Claude Code
-//! sources its shell snapshot before each command (the login shell's `PATH`,
-//! and its aliases and functions — a `git` alias or function runs instead of
-//! the git probed), a SessionStart hook's `CLAUDE_ENV_FILE`, and zsh's
-//! `~/.zshenv`, and sets variables of its own (`GIT_EDITOR`). Those come from
-//! the person's own rc files and hooks, not from the repository — an
-//! accept-edits worker writes them unasked only when it was launched in
-//! `$HOME` itself, where it can plant code the person's next shell runs in
-//! any case — and this check does not read them.
+//! Not covered: a box that runs on another machine (escalated), and the shell
+//! snapshot, `CLAUDE_ENV_FILE` and rc files Claude Code sources before each
+//! command, which come from the person's own configuration.
 
+use aterm_uds::spawnfd::{Command, Stdio};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use aterm_json::Value;
 use atpkg::caller_shell::ProcArgs;
@@ -652,9 +580,12 @@ struct Probe<'a> {
 
 impl Probe<'_> {
     /// `git --no-pager` in `dir`, with the worker's environment and nothing
-    /// of this process's ([`withheld_from_probe`] aside), stdin closed.
+    /// of this process's ([`withheld_from_probe`] aside), stdin closed. Built
+    /// through `aterm_uds::spawnfd::command`, so from a process with no console (the
+    /// window's harness host) `git.exe` gets a windowless console on Windows,
+    /// not a visible one.
     fn git(&self, dir: &Path) -> Command {
-        let mut cmd = Command::new(&self.program);
+        let mut cmd = aterm_uds::spawnfd::command(&self.program);
         cmd.arg("--no-pager")
             .current_dir(dir)
             .env_clear()

@@ -98,7 +98,7 @@ fn damage_iterator_empty() {
     assert!(damaged.is_empty());
 }
 
-/// Regression test for #1695: size_hint() should not panic after exhaustion.
+/// size_hint() does not panic after exhaustion.
 #[test]
 fn damage_iterator_size_hint_after_exhaustion() {
     let mut damage = Damage::new(24);
@@ -282,9 +282,7 @@ fn bitset_iterator_respects_max() {
     assert_eq!(rows, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 }
 
-// =========================================================================
-// State machine tests (migrated from Kani proofs per #1912)
-// =========================================================================
+// State machine tests
 
 #[test]
 fn state_new_creates_partial() {
@@ -415,17 +413,10 @@ fn damage_rect_dimensions_consistent() {
     assert_eq!(empty.cell_count(), 0);
 }
 
-// =========================================================================
 // DamageBoundsIterator correctness
-// =========================================================================
 
-/// Regression test for #5779: DamageBoundsIterator must skip rows whose
-/// column bounds are entirely out of the visible range, not terminate early.
-///
-/// When `mark_cell(row, col)` is called with col >= screen cols, the
-/// `row_damage_bounds` clamps to None.  The iterator must continue to the
-/// next damaged row rather than returning None (which signals exhaustion
-/// to all Iterator consumers).
+/// DamageBoundsIterator skips rows whose column bounds fall entirely outside
+/// the visible range (`mark_cell` with col >= cols) instead of ending early.
 #[test]
 fn damage_bounds_iterator_skips_out_of_range_row() {
     let mut damage = Damage::new(10);
@@ -457,9 +448,7 @@ fn damage_bounds_iterator_skips_multiple_out_of_range() {
     );
 }
 
-// =========================================================================
 // Out-of-bounds access safety tests
-// =========================================================================
 
 #[test]
 fn tracker_out_of_bounds_mark_row_is_safe() {
@@ -490,9 +479,7 @@ fn tracker_out_of_bounds_row_damage_bounds_returns_none() {
     assert_eq!(tracker.row_damage_bounds(100), None);
 }
 
-// =========================================================================
-// Missing coverage tests (identified in #1912)
-// =========================================================================
+// Additional coverage
 
 #[test]
 fn mark_rows_range_behavior() {
@@ -600,9 +587,7 @@ fn damage_rect_from_line() {
     assert_eq!(rect.height(), 1);
 }
 
-// =========================================================================
-// DamageTracker::clear() behavioral equivalence (#performance_proofs)
-// =========================================================================
+// DamageTracker::clear() behavioral equivalence
 
 /// clear() produces the same observable state as constructing a fresh tracker.
 #[test]

@@ -100,11 +100,8 @@ pub fn socket_directive(
 ///
 /// WHY THIS EXISTS: `var_os(..).is_some()` treats a present-but-empty variable
 /// as engaged, and empty env vars travel — a shell exporting `ATERM_X=` hands
-/// every descendant an is_some() veto nothing intended. That exact species
-/// disabled the seamless updater on the owner's daily terminal twice over
-/// (an empty control-socket selector on 2026-09-01, and the `ATERM_NO_*` family
-/// audited the same day). Flag readers go through here, or they re-grow the
-/// bug.
+/// every descendant an is_some() veto nothing intended (one once disabled the
+/// seamless updater on a daily driver). Flag readers go through here.
 #[must_use]
 pub fn env_flag_engaged(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
@@ -258,9 +255,8 @@ pub fn graph_entry_sock(body: &str) -> Option<String> {
 /// session's entry and `\\?\C:\…\aterm-16172.sock` from the next — and the
 /// client's dedupe, which canonicalizes each side and compares, could not
 /// collapse them because Windows refuses to `canonicalize` an AF_UNIX socket
-/// file at all (it is a reparse point CreateFile will not open). MEASURED
-/// 2026-09-22 on aterm 0.90.0: `aterm ctl instances` printed the one live
-/// instance twice, once per spelling, and `ls` printed every session twice.
+/// file at all (it is a reparse point CreateFile will not open), so
+/// `aterm ctl instances` printed the one live instance twice.
 ///
 /// This strips the verbatim-disk prefix and, on Windows, folds ASCII case
 /// (NTFS paths compare case-insensitively), and is the key both the writer

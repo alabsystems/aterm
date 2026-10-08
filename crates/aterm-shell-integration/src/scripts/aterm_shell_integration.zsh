@@ -27,6 +27,42 @@
 # Only run in interactive shells
 [[ -o interactive ]] || return
 
+# ─── THE TRACE (2026-10-02) ───
+#
+# A user's XTRACE (`set -x` at the prompt, `setopt xtrace` in an rc) traced every
+# line aterm runs around a command, where bare zsh traces only the command: 80 to
+# 660 lines of precmd, preexec and scheduled event per command, and in them the
+# capability nonce, in plain text, 4 to 10 times per command, on the screen and in
+# the scrollback (measured on zsh 5.9). An `unsetopt xtrace` is itself traced, and
+# `emulate` keeps XTRACE as it finds it. But zsh prints a traced command only after
+# expanding its words, so a command whose own expansion turns XTRACE off is never
+# printed — `: ${options[xtrace]::=off}` — and zsh puts XTRACE back as it found it
+# at every function's return. So every function the shell runs on aterm's behalf
+# OPENS with that line, before anything else: the hooks, the scheduled event's
+# function, what the prompt calls, the tty wrappers and what they call, the
+# documented helper; the trampoline takes `$?` in the same command (`${…:+}`
+# expands to nothing). Nothing of aterm's is traced from there on, while the
+# user's commands, and the precmd hooks after aterm's, are traced as in bare zsh.
+# The load does the same: XTRACE off here, put back as it was wherever this file
+# returns, so a `.zshenv` that sets it, or a typed upgrade under `set -x`, traces
+# none of it (the nonce is captured below) but the line above. A widget is never
+# traced (zle turns XTRACE off around each). What remains is the scheduled
+# event's own command — one line, three after a status of 2 or more — where an rc
+# replaced zle-line-init (see THE LEAD): zsh prints it before it runs, and the
+# event keeps the user's `$_` and `$pipestatus`, which the simple command that
+# turns XTRACE off would replace.
+#
+# The line is spelled
+#     : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+# so it assigns only where `options` is zsh's own. A function of the user's that
+# declares a local `options` (`local options`, `local -A options` for `zparseopts
+# -A`) hides zsh's from everything it calls, and the tty wrappers are called from
+# such functions: the bare assignment failed there (`options: assignment to
+# invalid subscript range`), which abandoned the user's whole function before its
+# `stty` ran, or wrote an `xtrace` key into the user's table (measured on zsh
+# 5.9). There aterm's lines are traced, as they were before.
+typeset -g __aterm_load_xtrace=${${(M)${(t)options}:#*special}:+${options[xtrace]}}${${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}:+}
+
 # ─── The multiplexer boundary (screen / tmux) ───
 #
 # aterm hosts ONE session per PTY. Run screen or tmux in that PTY and the
@@ -91,19 +127,31 @@ else
     esac
 fi
 
+# A user's ATERM_MUX=0 (or off/no/none/false) turns the whole check off:
+# keep it, and say nothing.
+case "${ATERM_MUX:-}" in 0|off|no|none|false) __aterm_mux="" ;; esac
+
 # THE IN-PLACE UPGRADE (2026-09-26). The guard below is exported, so a NON-empty
 # value normally proves this shell did not come straight from aterm (a pane — see
 # above). There is one other way to arrive here with it set: THIS VERY SHELL
 # sourcing the file again — the live agent upgrade's relaunch line sources a newer
 # build's loader into a shell spawned before loaders existed (`typed_rekey` in
 # aterm-shell-integration), or a user's rc that sources this file is re-read. That
-# shell, and only that shell, already holds `$__aterm_shell_nonce`: a plain global,
-# never exported, so no pane or child shell can have inherited it. For it the guard
-# is its own, and the load goes on as an upgrade in place: everything below is
-# idempotent, and what must run once per shell (the package blocks, the hook and
-# widget wiring) is skipped where it already ran.
+# shell, and only that shell, already holds `$__aterm_shell_nonce` AND the precmd
+# hook its integration defined, `__aterm_precmd` (every build's since 0.61): a
+# function, which no pane or child shell inherits. The nonce alone is no proof
+# (review finding 2026-10-01): the typed line assigns it in whichever shell runs
+# it — a NESTED one too (a `bash` typed in the tab, a `nix develop`), which
+# inherited the guard and ran no integration — and the next live agent upgrade
+# typed its line there again, upgrading that shell in place: hooks wired, PATH
+# re-fronted, a revision signed for a tab whose own shell was still frozen. For
+# the shell that holds both the guard is its own, and the load goes on as an
+# upgrade in place: everything below is idempotent, and what must run once per
+# shell (the package blocks, the hook and widget wiring) is skipped where it
+# already ran.
 typeset -gi __aterm_fresh_load=1
-if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]] && (( ${+__aterm_shell_nonce} )); then
+if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]] &&
+   (( ${+__aterm_shell_nonce} && ${+functions[__aterm_precmd]} )); then
     __aterm_fresh_load=0
     ATERM_SHELL_INTEGRATION_INSTALLED=
 fi
@@ -133,6 +181,7 @@ if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]]; then
         fi
     fi
     unset __aterm_mux
+    [[ $__aterm_load_xtrace != on ]] || builtin setopt xtrace
     return
 fi
 export ATERM_SHELL_INTEGRATION_INSTALLED=1
@@ -210,8 +259,8 @@ unset ATERM_MUX ATERM_MUX_OUTER_SESSION_ID __aterm_mux
 # `TerminalModes::require_shell_integration_nonce` is enabled.
 #
 # In an upgrade in place (see above) the environment holds no nonce any more — it
-# was scrubbed at this shell's first load — so the one the shell already signs
-# with is kept.
+# was scrubbed at this shell's first load — so the one the shell holds is kept: in
+# a typed upgrade, the key its line assigned just before sourcing this file.
 typeset -g __aterm_shell_nonce="${ATERM_SHELL_NONCE:-${__aterm_shell_nonce:-}}"
 unset ATERM_SHELL_NONCE
 
@@ -292,10 +341,14 @@ fi
 # when a pointer waits. The body is sourced under `emulate -L zsh`, so a user's
 # ksh_arrays / sh_word_split / warn_create_global cannot bend its top level, and
 # the revision moves only when the source succeeded: a body that failed to load is
-# still reported as the one before it.
+# still reported as the one before it. And with VERBOSE off, which `emulate`
+# without -R leaves as it finds it: VERBOSE echoes every line a file sourced,
+# which put the whole body on the user's screen at every switch (measured on zsh
+# 5.9: ~1,000 lines); LOCAL_OPTIONS puts it back at the return.
 __aterm_body_check() {
     [[ -n "$__aterm_body_pointer" && -f "$__aterm_body_pointer" ]] || return 0
     emulate -L zsh
+    builtin unsetopt verbose
     local __aterm_addr="" __aterm_file=""
     { IFS= read -r __aterm_addr < "$__aterm_body_pointer" } 2>/dev/null
     command rm -f -- "$__aterm_body_pointer"
@@ -311,11 +364,17 @@ __aterm_body_check() {
 # THE TRAMPOLINE: the one precmd hook, and the one piece of the prompt path that
 # never changes. A body sourced by the check is the body whose precmd runs in the
 # SAME prompt, so the prompt that takes a new body already emits its marks.
+# It returns 0, and so does the body's precmd: a hook's status is not `$?` for
+# the hooks after it, the prompt or the next command (zsh restores it after
+# every hook), and a function that returns non-zero is a failed command to a
+# user's ZERR trap, which fired twice inside these after every failed command
+# (measured on zsh 5.9; bare zsh fires it once, for the command). Its first
+# command takes `$?` and turns XTRACE off, and is not traced (see THE TRACE).
 __aterm_precmd() {
-    local __aterm_status=$?
+    local __aterm_status=$?${${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}:+}
     __aterm_body_check
     __aterm_body_precmd "$__aterm_status"
-    return $__aterm_status
+    return 0
 }
 
 # Install hooks using zsh hook arrays (the registrations are at the end of the
@@ -324,6 +383,10 @@ __aterm_precmd() {
 autoload -Uz add-zsh-hook
 
 # @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
+
+# Not traced (see THE TRACE): a loader from before it sources this body at a switch
+# with the user's XTRACE on, and its body check puts that back at its return.
+: ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
@@ -590,6 +653,10 @@ __aterm_managed_path_live() {
 
 # State tracking. KEPT across a live re-source: the body is re-sourced from the
 # precmd trampoline, and a command that was running must still get its 133;D.
+# The functions that run with the user's options (the precmd, the zle-line-init
+# widgets: no `emulate`) set a global with `typeset -g`: a plain
+# assignment there is what a user's WARN_NESTED_VAR warns at, at every command
+# and in the middle of the line editor's prompt.
 typeset -g __aterm_in_command="${__aterm_in_command:-0}"
 typeset -g __aterm_report_host="${HOST:-${HOSTNAME:-localhost}}"
 
@@ -638,8 +705,10 @@ __aterm_rekey_check() {
 # the empty string otherwise. Reads from the captured local — never from
 # the environment — so the nonce is not inherited by subprocesses.
 # Kept as the documented helper / external entry point; the hot emitters
-# below use $__aterm_id_suffix_str instead to avoid a fork per marker.
+# below use $__aterm_id_suffix_str instead to avoid a fork per marker. Not
+# traced (see THE TRACE): its caller's `set -x` printed the nonce.
 __aterm_id_suffix() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
     if [[ -n "$__aterm_shell_nonce" ]]; then
         print -rn -- ";id=${__aterm_shell_nonce}"
     fi
@@ -656,7 +725,14 @@ __aterm_id_suffix() {
 # to cost a fork; a 4-byte emoji cost four. No `& 0xFF` mask is needed (or
 # present, historically): unlike bash, zsh's `printf '%d' "'<byte>"` returns
 # the UNSIGNED byte value (195 for 0xC3), so `%02X` is already correct.
+#
+# Under `emulate -L zsh`, like `__aterm_encode_cmd`: the loop reads
+# `${string[$i]}` from 1, and a user's KSH_ARRAYS (subscripts from 0) dropped the
+# first byte and read one past the last — `file://<host>` then ran into the path,
+# and the `%00` it ended with is a cwd the engine refuses, so the tab's cwd stayed
+# at the directory before (measured on zsh 5.9).
 __aterm_urlencode() {
+    emulate -L zsh
     local LC_ALL=C
     # Fast path: no byte needs encoding, so the loop would copy the string
     # verbatim. Skip it. (The class is exactly the loop's pass-through class,
@@ -813,7 +889,9 @@ __aterm_tty_repair() {
 #    `reset`'s pause): zsh abandons the rest of a function whose foreground child
 #    died by SIGINT, `emulate` or not. The `always` block runs on that path too.
 # The command's own status is still what the wrapper returns (130 for the ^C).
+# Not traced (see THE TRACE): the user's `stty` line is, as in bare zsh.
 __aterm_tty_thaw_run() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
     emulate -L zsh
     local -i __aterm_tty_rc=0
     {
@@ -828,7 +906,9 @@ __aterm_tty_thaw_run() {
 
 # Once per shell, at the first prompt this body runs. The wrappers are spelled
 # with the `function` keyword: a user's alias for the name would otherwise be
-# expanded when a live body is parsed and define something else entirely.
+# expanded when a live body is parsed and define something else entirely. They
+# open with THE TRACE's line: under `set -x`, bare zsh traces the `stty` line and
+# nothing for it, where the wrapper traced its own call too.
 __aterm_tty_arm() {
     emulate -L zsh
     __aterm_tty_armed=1
@@ -841,17 +921,29 @@ __aterm_tty_arm() {
             return 0
         fi
     done
-    function stty { __aterm_tty_thaw_run stty "$@"; }
-    function reset { __aterm_tty_thaw_run reset "$@"; }
-    function tset { __aterm_tty_thaw_run tset "$@"; }
+    function stty {
+        : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+        __aterm_tty_thaw_run stty "$@"
+    }
+    function reset {
+        : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+        __aterm_tty_thaw_run reset "$@"
+    }
+    function tset {
+        : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+        __aterm_tty_thaw_run tset "$@"
+    }
     builtin ttyctl -f
     __aterm_tty_frozen=1
     return 0
 }
 
 # precmd - runs before each prompt, from the loader's trampoline, which hands it
-# the status the command before it left.
+# the status the command before it left. XTRACE off first (see THE TRACE): a
+# loader from before it calls this with the user's on. No `emulate`: the VERBOSE
+# it turns off below stays off for its caller.
 __aterm_body_precmd() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
     local last_status=$1
 
     # A waiting re-key first, so every mark this prompt emits carries it.
@@ -863,6 +955,15 @@ __aterm_body_precmd() {
     (( __aterm_tty_armed )) || __aterm_tty_arm
     (( __aterm_tty_frozen || last_status == 0 )) || __aterm_tty_repair
 
+    # 133;B leads zle-line-init again where something took it (see "THE LEAD").
+    __aterm_line_init_wire "$last_status"
+    # VERBOSE echoes a scheduled event's text before it runs (bare zsh echoes
+    # nothing between two prompts): off here, at the caller's level — the wire
+    # runs under `emulate -L` — and on again from the event's first `[[ ]]`. The
+    # precmd hooks after this one run with it off: a file one of them sources is
+    # not echoed (no function body or `eval` is echoed either way).
+    (( ! __aterm_line_init_hush )) || builtin unsetopt verbose
+
     # The managed dirs, live (see "LIVE" above): one stat, one readdir, an assign
     # (or a rehash) only on a change.
     __aterm_managed_path_live
@@ -870,7 +971,7 @@ __aterm_body_precmd() {
     # If we were in a command, mark it finished
     if (( __aterm_in_command )); then
         __aterm_mark_exec_finish $last_status
-        __aterm_in_command=0
+        typeset -g __aterm_in_command=0
     fi
 
     # Report current directory
@@ -897,7 +998,8 @@ __aterm_body_precmd() {
     __aterm_mark_integration_rev
     __aterm_mark_prompt_start
 
-    return $last_status
+    # 0, not the command's status (see THE TRAMPOLINE).
+    return 0
 }
 
 # Encode a string for OSC 633;E (VS Code convention).
@@ -908,8 +1010,11 @@ __aterm_body_precmd() {
 # `[[:cntrl:]]|' '` arm because it is unconditionally 0x20 — a literal
 # beats a subshell, and spaces are the only member of that arm a real
 # command line ever contains. Control bytes keep the computed form but
-# use `printf -v` instead of a `$(printf ...)` subshell.
+# use `printf -v` instead of a `$(printf ...)` subshell. Under `emulate -L zsh`
+# (see `__aterm_urlencode`): a user's KSH_ARRAYS cut the first letter off every
+# command line 633;E reported.
 __aterm_encode_cmd() {
+    emulate -L zsh
     local LC_ALL=C
     local string="$1" i char encoded="" hex
     for ((i = 1; i <= ${#string}; i++)); do
@@ -925,9 +1030,12 @@ __aterm_encode_cmd() {
     print -rn -- "$encoded"
 }
 
-# preexec - runs before command execution
+# preexec - runs before command execution. XTRACE off first (see THE TRACE), then
+# zsh's own options: nothing here is the user's to change.
 __aterm_preexec() {
-    __aterm_in_command=1
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    emulate -L zsh
+    typeset -g __aterm_in_command=1
 
     # The managed dirs, live — BEFORE this command resolves: a `claude` typed at a
     # prompt that was drawn before atpkg laid agents/ must already run the twin.
@@ -979,6 +1087,8 @@ __aterm_set_prompt() {
 }
 
 __aterm_git_segment() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    emulate -L zsh
     local branch
     branch=$(command git rev-parse --abbrev-ref HEAD 2>/dev/null) || return
     [[ -n "$branch" ]] && print -n "${1}(${branch//\%/%%})${2}"
@@ -1011,19 +1121,274 @@ __aterm_setup_keybindings() {
 # ─── OSC 133;B (end of prompt / start of user input) ───
 # Emitted via zle-line-init so it fires after the prompt is fully drawn.
 # Placing it in preexec is too late (user has already typed their command).
-# The widget is wired once, by the loader (end of file).
+# The loader wires `__aterm_zle_line_init` once (end of file) — from the wrapper
+# .zshenv, BEFORE ~/.zshrc. Where the lead (below) marked the line already, it
+# only passes the line on. With nothing to pass it to it returns 0, not the status
+# of a test: add-zle-hook-widget's dispatcher (`zle "$hook" … || return`) stopped
+# at aterm's widget, its first hook, and never ran the user's own line-init hooks
+# after it (measured 2026-10-01, zsh 5.9). What it passes the line to is reached
+# with the `$?` it was reached with (`__aterm_line_init_pass`).
 __aterm_zle_line_init() {
-    __aterm_mark_command_start
-    (( ${+widgets[__aterm_orig_zle_line_init]} )) && zle __aterm_orig_zle_line_init
+    local -i __aterm_reached=$?
+    if (( ! ${__aterm_line_init_marked:-0} )); then
+        typeset -g __aterm_line_init_marked=1
+        __aterm_mark_command_start
+    fi
+    # What holds the front reached this widget: it leads with 133;B by itself.
+    typeset -g __aterm_line_init_via="${widgets[zle-line-init]-}"
+    (( ${+widgets[__aterm_orig_zle_line_init]} )) || return 0
+    __aterm_line_init_pass $__aterm_reached __aterm_orig_zle_line_init
+}
+
+# `zle $2`, entered with `$?` = `$1`. zle hands zle-line-init the status of the
+# command before the line, which a widget reads as `$?` until it runs a command
+# of its own — and aterm's widgets ran theirs first, so the widget they pass the
+# line to read 0 (measured on zsh 5.9: after `false`, a zle-line-init that
+# prints `$?` printed 1 in bare zsh and 0 behind aterm's). The `if` leaves 0 for
+# a 0; any other status is a function's return, which on the left of `||` is no
+# failed command to a ZERR trap or ERR_RETURN. Run with the user's options.
+__aterm_line_init_pass() {
+    if (( ! $1 )); then
+        zle "$2"
+    else
+        __aterm_line_init_status "$1" || zle "$2"
+    fi
+}
+__aterm_line_init_status() { return "$1"; }
+
+# THE LEAD (2026-10-01). An rc that defines its own zle-line-init with `zle -N`
+# REPLACES the loader's widget instead of chaining it: oh-my-zsh's
+# lib/key-bindings.zsh does exactly that (`echoti smkx`, whenever terminfo has
+# smkx — every aterm tab), and so do vi-mode cursor snippets. Measured 2026-10-01
+# (zsh 5.9, oh-my-zsh 4d4cfc2, its default template): 133;A at every prompt and
+# never a 133;B, so the engine — which takes 133;C only after a B — kept no block
+# and no exit code for any command (`ctl blocks`: every block `prompt exit=-`),
+# while `status` read `integration=on`.
+#
+# So 133;B goes in FRONT of whatever holds zle-line-init — for the one line it
+# marks, and only once every precmd hook has run. The precmd schedules
+# `__aterm_line_init_late` (`sched +0`: zsh runs a due event after the precmd
+# hooks, before it expands the prompt and reads the line), which puts
+# `__aterm_line_init_lead` in front and keeps what was there as
+# `__aterm_line_init_under`; the lead marks the line, puts the table back as it
+# was and runs that widget AS zle-line-init. No rc or precmd hook finds the lead
+# in the table (what reads it while the prompt is expanded: see the two notes
+# below), and every widget runs once per line. A lead that stayed in front, put
+# back by the precmd, was seen by the plugins that read the table:
+#  - zsh-vi-mode, which at its first prompt wraps a widget listed under another
+#    function's name and replaces one listed under its own, wrapped the lead
+#    where it replaces oh-my-zsh's widget: `echoti smkx` kept running at every
+#    line while oh-my-zsh's `rmkx` (zle-line-finish, which zsh-vi-mode did
+#    replace) did not, so the cursor-key and keypad application modes stayed set
+#    while every command ran (measured 2026-10-01 with `ctl modes`; bare zsh
+#    sets neither);
+#  - a plugin that wraps zle-line-init again whenever its wrapper lost the front,
+#    under a NEW name each time (zsh-autosuggestions, once `zle-*` is out of its
+#    ignore list), wrapped the lead again at every prompt, and each line ran every
+#    wrapper so far until FUNCNEST stopped it (measured: from prompt 139 on).
+# (The PROMPT string is no place for the mark: measured the same day,
+# powerlevel10k rebuilds PROMPT in a precmd hook that runs after aterm's, and a
+# 133;B appended to it never reached a single prompt.)
+#
+# The event is scheduled only where the loader's widget would not mark the line:
+# what holds the front is neither that widget nor the one that reached it on the
+# line before (`__aterm_line_init_via`: powerlevel10k alone, zsh-vi-mode alone,
+# add-zle-hook-widget, an rc that wraps the loader's widget — none schedules it
+# after their first prompt). Where it runs it changes nothing a command could
+# read and prints nothing (measured on zsh 5.9): after a status of 0 or 1 it is an
+# arithmetic command calling `__aterm_line_init_late` as a math function, which
+# keeps `$?`, `$_` and `$pipestatus`; after any other status it is a call
+# returning that status, and `$pipestatus` after a PIPELINE so ended reads `($?)`
+# — every command sets it, and only a pipeline that reproduced it, forking once
+# per element, could put it back. That call runs with PRINT_EXIT_VALUE off: zsh reports
+# every top-level pipeline that ends non-zero while a user's rc has it on, so the
+# call reported the status a second time, above the prompt (`zsh: exit 3`), and a
+# function cannot turn it off for its caller (zsh puts it back at every return).
+# The event turns it off and back with `${name::=value}` inside `[[ ]]` — which
+# runs no command, so `$_` stays the user's — around the call, inside `{ }
+# always { }`, whose status is the call's. The arithmetic command, and that
+# block, are the first command of an `&&`/`||` list whose second never runs, so
+# neither fires a ZERR trap or ERR_EXIT. A DEBUG trap sees their commands.
+#
+# Nothing here re-points `__aterm_orig_zle_line_init`, the loader's: re-pointing
+# that alias made a loop (measured: ~250 marks and FUNCNEST errors at every
+# prompt). A body from before the lead (a rollback, an older build adopting the
+# shell through the pointer) finds the table exactly as the rc left it.
+
+# The widget that held the front when the loader's widget last ran in a line —
+# read, and forgotten, by the next precmd: a widget that stops reaching it costs
+# one line its mark, not every line after.
+typeset -g __aterm_line_init_via="${__aterm_line_init_via-}"
+# Whether this prompt's line is marked (cleared at every precmd): a line reaches
+# the loader's widget after the lead marked it, and a `vared` run by a command
+# reaches it too.
+typeset -gi __aterm_line_init_marked=0
+# Whether the event put the lead in the table and it has not stepped aside yet.
+typeset -gi __aterm_line_init_led="${__aterm_line_init_led:-0}"
+# The event's own (see "THE LEAD"): the user's `$_` and PRINT_EXIT_VALUE while
+# the call runs.
+typeset -g __aterm_line_init_u="" __aterm_line_init_pev=""
+# Whether the precmd turned the user's VERBOSE off for a pending event, which
+# turns it back on (see `__aterm_line_init_wire`).
+typeset -gi __aterm_line_init_hush="${__aterm_line_init_hush:-0}"
+
+# The lead runs no `emulate`: the widget it hands the line to runs with the
+# user's options, as it would without aterm, and with the `$?` the lead was
+# reached with (`__aterm_line_init_pass`). A widget called with `zle <name>`
+# keeps the caller's `$WIDGET`, so it is the table that says how it was reached.
+__aterm_line_init_lead() {
+    local -i __aterm_reached=$?
+    if (( ! ${__aterm_line_init_marked:-0} )); then
+        typeset -g __aterm_line_init_marked=1
+        __aterm_mark_command_start
+    fi
+    if [[ "${widgets[zle-line-init]-}" == user:__aterm_line_init_lead ]]; then
+        # zsh called it: zle-line-init goes back to what it took the front from,
+        # which then runs as zle-line-init. zle reads no status from it, and a
+        # non-zero one would be a second failed command to a user's ZERR trap,
+        # after the widget's own.
+        __aterm_line_init_aside
+        [[ -n "${widgets[zle-line-init]-}" ]] || return 0
+        __aterm_line_init_pass $__aterm_reached zle-line-init
+        return 0
+    fi
+    # A wrapper put in front while it led calls it: it runs what it took the
+    # front from, then steps aside.
+    local -i __aterm_status=0
+    if (( ${+widgets[__aterm_line_init_under]} )); then
+        __aterm_line_init_pass $__aterm_reached __aterm_line_init_under
+        __aterm_status=$?
+    fi
+    __aterm_line_init_aside
+    return $__aterm_status
+}
+
+# The table as it is without aterm: every name that holds the lead — zle-line-init,
+# and the alias a wrapper keeps of it when it wrapped zle-line-init while the lead
+# held it (powerlevel10k does, while it expands its first prompt: after the event,
+# before the line) — holds again the widget the lead took the front from, or
+# nothing where it took the front from nothing. (Measured on zsh 5.9 with
+# oh-my-zsh and powerlevel10k: a lead that put back only zle-line-init dropped
+# powerlevel10k's widget from the table at the first line, and the alias went on
+# naming the lead.)
+__aterm_line_init_aside() {
+    emulate -L zsh
+    __aterm_line_init_led=0
+    local __aterm_w
+    for __aterm_w in ${(k)widgets[(R)user:__aterm_line_init_lead]}; do
+        if (( ${+widgets[__aterm_line_init_under]} )); then
+            zle -A __aterm_line_init_under "$__aterm_w"
+        else
+            zle -D "$__aterm_w"
+        fi
+    done
+    (( ! ${+widgets[__aterm_line_init_under]} )) || zle -D __aterm_line_init_under
+}
+
+# The scheduled event: the lead takes the front, unless the loader's widget holds
+# it now. Called as a command it returns the status it was handed; as a math
+# function (see above) its value is not used. Where a precmd hook failed with an
+# error, zsh skips the due events and zle runs them as it starts reading the
+# line, after zle-line-init: there it marks the line itself (measured on zsh 5.9:
+# a lead put in front then reached only a continuation line).
+#
+# add-zle-hook-widget's dispatcher (zsh's own hook mechanism) is never led: 133;B
+# becomes one of its hooks instead — the loader's widget, added once where the
+# dispatcher does not list it already. A plugin that reads the table while the
+# lead holds the front chooses by what it finds there: powerlevel10k, expanding
+# its first prompt, registers through add-zle-hook-widget only where the
+# dispatcher holds the front, and otherwise wraps zle-line-init. In front of the
+# dispatcher, the lead made it wrap, and the next add-zle-hook-widget — from a
+# precmd hook — listed powerlevel10k's widget as a hook of the dispatcher it
+# wraps: every line looped until FUNCNEST stopped it (measured on zsh 5.9 with
+# oh-my-zsh, powerlevel10k and a hook added at the third prompt; bare zsh never
+# builds that chain). Not traced (see THE TRACE): the event's own line is.
+__aterm_line_init_late() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    emulate -L zsh
+    if zle; then
+        if (( ! __aterm_line_init_marked )); then
+            __aterm_line_init_marked=1
+            __aterm_mark_command_start
+        fi
+        return ${1:-0}
+    fi
+    local __aterm_now="${widgets[zle-line-init]-}"
+    case "$__aterm_now" in
+        (user:__aterm_zle_line_init|user:__aterm_line_init_lead) ;;
+        (user:azhw:zle-line-init)
+            local -a __aterm_hooks
+            zstyle -a zle-line-init widgets __aterm_hooks
+            if (( ! ${__aterm_hooks[(I)<->:(user:|)__aterm_zle_line_init]} &&
+                  ${+functions[add-zle-hook-widget]} )); then
+                zle -N __aterm_zle_line_init
+                add-zle-hook-widget line-init __aterm_zle_line_init
+            fi
+            ;;
+        (*)
+            if [[ -n "$__aterm_now" ]]; then
+                zle -A zle-line-init __aterm_line_init_under
+            elif (( ${+widgets[__aterm_line_init_under]} )); then
+                zle -D __aterm_line_init_under
+            fi
+            zle -N zle-line-init __aterm_line_init_lead
+            __aterm_line_init_led=1
+            ;;
+    esac
+    return ${1:-0}
+}
+functions -M __aterm_line_init_late 0 0
+
+# From the precmd, handed the status the command before it left. One string
+# compare where nothing needs the lead, and nothing at all without a line editor
+# (`unsetopt zle`), where no line is ever initialised.
+__aterm_line_init_wire() {
+    [[ -o zle ]] || return 0
+    # The user's VERBOSE, read before `emulate`: on, or off only because a
+    # pending event of ours (removed below) was to turn it back on.
+    local -i __aterm_verbose=${__aterm_line_init_hush:-0}
+    [[ -o verbose ]] && __aterm_verbose=1
+    emulate -L zsh
+    __aterm_line_init_hush=0
+    __aterm_line_init_marked=0
+    local __aterm_via="$__aterm_line_init_via"
+    __aterm_line_init_via=""
+    # A lead whose line never came steps aside first.
+    (( ! __aterm_line_init_led )) || __aterm_line_init_aside
+    local __aterm_now="${widgets[zle-line-init]-}"
+    [[ "$__aterm_now" == user:__aterm_zle_line_init ||
+       ( -n "$__aterm_now" && "$__aterm_now" == "$__aterm_via" ) ]] && return 0
+    # One still waiting (see `__aterm_line_init_late`) was written for an older
+    # status.
+    local -i __aterm_old=${zsh_scheduled_events[(I)*__aterm_line_init_late*]}
+    (( __aterm_old )) && builtin sched -$__aterm_old
+    local -i __aterm_s=${1:-0}
+    local __aterm_event
+    case $__aterm_s in
+        0) __aterm_event='(( __aterm_line_init_late(), 1 )) || builtin :' ;;
+        1) __aterm_event='(( __aterm_line_init_late(), 0 )) && builtin :' ;;
+        *)
+            __aterm_event='[[ -n ${__aterm_line_init_u::=$_}${__aterm_line_init_pev::=${options[printexitvalue]}}${options[printexitvalue]::=off} ]]'
+            __aterm_event+=' && { __aterm_line_init_late '$__aterm_s' "$__aterm_line_init_u" && builtin :; }'
+            __aterm_event+=' always { [[ -n ${options[printexitvalue]::=$__aterm_line_init_pev}${__aterm_line_init_u::=} ]]; } && builtin :'
+            ;;
+    esac
+    (( ! __aterm_verbose )) ||
+        __aterm_event='[[ -n ${options[verbose]::=on}${__aterm_line_init_hush::=0} ]] && '$__aterm_event
+    if builtin sched +0 "$__aterm_event" 2>/dev/null; then
+        __aterm_line_init_hush=$__aterm_verbose
+    else
+        __aterm_line_init_late
+    fi
 }
 
 # ─── Deferred First-Precmd Setup ───
 # Runs once on the very first precmd after the shell has fully initialized
 # and processed SIGWINCH from the initial terminal resize. Handles the prompt
-# override, then uninstalls itself.
+# override, then uninstalls itself. XTRACE off first (see THE TRACE); no
+# `emulate`, as the prompt override sets PROMPT_SUBST for the user.
 __aterm_first_precmd() {
-    local last_status=$?
-
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
     # Apply prompt override if requested
     # `${…:-}`: under a user's `setopt nounset` the bare form errored at every
     # prompt and this one-shot never uninstalled itself (review note 2026-09-16).
@@ -1040,7 +1405,8 @@ __aterm_first_precmd() {
     __aterm_reroute_path_front
 
     add-zsh-hook -d precmd __aterm_first_precmd
-    return $last_status
+    # 0, not the status the rc left (see THE TRAMPOLINE).
+    return 0
 }
 
 # The body ends in success: the loader moves its revision only when the source
@@ -1059,8 +1425,10 @@ true
 # — which calls ours — as `__aterm_orig_zle_line_init` and installed ours in
 # front of it, which calls that alias. A loop: measured on zsh 5.9, ~250 133;B
 # marks and "recursion limit exceeded" at every prompt of the upgraded shell.
-# Nothing needs re-wiring: a widget names its FUNCTION, so whatever chain the
-# shell has reaches the new body's `__aterm_zle_line_init` as it stands.
+# Nothing needs re-wiring here: a widget names its FUNCTION, so whatever chain the
+# shell has reaches the new body's `__aterm_zle_line_init` as it stands — and
+# where an rc took zle-line-init from it, the body's precmd puts 133;B back in
+# front under its own names (see "THE LEAD"), never through this alias.
 if (( __aterm_fresh_load )); then
     if (( ${+widgets[zle-line-init]} )) && [[ "${widgets[zle-line-init]}" != "user:__aterm_zle_line_init" ]]; then
         zle -A zle-line-init __aterm_orig_zle_line_init
@@ -1092,8 +1460,12 @@ fi
 # line that upgrades a shell from before loaders goes on to relaunch its agent,
 # which holds the terminal for hours, and until the shell's next prompt the host
 # would name it `integration_rev=frozen` — and an update in between would carry
-# no revision to point it by. (Signed with the key the shell holds; a fresh load
-# signs at its first prompt.)
+# no revision to point it by. (Signed with the key the shell holds — the one the
+# typed line assigned before it sourced this file, so a degraded tab's engine
+# verifies it; a fresh load signs at its first prompt.)
 if (( ! __aterm_fresh_load )); then
     __aterm_mark_integration_rev
 fi
+
+# The user's XTRACE, as the load found it (see THE TRACE).
+[[ $__aterm_load_xtrace != on ]] || builtin setopt xtrace

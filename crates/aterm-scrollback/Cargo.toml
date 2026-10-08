@@ -16,6 +16,9 @@ description = "Tiered scrollback storage with LZ4/Zstd compression and disk offl
 # zstd tiers are opt-in below; the warm tier's LZ4 path is the default fallback
 # for what would otherwise be the zstd-compressed cold tier.
 default = []
+# Exposes the fuzz-only decode API (`lz4` becomes `pub`) to the cargo-fuzz crate
+# in fuzz/, and runs src/decode_fuzz_tests.rs at its deep counts
+# (90k/90k/90k/40k inputs instead of 10k per loop).
 fuzz = []
 # Test-only corruption seam (`Scrollback::inject_corrupted_warm_block`) for
 # DOWNSTREAM crates' conformance tests; enabled only from a dev-dependency.
@@ -27,13 +30,10 @@ zstd = ["dep:zstd"]
 # and the memory-mapped `.dtrm` cold store. Implies `zstd` because the on-disk
 # page format is zstd-compressed. Off by default per §2.7.
 disk-tier = ["dep:libc", "zstd"]
-# TRUST_NATIVE_TLA §4 (Phase 4): register this crate's kani harnesses as
-# `proof_anchor!`s in the unified verifier ledger. Pulls in aterm-spec ONLY to
-# submit the (machine, action, proof) records into the `inventory` slice the
-# `spec_xref_closure` gate collects. OFF by default — production builds (and the
-# §2.7 no-platform engine invariant) stay free of aterm-spec; the gate's test build
-# turns it on. The anchors are decoupled from the `#[cfg(kani)]` harnesses, so they
-# register under stock cargo when this feature is on.
+# Register this crate's kani harnesses as `proof_anchor!`s for the
+# `spec_xref_closure` gate (TRUST_NATIVE_TLA §4). OFF by default so production
+# builds (and the §2.7 no-platform invariant) stay free of aterm-spec. The
+# anchors do not need `cfg(kani)`, so they register under a normal build.
 spec-anchors = ["dep:aterm-spec"]
 
 [dependencies]
@@ -44,43 +44,14 @@ aterm-lz4 = { workspace = true }
 zstd = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 aterm-log = { workspace = true }
-# Phase-4 verifier-ledger anchors only (see `spec-anchors` feature). Optional and
-# OFF by default so the default dependency closure is unchanged.
+# Verifier-ledger anchors only (see the `spec-anchors` feature).
 aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
-proptest = { workspace = true }
-criterion = "0.5"
-# Phase-4: make aterm-spec available under plain `cargo test -p aterm-scrollback` so the
-# `#[cfg(test)]`-visible `spec_proof_anchors` module compiles its `proof_anchor!`s without
-# requiring the `spec-anchors` feature on the command line (mirrors aterm-sandbox).
+# Lets the `#[cfg(test)]` `spec_proof_anchors` module compile without the
+# `spec-anchors` feature.
 aterm-spec = { workspace = true }
-
-[[bench]]
-name = "remove_newest"
-harness = false
-# Exercises the disk-backed cold tier; only buildable with the opt-in feature.
-required-features = ["disk-tier"]
-
-[[bench]]
-name = "disk_push_line"
-harness = false
-# Prices the disk cold tier's append path (ST-1): fsync policy + remap
-# elimination under steady growth and capped-session rotation.
-required-features = ["disk-tier"]
-
-[[bench]]
-name = "push_line"
-harness = false
-
-[[bench]]
-name = "iterate"
-harness = false
-
-[[bench]]
-name = "truncate"
-harness = false
 
 [lints]
 workspace = true

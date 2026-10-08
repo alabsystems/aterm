@@ -1,32 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W5 — THE METAL PRESENT ARM (map §5 W5, pass graph §2 Submit B).
+//! The Metal present arm, twin of the wgpu present path's seams:
 //!
-//! Three things live here, each the Metal twin of a seam `renderer.rs`'s
-//! wgpu present path already has:
+//! 1. [`MetalWindowSurface`]: one [`Swapchain`] plus the config it was last
+//!    configured to, with the per-present reconcile
+//!    ([`MetalWindowSurface::reconcile`]) mapping alpha-mode, usage, HDR and
+//!    size drift onto `Swapchain::reconfigure`, and a drift-checked acquire.
+//! 2. [`AcquireRefusal`] and [`surface_present_failure`]: the
+//!    `SurfacePresentFailure` mapping (table on `surface_present_failure`).
+//! 3. [`encode_present_sequence`]: Submit B as one command buffer, in order:
+//!    compose copy, bloom extract, bloom composite, shimmer stage and refract,
+//!    tray, then the blit pass onto the drawable (viewport and scissor
+//!    letterbox, with the HDR/SDR crown in the same pass), and the tap copy
+//!    appended before commit. Binding indices come from the table's
+//!    `BindSpec` via the caller.
 //!
-//! 1. [`MetalWindowSurface`] — the shape `GpuSurface` grows on the flip: one
-//!    [`Swapchain`] plus the retained config it was last configured to, with
-//!    the PER-PRESENT RECONCILE verb ([`MetalWindowSurface::reconcile`])
-//!    that maps the wgpu path's alpha-mode/usage/EDR/size drift reconfigure
-//!    onto the W1 `Swapchain::reconfigure`, and a drift-checked acquire.
-//!
-//! 2. [`AcquireRefusal`] + [`surface_present_failure`] — the
-//!    `SurfacePresentFailure` mapping, each arm pinned to a MEASURED signal
-//!    (the table on `surface_present_failure`).
-//!
-//! 3. [`encode_present_sequence`] — §2 Submit B as ONE command buffer, in
-//!    the pass graph's exact order: compose copy → bloom extract → bloom
-//!    composite → shimmer stage+refract → tray → the "aterm-gpu blit pass"
-//!    onto the drawable with `setViewport`+scissor letterbox and the EDR/SDR
-//!    crown IN THE SAME PASS → tap copy appended before commit. Every
-//!    binding index arrives from THE PIPELINE TABLE's `BindSpec` column via
-//!    the caller — this module never hardcodes a slot.
-//!
-//! This is the production native macOS present arm. Attached GUI surfaces
-//! register a demand-driven drawable worker; standalone differential tests
-//! retain synchronous acquisition without touching the event loop.
+//! Attached GUI surfaces use a demand-driven drawable worker; standalone tests
+//! acquire synchronously.
 
 use std::sync::Arc;
 
@@ -42,9 +33,8 @@ use super::swapchain::{
 };
 use crate::renderer::SurfacePresentFailure;
 
-/// The `GpuSurface` Metal variant's shape: one W1 swapchain + the config it
-/// currently holds, so the per-present reconcile can detect drift without
-/// re-querying the layer axis by axis.
+/// The Metal `GpuSurface` shape: one swapchain plus the config it holds, so the
+/// reconcile detects drift without re-reading the layer.
 pub(crate) struct MetalWindowSurface {
     swapchain: SurfaceSwapchain,
     config: SwapchainConfig,
@@ -70,9 +60,9 @@ impl std::ops::DerefMut for SurfaceSwapchain {
     }
 }
 
-/// MainThreadBound routes the final unparent/release to the UI thread AFTER
-/// acquisition has ceased. Only the worker can wait for that dispatch; the UI
-/// thread never joins it. The outer pool covers Obj's driver-side dealloc work.
+/// Routes the final unparent and release to the UI thread after acquisition
+/// has stopped. Only the worker waits for that dispatch. The outer pool covers
+/// `Obj`'s driver-side dealloc work.
 struct RetiredSwapchain(Option<Swapchain>);
 impl Drop for RetiredSwapchain {
     fn drop(&mut self) {
@@ -158,41 +148,27 @@ impl MetalWindowSurface {
         self.worker.is_some()
     }
 
-    /// **ASK FOR THE NEXT FRAME'S DRAWABLE NOW** (2026-09-14, the performance
-    /// audit).
+    /// Request the next frame's drawable now.
     ///
-    /// The only non-test `try_request` used to live inside [`Self::acquire`],
-    /// so `ready` was ALWAYS empty on a frame's first attempt: every frame
-    /// composed once, reached the present seam, found no drawable, issued the
-    /// request, returned `Pending` — and then composed the whole frame AGAIN
-    /// on the next turn of the loop. Measured `n_pre_present / frames` was
-    /// exactly 2.00 on five independent runs (the owner's live window included,
-    /// 250 165 / 125 082), and the discarded compose costs the same as the one
-    /// that presents.
+    /// Without this, the only request happened inside [`Self::acquire`], so
+    /// every frame composed once, found no drawable, requested one and
+    /// composed again. Called after a successful present, not at the top of a
+    /// redraw: a redraw that returns early would hand back an unpresented
+    /// drawable, which is not immediately re-vendable and stalls later acquires
+    /// for about a display period.
     ///
-    /// Called AFTER a successful present, never at the top of a redraw. That
-    /// placement matters and is not a style choice: a redraw that early-outs
-    /// (16% of them, measured) would hand an unpresented drawable back, and a
-    /// just-dropped drawable is not instantly re-vendable — the W6 flip drill
-    /// measured exactly that shape pinning every later acquire in
-    /// CoreAnimation's internal wait for ~a display period. After a present we
-    /// know a frame really was drawn, so the next one is worth prefetching.
-    ///
-    /// Idempotent and non-blocking: no worker, a result already waiting, or a
-    /// request already in flight all return without doing anything.
+    /// Idempotent and non-blocking.
     pub(crate) fn prefetch_drawable(&mut self) {
         if self.ready.is_some() {
             return;
         }
-        let generation = self.generation;
-        let request = self.swapchain.acquire_request();
         let Some(worker) = self.worker.as_mut() else {
             return;
         };
         if worker.is_pending() {
             return;
         }
-        let _ = worker.try_request(generation, request);
+        let _ = worker.try_request(self.generation, self.swapchain.acquire_request());
     }
 
     /// Invalidating never touches the layer or waits for the worker. In-flight
@@ -210,11 +186,10 @@ impl MetalWindowSurface {
         self.completed_wait_ns.take()
     }
 
-    /// The latest completed acquisition's QUEUE span — admission until the
-    /// worker dequeued it. Published beside, never inside,
-    /// [`Self::take_completed_acquire_wait_ns`]: the two legs have different
-    /// causes (this one is scheduling, that one is CoreAnimation) and folding
-    /// them together would make either unreadable.
+    /// The latest completed acquisition's queue span (admission to worker
+    /// dequeue), published separately from
+    /// [`Self::take_completed_acquire_wait_ns`] because the two legs have
+    /// different causes (scheduling vs CoreAnimation).
     pub(crate) fn take_completed_acquire_queue_ns(&mut self) -> Option<u64> {
         self.completed_queue_ns.take()
     }
@@ -226,9 +201,8 @@ impl MetalWindowSurface {
         match completed.outcome {
             AcquireOutcome::Ready(output) => {
                 self.completed_wait_ns = Some(output.wait_ns);
-                // Paired with the wait, so `n_acquire_queue == n_acquire` and
-                // the two legs of one acquisition are always readable
-                // together. Terminal outcomes book neither.
+                // Paired with the wait, so both legs of one acquisition are
+                // read together. Terminal outcomes book neither.
                 self.completed_queue_ns = Some(completed.queue_ns);
                 if result_is_current(completed.generation, self.generation, false) {
                     self.ready = Some(output.drawable.ok_or(AcquireRefusal::AcquireNil));
@@ -246,54 +220,31 @@ impl MetalWindowSurface {
         &self.config
     }
 
-    /// The live `contentsScale` of the presented layer, read back off the
-    /// `CAMetalLayer` itself. The points-per-pixel term CoreAnimation uses to
-    /// lay the drawable down: it MUST equal the parent view's backing scale,
-    /// or the device-pixel drawable composites as points (v0.69.0's 2x
-    /// oversize + resample). Never echoed from a cached field — the gate asks
-    /// the layer.
+    /// The live `contentsScale` read off the `CAMetalLayer`; must equal the
+    /// parent view's backing scale or the drawable composites as points.
     #[cfg(test)]
     pub(crate) fn contents_scale(&self) -> f64 {
         self.swapchain.contents_scale()
     }
 
-    /// W6 flip-drill diagnostic — the LIVE layer's pacing-relevant state,
-    /// read back off the actual `CAMetalLayer` (never echoed from config):
-    /// `(display_sync_enabled, framebuffer_only, maximum_drawable_count,
-    /// wants_edr)`. Exists because the on-glass A/B measured vsync-shaped
-    /// acquire waits on the armed arm, and the first question is always
-    /// whether the layer really holds the state the config mapped.
-    pub(crate) fn layer_state(&self) -> (bool, bool, usize, bool) {
-        (
-            self.swapchain.display_sync_enabled(),
-            self.swapchain.framebuffer_only(),
-            self.swapchain.maximum_drawable_count(),
-            self.swapchain.wants_extended_dynamic_range(),
-        )
-    }
-
-    /// M3: whether this is the EDR (`Rgba16Float` extended-linear) target —
+    /// Whether this is the EDR (`Rgba16Float` extended-linear) target;
     /// `GpuSurface::is_hdr`'s twin.
     #[cfg(test)]
     pub(crate) fn is_hdr(&self) -> bool {
         self.config.format == PixelFormat::Rgba16Float
     }
 
-    /// THE PER-PRESENT RECONCILE — the Metal twin of the wgpu path's
-    /// alpha-mode/usage drift check (`present_input_with_crop`): compare the
-    /// wanted config against the retained one and reconfigure ONLY on a real
-    /// change, so a steady present never touches the layer. The axes map:
+    /// Per-present reconcile, Metal twin of the wgpu drift check in
+    /// `present_input_with_crop`: reconfigure only when the wanted config
+    /// differs from the retained one. Axis mapping:
     ///
-    /// * wgpu `alpha_mode` Opaque↔PostMultiplied → `opaque`
-    ///   (`CALayer.opaque`);
-    /// * wgpu `usage` COPY_SRC armed/disarmed → `framebuffer_only`
-    ///   (the tap's copy-out needs a non-framebufferOnly drawable);
-    /// * wgpu format Bgra8↔Rgba16Float (EDR flip) → `format`;
-    /// * `resize_surface` → `width`/`height`.
+    /// * wgpu `alpha_mode` Opaque/PostMultiplied -> `opaque`;
+    /// * wgpu `usage` `COPY_SRC` -> `framebuffer_only` (the tap needs a
+    ///   non-framebufferOnly drawable);
+    /// * wgpu format `Bgra8`/`Rgba16Float` -> `format`;
+    /// * `resize_surface` -> `width`/`height`.
     ///
-    /// Returns whether a reconfigure happened. The W1 reconfigure-storm test
-    /// already leak-audits the verb itself; the sequence test below drives
-    /// this reconcile mid-cycle.
+    /// Returns whether a reconfigure happened.
     pub(crate) fn reconcile(
         &mut self,
         device: &ffi::Device,
@@ -309,22 +260,11 @@ impl MetalWindowSurface {
         if self.worker.as_ref().is_some_and(AcquireWorker::is_pending) {
             return Ok(false);
         }
-        // The layer's `contentsScale` is NOT one of the drift axes above and
-        // cannot be: it is not in `SwapchainConfig` at all, it is owned by the
-        // parent layer, and it changes with NO resize and no reconfigure when
-        // a window is dragged between a Retina and a non-Retina display. So it
-        // is polled here, ahead of the early-out — this is the poll that
-        // replaces `raw-window-metal`'s KVO observer, and skipping it on a
-        // steady present is what would let a display change go unnoticed.
-        // Change-gated inside, so the steady cost is one property read.
+        // `contentsScale` is not a config axis: the parent layer owns it and it
+        // changes with no resize when a window moves between displays. Poll it
+        // here, before the no-drift early-out. Change-gated.
         self.swapchain.sync_layer_geometry();
-        let drift = self.config.format != want.format
-            || self.config.width != want.width
-            || self.config.height != want.height
-            || self.config.framebuffer_only != want.framebuffer_only
-            || self.config.display_sync != want.display_sync
-            || self.config.maximum_drawables != want.maximum_drawables
-            || self.config.opaque != want.opaque;
+        let drift = self.config != *want;
         if !drift {
             return Ok(false);
         }
@@ -333,28 +273,18 @@ impl MetalWindowSurface {
         Ok(true)
     }
 
-    /// Acquire the next drawable, refusing TYPED instead of stringly: the
-    /// loss latch and the bounded nil-acquire each get their own arm, and a
-    /// drawable whose texture no longer matches the retained config (the
-    /// layer was mutated behind the surface's back) is returned as
-    /// [`AcquireRefusal::Drift`] — the caller
-    /// reconfigures and skips the frame, exactly like wgpu's Outdated arm.
+    /// Acquire the next drawable with typed refusals: the loss latch and the
+    /// bounded nil acquire each have an arm, and a drawable whose texture no
+    /// longer matches the retained config is [`AcquireRefusal::Drift`] (the
+    /// caller reconfigures and skips the frame, like wgpu's Outdated).
     pub(crate) fn acquire(&mut self) -> Result<Frame<'_>, AcquireRefusal> {
         if self.swapchain.latch().reason().is_some() {
             return Err(AcquireRefusal::LatchLost);
         }
-        // ONE acquire, geometry-checked on the vended frame itself. This was
-        // a probe-then-reacquire two-phase (a scoped throwaway acquire for
-        // the geometry check, then a second `nextDrawable` for the real
-        // frame) — and the W6 flip drill MEASURED that shape starving the
-        // pool on glass: a just-dropped unpresented drawable is not instantly
-        // re-vendable, so every present's second `nextDrawable` sat in
-        // CoreAnimation's internal usleep wait (`sample`d:
-        // `CAMetalLayerPrivateNextDrawableLocked` → `usleep`), pinning
-        // `last_acquire_wait_ns` at ~a display period per present —
-        // p50 ~10-16 ms vs the wgpu arm's ~0.02 ms, at EVERY cadence and
-        // window size. The wanted geometry is copied out first so the error
-        // arm borrows nothing from the live frame.
+        // One acquire, geometry-checked on the vended frame. A probe-then-acquire
+        // shape stalls: a just-dropped drawable is not immediately re-vendable,
+        // so the second `nextDrawable` waits about a display period. The wanted
+        // geometry is copied first so the error arm borrows nothing.
         let (want_w, want_h) = (self.config.width, self.config.height);
         let frame = if let Some(worker) = self.worker.as_mut() {
             if let Some(ready) = self.ready.take() {
@@ -386,9 +316,9 @@ impl MetalWindowSurface {
     }
 }
 
-/// A dead acquisition producer makes this backend unusable. Feed the same
-/// permanent-loss route that selects CPU fallback; merely returning Validation
-/// would park a permanently broken worker and retry it on every keystroke.
+/// A dead acquisition worker makes this backend unusable: feed the permanent
+/// loss route (CPU fallback) rather than returning Validation and retrying on
+/// every keystroke.
 fn terminal_worker_refusal(latch: &LossLatch) -> AcquireRefusal {
     latch.record(&CbOutcome::Lost {
         code: None,
@@ -397,46 +327,35 @@ fn terminal_worker_refusal(latch: &LossLatch) -> AcquireRefusal {
     AcquireRefusal::LatchLost
 }
 
-/// W6a — the winit view's backing `CALayer`, from a raw-window-handle target:
-/// the PARENT [`MetalWindowSurface::attached`] hangs the first-party
-/// swapchain under. `None` for a non-AppKit handle or a layerless view (a
-/// winit macOS window is always layer-backed). Must run on the MAIN THREAD
-/// (an AppKit property read), which is where the frontend attaches windows.
+/// The window view's backing `CALayer` from a raw-window-handle target: the
+/// parent [`MetalWindowSurface::attached`] attaches under. `None` for a
+/// non-AppKit handle or a layerless view. Main thread only.
 pub(crate) fn parent_layer_of<W: raw_window_handle::HasWindowHandle>(target: &W) -> Option<Obj> {
     let raw = target.window_handle().ok()?.as_raw();
     let raw_window_handle::RawWindowHandle::AppKit(h) = raw else {
         return None;
     };
     let view: ffi::Id = h.ns_view.as_ptr().cast();
-    // SAFETY: `ns_view` is a live NSView pointer for the duration of the
-    // attach call (raw-window-handle's contract); `layer` is a +0 property
-    // read retained to +1 by `Obj::retain`.
+    // SAFETY: `ns_view` is a live NSView pointer for the attach call; `layer`
+    // is a +0 property read retained to +1 by `Obj::retain`.
     unsafe {
         let f: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
         Obj::retain(f(view, ffi::sel(c"layer")))
     }
 }
 
-/// The EDR POTENTIAL of the screen the target's window is on —
-/// `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`, the
-/// brightness-independent "can this screen ever show extended range" answer
-/// (1.0 on an SDR-only screen). `None` for a non-AppKit handle, a view with no
-/// window yet, or a window on no screen. Two callers read it, and they read
-/// `None` differently. The attach (`GpuRenderer::create_window_surface`) gates
-/// the `Rgba16Float` pick through
+/// The EDR potential of the target window's screen
+/// (`NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`, 1.0 on
+/// an SDR-only screen). `None` for a non-AppKit handle, a view with no window,
+/// or a window on no screen.
+///
+/// The attach gates the `Rgba16Float` pick through
 /// `format_plan::hdr_swapchain_wants_f16_on_screen`, where `None` keeps the
-/// unconditional pick. The screen re-pick
-/// (`GpuRenderer::upgrade_surface_for_screen`, called with the live `&Window`
-/// from the frontend's monitor-change hook and from its throttled headroom
-/// re-query) gates the upgrade of an 8-bit window through
-/// `format_plan::hdr_screen_upgrade_wants_f16`, where `None` upgrades
-/// nothing. Nothing is cached: every call walks `-window` and `-screen`
-/// afresh, so it answers from the `NSScreen` AppKit reports for the window
-/// now (Apple fixes the potential per `NSScreen` object, not per monitor).
-/// Measured (2026-09-06, macOS 13.7, x86_64): a freshly created,
-/// not-yet-ordered-front `NSWindow` already answers `screen` (the screen its
-/// frame lands on), so the attach sees the real value. Main thread only, like
-/// [`parent_layer_of`] (AppKit property reads); both callers run there.
+/// pick. `GpuRenderer::upgrade_surface_for_screen` gates an 8-bit window's
+/// upgrade through `format_plan::hdr_screen_upgrade_wants_f16`, where `None`
+/// upgrades nothing. Not cached: each call reads `-window` and `-screen`
+/// afresh. A not-yet-ordered-front window already reports its screen. Main
+/// thread only.
 #[cfg(not(wgpu_arm))]
 pub(crate) fn screen_edr_potential_of<W: raw_window_handle::HasWindowHandle>(
     target: &W,
@@ -446,22 +365,11 @@ pub(crate) fn screen_edr_potential_of<W: raw_window_handle::HasWindowHandle>(
         return None;
     };
     let view: ffi::Id = h.ns_view.as_ptr().cast();
-    // SAFETY: `ns_view` is a live NSView pointer for as long as `target` is
-    // borrowed: raw-window-handle 0.6's `window_handle()` returns a
-    // `WindowHandle<'_>` that borrows `target`, and `target: &W` stays
-    // borrowed for this whole call. Both callers (the attach, and the screen
-    // re-pick the frontend runs from its monitor-change hook and its
-    // redraw-time headroom re-query) run on the main thread, where these
-    // AppKit reads belong. `-window` and `-screen` are `-(id)` +0 property reads,
-    // nil-checked before use (a nil receiver would answer zero anyway). The
-    // potential getter is `API_AVAILABLE(macos(10.15))` in the SDK's
-    // NSScreen.h and the app bundle declares `LSMinimumSystemVersion` 11.0
-    // (apps/aterm-mac/Info.plist), so the selector exists on every system the
-    // app launches on. It is `-(CGFloat)`, a `double` on every 64-bit Apple
-    // ABI, returned in the FP register `objc_msgSend` (not `_fpret`, which
-    // x86_64 reserves for `long double`) already hands back. Nothing is
-    // retained: every object read here is owned by AppKit for longer than
-    // this call.
+    // SAFETY: `ns_view` is live while `target` is borrowed (the window handle
+    // borrows it). Callers run on the main thread. `-window` and `-screen` are
+    // +0 reads, nil-checked. The potential getter exists on macOS 10.15+ (the
+    // app requires 11.0) and returns a `CGFloat` in the FP register plain
+    // `objc_msgSend` returns. Nothing is retained.
     unsafe {
         let obj: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
         let window = obj(view, ffi::sel(c"window"));
@@ -494,29 +402,25 @@ pub(crate) enum AcquireRefusal {
     Pending,
     /// The process device-loss latch is set (acquire refuses before FFI).
     LatchLost,
-    /// The drawable's texture geometry no longer matches the retained config
-    /// — the layer was resized/mutated externally.
+    /// The drawable's geometry no longer matches the retained config.
     Drift,
-    /// `nextDrawable` returned nil after the BOUNDED wait
-    /// (`allowsNextDrawableTimeout=YES`): pool exhausted or the window
-    /// server is throttling an invisible window.
+    /// `nextDrawable` returned nil after the bounded wait: pool exhausted or
+    /// the window server throttling an invisible window.
     AcquireNil,
 }
 
-/// The `SurfacePresentFailure` mapping, one arm per measured signal:
+/// The `SurfacePresentFailure` mapping:
 ///
-/// | failure | Metal signal (this arm) | wgpu-hal 29.0.3 Metal signal (measured, `metal/surface.rs`) |
-/// |---|---|---|
-/// | `Validation` | the process [`LossLatch`] is set — acquire/present refuse before FFI | wgpu-core validation (hal's Metal acquire never produces it) |
-/// | `Reconfigured` | drawable texture extent ≠ retained config (drift check at acquire) | never produced by hal's Metal acquire — Outdated/Lost come from wgpu-core config drift |
-/// | `Occluded` | **no CAMetalLayer signal exists** — the hint is `NSWindow.occlusionState`'s visible bit, supplied by the frontend | identical: hal walks layer→delegate→window and checks `occlusionState & (1<<1)` (`surface.rs:129-155`, the wgpu#8309 workaround) — a WINDOW signal, not a Metal one |
-/// | `Timeout` | `nextDrawable` nil after the bounded wait (`allowsNextDrawableTimeout=YES`, pinned by the S1 readback; the ~1 s bound is `CAMetalLayer.h`'s documented timeout — compositor-only, so headless the MEASURED nils are the deviceless layer's 0.000 s (S4) and never-starve ms vends (S5), and the ~1 s wait itself stays unmeasured first-party until W6's on-window drill) | `nextDrawable` nil (`surface.rs:166`; hal sets `allowsNextDrawableTimeout=false` at `surface.rs:103`, so its nil blocks unboundedly first) |
+/// | failure | Metal signal |
+/// |---|---|
+/// | `Validation` | the process [`LossLatch`] is set; acquire and present refuse before FFI |
+/// | `Reconfigured` | drawable texture extent differs from the retained config |
+/// | `Occluded` | nil acquire with the frontend's occlusion hint set (`NSWindow.occlusionState`; the layer has no such signal, and wgpu-hal reads the same window bit) |
+/// | `Timeout` | `nextDrawable` nil after the bounded wait (`allowsNextDrawableTimeout=YES`) with the hint clear |
 ///
-/// The occlusion hint is a parameter precisely because the layer cannot
-/// answer it: the frontend owns the `NSWindow`, so the frontend supplies the
-/// bit (winit surfaces it as `WindowEvent::Occluded`). A nil acquire WITH the
-/// hint set maps to `Occluded` (park until stimulus); without it, `Timeout`
-/// (bounded retry) — the same retry policy split the gui applies today.
+/// The occlusion hint is a parameter because the frontend owns the window
+/// (winit's `WindowEvent::Occluded`). `Occluded` parks until a stimulus;
+/// `Timeout` retries on a bound.
 pub(crate) fn surface_present_failure(
     refusal: &AcquireRefusal,
     occluded_hint: bool,
@@ -530,9 +434,8 @@ pub(crate) fn surface_present_failure(
     }
 }
 
-/// One fullscreen post pass over the throwaway present copy (bloom
-/// composite, shimmer refract) or the drawable (blit): the row's PSO plus
-/// its `BindSpec::POST_FS` bindings, spelled by the caller off the table.
+/// One fullscreen post pass over the present copy (bloom composite, shimmer)
+/// or the drawable (blit): the row's PSO and its `BindSpec::POST_FS` bindings.
 pub(crate) struct PostPass<'a> {
     pub(crate) pso: &'a Obj,
     /// Fragment texture at the row's `fragment_textures[0]` slot.
@@ -546,7 +449,7 @@ pub(crate) struct PostPass<'a> {
     pub(crate) uniform_slot: usize,
 }
 
-/// The bloom pair (§2: "bloom extract pass" + "bloom composite pass").
+/// The bloom pair: extract pass and composite pass.
 pub(crate) struct BloomPasses<'a> {
     /// Half-res target, cleared TRANSPARENT, drawn with row 4 `GlowAdd`.
     pub(crate) half_target: &'a SealedTexture,
@@ -554,13 +457,10 @@ pub(crate) struct BloomPasses<'a> {
     /// The 16-byte cell `Uniforms` block at row 4's `vertex_uniform` slot.
     pub(crate) cell_uniform: &'a Obj,
     pub(crate) cell_uniform_slot: usize,
-    /// The UNGATED glow stream — the extract sub-stream the wgpu arm draws
-    /// as `extract_first..extract_first+n` (the caller slices; see the
-    /// base-instance note in the W5 addendum).
+    /// The ungated glow stream; the extract draws from `extract_offset`.
     pub(crate) extract_stream: &'a Obj,
-    /// BYTE offset of the extract window's first instance inside
-    /// `extract_stream` (`extract_first * stride` — the W1 offset verb; the
-    /// crown keeps drawing the exact set from 0).
+    /// Byte offset of the extract window's first instance
+    /// (`extract_first * stride`); the crown draws the exact set from 0.
     pub(crate) extract_offset: usize,
     pub(crate) extract_count: usize,
     /// Row 12 `bloom` composited onto the present copy (SCREEN blend), with
@@ -569,7 +469,7 @@ pub(crate) struct BloomPasses<'a> {
     pub(crate) composite_scissor: Option<[u32; 4]>,
 }
 
-/// The shimmer pass (§2: stage copy + scissored refract, row 13).
+/// The shimmer pass: stage copy plus scissored refract (row 13).
 pub(crate) struct ShimmerPass<'a> {
     /// Frame-sized scratch the pass samples (stage-copied below).
     pub(crate) scratch: &'a SealedTexture,
@@ -581,34 +481,22 @@ pub(crate) struct ShimmerPass<'a> {
     pub(crate) region: [u32; 4],
 }
 
-/// The M1b sub-row band shift (§2: two staged whole-width copies OVER THE
-/// PRESENT COPY, between the shimmer and the tray). The SAME pure
-/// `BandShift` plan the wgpu arm records into its present encoder
-/// (`shift_present_copy_band`), run through the overlap-refusing W1 copy
-/// verb via a resident scratch. It lives HERE, in Submit B, and never on
-/// the offscreen: a glide frame used to translate the scissor base in place
-/// and then had to force `RepaintScope::Full` on itself AND the frame after
-/// (the retired `shift_full` law), which made every glide frame the most
-/// expensive frame class the renderer has. Over the copy the offscreen stays
-/// untranslated for the whole glide — the CPU `render_input_cached` →
-/// `present_view` precedent — and the gate / scissor / E7 rescue keep
-/// working underneath it.
+/// The sub-row band shift: two staged whole-width copies over the present
+/// copy, between the shimmer and the tray, using the same `BandShift` plan as
+/// the wgpu arm (`shift_present_copy_band`). It never touches the offscreen,
+/// which stays the untranslated scissor base during a glide.
 pub(crate) struct BandShiftPass<'a> {
     pub(crate) shift: crate::renderer::BandShift,
-    /// Frame-sized resident scratch (`WindowGpu::metal_shift_scratch`): a
-    /// same-texture overlapping copy is undefined in Metal, so the moved rows
-    /// stage through it.
+    /// Frame-sized resident scratch (`WindowGpu::metal_shift_scratch`); an
+    /// overlapping same-texture copy is undefined in Metal.
     pub(crate) scratch: &'a SealedTexture,
 }
 
-/// The M1b INCOMING-ROW APRON (§2: ONE whole-width copy OVER THE PRESENT COPY,
-/// right after the band shift and before the tray): the CPU-rastered incoming
-/// row (`WindowGpu::metal_apron_tex`, `w × cell_h`, uploaded by
-/// `metal_ensure_apron_tex` only when its bytes changed), its top `rows` px
-/// copied onto the strip the shift exposed at `[dst_y, dst_y + rows)`. The
-/// SAME bytes the CPU `paint_incoming_strip` lays, so the strip is
-/// byte-identical across backends by construction. Refused without a present
-/// copy for the same reason as the shift.
+/// The incoming-row apron: one whole-width copy over the present copy after the
+/// band shift and before the tray. The top `rows` px of the CPU-rastered
+/// incoming row (`WindowGpu::metal_apron_tex`) land on the exposed strip at
+/// `[dst_y, dst_y + rows)`, the same bytes as CPU `paint_incoming_strip`.
+/// Refused without a present copy.
 pub(crate) struct ApronStripPass<'a> {
     pub(crate) tex: &'a SealedTexture,
     /// First framebuffer row of the exposed strip (`y1 - frac`).
@@ -617,7 +505,7 @@ pub(crate) struct ApronStripPass<'a> {
     pub(crate) rows: usize,
 }
 
-/// The tray pass (§2: row 17, 4-vertex strip, straight-alpha src-over).
+/// The tray pass: row 17, 4-vertex strip, straight-alpha src-over.
 pub(crate) struct TrayPass<'a> {
     pub(crate) pso: &'a Obj,
     pub(crate) card_tex: &'a Obj,
@@ -630,9 +518,8 @@ pub(crate) struct TrayPass<'a> {
     pub(crate) uniform_slot: usize,
 }
 
-/// The crown, drawn IN THE BLIT PASS (§2: row 14 `hdr_glow` on f16, else
-/// row 15 `sdr_glow`), crown-scissored, instanced over the ungated glow
-/// stream.
+/// The crown, drawn in the blit pass (`hdr_glow` on f16, else `sdr_glow`),
+/// crown-scissored, instanced over the ungated glow stream.
 pub(crate) struct CrownPass<'a> {
     pub(crate) pso: &'a Obj,
     /// `HdrGlowUniform` at the row's `vertex_uniform` slot AND its
@@ -646,20 +533,17 @@ pub(crate) struct CrownPass<'a> {
     pub(crate) scissor: (u32, u32, u32, u32),
 }
 
-/// §2 Submit B, minus acquire/present (the caller owns the frame boundary).
+/// Submit B, minus acquire/present (the caller owns the frame boundary).
 pub(crate) struct PresentSequence<'a> {
     /// The clean offscreen (base + aurora — the scissor base).
     pub(crate) offscreen: &'a SealedTexture,
-    /// The throwaway present copy the effects composite over and the blit
-    /// samples. `None` = the effect-free present: the blit samples
-    /// `offscreen` directly and the compose copy is skipped (the wgpu
-    /// `use_present_off == false` arm).
+    /// The present copy the effects composite over and the blit samples. `None`
+    /// for an effect-free present: the blit samples `offscreen` and the compose
+    /// copy is skipped.
     pub(crate) present_off: Option<&'a SealedTexture>,
-    /// The compose copy's rect (half-open) — the caller's stale union
-    /// (`renderer::present_copy_rect`: the offscreen's dirt since the last sync
-    /// plus what the last sequence wrote over the copy); only the first sync
-    /// into a fresh copy is the full frame. Ignored when `present_off` is
-    /// `None`.
+    /// The compose copy's half-open rect from `renderer::present_copy_rect`;
+    /// full frame only for the first sync into a fresh copy. Ignored when
+    /// `present_off` is `None`.
     pub(crate) copy_rect: [u32; 4],
     pub(crate) bloom: Option<BloomPasses<'a>>,
     pub(crate) shimmer: Option<ShimmerPass<'a>>,
@@ -677,14 +561,11 @@ pub(crate) struct PresentSequence<'a> {
     pub(crate) crown: Option<CrownPass<'a>>,
 }
 
-/// Encode §2 Submit B onto `cb`, targeting `dest` (the drawable's sealed
-/// render target) at `dest_w`×`dest_h`. Record order IS the wgpu path's
-/// submission order — compose copy, bloom extract, bloom composite, shimmer
-/// stage+refract, tray, then ONE "aterm-gpu blit pass" carrying the
-/// viewport+scissor letterbox blit AND the crown — so nothing is reordered
-/// across the seam. The tap copy (when armed) is appended by the CALLER
-/// after this returns, before commit — the same "appended to the encoder
-/// before submit" ordering the wgpu taps use.
+/// Encode Submit B onto `cb`, targeting `dest` (the drawable's sealed render
+/// target) at `dest_w`×`dest_h`, in the wgpu path's order: compose copy, bloom
+/// extract, bloom composite, shimmer, tray, then one blit pass carrying the
+/// letterbox blit and the crown. The caller appends the tap copy before
+/// commit.
 pub(crate) fn encode_present_sequence(
     cb: &mut CommandBuffer<'_>,
     dest: &SealedTexture,
@@ -785,12 +666,9 @@ pub(crate) fn encode_present_sequence(
         pass.draw_fullscreen_triangle()?;
     }
 
-    // 3b. The M1b sub-row band shift, over the COPY — AFTER the halo and the
-    //     haze (so they ride the glide exactly as the oracle's in-place bake
-    //     under `shift_offscreen_band` does) and BEFORE the tray (chrome stays
-    //     pinned — the chrome-invariance theorem: rows outside the band are
-    //     never named by either copy). Refused without a present copy: the
-    //     shift must never land on the scissor base again.
+    // 3b. Sub-row band shift over the copy: after halo and haze (they ride the
+    //     glide), before the tray (chrome stays pinned). Refused without a
+    //     present copy, so it never lands on the scissor base.
     if let Some(bs) = &seq.band_shift {
         if seq.present_off.is_none() {
             return Err(
@@ -807,16 +685,13 @@ pub(crate) fn encode_present_sequence(
         );
         // 1. Stage the moved rows `[src_y, src_y+moved)` into the scratch.
         cb.copy_texture_sub_rect(composed, (0, src_y), bs.scratch, (0, 0), w, moved)?;
-        // 2. Lay them back at `[dst_y, dst_y+moved)`. The `|frac|`-px strip at
-        //    the opposite edge keeps the copy's own (compose-copied) pixels —
-        //    the placeholder the down-bounce keeps, and the up-glide's strip
-        //    until 3c lays the incoming row over it.
+        // 2. Lay them back at `[dst_y, dst_y+moved)`; the exposed strip keeps
+        //    the copy's pixels until 3c.
         cb.copy_texture_sub_rect(bs.scratch, (0, 0), composed, (0, dst_y), w, moved)?;
     }
 
-    // 3c. The INCOMING ROW over the exposed strip — AFTER the shift (the strip
-    //     is what it exposed), INSIDE the band (chrome stays pinned), the SAME
-    //     bytes the CPU `paint_incoming_strip` lays (`ApronStripPass`).
+    // 3c. The incoming row over the exposed strip, inside the band
+    //     (`ApronStripPass`).
     if let Some(ap) = &seq.apron {
         if seq.present_off.is_none() {
             return Err(
@@ -825,9 +700,8 @@ pub(crate) fn encode_present_sequence(
                     .to_owned(),
             );
         }
-        // The CPU / wgpu arms clamp to the apron's own width; a wider present
-        // copy (an oversized, device-clamped frame) must not turn the strip into
-        // a refused Submit B — the copy verb fails closed on the rect.
+        // Clamp to the apron's width, as the CPU and wgpu arms do, so an
+        // oversized copy does not make the copy verb refuse Submit B.
         let w = composed.width().min(ap.tex.width());
         let rows = ap.rows.min(ap.tex.height());
         if w > 0 && rows > 0 {
@@ -852,10 +726,9 @@ pub(crate) fn encode_present_sequence(
         pass.draw_strip_quad()?;
     }
 
-    // 5. THE "aterm-gpu blit pass": Clear(live bg), full-destination
-    //    viewport + scissor (the letterbox — fs_blit places the frame at
-    //    content_off and paints the bands), the row 16 fullscreen triangle,
-    //    then — IN THE SAME PASS — the crown, crown-scissored, instanced.
+    // 5. The blit pass: Clear (live bg), full-destination viewport and scissor
+    //    (`fs_blit` places the frame and paints the bands), the fullscreen
+    //    triangle, then the crown in the same pass.
     {
         let pass = cb.render_pass(&RenderPassDesc {
             target: dest,
@@ -900,44 +773,25 @@ mod tests {
     use super::super::encoder::EncodeSession;
     use super::super::loss::{CbOutcome, LossLatch};
     use super::*;
+    use crate::metal::test_support::{as_bytes, device, plain_calayer};
     use crate::pipeline_table::Pipeline;
-
-    fn device() -> Option<ffi::Device> {
-        let d = ffi::Device::preferred();
-        if d.is_none() {
-            crate::stderr_line!("SKIP: no Metal device on this machine");
-        }
-        d
-    }
 
     /// A bare `CALayer` at a caller-chosen `contentsScale` — the headless
     /// stand-in for the winit view's backing layer on a Retina display.
     fn parent_at_scale(scale: f64) -> Obj {
+        let layer = plain_calayer();
         let _pool = ffi::AutoreleasePool::new();
-        // SAFETY: alloc/init (+1, exactly as `Swapchain::new_layer`) then a
-        // scalar `CGFloat` setter on the live layer.
+        // SAFETY: a scalar `CGFloat` setter on the live layer.
         unsafe {
-            let alloc: unsafe extern "C" fn(ffi::ClassPtr, ffi::Sel) -> ffi::Id = ffi::msg();
-            let raw = alloc(ffi::class(c"CALayer"), ffi::sel(c"alloc"));
-            let init: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
-            let layer = Obj::from_owned(init(raw, ffi::sel(c"init"))).expect("CALayer init");
             let set: unsafe extern "C" fn(ffi::Id, ffi::Sel, f64) = ffi::msg();
             set(layer.id(), ffi::sel(c"setContentsScale:"), scale);
-            layer
         }
+        layer
     }
 
-    /// W7 — THE RETINA GATE AT THE PRESENT SEAM. `contentsScale` is owned by
-    /// the parent layer and is NOT a `SwapchainConfig` axis, so it can never
-    /// appear in `reconcile`'s drift set; the sync therefore has to run AHEAD
-    /// of the no-drift early-out. This test is the one that fails if someone
-    /// "tidies" the poll inside the `if drift` block: the config here never
-    /// moves, so `reconcile` returns `false` every time, and the scale must
-    /// still track the parent.
-    ///
-    /// It is reachable headlessly for the same reason S5 is — a layer tree
-    /// needs no window, and `contentsScale` propagation is a property read,
-    /// not a composite.
+    /// `contentsScale` is not a config axis, so the sync must run before
+    /// `reconcile`'s no-drift early-out: with a constant config, `reconcile`
+    /// returns `false` every time and the scale must still follow the parent.
     #[test]
     fn the_no_drift_reconcile_still_tracks_the_parents_contents_scale() {
         let Some(dev) = device() else { return };
@@ -984,17 +838,8 @@ mod tests {
         );
     }
 
-    /// # Safety
-    /// `T` must be `repr(C)` and padding-insensitive; the bytes go straight
-    /// into a GPU-visible shared buffer.
-    unsafe fn as_bytes<T: Copy>(v: &T) -> &[u8] {
-        // SAFETY: `T: Copy` + `repr(C)`; read-only, lives only for the copy.
-        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), size_of::<T>()) }
-    }
-
-    /// The 112-byte blit uniform, restated `repr(C)` (the swapchain tests'
-    /// spelling — the production `BlitUniform` layout is pinned against
-    /// `blit.metal` by `MetalBlit::UNIFORM_BYTES` and the differentials).
+    /// The 112-byte blit uniform as `repr(C)`; the production layout is checked
+    /// by `MetalBlit::UNIFORM_BYTES` and the differentials.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct BlitU {
@@ -1046,24 +891,16 @@ mod tests {
         );
     }
 
-    /// W5 — THE FAILURE MAPPING, live where a healthy GPU can produce the
-    /// signal and pure where it cannot:
+    /// The failure mapping:
     ///
-    /// * latch-lost → `Validation`: LIVE — an injected `Lost` outcome makes
-    ///   the next acquire refuse before FFI;
-    /// * config drift → `Reconfigured`: LIVE — the drawable's own texture
-    ///   extent disagrees with the retained config (the layer mutated behind
-    ///   the surface's back, simulated by desyncing the retained config);
-    /// * bounded nil → `Timeout`/`Occluded`: LIVE — the layer's device is
-    ///   stripped (S4's deterministic stand-in; a deviceless layer returns
-    ///   nil in ~0.000 s — the ~1 s compositor-paced wait is out of headless
-    ///   reach, `CAMetalLayer.h`'s documented bound riding the S1
-    ///   `allowsNextDrawableTimeout == YES` readback) and the surface's own
-    ///   acquire produces the real `AcquireNil`, wall-clock bounded; the
-    ///   MAPPING is pinned on it — hint set ⇒ `Occluded` (the window-side
-    ///   `NSWindow.occlusionState` signal wgpu-hal 29.0.3 also uses; the
-    ///   layer has none), hint clear ⇒ `Timeout` — and restoring the device
-    ///   restores acquire (the recovery half).
+    /// * latch lost -> `Validation`: an injected `Lost` makes the next acquire
+    ///   refuse before FFI;
+    /// * config drift -> `Reconfigured`: the drawable extent disagrees with a
+    ///   desynced retained config;
+    /// * bounded nil -> `Timeout`/`Occluded`: with the layer's device stripped
+    ///   the acquire returns a real `AcquireNil`; the hint set maps to
+    ///   `Occluded`, clear to `Timeout`, and restoring the device restores
+    ///   acquire.
     #[test]
     fn acquire_refusals_map_to_the_wgpu_failure_contract() {
         let Some(dev) = device() else { return };
@@ -1080,9 +917,8 @@ mod tests {
         let mut surface =
             MetalWindowSurface::standalone(&dev, config, Arc::clone(&latch)).expect("surface");
 
-        // DRIFT, live: desync the retained config from the layer — the next
-        // acquire measures the drawable texture at the LAYER's 16x16 against
-        // the retained 24x16 and refuses Reconfigured-shaped.
+        // Drift: the layer's drawable is 16x16 but the retained config says
+        // 24x16.
         surface.config.width = 24;
         let refusal = surface.acquire().expect_err("a drifted acquire refuses");
         assert!(
@@ -1095,11 +931,8 @@ mod tests {
         );
         surface.config.width = 16;
 
-        // THE NIL ARM, live: strip the layer's device (S4's deterministic
-        // stand-in for "the pool cannot serve this acquire") and the
-        // surface's own acquire produces a REAL `AcquireNil`, wall-clocked.
-        // SAFETY: `setDevice:` accepts nil (nullable, CAMetalLayer.h:66);
-        // the layer stays live.
+        // The nil arm: strip the layer's device so the acquire returns nil.
+        // SAFETY: `setDevice:` accepts nil; the layer stays live.
         unsafe {
             let set_obj: unsafe extern "C" fn(ffi::Id, ffi::Sel, ffi::Id) = ffi::msg();
             set_obj(
@@ -1147,7 +980,7 @@ mod tests {
                 .expect("restoring the device must restore acquire"),
         );
 
-        // LATCH-LOST, live: inject the loss, and acquire refuses before FFI.
+        // Latch lost: inject the loss; acquire refuses before FFI.
         latch.record(&CbOutcome::Lost {
             code: None,
             name: "injected",
@@ -1165,22 +998,19 @@ mod tests {
         );
     }
 
-    /// W5 — THE FRAME CYCLE WITH THE CROWN IN THE BLIT PASS, plus the
-    /// per-present reconcile verb driven mid-cycle:
+    /// The frame cycle with the crown in the blit pass and the reconcile driven
+    /// mid-cycle:
     ///
-    /// * frames 0-1: SDR (Bgra8) — letterboxed blit only; the band pixel is
-    ///   the clear colour, the content pixel is the offscreen's;
-    /// * frame 2: SDR + the row 15 `sdr_glow` crown IN THE SAME PASS,
-    ///   crown-scissored — the crowned pixel brightens vs frame 1, a pixel
-    ///   outside the crown scissor does not move;
-    /// * frame 3: reconcile flips `opaque` (the M5 translucency axis) — a
-    ///   real reconfigure, presenting continues;
-    /// * frames 4-5: reconcile flips the format to `Rgba16Float` (the EDR
-    ///   axis) — the row 14 `hdr_glow` crown adds >0 f16 light inside the
-    ///   scissor and none outside.
+    /// * frames 0-1: SDR, letterboxed blit only (band pixel is the clear,
+    ///   content pixel the offscreen's);
+    /// * frame 2: SDR with the `sdr_glow` crown, crown-scissored (inside
+    ///   brightens, outside unchanged);
+    /// * frame 3: reconcile flips `opaque`;
+    /// * frames 4-5: reconcile flips to `Rgba16Float`; the `hdr_glow` crown adds
+    ///   f16 light inside the scissor only.
     ///
-    /// Every present is committed on the ONE session queue, tap-read before
-    /// present, and status-polled to terminal; the latch stays healthy.
+    /// Every present uses the one session queue, is tap-read before present
+    /// and polled to terminal; the latch stays healthy.
     #[test]
     fn the_present_arm_cycles_reconciles_and_crowns_on_the_drawable() {
         let Some(dev) = device() else { return };
@@ -1274,13 +1104,8 @@ mod tests {
         let crown_stream = dev.new_buffer(stream_bytes.len()).expect("crown stream");
         // SAFETY: as above.
         unsafe { ffi::buffer_write(&crown_stream, &stream_bytes) };
-        // The crown scissor CLIPS THE QUAD, judged into the fixture: the
-        // original scissor was the whole content region and the only quad sat
-        // entirely inside it, so a plant replacing the crown's scissor with
-        // the full destination rode every test GREEN — the "outside" asserts
-        // were satisfied by quad geometry alone. Width 10 puts the quad's
-        // dest x 10..18 half in (10..14), half clipped (14..18), and the
-        // clipped_px probe below is what makes the scissor load-bearing.
+        // The crown scissor clips the quad (dest x 10..18, scissor ends at 14),
+        // so the scissor is load-bearing for the outside asserts.
         let crown_scissor = (OFF.0 as u32, OFF.1 as u32, 10u32, CH as u32);
 
         let blit_spec = Pipeline::Blit.spec();
@@ -1326,8 +1151,8 @@ mod tests {
         let mut sdr_plain: Option<Vec<u8>> = None;
         let mut sdr_crowned: Option<Vec<u8>> = None;
         for frame_no in 0..6usize {
-            // The per-present reconcile: flip the M5 translucency axis at 3,
-            // the EDR axis at 4 — each a REAL reconfigure through the verb.
+            // The per-present reconcile flips the translucency axis at 3 and
+            // the EDR axis at 4, each a real reconfigure through the verb.
             if frame_no == 3 {
                 config.opaque = false;
             }
@@ -1342,11 +1167,8 @@ mod tests {
             );
 
             let is_hdr = surface.is_hdr();
-            // The sticky-colorspace lesson, pinned AT THE PRESENT ARM: the
-            // layer's space must track the format across the mid-cycle EDR
-            // flip (S10 pins the verb; this pins the arm's use of it — a
-            // reconcile that skipped the space would present every EDR frame
-            // tagged sRGB, or worse, leave scRGB sticky after a flip back).
+            // The layer colorspace follows the format across the mid-cycle HDR
+            // flip.
             let space = surface.swapchain.colorspace_name();
             if is_hdr {
                 assert_eq!(

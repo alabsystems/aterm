@@ -1,44 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive report`: what the worker said since your turn, in full — not
-//! just what is still on its screen. Claude Code runs on the ALTERNATE screen
-//! and repaints in place, so a row that leaves the top of the screen is gone
-//! from it: in one measured worker turn the worker displayed 35 message blocks
-//! and 7 were still readable at the end. The host keeps those rows (the
-//! alt-screen archive, read with `offscreen`), and every `turn` records where
-//! the archive stood when it started (`history`'s `arch=<origin>:<last>`).
-//! This joins the two.
+//! `aterm drive report`: what the worker said since your turn, in full, not
+//! just what is still on its screen. Claude Code runs on the alternate screen
+//! and repaints in place, so rows that scroll off are gone; the host keeps them
+//! (the alt-screen archive, read with `offscreen`), and every `turn` records
+//! where the archive stood (`history`'s `arch=<origin>:<last>`).
 //!
-//! ONE read carries both halves: `offscreen since=<mark> screen=1` returns the
-//! rows archived after the mark AND the screen, taken under the same lock, with
-//! `back=` — how many rows the screen shows again from the archive (screen rows
-//! `pin..pin+back` are archived rows `back_at..`). The join is the archived
-//! rows, then the screen's rows down to where the transcript ends
-//! ([`transcript_end`]: the status row and everything under it, found by
-//! POSITION), less the re-shown rows this read already got. The rows are kept
-//! verbatim: a done row, a table, a todo item or indented code is what the
-//! worker said, and the filter behind "the last thing said"
-//! ([`super::phase::last_said_index`]) would drop them.
+//! One read, `offscreen since=<mark> screen=1`, returns the rows archived after
+//! the mark and the screen under one lock, with `back=` (how many screen rows
+//! repeat archived ones). The join is the archived rows, then the screen's
+//! rows down to [`transcript_end`], less the repeats, kept verbatim.
 //!
-//! The report opens at YOUR turn's `❯` row: the last one whose text begins
-//! with the first [`MARKER_CHARS`] characters of the ledger's text, compared
-//! without whitespace so a wrap never matters — or, since Claude Code can show
-//! a long paste as `[Pasted text #N +L lines]`, when the turn's text is a paste
-//! (it has a newline, or is long), the last such row if its line count fits.
-//! The rows above it are the tail of what the screen showed when the turn
-//! began. Without a turn in the ledger (`aterm drive prompt` keeps none) it
-//! opens at the last `❯` row; `--since <origin:i>` opens right after an
-//! archived row instead.
+//! The report opens at your turn's `❯` row: the last one whose text begins
+//! with the first [`MARKER_CHARS`] characters of the ledger's text (whitespace
+//! ignored), or a `[Pasted text #N +L lines]` row for a paste. Without a turn
+//! in the ledger it opens at the last `❯` row; `--since <origin:i>` opens after
+//! an archived row.
 //!
-//! `complete=1` says nothing was lost between that start and the end: the
-//! start was found, the archive is the one the mark named (a restart starts a
-//! new one; an aterm self-update carries it, marks and turn ledger included,
-//! unless it could not), the worker is on the alternate screen, no gap (a
-//! redraw with no overlap, a resize, a reset) and no eviction lies after the
-//! start, and `--max-rows` held every row. Otherwise `reason=` says why.
-//! A host without `offscreen` — or whose archive is off (`enabled=0`), or an
-//! `aterm ctl` too old to relay the rows — gets the screen alone
+//! `complete=1` says nothing was lost: the start was found, the archive is the
+//! one the mark named, the worker is on the alternate screen, no gap or
+//! eviction lies after the start, and `--max-rows` held every row; otherwise
+//! `reason=` says why. A host without the archive gets the screen alone
 //! (`reason=no-archive`).
 
 use std::fmt;
@@ -316,33 +299,10 @@ fn newest_turn(turns: Vec<LedgerTurn>) -> Option<LedgerTurn> {
     turns.into_iter().nth(at)
 }
 
-/// Decode the control protocol's `%XX` escape (every byte that is not ASCII
-/// graphic, and `%`). TOTAL: a malformed escape passes through verbatim and
-/// invalid UTF-8 decodes lossily. The same rule as `aterm_control::wire::
-/// pct_decode`, which this crate does not depend on. `pub(crate)` since the
-/// harness's grid spine (`harness::observe`) decodes `status` fields with it
-/// rather than carrying a fourth copy.
-pub(crate) fn pct_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && let (Some(hi), Some(lo)) = (
-                bytes.get(i + 1).and_then(|b| char::from(*b).to_digit(16)),
-                bytes.get(i + 2).and_then(|b| char::from(*b).to_digit(16)),
-            )
-            && let Ok(byte) = u8::try_from(hi * 16 + lo)
-        {
-            out.push(byte);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+/// Decode the control protocol's `%XX` escape: the wire's one TOTAL decoder,
+/// under the name this crate's parsers (`ledger`, `claim`, `lifecycle`, the
+/// approval loop, `run`) import it by.
+pub(crate) use aterm_codec::pct::decode as pct_decode;
 
 /// One `offscreen … screen=1` reply: the header's fields and the two halves.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -597,7 +557,7 @@ fn find_start(rows: &[String], marker: Marker, text: Option<&str>) -> Option<usi
             // A short turn is never a paste: an earlier turn's paste row is
             // not where it starts (it may be queued under the status row).
             let text = text.unwrap_or("");
-            // Only the LAST paste row can be the newest turn's; one that does
+            // Only the last paste row can be the newest turn's; one that does
             // not fit it is another paste, and an older one further up is
             // never reached for.
             by_text.or_else(|| {

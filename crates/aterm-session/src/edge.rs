@@ -3,45 +3,41 @@
 
 //! The per-edge, op-scoped, fail-closed authority table (design §7.1, A.6).
 //!
-//! An [`Edge`] is a single directed `src → dst` authority for one [`Op`]. A cycle
+//! An [`Edge`] is one directed `src → dst` authority for one [`Op`]. A cycle
 //! `A → B → A` is two independent rows; a self-loop `A → A` is the one row
-//! `(A, A, op)`. [`decide_edge`] is a per-call POINT LOOKUP, never a reachability
-//! walk — so an arbitrary cyclic graph provably cannot cause recursion or
-//! transitive authority accumulation in the gate.
+//! `(A, A, op)`. [`decide_edge`] is a per-call point lookup, never a
+//! reachability walk, so no graph shape can cause recursion or transitive
+//! authority accumulation in the gate.
 
 use std::collections::HashMap;
 
 use crate::id::{LaunchNonce, SessionId};
 use crate::{from_hex, hex};
 
-/// The operation an edge authorizes. Split so a `WriteInput` edge cannot signal and
-/// a `ReadScreen` edge cannot write (design §7.2). This is the fine, object-scoped
-/// identity; the coarse compile-time class markers the design paired it with were
-/// never required by a seam and were deleted from `aterm_cap::effects` (2026-09-25).
+/// The operation an edge authorizes. Split so a `WriteInput` edge cannot signal
+/// and a `ReadScreen` edge cannot write (design §7.2).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Op {
     /// Read the rendered surface (screen/cells/blocks/scrollback/search/image/
     /// timeline). The least-power edge.
     ReadScreen,
-    /// Inject input — the full human vocabulary (keys, mouse, wheel, selection,
+    /// Inject input: the full human vocabulary (keys, mouse, wheel, selection,
     /// paste, resize, focus), all converging on the one `App::input` seam.
     WriteInput,
-    /// Signal the destination's foreground process group (distinct from a keyboard
-    /// byte — a human's Ctrl-C is a byte, not an out-of-band signal).
+    /// Signal the destination's foreground process group (a human's Ctrl-C is a
+    /// byte, not this out-of-band signal).
     Signal,
-    /// Rewrite the destination's DURABLE on-disk configuration (the `settings
-    /// set|unset` path → `aterm.toml`). Split OUT of `WriteInput` so a keystroke-
-    /// injection edge cannot silently flip a default-OFF security knob
-    /// (allow_osc52_query/window_ops/…): persisting config is a strictly greater
-    /// authority than typing a byte, and is NOT provisioned to child edges.
+    /// Rewrite the destination's durable configuration (`settings set|unset` →
+    /// `aterm.toml`). Separate from `WriteInput` so an input edge cannot flip a
+    /// default-off security knob (allow_osc52_query/window_ops/…). Not
+    /// provisioned to child edges.
     ConfigWrite,
-    /// Move the destination's SELECTION out of the process onto the system
-    /// clipboard (the `copy` exfil boundary). Split OUT of `ReadScreen` because a
-    /// read stays in-process, whereas writing the OS pasteboard crosses the trust
-    /// boundary; NOT provisioned to child edges.
+    /// Copy the destination's selection onto the system clipboard (the `copy`
+    /// exfiltration boundary). Separate from `ReadScreen` because writing the OS
+    /// pasteboard leaves the process. Not provisioned to child edges.
     ClipboardWrite,
-    /// Feed bytes DERIVED from a read of an untrusted node back as input — the
-    /// semantic-cycle path; off by default (§7.6).
+    /// Feed bytes derived from a read of an untrusted node back as input (the
+    /// semantic-cycle path); off by default (§7.6).
     DeriveLoop,
 }
 
@@ -74,18 +70,15 @@ impl Op {
     }
 }
 
-/// The connection vocabulary the UX and wire mint in (design §1.4#2, §7) — a
-/// deliberately SMALLER language than [`Op`]. The contract is human fidelity:
-/// **push** is the full human seat — keystrokes *plus* the out-of-band
-/// Ctrl-C-class signal ([`Op::WriteInput`] + [`Op::Signal`], never one without
-/// the other, because a driver who can type but not interrupt is not a human
-/// seat); **pull** is the rendered screen exactly as a human would read it
-/// ([`Op::ReadScreen`]). There is NO kind spelling `ConfigWrite` /
-/// `ClipboardWrite` / `DeriveLoop`, so a connection can never mint those
-/// strictly greater authorities — unrepresentable, not merely unchecked.
+/// The connection vocabulary the UX and wire mint in, deliberately smaller than
+/// [`Op`]. **Push** is the full human seat: keystrokes plus the Ctrl-C-class
+/// signal ([`Op::WriteInput`] + [`Op::Signal`], never one without the other).
+/// **Pull** is the rendered screen as a human reads it ([`Op::ReadScreen`]). No
+/// kind spells `ConfigWrite`/`ClipboardWrite`/`DeriveLoop`, so a connection
+/// cannot mint those greater authorities: unrepresentable, not merely unchecked.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ConnectionKind {
-    /// Read the destination's rendered surface — what a human at that terminal
+    /// Read the destination's rendered surface: what a human at that terminal
     /// sees, and nothing more.
     Pull,
     /// Drive the destination as a human would sit at it: inject input and
@@ -96,9 +89,8 @@ pub enum ConnectionKind {
 }
 
 impl ConnectionKind {
-    /// The exact ops this kind mints — the closed mapping
-    /// [`EdgeTable::grant_connection`] draws from, so a connection is by
-    /// construction unable to express any op outside these slices.
+    /// The exact ops this kind mints; [`EdgeTable::grant_connection`] draws only
+    /// from these.
     #[must_use]
     pub fn ops(&self) -> &'static [Op] {
         match self {
@@ -109,8 +101,8 @@ impl ConnectionKind {
     }
 }
 
-/// A directed authority edge `src → dst` for one [`Op`]. There is no graph object
-/// and no traversal: this is just a labelled row.
+/// A directed authority edge `src → dst` for one [`Op`]: a labelled row, with no
+/// graph object and no traversal.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Edge {
     pub src: SessionId,
@@ -118,9 +110,9 @@ pub struct Edge {
     pub op: Op,
 }
 
-/// An unforgeable per-edge bearer secret (design §7.1): 32 random bytes recorded in
-/// the DESTINATION's [`EdgeTable`] and presented by the source on every `ctl`
-/// connect. **Not** the per-instance god-token: holding `(A, B, WriteInput)` confers
+/// An unforgeable per-edge bearer secret (design §7.1): 32 random bytes recorded
+/// in the destination's [`EdgeTable`] and presented by the source on every `ctl`
+/// connect. Not the per-instance token: holding `(A, B, WriteInput)` confers
 /// nothing toward `(B, A, *)`. Redacted in `Debug`; never logged in the clear.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EdgeToken([u8; 32]);
@@ -184,17 +176,16 @@ struct EdgeEntry {
 }
 
 /// The destination-side table mapping each presented [`EdgeToken`] to the
-/// `(src, dst, op, launch-nonce)` it authorizes. Default-empty; an absent token
-/// means no authority (fail closed). It holds edges for the local session(s) this
-/// process serves; storing `dst` per row keeps it correct for the future
-/// multi-session-per-process case.
+/// `(src, dst, op, launch-nonce)` it authorizes. Empty by default; an absent
+/// token means no authority (fail closed). Storing `dst` per row keeps it correct
+/// if one process serves several sessions.
 #[derive(Default)]
 pub struct EdgeTable {
     rows: HashMap<EdgeToken, EdgeEntry>,
 }
 
 impl EdgeTable {
-    /// A fresh, empty table (no authority — fail closed by default).
+    /// A fresh, empty table: no authority.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -202,13 +193,12 @@ impl EdgeTable {
         }
     }
 
-    /// Mint and record a new edge, returning the bearer token the source presents.
-    /// `nonce` is the DESTINATION's current launch nonce (so the edge fails closed
-    /// across a restart).
-    // Skip: bottoms out at `HashMap::insert` — growth can formally panic on
-    // capacity overflow (len > isize::MAX bytes), unreachable for a table
-    // bounded by live session count; key code is the derived Hash/Eq of
-    // `EdgeToken([u8; 32])` (panic-free). Audited-alloc class; verify-only.
+    /// Mint and record a new edge, returning the bearer token the source
+    /// presents. `nonce` is the destination's current launch nonce, so the edge
+    /// fails closed across a restart.
+    // Skip: `HashMap::insert` can formally panic on capacity overflow,
+    // unreachable for a table bounded by live sessions; the key's derived
+    // Hash/Eq is panic-free. Audited-alloc class; verify-only.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn grant(
         &mut self,
@@ -230,15 +220,12 @@ impl EdgeTable {
         token
     }
 
-    /// Mint one edge per op of `kind` from `src` into this (the DESTINATION's)
-    /// table, returning the `(op, token)` pairs for delivery to the source — the
-    /// ONE connection mint path (design §1.4#2; the §6 `connect` verb and the UI
-    /// both land here). Ops come solely from [`ConnectionKind::ops`], so a
-    /// connection cannot express `ConfigWrite`/`ClipboardWrite`/`DeriveLoop` —
-    /// there is no raw-op parameter to smuggle one through. A self-loop
-    /// (`src == dst`) is REFUSED — nothing minted, empty `Vec` — in the table's
-    /// fail-closed idiom: connections-to-self are a non-goal (§1.5) and must not
-    /// become authority by accident.
+    /// Mint one edge per op of `kind` from `src` into this (the destination's)
+    /// table, returning the `(op, token)` pairs to deliver to the source. This is
+    /// the one connection mint path (the `connect` verb and the UI). Ops come only
+    /// from [`ConnectionKind::ops`]; there is no raw-op parameter. A self-loop
+    /// (`src == dst`) is refused (empty `Vec`, nothing minted) so a
+    /// connection-to-self never becomes authority by accident.
     #[must_use]
     pub fn grant_connection(
         &mut self,
@@ -256,9 +243,9 @@ impl EdgeTable {
             .collect()
     }
 
-    /// Record a PRE-MINTED token (e.g. one provisioned by the launcher with the
-    /// `control_auth` file discipline). Returns `false` (and records nothing) if the
-    /// token already exists — minting must never silently overwrite a live edge.
+    /// Record a pre-minted token (e.g. one the launcher provisioned under the
+    /// `control_auth` file discipline). Returns `false` and records nothing if the
+    /// token exists: minting never overwrites a live edge.
     // Skip: same audited `HashMap::insert` alloc class as `grant` above.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn insert(
@@ -285,37 +272,29 @@ impl EdgeTable {
     }
 
     /// Remove an edge. Returns `true` if it existed (the basis for `revoke`).
-    // Skip: `HashMap::remove` runs no allocation — only the derived Hash/Eq
-    // of `EdgeToken([u8; 32])` (panic-free) — but the keyed-op totality is
-    // per-corpus (T3 keyed-writes lane); audited here, same tier as `grant`.
+    // Skip: `HashMap::remove` does not allocate and the key's Hash/Eq is
+    // panic-free, but keyed-op totality is unproved; audited like `grant`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn revoke(&mut self, token: &EdgeToken) -> bool {
         self.rows.remove(token).is_some()
     }
 
-    /// Remove EVERY row whose src is `src` (any op), returning how many were
-    /// dropped — the source-death sweep (design §1.4#4). This is a security
-    /// OBLIGATION, not a convenience: each row's nonce is the DESTINATION's, so
-    /// a destination restart fails closed automatically, but a dead SOURCE's
-    /// tokens stay live against a still-running destination — and the token
-    /// hexes are deliberately non-enumerable (see [`EdgeTable::edges`]), so
-    /// without this sweep those orphaned edges could never be revoked.
+    /// Remove every row whose src is `src` (any op) and return the count: the
+    /// source-death sweep. Required for safety: a destination restart fails
+    /// closed via its nonce, but a dead source's tokens stay live against a
+    /// running destination, and tokens are deliberately non-enumerable
+    /// ([`EdgeTable::edges`]), so nothing else could revoke them.
     pub fn revoke_src(&mut self, src: &SessionId) -> usize {
         self.revoke_src_ops(src, None)
     }
 
-    /// [`EdgeTable::revoke_src`] with an OP filter (design §1.4#4 [v5]): remove
-    /// every row whose src is `src` AND whose op is in `ops` (`None` = any op —
-    /// the bare sweep above is this call's sugar). This is what makes KIND-level
-    /// partial disconnects expressible against rows whose token hex was never
-    /// recorded (a wire `grant` mints no `ConnectionRecord`): the §6
-    /// `disconnect … kind=` verb can revoke exactly the push half while keeping
-    /// pull, which a bare sweep could not promise.
-    // Skip: `HashMap::retain` runs no allocation — only the derived Hash/Eq of
-    // `EdgeToken([u8; 32])`, `SessionId` equality, and a slice `contains` over
-    // `Op` (Copy, panic-free) — same keyed-op tier as `revoke` above.
-    // `saturating_sub` keeps the count obligation-free; retain never grows the
-    // map, so it is behavior-identical to plain subtraction.
+    /// [`EdgeTable::revoke_src`] with an op filter: remove rows whose src is
+    /// `src` and whose op is in `ops` (`None` = any op). This lets the
+    /// `disconnect … kind=` verb revoke exactly the push half and keep pull, for
+    /// rows whose token was never recorded.
+    // Skip: `HashMap::retain` does not allocate; the closure is panic-free
+    // (derived Hash/Eq, `SessionId` equality, slice `contains`). Same tier as
+    // `revoke`. `saturating_sub` is exact since retain never grows the map.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn revoke_src_ops(&mut self, src: &SessionId, ops: Option<&[Op]>) -> usize {
         let before = self.rows.len();
@@ -324,12 +303,10 @@ impl EdgeTable {
         before.saturating_sub(self.rows.len())
     }
 
-    /// Resolve a presented token to the OP it authorizes, IF it is a live edge whose
-    /// dst and launch-nonce match `dst`/`nonce` — the fail-closed lookup the `ctl`
-    /// auth handshake uses to scope a connection to a single op. `None` on any miss
-    /// or mismatch (so the handshake fails closed). This is the same predicate as
-    /// [`decide_edge`] but returns the op instead of taking it as input, since at
-    /// connect time the op (which verbs are allowed) is what we want to learn.
+    /// Resolve a presented token to the op it authorizes, if it is a live edge
+    /// whose dst and launch nonce match `dst`/`nonce`; `None` on any miss or
+    /// mismatch. The `ctl` auth handshake uses it to scope a connection to one
+    /// op. Same predicate as [`decide_edge`], returning the op instead of taking it.
     #[must_use]
     pub fn authorize(
         &self,
@@ -351,10 +328,8 @@ impl EdgeTable {
         self.rows.get(token).map(|e| &e.src)
     }
 
-    /// The full `(src, dst, op)` identity bound to a token — what the audit
-    /// seam records at revocation time (the row is gone after
-    /// [`EdgeTable::revoke`], so its identity must be read first). Like
-    /// [`EdgeTable::edges`], this exposes the row identity and never a token.
+    /// The `(src, dst, op)` bound to a token, which the audit seam records
+    /// before [`EdgeTable::revoke`] deletes the row. Exposes no token.
     #[must_use]
     pub fn edge_of(&self, token: &EdgeToken) -> Option<Edge> {
         self.rows.get(token).map(|e| Edge {
@@ -364,11 +339,9 @@ impl EdgeTable {
         })
     }
 
-    /// A clone of every live edge as `(src, dst, op)` triples — the introspection
-    /// query surface for the `edges`/`grants` control verb. The bearer TOKEN is
-    /// DELIBERATELY omitted: it is an unforgeable secret (the per-edge capability),
-    /// so enumerating the table for a human/agent must never leak it. Order is the
-    /// HashMap's arbitrary iteration order; the caller sorts for a stable listing.
+    /// Every live edge as `(src, dst, op)`, for the `edges`/`grants` control
+    /// verb. The bearer token is deliberately omitted: enumerating the table must
+    /// never leak a capability. Order is arbitrary; callers sort.
     #[must_use]
     pub fn edges(&self) -> Vec<Edge> {
         self.rows
@@ -411,15 +384,14 @@ impl EdgeDecision {
     }
 }
 
-/// TOTAL, FAIL-CLOSED, per-call authority gate (design §7.1). Default `Deny`.
+/// Total, fail-closed, per-call authority gate (design §7.1). Default `Deny`.
 ///
-/// Permits **iff** the presented token is recorded **and** its op `== op` **and**
-/// its dst `== dst` **and** its recorded launch-nonce matches `nonce` (the target
-/// has not restarted under the same name/pid). Any miss or mismatch → `Deny`.
+/// Permits iff the presented token is recorded and its op `== op`, its dst
+/// `== dst`, and its recorded launch nonce matches `nonce` (the target has not
+/// restarted under the same name/pid). Any miss or mismatch denies.
 ///
-/// NEVER traverses the graph: each edge is an independent row, so a cycle or
-/// self-loop cannot cause recursion or transitive authority accumulation. Authority
-/// does not flow along edges — holding one token says nothing about any other.
+/// Never traverses the graph: each edge is an independent row, and holding one
+/// token says nothing about any other.
 #[must_use]
 pub fn decide_edge(
     table: &EdgeTable,
@@ -549,8 +521,8 @@ mod tests {
         let mut got = tbl.edges();
         assert_eq!(got.len(), 2, "both granted edges enumerate");
         got.sort_by_key(|e| e.op.as_str());
-        // The triples are the granted (src, dst, op) — and the only fields an Edge
-        // carries are src/dst/op, so no secret token can be reached through them.
+        // The triples are the granted (src, dst, op); an Edge carries only those
+        // fields, so no token is reachable through them.
         assert_eq!(
             got[0],
             Edge {
@@ -579,8 +551,8 @@ mod tests {
         let (a, b, nonce) = ids();
         let mut tbl = EdgeTable::new();
         let tok = tbl.grant(a.clone(), b.clone(), Op::Signal, nonce);
-        // A live token resolves to exactly its (src, dst, op) identity — the
-        // triple the audit seam records before `revoke` deletes the row.
+        // A live token resolves to its (src, dst, op), the triple the audit seam
+        // records before `revoke` deletes the row.
         assert_eq!(
             tbl.edge_of(&tok),
             Some(Edge {
@@ -602,7 +574,7 @@ mod tests {
         let na = LaunchNonce::from_bytes([1u8; 16]);
         let nb = LaunchNonce::from_bytes([2u8; 16]);
 
-        // A cycle A->B->A is two INDEPENDENT rows, in two tables (one per dst).
+        // A cycle A->B->A is two independent rows, in two tables (one per dst).
         let mut tbl_b = EdgeTable::new(); // edges whose dst is B
         let mut tbl_a = EdgeTable::new(); // edges whose dst is A
         let tok_ab = tbl_b.grant(a.clone(), b.clone(), Op::WriteInput, nb);
@@ -661,8 +633,7 @@ mod tests {
         let sig = tbl.grant(a.clone(), b.clone(), Op::Signal, nonce);
         let other = tbl.grant(c.clone(), b.clone(), Op::WriteInput, nonce);
 
-        // The push half (write-input + signal) sweeps; pull survives — the
-        // kind-level partial disconnect a bare `revoke_src` could not express.
+        // The push half (write-input + signal) sweeps; pull survives.
         assert_eq!(
             tbl.revoke_src_ops(&a, Some(&[Op::WriteInput, Op::Signal])),
             2
@@ -693,7 +664,7 @@ mod tests {
             ConnectionKind::Both.ops(),
             [Op::ReadScreen, Op::WriteInput, Op::Signal]
         );
-        // The greater authorities are unreachable through ANY kind.
+        // The greater authorities are unreachable through any kind.
         for kind in [
             ConnectionKind::Pull,
             ConnectionKind::Push,

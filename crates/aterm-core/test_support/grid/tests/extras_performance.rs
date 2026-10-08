@@ -3,16 +3,9 @@
 // Author: Andrew Yates
 
 //! Terminal-coupled extras performance test.
-//!
-//! Grid-only extras/reflow complexity tests migrated to aterm-grid in
-//! Batch 2 (#6556). This file retains the single test that uses
-//! `crate::terminal::Terminal`.
 
-/// Verify that `take_response()` preserves buffer capacity (#4073, #4544).
-///
-/// `clone()` + `clear()` returns the data to the caller while the internal
-/// buffer retains its heap allocation. The next `process()` cycle reuses the
-/// existing capacity instead of re-allocating from scratch.
+/// `take_response()` preserves buffer capacity: the caller gets the data and
+/// the next `process()` cycle reuses the existing allocation.
 #[test]
 fn take_response_preserves_capacity() {
     use crate::terminal::Terminal;

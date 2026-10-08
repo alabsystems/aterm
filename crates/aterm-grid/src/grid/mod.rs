@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal grid with O(1) display scrolling, O(n × cols) content scrolling.
-//!
-//! Owns `Grid`, `GridStorage`, `MaterializedRow`, and all production
-//! `impl Grid` methods.
+//! Terminal grid with O(1) display scrolling and O(n × cols) content scrolling.
 
 mod accessors;
 mod buffer_access;
@@ -61,6 +58,9 @@ mod proofs_kani_tabs;
 mod tests;
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod write_test_helpers;
 
 // Re-export crate types visible to all grid submodules so moved files
@@ -85,13 +85,13 @@ pub(in crate::grid) use crate::test_counters::{
     count_scrollback_reflow_sync_lines, count_viewport_row_materialize,
 };
 
-// Scrollback re-exports for test files migrated from aterm-core (#6556).
+// Scrollback re-exports for the grid tests.
 #[cfg(test)]
 pub(in crate::grid) use aterm_scrollback::Scrollback;
 #[cfg(test)]
 pub(in crate::grid) use aterm_scrollback::{CellAttrs, HyperlinkSpan, Line, Rle};
 
-// Test counter take_* re-exports for performance/complexity tests (#6556 Batch 2).
+// Test counter take_* re-exports for performance/complexity tests.
 #[cfg(test)]
 pub(in crate::grid) use crate::test_counters::{
     take_extras_clear_ops, take_extras_shift_ops, take_reflow_cell_ops, take_reflow_row_ops,
@@ -107,9 +107,7 @@ pub use scrollback_access::HistoryLines;
 pub use scrollback_offload::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
 pub use visible_row_view::{CellDataView, VisibleRowView};
 
-/// Convert i32 result to u16 after clamping to non-negative.
-///
-/// Used for cursor math where we clamp to [0, max] range.
+/// Convert an i32 to u16 after clamping to non-negative (cursor math).
 #[cfg(any(test, feature = "fuzz", fuzzing))]
 #[inline]
 fn clamp_u16(val: i32) -> u16 {
@@ -119,22 +117,15 @@ fn clamp_u16(val: i32) -> u16 {
 use state::GridStorage;
 pub(in crate::grid) use viewport_row_cache::{HistoryEpoch, ViewportRowCache};
 
-/// Terminal grid.
-///
-/// Uses a ring buffer for O(1) scrolling. The `display_offset` determines
-/// what portion of the history is shown.
+/// Terminal grid. A ring buffer gives O(1) scrolling; `display_offset` selects
+/// the part of history shown.
 #[derive(Debug)]
 pub struct Grid {
     /// All grid state: rows, cursor, damage, extras, styles, scrollback.
-    ///
-    /// Accessed explicitly as `self.storage` — no `Deref` chain (#6917).
     pub(crate) storage: GridStorage,
-    /// DERIVED state, not grid state: the memo of materialized history rows a
-    /// scrolled-back viewport reads (SCR-1). Deliberately a sibling of
-    /// `storage` rather than a field inside it — nothing in it is authoritative
-    /// and every entry can be rebuilt from `storage` alone, which is exactly
-    /// why it is safe for it to be filled through `&self`. See the
-    /// `viewport_row_cache` module for the key and its invalidation.
+    /// Derived state: the memo of materialized history rows a scrolled-back
+    /// viewport reads. Rebuildable from `storage` alone, which is why it may be
+    /// filled through `&self`; see `viewport_row_cache`.
     pub(in crate::grid) viewport_cache: ViewportRowCache,
 }
 
@@ -163,12 +154,9 @@ impl Grid {
         self.row_mut(row).and_then(|r| r.get_mut(col))
     }
 
-    /// Whether the cell at (row, col) is a wide-character continuation spacer.
-    ///
-    /// Unlike `Cell::is_wide_continuation()` — which false-positives on
-    /// DECSCA-protected cells because `PROTECTED` and `WIDE_CONTINUATION`
-    /// share bit 10 — this disambiguates via the left neighbor: a true
-    /// continuation always immediately follows its `WIDE` main cell.
+    /// Whether the cell at (row, col) is a wide-character continuation spacer,
+    /// checked against its left `WIDE` neighbour (unlike
+    /// `Cell::is_wide_continuation()`, which misreads DECSCA-protected cells).
     #[must_use]
     #[inline]
     pub fn is_wide_continuation_at(&self, row: u16, col: u16) -> bool {
@@ -176,18 +164,12 @@ impl Grid {
             .is_some_and(|r| r.is_cell_wide_continuation(col))
     }
 
-    /// Set the BCE (Background Color Erase) cursor template cell.
+    /// Set the BCE (background colour erase) template cell, which ED, EL, ECH,
+    /// IL, DL and scroll use to fill erased cells. Call whenever the SGR
+    /// background changes.
     ///
-    /// The cursor template is used by erase operations (ED, EL, ECH, IL, DL,
-    /// scroll) to fill erased cells with the current SGR background color
-    /// instead of default. Call this whenever the SGR background changes.
-    ///
-    /// `bg_rgb` must be `Some([r, g, b])` when the current SGR background is
-    /// truecolor (24-bit RGB). Erase operations write this value into the
-    /// `RgbColorRing` for every filled cell so the renderer can resolve the
-    /// actual color. Without it, cells get the "RGB mode" flag but no value.
-    ///
-    /// Per VT420/xterm BCE specification (#7522). Fixes #7685.
+    /// `bg_rgb` is `Some([r, g, b])` for a truecolor background; erases write
+    /// it into the `RgbColorRing` for every filled cell.
     #[inline]
     pub fn set_cursor_template(&mut self, template: Cell, bg_rgb: Option<[u8; 3]>) {
         self.storage.cursor_template = template;

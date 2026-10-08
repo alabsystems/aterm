@@ -2,14 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Style API, scrollback boundary, damage tracking, and targeted regression tests.
+//! Style API, scrollback boundary, damage tracking, and targeted boundary tests.
 
 use crate::grid::Scrollback;
 use crate::{CellCoord, CellFlags, ExtendedStyle, Grid, PackedColor, StyleId};
 
-// -------------------------------------------------------------------------
 // Style API tests
-// -------------------------------------------------------------------------
 
 #[test]
 fn grid_write_char_with_style_id_default() {
@@ -196,14 +194,8 @@ fn grid_style_id_deduplication_in_writes() {
     assert_eq!(cell0.flags(), cell1.flags());
 }
 
-/// Test that scrolling into tiered scrollback returns None gracefully.
-///
-/// Regression test for #292: When display_offset exceeds the ring buffer
-/// portion of scrollback, `row_index()` previously underflowed, causing
-/// wrong cell data to be returned (manifested as character substitution).
-///
-/// Fixed in 67b2b1f: `row_index()` now returns `Option<usize>` and checks
-/// for underflow before subtraction.
+/// Scrolling into tiered scrollback makes `row()` return None rather than
+/// underflowing `row_index()`.
 #[test]
 fn row_returns_none_when_scrolled_into_tiered_scrollback() {
     // Setup: small ring buffer (2 lines), small hot tier (5 lines)
@@ -237,15 +229,12 @@ fn row_returns_none_when_scrolled_into_tiered_scrollback() {
     grid.scroll_to_top();
     assert_eq!(grid.display_offset(), total_scrollback);
 
-    // Key assertion: row() should return None for rows in tiered scrollback
-    // (instead of underflowing and returning garbage data)
-    //
-    // When display_offset > ring_scrollback + visible_row, the row is in
-    // tiered scrollback and row_index() should return None.
+    // With display_offset > ring_scrollback + visible_row, the row is in tiered
+    // scrollback and row() returns None.
     let row_result = grid.row(0);
 
     // At this scroll position, row 0 is in tiered scrollback (not ring buffer)
-    // so it should return None, NOT panic or return wrong data
+    // so it should return None, not panic or return wrong data
     assert!(
         row_result.is_none(),
         "row(0) should be None when scrolled into tiered scrollback (display_offset={}, ring={}, tiered={})",
@@ -267,10 +256,7 @@ fn row_returns_none_when_scrolled_into_tiered_scrollback() {
     }
 }
 
-/// Test partial scroll into tiered scrollback boundary.
-///
-/// Verifies behavior at the exact boundary between ring buffer and tiered
-/// scrollback storage.
+/// Partial scroll at the exact boundary between ring and tiered scrollback.
 #[test]
 fn row_access_at_ring_tiered_boundary() {
     let scrollback = Scrollback::new(5, 100, 1_000_000);
@@ -382,11 +368,10 @@ fn mark_cursor_damage_after_cursor_move() {
     assert_eq!(bounds.len(), 1);
     assert_eq!(bounds[0].line, 15);
 }
-// ========== Regression tests for algorithm audit findings ==========
+// Boundary regressions
 
-/// Regression: 1-row terminal has scroll region top == bottom (both 0).
-/// The TLA+ ScrollRegionValid invariant must allow top == bottom for single-row grids.
-/// Bug: invariants.rs used strict `<` instead of `<=` for top < bottom check.
+/// A 1-row terminal's scroll region has top == bottom == 0, which
+/// ScrollRegionValid allows.
 #[test]
 fn grid_one_row_invariants_valid() {
     let grid = Grid::new(1, 80);
@@ -396,8 +381,7 @@ fn grid_one_row_invariants_valid() {
     grid.assert_invariants();
 }
 
-/// Regression: scroll_region.bottom should be < visible_rows (0-indexed),
-/// not <= visible_rows. The invariant was too permissive.
+/// scroll_region.bottom is < visible_rows (0-indexed).
 #[test]
 fn grid_scroll_region_bottom_strictly_less_than_visible_rows() {
     let grid = Grid::new(24, 80);
@@ -407,9 +391,7 @@ fn grid_scroll_region_bottom_strictly_less_than_visible_rows() {
     grid.assert_invariants();
 }
 
-/// Regression: scroll_down() decrements total_lines but does not actually shift
-/// row content or clear new rows at the top. Verify that scroll_region_down()
-/// (the correct implementation) actually clears the top rows.
+/// scroll_region_down() shifts content and clears the top rows.
 #[test]
 fn grid_scroll_region_down_clears_top_rows() {
     let mut grid = Grid::new(5, 10);
@@ -429,7 +411,7 @@ fn grid_scroll_region_down_clears_top_rows() {
         first_cell_char == ' ' || first_cell_char == '\0',
         "After scroll_region_down, top row should be blank, got '{first_cell_char}'"
     );
-    // Row 1 should contain what was previously row 0 (A's)
+    // Row 1 holds the old row 0 (A's).
     assert_eq!(
         grid.cell(1, 0).unwrap().char(),
         'A',
@@ -437,8 +419,7 @@ fn grid_scroll_region_down_clears_top_rows() {
     );
 }
 
-/// Regression (#1966): scroll_down() was a stub that only decremented total_lines
-/// without shifting content. Now it delegates to scroll_region_down().
+/// scroll_down() shifts content (delegates to scroll_region_down()).
 #[test]
 fn grid_scroll_down_shifts_content_and_clears_top() {
     let mut grid = Grid::new(5, 10);
@@ -504,15 +485,10 @@ fn grid_scroll_down_full_screen_clears_all() {
     }
 }
 
-// -------------------------------------------------------------------------
-// HAS_EXTRAS per-cell flag tests (#5551)
-// -------------------------------------------------------------------------
+// HAS_EXTRAS per-cell flag tests
 
-/// Colored prompt (16 RGB-colored cells) + plain body (64 cells) scenario.
-///
-/// Verifies that has_extras() is true ONLY for cells that have extras entries
-/// (the colored prompt), and false for plain body cells. This validates the
-/// per-cell HAS_EXTRAS flag that eliminates 99% of hash probes in rendering.
+/// Coloured prompt (16 RGB cells) + plain body (64 cells): has_extras() is true
+/// only for cells with extras entries.
 #[test]
 fn colored_prompt_has_extras_only_on_prompt_cells() {
     let mut grid = Grid::new(1, 80);
@@ -537,7 +513,7 @@ fn colored_prompt_has_extras_only_on_prompt_cells() {
         grid.write_char(c);
     }
 
-    // Extras map is NOT empty (prompt has entries).
+    // Extras map is not empty (prompt has entries).
     assert!(!grid.extras().is_empty());
 
     // Prompt cells have has_extras() == true.
@@ -729,11 +705,7 @@ fn sync_extras_flags_for_row_sets_flags_correctly() {
     );
 }
 
-/// sync_extras_flags_for_row clears stale HAS_EXTRAS when no extras entry exists.
-///
-/// Covers the true-to-false direction: a cell has HAS_EXTRAS set but no
-/// corresponding extras map entry (e.g., after extras were removed by a
-/// different code path that forgot to clear the flag).
+/// sync_extras_flags_for_row clears a HAS_EXTRAS flag that has no extras entry.
 #[test]
 fn sync_extras_flags_for_row_clears_stale_flags() {
     let mut grid = Grid::new(1, 10);
@@ -795,7 +767,7 @@ fn sync_extras_flags_for_row_clears_stale_flags() {
     );
 }
 
-/// Erase operations clear HAS_EXTRAS by resetting cells to EMPTY.
+/// Erase operations clear HAS_EXTRAS by resetting cells to empty.
 #[test]
 fn erase_to_end_of_screen_clears_has_extras() {
     let mut grid = Grid::new(3, 10);
@@ -823,7 +795,7 @@ fn erase_to_end_of_screen_clears_has_extras() {
         "row 0 above cursor should keep has_extras"
     );
 
-    // Rows 1-2 should have cleared extras (cells reset to EMPTY)
+    // Rows 1-2 should have cleared extras (cells reset to empty)
     for row in 1..3u16 {
         assert!(
             !grid.cell(row, 0).unwrap().has_extras(),

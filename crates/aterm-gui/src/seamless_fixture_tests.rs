@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aterm_core::scrollback::Line;
 use aterm_core::terminal::Terminal;
 
-use super::tests::{ENV_LOCK, RestoreVar, child_proof_from, pipe_pair};
+use super::tests::{ENV_LOCK, ScratchEnv, child_proof_from, pipe_pair, restore_env};
 use super::*;
 
 /// The fixture root: one directory per release, one per desk inside it.
@@ -100,6 +100,19 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.98.0", "shell-integration"),
     ("v0.98.0", "stalled-sequence"),
     ("v0.98.0", "twelve-panes"),
+    ("v0.100.0", "claude-code-1049"),
+    ("v0.100.0", "colour-and-shell"),
+    ("v0.100.0", "held-pane"),
+    ("v0.100.0", "history"),
+    ("v0.100.0", "history-carry"),
+    ("v0.100.0", "incident-55x149"),
+    ("v0.100.0", "link-dense"),
+    ("v0.100.0", "link-dense-history"),
+    ("v0.100.0", "policy-repaint"),
+    ("v0.100.0", "policy-visible"),
+    ("v0.100.0", "shell-integration"),
+    ("v0.100.0", "stalled-sequence"),
+    ("v0.100.0", "twelve-panes"),
 ];
 
 /// THE DESK SET, one `("vX.Y.0", "<desk>")` row per desk: from that release on,
@@ -137,7 +150,56 @@ const REQUIRED_DESKS: &[(&str, &str)] = &[
     ("v0.97.0", "stalled-sequence"),
     ("v0.97.0", "twelve-panes"),
     ("v0.98.0", "link-dense-history"),
+    ("v0.100.0", "held-pane"),
 ];
+
+/// EVERY HELD PANE THE PRODUCER CARRIED IS SHOWN (v0.100.0 on): in the order
+/// it was named, at its carried geometry, without scrollback, with how its
+/// command ended, and with no link left to click (the successor strips every
+/// one from a held screen, which has no process behind it). A desk whose
+/// producer carried none shows none.
+fn assert_held_panes_shown(desk: &Desk, incoming: &IncomingHandoff) {
+    let label = desk.label();
+    assert_eq!(
+        incoming
+            .held
+            .iter()
+            .map(|pane| pane.local_id)
+            .collect::<Vec<_>>(),
+        desk.parent
+            .held
+            .iter()
+            .map(|pane| pane.local_id)
+            .collect::<Vec<_>>(),
+        "{label}: every held pane the producer carried is shown, and no other"
+    );
+    for (shown, expected) in incoming.held.iter().zip(&desk.parent.held) {
+        let cp = &shown.checkpoint;
+        assert_eq!(
+            (cp.rows, cp.cols, cp.history_lines, cp.alt_grid.is_some()),
+            (expected.rows, expected.cols, 0, expected.alt_grid),
+            "{label}: held pane {} keeps its carried geometry, without scrollback",
+            shown.local_id
+        );
+        let exit = match (expected.exit_code, expected.exit_signal) {
+            (Some(code), None) => Some(aterm_pty::ChildExit::Code(code)),
+            (None, Some(signal)) => Some(aterm_pty::ChildExit::Signal(signal)),
+            _ => None,
+        };
+        assert_eq!(
+            shown.exit, exit,
+            "{label}: held pane {} says how its command ended",
+            shown.local_id
+        );
+        for grid in [Some(&cp.grid), cp.alt_grid.as_ref()].into_iter().flatten() {
+            assert!(
+                !grid.windows(b"https://".len()).any(|w| w == b"https://"),
+                "{label}: held pane {} shows no link",
+                shown.local_id
+            );
+        }
+    }
+}
 
 /// What one desk's producer committed to (`parent.toml`, written beside the
 /// bytes by the generator in the release's worktree).
@@ -160,6 +222,27 @@ struct ParentRecord {
     commit_wire: String,
     files: Vec<String>,
     session: Vec<SessionExpectation>,
+    /// The panes kept open after their command exited (`--hold`) whose final
+    /// screens the producer carried beside the manifest, recorded from
+    /// v0.100.0 on (the first release that carries them). Absent from older
+    /// releases' `parent.toml`: their producers carry none, and the
+    /// successor shows each such pane as its placeholder.
+    #[serde(default)]
+    held: Vec<HeldExpectation>,
+}
+
+/// One held pane's screen as the producer carried it, and how its command
+/// ended.
+#[derive(serde::Deserialize)]
+struct HeldExpectation {
+    local_id: u64,
+    rows: u16,
+    cols: u16,
+    alt_grid: bool,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    exit_signal: Option<u8>,
 }
 
 /// The screen the producer carried for one session.
@@ -290,7 +373,9 @@ fn every_desk() -> Vec<Desk> {
         .flatten()
         .filter(|entry| entry.path().is_dir())
         .collect::<Vec<_>>();
-    releases.sort_by_key(std::fs::DirEntry::file_name);
+    // IN RELEASE ORDER, not the names': `v0.100.0` sorts before `v0.91.0` as
+    // text, and the controls below take the NEWEST release's desk (`rfind`).
+    releases.sort_by_key(|entry| release_triple(&entry.file_name().to_string_lossy()));
     let mut desks = Vec::new();
     for release in releases {
         let mut names = std::fs::read_dir(release.path())
@@ -568,7 +653,8 @@ fn assert_proof_function_is_the_parents(desk: &Desk) {
 /// deletes what it takes), fresh PTYs standing in for the parent's, and the
 /// launch environment `outgoing_parent_env` and the worker would publish.
 struct Staged {
-    scratch: std::path::PathBuf,
+    /// The scratch HOME and runtime dir, put back and removed by `teardown`.
+    scratch: ScratchEnv,
     /// The private control dir the desk's files were staged into — where the
     /// consumer takes (and unlinks) each sidecar.
     dir: std::path::PathBuf,
@@ -582,9 +668,10 @@ struct Staged {
 }
 
 impl Staged {
-    /// Close every descriptor still ours and remove the scratch dir. The
-    /// masters are not: once the wire names them they are the successor's —
-    /// the adoption closes each as it drops, and a refusal closes them at once.
+    /// Close every descriptor still ours, put HOME and the runtime dir back
+    /// and remove the scratch ([`ScratchEnv`]). The masters are not: once the
+    /// wire names them they are the successor's — the adoption closes each as
+    /// it drops, and a refusal closes them at once.
     fn teardown(self) {
         for fd in self
             .slaves
@@ -594,7 +681,7 @@ impl Staged {
         {
             aterm_pty::close_fd(fd);
         }
-        let _ = std::fs::remove_dir_all(&self.scratch);
+        drop(self.scratch);
     }
 }
 
@@ -605,16 +692,19 @@ type MetaRewrite<'a> = (u64, &'a dyn Fn(&str) -> String);
 /// named session's meta — standing in for a producer this build disagrees
 /// with; the recorded parent digests then no longer describe the wire.
 fn stage(desk: &Desk, rewrite_meta: Option<MetaRewrite<'_>>) -> Staged {
-    let scratch = std::env::temp_dir().join(format!(
-        "aterm-handoff-fixture-{}-{}-{}",
-        desk.release,
-        desk.name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).expect("scratch");
-    aterm_log::env::set("XDG_RUNTIME_DIR", &scratch);
-    aterm_log::env::set("HOME", &scratch);
+    stage_with(desk, rewrite_meta, None)
+}
+
+/// [`stage`], and `rewrite_manifest` applied to the manifest's record keys
+/// (no digest covers them) — standing in for a producer of another build, or
+/// one that wrote a key this desk's did not.
+fn stage_with(
+    desk: &Desk,
+    rewrite_meta: Option<MetaRewrite<'_>>,
+    rewrite_manifest: Option<&dyn Fn(&mut SessionHandoff)>,
+) -> Staged {
+    // Every caller holds ENV_LOCK for its whole body.
+    let scratch = ScratchEnv::home(&format!("{}-{}", desk.release, desk.name));
     let dir = crate::control_auth::socket_dir().expect("scratch control dir");
     let dir_text = dir.to_str().expect("a UTF-8 scratch dir");
     for file in &desk.parent.files {
@@ -628,11 +718,12 @@ fn stage(desk: &Desk, rewrite_meta: Option<MetaRewrite<'_>>) -> Staged {
             let text = String::from_utf8(bytes)
                 .expect("UTF-8 manifest")
                 .replace(&desk.parent.dir_placeholder, dir_text);
-            match rewrite_meta {
-                None => text.into_bytes(),
-                Some((local_id, rewrite)) => {
-                    let (nonce, toml) = text.split_once('\n').expect("nonce header");
-                    let mut manifest = SessionHandoff::from_toml(toml).expect("manifest");
+            if rewrite_meta.is_none() && rewrite_manifest.is_none() {
+                text.into_bytes()
+            } else {
+                let (nonce, toml) = text.split_once('\n').expect("nonce header");
+                let mut manifest = SessionHandoff::from_toml(toml).expect("manifest");
+                if let Some((local_id, rewrite)) = rewrite_meta {
                     let carry = manifest
                         .sessions
                         .iter_mut()
@@ -640,8 +731,11 @@ fn stage(desk: &Desk, rewrite_meta: Option<MetaRewrite<'_>>) -> Staged {
                         .and_then(|rec| rec.screen.as_mut())
                         .expect("the rewritten session carries a screen");
                     carry.meta = rewrite(&carry.meta);
-                    format!("{nonce}\n{}", manifest.to_toml().expect("reserialize")).into_bytes()
                 }
+                if let Some(rewrite) = rewrite_manifest {
+                    rewrite(&mut manifest);
+                }
+                format!("{nonce}\n{}", manifest.to_toml().expect("reserialize")).into_bytes()
             }
         } else {
             bytes
@@ -651,18 +745,8 @@ fn stage(desk: &Desk, rewrite_meta: Option<MetaRewrite<'_>>) -> Staged {
     let mut live = Vec::new();
     let mut slaves = Vec::new();
     for (index, session) in desk.parent.session.iter().enumerate() {
-        let (mut master, mut slave) = (0i32, 0i32);
-        // SAFETY: valid out-params; openpty fills them on success.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty {index}");
+        let (master, slave) = aterm_pty::open_pty_pair()
+            .unwrap_or_else(|error| panic!("open_pty_pair {index}: {error}"));
         live.push((
             session.local_id,
             master,
@@ -695,8 +779,10 @@ fn stage(desk: &Desk, rewrite_meta: Option<MetaRewrite<'_>>) -> Staged {
     aterm_log::env::set(
         ENV_TARGET,
         encode_target_identity(
-            crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-            crate::build_info::GIT_COMMIT,
+            crate::build_info::build_number()
+                .parse::<u64>()
+                .unwrap_or(0),
+            crate::build_info::git_commit(),
         ),
     );
     Staged {
@@ -707,23 +793,6 @@ fn stage(desk: &Desk, rewrite_meta: Option<MetaRewrite<'_>>) -> Staged {
         pipes: [ready_read, commit_read, commit_write],
         ready_write: Some(ready_write),
     }
-}
-
-/// Every variable [`stage`] and the consumer touch, restored on drop.
-fn restore_env() -> [RestoreVar; 11] {
-    [
-        RestoreVar::new("XDG_RUNTIME_DIR"),
-        RestoreVar::new("HOME"),
-        RestoreVar::new(ENV_MANIFEST),
-        RestoreVar::new(ENV_NONCE),
-        RestoreVar::new(ENV_FDS),
-        RestoreVar::new(ENV_LAYOUT),
-        RestoreVar::new(ENV_TARGET),
-        RestoreVar::new(ENV_READY_FD),
-        RestoreVar::new(ENV_COMMIT_FD),
-        RestoreVar::new(ENV_PARENT_PID),
-        RestoreVar::new(ENV_PARENT_BIRTH),
-    ]
 }
 
 /// THE HISTORY CARRY IS TAKEN, before the proof (v0.94.0 on): the sidecar
@@ -1251,6 +1320,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
             "{label}: the layout parses and names exactly the sessions — no orphan tabs"
         );
         drafts_carried += assert_settings_drafts_placed(desk, &incoming);
+        assert_held_panes_shown(desk, &incoming);
         for expected in &desk.parent.session {
             let adopted = incoming
                 .adopted
@@ -1325,8 +1395,10 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
             .unwrap_or_else(|| panic!("{label}: the child adopts and proves"));
         let expected = adoption_proof(
             &desk.parent.nonce,
-            crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-            crate::build_info::GIT_COMMIT,
+            crate::build_info::build_number()
+                .parse::<u64>()
+                .unwrap_or(0),
+            crate::build_info::git_commit(),
             &unhex::<32>(&label, &desk.parent.layout_digest),
             &unhex::<32>(&label, &desk.parent.screen_digest),
             &staged.live,
@@ -1434,8 +1506,10 @@ fn a_consumer_that_drops_the_shell_state_fails_only_the_meta_check() {
         child_proof_from(incoming).expect("the child adopts and proves");
     let parent_expects = adoption_proof(
         &desk.parent.nonce,
-        crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-        crate::build_info::GIT_COMMIT,
+        crate::build_info::build_number()
+            .parse::<u64>()
+            .unwrap_or(0),
+        crate::build_info::git_commit(),
         &unhex::<32>(&label, &desk.parent.layout_digest),
         &unhex::<32>(&label, &desk.parent.screen_digest),
         &staged.live,
@@ -1574,8 +1648,10 @@ fn a_consumer_that_loses_or_moves_a_settings_draft_fails_the_drafts_check() {
         child_proof_from(incoming).expect("the child adopts and proves");
     let parent_expects = adoption_proof(
         &desk.parent.nonce,
-        crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-        crate::build_info::GIT_COMMIT,
+        crate::build_info::build_number()
+            .parse::<u64>()
+            .unwrap_or(0),
+        crate::build_info::git_commit(),
         &unhex::<32>(&label, &desk.parent.layout_digest),
         &unhex::<32>(&label, &desk.parent.screen_digest),
         &staged.live,
@@ -1731,7 +1807,7 @@ fn a_repainted_session_is_counted_for_the_landing_row() {
 /// guard that silently checks less.
 #[cfg(target_os = "macos")]
 const PINNED_RENDEZVOUS: &[&str] = &[
-    "v0.91.0", "v0.92.0", "v0.93.0", "v0.94.0", "v0.95.0", "v0.97.0", "v0.98.0",
+    "v0.91.0", "v0.92.0", "v0.93.0", "v0.94.0", "v0.95.0", "v0.97.0", "v0.98.0", "v0.100.0",
 ];
 
 /// The fixed inputs every rendezvous capture runs over, in every release and in
@@ -1828,22 +1904,10 @@ fn inode_of(fd: i32) -> (libc::dev_t, libc::ino_t) {
     (info.st_dev, info.st_ino)
 }
 
-/// A fresh PTY: `(master, slave)`.
+/// A fresh PTY: `(master, slave)`, both close-on-exec from birth.
 #[cfg(target_os = "macos")]
 fn open_pty_pair() -> (i32, i32) {
-    let (mut master, mut slave) = (0i32, 0i32);
-    // SAFETY: valid out-params; openpty fills them on success.
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty");
-    (master, slave)
+    aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
 
 /// THIS BUILD'S TRANSPORT over the fixed inputs, observed from outside: the
@@ -1885,11 +1949,17 @@ fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
     let claim_hex_len = rendezvous.claim().len();
     let dialer = crate::handoff_rendezvous::dial_for_test(rendezvous.path(), rendezvous.claim())
         .expect("dial the rendezvous");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let own = i32::try_from(std::process::id()).expect("a pid fits pid_t");
-    let peer = rendezvous
-        .accept_claim(Some(own), deadline, &|| false)
-        .expect("the claim is accepted");
+    let peer = crate::handoff_rendezvous::admitted(
+        rendezvous.accept_claim(
+            Some(own),
+            &crate::handoff_rendezvous::DialerCode::this_process(),
+            deadline,
+            &|| false,
+        ),
+        "the claim is accepted",
+    );
     let ptys = RZ_SESSIONS
         .iter()
         .map(|_| open_pty_pair())
@@ -1922,7 +1992,7 @@ fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
     )
     .expect("the grant is sent");
     dialer
-        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
         .expect("a read bound");
     let mut header = [0u8; 8];
     let received =
@@ -2327,7 +2397,7 @@ fn every_shipped_producers_rendezvous_grants_this_successor() {
                 &unhex::<32>(&label, &record.proof_screen_digest),
                 &terms,
             ),
-            Some(AdoptionProof {
+            Ok(AdoptionProof {
                 count: record.proof_count,
                 digest: unhex::<32>(&label, &record.proof_digest),
             }),
@@ -2336,4 +2406,231 @@ fn every_shipped_producers_rendezvous_grants_this_successor() {
         replay_grant_to_this_successor(&label, record, &scratch);
     }
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A v0.97.0 POLICY DESK IS SAID AS THE POLICY'S REQUEST (round eight of the
+/// update audit, finding 87). v0.97.0 follows a successor's no-scrollback
+/// policy — it carries no line in any screen, names no sidecar and counts
+/// every line as left behind — but predates `history_withheld`, the per-record
+/// word that the loss was asked for. This build's consumer knows it from its
+/// own sealed policy: when that policy asked v0.97.0's build for no
+/// scrollback, the band's row is the request's ("the new version asked this
+/// update to carry no scrollback"), never the failure row's "everything on
+/// screen and the newest lines came across", which is false under `repaint`
+/// (no screen crossed) and under `visible` (no newest line did).
+///
+/// NEGATIVE CONTROLS: with no policy of its own, and with one that leaves
+/// v0.97.0's build out of its range, the same desk is said as before — a loss
+/// this build did not ask for is not dressed up as its request.
+///
+/// AND ONLY v0.97.0 (the review of the first fix): under a policy whose range
+/// spans v0.93.0 to v0.99 — a range natural for a bug that spans releases —
+/// the same records written by a v0.95.0 producer (which follows no policy),
+/// a v0.98.0 policy desk without its `history_withheld` word (a v0.98.0
+/// producer that read no policy at its park, or failed), and the v0.97.0 desk
+/// with one record naming a sidecar (a desk that carried scrollback somewhere
+/// was not parked under a no-scrollback policy) are each the FAILURE row, as
+/// before; the untouched v0.97.0 desk under that range is still the request,
+/// and the untouched v0.98.0 one says it by its own word. RED with the first
+/// fix, which read every producer the range covered as following it.
+#[test]
+fn a_v097_policy_desk_is_said_as_the_policys_request() {
+    use aterm_update_core::handoff_policy::{CarryCeiling, HandoffPolicy, ProducerRange};
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let desks = every_desk();
+    // The band row for `desk` adopted under `own` as this build's policy, its
+    // manifest rewritten by `rewrite` first.
+    let row_for_rewritten =
+        |desk: &Desk, own: Option<HandoffPolicy>, rewrite: Option<&dyn Fn(&mut SessionHandoff)>| {
+            let _own = own_policy_for_test(own);
+            let staged = stage_with(desk, None, rewrite);
+            let incoming = take_incoming_as(ReceiverShape::Current);
+            assert_eq!(
+                incoming.adopted.len(),
+                desk.parent.session.len(),
+                "{}: every session adopts",
+                desk.label()
+            );
+            let loss = crate::handoff_history::carried_loss(
+                incoming.adopted.iter().map(|adopted| &adopted.history),
+            );
+            drop(incoming);
+            staged.teardown();
+            (
+                loss,
+                crate::update_words::scrollback_left_behind(
+                    loss.lines,
+                    loss.tabs,
+                    loss.withheld,
+                    loss.held,
+                    loss.held_failed,
+                ),
+            )
+        };
+    let row_for = |desk: &Desk, own: Option<HandoffPolicy>| row_for_rewritten(desk, own, None);
+    // A range from v0.93.0 to just before v0.100.0.
+    let spanning = ProducerRange {
+        min_build: 1_790_305_290,
+        max_build: 1_790_807_621,
+    };
+    for (name, carry) in [
+        ("policy-repaint", CarryCeiling::Repaint),
+        ("policy-visible", CarryCeiling::Visible),
+    ] {
+        let desk = desks
+            .iter()
+            .find(|desk| desk.release == "v0.97.0" && desk.name == name)
+            .unwrap_or_else(|| panic!("the v0.97.0 {name} desk is checked in"));
+        let label = desk.label();
+        let producer = SessionHandoff::from_toml(
+            String::from_utf8(desk.read(&desk.parent.manifest))
+                .expect("UTF-8 manifest")
+                .split_once('\n')
+                .expect("nonce header")
+                .1,
+        )
+        .and_then(|manifest| manifest.outgoing_build)
+        .expect("v0.97.0 names its build");
+        let ours = |range: ProducerRange| HandoffPolicy {
+            applies_to_producers: Some(range),
+            carry: Some(carry),
+            park_quiet_gate_at_land: None,
+        };
+        let covering = ProducerRange {
+            min_build: producer,
+            max_build: producer,
+        };
+        let (loss, row) = row_for(desk, Some(ours(covering)));
+        assert!(
+            loss.lines > 0 && loss.tabs > 0,
+            "PRECONDITION: {label} leaves lines behind ({loss:?})"
+        );
+        assert_eq!(
+            loss.withheld, loss.lines,
+            "{label}: every line this build's policy asked v0.97.0 to leave is its request"
+        );
+        assert_eq!(
+            row,
+            crate::update_words::scrollback_withheld(loss.lines, loss.tabs),
+            "{label}: the row says the new version asked for it"
+        );
+        assert!(
+            !format!("{row:?}").contains("newest lines came across"),
+            "{label}: no claim that the newest lines crossed: {row:?}"
+        );
+        for (control, own) in [
+            ("no policy of its own", None),
+            (
+                "a policy for other builds",
+                Some(ours(ProducerRange {
+                    min_build: producer + 1,
+                    max_build: producer + 1,
+                })),
+            ),
+            (
+                "a policy that carries scrollback",
+                Some(HandoffPolicy {
+                    carry: Some(CarryCeiling::Full),
+                    ..ours(covering)
+                }),
+            ),
+        ] {
+            let (loss, row) = row_for(desk, own);
+            assert_eq!(
+                (loss.withheld, row),
+                (
+                    0,
+                    crate::update_words::scrollback_lost(loss.lines, loss.tabs)
+                ),
+                "{label} under {control}: a loss this build did not ask for is said as before"
+            );
+        }
+
+        // ONLY THE PRODUCER THAT FOLLOWS A POLICY WITHOUT SAYING SO.
+        assert_eq!(
+            producer,
+            aterm_update_core::handoff_policy::FIRST_POLICY_FOLLOWING_BUILD,
+            "{label}: the checked-in v0.97.0 desk is v0.97.0's build"
+        );
+        let spanning_policy = ours(spanning);
+        let (loss, row) = row_for(desk, Some(spanning_policy));
+        assert_eq!(
+            (loss.withheld, row),
+            (
+                loss.lines,
+                crate::update_words::scrollback_withheld(loss.lines, loss.tabs)
+            ),
+            "{label} under the spanning range: still the request"
+        );
+        let as_v095 = |manifest: &mut SessionHandoff| manifest.outgoing_build = Some(1_790_563_767);
+        let named_a_sidecar = |manifest: &mut SessionHandoff| {
+            let record = manifest
+                .sessions
+                .iter_mut()
+                .find(|record| record.history_dropped > 0)
+                .expect("a record that left lines behind");
+            record.history = Some(format!("1 {} 1", "0".repeat(64)));
+        };
+        for (control, rewrite) in [
+            (
+                "a v0.95.0 producer, which follows no policy",
+                &as_v095 as &dyn Fn(&mut SessionHandoff),
+            ),
+            (
+                "a desk that named a scrollback sidecar",
+                &named_a_sidecar as &dyn Fn(&mut SessionHandoff),
+            ),
+        ] {
+            let (loss, row) = row_for_rewritten(desk, Some(spanning_policy), Some(rewrite));
+            assert!(
+                loss.lines > 0,
+                "PRECONDITION: {label} as {control} loses lines"
+            );
+            assert_eq!(
+                (loss.withheld, row),
+                (
+                    0,
+                    crate::update_words::scrollback_lost(loss.lines, loss.tabs)
+                ),
+                "{label} as {control}: its unexplained loss is a failure, said as one"
+            );
+        }
+
+        let v098 = desks
+            .iter()
+            .find(|desk| desk.release == "v0.98.0" && desk.name == name)
+            .unwrap_or_else(|| panic!("the v0.98.0 {name} desk is checked in"));
+        let (loss, row) = row_for(v098, Some(spanning_policy));
+        assert_eq!(
+            (loss.withheld, row),
+            (
+                loss.lines,
+                crate::update_words::scrollback_withheld(loss.lines, loss.tabs)
+            ),
+            "{}: v0.98.0 says its withholding by its own word",
+            v098.label()
+        );
+        let unsaid = |manifest: &mut SessionHandoff| {
+            assert_eq!(
+                manifest.outgoing_build,
+                Some(crate::seamless::FIRST_WITHHELD_SAYING_BUILD),
+                "the checked-in v0.98.0 desk is v0.98.0's build"
+            );
+            for record in &mut manifest.sessions {
+                record.history_withheld = false;
+            }
+        };
+        let (loss, row) = row_for_rewritten(v098, Some(spanning_policy), Some(&unsaid));
+        assert!(loss.lines > 0, "PRECONDITION: {} loses lines", v098.label());
+        assert_eq!(
+            (loss.withheld, row),
+            (
+                0,
+                crate::update_words::scrollback_lost(loss.lines, loss.tabs)
+            ),
+            "{} without its word: a v0.98.0 record that does not say it was withheld was not",
+            v098.label()
+        );
+    }
 }

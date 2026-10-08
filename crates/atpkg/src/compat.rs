@@ -31,10 +31,9 @@
 //! written last, before the root is committed by `rename(2)`, so a root without one is
 //! never routed.
 //!
-//! It used to be a hard-link mirror of the store's own inodes, so every lay, rebuild and
-//! retire moved a live store inode's link count and ctime — both of which tippy pins — and a
-//! link from a tracked process tagged the store. A root laid that way has no marker and is
-//! not a clone, so it is never routed and the next `repair` rebuilds it.
+//! A root laid by an older client as a hard-link mirror of the store's inodes (which moved
+//! the link count and ctime tippy pins) has no marker and is not a clone, so it is never
+//! routed and the next `repair` rebuilds it.
 //!
 //! `lib/` is mirrored, not symlinked, for the reason the view's is: a frontend finds its
 //! sysroot through the real path of the driver dylib it loaded, so a symlinked `lib/`
@@ -214,20 +213,17 @@ pub fn root_matches(build_dir: &Path, root: &Path, depth: Depth) -> bool {
 #[must_use]
 pub fn laid_line(layout: &Layout, build: u64) -> String {
     format!(
-        "atpkg: exec root: trust build {build} ships a bin/rustc that is a separate file from \
-         bin/trustc with different bytes, which its tippy refuses — laid {} (copy-on-write \
-         clones, where rustc holds trustc's bytes; the store is untouched)",
+        "atpkg: Trust build {build}: tippy now runs from {}",
         root_dir(layout, build).display()
     )
 }
 
 /// `<prefix>/compat` or `<prefix>/compat/trust` standing as something other than a real
 /// directory — a symbolic link, or a file — which is where every trust exec root lives.
-/// atpkg never follows or writes through what stands there (a reviewer showed a removal
-/// following such a link out of the prefix, 2026-09-15), and no update, repair or gc removes
+/// atpkg never follows or writes through what stands there (a removal could follow such a
+/// link out of the prefix), and no update, repair or gc removes
 /// it — only `uninstall` takes `compat` — so no exec root is laid and no shim routes until a
-/// person moves it. No retry can fix it — `aterm pkg repair` refused on every run, while the
-/// lines around it said repair would — so every message about it names the path and that
+/// person moves it. No retry can fix it, so every message about it names the path and that
 /// one manual step: [`ensure_root`]'s error (what the passes print) and doctor's (5f) warn
 /// both speak through this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,9 +316,9 @@ pub fn not_laid_line(layout: &Layout, build: u64, e: &io::Error) -> String {
             blocked.fix()
         ),
         None => format!(
-            "atpkg: trust build {build}: exec root {} not put in order ({e}) — a shim routes \
-             only through a whole root already standing there, and otherwise runs the store \
-             path, where this build's tippy refuses to start; `aterm pkg repair` retries",
+            "atpkg: trust build {build}: exec root {} not put in order ({e}); a shim without a \
+             whole root runs the store path, where tippy refuses to start; `aterm pkg repair` \
+             retries",
             root_dir(layout, build).display()
         ),
     }
@@ -389,9 +385,9 @@ impl Report {
 /// file that will not open or read — is an error, never `Ok(None)`: an unproven "needs
 /// none" must not retire a root. Every caller that removes something acts on `Ok(None)`
 /// alone — [`ensure_root`] leaves whatever stands and returns the error, and [`sweep`]
-/// keeps the root — because a single failed read had swept a needed root, un-routed every
-/// shim and moved every store inode twice on the pass that re-laid it (a reviewer measured
-/// it with the store `bin/rustc` at mode `0111`, 2026-09-15).
+/// keeps the root — because a single failed read (a store `bin/rustc` at mode `0111`) would
+/// sweep a needed root, un-route every shim and move every store inode twice on the pass
+/// that re-laid it.
 pub fn needs_root(build_dir: &Path) -> io::Result<Option<u64>> {
     #[cfg(unix)]
     {
@@ -504,8 +500,8 @@ fn trust_tool_build(layout: &Layout, target: &Path) -> Option<u64> {
 ///   is removed — renamed aside first, a symlink unlinked — and the answer is
 ///   [`Ensured::Plain`]. Only under a `<prefix>/compat` and `compat/trust` that are both
 ///   real directories: behind a symlink at either name nothing is atpkg's, and a root-named
-///   directory there is left whole (a reviewer showed the removal following such a link
-///   out of the prefix, 2026-09-15).
+///   directory there is left whole (a removal could follow such a link out of the
+///   prefix).
 /// * `compat` or `compat/trust` exists and is not a real directory: refused with a
 ///   [`Blocked`] ([`blocked_by`] recovers it), which names that path and the manual fix,
 ///   before anything is compared — a root reached through a link is not one
@@ -1082,9 +1078,8 @@ pub fn reconcile(layout: &Layout, depth: Depth) -> Report {
                         blocked.fix()
                     ),
                     None => format!(
-                        "trust build {n}: exec root {} not put in order ({e}); a shim routes \
-                         only through a whole root already standing there, and otherwise runs \
-                         the store path",
+                        "trust build {n}: exec root {} not put in order ({e}); a shim without \
+                         a whole root runs the store path",
                         root_dir(layout, *n).display()
                     ),
                 }),
@@ -1257,9 +1252,8 @@ pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>
             // A shim to the stock-name COPY the bundle ships (`rustdoc`, say — `rustc` and
             // `cargo` are refused as shim names) has nothing to route to either: the root
             // presents that name as the Trust tool, not the copy, so the writer's
-            // [`route_for_shim`] answers `None` for it on every render. Counted, it read as
-            // unrouted forever — a warn `aterm pkg repair` could never clear (a reviewer
-            // showed it with a `bin/rustdoc` copy exposed, 2026-09-15). It runs the store
+            // [`route_for_shim`] answers `None` for it on every render. Counted, it would read
+            // as unrouted forever — a warn `aterm pkg repair` could never clear. It runs the store
             // copy, which no tippy authenticates, exactly as before roots existed.
             //
             // Only a copy ([`is_stock_copy`], the one predicate the writer asks too): a
@@ -1308,7 +1302,7 @@ mod tests {
 
     /// A private temp prefix. Nothing here reads `$HOME`, the real prefix or `~/.rustup`.
     struct Fx {
-        root: PathBuf,
+        root: aterm_tempfile::TempDir,
         layout: Layout,
     }
 
@@ -1317,7 +1311,7 @@ mod tests {
     enum Shape {
         /// 8571/8589/8590/8595: `rustc` and `cargo` separate copies that differ.
         Copy,
-        /// Trust-names-only (trust `dist.rs`, 2026-09-14 on).
+        /// Trust-names-only (trust `dist.rs`, builds from 2026-09-14 on).
         NamesOnly,
         /// A pack whose extractor kept `rustc` a hard link of `trustc`.
         Linked,
@@ -1333,12 +1327,11 @@ mod tests {
 
     impl Fx {
         fn new(label: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("atpkg-compat-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let prefix = root.join("pkg");
+            let root = aterm_tempfile::Builder::new()
+                .prefix(&format!("atpkg-compat-{label}-"))
+                .tempdir()
+                .unwrap();
+            let prefix = root.path().join("pkg");
             std::fs::create_dir_all(prefix.join("bin")).unwrap();
             Fx {
                 root,
@@ -1421,12 +1414,6 @@ mod tests {
             std::fs::write(&shim, crate::platform::sh_shim_content_env(target, env)).unwrap();
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
             shim
-        }
-    }
-
-    impl Drop for Fx {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -1722,7 +1709,7 @@ mod tests {
         assert!(root.is_dir(), "a root its build needs stays");
 
         // A symlink planted at the root's name is replaced by a real root, never followed.
-        let elsewhere = fx.root.join("elsewhere");
+        let elsewhere = fx.root.path().join("elsewhere");
         std::fs::rename(&root, &elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
         assert_eq!(
@@ -1804,7 +1791,7 @@ mod tests {
             Ensured::Plain
         );
         assert!(std::fs::symlink_metadata(&root).is_err());
-        let elsewhere = fx.root.join("elsewhere");
+        let elsewhere = fx.root.path().join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("bin")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
         assert_eq!(
@@ -1844,7 +1831,14 @@ mod tests {
             assert!(debris(&fx.layout).is_empty());
         }
         // Not a trust build of this layout: refused, nothing laid.
-        assert!(ensure_root(&fx.layout, &fx.root.join("elsewhere"), Depth::Shallow).is_err());
+        assert!(
+            ensure_root(
+                &fx.layout,
+                &fx.root.path().join("elsewhere"),
+                Depth::Shallow
+            )
+            .is_err()
+        );
         assert!(ensure_root(&fx.layout, &build.join("bin"), Depth::Shallow).is_err());
     }
 
@@ -1885,6 +1879,7 @@ mod tests {
         // A dev link into a checkout that merely has a store-shaped tail: no.
         let dev = fx
             .root
+            .path()
             .join("src")
             .join("store")
             .join("trust")
@@ -1894,7 +1889,7 @@ mod tests {
         std::fs::write(dev.join("tippy"), b"dev").unwrap();
         assert_eq!(route_for_shim(&shim, &dev.join("tippy")), None);
         // A lookalike prefix — the same target, a shim in another prefix: no.
-        let other = fx.root.join("pkg2").join("bin").join("tippy");
+        let other = fx.root.path().join("pkg2").join("bin").join("tippy");
         assert_eq!(route_for_shim(&other, &target), None);
         // Extra components, another directory of the build, a non-canonical number: no.
         assert_eq!(
@@ -1951,13 +1946,13 @@ mod tests {
         std::fs::write(&marker, ROOT_MARKER_BODY).unwrap();
         assert!(route_for_shim(&shim, &target).is_some());
         // No lib/ in a root whose build has one: no.
-        let lib_aside = fx.root.join("lib-aside");
+        let lib_aside = fx.root.path().join("lib-aside");
         std::fs::rename(root.join("lib"), &lib_aside).unwrap();
         assert_eq!(route_for_shim(&shim, &target), None);
         std::fs::rename(&lib_aside, root.join("lib")).unwrap();
         assert!(route_for_shim(&shim, &target).is_some());
         // The root itself a symlink to a whole root elsewhere: no.
-        let moved = fx.root.join("moved-root");
+        let moved = fx.root.path().join("moved-root");
         std::fs::rename(&root, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &root).unwrap();
         assert_eq!(route_for_shim(&shim, &target), None);
@@ -2093,8 +2088,7 @@ mod tests {
     /// shim scan included — all but its (5f)(c) exec-root line, the one report line meant to
     /// differ (a warn over plain shims, a note once they route), and its free-space line,
     /// which reads the live volume: any build on the same disk between the two reports moved
-    /// it by a tenth of a GiB and failed this test on unchanged code (a reviewer measured 7
-    /// failures in 12 runs beside a writer, 2026-09-15).
+    /// it by a tenth of a GiB and failed this test on unchanged code.
     #[test]
     fn every_shim_reader_answers_the_same_for_the_routed_form() {
         let fx = Fx::new("invariance");
@@ -2115,7 +2109,7 @@ mod tests {
         )
         .unwrap();
         crate::stub::write_pending_stub(&fx.layout, &ToolName::new("ay").unwrap()).unwrap();
-        let home = fx.root.join("home");
+        let home = fx.root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
         let names = [
@@ -2301,7 +2295,7 @@ mod tests {
                 .join("trust")
                 .join("8595.incoming-1"),
             fx.layout.prefix.join("store").join("trust").join("08595"),
-            fx.root.join("elsewhere").join("trust").join("8595"),
+            fx.root.path().join("elsewhere").join("trust").join("8595"),
             fx.layout.prefix.join("stash").join("trust").join("8595"),
         ] {
             discard_root_of(&not_a_build);
@@ -2321,7 +2315,7 @@ mod tests {
         );
 
         // A symlink planted at a root's name is unlinked; what it pointed at is whole.
-        let elsewhere = fx.root.join("elsewhere-root");
+        let elsewhere = fx.root.path().join("elsewhere-root");
         std::fs::create_dir_all(elsewhere.join("bin")).unwrap();
         std::fs::write(elsewhere.join("bin").join("keep"), b"not atpkg's").unwrap();
         let planted = root_dir(&fx.layout, 8589);
@@ -2334,10 +2328,10 @@ mod tests {
         );
 
         // `compat/` itself a symlink to a tree shaped like roots: nothing under it goes.
-        let lookalike = fx.root.join("lookalike");
+        let lookalike = fx.root.path().join("lookalike");
         std::fs::create_dir_all(lookalike.join("trust").join("8590").join("bin")).unwrap();
         let compat = compat_dir(&fx.layout);
-        std::fs::rename(&compat, fx.root.join("compat-aside")).unwrap();
+        std::fs::rename(&compat, fx.root.path().join("compat-aside")).unwrap();
         std::os::unix::fs::symlink(&lookalike, &compat).unwrap();
         crate::store::discard_build(&fx.layout.build_dir("trust", 8590));
         assert!(
@@ -2398,7 +2392,7 @@ mod tests {
         assert!(dir.join("8595").is_dir() && dir.join("not-a-build").is_dir());
 
         // `compat` itself a symlink to a tree holding a stray: not walked by either.
-        let elsewhere = fx.root.join("elsewhere");
+        let elsewhere = fx.root.path().join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("trust").join("7")).unwrap();
         std::fs::remove_dir_all(compat_dir(&fx.layout)).unwrap();
         std::os::unix::fs::symlink(&elsewhere, compat_dir(&fx.layout)).unwrap();
@@ -2433,13 +2427,13 @@ mod tests {
 
         let dir = roots_dir(&fx.layout);
         std::fs::create_dir_all(dir.join("9000").join("bin")).unwrap();
-        let elsewhere = fx.root.join("elsewhere");
+        let elsewhere = fx.root.path().join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("bin")).unwrap();
         std::fs::write(elsewhere.join("bin").join("keep"), b"not atpkg's").unwrap();
         std::os::unix::fs::symlink(&elsewhere, dir.join("9001")).unwrap();
         std::fs::create_dir_all(dir.join(".8595.tmp-77")).unwrap();
 
-        let report = crate::gc::run(&fx.layout);
+        let report = crate::gc::run(&fx.layout, None);
         assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8589])]);
         assert!(std::fs::symlink_metadata(root_dir(&fx.layout, 8589)).is_err());
         for n in [8590, 8595] {
@@ -2462,7 +2456,7 @@ mod tests {
             route_for_shim(&shim, &fx.tool(8595, "tippy")).is_some(),
             "the live build still routes"
         );
-        let again = crate::gc::run(&fx.layout);
+        let again = crate::gc::run(&fx.layout, None);
         assert!(again.swept_exec_roots.is_empty() && again.reclaimed.is_empty());
     }
 
@@ -2493,7 +2487,7 @@ mod tests {
         assert!(std::fs::symlink_metadata(compat_dir(&fx.layout)).is_err());
         remove_all(&fx.layout).unwrap();
 
-        let elsewhere = fx.root.join("elsewhere");
+        let elsewhere = fx.root.path().join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("trust").join("8595")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, compat_dir(&fx.layout)).unwrap();
         remove_program(&fx.layout, "trust").unwrap();
@@ -2695,8 +2689,8 @@ mod tests {
     /// shim, moves no stamp in the store, the root or `bin/`, and names the failed read;
     /// the sweep and doctor's strays keep the root; [`ensure_root`] refuses and leaves it;
     /// [`inspect`] answers `Err`; the shim still routes. Readable again, a reconcile finds
-    /// nothing to do. The failure mode this pins swept the root, un-routed every shim and
-    /// moved every store inode twice (a reviewer's probe, 2026-09-15).
+    /// nothing to do. The failure mode this pins sweeps the root, un-routes every shim and
+    /// moves every store inode twice.
     #[test]
     fn a_build_that_cannot_be_read_keeps_its_root_and_its_routes() {
         if crate::platform::our_uid() == 0 {
@@ -2765,9 +2759,8 @@ mod tests {
         // A `store/trust` that cannot be searched: the build directory's own `lstat` fails,
         // which is no more proof that the build is GONE than a failed read is proof that it
         // needs none. The sweep and strays keep the root, inspect answers `Err`, nothing
-        // under `compat/` moves, and once searchable again nothing is re-laid (the sweep
-        // had classified the root `BuildGone`, removed it, and re-laid every store `bin/`
-        // inode on the next pass — a reviewer's probe, 2026-09-15).
+        // under `compat/` moves, and once searchable again nothing is re-laid (never read as
+        // `BuildGone`, removed, and re-laid on the next pass).
         let programs = build.parent().unwrap().to_path_buf();
         let mode = std::fs::symlink_metadata(&programs).unwrap().permissions();
         let before = stamps(&compat_dir(&fx.layout));
@@ -2796,8 +2789,8 @@ mod tests {
     /// `<prefix>/compat/trust`, a symlink to a directory that holds a root-named tree:
     ///
     /// * a build that needs no root answers `Plain` from [`ensure_root`] and from a
-    ///   [`reconcile`] and removes NOTHING behind the link (the removal had followed it out
-    ///   of the prefix — a reviewer's probe, 2026-09-15);
+    ///   [`reconcile`] and removes NOTHING behind the link (a removal must not follow it out
+    ///   of the prefix);
     /// * an affected build whose root stands whole behind the link is REFUSED — not
     ///   `Present` — and the reconcile says so, because [`route_for_shim`] (which requires
     ///   both to be real directories) answers `None` through it and [`inspect`] reads it as
@@ -2811,7 +2804,7 @@ mod tests {
             let fx = Fx::new("linked-plain");
             let build = fx.build(8596, Shape::NamesOnly);
             fx.plain_shim("tippy", &fx.tool(8596, "tippy"), &none);
-            let elsewhere = fx.root.join("elsewhere");
+            let elsewhere = fx.root.path().join("elsewhere");
             let victim = if linked == COMPAT_DIR {
                 elsewhere.join("trust").join("8596")
             } else {
@@ -2848,7 +2841,7 @@ mod tests {
             let target = fx.tool(8595, "tippy");
             assert!(route_for_shim(&shim, &target).is_some());
             let at = fx.layout.prefix.join(linked);
-            let aside = fx.root.join("aside");
+            let aside = fx.root.path().join("aside");
             std::fs::rename(&at, &aside).unwrap();
             std::os::unix::fs::symlink(&aside, &at).unwrap();
             assert!(
@@ -2966,8 +2959,7 @@ mod tests {
         // A stock name that is a HARD LINK of its Trust tool is that tool's inode, which
         // the root presents under the stock name — so the writer routes its shim, and a
         // plain one is unrouted until a pass re-renders it. Skipped by name alone, doctor
-        // read healthy while the next reconcile still routed it (a reviewer's probe,
-        // 2026-09-15).
+        // would read healthy while the next reconcile still routed it.
         let fx = Fx::new("stock-link");
         let build = fx.build(8595, Shape::Copy);
         let bin = build.join("bin");

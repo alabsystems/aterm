@@ -39,27 +39,86 @@ use std::process::{Command, ExitCode};
 use crate::driver::{CargoDriver, export_driver_as_cargo, rustc_host_triple};
 use crate::workspace_root;
 
-/// A gate verb: its name, and the check it runs on the arguments after it.
-type Verb = (&'static str, fn(&[String]) -> bool);
+/// When a cells cache's checkout is gone: THE rule the window's disk watch
+/// deletes a cache whole by, compiled here from its one source — one
+/// verdict for both sweeps, and no dependency edge from this binary to
+/// `aterm-agent`.
+#[path = "../../aterm-agent/src/harness/disk_checkout.rs"]
+mod cell_checkout;
 
-/// Every verb `gate` dispatches, in the order the usage line prints them. ONE
+/// A gate verb: its name, its arguments, what it checks, and the check it runs
+/// on the arguments after it.
+type Verb = (
+    &'static str,
+    &'static str,
+    &'static str,
+    fn(&[String]) -> bool,
+);
+
+/// Every verb `gate` dispatches, in the order the usage lines print them. ONE
 /// table: the dispatch reads it and the usage lines (here and in `main.rs`) are
 /// printed from it, so a verb cannot be dispatched without being listed.
 const VERBS: &[Verb] = &[
-    ("lint", gate_lint),
-    ("forge", |_| gate_forge()),
-    ("cells", gate_cells),
-    ("cells-foreign", |_| gate_cells_foreign()),
+    (
+        "lint",
+        "[--fmt-only]",
+        "the formatter: targo-fmt --all --check, a per-file trustfmt sweep, fmt editions",
+        gate_lint,
+    ),
+    (
+        "forge",
+        "",
+        "third-party surface policy (tools/forge-budget.tsv)",
+        |_| gate_forge(),
+    ),
+    (
+        "cells",
+        "[--cell NAME]…",
+        "every forge cell type-checked for its own triple",
+        gate_cells,
+    ),
+    (
+        "cells-foreign",
+        "",
+        "the cells no fleet machine hosts; needs rustup stable with their stds",
+        |_| gate_cells_foreign(),
+    ),
 ];
 
 /// The verb names, for the usage lines.
 pub(crate) fn verb_names() -> Vec<&'static str> {
-    VERBS.iter().map(|(name, _)| *name).collect()
+    VERBS.iter().map(|(name, ..)| *name).collect()
 }
 
-/// The verbs retired on 2026-09-27 that still have a home, each with the package
-/// and argument that run it now, so a caller still typing the old name (the dated
-/// records under `docs/` keep it) is told where it went.
+/// The bare `gate` usage: one line per verb, with its arguments and what it checks.
+fn gate_usage() -> String {
+    let rows: Vec<(String, &str)> = VERBS
+        .iter()
+        .map(|(name, args, what, _)| {
+            let call = if args.is_empty() {
+                (*name).to_string()
+            } else {
+                format!("{name} {args}")
+            };
+            (call, *what)
+        })
+        .collect();
+    let width = rows
+        .iter()
+        .map(|(c, _)| c.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::from("usage: xtask gate <verb>");
+    for (call, what) in rows {
+        let pad = width - call.chars().count();
+        out.push_str(&format!("\n  {call}{:pad$}  {what}", ""));
+    }
+    out
+}
+
+/// Retired verbs that still have a home, with the package and argument that run
+/// them now, so a caller typing an old name (dated records under `docs/` keep
+/// it) is told where it went.
 const RETIRED_VERBS: &[(&str, &str, &str)] = &[
     ("mainloop", "aterm-census", "--mainloop"),
     ("lockorder", "aterm-census", "--locks"),
@@ -74,7 +133,7 @@ const RETIRED_VERBS: &[(&str, &str, &str)] = &[
 /// of a retired verb.
 fn unknown_verb_message(check: Option<&str>) -> String {
     let Some(verb) = check else {
-        return format!("usage: xtask gate <{}>", verb_names().join("|"));
+        return gate_usage();
     };
     let moved = RETIRED_VERBS
         .iter()
@@ -89,7 +148,7 @@ fn unknown_verb_message(check: Option<&str>) -> String {
 
 /// `rest` is everything after the verb name.
 pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
-    let Some((_, verb)) = VERBS.iter().find(|(name, _)| Some(*name) == check) else {
+    let Some((.., verb)) = VERBS.iter().find(|(name, ..)| Some(*name) == check) else {
         eprintln!("{}", unknown_verb_message(check));
         return ExitCode::FAILURE;
     };
@@ -138,12 +197,10 @@ fn gate_forge() -> bool {
 /// nothing (a caller's own export passes through as it came), and this walk then
 /// answers for itself.
 ///
-/// AND IT CHECKS THE PIN. A directory holding a file called `targo` is not
-/// evidence that it is the fork `rust-toolchain.toml` names; the branded rustc
-/// (`trustc`) beside it is. A candidate that fails is REFUSED, not adopted —
-/// otherwise this verb would lint with a different frontend under the pinned
-/// one's name and print GREEN, which is the accident that put six `-D warnings`
-/// violations on main in the sibling `clean` repo.
+/// AND IT CHECKS THE PIN: a file called `targo` is not evidence of the fork
+/// `rust-toolchain.toml` names; the branded `trustc` beside it is. A candidate
+/// that fails is REFUSED, never adopted, so no verb runs a different frontend
+/// under the pinned one's name.
 pub(crate) fn trust_toolchain() -> aterm_verify::Toolchain {
     let root = workspace_root();
     let home = std::env::var_os("HOME").unwrap_or_default();
@@ -211,14 +268,10 @@ pub(crate) const RUSTUP_LOOKED: &str = "on PATH, in $CARGO_HOME/bin, in ~/.cargo
 /// THIS BOX'S `rustup`, by path — PATH first, then where rustup installs itself.
 ///
 /// rustup-init puts `rustup` in `$CARGO_HOME/bin` (`~/.cargo/bin` by default) and
-/// leaves PATH to the shell's rc files, and a machine provisioned the product's way
-/// (atpkg's store, which is why `rust-toolchain.toml` needs no rustup) has no reason
-/// to put that directory on PATH at all. The cross gates asked PATH alone until
-/// 2026-09-27. Measured on the owner's Mac that day, rustup in `~/.cargo/bin` and all
-/// four foreign stds installed in `stable`: `gate cells-foreign` printed five
-/// `SKIPPED(no-std)` rows, each telling the reader to `rustup target add` a std that
-/// was already there, and `tools/verify.sh` withheld the merge contract on every run
-/// — a skip whose named fix could not clear it.
+/// leaves PATH to the shell's rc files, and a machine provisioned through atpkg's
+/// store has no reason to put that directory on PATH. Asking PATH alone skipped
+/// cells whose stds were installed, with a fix (`rustup target add`) that could
+/// not clear the skip.
 pub(crate) fn find_rustup() -> Option<PathBuf> {
     find_rustup_in(
         std::env::var_os("PATH").as_deref(),
@@ -284,11 +337,9 @@ fn rustup_candidates(
 /// A neutral build cwd for a cross-compile, because cargo discovers config — and
 /// rustup its toolchain pin — by walking the cwd upward, and both of this repo's are
 /// Trust's: the pin names the Trust toolchain and `.cargo/config.toml` carries
-/// Trust-only `-Z` flags. The config's table is `cfg(trust_verify)`-scoped since
-/// 2026-08-30, so an upstream compiler no longer sees its flags; when it was a
-/// per-triple table, an in-repo `--target` build died at flag-parse on its first HOST
-/// unit with an error that named no crate of ours. `tools/wasm-bench/run.sh` uses the
-/// same trick. Kept: an upstream lane owes nothing to this repo's Trust settings.
+/// Trust-only `-Z` flags. The config's table is `cfg(trust_verify)`-scoped, so an
+/// upstream compiler no longer sees its flags, but an upstream lane still owes
+/// nothing to this repo's Trust settings. `tools/wasm-bench/run.sh` does the same.
 fn neutral_build_cwd(gate: &str) -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(format!("aterm-{gate}-{}", std::process::id()));
     match std::fs::create_dir_all(&dir) {
@@ -308,7 +359,7 @@ fn neutral_build_cwd(gate: &str) -> Option<std::path::PathBuf> {
 /// `wasm32-unknown-unknown` out of `wasm32-unknown-unknown-nightly`, and read
 /// `wasm32-wasip1` as a match for the plain triple, so a box with the WRONG wasm
 /// target would sail past the pre-flight and fail the build instead of skipping.
-fn toolchain_lists_target(listing: &str, target: &str) -> bool {
+pub(crate) fn toolchain_lists_target(listing: &str, target: &str) -> bool {
     listing.lines().any(|l| l.trim() == target)
 }
 
@@ -378,13 +429,8 @@ fn shim_refusal(triple: &str) -> Option<String> {
 /// script and call the result coverage. Every other cell keeps its overrides,
 /// and the row stays live — the box that needs it is some other box.
 fn host_shim_refusal(triple: &str, host: &str) -> Option<String> {
-    (triple == host).then(|| {
-        format!(
-            "`{triple}` is this machine's own triple, where the build script RUNS — a cell that \
-             can run a build script needs no override, and applying one there would suppress the \
-             real script and call the result coverage"
-        )
-    })
+    (triple == host)
+        .then(|| format!("`{triple}` is this machine's own triple, so its build script runs"))
 }
 
 /// Parse [`CELL_GATE_POLICY`]: `cshim <name>@<version> <triple> <links> <why>`,
@@ -447,8 +493,7 @@ fn parse_cell_policy(text: &str) -> Result<CellPolicy, String> {
 /// The package name inside a cargo `package_id`. `registry+…#serde@1.0.228` and
 /// `path+…/foo#bar@0.1.0` carry `name@version` after the `#`, but a path package
 /// whose directory IS its name abbreviates to `path+…/serde#1.0.228` — no name,
-/// just a version — so the name is then the last path segment. Reading the
-/// version as the name once scored 42 packages as never-checked.
+/// just a version — so the name is then the last path segment.
 fn package_id_name(id: &str) -> &str {
     let Some((url, frag)) = id.rsplit_once('#') else {
         // Cargo's older opaque form: `name version (source)`.
@@ -488,12 +533,11 @@ enum CellCompiler<'a> {
 ///
 /// THE HOST CELL goes through the pinned driver with NO `RUSTUP_TOOLCHAIN` and
 /// NO `--target`: an explicit target makes cargo withhold `.cargo/config.toml`'s
-/// `[target.'cfg(trust_verify)']` rustflags (`-Ztrust-verify=off`) from host
-/// units, which then verify strictly and fail. A CROSS CELL is the toolchain's
+/// `[target.'cfg(trust_verify)']` rustflags (`--cfg clean_islands`) from host
+/// units, which then lose the Trust-lane cfg. A CROSS CELL is the toolchain's
 /// own `cargo` with `--target <triple>`, run from a neutral cwd — a STOCK
-/// EXCEPTION, because the Trust sysroot carries only the host std (measured
-/// 2026-09-28: `targo --unverified check --target <wasm32|windows-gnu|
-/// *-linux-gnu|x86_64-apple-darwin>` stops at error[E0463], no `std`/`core`).
+/// EXCEPTION, because the Trust sysroot carries only the host std (`targo
+/// --unverified check --target <cross>` stops at error[E0463]).
 fn cell_check_command(compiler: CellCompiler<'_>, triple: &str) -> Command {
     match compiler {
         CellCompiler::Host(driver) => driver.command("check"),
@@ -507,9 +551,8 @@ fn cell_check_command(compiler: CellCompiler<'_>, triple: &str) -> Command {
 
 /// A rustup toolchain resolved to its OWN drivers, by path — never a `cargo`
 /// off PATH trusted to honour `RUSTUP_TOOLCHAIN`, which only rustup's proxies
-/// read (Homebrew's cargo ahead of `~/.cargo/bin` compiled three cells with no
-/// cross std, 2026-09-24). `RUSTC` pins the compiler for cargo and for every
-/// build script it runs.
+/// read (a Homebrew cargo ahead of `~/.cargo/bin` ignores it). `RUSTC` pins the
+/// compiler for cargo and for every build script it runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RustupToolchain {
     name: String,
@@ -609,9 +652,7 @@ fn cell_toolchain(triple: &str) -> Result<CellToolchain, String> {
 }
 
 /// What [`cell_toolchain`] found for a cross cell. `NoStd` and `NoRustup` are both
-/// skips — nothing is compiled — but they are different facts with different fixes,
-/// and one `Option` spelled them the same: a box with no rustup was told to
-/// `rustup target add` (see [`find_rustup`]).
+/// skips — nothing is compiled — but different facts with different fixes.
 #[derive(Debug)]
 enum CellToolchain {
     /// An installed toolchain carries the triple's std.
@@ -647,12 +688,10 @@ const SKIPPED_NO_STD: &str = "SKIPPED(no-std)";
 /// The STATUS word a cell wears when there is no rustup to ask for a toolchain.
 const SKIPPED_NO_RUSTUP: &str = "SKIPPED(no-rustup)";
 
-/// What one cell's run DECIDED. Three-valued, like [`LaneVerdict`]: a cell no
-/// compiler started for once carried `ok: true`, and five of them printed
-/// `GREEN — all 5 cells type-check` (2026-09-17). A skip is NOT a pass — and not
-/// a failure either: an uninstalled std is a fact about the box that no change
-/// to the tree can clear, so the run exits 0 and forfeits the matrix claim, as
-/// `aterm_verify::verdict` does for a skipped stage.
+/// What one cell's run DECIDED. Three-valued, like [`LaneVerdict`]: a skip is NOT a
+/// pass — and not a failure either: an uninstalled std is a fact about the box that
+/// no change to the tree can clear, so the run exits 0 and forfeits the matrix
+/// claim, as `aterm_verify::verdict` does for a skipped stage.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CellOutcome {
     /// A compiler read this cell's graph FOR THE CELL'S OWN TRIPLE, and every
@@ -677,9 +716,8 @@ struct CellReport {
     /// Build scripts replaced by a [`CBuildShim`] on this cell.
     shimmed: Vec<String>,
     /// IN-REPO packages of this cell's graph that a compiler read, over the
-    /// number it could read at all. THE NUMBER THIS GATE IS ABOUT: `linux
-    /// 206/253` once read GREEN with every line of aterm's own platform code
-    /// unread.
+    /// number it could read at all. THE NUMBER THIS GATE IS ABOUT: a package
+    /// count can read high with none of aterm's own platform code compiled.
     own_checked: usize,
     own_total: usize,
     /// In-repo packages that CANNOT produce an artifact for a cross triple
@@ -697,10 +735,8 @@ struct CellReport {
     /// What the cell's target dir holds once its compile is done
     /// (`aterm_verify::disk::dir_bytes`), or `None` where nothing was
     /// compiled. With `secs`, the cell's COST, printed on every run: the
-    /// foreign cells run in every merge-contract run, and their target dirs
-    /// are the most that run writes outside the snapshot's own target lanes
-    /// (2.6 GiB cold, 2026-09-27), so a reader of the log sees what the gate
-    /// cost without measuring it by hand.
+    /// foreign cells' target dirs are the most a merge-contract run writes
+    /// outside the snapshot's own target lanes.
     disk: Option<u64>,
     status: String,
     outcome: CellOutcome,
@@ -708,10 +744,7 @@ struct CellReport {
 
 impl CellReport {
     /// The row for a cell NOTHING WAS COMPILED FOR, built in one place so the
-    /// STATUS word and the [`CellOutcome`] cannot be set apart from each other.
-    /// They were separate assignments forty lines apart, and they disagreed:
-    /// `SKIPPED(no-std)` beside `ok: true`. A constructor is the repair, not a
-    /// comment — the two facts now leave the same expression or neither does.
+    /// STATUS word and the [`CellOutcome`] cannot disagree.
     fn skipped(
         cell: &aterm_forge::model::Cell,
         graph: usize,
@@ -765,6 +798,7 @@ fn artifact_is_for(triple: Option<&str>, filenames: &[String]) -> bool {
 fn path_is_inside(dir: &Path, root: &Path) -> bool {
     match (dir.canonicalize(), root.canonicalize()) {
         (Ok(d), Ok(r)) => d.starts_with(r),
+        // Not created yet: compare the paths as written.
         _ => dir.starts_with(root),
     }
 }
@@ -773,8 +807,7 @@ fn path_is_inside(dir: &Path, root: &Path) -> bool {
 ///
 /// A proc macro is compiled for the HOST even in a cross build, so it can never
 /// produce an artifact for the cell's triple and is not owed one. Read from the
-/// manifest rather than from a hard-coded list: the three proc macros in this
-/// workspace today are not a fact anybody should have to maintain in two places.
+/// manifest, so no list of proc macros has to be maintained.
 fn manifest_is_proc_macro(dir: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
         return false;
@@ -808,8 +841,7 @@ fn manifest_is_proc_macro(dir: &Path) -> bool {
 /// `--exclude` takes.
 ///
 /// `program` is the driver that was actually spawned (the `$ …` line just
-/// above names it), so a refusal never blames a `cargo` that did not run —
-/// on a Trust-only box the program is the store's `targo` (2026-09-18).
+/// above names it), so a refusal never blames a `cargo` that did not run.
 fn parse_member_names(
     program: &str,
     json: &str,
@@ -837,49 +869,17 @@ fn parse_member_names(
 /// Split the workspace's members into the ones this cell's graph carries and the
 /// ones it does not.
 ///
-/// `--workspace --exclude …`, NOT a list of `-p` flags, and that was not a
-/// stylistic choice. Cargo re-resolves for a partial `-p` selection, and until
-/// 2026-09-25 this workspace could not be resolved for one that held both
-/// `aterm-alloc` and `aterm-gpu`: the differential oracle pins `arrayvec =
-/// "=0.7.7"` as a dev-dep while `[patch.crates-io]` points every other consumer
-/// at the first-party 0.7.8, and the two could not coexist in one partial
-/// resolve — measured, `error: failed to select a version for arrayvec … all
-/// possible versions conflict with previously selected packages`. The cause is
-/// cargo's patch alias (a patch first reached through a crates-io edge also
-/// claims crates-io's semver slot, where the oracle already sits), and the fix
-/// is `aterm-alloc`'s dev-dependency on the shim, which activates it through its
-/// own source first — `crates/aterm-alloc/Cargo.toml` has the whole account.
-/// Both forms below now resolve; the `--exclude` form and the patched-member
-/// rule stay, because they are right on their own terms.
+/// `--workspace --exclude …`, not a list of `-p` flags: cargo re-resolves for a
+/// partial `-p` selection, and a partial resolve can fail where the workspace's
+/// does (a dev-dep pinning an upstream version beside a `[patch.crates-io]`
+/// first-party one: `failed to select a version for arrayvec`).
 ///
-/// AND `--exclude` DOES TOUCH WHAT WAS RESOLVED, which this comment used to
-/// deny. Excluding a workspace member that a `[patch.crates-io]` entry POINTS AT
-/// takes it out of the roots, so the first edge to reach it is a crates-io one —
-/// which reproduced the identical arrayvec conflict the `-p` form was avoided
-/// for (the same mechanism; it no longer fires for `arrayvec` since the shim
-/// edge above). Measured 2026-09-18 on m17-tower, with the `mac-x64` cell's own
-/// exclude list:
-///
-/// ```text
-/// $ cargo +stable check --target x86_64-apple-darwin --all-targets --workspace \
-///       --exclude arrayvec …
-/// error: failed to select a version for `arrayvec`.
-///     ... required by package `wgpu v29.0.3`
-///   previously selected package `arrayvec v0.7.7`
-///     ... which satisfies dependency `arrayvec_upstream = "=0.7.7"` … of package `aterm-alloc`
-/// ```
-///
-/// The same command with `arrayvec` LEFT IN resolved and compiled. It was the
-/// Apple cells that tripped it, because `wgpu` is in no Darwin graph while
-/// `aterm-bench` still drags it into the WORKSPACE resolve — so the patched
-/// crate is outside the cell's graph, gets excluded, and the patch goes with it.
-/// `mac-x64` was the first cell to meet it: `mac-arm` is native on the boxes
-/// that run it, and a native cell is exempt from this pass.
-///
-/// So the third input: a member a patch POINTS AT is never excluded. It is then
-/// compiled for the cell's triple as well, which costs one small crate and is
-/// owed nothing — `selected` (and therefore the pass's `owed` list) is still
-/// exactly the members this cell's graph carries.
+/// `--exclude` has the same hazard: excluding a member a `[patch.crates-io]`
+/// entry POINTS AT takes it out of the roots, so the first edge to reach it is a
+/// crates-io one, and the patch goes with it. So a patched member is never
+/// excluded. It is then compiled for the cell's triple too, owed nothing —
+/// `selected` (and so the pass's `owed` list) is still exactly the members this
+/// cell's graph carries.
 fn cell_test_selection(
     members: &std::collections::BTreeSet<String>,
     graph: &std::collections::BTreeSet<String>,
@@ -944,11 +944,10 @@ fn patched_crate_names(root: &Path) -> Result<std::collections::BTreeSet<String>
 ///   * THE wasm32 CELLS. `cargo test --target wasm32-unknown-unknown` is not an
 ///     operation this repo performs — the web renderers run inside Electron —
 ///     and pulling the test targets in drags every member's DEV-dependencies
-///     with them: `criterion` (Rayon: "cannot be used when targeting wasi32"),
-///     `getrandom` ("the wasm32-unknown-unknown targets are not supported by
-///     default"), `wait-timeout` and `zstd-sys` all fail to build for wasm32 in
-///     their own code. Measured 2026-09-16. Owing a pass that upstream crates
-///     make impossible would teach the next reader to delete the pass.
+///     with them: `getrandom` ("the wasm32-unknown-unknown targets are not
+///     supported by default") and `zstd-sys` fail to build for wasm32 in their
+///     own code. Owing a pass that upstream crates make impossible would teach
+///     the next reader to delete the pass.
 fn test_pass_exemption(triple: &str, is_host: bool) -> Option<String> {
     if is_host {
         return Some(format!(
@@ -959,8 +958,8 @@ fn test_pass_exemption(triple: &str, is_host: bool) -> Option<String> {
     if triple.starts_with("wasm32") {
         return Some(format!(
             "`cargo test --target {triple}` is not an operation this repo performs, and the test \
-             targets drag in dev-dependencies (criterion/Rayon, getrandom, wait-timeout, zstd-sys) \
-             that do not build for wasm32 in their own code"
+             targets drag in dev-dependencies (getrandom, zstd-sys) that do not build for wasm32 \
+             in their own code"
         ));
     }
     None
@@ -1000,19 +999,95 @@ struct TestPassJob<'a> {
     proc_macros: &'a std::collections::BTreeSet<String>,
 }
 
+/// Read cargo's `--message-format=json` stream: the graph packages that left an
+/// artifact for `filter`'s triple (only TEST-target units when `tests_only`:
+/// `profile.test` is what separates a test unit from the lib unit the library
+/// pass already counted, so a crate whose tests failed to compile is not
+/// "checked" on the strength of its library), and every error-level
+/// diagnostic as `(package, rendered)`.
+fn read_cargo_json(
+    stdout: &str,
+    filter: Option<&str>,
+    graph_names: &std::collections::BTreeSet<String>,
+    tests_only: bool,
+) -> (std::collections::BTreeSet<String>, Vec<(String, String)>) {
+    let mut checked = std::collections::BTreeSet::new();
+    let mut errors = Vec::new();
+    for line in stdout.lines() {
+        let Ok(value) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let reason = value.get("reason").and_then(aterm_json::Value::as_str);
+        let pkg = value
+            .get("package_id")
+            .and_then(aterm_json::Value::as_str)
+            .map(package_id_name)
+            .unwrap_or("<unknown>")
+            .to_string();
+        match reason {
+            Some("compiler-artifact") => {
+                let is_test = value
+                    .get("profile")
+                    .and_then(|p| p.get("test"))
+                    .and_then(aterm_json::Value::as_bool)
+                    .unwrap_or(false);
+                let files: Vec<String> = value
+                    .get("filenames")
+                    .and_then(aterm_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(aterm_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if (is_test || !tests_only)
+                    && artifact_is_for(filter, &files)
+                    && graph_names.contains(&pkg)
+                {
+                    checked.insert(pkg);
+                }
+            }
+            Some("compiler-message") => {
+                let msg = value.get("message");
+                let level = msg
+                    .and_then(|m| m.get("level"))
+                    .and_then(aterm_json::Value::as_str);
+                if level == Some("error") {
+                    let rendered = msg
+                        .and_then(|m| m.get("rendered"))
+                        .and_then(aterm_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    errors.push((pkg, rendered));
+                }
+            }
+            _ => {}
+        }
+    }
+    (checked, errors)
+}
+
+/// The `error` lines cargo printed itself, outside the JSON stream. COLUMN ZERO
+/// IS THE TEST: a failing build script's output is re-emitted INDENTED under
+/// `Caused by:`, and `error: could not compile` is cargo's summary of
+/// diagnostics the JSON already carried.
+fn cargo_level_errors(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|l| l.starts_with("error") && !l.starts_with("error: could not compile"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Type-check EVERY TARGET — lib, bins, tests, benches, examples — of every
 /// workspace member in this cell's graph, for the cell's own triple.
 ///
-/// THE HOLE THIS CLOSES, measured rather than argued. The pass above checks
-/// `-p <cell root package>` without `--all-targets`, so no compiler any cell
-/// ran had ever read a `#[cfg(test)]` line for a triple that is not the box's
-/// own. Three defects landed in that gap in four days, each found by hand and
-/// each invisible to every gate in the tree: `atpkg`'s unit-test binary did not
-/// BUILD off macOS (commit 693f1c331), `aterm-gui`'s did not build for Windows
-/// (b2c2bb53d), and `aterm-verify`'s — the merge gate's own crate, which ships
-/// inside `aterm-cli` — did not either. A `#[cfg(test)]` module is one
-/// compilation unit with the crate, so ONE unix-only name in a fixture costs
-/// the whole crate's test binary on every other target, not one test.
+/// The library pass checks `-p <cell root package>` without `--all-targets`, so
+/// without this no compiler reads a `#[cfg(test)]` line for a triple that is
+/// not the box's own. A `#[cfg(test)]` module is one compilation unit with the
+/// crate, so ONE unix-only name in a fixture costs the whole crate's test
+/// binary on every other target.
 fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
     let TestPassJob {
         root,
@@ -1044,8 +1119,8 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
     }
     let started = std::time::Instant::now();
     // The same cwd rule as the library pass: the host cell IN-TREE, so
-    // `.cargo/config.toml`'s opt-out reaches every unit; a cross cell from a
-    // neutral cwd, so that Trust-only table never reaches a stable compiler.
+    // `.cargo/config.toml`'s Trust-lane table reaches every unit; a cross cell
+    // from a neutral cwd, so that Trust-only table never reaches a stable compiler.
     let neutral = if is_host {
         None
     } else {
@@ -1086,70 +1161,8 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
     } else {
         Some(cell.triple.as_str())
     };
-    let mut checked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut errors: Vec<(String, String)> = Vec::new();
-    for line in stdout.lines() {
-        let Ok(value) = aterm_json::from_str::<aterm_json::Value>(line) else {
-            continue;
-        };
-        let reason = value.get("reason").and_then(aterm_json::Value::as_str);
-        let pkg = value
-            .get("package_id")
-            .and_then(aterm_json::Value::as_str)
-            .map(package_id_name)
-            .unwrap_or("<unknown>")
-            .to_string();
-        match reason {
-            Some("compiler-artifact") => {
-                // `profile.test` is what separates a TEST target's unit from
-                // the lib unit the first pass already counted. Without it a
-                // crate whose tests failed to compile would still be "checked"
-                // here on the strength of its library, and this pass would
-                // measure exactly what the pass above it measures.
-                let is_test = value
-                    .get("profile")
-                    .and_then(|p| p.get("test"))
-                    .and_then(aterm_json::Value::as_bool)
-                    .unwrap_or(false);
-                let files: Vec<String> = value
-                    .get("filenames")
-                    .and_then(aterm_json::Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(aterm_json::Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if is_test && artifact_is_for(filter, &files) && graph_names.contains(&pkg) {
-                    checked.insert(pkg);
-                }
-            }
-            Some("compiler-message") => {
-                let msg = value.get("message");
-                let level = msg
-                    .and_then(|m| m.get("level"))
-                    .and_then(aterm_json::Value::as_str);
-                if level == Some("error") {
-                    let rendered = msg
-                        .and_then(|m| m.get("rendered"))
-                        .and_then(aterm_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    errors.push((pkg, rendered));
-                }
-            }
-            _ => {}
-        }
-    }
-    // Same column-zero rule as the pass above: a failing build script re-emits
-    // its own output INDENTED under `Caused by:`, and `error: could not compile`
-    // is cargo's summary of diagnostics already counted through the JSON stream.
-    let cargo_errors: Vec<String> = stderr
-        .lines()
-        .filter(|l| l.starts_with("error") && !l.starts_with("error: could not compile"))
-        .map(str::to_string)
-        .collect();
+    let (checked, errors) = read_cargo_json(&stdout, filter, graph_names, true);
+    let cargo_errors = cargo_level_errors(&stderr);
 
     let owed: Vec<String> = selected
         .into_iter()
@@ -1200,20 +1213,15 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 /// --full`), covered day to day by the native lanes of the boxes that host them.
 /// It needs rustup's `stable` with the foreign std targets; without them this
 /// exits 0 naming the missing std, and the verify stage is a SKIP. Measured cost
-/// (2026-09-27, M5 Max under load, `CARGO_INCREMENTAL=0`): 432 s and 2.6 GiB
-/// cold, 8 s warm, 278 s after a core edit.
+/// (M5 Max under load, `CARGO_INCREMENTAL=0`): 432 s and 2.6 GiB cold, 8 s warm,
+/// 278 s after a core edit.
 fn gate_cells_foreign() -> bool {
     let cells = foreign_cells();
-    // FAIL-CLOSED, and this is not a theoretical arm: `gate_cells` reads an
-    // EMPTY selection as THE WHOLE MATRIX, so a [`FLEET_HOST_TRIPLES`] grown to
-    // cover every cell would turn this gate into the whole-matrix run it was
-    // split out of, on every tier, silently.
+    // FAIL-CLOSED: `gate_cells` reads an EMPTY selection as THE WHOLE MATRIX.
     if cells.is_empty() {
         eprintln!(
-            "gate cells-foreign: FAILED — FLEET_HOST_TRIPLES now names every cell's triple, so \
-             this gate has no cell left to compile. It refuses rather than calling `gate cells` \
-             with an empty selection: no `--cell` means THE WHOLE MATRIX, and a subset that \
-             silently becomes the matrix is the opposite of the decision this gate records."
+            "gate cells-foreign: FAILED — FLEET_HOST_TRIPLES names every cell's triple; no \
+             foreign cell left (an empty selection would mean the whole matrix)"
         );
         return false;
     }
@@ -1247,9 +1255,8 @@ fn gate_cells_foreign() -> bool {
 /// file is read-only here.
 ///
 /// A cell OWES, and is red without: every in-repo non-proc-macro crate in its
-/// graph read by the compiler for its triple (a package count once read GREEN
-/// at `linux 206/253` with none of aterm's own crates compiled); every shimmed
-/// package type-checked (a mis-keyed `links` is silently ignored by cargo); no
+/// graph read by the compiler for its triple; every shimmed package
+/// type-checked (a mis-keyed `links` is silently ignored by cargo); no
 /// cargo error at all (a C build script this box cannot run is shimmed by a
 /// `cshim` row or it fails the cell); and, off the host and wasm32, a second
 /// pass compiling every target — tests, benches, examples — of every workspace
@@ -1372,11 +1379,8 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         }
     };
     let narrowed = !wanted.is_empty();
-    // INTENT, IN THE PRESENT TENSE. This banner is printed before a compiler
-    // has been asked for anything, and it used to read "N of forge's M cells
-    // type-checked for their own triples" — the past tense, at the top of a run
-    // that could still skip every one of them, and the only other place in this
-    // file that spelled [`MATRIX_CLAIM`].
+    // Present tense: printed before any compiler runs, and must not spell
+    // [`MATRIX_CLAIM`].
     eprintln!(
         "=== gate cells (type-checking {} of forge's {} cells, each for its own triple) ===",
         selected.len(),
@@ -1423,13 +1427,9 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         let graph_names: std::collections::BTreeSet<String> =
             graph.nodes.iter().map(|p| p.name.clone()).collect();
 
-        // 1b. THE CELL'S OWN CODE. `checked/graph` counts PACKAGES, and a
-        //     package count is the number a reader will quote while the thing
-        //     they care about — whether a compiler read aterm's platform code
-        //     for this triple — is invisible inside it. The Linux cell sat at
-        //     206/253 with all eighteen of aterm's own compiled crates
-        //     UNREACHED, and its verdict line said GREEN. So the in-repo half of
-        //     the graph is counted separately and OWED, not merely reported.
+        // 1b. THE CELL'S OWN CODE. `checked/graph` counts PACKAGES, which can
+        //     read high with none of aterm's own crates compiled, so the in-repo
+        //     half of the graph is counted separately and OWED.
         let own: std::collections::BTreeSet<String> = graph
             .nodes
             .iter()
@@ -1476,8 +1476,8 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                     .collect();
                 eprintln!(
                     "gate cells: FAILED — {CELL_GATE_POLICY} shims `{}@{}` on {}, and this cell's \
-                     graph carries {}. A shim is a claim about ONE build script AT ONE VERSION; \
-                     re-read the new one and move the row, or delete it.",
+                     graph carries {}. Re-read that version's build script and move the row, or \
+                     delete it.",
                     shim.package,
                     shim.version,
                     cell.triple,
@@ -1489,25 +1489,16 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                 );
                 continue;
             }
-            // LIVE, therefore not a dead row — and that verdict is taken
-            // BEFORE the host question below, on purpose. A row naming this
-            // box's own triple is a row some OTHER box needs; marking it unused
-            // here would make the end-of-run liveness audit say "delete the
-            // row", and deleting it would put the cross cell that depends on it
-            // back behind an uninstallable C toolchain. Satisfied-by-host, not
-            // dead.
+            // LIVE, so not a dead row — decided BEFORE the host question: a row
+            // naming this box's own triple is one some OTHER box needs, and the
+            // end-of-run audit must not ask for its deletion.
             cshim_row_used[i] = true;
-            // AND NOW THE HOST QUESTION, asked of this cell rather than of the
-            // file. Applying an override on the native cell is the failure a
-            // judge caught (`SHIMMED … GREEN` with the real build script never
-            // run), so the row is declined here — loudly, in the same place the
-            // applied ones are announced — and the cell compiles with the real
-            // script, which on this box is a script that RUNS.
+            // The native cell declines its overrides and compiles with the real
+            // build script, which runs here ([`host_shim_refusal`]).
             if let Some(why) = host_shim_refusal(&cell.triple, &host) {
                 shim_notes.push(format!(
-                    "gate cells: cell `{}` — `{}@{}`'s `cshim` row NOT APPLIED: {why}. The row \
-                     stays in {CELL_GATE_POLICY} for the boxes where this triple is a CROSS cell; \
-                     here the build script runs for real.",
+                    "gate cells: cell `{}` — `{}@{}` not shimmed: {why}; keep the row for boxes where \
+                     it is a cross cell.",
                     cell.name, shim.package, shim.version
                 ));
                 continue;
@@ -1520,12 +1511,8 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                 cell.triple, shim.links, shim.links
             ));
             shimmed.push(shim.package.clone());
-            // PRINTED where the override is really applied — just before cargo
-            // runs — and not here. A cell can still SKIP between this point and
-            // that one (no installed std for its triple), and "SHIMMED …"
-            // followed by "nothing was compiled" reads as though the shim bought
-            // something on a box where it bought nothing. The row's reason lives
-            // in the policy file, not in every run's log.
+            // Printed just before cargo runs, not here: the cell can still SKIP
+            // in between, and a shim note above "nothing was compiled" misleads.
             shim_notes.push(format!(
                 "gate cells: cell `{}` — `{}@{}`'s build script SHIMMED (`--config \
                  target.{}.{}`; why: {CELL_GATE_POLICY})",
@@ -1547,23 +1534,17 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                 Ok(CellToolchain::Found(tc)) => Ok(tc),
                 Ok(CellToolchain::NoStd) => {
                     eprintln!(
-                        "gate cells: cell `{}` SKIPPED — no installed toolchain carries a {} std, \
-                         so NOTHING WAS COMPILED for it.\n\
-                         gate cells:   install one:  rustup target add {} --toolchain stable\n\
-                         gate cells:   (`--toolchain` is not optional — this repo's default is the \
-                         Trust fork, which refuses `rustup target add`.)",
-                        cell.name, cell.triple, cell.triple
+                        "gate cells: cell `{}` SKIPPED — no rustup toolchain here has the {} \
+                         std; nothing was compiled for it.",
+                        cell.name, cell.triple
                     );
                     Err(SkipCause::NoStd)
                 }
                 Ok(CellToolchain::NoRustup) => {
                     eprintln!(
-                        "gate cells: cell `{}` SKIPPED — no rustup on this box (looked \
-                         {RUSTUP_LOOKED}), so no toolchain could be asked for a {} std and \
-                         NOTHING WAS COMPILED for it.\n\
-                         gate cells:   install rustup (https://rustup.rs), then:  rustup target \
-                         add {} --toolchain stable",
-                        cell.name, cell.triple, cell.triple
+                        "gate cells: cell `{}` SKIPPED — no rustup on this machine; nothing was \
+                         compiled for it.",
+                        cell.name
                     );
                     Err(SkipCause::NoRustup)
                 }
@@ -1665,59 +1646,12 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         } else {
             Some(cell.triple.as_str())
         };
-        let mut checked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut compile_errors: Vec<(String, String)> = Vec::new();
-        for line in stdout.lines() {
-            let Ok(value) = aterm_json::from_str::<aterm_json::Value>(line) else {
-                continue;
-            };
-            let reason = value.get("reason").and_then(aterm_json::Value::as_str);
-            let pkg = value
-                .get("package_id")
-                .and_then(aterm_json::Value::as_str)
-                .map(package_id_name)
-                .unwrap_or("<unknown>")
-                .to_string();
-            match reason {
-                Some("compiler-artifact") => {
-                    let files: Vec<String> = value
-                        .get("filenames")
-                        .and_then(aterm_json::Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(aterm_json::Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if artifact_is_for(filter, &files) && graph_names.contains(&pkg) {
-                        checked.insert(pkg);
-                    }
-                }
-                Some("compiler-message") => {
-                    let msg = value.get("message");
-                    let level = msg
-                        .and_then(|m| m.get("level"))
-                        .and_then(aterm_json::Value::as_str);
-                    if level == Some("error") {
-                        let rendered = msg
-                            .and_then(|m| m.get("rendered"))
-                            .and_then(aterm_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        compile_errors.push((pkg, rendered));
-                    }
-                }
-                _ => {}
-            }
-        }
+        let (checked, compile_errors) = read_cargo_json(&stdout, filter, &graph_names, false);
 
         let mut cell_ok = true;
-        // THE FIRST reason a cell went red is the one the summary table names.
-        // A type error also drops the coverage count (the crate that failed was
-        // not checked, nor was anything above it), so an unguarded assignment
-        // let COVERAGE-DROP overwrite TYPE-ERROR and the one-line summary
-        // reported the symptom instead of the cause.
+        // THE FIRST reason a cell went red is the one the summary table names:
+        // a type error also drops the coverage count, and the table must name
+        // the cause, not the symptom.
         let mut status = String::from("GREEN");
 
         if !compile_errors.is_empty() {
@@ -1737,17 +1671,13 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
 
         // 5. ANY OTHER `error:` cargo printed — a build script this box cannot
         //    run, a rejected flag, a broken manifest — fails the cell with its
-        //    own line. COLUMN ZERO IS THE TEST: a failing build script's output
-        //    is re-emitted INDENTED under `Caused by:`, and `error: could not
-        //    compile` is cargo's summary of diagnostics the JSON already carried.
-        for line in stderr.lines() {
-            if line.starts_with("error") && !line.starts_with("error: could not compile") {
-                cell_ok = false;
-                if status == "GREEN" {
-                    status = "CARGO-ERROR".to_string();
-                }
-                eprintln!("gate cells: cell `{}` FAILED — {line}", cell.name);
+        //    own line ([`cargo_level_errors`]).
+        for line in cargo_level_errors(&stderr) {
+            cell_ok = false;
+            if status == "GREEN" {
+                status = "CARGO-ERROR".to_string();
             }
+            eprintln!("gate cells: cell `{}` FAILED — {line}", cell.name);
         }
 
         // 6. DID THE SHIM ACTUALLY BUY ANYTHING? It fires when the override is
@@ -1783,8 +1713,7 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             }
             eprintln!(
                 "gate cells: cell `{}` FAILED — {} of aterm's own {} compiled crates in this \
-                 cell's graph were NOT type-checked for {}: {}. A cell that has not read this \
-                 repo's code for its own triple has not verified the thing the matrix claims.",
+                 cell's graph were NOT type-checked for {}: {}.",
                 cell.name,
                 own_missing.len(),
                 own_owed.len(),
@@ -1868,9 +1797,8 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                             cell.name
                         );
                     }
-                    // OWED, exactly like 6c and for the same reason: a pass that
-                    // quietly stopped selecting a member would otherwise report
-                    // a smaller number and stay green.
+                    // OWED, like step 7: a pass that quietly stopped selecting a
+                    // member would otherwise report a smaller number and stay green.
                     let missing: Vec<&String> = pass
                         .owed
                         .iter()
@@ -1897,15 +1825,9 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                                 .join(", ")
                         );
                     }
-                    // THE COVERAGE LINE IS ONLY SAID WHEN IT IS TRUE. A member
-                    // counts as reached the moment ONE of its test targets
-                    // produced an artifact, which is the right question for
-                    // vacuity (did the selection shrink?) and the WRONG one for
-                    // health: `aterm-verify` reached it on `profile_pin` and
-                    // `process_doc` while `environment_contract` and the lib
-                    // test were failing to compile beside them. So a run with
-                    // errors above says what it found, never a fraction that
-                    // reads as clean.
+                    // A member counts as reached once ONE of its test targets
+                    // produced an artifact — right for vacuity, wrong for health
+                    // — so a run with errors never prints a clean-reading line.
                     if pass.errors.is_empty() && pass.cargo_errors.is_empty() {
                         eprintln!(
                             "gate cells: cell `{}` — test targets: every target (lib, bins, tests, \
@@ -2003,8 +1925,7 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                 fail = true;
                 eprintln!(
                     "gate cells: FAILED — {CELL_GATE_POLICY} shims `{}@{}` on {}, and no cell with \
-                     that triple carries it. Delete the row: an override nobody uses is an \
-                     override nobody re-reads.",
+                     that triple carries it. Delete the row.",
                     shim.package, shim.version, shim.triple
                 );
             }
@@ -2012,16 +1933,16 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
     }
 
     eprintln!();
-    // OWN-CODE is the column this gate is about: in-repo packages a compiler
-    // read for the cell's triple, over the number it owed. PM is the in-repo
-    // proc macros, which compile for the HOST on every cell and are therefore
-    // outside that obligation rather than silently inside it.
-    // TESTS is the second column this gate is now about: workspace members whose
-    // TEST targets a compiler read for the cell's triple. `-` means the cell is
-    // exempt (the host cell, whose `cargo test` already does it; the wasm32
-    // cells, which nothing tests) — never "0 of 0 and green".
-    // SECS and DISK are the cell's COST (`CellReport::disk`), summed on the
-    // line under the table.
+    // OWN-CODE is the column this gate is about: in-repo packages a compiler read
+    // for the cell's triple, over the number it owed. PM is the in-repo proc
+    // macros, which compile for the HOST on every cell and are therefore outside
+    // that obligation rather than silently inside it.
+    // TESTS: workspace members whose TEST targets a compiler read for the cell's
+    // triple. `-` means the cell is exempt (the host cell, whose `cargo test`
+    // already does it; the wasm32 cells, which nothing tests) — never "0 of 0 and
+    // green".
+    // SECS and DISK are the cell's COST (`CellReport::disk`), summed on the line
+    // under the table.
     eprintln!(
         "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>7} {:>5} {:>9}  STATUS",
         "CELL",
@@ -2069,14 +1990,11 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
     verdict.ok
 }
 
-/// THE GATE'S COST, the line under the table: the seconds and the target-dir
-/// bytes of the cells this run compiled. `gate cells-foreign` is a stage of
-/// every merge-contract run since 2026-09-25, and a review on 2026-09-27
-/// measured it by hand because nothing printed what it cost (12 GiB and 242 s
-/// cold into a per-checkout cache, before the snapshot's run moved it into a
-/// cells lane its disk preflight counts). The bytes are what the target dirs
-/// HOLD after the run, not what it added: a warm run's dirs hold a cold run's
-/// artifacts too, and holding is what the disk preflight budgets.
+/// THE GATE'S COST, the line under the table: the seconds and the target-dir bytes
+/// of the cells this run compiled (`gate cells-foreign` is a stage of every
+/// merge-contract run). The bytes are what the target dirs HOLD after the run, not
+/// what it added: a warm run's dirs hold a cold run's artifacts too, and holding is
+/// what the disk preflight budgets.
 fn cells_cost_line(reports: &[CellReport]) -> String {
     let compiled: Vec<&CellReport> = reports.iter().filter(|r| r.disk.is_some()).collect();
     let secs: u64 = compiled.iter().map(|r| r.secs).sum();
@@ -2108,11 +2026,8 @@ struct CellsVerdict {
 
 /// Turn the per-cell rows into the sentence a reader quotes.
 ///
-/// A FUNCTION, and tested, because the sentence was wrong and nothing could see
-/// it: five `SKIPPED(no-std)` rows, no compiler started, and
-/// `GREEN — all 5 cells type-check` underneath them (measured 2026-09-17, see
-/// [`CellOutcome`]). The rows are the only input, so the tests can build the
-/// state a box without a cross std produces without owning that box.
+/// The rows are the only input, so the tests can build the state a box
+/// without a cross std produces without owning that box.
 fn cells_verdict(
     reports: &[CellReport],
     forge_cells: usize,
@@ -2133,11 +2048,8 @@ fn cells_verdict(
         .filter(|r| matches!(r.outcome, CellOutcome::Skipped(_)))
         .collect();
 
-    // SAY WHICH GREEN, AND SAY HOW MUCH. The sentence a reader quotes has to be
-    // true of the run that printed it. "All five cells type-check" was quotable
-    // and wrong for as long as eighteen of aterm's own crates went unread on
-    // two of them, so the coverage the sentence is really about — the in-repo
-    // half — is IN the sentence now, not in a table above it.
+    // SAY WHICH GREEN, AND HOW MUCH: the in-repo coverage is in the sentence a
+    // reader quotes, not only in the table above it.
     let own_checked: usize = reports.iter().map(|r| r.own_checked).sum();
     let own_total: usize = reports.iter().map(|r| r.own_total).sum();
     let unread = own_total - own_checked;
@@ -2149,17 +2061,13 @@ fn cells_verdict(
     } else {
         format!("{own_checked} of {own_total} in-repo crate-instances read; {unread} NOT")
     };
-    // AND SAY WHAT THE TEST-TARGET PASS REACHED, in the same sentence, because
-    // "the cells type-check" was quotable and true while not one `#[cfg(test)]`
-    // line had been compiled for a triple that is not this box's.
+    // And what the test-target pass reached, in the same sentence.
     let tests_checked: usize = reports.iter().map(|r| r.tests_checked).sum();
     let tests_owed: usize = reports.iter().map(|r| r.tests_owed).sum();
     // EXEMPT MEANS "RAN, AND WAS NOT OWED A TEST PASS" — the host cell, whose
     // `cargo test` already compiled them, and the wasm32 cells, which nothing
     // tests. A SKIPPED cell carries the same `tests_note` field and is not
-    // exempt from anything; counting it here printed
-    // `(5 not owed a test pass: mac-arm, linux, win, wasm-cpu, wasm-gpu)` about
-    // a run that owed all five and ran none.
+    // exempt from anything.
     let exempt: Vec<&str> = reports
         .iter()
         .filter(|r| r.outcome == CellOutcome::Checked && r.tests_note.is_some())
@@ -2194,7 +2102,7 @@ fn cells_verdict(
             .join(", ");
         let ran = reports.len() - skipped.len();
         // THE CAUSE AND ITS FIX, NAMED TOGETHER, with the triples filled in (the
-        // per-cell lines above name the same `--toolchain stable`). With no rustup
+        // per-cell lines above name only the cause; the fix is said once, here). With no rustup
         // at all, "no installed std … `rustup target add`" sends the reader to a
         // fix that cannot clear it.
         let install = skipped
@@ -2225,10 +2133,9 @@ fn cells_verdict(
         return CellsVerdict {
             text: format!(
                 "{} — {} of the {} cell(s) this run selected {had}, so NO COMPILER READ THEM: \
-                 {names}. {ran} cell(s) were checked: {coverage}. This run does NOT make the \
-                 matrix claim about forge's {forge_cells} cells.\n\
-                 gate cells: {fix}, then run again. Exits 0; `tools/verify.sh` counts it a SKIP \
-                 and withholds `{}`.{scope}",
+                 {names}. {ran} checked: {coverage}.\n\
+                 gate cells: {fix}, then run again. `tools/verify.sh --full` withholds `{}` \
+                 until then.{scope}",
                 aterm_verify::stages::CELLS_NOT_PROVEN,
                 skipped.len(),
                 reports.len(),
@@ -2238,9 +2145,7 @@ fn cells_verdict(
         };
     }
     // NARROWED, or short of forge's list for any other reason: the second test
-    // is not redundant. `--cell` is today's only narrowing, and a claim that
-    // depends on remembering to add a clause for tomorrow's is the defect one
-    // paragraph up, in a different shape.
+    // covers any future narrowing besides `--cell`.
     if narrowed || reports.len() != forge_cells {
         return CellsVerdict {
             text: format!(
@@ -2312,49 +2217,24 @@ fn cell_cache_root_from(
 
 /// Where a cell's build artifacts go: OUTSIDE the repo, and on a DISK.
 ///
-/// Never `<repo>/target`: a verification gate that writes into the tree it is
-/// judging can invalidate the very build a developer is mid-way through, and the
-/// brief for this verb makes it a hard rule. `$ATERM_CELL_TARGET_DIR` overrides
-/// for a caller who wants the cache somewhere specific, and is REFUSED if it
-/// points inside the workspace rather than quietly honoured.
+/// Never `<repo>/target`: a gate that writes into the tree it judges can
+/// invalidate a developer's build mid-way. `$ATERM_CELL_TARGET_DIR` overrides,
+/// used as given, and is REFUSED if it points inside the workspace.
 ///
-/// THE SECOND HAZARD, which this function used to walk straight into while
-/// guarding against the first. The default was [`std::env::temp_dir`], and on
-/// every mainstream Linux that is `/tmp` — which systemd mounts as a tmpfs,
-/// i.e. RAM. These cells leave GIGABYTES behind by design (5.0 GB for the three
-/// foreign ones alone, and the doc on [`gate_cells_foreign`] measured it), so
-/// the default turned a verification gate into a memory leak: on m17-tower a
-/// `/tmp/aterm-cells` reached 13.6 GB and took the box's swap with it, and the
-/// only warning was a doc line telling the reader to point the override at a
-/// disk themselves. A gate does not get to hand its own hazard to its caller.
-/// The default is now the user's CACHE directory, which is disk-backed on every
-/// platform we ship and is where a rebuildable multi-gigabyte artifact cache
-/// belongs: `$XDG_CACHE_HOME/aterm/cells`, else `$HOME/.cache/aterm/cells`. The
-/// temp dir survives only as the last resort for a host with neither, where
-/// there is no better answer and the run is a one-shot anyway.
+/// NOT THE TEMP DIR by default: on Linux `/tmp` is often a tmpfs (RAM), and the
+/// cells leave gigabytes behind by design. The default is the user's cache dir
+/// ([`default_cell_cache_root`]).
 ///
-/// THE THIRD HAZARD: one cache shared by every checkout. The default used to be
-/// the same `<cache>/aterm/cells/<cell>` for every worktree of this repo, and
-/// cargo cannot share a target dir between two checkouts of one workspace: it
-/// hashes a member's package id RELATIVE TO THE WORKSPACE ROOT, so both write
-/// the same artifact names, while the dep-info that decides freshness lists the
-/// OTHER checkout's absolute paths — whose mtimes say nothing about this tree's
-/// edits. So a cell could read another worktree's stale metadata as fresh.
-/// MEASURED 2026-09-25, three times in one day: the dead/gui, dead/engine and
-/// dead/services reviews each ran `gate cells` red on source their tree did not
-/// have (an `aterm-sixel` `hook()` E0061, an `aterm-gui` `Metadata` E0107), and
-/// green with a private `$ATERM_CELL_TARGET_DIR`. A stale artifact can as easily
-/// turn a red cell green, which is the direction a gate may never err in. The
-/// default is now keyed by the checkout ([`checkout_cache_key`]); an explicit
-/// `$ATERM_CELL_TARGET_DIR` is the caller's own choice and is used as given.
+/// KEYED BY CHECKOUT ([`checkout_cache_key`]): cargo cannot share a target dir
+/// between two checkouts of one workspace — it hashes package ids relative to
+/// the workspace root, so both write the same artifact names while the
+/// dep-info lists the OTHER checkout's paths, and a stale artifact reads as
+/// fresh (red or green on source the tree does not have).
 ///
-/// THE FOURTH HAZARD, which the third's fix created: a per-checkout cache
-/// outlives its checkout. A worktree is removed, its 20-46 GB of cells stay, and
-/// nothing ever names them again — MEASURED 2026-09-25 on m7, nine orphaned
-/// checkout caches (356 GB) plus four hand-made override dirs took the disk to
-/// 100% and 20 GB free. So each checkout's cache carries a marker naming the
-/// checkout it serves, and every default-cache run sweeps the caches whose
-/// checkout is gone ([`sweep_orphaned_cell_caches`]).
+/// SWEPT WITH ITS CHECKOUT: a per-checkout cache outlives its worktree (tens of
+/// GB each), so each carries a marker naming its checkout and every
+/// default-cache run sweeps the ones whose checkout is gone
+/// ([`sweep_orphaned_cell_caches`]).
 fn cell_target_dir(root: &Path, cell: &str) -> Result<PathBuf, String> {
     let dir = match std::env::var_os("ATERM_CELL_TARGET_DIR") {
         Some(v) => PathBuf::from(v).join(cell),
@@ -2379,13 +2259,7 @@ fn cell_target_dir(root: &Path, cell: &str) -> Result<PathBuf, String> {
             checkout.join(cell)
         }
     };
-    let inside = match (dir.canonicalize(), root.canonicalize()) {
-        (Ok(d), Ok(r)) => d.starts_with(&r),
-        // Not created yet: compare the paths as written, which is enough to
-        // catch the case this refusal exists for.
-        _ => dir.starts_with(root),
-    };
-    if inside {
+    if path_is_inside(&dir, root) {
         return Err(format!(
             "the target dir {} is inside the workspace; this gate never writes into the tree it \
              judges. Point $ATERM_CELL_TARGET_DIR somewhere else.",
@@ -2397,15 +2271,11 @@ fn cell_target_dir(root: &Path, cell: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// The per-checkout directory under the default cells cache: the checkout's
-/// directory name (for a human reading the cache) and an FNV-1a hash of its
-/// canonical path (so two checkouts that share a name still differ). Stable
-/// across toolchains, unlike `DefaultHasher`, so a checkout keeps its cache.
 /// The file in a checkout's cells cache that names the checkout it serves.
 const CELL_CACHE_MARKER: &str = ".checkout";
 
-/// The flat `<cache>/<cell>` dirs of the layout before per-checkout keys
-/// (2026-09-25): the cells that existed then. A migration list, not the cell
+/// The flat `<cache>/<cell>` dirs of the layout before per-checkout keys: the
+/// cells that existed then. A migration list, not the cell
 /// table — `tools/cross-cell-gate.tsv` stays the one roster of cells.
 const LEGACY_FLAT_CELL_DIRS: [&str; 8] = [
     "mac-arm",
@@ -2418,10 +2288,15 @@ const LEGACY_FLAT_CELL_DIRS: [&str; 8] = [
     "wasm-gpu",
 ];
 
-/// Remove every per-checkout cells cache under `cache` whose checkout no longer
-/// exists, and the flat `<cache>/<cell>` dirs of the layout before per-checkout
-/// keys. Never the cache named `keep`, and never a dir without a marker (it may
-/// be a cache this rule cannot account for). Best effort: a failure to read or
+/// Remove every per-checkout cells cache under `cache` whose checkout is SEEN
+/// to be gone ([`cell_checkout::gone`], the rule the window's disk watch
+/// deletes by: a checkout that cannot be read, is away with the folder that
+/// held it, or lies where volumes mount or in a privacy-guarded folder of
+/// `$HOME` keeps its cache), and the flat `<cache>/<cell>` dirs of the layout
+/// before per-checkout keys. Never the cache named `keep`, and never a dir
+/// without a marker naming a checkout, read exactly as it was written
+/// ([`cell_checkout::marker_checkout`], the window's reader too): it may be a
+/// cache this rule cannot account for. Best effort: a failure to read or
 /// remove leaves the cache as it was.
 fn sweep_orphaned_cell_caches(cache: &Path, keep: &str) {
     let Ok(entries) = std::fs::read_dir(cache) else {
@@ -2433,12 +2308,15 @@ fn sweep_orphaned_cell_caches(cache: &Path, keep: &str) {
         .map(|e| {
             let marker = std::fs::read(e.path().join(CELL_CACHE_MARKER))
                 .ok()
-                .map(|b| PathBuf::from(String::from_utf8_lossy(&b).into_owned()));
+                .and_then(|b| cell_checkout::marker_checkout(&b));
             (e.file_name().to_string_lossy().into_owned(), marker)
         })
         .collect();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute());
     for name in orphaned_cell_caches(&listed, keep, &LEGACY_FLAT_CELL_DIRS, |p| {
-        p.join("Cargo.toml").is_file()
+        cell_checkout::gone(p, home.as_deref()).is_err()
     }) {
         let _ = std::fs::remove_dir_all(cache.join(name));
     }
@@ -2467,13 +2345,13 @@ fn orphaned_cell_caches<'a>(
         .collect()
 }
 
+/// The per-checkout directory under the default cells cache: the checkout's
+/// directory name (for a human reading the cache) and an FNV-1a hash of its
+/// canonical path (so two checkouts that share a name still differ). Stable
+/// across toolchains, unlike `DefaultHasher`, so a checkout keeps its cache.
 fn checkout_cache_key(root: &Path) -> String {
     let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in canon.as_os_str().as_encoded_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let hash = aterm_hash::fnv1a_64(canon.as_os_str().as_encoded_bytes());
     // A worktree kept in a dot-directory would otherwise hide its cache too.
     let name = canon.file_name().map_or_else(
         || "root".to_owned(),
@@ -2489,11 +2367,8 @@ fn checkout_cache_key(root: &Path) -> String {
 /// The verdict a formatter pass reached. THREE-valued on purpose.
 ///
 /// "Ran and found nothing", "ran and found something" and "never ran" are three
-/// different facts. For a month the third wore the second's clothes —
-/// `trustfmt: FAILED (exit Some(1))` was `cargo fmt` failing to find a
-/// `cargo-fmt` the Trust stage2 does not ship — so the verb could not pass for
-/// any input, stopped being read, and three lint regressions reached `main`
-/// under it. A pass that reaches no verdict never renders one.
+/// different facts; a pass that never ran must not read as a finding (a verb
+/// that cannot pass stops being read) or as clean.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LaneVerdict {
     /// The pass RAN, over the real tree, and found nothing.
@@ -2617,8 +2492,8 @@ fn lint_verdict_line(verdict: LaneVerdict, not_run: &[&str], fix: Option<&str>) 
     match verdict {
         LaneVerdict::Clean => format!(
             "{LINT_VERDICT_GREEN} — every tracked `.rs` file outside vendor/ is formatted at its \
-             crate's edition, bar the {} in FMT_SWEEP_EXCLUSIONS, and rustfmt reads the same \
-             editions",
+             crate's edition, bar the {} in gate.rs's FMT_SWEEP_EXCLUSIONS, and rustfmt reads the \
+             same editions",
             FMT_SWEEP_EXCLUSIONS.len()
         ),
         LaneVerdict::Finding if not_run.is_empty() => {
@@ -2681,9 +2556,8 @@ fn fmt_workspace_pass(root: &Path, tools: &Path) -> LaneVerdict {
         LaneVerdict::Finding
     } else {
         eprintln!(
-            "  trustfmt: NOT RUN — `{TRUSTFMT_DRIVER}` exited non-zero WITHOUT reporting a single \
-             `{FMT_DIFF_MARKER}…` line, so it never read the tree. That is an environment fault, \
-             not a formatting finding. Its own words were:\n{}",
+            "  trustfmt: NOT RUN — `{TRUSTFMT_DRIVER}` exited non-zero without reading the \
+             tree:\n{}",
             stderr.trim_end()
         );
         LaneVerdict::NotRun
@@ -2697,14 +2571,11 @@ const TRUSTFMT_DRIVER: &str = "targo-fmt";
 
 /// How a formatting FINDING names each file, on STDOUT.
 ///
-/// MEASURED on this tree, both directions. A real drift report — the 254-file
-/// one this lane was armed against — writes 2,685 `Diff in <path>:<line>:`
-/// lines to STDOUT and exactly ZERO bytes to stderr. An environment fault
-/// (`targo-fmt` run with `trustfmt` off PATH; an unresolvable dependency
-/// manifest) writes its complaint to STDERR and emits no `Diff in` line at all.
-/// Both exit 1. So the presence of this marker, and not the exit code, is what
-/// separates "the tree is unformatted" from "the check never read the tree" —
-/// the distinction [`LaneVerdict`] exists for.
+/// Measured both ways: a drift report writes `Diff in <path>:<line>:` lines to
+/// STDOUT and nothing to stderr; an environment fault (`trustfmt` off PATH, an
+/// unresolvable manifest) writes to STDERR and no `Diff in` line. Both exit 1,
+/// so this marker, not the exit code, separates "unformatted" from "never read
+/// the tree" ([`LaneVerdict`]).
 const FMT_DIFF_MARKER: &str = "Diff in ";
 
 // ---------------------------------------------------------------------------
@@ -2735,11 +2606,8 @@ const FMT_SWEEP_EXCLUSIONS: &[&str] = &[
 
 /// Every TRACKED `*.rs` path outside `vendor/`, repo-relative, sorted.
 ///
-/// TRACKED, via `git ls-files`, and not a directory walk: a walk cannot tell a
-/// source file from a scratch file somebody left in the tree, and a lane that
-/// fires on an untracked experiment is a lane people learn to ignore. `git` is
-/// already a dependency of this crate's `perf` verb and of `aterm-verify`, so
-/// this adds no new one.
+/// TRACKED, via `git ls-files`, not a directory walk: a lane that fires on an
+/// untracked scratch file is a lane people learn to ignore.
 ///
 /// `vendor/` is excluded because it is third-party source aterm mirrors rather
 /// than authors; holding a fork to aterm's formatter would produce a diff
@@ -2771,22 +2639,11 @@ fn tracked_rs_files(root: &Path) -> Result<Vec<String>, String> {
 /// The edition `trustfmt` must be told for `rel`, found from the nearest
 /// enclosing `Cargo.toml`.
 ///
-/// THIS IS NOT A DETAIL, it is what makes the sweep's answers true. `cargo fmt`
-/// passes each target its own crate's edition; a bare per-file run reads only
-/// `rustfmt.toml`, which says `edition = "2024"` for the whole tree, and the
-/// tree is not all 2024. MEASURED on 2026-08-31, the same batched sweep run
-/// twice over this tree, with the lookup and with everything forced to
-/// `rustfmt.toml`'s 2024: WITH it, 35 files drift and stderr is empty; WITHOUT
-/// it, 39 files drift and stderr carries 16 `error:` lines. The difference is
-/// six PHANTOM findings and two HIDDEN files. The phantoms are `aterm-wasm`'s
-/// and `aterm-gpu-web`'s `lib.rs`, `notifications_api.rs` and
-/// `scrollback_tiers_api.rs` — both members declare `edition = "2021"`, and
-/// 2024 formats them differently. The hidden two are
-/// `tools/temporal-extract/refine/src/main.rs` and
-/// `tools/temporal-extract/src/infer.rs`, which use `gen` as an identifier:
-/// legal in 2021, RESERVED in 2024, so at the wrong edition they do not parse
-/// and their real drift never gets reported at all. The wrong edition therefore
-/// invents findings AND conceals them, in one step.
+/// This is what makes the sweep's answers true. `cargo fmt` passes each target
+/// its own crate's edition; a bare per-file run reads only `rustfmt.toml`, and
+/// the tree is not all one edition. The wrong edition both invents findings (a
+/// 2021 file formats differently at 2024) and conceals them (a file using `gen`
+/// as an identifier does not parse at 2024, so its drift is never reported).
 ///
 /// `edition.workspace = true` resolves to the root manifest's
 /// `[workspace.package] edition`. A file under no manifest at all (a fixture,
@@ -2808,15 +2665,14 @@ fn crate_edition(root: &Path, rel: &str) -> String {
 /// manifest, or a member inheriting one it never names).
 fn manifest_edition(manifest: &Path, root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(manifest).ok()?;
-    let line = text
+    let first = text
         .lines()
         .map(str::trim)
         .find(|l| l.starts_with("edition"))?;
-    if line.contains("workspace") {
+    if first.contains("workspace") {
         return Some(workspace_edition(root));
     }
-    let quoted = line.split('"').nth(1)?;
-    Some(quoted.to_owned())
+    toml_edition(&text)
 }
 
 /// The workspace's own edition, from the root `[workspace.package]`. Falls back
@@ -2826,12 +2682,7 @@ fn manifest_edition(manifest: &Path, root: &Path) -> Option<String> {
 fn workspace_edition(root: &Path) -> String {
     std::fs::read_to_string(root.join("Cargo.toml"))
         .ok()
-        .and_then(|t| {
-            t.lines()
-                .map(str::trim)
-                .find(|l| l.starts_with("edition") && l.contains('"'))
-                .and_then(|l| l.split('"').nth(1).map(str::to_owned))
-        })
+        .and_then(|t| toml_edition(&t))
         .unwrap_or_else(|| "2024".to_string())
 }
 
@@ -2872,38 +2723,15 @@ fn relative_to(abs: &str, root: &Path, canonical_root: Option<&Path>) -> String 
 /// PASS THREE of the trustfmt lane: EVERY OTHER SPELLING OF THE FORMATTER
 /// AGREES WITH THIS ONE.
 ///
-/// Passes one and two are the oracle, and they are right because [`crate_edition`]
-/// tells `trustfmt` each file's real edition, read from the nearest
-/// `Cargo.toml`. NOTHING ELSE DOES THAT. `rustfmt` resolves a file's edition
-/// from the nearest `rustfmt.toml` — never from a manifest — so every other way
-/// of reaching the formatter reads a DIFFERENT edition for the same file:
+/// Passes one and two read each file's edition from its manifest
+/// ([`crate_edition`]); `rustfmt` reads it from the nearest `rustfmt.toml`, so a
+/// hand-run `trustfmt <path>`, format-on-save, rust-analyzer and `targo-fmt --
+/// <paths>` (which formats the whole workspace regardless) can read a different
+/// edition, with the consequences [`crate_edition`] names.
 ///
-///   * `trustfmt <path>` by hand, and every editor's format-on-save, and
-///     rust-analyzer;
-///   * `targo-fmt -- <paths>`, which MEASURED 2026-09-17 does not even scope to
-///     the paths given — it formats the whole workspace and hands the paths to
-///     `rustfmt` as extra arguments.
-///
-/// The consequences are exactly the ones [`crate_edition`] records for the
-/// sweep, and they run in BOTH directions: at edition 2024 a 2021 crate's file
-/// formats differently (phantom findings, and a hand-run formatter silently
-/// rewriting a file the gate then calls unformatted), and a file using `gen` as
-/// an identifier does not PARSE, so its real drift is never reported at all.
-/// MEASURED on this tree the day this was written: with `rustfmt.toml` naming
-/// only the workspace edition, `trustfmt` on an edition-2021 file holding `let
-/// gen = 1;` answers `error: expected identifier, found reserved keyword`; with
-/// a `rustfmt.toml` in that crate it formats clean.
-///
-/// So the tree must be shaped so that both resolutions give the same answer,
-/// and this is the check that keeps it that way. It compares, for every tracked
-/// first-party `.rs` file, the edition its MANIFEST declares against the
-/// edition `rustfmt` would resolve for it, and names the one-line file that
-/// reconciles them. It needs no toolchain and no build; it is pure `stat` and
-/// `read_to_string`.
-///
-/// `vendor/` is out of scope for the same reason it is out of the sweep's: it
-/// is third-party source aterm mirrors rather than authors, and nothing in this
-/// repo should be formatting it at all.
+/// This compares, for every tracked first-party `.rs` file, the edition its
+/// MANIFEST declares against the one `rustfmt` would resolve, and names the
+/// one-line `rustfmt.toml` that reconciles them. No toolchain, no build.
 fn fmt_edition_agreement(root: &Path) -> LaneVerdict {
     let files = match tracked_rs_files(root) {
         Ok(f) => f,
@@ -2946,9 +2774,8 @@ fn fmt_edition_agreement(root: &Path) -> LaneVerdict {
         return LaneVerdict::Clean;
     }
     eprintln!(
-        "  fmt editions: FINDING — {} crate(s) whose files rustfmt formats at an edition \
-         their manifest does not declare. Every hand-run formatter, editor and \
-         rust-analyzer therefore disagrees with this gate about them.",
+        "  fmt editions: FINDING — {} crate(s) where rustfmt's edition differs from the \
+         manifest's:",
         wanted.len()
     );
     for ((dir, edition), example) in &wanted {
@@ -3002,31 +2829,29 @@ fn rustfmt_edition_for(root: &Path, rel: &str) -> String {
     }
 }
 
-/// `edition = "2021"` from a `rustfmt.toml`'s top level. A one-key reader, not
-/// a TOML parser: `rustfmt.toml` is flat by construction and this file already
-/// reads manifests the same way.
+/// The first `edition = "2021"` line of a flat TOML file (a `rustfmt.toml`, or
+/// a manifest). A one-key reader, not a TOML parser; it skips
+/// `edition.workspace = true`, which [`manifest_edition`] resolves itself.
 fn toml_edition(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.starts_with('#'))
         .find_map(|l| {
             let rest = l.strip_prefix("edition")?.trim_start();
-            let rest = rest.strip_prefix('=')?.trim();
-            Some(rest.trim_matches(['"', '\''].as_slice()).to_string())
+            let quoted = rest.strip_prefix('=')?.trim();
+            Some(quoted.split(['"', '\'']).nth(1)?.to_string())
         })
 }
 
 /// PASS TWO: hold every tracked `.rs` file outside `vendor/` to the same
 /// formatter, per file, at the edition of the crate that owns it.
 ///
-/// It sweeps the WHOLE tree rather than the complement of pass one on purpose:
-/// computing that complement means modelling cargo's target discovery and
-/// rustfmt's `mod` recursion, and a model that drifts drops a file out of BOTH
-/// passes silently. Sweeping everything makes the passes cross-check instead.
-/// `--skip-children` judges each file alone, at top-level indentation, which is
-/// how `--all` formats an out-of-line `mod` file, so the two never disagree
-/// (measured 2026-08-31: zero disagreements over 1,752 files). It needs no
-/// compiler and costs seconds.
+/// It sweeps the WHOLE tree rather than the complement of pass one: computing
+/// that complement means modelling cargo's target discovery and rustfmt's `mod`
+/// recursion, and a model that drifts drops a file out of BOTH passes silently.
+/// `--skip-children` judges each file alone, at top-level indentation, as
+/// `--all` formats an out-of-line `mod` file, so the two agree (measured: zero
+/// disagreements over 1,752 files). No compiler; seconds.
 fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
     let bin = tools.join(TRUSTFMT_BIN);
     if !bin.is_file() {
@@ -3054,11 +2879,8 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
         );
         return LaneVerdict::NotRun;
     }
-    // GROUPED BY EDITION, then chunked. The grouping is correctness (see
-    // [`crate_edition`]); the chunking is only ARG_MAX hygiene — 1,752 paths is
-    // ~80 KB against this platform's 1 MiB, so one exec would fit today, and a
-    // fixed chunk keeps it fitting on a machine with a longer checkout path or
-    // a much larger tree.
+    // GROUPED BY EDITION (correctness: [`crate_edition`]), then chunked (ARG_MAX
+    // headroom for a longer checkout path or a larger tree).
     const CHUNK: usize = 400;
     // trustfmt reports ABSOLUTE paths, and on macOS `/var` is a symlink to
     // `/private/var`, so a root under the system temp dir comes back with a
@@ -3105,23 +2927,17 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
             // "I could not read them". A `Diff in` line means it read them.
             if !out.status.success() && !stdout.contains(FMT_DIFF_MARKER) {
                 eprintln!(
-                    "  trustfmt sweep: NOT RUN — `{TRUSTFMT_BIN}` exited {:?} over a batch of {} \
-                     file(s) at edition {edition} WITHOUT printing a single `{FMT_DIFF_MARKER}…` \
-                     line, so it never read them. Environment fault, not a formatting finding. \
-                     Its own words were:\n{}",
+                    "  trustfmt sweep: NOT RUN — `{TRUSTFMT_BIN}` exited {:?} on {} file(s) at \
+                     edition {edition} without reading them:\n{}",
                     out.status.code(),
                     chunk.len(),
                     stderr.trim_end()
                 );
                 return LaneVerdict::NotRun;
             }
-            // MIXED batch: one `Diff in` line proved trustfmt read SOMETHING, and the
-            // check above then accepted the whole 400-file chunk — discarding every
-            // `error:` line it wrote about the OTHERS unread, while the summary below
-            // kept counting them as checked. A file that stops parsing at the edition
-            // it is handed (this lane's own doc records `gen` under 2024 doing exactly
-            // that) left the swept set in silence. Name them, and do not call the
-            // sweep clean while any remain.
+            // MIXED batch: a `Diff in` line proves trustfmt read SOME files; the
+            // `error:` lines name the others it could not read. Name them, and do
+            // not call the sweep clean while any remain.
             if !out.status.success() {
                 // `error[E0123]: …` and `error: …` both carry the path after the
                 // first `:`; keep the whole line, it is the operator's evidence.
@@ -3138,9 +2954,8 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
     }
     if !unread.is_empty() {
         eprintln!(
-            "  trustfmt sweep: NOT RUN — `{TRUSTFMT_BIN}` could not read {} file(s) in a batch \
-             where others did produce diffs, so part of the tree went unchecked while the \
-             count below would have called it checked:",
+            "  trustfmt sweep: NOT RUN — `{TRUSTFMT_BIN}` could not read {} file(s), so they \
+             were not checked:",
             unread.len()
         );
         for line in &unread {
@@ -3208,14 +3023,8 @@ mod cell_cache_root_tests {
     use super::*;
     use std::ffi::OsStr;
 
-    /// The rule that keeps a multi-gigabyte artifact cache off a RAM disk.
-    ///
-    /// `gate cells` and `gate cells-foreign` leave 5.0 GB behind by design. The
-    /// default used to be [`std::env::temp_dir`], which is `/tmp` on every
-    /// mainstream Linux and a tmpfs — RAM — on systemd boxes; one grew to
-    /// 13.6 GB on m17-tower and took the machine's swap with it. The cache dir
-    /// is disk-backed everywhere we ship, so that is the default now, and the
-    /// temp dir is only for a host that offers neither cache dir.
+    /// The rule that keeps a multi-gigabyte artifact cache off a RAM disk: the
+    /// temp dir only for a host that offers neither cache dir.
     #[test]
     fn the_cells_cache_prefers_a_disk_backed_home_over_the_temp_dir() {
         let temp = Path::new("/tmp");
@@ -3480,28 +3289,19 @@ mod tests {
     }
 
     /// A bare `xtask gate` prints the usage line and an unknown verb the verb
-    /// list — never a Rust `Option` — and a verb retired on 2026-09-27 says
-    /// where it went.
+    /// list — never a Rust `Option` — and a retired verb says where it went.
     #[test]
     fn an_unknown_gate_verb_names_the_verbs_and_the_new_home_of_a_retired_one() {
-        assert_eq!(
-            unknown_verb_message(None),
-            "usage: xtask gate <lint|forge|cells|cells-foreign>"
-        );
-        assert_eq!(
-            unknown_verb_message(Some("nope")),
-            "xtask gate: no verb `nope` — verbs: lint, forge, cells, cells-foreign"
-        );
-        assert_eq!(
-            unknown_verb_message(Some("mainloop")),
-            "xtask gate: no verb `mainloop` (now: targo --unverified run -p aterm-census -- \
-             --mainloop) — verbs: lint, forge, cells, cells-foreign"
-        );
-        assert_eq!(
-            unknown_verb_message(Some("perf")),
-            "xtask gate: no verb `perf` (now: targo --unverified run -p xtask -- perf) — \
-             verbs: lint, forge, cells, cells-foreign"
-        );
+        let usage = unknown_verb_message(None);
+        assert!(usage.starts_with("usage: xtask gate <verb>"), "{usage}");
+        for (name, ..) in VERBS {
+            assert!(usage.contains(&format!("\n  {name}")), "{name}: {usage}");
+        }
+        let verbs = verb_names().join(", ");
+        let unknown = unknown_verb_message(Some("nope"));
+        assert!(unknown.contains("no verb `nope`"), "{unknown}");
+        assert!(unknown.contains(&verbs), "{unknown}");
+        assert!(!unknown.contains("now:"), "{unknown}");
         for (old, package, arg) in RETIRED_VERBS {
             assert!(
                 unknown_verb_message(Some(old)).contains(&format!("-p {package} -- {arg})")),
@@ -3514,12 +3314,8 @@ mod tests {
     /// does not match its manifest is a FINDING, and adding the one-line file
     /// clears it.
     ///
-    /// This is the shape the real tree was in until 2026-09-17: seven crates at
-    /// edition 2021 under a single root `rustfmt.toml` saying 2024, so the
-    /// gate's sweep (which reads the MANIFEST) and every other spelling of the
-    /// formatter (which reads `rustfmt.toml`) disagreed about 77 files. The
-    /// disagreement is invisible to both passes above — each is internally
-    /// consistent — which is exactly why it needs a pass of its own.
+    /// The disagreement is invisible to the other two passes — each is
+    /// internally consistent — which is why it needs a pass of its own.
     ///
     /// Needs no `trustfmt`: it compares two file reads. It does need `git`, for
     /// the same file list the sweep uses.
@@ -4057,22 +3853,8 @@ mod tests {
     }
 
     /// THE SHIPPED POLICY MUST BE READABLE FROM WHICHEVER MACHINE IS READING
-    /// IT, and from 2026-09-01 until this test it was not.
-    ///
-    /// `tools/cross-cell-gate.tsv` carries two `cshim` rows for
-    /// `x86_64-unknown-linux-gnu` — correct rows, measured on m21, where Linux
-    /// is a CROSS cell. `parse_cell_policy` refused any row naming the reader's
-    /// own triple, and refused it BEFORE `gate cells` had selected a single
-    /// cell, so on m17-tower — where Linux is the NATIVE cell —
-    /// `cargo run -p xtask -- gate cells --cell win` printed (measured on an
-    /// unmodified 2ad5de183, where those rows are lines 89 and 90)
-    /// `COULD NOT RUN — tools/cross-cell-gate.tsv:89: refusing the `cshim` row
-    /// for `ring`` and never reached the `win` cell at all. The only gate that
-    /// compiles aterm for Windows could not be STARTED on a Linux box, so no
-    /// Windows break authored on one could ever turn it red — and the first
-    /// run after this fix found one: `crate::seam::is_real_dir` is
-    /// `#[cfg(unix)]` and `crates/atpkg/src/compat.rs:611` calls it on every
-    /// target.
+    /// IT: a row naming one box's own triple is a cross row on another, and
+    /// refusing it at parse time stops every cell from starting there.
     ///
     /// So this walks the verb's own first two steps, in the verb's own order,
     /// once for every cell's triple pretended to be the host: the file parses,
@@ -4138,7 +3920,7 @@ mod tests {
     fn the_proc_macro_carve_out_comes_from_the_manifest() {
         let root = crate::workspace_root();
         assert!(super::manifest_is_proc_macro(
-            &root.join("crates/aterm-error-derive")
+            &root.join("crates/aterm-spec-macros")
         ));
         assert!(super::manifest_is_proc_macro(
             &root.join("crates/aterm-tracing-attributes")
@@ -4184,24 +3966,12 @@ mod tests {
         }
     }
 
-    /// THE RED THIS FILE WAS WRITTEN FOR. Measured 2026-09-17 with no cross std
-    /// installed and no native cell: five `SKIPPED(no-std)` rows, zero compilers
-    /// started, and
-    ///
-    /// ```text
-    /// gate cells: GREEN — all 5 cells type-check, with nothing excused or
-    /// shimmed: 0 of 312 in-repo crate-instances read; 312 NOT; …
-    /// ```
-    ///
-    /// with exit 0 under it, because the row carried `ok: true`. The verdict
-    /// sentence is what a reader quotes, so it is what this holds: a run that
-    /// compiled nothing may not spell the matrix claim, and must name what it
-    /// did not do.
+    /// A run with a cell nothing was compiled for may not spell the matrix
+    /// claim, and must name what it did not do.
     #[test]
     fn a_cell_nothing_was_compiled_for_is_not_a_pass() {
-        // FORGE'S WHOLE LIST, no narrowing, one cell uncompiled — the exact
-        // shape that printed the sentence above, and the only shape in which
-        // the matrix claim is even reachable.
+        // FORGE'S WHOLE LIST, no narrowing, one cell uncompiled — the only
+        // shape in which the matrix claim is even reachable.
         let v = super::cells_verdict(
             &[
                 checked_cell("mac-arm", "aarch64-apple-darwin"),
@@ -4278,8 +4048,7 @@ mod tests {
 
     /// THE COST LINE sums what was COMPILED: the seconds and target-dir bytes
     /// of every cell that ran, and nothing for a cell nothing was compiled for
-    /// (its `-` DISK is not a zero-byte cell). Before 2026-09-27 no line said
-    /// what the gate cost, and a review had to measure it by hand.
+    /// (its `-` DISK is not a zero-byte cell).
     #[test]
     fn the_cost_line_sums_the_cells_that_compiled_and_only_those() {
         let mut win = checked_cell("win", "x86_64-pc-windows-msvc");
@@ -4495,9 +4264,8 @@ mod tests {
         );
     }
 
-    /// THE BOX THIS WAS MEASURED ON (2026-09-27): rustup in `~/.cargo/bin`, that
-    /// directory not on PATH. The search finds it; the PATH-only question the cross
-    /// gates asked until that day — the negative control — does not.
+    /// rustup in `~/.cargo/bin`, that directory not on PATH: the search finds it;
+    /// a PATH-only search — the negative control — does not.
     #[test]
     fn a_rustup_off_path_in_cargo_home_is_found() {
         let root = std::env::temp_dir().join(format!("aterm-find-rustup-{}", std::process::id()));
@@ -4613,16 +4381,14 @@ mod tests {
     // G-CELLS, THE ALWAYS-ON SUBSET
     // -----------------------------------------------------------------------
 
-    /// THE DECISION OF 2026-09-17, PINNED: the always-on cross-triple compile is
-    /// exactly forge's cells whose triple no box in this fleet runs natively,
-    /// and the WHOLE matrix stays opt-in.
+    /// The always-on cross-triple compile is exactly forge's cells whose triple no box
+    /// in this fleet runs natively, and the WHOLE matrix stays opt-in.
     ///
-    /// Both halves are load-bearing and both are asserted here, because the
-    /// failure this gate exists to stop is a subset that quietly becomes
-    /// something else: too small and Windows stops being compiled anywhere (the
-    /// four hand-found breaks of 2026-09-16); too large and every tier of the
-    /// merge gate inherits a cell whose verdict depends on which box ran it,
-    /// which is how a gate stops being read at all.
+    /// Both halves are load-bearing and both are asserted here, because the failure
+    /// this gate exists to stop is a subset that quietly becomes something else: too
+    /// small and Windows stops being compiled anywhere; too large and every tier of the
+    /// merge gate inherits a cell whose verdict depends on which box ran it, which is
+    /// how a gate stops being read at all.
     #[test]
     fn the_always_on_cell_subset_is_every_cell_no_box_in_this_fleet_hosts() {
         let all = aterm_forge::resolve::default_cells();
@@ -4686,7 +4452,7 @@ mod tests {
         }
     }
 
-    /// THE LIBC ORACLE'S CELL TABLE AND THIS CONST ARE ONE CLAIM (2026-09-20).
+    /// THE LIBC ORACLE'S CELL TABLE AND THIS CONST ARE ONE CLAIM.
     /// `libc-oracle/run.sh` decides one cell per box — the cell the box is
     /// native to, the rule [`FLEET_HOST_TRIPLES`] applies to the forge cells —
     /// and it carries its cell table twice: as `cell_table` in the shell driver
@@ -4793,12 +4559,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// THE HOST CELL NAMES NO RUSTUP TOOLCHAIN AND NO --target, and a cross
-    /// cell names both. The first half is the 2026-09-18 fix: the test-target
-    /// pass exported `RUSTUP_TOOLCHAIN="repo pin (rust-toolchain.toml)"` — a
-    /// label, as a toolchain name — and pinned `--target` to the native triple,
-    /// which `.cargo/config.toml`'s COROLLARY says strips `-Ztrust-verify=off`
-    /// from every host unit. Both passes now build the command in ONE place,
-    /// and this holds that place to its own doc comment.
+    /// cell names both: an explicit native `--target` strips `.cargo/config.toml`'s
+    /// Trust-lane table from every host unit. Both passes build the command in
+    /// ONE place, and this holds it to its doc comment.
     #[test]
     fn the_host_cell_command_names_no_rustup_toolchain_and_no_target() {
         let driver = crate::driver::CargoDriver {

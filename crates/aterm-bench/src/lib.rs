@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm performance benchmarks (ROADMAP WS-K).
-//!
-//! Run with `cargo bench -p aterm-bench`. Performance targets in `ATERM_DESIGN.md`
-//! §7 are **RED** (unproven) until reproduced here on the shipped binary; this
-//! crate exists so the numbers are measured, not asserted.
-//!
-//! The deterministic SEARCH corpora live here (not in one example) so the
-//! committed floor lane (`search_harness`) and the posting-container decision
-//! bench (`posting_container_harness`) measure the SAME bytes — a container
-//! verdict taken on different data than the floors gate would be dishonest.
+//! aterm performance harnesses: the examples `xtask perf` runs. This lib holds
+//! the deterministic corpora shared between them.
 
-/// Trigram-DIVERSE corpus: line counter + rotating 40-glyph body (same shape as
-/// the scroll-scrub fill). Every line differs, trigram space is saturated — the
-/// worst case the audit's external harness measured at ~1283 B/line.
+/// Trigram-diverse corpus: line counter + rotating 40-glyph body. Every line
+/// differs and trigram space is saturated: the worst case for the search index,
+/// and real (compressible) work for the scroll-scrub tiers.
 #[must_use]
 pub fn rotating_corpus(lines: usize) -> Vec<u8> {
     const GLYPHS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/-=";
@@ -30,10 +22,9 @@ pub fn rotating_corpus(lines: usize) -> Vec<u8> {
     out
 }
 
-/// REPETITIVE-LOG corpus (the audit's caveat): 8 real-shaped service-log
-/// templates cycling, only digits varying. Trigram-map small, per-line
-/// postings/Strings unchanged — the shape where a "the map shrank so we're
-/// fine" regression would hide.
+/// Repetitive-log corpus: 8 real-shaped service-log templates cycling, only
+/// digits varying. The trigram map stays small while per-line postings do
+/// not, the shape where a regression hidden by a shrinking map would show.
 #[must_use]
 pub fn replog_corpus(lines: usize) -> Vec<u8> {
     let templates: [&str; 8] = [
@@ -60,14 +51,12 @@ pub fn replog_corpus(lines: usize) -> Vec<u8> {
     out
 }
 
-/// HYPERLINK-HEAVY corpus (Wave-4A P7): package-registry fetch logs where
-/// every line prints a long URL wrapped in a real OSC 8 hyperlink (URL as its
-/// own visible text — the common registry/CI shape). Exercises what neither
-/// committed corpus does: punctuation-dense high-entropy trigrams from URLs,
-/// visible lines wide enough to soft-wrap at 80 columns (2 grid rows per
-/// logical line), and the OSC 8 parser path in the fill itself.
+/// Hyperlink-heavy corpus: package-registry fetch logs where every line prints
+/// a long URL wrapped in an OSC 8 hyperlink (the URL as its own visible text).
+/// Exercises punctuation-dense high-entropy trigrams, lines that soft-wrap at
+/// 80 columns, and the OSC 8 parser path in the fill itself.
 ///
-/// `lines` counts LOGICAL lines; at 80 columns each occupies 2 grid rows, so
+/// `lines` counts logical lines; at 80 columns each occupies 2 grid rows, so
 /// callers sizing a ring must budget `2 * lines` rows.
 #[must_use]
 pub fn linkheavy_corpus(lines: usize) -> Vec<u8> {

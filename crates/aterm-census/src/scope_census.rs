@@ -2,92 +2,65 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! SCOPE-CARDINALITY CENSUS (OB-13..OB-18) — the "one enforcer, N instances"
-//! CLASS, as a fail-closed, build-blocking OBLIGATION.
+//! Scope-cardinality census (OB-13..OB-18): the "one enforcer, N instances"
+//! class as a fail-closed, build-blocking obligation.
 //!
-//! THE BUG THIS GUARDS: `FlashLimiter` (aterm-spec `derive.rs`) proves at most
-//! 2 ignitions per rolling second over the four 250 ms slots of ONE limiter,
-//! and `flash_limiter_conformance_real_limiter_projects_onto_model` drives ONE
-//! `&mut Vec<IgnitionReservation>` through a scripted storm. Both stay GREEN if
-//! every split pane gets its own `WordDecorations`: each limiter independently
-//! satisfies the invariant while a photosensitive viewer — who has one retina,
-//! not one per pane — sees 2N flashes per second. The WCAG 2.3.1 argument is
-//! WINDOW-WIDE; nothing in the model, the binding, or the type system pinned
-//! how many limiters exist. It was caught by a human READING the words
-//! "window-wide" in a doc comment.
+//! A model can verify a local property of one instance of an enforcing
+//! structure while the property that matters is global across all live
+//! instances. `FlashLimiter` proves at most 2 ignitions per rolling second for
+//! one limiter; if every split pane had its own `WordDecorations`, each limiter
+//! would satisfy that while the viewer sees 2N flashes per second. WCAG 2.3.1
+//! is window-wide.
 //!
-//! THE CLASS: a model verifies a LOCAL property of one instance of an
-//! enforcing structure while the property that matters is GLOBAL across all
-//! live instances, and nothing pins the instance count.
+//! A [`ScopeClaim`] declares the ownership chain from the scope root down to the
+//! enforcing state, plus the closure of every other place that state may live.
+//! The census re-derives both from the tree on every build, so multiplying an
+//! enforcer either re-types a pinned link (OB-13) or opens the closure (OB-14).
 //!
-//! THE MOVE: the doc comment stops being prose and becomes a [`ScopeClaim`] —
-//! a declared ownership CHAIN from the scope root down to the enforcing state,
-//! plus the CLOSURE of every other place that state may live. The census
-//! re-derives both from the tree on every build. Multiplying an enforcer
-//! either re-types a pinned link (OB-13) or opens the closure (OB-14), and the
-//! compile fails.
+//! Obligations (`[OB-n]` tags in the diagnostics):
 //!
-//! The obligations (`[OB-n]` tags in the diagnostics):
+//! * OB-13 chain pinned: each link's field declaration occurs exactly once,
+//!   verbatim, in the declared owner's struct body.
+//! * OB-14 closure: every non-test struct field and construction site of a
+//!   claim's `closed_tokens` type is accounted for by its `chain` or
+//!   `replicas`.
+//! * OB-15 aggregation: a claim with shard replicas names an `aggregator` whose
+//!   body reads every declared access path.
+//! * OB-16 liveness: files exist, owners resolve, the `machine` (if declared)
+//!   resolves in aterm-spec's derive catalog, prose fields are non-empty,
+//!   `chain[0].owner == root`, and every closed token is mentioned by the chain.
+//! * OB-17 vocabulary lock: a [`RESERVED_SCOPE_PHRASES`] phrase in a `///` doc
+//!   block requires the file to be in some claim's `covers_prose_in`, or a
+//!   `scope-waiver: <reason>` line in the block.
+//! * OB-18 standing coherence: every registered standing finding is re-detected
+//!   this run and carries a written finding.
 //!
-//! * OB-13 CHAIN PINNED — every declared link's field declaration occurs
-//!   EXACTLY ONCE, verbatim, in the declared owner's struct body. Re-typing
-//!   `word_decos: WordDecorations` to a per-pane map is a 0-occurrence RED.
-//! * OB-14 CLOSURE — every non-test struct-field declaration and every
-//!   construction site of a claim's `closed_tokens` type must be accounted for
-//!   by its `chain` or its `replicas`. A NEW owner (a per-pane struct, a
-//!   per-pane constructor in a loop) that never touches the chain is RED here.
-//! * OB-15 AGGREGATION — a claim with SHARD replicas must name an
-//!   `aggregator` whose body reads every declared access path. Two copies of
-//!   the enforcing state with no site that reads both IS the bug, restated.
-//! * OB-16 LIVENESS — anti-vacuity, per claim: files exist, owners resolve,
-//!   the `machine` (when declared) resolves in aterm-spec's `derive.rs`, prose
-//!   fields are non-empty, `chain[0].owner == root`, and every closed token is
-//!   actually mentioned by the chain it claims to pin.
-//! * OB-17 VOCABULARY LOCK — a [`RESERVED_SCOPE_PHRASES`] phrase in a `///`
-//!   doc block requires the file to be in some claim's `covers_prose_in`, or
-//!   the block to carry an explicit `scope-waiver: <reason>`. This is the
-//!   RECALL knob: it catches exactly what the human caught.
-//! * OB-18 STANDING COHERENCE — every registered standing finding must still
-//!   be re-detected this run (fixed ⇒ stale-RED, the celebration path) and
-//!   carry a non-empty written finding. Not a waiver channel: a standing
-//!   finding is reprinted in full on every build and re-verified every build.
-//!
-//! OB-13/14/15/16/18 have NO waiver channel, matching the OB-7 lock-order
-//! precedent ("a detected cycle can only be fixed"). Only OB-17 has one,
-//! because it is the recall knob rather than the safety obligation, and a
-//! vocabulary migration with no waiver channel would be rejected on contact.
-//!
-//! ONE implementation, TWO consumers, so runner and gate cannot diverge: the
-//! `aterm-census` bin (`targo --unverified run -p aterm-census -- [<root>]
-//! --scope`), and tools/freeze-safety-gate/build.rs (obligation 5).
+//! Only OB-17 has a waiver channel. Consumers: the `aterm-census` bin
+//! (`targo --unverified run -p aterm-census -- [<root>] --scope`) and
+//! `tools/freeze-safety-gate/build.rs`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::lock_order::{mask_gated_items, mask_literals};
 use crate::{CensusOutcome, collect_rs_files, is_test_file, strip_line_comment};
 
-// ---------------------------------------------------------------------------
-// The claim vocabulary
-// ---------------------------------------------------------------------------
+// The claim vocabulary.
 
-/// The physical thing the safety budget belongs to. DECLARED, never derived:
-/// the census enforces the declaration. Choosing it wrong is a review defect,
-/// not a scan defect — see [`SCOPE_PRECISION_NOTE`].
+/// The physical thing the safety budget belongs to. Declared, not derived; see
+/// [`SCOPE_PRECISION_NOTE`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Scope {
-    /// One per OS window. Two windows are two enforcers ON PURPOSE.
+    /// One per OS window. Two windows are two enforcers on purpose.
     Window,
 }
 
 /// One link of the ownership chain from the scope root down to the enforcing
 /// state.
 ///
-/// `decl` is the field declaration VERBATIM (trimmed). Pinning the SPELLING
-/// rather than parsing the type is the point: `HashMap<PaneId,
-/// WordDecorations>`, `Vec<WordDecorations>`, a type alias and a newtype all
-/// read as a change, and a parser that normalised them away would normalise
-/// away the bug.
+/// `decl` is the field declaration verbatim (trimmed). Pinning the spelling
+/// means a map, `Vec`, alias or newtype all read as a change.
 struct Link {
     file: &'static str,
     owner: &'static str,
@@ -97,15 +70,15 @@ struct Link {
 /// Why a second copy of the enforcing state is sound.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReplicaKind {
-    /// A DIFFERENT scope instance (another process, another surface). Its
+    /// A different scope instance (another process, another surface). Its
     /// budget is its own; nothing has to reconcile the two.
     SeparateScope,
-    /// The SAME scope's state, split across containers. The aggregate property
+    /// The same scope's state, split across containers. The aggregate property
     /// is only real if some site reads every shard — hence [`Aggregator`].
     Shard,
 }
 
-/// A place the enforcing state legitimately lives OUTSIDE the primary chain,
+/// A place the enforcing state legitimately lives outside the primary chain,
 /// with the argument for why a second one is sound.
 struct Replica {
     file: &'static str,
@@ -118,8 +91,7 @@ struct Replica {
 }
 
 /// The fn that must re-establish the aggregate across every shard. Required
-/// whenever a claim has [`ReplicaKind::Shard`] replicas: two copies of the
-/// state with no site that reads both IS the bug, restated.
+/// whenever a claim has [`ReplicaKind::Shard`] replicas.
 struct Aggregator {
     symbol: &'static str,
     file: &'static str,
@@ -127,18 +99,14 @@ struct Aggregator {
     reads: &'static [&'static str],
 }
 
-/// A registered STANDING FINDING: a known, real, deliberately-unfixed
-/// violation, reported on every run and RE-DETECTED every run (OB-18) — never
-/// a waiver. Mirrors [`crate::wasm_census`]'s OB-10/OB-11 discipline: a
-/// finding that stops reproducing is stale-RED and must be deleted, so the
-/// registry cannot rot into a silent exemption.
+/// A registered standing finding: a known, deliberately unfixed violation,
+/// reported and re-detected every run (OB-18). A finding that stops
+/// reproducing is stale and red until deleted.
 struct StandingScopeFinding {
     claim: &'static str,
     obligation: &'static str,
-    /// The exact subject the violation must name (the `detail` of the
-    /// [`Violation`] it excuses). Matching on the SUBJECT, not just the
-    /// obligation, is what stops a second, different violation of the same
-    /// obligation from hiding behind this entry.
+    /// The exact subject the violation must name (its [`Violation`] `detail`),
+    /// so a different violation of the same obligation cannot hide here.
     detail: &'static str,
     finding: &'static str,
 }
@@ -148,9 +116,8 @@ struct StandingScopeFinding {
 struct ScopeClaim {
     /// Stable id; appears in diagnostics and in standing-finding cross-refs.
     id: &'static str,
-    /// The `ty` machine whose invariants ARE the safety argument. `Some`
-    /// forces the model to keep existing (OB-16); `None` requires
-    /// `unmodelled_because` to say why not.
+    /// The `ty` machine whose invariants are the safety argument. `Some` keeps
+    /// the model required (OB-16); `None` requires `unmodelled_because`.
     machine: Option<&'static str>,
     unmodelled_because: &'static str,
     scope: Scope,
@@ -169,9 +136,18 @@ struct ScopeClaim {
     rationale: &'static str,
 }
 
-// ---------------------------------------------------------------------------
-// The registry (the census's fail-closed ground truth)
-// ---------------------------------------------------------------------------
+// The registry (the census's fail-closed ground truth).
+
+/// Why a web host's pipeline is its own scope, not a second enforcer.
+const WEB_PIPELINE_SCOPE: &str = "The web page's pipeline runs in a DIFFERENT PROCESS \
+    driving its own browser surface — its window, its budget (the same limiter is \
+    documented at aterm-wasm/src/effects_api.rs). It never shares a retina with a \
+    native WindowState, so it is a second SCOPE, not a second enforcer inside one scope.";
+
+/// Why a demo binary's pipeline is its own scope.
+const DEMO_PIPELINE_SCOPE: &str = "A standalone example binary (not shipped) that drives \
+    one pipeline over its own offscreen surface: its own process and its own frames, \
+    never a native WindowState's retina — a second SCOPE, not a second enforcer.";
 
 const SCOPE_CLAIMS: &[ScopeClaim] = &[
     ScopeClaim {
@@ -180,11 +156,19 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
         unmodelled_because: "",
         scope: Scope::Window,
         root: "WindowState",
+        // The window owns one `EffectsPipeline`, which owns the one
+        // `WordDecorations`. Both types are closed: a second pipeline anywhere
+        // is a second limiter.
         chain: &[
             Link {
                 file: "crates/aterm-gui/src/lib.rs",
                 owner: "WindowState",
-                decl: "word_decos: crate::word_decorations::WordDecorations,",
+                decl: "fx: aterm_effects::pipeline::EffectsPipeline,",
+            },
+            Link {
+                file: "crates/aterm-effects/src/pipeline.rs",
+                owner: "EffectsPipeline",
+                decl: "decos: WordDecorations,",
             },
             Link {
                 file: "crates/aterm-effects/src/word_decorations.rs",
@@ -192,18 +176,42 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                 decl: "ignitions: Vec<IgnitionReservation>,",
             },
         ],
-        closed_tokens: &["WordDecorations"],
+        closed_tokens: &["WordDecorations", "EffectsPipeline"],
         replicas: &[
             Replica {
-                file: "crates/aterm-effects/src/pipeline.rs",
-                owner: "EffectsPipeline",
-                decl: "decos: WordDecorations,",
+                file: "crates/aterm-wasm/src/lib.rs",
+                owner: "AtermTerminal",
+                decl: "pub(crate) effects: EffectsPipeline,",
                 kind: ReplicaKind::SeparateScope,
-                justification: "The wasm/web pipeline is a DIFFERENT PROCESS driving its \
-                    own browser surface — its window, its budget (the same limiter is \
-                    documented at aterm-wasm/src/effects_api.rs). It never shares a \
-                    retina with a native WindowState, so it is a second SCOPE, not a \
-                    second enforcer inside one scope.",
+                justification: WEB_PIPELINE_SCOPE,
+            },
+            Replica {
+                file: "crates/aterm-gpu-web/src/lib.rs",
+                owner: "AtermGpuTerminal",
+                decl: "pub(crate) effects: EffectsPipeline,",
+                kind: ReplicaKind::SeparateScope,
+                justification: WEB_PIPELINE_SCOPE,
+            },
+            Replica {
+                file: "crates/aterm-effects/examples/wasm_host_echo.rs",
+                owner: "Page",
+                decl: "p: EffectsPipeline,",
+                kind: ReplicaKind::SeparateScope,
+                justification: DEMO_PIPELINE_SCOPE,
+            },
+            Replica {
+                file: "crates/aterm-effects/examples/wasm_host_echo.rs",
+                owner: "boot",
+                decl: "EffectsPipeline::new()",
+                kind: ReplicaKind::SeparateScope,
+                justification: DEMO_PIPELINE_SCOPE,
+            },
+            Replica {
+                file: "crates/aterm-render/examples/cursor_magic_demo.rs",
+                owner: "render_literal_rain",
+                decl: "EffectsPipeline::new()",
+                kind: ReplicaKind::SeparateScope,
+                justification: DEMO_PIPELINE_SCOPE,
             },
             Replica {
                 file: "crates/aterm-gui/src/settings_preview.rs",
@@ -229,9 +237,8 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                     cannot put a luminance transition on the glass.",
             },
         ],
-        // All three replicas are separate SCOPES, not shards, so there is
-        // nothing to re-aggregate: OB-15 requires an aggregator only for
-        // shards, and forbids a dead one.
+        // Every replica is a separate scope, not a shard, so OB-15 requires
+        // (and permits) no aggregator.
         aggregator: None,
         covers_prose_in: &[
             "crates/aterm-effects/src/word_decorations.rs",
@@ -242,41 +249,12 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
             // `flash_limiter_window_model` and its "window-wide" prose moved
             // here when the model catalog was split out of derive.rs by family.
             "crates/aterm-spec/src/derive/models_effects.rs",
-            // `max_streaks`' doc names this limiter, and it is about THIS
-            // claim rather than about the config field it sits on — which is
-            // precisely the case this list exists for. Arrived 2026-08-31 with
-            // PRISM WAKE (6dca65a30).
-            //
-            // WHAT THE SENTENCE SAYS CHANGED (found 2026-09-01, landed
-            // 2026-09-14), and the entry survived the change on purpose. It
-            // used to assert that this window-wide limiter is one of the
-            // governors binding PRISM WAKE's comet rate. That was FALSE: the
-            // streak engine never reserves against `FlashLimiterWindow`, and
-            // no host call does it on the engine's behalf. The doc now names
-            // the limiter in order to DISCLAIM it — a true sentence about this
-            // claim's scope, kept where a reader of `max_streaks` would
-            // otherwise inherit the old error, and the reason this file must
-            // stay in the list rather than drop out of it.
+            // `max_streaks`' doc names this limiter to disclaim it: the streak
+            // engine never reserves against `FlashLimiterWindow`.
             "crates/aterm-gui/src/app_config.rs",
-            // PRISM WAKE's own engine. `OutputStreak`'s doc block names THIS
-            // claim's budget in order to DISCLAIM it — it says the ≤2/s
-            // rolling ignition allowance is window-wide, that it belongs to
-            // `FlashLimiterWindow`, and that PRISM WAKE never reserves against
-            // it (there is no FlashLimiter call in that file and the host makes
-            // none on its behalf), so "one per window" would be the wrong shape
-            // for a per-pane state machine. Naming another scope in order to
-            // disclaim it is exactly the prose OB-17 should want written, and it
-            // must not be the thing that fails the build.
-            //
-            // NOT STALE, and verified rather than assumed: removing this line
-            // makes the real-tree census RED with
-            // "[OB-17] ... `window-wide` in the doc block at
-            // crates/aterm-effects/src/output_streak.rs". Arrived 2026-08-31
-            // with PRISM WAKE (6dca65a30); re-checked when that file's WCAG
-            // prose was corrected (found 2026-09-01, landed 2026-09-14), which
-            // deleted the module header's claim that the streak's spawn floor
-            // sat "inside" this budget — a sentence that invoked a budget the
-            // engine does not spend from.
+            // `OutputStreak`'s doc names this claim's window-wide budget to
+            // disclaim it (the streak engine never reserves against
+            // `FlashLimiterWindow`). Removing this line makes OB-17 red.
             "crates/aterm-effects/src/output_streak.rs",
         ],
         rationale: "WCAG 2.3.1 charges 2 flash pairs per ignition against a \
@@ -297,7 +275,12 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
             Link {
                 file: "crates/aterm-gui/src/lib.rs",
                 owner: "WindowState",
-                decl: "word_decos: crate::word_decorations::WordDecorations,",
+                decl: "fx: aterm_effects::pipeline::EffectsPipeline,",
+            },
+            Link {
+                file: "crates/aterm-effects/src/pipeline.rs",
+                owner: "EffectsPipeline",
+                decl: "decos: WordDecorations,",
             },
             Link {
                 file: "crates/aterm-effects/src/word_decorations.rs",
@@ -305,9 +288,8 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                 decl: "persist: FxHashMap<u64, Episode>,",
             },
         ],
-        // The leaf type is `HashMap<u64, Episode>` — a vocabulary far too
-        // common to close over. This claim's teeth are OB-13 (the chain) plus
-        // OB-15 (the aggregator), not a closure sweep.
+        // The leaf type `HashMap<u64, Episode>` is too common to close over;
+        // this claim relies on OB-13 (the chain) and OB-15 (the aggregator).
         closed_tokens: &[],
         replicas: &[Replica {
             file: "crates/aterm-effects/src/word_decorations.rs",
@@ -354,22 +336,16 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
     },
 ];
 
-/// Registered standing findings — re-detected and REPRINTED on every run
-/// (OB-18), never silenced. EMPTY since 2026-08-08: the supernova-burst-mutex
-/// aggregator finding closed when `super_prepass`'s busy scan grew the
-/// `self.parked` shard chain (the exact repair the finding prescribed) — the
-/// celebration path. The regression test below keeps the check honest.
+/// Registered standing findings, re-detected and reprinted every run (OB-18).
+/// Empty; the regression test below keeps the check honest.
 const SCOPE_STANDING_FINDINGS: &[StandingScopeFinding] = &[];
 
-/// Phrases that assert a scope WIDER than the declaration they sit on. Using
-/// one is a CLAIM, and a claim is an obligation — that is the whole lesson of
-/// the flash limiter: the only thing standing between a photosensitive user
-/// and 2N flashes per second was a human reading the words "window-wide".
+/// Phrases that assert a scope wider than the declaration they sit on; using
+/// one is a claim, and a claim is an obligation.
 ///
-/// "process-wide" is DELIBERATELY ABSENT: a `static` / `OnceLock` is its own
-/// cardinality proof, and every process-wide claim in this tree is one. The
-/// dangerous claims are the ones scoped to a container the type system does
-/// not make unique.
+/// "process-wide" is absent: a `static` / `OnceLock` is its own cardinality
+/// proof. The risky claims are scoped to containers the type system does not
+/// make unique.
 const RESERVED_SCOPE_PHRASES: &[&str] = &[
     "window-wide",
     "window wide",
@@ -382,15 +358,12 @@ const RESERVED_SCOPE_PHRASES: &[&str] = &[
     "one per app",
 ];
 
-/// The explicit OB-17 escape hatch. It is a DIRECTIVE, so it must OPEN a line
-/// of the same doc block (`/// scope-waiver: <reason>`) — see
-/// [`has_waiver_directive`] for why merely naming it in a sentence must not
-/// count.
+/// The OB-17 escape hatch. It must open a line of the doc block
+/// (`/// scope-waiver: <reason>`); see [`has_waiver_directive`].
 const SCOPE_WAIVER_MARKER: &str = "scope-waiver:";
 
 /// Sources this census never reads: its own registry names every token and
-/// every reserved phrase, so scanning it would flag the gate as its own
-/// violation.
+/// reserved phrase.
 const SELF_EXCLUDED_DIR: &str = "crates/aterm-census/src";
 
 /// The honest limits of this census, printed verbatim in every RED diagnostic
@@ -404,7 +377,9 @@ pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits
         `thread_local!`, or a macro-generated field is INVISIBLE: the realistic
         regression (re-typing the field to a per-pane collection, or adding a
         per-pane owner/constructor) is caught, an enforcer that never had a
-        field is not.
+        field is not. A construction is `T {`, `T::new(`, `T::default(`, or
+        `T::f(` for any `f` an `impl T` block in the tree returns `Self` from;
+        one reached through a free fn or a `.clone()` is not seen.
       - THE SCOPE ROOT IS DECLARED, NOT DERIVED. The census enforces `exactly
         one enforcer per WindowState`; it cannot know whether WindowState is
         the physically right scope (WCAG's real scope is a retina, which spans
@@ -426,16 +401,11 @@ pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits
         registry itself names every token and phrase).
 ";
 
-// ---------------------------------------------------------------------------
-// Source primitives
-// ---------------------------------------------------------------------------
+// Source primitives.
 
 /// Every file OB-16 resolves a claim's `machine` against: aterm-spec's
-/// `derive.rs` plus each `derive/*.rs` family module the model catalog is split
-/// across. Enumerated rather than listed so splitting or merging a family
-/// module cannot silently take a machine out of the census's reach — which is
-/// exactly how `FlashLimiterWindow` stopped resolving when the catalog moved
-/// out of the single file.
+/// `derive.rs` plus each `derive/*.rs` family module, enumerated so a split or
+/// merge cannot take a machine out of reach.
 fn derive_model_sources(root: &Path) -> Vec<std::path::PathBuf> {
     let mut paths = vec![root.join("crates/aterm-spec/src/derive.rs")];
     if let Ok(entries) = std::fs::read_dir(root.join("crates/aterm-spec/src/derive")) {
@@ -450,11 +420,9 @@ fn derive_model_sources(root: &Path) -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// Blank comments and string literals, preserving line count and byte offsets
-/// well enough for line-oriented matching. Used by every structural
-/// obligation, so a token inside a doc comment or a diagnostic string can
-/// never be mistaken for a declaration. OB-17 deliberately reads the UNmasked
-/// text — the doc comments are its subject.
+/// Blank comments and string literals, preserving line count and offsets, so
+/// a token in a doc comment or string is never read as a declaration. OB-17
+/// reads the unmasked text, since doc comments are its subject.
 fn mask_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
@@ -465,9 +433,8 @@ fn mask_comments(source: &str) -> String {
     out
 }
 
-/// The body of `struct <owner> {` … matching `}` in `source` (comments already
-/// masked). `None` when the struct is absent — OB-16's "the claim went stale"
-/// signal, never a silent pass.
+/// The body of `struct <owner> {` … matching `}` in masked `source`. `None`
+/// when the struct is absent (OB-16's stale-claim signal).
 fn struct_body<'a>(source: &'a str, owner: &str) -> Option<&'a str> {
     let head = format!("struct {owner} {{");
     let start = source.find(&head)? + head.len();
@@ -547,9 +514,9 @@ fn fn_body<'a>(source: &'a str, symbol: &str) -> Option<&'a str> {
     None
 }
 
-/// The name of the `fn` a byte offset sits inside — the nearest preceding
-/// `fn <ident>(`. Closures are not fns, which is what makes a constructor
-/// inside `|| …` attribute to its enclosing function.
+/// The name of the `fn` a byte offset sits inside (the nearest preceding
+/// `fn <ident>(`). A constructor inside a closure attributes to its enclosing
+/// function.
 fn enclosing_fn(source: &str, at: usize) -> Option<String> {
     let head = &source[..at];
     let mut best: Option<String> = None;
@@ -594,20 +561,8 @@ fn line_of(source: &str, at: usize) -> usize {
     source[..at].bytes().filter(|b| *b == b'\n').count() + 1
 }
 
-/// Every non-test source under `root/crates`, minus this census's own sources.
-///
-/// EXAMPLES ARE SWEPT, and the exclusion that used to sit here is gone with
-/// the two files that bought it. It was added because `companion_box_probe`
-/// and `companion_yield_probe` — hand-run scratch probes, referenced by
-/// nothing — each built a `WordDecorations` to poke at, and the census went
-/// red on a finding that named no reachable defect. That reasoning was sound
-/// as far as it went (an `examples/` target is never linked into a lib, a bin
-/// or the shipped app), but it answered a slop problem by narrowing a gate:
-/// the two probes stayed, and every future example lost its coverage to buy
-/// their silence. The probes are deleted instead, so the sweep gets its full
-/// reach back. An example that constructs an enforcer will now turn this
-/// census red again — which is the gate working, and the right moment to ask
-/// whether that example should exist.
+/// Every non-test source under `root/crates` (examples included), minus this
+/// census's own sources.
 fn sweep_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let _ = collect_rs_files(&root.join("crates"), &mut files);
@@ -628,9 +583,7 @@ fn rel(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-// ---------------------------------------------------------------------------
-// The census
-// ---------------------------------------------------------------------------
+// The census.
 
 /// One obligation violation, before the standing-finding registry decides
 /// whether it is a build-blocking failure or a reported hazard.
@@ -642,15 +595,14 @@ struct Violation {
     message: String,
 }
 
-/// The SCOPE-CARDINALITY census over the live registry. See the module doc.
+/// The scope-cardinality census over the live registry. See the module doc.
 #[must_use]
 pub fn run_scope_census(root: &Path) -> CensusOutcome {
     run_scope_census_over(root, SCOPE_CLAIMS, SCOPE_STANDING_FINDINGS)
 }
 
-/// The census body, parameterised by registry so the tests can drive ONE claim
-/// over a copied-and-mutated real tree (which is what makes the demonstration
-/// a mutation test against the real files rather than a synthetic lookalike).
+/// The census body, parameterised by registry so tests can drive one claim over
+/// a copied-and-mutated real tree.
 fn run_scope_census_over(
     root: &Path,
     claims: &[ScopeClaim],
@@ -672,7 +624,7 @@ fn run_scope_census_over(
         }
         check_aggregation(root, claim, &mut v);
     }
-    // OB-14 and OB-17 both need every non-test source; read the tree ONCE.
+    // OB-14 and OB-17 both need every non-test source; read the tree once.
     let waivers = sweep(root, claims, &mut v);
 
     // The standing-finding registry: partition the violations, then check the
@@ -770,9 +722,8 @@ fn run_scope_census_over(
     }
 }
 
-/// The WHY + REPAIR block every cardinality diagnostic ends with. Printed in
-/// full rather than cross-referenced: the diagnostic has to teach the class to
-/// whoever hit it, including an agent with no memory of this file.
+/// The why + repair block every cardinality diagnostic ends with, printed in
+/// full so the diagnostic explains the class on its own.
 fn why_and_repair(claim: &ScopeClaim) -> String {
     format!(
         "\x20   WHY THIS IS AN OBLIGATION: {}\n\
@@ -785,8 +736,8 @@ fn why_and_repair(claim: &ScopeClaim) -> String {
     )
 }
 
-/// OB-16: anti-vacuity. A claim that no longer resolves against the tree must
-/// go RED, never quietly green — the whole point of pinning.
+/// OB-16: anti-vacuity. A claim that no longer resolves against the tree is
+/// red.
 fn check_liveness(root: &Path, claim: &ScopeClaim, v: &mut Vec<Violation>) {
     let mut fail = |detail: &str, message: String| {
         v.push(Violation {
@@ -899,7 +850,7 @@ fn check_liveness(root: &Path, claim: &ScopeClaim, v: &mut Vec<Violation>) {
     }
 }
 
-/// OB-13: the pinned declaration occurs EXACTLY ONCE in its declared owner.
+/// OB-13: the pinned declaration occurs exactly once in its declared owner.
 fn check_link(root: &Path, claim: &ScopeClaim, link: &Link, v: &mut Vec<Violation>) {
     let Ok(source) = std::fs::read_to_string(root.join(link.file)) else {
         v.push(Violation {
@@ -952,12 +903,19 @@ fn check_link(root: &Path, claim: &ScopeClaim, link: &Link, v: &mut Vec<Violatio
     });
 }
 
-/// The ONE pass over the tree that discharges OB-14 (closure) and OB-17
+/// The one pass over the tree that discharges OB-14 (closure) and OB-17
 /// (vocabulary). Returns the explicit-waiver count.
 fn sweep(root: &Path, claims: &[ScopeClaim], v: &mut Vec<Violation>) -> usize {
     let closing = claims.iter().any(|c| !c.closed_tokens.is_empty());
+    let files = sweep_files(root);
+    let ctors = if closing {
+        closed_token_ctors(&files, claims)
+    } else {
+        BTreeMap::new()
+    };
+    let no_ctors = BTreeSet::new();
     let mut waivers = 0usize;
-    for path in sweep_files(root) {
+    for path in files {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -974,17 +932,17 @@ fn sweep(root: &Path, claims: &[ScopeClaim], v: &mut Vec<Violation>) -> usize {
         for claim in claims {
             for token in claim.closed_tokens {
                 check_closure_fields(claim, &file, &structs, token, v);
-                check_closure_ctors(claim, &file, &masked, token, v);
+                let named = ctors.get(token).unwrap_or(&no_ctors);
+                check_closure_ctors(claim, &file, &masked, token, named, v);
             }
         }
     }
     waivers
 }
 
-/// The FIELD half of OB-14. Enumerating struct BODIES (rather than grepping
-/// lines) is what keeps enum variants (`DeadlineOwner::WordDecorations`) and
-/// fn parameters (`decos: &mut WordDecorations`) out of the closure — a
-/// line-regex cannot tell them apart.
+/// The field half of OB-14. Enumerating struct bodies keeps enum variants
+/// (`DeadlineOwner::WordDecorations`) and fn parameters
+/// (`decos: &mut WordDecorations`) out of the closure.
 fn check_closure_fields(
     claim: &ScopeClaim,
     file: &str,
@@ -1029,13 +987,168 @@ fn check_closure_fields(
     }
 }
 
-/// The CONSTRUCTION half of OB-14: a per-pane engine needs no field at all if
+/// Whether the text before a type token ends in a fn signature's return
+/// arrow, optionally through a reference (`-> T`, `-> &T`, `-> &mut T`,
+/// `-> &'a mut T`).
+fn returns_token(before: &str) -> bool {
+    let mut rest = before.trim_end();
+    if let Some(r) = rest.strip_suffix("mut")
+        && r.ends_with(|c: char| c.is_whitespace() || c == '&')
+    {
+        rest = r.trim_end();
+    }
+    if let Some(q) = rest.rfind('\'')
+        && !rest[q + 1..].is_empty()
+        && rest[q + 1..]
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_')
+    {
+        rest = rest[..q].trim_end();
+    }
+    if let Some(r) = rest.strip_suffix('&') {
+        rest = r.trim_end();
+    }
+    rest.ends_with("->")
+}
+
+/// Every closed token's named constructors: associated fns of its `impl`
+/// blocks whose return type is the token (`-> Self`, `-> Option<Self>`, …),
+/// e.g. `EffectsPipeline::for_window`.
+fn closed_token_ctors(
+    files: &[std::path::PathBuf],
+    claims: &[ScopeClaim],
+) -> BTreeMap<&'static str, BTreeSet<String>> {
+    let tokens: BTreeSet<&'static str> = claims
+        .iter()
+        .flat_map(|c| c.closed_tokens.iter().copied())
+        .collect();
+    let mut out: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    for path in files {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !raw.contains("impl") || !tokens.iter().any(|t| raw.contains(t)) {
+            continue;
+        }
+        let masked = mask_comments(&mask_gated_items(&raw, UNSHIPPED_GATES));
+        for &token in &tokens {
+            for body in impl_bodies(&masked, token) {
+                out.entry(token)
+                    .or_default()
+                    .extend(self_returning_fns(body, token));
+            }
+        }
+    }
+    out
+}
+
+/// The bodies of every `impl … <token> {` (inherent or trait) in a masked
+/// source: the self type is what follows `for`, else what follows `impl` and
+/// its generics, with any path and generic arguments stripped.
+fn impl_bodies<'a>(masked: &'a str, token: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = masked[from..].find("impl") {
+        let at = from + rel;
+        from = at + "impl".len();
+        if !word_at(masked, at, "impl") {
+            continue;
+        }
+        let Some(open) = masked[from..].find(['{', ';']).map(|i| from + i) else {
+            break;
+        };
+        if masked.as_bytes()[open] != b'{' {
+            continue;
+        }
+        let mut header = masked[from..open].trim();
+        if let Some(where_at) = header.find(" where ") {
+            header = header[..where_at].trim();
+        }
+        let self_ty = match header.rfind(" for ") {
+            Some(f) => header[f + " for ".len()..].trim(),
+            None if header.starts_with('<') => skip_generics(header),
+            None => header,
+        };
+        let self_ty = self_ty.split('<').next().unwrap_or_default();
+        let self_ty = self_ty.rsplit("::").next().unwrap_or_default().trim();
+        if self_ty == token
+            && let Some(body) = brace_body(masked, open + 1)
+        {
+            out.push(body);
+        }
+    }
+    out
+}
+
+/// `<'a, T: X<Y>> Rest` → `Rest`.
+fn skip_generics(header: &str) -> &str {
+    let mut depth = 0i32;
+    for (i, c) in header.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return header[i + 1..].trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    ""
+}
+
+/// The names of the fns in an impl body whose return type names `Self` or
+/// the token by value (a `&Self` return lends, it builds nothing).
+fn self_returning_fns(body: &str, token: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find("fn ") {
+        let at = from + rel;
+        from = at + "fn ".len();
+        if !word_at(body, at, "fn") {
+            continue;
+        }
+        let rest = &body[from..];
+        let name_len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if name_len == 0 {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut end = rest.len();
+        for (i, b) in rest.bytes().enumerate().skip(name_len) {
+            match b {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'{' | b';' if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some((_, ret)) = rest[..end].split_once("->") else {
+            continue;
+        };
+        let ret = ret.split(" where ").next().unwrap_or_default().trim();
+        let names = |w: &str| ret.match_indices(w).any(|(i, _)| word_at(ret, i, w));
+        if !ret.starts_with('&') && (names("Self") || names(token)) {
+            out.push(rest[..name_len].to_string());
+        }
+    }
+    out
+}
+
+/// The construction half of OB-14: a per-pane engine needs no field at all if
 /// something builds one inside a loop.
 fn check_closure_ctors(
     claim: &ScopeClaim,
     file: &str,
     masked: &str,
     token: &str,
+    named_ctors: &BTreeSet<String>,
     v: &mut Vec<Violation>,
 ) {
     let mut from = 0usize;
@@ -1047,17 +1160,21 @@ fn check_closure_ctors(
         }
         let tail = &masked[at + token.len()..];
         let trimmed = tail.trim_start();
-        // `T::default()` / `T::new(` / `T {` — the three ways this tree builds
-        // an engine. A single space before the brace keeps `T| {` (a closure
-        // parameter) and `T) {` (a fn signature) out.
-        let is_ctor = tail.starts_with("::default()")
-            || tail.starts_with("::new(")
+        // `T::default()` / `T::new(` / `T::<named ctor>(` / `T {`. `default`
+        // and `new` count even for derives or out-of-tree definitions. The
+        // single space before the brace excludes `T| {` and `T) {`.
+        let assoc = tail.strip_prefix("::").and_then(|t| {
+            let len = t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+            t[len..].starts_with('(').then_some(&t[..len])
+        });
+        let is_ctor = assoc
+            .is_some_and(|f| f == "default" || f == "new" || named_ctors.contains(f))
             || (trimmed.starts_with('{') && tail.len() - trimmed.len() <= 1);
         if !is_ctor {
             continue;
         }
         // `struct X {`, `impl X {`, `impl Default for X {`, `enum`, `trait`,
-        // `union` are DEFINITIONS, not constructions.
+        // `union` are definitions, not constructions.
         let prev_word = masked[..at]
             .split_whitespace()
             .next_back()
@@ -1066,6 +1183,11 @@ fn check_closure_ctors(
             prev_word,
             "struct" | "impl" | "for" | "enum" | "trait" | "union"
         ) {
+            continue;
+        }
+        // `fn decos(&self) -> &X {` is a signature whose body brace follows
+        // its return type: an accessor lends the one instance, it builds none.
+        if returns_token(&masked[..at]) {
             continue;
         }
         let line_start = masked[..at].rfind('\n').map_or(0, |i| i + 1);
@@ -1194,9 +1316,8 @@ fn check_aggregation(root: &Path, claim: &ScopeClaim, v: &mut Vec<Violation>) {
     }
 }
 
-/// OB-17: a reserved scope phrase in a `///` block is a CLAIM. Returns the
-/// number of explicit waivers seen, so the exception set is visible in the
-/// GREEN line rather than silent.
+/// OB-17: a reserved scope phrase in a `///` block is a claim. Returns the
+/// number of explicit waivers seen, shown in the green line.
 fn check_vocabulary(
     claims: &[ScopeClaim],
     file: &str,
@@ -1240,18 +1361,9 @@ fn check_vocabulary(
     waivers
 }
 
-/// Does this doc block TAKE the OB-17 waiver, as opposed to merely talking
-/// about it?
-///
-/// The marker must OPEN a doc line (`/// scope-waiver: <reason>`). A
-/// `contains` test over the whole block exempts any block that names the
-/// marker in passing — and one in this tree did exactly that: `kitty_pet.rs`'s
-/// flight-scalar doc explained that it was deliberately NOT taking the waiver,
-/// spelled the marker to say so, and was silently waived for it. A waiver
-/// channel that can be opened by accident is the "registry rots into a silent
-/// exemption" failure this census exists to refuse. Every real waiver in the
-/// tree is already written as its own directive line, so the tightening costs
-/// them nothing.
+/// Whether this doc block takes the OB-17 waiver, as opposed to mentioning it.
+/// The marker must open a doc line (`/// scope-waiver: <reason>`); naming it
+/// in a sentence does not count.
 fn has_waiver_directive(block: &str) -> bool {
     block.lines().any(|line| {
         line.trim_start()
@@ -1262,8 +1374,8 @@ fn has_waiver_directive(block: &str) -> bool {
 }
 
 /// Every maximal run of `///` lines in a source, as `(1-based start line,
-/// text)`. `//!` module prose is deliberately out of scope: it documents a
-/// module, whose cardinality no declaration owns.
+/// text)`. `//!` module prose is out of scope: no declaration owns a module's
+/// cardinality.
 fn doc_blocks(source: &str) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     let mut current: Option<(usize, String)> = None;
@@ -1289,19 +1401,10 @@ fn doc_blocks(source: &str) -> Vec<(usize, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The real checkout: the main tests mutate copies of the real claim files
+    // rather than synthetic lookalikes.
+    use crate::scan_set::test_fixtures::repo_root;
     use std::path::PathBuf;
-
-    /// The real aterm checkout this crate lives in. The centrepiece test is a
-    /// MUTATION test against the REAL claim files (copied, then edited), not a
-    /// synthetic lookalike: a gate demonstrated only on a fixture proves
-    /// nothing about the tree it is supposed to guard.
-    fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("crates/aterm-census lives two levels under the aterm root")
-            .to_path_buf()
-    }
 
     fn claim_by_id(id: &str) -> &'static ScopeClaim {
         SCOPE_CLAIMS
@@ -1311,9 +1414,7 @@ mod tests {
     }
 
     /// Every repo-relative file a claim names, plus the whole derived-model
-    /// catalog (OB-16 resolves the `machine` across `derive.rs` + `derive/*.rs`,
-    /// so a fixture root missing the split modules would fail OB-16 for a
-    /// reason the fixture is not testing).
+    /// catalog OB-16 resolves `machine` against.
     fn claim_files(claim: &ScopeClaim) -> Vec<String> {
         let repo = repo_root();
         let mut files: Vec<String> = derive_model_sources(&repo)
@@ -1354,10 +1455,8 @@ mod tests {
         std::fs::write(path, contents).expect("write file");
     }
 
-    /// Apply a mutation to a copied file, asserting it actually applied.
-    /// Without this guard a stale `from` would make the whole demonstration
-    /// vacuous: the census would go green on an unmutated tree and the test
-    /// would still pass.
+    /// Apply a mutation to a copied file, asserting it applied (a stale `from`
+    /// would make the test vacuous).
     fn mutate(root: &Path, rel: &str, from: &str, to: &str) {
         let path = root.join(rel);
         let before = std::fs::read_to_string(&path).expect("read for mutation");
@@ -1374,9 +1473,8 @@ mod tests {
         run_scope_census_over(root, std::slice::from_ref(claim), &[])
     }
 
-    /// The union of every claim's files — used where the WHOLE registry has to
-    /// run (the vocabulary lock is registry-wide, so a partial registry over a
-    /// tree containing another claim's prose would fail for the wrong reason).
+    /// The union of every claim's files, for runs that need the whole registry
+    /// (the vocabulary lock is registry-wide).
     fn all_claim_files() -> Vec<String> {
         let mut files: Vec<String> = SCOPE_CLAIMS.iter().flat_map(claim_files).collect();
         files.sort();
@@ -1384,9 +1482,9 @@ mod tests {
         files
     }
 
-    /// THE CENTREPIECE. The proposed refactor — every split pane gets its own
-    /// `WordDecorations`, hence its own limiter — applied VERBATIM to a copy of
-    /// the real `crates/aterm-gui/src/lib.rs`. GREEN before, RED after.
+    /// Giving every split pane its own effects pipeline (and so its own
+    /// limiter), applied to a copy of the real `crates/aterm-gui/src/lib.rs`:
+    /// green before, red after.
     #[test]
     fn a_per_pane_word_decorations_map_fails_the_flash_limiter_chain() {
         let claim = claim_by_id("flash-limiter");
@@ -1403,14 +1501,14 @@ mod tests {
         mutate(
             &root,
             "crates/aterm-gui/src/lib.rs",
-            "    word_decos: crate::word_decorations::WordDecorations,\n",
-            "    word_decos: std::collections::HashMap<u64, \
-             crate::word_decorations::WordDecorations>,\n",
+            "    fx: aterm_effects::pipeline::EffectsPipeline,\n",
+            "    fx: std::collections::HashMap<u64, \
+             aterm_effects::pipeline::EffectsPipeline>,\n",
         );
         let after = run_one(&root, claim);
         assert!(
             !after.ok,
-            "a per-pane WordDecorations map MUST fail the flash-limiter chain:\n{}",
+            "a per-pane pipeline map MUST fail the flash-limiter chain:\n{}",
             after.log
         );
         assert!(
@@ -1426,8 +1524,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The chain is UNTOUCHED, so OB-13 alone would miss this: a brand-new
-    /// per-pane owner of the engine.
+    /// With the chain untouched, a new per-pane owner of the engine or of a
+    /// pipeline around it is caught by OB-14.
     #[test]
     fn a_new_per_pane_owner_fails_the_closure() {
         let claim = claim_by_id("flash-limiter");
@@ -1452,6 +1550,22 @@ mod tests {
         assert!(
             out.log.contains("[OB-14]") && out.log.contains("PaneState"),
             "OB-14 must name the unaccounted owner:\n{}",
+            out.log
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = copy_root("per-pane-pipeline", &claim_files(claim));
+        write_file(
+            &root,
+            "crates/aterm-gui/src/pane_fx.rs",
+            "pub(crate) struct PaneFx {\n\
+             \x20   pub(crate) fx: aterm_effects::pipeline::EffectsPipeline,\n\
+             }\n",
+        );
+        let out = run_one(&root, claim);
+        assert!(
+            !out.ok && out.log.contains("[OB-14]") && out.log.contains("PaneFx"),
+            "a per-pane pipeline is a second limiter and must open the closure:\n{}",
             out.log
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1492,9 +1606,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Anti-vacuity in both directions: a claim that stops matching the tree
-    /// goes RED, it never quietly passes. This is the per-claim form of the
-    /// `wasm_clock_safety` / `hdr_gate` discipline.
+    /// The discovery, pinned on the real tree: the window's constructor is
+    /// found, and a method that returns something else is not.
+    #[test]
+    fn named_constructors_are_discovered_from_impl_blocks() {
+        let ctors = closed_token_ctors(&sweep_files(&repo_root()), SCOPE_CLAIMS);
+        let fx = &ctors["EffectsPipeline"];
+        for f in ["new", "default", "for_window"] {
+            assert!(fx.contains(f), "`EffectsPipeline::{f}` builds one: {fx:?}");
+        }
+        assert!(
+            !fx.contains("word_panes"),
+            "a borrow is no constructor: {fx:?}"
+        );
+        let body = "fn a() -> Self {} fn b(&self) -> &Self {} fn c() -> Option<Self> {}\n\
+                    fn d(&self) -> u32 { 0 } fn e() -> T where X: Y {}";
+        assert_eq!(self_returning_fns(body, "T"), ["a", "c", "e"]);
+        let src = "impl<'a> T<'a> { fn a() {} }\nimpl Default for crate::m::T { fn b() {} }\n\
+                   impl U { fn c() {} }\nimpl X for Ts { fn d() {} }";
+        assert_eq!(impl_bodies(src, "T").len(), 2);
+    }
+
+    /// The same loop through a named constructor
+    /// (`EffectsPipeline::for_window()`): any associated fn of a closed token
+    /// returning `Self` builds one.
+    #[test]
+    fn a_per_pane_named_constructor_fails_the_closure() {
+        let claim = claim_by_id("flash-limiter");
+        let mut files = claim_files(claim);
+        files.push("crates/aterm-effects/src/pipeline_native.rs".to_string());
+        let root = copy_root("per-pane-named-ctor", &files);
+        let native = std::fs::read_to_string(root.join(&files[files.len() - 1]))
+            .expect("read pipeline_native.rs");
+        assert!(
+            native.contains("pub fn for_window() -> Self {"),
+            "the window's constructor moved: re-pin this row, or it proves nothing"
+        );
+        assert!(run_one(&root, claim).ok);
+
+        write_file(
+            &root,
+            "crates/aterm-gui/src/pane_fx_probe.rs",
+            "pub(crate) fn pane_pipelines(n: usize) -> Vec<aterm_effects::pipeline::EffectsPipeline> {\n\
+             \x20   let mut v = Vec::new();\n\
+             \x20   for _ in 0..n {\n\
+             \x20       v.push(aterm_effects::pipeline::EffectsPipeline::for_window());\n\
+             \x20   }\n\
+             \x20   v\n\
+             }\n",
+        );
+        let out = run_one(&root, claim);
+        assert!(
+            !out.ok
+                && out.log.contains("[OB-14]")
+                && out.log.contains("construction of `EffectsPipeline`")
+                && out.log.contains("pane_pipelines"),
+            "a per-pane `for_window()` is a second limiter and must open the closure, \
+             naming the fn:\n{}",
+            out.log
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Anti-vacuity: a claim that stops matching the tree goes red.
     #[test]
     fn a_renamed_field_or_owner_fails_stale_rather_than_silently_passing() {
         let claim = claim_by_id("flash-limiter");
@@ -1503,8 +1677,8 @@ mod tests {
         mutate(
             &root,
             "crates/aterm-gui/src/lib.rs",
-            "    word_decos: crate::word_decorations::WordDecorations,\n",
-            "    decos: crate::word_decorations::WordDecorations,\n",
+            "    fx: aterm_effects::pipeline::EffectsPipeline,\n",
+            "    effects: aterm_effects::pipeline::EffectsPipeline,\n",
         );
         let out = run_one(&root, claim);
         assert!(!out.ok, "a renamed claimed field must go RED:\n{}", out.log);
@@ -1532,7 +1706,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// OB-17 both ways on a synthetic tree (no claims at all, so ONLY the
+    /// OB-17 both ways on a synthetic tree (no claims at all, so only the
     /// vocabulary lock runs).
     #[test]
     fn an_undeclared_window_wide_doc_claim_fails_the_vocabulary_lock() {
@@ -1569,10 +1743,8 @@ mod tests {
             out.log
         );
 
-        // A MENTION is not a directive. This is the shape that was silently
-        // waived in kitty_pet.rs: a block that names the marker to explain why
-        // it is NOT taking the waiver. `contains` over the block let it
-        // through; the line-leading rule does not.
+        // A mention of the marker, explaining why the waiver is not taken, is
+        // not a directive.
         write_file(
             &root,
             "crates/aterm-thing/src/lib.rs",
@@ -1592,10 +1764,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// FALSE-POSITIVE CALIBRATION, pinned against the real shapes: an enum
-    /// VARIANT named after the type, a `Self::`-qualified variant, an `impl`
-    /// block, and a `&mut` fn PARAMETER are not owners of the enforcing state.
-    /// A line-regex closure would flag every one of them.
+    /// An accessor's signature is not a construction: its body brace follows
+    /// its return type (`-> &T {`), which the ctor scan would otherwise read
+    /// as a struct literal. A real literal behind a borrow still counts.
+    #[test]
+    fn a_return_type_is_not_a_construction() {
+        for before in [
+            "pub fn decos(&self) -> ",
+            "pub fn decos(&self) -> &",
+            "pub fn decos_mut(&mut self) -> &mut ",
+            "fn lend<'a>(x: &'a Y) -> &'a mut ",
+            "fn lend<'a>(x: &'a Y) -> &'a ",
+        ] {
+            assert!(returns_token(before), "{before:?} is a return type");
+        }
+        for before in ["let a = &", "let a = ", "    decos: ", "out.push("] {
+            assert!(!returns_token(before), "{before:?} is not a return type");
+        }
+    }
+
+    /// False-positive calibration on real shapes: an enum variant named after
+    /// the type, a `Self::`-qualified variant, an `impl` block and a `&mut` fn
+    /// parameter are not owners of the enforcing state.
     #[test]
     fn enum_variants_and_fn_parameters_are_not_owners() {
         let claim = claim_by_id("flash-limiter");
@@ -1623,8 +1813,7 @@ mod tests {
             motion.contains("SeriousEffect::WordDecorations"),
             "qualified variant gone"
         );
-        // The curse-bonk drain's `decos` parameter (the sound policy moved
-        // into the engine with host-boundary Phase 4, 2026-09-27).
+        // The curse-bonk drain's `decos` parameter.
         let drain = std::fs::read_to_string(root.join("crates/aterm-effects/src/sound_policy.rs"))
             .expect("read sound_policy.rs");
         assert!(
@@ -1646,9 +1835,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// OB-15 both ways, post-celebration: the repaired aggregator passes clean
-    /// on the real tree, and REGRESSING it (dropping the parked-shard chain)
-    /// goes RED immediately — with no standing finding left to excuse it.
+    /// OB-15 both ways: the aggregator passes on the real tree, and dropping
+    /// the parked-shard fold goes red.
     #[test]
     fn the_supernova_aggregator_regression_goes_red() {
         let root = copy_root("supernova-standing", &all_claim_files());
@@ -1665,15 +1853,9 @@ mod tests {
             out.log
         );
 
-        // Regress the aggregator: drop the parked-shard contribution from the
-        // scan. The aggregator no longer CHAINS every parked shard's whole
-        // episode map onto its live walk (that was `O(panes × total episodes)`
-        // per presented frame); each shard now carries an O(1) burst-mutex
-        // summary re-derived at its one choke point, and the aggregator folds
-        // those summaries in. The obligation is unchanged — the aggregate must
-        // still be computed over ALL shards, not just the bound one — so the
-        // demonstration deletes the fold, which is exactly today's spelling of
-        // "this scan sees one pane only".
+        // Drop the parked-shard fold: each shard carries an O(1) burst-mutex
+        // summary that the aggregator must fold in, so removing it means the
+        // scan sees one pane only.
         mutate(
             &root,
             "crates/aterm-effects/src/word_decorations.rs",
@@ -1694,12 +1876,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A REGISTERED standing finding keeps the census GREEN and comes back in
-    /// `standing`, whole, beside the log. The build gate prints a green build's
-    /// transcript nowhere a reader sees it and forwards `standing` as warnings,
-    /// so this field is the only road a standing hazard has to the owner; before
-    /// it existed a green build said "N STANDING finding(s) reported above"
-    /// about text cargo had hidden.
+    /// A registered standing finding keeps the census green and is returned
+    /// whole in `standing`, which the build gate forwards as warnings.
     #[test]
     fn a_registered_standing_finding_is_returned_whole_beside_the_log() {
         let root = copy_root("supernova-registered", &all_claim_files());
@@ -1737,11 +1915,8 @@ mod tests {
         );
     }
 
-    /// No standing finding is registered. The supernova aggregator finding
-    /// closed on 2026-08-08, and a standing block prints only for a registered
-    /// entry, so an empty registry is the whole claim. The live tree's GREEN is
-    /// not re-walked here: `tools/freeze-safety-gate`'s build runs this census
-    /// over the checkout on every `verify --fast` and fails the compile on RED.
+    /// No standing finding is registered. The live tree is walked by
+    /// `tools/freeze-safety-gate`'s build, not here.
     #[test]
     fn no_scope_standing_finding_is_registered() {
         assert!(

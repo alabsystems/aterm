@@ -1,55 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **aterm-fleet** — the fleet-federation bridge. It turns N per-instance control
-//! sockets into ONE fabric an orchestrator talks to:
+//! `aterm-fleet`: the fleet-federation bridge, turning the per-instance control
+//! sockets into one stream an orchestrator on this machine talks to:
 //!
-//!   aterm-fleet events                 federate: subscribe to `events` on every live
-//!                                      instance in the default socket dir, merge them,
-//!                                      and emit one NDJSON record per event on stdout —
-//!                                      each addressed by an astream Subject
-//!                                      `/fleet/<pid>/events/<sid>`. An instance bound to
-//!                                      an explicit --control-sock is listed but not
-//!                                      federated: the streamer addresses it by `--pid`,
-//!                                      which resolves only default-dir sockets.
+//! - `events`: subscribe to `events` on every live instance in the default
+//!   socket dir and emit one NDJSON record per event, addressed
+//!   `/fleet/<pid>/events/<sid>`. An instance on an explicit `--control-sock`
+//!   is listed but not federated (the streamer resolves `--pid` only in the
+//!   default dir).
+//! - `exec`: run each stdin line (`@<sid> <verb> [args…]`, an aterm-ctl verb
+//!   line) against the fleet and emit one NDJSON result per command.
+//! - `status|manage|…`: thin clients of the opt-in operator embedded in the
+//!   caller's aterm instance.
 //!
-//!   aterm-fleet exec                   dispatch: read command lines from stdin, one per
-//!                                      line (`@<sid> <verb> [args…]` — an aterm-ctl verb
-//!                                      line), run each against the fleet, and emit an
-//!                                      NDJSON result record per command.
-//!
-//!   aterm-fleet status|manage|...      thin clients of the opt-in operator
-//!                                      embedded in the caller's aterm instance.
-//!
-//! ## Why this shape, and where astream fits
-//!
-//! astream's broker exists, and aterm's fabric rides it: `crates/aterm-link`
-//! path-depends on `astream-broker` and carries the inbox, the post verbs and the
-//! fleet halt under `/f/<F>/…`. This bridge is deliberately NOT on it. `events` and
-//! `exec` are local glue — NDJSON over stdio, so redirecting `events` to a file gives
-//! an append-only replay log — for an orchestrator on this machine that wants every
-//! instance's stream in one pipe. The `/fleet/<pid>/events/<sid>` and
-//! `/fleet/commands/…` Subjects on the records are address labels in astream's
-//! grammar, not broker subjects: nothing publishes them, and cross-machine traffic
-//! goes through the fabric, not here.
-//!
-//! The bridge holds NO engine state and evaluates NO predicates — it is pure glue
-//! over `aterm-ctl`, so it inherits the control plane's auth, relay, and semantics
-//! verbatim (a cross-instance `@<sid>` is relayed by aterm-ctl exactly as always).
-//! DISCOVERY is glue over the aterm-ctl CRATE (`fleet_sessions`, the listing `ls`
-//! itself prints); the long-lived `subscribe` streamers and the `exec` dispatch
-//! are still glue over the aterm-ctl BINARY, resolved by [`ctl_bin`].
+//! This is local NDJSON glue, not the astream fabric (`crates/aterm-link`
+//! carries the cross-machine inbox and posts); the `/fleet/…` subjects are
+//! address labels nothing publishes. The bridge holds no engine state: discovery
+//! uses the aterm-ctl crate (`fleet_sessions`), and the streamers and `exec`
+//! run the aterm-ctl binary ([`ctl_bin`]), inheriting its auth and relay.
 
+use aterm_uds::spawnfd::Stdio;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
-use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
-/// The whole fleet CLI as a callable: `argv[1..]` in, process exit code out.
-/// Served in-process by the
-/// ONE `aterm` binary (`aterm fleet …` / argv0 alias) and by the thin
-/// standalone bin.
+/// The whole fleet CLI as a callable: `argv[1..]` in, process exit code out,
+/// served by `aterm fleet …`, the argv0 alias and the standalone bin.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     let mode = argv.first().map(|a| a.to_string_lossy().into_owned());
     match mode.as_deref() {
@@ -64,36 +42,36 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         ) => operator_command(command, &argv[1..]),
         Some("-h") | Some("--help") | None => usage(),
         Some(_) => {
-            eprintln!("aterm-fleet: no such mode; run `aterm fleet --help`");
+            eprintln!("aterm fleet: no such mode; run `aterm fleet --help`");
             ExitCode::from(2)
         }
     }
 }
 
 fn usage() -> ExitCode {
-    let help = "aterm-fleet — watch and drive the sessions of every aterm window \
+    let help = "aterm fleet — watch and drive the sessions of every aterm window \
          on this machine.\n\n\
          USAGE:\n\
-         \x20 aterm-fleet events     merge the `subscribe events` of every live instance in the\n\
-         \x20                        default socket dir to stdout as NDJSON, addressed by astream\n\
-         \x20                        Subject /fleet/<pid>/events/<sid> (an instance on an explicit\n\
+         \x20 aterm fleet events     merge the `subscribe events` of every live instance in the\n\
+         \x20                        default socket dir to stdout as NDJSON, addressed\n\
+         \x20                        /fleet/<pid>/events/<sid> (an instance on an explicit\n\
          \x20                        --control-sock is listed by `ls` but not federated)\n\
-         \x20 aterm-fleet exec       read `@<sid> <verb> [args...]` command lines from stdin,\n\
+         \x20 aterm fleet exec       read `@<sid> <verb> [args...]` command lines from stdin,\n\
          \x20                        dispatch each to the fleet, emit an NDJSON result per line\n\
          \x20                        retain stdout/stderr and exit_code; exit 1 if any command fails\n\
          \x20                        stdin failure emits batch_error with input_line and dispatched count\n\
-         \x20 aterm-fleet status     show the embedded operator and managed allowlist\n\
-         \x20 aterm-fleet inspect <event>\n\
-         \x20 aterm-fleet manage <sid> | unmanage <sid>\n\
-         \x20 aterm-fleet next [timeout=<ms>]\n\
-         \x20 aterm-fleet extend <event> <claim-token> [ms=<n>]\n\
-         \x20 aterm-fleet ack <event> <claim-token> <no-action|pause|escalate>\n\
-         \x20 aterm-fleet reconcile <event> <claim-token> <acted|no-action|pause|escalate> confirm=human\n\
-         \x20 aterm-fleet clear-fault confirm=human\n\
-         \x20 aterm-fleet propose    read one guarded-turn JSON proposal from stdin\n\n\
+         \x20 aterm fleet status     show the embedded operator and managed allowlist\n\
+         \x20 aterm fleet inspect <event>\n\
+         \x20 aterm fleet manage <sid> | unmanage <sid>\n\
+         \x20 aterm fleet next [timeout=<ms>]\n\
+         \x20 aterm fleet extend <event> <claim-token> [ms=<n>]\n\
+         \x20 aterm fleet ack <event> <claim-token> <no-action|pause|escalate>\n\
+         \x20 aterm fleet reconcile <event> <claim-token> <acted|no-action|pause|escalate> confirm=human\n\
+         \x20 aterm fleet clear-fault confirm=human\n\
+         \x20 aterm fleet propose    read one guarded-turn JSON proposal from stdin\n\n\
          The operator verbs need `[operator] enabled = true` in aterm.toml (else they\n\
          answer `ERR operator unavailable`) and a `manage <sid>` per session, kept\n\
-         across relaunches. See docs/OPERATOR-EMBEDDED.md.\n";
+         across relaunches. See `aterm help fleet`.\n";
     print!("{help}");
     ExitCode::SUCCESS
 }
@@ -107,7 +85,7 @@ fn operator_command(command: &str, args: &[std::ffi::OsString]) -> ExitCode {
     let ctl_args = match operator_ctl_args(command, args) {
         Ok(ctl_args) => ctl_args,
         Err(error) => {
-            eprintln!("aterm-fleet: {error}");
+            eprintln!("aterm fleet: {error}");
             return ExitCode::from(2);
         }
     };
@@ -132,12 +110,11 @@ fn operator_ctl_args(
     Ok(ctl_args)
 }
 
-/// Resolve the `aterm-ctl` BINARY for the child-process paths that still need
-/// one — the per-instance `subscribe` streamers and `exec` dispatch: the alias
-/// beside this binary (the co-distributed toolchain layout), else the bare name
-/// on `PATH`. Discovery no longer goes through it (see
-/// [`list_sessions`]), so a missing binary is now a streaming/dispatch failure
-/// only, never a silently empty fleet.
+/// Resolve the `aterm-ctl` binary for the child-process paths that need one
+/// (the per-instance `subscribe` streamers and `exec` dispatch): the alias
+/// beside this binary, else the bare name on `PATH`. Discovery does not use it
+/// (see [`list_sessions`]), so a missing binary fails streaming and dispatch
+/// only.
 fn ctl_bin() -> String {
     std::env::current_exe()
         .ok()
@@ -155,21 +132,13 @@ struct Session {
     sid: String,
 }
 
-/// Snapshot the fleet IN-PROCESS, through the `aterm-ctl` CRATE's own listing.
+/// Snapshot the fleet in-process, through the `aterm-ctl` crate's own listing.
 ///
-/// WHAT THIS REPLACES. The scanner used to fork the `aterm-ctl` BINARY once per
-/// [`RESCAN_SECS`] — forever — and read `ls` out of its stdout, with every
-/// failure arm collapsed to `Vec::new()`: a missing binary, a nonzero exit and
-/// unparseable output were all indistinguishable from "the fleet is empty".
-/// `Command::output()` then swallowed the child's stderr, which is where
-/// `aterm-ctl` had written the actual cause (a control-socket directory it could
-/// not read, a sandbox refusing AF_UNIX `connect()`, an instance whose token was
-/// rewritten) — so a bridge that had gone permanently blind and a fleet with
-/// nothing running produced the SAME silence on `aterm-fleet events`.
-///
-/// `fleet_sessions` returns that classification as data, so the two are now
-/// distinct: `Err` is reported through `diag` (rate-limited — see
-/// [`ListDiagnostics`]), and only `Ok` can mean an empty fleet.
+/// `fleet_sessions` classifies failure as data, so a listing that failed (a
+/// control-socket directory it could not read, a sandbox refusing AF_UNIX
+/// `connect()`, a rewritten token) is distinct from an empty fleet: `Err` is
+/// reported through `diag` (rate-limited, see [`ListDiagnostics`]), and only
+/// `Ok` can mean an empty fleet.
 fn list_sessions(diag: &mut ListDiagnostics) -> Vec<Session> {
     let outcome = aterm_ctl::fleet_sessions();
     if let Some(line) = diag.observe(&outcome) {
@@ -193,19 +162,17 @@ fn sessions_from(rows: &[aterm_ctl::FleetSession]) -> Vec<Session> {
         .collect()
 }
 
-/// How often a STILL-BROKEN listing repeats its diagnostic: once per this many
-/// consecutive failures carrying the same reason. At [`RESCAN_SECS`] that is one
-/// line every five minutes — enough that an operator who attached to
-/// `aterm-fleet events` after the breakage still learns of it, and far short of
-/// the 1 Hz repetition that would drown the stream stderr shares with the
-/// federation notes.
+/// How often a still-broken listing repeats its diagnostic: once per this many
+/// consecutive failures with the same reason. At [`RESCAN_SECS`] that is one
+/// line every five minutes, so an operator who attaches later still learns of
+/// it without the stream being drowned.
 const LIST_REPEAT_EVERY: u64 = 300;
 
 /// The rate limiter and the phrasing for fleet-listing outcomes.
 ///
 /// The federate loop lists once a second forever, so the diagnostic cannot be
 /// unconditional — but silence is the defect being fixed, so it cannot be
-/// dropped either. The rule: every DISTINCT reason speaks immediately (the first
+/// dropped either. The rule: every distinct reason speaks immediately (the first
 /// failure, and every change of cause), an unchanged one speaks again every
 /// [`LIST_REPEAT_EVERY`] scans, and a recovery speaks once and rearms.
 #[derive(Default)]
@@ -233,7 +200,7 @@ impl ListDiagnostics {
                 let (_, scans) = self.failing.take()?;
                 let found = rows.len();
                 return Some(format!(
-                    "aterm-fleet: fleet listing recovered — {found} session(s) after {scans} failed scan(s)"
+                    "aterm fleet: fleet listing recovered — {found} session(s) after {scans} failed scan(s)"
                 ));
             }
             Err(error) => error,
@@ -258,21 +225,21 @@ impl ListDiagnostics {
         };
         Some(if error.is_empty_fleet() {
             format!(
-                "aterm-fleet: nothing to federate{repeat} — {}",
+                "aterm fleet: nothing to federate{repeat} — {}",
                 error.reason
             )
         } else {
             format!(
-                "aterm-fleet: cannot list the fleet{repeat}: {}",
+                "aterm fleet: cannot list the fleet{repeat}: {}",
                 error.reason
             )
         })
     }
 }
 
-/// The fleet-rescan cadence: how often FEDERATE re-lists the fleet to pick up
-/// instances/sessions that appeared MID-RUN. A whole number of seconds; the
-/// scanner sleeps it in 100ms slices so a downstream close is observed promptly.
+/// The fleet-rescan cadence: how often federation re-lists the fleet to pick
+/// up instances that appeared mid-run, in whole seconds. The scanner sleeps it
+/// in 100ms slices so a downstream close is observed promptly.
 const RESCAN_SECS: u64 = 1;
 
 /// Maximum records waiting behind the one stdout writer. Federation is a live
@@ -307,7 +274,7 @@ fn read_federated_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Res
 /// Terminate a long-lived subscribe child when the local bridge rejects its
 /// stream, then always reap it. Killing happens before any best-effort
 /// diagnostic publication, so a full output queue cannot retain the child.
-fn terminate_stream_child(child: &mut std::process::Child) -> io::Result<()> {
+fn terminate_stream_child(child: &mut aterm_uds::spawnfd::Child) -> io::Result<()> {
     let _ = child.kill();
     child.wait().map(|_| ())
 }
@@ -330,33 +297,16 @@ fn resolve_federated_sid(
     sid
 }
 
-/// FEDERATE: ONE `subscribe @* events` per instance, merged to stdout as NDJSON.
+/// Federate: one `subscribe @* events` per instance, merged to stdout as
+/// NDJSON. `@*` covers sessions opened later; the server acks each with a
+/// `sub <local> <sid>` line.
 ///
-/// The fleet is NOT frozen at the startup snapshot, and — since the control plane
-/// grew a LIVE target set (`@*`) — it no longer needs a new connection to notice a
-/// new session either. One subscription per INSTANCE covers every session that
-/// instance has now and every one it opens later; the server adopts each and acks
-/// it with a `sub <local> <sid>` line, which the reader below already handles
-/// wherever it appears in the stream.
-///
-/// WHAT THIS REPLACES, AND WHY IT WAS BROKEN. The scanner used to key on SIDS: it
-/// remembered every sid it had ever seen and spawned a fresh `aterm-ctl subscribe`
-/// child for each batch of not-yet-seen ones. Connections, child processes and
-/// server push threads therefore scaled with the number of DISCOVERY MOMENTS —
-/// i.e. with tab-opens over the whole run — not with the number of instances. The
-/// server admits `CONTROL_SUBSCRIPTION_WORKERS` (4) subscriptions; the fifth got
-/// `ERR subscription capacity busy`, which is neither an `EVENT` nor a `sub` line,
-/// so the child read it, dropped it, and exited. The sid was already in `seen`,
-/// permanently — so from the fifth staggered tab-open onward, sessions were simply
-/// never federated, silently and forever.
-///
-/// So the scanner now keys on INSTANCES, and it does not remember failures as if
-/// they were successes: a streamer that ends (peer gone, connection dropped, pool
-/// momentarily full) releases its pid, and the next rescan re-establishes it. That
-/// makes a busy pool a one-second delay instead of permanent blindness.
+/// The scanner keys on instances, not sids, because the server admits only
+/// `CONTROL_SUBSCRIPTION_WORKERS` (4) subscriptions. A streamer that ends
+/// releases its pid and the next rescan re-establishes it.
 fn federate() {
     let ctl = ctl_bin();
-    eprintln!("aterm-fleet: streaming the fleet's events to stdout (Ctrl-C stops)");
+    eprintln!("aterm fleet: streaming the fleet's events to stdout (Ctrl-C stops)");
 
     // Each instance streams on its own thread; a single writer thread (this one, below)
     // serializes the merged NDJSON so records never interleave mid-line. The scanner and
@@ -364,13 +314,13 @@ fn federate() {
     let (tx, rx) = federation_channel();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Scanner: periodically snapshot the fleet and hold ONE subscribe per instance.
-    // Holding a `tx` clone keeps the writer alive across a momentarily-empty fleet,
-    // so a later-launched instance still lands.
+    // Scanner: periodically snapshot the fleet and hold one subscribe per
+    // instance. Holding a `tx` clone keeps the writer alive across an empty
+    // fleet, so a later-launched instance still lands.
     let scan_stop = stop.clone();
     let scan_ctl = ctl.clone();
     let scan_tx = tx.clone();
-    // Pids with a streamer currently attached. A streamer REMOVES its own pid when
+    // Pids with a streamer currently attached. A streamer removes its own pid when
     // it ends, so the next rescan re-establishes it — the retry the sid-keyed
     // design never had.
     let streaming: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -380,9 +330,8 @@ fn federate() {
         // spamming the stream once a second or going silent after one line.
         let mut listing = ListDiagnostics::default();
         while !scan_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            // Group the live sids by owning instance pid. The sids are needed ONLY
-            // as the fallback selector list for a peer too old to know `@*`; on a
-            // current peer the list is never used.
+            // Group the live sids by owning instance pid. The sids are only the
+            // fallback selector list for a peer that does not know `@*`.
             let mut fleet: std::collections::BTreeMap<String, Vec<String>> =
                 std::collections::BTreeMap::new();
             for s in list_sessions(&mut listing) {
@@ -396,7 +345,7 @@ fn federate() {
                     }
                 }
                 eprintln!(
-                    "aterm-fleet: streaming instance {pid}: {} session(s)",
+                    "aterm fleet: streaming instance {pid}: {} session(s)",
                     sids.len()
                 );
                 let ctl = scan_ctl.clone();
@@ -436,23 +385,20 @@ fn federate() {
     let _ = scanner.join();
 }
 
-/// Stream one instance's `events` for the whole run, preferring the LIVE target
-/// set and degrading to the frozen list only for a peer that does not know it.
+/// Stream one instance's `events` for the whole run, preferring the live
+/// target set and falling back to a frozen list only for a peer that does not
+/// know it.
 ///
-/// The compatibility test is behavioural, not a version handshake: a peer that
-/// rejects `@*` answers `ERR …`, which `aterm-ctl` reports on STDERR (discarded
-/// here) and which is neither an `EVENT` nor a `sub` line — so the child exits
-/// having ACKED NOTHING. "Acked at least one channel" is therefore the exact
-/// signal, and it is one this bridge can actually observe from the stdout stream
-/// it already parses.
+/// The test is behavioural: a peer that rejects `@*` answers `ERR …` on the
+/// child's stderr (discarded), which is neither an `EVENT` nor a `sub` line, so
+/// the child exits having acked nothing. "Acked at least one channel" is the
+/// signal, observable from the stdout this bridge parses.
 fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::SyncSender<String>) {
     if stream_targets(ctl, pid, "@*", tx) {
         return;
     }
-    // LEGACY PEER: freeze the target list, exactly as this bridge used to. Sessions
-    // opened after this point are not covered until the streamer ends and the next
-    // rescan re-establishes it with a wider list — lossy, but it is the old
-    // behaviour, reached only against an old server.
+    // A peer without `@*`: freeze the target list. Sessions opened later are
+    // covered once the streamer ends and the next rescan widens the list.
     let targets = sids
         .iter()
         .map(|s| format!("@{s}"))
@@ -465,16 +411,18 @@ fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::SyncSender<
 }
 
 /// Stream one `subscribe <targets> events` child, forwarding each event as an
-/// NDJSON record. Reads the `sub <local> <sid>` ack map so the compact `<local>`
-/// frame tag is resolved back to the stable sid the record is addressed by — and
-/// an ADOPTED channel arrives as exactly such a line, mid-stream, which this loop
-/// has always handled because the handshake ack was never guaranteed to arrive in
-/// one read.
+/// NDJSON record. Reads the `sub <local> <sid>` ack map to resolve the compact
+/// `<local>` frame tag back to the stable sid; an adopted channel arrives as
+/// such a line mid-stream.
 ///
-/// Returns whether the server acked at least one channel (see [`stream_instance`]).
+/// Returns whether the server acked at least one channel (see
+/// [`stream_instance`]).
 fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::SyncSender<String>) -> bool {
     let mut acked = false;
-    let mut child = match Command::new(ctl)
+    // On Windows `spawnfd::command` shares the console this verb was typed in
+    // with every `aterm-ctl` child here, and a caller with none gets a
+    // windowless one.
+    let mut child = match aterm_uds::spawnfd::command(ctl)
         .args(["--pid", pid, "subscribe", targets, "events"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -554,16 +502,16 @@ fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::SyncSender<Str
 /// EXEC: dispatch command lines from stdin (`@<sid> <verb> [args…]`) to the fleet.
 fn dispatch() -> ExitCode {
     let ctl = ctl_bin();
-    eprintln!("aterm-fleet: reading `@<sid> <verb> [args...]` lines from stdin");
+    eprintln!("aterm fleet: reading `@<sid> <verb> [args...]` lines from stdin");
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     match dispatch_lines(stdin.lock(), &mut stdout.lock(), |argv| {
-        Command::new(&ctl).args(argv).output()
+        aterm_uds::spawnfd::command(&ctl).args(argv).output()
     }) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
-            eprintln!("aterm-fleet: dispatch I/O failed: {error}");
+            eprintln!("aterm fleet: dispatch I/O failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -608,10 +556,9 @@ fn dispatch_lines(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // The command line IS an aterm-ctl verb line (`@<sid> <verb> rest…`); peel the
-        // selector + verb for the record's addressing and hand aterm-ctl the REMAINDER
-        // as ONE argument, so a `turn`/`send` payload's internal whitespace and quoting
-        // survive intact (see `dispatch_argv`) instead of collapsing.
+        // The line is an aterm-ctl verb line; peel the selector and verb for
+        // the record's addressing and hand aterm-ctl the remainder as one
+        // argument, so payload whitespace and quoting survive (`dispatch_argv`).
         let (sid, argv) = dispatch_argv(line);
         dispatched = dispatched.saturating_add(1);
         let rec = match run(&argv) {
@@ -658,16 +605,13 @@ fn dispatch_io_error(
     )
 }
 
-/// Parse one dispatch line into `(sid, argv)` for `aterm-ctl`, MIRRORING the server's
-/// verb-line split (aterm-gui `control.rs`): peel the leading `@<selector>` on the
-/// first space, then the verb on the next — and keep everything AFTER the verb as ONE
-/// argument. aterm-ctl rejoins its argv with single spaces, so a lone remainder arg is
-/// forwarded byte-for-byte: a `turn`/`send` payload's internal multiple spaces and
-/// quotes are preserved, where `split_whitespace` would have collapsed them into
-/// separate tokens. `sid` is the selector body (for the result record's astream
-/// address), or `-` when the line carries no `@selector` (a self-scoped verb).
+/// Parse one dispatch line into `(sid, argv)` for `aterm-ctl`, mirroring the
+/// server's verb-line split (aterm-gui `control.rs`): peel `@<selector>`, then
+/// the verb, and keep the rest as one argument, which aterm-ctl forwards
+/// byte-for-byte. `sid` is the selector body, or `-` when the line carries no
+/// `@selector`.
 fn dispatch_argv(line: &str) -> (String, Vec<String>) {
-    // `first`/`tail` and `verb`/`rest` split on the FIRST space only — identical to the
+    // `first`/`tail` and `verb`/`rest` split on the first space only — identical to the
     // server's `split_once(' ')`, which is what makes the remainder verbatim.
     let (selector, after_sel) = match line.split_once(' ') {
         Some((first, tail)) if first.starts_with('@') => (Some(first), tail),
@@ -717,9 +661,8 @@ fn result_record(
     stdout: &str,
     stderr: &str,
 ) -> String {
-    // Preserve the historical convenience field while retaining BOTH streams:
-    // a successful `turn` puts its screen on stdout and its verdict on stderr.
-    // The streams keep trailing newlines; only the legacy reply is trimmed.
+    // `reply` is the trimmed stream (stdout on success, stderr on failure);
+    // both streams are also kept with trailing newlines.
     let reply = if ok { stdout } else { stderr };
     let exit_code = exit_code.map_or_else(|| "null".to_string(), |code| code.to_string());
     format!(
@@ -771,6 +714,8 @@ fn json_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use aterm_uds::spawnfd::Command;
 
     #[test]
     fn federation_queue_is_bounded_and_backpressures_at_capacity() {
@@ -830,15 +775,16 @@ mod tests {
     fn rejected_stream_child_is_killed_and_reaped_promptly() {
         use std::os::unix::process::ExitStatusExt as _;
 
-        // "Terminated, not waited for" is read off the child's own STATUS: a
+        // "Terminated, not waited for" is read off the child's own status: a
         // subscriber cleanup killed ends by SIGKILL, one it waited out exits 0
         // when its sleep does. So the property needs no stopwatch. The bound is
-        // the child's lifetime again, as in the test below: only a wait for the
-        // child's own exit reaches half of it. It does not time the kill: a
-        // cleanup that killed a bounded while late (under 30 s) would pass. (It
-        // was a 3 s child under a 1 s bound, a kill and a reap timed against the
-        // scheduler.)
-        const CHILD_LIFETIME_S: u64 = 60;
+        // a minute's hang detector (AGENTS.md), as in the test below: the child
+        // lives five, so only a wait for the child's own exit reaches it. It
+        // does not time the kill: a cleanup that killed a bounded while late
+        // (under a minute) would pass. (It was a 3 s child under a 1 s bound, a
+        // kill and a reap timed against the scheduler; then a 60 s child under
+        // half its life.)
+        const CHILD_LIFETIME_S: u64 = 300;
         let mut child = Command::new("sh")
             // Replace the shell so terminating `child` cannot orphan a sleeping
             // grandchild in the test process tree.
@@ -858,7 +804,7 @@ mod tests {
             "cleanup waited for the long-lived child instead of terminating it: {status:?}"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(CHILD_LIFETIME_S / 2),
+            elapsed < aterm_spec::wait::MUST_HAPPEN,
             "cleanup returned after {elapsed:?}, the child's own {CHILD_LIFETIME_S} s \
              showing through"
         );
@@ -870,37 +816,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn subscriber_that_closes_stdout_is_terminated_promptly() {
-        use std::os::unix::fs::PermissionsExt;
-
         let script = std::env::temp_dir().join(format!(
             "aterm-fleet-closed-stdout-{}-{}.sh",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            aterm_time::since_epoch()
                 .expect("clock after epoch")
                 .as_nanos()
         ));
-        // THE BOUND IS THE CHILD'S OWN LIFETIME, not a guess at "prompt". What
-        // this pins is that EOF on a LIVE child's stdout ends the stream instead
-        // of waiting the child out — so the one thing the number has to do is
-        // separate "returned on EOF" from "waited for the child". The child
-        // sleeps 60 s; a regression therefore returns at 60 s or later, and any
-        // return before HALF the child's life (30 s) can only have come from the
-        // EOF. The history of this bound is why it is written this way: 3 s
-        // against 1 s failed in a full `cargo test --workspace` on a box running
-        // several builds, and 30 s against 5 s still failed at load 51 (a return
-        // after 7.64 s, measured 2026-09-24) — each time a budget for the
-        // scheduler's mood was charged to the property. Half the child's lifetime
-        // is the widest bound that still discriminates, and the 60 s is only
-        // ever paid when the test FAILS.
-        const CHILD_LIFETIME_S: u64 = 60;
-        std::fs::write(
+        // THE BOUND IS A HANG DETECTOR, not a guess at "prompt". What this pins
+        // is that EOF on a LIVE child's stdout ends the stream instead of waiting
+        // the child out — so the one thing the number has to do is separate
+        // "returned on EOF" from "waited for the child". The child sleeps five
+        // minutes; a regression therefore returns at five minutes or later, and
+        // any return inside a minute (AGENTS.md's hang detector) can only have
+        // come from the EOF. The history of this bound is why it is written this
+        // way: 3 s against 1 s failed in a full `cargo test --workspace` on a box
+        // running several builds, and 30 s against 5 s still failed at load 51 (a
+        // return after 7.64 s, measured 2026-09-24) — each time a budget for the
+        // scheduler's mood was charged to the property. The child's five minutes
+        // are only ever paid when the test FAILS.
+        const CHILD_LIFETIME_S: u64 = 300;
+        aterm_tempfile::stand_in(
             &script,
-            format!("#!/bin/sh\nexec 1>&-\nexec sleep {CHILD_LIFETIME_S}\n"),
+            &format!("#!/bin/sh\nexec 1>&-\nexec sleep {CHILD_LIFETIME_S}\n"),
         )
-        .expect("write fake subscriber");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
-            .expect("make fake subscriber executable");
+        .expect("lay fake subscriber");
         let (tx, _rx) = federation_channel();
 
         let started = std::time::Instant::now();
@@ -912,7 +852,7 @@ mod tests {
         ));
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(CHILD_LIFETIME_S / 2),
+            elapsed < aterm_spec::wait::MUST_HAPPEN,
             "EOF from a live child escaped prompt cleanup: returned after {elapsed:?}, \
              which is the child's own {CHILD_LIFETIME_S} s sleep showing through rather \
              than EOF"
@@ -1117,8 +1057,8 @@ mod tests {
 
     #[test]
     fn dispatch_argv_keeps_payload_as_one_verbatim_arg() {
-        // Internal multiple spaces and quotes must reach aterm-ctl as ONE argument —
-        // `split_whitespace` would have shattered this into five collapsed tokens.
+        // Internal multiple spaces and quotes must reach aterm-ctl as one
+        // argument.
         let (sid, argv) = dispatch_argv("@s-ab12 turn please run  the  build \"a b\"");
         assert_eq!(sid, "s-ab12");
         assert_eq!(
@@ -1204,10 +1144,9 @@ mod tests {
         );
     }
 
-    /// THE SILENT-EMPTY DEFECT: a listing that FAILED must reach the operator as
-    /// a diagnostic. It cannot reach them as sessions — the snapshot is empty
-    /// either way — so the logged line is the only thing standing between
-    /// "nothing to federate" and a bridge that has gone permanently blind.
+    /// A listing that failed reaches the operator as a diagnostic: the
+    /// snapshot is empty either way, so the logged line is what tells "nothing
+    /// to federate" from a bridge that has gone blind.
     #[test]
     fn a_failed_listing_is_reported_and_never_read_as_an_empty_fleet() {
         let mut diag = ListDiagnostics::default();
@@ -1221,7 +1160,7 @@ mod tests {
             .observe(&broken)
             .expect("a failure must never pass silently");
         assert!(line.contains("cannot list the fleet"), "{line}");
-        // The cause `Command::output()` used to swallow with the child's stderr.
+        // The cause from the listing's own error.
         assert!(
             line.contains("a sandbox is refusing AF_UNIX connect()"),
             "{line}"

@@ -19,7 +19,7 @@ fn rows(lines: &[&str]) -> Vec<String> {
 const T1: &str = "01a0dc36-1dc1-7ee2-be91-11bc323e377c";
 const T2: &str = "01a0dc3a-5c71-7143-bcee-58def0a15dfd";
 
-/// The atpkg store's codex 0.157.1 manifest, verbatim (2026-09-25).
+/// The atpkg store's codex 0.157.1 manifest, verbatim.
 const PACKAGE_0_157_1: &str = r#"{
   "layoutVersion": 1,
   "version": "0.157.1",
@@ -29,13 +29,6 @@ const PACKAGE_0_157_1: &str = r#"{
   "resourcesDir": "codex-resources",
   "pathDir": "codex-path"
 }"#;
-
-fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("aterm-codex-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("scratch");
-    d
-}
 
 #[test]
 fn the_measured_manifest_parses_and_a_changed_layout_refuses() {
@@ -55,12 +48,11 @@ fn the_measured_manifest_parses_and_a_changed_layout_refuses() {
 
 #[test]
 fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it() {
-    let d = scratch("pkg");
+    let d = crate::supervise::ScratchDir::new("codex", "pkg");
     let root = d.join("store/codex/1000000000157000001");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
-    // A binary that would HANG if it were run — executable, so a reader that
-    // ran it would wait out its ten minutes, not be refused at once: the reader
-    // must never exec it. A minute's hang detector tells the two apart.
+    // An executable that would hang if run: the reader must never exec it, and
+    // a one-minute hang detector tells the two apart.
     let exe = root.join("bin/codex");
     std::fs::write(&exe, "#!/bin/sh\nsleep 600\n").expect("exe");
     #[cfg(unix)]
@@ -76,7 +68,7 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
         "{:?}",
         started.elapsed()
     );
-    // NEGATIVE CONTROL: a manifest whose entrypoint names ANOTHER binary does
+    // Negative control: a manifest whose entrypoint names another binary does
     // not answer for this one (a stray `codex-package.json` in a parent).
     let other = d.join("elsewhere/bin");
     std::fs::create_dir_all(&other).expect("other");
@@ -89,47 +81,13 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
     assert_eq!(package_version(&other.join("codex")), None);
     // `codex --version`'s own words are no version (its first word).
     assert_eq!(Version::parse("codex-cli"), None);
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// THE CODEX LANE CARRIES THE MODEL, AND ONLY CARRIES IT (the decision of
 /// 2026-09-26, beside the Claude lane's same-family move): whatever model the
-/// launch named, in any spelling, rides the relaunch verbatim, and a launch
-/// that named none gets none — no model is guessed for Codex, and none is
-/// moved down.
-#[test]
-fn a_codex_relaunch_keeps_the_launch_model_verbatim_and_adds_none() {
-    for (launch, kept) in [
-        (&["codex", "-m", "gpt-5.4"][..], &["-m", "gpt-5.4"][..]),
-        (
-            &["codex", "--model=gpt-5.4-mini"],
-            &["--model=gpt-5.4-mini"],
-        ),
-        (
-            &["codex", "-mgpt-5.4", "--no-daemon"],
-            &["-mgpt-5.4", "--no-daemon"],
-        ),
-    ] {
-        let want: Vec<String> = std::iter::once("resume")
-            .chain(kept.iter().copied())
-            .chain([T1])
-            .map(str::to_string)
-            .collect();
-        assert_eq!(
-            rewrite_argv(&argv(launch), Some(T1)).expect("carried"),
-            want,
-            "{launch:?}"
-        );
-    }
-    let bare = rewrite_argv(&argv(&["codex", "--no-daemon"]), Some(T1)).expect("carried");
-    assert!(
-        !bare
-            .iter()
-            .any(|w| w == "-m" || w.starts_with("--model") || w.starts_with("-m")),
-        "{bare:?}"
-    );
-}
-
+/// launch named, in any spelling (`-m x`, `-mx`, `--model=x`), rides the
+/// relaunch verbatim with every other kept flag, and a launch that named none
+/// gets none — no model is guessed for Codex, and none is moved down.
 #[test]
 fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
     let a = argv(&[
@@ -143,6 +101,7 @@ fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
         "-mgpt-x",
         "--add-dir",
         "-",
+        "--model=gpt-5.4-mini",
         "fix the bug",
     ]);
     assert_eq!(
@@ -158,11 +117,13 @@ fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
             "-mgpt-x",
             "--add-dir",
             "-",
+            "--model=gpt-5.4-mini",
             T1,
         ])
     );
     // A session that was itself a resume, or a fork: the old id, `--last`,
-    // `--all` and the first prompt go; the thread the exit names comes back.
+    // `--all` and the first prompt go; the thread the exit names comes back
+    // — and a launch that named no model gets none.
     for a in [
         argv(&["codex", "resume", T2, "--no-daemon"]),
         argv(&["codex", "resume", "--last", "--no-daemon"]),
@@ -242,7 +203,7 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
     ] {
         assert!(is_tui_argv(&tui), "{tui:?}");
     }
-    // Measured: every process of the daemon is named `codex` too.
+    // Every process of the daemon is named `codex` too.
     for not in [
         argv(&[
             "/c/packages/app-server-daemon/releases/0.157.0-aarch64-apple-darwin/bin/codex",
@@ -289,8 +250,8 @@ fn a_thread_id_is_a_hyphenated_uuid_and_nothing_else() {
     ));
 }
 
-/// The tab after a daemon-mode `/exit`, measured 2026-09-25 (0.157.0): the
-/// launch's command line, the hint, then the prompt with the cursor.
+/// The tab after a daemon-mode `/exit` (0.157.0): the launch's command line,
+/// the hint, then the prompt with the cursor.
 fn daemon_exit_screen() -> Vec<String> {
     rows(&[
         "% \"$OLDCODEX\"",
@@ -302,8 +263,22 @@ fn daemon_exit_screen() -> Vec<String> {
     ])
 }
 
-/// The same tab after a SECOND exit, of an embedded session (measured): the
-/// first exit's hint is still on the screen above it.
+/// A daemon-mode `/exit` from 0.159 on: the embedded shape, under `To reconnect,
+/// run:` (the heading and the lines around it are both store builds' strings,
+/// 0.159.3 and 0.160.0; neither prints 0.157's `Reconnect:` line).
+fn daemon_exit_screen_two_line() -> Vec<String> {
+    rows(&[
+        "% codex",
+        "Disconnected from this task. Any running work continues.",
+        "To reconnect, run:",
+        &format!("  codex resume {T1}"),
+        "Stop the current turn: run codex agents, select this task, and press x.",
+        "% ",
+    ])
+}
+
+/// The same tab after a second exit, of an embedded session: the first exit's
+/// hint is still on the screen above it.
 fn embedded_exit_screen() -> Vec<String> {
     rows(&[
         &format!("Reconnect: codex resume {T1}"),
@@ -324,7 +299,7 @@ fn the_exit_hint_is_the_tuis_own_last_words() {
             daemon: true
         })
     );
-    // The LAST hint, not the first: the older exit's is above it.
+    // The last hint, not the first: the older exit's is above it.
     assert_eq!(
         parse_exit_hint(&embedded_exit_screen()),
         Some(ExitHint {
@@ -332,6 +307,16 @@ fn the_exit_hint_is_the_tuis_own_last_words() {
             daemon: false
         })
     );
+    // 0.159+: the daemon's id under its own heading is still a daemon hint
+    // (before, it matched neither form and every daemon-mode upgrade ended
+    // `failed:no-resume-hint`).
+    let two_line = daemon_exit_screen_two_line();
+    let daemon = Some(ExitHint {
+        thread: T1.into(),
+        daemon: true,
+    });
+    assert_eq!(parse_exit_hint(&two_line), daemon);
+    assert_eq!(hint_above_prompt(&two_line, 5), daemon);
     // Above the prompt (no shell integration): the same answers.
     let d = daemon_exit_screen();
     assert_eq!(hint_above_prompt(&d, 5).map(|h| h.thread), Some(T1.into()));
@@ -355,9 +340,9 @@ fn the_exit_hint_is_the_tuis_own_last_words() {
 
 #[test]
 fn a_tui_that_printed_nothing_is_never_relaunched_into_an_older_exits_thread() {
-    // NEGATIVE CONTROL for the whole reason the hint is read from the TUI's
-    // own rows: the second TUI died without a word, and the first exit's hint
-    // (another conversation) is still two rows above the new prompt.
+    // Negative control for reading the hint from the TUI's own rows: the second
+    // TUI died silently, and the first exit's hint (another conversation) is
+    // still two rows above the new prompt.
     let screen = rows(&[
         &format!("Reconnect: codex resume {T1}"),
         "Stop the current turn: run codex agents, select this task, and press x.",
@@ -381,10 +366,9 @@ fn a_tui_that_printed_nothing_is_never_relaunched_into_an_older_exits_thread() {
 
 #[test]
 fn the_hint_is_read_above_the_prompts_first_row_past_the_tuis_own_tally() {
-    // Measured 2026-09-26 (0.157.0, an inline TUI, a two-row prompt `%~` /
-    // `%#`): the daemon-mode hint, its stop line and the token tally the TUI
-    // prints once a turn ran, then the prompt's two rows, the cursor on the
-    // second.
+    // 0.157.0, an inline TUI, a two-row prompt (`%~` / `%#`): the daemon-mode
+    // hint, its stop line and the token tally printed once a turn ran, then
+    // the prompt's two rows with the cursor on the second.
     let screen = rows(&[
         "  line 45 of a long answer",
         "Disconnected from this task. Any running work continues.",
@@ -394,10 +378,10 @@ fn the_hint_is_read_above_the_prompts_first_row_past_the_tuis_own_tally() {
         "/tmp/fxl.VyGP/work",
         "%",
     ]);
-    // Bounded by the CURSOR row, the prompt's first row stands between the
-    // hint and it: the review's failure (exited, never relaunched).
+    // Bounded by the cursor row, the prompt's first row stands between the
+    // hint and it (read as exited, it would never be relaunched).
     assert_eq!(hint_above_prompt(&screen, 6), None);
-    // Bounded by the prompt's FIRST row (the entering block's `cmd -
+    // Bounded by the prompt's first row (the entering block's `cmd -
     // prompt` = 1 row above the cursor): the TUI's own words.
     assert_eq!(
         hint_above_prompt(&screen, 5),
@@ -406,7 +390,7 @@ fn the_hint_is_read_above_the_prompts_first_row_past_the_tuis_own_tally() {
             daemon: true
         })
     );
-    // The embedded form prints its tally ABOVE the hint (measured).
+    // The embedded form prints its tally above the hint.
     let embedded = rows(&[
         "% codex --no-daemon",
         "Token usage: total=4 input=2 output=2",
@@ -418,8 +402,8 @@ fn the_hint_is_read_above_the_prompts_first_row_past_the_tuis_own_tally() {
         hint_above_prompt(&embedded, 4).map(|h| h.thread),
         Some(T2.into())
     );
-    // NEGATIVE CONTROL: the tally is the TUI's own line; the command line
-    // that ran it is not, and an older exit's hint above it stays unread.
+    // Negative control: the tally is the TUI's own line; the command line that
+    // ran it is not, and an older exit's hint above it stays unread.
     let nothing = rows(&[
         &format!("Reconnect: codex resume {T1}"),
         "Token usage so far: total=2 input=1 output=1",
@@ -431,11 +415,11 @@ fn the_hint_is_read_above_the_prompts_first_row_past_the_tuis_own_tally() {
 
 #[test]
 fn a_background_terminal_is_a_session_leader_under_codex_and_a_helper_is_not() {
-    // Measured 2026-09-26 (0.157.0): the daemon 6854 leads its own session;
+    // A real process table (0.157.0): the daemon 6854 leads its own session;
     // its MCP servers 6872/7092 are in that session; the unified-exec
-    // `sleep 7771` (7095) leads one of its own. Under an embedded TUI (7180,
-    // in the tab shell's session 7173) the same: `sleep 7772` leads its own,
-    // the MCP server 7201 does not.
+    // `sleep 7771` (7095) leads its own. Under an embedded TUI (7180, in the
+    // tab shell's session 7173) the same: `sleep 7772` leads its own, the MCP
+    // server 7201 does not.
     let table = vec![
         (6854, 1, "codex".to_string()),
         (6872, 6854, "Python".to_string()),
@@ -459,7 +443,7 @@ fn a_background_terminal_is_a_session_leader_under_codex_and_a_helper_is_not() {
         terminals_under(6854, &table, sid),
         vec![(7095, "sleep".to_string())]
     );
-    // The terminal's own children are in ITS session: one terminal, once.
+    // The terminal's own children are in its session: one terminal, once.
     assert_eq!(
         terminals_under(7180, &table, sid),
         vec![(7203, "sleep".to_string())]
@@ -475,11 +459,10 @@ fn a_background_terminal_is_a_session_leader_under_codex_and_a_helper_is_not() {
     assert_eq!(terminals_under(6854, &idle, |_| None).len(), 2);
 }
 
-/// `lsof -a -U -c codex -F pcdn`, measured 2026-09-26 (0.157.0): the TUI 6847
-/// (two socketpairs of its own, and fd 35 naming the daemon's listener), the
-/// daemon 6854 (its socketpair 7/8, its listener 10 and one accepted
-/// connection 29, both named by the socket's path) and the vendor's updater
-/// 6864, attached to its own socket.
+/// `lsof -a -U -c codex -F pcdn` output (0.157.0): the TUI 6847 (two
+/// socketpairs, and fd 35 naming the daemon's listener), the daemon 6854 (its
+/// socketpair 7/8, its listener 10 and one accepted connection 29, both named
+/// by the socket's path) and the vendor's updater 6864 on its own socket.
 const LSOF_CODEX_UNIX: &[&str] = &[
     "p6847",
     "ccodex",
@@ -517,9 +500,8 @@ const LSOF_CODEX_UNIX: &[&str] = &[
 fn the_daemons_clients_are_its_sockets_peers() {
     let lsof = LSOF_CODEX_UNIX.join("\n");
     assert_eq!(daemon_clients_in(&lsof, 6854), Some(vec![6847]));
-    // The vendor's updater is no client; a daemon with none attached reads
-    // an empty list; one not in the listing reads NOTHING — never "no
-    // clients".
+    // The vendor's updater is no client; a daemon with none attached reads an
+    // empty list; one not in the listing reads nothing, never "no clients".
     let alone = LSOF_CODEX_UNIX[11..].join("\n");
     assert_eq!(daemon_clients_in(&alone, 6854), Some(vec![]));
     assert_eq!(daemon_clients_in(&lsof, 4242), None);
@@ -552,8 +534,8 @@ fn codexs_status_line_says_when_a_background_terminal_runs() {
     ])));
 }
 
-/// Measured rollout lines (0.157.0, 2026-09-25): a turn started, the user's
-/// message, the turn aborted by Esc.
+/// Real rollout lines (0.157.0): a turn started, the user's message, the turn
+/// aborted by Esc.
 const STARTED: &str = r#"{"timestamp":"2026-09-26T05:37:10.315Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"01a0dc37-a8a4-7932-8499-ba298833de9f","root_turn_id":"01a0dc37-a8a4-7932-8499-ba298833de9f","started_at":1790401030,"model_context_window":258400,"collaboration_mode_kind":"default"}}"#;
 const USER: &str = r#"{"timestamp":"2026-09-26T05:37:10.338Z","ordinal":8,"type":"response_item","payload":{"type":"message","id":"msg_01a0dc37-a8c2-78e0-a4a8-fc661bfaae1b","role":"user","content":[{"type":"input_text","text":"say hello"}],"internal_chat_message_metadata_passthrough":{"turn_id":"01a0dc37-a8a4-7932-8499-ba298833de9f","create_time":1790401030.338192,"content_item_kinds":["user.text"]}},"metadata":{"client_authored":false,"user_input_order":0,"mcp_attribution":{"status":"none"}}}"#;
 const ABORTED: &str = r#"{"timestamp":"2026-09-26T05:37:50.848Z","ordinal":11,"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"01a0dc37-a8a4-7932-8499-ba298833de9f","reason":"interrupted","started_at":1790401030,"completed_at":1790401070,"duration_ms":40536}}"#;
@@ -574,37 +556,13 @@ fn user(text: &str) -> String {
     )
 }
 
-#[test]
-fn a_turn_is_idle_only_when_its_last_event_ended_it() {
-    assert_eq!(rollout_turn(""), TurnState::Unknown);
-    assert_eq!(rollout_turn(STARTED), TurnState::Busy);
-    assert_eq!(rollout_turn(&[STARTED, USER].join("\n")), TurnState::Busy);
-    assert_eq!(
-        rollout_turn(&[STARTED, USER, ABORTED].join("\n")),
-        TurnState::Idle
-    );
-    assert_eq!(
-        rollout_turn(&[STARTED, COMPLETE_0_145].join("\n")),
-        TurnState::Idle
-    );
-    // A new turn after the last one ended is busy again, and a cut first line
-    // (the tail's) or a half-written last one is skipped.
-    assert_eq!(
-        rollout_turn(&[&ABORTED[40..], ABORTED, STARTED, "{\"type\":\"ev"].join("\n")),
-        TurnState::Busy
-    );
-    // A tail with no turn event in it is no idle.
-    assert_eq!(rollout_turn(USER), TurnState::Unknown);
-}
-
 /// A settings row Codex 0.158.0 writes between turns (`thread_settings_applied`,
 /// its measured keys, trimmed).
 const SETTINGS: &str = r#"{"timestamp":"2026-09-28T01:00:00.000Z","ordinal":9,"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"01a0dc36-1dc1-7ee2-be91-11bc323e377c","thread_settings":{"model":"gpt-5.5","reasoning_effort":"xhigh"}}}"#;
 
 /// An `item_completed` row of at least `size` bytes: a command's output, which
-/// Codex 0.158.0 wrote in ONE 542,736-byte line after the turn it ran in had
-/// ended (the owner's rollout, 2026-09-27) — its output opening with `quoted`,
-/// escaped as JSON text.
+/// Codex can write as one line of hundreds of KiB after its turn ended, its
+/// output opening with `quoted`, escaped as JSON text.
 fn item_line(size: usize, quoted: &str) -> String {
     let output = format!("{quoted}{}", "x".repeat(size));
     format!(
@@ -628,23 +586,19 @@ fn back(bytes: &[u8], chunk: u64, bound: u64) -> TurnState {
     rollout_turn_back(&mut std::io::Cursor::new(bytes), len, chunk, bound)
 }
 
-/// THE MEASURED SHAPE (the fourth review of 2026-09-28, the owner's live root
-/// rollout): a turn ended, then one line longer than the 256 KiB tail — a
-/// command's output written after the turn — then settings rows. The tail the
-/// round before read holds no turn event, so the idle conversation read
-/// Unknown and counted running; read back past it, it is idle. Controls: the
-/// same line after a turn that STARTED reads busy, and so does one whose
-/// output QUOTES a turn's end — the words are text in a string, never an
-/// event, so the search that finds them parses the line and passes it by.
+/// A turn ended, then one line longer than the 256 KiB tail (a command's output
+/// written after the turn), then settings rows: read back past it, the
+/// conversation is idle, not Unknown. Controls: the same line after a turn
+/// that started reads busy, and so does one whose output quotes a turn's end
+/// (text in a string, never an event).
 #[test]
 fn an_idle_turn_behind_a_line_longer_than_the_tail_reads_idle() {
     const TAIL: u64 = 262_144;
     const BOUND: u64 = 8 << 20;
     let big = item_line(300_000, "");
     let idle = rollout_bytes(&[STARTED, USER, COMPLETE_0_145, &big, SETTINGS, SETTINGS]);
-    let tail = &idle[idle.len() - usize::try_from(TAIL).expect("tail")..];
     assert_eq!(
-        rollout_turn(&String::from_utf8_lossy(tail)),
+        back(&idle, TAIL, TAIL),
         TurnState::Unknown,
         "the tail alone holds no turn event"
     );
@@ -664,11 +618,10 @@ fn an_idle_turn_behind_a_line_longer_than_the_tail_reads_idle() {
     assert_eq!(back(&none, TAIL, BOUND), TurnState::Unknown);
 }
 
-/// WHEREVER THE CHUNKS CUT IT, the turn read back is the whole file's: every
-/// chunk size from one byte to past the file, over a line many chunks long
-/// (carried until its start is read), a turn event at the file's first byte,
-/// a last line with no newline or caught half-written, and a line quoting
-/// turn events — each against [`rollout_turn`] over the whole text.
+/// Wherever the chunks cut it, the turn read back is the whole file's: every
+/// chunk size from one byte to past the file, over a line many chunks long, a
+/// turn event at the file's first byte, a last line with no newline or
+/// half-written, and a line quoting turn events.
 #[test]
 fn a_turn_event_is_read_back_wherever_the_chunks_cut_it() {
     let long = item_line(600, "");
@@ -712,11 +665,6 @@ fn a_turn_event_is_read_back_wherever_the_chunks_cut_it() {
         ),
     ];
     for (case, bytes, want) in &cases {
-        assert_eq!(
-            rollout_turn(&String::from_utf8_lossy(bytes)),
-            *want,
-            "{case}: the whole text"
-        );
         let len = u64::try_from(bytes.len()).expect("len");
         for chunk in 1..=len + 1 {
             assert_eq!(back(bytes, chunk, u64::MAX), *want, "{case}: chunk {chunk}");
@@ -724,39 +672,37 @@ fn a_turn_event_is_read_back_wherever_the_chunks_cut_it() {
     }
 }
 
-/// THE WORST CASE IS LINEAR (the fourth review of 2026-09-28, a nit): a
-/// line longer than a chunk is carried as the pieces read of it, each chunk
-/// MOVED into the carry — its own buffer, never a copy — and joined once,
-/// when the chunk holding the line's start arrives; the carry holds exactly
-/// the bytes read of that line, and after the join only the new cut. So a
-/// line costs its length, where re-copying the carry at every chunk cost its
-/// length squared over the chunk (the review's probe: 35 ms for a 9 MiB line
-/// in release, 250 ms in debug; the drive runs off the main loop, but on
-/// every look of each loaded thread). And the shapes the review timed read
-/// what they should at the drive's own chunk and bound: one line past the
-/// bound, bare or quoting a turn's end, reads Unknown; `task_started` behind
-/// a line of nearly the whole bound quoting one reads Busy; the bound filled
-/// with rows quoting turn events, every one parsed, reads Unknown.
+/// The worst case is linear: a line longer than a chunk is carried as the
+/// pieces read of it, each chunk moved into the carry (never copied) and joined
+/// once when the chunk holding the line's start arrives. At the drive's own
+/// chunk and bound: one line past the bound, bare or quoting a turn's end,
+/// reads Unknown; `task_started` behind a line of nearly the whole bound
+/// quoting one reads Busy; the bound filled with rows quoting turn events, all
+/// parsed, reads Unknown.
 #[test]
 fn a_line_longer_than_many_chunks_is_carried_once() {
     const TAIL: u64 = 262_144;
     const BOUND: u64 = 8 << 20;
     const CHUNK: usize = 4096;
     let mut back_of = TurnBack::default();
+    let mut scan = |text: &str| text.lines().rev().find_map(turn_event);
     let mut bytes = rollout_bytes(&[STARTED]);
     let middle = vec![b'x'; 8 * CHUNK];
     bytes.extend_from_slice(&middle[..middle.len() - 1]);
     bytes.push(b'\n');
-    // Fed from the end, a chunk at a time: the last chunk (the long line's
-    // end and its newline), then every chunk of its middle, none of which
-    // holds a newline.
+    // Fed from the end a chunk at a time: the last chunk (the long line's end
+    // and its newline), then every chunk of its middle, none holding a newline.
     let mut end = bytes.len();
     let mut fed = 0;
     while end > STARTED.len() + 1 {
         let start = end.saturating_sub(CHUNK).max(STARTED.len() + 1);
         let chunk = bytes[start..end].to_vec();
         let (at, n) = (chunk.as_ptr(), chunk.len());
-        assert_eq!(back_of.feed(chunk, false), None, "no line whole yet");
+        assert_eq!(
+            back_of.feed(chunk, false, &mut scan),
+            None,
+            "no line whole yet"
+        );
         fed += n;
         assert_eq!(back_of.carried(), fed, "the carry is the bytes read");
         let last = back_of.pieces.last().expect("a piece");
@@ -769,10 +715,10 @@ fn a_line_longer_than_many_chunks_is_carried_once() {
     assert_eq!(back_of.pieces.len(), 8, "one piece per chunk read");
     // The chunk holding the line's start: `task_started` and its newline.
     let head = bytes[..end].to_vec();
-    assert_eq!(back_of.feed(head, true), Some(TurnState::Busy));
+    assert_eq!(back_of.feed(head, true, &mut scan), Some(TurnState::Busy));
     assert_eq!(back_of.carried(), 0, "from the file's start nothing is cut");
 
-    // The shapes the review timed, at the drive's chunk and bound.
+    // Long-line shapes, at the drive's chunk and bound.
     let past = item_line(9 << 20, "");
     let quoting = item_line(9 << 20, COMPLETE_0_145);
     for (case, text, want) in [
@@ -811,12 +757,11 @@ fn a_line_longer_than_many_chunks_is_carried_once() {
     }
 }
 
-/// FAIL CLOSED PAST THE BOUND: a turn event is read only when its whole line
-/// lies within `bound` bytes of the end, the newline before it included (a
-/// line that begins at the bound's first byte is not known to begin there,
-/// and is not read), and nothing further back is ever read in its place —
-/// the state stays Unknown, counted running. A rollout that cannot be read
-/// whole (shorter than the length it was measured at) is Unknown too.
+/// Fail closed past the bound: a turn event is read only when its whole line,
+/// the newline before it included, lies within `bound` bytes of the end, and
+/// nothing further back is read instead; the state stays Unknown, counted
+/// running. A rollout shorter than the length it was measured at is Unknown
+/// too.
 #[test]
 fn past_the_bound_the_turn_stays_unknown() {
     let big = item_line(3_000, "");
@@ -874,7 +819,7 @@ fn ready_is_the_agents_last_word_after_the_latest_notice() {
     // Moved past: the agent answered again and went back to work.
     let moved = [answered.clone(), user("keep going"), assistant("On it.")].join("\n");
     assert!(!rollout_has_ready(&moved, marker));
-    // A NEW notice ends the old answer until the agent answers it.
+    // A new notice ends the old answer until the agent answers it.
     let asked_again = [answered.clone(), user(&notice)].join("\n");
     assert!(!rollout_has_ready(&asked_again, marker));
     // The other two places Codex writes the agent's words.
@@ -897,7 +842,7 @@ fn ready_is_the_agents_last_word_after_the_latest_notice() {
     assert!(rollout_has_ready(&[answered, env].join("\n"), marker));
 }
 
-/// The idle 0.157.0 screen, measured (the rows under the card, 40 rows cut).
+/// The idle 0.157.0 screen (the rows under the card, 40 rows cut).
 fn idle_rows() -> Vec<String> {
     rows(&[
         "╭─────────────────────────────────────────────╮",
@@ -913,8 +858,8 @@ fn idle_rows() -> Vec<String> {
     ])
 }
 
-/// A turn running (measured: the status row above the composer, which keeps
-/// its placeholder).
+/// A turn running: the status row above the composer, which keeps its
+/// placeholder.
 fn busy_rows() -> Vec<String> {
     rows(&[
         "› say hello",
@@ -930,11 +875,9 @@ fn busy_rows() -> Vec<String> {
     ])
 }
 
-/// THE COMPOSER IS THE ONE READER'S (`aterm_phase::codex`, 2026-09-28): the
-/// lane's own copy knew `›` alone, and Codex 0.158.0's `»` input line (the
-/// fixture measured on the owner's tab) was no composer to it — every look
-/// read a draft, or none. Both marks now, through the one reader; the dim
-/// placeholder on either is empty, a typed draft on either is the person's.
+/// The composer is read by `aterm_phase::codex`, which knows both input marks
+/// (`›` and 0.158.0's `»`): the dim placeholder on either is empty, a typed
+/// draft on either is the person's.
 #[test]
 fn the_composer_is_read_by_codexs_caret_and_its_dim_placeholder() {
     use aterm_phase::codex::{composer as composer_row, composer_draft};
@@ -944,8 +887,8 @@ fn the_composer_is_read_by_codexs_caret_and_its_dim_placeholder() {
         composer_draft(&idle),
         Some((6, vec!["Ask Codex to do anything".to_string()]))
     );
-    // 0.158.0's input line, measured (the goal-mode fixture): its placeholder
-    // dim at column 2 is an empty composer; the same row not dim is a draft.
+    // 0.158.0's input line (the goal-mode fixture): its placeholder dim at
+    // column 2 is an empty composer; the same row not dim is a draft.
     let goal = aterm_phase::prompt::fixtures::screen(aterm_phase::codex::fixtures::GOAL_BUSY_0_158);
     assert_eq!(composer_row(&goal), Some(60));
     assert!(composer_is_empty(&goal, Some((60, 2)), true));
@@ -955,8 +898,8 @@ fn the_composer_is_read_by_codexs_caret_and_its_dim_placeholder() {
     assert!(!composer_is_empty(&typed, Some((60, 16)), false));
     // The placeholder: text at the caret, the cursor at column 2, drawn dim.
     assert!(composer_is_empty(&idle, Some((6, 2)), true));
-    // NEGATIVE CONTROL: the same row NOT dim is a draft whose caret was moved
-    // home (measured: `› my draft here`, Home, cell `m … none`).
+    // Negative control: the same row not dim is a draft whose caret was moved
+    // home (`› my draft here`, Home, cell `m … none`).
     assert!(!composer_is_empty(&idle, Some((6, 2)), false));
     let draft = rows(&[
         "› my draft here",
@@ -1099,6 +1042,85 @@ fn a_daemon_client_exits_at_an_idle_point_once_its_daemon_went_first() {
             "0.157.1"
         ),
         Step::Wait("skipped")
+    );
+}
+
+/// The quiet upgrade on the Codex lane (the default): an embedded conversation
+/// is not asked first; at a genuinely idle point its `/exit` is the step
+/// (`Terminate`), with no notice and no READY, while work under it, a turn, a
+/// box or a draft still waits. A thread with nothing to resume is ended and
+/// started plain only once the owner has been told (`notice-shown`); a
+/// daemon-mode client, whose `/exit` ends none of its work, is not held for
+/// it. With `quiet` false:
+/// [`an_embedded_conversation_is_asked_first_and_exits_only_on_ready`].
+#[test]
+fn a_quiet_embedded_conversation_exits_at_an_idle_point_with_nothing_asked() {
+    let mode = Mode::Embedded {
+        thread: T2.into(),
+        conversation: true,
+    };
+    let quiet = Facts {
+        quiet: true,
+        ..facts("idle")
+    };
+    assert_eq!(
+        next_step(&mode, &Phase::Pending, &quiet, false, false, 100),
+        Step::Terminate
+    );
+    for (f, why) in [
+        (
+            Facts {
+                background: vec!["zsh".into()],
+                ..quiet.clone()
+            },
+            "background",
+        ),
+        (
+            Facts {
+                status: "busy".into(),
+                ..quiet.clone()
+            },
+            "not-idle",
+        ),
+        (
+            Facts {
+                approval_box: true,
+                ..quiet.clone()
+            },
+            "box",
+        ),
+        (
+            Facts {
+                composer_empty: false,
+                ..quiet.clone()
+            },
+            "draft",
+        ),
+    ] {
+        assert_eq!(
+            next_step(&mode, &Phase::Pending, &f, false, false, 100),
+            Step::Wait(why)
+        );
+    }
+    let untold = Facts {
+        unnoticed: true,
+        ..quiet.clone()
+    };
+    let plain = Mode::Embedded {
+        thread: T2.into(),
+        conversation: false,
+    };
+    assert_eq!(
+        next_step(&plain, &Phase::Pending, &untold, false, false, 100),
+        Step::Wait(upgrade::NOTICE_SHOWN)
+    );
+    assert_eq!(
+        next_step(&plain, &Phase::Pending, &quiet, false, false, 100),
+        Step::Terminate
+    );
+    assert_eq!(
+        next_step(&Mode::Daemon, &Phase::Pending, &untold, false, false, 100),
+        Step::Terminate
     );
 }
 
@@ -1270,6 +1292,7 @@ fn the_notice_opens_with_its_head_and_never_asks_to_cancel() {
     assert!(text.contains("do not cancel them"));
     assert!(text.contains("ATERM-UPGRADE-READY-0badf00d on a line by itself"));
     assert!(!text.contains('\n'), "one line, typed as one turn");
+    assert!(text.ends_with(upgrade::NOTICE_CLOSE), "{text}");
     let cont = continue_prompt(&v("0.157.0"), &v("0.157.1"));
     assert!(cont.starts_with("[aterm harness] Upgraded: "));
     assert!(cont.contains("Codex 0.157.1 (from 0.157.0)"));
@@ -1305,12 +1328,11 @@ fn project(state: &std::collections::BTreeMap<&'static str, i64>) -> DaemonFacts
     }
 }
 
-/// TIER-1: the derived `HarnessCodexDaemonUpdate` machine against the REAL
-/// `daemon_step`, over EVERY state the machine reaches — the model's `Update`
-/// enabled exactly where the shipping rule says `Update`. NEGATIVE CONTROL:
-/// the machine's `Buggy=1` member (the rule that asks only the tabs it can
-/// see) enables `Update` in a reachable state where the real rule refuses, so
-/// a pass here is never vacuous.
+/// Tier-1: the derived `HarnessCodexDaemonUpdate` machine against the real
+/// `daemon_step` over every reachable state: the model's `Update` is enabled
+/// exactly where the shipping rule says `Update`. Negative control: the
+/// machine's `Buggy=1` member (asking only the visible tabs) enables `Update`
+/// where the real rule refuses.
 #[test]
 fn the_real_daemon_rule_is_the_derived_machine() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1357,12 +1379,11 @@ fn the_real_daemon_rule_is_the_derived_machine() {
     assert!(caught, "the real rule refuses what the buggy one allows");
 }
 
-/// AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK (a background terminal a
-/// finished turn left, `Facts::background_point`) an EMBEDDED conversation
-/// gets its first notice — the owner's answer of 2026-09-26 — and nothing
-/// else; a client with no notice to take (daemon mode, a fresh TUI) ends at
-/// its `/exit`, which is an idle point's alone. NEGATIVE CONTROL: the same
-/// daemon-mode client at an idle point exits as before.
+/// At a break of the agent's own background work (a background terminal a
+/// finished turn left, `Facts::background_point`) an embedded conversation
+/// gets its first notice and nothing else; a client with no notice to take
+/// (daemon mode, a fresh TUI) ends at its `/exit`, only at an idle point.
+/// Negative control: the same daemon-mode client at an idle point exits.
 #[test]
 fn a_break_of_background_work_notices_an_embedded_session_and_exits_nothing() {
     let at_break = Facts {
@@ -1409,11 +1430,10 @@ fn a_break_of_background_work_notices_an_embedded_session_and_exits_nothing() {
     );
 }
 
-/// The relaunch on exit's pure readers (2026-09-27): the thread a TUI's argv
-/// resumes, a thread id's creation instant (UUIDv7), and a rollout's
-/// directory. NEGATIVE CONTROLS: a plain launch, `resume --last`, a picker
-/// and a `fork` name no thread; a non-v7 id has no instant; any other first
-/// line has no directory.
+/// The relaunch-on-exit readers: the thread a TUI's argv resumes, a thread id's
+/// creation instant (UUIDv7), and a rollout's directory. Negative controls: a
+/// plain launch, `resume --last`, a picker and a `fork` name no thread; a
+/// non-v7 id has no instant; any other first line has no directory.
 #[test]
 fn the_relaunch_on_exit_reads_a_thread_its_instant_and_its_directory() {
     let argv = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -1435,7 +1455,7 @@ fn the_relaunch_on_exit_reads_a_thread_its_instant_and_its_directory() {
     ] {
         assert_eq!(resumed_thread(&argv(a)), None, "{a:?}");
     }
-    // Measured 2026-09-27: the thread a TUI began at 21:19:57.751Z.
+    // The thread a TUI began at 21:19:57.751Z.
     assert_eq!(thread_created_ms(t), Some(1_790_543_997_751));
     assert_eq!(
         thread_created_ms("01a0e4bd-2b37-45a0-939c-43fb6f1a5dfb"),
@@ -1454,12 +1474,11 @@ fn the_relaunch_on_exit_reads_a_thread_its_instant_and_its_directory() {
     assert_eq!(rollout_cwd("not json"), None);
 }
 
-/// NO STOP IS FOR GOOD IN THE CODEX LANE EITHER (2026-09-27): a stopped
-/// round of a client with no notice to take (daemon mode, or an embedded
-/// thread with no conversation) rests `RETRY_S` — `failed` — then starts a
-/// new round, at a break too; an embedded conversation's is the Claude
-/// lane's reducer's, word for word. The owner's skip of the target holds
-/// it; a skip of another build does not.
+/// No stop is final in the Codex lane either: a stopped round of a client with
+/// no notice to take (daemon mode, or an embedded thread with no conversation)
+/// rests `RETRY_S` (`failed`) and then starts a new round, at a break too; an
+/// embedded conversation uses the Claude lane's reducer. The owner's skip of
+/// the target holds it; a skip of another build does not.
 #[test]
 fn a_stopped_codex_round_rests_then_rearms() {
     let stopped = Phase::Failed("resumed-elsewhere".to_string());
@@ -1530,16 +1549,14 @@ fn a_stopped_codex_round_rests_then_rearms() {
     }
 }
 
-/// A GOAL ON THIS SCREEN PLACES NOTHING (the second review of 2026-09-28):
-/// where the kernel names no thread (two threads, two clients), a running
-/// thread the still run placed elsewhere still holds the client while its
-/// footer shows a goal being pursued — the goal's own next turn runs under a
-/// screen that reads idle at the same words, as another session's would —
-/// and `goal_on_screen` reads that footer through its anchor, under the
-/// input line only. NEGATIVE CONTROLS: without the goal, the placed thread
-/// holds nothing; a thread the kernel names is the client's own, `Goal` or
-/// `Own`, placed or not; the footer's words quoted above the input line are
-/// no goal.
+/// A goal on this screen places nothing: where the kernel names no thread (two
+/// threads, two clients), a running thread placed elsewhere still holds the
+/// client while its footer shows a goal being pursued (the goal's next turn
+/// runs under a screen that reads idle). `goal_on_screen` reads that footer
+/// through its anchor, under the input line only. Negative controls: without
+/// the goal the placed thread holds nothing; a thread the kernel names is the
+/// client's own (`Goal` or `Own`), placed or not; the footer's words quoted
+/// above the input line are no goal.
 #[test]
 fn a_goal_on_the_screen_keeps_every_running_thread_unplaced() {
     use aterm_phase::codex::fixtures::GOAL_NEXT_TURN_0_158;
@@ -1608,9 +1625,9 @@ fn spawned(thread: &str, parent: &str, turn: TurnState) -> Loaded {
     }
 }
 
-/// THE OWNER'S DAEMON AS MEASURED (2026-09-28, read-only): one conversation
-/// — its root, the thread the one TUI resumed — and three subagents it
-/// spawned, `root_busy` its root's turn and `busy` each subagent's.
+/// A real daemon shape: one conversation (its root, the thread the one TUI
+/// resumed) and three subagents it spawned; `root_busy` is the root's turn and
+/// `busy` each subagent's.
 fn owners_daemon(root_busy: bool, busy: [bool; 3]) -> Vec<Loaded> {
     let turn = |b: bool| if b { TurnState::Busy } else { TurnState::Idle };
     let mut threads = vec![root(T1, turn(root_busy))];
@@ -1623,12 +1640,11 @@ fn owners_daemon(root_busy: bool, busy: [bool; 3]) -> Vec<Loaded> {
     threads
 }
 
-/// A ROLLOUT'S FIRST LINE NAMES ITS SPAWN TREE (the measured shapes,
-/// `fixtures`): a `cli` root is a root, a spawned subagent names its parent —
-/// at depth 2 too — and anything else is no guess: a subagent of another
-/// shape (a review's) is a subagent with no parent, a spawn naming no thread
-/// id is one too, and a line that is not a `session_meta`, not JSON, or a
-/// `source` of an unknown shape is `Unread`.
+/// A rollout's first line names its spawn tree (`fixtures`): a `cli` root is a
+/// root, a spawned subagent names its parent (at depth 2 too); a subagent of
+/// another shape (a review's) or a spawn naming no thread id is a subagent with
+/// no parent; a line that is not a `session_meta`, not JSON, or has an unknown
+/// `source` shape is `Unread`.
 #[test]
 fn a_rollouts_first_line_names_its_spawn_tree() {
     use super::fixtures::{root_meta, spawned_meta};
@@ -1662,16 +1678,13 @@ fn a_rollouts_first_line_names_its_spawn_tree() {
     assert_eq!(session_lineage(""), Lineage::Unread);
 }
 
-/// THE KERNEL NAMES A CONVERSATION, NOT A LOCK (the third review of
-/// 2026-09-28): the owner's daemon held FOUR writer locks — one conversation's
-/// root and three subagents it spawned — under ONE TUI, and the lane, counting
-/// locks, named nothing. Every thread hanging from one root and the TUI the
-/// daemon's only client names that ROOT (the thread `codex resume` takes
-/// back); a depth-2 subagent hangs from it through its parent. NEGATIVE
-/// CONTROLS: a second root (another conversation, or one no tab shows); a
-/// second client; clients unread; a subagent whose parent the daemon does
-/// not hold, or that names none, or whose lineage was not read; a lone
-/// subagent (no client's conversation); and a loop.
+/// The kernel names a conversation, not a lock: with a daemon holding four
+/// writer locks (one root and three subagents) under one TUI, every thread
+/// hanging from one root, with that TUI the daemon's only client, names the
+/// root (the thread `codex resume` takes back); a depth-2 subagent hangs from
+/// it through its parent. Negative controls: a second root; a second client;
+/// clients unread; a subagent whose parent the daemon does not hold, that names
+/// none, or whose lineage was not read; a lone subagent; a loop.
 #[test]
 fn the_kernel_names_the_root_of_the_one_conversation_on_the_daemon() {
     let (tui, other_tui) = (4_242, 4_343);
@@ -1699,7 +1712,7 @@ fn the_kernel_names_the_root_of_the_one_conversation_on_the_daemon() {
         }];
         assert_eq!(own_thread(tui, &one, Some(&[tui])), None, "a lone subagent");
     }
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let mut two_roots = owners.clone();
     two_roots.push(root(T2, TurnState::Idle));
     assert_eq!(own_thread(tui, &two_roots, Some(&[tui])), None, "two roots");
@@ -1727,19 +1740,14 @@ fn the_kernel_names_the_root_of_the_one_conversation_on_the_daemon() {
     assert_eq!(own_thread(tui, &looped, Some(&[tui])), None);
 }
 
-/// A TURN OF THE TAB'S OWN CONVERSATION HOLDS IT, SUBAGENTS INCLUDED (the
-/// third review of 2026-09-28), in the owner's measured shape — one root,
-/// three subagents, one TUI: a subagent running while the root is idle, and
-/// the root running while the subagents are idle, are this client's own —
-/// `Goal` under a goal on its screen, else `Own` — placed or not; all idle,
-/// nothing holds it. The round before, counting locks, named nothing and
-/// placed a subagent that ran through the still run: `None`, and `/exit`.
-/// NEGATIVE CONTROLS, two roots and two TUIs (the kernel names nothing): a
-/// root of the other session, placed, holds nothing; a SUBAGENT is never
-/// placed — the other session's or this one's; a root is never placed with
-/// this TUI the daemon's only client (a thread no tab shows — or this tab's
-/// own while it shows a subagent) or with clients unread; under a goal,
-/// nothing is.
+/// A turn of the tab's own conversation holds it, subagents included: with one
+/// root, three subagents and one TUI, a subagent running while the root is
+/// idle, or the root running while the subagents are idle, is this client's own
+/// (`Goal` under a goal on its screen, else `Own`), placed or not; all idle,
+/// nothing holds it. Negative controls with two roots and two TUIs (the kernel
+/// names nothing): the other session's root, placed, holds nothing; a subagent
+/// is never placed; a root is never placed while this TUI is the daemon's only
+/// client or with clients unread; under a goal, nothing is.
 #[test]
 fn a_turn_of_the_tabs_own_conversation_holds_it_subagents_included() {
     use upgrade::DaemonTurn;
@@ -1771,7 +1779,7 @@ fn a_turn_of_the_tabs_own_conversation_holds_it_subagents_included() {
         DaemonTurn::None
     );
 
-    // NEGATIVE CONTROLS: another conversation on the daemon, and its TUI.
+    // Negative controls: another conversation on the daemon, and its TUI.
     const R2: &str = T2;
     const R2_SUB: &str = "01a0dc3b-0000-7000-8000-000000000001";
     let both = [tui, other_tui];
@@ -1838,18 +1846,16 @@ fn a_turn_of_the_tabs_own_conversation_holds_it_subagents_included() {
     );
 }
 
-// --- the goal pause (the owner's decision of 2026-09-28) -------------------
+// --- the goal pause ----------------------------------------------------------
 
-/// A goal turn's opening rows as the owner's 0.158.0 rollout writes them
-/// (read-only, 2026-09-28; the ids and text stand-ins): its context, and the
-/// goal's own continuation message.
+/// A goal turn's opening rows as a 0.158.0 rollout writes them (ids and text
+/// are stand-ins): its context, and the goal's own continuation message.
 const TURN_CONTEXT: &str = r#"{"timestamp":"2026-09-29T00:35:15.615Z","ordinal":584306,"type":"turn_context","payload":{"cwd":"/stand-in/project","model":"gpt-6-astra"}}"#;
 const GOAL_CONTINUATION: &str = r#"{"timestamp":"2026-09-29T00:35:15.617Z","ordinal":584307,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal"}]}}"#;
 const REASONING: &str = r#"{"timestamp":"2026-09-29T00:35:19.730Z","ordinal":584309,"type":"response_item","payload":{"type":"reasoning","summary":[]}}"#;
 const TOOL_CALL: &str = r#"{"timestamp":"2026-09-29T00:35:23.432Z","ordinal":584311,"type":"response_item","payload":{"type":"function_call","name":"followup_task","arguments":"{}"}}"#;
 /// A turn's `world_state` as 0.158.0 writes it between the turn's opening
-/// messages and its `turn_context` (measured read-only in the owner's
-/// rollouts, 2026-09-28; its state cut down here).
+/// messages and its `turn_context` (its state cut down here).
 const WORLD_STATE: &str = r#"{"timestamp":"2026-09-28T15:28:29.649Z","ordinal":6,"type":"world_state","payload":{"full":true,"state":{"agents_md":{"directory":"/stand-in"}}}}"#;
 
 fn head_back(bytes: &[u8], chunk: u64) -> TurnState {
@@ -1857,16 +1863,13 @@ fn head_back(bytes: &[u8], chunk: u64) -> TurnState {
     rollout_head_back(&mut std::io::Cursor::new(bytes), len, chunk, u64::MAX)
 }
 
-/// A GOAL TURN'S HEAD (`TurnState::Head`, the one point an Esc may stop a
-/// turn at): `task_started`, then only what the turn opened with — its
-/// context, the goal's own message, the `world_state` 0.158.0 writes there
-/// (the goal-pause review of 2026-09-28: read as work, it ended every
-/// head it opened), a token count — read whole wherever the
+/// A goal turn's head (`TurnState::Head`, the one point an Esc may stop a turn
+/// at): `task_started`, then only what the turn opened with (its context, the
+/// goal's message, the `world_state`, a token count), read whole wherever the
 /// chunks cut it. Past its head: its first reasoning item, a tool call, a
-/// line half-written (never read as a head). An ended turn is idle, and the
-/// turn readers the rest of the lane asks read a head `Busy`. NEGATIVE
-/// CONTROL: a turn of the same rows plus one tool call is no head at any
-/// chunk.
+/// half-written line (never a head). An ended turn is idle, and the lane's
+/// turn reader reads a head `Busy`. Negative control: the same rows plus one
+/// tool call is no head at any chunk.
 #[test]
 fn a_goal_turns_head_is_told_from_its_work() {
     let token = r#"{"timestamp":"2026-09-29T00:35:15.620Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#;
@@ -1921,16 +1924,13 @@ fn a_goal_turns_head_is_told_from_its_work() {
         ),
     ];
     for (case, bytes, want) in &cases {
-        let text = String::from_utf8_lossy(bytes);
-        assert_eq!(rollout_turn_head(&text), *want, "{case}: the whole text");
         let len = u64::try_from(bytes.len()).expect("len");
         for chunk in 1..=len + 1 {
             assert_eq!(head_back(bytes, chunk), *want, "{case}: chunk {chunk}");
         }
-        // The turn readers never tell a head apart.
-        let turn = rollout_turn(&text);
+        // The turn reader never tells a head apart.
         assert_eq!(
-            turn,
+            back(bytes, u64::MAX, u64::MAX),
             if *want == TurnState::Head {
                 TurnState::Busy
             } else {
@@ -1981,20 +1981,20 @@ fn goal_look(hold: Option<&crate::harness::goal_hold::Hold>, now: u64) -> GoalLo
     }
 }
 
-/// THE GOAL PAUSE'S EDGES the derived machine leaves to its unit tests
+/// The goal pause's edges the derived machine leaves to unit tests
 /// (`HarnessUpgradeGoalPause`'s doc): a pause is waited on through its take
 /// window, then the Esc at a head; a pause never shown is given up past
 /// `PAUSE_GIVE_UP_S` (said, typing nothing); a paused goal is resumed at its
 /// bound with no move; a resume is waited on, then made again, and past
 /// `MAX_RESUMES` said as left paused; an open switch types nothing for the
-/// upgrade's hold; a footer that names the goal neither paused nor pursued
-/// releases it, one that names no goal only with a person's hand since; no
-/// footer decides nothing; the Esc is weighed with the turn's status row up;
-/// a pause shown after a person's hand is theirs; a resume without the move
-/// is withheld in a sandbox; the rest after a hold that ended
-/// without its move keeps the next pause off, and one that ended with it
-/// does not. And the pause is never made where anything but the goal's turn
-/// holds the move, nor at a draft, nor with a person typing.
+/// upgrade's hold; a footer naming the goal neither paused nor pursued
+/// releases it, one naming no goal only with a person's hand since; no footer
+/// decides nothing; the Esc is weighed with the turn's status row up; a pause
+/// shown after a person's hand is theirs; a resume without the move is
+/// withheld in a sandbox; the rest after a hold that ended without its move
+/// keeps the next pause off, one that ended with it does not. The pause is
+/// never made where anything but the goal's turn holds the move, at a draft,
+/// or with a person typing.
 #[test]
 fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
     use crate::harness::goal_hold::{Hold, How, Stage};
@@ -2086,10 +2086,8 @@ fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
         }),
         GoalStep::Release("by-hand")
     );
-    // The Esc at a head is weighed with the turn's own status row up (the
-    // goal-pause review of 2026-09-28: a head always shows it, and weighed
-    // on `free` the Esc could never be pressed) — never over a box or a
-    // draft.
+    // The Esc at a head is weighed with the turn's own status row up (a head
+    // always shows it), never over a box or a draft.
     assert_eq!(
         goal_step(&GoalLook {
             free: false,
@@ -2107,9 +2105,8 @@ fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
         GoalStep::Wait("goal-pausing"),
         "a box or a draft"
     );
-    // The pause SHOWN with a person's hand since it was typed may be
-    // theirs — their Esc into the last turn, their own `/goal pause`: never
-    // claimed (the review of 2026-09-28). With none, taken.
+    // A pause shown with a person's hand since it was typed may be theirs
+    // (their Esc, their own `/goal pause`): never claimed. With none, taken.
     let shown = |person: bool| GoalLook {
         goal: Some(CodexGoal::Paused),
         person_since: person,
@@ -2148,11 +2145,11 @@ fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
         GoalStep::Hold,
         "no footer read decides nothing"
     );
-    // A footer that names NO goal decides nothing with nobody's hand since
-    // (the goal-pause review of 2026-09-28: a narrow pane's misread released
-    // the hold with its resume owed) — held, then its resume waited on — and
-    // releases it with a person's hand since (their `/goal clear`, a thread
-    // of their own). A footer that names ANOTHER state releases it.
+    // A footer naming no goal decides nothing with nobody's hand since (a
+    // narrow pane's misread must not drop the owed resume): held, then its
+    // resume waited on. With a person's hand since (their `/goal clear`, a
+    // thread of their own) it releases. A footer naming another state
+    // releases it.
     assert_eq!(
         goal_step(&GoalLook {
             goal: None,
@@ -2202,7 +2199,7 @@ fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
         }),
         GoalStep::Release("changed")
     );
-    // A resume WITHOUT the move into a thread fallen into a sandbox is
+    // A resume without the move into a thread fallen into a sandbox is
     // withheld — the goal stays paused, said; the move's own resume is not.
     assert_eq!(
         goal_step(&GoalLook {
@@ -2302,9 +2299,9 @@ fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
         "a new move's goal is paused afresh"
     );
     assert!(!goal_owed(Some(&abandoned)) && goal_owed(Some(&resuming)));
-    // The relaunched Codex's box left to a person at the keys: their hand on
-    // the tab since makes its answer theirs — `Leave paused` too — and
-    // nothing is resumed over it; with no hand since, the resume.
+    // The relaunched Codex's box left to a person: their hand on the tab since
+    // makes its answer theirs (`Leave paused` too) and nothing is resumed over
+    // it; with no hand since, the resume.
     let mut boxed = paused.clone();
     boxed.tried_at = now + 900;
     assert!(boxed.say(BOX_THEIRS));
@@ -2333,17 +2330,12 @@ fn the_goal_pause_waits_retries_gives_up_and_resumes_at_its_bound() {
     assert_eq!(goal_step(&restarted(false)), GoalStep::Resume(BY_HAND));
 }
 
-/// A NARROW PANE NEVER DROPS THE RESUME ATERM OWES (the goal-pause review of
-/// 2026-09-28, its probes made real). Each footer CAPTURED LIVE (Codex
-/// 0.158.0 in a scratch headless aterm, a scratch `$CODEX_HOME`, a dummy
-/// key): in a narrow pane Codex cuts the status row's left side to keep the
-/// goal's state whole, and its ` · ` goes; read by the ` · ` alone, the
-/// key-hint row under it was the status row, the goal read as none, and the
-/// hold was released `changed` at the very next look — the pause made at 45
-/// columns and dropped there, and a paused hold after the move dropped at 40
-/// where 140 columns resumed it. Now the real readers find the goal at every
-/// width: at 45 the pause is made and TAKEN; at 40 the moved goal is
-/// RESUMED, as at 140 (the control).
+/// A narrow pane never drops the resume aterm owes. Footers captured live
+/// (Codex 0.158.0 in a scratch headless aterm): in a narrow pane Codex cuts the
+/// status row's left side and its ` · ` goes, so a reader keyed on ` · ` alone
+/// would take the key-hint row for the status row and release the hold. The
+/// real readers find the goal at every width: at 45 columns the pause is made
+/// and taken; at 40 the moved goal is resumed, as at 140 (the control).
 #[test]
 fn a_narrow_pane_never_drops_the_resume_aterm_owes() {
     use crate::harness::goal_hold::{Hold, How, Owner, Stage};

@@ -1,33 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// EMBERFORGE GLYPH CONTRAST-HALO on the GPU — both backends draw the dark warm
+// Fire glyph contrast-halo on the GPU: both backends draw the dark warm
 // dilation ring around a fire-engulfed glyph (a `fire_halo` cell in a
-// `fire_patch` frame — the COLOUR-FREE strength stream; the ink itself is
-// never recoloured, the no-recolor law) so the letterform stays legible inside
-// the flame. Parity is RELEASED for the halo (the GPU takes the richer
-// deco-over path, the CPU a true dilation), so this is NOT a byte-exact pin;
-// it verifies:
-//   * BOTH backends actually render the halo — a real dark ring darkens the
-//     flame around the engulfed glyph on CPU AND GPU (the "both backends render
-//     fire" sanity check, halo edition) — and its alpha SCALES with the cell's
-//     engulfment strength on both;
-//   * the halo is GATED on fire: fire_halo WITHOUT fire_patch draws no halo,
-//     so the CPU/GPU frame stays byte-exact — as does `char_fg` alone (the
-//     retired recolour stream keeps working as pure fg substitution and never
-//     keys the ring);
-//   * the CPU and GPU halos stay visually close (a bounded per-channel delta) —
-//     the shared offsets + shared deco-over/blend contract + the shared
-//     `fire_halo_alpha` byte keep them aligned.
+// `fire_patch` frame; the ink itself is never recoloured) so the letterform
+// stays legible. The GPU uses a deco-over path and the CPU a true dilation,
+// so this is not byte-exact. It verifies:
+//   * both backends render the halo (a dark ring darkens the flame around the
+//     glyph) with alpha scaling with the cell's engulfment strength;
+//   * the halo is gated on fire: `fire_halo` without `fire_patch`, and
+//     `char_fg` alone (pure fg substitution), stay byte-exact;
+//   * CPU and GPU halos stay within a bounded per-channel delta (shared
+//     offsets, blend contract and `fire_halo_alpha` byte).
 //
-// Gated: no GPU or no font -> no-op (like every other parity gate).
+// No GPU or no font: no-op.
 
 use aterm_core::render::{CharFg, FireHaloCell};
 use aterm_core::terminal::Terminal;
 use aterm_render::{FireMode, FirePatch, Theme};
 
-mod common;
-use common::{backends, bb, gg, max_channel_delta, rr};
+use crate::common::{backends, bb, gg, max_channel_delta, rr};
 
 fn luma(p: u32) -> i32 {
     rr(p) + gg(p) + bb(p)
@@ -57,13 +49,12 @@ fn halo(row: u16, col: u16, strength: u8) -> FireHaloCell {
     FireHaloCell { row, col, strength }
 }
 
-/// The retired recolour stream's hot-gold ink — kept to pin that `char_fg`
-/// alone stays a pure (byte-exact) fg substitution that never keys the ring.
+/// A hot-gold ink used to pin that `char_fg` alone stays a byte-exact fg
+/// substitution that never keys the ring.
 const HEAT_GLOW_FG: u32 = 0x00FF_C87A;
 
-/// Count MARGIN ring pixels (just outside the engulfed block cell at `col`,
-/// row 1) that the halo frame pulled well below the fire-only frame — the
-/// halo's darkening footprint on the flame.
+/// Count ring pixels just outside the engulfed block cell at `col`, row 1,
+/// that the halo frame darkened well below the fire-only frame.
 fn halo_ring_px(
     halo: &[u32],
     fire_only: &[u32],
@@ -112,9 +103,9 @@ fn halo_ring_deficit(
     sum
 }
 
-/// BOTH backends render the fire contrast-halo at strength-scaled alpha, and
-/// it is gated on a live fire field (fire_halo alone AND char_fg alone stay
-/// byte-exact).
+/// Both backends render the fire contrast-halo at strength-scaled alpha, and
+/// it is gated on a live fire field (`fire_halo` alone and `char_fg` alone
+/// stay byte-exact).
 #[test]
 fn both_backends_render_the_fire_contrast_halo() {
     let theme = Theme::default();
@@ -144,8 +135,8 @@ fn both_backends_render_the_fire_contrast_halo() {
         "fire_halo WITHOUT fire draws no halo and must stay byte-exact CPU==GPU"
     );
 
-    // (a2) char_fg ALONE (no fire): the retired recolour mechanism stays a
-    // pure fg substitution — byte-exact CPU==GPU, and it never keys the ring.
+    // (a2) `char_fg` alone (no fire): a pure fg substitution, byte-exact
+    // CPU==GPU, never keying the ring.
     let mut char_only = term.cell_frame(rows, cols);
     char_only.char_fg = vec![CharFg {
         row: 1,
@@ -192,18 +183,15 @@ fn both_backends_render_the_fire_contrast_halo() {
         cpu_h, cpu_fo,
         "the halo frame must differ from the fire-only frame (non-vacuous)"
     );
-    // Parity RELEASED: the CPU dilation and the GPU deco-over dilation share the
-    // offsets + the blend contract + the `fire_halo_alpha` byte, so they stay
-    // visually close. A loose bound (not byte-exact) catches gross divergence
-    // without pinning the richer path.
+    // The two dilations share offsets, blend contract and alpha byte, so a
+    // loose bound catches gross divergence without pinning exact bytes.
     assert!(
         delta <= 24,
         "CPU and GPU halos must stay visually close (max per-channel delta {delta})"
     );
 
-    // (d) STRENGTH SCALING on both backends: a weak lick rims strictly less
-    // than the full wall — and the weak frames stay just as close CPU-vs-GPU
-    // (the shared alpha byte).
+    // (d) Strength scaling on both backends: a weak lick rims strictly less
+    // than the full wall, and stays as close CPU-vs-GPU.
     let mut licked = term.cell_frame(rows, cols);
     licked.fire_patch = vec![fire];
     licked.fire_halo = vec![halo(1, 4, 24)];

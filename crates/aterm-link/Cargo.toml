@@ -1,25 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 
-# THE ONE ATERM-SIDE FABRIC CRATE — the `aterm-link serve` bridge (§11.2).
+# The aterm-side fabric crate: the `aterm-link serve` bridge (§11.2).
 #
-# IN THE WORKSPACE SINCE 2026-09-10, and that is the change. It used to carry
-# its own `[workspace]` table and path-depend on `../../astream`, a SIBLING
-# CHECKOUT most clones do not have — so `cargo build` at the aterm root never
-# built it, no release ever carried it, and turning the fabric on meant building
-# two repositories by hand. The astream crates it needs come from
-# `vendor/astream`, a GIT SUBMODULE of github.com/alabsystems/astream pinned
-# to one commit (2026-09-24; before that, a hand-synced copy that was reviewed
-# byte for byte and never diverged). Both repositories are first-party, so a
-# bus fix lands in astream and reaches aterm as a submodule bump, never as an
-# edit here: see `vendor/README-astream.md`.
+# The astream crates come from `vendor/astream`, a git submodule pinned to one
+# commit; a bus fix lands in astream and arrives here as a submodule bump
+# (`vendor/README-astream.md`).
 [package]
 name = "aterm-link"
 version.workspace = true
-# EDITION 2021, not the workspace's 2024, and deliberately: this crate uses
-# `gen` as an identifier (the fabric's `gen=<content_seq>:<fp16>` fence), which
-# 2024 reserves as a keyword. (The astream crates are 2021 too, but they declare
-# their own edition in their own workspace; nothing here decides it.)
+# Edition 2021, not 2024: this crate uses `gen` as an identifier (the fabric's
+# `gen=<content_seq>:<fp16>` fence), which 2024 reserves.
 edition = "2021"
 license.workspace = true
 repository.workspace = true
@@ -27,63 +18,55 @@ authors.workspace = true
 publish = false
 
 [features]
-# The sealed cross-host transport (`--tcp --key-file`), OFF BY DEFAULT — so a
-# default build, and every shipped binary, carries no cipher tree at all.
-#
-# It is a feature and not a plain dependency because of what it costs: `aead`
-# pulls astream-aead and with it chacha20poly1305 + getrandom, and the further
-# rungs the x25519/ed25519 curves — 22 third-party packages. This repository
-# COUNTS packages (`crates/aterm-digest` exists because `sha2` + `hmac` cost
-# eight of them to expose four methods), so the cross-host wire is opt-in.
-#
-# chacha20poly1305 + getrandom appear in `Cargo.lock` regardless, because a
-# lockfile records the optional dependencies a feature here can reach; `targo
-# tree -p aterm-link -e normal` is what shows that a default build compiles none
-# of them. (The x25519/ed25519 curves behind astream's `handshake`/`identity`
-# features are no longer in the lock: nothing in this workspace can enable them,
-# and a crate outside the workspace records only what its dependants can reach.)
-# `tests/two_nodes_sealed.rs` is the one thing that turns it on.
+# The sealed cross-host transport (`--tcp --key-file`), off by default so a
+# shipped binary carries no cipher tree: `aead` pulls chacha20poly1305 +
+# getrandom and, further up, the curves — 22 third-party packages, and this
+# repository counts packages. chacha20poly1305 + getrandom still appear in
+# `Cargo.lock` (a lockfile records reachable optional deps; the curves do not,
+# as nothing here can enable them); `targo tree -p aterm-link -e normal` shows a
+# default build compiles none. `tests/two_nodes_sealed.rs` turns it on.
 sealed = ["astream-broker/aead"]
-# Development seams (`aterm_types::dev_seam!`) in an optimized build: `ATERM_BIN`
-# (the binary `fabric on` installs), the bridge's and the notifier's fault
-# switches, `aterm fabric on`'s effect trace and mint fault, and the redirected
-# fabric root the tests run under. A debug build (every test) compiles them anyway;
-# the release cutter never enables this — aterm-release's buildplan pins it — so a
-# shipped `aterm fabric`/`aterm link` reads none of them.
+# Development seams (`aterm_types::dev_seam!`) in an optimized build: `ATERM_BIN`,
+# the bridge's and notifier's fault switches, `fabric on`'s effect trace and mint
+# fault, and the redirected fabric root. Debug builds compile them anyway; the
+# release buildplan never enables this, so a shipped binary reads none of them.
 dev-seams = []
 
 [dependencies]
-# The bus. `cap` for the bound grant every fabric principal attaches with; `aead`
-# for the sealed TCP the cross-host rung (A5) deploys on. Together they are the
-# crate's WHOLE third-party crypto surface: sha2, chacha20poly1305, getrandom.
-# (Its one other third-party crate is `serde`, through `aterm-toml` below.)
+# The bus: `cap` for the bound grant every fabric principal attaches with. With
+# `sealed`, the crate's whole third-party crypto surface is sha2,
+# chacha20poly1305 and getrandom.
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
-# aterm's own: the verb table (one source of truth for what the bridge may call)
-# and the control-socket vocabulary. Neither pulls the engine.
+# The verb table (what the bridge may call) and the control-socket vocabulary.
 aterm-types = { workspace = true }
+# The body's informational `t=` (`now_ms`).
+aterm-time = { workspace = true }
 aterm-uds = { workspace = true }
-# The control-socket CLIENT, for the local rendezvous walk and the Owner token
-# read — `aterm fabric` (src/fabric.rs), the operator's one-screen view of the
-# fabric, and the bridge's node-wide hosted set behind `fabric retire` — the
-# SAME discovery `aterm ctl instances`/`ls` make, so neither can find a
-# different set of instances than the client does. It depends on nothing but
-# the two crates above; std-only, like this crate.
+# The one hex codec (key file, roster nonce) and the control wire's percent
+# escape (`pct`, shared by the fabric body).
+aterm-codec = { workspace = true }
+# The one FNV-1a/64 (the `gen=` fingerprint, the say-cursor shard): the same
+# hash `status` stamps `hash=` with.
+aterm-hash = { workspace = true }
+# The control-socket client: the same rendezvous walk and Owner-token read
+# `aterm ctl instances`/`ls` use, so `aterm fabric` and the bridge's hosted set
+# cannot find different instances than the client does.
 aterm-ctl = { path = "../aterm-ctl" }
-# `aterm fabric` reads `[fabric] command` with the parser the app itself loads
-# aterm.toml with, so the report and the instance cannot disagree about what the
-# file says. It brings `serde`, which is in the shipped binary's graph already;
-# the third-party CRYPTO surface above is unchanged.
+# `[fabric] command` is read with the app's own aterm.toml parser, so the report
+# and the instance cannot disagree about the file. Its `serde` is already in the
+# shipped graph.
 aterm-toml = { workspace = true }
 
 [dev-dependencies]
 # `aterm fabric status --json` is asserted as JSON, not as substrings.
 aterm-json = { workspace = true }
-# `aterm fabric on`'s mint transaction is checked against the
-# capability-publication MODEL (`fabric_capability_publication_model`), not
-# against a paraphrase of it: `tests/fabric_on.rs` runs the real command's
-# effect trace through `Model::fire`. Test-only; the shipped graph is unchanged.
+# `tests/world/fabric_on.rs` runs `fabric on`'s effect trace through the
+# capability-publication model's `Model::fire`.
 aterm-spec = { workspace = true }
+# Scratch directories removed on drop, and `stand_in`: a fake program with one
+# pre-assessed inode per body.
+aterm-tempfile = { workspace = true, features = ["stand-in"] }
 
 [[bin]]
 name = "aterm-link"

@@ -10,15 +10,11 @@ use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 use super::*;
 
-/// A deterministic xorshift, so a failing step names a reproducible state.
+/// The shared generator (`aterm_spec::rng`) as a draw closure, so a failing
+/// step names a reproducible state.
 pub(super) fn xorshift(seed: u64) -> impl FnMut() -> u64 {
-    let mut state = seed;
-    move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    }
+    let mut rng = aterm_spec::rng::XorShift::new(seed);
+    move || rng.next_u64()
 }
 
 /// One step of the HOSTILE WALK: every byte class the 2026-09-22/23 audit found
@@ -194,7 +190,7 @@ fn assert_wire_admits(at: &str, checkpoint: &TerminalCheckpoint) {
 /// `16 KiB + cols * 512`, so the line's record cannot take the wire's shape at
 /// any history depth (the finding's reproduction: 8 links of 8 KiB in an
 /// 80-column pane).
-fn link_dense(n: usize, url_len: usize) -> Vec<u8> {
+pub(crate) fn link_dense(n: usize, url_len: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     for link in 0..n {
         let mut url = format!("https://example.test/{link}/");
@@ -1095,24 +1091,12 @@ fn dropping_carried_history_equals_the_engines_visible_only_carry() {
 #[cfg(unix)]
 fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
     use super::tests::{
-        ENV_LOCK, RestoreVar, StageCarry, child_proof_from, pipe_pair, stage_ladder_handoff,
+        ENV_LOCK, StageCarry, child_proof_from, pipe_pair, restore_env, stage_ladder_handoff,
     };
     use std::sync::PoisonError;
 
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = [
-        RestoreVar::new("XDG_RUNTIME_DIR"),
-        RestoreVar::new("HOME"),
-        RestoreVar::new(ENV_MANIFEST),
-        RestoreVar::new(ENV_NONCE),
-        RestoreVar::new(ENV_FDS),
-        RestoreVar::new(ENV_LAYOUT),
-        RestoreVar::new(ENV_TARGET),
-        RestoreVar::new(ENV_READY_FD),
-        RestoreVar::new(ENV_COMMIT_FD),
-        RestoreVar::new(ENV_PARENT_PID),
-        RestoreVar::new(ENV_PARENT_BIRTH),
-    ];
+    let _restore = restore_env();
     let mut healthy = Terminal::new(24, 80);
     healthy.process(b"\x1b[1;38;5;202muser@mac\x1b[0m ~ % ls\r\nCargo.toml\r\n% ");
     let mut mid_title = Terminal::new(24, 80);
@@ -1172,6 +1156,7 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
         // restores its modes, so its holder must still reach the adopting
         // reader, or a job that died during the handoff is never an edge.
         fg_holders: vec![(0, 4100), (2, 4242)],
+        render_debts: Vec::new(),
     };
     let staged = stage_ladder_handoff("ladder", &stage, &repaint);
 
@@ -1193,8 +1178,10 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
         ready_write,
         commit_read,
         Some(encode_target_identity(
-            crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-            crate::build_info::GIT_COMMIT,
+            crate::build_info::build_number()
+                .parse::<u64>()
+                .unwrap_or(0),
+            crate::build_info::git_commit(),
         )),
     );
     let incoming = take_incoming_as(ReceiverShape::Current);
@@ -1270,98 +1257,119 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
 /// is what sends ordinary 120x400 panes down the Repaint rung here.
 mod arbitrary {
     use super::*;
-    use proptest::prelude::*;
 
-    /// One step of a program's life: bytes it wrote, or a resize of its pane.
-    #[derive(Debug, Clone)]
-    enum Op {
-        Bytes(Vec<u8>),
-        Resize(u16, u16),
+    /// xorshift64 with a fixed seed, so a failure reproduces from its case.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+
+        /// Inclusive `lo..=hi`.
+        fn within(&mut self, lo: u16, hi: u16) -> u16 {
+            lo + self.below(u64::from(hi - lo) + 1) as u16
+        }
+
+        fn ascii(&mut self, lo: u8, hi: u8, max: u64) -> Vec<u8> {
+            (0..1 + self.below(max))
+                .map(|_| lo + self.below(u64::from(hi - lo) + 1) as u8)
+                .collect()
+        }
     }
+
+    /// Fragments that open and close control strings, switch screens, save
+    /// cursors and draw multi-codepoint clusters, so short samples still reach
+    /// those states.
+    const FRAGMENTS: &[&[u8]] = &[
+        b"\x1b",
+        b"\x1b[",
+        b"\x1b]",
+        b"\x1bP",
+        b"\x1b_",
+        b"\x1b\\",
+        b"\x07",
+        b";",
+        b"\r\n",
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+        b"\x1b[?1047h",
+        b"\x1b7",
+        b"\x1b8",
+        b"\x1b[?69h\x1b[2;5s",
+        b"\x1b[3;9r",
+        b"\x1b]7;file:///tmp/a%00b\x07",
+        b"\x1b]633;P;Cwd=/tmp/%ff%00\x07",
+        b"\x1b]8;;https://example.test/l\x1b\\",
+        b"\x1b[1;38;5;202;48;2;1;2;3;58;5;9m",
+        "e\u{301}".as_bytes(),
+        "\u{1F468}\u{200D}\u{1F4BB}".as_bytes(),
+        "\u{6f22}".as_bytes(),
+        b"\x1b[>1u",
+        b"\x1b[<u",
+        b"\x1b(0",
+        b"\x1bc",
+    ];
 
     /// A pane geometry: ordinary panes mostly, and the engine's extreme thin
     /// shapes out to its protocol ceiling.
-    fn geometry() -> impl Strategy<Value = (u16, u16)> {
-        prop_oneof![
-            4 => (1..=120_u16, 1..=400_u16),
-            1 => (1..=aterm_core::grid::MAX_GRID_ROWS, 1..=8_u16),
-            1 => (1..=8_u16, 1..=aterm_core::grid::MAX_GRID_COLS),
-        ]
+    fn geometry(rng: &mut Rng) -> (u16, u16) {
+        match rng.below(6) {
+            0..4 => (rng.within(1, 120), rng.within(1, 400)),
+            4 => (
+                rng.within(1, aterm_core::grid::MAX_GRID_ROWS),
+                rng.within(1, 8),
+            ),
+            _ => (
+                rng.within(1, 8),
+                rng.within(1, aterm_core::grid::MAX_GRID_COLS),
+            ),
+        }
     }
 
-    /// Bytes a program might write: any byte at all, plus the fragments that
-    /// open and close control strings, switch screens, save cursors and draw
-    /// multi-codepoint clusters, so short samples still reach those states.
-    fn fragment() -> impl Strategy<Value = Vec<u8>> {
-        prop_oneof![
-            4 => any::<u8>().prop_map(|byte| vec![byte]),
-            2 => "[ -~]{1,24}".prop_map(String::into_bytes),
-            2 => "[0-9]{1,4}".prop_map(String::into_bytes),
-            1 => prop::sample::select(vec![
-                &b"\x1b"[..],
-                b"\x1b[",
-                b"\x1b]",
-                b"\x1bP",
-                b"\x1b_",
-                b"\x1b\\",
-                b"\x07",
-                b";",
-                b"\r\n",
-                b"\x1b[?1049h",
-                b"\x1b[?1049l",
-                b"\x1b[?1047h",
-                b"\x1b7",
-                b"\x1b8",
-                b"\x1b[?69h\x1b[2;5s",
-                b"\x1b[3;9r",
-                b"\x1b]7;file:///tmp/a%00b\x07",
-                b"\x1b]633;P;Cwd=/tmp/%ff%00\x07",
-                b"\x1b]8;;https://example.test/l\x1b\\",
-                b"\x1b[1;38;5;202;48;2;1;2;3;58;5;9m",
-                "e\u{301}".as_bytes(),
-                "\u{1F468}\u{200D}\u{1F4BB}".as_bytes(),
-                "\u{6f22}".as_bytes(),
-                b"\x1b[>1u",
-                b"\x1b[<u",
-                b"\x1b(0",
-                b"\x1bc",
-            ])
-            .prop_map(<[u8]>::to_vec),
-        ]
+    /// Bytes a program might write: any byte at all, printable runs, digit
+    /// runs, and the [`FRAGMENTS`].
+    fn bytes(rng: &mut Rng) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..rng.below(48) {
+            match rng.below(9) {
+                0..4 => out.push(rng.below(256) as u8),
+                4..6 => out.extend(rng.ascii(b' ', b'~', 24)),
+                6..8 => out.extend(rng.ascii(b'0', b'9', 4)),
+                _ => out.extend_from_slice(FRAGMENTS[rng.below(FRAGMENTS.len() as u64) as usize]),
+            }
+        }
+        out
     }
 
-    fn op() -> impl Strategy<Value = Op> {
-        prop_oneof![
-            6 => prop::collection::vec(fragment(), 0..48).prop_map(|parts| Op::Bytes(parts.concat())),
-            1 => geometry().prop_map(|(rows, cols)| Op::Resize(rows, cols)),
-        ]
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 128,
-            ..ProptestConfig::default()
-        })]
-        #[test]
-        fn carry_for_wire_is_admitted_for_arbitrary_input(
-            (rows, cols) in geometry(),
-            ops in prop::collection::vec(op(), 0..24),
-            legacy in any::<bool>(),
-            want_history in 0..=MAX_HANDOFF_HISTORY_LINES,
-        ) {
+    #[test]
+    fn carry_for_wire_is_admitted_for_arbitrary_input() {
+        let mut rng = Rng(0x5EA_3E55_1ADD_E125);
+        for case in 0..128 {
+            let (rows, cols) = geometry(&mut rng);
             let mut t = Terminal::new(rows, cols);
-            for op in &ops {
-                match op {
-                    Op::Bytes(bytes) => t.process(bytes),
-                    Op::Resize(rows, cols) => t.resize(*rows, *cols),
+            for _ in 0..rng.below(24) {
+                if rng.below(7) < 6 {
+                    t.process(&bytes(&mut rng));
+                } else {
+                    let (rows, cols) = geometry(&mut rng);
+                    t.resize(rows, cols);
                 }
             }
-            let caps = if legacy { WireCaps::legacy() } else { WireCaps::current() };
+            let caps = if rng.below(2) == 0 {
+                WireCaps::legacy()
+            } else {
+                WireCaps::current()
+            };
+            let want_history = rng.below(u64::from(MAX_HANDOFF_HISTORY_LINES) + 1) as u32;
             let mut cells = 0;
             let (checkpoint, rung, cause) = carry_for_wire(&t, 0, want_history, &mut cells, caps);
-            let at = format!("{}x{} ({rung}: {cause:?})", t.rows(), t.cols());
-            prop_assert_eq!(cause.is_some(), rung != CarryRung::Full, "{}", at);
-            prop_assert!(
+            let at = format!("case {case}: {}x{} ({rung}: {cause:?})", t.rows(), t.cols());
+            assert_eq!(cause.is_some(), rung != CarryRung::Full, "{at}");
+            assert!(
                 caps.admit(
                     &mut 0,
                     checkpoint.rows,
@@ -1370,10 +1378,9 @@ mod arbitrary {
                     checkpoint.alt_grid.is_some(),
                 )
                 .is_ok(),
-                "{}: the successor's caps admit the carry",
-                at
+                "{at}: the successor's caps admit the carry",
             );
-            prop_assert!(cells <= MAX_HANDOFF_AGGREGATE_GRID_CELLS, "{}", at);
+            assert!(cells <= MAX_HANDOFF_AGGREGATE_GRID_CELLS, "{at}");
             assert_wire_admits(&at, &checkpoint);
         }
     }

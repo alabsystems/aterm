@@ -20,7 +20,18 @@ use crate::{
 /// never started: room for a slow rc file's `exit 1` or a moved dylib's abort.
 /// A shell that drew a prompt or was written to within it did start
 /// ([`App::shell_failed_at_start`]).
-pub(crate) const SHELL_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+///
+/// A HANG DETECTOR, not a latency budget (2026-10-01). It was 2 s, and the
+/// child's own start counts against it — exec, rc, exit — which a loaded
+/// machine starves: measured at load ~70-90, a shell that fails at once took
+/// 2.0-4.9 s from fork to EOF (aterm's reader, loop and status reads all
+/// prompt), was judged a later exit, closed the only tab and quit the instance
+/// silently (78 of 128 stressed runs of `shell_exit_at_start_live_headless`) —
+/// the very quit this exists to stop; a slow zsh rc can do the same unloaded.
+/// The trade is lopsided: a pane wrongly kept (an untyped shell with no
+/// integration that dies within the window) costs one ⌘W; a wrong close loses
+/// the window.
+pub(crate) const SHELL_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The most the exit path's FIRST look ([`ExitLook::First`]) waits for the
 /// status of a shell that may have failed at start
@@ -536,8 +547,15 @@ impl App {
     /// snapshots, retries, and queued provider work cannot outlive the PTY they
     /// describe. Shared sessions remain live until their last view closes.
     pub(crate) fn detach_session_view(&mut self, session: u64) -> bool {
+        let handed = self
+            .pool
+            .get(session)
+            .and_then(|session| session.handoff_local_id);
         let dropped = self.pool.detach(session);
         if dropped {
+            if let Some(local_id) = handed {
+                self.note_handed_shell_lost(local_id);
+            }
             self.retire_title_summary(session);
             self.retire_session_status(session);
             self.retire_presence(session);
@@ -575,6 +593,31 @@ impl App {
             }
         }
         dropped
+    }
+
+    /// AN ADOPTED SHELL THAT LEAVES THE POOL BEFORE THE ADOPTION PROOF
+    /// DEGRADES THE HANDOFF (round eight, finding 58). The proof names every
+    /// adopted session still pooled, and the parked parent expects every shell
+    /// it handed, so a successor that lost one — a co-view window whose glass
+    /// would not attach, a tab whose leaves were rolled back, an unconsumed
+    /// bootstrap — could only prove a subset: filed `AdoptionMismatch`, a
+    /// STRUCTURAL verdict on the new build, for what was this machine's
+    /// moment. It withholds the proof instead, as a terminal window that
+    /// failed to open always has: the parent times out, rolls back and resumes
+    /// every shell from its own descriptors (the dropped one's included,
+    /// `Session::drop` before Commit), and the attempt is filed transient.
+    /// Past the proof (`handoff_ready` taken) a drop changes no proof, and
+    /// nothing is said.
+    fn note_handed_shell_lost(&mut self, local_id: u64) {
+        if self.handoff_ready.is_none() || self.handoff_degraded {
+            return;
+        }
+        aterm_log::warn!(
+            "overlap handoff: adopted session {local_id} was dropped before the adoption proof \
+             (its pane could not be kept); withholding the proof so the parked parent resumes \
+             every shell"
+        );
+        self.handoff_degraded = true;
     }
 
     fn terminal_view_location(
@@ -765,18 +808,7 @@ impl App {
                     .ok()?;
                 Some(crate::tab_model::TabPresentation {
                     title: presentation.title,
-                    icon: Some(match presentation.icon {
-                        crate::native_app::AppIcon::Settings => {
-                            crate::tab_model::TabIconKind::Settings
-                        }
-                        crate::native_app::AppIcon::Markdown => {
-                            crate::tab_model::TabIconKind::Markdown
-                        }
-                        crate::native_app::AppIcon::Editor => crate::tab_model::TabIconKind::Editor,
-                        crate::native_app::AppIcon::Recovery => {
-                            crate::tab_model::TabIconKind::Recovery
-                        }
-                    }),
+                    icon: Some(presentation.icon),
                     indicators: crate::tab_model::TabIndicators {
                         dirty: presentation.indicators.dirty,
                         busy: presentation.indicators.busy,
@@ -1527,7 +1559,13 @@ impl App {
                             .get(tab.focus)
                             .copied()
                             .and_then(crate::tab_model::View::terminal_session);
-                        (session, tab.presentation.tooltip.clone())
+                        // Only native tabs read the snapshot tooltip back.
+                        let tooltip = if session.is_none() {
+                            tab.presentation.tooltip.clone()
+                        } else {
+                            None
+                        };
+                        (session, tooltip)
                     })
                     .collect()
             });
@@ -1692,15 +1730,9 @@ impl App {
         // The same order for the upgrade view's revision (gap #21): read
         // before the row it composes from.
         let upgrade_revision = self.upgrade_view.revision();
-        // Tab Subject & Status owns the live activity line when it has anything
-        // honest to say; the older generated summary remains the fallback so
-        // nothing regresses while the two subsystems coexist (RFC §11).
-        let status_text = self.session_status_text(session);
         let activity_revision = self
             .title_summary_activity_revision(session)
             .wrapping_add(self.session_status_revision(session));
-        let activity =
-            status_text.or_else(|| self.title_summary_activity(session).map(str::to_owned));
         let high_id = ctx
             .timeline
             .lock()
@@ -1717,6 +1749,12 @@ impl App {
         {
             return c.ext.clone();
         }
+        // Tab Subject & Status owns the live activity line when it has anything
+        // honest to say; the older generated summary remains the fallback so
+        // nothing regresses while the two subsystems coexist (RFC §11).
+        let activity = self
+            .session_status_text(session)
+            .or_else(|| self.title_summary_activity(session).map(str::to_owned));
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner()).clone();
         // The tab TOOLTIP's `cwd: …` line, so it takes the native form — the
         // reported defect showed `cwd: /C:/Users//m6-an` here.
@@ -1793,6 +1831,7 @@ impl App {
             timeline,
             connections,
             upgrade,
+            attention: meta.presentation_value("attention"),
         };
         let ext = chrome::TabChromeExt {
             tooltip: chrome::compose_tooltip(&input),
@@ -1945,6 +1984,19 @@ impl App {
     /// painted-row cache (`last_strip_fp`, which keys on this value). A NATIVE edit
     /// is deliberately absent — AppKit paints that one, and folding it in would
     /// repaint the in-grid strip for a field that is not on it.
+    ///
+    /// And it carries the strip's POINTER HOVER — which chip reveals its `✕`, and
+    /// whether the `+` or the trailing version label wears the hover wash — for
+    /// the same reason: each is painted into the strip and dirties no terminal
+    /// cell, so with this value standing still the RepaintKey early-out swallowed
+    /// the frame `track_strip_hover` asks for, and a wash reached the glass only
+    /// with the next unrelated present (a blink flip, output) — never, with the
+    /// cursor not blinking. Measured 2026-10-01 on Windows (a release build,
+    /// `cursor_blink = false`): after `pointer move` onto the version label,
+    /// `chrome` said `hovered=true` while the window still showed bare band
+    /// 1.5 s later, and after `pointer leave` the stale wash stayed. Hashed only
+    /// while something is lit, so a resting strip's value is byte-identical to
+    /// the one before hover was folded in.
     pub(crate) fn tab_strip_fingerprint_from_parts(
         &self,
         wid: WindowId,
@@ -1983,6 +2035,16 @@ impl App {
                 ws.preedit.hash(&mut h);
                 ws.preedit_caret.hash(&mut h);
             }
+        }
+        // The pointer's hover (see the doc): a chip's `✕`, the `+`'s wash, the
+        // version label's wash. Absent while nothing is lit.
+        if let Some(ws) = self.windows.get(&wid)
+            && (ws.strip_hover.is_some() || ws.strip_hover_new_tab || ws.strip_hover_version)
+        {
+            "strip-hover".hash(&mut h);
+            ws.strip_hover.hash(&mut h);
+            ws.strip_hover_new_tab.hash(&mut h);
+            ws.strip_hover_version.hash(&mut h);
         }
         // Never collide with the disabled-strip sentinel (0): a real strip always
         // sets at least bit 0, so a zero-hash strip still forces the first repaint.
@@ -2369,9 +2431,7 @@ impl App {
     /// equal `self.next_session_id` (the test builds it that way), which is then
     /// bumped. Used to stage multi-tab windows; the appended terminal becomes the
     /// window's canonical front capability.
-    // bench-support: many_tabs_idle in benches/frame_latency.rs stages its
-    // N-tab window through this exact helper (see src/bench_support.rs).
-    #[cfg(any(test, feature = "bench-support"))]
+    #[cfg(test)]
     pub(crate) fn push_stub_tab(&mut self, wid: WindowId, session: crate::Session) {
         self.install_new_tab(wid, session);
     }
@@ -2381,9 +2441,7 @@ impl App {
     /// [`Self::install_split_pane`] body a split runs after its spawn, fed a stub
     /// session instead of a real PTY (the pre-spawn refusals are the caller's to
     /// stage). Returns the new pane's session id.
-    // bench-support: the flood/pet compose fixtures in benches/frame_latency.rs
-    // stage their 2-pane split through this exact helper (src/bench_support.rs).
-    #[cfg(any(test, feature = "bench-support"))]
+    #[cfg(test)]
     pub(crate) fn split_active_stub_tab(&mut self, wid: WindowId) -> u64 {
         self.split_active_stub_tab_dir(wid, pane::SplitDir::Vertical)
     }
@@ -2391,7 +2449,7 @@ impl App {
     /// [`Self::split_active_stub_tab`] in a named direction — the minimum-pane
     /// tests need the audit's ALTERNATING gesture (left/right, top/bottom, …),
     /// which is what drove the tree deep enough to mint off-grid panes.
-    #[cfg(any(test, feature = "bench-support"))]
+    #[cfg(test)]
     pub(crate) fn split_active_stub_tab_dir(&mut self, wid: WindowId, dir: pane::SplitDir) -> u64 {
         self.split_active_stub_tab_dir_with_sink(
             wid,
@@ -2405,7 +2463,7 @@ impl App {
     /// boundary — a window-level mirror reports silence for a session the window
     /// is showing but not fronting, which is exactly the DEC 1004 focus-report
     /// case (the pane that LOST the keyboard is the one with something to say).
-    #[cfg(any(test, feature = "bench-support"))]
+    #[cfg(test)]
     pub(crate) fn split_active_stub_tab_dir_with_sink(
         &mut self,
         wid: WindowId,
@@ -2686,6 +2744,7 @@ impl App {
                         lineage_parent,
                         observe.as_ref(),
                         identity.as_deref(),
+                        None,
                     )
                     .is_none()
                 {
@@ -3022,8 +3081,8 @@ impl App {
                 // Drop a leading busy-spinner frame (Codex dots / Claude moons
                 // animate at up to ~10Hz) and any IME preedit suffix (churns
                 // per keystroke mid-composition): the menu row reads the same
-                // either way, and the fingerprint must not rebuild the native
-                // menu at animation/typing rate.
+                // either way, and the fingerprint must not move at
+                // animation/typing rate.
                 let title = crate::toolbar::busy_spinner_title_parts(&ws.current_title)
                     .map_or_else(
                         || ws.current_title.clone(),
@@ -3052,13 +3111,26 @@ impl App {
         // table-lock discipline. Same cost class as the marks' roles fold,
         // which already rides this refresh rate.
         glance.connections = crate::connections::connection_count(&self.store);
+        // What needs a look, not now: the digest's entries by SUBJECT (a menu is
+        // no place for a 200-character line; Settings ▸ Messages, one click
+        // away, shows the whole sentence and its button). The menu and the page
+        // are two views of one digest.
+        glance.exceptions = self
+            .messages
+            .digest()
+            .entries
+            .into_iter()
+            .map(|entry| (entry.id.raw(), entry.title))
+            .collect();
         glance
     }
 
-    /// Recompute the fleet glance and push it to the menu-bar status item —
-    /// fingerprint-gated, so per-prompt title drift does not rebuild the native
-    /// menu unless the rendered state actually changed. No-op with no status
-    /// item (headless, off macOS, or pre-first-window).
+    /// Recompute the fleet glance and hand it to the menu-bar status item —
+    /// fingerprint-gated, so per-prompt title drift hands nothing over unless
+    /// the rendered state actually changed. The status item keeps the glance
+    /// and paints its menu from it only when the menu opens, and retitles its
+    /// button only when the title changes (`status_item::update`). No-op with
+    /// no status item (headless, off macOS, or pre-first-window).
     pub(crate) fn refresh_operator_status_item(&mut self) {
         if self._status_item.is_none() {
             return;
@@ -3077,8 +3149,22 @@ impl App {
         }
         self.operator_status_fingerprint = Some(fp);
         if let Some(handle) = &self._status_item {
-            crate::status_item::update(handle, &glance);
+            crate::status_item::update(handle, glance);
         }
+    }
+
+    /// The menu-bar item's mark as one introspection line (`aterm ctl chrome`):
+    /// the title it shows, how many entries the digest holds and how many
+    /// sessions escalate. The same glance the item is drawn from, so the cue
+    /// the owner sees is a cue an agent can read.
+    pub(crate) fn status_item_chrome_line(&self) -> String {
+        let glance = self.operator_fleet_glance();
+        format!(
+            "statusitem title={} exceptions={} warnings={}",
+            glance.button_title(),
+            glance.exceptions.len(),
+            glance.warnings.len()
+        )
     }
 
     /// Dispatch one click from the menu-bar status item (the
@@ -3216,6 +3302,19 @@ impl App {
                 // precedent, exactly the `MenuAction::ShowConnectionMap` arm.
                 if let Err(e) = self.open_connection_map() {
                     aterm_log::info!("connection map: {e}");
+                }
+            }
+            // `Dismiss all` on the digest: the same filing the Settings page
+            // and `notice dismiss review` make.
+            crate::status_item::OperatorAction::DismissExceptions => {
+                let _ = self.dismiss_exceptions();
+            }
+            // A "To look at" line: the page at that entry (expanded, past a
+            // filter that would hide it, scrolled to it), in the frontmost
+            // window, else the first.
+            crate::status_item::OperatorAction::ShowException(id) => {
+                if !self.open_messages_entry_anywhere(id) {
+                    aterm_log::info!("status item: couldn't open message {id}");
                 }
             }
         }
@@ -5062,14 +5161,20 @@ impl App {
 
     /// The start of a fresh interactive shell that may have failed at start: it
     /// closed its PTY within [`SHELL_START_WINDOW`] of its spawn, never drew a
-    /// prompt (no shell-integration prompt mark), and nothing was written to
-    /// its PTY since the spawn. `None` for everything else: a `-e` command or a
-    /// shell adopted across an update (neither records a start), a later exit,
-    /// a shell someone typed into or that got to its prompt, and every pane
-    /// under `--hold` (which keeps every pane its own way).
+    /// prompt (no shell-integration prompt mark), and no input was driven into
+    /// its PTY since the spawn — no key, paste, report or control verb's bytes
+    /// (`SinkWriter::driven_input`). aterm's own replies to the shell's queries
+    /// do not count: fish and powerlevel10k ask for DA, the cursor position and
+    /// colours as they start, and a shell whose rc fails after asking still
+    /// failed at start. `None` for everything else: a `-e` command or a shell
+    /// adopted across an update (neither records a start), a later exit, a
+    /// shell someone typed into or that got to its prompt, and every pane under
+    /// `--hold` (which keeps every pane its own way).
     ///
     /// Measured to the reader's EOF stamp (`Session::pty_closed_at`), not to
-    /// now: a cold launch can take seconds to reach the exit.
+    /// now, so the delay between the close and this exit handler (aterm's own
+    /// cold launch, a busy loop) never counts. The child's own slow start does,
+    /// which is why the window is a hang detector ([`SHELL_START_WINDOW`]).
     fn unstarted_shell<'s>(
         &self,
         pooled: &'s crate::Session,
@@ -5084,7 +5189,7 @@ impl App {
             .copied()
             .unwrap_or_else(std::time::Instant::now);
         if closed.saturating_duration_since(start.at) > SHELL_START_WINDOW
-            || pooled.ctx.sink.input_epoch() != start.input
+            || pooled.ctx.sink.driven_input() != start.input
             || term_lock(&pooled.term).all_blocks().next().is_some()
         {
             return None;
@@ -5098,8 +5203,8 @@ impl App {
     /// (`Session::child_exit`); otherwise this reaps without blocking, and a
     /// [`ExitLook::First`] look at a shell that may have failed at start
     /// ([`Self::unstarted_shell`]) tries again for at most
-    /// [`SHELL_START_STATUS_WAIT`]. `None`: no status (an adopted session, a
-    /// child not yet reapable, or one this process cannot wait for).
+    /// [`SHELL_START_STATUS_WAIT`]. `None`: no status (an adopted session with no
+    /// exit witness, a child not yet reapable, or one this process cannot wait for).
     pub(crate) fn exit_status(&self, session: u64, look: ExitLook) -> Option<aterm_pty::ChildExit> {
         let pooled = self.pool.get(session)?;
         if pooled
@@ -5291,14 +5396,32 @@ impl App {
             }
             // The leading `↻` update alert (off-macOS chrome — menu-adjacent there):
             // ONE CLICK applies the staged build (the owner's "click-upgrade" ask; the
-            // old click-to-details flow was the "too many clicking" complaint). With
-            // nothing actually staged it falls back to the details overlay — never a
-            // blind restart, never a dead click. Details stay reachable via the App
-            // menu's "Check for Updates…".
+            // old click-to-details flow was the "too many clicking" complaint), unless
+            // it is on hold (`latched_activation_trial_spent`), which opens the details
+            // like an empty stage. With nothing actually staged it falls back to the
+            // details overlay — never a blind restart, never a dead click. Details stay
+            // reachable via the App menu's "Check for Updates…".
             tab_bar::TabHit::Update => {
                 self.clear_strip_press(wid);
                 self.settle_rename_edit(wid);
                 self.apply_update_or_details();
+            }
+            // The trailing VERSION LABEL (Windows): a button, committed on the
+            // press like the `+` and the `↻`, and never caption — no window drag,
+            // no maximize. It posts the menu action the macOS Version menu's
+            // About row fires (`menu::version_slot_click`: Settings ▸ About, or
+            // the update details where an updater has a staged build to
+            // describe), through the palette's own path — `Wake::MenuAction` →
+            // `dispatch_menu_action` → `fence_menu_action` — so it is fenced and
+            // rename-diverted exactly as a menu choice is. A second press posts
+            // it again, which focuses the same Settings tab.
+            tab_bar::TabHit::Version { attention, .. } => {
+                self.clear_strip_press(wid);
+                self.settle_rename_edit(wid);
+                let action = crate::menu::version_slot_click(attention);
+                if let Some(proxy) = self.proxy.as_ref() {
+                    let _ = proxy.send_event(crate::Wake::MenuAction { action });
+                }
             }
             tab_bar::TabHit::Close(i) => {
                 self.clear_strip_press(wid);
@@ -6151,7 +6274,12 @@ impl App {
                 // The active tab's geometry changed (a sibling grew); the closed
                 // tab may not be the active one (background EOF), but re-laying the
                 // active tab is cheap and correct. Resize panes to the new layout.
+                // This pass is the COLLAPSE the split's take-back hold judges
+                // (`crate::split_regrid_hold`): a sibling a split shrank inside
+                // the quiet does not grow straight back to its pre-split grid.
+                self.split_regrid_cause = crate::split_regrid_hold::RelayCause::Collapse;
                 self.resize_panes(wid);
+                self.split_regrid_cause = crate::split_regrid_hold::RelayCause::Other;
                 // The active pane MOVED (the focused pane collapsed onto its sibling);
                 // re-point the global handle, not just the per-window mirror, so a
                 // control verb can't keep driving the just-closed pane's session.
@@ -6214,6 +6342,7 @@ impl App {
     /// view remains: `pool.detach` returns `true` iff the view count hit 0. A later
     /// `@<selector>` to a genuinely-closed id fail-closes (unknown -> Deny).
     pub(crate) fn teardown_session(&mut self, id: u64) {
+        self.split_regrid_holds.forget(id);
         if self.detach_session_view(id) {
             self.retire_session_registration(id);
         }
@@ -7890,7 +8019,7 @@ mod home_abbreviation_tests {
 /// / `NSMenu` pop are the documented manual-verify steps.
 #[cfg(test)]
 mod session_chrome_app_tests {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use super::*;
     use crate::menu::MenuAction;
@@ -8076,12 +8205,13 @@ mod session_chrome_app_tests {
         let started = Instant::now();
         app.refresh_window_tabs(wid);
         // A real regression takes the parser mutex and blocks FOREVER behind the guard
-        // this test holds, so ANY finite bound catches it and tightness buys nothing.
-        // 100ms measured the scheduler, not the lock discipline: the sibling 1s bound
-        // on this same property in app_documents.rs already crossed under full-suite
-        // load (cb8c0cff), and this was ten times tighter.
+        // this test holds, so ANY finite bound catches it and tightness buys nothing:
+        // the minute is a hang detector. 100ms measured the scheduler, not the lock
+        // discipline: the sibling 1s bound on this same property in app_documents.rs
+        // already crossed under full-suite load (cb8c0cff), and this was ten times
+        // tighter.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "chrome refresh blocked behind the terminal parser mutex"
         );
         assert_eq!(
@@ -8484,6 +8614,45 @@ mod session_chrome_app_tests {
             "a button the card never consumed passes through"
         );
     }
+
+    /// The four spawn presets sit under a tab's CONNECTIONS header, so a
+    /// right-click on a BACKGROUND tab connects the new session to THAT tab,
+    /// not the front one. The dispatch needs an `ActiveEventLoop` no unit test
+    /// can build, so the subject is checked behaviourally and the arm's routing
+    /// through it is read from the source.
+    #[test]
+    fn tab_menu_spawn_presets_connect_the_clicked_tab_not_the_front_one() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        let tabs = &app.windows[&wid].tab_set;
+        assert_eq!(tabs.active_index(), Some(1), "the new tab is in front");
+        let session_of = |app: &App, index: usize| {
+            let local = app
+                .tab_terminal_session(wid, index)
+                .expect("a terminal tab");
+            app.pool.get(local).expect("pooled").ctx.self_id.clone()
+        };
+        let background = session_of(&app, 0);
+        assert_ne!(background, session_of(&app, 1));
+        assert_eq!(app.tab_menu_subject(wid, 0), Some(background));
+
+        let source = include_str!("app_input.rs");
+        let body = source
+            .split_once("pub(crate) fn dispatch_tab_menu_action(")
+            .expect("the tab-menu dispatcher")
+            .1;
+        let body = &body[..body
+            .find("other => self.dispatch_menu_action(")
+            .expect("tail")];
+        let presets = body
+            .find("MenuAction::NewControllerTab")
+            .expect("the presets have their own tab-menu arm, ahead of the front-tab fallback");
+        assert!(
+            body[presets..].contains("self.tab_menu_subject(window, index)"),
+            "the preset arm takes its origin from the clicked tab"
+        );
+    }
 }
 
 /// THE IN-GRID STRIP'S CLICK STREAK — the service AppKit provides on macOS
@@ -8516,16 +8685,7 @@ mod rename_strip_click_tests {
         seg.start_col + 1
     }
 
-    fn pin(app: &App, session: u64) -> Option<String> {
-        app.pool
-            .get(session)?
-            .ctx
-            .meta
-            .lock()
-            .unwrap()
-            .user_title
-            .clone()
-    }
+    use crate::session_pin_for_test as pin;
 
     /// DOUBLE-CLICK OPENS THE EDITOR. One click only switches; the second within
     /// the multi-click interval opens the inline rename over that chip.
@@ -8611,6 +8771,61 @@ mod rename_strip_click_tests {
         assert_eq!(app.rename_edit_session(wid), None);
         assert_eq!(pin(&app, 0).as_deref(), Some("kept"));
         assert!(app.windows[&wid].strip_press.is_none(), "streak broken");
+    }
+
+    /// THE VERSION LABEL IS A BUTTON, NOT CAPTION (Windows). A press on it arms
+    /// neither double-click streak — not the chip's (rename) and not the bare
+    /// band's (maximize) — so it can never drag or maximize the window; it
+    /// switches, opens and closes no tab; and like every press away from an
+    /// open rename it settles the edit. The `Wake::MenuAction` it posts cannot
+    /// be built in libtest (a headless App has no event-loop proxy): the drive
+    /// against a real window proves Settings ▸ About opens.
+    #[cfg(windows)]
+    #[test]
+    fn a_version_press_is_a_button_not_caption() {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let (mut app, wid) = app_with_two_tabs();
+        let label = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find(|seg| matches!(seg.kind, tab_bar::TabHit::Version { .. }))
+            .map(|seg| seg.start_col + 2)
+            .expect("the strip lays the version label out once the UI face is in");
+        let tab0 = app.windows[&wid].tab_set.tabs()[0].id;
+        assert!(app.begin_session_rename(wid, tab0));
+        app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("kept".into()));
+        let (tabs, active) = (
+            app.windows[&wid].tab_set.len(),
+            app.windows[&wid].tabs.active,
+        );
+
+        for press in 0..2 {
+            app.handle_tab_strip_click(wid, label);
+            let ws = &app.windows[&wid];
+            assert!(
+                ws.strip_band_press.is_none(),
+                "press {press}: not a caption press"
+            );
+            assert!(ws.strip_press.is_none(), "press {press}: not a chip press");
+            assert!(ws.strip_drag.is_none(), "press {press}: grabs no tab");
+            assert_eq!(
+                ws.tab_set.len(),
+                tabs,
+                "press {press}: no tab opened or closed"
+            );
+            assert_eq!(ws.tabs.active, active, "press {press}: no tab switched");
+        }
+        assert_eq!(
+            app.rename_edit_session(wid),
+            None,
+            "the open rename settled"
+        );
+        assert_eq!(
+            pin(&app, 0).as_deref(),
+            Some("kept"),
+            "…keeping what was typed"
+        );
+        crate::tray_raster::clear_ui_fonts_for_test();
     }
 
     /// W2: the BARE band keeps its own double-click streak — the FSM behind the
@@ -9302,11 +9517,175 @@ mod exit_attribution_tests {
         feed(app, session, b"\x1b]133;D;0\x07");
     }
 
-    fn feed(app: &App, session: u64, bytes: &[u8]) {
+    use crate::feed_session_for_test as feed;
+
+    /// The engine grid `(rows, cols)` of `session`.
+    fn grid(app: &App, session: u64) -> (u16, u16) {
         let term = app.pool.get(session).expect("live session").term.clone();
-        term.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .process(bytes);
+        let t = term.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        (t.rows(), t.cols())
+    }
+
+    /// Put `session` on the alternate screen with `ROW<r>` on every row — the
+    /// frame a full-screen program (Claude Code) last drew.
+    fn draw_alt_frame(app: &App, session: u64) {
+        let (rows, _) = grid(app, session);
+        let mut bytes = b"\x1b[?1049h\x1b[2J\x1b[H".to_vec();
+        for r in 0..rows {
+            if r > 0 {
+                bytes.extend_from_slice(b"\r\n");
+            }
+            bytes.extend_from_slice(format!("ROW{r}").as_bytes());
+        }
+        feed(app, session, &bytes);
+    }
+
+    /// **SPLIT, THEN CLOSE AT ONCE, IS NO NET-ZERO FLAP.** Confirmed 2026-09-29
+    /// by two skeptics: `@<claude> spawn split=h` answers after the Claude pane
+    /// shrank N -> ~N/2, and an `@<new> close` straight after grew it back to N
+    /// within ~8 ms. With one byte of the program's output between the halves
+    /// the alternate screen kept ~N/2 demoted rows, and a `SIGWINCH` handler
+    /// reading N (the size it last drew) never repainted. The shrink stays
+    /// immediate; the take-back waits until the shrink has stood the quiet, so
+    /// the program reads and draws the shrunk size first.
+    #[test]
+    fn a_split_closed_at_once_holds_the_siblings_take_back_for_the_quiet() {
+        use crate::split_regrid_hold::SPLIT_REGRID_QUIET;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let full = grid(&app, 0);
+        draw_alt_frame(&app, 0);
+
+        let new = app.split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        let shrunk = grid(&app, 0);
+        assert!(
+            shrunk.0 < full.0 && shrunk.1 == full.1,
+            "the split shrinks the sibling at once: {full:?} -> {shrunk:?}"
+        );
+        // The program's output lands between the halves.
+        feed(&app, 0, b"\x1b[1;1Hx");
+
+        let progress = ctl_close(&mut app, new).expect("the close proceeds");
+        assert_eq!(progress, CloseProgress::Retired);
+        assert_eq!(
+            app.windows[&wid].layouts[0].sessions(),
+            vec![0],
+            "the scratch pane is gone; its sibling fills the tab"
+        );
+        assert_eq!(
+            grid(&app, 0),
+            shrunk,
+            "the take-back is withheld inside the quiet: no N -> N/2 -> N pair"
+        );
+        // A redraw's pass (or any other re-lay to the same target) holds too.
+        app.resize_panes(wid);
+        assert_eq!(grid(&app, 0), shrunk, "a re-lay inside the quiet holds");
+        let due = app
+            .split_regrid_hold_deadline()
+            .expect("a withheld take-back owes one wake");
+
+        // Not before the quiet ends…
+        app.service_split_regrid_holds(due - std::time::Duration::from_millis(1));
+        assert_eq!(grid(&app, 0), shrunk);
+        // …and at its end the sibling grows back and nothing stays armed.
+        app.service_split_regrid_holds(due);
+        assert_eq!(grid(&app, 0), full, "the take-back lands after the quiet");
+        assert_eq!(app.split_regrid_hold_deadline(), None);
+        assert!(due <= std::time::Instant::now() + SPLIT_REGRID_QUIET);
+    }
+
+    /// The hold never delays anything but the exact take-back: a window
+    /// re-grid (a drag, a scale change, the control `resize` verb) inside the
+    /// quiet applies at once and ends the hold, and a close after the quiet
+    /// grows the sibling at once.
+    #[test]
+    fn the_split_hold_withholds_only_the_take_back_inside_the_quiet() {
+        use crate::split_regrid_hold::SPLIT_REGRID_QUIET;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let full = grid(&app, 0);
+
+        // A window re-grid inside the quiet is not held.
+        let new = app.split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        let _ = ctl_close(&mut app, new).expect("the close proceeds");
+        assert_ne!(grid(&app, 0), full, "held");
+        let bigger = (full.0 + 4, full.1 + 10);
+        assert!(app.apply_term_resize(wid, bigger.0, bigger.1));
+        assert_eq!(
+            grid(&app, 0),
+            bigger,
+            "a different target applies at once and ends the hold"
+        );
+        assert_eq!(app.split_regrid_hold_deadline(), None);
+
+        // A close after the quiet grows the sibling at once.
+        let new = app.split_active_stub_tab_dir(wid, pane::SplitDir::Vertical);
+        assert_ne!(grid(&app, 0), bigger, "the vertical split narrows it");
+        app.split_regrid_holds.age(SPLIT_REGRID_QUIET);
+        let _ = ctl_close(&mut app, new).expect("the close proceeds");
+        assert_eq!(
+            grid(&app, 0),
+            bigger,
+            "past the quiet the take-back is immediate"
+        );
+        assert_eq!(app.split_regrid_hold_deadline(), None);
+    }
+
+    /// The split's own NEW pane is never held: it was spawned at the window's
+    /// full grid, a size its program never drew, so the resize away from it is
+    /// no shrink. Closing the ORIGINAL pane at once grows the newborn to the
+    /// whole rect straight away, and no wake is armed.
+    #[test]
+    fn the_newborn_pane_of_a_split_is_never_held() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let full = grid(&app, 0);
+        let new = app.split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        assert!(grid(&app, new).0 < full.0, "the newborn has half the rect");
+        assert!(app.split_regrid_holds.get(new).is_none(), "no hold on it");
+
+        let progress = ctl_close(&mut app, 0).expect("the close proceeds");
+        assert_eq!(progress, CloseProgress::Retired);
+        assert_eq!(
+            grid(&app, new),
+            full,
+            "the newborn grows to the whole rect at once"
+        );
+        assert_eq!(app.split_regrid_hold_deadline(), None);
+    }
+
+    /// A pane ZOOM inside the quiet is no take-back, even though the zoomed
+    /// pane's target is exactly its pre-split grid: it applies at once — for
+    /// the original pane and for the newborn — and ends the hold.
+    #[test]
+    fn a_zoom_inside_the_quiet_is_not_withheld() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let full = grid(&app, 0);
+
+        // The newborn (focused after the split) zooms to the full grid.
+        let new = app.split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        let shrunk = grid(&app, 0);
+        app.toggle_pane_zoom();
+        assert_eq!(grid(&app, new), full, "the newborn's zoom applies at once");
+        app.toggle_pane_zoom();
+
+        // The ORIGINAL pane, whose zoom target is its pre-split grid.
+        assert_eq!(grid(&app, 0), shrunk);
+        assert!(
+            app.split_regrid_holds.get(0).is_some(),
+            "the split armed it"
+        );
+        assert!(
+            app.active_tree_mut(wid)
+                .is_some_and(|tree| tree.set_focus(0))
+        );
+        app.toggle_pane_zoom();
+        assert_eq!(grid(&app, 0), full, "the original's zoom applies at once");
+        assert!(app.split_regrid_holds.get(0).is_none(), "and ends the hold");
+        assert_eq!(app.split_regrid_hold_deadline(), None);
+        app.toggle_pane_zoom();
+        assert_eq!(grid(&app, 0), shrunk, "unzoom restores the split");
     }
 
     /// **ONE PANE, NOT THE TAB.** Measured 2026-09-22 (audit): `@<pane> close` on
@@ -9928,7 +10307,8 @@ mod exit_attribution_tests {
     fn a_wire_close_question_keeps_its_name_through_a_settings_open() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        let prompt = crate::quit_safety::confirm_prompt(true, true).expect("a busy quit prompts");
+        let prompt =
+            crate::quit_safety::confirm_prompt(true, true, true).expect("a busy quit prompts");
         let raised = app.invoke_attributed(crate::session_store::ExitActor::Ctl, |app| {
             Ok(app
                 .present_close_banner(wid, prompt, crate::close_confirm::CloseReplay::Window(wid))
@@ -10337,29 +10717,24 @@ mod shell_start_exit_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// A stub shell called `name` in `dir` that runs `body`.
-    fn stub_shell(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the stub shell");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub shell executable");
-        path
-    }
-
-    /// Run `program` as this process's child and wait — WITHOUT reaping — until
-    /// it has exited, so the exit path finds the zombie the way a real shell
-    /// leaves one. A minute is a hang detector, not a budget.
-    fn run_to_zombie(program: &std::path::Path) -> i32 {
-        let child = std::process::Command::new(program)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+    /// Run `script` under `/bin/sh -c` as this process's child and wait —
+    /// WITHOUT reaping — until it has exited, so the exit path finds the zombie
+    /// the way a real shell leaves one. `/bin/sh` and never a script written
+    /// for the test: a freshly written executable's first exec waits on the
+    /// system's code-policy check, which under load has outlasted the minute
+    /// (2026-10-02). A minute is a hang detector, not a budget.
+    fn run_to_zombie(script: &str) -> i32 {
+        let child = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", script])
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
-            .expect("spawn the stub shell");
+            .expect("spawn the stand-in shell");
         let pid = i32::try_from(child.id()).expect("pid fits");
-        // Dropping a `Child` neither waits nor kills: the zombie stays ours.
-        drop(child);
+        // Forgotten, not dropped: dropping the handle would reap a child that
+        // has already exited, and the zombie must stay ours.
+        std::mem::forget(child);
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             // SAFETY: a zeroed `siginfo_t` out-param for a non-reaping peek.
@@ -10382,7 +10757,7 @@ mod shell_start_exit_tests {
             if exited == pid {
                 return pid;
             }
-            assert!(Instant::now() < deadline, "the stub shell did not exit");
+            assert!(Instant::now() < deadline, "the stand-in shell did not exit");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -10400,10 +10775,10 @@ mod shell_start_exit_tests {
     /// scenario, not a reading: stamped from the clock after the stub ran, it
     /// measured how long a loaded machine took to spawn and exit `/bin/sh`,
     /// and under the merge gate's load (and at background QoS beside 72
-    /// spinners, 3 to 5 of 12 per run) that passed the 2 s window, so the
+    /// spinners, 3 to 5 of 12 per run) that passed the then-2 s window, so the
     /// shells these tests say failed at start were judged late and their
     /// windows closed ("nothing closes: [WindowId(1)]"). The one test about
-    /// a late exit stamps its own ([`a_shell_that_fails_after_two_seconds_closes_as_today`]).
+    /// a late exit stamps its own ([`a_shell_that_fails_after_the_start_window_closes_as_today`]).
     fn eof_at_start(at: Instant) -> Option<Instant> {
         Some(at + Duration::from_millis(100))
     }
@@ -10427,11 +10802,14 @@ mod shell_start_exit_tests {
         let id = app.next_session_id;
         let mut session = crate::stub_session_with_sink(id, sink);
         session.pid = pid;
-        // The input epoch is read at the spawn, before anything can write.
+        // A shell this process spawned, as `spawn_session` records one: only
+        // its own child is waited for (round seven, finding 25).
+        session.shell_identity = aterm_pty::record_spawned_shell(pid);
+        // The driven input is read at the spawn, before anything can write.
         session.shell_start = start.map(|(name, at)| crate::spawn::ShellStart {
             at,
             name: name.to_string(),
-            input: session.ctx.sink.input_epoch(),
+            input: session.ctx.sink.driven_input(),
         });
         if let Some(at) = closed {
             let _ = session.pty_closed_at.set(at);
@@ -10495,10 +10873,8 @@ mod shell_start_exit_tests {
     /// publishes the failure.
     #[test]
     fn a_shell_that_exits_3_at_start_keeps_its_pane_with_the_line() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "exit 3");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("exit 3");
         let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
 
         let to_close = reader_eof(&mut app, id);
@@ -10534,10 +10910,8 @@ mod shell_start_exit_tests {
     /// crash report is written) keeps the pane with the signal's number.
     #[test]
     fn a_shell_killed_by_a_signal_at_start_keeps_its_pane_with_the_signal_line() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "fish", "kill -KILL $$");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("kill -KILL $$");
         let (mut app, wid, id) = app_with(pid, started("fish", at), eof_at_start(at));
 
         let to_close = reader_eof(&mut app, id);
@@ -10549,10 +10923,8 @@ mod shell_start_exit_tests {
     /// is the one that reaps — and the line still has the signal.
     #[test]
     fn the_line_survives_tab_status_being_off() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "fish", "kill -KILL $$");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("kill -KILL $$");
         let (mut app, wid, id) = app_with(pid, started("fish", at), eof_at_start(at));
         app.config.tab_status = Some(false);
 
@@ -10566,10 +10938,8 @@ mod shell_start_exit_tests {
     /// and the ledger read the same code.
     #[test]
     fn with_tab_status_off_the_ledger_and_the_line_agree() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "exit 4");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("exit 4");
         let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
         app.config.tab_status = Some(false);
 
@@ -10585,10 +10955,8 @@ mod shell_start_exit_tests {
     /// closes as the person asked.
     #[test]
     fn a_shell_that_got_input_closes_as_before_even_on_exit_1() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "exit 1");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("exit 1");
         let mut fds = [0; 2];
         // SAFETY: a fresh two-slot out-param for `pipe(2)`.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -10612,14 +10980,58 @@ mod shell_start_exit_tests {
         }
     }
 
+    /// THE QUERY CASE: fish (or zsh under powerlevel10k) asks for the device
+    /// attributes as it starts, aterm's reply writer answers, and then its rc
+    /// fails with `exit 1`. The answer is aterm's, not anyone's input: the
+    /// pane stays with the line, where it used to close (and with one tab
+    /// quit aterm) as if someone had typed into the shell.
+    #[test]
+    fn a_shell_that_was_only_answered_keeps_its_pane() {
+        let at = Instant::now();
+        let pid = run_to_zombie("exit 1");
+        let mut fds = [0; 2];
+        // SAFETY: a fresh two-slot out-param for `pipe(2)`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
+        let (mut app, wid, id) =
+            app_with_sink(pid, started("fish", at), eof_at_start(at), sink.clone());
+        // The real reply writer answers `ESC [ c`, as the reader hands it the
+        // engine's response; the shell's end of the PTY receives it.
+        let (lane, _writer) = crate::spawn::spawn_reply_writer_for_test(sink.clone());
+        assert!(
+            lane.submit(std::sync::Arc::from(&b"\x1b[?62;22c"[..])),
+            "queued"
+        );
+        let mut ready = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd; a minute is a hang detector, not a budget.
+        assert_eq!(
+            unsafe { libc::poll(&mut ready, 1, 60_000) },
+            1,
+            "the reply arrives"
+        );
+
+        let to_close = reader_eof(&mut app, id);
+
+        assert_kept(&app, wid, id, &to_close, "[fish ended at start: exit 1]");
+        drop((app, lane, sink));
+        // SAFETY: both ends of the pipe opened above; the borrowed sink that
+        // used the write end is gone.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
     /// A shell that drew its prompt started, whatever ends it next: here a
     /// `signal kill` sent to a fresh prompt. The tab closes as before.
     #[test]
     fn a_shell_that_drew_its_prompt_closes_as_before_even_on_a_signal() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "kill -KILL $$");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("kill -KILL $$");
         let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
         // The shell-integration prompt marks around a prompt, as zsh draws it.
         term_lock(&app.pool.get(id).expect("the pane's session").term)
@@ -10634,9 +11046,7 @@ mod shell_start_exit_tests {
     /// shell failed 1 s after its spawn, still keeps its pane.
     #[test]
     fn a_slow_launch_is_measured_to_the_readers_eof() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "exit 3");
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("exit 3");
         let at = Instant::now()
             .checked_sub(Duration::from_secs(3))
             .expect("the clock reaches back 3 s");
@@ -10652,10 +11062,8 @@ mod shell_start_exit_tests {
     /// last tab goes, and the caller escalates to closing the window.
     #[test]
     fn a_clean_exit_at_start_closes_as_today() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "exit 0");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("exit 0");
         let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
 
         assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
@@ -10667,9 +11075,7 @@ mod shell_start_exit_tests {
     /// documented ("the window closes when it exits").
     #[test]
     fn a_session_with_no_recorded_start_closes_as_today() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let command = stub_shell(dir.path(), "false", "exit 1");
-        let pid = run_to_zombie(&command);
+        let pid = run_to_zombie("exit 1");
         let (mut app, wid, id) = app_with(pid, None, Some(Instant::now()));
 
         assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
@@ -10679,14 +11085,12 @@ mod shell_start_exit_tests {
     /// NEGATIVE CONTROL: a shell that fails after the start window ran; its
     /// exit closes as today.
     #[test]
-    fn a_shell_that_fails_after_two_seconds_closes_as_today() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "exit 3");
-        let pid = run_to_zombie(&shell);
+    fn a_shell_that_fails_after_the_start_window_closes_as_today() {
+        let pid = run_to_zombie("exit 3");
         let closed = Instant::now();
         let at = closed
             .checked_sub(SHELL_START_WINDOW + Duration::from_millis(500))
-            .expect("the clock reaches back 2.5 s");
+            .expect("the clock reaches back past the start window");
         let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(closed));
 
         assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
@@ -10696,10 +11100,8 @@ mod shell_start_exit_tests {
     /// `--hold` keeps every pane its own way: no line is added.
     #[test]
     fn hold_keeps_its_own_behaviour() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "exit 3");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("exit 3");
         let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
         app.hold = true;
 
@@ -10712,10 +11114,8 @@ mod shell_start_exit_tests {
     /// it, and its one engine carries the line once.
     #[test]
     fn a_shared_shell_that_fails_at_start_stays_in_every_viewer() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let shell = stub_shell(dir.path(), "zsh", "exit 1");
         let at = Instant::now();
-        let pid = run_to_zombie(&shell);
+        let pid = run_to_zombie("exit 1");
         let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
         app.frontmost_window = Some(wid);
         let second = app
@@ -10731,5 +11131,113 @@ mod shell_start_exit_tests {
             1,
             "one line, not one per viewer"
         );
+    }
+
+    /// AN ADOPTED SESSION NEVER WAITS FOR ITS PID (round seven of the update
+    /// audit, finding 25). Its shell's parent was the old build, so the number
+    /// it carries is not this process's child — unless the kernel reissued it
+    /// to one of ours after the shell exited, which is exactly when a `waitpid`
+    /// on it reaps a stranger: the stand-in here is OUR zombie (exit 3) sitting
+    /// under the adopted session's pid. The exit path must answer "unknown"
+    /// and leave the zombie to its owner, whose own wait still reads 3.
+    ///
+    /// RED before the fix: the exit path reaped the stand-in, booked exit 3 as
+    /// the adopted session's, and the owner's `waitpid` read `ECHILD`.
+    #[test]
+    fn an_adopted_session_never_reaps_the_child_its_freed_pid_now_names() {
+        let pid = run_to_zombie("exit 3");
+        let (mut app, _wid, id) = app_with(pid, None, None);
+        // What `spawn_session` records for an adopted shell that no longer
+        // leads its PTY: not our child, no birth.
+        app.pool
+            .sessions
+            .get_mut(&id)
+            .expect("pooled")
+            .session
+            .shell_identity = aterm_pty::ShellIdentity::from_parts(pid, None, false);
+
+        let _ = reader_eof(&mut app, id);
+
+        for look in [ExitLook::First, ExitLook::Retry] {
+            assert_eq!(app.exit_status(id, look), None, "{look:?}: unknown");
+        }
+        assert_eq!(
+            ledger_code(&app, id),
+            None,
+            "exit_code=-, never the stranger's 3"
+        );
+        let mut status: libc::c_int = 0;
+        // SAFETY: a non-blocking wait on this test's own zombie child.
+        let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(reaped, pid, "the zombie was left for its owner");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            3,
+            "whose wait reads its own status"
+        );
+    }
+
+    /// AN ADOPTED SESSION'S EXIT IS READ FROM ITS KERNEL WITNESS (round seven
+    /// of the update audit, finding 26). The shell is alive when the session
+    /// takes it and is never this process's to wait for — here its parent (the
+    /// test, standing in for launchd) reaps it before the exit path looks, so
+    /// `waitpid` could not answer even if it were asked. The watch
+    /// `adopted_exit_watch` registered at the adoption still reads exit 5, and
+    /// the classifier, the ledger and every later look agree on it.
+    ///
+    /// RED before the fix: `exit_code=-` and `Outcome::None` — every session
+    /// alive across an update ended with an unknown status.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn an_adopted_shell_s_exit_status_comes_from_its_exit_watch() {
+        use std::io::Write as _;
+        let mut shell = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", "read _; exit 5"])
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn the shell");
+        let pid = i32::try_from(shell.id()).expect("pid fits");
+        let (mut app, _wid, id) = app_with(pid, None, None);
+        {
+            let session = &mut app.pool.sessions.get_mut(&id).expect("pooled").session;
+            // The adoption's record: a birth proved while it led its PTY, and
+            // not our child.
+            let birth = aterm_pty::record_spawned_shell(pid).birth;
+            assert!(
+                birth.is_some(),
+                "PRECONDITION: the live shell's birth reads"
+            );
+            session.shell_identity = aterm_pty::ShellIdentity::from_parts(pid, birth, false);
+            session.exit_watch = crate::spawn::adopted_exit_watch(&session.shell_identity);
+            assert!(
+                session.exit_watch.is_some(),
+                "the live adopted shell is watched"
+            );
+        }
+        shell
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"\n")
+            .expect("release the shell");
+        assert_eq!(shell.wait().expect("its parent reaps it").code(), Some(5));
+
+        let _ = reader_eof(&mut app, id);
+
+        assert_eq!(ledger_code(&app, id), Some(5), "the ledger has the code");
+        assert_eq!(
+            app.session_status.status(id).map(|s| s.last_outcome),
+            Some(crate::session_status::Outcome::Failure { exit_code: 5 }),
+            "the classifier has the failure"
+        );
+        for look in [ExitLook::First, ExitLook::Retry] {
+            assert_eq!(
+                app.exit_status(id, look),
+                Some(aterm_pty::ChildExit::Code(5)),
+                "{look:?} reads the witnessed status"
+            );
+        }
     }
 }

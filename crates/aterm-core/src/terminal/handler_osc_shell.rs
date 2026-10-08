@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OSC shell integration handlers for the terminal.
-//!
-//! This module contains handlers for shell-integration OSC sequences:
+//! OSC shell-integration handlers:
 //! - OSC 133: FinalTerm/Terminal shell integration
 //! - OSC 633: VS Code shell integration
 
@@ -27,9 +25,8 @@ impl TerminalHandler<'_> {
     /// Shell mark A: Prompt starting — create mark, finalize previous block, start new block.
     fn shell_prompt_start(&mut self, row: u64, col: u16) {
         // Every mark time comes from the batch's pipeline clock (`process_at`),
-        // like B/C/D below — not from the constructors' own wall-clock read,
-        // which made a replayed or re-chunked byte log stamp a different
-        // prompt time (a checkpoint that was not a function of its input).
+        // like B/C/D below, not a wall-clock read: a replayed or re-chunked
+        // byte log must stamp the same times.
         let mut mark = CommandMark::new(row, col);
         mark.prompt_time_ms = self.transient.process_wall_ms;
         if let Some(ref cwd) = *self.current_working_directory {
@@ -39,12 +36,12 @@ impl TerminalHandler<'_> {
         self.shell.state = ShellState::ReceivingPrompt;
 
         // Finalize any in-progress block
-        if let Some(ref mut prev_block) = self.shell.current_block.take() {
+        if let Some(mut prev_block) = self.shell.current_block.take() {
             prev_block.end_row = Some(row);
             if self.shell.output_blocks.len() >= OUTPUT_BLOCKS_MAX {
                 self.shell.output_blocks.pop_front();
             }
-            self.shell.output_blocks.push_back(prev_block.clone());
+            self.shell.output_blocks.push_back(prev_block);
             self.shell.output_blocks.make_contiguous();
         }
 
@@ -124,7 +121,7 @@ impl TerminalHandler<'_> {
     /// Dispatch shared A/B/C/D shell integration marks (common to OSC 133 and 633).
     ///
     /// Enforces the valid A→B→C→D state machine. Out-of-order markers are
-    /// silently ignored, matching Terminal behavior (#7668). Valid transitions:
+    /// silently ignored, matching Terminal behavior. Valid transitions:
     /// - `None`/`CommandFinished` → A (prompt start)
     /// - `PromptStart` → B (command input start)
     /// - `CommandStart` → C (command execution start)
@@ -132,6 +129,12 @@ impl TerminalHandler<'_> {
     ///
     /// Returns `true` if the command character was recognized (A/B/C/D),
     /// regardless of whether the transition was accepted.
+    ///
+    /// A prompt start (A) and an accepted command start (C) end any kitty
+    /// chunked load in flight: the program that began it has ended, or is not
+    /// the one about to run, so no chunk of it can follow. Kept, it would take
+    /// the next program's first kitty command as its continuation and lose
+    /// it.
     fn dispatch_shell_mark(&mut self, cmd: char, row: u64, col: u16, params: &[&[u8]]) -> bool {
         use super::grouped_state::ShellIntegrationPhase;
 
@@ -139,9 +142,10 @@ impl TerminalHandler<'_> {
             'A' => {
                 // Accept A from any phase — Terminal treats A as a hard reset
                 // to prompt-start. Common when user presses Enter on an empty
-                // line or Ctrl-C during typing (shell emits A→B→A) (#7684).
+                // line or Ctrl-C during typing (shell emits A→B→A).
                 self.shell.phase = ShellIntegrationPhase::PromptStart;
                 self.shell_prompt_start(row, col);
+                self.transient.kitty_pending = None;
             }
             'B' => {
                 if self.shell.phase != ShellIntegrationPhase::PromptStart {
@@ -156,6 +160,7 @@ impl TerminalHandler<'_> {
                 }
                 self.shell.phase = ShellIntegrationPhase::CommandExec;
                 self.shell_execution_start(row);
+                self.transient.kitty_pending = None;
             }
             'D' => {
                 if self.shell.phase != ShellIntegrationPhase::CommandExec {
@@ -169,25 +174,15 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Gate OSC 133/633 on the capability nonce (#7937 F01-2, #7960).
+    /// Gate OSC 133/633 on the capability nonce.
     ///
-    /// When [`super::types::TerminalModes::require_shell_integration_nonce`]
-    /// is set, every OSC 133 A/B/C/D and OSC 633 A/B/C/D/E/F/G/H/P must
-    /// carry an `id=<64-hex>` parameter matching the host-authorized nonce.
-    /// Sequences without a matching nonce are silently dropped (no state
-    /// transition, no callback, no response) and counted in
-    /// `ShellIntegrationAuth::dropped_count`. When the bit is clear
-    /// (default), the handler preserves the pre-nonce dispatch behavior
-    /// for backward compatibility with unnonced shell integrations.
-    ///
-    /// Returns `true` if dispatch should proceed, `false` if the handler
-    /// should silently drop.
-    ///
-    /// The engine-consulting variant (#7994) is used when a policy engine is
-    /// attached: the engine's decision wins before the nonce check runs (per
-    /// design §6.3), with Deny dropping the sequence, Allow/Fallback deferring
-    /// to the existing nonce check. When no policy engine is attached, the
-    /// legacy nonce-only gate is preserved.
+    /// When [`super::types::TerminalModes::require_shell_integration_nonce`] is
+    /// set, every OSC 133 A/B/C/D and OSC 633 A–H/P must carry an
+    /// `id=<64-hex>` matching the host-authorized nonce; others are dropped
+    /// silently and counted in `ShellIntegrationAuth::dropped_count`. When the
+    /// bit is clear (default) every mark passes. With a policy engine attached,
+    /// its Deny drops the sequence first; Allow/Fallback defer to the nonce
+    /// check. Returns whether dispatch should proceed.
     fn shell_nonce_gate_ok(&mut self, command: u32, params: &[&[u8]]) -> bool {
         if !self.modes.require_shell_integration_nonce {
             return true;
@@ -197,31 +192,21 @@ impl TerminalHandler<'_> {
             .verify_nonce_with_engine(gate, params)
     }
 
-    /// A shell PROMPT (OSC 133/633 `A`) on the ALTERNATE screen: the full-screen
+    /// A shell prompt (OSC 133/633 `A`) on the alternate screen: the full-screen
     /// app the shell ran is dead and its `?1049l` never came, so leave the screen
-    /// for it before the prompt is placed — a prompt on the alt screen is never
-    /// intended; the shell believes it is on the main screen.
+    /// before the prompt is placed. After a pager is killed, the only bytes are
+    /// the shell's `133;D;-1`, `133;A`, prompt and `133;B`; conhost never sends
+    /// the `l` for a client it outlived, and the same holds for a SIGKILLed pager
+    /// on unix.
     ///
-    /// MEASURED (2026-09-22, Windows 11, the `cast` tap): `less` killed from
-    /// another tab; the bytes after the kill were pwsh's `133;D;-1`, `133;A`, the
-    /// prompt and `133;B`, and nothing else — conhost never sends the `l` for a
-    /// client it outlived (`handler_dec.rs`, `leave_orphaned_alternate_screen`,
-    /// has the ConPTY probe). The same bytes follow a SIGKILLed pager on unix.
-    ///
-    /// Only `A` is a trigger, and only past the nonce gate: `A` is the one mark
-    /// that says the shell is drawing its prompt, while `B`/`C`/`D` only open or
-    /// close a block; and a forged `133;A` an unauthorized writer prints must not
-    /// yank a running app off its screen when the host demands the nonce. (A
-    /// multiplexer on the alt screen passes no pane's marks outward: screen and
-    /// tmux forward no unknown OSC, and aterm's scripts install none in a pane.)
-    /// The phase before the `A` is deliberately not consulted: pwsh's prompt
-    /// sends `D` first (CommandFinished), a shell whose prompt sends no `D`
-    /// arrives from CommandExec, and an app a key binding launched from the
-    /// prompt (`fzf` on Ctrl-R) arrives from PromptStart/CommandStart — all the
-    /// same fact. Runs BEFORE `parse_shell_osc` reads the cursor, so the mark's
-    /// row is the main-grid row the prompt actually paints on. What the alt
-    /// screen showed, including anything typed onto it while stuck, is flushed to
-    /// the archive first (`offscreen`).
+    /// Only `A` triggers (it is the one mark that means the shell is drawing its
+    /// prompt), and only past the nonce gate, so a forged `133;A` cannot yank a
+    /// running app off its screen when the host demands the nonce. The phase
+    /// before the `A` is not consulted: shells arrive from CommandFinished,
+    /// CommandExec, or PromptStart/CommandStart (an app launched by a key
+    /// binding) alike. Runs before `parse_shell_osc` reads the cursor, so the
+    /// mark's row is the main-grid row the prompt paints on. The alt screen's
+    /// content is flushed to the archive first.
     fn prompt_leaves_orphaned_alt_screen(&mut self, params: &[&[u8]]) {
         if !self.modes.alternate_screen {
             return;
@@ -237,7 +222,7 @@ impl TerminalHandler<'_> {
     /// Marks: A (prompt start), B (command input), C (execution start), D (finished).
     ///
     /// When `modes.require_shell_integration_nonce` is set, requires every
-    /// sequence to carry a valid `id=<64-hex>` nonce (#7937 F01-2, #7960).
+    /// sequence to carry a valid `id=<64-hex>` nonce.
     pub(super) fn handle_osc_133(&mut self, params: &[&[u8]]) {
         if !self.shell_nonce_gate_ok(133, params) {
             return;
@@ -246,7 +231,7 @@ impl TerminalHandler<'_> {
         let Some((cmd, row, col)) = self.parse_shell_osc(params) else {
             return;
         };
-        // Queue a compact REAL mark for poll-based hosts, but only for a
+        // Queue a compact real mark for poll-based hosts, but only for a
         // recognized A/B/C/D char (dispatch returns true) so out-of-band chars
         // don't surface as bogus events. row/col come from the live cursor.
         if self.dispatch_shell_mark(cmd, row, col, params) {
@@ -264,7 +249,7 @@ impl TerminalHandler<'_> {
     /// See: <https://code.visualstudio.com/docs/terminal/shell-integration>
     ///
     /// When `modes.require_shell_integration_nonce` is set, requires every
-    /// sequence to carry a valid `id=<64-hex>` nonce (#7937 F01-2, #7960).
+    /// sequence to carry a valid `id=<64-hex>` nonce.
     pub(super) fn handle_osc_633(&mut self, params: &[&[u8]]) {
         if !self.shell_nonce_gate_ok(633, params) {
             return;
@@ -290,7 +275,7 @@ impl TerminalHandler<'_> {
                 // byte-capped) shell mark/block `commandline` fields and the parser
                 // admits up to MAX_OSC_DATA (8 MiB). unescape only shrinks, so
                 // bounding the escaped input bounds both the stored string and the
-                // unescape work. (#7172)
+                // unescape work.
                 if escaped_cmd.len() > MAX_COMMANDLINE_BYTES {
                     return;
                 }
@@ -312,11 +297,9 @@ impl TerminalHandler<'_> {
                 let Some(prop) = params.get(2).and_then(|p| std::str::from_utf8(p).ok()) else {
                     return;
                 };
-                let Some(pos) = prop.find('=') else {
+                let Some((key, value)) = prop.split_once('=') else {
                     return;
                 };
-                let key = &prop[..pos];
-                let value = &prop[pos + 1..];
                 if key == crate::shell_integration::INTEGRATION_REV_KEY {
                     self.record_integration_rev(value);
                     return;
@@ -328,7 +311,7 @@ impl TerminalHandler<'_> {
                 // (but not byte-capped) current_working_directory / mark / block
                 // working-directory fields, mirroring the OSC 7 cap. The parser
                 // admits up to MAX_OSC_DATA (8 MiB); 4 KiB (PATH_MAX) is generous
-                // for any real directory. (#7172)
+                // for any real directory.
                 if value.len() > MAX_CWD_PATH_BYTES {
                     return;
                 }
@@ -346,14 +329,12 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// OSC 633 `P;AtermIntegration=<rev>` — which integration BODY the shell
-    /// runs (the LOADER / BODY split, 2026-09-26; `status integration_rev=`).
+    /// OSC 633 `P;AtermIntegration=<rev>`: which integration body the shell runs
+    /// (`status integration_rev=`).
     ///
-    /// Recorded ONLY when the nonce gate is on: the mark reached here signed
-    /// with the shell's authorized key, so it is the shell's word and not a
-    /// program's output (with the gate off every mark passes, and a revision
-    /// anyone can print is worth nothing). The value must be a script folder's
-    /// address — exactly 16 lowercase hex digits — or it is ignored.
+    /// Recorded only when the nonce gate is on, so the value is the shell's word
+    /// rather than a program's output. The value must be exactly 16 lowercase hex
+    /// digits (a script folder's address) or it is ignored.
     fn record_integration_rev(&mut self, value: &str) {
         if !self.modes.require_shell_integration_nonce
             || !crate::shell_integration::is_integration_rev(value)
@@ -420,15 +401,14 @@ impl TerminalHandler<'_> {
 
 #[cfg(test)]
 mod prompt_on_alt_screen_tests {
-    //! The measured stream of a killed pager (2026-09-22, ConPTY `cast` tap):
-    //! `?1049h`, the pager's frames, then — no `?1049l` anywhere — the shell's
-    //! `133;D;-1`, `133;A`, its prompt and `133;B`. The host's own recovery is
-    //! tested beside the exit paths in `handler_dec.rs`; the archive's share of
-    //! both is in `alt_archive_tests.rs`.
+    //! A killed pager's stream: `?1049h`, the pager's frames, then no `?1049l`,
+    //! only the shell's `133;D;-1`, `133;A`, prompt and `133;B`. The host's own
+    //! recovery is tested in `handler_dec.rs`; the archive side in
+    //! `alt_archive_tests.rs`.
     use crate::terminal::Terminal;
 
-    /// Eight lines of history, a marked `less` command, and the pager on the alt
-    /// screen — the screen the audit's tab A was left with.
+    /// Eight lines of history, a marked `less` command, and the pager stuck on
+    /// the alt screen.
     fn stuck_pager() -> Terminal {
         let mut term = Terminal::new(5, 40);
         term.set_alt_archive_enabled(true);
@@ -460,8 +440,7 @@ mod prompt_on_alt_screen_tests {
             "the prompt left the alt screen"
         );
         // 8 lines, the command line and the empty row its `\r\n` opened = 10 rows
-        // on a 5-row grid: 5 in scrollback, reachable again (the audit measured
-        // `lines` = 0 while stuck).
+        // on a 5-row grid: 5 in scrollback, reachable again.
         assert_eq!(term.grid().scrollback_lines(), 5);
         let rows = screen(&term);
         assert_eq!(rows[3], "$ less file");
@@ -515,7 +494,7 @@ mod prompt_on_alt_screen_tests {
 
     #[test]
     fn rows_painted_in_the_same_read_as_the_prompt_are_archived() {
-        // The kill's read carries the app's last paint AND the prompt: the commit
+        // The kill's read carries the app's last paint and the prompt: the commit
         // must happen at the `A`, not at an epilogue that runs after the swap.
         let mut term = stuck_pager();
         let mut read = b"\x1b[5;1Hlast paint before death".to_vec();
@@ -551,7 +530,7 @@ mod prompt_on_alt_screen_tests {
     fn a_prompt_the_nonce_gate_drops_leaves_nothing() {
         // With the nonce demanded, an unauthenticated `133;A` — what any program
         // on the alt screen could print — is dropped whole: the app keeps its
-        // screen. The authenticated one recovers as before.
+        // screen. The authenticated one recovers.
         let mut term = stuck_pager();
         term.authorize_shell_integration([0x11; 32]);
         term.modes_mut().require_shell_integration_nonce = true;

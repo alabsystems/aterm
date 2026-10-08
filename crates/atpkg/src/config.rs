@@ -7,12 +7,9 @@
 //! The GUI parses the whole file into its `Config` (including a mirror
 //! `PackagesConfig` it uses only for the background-loop gate); atpkg reads just
 //! the `[packages]` table out of the identical file, so there is exactly ONE
-//! user-facing config surface — and NO environment alternative to it (2026-09-23, the
-//! owner's R2: "the one true best batteries included default on path. Delete
-//! alternatives. in the future, we could add settings, but NOT ENV VARS those are for
-//! development"). `ATPKG_DISABLE`, `ATPKG_ACCOUNT`, `ATPKG_INDEX_REPO`, `ATPKG_TOKEN`
-//! and `ATPKG_REFUSE_TRACKED_INSTALL` are gone; `ATPKG_REGISTRY` is a development
-//! seam (`aterm_types::dev_seam!`).
+//! user-facing config surface — and NO environment alternative to it (owner rule:
+//! settings, never env vars, which are for development). `ATPKG_REGISTRY` is a
+//! development seam (`aterm_types::dev_seam!`).
 //!
 //! THE KEYS A PERSON HAS (Settings ▸ Packages writes the first two):
 //!
@@ -44,16 +41,11 @@
 //! defaults: automatic updates and installs on, no links, compiled account — the
 //! posture of a machine that never wrote a config, which is most of them.
 //!
-//! A table we could not READ is NOT that case, and used to be treated as it.
-//! CORRECTION 2026-09-16: this module claimed every `[packages]` default was the
-//! inert/narrowest behavior, so a broken config "can only DISABLE bootstrap/links,
-//! never widen anything". TWO defaults widen. The install consent (`auto_install`,
-//! then spelled `seed_install`) defaults TRUE (§9.1), and on a LEAN install that lane is
-//! a multi-GB DOWNLOAD; `exclude` defaults EMPTY, which excludes nothing. So the owner
-//! who wrote `auto_install = false`, or `exclude = ["trust"]`, had precisely the two
-//! keys that PREVENT large downloads reset to the permissive reading by a typo — a wrong TYPE in the table, or a TOML syntax
-//! error ANYWHERE in the file, including the GUI-owned part this module does not
-//! otherwise read. A malformed `[packages]` therefore falls to
+//! A table we could not READ is NOT that case: TWO defaults widen. The install consent
+//! (`auto_install`) defaults TRUE (§9.1), and on a LEAN install that lane is a multi-GB
+//! DOWNLOAD; `exclude` defaults EMPTY, which excludes nothing. Falling to defaults would
+//! let a typo — a wrong TYPE in the table, or a TOML syntax error ANYWHERE in the file —
+//! reset exactly the keys that PREVENT large downloads. A malformed `[packages]` therefore falls to
 //! [`PackagesConfig::unreadable_table`], loudly: the seed lane declines (so the machine
 //! adopts nothing, and the network pass that follows adoption never fires), and the
 //! unattended pass does not complete the set — the exclusions it would need are the
@@ -75,9 +67,8 @@ use std::path::{Path, PathBuf};
 /// Matches the native config service's 512-KiB admission budget.
 pub const MAX_PACKAGES_CONFIG_BYTES: usize = 512 * 1024;
 
-/// The one channel whose pin set drives install/update. `[packages].channel` is retired
-/// (2026-09-23): only `stable` has ever been published, so the key selected nothing but
-/// a way to point a machine at a channel that does not exist.
+/// The one channel whose pin set drives install/update. `[packages].channel` is retired:
+/// only `stable` is published.
 pub const CHANNEL: &str = "stable";
 
 /// Whether this build honours the DEVELOPMENT settings of `[packages]` — `prefix`,
@@ -101,16 +92,9 @@ pub struct PackagesConfig {
     /// default on any violation. So a hostile config can redirect the store only to a
     /// place that is already at least as safe as the default.
     ///
-    /// CORRECTION 2026-08-18: this doc used to say a root-owned prefix was REQUIRED for
-    /// the verified lane — that "Trust's verified launcher refuses a user-owned toolchain
-    /// path", so `targo trust` could not run on anything atpkg installed under `$HOME`.
-    /// That was true of an older Trust and is now false, and it is worth stating loudly
-    /// because it nearly bought this project a `.pkg` installer, an admin prompt and a
-    /// privileged updater daemon it does not need.
-    ///
-    /// Trust's default authority mode is `CallerOwned`
-    /// (`targo/src/cargo/util/process_authority.rs`): a path component may be owned by
-    /// root **or by the invoking identity**, and must not be group/world-writable. The
+    /// A root-owned prefix is NOT required for the verified lane. Trust's default authority mode is
+    /// `CallerOwned` (`targo/src/cargo/util/process_authority.rs`): a path component may be owned
+    /// by root **or by the invoking identity**, and must not be group/world-writable. The
     /// DEFAULT `$HOME` prefix (0700, ours) satisfies it, so proving works with no
     /// privilege at all — Trust's own comment cites rustup's `~/.rustup` as the case that
     /// demanding root would break. Root is in fact REFUSED: targo bails when
@@ -122,7 +106,7 @@ pub struct PackagesConfig {
     /// `TRUST_REQUIRE_SEALED_LAUNCHER=1`, whose sealed-release predicate Trust itself
     /// documents as still unimplementable. See `docs/GOLDEN-INSTALL-PATH.md` §2.
     ///
-    /// A DEVELOPMENT setting since 2026-09-23 ([`DEV_SEAMS`]): a shipped binary drops it
+    /// A DEVELOPMENT setting ([`DEV_SEAMS`]): a shipped binary drops it
     /// at load and uses the one default prefix — and while it names another store, installs
     /// nothing unattended ([`Self::ignored_prefix`], [`Self::installs_unattended`]).
     pub prefix: Option<String>,
@@ -132,19 +116,16 @@ pub struct PackagesConfig {
     /// detached pass, the vendor head watch) and the unattended set completion; never a
     /// verb a person typed — an explicit `atpkg update` always works.
     pub enabled: Option<bool>,
-    /// RETIRED 2026-09-23, folded into `enabled`: it gated the recurring loop alone while
-    /// `enabled` gated the loop and the launch seed — two switches for one question. An
-    /// existing `auto_update = false` is still honoured as `enabled = false`
-    /// ([`Self::enabled`]) and doctor names the rename ([`Self::config_notes`]); Settings
-    /// writes only `enabled` and drops this key when it does.
+    /// RETIRED, folded into `enabled`. An existing `auto_update = false` is still honoured as
+    /// `enabled = false` ([`Self::enabled`]) and doctor names the rename ([`Self::config_notes`]);
+    /// Settings writes only `enabled` and drops this key when it does.
     pub auto_update: Option<bool>,
     /// `[packages].auto_install` — THE install consent (Settings ▸ Packages, "Install
     /// the ALab toolset"). Read through [`Self::auto_install`], which states the rule and
     /// the migration of the retired `seed_install`.
     pub auto_install: Option<bool>,
-    /// RETIRED 2026-09-23, folded into `auto_install`: the first-run fill's consent, a
-    /// second key for the one question "may atpkg install the toolset I did not name?".
-    /// An existing `seed_install = false` is still honoured as `auto_install = false`
+    /// RETIRED, folded into `auto_install` (it was the first-run fill's consent). An
+    /// existing `seed_install = false` is still honoured as `auto_install = false`
     /// when `auto_install` itself is unset ([`Self::auto_install`]), and doctor names
     /// the rename.
     pub seed_install: Option<bool>,
@@ -153,18 +134,17 @@ pub struct PackagesConfig {
     /// a shipped binary drops it at load. Slug-validated downstream — a malformed value
     /// can never redirect fetches.
     pub account: Option<String>,
-    /// RETIRED 2026-09-23 ([`CHANNEL`]): parsed as any value so a stale key never fails
+    /// RETIRED ([`CHANNEL`]): parsed as any value so a stale key never fails
     /// the table, named once at load, never read.
     pub channel: Option<aterm_toml::Value>,
-    /// RETIRED 2026-09-23: the narrowing include filter. A machine keeps the whole signed
+    /// RETIRED: the narrowing include filter. A machine keeps the whole signed
     /// set minus `exclude`; parsed as any value, named once at load, never read.
     pub include: Option<aterm_toml::Value>,
     /// Narrowing-only exclude filter: the per-program opt-out.
     pub exclude: Option<Vec<String>>,
-    /// RETIRED 2026-09-24: the refuse/record policy of the untracked install lanes, which
-    /// were deleted — the store heal is the one cure for the macOS tag
-    /// ([`crate::provenance::heal_store`]). Parsed as any value, named once at load, never
-    /// read.
+    /// RETIRED: the policy of the deleted untracked install lanes — the store heal is the one cure
+    /// for the macOS tag ([`crate::provenance::heal_store`]). Parsed as any value, named once at
+    /// load, never read.
     pub tracked_install: Option<aterm_toml::Value>,
     /// `[packages.links]`: `name = "/path/to/checkout"` (or `~/…`) declares a
     /// managed dev-link ([`crate::linkmode`] — registry management skipped; a
@@ -236,9 +216,8 @@ impl PackagesConfig {
     /// the first-run `seed` pass adopts the machine and lays the set down, and every
     /// update pass after it installs what the signed default set gained. Default TRUE,
     /// batteries included (§9.1): installing aterm is wanting the toolset. The set is a
-    /// multi-GB download (no current client reads a sealed seed — Phase 5 deleted that
-    /// lane), and this key is the one switch that prevents it — so every user-facing
-    /// description of it says so (audit-2 item 7).
+    /// multi-GB download, and this key is the one switch that prevents it — so every
+    /// user-facing description of it says so.
     ///
     /// The explicit opt-outs ALWAYS win over it, whatever it says: `uninstall <p>`
     /// (the program's removed marker), `uninstall --all` (the decline), `exclude`, and
@@ -246,12 +225,9 @@ impl PackagesConfig {
     /// types (`install <p>`, `install --default-set`) is its own consent and ignores
     /// this key.
     ///
-    /// MIGRATION of the two keys this replaced (2026-09-23): `auto_install` itself wins
-    /// when written; else the retired `seed_install` (its `false` was the documented
-    /// "not on my disk"); else TRUE. So `seed_install = false` still keeps a machine
-    /// bare, `auto_install = true` still installs, and an `auto_install = false` —
-    /// before today a no-op spelling of the old default — now means what it says: no
-    /// unattended installs (doctor names both, [`Self::config_notes`]).
+    /// MIGRATION: `auto_install` itself wins when written; else the retired
+    /// `seed_install` (its `false` was the documented "not on my disk"); else TRUE
+    /// (doctor names both, [`Self::config_notes`]).
     ///
     /// A table we could not READ resolves FALSE, whatever the file said: the default is
     /// the one that costs gigabytes, and `auto_install = false` is the documented way to
@@ -266,7 +242,7 @@ impl PackagesConfig {
     /// ([`Self::auto_install`]) AND no configured prefix being ignored
     /// ([`Self::ignored_prefix`]). The first-run seed and the update pass's set completion
     /// read this; Settings shows the consent itself. A shipped binary keeps ONE store, the
-    /// default (2026-09-23), so a `[packages] prefix` naming another one is dropped — and
+    /// default, so a `[packages] prefix` naming another one is dropped — and
     /// until its owner removes the line, the machine is treated as not wanting the toolset
     /// in the default store: the toolset they have lives where the key points, and filling
     /// a second store beside it (gigabytes, over the network on a lean install) and moving
@@ -473,11 +449,9 @@ pub fn config_path() -> Option<PathBuf> {
     if let Some(appdata) = std::env::var_os("APPDATA").filter(|a| !a.is_empty()) {
         return Some(PathBuf::from(appdata).join("aterm").join("aterm.toml"));
     }
-    // `HOME` first, the ACCOUNT's home second. A process launched without `HOME` (a
-    // launchd job, `su` without `-`, a sandbox) used to resolve NO config file — which
-    // for this table is not "no settings" but "both defaults act", so an explicit
-    // `universal_control = "leave"` was silently replaced by the acting default and the
-    // pass wrote the real account's per-host keys against the owner's stated wish.
+    // `HOME` first, the ACCOUNT's home second. For a process launched without `HOME` (a
+    // launchd job, `su` without `-`, a sandbox), NO config file would mean "both
+    // `[machine]` defaults act", overriding an explicit `universal_control = "leave"`.
     // `defaults` follows the account regardless of `$HOME`, so reading the account's
     // config in that state is the only reading that matches what would be written.
     std::env::var_os("HOME")
@@ -488,9 +462,8 @@ pub fn config_path() -> Option<PathBuf> {
 }
 
 /// The `[machine]` table — the machine settings `aterm pkg machine apply` applies at
-/// first open and keeps applied (R5, owner decisions 2026-09-10; a pass carries only an
-/// edit to the table since Phase 3). Read by atpkg because atpkg
-/// APPLIES them: the GUI only renders the resulting `machine-settings:` row.
+/// first open and keeps applied (a pass carries only an edit to the table). Read by atpkg because
+/// atpkg APPLIES them: the GUI only renders the resulting `machine-settings:` row.
 ///
 /// All-Option like [`PackagesConfig`]; defaults live ONLY in the resolver methods. Both
 /// defaults ACT — this is the one table whose "absent" means "do the doctor's remedy" —
@@ -514,12 +487,9 @@ pub struct MachineConfig {
     /// The config file EXISTS and could not be parsed, so neither opt-out above could be
     /// read. Never deserialized — [`parse_machine`] sets it.
     ///
-    /// FAIL CLOSED (2026-09-15). Both defaults ACT, so "malformed ⇒ defaults" meant a
-    /// single typo anywhere in `aterm.toml` — a broken `[keys]` binding three tables
-    /// away — silently re-enabled the very changes the owner had switched off with
-    /// `universal_control = "leave"`, and said so only in one stderr line nothing
-    /// surfaces. A table whose defaults change the machine may not be inferred from a
-    /// file nobody could read.
+    /// FAIL CLOSED. Both defaults ACT, so "malformed ⇒ defaults" would let a typo anywhere
+    /// in `aterm.toml` re-enable changes the owner switched off. A table whose defaults
+    /// change the machine may not be inferred from a file nobody could read.
     #[serde(skip)]
     pub unreadable: bool,
 }
@@ -605,19 +575,23 @@ struct MachineOnly {
 }
 
 /// The `[reroute]` table — what a session does with the upstream Rust names
-/// ([`crate::reroute`]). ONE key, and it is the owner's 2026-09-08 ask ("some kind of
-/// printed message when using these tools that could be suppressed with a flag") made
-/// a SETTING on 2026-09-23 ("NOT ENV VARS those are for development"): it replaces
-/// `ATERM_REROUTE_QUIET`. Settings ▸ Packages writes it.
+/// ([`crate::reroute`]). `announce` silences the stub's line (a setting, not an env
+/// var); Settings ▸ Packages writes it. `strict` opts back into refusals instead of
+/// warnings; it is written by hand (Manual).
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct RerouteConfig {
-    /// `[reroute].announce`: whether a SIGNPOST row (`cargo`, `rustc`, `tlc`) prints its
-    /// announcement before it runs the upstream tool. Default TRUE. `false` silences the
-    /// line and changes nothing else — the upstream tool still runs, a DIRECT row still
-    /// says what it substituted (that line is the "never silently substituting"
-    /// guarantee itself), and the ORACLE row still refuses.
+    /// `[reroute].announce`: whether a stub prints its line before it runs an UPSTREAM
+    /// tool — a SIGNPOST row (`cargo`, `rustc`, `tlc`), `z3`, and a DIRECT row whose
+    /// Trust tool is missing. Default TRUE. `false` silences the line and changes
+    /// nothing else — the upstream tool still runs, and a DIRECT row still says what it
+    /// substituted (that line is the "never silently substituting" guarantee itself).
     pub announce: Option<bool>,
+    /// `[reroute].strict`: default FALSE — every stub runs something, with a one-line
+    /// notice. `true` refuses instead: `z3` refuses (exit 2),
+    /// a DIRECT row whose Trust tool is missing exits 127 instead of running upstream,
+    /// and a stub that cannot reach atpkg exits 2 instead of walking PATH.
+    pub strict: Option<bool>,
 }
 
 impl RerouteConfig {
@@ -625,6 +599,12 @@ impl RerouteConfig {
     #[must_use]
     pub fn announce(&self) -> bool {
         self.announce.unwrap_or(true)
+    }
+
+    /// `[reroute].strict`, default FALSE.
+    #[must_use]
+    pub fn strict(&self) -> bool {
+        self.strict.unwrap_or(false)
     }
 }
 
@@ -652,11 +632,18 @@ pub fn parse_reroute(text: &str) -> RerouteConfig {
 #[must_use]
 pub fn cached_reroute() -> &'static RerouteConfig {
     static CFG: std::sync::OnceLock<RerouteConfig> = std::sync::OnceLock::new();
-    CFG.get_or_init(|| {
-        config_path()
-            .and_then(|p| read_config_text(&p))
-            .map_or_else(RerouteConfig::default, |t| parse_reroute(&t))
-    })
+    CFG.get_or_init(load_reroute)
+}
+
+/// The `[reroute]` config as the file says it NOW — for a long-lived caller. The window
+/// lays the reroute stubs at every session spawn ([`crate::reroute::lay`]) and a stub
+/// carries `strict` in its bytes, so a value cached at the window's launch would re-lay
+/// the old policy over the one a pass just laid, until the window restarted.
+#[must_use]
+pub fn load_reroute() -> RerouteConfig {
+    config_path()
+        .and_then(|p| read_config_text(&p))
+        .map_or_else(RerouteConfig::default, |t| parse_reroute(&t))
 }
 
 /// Parse the `[packages]` table out of full `aterm.toml` text. A file without the
@@ -686,20 +673,45 @@ pub fn parse_packages_at(text: &str, dev_seams: bool, home: Option<&Path>) -> Pa
         Err(e) => {
             // Said wherever this process's unasked notices go ([`crate::notice`]): a typed
             // verb's stderr, or the host's log — a session launch reads this table too.
-            // ONCE per process: every layout resolution reads the file again.
-            crate::notice::say_once(&format!(
-                "aterm.toml has an error in [packages] \u{2014} updates continue, but new \
-                 programs are not installed until it is fixed: {e}"
-            ));
+            // ONCE per process: every layout resolution reads the file again. A file that
+            // is not TOML at all is said once for both tables ([`say_not_toml`]); only a
+            // shape error is this table's.
+            if !say_not_toml(text) {
+                crate::notice::say_once(&format!(
+                    "[packages] in aterm.toml: {e} \u{2014} updates continue; new programs \
+                     wait until it is fixed"
+                ));
+            }
             PackagesConfig::unreadable_table()
         }
     }
 }
 
+/// When `text` is not valid TOML, say so ONCE for every table read from it, and answer
+/// true: the parser fails the whole file before any table is looked at, so a per-table
+/// line would blame a table that has nothing wrong with it.
+fn say_not_toml(text: &str) -> bool {
+    match not_toml_note(text) {
+        Some(note) => {
+            crate::notice::say_once(&note);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The one line for an `aterm.toml` that is not valid TOML, or `None` when it parses.
+fn not_toml_note(text: &str) -> Option<String> {
+    let e = aterm_toml::from_str::<aterm_toml::Value>(text).err()?;
+    Some(format!(
+        "aterm.toml is not valid TOML ({e}) \u{2014} updates continue; new programs and the \
+         [machine] settings wait until it is fixed"
+    ))
+}
+
 /// The per-key admission a WELL-FORMED `[packages]` table still gets, once, at load.
 ///
-/// RETIRED AND DEVELOPMENT KEYS (2026-09-23). A retired `channel`/`include` (and, since
-/// 2026-09-24, `tracked_install`) is named
+/// RETIRED AND DEVELOPMENT KEYS. A retired `channel`/`include`/`tracked_install` is named
 /// ([`crate::notice::say_spelling`]) and never read. In a shipped binary (`dev_seams`
 /// false) the development settings — `prefix`, `account`, and every `owner/repo` value of
 /// `[packages.links]` — are named and DROPPED from the table, so no resolver downstream
@@ -726,13 +738,15 @@ fn admit_packages(mut cfg: PackagesConfig, dev_seams: bool, home: Option<&Path>)
     if !dev_seams {
         let mut dropped: Vec<String> = Vec::new();
         let configured = cfg.prefix_path(home);
-        if cfg.prefix.take().is_some_and(|p| !p.trim().is_empty()) {
-            dropped.push("prefix".to_string());
-        }
         if let (Some(configured), Some(home)) = (configured, home)
             && configured != crate::store::default_prefix(home)
         {
             cfg.ignored_prefix = Some(configured);
+        }
+        // An ignored prefix has its own notice (below), naming the key and the remedy;
+        // listing it here too said the one fact twice.
+        if cfg.prefix.take().is_some_and(|p| !p.trim().is_empty()) && cfg.ignored_prefix.is_none() {
+            dropped.push("prefix".to_string());
         }
         if cfg.account.take().is_some_and(|a| !a.trim().is_empty()) {
             dropped.push("account".to_string());
@@ -797,10 +811,12 @@ pub fn parse_machine(text: &str) -> MachineConfig {
             // surfaces HONEST: the CLI verdict, the "This Mac" card and the
             // `machine-state:` record can say WHY nothing is being applied, instead of
             // rendering a machine that looks deliberately switched off.
-            crate::notice::say(&format!(
-                "malformed aterm.toml — the [machine] settings are not applied, and \
-                 Universal Control and Spotlight are left exactly as they are: {e}"
-            ));
+            if !say_not_toml(text) {
+                crate::notice::say(&format!(
+                    "[machine] in aterm.toml: {e} \u{2014} its settings are not applied; \
+                     Universal Control and Spotlight are left as they are"
+                ));
+            }
             MachineConfig {
                 unreadable: true,
                 ..MachineConfig::inert()
@@ -909,17 +925,10 @@ mod tests {
         assert!(!parse_machine(both).spotlight_noindex());
     }
 
-    /// A TYPO IN `[packages]` MUST NOT RE-ARM THE ACTING `[machine]` DEFAULTS.
-    /// Both tables used to come out of ONE deserialization of the whole file, so a
-    /// type error in `[packages]` — a table [`parse_machine`] does not even read —
-    /// threw away the owner's explicit `[machine]` opt-outs and handed the pass the
-    /// defaults, which ACT: the next seed/update/install pass wrote
-    /// `com.apple.universalcontrol Disable`/`DisableMagicEdges` and renamed cargo
-    /// target dirs on a machine whose owner had written `universal_control = "leave"`
-    /// and `spotlight_noindex = false`, and the only notice was one `eprintln!` from a
-    /// background child whose stderr nobody reads. Each table is parsed on its OWN
-    /// now, and a `[machine]` table that cannot be read falls to the INERT reading —
-    /// never to the acting one.
+    /// A TYPO IN `[packages]` MUST NOT RE-ARM THE ACTING `[machine]` DEFAULTS. Each table
+    /// is parsed on its OWN, so a type error in `[packages]` keeps the owner's explicit
+    /// `[machine]` opt-outs, and a `[machine]` table that cannot be read falls to the
+    /// INERT reading — never to the acting one.
     #[test]
     fn a_packages_typo_never_re_arms_the_machine_defaults() {
         let typo = "[packages]\nauto_install = \"yes\"\n[machine]\n\
@@ -945,6 +954,13 @@ mod tests {
         let broken = parse_machine("[machine\nnot toml");
         assert_eq!(broken.universal_control(), UniversalControlPolicy::Leave);
         assert!(!broken.spotlight_noindex());
+        // A syntax error outside both tables is the FILE's, said once, never blamed on
+        // [packages]; a well-formed file has no such line.
+        let note = not_toml_note("[packages]\nexclude = [\"ay\"]\n[window]\ntitle = \"x\n")
+            .expect("an unclosed quote is not TOML");
+        assert!(note.starts_with("aterm.toml is not valid TOML"), "{note}");
+        assert!(!note.contains("[packages] in"), "{note}");
+        assert_eq!(not_toml_note("[machine]\nuniversal_control = 1\n"), None);
     }
 
     #[test]
@@ -1081,11 +1097,8 @@ mod tests {
             "the note names the fix"
         );
         assert!(
-            shared
-                .config_notes()
-                .iter()
-                .any(|n| n.contains("[packages] prefix")),
-            "the drop itself is a note: {:?}",
+            !shared.config_notes().iter().any(|n| n.contains("prefix")),
+            "the ignored-prefix note alone says it, not a second drop note: {:?}",
             shared.config_notes()
         );
         let default = crate::store::default_prefix(home);
@@ -1232,17 +1245,11 @@ mod tests {
         assert!(cfg.unreadable);
     }
 
-    /// A `[packages]` table we could not read must not WIDEN — the one claim this
-    /// module made about malformed files that was FALSE (2026-09-16 audit).
-    ///
-    /// The install consent (then `seed_install`, now `auto_install`) defaults TRUE and
-    /// `exclude` defaults EMPTY, so resetting the table
-    /// to its defaults switched ON the multi-GB paths those two keys exist to block: the
-    /// owner of a lean install (an Intel Mac, a Linux box, any cut since 2026-08-26 —
-    /// none seal a seed) who wrote `seed_install = false` got the seed lane installing
-    /// anyway on the next launch, recording adoption, after which `cmd_update_all` sees
-    /// `complete_the_set` and pulls the whole set over the network. The trigger needs no mistake in `[packages]` at all: the GUI owns
-    /// most of `aterm.toml`, and a syntax error anywhere in it fails this parse too.
+    /// A `[packages]` table we could not read must not WIDEN. The install consent defaults
+    /// TRUE and `exclude` defaults EMPTY, so resetting the table to its defaults would
+    /// switch ON the multi-GB paths those two keys exist to block. The trigger needs no
+    /// mistake in `[packages]` at all: the GUI owns most of `aterm.toml`, and a syntax
+    /// error anywhere in it fails this parse too.
     #[test]
     fn an_unreadable_packages_table_never_widens_the_download_gates() {
         // A wrong TYPE inside [packages] — the whole table fails — with auto_install =
@@ -1316,10 +1323,7 @@ mod tests {
     fn config_fifo_returns_defaults_and_symlinked_config_remains_supported() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let root =
-            std::env::temp_dir().join(format!("atpkg-config-admission-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::testdir::dir("atpkg-config-admission-");
         let fifo = root.join("fifo.toml");
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: `fifo_c` is a live NUL-terminated path in our private fixture.
@@ -1334,21 +1338,18 @@ mod tests {
         std::fs::write(&target, "[packages]\nexclude = [\"ay\"]\n").unwrap();
         std::os::unix::fs::symlink(&target, &logical).unwrap();
         assert_eq!(load_from_path(&logical).exclude(), ["ay".to_string()]);
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn oversized_sparse_config_returns_bounded_defaults() {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-config-oversized-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::testdir::dir("atpkg-config-oversized-");
         let path = root.join("aterm.toml");
         let file = std::fs::File::create(&path).unwrap();
         file.set_len((MAX_PACKAGES_CONFIG_BYTES + 1) as u64)
             .unwrap();
         assert!(load_from_path(&path).exclude().is_empty());
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `[reroute].announce` (2026-09-23, replacing `ATERM_REROUTE_QUIET`): default on,
@@ -1362,6 +1363,23 @@ mod tests {
         assert!(
             !parse_reroute("[packages]\nenabled = 3\n[reroute]\nannounce = false\n").announce(),
             "a typo in another table does not repeal it"
+        );
+    }
+
+    /// `[reroute].strict` (2026-09-29): default OFF — warn and run — and only an explicit
+    /// `true` restores the refusals. A value that does not parse is the default: a typo
+    /// never turns a warning into a stop.
+    #[test]
+    fn reroute_strict_defaults_off_and_only_true_turns_it_on() {
+        assert!(!parse_reroute("").strict());
+        assert!(!parse_reroute("[reroute]\nannounce = false\n").strict());
+        assert!(!parse_reroute("[reroute]\nstrict = false\n").strict());
+        assert!(parse_reroute("[reroute]\nstrict = true\n").strict());
+        assert!(!parse_reroute("[reroute]\nstrict = \"yes\"\n").strict());
+        let both = parse_reroute("[reroute]\nannounce = false\nstrict = true\n");
+        assert!(
+            both.strict() && !both.announce(),
+            "the two keys are independent"
         );
     }
 

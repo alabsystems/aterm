@@ -13,9 +13,9 @@
 //! to draw an image inline over the grid. This module parses that one sub-command
 //! (`File=`), base64-decodes the payload, computes the image's CELL footprint, and
 //! stamps an [`ImageRef`](aterm_grid::ImageRef) onto every covered cell. The
-//! engine does NOT decode pixels — it has no image codec; the raw bytes ride along
-//! behind an `Arc` and the renderer decodes once (keyed by `Arc` identity) and
-//! blits each cell's tile. See `aterm-render`'s image pass.
+//! engine does not decode the picture: the raw bytes ride along behind an `Arc`
+//! and the renderer decodes once (keyed by `Arc` identity) and blits each cell's
+//! tile. See `aterm-render`'s image pass.
 //!
 //! Every other OSC 1337 sub-command (`SetUserVar`, `SetMark`, …) is handled via
 //! the shell-API / KVP callback layer, not here. A param that is not `File=` is
@@ -28,6 +28,7 @@
 //! grid all return early. An unknown image format (not PNG) is still stored so the
 //! cursor advances consistently, but the renderer draws nothing for it.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aterm_grid::{ImageData, ImageFormat, ImageRef, ImageScaling, KittyPlacementTag};
@@ -40,7 +41,7 @@ pub(super) enum PlacementCursor {
     /// iTerm2 and sixel: a fresh line at column 0 below the image, so
     /// following output never overprints its last row.
     NextLine,
-    /// Kitty's default: the cell just past the image's right edge on its LAST
+    /// Kitty's default: the cell just past the image's right edge on its last
     /// row (the next line's column 0 when that is past the right margin) —
     /// kitty moves the cursor `c` columns right and `r - 1` rows down.
     AfterImage,
@@ -55,12 +56,47 @@ pub(super) enum PlacementCursor {
 const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum footprint in cells along either axis. Caps the per-image cell-stamp
-/// work and the renderer's blit area regardless of the requested dimensions.
+/// work regardless of the requested dimensions; the footprint's height is held
+/// tighter still ([`MAX_DECODED_IMAGE_PX`]).
 const MAX_FOOTPRINT_CELLS: u16 = 4096;
+
+/// The tallest raster the image paths make or read, in pixels: the renderers'
+/// PNG decode limit (`aterm-render`'s `IMAGE_MAX_DIMENSION`) and the sixel
+/// decoder's `SIXEL_MAX_DIMENSION`.
+///
+/// The renderers decode a placement into ONE RGBA buffer of its footprint's
+/// pixel size (`cols * cell_w` by `rows * cell_h`), so a footprint's height is
+/// what a draw allocates and resamples. Kitty's is held to the screen and
+/// sixel's comes from its raster; an iTerm2 `height=` in cells is bounded only
+/// by [`MAX_FOOTPRINT_CELLS`], so without this `height=4096` on a one-pixel PNG
+/// asks each draw for a 262 MB buffer at an 80-column 10x20-px grid (over 1 GB
+/// on a Retina window). An iTerm2 footprint is no taller than the screen or
+/// this, whichever is more: no source taller than this decodes anyway.
+const MAX_DECODED_IMAGE_PX: u32 = 4096;
+
+/// Payload bytes of the inline images the live screen may show at once, past
+/// which whole images are taken off it ([`TerminalHandler::admit_live_image`]).
+///
+/// Every protocol stamps images into cells, and a cell keeps its image while
+/// any of it shows, so without a bound per screen the pictures a screen holds
+/// are bounded only by its cell count times the per-image cap. A program's
+/// output reaches that cheaply: an 80x24 screen of sixels each declaring a
+/// 4096x20 raster (`"1;1;4096;20`, no pixel data) holds 603 MB after 65 KB of
+/// output, and Kitty `o=z` inflates 4 MiB from about 4 KB. The Kitty store's
+/// images are bounded by its own budget and are counted here only once it lets
+/// one go, as a placement on either screen may still show it; history
+/// charges what scrolls off to the scrollback budget. Generous next to any real
+/// screen: a full 6K window of RGBA is 81 MB.
+pub(super) const MAX_LIVE_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+
+/// What an over-budget screen is trimmed to: half the budget, so each count of
+/// the screen's images is at least that many placed bytes after the last and
+/// the counting stays linear in the bytes placed.
+const LIVE_IMAGE_TRIM_BYTES: usize = MAX_LIVE_IMAGE_BYTES / 2;
 
 /// A requested image dimension from the `width=`/`height=` argument.
 ///
-/// iTerm2 accepts: a bare count = CELLS, an `N px` suffix = PIXELS, an `N%`
+/// iTerm2 accepts: a bare count = cells, an `N px` suffix = pixels, an `N%`
 /// suffix = a percentage of the viewport, or `auto` = derive from the image's own
 /// pixel size. Anything unparseable is treated as `Auto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,41 +182,36 @@ struct FileArgs {
 }
 
 impl TerminalHandler<'_> {
-    /// Handle OSC 1337 — the iTerm2 `File=` inline-image sub-command.
+    /// Handle OSC 1337, the iTerm2 `File=` inline-image sub-command.
     ///
-    /// `params` is the VTE-split OSC: `params[0] == "1337"`, and the rest is the
-    /// `File=…:base64` body, which the parser splits on every `;` (the `File=`
-    /// arg list is semicolon-separated) and on no other delimiter.
+    /// `params[0] == "1337"`; the rest is the `File=…:base64` body, split by the
+    /// parser on every `;` (the arg list is semicolon-separated). The body is
+    /// divided into `(args, payload)` at the first `:`. Base64 has no `;`, so a
+    /// well-formed payload is entirely in the last param and borrowed in place;
+    /// only the small args prefix is rejoined. A `:` in an earlier param means
+    /// a `;` follows the payload start (malformed), and then the whole body is
+    /// rejoined so acceptance matches the unsplit form. This avoids copying a
+    /// payload of up to `MAX_OSC_DATA` under the terminal lock.
     ///
-    /// The body is dispatched as `(args, payload)` split at the FIRST `:`. The
-    /// base64 alphabet contains no `;`, so for well-formed input the whole
-    /// payload sits inside the LAST split param and is borrowed in place — only
-    /// the small args prefix is ever rejoined. A `:` in an earlier param means a
-    /// `;` follows the payload start (malformed base64); that case falls back to
-    /// a full rejoin so accept/reject behavior matches the split-free path
-    /// byte for byte. This avoids copying a near-8-MiB payload (the parser's
-    /// `MAX_OSC_DATA` cap) inside one dispatch under the terminal lock.
-    ///
-    /// Any body that is not `File=` is left to the shell-API / KVP path (this is a
-    /// no-op for it). All malformed `File=` input is ignored without panicking.
+    /// Bodies other than `File=` are left to the shell-API / KVP path. Malformed
+    /// `File=` input is ignored without panicking.
     pub(super) fn handle_osc_1337(&mut self, params: &[&[u8]]) {
         if params.len() < 2 {
             return;
         }
 
-        // Locate the FIRST ':' across the split params (param index, byte offset).
+        // Locate the first ':' across the split params (param index, byte offset).
         let colon_at = params
             .iter()
             .enumerate()
             .skip(1)
             .find_map(|(i, p)| p.iter().position(|&b| b == b':').map(|j| (i, j)));
-        // No ':' anywhere means no payload — nothing to draw regardless of the
-        // sub-command (the rejoined-body path returned without effect too).
+        // No ':' anywhere means no payload: nothing to draw.
         let Some((colon_param, colon_off)) = colon_at else {
             return;
         };
 
-        // Fast path: the ':' lives in the LAST param, so the payload contains no
+        // Fast path: the ':' lives in the last param, so the payload contains no
         // ';' and can be borrowed in place. Rejoin only the args prefix.
         if colon_param == params.len() - 1 {
             let payload = &params[colon_param][colon_off + 1..];
@@ -212,9 +243,8 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // Malformed shape (a ';' after the first ':'): reconstruct the full body
-        // exactly as before, so downstream accept/reject behavior is unchanged
-        // (the ';'-bearing payload then fails base64 decode as it always did).
+        // Malformed shape (a ';' after the first ':'): rebuild the full body, so
+        // the ';'-bearing payload fails base64 decode as the unsplit form would.
         let mut body: Vec<u8> = params[1].to_vec();
         for extra in &params[2..] {
             body.push(b';');
@@ -240,15 +270,12 @@ impl TerminalHandler<'_> {
         }
 
         // Base64 → raw image bytes. A decode failure degrades to nothing.
-        let payload_str = match std::str::from_utf8(payload) {
-            Ok(s) => s,
-            Err(_) => return,
+        let Ok(payload_str) = std::str::from_utf8(payload) else {
+            return;
         };
-        // The payload may carry incidental whitespace/newlines from line-wrapping;
-        // the decoder is strict, so strip ASCII whitespace first. `imgcat` and
-        // friends emit none, so probe first and only copy when a strip is
-        // actually needed (the byte probe equals the char filter: ASCII
-        // whitespace is single-byte and non-ASCII UTF-8 bytes are >= 0x80).
+        // Strip ASCII whitespace (line-wrapped payloads) before the strict
+        // decoder, copying only when some is present (a byte probe suffices:
+        // ASCII whitespace is single-byte and non-ASCII UTF-8 bytes are >= 0x80).
         let cleaned: std::borrow::Cow<'_, str> = if payload.iter().any(u8::is_ascii_whitespace) {
             let mut s = String::with_capacity(payload_str.len());
             s.extend(payload_str.chars().filter(|c| !c.is_ascii_whitespace()));
@@ -272,7 +299,7 @@ impl TerminalHandler<'_> {
         let grid_cols = self.grid.cols();
         let grid_rows = self.grid.rows();
 
-        // Auto footprint from the image's own pixels, rounded UP so the whole
+        // Auto footprint from the image's own pixels, rounded up so the whole
         // image fits. Clamp to a sane default when the header is unreadable.
         let auto_cols = if px_w == 0 {
             1
@@ -285,20 +312,28 @@ impl TerminalHandler<'_> {
             clamp_cells(px_h.div_ceil(u32::from(cell_h))).max(1)
         };
 
+        // The tallest footprint: the screen, or the tallest decodable raster
+        // ([`MAX_DECODED_IMAGE_PX`]), whichever is more.
+        let tallest = grid_rows.max(clamp_cells(
+            MAX_DECODED_IMAGE_PX.div_ceil(u32::from(cell_h)),
+        ));
+
         let want_w = args.width.unwrap_or(Dimension::Auto);
         let want_h = args.height.unwrap_or(Dimension::Auto);
         let mut cols = want_w.to_cells(cell_w, grid_cols, auto_cols).max(1);
-        let mut rows = want_h.to_cells(cell_h, grid_rows, auto_rows).max(1);
+        let mut rows = want_h
+            .to_cells(cell_h, grid_rows, auto_rows)
+            .min(tallest)
+            .max(1);
 
         // Preserve aspect ratio when one axis is Auto and the other explicit: scale
         // the Auto axis from the image's pixel aspect so the picture is not warped.
         if args.preserve_aspect_ratio && px_w > 0 && px_h > 0 {
             match (want_w, want_h) {
                 (Dimension::Auto, _) if !matches!(want_h, Dimension::Auto) => {
-                    // height fixed → derive width from aspect (in pixels, then cells).
-                    // IHDR px_w is an attacker-controlled u32 (up to u32::MAX), so the
-                    // rows*cell_h*px_w product overflows u32 — accumulate in u64 and
-                    // saturate the cell count back into clamp_cells' u32 domain.
+                    // Height fixed: derive width from the aspect ratio. IHDR px_w is
+                    // an attacker-controlled u32, so the product is computed in u64
+                    // and the cell count saturated into clamp_cells' u32 domain.
                     let px =
                         u64::from(rows) * u64::from(cell_h) * u64::from(px_w) / u64::from(px_h);
                     let cells = u32::try_from(px.div_ceil(u64::from(cell_w))).unwrap_or(u32::MAX);
@@ -309,7 +344,7 @@ impl TerminalHandler<'_> {
                     let px =
                         u64::from(cols) * u64::from(cell_w) * u64::from(px_h) / u64::from(px_w);
                     let cells = u32::try_from(px.div_ceil(u64::from(cell_h))).unwrap_or(u32::MAX);
-                    rows = clamp_cells(cells).max(1);
+                    rows = clamp_cells(cells).min(tallest).max(1);
                 }
                 _ => {}
             }
@@ -329,11 +364,10 @@ impl TerminalHandler<'_> {
             rows,
             z_index: 0,
             band_lift_px: 0,
-            // iTerm2 names its target in CELLS (`width=`/`height=`), so filling
-            // the cells the program asked for IS the spec: FIT, don't pin pixels
-            // (the sixel sibling below is the opposite case) — aspect kept,
-            // unless the program said `preserveAspectRatio=0`, iTerm2's "stretch
-            // to fill, ignore the inherent ratio".
+            cell_offset_px: (0, 0),
+            // iTerm2 names its target in cells, so the image fits the requested
+            // cells (unlike sixel below), keeping the aspect ratio unless
+            // `preserveAspectRatio=0` asks to stretch.
             scaling: if args.preserve_aspect_ratio {
                 ImageScaling::Fit
             } else {
@@ -341,22 +375,17 @@ impl TerminalHandler<'_> {
             },
             source_rect: None,
         });
-        // iTerm2 inline images are LEFT-anchored at the margin (column 0).
+        // iTerm2 inline images are left-anchored at the margin (column 0).
         self.place_image(&image, cols, rows, 0);
     }
 
-    /// Stamp `image` onto a `rows`×`cols` block of cells starting at `start_col`,
-    /// advancing the cursor down one line per footprint row so following output
-    /// lands BELOW the image. Each footprint row scrolls via `line_feed`, so an
-    /// image taller than the remaining screen scrolls the grid exactly as text
-    /// would.
+    /// Stamp `image` onto a `rows`×`cols` block of cells starting at
+    /// `start_col`, line-feeding once per footprint row so later output lands
+    /// below the image and a tall image scrolls the grid as text would.
     ///
-    /// `start_col` is the anchoring column: the iTerm2 OSC 1337 path passes `0`
-    /// (left-anchored at the margin, per spec); the sixel path passes the CURRENT
-    /// cursor column so a mid-line sixel paints at the cursor instead of snapping
-    /// to column 0 (VT340/xterm). Cells whose column would fall past the right
-    /// edge are clipped (not wrapped), so a wide image anchored near the margin is
-    /// truncated rather than overprinting the next row.
+    /// `start_col` is the anchor: 0 for iTerm2 OSC 1337 (left margin, per spec),
+    /// the cursor column for sixel (VT340/xterm). Cells past the right edge are
+    /// clipped, not wrapped.
     pub(super) fn place_image(
         &mut self,
         image: &Arc<ImageData>,
@@ -386,11 +415,11 @@ impl TerminalHandler<'_> {
         kitty: Option<KittyPlacementTag>,
         cursor: PlacementCursor,
     ) {
+        self.admit_live_image(image, kitty);
         let start_col = start_col.min(self.grid.cols().saturating_sub(1));
         if cursor == PlacementCursor::Unmoved {
-            // Kitty `C=1`: stamp in place, below the cursor row, without a
-            // single line feed — the cursor and the scroll position are the
-            // caller's to keep.
+            // Kitty `C=1`: stamp in place below the cursor row without any line
+            // feed; cursor and scroll position stay.
             let top = self.grid.cursor_row();
             let visible = rows.min(self.grid.rows().saturating_sub(top));
             for cell_row in 0..visible {
@@ -398,26 +427,20 @@ impl TerminalHandler<'_> {
             }
             return;
         }
-        // Anchor at `start_col`; the per-row stamp loop below restores this column
-        // after every line_feed so the footprint tiles map cleanly onto whole
-        // columns from the anchor.
+        // Anchor at `start_col`; the stamp loop restores this column after every
+        // line_feed so footprint tiles map onto whole columns from the anchor.
         self.grid.set_cursor(self.grid.cursor_row(), start_col);
 
-        // Footprint rows in the middle band can never be the FINAL writer of any
-        // visible cell, so their per-cell stamps are skipped: after at most
-        // `grid_rows` line feeds the cursor is pinned (at the scroll-region
-        // bottom, scrolling, or at the last screen row, stationary). A row
-        // stamped at a pinned-scrolling cursor leaves the region after at most
-        // `grid_rows` further scrolls; at a pinned-stationary cursor it is
-        // overwritten identically-shaped by every later footprint row. Only the
-        // first `grid_rows` rows (stamped while the cursor may still be
-        // descending — possibly OUTSIDE the scroll region, where nothing ever
-        // scrolls or overwrites them) and the last `2 * grid_rows` rows can
-        // remain visible. This bounds a hostile `height=4096` placement to
-        // ~3*grid_rows*cols extras-map inserts instead of rows*cols (~1M on a
-        // wide window) while keeping the final grid, cursor, scroll count, and
-        // scrollback text identical; the line feeds still run per footprint row
-        // (the ordinary optimized text-scroll cost).
+        // Middle-band footprint rows can never be the final writer of a visible
+        // cell: after at most `grid_rows` line feeds the cursor is pinned
+        // (scrolling at the region bottom, or stationary on the last row), and a
+        // row stamped there is either scrolled away or overwritten by later rows.
+        // Only the first `grid_rows` rows (the cursor may still be descending,
+        // possibly outside the scroll region) and the last `2 * grid_rows` can
+        // remain visible. So a hostile `height=4096` costs about
+        // 3*grid_rows*cols extras inserts instead of rows*cols, with identical
+        // final grid, cursor, scroll count and scrollback; the line feeds still
+        // run per row.
         let grid_rows = self.grid.rows();
         let skip_end = rows.saturating_sub(grid_rows.saturating_mul(2));
 
@@ -426,9 +449,8 @@ impl TerminalHandler<'_> {
             if cell_row < grid_rows || cell_row >= skip_end {
                 self.stamp_image_row(image, row, cell_row, start_col, cols, kitty);
             }
-            // Advance to the next image row (scrolling at the bottom), except after
-            // the last row — leave the cursor on the final image row's start so the
-            // next write continues right after, matching text flow.
+            // Line-feed to the next image row except after the last, leaving the
+            // cursor on the final row's start as text flow would.
             if cell_row + 1 < rows {
                 self.grid.line_feed();
                 self.grid.set_cursor(self.grid.cursor_row(), start_col);
@@ -439,17 +461,125 @@ impl TerminalHandler<'_> {
             // Kitty: continue right after the image, on its last row.
             self.grid.set_cursor(self.grid.cursor_row(), end_col);
         } else {
-            // After the image, move to a fresh line at column 0 so subsequent
-            // text does not overprint the last image row (and a Kitty image
-            // that reaches the right margin wraps there, as kitty does).
+            // After the image move to a fresh line at column 0 so later text does
+            // not overprint it (a Kitty image reaching the right margin wraps
+            // there, as in kitty).
             self.grid.line_feed();
             self.grid.set_cursor(self.grid.cursor_row(), 0);
         }
     }
 
+    /// Make room on the live screen for `image`, about to be stamped there
+    /// (as Kitty placement `kitty`, if one), so the screen's images stay
+    /// within [`MAX_LIVE_IMAGE_BYTES`] — every stamp of every protocol comes
+    /// through here.
+    ///
+    /// The active screen's `live_image_charge` is an upper bound on their
+    /// bytes: that screen's last count, plus every image stamped on it since,
+    /// plus every image the Kitty store has let go since (an image overwritten
+    /// or scrolled off stays charged until the next count). Only when the bound
+    /// passes the budget are the images counted, and then trimmed
+    /// ([`trim_live_images`](Self::trim_live_images)), so the count runs once
+    /// per half-budget of bytes charged to that screen. Each screen keeps its
+    /// own bound, as a count sees only the active grid. An image the Kitty
+    /// store holds is bounded by that store's budget and is charged nothing
+    /// until the store lets it go, when it is charged to both screens, as
+    /// either grid may still show it. Its stamp still checks the bound: a
+    /// screen whose stamps are all stored images is counted only then.
+    pub(super) fn admit_live_image(
+        &mut self,
+        image: &Arc<ImageData>,
+        kitty: Option<KittyPlacementTag>,
+    ) {
+        let add = if kitty.is_some_and(|tag| self.kitty_store_holds(tag.image_id, image)) {
+            0
+        } else {
+            image.payload_bytes()
+        };
+        let screen = usize::from(self.modes.alternate_screen);
+        let charge = self.transient.live_image_charge[screen].saturating_add(add);
+        self.transient.live_image_charge[screen] = if charge > MAX_LIVE_IMAGE_BYTES {
+            self.trim_live_images(image).saturating_add(add)
+        } else {
+            charge
+        };
+    }
+
+    /// Count the payload bytes of the images the live screen shows (each
+    /// once, the Kitty store's excepted) and, past [`LIVE_IMAGE_TRIM_BYTES`],
+    /// take whole images off the screen — the one that first shows topmost,
+    /// then leftmost, first: output placed it there earliest. `keep` (the image
+    /// being placed) stays. Returns the bytes left.
+    fn trim_live_images(&mut self, keep: &Arc<ImageData>) -> usize {
+        let stored = self.kitty_store_images();
+        let grid: &aterm_grid::Grid = self.grid;
+        let (rows, cols) = (grid.rows(), grid.cols());
+        // Each image once: the first layer showing it, row-major, and its bytes.
+        let mut index: HashMap<*const ImageData, usize> = HashMap::new();
+        let mut shown: Vec<((u16, u16, usize), *const ImageData, usize)> = Vec::new();
+        for (at, extra) in grid.extras().iter() {
+            if at.row >= rows || at.col >= cols {
+                continue;
+            }
+            for (depth, layer) in extra.images().iter().enumerate() {
+                let image = Arc::as_ptr(&layer.image);
+                if stored.contains(&image) {
+                    continue;
+                }
+                let first = (at.row, at.col, depth);
+                match index.get(&image) {
+                    Some(&i) => shown[i].0 = shown[i].0.min(first),
+                    None => {
+                        index.insert(image, shown.len());
+                        shown.push((first, image, layer.image.payload_bytes()));
+                    }
+                }
+            }
+        }
+        let mut total = shown
+            .iter()
+            .fold(0usize, |sum, &(_, _, bytes)| sum.saturating_add(bytes));
+        if total <= LIVE_IMAGE_TRIM_BYTES {
+            return total;
+        }
+        shown.sort_unstable_by_key(|&(first, ..)| first);
+        let keep = Arc::as_ptr(keep);
+        let mut gone: HashSet<*const ImageData> = HashSet::new();
+        for &(_, image, bytes) in &shown {
+            if total <= LIVE_IMAGE_TRIM_BYTES {
+                break;
+            }
+            if image != keep {
+                gone.insert(image);
+                total = total.saturating_sub(bytes);
+            }
+        }
+        let cells: Vec<(u16, u16)> = grid
+            .extras()
+            .iter()
+            .filter(|(at, extra)| {
+                at.row < rows
+                    && at.col < cols
+                    && extra
+                        .images()
+                        .iter()
+                        .any(|layer| gone.contains(&Arc::as_ptr(&layer.image)))
+            })
+            .map(|(at, _)| (at.row, at.col))
+            .collect();
+        for (row, col) in cells {
+            self.grid
+                .cell_extra_mut(row, col)
+                .retain_images(|layer| !gone.contains(&Arc::as_ptr(&layer.image)));
+            self.grid.damage_mut().mark_cell(row, col);
+        }
+        total
+    }
+
     /// Stamp footprint row `cell_row` of `image` onto grid row `row`, columns
     /// `start_col..start_col + cols` (clipped at the right edge), damaging each
-    /// stamped cell.
+    /// stamped cell. A Kitty placement (`kitty` given) stacks over the images a
+    /// cell already shows; any other image replaces them.
     fn stamp_image_row(
         &mut self,
         image: &Arc<ImageData>,
@@ -464,48 +594,43 @@ impl TerminalHandler<'_> {
             if col >= self.grid.cols() {
                 break;
             }
-            // `set_cell_image`, not `cell_extra_mut(..).set_image(..)`: the
-            // grid-level setter also arms the extras collection's scroll-off
-            // image gate, and a picture the gate never heard about is one that
-            // cannot be carried into history when its row scrolls off the top.
-            self.grid.set_cell_image(
-                row,
-                col,
-                ImageRef {
-                    image: Arc::clone(image),
-                    cell_row,
-                    cell_col,
-                    kitty,
-                },
-            );
+            // Use the grid-level setters, not `cell_extra_mut(..)`: they also arm
+            // the extras' scroll-off image gate, without which the picture is not
+            // carried into history when its row scrolls off.
+            let layer = ImageRef {
+                image: Arc::clone(image),
+                cell_row,
+                cell_col,
+                kitty,
+            };
+            if kitty.is_some() {
+                self.grid.stack_cell_image(row, col, layer);
+            } else {
+                self.grid.set_cell_image(row, col, layer);
+            }
             self.grid.damage_mut().mark_cell(row, col);
         }
     }
 
-    /// Place a decoded sixel raster as an inline image, reusing the OSC 1337
-    /// placement/blit path.
+    /// Place a decoded sixel raster as an inline image via the OSC 1337
+    /// placement path: the RGBA pixels from `aterm-sixel` are wrapped in an
+    /// [`ImageData`] tagged [`ImageFormat::RawRgba8`] and passed to
+    /// [`place_image`], with the footprint computed from the same cell metric.
     ///
-    /// The sixel decoder (`aterm-sixel`) has already materialized RGBA pixels —
-    /// the engine carries no codec — so we wrap them in an [`ImageData`] tagged
-    /// [`ImageFormat::RawRgba8`] and hand it to the same [`place_image`] the
-    /// iTerm2 path uses. The footprint is computed from the iTerm2 cell metric
-    /// exactly as `handle_osc_1337_file` does.
-    ///
-    /// Cursor behavior follows the sixel mode (DEC private mode 80, DECSDM):
-    /// - **scrolling mode** (DECSDM reset, the default): `place_image` line-feeds
-    ///   per footprint row and leaves the cursor on the line BELOW the image.
-    /// - **display mode** (DECSDM set): the image is painted at the cursor and
-    ///   the cursor is RESTORED to where it was, so it does not move.
+    /// Cursor behavior follows DECSDM (DEC private mode 80):
+    /// - scrolling mode (reset, default): `place_image` line-feeds per row and
+    ///   leaves the cursor on the line below the image;
+    /// - display mode (set): the image is painted at the cursor and the cursor
+    ///   is restored.
     #[cfg(feature = "sixel")]
     pub(super) fn place_sixel_image(&mut self, image: &crate::sixel::SixelImage) {
         let (cell_w, cell_h) = self.iterm2.cell_px;
         let (cell_w, cell_h) = (cell_w.max(1), cell_h.max(1));
         let grid_cols = self.grid.cols();
 
-        // Footprint in cells: the image rounds its pixel raster UP to whole
-        // cells (`cols_spanned`/`rows_spanned`); clamp to the grid width and the
-        // per-image cell cap. The spans are bounded by SIXEL_MAX_DIMENSION / 1,
-        // so the `u32` conversion never truncates.
+        // Footprint: the raster rounded up to whole cells, clamped to the grid
+        // width and the per-image cell cap. Spans are bounded by
+        // SIXEL_MAX_DIMENSION, so the `u32` conversion never truncates.
         let cols = clamp_cells(clamp_u32(image.cols_spanned(cell_w)))
             .max(1)
             .min(grid_cols);
@@ -519,14 +644,11 @@ impl TerminalHandler<'_> {
         let raw_w = u16::try_from(image.width()).unwrap_or(u16::MAX);
         let raw_h = u16::try_from(image.height()).unwrap_or(u16::MAX);
 
-        // Bound the realized RGBA allocation by the same per-image cap the OSC
-        // 1337 path enforces at decode (`MAX_IMAGE_BYTES`). A DECGRA-only sixel
-        // (`"Pan;Pad;Ph;Pv` with no trailing `$`/`-`/data byte) defers
-        // `apply_raster` until `unhook`, so the width*height buffer is composed
-        // AFTER the DCS stream/pixel-budget accounting in `dcs_put_inner` —
-        // bypassing both the 10MB DCS budget and the 16MB image cap. Recompute
-        // the byte count in u64 (4096*4096*4 overflows the u32 arithmetic
-        // assumed elsewhere) and reject the image rather than allocating it.
+        // Bound the RGBA allocation by the OSC 1337 per-image cap
+        // (`MAX_IMAGE_BYTES`). A DECGRA-only sixel defers `apply_raster` to
+        // `unhook`, after the DCS budget accounting in `dcs_put_inner`, so the
+        // width*height buffer is checked here, in u64 (4096*4096*4 overflows
+        // u32), and rejected rather than allocated.
         let image_bytes = (image.width() as u64)
             .saturating_mul(image.height() as u64)
             .saturating_mul(4);
@@ -538,8 +660,7 @@ impl TerminalHandler<'_> {
         // layout `resample_rgba`/`blit_image_cell` consume.
         let mut bytes: Vec<u8> = Vec::with_capacity(image.pixels().len() * 4);
         for &px in image.pixels() {
-            let bytes_le = px.to_be_bytes(); // [a, r, g, b]
-            let (a, r, g, b) = (bytes_le[0], bytes_le[1], bytes_le[2], bytes_le[3]);
+            let [a, r, g, b] = px.to_be_bytes();
             bytes.extend_from_slice(&[r, g, b, a]);
         }
 
@@ -553,34 +674,24 @@ impl TerminalHandler<'_> {
             rows,
             z_index: 0,
             band_lift_px: 0,
-            // SIXEL NAMES PIXELS, so the raster is drawn 1:1 from the top-left
-            // of the footprint — not scaled out to fill it. The footprint above
-            // is DERIVED from the raster by rounding UP to whole cells, so
-            // filling it back in would magnify the picture by up to one cell on
-            // the binding axis (a 4x6 sprite in a 9x17 cell: 2.25x) and blur it
-            // through an interpolating resample. The rounded-up remainder is
-            // simply left unpainted, as on every other sixel terminal.
+            cell_offset_px: (0, 0),
+            // Sixel names pixels: the raster is drawn 1:1 from the footprint's
+            // top-left, not scaled to fill it (the footprint is the raster rounded
+            // up to whole cells, and filling would magnify and blur it). The
+            // remainder stays unpainted, as on other sixel terminals.
             scaling: ImageScaling::PixelExact,
             source_rect: None,
         });
 
-        // Sixel anchors at the CURRENT cursor column (VT340/xterm), NOT at the
-        // left margin like iTerm2's OSC 1337 path: a sixel emitted mid-line paints
-        // starting at the cursor and does not overprint the cells to its left.
+        // Sixel anchors at the current cursor column (VT340/xterm), not the left
+        // margin, so a mid-line sixel does not overprint cells to its left.
         let anchor_col = self.grid.cursor_col();
 
+        let save_row = self.grid.cursor_row();
+        self.place_image(&image_data, cols, rows, anchor_col);
         if self.modes.sixel_display_mode {
-            // Display mode (DECSDM set): paint at the cursor, then restore it so
-            // the cursor does not move. `place_image` mutates the cursor as it
-            // stamps + line-feeds, so save and restore around it.
-            let save_row = self.grid.cursor_row();
-            let save_col = self.grid.cursor_col();
-            self.place_image(&image_data, cols, rows, anchor_col);
-            self.grid.set_cursor(save_row, save_col);
-        } else {
-            // Scrolling mode (DECSDM reset, default): cursor advances below the
-            // image, matching text flow.
-            self.place_image(&image_data, cols, rows, anchor_col);
+            // Display mode (DECSDM set): restore the cursor `place_image` moved.
+            self.grid.set_cursor(save_row, anchor_col);
         }
     }
 }
@@ -589,7 +700,7 @@ impl TerminalHandler<'_> {
 /// ignored; a missing/duplicate key takes the last value. Never errors.
 fn parse_file_args(args: &[u8]) -> FileArgs {
     let mut out = FileArgs {
-        // preserveAspectRatio defaults ON per the iTerm2 spec.
+        // preserveAspectRatio defaults on per the iTerm2 spec.
         preserve_aspect_ratio: true,
         ..FileArgs::default()
     };
@@ -607,7 +718,7 @@ fn parse_file_args(args: &[u8]) -> FileArgs {
         } else if key.eq_ignore_ascii_case("inline") {
             out.inline = value == "1";
         } else if key.eq_ignore_ascii_case("preserveAspectRatio") {
-            // Default ON; only an explicit "0" disables it.
+            // Default on; only an explicit "0" disables it.
             out.preserve_aspect_ratio = value != "0";
         }
         // name=, size= and any other key are accepted but unused for placement.
@@ -633,9 +744,8 @@ fn detect_format(bytes: &[u8]) -> ImageFormat {
     }
 }
 
-/// Read a PNG's pixel dimensions straight from the IHDR chunk without decoding
-/// pixels (the engine has no codec). Returns `None` for a non-PNG or a truncated
-/// header. IHDR width/height are the two big-endian u32s at byte offset 16.
+/// A PNG's pixel dimensions from the IHDR chunk (the big-endian u32s at byte
+/// offset 16), without decoding. `None` for a non-PNG or truncated header.
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     // 8-byte signature + 4-byte length + "IHDR" (4) → width@16, height@20.
     if bytes.len() < 24 || !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {

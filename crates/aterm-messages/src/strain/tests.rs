@@ -354,7 +354,7 @@ fn a_lone_hitch_never_leaves_calm() {
     s.run(6000, &World::calm(), Some((EVERY, FAST)));
     assert_eq!(s.t.state_word(), "calm");
     assert!(s.outs.is_empty());
-    // ONE stall is one hitch however it is seen (review 2026-09-24): a 900
+    // ONE stall is one hitch however it is seen: a 900
     // ms freeze with a key typed into it — the key's arrival-to-present
     // slice waited out that same turn — and two keys typed into one 600 ms
     // stall, freeze and all, never leave calm.
@@ -802,7 +802,7 @@ fn only_escalation_breaks_quiet() {
     );
 }
 
-/// Review round 12 (ruling 247): a memory row claims only what was read.
+/// Ruling 247: a memory row claims only what was read.
 /// An episode entered on Critical pressure alone — no swap, no used figure
 /// (`Reading::mem_used_mib` is `None`) — never says `memory full ·
 /// swapping`; with a used figure it says that; swapping says swapping.
@@ -1453,7 +1453,7 @@ fn exits_never_hand_the_services_the_culprits_time() {
     );
 }
 
-/// Review 2026-09-24: a build's compilers start and exit every sweep. The
+/// A build's compilers start and exit every sweep. The
 /// exits' time is credited, at their last rate, to the group they belonged
 /// to — never thrown away with the whole sweep (the build was never named:
 /// `Typing slowed by CPU load`), never handed to the services. A steady
@@ -1492,7 +1492,7 @@ fn churning_children_still_name_their_session() {
     }
 }
 
-/// Review 2026-09-24: a leader whose share hovers at the NAMED line (1 core
+/// A leader whose share hovers at the NAMED line (1 core
 /// and 40 % of the busy time) never flips the title between the culprit and
 /// the resource scan by scan: while a row shows, NAMED changes like a
 /// culprit does — after two scans that agree.
@@ -1520,7 +1520,7 @@ fn the_named_flag_changes_only_after_two_scans() {
     assert_eq!(l.now, Some((c, false)));
 }
 
-/// Review 2026-09-24: a Suspect always outlives [`STRAIN_RECORD_AFTER`]
+/// A Suspect always outlives [`STRAIN_RECORD_AFTER`]
 /// before it ends, so the record's line is how long typing was FELT slow: a
 /// blip felt for under five seconds writes nothing (and spends none of the
 /// cap); one felt longer writes its record.
@@ -1547,7 +1547,7 @@ fn a_suspect_felt_under_five_seconds_writes_no_record() {
     assert!(!recs[0].title.contains("for 0 s"), "{}", recs[0].title);
 }
 
-/// Review 2026-09-24: memory stays heavy while pressure sits at Warn (it
+/// Memory stays heavy while pressure sits at Warn (it
 /// clears only at Normal) after the swapping stops; a CPU kind that is
 /// pegged and RISING still opens the row, and the row does not turn into
 /// `low memory` a reading later.
@@ -1574,7 +1574,7 @@ fn a_heavy_kind_no_longer_rising_never_blocks_a_rising_one() {
     }
 }
 
-/// Review 2026-09-24: two panes of one tab both at a `zsh` prompt, `yes`
+/// Two panes of one tab both at a `zsh` prompt, `yes`
 /// under pane B. The session is named from pane B's OWN shell — never by
 /// looking a session up again by its words, which could find pane A and
 /// walk past B's `zsh` to blame the idle shell.
@@ -1623,7 +1623,7 @@ fn split_panes_name_the_pane_that_is_heavy() {
     assert_eq!(g[0].cpu_ns, 991);
 }
 
-/// Review 2026-09-24: the window loses focus with the row open; the host
+/// The window loses focus with the row open; the host
 /// takes no readings (the idle law) and the row fades. When a reading comes
 /// an hour later, the episode ends where sampling STOPPED: its record never
 /// counts the hour away as time on the glass, and the quiet period starts
@@ -1670,7 +1670,7 @@ fn a_gap_folds_where_sampling_stopped() {
     }
 }
 
-/// Review 2026-09-24: an episode that ends as a Suspect after the window
+/// An episode that ends as a Suspect after the window
 /// lost focus counts its felt span to its last reading, never the time away.
 #[test]
 fn a_suspect_gap_ends_at_the_last_reading() {
@@ -1699,4 +1699,35 @@ fn a_suspect_gap_ends_at_the_last_reading() {
         rec.detail
     );
     assert_eq!(s.t.state_word(), "calm");
+}
+
+/// `begin` takes every per-episode figure fresh
+/// from the FEEL_WINDOW at its start, and `felt_no_heavy` promises "the turn
+/// that held the loop longest" of what the person felt THEN: a lone freeze
+/// noted while calm, forty minutes before the episode, is no part of its
+/// record.
+#[test]
+fn a_calm_freeze_never_leaks_into_a_later_episodes_record() {
+    let mut s = Sim::new();
+    let w = World::calm();
+    s.run(2000, &w, Some((EVERY, FAST)));
+    s.t.note_freeze(s.at(2000), 900, "old");
+    assert_eq!(s.t.state_word(), "calm", "one hitch is no episode");
+    let later = 2000 + 40 * 60 * 1000;
+    s.run(later, &w, None);
+    assert_eq!(s.t.state_word(), "calm");
+    s.run(later + 8000, &w, Some((EVERY, SLOW)));
+    s.run(later + 38_000, &w, Some((EVERY, FAST)));
+    assert_eq!(s.t.state_word(), "calm");
+    let recs = s.records();
+    assert_eq!(recs.len(), 1, "{:?}", s.outs);
+    let r = &recs[0];
+    assert!(r.title.starts_with("Typing slow for "), "{}", r.title);
+    assert!(
+        !r.detail
+            .iter()
+            .any(|l| l.starts_with("longest pause in aterm")),
+        "no pause held the loop in this episode: {:?}",
+        r.detail
+    );
 }

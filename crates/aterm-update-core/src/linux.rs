@@ -34,11 +34,7 @@ impl BinaryIdentity {
             || self.build_number == 0
             || self.version != manifest.version
             || self.build_number != manifest.build_number
-            || self.commit.len() != 40
-            || !self
-                .commit
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !aterm_codec::hex::is_lower(&self.commit, 40)
             || manifest.commit.as_deref() != Some(self.commit.as_str())
             || self.target != target.triple()
         {
@@ -162,11 +158,7 @@ pub(crate) fn artifact<'a>(
             target.asset_name(version)
         ));
     }
-    if sha256.len() != 64
-        || !sha256
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if !aterm_codec::hex::is_lower(sha256, 64) {
         return Err(format!(
             "Linux {} sha256 is not lowercase SHA-256",
             target.arch()

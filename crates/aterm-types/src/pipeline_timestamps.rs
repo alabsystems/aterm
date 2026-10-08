@@ -2,21 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Per-frame pipeline timing for keystroke-to-pixel decomposition (#5560).
+//! Per-frame pipeline timing for keystroke-to-pixel decomposition.
 //!
 //! Stores durations measured at stage boundaries in the Rust processing
-//! pipeline. Swift correlates these with its own absolute timestamps
-//! (NSEvent → presentedTime) to produce full end-to-end latency breakdown.
+//! pipeline.
 
 /// Per-frame Rust-side pipeline timing in nanoseconds.
 ///
 /// Durations are measured per `process()` call via `Instant::now()` deltas.
-/// The render snapshot captures its own timing. Swift correlates both with
-/// its endpoint timestamps to produce full keystroke-to-pixel decomposition.
 ///
 /// All durations are nanoseconds. `process_sequence` increments on each
-/// `process()` call so Swift can detect stale timestamps (render without
-/// new input).
+/// `process()` call; the renderers (aterm-effects, aterm-gui) compare it to
+/// detect a frame with no new input.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineTimestamps {
@@ -26,33 +23,16 @@ pub struct PipelineTimestamps {
     pub grid_duration_ns: u64,
     /// Total `process()` duration including routing overhead (ns).
     pub process_total_ns: u64,
-    /// Duration of `copy_visible_cells_inner()` in render snapshot (ns).
-    pub snapshot_copy_ns: u64,
-    /// Duration of `get_damage_inner()` in render snapshot (ns).
-    pub snapshot_damage_ns: u64,
-    /// Total render snapshot duration under read lock (ns).
-    pub snapshot_total_ns: u64,
     /// Bytes processed in the last `process()` call.
     pub last_process_bytes: u32,
-    /// Sequence counter — incremented on each `process()` call so Swift
-    /// can detect whether timestamps are stale (render without new input).
+    /// Sequence counter — incremented on each `process()` call so a renderer
+    /// can detect a frame with no new input.
     pub process_sequence: u32,
-    /// When false, `process()` skips per-stage `Instant::now()` calls
-    /// (6 syscalls per invocation) to maximize throughput. Part of Wave 1
-    /// throughput optimization.
+    /// When false, `process()` skips its six per-stage `Instant::now()` calls.
     ///
-    /// TRUE ONLY IN A DEBUG BUILD. This used to be
-    /// `cfg!(debug_assertions) || std::env::var("ATERM_PROFILING").is_ok()`,
-    /// which let an ambient variable move a RELEASE binary onto the second,
-    /// hand-maintained copy of the hot `process()` loop
-    /// (`aterm-core/src/terminal/processing.rs` — ~45 duplicated lines of
-    /// parser-reset / `post_process` / `observe_at` that differ from the else
-    /// arm only by six `Instant::now()` calls). A shipped build could take a
-    /// code path no release test covers, and the fields it fills
-    /// (`parse_duration_ns`, `grid_duration_ns`, `process_total_ns`) are
-    /// written at processing.rs and read NOWHERE in the workspace: no `ctl`
-    /// verb, no FFI reader, no bench. The env arm is gone; a debug build still
-    /// populates the decomposition for anyone wiring up a consumer.
+    /// TRUE ONLY IN A DEBUG BUILD, never from the environment: the profiled
+    /// arm is a second copy of the hot `process()` loop
+    /// (`aterm-core/src/terminal/processing.rs`) that no release test covers.
     pub profiling_enabled: bool,
 }
 
@@ -67,9 +47,6 @@ impl Default for PipelineTimestamps {
             parse_duration_ns: 0,
             grid_duration_ns: 0,
             process_total_ns: 0,
-            snapshot_copy_ns: 0,
-            snapshot_damage_ns: 0,
-            snapshot_total_ns: 0,
             last_process_bytes: 0,
             process_sequence: 0,
             profiling_enabled: cfg!(debug_assertions),

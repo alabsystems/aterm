@@ -1,32 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive ledger --format html`: ONE self-contained page — the summary
-//! on top, then three swimlanes (manager, watcher, worker) and the fabric's
+//! `aterm drive ledger --format html`: one self-contained page with the
+//! summary on top, three swimlanes (manager, watcher, worker) and the fabric's
 //! mail on a time axis, then every row as a table.
 //!
-//! No network: the style and the script are inline, there is no image and no
-//! font to fetch, and a `Content-Security-Policy` meta says `default-src
-//! 'none'` so a URL that appears in a worker's own words cannot become a
-//! request. Every string from the worker, the journal or the bus is escaped —
-//! into the HTML as text ([`html_text`]) and into the one embedded JSON
-//! document with `<`, `>` and `&` as `\u` escapes ([`html_json_str`]), so
-//! neither a `</script>` in a transcript nor a quote in a command can close a
-//! tag.
+//! No network: style and script are inline, and a `Content-Security-Policy`
+//! of `default-src 'none'` keeps a URL in a worker's words from becoming a
+//! request. Every string from the worker, journal or bus is escaped, into the
+//! HTML as text ([`html_text`]) and into the embedded JSON with `<`, `>` and
+//! `&` as `\u` escapes ([`html_json_str`]), so nothing can close a tag.
 //!
-//! The marks: a turn is a BAR in the worker lane, from when the `turn` verb
-//! started to where it settled, with a lighter bar on to the EVENT that ended
-//! the worker's reply (the journal's, when there is one); the manager's turns,
-//! the watcher's lines and the mail are marks on their own lanes, one shape
-//! per lane and one hue per lane, with a status colour for what went wrong (a
-//! limit notice, an EXIT, a reconnect). Hovering any of them shows the whole
-//! line, which the table below carries too — the chart is never the only way
-//! to read a row.
-//!
-//! The palette is the validated categorical default (blue, orange, aqua,
-//! violet) with the fixed status pair, stepped for each surface and declared
-//! under both the media query and the theme attribute, so the page reads in
-//! light and dark alike.
+//! A turn is a bar in the worker lane from when `turn` started to where it
+//! settled, with a lighter bar on to the EVENT that ended the reply; the other
+//! lanes carry marks, one shape and hue per lane, with a status colour for
+//! what went wrong. Hovering shows the whole line, which the table also
+//! carries. The palette is declared under both the media query and the theme
+//! attribute, so the page reads in light and dark.
 
 use std::fmt::Write as _;
 

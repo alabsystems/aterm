@@ -2,25 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Width-reflow bottom-anchoring (fixwave5): the belt lift and the deficit fill.
+//! Width-reflow bottom-anchoring: the belt lift and the deficit fill.
 //!
-//! A width change rewraps the viewport and the off-screen history SEPARATELY
-//! (`reflow` / `scrollback_reflow`), which leaves two seams the feel audit
-//! caught as permanent wrap-topology corruption after a rapid width sweep:
+//! A width change rewraps the viewport and the off-screen history separately
+//! (`reflow` / `scrollback_reflow`), which leaves two seams:
 //!
-//! * a logical line whose soft-wrapped tail sat at the TOP of the viewport
-//!   (head in history) re-split at the seam on every resize and never
-//!   rejoined — [`Grid::take_boundary_continuation_lines`] lifts that tail
-//!   into the history rewrap so the line rewraps as one unit;
-//! * a width-GROW unwraps content into fewer rows and used to pad the bottom
-//!   of the viewport with blanks, stranding the prompt mid-window while the
-//!   content above it stayed in history — [`Grid::fill_viewport_deficit_from_history`]
-//!   pulls the newest history back in until the trailing-blank band returns
-//!   to its pre-resize count, bottom-anchoring the viewport.
+//! * a logical line whose soft-wrapped tail sits at the top of the viewport
+//!   (head in history) would re-split there on every resize;
+//!   [`Grid::take_boundary_continuation_lines`] lifts that tail into the
+//!   history rewrap so the line rewraps as one unit;
+//! * a width grow unwraps content into fewer rows, which would pad the bottom
+//!   of the viewport with blanks; [`Grid::fill_viewport_deficit_from_history`]
+//!   pulls the newest history back in until the trailing-blank band returns to
+//!   its pre-resize count.
 //!
-//! Both run inside the synchronous width-reflow resize; the offloaded path
-//! (history detached for an off-thread rewrap) runs the fill at re-attach
-//! instead, against the `pending_fill_target` captured at detach.
+//! Both run inside the synchronous width-reflow resize; the offloaded path runs
+//! the fill at re-attach against the `pending_fill_target` captured at detach.
 
 use aterm_scrollback::Line;
 
@@ -29,14 +26,12 @@ use super::{Grid, LineSize};
 use crate::Damage;
 
 impl Grid {
-    /// Count the trailing viewport rows STRICTLY below the cursor that are
-    /// blank (empty, not a wrap continuation) — the band a width-grow reflow
-    /// pads. Counted from the bottom up to the first non-blank row.
+    /// Count the trailing blank viewport rows (empty, not a wrap continuation)
+    /// strictly below the cursor, from the bottom up to the first non-blank row.
     ///
-    /// Reads CONTENT rows via `row_at_screen`, never the `display_offset`-mapped
-    /// `row()`: the offloaded detach captures this target BEFORE `resize()`
-    /// zeroes the offset, and the cursor lives in the content frame — a
-    /// scrolled-back reader must not shift which rows the count sees.
+    /// Reads content rows via `row_at_screen`, not the `display_offset`-mapped
+    /// `row()`: the offloaded detach captures this before `resize()` zeroes the
+    /// offset.
     pub(super) fn trailing_blank_rows_below_cursor(&self) -> usize {
         let visible = usize::from(self.storage.visible_rows).min(self.storage.rows.len());
         let cursor_row = usize::from(self.storage.cursor.row);
@@ -53,30 +48,23 @@ impl Grid {
         blanks
     }
 
-    /// Lift the viewport's LEADING soft-wrap continuation rows — the tail of a
-    /// logical line whose head is the newest history line — out of the ring as
-    /// materialized [`Line`]s, so a width-change rewrap can process the whole
-    /// boundary-straddling logical line in ONE pass (the history rewrap).
+    /// Lift the viewport's leading soft-wrap continuation rows (the tail of a
+    /// logical line whose head is the newest history line) out of the ring as
+    /// [`Line`]s, so the history rewrap processes the whole line in one pass.
     ///
     /// The belt is the maximal prefix of visible rows that are wrapped
-    /// single-width continuations, capped strictly below the cursor row (the
-    /// cursor must stay in the viewport). Extras ride along inside the
-    /// produced `Line`s exactly as ring-scrollback extraction does. The
-    /// cursor, saved cursor and live extras are shifted up by the lifted count.
-    ///
-    /// Callers run this immediately after the ring scrollback has been taken
-    /// (`take_scrollback_lines` / `take_ring_scrollback_lines`), appending the
-    /// result to the taken history so the belt joins its head for the rewrap.
+    /// single-width continuations, strictly above the cursor row. Extras ride in
+    /// the produced `Line`s; cursor, saved cursor and live extras shift up by
+    /// the lifted count. Callers append the result to the ring scrollback they
+    /// just took (`take_scrollback_lines` / `take_ring_scrollback_lines`).
     // COST: O(belt rows × cols) — bounded by the viewport height.
     pub(super) fn take_boundary_continuation_lines(&mut self) -> Vec<Line> {
         let visible = usize::from(self.storage.visible_rows).min(self.storage.rows.len());
         let cursor_row = usize::from(self.storage.cursor.row);
         let mut belt = 0usize;
-        // Detect the belt in CONTENT coordinates (`row_at_screen`), matching the
-        // physical extraction below. The offloaded detach runs this BEFORE
-        // `resize()` zeroes `display_offset`; the offset-mapped `row()` would
-        // probe the SCROLLED view here and then extract different rows at
-        // `hist + i` — shredding a scrolled-back reader's viewport.
+        // Detect the belt in content coordinates (`row_at_screen`), matching
+        // the extraction below; the offloaded detach runs before `resize()`
+        // zeroes `display_offset`.
         while belt < visible.min(cursor_row) {
             match self.storage.row_at_screen(row_u16(belt)) {
                 Some(r) if r.is_wrapped() && r.line_size() == LineSize::SingleWidth => belt += 1,
@@ -108,22 +96,16 @@ impl Grid {
                 self.styles(),
             );
             let row = &self.storage.rows[hist + i];
-            // A belt row whose successor (the next belt row, or the first
-            // remaining viewport row for the last) is a wrap continuation was
-            // filled to its last column by autowrap: materialize its trailing
-            // blank cells too, or the sweep erodes a mid-line space at the
-            // boundary (fixwave5). EXCEPT when the continuation opens with a
-            // WIDE cell: a wide char that cannot start at the last column
-            // EARLY-WRAPS, leaving that cell unwritten — materializing it
-            // would inject a phantom space before the wide char.
+            // A belt row whose successor is a wrap continuation was filled to
+            // its last column by autowrap, so its trailing blank cells are
+            // content, except when the continuation opens with a wide cell: that
+            // char early-wrapped and left the last cell unwritten.
             let successor = self.storage.rows.get(hist + i + 1);
             let len = if row.line_size() == LineSize::SingleWidth
                 && successor.is_some_and(super::Row::is_wrapped)
             {
-                // Autowrap filled this row — its trailing blanks are content.
-                // A successor OPENING wide means exactly ONE cell (the early-
-                // wrap hole) was never written; real trimmed spaces before it
-                // still materialize.
+                // A successor opening wide leaves exactly one unwritten cell;
+                // real trimmed spaces before it still materialize.
                 let hole = successor
                     .and_then(|r| r.as_slice().first())
                     .is_some_and(super::Cell::is_wide);
@@ -157,18 +139,15 @@ impl Grid {
         lines
     }
 
-    /// Pull the newest history lines back into the TOP of the viewport until
-    /// the trailing-blank band below the cursor shrinks to `target_blanks`
-    /// (its pre-resize count) — the bottom-anchor step of a width-grow reflow,
-    /// and the step that rejoins the boundary line the belt lift handed to the
-    /// history rewrap. Content (the cursor's row included) moves DOWN by the
-    /// pulled count; the pulled physical lines are already wrapped at the
-    /// current width, so this is a pure re-seating, never a re-split.
+    /// Pull the newest history lines back into the top of the viewport until the
+    /// trailing-blank band below the cursor shrinks to `target_blanks` (its
+    /// pre-resize count). This bottom-anchors a width grow and rejoins the line
+    /// the belt lift handed to the history rewrap. Content moves down by the
+    /// pulled count; pulled lines are already wrapped at the current width.
     ///
-    /// No-ops (returns 0) when the reader is scrolled back, when a TUI has a
-    /// partial scroll region, or when there is nothing to pull. Genuine blank
-    /// rows (post-`clear` screens) are protected by `target_blanks`: only the
-    /// blanks a reflow CREATED are filled.
+    /// Returns 0 without effect when scrolled back, under a partial scroll
+    /// region, or with nothing to pull. Only blanks the reflow created are
+    /// filled; `target_blanks` protects genuine blank rows.
     // COST: O(pull × cols) — bounded by the viewport height.
     pub(crate) fn fill_viewport_deficit_from_history(&mut self, target_blanks: usize) -> usize {
         if self.storage.display_offset != 0 {
@@ -190,9 +169,9 @@ impl Grid {
         if deficit == 0 {
             return 0;
         }
-        // Pull only from tiers whose newest lines we can also REMOVE without
-        // reordering: the ring (newest), then the tiered store — but the store
-        // only when no lazy-staged lines sit between them in age order.
+        // Pull only from tiers whose newest lines can be removed without
+        // reordering: the ring, then the tiered store when no lazy-staged lines
+        // sit between them.
         let ring = self.storage.ring_buffer_scrollback();
         let avail = if self.storage.lazy_buffer_lines() > 0 {
             ring
@@ -204,8 +183,8 @@ impl Grid {
             return 0;
         }
 
-        // Read every line BEFORE any destructive step (the #4521 unscroll
-        // pattern): a decode failure aborts the fill instead of half-moving.
+        // Read every line before any destructive step (as unscroll
+        // does): a decode failure aborts the fill instead of half-moving.
         let mut lines: Vec<Line> = Vec::with_capacity(pull);
         for i in (0..pull).rev() {
             match self.try_history_line_rev(i) {
@@ -241,7 +220,7 @@ impl Grid {
             && let Some(scrollback) = self.storage.scrollback.as_mut()
             && let Err(error) = scrollback.remove_newest(from_tiered)
         {
-            // Lines remain duplicated in history rather than lost (#4638 shape).
+            // Lines remain duplicated in history rather than lost.
             aterm_log::warn!("deficit fill: failed to remove {from_tiered} history lines: {error}");
         }
 
@@ -263,9 +242,7 @@ impl Grid {
                 .min(max_row);
         }
 
-        // History lost its newest suffix: every older retained line keeps its
-        // content but its absolute key shifts — the renumbering epoch exists
-        // for exactly this (see `unscroll_from_scrollback`).
+        // History lost its newest suffix, so older lines' absolute keys shift.
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
         self.force_selection_invalidation();
         self.storage.damage = Damage::Full;
@@ -274,20 +251,17 @@ impl Grid {
     }
 
     /// Invalidate the offloaded reflow's deficit-fill debt: a screen-clearing
-    /// erase (ED 0/2, DECSED 0/2) during the detach window makes the blank
-    /// band below the cursor GENUINE — the pre-erase `pending_fill_target`
-    /// no longer describes reflow-created blanks, and honoring it at re-attach
-    /// would resurrect pre-clear history onto the freshly cleared screen.
-    /// No-op outside a detach window (the field is `None` there).
+    /// erase (ED 0/2, DECSED 0/2) during the detach window makes the blank band
+    /// genuine, and filling it would resurrect pre-clear history. No-op outside
+    /// a detach window.
     #[inline]
     pub(super) fn invalidate_pending_fill_target(&mut self) {
         self.storage.pending_fill_target = None;
     }
 
-    /// Drop the `n` NEWEST ring-scrollback rows (the rows directly above the
-    /// viewport) after their content has been re-seated into the viewport by
-    /// the deficit fill or a Kitty CSI + T unscroll. Their `ring_extras` entries
-    /// drop with them.
+    /// Drop the `n` newest ring-scrollback rows (directly above the viewport)
+    /// and their `ring_extras` after the deficit fill or a Kitty CSI + T
+    /// unscroll re-seated them into the viewport.
     pub(super) fn drop_newest_ring_scrollback(&mut self, n: usize) {
         let hist = self.storage.ring_buffer_scrollback();
         let n = n.min(hist);

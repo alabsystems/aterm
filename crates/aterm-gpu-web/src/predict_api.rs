@@ -1,39 +1,32 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! The host-facing predictive-echo API on [`AtermGpuTerminal`] — mosh-style
-//! speculative typing, driven by the shared [`aterm_predict`] state machine
-//! (the SAME predictor the native app runs — no forked heuristics). Mirrors
-//! aterm-wasm's `predict_api` so the GPU and CPU bindings expose ONE contract:
-//! the same shared state machine surfaces the same `[row, col, codepoint]`
-//! overlay triples on both bundles.
+//! The host-facing predictive-echo API on [`AtermGpuTerminal`]: mosh-style
+//! speculative typing driven by the shared [`aterm_predict`] state machine
+//! (the same predictor the native app runs). Mirrors aterm-wasm's
+//! `predict_api`, producing the same `[row, col, codepoint]` overlay triples.
 //!
-//! The host seams (the crate's own contract):
+//! Host seams:
 //! 1. [`predict_char`](AtermGpuTerminal::predict_char) /
 //!    [`predict_backspace`](AtermGpuTerminal::predict_backspace) on the keydown
-//!    whose bytes the host writes to the PTY, and
+//!    whose bytes go to the PTY, and
 //!    [`predict_line_submit`](AtermGpuTerminal::predict_line_submit) on Enter
-//!    (the submit boundary — the password-prompt safety seam),
+//!    (the password-prompt safety boundary),
 //! 2. [`predict_reconcile`](AtermGpuTerminal::predict_reconcile) after `process()`
-//!    applies a chunk of child output to the grid,
+//!    applies child output,
 //! 3. [`predict_overlay`](AtermGpuTerminal::predict_overlay) when composing a
-//!    frame (the tentative ghost cells the host paints), and
-//! 4. [`predict_reset`](AtermGpuTerminal::predict_reset) when only the coordinate
-//!    space changes (`resize` calls it automatically), and
+//!    frame (the ghost cells to paint), and
+//! 4. [`predict_reset`](AtermGpuTerminal::predict_reset) when the coordinate
+//!    space changes (`resize` calls it), and
 //!    [`predict_session_reset`](AtermGpuTerminal::predict_session_reset) when the
-//!    host reuses this wrapper for a different pane/session.
+//!    wrapper is reused for a different pane/session.
 //!
-//! OFF by default: until `set_predictive_echo("adaptive" | "always")` every
-//! entry point is inert and rendering is untouched — the same fail-safe
-//! `PredictMode::parse` domain as the native `predictive_echo` config knob.
+//! Off by default: until `set_predictive_echo("adaptive" | "always")` every
+//! entry point is inert (`PredictMode::parse`, as the native knob).
 //!
-//! Unlike the effects clock (a deterministic host-advanced `advance_effects`
-//! stream), this module samples the REAL monotonic clock (`aterm_time::Instant`:
-//! std on native, `performance.now()` on wasm32). The predictor's glitch-expiry
-//! self-heal is a wall-clock window (an unechoed guess must vanish ~250 ms
-//! after the real keypress) — the same live-clock seam the native event loop
-//! wires. The state machine itself stays pure/clock-injected; deterministic
-//! timing coverage lives in the `aterm-predict` crate tests.
+//! This module samples the real monotonic clock (`aterm_time::Instant`),
+//! because an unechoed guess must expire ~250 ms after the keypress. The state
+//! machine itself is clock-injected; timing tests live in `aterm-predict`.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -44,28 +37,25 @@ use aterm_time::Instant;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl AtermGpuTerminal {
-    /// Set the predictive-echo display mode: `"off"` (the default) |
-    /// `"adaptive"` (show after the current line confirms echo and its measured
-    /// RTT is high enough to benefit) | `"always"` (power users / demos). Case-
-    /// insensitive; unknown strings fail safe to `off` — the native
-    /// `predictive_echo` domain.
+    /// Set the predictive-echo mode: `"off"` (default) | `"adaptive"` (show
+    /// once the current line confirms echo and measured RTT is high enough)
+    /// | `"always"`. Case-insensitive; unknown strings mean `off`.
     pub fn set_predictive_echo(&mut self, mode: &str) {
         let mode = PredictMode::parse(mode);
-        // A real mode change flushes in-flight guesses (set_mode). Flipping to
-        // Off additionally forgets the confirmation epoch so the toggle is
-        // FULLY inert: no armed deadline may outlive a disable (the native
-        // stranded-deadline 100%-CPU lesson).
+        // A real mode change flushes in-flight guesses; switching to Off also
+        // forgets the confirmation epoch so no armed deadline outlives a
+        // disable.
         self.predict.set_mode(mode);
         if mode == PredictMode::Off {
             self.predict.reset();
         }
     }
 
-    /// Register a printable character the host just wrote to the PTY (the
-    /// keydown seam — call beside `encode_key`). The guess anchors at the
-    /// engine's live cursor, extends pending type-ahead, and never crosses the
-    /// right margin. Returns whether a guess is now TRACKED — display is a
-    /// separate gate (see [`predict_overlay`](Self::predict_overlay)).
+    /// Register a printable character just written to the PTY (call beside
+    /// `encode_key`). The guess anchors at the live cursor, extends pending
+    /// type-ahead and never crosses the right margin. Returns whether a guess
+    /// is tracked; display is gated separately (see
+    /// [`predict_overlay`](Self::predict_overlay)).
     pub fn predict_char(&mut self, ch: char) -> bool {
         if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
             self.predict.reset();
@@ -77,9 +67,8 @@ impl AtermGpuTerminal {
             .predict_char(ch, (cur.row, cur.col), cols, Instant::now())
     }
 
-    /// Register a Backspace: cancels our OWN trailing guess only (erasing
-    /// already-committed real content is left to the program's echo). Returns
-    /// whether state changed.
+    /// Register a Backspace: cancels only our own trailing guess (erasing real
+    /// content is left to the program's echo). Returns whether state changed.
     pub fn predict_backspace(&mut self) -> bool {
         if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
             self.predict.reset();
@@ -88,32 +77,27 @@ impl AtermGpuTerminal {
         self.predict.predict_backspace(Instant::now())
     }
 
-    /// Register a plain Enter (the SUBMIT boundary — call when the host writes
-    /// the line terminator to the PTY). Ends the confirmation epoch: the NEXT
-    /// line must re-confirm an echo before `adaptive` displays anything.
-    /// LOAD-BEARING for password safety on a terminal scrolled to the bottom,
-    /// where the cursor REUSES one physical row across logical lines: without
-    /// it, a non-echoing password prompt landing on the same row as a just-
-    /// confirmed command would inherit that confirmation and flash the secret
-    /// (the native `note_line_submit` seam). Cheap no-op when nothing pends.
+    /// Register a plain Enter (call when the line terminator goes to the PTY).
+    /// Ends the confirmation epoch, so the next line must re-confirm echo
+    /// before `adaptive` displays anything. Required for password safety: at
+    /// the bottom of the screen the cursor reuses one row across lines, and a
+    /// non-echoing prompt there must not inherit the last command's
+    /// confirmation. No-op when nothing is pending.
     pub fn predict_line_submit(&mut self) {
         self.predict.note_line_submit();
     }
 
-    /// Reconcile pending guesses against the grid — call after `process()`
-    /// applies a PTY chunk. Confirmed leading guesses retire (arming the
-    /// epoch's display gate), any divergence flushes the set, and a no-echo
-    /// context refuses prediction outright — the alternate screen (vim/less/
-    /// htop) OR an app-owned Kitty composer (REPORT_EVENT_TYPES /
-    /// REPORT_ALL_KEYS_AS_ESC). While scrolled into history only the expiry
-    /// self-heal runs: guesses live in ACTIVE-grid coords, so the scrollback
-    /// view is never reconciled against them (the native discipline).
+    /// Reconcile pending guesses against the grid; call after `process()`.
+    /// Confirmed leading guesses retire (arming display), a divergence flushes
+    /// the set, and a no-echo context refuses prediction: the alternate screen
+    /// or an app-owned Kitty composer (REPORT_EVENT_TYPES /
+    /// REPORT_ALL_KEYS_AS_ESC). While scrolled into history only expiry runs,
+    /// since guesses are in active-grid coords.
     pub fn predict_reconcile(&mut self) {
         let now = Instant::now();
         if self.term.grid().display_offset() != 0 {
-            // Expiry flush only — a guess in flight when the user scrolled up
-            // must still self-heal, or `predict_next_deadline_ms` stays pinned
-            // at a past instant forever.
+            // Expiry only: a guess in flight when the user scrolled up must
+            // still expire, or `predict_next_deadline_ms` stays in the past.
             let _ = self.predict.overlay(now);
             return;
         }
@@ -122,14 +106,10 @@ impl AtermGpuTerminal {
         // Read-only display projection — never a byte producer.
         let no_echo =
             self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo();
-        // `reconcile` probes once per retired guess plus the head, and the
-        // predictor is a same-row model — so the allocating `render_row` would
-        // rebuild the identical row (fresh Vec + full colour/decoration resolve
-        // over every column) N times per call to read N single chars. Memoize
-        // by row into the resident scratch and refill it in place with
-        // `render_row_into`, which IS `render_row`'s one code path (and clears
-        // `out` itself), so observations are unchanged. This is the fix
-        // aterm-gui already carries; the wasm binding never received it.
+        // `reconcile` probes the same row once per retired guess plus the
+        // head; memoize by row into the resident scratch, refilled in place by
+        // `render_row_into` (the same code path as `render_row`), instead of
+        // re-resolving the whole row each time.
         let mut scratch = std::mem::take(&mut self.pred_row_scratch);
         let mut cached: Option<u16> = None;
         let (term, predict) = (&self.term, &mut self.predict);
@@ -148,13 +128,12 @@ impl AtermGpuTerminal {
         self.pred_row_scratch = scratch;
     }
 
-    /// The ghost cells to paint THIS frame, as flat `[row, col, codepoint]`
-    /// triples (a `Uint32Array` in JS). The host renders them tentatively
-    /// (dim/underline) and may advance its DRAWN cursor past the last one,
-    /// mosh-style. Runs the expiry self-heal first, then the display gate:
-    /// `always` ⇒ all pending; `adaptive` ⇒ all pending after an echo is confirmed
-    /// on this line and measured RTT is high enough to help. Empty in app-owned
-    /// Kitty composers and while scrolled into history.
+    /// The ghost cells to paint this frame, as flat `[row, col, codepoint]`
+    /// triples (`Uint32Array`). The host paints them tentatively (dim or
+    /// underlined) and may draw its cursor past the last one. Runs expiry,
+    /// then the display gate: `always` shows all pending; `adaptive` shows them
+    /// once echo is confirmed on this line and RTT is high enough. Empty in
+    /// app-owned Kitty composers and while scrolled into history.
     pub fn predict_overlay(&mut self) -> Vec<u32> {
         if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
             self.predict.reset();
@@ -171,19 +150,18 @@ impl AtermGpuTerminal {
         out
     }
 
-    /// Milliseconds until the oldest pending guess self-expires (the glitch
-    /// flush), or `undefined` when none is pending. Arm ONE timer for this and
-    /// call [`predict_overlay`](Self::predict_overlay) + repaint there, so a
-    /// stale ghost is erased even when no further input or output arrives.
+    /// Milliseconds until the oldest pending guess expires, or `undefined`
+    /// when none is pending. Arm one timer for it and call
+    /// [`predict_overlay`](Self::predict_overlay) + repaint there.
     pub fn predict_next_deadline_ms(&self) -> Option<f64> {
         self.predict
             .next_deadline()
             .map(|d| d.saturating_duration_since(Instant::now()).as_secs_f64() * 1000.0)
     }
 
-    /// Drop all in-flight guesses because this SAME terminal's coordinate space
-    /// changed (`resize` calls this automatically). The confirmation epoch is
-    /// forgotten, while this session's learned link RTT remains useful.
+    /// Drop in-flight guesses because this terminal's coordinate space changed
+    /// (`resize` calls this). Forgets the confirmation epoch, keeps the learned
+    /// link RTT.
     pub fn predict_reset(&mut self) {
         // ICF barrier — see aterm-wasm/src/predict_api.rs: identical-body shims get
         // merged by LLVM and wasm-bindgen then cross-binds the JS methods.
@@ -191,11 +169,9 @@ impl AtermGpuTerminal {
         self.predict.reset();
     }
 
-    /// Reset for a DIFFERENT pane/session. In addition to coordinate-bound
-    /// guesses, forget the learned echo RTT so a slow remote pane cannot make a
-    /// newly selected local pane display speculation. Hosts that keep one
-    /// `AtermGpuTerminal` per session never need this; pane-reusing hosts call it
-    /// at the identity switch.
+    /// Reset for a different pane/session: also forgets the learned echo RTT,
+    /// so a slow remote pane cannot make a local one display speculation.
+    /// Only pane-reusing hosts need this.
     pub fn predict_session_reset(&mut self) {
         // Keep this export distinct from the coordinate-only reset and line-submit
         // shims under wasm LLVM function merging.
@@ -296,9 +272,8 @@ mod tests {
             "two independent slow confirmations display the next prediction"
         );
 
-        // Resize/coordinate reset retains this terminal's link estimate and
-        // stable slow-link classification. A slow confirmation in the new
-        // coordinate epoch therefore makes its next prediction visible.
+        // A coordinate reset keeps the link estimate, so a slow confirmation
+        // in the new epoch makes the next prediction visible.
         t.predict_reset();
         assert!(t.predict_char('x'));
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -351,10 +326,8 @@ mod tests {
 
     #[test]
     fn line_submit_ends_the_epoch_no_same_row_leak() {
-        // The native note_line_submit seam through the export: after Enter, a
-        // non-echoing prompt on the SAME physical row (a terminal scrolled to
-        // the bottom reuses its last row across logical lines) must not
-        // inherit the previous command's confirmation and flash a secret.
+        // After Enter, a non-echoing prompt on the same physical row must not
+        // inherit the previous command's confirmation.
         let Some(mut t) = terminal() else {
             return;
         };
@@ -406,8 +379,8 @@ mod tests {
         t.predict_char('b');
         assert!(t.predict_backspace());
         assert_eq!(t.predict_overlay(), vec![0, 0, u32::from('a')]);
-        // Disabled with a guess still in flight: overlay empties AND no
-        // deadline stays armed (the stranded-timer regression).
+        // Disabled with a guess in flight: the overlay empties and no deadline
+        // stays armed.
         t.set_predictive_echo("off");
         assert!(t.predict_overlay().is_empty());
         assert!(t.predict_next_deadline_ms().is_none());

@@ -1079,6 +1079,12 @@ fn since(a: Instant, b: Instant) -> Duration {
     a.saturating_duration_since(b)
 }
 
+/// Memory's enter line on a Mac whose kernel says WARN: the machine swaps
+/// at least this many KiB/s (in plus out, 4 MB/s). The supervisor's memory
+/// ceiling reads a thrash off the same line
+/// (`aterm_agent::supervise::memory::THRASH_SWAP_KIB_S`, pinned equal).
+pub const WARN_SWAP_ENTER_KIB_S: u32 = 4096;
+
 /// A permille delta ratio, clamped to 1000.
 fn permille(num: u64, den: u64) -> u16 {
     if den == 0 {
@@ -1253,9 +1259,29 @@ impl StrainTracker {
         (keys >= FEEL_MIN_KEYS && slow * 2 >= keys) || hitches >= FEEL_MIN_HITCHES
     }
 
+    /// The longest freeze in the window ending at `now`.
+    fn worst_freeze(&self, now: Instant) -> Option<u32> {
+        self.ring
+            .iter()
+            .flatten()
+            .filter(|s| s.freeze && s.at <= now && since(now, s.at) < FEEL_WINDOW)
+            .map(|s| s.ms)
+            .max()
+    }
+
     /// A new episode: Suspect, every measurement fresh.
     fn begin(&mut self, at: Instant) {
         let (keys, slow, _, worst) = self.window(at);
+        // The longest pause is the episode's own, taken from the window as
+        // the key figures are: a freeze noted while calm, long
+        // before, is no part of it. The owner (which only aterm.log's stall
+        // line names) is kept when it is that freeze.
+        let turn = self.worst_freeze(at);
+        self.worst_turn = self
+            .worst_turn
+            .take()
+            .filter(|(_, ms)| Some(*ms) == turn)
+            .or_else(|| turn.map(|ms| (String::new(), ms)));
         self.state = State::Suspect;
         self.episode_start = Some(at);
         self.felt_at = Some(at);
@@ -1630,7 +1656,7 @@ impl StrainTracker {
         // Memory.
         let mac_enter = match r.pressure {
             Some(MemoryLevel::Critical) => true,
-            Some(MemoryLevel::Warn) => swap.is_some_and(|s| s >= 4096),
+            Some(MemoryLevel::Warn) => swap.is_some_and(|s| s >= WARN_SWAP_ENTER_KIB_S),
             _ => false,
         };
         let mem_enter = mac_enter || ge(psi.memory_some_pm, 100) || ge(psi.memory_full_pm, 50);

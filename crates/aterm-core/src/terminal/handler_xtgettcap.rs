@@ -2,32 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! XTGETTCAP (xterm termcap/terminfo query) handler for the terminal.
-//!
-//! This module handles XTGETTCAP queries which allow applications to query
-//! terminal capabilities in-band via DCS sequences.
-//!
-//! Supported capabilities:
-//! - `TN` / `name`: Terminal name (returns "xterm-256color")
-//! - `Co` / `colors`: Number of colors (returns 256)
-//! - `RGB`: Direct color support (returns 8:8:8)
-//! - `Tc`: True color support (empty value = supported)
-//! - `Ms`: OSC 52 clipboard format string
-//! - `Ss` / `Se`: Cursor style set/reset (DECSCUSR)
-//! - `smkx` / `ks`: Enter keypad transmit mode
-//! - `rmkx` / `ke`: Exit keypad transmit mode
-//! - `op`: Reset foreground/background to defaults
-//! - `AF` / `setaf`: Set ANSI foreground (256-color parameterized)
-//! - `AB` / `setab`: Set ANSI background (256-color parameterized)
-//! - `sgr0` / `me`: Reset all attributes
-//! - `bel`: Bell character
-//! - `cr`: Carriage return
-//! - `smcup` / `ti`: Enter alt screen
-//! - `rmcup` / `te`: Exit alt screen
-//! - Keyboard keys: `kbs`, `kdch1`/`kD`, `kcuu1`/`ku`, `kcud1`/`kd`,
-//!   `kcuf1`/`kr`, `kcub1`/`kl`, `khome`/`kh`, `kend`/`@7`,
-//!   `kpp`/`kP`, `knp`/`kN`, `kich1`/`kI`
-//! - Function keys: `kf1`-`kf12` / `k1`-`k;`,`F1`,`F2`
+//! XTGETTCAP: in-band termcap/terminfo queries. The answered capabilities
+//! are `lookup_capability`'s table.
 //!
 //! Protocol:
 //! - Request: `DCS + q Pt ST` (Pt = hex-encoded names separated by `;`)
@@ -43,19 +19,9 @@ use super::response_capability::ResponseCapability;
 const MAX_RESPONSE_SIZE: usize = 4096;
 
 impl TerminalHandler<'_> {
-    /// Handle XTGETTCAP (xterm termcap/terminfo query).
-    ///
-    /// Format: `DCS + q Pt ST`
-    /// - Pt is hex-encoded list of capability names separated by `;`
-    ///
-    /// Response: `DCS <status> + r Pt ST`
-    /// - status = 1 for valid request with known capabilities
-    /// - status = 0 for invalid request (all names unknown or invalid hex)
+    /// Answer the XTGETTCAP query accumulated in `dcs.data` (module docs).
     pub(super) fn handle_xtgettcap(&mut self, cap: &ResponseCapability) {
-        // Decode hex-encoded names
         let hex_names = &self.dcs.data;
-
-        // Split on `;` and decode each name
         let mut response_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut total_size = 0;
 
@@ -64,29 +30,23 @@ impl TerminalHandler<'_> {
                 continue;
             }
 
-            // Decode hex to get the capability name
-            let Some(name) = hex_decode(hex_name) else {
-                // Invalid hex encoding - send error response
+            let Some(name) = aterm_codec::hex::decode_vec(hex_name) else {
                 self.xtgettcap_invalid_response(cap);
                 return;
             };
 
-            // Look up the capability — skip unknown names per xterm behavior
-            // (xterm responds with known caps and ignores unknown ones in
-            // multi-capability queries, rather than aborting the entire query).
+            // Skip unknown names, as xterm does in multi-capability queries,
+            // rather than aborting the whole query.
             let Some(value) = Self::lookup_capability(&name) else {
                 continue;
             };
 
-            // Hex-encode name and value for response
-            let hex_name_enc = hex_encode(&name);
-            let hex_value_enc = hex_encode(&value);
+            let hex_name_enc = aterm_codec::hex::encode_upper(&name).into_bytes();
+            let hex_value_enc = aterm_codec::hex::encode_upper(&value).into_bytes();
 
-            // Check response size bound
-            // Format: hex_name=hex_value (plus ; separator)
+            // `name=value;`: stop before the reply passes MAX_RESPONSE_SIZE.
             let pair_size = hex_name_enc.len() + 1 + hex_value_enc.len() + 1;
             if total_size + pair_size > MAX_RESPONSE_SIZE {
-                // Response would be too large - truncate
                 break;
             }
             total_size += pair_size;
@@ -95,12 +55,11 @@ impl TerminalHandler<'_> {
         }
 
         if response_pairs.is_empty() {
-            // No valid capabilities requested
             self.xtgettcap_invalid_response(cap);
             return;
         }
 
-        // Build success response: DCS 1 + r Pt ST
+        // DCS 1 + r Pt ST
         let mut response = Vec::with_capacity(total_size + 8);
         response.extend_from_slice(b"\x1bP1+r");
 
@@ -117,15 +76,12 @@ impl TerminalHandler<'_> {
         self.send_response(cap, &response);
     }
 
-    /// Send invalid/error response for XTGETTCAP.
+    /// The XTGETTCAP error reply, `DCS 0 + r ST`.
     fn xtgettcap_invalid_response(&mut self, cap: &ResponseCapability) {
-        // DCS 0 + r ST
         self.send_response(cap, b"\x1bP0+r\x1b\\");
     }
 
-    /// Look up a capability by name (termcap or terminfo).
-    ///
-    /// Returns the value as bytes, or None if unknown.
+    /// A capability's value by termcap or terminfo name; `None` if unknown.
     fn lookup_capability(name: &[u8]) -> Option<Vec<u8>> {
         match name {
             // Terminal name (termcap: TN, terminfo: name)
@@ -136,7 +92,7 @@ impl TerminalHandler<'_> {
 
             // Direct color / RGB support (ncurses extension)
             // Value 8:8:8 indicates 8 bits per channel for R, G, B.
-            // ncurses-based programs parse this format for truecolor detection (#7466).
+            // ncurses-based programs parse this format for truecolor detection.
             b"RGB" => Some(b"8:8:8".to_vec()),
 
             // True color support (tmux extension, empty = supported)
@@ -209,87 +165,5 @@ impl TerminalHandler<'_> {
             // Unknown capability
             _ => None,
         }
-    }
-}
-
-/// Decode a hex-encoded byte sequence.
-///
-/// Returns None if the input contains invalid hex characters or has odd length.
-fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-
-    let mut result = Vec::with_capacity(hex.len() / 2);
-
-    for chunk in hex.chunks(2) {
-        let high = hex_char_to_nibble(chunk[0])?;
-        let low = hex_char_to_nibble(chunk[1])?;
-        result.push((high << 4) | low);
-    }
-
-    Some(result)
-}
-
-/// Convert a hex character to its nibble value.
-fn hex_char_to_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        _ => None,
-    }
-}
-
-/// Encode bytes as uppercase hex.
-fn hex_encode(data: &[u8]) -> Vec<u8> {
-    const HEX_CHARS: &[u8] = b"0123456789ABCDEF";
-
-    let mut result = Vec::with_capacity(data.len() * 2);
-    for &byte in data {
-        result.push(HEX_CHARS[(byte >> 4) as usize]);
-        result.push(HEX_CHARS[(byte & 0x0F) as usize]);
-    }
-    result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hex_decode_valid() {
-        assert_eq!(hex_decode(b"544E"), Some(b"TN".to_vec()));
-        assert_eq!(hex_decode(b"436F"), Some(b"Co".to_vec()));
-        assert_eq!(hex_decode(b"524742"), Some(b"RGB".to_vec()));
-    }
-
-    #[test]
-    fn test_hex_decode_lowercase() {
-        assert_eq!(hex_decode(b"544e"), Some(b"TN".to_vec()));
-        assert_eq!(hex_decode(b"436f"), Some(b"Co".to_vec()));
-    }
-
-    #[test]
-    fn test_hex_decode_invalid() {
-        assert_eq!(hex_decode(b"5"), None); // Odd length
-        assert_eq!(hex_decode(b"GH"), None); // Invalid chars
-        assert_eq!(hex_decode(b"5G"), None); // Invalid char
-    }
-
-    #[test]
-    fn test_hex_encode() {
-        assert_eq!(hex_encode(b"TN"), b"544E".to_vec());
-        assert_eq!(hex_encode(b"Co"), b"436F".to_vec());
-        assert_eq!(hex_encode(b"RGB"), b"524742".to_vec());
-        assert_eq!(hex_encode(b""), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn test_hex_encode_decode_roundtrip() {
-        let original = b"xterm-256color";
-        let encoded = hex_encode(original);
-        let decoded = hex_decode(&encoded).unwrap();
-        assert_eq!(decoded, original.to_vec());
     }
 }

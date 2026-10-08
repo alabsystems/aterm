@@ -313,16 +313,6 @@ fn open_sealed_file(path: &Path, uid: u32, limit: u64) -> Result<std::fs::File, 
 }
 
 #[cfg(target_os = "macos")]
-fn digest_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-#[cfg(target_os = "macos")]
 fn descriptor_digest_and_size(
     descriptor: &aterm_json::Value,
 ) -> Result<(String, String, u64), String> {
@@ -336,11 +326,7 @@ fn descriptor_digest_and_size(
         .and_then(aterm_json::Value::as_str)
         .and_then(|digest| digest.strip_prefix("sha256:"))
         .ok_or_else(|| "managed model manifest descriptor lacks a SHA-256 digest".to_string())?;
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if !aterm_codec::hex::is_lower(digest, 64) {
         return Err("managed model manifest contains an invalid SHA-256 digest".to_string());
     }
     let size = descriptor
@@ -492,7 +478,9 @@ fn attest_managed_model_with_pin(
             }
             hasher.update(&buffer[..read]);
         }
-        if read_total != expected_size || digest_hex(&hasher.finalize()) != digest {
+        if read_total != expected_size
+            || aterm_codec::hex::encode_lower(&hasher.finalize()) != digest
+        {
             return Err(format!(
                 "managed model blob SHA-256 does not match its manifest: {}",
                 blob.display()
@@ -524,28 +512,26 @@ pub(super) fn attest_managed_model(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_TREE: AtomicU64 = AtomicU64::new(1);
 
     struct TestTree {
-        root: PathBuf,
+        root: aterm_tempfile::TempDir,
         blob: PathBuf,
         pin: Vec<PinnedDescriptor<'static>>,
     }
 
     impl TestTree {
         fn new(blob_bytes: &[u8]) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "aterm-managed-model-test-{}-{}",
-                std::process::id(),
-                NEXT_TREE.fetch_add(1, Ordering::Relaxed)
-            ));
-            let manifest = root.join("manifests/registry.ollama.ai/library/tiny/unit");
+            let root = aterm_tempfile::Builder::new()
+                .prefix("aterm-managed-model-test-")
+                .tempdir()
+                .unwrap();
+            let manifest = root
+                .path()
+                .join("manifests/registry.ollama.ai/library/tiny/unit");
             std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-            std::fs::create_dir_all(root.join("blobs")).unwrap();
-            let digest = digest_hex(&Sha256::digest(blob_bytes));
-            let blob = root.join("blobs").join(format!("sha256-{digest}"));
+            std::fs::create_dir_all(root.path().join("blobs")).unwrap();
+            let digest = aterm_codec::hex::encode_lower(&Sha256::digest(blob_bytes));
+            let blob = root.path().join("blobs").join(format!("sha256-{digest}"));
             std::fs::write(&blob, blob_bytes).unwrap();
             let manifest_json = aterm_json::json!({
                 "schemaVersion": 2,
@@ -557,7 +543,7 @@ mod tests {
                 "layers": []
             });
             std::fs::write(manifest, aterm_json::to_vec(&manifest_json).unwrap()).unwrap();
-            seal_tree(&root);
+            seal_tree(root.path());
             let leaked_digest: &'static str = Box::leak(digest.into_boxed_str());
             Self {
                 root,
@@ -572,9 +558,10 @@ mod tests {
     }
 
     impl Drop for TestTree {
+        /// The sealed tree made writable again, so the `root` field's own drop,
+        /// which runs next, can remove it.
         fn drop(&mut self) {
-            make_tree_writable(&self.root);
-            let _ = std::fs::remove_dir_all(&self.root);
+            make_tree_writable(self.root.path());
         }
     }
 
@@ -625,7 +612,8 @@ mod tests {
     #[test]
     fn sealed_manifest_and_blob_are_verified_and_held() {
         let tree = TestTree::new(b"small deterministic model blob");
-        let attested = attest_managed_model_with_pin(&tree.root, "tiny:unit", &tree.pin).unwrap();
+        let attested =
+            attest_managed_model_with_pin(tree.root.path(), "tiny:unit", &tree.pin).unwrap();
         assert_eq!(attested._guards.len(), 2);
         attested.revalidate().unwrap();
         assert_eq!(
@@ -638,14 +626,17 @@ mod tests {
     fn writable_or_substituted_model_store_fails_closed() {
         let writable = TestTree::new(b"model");
         std::fs::set_permissions(&writable.blob, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(attest_managed_model_with_pin(&writable.root, "tiny:unit", &writable.pin).is_err());
+        assert!(
+            attest_managed_model_with_pin(writable.root.path(), "tiny:unit", &writable.pin)
+                .is_err()
+        );
 
         let changed = TestTree::new(b"model");
         std::fs::set_permissions(&changed.blob, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(&changed.blob, b"evil!").unwrap();
         std::fs::set_permissions(&changed.blob, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let error =
-            attest_managed_model_with_pin(&changed.root, "tiny:unit", &changed.pin).unwrap_err();
+        let error = attest_managed_model_with_pin(changed.root.path(), "tiny:unit", &changed.pin)
+            .unwrap_err();
         assert!(error.contains("SHA-256"));
     }
 
@@ -653,16 +644,18 @@ mod tests {
     fn coherent_manifest_and_blob_replacement_cannot_replace_the_pin() {
         let trusted = TestTree::new(b"trusted model");
         let replacement = TestTree::new(b"coherent malicious replacement");
-        let error = attest_managed_model_with_pin(&replacement.root, "tiny:unit", &trusted.pin)
-            .unwrap_err();
+        let error =
+            attest_managed_model_with_pin(replacement.root.path(), "tiny:unit", &trusted.pin)
+                .unwrap_err();
         assert!(error.contains("pinned descriptor set"));
-        assert!(attest_managed_model(&replacement.root, "tiny:unit").is_err());
+        assert!(attest_managed_model(replacement.root.path(), "tiny:unit").is_err());
     }
 
     #[test]
     fn post_attestation_same_uid_mutation_invalidates_the_anchor() {
         let tree = TestTree::new(b"trusted model");
-        let attested = attest_managed_model_with_pin(&tree.root, "tiny:unit", &tree.pin).unwrap();
+        let attested =
+            attest_managed_model_with_pin(tree.root.path(), "tiny:unit", &tree.pin).unwrap();
         std::fs::set_permissions(&tree.blob, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(&tree.blob, b"evil replacement").unwrap();
         std::fs::set_permissions(&tree.blob, std::fs::Permissions::from_mode(0o444)).unwrap();
@@ -675,10 +668,10 @@ mod tests {
         assert!(manifest_relative_path("../../secret:latest").is_err());
         assert!(manifest_relative_path("registry:443/model:latest").is_err());
         let tree = TestTree::new(b"model");
-        let link = tree.root.join("unexpected-link");
-        std::fs::set_permissions(&tree.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tree.root.path().join("unexpected-link");
+        std::fs::set_permissions(tree.root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::os::unix::fs::symlink(&tree.blob, &link).unwrap();
-        std::fs::set_permissions(&tree.root, std::fs::Permissions::from_mode(0o555)).unwrap();
-        assert!(attest_managed_model_with_pin(&tree.root, "tiny:unit", &tree.pin).is_err());
+        std::fs::set_permissions(tree.root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(attest_managed_model_with_pin(tree.root.path(), "tiny:unit", &tree.pin).is_err());
     }
 }

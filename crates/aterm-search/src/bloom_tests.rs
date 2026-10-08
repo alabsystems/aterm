@@ -97,8 +97,6 @@ fn bloom_with_size() {
 /// Note: We lookup EXISTING items to ensure all K bits are checked (worst case).
 /// Non-existing items can short-circuit when any bit is 0, which is still O(1)
 /// but with variable operation counts depending on filter density.
-///
-/// Addresses claim verification in #1647.
 #[test]
 fn bloom_lookup_constant_time() {
     fn measure_lookup_ops(num_bits: usize, num_items: usize, num_lookups: usize) -> usize {
@@ -161,8 +159,6 @@ fn bloom_lookup_constant_time() {
 ///
 /// Each insert should set exactly K=7 bits regardless of filter size.
 /// This verifies the O(1) insert claim in the module documentation.
-///
-/// Addresses claim verification in #1647.
 #[test]
 fn bloom_insert_constant_time() {
     fn measure_insert_ops(num_bits: usize, num_inserts: usize) -> usize {
@@ -284,8 +280,6 @@ fn bloom_with_size_rounding() {
 /// When checking items not in the filter, the lookup should short-circuit
 /// and return early when it finds the first 0 bit. This verifies the
 /// "checks at most K=7 bits (early return on miss)" claim in documentation.
-///
-/// Addresses claim verification in #1647.
 #[test]
 fn bloom_lookup_early_return_on_miss() {
     // Clear counters

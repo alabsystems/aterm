@@ -4,9 +4,9 @@
 
 //! Unicode Bidirectional Algorithm (UAX #9) line reordering for the terminal.
 //!
-//! Terminal lines are stored in LOGICAL order (the order characters were
+//! Terminal lines are stored in logical order (the order characters were
 //! written). To display mixed left-to-right / right-to-left text correctly the
-//! renderer needs the VISUAL order — the left-to-right sequence of columns on
+//! renderer needs the visual order — the left-to-right sequence of columns on
 //! screen. This crate computes that reordering: given a line's characters it
 //! resolves UAX #9 embedding levels and returns a visual→logical permutation the
 //! renderer can apply per row.
@@ -242,9 +242,9 @@ pub fn reorder_str(s: &str, base: BaseDirection) -> Vec<usize> {
 
 /// Compute the visual→logical **cell** permutation for a terminal row.
 ///
-/// Terminal rows store a WIDE glyph (CJK, wide emoji) as two cells: a lead cell
+/// Terminal rows store a wide glyph (CJK, wide emoji) as two cells: a lead cell
 /// carrying the glyph and a right-half *continuation* cell. The Bidirectional
-/// Algorithm runs on the LOGICAL CHARACTERS — one per lead/single cell — and each
+/// Algorithm runs on the logical characters — one per lead/single cell — and each
 /// character's cell(s) are then emitted as a unit in lead-then-continuation
 /// order: a wide glyph is never mirrored, only its *position* in the line is
 /// reordered. The result is always a permutation of `0..n`; a malformed
@@ -374,7 +374,7 @@ pub fn resolve_levels_from_classes(
     levels
 }
 
-/// The base level of the FIRST paragraph of `text` (0 = LTR, 1 = RTL).
+/// The base level of the first paragraph of `text` (0 = LTR, 1 = RTL).
 #[must_use]
 #[cfg(test)]
 pub fn paragraph_level(text: &[char], base: BaseDirection) -> u8 {
@@ -1256,7 +1256,7 @@ mod tests {
     fn reorder_cells_rtl_with_wide_glyph_keeps_pair_unmirrored() {
         // Logical: ALEF (R, 1 cell), 中 (L, 2 cells). Base auto → RTL. The Hebrew
         // letter ends on the right; 中 moves left but its two cells stay in
-        // lead-then-continuation order (the glyph is NOT mirrored).
+        // lead-then-continuation order (the glyph is not mirrored).
         let cc = vec![ALEF, CJK, ' '];
         let wide = vec![false, false, true];
         // visual: 中-lead(1), 中-cont(2), ALEF(0)
@@ -1473,49 +1473,60 @@ mod tests {
 }
 
 #[cfg(test)]
-mod proptests {
+mod generated {
     use super::*;
-    use proptest::prelude::*;
+    use aterm_spec::rng::XorShift;
 
     /// A representative bidi alphabet exercising every resolved class: LTR letters,
     /// European numbers/separators/terminators, Hebrew (R), Arabic (AL) +
     /// Arabic-Indic digits (AN), common separators, neutrals, whitespace, and the
     /// directional marks.
-    fn bidi_char() -> impl Strategy<Value = char> {
-        prop::sample::select(vec![
-            'a', 'Z', '5', '0', '+', '-', '$', '%', ',', '.', ':', '/', ' ', '\t', '\n', '!', '(',
-            ')', '\u{05D0}', '\u{05D1}', '\u{05EA}', '\u{0627}', '\u{0628}', '\u{0660}',
-            '\u{0669}', '\u{200F}', '\u{200E}', '[', ']', '\u{0301}', '\u{202A}', '\u{202B}',
-            '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
-        ])
+    const ALPHABET: &[char] = &[
+        'a', 'Z', '5', '0', '+', '-', '$', '%', ',', '.', ':', '/', ' ', '\t', '\n', '!', '(', ')',
+        '\u{05D0}', '\u{05D1}', '\u{05EA}', '\u{0627}', '\u{0628}', '\u{0660}', '\u{0669}',
+        '\u{200F}', '\u{200E}', '[', ']', '\u{0301}', '\u{202A}', '\u{202B}', '\u{202C}',
+        '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ];
+    const LTR_ONLY: &[char] = &[
+        'a', 'q', 'Z', 'M', '0', '7', ' ', '+', '-', '.', ',', ':', '(', ')', '!',
+    ];
+    const BASES: [BaseDirection; 3] = [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl];
+
+    /// A line of up to 47 characters drawn from `alphabet`.
+    fn draw_line(rng: &mut XorShift, alphabet: &[char]) -> Vec<char> {
+        (0..rng.index(48)).map(|_| *rng.pick(alphabet)).collect()
     }
 
-    fn bidi_line() -> impl Strategy<Value = Vec<char>> {
-        prop::collection::vec(bidi_char(), 0..48)
+    /// Lines over [`ALPHABET`], plus the case that once broke paragraph handling.
+    fn lines() -> impl Iterator<Item = Vec<char>> {
+        let mut rng = XorShift::new(0x0B1D_1A57_C0FF_EE11);
+        std::iter::once(vec!['\u{05D0}', '\n', 'a'])
+            .chain((0..512).map(move |_| draw_line(&mut rng, ALPHABET)))
     }
 
-    proptest! {
-        /// The visual order is ALWAYS a permutation of 0..n, for any input and base
-        /// — the load-bearing safety property (no cell dropped or duplicated).
-        #[test]
-        fn reorder_is_always_a_permutation(line in bidi_line()) {
-            for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
-                let order = reorder_visual_to_logical(&line, base);
-                prop_assert_eq!(order.len(), line.len());
-                let mut sorted = order.clone();
-                sorted.sort_unstable();
-                prop_assert_eq!(sorted, (0..line.len()).collect::<Vec<_>>());
+    /// The visual order is always a permutation of 0..n, for any input and base
+    /// — the load-bearing safety property (no cell dropped or duplicated).
+    #[test]
+    fn reorder_is_always_a_permutation() {
+        for line in lines() {
+            for base in BASES {
+                let mut order = reorder_visual_to_logical(&line, base);
+                assert_eq!(order.len(), line.len());
+                order.sort_unstable();
+                assert_eq!(order, (0..line.len()).collect::<Vec<_>>(), "{line:?}");
             }
         }
+    }
 
-        /// Levels match the input length and never fall below their PARAGRAPH's
-        /// base level (explicit embeddings and I1/I2 only raise; L1 resets to
-        /// base). A `B` ends a paragraph, and the next one has its own base.
-        #[test]
-        fn levels_well_formed(line in bidi_line()) {
-            for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
+    /// Levels match the input length and never fall below their PARAGRAPH's
+    /// base level (explicit embeddings and I1/I2 only raise; L1 resets to
+    /// base). A `B` ends a paragraph, and the next one has its own base.
+    #[test]
+    fn levels_well_formed() {
+        for line in lines() {
+            for base in BASES {
                 let levels = resolve_levels(&line, base);
-                prop_assert_eq!(levels.len(), line.len());
+                assert_eq!(levels.len(), line.len());
                 let mut start = 0;
                 while start < line.len() {
                     let end = line[start..]
@@ -1524,68 +1535,59 @@ mod proptests {
                         .map_or(line.len(), |off| start + off + 1);
                     let para = paragraph_level(&line[start..end], base);
                     for &l in &levels[start..end] {
-                        prop_assert!(l >= para);
+                        assert!(l >= para, "{line:?}");
                     }
                     start = end;
                 }
             }
         }
+    }
 
-        /// A line with no strong-RTL and no Arabic number is pure LTR → identity.
-        #[test]
-        fn ltr_only_is_identity(s in "[a-zA-Z0-9 +\\-.,:()!]{0,48}") {
-            let line: Vec<char> = s.chars().collect();
-            prop_assert!(!has_bidi(&line));
+    /// A line with no strong-RTL and no Arabic number is pure LTR → identity.
+    #[test]
+    fn ltr_only_is_identity() {
+        let mut rng = XorShift::new(0x17E0_17E0_17E0_17E0);
+        for _ in 0..512 {
+            let line = draw_line(&mut rng, LTR_ONLY);
+            assert!(!has_bidi(&line));
             let order = reorder_visual_to_logical(&line, BaseDirection::Auto);
-            prop_assert_eq!(order, (0..line.len()).collect::<Vec<_>>());
+            assert_eq!(order, (0..line.len()).collect::<Vec<_>>());
         }
+    }
 
-        /// Resolution is deterministic (same input → same levels).
-        #[test]
-        fn resolution_is_deterministic(line in bidi_line()) {
-            prop_assert_eq!(
-                resolve_levels(&line, BaseDirection::Auto),
-                resolve_levels(&line, BaseDirection::Auto)
-            );
-        }
-
-        /// The class-taking entry points are byte-identical to the char-taking
-        /// originals for any input and base (the dedup the bridge depends on).
-        #[test]
-        fn class_taking_matches_char_taking(line in bidi_line()) {
+    /// The class-taking entry points, and the `_into` companion with one
+    /// Scratch reused across bases, are byte-identical to the char-taking
+    /// originals (the dedup the bridge depends on). Resolution is deterministic.
+    #[test]
+    fn class_taking_and_into_variants_match_char_taking() {
+        let mut scratch = Scratch::default();
+        let mut cell_order = Vec::new();
+        for line in lines() {
             let classes: Vec<BidiClass> = line.iter().map(|&c| bidi_class(c)).collect();
             let brackets: Vec<Bracket> = line.iter().map(|&c| bracket_of(c)).collect();
             let wide = vec![false; line.len()];
-            prop_assert_eq!(has_bidi(&line), has_bidi_classes(&classes));
-            for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
-                prop_assert_eq!(
-                    resolve_levels(&line, base),
+            assert_eq!(has_bidi(&line), has_bidi_classes(&classes));
+            for base in BASES {
+                let levels = resolve_levels(&line, base);
+                assert_eq!(levels, resolve_levels(&line, base), "deterministic");
+                assert_eq!(
+                    levels,
                     resolve_levels_from_classes(&classes, &brackets, base)
                 );
-                prop_assert_eq!(
-                    reorder_cells(&line, &wide, base),
+                let cells = reorder_cells(&line, &wide, base);
+                assert_eq!(
+                    cells,
                     reorder_cells_with_classes(&classes, &brackets, &wide, base)
                 );
-            }
-        }
-
-        /// The `_into` companion is byte-identical to the Vec-returning wrapper
-        /// for any input and base, with one Scratch reused across bases.
-        #[test]
-        fn into_variants_match_vec_returning_prop(line in bidi_line()) {
-            let classes: Vec<BidiClass> = line.iter().map(|&c| bidi_class(c)).collect();
-            let brackets: Vec<Bracket> = line.iter().map(|&c| bracket_of(c)).collect();
-            let wide = vec![false; line.len()];
-            let mut scratch = Scratch::default();
-            let mut cell_order = Vec::new();
-            for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
                 reorder_cells_with_classes_into(
-                    &classes, &brackets, &wide, base, &mut scratch, &mut cell_order,
+                    &classes,
+                    &brackets,
+                    &wide,
+                    base,
+                    &mut scratch,
+                    &mut cell_order,
                 );
-                prop_assert_eq!(
-                    &cell_order,
-                    &reorder_cells_with_classes(&classes, &brackets, &wide, base)
-                );
+                assert_eq!(cell_order, cells, "{line:?}");
             }
         }
     }

@@ -3,7 +3,7 @@
 
 # TLS verification fixtures
 
-Certificates for `crates/aterm-http/src/verifier.rs`'s differential oracle. All
+Certificates for `crates/aterm-http/src/verifier/tests.rs`. All
 of them are public test data. **Do not install, trust, or reuse any file here in
 any real deployment.**
 
@@ -33,45 +33,27 @@ verify, they never sign — so nothing here can mint a new certificate; re-run
 | `tampertbs.der` | `good.der` with a SAN byte rewritten inside the signed body | as above, from the other direction |
 | `malformed.der` | nine bytes that are not a certificate | the wrong‑reason control: this must report `BadEncoding`, never a trust verdict |
 | `gh-leaf.der`, `gh-int0.der`, `gh-int1.der` | github.com's real chain, captured 2026‑08‑29 | proves the machine's real system trust store is consulted |
-| `cl-leaf.der`, `cl-int0.der`, `cl-int1.der` | downloads.claude.ai's real chain, captured 2026‑08‑29 | the SECOND positive control, under an independent root |
 
-`mint.sh` regenerates everything except the `gh-*` and `cl-*` captures, and its
+`mint.sh` regenerates everything except the `gh-*` capture, and its
 header records the two properties the LOCAL corpus must never lose (no leaf over
 ~398 days, and no `authorityInformationAccess` / `crlDistributionPoints`
 anywhere).
 
-## The two captured chains, and why there are two
+## The captured chain
 
-They are the only fixtures a real system anchor validates, so they are the only
-source of an ACCEPT in the shipped configuration — which makes them the only
-thing standing between
-`crates/aterm-http/tests/verifier_differential.rs` and a suite that a verifier
-returning `Err` for every input would pass. There are two of them, under roots
-from different operators with different key types, so that one CA leaving the
-platform trust store cannot disarm the suite on its own:
+It is the only fixture a real system anchor validates, so it is the only
+source of an ACCEPT under the system store. Its anchor is Sectigo Public Server
+Authentication Root E46 (ECC, to 2038‑01‑18), via USERTrust ECC; github.com
+because `aterm-update-core` fetches releases from github.com / api.github.com.
 
-| chain | anchor | why this host |
-| --- | --- | --- |
-| `gh-*` | Sectigo Public Server Authentication Root E46 (ECC, to 2038‑01‑18), via USERTrust ECC | `aterm-update-core` fetches releases from github.com / api.github.com |
-| `cl-*` | Google Trust Services GTS Root R1 (RSA), cross‑signed by GlobalSign Root CA | `crates/atpkg/src/vendor.rs:59` allow‑lists downloads.claude.ai |
-
-**Time is pinned on both sides of every test**, so neither chain rots when its
-leaf expires — `gh-leaf` on 2026‑09‑30 and `cl-leaf` on 2026‑10‑16, both already
-in the past for most readers of this file, and both still perfectly usable.
-Pinning does NOT protect against the anchor leaving the trust store; that is what
-`the_positive_control_is_armed_and_not_inert` fails loudly about.
-
-Unlike the local fixtures, these DO carry `authorityInformationAccess` — that is
-what makes `a_missing_intermediate_is_not_repaired_by_a_network_fetch` a real
-test rather than an empty claim.
+**Time is pinned in every test**, so the chain does not rot when its leaf
+expires (2026‑09‑30). Pinning does NOT protect against the anchor leaving the
+trust store.
 
 ### Recapture
 
-Needed only when a test says so. One host at a time; the other keeps the suite
-armed meanwhile.
-
 ```sh
-host=github.com   # or downloads.claude.ai
+host=github.com
 openssl s_client -connect "$host:443" -servername "$host" -showcerts </dev/null \
   > chain.txt
 # split chain.txt into its PEM blocks IN ORDER, then for each block N:
@@ -80,7 +62,5 @@ openssl s_client -connect "$host:443" -servername "$host" -showcerts </dev/null 
 #   openssl x509 -in blockN.pem -outform DER -out gh-int1.der   # N=2
 ```
 
-Then update `T_REAL` in `tests/verifier_differential.rs` to an instant inside the
-NEW leaf's validity window (`openssl x509 -noout -dates` prints it), and check
-that the same instant still sits inside the OTHER captured leaf's window — one
-constant serves both.
+Then update `T_GH` in `src/verifier/tests.rs` to an instant inside the NEW
+leaf's validity window (`openssl x509 -noout -dates` prints it).

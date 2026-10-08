@@ -13,12 +13,6 @@ description = "aterm L3 — network transport for the control protocol: a transp
 [lints]
 workspace = true
 
-# WALL-CLOCK connection-setup latency over loopback (no criterion: the quantity of
-# interest is the one-shot user-perceived setup span, not a steady-state rate).
-[[bench]]
-name = "drive_setup_latency"
-harness = false
-
 [dependencies]
 # The capability the network hop carries (the same EdgeToken the local one-hop
 # proxy mints), and the session/op identity it binds to.
@@ -30,6 +24,8 @@ aterm-uds = { workspace = true }
 # exporter; constant-time verify via `HmacSha256::verify_slice`. SHA-256 also
 # fingerprints the pinned server certificate (tls.rs).
 aterm-digest = { workspace = true }
+# The workspace's one hex codec: the AUTH tag and the certificate fingerprint.
+aterm-codec = { workspace = true }
 rustls = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

@@ -45,7 +45,7 @@ pub fn empty(_now_unix: u64) -> Roster {
     }
 }
 
-/// Add a machine, advancing the sequence and refreshing the window.
+/// Add a machine, advancing the sequence and restamping `valid_until` (see [`bump`]).
 ///
 /// # Why an id collision is a hard refusal and not an overwrite
 ///
@@ -117,7 +117,7 @@ pub fn add(mut r: Roster, id: &str, pubkey_b64: &str, now_unix: u64) -> Result<R
         added_at: aterm_types::rfc3339::format_rfc3339(now_unix),
         not_after: None,
     });
-    Ok(bump(r, now_unix))
+    Ok(bump(r))
 }
 
 /// Withdraw a machine: remove it from `[[machine]]` AND name it in `revoked`.
@@ -126,7 +126,7 @@ pub fn add(mut r: Roster, id: &str, pubkey_b64: &str, now_unix: u64) -> Result<R
 /// deleting the entry would leave a client that fetched the OLD roster with no reason to
 /// stop trusting the machine; naming it explicitly means any client that reads this roster
 /// learns the denial in the same document that grants everyone else's authority.
-pub fn revoke(mut r: Roster, id: &str, now_unix: u64) -> Result<Roster, String> {
+pub fn revoke(mut r: Roster, id: &str, _now_unix: u64) -> Result<Roster, String> {
     if !r.machines.iter().any(|m| m.id == id) && !r.is_revoked(id) {
         let mut s = String::from("machine id '");
         s.push_str(id);
@@ -137,17 +137,17 @@ pub fn revoke(mut r: Roster, id: &str, now_unix: u64) -> Result<Roster, String> 
     if !r.is_revoked(id) {
         r.revoked.push(id.to_string());
     }
-    Ok(bump(r, now_unix))
+    Ok(bump(r))
 }
 
-/// Advance the replay counter and refresh the freshness window — the two things EVERY
-/// edit must do.
+/// Advance the replay counter — the thing EVERY edit must do — and restamp `valid_until`
+/// to [`VALID_UNTIL_FOREVER`].
 ///
-/// They are here, in one private helper, rather than at each call site because forgetting
-/// either one is silent and serious: a roster published without a sequence bump can be
-/// swapped for its predecessor by anyone who kept a copy, and one published without a
-/// refreshed window starts life closer to bricking the channel.
-fn bump(mut r: Roster, _now_unix: u64) -> Roster {
+/// One private helper rather than a line at each call site because forgetting the bump is
+/// silent and serious: a roster published without a sequence bump can be swapped for its
+/// predecessor by anyone who kept a copy. The restamp upgrades a roster minted under the
+/// old 180-day window at its next edit.
+fn bump(mut r: Roster) -> Roster {
     r.roster_seq += 1;
     r.valid_until = VALID_UNTIL_FOREVER.to_string();
     r

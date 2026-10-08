@@ -9,15 +9,15 @@ use crate::{ledger, publish};
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
-use ledger::{Error, GitCli, GitRunner, Result, RunOut};
+use ledger::testing::Git;
+use ledger::{Error, GitRunner, Result, RunOut};
 use publish::{FenceRelease, LeaseRelease, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF};
 
 fn command(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = ledger::testing::git()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -32,50 +32,47 @@ fn command(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-static BARE_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 struct BareFixture {
-    root: PathBuf,
+    _root: aterm_tempfile::TempDir,
     repo_a: PathBuf,
     repo_b: PathBuf,
     owner_a: String,
     owner_b: String,
 }
 
-impl Drop for BareFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
 fn bare_fixture(name: &str) -> BareFixture {
-    let sequence = BARE_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("release-lease")
-        .join(format!("{name}-{}-{sequence}", std::process::id()));
-    std::fs::create_dir_all(&root).expect("create lease fixture");
+    let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("release-lease");
+    std::fs::create_dir_all(&parent).expect("create lease fixture");
+    let dir = aterm_tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir_in(parent)
+        .expect("create lease fixture");
+    let root = dir.path();
     let remote = root.join("origin.git");
     let seed = root.join("seed");
     assert!(
-        Command::new("git")
+        ledger::testing::git()
             .args(["init", "--bare"])
             .arg(&remote)
             .status()
             .expect("git init bare")
             .success()
     );
+    ledger::testing::config(&remote, &[]);
     assert!(
-        Command::new("git")
+        ledger::testing::git()
             .args(["init", "-b", "main"])
             .arg(&seed)
             .status()
             .expect("git init seed")
             .success()
     );
-    command(&seed, &["config", "user.name", "Release Lease Test"]);
-    command(
+    ledger::testing::config(
         &seed,
-        &["config", "user.email", "release-lease@example.invalid"],
+        &[
+            ("user.name", "Release Lease Test"),
+            ("user.email", "release-lease@example.invalid"),
+        ],
     );
     std::fs::write(seed.join("claim"), "first\n").expect("write first claim");
     command(&seed, &["add", "claim"]);
@@ -97,17 +94,19 @@ fn bare_fixture(name: &str) -> BareFixture {
 
     let clone = |name: &str| {
         let path = root.join(name);
-        let status = Command::new("git")
+        let status = ledger::testing::git()
             .args(["clone", "--branch", "main"])
             .arg(&remote)
             .arg(&path)
             .status()
             .expect("git clone");
         assert!(status.success());
-        command(&path, &["config", "user.name", "Release Fence Test"]);
-        command(
+        ledger::testing::config(
             &path,
-            &["config", "user.email", "release-fence@example.invalid"],
+            &[
+                ("user.name", "Release Fence Test"),
+                ("user.email", "release-fence@example.invalid"),
+            ],
         );
         path
     };
@@ -116,14 +115,14 @@ fn bare_fixture(name: &str) -> BareFixture {
         repo_b: clone("publisher-b"),
         owner_a: first,
         owner_b: second,
-        root,
+        _root: dir,
     }
 }
 
 /// Pause same-claim sessions after both observed the same fence token (or
 /// absence), forcing the create/rotation CAS itself to decide the winner.
 struct FenceProbeBarrier {
-    inner: GitCli,
+    inner: Git,
     barrier: Arc<Barrier>,
     first_probe: AtomicBool,
 }
@@ -131,7 +130,7 @@ struct FenceProbeBarrier {
 impl FenceProbeBarrier {
     fn new(repo: PathBuf, barrier: Arc<Barrier>) -> Self {
         Self {
-            inner: GitCli::new(repo),
+            inner: Git::new(repo),
             barrier,
             first_probe: AtomicBool::new(true),
         }
@@ -157,7 +156,7 @@ impl GitRunner for FenceProbeBarrier {
 /// Their subsequent pushes therefore exercise the remote's real atomic
 /// create behavior rather than a conveniently serialized test schedule.
 struct FirstProbeBarrier {
-    inner: GitCli,
+    inner: Git,
     barrier: Arc<Barrier>,
     first_probe: AtomicBool,
 }
@@ -165,7 +164,7 @@ struct FirstProbeBarrier {
 impl FirstProbeBarrier {
     fn new(repo: PathBuf, barrier: Arc<Barrier>) -> Self {
         Self {
-            inner: GitCli::new(repo),
+            inner: Git::new(repo),
             barrier,
             first_probe: AtomicBool::new(true),
         }
@@ -213,8 +212,8 @@ fn real_bare_remote_allows_one_claim_and_only_owner_recovery() {
     } else {
         (repo_b, repo_a, owner_b, owner_a, result_b.unwrap())
     };
-    let winner_git = GitCli::new(&winner_repo);
-    let loser_git = GitCli::new(&loser_repo);
+    let winner_git = Git::new(&winner_repo);
+    let loser_git = Git::new(&loser_repo);
     assert_eq!(
         publish::release_lease_owner(&winner_git).unwrap(),
         Some(winner.clone())
@@ -281,7 +280,7 @@ fn same_claim_publishers_get_one_unique_fence_and_exact_token_cleanup() {
     let repo_a = fixture.repo_a.clone();
     let repo_b = fixture.repo_b.clone();
     let owner = fixture.owner_a.clone();
-    let git_a = GitCli::new(&repo_a);
+    let git_a = Git::new(&repo_a);
     publish::acquire_release_lease(&git_a, &owner).unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
@@ -321,7 +320,7 @@ fn killed_session_recovery_rotates_exact_old_token_with_one_winner() {
     let repo_a = fixture.repo_a.clone();
     let repo_b = fixture.repo_b.clone();
     let owner = fixture.owner_a.clone();
-    let git_a = GitCli::new(&repo_a);
+    let git_a = Git::new(&repo_a);
     publish::acquire_release_lease(&git_a, &owner).unwrap();
     let stale = publish::acquire_publisher_fence(&git_a, &owner).unwrap();
 
@@ -364,7 +363,7 @@ fn final_unlock_atomically_removes_owner_and_fence_without_orphan_state() {
     let fixture = bare_fixture("atomic-final-unlock");
     let repo = fixture.repo_a.clone();
     let owner = fixture.owner_a.clone();
-    let git = GitCli::new(&repo);
+    let git = Git::new(&repo);
     publish::acquire_release_lease(&git, &owner).unwrap();
     let fence = publish::acquire_publisher_fence(&git, &owner).unwrap();
     assert_eq!(
@@ -386,7 +385,7 @@ fn unlock_only_replay_leaves_a_coherent_foreign_successor_pair_untouched() {
     let repo = fixture.repo_a.clone();
     let old_owner = fixture.owner_a.clone();
     let successor_owner = fixture.owner_b.clone();
-    let git = GitCli::new(&repo);
+    let git = Git::new(&repo);
     publish::acquire_release_lease(&git, &old_owner).unwrap();
     let old_fence = publish::acquire_publisher_fence(&git, &old_owner).unwrap();
     publish::release_completed_publisher_session(&git, &old_owner, &old_fence).unwrap();
@@ -419,7 +418,7 @@ fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
     let repo = fixture.repo_a.clone();
     let owner = fixture.owner_a.clone();
     let foreign = fixture.owner_b.clone();
-    let git = GitCli::new(&repo);
+    let git = Git::new(&repo);
     publish::acquire_release_lease(&git, &owner).unwrap();
     let fence = publish::acquire_publisher_fence(&git, &owner).unwrap();
     command(
@@ -486,12 +485,12 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
     };
 
     // A clean tree is the only accepted state.
-    publish::recovery_resume_worktree_preflight(&repo, &GitCli::new(&repo), &journal).unwrap();
+    publish::recovery_resume_worktree_preflight(&repo, &Git::new(&repo), &journal).unwrap();
 
     // An untracked path fails closed.
     std::fs::write(repo.join("claim"), "unrelated mutation\n").unwrap();
     assert!(
-        publish::recovery_resume_worktree_preflight(&repo, &GitCli::new(&repo), &journal).is_err()
+        publish::recovery_resume_worktree_preflight(&repo, &Git::new(&repo), &journal).is_err()
     );
     std::fs::remove_file(repo.join("claim")).unwrap();
 
@@ -499,7 +498,7 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
     // journal-derived write that recovery will explain away.
     std::fs::write(repo.join(".gitignore"), "dist/\nextra/\n").unwrap();
     assert!(
-        publish::recovery_resume_worktree_preflight(&repo, &GitCli::new(&repo), &journal).is_err()
+        publish::recovery_resume_worktree_preflight(&repo, &Git::new(&repo), &journal).is_err()
     );
 }
 

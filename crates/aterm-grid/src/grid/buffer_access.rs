@@ -2,14 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! [`BufferAccess`] implementation for [`Grid`].
-//!
-//! Provides the unified read-only buffer access interface so navigation
-//! logic (vi mode, emacs mode, editor) can operate on the terminal grid
-//! through `dyn BufferAccess` without coupling to grid internals.
-//!
-//! This is the sole buffer-reading interface: vi mode, emacs mode, and editor
-//! all operate through `dyn BufferAccess` from `aterm-types`.
+//! [`BufferAccess`] for [`Grid`]: the read-only interface through which vi
+//! mode, emacs mode and the editor navigate the grid (`dyn BufferAccess`).
 
 use aterm_types::BufferAccess;
 
@@ -71,16 +65,11 @@ impl BufferAccess for Grid {
         self.row_text(row)
     }
 
-    /// ONE row lookup for the whole line — the override the trait's doc asks
-    /// for. `Row::is_cell_wide_continuation` is the canonical predicate (it
-    /// reads the cell's own `WIDE_CONTINUATION` flag rather than inferring it
-    /// from a neighbour), so this is both cheaper AND more direct than the
-    /// default's per-cell `is_wide(col - 1)` inference.
+    /// One row lookup for the whole line, reading each cell's own
+    /// `WIDE_CONTINUATION` flag via `Row::is_cell_wide_continuation`.
     fn line_wide_continuations(&self, line: i32) -> Option<Vec<bool>> {
         if line < 0 {
-            // ONE materialization for the whole line — the point of batching.
-            // `Cell::is_wide_continuation` reads the cell's own flag, so this
-            // needs no neighbour inference.
+            // One materialization for the whole line.
             return scrollback_row(self, line).map(|row| {
                 row.cells
                     .iter()
@@ -130,26 +119,21 @@ impl BufferAccess for Grid {
     }
 }
 
-/// Convert a logical line to a grid visible-row index.
-///
-/// Returns `Some(row)` for non-negative lines within `u16` range.
-/// Negative lines (scrollback) are handled inline by each trait method.
+/// Convert a non-negative logical line within `u16` range to a visible-row
+/// index; negative lines (scrollback) are handled by each method.
 fn line_to_visible_row(line: i32) -> Option<u16> {
     u16::try_from(line).ok()
 }
 
-/// Materialize a scrollback row from a negative line index.
-///
-/// Line -1 is the most recent scrollback line, -2 the next, etc.
+/// Materialize a scrollback row from a negative line index (-1 is the most
+/// recent).
 fn scrollback_row(grid: &Grid, line: i32) -> Option<super::scroll_materialize::MaterializedRow> {
     let rev_idx = usize::try_from(-(i64::from(line)) - 1).ok()?;
     grid.materialize_scrollback_row_full(rev_idx, grid.cols())
 }
 
-/// Resolve a character from a scrollback row, checking overflow.
-///
-/// Like `Grid::resolved_char()` but for scrollback rows where extras
-/// are stored in `MaterializedRow` instead of the grid-level `CellExtras`.
+/// Resolve a character from a scrollback row, whose extras live in the
+/// `MaterializedRow` rather than the grid's `CellExtras`.
 fn scrollback_resolved_char(grid: &Grid, line: i32, col: u16) -> Option<char> {
     let row = scrollback_row(grid, line)?;
     let cell = row.cells.get(col as usize)?;
@@ -211,7 +195,7 @@ mod tests {
         assert_eq!(grid.line_text(-1), None); // no scrollback
     }
 
-    // --- Scrollback tests (#5613) ---
+    // --- Scrollback tests ---
 
     #[test]
     fn test_char_at_reads_scrollback() {
@@ -283,7 +267,7 @@ mod tests {
         assert_eq!(grid.line_text(-2), None);
     }
 
-    // --- Supplementary plane character resolution tests (#5939) ---
+    // --- Supplementary plane character resolution tests ---
 
     #[test]
     fn test_resolved_char_supplementary_plane_emoji() {

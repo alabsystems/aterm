@@ -90,7 +90,8 @@ impl HeaderCache {
                             },
                         )
                     }));
-                    images.sort_unstable_by_key(|(col, _)| *col);
+                    // Stable: the pane's other cells keep their layer order.
+                    images.sort_by_key(|(col, _)| *col);
                 }
             }
         }
@@ -144,28 +145,29 @@ impl App {
             match self.view_store.get(leaf.view).copied() {
                 Some(View::Terminal(view)) => {
                     indicators = self.session_status_indicators(view.session);
-                    if let Some(session) = self.pool.get(view.session) {
-                        let meta = session.ctx.meta.try_lock().ok().map(|meta| {
-                            (
-                                meta.presentation_value("title"),
-                                meta.presentation_value("icon"),
-                                meta.attention.is_some(),
-                            )
-                        });
-                        if let Some((user_title, icon, attention)) = meta {
-                            entry.icon = icon.unwrap_or_default();
-                            entry.meta_attention = attention;
-                            if let Some(title) = user_title.filter(|s| !s.is_empty()) {
-                                entry.title = title;
-                            } else if let Some(term) = term_try_lock(&session.term) {
-                                use crate::cwd_native::ReportedCwd as _;
-                                let cwd = term.native_working_directory();
-                                entry.title = crate::app_tabs::resolved_terminal_title_rung(
-                                    None,
-                                    term.title(),
-                                    cwd.as_deref(),
-                                )
-                                .unwrap_or_else(|| "Terminal".into());
+                    // Written into the resident strings, as `refill_strip_titles`
+                    // does: the rungs of `resolved_terminal_title_rung`, then
+                    // "Terminal", without a per-frame allocation.
+                    if let Some(session) = self.pool.get(view.session)
+                        && let Ok(meta) = session.ctx.meta.try_lock()
+                    {
+                        if !meta.presentation_value_into("icon", &mut entry.icon) {
+                            entry.icon.clear();
+                        }
+                        entry.meta_attention = meta.attention.is_some();
+                        let user_titled = meta.presentation_value_into("title", &mut entry.title);
+                        drop(meta);
+                        if !user_titled && let Some(term) = term_try_lock(&session.term) {
+                            use crate::cwd_native::ReportedCwd as _;
+                            let live = crate::tab_label::informative(term.title());
+                            entry.title.clear();
+                            if !live.is_empty() {
+                                entry.title.push_str(live);
+                            } else if !crate::app_window::push_home_abbreviated_cwd(
+                                &mut entry.title,
+                                term.native_working_directory().as_deref(),
+                            ) {
+                                entry.title.push_str("Terminal");
                             }
                         }
                     }
@@ -296,13 +298,9 @@ fn semantic_row(
         marker.fg = if focused { colors.accent } else { colors.label };
     }
     let status = status_label(indicators);
-    let suffix = if focused && cols >= 32 {
-        if status.is_empty() {
-            "FOCUSED".into()
-        } else {
-            format!("{status} FOCUSED")
-        }
-    } else if cols >= 6 {
+    // Focus is the `▸` marker and the label's colour; the right side is the
+    // pane's status alone, so the title keeps the room.
+    let suffix = if cols >= 6 {
         status.to_string()
     } else {
         String::new()
@@ -311,53 +309,58 @@ fn semantic_row(
     let label_cols = cols.saturating_sub(1 + suffix_cols + usize::from(suffix_cols > 0));
     let label = fit_cell_label(label, label_cols);
     let mut col = 1;
+    // The grid's own walk over the label, so a cluster is painted in exactly
+    // the cells `fit_cell_label` measured it in.
+    let mut grid = aterm_grapheme::GridColumns::new();
+    // The cell a joining character (a mark, a selector, a letter the grid
+    // folds after a ZWJ) attaches to.
+    let mut base: Option<usize> = None;
     for cluster in aterm_grapheme::split_graphemes(&label) {
-        let folded = cluster.is_emoji || cluster.text.contains('\u{20e3}');
-        let width = if folded {
-            cluster.width
-        } else {
-            aterm_grapheme::grapheme_grid_columns(cluster.text)
-        };
-        if width == 0 {
-            continue;
-        }
+        let mut after = grid.clone();
+        let width = header_cells(&cluster, &mut after);
         if col + width > cols {
             break;
         }
-        if folded {
-            row.cells[col].ch = cluster.text.chars().next().unwrap_or(' ');
+        if is_glyph(&cluster) {
+            grid = after;
+            base = None;
+            let Some(cell) = row.cells.get_mut(col).filter(|_| width > 0) else {
+                continue;
+            };
+            cell.ch = cluster.text.chars().next().unwrap_or(' ');
             if cluster.codepoint_count > 1 {
                 row.clusters.push((col, cluster.text.into()));
             }
             if width == 2 {
-                row.cells[col + 1].wide = true;
+                mark_continuation(&mut row.cells, col);
             }
             col += width;
-        } else {
-            let mut base = None;
-            for ch in cluster.text.chars() {
-                let width = aterm_grapheme::char_width(ch);
-                if width == 0 {
-                    if let Some(base) = base {
-                        if let Some((_, marks)) =
-                            row.combining.last_mut().filter(|(at, _)| *at == base)
-                        {
-                            let mut extended = marks.to_vec();
-                            extended.push(ch);
-                            *marks = extended.into_boxed_slice();
-                        } else {
-                            row.combining.push((base, vec![ch].into_boxed_slice()));
-                        }
-                    }
-                    continue;
+            continue;
+        }
+        for ch in cluster.text.chars() {
+            let step = grid.step(ch);
+            if let aterm_grapheme::GridStep::Opens { width, .. } = step {
+                if let Some(cell) = row.cells.get_mut(col) {
+                    cell.ch = ch;
+                    base = Some(col);
                 }
-                row.cells[col].ch = ch;
-                base = Some(col);
                 if width == 2 {
-                    row.cells[col + 1].wide = true;
+                    mark_continuation(&mut row.cells, col);
                 }
-                col += width;
+            } else if let Some(at) = base {
+                if let Some((_, marks)) = row.combining.last_mut().filter(|(cell, _)| *cell == at) {
+                    let mut extended = marks.to_vec();
+                    extended.push(ch);
+                    *marks = extended.into_boxed_slice();
+                } else {
+                    row.combining.push((at, vec![ch].into_boxed_slice()));
+                }
+                // VS16 widened the cell it joined.
+                if step == (aterm_grapheme::GridStep::Joins { widened: true }) {
+                    mark_continuation(&mut row.cells, at);
+                }
             }
+            col += step.advance();
         }
     }
     for (col, ch) in (cols.saturating_sub(suffix_cols)..cols).zip(suffix.chars()) {
@@ -371,21 +374,53 @@ fn semantic_row(
     row
 }
 
+/// Mark the column after the wide cell at `col` as its continuation.
+fn mark_continuation(cells: &mut [RenderCell], col: usize) {
+    if let Some(spacer) = cells.get_mut(col + 1) {
+        spacer.wide = true;
+    }
+}
+
+/// An emoji or keycap cluster, which the header paints as one glyph.
+fn is_glyph(cluster: &aterm_grapheme::Grapheme<'_>) -> bool {
+    cluster.is_emoji || cluster.text.contains('\u{20e3}')
+}
+
+/// The cells the header paints `cluster` in, feeding its characters to `grid`
+/// (the walk over the label so far): a glyph takes its display width, and any
+/// other cluster the cells the grid lays it out in, in context.
+fn header_cells(
+    cluster: &aterm_grapheme::Grapheme<'_>,
+    grid: &mut aterm_grapheme::GridColumns,
+) -> usize {
+    let cells = grid.advance_str(cluster.text);
+    if is_glyph(cluster) {
+        cluster.width
+    } else {
+        cells
+    }
+}
+
 fn fit_cell_label(label: &str, cols: usize) -> String {
-    if aterm_grapheme::str_grid_columns(label) <= cols {
+    let mut grid = aterm_grapheme::GridColumns::new();
+    let total: usize = aterm_grapheme::split_graphemes(label)
+        .map(|cluster| header_cells(&cluster, &mut grid))
+        .sum();
+    if total <= cols {
         return label.into();
     }
     if cols == 0 {
         return String::new();
     }
+    let mut grid = aterm_grapheme::GridColumns::new();
     let mut result = String::new();
     let mut available = cols - 1;
-    for cluster in label.graphemes() {
-        let width = aterm_grapheme::grapheme_grid_columns(cluster);
+    for cluster in aterm_grapheme::split_graphemes(label) {
+        let width = header_cells(&cluster, &mut grid);
         if width > available {
             break;
         }
-        result.push_str(cluster);
+        result.push_str(cluster.text);
         available -= width;
     }
     result.push('…');
@@ -556,15 +591,9 @@ fn raster(
         });
     }
     let status = status_label(indicators);
-    let suffix = if focused && w >= 220.0 * scale {
-        if status.is_empty() {
-            "FOCUSED".to_string()
-        } else {
-            format!("{status}  FOCUSED")
-        }
-    } else {
-        status.to_string()
-    };
+    // Focus is the accent rail and the bold label; the right side is the
+    // pane's status alone, so the title keeps the room.
+    let suffix = status.to_string();
     let suffix_size = TypeStep::Caption.px(h * 0.70);
     let suffix_width = tray_raster::ui_text_width_for(TextFace::Ui, &suffix, suffix_size.get());
     let inset = 8.0 * scale;
@@ -623,6 +652,7 @@ fn raster(
         rows: 1,
         z_index: 0,
         band_lift_px: 0,
+        cell_offset_px: (0, 0),
         scaling: ImageScaling::Fit,
         source_rect: None,
     }))
@@ -696,6 +726,49 @@ mod tests {
         assert!(
             clipped.clusters.is_empty(),
             "a wide cluster never straddles the pane edge"
+        );
+    }
+
+    /// The header paints a title in exactly the cells it measured it in, by
+    /// the grid's own walk. A title of explicit Devanagari half forms
+    /// (`क्‍ष`, which the grid folds into ONE cell after the ZWJ) was measured
+    /// as one cell per form and painted as two, so the row ran off its end
+    /// and indexed past the cell vector: a panic in the paint path from a
+    /// title any program can set with OSC 0/2. Sinhala `ක්‍ය` is two clusters
+    /// in one cell; its second cluster joins the first's cell rather than
+    /// vanish or take a cell of its own.
+    #[test]
+    fn header_rows_paint_titles_in_the_cells_they_measure() {
+        let theme = aterm_render::Theme::default();
+        let indicators = TabIndicators::default();
+        for title in [
+            "\u{915}\u{94d}\u{200d}\u{937}",
+            "\u{d9a}\u{dca}\u{200d}\u{dba}",
+            "\u{1f44d}\u{200d}\u{200d}\u{1f44d}",
+            "\u{a9}\u{fe0f}",
+            "\u{928}\u{94d}\u{926}\u{940}",
+        ] {
+            for n in [1, 3, 8, 40] {
+                let text = label(1, "", &title.repeat(n));
+                for cols in 2..60 {
+                    let row = semantic_row(&text, cols, cols % 2 == 0, theme, indicators);
+                    assert_eq!(row.cells.len(), cols);
+                    assert!(
+                        row.clusters.iter().all(|(at, _)| *at < cols)
+                            && row.combining.iter().all(|(at, _)| *at < cols),
+                        "{title:?} x{n} in {cols} columns"
+                    );
+                }
+            }
+        }
+        let row = semantic_row("\u{d9a}\u{dca}\u{200d}\u{dba}Z", 4, true, theme, indicators);
+        assert_eq!(
+            row.cells.iter().map(|c| c.ch).collect::<String>(),
+            "\u{25b8}\u{d9a}Z "
+        );
+        assert_eq!(
+            row.combining,
+            vec![(1, vec!['\u{dca}', '\u{200d}', '\u{dba}'].into_boxed_slice())]
         );
     }
 

@@ -46,11 +46,12 @@ const TRIPLE: &str = "aarch64-apple-darwin";
 /// 2026-08-04T00:00:00Z — inside the roster's default validity window.
 const NOW: i64 = 1_785_801_600;
 
-fn scratch(label: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("atpkg-o2c-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A test's own directory, removed when the test ends, failed or not.
+fn scratch(label: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("atpkg-o2c-{label}-"))
+        .tempdir()
+        .unwrap()
 }
 
 /// A raw USTAR + zstd archive holding `bin/ay`.
@@ -251,8 +252,9 @@ fn request() -> InstallRequest<'static> {
 /// that same machine.
 #[test]
 fn one_master_and_one_roster_authorize_both_a_release_and_a_toolchain_index() {
-    let dir = scratch("both");
-    let p = with_roster_sig(publish(&dir, "m3", &[]));
+    let tmp = scratch("both");
+    let dir = tmp.path();
+    let p = with_roster_sig(publish(dir, "m3", &[]));
 
     // ---- product 1: the aterm release, through `aterm_update_core::roster` -----------
     let verified = verify_roster(&[&p.master_pub], p.roster_bytes.clone(), &p.roster_sig)
@@ -273,7 +275,7 @@ fn one_master_and_one_roster_authorize_both_a_release_and_a_toolchain_index() {
     // The anchor is the SAME master key the release chain just used — not a second root,
     // not a package-specific key. That equality is the entire point of this test.
     let anchor = atpkg::Anchor::of(vec![p.master_pub.clone()], 0);
-    let layout = store_at(&dir, "prefix");
+    let layout = store_at(dir, "prefix");
     let report = atpkg::install(
         &p.registry,
         &layout,
@@ -297,8 +299,6 @@ fn one_master_and_one_roster_authorize_both_a_release_and_a_toolchain_index() {
         anchor.is_armed(),
         "precondition: the atpkg anchor is armed with the master, not a package root"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// THE DANGEROUS DIRECTION, through the whole client flow: with NOTHING pinned, atpkg
@@ -311,9 +311,10 @@ fn one_master_and_one_roster_authorize_both_a_release_and_a_toolchain_index() {
 /// does: nothing — the test passes its own empty anchor and never reads `pins`.
 #[test]
 fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
-    let dir = scratch("inert");
-    let p = with_roster_sig(publish(&dir, "m3", &[]));
-    let layout = store_at(&dir, "prefix");
+    let tmp = scratch("inert");
+    let dir = tmp.path();
+    let p = with_roster_sig(publish(dir, "m3", &[]));
+    let layout = store_at(dir, "prefix");
 
     let inert = atpkg::Anchor::of(vec![], 0);
     assert!(!inert.is_armed(), "precondition: nothing is pinned");
@@ -357,17 +358,16 @@ fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
     // The pure core, over the COMPILED anchor. (It once had to be the pure core because
     // `manager_enabled()` also read `ATPKG_DISABLE`; that switch is gone, 2026-09-23.)
     assert!(atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A DIFFERENT master installs nothing — and, crucially, there is no older root left to
 /// fall back to, so "wrong master" is the end of the road rather than a downgrade.
 #[test]
 fn a_client_pinned_to_a_different_master_installs_nothing() {
-    let dir = scratch("wrong-master");
-    let p = with_roster_sig(publish(&dir, "m3", &[]));
-    let layout = store_at(&dir, "prefix");
+    let tmp = scratch("wrong-master");
+    let dir = tmp.path();
+    let p = with_roster_sig(publish(dir, "m3", &[]));
+    let layout = store_at(dir, "prefix");
 
     let (_other_key, other_pub) = atpkg_keys::generate().unwrap();
     assert_ne!(other_pub, p.master_pub, "the fixture must actually differ");
@@ -381,7 +381,6 @@ fn a_client_pinned_to_a_different_master_installs_nothing() {
     )
     .expect_err("a registry not authorized by the pinned master must not install");
     assert!(matches!(err, atpkg::FlowError::NoIndex), "{err:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// ONE REVOCATION STOPS BOTH PRODUCTS. This is the property the two-root design could not
@@ -394,9 +393,10 @@ fn a_client_pinned_to_a_different_master_installs_nothing() {
 /// candidate set before either signature is checked.
 #[test]
 fn revoking_one_machine_stops_the_release_and_the_toolchain_at_once() {
-    let dir = scratch("revoked");
-    let p = with_roster_sig(publish(&dir, "m3", &["m3"]));
-    let layout = store_at(&dir, "prefix");
+    let tmp = scratch("revoked");
+    let dir = tmp.path();
+    let p = with_roster_sig(publish(dir, "m3", &["m3"]));
+    let layout = store_at(dir, "prefix");
     let anchor = atpkg::Anchor::of(vec![p.master_pub.clone()], 0);
 
     // PRECONDITION: this is a REVOCATION, not a machine that was never minted. `revoke`
@@ -443,9 +443,10 @@ fn revoking_one_machine_stops_the_release_and_the_toolchain_at_once() {
 
     // NON-VACUITY: the SAME machine key, the same documents, published under a roster that
     // does not revoke it — both accepted. So the two refusals above are the revocation.
-    let dir2 = scratch("revoked-control");
-    let ok = with_roster_sig(publish(&dir2, "m3", &[]));
-    let ok_layout = store_at(&dir2, "prefix");
+    let tmp2 = scratch("revoked-control");
+    let dir2 = tmp2.path();
+    let ok = with_roster_sig(publish(dir2, "m3", &[]));
+    let ok_layout = store_at(dir2, "prefix");
     assert!(
         atpkg::install(
             &ok.registry,
@@ -458,9 +459,6 @@ fn revoking_one_machine_stops_the_release_and_the_toolchain_at_once() {
         .is_ok()
     );
     assert!(!ok.machine_key.is_empty(), "the control used a real key");
-
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&dir2);
 }
 
 /// A REPLAYED ROSTER GENERATION is refused forever once a newer one has been durably seen —
@@ -471,9 +469,10 @@ fn revoking_one_machine_stops_the_release_and_the_toolchain_at_once() {
 /// so the ratchet is what stops it.
 #[test]
 fn a_pre_revocation_roster_cannot_be_replayed_past_the_ratchet() {
-    let dir = scratch("replay");
-    let p = with_roster_sig(publish(&dir, "m3", &[]));
-    let layout = store_at(&dir, "prefix");
+    let tmp = scratch("replay");
+    let dir = tmp.path();
+    let p = with_roster_sig(publish(dir, "m3", &[]));
+    let layout = store_at(dir, "prefix");
 
     // Its master signature still verifies — that is exactly why the floor exists.
     assert!(
@@ -495,7 +494,7 @@ fn a_pre_revocation_roster_cannot_be_replayed_past_the_ratchet() {
         .is_ok(),
         "seq == floor is the current generation, not an attack"
     );
-    let fresh = store_at(&dir, "prefix2");
+    let fresh = store_at(dir, "prefix2");
     let err = atpkg::install(
         &p.registry,
         &fresh,
@@ -507,7 +506,6 @@ fn a_pre_revocation_roster_cannot_be_replayed_past_the_ratchet() {
     .expect_err("a client that has seen a newer generation refuses this one");
     assert!(matches!(err, atpkg::FlowError::NoIndex), "{err:?}");
     assert!(atpkg::which(&fresh, "ay").is_none());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// THE MACHINE ID IS NOT A LABEL, on the atpkg side too. An index signed by the rostered
@@ -515,9 +513,10 @@ fn a_pre_revocation_roster_cannot_be_replayed_past_the_ratchet() {
 /// authenticated by the time the check runs.
 #[test]
 fn an_index_cannot_wear_another_machines_name() {
-    let dir = scratch("relabel");
-    let mut p = with_roster_sig(publish(&dir, "m3", &[]));
-    let layout = store_at(&dir, "prefix");
+    let tmp = scratch("relabel");
+    let dir = tmp.path();
+    let mut p = with_roster_sig(publish(dir, "m3", &[]));
+    let layout = store_at(dir, "prefix");
 
     // Re-cut the index claiming `m11` — and SIGN IT with m3's real key, so the signature
     // itself is genuine and only the claim is false.
@@ -542,7 +541,6 @@ fn an_index_cannot_wear_another_machines_name() {
     .expect_err("a genuine signature must not be wearable under another machine's name");
     assert!(matches!(err, atpkg::FlowError::NoIndex), "{err:?}");
     assert_eq!(p.machine_id, "m3", "the key that signed really is m3's");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // =====================================================================================
@@ -650,7 +648,8 @@ fn release(
 /// who may sign before any number is compared.
 #[test]
 fn a_revoked_machine_cannot_outbid_the_generation_that_revokes_it() {
-    let dir = scratch("outbid");
+    let tmp = scratch("outbid");
+    let dir = tmp.path();
     let o = two_machines();
     let before = both_rostered(&o, &[]);
     let after = both_rostered(&o, &["m11"]);
@@ -671,7 +670,7 @@ fn a_revoked_machine_cannot_outbid_the_generation_that_revokes_it() {
         release("thief-m11", &before, &o.m11, "m11", 100),
         release("owner-revoking", &after, &o.m3, "m3", 50),
     ]);
-    let layout = store_at(&dir, "prefix");
+    let layout = store_at(dir, "prefix");
     let anchor = atpkg::Anchor::of(vec![o.master_pub.clone()], 0);
     let index =
         atpkg::resolve_verified_index(&fetcher, &layout, &anchor, atpkg::BuildFloor::none(), NOW)
@@ -688,7 +687,7 @@ fn a_revoked_machine_cannot_outbid_the_generation_that_revokes_it() {
     // NON-VACUITY, both directions. The thief's release is not malformed: served alone
     // (against a client that has not yet seen the revocation) it is selected, and it really
     // does carry the higher build.
-    let alone = store_at(&dir, "alone");
+    let alone = store_at(dir, "alone");
     let solo = atpkg::resolve_verified_index(
         &Releases(vec![release("thief-m11", &before, &o.m11, "m11", 100)]),
         &alone,
@@ -699,8 +698,6 @@ fn a_revoked_machine_cannot_outbid_the_generation_that_revokes_it() {
     .expect("it is a genuine release of the older generation");
     assert_eq!(solo.index_build, 100);
     assert_eq!(solo.attribution().machine_id, "m11");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// SEEING A REVOCATION IS DURABLE, EVEN WHEN NOTHING IS INSTALLED UNDER IT.
@@ -717,11 +714,12 @@ fn a_revoked_machine_cannot_outbid_the_generation_that_revokes_it() {
 /// `aterm-update`'s sibling tier has always done for the same document.
 #[test]
 fn observing_a_revocation_is_durable_even_when_nothing_installs() {
-    let dir = scratch("observe");
+    let tmp = scratch("observe");
+    let dir = tmp.path();
     let o = two_machines();
     let before = both_rostered(&o, &[]);
     let after = both_rostered(&o, &["m11"]);
-    let layout = store_at(&dir, "prefix");
+    let layout = store_at(dir, "prefix");
     std::fs::create_dir_all(&layout.prefix).unwrap();
 
     // PASS 1 — the revoking generation is fetched and admitted, and the install fails
@@ -752,23 +750,41 @@ fn observing_a_revocation_is_durable_even_when_nothing_installs() {
 
     // PASS 2 — the attacker serves ONLY the pre-revocation generation, whose master
     // signature is still perfectly valid, with a high-build index signed by revoked m11.
+    // The generation that authorized m11 is dead to this client: the served set selects
+    // nothing, so the store goes on with the last index it trusted (its §14 cache, the
+    // owner's revoking release from pass 1) — never the thief's.
+    let thief = Releases(vec![release("thief-m11", &before, &o.m11, "m11", 999)]);
+    let anchor = atpkg::Anchor::of(vec![o.master_pub.clone()], recorded);
+    let served =
+        atpkg::resolve_verified_index(&thief, &layout, &anchor, atpkg::BuildFloor::none(), NOW)
+            .expect("the cached owner's index still serves");
+    assert_eq!(
+        (
+            served.attribution().machine_id.as_str(),
+            served.index_build,
+            served.roster_seq()
+        ),
+        ("m3", 50, after.0.roster_seq),
+        "the revoked machine's index is never selected; the owner's cached one is"
+    );
     let replayed = atpkg::install(
-        &Releases(vec![release("thief-m11", &before, &o.m11, "m11", 999)]),
+        &thief,
         &layout,
-        &atpkg::Anchor::of(vec![o.master_pub.clone()], recorded),
+        &anchor,
         &request(),
         atpkg::BuildFloor::none(),
         NOW,
     )
-    .expect_err("the generation that authorized m11 is dead to this client");
+    .expect_err("nothing installs: the cached owner's release publishes no manifest");
     assert!(
-        matches!(replayed, atpkg::FlowError::NoIndex),
-        "the refusal is 'no index I can trust' at the selection tier: {replayed:?}"
+        !matches!(replayed, atpkg::FlowError::NoIndex),
+        "the cached owner's index is selected, so the failure is downstream of it: \
+         {replayed:?}"
     );
 
     // NON-VACUITY: those exact bytes install-attempt PAST selection on a client that never
     // saw the revocation — so pass 2's refusal is the durable observation and nothing else.
-    let naive = store_at(&dir, "naive");
+    let naive = store_at(dir, "naive");
     let naive_err = atpkg::install(
         &Releases(vec![release("thief-m11", &before, &o.m11, "m11", 999)]),
         &naive,
@@ -783,6 +799,4 @@ fn observing_a_revocation_is_durable_even_when_nothing_installs() {
         "a client that never saw the revocation DOES accept the thief's index — which is \
          exactly why the observation has to be durable. Got {naive_err:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

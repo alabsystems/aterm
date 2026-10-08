@@ -326,6 +326,25 @@ pub(crate) struct SessionRecord {
     /// always did. In neither proof digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport_from_bottom: Option<u32>,
+    /// THE RENDER DEBT (additive, absent ⇒ none; the render stream, R08):
+    /// `"<shift>,<pushed>"` — the rows the ENGINE owed this session's alternate
+    /// screen when it was parked (`Terminal::render_debt`), written only for a
+    /// session on the alternate screen whose debt is not zero and whose screen
+    /// is carried (not blank on purpose). A program that misses a resize of its
+    /// window is left drawing one row off, and the update must not launder
+    /// that: the successor seeds its engine with the debt
+    /// (`Terminal::seed_render_debt`), and the SAME epoch judge and repaint
+    /// nudge that would have judged the tab in the parent judge it. Absent
+    /// means "owes nothing, or the producer predates the field" and nothing
+    /// happens: the debt is carried, never a verdict about the program. In
+    /// neither proof digest; a value that does not read (`lenient_row`) seeds
+    /// nothing and never costs the manifest. An older reader skips the key.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row"
+    )]
+    pub render_debt: Option<String>,
     /// THE MAILBOX'S OUTBOUND HALF AND ITS ID COUNTERS (additive, absent ⇒
     /// none; round seven of the update audit, findings 6, 8 and 28): the posts
     /// still waiting for a bridge, the receipts still owed, and the last inbox,
@@ -355,6 +374,54 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_count"
     )]
     pub timeline_id: u64,
+    /// THE PAIR THE CRASH JOURNAL KEYS THIS SHELL BY (additive, absent ⇒ none;
+    /// round seven of the update audit, leftover I2b): `"<pid>:<id>"`, the
+    /// window process and pool id by which the crash journal image the
+    /// outgoing process still held names this shell's pane — written only when
+    /// that image is not the outgoing process's own (it took its own parent's
+    /// over at Commit and never replaced it: the image's first write failed and
+    /// the desk did not change since). The successor's keeper registration
+    /// names it beside the parent's pair (`keeper_link::Tag::keyed`), so a
+    /// successor that dies before its own first image still gets its kept
+    /// shells back in their panes two updates on. A value that does not read is
+    /// none ([`parse_journal_key`]); in neither proof digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_key: Option<String>,
+}
+
+/// The wire spelling of a crash journal key (`<pid>:<id>`,
+/// [`SessionRecord::journal_key`]).
+pub(crate) fn journal_key_row((pid, id): (u32, u64)) -> String {
+    format!("{pid}:{id}")
+}
+
+/// Read a carried crash journal key: a window pid that is a process (never
+/// `0`) and a pool id, or none.
+pub(crate) fn parse_journal_key(row: &str) -> Option<(u32, u64)> {
+    let (pid, id) = row.split_once(':')?;
+    Some((
+        pid.parse::<u32>().ok().filter(|pid| *pid != 0)?,
+        id.parse::<u64>().ok()?,
+    ))
+}
+
+/// The wire spelling of a render debt (`<shift>,<pushed>`).
+pub(crate) fn render_debt_row(shift: i32, pushed: i32) -> String {
+    format!("{shift},{pushed}")
+}
+
+/// Read a carried render debt. Anything but two integers, or a debt of zero,
+/// is no debt: the successor owes the program nothing it was not told.
+pub(crate) fn parse_render_debt(row: &str) -> Option<(i32, i32)> {
+    let (shift, pushed) = row.split_once(',')?;
+    let debt = (
+        shift.trim().parse::<i32>().ok()?,
+        pushed.trim().parse::<i32>().ok()?,
+    );
+    // The engine's debt is a handful of rows; a value past a screen is a bad
+    // row, not a debt (`seed_render_debt` would take any i32).
+    (debt != (0, 0) && debt.0.unsigned_abs() <= 4096 && debt.1.unsigned_abs() <= 4096)
+        .then_some(debt)
 }
 
 impl SessionRecord {
@@ -531,14 +598,14 @@ fn is_zero(count: &u64) -> bool {
 ///
 /// A session handed off by a build that wrote no [`SessionHandoff::outgoing_build`]
 /// at all — the old→new handoff that introduced the field, by definition — is
-/// FROZEN: the row must not claim "this one too" for it, and names the in-place
+/// FROZEN: the record must not claim "every aterm tab" for it, and names the in-place
 /// remedy (sourcing the atpkg hook in that tab; `toolchain_words::HookDialect`).
 ///
 /// PRESENCE, NOT A NUMBER (review, 2026-09-16). The first cut compared
 /// `outgoing_build` against a hand-picked epoch of that day (1789585000, 11:56
 /// PDT), on the argument that build numbers are the cutter's ledger claims
 /// stamped from committer epochs and so rise monotonically. They do — but
-/// `crates/aterm-gui/build.rs` stamps a DEV build from HEAD's committer epoch
+/// `crates/aterm/build.rs` stamps a DEV build from HEAD's committer epoch
 /// too ("0" only without git), and HEAD at authoring time was 1789580066, BELOW
 /// that bar: a dev build of this very change — or a release cut in the minutes
 /// after review — would have handed off with a number under it and marked every
@@ -563,8 +630,7 @@ pub(crate) fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
 /// rides the TOML manifest; the grid byte blobs (binary `Line` codec — the same
 /// codec scrollback offload already trusts across process restarts) ride
 /// nonce-stamped sidecar files next to the manifest. The modern two-phase reader
-/// requires the declared schema and every semantics-bearing meta key; the explicit
-/// one-release legacy protocol alone tolerates schema 0.
+/// requires the declared schema and every semantics-bearing meta key.
 ///
 /// WHAT A BAD CARRY COSTS (the 2026-09-22/23 update audit, plan P0-2). A carry
 /// that is missing, names a sidecar other than its own, or breaks a RESOURCE
@@ -579,8 +645,8 @@ pub(crate) fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
 /// shell on the old build, update after update.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScreenCarry {
-    /// Required by the modern two-phase protocol. `0` is accepted only by the
-    /// explicit v0.52/v0.53 one-channel bridge.
+    /// Must equal [`Self::SCHEMA`]; any other value (including a defaulted 0)
+    /// refuses the screen.
     #[serde(default)]
     pub schema: u32,
     /// The checkpoint minus its grid blobs (`aterm_core::terminal::CheckpointMeta`),
@@ -629,6 +695,38 @@ pub(crate) struct WindowCarry {
     pub outer_x: Option<i32>,
     #[serde(default)]
     pub outer_y: Option<i32>,
+    /// THE WINDOW'S RAW INNER SIZE, `[width, height]` in physical px, as the
+    /// outgoing window recorded it (`WindowState::win_px`). Additive: absent
+    /// in older and headless carries, which the successor reads as the exact
+    /// frame of `rows`×`cols`, the only size it had before.
+    ///
+    /// Why (P6, finding 4): a font zoom re-grids INSIDE the window it has and
+    /// never resizes it, so a zoomed window is its grid's frame plus a
+    /// remainder of up to one cell per axis, and the zoom back out re-grids
+    /// that same window to the grid it had. `rows`/`cols` carry only the
+    /// zoomed grid, so a successor that sized its window as the exact frame
+    /// of that grid dropped the remainder, and the zoom back out fitted a row
+    /// and a column fewer, one more at every handoff between zoom steps
+    /// (1048×678 → 1038×675 → 1038×659 → 1038×654 → 1038×640).
+    ///
+    /// The successor takes the size only when it holds exactly the carried
+    /// grid at its own metrics (`App::attach_frame_px`); otherwise it
+    /// sizes the exact frame, as before. No digest covers it: the adoption
+    /// proof commits to the layout and screen bytes, never to this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_px: Option<[u32; 2]>,
+    /// THE WINDOW'S PRESENCE ROW (additive, absent ⇒ none): whether the
+    /// outgoing window had its presence row committed under its chrome
+    /// (`WindowState::presence`, the agent's status line), which its grid and
+    /// `inner_px` hold. Per window, unlike the band's shared rows below, and
+    /// the successor's presence rows are frozen until Commit, so it reserves
+    /// the row before its first attach sizes the window
+    /// (`WindowState::take_carried_frame`): without it the carried size read a
+    /// cell taller than the frame it measured and was refused, and the
+    /// Commit's lift then re-gridded the window a row shorter than its
+    /// parent's. Written only while a row stands; no digest covers it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub presence_row: bool,
     /// THE MESSAGE BAND'S ROWS the outgoing window had committed above its
     /// grid at handoff time (`App::message_band_rows`), with the messages
     /// each row carried (`messages`). The successor reserves the same rows
@@ -695,18 +793,36 @@ pub(crate) struct WindowCarry {
     /// an older reader ignores the key (no `deny_unknown_fields`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub update_health_said: Vec<CarriedHealthSaid>,
+    /// WHEN THE MESSAGES ABOVE WERE CAPTURED, on the outgoing process's wall
+    /// clock (Unix ms; additive, absent ⇒ unknown; round eight of the update
+    /// audit, the U5 group's review of lead U62). The parent records on from
+    /// [`Self::next_message_id`] until Commit, into the `messages.log` every
+    /// aterm of the user shares, and its successor reads a healing the parent
+    /// recorded there as already said (`App::forget_health_the_parked_parent_healed`).
+    /// An id alone does not say which process wrote a record, or when: another
+    /// aterm's records carry its own counter's ids, and one that collided loads
+    /// under a fresh id above the file's top. A record stamped before this was
+    /// written before the capture, whatever its id. A successor given no stamp
+    /// (an older parent) reads no record as the parent's healing. Written only
+    /// with a carry; an older reader ignores the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_captured_unix_ms: Option<u64>,
 }
 
 /// One unanswered update-health warning a parent had said, as the handoff
-/// carries it: its kind by the row key (`update_words::HealthKind::key`), and
-/// the title and first line its record of healing is written against. A key
-/// this build does not know is skipped by the successor, never guessed.
+/// carries it: its kind by the row key (`update_words::HealthKind::key`), the
+/// title and first line its record of healing is written against, and the
+/// whole sentence its "To look at" line quotes (empty from a parent older than
+/// it). A key this build does not know is skipped by the successor, never
+/// guessed.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CarriedHealthSaid {
     pub kind: String,
     pub title: String,
     #[serde(default)]
     pub line: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
 }
 
 /// The message fields of a [`WindowCarry`] as one value — what
@@ -717,6 +833,8 @@ pub(crate) struct MessagesCarry {
     pub messages: Vec<CarriedMessage>,
     pub next_message_id: u64,
     pub update_health_said: Vec<CarriedHealthSaid>,
+    /// [`WindowCarry::messages_captured_unix_ms`].
+    pub captured_unix_ms: Option<u64>,
 }
 
 #[cfg(any(unix, test))]
@@ -726,6 +844,7 @@ impl From<&aterm_messages::Carry> for MessagesCarry {
             messages: carry.live.iter().map(CarriedMessage::from).collect(),
             next_message_id: carry.next_id,
             update_health_said: Vec::new(),
+            captured_unix_ms: None,
         }
     }
 }
@@ -806,6 +925,33 @@ pub struct CarriedMessage {
     /// row, or one about now — reads `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retrospective: bool,
+    /// The row is the WIRE's (`aterm_messages::Origin::wire_owned`): a
+    /// keyless `notice post` row stays the wire's across the handoff by this
+    /// (design ruling 415 (h)). Absent — an older parent's row, or a host
+    /// row — reads `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wire: bool,
+    /// Duplicate posts folded into the row (design ruling 415 (j)). Absent —
+    /// an older parent's row, or one posted once — reads 1.
+    #[serde(
+        default = "carried_repeats",
+        skip_serializing_if = "is_carried_repeats"
+    )]
+    pub repeats: u32,
+}
+
+/// [`CarriedMessage::repeats`]' default: posted once.
+fn carried_repeats() -> u32 {
+    1
+}
+
+/// The default is not written.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the field by reference"
+)]
+fn is_carried_repeats(repeats: &u32) -> bool {
+    *repeats == 1
 }
 
 /// [`CarriedMessage::excerpt`]'s default: the excerpt is painted.
@@ -842,6 +988,8 @@ impl From<&aterm_messages::CarriedMessage> for CarriedMessage {
             excerpt: m.excerpt,
             finished: m.finished.clone(),
             retrospective: m.retrospective,
+            wire: m.wire,
+            repeats: m.repeats,
         }
     }
 }
@@ -866,6 +1014,8 @@ impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
             excerpt: m.excerpt,
             finished: m.finished.clone(),
             retrospective: m.retrospective,
+            wire: m.wire,
+            repeats: m.repeats,
         }
     }
 }
@@ -980,6 +1130,68 @@ pub(crate) struct HeldPaneCarry {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_signal: Option<u8>,
+    /// The pane's session id (round eight, finding 21), so the successor
+    /// registers it under the sid `aterm ctl @<sid>` named before the update,
+    /// as it does an adopted shell's (`SessionRecord::sid`). ADDITIVE and
+    /// outside every digest like the rest of the side list: an older reader
+    /// ignores it, and a successor that reads none (an older producer's
+    /// manifest) mints a fresh one, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// The scrollback lines the held carry left behind, counted on the band
+    /// like a handed tab's (round eight, finding 39): every line when no
+    /// sidecar is named, else the lines older than the sidecar's.
+    /// ADDITIVE: an older reader counts none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub history_dropped: u64,
+    /// WHY `history_dropped` stayed behind, when the successor's signed
+    /// handoff policy carries no scrollback (`handoff_history::HeldLoss::Withheld`):
+    /// the new build's request, said as one — as `SessionRecord::history_withheld`
+    /// says it for a handed session. ADDITIVE, absent ⇒ `false`, in neither
+    /// proof digest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history_withheld: bool,
+    /// WHY `history_dropped` stayed behind, when the carry was OFFERED and
+    /// FAILED (`handoff_history::HeldLoss::Failed`): the export had not
+    /// reached the pane or refused it, a resize moved its fence, the sidecar
+    /// could not be named, or the history was deeper than one export carries.
+    /// The successor says those lines as a failure, never as a held pane's by
+    /// design (the review of round eight's finding 39). With neither key the
+    /// lines were left by design: the hop carried a held pane's screen alone
+    /// (a successor older than the producer). ADDITIVE, absent ⇒ `false`, in
+    /// neither proof digest; a record with both is read as failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history_failed: bool,
+    /// HISTORY CARRY (additive, absent tolerated; round eight of the update
+    /// audit, finding 39): `"<len> <sha256hex> <take>"` of this pane's
+    /// `seamless-<pid>-<nonce>.h<id>.hist` sidecar — its scrollback, exactly
+    /// as a handed session's `SessionRecord::history` carries one
+    /// (`handoff_history::name_held_sidecar`). An older reader skips it and
+    /// leaves the sidecar, which the outgoing process retires once the proof
+    /// checks out; in neither proof digest, like the whole side list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<String>,
+    /// CONTROL CARRY (additive, absent tolerated; round eight of the update
+    /// audit, finding 730): `"<len> <sha256hex>"` of this pane's
+    /// `seamless-<pid>-<nonce>.h<id>.ctl` sidecar — its turn ledger and archive
+    /// tail, exactly as a handed session's `SessionRecord::control` carries them
+    /// (`crate::handoff_carry`), so `history` and `aterm drive report` still read
+    /// the turns a manager drove into the pane before its command ended. An
+    /// older reader skips it and leaves the sidecar, which the outgoing process
+    /// retires once the proof checks out; in neither proof digest, like the
+    /// whole side list. A successor that reads none (an older producer, a carry
+    /// left out) starts the pane's ledger saying which turn ids it cannot vouch
+    /// for, as it does an adopted session's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<String>,
+    /// THE PERSON HAD SEEN ITS FAILURE (round eight of the update audit, U34):
+    /// the pane's exit marked its tab as a failure and the person had looked at
+    /// it (`session_status::StatusObserver::failure_seen`), so the successor,
+    /// which shows the carried exit again, keeps the mark quiet. ADDITIVE,
+    /// absent ⇒ `false` (the mark shows, as it did from every older producer),
+    /// in neither proof digest; an older reader skips it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failure_seen: bool,
 }
 
 // ⚠ LOAD-BEARING WIRE FORMAT — DO NOT "CLEAN UP" THIS SERIALIZATION.
@@ -998,6 +1210,118 @@ pub(crate) struct HeldPaneCarry {
 // (`seamless::layout_wire_digest` / `seamless::screen_wire_digest`) — keep it
 // that way. Additive `#[serde(default, skip_serializing_if = "…")]` fields are
 // the safe shape; anything else needs a protocol-shape bump.
+/// The parts of a session's handoff record its meta and its fabric give, as
+/// [`SessionHandoff::from_store`] draws them: one function for the park's draw
+/// and the Commit's second reading ([`CarriedClaims::of_session`]), so the two
+/// cannot disagree about a session nothing moved.
+#[cfg(any(unix, test))]
+struct Drawn {
+    /// The operator metadata, sanitized as a record carries it.
+    meta: crate::session_timeline::SessionMeta,
+    /// The claim's row (`"<holder> <remaining_ms>"`) and whether the producer
+    /// vouches for it ([`SessionRecord::claim_known`]).
+    supervisor: Option<String>,
+    claim_known: bool,
+    /// The keyed escalations, in write order.
+    attention_owners: Vec<String>,
+    /// The broadcast opt-ins.
+    topics: Vec<String>,
+}
+
+#[cfg(any(unix, test))]
+impl Drawn {
+    /// `ctx`'s draw at `now_us`, its own host `own_holder`: the meta's leaf
+    /// lock, then the topics' — never across a `Terminal` lock or each other.
+    fn of(ctx: &SessionCtx, now_us: u64, own_holder: &str) -> Self {
+        let (meta, (supervisor, claim_known), attention_owners) = {
+            let live = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                live.sanitized(),
+                live.handoff_supervisor(now_us, own_holder),
+                live.handoff_attention_owners(),
+            )
+        };
+        Self {
+            meta,
+            supervisor,
+            claim_known,
+            attention_owners,
+            topics: crate::fabric::render_topics(&ctx.fabric.topics()),
+        }
+    }
+}
+
+/// What a handoff record carries of a session that a control verb can move
+/// after the park drew it, and that no other Commit fact compares (round eight
+/// of the update audit, finding 751): its broadcast opt-ins (`topic add` /
+/// `drop`), its keyed escalations (`meta set attention owner=…`) and its
+/// supervisor claim (`meta set supervisor …`) — the holder and whether the
+/// producer vouches for the claim, never a lease's remaining time, which moves
+/// by itself. A change answered `OK` between the park's draw and the Commit
+/// was in no manifest, and a Commit that landed lost it with this process.
+///
+/// The rest of a record is compared elsewhere: the six bare meta fields ride
+/// the layout, which the Commit captures again (`exact_layout`); the hold and
+/// the outbox ride the serials (`App::hold_serials`); the inbox and timeline
+/// ids their reserves. The park keeps each record's as drawn
+/// ([`Self::of_record`]), the Commit reads each live session's
+/// ([`Self::of_session`]), and any difference stands the Commit down — a
+/// lossless retry, whose next draw carries the change. Compared as final
+/// state, so a change made and undone inside the window costs nothing, and a
+/// change made just before the draw and undone after it is still caught.
+#[cfg(any(unix, test))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CarriedClaims {
+    pub local_id: u64,
+    topics: Vec<String>,
+    attention_owners: Vec<String>,
+    /// The claim's holder, without the lease's remaining time.
+    supervisor: Option<String>,
+    claim_known: bool,
+}
+
+#[cfg(any(unix, test))]
+impl CarriedClaims {
+    /// What `record` carries, as the park drew it.
+    #[must_use]
+    pub(crate) fn of_record(record: &SessionRecord) -> Self {
+        Self {
+            local_id: record.local_id,
+            topics: record.topics.clone(),
+            attention_owners: record.attention_owners.clone(),
+            supervisor: record.supervisor.as_deref().map(lease_holder),
+            claim_known: record.claim_known,
+        }
+    }
+
+    /// What a record drawn from `ctx` now would carry, `own_holder` this
+    /// process's own host ([`crate::harness_host::holder`]).
+    #[must_use]
+    pub(crate) fn of_session(
+        local_id: u64,
+        ctx: &SessionCtx,
+        now_us: u64,
+        own_holder: &str,
+    ) -> Self {
+        let drawn = Drawn::of(ctx, now_us, own_holder);
+        Self {
+            local_id,
+            topics: drawn.topics,
+            attention_owners: drawn.attention_owners,
+            supervisor: drawn.supervisor.as_deref().map(lease_holder),
+            claim_known: drawn.claim_known,
+        }
+    }
+}
+
+/// A carried supervisor row's holder (`"<holder> <remaining_ms>"`).
+#[cfg(any(unix, test))]
+fn lease_holder(row: &str) -> String {
+    row.split_once(' ')
+        .map_or(row, |(holder, _)| holder)
+        .to_string()
+}
+
 impl SessionHandoff {
     /// Current schema of the handoff manifest.
     pub(crate) const SCHEMA: u32 = 1;
@@ -1010,11 +1334,23 @@ impl SessionHandoff {
         let handles = store.snapshot();
         // CONNECTION CARRY (design §1.4#6): every live edge row across every
         // registered session's table, projected TOKENLESS — the same
-        // `EdgeTable::edges()` fold the `flows` verb aggregates (a row lives
-        // only in its destination's table, so the concatenation has no
-        // duplicates). Each table is a leaf lock (the meta-lock discipline
-        // below — never a `Terminal` lock). Sorted `(src, dst, op)` so the
-        // manifest bytes are stable for a given edge set.
+        // `EdgeTable::edges()` fold the `flows` verb aggregates. Each table is
+        // a leaf lock (the meta-lock discipline below — never a `Terminal`
+        // lock). Sorted `(src, dst, op)` so the manifest bytes are stable for
+        // a given edge set.
+        //
+        // EACH TRIPLE ONCE (round eight of the update audit, U23). A row lives
+        // only in its destination's table, but the raw `grant` verb mints a
+        // fresh row for every call, an identical `(src, dst, op)` included; a
+        // controller that granted on every attach filled the manifest past the
+        // cap the successor reads it under, and the update was refused whole on
+        // every attempt. Every successor since the carry began (646de9346)
+        // re-mints per pair from the SET of ops (`App::remint_carried_connections`),
+        // so a repeated triple is bytes every consumer throws away, and it is not
+        // written. A row the successor cannot re-mint — a source that is not one
+        // of its sessions, a self-loop — still rides (U23's review): the
+        // successor's drop of it is the `session_edge` audit that puts its
+        // dissolution on record, after the Commit that dissolves it.
         let mut connections: Vec<ConnectionCarry> = Vec::new();
         for h in &handles {
             let rows = {
@@ -1028,6 +1364,7 @@ impl SessionHandoff {
             }));
         }
         connections.sort_by(|a, b| (&a.src, &a.dst, &a.op).cmp(&(&b.src, &b.dst, &b.op)));
+        connections.dedup();
         // One clock and one name for every record's claim: a lease's remaining
         // time is counted from here, and this process's own host's claim is
         // left behind (its successor's host takes the session at Commit).
@@ -1066,15 +1403,16 @@ impl SessionHandoff {
                     // one copy; a leaf lock, taken after the store guard above
                     // already dropped — never across a Terminal lock) — and,
                     // under the same hold, the claim and the keyed escalations
-                    // the handoff carries (round four, item 9).
-                    let (meta, (supervisor, claim_known), attention_owners) = {
-                        let live = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-                        (
-                            live.sanitized(),
-                            live.handoff_supervisor(now_us, &own_holder),
-                            live.handoff_attention_owners(),
-                        )
-                    };
+                    // the handoff carries (round four, item 9), with the
+                    // topics: the one draw the Commit compares again
+                    // ([`CarriedClaims`]).
+                    let Drawn {
+                        meta,
+                        supervisor,
+                        claim_known,
+                        attention_owners,
+                        topics,
+                    } = Drawn::of(&h.ctx, now_us, &own_holder);
                     SessionRecord {
                         local_id: h.local_id,
                         sid: h.sid.as_str().to_string(),
@@ -1100,7 +1438,7 @@ impl SessionHandoff {
                         identity: h.identity.as_deref().map(str::to_owned),
                         // The broadcast opt-ins, off the one live copy — the
                         // same leaf lock the `topic` verb takes.
-                        topics: crate::fabric::render_topics(&h.ctx.fabric.topics()),
+                        topics,
                         // Stamped by the handoff's park capture, once the readers
                         // that write `Session::fg_holder` are parked
                         // (`app_update_handoff::stamp_fg_holders`).
@@ -1129,6 +1467,7 @@ impl SessionHandoff {
                         // Stamped with the history carry, from the park's head
                         // (`handoff_history::stamp_manifest`).
                         viewport_from_bottom: None,
+                        render_debt: None,
                         // The outbound mailbox and the id counters, under the
                         // fabric's leaf lock (round seven, findings 6/8/28).
                         fabric: h.ctx.fabric.handoff_carry(&mut post_budget),
@@ -1141,6 +1480,9 @@ impl SessionHandoff {
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .handoff_id(),
+                        // Stamped by the park from the crash journal's state
+                        // (`app_update_handoff::stamp_journal_keys`).
+                        journal_key: None,
                     }
                 })
                 .collect(),
@@ -1778,8 +2120,7 @@ impl SessionStore {
     /// Deregister the session with process-local id `local_id`, removing it from
     /// BOTH key spaces atomically and returning its stable sid (so the caller can
     /// retire external artifacts keyed by it — e.g. the sibling-discovery graph
-    /// entry). `None` if it is unknown — a late deregister mirrors the existing
-    /// `is_active_session` miss.
+    /// entry). `None` if it is unknown (a late deregister).
     ///
     /// `reason`/`actor` say why and by whom (the exit ledger's tale). A caller
     /// that passes [`ExitReason::Unknown`] on a session whose shell has already
@@ -2225,7 +2566,6 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
             crate::turn_ledger::TurnLedger::default(),
         )),
         meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
-        app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
@@ -2253,6 +2593,39 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A carried render debt round-trips, and a bad row is no debt: not two
+    /// integers, zero, past a screen, or `i32::MIN` (whose `abs` overflows).
+    #[test]
+    fn a_carried_render_debt_round_trips_and_a_bad_row_is_none() {
+        assert_eq!(parse_render_debt(&render_debt_row(-1, 3)), Some((-1, 3)));
+        assert_eq!(parse_render_debt(&render_debt_row(0, 0)), None);
+        assert_eq!(parse_render_debt("1"), None);
+        assert_eq!(parse_render_debt("a,b"), None);
+        assert_eq!(parse_render_debt("4096,-4096"), Some((4096, -4096)));
+        assert_eq!(parse_render_debt("4097,0"), None);
+        assert_eq!(parse_render_debt("-2147483648,0"), None);
+        assert_eq!(parse_render_debt("0,-2147483648"), None);
+    }
+
+    /// A carried crash journal key round-trips, and a bad one is none (round
+    /// seven's leftover I2b): not `<pid>:<id>`, or a pid `0`. A record without
+    /// the key — every producer before it — reads none.
+    #[test]
+    fn a_carried_journal_key_round_trips_and_a_bad_one_is_none() {
+        let key = (u32::MAX, u64::MAX);
+        assert_eq!(parse_journal_key(&journal_key_row(key)), Some(key));
+        assert_eq!(parse_journal_key("4141:7"), Some((4141, 7)));
+        for bad in ["", "4141", "0:7", "a:7", "4141:-1", "4141:7:1", " 4141:7"] {
+            assert_eq!(parse_journal_key(bad), None, "{bad:?}");
+        }
+        let old = SessionHandoff::from_toml(
+            "schema = 1\n\n[[sessions]]\nlocal_id = 0\nsid = \"s-0123456789abcdef0123\"\nstate = \
+             \"alive\"\ntitle = \"zsh\"\n",
+        )
+        .expect("an older producer's manifest parses");
+        assert_eq!(old.sessions[0].journal_key, None);
+    }
 
     fn handle(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
         handle_in_state(local_id, parent, SessionState::Alive)

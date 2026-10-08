@@ -19,10 +19,10 @@
 //! zsh/bash/fish it integrates; the loader captures and scrubs it and checks the
 //! file at every prompt (one fork-free `[[ -f ]]`). A successor that adopts such
 //! a shell across an update writes ITS OWN folder's address there
-//! ([`hand_over`]: the folder installed first, then the file `0600`, created
-//! exclusively, never through a symlink, in the `0700` control dir — the re-key
-//! channel's discipline, `shell_rekey::deliver`) — and the shell sources that
-//! folder's body at its next prompt. The loader takes a body ONLY from
+//! ([`hand_over`]: the folder installed first, then the file `0600`, renamed
+//! into place whole, never through a symlink, in the `0700` control dir — the
+//! re-key channel's discipline, `shell_rekey::deliver`) — and the shell sources
+//! that folder's body at its next prompt. The loader takes a body ONLY from
 //! `<root>/<address>/`, `<root>` being the folder it was itself loaded from, and
 //! only a 16-hex address; nothing a peer can write names a file it sources.
 //!
@@ -42,7 +42,11 @@
 //! absent) and `status` says `frozen` — until the live agent upgrade types its
 //! relaunch line there: `shell_rekey::typed` then also hands it this build's
 //! folder and its pointer path, and the line sources the loader
-//! (`aterm_shell_integration::typed_rekey_with_loader`).
+//! (`aterm_shell_integration::typed_rekey_with_loader`). The same line reaches
+//! a LOADER whose prompt hook never runs — a fish from before the prompt event
+//! (2026-10-01) under a prompt its config.fish defines reads no pointer and
+//! signs no revision for its life, though its record says it has a loader —
+//! which is why `typed` asks the revision the engine holds, never the record.
 //!
 //! [`SessionRecord::loader`]: crate::session_store::SessionRecord::loader
 
@@ -55,25 +59,15 @@ use aterm_session::SessionId;
 pub(crate) const POINTER_VAR: &str = aterm_core::shell_integration::BODY_POINTER_VAR;
 
 /// The directory the pointer files live in: `<control dir>/integration`,
-/// created `0700` (the control dir's own discipline). `None` when there is no
-/// private control dir to put it in — no pointer is offered then.
+/// created `0700`. `None` when there is no private control dir; no pointer is
+/// offered then.
 fn dir() -> Option<PathBuf> {
-    let dir = crate::control_auth::socket_dir()?.join("integration");
-    crate::control_auth::ensure_private_dir(&dir).ok()?;
-    Some(dir)
-}
-
-/// The pointer file of session `sid`, in `dir`. The sid is server-minted
-/// (`s-<hex>`); anything else is refused, so no carried value can steer a write
-/// out of the directory.
-fn path_in(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
-    let hex = sid.as_str().strip_prefix("s-")?;
-    (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| dir.join(sid.as_str()))
+    crate::control_auth::private_subdir("integration")
 }
 
 /// The pointer file of session `sid` in this user's control dir.
 pub(crate) fn path_for(sid: &SessionId) -> Option<PathBuf> {
-    path_in(&dir()?, sid)
+    crate::control_auth::sid_file_in(&dir()?, sid)
 }
 
 /// Remove session `sid`'s pointer, if one still waits there (the session closed
@@ -89,13 +83,12 @@ pub(crate) fn own_rev() -> &'static str {
     aterm_core::shell_integration::script_set_address()
 }
 
-/// POINT an adopted shell at this build's body, first half: this build's
-/// script folder installed (or verified byte for byte), and the pointer that
-/// names it, ready to write to `path` — or `None`, and why in the log, when the
-/// folder cannot be made sure of (a shell is never pointed at a folder that is
-/// not this build's). `carried` is the revision the shell last signed, carried
-/// across the update: a shell that already runs this build's body needs no
-/// pointer. File work, so the caller holds no engine lock.
+/// First half of pointing an adopted shell at this build's body: install (or
+/// verify byte for byte) this build's script folder and return the pointer
+/// naming it, ready to write to `path`. `None` (logged) when the folder cannot
+/// be verified. `carried` is the revision the shell last signed; a shell
+/// already on this build's body needs no pointer. Does file I/O, so the caller
+/// holds no engine lock.
 pub(crate) fn pending(
     path: &Path,
     id: u64,
@@ -164,16 +157,15 @@ pub(crate) fn hand_over(
 /// `status integration_rev=`: which integration body the session's shell runs,
 /// against the one this build ships.
 ///
-/// - `current` — the shell's last SIGNED revision is this build's.
-/// - `stale:<rev>` — it signed another build's (in practice an older one: a
-///   successor points an adopted shell at its own body, which the shell takes at
-///   its next prompt, and this word then reads `current`).
-/// - `frozen` — a shell whose integration predates loaders: adopted from a record
-///   with no loader, signing marks (`integration=on`/`degraded`) but no revision.
-///   Nothing reaches it by itself; a new tab does, and so does the live agent
-///   upgrade's relaunch line.
-/// - `-` — no revision to say: no integrated shell, one that has not reached its
-///   first prompt yet, or the terminal lock was contended (`engine` is `None`).
+/// - `current` — the shell's last signed revision is this build's.
+/// - `stale:<rev>` — it signed another build's (a successor points an adopted
+///   shell at its own body, which the shell takes at its next prompt).
+/// - `frozen` — the shell's integration predates loaders: adopted from a
+///   record with no loader, signing marks (`integration=on`/`degraded`) but no
+///   revision. Only a new tab or the live agent upgrade's relaunch line
+///   reaches it.
+/// - `-` — nothing to say: no integrated shell, no first prompt yet, or the
+///   terminal lock was contended (`engine` is `None`).
 ///
 /// `engine` is the shell's signed revision and its integration posture, read
 /// under the one terminal guard `status` takes.
@@ -233,26 +225,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_pointer_file_is_named_only_for_a_server_minted_sid() {
-        let dir = Path::new("/c/integration");
-        let sid = SessionId::new("s-09035e075d6ee9388965".to_string());
-        assert_eq!(path_in(dir, &sid), Some(dir.join("s-09035e075d6ee9388965")));
-        for bad in ["../x", "s-", "s-zz", "s-12/../../etc", "abc"] {
-            assert_eq!(
-                path_in(dir, &SessionId::new(bad.to_string())),
-                None,
-                "{bad}"
-            );
-        }
-    }
-
-    /// A shell that already signs this build's revision is not pointed anywhere;
-    /// any other — an older build's, or none carried — is pointed at this
-    /// build's folder, ONLY once that folder is made sure of: an installer that
-    /// fails, or hands back a folder not named by this build's address, points
-    /// nothing. The pointer lands as the re-key channel writes a key: the
-    /// address and its newline, `0600`.
+    /// A shell already signing this build's revision is not pointed anywhere;
+    /// any other is pointed at this build's folder only once that folder is
+    /// verified (a failing installer, or a folder not named by this build's
+    /// address, points nothing). The pointer is the address and a newline,
+    /// `0600`, as the re-key channel writes a key.
     #[test]
     fn an_adopted_shell_is_pointed_at_this_builds_body_unless_it_runs_it() {
         use std::os::unix::fs::PermissionsExt as _;

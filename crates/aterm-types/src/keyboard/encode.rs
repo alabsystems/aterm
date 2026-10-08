@@ -136,14 +136,14 @@ pub fn encode_key_with_layout(
     // VT goes out as the INPUT_RECORD pair conhost asked for — the Enter chords
     // and the ESC keys [`win32_key_record`] names — and it goes out FIRST, ahead
     // of the kitty gate and of xterm modifyOtherKeys, because under ConPTY
-    // conhost is the only reader there is. Measured 2026-09-22 (scratch
+    // conhost is the only reader there is. Measured (scratch
     // CreatePseudoConsole, conhost 10.0.26200): an application's `CSI > 1 u`
     // push and its `CSI > 4;2 m` reach this terminal verbatim through the
     // pipe, so the kitty flags and the xterm level really do get set here — but
     // conhost's input parser then DROPS the `CSI 13;2 u` and the
     // `CSI 27;2;13 ~` the terminal writes back (no INPUT_RECORD at all reached
     // a `ReadKey` loop; a byte fed after them arrived fine), while the win32
-    // pair arrives as `Enter+Shift`; re-measured 2026-09-27 for Escape's own
+    // pair arrives as `Enter+Shift`; likewise for Escape's own
     // `CSI 27 u` and Ctrl+['s `CSI 27;5;91 ~`, both dropped the same way.
     // Letting the application's push outrank the record would therefore kill
     // the key for exactly the applications that asked for it (Claude Code
@@ -404,16 +404,9 @@ fn encode_kitty(
         }
     }
 
-    if let Some(associated_text) = associated_text {
+    if let Some(codepoint) = associated_text {
         buf.push(b';');
-        let mut codepoints = associated_text.into_iter();
-        if let Some(first) = codepoints.next() {
-            write_u32(&mut buf, first);
-            for codepoint in codepoints {
-                buf.push(b':');
-                write_u32(&mut buf, codepoint);
-            }
-        }
+        write_u32(&mut buf, codepoint);
     }
 
     buf.push(b'u');
@@ -623,7 +616,7 @@ fn associated_text_codepoints(
     modifiers: Modifiers,
     mode: KeyboardMode,
     event_type: KeyEventType,
-) -> Option<Vec<u32>> {
+) -> Option<u32> {
     if !mode.contains(KeyboardMode::REPORT_ASSOCIATED_TEXT)
         || !mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
         || event_type == KeyEventType::Release
@@ -653,7 +646,7 @@ fn associated_text_codepoints(
             if text.is_control() {
                 None
             } else {
-                Some(vec![text as u32])
+                Some(text as u32)
             }
         }
         // A KEYPAD GLYPH KEY REPORTS THE TEXT IT TYPES. `REPORT_ASSOCIATED_TEXT`
@@ -700,7 +693,7 @@ fn associated_text_codepoints(
                 _ => None,
             });
             match text {
-                Some(glyph) if !glyph.is_control() => Some(vec![glyph as u32]),
+                Some(glyph) if !glyph.is_control() => Some(glyph as u32),
                 _ => None,
             }
         }
@@ -1257,13 +1250,7 @@ fn xterm_modify_other_keys_level2_applies(key: &Key, modifiers: Modifiers) -> bo
 // bytes are exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
 fn write_u8(buf: &mut Vec<u8>, val: u8) {
-    if val >= 100 {
-        buf.push(b'0' + val / 100);
-    }
-    if val >= 10 {
-        buf.push(b'0' + (val / 10) % 10);
-    }
-    buf.push(b'0' + val % 10);
+    write_u32(buf, u32::from(val));
 }
 /// Write a u32 as decimal digits to a buffer.
 // Skip: the key encoders build byte sequences via Vec push/extend and

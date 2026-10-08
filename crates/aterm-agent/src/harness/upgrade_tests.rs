@@ -17,7 +17,7 @@ fn rows(lines: &[&str]) -> Vec<String> {
 
 const ID: &str = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
 
-/// The session file Claude Code 2.1.280 wrote for pid 9162, measured 2026-09-23.
+/// The session file Claude Code 2.1.280 writes for a session.
 const SESSION_9162: &str = r#"{"pid":9162,"sessionId":"03396a15-856e-4f1b-8174-ae9a3e4b369f","cwd":"/Users/_owner/aterm","startedAt":1790194436213,"procStart":"Wed Sep 23 20:13:55 2026","version":"2.1.280","peerProtocol":1,"peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],"kind":"interactive","entrypoint":"cli","pidDomain":"darwin","messagingSocketPath":"/tmp/cc-socks/9162.sock","name":"aterm-83","nameSource":"derived","nameSince":1790194436213,"updatedAt":1790212772957,"status":"busy","statusUpdatedAt":1790212772957}"#;
 
 #[test]
@@ -67,8 +67,8 @@ fn cand(exe: &str, ver: &str, source: Source) -> Candidate {
 fn the_target_is_the_newest_build_never_sideways_and_managed_on_a_tie() {
     let managed_280 = cand("/pkg/agents/claude", "2.1.280", Source::Managed);
     let native_281 = cand("/n/versions/2.1.281", "2.1.281", Source::Native);
-    // Pid 9162 today (measured): native 2.1.280 running, managed 2.1.280, the
-    // native updater put 2.1.281 on disk -> the native 2.1.281.
+    // Native 2.1.280 running, managed 2.1.280, and the native updater put
+    // 2.1.281 on disk -> the native 2.1.281.
     let t = choose_target(&v("2.1.280"), &[managed_280.clone(), native_281.clone()]);
     assert_eq!(t, Some(native_281.clone()));
     // A tie at the newest version goes to the managed copy.
@@ -94,7 +94,7 @@ fn the_target_is_the_newest_build_never_sideways_and_managed_on_a_tie() {
 
 #[test]
 fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
-    // Pid 9162's argv, measured: a bare --resume (the picker) becomes the id.
+    // A bare --resume (the picker) becomes the id.
     let got = rewrite_argv(
         &argv(&["claude", "--dangerously-skip-permissions", "--resume"]),
         ID,
@@ -171,10 +171,9 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
 
 #[test]
 fn a_value_is_consumed_exactly_as_claudes_parser_consumes_it() {
-    // `<values...>` is REQUIRED: Claude's parser takes the first value whatever
-    // it looks like. A rewrite that stopped there left the flag bare, and the
-    // bare flag swallowed the appended `--resume <id>` as its own values
-    // (measured with the bundled parser: add-dir = ["--resume", id], no resume).
+    // `<values...>` requires a value: Claude's parser takes the first value
+    // whatever it looks like, so a flag left bare would swallow the appended
+    // `--resume <id>` as its own values.
     for first in ["-", "-c", "--continue", "-r", "--", "--print", "-x"] {
         assert_eq!(
             rewrite_argv(
@@ -249,13 +248,12 @@ struct Parsed {
     missing: bool,
 }
 
-/// CLAUDE'S OWN PARSER, transcribed branch for branch: `parseOptions` of the
-/// Commander bundled in Claude Code 2.1.281, read out of the shipped binary. Its
-/// options are the [`FLAGS`] table: `One` and `Many` are required values, `Many`
-/// the variadic one, `Optional` an optional value, `None` a boolean. The one branch
-/// left out is the positional-options stop (the program calls
-/// `enablePositionalOptions()`), which fires only on an operand that names a
-/// subcommand (`claude mcp …`): never a live session, and no word used here.
+/// Claude's own parser, transcribed branch for branch: `parseOptions` of the
+/// Commander bundled in Claude Code 2.1.281. Its options are the [`FLAGS`]
+/// table: `One` and `Many` are required values, `Many` the variadic one,
+/// `Optional` an optional value, `None` a boolean. The positional-options stop
+/// is left out: it fires only on an operand naming a subcommand (`claude mcp
+/// …`), never a live session.
 fn claude_parses(args: &[String]) -> Parsed {
     // `function r(o){return o.length>1&&o[0]==="-"}`
     let r = |o: &str| o.len() > 1 && o.starts_with('-');
@@ -346,7 +344,7 @@ fn of_fate(p: &Parsed, fate: Fate) -> Vec<(String, Option<String>)> {
 fn every_short_argv_resumes_with_exactly_the_values_claude_parsed() {
     // Every argv of up to four words over flags of each arity and fate, the
     // dash-led values that decide consumption, an inline value, `--` and an
-    // unknown flag — each fed to the rewrite AND to Claude's own parser.
+    // unknown flag, each fed to the rewrite and to Claude's own parser.
     let words = [
         "--add-dir",
         "--debug",
@@ -473,9 +471,8 @@ fn the_relaunch_line_heals_a_frozen_shell_and_quotes_every_word() {
 
 #[test]
 fn a_line_the_tty_could_cut_is_refused() {
-    // macOS keeps at most 1024 bytes of a line typed before the shell's line
-    // editor is back (measured: with the Enter in that window 1023 ran and 1024
-    // did not); `--resume <id>` is the END of the line, so any cut loses it.
+    // macOS keeps at most 1023 bytes of a line typed before the shell's line
+    // editor is back; `--resume <id>` ends the line, so any cut loses it.
     let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
     let hook = Path::new("/Users/_me/.aterm/shell.d/00-atpkg.zsh");
     let line = |tty: LineDiscipline, pad: &str| {
@@ -484,6 +481,7 @@ fn a_line_the_tty_could_cut_is_refused() {
             Dialect::Zsh,
             Some(hook),
             None,
+            &[],
             exe,
             &argv(&["--append-system-prompt", pad, "--resume", ID]),
         )
@@ -504,11 +502,10 @@ fn a_line_the_tty_could_cut_is_refused() {
         assert_eq!(at(tty, tty.max_line()).map(|l| l.len()), Ok(tty.max_line()));
         assert!(at(tty, tty.max_line() + 1).is_err(), "{tty:?}");
     }
-    // Each kernel keeps its OWN bound: Linux keeps 4095 bytes of a line, so a
-    // line the old 2048 carried there is still carried — one bound for both
-    // would refuse it for macOS's sake.
+    // Each kernel keeps its own bound: Linux keeps 4095 bytes of a line, so a
+    // 2048-byte line is carried there.
     assert!(at(LineDiscipline::Linux, 2048).is_ok());
-    // The measured macOS cut, pinned by its number: 1024 bytes did not run.
+    // macOS drops a 1024-byte line.
     assert!(at(LineDiscipline::Darwin, 1024).is_err());
     // What the driver gets is this kernel's.
     assert_eq!(MAX_LINE, LineDiscipline::HOST.max_line());
@@ -537,13 +534,12 @@ fn a_line_the_tty_could_cut_is_refused() {
     assert!(everyday.is_ok_and(|l| l.len() < MAX_LINE / 2));
 }
 
-/// THE HEALED RELAUNCH LINE (2026-09-26): the shell takes its key from the file
-/// FIRST, in its own dialect, then runs the relaunch line unchanged — still one
-/// line, still led by the one space that keeps it out of history. The path is
-/// quoted by the same rule as every other word (the real control dir has a
-/// space in it); the key is not in the line at all. A path with a control
-/// character, or a healed line past the kernel's bound, is refused — and the
-/// caller then types the plain line, so the heal never costs the relaunch.
+/// The healed relaunch line: the shell takes its key from the file first, in
+/// its own dialect, then runs the relaunch line unchanged, still one line led
+/// by the space that keeps it out of history. The path is quoted like every
+/// other word; the key is not in the line. A path with a control character,
+/// or a healed line past the kernel's bound, is refused and the caller types
+/// the plain line.
 #[test]
 fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
     let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
@@ -552,8 +548,8 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
     let q = "'/Users/_me/Library/Application Support/aterm/rekey/s-0a.1'";
     let args = argv(&["--resume", ID]);
     let zsh = relaunch_line(Dialect::Zsh, Some(hook), Some("/w"), exe, &args).unwrap();
-    // The UPGRADING form where it fits (2026-09-26): the shell's own text, the
-    // quoted path its only path.
+    // The upgrading form where it fits: the shell's own text, the quoted path
+    // its only path.
     let form = |shell, q: &str| {
         aterm_shell_integration::typed_rekey_with_loader(shell, q).expect("scripted")
     };
@@ -585,18 +581,20 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
             &fish[1..]
         )
     );
-    // The key-only form beneath it is the scripts' older text, unchanged.
+    // The key-only form beneath it: the key read, and the suffix built, inside
+    // the group whose stderr (a `set -x` trace too) is silenced.
     assert_eq!(
         aterm_shell_integration::typed_rekey(aterm_shell_integration::ShellType::Zsh, q)
             .expect("scripted"),
         format!(
-            "{{ read -r __aterm_shell_nonce <{q}; }} 2>/dev/null; command rm -f -- {q}; \
-             __aterm_id_suffix_str=\";id=$__aterm_shell_nonce\";"
+            "{{ read -r __aterm_shell_nonce <{q}; \
+             __aterm_id_suffix_str=\";id=$__aterm_shell_nonce\"; }} 2>/dev/null; \
+             command rm -f -- {q};"
         )
     );
     // Quoted like any word: a quote in the path cannot end the word early.
     let odd = with_rekey(Dialect::Zsh, &bash, Path::new("/r/it's")).unwrap();
-    assert!(odd.contains("<'/r/it'\\''s'; }"), "{odd}");
+    assert!(odd.contains("<'/r/it'\\''s'; "), "{odd}");
     assert!(
         with_rekey(Dialect::Fish, &fish, Path::new("/r/it's"))
             .unwrap()
@@ -611,6 +609,7 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
                 Dialect::Zsh,
                 None,
                 None,
+                &[],
                 exe,
                 &argv(&["--append-system-prompt", pad, "--resume", ID]),
             )
@@ -672,67 +671,9 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
     assert!(healed.starts_with(" {") && !healed.starts_with("  "));
 }
 
-/// The body of `fn <name>(` (private or `pub(super)`) in `src`, up to its
-/// closing brace at column 0.
-fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
-    let start = src
-        .find(&format!("\nfn {name}("))
-        .or_else(|| src.find(&format!("\npub(super) fn {name}(")))?;
-    let body = &src[start..];
-    Some(&body[..body.find("\n}\n").unwrap_or(body.len())])
-}
-
-/// Whether `restart` in the driver's source plans the relaunch — the flags and
-/// the line, both built in the relaunch primitive's `line_for` — and returns
-/// on a refusal, BEFORE its one signal: the call to `terminate`, which holds
-/// the driver's only `libc::SIGTERM` (its fallback for an aterm older than the
-/// server's exact-pid `signal term pid=`); the relaunch primitive sends none.
-fn refused_before_signalled(src: &str, relaunch: &str) -> bool {
-    let (Some(restart), Some(line_for)) = (body_of(src, "restart"), body_of(relaunch, "line_for"))
-    else {
-        return false;
-    };
-    let at = |needle: &str| restart.find(needle);
-    let (Some(planned), Some(kill)) = (at("plan(opts"), at("terminate(c")) else {
-        return false;
-    };
-    planned < kill
-        && restart[planned..kill].contains("return unplanned(")
-        && body_of(relaunch, "plan").is_some_and(|p| p.contains("line_for("))
-        && line_for.contains("upgrade::rewrite_argv(")
-        && line_for.contains("upgrade::relaunch_line(")
-        && src.matches("libc::SIGTERM").count() == 1
-        && body_of(src, "terminate").is_some_and(|t| t.contains("libc::SIGTERM"))
-        && src.matches("terminate(c,").count() == 1
-        && !relaunch.contains("libc::SIGTERM")
-}
-
-#[test]
-fn a_refused_line_is_refused_before_the_agent_is_signalled() {
-    // The bound above refuses a session, never ends one: the driver plans the
-    // line, and returns on a refusal, before its one signal. The source is
-    // the evidence. (That the plan is asked before the ANNOUNCEMENT too is the
-    // driver's own test, `upgrade_drive_tests.rs`.)
-    let drive = include_str!("upgrade_drive.rs");
-    let relaunch = include_str!("relaunch.rs");
-    assert!(refused_before_signalled(drive, relaunch));
-    // NEGATIVE CONTROL: the same driver with its one signal moved to the top of
-    // `restart`, ahead of the plan.
-    let signals_first = drive
-        .replacen(
-            "terminate(c, tab, pid, opts.human_grace_s)",
-            "Terminated::Failed",
-            1,
-        )
-        .replacen("\nfn restart(", "\nfn restart(/* terminate(c */", 1);
-    assert!(!refused_before_signalled(&signals_first, relaunch));
-}
-
-/// THE NOTICE'S LIST OF WHAT RUNS (2026-09-26): each process by pid, name,
-/// age and command, in one line that a paste cannot split (no control
-/// characters), at most [`HELD_NAMED`] named and the rest counted. Nothing at
-/// all when nothing runs, so a notice to an agent with no background work
-/// reads exactly as before.
+/// The notice's list of what runs: each process by pid, name, age and command
+/// on one line a paste cannot split (no control characters), at most
+/// [`HELD_NAMED`] named and the rest counted. Nothing when nothing runs.
 #[test]
 fn the_notice_lists_what_runs_under_the_agent_in_one_line() {
     assert_eq!(running_clause(&[]), "");
@@ -770,18 +711,23 @@ fn the_notice_lists_what_runs_under_the_agent_in_one_line() {
         running_clause(&[held(7, 0, "")]),
         " Running under you now, as aterm sees it: pid 7 (zsh, 0s)."
     );
-    // The notice itself stays one line with the clause appended.
-    let notice = prepare_prompt(&v("2.1.278"), &v("2.1.283"), Source::Managed, "M") + &two;
+    // The notice stays one line with the clause before its closing sentence,
+    // so its last word is that sentence's, the word the guarded Enter waits on.
+    let notice = with_running(
+        &prepare_prompt(&v("2.1.278"), &v("2.1.283"), Source::Managed, "M"),
+        &two,
+    );
     assert!(!notice.contains('\n') && notice.starts_with(ANNOUNCE_HEAD));
+    assert!(
+        notice.ends_with(&format!("{} {NOTICE_CLOSE}", two.trim_end())),
+        "{notice}"
+    );
 }
 
-/// THE OLDEST IS NAMED FIRST (design record 2026-09-28, §3.2 C7c): tab #1
-/// held 15 processes under its agent, and the one that held the restart —
-/// its own `df`/`sysctl vm.swapusage` watch loop, 4d22h old — was one the
-/// list could leave among the counted, since only [`HELD_NAMED`] are named
-/// and they were named in the process table's order. Oldest first, ties in
-/// the order given. NEGATIVE CONTROL: the old order, replayed (the first
-/// [`HELD_NAMED`] as given), names none of the watch.
+/// The oldest process is named first, ties in the order given, so a
+/// long-running watch loop is never left among the counted ones past
+/// [`HELD_NAMED`]. Negative control: the process table's order names none of
+/// the watch.
 #[test]
 fn the_notice_names_the_oldest_processes_first() {
     let held = |pid: u32, age_s: u64| Held {
@@ -805,71 +751,21 @@ fn the_notice_names_the_oldest_processes_first() {
     // Ties keep the order given.
     let tied = held_list(&[held(3, 5), held(1, 5), held(2, 9)]);
     assert_eq!(tied, "pid 2 (zsh, 9s); pid 3 (zsh, 5s); pid 1 (zsh, 5s)");
-    // NEGATIVE CONTROL: the table's order, as the list named it until this
-    // day, leaves the watch uncounted by name.
+    // Negative control: the table's order leaves the watch unnamed.
     let old_named: Vec<u32> = table.iter().take(HELD_NAMED).map(|h| h.pid).collect();
     assert!(!old_named.contains(&51_435), "{old_named:?}");
 }
 
-/// A WATCH IS NOT WORK, AND IT COMES BACK (design record 2026-09-28, §3.2
-/// C7c): tab #1's agent kept a four-day disk/swap watch loop that ends only on
-/// an alert, which the stopping-point clause did not name (it waits on
-/// nothing that has ended), so no READY came. The notice now names a watch or
-/// monitor loop as something to stop and note, and every UPGRADE carry-on
-/// asks for it back — never a relaunch's, whose notice asked nothing to be
-/// stopped. NEGATIVE CONTROL: the clause as it stood names no watch.
-#[test]
-fn the_notice_asks_a_watch_stopped_and_the_carry_on_asks_it_back() {
-    assert!(
-        STOPPING_POINT.contains(
-            "A watch or monitor loop you can start again after the resume (a disk or swap \
-             watch, a status poll) is not work either: stop it, and note it."
-        ),
-        "{STOPPING_POINT}"
-    );
-    let notice = prepare_prompt(&v("2.1.280"), &v("2.1.284"), Source::Managed, "M");
-    assert!(notice.contains(STOPPING_POINT) && !notice.contains('\n'));
-    let (from, to) = (v("2.1.280"), v("2.1.284"));
-    for carry_on in [
-        continue_prompt(&from, &to, None),
-        continue_prompt(&from, &to, Some("claude-opus-5")),
-        continue_prompt_with_model(&from, &to, Some("claude-opus-5"), Some("claude-opus-5-5")),
-        continue_prompt_with_model(&to, &to, None, Some("claude-opus-5-5")),
-    ] {
-        assert!(
-            carry_on.ends_with(&format!("{RESTART_WATCHES} {CARRY_ON}")),
-            "{carry_on}"
-        );
-    }
-    // A relaunch's carry-on asked nothing to be stopped, and says nothing of it.
-    assert!(!CARRY_ON.contains("watch"));
-    // NEGATIVE CONTROL: the clause as it stood until this day.
-    let old = "Please get to a good stopping point first: let background tasks, subagents or \
-               workflows you started finish while they are still making progress (do not \
-               cancel them), but stop any background shell or task of yours that only waits \
-               for something that has already ended or can never happen (a poll loop on a \
-               workflow, agent, job or file that is gone): that wait is not work. Save or \
-               commit work in progress, and do not start new long-running work.";
-    assert!(!old.contains("watch") && !old.contains("monitor"));
-    assert_ne!(old, STOPPING_POINT);
-}
-
-/// The incident's closer (measured 2026-09-27), as the transcript of the
-/// Claude Code that ran it twice, at 03:09:00Z and 03:19:43Z on 2026-09-22,
-/// records it: 253 characters, 119 of them the one path in `D=`.
+/// A real closer command: 253 characters, 119 of them the one path in `D=`.
 const CLOSER: &str = "D=/Users//person/.claude/projects/-Users-person/\
     00000000-0000-4000-8000-000000000001/subagents/workflows/wf_examplerun-1; \
     tail -f -n +1 \"$D/journal.jsonl\" | /usr/bin/grep -m1 -F \
     '\"agentId\":\"a0000000000000001\",\"result\"' > /dev/null; echo \"closer finished\"";
 
-/// THE NOTICE KEEPS WHAT MAKES A WAIT DEAD (measured 2026-09-27: two shells
-/// held a tab five days on [`CLOSER`], a `tail -f` its `grep -m1` had already
-/// matched and left). Cut at its 160th character, the notice quoted each as
-/// its 119-character path and then `; tail -f -n +1 "$D/journal.jsonl" |
-/// /us…`: the `grep -m1` that made the `tail -f` a wait that can never end
-/// was gone, and what was left read as live work. A
-/// command over [`HELD_COMMAND_CHARS`] now has the middle of each long path
-/// elided before that cut, which stays the backstop.
+/// The notice keeps what makes a wait dead: a command over
+/// [`HELD_COMMAND_CHARS`] has the middle of each long path elided before the
+/// cut, so the `grep -m1` that bounds a `tail -f` survives. The cut stays the
+/// backstop.
 #[test]
 fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
     assert_eq!(CLOSER.chars().count(), 253);
@@ -913,8 +809,8 @@ fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
         format!("tail -f -n +1 /Users/…/journal.jsonl | grep -m1 -F \"wrote {pattern} ok\"")
     );
 
-    // NEGATIVE CONTROLS. A command that fits is quoted whole, however long
-    // its paths. A URL is never a path, its query included.
+    // Negative controls: a command that fits is quoted whole, however long its
+    // paths. A URL is never a path, its query included.
     let fits = format!("tail -f {dir}/journal.jsonl");
     assert_eq!(quoted(&fits), fits);
     let url = "https://api.github.com/repos/people/aterm/actions/runs/123456789/jobs?filter=latest";
@@ -925,7 +821,7 @@ fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
         fetch,
         format!("until curl -fsS -o /Users/…/jobs.json {url}; do sleep 30; done")
     );
-    // Only a ROOTED path is elided: a long relative one is quoted whole, as
+    // Only a rooted path is elided: a long relative one is quoted whole, as
     // the agent wrote it. A redirection's path is elided after its operator.
     let relative =
         "crates/aterm-agent/src/harness/subagents/workflows/wf_examplerun-1/journal.jsonl";
@@ -1018,9 +914,41 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
         !composer_is_empty(&suggestion, Some((1, 17)), true),
         "typed: the cursor moved"
     );
+    // The cursor can only PROVE typed text (on the caret row, off column 2),
+    // never placeholder: elsewhere the dim cell decides — a grid displaced by
+    // a net-zero re-grid leaves the cursor a row below the composer.
     assert!(
-        !composer_is_empty(&suggestion, None, true),
-        "no cursor, no proof"
+        composer_is_empty(&suggestion, None, true),
+        "no cursor: the dim cell decides"
+    );
+    assert!(
+        !composer_is_empty(&suggestion, None, false),
+        "no cursor, not dim: typed"
+    );
+    assert!(
+        composer_is_empty(&suggestion, Some((2, 2)), true),
+        "displaced: the cursor one row below the composer"
+    );
+    assert!(
+        composer_is_empty(&suggestion, Some((0, 2)), true),
+        "displaced the other way"
+    );
+    assert!(
+        !composer_is_empty(&suggestion, Some((2, 2)), false),
+        "displaced, typed text is still a draft"
+    );
+    assert_eq!(composer_dim_row(&suggestion, Some((1, 2))), Some(1));
+    assert_eq!(composer_dim_row(&suggestion, Some((2, 2))), Some(1));
+    assert_eq!(composer_dim_row(&suggestion, None), Some(1));
+    assert_eq!(
+        composer_dim_row(&suggestion, Some((1, 17))),
+        None,
+        "inside the text: nothing to ask"
+    );
+    assert_eq!(
+        composer_dim_row(&blank, Some((1, 2))),
+        Some(1),
+        "blank: read, as it always was"
     );
     let two_rows = rows(&[
         "─────────────────",
@@ -1029,7 +957,7 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
         "─────────────────",
     ]);
     assert!(!composer_is_empty(&two_rows, Some((1, 2)), true));
-    // The live screen of 2026-09-23 while the person typed `we'd want`.
+    // A live screen while the person types `we'd want`.
     let typing = rows(&["─────────────────", "❯ we'd want", "─────────────────"]);
     assert!(!composer_is_empty(&typing, Some((1, 11)), false));
     assert!(
@@ -1065,69 +993,309 @@ fn idle_facts() -> Facts {
         still_s: 0,
         daemon_turn: DaemonTurn::None,
         work_ended: false,
+        ready_unrecorded: false,
+        ready_superseded: false,
+        quiet: false,
+        unnoticed: false,
     }
 }
 
 /// One fact knocked off an otherwise-go reading, and the wait it must cause.
 type Knock = (fn(&mut Facts), &'static str);
 
+/// THE QUIET UPGRADE, THE DEFAULT SINCE 2026-09-29 (the owner: "never
+/// interrupt an agent that is working"; [`Facts::quiet`], [`quiet_step`]):
+/// at a genuinely idle point — Claude's own `idle`, nothing under the agent,
+/// no box, no draft, nobody at the tab, settled — a pending round RESTARTS
+/// the session with nothing typed first (`Terminate`, never `Announce`), and
+/// needs no READY; anywhere else it WAITS with the gate's own word, and
+/// never types a notice: a turn still running, work under the agent, a break
+/// of its own background work (a workflow, a background agent), a box, a
+/// draft, a person at the tab, a hold, the settle, a usage limit, the login
+/// wall. A round an older aterm announced is restarted at the same point,
+/// READY or not. The owner is told first: a move the waiting record has not
+/// stood a look for waits `notice-shown` ([`Facts::unnoticed`]). THE KNOB
+/// (`upgrade_ask = true`, `quiet` false) is the ask-and-drain flow:
+/// `Announce` at the same idle point, `awaiting-ready` after it. A restart
+/// in flight, a finished move and a stopped round are the old reducer's as
+/// ever.
 #[test]
-fn the_gates_wait_for_every_fact_and_never_for_a_kill() {
-    assert_eq!(gate_announce(&idle_facts()), Gate::Go);
-    let cases: [Knock; 7] = [
-        (|f| f.held = true, "held"),
+fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
+    let quiet = Facts {
+        quiet: true,
+        ..idle_facts()
+    };
+    let announced = Phase::Announced { at_s: 100, asks: 1 };
+    assert_eq!(
+        next_step(&Phase::Pending, &quiet, false, 200),
+        Step::Terminate
+    );
+    assert_eq!(next_step(&announced, &quiet, false, 200), Step::Terminate);
+    assert_eq!(next_step(&announced, &quiet, true, 200), Step::Terminate);
+    let knocks: [Knock; 13] = [
         (|f| f.status = "busy".into(), "not-idle"),
         (|f| f.status = "shell".into(), "not-idle"),
         (|f| f.busy_footer = true, "busy"),
+        (|f| f.background = vec!["zsh".into()], "background"),
+        (|f| f.background_point = true, "background"),
         (|f| f.approval_box = true, "box"),
         (|f| f.composer_empty = false, "draft"),
+        (|f| f.attended = true, "attended"),
+        (|f| f.held = true, "held"),
         (|f| f.quiet_s = 3, "settling"),
+        (|f| f.limited = true, "limited"),
+        (|f| f.login = true, "login"),
+        (|f| f.unnoticed = true, NOTICE_SHOWN),
     ];
-    for (edit, word) in cases {
-        let mut f = idle_facts();
+    for (edit, word) in knocks {
+        let mut f = quiet.clone();
         edit(&mut f);
-        assert_eq!(gate_announce(&f), Gate::Wait(word));
-        assert_eq!(gate_restart(&f, true), Gate::Wait(word));
+        for phase in [&Phase::Pending, &announced] {
+            let step = next_step(phase, &f, false, 200);
+            assert_eq!(step, Step::Wait(word), "{phase:?}");
+            assert_ne!(step, Step::Announce, "nothing is ever typed first");
+        }
     }
-    assert_eq!(gate_restart(&idle_facts(), false), Gate::Wait("not-ready"));
-    let mut working = idle_facts();
-    working.background = vec!["zsh".to_string()];
-    assert_eq!(gate_restart(&working, true), Gate::Wait("background"));
-    assert_eq!(gate_restart(&idle_facts(), true), Gate::Go);
-}
-
-#[test]
-fn the_reducer_announces_waits_for_ready_reasks_and_gives_up_without_forcing() {
-    let f = idle_facts();
-    assert_eq!(next_step(&Phase::Pending, &f, false, 100), Step::Announce);
-    let asked = Phase::Announced { at_s: 100, asks: 1 };
+    // The old reducer's phases are its own.
     assert_eq!(
-        next_step(&asked, &f, false, 200),
-        Step::Wait("awaiting-ready")
-    );
-    assert_eq!(next_step(&asked, &f, true, 200), Step::Terminate);
-    let mut busy = f.clone();
-    busy.background = vec!["caffeinate".to_string()];
-    assert_eq!(
-        next_step(&asked, &busy, true, 200),
-        Step::Wait("background")
-    );
-    assert_eq!(next_step(&asked, &f, false, 100 + REASK_S), Step::Announce);
-    let tired = Phase::Announced {
-        at_s: 100,
-        asks: MAX_ASKS,
-    };
-    assert_eq!(next_step(&tired, &f, false, 100 + REASK_S), Step::GiveUp);
-    assert_eq!(
-        next_step(&Phase::Exiting { at_s: 1 }, &f, true, 5),
+        next_step(&Phase::Exiting { at_s: 1 }, &quiet, false, 5),
         Step::Wait("in-flight")
     );
-    assert_eq!(Phase::Failed("x".into()).word(), "failed:x");
+    assert_eq!(
+        next_step(&Phase::Done, &quiet, false, 5),
+        Step::Wait("done")
+    );
+    assert_eq!(
+        next_step(&Phase::Failed("x".into()), &quiet, false, 5),
+        Step::Wait("failed")
+    );
+    // The knob: the ask-and-drain flow at the very same point.
+    let ask = idle_facts();
+    assert_eq!(next_step(&Phase::Pending, &ask, false, 200), Step::Announce);
+    assert_eq!(
+        next_step(&announced, &ask, false, 200),
+        Step::Wait("awaiting-ready")
+    );
 }
 
-/// Only a box (a visible one, or Claude's own `waiting` status) and a typed draft
-/// are a PERSON's to clear. The agent's own work, aterm's hold and the settle
-/// window are not — the negative controls, each of which shuts the gate too.
+/// A ROUND AN OLDER BUILD ANNOUNCED STILL ENDS UNDER THE QUIET UPGRADE (round
+/// eight, #4; [`quiet_step`]): the agent was told to wind down, and the quiet
+/// flow asks it nothing again. Once the agent's own work — a break of it,
+/// a shell under it, a status its idle screen does not bear out — has held
+/// the restart a whole [`REASK_S`] past the notice (or past a READY), the
+/// round GIVES UP at any ask, so the driver owes the agent its release; a
+/// READY a person's box held past [`DRAIN_S`] is void. The incident's tab:
+/// behind for days, `wait=background` at every look, `Announced{asks:3}`
+/// written by 0.99 — answered `Wait("background")` for ever, no release.
+/// CONTROL: the ask flow gives up there at its last ask. NEGATIVE CONTROLS:
+/// inside the window the restart's wait stands; a pending round (nothing
+/// asked) is never given up on; a genuinely idle point restarts; a person at
+/// the tab, or the settle, is no work of the agent's and never gives up.
+#[test]
+fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
+    let brk = Facts {
+        quiet: true,
+        background_point: true,
+        ..idle_facts()
+    };
+    let last = Phase::Announced {
+        at_s: 0,
+        asks: MAX_ASKS,
+    };
+    let first = Phase::Announced { at_s: 0, asks: 1 };
+    let later = 10 * REASK_S;
+    // CONTROL: the ask flow gives up at its last ask.
+    let asking = Facts {
+        quiet: false,
+        ..brk.clone()
+    };
+    assert_eq!(next_step(&last, &asking, false, later), Step::GiveUp);
+    // The quiet flow gives up at any ask: it never asks again.
+    for phase in [&last, &first] {
+        assert_eq!(
+            next_step(phase, &brk, false, later),
+            Step::GiveUp,
+            "{phase:?}"
+        );
+    }
+    // READY given, the agent's own shell under it at an idle point: given
+    // up on once the READY has stood the window, never waited on for good.
+    let held = Facts {
+        quiet: true,
+        background: vec!["zsh".into()],
+        ready_s: REASK_S,
+        ..idle_facts()
+    };
+    assert_eq!(next_step(&first, &held, true, later), Step::GiveUp);
+    assert_eq!(
+        next_step(
+            &first,
+            &Facts {
+                ready_s: REASK_S - 1,
+                ..held.clone()
+            },
+            true,
+            later
+        ),
+        Step::Wait("background"),
+        "a late READY gets its whole window"
+    );
+    // A status its idle screen does not bear out holds it the same way.
+    let stale = Facts {
+        quiet: true,
+        status: "shell".into(),
+        status_age_s: QUIET_S,
+        idle_looks: IDLE_LOOKS,
+        ..idle_facts()
+    };
+    assert_eq!(next_step(&first, &stale, false, later), Step::GiveUp);
+    // A person's box past the drain voids a READY, as under the ask flow.
+    let boxed = Facts {
+        quiet: true,
+        approval_box: true,
+        hold_s: HOLD_S,
+        ..idle_facts()
+    };
+    assert_eq!(next_step(&first, &boxed, true, DRAIN_S), Step::Void("box"));
+    assert_eq!(
+        next_step(&first, &boxed, false, later),
+        Step::Wait("box"),
+        "no READY: nothing to void, and a person's box is no work of the agent's"
+    );
+    // NEGATIVE CONTROLS.
+    assert_eq!(
+        next_step(&first, &brk, false, REASK_S - 1),
+        Step::Wait("background"),
+        "inside the notice's window"
+    );
+    assert_eq!(
+        next_step(&Phase::Pending, &brk, false, later),
+        Step::Wait("background"),
+        "a pending round asked nothing"
+    );
+    let idle = Facts {
+        quiet: true,
+        ..idle_facts()
+    };
+    assert_eq!(next_step(&first, &idle, false, later), Step::Terminate);
+    for (edit, word) in [
+        ((|f| f.attended = true) as fn(&mut Facts), "attended"),
+        (|f| f.quiet_s = 3, "settling"),
+        (|f| f.status = "busy".into(), "not-idle"),
+    ] {
+        let mut f = idle.clone();
+        edit(&mut f);
+        assert_eq!(next_step(&first, &f, false, later), Step::Wait(word));
+    }
+}
+
+/// A STATUS THAT ONLY LAGS HOLDS THE QUIET RESTART UNTIL THE OWNER'S WORD
+/// (round eight, #5; [`quiet_step`]): Claude's own `shell`/`busy` left over
+/// an idle screen — an agent that finished, or asked its person something,
+/// with nothing under it — let the ask flow's notice through (its turn
+/// rewrote the status), but the quiet flow types nothing, so it waited
+/// `status-stale` at every look, at the Land rung and under the owner's
+/// `Upgrade now` alike. The restart still never kills on that status
+/// unasked; the owner's `--now` reads the lag past. NEGATIVE CONTROLS under
+/// `--now`: a status not yet shown to lag (one look short, too young), work
+/// under the agent, a box, and the ask flow (whose notice goes through the
+/// lag, so its `--now` waives no status).
+#[test]
+fn a_quiet_round_is_not_held_for_ever_by_a_status_its_idle_screen_contradicts() {
+    let stale = Facts {
+        quiet: true,
+        status: "shell".into(),
+        status_age_s: 3_600,
+        idle_looks: IDLE_LOOKS,
+        ..idle_facts()
+    };
+    // CONTROL: the ask flow's notice goes through the lag.
+    let asking = Facts {
+        quiet: false,
+        ..stale.clone()
+    };
+    assert_eq!(
+        next_step(&Phase::Pending, &asking, false, 200),
+        Step::Announce
+    );
+    for status in ["shell", "busy"] {
+        let stale = Facts {
+            status: status.into(),
+            ..stale.clone()
+        };
+        // Unasked, never on the status alone — at the last rung too.
+        let land = Facts {
+            rung: Rung::Land,
+            ..stale.clone()
+        };
+        assert_eq!(
+            next_step(&Phase::Pending, &land, false, 30 * 86_400),
+            Step::Wait("status-stale"),
+            "{status}"
+        );
+        // The owner's word moves it.
+        assert_eq!(
+            requested_step(&Request::Now, &Phase::Pending, &stale, false, 200, "9.9.9"),
+            Step::Terminate,
+            "{status}"
+        );
+    }
+    // NEGATIVE CONTROLS under the owner's word.
+    let knocks: [Knock; 4] = [
+        (|f| f.idle_looks = IDLE_LOOKS - 1, "status-stale"),
+        (|f| f.status_age_s = QUIET_S - 1, "status-stale"),
+        (|f| f.background = vec!["zsh".into()], "background"),
+        (|f| f.approval_box = true, "box"),
+    ];
+    for (edit, word) in knocks {
+        let mut f = stale.clone();
+        edit(&mut f);
+        assert_eq!(
+            requested_step(&Request::Now, &Phase::Pending, &f, false, 200, "9.9.9"),
+            Step::Wait(word)
+        );
+    }
+    let announced = Phase::Announced { at_s: 100, asks: 1 };
+    assert_eq!(
+        requested_step(&Request::Now, &announced, &asking, true, 200, "9.9.9"),
+        Step::Wait("status-stale"),
+        "the ask flow's --now waives no status"
+    );
+}
+
+/// NO UNTASKED SESSION IS RESTARTED WITHOUT A NOTICE (the owner's direction
+/// of 2026-09-29): the fresh restart of a conversation with no task waits
+/// `notice-shown` until the owner's waiting record has stood a look
+/// ([`Facts::unnoticed`]) — under the knob too — and then goes as before.
+/// NEGATIVE CONTROL: a told owner's session is restarted afresh at once.
+#[test]
+fn an_untasked_session_is_restarted_only_after_the_owner_is_told() {
+    for quiet in [false, true] {
+        let taskless = Facts {
+            taskless: true,
+            quiet,
+            ..idle_facts()
+        };
+        let untold = Facts {
+            unnoticed: true,
+            ..taskless.clone()
+        };
+        assert_eq!(
+            next_step(&Phase::Pending, &untold, false, 200),
+            Step::Wait(NOTICE_SHOWN),
+            "quiet={quiet}"
+        );
+        assert_eq!(
+            next_step(&Phase::Pending, &taskless, false, 200),
+            Step::Fresh,
+            "quiet={quiet}"
+        );
+    }
+}
+
+/// Only a box (a visible one, or Claude's own `waiting` status) and a typed
+/// draft are a person's to clear. The agent's own work, aterm's hold and the
+/// settle window are not; each still shuts the gate.
 #[test]
 fn only_a_box_and_a_draft_are_a_persons_hold() {
     assert_eq!(person_hold(&idle_facts()), None);
@@ -1157,14 +1325,12 @@ fn only_a_box_and_a_draft_are_a_persons_hold() {
     }
 }
 
-/// THE DRAIN IS BOUNDED AGAINST A PERSON. A READY answer held past [`DRAIN_S`] by
-/// a box nobody answers or a draft nobody sends, standing [`HOLD_S`], is void.
-/// Before the bound it is still a wait. A busy turn and a hold are waited for
-/// past it and never voided (the negative controls: the owner's "never kill
-/// background work", and a void is not a kill either). Background work under
-/// the agent is never voided or ended either, but past [`REASK_S`] it is asked
-/// about again, and past [`MAX_ASKS`] the upgrade gives up. Once void, the
-/// answer is gone, so the reducer asks again at the next idle point, not later.
+/// The drain is bounded against a person: a READY answer held past
+/// [`DRAIN_S`] by a box or draft standing [`HOLD_S`] is void; before the
+/// bound it is a wait. A busy turn and a hold are waited for past it and
+/// never voided. Background work under the agent is never voided or ended,
+/// but past [`REASK_S`] it is asked about again, and past [`MAX_ASKS`] the
+/// upgrade gives up. A void answer is re-asked at the next idle point.
 #[test]
 fn a_ready_answer_a_person_holds_past_the_drain_bound_is_void() {
     let asked = Phase::Announced { at_s: 100, asks: 1 };
@@ -1213,11 +1379,9 @@ fn a_ready_answer_a_person_holds_past_the_drain_bound_is_void() {
             "the agent's own {word} is waited for, however long"
         );
     }
-    // Work running UNDER the agent is waited for and never voided or ended.
-    // But a READY answer it outlives by a whole REASK_S can no longer be acted
-    // on, so it is asked about again (2026-09-26: two poll loops that could
-    // never end held a tab for four days, told once). Past MAX_ASKS the
-    // upgrade gives up. It never ends the agent.
+    // Work under the agent is waited for and never voided or ended. A READY
+    // answer it outlives by a whole REASK_S is asked about again; past
+    // MAX_ASKS the upgrade gives up. It never ends the agent.
     let mut working = idle_facts();
     working.background = vec!["zsh".to_string()];
     // The answer came with the notice: its own clock has run as long.
@@ -1244,7 +1408,7 @@ fn a_ready_answer_a_person_holds_past_the_drain_bound_is_void() {
         "an open gate past the bound still restarts"
     );
 
-    // After the void the answer no longer counts: the re-ask at the next idle point.
+    // After the void the answer is gone: the re-ask at the next idle point.
     assert_eq!(
         next_step(&asked, &idle_facts(), false, bound),
         Step::Announce
@@ -1258,13 +1422,10 @@ fn a_ready_answer_a_person_holds_past_the_drain_bound_is_void() {
     assert_eq!(next_step(&tired, &boxed, false, bound), Step::GiveUp);
 }
 
-/// Audit F8 (2026-09-24): ONE SAMPLE OF A BOX IS NOT A PERSON'S HOLD. The
-/// supervisor answers or declines a box it can read within seconds, and
-/// Claude's status reads `waiting` while it does; the drain voided the READY
-/// answer on the first sweep past [`DRAIN_S`] that happened to catch one, and
-/// typed the announcement again. A hold voids only once it has stood for
-/// [`HOLD_S`], sample after sample (the negative control: the same box, held
-/// that long).
+/// One sample of a box is not a person's hold: the supervisor answers a box
+/// it can read within seconds and Claude's status reads `waiting` meanwhile.
+/// A hold voids only once it has stood for [`HOLD_S`], sample after sample
+/// (the negative control: the same box, held that long).
 #[test]
 fn a_box_one_sweep_catches_is_not_a_persons_hold() {
     let asked = Phase::Announced { at_s: 100, asks: 1 };
@@ -1296,14 +1457,11 @@ fn a_box_one_sweep_catches_is_not_a_persons_hold() {
     assert_eq!(hold_since((0, 0), &boxed, 680), (680, 680));
 }
 
-/// The review of 2026-09-25 (F8): A HOLD STANDS ONLY WHILE IT IS SAMPLED. The
-/// dwell was wall time from the first sample, kept across any gap: two sweeps
-/// two hours apart — either side of a system sleep, a driver restart — that
-/// each caught a box (two boxes, each answered in seconds, for all anyone saw)
-/// voided the READY answer and spent one of [`MAX_ASKS`]. A gap longer than
-/// [`HOLD_GAP_S`] now begins the hold again, so those two samples are a wait;
-/// NEGATIVE CONTROL: a box sampled once a minute for [`HOLD_S`] still voids
-/// it, and a gap of exactly [`HOLD_GAP_S`] carries the hold on.
+/// A hold stands only while it is sampled: a gap longer than [`HOLD_GAP_S`]
+/// (a system sleep, a driver restart) begins the hold again, so two samples
+/// hours apart are a wait. Negative control: a box sampled once a minute for
+/// [`HOLD_S`] still voids, and a gap of exactly [`HOLD_GAP_S`] carries the
+/// hold on.
 #[test]
 fn a_hold_stands_only_while_it_is_sampled() {
     let asked = Phase::Announced { at_s: 0, asks: 1 };
@@ -1345,18 +1503,15 @@ fn a_hold_stands_only_while_it_is_sampled() {
 }
 
 /// The drain model (`harness_upgrade_drain_bound_model`) folds the drain and
-/// the re-ask clocks into ONE `Bound`, and the bind below samples only
-/// [`DRAIN_S`]. Were the two to differ, the reducer would re-ask inside
-/// `[REASK_S, DRAIN_S)` where the model allows only a wait, and no sample here
-/// would see it. The equality is the model's assumption, pinned where the
-/// build reads it.
+/// re-ask clocks into one `Bound`, and the bind below samples only
+/// [`DRAIN_S`]; the equality is the model's assumption, pinned here.
 const _: () = assert!(DRAIN_S == REASK_S);
 
-/// TIER-1: on every state of the derived drain model
+/// Tier-1: on every state of the derived drain model
 /// (`harness_upgrade_drain_bound_model`), the real reducer takes the step the
 /// model's guards allow. The mapping:
-/// - A person is a box that has stood [`HOLD_S`] (one a sweep has only just
-///   caught is not yet a person's: `a_box_one_sweep_catches_is_not_a_persons_hold`).
+/// - A person is a box that has stood [`HOLD_S`]
+///   (`a_box_one_sweep_catches_is_not_a_persons_hold`).
 /// - The agent's own work is a background shell.
 /// - A break is a step taken at one ([`Facts::background_point`], Claude's
 ///   status `busy`).
@@ -1368,10 +1523,10 @@ const _: () = assert!(DRAIN_S == REASK_S);
 /// - Its `MaxAsks` notices are [`MAX_ASKS`], and a notice typed is `ReAsk`.
 ///
 /// An answer is never older than its notice. Negative controls: at `Buggy=1`
-/// (no void, a wait in silence on the agent's work, and the notice's clock
-/// for a READY answer), at `LagEnds=1` (the restart on a lagging status, the
-/// review of 2026-09-27) and at `LagHolds=1` (a READY behind the lag waited
-/// on in silence) the model disagrees with the reducer.
+/// (no void, a silent wait on the agent's work, the notice's clock for a
+/// READY answer), `LagEnds=1` (a restart on a lagging status) and
+/// `LagHolds=1` (a READY behind the lag waited on in silence) the model
+/// disagrees with the reducer.
 #[test]
 fn the_reducer_takes_the_step_the_drain_model_allows() {
     let model = aterm_spec::derive::harness_upgrade_drain_bound_model();
@@ -1477,11 +1632,9 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
     assert!(holds_caught > 0, "a silent wait behind the lag is caught");
 }
 
-/// A BREAK ENDS NOTHING ([`break_step`]): a notice, a void, a give-up and a
+/// A break ends nothing ([`break_step`]): a notice, a void, a give-up and a
 /// wait pass through it; the one step that ends the agent becomes a wait on
-/// its work. Both drivers apply this rule. Before 2026-09-26 each carried its
-/// own hand-written list, which let only a notice and a wait through: a
-/// give-up and a void at a break were silently turned into waits.
+/// its work. Both drivers apply this rule.
 #[test]
 fn a_break_passes_every_step_but_the_end() {
     for step in [
@@ -1495,12 +1648,11 @@ fn a_break_passes_every_step_but_the_end() {
     assert_eq!(break_step(Step::Terminate), Step::Wait("background"));
 }
 
-/// A READY ANSWER GETS ITS OWN CLOCK (review of 2026-09-26). The last notice
-/// goes out at T. The agent winds down for 35 minutes, as the notice asks,
-/// and answers READY while a shell of its own is still exiting. The notice's
-/// clock alone would give up at the first look, seconds after the answer.
-/// The answer's own clock waits a whole [`REASK_S`] first, at a break and at
-/// an idle point alike. If the shell ends inside it, the agent is restarted.
+/// A READY answer gets its own clock: an agent that winds down for 35 minutes
+/// and answers READY while its own shell is still exiting is not given up on
+/// at the first look. The answer's clock waits a whole [`REASK_S`], at a
+/// break and at an idle point alike; if the shell ends inside it, the agent
+/// is restarted.
 #[test]
 fn a_late_ready_answer_gets_its_own_reask_interval() {
     let last = Phase::Announced {
@@ -1522,8 +1674,7 @@ fn a_late_ready_answer_gets_its_own_reask_interval() {
         assert_eq!(next_step(&last, f, true, late), Step::Wait("background"));
         f.ready_s = REASK_S;
         assert_eq!(next_step(&last, f, true, late + REASK_S), Step::GiveUp);
-        // NEGATIVE CONTROL: an answer as old as its notice — the notice's
-        // clock alone — gives up at once.
+        // Negative control: an answer as old as its notice gives up at once.
         f.ready_s = late;
         assert_eq!(next_step(&last, f, true, late), Step::GiveUp);
     }
@@ -1533,15 +1684,11 @@ fn a_late_ready_answer_gets_its_own_reask_interval() {
     assert_eq!(next_step(&last, &done, true, late + 60), Step::Terminate);
 }
 
-/// A PERSON AT A BUSY TAB IS ASKED FIRST (review of 2026-09-25): the gate
-/// asked the person only after Claude's status, so a busy attended tab waited
-/// `not-idle` — a wait that names the turn, not the person holding the tab —
-/// and the upgrade took the tab's turn ends for a notice its idle point then
-/// refused (`attended`). A person at the tab now waits `attended` busy or
-/// idle, before the notice and before the restart (a wait the session's
-/// worker owns no turn end for). NEGATIVE CONTROLS: the same busy visit
-/// unattended waits `not-idle`; under the owner's `--now` the person is
-/// waived, and the busy tab waits on its turn alone.
+/// A person at a busy tab is asked first: a person at the tab waits
+/// `attended`, busy or idle, before the notice and before the restart.
+/// Negative controls: the same busy visit unattended waits `not-idle`; under
+/// the owner's `--now` the person is waived and the busy tab waits on its
+/// turn alone.
 #[test]
 fn a_person_at_a_busy_tab_waits_attended() {
     let busy = |attended: bool| Facts {
@@ -1570,10 +1717,10 @@ fn a_person_at_a_busy_tab_waits_attended() {
     }
 }
 
-/// ONE PRESENCE FACT (review of 2026-09-25): a session is attended when a
-/// person gave IT input within `[harness] human_grace_s`, by the server's own
-/// per-session stamp — never by where the tab sits or the machine's input
-/// clock. A host that sends no stamp proves no absence: attended.
+/// One presence fact: a session is attended when a person gave it input
+/// within `[harness] human_grace_s`, by the server's per-session stamp, never
+/// by where the tab sits or the machine's input clock. A host that sends no
+/// stamp proves no absence: attended.
 #[test]
 fn a_session_is_attended_by_its_own_person_stamp() {
     use crate::supervise::screen::HumanInput;
@@ -1596,13 +1743,12 @@ fn a_session_is_attended_by_its_own_person_stamp() {
     assert!(attended_by(HumanInput::Unknown, grace), "fails closed");
 }
 
-/// A PERSON AT THE TAB (the 2026-09-24 review; [`Facts::attended`]): nothing
-/// the upgrade decides for itself is typed into it, and — READY or not — it
-/// is never signalled there (review of 2026-09-25): the SIGTERM is the one act
-/// that cannot be taken back. Only the owner's own `--now` waives it
-/// ([`Facts::owner_now`]), at the notice and at the signal alike. NEGATIVE
-/// CONTROLS: the same READY facts unattended are ended, and an attended tab
-/// is still refused a draft, a box and a busy Claude under `--now`.
+/// A person at the tab ([`Facts::attended`]): nothing the upgrade decides for
+/// itself is typed into it, and, READY or not, it is never signalled there,
+/// since the SIGTERM cannot be taken back. Only the owner's `--now` waives it
+/// ([`Facts::owner_now`]). Negative controls: the same READY facts unattended
+/// are ended, and an attended tab is still refused a draft, a box and a busy
+/// Claude under `--now`.
 #[test]
 fn an_attended_tab_is_neither_typed_into_nor_signalled_without_the_owners_now() {
     let attended = Facts {
@@ -1669,12 +1815,10 @@ fn an_attended_tab_is_neither_typed_into_nor_signalled_without_the_owners_now() 
     }
 }
 
-/// THE READY ANSWER IS THE AGENT'S LAST WORD, or none (review of
-/// 2026-09-25): a READY row the agent has since answered past — a `keep
-/// going` it took, a person's message — is no consent to a restart, however
-/// long it stays in the tail. NEGATIVE CONTROLS: a subagent's row and one
-/// Claude Code writes itself (`<synthetic>`) after the answer supersede
-/// nothing.
+/// The READY answer must be the agent's last word: a READY row the agent has
+/// since answered past (a `keep going` it took, a person's message) is no
+/// consent to a restart. Negative controls: a subagent's row and a
+/// `<synthetic>` row after the answer supersede nothing.
 #[test]
 fn a_ready_answer_counts_only_while_it_is_the_agents_last_word() {
     let marker = "ATERM-UPGRADE-READY-0badf00d";
@@ -1710,16 +1854,11 @@ fn a_ready_answer_counts_only_while_it_is_the_agents_last_word() {
     assert!(transcript_has_ready(&[past, ready].join("\n"), marker));
 }
 
-/// A NOTICE ENDS EVERY READY BEFORE IT (review of 2026-09-25): a READY the
-/// agent gave to an earlier notice — one the owner's hold ended — was still
-/// its last assistant word after the notice typed once the hold lifted, until
-/// it wrote a real assistant row; an API error Claude Code records as a
-/// `<synthetic>` row, or a person's Esc (a USER row), left it standing, and
-/// the next visit signalled an agent that never answered the new notice. A
-/// main-chain user row that IS an announcement ends it. NEGATIVE CONTROLS: a
-/// READY after the notice answers it; a user row that only mentions the head
-/// mid-sentence is no notice (a person's direction), and a subagent's notice
-/// ends nothing.
+/// A notice ends every READY before it: a main-chain user row that is an
+/// announcement ends an earlier READY, even when only a `<synthetic>` row or
+/// a person's Esc follows. Negative controls: a READY after the notice
+/// answers it; a user row that only mentions the head mid-sentence is no
+/// notice, and a subagent's notice ends nothing.
 #[test]
 fn a_ready_before_the_latest_notice_is_no_answer_to_it() {
     let marker = "ATERM-UPGRADE-READY-0badf00d";
@@ -1769,10 +1908,9 @@ fn a_ready_before_the_latest_notice_is_no_answer_to_it() {
             marker
         ));
     }
-    // Negative controls: a mention mid-sentence, and a subagent's notice.
-    // The mention is a person's DIRECTION (it ends the READY as one, the
-    // second review of 2026-09-26), never a notice: a notice ends a direction
-    // the agent took up before it, the mention does not.
+    // Negative controls: a mention mid-sentence, and a subagent's notice. The
+    // mention is a person's direction (it ends the READY as one), never a
+    // notice: a notice ends a direction the agent took up before it.
     let mention = r#"{"type":"user","message":{"role":"user","content":"why did [aterm harness] Claude Code ask that?"}}"#;
     assert!(!transcript_has_ready(
         &[ready.as_str(), mention].join("\n"),
@@ -1802,17 +1940,13 @@ fn a_ready_before_the_latest_notice_is_no_answer_to_it() {
     ));
 }
 
-/// A DIRECTION AFTER THE READY ENDS IT (the second review of 2026-09-26): a
-/// main-chain user row that directs the conversation — a person's Esc, a
-/// person's message met only by a `<synthetic>` row (an API error, the usage
-/// limit), a peer's message — ends the READY before it, whether or not the
-/// agent has written a real row since; kept as the last assistant word, it
-/// let an upgrade that had given up asking restart the session over the
-/// person who had just spoken. NEGATIVE CONTROLS: the rows Claude Code
-/// writes on its own after the answer (the limit's reset, a tool's result, a
-/// task notification, a command's output, the harness's own line, a
-/// subagent's prompt) end nothing, and a READY given again after the
-/// direction answers.
+/// A direction after the READY ends it: a main-chain user row that directs
+/// the conversation (a person's Esc, a message met only by a `<synthetic>`
+/// row, a peer's message) ends the READY before it, whether or not the agent
+/// has written a real row since. Negative controls: rows Claude Code writes
+/// on its own after the answer (the limit's reset, a tool result, a task
+/// notification, a command's output, the harness's line, a subagent's
+/// prompt) end nothing, and a READY given again after the direction answers.
 #[test]
 fn a_direction_after_the_ready_ends_it() {
     let marker = "ATERM-UPGRADE-READY-0badf00d";
@@ -1868,10 +2002,10 @@ fn a_direction_after_the_ready_ends_it() {
     assert!(transcript_has_ready(&rows(&[&esc, &ready]), marker));
 }
 
-/// A READY ANSWER IS A LINE THAT IS THE MARKER ALONE ([`is_ready_line`],
-/// review of 2026-09-25): words that only QUOTE a marker are no answer.
-/// NEGATIVE CONTROLS: the marker on a line of its own, in backticks or
-/// indented, is one; another marker, or one cut short, is not.
+/// A READY answer is a line that is the marker alone ([`is_ready_line`]):
+/// words that only quote a marker are no answer. Negative controls: the
+/// marker on its own line, in backticks or indented, is one; another marker,
+/// or one cut short, is not.
 #[test]
 fn a_ready_answer_is_the_marker_on_a_line_of_its_own() {
     let marker = ready_marker(ID, &v("2.1.282"), 3);
@@ -1887,9 +2021,8 @@ fn a_ready_answer_is_the_marker_on_a_line_of_its_own() {
 
 // ---------------------------------------------------------------- the model
 
-/// An assistant row as Claude Code 2.1.282 writes one (measured 2026-09-24 in
-/// the owner's transcript: `isSidechain`, `type`, `message.model`, the content
-/// blocks), naming `model`.
+/// An assistant row as Claude Code 2.1.282 writes one (`isSidechain`, `type`,
+/// `message.model`, the content blocks), naming `model`.
 fn said_by(model: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","message":{{"model":"{model}","id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"ok"}}]}},"version":"2.1.282"}}"#
@@ -1907,9 +2040,8 @@ fn between() -> [String; 4] {
     ]
 }
 
-/// Claude Code's own assistant rows name no model: `<synthetic>`, measured
-/// 2026-09-24 (22 in the owner's transcripts — a limit notice, and `No
-/// response requested.` written just after a restart).
+/// Claude Code's own assistant rows name the model `<synthetic>` (a limit
+/// notice, `No response requested.` after a restart).
 const SYNTHETIC: &str = r#"{"type":"assistant","isApiErrorMessage":false,"message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"No response requested."}]}}"#;
 
 fn jsonl(rows: &[&str]) -> String {
@@ -2023,15 +2155,14 @@ fn the_continuation_says_what_the_session_ran_before_the_restart() {
     );
 }
 
-/// THE INCIDENT'S NOTICE, 2026-09-25 (2.1.282 -> 2.1.283): the words the
-/// session got said only what it ran BEFORE — true, and silent on the fact
-/// that it came back on the same old model. A restart that moves the model
-/// says both, the model after being the one its relaunch line asked for.
+/// A restart that moves the model says what ran before and that it came back
+/// on a different model, the model after being the one its relaunch line
+/// asked for.
 #[test]
 fn a_model_move_says_what_ran_before_and_what_runs_now() {
     let (from, to) = (v("2.1.282"), v("2.1.283"));
-    // NEGATIVE CONTROL: the notice the incident typed, unchanged for a
-    // restart that moves no model.
+    // Negative control: the notice is unchanged for a restart that moves no
+    // model.
     assert_eq!(
         continue_prompt_with_model(&from, &to, Some("claude-opus-5"), None),
         format!(
@@ -2059,8 +2190,8 @@ fn a_model_move_says_what_ran_before_and_what_runs_now() {
         )
         .contains("now runs claude-opus-5-5[1m], the newest model of its family")
     );
-    // A move ACROSS families is the priority list's (owner, 2026-09-27: only
-    // with nothing newer of its own family), and is said so.
+    // A move across families is the priority list's (only with nothing newer
+    // of its own family), and is said so.
     assert_eq!(
         continue_prompt_with_model(
             &from,
@@ -2128,10 +2259,10 @@ fn a_provider_arn_is_a_model_id() {
     assert_eq!(transcript_model(&said_by(&endless)), None);
 }
 
-/// THE REASON FOR A CHANGE is what decided the model after: a launch that
-/// named `--model` keeps it on the relaunch — which undoes a `/model` choice
-/// made since, and resolves an alias against the new build — so the default
-/// had nothing to do with it and is not blamed.
+/// The reason for a change is what decided the model after: a launch that
+/// named `--model` keeps it on the relaunch (undoing a `/model` choice made
+/// since, and resolving an alias against the new build), so the default is
+/// not blamed.
 #[test]
 fn the_outcome_blames_a_kept_model_flag_not_the_default() {
     assert_eq!(
@@ -2167,7 +2298,7 @@ fn the_outcome_blames_a_kept_model_flag_not_the_default() {
     );
 }
 
-/// THE KEPT `--model` is read by the rewrite's own parse: the last one wins,
+/// The kept `--model` is read by the rewrite's own parse: the last one wins,
 /// as in Claude's parser; `--model=<v>` is one; a `--model` that is another
 /// flag's value, or comes after `--`, is not one.
 #[test]
@@ -2204,12 +2335,12 @@ fn the_launch_model_is_the_model_flag_the_rewrite_keeps() {
     assert_eq!(got(&["claude", "--print", "--model", "x"]), None);
 }
 
-/// THE RESUMED CONVERSATION of a launch, by the same parse: `--resume <id>`
-/// and `-r <id>` name it (`--resume=<id>` too, the last flag winning); a
-/// resume that names none the process keeps — `--continue`, `-c`, a bare
-/// `--resume` (the picker), or any resume with `--fork-session` — is
-/// `Some(None)`; a launch with no resume flag, or one whose `--resume` is
-/// another flag's value or after `--`, resumed nothing.
+/// The resumed conversation of a launch, by the same parse: `--resume <id>`,
+/// `-r <id>` and `--resume=<id>` name it (the last flag winning); a resume
+/// that names none the process keeps (`--continue`, `-c`, a bare `--resume`,
+/// or any resume with `--fork-session`) is `Some(None)`; a launch with no
+/// resume flag, or whose `--resume` is another flag's value or after `--`,
+/// resumed nothing.
 #[test]
 fn the_launch_resume_names_the_conversation_the_process_kept() {
     let got = |w: &[&str]| launch_resume(&argv(w));
@@ -2250,10 +2381,9 @@ fn the_launch_resume_names_the_conversation_the_process_kept() {
     assert_eq!(got(&["claude", "--", "--resume", "x"]), None);
 }
 
-/// THE RESUMED MODEL is the new process's: every transcript row carries the
-/// `version` that wrote it (measured 2026-09-24: all 25,018 assistant rows in
-/// the owner's transcripts), so a row the old process wrote past the mark —
-/// alive past its SIGTERM for one more turn — is never taken as the answer.
+/// The resumed model is the new process's: every transcript row carries the
+/// `version` that wrote it, so a row the old process wrote past the mark
+/// (alive past its SIGTERM for one more turn) is never taken as the answer.
 #[test]
 fn the_resumed_model_is_read_only_from_the_new_builds_rows() {
     let old = said_by("claude-opus-5").replace("2.1.282", "2.1.281");
@@ -2277,10 +2407,10 @@ fn the_resumed_model_is_read_only_from_the_new_builds_rows() {
 const TARGET: &str = "2.1.282";
 
 /// `--now` waives the settling window (and, the owner being the person at the
-/// tab, the attended-tab guard) and NOTHING else: a draft, a box, the
-/// busy footer, a non-idle status and a hold still wait, and a restart still
-/// needs the READY answer and an empty process tree. The negative control is
-/// the same reading with no request, which waits `settling`.
+/// tab, the attended-tab guard) and nothing else: a draft, a box, the busy
+/// footer, a non-idle status and a hold still wait, and a restart still needs
+/// the READY answer and an empty process tree. Negative control: the same
+/// reading with no request waits `settling`.
 #[test]
 fn a_now_request_waives_settling_and_never_the_draft_or_the_ready_answer() {
     let mut settling = idle_facts();
@@ -2467,6 +2597,17 @@ fn the_request_word_round_trips_and_an_unknown_word_asks_for_nothing() {
     }
 }
 
+/// A deferral is SHOWN as the time it has left, never its unix second.
+#[test]
+fn a_deferral_is_shown_as_the_time_it_has_left() {
+    let now = 1_790_000_000;
+    assert_eq!(Request::DeferUntil(now + 6 * 3_600).shown(now), "defer:6h");
+    assert_eq!(Request::DeferUntil(now + 90).shown(now), "defer:1m");
+    assert_eq!(Request::DeferUntil(now).shown(now), "defer:due");
+    assert_eq!(Request::Now.shown(now), "now");
+    assert_eq!(Request::Skip("2.1.282".into()).shown(now), "skip:2.1.282");
+}
+
 #[test]
 fn the_wait_word_names_claudes_status_only_for_not_idle() {
     assert_eq!(wait_word("not-idle", "busy"), "not-idle:busy");
@@ -2554,20 +2695,17 @@ fn a_model_restart_says_the_model_and_keeps_the_announce_head() {
     );
 }
 
-/// THE NOTICE AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK (the owner's
-/// answer of 2026-09-26: "Busy agentic sessions get upgraded at their next
-/// natural break. The notice interrupts the agent's orchestration once, and
-/// the restart still never kills running work"). Claude's own `busy` (a
+/// The notice at a break of the agent's own background work: busy agentic
+/// sessions are upgraded at their next natural break; the notice interrupts
+/// once and the restart never kills running work. Claude's own `busy` (a
 /// workflow it waits on) or `shell` status is no wait there, and the loop's
-/// settle stands for the screen's (a workflow's progress line never holds
-/// still). The break takes only NOTICES: the first one, and a re-ask once a
-/// whole [`REASK_S`] has passed with the work still running. Past
-/// [`MAX_ASKS`] the upgrade gives up. READY's restart and a void are an idle
-/// point's (`background`), and the restart's gate still asks for nothing
-/// running under the agent. NEGATIVE CONTROLS: a person, a hold, a box, a
-/// draft, a live turn's busy footer and a dialog's `waiting` still wait at
-/// the break. The same `busy` session at an idle point's step waits
-/// `not-idle`, as before.
+/// settle stands for the screen's. The break takes only notices: the first,
+/// and a re-ask once a whole [`REASK_S`] has passed with the work still
+/// running; past [`MAX_ASKS`] the upgrade gives up. READY's restart and a
+/// void are an idle point's (`background`). Negative controls: a person, a
+/// hold, a box, a draft, a live turn's busy footer and a dialog's `waiting`
+/// still wait at the break; the same `busy` session at an idle point waits
+/// `not-idle`.
 #[test]
 fn a_break_of_background_work_takes_only_notices_and_ends_nothing() {
     let at_break = |status: &str| Facts {
@@ -2611,11 +2749,10 @@ fn a_break_of_background_work_takes_only_notices_and_ends_nothing() {
         next_step(&announced, &at_break("idle"), true, 10),
         Step::Wait("background")
     );
-    // THE FOUR-DAY TAB (2026-09-26): a notice out, the agent's poll loops
-    // running on, a break every minute. Once a whole REASK_S has passed, the
-    // break asks again, READY or not. That is never an end, and past MAX_ASKS
-    // it is a give-up. Before this fix it answered `background` for good. A
-    // READY answer given with the notice has stood the same whole REASK_S.
+    // A notice out, the agent's poll loops running on, a break every minute:
+    // once a whole REASK_S has passed the break asks again, READY or not.
+    // That is never an end, and past MAX_ASKS it is a give-up. A READY given
+    // with the notice has stood the same whole REASK_S.
     for ready in [false, true] {
         let brk = Facts {
             ready_s: if ready { REASK_S } else { 0 },
@@ -2635,7 +2772,7 @@ fn a_break_of_background_work_takes_only_notices_and_ends_nothing() {
             Step::GiveUp,
             "ready={ready}"
         );
-        // AT ITS LIMIT, a break asks nothing and gives up on nothing: the
+        // At its limit, a break asks nothing and gives up on nothing: the
         // notice would be queued unread.
         let limited = Facts {
             limited: true,
@@ -2683,7 +2820,7 @@ fn a_break_of_background_work_takes_only_notices_and_ends_nothing() {
         ),
         Step::Announce
     );
-    // NEGATIVE CONTROL: no break — the busy session waits, as before.
+    // Negative control: no break, so the busy session waits.
     let busy_at_idle_point = Facts {
         status: "busy".to_string(),
         ..idle_facts()
@@ -2694,31 +2831,22 @@ fn a_break_of_background_work_takes_only_notices_and_ends_nothing() {
     );
 }
 
-/// CLAUDE'S OWN STATUS IS READ AGAINST ITS SCREEN AND THE WORK UNDER IT
-/// (2026-09-27). The gates took the session file's `status` as it stood,
-/// and a break only off the screen's words: a build whose idle screen draws
-/// no shell count, over shells that run under the agent with its status at
-/// `shell`, waited `not-idle` at every idle point — no notice, so no re-ask
-/// and no give-up, for as long as the shells ran; and a status Claude left
-/// stale over an idle screen and an empty process tree waited the same.
-/// Now, once the session's own reader has read the screen AUTHORITATIVELY
-/// IDLE for [`IDLE_LOOKS`] looks with the status standing [`QUIET_S`]:
-/// with work under the agent, the turn is over and that work is its own —
-/// the notice goes, as at a break, then the re-ask and the give-up, and the
-/// restart waits `background`; with NOTHING under it, the status is stale,
-/// and the NOTICE and the RELEASE go — each types one line and ends nothing.
-/// THE RESTART STILL WAITS FOR CLAUDE'S OWN `idle` (the Drain step's rule:
-/// work inside the agent's own process — a background agent, a workflow — is
-/// no process under it, and only that status says it runs): the READY it
-/// holds is asked again once [`REASK_S`] has passed, given up on after
-/// [`MAX_ASKS`], and a gave-up upgrade's late READY is void past
-/// [`DRAIN_S`], so the agent is released, never left stopped. A conversation
-/// with no task is not restarted afresh on it either, and the owner's `--now`
-/// waives none of it. NEGATIVE CONTROLS: a live turn (a foreground Bash call)
-/// never reads authoritatively idle, so it still waits `not-idle`; one look
-/// short, or a status younger than [`QUIET_S`], waits `status-stale`, which
-/// names it; a person's `waiting`, a box, a draft, the busy footer and the
-/// settle still hold.
+/// Claude's own status is read against its screen and the work under it.
+/// Once the session's reader has read the screen authoritatively idle for
+/// [`IDLE_LOOKS`] looks with the status standing [`QUIET_S`]: with work under
+/// the agent the turn is over and that work is its own, so the notice goes as
+/// at a break, then the re-ask and the give-up, and the restart waits
+/// `background`; with nothing under it the status is stale, and the notice
+/// and the release go (each types one line and ends nothing). The restart
+/// still waits for Claude's own `idle`, since work inside the agent's process
+/// (a background agent, a workflow) shows only in that status: its READY is
+/// asked again after [`REASK_S`], given up on after [`MAX_ASKS`], and a
+/// gave-up upgrade's late READY is void past [`DRAIN_S`], so the agent is
+/// released, never left stopped. A taskless conversation is not restarted
+/// afresh on it, and `--now` waives none of it. Negative controls: a live
+/// turn never reads authoritatively idle and waits `not-idle`; one look short
+/// or a status younger than [`QUIET_S`] waits `status-stale`; a person's
+/// `waiting`, a box, a draft, the busy footer and the settle still hold.
 #[test]
 fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
     let own_work = Facts {
@@ -2758,7 +2886,7 @@ fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
         next_step(&Phase::Pending, &busy, false, 1_000),
         Step::Announce
     );
-    // THE STALE STATUS: nothing under the agent. One line goes; nothing ends.
+    // The stale status: nothing under the agent. One line goes; nothing ends.
     let stale = Facts {
         background: Vec::new(),
         ..busy.clone()
@@ -2812,13 +2940,13 @@ fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
             Step::Void("status-stale")
         );
     }
-    // NEGATIVE CONTROL: Claude's own `idle` over the same screen restarts.
+    // Negative control: Claude's own `idle` over the same screen restarts.
     let idle = Facts {
         status: "idle".to_string(),
         ..stale.clone()
     };
     assert_eq!(next_step(&asked, &idle, true, 10), Step::Terminate);
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let knocks: [Knock; 8] = [
         (|f| f.idle_looks = 0, "not-idle"),
         (|f| f.idle_looks = IDLE_LOOKS - 1, "status-stale"),
@@ -2844,21 +2972,15 @@ fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
     assert_eq!(wait_word("status-stale", "busy"), "status-stale:busy");
 }
 
-/// A STOPPED UPGRADE TAKES ITS OWN STEP AT A BREAK, NOT A BARE `background`
-/// — save the restart, which waits for an idle point (2026-09-27: two
-/// widowed `tail -f` shells under a Claude Code whose status read `shell`
-/// made every screen a break, and no idle point ever came). Every break after
-/// the give-up answered `background` before the reducer looked at the phase,
-/// so the release the give-up owed was never typed, and a late READY that
-/// work outlived was never voided: the agent the upgrade asked was left
-/// stopped for as long as the shells lived. Now a gave-up upgrade with no
+/// A stopped upgrade takes its own step at a break, not a bare `background`,
+/// save the restart, which waits for an idle point. A gave-up upgrade with no
 /// READY waits `failed` at a break (the release it owes is its next act), and
-/// one whose late READY that work outlived past the drain is VOIDED there,
-/// owing the release. The release line goes wherever a notice may go, a
-/// settled break included: it types one line and ends nothing. NEGATIVE
-/// CONTROLS: the restart a READY would take still waits at a break
+/// one whose late READY the agent's work outlived past the drain is voided
+/// there, owing the release. The release line goes wherever a notice may go,
+/// a settled break included: it types one line and ends nothing. Negative
+/// controls: the restart a READY would take still waits at a break
 /// ([`gate_restart`], [`break_step`]); an announced upgrade still waits
-/// `background` within its window; and a person, a draft, a box, a hold, the
+/// `background` within its window; a person, a draft, a box, a hold, the
 /// limit and a live turn's footer still hold the release at a break.
 #[test]
 fn a_stopped_upgrade_takes_its_idle_points_step_at_a_break() {
@@ -2907,12 +3029,11 @@ fn a_stopped_upgrade_takes_its_idle_points_step_at_a_break() {
         break_step(next_step(&gave_up, &done, true, 1)),
         Step::Wait("background")
     );
-    // WORK INSIDE THE AGENT'S OWN PROCESS (the review of 2026-09-27: a
-    // workflow Claude's `busy` says it waits on, dead or alive, and nothing
-    // under the agent): the break arm waits on it as on a shell under the
-    // agent, before the restart's gate is ever asked — so the late READY it
-    // outlives past the drain is voided the same way, whatever Claude's word
-    // for it, the owner's `--now` included.
+    // Work inside the agent's own process (a workflow Claude's `busy` says it
+    // waits on, nothing under the agent): the break arm waits on it as on a
+    // shell under the agent, before the restart's gate is asked, so the late
+    // READY it outlives past the drain is voided the same way, whatever
+    // Claude's word for it, `--now` included.
     for status in ["busy", "shell", "idle"] {
         let own = Facts {
             status: status.to_string(),
@@ -2939,10 +3060,10 @@ fn a_stopped_upgrade_takes_its_idle_points_step_at_a_break() {
             "{status}: the owner's --now ends nothing at a break"
         );
     }
-    // NEGATIVE CONTROL: off a break, Claude's own `idle` with nothing under
+    // Negative control: off a break, Claude's own `idle` with nothing under
     // the agent is the restart.
     assert_eq!(gate_restart(&idle_facts(), true), Gate::Go);
-    // THE RELEASE AT A BREAK: the notice's own gate there.
+    // The release at a break: the notice's own gate there.
     assert_eq!(gate_release(&brk, false), Gate::Go);
     assert_eq!(gate_release(&brk, true), Gate::Wait("ready"));
     let knocks: [Knock; 6] = [
@@ -2958,7 +3079,7 @@ fn a_stopped_upgrade_takes_its_idle_points_step_at_a_break() {
         edit(&mut f);
         assert_eq!(gate_release(&f, false), Gate::Wait(word), "{word}");
     }
-    // NEGATIVE CONTROL: an announced upgrade within its window still waits
+    // Negative control: an announced upgrade within its window still waits
     // on the agent's own work at a break.
     let announced = Phase::Announced { at_s: 0, asks: 1 };
     assert_eq!(
@@ -2967,21 +3088,14 @@ fn a_stopped_upgrade_takes_its_idle_points_step_at_a_break() {
     );
 }
 
-/// THE RESTART'S OWN GATE WAITS AT A BREAK (the merge review of 2026-09-27,
-/// G1a). At a break of the agent's own work ([`Facts::background_point`])
-/// that work runs by definition — a shell under the agent, or a workflow
-/// inside its own process that [`Facts::background`] never names — and the
-/// Drain never ends the agent's own work (the module doc: it "is waited for,
-/// and never ended"). [`next_step`]'s break arm answers every phase there
-/// before this gate is asked, and the drivers' [`break_step`] turns an end
-/// into a wait; the merge with main's break arm had left the gate itself
-/// answering `Go` there — on Claude's `idle`, on a `busy` or `shell` a break
-/// admits, and on the owner's `--now` — while [`next_step`]'s doc said it
-/// never does. Now the gate says what the break arm says. The break arm's
-/// word for a phase the drivers carry instead of stepping (a restart in
-/// flight, a move done) is `background` too. NEGATIVE CONTROLS: a gate that
-/// is shut says its own word first, and off a break the same facts are the
-/// restart.
+/// The restart's own gate waits at a break: at a break of the agent's own
+/// work ([`Facts::background_point`]) that work runs by definition (a shell
+/// under the agent, or a workflow inside its process that
+/// [`Facts::background`] never names), and the drain never ends the agent's
+/// own work. The gate says what [`next_step`]'s break arm says, including
+/// `background` for a phase the drivers carry instead of stepping (a restart
+/// in flight, a move done). Negative controls: a shut gate says its own word
+/// first, and off a break the same facts are the restart.
 #[test]
 fn the_restarts_gate_waits_at_a_break_whatever_else_lets_it_go() {
     for status in ["idle", "busy", "shell"] {
@@ -3024,8 +3138,8 @@ fn the_restarts_gate_waits_at_a_break_whatever_else_lets_it_go() {
 }
 
 /// A main-chain user row saying `text`, as Claude Code 2.1.283 writes a typed
-/// prompt — the harness's and a person's alike (measured on the live E2E of
-/// 2026-09-26: `promptSource` and `origin` cannot tell them apart).
+/// prompt; the harness's and a person's alike (`promptSource` and `origin`
+/// cannot tell them apart).
 fn prompt_row(text: &str) -> String {
     format!(
         r#"{{"type":"user","isSidechain":false,"promptSource":"typed","origin":{{"kind":"human"}},"message":{{"role":"user","content":"{text}"}}}}"#
@@ -3039,20 +3153,17 @@ fn answer_row(model: &str) -> String {
     )
 }
 
-/// D1 OF THE LIVE E2E OF 2026-09-26: A CONVERSATION HAS A TASK from the first
-/// prompt of someone else's — never for the harness's own turns. The E2E's
-/// 0eada4a1 (the upgrade notice, READY), 1a5299ab (notice, READY, carry-on,
-/// its answer) read TASKLESS; a person's or an orchestrator's prompt makes it
-/// tasked the moment it is recorded — answered or not yet (the review of
-/// 2026-09-26: an orchestrator's first prompt not answered yet read taskless,
-/// and the fresh restart's last look let its signal through) — and for good,
-/// whatever the harness types after — stopped with Esc before its answer too.
-/// A command of theirs is a task once it
-/// starts a turn and while it has not said it started none; `/model`, whose
-/// local output says so, is none. Not prompts: a subagent's rows, Claude
-/// Code's own expansions (`isMeta`), a tool's result, Esc's note. NEGATIVE
-/// CONTROLS: the same transcripts with one person's prompt in them read
-/// tasked; an unknown user row's shape reads as someone's.
+/// A conversation has a task from the first prompt of someone else's, never
+/// for the harness's own turns (the upgrade notice, READY, the carry-on and
+/// its answer read taskless). A person's or an orchestrator's prompt makes it
+/// tasked the moment it is recorded, answered or not, and for good, whatever
+/// the harness types after, even stopped with Esc before its answer. A
+/// command of theirs is a task once it starts a turn and while it has not
+/// said it started none; `/model`, whose local output says so, is none. Not
+/// prompts: a subagent's rows, Claude Code's own expansions (`isMeta`), a
+/// tool's result, Esc's note. Negative controls: the same transcripts with
+/// one person's prompt read tasked; an unknown user row's shape reads as
+/// someone's.
 #[test]
 fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     let notice = prompt_row(
@@ -3107,8 +3218,8 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     let tasked: [(&str, Vec<&String>); 11] = [
         ("a person's prompt, answered", vec![&person, &ready]),
         ("a person's prompt, not answered yet", vec![&person]),
-        // ND1 of the live re-test of 2026-09-26: a first prompt stopped with
-        // Esc before any answer is still someone's ask.
+        // A first prompt stopped with Esc before any answer is still someone's
+        // ask.
         ("a person's prompt, stopped with Esc", vec![&person, &esc]),
         (
             "a first prompt after the notice, stopped with Esc",
@@ -3169,38 +3280,49 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
 
 /// D1: THE SUPERVISOR'S OWN TURNS ARE NO TASK EITHER (the review of
 /// 2026-09-26). `keep going` and `answer_text` carry no mark — their words
-/// are the owner's — but the loop's ledger records every text it types
-/// ([`TaskScan::supervisor_typed`]), and a row with the same words (however
-/// wrapped) is the harness's: the E2E's chain — the notice, READY, the
-/// carry-on, `keep going`, `answer_text` — holds no task. So is a command it
-/// typed (`/compact`), read out of Claude Code's command row. NEGATIVE
-/// CONTROLS: the same record read with no ledger is tasked by the first
-/// unmarked turn; a person's prompt that is not the loop's words is theirs,
-/// ledger or not; and a person's command is still a command.
+/// are the owner's — but the loop's ledger records every text it types, and
+/// when ([`TaskScan::supervisor_typed`]), and a row with the same words
+/// (however wrapped), recorded as they were typed, is the harness's: the
+/// E2E's chain — the notice, READY, the carry-on, `keep going`,
+/// `answer_text` — holds no task. So is a command it typed (`/compact`),
+/// read out of Claude Code's command row. NEGATIVE CONTROLS: the same record
+/// read with no ledger is tasked by the first unmarked turn; a person's
+/// prompt that is not the loop's words is theirs, ledger or not; and a
+/// person's command is still a command.
 #[test]
 fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
     let cfg = crate::supervise::SupervisorConfig::default();
-    let ours = vec![
-        cfg.continue_text.clone(),
-        cfg.answer_text.clone(),
-        "/compact".to_string(),
-    ];
+    let ours: Vec<Typed> = [
+        cfg.continue_text.as_str(),
+        cfg.answer_text.as_str(),
+        "/compact",
+    ]
+    .into_iter()
+    .map(|text| Typed {
+        at_ms: 1_000,
+        text: text.to_string(),
+    })
+    .collect();
+    // Recorded as the loop typed it (its ledger's `ts` 1 000 ms).
+    let typed = |text: &str| {
+        prompt_row(text).replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1)
+    };
     let chain = [
         prompt_row("[aterm harness] Claude Code 2.1.283 (managed) is installed"),
         answer_row("claude-haiku-4-5"),
         prompt_row("[aterm harness] Upgraded: this session was restarted on 2.1.283."),
         answer_row("claude-haiku-4-5"),
-        prompt_row("keep going"),
+        typed("keep going"),
         answer_row("claude-haiku-4-5"),
-        prompt_row(&cfg.answer_text.replace(". ", ".  ")),
+        typed(&cfg.answer_text.replace(". ", ".  ")),
         answer_row("claude-haiku-4-5"),
-        prompt_row("<command-name>/compact</command-name>\\n<command-args></command-args>"),
+        typed("<command-name>/compact</command-name>\\n<command-args></command-args>"),
         answer_row("claude-haiku-4-5"),
     ]
     .join("\n");
     assert!(!transcript_tasked(&chain, &ours), "the harness's alone");
     assert!(transcript_tasked(&chain, &[]), "no ledger: someone's");
-    let person = format!("{chain}\n{}", prompt_row("keep going, and fix the parser"));
+    let person = format!("{chain}\n{}", typed("keep going, and fix the parser"));
     assert!(transcript_tasked(&person, &ours), "not the loop's words");
     let command = format!(
         "{chain}\n{}\n{}",
@@ -3210,17 +3332,14 @@ fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
     assert!(transcript_tasked(&command, &ours), "a person's command");
 }
 
-/// D1: A CONVERSATION WITH NO TASK IS NEVER ANNOUNCED TO — it is restarted
-/// AFRESH ([`Step::Fresh`]) once idle the full [`QUIET_S`] (no answer to
-/// read, but a first prompt may be on its way: an orchestrator's `await agent
-/// idle` returns at the first idle verdict — ND1 of the live re-test of
-/// 2026-09-26, where the restart fired 1.3 s after it), whether nothing was
-/// typed yet or an older aterm's notice stands unanswered. A person at the
-/// tab, a hold, a box, a draft, a busy agent and work running under it still
-/// wait, and a break of its background work ends nothing. NEGATIVE
-/// CONTROLS: the same facts with a task are announced to; a taskless agent
-/// whose verdict moved under `QUIET_S` ago (a launch, a prompt's turn)
-/// settles first — ten seconds, the settle before this, among them.
+/// A conversation with no task is never announced to: it is restarted afresh
+/// ([`Step::Fresh`]) once idle the full [`QUIET_S`] (a first prompt may be on
+/// its way: an orchestrator's `await agent idle` returns at the first idle
+/// verdict), whether nothing was typed yet or an older aterm's notice stands
+/// unanswered. A person at the tab, a hold, a box, a draft, a busy agent and
+/// work under it still wait, and a break ends nothing. Negative controls:
+/// the same facts with a task are announced to; a taskless agent whose
+/// verdict moved under `QUIET_S` ago settles first.
 #[test]
 fn a_conversation_with_no_task_is_restarted_afresh_never_announced_to() {
     let now = 10_000;
@@ -3277,7 +3396,7 @@ fn a_conversation_with_no_task_is_restarted_afresh_never_announced_to() {
             Step::Wait(_)
         ));
     }
-    // NEGATIVE CONTROL: with a task, the notice.
+    // Negative control: with a task, the notice.
     let tasked = Facts {
         taskless: false,
         ..settled.clone()
@@ -3288,11 +3407,9 @@ fn a_conversation_with_no_task_is_restarted_afresh_never_announced_to() {
     );
 }
 
-// ------------------------------------------- the stall of 2026-09-25/26
+// ------------------------------------------- a session parked at its usage limit
 
-/// The row Claude Code 2.1.280 parked the incident's session under, as the
-/// window's supervisor journaled it (`EVENT limited seq=43484 message=…`,
-/// tab `s-d3346b29dd236432b852`, 2026-09-25 16:00:26 PDT).
+/// The row Claude Code 2.1.280 parks a session at its usage limit under.
 const AUTO_CONTINUE: &str =
     "⚠ Usage limit reached · continuing automatically at 6am · esc to cancel";
 
@@ -3312,13 +3429,12 @@ fn claude_screen(live: &[&str]) -> Vec<String> {
     r
 }
 
-/// THE LIMIT FACT IS THE SUPERVISOR'S OWN READING (F1): the incident's screen
-/// — the auto-continue banner alone over an empty composer, which the gates
-/// read as idle — is `limited` by the one recogniser the supervisor journaled
-/// `EVENT limited` with, and so is the same wall over a break of the agent's
-/// own background work, which the supervisor's phase reads BUSY. NEGATIVE
-/// CONTROLS: the screen without the banner, the banner made history by the
-/// words under it, and a copy of it in a tool's output are not.
+/// The limit fact is the supervisor's own reading: the auto-continue banner
+/// alone over an empty composer, which the gates read as idle, is `limited`
+/// by the supervisor's recogniser, and so is the same wall over a break of
+/// the agent's background work. Negative controls: the screen without the
+/// banner, the banner made history by the words under it, and a copy of it in
+/// a tool's output are not.
 #[test]
 fn the_limit_fact_is_read_by_the_supervisors_own_recogniser() {
     let parked = claude_screen(&[AUTO_CONTINUE, ""]);
@@ -3329,7 +3445,7 @@ fn the_limit_fact_is_read_by_the_supervisors_own_recogniser() {
         "the supervisor's reader says limited too: {:?}",
         reading.phase
     );
-    // The composer the gates read is empty on it: a limited session LOOKS
+    // The composer the gates read is empty on it: a limited session looks
     // idle to every other fact.
     assert!(composer_is_empty(
         &parked,
@@ -3362,12 +3478,11 @@ fn the_limit_fact_is_read_by_the_supervisors_own_recogniser() {
     );
 }
 
-/// F1: A SESSION AT ITS LIMIT IS NEVER ASKED, AND NOTHING OF THE UPGRADE'S IS
-/// SPENT THERE. Every gate waits `limited` — the owner's `--now` and a break
-/// of the agent's background work included — no re-ask, no give-up, no void
-/// and no restart is taken, and an announced upgrade's clock restarts at every
-/// look that finds the limit ([`clock_held`]). NEGATIVE CONTROLS: the same
-/// facts off the limit take each of those steps.
+/// A session at its limit is never asked, and nothing of the upgrade's is
+/// spent there: every gate waits `limited` (`--now` and a break included), no
+/// re-ask, give-up, void or restart is taken, and an announced upgrade's clock
+/// restarts at every look that finds the limit ([`clock_held`]). Negative
+/// controls: the same facts off the limit take each of those steps.
 #[test]
 fn a_limited_session_is_never_asked_and_its_clock_is_held() {
     let limited_facts = Facts {
@@ -3403,7 +3518,7 @@ fn a_limited_session_is_never_asked_and_its_clock_is_held() {
         Step::Wait("limited")
     );
 
-    // Four half-hours and the asks budget, as the incident spent them.
+    // Four half-hours and the asks budget.
     let t0 = 1_790_377_339;
     let asked = Phase::Announced { at_s: t0, asks: 1 };
     let tired = Phase::Announced {
@@ -3444,7 +3559,7 @@ fn a_limited_session_is_never_asked_and_its_clock_is_held() {
             }
         );
     }
-    // NEGATIVE CONTROLS: off the limit, the same looks re-ask, give up, end
+    // Negative controls: off the limit, the same looks re-ask, give up, end
     // and void, and the clock runs.
     let late = t0 + REASK_S;
     let idle = idle_facts();
@@ -3466,12 +3581,11 @@ fn a_limited_session_is_never_asked_and_its_clock_is_held() {
     );
 }
 
-/// F2: AN UPGRADE THAT GAVE UP ASKING STILL HEARS A LATE READY — the one the
-/// incident's agent gave at 06:02 — and takes exactly the step an announced
-/// upgrade takes on it: every gate of the restart kept (the agent's own work,
-/// a person at the tab, the limit), then the restart. NEGATIVE CONTROLS: no
-/// READY waits `failed`, and so does a READY to an upgrade that stopped for
-/// any other reason.
+/// An upgrade that gave up asking still hears a late READY and takes exactly
+/// the step an announced upgrade takes on it: every gate of the restart kept
+/// (the agent's own work, a person at the tab, the limit), then the restart.
+/// Negative controls: no READY waits `failed`, as does a READY to an upgrade
+/// that stopped for any other reason.
 #[test]
 fn an_upgrade_that_gave_up_asking_honours_a_late_ready() {
     let gave_up = Phase::Failed(GAVE_UP.to_string());
@@ -3501,20 +3615,16 @@ fn an_upgrade_that_gave_up_asking_honours_a_late_ready() {
     assert_eq!(gave_up.word(), "failed:unanswered");
 }
 
-/// A READY THE RESTART'S GATE HOLDS PAST THE DRAIN IS NEVER WAITED ON FOR
-/// GOOD — an announced upgrade's and a gave-up one's late answer alike. A
-/// person's box or draft that has stood [`HOLD_S`] voids it in either phase
-/// ([`person_void`]). The agent's own background work still running
-/// [`DRAIN_S`] after the answer is met by what each phase has left: an
-/// announced upgrade ASKS AGAIN, naming what runs, and the new notice
-/// supersedes the answer (the four-day tab of 2026-09-26); one that gave up
-/// has no ask left and VOIDS it, owing the release ([`void_of`]; review of
-/// 2026-09-26: the gave-up arm had no void at all, so a READY a person's
-/// hold kept for hours ended the agent the moment it cleared, and one a
-/// `run_in_background` server held left the agent stopped for good). A gate
-/// about to open — the settle after that work ends — never voids, however
-/// old the answer; at the limit, nothing does. NEGATIVE CONTROLS: short of
-/// each bound, the gate's own wait.
+/// A READY the restart's gate holds past the drain is never waited on for
+/// good, an announced upgrade's and a gave-up one's alike. A person's box or
+/// draft that has stood [`HOLD_S`] voids it in either phase
+/// ([`person_void`]). The agent's own work still running [`DRAIN_S`] after
+/// the answer is met by what each phase has left: an announced upgrade asks
+/// again, naming what runs, and the new notice supersedes the answer; one
+/// that gave up voids it, owing the release ([`void_of`]). A gate about to
+/// open (the settle after that work ends) never voids, however old the
+/// answer; at the limit nothing does. Negative controls: short of each bound,
+/// the gate's own wait.
 #[test]
 fn a_ready_the_gate_holds_past_the_drain_is_void_in_either_phase() {
     let gave_up = Phase::Failed(GAVE_UP.to_string());
@@ -3574,10 +3684,10 @@ fn a_ready_the_gate_holds_past_the_drain_is_void_in_either_phase() {
     assert_eq!(ready_since(50, false, &idle, 90), 0);
 }
 
-/// F3: THE RELEASE IS TYPED UNDER THE NOTICE'S OWN GATE, and never over a
-/// READY answer the restart will act on. Its words tell the agent nothing
-/// will restart it and to go on — and are neither a notice nor a
-/// continuation to any reader of the transcript.
+/// The release is typed under the notice's own gate, never over a READY the
+/// restart will act on. Its words tell the agent nothing will restart it and
+/// to go on, and are neither a notice nor a continuation to a transcript
+/// reader.
 #[test]
 fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
     assert_eq!(gate_release(&idle_facts(), false), Gate::Go);
@@ -3597,8 +3707,7 @@ fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
         assert_eq!(gate_release(&f, false), Gate::Wait(word), "{word}");
     }
     // A break of the agent's own background work types it too, where a
-    // notice may go (2026-09-27: a break that never ends reached no idle
-    // point, and the release a give-up owed was never typed).
+    // notice may go, since a break that never ends reaches no idle point.
     let at_break = Facts {
         status: "busy".to_string(),
         background_point: true,
@@ -3613,9 +3722,8 @@ fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
          restart this session without asking you again first, and nothing the notice asked of \
          you still applies. Carry on as you would have without it."
     );
-    // It points at no work of its own (the review of 2026-09-26: "continue
-    // the work you were doing before the notice" pulled an agent back over
-    // direction it had been given since).
+    // It points at no work of its own, so it never pulls the agent back over
+    // direction given since the notice.
     assert!(!text.contains("before the notice"));
     assert!(!text.starts_with(ANNOUNCE_HEAD));
     assert!(!text.contains(READY_PREFIX));
@@ -3629,7 +3737,7 @@ fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
     assert!(!is_announcement(row.get("message").expect("message")));
 }
 
-// ------------------------------------------------ no stop is for good (2026-09-27)
+// ------------------------------------------------ no stop is for good
 
 /// Every reason a round stops for: the give-up, the refusals, the stops of a
 /// restart, the orphan pass's expirations and the Codex lane's.
@@ -3658,23 +3766,6 @@ fn break_with_work() -> Facts {
         background: vec!["zsh".to_string()],
         ..idle_facts()
     }
-}
-
-/// ONE ROUND ON, ONE ROUND OFF: the rest is one round's worth of asking, so
-/// the nagging is at most half of any stretch, and the silence after a first
-/// stop that hears no late READY is the give-up's window plus the rest. That
-/// is NOT the longest silence: a late READY the agent's own work outlives
-/// adds a drain and a second rest ([`RETRY_S`]'s doc;
-/// `upgrade_stall_tests::the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest`).
-#[test]
-fn the_rest_is_one_rounds_worth_of_asking() {
-    assert_eq!(RETRY_S, u64::from(MAX_ASKS) * REASK_S);
-    assert_eq!(span(RETRY_S), "2h");
-    assert_eq!(
-        span(REASK_S + RETRY_S),
-        "2h30m",
-        "the silence after a first stop with no late READY"
-    );
 }
 
 /// NO STOP IS FOR GOOD (the owner, 2026-09-27: "you should NEVER have
@@ -3755,19 +3846,13 @@ fn every_stopped_round_rests_then_rearms() {
     }
 }
 
-/// THE OWNER'S TAB OF 2026-09-27, through the reducer (`s-d3346b29dd236432b852`:
-/// `phase=failed:unanswered pending_for=1d22h wait=background wait_for=2h56m
-/// stalled=gave-up`). Its agent runs a background gate or monitor at every
-/// look, so nearly every step is taken at a break. The round gave up; the
-/// agent's late READY came; its own work outlived the answer — and the break
-/// answered `background` before any bound was asked, for good, while at an
-/// idle point the void sent it back to `failed`, for good. Now: at a break
-/// the late READY is voided on the drain's bound as at an idle point, and
-/// once the round has rested — the READY voided, a STALE READY in the
-/// transcript no marker holds any more — a new round starts at the break and
-/// its first notice is typed there. NEGATIVE CONTROL: a READY heard for less
-/// than the drain's bound is still waited for — the late READY is honoured,
-/// never cut short by the new round.
+/// A tab whose agent runs a background gate or monitor at every look, so
+/// nearly every step is taken at a break, after the round gave up and a late
+/// READY came that its own work outlived: at a break the late READY is voided
+/// on the drain's bound as at an idle point, and once the round has rested
+/// (the READY voided, a stale READY no marker holds) a new round starts at
+/// the break and its first notice is typed there. Negative control: a READY
+/// heard for less than the drain's bound is still waited for.
 #[test]
 fn the_owners_stall_never_waits_for_ever() {
     let gave_up = Phase::Failed(GAVE_UP.to_string());
@@ -3797,9 +3882,8 @@ fn the_owners_stall_never_waits_for_ever() {
         next_step(&gave_up, &idle_with_work, true, 1),
         Step::Void("background")
     );
-    // Voided: a stale READY no marker holds (`ready` false). It rests —
-    // never `failed` for ever — and past the rest a new round starts, at a
-    // break and at an idle point alike.
+    // Voided: a stale READY no marker holds (`ready` false). It rests, and
+    // past the rest a new round starts, at a break and at an idle point alike.
     assert_eq!(
         next_step(&gave_up, &heard(0, 60), false, 1),
         Step::Wait("failed")
@@ -3838,11 +3922,10 @@ fn the_owners_stall_never_waits_for_ever() {
     );
 }
 
-/// THE OWNER'S WORD HOLDS A NEW ROUND AS IT HOLDS ANY ([`rearm_held`]): a
-/// stopped round the owner skipped (`--skip` of THIS target) stays skipped,
-/// however long it rests; a deferral holds it until it runs out, then the
-/// round re-arms. NEGATIVE CONTROLS: a skip of another build, no word, and
-/// `--now` hold nothing.
+/// The owner's word holds a new round as it holds any ([`rearm_held`]): a
+/// stopped round the owner skipped (`--skip` of this target) stays skipped
+/// however long it rests; a deferral holds it until it runs out. Negative
+/// controls: a skip of another build, no word, and `--now` hold nothing.
 #[test]
 fn a_skip_stays_skipped_and_a_deferral_lets_a_stopped_round_go() {
     let rested = Facts {
@@ -3875,34 +3958,9 @@ fn a_skip_stays_skipped_and_a_deferral_lets_a_stopped_round_go() {
     }
 }
 
-/// A SESSION AT ITS LIMIT IS RE-ARMED BUT NEVER ASKED: the new round types
-/// nothing, so it is taken at the limit; its first notice waits `limited`,
-/// at an idle point and at a break alike, for as long as the limit stands.
-#[test]
-fn a_limited_session_is_rearmed_but_never_asked_while_limited() {
-    for f in [idle_facts(), break_with_work()] {
-        let limited = Facts {
-            limited: true,
-            failed_s: RETRY_S,
-            ..f
-        };
-        assert_eq!(
-            next_step(&Phase::Failed(GAVE_UP.to_string()), &limited, false, 1),
-            Step::Rearm
-        );
-        assert_eq!(
-            next_step(&Phase::Pending, &limited, false, 1),
-            Step::Wait("limited")
-        );
-        assert_eq!(gate_announce(&limited), Gate::Wait("limited"));
-    }
-}
-
 // ------------------------------------ the notices queued behind a limit (2026-09-27)
 
-/// The owner's session of 2026-09-27 (`25e3b26e…`, tab
-/// `s-c543f4e0edd3439e5791`): its fourth notice's READY marker, as 0.93.0
-/// typed it.
+/// A READY marker as aterm 0.93.0 typed it.
 const QUEUED_MARKER: &str = "ATERM-UPGRADE-READY-6a57ff7a";
 
 fn json_text(text: &str) -> String {
@@ -3918,9 +3976,8 @@ fn notice_row(ts: &str, marker: &str) -> String {
     )
 }
 
-/// CLAUDE CODE'S OWN ANSWER AT THE WEEKLY LIMIT, as the owner's transcript
-/// holds it (row 2427, 2026-09-27T15:06:40.380Z, the first notice's turn;
-/// ids cut, every key the readers look at kept).
+/// Claude Code's own answer at the weekly limit (ids cut, every key the
+/// readers look at kept).
 fn limit_row(ts: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"{ts}","message":{{"diagnostics":null,"id":"m","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"You've hit your weekly limit · resets Oct 3 at 10am (America/Los_Angeles)"}}],"context_management":null}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":1791046800,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.280"}}"#
@@ -3943,19 +4000,16 @@ fn person_row(ts: &str, text: &str) -> String {
     )
 }
 
-/// A NOTICE THE LIMIT ANSWERED IS QUEUED, NEVER READ AS ASKED (the owner's
-/// report of 2026-09-27: 0.93.0 typed four notices into a session parked at
-/// its weekly limit, each answered within two seconds by Claude Code's
-/// `rate_limit` row, and when the session went on all four reached the agent
-/// at once). Its fate is `Queued` until the model writes a row of its own,
-/// and then `Taken` at that row's time — the moment its window opens. The
-/// login wall's reading is unchanged by it: a limit is no wall. NEGATIVE
-/// CONTROLS: a notice the model answered is `Answered`, one the wall
-/// answered `Wall`, one nothing has answered yet `Open`; a limit hit BEFORE
-/// the notice (the wind-down turn's) leaves the notice's own fate its own; an
-/// API error that is no limit and a warning are passed over; a subagent's
-/// limit is not the session's; a limit row Claude Code writes without the
-/// `error` key is read by the wall table's words.
+/// A notice the limit answered is queued, never read as asked: Claude Code
+/// answers each notice typed into a session at its limit with a `rate_limit`
+/// row, and when the session goes on all of them reach the agent at once.
+/// Its fate is `Queued` until the model writes a row of its own, then `Taken`
+/// at that row's time. A limit is no login wall. Negative controls: a notice
+/// the model answered is `Answered`, one the wall answered `Wall`, one
+/// nothing has answered `Open`; a limit hit before the notice leaves the
+/// notice's fate its own; an API error that is no limit and a warning are
+/// passed over; a subagent's limit is not the session's; a limit row without
+/// the `error` key is read by the wall table's words.
 #[test]
 fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
     let m = QUEUED_MARKER;
@@ -3963,7 +4017,6 @@ fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
     let queued = [notice.clone(), limit_row("2026-09-27T15:06:40.380Z")].join("\n");
     assert_eq!(notice_fate_of(&queued, m), Some(NoticeFate::Queued));
     assert_eq!(notice_fate(&queued, m), Some(false), "a limit is no wall");
-    assert!(!notice_undelivered(&queued, m));
     let taken = [
         queued.clone(),
         person_row("2026-09-27T19:57:55.873Z", "first, continue"),
@@ -3978,9 +4031,9 @@ fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
         Some(NoticeFate::Taken(Some(1_790_539_085))),
         "taken when the model first wrote after it"
     );
-    // HOW LONG IT WAITS ON ITS LIMIT (review of 2026-09-27): the reset its
-    // row names; a row naming none, REASK_S from when it was written; a
-    // `/login` finished since, over (0) — in both of Claude Code's shapes.
+    // How long it waits on its limit: the reset its row names; a row naming
+    // none, REASK_S from when it was written; a `/login` finished since, over
+    // (0), in both of Claude Code's shapes.
     assert_eq!(queued_until(&queued, m), Some(1_791_046_800));
     let unstamped = [
         notice.clone(),
@@ -4005,7 +4058,7 @@ fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
         );
     }
     assert_eq!(queued_until(&taken, m), None, "taken: no longer queued");
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let answered = [notice.clone(), said_row("2026-09-27T15:06:50Z", "Saved.")].join("\n");
     assert_eq!(notice_fate_of(&answered, m), Some(NoticeFate::Answered));
     assert_eq!(queued_until(&answered, m), None);
@@ -4054,64 +4107,14 @@ fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
     );
 }
 
-/// THE REDUCER ON A QUEUED NOTICE: one queued behind the limit (read
-/// [`Facts::limited`] by the driver) is never asked again or given up on
-/// however long it waits, and its window waits with it. NEGATIVE CONTROL:
-/// the same notice read and left with no READY is given up on after the
-/// last ask, as before — a round that then rests and asks again
-/// ([`RETRY_S`]).
-#[test]
-fn a_queued_notice_is_never_given_up_on() {
-    let tired = Phase::Announced {
-        at_s: 1_000,
-        asks: MAX_ASKS,
-    };
-    let late = 1_000 + REASK_S;
-    let queued = Facts {
-        limited: true,
-        ..idle_facts()
-    };
-    for now in [late, late + 10 * REASK_S] {
-        assert_eq!(
-            next_step(&tired, &queued, false, now),
-            Step::Wait("limited")
-        );
-    }
-    assert_eq!(
-        clock_held(&tired, &queued, late),
-        Phase::Announced {
-            at_s: late,
-            asks: MAX_ASKS
-        },
-        "its window waits with it"
-    );
-    // NEGATIVE CONTROL.
-    assert_eq!(next_step(&tired, &idle_facts(), false, late), Step::GiveUp);
-    assert_eq!(
-        next_step(
-            &tired,
-            &Facts {
-                background_point: true,
-                status: "busy".to_string(),
-                ..idle_facts()
-            },
-            false,
-            late
-        ),
-        Step::GiveUp
-    );
-}
-
 /// THE LIMIT'S RESET, FROM THE TRANSCRIPT ([`transcript_limit_until`]): while
 /// the session's last word is Claude Code's limit row, the instant it names
-/// (`quotaLimits.resetsAt`) is how long the session stands at its limit —
-/// what keeps even a first notice out of it once the banner has left the
-/// screen. Claude Code's other rows of its own are passed over. A limit row
-/// naming no reset holds [`REASK_S`] from when it was written, as a notice
-/// queued behind one waits (review of 2026-09-27: read as no limit, a
-/// pending upgrade typed a fresh notice minutes after one). NEGATIVE
-/// CONTROLS: the model answering after it ends it; a row naming neither a
-/// reset nor a time, a subagent's and none at all say nothing.
+/// (`quotaLimits.resetsAt`) is how long the session stands at its limit,
+/// which keeps even a first notice out once the banner has left the screen.
+/// Claude Code's other rows are passed over. A limit row naming no reset
+/// holds [`REASK_S`] from when it was written. Negative controls: the model
+/// answering after it ends it; a row naming neither a reset nor a time, a
+/// subagent's and none at all say nothing.
 #[test]
 fn the_limit_stands_until_the_reset_its_row_names() {
     let limit = limit_row("2026-09-27T15:04:28.344Z");
@@ -4126,7 +4129,7 @@ fn the_limit_stands_until_the_reset_its_row_names() {
         Some(1_791_046_800),
         "passed over"
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let later = said_row("2026-09-27T19:58:05.554Z", "Pushing first.");
     assert_eq!(
         transcript_limit_until(&[limit.clone(), later].join("\n")),
@@ -4148,9 +4151,8 @@ fn the_limit_stands_until_the_reset_its_row_names() {
     );
     assert_eq!(transcript_limit_until(&answered), None);
     assert_eq!(transcript_limit_until(""), None);
-    // A `/login` that finished after it ends it (review of 2026-09-27: the
-    // owner's `Login successful` at 19:57:47Z, an account switched, the
-    // reset days off) — and a limit hit again after it stands again.
+    // A `/login` that finished after it ends it (an account switched, the
+    // reset days off), and a limit hit again after it stands again.
     let login = person_row(
         "2026-09-27T19:57:47Z",
         "<local-command-stdout>Login successful</local-command-stdout>",
@@ -4166,18 +4168,15 @@ fn the_limit_stands_until_the_reset_its_row_names() {
     );
 }
 
-/// THE COPIES OF A QUEUED NOTICE, COUNTED UNTIL THE MODEL TAKES ONE
-/// ([`REQUEUE_MAX`]): every upgrade notice typed since the model's last row
-/// of its own is one more in the conversation, untaken — this notice's copies
-/// and another's (an earlier round's: review of 2026-09-27), whatever
-/// answered each (a limit, the login wall: the same review — a wall's answer
-/// restarted the count, and limit and wall answers in turn could stack more
-/// than the bound); a `/login` between them takes none (the copies stay); a
-/// row of the model's own starts the count again. The FULL queue's rest
-/// ([`Scan::rests_until`]) counts from the latest copy's limit row: its
-/// reset, or [`REASK_S`] after a row naming none, then [`RETRY_S`]. NEGATIVE
-/// CONTROLS: a notice not queued — answered, taken, open behind a queued
-/// copy — has none counted, and no rest; a marker nothing carries, none.
+/// The copies of a queued notice, counted until the model takes one
+/// ([`REQUEUE_MAX`]): every upgrade notice typed since the model's last row of
+/// its own is one more untaken, this notice's copies and an earlier round's,
+/// whatever answered each (a limit, the login wall); a `/login` between them
+/// takes none; a row of the model's own starts the count again. The full
+/// queue's rest ([`Scan::rests_until`]) counts from the latest copy's limit
+/// row: its reset, or [`REASK_S`] after a row naming none, then [`RETRY_S`].
+/// Negative controls: a notice not queued (answered, taken, open behind a
+/// queued copy) has none counted and no rest; a marker nothing carries, none.
 #[test]
 fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
     let m = QUEUED_MARKER;
@@ -4206,7 +4205,7 @@ fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
         1,
         "the model's row starts the count again"
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let taken = rows(&[&copy(15, m), &copy(16, m), &took]);
     assert!(matches!(
         notice_fate_of(&taken, m),
@@ -4248,7 +4247,7 @@ fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
     );
     assert_eq!(queued_copies(&three, "ATERM-UPGRADE-READY-00000000"), 0);
 
-    // THE REST of a full queue, from the latest copy's limit row.
+    // The rest of a full queue, from the latest copy's limit row.
     let scan = notice_scan(&three, m).expect("queued");
     assert_eq!(
         scan.rests_until(),
@@ -4283,14 +4282,12 @@ fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
     );
 }
 
-/// THE FULL QUEUE'S REST GROWS WITH EVERY COPY UNREAD, UP TO A DAY (the
-/// owner, 2026-09-27: a limit naming no reset still added a copy every two
-/// and a half hours for as long as it stood): two hours for the queue at its
-/// room's end (`1 + REQUEUE_MAX` unread), then four, eight and sixteen, then
-/// a day for every count past that — `QUEUE_REST_DOUBLINGS` rests shorter
-/// than a day. NEGATIVE CONTROLS: the rest never exceeds a day, however many
-/// wait (a count the scan saturates at), and a queue with room — which types
-/// again straight away, never after a rest — reads the first rest.
+/// The full queue's rest grows with every copy unread, up to a day: two hours
+/// for the queue at its room's end (`1 + REQUEUE_MAX` unread), then four,
+/// eight and sixteen, then a day for every count past that
+/// (`QUEUE_REST_DOUBLINGS` rests shorter than a day). Negative controls: the
+/// rest never exceeds a day however many wait, and a queue with room (which
+/// types again straight away) reads the first rest.
 #[test]
 fn a_full_queues_rest_doubles_per_copy_unread_up_to_a_day() {
     let full = REQUEUE_MAX + 1;
@@ -4303,7 +4300,7 @@ fn a_full_queues_rest_doubles_per_copy_unread_up_to_a_day() {
         .filter(|n| queue_rest(*n) < QUEUE_REST_MAX_S)
         .count();
     assert_eq!(short, usize::try_from(QUEUE_REST_DOUBLINGS).expect("small"));
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     for n in [full + 30, 1_000, u32::MAX] {
         assert_eq!(queue_rest(n), QUEUE_REST_MAX_S, "{n}");
     }
@@ -4312,8 +4309,8 @@ fn a_full_queues_rest_doubles_per_copy_unread_up_to_a_day() {
     }
 }
 
-/// THE LADDER'S RUNGS (the owner's decision of 2026-09-28): twenty minutes,
-/// an hour and two hours behind, and nothing before a start is known.
+/// The ladder's rungs: twenty minutes, an hour and two hours behind, and
+/// nothing before a start is known (owner, 2026-09-28).
 #[test]
 fn the_ladder_climbs_by_how_long_the_session_has_been_behind() {
     assert_eq!(rung(0), Rung::Prefer);
@@ -4344,20 +4341,18 @@ fn the_ladder_climbs_by_how_long_the_session_has_been_behind() {
     assert_eq!(rung_in_force(&idle_facts()), Rung::Prefer);
 }
 
-/// ACTIVITY DELAYS; IT NEVER DISABLES — AND NO RUNG RELAXES A FLOOR (the
-/// owner, 2026-09-28: "It never types over a draft, a dialog or running
-/// work."). At each rung, what the gate passes that the rung before did
-/// not: from Settled a pause that only LOOKS quiet (the reader's run of idle
-/// looks at the same last words, `still_s`, the screen's own quiet restarted
-/// by a repaint); from KeysOnly a person near the tab who has not typed
-/// within KEYS_GAP_S; at Land — and under the owner's `--now` — the first
-/// such pause, its settle waived. NEGATIVE CONTROLS at EVERY rung, `--now`
-/// included: a hold, the usage limit, the login wall, a full queue, the
-/// agent's own turn (its status, its busy footer), a turn running in a Codex
-/// daemon the screen does not show — its own thread's, a goal, or one the
-/// lane cannot place in another session — a box, a draft, and a keystroke within
-/// KEYS_GAP_S each still wait — the last one, until that day, `--now`
-/// waived.
+/// Activity delays, never disables, and no rung relaxes a floor: it never
+/// types over a draft, a dialog or running work. At each rung, what the gate
+/// passes that the rung before did not: from Settled a pause that only looks
+/// quiet (the reader's run of idle looks at the same last words, `still_s`,
+/// the screen's own quiet restarted by a repaint); from KeysOnly a person
+/// near the tab who has not typed within KEYS_GAP_S; at Land and under
+/// `--now` the first such pause, its settle waived. Negative controls at
+/// every rung, `--now` included: a hold, the usage limit, the login wall, a
+/// full queue, the agent's own turn (its status, its busy footer), a turn in
+/// a Codex daemon the screen does not show (its own thread's, a goal, or one
+/// the lane cannot place in another session), a box, a draft, and a
+/// keystroke within KEYS_GAP_S each still wait (owner, 2026-09-28).
 #[test]
 fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
     let at = |rung: Rung, f: Facts| Facts { rung, ..f };
@@ -4448,10 +4443,10 @@ fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
     }
 }
 
-/// THE LAST WORDS' PRINT (the repaint-proof settle): what a footer's clock,
-/// a goal's counter, a dim suggestion on the composer's row or a blank row
+/// The last words' print (the repaint-proof settle): what a footer's clock, a
+/// goal's counter, a dim suggestion on the composer's row or a blank row
 /// under the words leaves as it was, and what new words or another process
-/// change. NEGATIVE CONTROL: a changed word above the composer is a new print.
+/// change. Negative control: a changed word above the composer is a new print.
 #[test]
 fn the_last_words_print_ignores_the_live_zone_and_follows_the_words() {
     let screen = |caret: &str, footer: &str| -> Vec<String> {
@@ -4499,7 +4494,7 @@ fn the_last_words_print_ignores_the_live_zone_and_follows_the_words() {
         base,
         "a blank row under the words"
     );
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let mut words = screen("» Ask Codex to do anything", "  gpt");
     words[1] = "• Fixed it; one test still fails.".to_string();
     assert_ne!(still_print(7, &words, 5), base, "new words");
@@ -4510,22 +4505,16 @@ fn the_last_words_print_ignores_the_live_zone_and_follows_the_words() {
     );
 }
 
-/// THE END OF THE AGENT'S OWN WORK IS THE UPGRADE'S POINT (2026-09-28, tab
-/// s-692e6 "Free disk space"): every notice was answered within seconds — "I
-/// can't stop yet, my workflow is still running; ask again later" — the round
-/// asked four times at breaks, gave up, rested two hours, re-armed and asked
-/// again; and the one moment the move could finish, the first idle point
-/// after the workflow with nothing under the agent, found the round waiting
-/// `awaiting-ready` (announced within its window) or `failed` (resting),
-/// words that own no turn end, so the loop's `keep going` took it and a new
-/// workflow began. Now, with the agent's work seen since the latest notice
-/// and ended at this idle point (`Facts::work_ended`): an announced round
-/// asks again at once — whatever its asks — and a round that gave up is
-/// re-armed (its driver asks in the same visit), once the restart's gate is
-/// open but for the READY; while that gate settles, the step waits a settle,
-/// which owns the point. NEGATIVE CONTROLS: the same point with no work seen
-/// waits as before (`awaiting-ready`, `failed`); a break is never such a
-/// point; a READY takes the restart as ever.
+/// The end of the agent's own work is the upgrade's point: an agent that
+/// answers every notice with "my workflow is still running" is asked at the
+/// first idle point after its work ends. With the agent's work seen since the
+/// latest notice and ended at this idle point (`Facts::work_ended`), an
+/// announced round asks again at once, whatever its asks, and a gave-up round
+/// is re-armed (its driver asks in the same visit), once the restart's gate
+/// is open but for the READY; while that gate settles, the step waits a
+/// settle, which owns the point. Negative controls: the same point with no
+/// work seen waits (`awaiting-ready`, `failed`); a break is never such a
+/// point; a READY takes the restart.
 #[test]
 fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
     let now = 1_790_645_000;
@@ -4586,8 +4575,7 @@ fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
         next_step(&announced, &attended, false, now),
         Step::Wait("attended")
     );
-    // NEGATIVE CONTROLS: no work seen since the notice — the builds before at
-    // every point.
+    // Negative controls: no work seen since the notice, at every point.
     let idle = idle_facts();
     assert_eq!(
         next_step(&announced, &idle, false, now),
@@ -4617,12 +4605,12 @@ fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
     // A READY takes the restart, as ever.
     assert_eq!(next_step(&announced, &ended, true, now), Step::Terminate);
 
-    // A STATUS THAT LAGS THE IDLE SCREEN (the review of 2026-09-28): the
-    // agent's background shell ended, Claude's status still reads `shell`
-    // over an idle screen, and the restart's gate never reads that lag past
-    // (`status-stale` at every look). Inside the re-ask's window the wait
-    // holds the point; past it the re-ask decides — a line goes through the
-    // lag, or, its asks spent, the round gives up — never the wait again.
+    // A status that lags the idle screen: the agent's background shell ended,
+    // Claude's status still reads `shell` over an idle screen, and the
+    // restart's gate never reads past that lag (`status-stale` at every
+    // look). Inside the re-ask's window the wait holds the point; past it the
+    // re-ask decides (a line goes through the lag, or, its asks spent, the
+    // round gives up), never the wait again.
     let lagging = Facts {
         status: "shell".to_string(),
         idle_looks: IDLE_LOOKS,
@@ -4661,24 +4649,23 @@ fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
     );
 }
 
-/// **TIER-1 FOR `HarnessUpgradeWorkEnd`** (aterm-spec
-/// `harness_upgrade_work_end_model`): at EVERY reachable idle point of the
+/// Tier-1 for `HarnessUpgradeWorkEnd` (aterm-spec
+/// `harness_upgrade_work_end_model`): at every reachable idle point of the
 /// model before the host's look (`screen == 0 && looked == 0`), the real
-/// reducer is asked what the model's round would be asked — announced with
+/// reducer is asked what the model's round would be asked: announced with
 /// the model's asks (shifted so the model's `Cap` is `MAX_ASKS`), within its
 /// re-ask window or past it (`late`), or resting after a give-up well within
 /// its rest; an idle, settled, empty composer with nothing under the agent,
 /// Claude's status `idle` or, where the model's status lags, `shell` over an
 /// idle screen read so `IDLE_LOOKS` looks in a row; the end of the agent's
 /// work exactly when the model saw work since the notice
-/// (`Facts::work_ended`) — and it asks (`Announce`, or `Rearm` from a rest)
+/// (`Facts::work_ended`). It asks (`Announce`, or `Rearm` from a rest)
 /// exactly where `HostAsks` or `HostReasks` is enabled, gives up exactly
-/// where `HostGivesUp` is, waits the restart gate's `status-stale` exactly
-/// where `HostHolds` is, and says its quiet word (`awaiting-ready`, `failed`)
-/// exactly where `HostWaits` is. NEGATIVE CONTROLS: the builds before
-/// (`Buggy`), an ask with no work seen (`Nag`) and the wait held past the
-/// window (`Hold`, the first build of the ask at the end of the work) each
-/// disagree with the real reducer at some reachable point.
+/// where `HostGivesUp` is, waits `status-stale` exactly where `HostHolds` is,
+/// and says its quiet word (`awaiting-ready`, `failed`) exactly where
+/// `HostWaits` is. Negative controls: `Buggy`, an ask with no work seen
+/// (`Nag`) and the wait held past the window (`Hold`) each disagree with the
+/// real reducer at some reachable point.
 #[test]
 fn the_work_end_reducer_is_bound_to_its_model() {
     use aterm_spec::derive::{Model, harness_upgrade_work_end_model};
@@ -4785,7 +4772,7 @@ fn the_work_end_reducer_is_bound_to_its_model() {
             "the real reducer against the model at {s:?}"
         );
     }
-    // NEGATIVE CONTROLS: each dial disagrees with the real reducer somewhere.
+    // Negative controls: each dial disagrees with the real reducer somewhere.
     for dial in ["Buggy", "Nag", "Hold"] {
         let wrong = aterm_spec::interp::with_consts(&model, &[(dial, 1)]);
         let caught = reachable(&wrong)
@@ -4797,4 +4784,941 @@ fn the_work_end_reducer_is_bound_to_its_model() {
             "{dial}: the real reducer disagrees with it somewhere"
         );
     }
+}
+
+// ---------------------------------------------------------------- a notice recorded as a paste
+
+/// A READY marker a notice asked for (Claude Code 2.1.284 → 2.1.285).
+const INCIDENT_MARKER: &str = "ATERM-UPGRADE-READY-d6476091";
+
+/// A main-chain user row saying `text`, typed (`origin` human: the upgrade's
+/// notice, the loop's `keep going` and a person's words alike).
+fn typed_row(text: &str) -> String {
+    format!(
+        r#"{{"isSidechain":false,"type":"user","message":{{"role":"user","content":{}}},"origin":{{"kind":"human"}},"promptSource":"typed","version":"2.1.284"}}"#,
+        aterm_json::to_string(&Value::from(text)).expect("json")
+    )
+}
+
+/// A main-chain row of the agent's own model saying `text`.
+fn model_row(text: &str) -> String {
+    format!(
+        r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{}}}],"stop_reason":"end_turn"}},"version":"2.1.284"}}"#,
+        aterm_json::to_string(&Value::from(text)).expect("json")
+    )
+}
+
+/// `text` as Claude Code 2.1.284 records a paste of it.
+fn pasted(text: &str) -> String {
+    format!("\n\n<pasted_content id=\"6dd8\">\n{text}\n</pasted_content id=\"6dd8\">\n")
+}
+
+/// The notice with `marker` as typed into the session.
+fn incident_notice(marker: &str) -> String {
+    prepare_prompt(&v("2.1.284"), &v("2.1.285"), Source::Managed, marker)
+}
+
+/// A transcript up to the READY answer: the task, the notice (wrapped as a
+/// paste), the agent's "not yet", a background task's notification, and,
+/// with `ready`, the answer: several paragraphs, the marker its last line.
+fn incident_rows(ready: bool) -> Vec<String> {
+    let mut rows = vec![
+        typed_row("compile trust through trust-ir and trust-cg"),
+        model_row("Started the stage1 build."),
+        typed_row(&pasted(&incident_notice(INCIDENT_MARKER))),
+        model_row(
+            "That upgrade notice arrived as pasted text.\n\nOnce the build is done I will \
+             commit, push and send the token.",
+        ),
+        typed_row(
+            "<task-notification>\n<task-id>bleqtme6t</task-id>\n<status>completed</status>\n</task-notification>",
+        ),
+    ];
+    if ready {
+        rows.push(model_row(&format!(
+            "Step 2 increment 2 passed, and it's merged and pushed.\n\n**Result.** 5 of 6 \
+             functions.\n\n**Clean state.**\n- None of my builds, tests or workflows are \
+             running.\n\nNothing of mine is running now, so this is a good point for the \
+             upgrade:\n\n{INCIDENT_MARKER}"
+        )));
+    }
+    rows
+}
+
+/// A notice Claude Code recorded as a paste is still the notice, and a
+/// person's paste still a direction: Claude Code records a long paste as
+/// `\n\n<pasted_content id="…">\n…\n</pasted_content id="…">`, and the control
+/// socket types the notice as one. Negative controls: the same rows typed
+/// plainly read the same; a READY on the last line of several paragraphs is
+/// heard.
+#[test]
+fn a_pasted_notice_is_the_notice_and_a_pasted_message_a_direction() {
+    let earlier = ready_marker(ID, &v("2.1.285"), 1);
+    let later = ready_marker(ID, &v("2.1.285"), 2);
+    for (how, wrap) in [
+        ("pasted", pasted as fn(&str) -> String),
+        ("typed", str::to_string as fn(&str) -> String),
+    ] {
+        // A READY to the earlier ask, then the next ask's notice: the latest
+        // notice ends every READY before it.
+        let asked_again = [
+            model_row(&format!("Done.\n\n{earlier}")),
+            typed_row(&wrap(&incident_notice(&later))),
+        ]
+        .join("\n");
+        assert!(
+            !transcript_has_ready(&asked_again, &earlier),
+            "{how}: the notice after the answer ends it"
+        );
+        // The harness's own notice is no task of anyone's.
+        assert!(
+            !transcript_tasked(&typed_row(&wrap(&incident_notice(&later))), &[]),
+            "{how}: the notice is the harness's"
+        );
+        // A person's message after the READY, taken up by the agent.
+        let directed = [
+            model_row(&format!("Saved.\n\n{earlier}")),
+            typed_row(&wrap("Here is the log you asked for: ...")),
+            model_row("Reading the log."),
+        ]
+        .join("\n");
+        assert!(
+            directed_since_ready(&directed, std::slice::from_ref(&earlier)),
+            "{how}: the person's message is a direction"
+        );
+    }
+    let ready = incident_rows(true).join("\n");
+    assert!(transcript_has_ready(&ready, INCIDENT_MARKER));
+}
+
+/// A READY through the transcript's folds: the tail read at the idle point,
+/// before the READY row is appended, hears nothing; with the row appended it
+/// is heard; the loop's `keep going` after the turn supersedes it
+/// ([`ready_superseded`]; [`transcript_has_ready`] false), as does anything
+/// the agent says after, until the next notice (not yet answered, no
+/// supersession) or a new READY. Negative control: a notice nobody has
+/// answered is not a superseded answer.
+#[test]
+fn the_incidents_ready_is_heard_once_written_and_superseded_by_the_keep_going() {
+    let markers = [INCIDENT_MARKER.to_string()];
+    let unwritten = incident_rows(false).join("\n");
+    assert!(!transcript_has_ready(&unwritten, INCIDENT_MARKER));
+    assert!(
+        !ready_superseded(&unwritten, &markers),
+        "not answered is not superseded"
+    );
+    let mut rows = incident_rows(true);
+    assert!(transcript_has_ready(&rows.join("\n"), INCIDENT_MARKER));
+    assert!(!ready_superseded(&rows.join("\n"), &markers));
+    rows.push(
+        r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":69665}"#
+            .to_string(),
+    );
+    rows.push(typed_row("keep going"));
+    assert!(!transcript_has_ready(&rows.join("\n"), INCIDENT_MARKER));
+    assert!(ready_superseded(&rows.join("\n"), &markers));
+    rows.push(model_row(
+        "Two pieces of work are running in the background.",
+    ));
+    assert!(ready_superseded(&rows.join("\n"), &markers));
+    // The next ask: a notice of its own, not answered yet.
+    let next = ready_marker(ID, &v("2.1.285"), 2);
+    rows.push(typed_row(&pasted(&incident_notice(&next))));
+    let both = [INCIDENT_MARKER.to_string(), next.clone()];
+    assert!(!ready_superseded(&rows.join("\n"), &both));
+    rows.push(model_row(&format!("All done.\n\n{next}")));
+    assert!(transcript_has_ready(&rows.join("\n"), &next));
+    assert!(!ready_superseded(&rows.join("\n"), &both));
+}
+
+/// A READY on the screen holds the point its transcript row is owed at
+/// ([`Facts::ready_unrecorded`]): it waits `ready-unrecorded` instead of
+/// `awaiting-ready`, and the row once written takes the restart's path (its
+/// settle, then the restart). Bounded: once the same words have stood
+/// [`UNRECORDED_S`] the round goes on; however many idle looks came before at
+/// other points, the first looks at the answer hold; a break never restarts;
+/// a limit waits first; a gave-up round holds a late READY the same and is
+/// not re-armed over it; a pending round has nothing to hear. Negative
+/// control: without the screen's READY, `awaiting-ready`.
+#[test]
+fn a_ready_on_the_screen_holds_the_point_until_its_row_is_written() {
+    let now = 1_790_714_134;
+    let announced = Phase::Announced {
+        at_s: now - 945,
+        asks: 1,
+    };
+    let turn_end = Facts {
+        quiet_s: 0,
+        status_age_s: 0,
+        idle_looks: 1,
+        ..idle_facts()
+    };
+    let shown = Facts {
+        ready_unrecorded: true,
+        ..turn_end.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &turn_end, false, now),
+        Step::Wait("awaiting-ready"),
+        "the incident's look"
+    );
+    assert_eq!(
+        next_step(&announced, &shown, false, now),
+        Step::Wait(READY_UNRECORDED)
+    );
+    // The row written: the restart's settle, then the restart.
+    assert_eq!(
+        next_step(&announced, &turn_end, true, now),
+        Step::Wait("settling")
+    );
+    assert_eq!(
+        next_step(&announced, &idle_facts(), true, now + 20),
+        Step::Terminate
+    );
+    // Held however many idle looks came before at other points, and still at
+    // the next look at the same words; bounded by how long they have stood.
+    // (The host looks again the settle's length after a wait.)
+    let looked_before = Facts {
+        idle_looks: 5,
+        still_s: QUIET_S,
+        ..shown.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &looked_before, false, now),
+        Step::Wait(READY_UNRECORDED)
+    );
+    let long = Facts {
+        still_s: UNRECORDED_S,
+        ..shown.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &long, false, now),
+        Step::Wait("awaiting-ready")
+    );
+    let at_break = Facts {
+        background_point: true,
+        ..shown.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &at_break, false, now),
+        Step::Wait("background")
+    );
+    let limited = Facts {
+        limited: true,
+        ..shown.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &limited, false, now),
+        Step::Wait("limited")
+    );
+    // A round that gave up and rested past its next round's due time.
+    let gave_up = Phase::Failed(GAVE_UP.to_string());
+    let rested = Facts {
+        failed_s: RETRY_S + 60,
+        ..shown.clone()
+    };
+    assert_eq!(
+        next_step(&gave_up, &rested, false, now),
+        Step::Wait(READY_UNRECORDED)
+    );
+    assert_eq!(
+        next_step(
+            &gave_up,
+            &Facts {
+                ready_unrecorded: false,
+                ..rested
+            },
+            false,
+            now
+        ),
+        Step::Rearm
+    );
+    assert_ne!(
+        next_step(&Phase::Pending, &shown, false, now),
+        Step::Wait(READY_UNRECORDED)
+    );
+    // The quiet upgrade (the default) acts on no READY: its own restart gate
+    // holds the turn end (the settle), whatever the screen says.
+    let quiet = Facts {
+        quiet: true,
+        ..shown.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &quiet, false, now),
+        Step::Wait("settling")
+    );
+}
+
+/// A READY the agent was moved on from is asked again at its next point
+/// ([`Facts::ready_superseded`]), never waited on for the re-ask's window. At
+/// an idle point the notice goes again at once; while the agent's own turn
+/// settles the step says `superseded`; a person, a box, a hold wait as
+/// themselves; the last ask spent gives up; at a break the notice goes there.
+/// A READY given again takes the restart. Negative control: an answer that
+/// was never READY waits the window.
+#[test]
+fn a_superseded_ready_is_asked_again_at_the_next_point() {
+    let now = 1_790_714_200;
+    let announced = Phase::Announced {
+        at_s: now - 1_000,
+        asks: 1,
+    };
+    let moved_on = Facts {
+        ready_superseded: true,
+        ..idle_facts()
+    };
+    assert_eq!(
+        next_step(&announced, &idle_facts(), false, now),
+        Step::Wait("awaiting-ready")
+    );
+    assert_eq!(next_step(&announced, &moved_on, false, now), Step::Announce);
+    for (settling, why) in [
+        (
+            Facts {
+                quiet_s: 3,
+                ..moved_on.clone()
+            },
+            "its screen settling",
+        ),
+        (
+            Facts {
+                status: "busy".to_string(),
+                ..moved_on.clone()
+            },
+            "its status still busy",
+        ),
+        (
+            Facts {
+                busy_footer: true,
+                ..moved_on.clone()
+            },
+            "a turn still running",
+        ),
+    ] {
+        assert_eq!(
+            next_step(&announced, &settling, false, now),
+            Step::Wait(SUPERSEDED),
+            "{why}"
+        );
+    }
+    for (held, word) in [
+        (
+            Facts {
+                attended: true,
+                ..moved_on.clone()
+            },
+            "attended",
+        ),
+        (
+            Facts {
+                approval_box: true,
+                ..moved_on.clone()
+            },
+            "box",
+        ),
+        (
+            Facts {
+                status: "waiting".to_string(),
+                ..moved_on.clone()
+            },
+            "not-idle",
+        ),
+    ] {
+        assert_eq!(next_step(&announced, &held, false, now), Step::Wait(word));
+    }
+    let last = Phase::Announced {
+        at_s: now - 1_000,
+        asks: MAX_ASKS,
+    };
+    assert_eq!(next_step(&last, &moved_on, false, now), Step::GiveUp);
+    let at_break = Facts {
+        background_point: true,
+        status: "busy".to_string(),
+        ..moved_on.clone()
+    };
+    assert_eq!(next_step(&announced, &at_break, false, now), Step::Announce);
+    // Negative control: the same break with no READY given waits its window.
+    assert_eq!(
+        next_step(
+            &announced,
+            &Facts {
+                ready_superseded: false,
+                ..at_break
+            },
+            false,
+            now
+        ),
+        Step::Wait("background")
+    );
+    assert_eq!(next_step(&announced, &moved_on, true, now), Step::Terminate);
+}
+
+/// CLAUDE CODE'S ANSWER AT A QUOTA LIMIT, as 2.1.286 writes it (the accounts
+/// design §1's row; ids cut, every key the readers look at kept): the limit
+/// `limit` (`quotaLimits.rateLimitType`), resetting at `resets`, saying
+/// `text`.
+fn quota_row(ts: &str, limit: &str, resets: u64, text: &str) -> String {
+    format!(
+        r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"{ts}","message":{{"id":"m","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":{}}}]}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":{resets},"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"{limit}","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.286"}}"#,
+        json_text(text)
+    )
+}
+
+/// THE QUOTA WALL A SESSION STANDS AT, FROM ITS TRANSCRIPT
+/// ([`transcript_standing_wall`], accounts design §5 and §6): the limit row
+/// that stands last, read for when it was written, the reset it names and
+/// which of the account's limits it is — and only when it is a quota
+/// rejection. It is the same row [`transcript_limit_until`] reads, so every
+/// rule of which row STANDS is that scan's (the controls below ask both).
+///
+/// NEGATIVE CONTROLS, each beside its rule: a subagent's row, a model row or
+/// a finished `/login` after the wall; an API rate limit and a spend or
+/// credit wall, which are limits and are no account's window; a status that
+/// is not `rejected`.
+#[test]
+fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejection() {
+    let at = 1_790_521_468;
+    let ts = "2026-09-27T15:04:28.344Z";
+    let wall = |window: &str, until: u64| {
+        Some(StandingWall {
+            at,
+            until: Some(until),
+            window: Some(window.to_string()),
+        })
+    };
+    let session = quota_row(
+        ts,
+        "five_hour",
+        1_790_532_000,
+        "You've hit your session limit · resets 7pm (America/Los_Angeles)",
+    );
+    let answered = said_row("2026-09-27T14:00:00Z", "Working.");
+
+    // THE THREE WALLS THAT ROTATE: the session window, the week, and a
+    // model's bucket — each by the vendor's own limit type.
+    assert_eq!(
+        transcript_standing_wall(&[answered.clone(), session.clone()].join("\n")),
+        wall("five_hour", 1_790_532_000)
+    );
+    // The week: the owner's row of 2026-09-27 (2.1.280), as it is.
+    assert_eq!(
+        transcript_standing_wall(&limit_row(ts)),
+        wall("seven_day", 1_791_046_800)
+    );
+    for bucket in [
+        "seven_day_opus",
+        "seven_day_sonnet",
+        "seven_day_overage_included",
+    ] {
+        let row = quota_row(
+            ts,
+            bucket,
+            1_791_046_800,
+            "You've hit your Opus limit · resets Oct 3 at 10am (America/Los_Angeles)",
+        );
+        assert_eq!(
+            transcript_standing_wall(&row),
+            wall(bucket, 1_791_046_800),
+            "{bucket}"
+        );
+    }
+
+    // WHICH ROW STANDS. Claude Code's other rows of its own are passed over.
+    let no_response = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#;
+    assert_eq!(
+        transcript_standing_wall(&[session.as_str(), no_response].join("\n")),
+        wall("five_hour", 1_790_532_000),
+        "passed over"
+    );
+    // A subagent's sidechain row is not the session's: its wall is no wall
+    // of the session's, and its model row ends none.
+    let side = |row: &str| row.replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+    assert_eq!(
+        transcript_standing_wall(&[answered.clone(), side(&session)].join("\n")),
+        None
+    );
+    let later = said_row("2026-09-27T19:58:05.554Z", "Pushing first.");
+    assert_eq!(
+        transcript_standing_wall(&[session.clone(), side(&later)].join("\n")),
+        wall("five_hour", 1_790_532_000),
+        "a subagent that answered did not lift the session's wall"
+    );
+    // A row of the session's own model after the wall ends it…
+    assert_eq!(
+        transcript_standing_wall(&[session.clone(), later.clone()].join("\n")),
+        None
+    );
+    // …and so does a `/login` that finished; a wall hit after either stands.
+    let login = person_row(
+        "2026-09-27T19:57:47Z",
+        "<local-command-stdout>Login successful</local-command-stdout>",
+    );
+    assert_eq!(
+        transcript_standing_wall(&[session.clone(), login.clone()].join("\n")),
+        None
+    );
+    assert_eq!(
+        transcript_standing_wall(&[login, later, session.clone()].join("\n")),
+        wall("five_hour", 1_790_532_000)
+    );
+    assert_eq!(transcript_standing_wall(&answered), None);
+    assert_eq!(transcript_standing_wall(""), None);
+
+    // ONLY A QUOTA REJECTION. An API rate limit carries no `quotaLimits`: it
+    // is a limit (the upgrade waits behind it), and no account's window —
+    // also when it is the row standing AFTER a quota wall.
+    let api = r#"{"isSidechain":false,"type":"assistant","timestamp":"2026-09-27T15:10:00Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: Rate limit reached for requests"}]},"isApiErrorMessage":true}"#;
+    assert!(transcript_limit_until(api).is_some(), "it is a limit row");
+    assert_eq!(transcript_standing_wall(api), None);
+    assert_eq!(
+        transcript_standing_wall(&[session.as_str(), api].join("\n")),
+        None,
+        "the row that stands last is the API's"
+    );
+    // A spend or credit wall, by its text (the wall table's `Spend`)…
+    for text in [
+        "You've hit your usage credit limit · resets Oct 3 at 10am (America/Los_Angeles)",
+        "You're out of extra usage · resets 7pm (America/Los_Angeles)",
+        "You've hit your org's monthly spend limit",
+    ] {
+        let spend = quota_row(ts, "seven_day", 1_791_046_800, text);
+        assert!(transcript_limit_spend(&spend), "{text}");
+        assert_eq!(
+            transcript_limit_reset(&spend),
+            Some(1_791_046_800),
+            "{text}"
+        );
+        assert_eq!(transcript_standing_wall(&spend), None, "{text}");
+    }
+    // …and by its limit type, whatever its text says: the vendor's
+    // usage-credit limit.
+    let credit = quota_row(
+        ts,
+        "overage",
+        1_791_046_800,
+        "You've hit your weekly limit · resets Oct 3 at 10am (America/Los_Angeles)",
+    );
+    assert!(!transcript_limit_spend(&credit), "its text is the week's");
+    assert_eq!(transcript_standing_wall(&credit), None);
+    // A status that is not `rejected` — the vendor's `allowed_warning`, one
+    // a hair off, none at all — is no rejection.
+    for status in [
+        r#""status":"allowed_warning","#,
+        r#""status":"allowed","#,
+        r#""status":"rejected ","#,
+        r#""status":"Rejected","#,
+        r#""status":true,"#,
+        r#""status":["rejected"],"#,
+        "",
+    ] {
+        let row = session.replace(r#""status":"rejected","#, status);
+        assert_ne!(row, session, "{status}");
+        assert_eq!(
+            transcript_limit_reset(&row),
+            Some(1_790_532_000),
+            "it is still a limit row naming its reset: {status}"
+        );
+        assert_eq!(transcript_standing_wall(&row), None, "{status}");
+    }
+}
+
+/// THE LIMIT TYPE WHERE THE ROW CARRIES NONE, AND ROWS OF THE WRONG SHAPE
+/// ([`transcript_standing_wall`]). `rateLimitType` is optional in the
+/// vendor's schema: without it the window is what the row's text names
+/// (`usage::notice_window`: the session's or the week's), else none — the
+/// wall is a wall all the same. A key of the wrong shape costs that key and
+/// no more, a row that names no time is no observation, and nothing that is
+/// not a short lowercase word becomes a window.
+#[test]
+fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_cost_one_key() {
+    let at = 1_790_521_468;
+    let ts = "2026-09-27T15:04:28.344Z";
+    let typed = r#""rateLimitType":"seven_day","#;
+    let week = limit_row(ts);
+    assert!(week.contains(typed), "{week}");
+    let read = |row: &str| transcript_standing_wall(row);
+    let window = |row: &str| read(row).expect("a wall").window;
+
+    // No limit type: the text's.
+    let untyped = week.replace(typed, "");
+    assert_eq!(
+        read(&untyped),
+        Some(StandingWall {
+            at,
+            until: Some(1_791_046_800),
+            window: Some("seven_day".to_string()),
+        })
+    );
+    let session_text = "You've hit your session limit · resets 7pm (America/Los_Angeles)";
+    let untyped_session = untyped.replace(
+        "You've hit your weekly limit · resets Oct 3 at 10am (America/Los_Angeles)",
+        session_text,
+    );
+    assert_eq!(window(&untyped_session).as_deref(), Some("five_hour"));
+    // A text that names neither window: the wall stands, its window unnamed.
+    let untyped_bucket = untyped.replace("weekly limit", "Opus limit");
+    assert_eq!(
+        read(&untyped_bucket),
+        Some(StandingWall {
+            at,
+            until: Some(1_791_046_800),
+            window: None,
+        })
+    );
+    // NEGATIVE CONTROL: where the row carries a type, the text is not asked
+    // — a bucket's row whose text names the week is the bucket's.
+    let bucket = week.replace(typed, r#""rateLimitType":"seven_day_opus","#);
+    assert_eq!(window(&bucket).as_deref(), Some("seven_day_opus"));
+
+    // A LIMIT TYPE THAT IS NOT A WORD is read as absent: the text's again.
+    let long = "a".repeat(LIMIT_TYPE_MAX + 1);
+    for hostile in [
+        r#""rateLimitType":7,"#.to_string(),
+        r#""rateLimitType":null,"#.to_string(),
+        r#""rateLimitType":{"is":"five_hour"},"#.to_string(),
+        r#""rateLimitType":"","#.to_string(),
+        r#""rateLimitType":"five hour","#.to_string(),
+        r#""rateLimitType":"Five_Hour","#.to_string(),
+        r#""rateLimitType":"five_hour\n","#.to_string(),
+        r#""rateLimitType":"five-hour","#.to_string(),
+        r#""rateLimitType":"../../state","#.to_string(),
+        r#""rateLimitType":"séven","#.to_string(),
+        format!(r#""rateLimitType":"{long}","#),
+    ] {
+        let row = week.replace(typed, &hostile);
+        assert_eq!(window(&row).as_deref(), Some("seven_day"), "{hostile}");
+    }
+    // NEGATIVE CONTROL: a word the vendor has not named yet, at the bound,
+    // is kept as it is.
+    let new = "b".repeat(LIMIT_TYPE_MAX);
+    let row = week.replace(typed, &format!(r#""rateLimitType":"{new}","#));
+    assert_eq!(window(&row), Some(new));
+
+    // A RESET THAT IS NOT A POSITIVE INTEGER is no reset; the wall stands.
+    let reset = r#""resetsAt":1791046800,"#;
+    assert!(week.contains(reset));
+    for hostile in [
+        r#""resetsAt":0,"#,
+        r#""resetsAt":-5,"#,
+        r#""resetsAt":1791046800.5,"#,
+        r#""resetsAt":"1791046800","#,
+        r#""resetsAt":null,"#,
+        r#""resetsAt":[1791046800],"#,
+        "",
+    ] {
+        assert_eq!(
+            read(&week.replace(reset, hostile)),
+            Some(StandingWall {
+                at,
+                until: None,
+                window: Some("seven_day".to_string()),
+            }),
+            "{hostile}"
+        );
+    }
+
+    // A ROW THAT NAMES NO TIME is no observation: nobody could say which
+    // process wrote it. (A zone offset is refused, never read as UTC.)
+    let stamp = r#""timestamp":"2026-09-27T15:04:28.344Z","#;
+    assert!(week.contains(stamp));
+    for hostile in [
+        "",
+        r#""timestamp":1790521468,"#,
+        r#""timestamp":"yesterday","#,
+        r#""timestamp":"2026-09-27T15:04:28+05:30","#,
+        r#""timestamp":null,"#,
+    ] {
+        let row = week.replace(stamp, hostile);
+        assert_eq!(read(&row), None, "{hostile}");
+        assert_eq!(
+            transcript_limit_reset(&row),
+            Some(1_791_046_800),
+            "it is still the limit row: {hostile}"
+        );
+    }
+
+    // `quotaLimits` of another shape is none; a line that is not JSON, or
+    // not a row, is skipped and the row before it still stands.
+    let quota = week
+        .find(r#""quotaLimits":{"#)
+        .zip(week.find(r#""error":"rate_limit""#))
+        .expect("the row's quotaLimits");
+    for hostile in [
+        r#""quotaLimits":null,"#,
+        r#""quotaLimits":"rejected","#,
+        r#""quotaLimits":["rejected",1791046800,"seven_day"],"#,
+        r#""quotaLimits":{},"#,
+    ] {
+        let mut row = week.clone();
+        row.replace_range(quota.0..quota.1, hostile);
+        assert!(transcript_limit_until(&row).is_some(), "{hostile}");
+        assert_eq!(read(&row), None, "{hostile}");
+    }
+    let cut = &week[..week.len() / 2];
+    for junk in [
+        cut,
+        "assistant",
+        "[\"assistant\"]",
+        "\u{fffd}assistant{",
+        "42",
+    ] {
+        assert_eq!(
+            read(&[week.as_str(), junk].join("\n")),
+            Some(StandingWall {
+                at,
+                until: Some(1_791_046_800),
+                window: Some("seven_day".to_string()),
+            }),
+            "{junk:?}"
+        );
+    }
+}
+
+/// One row a local command wrote at `ts`: a `user` row whose content is the
+/// string `content`, in the shape MEASURED for `/model` on 2.1.283
+/// (`footer.rs`'s rows).
+fn local_command_row(ts: &str, content: &str) -> String {
+    format!(
+        r#"{{"parentUuid":"p","isSidechain":false,"promptId":"q","type":"user","message":{{"role":"user","content":{}}},"uuid":"u","timestamp":"{ts}","userType":"external","entrypoint":"cli","version":"2.1.287"}}"#,
+        json_text(content)
+    )
+}
+
+/// The same content as the `system` row some results are written as
+/// (MEASURED on 2.1.278 for a `/model` picker that changed nothing).
+fn local_command_system_row(ts: &str, content: &str) -> String {
+    format!(
+        r#"{{"parentUuid":"p","isSidechain":false,"type":"system","subtype":"local_command","content":{},"level":"info","timestamp":"{ts}","uuid":"u","isMeta":false,"version":"2.1.287"}}"#,
+        json_text(content)
+    )
+}
+
+/// A local command's own row content, as Claude Code writes it.
+fn command_content(name: &str) -> String {
+    format!(
+        "<command-name>/{name}</command-name>\n            <command-message>{name}</command-message>\n            <command-args></command-args>"
+    )
+}
+
+/// A local command's output row content.
+fn stdout_content(text: &str) -> String {
+    format!("<local-command-stdout>{text}</local-command-stdout>")
+}
+
+/// THE LINE THE USAGE-LIMIT DIALOG ENDED WITH ([`transcript_reset_line`]):
+/// the last `<local-command-stdout>` row written at or after the claim's
+/// second that stands under a `/rate-limit-options` command row, its text
+/// between the tags. It is what a limit reset's outcome is read from.
+///
+/// EVERY RESET ROW HERE IS COMPOSED 2026-10-02, never captured: the texts
+/// are the 2.1.287 bundle's (`docs/SPEC-claude-accounts-resets-2026-10-02.md`
+/// §0), laid on the two rows MEASURED for this dialog's wait row
+/// (`upgrade_stall_tests.rs`: the `/rate-limit-options` command row, then
+/// its output row) in the full row shape measured for `/model`; the values
+/// are invented. OPEN: replace with a captured transcript (SPEC §6).
+///
+/// NEGATIVE CONTROLS: a row older than the claim is not read; a `/model`
+/// output after the claim is not read, whatever it says; an output is read
+/// only directly under the dialog's own command; a row with no time, a
+/// subagent's row, an error output, and a line merely quoted in a prompt, an
+/// answer or a tool result are not read.
+#[test]
+fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_claim() {
+    // 2026-09-27T15:04:28Z, the second the attempt was claimed.
+    let claimed = 1_790_521_468;
+    let before = "2026-09-27T15:04:27.900Z";
+    let same = "2026-09-27T15:04:28.344Z";
+    let after = "2026-09-27T15:05:10.120Z";
+    let later = "2026-09-27T15:09:00.000Z";
+    let spent = "Limits reset · your weekly reset day stays Oct 3 at 10am · 1 reset left";
+    let kept = "Reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
+    let waited = "Claude Code will continue automatically at 6am";
+
+    let dialog = |ts: &str| local_command_row(ts, &command_content("rate-limit-options"));
+    let model = |ts: &str| local_command_row(ts, &command_content("model"));
+    let out = |ts: &str, text: &str| local_command_row(ts, &stdout_content(text));
+    let read = |rows: &[String]| transcript_reset_line(&rows.join("\n"), claimed);
+
+    // The dialog's two rows, written when it ended.
+    assert_eq!(
+        read(&[dialog(after), out(after, spent)]).as_deref(),
+        Some(spent)
+    );
+    // In the claim's own second too: "at or after".
+    assert_eq!(
+        read(&[dialog(same), out(same, kept)]).as_deref(),
+        Some(kept)
+    );
+    // The reader of the line takes what this hands it.
+    for (text, class) in [
+        (
+            spent,
+            aterm_phase::ResetLine::Spent {
+                left: Some(1),
+                asks: false,
+            },
+        ),
+        (kept, aterm_phase::ResetLine::Kept),
+        (waited, aterm_phase::ResetLine::Other),
+    ] {
+        let line = read(&[dialog(after), out(after, text)]).expect("a line");
+        assert_eq!(aterm_phase::reset_line(&line), class, "{text}");
+    }
+    // A whole tail around it: the wall's own row, the turn before, the
+    // caveat row a command is written under, and what follows.
+    let tail = [
+        said_row("2026-09-27T14:00:00Z", "Working."),
+        limit_row("2026-09-27T15:00:00.000Z"),
+        dialog(before),
+        out(before, waited),
+        local_command_row(
+            after,
+            "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>",
+        )
+        .replace(r#""type":"user","#, r#""type":"user","isMeta":true,"#),
+        dialog(after),
+        out(after, spent),
+        said_row(later, "Continuing."),
+        model(later),
+        out(later, "Set model to `Opus 5.5`"),
+    ];
+    assert_eq!(read(&tail).as_deref(), Some(spent));
+    // The LAST such row since the claim. A claim outlives a dialog a person
+    // answered: the wait row's line, then the dialog again and the reset
+    // spent through it — read as the first, that reset was recorded as the
+    // wait row's failure.
+    assert_eq!(
+        read(&[
+            dialog(after),
+            out(after, waited),
+            dialog(later),
+            out(later, spent)
+        ])
+        .as_deref(),
+        Some(spent)
+    );
+    // …whatever came between, and whatever another command wrote after it.
+    assert_eq!(
+        read(&[
+            dialog(before),
+            out(before, spent),
+            dialog(same),
+            out(same, waited),
+            said_row(after, "Working."),
+            dialog(after),
+            out(after, kept),
+            model(later),
+            out(later, "Set model to `Opus 5.5`"),
+        ])
+        .as_deref(),
+        Some(kept)
+    );
+    // Both row shapes, the command's and the output's.
+    for system in [(true, true), (true, false), (false, true)] {
+        let command = if system.0 {
+            local_command_system_row(after, &command_content("rate-limit-options"))
+        } else {
+            dialog(after)
+        };
+        let output = if system.1 {
+            local_command_system_row(after, &stdout_content(spent))
+        } else {
+            out(after, spent)
+        };
+        assert_eq!(
+            read(&[command, output]).as_deref(),
+            Some(spent),
+            "{system:?}"
+        );
+    }
+    // The measured wait row carries no closing tag in the stall suite's
+    // copy: the text is the same without one.
+    assert_eq!(
+        read(&[
+            dialog(after),
+            local_command_row(after, &format!("<local-command-stdout>{spent}"))
+        ])
+        .as_deref(),
+        Some(spent)
+    );
+
+    // NEGATIVE CONTROL: A ROW OLDER THAN THE CLAIM is an earlier dialog's —
+    // the wait an earlier wall armed — and is not read…
+    assert_eq!(read(&[dialog(before), out(before, waited)]), None);
+    assert_eq!(read(&[dialog(before), out(before, spent)]), None);
+    // …and neither is a row that names no time.
+    let untimed = out(after, spent).replace(&format!(r#""timestamp":"{after}","#), "");
+    assert!(!untimed.contains("timestamp"));
+    assert_eq!(read(&[dialog(after), untimed]), None);
+
+    // NEGATIVE CONTROL: A `/model` OUTPUT AFTER THE CLAIM is not read —
+    // its own words, and a reset line under it.
+    assert_eq!(
+        read(&[model(after), out(after, "Set model to `Opus 5.5`")]),
+        None
+    );
+    assert_eq!(read(&[model(after), out(after, spent)]), None);
+    // Nor under `/model` typed after the dialog's command: the output is
+    // the last command's.
+    assert_eq!(
+        read(&[dialog(after), model(after), out(after, spent)]),
+        None
+    );
+    // An output ends what its command armed: a second one is nobody's.
+    assert_eq!(
+        read(&[dialog(before), out(before, waited), out(after, spent)]),
+        None
+    );
+    // No command row at all; the command typed with arguments, which is not
+    // the dialog the vendor opens; another command whose name it opens.
+    assert_eq!(read(&[out(after, spent)]), None);
+    let with_args = dialog(after).replace(
+        "<command-args></command-args>",
+        "<command-args>now</command-args>",
+    );
+    assert_eq!(read(&[with_args, out(after, spent)]), None);
+    let longer = local_command_row(after, &command_content("rate-limit-options-2"));
+    assert_eq!(read(&[longer, out(after, spent)]), None);
+    // An error output; a subagent's rows.
+    let failed = local_command_row(
+        after,
+        &format!("<local-command-stderr>{spent}</local-command-stderr>"),
+    );
+    assert_eq!(read(&[dialog(after), failed, out(after, spent)]), None);
+    let side = |row: String| row.replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+    assert_eq!(read(&[dialog(after), side(out(after, spent))]), None);
+    assert_eq!(read(&[side(dialog(after)), out(after, spent)]), None);
+    // The line QUOTED is not the line: in a person's prompt, in an answer,
+    // in a tool result.
+    let quoted = stdout_content(spent);
+    for row in [
+        local_command_row(after, &format!("it printed {quoted}")),
+        said_row(after, &quoted),
+        format!(
+            r#"{{"type":"user","isSidechain":false,"timestamp":"{after}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","content":{}}}]}}}}"#,
+            json_text(&quoted)
+        ),
+        format!(
+            r#"{{"type":"user","isSidechain":false,"timestamp":"{after}","message":{{"role":"user","content":[{{"type":"text","text":{}}}]}}}}"#,
+            json_text(&quoted)
+        ),
+    ] {
+        assert_eq!(read(&[dialog(after), row.clone()]), None, "{row}");
+    }
+    assert_eq!(read(&[]), None);
+    assert_eq!(transcript_reset_line("not json\n{}\n", 0), None);
+
+    // The text is one bounded line, and a row that says nothing is the
+    // empty line: the dialog ended, and said nothing this reader keeps.
+    let long = format!("{spent} {}", "x".repeat(4 * RESET_LINE_MAX));
+    let cut = read(&[dialog(after), out(after, &long)]).expect("a line");
+    assert!(
+        cut.len() <= RESET_LINE_MAX && cut.starts_with(spent),
+        "{cut}"
+    );
+    assert_eq!(
+        read(&[dialog(after), out(after, "two\nlines")]).as_deref(),
+        Some("two lines")
+    );
+    assert_eq!(read(&[dialog(after), out(after, "")]).as_deref(), Some(""));
 }

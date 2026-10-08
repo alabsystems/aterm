@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A fixed composer caret surrounded by sparse animated program glyphs.
-//! The sampled Codex scene used braille particles throughout the three input
-//! rows. They are ordinary terminal content, independent of aterm's effects.
+//! A fixed composer caret surrounded by sparse animated program glyphs, as in
+//! a Codex scene with braille particles across its three input rows. They are
+//! ordinary terminal content, independent of aterm's effects.
 
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,14 @@ use aterm_effects::kitty_pet::{PetBrain, PetFrame, PetSense};
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
+
+/// An INCOHERENT observation: the cells were extracted before a scroll the
+/// facts already saw (`base_y` disagrees), the shape of a snapshot a present
+/// reused. A sub-row scroll offset is no longer one: the renderer translates
+/// the grid band and the pet's sprite together (`PetWorld::observe`).
+fn stale_snapshot(input: &mut aterm_core::render::RenderInput) {
+    input.base_y += 1;
+}
 
 const ROWS: u16 = 58;
 const COLS: u16 = 116;
@@ -91,7 +99,7 @@ impl Scene {
             .term
             .cell_frame(usize::from(self.rows), usize::from(self.cols));
         if self.incoherent {
-            input.scroll_frac_px = 1;
+            stale_snapshot(&mut input);
         }
         let facts = PetWorldFacts::read(&self.term, 7);
         if self.observe {
@@ -186,9 +194,13 @@ fn a_single_incoherent_observation_does_not_commission_a_far_trip() {
     assert_eq!(before.alpha, 255);
     s.incoherent = true;
     let unknown = s.tick();
+    // HELD, NOT CUT (2026-10-01): the body already on glass stays exactly
+    // where the last certified frame judged it, at the same opacity — the
+    // visibility hold's unknown — and is never moved by a map it cannot read.
     assert_eq!(
-        unknown.alpha, 0,
-        "the incoherent surface is correctly not drawn"
+        (unknown.alpha, unknown.col, unknown.row),
+        (before.alpha, before.col, before.row),
+        "an incoherent surface holds the body already on glass"
     );
     s.incoherent = false;
     let mut min = before.col;
@@ -251,9 +263,17 @@ fn invalid_surface_cannot_materialize_static_capture_or_replay_an_unfocused_trip
         for _ in 0..240 {
             s.tick();
         }
+        let before = s.tick();
+        assert_eq!(before.alpha, 255, "fixture: the resident is on glass");
         s.incoherent = true;
         s.static_capture = capture;
-        assert_eq!(s.tick().alpha, 0);
+        // The body already on glass is HELD where it was certified — the
+        // same body, the same place — never a new one and never a trip.
+        let held = s.tick();
+        assert_eq!(
+            (held.alpha, held.col, held.row),
+            (before.alpha, before.col, before.row)
+        );
         assert!(!s.brain.console_legacy_motion_pending());
         s.presentable = false; // host also withholds caret when it gives up custody
         for _ in 0..8 {
@@ -266,6 +286,15 @@ fn invalid_surface_cannot_materialize_static_capture_or_replay_an_unfocused_trip
             let f = s.tick();
             assert!(f.col < 9.0, "refocus replayed an invalid trip at {}", f.col);
         }
+        // …and an incoherent surface still MATERIALIZES nothing: a pet that
+        // was never on glass is not drawn by a capture of a map that does
+        // not exist.
+        let mut cold = Scene::new();
+        cold.particles(2);
+        cold.incoherent = true;
+        cold.static_capture = capture;
+        assert_eq!(cold.tick().alpha, 0);
+        assert!(!cold.brain.console_legacy_motion_pending());
     }
 }
 
@@ -333,7 +362,7 @@ fn real_failed_observations_conform_for_idle_and_airborne_locomotion() {
         // Independently establish the observation verdict on the exact
         // production input, rather than infer it from the resulting motion.
         let mut input = s.term.cell_frame(usize::from(s.rows), usize::from(s.cols));
-        input.scroll_frac_px = 1;
+        stale_snapshot(&mut input);
         let facts = PetWorldFacts::read(&s.term, 7);
         assert!(!PetWorld::default().observe(&input, &facts, PetPane::full(&input)));
         s.incoherent = true;
@@ -352,7 +381,9 @@ fn real_failed_observations_conform_for_idle_and_airborne_locomotion() {
                 "actual failed-observation transition diverged: {state:?} -> {post:?}"
             );
             assert!(model.check_invariant("IncoherentObservationFreezesMotion", &post));
-            assert_eq!(held.alpha, 0);
+            // Frozen AND held: the body on glass keeps its opacity through
+            // the unknown frames rather than blinking out.
+            assert_eq!(held.alpha, before.alpha);
             // Historical controls: the old idle path commissioned a flight;
             // the old airborne path advanced an already committed trajectory.
             let mut historical = post.clone();

@@ -5,9 +5,7 @@
 use super::*;
 use crate::{CellFlags, PackedColor};
 
-// ========================================================================
 // Wide char overwrite interactions
-// ========================================================================
 
 #[test]
 fn write_char_styled_overwrite_wide_first_half() {

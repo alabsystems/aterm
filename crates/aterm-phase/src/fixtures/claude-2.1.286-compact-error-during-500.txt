@@ -1,0 +1,30 @@
+# claude-code 2.1.286 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50) on origin/main 9215c99b1, the managed 2.1.286 launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL` pointing at a local stub of the API · a `/compact` whose own request fails with HTTP 500 (the stub, not retried) after six failed ones over a standing wall: `⎿  Error during compaction: API Error: 500 …` wrapped onto a second row indented to the gutter text — the third kind of compaction notice (the gateway words are the vendor's for a custom `ANTHROPIC_BASE_URL`)
+
+✻ Churned for 0s · done 1:44 AM
+
+❯ /compact
+  ⎿  Compaction failed · conversation could not be reduced below the context limit
+
+❯ /compact
+  ⎿  Compaction failed · conversation could not be reduced below the context limit
+
+❯ /compact
+  ⎿  Compaction failed · conversation could not be reduced below the context limit
+
+❯ /compact
+  ⎿  Compaction failed · conversation could not be reduced below the context limit
+
+❯ /compact
+  ⎿  Compaction failed · conversation could not be reduced below the context limit
+
+❯ /compact
+  ⎿  Compaction failed · conversation could not be reduced below the context limit
+
+❯ /compact
+  ⎿  Error during compaction: API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment. If
+     it persists, check your inference gateway (127.0.0.1:63819).
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

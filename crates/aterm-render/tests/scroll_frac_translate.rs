@@ -45,10 +45,8 @@ fn frame_with_partition(t: &mut Terminal, frac: i32) -> aterm_core::render::Rend
 
 #[test]
 fn frac_zero_is_byte_identical_to_untranslated() {
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found (headless without fonts)");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let mut t = seeded_terminal();
     // A frame with a grid partition but frac 0.
     let zero = r.render_input(&frame_with_partition(&mut t, 0));
@@ -71,10 +69,8 @@ fn frac_zero_is_byte_identical_to_untranslated() {
 
 #[test]
 fn chrome_pixels_are_invariant_under_any_frac() {
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found (headless without fonts)");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (_cw, cell_h) = r.cell_size();
     let pad = r.pad();
     // Grid band in device pixels (the renderer's own row→px mapping).
@@ -131,10 +127,8 @@ fn damage_cached_present_translates_without_perturbing_the_cache() {
     // damage cache keeps driving the row diff: after a fractional frame, a
     // subsequent frac-0 frame of the SAME viewport returns to the byte-identical
     // untranslated pixels (no residue banked into the cache).
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system monospace font found (headless without fonts)");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let mut wc = WindowCpu::new();
     let mut t = seeded_terminal();
 

@@ -95,17 +95,10 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::fs::Permissions;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn layout(label: &str) -> Layout {
-        let p = std::env::temp_dir().join(format!("atpkg-pin-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&p, Permissions::from_mode(0o700)).unwrap();
-        Layout { prefix: p }
+    fn layout(label: &str) -> crate::testdir::ScratchLayout {
+        crate::testdir::layout(&format!("atpkg-pin-{label}-"))
     }
 
     #[test]

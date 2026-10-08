@@ -184,7 +184,7 @@
 //! stamps, the root, and how long a hop has waited for the main thread to
 //! take it, at the shipped bar in every build. While it finds the thread
 //! stalled, such a verb is refused before anything is posted, with
-//! `ERR main thread stalled <N>s since <root>; retry` (`control_media`).
+//! `ERR main thread stalled <N>s; retry` (`control_media`).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -397,8 +397,10 @@ const MAIN_STALL_BAR: Duration = RELEASE_STALL_THRESHOLD;
 
 /// A main thread that cannot take a verb now, as [`main_stall`] reads it. Its
 /// `Display` is the reason a refused verb answers with:
-/// ``main thread stalled <N>s since `<root>`; retry``, with ` returned` after
-/// the root when its handler had returned.
+/// `main thread stalled <N>s; retry`. The root stays out of it: past the idle
+/// park `<N>` counts from the waiting hop, not from that root, and a winit
+/// handler name is nothing a client can act on. The refusal's log line names
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MainStall {
     /// How long the main thread has gone without a beat while it had work:
@@ -415,13 +417,7 @@ pub(crate) struct MainStall {
 
 impl std::fmt::Display for MainStall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let returned = if self.returned { " returned" } else { "" };
-        write!(
-            f,
-            "main thread stalled {}s since `{}`{returned}; retry",
-            self.stalled.as_secs(),
-            self.root.name()
-        )
+        write!(f, "main thread stalled {}s; retry", self.stalled.as_secs())
     }
 }
 
@@ -2221,102 +2217,6 @@ mod tests {
         assert!(!again.contains("up to a second"), "{again}");
     }
 
-    /// LIVE end-to-end proof that the REAL background sampler thread wakes, sees a
-    /// frozen heartbeat sitting on the `ResizeSettle` breadcrumb, and emits the
-    /// named stall log line — the exact behaviour a stripped-release freeze needs.
-    ///
-    /// `#[ignore]` because it (a) sleeps ~1 s and (b) installs the process-global
-    /// logger (a `OnceLock`), which would collide with the rest of the suite. Run
-    /// it in isolation:
-    ///
-    /// ```text
-    /// ATERM_WATCHDOG=1 cargo test -p aterm-gui -- --ignored --exact \
-    ///     watchdog::tests::live_sampler_thread_logs_a_named_resize_stall
-    /// ```
-    #[test]
-    #[ignore = "live: sleeps ~1s and installs the global logger; run with --ignored"]
-    fn live_sampler_thread_logs_a_named_resize_stall() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-
-        struct Capture {
-            fired: Arc<AtomicBool>,
-            saw_name: Arc<std::sync::Mutex<String>>,
-            saw_stack: Arc<std::sync::Mutex<String>>,
-        }
-        impl aterm_log::Log for Capture {
-            fn enabled(&self, _m: &aterm_log::Metadata) -> bool {
-                true
-            }
-            fn log(&self, record: &aterm_log::Record<'_>) {
-                let line = format!("{}", record.args());
-                if line.starts_with(STACK_LINE) {
-                    // Every part, in order: the stack is several lines now.
-                    let mut stack = self.saw_stack.lock().unwrap();
-                    stack.push_str(&line);
-                    stack.push('\n');
-                } else if line.contains("MAIN-THREAD STALL") {
-                    self.fired.store(true, Ordering::SeqCst);
-                    *self.saw_name.lock().unwrap() = line;
-                }
-            }
-            fn flush(&self) {}
-        }
-
-        let fired = Arc::new(AtomicBool::new(false));
-        let saw = Arc::new(std::sync::Mutex::new(String::new()));
-        let stack = Arc::new(std::sync::Mutex::new(String::new()));
-        // Leak the logger to obtain the `&'static` `set_logger` requires.
-        let cap: &'static Capture = Box::leak(Box::new(Capture {
-            fired: fired.clone(),
-            saw_name: saw.clone(),
-            saw_stack: stack.clone(),
-        }));
-        let _ = aterm_log::set_logger(cap);
-        aterm_log::set_max_level(aterm_log::LevelFilter::Trace);
-
-        // Ensure the sampler is enabled regardless of debug/release. Routed
-        // through the workspace's one lock-scoped env helper.
-        aterm_log::env::set("ATERM_WATCHDOG", "1");
-
-        // Enter the resize-settle arm, then STOP beating (simulate the wedge).
-        beat(Breadcrumb::ResizeSettle);
-        start();
-
-        // Give the sampler (250 ms tick, 500 ms threshold) time to trip.
-        std::thread::sleep(Duration::from_millis(1100));
-
-        assert!(
-            fired.load(Ordering::SeqCst),
-            "watchdog should have logged a stall for the frozen ResizeSettle beat"
-        );
-        assert!(
-            saw.lock().unwrap().contains("ResizeSettle"),
-            "the stall line must NAME the breadcrumb; got: {}",
-            saw.lock().unwrap()
-        );
-        // `start` registered THIS thread as the one to probe, so the stack line
-        // that follows the stall line is this test's own, asleep.
-        #[cfg(target_os = "macos")]
-        {
-            let stack = stack.lock().unwrap().clone();
-            eprintln!("{stack}");
-            assert!(
-                stack.contains("load address 0x") && stack.contains(" | #1 "),
-                "a stall line is followed by the main thread's stack; got: {stack}"
-            );
-            assert!(
-                stack.starts_with("MAIN-THREAD STALL stack: (part 1/"),
-                "numbered from its first part; got: {stack}"
-            );
-            let cap = aterm_log::record_cap(aterm_log::Level::Error);
-            assert!(
-                stack.lines().all(|part| part.len() <= cap),
-                "every part fits the ERROR body cap; got: {stack}"
-            );
-        }
-    }
-
     /// THE ATTRIBUTION RULE (2026-09-15 responsiveness audit). A turn that ended
     /// inside a WORK root is the span this census exists to name — the 100–600 ms
     /// band that is too short for the release sampler's 5 s bar and never enters
@@ -3878,16 +3778,10 @@ mod tests {
         let stall = main_stall(beat + secs(12_138), beat, Breadcrumb::NewEvents, true, None)
             .expect("a work root frozen past the bar is stalled");
         assert_eq!(stall.stalled, Duration::from_secs(12_138));
-        assert_eq!(
-            stall.to_string(),
-            "main thread stalled 12138s since `NewEvents` returned; retry"
-        );
+        assert_eq!(stall.to_string(), "main thread stalled 12138s; retry");
         let inside = main_stall(beat + secs(7), beat, Breadcrumb::UserEvent, false, None)
             .expect("a handler still on the stack is stalled too");
-        assert_eq!(
-            inside.to_string(),
-            "main thread stalled 7s since `UserEvent`; retry"
-        );
+        assert_eq!(inside.to_string(), "main thread stalled 7s; retry");
     }
 
     /// The idle park is no stall by itself: a thread asleep in its event wait
@@ -3921,7 +3815,8 @@ mod tests {
         );
         assert_eq!(
             stall.to_string(),
-            "main thread stalled 5s since `AboutToWait` returned; retry"
+            "main thread stalled 5s; retry",
+            "counted from the hop, so the idle root is not named"
         );
         // A beat after the hop was posted restarts the count from that beat.
         assert_eq!(

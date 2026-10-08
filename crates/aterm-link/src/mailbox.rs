@@ -1,73 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SCHEDULING ROUND, as a data structure.
+//! The scheduling round, as a data structure.
 //!
-//! §11.2 states one ordering rule about the bridge's inputs and it is a safety
-//! rule, not a fairness one:
+//! §11.2's ordering rule is a safety rule, not a fairness one:
 //!
 //! > drains the `fleet/>` tail **ahead of** the inbox group on every scheduling
 //! > round so a halt never queues behind a redelivery backlog
 //!
-//! A single FIFO channel cannot express that: a halt published behind ten
-//! thousand redeliveries arrives after them. So each source has its own queue
-//! and one condvar wakes the loop; the loop then takes strictly by priority.
-//! Nothing polls and nothing sleeps — a reader thread pushes and notifies, and
-//! the loop blocks until there is something to take.
+//! One FIFO cannot express that, so each source has its own queue and one
+//! condvar wakes the loop, which takes strictly by priority. Nothing polls.
 //!
-//! ## THE QUEUES ARE BOUNDED, AND THE SHED POLICY IS BACK-PRESSURE
+//! ## The queues are bounded; the shed policy is back-pressure
 //!
-//! Every other bound in this design is written down and argued (`RING_CAP`,
-//! `SENDER_QUOTA`, `OUTBOX_CAP`, `PRODUCER_CAP`); this one used to be the
-//! exception, and an exception here is worse than most. The reader threads push
-//! as fast as the broker delivers
-//! while ONE consumer pays a synchronous aterm round trip per inbox record, and
-//! a record body may be up to 16 MiB. Unbounded, a co-permitted peer's burst —
-//! or a broker replaying a backlog after an outage — is bridge memory
-//! exhaustion, and the bridge's death is the fail-closed halt of every session
-//! it governs. T9's stated residual is "log flooding"; unbounded queues turn
-//! that into a remote kill.
+//! Readers push as fast as the broker delivers while one consumer pays a
+//! synchronous aterm round trip per record, and a body may be 16 MiB. Unbounded,
+//! a peer's burst or a broker replaying a backlog exhausts bridge memory, and
+//! the bridge's death halts every session it governs. The policy is block, not
+//! drop, for a different reason per source:
 //!
-//! The shed policy is BLOCK, not drop, and the reason is written per source
-//! because it is not the same reason twice:
+//! * `Fleet` — a halt may never be dropped.
+//! * `Inbox` — the group cursor commits only after the endpoint takes the
+//!   record, so blocking restores socket back-pressure and anything the broker
+//!   sheds is redelivered on the next attach.
+//! * `Event` — aterm's push lane already coalesces and emits `GAP` (§4.2), so
+//!   blocking hands the decision to the side that can report it.
 //!
-//! * `Fleet` — a halt may never be dropped. Blocking is the only admissible
-//!   answer.
-//! * `Inbox` — the group cursor is committed only after the endpoint takes the
-//!   record, so a subscription the broker sheds under its own write timeout is
-//!   redelivered in full on the next attach. Blocking restores exactly the
-//!   socket back-pressure the reader thread had removed.
-//! * `Event` — aterm's own push lane already has a shed policy of its own: it
-//!   coalesces and emits `GAP`, which §4.2 says is published rather than
-//!   dropped. Blocking hands the decision back to the side that can report it.
+//! `Closed` is never bounded: a bound on it would bound the bridge's liveness.
+//! A push blocks only while its queue is over a cap AND non-empty, so one record
+//! larger than [`QUEUE_BYTES_MAX`] still makes progress.
 //!
-//! `Closed` is NEVER bounded: it is the notice that the connection carrying
-//! everything behind it is gone, and a bound that could delay it would be a
-//! bound on the bridge's own liveness.
+//! ## Every broker input carries its incarnation
 //!
-//! ## EVERY BROKER INPUT CARRIES THE INCARNATION IT BELONGS TO
-//!
-//! A reader thread outlives the subscription it reads: `close_subscriptions`
-//! shuts the socket down, and the parked `recv` returns some microseconds later,
-//! on its own thread, with no ordering against the reconnect that is already
-//! running on the loop's thread. Clearing the queues on reconnect can therefore
-//! only drop what has ALREADY been pushed — the notice or record still in flight
-//! lands in the FRESH mailbox, where a `Closed` tears down a connection that was
-//! just brought up (a reconnect loop, not a retry) and a stale broker record is
-//! the late-applied keystroke [`Mailbox::reset_broker_sources`] says must not
-//! happen.
-//!
-//! So a broker input is accepted only under the GENERATION it was subscribed in:
-//! [`Mailbox::reset_broker_sources`] bumps it, each reader captures it at spawn,
-//! and a push from any other generation is dropped whenever it arrives rather
-//! than only when it arrives early enough. This is `fabric::BridgeGeneration`'s
-//! rule on the aterm side, for the same reason. `Source::Aterm` is not a broker
-//! source — it is the inherited push lane, which no reconnect touches — so its
-//! closure notice is never generation-scoped ([`Mailbox::push_aterm_closed`]).
-//!
-//! A push blocks only while its queue is over a cap AND non-empty, so a single
-//! record larger than [`QUEUE_BYTES_MAX`] still makes progress rather than
-//! wedging the lane forever.
+//! A reader thread outlives its subscription: after `close_subscriptions` its
+//! parked `recv` returns microseconds later, unordered against the reconnect.
+//! Clearing queues on reconnect drops only what was already pushed; the
+//! in-flight `Closed` would tear down the fresh connection (a reconnect loop)
+//! and a stale record would be applied late. So [`Mailbox::reset_broker_sources`]
+//! bumps a generation, each reader captures it at spawn, and a push from any
+//! other generation is dropped whenever it arrives — `fabric::BridgeGeneration`'s
+//! rule on the aterm side. `Source::Aterm` is the inherited push lane, which no
+//! reconnect touches, so its closure is never generation-scoped.
 
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
@@ -116,15 +89,12 @@ pub(crate) enum ReplayPressure {
     Urgent,
 }
 
-/// The most records ONE source may hold before its reader is made to wait.
-///
-/// A thousand rows is a deep enough buffer that an ordinary burst never touches
-/// it, and shallow enough that the resident cost is a queue rather than a heap.
+/// The most records one source may hold before its reader waits: deep enough
+/// for an ordinary burst, shallow enough to stay a queue rather than a heap.
 pub const QUEUE_ROWS_MAX: usize = 1024;
 
-/// The most bytes ONE source may hold before its reader is made to wait, over
-/// subjects and bodies. The row cap alone is not a memory bound: a record body
-/// may be up to 16 MiB, so a thousand of them is sixteen gigabytes.
+/// The most subject+body bytes one source may hold before its reader waits. The
+/// row cap alone is no memory bound: a thousand 16 MiB bodies is 16 GiB.
 pub const QUEUE_BYTES_MAX: usize = 8 * 1024 * 1024;
 
 /// The bytes one queued record occupies, as the bound counts them.
@@ -151,9 +121,8 @@ const FLEET: usize = 0;
 const INBOX: usize = 1;
 const SAY: usize = 2;
 
-/// Whether one source is over a bound AND has something to shed. Both halves
-/// matter: a queue that is over the byte cap because of ONE huge record must
-/// still accept it, or the lane wedges forever.
+/// Whether one source is over a bound AND non-empty: an empty queue must accept
+/// one record however large, or the lane wedges forever.
 fn over_bound(rows: usize, bytes: usize) -> bool {
     rows > 0 && (rows >= QUEUE_ROWS_MAX || bytes >= QUEUE_BYTES_MAX)
 }
@@ -167,21 +136,15 @@ impl Queues {
             && self.closed.is_empty()
     }
 
-    /// THE PRIORITY, in one place. A closure notice outranks everything (the
-    /// connection it names is gone, so anything queued behind it is stale), then
-    /// the fleet halt, then aterm's own events, then the inbox group, and the
-    /// BROADCAST face last.
+    /// The priority, in one place: a closure notice (anything behind it is
+    /// stale), the fleet halt, aterm's events, the inbox group, then broadcast.
     ///
-    /// Say is last because it is the one lane whose volume nobody on this node
-    /// chose: an addressed message was sent to a session here, and a halt is a
-    /// safety order, but a `say` record is a shout any co-permitted peer in the
-    /// fleet may publish as often as it likes. Draining it ahead of the inbox
-    /// would let a chatty topic delay mail somebody addressed — and each say
-    /// record costs up to one synchronous `deliver` PER SUBSCRIBED SESSION,
-    /// which is the most expensive item the loop can take.
-    /// Whether taking this item released room for a blocked producer. The
-    /// readers park only at their OWN queue's bound, so a routine item from an
-    /// uncapped queue (or a different source) has nobody to wake.
+    /// Say is last because nobody on this node chose its volume: any
+    /// co-permitted peer may shout as often as it likes, and each record costs
+    /// one synchronous `deliver` per subscribed session.
+    ///
+    /// The `bool` is whether the take released room for a blocked producer;
+    /// readers park only at their own queue's bound.
     fn take(&mut self) -> Option<(Item, bool)> {
         if let Some(s) = self.closed.pop_front() {
             return Some((Item::Closed(s), false));
@@ -215,18 +178,11 @@ pub struct Mailbox {
     /// Woken when the loop takes something, or when a reconnect clears the
     /// broker queues: the back-pressure half of the pair.
     drained: Condvar,
-    /// How many times a pusher has PARKED on a bound, ever.
+    /// How many times a pusher has parked on a bound, ever (monotone).
     ///
-    /// MONOTONE, AND IT EXISTS FOR THE TESTS THAT ASSERT A NON-EVENT. "The
-    /// writer did not get past the bound" is a negative, and the only honest
-    /// way to test one is to observe the positive that causes it: that a
-    /// pusher actually reached [`Mailbox::wait_for_room`]. A test that instead
-    /// sleeps and reads a flag the writer sets AFTER its push passes just as
-    /// happily when the bound has been deleted and the thread was simply not
-    /// scheduled in time — a false green over a memory bound whose own doc
-    /// calls it "a safety bound, not a tidiness one". Spinning on this to a
-    /// hang-detector deadline cannot pass without the bound: with no bound,
-    /// nothing ever parks and the counter never moves.
+    /// Lets tests assert the bound by observing the park itself rather than
+    /// sleeping and reading a flag: without the bound nothing parks and the
+    /// counter never moves, so a test cannot pass on scheduling luck.
     parks: std::sync::atomic::AtomicU64,
 }
 
@@ -264,10 +220,8 @@ impl Mailbox {
 
     /// Push a fleet record, WAITING while the fleet queue is over its bound.
     ///
-    /// Dropped if `generation` is not the live broker generation — the subscription it
-    /// came from has been torn down. Re-checked after every wait, so a reader
-    /// parked on the bound when the reconnect happens sheds its record instead of
-    /// pushing it into the fresh mailbox.
+    /// Dropped if `generation` is not the live broker generation; re-checked
+    /// after every wait, so a reader parked across a reconnect sheds its record.
     pub fn push_fleet(&self, r: Record, generation: u64) {
         let n = record_bytes(&r);
         let mut q = self.lock();
@@ -287,8 +241,7 @@ impl Mailbox {
     }
 
     /// Push one aterm `EVENT` line, WAITING while the event queue is over its
-    /// row bound. Lines are small and already coalesced by aterm, so only the
-    /// row count applies.
+    /// row bound (lines are small and coalesced, so only rows count).
     pub fn push_event(&self, line: String) {
         let mut q = self.lock();
         while over_bound(q.events.len(), 0) {
@@ -321,15 +274,10 @@ impl Mailbox {
 
     /// Push a BROADCAST record, WAITING while the say queue is over its bound.
     ///
-    /// Blocking, like the other two, and the reason is the one the module header
-    /// gives for `Inbox` with one difference: the say face is a PLAIN
-    /// subscription, so there is no group cursor and nothing is redelivered.
-    /// What blocking buys here is the socket back-pressure the reader thread
-    /// removed — the broker sheds under its own write timeout, and a broadcast
-    /// this bridge was too busy to read is a broadcast it does not deliver,
-    /// which is the honest outcome for an opt-in fan-out with no delivery
-    /// promise. Dropping records here instead would spend the same memory bound
-    /// and lie about why.
+    /// The say face is a plain subscription with no group cursor, so blocking
+    /// buys only socket back-pressure: a broadcast the bridge was too busy to
+    /// read is one the broker sheds and nobody delivers — the honest outcome for
+    /// an opt-in fan-out with no delivery promise.
     pub fn push_say(&self, r: Record, generation: u64) {
         let n = record_bytes(&r);
         let mut q = self.lock();
@@ -350,9 +298,7 @@ impl Mailbox {
 
     /// Park until the loop takes something (or a reconnect clears the queues).
     ///
-    /// BOUNDED, and the bound is a hang detector rather than a poll: the wait is
-    /// woken by [`Mailbox::take`], and re-checking on a timer only means a
-    /// reader thread whose loop had exited cannot be wedged invisibly.
+    /// The timeout is a hang detector, not a poll: [`Mailbox::take`] wakes it.
     fn wait_for_room<'a>(
         &'a self,
         q: std::sync::MutexGuard<'a, Queues>,
@@ -368,11 +314,7 @@ impl Mailbox {
     /// Report that a BROKER reader ended, under the generation it was reading in.
     ///
     /// A notice from a torn-down subscription is dropped: it names a connection
-    /// the loop has already replaced, and acting on it drops a healthy one. That
-    /// is the shape the aterm side fixed with `fabric::BridgeGeneration` — a late
-    /// guard from a previous incarnation reporting a live replacement
-    /// disconnected — and clearing the queue on reconnect cannot fix it, because
-    /// clearing only reaches notices that have already been pushed.
+    /// the loop already replaced, and acting on it would drop a healthy one.
     pub fn push_closed(&self, s: Source, generation: u64) {
         let mut q = self.lock();
         if q.broker_gen != generation {
@@ -385,10 +327,9 @@ impl Mailbox {
 
     /// Report that ATERM went away — never generation-scoped.
     ///
-    /// The verb and push descriptors are inherited once, at exec, and no
-    /// reconnect touches them: there is no stale incarnation of this lane, and
-    /// its closure is the only thing that makes the run loop return. A bound or a
-    /// generation on it would be a bound on the bridge's own liveness.
+    /// The verb and push descriptors are inherited once at exec and no reconnect
+    /// touches them; this closure is the only thing that makes the run loop
+    /// return.
     pub fn push_aterm_closed(&self) {
         self.lock().closed.push_back(Source::Aterm);
         self.ready.notify_all();
@@ -396,20 +337,15 @@ impl Mailbox {
 
     /// FORGET EVERY BROKER INPUT, on a reconnect.
     ///
-    /// The queued records came from subscriptions that no longer exist and the
-    /// queued closure notices name them; leaving either in place makes the first
-    /// `take` after a successful reconnect tear the fresh connection down again,
-    /// which is an infinite loop, not a retry. Losing the records costs nothing:
-    /// the fleet face resubscribes from zero, the inbox group re-delivers
-    /// everything it never committed, and a stale drive record must not be
-    /// applied late anyway. `Closed(Aterm)` is KEPT — aterm going away is not a
-    /// broker event and it is the one closure the loop must still act on.
+    /// A queued closure notice from a dead subscription would tear the fresh
+    /// connection down again (a loop, not a retry). Losing the records costs
+    /// nothing: the fleet face resubscribes from zero and the inbox group
+    /// redelivers everything uncommitted. `Closed(Aterm)` is kept — it is not a
+    /// broker event.
     pub fn reset_broker_sources(&self) {
         let mut q = self.lock();
-        // THE GENERATION MOVES FIRST, and it is what makes this total: clearing
-        // reaches only what has already been pushed, while a reader killed BY
-        // this reconnect pushes microseconds later, on its own thread, into the
-        // fresh mailbox. See the module header.
+        // The generation is what makes this total: clearing reaches only what
+        // was already pushed, not a killed reader's late push.
         q.broker_gen = q.broker_gen.wrapping_add(1);
         q.fleet.clear();
         q.inbox.clear();
@@ -424,9 +360,8 @@ impl Mailbox {
 
     /// Block until there is something to take, or `timeout` elapses.
     ///
-    /// The timeout is not a poll interval: nothing is discovered by waking up.
-    /// It exists so the loop can run its periodic duties (a presence refresh, a
-    /// reconnect attempt) without a second timer, and it is generous.
+    /// The timeout is not a poll: it lets the loop run periodic duties (presence
+    /// refresh, reconnect) without a second timer.
     pub fn take(&self, timeout: Duration) -> Option<Item> {
         let mut q = self.lock();
         if let Some((item, released)) = q.take() {
@@ -454,19 +389,18 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// How long a wait for something that MUST happen — an item, a park — may
+    /// take before it is read as a hang (AGENTS.md: a hang detector is a
+    /// minute, never a latency budget).
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
     fn rec(off: u64) -> Record {
         (off, format!("/s/{off}"), Vec::new())
     }
 
-    /// A HALT BEHIND A BACKLOG still arrives first. This is the whole reason the
-    /// mailbox is not one channel: a fleet halt queued after a full inbox
-    /// backlog would be applied a whole backlog of records too late, and a halt
-    /// that late is not a halt.
-    ///
-    /// The backlog is one short of [`QUEUE_ROWS_MAX`] rather than ten thousand
-    /// because the queue is now BOUNDED: a single-threaded test that pushed
-    /// past the bound would park on its own back-pressure. The property is
-    /// unchanged — a halt outranks however deep the inbox is allowed to get.
+    /// A halt behind a full inbox backlog still arrives first. The backlog is one
+    /// short of [`QUEUE_ROWS_MAX`] so this single-threaded test does not park on
+    /// its own back-pressure.
     #[test]
     fn a_halt_outranks_an_inbox_backlog_however_deep_it_is() {
         let mb = Mailbox::default();
@@ -474,19 +408,19 @@ mod tests {
             mb.push_inbox(rec(off), 0);
         }
         mb.push_fleet(rec(999_999), 0);
-        let first = mb.take(Duration::from_secs(30)).expect("an item");
+        let first = mb.take(HANG_DETECTOR).expect("an item");
         match first {
             Item::Fleet((off, _, _)) => assert_eq!(off, 999_999),
             other => panic!("the halt did not come first: {other:?}"),
         }
         // And the backlog is still there, in order.
-        match mb.take(Duration::from_secs(30)).expect("an item") {
+        match mb.take(HANG_DETECTOR).expect("an item") {
             Item::Inbox((off, _, _)) => assert_eq!(off, 0),
             other => panic!("{other:?}"),
         }
     }
 
-    /// The full order, once: closed, fleet, event, inbox.
+    /// The full order, once: closed, fleet, event, inbox, say.
     #[test]
     fn the_priority_is_the_declared_one() {
         let mb = Mailbox::default();
@@ -505,9 +439,7 @@ mod tests {
                 Item::Say(_) => "say",
             });
         }
-        // THE BROADCAST FACE IS LAST, behind the mail somebody addressed — see
-        // [`Queues::take`]. Pushed FIRST above so the order below is the
-        // priority and not the arrival.
+        // Pushed in reverse so the order below is priority, not arrival.
         assert_eq!(seen, ["closed", "fleet", "event", "inbox", "say"]);
     }
 
@@ -537,9 +469,7 @@ mod tests {
         assert_eq!(mb.replay_pressure(), ReplayPressure::Urgent);
     }
 
-    /// The wait is EVENT-DRIVEN: a push from another thread wakes it, and the
-    /// timeout is only the ceiling. The generous bound here is a hang detector,
-    /// not a performance assertion — a healthy wake is microseconds.
+    /// A push from another thread wakes the wait; the timeout is a hang detector.
     #[test]
     fn a_push_from_another_thread_wakes_the_wait() {
         let mb = Arc::new(Mailbox::default());
@@ -547,23 +477,17 @@ mod tests {
             let mb = mb.clone();
             std::thread::spawn(move || mb.push_fleet(rec(7), 0))
         };
-        let got = mb.take(Duration::from_secs(30)).expect("woken by the push");
+        let got = mb.take(HANG_DETECTOR).expect("woken by the push");
         assert!(matches!(got, Item::Fleet((7, _, _))));
         writer.join().expect("writer thread");
     }
 
-    /// A RECONNECT FORGETS THE OLD CONNECTION and nothing else. Without this the
-    /// first `take` after a successful reattach picks up the closure notice the
-    /// OLD subscription left and tears the fresh one down — a loop, not a retry.
-    /// `Closed(Aterm)` survives, because aterm going away is not a broker event.
+    /// A reconnect forgets the old connection's inputs and nothing else.
     #[test]
     fn a_reconnect_forgets_the_old_connections_inputs_but_not_aterms() {
         let mb = Mailbox::default();
         mb.push_fleet(rec(1), 0);
         mb.push_inbox(rec(3), 0);
-        // The broadcast face is a BROKER source like the other two: a shout
-        // queued under the dead connection must not be delivered against the
-        // fresh one, where the cursors have already been re-read off disk.
         mb.push_say(rec(9), 0);
         mb.push_event("EVENT 1 post 1".into());
         mb.push_closed(Source::Inbox, 0);
@@ -587,23 +511,11 @@ mod tests {
         );
     }
 
-    /// A NOTICE FROM THE SUBSCRIPTION THE RECONNECT KILLED IS DISCARDED WHENEVER
-    /// IT ARRIVES — which is not the same property as clearing the queue.
-    ///
-    /// `attach_broker` closes the old subscriptions and then clears the mailbox
-    /// on its own thread, but closing is exactly what makes a still-live reader
-    /// end: its parked `recv` returns microseconds LATER, on another thread, and
-    /// `push_closed` was unconditional. So the notice landed in the fresh
-    /// mailbox, the loop read it as "a broker subscription ended", and dropped a
-    /// connection that had just come up — every churn re-running
-    /// `read_fleet_halts`, `bring_presence_up`, `apply_fleet_halts` and `write_holds` over every hosted
-    /// session. Reachable whenever a subscription is still alive at reconnect
-    /// time: a partial `attach_broker` failure (the broker's `MAX_CONNS` under a
-    /// post-restart herd, which `attach_broker` explicitly anticipates), or one
-    /// subscription ending while the others live.
-    ///
-    /// The stale RECORD half is the same defect and the same fix: a `Term`
-    /// record from a torn-down subscription is a keystroke applied late.
+    /// A notice or record from the subscription a reconnect killed is discarded
+    /// whenever it arrives, not only if it arrives before the queue is cleared.
+    /// A late `Closed` would drop a connection that just came up (reachable on a
+    /// partial `attach_broker` failure, e.g. the broker's `MAX_CONNS` under a
+    /// post-restart herd); a late record would be applied late.
     #[test]
     fn a_late_push_from_the_previous_incarnation_is_discarded() {
         let mb = Mailbox::default();
@@ -630,10 +542,7 @@ mod tests {
         ));
     }
 
-    /// ATERM'S OWN CLOSURE IS NEVER GENERATION-SCOPED. The verb and push
-    /// descriptors are inherited once at exec and no reconnect touches them, so
-    /// there is no stale incarnation of that lane — and its notice is the only
-    /// thing that makes the run loop return.
+    /// Aterm's own closure is never generation-scoped.
     #[test]
     fn aterms_closure_survives_every_broker_generation() {
         let mb = Mailbox::default();
@@ -651,19 +560,7 @@ mod tests {
         ));
     }
 
-    /// An empty mailbox with a zero timeout answers `None` rather than parking:
-    /// the loop's periodic duties must be reachable when nothing is arriving.
-    #[test]
-    fn an_empty_mailbox_times_out() {
-        let mb = Mailbox::default();
-        assert!(mb.take(Duration::from_millis(0)).is_none());
-    }
-
-    /// A READER IS MADE TO WAIT AT THE ROW BOUND, and is released by the loop
-    /// taking one. Unbounded, this thread would push a million records into the
-    /// bridge's heap while the single consumer paid an aterm round trip each;
-    /// the bridge's death by OOM is the fail-closed halt of every session it
-    /// governs, so the queue's bound is a safety bound, not a tidiness one.
+    /// A reader waits at the row bound and is released by a take.
     #[test]
     fn a_reader_blocks_at_the_row_bound_and_is_released_by_a_take() {
         let mb = Arc::new(Mailbox::default());
@@ -677,13 +574,8 @@ mod tests {
                 }
             })
         };
-        // The writer parks at the bound: it can never get past it while nothing
-        // drains. WAITED FOR AS AN EVENT, not slept past — `parks` moves only
-        // when a pusher actually reaches the back-pressure wait, so this loop
-        // ends on the thing being asserted rather than on a timer. The deadline
-        // is a hang detector: without the bound nothing ever parks and the
-        // counter never moves, which is the failure.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // Wait for the park itself (see `Mailbox::parks`), not a timer.
+        let deadline = std::time::Instant::now() + HANG_DETECTOR;
         while mb.parked() == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -700,7 +592,7 @@ mod tests {
         // Draining releases it, one slot at a time, and nothing was dropped.
         let mut seen = 0u64;
         while seen < QUEUE_ROWS_MAX as u64 + 4 {
-            match mb.take(Duration::from_secs(30)) {
+            match mb.take(HANG_DETECTOR) {
                 Some(Item::Inbox((off, _, _))) => {
                     assert_eq!(off, seen, "the queue is FIFO and sheds nothing");
                     seen += 1;
@@ -711,21 +603,8 @@ mod tests {
         writer.join().expect("writer thread");
     }
 
-    /// THE BYTE BOUND BITES BEFORE THE ROW BOUND on big records — a thousand
-    /// 16 MiB records is sixteen gigabytes, so a row count alone is not a
-    /// memory bound — and ONE record over the whole byte cap still gets
-    /// through, because a bound that could refuse a single record forever would
-    /// wedge the lane instead of slowing it.
-    ///
-    /// THE ASSERTION IS THE PARK, NOT A SLEEP. This test used to spawn the
-    /// writer, sleep 50 ms and assert a flag the writer sets AFTER its push was
-    /// still false. Nothing in that proved the thread had reached `push_inbox`
-    /// at all: delete the byte half of `over_bound` and, on a loaded box where
-    /// the thread is not scheduled inside the window, the assertion holds and
-    /// the suite reports a memory bound that is gone. So the writer's park is
-    /// waited FOR — `Mailbox::parked` moves only when a pusher reaches the
-    /// back-pressure wait — and the drain that releases it is what the ordering
-    /// assertions below are about.
+    /// The byte bound bites before the row bound on big records, and one record
+    /// over the whole byte cap still passes an empty queue.
     #[test]
     fn the_byte_bound_holds_and_one_oversized_record_still_passes() {
         let mb = Arc::new(Mailbox::default());
@@ -738,10 +617,8 @@ mod tests {
             let mb = mb.clone();
             std::thread::spawn(move || mb.push_inbox(big(4), 0))
         };
-        // The fifth record takes the queue over the byte cap, so the writer
-        // MUST park. Without the byte half of the bound it never does, and this
-        // loop runs to its hang detector instead of passing on a timer.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // The fifth record is over the byte cap, so the writer must park.
+        let deadline = std::time::Instant::now() + HANG_DETECTOR;
         while mb.parked() == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -749,17 +626,16 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        // AND THE DRAIN IS WHAT RELEASES IT, in order: the four that were
-        // already in, then the one that was waiting on room.
+        // The drain releases it, in order.
         for want in 0..5u64 {
-            match mb.take(Duration::from_secs(30)) {
+            match mb.take(HANG_DETECTOR) {
                 Some(Item::Inbox((off, _, _))) => assert_eq!(off, want, "FIFO, nothing shed"),
                 other => panic!("{other:?}"),
             }
         }
         writer.join().expect("writer thread");
 
-        // AND THE ESCAPE HATCH: an empty queue takes a record however large.
+        // An empty queue takes a record however large.
         let mb2 = Mailbox::default();
         mb2.push_inbox((9, "/s".to_string(), vec![0u8; QUEUE_BYTES_MAX * 2]), 0);
         assert!(matches!(

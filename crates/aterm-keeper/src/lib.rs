@@ -3,17 +3,16 @@
 
 //! **aterm-keeper** — the PTY keeper (`docs/DESIGN-pty-keeper-2026-09-26.md`).
 //!
-//! Today the window holds every terminal's master alone, so a window that dies
-//! without running its exit path — a fatal signal, a jetsam or Force Quit
-//! kill — hangs up every shell and every agent in it. The keeper is a second
-//! holder that outlives the window: a per-login launchd job that holds a
-//! CUSTODY COPY of every master, never reads it, and hands a crashed window's
-//! masters to the next window through the adoption landing the seamless update
-//! already uses.
+//! A window that dies without running its exit path — a fatal signal, a
+//! jetsam or Force Quit kill — hangs up every shell whose master it alone
+//! holds. The keeper is a second holder that outlives the window: a per-login
+//! launchd job that holds a CUSTODY COPY of every master, never reads it, and
+//! hands a crashed window's masters to the next window through the adoption
+//! landing the seamless update uses.
 //!
-//! P3 is OPT-IN: a window registers with a keeper only under `[keeper] enabled
+//! It is OPT-IN: a window registers with a keeper only under `[keeper] enabled
 //! = true` (`aterm-gui`'s `keeper_link`), and nothing starts one by itself
-//! (`aterm keeper start` does, by hand; P4 makes it the default). What is here:
+//! (`aterm keeper start` does). What is here:
 //!
 //! * [`core`] — the PURE keeper: the custody table and its transitions, the
 //!   §5.4 death classifier (with row 3's crash-marker cross-check), the
@@ -30,6 +29,8 @@
 //!   satisfies this build's designated requirement.
 //! * [`job`] — the launchd label (`com.aterm.aterm.keeper`), the socket, and
 //!   `launchctl submit|remove|print`.
+//! * [`code`] — the copy of its own code a keeper runs from, so that an update
+//!   deleting the build it started from leaves it checkable.
 //! * [`cli`] — `aterm keeper serve|status|start|stop`.
 //!
 //! It links no AppKit, CoreGraphics or winit (`tools/grep_guard.sh` B19): the
@@ -49,6 +50,8 @@ pub mod wire;
 
 #[cfg(unix)]
 pub mod client;
+#[cfg(unix)]
+pub mod code;
 #[cfg(unix)]
 pub mod frameio;
 #[cfg(unix)]

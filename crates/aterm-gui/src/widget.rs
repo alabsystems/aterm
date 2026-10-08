@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The tray draw IR: renderer-AGNOSTIC drawing primitives ([`DrawPrim`]) and the
-//! [`TrayInput`] one-frame bundle that carries them. Both the GPU overlay pass and the
-//! CPU/softbuffer fallback consume the SAME `DrawPrim` list, so every overlay card
-//! (settings, about, palette, notice, build badge, update screen) lays out ONCE and
-//! renders identically on both paths. All chrome text is minted through the single
-//! [`text_prim`] funnel, so every string maps to a named step of the type scale by
-//! construction.
+//! The tray draw IR: renderer-agnostic drawing primitives ([`DrawPrim`]) and the
+//! [`TrayInput`] one-frame bundle that carries them. The GPU overlay pass and the
+//! CPU/softbuffer fallback consume the same `DrawPrim` list, so every overlay card
+//! lays out once and renders identically on both paths. All chrome text goes
+//! through [`text_prim`], so every string maps to a named step of the type scale.
 
 use std::sync::Arc;
 
@@ -22,25 +20,23 @@ pub(crate) fn rgba(c: [u8; 3], a: u8) -> Rgba {
     [c[0], c[1], c[2], a]
 }
 
-/// The weight of a chrome text run. `Bold` draws from the renderer-discovered
-/// real bold sibling of the user's terminal face when it covers the glyph
-/// (see `tray_raster::select_chrome_face`); otherwise it honestly downgrades
-/// to the regular face — never a synthetic dilation. Orthogonal to
-/// [`TextFace`]: `weight` selects the Mono-face bold sibling, while `UiBold`
-/// is the UI face's synthesized semibold.
+/// The weight of a chrome text run. `Bold` draws from the real bold sibling of
+/// the user's terminal face when it covers the glyph
+/// (`tray_raster::select_chrome_face`), else the regular face; never a synthetic
+/// dilation. Orthogonal to [`TextFace`]: `UiBold` is the UI face's synthesized
+/// semibold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TextWeight {
     Regular,
     Bold,
 }
 
-/// The FACE a [`DrawPrim::Text`] rasterizes in ([`crate::tray_raster`] picks the font):
-/// `Mono` is the terminal face (the renderer-resolved user primary + DejaVu coverage
-/// fallback) — code, hex readouts, the preview mock's terminal body, and glyph-art
-/// pictograms; `Ui` is the native PROPORTIONAL system face (SF Pro on macOS, mono
-/// fallback elsewhere) for panel chrome; `UiBold` is the UI face with a synthesized
-/// semibold weight for headings. `Mono` is the semantic default — a prim opts INTO the
-/// UI face, so pre-existing cards (About / Palette) stay pixel-identical.
+/// The face a [`DrawPrim::Text`] rasterizes in ([`crate::tray_raster`] picks the
+/// font). `Mono` is the terminal face (the user's primary plus DejaVu coverage
+/// fallback), for code, hex readouts, the preview's terminal body and glyph art;
+/// `Ui` is the native proportional system face (SF Pro on macOS, mono elsewhere)
+/// for panel chrome; `UiBold` is the UI face with synthesized semibold. `Mono`
+/// is the default; a prim opts into the UI face.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TextFace {
     Mono,
@@ -48,11 +44,10 @@ pub(crate) enum TextFace {
     UiBold,
 }
 
-/// Exact, view-authored terminal face candidate carried by every renderer-native
-/// specimen run.  Keeping this identity in the draw IR—not in process-global
-/// transient state—prevents two Settings views from borrowing one another's
-/// uncommitted font while their retained frames are rasterized out of order.
-/// Empty slots mean "follow the committed renderer's corresponding face".
+/// The exact, view-authored terminal face candidate carried by every
+/// renderer-native specimen run. Kept in the draw IR, not global state, so two
+/// Settings views never borrow each other's uncommitted font when their frames
+/// rasterize out of order. Empty slots follow the committed renderer's face.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SemanticVariation {
     pub(crate) tag: u32,
@@ -177,13 +172,11 @@ pub(crate) struct TerminalSpecimenSpec {
     pub(crate) selection_inactive: bool,
 }
 
-/// THE text funnel: the only constructor of [`DrawPrim::Text`]. Its size is a
-/// [`StepPx`] — mintable only by [`TypeStep`] — so every chrome text site maps
-/// to a named step of the 5-step type scale BY CONSTRUCTION (no orphan
-/// multipliers can compile). `weight` picks the Mono bold sibling; `face`
-/// selects the Mono terminal face vs the native Ui/UiBold proportional face.
-/// The funnel itself is enforced by `every_text_prim_goes_through_the_funnel`
-/// below.
+/// The only constructor of [`DrawPrim::Text`]. Its size is a [`StepPx`],
+/// mintable only by [`TypeStep`], so every chrome text site maps to a named step
+/// of the 5-step type scale. `weight` picks the Mono bold sibling; `face` picks
+/// Mono or the Ui/UiBold face. `every_text_prim_goes_through_the_funnel`
+/// enforces the funnel.
 pub(crate) fn text_prim(
     x: f32,
     baseline: f32,
@@ -218,10 +211,10 @@ pub(crate) enum DrawPrim {
         radius: f32,
         fill: Rgba,
     },
-    /// A concentric three-way gauge: faint full-circle `track` = CAPACITY; a bold
-    /// `sys` arc (fraction, color) = whole-machine usage; an optional thinner, brighter
-    /// `tab` arc nested inside = THIS tab's slice. `dashed` marks an unobtainable inner
-    /// arc (per-tab GPU) so it reads as "—", never a fabricated value.
+    /// A concentric gauge: a faint full-circle `track` (capacity), a bold `sys`
+    /// arc (whole-machine usage) and an optional thinner `tab` arc inside (this
+    /// tab's slice). `dashed` marks an unobtainable inner arc (per-tab GPU) so it
+    /// reads as "—", not a fabricated value.
     Ring {
         cx: f32,
         cy: f32,
@@ -252,18 +245,13 @@ pub(crate) enum DrawPrim {
         r: f32,
         color: Rgba,
     },
-    /// Free-positioned text, `px` tall, positioned by BASELINE (the grid
-    /// standard). `face` selects the render font (see [`TextFace`]): `Mono` is
-    /// the user's terminal font (renderer-resolved primary + real bold sibling;
-    /// embedded DejaVu strictly as per-char coverage fallback —
-    /// `tray_raster::select_chrome_face`) whose figures are tabular by
-    /// construction; `Ui`/`UiBold` are the native proportional system face.
-    /// `weight` picks the Mono bold sibling. Construct only via [`text_prim`],
-    /// which pins the size to the named type scale. (The former `tabular` flag
-    /// was never honored — a mono face is always tabular — and is gone.)
+    /// Free-positioned text, `px` tall, positioned by baseline. `face` selects
+    /// the font (see [`TextFace`]); `Mono` figures are tabular. `weight` picks
+    /// the Mono bold sibling. Construct only via [`text_prim`], which pins the
+    /// size to the type scale.
     Text {
         x: f32,
-        /// The BASELINE y (frame px). Row-centred sites derive it from the
+        /// The baseline y (frame px). Row-centred sites derive it from the
         /// cap-height centering rule (`tray_raster::row_baseline`); mixed-size
         /// runs on one visual row share a single baseline.
         baseline: f32,
@@ -302,20 +290,18 @@ pub(crate) enum DrawPrim {
         offset_y: f32,
     },
     /// One procedural EMBERFORGE patch emitted by `CursorGlow`. The rasterizer
-    /// evaluates aterm-render's real pure-integer fire field, preserving the
-    /// effect's Add/Over blend contract inside the semantic preview.
+    /// evaluates aterm-render's integer fire field, keeping the effect's Add/Over
+    /// blend inside the semantic preview.
     EffectFire {
         patch: aterm_render::FirePatch,
         offset_x: f32,
         offset_y: f32,
     },
-    /// An OUTLINED rounded rect: the stroke of width `width` centered on the rect
-    /// edge. The building block for focus rings, framed inputs, segmented/popup
-    /// borders, swatch contrast rings, hairline separators, drawn icons, and the
-    /// text caret. The rasterizer DEVICE-PX-SNAPS thin (`width <= 1`) axis-aligned
-    /// strokes so 1px rules/carets land on exactly one device row (no smear); a
-    /// rounded (`radius > 0`) outline uses the analytic SDF. A `radius == 0`,
-    /// degenerate (`w` or `h` ~= `width`) stroke is a crisp snapped line/caret.
+    /// An outlined rounded rect: a stroke of `width` centered on the rect edge,
+    /// for focus rings, framed inputs, borders, swatch rings, separators, drawn
+    /// icons and the text caret. Thin (`width <= 1`) axis-aligned strokes snap to
+    /// device pixels; a rounded (`radius > 0`) outline uses the analytic SDF; a
+    /// `radius == 0` degenerate (`w` or `h` ~= `width`) stroke is a snapped line.
     Stroke {
         x: f32,
         y: f32,
@@ -325,9 +311,8 @@ pub(crate) enum DrawPrim {
         width: f32,
         color: Rgba,
     },
-    /// An anti-aliased round-capped segment. Native pictograms use this rather
-    /// than font arrows or staircase rectangles, keeping direction affordances
-    /// crisp and shape-stable at both 1× and Retina scale.
+    /// An anti-aliased round-capped segment, used by native pictograms so
+    /// direction affordances stay crisp at 1× and Retina scale.
     Line {
         x1: f32,
         y1: f32,
@@ -336,32 +321,26 @@ pub(crate) enum DrawPrim {
         width: f32,
         color: Rgba,
     },
-    /// A filled HSV colour DISK (the settings colour-wheel picker, design §7):
-    /// per-pixel polar hue (angle, 0° at 12 o'clock, clockwise — the same angular
-    /// convention as [`DrawPrim::Ring`] arcs) / saturation (radius), all scaled by
-    /// `value`, with a ~1px anti-aliased rim. The ONE vocabulary addition of the
-    /// colour wheel — a raster op in the shared CPU rasterizer, not a toolkit
-    /// widget, so it stays WYSIWYG on both backends.
+    /// A filled HSV colour disk (the settings colour wheel): per-pixel polar hue
+    /// (0° at 12 o'clock, clockwise, as [`DrawPrim::Ring`] arcs) and saturation
+    /// (radius), scaled by `value`, with a ~1px anti-aliased rim. A raster op in
+    /// the shared CPU rasterizer, so it matches on both backends.
     HsvDisk {
         cx: f32,
         cy: f32,
         r: f32,
         value: f32,
     },
-    /// Push a rectangular clip (frame px) onto the rasterizer's clip stack: every
-    /// subsequent prim is AND-clipped to the intersection of all pushed rects until
-    /// the matching [`DrawPrim::ClipPop`]. Required for the scrolling body band, the
-    /// sticky section header, the scrollbar, and pop/menus whose content must not
-    /// spill past a card's rounded corners. Clips are a pure-CPU concern of
-    /// `tray_raster` (both backends composite the one finished buffer).
+    /// Push a rectangular clip (frame px): every later prim is clipped to the
+    /// intersection of all pushed rects until the matching
+    /// [`DrawPrim::ClipPop`]. Used by the scrolling body, sticky headers, the
+    /// scrollbar and menus that must stay inside a card's rounded corners.
     ClipPush { x: f32, y: f32, w: f32, h: f32 },
     /// Pop the most recent [`DrawPrim::ClipPush`]. Unbalanced pops are ignored.
     ClipPop,
-    /// One of the message band's DRAWN ICONS (`aterm_render::BandIcon`,
-    /// rulings 251 and 258) in a `size`-point square at `(x, y)`, in `color` —
-    /// the same signed-distance shapes the band draws, rasterized at the
-    /// device scale, so Settings ▸ Messages' severity column reads in the
-    /// band's own marks (design ruling 262).
+    /// One of the message band's drawn icons (`aterm_render::BandIcon`) in a
+    /// `size`-point square at `(x, y)`, in `color`, rasterized at device scale so
+    /// Settings ▸ Messages' severity column uses the band's own marks.
     BandIcon {
         x: f32,
         y: f32,
@@ -371,10 +350,8 @@ pub(crate) enum DrawPrim {
     },
 }
 
-/// Translate every prim by `(dx, dy)` frame px — the splice uses this to rasterize a
-/// FLOATING card (the About dialog) into a buffer cropped to the card's paint bounds
-/// instead of a full-frame, mostly-transparent one: the prims are emitted in tray
-/// coordinates, then shifted into the cropped buffer's local space.
+/// Translate every prim by `(dx, dy)` frame px. Used to rasterize a floating card
+/// (the About dialog) into a buffer cropped to its paint bounds.
 pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {
     for p in prims {
         match p {
@@ -421,13 +398,9 @@ pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {
     }
 }
 
-/// HSV → RGB (`h` in 0..1 turns, `s`/`v` in 0..1) — shared by the settings colour
-/// wheel's state/marker/commit math AND the per-pixel [`DrawPrim::HsvDisk`] raster
-/// ([`crate::tray_raster`]), so the committed colour and the painted disk can
-/// never disagree.
-/// RGB → HSV (`h` in 0..1 turns, `s`/`v` in 0..1) — the inverse of
-/// [`hsv_to_rgb`], used by the Tab Color wheel to place its marker at the
-/// committed color's polar position on the SAME disk the raster paints.
+/// RGB → HSV (`h` in 0..1 turns, `s`/`v` in 0..1), the inverse of
+/// [`hsv_to_rgb`]; places the Tab Color wheel's marker on the disk the raster
+/// paints.
 pub(crate) fn rgb_to_hsv(rgb: [u8; 3]) -> (f32, f32, f32) {
     let [r, g, b] = rgb.map(|c| f32::from(c) / 255.0);
     let max = r.max(g).max(b);
@@ -450,6 +423,8 @@ pub(crate) fn rgb_to_hsv(rgb: [u8; 3]) -> (f32, f32, f32) {
     (h, s, max)
 }
 
+/// HSV → RGB (`h` in 0..1 turns, `s`/`v` in 0..1), shared by the colour wheel's
+/// commit math and the [`DrawPrim::HsvDisk`] raster so the two never disagree.
 pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
     let h = h.rem_euclid(1.0) * 6.0;
     let f = h.fract();

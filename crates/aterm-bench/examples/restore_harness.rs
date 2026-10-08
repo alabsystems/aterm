@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// RESTORE-BENCH harness (E0): session-restore latency floor. A pane restore in
-// the product is "replay a serialized ANSI snapshot into a fresh engine" (the
-// aterm-wasm `serialize` contract, itself byte-compatible with the daemon's
-// `serialize_ansi`); this harness times exactly that — fresh engine + full
-// replay — so P5's incremental-hydration work and any parser regression on the
-// restore path have a committed before/after number.
+// Session-restore latency harness: a pane restore replays a serialized ANSI
+// snapshot into a fresh engine (the aterm-wasm `serialize` contract), and this
+// times exactly that, fresh engine plus full replay.
 //
-//   cargo run --release -q -p aterm-bench --example restore_harness
+//   targo --unverified run --release -q -p aterm-bench --example restore_harness
 //   -> {"restore_median_hz":...,"restore_median_mbps":...,"payload_bytes":...,
 //       "history_lines":...,"n":...,"warmup":...}
 //
 // The payload is built with the same grid calls (`get_history_line` +
-// `row_ansi_text_screen`) and the same layout as `AtermTerminal::serialize`
-// (history text + CRLF, scroll-off LFs, absolute-CUP viewport paint, cursor
-// restore); the wasm bench (tools/wasm-bench) times the REAL export end-to-end,
-// so this native lane only needs the same workload shape, not the same code.
+// `row_ansi_text_screen`) and layout as `AtermTerminal::serialize`; the wasm
+// bench (tools/wasm-bench) times the real export end to end.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -26,9 +21,8 @@ use aterm_core::terminal::{Terminal, TerminalBuilder};
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
-/// History depth of the snapshot. 10k lines ≈ a healthy working session (and
-/// ~2x the daemon's current 5k default cap, so the number stays meaningful when
-/// P4 forwards the real setting).
+/// History depth of the snapshot: a healthy working session, ~2x the daemon's
+/// 5k default cap.
 const HISTORY_LINES: usize = 10_000;
 
 /// Ring holds source + restored history without truncation, keeping the replay
@@ -116,8 +110,8 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 fn main() {
-    // Source session: fill, then snapshot ONCE (snapshot cost is the serialize
-    // side; this lane fences the RESTORE side).
+    // Source session: fill, then snapshot once (snapshot cost is the serialize
+    // side; this lane fences the restore side).
     let corpus = fill_corpus();
     let mut source = TerminalBuilder::new()
         .size(ROWS, COLS)

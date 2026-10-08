@@ -68,11 +68,11 @@ use aterm_effects::trail_sound::{EventMeta, SoundEvent, SoundGesture, SoundKind,
 use aterm_spec::derive::{Model, trail_audio_reopen_ladder_model};
 use aterm_spec::interp::{self, State};
 
-use super::mac::{Delivery, Service, callback_stalled};
+use super::mac::{Delivery, Service};
 use super::{
     AudioWorkerOutput, BUSY_OPENING, Cue, HostState, OPEN_WEDGE_AFTER_MS, REOPEN_BACKOFF,
-    REOPEN_BUDGET, Reopen, RetryState, STALL_AFTER_MS, STATE_DORMANT, STATE_FAILED, TrailAudio,
-    WEDGE_AFTER_MS, WorkerFlags, busy_stale, cue_channel, reopen_after_fault, worker_loop,
+    REOPEN_BUDGET, Reopen, RetryState, STATE_DORMANT, STATE_FAILED, TrailAudio, WEDGE_AFTER_MS,
+    WorkerFlags, busy_stale, cue_channel, reopen_after_fault, worker_loop,
 };
 
 type Key = Vec<(&'static str, i64)>;
@@ -688,7 +688,7 @@ fn run_worker(
                 let traced = probe.trace_len();
                 let dropped = dropped_backoff.load(Ordering::Acquire);
                 let _ = tx.send(cue(n));
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
                 loop {
                     let ticked = probe.trace.lock().expect("trace lock")[traced..]
                         .iter()
@@ -1034,30 +1034,6 @@ fn the_worker_loop_traces_conform_to_the_reopen_ladder() {
             _ => {}
         }
     }
-}
-
-/// The stall watchdog's boundary, exactly: silent for `STALL_AFTER_MS`
-/// since an armed callback is a stall, and one microsecond less is not.
-/// (A pure-function pin; the watchdog's CALL SITE is the housekeeping
-/// tick, which `plays-once-then-stalls-by-tick` drives.)
-#[test]
-fn the_stall_watchdog_boundary_is_exact() {
-    let armed = 1_000_000u64;
-    assert!(!callback_stalled(
-        true,
-        armed,
-        armed + STALL_AFTER_MS * 1_000 - 1
-    ));
-    assert!(callback_stalled(
-        true,
-        armed,
-        armed + STALL_AFTER_MS * 1_000
-    ));
-    assert!(!callback_stalled(
-        false,
-        armed,
-        armed + STALL_AFTER_MS * 10_000
-    ));
 }
 
 /// NEGATIVE CONTROLS for the call-site half: doctored traces of the

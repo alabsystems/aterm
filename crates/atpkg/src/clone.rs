@@ -303,16 +303,8 @@ mod decisions {
 mod tests {
     use super::*;
 
-    fn scratch(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "atpkg-clone-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(label: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-clone-{label}-"))
     }
 
     #[test]

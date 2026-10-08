@@ -18,13 +18,11 @@
 //! of wrong: it reads as a font-taste problem, not a bug.
 
 /// Every winner must really cover its code point, across the scripts a terminal
-/// actually meets. Skips cleanly where no system fonts resolve (CI images).
+/// actually meets.
 #[test]
 fn a_chain_face_only_wins_a_code_point_it_really_covers() {
-    let Some(mut r) = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
-    else {
-        return;
-    };
+    let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
     // Korean first — the reported break — then the scripts that share the CJK
     // fallback with it, then a spread of other non-Latin writing systems.
@@ -68,10 +66,8 @@ fn a_chain_face_only_wins_a_code_point_it_really_covers() {
 /// it, and they must not be split across faces that disagree about the script.
 #[test]
 fn korean_resolves_consistently_to_a_face_that_has_hangul() {
-    let Some(mut r) = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
-    else {
-        return;
-    };
+    let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
     let mut homes = std::collections::BTreeSet::new();
     let mut resolved = 0usize;

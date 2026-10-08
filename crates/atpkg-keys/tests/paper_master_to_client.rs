@@ -107,9 +107,11 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
         Paths, Verb, plan, preflight, verify_master, write_pins, write_rest,
     };
 
-    let dir = std::env::temp_dir().join("atpkg-keys-e2e/provisioned");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch tree");
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("atpkg-keys-e2e-provisioned-")
+        .tempdir()
+        .expect("scratch tree");
+    let dir = tmp.path().to_path_buf();
     let at = |n: &str| dir.join(n).to_str().expect("utf-8 path").to_string();
 
     // An unarmed anchor file.

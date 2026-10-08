@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CRC-32/ISO-HDLC — the checksum RFC 1952 puts in a gzip trailer.
+//! CRC-32/ISO-HDLC, the checksum in a gzip (RFC 1952) trailer.
 //!
 //! Written as a generator, not a transcription: the 256-entry table is derived
 //! from the reflected polynomial `0xEDB8_8320` in a `const fn`, so the
@@ -36,11 +36,8 @@ const TABLE: [u32; 256] = {
     table
 };
 
-/// A running CRC-32 over a byte stream fed in arbitrary pieces.
-///
-/// `Crc32::new().update(a).update(b).finish()` equals the CRC of `a` followed by
-/// `b` for every split — the property a streaming decoder depends on, since it
-/// folds each chunk as it hands it to the caller.
+/// A running CRC-32 over a byte stream fed in arbitrary pieces; every split
+/// gives the same result as one update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Crc32(u32);
 

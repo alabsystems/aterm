@@ -2,19 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! No-op stubs for the engine's BiDi resolver/sync hooks.
+//! The engine's BiDi invalidation hooks.
 //!
-//! BiDi visual reordering itself lives in the `aterm-bidi` crate and is reached
-//! through the off-by-default `bidi` feature (see `bidi_reorder.rs`). These
-//! `Terminal`-level hooks are where a future stateful render-side resolver cache
-//! would attach. Today invalidation still dirties the presented grid because
-//! BiDi policy changes reorder already-stored rows at snapshot time.
+//! BiDi reordering runs at snapshot time (`bidi_reorder.rs`, feature `bidi`),
+//! so a policy change dirties the whole presented grid. `sync_bidi_from_damage`
+//! is where a render-side resolver cache would attach.
 
 use super::Terminal;
 
 #[allow(
     clippy::unused_self,
-    reason = "stubs mirror the &mut self signatures of the real bidi methods so call sites are identical whether or not the feature is enabled"
+    reason = "a hook with no state yet keeps the &mut self signature its callers use"
 )]
 impl Terminal {
     /// Invalidate the render-time BiDi projection of all stored rows.
@@ -22,9 +20,6 @@ impl Terminal {
         self.grid.damage_mut().mark_full();
     }
 
-    /// No-op: BiDi feature is disabled.
-    pub(super) fn sync_bidi_resolver_from_config(&mut self) {}
-
-    /// No-op: BiDi feature is disabled.
+    /// No-op: no resolver cache to sync.
     pub(super) fn sync_bidi_from_damage(&mut self) {}
 }

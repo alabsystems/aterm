@@ -28,7 +28,8 @@
 //! checkable from a machine that is not Windows.
 #![cfg(unix)]
 
-mod common;
+// The shared fixture half, mounted once by `tests/contract.rs`.
+use crate::common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -38,6 +39,7 @@ use std::time::Duration;
 
 use aterm_verify::disk::{Budget, Reading};
 use aterm_verify::identity::{self, PathState, ToolchainIdentity, TreeState, Tripwire};
+use aterm_verify::plan::StageId;
 use aterm_verify::snapshot;
 use aterm_verify::verdict::MERGE_CONTRACT_SENTENCE;
 use aterm_verify::{Ctx, Mode, Scope, exit, mktemp_dir};
@@ -51,6 +53,11 @@ const IGNORES: &str = "*.log\n/target/\n/target-*/\n/.aterm-verify/\n";
 /// fixture's run that does reach the ladder.
 const FIRST_STAGE: &str = "=== test compile (";
 
+/// The stages of a LEAN ladder: the test compile, where the fixtures' drivers
+/// move the tree or the compiler, and the test run, which the base and the
+/// receipt read their reds from ([`Fixture::ctx_lean`]).
+const LEAN: [StageId; 2] = [StageId::TestCompile, StageId::Test];
+
 /// The test compile's argv, which the fixtures' drivers match on.
 const TEST_COMPILE_ARGV: &str = "--unverified test --workspace --no-fail-fast --no-run --message-format=json-render-diagnostics";
 
@@ -60,8 +67,9 @@ fn path_env() -> std::ffi::OsString {
 
 /// `git` in `dir`, deterministic whatever the developer's own config says:
 /// no signing, no hooks, a fixed identity, no redirects inherited from a hook.
+/// The program is the one PATH names, past macOS's shim ([`common::git_program`]).
 fn git(dir: &Path, args: &[&str]) -> String {
-    let mut c = Command::new("git");
+    let mut c = Command::new(common::git_program());
     c.current_dir(dir).args([
         "-c",
         "user.name=gate",
@@ -100,8 +108,7 @@ fn write(p: &Path, body: &str) {
 }
 
 fn script(p: &Path, body: &str) {
-    write(p, &format!("#!/bin/sh\n{body}\n"));
-    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).expect("chmod");
+    common::standin(p, body);
 }
 
 fn mtime(p: &Path) -> std::time::SystemTime {
@@ -212,8 +219,17 @@ impl Fixture {
 
     /// `targo`: when `<base>/trigger` exists, run `on_build` during the
     /// workspace test compile; answer the smokes either way.
+    ///
+    /// The text embeds the fixture's own paths (the trigger, the listener), so
+    /// written as a script every fixture was a fresh inode, and a fresh inode's
+    /// first exec is a machine-wide macOS assessment, serialised and past a
+    /// minute under the gate's load ([`aterm_verify::standin`]). It is DATA
+    /// behind the one constant stand-in instead ([`common::standin_body`]): one
+    /// inode, assessed once per process. Nothing here needs the file itself to
+    /// move: the tests that rewrite a tool mid-run rewrite `trustc`, which
+    /// stays a [`script`] because its changing stamp is what they trip on.
     fn with_targo(&self, on_build: &str) -> &Self {
-        script(
+        common::standin_body(
             &self.stage2.join("targo"),
             &format!(
                 "case \"$*\" in\n  \"{TEST_COMPILE_ARGV}\")\n    \
@@ -222,6 +238,14 @@ impl Fixture {
                 self.answering_smoke()
             ),
         );
+        self
+    }
+
+    /// A `targo` that answers every argv with exit 0: toolchain discovery wants
+    /// one beside the stage2, and a BARE ladder ([`Self::ctx_bare`]) never runs
+    /// it. One text for every fixture, so it is linked, not first-exec'd.
+    fn with_bare_targo(&self) -> &Self {
+        script(&self.stage2.join("targo"), "exit 0");
         self
     }
 
@@ -245,6 +269,39 @@ impl Fixture {
             Scope::workspace(),
             |_| {},
         )
+    }
+
+    /// [`Self::ctx`] over a LEAN ladder ([`LEAN`], [`Ctx::with_only_stages`]):
+    /// for a law that is decided around the ladder, by the tripwires, the
+    /// receipt or the base, and read from no stage's row but the test run's.
+    /// The other stages answer one skip each instead of spawning: a full
+    /// ladder is some twenty stages' children, the trust lane's and the
+    /// exclusive smoke's among them (measured 2026-10-02 at load 17: a scoped
+    /// ladder took 6 s, of which its two test stages were 0.3 s), and these
+    /// tests ran four or five of them. A skip is a run that cannot claim the
+    /// contract, so a lean run can never be mistaken for the real one. The
+    /// full ladder stays under test in the two tests that read its rows:
+    /// `a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named`
+    /// in process and `the_gate_binary_runs_its_ladder_in_the_snapshot_…`
+    /// through the binary.
+    fn ctx_lean(&self) -> Ctx {
+        self.ctx().with_only_stages(&LEAN)
+    }
+
+    /// [`Self::ctx_at`] over a LEAN ladder ([`Self::ctx_lean`]).
+    fn ctx_at_lean(&self, root: &Path) -> Ctx {
+        self.ctx_at(root).with_only_stages(&LEAN)
+    }
+
+    /// [`Self::ctx`] over a BARE ladder: no stage runs, so every row is the
+    /// seam's own skip ([`Ctx::with_only_stages`]), and what is left is the run
+    /// around the ladder: the header, the arm, the tripwire's last check and the
+    /// receipt. For a law decided by the header or by what the run files, read
+    /// from no stage's row and no child's output; a test that reads the test
+    /// run's reds takes [`Self::ctx_lean`]. A skip cannot claim the contract, so
+    /// a bare run is never mistaken for the real one either.
+    fn ctx_bare(&self) -> Ctx {
+        self.ctx().with_only_stages(&[])
     }
 
     fn run(&self, ctx: &Ctx) -> (String, i32) {
@@ -281,7 +338,7 @@ fn a_tree_that_moves_mid_run_never_claims_the_contract() {
 
     // The same fixture, left alone, is not COULD NOT RUN — so what the moved
     // run reports below is the move and nothing else.
-    let (calm, calm_code) = repo.run(&repo.ctx());
+    let (calm, calm_code) = repo.run(&repo.ctx_lean());
     assert_ne!(calm_code, exit::COULD_NOT_RUN, "{calm}");
     assert!(
         calm.contains(&format!("verify: source {started_on} in place ")),
@@ -290,7 +347,7 @@ fn a_tree_that_moves_mid_run_never_claims_the_contract() {
     assert!(!calm.contains("moved during this run"), "{calm}");
 
     repo.arm_trigger();
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     let moved_to = git(&repo.root, &["rev-parse", "HEAD"]);
     assert_ne!(moved_to, started_on, "the fixture really moved HEAD");
 
@@ -307,7 +364,7 @@ fn a_tree_that_moves_mid_run_never_claims_the_contract() {
         .find(|b| b.starts_with("test ("))
         .expect("the test stage is still printed");
     assert!(
-        test_block.contains("  FAIL  not run: the tree or the toolchain moved"),
+        test_block.contains("  NOT RUN the tree or the toolchain moved"),
         "{test_block}"
     );
     assert!(
@@ -341,7 +398,7 @@ fn gate(
         .arg("--root")
         .arg(root)
         .env("PATH", path)
-        .arg("--skip-gui-smoke")
+        .arg("--no-windows")
         .env("TRUST_STAGE2_BIN", stage2)
         .arg("--machine-lock-dir")
         .arg(fixture_lock(root))
@@ -466,20 +523,39 @@ fn an_edit_hidden_by_an_index_flag_is_verified_not_replaced_by_head() {
     assert!(!tree.dirty.contains_key("c.txt"), "{tree:?}");
 
     // Snapshot: the stages read the edited bytes, and the source says +dirty.
-    script(
+    // Data behind the shared stand-in, as every `targo` here whose text is its
+    // own ([`common::standin_body`]): a text of its own is a first exec, and an
+    // assessment, of its own.
+    common::standin_body(
         &repo.stage2.join("targo"),
         "echo \"child: $* a=$(cat a.txt) b=$(cat b.txt) c=$(cat c.txt)\"; exit 0",
     );
-    let (ladder, code) = gate(&repo.root, &repo.stage2, &[], &path_env());
+    // The MEASURE tier's ladder (`--measure` follows the helper's `--fast`, and
+    // the last mode wins): its stages are three targo children and a skip, so
+    // the run is the sync, the tripwires and the bytes the children read, and
+    // none of the Fast ladder's other spawns, which this law reads no row of.
+    let (ladder, code) = gate(&repo.root, &repo.stage2, &["--measure"], &path_env());
     let head = git(&repo.root, &["rev-parse", "HEAD"]);
     assert!(
         ladder.contains(&format!("verify: source {head}+dirty ")),
         "{code:?}: {ladder}"
     );
+    // Every child read the edited bytes, and there was a child to read them:
+    // a ladder that ran none would pass the loop below for nothing.
+    let children: Vec<&str> = ladder
+        .lines()
+        .filter(|l| l.starts_with("child: "))
+        .collect();
     assert!(
-        ladder.contains(&format!("child: {TEST_COMPILE_ARGV} a=a2 b=b2 c=c1")),
-        "{code:?}: {ladder}"
+        !children.is_empty(),
+        "no stage ran a child: {code:?}: {ladder}"
     );
+    for child in &children {
+        assert!(
+            child.ends_with(" a=a2 b=b2 c=c1"),
+            "a child read other bytes than the caller's: {child}: {ladder}"
+        );
+    }
     assert!(
         !ladder.contains("a=a1") && !ladder.contains("b=b1"),
         "{ladder}"
@@ -511,7 +587,7 @@ fn a_compiler_rewritten_mid_run_never_claims_the_contract() {
         trustc.display()
     ));
 
-    let (calm, calm_code) = repo.run(&repo.ctx());
+    let (calm, calm_code) = repo.run(&repo.ctx_lean());
     assert_ne!(calm_code, exit::COULD_NOT_RUN, "{calm}");
     assert!(
         !calm.contains("verify: source"),
@@ -519,7 +595,7 @@ fn a_compiler_rewritten_mid_run_never_claims_the_contract() {
     );
 
     repo.arm_trigger();
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
     assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
     assert!(
@@ -559,7 +635,7 @@ fn a_spec_checker_repointed_mid_run_never_claims_the_contract() {
     ));
     write(&repo.base.join("shim-two"), &shim(&two));
     let ctx = || {
-        let mut ctx = repo.ctx();
+        let mut ctx = repo.ctx_lean();
         ctx.env.home = home.clone();
         ctx
     };
@@ -588,170 +664,6 @@ fn a_spec_checker_repointed_mid_run_never_claims_the_contract() {
         )),
         "the checker that moved is named: {ladder}"
     );
-}
-
-/// Whole seconds past `bound`: a stand-in that waits this long starts later
-/// than the production bound allows.
-fn past(bound: Duration) -> u64 {
-    bound.as_secs() + 1
-}
-
-/// A stand-in body whose FIRST run waits `secs` before `then`, and whose later
-/// runs answer at once: the shape of a freshly written executable's first exec
-/// on macOS, which waits on the system's assessment of the new file (0.4 s
-/// idle, tens of seconds under load; `aterm-cli`'s `manual.rs` `run_once`).
-fn slow_first_exec(marker: &Path, secs: u64, then: &str) -> String {
-    format!(
-        "if [ ! -e '{m}' ]; then : > '{m}'; sleep {secs}; fi\n{then}",
-        m = marker.display()
-    )
-}
-
-/// A CHECKER SLOW ONLY AT ITS FIRST EXEC IS STILL NAMED WITH ITS VERSION
-/// (2026-09-28). Every stand-in here is a freshly written file, and in a
-/// merge-contract run (`verify-bcbd1f9d0`, run 2) a fresh `ty` stand-in's
-/// checkers line read `no --version answer` where
-/// `a_spec_checker_repointed_mid_run_never_claims_the_contract` asserts `ty 1`
-/// — what a stand-in answering after the 5 s deadline prints. Here the
-/// checker's FIRST exec is deliberately later than that deadline, as macOS's
-/// assessment of a new file makes it under load, and later ones answer at
-/// once. The fixture pays that first exec when it lays the checker
-/// ([`common::lay_checker`], the `run_once` rule), outside the deadline the
-/// run asks it under — a real run's, never a longer one (the review of
-/// 2026-09-28).
-#[test]
-fn a_checker_slow_only_at_its_first_exec_is_named_with_its_version() {
-    let repo = Fixture::new("atv-env-slow-ty");
-    repo.with_targo("true");
-    let ty = common::lay_checker(
-        &repo.base.join("home"),
-        "ty",
-        "9",
-        &slow_first_exec(
-            &repo.base.join("ty.started"),
-            past(aterm_verify::checkers::VERSION_DEADLINE),
-            "echo 'ty slow'",
-        ),
-    );
-
-    let (ladder, code) = repo.run(&repo.ctx());
-    assert_ne!(code, exit::COULD_NOT_RUN, "{ladder}");
-    let ty = fs::canonicalize(&ty).expect("the checker");
-    assert!(
-        ladder.contains(&format!(
-            "verify: checkers ty = {} (atpkg store, ty slow); ",
-            ty.display()
-        )),
-        "the version a checker slow to start answers is named: {ladder}"
-    );
-}
-
-/// AN INSTANCE SLOW ONLY AT ITS FIRST EXEC ADDS NO RED TO A FIXTURE RUN
-/// (2026-09-28). The stand-in `aterm-gui` the smoke launches is written afresh
-/// by every smoke build, and in the same merge-contract run it did not listen
-/// within the smoke's listen wait: `smoke: control socket never started
-/// listening` joined main's receipt as a second red, and
-/// `a_red_main_already_has_is_inherited_and_a_new_one_blocks`, which counts
-/// exactly one, failed. Here the instance's FIRST exec is half as long again
-/// as that wait ([`SOCKET_POLLS`](aterm_verify::smoke_stages::SOCKET_POLLS)
-/// looks, [`POLL_GAP`](aterm_verify::smoke_stages::POLL_GAP) apart), and later
-/// ones start at once. The build that writes it runs it once
-/// ([`common::answering_smoke`]), so the smoke — waiting a real run's wait,
-/// never a longer one (the review of 2026-09-28) — decides exactly what a fast
-/// start decides.
-#[test]
-fn an_instance_slow_only_at_its_first_exec_adds_no_red_to_a_fixture_run() {
-    let repo = Fixture::new("atv-env-slow-gui");
-    repo.git_init();
-    let smoke = repo.answering_smoke();
-    let head = "<<'GUI'\n#!/bin/sh\n";
-    assert!(smoke.contains(head), "the stand-in instance's head moved");
-    let wait = aterm_verify::smoke_stages::POLL_GAP
-        * u32::try_from(aterm_verify::smoke_stages::SOCKET_POLLS).expect("a count");
-    let first = slow_first_exec(&repo.base.join("gui.started"), wait.as_secs() * 3 / 2, "");
-    script(
-        &repo.stage2.join("targo"),
-        &smoke.replacen(head, &format!("{head}{first}\n"), 1),
-    );
-
-    let (ladder, code) = repo.run(&repo.ctx());
-    assert!(!ladder.contains("never started listening"), "{ladder}");
-    assert!(
-        ladder.contains("  ok    smoke: aterm-ctl cursor -> OK 0 0 1 blinking_block"),
-        "{ladder}"
-    );
-    assert_eq!(code, exit::PASS, "{ladder}");
-}
-
-/// Thirty seconds: six times a spec checker's `--version` deadline (5 s) and
-/// three times the smoke's listen wait (a hundred 100 ms polls). A stand-in
-/// this slow on EVERY exec, not only its first, is one a real run gives up on.
-const SLOWER_THAN_A_REAL_RUN_WAITS: u64 = 30;
-
-/// A FIXTURE WAITS NO LONGER THAN A REAL RUN FOR A CHECKER (the review of
-/// 2026-09-28). The fixtures waited 300 s for each checker's `--version`
-/// (f6921d3de's `FIXTURE_PATIENCE`) where a real run waits 5 s, so a checker
-/// that answers late at EVERY exec — what a real regression looks like —
-/// was named with its version in a fixture and without one in a real run.
-/// A fixture now asks under the real run's deadline and pays each stand-in's
-/// FIRST exec before the run instead (the `run_once` rule; see
-/// [`common::checker_home`]).
-#[test]
-fn a_checker_slower_than_a_real_run_allows_is_named_without_a_version() {
-    let repo = Fixture::new("atv-env-late-ty");
-    repo.with_targo("true");
-    let home = repo.base.join("home");
-    let ty = home.join("store/ty/8/bin/ty");
-    script(
-        &ty,
-        &format!("/bin/sleep {SLOWER_THAN_A_REAL_RUN_WAITS}; echo 'ty late'"),
-    );
-    write(
-        &aterm_verify::checkers::store_bin_dir(&home).join("ty"),
-        &format!("#!/bin/sh\nexec '{}' \"$@\"\n", ty.display()),
-    );
-
-    let (ladder, code) = repo.run(&repo.ctx());
-    assert_ne!(code, exit::COULD_NOT_RUN, "{ladder}");
-    let ty = fs::canonicalize(&ty).expect("the checker");
-    assert!(
-        ladder.contains(&format!(
-            "verify: checkers ty = {} (atpkg store, no --version answer); ",
-            ty.display()
-        )),
-        "a checker a real run gives up on is given up on here too: {ladder}"
-    );
-}
-
-/// A FIXTURE WAITS NO LONGER THAN A REAL RUN FOR ITS INSTANCE TO LISTEN (the
-/// review of 2026-09-28). The fixtures waited 300 s where a real run's smoke
-/// waits a hundred 100 ms polls, so a stand-in `aterm-gui` that listens late
-/// at EVERY launch added no red to a fixture run, which a real run reds. A
-/// fixture's smoke now waits what a real run's does, and the stand-in's FIRST
-/// exec is paid by the build that writes it instead
-/// ([`common::answering_smoke`]).
-#[test]
-fn an_instance_listening_later_than_a_real_run_waits_is_red_in_a_fixture() {
-    let repo = Fixture::new("atv-env-late-gui");
-    repo.git_init();
-    let smoke = repo.answering_smoke();
-    let link = "mkdir -p \"$XDG_RUNTIME_DIR/aterm\"\n";
-    assert!(smoke.contains(link), "the stand-in's listen step moved");
-    script(
-        &repo.stage2.join("targo"),
-        &smoke.replacen(
-            link,
-            &format!("sleep {SLOWER_THAN_A_REAL_RUN_WAITS}\n{link}"),
-            1,
-        ),
-    );
-
-    let (ladder, code) = repo.run(&repo.ctx());
-    assert!(
-        ladder.contains("smoke: control socket never started listening"),
-        "an instance a real run reds is red here too: {ladder}"
-    );
-    assert_eq!(code, exit::FAILED, "{ladder}");
 }
 
 /// A caller repo with every kind of uncommitted change a developer has.
@@ -1145,7 +1057,7 @@ fn a_second_gate_on_a_held_snapshot_is_could_not_run() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(exit::COULD_NOT_RUN), "{stdout}");
     assert!(
-        stdout.contains("  FAIL  snapshot: ") && stdout.contains("held by a running gate"),
+        stdout.contains("  NOT RUN snapshot: ") && stdout.contains("held by a running gate"),
         "{stdout}"
     );
     assert!(stdout.contains("VERIFY: COULD NOT RUN"), "{stdout}");
@@ -1406,6 +1318,27 @@ fn a_dirty_submodule_is_mirrored_path_by_path_and_an_edit_inside_it_trips_the_ru
     );
     assert_eq!(s.tree, caller_tree);
     s.finish();
+
+    // Dirt the submodule's own `git status` is told not to show — an edit under
+    // its skip-worktree flag, an untracked file under its own
+    // `status.showUntrackedFiles=no` — still makes the gitlink dirty
+    // (2026-10-02): git's diff left it out, the snapshot carried both as plain
+    // dirt and listed it, and every sync was refused as a checkout "changing
+    // faster than it can be copied".
+    git(&sub, &["checkout", "-q", "--", "lib.txt"]);
+    git(&sub, &["update-index", "--skip-worktree", "lib.txt"]);
+    git(&sub, &["config", "status.showUntrackedFiles", "no"]);
+    write(&sub.join("lib.txt"), "hidden\n");
+    let caller_tree = TreeState::capture(&c.root, &path_env()).expect("caller");
+    assert!(
+        caller_tree.dirty.contains_key(SUB),
+        "{:?}",
+        caller_tree.dirty
+    );
+    let s = c.prepare(&[], None).expect("hidden dirt syncs");
+    assert_eq!(read(&s.root.join(SUB).join("lib.txt")), "hidden\n");
+    assert_eq!(s.tree, caller_tree);
+    s.finish();
 }
 
 fn s_root_of(c: &Caller) -> PathBuf {
@@ -1642,7 +1575,7 @@ fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_r
     let repo = Fixture::new("atv-env-bin");
     repo.git_init();
     // Every targo child reports where it ran and which target dir it inherited.
-    script(
+    common::standin_body(
         &repo.stage2.join("targo"),
         "echo \"child: $* cwd=$(pwd -P) ctd=${CARGO_TARGET_DIR-unset}\"; exit 0",
     );
@@ -1656,7 +1589,7 @@ fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_r
         .args(["--fast", "--root"])
         .arg(&repo.root)
         .env("TRUST_STAGE2_BIN", &repo.stage2)
-        .arg("--skip-gui-smoke")
+        .arg("--no-windows")
         .env("CARGO_TARGET_DIR", repo.base.join("caller-target"))
         .arg("--machine-lock-dir")
         .arg(fixture_lock(&repo.root))
@@ -1695,7 +1628,8 @@ fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_r
 /// THE XTASK VERBS RUN THE HEADER'S COMPILER (2026-09-24). The Formatting stage
 /// (`gate lint --fmt-only`), `gate forge` and `gate cells-foreign` are xtask children,
 /// and xtask calls `Toolchain::discover` again, reading `$TRUST_STAGE2_BIN`
-/// first. Two callers, through the real gate binary:
+/// first. Two callers, each through the three verbs in process and through the
+/// real gate binary:
 ///
 /// * one that exported NOTHING (discovery found the stage2 on PATH): the child
 ///   must still be handed the header's directory — without the pin it had no
@@ -1711,7 +1645,7 @@ fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_r
 fn every_xtask_child_is_handed_the_toolchain_the_header_names() {
     let repo = Fixture::new("atv-env-xtask-tc");
     repo.git_init();
-    script(
+    common::standin_body(
         &repo.stage2.join("targo"),
         "echo \"child: $* tsb=${TRUST_STAGE2_BIN-unset}\"; exit 0",
     );
@@ -1720,22 +1654,79 @@ fn every_xtask_child_is_handed_the_toolchain_the_header_names() {
     std::os::unix::fs::symlink(&repo.stage2, &alias).expect("symlink");
     let home = repo.base.join("empty-home");
     fs::create_dir_all(&home).expect("home");
+    let callers = [("no export", None), ("a symlinked export", Some(&alias))];
+    let handed = format!(" tsb={}", physical.display());
 
-    for (what, export) in [("no export", None), ("a symlinked export", Some(&alias))] {
+    // THE VERBS THEMSELVES, in process, one stage each. The ladder is not what
+    // is under test, so none runs: the three xtask stages are driven through
+    // the same `Ctx` a run builds, over a stage2 that echoes what it was handed
+    // (a full Fast ladder per caller was most of this test's 36 s, and read
+    // these three rows and the header only). This half cannot say that the
+    // binary builds its `Ctx` this way; the run below it does.
+    for (what, export) in callers {
+        let mut path = std::ffi::OsString::from(repo.stage2.as_os_str());
+        path.push(":");
+        path.push(path_env());
+        let env = aterm_verify::EnvSnapshot {
+            path,
+            home: home.clone(),
+            trust_stage2_bin: export.cloned(),
+            ..aterm_verify::EnvSnapshot::default()
+        };
+        let ctx = Ctx::new(
+            repo.root.clone(),
+            Mode::Fast,
+            Scope::workspace(),
+            env,
+            repo.scratch.clone(),
+        )
+        .with_pinned_child_facts(None);
+        assert!(
+            aterm_verify::toolchain_header(&ctx)
+                .starts_with(&format!("verify: toolchain {} ", physical.display())),
+            "{what}: the header names the physical stage2"
+        );
+        for (id, verb) in [
+            (StageId::Formatting, "gate lint --fmt-only"),
+            (StageId::Forge, "gate forge"),
+            (StageId::ForeignCells, "gate cells-foreign"),
+        ] {
+            let spec = aterm_verify::plan::plan(&ctx)
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("{what}: {id:?} is planned"));
+            let rendered = aterm_verify::stages::run_stage(&ctx, &spec).render();
+            let child = rendered
+                .lines()
+                .find(|l| l.contains(&format!("child: --unverified run -q -p xtask -- {verb}")))
+                .unwrap_or_else(|| panic!("{what}: {id:?} ran xtask: {rendered}"));
+            assert!(
+                child.ends_with(&handed),
+                "{what}: the xtask child of {id:?} must be handed the header's directory: {child}"
+            );
+        }
+    }
+
+    // THE BINARY, once per caller, on the MEASURE tier: its three children are
+    // the whole ladder, and what they are handed is what `main` wired, which
+    // is the one thing the half above cannot see. The caller's own export is
+    // read from the process environment here, as a real run reads it.
+    for (what, export) in callers {
         let mut path = std::ffi::OsString::from(repo.stage2.as_os_str());
         path.push(":");
         path.push(path_env());
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm-verify"));
         // Every knob is a flag (the gate reads none from the environment
-        // since 2026-09-24): the smoke skipped, the fixture's own machine lock.
-        cmd.args(["--disk-floor", "0", "--fast", "--root"])
+        // since 2026-09-24): no windows, the fixture's own machine lock.
+        cmd.args(["--disk-floor", "0", "--measure", "--root"])
             .arg(&repo.root)
-            .arg("--skip-gui-smoke")
+            .arg("--no-windows")
             .arg("--machine-lock-dir")
             .arg(fixture_lock(&repo.root))
             .env("PATH", &path)
             .env("HOME", &home)
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("RUSTUP_HOME")
             .env_remove("TRUST_STAGE2_BIN")
             .env_remove("CARGO_TARGET_DIR");
         if let Some(dir) = export {
@@ -1747,14 +1738,20 @@ fn every_xtask_child_is_handed_the_toolchain_the_header_names() {
             ladder.starts_with(&format!("verify: toolchain {} ", physical.display())),
             "{what}: the header names the physical stage2: {ladder}"
         );
-        let fmt = ladder
+        let children: Vec<&str> = ladder
             .lines()
-            .find(|l| l.contains("child: --unverified run -q -p xtask -- gate lint --fmt-only"))
-            .unwrap_or_else(|| panic!("{what}: the Formatting stage ran xtask: {ladder}"));
+            .filter(|l| l.starts_with("child: "))
+            .collect();
         assert!(
-            fmt.ends_with(&format!(" tsb={}", physical.display())),
-            "{what}: the xtask child must be handed the header's directory: {fmt}"
+            !children.is_empty(),
+            "{what}: no stage ran a child: {ladder}"
         );
+        for child in children {
+            assert!(
+                child.ends_with(&handed),
+                "{what}: every child must be handed the header's directory: {child}"
+            );
+        }
     }
 }
 
@@ -1847,6 +1844,8 @@ fn verify_sh_ranks_a_rustup_trust_older_than_the_store_below_it() {
             .arg("--print-toolchain")
             .env("HOME", &home)
             .env("PATH", "/usr/bin:/bin")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("RUSTUP_HOME")
             .env_remove("TRUST_STAGE2_BIN")
             .output()
             .expect("verify.sh runs");
@@ -1947,6 +1946,8 @@ fn the_contract_probe_by_hand_ranks_a_rustup_trust_older_than_the_store_below_it
             .arg("--print-toolchain")
             .env("HOME", &t.home)
             .env("PATH", "/usr/bin:/bin")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("RUSTUP_HOME")
             .env_remove("TRUST_STAGE2_BIN");
         if let Some(dir) = explicit {
             cmd.env("TRUST_STAGE2_BIN", dir);
@@ -2074,27 +2075,32 @@ fn a_sync_never_writes_through_a_symlink_in_the_snapshot() {
 /// tree is read, so an UNTRACKED path with the same `(dev, ino)` is this run's
 /// log rather than a source change. This test drives the real binary, because
 /// the redirect is the point: an in-process `Vec<u8>` ladder cannot have one.
+///
+/// WHY ONE STAGE IS ENOUGH (2026-10-02). `--measure --scope crate-x` plans one
+/// stage, the GUI smoke, which `--no-windows` answers with a named skip: no
+/// driver stand-in, no smoke and no child at all. The Fast ladder this test
+/// used to run was never what it witnessed: a snapshot's tripwire watches the
+/// snapshot's root, and the caller's log is excluded before the sync and never
+/// copied into it, so the log's growth down a long ladder was already not what
+/// the exit read, and the test was weaker than its comment. What decides it
+/// is before and after the stages — the exclusion's note, the sync that must
+/// not read the log, the final check — and a one-stage ladder reaches all
+/// three. The Fast ladder through the binary stays under test in
+/// `the_gate_binary_runs_its_ladder_in_the_snapshot_…`.
 #[test]
 fn a_run_whose_ladder_is_redirected_into_the_checkout_still_decides() {
     let repo = Fixture::new("atv-env-ownlog");
-    repo.git_init().with_targo("true");
-    // Every run of the gate binary verifies a SNAPSHOT (2026-09-27), and the
-    // fixture's driver stand-ins are ignored files a snapshot does not carry:
-    // without them every driven row is COULD NOT RUN and the exit below could
-    // not tell a moving tree from a missing driver. Tracked, they travel.
-    git(&repo.root, &["add", "-f", "target-drivers"]);
-    git(
-        &repo.root,
-        &["commit", "-q", "-m", "the driver stand-ins, tracked"],
-    );
+    repo.git_init();
+    // The toolchain discovery wants a `targo` beside the stage2; nothing runs it.
+    script(&repo.stage2.join("targo"), "exit 0");
     let log = repo.root.join("gate-run.out");
 
     let status = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
         .args(["--disk-floor", "0"])
-        .args(["--fast", "--root"])
+        .args(["--measure", "--scope", "crate-x", "--root"])
         .arg(&repo.root)
         .env("PATH", path_env())
-        .arg("--skip-gui-smoke")
+        .arg("--no-windows")
         .arg("--machine-lock-dir")
         .arg(fixture_lock(&repo.root))
         // The gate's OWN copy off: this test is about the caller's redirect.
@@ -2138,7 +2144,7 @@ fn a_churning_untracked_file_trips_the_run_and_the_label_names_the_remedy() {
         .with_targo(&format!("echo churn >> '{}'", scratch.display()));
     repo.arm_trigger();
 
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
     assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
     assert!(ladder.contains("peer-scratch.out"), "{ladder}");
@@ -2161,7 +2167,7 @@ fn a_tracked_file_moving_gets_no_log_remedy() {
         .with_targo("echo 'edited mid-run' >> Cargo.toml");
     repo.arm_trigger();
 
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
     assert!(ladder.contains("Cargo.toml"), "{ladder}");
     assert!(
@@ -2307,7 +2313,8 @@ fn a_verdict_that_could_not_be_written_files_no_receipt() {
     repo.git_init().with_targo("true");
     let head = git(&repo.root, &["rev-parse", "HEAD"]);
     let mut out = GoneAtTheVerdict(Vec::new());
-    let err = aterm_verify::run(&repo.ctx(), &mut out).expect_err("the verdict was not written");
+    let err =
+        aterm_verify::run(&repo.ctx_lean(), &mut out).expect_err("the verdict was not written");
     assert!(err.to_string().contains("the reader went away"), "{err}");
     let ladder = String::from_utf8_lossy(&out.0);
     assert!(ladder.contains("=== test"), "the ladder ran: {ladder}");
@@ -2317,7 +2324,7 @@ fn a_verdict_that_could_not_be_written_files_no_receipt() {
         "a verdict nobody read left a receipt:\n{ladder}"
     );
     // The control: the same run, read, files one.
-    let (_ladder, _code) = repo.run(&repo.ctx());
+    let (_ladder, _code) = repo.run(&repo.ctx_lean());
     assert!(store.join(&head).exists(), "a read verdict is recorded");
 }
 
@@ -2332,7 +2339,9 @@ fn a_verdict_that_could_not_be_written_files_no_receipt() {
 #[test]
 fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
     let repo = Fixture::new("atv-env-measure");
-    repo.git_init().with_targo("true");
+    // The two MEASURE children (the release build, the paint and spin run) are
+    // answered with exit 0 by any targo, and the Fast run below runs none.
+    repo.git_init().with_bare_targo();
     let head = git(&repo.root, &["rev-parse", "HEAD"]);
     let tree = git(&repo.root, &["rev-parse", "HEAD^{tree}"]);
     let store = aterm_verify::receipt::dir(&repo.root).expect("the receipt store");
@@ -2349,16 +2358,17 @@ fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
     assert_eq!(code, exit::PASS, "{ladder}");
     assert!(
         ladder.contains(&format!(
-            "verify: base — {}: every red counts (the absolute rule)",
+            "verify: base — {}: every red counts\n",
             aterm_verify::MEASURE_IS_ABSOLUTE
         )),
         "{ladder}"
     );
     assert!(
-        ladder.contains(
+        ladder.contains(&format!(
             "verify: MEASURE tier — NOT MEASURED: `gui typing-pacing smoke` skipped: gui smoke \
-             (--skip-gui-smoke)"
-        ),
+             ({})",
+            aterm_verify::plan::NO_WINDOWS_REASON
+        )),
         "{ladder}"
     );
     assert!(!ladder.contains(FIRST_STAGE), "{ladder}");
@@ -2380,7 +2390,10 @@ fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
         );
     }
 
-    let (ladder, _) = repo.run(&repo.ctx());
+    // The merge-contract run after it is BARE: what is asked of it is the key it
+    // files and the measurement it leaves, decided by `write_receipt` after any
+    // ladder; a full Fast ladder (the stages' children, the smoke) read none of it.
+    let (ladder, _) = repo.run(&repo.ctx_bare());
     assert!(!ladder.contains("verify: MEASURE tier —"), "{ladder}");
     assert_eq!(read(&head).mode, "fast");
     assert_eq!(
@@ -2388,97 +2401,6 @@ fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
         measured,
         "the merge-contract run left the measurement standing"
     );
-}
-
-/// THE SAME BYTES UNDER ANOTHER COMMIT ID FIND THE RUN'S RECEIPT, FROM ANY
-/// WORKTREE (2026-09-26). A run's receipt is filed under `HEAD^{tree}` as
-/// well as HEAD, in the git common dir, so each of the three ways a gated tree
-/// reaches a new commit id finds it by that tree: a MESSAGE-ONLY AMEND (the
-/// `Co-Authored-By` line added after the run), an IDENTICAL-TREE REBASE onto
-/// another parent, and a checkout of either from a SIBLING WORKTREE. Each new
-/// id has no receipt of its own — the negative control that keyed by commit
-/// alone, as before, they vouched for nothing. The reader's half, the cutter
-/// counting such a commit as gated, is pinned in `aterm-release`
-/// (`gates::published_commit_tests`).
-#[test]
-fn a_reworded_rebased_or_sibling_commit_finds_the_runs_receipt_by_its_tree() {
-    let repo = Fixture::new("atv-env-receipt-tree");
-    repo.git_init().with_targo("true");
-    let head = git(&repo.root, &["rev-parse", "HEAD"]);
-    let tree_sha = git(&repo.root, &["rev-parse", "HEAD^{tree}"]);
-    repo.run(&repo.ctx());
-    let store = aterm_verify::receipt::dir(&repo.root).expect("the receipt store");
-    let by_tree = |root: &Path, commit: &str| {
-        let tree = aterm_verify::receipt::tree_of(root, commit).expect("a tree");
-        let dir = aterm_verify::receipt::dir(root).expect("the store");
-        fs::read_to_string(dir.join(aterm_verify::receipt::tree_key(&tree)))
-            .ok()
-            .and_then(|t| aterm_verify::receipt::Receipt::parse(&t))
-    };
-    assert!(store.join(&head).is_file(), "the run left its receipt");
-
-    // A message-only amend: a new id over the same tree.
-    git(
-        &repo.root,
-        &["commit", "-q", "--amend", "-m", "fixture, reworded"],
-    );
-    let amended = git(&repo.root, &["rev-parse", "HEAD"]);
-    assert_ne!(amended, head);
-    assert!(
-        !store.join(&amended).exists(),
-        "no receipt under the new id"
-    );
-    let r = by_tree(&repo.root, &amended).expect("found by its tree");
-    assert_eq!(
-        (r.head.as_str(), r.tree.as_deref()),
-        (head.as_str(), Some(tree_sha.as_str()))
-    );
-
-    // An identical-tree rebase: the same tree over another parent.
-    let empty = git(&repo.root, &["hash-object", "-t", "tree", "/dev/null"]);
-    let base = git(&repo.root, &["commit-tree", &empty, "-m", "another base"]);
-    let rebased = git(
-        &repo.root,
-        &[
-            "commit-tree",
-            &tree_sha,
-            "-p",
-            &base,
-            "-m",
-            "fixture, rebased",
-        ],
-    );
-    assert!(!store.join(&rebased).exists());
-    assert_eq!(
-        by_tree(&repo.root, &rebased).map(|r| r.head),
-        Some(head.clone())
-    );
-
-    // A sibling worktree sitting at the rebased commit reads the same store.
-    let linked = repo.base.join("linked");
-    git(
-        &repo.root,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "--detach",
-            linked.to_str().expect("utf-8"),
-            &rebased,
-        ],
-    );
-    assert_eq!(
-        aterm_verify::receipt::dir(&linked).expect("its store"),
-        store
-    );
-    assert_eq!(by_tree(&linked, &rebased).map(|r| r.head), Some(head));
-
-    // The control: a commit with other bytes finds nothing by its tree.
-    write(&repo.root.join("other.txt"), "other bytes\n");
-    git(&repo.root, &["add", "other.txt"]);
-    git(&repo.root, &["commit", "-q", "-m", "other bytes"]);
-    let other = git(&repo.root, &["rev-parse", "HEAD"]);
-    assert_eq!(by_tree(&repo.root, &other), None);
 }
 
 /// A NARROWED RUN SAYS SO AT ITS START (2026-09-26), not only in the verdict
@@ -2511,7 +2433,7 @@ fn a_narrowed_run_says_so_before_its_first_stage_and_its_receipt_names_its_base(
         );
     };
 
-    let mut changed = repo.ctx();
+    let mut changed = repo.ctx_lean();
     changed.scope = Scope::changed("origin/main", Vec::new(), true);
     let (ladder, _) = repo.run(&changed);
     before_first_stage(
@@ -2524,13 +2446,13 @@ fn a_narrowed_run_says_so_before_its_first_stage_and_its_receipt_names_its_base(
         ("changed:origin/main", false)
     );
 
-    let mut scoped = repo.ctx();
+    let mut scoped = repo.ctx_lean();
     scoped.scope = Scope::from_option(Some("crate-x".into()));
     let (ladder, _) = repo.run(&scoped);
     before_first_stage(&ladder, "verify: NARROWED — scoped to -p crate-x");
     assert_eq!(standing().scope, "crate:crate-x");
 
-    let (ladder, _) = repo.run(&repo.ctx());
+    let (ladder, _) = repo.run(&repo.ctx_lean());
     assert!(
         !ladder.contains("verify: NARROWED"),
         "a whole-tree run: {ladder}"
@@ -2549,7 +2471,9 @@ fn a_narrowed_run_says_so_before_its_first_stage_and_its_receipt_names_its_base(
 #[test]
 fn a_dirty_or_narrowed_run_leaves_the_commits_whole_tree_receipt_standing() {
     let repo = Fixture::new("atv-env-receipt-keep");
-    repo.git_init().with_targo("true");
+    // Every run here is bare: each law is a header line or a receipt, decided
+    // around a ladder whose rows none of them reads.
+    repo.git_init().with_bare_targo();
     let head = git(&repo.root, &["rev-parse", "HEAD"]);
     let path = aterm_verify::receipt::dir(&repo.root)
         .expect("the receipt store")
@@ -2572,7 +2496,7 @@ fn a_dirty_or_narrowed_run_leaves_the_commits_whole_tree_receipt_standing() {
     // A --changed run over uncommitted work verified bytes no commit holds:
     // it writes nothing at all, whatever stands…
     write(&repo.root.join("notes.txt"), "not committed\n");
-    let mut dirty = repo.ctx();
+    let mut dirty = repo.ctx_bare();
     dirty.scope = Scope::changed("HEAD", Vec::new(), true);
     let (ladder, _) = repo.run(&dirty);
     assert!(
@@ -2587,7 +2511,7 @@ fn a_dirty_or_narrowed_run_leaves_the_commits_whole_tree_receipt_standing() {
     fs::remove_file(repo.root.join("notes.txt")).expect("clean again");
 
     // A clean --scope run at the same commit.
-    let mut scoped = repo.ctx();
+    let mut scoped = repo.ctx_bare();
     scoped.scope = Scope::from_option(Some("crate-x".into()));
     let (ladder, _) = repo.run(&scoped);
     assert!(
@@ -2650,7 +2574,7 @@ fn a_volume_under_the_requirement_is_could_not_run_before_any_stage_and_leaves_n
         "{line}"
     );
     assert!(
-        ladder.contains("\n=== disk preflight ===\n  FAIL  disk: "),
+        ladder.contains("\n=== disk preflight ===\n  NOT RUN disk: "),
         "{ladder}"
     );
     assert!(
@@ -2676,27 +2600,6 @@ fn a_volume_under_the_requirement_is_could_not_run_before_any_stage_and_leaves_n
     )
     .expect("the prior receipt is still there");
     assert_eq!(aterm_verify::receipt::Receipt::parse(&text), Some(prior));
-}
-
-/// A volume with room changes nothing but the line that records the reading:
-/// the preflight costs one `df`, one `du` and one header line.
-#[test]
-fn a_volume_with_room_runs_the_ladder_with_the_reading_on_record() {
-    let repo = Fixture::new("atv-env-disk-ok");
-    repo.git_init().with_targo("true");
-    let (ladder, code) = repo.run(&repo.ctx().with_disk_floor(0));
-    assert_ne!(code, exit::COULD_NOT_RUN, "{ladder}");
-    let line = ladder
-        .lines()
-        .find(|l| l.starts_with("verify: disk "))
-        .unwrap_or_else(|| panic!("no disk line: {ladder}"));
-    assert!(
-        line.contains(" free on the volume holding ")
-            && line.ends_with("; need 0.0 GiB (--disk-floor: exactly this, no estimate)"),
-        "{line}"
-    );
-    assert!(!ladder.contains("disk preflight"), "{ladder}");
-    assert!(ladder.contains(FIRST_STAGE), "{ladder}");
 }
 
 /// The fixture as a SNAPSHOT of a separate caller, with 256 KiB of warm lanes
@@ -2927,10 +2830,11 @@ impl Fixture {
         // leaves the run's receipt naming no compiler commit, so main's could
         // serve no branch as a base.
         common::run_once(&trustc, "-vV");
-        script(
+        // The targo is data behind the one shared stand-in, as [`Self::with_targo`]'s.
+        common::standin_body(
             &self.stage2.join("targo"),
             &format!(
-                "case \"$*\" in\n  *\"--tests \"*\"-- --skip measuring::\"*)\n    \
+                "case \"$*\" in\n  *\"--tests \"*\"-- -Zunstable-options --report-time --skip measuring::\"*)\n    \
                  if [ -e '{out}' ]; then cat '{out}'; exit 101; fi ;;\nesac\n{smoke}",
                 out = self.base.join("tests.out").display(),
                 smoke = self.answering_smoke()
@@ -3005,8 +2909,7 @@ fn short(sha: &str) -> &str {
 ///    inherited (red on main since <main>)`, exit 0 — this fixture skips the
 ///    GUI smoke, so no contract — and the receipt names the base and the
 ///    inherited id, carrying main's since.
-/// 3. The same test failing DIFFERENTLY is new, and so is a second test
-///    beside the inherited one: exit 1.
+/// 3. A second test beside the inherited one is new: exit 1.
 /// 4. Main's red made 25 hours old is past the cap: it blocks again.
 #[test]
 fn a_red_main_already_has_is_inherited_and_a_new_one_blocks() {
@@ -3017,12 +2920,12 @@ fn a_red_main_already_has_is_inherited_and_a_new_one_blocks() {
     let id = "-p x --test probe -- probe";
 
     repo.tests_fail(&[("probe", "lock held by pid 4411")]);
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert_eq!(code, exit::FAILED, "{ladder}");
     assert!(
         ladder.contains(&format!(
             "verify: base — {} is itself on origin/main: a run on main has no base to inherit \
-             from: every red counts (the absolute rule)",
+             from: every red counts\n",
             short(&main)
         )),
         "{ladder}"
@@ -3035,33 +2938,38 @@ fn a_red_main_already_has_is_inherited_and_a_new_one_blocks() {
         (id, main.as_str())
     );
     assert_eq!((on_main.base, on_main.inherited.len()), (None, 0));
-    // THE MACHINE'S LOAD RIDES WITH THE VERDICT (2026-09-26): where the host
-    // answers a load average, every stage's `time` line names it and the
-    // receipt holds one `load` line per stage — the test stage's among them.
-    if aterm_verify::exec::load_average().is_some() {
-        let times: Vec<&str> = ladder
-            .lines()
-            .filter(|l| l.starts_with("  time  "))
-            .collect();
-        assert!(!times.is_empty(), "{ladder}");
-        for t in &times {
-            assert!(t.contains("; load ") && t.ends_with(" cores)"), "{t}");
-        }
-        assert_eq!(on_main.loads.len(), times.len(), "{:?}", on_main.loads);
-        assert!(
-            on_main
-                .loads
-                .iter()
-                .any(|(l, title)| title == "test (--workspace)" && l.cores > 0),
-            "{:?}",
-            on_main.loads
-        );
+    // THE MACHINE'S LOAD RIDES WITH THE VERDICT (2026-09-26): every stage's
+    // `time` line names it and the receipt holds one `load` line per stage —
+    // the test stage's among them. This file is unix-pinned and every unix host
+    // answers `getloadavg`, so the host's answer is asserted, not branched on:
+    // a reader that returned `None` would otherwise skip the whole block and
+    // this would pass having checked nothing.
+    assert!(
+        aterm_verify::exec::load_average().is_some(),
+        "a unix host answers a one-minute load average"
+    );
+    let times: Vec<&str> = ladder
+        .lines()
+        .filter(|l| l.starts_with("  time  "))
+        .collect();
+    assert!(!times.is_empty(), "{ladder}");
+    for t in &times {
+        assert!(t.contains("; load ") && t.ends_with(" cores)"), "{t}");
     }
+    assert_eq!(on_main.loads.len(), times.len(), "{:?}", on_main.loads);
+    assert!(
+        on_main
+            .loads
+            .iter()
+            .any(|(l, title)| title == "test (--workspace)" && l.cores > 0),
+        "{:?}",
+        on_main.loads
+    );
 
     // 2. The branch, the same failure told differently in its noise.
     let feature = repo.branch_commit("a change that breaks nothing");
     repo.tests_fail(&[("probe", "lock held by pid 97")]);
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert!(
         ladder.contains(&format!(
             "verify: base {} (the merge-base with origin/main) — main's receipt {} lists 1 red(s)",
@@ -3101,22 +3009,15 @@ fn a_red_main_already_has_is_inherited_and_a_new_one_blocks() {
     );
     assert!(!judged.merge_contract);
 
-    // 3. Failing differently, and a second red beside the inherited one.
-    repo.tests_fail(&[("probe", "lock lost")]);
-    let (ladder, code) = repo.run(&repo.ctx());
-    assert_eq!(code, exit::FAILED, "{ladder}");
-    assert!(
-        ladder.contains("1 new, 0 inherited, judged against"),
-        "{ladder}"
-    );
-    assert!(
-        ladder.contains(&format!(
-            "      - {id} — red on main too, but failing differently"
-        )),
-        "{ladder}"
-    );
+    // 3. A second red beside the inherited one. (The same test failing
+    // DIFFERENTLY is new too, "red on main too, but failing differently": that
+    // arm is asserted where it is decided, by `differential::tests::
+    // a_finding_is_inherited_only_on_the_same_id_and_hash_inside_the_cap` and,
+    // over the real log parser, `a_test_failing_with_other_values_is_new`, and
+    // its wording by `verdict::tests::a_judged_failure_names_new_expired_and_
+    // inherited_reds_apart`; a run of it here read nothing they do not.)
     repo.tests_fail(&[("probe", "lock held by pid 1"), ("fresh", "a new bug")]);
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert_eq!(code, exit::FAILED, "{ladder}");
     assert!(
         ladder.contains("1 new, 1 inherited (red on main since"),
@@ -3151,7 +3052,7 @@ fn a_red_main_already_has_is_inherited_and_a_new_one_blocks() {
         fs::write(&path, aged).expect("write");
     }
     repo.tests_fail(&[("probe", "lock held by pid 5")]);
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert_eq!(code, exit::FAILED, "{ladder}");
     assert!(
         ladder.contains("0 new, 0 inherited, 1 red on main past the 24 h cap"),
@@ -3177,12 +3078,12 @@ fn without_a_base_receipt_every_red_counts_and_the_run_says_why() {
     repo.git_init().with_failing_tests();
     repo.tests_fail(&[("probe", "lock held")]);
 
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert_eq!(code, exit::FAILED, "{ladder}");
     assert!(
         ladder.contains(
             "verify: base — this repository has no origin/main to be judged against: every red \
-             counts (the absolute rule)"
+             counts\n"
         ),
         "{ladder}"
     );
@@ -3198,7 +3099,7 @@ fn without_a_base_receipt_every_red_counts_and_the_run_says_why() {
     let store = aterm_verify::receipt::dir(&repo.root).expect("store");
     fs::remove_dir_all(&store).expect("empty the store");
     let feature = repo.branch_commit("a change");
-    let (ladder, code) = repo.run(&repo.ctx());
+    let (ladder, code) = repo.run(&repo.ctx_lean());
     assert_eq!(code, exit::FAILED, "{ladder}");
     assert!(
         ladder.contains(&format!(
@@ -3235,7 +3136,7 @@ fn the_base_line_names_a_main_commit_to_merge_only_when_it_is_newer_than_the_bas
     repo.tests_fail(&[("probe", "lock held")]);
     let old_main = git(&repo.root, &["rev-parse", "HEAD"]);
     // A receipt for the first main commit, then main moves on without one.
-    let (ladder, _) = repo.run(&repo.ctx());
+    let (ladder, _) = repo.run(&repo.ctx_lean());
     assert!(ladder.contains("verify: base — "), "{ladder}");
     repo.with_origin();
     write(&repo.root.join("README"), "main moves");
@@ -3250,7 +3151,7 @@ fn the_base_line_names_a_main_commit_to_merge_only_when_it_is_newer_than_the_bas
 
     // A branch off the new main: the only receipt is its base's ancestor.
     repo.branch_commit("a change");
-    let (ladder, _) = repo.run(&repo.ctx());
+    let (ladder, _) = repo.run(&repo.ctx_lean());
     assert!(
         ladder.contains(&format!(
             "verify: base — no usable receipt for the base {}",
@@ -3263,7 +3164,7 @@ fn the_base_line_names_a_main_commit_to_merge_only_when_it_is_newer_than_the_bas
     // The positive control: main's newer commit has a receipt, and a branch
     // off the older one (its receipt gone) is told to merge it.
     git(&repo.root, &["switch", "-q", "main"]);
-    let _ = repo.run(&repo.ctx());
+    let _ = repo.run(&repo.ctx_lean());
     let store = aterm_verify::receipt::dir(&repo.root).expect("store");
     let old_tree = git(&repo.root, &["rev-parse", &format!("{old_main}^{{tree}}")]);
     for key in [old_main.clone(), aterm_verify::receipt::tree_key(&old_tree)] {
@@ -3273,7 +3174,7 @@ fn the_base_line_names_a_main_commit_to_merge_only_when_it_is_newer_than_the_bas
     write(&repo.root.join("README"), "an old change");
     git(&repo.root, &["add", "README"]);
     git(&repo.root, &["commit", "-q", "-m", "an old change"]);
-    let (ladder, _) = repo.run(&repo.ctx());
+    let (ladder, _) = repo.run(&repo.ctx_lean());
     assert!(
         ladder.contains(&format!(
             "; {HINT} {} — merge it to be judged against it",
@@ -3301,7 +3202,7 @@ fn a_baseline_publishes_mains_reds_and_another_clone_is_judged_against_them() {
     // In process, in place: the fixture's driver stand-ins are ignored files
     // a snapshot does not carry, and every run of the gate binary verifies a
     // snapshot (2026-09-27). The flag itself is `cli`'s to parse.
-    let (ladder, code) = repo.run(&repo.ctx().with_baseline(true));
+    let (ladder, code) = repo.run(&repo.ctx_lean().with_baseline(true));
     assert_eq!(
         code,
         exit::FAILED,
@@ -3345,16 +3246,6 @@ fn a_baseline_publishes_mains_reds_and_another_clone_is_judged_against_them() {
             .unwrap_or(true),
         "the clone's store is its own"
     );
-    let copied = Command::new("cp")
-        .arg("-R")
-        .arg(repo.root.join("target-drivers"))
-        .arg(clone.join("target-drivers"))
-        .status()
-        .expect("cp runs");
-    assert!(
-        copied.success(),
-        "the driver stand-ins, ignored, beside the clone's tree"
-    );
     git(&clone, &["switch", "-q", "-c", "feature"]);
     write(&clone.join("README"), "elsewhere\n");
     git(&clone, &["add", "README"]);
@@ -3363,7 +3254,7 @@ fn a_baseline_publishes_mains_reds_and_another_clone_is_judged_against_them() {
         &["commit", "-q", "-m", "a change on another machine"],
     );
     repo.tests_fail(&[("probe", "lock held by pid 3")]);
-    let (ladder, code) = repo.run(&repo.ctx_at(&clone));
+    let (ladder, code) = repo.run(&repo.ctx_at_lean(&clone));
     assert!(
         ladder.contains(&format!(
             "verify: base {} (the merge-base with origin/main) — main's note {} lists 1 red(s)",
@@ -3383,7 +3274,7 @@ fn a_baseline_publishes_mains_reds_and_another_clone_is_judged_against_them() {
 
     // Refusals: a branch commit is not main's, and a dirty tree gets no receipt.
     let feature = repo.branch_commit("not main");
-    let (ladder, code) = repo.run(&repo.ctx().with_baseline(true));
+    let (ladder, code) = repo.run(&repo.ctx_lean().with_baseline(true));
     assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
     assert!(
         ladder.contains(&format!(
@@ -3402,7 +3293,7 @@ fn a_baseline_publishes_mains_reds_and_another_clone_is_judged_against_them() {
     );
     git(&repo.root, &["switch", "-q", "--detach", &main]);
     write(&repo.root.join("README"), "uncommitted\n");
-    let (ladder, code) = repo.run(&repo.ctx().with_baseline(true));
+    let (ladder, code) = repo.run(&repo.ctx_lean().with_baseline(true));
     assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
     assert!(
         ladder.contains("--baseline refused: the tree has uncommitted work"),

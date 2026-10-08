@@ -1,47 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Runtime class creation — the capability `metal/ffi.rs` deliberately never
-//! needed, and the one the objc2 cluster was being paid for.
+//! Runtime class creation: `objc_allocateClassPair`, `class_addMethod`,
+//! `class_addIvar`, `class_addProtocol`, `objc_registerClassPair`, plus
+//! `objc_msgSendSuper` for `[super …]`.
 //!
-//! `objc_allocateClassPair` / `class_addMethod` / `class_addIvar` /
-//! `class_addProtocol` / `objc_registerClassPair` had ZERO uses anywhere in the
-//! tree before this module. Everything aterm-gui's seven `declare_class!` sites
-//! and winit's five actually do decomposes into exactly those five calls plus
-//! `objc_msgSendSuper`.
+//! What the declared classes need, and so what this provides:
 //!
-//! # What the real sites need, measured rather than guessed
+//! * Any superclass (`NSObject`, `NSView`, `NSWindow`, `NSApplication`,
+//!   `NSResponder` in practice).
+//! * One Rust value per instance (`type Ivars = T`), dropped correctly, rather
+//!   than per-field ivars.
+//! * An automatic `dealloc` that drops the ivars and calls `[super dealloc]`;
+//!   no user-facing `dealloc` hook. [`IvarSlot`]'s flag keeps that drop sound
+//!   if `dealloc` runs before the ivars were written.
+//! * Protocol claims via `class_addProtocol`.
+//! * Superclass sends through [`crate::msg_super`] and
+//!   [`ObjcSuper`](crate::ObjcSuper).
 //!
-//! Read from the seven sites in `aterm-gui` (33 methods) and the five in
-//! winit's macOS backend (71 methods):
-//!
-//! * **Superclasses**: only `NSObject` (5 sites) and `NSView` (2 sites) in
-//!   aterm-gui; winit adds `NSWindow`, `NSApplication` and `NSResponder`.
-//!   [`ClassBuilder`] takes any class, so this is not a constraint.
-//! * **Ivars**: every one of the seven has exactly ONE `type Ivars = T`, where
-//!   `T` is an ordinary Rust type — `EventLoopProxy<Wake>` for four of them, a
-//!   plain struct of `Cell`/`RefCell`/`Retained`/`String` for the other three.
-//!   So the requirement is "store one arbitrary Rust value per instance and
-//!   drop it correctly", NOT objc2's per-field ivar machinery.
-//! * **`dealloc`**: NOT ONE of the seven writes a `dealloc`. What they rely on
-//!   is objc2's *generated* ivar drop. So this module owes an automatic
-//!   `dealloc` that drops the Rust ivars and calls `[super dealloc]`, and owes
-//!   no user-facing `dealloc` hook at all. (See [`crate::declare_class!`] for
-//!   the flag that makes that drop sound even if `dealloc` runs before the
-//!   ivars were written.)
-//! * **Protocol conformance**: `NSObjectProtocol` (a marker objc2 needs for its
-//!   own trait bounds and which the runtime already gives every `NSObject`
-//!   subclass), `NSMenuDelegate` (1 site) and `NSToolbarDelegate` (1 site).
-//!   That is the whole list — `class_addProtocol` twice.
-//! * **Ivars are dropped on whatever thread performs the LAST RELEASE** — see
-//!   the crate's soundness list (`S3`). `register` hands the object to
-//!   Objective-C, and nothing in the runtime promises the final `release` comes
-//!   from the thread that created it, so a Rust destructor can run on a foreign
-//!   thread with no `Send` bound in sight. objc2 0.5 has the identical hole; it
-//!   is why 0.6 introduced `MainThreadOnly`. Unclosed here, and NAMED.
-//! * **Superclass sends**: four sites, three selectors — `init`,
-//!   `initWithFrame:` and `updateTrackingAreas`. [`crate::msg_super`] plus
-//!   [`ObjcSuper`](crate::ObjcSuper) covers all of them.
+//! Ivars are dropped on whatever thread performs the last release (`S3` in the
+//! crate docs): nothing in the runtime ties the final `release` to the creating
+//! thread, so a Rust destructor can run on a foreign thread with no `Send`
+//! bound. Instantiation is gated by [`MainThread`]; the release end is not.
 
 use std::ffi::{CStr, CString, c_void};
 use std::mem::MaybeUninit;
@@ -55,77 +35,24 @@ use crate::runtime::{
 /// The name of the single ivar every declared class carries.
 pub const IVAR_NAME: &CStr = c"_atermIvars";
 
-/// A witness that the caller asked, on THIS thread, whether it is the process
-/// main thread — and got yes.
+/// A witness that the caller asked, on this thread, whether it is the process
+/// main thread, and got yes.
 ///
-/// # Why this type exists at all: a regime change, named
+/// `alloc_init` and `alloc_ivars` take one, so a declared class cannot be
+/// instantiated (and its Rust ivars born) off the main thread without an
+/// `unsafe` [`Self::new_unchecked`]. [`crate::Retained`] being `!Send` limits
+/// where an instance travels, not where it is born.
 ///
-/// objc2 0.5 gave every class in this port `type Mutability =
-/// mutability::MainThreadOnly`, and that parameter did one load-bearing job:
-/// `alloc` was reachable only through `MainThreadMarker`, so *the compiler*
-/// refused an instantiation that had not asked the thread question. Its five
-/// winit classes and aterm-gui's six all carry it.
+/// A witness, not a capability: it records that the question was asked. It is
+/// `!Send`/`!Sync`, so it cannot be carried off the main thread. [`Self::new`]
+/// asks `+[NSThread isMainThread]` at run time (the question AppKit itself
+/// asks); `pthread_main_np` would be faster, but most of the cost is the
+/// uncached `objc_getClass` (see [`crate::class`]).
 ///
-/// The first version of [`crate::declare_class!`] dropped the parameter, on the
-/// argument that [`crate::Retained`] is unconditionally `!Send` and the marker
-/// therefore had only one useful value. That argument is about where an
-/// instance may TRAVEL, and the parameter was about where one may be BORN. A
-/// judge proved the difference by construction: a declared class registered,
-/// instantiated and deallocated on a `std::thread::spawn`ed thread with no
-/// witness, no `unsafe` token at the call site, and no diagnostic anywhere —
-/// running the ivar type's Rust destructor on a foreign thread, which is `S3`
-/// in the crate's soundness list arriving through the front door instead of
-/// through a framework's release. Every aterm-gui call site happens to sit
-/// behind its own main-thread check, so nothing was broken; the *enforcement*
-/// had simply moved from compile time to convention.
-///
-/// This type moves it back. `alloc_init` and `alloc_ivars` take one, so an
-/// instantiation that never asked does not compile.
-///
-/// # What it is and is not
-///
-/// It is a WITNESS, not a capability: holding one does not make a call safe, it
-/// records that the question was asked at a boundary where the answer was still
-/// knowable. It is `!Send`/`!Sync`, so it cannot be minted on the main thread
-/// and carried elsewhere. And the check behind [`Self::new`] is a RUNTIME one —
-/// `+[NSThread isMainThread]`; what the type system enforces is that it was
-/// performed, not its answer.
-///
-/// # THE COMPARISON TO objc2 USED TO BE WRITTEN HERE, AND IT WAS BACKWARDS
-///
-/// This paragraph said the check is `+[NSThread isMainThread]` *"exactly as
-/// objc2's `MainThreadMarker::new` is"*. It is not, and objc2 says so in its
-/// own source. `objc2-foundation-0.2.2/src/thread.rs:43` —
-/// `MainThreadMarker::new`'s predicate — reads:
-///
-/// ```text
-/// // Normally you would use NSThread::isMainThread, but that function uses
-/// // pthread_main_np under the hood. Benchmarks have shown that calling it
-/// // directly is up to four times faster. So, we just use that instead.
-/// unsafe { pthread_main_np() != 0 }
-/// ```
-///
-/// MEASURED here (release, 2x10^6 iterations/arm, four alternating rounds):
-/// `pthread_main_np()` **0.87 ns/op** against this constructor's
-/// **18.24-18.68 ns/op** — 21x, not 4x, because 17 of those nanoseconds are the
-/// UNCACHED `objc_getClass("NSThread")` that precedes the send, not the send
-/// (1.67-1.97 ns). See [`crate::class`].
-///
-/// The check is KEPT in this form regardless, and the reason is not the cost: a
-/// `BOOL` the Objective-C runtime answers is the same question AppKit itself
-/// asks, and this crate would rather ask the runtime than assert an equivalence
-/// between two thread identities it has not measured. What changed is that the
-/// claim about objc2 is deleted instead of repeated, because a comparison a
-/// reader could check and find false is worse than no comparison.
-///
-/// # What it deliberately does NOT gate
-///
-/// Class REGISTRATION. `objc_allocateClassPair`/`objc_registerClassPair` are
-/// documented thread-safe, they run no Rust destructor, and the class object
-/// they produce is immortal — so `Self::class()` stays callable anywhere, which
-/// is what lets an encoding test read a class's method table off a libtest
-/// worker. The hazard `S3` names lives in the INSTANCE: its ivars are Rust
-/// values with no `Send` bound, and `+alloc` is where they are born.
+/// Class registration is not gated: `objc_allocateClassPair` and
+/// `objc_registerClassPair` are thread-safe, run no Rust destructor and produce
+/// an immortal class, so `Self::class()` works anywhere (e.g. to read a method
+/// table from a test worker). The `S3` hazard lives in the instance.
 #[derive(Clone, Copy, Debug)]
 pub struct MainThread {
     /// `!Send`/`!Sync`: a witness is only true on the thread that minted it.
@@ -133,15 +60,12 @@ pub struct MainThread {
 }
 
 impl MainThread {
-    /// A witness, or `None` off the main thread.
-    ///
-    /// Never panics: every caller in this tree treats `None` as "do nothing",
-    /// which is the contract `aterm-gui`'s AppKit entry points already had.
+    /// A witness, or `None` off the main thread. Never panics; callers treat
+    /// `None` as "do nothing".
     #[must_use]
     pub fn new() -> Option<Self> {
-        // SAFETY: `+[NSThread isMainThread]` is a side-effect-free class-method
-        // `BOOL` query on a Foundation class that is always linked into an
-        // AppKit process, and the prototype cast is exactly `-(BOOL)(id, SEL)`.
+        // SAFETY: `+[NSThread isMainThread]` is a side-effect-free `BOOL` class
+        // query on an always-linked Foundation class, cast as `-(BOOL)(id, SEL)`.
         let is_main = unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> crate::encode::Bool =
                 crate::runtime::msg();
@@ -153,21 +77,14 @@ impl MainThread {
         is_main.as_bool().then(Self::mint)
     }
 
-    /// A witness WITHOUT asking — for a caller that has its own proof, and for
-    /// tests of classes that touch no AppKit state.
-    ///
-    /// This is objc2's `MainThreadMarker::new_unchecked`, kept for the same
-    /// reason: a library that offers no escape hatch gets one built by hand,
-    /// unsafely, out of sight. Here it is `unsafe`, so the obligation is
-    /// written at every use.
+    /// A witness without asking, for a caller with its own proof and for tests
+    /// of classes that touch no AppKit state.
     ///
     /// # Safety
-    /// The caller must be on the process main thread, OR must know that the
-    /// class being instantiated has no main-thread affinity and that its
-    /// `Ivars` type may be dropped on whatever thread performs the last release
-    /// (`S3`). A test that registers a class, sends it a message and drops it
-    /// on one libtest worker satisfies the second form; nothing that reaches
-    /// AppKit satisfies anything but the first.
+    /// The caller must be on the process main thread, or know that the class
+    /// has no main-thread affinity and its `Ivars` may be dropped on whatever
+    /// thread performs the last release (`S3`). Nothing that reaches AppKit
+    /// satisfies anything but the first.
     #[must_use]
     pub const unsafe fn new_unchecked() -> Self {
         Self::mint()
@@ -184,9 +101,8 @@ impl MainThread {
 
 /// Per-class facts resolved once at registration and read on every ivar access.
 ///
-/// The class pointer is kept as a `usize` so this type is `Send + Sync` and can
-/// live in a `OnceLock` — an ObjC class object is immortal, so the address is
-/// stable for the life of the process and carries no aliasing meaning.
+/// The class pointer is kept as a `usize` so this is `Send + Sync` and can live
+/// in a `OnceLock`; a class object is immortal, so the address is stable.
 #[derive(Clone, Copy, Debug)]
 pub struct ClassMeta {
     class_addr: usize,
@@ -198,9 +114,8 @@ impl ClassMeta {
     #[inline]
     #[must_use]
     pub fn class(&self) -> ClassPtr {
-        // The address came from `objc_allocateClassPair`, i.e. from FFI, so it
-        // already has exposed provenance; a class pointer is never dereferenced
-        // by Rust anyway, only handed back to the runtime.
+        // The address came from FFI, so its provenance is already exposed; Rust
+        // never dereferences a class pointer, only hands it back to the runtime.
         ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(self.class_addr))
     }
 
@@ -214,18 +129,10 @@ impl ClassMeta {
 
 /// The per-instance ivar payload: an initialised flag plus the Rust value.
 ///
-/// # Why the flag
-///
-/// `class_createInstance` (what `+alloc` calls) returns ZEROED memory, so
-/// `initialized` reads `false` on a freshly allocated instance. That makes
-/// `dealloc` sound in the window between `+alloc` and the ivars being written:
-/// if a superclass `init` fails and releases `self`, `dealloc` runs against a
-/// slot that was never filled and correctly drops NOTHING, instead of calling
-/// `drop_in_place` on all-zero bytes — which is undefined behaviour for almost
-/// every real ivar type (`EventLoopProxy<Wake>` and `Retained<NSTrackingArea>`
-/// among them). This is a deliberate improvement on objc2 0.5, where
-/// `set_ivars` must be called before anything can send a message and nothing in
-/// the type system enforces it.
+/// `class_createInstance` (behind `+alloc`) returns zeroed memory, so the flag
+/// reads `false` until the ivars are written. If a superclass `init` fails and
+/// releases `self`, `dealloc` then drops nothing instead of running
+/// `drop_in_place` over zero bytes.
 #[repr(C)]
 pub struct IvarSlot<T> {
     initialized: bool,
@@ -237,21 +144,13 @@ impl<T> IvarSlot<T> {
     ///
     /// # Safety
     /// `slot` must point at a properly aligned, writable `IvarSlot<T>` whose
-    /// `initialized` flag is currently `false` (i.e. freshly `+alloc`ed memory,
-    /// never a slot that was already filled — that would leak the old value).
-    ///
-    /// "Properly aligned" is the half that used to be UNDISCHARGED. The only
-    /// caller is [`crate::declare_class!`]'s `alloc_init`, which derives `slot`
-    /// from the instance base plus the registered ivar offset — and the offset
-    /// is aligned within the instance while the BASE is only 16-aligned, so for
-    /// `align_of::<Self>() > 16` this precondition was violated by construction
-    /// from SAFE code. [`crate::ClassBuilder::add_rust_ivar`] now refuses such a
-    /// `T` at compile time, which is what makes this contract dischargeable —
-    /// see `S4` in the crate's soundness list.
+    /// `initialized` flag is `false` (freshly `+alloc`ed; refilling would leak
+    /// the old value). Alignment holds because
+    /// [`crate::ClassBuilder::add_rust_ivar`] refuses a `T` aligned above the
+    /// instance base's 16 bytes (`S4`).
     pub unsafe fn init(slot: *mut Self, value: T) {
-        // SAFETY: the caller pins `slot` as an aligned, writable, not-yet-filled
-        // slot. Writing the whole struct (rather than the fields) is a single
-        // initialising store with no read of the old bytes.
+        // SAFETY: `slot` is aligned, writable and unfilled. Writing the whole
+        // struct is one initialising store with no read of the old bytes.
         unsafe {
             slot.write(Self {
                 initialized: true,
@@ -262,60 +161,30 @@ impl<T> IvarSlot<T> {
 
     /// Borrow the value.
     ///
-    /// The initialised flag is checked in RELEASE builds too, and that is a
-    /// deliberate change from `debug_assert!`. The window it guards is not
-    /// hypothetical: `alloc_init` is this crate's only constructor, but the
-    /// class is registered with the Objective-C runtime under a public name, so
-    /// Objective-C code — a nib, a `+alloc`/`-init` from a framework, an
-    /// `NSClassFromString` — can mint an instance whose slot was never written.
-    /// The old comment here claimed the write "was performed by `alloc_init`
-    /// before any message could reach the instance", which is true of every
-    /// instance THIS crate creates and of no other. A panic inside a
-    /// trampoline is already caught and turned into an abort, so the failure is
-    /// loud rather than an `assume_init_ref` over zeroed bytes.
+    /// The initialised flag is checked in release builds too: the class is
+    /// registered under a public name, so Objective-C code (a nib, a framework
+    /// `+alloc`/`-init`, `NSClassFromString`) can mint an instance whose slot
+    /// was never written. A panic in a trampoline aborts, so the failure is loud.
+    /// The cost is one load and a predictable branch.
     ///
-    /// The cost is one load and one predictable branch, on a path that already
-    /// pays a `catch_unwind` per message.
-    ///
-    /// # WHAT THE FLAG DOES NOT GUARD, measured
-    ///
-    /// It guards the window between `+alloc` and the ivar store ON ONE
-    /// INSTANCE. It is NOT a guard against a substituting initializer — one that
-    /// releases `self` and answers a different object — and a comment in
-    /// `vendor/winit/src/platform_impl/macos/window.rs` used to say it was.
-    /// Measured with four purpose-built substitutions against a class whose
-    /// slot the runtime places at offset 513 of an `NSWindow`, inside its tail
-    /// padding — on the macOS 26 release cutter; macOS 14.4.1's `NSWindow` is
-    /// 448 bytes with no tail padding and the slot lands AT 448, past the
-    /// allocation, which the test measures rather than assumes
+    /// The flag does not guard against a substituting initializer (one that
+    /// releases `self` and returns a different object): a sibling class whose
+    /// ivar lands at the same offset reads `true` and hands out a `&T` over its
+    /// bytes, and a smaller survivor puts the read past its allocation
     /// (`winit_seam.rs`'s
-    /// `a_substituting_initializer_defeats_the_initialized_flag`): a same-class
-    /// survivor reads `false` and panics (the guard working); a plain `NSWindow`
-    /// survivor panics only because that padding is currently zero; a SIBLING
-    /// subclass whose own first ivar the runtime also places at 513 reads `true`
-    /// and hands out a `&T` over that class's bytes; and an `NSObject`-sized
-    /// survivor puts the read 497 bytes past the end of its 16-byte malloc
-    /// block. Three of four defeat it. A class whose `Ivars` carry state must
-    /// establish that its designated initializer does not substitute; the flag
-    /// will not do it.
+    /// `a_substituting_initializer_defeats_the_initialized_flag`). A class whose
+    /// `Ivars` carry state must ensure its designated initializer does not
+    /// substitute.
     ///
     /// # Safety
     /// `slot` must point at an aligned, readable `IvarSlot<T>` (initialised or
-    /// zeroed) that outlives `'a`.
-    ///
-    /// The word "aligned" here was the SECOND undischargeable precondition of
-    /// this type, and the more serious one: `get`'s only caller is the SAFE
-    /// `ivars()` accessor the macro generates, which cannot establish it at all
-    /// — the same shape as the pool contract F2 was raised for, one pass later.
-    /// It is dischargeable now because `add_rust_ivar` refuses any `T` whose
-    /// slot needs more than the 16 bytes `class_createInstance` guarantees, so
-    /// every registered class HAS an aligned slot and the accessor's obligation
-    /// is met by the class's own existence.
+    /// zeroed) that outlives `'a`. The safe `ivars()` accessor can rely on
+    /// alignment because `add_rust_ivar` refuses any `T` needing more than the
+    /// 16 bytes `class_createInstance` guarantees.
     #[must_use]
     pub unsafe fn get<'a>(slot: *const Self) -> &'a T {
-        // SAFETY: the caller pins `slot` as aligned, readable and live for
-        // `'a`; reading the flag is valid either way because `+alloc` zeroed
-        // the whole instance.
+        // SAFETY: `slot` is aligned, readable and live for `'a`; the flag is
+        // readable either way because `+alloc` zeroed the instance.
         let this = unsafe { &*slot };
         assert!(
             this.initialized,
@@ -323,10 +192,8 @@ impl<T> IvarSlot<T> {
              not created by `alloc_init`, or a message reached it between \
              `+alloc` and the ivar store"
         );
-        // SAFETY: `initialized` is only ever set by `init`, which wrote a valid
-        // `T` into `value` in the same store, and `dispose` clears it before
-        // dropping. The assertion above is what makes that a fact rather than a
-        // convention.
+        // SAFETY: only `init` sets `initialized`, in the same store that wrote a
+        // valid `T`, and `dispose` clears it before dropping; checked above.
         unsafe { this.value.assume_init_ref() }
     }
 
@@ -334,11 +201,8 @@ impl<T> IvarSlot<T> {
     ///
     /// # Safety
     /// `slot` must point at an aligned, writable `IvarSlot<T>` (initialised or
-    /// zeroed) that nothing else is borrowing. Alignment is discharged the way
-    /// [`Self::init`] and [`Self::get`] discharge it — by `add_rust_ivar`
-    /// refusing an over-aligned `T` — which is also the second of the two sites
-    /// an over-aligned ivar aborted at (`(*slot).initialized` on the dealloc
-    /// path, below).
+    /// zeroed) that nothing else is borrowing. Alignment is discharged as for
+    /// [`Self::init`].
     pub unsafe fn dispose(slot: *mut Self) {
         // SAFETY: the caller pins `slot` as writable; reading the flag is
         // always valid because `+alloc` zeroed it.
@@ -346,9 +210,8 @@ impl<T> IvarSlot<T> {
         if !initialized {
             return;
         }
-        // Clear the flag FIRST, so a re-entrant `dealloc` (which the runtime
-        // does not do, but a superclass `dealloc` that resurrected `self` could
-        // provoke) cannot drop the same value twice.
+        // Clear the flag first, so a re-entrant `dealloc` (e.g. a superclass
+        // `dealloc` that resurrected `self`) cannot drop the value twice.
         // SAFETY: as above.
         unsafe {
             (*slot).initialized = false;
@@ -359,22 +222,20 @@ impl<T> IvarSlot<T> {
 
 /// A class pair under construction. Consumed by [`ClassBuilder::register`].
 ///
-/// Every mutator must run BEFORE registration: `class_addIvar` in particular is
-/// only legal on an unregistered pair, because adding an ivar moves the
-/// instance size and a registered class may already have instances.
+/// Every mutator must run before registration: `class_addIvar` is legal only on
+/// an unregistered pair, since it changes the instance size.
 pub struct ClassBuilder {
     cls: ClassPtr,
     name: CString,
 }
 
 impl ClassBuilder {
-    /// Start a new class pair. `None` if a class of that name already exists —
-    /// which, inside one process, means two [`crate::declare_class!`] sites
-    /// picked the same `NAME`.
+    /// Start a new class pair. `None` if a class of that name already exists
+    /// (two [`crate::declare_class!`] sites picked the same `NAME`).
     ///
     /// # Safety
-    /// `superclass` must be a live class object (it is dereferenced by the
-    /// runtime to compute the new class's instance layout).
+    /// `superclass` must be a live class object; the runtime reads it to lay
+    /// out the new class.
     #[must_use]
     pub unsafe fn new(superclass: ClassPtr, name: &CStr) -> Option<Self> {
         assert!(
@@ -382,11 +243,9 @@ impl ClassBuilder {
             "aterm-objc: superclass not found for class {name:?} — the framework \
              that defines it is not linked into this binary"
         );
-        // SAFETY: `superclass` is a live class object (asserted non-null above,
-        // and class objects are immortal); `name` is a valid C string. The
-        // runtime copies the name. `extra_bytes` is 0 because this crate stores
-        // its payload in a real ivar rather than in indexed extra storage — an
-        // ivar has a name the runtime can report and survives subclassing.
+        // SAFETY: `superclass` is a live, immortal class (non-null asserted
+        // above); `name` is a valid C string the runtime copies. `extra_bytes`
+        // is 0: the payload lives in a named ivar, which survives subclassing.
         let cls = unsafe { objc_allocateClassPair(superclass, name.as_ptr(), 0) };
         if cls.is_null() {
             return None;
@@ -406,24 +265,14 @@ impl ClassBuilder {
 
     /// Add an ivar big enough for `T`, named [`IVAR_NAME`].
     ///
-    /// The type encoding written is `[Nc]` — "an array of N opaque bytes". That
-    /// is the honest encoding for a Rust value, and it is deliberately NOT a
-    /// pointer encoding: the runtime must not treat these bytes as an object
-    /// reference to retain, release or scan.
+    /// The encoding is `[Nc]` (N opaque bytes), deliberately not a pointer
+    /// encoding, so the runtime never treats the bytes as an object to retain,
+    /// release or scan.
     ///
-    /// # An ivar cannot out-align the instance allocator: `S4`'s SECOND half
-    ///
-    /// `_Block_copy` allocates with `malloc` and a block capture needing more
-    /// than 16-byte alignment is refused at compile time — that is `S4`, and it
-    /// was recorded as CLOSED while its exact twin stood open one module over.
-    /// `class_createInstance` (what `+alloc` calls) uses the same allocator, so
-    /// the ivar SLOT inherits the instance base's alignment and nothing more:
-    /// `class_addIvar` aligns the OFFSET within the instance, which is all it
-    /// can do, and the base is the part `malloc` decides.
-    ///
-    /// MEASURED through `ivar_getOffset` and the raw `+alloc` addresses — no
-    /// Rust reference anywhere in the measurement, so nothing is folded away —
-    /// 4,096 instances per class on this box:
+    /// `T` may not be aligned above 16 (`S4`). `class_createInstance` allocates
+    /// with `malloc`, which guarantees only 16-byte alignment, and
+    /// `class_addIvar` aligns the ivar's offset but not the base. Over 4,096
+    /// raw `+alloc`s per class:
     ///
     /// ```text
     /// Ivars align  ivar offset  slot misaligned    base not 32-aligned
@@ -432,23 +281,8 @@ impl ClassBuilder {
     ///        64         64          9 / 4096             9 / 4096
     /// ```
     ///
-    /// Sixteen is exact, and it is exact for the same reason and at the same
-    /// number as the block case. The `align 16` row also shows the base really
-    /// is only 16-aligned rather than accidentally more.
-    ///
-    /// It was reachable from safe code with NOT ONE `unsafe` token at the call
-    /// site — `declare_class!{ type Ivars = Align64 }` then
-    /// `X::alloc_init(mtm, v)`
-    /// — and in a debug build it aborted at `IvarSlot::init`'s `ptr::write`
-    /// ("unsafe precondition(s) violated: ptr::write requires that the pointer
-    /// argument is aligned and non-null"), with a second site on the `dealloc`
-    /// path. In RELEASE the precondition compiles out and LLVM is entitled to
-    /// fold the alignment check to `true` off the reference's declared
-    /// alignment, which makes it assumption-propagating undefined behaviour
-    /// rather than a tolerated unaligned access.
-    ///
-    /// So the fix is the one the crate already wrote for blocks: refuse the
-    /// type at compile time, since there is no knob to ask the runtime for more.
+    /// A misaligned slot makes `IvarSlot::init`'s write and every `&T`
+    /// undefined behaviour, so an over-aligned `T` is refused at compile time:
     ///
     /// ```compile_fail
     /// #[repr(align(32))]
@@ -470,11 +304,9 @@ impl ClassBuilder {
     /// );
     /// ```
     pub fn add_rust_ivar<T>(&mut self) {
-        // `class_createInstance` allocates the instance with the same 16-byte
-        // `malloc` guarantee `_Block_copy` has, and the slot sits at a fixed
-        // offset from that base — so a `T` wanting more lands misaligned in
-        // some fraction of instances and there is no way to ask for more. See
-        // this method's docs for the measurement.
+        // The instance base is only 16-aligned (`malloc`) and the slot sits at
+        // a fixed offset from it, so a `T` wanting more would be misaligned in
+        // some instances.
         const {
             assert!(
                 align_of::<IvarSlot<T>>() <= 16,
@@ -487,10 +319,9 @@ impl ClassBuilder {
         debug_assert!(align.is_power_of_two());
         let align_log2 = u8::try_from(align.trailing_zeros()).expect("ivar alignment fits in u8");
         let encoding = CString::new(format!("[{size}c]")).expect("encoding has no interior NUL");
-        // SAFETY: `self.cls` is an allocated, NOT-yet-registered class pair,
-        // which is the only state in which `class_addIvar` is legal; the name
-        // and encoding are valid C strings; `size`/`align_log2` describe a real
-        // Rust type. The runtime copies both strings.
+        // SAFETY: `self.cls` is an allocated, unregistered pair (the only state
+        // where `class_addIvar` is legal); the strings are valid C strings the
+        // runtime copies; `size`/`align_log2` describe a real Rust type.
         let ok = unsafe {
             class_addIvar(
                 self.cls,
@@ -528,20 +359,13 @@ impl ClassBuilder {
 
     /// Declare conformance to a protocol, by name.
     ///
-    /// The protocol object comes from [`protocol_or_register`]: the host's
-    /// framework supplies it when it registers one, and this crate supplies a
-    /// name-only one when it does not. Whether a framework registers a
-    /// protocol it declares is a fact about THAT HOST's build of the
-    /// framework, not about what this binary links — `NSApplicationDelegate`
-    /// is absent from macOS 14.4.1's AppKit and present on macOS 26 — and a
-    /// class that must claim a protocol cannot make its launch conditional on
-    /// it. v0.72.0 through v0.75.0 asserted presence here and died at launch on
-    /// 14.4.1 before the first window, with a message blaming a framework that
-    /// was not linked, which was never the case.
+    /// The protocol object comes from [`protocol_or_register`], which supplies a
+    /// name-only protocol when the host framework does not register one (e.g.
+    /// `NSApplicationDelegate` on some macOS releases), so launch never depends
+    /// on it.
     ///
-    /// Panics only if the runtime refuses the claim itself — a protocol that
-    /// cannot be supplied at all, or `class_addProtocol` answering NO — both
-    /// genuine runtime failures rather than host facts.
+    /// Panics only if the runtime refuses the claim (no protocol can be
+    /// supplied, or `class_addProtocol` answers NO).
     pub fn add_protocol(&mut self, name: &'static CStr) {
         let proto = protocol_or_register(name);
         // SAFETY: `self.cls` is a live class pair and `proto` a live, immortal
@@ -556,9 +380,8 @@ impl ClassBuilder {
 
     /// Register the pair and resolve the ivar offset.
     ///
-    /// After this the class is live and immortal; the pair is never disposed
-    /// (`objc_disposeClassPair` is deliberately not bound — every class this
-    /// crate creates is a process-lifetime singleton).
+    /// The class is then live and immortal; `objc_disposeClassPair` is not
+    /// bound, since every class created here is a process-lifetime singleton.
     #[must_use]
     pub fn register(self) -> ClassMeta {
         // SAFETY: `self.cls` is an allocated, unregistered pair; registering it
@@ -586,9 +409,8 @@ impl ClassBuilder {
 #[must_use]
 pub fn begin(superclass_name: &'static CStr, class_name: &'static CStr) -> ClassBuilder {
     let sup = class(superclass_name);
-    // SAFETY: `sup` came straight out of `objc_getClass`, so it is either a
-    // live, immortal class object or null — and `ClassBuilder::new` asserts
-    // non-null before the runtime ever reads it.
+    // SAFETY: `sup` came from `objc_getClass`, so it is an immortal class or
+    // null, and `ClassBuilder::new` asserts non-null before the runtime reads it.
     unsafe { ClassBuilder::new(sup, class_name) }.unwrap_or_else(|| {
         panic!(
             "aterm-objc: objc_allocateClassPair({class_name:?}) returned nil — a \
@@ -600,11 +422,9 @@ pub fn begin(superclass_name: &'static CStr, class_name: &'static CStr) -> Class
 /// Build the `objc_super` a `[super …]` send needs from inside a method of
 /// `cls`.
 ///
-/// `cls` must be the class that DEFINES the method doing the sending, not
-/// `object_getClass(this)`: using the latter in a class that is itself
-/// subclassed turns `[super foo]` into infinite recursion. The four real super
-/// sends in the tree (`init` x3, `initWithFrame:` x2, `updateTrackingAreas` x2)
-/// are all in leaf classes, but the rule is the same.
+/// `cls` must be the class that defines the sending method, not
+/// `object_getClass(this)`, which recurses forever once the class is
+/// subclassed.
 ///
 /// # Safety
 /// `cls` must be a live class object and `this` a live instance of it.
@@ -622,15 +442,14 @@ pub unsafe fn super_of(this: Id, cls: ClassPtr) -> crate::runtime::ObjcSuper {
 ///
 /// # Safety
 /// `this` must be the instance currently being deallocated, and `cls` the class
-/// that DEFINES the `dealloc` being run (so the send starts at its superclass).
+/// that defines the `dealloc` being run (so the send starts at its superclass).
 pub unsafe fn send_super_dealloc(this: Id, cls: ClassPtr) {
     // SAFETY: the caller pins `this` as the instance being deallocated and
     // `cls` as the class defining that `dealloc`, so both are live.
     let sup = unsafe { super_of(this, cls) };
-    // SAFETY: the prototype below is `-(void)dealloc`'s exact C signature and
-    // the receiver slot holds a well-formed `objc_super`. Every class this
-    // crate creates descends from `NSObject`, which implements `dealloc`, so
-    // the send always resolves.
+    // SAFETY: the prototype is `-(void)dealloc`'s exact signature and the
+    // receiver slot holds a well-formed `objc_super`. Every class created here
+    // descends from `NSObject`, which implements `dealloc`.
     unsafe {
         let f: unsafe extern "C-unwind" fn(*const crate::runtime::ObjcSuper, Sel) =
             crate::runtime::msg_super();
@@ -641,21 +460,11 @@ pub unsafe fn send_super_dealloc(this: Id, cls: ClassPtr) {
 /// Abort the process after a Rust panic reached an `extern "C"` boundary.
 ///
 /// Unwinding out of an ObjC frame is undefined behaviour, so every trampoline
-/// [`crate::declare_class!`] generates catches and lands here. This is the
-/// same rule the tree already applies to its C FFI entry points.
-/// # Why not `eprintln!`
+/// [`crate::declare_class!`] generates catches and lands here.
 ///
-/// It was `eprintln!`, and `eprintln!` PANICS if the write fails — a closed or
-/// full stderr, which is an ordinary state for a GUI app launched from Finder
-/// or re-parented by `launchd`. The process still aborts either way, but a
-/// panic here unwinds out of the very `extern "C"` frame this function exists
-/// to stop, and lands on Rust's own shim with "thread caused non-unwinding
-/// panic. aborting." — the unnamed message the guard was added to avoid. That
-/// is F3's defect inside F3's own fix.
-///
-/// The replacement writes the three pieces straight to stderr and IGNORES the
-/// result. It allocates nothing (no `format!`), so there is no second failure
-/// mode, and the string every test greps for is unchanged.
+/// Writes straight to stderr and ignores the result, allocating nothing:
+/// `eprintln!` panics on a closed or full stderr (normal for a GUI app), and a
+/// panic here would unwind out of the frame this exists to protect.
 #[cold]
 #[inline(never)]
 pub fn abort_on_unwind(method: &str) -> ! {

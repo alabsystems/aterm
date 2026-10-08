@@ -1,42 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// ARENA-SCROLL (FASTER_THAN_GHOSTTY_PLAN §2 harness table + §4 SCROLL-1): the
-// engine-level, headless-capable half of the scrollback-scrub dimension — the
-// piece that becomes an `xtask perf` floor. It guards our own moat: our tiered
-// compressed scrollback pays LZ4/zstd tier decode on the interactive scrub path
-// where ghostty's all-RAM PageList pays only pointer math, so scrub is the
-// dimension we are structurally most at risk of LOSING. This harness fences the
-// read path against a catastrophic regression (and, specifically, against
-// THRU-5's async-compression change silently slowing decode-on-scrub).
+// Scrollback scrub harness: the headless half of the scrub dimension, an
+// `xtask perf` floor. Tiered compressed scrollback pays LZ4/zstd decode on the
+// interactive scrub path, so this fences the read path against regressions.
 //
-//   cargo run --release -q -p aterm-bench --example scroll_scrub_harness
+//   targo --unverified run --release -q -p aterm-bench --example scroll_scrub_harness
 //   -> {"scrub_median_rps":...,"pageup_median_rps":...,"jump_top_median_jps":...,
 //       "fill_lines":...,"depth":...,"n":7,"warmup":2}
 //
-// The three phases and why each is here (all BIGGER-IS-BETTER so the shared
-// `xtask::perf::compare` throughput contract applies unchanged — jump-to-top is
-// a latency, so it is reported as jumps-per-second, not milliseconds):
-//   scrub     small-delta wheel scrub (3 lines/step, overlapping viewports) —
-//             the common interactive motion; the per-tier decode cache (two
-//             slots) mostly HITS, so this measures the cache-warm scrub cost.
-//   pageup    full-depth page sweep (one screen/step, NON-overlapping) — every
-//             step exposes a fresh screen, walking the tier caches off their
-//             cached blocks into a real warm/cold decode per step. This is the
-//             hold-PageUp worst case and the number THRU-5 must not regress.
-//   jump_top  bottom -> deep-history jumps, each landing on a DIFFERENT cold-tier
-//             page (the tiers cache only the last two decompressed pages, so
-//             re-jumping to the same oldest page would measure cache hits, not
-//             decode) — the worst-case cold zstd/LZ4 decode fence.
+// Three phases, all bigger-is-better so `xtask::perf::compare` applies (the
+// jump latency is reported as jumps per second):
+//   scrub     small-delta wheel scrub (3 lines/step, overlapping viewports):
+//             the cache-warm scrub cost.
+//   pageup    full-depth page sweep (one screen/step, non-overlapping): a real
+//             warm/cold decode per step, the hold-PageUp worst case.
+//   jump_top  bottom -> deep-history jumps, each to a different cold-tier page:
+//             the worst-case cold decode.
 //
-// Rows MATERIALIZED (not raw lines) is the unit: the harness rebuilds each
-// visible history row through `materialize_scrollback_row_full`, the exact
-// call the bridge renderer makes per visible scrollback row, so a decode
-// slowdown lands directly in the number.
+// The unit is rows materialized through `materialize_scrollback_row_full`, the
+// call the renderer makes per visible scrollback row.
 
 use std::hint::black_box;
 use std::time::Instant;
 
+use aterm_bench::rotating_corpus;
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
 
@@ -47,9 +35,8 @@ const COLS: u16 = 80;
 /// Live ring in front of the tiers — mirrors the GUI's `LIVE_SCROLLBACK_RING_LINES`.
 const RING_LINES: usize = 10_000;
 
-/// Fill target. The default tiered limit is 100k lines, so 120k lines OVERFLOWS
-/// it: the line-limit truncation runs, the cold (zstd) tier is deep, and "100k+
-/// lines" (the plan's fill spec) holds after truncation.
+/// Fill target. 120k overflows the default 100k tiered limit: truncation runs,
+/// the cold (zstd) tier is deep, and 100k+ lines remain.
 const FILL_LINES: usize = 120_000;
 
 /// Wheel scrub: 3 lines per step (a mouse notch), a bounded number of steps so
@@ -65,40 +52,6 @@ const WARMUP: usize = 2;
 /// How many jump-to-top round trips to time per iteration (each is one full
 /// bottom -> top jump plus a top-screen materialize).
 const JUMP_REPS: usize = 400;
-
-/// Build a deterministic ~`FILL_LINES`-line corpus. Content VARIES per line
-/// (rotating printable text + a line counter) so LZ4/zstd have realistic work
-/// and decode is not a degenerate all-identical fast path. No RNG/clock: the
-/// corpus is byte-identical every run, per the gate's determinism contract.
-fn fill_corpus() -> Vec<u8> {
-    // A rotating printable-ASCII alphabet keeps every line renderable and gives
-    // the compressor real-but-compressible entropy.
-    const GLYPHS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/-=";
-    let mut out = Vec::with_capacity(FILL_LINES * 48);
-    for line in 0..FILL_LINES {
-        // A visible line number so lines are distinguishable (defeats trivial
-        // dedupe), then a rotating body of ~40 glyphs.
-        let mut n = line;
-        // decimal line number, fixed-ish width
-        let mut digits = [0u8; 8];
-        let mut di = digits.len();
-        loop {
-            di -= 1;
-            digits[di] = b'0' + (n % 10) as u8;
-            n /= 10;
-            if n == 0 {
-                break;
-            }
-        }
-        out.extend_from_slice(&digits[di..]);
-        out.push(b' ');
-        for c in 0..40usize {
-            out.push(GLYPHS[(line + c) % GLYPHS.len()]);
-        }
-        out.extend_from_slice(b"\r\n");
-    }
-    out
-}
 
 /// Materialize the whole visible history window at the current display offset —
 /// exactly the per-row decode the renderer performs for a scrolled-back frame.
@@ -160,20 +113,15 @@ fn pageup_pass(term: &mut Terminal) -> usize {
 }
 
 /// Stride between successive jump targets, in lines. Larger than the tier
-/// block/page size (100) and co-prime-ish so consecutive jumps land on DISTINCT
+/// block/page size (100) and co-prime-ish so consecutive jumps land on distinct
 /// cold pages — the point of the sweep (see [`jump_top_pass`]).
 const JUMP_STRIDE: usize = 137;
 
-/// Jump into deep history: `JUMP_REPS` bottom -> deep-page jumps, each landing on
-/// a DIFFERENT cold-tier page + a screen materialize. Returns the jump count.
-///
-/// The warm/cold tiers cache only the last TWO decompressed blocks/pages, so
-/// jumping to the SAME oldest page every rep would measure cache-HIT
-/// throughput, not the cold zstd/LZ4 decode this floor is meant to guard — a
-/// cold-decode regression could then pass the gate. Instead we sweep the jump
-/// target across the oldest region (stride > page size), so each rep enters a
-/// page no earlier rep cached and pays a real cold decode. This keeps
-/// `jump_top_median_jps` a true worst-case-decode fence.
+/// Jump into deep history: `JUMP_REPS` bottom -> deep-page jumps, each landing
+/// on a different cold-tier page plus a screen materialize. Returns the jump
+/// count. The tiers cache only the last two decompressed pages, so the target
+/// sweeps the oldest region (stride > page size) and every rep pays a real
+/// cold decode rather than a cache hit.
 fn jump_top_pass(term: &mut Terminal) -> usize {
     let depth = term.grid().scrollback_lines();
     // Sweep the oldest `span` lines (all in the warm/cold tiers, past the 10k live
@@ -217,11 +165,10 @@ fn rate(mut f: impl FnMut() -> usize) -> f64 {
 }
 
 fn main() {
-    // Fill ONCE: scrub is a read-only viewport operation, so a single settled
-    // tier state serves every timed iteration (and matches how a user scrubs a
-    // fixed history). Building it per-iter would dominate the measurement with
-    // ingest+compression cost, which is THRU-2/THRU-5 territory, not scrub.
-    let corpus = fill_corpus();
+    // Fill once: scrub is a read-only viewport operation, so one settled tier
+    // state serves every timed iteration; building it per iteration would
+    // measure ingest and compression instead.
+    let corpus = rotating_corpus(FILL_LINES);
     let mut term = Terminal::with_scrollback(ROWS, COLS, RING_LINES, Scrollback::with_defaults());
     term.process(black_box(&corpus));
     // Settle: force the lazy buffer to drain into the tiers so the timed reads
@@ -230,7 +177,7 @@ fn main() {
     let depth = term.grid().scrollback_lines();
     eprintln!("scroll_scrub_harness: filled {FILL_LINES} lines -> {depth} scrollback depth");
 
-    // NOTE: the phase NAME->KEY list is mirrored by `xtask::perf::SCROLL_PHASES`
+    // The phase keys are mirrored by `xtask::perf::SCROLL_LANE`
     // (the gate reads each key) — keep the two in sync.
     let mut scrub = Vec::with_capacity(N_ITERS);
     let mut pageup = Vec::with_capacity(N_ITERS);

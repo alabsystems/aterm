@@ -23,29 +23,36 @@ pub struct Screen {
     /// The grid row the first of `rows` is: a shaped read's `first` (`tail=`
     /// sends it when it does not start at row 0), 0 for a full read.
     pub first: usize,
-    /// The screen GENERATION the read was taken at, `<epoch>.<seq>` (the
+    /// The screen generation the read was taken at, `<epoch>.<seq>` (the
     /// server's `"gen"`, read under the same lock as the rows): what a fenced
-    /// press names (`key if-gen=`). Unlike `seq` it never repeats — an
-    /// alternate-screen re-entry moves the epoch — so a press fenced on it
-    /// cannot land on a box that replaced the one read. `None` from a host
-    /// that does not send it (the press then carries no fence).
+    /// press names (`key if-gen=`). Unlike `seq` it never repeats, so a press
+    /// fenced on it cannot land on a box that replaced the one read. `None`
+    /// from a host that does not send it (the press then carries no fence).
     pub generation: Option<String>,
-    /// When a PERSON last gave the session input, as the server stamped it
-    /// at the read (`"human_ms"`, 2026-09-25): what the question answer waits
-    /// on before it keys a dialog a person may be navigating.
+    /// When a person last gave the session input, as the server stamped it at
+    /// the read (`"human_ms"`): what the question answer waits on before it
+    /// keys a dialog a person may be navigating.
     pub human: HumanInput,
     /// How many person gestures had reached the session at the read
-    /// (`"human_seq"`, 2026-09-27): what a key fenced `if-human=` names, so
-    /// the server writes it only if no person has keyed since. `None` from a
-    /// host that does not send it (the key then carries no person fence).
+    /// (`"human_seq"`): what a key fenced `if-human=` names, so the server
+    /// writes it only if no person has keyed since. `None` from a host that
+    /// does not send it (the key then carries no person fence).
     pub human_seq: Option<u64>,
+    /// The pane's width in cells (`"dims":{"cols":…}`), `None` from a reply
+    /// that does not carry it: what a question's policy text is estimated
+    /// to wrap in.
+    pub cols: Option<u16>,
+    /// The PANE's height in rows (`"dims":{"rows":…}`: the grid's, whatever
+    /// slice `tail=` sent in [`Self::rows`]), `None` from a reply that does
+    /// not carry it: what a question's policy text is estimated to fit in.
+    pub pane_rows: Option<usize>,
 }
 
 /// The server's person stamp on a read ([`Screen::human`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HumanInput {
-    /// The host does not send it (a build before 2026-09-25): unknown — the
-    /// question answer then waits for the screen to hold still instead.
+    /// The host does not send it: unknown, and the question answer then waits
+    /// for the screen to hold still instead.
     #[default]
     Unknown,
     /// No person has given the session input since the host began serving it.
@@ -74,7 +81,7 @@ impl HumanInput {
     }
 
     /// Whether a person gave the session input within `grace_s` seconds
-    /// (`[harness] human_grace_s`): THE one test of a person's hand, for
+    /// (`[harness] human_grace_s`): the one test of a person's hand, for
     /// every caller. `None` for [`Self::Unknown`] — each caller says what an
     /// unknown stamp means where it acts (nobody, for a relaunch; someone,
     /// for the upgrade's notice).
@@ -84,6 +91,25 @@ impl HumanInput {
             Self::Never => Some(false),
             Self::Ago(ms) => Some(ms < u64::from(grace_s).saturating_mul(1000)),
             Self::Unknown => None,
+        }
+    }
+
+    /// Whether NO person gave the session input at or after `since_ms` (Unix
+    /// milliseconds), for a stamp read at `now_ms`: an age is true where the
+    /// input it dates came before `since_ms`; [`Self::Unknown`] AND
+    /// [`Self::Never`] are `None`, for the caller to read as someone. Never
+    /// says nobody keyed the session since the host BEGAN SERVING it, which
+    /// may be after `since_ms`: the stamp lives in the serving process, and a
+    /// seamless update's successor reads every session it adopts as never
+    /// keyed — a person's keys before the update are gone from it, not
+    /// absent. The instant is `now_ms − age`, so a caller's clock read after
+    /// the server's stamp dates the input LATER than it was — the safe way
+    /// to be wrong.
+    #[must_use]
+    pub fn quiet_since(self, since_ms: u64, now_ms: u64) -> Option<bool> {
+        match self {
+            Self::Ago(ms) => Some(now_ms.saturating_sub(ms) < since_ms),
+            Self::Never | Self::Unknown => None,
         }
     }
 }
@@ -106,16 +132,24 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         .strip_prefix("OK 1")
         .map(str::trim_start)
         .unwrap_or(body);
-    let v = Json::parse(body)?;
-    let rows = v
-        .get("rows")
-        .and_then(Json::as_array)
-        .ok_or("text --json: no rows array")?
-        .iter()
-        .map(|r| {
-            r.as_str()
-                .map(str::to_string)
-                .ok_or("text --json: a row is not a string")
+    let mut v = Json::parse(body)?;
+    // The rows are MOVED out of the parsed value, never copied: nothing below
+    // reads the top-level `rows` again.
+    let rows = match &mut v {
+        Json::Object(kv) => kv
+            .iter_mut()
+            .find(|(k, _)| k == "rows")
+            .map(|(_, r)| std::mem::replace(r, Json::Null)),
+        _ => None,
+    };
+    let Some(Json::Array(rows)) = rows else {
+        return Err("text --json: no rows array".to_string());
+    };
+    let rows = rows
+        .into_iter()
+        .map(|r| match r {
+            Json::Str(s) => Ok(s),
+            _ => Err("text --json: a row is not a string"),
         })
         .collect::<Result<Vec<_>, _>>()?;
     let cursor = v.get("cursor");
@@ -127,7 +161,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         seq: num(Some(&v), "seq").unwrap_or(0),
         first: usize::try_from(num(Some(&v), "first").unwrap_or(0)).unwrap_or(usize::MAX),
         // Kept only if the server will take it back as a fence: asked of the
-        // SAME reader the server parses `if-gen=` with. Anything else is not
+        // same reader the server parses `if-gen=` with. Anything else is not
         // sent (the server would answer `ERR usage`); a local "two runs of
         // digits" check stood here and passed an epoch past `u64::MAX`.
         generation: v
@@ -143,16 +177,9 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
             Some(h) => h.as_u64().map_or(HumanInput::Unknown, HumanInput::Ago),
         },
         human_seq: v.get("human_seq").and_then(Json::as_u64),
+        cols: num(v.get("dims"), "cols").and_then(|c| u16::try_from(c).ok()),
+        pane_rows: num(v.get("dims"), "rows").and_then(|r| usize::try_from(r).ok()),
     })
-}
-
-/// Parse a plain `text` reply (one row per line) when `--json` is unavailable.
-#[cfg(test)]
-pub(crate) fn parse_text_plain(body: &str) -> Screen {
-    Screen {
-        rows: body.lines().map(str::to_string).collect(),
-        ..Screen::default()
-    }
 }
 
 /// A minimal JSON value.
@@ -169,12 +196,11 @@ pub enum Json {
 impl Json {
     /// Parse one JSON document.
     pub fn parse(s: &str) -> Result<Json, String> {
-        let chars: Vec<char> = s.chars().collect();
         let mut i = 0;
-        let v = parse_value(&chars, &mut i)?;
-        skip_ws(&chars, &mut i);
-        if i != chars.len() {
-            return Err(format!("json: trailing data at char {i}"));
+        let v = parse_value(s, &mut i)?;
+        skip_ws(s, &mut i);
+        if i != s.len() {
+            return Err(format!("json: trailing data at char {}", at(s, i)));
         }
         Ok(v)
     }
@@ -208,15 +234,21 @@ impl Json {
     }
 }
 
-fn skip_ws(c: &[char], i: &mut usize) {
-    while *i < c.len() && c[*i].is_whitespace() {
-        *i += 1;
-    }
+// The reader walks the `&str` itself: `i` is a BYTE offset, always on a char
+// boundary, and an error names the CHAR index (`at`).
+
+/// The char index of byte offset `i`, as an error names it.
+fn at(s: &str, i: usize) -> usize {
+    s[..i].chars().count()
 }
 
-fn parse_value(c: &[char], i: &mut usize) -> Result<Json, String> {
-    skip_ws(c, i);
-    let Some(&ch) = c.get(*i) else {
+fn skip_ws(s: &str, i: &mut usize) {
+    *i = s.len() - s[*i..].trim_start().len();
+}
+
+fn parse_value(s: &str, i: &mut usize) -> Result<Json, String> {
+    skip_ws(s, i);
+    let Some(ch) = s[*i..].chars().next() else {
         return Err("json: unexpected end".to_string());
     };
     match ch {
@@ -224,19 +256,19 @@ fn parse_value(c: &[char], i: &mut usize) -> Result<Json, String> {
             *i += 1;
             let mut kv = Vec::new();
             loop {
-                skip_ws(c, i);
-                if c.get(*i) == Some(&'}') {
+                skip_ws(s, i);
+                if s[*i..].starts_with('}') {
                     *i += 1;
                     return Ok(Json::Object(kv));
                 }
                 if !kv.is_empty() {
-                    expect(c, i, ',')?;
-                    skip_ws(c, i);
+                    expect(s, i, ',')?;
+                    skip_ws(s, i);
                 }
-                let k = parse_string(c, i)?;
-                skip_ws(c, i);
-                expect(c, i, ':')?;
-                let v = parse_value(c, i)?;
+                let k = parse_string(s, i)?;
+                skip_ws(s, i);
+                expect(s, i, ':')?;
+                let v = parse_value(s, i)?;
                 kv.push((k, v));
             }
         }
@@ -244,120 +276,114 @@ fn parse_value(c: &[char], i: &mut usize) -> Result<Json, String> {
             *i += 1;
             let mut items = Vec::new();
             loop {
-                skip_ws(c, i);
-                if c.get(*i) == Some(&']') {
+                skip_ws(s, i);
+                if s[*i..].starts_with(']') {
                     *i += 1;
                     return Ok(Json::Array(items));
                 }
                 if !items.is_empty() {
-                    expect(c, i, ',')?;
+                    expect(s, i, ',')?;
                 }
-                items.push(parse_value(c, i)?);
+                items.push(parse_value(s, i)?);
             }
         }
-        '"' => Ok(Json::Str(parse_string(c, i)?)),
-        't' => literal(c, i, "true", Json::Bool(true)),
-        'f' => literal(c, i, "false", Json::Bool(false)),
-        'n' => literal(c, i, "null", Json::Null),
+        '"' => Ok(Json::Str(parse_string(s, i)?)),
+        't' => literal(s, i, "true", Json::Bool(true)),
+        'f' => literal(s, i, "false", Json::Bool(false)),
+        'n' => literal(s, i, "null", Json::Null),
         _ => {
             let start = *i;
-            while *i < c.len()
-                && (c[*i].is_ascii_digit() || matches!(c[*i], '-' | '+' | '.' | 'e' | 'E'))
-            {
-                *i += 1;
-            }
+            *i += s[start..]
+                .bytes()
+                .take_while(|&b| {
+                    b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E')
+                })
+                .count();
             if start == *i {
-                return Err(format!("json: unexpected {ch:?} at char {start}"));
+                return Err(format!("json: unexpected {ch:?} at char {}", at(s, start)));
             }
-            Ok(Json::Number(c[start..*i].iter().collect()))
+            Ok(Json::Number(s[start..*i].to_string()))
         }
     }
 }
 
-fn expect(c: &[char], i: &mut usize, want: char) -> Result<(), String> {
-    if c.get(*i) == Some(&want) {
-        *i += 1;
+fn expect(s: &str, i: &mut usize, want: char) -> Result<(), String> {
+    if s[*i..].starts_with(want) {
+        *i += want.len_utf8();
         Ok(())
     } else {
-        Err(format!("json: expected {want:?} at char {}", *i))
+        Err(format!("json: expected {want:?} at char {}", at(s, *i)))
     }
 }
 
-fn literal(c: &[char], i: &mut usize, word: &str, v: Json) -> Result<Json, String> {
-    let n = word.chars().count();
-    if c.len() >= *i + n && c[*i..*i + n].iter().copied().eq(word.chars()) {
-        *i += n;
+fn literal(s: &str, i: &mut usize, word: &str, v: Json) -> Result<Json, String> {
+    if s[*i..].starts_with(word) {
+        *i += word.len();
         Ok(v)
     } else {
-        Err(format!("json: bad literal at char {}", *i))
+        Err(format!("json: bad literal at char {}", at(s, *i)))
     }
 }
 
-fn parse_string(c: &[char], i: &mut usize) -> Result<String, String> {
-    expect(c, i, '"')?;
+fn parse_string(s: &str, i: &mut usize) -> Result<String, String> {
+    expect(s, i, '"')?;
     let mut out = String::new();
-    while let Some(&ch) = c.get(*i) {
-        *i += 1;
-        match ch {
-            '"' => return Ok(out),
-            '\\' => {
-                let Some(&e) = c.get(*i) else {
-                    break;
+    // The plain run up to the next quote or escape is copied in one step.
+    while let Some((run, ch)) = s[*i..].char_indices().find(|&(_, c)| c == '"' || c == '\\') {
+        out.push_str(&s[*i..*i + run]);
+        *i += run + 1;
+        if ch == '"' {
+            return Ok(out);
+        }
+        let Some(e) = s[*i..].chars().next() else {
+            break;
+        };
+        *i += e.len_utf8();
+        match e {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let cp = hex4(s, i)?;
+                // A surrogate pair arrives as two escapes.
+                let ch = if (0xD800..0xDC00).contains(&cp) && s[*i..].starts_with("\\u") {
+                    *i += 2;
+                    let lo = hex4(s, i)?;
+                    let combined =
+                        0x10000 + ((cp - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
+                    char::from_u32(combined).unwrap_or('\u{FFFD}')
+                } else {
+                    char::from_u32(cp).unwrap_or('\u{FFFD}')
                 };
-                *i += 1;
-                match e {
-                    '"' => out.push('"'),
-                    '\\' => out.push('\\'),
-                    '/' => out.push('/'),
-                    'b' => out.push('\u{8}'),
-                    'f' => out.push('\u{c}'),
-                    'n' => out.push('\n'),
-                    'r' => out.push('\r'),
-                    't' => out.push('\t'),
-                    'u' => {
-                        let cp = hex4(c, i)?;
-                        // A surrogate pair arrives as two escapes.
-                        let ch = if (0xD800..0xDC00).contains(&cp)
-                            && c.get(*i) == Some(&'\\')
-                            && c.get(*i + 1) == Some(&'u')
-                        {
-                            *i += 2;
-                            let lo = hex4(c, i)?;
-                            let combined =
-                                0x10000 + ((cp - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
-                            char::from_u32(combined).unwrap_or('\u{FFFD}')
-                        } else {
-                            char::from_u32(cp).unwrap_or('\u{FFFD}')
-                        };
-                        out.push(ch);
-                    }
-                    other => return Err(format!("json: bad escape \\{other}")),
-                }
+                out.push(ch);
             }
-            _ => out.push(ch),
+            other => return Err(format!("json: bad escape \\{other}")),
         }
     }
     Err("json: unterminated string".to_string())
 }
 
-fn hex4(c: &[char], i: &mut usize) -> Result<u32, String> {
-    if c.len() < *i + 4 {
+fn hex4(s: &str, i: &mut usize) -> Result<u32, String> {
+    let rest = &s[*i..];
+    let Some((last, c)) = rest.char_indices().nth(3) else {
         return Err("json: short \\u escape".to_string());
-    }
-    let s: String = c[*i..*i + 4].iter().collect();
-    *i += 4;
-    u32::from_str_radix(&s, 16).map_err(|_| format!("json: bad \\u escape {s:?}"))
+    };
+    let t = &rest[..last + c.len_utf8()];
+    *i += t.len();
+    u32::from_str_radix(t, 16).map_err(|_| format!("json: bad \\u escape {t:?}"))
 }
 
-/// Whether one `cell` reply — `OK <grapheme%enc> <fg> <bg> <attrs>[ link=…]`,
-/// the attrs a comma list or `none` (aterm-gui `cmd_cell`) — names `dim`. The
+/// Whether one `cell` reply (`OK <grapheme%enc> <fg> <bg> <attrs>[ link=…]`,
+/// the attrs a comma list or `none`; aterm-gui `cmd_cell`) names `dim`. The
 /// fields are split on single spaces, never on runs: a blank cell's grapheme
-/// is an EMPTY token, and collapsing it would read the bg colour as the attrs.
-/// The ONE reading of a composer's column-2 cell: the dim placeholder (Claude
-/// Code's suggestion, Codex's `Ask Codex…`) against a typed draft whose caret
-/// was moved home — the supervisor's loop and the live upgrade's gate both
-/// ask it (the elegance review of 2026-09-25: the loop took column 2 for the
-/// placeholder with no look, and could type in front of a person's draft).
+/// is an empty token. This is the one reading of a composer's column-2 cell,
+/// telling the dim placeholder from a typed draft whose caret was moved home;
+/// the supervisor's loop and the live upgrade's gate both ask it.
 #[must_use]
 pub fn cell_is_dim(line: &str) -> bool {
     line.trim_end()
@@ -381,7 +407,7 @@ mod tests {
     /// A `status` reply's stamp reads as a `text --json` one does: a count
     /// its age, `-` never, and no field (an older server) or no `OK`
     /// unknown — and [`HumanInput::within`] is the one grace test, strictly
-    /// under it. NEGATIVE CONTROLS: the grace's own edge is outside it, and
+    /// under it. Negative controls: the grace's own edge is outside it, and
     /// `human_ms=` on an `ERR` is no stamp.
     #[test]
     fn a_status_stamp_reads_as_the_one_person_fact() {
@@ -419,7 +445,20 @@ mod tests {
             assert_eq!(s.rows[1], "second \"quoted\" \\ tab\t");
             assert_eq!(s.rows[2], "❯ café 😀");
             assert_eq!((s.cursor_row, s.cursor_col, s.seq), (60, 2, 122571));
+            assert_eq!(s.cols, Some(138), "the pane's width, from dims");
+            assert_eq!(
+                s.pane_rows,
+                Some(63),
+                "the PANE's height, from dims — not the 3 rows sent"
+            );
         }
+        // No dims, or a width no pane has: unknown, never a guess.
+        let bare = r#"{"rows":[],"cursor":{"row":0,"col":0},"seq":5}"#;
+        assert_eq!(parse_text_json(bare).expect("parses").cols, None);
+        assert_eq!(parse_text_json(bare).expect("parses").pane_rows, None);
+        let huge =
+            r#"{"rows":[],"cursor":{"row":0,"col":0},"dims":{"rows":2,"cols":70000},"seq":5}"#;
+        assert_eq!(parse_text_json(huge).expect("parses").cols, None);
         // The trimmed form adds a field; unknown fields are ignored.
         let trimmed = r#"{"rows":[],"cursor":{"row":0,"col":0},"dims":{"rows":2,"cols":2},"seq":5,"trimmed":2}"#;
         let s = parse_text_json(trimmed).expect("parses");
@@ -454,9 +493,9 @@ mod tests {
         }
     }
 
-    /// The person's stamp (`"human_ms"`, 2026-09-25): a number is its age,
-    /// `null` is never, and a host that sends none is unknown — so is a value
-    /// that is neither, never a guess.
+    /// The person's stamp (`"human_ms"`): a number is its age, `null` is
+    /// never, and a host that sends none is unknown, as is a value that is
+    /// neither.
     #[test]
     fn the_persons_stamp_is_read_and_its_absence_is_unknown() {
         let with = |tail: &str| {
@@ -502,8 +541,6 @@ mod tests {
         assert!(parse_text_json(r#"{"rows":[1]}"#).is_err());
         assert!(parse_text_json(r#"{"rows":[]} x"#).is_err());
         assert!(parse_text_json("").is_err());
-        let s = parse_text_plain("a\nb\n");
-        assert_eq!(s.rows, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

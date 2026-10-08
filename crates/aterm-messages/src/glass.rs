@@ -2,105 +2,84 @@
 // Copyright 2026 Andrew Yates
 
 //! The glass: which rows rank where (pure over the live set), and the
-//! single-row WIDTH LAW that turns one message into one `cols`-wide row of
-//! cells — glyph, bold title, ` · ` excerpt, percent or elapsed clock, ETA,
-//! load words, stats, and the right-aligned capsules (design §1.5,
-//! generalised from status_bars.rs:2365-2485) — over the row's METER.
+//! single-row width law that turns one message into one `cols`-wide row of
+//! cells (glyph, bold title, ` · ` excerpt, percent or elapsed clock, ETA,
+//! load words, stats, and the right-aligned capsules) over the row's meter.
 //! Everything here is a pure function of its arguments; the host paints the
 //! [`Presentation`] it gets back.
 //!
-//! THE METER IS THE ROW (owner, 2026-09-23 — design ruling 55, kept by the
-//! merge's ruling 136). A metered row's meter is its whole width, `(0, cols,
-//! fill)`: 0 % at the window's left edge, 100 % at its right edge, and
-//! everything else on the row is written over it. It takes no room from the
-//! words and is never sacrificed; the host maps the fill onto the window's
-//! pixels, gutters included. The owner, of the 8–20-cell block that sat
-//! after the excerpt: *"the progress bar doesn't go all the way across the
-//! screen"*, and *"make sure that 0% and 100% and similar concepts are
-//! mapped to the relative size of the screen with such top progress bars"*.
-//! A BUSY row ([`crate::Meter::busy`]) carries `track = (0, cols)`: the same
-//! surface, for the comet (ruling 75). The pill, its caps and the meter's
-//! width constants retired with it (ruling 136).
+//! The meter is the row: a metered row's meter is `(0, cols, fill)`, 0 % at
+//! the window's left edge and 100 % at its right, with everything else on
+//! the row written over it. It takes no room from the words and is never
+//! sacrificed; the host maps the fill onto the window's pixels, gutters
+//! included. A busy row ([`crate::Meter::busy`]) carries `track = (0, cols)`,
+//! the same surface, for the comet.
 //!
-//! Fit order per row, `budget = cols − 2·MARGIN` (design §1.5, extended by
-//! §10.4.5 for the live words, amended by ruling 136):
+//! Fit order per row, `budget = cols − 2·MARGIN`:
 //!
 //! 1. `fixed = head + A + BEFORE_CAPSULES + capsules(long)`, where `A` is the
-//!    ACTIVITY's words: [`PCT_W`] for a row with a fill (two cells of gap and
-//!    the right-aligned percent), `1 + ELAPSED_SHORT_W` for a busy one (the
-//!    elapsed slot's short form; its long form is the first extra, ruling
-//!    241), 0 otherwise — and, on a moving row that carries the load SLOT, `2 +` the
-//!    widest words among the loads the row DECLARED ([`crate::Message::loads`];
-//!    every load's when it declared none, design ruling 221) more, whether
-//!    its words show yet or not: for
-//!    a routine pass the load is the one reason the row is on the glass at
-//!    all, so the words are paid for by the capsules' short forms and the
-//!    title's elision before they drop (review 2026-09-23), and the slot is
-//!    reserved at ONE width for the row's life so words arriving, changing
-//!    resource or leaving never re-lay a moving row (review round 2). Over
-//!    budget → the implicit `Details ›` goes first, where that alone fits
-//!    the row (ruling 305: the row body opens Details, and an authored
-//!    capsule keeps its words); still over → every capsule takes its SHORT
-//!    form (a capsule with none, the implicit `Details ›`, goes: a lone `›`
-//!    said nothing the row body does not do); still over → the title elides down to [`TITLE_MIN`]; still
-//!    over (cols < ~24) → degenerate: `A` goes whole, the title takes what
-//!    is left, the implicit `Details ›` goes, and the capsules stand from
-//!    column 0 for the painter to clip. Rows are always exactly `cols`
-//!    cells; never a panic; **authored capsules are never dropped**. The
-//!    meter and the track cost nothing and outlive even the degenerate step.
+//!    activity's words: [`PCT_W`] for a row with a fill, `1 + ELAPSED_SHORT_W`
+//!    for a busy one (the elapsed slot's long form is the first extra), 0
+//!    otherwise; plus, on a moving row that carries the load slot, `2 +` the
+//!    widest words among the loads the row declared
+//!    ([`crate::Message::loads`]; every load's when it declared none), whether
+//!    its words show yet or not. The slot is reserved at one width for the
+//!    row's life, so words arriving, changing resource or leaving never re-lay
+//!    a moving row. Over budget → the implicit `Details ›` goes first, where
+//!    that alone fits the row (the row body opens Details); still over →
+//!    every capsule takes its short form (a capsule with none goes); still
+//!    over → the title elides down to [`TITLE_MIN`]; still over (cols < ~24)
+//!    → degenerate: `A` goes whole, the title takes what is left, the implicit
+//!    `Details ›` goes, and the capsules stand from column 0 for the painter to
+//!    clip. Rows are always exactly `cols` cells; never a panic; authored
+//!    capsules are never dropped. The meter and the track cost nothing and
+//!    outlive even the degenerate step.
 //!
-//!    An ACTION EXCERPT — a painted `detail[0]` on a moving row, which the
-//!    host paints only when it changes what the person does (ruling 77):
-//!    the flow row's typing hold — is the one thing on such a row the person
-//!    must read. Its joint and its first [`DETAIL_FLOOR`] cells join `fixed`
-//!    (`3 + min(width, DETAIL_FLOOR)`), so the capsules' short forms and the
-//!    title's elision pay for it; only when the title at [`TITLE_MIN`] still
-//!    cannot does it go, before the degenerate step. Its row's load slot is not in `fixed`:
-//!    it is an extra after the excerpt (review 2026-09-24 — at 80 columns
-//!    the slot reserved at `network busy` left the retired admin install's
-//!    password line no room).
-//! 2. `room = budget − fixed`, `fixed` measured with the LONG capsules
-//!    whatever they became: the short forms fit the head, and the cells they
-//!    free never re-buy an extra a wider row already gave up — so once the
-//!    capsules are short the room is nil and every extra below is monotone
-//!    as the row narrows. The extras, in allocation order — (a) the ETA
-//!    slot, `1 + ETA_W` (else `1 + ETA_SHORT_W`), when a moving determinate
-//!    row asks for one; (b) the excerpt (`detail[0]`): whole if `3 + width ≤
-//!    room`, else shaped to `room − 3` CELLS if `room ≥ 3 + DETAIL_FLOOR`
-//!    (its whole lead clause where that cut says no word past it, ruling
-//!    404), else its whole LEAD CLAUSE if `3 +` its width fits and the
-//!    floor's cut begins with it (`behind for 7 h` of `behind for 7 h: its
-//!    turn…`, `tab 1 for 7 h` of `tab 1 for 7 h · tab 3…`;
-//!    [`crate::text::lead_clause`], rulings 402 and 404), else dropped —
-//!    never a stub (an action excerpt adds its reserved floor to the room,
-//!    and a starved one keeps just the floor); (b′) an
-//!    action excerpt's row's load slot, `3 +` its widest load words, beside a
-//!    WHOLE excerpt when it fits; (c) stats if `2 + len` fits after the
-//!    excerpt, else their short form ([`short_stats`]: `3 of 10 programs` →
-//!    `3/10 programs`, never a bare `3/10`) if that fits — beside a WHOLE
-//!    excerpt (or none at all). An extra asked for that does not fit starves
-//!    every extra after it.
+//!    An action excerpt (a painted `detail[0]` on a moving row, which the
+//!    host paints only when it changes what the person does) is the one thing
+//!    on such a row the person must read. Its joint and its first
+//!    [`DETAIL_FLOOR`] cells join `fixed` (`3 + min(width, DETAIL_FLOOR)`), so
+//!    the capsules' short forms and the title's elision pay for it; only when
+//!    the title at [`TITLE_MIN`] still cannot does it go, before the
+//!    degenerate step. Its row's load slot is not in `fixed`: it is an extra
+//!    after the excerpt.
+//! 2. `room = budget − fixed`, `fixed` measured with the long capsules
+//!    whatever they became: the cells the short forms free never re-buy an
+//!    extra a wider row already gave up, so every extra below is monotone as
+//!    the row narrows. The extras, in allocation order: (a) the ETA slot,
+//!    `1 + ETA_W` (else `1 + ETA_SHORT_W`), when a moving determinate row asks
+//!    for one; (b) the excerpt (`detail[0]`): whole if `3 + width ≤ room`,
+//!    else shaped to `room − 3` cells if `room ≥ 3 + DETAIL_FLOOR` (its whole
+//!    lead clause where that cut says no word past it), else its whole lead
+//!    clause if `3 +` its width fits and the floor's cut begins with it
+//!    (`behind for 7 h` of `behind for 7 h: its turn…`;
+//!    [`crate::text::lead_clause`]), else dropped, never a stub (an action
+//!    excerpt adds its reserved floor to the room, and a starved one keeps
+//!    just the floor); (b′) an action excerpt's row's load slot, `3 +` its
+//!    widest load words, beside a whole excerpt when it fits; (c) stats if
+//!    `2 + len` fits after the excerpt, else their short form
+//!    ([`short_stats`]: `3 of 10 programs` → `3/10 programs`, never a bare
+//!    `3/10`) if that fits, beside a whole excerpt (or none at all). An extra
+//!    asked for that does not fit starves every extra after it.
 //!
-//! Sacrifice order, therefore, as the row narrows: stats (short, then gone) → excerpt (shaped,
-//! then its lead clause, then dropped) → ETA (long, then short) → the implicit `Details ›` →
-//! capsule short forms → title
-//! elision → the activity words with the load words; on a row with an ETA
-//! the load words go before the short ETA does — where no ETA fits the room
-//! the load slot's cells, which the head paid for, buy the short one, and it
-//! then goes with the activity's words (ruling 229: how long outranks the
-//! load words) (on an action excerpt's row: stats → load
-//! slot → excerpt shaped → ETA → capsule short forms → title elision → the
-//! excerpt → the activity words); each a monotone flag while the row narrows
-//! (what is gone at one width is gone at every narrower one). The meter is
-//! never on that list.
+//! Sacrifice order as the row narrows: stats (short, then gone) → excerpt
+//! (shaped, then its lead clause, then dropped) → ETA (long, then short) →
+//! the implicit `Details ›` → capsule short forms → title elision → the
+//! activity words with the load words. On a row with an ETA, how long
+//! outranks the load words: where no ETA fits the room, the load slot's
+//! cells (which the head paid for) buy the short one, and it then goes with
+//! the activity's words. On an action excerpt's row: stats → load slot →
+//! excerpt shaped → ETA → capsule short forms → title elision → the excerpt →
+//! the activity words. Each is a monotone flag while the row narrows (what is
+//! gone at one width is gone at every narrower one). The meter is never on
+//! that list.
 //!
 //! Cells on a row: `glyph title · excerpt ␠␠pct|␠elapsed ␠eta ␠␠stats …
 //! load ␠␠capsules`, all over the meter. The percent is right-aligned in its
 //! four cells and the time words are left-aligned in theirs, so nothing after
-//! them moves as the numbers change; the load slot sits at the TAIL of the
-//! words, right-aligned against the capsules (ruling 246), so it never moves
-//! as the stats do. Beside a percent the stats paint only the job's size
-//! ([`job_stats`]).
+//! them moves as the numbers change; the load slot sits at the tail of the
+//! words, right-aligned against the capsules, so it never moves as the stats
+//! do. Beside a percent the stats paint as [`job_stats`] says.
 
 use std::cmp::Reverse;
 
@@ -113,18 +92,14 @@ use crate::{
 };
 
 /// The glass rank of a live row, highest first: asks, then the severity
-/// CLASS ([`severity_class`]), then live/standing before held, then the
+/// class ([`severity_class`]), then live/standing before held, then the
 /// earlier post (ties by the lower id).
 pub(crate) type Rank = (bool, u8, bool, Reverse<Instant>, Reverse<MessageId>);
 
 /// The rank's severity term: Error above Warn above the quiet tones, and
-/// Success WITH Info — one class, so the two order by `posted_at` alone.
-/// A launch pass posts `✓ ALab tools installed` and then the `↻`
-/// machine-settings rows; with Info over Success the pass's own result
-/// sat behind the overflow row for the length of the machine rows' holds
-/// (review, 2026-09-22), where today's lane shows it first. Design §2.4's
-/// own consequence — "rank ties break on `posted_at`" for an `↻` row
-/// before a `✓` row — presumes exactly this class.
+/// Success with Info as one class, so the two order by `posted_at` alone (a
+/// launch pass's `✓` result posted first is not held behind the `↻` rows
+/// that follow it).
 #[must_use]
 pub(crate) const fn severity_class(severity: Severity) -> u8 {
     match severity {
@@ -134,16 +109,16 @@ pub(crate) const fn severity_class(severity: Severity) -> u8 {
     }
 }
 
-/// The rank tuple of one row. A RETROSPECTIVE row — a record about a
-/// previous run, `aterm crashed last time` ([`crate::Message::retrospective`])
-/// — ranks one severity class below its own (design ruling 259): what
-/// happened last time never takes the row of what is happening now.
+/// The rank tuple of one row. A retrospective row (a record about a previous
+/// run, `aterm crashed last time`, [`crate::Message::retrospective`]) ranks
+/// one severity class below its own: what happened last time never takes the
+/// row of what is happening now.
 #[must_use]
 pub(crate) fn rank(live: &Live) -> Rank {
     (
         live.msg.is_ask(),
         severity_class(live.msg.severity).saturating_sub(u8::from(live.msg.retrospective)),
-        matches!(live.msg.hold, Hold::Live { .. } | Hold::Standing),
+        matches!(live.msg.hold, Hold::Live { .. } | Hold::Standing(_)),
         Reverse(live.posted_at),
         Reverse(live.id),
     )
@@ -169,9 +144,9 @@ pub struct Presentation {
 pub enum RowKind {
     /// One message.
     Message(MessageId),
-    /// A retired live row's completion ECHO in the slot it held (design
-    /// §10.4.3): laid out as the row was, painted by the motion layer, not
-    /// pressable, not announced, never counted as a row.
+    /// A retired live row's completion echo in the slot it held: laid out as
+    /// the row was, painted by the motion layer, not pressable, not announced,
+    /// never counted as a row.
     Echo(MessageId),
     /// `N more messages` — one link to Settings ▸ Messages.
     Overflow {
@@ -184,7 +159,7 @@ pub enum RowKind {
 /// already shaped to fit; the ` · ` joint occupies the three cells before
 /// `detail`'s column (and `load`'s), the space before `pct`'s, `elapsed`'s
 /// and `eta`'s, and the two before `stats`'. The meter (or a busy row's
-/// track) is the whole row, under every piece (ruling 136).
+/// track) is the whole row, under every piece.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "four independent facts the painter reads — live ink, busy, and each time slot's short form — each set once by the width law"
@@ -205,18 +180,17 @@ pub struct RowLayout {
     pub full_title: String,
     /// The excerpt text and its column, when it fits.
     pub detail: Option<(usize, String)>,
-    /// `(col, width, fill_permille)` of the row's meter — always `(0, cols,
-    /// fill)`, THE WHOLE ROW, whenever the message carries a fill (see the
-    /// module docs): the host lays it under every other piece and maps the
-    /// fill onto the window's full pixel width.
+    /// `(col, width, fill_permille)` of the row's meter: always `(0, cols,
+    /// fill)`, the whole row, whenever the message carries a fill. The host
+    /// lays it under every other piece and maps the fill onto the window's
+    /// full pixel width.
     pub meter: Option<(usize, usize, u16)>,
     /// Work in flight with no fill ([`crate::Meter::busy`]): the motion
     /// layer sweeps the comet along the track.
     pub busy: bool,
-    /// `(col, width)` of a busy row's track — always `(0, cols)`, THE WHOLE
-    /// ROW, like a meter (ruling 75): the host lays it under every other
-    /// piece and maps the comet onto the window's full pixel width. Never
-    /// with `meter`.
+    /// `(col, width)` of a busy row's track: always `(0, cols)`, the whole
+    /// row, like a meter. The host lays it under every other piece and maps
+    /// the comet onto the window's full pixel width. Never with `meter`.
     pub track: Option<(usize, usize)>,
     /// The `NN%` text and its column (right-aligned in its four cells).
     pub pct: Option<(usize, String)>,
@@ -224,19 +198,18 @@ pub struct RowLayout {
     /// or [`ELAPSED_SHORT_W`] where the long form did not fit) of a busy row;
     /// the motion layer writes the words.
     pub elapsed: Option<usize>,
-    /// The elapsed slot is in its SHORT form (`for 3m`, [`ELAPSED_SHORT_W`]
+    /// The elapsed slot is in its short form (`for 3m`, [`ELAPSED_SHORT_W`]
     /// cells).
     pub elapsed_short: bool,
     /// The ETA slot's column ([`Self::eta_width`] cells: [`ETA_W`], or
     /// [`ETA_SHORT_W`] where the long form did not fit); the motion layer
     /// writes the words.
     pub eta: Option<usize>,
-    /// The ETA slot is in its SHORT form (`59m left`, [`ETA_SHORT_W`] cells).
+    /// The ETA slot is in its short form (`59m left`, [`ETA_SHORT_W`] cells).
     pub eta_short: bool,
-    /// The heavy-load words and their column, right-aligned in the load
-    /// slot, when they show. No joint: the slot sits at the TAIL of the word
-    /// cluster, before the capsules (design ruling 246), two cells clear of
-    /// whatever precedes it.
+    /// The heavy-load words and their column, right-aligned in the load slot,
+    /// when they show. No joint: the slot sits at the tail of the word
+    /// cluster, before the capsules, two cells clear of whatever precedes it.
     pub load: Option<(usize, &'static str)>,
     /// The reserved load slot's column and width, words or not — the cells
     /// the row keeps for them at the tail of its words, so an empty
@@ -248,10 +221,10 @@ pub struct RowLayout {
     pub capsules: Vec<CapsuleLayout>,
 }
 
-/// Which chip a capsule is. The role follows the INTENT, not its position:
+/// Which chip a capsule is. The role follows the intent, not its position:
 /// the accent marks a consequential press ([`Intent::is_consequential`]),
 /// so a row of navigations wears quiet chips only and two accent chips never
-/// stack on one band (Phase 1 review ruling 18, 2026-09-22).
+/// stack on one band.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapsuleRole {
     /// A consequential authored intent (Install now, Install, a system pane,
@@ -319,11 +292,10 @@ impl Presentation {
         }
     }
 
-    /// The repaint-key term: **exactly `0` with no rows**, else a nonzero
-    /// FNV-1a over everything the painter reads (status_bars.rs:1024-1053).
-    /// The fill is folded quantized to whole percent — the resolution the
-    /// `NN%` readout shows — so a byte tick that cannot move a glyph does
-    /// not re-present the frame.
+    /// The repaint-key term: exactly `0` with no rows, else a nonzero FNV-1a
+    /// over everything the painter reads. The fill is folded quantized to
+    /// whole percent (what the `NN%` readout shows), so a byte tick that
+    /// cannot move a glyph does not re-present the frame.
     #[must_use]
     pub fn fingerprint(&self) -> u64 {
         if self.rows.is_empty() {
@@ -364,7 +336,7 @@ impl Presentation {
                 }
                 None => h.byte(0),
             }
-            // The busy row's STATIC shape only: what moves is the motion
+            // The busy row's static shape only: what moves is the motion
             // layer's, folded in its own term.
             h.byte(u8::from(row.busy));
             match row.track {
@@ -469,10 +441,10 @@ impl RowLayout {
         }
     }
 
-    /// The spoken sentence: `title` or `title · <detail[0] whole>` —
-    /// width-independent, so a resize that re-shapes or drops the painted
-    /// excerpt never re-announces a row (design §3.5) — with the band's
-    /// pictographic joints said as words ([`speakable`]).
+    /// The spoken sentence: `title` or `title · <detail[0] whole>`,
+    /// width-independent so a resize that re-shapes or drops the painted
+    /// excerpt never re-announces a row, with the band's pictographic joints
+    /// said as words ([`speakable`]).
     #[must_use]
     pub fn spoken(&self, full_detail0: &str) -> String {
         if full_detail0.is_empty() {
@@ -484,11 +456,10 @@ impl RowLayout {
 }
 
 /// The painted words as a screen reader should say them. The band's terse
-/// excerpts join their parts with pictographs a reader spells out
-/// (`windw_padding right arrow window_padding?`, `pane 20 multiplication sign
-/// 5`, review 2026-09-24): ` → ` (an unknown key's near miss) is said `, did
-/// you mean `, ` ▸ ` (a Settings route) `, `, and `×` between two digits (a
-/// pane's size) ` by `. The paint is unchanged.
+/// excerpts join their parts with pictographs a reader would spell out:
+/// ` → ` (an unknown key's near miss) is said `, did you mean `, ` ▸ ` (a
+/// Settings route) `, `, and `×` between two digits (a pane's size) ` by `.
+/// The paint is unchanged.
 #[must_use]
 pub(crate) fn speakable(words: &str) -> String {
     let chars: Vec<char> = words.chars().collect();
@@ -525,11 +496,10 @@ pub(crate) fn speakable(words: &str) -> String {
     out
 }
 
-/// Whether the IMPLICIT links are laid out — a row's `Details ›` (`+N ›`
-/// on a single row) and the overflow row's `Messages ›`. The authored
-/// capsules are laid out either way; the host withholds the links until it
-/// has the page they open (design §8, Phase 1: a link with no destination
-/// is dishonest, and a press on it that only folded the row was worse).
+/// Whether the implicit links are laid out: a row's `Details ›` (`+N ›` on a
+/// single row) and the overflow row's `Messages ›`. The authored capsules
+/// are laid out either way; the host withholds the links until it has the
+/// page they open (a link with no destination is dishonest).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Links {
     /// Authored capsules only; the overflow row is words alone.
@@ -541,11 +511,17 @@ pub enum Links {
 /// One capsule before layout: both forms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CapsuleSpec {
-    /// The long form.
+    /// The long form, as painted.
     pub long: String,
-    /// The short form the width law falls back to; EMPTY for a capsule
-    /// with none, which the law drops instead (the implicit `Details ›`).
+    /// The short form the width law falls back to; empty for a capsule with
+    /// none, which the law drops instead (the implicit `Details ›`).
     pub short: String,
+    /// The long form the row pays for: `long` itself, save on a capsule the
+    /// band forced to its short form (`long` is then the short words). Every
+    /// fitting decision of the row (the link's drop, the short forms, the
+    /// title's elision, the extras' room) is measured on this, so the cells a
+    /// forced form saves buy nothing a wider row gave up.
+    pub paid: String,
     /// The full label a screen reader says.
     pub full_label: &'static str,
     /// Its ink.
@@ -561,6 +537,7 @@ impl CapsuleSpec {
         Self {
             long: intent.label().to_string(),
             short: intent.short().to_string(),
+            paid: intent.label().to_string(),
             full_label: intent.label(),
             role: if intent.is_consequential() {
                 CapsuleRole::Primary
@@ -571,17 +548,17 @@ impl CapsuleSpec {
         }
     }
 
-    /// This capsule with its cells kept and nothing drawn in them (design
-    /// ruling 235): both forms become blanks of their own widths, in the
-    /// `Details` ink, which paints no chip ground, and nothing to say. The
-    /// row it sits on does not reflow when a capsule stops meaning anything
-    /// — an echo's `Stop paste`, once the paste is over.
+    /// This capsule with its cells kept and nothing drawn in them: both forms
+    /// become blanks of their own widths, in the `Details` ink (no chip
+    /// ground), with nothing to say. The row does not reflow when a capsule
+    /// stops meaning anything (an echo's `Stop paste`, once the paste is over).
     #[must_use]
     pub fn blanked(self) -> Self {
         let blank = |s: &str| " ".repeat(s.chars().count());
         Self {
             long: blank(&self.long),
             short: blank(&self.short),
+            paid: blank(&self.paid),
             full_label: "",
             role: CapsuleRole::Details,
             action: self.action,
@@ -589,10 +566,9 @@ impl CapsuleSpec {
     }
 
     /// The implicit `Details ›`; with `hidden > 0` behind a single committed
-    /// row it reads `+N ›`. `Details ›` has NO short form: below its long
-    /// width it goes, rather than painting a lone `›` — the row body
-    /// performs Details (§2.2), and the cells go to the title and the
-    /// activity (review round 2, 2026-09-23). `+N›` keeps its count.
+    /// row it reads `+N ›`. `Details ›` has no short form: below its long
+    /// width it goes rather than paint a lone `›` (the row body performs
+    /// Details). `+N›` keeps its count.
     #[must_use]
     pub(crate) fn details(hidden: usize) -> Self {
         let (long, short) = if hidden > 0 {
@@ -601,6 +577,7 @@ impl CapsuleSpec {
             ("Details \u{203a}".to_string(), String::new())
         };
         Self {
+            paid: long.clone(),
             long,
             short,
             full_label: Intent::Details.label(),
@@ -636,24 +613,23 @@ pub(crate) struct RowSpec<'a> {
     /// Work in flight with no fill ([`crate::Meter::busy`]): the whole row
     /// is its track, and the elapsed slot is part of the fixed head.
     pub busy: bool,
-    /// The row's FILL moves (a live row's glide and glint): its percent may
+    /// The row's fill moves (a live row's glide and glint): its percent may
     /// bring the ETA slot and the load slot. A still fill (a held row's)
     /// brings neither.
     pub animated: bool,
-    /// The fill is a measured LEVEL ([`crate::Meter::level`], ruling 208):
-    /// the whole row still, but no percent — the elapsed clock (how long
-    /// the strain has lasted) and the load slot in its place — and never
-    /// an ETA.
+    /// The fill is a measured level ([`crate::Meter::level`]): the whole row
+    /// still, but no percent (the elapsed clock, how long the strain has
+    /// lasted, and the load slot in its place) and never an ETA.
     pub level: bool,
     /// Reserve the ETA slot (a live determinate row whose reporter supplies
     /// an amount).
     pub eta: bool,
     /// The heavy-load words, when they show.
     pub load: Option<Load>,
-    /// The loads the row reserves the load slot for (it has declared a
-    /// load): the slot is laid out whether or not `load` shows, at the widest
-    /// of THESE loads' words (design ruling 221). Empty: no slot, unless
-    /// `load` shows (then every load's width).
+    /// The loads the row reserves the load slot for (it has declared a load):
+    /// the slot is laid out whether or not `load` shows, at the widest of
+    /// these loads' words. Empty: no slot, unless `load` shows (then every
+    /// load's width).
     pub load_slot: Loads,
     /// The capsules, left to right (authored first, `Details ›` last).
     pub capsules: Vec<CapsuleSpec>,
@@ -698,22 +674,21 @@ impl Activity {
         match self {
             Self::None => 0,
             Self::LiveBar | Self::HeldBar => PCT_W,
-            // The SHORT elapsed form is the head's: the long one is an
-            // extra, the first sacrificed (ruling 241).
+            // The short elapsed form is the head's: the long one is an extra,
+            // the first sacrificed.
             Self::LiveBusy | Self::LiveLevel => 1 + ELAPSED_SHORT_W,
         }
     }
 }
 
-/// The overflow row's spec (design ruling 259): ONE LINK to Settings ▸
-/// Messages, its words the whole row — `… N more ›` — with no capsule of its
-/// own. When a live progress row is among the hidden ones (two rows, two
-/// downloads), the row names it first: `+ Downloading aterm v0.91.0 45% ·
-/// 2 more ›` — the `+` in the glyph's cell, `N` then the OTHER hidden rows —
-/// and falls back to `N more ›` where that does not fit whole. `progress` is
-/// the hidden row's title and its percent, already joined. The `›` is the
-/// link's, so it is painted only with the links ([`Links::Painted`]).
-/// `words` is [`overflow_words`]' long form.
+/// The overflow row's spec: one link to Settings ▸ Messages, its words the
+/// whole row (`… N more ›`), with no capsule of its own. When a live
+/// progress row is among the hidden ones, the row names it first (`+
+/// Downloading aterm v0.91.0 45% · 2 more ›`: the `+` in the glyph's cell,
+/// `N` then the other hidden rows) and falls back to `N more ›` where that
+/// does not fit whole. `progress` is the hidden row's title and its percent,
+/// already joined. The `›` is the link's, so it is painted only with the
+/// links ([`Links::Painted`]). `words` is [`overflow_words`]' long form.
 #[must_use]
 pub(crate) fn overflow_spec(hidden: usize, words: &str) -> RowSpec<'_> {
     RowSpec {
@@ -753,10 +728,10 @@ fn overflow_short(hidden: usize, arrow: &str) -> String {
     format!("{hidden} more{arrow}")
 }
 
-/// The overflow row's long form ([`overflow_spec`]): the hidden progress row's words, then how
-/// many OTHER rows are hidden (`+ Downloading … 45% · 2 more ›`, or `+
-/// Downloading … 45% ›` when it is the only one); the short form when no
-/// progress row is hidden.
+/// The overflow row's long form ([`overflow_spec`]): the hidden progress
+/// row's words, then how many other rows are hidden (`+ Downloading … 45% ·
+/// 2 more ›`, or `+ Downloading … 45% ›` when it is the only one); the short
+/// form when no progress row is hidden.
 #[must_use]
 pub(crate) fn overflow_words(hidden: usize, links: Links, progress: Option<&str>) -> String {
     let arrow = overflow_arrow(links);
@@ -833,11 +808,11 @@ fn next_piece(row: &RowLayout, cols: usize) -> usize {
     next
 }
 
-/// A Complete echo's title (design ruling 154): `words` — the row's finished
-/// form — in the title's place, with NOTHING else on the row moved. It takes
-/// the laid title's cells, padded with blanks when shorter, and may run on
-/// into the blank cells before the next piece (one kept clear) before it
-/// elides; the spoken title is `words` whole.
+/// A Complete echo's title: `words` (the row's finished form) in the
+/// title's place, with nothing else on the row moved. It takes the laid
+/// title's cells, padded with blanks when shorter, and may run on into the
+/// blank cells before the next piece (one kept clear) before it elides; the
+/// spoken title is `words` whole.
 pub(crate) fn finish_title(
     row: &mut RowLayout,
     words: &str,
@@ -863,15 +838,17 @@ pub(crate) fn finish_title(
 }
 
 /// The capsules painted in the long or the short forms: every one long; the
-/// ones that HAVE a short form short.
+/// ones that have a short form short.
 fn painted(caps: &[CapsuleSpec], short: bool) -> impl Iterator<Item = &CapsuleSpec> {
     caps.iter().filter(move |c| !short || !c.short.is_empty())
 }
 
-/// The cells the capsules take together.
+/// The cells the capsules take together, as the row pays for them: the
+/// short forms, else each capsule's [`CapsuleSpec::paid`] long form (a
+/// forced short label paints narrower and pays its long width).
 fn capsules_width(caps: &[CapsuleSpec], short: bool, width: &dyn Fn(&str) -> usize) -> usize {
     let (texts, n) = painted(caps, short).fold((0usize, 0usize), |(w, n), c| {
-        (w + width(if short { &c.short } else { &c.long }) + 2, n + 1)
+        (w + width(if short { &c.short } else { &c.paid }) + 2, n + 1)
     });
     texts + CAPSULE_GAP * n.saturating_sub(1)
 }
@@ -896,9 +873,9 @@ struct Fit {
     activity: Activity,
     details_dropped: bool,
     room: usize,
-    /// A moving row's PAINTED excerpt ([`action_excerpt`]): the cells the
+    /// A moving row's painted excerpt ([`action_excerpt`]): the cells the
     /// fixed head reserved for it (its floor), 0 once even the elided title
-    /// could not pay for them — and then it is gone, not an extra.
+    /// could not pay for them (and then it is gone, not an extra).
     excerpt_floor: usize,
     /// The row's excerpt is an action excerpt (whether or not its floor
     /// survived): the load slot is then an extra after it.
@@ -907,7 +884,7 @@ struct Fit {
 
 /// The load slot's width: the widest words among the loads the row reserves
 /// the slot for, under `width`, so a resource change within them never
-/// re-lays the row (design ruling 221) — every load's when it declared none.
+/// re-lays the row; every load's when it declared none.
 fn load_slot_width(spec: &RowSpec<'_>, width: &dyn Fn(&str) -> usize) -> usize {
     let reserved = match spec.load {
         Some(l) if !spec.load_slot.is_empty() => spec.load_slot.with(l),
@@ -920,15 +897,16 @@ fn load_slot_width(spec: &RowSpec<'_>, width: &dyn Fn(&str) -> usize) -> usize {
 /// Whether the row lays out the load slot: a moving activity on a row that
 /// reserves one (or shows words now).
 fn reserves_load(spec: &RowSpec<'_>, activity: Activity) -> bool {
-    // A measured LEVEL (the strain row) never has one: its title already
-    // names the load (design ruling 243).
+    // A measured level (the strain row) never has one: its title already
+    // names the load.
     matches!(activity, Activity::LiveBar | Activity::LiveBusy)
         && (!spec.load_slot.is_empty() || spec.load.is_some())
 }
 
-/// The load slot's cells, its two-cell gap included, when the row lays it out in the
-/// fixed head (module doc, step 1) — not on a row whose excerpt is an ACTION
-/// excerpt ([`action_excerpt`]), where the slot is an extra after it.
+/// The load slot's cells, its two-cell gap included, when the row lays it
+/// out in the fixed head (module doc, step 1); not on a row whose excerpt is
+/// an action excerpt ([`action_excerpt`]), where the slot is an extra after
+/// it.
 fn load_cells(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) -> usize) -> usize {
     if reserves_load(spec, activity) && !action_excerpt(spec, activity) {
         2 + load_slot_width(spec, width)
@@ -937,12 +915,11 @@ fn load_cells(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) -> us
     }
 }
 
-/// Whether the row's excerpt is an ACTION excerpt: a PAINTED `detail[0]`
-/// on a MOVING row. The host paints a moving row's excerpt only when it
-/// changes what the person does (ruling 77) — the flow row's typing hold —
-/// so it is the one thing on the row the person must read: it outranks the load slot
-/// and is paid for by the capsules' short forms and the title's elision,
-/// never dropped while they can pay (module doc, step 1; review 2026-09-24).
+/// Whether the row's excerpt is an action excerpt: a painted `detail[0]` on
+/// a moving row. The host paints a moving row's excerpt only when it changes
+/// what the person does, so it is the one thing on the row the person must
+/// read: it outranks the load slot and is paid for by the capsules' short
+/// forms and the title's elision, never dropped while they can pay.
 fn action_excerpt(spec: &RowSpec<'_>, activity: Activity) -> bool {
     matches!(
         activity,
@@ -988,12 +965,10 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     // never re-buy an excerpt a wider row already gave up.
     let room = budget.saturating_sub(fixed);
     let mut details_dropped = false;
-    // THE IMPLICIT `Details ›` GOES FIRST (design ruling 305): the row body
-    // opens Details at every width, so the link's cells are spent before an
-    // authored capsule loses its words — at 60 columns `Open aterm.toml`
-    // stayed whole on one config row and read `Edit` on the next, by title
-    // length alone (round 21). Only the plain link: `+N ›` keeps its count
-    // in its short form.
+    // The implicit `Details ›` goes first: the row body opens Details at
+    // every width, so the link's cells are spent before an authored capsule
+    // loses its words. Only the plain link: `+N ›` keeps its count in its
+    // short form.
     if fixed > budget
         && let Some((last, kept)) = spec.capsules.split_last()
         && last.action.is_details()
@@ -1031,7 +1006,7 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     }
     if fixed > budget && ex > 0 {
         // Even the elided title cannot pay for the action excerpt: it goes
-        // (for good — every narrower row is shorter still), and the title
+        // (for good: every narrower row is shorter still), and the title
         // takes back what it can of the cells.
         ex = 0;
         title = elide(full_title, 0);
@@ -1039,7 +1014,7 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     }
     if fixed > budget {
         // Degenerate: the activity's words go whole (pct or elapsed, and the
-        // load slot, together — the meter and the track stay: they cost
+        // load slot, together; the meter and the track stay, they cost
         // nothing), the title takes what is left, and the implicit Details
         // capsule goes before any authored one is touched.
         activity = Activity::None;
@@ -1065,9 +1040,9 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     }
 }
 
-/// `detail0` shaped to at most `target` CELLS under `width`. [`shape_detail`]
+/// `detail0` shaped to at most `target` cells under `width`. [`shape_detail`]
 /// cuts by chars; under a wide measure its result can still be too wide, so
-/// the char cap is lowered until the cells fit — to the LARGEST cap that
+/// the char cap is lowered until the cells fit, to the largest cap that
 /// does, so what is shown at one width is shown at every wider one and the
 /// excerpt never flickers during a resize. `None` when nothing fits.
 fn shape_to_cells(detail0: &str, target: usize, width: &dyn Fn(&str) -> usize) -> Option<String> {
@@ -1088,11 +1063,10 @@ fn shape_to_cells(detail0: &str, target: usize, width: &dyn Fn(&str) -> usize) -
     }
 }
 
-/// The excerpt's lead clause where the floor would drop it (design ruling
-/// 402): [`lead_clause`], narrower than [`DETAIL_FLOOR`], kept only where
-/// the floor's own cut begins with it — so the words a narrow row shows,
-/// every wider row shows too, and the excerpt never grows as the row
-/// narrows.
+/// The excerpt's lead clause where the floor would drop it: [`lead_clause`],
+/// narrower than [`DETAIL_FLOOR`], kept only where the floor's own cut
+/// begins with it, so the words a narrow row shows every wider row shows
+/// too, and the excerpt never grows as the row narrows.
 fn floor_clause(detail0: &str, width: &dyn Fn(&str) -> usize) -> Option<String> {
     let lead = lead_clause(detail0)?;
     let floor = shape_to_cells(detail0, DETAIL_FLOOR, width)?;
@@ -1100,12 +1074,10 @@ fn floor_clause(detail0: &str, width: &dyn Fn(&str) -> usize) -> Option<String> 
 }
 
 /// An excerpt that is not whole in `cells` (its joint included): shaped to
-/// the cells at or above the floor — its whole lead clause where the cut
-/// says no word past it (ruling 404: `behind for 26 h`, never `behind for
-/// 26 h:…` with its joint dangling) — else, under the floor, where a cut
-/// would be a stub, its whole lead clause ([`floor_clause`], ruling 402:
-/// `behind for 7 h` where `behind for 7 h: its…` no longer fits), else
-/// nothing.
+/// the cells at or above the floor (its whole lead clause where the cut says
+/// no word past it: `behind for 26 h`, never `behind for 26 h:…`), else,
+/// under the floor where a cut would be a stub, its whole lead clause
+/// ([`floor_clause`]), else nothing.
 fn excerpt_cut(detail0: &str, cells: usize, width: &dyn Fn(&str) -> usize) -> Option<String> {
     if cells >= 3 + DETAIL_FLOOR
         && let Some(shaped) = shape_to_cells(detail0, cells - 3, width)
@@ -1147,8 +1119,8 @@ pub(crate) fn layout_row(
 }
 
 /// [`layout_row`], with the band's time words forced to their short form
-/// where `short_time` (design ruling 305: one row at this width took them
-/// short, so every row does).
+/// where `short_time` (one row at this width took them short, so every row
+/// does).
 pub(crate) fn layout_row_with(
     spec: &RowSpec<'_>,
     cols: usize,
@@ -1162,9 +1134,9 @@ pub(crate) fn layout_row_with(
 
 /// Step 2: the extras from the room the fixed head left, in allocation
 /// order (module doc). The meter is not one: it costs nothing. `short_time`:
-/// the band paints its time words short at this width (ruling 305) — a row
-/// that could take the long elapsed or ETA form takes the short one, so
-/// stacked rows read alike, and the cells it saves are not spent.
+/// the band paints its time words short at this width, so a row that could
+/// take the long elapsed or ETA form takes the short one and the cells it
+/// saves are not spent.
 fn allocate_extras(
     spec: &RowSpec<'_>,
     fit: &Fit,
@@ -1172,22 +1144,25 @@ fn allocate_extras(
     short_time: bool,
 ) -> Extras {
     let mut room = fit.room;
-    // An extra the row asked for that did not fit STARVES every extra after
+    // An extra the row asked for that did not fit starves every extra after
     // it: they are sacrificed first as the row narrows, so none of them may
     // come back in the cells the starved one left.
     let mut starved = false;
-    // a0. the elapsed slot's LONG form (`for 3 min`), else its short one
-    //    (`for 3m`, paid for in the head) — which starves the rest, as a
-    //    short ETA does (ruling 241).
+    // a0. the elapsed slot's long form (`for 3 min`), else its short one
+    //    (`for 3m`, paid for in the head), which starves the rest, as a
+    //    short ETA does.
     let mut elapsed_w = 0;
     if matches!(fit.activity, Activity::LiveBusy | Activity::LiveLevel) {
         if ELAPSED_W - ELAPSED_SHORT_W <= room {
-            if short_time {
-                elapsed_w = ELAPSED_SHORT_W;
+            // Forced short, the row still pays the long form's cells: they
+            // buy no stats, excerpt or load slot its own layout at this width
+            // does not have.
+            elapsed_w = if short_time {
+                ELAPSED_SHORT_W
             } else {
-                elapsed_w = ELAPSED_W;
-                room -= ELAPSED_W - ELAPSED_SHORT_W;
-            }
+                ELAPSED_W
+            };
+            room -= ELAPSED_W - ELAPSED_SHORT_W;
         } else {
             elapsed_w = ELAPSED_SHORT_W;
             starved = true;
@@ -1198,21 +1173,18 @@ fn allocate_extras(
     //    never re-buy an excerpt or stats a wider row gave up.
     let mut eta_w = 0;
     // The load slot and its words: paid for in the fixed head, so a moving
-    // row that kept its activity keeps them — except beside an action
-    // excerpt, where the slot is an extra after it (below), and on a row
-    // whose ETA they would cost: HOW LONG outranks the load words (the
-    // owner: "how long to wait and for what" — ruling 229), so where no
-    // ETA fits the room the slot's cells buy the short one. The slot is one
-    // width for the row's life, so the trade is a fact of the width alone:
-    // words arriving or leaving never re-lay the row, and once traded it
-    // stays traded at every narrower width (the ETA short: the cells a
-    // wider row gave the long one never come back).
+    // row that kept its activity keeps them, except beside an action excerpt
+    // (the slot is an extra after it, below) and on a row whose ETA they
+    // would cost: how long outranks the load words, so where no ETA fits the
+    // room the slot's cells buy the short one. The slot is one width for the
+    // row's life, so the trade depends on the width alone: words arriving or
+    // leaving never re-lay the row, and once traded it stays traded at every
+    // narrower width.
     let mut load_slot = reserves_load(spec, fit.activity) && !fit.action_excerpt;
     // What the slot costs the room: its painted width, save where the band
-    // forces the short form on a row that had room for the long one — that
-    // row pays the LONG width, so the cells the short words save buy no
-    // excerpt, load words or stats (ruling 305(b); the elapsed slot above
-    // leaves its forced cells unspent the same way).
+    // forces the short form on a row that had room for the long one; that
+    // row pays the long width, so the cells the short words save buy no
+    // excerpt, load words or stats (the elapsed slot above does the same).
     if spec.eta && fit.activity == Activity::LiveBar {
         if ETA_W < room {
             eta_w = if short_time { ETA_SHORT_W } else { ETA_W };
@@ -1258,15 +1230,15 @@ fn allocate_extras(
             detail = Some(cut);
         }
         if fit.action_excerpt {
-            // What the excerpt left is the row's again only beside a WHOLE
-            // excerpt: a shaped one ends where its words did, and the cells
-            // a word-boundary cut left must not re-buy what a wider row had.
+            // What the excerpt left is the row's again only beside a whole
+            // excerpt: a shaped one ends where its words did, and the cells a
+            // word-boundary cut left must not re-buy what a wider row had.
             room += if detail_whole { cells } else { 0 };
         } else {
             room = cells;
         }
     }
-    // b′. the load slot beside a WHOLE action excerpt, when it fits.
+    // b′. the load slot beside a whole action excerpt, when it fits.
     if fit.action_excerpt
         && detail_whole
         && !starved
@@ -1280,7 +1252,7 @@ fn allocate_extras(
     // c. stats beside a whole excerpt (or none): a cut excerpt already
     //    said the row is short, and the stats never come back below that.
     //    Long, else short: the count is the one word that agrees with the
-    //    bar, so it goes last (ruling 223).
+    //    bar, so it goes last.
     let mut stats: Option<String> = None;
     let painted = spec.meter.and_then(|(_, s)| {
         if matches!(fit.activity, Activity::LiveBar | Activity::HeldBar) {
@@ -1306,16 +1278,15 @@ fn allocate_extras(
     }
 }
 
-/// The stats' SHORT form, where the long one does not fit (design rulings
-/// 223 and 248): a count `A of B unit …` as `A/B unit` — `3 of 10 programs`
-/// → `3/10 programs`, `6 of 8 cores` → `6/8 cores`, `23 of 24 GB used` →
-/// `23/24 GB` — the same numbers, changing at the same instants, and never
-/// without the word that says what they count: a count with no unit word
-/// (`1,200 of 3,400`) has no short form, so the width law drops it whole
-/// rather than paint a bare fraction. Else stats of several ` · ` clauses
-/// keep their LAST, where a reporter writes how big the wait is: `10
-/// programs · ~3 GB` → `~3 GB` (ruling 229). `None` for stats with no such
-/// count or clause (`31 MB / 74 MB` is its own short form).
+/// The stats' short form, where the long one does not fit: a count `A of B
+/// unit …` as `A/B unit` (`3 of 10 programs` → `3/10 programs`, `23 of 24 GB
+/// used` → `23/24 GB`), the same numbers changing at the same instants, and
+/// never without the word that says what they count: a count with no unit
+/// word (`1,200 of 3,400`) has no short form, so the width law drops it
+/// whole. Else stats of several ` · ` clauses keep their last, where a
+/// reporter writes how big the wait is (`10 programs · ~3 GB` → `~3 GB`).
+/// `None` for stats with no such count or clause (`31 MB / 74 MB` is its own
+/// short form).
 #[must_use]
 pub(crate) fn short_stats(stats: &str) -> Option<String> {
     let count = |w: &str| {
@@ -1357,10 +1328,10 @@ fn place(
         col += width(&d);
         (at, d)
     });
-    // THE METER IS THE ROW: every column, under everything else.
+    // The meter is the row: every column, under everything else.
     let meter = fill.filter(|_| cols > 0).map(|f| (0, cols, f));
-    // A BUSY ROW'S TRACK IS THE ROW TOO (ruling 75): the same whole-row
-    // surface, for the comet — never with a meter.
+    // A busy row's track is the row too: the same whole-row surface, for the
+    // comet, never with a meter.
     let busy = spec.busy && fill.is_none();
     let track = (busy && cols > 0).then_some((0, cols));
     let mut pct = None;
@@ -1368,7 +1339,7 @@ fn place(
     match (fit.activity, fill) {
         (Activity::LiveBar | Activity::HeldBar, Some(p)) => {
             // Two cells of gap, then the percent right-aligned in four, so
-            // `100%` keeps the standard two-space gap (ruling 246).
+            // `100%` keeps the standard two-space gap.
             let text = format!("{}%", p / 10);
             col += PCT_W - PCT_SLOT;
             pct = Some((col + PCT_SLOT.saturating_sub(width(&text)), text));
@@ -1396,11 +1367,11 @@ fn place(
         (at, s)
     });
     let capsules = place_capsules(spec, cols, width, fit);
-    // THE LOAD SLOT SITS AT THE TAIL of the words (ruling 246): right-aligned
-    // against the capsules' clearance (the right margin on a row with none),
-    // so it never moves as the stats or the time words change, and an empty
-    // reservation reads as track before the capsules rather than as a hole
-    // in the middle of the row. Its words are right-aligned in it.
+    // The load slot sits at the tail of the words: right-aligned against the
+    // capsules' clearance (the right margin on a row with none), so it never
+    // moves as the stats or the time words change, and an empty reservation
+    // reads as track before the capsules rather than as a hole in the middle
+    // of the row. Its words are right-aligned in it.
     let load_slot = extras.load_slot.then(|| {
         let w = load_slot_width(spec, width);
         let end = capsules.first().map_or(cols.saturating_sub(MARGIN), |c| {
@@ -1439,18 +1410,13 @@ fn place(
 /// The percent's own cells inside [`PCT_W`]: `100%` right-aligned in four.
 const PCT_SLOT: usize = 4;
 
-/// What a row WITH A PERCENT paints in its stats slot (design ruling 246):
-/// only the SIZE OF THE WHOLE JOB, and only where the title does not already
-/// say it. The percent already says how far along the work is, so the bytes
-/// done so far repeat it in a second unit: they ride the description, the
-/// `messages` verb and Details, never the glass. Clause by clause (` · `):
-/// a pair `A / B` paints `B`; a count `A of B unit` keeps its one grammar
-/// (`3 of 10 programs` — the count is the one word that agrees with the bar);
-/// a clause whose first figure is still zero (`0 B / 200 MB`, `0 of 10`) is
-/// hidden until the first unit arrives; and a clause whose total the title
-/// already states (`Pasting 4.2 MB` beside `1.1 MB / 4.2 MB`, `Rewrapping
-/// 3.4M lines` beside `1.2M of 3.4M lines`) goes. `None` when nothing is
-/// left.
+/// What a row with a percent paints in its stats slot, clause by clause
+/// (` · `): a pair `A / B` as one count (`33 MB / 74 MB` → `33 of 74 MB`); a
+/// count `A of B unit` keeps its grammar (`3 of 10 programs`); a clause
+/// whose first figure is still zero (`0 B / 200 MB`, `0 of 10`) is hidden
+/// until the first unit arrives; and a clause whose total the title already
+/// states (`Pasting 4.2 MB` beside `1.1 MB / 4.2 MB`) goes. `None` when
+/// nothing is left.
 #[must_use]
 pub fn job_stats(title: &str, stats: &str) -> Option<String> {
     let zero = |a: &str| {
@@ -1480,9 +1446,9 @@ pub fn job_stats(title: &str, stats: &str) -> Option<String> {
             if zero(first) || says_whole(title, &total) {
                 return None;
             }
-            // A count keeps its grammar; a pair becomes one — a size never
-            // stands bare beside the percent, it says what it is part of
-            // (`33 of 74 MB`, ruling 259; `74 MB` alone read as the size done).
+            // A count keeps its grammar; a pair becomes one: a size never
+            // stands bare beside the percent (`74 MB` alone would read as
+            // the size done).
             Some(match clause.split_once(" / ") {
                 Some((done, _)) => size_of(done.trim(), &total),
                 None => clause.to_string(),
@@ -1492,9 +1458,9 @@ pub fn job_stats(title: &str, stats: &str) -> Option<String> {
     (!clauses.is_empty()).then(|| clauses.join(crate::PIECE_SEP))
 }
 
-/// A pair `done / total` as one count (design ruling 259): `33 MB / 74 MB`
-/// → `33 of 74 MB` when both figures share a unit, `512 KB / 1.2 GB` →
-/// `512 KB of 1.2 GB` when they do not.
+/// A pair `done / total` as one count: `33 MB / 74 MB` → `33 of 74 MB` when
+/// both figures share a unit, `512 KB / 1.2 GB` → `512 KB of 1.2 GB` when
+/// they do not.
 fn size_of(done: &str, total: &str) -> String {
     fn split(s: &str) -> Option<(&str, &str)> {
         s.rsplit_once(' ')
@@ -1506,9 +1472,9 @@ fn size_of(done: &str, total: &str) -> String {
     }
 }
 
-/// Whether `title` states `words` as WHOLE words: an occurrence with no
-/// letter, digit or decimal point against either end — `Uploading 12 GB`
-/// does not say `2 GB`, `Pasting 4.2 MB` says `4.2 MB`.
+/// Whether `title` states `words` as whole words: an occurrence with no
+/// letter, digit or decimal point against either end (`Uploading 12 GB` does
+/// not say `2 GB`, `Pasting 4.2 MB` says `4.2 MB`).
 fn says_whole(title: &str, words: &str) -> bool {
     let joins = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '.' || c == ',');
     !words.is_empty()
@@ -1571,13 +1537,12 @@ pub(crate) mod tests {
     use super::*;
     use crate::model::Decision;
 
-    /// Paint a layout's WORDS into exactly `cols` cells the way the host
+    /// Paint a layout's words into exactly `cols` cells the way the host
     /// will: text at its columns, the ` · ` joint before the excerpt and the
-    /// load words, capsules as ` text ` — everything clipped at `cols`. The
-    /// meter (and a busy row's track) is the row's surface, not text: it is
-    /// `(0, cols, …)` whenever present, so it paints no character here and
-    /// tests assert it field by field (ruling 136). The time slots are the
-    /// motion layer's and stay blank here.
+    /// load words, capsules as ` text `, everything clipped at `cols`. The
+    /// meter (and a busy row's track) is the row's surface, not text: it
+    /// paints no character here and tests assert it field by field. The time
+    /// slots are the motion layer's and stay blank here.
     pub(crate) fn render(row: &RowLayout, cols: usize) -> String {
         let mut cells = vec![' '; cols];
         let mut put = |col: usize, s: &str| {
@@ -1597,7 +1562,7 @@ pub(crate) mod tests {
             put(*col, p);
         }
         if let Some((col, words)) = row.load {
-            // At the tail, no joint (ruling 246).
+            // At the tail, no joint.
             put(col, words);
         }
         if let Some((col, s)) = &row.stats {
@@ -1632,8 +1597,8 @@ pub(crate) mod tests {
     pub(crate) const STAGED_MANUAL: &str = "build 1234 \u{2014} verified; auto-apply is off \u{2014} apply it from the Version menu or Software Update (in place; your shells keep running)";
     pub(crate) const STAGED_AUTO: &str = "build 1234 \u{2014} verified; applies by itself at the next quiet moment, and within 15 min regardless \u{2014} nothing to do; your shells keep running";
 
-    /// The five §2.3 fixtures: crash, file access, staged (manual and auto),
-    /// config warning, toolchain meter.
+    /// The five width-law fixtures: crash, file access, staged (manual and
+    /// auto), config warning, toolchain meter.
     pub(crate) fn fixtures() -> Vec<(&'static str, RowSpec<'static>)> {
         vec![
             (
@@ -1762,9 +1727,9 @@ pub(crate) mod tests {
         ]
     }
 
-    /// The live indicator's fixtures (design §10.4.5): a download with its
-    /// ETA, a first run's indeterminate pass declaring disk load, the admin
-    /// install's comet, and a held metered row (a carried meter).
+    /// The live indicator's fixtures: a download with its ETA, a first run's
+    /// indeterminate pass declaring disk load, a busy install's comet, and a
+    /// held metered row (a carried meter).
     pub(crate) fn motion_fixtures() -> Vec<(&'static str, RowSpec<'static>)> {
         vec![
             (
@@ -1826,9 +1791,8 @@ pub(crate) mod tests {
                     capsules: caps(&[]),
                 },
             ),
-            // The longest action excerpt the band was measured with — the
-            // retired admin install's row (deleted 2026-09-24), kept as a
-            // fixture — beside a load slot.
+            // The longest action excerpt the band is measured with, kept as
+            // a fixture, beside a load slot.
             (
                 "action-excerpt",
                 RowSpec {
@@ -1892,13 +1856,8 @@ pub(crate) mod tests {
     }
 
     /// Invariant 14: the five rows at 60 / 80 / 120 / 160 columns, pinned
-    /// string-for-string — the width law's output, checked row by row
-    /// against design §2.3's per-row arithmetic (whole / shaped-to-N /
-    /// dropped / short capsules / meter width). A chip is ` label `; every
-    /// row is exactly `cols` cells; the doc's own literals are schematic
-    /// (their spacing is illustrative, and the manual staged detail uses
-    /// the macOS `apply it from the Version menu` phrase, longer than the
-    /// doc's placeholder), so the cells pinned here are the law's.
+    /// string for string (whole / shaped-to-N / dropped / short capsules /
+    /// meter width). A chip is ` label `; every row is exactly `cols` cells.
     #[test]
     fn the_five_rows_at_60_80_120_160_are_pinned_string_for_string() {
         let pinned: &[(&str, usize, &str)] = &[
@@ -2017,11 +1976,9 @@ pub(crate) mod tests {
                 80,
                 " ⇣ Installing ALab tools · trust · extracting   42%       Packages   Details ›  ",
             ),
-            // A moving row's painted excerpt is an ACTION excerpt (the host
-            // paints one only where it changes what the person does, ruling
-            // 77 — the real toolchain row paints none): at 60 the capsules'
-            // short forms and the title's elision pay for it (review
-            // 2026-09-24).
+            // A moving row's painted excerpt is an action excerpt (the host
+            // paints one only where it changes what the person does): at 60
+            // the capsules' short forms and the title's elision pay for it.
             (
                 "toolchain",
                 60,
@@ -2043,22 +2000,20 @@ pub(crate) mod tests {
     }
 
     /// Invariant 13: cols 8..=200 over the five fixtures, the live
-    /// indicator's and day ten's overdue upgrade rows (rulings 402 and 404) —
-    /// every row exactly `cols` wide, no panic; the sacrifices land in order
-    /// (stats, the excerpt shaped, then its whole lead clause, then dropped
-    /// below the floor, the ETA, then the capsules go short, then the title, then the
-    /// activity's words whole with their load words); authored capsules
-    /// present at every width; the METER (or a busy row's track) is the
-    /// whole row at every width (ruling 136); a moving row's percent or
-    /// elapsed slot outlives every extra, and its latched load words live
-    /// exactly as long as it.
+    /// indicator's and the overdue upgrade rows: every row exactly `cols`
+    /// wide, no panic; the sacrifices land in order (stats, the excerpt
+    /// shaped, then its whole lead clause, then dropped below the floor, the
+    /// ETA, then the capsules go short, then the title, then the activity's
+    /// words whole with their load words); authored capsules present at every
+    /// width; the meter (or a busy row's track) is the whole row at every
+    /// width; a moving row's percent or elapsed slot outlives every extra, and
+    /// its latched load words live exactly as long as it.
     #[test]
     fn width_law_degrades_in_order() {
-        // Day ten's overdue upgrade rows: one tab's excerpt's lead clause
-        // stands below the floor at 97..=102 columns (ruling 402), the
-        // agent's row's first ` · ` piece likewise, and a 26-hour lead
-        // stands whole where the floor's cut would add no word to it
-        // (ruling 404).
+        // The overdue upgrade rows: one tab's excerpt's lead clause stands
+        // below the floor at 97..=102 columns, the agent's row's first ` · `
+        // piece likewise, and a 26-hour lead stands whole where the floor's
+        // cut would add no word to it.
         use crate::model::UpgradeWord::{NotToday, Now, Skip};
         let upgrade = |word| Intent::AgentUpgrade {
             tab: "s-1".into(),
@@ -2154,9 +2109,9 @@ pub(crate) mod tests {
                 if let Some((c, d)) = &row.detail {
                     spans.push((c - 3, c + chars(d)));
                 }
-                // THE METER IS THE ROW: present exactly when the spec carries
-                // a fill, at every width, spanning every column — and a busy
-                // row's track likewise (ruling 136). Neither is a span.
+                // The meter is the row: present exactly when the spec carries
+                // a fill, at every width, spanning every column, and a busy
+                // row's track likewise. Neither is a span.
                 let fill = spec.meter.and_then(|(f, _)| f).map(|f| f.min(1000));
                 assert_eq!(
                     row.meter,
@@ -2223,10 +2178,9 @@ pub(crate) mod tests {
                 // them gone (the degenerate step) nothing else is left.
                 let moving = spec.animated || spec.busy;
                 let activity = row.pct.is_some() || row.elapsed.is_some();
-                // A moving row's painted excerpt is an ACTION excerpt: part
-                // of the fixed head, paid for by the capsules' short forms
-                // and the title's elision, with the load slot an extra after
-                // it (review 2026-09-24).
+                // A moving row's painted excerpt is an action excerpt: part of
+                // the fixed head, paid for by the capsules' short forms and
+                // the title's elision, with the load slot an extra after it.
                 let action = moving && spec.detail0.is_some_and(|d| !d.is_empty());
                 if moving && !activity {
                     assert!(
@@ -2249,8 +2203,8 @@ pub(crate) mod tests {
                         "{name}@{cols}: the action excerpt went before the capsules' long forms: {painted:?}"
                     );
                 }
-                // The load slot is the activity's — except on a row whose
-                // ETA it bought where none fit the room (ruling 229).
+                // The load slot is the activity's, except on a row whose ETA
+                // it bought where none fit the room.
                 let traded = spec.eta && row.eta_short && row.load_slot.is_none();
                 if moving && activity && !action && !traded {
                     assert_eq!(
@@ -2304,10 +2258,9 @@ pub(crate) mod tests {
                         );
                     }
                     // Every extra goes before the capsules' long forms do (the
-                    // meter is not an extra: it is the row's surface) — an
-                    // action excerpt is not one either: it is paid for there,
-                    // nor a short ETA in the load slot's cells, which the
-                    // head paid for (ruling 229).
+                    // meter is not an extra: it is the row's surface); neither
+                    // is an action excerpt (it is paid for there) nor a short
+                    // ETA in the load slot's cells, which the head paid for.
                     if short_now {
                         assert!(
                             (row.detail.is_none() || action)
@@ -2358,14 +2311,13 @@ pub(crate) mod tests {
                         );
                     }
                 }
-                // The floor governs the ROOM: an excerpt is shaped only when
+                // The floor governs the room: an excerpt is shaped only when
                 // `3 + DETAIL_FLOOR` cells were free for it (a word-boundary
-                // cut may then land a few cells under the floor — "Full Disk
-                // Access…" is whole words, not a stub), and a cut that says
-                // no word past the lead clause is the clause (ruling 404);
-                // below that it is its whole lead clause, with no ellipsis,
-                // where that fits (ruling 402), else dropped. Non-metered
-                // rows expose the room exactly.
+                // cut may then land a few cells under the floor: "Full Disk
+                // Access…" is whole words, not a stub), and a cut that says no
+                // word past the lead clause is the clause; below that it is
+                // its whole lead clause, with no ellipsis, where that fits,
+                // else dropped. Non-metered rows expose the room exactly.
                 let clause = spec.detail0.and_then(crate::text::lead_clause);
                 if let Some((dcol, d)) = &row.detail
                     && clause.as_ref() == Some(d)
@@ -2414,7 +2366,7 @@ pub(crate) mod tests {
             }
         }
         // The config row's `skipping "cmd+shift+k"` stands, too, where its
-        // cut was `skipping "cmd+shift+k":…` (ruling 404).
+        // cut was `skipping "cmd+shift+k":…`.
         assert_eq!(
             clause_seen.into_iter().collect::<Vec<_>>(),
             [
@@ -2465,8 +2417,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Invariant 18 (FL-1): `0` with no rows; stats fold into the key; the
-    /// fill is quantized to whole percent.
+    /// Invariant 18: `0` with no rows; stats fold into the key; the fill is
+    /// quantized to whole percent.
     #[test]
     fn fingerprint_is_zero_when_empty_and_quantizes_the_fill() {
         assert_eq!(
@@ -2511,7 +2463,7 @@ pub(crate) mod tests {
         }
         .fingerprint();
         assert_ne!(base, other_cols);
-        // BUSY flips the key (the static shape: the flag and the track); the
+        // Busy flips the key (the static shape: the flag and the track); the
         // motion layer folds what moves in its own term.
         let busy_at = |busy: bool| {
             let mut s = spec.clone();
@@ -2526,17 +2478,13 @@ pub(crate) mod tests {
         assert_ne!(busy_at(false), busy_at(true), "busy is folded");
     }
 
-    /// A BUSY ROW IS A WHOLE-ROW TRACK (ruling 75, kept by rulings 136 and
-    /// 139). A row with work in flight and no fill carries `track = (0,
-    /// cols)` at every width — the same surface a meter is, under every
-    /// piece, for the comet — and never a meter or a pct. It costs the words
-    /// nothing but its elapsed slot: at every width the busy row's title and
-    /// stats are the still row's with `1 + ELAPSED_W` cells less room. Its
-    /// excerpt is an ACTION excerpt (a moving row's painted excerpt, which
-    /// outranks the capsules' long forms and the title's length — review
-    /// 2026-09-24), so the track never takes from it: it is at least the
-    /// still row's there. A fill wins (a row with one is never busy), and a
-    /// row that is not busy has no track.
+    /// A busy row is a whole-row track: a row with work in flight and no
+    /// fill carries `track = (0, cols)` at every width, under every piece,
+    /// and never a meter or a pct. It costs the words nothing but its elapsed
+    /// slot: at every width the busy row's title and stats are the still
+    /// row's with `1 + ELAPSED_W` cells less room. Its excerpt is an action
+    /// excerpt, so the track never takes from it. A fill wins (a row with one
+    /// is never busy), and a row that is not busy has no track.
     #[test]
     fn a_busy_row_is_a_whole_row_track_that_costs_the_words_nothing() {
         let flow = RowSpec {
@@ -2677,13 +2625,11 @@ pub(crate) mod tests {
             .sum()
     }
 
-    /// REVIEW (2026-09-22): `shape_detail` cuts by CHARS while the law
-    /// measures CELLS with the injected width. With a wide-char tail the
-    /// char cut used to keep a wide word that did not fit, so the excerpt
-    /// was DROPPED at 125..=96 cols and CAME BACK at 95..=50 — a flicker
-    /// during a resize under the host's grapheme measure. `shape_to_cells`
-    /// lowers the char cap until the cells fit, to the largest cap that
-    /// does, so the excerpt is monotone.
+    /// `shape_detail` cuts by chars while the law measures cells with the
+    /// injected width; with a wide-char tail `shape_to_cells` lowers the char
+    /// cap until the cells fit, to the largest cap that does, so the excerpt
+    /// is monotone across a resize (never dropped at one width and back at a
+    /// narrower one).
     #[test]
     fn a_wide_excerpt_does_not_flicker_while_narrowing() {
         let detail = format!("{}{}", "ok ".repeat(12), "\u{6f22}".repeat(30));
@@ -2729,17 +2675,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE METER IS THE ROW (ruling 55, kept by ruling 136). It used to be an
-    /// 8–20 cell pill after the excerpt, bought from the row's room (a
-    /// review of 2026-09-22 caught it coming back at the long→short capsule
-    /// transition, and the live pill was a fixed part of the head). It now
-    /// spans every column at every width, from 120 cols down through the
-    /// short capsules and the degenerate clip, held or live, costs the words
-    /// nothing — the excerpt a held metered row shows at a width is the one
-    /// the same row without a fill shows five columns narrower (the ` NN%`),
-    /// and a live one's, an ACTION excerpt that outranks the capsules' long
-    /// forms and the title's length (review 2026-09-24), is at least that —
-    /// and carries the fill exactly.
+    /// The meter is the row: it spans every column at every width, from 120
+    /// cols down through the short capsules and the degenerate clip, held or
+    /// live, and costs the words nothing. The excerpt a held metered row
+    /// shows at a width is the one the same row without a fill shows five
+    /// columns narrower (the ` NN%`), a live one's (an action excerpt) at
+    /// least that, and the fill is carried exactly.
     #[test]
     fn the_meter_is_the_whole_row_at_every_width_and_costs_the_words_nothing() {
         for animated in [false, true] {
@@ -2862,9 +2803,8 @@ pub(crate) mod tests {
                 160,
                 " ⇣ Installing ALab tools   42%              3 of 10 programs                                                                                         Details ›  ",
             ),
-            // An ACTION excerpt (M13, ruling 148) outranks the load slot and
-            // `Details ›`, and the title elides for it — at 80 it used to be
-            // the one word the row did not paint (review 2026-09-24).
+            // An action excerpt outranks the load slot and `Details ›`, and
+            // the title elides for it.
             (
                 "action-excerpt",
                 60,
@@ -2950,12 +2890,10 @@ pub(crate) mod tests {
         assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
     }
 
-    /// THE ETA KEEPS ITS SLOT WHERE THE LONG FORM DOES NOT FIT (review
-    /// 2026-09-24): the remaining time says `left` (`~8 min left`), which
-    /// cost five cells, and at 80 columns a first run's row under disk load
-    /// had room for the old seven and not for twelve. There the slot takes
-    /// its SHORT form (`8m left`, [`ETA_SHORT_W`]); wider it is long; the
-    /// short form starves the excerpt and the stats after it.
+    /// The ETA keeps its slot where the long form does not fit: at 80
+    /// columns a first run's row under disk load takes its short form (`8m
+    /// left`, [`ETA_SHORT_W`]); wider it is long; the short form starves the
+    /// excerpt and the stats after it.
     #[test]
     fn the_eta_slot_goes_short_before_it_goes() {
         let fixtures = motion_fixtures();
@@ -2966,8 +2904,7 @@ pub(crate) mod tests {
         assert_eq!(wide.eta_width(), ETA_W);
         // Narrowing: long, then short (beside the load words, starving the
         // excerpt and the stats), then short in the load slot's cells (how
-        // long outranks the load words, ruling 229), then gone with the
-        // activity's words.
+        // long outranks the load words), then gone with the activity's words.
         let short: Vec<usize> = (20..=120).filter(|c| at(*c).eta_short).collect();
         assert!(
             !short.is_empty(),
@@ -3014,21 +2951,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// THE LOAD SLOT IS SIZED TO THE ROW'S OWN LOADS (design ruling 221): a
-    /// busy row that declared `CPU busy` reserves 2 + 8 cells at the tail
-    /// of its words (ruling 246), not the 2 + 12 of `network busy`, so at the
-    /// default 80 columns its stats keep their cells where the slot sized for
-    /// every load starved them. A row whose loads include the
-    /// network (the ALab tools pass) keeps the widest slot, and at 80 its
-    /// ETA outranks its stats (the owner's "how long to wait"): its count's
-    /// short form, `3/10 programs`, does not fit there, so the count goes
-    /// whole rather than as a bare `3/10` (rulings 223 and 248), and is
-    /// whole at 120.
+    /// The load slot is sized to the row's own loads: a busy row that
+    /// declared `CPU busy` reserves 2 + 8 cells at the tail of its words, not
+    /// the 2 + 12 of `network busy`, so at 80 columns its stats keep their
+    /// cells. A row whose loads include the network (the ALab tools pass)
+    /// keeps the widest slot, and at 80 its ETA outranks its stats: its
+    /// count's short form, `3/10 programs`, does not fit there, so the count
+    /// goes whole rather than as a bare `3/10`, and is whole at 120.
     #[test]
     fn the_load_slot_is_sized_to_the_rows_declared_loads() {
-        // A busy build that declared its CPU (a measured level — the strain
-        // row — has no load slot at all: its title names the load, ruling
-        // 243).
+        // A busy build that declared its CPU (a measured level, the strain
+        // row, has no load slot at all: its title names the load).
         let strain = |slot: Loads| RowSpec {
             kind: RowKind::Message(id(20)),
             severity: Severity::Info,
@@ -3128,9 +3061,8 @@ pub(crate) mod tests {
             Some(chars("network busy"))
         );
         // 80 keeps the ETA; the count's short form, `3/10 programs`, does
-        // not fit beside it, and a bare `3/10` never stands in for it
-        // (ruling 248): the stats go whole. 120 keeps the long count; 60
-        // neither.
+        // not fit beside it, and a bare `3/10` never stands in for it: the
+        // stats go whole. 120 keeps the long count; 60 neither.
         assert_eq!(
             render(&pass(80), 80),
             " \u{21e3} Installing ALab tools   42%                           disk busy   Details ›  "
@@ -3143,8 +3075,8 @@ pub(crate) mod tests {
             "120: both, long"
         );
         assert!(pass(60).stats.is_none());
-        // The short form is a count's with its unit word (ruling 248): the
-        // numbers never stand without what they count.
+        // The short form is a count's with its unit word: the numbers never
+        // stand without what they count.
         assert_eq!(
             short_stats("3 of 10 programs").as_deref(),
             Some("3/10 programs")
@@ -3169,7 +3101,7 @@ pub(crate) mod tests {
             assert_eq!(short_stats(none), None, "{none:?}");
         }
         // Several clauses keep the last, where the size of the wait is
-        // written (ruling 229); a leading count with its unit still wins.
+        // written; a leading count with its unit still wins.
         assert_eq!(
             short_stats("10 programs \u{b7} ~3 GB").as_deref(),
             Some("~3 GB")
@@ -3189,11 +3121,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// HOW LONG OUTRANKS THE LOAD WORDS (ruling 229; the owner: "how long to
-    /// wait and for what"). A moving row with an ETA and a load slot keeps
-    /// both while the ETA fits the room; where no ETA fits, the slot's cells
-    /// buy the short one — at 60 `Updating ALab tools 66% ~1 min` rather
-    /// than `66% · network busy`. Each is a monotone flag as the row
+    /// How long outranks the load words. A moving row with an ETA and a load
+    /// slot keeps both while the ETA fits the room; where no ETA fits, the
+    /// slot's cells buy the short one (at 60 `Updating ALab tools 66% ~1 min`
+    /// rather than `66% · network busy`). Each is a monotone flag as the row
     /// narrows, and the load words arriving or leaving never move a cell. A
     /// busy Install's announced size survives at 80 in its short form.
     #[test]

@@ -20,9 +20,7 @@
 //! several harnesses and has not run green in a month. A COUNT has none of those
 //! problems: it is exact, machine-independent, cannot flake under load, and
 //! rides `cargo test` — hence `tools/verify.sh`, the merge contract — at
-//! zero marginal cost. (This named "and the pre-push hook" until 2026-08-31.
-//! It does not ride one: `.githooks/pre-push` was demoted to ADVISORY on
-//! 2026-08-24 and deleted on 2026-09-25 — there is no git hook.)
+//! zero marginal cost.
 //!
 //! WHAT A COUNT CANNOT CATCH: a constant-factor slowdown with the counts
 //! unchanged. If `fill_rect` itself became 3x slower this file stays green. It
@@ -105,10 +103,8 @@ fn themed_term() -> Terminal {
 
 #[test]
 fn a_plain_frame_never_fills_a_band_with_the_colour_it_already_carries() {
-    let Some(mut r) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let mut term = themed_term();
     term.process(b"hello");
     let input = term.cell_frame(ROWS, COLS);
@@ -150,10 +146,8 @@ fn under_a_live_wallpaper_no_background_run_is_elided() {
         selection: theme_bg,
         ..Theme::default()
     };
-    let Some(mut r) = Renderer::from_system(18.0, theme) else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, theme)
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let mut term = themed_term();
     term.process(b"selected text here");
     {
@@ -236,10 +230,8 @@ fn rgb_bytes(c: u32) -> [u8; 3] {
 /// EOL, so it can only leave through the mid-run flush.
 #[test]
 fn a_base_run_that_ends_mid_row_is_elided_at_the_mid_run_flush() {
-    let Some(mut r) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let mut term = themed_term();
     // Cursor hidden: this fixture is background-run STRUCTURE and nothing else.
     term.process(b"\x1b[?25lab\x1b[48;2;200;40;40mXY\x1b[0mcd");
@@ -316,10 +308,8 @@ fn a_base_run_that_ends_mid_row_is_elided_at_the_mid_run_flush() {
 /// pane resolves to a different colour and must be paid for.
 #[test]
 fn a_composed_split_row_elides_the_pane_sitting_on_the_frame_default() {
-    let Some(mut r) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let theme_bg = Theme::default().bg;
     let mut term = themed_term();
     term.process(b"\x1b[?25l");

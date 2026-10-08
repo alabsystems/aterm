@@ -57,7 +57,7 @@ mod words;
 
 pub use model::{
     AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, LeaseMark, Level, Link, MailFacts,
-    MailLast, Rim, Slot, StopCause, StoryPoint, StoryVerb, Tone, TurnFact,
+    MailLast, Rim, Slot, StopCause, StoryPoint, StoryVerb, Tone, TurnFact, WallAnswer,
 };
 pub use paint::{PresenceTones, inks, paint_row, text_cols, tones};
 pub use view::{RimGlow, View, chip_of_attention, words_step};
@@ -123,7 +123,7 @@ pub(crate) const SETTLED_GLOW: Duration = Duration::from_secs(2);
 /// The context-left percentage at and below which the row warns.
 pub(crate) const CTX_WARN_PCT: u8 = 15;
 
-/// THE ROW'S FOLD QUIET (design ruling 394, proposed): a committed row whose
+/// THE ROW'S FOLD QUIET (design ruling 394): a committed row whose
 /// words went away folds — one PTY re-grid — only after it has wanted no row
 /// for this long; a want that returns first cancels the fold, and no re-grid
 /// is paid at all. Birth stays immediate. Measured 2026-09-28 on the owner's

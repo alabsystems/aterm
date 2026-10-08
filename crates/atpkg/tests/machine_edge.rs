@@ -22,19 +22,20 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     prefix: PathBuf,
 }
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-machine-edge-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("home")).unwrap();
-        std::fs::create_dir_all(root.join("registry")).unwrap();
-        let prefix = atpkg::store::default_prefix(&root.join("home"));
-        assert!(prefix.starts_with(&root), "{}", prefix.display());
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-machine-edge-{case}-"))
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(root.path().join("home")).unwrap();
+        std::fs::create_dir_all(root.path().join("registry")).unwrap();
+        let prefix = atpkg::store::default_prefix(&root.path().join("home"));
+        assert!(prefix.starts_with(root.path()), "{}", prefix.display());
         let layout = atpkg::store::Layout {
             prefix: prefix.clone(),
         };
@@ -65,12 +66,12 @@ impl Fixture {
     fn run(&self, args: &[&str], state_home: Option<&std::path::Path>) -> std::process::Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.args(args)
-            .current_dir(&self.root)
-            .env("HOME", self.root.join("home"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .current_dir(self.root.path())
+            .env("HOME", self.root.path().join("home"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env(
                 "ATPKG_REGISTRY",
-                format!("dir:{}", self.root.join("registry").display()),
+                format!("dir:{}", self.root.path().join("registry").display()),
             )
             .env_remove("ATERM_STATE_HOME")
             .stdin(Stdio::null());
@@ -100,12 +101,6 @@ impl Fixture {
         lines
             .iter()
             .any(|l| l.starts_with(atpkg::cli::MACHINE_NOT_APPLIED_PREFIX))
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -150,7 +145,7 @@ fn an_update_pass_applies_the_machine_settings_only_when_the_table_changed() {
 #[test]
 fn a_pass_under_a_private_state_root_carries_no_machine_edit() {
     let fx = Fixture::new("private");
-    let absolute = fx.root.join("aterm-state");
+    let absolute = fx.root.path().join("aterm-state");
     for state in [
         absolute.as_path(),
         std::path::Path::new(""),

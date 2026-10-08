@@ -1,17 +1,11 @@
-// Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
+// Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the temporal event-log spine (design B.9): the
-//! `append_at` recording seam and its **spill-not-forget** obligation.
-//!
-//! The Tier-0 `tier_residency_model` (B.8.2, `aterm-spec`) proves `NoSilentLoss`:
-//! every evicted seq stays resident in a tier. This binds that property to the
-//! real `EventLog`: `append_at` hands the evicted oldest event BACK to the caller
-//! (the spill seam) instead of dropping it, so a host that tiers every returned
-//! event loses nothing. The negative-control half shows that *ignoring* the
-//! returned event (the legacy drop-on-evict path) DOES lose seqs — i.e. the seam
-//! is load-bearing, not decorative.
+//! Tier-1 conformance for the temporal `append_at` seam and its spill-not-forget
+//! obligation: `tier_residency_model`'s `NoSilentLoss` says every evicted seq
+//! stays resident in a tier. `append_at` hands each evicted event back to the
+//! caller, so a host that tiers every returned event loses nothing; the negative
+//! control shows that ignoring the return does lose seqs.
 
 use aterm_buffer::{BlobId, Event, EventLog, KeyframeId, MAX_LOG_EVENTS, Op, Ticks};
 
@@ -42,10 +36,8 @@ fn append_at_records_seq_tick_and_op() {
     assert_eq!(log.total(), 4);
 }
 
-/// SPILL-NOT-FORGET (the B.8.2 `NoSilentLoss` obligation, bound to the real log).
-/// Driving past `MAX_LOG_EVENTS` evicts the oldest events; `append_at` returns
-/// each one so the caller can tier it. Tiered ∪ live MUST cover every appended
-/// seq, contiguously — nothing is silently lost.
+/// `NoSilentLoss` on the real log: past `MAX_LOG_EVENTS`, tiered ∪ live covers
+/// every appended seq contiguously.
 #[test]
 fn append_at_spills_every_evicted_event_no_silent_loss() {
     let mut log = EventLog::default();
@@ -95,10 +87,8 @@ fn append_at_spills_every_evicted_event_no_silent_loss() {
     );
 }
 
-/// NEGATIVE CONTROL: the spill seam is load-bearing. A caller that DROPS the
-/// returned evicted event (the legacy behavior) loses the over-cap seqs — so the
-/// `NoSilentLoss` guarantee genuinely depends on tiering the returned event, it
-/// is not automatic.
+/// Negative control: a caller that drops the returned evicted event loses the
+/// over-cap seqs, so `NoSilentLoss` depends on tiering the return.
 #[test]
 fn dropping_the_evicted_event_loses_seqs_control() {
     let mut log = EventLog::default();
@@ -109,8 +99,8 @@ fn dropping_the_evicted_event_loses_seqs_control() {
         let _ = log.append_at(Op::RawIn(BlobId(i as u64)), Ticks(i as u64));
     }
     let live: Vec<Event> = log.live().cloned().collect();
-    // The oldest `overflow` seqs are gone from the live ring and (since we
-    // dropped them) from anywhere — exactly the loss the spill seam prevents.
+    // The oldest `overflow` seqs are gone from the ring and, dropped, from
+    // everywhere.
     assert_eq!(live.len(), MAX_LOG_EVENTS);
     assert_eq!(
         live.first().unwrap().seq.0,

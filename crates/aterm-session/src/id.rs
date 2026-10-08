@@ -7,9 +7,9 @@
 
 use crate::{ct_eq, fill_random, from_hex, hex};
 
-/// A stable session identity. Default form `s-<20 hex>` (80 bits of entropy),
-/// minted ONCE at launch and recorded in `<id>/meta`. **Not** derived from a pid:
-/// pids reuse, and an edge bound to a reused pid would silently target a stranger.
+/// A stable session identity, `s-<20 hex>` (80 bits of entropy), minted once at
+/// launch and recorded in `<id>/meta`. Not derived from a pid: pids are reused,
+/// and an edge bound to a reused pid would silently target a stranger.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SessionId(String);
 
@@ -31,9 +31,8 @@ impl SessionId {
     pub fn generate() -> Self {
         let mut b = [0u8; 10];
         fill_random(&mut b);
-        // Concatenate without `format!`: the `fmt::Arguments` machinery has an
-        // unmodeled panic path the verifier cannot lower; plain `String`
-        // pushes are verifiable and produce the identical `s-<20 hex>` form.
+        // No `format!`: its `fmt::Arguments` path has a panic the verifier cannot
+        // lower; plain pushes produce the same `s-<20 hex>` form.
         let mut id = String::from("s-");
         id.push_str(&hex(&b));
         Self(id)
@@ -46,11 +45,11 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-/// A per-LAUNCH nonce an edge binds to (design §4.1). It is **public** anti-spoof
-/// state (published as `meta.nonce`), not a secret: the unforgeable secret is the
-/// [`EdgeToken`](crate::EdgeToken). Its job is to invalidate an edge when the target
-/// restarts — a fresh launch mints a fresh nonce, so a stale edge fails closed and
-/// is audited, closing the pid-reuse confused-deputy hazard.
+/// A per-launch nonce an edge binds to. It is public anti-spoof state
+/// (published as `meta.nonce`), not a secret; the secret is the
+/// [`EdgeToken`](crate::EdgeToken). A restarted target mints a fresh nonce, so a
+/// stale edge fails closed and is audited, closing the pid-reuse confused-deputy
+/// hazard.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LaunchNonce([u8; 16]);
 

@@ -354,7 +354,7 @@ pub fn auxv_value(bytes: &[u8], key: u64) -> Option<u64> {
 /// on real hardware the `intr` line right after the `cpuN` lines carries one
 /// count per IRQ, often thousands of bytes, so the cap cuts it on most
 /// machines. Its first bytes are enough — any text that is not `cpu…` and
-/// cannot be the start of one (`c`, `cp`) ends the block (review round 9).
+/// cannot be the start of one (`c`, `cp`) ends the block.
 #[must_use]
 pub fn stat_cores(stat: &str) -> Option<u16> {
     let mut n: u16 = 0;

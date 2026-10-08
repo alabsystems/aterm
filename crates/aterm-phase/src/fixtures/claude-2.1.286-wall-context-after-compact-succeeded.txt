@@ -1,0 +1,40 @@
+# claude-code 2.1.286 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50) on origin/main 9215c99b1, the managed 2.1.286 launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL` pointing at a local stub of the API · a full-context wall (the stub's too-long mode) in a session that had one SUCCESSFUL `/compact` already: the conversation starts at the compaction banner; the wall is the same `⎿  Context limit reached · /compact or /clear to continue` row over a done row · scratch path redacted at equal length
+ ▐▛███▛█   Claude Code v2.1.286
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+⏺ Hi! I am the local lab stub, not a model. (reply 3)
+
+✻ Crunched for 0s · done 1:43 AM
+
+❯ /compact
+  ⎿  Compacted (ctrl+o to see full summary)
+
+❯ fourth normal turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 4)
+
+✻ Cogitated for 0s · done 1:43 AM
+
+❯ fifth normal turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 5)
+
+✻ Baked for 0s · done 1:43 AM
+
+❯ /compact
+  ⎿  Compaction failed · conversation could not be reduced below the context limit
+
+❯ sixth turn: the stub says the prompt is too long
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Churned for 0s · done 1:44 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

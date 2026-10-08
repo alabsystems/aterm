@@ -1,18 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Every invocation form the six third-party consumers of `arrayvec` write,
+//! Every invocation form the five third-party consumers of `arrayvec` write,
 //! reproduced verbatim against this crate.
 //!
 //! # Why this file is the deliverable and not a formality
 //!
-//! Five of the six consumers cannot be compiled on the macOS box this crate was
+//! Most of the consumers cannot be compiled on the macOS box this crate was
 //! written on. `naga` resolves here with `default,msl-out,wgsl-in`, so its
 //! entire SPIR-V writer — where a third of the `ArrayVec` uses live — is
 //! `cfg`'d off; `wgpu-hal` resolves with `metal,portable-atomic`, and the Metal
 //! backend contains no `ArrayVec` at all, so `dx12`, `gles` and `vulkan` are
-//! dark; `tiny-skia` only enters the graph on Linux, under `sctk-adwaita`; and
-//! `vte` only through dev edges. A macOS `cargo check -p aterm-gui` therefore
+//! dark; and `tiny-skia` only enters the graph on Linux, under `sctk-adwaita`.
+//! A macOS `cargo check -p aterm-gui` therefore
 //! exercises `Hash`, `Extend`, by-value `IntoIterator` and `into_inner` — and
 //! misses `drain`, by-`&`/`&mut` `IntoIterator`, `new_const` and `clone_from`
 //! entirely.
@@ -27,8 +27,8 @@
 //!
 //! It is a compile-time proof first; the `#[test]` functions additionally run
 //! the forms so that a shape which compiles but computes the wrong thing is
-//! caught too. Behaviour against the real upstream crate is checked separately
-//! and more aggressively by
+//! caught too. Behaviour against a `Vec`-backed model of upstream's contract
+//! is checked separately and more aggressively by
 //! `crates/aterm-alloc/tests/arrayvec_differential.rs`.
 
 // The consumers' shapes are reproduced whole, including fields and variants
@@ -249,7 +249,7 @@ mod wgpu_core {
     pub type ShaderModule = StandIn;
     pub type TextureBarrier = StandIn;
 
-    // wgpu-core-29.0.3/src/resource.rs:1922 — FULLY-QUALIFIED path in field
+    // wgpu-core-29.0.3/src/resource.rs:1922: a fully-qualified path in field
     // position, holding `Arc`s (so `Drop` matters).
     #[derive(Debug)]
     pub struct ExternalTexture {
@@ -295,15 +295,10 @@ mod wgpu_core {
         pub mips: ArrayVec<u32, { MAX_MIP_LEVELS as usize }>,
     }
 
-    // wgpu-core-29.0.3/src/device/resource.rs:3787 and :3793 — `pop()`, then
-    // `into_iter()` THROUGH A BOX.
-    //
-    // The `Box` is the form under test, not an accident: wgpu-core's
-    // `PipelineLayoutSource::Derived` stores the ArrayVec boxed
-    // (validation.rs:910) and moves out of it with `.into_iter()`, which only
-    // works because `Box` can be moved out of. `clippy::boxed_local` is right
-    // in general and wrong here — taking the `ArrayVec` by value would stop
-    // reproducing the consumer's shape.
+    // wgpu-core-29.0.3/src/device/resource.rs:3787 and :3793: `pop()`, then
+    // `into_iter()` through a box. wgpu-core's `PipelineLayoutSource::Derived`
+    // stores the ArrayVec boxed (validation.rs:910) and moves out of it, so the
+    // `Box` is the form under test.
     #[allow(clippy::boxed_local)]
     pub fn finish_derived(
         mut derived: Box<ArrayVec<EntryMap, { MAX_BIND_GROUPS }>>,
@@ -373,7 +368,7 @@ mod wgpu_core {
     // on the previous line, and it is the only place either shape appears
     // outside `track/texture.rs`: re-derive with
     // `grep -rn 'get_unchecked' <registry>/{naga,wgpu,wgpu-core,wgpu-hal}-29.0.3
-    //  <registry>/{tiny-skia-0.11.4,vte-0.15.0} --include='*.rs'`.
+    //  <registry>/tiny-skia-0.11.4 --include='*.rs'`.
     pub fn read_mip(complex: &ComplexTextureState, mip_id: usize) -> u32 {
         // SAFETY: the caller has already bounds-checked `mip_id`, exactly as
         // wgpu-core does one line above its own call
@@ -473,10 +468,9 @@ mod wgpu_hal {
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct ColorTargetState(pub u32);
 
-    // wgpu-hal-29.0.3/src/dx12/shader_compilation.rs:382 — `new_const()`, the
-    // only site in the graph, and :388 — `Extend` from an ARRAY LITERAL. A
-    // truncating extend here silently drops `-no-warnings`, strictness and
-    // `-HV 2018` from every HLSL compile.
+    // wgpu-hal-29.0.3/src/dx12/shader_compilation.rs:382: `new_const()`, the
+    // only site in the graph, and :388: `Extend` from an array literal. A
+    // truncating extend would drop HLSL compile flags.
     pub fn compile_args(source_name: Option<Pcwstr>, extra: [Pcwstr; 3]) -> ArrayVec<Pcwstr, 13> {
         let mut compile_args = arrayvec::ArrayVec::<Pcwstr, 13>::new_const();
         if let Some(name) = source_name {
@@ -513,7 +507,7 @@ mod wgpu_hal {
     // block containing ARITHMETIC.
     pub type InvalidatedAttachments = ArrayVec<u32, { MAX_COLOR_ATTACHMENTS + 2 }>;
 
-    // wgpu-hal-29.0.3/src/vulkan/mod.rs:463 — `Default` AND `Hash` in one derive
+    // wgpu-hal-29.0.3/src/vulkan/mod.rs:463 — `Default` and `Hash` in one derive
     #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
     pub struct RenderPassKey {
         pub colors: ArrayVec<TextureView, { MAX_COLOR_ATTACHMENTS }>,
@@ -568,10 +562,9 @@ mod wgpu_hal {
             self.immediates_descs.clone_from(&inner.immediates_descs);
         }
 
-        // wgpu-hal-29.0.3/src/gles/command.rs:698 — `drain(..)`, the ONLY place
+        // wgpu-hal-29.0.3/src/gles/command.rs:698: `drain(..)`, the only place
         // `resolve_attachments` is emptied at end-of-pass. A `drain` that
-        // yielded without removing would re-emit the previous pass's MSAA
-        // resolves against stale views on every later pass.
+        // yielded without removing would re-emit stale MSAA resolves.
         pub fn end_pass(&mut self) -> Vec<(u32, TextureView)> {
             let mut done = Vec::new();
             for (attachment, dst) in self.resolve_attachments.drain(..) {
@@ -615,16 +608,11 @@ mod wgpu_hal {
         deleted
     }
 
-    // wgpu-hal-29.0.3/src/gles/device.rs:401, :409-412 — `last_mut()` through
-    // `DerefMut`, inside a BLOCK EXPRESSION whose value is the `&mut` it
-    // returns, and that borrow then outlives the block and is stored in a
-    // struct. It is the graph's only `last_mut` (the `deref_sites` module below
-    // covers the shared `last()`), and the position is the reason it is
-    // reproduced whole rather than as a bare method call: `push` then
-    // `last_mut()` in one block means the borrow checker has to see the mutable
-    // borrow of `immediates_items` begin AFTER the `push` ends, which it can do
-    // only because `last_mut` goes through `DerefMut` on the ArrayVec itself
-    // rather than through a method that also holds something else.
+    // wgpu-hal-29.0.3/src/gles/device.rs:401, :409-412: `last_mut()` through
+    // `DerefMut` inside a block expression whose value is the `&mut` it
+    // returns, stored in a struct after the block. The borrow checker must
+    // see the mutable borrow begin after the `push` ends, which works only
+    // because `last_mut` goes through `DerefMut` on the ArrayVec itself.
     pub struct CompilationContext<'a> {
         pub immediates_items: &'a mut Vec<u32>,
     }
@@ -655,7 +643,7 @@ mod wgpu_hal {
         out
     }
 
-    // wgpu-hal-29.0.3/src/vulkan/instance.rs:803 — a DEFERRED-INIT binding
+    // wgpu-hal-29.0.3/src/vulkan/instance.rs:803: a deferred-init binding
     // (declared without a value, assigned in a branch).
     pub fn validation_features(enable: bool) -> usize {
         let mut validation_feature_list: ArrayVec<u32, 3>;
@@ -775,10 +763,10 @@ mod tiny_skia {
         functions
     }
 
-    // tiny-skia-0.11.4/src/pipeline/mod.rs:407 and :440 — `for x in &mut av`.
-    // THE ONLY by-`&mut` iteration sites in the whole graph, and they WRITE
-    // through every element they visit: a walk bounded by `N` instead of `len`
-    // would store into uninitialized slots.
+    // tiny-skia-0.11.4/src/pipeline/mod.rs:407 and :440: `for x in &mut av`,
+    // the only by-`&mut` iteration sites in the graph, writing through every
+    // element: a walk bounded by `N` instead of `len` would store into
+    // uninitialized slots.
     pub fn patch_tail(tail_functions: &mut ArrayVec<u32, MAX_STAGES>) {
         for fun in tail_functions {
             *fun += 1;
@@ -809,37 +797,6 @@ fn tiny_skia_forms() {
 
     let functions = functions(&[1, 2, 3]);
     assert_eq!(run(&functions), (false, vec![3, 5, 7], 12));
-}
-
-// ── vte 0.15.0 (dev edges only, and it names nothing) ───────────────────────
-
-mod vte {
-    use arrayvec::ArrayVec;
-
-    pub const OSC_RAW_BUF_SIZE: usize = 1024;
-
-    // vte-0.15.0/src/lib.rs:62. Reproduced for completeness and to record the
-    // finding: this field — and the `use arrayvec::ArrayVec;` at lib.rs:36 —
-    // sit under `#[cfg(not(feature = "std"))]`, and vte resolves in aterm's
-    // graph with `std` ON. So vte compiles with ZERO `ArrayVec` uses and
-    // imposes no API requirement at all. It is still a REAL consumer for the
-    // purposes of the patch (`aterm-bench` pulls it directly and through
-    // `alacritty_terminal 0.26.0`, so `[patch.crates-io]` reaches it and
-    // `cargo test -p aterm-bench` compiles it) — which is why a
-    // `cargo tree -e normal` census, which hides dev edges, is not sufficient
-    // evidence for a patch change.
-    pub struct Parser {
-        pub osc_raw: ArrayVec<u8, OSC_RAW_BUF_SIZE>,
-    }
-}
-
-#[test]
-fn vte_forms() {
-    let mut p = vte::Parser {
-        osc_raw: arrayvec::ArrayVec::new(),
-    };
-    p.osc_raw.push(b'x');
-    assert_eq!(p.osc_raw.as_slice(), b"x");
 }
 
 // ── Deref coercion sites ────────────────────────────────────────────────────
@@ -891,15 +848,9 @@ mod deref_sites {
 
     /// The slice inherent methods and index forms the consumers reach through
     /// `Deref`/`DerefMut`: `Index` (usize / `Range` / `RangeFrom` / `RangeFull`),
-    /// `get`, `get_mut`, `first`, `last`, `sort`, `contains`.
-    ///
-    /// Three more `Deref`-reached methods are pinned in their real consumer
-    /// context rather than here, because the CONTEXT is what is being tested:
-    /// `get_unchecked_mut` and `get_unchecked` in `wgpu_core`
-    /// (`track/texture.rs:108` / `:1383`, an `unsafe` block and two different
-    /// `SliceIndex` impls) and `last_mut` in `wgpu_hal`
-    /// (`gles/device.rs:409-412`, a block expression whose value is the `&mut`
-    /// it returns).
+    /// `get`, `get_mut`, `first`, `last`, `sort`, `contains`. `get_unchecked`,
+    /// `get_unchecked_mut` and `last_mut` are pinned in their consumer context
+    /// above, since the context is what is tested.
     pub fn slice_surface(av: &mut ArrayVec<u32, 8>) -> bool {
         av.sort();
         let _ = av[0];

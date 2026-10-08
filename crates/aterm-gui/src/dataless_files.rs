@@ -1,38 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Thread-scoped DATALESS-FILE policy (macOS).
+//! Thread-scoped dataless-file policy (macOS).
 //!
-//! An evicted iCloud Drive item — or any File Provider placeholder — is a
-//! "dataless" file: `lstat`, `open(2)`, `fstat` and `realpath` all succeed
-//! instantly, and the FIRST `read(2)` blocks until the whole download has
-//! finished. `O_NONBLOCK` does not help; it governs FIFOs and sockets, not
-//! materialization. The same shape appears on an unreachable SMB/NFS volume,
-//! where the read blocks until the network timeout.
+//! An evicted iCloud Drive item or other File Provider placeholder is "dataless":
+//! `lstat`, `open(2)`, `fstat` and `realpath` succeed at once, and the first
+//! `read(2)` blocks until the whole download finishes (`O_NONBLOCK` does not apply).
+//! An unreachable SMB/NFS volume behaves the same until its network timeout.
 //!
-//! The kernel exposes one knob for this: `setiopolicy_np(
-//! IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, …)`. With the
-//! policy OFF, a read of a dataless file fails at once with `EDEADLK` instead of
-//! waiting — MEASURED on this machine on 2026-09-03: open/lstat/fstat/realpath
-//! unaffected, only `read(2)` fails, errno `EDEADLK`. With it ON, the thread may
-//! wait for the download.
+//! `setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, …)`
+//! controls this per thread: with the policy off, only `read(2)` of a dataless file
+//! fails immediately with `EDEADLK`; with it on, the thread may wait.
 //!
-//! aterm's rule, decided by the three-lens audit of the main-thread stall:
+//! * The main thread never materializes: [`main_thread_never_materializes`] runs once
+//!   at GUI startup, and a dataless read there fails fast as
+//!   [`crate::native_document_host::DocumentHostError::NotDownloaded`] instead of
+//!   stalling the event loop.
+//! * A document admission worker (`aterm-document-admit`, see
+//!   `App::begin_document_admission`) sets [`MaterializePolicy::On`] for itself, since
+//!   the user asked for the file and a short-lived worker may wait.
 //!
-//! * the MAIN THREAD never materializes — [`main_thread_never_materializes`]
-//!   runs once at GUI startup, before any document can be opened; a dataless
-//!   read reaching the main thread by any remaining path fails fast and is
-//!   reported as [`crate::native_document_host::DocumentHostError::NotDownloaded`]
-//!   rather than freezing the event loop into the watchdog;
-//! * a DOCUMENT ADMISSION WORKER (`aterm-document-admit`, see
-//!   `App::begin_document_admission`) sets its OWN policy to
-//!   [`MaterializePolicy::On`] first, because a user who dropped the file
-//!   really does want it, and a short-lived worker is the right place to wait.
-//!
-//! The generated first-party `libc` shim cannot carry `setiopolicy_np`: the
-//! pinned reference libc 0.2.186 does not export it, and the shim's oracle
-//! asserts that the two declare the same names. So the declaration lives here,
-//! locally, with the SDK constants from `<sys/resource.h>`.
+//! `setiopolicy_np` is declared here because the generated `libc` shim must match the
+//! pinned reference libc 0.2.186, which does not export it.
 
 /// Whether reads on the CALLING thread may block to download a dataless file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,9 +40,8 @@ pub(crate) enum MaterializePolicy {
 mod sys {
     use std::os::raw::c_int;
 
-    // `<sys/resource.h>`, macOS SDK. Values are ABI facts; they have not changed
-    // since the policy was introduced (10.15) and are asserted by the round-trip
-    // test below through `getiopolicy_np`.
+    // `<sys/resource.h>` ABI values (stable since 10.15), checked by the round-trip
+    // test through `getiopolicy_np`.
     pub(super) const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: c_int = 3;
     pub(super) const IOPOL_SCOPE_THREAD: c_int = 1;
     #[cfg(test)]
@@ -61,12 +49,8 @@ mod sys {
     pub(super) const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: c_int = 1;
     pub(super) const IOPOL_MATERIALIZE_DATALESS_FILES_ON: c_int = 2;
 
-    // SAFETY (declaration): both functions are exported by libSystem on every
-    // supported macOS (`man 3 setiopolicy_np`) with exactly these C signatures —
-    // three/two `int` arguments, `int` return, errno on failure. They are declared
-    // here rather than in the first-party `libc` shim because the shim is
-    // generated from, and conformance-checked against, the pinned reference libc
-    // 0.2.186, which does not export them.
+    // SAFETY (declaration): libSystem exports both on every supported macOS with
+    // these C signatures (`int` arguments, `int` return, errno on failure).
     unsafe extern "C" {
         pub(super) fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
         #[cfg(test)]
@@ -83,9 +67,8 @@ mod sys {
     }
 }
 
-/// Set the dataless-file policy of the CALLING thread only. `Err` carries the
-/// errno the kernel returned; it never panics, and off macOS it is a no-op that
-/// succeeds (no other supported platform has the concept).
+/// Set the calling thread's dataless-file policy. `Err` carries the kernel errno;
+/// off macOS this is a no-op that succeeds.
 pub(crate) fn set_thread_materialize_policy(policy: MaterializePolicy) -> Result<(), i32> {
     #[cfg(target_os = "macos")]
     {
@@ -102,9 +85,8 @@ pub(crate) fn set_thread_materialize_policy(policy: MaterializePolicy) -> Result
 /// test can hand the kernel a value it must refuse and observe the errno path.
 #[cfg(target_os = "macos")]
 fn set_thread_policy_raw(policy: std::os::raw::c_int) -> Result<(), i32> {
-    // SAFETY: plain FFI call with three integer arguments and no pointers; the
-    // callee touches only the calling thread's own policy state. See the
-    // declaration's SAFETY note for the signature guarantee.
+    // SAFETY: integer-only FFI call that changes only the calling thread's policy;
+    // signature per the declaration above.
     let rc = unsafe {
         sys::setiopolicy_np(
             sys::IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
@@ -119,9 +101,8 @@ fn set_thread_policy_raw(policy: std::os::raw::c_int) -> Result<(), i32> {
     }
 }
 
-/// Read back the calling thread's dataless-file policy (macOS only; `None` when
-/// the kernel refuses the query). Test seam: it is how the tests prove the SDK
-/// constants above name what the kernel thinks they name.
+/// Read back the calling thread's dataless-file policy (`None` when the kernel
+/// refuses the query); lets the tests check the SDK constants against the kernel.
 #[cfg(all(target_os = "macos", test))]
 fn thread_materialize_policy() -> Option<MaterializePolicy> {
     // SAFETY: plain FFI query with two integer arguments; see the declaration.
@@ -139,10 +120,9 @@ fn thread_materialize_policy() -> Option<MaterializePolicy> {
     }
 }
 
-/// GUI startup, main thread, once: the event-loop thread must never wait on a
-/// download. Returns the errno on failure so the caller can log it; the caller
-/// proceeds either way (a failure here degrades to the pre-fix behaviour, it
-/// does not make anything less safe).
+/// Run once on the main thread at GUI startup so the event loop never waits on a
+/// download. Returns the errno on failure for the caller to log; startup proceeds
+/// either way.
 pub(crate) fn main_thread_never_materializes() -> Result<(), i32> {
     set_thread_materialize_policy(MaterializePolicy::Off)
 }

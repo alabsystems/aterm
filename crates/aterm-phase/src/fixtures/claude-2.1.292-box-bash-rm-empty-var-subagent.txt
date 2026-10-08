@@ -1,0 +1,50 @@
+# claude-code 2.1.292 · MEASURED 2026-10-06, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · default (manual) mode: a background general-purpose agent's Bash `rm -f $SP/cast0.txt $SP/run3.log` with SP unset, no glob: the note 2.1.292 draws where 2.1.285 said `Dangerous rm operation on possibly-empty variable path`, `A variable in this command can't be checked before it runs`; at `approve = "all"` the harness pressed `1` (`allow-once@v1`, unproven: the vendor note); at `"none"` it escalated
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+⏺ Agent "Clean scratch logs" finished · 1s
+
+⏺ Tool call done.
+
+✻ Sautéed for 1s · done 10:17 PM
+
+❯ toolstart
+
+⏺ Agent(Clean scratch logs)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+⏺ Agent "Clean scratch logs" finished · 8s
+
+⏺ Tool call done.
+
+✻ Crunched for 8s · done 10:19 PM
+
+❯ toolstart
+
+⏺ Agent(Clean scratch logs)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command · from the general-purpose agent
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Remove the scratch logs
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ rm -f $SP/cast0.txt $SP/run3.log
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ A variable in this command can't be checked before it runs
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and switch to auto mode · auto mode handles these prompts for you
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents

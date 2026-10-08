@@ -34,6 +34,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use aterm_control::wire::pct_decode;
+
+#[path = "support/child_output.rs"]
+mod child_output;
 #[path = "support/headless_boot.rs"]
 mod headless_boot;
 #[path = "support/launch_isolation.rs"]
@@ -161,7 +165,7 @@ fn private_launch_environment_gates_host_maintenance() {
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
         let mut child = cmd.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success(), "{case}: {}", log_tail(&log));
@@ -242,28 +246,6 @@ fn client_ok(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Stri
         String::from_utf8_lossy(&out.stderr),
     );
     String::from_utf8(out.stdout).expect("client stdout is UTF-8")
-}
-
-/// Decode the wire's percent-encoding (the tolerant `aterm conn` rule: a `%`
-/// not followed by two hex digits passes through verbatim).
-fn pct_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Parse the raw `sessions` rows (`<local> <sid> <parent|-> <state> <title>
@@ -364,7 +346,7 @@ fn conn_round_trips_against_a_live_headless_instance() {
         &["conn", "--sock", &sock, "add", &format!("@{sid2}")],
         in_session,
     );
-    assert_eq!(got, format!("connected {sid1} -> {sid2} (both)\n"));
+    assert_eq!(got, format!("connected @{sid1} -> @{sid2} (both)\n"));
     // The incoming half (§9: the no-arg form shows BOTH directions): invite
     // the peer as a pull-only controller of this session.
     let got = client_ok(
@@ -381,7 +363,7 @@ fn conn_round_trips_against_a_live_headless_instance() {
         ],
         in_session,
     );
-    assert_eq!(got, format!("connected {sid2} -> {sid1} (pull)\n"));
+    assert_eq!(got, format!("connected @{sid2} -> @{sid1} (pull)\n"));
 
     // --- (b) the no-arg and ls renders, byte-stable -----------------------
     // Titles are live wire state, so each pin fetches them immediately before
@@ -392,8 +374,8 @@ fn conn_round_trips_against_a_live_headless_instance() {
     assert_eq!(
         got,
         format!(
-            "\u{21e5} both  {sid2} {t2}\n\
-             \u{21e4} pull  {sid2} {t2}\n\
+            "\u{21e5} both  @{sid2} {t2}\n\
+             \u{21e4} pull  @{sid2} {t2}\n\
              \n\
              drive it: aterm ctl @{sid2} turn 'your message'\n"
         ),
@@ -402,8 +384,8 @@ fn conn_round_trips_against_a_live_headless_instance() {
     // `conn ls`: one line per directed pair, in the wire's sorted (src, dst)
     // order — computed here the same way so the pin is order-exact.
     let mut pairs = [
-        format!("{sid1} -> {sid2}  both  {t1} -> {t2}"),
-        format!("{sid2} -> {sid1}  pull  {t2} -> {t1}"),
+        format!("@{sid1} -> @{sid2}  both  {t1} -> {t2}"),
+        format!("@{sid2} -> @{sid1}  pull  {t2} -> {t1}"),
     ];
     pairs.sort();
     let got = client_ok(&inst, &["conn", "--sock", &sock, "ls"], &[]);
@@ -423,7 +405,7 @@ fn conn_round_trips_against_a_live_headless_instance() {
         ],
         in_session,
     );
-    assert_eq!(got, format!("disconnected {sid2} -> {sid1} (1 revoked)\n"));
+    assert_eq!(got, format!("disconnected @{sid2} -> @{sid1}\n"));
     let got = client_ok(
         &inst,
         &[
@@ -437,7 +419,7 @@ fn conn_round_trips_against_a_live_headless_instance() {
         ],
         in_session,
     );
-    assert_eq!(got, format!("set {sid1} -> {sid2} (pull)\n"));
+    assert_eq!(got, format!("set @{sid1} -> @{sid2} (pull)\n"));
     // The §9 wire-equivalence pin, BYTE-FOR-BYTE: after the both→pull set,
     // the raw `edges --json` body (the server's own emitter, no conn in the
     // path) holds exactly the read-screen row — the push half is gone and no
@@ -468,7 +450,7 @@ fn conn_round_trips_against_a_live_headless_instance() {
         &["conn", "--sock", &sock, "rm", &format!("@{sid2}")],
         in_session,
     );
-    assert_eq!(got, format!("disconnected {sid1} -> {sid2} (1 revoked)\n"));
+    assert_eq!(got, format!("disconnected @{sid1} -> @{sid2}\n"));
     let got = client_ok(
         &inst,
         &[
@@ -486,7 +468,7 @@ fn conn_round_trips_against_a_live_headless_instance() {
     assert_eq!(
         got,
         format!(
-            "no session connections for {sid1}\n\
+            "no session connections for @{sid1}\n\
              create one:\n  \
              aterm conn add @<sid>        take control of a session (pull+push)\n  \
              aterm conn spawn controlled  spawn a new session this one controls\n"

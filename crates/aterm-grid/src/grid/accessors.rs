@@ -18,11 +18,9 @@ use crate::{CellCoord, CellExtra, CellExtras};
 #[cfg(test)]
 use crate::{ExtendedStyle, StyleId};
 
-/// Bridge-compatible grid dimensions (#3828).
-///
-/// Implements `aterm_types::index::Dimensions` so the Alacritty bridge (and
-/// any future consumer) can use `Dimensions` methods on `Grid` without the
-/// bridge needing to define a foreign impl.
+/// Grid dimensions for `aterm_types::index::Dimensions`, so the Alacritty
+/// bridge (and other consumers) can use `Dimensions` methods on `Grid` without
+/// a foreign impl.
 impl Dimensions for Grid {
     fn total_lines(&self) -> usize {
         self.storage.total_lines()
@@ -128,28 +126,24 @@ impl Grid {
         // A wholesale coordinate change is not a row-band translation: poison the
         // band record so no host replays the batch's bands as if they explained it.
         self.storage.presentation.poison_row_band_moves();
-        // SELECTION CUSTODY Phase 4: also record it on the lattice. `All` is the
-        // honest answer for the callers that keep this: the whole coordinate space
-        // is gone (ED 3, `clear_scrollback`, RIS, a Kitty unscroll that renumbers
-        // history wholesale), so no band can describe the damage.
+        // Also record it on the selection damage lattice. `All`, since the whole
+        // coordinate space is gone for these callers (ED 3, `clear_scrollback`,
+        // RIS, a Kitty unscroll renumbering history), so no band describes it.
         self.storage.selection_damage = self
             .storage
             .selection_damage
             .union(crate::SelectionDamage::All);
     }
 
-    /// Record that host-cached grid COORDINATES are stale, WITHOUT claiming the
+    /// Record that host-cached grid coordinates are stale, without claiming the
     /// content under any selection was destroyed.
     ///
-    /// The alt-screen-switch half of [`Self::force_selection_invalidation`]. A buffer
-    /// swap does replace every visible coordinate — hosts that cache them (cursor
-    /// effects, the viewport row cache) TRANSLATE rather than rebuild while
-    /// `ContentScrollState::invalidation_epoch` is unchanged, so dropping the bump
-    /// leaves their state attached to cells from the other buffer. But the outgoing
-    /// screen's selection is PARKED across the switch, not destroyed, so recording
-    /// `SelectionDamage::All` here would clear the very selection the park exists to
-    /// keep. The two signals were one flag until they had to disagree; this is that
-    /// disagreement.
+    /// For the alt-screen switch: a buffer swap replaces every visible
+    /// coordinate, and hosts caching them (cursor effects, the viewport row
+    /// cache) translate rather than rebuild while
+    /// `ContentScrollState::invalidation_epoch` is unchanged. But the outgoing
+    /// screen's selection is parked across the switch, not destroyed, so
+    /// recording `SelectionDamage::All` here would clear what the park keeps.
     #[inline]
     pub fn invalidate_host_coordinates(&mut self) {
         self.storage.coordinates_invalidated = true;
@@ -158,38 +152,25 @@ impl Grid {
         self.storage.presentation.poison_row_band_moves();
     }
 
-    /// Record that RETAINED HISTORY was discarded wholesale — the third half of
-    /// [`Self::force_selection_invalidation`], and the one that must NOT claim a
-    /// coordinate move.
+    /// Record that retained history was discarded wholesale, without claiming
+    /// a coordinate move.
     ///
-    /// The selection half is identical and deliberately so: history that no
-    /// longer exists cannot be named by a band, so `All` is the only honest
-    /// answer and every anchor must go. What ED 3 / `clear_scrollback` does NOT
-    /// do is move a live coordinate. `erase_scrollback` copies the visible rows
-    /// `[live_top, live_top + visible_rows)` into `new_rows[0..visible_rows]` and
-    /// sets `ring_head = 0`; with `display_offset` at 0 — which the SCR-1
-    /// processing prologue guarantees for the whole of a batch —
-    /// `GridStorage::row_index` reads `(live_top + i)` before and `i` after, the
-    /// same row. `absolute_row_counter` and `visible_rows` are untouched, so
-    /// `visible_to_absolute` is unchanged as well: row `r`, column `c` is the
-    /// same cell, with the same absolute number, before and after. Only
-    /// `oldest_absolute_row()` moves, and it moves because history was EVICTED —
-    /// which is not the same event as history being RENUMBERED (that one has its
-    /// own `history_renumber_epoch`, bumped by the Kitty unscroll in
-    /// `scroll_unscroll.rs` and by nothing here).
+    /// Selection damage is `All`: history that no longer exists cannot be
+    /// named by a band. But ED 3 / `clear_scrollback` moves no live coordinate:
+    /// `erase_scrollback` copies the visible rows to `new_rows[0..visible_rows]`
+    /// and sets `ring_head = 0`, so with `display_offset` at 0 (guaranteed for
+    /// the whole batch by the processing prologue) `GridStorage::row_index`
+    /// names the same row before and after, and `absolute_row_counter` and
+    /// `visible_rows` are untouched. Only `oldest_absolute_row()` moves, because
+    /// history was evicted, which is not renumbering (that has its own
+    /// `history_renumber_epoch`).
     ///
-    /// Claiming the move anyway bumped `ContentScrollState::invalidation_epoch`,
-    /// which the GUI reads to call `cursor_glow.reset()` — so the `clear` command
-    /// annihilated the earned rainbow ribbon exactly as every ED spelling used to
-    /// before `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
-    /// The `content_scroll_delta == i32::MAX` sentinel is dropped with it and for
-    /// the same reason: `post_process` folds it into `invalidates_coordinates`
-    /// independently, and its OTHER job — clearing the selection — is exactly what
-    /// the damage lattice does here (`SelectionDamage::All` short-circuits
-    /// `clears_selection` to true without consulting the overlap predicate).
+    /// So `invalidation_epoch` is not bumped (it would reset the GUI's cursor
+    /// effects on every `clear`), and the `content_scroll_delta == i32::MAX`
+    /// sentinel is not set either: its other job, clearing the selection, is
+    /// done by `SelectionDamage::All`.
     ///
-    /// Pinned by `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`,
-    /// whose selection control is what refuses the "delete the call" mutant.
+    /// Pinned by `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`.
     #[inline]
     pub fn discard_history_selection(&mut self) {
         self.storage.selection_damage = self
@@ -198,24 +179,19 @@ impl Grid {
             .union(crate::SelectionDamage::All);
     }
 
-    /// SELECTION CUSTODY Phase 4: record the SCROLL REGION's rows as damaged.
+    /// Record the scroll region's rows as selection damage.
     ///
-    /// The shorthand for the line/column editing family — IL, DL, DECIC, DECDC, SL,
-    /// SR, DECBI, DECFI — every one of which is confined to the current scroll
-    /// region. Using the whole region rather than the exact sub-span each op touched
-    /// is deliberately CONSERVATIVE: it can over-clear a selection sitting in the
-    /// untouched part of the region, but it can never leave a stale highlight over
-    /// replaced content, and one uniform rule is far easier to audit than eight
-    /// hand-derived spans. The rows OUTSIDE the region — including all of
-    /// scrollback, which is what the user is actually reading — are spared, and that
-    /// is the whole point.
+    /// Shorthand for the line/column editing family (IL, DL, DECIC, DECDC, SL,
+    /// SR, DECBI, DECFI), all confined to the scroll region. Using the whole
+    /// region rather than each op's exact span may over-clear a selection in
+    /// the untouched part of the region but never leaves a stale highlight;
+    /// rows outside the region, including all of scrollback, are spared.
     pub(crate) fn damage_selection_scroll_region(&mut self) {
         // A line/column edit MOVES rows, so host coordinate caches must drop.
         self.storage.coordinates_invalidated = true;
-        // ...and a margined IL/DL or a column op (DECIC/DECDC/SL/SR/DECBI/DECFI)
-        // moves a RECTANGLE or cells within rows, which no row-band translation
-        // describes: poison the band record so the batch fails closed for hosts that
-        // translate bands. The full-width IL/DL use
+        // A margined IL/DL or a column op (DECIC/DECDC/SL/SR/DECBI/DECFI) moves a
+        // rectangle or cells within rows, which no row-band translation
+        // describes, so poison the band record. Full-width IL/DL use
         // [`Self::damage_selection_scroll_region_as_band`] instead.
         self.storage.presentation.poison_row_band_moves();
         let (top, bottom) = (
@@ -225,12 +201,10 @@ impl Grid {
         self.damage_selection_visible_rows(top, bottom);
     }
 
-    /// The row-band twin of [`Self::damage_selection_scroll_region`] for the
-    /// full-width IL/DL: the coordinate flag and the region damage are recorded
-    /// exactly as there, and ADDITIONALLY the move is recorded with numbers — rows
-    /// `top..=bottom` (the cursor row through the region bottom) moved by `delta`
-    /// (see [`crate::RowBandMove`]), so a host that translates bands keeps its marks
-    /// on the lines they belong to instead of discarding them.
+    /// [`Self::damage_selection_scroll_region`] for the full-width IL/DL, also
+    /// recording the move with numbers: rows `top..=bottom` (the cursor row
+    /// through the region bottom) moved by `delta` (see [`crate::RowBandMove`]),
+    /// so a host that translates bands keeps its marks on their lines.
     pub(crate) fn damage_selection_scroll_region_as_band(
         &mut self,
         top: u16,
@@ -256,16 +230,16 @@ impl Grid {
         self.storage.take_coordinates_invalidated()
     }
 
-    /// Drain this batch's row-band move record (see [`crate::RowBandMoves`]) —
+    /// Drain this batch's row-band move record (see [`crate::RowBandMoves`]),
     /// the numbers behind `take_coordinates_invalidated`. Read it in the same
-    /// post-processing step as the flag: a batch whose record is non-empty and not
-    /// `inexact` moved rows ONLY as the listed bands say.
+    /// post-processing step as the flag: a non-empty, exact record means rows
+    /// moved only as the listed bands say.
     pub fn take_row_band_moves(&mut self) -> crate::RowBandMoves {
         self.storage.presentation.take_row_band_moves()
     }
 
     /// Drain the most recent resize's revealed-history row shift (see
-    /// `last_resize_row_shift`). Read from the ACTIVE grid: `Terminal::resize`
+    /// `last_resize_row_shift`). Read from the active grid: `Terminal::resize`
     /// resizes both the active and the saved grid, so each records its own.
     pub fn take_last_resize_row_shift(&mut self) -> u16 {
         self.storage.take_last_resize_row_shift()
@@ -288,21 +262,19 @@ impl Grid {
         self.storage.presentation.last_resize_shape
     }
 
-    /// SELECTION CUSTODY Phase 4: record that VISIBLE rows `top..=bottom` had their
-    /// content moved or rewritten, so a selection overlapping them — and ONLY one
-    /// overlapping them — must be cleared.
+    /// Record that visible rows `top..=bottom` had their content moved or
+    /// rewritten, so a selection overlapping them (and only such a selection)
+    /// is cleared.
     ///
-    /// Converts through [`Grid::visible_to_absolute`], which is
-    /// `absolute_row_counter - visible_rows + visible_row` and deliberately does NOT
-    /// read `display_offset`. That is what makes it sound to call MID-BATCH, while
-    /// the processing prologue has forced `display_offset` to 0 for VT row
-    /// arithmetic. `top_visible_absolute_row` DOES subtract `display_offset` and
-    /// would be the wrong primitive here.
-    /// `moves_coordinates` states whether this op also MOVED rows, which is a
-    /// separate question from content replacement and feeds the host-facing
-    /// `ContentScrollState::invalidation_epoch` (see `coordinates_invalidated`). A
-    /// scroll or line-edit moves rows; an erase or a rectangle op rewrites cells in
-    /// place and moves nothing.
+    /// Converts through [`Grid::visible_to_absolute`], which does not read
+    /// `display_offset`, so it is sound mid-batch while the processing
+    /// prologue forces `display_offset` to 0 (`top_visible_absolute_row`
+    /// subtracts it and would be wrong here).
+    ///
+    /// `moves_coordinates` says whether the op also moved rows (a scroll or
+    /// line edit), as opposed to rewriting cells in place (an erase or
+    /// rectangle op); it feeds `ContentScrollState::invalidation_epoch` (see
+    /// `coordinates_invalidated`).
     pub fn damage_selection_visible_rows_ext(
         &mut self,
         top: u16,
@@ -321,14 +293,10 @@ impl Grid {
         } else {
             (bottom, top)
         };
-        // CLAMP to the visible screen before converting. Callers can legitimately
-        // hand in rows outside it: a crafted DECSTBM leaves a scroll region whose
-        // `bottom` outlives a later shrink, and `visible_to_absolute` would then
-        // compute a row ABOVE `absolute_row_counter` — a band naming content that
-        // does not exist. A band off the screen describes nothing, so clamping is
-        // both safe and the only meaningful reading. (Found by
-        // `fuzz_process_never_panics::process_crafted_escape_sequences_never_panics`,
-        // which is exactly the crafted-sequence surface this guards.)
+        // Clamp to the visible screen before converting: a crafted DECSTBM can
+        // leave a region `bottom` past a later shrink, and `visible_to_absolute`
+        // would then name a row above `absolute_row_counter`. A band off screen
+        // describes nothing.
         let last = self.storage.visible_rows.saturating_sub(1);
         let (top, bottom) = (top.min(last), bottom.min(last));
         let lo_abs = self.visible_to_absolute(top);
@@ -337,13 +305,13 @@ impl Grid {
         self.damage_selection_absolute_rows(lo_abs, hi_abs);
     }
 
-    /// SELECTION CUSTODY Phase 4: record that ABSOLUTE rows `lo_abs..=hi_abs` had
-    /// their content moved or rewritten.
+    /// Record that absolute rows `lo_abs..=hi_abs` had their content moved or
+    /// rewritten.
     ///
-    /// The primitive under [`Grid::damage_selection_visible_rows`], for the one
-    /// caller that already holds absolute rows and must NOT re-derive them from
-    /// visible ones: ordinary output, whose start row can have scrolled away by the
-    /// time the run ends (see [`Grid::damage_selection_output`]).
+    /// The primitive under [`Grid::damage_selection_visible_rows`], for callers
+    /// already holding absolute rows: ordinary output, whose start row can have
+    /// scrolled away by the time the run ends (see
+    /// [`Grid::damage_selection_output`]).
     pub(crate) fn damage_selection_absolute_rows(&mut self, lo_abs: u64, hi_abs: u64) {
         let (lo_abs, hi_abs) = if lo_abs <= hi_abs {
             (lo_abs, hi_abs)
@@ -356,16 +324,16 @@ impl Grid {
             .union(crate::SelectionDamage::Band { lo_abs, hi_abs });
     }
 
-    /// The ABSOLUTE row the cursor is on, i.e. where the next printed character
-    /// lands. Frame-invariant, so it survives any scroll that happens after it is
-    /// read — which is what lets ordinary output bracket a whole run with two reads.
+    /// The absolute row the cursor is on, where the next printed character
+    /// lands. Frame-invariant, so it survives later scrolls, letting output
+    /// bracket a whole run with two reads.
     #[must_use]
     #[inline]
     fn cursor_absolute_row(&self) -> u64 {
         self.visible_to_absolute(self.storage.cursor.row)
     }
 
-    /// SELECTION CUSTODY: snapshot where output is about to land, for
+    /// Snapshot where output is about to land, for
     /// [`Grid::damage_selection_output`] to close over the print.
     #[must_use]
     pub fn output_damage_origin(&self) -> crate::OutputOrigin {
@@ -378,37 +346,27 @@ impl Grid {
         }
     }
 
-    /// SELECTION CUSTODY: record ORDINARY PRINTED OUTPUT that ran from `origin` to
-    /// the cursor's current position.
+    /// Record ordinary printed output that ran from `origin` to the cursor's
+    /// current position as selection damage, so a bare `\rProgress: 90%`
+    /// overwrite under a live highlight clears it.
     ///
-    /// The other half of the inverse hole. EL closed the `\r` + `\e[K` progress bar;
-    /// this closes the bare `\rProgress: 90%` overwrite, which replaces the cells
-    /// under a live highlight with no erase op anywhere, leaving a copy that returns
-    /// text the user never selected.
+    /// Kept cheap and from over-clearing:
     ///
-    /// Design §10 rejected PER-GLYPH tracking as too costly on the hottest loop, and
-    /// that judgement stands — this is not it. Three properties keep it cheap and
-    /// keep it from over-clearing:
+    /// 1. Recorded per print call, not per glyph: the bulk ASCII/Unicode paths
+    ///    pay it once per run, and the absolute frame lets one band cover a run
+    ///    that wrapped and scrolled.
+    /// 2. An append past the row's existing content on a single row replaces
+    ///    nothing and records nothing. This is required: a top-anchored history
+    ///    splice (Codex's `insert_history`) fills the blank row it created, and
+    ///    the piecewise remap keeps a selection across that
+    ///    (`EligibleSelectionUsesPiecewiseRemap`).
+    /// 3. While an overwriting program stays on one row (progress bar,
+    ///    spinner), it is one `Option<u64>` compare and an early return, since
+    ///    `SelectionDamage::union` is monotone.
     ///
-    /// 1. Recorded per PRINT CALL, not per glyph: the bulk ASCII/Unicode blast paths
-    ///    pay it once for a whole run, and the absolute frame's invariance lets one
-    ///    band cover a run that wrapped and scrolled mid-flight.
-    /// 2. An APPEND past the row's existing content on a single row replaces nothing
-    ///    and records nothing. That is not only a saving, it is REQUIRED: a
-    ///    top-anchored history splice (Codex's `insert_history`) fills the blank row
-    ///    it just created, and the piecewise remap deliberately keeps a selection
-    ///    across that — recording it would silently destroy the survival
-    ///    `EligibleSelectionUsesPiecewiseRemap` proves.
-    /// 3. While an overwriting program stays on one row — a progress bar, a spinner —
-    ///    it is one `Option<u64>` compare and an early return, because
-    ///    `SelectionDamage::union` is monotone in coverage and re-recording an
-    ///    already-covered row cannot change the accumulator.
-    ///
-    /// Rows are recorded, columns are not, so an overwrite in a DIFFERENT column of a
-    /// selected row still clears it — the same row granularity every other member of
-    /// the lattice has, and it fails safe. The residual: a run that WRAPS is recorded
-    /// whole (rule 2 is asked of the first row only), which over-clears the wrapped
-    /// tail rather than under-naming it.
+    /// Rows are recorded, not columns, so an overwrite in another column of a
+    /// selected row still clears it (row granularity, failing safe). A run that
+    /// wraps is recorded whole (rule 2 applies to its first row only).
     pub fn damage_selection_output(&mut self, origin: crate::OutputOrigin) {
         let to_abs = self.cursor_absolute_row();
         let single_row = origin.abs_row == to_abs;
@@ -450,11 +408,10 @@ impl Grid {
     /// Soft-wrap flag for a visible row: `true` if this row is a wrap
     /// continuation of the previous row. `None` for an out-of-range row.
     ///
-    /// Resolved through [`visible_row_view`](Self::visible_row_view) so a
-    /// scrolled-back row past the ring base (materialized from lazy/tiered
-    /// scrollback) reports its real wrap state instead of `None` — matching the
-    /// tier-aware `row_text`/`cell_text` siblings. At `display_offset == 0` this
-    /// is byte-identical to reading `Grid::row` directly.
+    /// Resolved through [`visible_row_view`](Self::visible_row_view), so a
+    /// scrolled-back row materialized from lazy/tiered scrollback reports its
+    /// real wrap state, like `row_text`/`cell_text`. At `display_offset == 0`
+    /// this equals reading `Grid::row` directly.
     #[must_use]
     #[inline]
     pub fn row_is_wrapped(&self, visible_row: u16) -> Option<bool> {
@@ -467,10 +424,10 @@ impl Grid {
     /// Logical length of a visible row (last non-empty cell + 1, 0 if blank).
     /// `None` for an out-of-range row.
     ///
-    /// Resolved through [`visible_row_view`](Self::visible_row_view) so a
-    /// scrolled-back history row reports its materialized length instead of
-    /// `None`, matching the tier-aware `row_text`/`cell_text` siblings. At
-    /// `display_offset == 0` this is byte-identical to reading `Grid::row`.
+    /// Resolved through [`visible_row_view`](Self::visible_row_view), so a
+    /// scrolled-back history row reports its materialized length, like
+    /// `row_text`/`cell_text`. At `display_offset == 0` this equals reading
+    /// `Grid::row`.
     #[must_use]
     #[inline]
     pub fn row_len(&self, visible_row: u16) -> Option<u16> {
@@ -487,7 +444,7 @@ impl Grid {
         self.storage.pending_wrap()
     }
 
-    /// Set the pending wrap flag directly (#7283).
+    /// Set the pending wrap flag directly.
     ///
     /// Used by DECRC (cursor restore) to restore the saved wrap-next state.
     /// Normal cursor operations clear pending_wrap automatically.
@@ -509,16 +466,14 @@ impl Grid {
         }
     }
 
-    /// Monotonic AUTOWRAP serial — the emulator wrap fact (kitty-motion §4.1).
+    /// Monotonic autowrap serial: the emulator's wrap fact.
     ///
-    /// Advances by exactly one each time an autowrap line advance RESOLVES
-    /// (`advance_autowrap_line`, the one funnel), so `serial changed since my
-    /// last read` is a fact — not a caret-delta heuristic — and a parked
-    /// [`pending_wrap`](Self::pending_wrap) that has not yet resolved is
-    /// correctly not a wrap. Hard newlines (`line_feed`) never advance it.
-    /// Transient observability with a deliberate non-persistence law: see
-    /// `GridStorage::wrap_serial` for why checkpoint/restore and main/alt
-    /// swaps carry no migration.
+    /// Advances by exactly one each time an autowrap line advance resolves
+    /// (`advance_autowrap_line`), so a change since the last read means a wrap
+    /// happened; a parked [`pending_wrap`](Self::pending_wrap) is not yet a
+    /// wrap, and hard newlines (`line_feed`) never advance it. Transient: see
+    /// `GridStorage::wrap_serial` for why checkpoint/restore and main/alt swaps
+    /// do not carry it.
     #[must_use]
     #[inline]
     pub fn wrap_serial(&self) -> u64 {
@@ -542,13 +497,12 @@ impl Grid {
         self.storage.damage_mut()
     }
 
-    /// Monotonic content-generation counter (P1.0).
+    /// Monotonic content-generation counter.
     ///
-    /// Advances by one on every CONTENT mutation (cell/line/scrollback change)
-    /// but NOT on a pure viewport scroll (`scroll_display`). A cached search
-    /// index or a peer session caches this value and does an O(1) compare to
-    /// detect change. Starts at a NONZERO value, so `0` is a usable "never
-    /// observed" sentinel.
+    /// Advances by one on every content mutation (cell/line/scrollback change)
+    /// but not on a pure viewport scroll (`scroll_display`). Caches (search
+    /// index, peer sessions) compare it in O(1) to detect change. Starts
+    /// nonzero, so `0` is a usable "never observed" sentinel.
     #[must_use]
     #[inline]
     pub fn content_gen(&self) -> u64 {
@@ -640,12 +594,12 @@ impl Grid {
         self.storage.cell_extra_mut(row, col)
     }
 
-    /// Attach an inline-image ref to a cell (iTerm2 OSC 1337 / sixel / Kitty).
+    /// Make an inline-image ref a cell's only image (iTerm2 OSC 1337 / sixel,
+    /// which own the cells they cover).
     ///
-    /// Goes through `CellExtras::set_image` rather than
-    /// `cell_extra_mut(..).set_image(..)` so the collection's scroll-off scan
-    /// gate is armed by the same call that places the picture — an image the
-    /// gate never heard about is one that vanishes at the top of the screen.
+    /// Goes through `CellExtras::set_image` so the collection's scroll-off scan
+    /// gate is armed by the same call; otherwise the image would vanish when
+    /// its row scrolls off.
     #[inline]
     pub fn set_cell_image(&mut self, row: u16, col: u16, image: crate::ImageRef) {
         // Set the HAS_EXTRAS bit first (the cell-level flag the render fast
@@ -653,6 +607,16 @@ impl Grid {
         self.storage.cell_extra_mut(row, col);
         let coord = CellCoord::new(row, col);
         self.storage.extras_mut().set_image(coord, image);
+    }
+
+    /// Stack an inline-image ref onto a cell's images in draw order (a Kitty
+    /// placement, which layers over what the cell already shows); the same
+    /// scan-gate contract as [`set_cell_image`](Self::set_cell_image).
+    #[inline]
+    pub fn stack_cell_image(&mut self, row: u16, col: u16, image: crate::ImageRef) {
+        self.storage.cell_extra_mut(row, col);
+        let coord = CellCoord::new(row, col);
+        self.storage.extras_mut().stack_image(coord, image);
     }
 
     /// Get or create extras for a cell whose HAS_EXTRAS flag is already set.
@@ -664,11 +628,11 @@ impl Grid {
         self.storage.cell_extra_mut_preflagged(row, col)
     }
 
-    /// Store a complex char codepoint in the dense ring buffer (O(1) flat-array write).
+    /// Store a complex char codepoint in the dense ring buffer (O(1) flat-array
+    /// write, raw `char`, no Arc or refcounting).
     ///
-    /// Use this for the non-BMP write hot path instead of `cell_extra_mut_preflagged`
-    /// + `set_complex_char`. The ring buffer avoids FxHashMap overhead entirely.
-    ///   Stores raw `char` — no Arc allocation or atomic refcounting.
+    /// Use this on the non-BMP write path instead of `cell_extra_mut_preflagged`
+    /// + `set_complex_char`.
     #[inline]
     pub fn set_complex_char_ring(&mut self, row: u16, col: u16, value: char) {
         let visible_rows = self.storage.visible_rows;
@@ -726,7 +690,7 @@ impl Grid {
     ///
     /// Evicts hyperlink data from the oldest entries when the extras map
     /// exceeds [`crate::extra_collection::MAX_HYPERLINK_ENTRIES`].
-    /// Should be called after setting hyperlinks on cells (#7172).
+    /// Call after setting hyperlinks on cells.
     #[inline]
     pub fn enforce_hyperlink_limit(&mut self) {
         self.storage.extras_mut().enforce_hyperlink_limit();
@@ -774,14 +738,10 @@ impl Grid {
 
     /// Whether DECSLRM margins are narrower than the full row.
     ///
-    /// The same answer as `!self.horizontal_margins().is_full(self.cols())`,
-    /// but READ rather than re-derived: the grid already maintains this as a
-    /// flag, updated at the only two places margins can move
-    /// (`set_horizontal_margins` / `reset_horizontal_margins`). The derived form
-    /// costs a `cursor_state` load, a `cols` load, a `saturating_sub` and two
-    /// compares — trivial once, but the bulk write path asks the question once
-    /// per bulk call, i.e. thousands of times per MiB of output, purely to pick
-    /// between a batched and a per-glyph writer.
+    /// Same answer as `!self.horizontal_margins().is_full(self.cols())`, read
+    /// from a flag maintained by `set_horizontal_margins` /
+    /// `reset_horizontal_margins`, because the bulk write path asks once per
+    /// call to choose between a batched and a per-glyph writer.
     #[must_use]
     #[inline]
     pub fn has_horizontal_margins(&self) -> bool {
@@ -803,41 +763,36 @@ impl Grid {
     /// Get the current tab stops as a boolean slice (column-indexed).
     ///
     /// Each element is `true` if a tab stop is set at that column.
-    /// Used by checkpoint serialization to persist custom tab stops (#7280).
+    /// Used by checkpoint serialization to persist custom tab stops.
     #[must_use]
     #[inline]
     pub fn tab_stops(&self) -> &[bool] {
         &self.storage.tab_stops
     }
 
-    /// Whether TBC 3 has suppressed the every-8 defaults on this grid — the
-    /// half of the tab state that is NOT the array. It must cross every seam
-    /// the array crosses; see [`Self::restore_tab_stops`].
+    /// Whether TBC 3 has suppressed the every-8 defaults on this grid: the part
+    /// of the tab state that is not the array. It must cross every seam the
+    /// array crosses; see [`Self::restore_tab_stops`].
     #[must_use]
     #[inline]
     pub fn tab_defaults_suppressed(&self) -> bool {
         self.storage.tab_defaults_suppressed
     }
 
-    /// Replace the tab stops with the given boolean slice AND the suppression
+    /// Replace the tab stops with the given boolean slice and the suppression
     /// flag that goes with them.
     ///
-    /// Used by checkpoint deserialization to restore custom tab stops (#7280)
-    /// and by the alt-screen switch, which shares tab state between the two
-    /// screens per xterm. A narrowed grid intentionally retains stops beyond
-    /// its current width so a later grow restores the user's exact semantics.
-    /// Accept only a vector that covers every active column and stays within
-    /// [`crate::MAX_GRID_COLS`]; an invalid untrusted projection is a no-op.
+    /// Used by checkpoint deserialization and by the alt-screen switch, which
+    /// shares tab state between the two screens per xterm. A narrowed grid
+    /// keeps stops beyond its current width so a later grow restores them.
+    /// Accepts only a vector covering every active column and within
+    /// [`crate::MAX_GRID_COLS`]; anything else is a no-op.
     ///
-    /// **`defaults_suppressed` IS NOT OPTIONAL, and that is the point.** TBC 3
-    /// ("clear ALL tab stops") is two facts: the cleared array, and the
-    /// standing instruction that a later WIDEN must not re-seed the every-8
-    /// default into the columns it adds. This function used to carry only the
-    /// first, so every seam that moved tab state between grids — the four
-    /// alt-screen switch sites and the seamless-update checkpoint — silently
-    /// dropped the second, and the next window resize resurrected stops the
-    /// application had explicitly erased. Taking it as a parameter makes each
-    /// of those seams state its answer instead of inheriting `false`.
+    /// `defaults_suppressed` is required: TBC 3 ("clear all tab stops") is both
+    /// the cleared array and the instruction that a later widen must not
+    /// re-seed the every-8 defaults. Every seam moving tab state between grids
+    /// (alt-screen switches, the update checkpoint) must pass it, or the next
+    /// resize would resurrect stops the application erased.
     pub fn restore_tab_stops(&mut self, stops: &[bool], defaults_suppressed: bool) {
         if stops.len() < usize::from(self.cols()) || stops.len() > usize::from(crate::MAX_GRID_COLS)
         {
@@ -866,15 +821,18 @@ impl Grid {
         scrollback: impl Into<aterm_scrollback::ScrollbackStorage>,
     ) {
         self.storage.attach_scrollback(scrollback);
+        // The store's history takes the keys below the screen's: a store that
+        // holds more lines than the counter covers raises it, so the two maps
+        // of an absolute row still name one row (`cover_retained_rows`).
+        self.cover_retained_rows();
         if !self.storage.scrollback_detached_for_reflow {
             return;
         }
 
-        // A reset/recovery path installed a replacement while the old worker
-        // is still unresolved. Untouched settings follow that authoritative
-        // replacement; dirty host requests remain authoritative and are
-        // enforced immediately (the snapshot stays live for last-writer-wins
-        // updates until finish/abort consumes it).
+        // A reset/recovery path installed a replacement while the old worker is
+        // unresolved. Untouched settings follow the replacement; dirty host
+        // requests stay authoritative and are enforced now (the snapshot stays
+        // live for last-writer-wins updates until finish/abort consumes it).
         let replacement_line_limit = self
             .storage
             .scrollback
@@ -932,28 +890,21 @@ impl Grid {
 
     /// Set the retained scrollback line limit (`None` = unlimited).
     ///
-    /// The limit is ONE TOTAL retention count (audit E1, Codex-required
-    /// unification): on a tiered grid it caps ring + lazy + store TOGETHER,
-    /// not the store alone — previously a limit of `L` retained `L` store
-    /// lines PLUS the full ring, silently doubling retention. Split rule:
-    /// the ring keeps its role as the fixed fast tier, so
-    ///   * `limit >= ring cap`: store limit = `limit - ring cap` (the ring's
-    ///     share is its cap — the steady-state ring occupancy);
-    ///   * `limit < ring cap`: the ring itself is re-capped to `limit`
-    ///     (evicting its oldest lines) and the store drops to zero. The ring
-    ///     cap does NOT grow back on a later raise — the hot-tier size is a
-    ///     construction decision; the raise widens only the store share.
+    /// The limit is one total: on a tiered grid it caps ring + lazy + store
+    /// together, not the store alone. The ring stays the fixed fast tier:
+    ///   * `limit >= ring cap`: store limit = `limit - ring cap`;
+    ///   * `limit < ring cap`: the ring is re-capped to `limit` (evicting its
+    ///     oldest lines) and the store share is zero. The ring cap does not grow
+    ///     back on a later raise; a raise widens only the store share.
     ///
-    /// Lines staged in the lazy buffer count against the store share (they
-    /// are drained into the store here, and every steady-state drain point
-    /// re-truncates), so `scrollback_lines() <= limit` at every quiescent
-    /// point; mid-batch the transient overshoot is bounded by the lazy-drain
-    /// threshold.
+    /// Staged lazy lines count against the store share (drained into the store
+    /// here, and re-truncated at every steady-state drain), so
+    /// `scrollback_lines() <= limit` at quiescent points; mid-batch overshoot
+    /// is bounded by the lazy-drain threshold.
     ///
-    /// Ring-only grids (no store) have no other retention, so the limit
-    /// re-caps the ring itself: growth stays lazy (rows allocate only as
-    /// lines scroll off) and a shrink evicts the OLDEST lines immediately,
-    /// mirroring the store's `set_line_limit` truncation semantics.
+    /// Ring-only grids re-cap the ring itself: growth stays lazy (rows allocate
+    /// as lines scroll off) and a shrink evicts the oldest lines immediately,
+    /// like the store's `set_line_limit`.
     pub fn set_scrollback_line_limit(&mut self, limit: Option<usize>) {
         // The worker owns the store during an off-thread reflow. Keep the
         // newest request in the detach snapshot so the getter is truthful and
@@ -985,7 +936,7 @@ impl Grid {
             let ring_cap = self.storage.max_scrollback;
             let store_limit = limit.map(|l| l.saturating_sub(ring_cap));
             // Drain staged lazy lines first (via scrollback_mut) so the store's
-            // truncation sees the full history — the historical Terminal path.
+            // truncation sees the full history.
             if let Some(sb) = self.scrollback_mut() {
                 sb.set_line_limit(store_limit);
             }
@@ -1000,11 +951,9 @@ impl Grid {
                     self.evict_oldest_ring_scrollback(excess);
                 }
             }
-            // A shrink that evicted lines changed the retained/indexed set:
-            // re-clamp a scrolled-back viewport and invalidate content-keyed
-            // caches (search index, peer polls) exactly like the ring arm's
-            // eviction does — a stale index otherwise keeps returning absolute
-            // rows `line` already reports evicted, until the next write.
+            // A shrink that evicted lines changed the retained set: re-clamp a
+            // scrolled-back viewport and invalidate content-keyed caches (search
+            // index, peer polls), as the ring arm's eviction does.
             if self.scrollback_lines() != before {
                 self.clamp_display_offset();
                 self.storage.mark_content_full();
@@ -1051,9 +1000,9 @@ impl Grid {
             Some(scrollback) => scrollback.set_memory_budget(budget),
             None => Ok(()),
         };
-        // Preserve the historical `scrollback_mut` contract: callers setting a
-        // budget also settle staged history. Do it AFTER installing the new
-        // budget so a raise cannot evict those rows against the stale lower cap.
+        // Callers setting a budget also settle staged history (the
+        // `scrollback_mut` contract). Done after installing the budget, so a
+        // raise cannot evict those rows against the old lower cap.
         if self.storage.scrollback.is_some() {
             self.drain_lazy_buffer();
             // `drain_lazy_buffer` enforces internally but cannot return its
@@ -1073,23 +1022,22 @@ impl Grid {
         result
     }
 
-    /// Monotonic count of history lines LOST to non-user-requested truncation:
-    /// flood-backpressure staged-line drops + detached-reflow-window cap drops
-    /// (this grid) + memory-pressure store evictions (the attached tiered
-    /// store). User-requested limit shrinks and ordinary retention eviction —
-    /// including the rows a flood pushes past the configured line limit,
-    /// which the flood path evicts early rather than drops — are intentional
-    /// and not counted.
+    /// Monotonic count of history lines lost to truncation the user did not
+    /// request: flood-backpressure staged-line drops, detached-reflow-window
+    /// cap drops (this grid) and memory-pressure store evictions (the attached
+    /// store). Limit shrinks and ordinary retention eviction (including rows a
+    /// flood pushes past the configured limit) are not counted.
     ///
-    /// The out-of-band half of the loss signal, for `metrics`/`lines`. The
-    /// flood drops this grid makes are ALSO marked in band: one dim
-    /// `— aterm dropped N lines here …` row stands in the history at each cut
-    /// (`scroll_convert::FloodCut`), naming the lines missing there that the
-    /// limit would still hold; each cut adds its PEAK count here, so for one
-    /// flood the two figures agree until the limit's window slides past part
-    /// of the hole or retention evicts a marker with the history around it.
-    /// The store's own memory-pressure evictions take the oldest lines and
-    /// leave no marker (the top of history moving is not a hole).
+    /// The out-of-band half of the loss signal, for `metrics`/`lines`. This
+    /// grid's flood drops are also marked in band: one dim
+    /// `— aterm dropped N lines here …` row per cut
+    /// (`scroll_convert::FloodCut`), naming the missing lines the limit would
+    /// still hold; each cut adds its peak count here. The store's own
+    /// memory-pressure evictions take the oldest lines and leave no marker.
+    /// It also counts the lines of a store block quarantined as undecodable,
+    /// whose rows stay in [`scrollback_lines`](Self::scrollback_lines) as blank
+    /// rows when older history sits before them, so `lines`' count and its
+    /// `truncated=` can overlap.
     #[must_use]
     pub fn truncated_lines(&self) -> u64 {
         self.storage.flood_truncated_lines
@@ -1099,17 +1047,13 @@ impl Grid {
             )
     }
 
-    /// Monotonic count of history ROWS that kept their text but lost their
-    /// INLINE IMAGE, because the attached tiered store compressed the line
-    /// (audit E10a, out-of-band — the row is left exactly as blank as it always
-    /// was under the picture; no sentinel is injected).
+    /// Monotonic count of history rows that kept their text but lost their
+    /// inline image because the attached tiered store compressed the line (the
+    /// row is left blank under the picture; no sentinel is injected).
     ///
-    /// This grid's own ring tier holds scrolled rows as extras and never
-    /// compresses, so a picture inside the ring is intact and counted nowhere;
-    /// the horizon is entirely the store's, and a grid with no store attached
-    /// never crosses it. See
-    /// [`Scrollback::image_rows_dropped_by_compression`](aterm_scrollback::Scrollback::image_rows_dropped_by_compression)
-    /// for what a person scrolling past it sees.
+    /// The ring tier never compresses, so pictures there are intact; a grid
+    /// with no store never counts anything. See
+    /// [`Scrollback::image_rows_dropped_by_compression`](aterm_scrollback::Scrollback::image_rows_dropped_by_compression).
     #[must_use]
     pub fn image_rows_dropped_by_compression(&self) -> u64 {
         self.storage.scrollback.as_ref().map_or(
@@ -1118,24 +1062,21 @@ impl Grid {
         )
     }
 
-    /// Set the RING byte watermark budget (audit E10a): ring-only grids with
-    /// an unlimited line limit have no other memory signal — with a budget
-    /// set, [`ring_watermark_level`](Self::ring_watermark_level) reports
-    /// Yellow at 80% and Red at 95% of it. `None` (default) disables the
-    /// watermark (level reads Green). Advisory only: nothing is evicted.
+    /// Set the ring byte watermark budget: ring-only grids with an unlimited
+    /// line limit have no other memory signal. With a budget set,
+    /// [`ring_watermark_level`](Self::ring_watermark_level) reports Yellow at
+    /// 80% and Red at 95%. `None` (default) disables it (Green). Advisory only:
+    /// nothing is evicted.
     pub fn set_ring_byte_watermark(&mut self, budget: Option<usize>) {
         self.storage.ring_byte_watermark = budget;
     }
 
     /// Ring-byte watermark level against the configured budget
     /// ([`set_ring_byte_watermark`](Self::set_ring_byte_watermark)), computed
-    /// from [`memory_used`](Self::memory_used) at query time — which counts
-    /// staged lazy-buffer lines too (Wave-3 review: flood backpressure parks
-    /// raw rows there before the store absorbs them), so the signal rises
-    /// DURING a flood, not only after the drain. A PURE
-    /// threshold compare (the poll-driven advisory signal does not carry the
-    /// store watermark's hysteresis latch): Green below 80%, Yellow from 80%,
-    /// Red from 95%. Green when no budget is configured.
+    /// from [`memory_used`](Self::memory_used) at query time, which includes
+    /// staged lazy-buffer lines so the signal rises during a flood. A pure
+    /// threshold compare (no hysteresis): Green below 80%, Yellow from 80%, Red
+    /// from 95%. Green when no budget is configured.
     #[must_use]
     pub fn ring_watermark_level(&self) -> aterm_scrollback::WatermarkLevel {
         use aterm_scrollback::WatermarkLevel;
@@ -1171,17 +1112,17 @@ impl Grid {
         self.storage.clear_damage(visible_rows);
     }
 
-    /// D-2 PER-ROW CONTENT REVISIONS for the VISIBLE rows, current as of this
-    /// call (the pending damage session is folded in first).
+    /// Per-row content revisions for the visible rows, current as of this call
+    /// (the pending damage session is folded in first).
     ///
     /// `rev[r]` changes whenever visible row `r`'s content changed since an
-    /// earlier read; `0` means "no fold has ever vouched for this row", which a
-    /// consumer must read as UNKNOWN and answer by comparing content. See
+    /// earlier read; `0` means no fold has vouched for the row, which a
+    /// consumer must treat as unknown and answer by comparing content. See
     /// [`GridPresentationState::row_rev`](crate::state::GridPresentationState::row_rev)
-    /// for the exact contract and for the row-identity conditions a consumer
-    /// must pin before comparing two reads.
+    /// for the contract and the row-identity conditions to pin before
+    /// comparing two reads.
     ///
-    /// `&mut self` because the fold latches; the grid's CONTENT is untouched.
+    /// `&mut self` because the fold latches; the grid's content is untouched.
     pub fn row_revisions(&mut self) -> &[u64] {
         let visible_rows = self.storage.visible_rows();
         self.storage.presentation.fold_row_revisions(visible_rows);
@@ -1204,10 +1145,9 @@ impl Grid {
     /// Damage the whole screen and bump `content_gen`, invalidating every
     /// content-keyed cache (search index, cross-session polls).
     ///
-    /// The public seam for callers that evict retained scrollback OUTSIDE a
-    /// Grid mutation — e.g. `Terminal::set_memory_budget`, which drives the
-    /// store's budget enforcer directly — so the content generation still
-    /// advances past the shrunk retained set (matching `set_scrollback_line_limit`).
+    /// For callers that evict retained scrollback outside a Grid mutation (e.g.
+    /// `Terminal::set_memory_budget` driving the store's budget enforcer), like
+    /// `set_scrollback_line_limit` does internally.
     #[cfg(test)]
     pub fn mark_content_full(&mut self) {
         self.storage.mark_content_full();
@@ -1221,7 +1161,7 @@ impl Grid {
     }
 
     // -------------------------------------------------------------------------
-    // Test-only convenience helpers (moved from aterm-core/src/grid/tests/mod.rs)
+    // Test-only convenience helpers
     // -------------------------------------------------------------------------
 
     /// Detach and return the scrollback storage, if any.

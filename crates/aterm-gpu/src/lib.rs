@@ -1,39 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// aterm GPU renderer (wgpu → Metal on macOS).
+// aterm GPU renderer: wgpu, and first-party Metal on macOS.
 //
-// The terminal grid is drawn on the GPU: a glyph atlas texture + one instanced
-// quad per cell (background fill + glyph blit). The SAME renderer can target an
-// on-screen window surface OR an offscreen texture; the offscreen path reads the
-// pixels back into an `aterm_render::Frame` so GPU output is verifiable headless
-// (PNG round-trip) — exactly like the CPU `read_image` oracle, but on the GPU.
-//
-// This file currently lands the device + offscreen readback foundation; glyph
-// rendering builds on top.
+// The terminal grid is drawn on the GPU: a glyph atlas texture plus instanced
+// quads per cell (background fill and glyph). The renderer targets an on-screen
+// window surface or an offscreen texture; the offscreen path reads pixels back
+// into an `aterm_render::Frame`, so GPU output is verifiable headless like the
+// CPU `read_image` oracle.
 
-// THE FLIP: the wgpu-free macOS production configuration leaves the
-// oracle-SHARED spellings formally dead or single-armed — the neutral device
-// layer's two-variant seams collapse to their Metal arm (making the `else`
-// refusals irrefutable), and the wgpu-arm-only helpers keep compiling for the
-// oracle without a production caller. The ORACLE configuration — the one
-// `targo-tippy --all-targets -- -D warnings` lints, because every test/bench
-// target activates `wgpu-oracle` — compiles BOTH arms and keeps all four
-// lints sharp; the suppression below applies to the production configuration
-// alone, so the shared spellings need no fork.
+// The wgpu-free macOS production build leaves some oracle-shared code
+// single-armed (device-layer seams collapse to their Metal arm) or without a
+// production caller. The oracle build (every test target enables
+// `wgpu-oracle`) compiles both arms with all lints on; this suppression
+// applies only to the production build.
 #![cfg_attr(not(wgpu_arm), allow(unreachable_patterns, irrefutable_let_patterns))]
 
-/// `eprintln!` that CANNOT panic — for every stderr line this crate writes at
-/// runtime (the Metal arm's degrade notes, the swapchain diagnostics).
-///
-/// `eprintln!` panics when the write fails ("failed printing to stderr"), and
-/// the windowed app's stderr fails in ordinary ways: a pipe whose reader has
-/// gone (EPIPE — Rust ignores SIGPIPE, so the write errors), a terminal that
-/// was closed (EIO on the pty). These notes fire on the live present path,
-/// under `drawRect:` / `RedrawRequested`, where a panic is a process abort
-/// under aterm-objc's trampoline policy. Same shape as
-/// `aterm_gui::logging::stderr_line!`; found by the 2026-09-02 abort audit's
-/// second round.
+/// `eprintln!` that cannot panic, for every stderr line this crate writes at
+/// runtime. `eprintln!` panics when stderr fails (a closed pipe or pty), and
+/// these notes fire on the present path, where a panic aborts under
+/// aterm-objc's trampoline policy. Same shape as
+/// `aterm_gui::logging::stderr_line!`.
 macro_rules! stderr_line {
     ($($arg:tt)*) => {{
         use ::std::io::Write as _;
@@ -61,30 +48,24 @@ use aterm_render::Frame;
 
 mod device_layer;
 mod format_plan;
-// THE PIPELINE TABLE: the one declaration of all eighteen render pipelines —
-// entry points, colour-target role, blend factors, write mask, vertex layout and
-// topology — read by BOTH the wgpu renderer and the first-party Metal backend, so
-// a state change cannot land on one and miss the other. See its header for what
-// the hand-copied constants it replaces actually cost.
+// The pipeline table: the single declaration of every render pipeline (entry
+// points, target role, blend, write mask, vertex layout, topology), read by the
+// wgpu renderer and the Metal backend.
 mod pipeline_table;
-// The one-future park/unpark executor the native init path drives wgpu's async
-// adapter/device acquisition on (retired `pollster`). Native-only: blocking the
-// browser main thread is forbidden, so the wasm path awaits instead.
+// A one-future executor for wgpu's async adapter/device acquisition on native.
+// The browser must not block its main thread, so wasm awaits instead.
 #[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
 mod block_on;
 
-// M3 phase B: the EDR present gate's pure decision functions, re-exported so the
-// Tier-1 exhaustive enumeration (tests/hdr_gate.rs) drives the SHIPPING policy.
+// The EDR present gate's pure decision functions, re-exported so
+// tests/hdr_gate.rs enumerates the shipping policy.
 pub use format_plan::{
     HdrPlan, HdrReconfigurePlan, hdr_live_upgrade_wants_f16, hdr_present_plan,
     hdr_reconfigure_plan, hdr_screen_upgrade_wants_f16, hdr_swapchain_wants_f16,
     hdr_swapchain_wants_f16_on_screen,
 };
-// THE ROW (macOS): the first-party Metal backend that will retire `wgpu` and
-// `softbuffer` on this cell. FOUNDATION ONLY so far — the ObjC FFI plus the six
-// WGSL shaders ported to MSL, with the fire/rain integer parity proven against
-// the CPU. Nothing in `renderer` calls it yet, and every other cell is
-// untouched. See `metal/mod.rs` for exactly what is and is not done.
+// The first-party Metal backend, the renderer's arm on macOS. See
+// `metal/mod.rs`.
 #[cfg(target_os = "macos")]
 mod metal;
 mod renderer;
@@ -92,109 +73,77 @@ pub use renderer::{
     DropOverlay, GpuRenderer, GpuSurface, PresentCrop, SurfacePresentFailure, TrayQuad, WindowGpu,
     WindowTarget,
 };
-/// THE DEMAND-DRIVEN EFFECT PIPELINES: the nine cell pipelines a launch with
-/// the shipped defaults never compiles (see `renderer::EffectPipelines`). The
-/// enum + name table are re-exported so a test can name a slot and read
-/// `GpuRenderer::effect_pipelines_resident` without knowing the build order.
+/// The demand-built effect pipelines (see `renderer::EffectPipelines`). The
+/// enum and name table let a test name a slot and read
+/// `GpuRenderer::effect_pipelines_resident`.
 pub use renderer::{
     EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
 };
-/// PRESENT → GLASS: `presentDrawable:` registration → the drawable's
-/// `presentedTime`, the compositor leg the frontend ledger could not see.
+/// Present-to-glass timing: `presentDrawable:` registration to the drawable's
+/// `presentedTime`.
 pub mod present_glass;
-/// COLD-BUILD sub-phase probe: the ns split of the one startup phase the
-/// frontend ledger could only see as a `join()` (see `startup_probe`).
+/// Cold-build sub-phase timing for the GPU backend (see `startup_probe`).
 pub mod startup_probe;
 /// VIDEO introspection: submitted-destination-frame capture (see `video_tap`).
 pub mod video_tap;
-// TRUST_NATIVE_TLA Phase 2: the GPU-free slice-precondition decision (the real
-// `GpuEncode.tla` `NeverSliceEmpty` gate `InstanceBuf::upload` uses), re-exported so
-// the Tier-1 conformance test can drive the genuine decision headlessly.
+// The GPU-free slice-precondition decision `VertexBuffer::upload_via` (and the
+// Metal arm's `upload_stream`) uses,
+// re-exported for the Tier-1 conformance test.
 pub use renderer::should_slice;
 
-// H1 (Windows Mica/Acrylic): the DirectComposition VISUAL swapchain opt-in.
+// The DirectComposition visual swapchain opt-in (Windows).
 //
-// The default DX12 surface is an HWND swapchain (`CreateSwapChainForHwnd`) whose
-// ONLY composite mode is Opaque — DWM's Mica/Acrylic backdrop
-// (`DWMWA_SYSTEMBACKDROP_TYPE`) is painted strictly BEHIND the window's visual
-// tree, so an opaque client area covers it completely and `background_material`
-// could never reach the client pixels. wgpu 29 ships the alternative wholesale:
-// `Dx12SwapchainKind::DxgiFromVisual` builds an `IDCompositionVisual` +
-// `CreateSwapChainForComposition` swapchain itself, whose caps DO advertise the
-// non-opaque composite modes — a frame presented with per-pixel alpha then blends
-// over the DWM backdrop.
+// The default DX12 surface is an HWND swapchain whose only composite mode is
+// Opaque, which fully covers DWM's Mica/Acrylic backdrop. wgpu's
+// `Dx12SwapchainKind::DxgiFromVisual` builds a composition swapchain that offers
+// non-opaque modes, so per-pixel alpha blends over the backdrop.
 //
-// The presentation system is an INSTANCE-descriptor property (it decides how
-// `create_surface` interprets a Win32 handle), and the instance is created before
-// any window/config-reload can be consulted — so the opt-in is a process-global
-// latch the frontend sets from config BEFORE building the [`GpuContext`].
-// Rejected alternatives:
-//   * `WGPU_DX12_PRESENTATION_SYSTEM=visual` (wgpu's own env knob): works, but
-//     mutating our own environment as an IPC channel to a library is exactly the
-//     kind of spooky action the explicit `InstanceDescriptor` field exists to
-//     replace — and the env would leak to child shells the terminal spawns.
-//   * Always-visual: the HWND swapchain is the RenderDoc-debuggable, most-mature
-//     path and the shipped default is `background_material = "none"`; the visual
-//     path engages ONLY on explicit config, keeping the default byte-identical.
+// The presentation system is an instance-descriptor property decided before any
+// window exists, so the opt-in is a process-global latch the frontend sets from
+// config before building the [`GpuContext`]. Not wgpu's
+// `WGPU_DX12_PRESENTATION_SYSTEM` env knob, which would leak to child shells.
+// The HWND path remains the default (`background_material = "none"`).
 //
-// FAIL-SOFT ("DirectComposition unavailable"). On a visual instance
-// `create_surface` only records the HWND: the DComp device / target / visual and
-// the composition swapchain are all built LAZILY by the FIRST `Surface::configure`
-// (wgpu-hal dx12 `DCompositionCreateDevice2` → `CreateTargetForHwnd` →
-// `CreateVisual` → `CreateSwapChainForComposition` → `SetContent` → `Commit`),
-// and wgpu's `Surface::configure` returns no `Result` — a hal failure becomes
-// `ConfigureSurfaceError::InvalidSurface`, delivered to the DEVICE's error sink,
-// whose default handler PANICS (aterm installs no uncaptured-error handler, by
-// design — see `GpuRenderer::clamp_fb_dim`). Left alone, "DComp unavailable"
-// would therefore be a process abort at the first window attach, not a soft
-// error, and the `create_window_surface` Err ⇒ CPU arm would never see it. So
-// `GpuRenderer::create_window_surface` runs the visual path's first configure
-// inside wgpu error scopes and returns `Err`; the frontend's attach arm then
-// consults [`surface_attach_fallback`], withdraws this latch, rebuilds the GPU
-// stack on the plain HWND swapchain (`GpuRenderer::rebuild_on_fresh_context` —
-// the presentation system is instance-level, so a new instance it is), and
-// retries the attach once. The material then styles the caption only, with one
-// diagnostic; the default (non-visual) configure is never scoped.
+// Fail-soft: on a visual instance the composition stack is built lazily by the
+// first `Surface::configure`, and a failure there reaches wgpu's default error
+// handler, which panics. So `GpuRenderer::create_window_surface` runs that
+// configure inside error scopes and returns `Err`; the frontend consults
+// [`surface_attach_fallback`], withdraws this latch, rebuilds on the HWND
+// swapchain (`GpuRenderer::rebuild_on_fresh_context`) and retries once. The
+// material then styles only the caption, with one diagnostic.
 #[cfg(windows)]
 static DX12_VISUAL_SWAPCHAIN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// Whether a made request was later WITHDRAWN this run (GPU init failed, the
-/// first composition-swapchain configure failed, or the device was lost), so a
-/// later "caption only" diagnostic can say so instead of suggesting a restart
-/// that would only repeat the failure.
+/// Whether a request was withdrawn this run (GPU init failed, the first
+/// composition configure failed, or the device was lost), so the "caption
+/// only" diagnostic can say so rather than suggest a restart.
 #[cfg(windows)]
 static DX12_VISUAL_SWAPCHAIN_WITHDRAWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// What [`GpuContext::new`] actually BUILT (requested AND the DX12 backend won
-/// adapter selection), distinct from the request so introspection never reports
-/// an engaged visual path on a run where DX12 did not win the adapter.
+/// Whether [`GpuContext::new`] actually built the visual path (requested and
+/// the DX12 backend won adapter selection).
 #[cfg(windows)]
 static DX12_VISUAL_SWAPCHAIN_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Request that the NEXT [`GpuContext::new`] build its DX12 instance on the
-/// DirectComposition VISUAL swapchain path (see the latch comment above). Must be
-/// called before the context exists; a GPU-loss recovery rebuild re-reads the
-/// latch, so the choice survives device loss. Windows-only by construction —
-/// every other backend ignores the DX12 options.
+/// Request that the next [`GpuContext::new`] build its DX12 instance on the
+/// visual swapchain path. Call before the context exists; loss recovery
+/// re-reads the latch. Ignored by non-DX12 backends.
 #[cfg(windows)]
 pub fn request_dx12_visual_swapchain() {
     DX12_VISUAL_SWAPCHAIN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Withdraw the visual-swapchain request. Three frontend arms call this:
-///   * the GPU-init-failure arm — windows created after a failed GPU init go
-///     back to plain HWND attributes (a softbuffer present into a
-///     `WS_EX_NOREDIRECTIONBITMAP` window has no redirection surface to blit
-///     into and would show nothing);
-///   * the GPU-loss downgrade (same softbuffer reasoning for later windows);
-///   * the H1 fail-soft arm — the first composition-swapchain configure failed
-///     (see the latch comment above), so the GPU stack is rebuilt on the HWND
-///     path: [`GpuContext::new`] re-reads the latch, which must be `false` by
-///     then.
+/// Withdraw the visual-swapchain request. Called by:
+///   * the GPU-init-failure arm (later windows use plain HWND attributes, since
+///     a softbuffer present into a `WS_EX_NOREDIRECTIONBITMAP` window shows
+///     nothing);
+///   * the GPU-loss downgrade (same reason);
+///   * the fail-soft arm after the first composition configure failed, before
+///     [`GpuContext::new`] re-reads the latch.
 ///
 /// Records the withdrawal ([`dx12_visual_swapchain_withdrawn`]) when a request
-/// was actually standing; a withdraw with no request outstanding is a no-op.
+/// was standing; otherwise a no-op.
 #[cfg(windows)]
 pub fn withdraw_dx12_visual_swapchain() {
     if DX12_VISUAL_SWAPCHAIN_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -202,43 +151,31 @@ pub fn withdraw_dx12_visual_swapchain() {
     }
 }
 
-/// Whether a visual-swapchain request was made and then withdrawn this run
-/// (see [`withdraw_dx12_visual_swapchain`]). Diagnostics only: the "material
-/// styles the caption only" once-warning uses it to name the real cause rather
-/// than advise a restart.
+/// Whether a visual-swapchain request was made and then withdrawn this run.
+/// Diagnostics only.
 #[cfg(windows)]
 pub fn dx12_visual_swapchain_withdrawn() -> bool {
     DX12_VISUAL_SWAPCHAIN_WITHDRAWN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// H1 fail-soft: what the frontend does when a window's GPU swapchain attach
-/// ([`GpuRenderer::create_window_surface`]) returns `Err`. The decision is pure
-/// and platform-independent so the latch-withdrawal policy is unit-tested on
-/// every CI runner, even though only Windows can build a visual instance.
+/// What the frontend does when [`GpuRenderer::create_window_surface`] returns
+/// `Err`. Pure and platform-independent, so the policy is tested everywhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceAttachFallback {
-    /// Another window already presents on this GPU instance, so the instance
-    /// itself works (on a visual instance, its composition swapchain has
-    /// already succeeded once): decline THIS window only. Downgrading or
-    /// rebuilding the shared backend would orphan the live surfaces.
+    /// Another window already presents on this instance, so it works: decline
+    /// this window only. Rebuilding would orphan the live surfaces.
     DeclineWindow,
-    /// First/only window on a DirectComposition visual instance: the failure is
-    /// the lazily built composition stack (or something the opaque path does
-    /// not need) — withdraw the visual latch, rebuild the GPU stack on the
-    /// opaque HWND swapchain, and retry the attach ONCE. The window's
-    /// `WS_EX_NOREDIRECTIONBITMAP` is harmless to a flip-model HWND swapchain.
+    /// First window on a visual instance: withdraw the latch, rebuild on the
+    /// opaque HWND swapchain, and retry the attach once.
     RebuildOpaque,
     /// First/only window on a plain instance (or the opaque retry failed too):
-    /// downgrade the whole app to the CPU softbuffer renderer — the pre-H1 arm.
+    /// downgrade the whole app to the CPU softbuffer renderer.
     CpuRenderer,
 }
 
-/// The [`SurfaceAttachFallback`] for a failed attach, given whether the live
-/// context was built on the visual path (`visual_swapchain_active`) and whether
-/// any other window already presents on it (`other_gpu_windows`). Total over
-/// both inputs; `RebuildOpaque` is chosen iff the instance is visual AND no
-/// other GPU window exists — the one situation where "DComp unavailable" is
-/// the plausible cause and a rebuild orphans nothing.
+/// The [`SurfaceAttachFallback`] for a failed attach: `RebuildOpaque` iff the
+/// context is visual (`visual_swapchain_active`) and no other window presents
+/// on it (`other_gpu_windows`).
 #[must_use]
 pub fn surface_attach_fallback(
     visual_swapchain_active: bool,
@@ -253,11 +190,9 @@ pub fn surface_attach_fallback(
     }
 }
 
-/// Whether the visual swapchain has been REQUESTED (config asked for a client-area
-/// backdrop and the frontend latched it). Window creation keys
-/// `with_no_redirection_bitmap` off this — the request is made before any window
-/// exists, while [`dx12_visual_swapchain_active`] is only known after the (possibly
-/// concurrent) GPU init finishes.
+/// Whether the visual swapchain has been requested. Window creation keys
+/// `with_no_redirection_bitmap` off this, since
+/// [`dx12_visual_swapchain_active`] is known only after GPU init.
 #[cfg(windows)]
 pub fn dx12_visual_swapchain_requested() -> bool {
     DX12_VISUAL_SWAPCHAIN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
@@ -270,30 +205,22 @@ pub fn dx12_visual_swapchain_active() -> bool {
     DX12_VISUAL_SWAPCHAIN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// wgpu device + queue, plus what we learned about the adapter.
+/// wgpu device and queue, plus what we learned about the adapter.
 ///
-/// The `instance` and `adapter` are KEPT (not dropped after device creation) so a
-/// window surface can be created on the SAME instance/adapter later — the GPU
-/// application-present path (`GpuRenderer::create_window_surface`) blits the
-/// offscreen frame straight into a swapchain instead of reading it back to CPU.
+/// `instance` and `adapter` are kept so a window surface can be created on the
+/// same instance later (`GpuRenderer::create_window_surface`).
 pub struct GpuContext {
-    /// THE FLIP: the wgpu device/queue exist only where the wgpu arm compiles
-    /// — every non-mac cell, plus mac oracle (test) builds. The production
-    /// macOS context is Metal-only: the armed renderer mints its own device
-    /// (`MetalArmLive`), and this struct carries just the neutral facts.
+    /// Present only where the wgpu arm compiles. The production macOS context
+    /// is Metal-only; the armed renderer mints its own device (`MetalArmLive`).
     #[cfg(wgpu_arm)]
     pub device: wgpu::Device,
     #[cfg(wgpu_arm)]
     pub queue: wgpu::Queue,
     pub adapter_name: String,
     pub backend: String,
-    /// Whether the device supports `DownlevelFlags::VIEW_FORMATS` — creating a
-    /// texture view with a different (sRGB) format than its base. The linear-light
-    /// compositing path aliases the `Rgba8Unorm` offscreen with an `Rgba8UnormSrgb`
-    /// VIEW, which REQUIRES this. wgpu's GLES/WebGL2 backend (orc's renderer) does
-    /// NOT support it — GL textures have an immutable format — so on those devices
-    /// we fall back to compositing on the plain Unorm view (no crash; the prior,
-    /// non-linear blend). Native (Metal/Vulkan/DX) keeps the linear-light path.
+    /// Whether the device supports `DownlevelFlags::VIEW_FORMATS` (an sRGB view
+    /// of `Rgba8Unorm` storage), which linear-light compositing needs. GLES and
+    /// WebGL2 lack it and composite on an sRGB-typed offscreen instead.
     pub(crate) srgb_offscreen: bool,
     /// Kept alive so window surfaces can be created from this instance, and so
     /// `surface.get_capabilities(&adapter)` can be queried at surface setup.
@@ -301,65 +228,46 @@ pub struct GpuContext {
     pub(crate) instance: wgpu::Instance,
     #[cfg(wgpu_arm)]
     pub(crate) adapter: wgpu::Adapter,
-    /// Set once by wgpu's device-lost callback (registered at device creation) when
-    /// the underlying GPU device is removed — a Windows NVIDIA/AMD driver
-    /// install/update, a TDR (2s GPU hang) reset, an eGPU unplug, or an explicit
-    /// `device.destroy()`. wgpu otherwise routes the lost-device condition to this
-    /// callback and DROPS it if unregistered, so every subsequent frame silently
-    /// `get_current_texture() -> Lost`s and the window freezes at its last frame
-    /// forever. The frontend polls [`Self::device_lost`] after a present and, when
-    /// set, rebuilds the whole GPU stack (new instance/adapter/device + per-window
-    /// surfaces) or downgrades to the CPU softbuffer backend, instead of freezing.
+    /// Set by wgpu's device-lost callback (driver install or update, TDR reset,
+    /// eGPU unplug, `device.destroy()`). Without the callback wgpu drops the
+    /// notification and the window freezes. The frontend polls
+    /// [`Self::device_lost`] and rebuilds the GPU stack or downgrades to CPU.
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// W5 — the METAL loss-domain hook: the first-party swapchain's
-    /// [`metal::loss::LossLatch`], wired here (once, at attach) so the
-    /// frontend's existing `device_lost()` poll — and therefore
-    /// `recover_from_gpu_loss` — consumes Metal device loss through the SAME
-    /// seam wgpu's callback feeds. Metal has no device-lost callback to
-    /// register (`metal/loss.rs` — loss is classified from command-buffer
-    /// outcomes), so the latch IS the callback's stand-in and this cell is
-    /// its delivery. Production wires it once at construct (the macOS
-    /// constructors, since THE FLIP made the Metal arm the macOS backend);
-    /// the W5 wiring test drives it with an injected loss.
+    /// The driver's message from that callback (set once, only when non-empty),
+    /// read back by [`Self::device_loss_reason`] for the frontend's one line.
+    device_loss_msg: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// The Metal loss latch, wired once at construct so `device_lost()` (and
+    /// `recover_from_gpu_loss`) consumes Metal loss through the same seam. Metal
+    /// has no device-lost callback; loss is classified from command-buffer
+    /// outcomes (`metal/loss.rs`).
     #[cfg(target_os = "macos")]
     metal_loss: std::sync::OnceLock<std::sync::Arc<metal::loss::LossLatch>>,
-    /// H1 (Windows Mica/Acrylic): whether THIS instance was built on the DX12
-    /// DirectComposition VISUAL swapchain path (`Dx12SwapchainKind::DxgiFromVisual`)
-    /// — i.e. the request latch was set at build time AND the DX12 backend won
-    /// adapter selection. Window surfaces created from a visual instance offer the
-    /// non-opaque composite modes; the renderer keys its backdrop-margin alpha and
-    /// the PreMultiplied present off this, never off the request alone. Always
-    /// `false` off Windows / on wasm / on the Vulkan escape hatch.
+    /// Whether this instance was built on the DirectComposition visual path
+    /// (requested and DX12 won adapter selection). Surfaces then offer
+    /// non-opaque modes; the renderer keys backdrop-margin alpha and the
+    /// PreMultiplied present off this. Always `false` off Windows.
     pub(crate) visual_swapchain: bool,
 }
 
-/// Row alignment required by `copy_texture_to_buffer` — and, post-flip, BY
-/// THE FRAME BYTE CONTRACT ITSELF: the Metal readback arm reproduces this
-/// stride on builds that carry no wgpu, so the literal is the law and the
-/// gated assert below pins it to wgpu's constant wherever the oracle compiles.
+/// Row alignment required by `copy_texture_to_buffer`, also the frame byte
+/// contract the Metal readback reproduces; checked against wgpu's constant
+/// where wgpu compiles.
 const ALIGN: usize = 256;
 #[cfg(wgpu_arm)]
 const _: () = assert!(ALIGN == wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
 
-/// THE READBACK ROW-PADDING CONTRACT (W4): wgpu requires
-/// `copy_texture_to_buffer` strides to be multiples of 256
-/// (`COPY_BYTES_PER_ROW_ALIGNMENT`), so every `Frame` readback stages through
-/// rows of this padded width and strips the tail. `pub(crate)` because the
-/// Metal readback arm (`device_layer::metal_try_read_back`) must reproduce
-/// the SAME stride — Metal itself would accept a tight stride, and a Metal
-/// arm that used one would produce an identical `Frame` TODAY while silently
-/// diverging from the byte contract every wgpu-side consumer of the staging
-/// buffer shape assumes (the stride bug's cautionary sibling, map §3).
+/// The padded readback row width: `copy_texture_to_buffer` strides are
+/// multiples of 256, so every `Frame` readback stages through padded rows. The
+/// Metal readback (`device_layer::metal_try_read_back`) uses the same stride so
+/// the staging shape is identical on both backends.
 pub(crate) fn padded_bytes_per_row(width: usize) -> usize {
     let unpadded = width * 4;
     unpadded.div_ceil(ALIGN) * ALIGN
 }
 
-/// Unpack a PADDED RGBA8 staging buffer into an `aterm_render::Frame`
-/// (`0xTTRRGGBB`, top byte = `255 - alpha` — the CPU renderer's TRANSMITTANCE
-/// encoding), stripping the per-row padding tail. Extracted VERBATIM from
-/// `try_read_back` so the Metal readback arm shares the exact unpack — the
-/// `Frame` byte contract has ONE spelling, whichever backend filled the rows.
+/// Unpack a padded RGBA8 staging buffer into an `aterm_render::Frame`
+/// (`0xTTRRGGBB`, top byte `255 - alpha`, the CPU's transmittance encoding),
+/// stripping row padding. Shared by both readback arms.
 pub(crate) fn frame_from_padded_rgba(bytes: &[u8], w: usize, h: usize, padded: usize) -> Frame {
     let mut pixels = Vec::with_capacity(w * h);
     for row in 0..h {
@@ -392,26 +300,20 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
     }
 }
 
-/// GPU selection DEVELOPMENT seams ([`aterm_types::dev_seam!`] — a shipped binary
-/// reads none of them and takes the defaults below):
+/// GPU selection development seams ([`aterm_types::dev_seam!`]; shipped
+/// binaries read none of them):
 ///
-/// * `ATERM_GPU_ADAPTER=<substring>` — pick the adapter whose reported name
-///   contains this string, case-insensitive (e.g. `intel`, `nvidia`). Falls back
-///   to default selection (with a stderr warning) when nothing matches.
-/// * `ATERM_GPU_POWER=low|high` — adapter power preference; defaults to `low`.
-///   A terminal's per-frame GPU cost is trivial, and LowPower keeps hybrid
-///   laptops on the iGPU (a dGPU-only machine still picks its dGPU); `high`
-///   restores the always-discrete behavior.
-/// * `ATERM_GPU_MEMBLOCK=performance|small|default|<4..=256>` — the wgpu
-///   suballocator's block-size floor; `<N>` is the DEVICE floor in MiB (the host
-///   floor is half of it). Defaults to 16 MiB. See [`terminal_memory_hints`] for
-///   what the wgpu `Performance` default costs and why this exists.
+/// * `ATERM_GPU_ADAPTER=<substring>`: pick the adapter whose name contains
+///   this, case-insensitive; falls back to default selection with a warning.
+/// * `ATERM_GPU_POWER=low|high`: power preference, default `low` (keeps hybrid
+///   laptops on the iGPU).
+/// * `ATERM_GPU_MEMBLOCK=performance|small|default|<4..=256>`: the
+///   suballocator's block-size floor; `<N>` is the device floor in MiB (host is
+///   half). Default 16 MiB; see [`terminal_memory_hints`].
 ///
-/// The backend itself is not selectable: each platform compiles exactly one wgpu
-/// backend (DX12 on Windows — the native API and the only HDR/scRGB present path
-/// — and Vulkan elsewhere; see this crate's manifest), so there is nothing to
-/// choose between. A driver that cannot render falls to the CPU present path, and
-/// `gpu = false` in aterm.toml chooses it outright.
+/// The backend is not selectable: each platform compiles one wgpu backend
+/// (DX12 on Windows, Vulkan elsewhere). A driver that cannot render falls to
+/// the CPU present path; `gpu = false` in aterm.toml chooses it outright.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(wgpu_arm)]
 fn default_backends() -> wgpu::Backends {
@@ -422,30 +324,11 @@ fn default_backends() -> wgpu::Backends {
     backends
 }
 
-/// THE FLIP (map §5 W6, delivered): the first-party Metal renderer is the
-/// macOS backend — unconditionally. `ATERM_METAL` was the W6a dark-launch
-/// switch; it is DELETED (2026-09-24: nothing reads it, not even to warn),
-/// and there is deliberately NO `ATERM_WGPU=1` escape hatch. Why removal
-/// outright rather than one release of hatch (the Close report's confidence,
-/// recorded here so the decision is auditable):
-///
-/// - The same release removes wgpu from the macOS normal dependency graph
-///   (`aterm-gpu` was the cell's ONLY edge into it). A compiled-in wgpu
-///   fallback would keep the entire dom(wgpu) hostage — 37 packages /
-///   635,044 lines — in the shipped closure, which is the exact prize the
-///   flip collects; a hatch and the graph retirement cannot coexist.
-/// - The armed arm's evidence is not a projection: 8 armed differentials
-///   byte-identical against wgpu on the full-frame AND present paths, the
-///   paint matrix row-for-row green on the armed arm (N>=5, deterministic
-///   rows), the injected-loss drill end-to-end, live on-glass fingerprints
-///   byte-identical cross-process, and the W6a acquire-tail regression
-///   measured GONE (armed p99 0.02 ms vs wgpu 0.03 ms).
-/// - A macOS box where Metal genuinely fails to init lands on the SAME
-///   floor device loss always landed on: the softbuffer CPU present path,
-///   which stays shipped. The hatch would duplicate an existing safety
-///   arm, not add one.
-///
-/// Kept as a `const fn` so every armed-path site reads as the decision it is.
+/// The first-party Metal renderer is the macOS backend, unconditionally, with
+/// no wgpu escape hatch: wgpu is not in the macOS production dependency graph.
+/// A Mac where Metal fails to initialize falls to the softbuffer CPU present
+/// path, the same floor as device loss. A `const fn` so every armed-path site
+/// reads as this decision.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub const fn metal_backend_selected() -> bool {
@@ -466,27 +349,20 @@ fn power_preference_from_env() -> wgpu::PowerPreference {
     }
 }
 
-/// The SUBALLOCATOR BLOCK FLOOR, in MiB: the smallest driver heap wgpu-hal's
-/// allocator will create for the first buffer/texture of a memory type.
+/// The suballocator block floor in MiB: the smallest driver heap wgpu-hal's
+/// allocator creates for the first resource of a memory type. It is an empty
+/// reservation paid once per memory type.
 ///
-/// wgpu turns [`wgpu::MemoryHints`] into a `(min, max)` block size per memory
-/// type, and gpu-allocator creates a heap of exactly `min` the FIRST time that
-/// memory type is touched — whether the resource is 256 bytes or 8 MiB. So the
-/// floor is a fixed, unavoidable, *empty* reservation, paid once per memory type.
-///
-/// A resource LARGER than the block size never joins a pool: gpu-allocator gives
-/// it a dedicated heap of its exact size. That is the property that makes a small
-/// floor safe here — a terminal's one big GPU resource is the full-surface
-/// offscreen (33.7 MB at 4180×2016), and it is dedicated either way. The pool is
-/// only ever holding the small stuff: the glyph atlas, the uniform buffers, the
-/// per-frame instance streams.
+/// A resource larger than the block size gets a dedicated heap of its exact
+/// size, so a small floor is safe: the full-surface offscreen is dedicated
+/// either way, and the pool holds only small resources (atlas, uniforms,
+/// instance streams).
 #[cfg(wgpu_arm)]
 const MEMBLOCK_FLOOR_MIB: u64 = 16;
 
-/// The block-size CEILING, in MiB. gpu-allocator doubles the block size per
-/// additional live block of a memory type (`min << active_blocks`), capped here,
-/// so a workload that genuinely needs pooled memory still converges on big blocks
-/// after a few — it just does not START there.
+/// The block-size ceiling in MiB. The block size doubles per additional live
+/// block of a memory type up to this, so real pooled demand still reaches big
+/// blocks.
 #[cfg(wgpu_arm)]
 const MEMBLOCK_CEILING_MIB: u64 = 128;
 
@@ -510,12 +386,8 @@ fn parse_memblock(v: &str) -> Option<wgpu::MemoryHints> {
     }
 }
 
-/// Build a `MemoryHints::Manual` from a `(min, max)` DEVICE block size in MiB.
-///
-/// wgpu-hal derives the HOST (upload/readback) block sizes as half the device
-/// ones, so `(16, 128)` MiB device means `(8, 64)` MiB host — a 24 MiB floor
-/// across the two memory types a terminal touches first, against the 192 MiB
-/// (128 device + 64 host) that [`wgpu::MemoryHints::Performance`] floors at.
+/// Build a `MemoryHints::Manual` from a `(min, max)` device block size in MiB.
+/// Host block sizes are half the device ones.
 #[cfg(wgpu_arm)]
 fn memblock_hints(min_mib: u64, max_mib: u64) -> wgpu::MemoryHints {
     const MIB: u64 = 1024 * 1024;
@@ -530,42 +402,17 @@ fn terminal_memory_hints_default() -> wgpu::MemoryHints {
     memblock_hints(MEMBLOCK_FLOOR_MIB, MEMBLOCK_CEILING_MIB)
 }
 
-/// THE SUBALLOCATOR SIZING aterm asks its GPU device for.
+/// The suballocator sizing aterm asks its GPU device for.
 ///
-/// This used to be [`wgpu::MemoryHints::Performance`], which is wgpu's sizing for
-/// an application that streams tens of megabytes of geometry and textures per
-/// frame. It floors the suballocator at **128 MiB device + 64 MiB host = 192 MiB
-/// of empty driver heap**, created eagerly at the first buffer and the first
-/// texture — i.e. during renderer construction, before a single frame.
+/// [`wgpu::MemoryHints::Performance`] floors the suballocator at 128 MiB device
+/// plus 64 MiB host of empty heap, created at the first buffer and texture. On
+/// an integrated adapter that is all process working set, for a terminal that
+/// uses a few MB (the one large resource, the offscreen, gets a dedicated heap
+/// anyway). A 16 MiB device floor keeps the reservation at 24 MiB; smaller
+/// floors cost more heap creations for little gain.
 ///
-/// MEASURED on this Windows box (AMD Radeon 780M, DX12, an INTEGRATED adapter, so
-/// every D3D12 heap is system RAM and every byte of it lands in the process
-/// working set), headless renderer, `tests/gpu_memory_floor.rs`:
-///
-/// | | reserved after construct | actually used |
-/// |---|---:|---:|
-/// | `MemoryHints::Performance` | 192.00 MB | 2.94 MB |
-/// | this policy | 24.00 MB | 2.94 MB |
-///
-/// and after rendering a 4180×2016 frame (a 4K terminal — the largest resource a
-/// terminal ever allocates) the used figure is 46.8 MB, of which 33.7 MB is the
-/// offscreen texture, which gets a DEDICATED exact-size heap under either policy.
-/// So the 168 MB the old hint reserved was never going to be sub-allocated from.
-///
-/// End to end, 3 paired runs per arm (construct + 60 readback frames at
-/// 1914×1071, `K32GetProcessMemoryInfo` working set): **337.7 / 337.9 / 337.7 MB
-/// before, 97.8 / 97.8 / 97.9 MB after — −240 MB**. Holding the bloom change out
-/// of it, this hint alone accounts for all but ~2.6 MB of that: with the eager
-/// bloom still in place the *used* figure is 16.12 MB under both hints and only
-/// the *reserved* figure moves (256 MB → 32 MB). The floor was swept
-/// (4/8/16/32 MiB and `Performance`): 16 MiB is where the curve flattens — 4 and
-/// 8 MiB buy only 4 MB more working set while costing ~2 ms on the first frame
-/// (more `CreateHeap` calls), and 32 MiB gives 48 MB back.
-///
-/// A development build can override it with the `ATERM_GPU_MEMBLOCK=performance|
-/// small|default|<MiB>` seam (the `<MiB>` arm sets the device-block FLOOR, clamped
-/// to gpu-allocator's own 4..=256 MiB range) to measure a workload that might
-/// want bigger pools — see [`default_backends`] for the seam table.
+/// A development build can override it with `ATERM_GPU_MEMBLOCK` (the `<MiB>`
+/// arm sets the device floor, clamped to 4..=256); see [`default_backends`].
 #[must_use]
 #[cfg(wgpu_arm)]
 pub fn terminal_memory_hints() -> wgpu::MemoryHints {
@@ -581,9 +428,8 @@ pub fn terminal_memory_hints() -> wgpu::MemoryHints {
     }
 }
 
-/// The `ATERM_GPU_ADAPTER` seam (see [`default_backends`] for the table).
-/// Adapter enumeration is a native-only wgpu API; the wasm build has exactly one
-/// adapter anyway, so the override is a no-op there.
+/// The `ATERM_GPU_ADAPTER` seam (see [`default_backends`]). Native only; wasm
+/// has one adapter.
 #[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
 async fn adapter_from_env(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
     let want = aterm_types::dev_seam!("ATERM_GPU_ADAPTER")
@@ -610,15 +456,11 @@ async fn adapter_from_env(_instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
 }
 
 impl GpuContext {
-    /// THE FLIP — the PRODUCTION macOS constructor: no wgpu in this build, so
-    /// there is no adapter negotiation and nothing to block on. The context
-    /// carries the neutral facts (device name via the Metal FFI, the loss
-    /// domain wired at construct exactly as the armed init always did) and the
-    /// armed renderer mints its own device/queue lazily on the render thread
-    /// (`MetalArmLive::new`). `srgb_offscreen` is TRUE: Metal supports
-    /// sRGB-typed texture views of Unorm storage unconditionally
-    /// (`newTextureViewWithPixelFormat:` — the armed arm's PIXEL_FORMAT_VIEW
-    /// pairs), which is the same answer the wgpu Metal backend reported here.
+    /// The production macOS constructor (no wgpu): no adapter negotiation. The
+    /// context carries neutral facts (device name via the Metal FFI, the loss
+    /// domain wired at construct); the armed renderer mints its own device on
+    /// the render thread (`MetalArmLive::new`). `srgb_offscreen` is true: Metal
+    /// always supports sRGB views of Unorm storage.
     #[cfg(all(not(wgpu_arm), target_os = "macos"))]
     pub fn new() -> Result<Self, String> {
         let adapter_name = metal::ffi::Device::preferred()
@@ -629,6 +471,7 @@ impl GpuContext {
             backend: "Metal".to_owned(),
             srgb_offscreen: true,
             device_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            device_loss_msg: std::sync::Arc::default(),
             metal_loss: std::sync::OnceLock::new(),
             visual_swapchain: false,
         };
@@ -637,35 +480,24 @@ impl GpuContext {
         Ok(ctx)
     }
 
-    /// Acquire a GPU. Works headless (no window/surface needed) — picks the
-    /// default low-power adapter (Metal on macOS), subject to a development
-    /// build's `ATERM_GPU_*` seams (see [`default_backends`]).
+    /// Acquire a GPU headless, picking the default low-power adapter, subject to
+    /// the development `ATERM_GPU_*` seams (see [`default_backends`]).
     ///
-    /// NATIVE ONLY: this uses the crate's own `block_on` (`src/block_on.rs`) —
-    /// a private module, so this is deliberately not an intra-doc link;
-    /// rustdoc's `private_intra_doc_links` lint fires on a public item pointing
-    /// at a private path, and `cargo doc` is warning-clean here.
-    /// It has no browser equivalent (blocking the wasm main thread is
-    /// forbidden). The wasm WebGPU path awaits the adapter/device futures
-    /// instead — see [`GpuContext::request`] — so this synchronous constructor
-    /// is excluded from the wasm32 build.
+    /// Native only: it blocks via the crate's private `block_on`. The wasm path
+    /// awaits instead (see [`GpuContext::request`]).
     #[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
     pub fn new() -> Result<Self, String> {
-        // This instance must OUTLIVE device creation: it is kept on `GpuContext`
-        // so a window surface can be created from it for the application-present
-        // path. `new_without_display_handle()` (no `OwnedDisplayHandle`) is still
-        // surface-capable on Metal — the platform doesn't use the display handle
-        // (it's only required for GLES/Wayland presentation), so the headless
-        // adapter request below can keep `compatible_surface: None`.
+        // The instance outlives device creation so window surfaces can be made
+        // from it later. It is surface-capable without a display handle except
+        // on GLES/Wayland, so the adapter request can use
+        // `compatible_surface: None`.
         let desc = wgpu::InstanceDescriptor {
             backends: default_backends(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         };
-        // H1 (Windows Mica/Acrylic): honour the visual-swapchain latch via the
-        // EXPLICIT descriptor field (not wgpu's `WGPU_DX12_PRESENTATION_SYSTEM`
-        // env knob — see the latch comment at the top of this file). Ignored by
-        // every non-DX12 backend; `visual_swapchain` below records the ground
-        // truth.
+        // Honour the visual-swapchain latch via the explicit descriptor field.
+        // Ignored by non-DX12 backends; `visual_swapchain` below records the
+        // outcome.
         #[cfg(windows)]
         let desc = {
             let mut desc = desc;
@@ -675,16 +507,13 @@ impl GpuContext {
             }
             desc
         };
-        // The first timed leg of the cold build: backend enumeration + driver
-        // load. Everything from here to `from_parts` returning is inside the
-        // frontend's single `backend_finalize` number.
+        // The first timed cold-build leg: backend enumeration and driver load.
         let instance = startup_probe::timed(startup_probe::Leg::GpuInstance, || {
             wgpu::Instance::new(desc)
         });
         let ctx = crate::block_on::block_on(Self::from_instance(instance))?;
-        // The visual path is ACTIVE only if the DX12 backend actually won adapter
-        // selection (the descriptor option is inert elsewhere). Recorded on the
-        // context (renderer decisions) AND the process-global (introspection).
+        // The visual path is active only if DX12 won adapter selection.
+        // Recorded on the context and the process global.
         #[cfg(windows)]
         let ctx = {
             let mut ctx = ctx;
@@ -693,10 +522,9 @@ impl GpuContext {
                 .store(ctx.visual_swapchain, std::sync::atomic::Ordering::Relaxed);
             ctx
         };
-        // W6a — the ARMED path's init (map W5 addendum, "the loss hook"): the
-        // Metal arm is selected (unconditionally, post-flip), so mint the process
-        // loss domain NOW and wire it into `device_lost()`, so the frontend's
-        // existing poll consumes Metal loss from the very first armed frame.
+        // Mint the process Metal loss domain now and wire it into
+        // `device_lost()`, so the frontend's poll sees Metal loss from the first
+        // armed frame.
         #[cfg(target_os = "macos")]
         if metal_backend_selected() {
             let wired =
@@ -706,27 +534,18 @@ impl GpuContext {
         Ok(ctx)
     }
 
-    /// ASYNC adapter+device acquisition on an existing `wgpu::Instance`. Shared by
-    /// the native (`block_on`) and wasm (`.await`) init paths so both
-    /// hit the SAME adapter/device descriptors. The instance is moved in and kept
-    /// alive on the returned `GpuContext` (surfaces are created from it later).
-    ///
-    /// No compatible surface — the headless/WebGPU path, where the adapter is
-    /// surface-independent. The WebGL backend instead needs the canvas surface as
-    /// the adapter's compatibility target; see
+    /// Async adapter and device acquisition on an existing `wgpu::Instance`,
+    /// shared by the native (`block_on`) and wasm (`.await`) paths. No
+    /// compatible surface; the WebGL backend uses
     /// [`from_instance_with_surface`](Self::from_instance_with_surface).
     #[cfg(wgpu_arm)]
     pub async fn from_instance(instance: wgpu::Instance) -> Result<Self, String> {
         Self::from_instance_with_surface(instance, None).await
     }
 
-    /// ASYNC adapter+device acquisition, with an OPTIONAL `compatible_surface`.
-    ///
-    /// The WebGL backend (wgpu's `webgl` feature on wasm32) can only enumerate an
-    /// adapter that is compatible with a presentation surface — the GL context
-    /// lives ON the `<canvas>`. So the wasm WebGL init creates the canvas surface
-    /// first and passes it here; native (Metal/Vulkan) passes `None`, leaving the
-    /// adapter/device descriptors byte-identical to the prior behavior.
+    /// Async adapter and device acquisition with an optional
+    /// `compatible_surface`: WebGL can only enumerate an adapter compatible
+    /// with the canvas surface. Native passes `None`.
     #[cfg(wgpu_arm)]
     pub async fn from_instance_with_surface(
         instance: wgpu::Instance,
@@ -747,14 +566,9 @@ impl GpuContext {
         let info = adapter.get_info();
         startup_probe::record(startup_probe::Leg::GpuAdapter, adapter_started.elapsed());
         let device_started = aterm_time::Instant::now();
-        // WebGL2 has no compute + lower texture/buffer ceilings, so `Limits::
-        // default()` is unsatisfiable there (e.g. max_compute_workgroups_per_
-        // dimension default 65535 vs WebGL2's 0) and device request fails. On
-        // wasm32 (the WebGL backend) request the ADAPTER's OWN supported limits:
-        // that's always satisfiable AND keeps the real texture-dimension ceiling
-        // the WebGL2 context reports (the canonical downlevel_webgl2_defaults caps
-        // max_texture_dimension_2d at 2048, which is too small for a Hi-DPI grid
-        // canvas — surface configure then fails). Native keeps the full defaults.
+        // WebGL2 cannot satisfy `Limits::default()` (no compute, lower ceilings),
+        // so on wasm32 request the adapter's own limits, which also keeps its
+        // real texture-dimension ceiling for Hi-DPI canvases.
         #[cfg(target_arch = "wasm32")]
         let required_limits = adapter.limits();
         #[cfg(not(target_arch = "wasm32"))]
@@ -765,9 +579,7 @@ impl GpuContext {
                 required_features: wgpu::Features::empty(),
                 required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                // NOT `MemoryHints::Performance`: on DX12 that floors the
-                // suballocator at 192 MiB of empty driver heap before the first
-                // frame. See `terminal_memory_hints`.
+                // Not `MemoryHints::Performance`; see `terminal_memory_hints`.
                 memory_hints: terminal_memory_hints(),
                 trace: wgpu::Trace::Off,
             })
@@ -780,20 +592,20 @@ impl GpuContext {
             .get_downlevel_capabilities()
             .flags
             .contains(wgpu::DownlevelFlags::VIEW_FORMATS);
-        // Capture device loss: without a registered callback wgpu SILENTLY DROPS the
-        // lost-device notification, so a driver update / TDR reset freezes every
-        // window at its last frame with no error. Flip an atomic the frontend polls
-        // (see the `device_lost` field) so it can rebuild the GPU stack or fall back
-        // to the CPU renderer. The callback runs at most once per device.
+        // Register a device-lost callback (wgpu drops the notification
+        // otherwise) that keeps the driver's message and flips an atomic the
+        // frontend polls; the frontend prints the one line. Runs at most once.
         let device_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let device_loss_msg = std::sync::Arc::new(std::sync::OnceLock::new());
         {
             let flag = std::sync::Arc::clone(&device_lost);
+            let msg_cell = std::sync::Arc::clone(&device_loss_msg);
             device.set_device_lost_callback(move |reason, msg| {
-                // `Destroyed` fires on an intentional teardown (our own drop); only a
-                // genuine loss (`Unknown` / driver removal) needs recovery, but flag
-                // both — the frontend re-checks liveness before it rebuilds, and a
-                // stale flag on a context that is being dropped is harmless.
-                crate::stderr_line!("aterm-gpu: GPU device lost ({reason:?}): {msg}");
+                let _ = msg_cell.set(if msg.is_empty() {
+                    format!("{reason:?}")
+                } else {
+                    msg
+                });
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             });
         }
@@ -806,6 +618,7 @@ impl GpuContext {
             instance,
             adapter,
             device_lost,
+            device_loss_msg,
             #[cfg(target_os = "macos")]
             metal_loss: std::sync::OnceLock::new(),
             // Seeded false; ONLY the native `new()` (which owns the descriptor
@@ -819,11 +632,9 @@ impl GpuContext {
         Ok(ctx)
     }
 
-    /// Whether the GPU device has been reported lost since this context was created
-    /// (driver update, TDR reset, eGPU unplug, explicit destroy). Once `true` it
-    /// stays `true` — a lost device is never revived in place; the frontend must
-    /// rebuild the GPU stack or downgrade to the CPU backend. Cheap (one relaxed
-    /// atomic load), so it is safe to poll every presented frame.
+    /// Whether the device has been reported lost. Sticky: a lost device is never
+    /// revived; the frontend rebuilds or downgrades to CPU. One relaxed load,
+    /// safe to poll every frame.
     #[inline]
     pub fn device_lost(&self) -> bool {
         #[cfg(target_os = "macos")]
@@ -833,28 +644,22 @@ impl GpuContext {
         self.device_lost.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// W6 flip-drill — the FIRST latched loss's classification, for the
-    /// frontend's downgrade diagnostics (`recover_from_gpu_loss` prints it).
-    /// `Some` only for a Metal-latch loss: the wgpu callback prints its own
-    /// `(reason, msg)` on stderr at latch time and stores only the flag, so a
-    /// wgpu-path loss reports `None` here and its reason is already on the
-    /// log. Metal losses carry `CbOutcome::Lost`'s Debug form — the exact
-    /// classification (`MTLCommandBufferErrorPageFault`, ...) the latch
-    /// recorded first.
+    /// The first latched loss's cause, for the downgrade line: the Metal latch's
+    /// classification (e.g. `MTLCommandBufferErrorPageFault`), else the driver
+    /// message the wgpu device-lost callback stored (its reason when the message
+    /// is empty). `None` when neither has one.
     #[must_use]
     pub fn device_loss_reason(&self) -> Option<String> {
         #[cfg(target_os = "macos")]
         if let Some(r) = self.metal_loss.get().and_then(|l| l.reason()) {
             return Some(r.to_owned());
         }
-        None
+        self.device_loss_msg.get().cloned()
     }
 
-    /// W5 — wire a Metal loss latch into [`Self::device_lost`] (see the
-    /// `metal_loss` field). One latch per context lifetime — the process has
-    /// ONE Metal loss domain (`metal/loss.rs`), and a context that outlives a
-    /// loss is rebuilt, not re-wired; a second wire is therefore a no-op that
-    /// reports `false` rather than silently swapping domains.
+    /// Wire a Metal loss latch into [`Self::device_lost`] (see `metal_loss`).
+    /// One latch per context; a second wire returns `false` rather than
+    /// swapping domains.
     #[cfg(target_os = "macos")]
     pub(crate) fn wire_metal_loss_latch(
         &self,
@@ -863,10 +668,9 @@ impl GpuContext {
         self.metal_loss.set(latch).is_ok()
     }
 
-    /// W6a — the ARMED renderer's loss domain: the latch wired at construct,
-    /// wiring a fresh one first when the cell is still empty (the test-armed
-    /// path, which bypasses that constructor).
-    /// Either way the returned latch IS the one `device_lost()` polls.
+    /// The armed renderer's loss domain: the latch wired at construct, or a
+    /// fresh one wired now for the test-armed path. It is the latch
+    /// `device_lost()` polls.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_loss_latch_or_wire(&self) -> std::sync::Arc<metal::loss::LossLatch> {
         if let Some(l) = self.metal_loss.get() {
@@ -876,26 +680,17 @@ impl GpuContext {
         std::sync::Arc::clone(self.metal_loss.get().expect("wired just above"))
     }
 
-    /// Clamp a texture pixel dimension to `1..=max_texture_dimension_2d`.
-    ///
-    /// The `GpuContext`-side equivalent of [`GpuRenderer::clamp_fb_dim`] (this type
-    /// holds the device directly). See that method for why the clamp exists (wgpu
-    /// validates every texture against this limit; with no uncaptured-error handler a
-    /// violation PANICS/aborts). Floors to 1 like `clamp_fb_dim`: a 0-dimension
-    /// texture is ALWAYS invalid, so a public caller passing 0 (e.g.
-    /// `clear_to_frame(0, h, ..)`) would otherwise reach `create_texture` with a zero
-    /// extent and abort. Upper bound mirrors `Renderer::create_atlas_texture`'s
-    /// own-site `.min(max_tex_dim)`.
+    /// Clamp a texture dimension to `1..=max_texture_dimension_2d`, the
+    /// `GpuContext` equivalent of [`GpuRenderer::clamp_fb_dim`]. A 0 or oversized
+    /// extent would abort in wgpu's default error handler.
     #[inline]
     #[cfg(wgpu_arm)]
     fn clamp_tex_dim(&self, d: u32) -> u32 {
         d.max(1).min(self.device.limits().max_texture_dimension_2d)
     }
 
-    /// This context as the W3 DEVICE LAYER's live arm — the handle every
-    /// routed construction site does its resource work through. Always the
-    /// Wgpu variant here: the Metal arm is minted only by the differential
-    /// tests, from `metal::resources::MetalResourceDevice`.
+    /// This context as the device layer's wgpu arm. The Metal arm is minted only
+    /// by the differential tests (`metal::resources::MetalResourceDevice`).
     #[cfg(wgpu_arm)]
     pub(crate) fn device_layer(&self) -> crate::device_layer::DeviceHandle<'_> {
         crate::device_layer::DeviceHandle::Wgpu {
@@ -904,39 +699,20 @@ impl GpuContext {
         }
     }
 
-    /// Create an offscreen colour target (Rgba8Unorm; render + copy-src +
-    /// texture-binding). `TEXTURE_BINDING` is additive — it lets the application
-    /// present blit SAMPLE this exact texture into the swapchain destination, so
-    /// submitted destination bytes match the introspection readback at the
-    /// app-owned boundary. The platform compositor and scanout are unobserved.
-    /// The parity tests (which build the atlas on the CPU, not this texture) are
-    /// unaffected.
+    /// Create an offscreen colour target (Rgba8Unorm; render, copy-src,
+    /// texture-binding). `TEXTURE_BINDING` lets the present blit sample this
+    /// texture, so presented bytes match the introspection readback.
     #[cfg(wgpu_arm)]
     pub fn offscreen_texture(&self, width: u32, height: u32) -> wgpu::Texture {
-        // Defensive floor at this `create_texture` choke point: clamp to the device's
-        // max 2D texture dimension (mirrors `Renderer::create_atlas_texture`). Without
-        // it an oversized grid would ask wgpu for a texture past the limit, and with NO
-        // `on_uncaptured_error` handler installed the validation error hits wgpu's
-        // default handler, which PANICS/aborts. IMPORTANT: this clamp bounds ONLY the
-        // texture — a caller that ALSO feeds the SAME dims to `read_back` /
-        // copy_texture_to_buffer (e.g. `clear_to_frame`) must clamp its OWN copy up
-        // front, else the copy extent would exceed this clamped texture and abort
-        // anyway (which is exactly why `clear_to_frame` pre-clamps). `encode_frame`
-        // pre-clamps too, so on both production paths this is idempotent
-        // (`clamp_tex_dim(clamped) == clamped`); it still bounds any future caller.
+        // Clamp to the device's max 2D dimension at this choke point. This
+        // bounds only the texture: a caller that also reads back must clamp its
+        // own copy extent (`encode_frame` pre-clamps).
         let width = self.clamp_tex_dim(width);
         let height = self.clamp_tex_dim(height);
-        // The linear-light rationale the pre-layer descriptor carried, kept at the
-        // routed site: the base passes fixed-function-blend in LINEAR light. With
-        // VIEW_FORMATS (native) the texture stays Rgba8Unorm + an sRGB-typed
-        // ALIAS view; WebGL2/GLES can't alias formats, so there the texture
-        // ITSELF is Rgba8UnormSrgb (and `alias` above is `None`). Either way the
-        // STORED bytes are sRGB, so readback is identical. COPY_DST serves the
-        // M1b scroll band shift; RENDER_ATTACHMENT + COPY_SRC + TEXTURE_BINDING
-        // as before — `TexUsage::OFFSCREEN` is exactly that set.
-        // Routed through the W3 DEVICE LAYER (the Wgpu arm is the live one):
-        // same label, format, usage and view-formats as the direct
-        // `create_texture` this replaced, byte for byte.
+        // Base passes blend in linear light: with VIEW_FORMATS the texture is
+        // Rgba8Unorm plus an sRGB alias view; on WebGL2/GLES the texture itself
+        // is Rgba8UnormSrgb. Stored bytes are sRGB either way. `COPY_DST` serves
+        // the scroll band shift; `TexUsage::OFFSCREEN` is the full usage set.
         let format = crate::device_layer::TexelFormat::from_wgpu(self.offscreen_format())
             .expect("the offscreen format is inside the map's closed set of six");
         let alias = crate::format_plan::offscreen_view_formats(self.srgb_offscreen)
@@ -957,29 +733,25 @@ impl GpuContext {
             .into_wgpu()
     }
 
-    /// The offscreen colour-target format (== `off.view` format). Delegates to the
-    /// single source of truth in [`crate::format_plan`] so the texture, its views,
-    /// and every pipeline target cannot drift apart (the C1/C2 bug class). Every
-    /// render pipeline whose pass attaches `off.view` (additive glow/deco-add, bloom
-    /// composite + extract, tray, test/readback blit) MUST build with this.
+    /// The offscreen colour-target format (the `off.view` format), from
+    /// [`crate::format_plan`]. Every pipeline whose pass attaches `off.view`
+    /// builds with it.
     #[cfg(wgpu_arm)]
     pub(crate) fn offscreen_format(&self) -> wgpu::TextureFormat {
         crate::format_plan::offscreen_format(self.srgb_offscreen)
     }
 
-    /// The sRGB-typed VIEW format attached by the base OVER/REPLACE + cursor +
-    /// deco-over passes (linear-light blend). Pipelines whose pass attaches
-    /// `off.view_srgb` build with this. See [`crate::format_plan`].
+    /// The sRGB view format attached by the base, cursor and deco-over passes.
+    /// See [`crate::format_plan`].
     #[cfg(wgpu_arm)]
     pub(crate) fn offscreen_srgb_view_format(&self) -> wgpu::TextureFormat {
         crate::format_plan::offscreen_srgb_view_format(self.srgb_offscreen)
     }
 
-    /// The offscreen's two view formats packaged for
-    /// [`crate::pipeline_table::TargetFormats::resolve`], so a construction
-    /// site never chooses between them by hand — the pipeline's own
-    /// [`crate::pipeline_table::TargetRole`] does. Sites that also target the
-    /// swapchain add it with `with_present`.
+    /// The offscreen's two view formats for
+    /// [`crate::pipeline_table::TargetFormats::resolve`]; each pipeline's
+    /// [`crate::pipeline_table::TargetRole`] chooses. Add the swapchain with
+    /// `with_present`.
     #[cfg(wgpu_arm)]
     pub(crate) fn pipeline_targets(&self) -> crate::pipeline_table::TargetFormats {
         crate::pipeline_table::TargetFormats {
@@ -990,17 +762,11 @@ impl GpuContext {
     }
 
     /// Read an Rgba8Unorm texture back into an `aterm_render::Frame`
-    /// (`0xTTRRGGBB` where the top byte is the CPU renderer's TRANSMITTANCE
-    /// encoding, `255 - alpha`; every opaque texel — the historical case —
-    /// yields `0x00RRGGBB` exactly as before), stripping GPU row padding.
-    /// Folding the texture alpha into the CPU encoding lets the parity tests
-    /// compare background-opacity alpha CPU==GPU like any other channel.
+    /// (`0xTTRRGGBB`, top byte `255 - alpha`, so opaque texels are `0x00RRGGBB`),
+    /// stripping row padding.
     ///
-    /// Infallible wrapper over [`Self::try_read_back`]: a readback failure
-    /// (device lost mid-frame — TDR, driver update) degrades to a black frame
-    /// instead of panicking for historical renderer-oracle/probe callers. Durable
-    /// artifact APIs must call the fallible path and report capture failure rather
-    /// than publishing this best-effort sentinel as real pixels.
+    /// Infallible wrapper over [`Self::try_read_back`]: a failure (device lost)
+    /// yields a black frame. Artifact producers must use the fallible path.
     #[cfg(wgpu_arm)]
     pub fn read_back(&self, texture: &wgpu::Texture, width: u32, height: u32) -> Frame {
         self.try_read_back(texture, width, height)
@@ -1076,67 +842,15 @@ impl GpuContext {
             Err(_) => return Err("readback buffer map never completed".to_string()),
         }
         let data = slice.get_mapped_range();
-        // Deref the BufferView ONCE. `wgpu::BufferView: Deref` runs
-        // `self.inner.read_slice()` through `DispatchBufferMappedRange`, so the
-        // old `data[p]`/`data[p+1]`/... form paid that chain (plus a bounds
-        // check) FOUR TIMES PER PIXEL — ~24M redundant deref/bounds pairs for a
-        // 3024x1964 readback, on the UI event loop behind the snapshot/image
-        // verbs. Binding `&[u8]` once and walking row slices as `[u8; 4]` texels
-        // gives the compiler a fixed-size, bounds-check-free window; the packing
-        // expression below is byte-for-byte the old one.
+        // Deref the `BufferView` once and walk row slices as `[u8; 4]` texels,
+        // avoiding a mapped-range deref and bounds check per channel.
         let bytes: &[u8] = &data;
-        // The unpack itself is the shared `frame_from_padded_rgba` — one
-        // spelling of the Frame byte contract for both backends (W4).
+        // The unpack is the shared `frame_from_padded_rgba`, one spelling of
+        // the Frame byte contract for both backends.
         let frame = frame_from_padded_rgba(bytes, w, h, padded);
         drop(data);
         buffer.unmap();
         Ok(frame)
-    }
-
-    /// Phase-1 proof of life: clear an offscreen target to a colour and read it
-    /// back. Confirms the GPU pipeline + readback work on this machine.
-    #[cfg(wgpu_arm)]
-    pub fn clear_to_frame(&self, width: u32, height: u32, rgb: u32) -> Frame {
-        // Clamp ONCE up front so BOTH the offscreen texture AND the `read_back` copy
-        // extent below use the same bounded dims. `offscreen_texture` clamps the
-        // texture internally, but `read_back` (copy_texture_to_buffer) would otherwise
-        // request a copy LARGER than the clamped source texture — a wgpu validation
-        // error that, with no uncaptured-error handler installed, PANICS/aborts.
-        let width = self.clamp_tex_dim(width);
-        let height = self.clamp_tex_dim(height);
-        let tex = self.offscreen_texture(width, height);
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("clear"),
-            });
-        {
-            let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // Decode to linear on the downlevel sRGB offscreen so the readback
-                        // byte == `rgb` (the proof-of-life probe must not lie); raw on
-                        // native (plain Unorm) — see format_plan::offscreen_clear_color.
-                        load: wgpu::LoadOp::Clear(crate::format_plan::offscreen_clear_color(
-                            rgb,
-                            self.srgb_offscreen,
-                        )),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-        self.queue.submit([enc.finish()]);
-        self.read_back(&tex, width, height)
     }
 }
 
@@ -1169,10 +883,7 @@ mod env_override_tests {
         }
     }
 
-    /// THE FLOOR ITSELF. This is the number that turned 2.94 MB of terminal GPU
-    /// resources into 192 MB of reserved driver heap when it was wgpu's
-    /// `Performance` preset (128 device + 64 host); the shipped policy floors at
-    /// 16 MiB device (⇒ 8 MiB host) and still grows to 128 MiB under real
+    /// The floor: 16 MiB device (8 MiB host), growing to 128 MiB under real
     /// pressure. See `terminal_memory_hints`.
     #[test]
     fn the_shipped_floor_is_terminal_sized_not_streaming_sized() {
@@ -1224,33 +935,26 @@ mod env_override_tests {
     }
 }
 
-/// H1 fail-soft: the latch-withdrawal decision a failed window-surface attach
+/// Fail-soft: the latch-withdrawal decision a failed window-surface attach
 /// drives (`surface_attach_fallback`). Pure, so it runs on every platform.
 #[cfg(test)]
 mod surface_attach_fallback_tests {
     use super::{SurfaceAttachFallback as F, surface_attach_fallback};
 
-    /// Totality + the one-liner invariant: `RebuildOpaque` iff visual AND no
-    /// other GPU window; `other_gpu_windows` dominates regardless of the path.
-    /// Every input is a labelled row with its exact verdict.
+    /// `RebuildOpaque` iff visual and no other GPU window; other windows
+    /// dominate. One labelled row per input.
     #[test]
     fn rebuild_iff_visual_and_alone() {
         // (visual, other_gpu_windows, verdict, why)
         let rows = [
-            // The review's scenario: `background_material` set, DX12 won, DComp
-            // is unavailable, first window — the ONLY case that withdraws the
-            // latch and rebuilds on the opaque HWND swapchain (instead of
-            // aborting the process).
+            // Material set, DX12 won, DComp unavailable, first window: the only
+            // case that withdraws the latch and rebuilds.
             (true, false, F::RebuildOpaque, "visual, first window"),
-            // A later window failing on a WORKING visual instance is not a DComp
-            // outage (the first window's composition swapchain succeeded): keep
-            // the pre-H1 hard rollback for that one window, never rebuild under
-            // the survivors.
+            // A later window failing on a working visual instance: decline that
+            // window only.
             (true, true, F::DeclineWindow, "visual, live GPU windows"),
-            // The shipped default (`background_material = "none"`, HWND
-            // swapchain) keeps its byte-identical pre-H1 arms: decline when
-            // others present, else the CPU softbuffer downgrade. No latch to
-            // withdraw, no rebuild.
+            // The default HWND swapchain: decline when others present, else the
+            // CPU downgrade.
             (false, true, F::DeclineWindow, "plain, live GPU windows"),
             (false, false, F::CpuRenderer, "plain, first window"),
         ];

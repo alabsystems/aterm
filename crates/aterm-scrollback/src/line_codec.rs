@@ -900,7 +900,9 @@ impl Line {
 // Block-level serialization (serialize_lines, deserialize_lines) is in line_codec_block.rs.
 // Exposed publicly (B.3.2): `TerminalCheckpoint` encodes both grid bodies with
 // this exact block codec, so it must be reachable from aterm-core.
-pub(crate) use super::line_codec_block::{MAX_DECODE_PAGE_LINES, count_page_lines};
+pub(crate) use super::line_codec_block::{
+    MAX_DECODE_PAGE_LINES, count_page_lines, serialize_pages,
+};
 pub use super::line_codec_block::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,

@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The resize journal against the incident's geometry: a Claude-shaped frame on
-//! the alternate screen, a rows-only flap (8→7→8 here, 64→63→64 live), and
-//! nothing processed between the two halves.
+//! The resize journal against a flap: a Claude-shaped frame on the alternate
+//! screen, a rows-only 8→7→8 resize, and nothing processed between the halves.
 
 use super::{RESIZE_JOURNAL_CAP, ResizeReport};
 use crate::terminal::Terminal;
@@ -24,9 +23,9 @@ fn paint(t: &mut Terminal, rows: std::ops::Range<u16>) {
     }
 }
 
-/// The incident's shape at `rows` rows: the alternate screen, every row
-/// painted (a non-blank footer under the composer), and the cursor parked on
-/// the composer three rows from the bottom, as Claude Code parks it.
+/// A Claude-shaped screen at `rows` rows: the alternate screen, every row
+/// painted (a non-blank footer under the composer), and the cursor on the
+/// composer three rows from the bottom.
 fn claude_shaped_alt(rows: u16) -> Terminal {
     let mut t = Terminal::new(rows, 20);
     t.process(b"\x1b[?1049h\x1b[2J");
@@ -49,12 +48,10 @@ fn flap(t: &mut Terminal, resizes: &[u16]) -> Vec<ResizeReport> {
     reports
 }
 
-/// The incident, quiet: both halves land before the app's handler runs and
-/// nothing is processed between them. The shrink finds no blank tail to trim,
-/// so it demotes the top row; the alt grid keeps no history, so the row leaves
-/// the ring, but the grid's resize undo keeps it and the grow hands it back.
-/// The app, reading 8 == 8, skips its repaint, and its diff frames land on
-/// exactly the rows it painted.
+/// A quiet flap: both halves land before the app's handler runs. The shrink
+/// finds no blank tail, so it demotes the top row, which the alt grid cannot
+/// keep, but the resize undo keeps it and the grow hands it back. The app reads
+/// 8 == 8, skips its repaint, and its diff frames land on the rows it painted.
 #[test]
 fn a_quiet_alt_flap_with_a_full_tail_is_an_identity() {
     let mut t = claude_shaped_alt(8);
@@ -105,7 +102,7 @@ fn a_quiet_alt_flap_with_a_full_tail_is_an_identity() {
     assert_eq!((t.cursor().row, t.cursor().col), (51, 4));
 }
 
-/// The same flap with the app's output landing BETWEEN the halves (its
+/// The same flap with the app's output landing between the halves (its
 /// SIGWINCH handler ran at the smaller size): the undo is dropped, the grow
 /// appends a blank row, and the screen stays one row higher than painted.
 /// That is the app's to repaint, and its changed-size repaint (ED 2) heals it.
@@ -157,7 +154,7 @@ fn alt_flap_with_output_between_the_halves_keeps_the_shift() {
     assert_eq!(screen(&t)[..5], painted[1..6], "still shifted");
     t.process(b"\x1b[2J");
     assert!(healed(&t));
-    // A reading taken BEFORE the flap (lower counters) is never a heal.
+    // A reading taken before the flap (lower counters) is never a heal.
     assert!(!grow.healed_by(clears, 0));
 }
 
@@ -185,12 +182,10 @@ fn a_quiet_alt_flap_keeps_decsc_the_scroll_region_and_extras() {
     assert_eq!((t.cursor().row, t.cursor().col), (5, 2));
 }
 
-/// The selection comes through an undone flap exactly as it went in, even
-/// with an anchor on the row the shrink demoted. (Adversarial review of the
-/// first cut: the shrink transform CLAMPED that anchor, the alt grid keeping
-/// no history to hold it, and the grow's reveal then landed it one row low
-/// while every cell was back.) A selection moved between the halves is the
-/// user's, and is left as they moved it.
+/// The selection comes through an undone flap exactly as it went in, even with
+/// an anchor on the row the shrink demoted (the alt grid has no history to hold
+/// it, so the shrink must not clamp it). A selection moved between the halves
+/// is the user's, and is left as they moved it.
 #[test]
 fn an_undone_flap_puts_the_selection_back() {
     use crate::selection::{SelectionSide, SelectionType};
@@ -265,7 +260,7 @@ fn an_alt_screen_switch_between_the_halves_drops_the_undo() {
 
 /// Every engine gets its own lifetime token, fixed for its life; a restored
 /// engine (a fresh one) gets a new token and restarts its
-/// ordinals at 0 — what lets a reader tell a stale copy of THIS engine (a
+/// ordinals at 0 — what lets a reader tell a stale copy of this engine (a
 /// lower ordinal, same token) from a restored one.
 #[test]
 fn every_engine_has_its_own_lifetime_token() {
@@ -287,7 +282,7 @@ fn every_engine_has_its_own_lifetime_token() {
 }
 
 /// The negative control: a blank tail below the cursor absorbs the shrink by
-/// TRIM, so nothing moves and the flap is an identity even with no history.
+/// trim, so nothing moves and the flap is an identity even with no history.
 #[test]
 fn alt_shrink_with_a_blank_tail_only_trims() {
     let mut t = Terminal::new(8, 20);
@@ -336,7 +331,7 @@ fn primary_rows_only_flap_is_lossless() {
 
 /// Both halves of a flap are journalled even with no `process()` between them,
 /// which is the case a per-read geometry watermark cannot see. The ring keeps
-/// the newest 16 and COUNTS what it dropped, while the ordinal stays exact.
+/// the newest 16 and counts what it dropped, while the ordinal stays exact.
 #[test]
 fn journal_keeps_both_halves_of_a_flap() {
     let mut t = Terminal::new(8, 20);
@@ -475,4 +470,180 @@ fn screen_replaced_counts_alt_screen_switches_and_resets() {
     t.reset();
     assert_eq!(t.screen_replaced_count(), before + 1, "Terminal::reset");
     assert_eq!(t.full_clear_count(), 0, "no ED was processed");
+}
+
+// ---------------------------------------------------------------------------
+// The engine's render debt (`Terminal::render_debt`): what the program owes the
+// screen since it was last repainted from scratch.
+// ---------------------------------------------------------------------------
+
+/// Output that draws nothing (a mode set), the first bytes of a SIGWINCH
+/// handler: it drops the resize undo and moves no row.
+const MODE_SET: &[u8] = b"\x1b[?1004h";
+
+/// A flap `rows -> rows-1 -> rows` with `between` processed between the halves.
+fn flap_with(t: &mut Terminal, rows: u16, between: &[u8]) {
+    t.resize(rows - 1, 20);
+    if !between.is_empty() {
+        t.process(between);
+    }
+    t.resize(rows, 20);
+}
+
+#[test]
+fn a_quiet_flap_leaves_no_debt() {
+    let mut t = claude_shaped_alt(8);
+    assert_eq!(t.render_debt(), (0, 0));
+    flap_with(&mut t, 8, b"");
+    assert_eq!(t.render_debt(), (0, 0), "the undo handed the row back");
+    // Two shrinks and two grows, all quiet.
+    t.resize(7, 20);
+    t.resize(6, 20);
+    assert_eq!(t.render_debt(), (-2, 0), "two rows are held by the undo");
+    t.resize(7, 20);
+    t.resize(8, 20);
+    assert_eq!(t.render_debt(), (0, 0));
+}
+
+#[test]
+fn input_between_the_halves_leaves_the_shift_as_debt() {
+    let mut t = claude_shaped_alt(8);
+    flap_with(&mut t, 8, MODE_SET);
+    let (shrink, grow) = {
+        let (r, _) = t.resize_journal_since(0);
+        (r[0], r[1])
+    };
+    assert_eq!(
+        (shrink.shift(), grow.restored_top, grow.appended),
+        (-1, 0, 1)
+    );
+    assert_eq!(t.render_debt(), (-1, 0), "every row is one higher");
+    // A second such flap with the bottom row painted again adds another row.
+    paint(&mut t, 7..8);
+    flap_with(&mut t, 8, MODE_SET);
+    assert_eq!(t.render_debt(), (-2, 0));
+}
+
+#[test]
+fn the_push_corner_leaves_the_bottom_row_as_debt() {
+    // Cursor on row 0: the shrink pushes the bottom row off and nothing above
+    // it moves; the grow, its undo dropped, appends a blank.
+    let mut t = Terminal::new(8, 20);
+    t.process(b"\x1b[?1049h\x1b[2J");
+    paint(&mut t, 0..8);
+    t.process(b"\x1b[1;1H");
+    flap_with(&mut t, 8, MODE_SET);
+    assert_eq!(
+        t.render_debt(),
+        (0, 1),
+        "the bottom row is lost, nothing moved"
+    );
+    // Quiet, the same corner is an identity.
+    let mut t = Terminal::new(8, 20);
+    t.process(b"\x1b[?1049h\x1b[2J");
+    paint(&mut t, 0..8);
+    t.process(b"\x1b[1;1H");
+    flap_with(&mut t, 8, b"");
+    assert_eq!(t.render_debt(), (0, 0));
+}
+
+#[test]
+fn debt_accumulates_over_a_run_of_flaps_and_is_exact_after_a_journal_overrun() {
+    let mut t = claude_shaped_alt(8);
+    let flaps = 20;
+    for _ in 0..flaps {
+        // The program keeps painting its footer, so each shrink demotes again.
+        paint(&mut t, 7..8);
+        flap_with(&mut t, 8, MODE_SET);
+    }
+    let (_, lost) = t.resize_journal_since(0);
+    assert!(
+        lost > 0,
+        "{flaps} flaps are {} resizes: past the journal",
+        2 * flaps
+    );
+    assert_eq!(
+        t.render_debt(),
+        (-flaps, 0),
+        "the counter is exact though the journal is not"
+    );
+}
+
+#[test]
+fn a_full_clear_a_screen_switch_and_ris_each_reset_the_debt() {
+    let displaced = || {
+        let mut t = claude_shaped_alt(8);
+        flap_with(&mut t, 8, MODE_SET);
+        assert_eq!(t.render_debt(), (-1, 0));
+        t
+    };
+    let mut t = displaced();
+    t.process(b"\x1b[2J");
+    assert_eq!(t.render_debt(), (0, 0), "ED 2 repaints from scratch");
+    let mut t = displaced();
+    t.process(b"\x1b[H\x1b[J");
+    assert_eq!(t.render_debt(), (0, 0), "a home ED 0 is a full clear");
+    let mut t = displaced();
+    t.process(b"\x1b[2K\x1b[1J");
+    assert_eq!(t.render_debt(), (-1, 0), "EL and ED 1 repaint nothing");
+    let mut t = displaced();
+    t.process(b"\x1b[?1049l");
+    assert_eq!(t.render_debt(), (0, 0), "leaving the alternate screen");
+    let mut t = displaced();
+    t.process(b"\x1b[?1049h");
+    assert_eq!(t.render_debt(), (0, 0), "entering it again");
+    let mut t = displaced();
+    t.process(b"\x1bc");
+    assert_eq!(t.render_debt(), (0, 0), "RIS");
+}
+
+#[test]
+fn a_primary_screen_resize_owes_nothing() {
+    // The primary screen is history-backed: its rows move with the cursor. (Its
+    // own bottom-push corner shifts content down one row on a flap, a
+    // pre-existing behaviour outside this counter.)
+    let mut t = Terminal::new(8, 20);
+    for r in 0..8u16 {
+        t.process(format!("\x1b[{};1HL{r}", r + 1).as_bytes());
+    }
+    t.process(b"\x1b[8;3H");
+    flap_with(&mut t, 8, MODE_SET);
+    assert_eq!(t.render_debt(), (0, 0));
+}
+
+#[test]
+fn a_conpty_resize_owes_nothing() {
+    // conhost repaints the viewport after every resize and the grid keeps no
+    // undo, so the session never accrues debt and `render=` stays per run.
+    let mut t = claude_shaped_alt(8);
+    t.resize_with_policy(7, 20, crate::grid::ResizePolicy::ConPty);
+    t.process(MODE_SET);
+    t.resize_with_policy(8, 20, crate::grid::ResizePolicy::ConPty);
+    assert_eq!(t.render_debt(), (0, 0));
+    // The same flap under Native does.
+    let mut t = claude_shaped_alt(8);
+    flap_with(&mut t, 8, MODE_SET);
+    assert_eq!(t.render_debt(), (-1, 0));
+}
+
+#[test]
+fn seeding_the_debt_survives_a_checkpoint_restore_and_a_full_clear_resets_it() {
+    let mut t = claude_shaped_alt(8);
+    flap_with(&mut t, 8, MODE_SET);
+    assert_eq!(t.render_debt(), (-1, 0));
+    // A restored engine starts at zero: the successor seeds what the
+    // predecessor owed, on the alternate screen only.
+    let mut restored = claude_shaped_alt(8);
+    assert_eq!(restored.render_debt(), (0, 0));
+    restored.seed_render_debt(-1, 0);
+    assert_eq!(restored.render_debt(), (-1, 0));
+    restored.process(b"\x1b[2J");
+    assert_eq!(restored.render_debt(), (0, 0));
+    let mut primary = Terminal::new(8, 20);
+    primary.seed_render_debt(-1, 0);
+    assert_eq!(
+        primary.render_debt(),
+        (0, 0),
+        "the primary screen owes nothing"
+    );
 }

@@ -1,71 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE `objc2` EXIT CONDITION, WITH EYES — the scope is derived, not remembered.
+//! The `objc2` exit condition, with a derived scope.
 //!
-//! # The finding this file exists to answer
+//! The objc2 family (`objc2`, `block2`, `objc2-app-kit`, `objc2-foundation`,
+//! …) must not be used in code the macOS build compiles, and must not be
+//! declared as a dependency.
 //!
-//! Both endgame metrics in `docs/THIRD_PARTY_ROAD_TO_ZERO.md` were scoped to
-//! two directories: `crates/aterm-gui/src` and
-//! `vendor/winit/src/platform_impl/macos`. `vendor/winit/src/platform/macos.rs`
-//! is in NEITHER, is COMPILED ON macOS (`platform/mod.rs` gates it on
-//! `macos_platform`), and carried a live `objc2::rc::Retained::as_ptr` call. So
-//! a wave could have driven both numbers to zero and shipped a build that still
-//! linked `objc2` for a line no instrument was looking at.
+//! * The scope is everything under `vendor/winit/src` the macOS build
+//!   compiles, defined by subtraction (the whole tree minus the per-OS
+//!   slices), plus all of `crates/aterm-gui/src`, so a new file is in scope
+//!   when it is written.
+//! * The subtracted slices match `aterm-census`'s `REVIEWED_VENDORED_CRATES`
+//!   and are existence-checked, so a rename fails instead of widening a blind
+//!   spot.
+//! * A second walk over all of `crates/` and `vendor/winit/src` requires every
+//!   family use to be inside the scope or a declared slice.
 //!
-//! **An exit condition that cannot see a live use is not an exit condition.**
-//! Fixing the line would have left the hole; this file fixes the SCOPE, and
-//! does it the only way that survives the next file someone adds:
-//!
-//! * The scope is **everything under `vendor/winit/src` that the macOS build
-//!   compiles**, defined by SUBTRACTION — the whole tree minus the six per-OS
-//!   slices — plus all of `crates/aterm-gui/src`. A new shared file, or a new
-//!   macOS-gated extension module, is in scope the day it is written, with
-//!   nobody remembering to add it.
-//! * The subtraction list is the SAME six slices `aterm-census`'s
-//!   `REVIEWED_VENDORED_CRATES` registers, and every path is existence-checked,
-//!   so a rename fails this test instead of silently widening the blind spot.
-//! * A second walk sweeps ALL of `crates/` and `vendor/winit/src` and requires
-//!   every `objc2` code use it finds to be inside the scope or inside a
-//!   declared slice. That is what makes the scope a claim rather than a hope.
-//!
-//! # THE RULE STRIPS `//`, AND A DOC FENCE IS BEHIND `//` — thirteenth pass
-//!
-//! The scope was widened to include `vendor/winit/src/platform/macos.rs` and
-//! the `objc2::rc::Retained::as_ptr` at its line 506 was ported. Four hundred
-//! and seventy lines ABOVE that, in the same file, sits an application-delegate
-//! example whose fence is `#![cfg_attr(target_os = "macos", doc = "```")]` and
-//! `doc = "```ignore"` only when NOT macOS — five doc lines importing six
-//! family items (`objc2::rc::Retained`, `objc2::runtime::ProtocolObject`,
-//! `objc2::{declare_class, …}`, `objc2_app_kit::{…}`, `objc2_foundation::{…}`).
-//!
-//! `code_idents` breaks on `//`, so the widened scope walks straight past it.
-//! F5's shape, recurring inside F5's own fix.
-//!
-//! **Its severity is stated rather than inflated: it does not compile here.**
-//! `winit` is a path dependency and NOT a workspace member, so
-//! `cargo test --doc -p winit` answers *"package `winit` cannot be tested
-//! because it requires dev-dependencies and is not a member of the workspace"*,
-//! and `cargo test --workspace` never reaches it. So this is not a live
-//! compiled use the way line 506 was. What it IS: authored to compile on macOS,
-//! and the fork's own public documentation instructing a reader to use crates
-//! the exit condition is about to delete. Removing the `objc2` row would leave
-//! a doc example that cannot build, and nothing here would say so.
-//!
-//! So it was COUNTED, by `the_doc_fences_that_name_the_family_are_counted`,
-//! which walked the same scope for family names inside doc comments and pinned
-//! the total until the packages left; the fence is `ignore`d on every platform
-//! since the W12 + W13 merge, and the counter was retired on 2026-09-24
-//! (source at `e8a8c80ab`).
-//!
-//! # What this file does NOT see, stated because the last one did not
-//!
-//! The rule matches NAMES. `window_delegate.rs` passes this test and still
-//! CONSUMES an `objc2` type at two lines — `monitor.ns_screen(mtm)` answers
-//! `Option<Retained<NSScreen>>`, which reaches `seam::obj_of<T>` through a
-//! generic parameter, so no `objc2` token appears in the file. A file "off the
-//! list" can still change when its unported neighbours port. The two lines are
-//! named at their sites and in the roadmap.
+//! Limits: the rule strips `//` comments, so doc examples are not counted; and
+//! it matches names, so a family type reaching a file through a generic
+//! parameter is not seen.
 
 #![cfg(target_os = "macos")]
 
@@ -84,12 +38,9 @@ const FAMILY: &[&str] = &[
 /// and is reported apart from the `objc2` family everywhere.
 const BLOCK2: &str = concat!("block", "2");
 
-/// The per-OS subtrees the macOS build does not compile.
-///
-/// Identical to the `platform_slices` list `aterm-census`'s
-/// `REVIEWED_VENDORED_CRATES` registers for `winit`, and existence-checked here
-/// for the same reason it is there: a stale path is a blind spot, not a
-/// nuisance.
+/// The per-OS subtrees the macOS build does not compile. Identical to the
+/// `platform_slices` `aterm-census`'s `REVIEWED_VENDORED_CRATES` registers for
+/// `winit`, and existence-checked, since a stale path is a blind spot.
 const NON_MACOS_SLICES: &[(&str, &[&str])] = &[
     (
         "linux",
@@ -116,52 +67,16 @@ const NON_MACOS_SLICES: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// THE RECORDED COUNTS. Update them in the same commit that moves them, in
-/// EITHER direction — a number that fell without being written down is how the
-/// last scope went stale.
+/// The recorded counts. Update them in the same commit that moves them, in
+/// either direction.
 mod recorded {
     /// Files in the macOS-compiled scope with an `objc2`-family code use,
-    /// counting `block2` (the documented rule).
-    ///
-    /// W9 phase 2: 15 -> 13. `cursor.rs` and `view.rs` are ported.
-    /// Containment (main, 2026-09-05): 13 -> 12. `observer.rs`'s queued-closure
-    /// block — its only family use, `block2` — became `aterm_objc::RcBlock`, and
-    /// `block2` stopped being a direct dependency of the fork or of `aterm-gui`.
-    ///
-    /// W12: 13 -> 5, on its own branch, and the shape of the fall matters more
-    /// than its size. `observer.rs` went first and took the count from 13 to 12
-    /// WITHOUT moving `FILES_WITH_OBJC2`, because it was the one file in the
-    /// scope whose only family name was `block2`. Then `menu.rs`, `monitor.rs`,
-    /// `app.rs`, `app_state.rs`, `event_loop.rs`, `window.rs` and
-    /// `aterm_objc_seam.rs` — which is ALL OF THEM. `WINIT_FILES` is zero.
-    ///
-    /// W13: 13 -> 8, on ITS own branch. `aterm-gui`'s last five are ported and
-    /// its four rows retired. `GUI_FILES` is zero.
-    ///
-    /// THE MERGE, 2026-09-03: the two branches were cut from the same trunk
-    /// and each recorded the other half unmoved (W12 wrote `GUI_FILES = 5`,
-    /// W13 wrote `WINIT_FILES = 8`). Merged, both halves are zero, so every
-    /// count below is zero — and the fork's four macOS rows, which
-    /// `the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say`
-    /// holds to these counts, leave in the same commit.
+    /// counting `block2`.
     pub const FILES_WITH_FAMILY: usize = 0;
     /// The same, `objc2` proper only.
     pub const FILES_WITH_OBJC2: usize = 0;
-    /// …split by tree.
-    ///
-    /// **Both halves are ZERO.** `aterm-gui`'s five (`alert_keys.rs`,
-    /// `menu.rs`, `lib.rs`, `app_introspect.rs`, `appkit.rs`) went with W13;
-    /// the fork's eight went with W12. What the merge can say that neither
-    /// branch could: the `objc2`, `objc2-app-kit` and `objc2-foundation` rows
-    /// under `cfg(target_os = "macos")` in `vendor/winit/Cargo.toml` are dead
-    /// code AND dead features (`block2`'s row had already left with the
-    /// containment, one wave earlier). W12 had
-    /// measured them as live features — `aterm-gui` compiled only because the
-    /// fork's `objc2-foundation` row enabled `NSThread`, `dispatch` and
-    /// `NSEnumerator` for it — and held that in a test
-    /// (`the_forks_objc2_rows_are_dead_code_but_live_features`) whose own
-    /// failure message said to delete it the day `aterm-gui` stopped needing
-    /// the hostage. W13's port is that day, and the test is gone with the rows.
+    /// …split by tree. Both are zero, so the family's manifest rows must be gone
+    /// (see `the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say`).
     pub const GUI_FILES: usize = 0;
     pub const WINIT_FILES: usize = 0;
 }
@@ -282,10 +197,7 @@ fn the_family_file_count_is_what_is_recorded() {
     assert_eq!(winit, recorded::WINIT_FILES, "the winit half moved");
 }
 
-/// THE TEETH: nothing outside the scope may use the family in code.
-///
-/// This is the test the old scope could not have had, and the one that would
-/// have caught `platform/macos.rs` the day it was written.
+/// Nothing outside the scope uses the family in code.
 #[test]
 fn every_family_use_in_the_tree_is_in_scope_or_in_a_declared_slice() {
     let repo = repo();
@@ -318,12 +230,9 @@ fn every_family_use_in_the_tree_is_in_scope_or_in_a_declared_slice() {
     );
 }
 
-/// THE RULE READS EVERY SPELLING OF AN IMPORT, not just the punctuated ones.
-///
-/// `code_idents` is the whole endgame metric: it decides which files count, and
-/// through `every_family_use_in_the_tree_is_in_scope_or_in_a_declared_slice` it
-/// decides whether anything is hiding. It matched a family name followed by
-/// `::`, `;`, `,` or `}` — and a renaming import has none of those.
+/// The code rule sees every spelling of an import, including a renaming
+/// `use objc2 as oc;`, which has none of the punctuation the rule otherwise
+/// keys on.
 #[test]
 fn the_code_rule_sees_a_renaming_import() {
     let family_seen = |l: &str| code_idents(l).iter().any(|n| FAMILY.contains(&n.as_str()));
@@ -374,12 +283,11 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `(any family name, any name other than block2)` used in CODE.
+/// `(any family name, any name other than block2)` used in code.
 ///
-/// The documented rule: strip `//` comments AND string literals, then require
-/// a family name followed by `::`, `;`, `,` or `}`. Stripping the literals is
-/// load-bearing — it is what keeps a test assertion quoting a call, or a bare
-/// word in a message, from counting as a port that has not happened.
+/// Strips `//` comments and string literals (so a quoted call or a word in a
+/// message does not count), then requires a family name followed by `::`, `;`,
+/// `,` or `}`, or the `as` of a renaming import.
 fn family_uses(file: &Path) -> (bool, bool) {
     let Ok(src) = std::fs::read_to_string(file) else {
         return (false, false);
@@ -426,18 +334,8 @@ fn code_idents(line: &str) -> Vec<String> {
             while j < b.len() && b[j].is_whitespace() {
                 j += 1;
             }
-            // …OR the `as` of a RENAMING import. `use objc2 as oc;` and
-            // `use objc2_app_kit as ak;` put the family name in code with none
-            // of the four punctuation marks after it, so the fourteenth pass
-            // measured them slipping through this rule — and with them the
-            // TEETH test, which shares this function, so a renamed import
-            // anywhere in `crates/` was invisible too.
-            //
-            // Severity stated rather than inflated: nothing in the tree renames
-            // a crate root, and the packages cannot actually leave while any
-            // code uses them, because the build would fail. What was wrong is
-            // that the number deciding when they MAY leave could not see one
-            // way of writing the thing it counts.
+            // …or the `as` of a renaming import: `use objc2 as oc;` has none of
+            // the four punctuation marks after the name.
             let as_kw =
                 b[j..].starts_with(&['a', 's']) && b.get(j + 2).is_none_or(|c| c.is_whitespace());
             let follows = if j + 1 < b.len() && b[j] == ':' && b[j + 1] == ':' {
@@ -455,29 +353,12 @@ fn code_idents(line: &str) -> Vec<String> {
     out
 }
 
-/// A manifest with its COMMENTS STRIPPED — the TOML twin of [`code_idents`].
+/// A manifest with its comments stripped — the TOML twin of [`code_idents`], so
+/// prose about a dependency (e.g. a retirement note naming
+/// `objc2-app-kit/NSAccessibility`) is not read as the dependency.
 ///
-/// # Why this exists: the guard was armed at a spelling, not at the code
-///
-/// W13 phase 2 retired `aterm-gui`'s four rows and wrote, in the comment that
-/// replaces them, what they used to name — including the literal
-/// `objc2-app-kit/NSAccessibility`, because a retirement note that cannot say
-/// what was retired is not a note. The backstop below asked
-/// `gui.contains("objc2-app-kit/NSAccessibility")` over the RAW FILE, so the
-/// documentation of the removal read as the removal not having happened, and
-/// the test failed on a correct tree.
-///
-/// That is this campaign's recurring defect one more time: a guard whose
-/// subject is the TEXT rather than the CODE. A feature list and a sentence
-/// about a feature list are different things, and only the first can affect a
-/// build. So the subject is now the code: comments go, then the question is
-/// asked. Both arms of the backstop use it, so neither can be satisfied — or
-/// broken — by prose.
-///
-/// Comments are stripped the way TOML actually defines them: `#` starts one
-/// only OUTSIDE a string, so a `#` inside `"…"` or `'…'` is data. A naive
-/// line-wise `starts_with('#')` would miss a trailing comment, and a naive
-/// "cut at the first `#`" would corrupt any row whose value contains one.
+/// `#` starts a comment only outside a string, so `"…"`/`'…'` data containing
+/// `#` is kept and a trailing comment is removed.
 fn manifest_code(manifest: &str) -> String {
     let mut out = String::with_capacity(manifest.len());
     for line in manifest.lines() {
@@ -500,15 +381,10 @@ fn manifest_code(manifest: &str) -> String {
     out
 }
 
-/// EVERY DEPENDENCY A MANIFEST DECLARES, IN EITHER SPELLING, with the table it
-/// was declared in.
+/// Every dependency a manifest declares, as `(package, table)`, in any
+/// spelling Cargo accepts.
 ///
-/// # The blind spot this closes, which was measured before it was fixed
-///
-/// The row check used to be `line.starts_with("{name} = ")` for `aterm-gui` and
-/// `manifest.contains("[target.…dependencies.{name}]")` for the fork — that is,
-/// each half knew exactly ONE of Cargo's two spellings, and each knew the other
-/// half's. Cargo accepts both everywhere:
+/// Inline rows and `[…dependencies.NAME]` tables are both read:
 ///
 /// ```toml
 /// [target.'cfg(target_os = "macos")'.dependencies]
@@ -518,30 +394,9 @@ fn manifest_code(manifest: &str) -> String {
 /// version = "0.2.2"                            # table row — the FORK's own form
 /// ```
 ///
-/// So `aterm-gui` could re-acquire the whole family in the fork's spelling and
-/// the guard would answer "retired". PLANTED AND MEASURED before this helper
-/// existed: adding the table form above to `crates/aterm-gui/Cargo.toml` left
-/// `the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say` GREEN
-/// while `cargo tree -p aterm-gui` showed `objc2-app-kit v0.2.2` live in the
-/// graph. The guard was armed at a spelling of its own rule; its subject is the
-/// declared dependency now, however it is written.
-///
-/// The table CONTEXT comes back with each name because it is load-bearing in
-/// one direction: the fork legitimately keeps `objc2-foundation` and
-/// `objc2-ui-kit` rows under `cfg(target_os = "ios")`, a target no aterm build
-/// compiles, and those must NOT read as macOS rows. `aterm-gui` has no such
-/// exemption — a family dependency in ANY of its tables is a live dependency.
-///
-/// Dotted spellings (`name.workspace = true`, `name.version = "…"`) count too.
-///
-/// # THE NAME IT REPORTS IS THE PACKAGE, NOT THE KEY — sixteenth pass
-///
-/// Two further spellings were PLANTED into `crates/aterm-gui/Cargo.toml` and
-/// MEASURED. For both, `cargo tree -i -p objc2-app-kit --target
-/// aarch64-apple-darwin -e normal` printed `aterm-gui` as a DIRECT parent again
-/// — the exact edge W13 phase 2 retired — while
-/// `the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say` reported
-/// `ok. 1 passed`:
+/// Dotted spellings (`name.workspace = true`) count. Keys are unquoted, and a
+/// `package = "…"` rename (inline, dotted `key.package`, or inside the table)
+/// replaces the key, so the name reported is the package:
 ///
 /// ```toml
 /// [target.'cfg(target_os = "macos")'.dependencies]
@@ -549,23 +404,9 @@ fn manifest_code(manifest: &str) -> String {
 /// "objc2-app-kit" = { version = "0.2" }                             # PLANT B
 /// ```
 ///
-/// PLANT A is the manifest twin of the defect
-/// [`the_code_rule_sees_a_renaming_import`] closed on the code side, and it is
-/// worse here than there: `package = "…"` is a Cargo RENAME, whose entire
-/// purpose is that the key stops being the package name, so a guard keyed on
-/// the key cannot see the dependency at all. The file already knew renaming was
-/// this campaign's defect shape — it had simply never asked the question of a
-/// manifest. PLANT B is quoting, which TOML permits on any key including one
-/// that needs none, and which `rsplit_once('.')` and `split_once(['=', '.'])`
-/// both hand back with the quote characters still attached.
-///
-/// So this reports the PACKAGE each row resolves to: keys are unquoted, and a
-/// `package = "…"` field — in an inline value, in the dotted `key.package`
-/// form, or as a row inside a `[…dependencies.key]` table — REPLACES the key.
-/// The subject is the dependency, not the spelling of its name.
-///
-/// The table CONTEXT still comes back with each name, for the `ios` exemption
-/// above.
+/// The table comes back with each name because the fork keeps legitimate
+/// `objc2-foundation` / `objc2-ui-kit` rows under `cfg(target_os = "ios")`,
+/// which no aterm build compiles. `aterm-gui` has no such exemption.
 fn declared_deps(manifest: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut table = String::new();
@@ -605,9 +446,8 @@ fn declared_deps(manifest: &str) -> Vec<(String, String)> {
             };
             let field: Vec<&str> = segments.map(unquote_key).collect();
             // `NAME.package = "real"` and `NAME = { package = "real", … }` are
-            // one rename written two ways. Anything else keeps the key: a row
-            // literally named `package` (a legal crate name) has an empty field
-            // path, so its own value is never mistaken for a rename target.
+            // one rename. A row literally named `package` (a legal crate name)
+            // has an empty field path, so it is never taken as a rename target.
             let renamed = if field == ["package"] {
                 first_string(value)
             } else if field.is_empty() {
@@ -646,11 +486,9 @@ fn first_string(value: &str) -> Option<&str> {
     None
 }
 
-/// The `package = "…"` rename inside an INLINE dependency value, if it has one.
-///
-/// `package` is required to be a whole key — preceded by a boundary and
-/// followed by `=` — so `default-features`, a feature literally called
-/// `"package"`, and a path ending in `package` are all left alone.
+/// The `package = "…"` rename inside an inline dependency value, if any.
+/// `package` must be a whole key followed by `=`, so `default-features`, a
+/// feature called `"package"`, or a path ending in `package` are left alone.
 fn inline_rename(value: &str) -> Option<&str> {
     let mut rest = value;
     while let Some(i) = rest.find("package") {
@@ -670,19 +508,9 @@ fn inline_rename(value: &str) -> Option<&str> {
     None
 }
 
-/// THE MANIFEST RULE READS EVERY SPELLING OF A DEPENDENCY — the twin of
-/// [`the_code_rule_sees_a_renaming_import`], asked of the other half.
-///
-/// That test exists because a renaming IMPORT (`use objc2 as oc;`) slipped the
-/// code rule. Nobody had asked the same question of the manifest rule, and the
-/// answer was worse: a renaming DEPENDENCY
-/// (`appkit = { package = "objc2-app-kit" }`) slipped it, and so did a merely
-/// QUOTED key. Both were planted into `crates/aterm-gui/Cargo.toml`, and for
-/// both `cargo tree -i -p objc2-app-kit` printed `aterm-gui` as a direct parent
-/// while the rows test passed — see [`declared_deps`].
-///
-/// The subject here is the PACKAGE. Every row below declares `objc2-app-kit`;
-/// they differ only in how it is written.
+/// The manifest rule sees every spelling of a dependency: each row below
+/// declares `objc2-app-kit`, differing only in how it is written (renamed via
+/// `package =`, quoted key, table form, …). See [`declared_deps`].
 #[test]
 fn the_manifest_rule_sees_a_renamed_dependency() {
     const MACOS: &str = "target.'cfg(target_os = \"macos\")'.dependencies";
@@ -733,9 +561,8 @@ fn the_manifest_rule_sees_a_renamed_dependency() {
         );
     }
 
-    // …and it still does not fire on prose, on a feature list, on a row that
-    // merely mentions the name, or on the near-miss `objc2` — which is what
-    // keeps the classification meaningful in the other direction.
+    // It does not fire on prose, a feature list, a row that merely mentions the
+    // name, or the near-miss `objc2`.
     for (label, manifest) in [
         (
             "a commented-out row",
@@ -764,9 +591,7 @@ fn the_manifest_rule_sees_a_renamed_dependency() {
         );
     }
 
-    // The ios exemption survives the rewrite: a renamed row under the ios cfg
-    // comes back under the IOS table, so it can still be told apart from a
-    // macOS one.
+    // A renamed row under the ios cfg still comes back under the ios table.
     let ios = declared_deps(
         "[target.'cfg(target_os = \"ios\")'.dependencies]\n         uikit = { package = \"objc2-ui-kit\", version = \"0.2\" }\n",
     );
@@ -780,66 +605,12 @@ fn the_manifest_rule_sees_a_renamed_dependency() {
     );
 }
 
-/// WHICH MANIFEST ROWS ARE DEAD CODE, DECIDED BY THE FILE COUNTS ABOVE.
+/// The manifest rows agree with the recorded file counts.
 ///
-/// # The claim this exists to refute, and the measurement that refutes it
-///
-/// W13 was planned against a premise: "the fork's CODE is at zero, so its four
-/// macOS family rows are dead code", and "deleting the fork's rows alone leaves
-/// winit compiling and breaks `aterm-gui` with five errors". **Both halves are
-/// backwards**, and [`recorded::WINIT_FILES`] is why: eight files of the
-/// compiled macOS backend still use the family. MEASURED, by deleting the four
-/// rows and asking the compiler:
-///
-/// ```text
-/// $ cargo check -p winit          # with the fork's 4 macOS family rows deleted
-/// 27 errors: unresolved import `objc2_foundation` (7), `objc2_app_kit` (6),
-///            `objc2` (3), `block2` (1); cannot find module `objc2` (9), `block2` (1)
-/// ```
-///
-/// The other direction, measured the same way after W13's port:
-///
-/// ```text
-/// $ cargo check -p aterm-gui --all-targets   # with aterm-gui's 4 rows AND the
-///                                            # `a11y-appkit` feature list deleted
-/// exit 0
-/// $ targo --unverified forge survey --cell mac-arm
-/// mac-arm  116  69  47  563,759  24,865      # byte-identical to before
-/// ```
-///
-/// So the rows fall into two classes and this test is the classification:
-///
-/// * **`aterm-gui`'s four are DEAD CODE** — `GUI_FILES` is 0, and the crate
-///   compiles without them. Retiring them costs nothing and BUYS nothing on its
-///   own: with them gone, `cargo tree -i` shows every one of the six family
-///   packages held by `vendor/winit` alone, so the package count, the LOC and
-///   the unsafe-token count do not move by one.
-/// * **The fork's four are LIVE** — `WINIT_FILES` is 8. The `objc2` row in
-///   `vendor/winit/Cargo.toml` says this itself ("`objc2` leaves only when every
-///   file in this backend has stopped using it"), and it is the row's own words
-///   that this test holds it to.
-///
-/// **The package set moves when the FORK's eight files port, and at no earlier
-/// commit.** That is a port, not a manifest edit, and writing it down here is
-/// what stops the next wave from planning against the premise this one did.
-///
-/// # What phase 2 then did, and what it was worth
-///
-/// It retired `aterm-gui`'s four rows and emptied the `a11y-appkit` feature
-/// list, so this test now takes its `gui_present.is_empty()` arm. The survey
-/// across all five cells was byte-identical over that commit — 0 packages,
-/// 0 LOC, 0 unsafe tokens — exactly as the classification above predicted, and
-/// `cargo tree -i` now answers `winit` alone for all four family packages.
-/// The value is that the fork is the SOLE remaining parent: there is no longer
-/// a second row anywhere that could be mistaken for the thing holding them.
-///
-/// The doc fence in `vendor/winit/src/platform/macos.rs` was deliberately NOT
-/// removed with them, and `the_doc_fences_that_name_the_family_are_counted`
-/// counted its 5 lines (the counter was retired on 2026-09-24). It teaches a
-/// reader to write an `NSApplicationDelegate` against `objc2` — crates the FORK
-/// still depends on and still compiles against. Deleting accurate documentation
-/// ahead of the retirement it belongs to would have been cosmetic churn that
-/// also made the count lie about where the campaign stands.
+/// With both [`recorded::GUI_FILES`] and [`recorded::WINIT_FILES`] at zero, no
+/// family row may remain under `vendor/winit`'s macOS cfg or anywhere in
+/// `aterm-gui`'s manifest, and `aterm-gui`'s `a11y-appkit` feature list may not
+/// name the family.
 #[test]
 fn the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say() {
     let repo = repo();
@@ -854,11 +625,8 @@ fn the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say() {
             .expect("aterm-gui's manifest is readable"),
     );
 
-    // The fork's four rows. Read in EITHER spelling (see `declared_deps`) but
-    // ONLY under the macOS cfg: the fork keeps legitimate `objc2-foundation`
-    // and `objc2-ui-kit` rows under `cfg(target_os = "ios")`, and counting one
-    // of those as a macOS row would report this exit condition as further from
-    // done than it is.
+    // The fork's rows, in any spelling but only under the macOS cfg (the ios
+    // rows are legitimate).
     let fork_rows = [FAMILY[0], BLOCK2, "objc2-app-kit", "objc2-foundation"];
     let fork_macos = "target.'cfg(target_os = \"macos\")'.dependencies";
     let fork_deps = declared_deps(&fork);
@@ -872,13 +640,7 @@ fn the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say() {
         })
         .collect();
 
-    // THE LOAD-BEARING ARM IS GONE WITH THE ROWS. While `WINIT_FILES` was
-    // above zero this asserted all four rows PRESENT ("deleting them was
-    // measured at 27 compile errors in `winit` itself"); the W12 + W13 merge
-    // took the count to zero, so the arm that pinned the rows in place would
-    // now be dead code guarding a constant — which is exactly what clippy
-    // says of `WINIT_FILES > 0`. Like the aterm-gui half below, this half is
-    // written for a ported fork, and says so rather than branching on it.
+    // With `WINIT_FILES` at zero, the fork's macOS rows must be absent.
     assert_eq!(
         recorded::WINIT_FILES,
         0,
@@ -890,9 +652,8 @@ fn the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say() {
          dead code and owe their retirement: {present:?}"
     );
 
-    // `aterm-gui`'s four. ANY table counts here — unlike the fork, this crate
-    // has no target it does not build, so a family dependency in any of its
-    // dependency tables, in either spelling, is a live dependency.
+    // `aterm-gui`'s rows. Any table counts: this crate has no target it does
+    // not build.
     let gui_rows = ["objc2-app-kit", "objc2-foundation", FAMILY[0], BLOCK2];
     let gui_deps = declared_deps(&gui);
     let gui_present: Vec<&str> = gui_rows
@@ -905,18 +666,10 @@ fn the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say() {
         0,
         "this test's aterm-gui half is written for a ported crate; re-derive it"
     );
-    // W13 phase 2 RETIRED all four, so the live tree takes the empty arm. What
-    // is pinned is still the PAIRING rather than "they must be gone", because
-    // the property that matters survives in both directions: all four present
-    // or all four absent. They are one decision, and a partial retirement
-    // leaves a manifest claiming a mixed state nothing is in — which is also
-    // the shape a careless re-add would take, so the rule keeps its teeth after
-    // the retirement it was written before.
-    // The `a11y-appkit` feature list travels with them for the same reason —
-    // it names `objc2-app-kit/*` features, and cargo refuses a feature list that
-    // points at an absent dependency ("feature `a11y-appkit` includes
-    // `objc2-app-kit/NSAccessibility`, but `objc2-app-kit` is not a dependency"),
-    // measured.
+    // All four present or all four absent: a partial retirement is a state
+    // nothing is in, and the shape a careless re-add would take. The
+    // `a11y-appkit` feature list travels with them (cargo refuses a feature
+    // naming an absent dependency).
     assert!(
         gui_present.len() == gui_rows.len() || gui_present.is_empty(),
         "aterm-gui's four family rows are ONE decision and this tree has {} of \
@@ -925,15 +678,10 @@ fn the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say() {
         gui_present.len()
     );
     if gui_present.is_empty() {
-        // A BACKSTOP, AND IT IS NOT THE CATCHER. Measured: with the four rows
-        // deleted and the feature list left, cargo refuses to load the workspace
-        // at all ("feature `a11y-appkit` includes `objc2-app-kit/NSAccessibility`,
-        // but `objc2-app-kit` is not a dependency"), so no test in this file ever
-        // runs to say it. This arm exists for the shape cargo would NOT catch —
-        // a feature list rewritten to name something else while still teaching
-        // the retired crate — and the claim about which instrument catches what
-        // is written down rather than assumed, because a guard credited with a
-        // catch it does not make is how the last two passes' defects survived.
+        // A backstop: with the rows gone and the feature list left, cargo
+        // refuses to load the workspace before any test runs. This arm catches
+        // a feature list rewritten to name something else while still naming
+        // the retired crate.
         assert!(
             !gui.contains("objc2-app-kit/NSAccessibility"),
             "the rows are retired but the `a11y-appkit` feature list still names \

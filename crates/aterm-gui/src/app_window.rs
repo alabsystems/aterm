@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Window lifecycle: logical + OS window create/attach/close/focus orchestration
-//! (`create_window_logical`/`create_window_internal`/`attach_os_window`,
-//! `close_window`/`close_window_logical`/`escalate_pending_close`, focus
-//! bookkeeping), the `front`/`front_mut` accessors, and `apply_title`. The native
-//! window chrome (colour-space/appearance, background, toolbar, menu) is reached
-//! through the platform [`crate::platform::AppRt`] seam. A verbatim inherent-impl
-//! split of `App`.
+//! Window lifecycle: logical and OS window create/attach/close/focus, the
+//! `front`/`front_mut` accessors and `apply_title`. Native chrome is reached
+//! through the platform [`crate::platform::AppRt`] seam. An inherent-impl split
+//! of `App`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,11 +24,10 @@ use crate::{
     Session, TabIndex, WindowId, WindowState, pane, seed_cell_px,
 };
 
-/// A screen's usable placement rectangle in LOGICAL POINTS, top-left origin with
-/// y growing DOWN — the space [`Window::outer_position`] reports once converted to
-/// logical, so an anchor position, a window size, and this rectangle are directly
-/// comparable. On macOS it excludes the menu bar and the Dock
-/// ([`AppRt::window_work_area_pts`]); elsewhere it is the full monitor rectangle.
+/// A screen's usable placement rectangle in logical points, top-left origin, y
+/// down (the space of [`Window::outer_position`] in logical units). On macOS it
+/// excludes the menu bar and Dock ([`AppRt::window_work_area_pts`]); elsewhere it
+/// is the full monitor rectangle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WorkAreaPts {
     pub(crate) x: f64,
@@ -40,29 +36,22 @@ pub(crate) struct WorkAreaPts {
     pub(crate) h: f64,
 }
 
-/// How far down-and-right of the window it was opened from a new window is placed,
-/// in LOGICAL POINTS. Sized to clear a standard titlebar, so the previous window
-/// keeps a graspable strip of its own frame (and its traffic lights) visible —
-/// which is the whole point: a new window must never sit exactly on top of the one
-/// the user was just looking at. Roughly what AppKit's own `cascadeTopLeftFromPoint:`
-/// steps by, and what Terminal/Finder cascade by.
+/// Offset down-right from its parent at which a new window is placed, in logical
+/// points. Clears a standard titlebar so the parent's frame stays graspable;
+/// about AppKit's `cascadeTopLeftFromPoint:` step.
 const CASCADE_STEP_PTS: f64 = 26.0;
 
 /// The smallest slice of a cascaded frame that must stay inside the work area, in
-/// points: enough of its top-left corner to see it and grab it.
+/// points: enough of its top-left corner to see and grab it.
 ///
-/// A cascaded window is deliberately ALLOWED to hang past the right and bottom
-/// edges — macOS places windows that way, and permitting it is what keeps the
-/// cascade meaningful for a parent that already fills the screen. Wrapping on "the
-/// whole frame no longer fits" would send a work-area-sized window straight back to
-/// the work area's origin: exactly on top of the window it was supposed to clear.
+/// A cascaded window may hang past the right and bottom edges, as on macOS;
+/// wrapping when the whole frame no longer fits would put a work-area-sized
+/// window back at the origin, on top of its parent.
 const CASCADE_MIN_VISIBLE_PTS: f64 = 160.0;
 
-/// How long after an attach the [`crate::InitialFrameSettle`] may still correct
-/// the frame. Long enough for the map + first configure burst AND the
-/// activation-echo configure that trails it (observed well under 500 ms on
-/// GNOME); short enough that a real user gesture is essentially impossible to
-/// collide with — past it, the compositor's size is the user's truth.
+/// How long after an attach [`crate::InitialFrameSettle`] may still correct the
+/// frame: covers the map, first configure burst and trailing activation
+/// configure; after it, the compositor's size is the user's.
 #[cfg(target_os = "linux")]
 const INITIAL_FRAME_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
 /// Corrective size requests one attach may spend (stale-echo + scale-change can
@@ -73,18 +62,13 @@ const INITIAL_FRAME_SETTLE_MAX_CORRECTIONS: u8 = 3;
 /// Where a freshly-created window goes so it does not eclipse `anchor` (the outer
 /// top-left, in points, of the window it was opened from).
 ///
-/// A diagonal step down-right, wrapped PER AXIS back to the work area's edge once
-/// the step would push the frame's grabbable corner ([`CASCADE_MIN_VISIBLE_PTS`])
-/// off that edge: the cascade marches down-right, returns to the top of the screen
-/// when it runs out of height (keeping its column, so the run continues rightwards)
-/// and to the left when it runs out of width. Same shape as AppKit's own cascade,
-/// and it can never march unboundedly off-screen. The final clamp is the fail-safe
-/// for an anchor that is itself off the work area (a window dragged nearly
-/// off-screen, or left behind by a display change).
+/// A diagonal step down-right, wrapped per axis back to the work area's edge once
+/// the grabbable corner ([`CASCADE_MIN_VISIBLE_PTS`]) would leave it, like
+/// AppKit's cascade. The final clamp handles an anchor that is itself off the
+/// work area.
 ///
-/// `None` for degenerate geometry (a non-finite coordinate, a negative frame, or an
-/// empty work area — e.g. a monitor winit reports as 0×0); the caller then leaves
-/// the OS placement alone rather than moving the window somewhere nonsensical.
+/// `None` for degenerate geometry (non-finite coordinate, negative frame, empty
+/// work area); the caller then leaves the OS placement alone.
 #[must_use]
 fn cascade_top_left_pts(
     anchor: (f64, f64),
@@ -118,12 +102,10 @@ fn cascade_top_left_pts(
     ))
 }
 
-/// One live monitor's rectangle in PHYSICAL px — global desktop coordinates, the
-/// space [`Window::outer_position`]/`set_outer_position` and the persisted
-/// `outer_x`/`outer_y` all share — plus its scale factor, so the point-denominated
-/// grab minimum ([`CASCADE_MIN_VISIBLE_PTS`]) can be converted per monitor.
-/// Physical rather than logical on purpose: mixed-DPI logical rectangles overlap
-/// and gap in ways the physical virtual desktop does not.
+/// One live monitor's rectangle in physical px (global desktop coordinates, the
+/// space of `outer_position`/`set_outer_position` and persisted `outer_x`/`outer_y`)
+/// plus its scale factor, to convert [`CASCADE_MIN_VISIBLE_PTS`] per monitor.
+/// Physical because mixed-DPI logical rectangles overlap and gap.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MonitorRectPx {
     pub(crate) x: f64,
@@ -133,30 +115,15 @@ pub(crate) struct MonitorRectPx {
     pub(crate) scale: f64,
 }
 
-/// W4: does a PERSISTED window origin still land on a monitor that exists?
+/// Whether a persisted window origin still lands on an existing monitor.
 ///
-/// The restore path used to apply `outer_x`/`outer_y` verbatim, so undocking a
-/// laptop (or unplugging the external display) brought every window that lived on
-/// the absent monitor back entirely outside the desktop — invisible and, off
-/// macOS (whose AppKit constrains frames onto screens itself), unreachable
-/// without Win+arrow archaeology. This is the same scenario the cascade clamp's
-/// doc above names ("left behind by a display change"); restore deliberately
-/// overrides the cascade, so it must run the same test itself.
+/// Restore overrides the cascade, so it runs the cascade clamp's test itself:
+/// the origin is accepted when some monitor contains the top-left corner with at
+/// least [`CASCADE_MIN_VISIBLE_PTS`] (in px at that monitor's scale) to its right
+/// and below. A rejected origin falls back to the cascade; clamping instead would
+/// invent a position that can land on top of another window.
 ///
-/// The contract mirrors [`cascade_top_left_pts`]'s final clamp: the origin is
-/// acceptable when SOME monitor contains the window's top-left corner with at
-/// least [`CASCADE_MIN_VISIBLE_PTS`] (converted to px at THAT monitor's scale) of
-/// room to its right and below — enough of the titlebar on glass to see and grab.
-/// A window deliberately parked hanging off the desktop's outer edge fails this
-/// and falls back to the cascade: conservative, and exactly what the clamp would
-/// have done to a fresh window at that anchor. CLAMPING the point instead of
-/// rejecting it was considered and rejected — a clamp invents a position on
-/// whichever monitor happens to compare first and lands the window exactly on
-/// top of window 1, which is the eclipse the cascade exists to prevent.
-///
-/// Degenerate rectangles (a monitor winit reports as 0×0, non-finite anything)
-/// are skipped rather than matched, mirroring `cascade_top_left_pts`'s refusal
-/// to reason about nonsense geometry.
+/// Degenerate rectangles (0×0, non-finite) are skipped rather than matched.
 #[must_use]
 fn restored_origin_visible(origin: (f64, f64), monitors: &[MonitorRectPx]) -> bool {
     if !origin.0.is_finite() || !origin.1.is_finite() {
@@ -170,11 +137,8 @@ fn restored_origin_visible(origin: (f64, f64), monitors: &[MonitorRectPx]) -> bo
             return false;
         }
         let keep = CASCADE_MIN_VISIBLE_PTS * m.scale;
-        // Same shape as the cascade clamp's bounds: corner inside the monitor,
-        // with a grabbable slice of frame guaranteed to its right and below. A
-        // monitor smaller than the grab minimum keeps the whole-frame rule from
-        // `cascade_top_left_pts` (`min` there); here it simply accepts any
-        // corner inside it.
+        // Corner inside the monitor with a grabbable slice to its right and below;
+        // a monitor smaller than the grab minimum accepts any corner inside it.
         let keep_x = keep.min(m.w);
         let keep_y = keep.min(m.h);
         origin.0 >= m.x
@@ -184,12 +148,9 @@ fn restored_origin_visible(origin: (f64, f64), monitors: &[MonitorRectPx]) -> bo
     })
 }
 
-/// [`restored_origin_visible`] against the LIVE monitor set, for the restore
-/// paths that are about to `set_outer_position` a persisted coordinate. `true`
-/// means "apply it". An EMPTY monitor enumeration (headless-ish environments,
-/// a driver mid-modeswitch) cannot validate anything, so it answers `true` —
-/// the pre-validation status quo — rather than silently discarding every
-/// persisted position on a machine whose enumeration is merely shy.
+/// [`restored_origin_visible`] against the live monitor set; `true` means apply
+/// the persisted coordinate. An empty monitor enumeration cannot validate
+/// anything, so it answers `true`.
 #[must_use]
 pub(crate) fn restored_position_on_screen(window: &Window, x: i32, y: i32) -> bool {
     let monitors: Vec<MonitorRectPx> = window
@@ -212,16 +173,71 @@ pub(crate) fn restored_position_on_screen(window: &Window, x: i32, y: i32) -> bo
     restored_origin_visible((f64::from(x), f64::from(y)), &monitors)
 }
 
+/// A restored window's FRAME, as its layout row carried it — an update's (P6
+/// finding 4) or a cold restore's: the grid the window is created at, and the
+/// raw inner size it had, which its first attach takes when that size holds the
+/// grid ([`App::attach_frame_px`]), with the presence row both hold (an update's
+/// only, [`crate::WindowState::take_carried_frame`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CarriedFrame {
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) inner_px: PhysicalSize<u32>,
+    pub(crate) presence_row: bool,
+}
+
+impl CarriedFrame {
+    /// The frame `layout` carries, when it carries one: a row that names its
+    /// window's raw inner size ([`crate::restore::WindowLayout::inner_px`]) —
+    /// every row of an update's layout or a quit's, but a maximized window's
+    /// and a quit's full-screen one — is recreated at its own grid, and at that
+    /// size when it still holds the grid. Every other row — an older build's,
+    /// those two — gives `None`, and the window inherits the front window's
+    /// grid as it always has. The grid keeps the launch clamps window 0's does
+    /// (`main_entry`); a clamped grid is one the carried size no longer holds,
+    /// so it then comes up at that grid's exact frame.
+    #[must_use]
+    pub(crate) fn of(layout: &crate::restore::WindowLayout) -> Option<Self> {
+        let [width, height] = layout.inner_px?;
+        Some(Self {
+            rows: layout.rows.clamp(5, 300),
+            cols: layout.cols.clamp(20, 500),
+            inner_px: PhysicalSize::new(width, height),
+            presence_row: layout.presence_row,
+        })
+    }
+}
+
+impl crate::WindowState {
+    /// Take a restored window's CARRIED FRAME before its first attach sizes
+    /// it: the raw inner size it had — an update's parent's, or a cold
+    /// restore's quit ([`App::attach_frame_px`] takes it when it holds the
+    /// carried grid) — and whether its presence row stood (an update's only).
+    ///
+    /// The presence row is reserved here: the parent's size and grid include it,
+    /// but a successor's presence engine does not commit rows before Commit, so
+    /// without the reservation the carried size would be refused and the window
+    /// come up a row short. The reserved row paints blank until this process
+    /// projects its story.
+    pub(crate) fn take_carried_frame(
+        &mut self,
+        inner_px: Option<PhysicalSize<u32>>,
+        presence_row: bool,
+    ) {
+        self.carried_inner_px = inner_px;
+        if presence_row {
+            self.presence.rows = 1;
+        }
+    }
+}
+
 /// Which existing window a new one cascades off, given the MRU focus stack and the
-/// ids of the windows that actually own an OS window (ASCENDING — `App.windows` is
-/// a `BTreeMap`, so its key order already is).
+/// ids of windows that own an OS window (ascending, as `App.windows` is a
+/// `BTreeMap`).
 ///
-/// Most-recently-focused first, because that is the window the user was in; the
-/// highest attached id otherwise, which is the most recently CREATED window and
-/// therefore where an unfocused burst (session restore) last placed a frame.
-/// Excluding `new` is load-bearing, not defensive: `frontmost_window` — and, once
-/// the OS focuses it, `focus_order` — name the new window itself, and cascading a
-/// window off its own position would step it away from nothing on every attach.
+/// Most-recently-focused first; otherwise the highest attached id (the most
+/// recently created). `new` is excluded because `frontmost_window` and
+/// `focus_order` can already name the new window itself.
 #[must_use]
 fn cascade_anchor_of(
     new: WindowId,
@@ -238,10 +254,9 @@ fn cascade_anchor_of(
 
 /// Authority currently owning the native window title.
 ///
-/// The close-warning is safety-critical and outranks the temporary find status;
-/// find in turn outranks the continuously refreshed canonical Title/Description.
-/// Canonical composition still advances its cache under either override so the
-/// newest Smart Title is ready when the temporary owner leaves.
+/// The close warning outranks the temporary find status, which outranks the
+/// canonical Title/Description. The canonical cache keeps advancing under either
+/// override so it is current when the override leaves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowTitleAuthority {
     CloseWarning,
@@ -263,13 +278,10 @@ pub(crate) const fn window_title_authority(
     }
 }
 
-/// Push a session's reported cwd onto `slot` in the `~`-abbreviated tab-label
-/// form, reporting whether anything was written (`false` leaves `slot` untouched,
-/// so the caller can fall through to the next rung). Byte-for-byte the result of
-/// [`crate::app_tabs::home_abbreviated`], but pushed IN PLACE — the window-title
-/// path recomposes on every redraw and must not allocate a `String` per frame.
-/// Mirrors the tab strip's own in-place cwd rung (`refill_strip_titles`).
-fn push_home_abbreviated_cwd(slot: &mut String, cwd: Option<&str>) -> bool {
+/// Push a session's cwd onto `slot` in `~`-abbreviated tab-label form; `false`
+/// leaves `slot` untouched. Same result as [`crate::app_tabs::home_abbreviated`]
+/// but in place, so the per-redraw title path does not allocate.
+pub(crate) fn push_home_abbreviated_cwd(slot: &mut String, cwd: Option<&str>) -> bool {
     let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
         return false;
     };
@@ -285,12 +297,10 @@ fn push_home_abbreviated_cwd(slot: &mut String, cwd: Option<&str>) -> bool {
     true
 }
 
-/// Decide the `attach_os_window` outcome at its real installation seam. A
-/// stale/missing logical window must fail closed: it cannot offer startup
-/// milestones or tell the caller that a present target exists. Every successful
-/// installation offers its complete timeline to the process-wide first-write
-/// slot; that slot, rather than the backend's Pending/Ready state, decides which
-/// successful surface is the startup surface.
+/// Decide the `attach_os_window` outcome. A stale or missing logical window fails
+/// closed: no startup milestones, no present target. Every successful install
+/// offers its timeline to the process-wide first-write slot, which picks the
+/// startup surface.
 #[must_use]
 fn present_target_install_outcome(
     present_installed: bool,
@@ -303,76 +313,56 @@ fn present_target_install_outcome(
 }
 
 /// How [`App::confirm_destructive_close`] answers a close that would exit a window
-/// (or the app) — the one seam between a human gesture and a wire instruction.
+/// or the app.
 ///
-/// The native confirm dialog is `NSAlert runModal`: it parks the main thread until
-/// a human clicks. A control-socket verb waits for that same main thread's reply,
-/// so a wire close that reached the dialog wedged the instance — nobody clicks a
-/// modal in a window an agent opened in the background. Every wire path therefore
-/// sets a non-interactive policy for the duration of its close, and the dialog is
-/// reserved for Cmd-W / Cmd-Q / the red light / the strip's ✕.
+/// The native confirm dialog is modal on the main thread, which a control-socket
+/// verb is waiting on, so wire paths set a non-interactive policy for their close;
+/// the dialog is only for Cmd-W, Cmd-Q, the close button and the strip's ✕.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum CloseConfirm {
     /// A human gesture: the native dialog, or the titlebar-warning fallback where
     /// there is none.
     #[default]
     Interactive,
-    /// Proceed with no dialog, busy or not, for a close that is already an
-    /// explicit instruction: the operator's typed Stop row (it declared
-    /// `role=operator`), and the replay of a close the human confirmed on the
-    /// windows in-window banner ([`App::replay_confirmed_close`] — asking again
-    /// would pose the answered question twice).
+    /// Proceed with no dialog, for a close that is already an explicit
+    /// instruction: the operator's Stop row, and the replay of a close the human
+    /// confirmed on the in-window banner ([`App::replay_confirmed_close`]).
     Programmatic,
-    /// The `close` and `tab close` verbs: no dialog; an idle close proceeds, and a
-    /// close that would hang up a running job is refused. A busy LAST-tab close
-    /// answers [`WIRE_CLOSE_REFUSED`], as the `close` catalog entry promises; a
-    /// busy pane in a window that stays open answers the pane refusal
-    /// (`app_tabs::WIRE_PANE_CLOSE_REFUSED`), and a busy tab among several the
-    /// tab refusal ([`WIRE_TAB_CLOSE_REFUSED`]). `tab close` shares this policy
-    /// since the 2026-09-22 audit: it is the same retirement by another
-    /// spelling, and under `Programmatic` it was the one wire path that killed a
-    /// running job.
+    /// The `close` and `tab close` verbs: no dialog; an idle close proceeds and a
+    /// close that would hang up a running job is refused: a busy last tab with
+    /// [`WIRE_CLOSE_REFUSED`], a busy pane in a window that stays open with
+    /// `app_tabs::WIRE_PANE_CLOSE_REFUSED`, a busy tab among several with
+    /// [`WIRE_TAB_CLOSE_REFUSED`].
     WireRefuseBusy,
 }
 
-/// The wire refusal of a busy last-tab close — the `close` verb's catalog
-/// promise, verbatim. Both `close_session_by_id` (the `close` verb) and
-/// [`App::confirm_destructive_close`] (through `pending_action_refusal`, for
-/// `tab close`) answer with it, so the two verbs refuse in one voice.
+/// The wire refusal of a busy last-tab close, as the `close` catalog entry
+/// promises. Both `close_session_by_id` and [`App::confirm_destructive_close`]
+/// answer with it.
 pub(crate) const WIRE_CLOSE_REFUSED: &str =
     "close refused (a running job armed the last-tab confirm)";
 
-/// The wire refusal of a busy `tab close` aimed at a tab that is NOT its
-/// window's last: a pane of that tab would hang up its own foreground job.
-/// The tab's sibling of the pane refusal `close` answers for the same pane
-/// (`app_tabs::WIRE_PANE_CLOSE_REFUSED`): same opening words, so a driver that
-/// matches `close refused (a running job` meets every busy refusal, but it
-/// names the TAB, the thing `tab close` aimed at — a split tab has several
-/// panes, and "that pane" would not say which.
+/// The wire refusal of a busy `tab close` aimed at a tab that is not its
+/// window's last. Shares its opening words with `app_tabs::WIRE_PANE_CLOSE_REFUSED`
+/// so a driver can match every busy refusal, but names the tab.
 pub(crate) const WIRE_TAB_CLOSE_REFUSED: &str = "close refused (a running job in that tab)";
 
 impl App {
-    /// Coalesce a destructive request behind the one live overlap handoff and
-    /// nonblockingly ask its worker to abort.  Returning `true` is a hard
-    /// structural barrier: the caller must not detach documents, windows, or PTYs.
-    /// The worker emits completion only after the child process group is reaped;
-    /// `finish_update_handoff` then rolls back overlap and replays this exact intent.
+    /// Coalesce a destructive request behind the live overlap handoff and ask its
+    /// worker to abort without blocking. `true` is a hard barrier: the caller must
+    /// not detach documents, windows or PTYs. The worker completes only after the
+    /// child process group is reaped; `finish_update_handoff` then rolls back
+    /// overlap and replays this intent.
     #[cfg(unix)]
     pub(crate) fn defer_pending_update_handoff_teardown(
         &mut self,
         intent: crate::DeferredHandoffTeardown,
     ) -> bool {
         if self.pending_update_handoff.is_none() {
-            // A HELD SUCCESSOR WITH NOTHING PARKED IS NO BARRIER (2026-09-19, the
-            // late park): it holds no descriptor, so nothing the teardown does
-            // can strand a session. The intent proceeds now.
-            //
-            // THROUGH THE TYPED STAND-DOWN, not a raw cancel poke (review round
-            // 1): the poke reaches the worker, but the park GATE is main-thread
-            // state and would have stayed armed — so the next 20 ms tick could
-            // freeze every reader onto a successor this very call had just
-            // cancelled. `stand_down_prelaunched_successor` shuts the gate and
-            // falls back to the poke by itself.
+            // A held successor with nothing parked holds no descriptor, so it is
+            // no barrier and the intent proceeds now. The typed stand-down also
+            // shuts the main-thread park gate, which a raw cancel poke would
+            // leave armed.
             //
             #[cfg(any(target_os = "macos", all(test, unix)))]
             if self.update_handoff_prelaunch.is_some() {
@@ -387,11 +377,10 @@ impl App {
             }
             return false;
         }
-        // This is commit revocation, not just a wake hint. Some native/control
-        // close events bypass ordinary keyboard activity accounting, and cancel
-        // can race a worker that already emitted ProofReady. Advancing the epoch
-        // makes that proof inadmissible; the explicit teardown predicate in the
-        // proof reducer remains fail-closed even if the counter saturated.
+        // Commit revocation, not only a wake hint: some close events bypass
+        // keyboard activity accounting and cancel can race a worker that already
+        // emitted ProofReady. Advancing the epoch makes that proof inadmissible;
+        // the proof reducer's teardown predicate stays fail-closed on saturation.
         self.note_update_handoff_activity();
         let pending = self
             .pending_update_handoff
@@ -419,33 +408,26 @@ impl App {
         self.frontmost_window.and_then(|id| self.windows.get(&id))
     }
 
-    /// The window-CHROME theme to apply from config `window_theme`.
-    /// `Auto` remains `Auto` on every platform so AppKit/winit/DWM can follow the
-    /// live system appearance; Light and Dark are explicit overrides. Terminal
-    /// palette selection is deliberately independent.
+    /// The window-chrome theme from config `window_theme`. `Auto` stays `Auto` so
+    /// the platform follows the live system appearance; Light/Dark override.
+    /// Independent of the terminal palette.
     pub(crate) fn window_theme_for_chrome(&self) -> crate::app_config::WindowTheme {
         self.window_theme
     }
 
-    /// (L1) The cell-GEOMETRY fingerprint the per-scale cell-metrics cache is
-    /// keyed under (`restore::load_cell_metrics` / `store_cell_metrics`): the
-    /// canonicalized font selection (`font_family_request` collapses
-    /// `display_font` and its legacy ids into `font_family`'s space — one string
-    /// for the one face that decides advance/line metrics) plus `line_height`,
-    /// the only other config knob that changes cell geometry. Deliberately NOT
-    /// keyed on: `font_px` (stored per entry — the reader predicts its own
-    /// target and rejects on mismatch), padding/strip-rows (recomputed live at
-    /// lookup, so editing them never needlessly cools the cache), or the
-    /// bold/italic/fallback families (they never set the cell). A font FILE
-    /// swapped under an unchanged name is invisible here by design; the
-    /// post-join mismatch log + re-store in `attach_os_window` is the
-    /// self-healing net for that.
+    /// The cell-geometry fingerprint keying the per-scale cell-metrics cache
+    /// (`restore::load_cell_metrics`/`store_cell_metrics`): the canonicalized font
+    /// family (`font_family_request`) plus `line_height`. Not keyed on `font_px`
+    /// (stored per entry and checked by the reader), padding/strip rows
+    /// (recomputed at lookup) or bold/italic/fallback families (they never set
+    /// the cell). A font file swapped under an unchanged name is caught by the
+    /// post-join mismatch check in `attach_os_window`.
     ///
     /// An UNCONFIGURED font keys on the build's default primary identity where
-    /// it has one (`bundled:JetBrains Mono` on non-macOS; empty on macOS, where
-    /// the key is unchanged), so the release that changed that default reads
-    /// as a cache miss rather than early-revealing the previous default's
-    /// metrics.
+    /// it has one (`bundled:Cascadia Mono PL` on Windows, `bundled:JetBrains
+    /// Mono` on Linux; empty on macOS, where the key is unchanged), so the
+    /// release that changed that default reads as a cache miss rather than
+    /// early-revealing the previous default's metrics.
     fn cell_metrics_font_key(&self) -> String {
         format!(
             "{}|lh={}",
@@ -460,70 +442,40 @@ impl App {
         )
     }
 
-    /// (L1) The ONE resolved colour the warm-launch early reveal puts on glass
-    /// before the backend joins, and the colour the first presented frame then
-    /// paints over it: the renderer theme background, 24-bit.
+    /// The resolved colour the warm-launch early reveal shows before the backend
+    /// joins, and which the first frame then paints over it: the renderer theme
+    /// background, 24-bit.
     ///
-    /// Three consumers read it and must never diverge: the Windows class brush
-    /// (`window_set_background_color` — the pre-join erase), every unstyled
-    /// cell of the first frame (`applied_terminal_config_for_with_assets` pins
-    /// the engine default background to the same resolved theme), and the
-    /// remainder bands around the grid (`present_band_bg` falls back to the
-    /// theme until OSC 11 sets a live one, which cannot have happened before
-    /// the first frame). `early_reveal_backdrop_is_the_colour_the_first_frame_paints`
-    /// pins the identity for both OS appearances; the post-join check in
-    /// `attach_os_window` pins it per launch. Deliberately NOT a persisted
-    /// "last presented background" beside the cell-metrics cache: that value
-    /// is stale by construction whenever the previous session ended under
-    /// OSC 11, a live theme edit, or the other half of a `dark:…,light:…`
-    /// split — the resolved theme IS what the first frame paints, so it is
-    /// what the erase paints.
+    /// Three consumers must agree: the Windows class brush
+    /// (`window_set_background_color`), every unstyled cell of the first frame
+    /// (`applied_terminal_config_for_with_assets`), and the bands around the grid
+    /// (`present_band_bg`, which uses the theme until OSC 11 sets one).
+    /// `early_reveal_backdrop_is_the_colour_the_first_frame_paints` pins this;
+    /// `attach_os_window` checks it per launch. It is not a persisted "last
+    /// background", which would be stale after OSC 11 or a theme change.
     ///
-    /// On an HDR desktop the two reach glass through different compositor
-    /// inputs — an 8-bit GDI surface vs the scRGB `Rgba16Float` swapchain —
-    /// and compose to the SAME linear value: DWM decodes the 8-bit surface
-    /// with the sRGB curve and scales it by the SDR-white level
-    /// (`SDRwhite / 80`), which is exactly what the present blit does
-    /// (`hdr_grid_encode3 * sdr_white_scale`). Measured with an FP16
-    /// Windows.Graphics.Capture of the composed desktop (SDR white 240 nits,
-    /// scale 3.0): erase and first present both compose `#111318` to linear
-    /// `(0.01682, 0.01953, 0.02739)`, identical, with no intermediate frame.
-    /// A GDI `BitBlt` / `CopyFromScreen` of that desktop is NOT
-    /// colour-faithful for the float surface: it returns 8-bit surfaces
-    /// verbatim but converts float surfaces at the 80-nit scRGB reference
-    /// (the SDR-white scale un-applied), so the SAME composed pixel reads
-    /// `#111318` during the erase and `#23262E` after the present (and
-    /// `#D0D0D0` text reads `#FFFFFF`). That is a capture artifact, not a
-    /// luminance step: with an 8-bit swapchain (`hdr_glow = false`) the same
-    /// tool reads `#111318` for both. Measure colour on an HDR desktop with
-    /// an FP16 capture, or `aterm-ctl video` (whose `index.json` carries the
-    /// presentation encoding and the SDR-white scale it un-applies).
+    /// On an HDR desktop the 8-bit GDI erase and the scRGB `Rgba16Float` swapchain
+    /// compose to the same linear value (DWM scales the sRGB surface by
+    /// `SDRwhite / 80`, as the present blit does). GDI `BitBlt`/`CopyFromScreen`
+    /// captures misreport float surfaces; measure with an FP16 capture or
+    /// `aterm-ctl video`.
     fn early_reveal_backdrop(&self) -> u32 {
         self.theme.bg & 0x00FF_FFFF
     }
 
-    /// The chrome appearance actually handed to
-    /// [`crate::platform::AppRt::window_set_appearance`] — the ONE resolution seam
-    /// between the config policy above and the platform seam.
+    /// The chrome appearance handed to
+    /// [`crate::platform::AppRt::window_set_appearance`].
     ///
-    /// macOS/Windows pass the policy through verbatim: `Auto` stays `Auto` so
-    /// AppKit/DWM keep following the live OS appearance (the system-owned contract
-    /// `automatic_window_chrome_remains_system_owned_independent_of_terminal_palette`
-    /// pins), and the titlebar still MATCHES the terminal because those platforms
-    /// paint it the theme's own bg (`window_set_background_color` + the toolbar's
-    /// `set_strip_dark`).
+    /// macOS/Windows pass the policy through: `Auto` follows the OS appearance
+    /// (`automatic_window_chrome_remains_system_owned_independent_of_terminal_palette`)
+    /// and the titlebar matches the terminal because those platforms paint it the
+    /// theme's background.
     ///
-    /// Linux has neither of those painters: its fallback chrome is winit's
-    /// sctk-adwaita CLIENT-side header on Wayland (the `_GTK_THEME_VARIANT` hint on
-    /// X11), whose only knob is the light/dark variant — and winit's Wayland backend
-    /// never delivers `ThemeChanged`, so `Auto` there does not even track the OS
-    /// live. Under a dark terminal theme that fell back to a mismatched light-grey
-    /// slab bolted onto a black body. So on Linux ONLY, `Auto` resolves to the
-    /// ACTIVE terminal theme's darkness ([`crate::tab_bar::theme_is_dark`]) — the
-    /// header reads as an extension of the terminal, which is what every other
-    /// platform already achieves by painting. An explicit config Light/Dark remains
-    /// the operator's override everywhere. Re-pushed by `apply_theme_live` on Linux
-    /// so a live theme swap moves the header with the body.
+    /// Linux's fallback chrome (sctk-adwaita CSD on Wayland, `_GTK_THEME_VARIANT`
+    /// on X11) only has a light/dark variant, and winit's Wayland backend never
+    /// delivers `ThemeChanged`. So on Linux `Auto` resolves to the active terminal
+    /// theme's darkness ([`crate::tab_bar::theme_is_dark`]); explicit Light/Dark
+    /// still override. `apply_theme_live` re-pushes it on Linux.
     pub(crate) fn chrome_theme_for_apprt(&self) -> crate::app_config::WindowTheme {
         #[cfg(target_os = "linux")]
         if self.window_theme == crate::app_config::WindowTheme::Auto {
@@ -536,56 +488,32 @@ impl App {
         self.window_theme_for_chrome()
     }
 
-    /// The THEME the window's CHROME PAINTERS draw from — the tab band's strip
-    /// tones and the native pages' role palette — as opposed to the terminal
-    /// GRID, which always renders the terminal theme itself.
+    /// The theme the window's chrome painters (tab band strip tones, native pages'
+    /// role palette) draw from; the terminal grid always uses the terminal theme.
     ///
-    /// macOS/Windows return the terminal theme untouched: their titlebar is
-    /// painted by the platform, config `window_theme` already reaches it
-    /// through [`crate::platform::AppRt::window_set_appearance`], and the
-    /// system-owned contract (`automatic_window_chrome_remains_system_owned_…`)
-    /// pins that pass-through — the in-grid painters there keep extending the
-    /// terminal.
+    /// macOS/Windows return the terminal theme: their titlebar is painted by the
+    /// platform via [`crate::platform::AppRt::window_set_appearance`].
     ///
-    /// Linux is where the config was observably a NO-OP beyond the CSD header
-    /// (2026-08 settings audit): `window_theme = light` flipped only winit's
-    /// decoration variant while the tab band and every native Settings page
-    /// kept painting from the (dark) terminal theme — a light titlebar bolted
-    /// onto a dark chrome body. So on Linux ONLY:
+    /// On Linux:
     ///
-    ///  * `Auto` — the terminal theme, unchanged: chrome extends the terminal,
-    ///    exactly the side [`Self::chrome_theme_for_apprt`] resolves the CSD to,
-    ///    so header, band and pages stay one material;
-    ///  * `Light`/`Dark` matching the terminal theme's own darkness — the
-    ///    terminal theme, unchanged: theme-derived chrome already reads as the
-    ///    forced side, and keeping it preserves the harmony Auto ships;
-    ///  * `Light`/`Dark` AGAINST the terminal theme's darkness — the authored
-    ///    forced palette ([`crate::native_appearance::forced_chrome_theme`]),
-    ///    accent carried from the terminal theme.
+    ///  * `Auto` — the terminal theme, matching what
+    ///    [`Self::chrome_theme_for_apprt`] resolves the CSD to;
+    ///  * `Light`/`Dark` matching the terminal theme's darkness — the terminal
+    ///    theme;
+    ///  * `Light`/`Dark` against it — the authored forced palette
+    ///    ([`crate::native_appearance::forced_chrome_theme`]), accent carried from
+    ///    the terminal theme.
     ///
-    /// The CSD variant, the strip and the native pages all resolve from the one
-    /// `window_theme` field, classifying the SAME bg with the SAME predicate
-    /// ([`crate::tab_bar::theme_is_dark`] — which the role pipeline also
-    /// resolves its dark/light side with), so the three move together by
-    /// construction. When the predicate was only nominally shared — the strip's
-    /// Rec.601 luma here against a WCAG relative-luminance split inside
-    /// `native_appearance::roles` — the "already that side" branch below handed
-    /// back a theme whose roles then built the OPPOSITE side for every
-    /// background in the `#979797`..`#ADADAD` band, which is precisely what made
-    /// `window_theme = light` a silent no-op for those themes.
+    /// The CSD variant, strip and native pages classify the same background with
+    /// the same predicate ([`crate::tab_bar::theme_is_dark`], also used by the role
+    /// pipeline), so they always pick the same side.
     pub(crate) fn chrome_palette_theme(&self) -> aterm_render::Theme {
-        // The PIXEL-BAND platforms (Linux + Windows, `STRIP_IS_CHROME_BAND`)
-        // resolve a FORCED `window_theme` into an authored chrome palette so
-        // the WHOLE chrome — tab band and native settings pages — flips to that
-        // variant, not just the OS caption. Before this, only Linux did
-        // (961f7bba); Windows flipped the DWM caption to the stock variant but
-        // kept painting the band + pages the TERMINAL theme, so
-        // `window_theme = "light"` over a dark terminal drew a light titlebar
-        // bolted onto a dark chrome body — the same config, opposite meanings
-        // per platform (owner decision 2026-08-25: match Linux). `Auto` still
-        // passes through on every platform (system-following chrome). macOS
-        // paints its tabs in the native toolbar — no band — so it never
-        // consumes this and keeps the pass-through.
+        // The pixel-band platforms (Linux, Windows; `STRIP_IS_CHROME_BAND`)
+        // resolve a forced `window_theme` into an authored chrome palette so the
+        // whole chrome (tab band and native pages) flips, not just the OS caption
+        // (owner, 2026-08-25).
+        // `Auto` passes through. macOS paints tabs in the native toolbar and keeps
+        // the pass-through.
         #[cfg(any(target_os = "linux", windows))]
         {
             crate::native_appearance::resolve_chrome_palette(self.window_theme, self.theme)
@@ -599,13 +527,10 @@ impl App {
             .and_then(move |id| self.windows.get_mut(&id))
     }
 
-    /// LOGICAL window creation (NO winit): mint a fresh [`WindowId`], spawn a new
-    /// single-tab session at `rows`×`cols`, register it, and install a fresh
-    /// [`WindowState`] as the new frontmost window. Returns the new id, or `None`
-    /// if the spawn failed (in which case NO window is minted — we never leave a
-    /// broken, session-less window behind). This is the fully-testable seam the
-    /// multi-window conformance test drives; `create_window_internal` wraps it with
-    /// the winit surface attach.
+    /// Logical window creation (no winit): mint a fresh [`WindowId`], spawn a
+    /// single-tab session at `rows`×`cols`, register it and install a fresh
+    /// [`WindowState`] as frontmost. `None` if the spawn failed, in which case no
+    /// window is minted. `create_window_internal` wraps it with the surface attach.
     #[allow(
         clippy::too_many_arguments,
         reason = "the window's birth facts — geometry, cwd, the seamless adoptee, the \
@@ -618,17 +543,14 @@ impl App {
         cols: u16,
         cwd_override: Option<&str>,
         adopt: Option<crate::spawn::Adopted>,
-        // Session-connection birth facts (design §2.3 spawn presets), `(None,
-        // None)` for every ordinary open: `lineage_parent` records the origin
-        // as the first session's registry parent (a CONTROLLED window is a
-        // child of its origin; a controller window stays a lineage root — the
-        // shipping `None`), and `observe` injects the CONTROLLER hint env
-        // (`ATERM_OBSERVE_SESSION_ID`) into the newborn's shell.
+        // Session-connection birth facts, `(None, None)` for an ordinary open:
+        // `lineage_parent` records the origin as the first session's registry
+        // parent (a controlled window is a child of its origin), and `observe`
+        // injects the controller hint env (`ATERM_OBSERVE_SESSION_ID`).
         lineage_parent: Option<aterm_session::SessionId>,
         observe: Option<&aterm_session::SessionId>,
-        // The agent identity the first session spawns under (session
-        // identities; `spawn … place=window identity=<name>`), `None` for
-        // every ordinary open and every restore-created window.
+        // The agent identity the first session spawns under (`spawn … place=window
+        // identity=<name>`); `None` for ordinary opens and restores.
         identity: Option<&str>,
     ) -> Option<WindowId> {
         // Mint the window id FIRST so the spawned session's `Wake`s are stamped with
@@ -639,10 +561,9 @@ impl App {
         // A real run always has a proxy; only `headless_for_test` lacks one (and it
         // never calls this — it installs stub sessions directly). Guard, don't panic.
         let proxy = self.proxy.clone()?;
-        // `cwd_override` (RESTORE-1: the persisted first-leaf cwd) wins; otherwise
-        // inherit the cwd of the (still-current) frontmost window's focused pane, so a
-        // new window opens where the user is — frontmost_window is repointed to `wid`
-        // only later, in install_window_state_with_parent.
+        // `cwd_override` (the persisted first-leaf cwd) wins; otherwise inherit the
+        // frontmost window's focused pane cwd. `frontmost_window` moves to `wid`
+        // only later, in `install_window_state_with_parent`.
         let cwd = cwd_override
             .map(str::to_owned)
             .or_else(|| self.frontmost_window.and_then(|w| self.focused_pane_cwd(w)));
@@ -651,11 +572,9 @@ impl App {
             wid,
             rows,
             cols,
-            // CELL-PX-1: `wid` is not in `self.windows` yet, so this resolves through
-            // `win_cell_size`'s documented unknown-window fallback (the live shared
-            // backend) — the best available answer until the attach below records
-            // this window's own metrics, at which point `apply_window_scale`'s
-            // `sync_cell_pixel_size` corrects it.
+            // `wid` is not in `self.windows` yet, so this uses `win_cell_size`'s
+            // unknown-window fallback (the shared backend); `apply_window_scale`'s
+            // `sync_cell_pixel_size` corrects it after attach.
             self.spawn_cell_px(wid),
             &self.session_factory,
             &proxy,
@@ -679,13 +598,9 @@ impl App {
     }
 
     /// Install an already-spawned `session` as the sole tab of a fresh window `wid`
-    /// and make it frontmost. Factored out of `create_window_logical` so the spawn
-    /// (real PTY) and the pure windows/pool/frontmost bookkeeping are separable:
-    /// the unit test drives THIS with a stub `Session`, exercising the real
-    /// frontmost/windows/pool state transitions with no PTY.
-    // Test-only sugar now that the shipping caller (`create_window_logical`)
-    // threads the lineage parent explicitly; the state-transition tests drive
-    // the same body through this `None` wrapper.
+    /// and make it frontmost. Separate from the spawn so tests can drive the
+    /// windows/pool/frontmost transitions with a stub `Session`.
+    // Test-only wrapper with no lineage parent.
     #[cfg(test)]
     pub(crate) fn install_window_state(
         &mut self,
@@ -697,11 +612,9 @@ impl App {
         self.install_window_state_with_parent(wid, session, rows, cols, None);
     }
 
-    /// `install_window_state` with an explicit registry LINEAGE PARENT for the
-    /// window's first session — the session-connections CONTROLLED-window preset
-    /// records `parent = origin` (design §2.3); every ordinary window stays a
-    /// fresh lineage root (`None`, the wrapper above / every shipping caller
-    /// but the connected spawn).
+    /// `install_window_state` with an explicit registry lineage parent for the
+    /// window's first session: a connected controlled window records
+    /// `parent = origin`; every other window is a fresh root (`None`).
     pub(crate) fn install_window_state_with_parent(
         &mut self,
         wid: WindowId,
@@ -711,9 +624,7 @@ impl App {
         lineage_parent: Option<aterm_session::SessionId>,
     ) {
         let sid = session.id;
-        // Clone the mirror Arcs BEFORE moving the session into the pool (the pool
-        // then OWNS it; these are the window's active-tab mirror, source-of-truth in
-        // the pool).
+        // Clone the active-tab mirror Arcs before the pool takes the session.
         let (term, session_vi_active, master, sink, ui_waiting) = (
             session.term.clone(),
             session.vi_active.clone(),
@@ -721,10 +632,9 @@ impl App {
             session.ctx.sink.clone(),
             session.ctx.ui_waiting.clone(),
         );
-        // P1.1: register in the process-wide registry. A new window's first tab has
-        // no parent (it is a fresh root, like session 0) unless a connected spawn
-        // named its origin. Test-only inert sessions
-        // (`master == -1`) are not registered, avoiding phantom control targets.
+        // Register in the process-wide registry. A new window's first tab has no
+        // parent unless a connected spawn named its origin. Inert test sessions
+        // (`master == -1`) are not registered.
         if session.master >= 0 {
             Self::register_session(&self.store, &session, lineage_parent);
         }
@@ -749,12 +659,10 @@ impl App {
         );
         self.windows.insert(wid, ws);
         self.install_window_config_assets(wid);
-        // The new window becomes frontmost (the standard "open and focus" behavior),
-        // and the GLOBAL control/notify handle follows it HERE, in the same seam that
-        // moves the front. Leaving the re-point to each caller is the swallow shape
-        // `active_handle_model` exists to catch: the control socket keeps driving
-        // the PREVIOUS window's session for the new window's whole life (Tier-1:
-        // `active_handle_conformance`).
+        // The new window becomes frontmost, and the global control/notify handle
+        // follows it here, in the same seam that moves the front, so the control
+        // socket never keeps driving the previous window's session
+        // (`active_handle_conformance`).
         self.frontmost_window = Some(wid);
         self.sync_active_session();
         // The status-item glance lists windows now, so a create moves it
@@ -767,23 +675,14 @@ impl App {
         );
     }
 
-    /// Test-only window creation that drives the SAME wid/session-id minting +
+    /// Test-only window creation with the same id minting and
     /// `install_window_state` bookkeeping as [`Self::create_window_logical`], but
-    /// takes a pre-built (stub) `Session` instead of spawning a real PTY — so the
-    /// multi-window state-transition test exercises the real frontmost/windows/pool
-    /// transitions with no event loop and no shell. `session.id` MUST equal the
-    /// caller's `self.next_session_id` so the pool/window ids stay consistent (the
-    /// test builds it that way). Returns the freshly-minted, strictly-increasing id.
+    /// taking a stub `Session` instead of spawning a PTY. `session.id` must equal
+    /// `self.next_session_id`. Returns the new, strictly increasing id.
     ///
-    /// SPEC (TRUST_VACUITY_GATE §2.3 / finding 3): this real seam IS the
-    /// `WindowRouting.CreateWindow` action — minting the next monotonic id, bumping
-    /// `win_count`, and re-pointing `frontmost`. The `#[refines]` makes `window_routing`
-    /// an ACTIVELY-BOUND machine in the gate (so it is coverage-gated, no longer a
-    /// report-only model), and the gate now also RUNS its Tier-1 conformance
-    /// (`run_window_routing_conformance`) — the "already green" claim is no longer a
-    /// conflation of two disconnected tests. PROJECTION
-    /// (`aterm_gui::App::project_window_routing`): `App` → `<<win_count, frontmost,
-    /// next_id, exited>>` (the load-bearing +1 remap is in `window_routing_conformance::project`).
+    /// Refines `WindowRouting.CreateWindow`: mint the next id, bump `win_count`,
+    /// re-point `frontmost`. Projection: `window_routing_conformance::project`
+    /// (lib.rs) → `<<win_count, frontmost, next_id, exited>>`, with the +1 remap.
     #[cfg(test)]
     #[cfg_attr(
         test,
@@ -810,40 +709,34 @@ impl App {
         wid
     }
 
-    /// Full window creation: the logical seam + (when not headless) the winit OS
-    /// window attach. The new window inherits the front window's grid size (or an
-    /// 80×24 default if somehow no window exists). Under headless the window stays
-    /// logical-only (no OS surface); a headless 2nd window is refused EARLIER, at the
-    /// `Wake::CreateWindow` arm, so this stays logical-only there only defensively.
-    /// `cwd_override` (RESTORE-1) starts the first session in a specific directory
-    /// instead of inheriting the frontmost pane's; `None` for every user-driven open.
+    /// Full window creation: the logical seam plus, when not headless, the winit OS
+    /// window attach. The new window inherits the front window's grid (80×24 if no
+    /// window exists). Headless second windows are refused earlier, at
+    /// `Wake::CreateWindow`. `cwd_override` starts the first session in a given
+    /// directory; `None` for user-driven opens.
     pub(crate) fn create_window_internal(
         &mut self,
         el: &ActiveEventLoop,
         cwd_override: Option<&str>,
         adopt: Option<crate::spawn::Adopted>,
     ) -> Option<WindowId> {
-        self.create_window_internal_connected(el, cwd_override, adopt, None, None, None)
+        self.create_window_internal_connected(el, cwd_override, adopt, None, None, None, None)
     }
 
-    /// [`create_window_internal`] with the session-connection birth facts
-    /// threaded through (the §2.3 window presets): `lineage_parent` for a
-    /// CONTROLLED window, `observe` for a CONTROLLER window's env hint. Every
-    /// ordinary open goes through the `(None, None)` wrapper above.
+    /// [`create_window_internal`] with the session-connection birth facts:
+    /// `lineage_parent` for a controlled window, `observe` for a controller
+    /// window's env hint. Ordinary opens use the `(None, None)` wrapper above.
     ///
-    /// SPEC (design §9: the window-routing obligations): this real seam IS the
-    /// `WindowRouting.ConnectedCreateWindow` action — the `spawn connected=
-    /// place=window` mint: the same monotonic-id/`win_count`/`frontmost`
-    /// bookkeeping as `CreateWindow` (via `create_window_logical`), with the
-    /// hosted-origin precondition already enforced by
-    /// [`App::connected_spawn_precheck`] (a live origin ⇒ `win_count > 0`;
-    /// headless `place=window` is refused before any create). The `#[refines]`
-    /// keeps `window_routing` fully bound now that the act exists; Tier-1
-    /// validates the mint transition against this arm in
-    /// `window_routing_conformance` (through the shared logical minting seam —
-    /// this fn itself needs an `ActiveEventLoop`). PROJECTION
-    /// (`aterm_gui::App::project_window_routing`): the
-    /// `window_routing_conformance::project` tuple.
+    /// `carried` is a restored window's frame ([`CarriedFrame`], an update's or
+    /// a cold restore's): the window is created at its grid instead of the
+    /// front window's, and first attached at its raw inner size when that holds
+    /// the grid. `None` for every other open.
+    ///
+    /// Refines `WindowRouting.ConnectedCreateWindow` (`spawn connected=
+    /// place=window`): the same minting as `CreateWindow`, with the hosted-origin
+    /// precondition enforced by [`App::connected_spawn_precheck`]. Tier-1 checks
+    /// the mint in `window_routing_conformance` through the shared logical seam,
+    /// since this fn needs an `ActiveEventLoop`.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -851,6 +744,12 @@ impl App {
             action = "ConnectedCreateWindow",
             project = "aterm_gui::App::project_window_routing"
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the window's birth facts — cwd, the seamless adoptee, the connection \
+                  lineage, the agent identity and an update's carried frame — are each a \
+                  per-open datum, as in `create_window_logical`"
     )]
     pub(crate) fn create_window_internal_connected(
         &mut self,
@@ -860,8 +759,9 @@ impl App {
         lineage_parent: Option<aterm_session::SessionId>,
         observe: Option<&aterm_session::SessionId>,
         identity: Option<&str>,
+        carried: Option<CarriedFrame>,
     ) -> Option<WindowId> {
-        let (rows, cols) = self.front().map_or((80, 24), |ws| (ws.rows, ws.cols));
+        let ((rows, cols), carried_inner_px) = self.new_window_frame(carried);
         let wid = self.create_window_logical(
             rows,
             cols,
@@ -871,46 +771,44 @@ impl App {
             observe,
             identity,
         )?;
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.take_carried_frame(
+                carried_inner_px,
+                carried.is_some_and(|frame| frame.presence_row),
+            );
+        }
         if !self.headless && !self.attach_os_window(el, wid) {
             // GPU surface failed: roll back the just-created window + its fresh
             // session rather than leave a present-less black window.
             self.close_window_logical(wid);
             return None;
         }
-        // `install_window_state_with_parent` already re-pointed the global handle
-        // at the new front; sync once more now that the OS surface exists, so the
-        // title nudge (which needs the window) lands immediately rather than at
-        // the first redraw. On the attach-failure path above, `close_window_logical` already
-        // re-synced the surviving front.
+        // Sync again now that the OS surface exists so the title lands
+        // immediately. On attach failure `close_window_logical` already re-synced
+        // the surviving front.
         self.sync_active_session();
         Some(wid)
     }
 
-    /// The SINGLE join point for a windowed cold launch's deferred backend build
-    /// (#7 tail): take the `Pending` handle, join it, and run the setup `main`
-    /// used to run right after its early join — the `metrics` backend tag, the
-    /// 1× pad seed (re-applied at the window's real scale by the caller), the
-    /// GPU bloom config, and the text shaping + font-feature warnings.
-    /// Idempotent: a `Ready` slot returns immediately (every non-first attach,
-    /// and always in headless).
+    /// The single join point for a windowed cold launch's deferred backend build:
+    /// take the `Pending` handle, join it, and run the post-join setup (`metrics`
+    /// backend tag, 1× pad seed, GPU bloom config, shaping and font-feature
+    /// warnings). A `Ready` slot returns immediately.
     ///
-    /// A backend-build panic is a launch-fatal loss of the only renderer: exit
-    /// with a one-line failure — the same outcome class as the old pre-`run_app`
-    /// `.expect` — never a half-attached window.
+    /// A backend-build panic loses the only renderer: exit with a one-line
+    /// failure, never a half-attached window.
     pub(crate) fn finalize_backend(&mut self) {
         let BackendSlot::Pending(handle) = &mut self.backend else {
             return;
         };
         let handle = handle.take().expect("finalize_backend re-entered mid-join");
-        let (backend, use_gpu, font_family_admitted) = handle.join().unwrap_or_else(|_| {
+        let (backend, use_gpu, font_family_rejected) = handle.join().unwrap_or_else(|_| {
             crate::logging::stderr_line!(
                 "aterm-gui: backend-build thread panicked; no renderer — exiting"
             );
-            // The launch-fatal terminator, not `exit(3)`: this fires with the OS
-            // window already created and the GPU driver loaded, so running the
-            // driver's static destructors here aborts underneath its own live
-            // threads — the same death `fatal_launch_error` was measured taking.
-            // See `crate::exit_without_process_teardown`.
+            // Not `exit(3)`: the OS window and GPU driver are live, and running the
+            // driver's static destructors under its own threads aborts. See
+            // `crate::exit_without_process_teardown`.
             crate::exit_without_process_teardown(1);
         });
         assert!(
@@ -919,92 +817,65 @@ impl App {
         );
         self.backend = BackendSlot::Ready(backend);
         self.use_gpu = use_gpu;
-        // A WARM MISS (warm successor P2): the worker built this backend before
-        // the dial at the launch hint's size, and the authenticated carry
-        // selected another. Select it now, before anything measures a cell —
-        // the light size switch every zoom takes (`activate_px`), which keeps
-        // the sealed faces and the warm glyphs at the hinted size resident.
+        // Warm miss: the worker built this backend at the launch hint's size
+        // and the authenticated carry selected another. Switch now, before
+        // anything measures a cell, via the light zoom path (`activate_px`).
         if let Some(px) = self.warm_miss_px.take() {
             self.backend.activate_px(px);
         }
-        // The worker is the thread that resolved the configured family (the
-        // one resolve at startup); a family it rejected was seeded
-        // optimistically in `main_entry` and must not survive as the live
-        // rebuild source — `None` names the built-in candidate regime the
-        // published renderer actually uses.
-        if !font_family_admitted {
+        // The worker resolved the configured family. A family it rejected was
+        // seeded optimistically in `main_entry` and must not stay the rebuild
+        // source; `None` names the built-in candidates the renderer uses. The
+        // refusal is reported here, at the join.
+        if let Some(warning) = font_family_rejected {
+            crate::say_font_family_rejected(&warning);
             self.font_family = None;
         }
         crate::metrics::set_backend_gpu(use_gpu);
-        // Seed the interior padding at 1×, exactly as the old pre-`run_app` join
-        // did; `attach_os_window` re-applies it at the window's real scale.
-        // Config-resolved so a set `window_padding` shapes the first frame too.
+        // Seed interior padding at 1× (config-resolved); `attach_os_window`
+        // re-applies it at the window's real scale.
         self.backend.set_pad(self.cfg_pad_for_scale(1.0));
-        // Seed the chrome headroom at 0 (no NSWindow measured yet);
-        // `attach_os_window` re-applies the real titlebar band post-attach.
+        // Chrome headroom starts at 0; `attach_os_window` applies the titlebar band.
         self.backend.set_head(0);
-        // GPU cursor-comet BLOOM settings from config (GPU backend only; the
-        // CPU/software path has no bloom). Set before the first present so the
-        // per-window bloom target is built alongside the offscreen.
+        // GPU cursor-comet bloom from config, set before the first present so the
+        // per-window bloom target is built with the offscreen. GPU only.
         self.pin_gpu_effect_config();
-        // The build worker already applied and sealed the complete font
-        // generation before publishing this backend. Re-pin only memory-backed
-        // shaping/typography/render knobs here; reopening configured font paths
-        // on the event-loop thread would violate the worker-only seal contract
-        // and serialize hundreds of MB of fallback parsing before first paint.
+        // The worker applied and sealed the font generation. Re-pin only
+        // memory-backed shaping/typography/render knobs; reopening font paths here
+        // would break the worker-only seal and delay first paint.
         self.pin_backend_render_config_core();
         // Once-only font-feature diagnostics — now that the backend carries the
         // shaping AND the resolved font config, so the font probe is accurate.
         self.warn_font_feature_issues();
-        // NOT `sync_chrome_fonts()` here. It hands the terminal face to the chrome
-        // rasterizer so Settings/About/Palette render in the user's font, and it
-        // costs ~295 ms (a ChromeFace parse of the resolved face plus a semantic
-        // surface fork) — measured on the event-loop thread, INSIDE the window-attach
-        // bracket, i.e. squarely between launch and the first frame. Nothing the
-        // first terminal frame draws reads those faces: every `tray_raster`
-        // consumer is an overlay (Settings, About, Palette, the modal trays) that
-        // only exists after a deliberate user action. So it runs on the
-        // first-present hook in `app_render` instead, where it is off time-to-glass
-        // and still far earlier than any overlay can be opened.
+        // Not `sync_chrome_fonts()`: it parses the face for the chrome rasterizer
+        // (hundreds of ms) and only overlays opened by the user read it, so it runs
+        // on the first-present hook in `app_render`, off time-to-glass.
 
-        // CELL-PX-1: THE JOIN IS THE FIRST INSTANT REAL FONT METRICS EXIST. The BOOT
-        // session was spawned before it — deliberately, so the window-server round
-        // trip overlaps the build — and therefore carries the engine's 8x16
-        // placeholder (`spawn_session(.., cell_px: None, ..)`). Push every window's
-        // real cell box the moment it is knowable, so a shell that emits an OSC 1337
-        // image or a DEC 1016 report in its FIRST bytes is already answered from the
-        // font, not the placeholder. `apply_window_scale` re-pushes if this window's
-        // display resolves a different scale a moment later (the memo keys on the
-        // resolved cell size, so that second push is not suppressed).
+        // The join is the first moment real font metrics exist. The boot session
+        // was spawned before it with the engine's 8x16 placeholder, so push every
+        // window's real cell box now; a shell's first OSC 1337 image or DEC 1016
+        // report is then answered from the font. `apply_window_scale` re-pushes if
+        // the display resolves another scale (the memo keys on the cell size).
         //
-        // A THIRD contract now reads this push, and it is the one with teeth: the
-        // XTWINOPS pixel reports (`CSI 14 t` text area, `CSI 16 t` cell size —
-        // what a sixel or image-capable TUI asks before it decides how big to
-        // draw). Those answer ONLY from a host-reported cell box and stay silent
-        // until one arrives, because a placeholder handed back as a measurement
-        // would send the application off to render at a font size that exists
-        // nowhere. So this push is not merely an accuracy improvement for them —
-        // it is the difference between a truthful answer and no answer at all.
-        // See `Terminal::host_cell_pixel_size` and `handler_window`.
+        // The XTWINOPS pixel reports (`CSI 14 t`, `CSI 16 t`) answer only from a
+        // host-reported cell box and stay silent until one arrives. See
+        // `Terminal::host_cell_pixel_size` and `handler_window`.
         let windows: Vec<WindowId> = self.windows.keys().copied().collect();
         for wid in windows {
             self.sync_cell_pixel_size(wid);
         }
     }
 
-    /// Pin the GPU-only effect/swapchain knobs (bloom, shimmer, the H1 backdrop
-    /// margins, the M3 EDR opt-in and its SDR twin) from config onto a freshly
-    /// constructed GPU backend. Extracted verbatim from [`Self::finalize_backend`]
-    /// so the H1 fail-soft rebuild ([`Self::retry_attach_on_opaque_swapchain`])
-    /// re-pins exactly what the deferred join pins — one seam, never two lists.
-    /// No-op on the CPU backend.
+    /// Pin the GPU-only effect/swapchain knobs (bloom, shimmer, backdrop margins,
+    /// EDR opt-in and its SDR twin) from config onto a freshly built GPU backend.
+    /// Shared by [`Self::finalize_backend`] and
+    /// [`Self::retry_attach_on_opaque_swapchain`]. No-op on the CPU backend.
     pub(crate) fn pin_gpu_effect_config(&mut self) {
         let gpu_post_fx = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::GpuPostFx);
         // Per-style bloom radius (rainbow kitty 1.8, else 2.2; the knob
-        // overrides): the same config-generation presentation the frame path
-        // reads, resolved before the `&mut` backend borrow.
+        // overrides), resolved before the `&mut` backend borrow.
         let bloom_radius = self
             .config
             .cursor_trail_bloom_radius_or_default(self.trail_presentation());
@@ -1017,54 +888,40 @@ impl App {
             // Heat shimmer above burning cells (the bloom's parity class —
             // GPU only, like the bloom; the CPU path has no shimmer).
             g.set_shimmer(gpu_post_fx && self.config.cursor_fire_shimmer_or_default());
-            // H1 (Windows Mica/Acrylic): mirror the material knob onto the
-            // renderer BEFORE any window surface exists, so a backdrop-config
-            // first window is configured PreMultiplied at attach and its very
-            // first frame carries the margin alpha. Inert unless the GPU
-            // context was actually built on the DComp visual path (the
-            // renderer double-keys on `ctx.visual_swapchain`), so macOS/Linux
-            // and every default Windows run are byte-identical.
+            // Windows Mica/Acrylic: mirror the material knob before any surface
+            // exists so the first window is configured PreMultiplied at attach.
+            // Inert unless the context was built on the DComp visual path.
             g.set_backdrop_margins(
                 self.render_knobs.background_material
                     != crate::app_config::BackgroundMaterial::None,
             );
-            // M3 phase B: the EDR cursor glow opt-in (default off). Set BEFORE any
-            // window surface exists so an opted-in first window gets the
-            // Rgba16Float extended-linear swapchain at attach. Ordered AFTER the
-            // backdrop mirror above: on a visual instance the renderer forces
-            // the HDR opt-in off (the two swapchains are mutually exclusive)
-            // and prints the diagnostic exactly once.
+            // The EDR cursor glow opt-in (default off), set before any surface
+            // exists so an opted-in first window gets the Rgba16Float swapchain.
+            // After the backdrop mirror: on a visual instance the renderer forces
+            // HDR off (the swapchains are exclusive) and logs it once.
             g.set_hdr_glow(self.config.hdr_glow_or_default());
             // SDR twin: the swapchain-side crown budget for non-HDR desktops.
             g.set_sdr_glow_boost(self.config.cursor_glow_sdr_boost_or_default());
         }
     }
 
-    /// H1 fail-soft (Windows): a window's GPU swapchain attach just failed with
-    /// `first_error`. Consult [`aterm_gpu::surface_attach_fallback`]; unless the
-    /// verdict is `RebuildOpaque` (first/only window on a DirectComposition
-    /// visual instance — "DComp unavailable", which the renderer now reports as
-    /// `Err` instead of wgpu's default-handler panic), hand the error straight
-    /// back so the pre-H1 arms (decline this window / CPU downgrade) run
-    /// byte-identically. Otherwise: withdraw the visual latch, build a second
-    /// GPU renderer on a FRESH instance (the presentation system is
-    /// instance-level, so the opaque HWND swapchain needs a new one), re-pin
-    /// every renderer knob through the same seams the deferred join uses, and
-    /// retry the attach ONCE on the new renderer. The just-created window keeps
-    /// its `WS_EX_NOREDIRECTIONBITMAP` — harmless to a flip-model HWND
-    /// swapchain (Windows Terminal ships it unconditionally). A failed rebuild
-    /// leaves the current backend untouched and returns `first_error`; a failed
-    /// retry returns ITS error with the opaque backend installed — either way
-    /// the caller's CPU arm still works (`cpu_renderer_from_admitted` forks the
-    /// sealed face of whichever GPU renderer is live).
+    /// Windows fail-soft: a window's GPU swapchain attach failed with
+    /// `first_error`. Unless [`aterm_gpu::surface_attach_fallback`] says
+    /// `RebuildOpaque` (first window on a DirectComposition visual instance with
+    /// DComp unavailable), return the error so the caller declines the window or
+    /// downgrades to CPU. Otherwise withdraw the visual latch, build a GPU
+    /// renderer on a fresh instance (presentation is instance-level), re-pin
+    /// every knob through the join's seams, and retry the attach once. The
+    /// window keeps `WS_EX_NOREDIRECTIONBITMAP`, harmless to a flip-model HWND
+    /// swapchain. A failed rebuild leaves the backend untouched and returns
+    /// `first_error`; a failed retry returns its own error with the opaque
+    /// backend installed. The caller's CPU arm works either way.
     #[cfg(windows)]
     fn retry_attach_on_opaque_swapchain(
         &mut self,
         first_error: String,
         window: &Arc<Window>,
         (w_px, h_px): (u32, u32),
-        scale: f64,
-        head: usize,
     ) -> Result<aterm_gpu::GpuSurface, String> {
         let other_gpu = self
             .windows
@@ -1080,11 +937,9 @@ impl App {
              falling back to the opaque swapchain — background_material styles the caption \
              only this run"
         );
-        // The honesty half: this runs during the FIRST attach, before any window is
-        // on glass, on a process whose stderr a Start-Menu launch discarded. Queue
-        // the message for the band (design R6) and latch the cause so `aterm-ctl
-        // chrome` reads `client=opaque(dcomp_unavailable)` rather than a bare
-        // `opaque` that could mean five different things.
+        // This runs during the first attach, before anything is on glass and with
+        // stderr possibly discarded: queue the message for the band and latch the
+        // cause so `aterm-ctl chrome` reads `client=opaque(dcomp_unavailable)`.
         crate::message_inbox::queue_message(crate::message_reporters::backdrop_declined(
             "background_material is styling the title bar only",
             "this display stack refused the DirectComposition backdrop swapchain, so the \
@@ -1109,14 +964,13 @@ impl App {
         // Replacing the renderer destroys any virtual tap (none can be live at
         // a first attach, but the rebuild path's contract is kept whole).
         let _ = self.video_abort_backend_rebuild();
-        self.backend = BackendSlot::Ready(Backend::Gpu(GpuBackend::new(rebuilt)));
+        // Carries the pad, top pad and head the attach applied at this window's
+        // scale.
+        self.backend
+            .swap_renderer(Backend::Gpu(GpuBackend::new(rebuilt)));
         // `use_gpu` / the metrics backend tag are unchanged: GPU stays GPU.
-        self.reset_gpu_window_caches();
-        // Mirror the CPU arm's re-pin (pad/head at this window's scale), then
-        // the deferred join's two knob seams, on the fresh renderer.
-        self.backend.set_pad(self.cfg_pad_for_scale(scale));
-        self.backend.set_pad_top(self.cfg_pad_top_for_scale(scale));
-        self.backend.set_head(head);
+        self.reset_window_raster_caches();
+        // The deferred join's two knob seams, on the fresh renderer.
         self.pin_gpu_effect_config();
         self.pin_backend_render_config_core();
         self.backend
@@ -1125,18 +979,12 @@ impl App {
             .create_window_surface(window.clone(), w_px, h_px)
     }
 
-    /// The window a NEW window should be offset from: the most recently FOCUSED
-    /// other window that still owns an OS window, falling back to the highest-id
-    /// other attached window when no focus history exists (a restore loop creating
-    /// several windows back-to-back, or a control-driven open before any
-    /// `Focused(true)` arrives).
+    /// The window a new window is offset from: the most recently focused other
+    /// window that owns an OS window, else the highest-id other attached window.
     ///
-    /// `frontmost_window` is deliberately NOT the source: every creation path
-    /// re-points it at the brand-new window BEFORE the OS surface attaches, so it
-    /// would name the very window being placed. `focus_order`'s last entry is still
-    /// the window the user was actually in — the new one is not in it yet, since
-    /// nothing has focused it. `None` means this is the only window on glass:
-    /// nothing to avoid, so the OS's own (centred) placement stands.
+    /// Not `frontmost_window`: creation re-points it at the new window before the
+    /// surface attaches. `None` means this is the only window, so the OS
+    /// placement stands.
     fn cascade_anchor_window(&self, new: WindowId) -> Option<Arc<Window>> {
         let attached: Vec<WindowId> = self
             .windows
@@ -1149,10 +997,8 @@ impl App {
     }
 
     /// The usable placement rectangle of the screen `window` occupies, in points:
-    /// the real work area when the platform can measure one (macOS: menu bar and
-    /// Dock excluded), else the winit monitor rectangle — the FULL display. Off
-    /// macOS that fallback only makes the cascade wrap a little later than it
-    /// ideally would; it never places a window wrongly.
+    /// the real work area where measurable (macOS), else the winit monitor
+    /// rectangle, which only makes the cascade wrap slightly later.
     fn work_area_pts(&self, window: &Window) -> Option<WorkAreaPts> {
         if let Some(area) = self.apprt.window_work_area_pts(window) {
             return Some(area);
@@ -1169,24 +1015,17 @@ impl App {
         })
     }
 
-    /// Offset a freshly created 2nd..Nth window down-and-right of the window it was
+    /// Offset a freshly created 2nd..Nth window down-right of the window it was
     /// opened from, so that window stays visible behind it.
     ///
-    /// winit gives a window it creates with no explicit position the OS default
-    /// placement, and on macOS that is `NSWindow::center` — so a new window, which
-    /// inherits the front window's grid and therefore its exact size, lands
-    /// pixel-perfectly ON TOP of it and Cmd-N reads as "nothing happened". Every
-    /// new-window path funnels through `attach_os_window`, so placing it there
-    /// covers Cmd-N, Move Tab to New Window, Open Session in New Window, and the
-    /// restore loop's extra windows alike.
+    /// The OS default placement (macOS: `NSWindow::center`) would put a same-size
+    /// window exactly on top of its parent. Every new-window path goes through
+    /// `attach_os_window`, so placing it here covers them all.
     ///
-    /// Called AFTER the real frame size is known (the frame is what decides where
-    /// the cascade must wrap) and BEFORE the surface exists, so no present has
-    /// happened yet and the window never visibly hops. Best-effort in every
-    /// direction — no other window (the first window), an unreadable position, or
-    /// degenerate screen geometry all simply leave the OS placement in force.
-    /// Callers carrying an EXPLICIT position (session restore, the seamless-update
-    /// window carry) apply theirs after the attach and deliberately win over this.
+    /// Called after the frame size is known and before the surface exists, so the
+    /// window never visibly hops. Best-effort: no other window, an unreadable
+    /// position or degenerate geometry leave the OS placement. Callers with an
+    /// explicit position (restore, update carry) apply it afterwards and win.
     fn cascade_window_placement(&self, new: WindowId, window: &Window) {
         let Some(anchor) = self.cascade_anchor_window(new) else {
             return;
@@ -1197,9 +1036,8 @@ impl App {
         let Some(area) = self.work_area_pts(&anchor) else {
             return;
         };
-        // Points, not pixels: the anchor and the new window can sit on displays with
-        // different scale factors, and winit's physical coordinates are each scaled
-        // by their own display's factor — only the logical space is common.
+        // Points, not pixels: the windows can sit on displays with different
+        // scale factors; only the logical space is common.
         let anchor_pts = anchor_origin.to_logical::<f64>(anchor.scale_factor());
         let frame_pts = window.outer_size().to_logical::<f64>(window.scale_factor());
         let Some((x, y)) = cascade_top_left_pts(
@@ -1210,10 +1048,7 @@ impl App {
         ) else {
             return;
         };
-        // Where a window lands is otherwise invisible to everything but the eye:
-        // no control verb reports a frame's screen origin, and the OS placement it
-        // replaces leaves no trace. One debug-level record (coordinates and
-        // screen metrics only — never window content) makes the decision auditable.
+        // Coordinates and screen metrics only, never window content.
         aterm_log::debug!(
             "window {} placed at ({x:.0},{y:.0}) pt, cascaded from ({:.0},{:.0}) — frame {:.0}x{:.0} in work area {:.0}x{:.0}+{:.0}+{:.0}",
             new.0,
@@ -1229,48 +1064,99 @@ impl App {
         window.set_outer_position(LogicalPosition::new(x, y));
     }
 
-    /// Create the OS window + present surface for logical window `wid` and attach
-    /// them to its [`WindowState`]. Factored out of `resumed` so it serves BOTH the
-    /// first window (at `resumed`) and every Cmd-N 2nd..Nth window (at
-    /// `create_window_internal`). Sizes the OS window from the window's stored grid,
-    /// installs the macOS menu (FIRST window only), and builds the GPU or CPU present
-    /// target. NEVER called in headless (no OS window is ever created there). A
-    /// missing `wid` (stale) is a silent no-op on the present-target writes.
-    /// Returns `true` iff the OS window was created AND a present target installed.
-    /// `false` means an OS-window, GPU-swapchain, or CPU-surface creation failure: the
-    /// just-created OS window (if any) is dropped rather than installed present-less
-    /// (which would show a permanently black window), and the caller rolls back the
-    /// logical window (or, for the first window, exits). Every failure path is
-    /// fail-SOFT — declining just this window — never a process-wide panic that would
-    /// also destroy every other live window/session.
+    /// The grid a new window is created at, and the raw inner size its first
+    /// attach may size to ([`Self::attach_frame_px`]): a restored window's
+    /// carried frame ([`CarriedFrame`]), else the front window's grid (or an
+    /// 80×24 default if somehow no window exists) and no size.
+    pub(crate) fn new_window_frame(
+        &self,
+        carried: Option<CarriedFrame>,
+    ) -> ((u16, u16), Option<PhysicalSize<u32>>) {
+        match carried {
+            Some(frame) => ((frame.rows, frame.cols), Some(frame.inner_px)),
+            None => (self.front().map_or((80, 24), |ws| (ws.rows, ws.cols)), None),
+        }
+    }
+
+    /// The size window `wid` is attached at: the exact frame of its
+    /// `rows`×`cols` grid, or `carried` — a restored window's raw inner size
+    /// (`WindowState::carried_inner_px`: an update successor's window 0's
+    /// from [`crate::session_store::WindowCarry::inner_px`], every further
+    /// window's from [`crate::restore::WindowLayout::inner_px`], an update's
+    /// or a cold restore's) — when that size holds exactly this grid at this
+    /// window's metrics: the launch's font and the window's scale.
+    ///
+    /// A font zoom re-grids inside the window it has, so a zoomed parent's
+    /// window is its grid's frame plus a remainder of less than one cell per
+    /// axis. Sizing the successor to the bare frame dropped the remainder, and
+    /// the zoom back out then fitted a row and a column fewer than it had
+    /// (P6, finding 4). The check keeps the window's grid the carried one:
+    /// a size outside `[frame, frame + one cell)` on either axis (another
+    /// display scale, another chrome band, a cold launch at the configured
+    /// font after a zoomed quit, a hostile manifest) is not the window's
+    /// remainder, and the exact frame is used as before.
+    pub(crate) fn attach_frame_px(
+        &self,
+        wid: WindowId,
+        rows: u16,
+        cols: u16,
+        carried: Option<PhysicalSize<u32>>,
+    ) -> PhysicalSize<u32> {
+        let exact = self.window_frame_px_for(wid, rows, cols);
+        let Some(carried) = carried else {
+            return exact;
+        };
+        let (cell_w, cell_h) = self.win_cell_size(wid);
+        let remainder = |got: u32, frame: u32, cell: usize| {
+            got.checked_sub(frame)
+                .is_some_and(|extra| (extra as usize) < cell)
+        };
+        if remainder(carried.width, exact.width, cell_w)
+            && remainder(carried.height, exact.height, cell_h)
+            && self.grid_dims_for(wid, carried) == (rows, cols)
+        {
+            return carried;
+        }
+        aterm_log::info!(
+            "restore: window {}'s carried size {}x{} does not hold the carried \
+             {cols}x{rows} grid here (its frame is {}x{}); sized to the frame",
+            wid.0,
+            carried.width,
+            carried.height,
+            exact.width,
+            exact.height
+        );
+        exact
+    }
+
+    /// Create the OS window and present surface for logical window `wid` and
+    /// attach them to its [`WindowState`]; used for the first window (at `resumed`)
+    /// and every later one (`create_window_internal`). Sizes the OS window from the
+    /// stored grid, installs the macOS menu (first window only) and builds the GPU
+    /// or CPU present target. Never called headless. A stale `wid` is a no-op.
+    /// Returns `true` iff the OS window was created and a present target installed.
+    /// On failure the just-created OS window is dropped (never installed
+    /// present-less) and the caller rolls back the logical window, or exits for
+    /// the first. Failures decline only this window, never panic.
     #[must_use]
     pub(crate) fn attach_os_window(&mut self, el: &ActiveEventLoop, wid: WindowId) -> bool {
         let (rows, cols) = self
             .windows
             .get(&wid)
             .map_or((0, 0), |ws| (ws.rows, ws.cols));
-        // (#7 tail) FIRST window while the backend build is still in flight:
-        // create the OS window BEFORE joining, so the AppKit window-server round
-        // trip overlaps the GPU device/pipeline/font tail instead of being
-        // serialized behind it. Its initial size comes from ESTIMATED cell
-        // metrics (`seed_cell_px` at the old 1× pad seed) and it is created
-        // HIDDEN; the join + the existing `request_inner_size` correction below
-        // fix the size before the first show, so the seed is never on glass (no
-        // size jump on 1× displays, no unthemed flash). Every non-first attach
-        // (Cmd-N) sees a Ready slot — byte-identical behavior to before.
+        // First window while the backend build is in flight: create the OS window
+        // before joining so the window-server round trip overlaps the GPU/font
+        // build. It is created hidden at estimated cell metrics (`seed_cell_px`);
+        // the join and the `request_inner_size` correction below fix the size
+        // before it is shown. Later attaches see a Ready slot.
         let pending_join = self.backend.is_pending();
-        // Startup-only drill-down. Every successful installation offers these
-        // stamps to a process-wide OnceLock. The first successful surface wins;
-        // later Cmd-N windows cannot replace it. Do NOT key this to `pending_join`:
-        // an early proxy Wake may legitimately finalize the backend before the
-        // first `resumed` attach reaches this function.
+        // Startup drill-down: every successful install offers these stamps to a
+        // process-wide OnceLock and the first wins. Not keyed to `pending_join`,
+        // since an early proxy Wake may finalize the backend before this attach.
         let startup_attach_entry = Instant::now();
-        // The window holds the terminal grid PLUS the tab-strip rows at the top PLUS
-        // independent configured top and base bottom padding. `window_frame_px_for`
-        // folds in both; with both zero this is the original `rows * ch`. Chrome headroom
-        // is deliberately 0 here — no NSWindow exists yet to
-        // measure a titlebar band; the post-attach `set_head` + size recompute
-        // below fold it in before the window is ever shown.
+        // The window holds the grid, the tab-strip rows and configured top/bottom
+        // padding (`window_frame_px_for`). Chrome headroom is 0 here; the
+        // post-attach `set_head` and size recompute add it before first show.
         let mut size = if pending_join {
             let (cw, ch) = seed_cell_px(self.font_px);
             let pad = self.cfg_pad_for_scale(1.0);
@@ -1286,38 +1172,17 @@ impl App {
         let attrs = Window::default_attributes()
             .with_title("aterm")
             .with_inner_size(size);
-        // WINDOWS: point the window at the aterm icon compiled into this exe.
+        // Windows: point the window at the icon compiled into this exe. DWM reads
+        // the window's icon via WM_GETICON / the class GCLP_HICON, and winit
+        // registers its class with no icon, so without WM_SETICON the caption and
+        // Alt-Tab show the generic exe glyph.
         //
-        // (Windows arm first, Linux arm below — each shadows `attrs` under its
-        // own `#[cfg]`, so exactly one applies per target and the other target's
-        // bytes are untouched.)
+        // `None` loads the SM_CXICON-sized frame for the big icon; the small icon
+        // asks for the .ico's hand-tuned 16 px frame explicitly.
         //
-        // Embedding the icon is NOT enough on its own. Explorer reads the exe's
-        // icon resource directly, but the *window* chrome does not: DWM asks the
-        // HWND via WM_GETICON, falls back to the window class's GCLP_HICON, and
-        // winit registers its class with no icon — so the caption, Alt-Tab and
-        // Task View all showed the generic exe glyph (measured on the shipped
-        // build: WM_GETICON(SMALL)=0, WM_GETICON(BIG)=0, GCLP_HICON=0). winit
-        // turns these two attributes into the WM_SETICON pair, which is what
-        // actually closes it.
-        //
-        // Sizes: `None` means LR_DEFAULTSIZE, which loads the frame matching
-        // SM_CXICON (32 px at 100%, DPI-scaled) — right for the big/taskbar
-        // icon. The small icon wants SM_CXSMICON, but LoadImage has no
-        // "default SMALL size" spelling, so 16 is asked for explicitly; the .ico
-        // carries a hand-tuned 16 px frame (its ladder is 16/32/48/64/128/256),
-        // which beats letting the shell downscale a 32. The honest cost is that
-        // above 100% DPI Windows scales that 16 up to a 20/24 px caption slot
-        // rather than picking the 32; reading SM_CXSMICON to do better would
-        // mean a GetSystemMetrics FFI declaration in this file for a handful of
-        // caption pixels, which is not worth the surface.
-        //
-        // Failure is silent on purpose: `from_resource` errors only when the exe
-        // has no such resource (a build whose resource compiler was missing —
-        // build.rs already printed a banner about it), and the fallback is
-        // precisely today's behaviour, so there is nothing new to tell the user
-        // at launch time. Do NOT eprintln here: this is a GUI-subsystem binary
-        // and it would either go nowhere or spam a launching console every run.
+        // Failure is silent: `from_resource` fails only when the build had no
+        // resource compiler (build.rs already warned), and this is a GUI-subsystem
+        // binary with no useful stderr.
         #[cfg(windows)]
         let attrs = {
             use winit::platform::windows::{IconExtWindows as _, WindowAttributesExtWindows as _};
@@ -1328,41 +1193,24 @@ impl App {
                 .ok()
                 .or_else(|| big.clone());
             let attrs = attrs.with_window_icon(small).with_taskbar_icon(big);
-            // H1 (Windows Mica/Acrylic): a window presented through the
-            // DirectComposition VISUAL swapchain must be created WITHOUT the GDI
-            // redirection bitmap (`WS_EX_NOREDIRECTIONBITMAP`) — DWM composites
-            // the redirection surface UNDER the visual tree, filled with the
-            // class background brush, so leaving it in place would paint an
-            // opaque layer exactly where the transparent padding is supposed to
-            // reveal the Mica/Acrylic backdrop (the feature would silently
-            // degrade to today's opaque look). Keyed to the REQUEST latch, not
-            // the (possibly still-building) GPU context: window creation
-            // deliberately overlaps the backend build (#7), so the ground truth
-            // is not yet known here. The build thread's failure arm withdraws
-            // the latch, so only a first window racing a failing GPU init can
-            // end up no-redirection + softbuffer (diagnosed loudly there).
-            // Harmless with a live HWND swapchain too (flip-model present does
-            // not use the redirection surface — Windows Terminal ships this
-            // style unconditionally), but scoped to the backdrop opt-in anyway
-            // so the default window bytes stay untouched.
+            // A window presented through the DirectComposition visual swapchain is
+            // created without the GDI redirection bitmap
+            // (`WS_EX_NOREDIRECTIONBITMAP`); DWM would composite it, filled with
+            // the class brush, under the visual tree and hide the Mica/Acrylic
+            // backdrop. Keyed to the request latch because the GPU context may
+            // still be building; the build thread's failure arm withdraws it.
+            // Scoped to the backdrop opt-in so default windows are unchanged.
             if aterm_gpu::dx12_visual_swapchain_requested() {
                 attrs.with_no_redirection_bitmap(true)
             } else {
                 attrs
             }
         };
-        // LINUX WINDOW IDENTITY + FLOOR. `with_name` is the Wayland `app_id`
-        // AND the X11 `WM_CLASS` (one shared attribute serves both backends):
-        // without it the compositor sees an EMPTY app id — GNOME shows the
-        // generic gear icon, refuses to group aterm windows, and can never
-        // match `aterm.desktop` (which tools/install.sh now ships, with the
-        // hicolor icons; icon/pinning/dock/launcher identity all key on
-        // this string equalling the desktop-file basename). Keep it `"aterm"`
-        // and lowercase-stable across releases for exactly that reason. The min
-        // size is the smallest LEGAL grid — the 20-col × 5-row clamp floor at
-        // the 12 px base font plus strip row and padding, in LOGICAL px so
-        // HiDPI scales it — a floor `resize`/WM hints cannot collapse to a
-        // sub-cell sliver. macOS/Windows attrs are byte-identical to before.
+        // Linux identity and minimum size. `with_name` is the Wayland `app_id` and
+        // X11 `WM_CLASS`; it must equal the `aterm.desktop` basename for icon,
+        // grouping and launcher matching, so keep it `"aterm"`. The minimum is
+        // the smallest legal grid (20 cols × 5 rows at the 12 px base font plus
+        // strip row and padding), in logical px.
         #[cfg(target_os = "linux")]
         let attrs = {
             use winit::platform::wayland::WindowAttributesExtWayland;
@@ -1370,21 +1218,17 @@ impl App {
                 .with_name("aterm", "aterm")
                 .with_min_inner_size(winit::dpi::LogicalSize::new(164.0, 98.0))
         };
-        // a11y: AccessKit must attach BEFORE the window is first shown, so create it
-        // hidden and reveal it right after the adapter is built (feature-gated; the
-        // default build keeps winit's visible-by-default).
+        // AccessKit must attach before the window is first shown, so create it
+        // hidden and reveal it after the adapter is built (feature-gated).
         #[cfg(a11y_tree)]
         let attrs = attrs.with_visible(false);
-        // OVERLAP HANDOFF: EVERY window of a handoff boot is created hidden and
-        // revealed only after its first REAL content present (the post-present
-        // hook in `app_render`), so the parked parent's frozen frame is never
-        // covered by a themed-background-only flash — the carried pixels are the
-        // first thing on glass. Bounded: `about_to_wait` force-reveals at the
-        // deadline if presents keep dropping while hidden.
+        // Overlap handoff: every window of a handoff boot is created hidden and
+        // revealed after its first real content present (`app_render`), so the
+        // parked parent's frozen frame is never covered by a background-only
+        // flash. `about_to_wait` force-reveals at a deadline.
         let defer_reveal = self.handoff_ready.is_some();
-        // Deferred-join first window: created hidden, shown only after the joined
-        // backend's real metrics have resized it (below). A no-op when the a11y
-        // feature already forced hidden creation.
+        // Deferred-join first window: created hidden, shown once the joined
+        // backend's metrics have resized it.
         let attrs = if pending_join || defer_reveal {
             attrs.with_visible(false)
         } else {
@@ -1401,55 +1245,40 @@ impl App {
             }
         };
         let startup_after_window_create = Instant::now();
-        // P2: attach this window's AccessKit adapter (events arrive as `Wake::Accessibility`
-        // via the proxy), then SHOW the window. Stored into `ws` at the os_window assignment
-        // below. `update_if_active` (in app_settings) pushes the Settings tree on change.
+        // Attach this window's AccessKit adapter (events arrive as
+        // `Wake::Accessibility`), then show the window.
         #[cfg(a11y_tree)]
         let a11y_adapter = self
             .proxy
             .clone()
             .map(|proxy| accesskit_winit::Adapter::with_event_loop_proxy(el, &window, proxy));
-        // Deferred-join first window: keep it hidden past the adapter attach.
-        // Its show site is either the L1 warm-launch EARLY reveal below (persisted
-        // metrics sized it exactly, pre-join) or the post-join size correction —
-        // both strictly after this point, so the adapter always attaches before
-        // the first show, as AccessKit requires.
+        // Deferred-join first window stays hidden past the adapter attach; it is
+        // shown by the warm early reveal or the post-join size correction, both
+        // after this point, as AccessKit requires.
         #[cfg(a11y_tree)]
         if !pending_join && !defer_reveal {
             window.set_visible(true);
         }
-        // L1 reveal ledger: a non-deferred window with a Ready backend is on
-        // glass right here (created visible; under a11y, shown just above).
-        // Offer the process-wide first-reveal stamp — first-write-wins, so only
-        // the FIRST window's reveal ever records and every later Cmd-N attach
-        // is a no-op. (For the non-a11y build the stamp trails the visible
-        // creation by microseconds; honest at the ms grain the metric reports.)
+        // A non-deferred window with a Ready backend is on glass here. Offer the
+        // process-wide first-reveal stamp (first write wins).
         if !pending_join && !defer_reveal {
             crate::metrics::mark_first_window_visible();
         }
-        // Native macOS menu bar (menu.rs): build + install NSApp.mainMenu now the
-        // FIRST window exists, so aterm presents as a real Mac app. There is ONE
-        // shared NSApp.mainMenu, so window 2..N must NOT reinstall it (that would
-        // drop the first install's retained action target and rebuild the bar). The
-        // `_menu.is_none()` guard makes the install fire exactly once. Skipped under
-        // `--headless` (this fn is never reached there); a no-op off macOS. The
-        // returned action target is RETAINED in `self` (AppKit holds a menu item's
-        // target only weakly) for the run loop's life.
+        // Install the shared NSApp.mainMenu once, with the first window;
+        // reinstalling would drop the retained action target. The target is kept
+        // in `self` because AppKit holds menu targets weakly. No-op off macOS.
         if self._menu.is_none()
             && let Some(proxy) = self.proxy.as_ref()
         {
             self._menu = self.apprt.install_menu(proxy);
-            // Defer AppKit `terminate:` quits that BYPASS the menu (Dock-icon Quit,
-            // AppleScript `quit`, logout/restart/shutdown) onto the typed App lane,
-            // which runs the same confirmation + document barrier as Cmd-Q.
-            // Registered once alongside the menu (a no-op off macOS).
+            // Route AppKit `terminate:` quits that bypass the menu (Dock Quit,
+            // AppleScript, logout) through the App lane's Cmd-Q confirmation and
+            // document barrier. Registered once; no-op off macOS.
             self.apprt.install_quit_confirm();
         }
-        // The menu-bar OPERATOR status item (status_item.rs): created once with
-        // the FIRST window, alive for the process lifetime (the handle retains
-        // both the NSStatusItem — releasing one removes it from the bar — and
-        // its weakly-referenced action target). Same one-shot/headless/off-macOS
-        // contract as the menu install above.
+        // The menu-bar operator status item (status_item.rs), created once with the
+        // first window and retained for the process life (releasing the
+        // NSStatusItem removes it). No-op off macOS.
         if self._status_item.is_none()
             && let Some(proxy) = self.proxy.as_ref()
         {
@@ -1463,12 +1292,9 @@ impl App {
                 crate::fleet_watch::request_scan(proxy.clone());
             }
         }
-        // W11 MotionPolicy: seed the OS "Reduce Motion" flag at ATTACH and subscribe
-        // to its change notification once (the observer target is retained for the
-        // process life, like `_menu`). Windows has a real attach-time query but no
-        // live observer, so it re-samples on each attach; Linux does the same
-        // with GNOME's `enable-animations` (a bounded `gsettings get`, `false`
-        // wherever it cannot be read, leaving explicit config in control).
+        // Seed the OS "Reduce Motion" flag at attach and subscribe to its change
+        // notification once (macOS). Windows and Linux (GNOME
+        // `enable-animations`, `false` when unreadable) re-sample on each attach.
         if self._reduce_motion.is_none()
             && let Some(proxy) = self.proxy.as_ref()
         {
@@ -1478,100 +1304,43 @@ impl App {
             );
             self._reduce_motion = self.apprt.observe_reduce_motion(proxy);
         }
-        // IME-1: opt into IME so the window receives `WindowEvent::Ime`
-        // (Preedit/Commit) for CJK/dead-key/Option composition. Never enabled
-        // before, so composition input was impossible.
+        // Enable IME so the window receives `WindowEvent::Ime` for composition.
         window.set_ime_allowed(true);
-        // …and tell the input method WHAT KIND of field it is driving. winit
-        // defaults to `ImePurpose::Normal`, which on Wayland goes out as
-        // `zwp_text_input_v3.set_content_type(hint=none, purpose=normal)` — a
-        // plain prose field. A terminal is not one: the protocol has a dedicated
-        // `content_purpose.terminal`, and IMs/on-screen keyboards read it to drop
-        // the prose affordances that corrupt shell input (autocapitalisation,
-        // word prediction, smart punctuation) and to surface the keys a terminal
-        // actually needs. Stored on the window here, so EVERY later
-        // `text_input.enter` re-announces it — which matters because `enable`
-        // resets the compositor's copy. A cross-platform no-op everywhere else
-        // (X11/macOS/Windows implement it as an empty body).
+        // Declare the field a terminal (Wayland `content_purpose.terminal`), so IMs
+        // and on-screen keyboards drop autocapitalisation and prediction. Stored on
+        // the window so every `text_input.enter` re-announces it. No-op on other
+        // platforms.
         window.set_ime_purpose(winit::window::ImePurpose::Terminal);
-        // OS color-scheme source: seed every session of this window with the REAL
-        // desktop light/dark appearance (winit's `Window::theme()`, cross-platform).
-        // The engine REPORTS the scheme to apps (DEC 2031 + DSR ?996n); this is what
-        // actually feeds it the host value at startup. Live OS toggles are handled by
-        // `WindowEvent::ThemeChanged`. `None` (indeterminate OS) maps to the engine's
-        // own `Dark` default, so this is a no-op there.
+        // Seed every session of this window with the desktop light/dark appearance
+        // (`Window::theme()`), which the engine reports to apps (DEC 2031, DSR
+        // ?996n). Live changes arrive as `WindowEvent::ThemeChanged`; `None` maps to
+        // the engine's `Dark` default.
         let os_appearance = crate::app_colorscheme::theme_to_appearance(window.theme());
         self.apply_os_color_scheme(wid, os_appearance);
-        // Also switch aterm's OWN rendered theme to the matching side of a
-        // `dark:…,light:…` split `theme` config (a no-op for a single theme, or when
-        // the OS appearance equals the engine default already in effect).
+        // Switch aterm's own theme to the matching side of a `dark:…,light:…`
+        // `theme` config.
         self.sync_app_theme_to_appearance(os_appearance);
-        // (L1) EARLY REVEAL — kill the invisible half-second. Measured on the
-        // shipped Windows build: rust_main→first_present ≈ 440 ms, ~410 ms of it
-        // BEFORE the reveal below (backend_finalize ≈ 274, gui_prepare ≈ 108) —
-        // no window and no taskbar button for most of startup, because a hidden
-        // top-level HWND has neither. The wait exists for a real reason (the
-        // seeded `seed_cell_px` size is a 0.6×/1.2× heuristic — a bare early
-        // show trades blankness for a JUMPING window), so the early path runs
-        // ONLY when it can put the EXACT final frame on glass: a WARM launch
-        // whose per-scale REAL cell metrics were persisted by a previous
-        // backend finish (`restore::load_cell_metrics`). Then the window is
-        // revealed correctly sized, correctly positioned, and correctly themed
-        // BEFORE the ~300 ms join, and content arrives into it with zero
-        // geometry change (asserted against the post-join size below).
+        // Warm-launch early reveal (Windows only). A hidden top-level HWND has no
+        // window or taskbar button, and the backend join takes a noticeable part of
+        // startup there. When a previous run persisted this scale's real cell
+        // metrics (`restore::load_cell_metrics`), the window is revealed at its
+        // exact final size, position and theme before the join; content then
+        // arrives with no geometry change (checked post-join below). The seeded
+        // `seed_cell_px` size is only a heuristic, so without cached metrics the
+        // window stays hidden. The titlebar band is 0 on Windows (the caption is
+        // outside the client area).
         //
-        // Windows-only, deliberately: this platform is where the cost lives
-        // (no Dock bounce covers the gap), its chrome calls here are all
-        // backend-independent, and its titlebar band is provably 0 (the OS
-        // caption sits outside the client area).
+        // Not done on macOS: the join there is already negligible and the exact
+        // resize has to precede the show on either path, so revealing earlier
+        // gains nothing.
         //
-        // macOS WAS TRIED AND MEASURED, AND IS NOT COMING. The old reason
-        // recorded here was that macOS reads `head_pts` off `contentLayoutRect`,
-        // which is 0 until the post-join fullsize-content + toolbar installs, so
-        // an early frame would be short one chrome band unless those installs
-        // moved above the join first. That blocker is real but removable: moved
-        // above the join, the band reads correctly on a still-HIDDEN window
-        // (`head=80` identical across the move, `aterm-ctl dims`), the warm
-        // reveal fires, and it logs "early reveal held … zero resize on glass" —
-        // the exact frame, no jump. What killed it is the SIZE OF THE PRIZE, on
-        // its own metric:
-        //
-        //   rust_main_to_first_visible_ms — warm lane, paired AB/BA, n=20 pairs,
-        //   `start-compare.sh --warm`; POSITIVE = the second binary is faster:
-        //     baseline            → hoist + macOS reveal ON:  −0.18 ms (10w/10l)
-        //     hoist, macOS reveal OFF → the same, ON:         +0.80 ms (12w/8l)
-        //   and the enabler by itself, cold lane, same shape:
-        //     baseline            → hoist alone:              −1.37 ms (6w/14l)
-        //
-        // i.e. nil, against a ~96 ms time-to-visible. The drill-down says why,
-        // and it is not a tuning problem: 8.7 ms moves out of `chrome_geometry`
-        // and 9.3 ms moves into `window_setup`, because the dominant pre-reveal
-        // cost is the `request_inner_size` to the exact frame — and that resize
-        // has to happen BEFORE the window is shown on either path. Revealing
-        // earlier drags the resize earlier with it and arrives at the same
-        // instant. There is no ~300 ms join here to reveal in front of (see the
-        // join note below: 0.01–0.04 ms), macOS already covers the launch gap
-        // with a Dock bounce, and the change would buy that nil at the price of
-        // a second reveal site plus a new visible failure mode (an early frame
-        // that jumps if the cached box ever goes stale). Windows keeps it: there
-        // the same mechanism removes ~300 ms of no window at all.
-        //
-        // Skips (each keeps today's hidden-until-ready behaviour):
+        // Skipped (window stays hidden until ready) for:
         //   * cold launch — no persisted metrics for this scale/font;
-        //   * overlap handoff (`defer_reveal`) — the parked parent's frozen
-        //     frame must not be covered by a content-less window;
-        //   * seamless position carry — applied by `resumed` after this
-        //     returns, and a 300 ms visibly-misplaced window then a hop is
-        //     worse than 300 ms hidden;
-        //   * a maximized session restore — the post-join
-        //     `request_inner_size` law below operates on a NORMAL frame, and
-        //     maximizing early would make it fight the OS (the restore
-        //     maximizes after attach, exactly as today).
-        // A restore with a plain persisted position is NOT skipped: that
-        // position is readable right here (`pending_restore` is drained later,
-        // in `about_to_wait`), so it is applied pre-reveal and `resumed`'s
-        // post-attach re-application degenerates to a same-place no-op.
-        // The early reveal is Windows-only: everywhere else both stay `None`.
+        //   * overlap handoff (`defer_reveal`) — the parked parent's frame must
+        //     not be covered;
+        //   * seamless position carry — applied by `resumed` after this returns;
+        //   * a maximized restore — the post-join resize works on a normal frame.
+        // A restore with a plain persisted position is applied here, pre-reveal.
         #[cfg(windows)]
         let mut early_reveal_size: Option<PhysicalSize<u32>> = None;
         #[cfg(not(windows))]
@@ -1592,10 +1361,9 @@ impl App {
             // The same scale resolution the post-join sizing uses (force-scale
             // override included), so the two frame derivations cannot diverge.
             let scale = resolve_force_scale().unwrap_or_else(|| window.scale_factor());
-            // Predict the font px the post-join HiDPI block will settle on:
-            // the auto-scale target, or the explicit/1× size held verbatim.
-            // Pure + deterministic, so a cache hit implies the joined backend
-            // activates exactly the cached metrics' size.
+            // Predict the font px the post-join HiDPI block settles on (auto-scale
+            // target, or the explicit size); deterministic, so a cache hit means
+            // the joined backend activates the cached size.
             let target_font_px =
                 hidpi_target_font_px(self.font_px_explicit, scale).unwrap_or(self.font_px);
             let cached = (!restore_maximized)
@@ -1608,32 +1376,21 @@ impl App {
                 })
                 .flatten();
             if let Some((cell_w, cell_h)) = cached {
-                // The exact-frame twin of `window_frame_px_for` (`frame_size` +
-                // `visible_frame_height`), computed from the CACHED cell
-                // metrics because the backend that owns the live derivation is
-                // precisely what has not joined yet. Any drift between this
-                // and the post-join truth is caught by the mismatch log below.
+                // The exact frame from cached cell metrics, since the live backend
+                // has not joined; drift is caught by the mismatch log below.
                 let pad = self.cfg_pad_for_scale(scale);
                 let pad_top = self.cfg_pad_top_for_scale(scale);
-                // The measured OS band (0 on Windows — no AppKit titlebar) PLUS the
-                // C3 synthetic tab band, which is emphatically NOT 0 here: it is
-                // reserved out of the frame the post-join path derives, so predicting
-                // it wrong would make every warm launch log "early reveal was STALE"
-                // and put one visible resize on glass. The cached `(cell_w, cell_h)`
-                // this branch is already gated on is exactly the input the law wants,
-                // so the prediction is the same arithmetic, not a second heuristic.
+                // The measured OS band (0 on Windows) plus the synthetic tab band,
+                // which is reserved from the post-join frame too; mispredicting it
+                // would log a stale reveal and resize on glass.
                 let head = (self.apprt.titlebar_band_pts(&window) * scale)
                     .round()
                     .max(0.0) as usize
                     + self.synthetic_strip_head_px(scale, cell_h);
                 let total_rows = rows.saturating_add(self.chrome_rows(wid)) as usize;
-                // THE SHARED LAW, not a second copy of it. `frame_size_px` is what
-                // `Renderer::frame_size` itself is, and `visible_frame_height` is the
-                // same top-pad crop `Backend::frame_size` applies over it — so this
-                // prediction and the post-join `window_frame_px_for` below differ ONLY in
-                // where the cell box came from (cached here, live there). Open-coding
-                // the arithmetic is what would let the two drift, and the `head` term
-                // is exactly the one a synthetic tab band makes non-zero.
+                // The shared frame law (`frame_size_px` + `visible_frame_height`),
+                // so this prediction and the post-join `window_frame_px_for` differ
+                // only in where the cell box came from.
                 let (width, raw_height) = aterm_render::frame_size_px(
                     total_rows,
                     cols as usize,
@@ -1647,23 +1404,18 @@ impl App {
                 // Still hidden: the correction from the seeded size to the
                 // exact frame is never on glass.
                 let _ = window.request_inner_size(exact);
-                // Bootstrap session-restore position, pre-reveal (W4-validated
-                // against the live monitor set, like every restore apply).
-                // Without this the window would sit ~300 ms at the OS-default
-                // spot before `resumed`'s post-attach move — a visible hop.
+                // Bootstrap restore position, applied pre-reveal and validated
+                // against the live monitors, so the window does not hop later.
                 if let Some((x, y)) =
                     bootstrap_restore.and_then(|wl| Some((wl.outer_x?, wl.outer_y?)))
                     && restored_position_on_screen(&window, x, y)
                 {
                     window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
                 }
-                // The two backend-independent chrome calls, hoisted above the
-                // join (their post-join runs become idempotent re-applies): the
-                // themed class brush so the client area erases to EXACTLY the
-                // colour the first frame will paint (`early_reveal_backdrop` —
-                // one resolved value, checked post-join below), and the
-                // caption/immersive-dark resolution so the titlebar is right
-                // from the first composite.
+                // The backend-independent chrome calls, hoisted above the join
+                // (re-applied idempotently after it): the themed class brush, so
+                // the client area erases to the first frame's colour
+                // (`early_reveal_backdrop`), and the caption dark-mode resolution.
                 let backdrop = self.early_reveal_backdrop();
                 self.apprt.window_set_background_color(&window, backdrop);
                 self.apprt
@@ -1672,85 +1424,53 @@ impl App {
                 // this — the invariant holds on every show path.
                 window.set_visible(true);
                 crate::metrics::mark_first_window_visible();
-                // The event-loop thread is about to block in the join and pump
-                // nothing, so force the themed erase onto glass synchronously —
-                // otherwise the "revealed" window is an unpainted rectangle for
-                // the whole join, worse than staying hidden.
+                // The event loop is about to block in the join, so paint the themed
+                // erase synchronously; otherwise the window is unpainted until then.
                 self.apprt.window_flush_backdrop(&window);
                 early_reveal_size = Some(exact);
                 early_reveal_bg = Some(backdrop);
             }
         }
-        // (#7 tail) THE join: the OS window now exists (its creation overlapped the
-        // build tail); everything below — the HiDPI font derivation, the pad, the
-        // corrected window size, the present target — needs the real backend. A
-        // build panic exits inside `finalize_backend` (launch-fatal, same outcome
-        // as the old pre-`run_app` `.expect`).
-        //
-        // ON macOS THIS WAIT IS ALREADY GONE — 0.01–0.04 ms MEASURED
-        // (`startup_attach_backend_finalize_ms`, arena n=20 paired, both warm and
-        // cold). The overlap #7 introduced works so well here that the worker has
-        // finished long before the event-loop thread arrives: window creation
-        // alone (~20 ms) outlasts the entire backend build. Read that number
-        // before proposing to hoist work above this line "to overlap the join" —
-        // there is nothing left to overlap, and work moved across a 0.04 ms wait
-        // only re-books itself from `chrome_geometry` into `window_setup` in the
-        // attach drill-down. The ~300 ms figure that keeps getting quoted for
-        // this join is the WINDOWS one from the early-reveal note above, and it
-        // does not transfer.
+        // The backend join: the OS window exists (its creation overlapped the
+        // build); the HiDPI font derivation, pad, corrected size and present
+        // target below need the real backend. A build panic exits inside
+        // `finalize_backend`. On macOS the worker normally finishes before this
+        // point, so the wait is negligible.
         let startup_before_backend_finalize = Instant::now();
         if pending_join {
             self.finalize_backend();
         }
         let startup_after_backend_finalize = Instant::now();
-        // FIRE-INTO-CHROME (order matters): extend the content view under the
-        // titlebar FIRST (fullSizeContentView), THEN measure the band via
-        // `contentLayoutRect` — the ONE truth for how much chrome sits above the
-        // usable content. Measuring pre-mask (`frame - contentRectForFrameRect`)
-        // UNDER-counts by the unified toolbar's height (32 vs 46 pt observed), and a
-        // band that disagrees with the post-mask resize law costs a grid row and
-        // mis-pads the top. `contentLayoutRect` is recomputed synchronously by the
-        // style-mask change, so the measure is valid immediately — no need to wait
-        // for the grown bounds to land. Stored in POINTS so scale changes recompute
-        // the px headroom without an AppKit round-trip. Both calls are no-ops off
-        // macOS.
+        // Extend the content view under the titlebar first (fullSizeContentView),
+        // then measure the band via `contentLayoutRect`, which the style-mask
+        // change recomputes synchronously. Measuring before the mask under-counts
+        // the unified toolbar and costs a grid row. Stored in points so scale
+        // changes recompute px headroom. No-ops off macOS.
         self.apprt.window_set_fullsize_content(&window);
-        // Native macOS window toolbar (toolbar.rs): a unified-style NSToolbar with
-        // a "+" New Tab button, so the window presents as a real Mac app.
-        // Installed HERE — before the titlebar-band measure below (the toolbar
-        // GROWS `contentLayoutRect`'s chrome band, 32→46 pt observed; measuring
-        // first under-counts and costs a grid row) and before the GPU/CPU present
-        // split so BOTH backends get it. The "+" reuses File ▸ New Tab (posts the
-        // same `Wake::MenuAction { NewTab }`). The retained backing objects are
-        // kept in `self._toolbars` keyed by window (AppKit holds the toolbar's
-        // delegate + the item's target only WEAKLY). A no-op off macOS; never
-        // reached under `--headless`. Cloning the proxy avoids borrowing `self`
-        // immutably (proxy) and mutably (`_toolbars`) at once.
+        // Native macOS toolbar (toolbar.rs) with a "+" New Tab button (posts
+        // `Wake::MenuAction { NewTab }`). Installed before the band measure, since
+        // the toolbar grows `contentLayoutRect`'s band, and before the GPU/CPU
+        // split so both backends get it. Backing objects live in
+        // `self._toolbars` because AppKit holds the delegate and target weakly.
+        // No-op off macOS. The proxy clone avoids a simultaneous borrow of `self`.
         if let Some(proxy) = self.proxy.clone()
             && let Some(handle) = self.apprt.install_toolbar(&window, &proxy, wid)
         {
-            // Pin the strip's appearance to the THEME's darkness so the tab
-            // labels' semantic colours resolve against their actual backdrop (the
-            // theme-coloured titlebar), not the OS/window appearance — a dark
-            // theme under a light OS otherwise renders inactive labels as
-            // translucent black on near-black. Re-synced on every theme change
-            // (apply_theme_live + the reload rebuild branch).
+            // Pin the strip appearance to the theme's darkness so tab label
+            // colours resolve against the theme-coloured titlebar, not the OS
+            // appearance. Re-synced on theme change.
             crate::toolbar::set_strip_dark(&handle, crate::tab_bar::theme_is_dark(self.theme.bg));
             // Pin the user's selected-tab color override (config `active_tab_color`)
             // at install too, so a fresh window's strip matches the live config.
             crate::toolbar::set_active_tab_color(&handle, self.config.active_tab_color_rgb());
             self._toolbars.insert(wid, handle);
         }
-        // Measure the band AFTER the mask + toolbar: `contentLayoutRect` now
-        // reflects the full chrome (titlebar + unified toolbar) above the usable
-        // content — the ONE truth the resize law re-derives against.
+        // Measure the band after the mask and toolbar: `contentLayoutRect` now
+        // covers the full chrome above the content.
         let head_pts = self.apprt.titlebar_band_pts(&window);
-        // Seed the last-good-windowed band memory from the same sample (via the
-        // one decision law — only a sane decorated windowed measurement seeds).
-        // Without this, a fullscreen entered before any windowed resize would
-        // leave the memory at 0 and a bad exit sample would have nothing to
-        // restore. The applied `head_pts` stays the verbatim measurement — the
-        // deliberate post-chrome ordering above makes attach the trusted read.
+        // Seed the last-good windowed band memory from this sample (via the
+        // decision law), so a fullscreen entered before any windowed resize has a
+        // value to restore. The applied `head_pts` stays the raw measurement.
         let (_, band_memory_pts) = crate::app_config::titlebar_band_decision(
             head_pts,
             window.fullscreen().is_some(),
@@ -1763,68 +1483,43 @@ impl App {
             ws.head_pts = head_pts;
             ws.last_windowed_band_pts = band_memory_pts;
         }
-        // HiDPI / Retina auto-scale. aterm rasterizes glyphs at `font_px` PHYSICAL
-        // pixels and works in physical units throughout, so on a 2× Retina display
-        // the built-in 12 px default renders at ~6 LOGICAL points — crisp but tiny.
-        // The display scale factor is only knowable once the window exists, so apply
-        // it HERE: when the size is the DEFAULT (no `--font-px`, no
-        // `config.font_px`), scale it to `round(FONT_PX × scale)`. An EXPLICIT size is
-        // honored verbatim — never double-scaled.
+        // HiDPI auto-scale. Glyphs are rasterized at `font_px` physical pixels, so
+        // the default size is scaled to `round(FONT_PX × scale)` once the window's
+        // scale is known; an explicit size (`--font-px`, `config.font_px`) is used
+        // verbatim.
         //
-        // W12: SELECT this window's size on the SHARED renderer via the LIGHT
-        // `activate_px` — NOT a rebuild. The old path swapped the whole CPU backend
-        // (or re-faced the GPU one) whenever a window landed on a different-scale
-        // display, tearing down EVERY other window's warm glyph atlas and re-parsing
-        // the font on the critical path to this window's first pixel. The light
-        // switch keeps the shared faces + every size's glyphs resident (they coexist
-        // by `px_q`); other windows simply re-activate their own size on their next
-        // redraw. This is the same mechanism `apply_window_scale` uses per frame, so
-        // attach and steady-state agree.
-        //
-        // An explicit render-scale override (`--scale`) wins over
-        // the window's real scale_factor(), driving BOTH the auto-scaled font and the
-        // interior padding so a forced scale renders identically to that real DPI.
+        // The size is selected on the shared renderer via the light `activate_px`,
+        // not a rebuild, so other windows keep their glyph atlases; this is the
+        // same mechanism `apply_window_scale` uses per frame. `--scale` overrides
+        // the window's scale factor for both font and padding.
         let scale = resolve_force_scale().unwrap_or_else(|| window.scale_factor());
-        // Record THIS window's scale so `redraw_window` can re-select the shared
-        // backend to it per frame (per-window DPI); the block below activates it for
-        // this window's first paint + the geometry-dependent sizing that follows.
+        // Record this window's scale so `redraw_window` re-selects the shared
+        // backend to it per frame.
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.scale = scale;
         }
         if let Some(scaled) = hidpi_target_font_px(self.font_px_explicit, scale) {
-            // Light switch on a real change; a no-op guard keeps the common case
-            // (every 2nd..Nth window on the SAME display) free. The faces / shaping /
-            // fallback config on the shared renderer are unchanged by a size switch,
-            // so none of the old rebuild's re-pinning is needed. Cmd-0 resets to this
-            // scaled default rather than the tiny FONT_PX base.
+            // Switch only on a real change. Faces and shaping config are unchanged
+            // by a size switch. Cmd-0 resets to this scaled default.
             if (scaled - self.font_px).abs() >= 0.5 {
                 self.backend.activate_px(scaled);
             }
             self.font_px = scaled;
             self.default_font_px = scaled;
         }
-        // Apply the interior padding at the window's REAL scale and recompute `size`
-        // so the window — and the GPU swapchain configured from it below — fits the
-        // grid PLUS this border (and the new cell metrics the size activation above
-        // selected) PLUS the tab strip.
+        // Apply the padding at the real scale and recompute `size` so the window
+        // and its swapchain fit grid, border, new cell metrics and tab strip.
         let pad = self.cfg_pad_for_scale(scale);
         self.backend.set_pad(pad);
-        // TOP-only tighter interior pad (the ~46 pt chrome band already separates
-        // the grid from the window top). The frame shrinks by exactly the removed
-        // top pixels; the bottom remains the base pad. Apply it after `set_pad`:
-        // an actual base-pad change deliberately starts a new symmetric padding
-        // regime, while a redundant same-value `set_pad` is a complete no-op.
+        // Tighter top pad (the chrome band already separates the grid from the
+        // window top); the bottom keeps the base pad. Applied after `set_pad`,
+        // since a real base-pad change starts a new symmetric padding regime.
         let pad_top = self.cfg_pad_top_for_scale(scale);
         self.backend.set_pad_top(pad_top);
-        // C3 (Windows + Linux): overwrite the measured band (0 — there is no AppKit
-        // titlebar to sample on either) with the SYNTHETIC tab band. Derived HERE,
-        // not up at the `titlebar_band_pts` measure, because the law's residue is
-        // `target − pad_top − strip_rows·cell_h` and `cell_h` is only knowable once
-        // the block above has settled `self.font_px` and activated the backend at
-        // it. `ws.metrics` is written from `head` immediately below, so this is the
-        // one write the whole attach needs. A no-op on macOS (whose measured band
-        // this must never clobber — the attribute keeps it out) and whenever the
-        // strip is off / the band is `compact`.
+        // Windows/Linux: replace the measured band (0) with the synthetic tab band.
+        // Derived here because its residue depends on `cell_h`, which is settled
+        // only after the size activation above. Not compiled on macOS, whose
+        // measured band must stand; no-op when the strip is off or `compact`.
         #[cfg(any(windows, target_os = "linux"))]
         {
             let cell_h = self.backend.cell_geometry(self.font_px).1;
@@ -1837,23 +1532,25 @@ impl App {
         let head_pts = self.windows.get(&wid).map_or(0.0, |ws| ws.head_pts);
         let head = (head_pts * scale).round() as usize;
         self.backend.set_head(head);
-        // W12: record THIS window's resolved metrics from its OWN scale — the
-        // per-window source of truth `on_scale_factor_changed` keeps current. Uses the
-        // live `font_px` (which the explicit-font / force-scale paths above pin
-        // verbatim) so the record never diverges from what the window renders.
+        // Record this window's resolved metrics from its own scale (kept current by
+        // `on_scale_factor_changed`), using the live `font_px`.
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.metrics = crate::MetricsView::applied(self.font_px, pad, pad_top, head);
         }
-        size = self.window_frame_px_for(wid, rows, cols);
+        // A restored window (an update successor's, or a cold restore's) comes
+        // up at the raw inner size it had, not just its grid's frame, when that
+        // size holds the grid (P6 finding 4).
+        let carried = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.carried_inner_px.take());
+        size = self.attach_frame_px(wid, rows, cols, carried);
         let _ = window.request_inner_size(size);
-        // (L1) The warm-launch contract, verified: the frame revealed BEFORE
-        // the join must equal the frame the joined backend just derived, so the
-        // `request_inner_size` above was a no-op and the user saw ZERO geometry
-        // change after the reveal. A mismatch is not a crash (a font file can
-        // change metrics under an unchanged config fingerprint — the cache is a
-        // prediction, not a proof) but it IS the one visible failure mode of
-        // the early path, so it logs loudly; the store below then re-persists
-        // the corrected metrics and the next launch is exact again.
+        // The warm-launch check: the frame revealed before the join must equal the
+        // one the joined backend derived, so the `request_inner_size` above was a
+        // no-op. A mismatch (e.g. a font file changed under an unchanged
+        // fingerprint) is the early path's visible failure mode, so it logs; the
+        // store below re-persists the corrected metrics.
         if let Some(early) = early_reveal_size {
             if early == size {
                 aterm_log::debug!(
@@ -1872,14 +1569,9 @@ impl App {
                 );
             }
         }
-        // (L1) The colour twin of that contract: the erase the reveal put on
-        // glass must be the colour the first frame paints over it, i.e. the
-        // theme background resolved NOW (the value the post-join brush
-        // re-apply and the engine default background both read) must still
-        // be the one the pre-join brush was seeded from. Nothing between the
-        // two re-resolves the theme today — the OS-appearance sync runs before
-        // the reveal — and a future seam that did would be the one way to put
-        // a real colour step at content arrival, so a mismatch logs at warn.
+        // The colour check: the theme background resolved now must equal the one
+        // the pre-join brush was seeded from; a mismatch would be a visible colour
+        // step at content arrival, so it logs at warn.
         if let Some(early_bg) = early_reveal_bg {
             let now_bg = self.early_reveal_backdrop();
             if early_bg == now_bg {
@@ -1896,13 +1588,11 @@ impl App {
                 );
             }
         }
-        // LINUX INITIAL-FRAME SETTLE: the request above is pre-map on Wayland —
-        // no CSD frame exists yet and `scale_factor()` may still be the assumed
-        // 1.0 — so the compositor's first configure round can hand back a frame
-        // that is NOT `rows`×`cols` (GNOME subtracts the 35 px CSD header from a
-        // geometry echo; a HiDPI output re-derives the font under the same
-        // logical size). Arm one bounded post-map re-request of THIS grid; see
-        // [`crate::InitialFrameSettle`] / [`Self::settle_initial_frame`].
+        // Linux initial-frame settle: on Wayland the request above is pre-map (no
+        // CSD frame, `scale_factor()` possibly 1.0), so the first configure can
+        // return a frame that is not `rows`×`cols`. Arm one bounded post-map
+        // re-request of this grid; see [`crate::InitialFrameSettle`] and
+        // [`Self::settle_initial_frame`].
         #[cfg(target_os = "linux")]
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.initial_frame_settle = Some(crate::InitialFrameSettle {
@@ -1913,36 +1603,24 @@ impl App {
                 corrected: false,
             });
         }
-        // W1 (kill the compositor stretch): hint the WM to resize in whole-cell
-        // steps, so an interactive edge drag lands on an exact grid fit and the
-        // remainder bands stay at the base pad. macOS honours this during live
-        // resizes only — zoom/tiling/maximize still produce arbitrary sizes,
-        // which the per-edge padding bands absorb (the actual root fix). The
-        // increments are re-derived on every font/DPI rebuild (`rebuild_backend`).
+        // Hint the WM to resize in whole-cell steps so edge drags land on an exact
+        // grid fit. macOS honours it only during live resize; other sizes are
+        // absorbed by the per-edge padding bands. Re-derived on every font/DPI
+        // rebuild (`rebuild_backend`).
         {
             let (cw, ch) = self.cell_size();
             window.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
-            // W1 companion (fixwave5): put the increment BASE on the same
-            // whole-cell frame lattice. winit's Wayland backend snaps
-            // interactive resizes to `min + k·increment`, so the creation-time
-            // 164×98 UX floor made the lattice incongruent with the frame law
-            // and a pure-vertical edge drag re-snapped the untouched width
-            // below the exact fit — shaving a column. See
-            // `whole_cell_min_size`. Linux-only: macOS/Windows never carried a
-            // min and their backends do not base increments on it.
+            // Put the increment base on the same whole-cell frame lattice: winit's
+            // Wayland backend snaps resizes to `min + k·increment`, and an
+            // incongruent min made a vertical drag shave a column. See
+            // `whole_cell_min_size`. Linux-only.
             #[cfg(target_os = "linux")]
             window.set_min_inner_size(Some(self.whole_cell_min_size(wid)));
-            // (L1) Persist THIS scale's REAL cell metrics — "written when a
-            // backend finishes": the joined backend is active at this window's
-            // px, so `cell_size()` is the ground truth the next launch's early
-            // reveal sizes from. Guarded to the LAUNCH-DEFAULT font size so a
-            // Cmd-N attach after Cmd-+/− zoom can never poison the cache with
-            // transient metrics (`default_font_px` is what a fresh launch at
-            // this scale settles on; same 0.5 px tolerance as the activate
-            // guard above). All platforms record — the cache is pure file I/O
-            // and lets macOS adopt the early reveal later without a migration —
-            // only the LOOKUP is Windows-gated. Fire-and-forget off-thread;
-            // steady-state (unchanged metrics) writes nothing at all.
+            // Persist this scale's real cell metrics for the next launch's early
+            // reveal. Only at the launch-default font size (0.5 px tolerance), so a
+            // zoomed Cmd-N attach never stores transient metrics. All platforms
+            // record; only the lookup is Windows-gated. Off-thread, and unchanged
+            // metrics write nothing.
             if (self.font_px - self.default_font_px).abs() < 0.5 {
                 crate::restore::store_cell_metrics(
                     self.cell_metrics_font_key(),
@@ -1953,37 +1631,25 @@ impl App {
                 );
             }
         }
-        // Don't eclipse the window this one was opened from: step the frame down and
-        // right so the previous window stays visible behind it. Placed HERE — after
-        // the size correction above (the real frame decides where the cascade wraps)
-        // and before any present — so the move is never on glass. A no-op for the
-        // first window, and overridden by the explicit positions the restore /
-        // seamless-update carries apply after the attach returns.
+        // Step the frame down-right so the parent window stays visible. After the
+        // size correction (the frame decides where the cascade wraps) and before
+        // any present. No-op for the first window; restore/update positions
+        // applied after the attach win.
         self.cascade_window_placement(wid, &window);
-        // Paint the window background the terminal's theme background colour so the
-        // transparent titlebar — and the bare single-tab compact bar — reads as a
-        // seamless extension of the terminal body instead of a distinct lighter chrome
-        // strip (Ghostty's "transparent" titlebar look). Runs for BOTH backends: the
-        // GPU arm `return`s below, so this must precede the split. No-op off macOS
-        // (the Linux apprt's `window_set_background_color` does nothing).
+        // Paint the window background the theme background so the transparent
+        // titlebar reads as part of the terminal body. Before the GPU/CPU split,
+        // since the GPU arm returns. No-op off macOS.
         self.apprt
             .window_set_background_color(&window, self.theme.bg);
-        // Apply the configured window-chrome appearance (config `window_theme`) at
-        // attach, BEFORE the GPU/CPU split so BOTH present paths get it — the GPU
-        // arm `return`s below. On Windows this is winit `set_theme` →
-        // DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE), so the titlebar
-        // matches from the first frame instead of waiting for a config reload; on
-        // macOS it also matches the NSWindow colour space to the device-RGB content
-        // (dropping CoreAnimation's per-frame gamut conversion — see the apprt
-        // method's docs).
+        // Apply the configured chrome appearance (`window_theme`) at attach, before
+        // the GPU/CPU split. On Windows this sets DWMWA_USE_IMMERSIVE_DARK_MODE so
+        // the titlebar matches from the first frame; on macOS it also matches the
+        // NSWindow colour space to the content (see the apprt method).
         self.apprt
             .window_set_appearance(&window, self.chrome_theme_for_apprt());
-        // (#7 tail) Reveal the deferred-join first window NOW — unless the L1
-        // early path already showed it pre-join (warm launch, exact persisted
-        // size; `early_reveal_size` is the receipt). On the remaining COLD path
-        // the joined backend's real metrics resized it above and the themed
-        // background is set, so the seeded size / unthemed chrome are never on
-        // glass. (Under a11y the adapter attached strictly before either show.)
+        // Reveal the deferred-join first window now, unless the early path already
+        // showed it (`early_reveal_size`). By now it has its real size and themed
+        // background.
         if pending_join {
             // Handoff boots stay hidden here — the post-present hook is the one
             // reveal site (carried pixels first, never a bg-only frame).
@@ -1991,20 +1657,14 @@ impl App {
                 window.set_visible(true);
                 crate::metrics::mark_first_window_visible();
             }
-            // First paint must never wait on the OS to volunteer a WM_PAINT: request
-            // it explicitly so the just-revealed window presents its first real frame
-            // on the next loop turn (the class-brush themed erase covers the gap; see
-            // `AppRtWindows::window_set_background_color`). Harmless everywhere — a
-            // duplicate redraw of a fresh window coalesces.
+            // Request the first redraw explicitly rather than waiting for WM_PAINT;
+            // the themed class-brush erase covers the gap. A duplicate coalesces.
             window.request_redraw();
         }
-        // W1: the surface (GPU swapchain or CPU softbuffer) is sized to the RAW
-        // window pixels — what the WM actually granted, not the grid-quantized
-        // request — so the compositor never rescales the presented frame. Read
-        // AFTER the deferred-join reveal above, so `inner_size()` reflects the
-        // really-granted size. The `Resized` event that may still follow re-syncs
-        // both `win_px` and the swapchain; a zero inner size (not yet laid out)
-        // falls back to the requested frame size.
+        // Size the surface to the raw window pixels the WM granted, not the grid
+        // request, so the compositor never rescales the frame. Read after the
+        // reveal so `inner_size()` is the granted size; a later `Resized`
+        // re-syncs. A zero size falls back to the requested frame.
         let inner = window.inner_size();
         let raw_px = if inner.width == 0 || inner.height == 0 {
             size
@@ -2013,36 +1673,27 @@ impl App {
         };
         let startup_before_surface_create = Instant::now();
         if self.backend.is_gpu() {
-            // GPU mode: a wgpu swapchain on the SAME instance/adapter as the
-            // offscreen renderer. The offscreen frame is blitted into it and
-            // presented on the GPU — no softbuffer surface is created.
+            // GPU mode: a wgpu swapchain on the offscreen renderer's instance and
+            // adapter; the offscreen frame is blitted into it. No softbuffer.
             let (w_px, h_px) = (raw_px.width, raw_px.height);
             let surface_result =
                 self.backend
                     .gpu_mut()
                     .unwrap()
                     .create_window_surface(window.clone(), w_px, h_px);
-            // H1 fail-soft (Windows): a first-window attach failure on a
-            // DirectComposition visual instance rebuilds the GPU stack on the
-            // opaque HWND swapchain and retries once, so "DComp unavailable" is
-            // a diagnostic + caption-only material, not a lost launch. Every
-            // other outcome passes through untouched (`Ok`, or an `Err` the
-            // arms below handle exactly as before H1).
+            // Windows fail-soft: a first-window attach failure on a DComp visual
+            // instance rebuilds the GPU stack on the opaque HWND swapchain and
+            // retries once. Other outcomes pass through.
             #[cfg(windows)]
             let surface_result = match surface_result {
                 Ok(surf) => Ok(surf),
-                Err(first_error) => self.retry_attach_on_opaque_swapchain(
-                    first_error,
-                    &window,
-                    (w_px, h_px),
-                    scale,
-                    head,
-                ),
+                Err(first_error) => {
+                    self.retry_attach_on_opaque_swapchain(first_error, &window, (w_px, h_px))
+                }
             };
-            // Both ordinary creation and the opaque-swapchain rebuild above
-            // register before installation/first present. A worker spawn failure
-            // takes the existing attach-error fallback, never a synchronous
-            // drawable-acquire fallback on the event loop.
+            // Both creation paths register before installation and first present.
+            // A worker spawn failure takes the attach-error fallback, never a
+            // synchronous drawable acquire on the event loop.
             let surface_result = surface_result.and_then(|mut surface| {
                 let proxy = self.proxy.clone().ok_or_else(|| {
                     "GPU surface attach requires an event-loop completion proxy".to_string()
@@ -2059,34 +1710,25 @@ impl App {
             let startup_after_surface_create = Instant::now();
             match surface_result {
                 Ok(surf) => {
-                    // M3 (colour-managed present): the wgpu surface creation just
-                    // attached a CAMetalLayer to this view; tag it so ColorSync
-                    // INTERPRETS the presented bytes — the configured space
-                    // (default `srgb`) for an SDR swapchain, or (phase B) the
-                    // extended-linear-sRGB tag an HDR (Rgba16Float) swapchain
-                    // REQUIRES (`resolve_surface_colorspace`, proven precedence).
-                    // Interpretation only — the bytes (and the readback/
-                    // introspection parity) are untouched. No-op off macOS.
+                    // Tag the new CAMetalLayer's colour space so ColorSync interprets
+                    // the presented bytes: the configured space (default `srgb`) for
+                    // SDR, or extended-linear sRGB for an Rgba16Float swapchain
+                    // (`resolve_surface_colorspace`). The bytes are unchanged. No-op
+                    // off macOS.
                     let hdr = surf.is_hdr();
                     let surface_colorspace =
                         crate::platform::resolve_surface_colorspace(self.window_colorspace, hdr);
                     let effective_colorspace = self
                         .apprt
                         .window_set_surface_colorspace(&window, surface_colorspace);
-                    // LIVE-RESIZE ANCHOR: the same freshly-attached CAMetalLayer
-                    // keeps CoreAnimation's default `contentsGravity` (`resize`),
-                    // which STRETCHES the last presented frame onto the new bounds
-                    // for every drag step we have not repainted yet — text smears,
-                    // then snaps back. Pin it to `topLeft` so an un-repainted frame
-                    // stays at 1:1 where it was drawn. Once per window, here,
-                    // because the layer does not exist before the surface does.
+                    // Pin the CAMetalLayer's `contentsGravity` to `topLeft` so an
+                    // un-repainted frame stays 1:1 during live resize instead of
+                    // being stretched. Once per window, after the layer exists.
                     self.apprt.window_anchor_surface_top_left(&window);
-                    // M5 TRUE VIBRANCY: with the wgpu CAMetalLayer now attached,
-                    // install the NSVisualEffectView backdrop + flip the window /
-                    // Metal-layer opacity when `background_opacity < 1.0`, so this
-                    // window's translucent (PostMultiplied) present composites over
-                    // live blur. No-op at the solid default / off macOS. Windows
-                    // opened AFTER a reload read the same cached knobs.
+                    // With `background_opacity < 1.0`, install the
+                    // NSVisualEffectView backdrop and make the window and layer
+                    // non-opaque so the translucent present composites over live
+                    // blur. No-op at the solid default or off macOS.
                     self.apprt.window_set_vibrancy(
                         &window,
                         self.render_knobs.background_material,
@@ -2095,15 +1737,13 @@ impl App {
                         ),
                         self.theme.bg,
                     );
-                    // M3 phase B: seed this window's per-screen EDR headroom for
-                    // the aurora boost (re-queried on monitor changes in
-                    // `refresh_frame_interval`). Only worth a query on an HDR
-                    // swapchain; the renderer-side sanitizer makes the unset
-                    // default (0.0 → headroom 0) provably inert.
+                    // Seed this window's per-screen EDR headroom (re-queried on
+                    // monitor changes in `refresh_frame_interval`); only queried on
+                    // an HDR swapchain, and the unset default is inert.
                     let mut window_gpu = aterm_gpu::WindowGpu::new();
-                    // Snapshot/video PNGs are unprofiled sRGB. Freeze the ACTUAL
-                    // compositor interpretation alongside the surface instead of
-                    // guessing it from Bgra8 (which can also be tagged P3).
+                    // Snapshot/video PNGs are unprofiled sRGB; record the actual
+                    // compositor interpretation with the surface rather than
+                    // guessing it from Bgra8.
                     window_gpu.set_capture_color_space(
                         crate::platform::capture_space_after_surface_tag(
                             effective_colorspace,
@@ -2155,16 +1795,12 @@ impl App {
                     return attached;
                 }
                 Err(e) => {
-                    // The window's GPU swapchain failed even though the offscreen
-                    // device initialized (e.g. an adapter that is offscreen-capable
-                    // but not present-capable — some Linux/Vulkan setups). With GPU
-                    // now the default renderer, a hard exit here would crash launch
-                    // on such a box. If ANOTHER window already presents on the GPU,
-                    // keep the hard rollback — downgrading the shared backend would
-                    // corrupt those live GPU surfaces. Otherwise this is the
-                    // first/only window: downgrade the whole app to the CPU
-                    // softbuffer renderer and fall through to the CPU present path
-                    // below (reusing the just-created `window`).
+                    // The window's swapchain failed although the offscreen device
+                    // initialized (e.g. an adapter that cannot present). If another
+                    // window already presents on the GPU, roll back hard, since a
+                    // downgrade would break its surface. Otherwise downgrade the app
+                    // to the CPU renderer and fall through to the CPU path with this
+                    // `window`.
                     let other_gpu = self
                         .windows
                         .values()
@@ -2182,12 +1818,11 @@ impl App {
                         .cpu_renderer_from_admitted(self.font_px, self.theme)
                     {
                         Ok(cpu) => {
-                            self.backend = BackendSlot::Ready(Backend::Cpu(cpu));
+                            // Carries the pad, top pad and head applied above at
+                            // this window's scale.
+                            self.backend.swap_renderer(Backend::Cpu(cpu));
                             self.use_gpu = false;
                             crate::metrics::set_backend_gpu(false);
-                            self.backend.set_pad(self.cfg_pad_for_scale(scale));
-                            self.backend.set_pad_top(self.cfg_pad_top_for_scale(scale));
-                            self.backend.set_head(head);
                             self.pin_backend_render_config_core();
                             self.warn_font_feature_issues();
                             self.sync_chrome_fonts();
@@ -2204,12 +1839,9 @@ impl App {
                 }
             }
         }
-        // CPU present path (first-party CoreGraphics on macOS, `softbuffer`
-        // elsewhere — see `crate::present`). Mirror the GPU arm's fail-soft
-        // rollback: a surface-creation failure drops the just-created window and
-        // returns false so the caller declines just this window, instead of
-        // `.expect()` unwinding the whole process and taking every other
-        // window/session down with it.
+        // CPU present path (CoreGraphics on macOS, `softbuffer` elsewhere; see
+        // `crate::present`). A surface failure drops the window and returns false
+        // so only this window is declined.
         let surface = match crate::present::CpuSurface::new(window.clone()) {
             Ok(s) => s,
             Err(e) => {
@@ -2255,10 +1887,9 @@ impl App {
         attached
     }
 
-    /// A newly attached window can remain behind another app without ever
-    /// receiving a focus event: read the OS window's key state at attach and
-    /// hand it to [`Self::adopt_initial_focus`], the one attach-time seam both
-    /// successful CPU/GPU tails call.
+    /// Read the OS window's key state at attach and hand it to
+    /// [`Self::adopt_initial_focus`], since a window can come up behind another
+    /// app without any focus event.
     fn adopt_attached_window_focus(&mut self, wid: WindowId) {
         let focused = self
             .windows
@@ -2268,16 +1899,12 @@ impl App {
         self.adopt_initial_focus(wid, focused);
     }
 
-    /// THE ATTACH-TIME FOCUS ADOPTION (`docs/DESIGN-host-boundary-2026-08-30.md`
-    /// §7 decision 8). `os_focus` is the OS window's `has_focus()` at attach;
-    /// `None` (no OS surface) keeps the controller-declared focus. Otherwise the
-    /// window takes the OS answer before its first frame, through
-    /// [`Self::on_focus`] — the seam cursor/pet/rain visibility, modifier state,
-    /// notification suppression and focus reports share. On macOS this agrees
-    /// with what winit sends anyway (a `Focused(false)` queued for every window
-    /// it creates, then `Focused(true)` if activation makes it key); on a
-    /// backend that sends no creation-time event it is the only correction a
-    /// window born behind another app ever gets.
+    /// Attach-time focus adoption (`docs/DESIGN-host-boundary-2026-08-30.md` §7
+    /// decision 8). `os_focus` is the OS window's `has_focus()` at attach; `None`
+    /// (no OS surface) keeps the controller-declared focus. Otherwise the window
+    /// takes the OS answer before its first frame through [`Self::on_focus`]. On
+    /// backends that send no creation-time focus event this is the only
+    /// correction a window born behind another app gets.
     pub(crate) fn adopt_initial_focus(&mut self, wid: WindowId, os_focus: Option<bool>) {
         if let Some(focused) = os_focus
             && self
@@ -2289,61 +1916,65 @@ impl App {
         }
     }
 
-    /// LINUX INITIAL-FRAME SETTLE (see [`crate::InitialFrameSettle`]): called on
-    /// every `WindowEvent::Resized` AFTER the normal reflow has applied `size`.
-    /// While armed and inside the deadline, a `size` that is NOT the attach's
-    /// intended `rows`×`cols` frame — re-derived at the window's CURRENT scale,
-    /// so a post-map `ScaleFactorChanged` folds into the same target — spends
-    /// one corrective `request_inner_size`. A matching `size` after a correction
-    /// disarms (settled); a matching `size` BEFORE any correction keeps the arm,
-    /// because GNOME's activation configure can echo the pre-CSD-frame geometry
-    /// (header subtracted, −35 px) AFTER an initially-correct resize. winit
-    /// itself drops the request under a non-stateless configure
-    /// (maximized/fullscreen/tiled), so a tiling compositor is never fought.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn settle_initial_frame(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
+    /// The grid half of a `WindowEvent::Resized`: the settle's veto first, then
+    /// the throttled apply, in one testable unit so a compositor echo never
+    /// reaches the PTY.
+    ///
+    /// The reflow is scoped to the active tab via `resize_live_drag`, which
+    /// `on_resize_throttled` -> ... -> `resize_panes` reads; it is set and
+    /// cleared inline. The settle's own correction runs with it clear (all tabs).
+    pub(crate) fn apply_window_resized_grid(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
+        #[cfg(any(target_os = "linux", test))]
+        if self.settle_initial_frame(wid, size) {
+            return;
+        }
+        self.resize_live_drag = true;
+        self.on_resize_throttled(wid, size);
+        self.resize_live_drag = false;
+    }
+
+    /// Linux initial-frame settle (see [`crate::InitialFrameSettle`]): called on
+    /// every `WindowEvent::Resized` before the reflow applies `size`; returns
+    /// whether it took the size over (the caller must then not apply it). While
+    /// armed and before the deadline, a `size` whose grid is not the intended
+    /// `rows`×`cols` at the current scale spends one corrective
+    /// `request_inner_size`. A match after a correction disarms; a match before
+    /// any correction keeps the arm, because GNOME's activation configure can
+    /// echo the pre-CSD geometry later. winit drops the request under a
+    /// non-stateless configure (maximized/fullscreen/tiled).
+    ///
+    /// It runs before the apply so a size about to be corrected is never applied:
+    /// shrinking and restoring the PTY sends a net-zero SIGWINCH pair, and an
+    /// alternate-screen app loses its top row and may not repaint. On a
+    /// synchronous grant the corrected size is applied instead; on an
+    /// asynchronous one the vetoed size is parked in `pending_resize`, superseded
+    /// by the correction's `Resized`, or applied after
+    /// [`App::SETTLE_VETO_FALLBACK`] if the WM refuses.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn settle_initial_frame(&mut self, wid: WindowId, size: PhysicalSize<u32>) -> bool {
         let Some(settle) = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.initial_frame_settle)
         else {
-            return;
+            return false;
         };
         if Instant::now() > settle.deadline || settle.corrections == 0 {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.initial_frame_settle = None;
             }
-            return;
+            return false;
         }
-        // Re-tune the shared backend to THIS window's live scale before deriving
-        // the target frame — a `ScaleFactorChanged` may have landed since attach
-        // and `window_frame_px_for` reads the backend's current cell metrics.
+        // Re-tune the shared backend to this window's live scale first, since
+        // `window_frame_px_for` reads its cell metrics.
         self.apply_window_scale(wid);
         let intended = self.window_frame_px_for(wid, settle.rows, settle.cols);
-        // THE SETTLE'S SUBJECT IS THE GRID, NOT THE PIXEL COUNT. Asking for
-        // `size == intended` is the same question only while the frame law's
-        // output is representable on the wire, and at a FRACTIONAL scale it is
-        // not: winit hands Wayland a LOGICAL size, which must be a whole number,
-        // so a physical frame that is not a multiple of the scale's denominator
-        // is rounded up on the round trip and can never come back. Measured in a
-        // nested GNOME 50 (mutter 50.1) session at scale 1.5, 24×80: the frame
-        // law wants 1156×720, `1156/1.5 = 770.67` rounds to 771 logical, and the
-        // compositor returns 1157×720 — one px the request can never win. The
-        // grid is nevertheless exactly the 24×80 that was asked for, because
-        // `pad_split` absorbs the stray px into the right-edge band (`dims`
-        // reports `band_right=1`, `crop_*=0`), which is precisely what the
-        // per-edge bands exist for.
-        //
-        // Pixel equality therefore burned the whole correction budget every
-        // fractional-scale launch — three synchronous `request_inner_size` +
-        // resync + redraw round trips, at the most latency-sensitive moment a
-        // window has, fighting for a size the compositor cannot express — and
-        // then parked the arm until the deadline instead of disarming. Comparing
-        // the GRID asks the question the settle actually cares about: 1.25/1.5
-        // now settle on the first configure like 1× and 2× always did, while the
-        // real defect this mechanism exists for (GNOME subtracting the 35 px CSD
-        // header, which costs three whole ROWS) still differs in the grid and is
-        // still corrected.
+        // Compare grids, not pixels. At a fractional scale winit sends Wayland a
+        // whole-number logical size, so the physical frame can come back a pixel
+        // off (e.g. 1157 for 1156 at 1.5×) while the grid is exact; `pad_split`
+        // puts the stray px in the right band. Pixel equality would spend the
+        // whole correction budget on an unreachable size. The CSD header
+        // subtraction this settle exists for still changes the grid.
         let grid_now = self.grid_dims_for(wid, size);
         if grid_now == (settle.rows, settle.cols) {
             if size != intended {
@@ -2366,7 +1997,7 @@ impl App {
             {
                 ws.initial_frame_settle = None;
             }
-            return;
+            return false;
         }
         aterm_log::debug!(
             "initial-frame settle: {}x{} grids {}x{}, attach asked for {}x{} — \
@@ -2382,50 +2013,83 @@ impl App {
             settle.corrections.saturating_sub(1)
         );
         let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
+            return false;
         };
         if let Some(s) = ws.initial_frame_settle.as_mut() {
             s.corrections -= 1;
             s.corrected = true;
         }
-        let Some(w) = ws.os_window.clone() else {
+        // winit's Wayland backend applies this request synchronously and returns
+        // `Some`, with no `Resized` to follow. `None` means X11/async or no OS
+        // window. [`App::settle_take_over`] handles both.
+        let os_window = ws.os_window.clone();
+        let granted = os_window
+            .as_ref()
+            .and_then(|w| w.request_inner_size(intended));
+        self.settle_take_over(wid, size, granted, settle.deadline);
+        if granted.is_some()
+            && let Some(w) = os_window
+        {
+            w.request_redraw();
+        }
+        true
+    }
+
+    /// How long a size the settle vetoed on an asynchronous backend stays parked
+    /// before the fallback applies the window's real size. It must outlast the
+    /// correction's configure round trip, or the fallback and the correction
+    /// produce the net-zero SIGWINCH pair the veto exists to prevent. Capped by
+    /// the settle's deadline.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const SETTLE_VETO_FALLBACK: std::time::Duration =
+        std::time::Duration::from_millis(250);
+
+    /// The settle's take-over of a vetoed `Resized` size, given what the
+    /// corrective `request_inner_size` answered (`granted`). Separate from
+    /// [`App::settle_initial_frame`] so the synchronous branch is testable.
+    ///
+    /// `Some(applied)` (Wayland): the request was applied synchronously and no
+    /// `Resized` follows, so the applied size goes through the resize path in
+    /// place of the echo and any pending throttled reflow is cancelled. If the
+    /// compositor refused, `applied` is the current size.
+    ///
+    /// `None` (X11/async, or no OS window): the correction arrives as a later
+    /// `Resized`. The vetoed size is parked in the trailing settle instead; the
+    /// correction supersedes it, and a refused request still lands the real size
+    /// after [`App::SETTLE_VETO_FALLBACK`] or at the settle's deadline.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn settle_take_over(
+        &mut self,
+        wid: WindowId,
+        vetoed: PhysicalSize<u32>,
+        granted: Option<PhysicalSize<u32>>,
+        settle_deadline: Instant,
+    ) {
+        let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        // winit's Wayland backend applies this request SYNCHRONOUSLY and
-        // returns `Some` — NO `Resized` event will follow (the event-driven
-        // shape the macOS/X11 backends have). Left unhandled, the app keeps
-        // the echo's size while the compositor holds the corrected one, and
-        // the two never reconverge (observed: a 24-row engine cropped into a
-        // 329 px surface). So feed the applied size through the same resize
-        // path an event would have taken, and cancel the throttled reflow of
-        // the very size being corrected away — its trailing settle would
-        // otherwise re-apply the stale grid on top of this resync. `None`
-        // (X11/async) keeps the event path authoritative.
-        if let Some(applied) = w.request_inner_size(intended) {
+        if let Some(applied) = granted {
             ws.pending_resize = None;
             ws.next_resize_settle = None;
             ws.win_px = Some(applied);
             self.sync_surface_to_window(wid);
             self.on_resize(wid, applied);
-            w.request_redraw();
+        } else {
+            let fallback = (Instant::now() + Self::SETTLE_VETO_FALLBACK).min(settle_deadline);
+            ws.pending_resize = Some(vetoed);
+            ws.next_resize_settle = Some(fallback);
         }
     }
 
-    /// LOGICAL window teardown (NO winit/`el`): close window `wid` — drop every one
-    /// of its tabs' PANES' views (the last view closes the PTY master via
-    /// `Session::drop`), remove the window (dropping its present target →
-    /// surface/`Arc<Window>`; the SHARED GPU device on the `Backend` is NEVER
-    /// dropped — the S6 invariant), clear its winit mapping, and re-point
-    /// `frontmost_window` to a surviving window if it named the closed one. Returns
-    /// whether the APP should now exit ([`CloseOutcome::Exit`] iff no windows
-    /// remain). A stale/unknown `wid` is a silent `Stay`.
+    /// Logical window teardown (no winit): drop the views of every pane in every
+    /// tab of `wid` (the last view closes the PTY master via `Session::drop`),
+    /// remove the window (the shared GPU device on `Backend` is never dropped),
+    /// clear its winit mapping and re-point `frontmost_window` if needed. Returns
+    /// [`CloseOutcome::Exit`] iff no windows remain; a stale `wid` is `Stay`.
     ///
-    /// SPEC (TRUST_VACUITY_GATE §2.3 / finding 3): this real production seam IS the
-    /// `WindowRouting.CloseWindow` action — decrement `win_count`, exit-iff-empty, and
-    /// the nondeterministic frontmost re-point. The `#[refines]` (paired with the
-    /// `CreateWindow` anchor) makes `window_routing` actively-bound + coverage-gated;
-    /// its Tier-1 conformance is run by the gate (`run_window_routing_conformance`).
-    /// PROJECTION `aterm_gui::App::project_window_routing` (the `window_routing_conformance::project`).
+    /// Refines `WindowRouting.CloseWindow`: decrement `win_count`, exit iff empty,
+    /// nondeterministic frontmost re-point. Projection:
+    /// `window_routing_conformance::project` (lib.rs).
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -2443,43 +2107,32 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return CloseOutcome::Stay; // stale/unknown id → no-op
         }
-        // A single-tab window's close was DEFERRED: the gesture that started it
-        // (✕, Cmd-W, ctl `close`/`tab close`) captured its attribution on the
-        // window (`stash_deferred_close_attribution`) because THIS teardown — and
-        // the deregistration below that journals the exit — runs a later turn,
-        // after that gesture's `CloseAttribution` scope has dropped. Re-enter it
-        // now so `deregister_local_as` writes `reason=ctl-close`/`ui-close`
-        // instead of `reason=unknown by=-`. `enter` is outermost-wins, so a
-        // still-live scope (a red-button close that owns its own) takes
-        // precedence and this is inert; the stash is taken either way so it never
-        // outlives its close.
+        // A single-tab close is deferred, so the gesture's `CloseAttribution`
+        // scope has dropped by now; re-enter the attribution stashed on the window
+        // so `deregister_local_as` records `ctl-close`/`ui-close`. `enter` is
+        // outermost-wins, so a live scope takes precedence. The stash is taken
+        // either way.
         let deferred_attribution = self
             .windows
             .get_mut(&wid)
             .and_then(|ws| ws.pending_close_attribution.take());
         let _deferred_close = deferred_attribution
             .map(|(reason, actor)| crate::session_store::CloseAttribution::enter(reason, actor));
-        // The recording owns this WindowState's tap and a pre-created output
-        // directory. Abort while the tap is still reachable, before structural
-        // removal can strand the client until its old deadline.
+        // Abort a recording that owns this window's tap while the tap is still
+        // reachable, so its client is not stranded until the deadline.
         let _ = self.video_abort_window_close(wid);
         let Some(ws) = self.windows.get(&wid) else {
             return CloseOutcome::Stay;
         };
-        // RESTORE-1: this close is about to end the app (the last window is
-        // going away) — capture the layout manifest NOW, while the window's tabs/panes
-        // and the pool's sessions are still intact (everything below tears them down
-        // before the `CloseOutcome::Exit` reaches `el.exit()`). The post-loop writer in
-        // `main` persists it (and is what gates headless runs off the user's manifest —
-        // this stash is memory-only).
+        // If this close ends the app, capture the layout manifest now while tabs,
+        // panes and sessions are intact. The post-loop writer in `main` persists
+        // it; this stash is memory-only.
         if self.config.restore_session_or_default() && self.exits_app_when_closing(wid) {
             self.quit_capture = Some(self.capture_restore_manifest());
         }
-        // Snapshot EVERY canonical terminal-view edge before mutating. The old
-        // all-terminal `layouts` projection deliberately omits heterogeneous tabs;
-        // using it here would leak a mixed tab's live Session/PTY on window close.
-        // Preserve duplicate session ids because each terminal View owns one pool
-        // attachment and therefore requires one matching detach.
+        // Snapshot every terminal-view edge before mutating. The `layouts`
+        // projection omits heterogeneous tabs and would leak a mixed tab's
+        // session. Duplicate ids are kept: each view needs one matching detach.
         let ids = self.window_terminal_sessions(wid);
         let view_ids: Vec<crate::tab_model::ViewId> = ws
             .tab_set
@@ -2487,13 +2140,10 @@ impl App {
             .iter()
             .flat_map(|tab| tab.root.leaves())
             .collect();
-        // Drop every pane's view. DETACH the pool view FIRST (which drops the Session
-        // iff it was the last view, closing its PTY master), and deregister from the
-        // process-wide registry ONLY when that detach actually dropped the session —
-        // a shared (Cmd-Shift-O) session still viewed in ANOTHER window keeps its
-        // single store entry while a view remains. A genuinely-closed id then
-        // fail-closes a later @<selector>. EACH pane is detached (not once per tab)
-        // so a split-tab window releases every pane's PTY.
+        // Detach each pane's pool view (dropping the Session and its PTY iff it was
+        // the last view), and deregister from the registry only when the detach
+        // dropped the session; a session shared with another window keeps its
+        // entry.
         for id in ids {
             if self.detach_session_view(id) {
                 self.retire_session_registration(id);
@@ -2502,9 +2152,8 @@ impl App {
         for view in view_ids {
             self.remove_view_link(view);
         }
-        // Forget this window's taskbar-progress change-detection entry BEFORE its HWND
-        // is dropped, so a later window reusing the same HWND value is not falsely
-        // skipped (its button vanishes with the window, so no explicit clear is needed).
+        // Forget this window's taskbar-progress entry before its HWND drops, so a
+        // later window reusing the HWND value is not skipped.
         #[cfg(windows)]
         {
             let hwnd = self.window_hwnd(wid);
@@ -2515,36 +2164,26 @@ impl App {
         // Drop the WindowState (its PresentTarget → GpuSurface/softbuffer Surface +
         // Arc<Window>; the shared GPU DEVICE on the Backend is untouched).
         self.windows.remove(&wid);
-        // SELECTION CUSTODY: the parked find origins are keyed by (session, window),
-        // but the only other prune is `detach_session_view`'s, which keys on SESSION.
-        // A window closed with a find origin still parked would leak its entry for
-        // the life of the process — and `WindowId`s are minted monotonically, so it
-        // can never be reclaimed by reuse either.
+        // Parked find origins are keyed by (session, window) and otherwise pruned
+        // only per session; drop this window's entries, since `WindowId`s are
+        // never reused.
         self.find_origins.retain(|(_, entry), _| *entry != wid);
         // Release this window's retained native toolbar backing objects (no-op off
         // macOS / when none was installed) so they don't outlive the window.
         self._toolbars.remove(&wid);
-        // A multi-line-paste confirmation sheet hanging off this window dies with it,
-        // and AppKit posts no answer for a sheet torn down that way — so retire the
-        // entry (and with it the key interceptor) HERE. Without this the app would keep
-        // a filter alive for a window that no longer exists and refuse the next paste
-        // confirmation as "already outstanding" until the self-healing attachment check
-        // caught it.
+        // A paste-confirmation sheet on this window dies with it and AppKit posts
+        // no answer, so retire the entry and its key interceptor here.
         #[cfg(target_os = "macos")]
         if self.paste_confirm.as_ref().is_some_and(|c| c.wid == wid) {
             self.paste_confirm = None;
         }
-        // Same rule for the in-window paste-confirmation banner (Linux): the parked
-        // text targeted THIS window's PTY, so the closing window takes the question
-        // with it — dropping the entry is the fail-closed cancel, and it frees the
-        // one-at-a-time slot for the next paste elsewhere.
+        // The in-window paste banner (Linux) targeted this window's PTY; dropping
+        // it is the fail-closed cancel and frees the one-at-a-time slot.
         if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
             self.paste_banner = None;
         }
-        // And for the close/quit confirm (Windows, `close_confirm`): the window
-        // closing was the very thing being asked about — a wire `close` or `tab
-        // close` landed while the question stood — so the question is moot.
-        // Dropping it is the only answer left, and it frees the one-at-a-time slot.
+        // The close/quit banner (Windows) asked about this very window, so it is
+        // moot; dropping it frees the slot.
         if self.close_banner.as_ref().is_some_and(|p| p.wid == wid) {
             self.close_banner = None;
         }
@@ -2557,9 +2196,8 @@ impl App {
         if self.pending_deminiaturize_focus == Some(wid) {
             self.pending_deminiaturize_focus = None;
         }
-        // Re-point frontmost if it named the just-closed window: the most-recently
-        // focused SURVIVOR (matching the window the OS raises), with a deterministic
-        // lowest-live-id fallback. See `next_frontmost_after_close`.
+        // Re-point frontmost to the most recently focused survivor, else the
+        // lowest live id. See `next_frontmost_after_close`.
         if self.frontmost_window == Some(wid) {
             self.frontmost_window = self.next_frontmost_after_close();
         }
@@ -2578,9 +2216,8 @@ impl App {
                 self.structural_invariant_violation().unwrap_or_default(),
             );
         }
-        // Glance refresh AFTER the store deregistration and the map removal,
-        // so the menu shows post-close truth (fires on the last close too —
-        // harmless when the loop is about to exit).
+        // Refresh the status item after deregistration so it shows post-close
+        // state.
         self.refresh_operator_status_item();
         if self.windows.is_empty() {
             CloseOutcome::Exit
@@ -2589,28 +2226,21 @@ impl App {
         }
     }
 
-    /// Record that `wid` gained OS focus — move it to the most-recent end of the
-    /// focus-order (MRU) stack consulted when the frontmost window closes. Removing
-    /// any prior occurrence before pushing keeps the stack deduped and bounded by the
-    /// live-window count. Called only from `WindowEvent::Focused(true)`, so headless
-    /// (no OS focus events) leaves `focus_order` empty and the re-point falls back to
-    /// the lowest live id — byte-identical to the pre-MRU behavior.
+    /// Record that `wid` gained OS focus: move it to the most-recent end of the
+    /// deduped MRU stack consulted when the front window closes. Called only from
+    /// `WindowEvent::Focused(true)`, so headless leaves it empty.
     pub(crate) fn note_window_focused(&mut self, wid: WindowId) {
         self.focus_order.retain(|w| *w != wid);
         self.focus_order.push(wid);
-        // The glance marks the frontmost window, and a same-window re-focus is
-        // the case the `frontmost_window` guard in the Focused(true) arm skips
-        // — this seam sees every focus gain (fingerprint-gated, cheap).
+        // The status item marks the frontmost window; this sees every focus gain,
+        // including same-window re-focus (fingerprint-gated).
         self.refresh_operator_status_item();
     }
 
-    /// The window to make frontmost when the current front window closes: the
-    /// most-recently-FOCUSED window that still exists (matching the window macOS
-    /// raises — usually NOT the lowest id), falling back to the lowest live
-    /// `WindowId` when no focus history applies (headless, or a window never
-    /// focused). The fallback keeps the choice DETERMINISTIC where there is no OS
-    /// focus to honor — the behavior the headless multi-window tests pin. Returns
-    /// `None` only when no window remains.
+    /// The window to make frontmost when the front window closes: the most
+    /// recently focused surviving window (what macOS raises), else the lowest
+    /// live `WindowId`, which keeps headless deterministic. `None` only when no
+    /// window remains.
     pub(crate) fn next_frontmost_after_close(&self) -> Option<WindowId> {
         self.focus_order
             .iter()
@@ -2620,9 +2250,9 @@ impl App {
             .or_else(|| self.windows.keys().next().copied())
     }
 
-    /// Close window `wid` and exit the app IFF it was the LAST window (the
-    /// `ExitIffEmpty` invariant). The single routing point for every close path
-    /// (CloseRequested, last-tab Cmd-W/CloseTab, a last-tab `Wake::Exit`).
+    /// Close window `wid` and exit the app iff it was the last window. The routing
+    /// point for every close path (CloseRequested, last-tab Cmd-W/CloseTab, a
+    /// last-tab `Wake::Exit`).
     pub(crate) fn close_window(&mut self, el: &ActiveEventLoop, wid: WindowId) {
         if self.defer_pending_update_handoff_teardown(crate::DeferredHandoffTeardown::mutation(
             crate::DeferredHandoffMutation::CloseWindow(wid),
@@ -2652,12 +2282,9 @@ impl App {
         }
     }
 
-    /// Escalate any window whose LAST-tab close set `pending_close`: close it (the
-    /// close paths have no `ActiveEventLoop`, so they flag instead). The flag is set
-    /// on the FRONTMOST window by keyboard/menu Cmd-W and on the CLICKED window by a
-    /// tab-strip close — either may differ from the event-stamped window — so SCAN
-    /// for it rather than assume the event window. At most one is set per action;
-    /// clearing it first guards against a re-trigger if the close somehow no-ops.
+    /// Close any window whose last-tab close set `pending_close` (those paths have
+    /// no `ActiveEventLoop`). The flag may be on the frontmost or the clicked
+    /// window, so scan for it. It is cleared first to avoid a re-trigger.
     pub(crate) fn escalate_pending_close(&mut self, el: &ActiveEventLoop) {
         let to_close: Vec<WindowId> = self
             .windows
@@ -2670,40 +2297,28 @@ impl App {
                 ws.pending_close = false;
             }
             // The destructive-close confirm already ran at the tab-close gate
-            // (`window_exit_close_allowed`, inside `close_tab_at`/`close_active_tab`)
-            // BEFORE `pending_close` was set, so this escalation must NOT re-prompt —
-            // it just tears the window down (exiting the app iff it was the last
-            // window). Re-confirming here would pop a SECOND dialog for one gesture.
+            // (`window_exit_close_allowed`), so do not prompt again.
             self.close_window(el, w);
         }
     }
 
-    /// M2 quit-safety: whether session `id` is running a foreground JOB (not the
-    /// idle shell). See [`Self::session_busy`]. Unknown id → idle. Crate-visible
-    /// for the `close` verb's per-pane guard (`App::pane_close_hangs_up_a_job`),
-    /// which must read the SAME predicate the window close reads.
+    /// Whether session `id` is running a foreground job (not the idle shell). See
+    /// [`Self::session_busy`]. Unknown id → idle. Also used by the `close` verb's
+    /// per-pane guard (`App::pane_close_hangs_up_a_job`).
     pub(crate) fn session_foreground_busy(&self, id: u64) -> bool {
         self.pool.get(id).is_some_and(Self::session_busy)
     }
 
-    /// THE one busy predicate every close path reads — the ctl `close` / `tab
-    /// close` refusal, the caption ✕ / red light, Close Tab and Quit — so the
-    /// four cannot disagree. [`crate::quit_safety::foreground_busy`]: the
-    /// shell-integration state — the fact `status`/`blocks` already showed
-    /// (executing: OSC 133;C opened, no 133;D yet) while the windows walk alone
-    /// let `close` end an instance mid-`Start-Sleep 60` (audit 2026-09-22) — OR
-    /// the PTY's verdict (`tcgetpgrp` on unix; on windows the child-process
-    /// walk, which counts only a child the shell started since it last said it
-    /// went idle, [`crate::quit_safety::ShellWord`]: the walk alone refused an
-    /// idle pwsh over a recycled parent pid and every idle Git Bash over its
-    /// launcher, 2026-09-27).
+    /// The busy predicate every close path reads (ctl `close`/`tab close`, the
+    /// close button, Close Tab, Quit): [`crate::quit_safety::foreground_busy`] over
+    /// the shell-integration state (OSC 133;C open without 133;D) or the PTY's
+    /// verdict (`tcgetpgrp` on unix; on Windows a child-process walk counting only
+    /// children started since the shell last went idle,
+    /// [`crate::quit_safety::ShellWord`]).
     ///
-    /// The engine is LOCKED, not `try_lock`ed: a close gesture is a one-off on
-    /// the main thread, which already takes this lock every frame to render, and
-    /// the only other holder is the PTY reader for the length of one chunk. A
-    /// contended `try_lock` would have to guess, and a guess here is either a
-    /// killed job or a wedged close. Poison is recovered the way every other
-    /// main-thread read of the engine recovers it.
+    /// The engine is locked, not `try_lock`ed: a close is a one-off on the main
+    /// thread and a contended guess would either kill a job or wedge the close.
+    /// Poison is recovered like every other main-thread engine read.
     fn session_busy(s: &crate::Session) -> bool {
         let word = {
             let term = s
@@ -2719,12 +2334,9 @@ impl App {
         )
     }
 
-    /// M2: any pane (across every tab) of window `wid` has a foreground job that
-    /// CLOSING this window would actually SIGHUP. A Cmd-Shift-O co-viewed session has
-    /// one PTY but is shown in more than one window (pool view-count > 1); closing this
-    /// window only detaches its view and the shell keeps running elsewhere — so it must
-    /// NOT arm the close confirm. Only a session whose LAST viewer is this window
-    /// (`views == 1`) is at risk, so only those count toward "busy".
+    /// Whether closing window `wid` would SIGHUP a foreground job. A session also
+    /// viewed in another window only loses a view, so only sessions whose last
+    /// viewer is this window count.
     fn window_has_foreground_job(&self, wid: WindowId) -> bool {
         let mut ids = self.window_terminal_sessions(wid);
         ids.sort_unstable();
@@ -2734,9 +2346,8 @@ impl App {
         })
     }
 
-    /// Closing `wid` removes all of its canonical view edges at once. A shared
-    /// session is therefore safe only when at least one pool view remains outside
-    /// this window—not merely when its global refcount happens to exceed one.
+    /// Closing `wid` removes all of its view edges at once, so a shared session is
+    /// safe only when a pool view remains outside this window.
     fn window_drops_last_session_view(&self, wid: WindowId, session: u64) -> bool {
         let local_views = self
             .window_terminal_sessions(wid)
@@ -2750,75 +2361,51 @@ impl App {
                 .is_some_and(|all_views| all_views <= local_views)
     }
 
-    /// M2: any live session in the whole app has a foreground job running — the
-    /// whole-app Quit's `busy`, read through the same [`Self::session_busy`] the
-    /// per-window close reads, so a job Quit would kill is never one Close Tab
-    /// would have refused.
+    /// Whether any live session has a foreground job: the app Quit's `busy`, read
+    /// through the same [`Self::session_busy`] as the window close.
     fn any_foreground_job(&self) -> bool {
         self.pool.iter().any(Self::session_busy)
     }
 
     /// Arm the ~2 s close/quit confirm window on `wid` and show the warning in its
-    /// titlebar (`apply_title` suppresses overwriting it while armed; `new_events`
-    /// restores the live title at expiry).
-    fn arm_close_warning(&mut self, wid: WindowId) {
+    /// titlebar — the quit's words when the gesture was a quit (`apply_title`
+    /// suppresses overwriting it while armed; `new_events` restores the live
+    /// title at expiry).
+    fn arm_close_warning(&mut self, wid: WindowId, quit_gesture: bool) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.close_warning_until =
                 Some(Instant::now() + crate::quit_safety::CLOSE_CONFIRM_WINDOW);
             if let Some(w) = ws.os_window.as_ref() {
-                w.set_title(crate::quit_safety::CLOSE_WARNING_TITLE);
+                w.set_title(crate::quit_safety::warning_title(quit_gesture));
             }
         }
     }
 
     /// Confirm a destructive close/quit gesture for window `wid`, returning `true` to
-    /// PROCEED. `exits_app` = the gesture quits the WHOLE program (Cmd-Q / app-menu
-    /// Quit, or a close that removes the last window); `busy` = closing now would
-    /// SIGHUP a foreground job.
+    /// proceed. `exits_app`: the gesture quits the whole program (Cmd-Q, app-menu
+    /// Quit, or closing the last window); `busy`: closing now would SIGHUP a
+    /// foreground job.
     ///
-    /// On macOS this shows the native confirmation dialog (`NSAlert`) — ALWAYS for a
-    /// whole-app quit (the iTerm-style "are you sure you want to quit?" the user
-    /// expects from ⌘Q) and, for a window/tab close that leaves the app running, only
-    /// while a job is running. Off macOS (no native dialog) it falls back to the ~2 s
-    /// titlebar-warning confirm: the gesture is refused once (arming the warning) and
-    /// proceeds on a repeat within the window.
+    /// macOS shows the native `NSAlert`: always for a whole-app quit, and for a
+    /// window/tab close only while a job runs. Linux uses the ~2 s titlebar-warning
+    /// confirm: the gesture is refused once and proceeds on a repeat.
     ///
-    /// NON-INTERACTIVE closes never reach a dialog: `headless` (no window to confirm
-    /// against) always proceeds, and a control-socket-driven close answers by its
-    /// [`CloseConfirm`] policy — the `close` and `tab close` verbs proceed when
-    /// idle and are REFUSED (never asked) when a job runs, which is the `ERR close
-    /// refused (a running job armed the last-tab confirm)` the `close` catalog
-    /// entry promises; only an explicit instruction proceeds busy or not — the
-    /// operator's typed Stop row, and the replay of a close the human already
-    /// confirmed on the windows banner ([`CloseConfirm::Programmatic`]).
-    /// Either way no wire close blocks on a human click: that wedged the UI thread
-    /// inside `runModal` and the client's reply behind it — measured 2026-09-08, a
-    /// `close` of an idle last tab in a background window hung the instance until
-    /// it was killed. The M2 busy-job guard is therefore a refusal on the wire
-    /// verbs, not enforced at all headless, and a dialog only for UI gestures.
+    /// Non-interactive closes never reach a dialog: headless always proceeds, and a
+    /// control-socket close answers by its [`CloseConfirm`] policy. The `close` and
+    /// `tab close` verbs proceed when idle and are refused when a job runs (the
+    /// refusal reaches the wire through `pending_action_refusal`); only an explicit
+    /// instruction ([`CloseConfirm::Programmatic`]) proceeds regardless. A wire close
+    /// never blocks on a human click.
     ///
-    /// `tab close` used to run `Programmatic` — proceed busy or not — so a `tab
-    /// close` of a last tab with a running job killed the job and ended the
-    /// instance with `OK 0 1` while the sibling `close` refused and `invoke
-    /// CloseTab` raised the dialog (audit 2026-09-22, reproduced twice). The
-    /// refusal now travels through `pending_action_refusal`, the channel the
-    /// `tab` verb's `apply_tab_cmd_in` and the menu `invoke` seam read, so it
-    /// answers on the wire in the `close` verb's exact words instead of an `OK`
-    /// over a tab that is still there.
+    /// Windows asks through the in-window banner, not a dialog: a task-modal dialog
+    /// would park the event loop and every control verb with it. The gesture is
+    /// refused now (`false`) and its question parked on `close_banner` (see
+    /// [`crate::close_confirm`]); Enter replays it under
+    /// [`CloseConfirm::Programmatic`], so it is never asked twice.
     ///
-    /// WINDOWS ASKS THROUGH THE IN-WINDOW BANNER, NOT A DIALOG (2026-09-22 audit):
-    /// the native confirm there was a task-modal `TaskDialogIndirect` on this
-    /// thread, which parked the event loop until a human clicked — and with it every
-    /// control verb (`ERR main-thread reply did not arrive within 30s`), with nothing
-    /// reporting that a dialog was pending. So on Windows an interactive gesture
-    /// that needs a confirm is REFUSED NOW (`false`) and its question is parked on
-    /// `close_banner` (see [`crate::close_confirm`]); Enter later REPLAYS the gesture
-    /// under [`CloseConfirm::Programmatic`], so it is never asked twice. The macOS
-    /// `NSAlert` and the Linux titlebar-warning confirm are untouched.
-    ///
-    /// The gesture here is a WINDOW close — a last-tab close that escalates to one,
-    /// Alt+F4, the caption ✕ — so its replay is [`crate::close_confirm::CloseReplay::Window`];
-    /// the Quit action names its own replay through [`Self::confirm_destructive_gesture`].
+    /// The gesture here is a window close (a last-tab close, Alt+F4, the caption ✕),
+    /// so its replay is [`crate::close_confirm::CloseReplay::Window`]; Quit names its
+    /// own replay through [`Self::confirm_destructive_gesture`].
     pub(crate) fn confirm_destructive_close(
         &mut self,
         wid: WindowId,
@@ -2835,9 +2422,10 @@ impl App {
 
     /// [`Self::confirm_destructive_close`] with the gesture's REPLAY named: what
     /// Enter re-runs once the Windows banner is answered (a window close, or the
-    /// whole-app quit whose barriers a window close does not run). Off Windows the
-    /// replay is unused — macOS answers synchronously through the alert, Linux by
-    /// the armed titlebar warning — and the decision is byte-identical to before.
+    /// whole-app quit whose barriers a window close does not run). macOS answers
+    /// synchronously through the alert; Linux arms the titlebar warning, worded
+    /// for the gesture the replay names (a close that ends the last window still
+    /// says "close").
     pub(crate) fn confirm_destructive_gesture(
         &mut self,
         wid: WindowId,
@@ -2852,11 +2440,9 @@ impl App {
             CloseConfirm::Programmatic => return true,
             CloseConfirm::WireRefuseBusy => {
                 if busy {
-                    // Every consumer of this channel clears it BEFORE its own
-                    // action (`apply_tab_cmd_in`, `invoke_menu_action_by_name`),
-                    // so a `close`-verb refusal — which answers from the store
-                    // diff and never reads this — cannot be reported against a
-                    // later `tab` or `invoke`.
+                    // Every consumer of this channel clears it before its own action
+                    // (`apply_tab_cmd_in`, `invoke_menu_action_by_name`), so this
+                    // refusal is never reported against a later `tab` or `invoke`.
                     self.pending_action_refusal = Some(WIRE_CLOSE_REFUSED.to_string());
                 }
                 return !busy;
@@ -2870,6 +2456,8 @@ impl App {
         // the closing window's for a window close. A last-tab close
         // (`window_exit_close_allowed`) reaches here with the window already down
         // to one tab, so it stays instant while idle under both policies.
+        // A quit with restore on loses the shells, not the layout: the copy says so.
+        let reopens = self.config.restore_session_or_default();
         #[cfg(windows)]
         let prompt = {
             let tabs_closing: usize = if exits_app {
@@ -2877,22 +2465,18 @@ impl App {
             } else {
                 self.windows.get(&wid).map_or(1, |ws| ws.tab_set.len())
             };
-            crate::quit_safety::confirm_prompt_windows(exits_app, tabs_closing, busy)
+            crate::quit_safety::confirm_prompt_windows(exits_app, tabs_closing, busy, reopens)
         };
         #[cfg(not(windows))]
-        let prompt = crate::quit_safety::confirm_prompt(exits_app, busy);
+        let prompt = crate::quit_safety::confirm_prompt(exits_app, busy, reopens);
         let Some(prompt) = prompt else {
             // Nothing worth interrupting for (macOS: app keeps running and nothing
             // is busy; Windows: also a single idle tab): the close needs no confirm.
             return true;
         };
-        // Windows: park the question on the in-window banner and refuse for now —
-        // never `apprt.confirm`, whose task-modal dialog is the loop-parking wedge
-        // this arm replaces (see the doc above and `close_confirm`). A `cfg!`, not
-        // a `#[cfg]` split: both arms stay compiled on every host, so neither the
-        // banner (unused off Windows) nor the titlebar fallback below (unused on
-        // it) is dead code anywhere, and off Windows the branch is never taken —
-        // macOS and Linux run exactly the code they ran before.
+        // Windows: park the question on the in-window banner and refuse for now,
+        // never `apprt.confirm` (see the doc above and `close_confirm`). `cfg!`
+        // rather than `#[cfg]` keeps both arms compiled on every host.
         if cfg!(windows) {
             return self.present_close_banner(wid, prompt, replay);
         }
@@ -2902,9 +2486,8 @@ impl App {
         {
             return proceed;
         }
-        // No native dialog on this platform (off macOS): the in-window
-        // titlebar-warning fallback. `close_decision` gates on `busy` only, so an
-        // idle whole-app quit still closes immediately (as before); a busy gesture
+        // Off macOS and Windows: the titlebar-warning fallback. `close_decision`
+        // gates on `busy` only, so an idle quit closes immediately; a busy gesture
         // is refused once and confirmed by a repeat within the armed window.
         let armed = self
             .windows
@@ -2914,29 +2497,25 @@ impl App {
         match crate::quit_safety::close_decision(busy, armed) {
             crate::quit_safety::CloseDecision::Close => true,
             crate::quit_safety::CloseDecision::Warn => {
-                self.arm_close_warning(wid);
+                self.arm_close_warning(
+                    wid,
+                    matches!(replay, crate::close_confirm::CloseReplay::Quit),
+                );
                 false
             }
         }
     }
 
-    /// Park a destructive question on the in-window banner over `wid` and REFUSE the
-    /// gesture for now: `false`, always. The event loop keeps turning while the
-    /// question stands, which is the whole point (`close_confirm`). ONE at a time: a
-    /// second gesture while one stands is refused too and the STANDING question keeps
-    /// its answer — the disabled owner window of the modal this replaces refused a
-    /// second Alt+F4 the same way — with a log line so the drop is not silent.
+    /// Park a destructive question on the in-window banner over `wid` and refuse
+    /// the gesture for now (always `false`), so the event loop keeps turning
+    /// (`close_confirm`). One at a time: a second gesture while one stands is
+    /// refused and logged, and the standing question stays.
     ///
-    /// The gesture's exit-ledger attribution is carried onto the window NOW, while
-    /// its `CloseAttribution` scope is still open (a Ctrl-W / strip-✕ close enters
-    /// `ui-close by=human` at its top): the replay runs a later turn with no scope,
-    /// exactly the deferral `close_tab_at` stashes for, so without this the journal
-    /// would say `reason=unknown by=-` for a close the user confirmed by name.
+    /// The gesture's exit-ledger attribution is stashed on the window now, while
+    /// its `CloseAttribution` scope is open, because the replay runs later with no
+    /// scope.
     ///
-    /// A MINIMIZED window is restored first. The dialog this replaces came up on
-    /// its own over whatever was on screen; a band painted into an iconic window
-    /// is a question nobody can see, so a taskbar "Close window" on a minimized
-    /// busy window would read as a close that silently did nothing.
+    /// A minimized window is restored first, so the banner is visible.
     pub(crate) fn present_close_banner(
         &mut self,
         wid: WindowId,
@@ -2954,16 +2533,14 @@ impl App {
             self.pending_action_refusal = Some(standing.wire_refusal());
             return false;
         }
-        // Who asked decides who may answer (`PendingClose::wire_may_answer`): the
-        // attribution scope the gesture opened — `ctl-close` for `invoke`, the
-        // human's `ui-close` / `window-close` for Ctrl-W / the caption ✕, none for
-        // the Quit menu — read NOW, while it is still open, like the stash below.
+        // Who asked decides who may answer (`PendingClose::wire_may_answer`): read
+        // the gesture's attribution scope (`ctl-close` for `invoke`, `ui-close` /
+        // `window-close` for the human, none for Quit) while it is still open.
         let (_, asked_by) = crate::session_store::current_close_attribution();
         let pending = crate::close_confirm::PendingClose::new(wid, prompt, replay, asked_by);
-        // A gesture that mints a reply (`invoke CloseTab`, the `tab` verb) says the
-        // question is pending and how to answer it — never `OK` over a tab that is
-        // still there. Every wire consumer clears this before its own action, so a
-        // human's Ctrl-W leaves nothing a later verb could be blamed for.
+        // A gesture that mints a reply (`invoke CloseTab`, the `tab` verb) reports
+        // the pending question and how to answer it. Wire consumers clear this
+        // before their own action.
         self.pending_action_refusal = Some(pending.wire_refusal());
         self.stash_deferred_close_attribution(wid);
         self.close_banner = Some(pending);
@@ -2976,14 +2553,12 @@ impl App {
         false
     }
 
-    /// Answer the in-window close/quit banner: `proceed` REPLAYS the parked gesture
-    /// through [`crate::Wake::ConfirmedClose`] — the one lane that holds the
-    /// `ActiveEventLoop` the close needs — and `!proceed` drops the question, so
-    /// nothing closes. Reached from the Enter/Escape gate in `on_key`, from a click
-    /// on the band (`app_mouse`), and from the wire's `confirm yes|no`
-    /// ([`Self::answer_close_confirm_from_wire`]). No-op (`None`) when no banner is
-    /// up. Returns the replay it posted, for the seams and tests that have no event
-    /// loop to watch.
+    /// Answer the in-window close/quit banner: `proceed` replays the parked gesture
+    /// through [`crate::Wake::ConfirmedClose`] (the lane with the `ActiveEventLoop`
+    /// the close needs); `!proceed` drops the question. Reached from Enter/Escape in
+    /// `on_key`, a click on the band (`app_mouse`) and the wire's `confirm yes|no`
+    /// ([`Self::answer_close_confirm_from_wire`]). `None` when no banner is up;
+    /// otherwise the replay it posted.
     pub(crate) fn answer_close_banner(
         &mut self,
         proceed: bool,
@@ -3013,15 +2588,12 @@ impl App {
     }
 
     /// The `confirm yes|no` verb ([`crate::Wake::AnswerCloseConfirm`]): answer the
-    /// standing question exactly as Enter / Escape at the window would, when the
-    /// wire may. `Ok` is the reply after `OK ` (`answered=yes kind=quit`), `Err`
-    /// the refusal after `ERR `.
+    /// standing question as Enter/Escape would, when the wire may. `Ok` is the text
+    /// after `OK ` (`answered=yes kind=quit`), `Err` the refusal after `ERR `.
     ///
-    /// It needs no aim: there is ONE question per instance, so the verb reaches it
-    /// over whichever window it stands, whatever window is in front. A wire
-    /// keystroke never answers it (see [`crate::close_confirm`] for the two ways
-    /// that failed), and a question a person asked at the window is refused here
-    /// and left standing for them ([`crate::close_confirm::PendingClose::wire_may_answer`]).
+    /// There is one question per instance, so no aim is needed. A question a
+    /// person asked at the window is refused here and left for them
+    /// ([`crate::close_confirm::PendingClose::wire_may_answer`]).
     pub(crate) fn answer_close_confirm_from_wire(
         &mut self,
         proceed: bool,
@@ -3037,14 +2609,10 @@ impl App {
         Ok(reply)
     }
 
-    /// Serve [`crate::Wake::ConfirmedClose`]: run the gesture the banner stood in
-    /// for, under [`CloseConfirm::Programmatic`] so [`Self::confirm_destructive_close`]
-    /// answers from the policy and never asks again — the bracket the operator's
-    /// Stop row runs under: the human's Enter is the same explicit instruction
-    /// that row is. The policy is restored before returning,
-    /// whatever the replay did, so the latch spans exactly this replay and no other
-    /// close can ride through it. A window that closed meanwhile (a wire `close`
-    /// landed first) has nothing left to replay.
+    /// Serve [`crate::Wake::ConfirmedClose`]: run the gesture the banner stood for
+    /// under [`CloseConfirm::Programmatic`], so [`Self::confirm_destructive_close`]
+    /// does not ask again. The policy is restored afterwards so it covers only this
+    /// replay. A window that closed meanwhile has nothing to replay.
     pub(crate) fn replay_confirmed_close(
         &mut self,
         el: &ActiveEventLoop,
@@ -3069,15 +2637,11 @@ impl App {
     }
 
     /// The `controls front` line for the close/quit confirm: the pending question
-    /// and the wire way to answer it, or `confirm open=false`. Reported whichever
-    /// window the banner stands over — an agent asking whether the instance is
-    /// waiting on an answer wants the truth about the instance, not one window —
-    /// and the `confirm yes|no` it prints reaches the question from any window.
+    /// and the wire way to answer it, or `confirm open=false`. Reported for the
+    /// instance regardless of which window the banner is over.
     ///
-    /// `None` — no line at all — off Windows while nothing is pending, which is
-    /// always there: macOS and Linux never park a close question in the window
-    /// (their confirm answers inside the gesture), so their `controls front`
-    /// keeps the one `overlay` line it has always printed.
+    /// `None` off Windows while nothing is pending, which is always: macOS and
+    /// Linux never park a close question.
     pub(crate) fn close_confirm_controls_line(&self) -> Option<String> {
         match self.close_banner.as_ref() {
             Some(pending) => Some(pending.controls_line()),
@@ -3086,20 +2650,16 @@ impl App {
         }
     }
 
-    /// Quit-safety for a TAB close that would EXIT the window. The tab-close gestures
-    /// (Cmd-W, Close Tab, the strip/native ✕, the `tab close` verb) all funnel through
-    /// `close_active_tab`/`close_tab_at`, which — when the close drops the window's LAST
-    /// tab (and, for a pane-close, its last pane) — escalate to closing the window (and
-    /// exiting the app if it was the last window). Those paths must enforce the SAME
-    /// confirmation the red traffic light ([`Self::on_close_requested`]) and Cmd-Q
-    /// ([`Self::on_quit_requested`]) enforce, so a stray last-tab Cmd-W can't SIGHUP an
-    /// in-flight build/AI run — or quit the whole app — without asking.
+    /// Quit-safety for a tab close that would exit the window. Tab-close gestures
+    /// (Cmd-W, Close Tab, the strip/native ✕, `tab close`) go through
+    /// `close_active_tab`/`close_tab_at`, which escalate to closing the window when
+    /// they drop its last tab (or last pane), so they enforce the same confirm as
+    /// the close button ([`Self::on_close_requested`]) and Cmd-Q
+    /// ([`Self::on_quit_requested`]).
     ///
-    /// Given `exits_window` (the caller computed that this close closes the window),
-    /// return `true` to PROCEED or `false` to CANCEL via
-    /// [`Self::confirm_destructive_close`] — the native quit/close dialog when the close
-    /// exits the last window or a job is running. A non-exiting close (a split-pane
-    /// collapse, or one tab among several) always returns `true`.
+    /// Given `exits_window`, return `true` to proceed or `false` to cancel via
+    /// [`Self::confirm_destructive_close`]. A non-exiting close always returns
+    /// `true`.
     pub(crate) fn window_exit_close_allowed(&mut self, wid: WindowId, exits_window: bool) -> bool {
         if !exits_window {
             return true;
@@ -3116,11 +2676,9 @@ impl App {
         !self.windows.keys().any(|w| *w != wid)
     }
 
-    /// Quit-safety: a CloseRequested (red traffic light / Window ▸ Close). Confirms via
-    /// [`Self::confirm_destructive_close`] — the native "quit aterm?" dialog when this is
-    /// the LAST window (closing it exits the app), or the "a process is running" dialog
-    /// when a pane of `wid` has a foreground job. An idle non-last-window close proceeds
-    /// immediately.
+    /// Quit-safety for CloseRequested (close button / Window ▸ Close): confirms via
+    /// [`Self::confirm_destructive_close`] when this is the last window or a pane
+    /// of `wid` has a foreground job; otherwise proceeds immediately.
     pub(crate) fn on_close_requested(&mut self, el: &ActiveEventLoop, wid: WindowId) {
         // The red traffic light closes this window and quits when no other window
         // survives.
@@ -3131,35 +2689,29 @@ impl App {
         }
     }
 
-    /// Quit-safety for whole-app Quit (Cmd-Q / app menu): ALWAYS shows the native
-    /// "are you sure you want to quit aterm?" confirmation (iTerm-style), and exits the
-    /// whole program only when the user confirms. A running foreground job in any window
-    /// enriches the dialog copy. Off macOS (no native dialog) it falls back to the
-    /// titlebar-warning confirm, which is busy-gated.
+    /// Quit-safety for whole-app Quit (Cmd-Q / app menu): always confirms on macOS
+    /// and exits only when the user confirms; a running job in any window enriches
+    /// the dialog copy. Elsewhere it uses the platform confirm, which is
+    /// busy-gated.
     ///
-    /// This covers Cmd-Q and the menu-bar "Quit aterm" item (both route through our
-    /// custom `menuAction:` selector). The Dock-icon "Quit", AppleScript `quit`, and
-    /// logout/restart/shutdown send AppKit `terminate:` straight to `NSApp` instead —
-    /// that hook vetoes and posts [`crate::Wake::NativeTerminateRequested`] through
-    /// [`crate::platform::AppRt::install_quit_confirm`], returning here on the typed
-    /// event-loop lane before any process exit can occur.
+    /// Dock Quit, AppleScript `quit` and logout send AppKit `terminate:` to `NSApp`
+    /// directly; that hook vetoes and posts [`crate::Wake::NativeTerminateRequested`]
+    /// ([`crate::platform::AppRt::install_quit_confirm`]), which returns here on the
+    /// event-loop lane before any exit.
     pub(crate) fn on_quit_requested(&mut self, el: &ActiveEventLoop) {
         if self.defer_pending_update_handoff_teardown(crate::DeferredHandoffTeardown::QuitRequested)
         {
             return;
         }
-        // The window the confirm is anchored to: the frontmost, or ANY survivor when
-        // none is frontmost (e.g. before the first OS focus). Resolving a window even
-        // with no frontmost means a Cmd-Q still prompts instead of exiting outright;
-        // only a truly window-less app (headless) exits immediately.
+        // Anchor the confirm to the frontmost window, else any survivor, so Cmd-Q
+        // still prompts before the first OS focus; only a window-less app exits
+        // immediately.
         let anchor = self
             .frontmost_window
             .filter(|w| self.windows.contains_key(w))
             .or_else(|| self.windows.keys().next().copied());
-        // Cmd-Q / app-menu Quit ALWAYS confirms (it exits the whole program); `busy`
-        // — any job in any window — enriches the dialog copy. A truly windowless
-        // process has nowhere to anchor a dialog, but still runs the store-owned
-        // document barrier (a dirty suspended document must not be skipped).
+        // Quit always confirms; `busy` enriches the copy. A windowless process
+        // still runs the store-owned document barrier.
         if let Some(wid) = anchor {
             let busy = self.any_foreground_job();
             if !self.confirm_destructive_gesture(
@@ -3197,13 +2749,11 @@ impl App {
         el.exit();
     }
 
-    /// A harness's lifeline was cut (`crate::lifeline`): the process that started
-    /// this headless instance is gone. Quit the way Cmd-Q quits — a headless
-    /// process has no one to confirm with, so [`Self::on_quit_requested`] goes
-    /// straight to its barriers and `el.exit()`, and the post-loop teardown
-    /// unlinks the socket and hangs up every shell. A barrier that holds the quit
-    /// (a pending update overlap, a document still saving) is left to finish; the
-    /// watcher's backstop ends the process if the quit never comes.
+    /// The process that started this headless instance is gone
+    /// (`crate::lifeline`): quit as Cmd-Q does. Headless has no confirm, so
+    /// [`Self::on_quit_requested`] runs its barriers and `el.exit()`, and teardown
+    /// unlinks the socket and hangs up every shell. A barrier holding the quit is
+    /// left to finish; the watcher's backstop ends the process if it never does.
     #[cfg(unix)]
     pub(crate) fn on_lifeline_cut(&mut self, el: &ActiveEventLoop) {
         if !self.headless {
@@ -3283,9 +2833,9 @@ impl App {
     }
 
     /// Re-evaluate document-owned close plans after an asynchronous atomic-save
-    /// completion.  Whole-app Quit has priority; otherwise each now-ready window
-    /// has already detached all of its document edges as one batch and may be
-    /// structurally removed without re-entering the barrier.
+    /// completion. Whole-app Quit has priority; otherwise each ready window has
+    /// already detached its document edges as one batch and can be removed
+    /// without re-entering the barrier.
     pub(crate) fn escalate_document_shutdown(&mut self, el: &ActiveEventLoop) {
         let (quit, windows) = match self.take_ready_document_shutdowns() {
             Ok(ready) => ready,
@@ -3315,18 +2865,13 @@ impl App {
         }
     }
 
-    /// Resolve the stable identity used by native window chrome. Terminal windows
-    /// share the tab-label precedence exactly: operator title, live OSC 0/2 title,
-    /// reported OSC-7 cwd, tab presentation, then `"aterm"`. The terminal fallback
-    /// read is deliberately nonblocking because this runs on the event-loop thread;
-    /// contention keeps the last tab-title cache value (or the presentation fallback)
-    /// until the next output wake/redraw instead of parking behind a busy parser.
+    /// Resolve the identity shown in native window chrome, with the tab-label
+    /// precedence: operator title, live OSC 0/2 title, OSC-7 cwd, tab presentation,
+    /// then `"aterm"`. The terminal read is nonblocking (event-loop thread);
+    /// contention keeps the last cached title until the next redraw.
     ///
-    /// Resolves IN PLACE into `slot` (which arrives holding anything and leaves
-    /// holding the resolved raw title) rather than returning an owned `String`:
-    /// [`Self::apply_title`] runs on every redraw of the window, so the steady
-    /// state must not allocate. Only the rare operator-title rung, which owns its
-    /// `String` in the session meta, still copies.
+    /// Resolves in place into `slot` so the per-redraw [`Self::apply_title`] does
+    /// not allocate.
     fn window_title_identity(
         &self,
         id: WindowId,
@@ -3356,31 +2901,27 @@ impl App {
             slot.push_str(presentation_fallback);
             return (Some(session_id), None);
         };
-        let (user_title, authored_description) = {
+        slot.clear();
+        let (user_titled, authored_description) = {
             let meta = session
                 .ctx
                 .meta
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (
-                meta.presentation_value("title"),
+                meta.presentation_value_into("title", slot),
                 meta.presentation_value("description"),
             )
         };
-        slot.clear();
-        if let Some(user_title) = user_title {
-            slot.push_str(&user_title);
+        if user_titled {
+            // The operator title is already in `slot`.
         } else if !live_title.is_empty() {
             slot.push_str(live_title);
         } else {
-            // Same rungs as before, written into the resident slot: reported cwd
-            // (`~`-abbreviated), else the last stable tab-title cache value when the
-            // parser holds the lock, else the presentation fallback.
-            // Native form (`C:\Users\x`, not the engine's RFC 8089 `/C:/Users//x`)
-            // — this rung is what the user READS in the window title. The `Cow`
-            // is bound to a local so it outlives the `as_deref` borrow handed to
-            // the in-place push, keeping the no-alloc-per-frame property intact
-            // off Windows, where the conversion is a pure borrow.
+            // Reported cwd (`~`-abbreviated, native form such as `C:\Users\x`), else
+            // the cached tab title when the lock is free, else the presentation
+            // fallback. The `Cow` is bound to a local so it outlives the borrow;
+            // off Windows the conversion is a pure borrow.
             let filled = match session.term.try_lock() {
                 Ok(term) => {
                     use crate::cwd_native::ReportedCwd as _;
@@ -3413,12 +2954,10 @@ impl App {
         (Some(session_id), authored_description)
     }
 
-    /// Reflect the focused terminal's stable identity in the window chrome, falling
-    /// back to `"aterm"` when nothing has set one. Calls `set_title` only on an actual
-    /// semantic change (a cheap String compare plus leading-busy-spinner
-    /// coalescing), so it is safe to call every frame — even on the redraw
-    /// early-out path, where a title-only change still updates the titlebar
-    /// without a pixel repaint.
+    /// Reflect the focused terminal's identity in the window chrome, falling back
+    /// to `"aterm"`. Calls `set_title` only on a semantic change (string compare
+    /// with busy-spinner coalescing), so it is safe every frame, including the
+    /// redraw early-out path.
     ///
     /// IME-2: the caption deliberately shows NO composition state. An earlier
     /// cut appended `title [‹preedit›]` here as the only preedit indicator; the
@@ -3430,40 +2969,25 @@ impl App {
     /// whenever a temporary title owner held the caption (find status), and a
     /// headless window has no OS caption for a "headless fallback" to reach.
     ///
-    /// TABS: with more than one in-window tab, a ` — [active/total]` indicator is
-    /// appended (e.g. `aterm — [2/3]`) so the (visual-tab-bar-less) tab state is
-    /// visible in the window chrome. A single tab shows no indicator, so a
-    /// one-session window's title is byte-identical to before. (The count is the
-    /// number of TABS, not panes — a split tab is still one tab in the indicator.)
+    /// No tab counter: the tab strip shows the tabs.
     pub(crate) fn apply_title(&mut self, id: WindowId, window: &Window, title: &str) {
-        // TASKBAR PROGRESS (Windows, ConEmu OSC 9;4): mirror this window's focused
-        // session's engine `taskbar_progress()` onto its taskbar button. `apply_title`
-        // runs every frame for the redrawn window (including the "nothing changed"
-        // early-out path), so this follows OSC-driven progress + tab switches within a
-        // frame; `sync_taskbar_progress` is change-gated so it only calls into COM when
-        // the state actually differs. A no-op on every other platform.
+        // Windows taskbar progress (ConEmu OSC 9;4): mirror the focused session's
+        // `taskbar_progress()` onto the taskbar button. Change-gated, so COM is
+        // called only on a real change.
         #[cfg(windows)]
         self.sync_taskbar_progress(id);
-        // Keep the registry's title for the FOCUSED pane's session fresh
-        // (best-effort), so a cross-session `sessions` read reflects the live window
-        // title. Gate on the per-window `(session, title)` cache: take the process-
-        // wide store WRITE lock (contended with the control thread) ONLY when the
-        // active session or its title actually changed since the last publish — a
-        // steady screen no longer grabs the exclusive lock every redraw. Resolve the
-        // active session via the TARGET window's active tab focus → pool.
+        // Keep the registry title for the focused pane's session fresh, taking the
+        // store write lock only when the per-window `(session, title)` cache says
+        // the session or its title changed.
         self.publish_active_terminal_title(id, title);
-        // Resolve + compose through a RESIDENT slot: this runs on every redraw of
-        // this window (including the no-change early-out), so the identity ladder
-        // and the label composition must reuse one warmed buffer instead of
-        // allocating two `String`s per frame. Taken out of `self` for the call so
-        // `&self.config`/`&self.title_summaries` stay borrowable, and put back
-        // (with its capacity) before every exit.
+        // Resolve and compose through a resident buffer so the per-redraw path does
+        // not allocate. Taken out of `self` so `&self.config` and
+        // `&self.title_summaries` stay borrowable; put back before every exit.
         let mut scratch = std::mem::take(&mut self.title_compose_scratch);
         let (focused_session, authored_description) =
             self.window_title_identity(id, title, &mut scratch);
-        // Composes IN PLACE: `scratch` arrives holding the resolved raw title and
-        // leaves holding the presented label — a cache hit `clone_from`s into the
-        // slot's existing capacity, so a steady frame allocates nothing.
+        // Composes in place: `scratch` holds the raw title in and the presented
+        // label out; a cache hit reuses its capacity.
         self.title_summaries.compose_label_into(
             focused_session,
             authored_description.as_deref(),
@@ -3472,13 +2996,10 @@ impl App {
             crate::title_summary::ChromeSurface::WindowTitle,
             &mut scratch,
         );
-        // No "[active/total]" tab counter in the title: the visible tab strip already
-        // shows the tabs, so a title-bar counter is redundant clutter (and macOS apps
-        // like Ghostty/Terminal don't do it). The title is just the program/cwd title.
-        // Temporary native-title owners form one explicit precedence stack:
-        // close-warning > find status > canonical Smart Title. Keep tracking
-        // `current_title` under either override, but suppress canonical writes so
-        // neither temporary owner is erased by a live title/summary refresh.
+        // No tab counter in the title; the tab strip shows the tabs. Temporary
+        // title owners take precedence: close warning > find status > canonical
+        // Smart Title. `current_title` keeps tracking under either override, but
+        // canonical writes are suppressed.
         let (warning_armed, search_active) = self.windows.get(&id).map_or((false, false), |ws| {
             (
                 ws.close_warning_until.is_some_and(|t| Instant::now() < t),
@@ -3487,11 +3008,8 @@ impl App {
         });
         let title_authority = window_title_authority(warning_armed, search_active);
         let title_changed = {
-            // Compare the cached title against the composed scratch directly,
-            // avoiding the per-frame String allocation that an unconditional
-            // `format!`/`to_string` would pay. (No IME branch here any more —
-            // the composition paints inline, never in the caption; see the
-            // IME-2 note above.)
+            // Compare against the composed scratch directly to avoid a per-frame
+            // allocation.
             let Some(ws) = self.windows.get_mut(&id) else {
                 // Disjoint field, so restoring the slot here is fine even though
                 // `self.windows` was just borrowed.
@@ -3514,48 +3032,34 @@ impl App {
         // Hand the warmed buffer back before any further `&mut self` work, so the
         // next frame's resolve/compose reuses this capacity.
         self.title_compose_scratch = scratch;
-        // LIVE TAB TITLES: the native tab strip labels each tab with its session's title
-        // (the cwd / running command the shell integration sets via OSC 0/2). That title
-        // changes constantly (every `cd`, every command) but `refresh_window_tabs` only
-        // ran on STRUCTURAL tab changes (`sync_window`), so the strip labels froze at
-        // tab-creation time. Refresh the strip whenever the active tab's title changes
-        // (it re-reads EVERY tab), so the tabs track the live cwd like Ghostty/iTerm.
-        // Cheap + gated: only on a semantic title change (not another frame of the
-        // conventional leading busy spinner), and a no-op off macOS / with no native
-        // strip. A cwd-ONLY label drift (the titleless cwd-as-default-label fallback —
-        // `tab_titles`) never trips this gate; the `Wake::Output` title-epoch path owns
-        // that refresh.
+        // Refresh the native tab strip when the active tab's title changes (it
+        // re-reads every tab), so labels track the live cwd/command; structural
+        // changes are handled by `sync_window`. Gated on a semantic change; no-op
+        // off macOS. Cwd-only label drift is refreshed by the `Wake::Output`
+        // title-epoch path.
         if title_changed {
             self.refresh_window_tabs(id);
         }
     }
 
-    /// Apply one engine-authorized XTWINOPS window manipulation (frame audit #4:
-    /// `CSI 9;1t` with `allow_window_ops = true` did nothing, because nothing
-    /// connected the core's [`aterm_types::WindowOperation`] events to the winit
-    /// window). Runs on the main thread — the sole winit owner — via
-    /// [`crate::Wake::WindowOp`], posted by `spawn::configure_window_ops` (Linux).
+    /// Apply one engine-authorized XTWINOPS window manipulation on the main thread,
+    /// via [`crate::Wake::WindowOp`] posted by `spawn::configure_window_ops`
+    /// (Linux).
     ///
-    /// SECURITY is the engine's, not re-litigated here: this is only reachable
-    /// through the in-core `allow_window_ops` capability mint, window MOVE is
-    /// denied there outright, and both resize forms arrive pre-clamped to the
-    /// engine's minimums. What this method adds is ROUTING discipline:
+    /// Security is the engine's: this is reachable only through the in-core
+    /// `allow_window_ops` capability, window move is denied there, and resizes
+    /// arrive clamped. This method adds routing:
     ///
     /// * the target window is re-resolved from the session (the spawn-stamped
-    ///   `window` is only a fallback), mirroring the bell's stale-stamp rule —
-    ///   a migrated tab manipulates the window it actually lives in;
-    /// * a CELL resize is honored only when the session IS the target window's
-    ///   focused one, and then routes through the one clamp+apply seam the
-    ///   `resize` verb uses (`echo_to_window: true`, RES-1), so grid, PTY and
-    ///   window converge through the proven path — a background tab cannot
-    ///   re-grid a window somebody else's shell is displayed in;
-    /// * `LowerWindow` and the axis-only maximizes are accepted-and-ignored:
-    ///   winit exposes no lower/vertical/horizontal affordance, and answering a
-    ///   manipulation with a WRONG one is worse than a no-op.
+    ///   `window` is a fallback), so a migrated tab manipulates its current window;
+    /// * a cell resize applies only when the session is the target window's
+    ///   focused one, through the `resize` verb's clamp+apply seam
+    ///   (`echo_to_window: true`), so a background tab cannot re-grid a window;
+    /// * `LowerWindow` and axis-only maximizes are ignored: winit has no such
+    ///   affordance.
     ///
-    /// Every winit call here is best-effort by contract — the WM/compositor may
-    /// clamp, defer, or refuse (Wayland in particular) — and any geometry that
-    /// does change flows back through the ordinary `Resized` path.
+    /// winit calls are best-effort (the WM may clamp, defer or refuse); geometry
+    /// changes flow back through `Resized`.
     #[cfg(any(target_os = "linux", test))]
     pub(crate) fn on_window_op(
         &mut self,
@@ -3567,12 +3071,9 @@ impl App {
         let Some(wid) = self.window_op_target(session, window) else {
             return;
         };
-        // A CELL resize needs no window handle of its own: it routes through
-        // the RES-1 clamp+apply seam, which resizes grid + PTY regardless and
-        // echoes the pixel size to whatever glass exists — the same headless
-        // posture as the `resize` verb. Handled before the glass gate below
-        // (which is also what lets the harness exercise the focused-session
-        // gate without an OS window).
+        // A cell resize needs no window handle: the clamp+apply seam resizes grid
+        // and PTY and echoes the pixel size to any glass, as the `resize` verb
+        // does. Handled before the glass gate, so it also works headless.
         if let W::ResizeWindowCells { rows, cols } = op {
             if self.focused_session_id(wid) == Some(session) {
                 let _ = self.input(
@@ -3598,9 +3099,8 @@ impl App {
             W::RaiseWindow => w.focus_window(),
             W::RefreshWindow => w.request_redraw(),
             W::ResizeWindowPixels { height, width } => {
-                // The engine clamped both axes to its 200 px floor already; ask
-                // the window and let the platform's `Resized` drive the grid —
-                // the same inversion `InputEvent::ResizeWindowPx` documents.
+                // The engine already clamped both axes to its 200 px floor; the
+                // platform's `Resized` then drives the grid.
                 #[cfg(target_os = "linux")]
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     // A driven resize owns the geometry from here: the launch
@@ -3623,23 +3123,17 @@ impl App {
                     w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
                 }
             }
-            // No honest winit mapping (lower/axis-maximize), and reports never
-            // ride the async wake (`configure_window_ops` answers them `None`
-            // at the callback, keeping the engine fallbacks). `_` also absorbs
-            // the `#[non_exhaustive]` future of `WindowOperation` (and the
-            // cell resize the early-return above already routed).
+            // No winit mapping (lower/axis-maximize). Reports never ride this wake
+            // (`configure_window_ops` answers them `None`). `_` covers the
+            // `#[non_exhaustive]` enum and the cell resize routed above.
             W::LowerWindow | W::MaximizeVertically | W::MaximizeHorizontally => {}
             _ => {}
         }
     }
 
-    /// Stale-stamp target resolution for one XTWINOPS wake (see
-    /// [`Self::on_window_op`], mirroring `on_bell`): prefer the window whose
-    /// tab set focuses this session NOW — a migrated tab manipulates the
-    /// window it actually lives in — and fall back to the spawn-stamped window
-    /// only while it still names a live one. `None` (session gone AND stamp
-    /// dead) drops the operation. Split out so the routing is testable
-    /// without glass.
+    /// Target window for one XTWINOPS wake (as `on_bell`): the window whose tab set
+    /// focuses this session now, else the spawn-stamped window while it is live.
+    /// `None` drops the operation.
     #[cfg(any(target_os = "linux", test))]
     fn window_op_target(&self, session: u64, stamped: WindowId) -> Option<WindowId> {
         self.windows_with_focused_session(session)
@@ -3648,10 +3142,9 @@ impl App {
             .or_else(|| self.windows.contains_key(&stamped).then_some(stamped))
     }
 
-    /// Publish an OSC-derived title only when the canonical active tab is a
-    /// terminal. Native presentations own OS chrome while active, but they must
-    /// never rename the parked terminal in `SessionStore` (which is also the
-    /// control-socket identity visible to other processes).
+    /// Publish an OSC-derived title only when the active tab is a terminal. Native
+    /// presentations own OS chrome while active but must never rename the parked
+    /// terminal in `SessionStore` (its control-socket identity).
     fn publish_active_terminal_title(&mut self, id: WindowId, title: &str) {
         if self.active_native_view(id).is_some() {
             return;
@@ -3689,13 +3182,10 @@ impl App {
     }
 
     /// Reflect window `wid`'s focused-session ConEmu taskbar progress (OSC 9;4,
-    /// parsed by the engine into [`aterm_core::terminal::Terminal::taskbar_progress`])
-    /// onto its Windows taskbar button via `ITaskbarList3::SetProgressState` /
-    /// `SetProgressValue` (see [`taskbar`]). The optional front-terminal capability
-    /// follows tab/pane focus, so this naturally follows the active terminal tab;
-    /// [`TaskbarProgress::Hidden`] (and no window/HWND) clears the button. Change-gated
-    /// inside [`taskbar::set_progress`], so the per-frame call is a cheap map lookup
-    /// until the state actually changes. Windows-only; the caller is `cfg`-gated.
+    /// [`aterm_core::terminal::Terminal::taskbar_progress`]) onto its taskbar
+    /// button via `ITaskbarList3` (see [`taskbar`]). Follows tab/pane focus;
+    /// [`TaskbarProgress::Hidden`] or no HWND clears the button. Change-gated in
+    /// [`taskbar::set_progress`]. Windows-only.
     #[cfg(windows)]
     pub(crate) fn sync_taskbar_progress(&self, wid: WindowId) {
         let hwnd = self.window_hwnd(wid);
@@ -3709,15 +3199,12 @@ impl App {
     }
 }
 
-/// Hand-rolled COM FFI for the Windows taskbar progress indicator (`ITaskbarList3`),
-/// the surface behind ConEmu's `OSC 9;4` progress protocol (winget / npm / PowerShell
-/// `Write-Progress` emit it; the engine parses it into `Terminal::taskbar_progress`).
-/// Same tiny-FFI house style as [`super::win32`]: direct `ole32` declarations and a
-/// by-hand vtable, no new dependency (ole32 is a system DLL). The single COM object is
-/// created lazily on the UI/STA thread, cached in a `thread_local`, and reused for
-/// every window (the HWND is a per-call argument); it is deliberately leaked for the
-/// process's life (a cheap shell singleton). Each window's last-applied state is cached
-/// so the per-frame call only reaches COM on an actual change.
+/// Hand-rolled COM FFI for the Windows taskbar progress indicator
+/// (`ITaskbarList3`), behind ConEmu's `OSC 9;4`. Direct `ole32` declarations and a
+/// by-hand vtable, like [`super::win32`]. One COM object is created lazily on the
+/// UI/STA thread, cached in a `thread_local`, shared by every window and leaked
+/// for the process life. Each window's last state is cached so COM is reached
+/// only on change.
 #[cfg(windows)]
 pub(crate) mod taskbar {
     use std::cell::RefCell;
@@ -3759,11 +3246,9 @@ pub(crate) mod taskbar {
     const TBPF_ERROR: u32 = 0x4;
     const TBPF_PAUSED: u32 = 0x8;
 
-    /// The `ITaskbarList3` vtable, laid out in COM inheritance order (IUnknown →
-    /// ITaskbarList → ITaskbarList2 → ITaskbarList3). Only the entries up to
-    /// `set_progress_state` are declared — the later methods are unused, and we only
-    /// ever index the pointers we name, so truncating the tail is sound. The unused
-    /// leading slots MUST remain for correct offsets of the ones we call.
+    /// The `ITaskbarList3` vtable in COM inheritance order (IUnknown → ITaskbarList
+    /// → ITaskbarList2 → ITaskbarList3), truncated after `set_progress_state`. The
+    /// unused leading slots must stay for the offsets of the ones called.
     #[repr(C)]
     struct ITaskbarList3Vtbl {
         query_interface:
@@ -3825,12 +3310,11 @@ pub(crate) mod taskbar {
                 return None;
             }
             self.tried_init = true;
-            // SAFETY: standard COM bring-up. `CoInitializeEx` is idempotent — winit's
-            // `OleInitialize` on this thread usually ran already, and S_FALSE /
-            // RPC_E_CHANGED_MODE are non-fatal, so the HRESULT is intentionally ignored.
-            // `CoCreateInstance` writes the interface pointer into `ppv`; a failed HRESULT
-            // or null pointer is rejected before any use. `HrInit` must precede any
-            // progress call; on failure the object is released and dropped.
+            // SAFETY: standard COM bring-up. `CoInitializeEx` is idempotent (S_FALSE
+            // and RPC_E_CHANGED_MODE are non-fatal, so its HRESULT is ignored).
+            // A failed `CoCreateInstance` HRESULT or null pointer is rejected before
+            // use; `HrInit` precedes any progress call, and on failure the object
+            // is released.
             unsafe {
                 let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
                 let mut ppv: *mut c_void = std::ptr::null_mut();
@@ -3884,10 +3368,9 @@ pub(crate) mod taskbar {
             let Some(obj) = c.object() else {
                 return; // no taskbar interface available
             };
-            // SAFETY: `obj` is a live `ITaskbarList3` created on this thread; `hwnd` is a
-            // live winit window handle (0 was rejected by the caller). Both calls are
-            // synchronous and take only integers. State is set first, then (for a
-            // determinate flag) the value, which the taskbar draws against total 100.
+            // SAFETY: `obj` is a live `ITaskbarList3` created on this thread and
+            // `hwnd` a live window handle (0 rejected by the caller); both calls are
+            // synchronous and take integers. The value is out of 100.
             unsafe {
                 let vtbl = &*(*obj).vtbl;
                 (vtbl.set_progress_state)(obj, hwnd, flag);
@@ -3899,9 +3382,8 @@ pub(crate) mod taskbar {
         });
     }
 
-    /// Drop the change-detection cache entry for a closing window's `hwnd`, so a future
-    /// window that reuses the same HWND value is not falsely skipped. The taskbar button
-    /// itself disappears with the window, so no explicit clear is needed.
+    /// Drop the cache entry for a closing window's `hwnd`, so a later window
+    /// reusing the value is not skipped. The button disappears with the window.
     pub(crate) fn forget(hwnd: isize) {
         CACHE.with(|c| {
             c.borrow_mut().applied.remove(&hwnd);
@@ -3909,20 +3391,13 @@ pub(crate) mod taskbar {
     }
 }
 
-/// W3: the Win32 window-placement read backing maximized-state persistence —
-/// `GetWindowPlacement` on the raw HWND, user32 (already on the tiny-FFI
-/// allowlist; see the vocabulary note on [`taskbar`] above and `lib.rs`'s
-/// `win32` module).
+/// Win32 window-placement read (`GetWindowPlacement`, user32) for
+/// maximized-state persistence.
 ///
-/// Why not winit: `Window::is_maximized` answers only the CURRENT show state
-/// (and lies for a window minimized FROM maximized, which must restore
-/// maximized), and nothing in winit exposes `rcNormalPosition` — the rect the
-/// OS itself would restore-down to. While maximized, `outer_position()` reports
-/// the maximized frame's origin (the monitor corner, minus the invisible resize
-/// border), which is exactly the coordinate a restore must NOT persist: re-apply
-/// it and then maximize, and the eventual un-maximize plants the window at the
-/// monitor corner instead of where the user had it. One placement call answers
-/// both questions atomically.
+/// winit's `is_maximized` reports only the current show state (wrong for a
+/// window minimized from maximized) and exposes no `rcNormalPosition`, the rect
+/// the OS restores down to. While maximized, `outer_position()` is the monitor
+/// corner, which a restore must not persist. One placement call answers both.
 #[cfg(windows)]
 pub(crate) mod placement {
     #[repr(C)]
@@ -3954,21 +3429,18 @@ pub(crate) mod placement {
     /// `SW_SHOWMAXIMIZED` / `SW_SHOWMINIMIZED` show commands.
     const SW_SHOWMINIMIZED: u32 = 2;
     const SW_SHOWMAXIMIZED: u32 = 3;
-    /// `WPF_RESTORETOMAXIMIZED`: the window is minimized NOW but returns to
-    /// maximized — quitting from the taskbar while minimized must still reopen
-    /// maximized, so this counts.
+    /// `WPF_RESTORETOMAXIMIZED`: minimized now but returns to maximized, so it
+    /// counts as maximized.
     const WPF_RESTORETOMAXIMIZED: u32 = 0x2;
-    /// `SPI_GETWORKAREA` (SystemParametersInfoW): the PRIMARY monitor's work
-    /// area in screen coordinates — the origin of the "workspace" coordinate
-    /// space `rcNormalPosition` is denominated in.
+    /// `SPI_GETWORKAREA`: the primary monitor's work area in screen coordinates,
+    /// the origin of the workspace space `rcNormalPosition` uses.
     const SPI_GETWORKAREA: u32 = 0x0030;
 
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetWindowPlacement(hwnd: isize, placement: *mut WindowPlacement) -> i32;
-        // Signature kept byte-identical to `platform_win.rs`'s declaration of
-        // the same import (`*mut c_void`, not a typed out-pointer), or rustc's
-        // `clashing_extern_declarations` fires across the two modules.
+        // Signature matches `platform_win.rs`'s declaration of this import
+        // (`*mut c_void`) to avoid `clashing_extern_declarations`.
         fn SystemParametersInfoW(
             action: u32,
             ui_param: u32,
@@ -3977,27 +3449,21 @@ pub(crate) mod placement {
         ) -> i32;
     }
 
-    /// `(maximized, normal-rect top-left in SCREEN physical px)` for `window`,
-    /// or `None` when the HWND is unreachable or the call fails (capture then
-    /// degrades to the winit `outer_position()` read, today's behaviour).
+    /// `(maximized, normal-rect top-left in screen physical px)` for `window`, or
+    /// `None` when the HWND is unreachable or the call fails (capture then uses
+    /// `outer_position()`).
     ///
-    /// The coordinate conversion is the subtle half: `rcNormalPosition` is in
-    /// WORKSPACE coordinates — screen coordinates shifted by the PRIMARY
-    /// monitor's work-area origin. With the taskbar in its default bottom slot
-    /// the two spaces coincide, which is why code that skips the conversion
-    /// appears correct on most machines and restores every window one
-    /// taskbar-height off on a top- or left-docked one. `SPI_GETWORKAREA`
-    /// supplies the offset; a failed read degrades to (0,0), i.e. the
-    /// no-conversion behaviour.
+    /// `rcNormalPosition` is in workspace coordinates (screen shifted by the
+    /// primary work-area origin); they coincide only with a bottom taskbar.
+    /// `SPI_GETWORKAREA` supplies the offset; a failed read uses (0,0).
     pub(crate) fn read(window: &winit::window::Window) -> Option<(bool, (i32, i32))> {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let hwnd = match window.window_handle().ok()?.as_raw() {
             RawWindowHandle::Win32(h) => h.hwnd.get(),
             _ => return None,
         };
-        // SAFETY: out-params are stack locals sized per the documented layouts,
-        // `length` pre-set as `GetWindowPlacement` requires; no pointer outlives
-        // the call.
+        // SAFETY: out-params are stack locals of the documented layouts, `length`
+        // pre-set as `GetWindowPlacement` requires; no pointer outlives the call.
         unsafe {
             let mut wp = WindowPlacement {
                 length: std::mem::size_of::<WindowPlacement>() as u32,
@@ -4045,16 +3511,10 @@ pub(crate) mod placement {
 }
 
 /// HiDPI auto-scale target for [`App::attach_os_window`]: the `font_px` the
-/// default font size should render at on a display of `scale`, or `None` when the
-/// auto-scale does not apply (an EXPLICIT `--font-px`/`config.font_px` is
-/// honored verbatim, and a 1× display keeps the built-in default). Pure and
-/// deterministic: the same `scale` always yields a bit-identical `f32`, so a
-/// caller that stored a previous target into `font_px` can compare with `==` to
-/// detect "backend already at the target size" and skip the (expensive,
-/// first-pixel-blocking) font rebuild. `pub(crate)` because the launch path's
-/// `first_window_prewarm_px` predicts the first window's size through THIS
-/// function, so the worker's glyph warm and the attach's activation cannot
-/// disagree about what 2× means.
+/// default font size renders at on a display of `scale`, or `None` when an
+/// explicit size is set or the display is 1×. Deterministic, so callers can
+/// compare with `==` to skip a rebuild. Also used by `first_window_prewarm_px`,
+/// so the worker's glyph warm and the attach agree.
 pub(crate) fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option<f32> {
     (!font_px_explicit && scale > 1.0).then(|| {
         (FONT_PX * scale as f32)
@@ -4067,24 +3527,12 @@ pub(crate) fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option
 mod tests {
     use super::*;
 
-    /// Feed shell-integration bytes to `session`'s engine, the way its PTY
-    /// reader would.
-    fn feed(app: &crate::App, session: u64, bytes: &[u8]) {
-        let term = app.pool.get(session).expect("live session").term.clone();
-        term.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .process(bytes);
-    }
+    use crate::feed_session_for_test as feed;
 
-    /// THE WINDOWS DEFECT (audit 2026-09-22, defect a): a cmdlet, loop or
-    /// script running INSIDE `pwsh.exe` spawns no child, so the child-process
-    /// walk never saw a job and the X button, Close Tab, Quit and the ctl
-    /// `close` all read the session as idle mid-`Start-Sleep 60`. The stub
-    /// session's PTY says nothing at all (`master`/`pid` = -1) — the ConPTY
-    /// shape exactly — so every gate below can be armed ONLY by the block
-    /// state, and every one of them is: the per-session predicate, the
-    /// per-window one the ✕ / Close Tab / `close` read, and the whole-app one
-    /// Quit reads. All four go idle again on 133;D.
+    /// A cmdlet or script inside `pwsh.exe` spawns no child, so only the block
+    /// state can mark the session busy. The stub PTY says nothing (`master`/`pid`
+    /// = -1, as ConPTY), and the per-session, per-window and whole-app gates must
+    /// all arm from OSC 133 alone and go idle on 133;D.
     #[test]
     fn a_running_block_arms_every_close_gate_without_a_child_process() {
         let app = crate::App::headless_for_test();
@@ -4121,11 +3569,9 @@ mod tests {
         assert!(!app.any_foreground_job());
     }
 
-    /// The co-viewed-session exemption is kept: a session another window also
-    /// displays (Cmd-Shift-O, pool views > 1) is NOT this window's to hang up —
-    /// closing this window only detaches a view — so it must not arm THIS
-    /// window's close gate even while its block executes. The whole-app Quit
-    /// gate still counts it: Quit hangs up every view.
+    /// A session another window also displays is not this window's to hang up, so
+    /// it does not arm this window's close gate while its block executes; the
+    /// whole-app Quit gate still counts it.
     #[test]
     fn a_co_viewed_running_block_exempts_the_window_gate_but_not_quit() {
         let mut app = crate::App::headless_for_test();
@@ -4161,14 +3607,11 @@ mod tests {
         );
     }
 
-    /// (L1) The early reveal's class-brush erase and the first presented frame
-    /// are ONE colour: the brush is seeded from `early_reveal_backdrop`, and
-    /// both things the first frame paints — the engine default background of
-    /// every unstyled cell, and the remainder bands around the grid before any
-    /// OSC 11 — resolve to that same byte triple. Pinned under EITHER OS
-    /// appearance after the sync the attach path runs pre-reveal, because a
-    /// `dark:…,light:…` split theme is the one place the two resolutions could
-    /// disagree. A stray alpha byte on the theme never reaches the brush.
+    /// The early reveal's class-brush erase and the first presented frame are one
+    /// colour: the brush seeded from `early_reveal_backdrop`, every unstyled cell
+    /// and the remainder bands all resolve to the same bytes, under either OS
+    /// appearance (a `dark:…,light:…` split theme is where they could differ). A
+    /// theme alpha byte never reaches the brush.
     #[test]
     fn early_reveal_backdrop_is_the_colour_the_first_frame_paints() {
         let mut app = crate::App::headless_for_test();
@@ -4201,9 +3644,8 @@ mod tests {
         );
     }
 
-    /// A 1440×900-point work area whose origin is NOT (0, 0) — the menu-bar band on
-    /// the main display, and the general case on a secondary one. Placements that
-    /// silently assume a zero origin fail against this.
+    /// A 1440×900-point work area whose origin is not (0, 0), as with the menu-bar
+    /// band or a secondary display.
     const SCREEN: WorkAreaPts = WorkAreaPts {
         x: 0.0,
         y: 25.0,
@@ -4257,11 +3699,9 @@ mod tests {
 
     #[test]
     fn a_screen_filling_parent_is_still_stepped_off_not_wrapped_back_onto() {
-        // The zoomed/maximized case, and the reason the wrap tests the grabbable
-        // corner rather than the whole frame: the new window inherits the front
-        // window's grid, so parent and child are the same size. Wrapping on "the
-        // frame no longer fits" would put the child back at the work-area origin —
-        // the exact eclipse this placement exists to prevent.
+        // Parent and child share a size (the child inherits the grid), so the wrap
+        // tests the grabbable corner, not the whole frame; otherwise the child
+        // would land back at the origin on top of a filled parent.
         let filled = (SCREEN.x, SCREEN.y);
         let frame = (SCREEN.w, SCREEN.h);
         let placed = cascade_top_left_pts(filled, CASCADE_STEP_PTS, frame, SCREEN)
@@ -4372,10 +3812,9 @@ mod tests {
             !attached && publication.is_none(),
             "negative control: a stale wid must fail even after surface creation"
         );
-        // `pending_join == false` used to suppress this publication candidate.
-        // Its absence from this seam is the regression pin: an early Wake may
-        // finalize the backend before `resumed`, but the first surface still owns
-        // a complete attach timeline.
+        // Publication does not depend on `pending_join`: an early Wake may finalize
+        // the backend before `resumed`, and the first surface still owns a complete
+        // attach timeline.
         let (attached, publication) = present_target_install_outcome(true, milestones);
         assert!(
             attached && publication.is_some(),
@@ -4407,12 +3846,10 @@ mod tests {
         );
     }
 
-    /// The Linux platform-seam resolution (`chrome_theme_for_apprt`): `Auto`
-    /// resolves to the ACTIVE terminal theme's darkness so the sctk-adwaita CSD
-    /// header tracks the terminal body (Linux has no titlebar bg painter, and
-    /// winit's Wayland backend never delivers `ThemeChanged` for `Auto` to
-    /// follow). The CONFIG policy value itself stays system-owned — the test
-    /// above pins that — and an explicit Light/Dark remains the operator's word.
+    /// Linux `chrome_theme_for_apprt`: `Auto` resolves to the active terminal
+    /// theme's darkness so the CSD header tracks the terminal body. The config
+    /// value itself stays system-owned (test above), and explicit Light/Dark
+    /// override.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_csd_chrome_resolves_auto_from_terminal_theme_darkness() {
@@ -4440,13 +3877,9 @@ mod tests {
         );
     }
 
-    /// The Linux CHROME-PAINTER resolution (`chrome_palette_theme`): the theme
-    /// the tab band and the native pages paint from. Auto is the terminal theme
-    /// verbatim; an explicit Light/Dark matching the terminal theme's own side
-    /// keeps the theme-derived chrome; an explicit side AGAINST the terminal
-    /// theme swaps in the authored forced palette with the accent carried over
-    /// — which is what makes `window_theme = light` observable at all on Linux
-    /// (2026-08 settings audit: it used to move only the CSD variant).
+    /// Linux `chrome_palette_theme`: Auto is the terminal theme; an explicit side
+    /// matching the terminal theme keeps it; an explicit side against it swaps in
+    /// the authored forced palette with the accent carried over.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_chrome_painters_resolve_window_theme_to_a_real_palette() {
@@ -4503,19 +3936,10 @@ mod tests {
         );
     }
 
-    /// Forcing a side is never a NO-OP — not even for the band of backgrounds
-    /// where the chrome's two dark/light answers used to differ.
-    ///
-    /// `chrome_palette_theme` passes the terminal theme straight through when the
-    /// configured side is the side that theme is already on. That test and the
-    /// role pipeline's own dark/light split were two different predicates: the
-    /// strip's Rec.601 luma here, a WCAG relative-luminance split there. Across
-    /// neutral `#979797`..`#ADADAD` they disagree, so `window_theme = light` on
-    /// such a theme took the passthrough — "you are already light" — and handed
-    /// back a background `native_appearance::roles` then built the DARK side
-    /// from. Config honoured on paper, nothing moved on screen. Both sites now
-    /// read the one predicate, so whatever comes back here, the pages build the
-    /// side the operator asked for.
+    /// Forcing a side always moves the chrome, including for neutral backgrounds
+    /// (`#979797`..`#ADADAD`) where Rec.601 luma and WCAG relative luminance
+    /// disagree: `chrome_palette_theme` and `native_appearance::roles` read the
+    /// same predicate, so the pages build the side the operator asked for.
     #[cfg(target_os = "linux")]
     #[test]
     fn forcing_a_side_moves_the_pages_across_the_former_classifier_band() {
@@ -4571,11 +3995,11 @@ mod tests {
         let sid = app.next_session_id;
         let wid = app.insert_logical_window(crate::stub_session(sid), 24, 80);
         assert!(
-            app.windows[&wid].word_decos.has_custom_kitty_sprite(),
+            app.windows[&wid].fx.decos().has_custom_kitty_sprite(),
             "a post-publication window must not silently fall back to built-in art"
         );
         assert!(Arc::ptr_eq(
-            app.windows[&wid].word_decos.kitty_sprite_rgba().unwrap(),
+            app.windows[&wid].fx.decos().kitty_sprite_rgba().unwrap(),
             &rgba
         ));
     }
@@ -4609,11 +4033,9 @@ mod tests {
         assert_eq!(hidpi_target_font_px(false, 1000.0), Some(FONT_PX_MAX));
     }
 
-    /// The skip contract in `attach_os_window`: a 2nd window opening on the SAME
-    /// display must compute a bit-identical target, so `scaled == self.font_px`
-    /// (stored by the 1st window's rebuild) detects the already-correct backend
-    /// and skips the redundant font re-read/re-parse. A DIFFERENT-scale display
-    /// must yield a different target so the rebuild still fires there.
+    /// A second window on the same display computes a bit-identical target, so
+    /// `scaled == self.font_px` skips the redundant rebuild; a different-scale
+    /// display yields a different target.
     #[test]
     fn same_display_target_is_bit_stable_across_windows() {
         let first = hidpi_target_font_px(false, 2.0).unwrap();
@@ -4857,9 +4279,8 @@ mod tests {
         );
     }
 
-    /// W4: a synthetic two-monitor desktop — a 1× 1920×1080 primary and a 2×
-    /// 2560×1440 external to its right (the classic docked-laptop shape whose
-    /// undocking is the whole reason the validation exists).
+    /// A synthetic two-monitor desktop: a 1× 1920×1080 primary and a 2× 2560×1440
+    /// external to its right (a docked laptop).
     fn desk() -> Vec<MonitorRectPx> {
         vec![
             MonitorRectPx {
@@ -4910,9 +4331,8 @@ mod tests {
 
     #[test]
     fn restored_positions_need_a_grabbable_corner_not_just_intersection() {
-        // Inside the primary's rectangle, but with less than the 160-pt grab
-        // minimum to the right/below — the titlebar would be a sliver in the
-        // corner. Same rule as `cascade_top_left_pts`'s final clamp.
+        // Inside the primary but with less than the 160-pt grab minimum to the
+        // right: rejected, as in `cascade_top_left_pts`'s final clamp.
         assert!(!restored_origin_visible((1920.0 - 10.0, 100.0), &desk()));
         assert!(!restored_origin_visible((100.0, 1080.0 - 10.0), &desk()));
         // The 2× monitor's grab minimum is 320 PHYSICAL px: a point 200 px from
@@ -4938,7 +4358,6 @@ mod tests {
 
     /// Arm window 0's initial-frame settle with a far deadline and `budget`
     /// corrections, returning the intended frame for the given grid.
-    #[cfg(target_os = "linux")]
     fn arm_settle(app: &mut App, rows: u16, cols: u16, budget: u8) -> PhysicalSize<u32> {
         let wid = WindowId(0);
         app.windows
@@ -4954,19 +4373,16 @@ mod tests {
         app.window_frame_px_for(wid, rows, cols)
     }
 
-    #[cfg(target_os = "linux")]
     fn settle_state(app: &App) -> Option<crate::InitialFrameSettle> {
         app.windows
             .get(&WindowId(0))
             .and_then(|ws| ws.initial_frame_settle)
     }
 
-    /// The GNOME shape: the first configure lands the intended size (settle
-    /// must WAIT, not disarm — the lossy echo is still in flight), the
-    /// activation echo then hands back a CSD-header-short frame (settle spends
-    /// a correction), and the corrected size finally lands (settle disarms).
+    /// The GNOME shape: the first configure lands the intended size (settle waits,
+    /// the echo is still in flight), the activation echo returns a CSD-header-short
+    /// frame (settle corrects), and the corrected size lands (settle disarms).
     #[test]
-    #[cfg(target_os = "linux")]
     fn initial_frame_settle_waits_out_the_csd_header_echo_then_disarms() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -4993,17 +4409,11 @@ mod tests {
         );
     }
 
-    /// FRACTIONAL SCALE (125% / 150% — the everyday Linux HiDPI settings): the
-    /// compositor cannot always hand back the exact physical frame the law asks
-    /// for, because winit's Wayland size round-trips through a WHOLE-NUMBER
-    /// logical size. Measured in a nested GNOME 50 session at scale 1.5, 24×80:
-    /// the law wants 1156×720 and the surface comes back 1157×720 — forever.
-    /// That residue is band-absorbed and the GRID is exactly the 24×80 asked
-    /// for, so the settle must call it settled instead of spending its whole
-    /// budget on a size that does not exist. A residue of a WHOLE CELL is a real
-    /// grid change and must still be corrected.
+    /// Fractional scale (125%/150%): the Wayland size round-trips through a
+    /// whole-number logical size, so the surface can come back a pixel off the
+    /// law's frame (1157×720 for 1156×720 at 1.5×, 24×80). The grid is exact, so
+    /// the settle counts it settled; a whole-cell residue is still corrected.
     #[test]
-    #[cfg(target_os = "linux")]
     fn initial_frame_settle_accepts_a_band_absorbed_fractional_scale_residue() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -5047,7 +4457,6 @@ mod tests {
     /// An exhausted correction budget disarms WITHOUT another request — the
     /// compositor that keeps insisting (tiling, an early maximize) wins.
     #[test]
-    #[cfg(target_os = "linux")]
     fn initial_frame_settle_budget_bounds_the_fight() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -5076,7 +4485,6 @@ mod tests {
     /// Past the deadline the settle disarms untouched — whatever the window is
     /// by then is the user's truth, never re-asserted.
     #[test]
-    #[cfg(target_os = "linux")]
     fn initial_frame_settle_deadline_expires_without_correcting() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -5097,6 +4505,208 @@ mod tests {
         );
     }
 
+    /// A window attached with a running session gets the intended frame, then
+    /// GNOME's activation configure echoes the pre-CSD geometry (−35 px, three
+    /// rows), then the correction lands. The echo must never reach the engine or
+    /// PTY, or an alternate-screen app sees a net-zero SIGWINCH pair and never
+    /// repaints its top row.
+    #[test]
+    fn initial_frame_settle_keeps_the_csd_echo_off_the_engine_and_pty() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let intended = arm_settle(&mut app, 24, 80, 3);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let rows = |app: &App| {
+            (
+                term.lock().expect("term").rows(),
+                app.windows.get(&wid).expect("window 0").rows,
+            )
+        };
+        let echo = PhysicalSize::new(intended.width, intended.height - 35);
+        assert_eq!(
+            app.grid_dims_for(wid, echo),
+            (21, 80),
+            "negative control: the echo is a real three-row grid change"
+        );
+
+        let mut seen = Vec::new();
+        app.apply_window_resized_grid(wid, intended); // first configure: right
+        seen.push(rows(&app));
+        app.apply_window_resized_grid(wid, echo); // activation echo
+        seen.push(rows(&app));
+        app.apply_window_resized_grid(wid, intended); // the correction lands
+        seen.push(rows(&app));
+        app.flush_pending_resize(wid); // the trailing settle, if still armed
+        seen.push(rows(&app));
+        assert_eq!(
+            seen,
+            [(24, 24); 4],
+            "the engine (and so the PTY winsize) must stay at the attach grid \
+             through the echo — pre-fix it read 24 -> 21 -> 24"
+        );
+        assert!(
+            settle_state(&app).is_none(),
+            "the corrected frame settles the arm"
+        );
+
+        // A second stale echo between issuing and receiving the first correction
+        // is vetoed the same way.
+        let intended = arm_settle(&mut app, 24, 80, 3);
+        app.apply_window_resized_grid(wid, intended);
+        app.apply_window_resized_grid(wid, echo);
+        app.apply_window_resized_grid(wid, echo);
+        assert_eq!(rows(&app), (24, 24), "a repeated echo is vetoed too");
+        assert_eq!(
+            settle_state(&app).expect("still correcting").corrections,
+            1,
+            "each vetoed echo spent one correction"
+        );
+        app.apply_window_resized_grid(wid, intended);
+        assert_eq!(rows(&app), (24, 24));
+        assert!(settle_state(&app).is_none());
+    }
+
+    /// The veto never strands the grid: when an X11 WM ignores the correction (no
+    /// `Resized` follows), the vetoed size parked in the trailing settle applies
+    /// the window's real size. This pins the fallback only; the ordering is pinned
+    /// by `initial_frame_settle_keeps_the_csd_echo_off_the_engine_and_pty`.
+    #[test]
+    fn a_refused_initial_frame_correction_still_lands_the_real_size() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let intended = arm_settle(&mut app, 24, 80, 3);
+        let echo = PhysicalSize::new(intended.width, intended.height - 35);
+        app.apply_window_resized_grid(wid, intended);
+        app.apply_window_resized_grid(wid, echo);
+        assert_eq!(
+            app.windows.get(&wid).expect("window 0").pending_resize,
+            Some(echo),
+            "the vetoed size is parked, not dropped"
+        );
+        assert!(
+            app.windows
+                .get(&wid)
+                .expect("window 0")
+                .next_resize_settle
+                .is_some(),
+            "and its trailing settle is armed"
+        );
+        app.flush_pending_resize(wid);
+        assert_eq!(
+            app.windows.get(&wid).expect("window 0").rows,
+            21,
+            "no correction arrived: the window's real size is the truth"
+        );
+    }
+
+    /// The async (X11) veto parks the echo long enough for an ordinary configure
+    /// round trip, so the fallback does not apply the echo before the correction;
+    /// the park is capped by the settle's deadline.
+    #[test]
+    fn a_vetoed_async_echo_is_parked_past_a_configure_round_trip() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let intended = arm_settle(&mut app, 24, 80, 3);
+        let echo = PhysicalSize::new(intended.width, intended.height - 35);
+        app.apply_window_resized_grid(wid, intended);
+        let before = Instant::now();
+        app.apply_window_resized_grid(wid, echo);
+        let parked = app
+            .windows
+            .get(&wid)
+            .expect("window 0")
+            .next_resize_settle
+            .expect("the vetoed echo is parked");
+        assert!(
+            parked >= before + App::SETTLE_VETO_FALLBACK,
+            "the fallback must outlast a configure round trip, not one throttle \
+             window (pre-fix: now + {:?})",
+            crate::RESIZE_THROTTLE
+        );
+        assert!(
+            App::SETTLE_VETO_FALLBACK > crate::RESIZE_THROTTLE,
+            "negative control: the park is longer than the ordinary throttle"
+        );
+
+        // A settle about to expire caps the park at its deadline.
+        let intended = arm_settle(&mut app, 24, 80, 3);
+        let deadline = Instant::now() + std::time::Duration::from_millis(20);
+        app.windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.initial_frame_settle.as_mut())
+            .expect("armed")
+            .deadline = deadline;
+        app.apply_window_resized_grid(wid, intended);
+        app.apply_window_resized_grid(wid, echo);
+        assert_eq!(
+            app.windows.get(&wid).expect("window 0").next_resize_settle,
+            Some(deadline),
+            "the park never outlives the settle"
+        );
+    }
+
+    /// The synchronous grant (Wayland: `request_inner_size` returns
+    /// `Some(applied)` and no `Resized` follows). The applied size replaces the
+    /// echo: the engine stays at the attach grid, any parked reflow is cancelled
+    /// and the window's recorded size is the applied one. A refusing compositor
+    /// answers its current size, which is applied.
+    #[test]
+    fn a_synchronous_settle_grant_applies_the_granted_size_in_place_of_the_echo() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let intended = arm_settle(&mut app, 24, 80, 3);
+        let echo = PhysicalSize::new(intended.width, intended.height - 35);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let rows = |app: &App| {
+            (
+                term.lock().expect("term").rows(),
+                app.windows.get(&wid).expect("window 0").rows,
+            )
+        };
+        app.apply_window_resized_grid(wid, intended);
+        assert_eq!(rows(&app), (24, 24));
+        let deadline = settle_state(&app).expect("armed").deadline;
+        // A stale park from an earlier event must be cancelled by the grant.
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.pending_resize = Some(echo);
+            ws.next_resize_settle = Some(Instant::now());
+        }
+
+        app.settle_take_over(wid, echo, Some(intended), deadline);
+        let ws = app.windows.get(&wid).expect("window 0");
+        assert_eq!(
+            ws.pending_resize, None,
+            "the grant cancels any parked reflow"
+        );
+        assert_eq!(ws.next_resize_settle, None);
+        assert_eq!(ws.win_px, Some(intended), "the applied size is recorded");
+        assert_eq!(
+            rows(&app),
+            (24, 24),
+            "the engine never sees the echo on a synchronous grant"
+        );
+
+        // A refusing compositor (a non-stateless configure) answers with the
+        // window's CURRENT size; that is applied, not the intended one.
+        let tiled = PhysicalSize::new(intended.width, intended.height + 200);
+        app.settle_take_over(wid, echo, Some(tiled), deadline);
+        assert_eq!(app.windows.get(&wid).expect("window 0").win_px, Some(tiled));
+        assert_eq!(
+            rows(&app).1,
+            app.grid_dims_for(wid, tiled).0,
+            "negative control: the granted size really drives the grid"
+        );
+        assert_ne!(rows(&app), (24, 24));
+    }
+
     /// A control-socket grid resize OWNS the geometry: it disarms the settle so
     /// the attach grid is never re-asserted over a driven size.
     #[test]
@@ -5111,12 +4721,9 @@ mod tests {
         );
     }
 
-    /// XTWINOPS transport (frame audit #4 follow-up: the routing had ZERO
-    /// automated coverage). Exactly the manipulation set posts
-    /// `Wake::WindowOp`, stamped with the requesting session and its owner
-    /// window and carrying the operation unchanged; reports — and the in-core
-    /// denied `MoveWindow` — post NOTHING, so the engine's own fallbacks stay
-    /// the only answerer.
+    /// XTWINOPS transport: exactly the manipulation set posts `Wake::WindowOp`,
+    /// stamped with the session and its owner window, operation unchanged; reports
+    /// and the denied `MoveWindow` post nothing, leaving the engine's fallbacks.
     #[test]
     #[cfg(target_os = "linux")]
     fn xtwinops_manipulations_post_a_window_op_wake_and_reports_post_nothing() {
@@ -5188,10 +4795,8 @@ mod tests {
         }
     }
 
-    /// The focused-session gate on `ResizeWindowCells` (RES-1): only the
-    /// target window's FOCUSED session may re-grid it; a background pane's
-    /// request is accepted-and-ignored, so somebody else's shell cannot
-    /// re-grid the window the user is looking at.
+    /// Only the target window's focused session may re-grid it via
+    /// `ResizeWindowCells`; a background pane's request is ignored.
     #[test]
     fn a_cell_resize_is_honored_only_for_the_focused_session() {
         let mut app = App::headless_for_test();
@@ -5216,7 +4821,7 @@ mod tests {
             "a background pane must not re-grid the window"
         );
 
-        // The FOCUSED session's request routes through the RES-1 seam.
+        // The focused session's request routes through the resize clamp+apply seam.
         app.on_window_op(
             wid,
             focused,
@@ -5225,10 +4830,9 @@ mod tests {
         assert_eq!(dims(&app), (30, 90), "the focused session re-grids");
     }
 
-    /// The stale-stamp rule: the wake's spawn-stamped window is only a
-    /// FALLBACK. A session whose tab has moved manipulates the window it
-    /// actually lives in; a dead stamp with no session match drops the
-    /// operation instead of guessing.
+    /// The spawn-stamped window is only a fallback: a session whose tab moved
+    /// manipulates its current window; a dead stamp with no session match drops
+    /// the operation.
     #[test]
     fn a_window_op_re_resolves_the_stale_spawn_stamp() {
         let mut app = App::headless_for_test();
@@ -5242,9 +4846,8 @@ mod tests {
         assert_eq!(app.window_op_target(9999, WindowId(0)), Some(WindowId(0)));
         assert_eq!(app.window_op_target(9999, WindowId(77)), None);
 
-        // End to end through the RES-1 seam: the stale stamp (window A) must
-        // not stop window B's focused session from re-gridding B — and must
-        // not let it touch A.
+        // The stale stamp (window A) must not stop B's focused session from
+        // re-gridding B, nor let it touch A.
         app.on_window_op(
             WindowId(0),
             sid,
@@ -5276,11 +4879,10 @@ mod tests {
     }
 }
 
-/// The Windows close/quit confirm as an IN-WINDOW banner (`close_confirm`): the
-/// gesture is refused now and its question parked; the loop — this test's thread —
-/// is never parked with it. The platform-independent half runs everywhere (the
-/// banner type compiles on every host); the arm that ROUTES the interactive
-/// confirm to it is Windows-only and pinned under `cfg(windows)`.
+/// The Windows close/quit confirm as an in-window banner (`close_confirm`): the
+/// gesture is refused now and its question parked, without parking the loop. The
+/// banner type compiles everywhere; the routing arm is pinned under
+/// `cfg(windows)`.
 #[cfg(test)]
 mod close_confirm_tests {
     use super::*;
@@ -5288,17 +4890,16 @@ mod close_confirm_tests {
     use crate::quit_safety::ConfirmPrompt;
 
     fn busy_quit_prompt() -> ConfirmPrompt {
-        crate::quit_safety::confirm_prompt(true, true).expect("a busy quit always prompts")
+        crate::quit_safety::confirm_prompt(true, true, true).expect("a busy quit always prompts")
     }
 
     fn busy_close_prompt() -> ConfirmPrompt {
-        crate::quit_safety::confirm_prompt(false, true).expect("a busy close prompts")
+        crate::quit_safety::confirm_prompt(false, true, true).expect("a busy close prompts")
     }
 
-    /// Presenting REFUSES the gesture now and parks the question; a second gesture
-    /// while it stands is refused too and the FIRST question keeps its answer (the
-    /// disabled owner window of the modal this replaces); Escape drops it and
-    /// nothing closes; Enter hands back the replay for the event loop to run.
+    /// Presenting refuses the gesture and parks the question; a second gesture is
+    /// refused and the first question stands; Escape drops it and nothing closes;
+    /// Enter hands back the replay.
     #[test]
     fn presenting_refuses_now_and_the_answer_replays_or_drops() {
         let mut app = App::headless_for_test();
@@ -5310,17 +4911,15 @@ mod close_confirm_tests {
             app.windows[&wid].pending_close_attribution.is_some(),
             "the gesture's exit-ledger attribution rides to the replay"
         );
-        // A verb that mints a reply (`invoke CloseTab`) answers ERR with the
-        // pending question, never OK over a tab still there. No wire scope was
-        // open, so this is a person's question and the reply says whose.
+        // A reply-minting verb (`invoke CloseTab`) answers ERR with the pending
+        // question. No wire scope was open, so the reply says a person asked.
         let refusal = app
             .pending_action_refusal
             .take()
             .expect("the parked question is reported to the wire");
         assert_eq!(refusal, "a quit is waiting for the person at the window");
-        // A second gesture: refused, and the FIRST question stands unchanged —
-        // and it is the STANDING question (a quit) the refusal names, not the
-        // window close that was dropped.
+        // A second gesture is refused, and the refusal names the standing question
+        // (a quit), not the dropped window close.
         assert!(!app.present_close_banner(wid, busy_close_prompt(), CloseReplay::Quit));
         assert_eq!(
             app.close_banner.as_ref().map(|p| p.replay),
@@ -5345,11 +4944,9 @@ mod close_confirm_tests {
         assert_eq!(app.answer_close_banner(true), None);
     }
 
-    /// `controls front` says what stands and how to answer it — the report the
-    /// audit found missing while the dialog wedged every other verb. With nothing
-    /// pending, Windows says so (`confirm open=false`, the shape every other
-    /// surface reports) and macOS/Linux — which never park a close question —
-    /// print exactly the one `overlay` line they always printed.
+    /// `controls front` reports what stands and how to answer it. With nothing
+    /// pending, Windows prints `confirm open=false`; macOS/Linux print only the
+    /// `overlay` line.
     #[test]
     fn controls_front_reports_the_pending_confirm() {
         let mut app = App::headless_for_test();
@@ -5402,10 +4999,9 @@ mod close_confirm_tests {
         );
     }
 
-    /// Raise `prompt` over `wid` the way `invoke CloseTab` does: through
-    /// `App::invoke_attributed`, the wake's own bracket. Its `ctl-close` scope is
-    /// what makes the question the wire's to answer, so the link is pinned here
-    /// rather than assumed.
+    /// Raise `prompt` over `wid` as `invoke CloseTab` does, through
+    /// `App::invoke_attributed`, whose `ctl-close` scope makes the question the
+    /// wire's to answer.
     fn raise_from_the_wire(app: &mut App, wid: WindowId, prompt: ConfirmPrompt) {
         let proceeded = app.invoke_attributed(crate::session_store::ExitActor::Ctl, |app| {
             Ok(app
@@ -5421,13 +5017,10 @@ mod close_confirm_tests {
         );
     }
 
-    /// The wire's `confirm yes|no` answers the question a control client raised
-    /// from ANY window. The person bringing another window forward does not take
-    /// the question out of the wire's reach — the gap an answer by keystroke had,
-    /// since a flagless `key enter` lands in the FRONT window's shell. `no` keeps
-    /// everything (the stashed close attribution goes with the question), `yes`
-    /// keeps the attribution for the replay it posts, and each reply says what it
-    /// answered, over which question.
+    /// The wire's `confirm yes|no` answers a question a control client raised,
+    /// whichever window is in front. `no` drops everything including the stashed
+    /// attribution; `yes` keeps the attribution for the replay; each reply names
+    /// what it answered.
     #[test]
     fn the_wire_answers_its_own_question_whatever_window_is_in_front() {
         let mut app = App::headless_for_test();
@@ -5467,9 +5060,8 @@ mod close_confirm_tests {
         );
     }
 
-    /// A question the PERSON at the window asked (no wire scope open: Ctrl-W,
-    /// Alt+F4, the caption ✕, the Quit menu) is refused to the wire, both ways,
-    /// and stays up for the person.
+    /// A question a person asked at the window (Ctrl-W, Alt+F4, the caption ✕,
+    /// Quit) is refused to the wire, both ways, and stays up.
     #[test]
     fn the_wire_cannot_answer_a_question_the_person_asked() {
         let mut app = App::headless_for_test();
@@ -5506,14 +5098,11 @@ mod close_confirm_tests {
         )
     }
 
-    /// THE KEYBOARD GATE in `on_key`, driven with real winit key events. While a
-    /// question stands over a window it owns that window's keyboard, as the
-    /// task-modal dialog it replaced did: Escape cancels and closes nothing,
-    /// Enter answers yes (its attribution kept for the replay), and every other
-    /// key — printable text, a chord — is swallowed, so nothing reaches the
-    /// shell under the question. A key in ANOTHER window passes through to that
-    /// window. The witness is the session sink's input-attempt epoch, which every
-    /// PTY write moves; the unguarded press first proves it does move.
+    /// The keyboard gate in `on_key`, with real winit key events: while a question
+    /// stands over a window it owns that window's keyboard. Escape cancels, Enter
+    /// answers yes (attribution kept), every other key is swallowed; a key in
+    /// another window passes through. The witness is the sink's input-attempt
+    /// epoch, which every PTY write moves.
     #[test]
     fn the_keyboard_answers_a_standing_question_and_nothing_leaks_under_it() {
         use winit::keyboard::NamedKey;
@@ -5521,14 +5110,12 @@ mod close_confirm_tests {
         let mut app = App::headless_for_test_with_sink(std::sync::Arc::clone(&sink));
         app.headless = false;
         let wid = WindowId(0);
-        // On Windows every key goes through the session's ordered writer thread
-        // (`paste_order::UI_WRITES_CAN_BLOCK`), so the sink's epoch moves AFTER
-        // `on_key` returns; reading it at once raced the writer (2 of 5 runs
-        // failed "an unguarded key writes"). Drain the writer before each read.
-        // A key that leaked under the question would still be written and still
-        // move the epoch, so the "nothing reaches the shell" checks stay strict.
+        // On Windows keys go through the session's ordered writer thread
+        // (`paste_order::UI_WRITES_CAN_BLOCK`), so the epoch moves after `on_key`
+        // returns; drain the writer before each read. A leaked key would still
+        // move the epoch.
         let settled = |sink: &aterm_session::sink::SinkWriter| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while sink.ordered_egress_count() > 0 && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -5592,13 +5179,10 @@ mod close_confirm_tests {
         assert!(app.close_banner.is_none());
     }
 
-    /// WINDOWS: the interactive confirm asks through the banner, never a dialog —
-    /// the gesture is refused now, and the loop is never parked. On EVERY host the
-    /// wire policies still answer from the policy before any banner, and a single
-    /// idle tab is still instant and unasked. Not `#[cfg(windows)]`: the routing is
-    /// a `cfg!` branch compiled everywhere, so only the half that would reach the
-    /// platform dialog off Windows (a real `NSAlert` in a unit test) is skipped
-    /// there, and the rest runs on the machines that run this suite.
+    /// On Windows the interactive confirm uses the banner, never a dialog, and the
+    /// loop is never parked. On every host the wire policies answer before any
+    /// banner and a single idle tab closes unasked. The routing is a `cfg!` branch,
+    /// so only the half that would open a real `NSAlert` is skipped off Windows.
     #[test]
     fn an_interactive_busy_close_parks_the_banner_instead_of_a_dialog() {
         let mut app = App::headless_for_test();

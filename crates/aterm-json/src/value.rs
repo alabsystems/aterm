@@ -86,24 +86,6 @@ impl Number {
             N::Float(v) => v,
         })
     }
-
-    /// Whether this number is held as a non-negative integer.
-    #[must_use]
-    pub fn is_u64(&self) -> bool {
-        matches!(self.0, N::Unsigned(_))
-    }
-
-    /// Whether this number is held as an integer of either sign.
-    #[must_use]
-    pub fn is_i64(&self) -> bool {
-        self.as_i64().is_some()
-    }
-
-    /// Whether this number is held as a double.
-    #[must_use]
-    pub fn is_f64(&self) -> bool {
-        matches!(self.0, N::Float(_))
-    }
 }
 
 impl From<u64> for Number {

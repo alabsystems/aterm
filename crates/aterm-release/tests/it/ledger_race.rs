@@ -9,17 +9,18 @@
 //! claim's fast-forward push either is or is not a compare-and-swap, and only
 //! git can say. The injectable [`ledger::GitRunner`] seam is used solely to
 //! land a rival's push at the exact moment between the claimant's fetch and
-//! its own push — the race window itself, made deterministic.
+//! its own push — the race window itself, made deterministic. Every runner
+//! underneath is [`ledger::testing::Git`]: `GitCli`'s spawn of that same git.
 
 use crate::{changelog, ledger};
 
 use std::cell::{Cell, RefCell};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ledger::{ClaimPlan, GitCli, GitRunner, LEDGER_FLOOR, RunOut};
+use ledger::testing::Git;
+use ledger::{ClaimPlan, GitRunner, LEDGER_FLOOR, RunOut};
 
 /// One frozen "clock" for every test: claims take `now` as an input (spec §2
 /// computes `n = max(last + 1, unix_now)`), so freezing it makes every minted
@@ -46,7 +47,7 @@ const DATE: &str = "2026-09-23";
 // --------------------------------------------------------------------------
 
 struct Fixture {
-    root: PathBuf,
+    root: aterm_tempfile::TempDir,
     origin: PathBuf,
     rival: PathBuf,
     work: PathBuf,
@@ -54,19 +55,21 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Fixture {
-        // Distinct per test name + pid: tests run in parallel threads.
-        let root = env::temp_dir().join(format!("aterm-ledger-race-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-ledger-race-{name}-"))
+            .tempdir()
+            .unwrap();
+        let root = dir.path();
         let origin = root.join("origin.git");
         run(
-            &root,
+            root,
             "git",
             &["init", "-q", "--bare", "-b", "main", "origin.git"],
         );
+        ledger::testing::config(&origin, &[]);
         let rival = root.join("rival");
         run(
-            &root,
+            root,
             "git",
             &["clone", "-q", origin.to_str().unwrap(), "rival"],
         );
@@ -82,13 +85,13 @@ impl Fixture {
         run(&rival, "git", &["push", "-q", "-u", "origin", "main"]);
         let work = root.join("work");
         run(
-            &root,
+            root,
             "git",
             &["clone", "-q", origin.to_str().unwrap(), "work"],
         );
         config_identity(&work);
         Fixture {
-            root,
+            root: dir,
             origin,
             rival,
             work,
@@ -96,16 +99,15 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 /// Run a command, assert success, return stdout. Setup/assertion plumbing
 /// only — the code under test never goes through here.
 fn run(cwd: &Path, prog: &str, args: &[&str]) -> String {
-    let out = Command::new(prog)
+    let mut command = if prog == "git" {
+        ledger::testing::git()
+    } else {
+        Command::new(prog)
+    };
+    let out = command
         .current_dir(cwd)
         .args(args)
         .output()
@@ -122,14 +124,15 @@ fn run(cwd: &Path, prog: &str, args: &[&str]) -> String {
 /// Fixture repos must commit regardless of this machine's global git config:
 /// pin identity and disable signing (a gpg prompt would hang the test).
 fn config_identity(repo: &Path) {
-    run(
+    ledger::testing::config(
         repo,
-        "git",
-        &["config", "user.email", "ship-test@aterm.invalid"],
+        &[
+            ("user.email", "ship-test@aterm.invalid"),
+            ("user.name", "aterm ship test"),
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+        ],
     );
-    run(repo, "git", &["config", "user.name", "aterm ship test"]);
-    run(repo, "git", &["config", "commit.gpgsign", "false"]);
-    run(repo, "git", &["config", "tag.gpgsign", "false"]);
 }
 
 /// Read a file straight out of the BARE origin — the ground truth every
@@ -191,11 +194,11 @@ fn rival_land_section(fix: &Fixture, line: &str, version: &str) {
 // the race hook: a GitRunner that fires a callback right before each push
 // --------------------------------------------------------------------------
 
-/// Wraps the production [`GitCli`] and invokes `on_push(attempt_no)` before
+/// Wraps the real runner ([`Git`]) and invokes `on_push(attempt_no)` before
 /// forwarding each `push` — everything else passes straight through to real
 /// git. This is the deterministic stand-in for "the rival's push lands first".
 struct HookRunner<F: FnMut(u32)> {
-    inner: GitCli,
+    inner: Git,
     pushes: Cell<u32>,
     on_push: RefCell<F>,
 }
@@ -203,7 +206,7 @@ struct HookRunner<F: FnMut(u32)> {
 impl<F: FnMut(u32)> HookRunner<F> {
     fn new(work: &Path, on_push: F) -> Self {
         HookRunner {
-            inner: GitCli::new(work),
+            inner: Git::new(work),
             pushes: Cell::new(0),
             on_push: RefCell::new(on_push),
         }
@@ -374,7 +377,7 @@ fn next_build_is_monotonic_and_floored() {
 #[test]
 fn claim_rejects_non_canonical_three_component_versions() {
     // Shape-checked before any git runs, so a dead path is fine as the repo.
-    let git = GitCli::new("/nonexistent");
+    let git = Git::new("/nonexistent");
     for bad in [
         "0.26",     // the retired two-component scheme
         "v0.26.1",  // tag spelling, not a version
@@ -409,7 +412,7 @@ fn claim_rejects_non_canonical_three_component_versions() {
 fn happy_path_claims_appends_and_verifies() {
     let fix = Fixture::new("happy");
     let source = head_of(&fix.work);
-    let git = GitCli::new(&fix.work);
+    let git = Git::new(&fix.work);
     let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     let c = res.unwrap();
     assert_eq!(c.build, NOW);
@@ -449,7 +452,7 @@ fn a_published_commit_behind_main_is_released_and_merged() {
     let tip = run(&fix.work, "git", &["rev-parse", "origin/main"])
         .trim()
         .to_string();
-    let git = GitCli::new(&fix.work);
+    let git = Git::new(&fix.work);
     let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     let c = res.expect("a peer's push is not a refusal");
     assert_eq!(attempts, 1);
@@ -524,7 +527,7 @@ fn a_published_commit_behind_main_is_released_and_merged() {
 /// unpushed release commit would be left checked out.)
 #[test]
 fn a_failure_building_mains_commit_leaves_the_checkout_on_the_published_commit() {
-    struct FailingIndex(GitCli);
+    struct FailingIndex(Git);
     impl GitRunner for FailingIndex {
         fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
             if args.first() == Some(&"update-index") {
@@ -541,7 +544,7 @@ fn a_failure_building_mains_commit_leaves_the_checkout_on_the_published_commit()
     let source = head_of(&fix.work);
     rival_peer_push(&fix);
     let (res, attempts) = do_claim(
-        &FailingIndex(GitCli::new(&fix.work)),
+        &FailingIndex(Git::new(&fix.work)),
         &fix.work,
         "0.26.0",
         false,
@@ -560,7 +563,7 @@ fn a_checkout_off_the_published_commit_is_refused_before_anything() {
     let tip = run(&fix.work, "git", &["rev-parse", "origin/main"])
         .trim()
         .to_string();
-    let git = GitCli::new(&fix.work);
+    let git = Git::new(&fix.work);
     let plan = ClaimPlan {
         version: "0.26.0",
         now: NOW,
@@ -731,7 +734,7 @@ fn malformed_remote_ledger_aborts_before_any_commit() {
     run(&fix.work, "git", &["fetch", "-q", "origin", "main"]);
     run(&fix.work, "git", &["reset", "-q", "--hard", "origin/main"]);
     let source = head_of(&fix.work);
-    let git = GitCli::new(&fix.work);
+    let git = Git::new(&fix.work);
     let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("line 3") && err.contains("not a u64"), "{err}");
@@ -743,13 +746,13 @@ fn malformed_remote_ledger_aborts_before_any_commit() {
 #[test]
 fn offline_fetch_fails_closed() {
     let fix = Fixture::new("offline");
-    let gone = fix.root.join("nonexistent.git");
+    let gone = fix.root.path().join("nonexistent.git");
     run(
         &fix.work,
         "git",
         &["remote", "set-url", "origin", gone.to_str().unwrap()],
     );
-    let git = GitCli::new(&fix.work);
+    let git = Git::new(&fix.work);
     let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("no offline cuts"), "{err}");

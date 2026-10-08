@@ -29,6 +29,22 @@
 //! Deliberately a source scan and not a runtime hook: the failure mode is a
 //! driver that never calls the shared helper at all, which no amount of
 //! instrumentation inside the helper can observe.
+//!
+//! **The second rule (2026-09-28): every `ty` spawn goes through
+//! `verify::ty_output`.** `ty` sizes its memory budget by the number of live
+//! `ty`/`cargo`/`rustc` processes, and a search the budget stops still exits 0
+//! under a header that says `exhaustive` — a false green to anything that
+//! reads the exit status. `ty_output` classifies that stop (exit 5, or a
+//! `Model checking stopped:` line) as an `Err` naming INCOMPLETE, so it fails
+//! closed (2026-10-01; until then it serialised every spawn behind a lock
+//! instead). It does that only for the drivers that call it: one
+//! `Command::output()` of its own reads a stopped search as a pass. Same shape
+//! as the arming rule, same scan, one more fact per driver — and it covers
+//! `ty trace validate` drivers too, which take no arming but go through the one
+//! place that decides what a `ty` transcript may be credited as. The one other
+//! door is `verify::ty_child`, the `--cases` co-process spawn (2026-10-01): it
+//! shares `ty_output`'s environment, and its client reads no verdict it was
+//! not sent as one.
 
 use std::path::{Path, PathBuf};
 
@@ -64,8 +80,12 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 struct Driver {
     file: String,
     line: usize,
+    /// A `ty check` (held to the arming rule); `false` = `ty trace validate`.
+    check: bool,
     armed: bool,
     exempt: bool,
+    /// The spawn runs through `verify::ty_output` (the fail-closed wrapper).
+    routed: bool,
 }
 
 /// The ONE legitimate reason to run `ty check` unarmed: a driver whose subject is
@@ -93,6 +113,22 @@ fn mentions_ty(region: &str) -> bool {
         .any(|w| w == "ty" || w.starts_with("ty_"))
 }
 
+/// Whether a region CALLS `ty_output` — or `ty_child`, the `--cases`
+/// co-process door with the same environment, whose client protocol fails
+/// closed on its own (2026-10-01) — the name as a whole identifier, so
+/// `pty_output(` or `dirty_output(` beside an unrouted driver never reads as
+/// its routing.
+fn calls_ty_output(region: &str) -> bool {
+    ["ty_output(", "ty_child("].iter().any(|name| {
+        region.match_indices(name).any(|(at, _)| {
+            !region[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    })
+}
+
 fn scan(path: &Path, rel: &str) -> Vec<Driver> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -100,8 +136,30 @@ fn scan(path: &Path, rel: &str) -> Vec<Driver> {
     let lines: Vec<&str> = text.lines().collect();
     let mut found = Vec::new();
     for (i, l) in lines.iter().enumerate() {
-        // The shape every driver shares: a `check` subcommand argument.
-        if !l.contains(".arg(\"check\")") {
+        // `ty trace validate` drivers: held to the routing rule only (a
+        // two-state trace takes no whole-space arming). A comment that quotes
+        // the shape is not a driver.
+        if l.contains(".arg(\"trace\")") && !l.trim_start().starts_with("//") {
+            let lo = i.saturating_sub(WINDOW);
+            let hi = (i + WINDOW).min(lines.len());
+            let region = lines[lo..hi].join("\n");
+            if mentions_ty(&region) {
+                found.push(Driver {
+                    file: rel.to_string(),
+                    line: i + 1,
+                    check: false,
+                    armed: false,
+                    exempt: false,
+                    routed: calls_ty_output(&region),
+                });
+            }
+            continue;
+        }
+        // The shape every `ty check` driver shares: a `check` subcommand
+        // argument. A comment quoting that shape (this file's own `Driver` doc
+        // does) is not a driver — counted, its window can borrow this file's
+        // exemption marker and read as a second exempt driver.
+        if !l.contains(".arg(\"check\")") || l.trim_start().starts_with("//") {
             continue;
         }
         // `cargo check` drivers are not model checks.
@@ -126,8 +184,10 @@ fn scan(path: &Path, rel: &str) -> Vec<Driver> {
         found.push(Driver {
             file: rel.to_string(),
             line: i + 1,
+            check: true,
             armed: region.contains("arm_whole_space_check"),
             exempt: region.contains(EXEMPTION),
+            routed: calls_ty_output(&region),
         });
     }
     found
@@ -155,18 +215,24 @@ fn every_ty_check_driver_arms_the_whole_space() {
     }
 
     // The scan must actually find the known drivers, or a rename silently turns
-    // this gate into a no-op that passes forever.
+    // this gate into a no-op that passes forever. Only the `ty check` drivers
+    // count: the scan returns `ty trace validate` drivers too (for the routing
+    // rule), and those alone could satisfy a count of every driver while
+    // this rule's pattern found nothing.
+    let checks = drivers.iter().filter(|d| d.check).count();
     assert!(
-        drivers.len() >= 5,
-        "expected the workspace's several `ty check` drivers, found {} — the scan pattern \
-         has drifted and this gate is now vacuous",
-        drivers.len()
+        checks >= 5,
+        "expected the workspace's several `ty check` drivers, found {checks} — the scan \
+         pattern has drifted and this gate is now vacuous"
     );
 
     // Exemptions are allowed but BOUNDED: exactly one driver may test the
     // checker itself. A second appearing without this gate being edited would
     // mean the marker had become a way to opt out of verification.
-    let exempt: Vec<&Driver> = drivers.iter().filter(|d| d.exempt && !d.armed).collect();
+    let exempt: Vec<&Driver> = drivers
+        .iter()
+        .filter(|d| d.check && d.exempt && !d.armed)
+        .collect();
     assert_eq!(
         exempt.len(),
         1,
@@ -186,7 +252,7 @@ fn every_ty_check_driver_arms_the_whole_space() {
 
     let unarmed: Vec<String> = drivers
         .iter()
-        .filter(|d| !d.armed && !d.exempt)
+        .filter(|d| d.check && !d.armed && !d.exempt)
         .map(|d| format!("  {}:{}", d.file, d.line))
         .collect();
     assert!(
@@ -197,5 +263,62 @@ fn every_ty_check_driver_arms_the_whole_space() {
          violated three steps from Init). Route the command through \
          `aterm_spec::verify::arm_whole_space_check(&mut cmd)`:\n{}",
         unarmed.join("\n")
+    );
+}
+
+/// The routing scan reads a call, not a substring: `pty_output(` (a real name
+/// in aterm-gui) is not `ty_output(`.
+#[test]
+fn routing_is_read_off_the_whole_name() {
+    assert!(calls_ty_output("let out = verify::ty_output(&mut cmd)"));
+    assert!(calls_ty_output("aterm_spec::verify::ty_output(&mut cmd)?"));
+    assert!(calls_ty_output("ty_output(&mut cmd)"));
+    assert!(
+        calls_ty_output("let child = ty_child(&mut cmd)?;") && !calls_ty_output("pty_child(&x)")
+    );
+    assert!(!calls_ty_output(
+        "fn later_pty_output() {}\nlet o = pty_output(&x);"
+    ));
+    assert!(!calls_ty_output("let out = cmd.output();"));
+}
+
+/// THE ROUTING RULE: every `ty check` and `ty trace validate` driver under
+/// `crates/` spawns through `aterm_spec::verify::ty_output`. None is exempt —
+/// the checker canary tests `ty`'s own reduction, and a search stopped short
+/// of the violation it expects must fail as INCOMPLETE like any other.
+#[test]
+fn every_ty_spawn_is_routed_through_ty_output() {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    rust_sources(&root.join("crates"), &mut files);
+    let mut drivers = Vec::new();
+    for f in &files {
+        let rel = f
+            .strip_prefix(&root)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .into_owned();
+        drivers.extend(scan(f, &rel));
+    }
+    // Both shapes must still be found, or the scan has drifted into a no-op.
+    let checks = drivers.iter().filter(|d| d.check).count();
+    let traces = drivers.iter().filter(|d| !d.check).count();
+    assert!(
+        checks >= 5 && traces >= 3,
+        "expected the workspace's `ty check` and `ty trace validate` drivers, found {checks} \
+         and {traces} — the scan pattern has drifted and this gate is now vacuous"
+    );
+    let unrouted: Vec<String> = drivers
+        .iter()
+        .filter(|d| !d.routed)
+        .map(|d| format!("  {}:{}", d.file, d.line))
+        .collect();
+    assert!(
+        unrouted.is_empty(),
+        "`ty` spawned outside `aterm_spec::verify::ty_output` — every `ty` spawn must be \
+         routed for fail-closed classification: a search `ty`'s memory budget stops still \
+         exits 0 (a false green) unless `ty_output` turns it into an INCOMPLETE `Err`. \
+         Replace `cmd.output()` with `aterm_spec::verify::ty_output(&mut cmd)`:\n{}",
+        unrouted.join("\n")
     );
 }

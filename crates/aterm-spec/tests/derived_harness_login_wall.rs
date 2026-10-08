@@ -9,46 +9,9 @@
 //! aterm-agent's `conformance_login_wall`, over the real readers, reducer and
 //! turn-end decider on every reachable state.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-use aterm_spec::derive::{Model, harness_login_wall_model};
+use crate::walk::{only, reachable, walk};
+use aterm_spec::derive::harness_login_wall_model;
 use aterm_spec::{interp, verify};
-
-type S = BTreeMap<&'static str, i64>;
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
-
-fn run(m: &Model, actions: &[&str]) -> S {
-    let mut s = m.init_state();
-    for action in actions {
-        assert!(m.fire(action, &mut s), "{action} at {s:?}");
-    }
-    s
-}
-
-/// Every state `m` reaches, invariants unchecked.
-fn reachable(m: &Model) -> Vec<S> {
-    let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([m.init_state()]);
-    let mut out = Vec::new();
-    while let Some(s) = queue.pop_front() {
-        if !seen.insert(s.clone()) {
-            continue;
-        }
-        for a in &m.actions {
-            let mut next = s.clone();
-            if m.fire(a.name, &mut next) {
-                queue.push_back(next);
-            }
-        }
-        out.push(s);
-    }
-    out
-}
 
 const INVARIANTS: [&str; 4] = [
     "NoNoticeAtTheWall",
@@ -173,7 +136,7 @@ fn the_incident_as_it_ran_is_the_caught_negative_control() {
 #[test]
 fn the_incident_now_is_waited_out_and_nothing_is_spent() {
     let m = harness_login_wall_model();
-    let mut s = run(&m, &["Expire", "WallHit", "TypeLogin"]);
+    let mut s = walk(&m, &["Expire", "WallHit", "TypeLogin"]);
     assert_eq!((s["track"], s["told"]), (1, 1));
     for quiet in ["Continue", "Announce", "Elapse", "TypeLogin"] {
         assert!(!m.action_enabled(quiet, &s), "{quiet} at the wall: {s:?}");
@@ -188,7 +151,7 @@ fn the_incident_now_is_waited_out_and_nothing_is_spent() {
     assert_eq!((s["phase"], s["got"], s["asks"]), (3, 1, 1));
 
     // A notice the wall answered: the same ask again once the login is back.
-    let mut s = run(&m, &["Expire", "Announce"]);
+    let mut s = walk(&m, &["Expire", "Announce"]);
     assert_eq!((s["asks"], s["unread"], s["got"]), (1, 1, 0));
     assert!(!m.action_enabled("Elapse", &s), "no clock at the wall");
     assert!(m.fire("LoginBack", &mut s));
@@ -197,7 +160,7 @@ fn the_incident_now_is_waited_out_and_nothing_is_spent() {
 
     // The inherited give-up: taken back from the first ask, and given up
     // again only after the bound, every notice received.
-    let mut s = run(&m, &["Expire", "WallHit", "Inherit"]);
+    let mut s = walk(&m, &["Expire", "WallHit", "Inherit"]);
     assert_eq!((s["phase"], s["asks"], s["got"]), (2, 2, 0));
     assert!(!m.action_enabled("Announce", &s), "not at the wall");
     for action in [

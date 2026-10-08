@@ -1,47 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance + on-GPU clamp laws for the M3 phase-B EDR ("HDR glow")
-//! present gate.
+//! Tier-1 conformance and on-GPU clamp laws for the HDR glow present gate.
 //!
-//! ## Two-tier proof (the boolean policy)
+//! ## Boolean policy
 //!
-//! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
-//!   `HdrPresentGate` derived model (`aterm_spec::derive::hdr_present_gate_model`)
-//!   carries `SdrInvariance` / `BoostNeedsLinearF16` / `F16NeedsSupport`.
-//!   `cargo test -p aterm-spec`
-//!   (`derived_hdr_present_gate_proves_and_catches_hdr_without_optin`) runs the
-//!   REAL `ty` binary over the whole bounded state space: it PROVES the
-//!   invariants at `Buggy=0` and CATCHES the config-ignoring attach at `Buggy=1`.
-//! * **Tier-1 (concrete, this file)** — the SHIPPING policy functions
-//!   [`aterm_gpu::hdr_swapchain_wants_f16`] (Attach) and
-//!   [`aterm_gpu::hdr_present_plan`] (Present) have a finite boolean domain, so
-//!   we don't sample: every 2^3 Attach→Present chain AND every 2^3 raw plan
-//!   input (covering the live config-flip states where the surface format no
-//!   longer matches the config) is enumerated — a complete proof for the real
-//!   code, with non-vacuity controls. On the shipped macOS Metal arm
-//!   (`cfg(not(wgpu_arm))`) `create_window_surface` reaches the Attach
-//!   function through [`aterm_gpu::hdr_swapchain_wants_f16_on_screen`], which
-//!   narrows it by the screen's EDR potential and never widens it — its result
-//!   implies `hdr_swapchain_wants_f16` for every input
-//!   (`metal_attach_pick_is_the_proven_gate_narrowed_by_the_screen`), so the
-//!   enumeration here bounds everything the Metal attach can pick; the live
-//!   screen re-pick (`GpuRenderer::upgrade_surface_for_screen`, gated
-//!   by [`aterm_gpu::hdr_screen_upgrade_wants_f16`]) sits inside that gate
-//!   again (`metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence`).
+//! * Tier-0: the `HdrPresentGate` model
+//!   (`aterm_spec::derive::hdr_present_gate_model`) carries `SdrInvariance`,
+//!   `BoostNeedsLinearF16` and `F16NeedsSupport`, proved and mutation-caught
+//!   by `derived_hdr_present_gate_proves_and_catches_hdr_without_optin` in
+//!   aterm-spec.
+//! * Tier-1 (this file): [`aterm_gpu::hdr_swapchain_wants_f16`] (attach) and
+//!   [`aterm_gpu::hdr_present_plan`] (present) have finite boolean domains,
+//!   so every attach-to-present chain and every raw plan input (including
+//!   live config-flip states) is enumerated, with non-vacuity controls. The
+//!   macOS Metal attach uses [`aterm_gpu::hdr_swapchain_wants_f16_on_screen`],
+//!   which implies the base gate for every input, and the live re-pick
+//!   ([`aterm_gpu::hdr_screen_upgrade_wants_f16`]) implies that in turn, so
+//!   this enumeration bounds them.
 //!
-//! ## On-GPU clamp laws (the float pipeline)
+//! ## On-GPU clamp laws
 //!
-//! The `gpu_*` tests drive the REAL `fs_blit` `hdr` arm and the REAL EDR aurora
-//! pass through `present_hdr_for_test` (an `Rgba16Float` swapchain stand-in,
-//! half-float readback) and assert the two laws `aterm_render::hdr` proves in
-//! the abstract (exhaustive sweeps + trust-mc):
-//! (1) GRID CLAMP — the non-additive stream never exceeds 1.0, and equals the
-//! linear decode of the SDR readback byte-for-byte (within f16 quantization);
-//! (2) ADDITIVE CLAMP — with the aurora pass on, no channel exceeds the
-//! sanitized EDR max, and (non-vacuity) some channel genuinely exceeds 1.0.
-//! Gated: no GPU / no system font -> the test no-ops (returns), like the other
-//! differential suites.
+//! The `gpu_*` tests drive the real `fs_blit` `hdr` arm and HDR aurora pass
+//! through `present_hdr_for_test` (an `Rgba16Float` stand-in, half-float
+//! readback) and check the laws `aterm_render::hdr` proves abstractly:
+//! (1) grid clamp: the non-additive stream never exceeds 1.0 and equals the
+//! linear decode of the SDR readback within f16 quantization;
+//! (2) additive clamp: with the aurora pass on, no channel exceeds the
+//! sanitized EDR max, and some channel exceeds 1.0.
+//! Skips without a GPU or system font.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{
@@ -52,6 +39,8 @@ use aterm_gpu::{
 use aterm_render::{GlowQuad, RenderInput, hdr, premul_rgb};
 use aterm_spec::derive::hdr_reconfigure_retag_model;
 
+use crate::common;
+
 /// Iterate every (hdr_glow, supports_f16, glow_nonempty) tuple over {false,true}^3.
 fn all_inputs() -> impl Iterator<Item = (bool, bool, bool)> {
     (0u32..8).map(|bits| {
@@ -60,10 +49,9 @@ fn all_inputs() -> impl Iterator<Item = (bool, bool, bool)> {
     })
 }
 
-/// Tier-1, complete: chain the SHIPPING Attach decision into the SHIPPING
-/// Present plan for every input combination and check the three model
-/// invariants on the outcome — plus the raw plan over ALL surface states
-/// (including the live-flip mismatches an Attach chain cannot reach).
+/// Chain the attach decision into the present plan for every input and check
+/// the three model invariants, plus the raw plan over all surface states
+/// (including live-flip mismatches no attach chain reaches).
 #[test]
 fn hdr_gate_exhaustive_attach_present_chain() {
     let mut boosted = 0usize;
@@ -106,10 +94,9 @@ fn hdr_gate_exhaustive_attach_present_chain() {
         "the aurora pass fires exactly for (on, f16, glow)"
     );
 
-    // The RAW plan over every surface state — covers a swapchain whose format no
-    // longer matches what the current config would pick (live flips): an 8-bit
-    // surface NEVER decodes/boosts, an f16 surface ALWAYS decodes, and switching
-    // hdr_glow off kills the boost even on a still-f16 surface.
+    // Raw plan over every surface state: an 8-bit surface never decodes or
+    // boosts, an f16 surface always decodes, and `hdr_glow` off kills the boost
+    // even on an f16 surface.
     for (hdr_glow, is_f16, glow) in all_inputs() {
         let plan = hdr_present_plan(hdr_glow, is_f16, glow);
         assert_eq!(plan.blit_linear_encode, is_f16);
@@ -117,10 +104,9 @@ fn hdr_gate_exhaustive_attach_present_chain() {
     }
 }
 
-/// Tier-1 lifecycle conformance for an f16 surface rebuilt by any live
-/// reconfiguration or checked after a same-size Windows HDR-state change. Drive
-/// the genuine shipping policy, project its result onto the derived model, and
-/// require the exact modeled successor for both re-tag outcomes.
+/// Lifecycle conformance for an f16 surface rebuilt by a reconfigure or checked
+/// after a same-size Windows HDR change: drive `hdr_reconfigure_plan`, project
+/// onto the model, and require the modeled successor for both re-tag outcomes.
 ///
 /// THE PLANNER HALF. This file can only reach `hdr_reconfigure_plan`, which
 /// decides; the metadata each decision must actually apply lives on
@@ -197,9 +183,8 @@ fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
         "exactly the failed f16 re-tag must select SDR fallback"
     );
 
-    // Symmetric live HDR-on recovery starts from the retained capable SDR
-    // surface. After the output probe admits an attempt, configure+tag has the
-    // same two shipping policy outcomes as every other f16 recreation.
+    // Live HDR-on recovery starts from the retained SDR surface; after the
+    // output probe admits it, configure and tag have the same two outcomes.
     let sdr = model
         .successors("EnterSdrFallback", &initial)
         .into_iter()
@@ -261,9 +246,8 @@ fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
         );
     }
 
-    // NEGATIVE CONTROL: the pre-fix live reconfigure ignored `false` and kept
-    // both f16 and linear capture metadata. That state is neither the model
-    // successor nor invariant-safe.
+    // Negative control: a reconfigure that ignores the failed re-tag and keeps
+    // f16 with linear capture metadata is neither the successor nor safe.
     let mut ignored_failure = initial.clone();
     ignored_failure.insert("stage", 2);
     ignored_failure.insert("retagged", 0);
@@ -280,9 +264,8 @@ fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
         "negative control must expose untagged f16"
     );
 
-    // NEGATIVE CONTROL: an HDR-on upgrade configured f16 but its subsequent tag
-    // failed, while the old path left that plausible f16 surface live. Capture
-    // stayed honestly SDR, exposing both the format/tag and metadata mismatch.
+    // Negative control: an upgrade whose tag failed but left the f16 surface
+    // live, with capture still SDR, mismatches format and metadata.
     let mut failed_upgrade = sdr.clone();
     failed_upgrade.insert("stage", 2);
     failed_upgrade.insert("retagged", 0);
@@ -304,10 +287,9 @@ fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
     );
 }
 
-/// The live-upgrade admission gate retains raw f16 support independently of the
-/// attach-time opt-in, then requires the CURRENT opt-in and CURRENT Windows
-/// output state. Enumerate the complete boolean domain and pin the hot-reload
-/// case that an attach-frozen `hdr_capable` bit lost.
+/// The live-upgrade gate keeps raw f16 support independent of the attach-time
+/// opt-in, then requires the current opt-in and Windows output state. The full
+/// boolean domain is enumerated, including the hot-reload case.
 #[test]
 fn hdr_live_upgrade_gate_is_complete_and_hot_reloadable() {
     let mut admitted = 0usize;
@@ -332,8 +314,8 @@ fn hdr_live_upgrade_gate_is_complete_and_hot_reloadable() {
         "turning the live opt-in on must use retained raw f16 support"
     );
 
-    // NEGATIVE CONTROL: freezing opt-in+support together at attach while opt-in
-    // was false permanently rejects the same capable surface after hot reload.
+    // Negative control: freezing opt-in and support together at attach (opt-in
+    // false) would reject the same capable surface after a hot reload.
     let old_attach_frozen_capable = hdr_swapchain_wants_f16(false, supports_f16);
     assert!(!old_attach_frozen_capable);
     assert!(
@@ -586,32 +568,20 @@ fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput
 }
 
 fn gpu(px: f32) -> Option<GpuRenderer> {
-    match GpuRenderer::new(px, aterm_render::Theme::default()) {
-        Ok(mut g) => {
-            // THE FLIP: the EDR gates drive the wgpu present stand-ins (the
-            // wgpu offscreen + test-hdr destinations) — the WGPU ORACLE arm,
-            // asked for by name post-flip.
-            #[cfg(target_os = "macos")]
-            g.disarm_metal_for_oracle();
-            // Deterministic expectations: the bloom halo is a separate additive
-            // layer over the offscreen, orthogonal to the laws under test.
-            g.set_bloom(false);
-            g.set_shimmer(false);
-            Some(g)
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            None
-        }
-    }
+    // The EDR gates drive the wgpu present stand-ins (the wgpu offscreen and
+    // test-hdr destinations).
+    let mut g = common::wgpu_oracle_or_skip(px, aterm_render::Theme::default())?;
+    // Deterministic expectations: the bloom halo is a separate additive layer
+    // over the offscreen, orthogonal to the laws under test.
+    g.set_bloom(false);
+    g.set_shimmer(false);
+    Some(g)
 }
 
-/// GRID CLAMP LAW on the REAL pipeline: with `hdr_glow` on and real headroom,
-/// the blit stream (no aurora pass) never leaves [0, 1] — and every channel
-/// equals `aterm_render::hdr::hdr_grid_encode` of the SDR readback byte within
-/// f16 quantization, so the EDR grid is exactly the linear reading of the SDR
-/// frame in the app-owned EDR destination encoding at reference white. The
-/// compositor transform is unobserved.
+/// Grid clamp on the real pipeline: with `hdr_glow` on and headroom, the blit
+/// (no aurora) stays in [0, 1], and each channel equals
+/// `aterm_render::hdr::hdr_grid_encode` of the SDR readback byte within f16
+/// quantization.
 #[test]
 fn gpu_hdr_blit_grid_clamped_and_linear() {
     let Some(mut gpu) = gpu(18.0) else { return };
@@ -648,13 +618,10 @@ fn gpu_hdr_blit_grid_clamped_and_linear() {
     );
 }
 
-/// REFERENCE-WHITE SCALE on the REAL pipeline, grid AND bands: a Windows-style
-/// scRGB present (`sdr_white_scale = 3.0`, a 240-nit SDR-white desktop) into a
-/// destination 7 px larger than grid fit. Every content pixel equals
-/// `scrgb_present_channel(sdr byte, 3.0)` and every remainder-band pixel equals
-/// the SAME encode of the theme background — the bands are the same sheet as
-/// the grid. Measured on glass before the fix: the band arm skipped the scale,
-/// so the strips composed 1/3 as bright as the grid beside them.
+/// Reference-white scale on grid and bands: an scRGB present at
+/// `sdr_white_scale = 3.0` into a destination 7 px larger than the grid. Content
+/// pixels equal `scrgb_present_channel(sdr byte, 3.0)` and band pixels the same
+/// encode of the theme background.
 #[test]
 fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
     let Some(mut gpu) = gpu(18.0) else { return };
@@ -726,11 +693,9 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
     );
 }
 
-/// ADDITIVE CLAMP LAW on the REAL pipeline: with the aurora pass on and a
-/// 2.0x panel, no channel exceeds the sanitized EDR max — and (non-vacuity)
-/// the aurora genuinely emits ABOVE reference white, the whole point of M3.
-/// On an SDR panel (edr_max = 1.0, headroom 0) the pass provably adds nothing:
-/// output equals the pass-less present exactly.
+/// Additive clamp: with the aurora pass on a 2.0x panel, no channel exceeds
+/// the sanitized EDR max and the aurora emits above 1.0. On an SDR panel
+/// (`edr_max = 1.0`) the output equals the pass-less present.
 #[test]
 fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
     let Some(mut gpu) = gpu(18.0) else { return };
@@ -774,11 +739,8 @@ fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
     }
 }
 
-/// SDR INVARIANCE at the present seam, on the REAL pipeline: with `hdr_glow`
-/// OFF the plan keeps the aurora pass off even when the caller asks for it and
-/// glow quads exist — no channel ever exceeds 1.0. (The attach seam's half —
-/// an SDR window never gets an f16 swapchain at all — is the exhaustive test
-/// above plus the readback byte-identity every parity suite pins.)
+/// SDR invariance at present: with `hdr_glow` off the plan keeps the aurora
+/// pass off even when asked and glow exists; no channel exceeds 1.0.
 #[test]
 fn gpu_hdr_off_never_boosts() {
     let Some(mut gpu) = gpu(18.0) else { return };
@@ -838,25 +800,23 @@ fn every_surface_reconfigure_retags_scrgb() {
 }
 
 // ---------------------------------------------------------------------------
-// WHITE IS HOT — the EDR crown's per-fragment boost (design §L5)
+// The HDR crown's per-fragment white boost
 // ---------------------------------------------------------------------------
 
-/// One mark of the rainbow-kitty palette as it reaches the crown: the colour
-/// the effect emits and the composited coverage §3.2 pins for it. The stream
-/// carries PREMULTIPLIED colour, so this is exactly what `fs_hdr_glow` sees.
+/// One rainbow-kitty palette mark as the crown sees it: the premultiplied
+/// colour and its composited coverage.
 struct Mark {
     name: &'static str,
     rgb: u32,
     cov: u8,
-    /// A white CORE — the marks §3.2 ranks 1, 2, 4 (m1) and 5, the ones the
-    /// hierarchy says are hotter than any hue.
+    /// A white core: the marks the hierarchy ranks hotter than any hue.
     white_core: bool,
 }
 
 /// The palette, straight off the design: five white cores and the coloured
 /// company they must not drag over reference white with them.
 const PALETTE: &[Mark] = &[
-    // §3.2 rank 1 / 5 / 2 — the meteor's head and the landing pin.
+    // The meteor's head and the landing pin.
     Mark {
         name: "meteor nucleus core",
         rgb: 0x00FF_FFFF,
@@ -875,23 +835,22 @@ const PALETTE: &[Mark] = &[
         cov: 118,
         white_core: true,
     },
-    // §3.2 rank 4 — the field m1 core, the brightest small thing that persists.
+    // The field m1 core, the brightest small thing that persists.
     Mark {
         name: "field star core m1",
         rgb: 0x00FF_FFFF,
         cov: 143,
         white_core: true,
     },
-    // §3.2 rank 2 — the caret's flare frame, opaque white for one frame.
+    // The caret's flare frame, opaque white for one frame.
     Mark {
         name: "caret flare frame",
         rgb: 0x00FF_FFFF,
         cov: 255,
         white_core: true,
     },
-    // Everything coloured: spectrum stops (a zero channel, so no white part at
-    // any coverage), the m2's 60 %-tint body, the coma's half-white blend, and
-    // the two hot-edge inks §4.1 lifted furthest toward white.
+    // Coloured marks: spectrum stops (a zero channel, so no white part), the
+    // tinted body, the coma's half-white blend, and the two hot-edge inks.
     Mark {
         name: "star bar / m3 body",
         rgb: 0x00FF_0000,
@@ -948,11 +907,9 @@ const PALETTE: &[Mark] = &[
     },
 ];
 
-/// The CPU twin of `HDR_GLOW_SHADER::white_part` + the §L5 boost curve —
-/// `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))`, capped at 3x linear. Below
-/// the knee this is EXACTLY 1.0, and `x * 1.0` is exact in IEEE-754, so a mark
-/// with no white part emits the very bits it emitted before the crown learned
-/// about white.
+/// CPU twin of `HDR_GLOW_SHADER::white_part` and the boost,
+/// `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))` capped at 3x. Exactly 1.0 below
+/// the knee.
 fn white_boost(premul: [f32; 3]) -> f32 {
     let w = premul[0].min(premul[1]).min(premul[2]);
     let t = ((w - 0.35) / (0.60 - 0.35)).clamp(0.0, 1.0);
@@ -1001,22 +958,16 @@ fn palette_input(
     (input, cells)
 }
 
-/// WHITE IS HOT (§L5). The EDR crown prices every fragment by the WHITE PART of
-/// its own colour — `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))`, capped at 3x
-/// linear and clamped, as ever, to the panel's real headroom. Measured on the
-/// REAL pipeline as the difference between the pass-less and the crowned
-/// present, mark by mark, over the whole rainbow-kitty palette:
+/// The HDR crown boosts each fragment by its white part,
+/// `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))` capped at 3x and clamped to the
+/// headroom. Measured on the real pipeline as crowned minus pass-less, over the
+/// palette:
 ///
-///   * every coloured mark — the spectrum stops of the star bars, the ring and
-///     the fan grains, the m2's 60 %-tint body, the coma, and BOTH of §4.1's
-///     hot-edge inks at the transient cap — is multiplied by EXACTLY 1.0, i.e.
-///     emits what it emitted before this law existed;
-///   * every white core climbs, and a white core is strictly brighter on glass
-///     than a coloured mark of the SAME coverage on the same channel — which is
-///     the whole sentence "white is hot", and which was an EQUALITY before;
-///   * the pixels that end up over reference white are exactly the ones the
-///     twin predicts, with no mark left within 3 % of the boundary to make the
-///     comparison a coin flip.
+///   * every coloured mark is multiplied by exactly 1.0;
+///   * every white core climbs, and is brighter than a coloured mark of the
+///     same coverage on the same channel;
+///   * the pixels over reference white are exactly the predicted ones, none
+///     within 3 % of the boundary.
 #[test]
 fn only_the_whitest_cores_exceed_reference_white() {
     let Some(mut gpu) = gpu(18.0) else { return };
@@ -1058,8 +1009,7 @@ fn only_the_whitest_cores_exceed_reference_white() {
                  {want_add} (linear {lin:.4} x factor {hot:.3})",
                 m.name
             );
-            // The predicted composite, taken off the measured pass-less present
-            // so the SDR grid underneath is the pipeline's own answer.
+            // Predicted composite on top of the measured pass-less present.
             let want_total = plain[base + i] + want_add;
             assert!(
                 (want_total - 1.0).abs() > 0.03,
@@ -1095,9 +1045,8 @@ fn only_the_whitest_cores_exceed_reference_white() {
         "no mark reached reference white — the differential is vacuous"
     );
 
-    // "WHITE IS HOT", stated as the comparison it names: at the SAME coverage
-    // and on the SAME channel, the white core out-emits its coloured twin.
-    // Before the per-fragment boost these two were EQUAL.
+    // At the same coverage and channel, the white core out-emits its coloured
+    // twin.
     let white = PALETTE
         .iter()
         .position(|m| m.name == "field star core m1")
@@ -1139,12 +1088,9 @@ fn only_the_whitest_cores_exceed_reference_white() {
     );
 }
 
-/// AN SDR PANEL IS BYTE-IDENTICAL (§L5). The crown's new appetite is spent
-/// strictly inside the headroom the panel actually reports: at `edr_max = 1.0`
-/// the pass is skipped whole and the present is bit-for-bit the pass-less one,
-/// over the ENTIRE palette — including the white cores that would triple on an
-/// EDR panel. (The SDR *crown* on a non-f16 swapchain is `fs_sdr_glow`, a
-/// separate fragment this law never touched.)
+/// An SDR panel is byte-identical: at `edr_max = 1.0` the pass is skipped and
+/// the present equals the pass-less one over the whole palette. (The SDR crown
+/// on a non-f16 swapchain is the separate `fs_sdr_glow`.)
 #[test]
 fn an_sdr_panel_is_byte_identical() {
     let Some(mut gpu) = gpu(18.0) else { return };
@@ -1165,9 +1111,8 @@ fn an_sdr_panel_is_byte_identical() {
         assert!(v <= 1.0, "an SDR panel must stay at reference white ({v})");
     }
 
-    // NON-VACUITY: the very same frame on a panel WITH headroom does boost —
-    // and boosts only the white part. Without this the equality above would
-    // hold just as well for a crown that had been deleted.
+    // Non-vacuity: the same frame on a panel with headroom boosts only the
+    // white part.
     win.set_edr_max(4.0);
     let (edr_plain, _, _) = gpu.present_hdr_for_test(&mut win, &input, false);
     let (edr_lit, _, _) = gpu.present_hdr_for_test(&mut win, &input, true);

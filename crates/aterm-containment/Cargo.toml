@@ -9,19 +9,49 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# One integration binary (`tests/containment_suite.rs`) plus the two files that
+# must own their process; the suite gives each one-shot-state test a fresh
+# process of its own by re-executing itself (`in_fresh_process`). With
+# autotests off a `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 
 [features]
 default = []
+# Test-only: exposes `consent::devtools_change_with_for_test`, the debugger
+# change's real order, to aterm-gui's Tier-1 bind. Enabled only from a
+# dev-dependency; resolver 2 keeps it out of every production build.
+testing = []
 
 [dependencies]
 aterm-log.workspace = true
+# `aterm_uds::spawnfd::command`: the `Command` every child here is built with, so
+# none inherits a descriptor of this process above stdio (`tools/grep_guard.sh`
+# B27). A dependency-free leaf the one binary links already.
+aterm-uds = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
+# The one trustd probe and skip line, and the ad-hoc signer the tests' fixtures use,
+# under a hang detector (`aterm_uds::deadline`).
+aterm-uds = { workspace = true, features = ["test-support"] }
 aterm-log = { workspace = true }
 aterm-tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "containment_suite"
+path = "tests/containment_suite.rs"
+
+# Alone: installs the process-global logger and asserts exact record counts.
+[[test]]
+name = "audit_denial_logged"
+path = "tests/audit_denial_logged.rs"
+
+# Alone: copies its own binary and re-enters it by `--exact` as the child.
+[[test]]
+name = "image_anchor_live"
+path = "tests/image_anchor_live.rs"

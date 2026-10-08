@@ -12,8 +12,7 @@
 //! valid, unrevoked, master-signed roster whose master is one of the pinned anchors. The
 //! gate is the client's own verifier over the exact bytes to be published, run at cut
 //! time — and it is the WHOLE authorization question, because the client consults nothing
-//! else (`aterm_update::github::fetch_authoritative_release`; the pre-roster channel
-//! keyset was retired 2026-09-23).
+//! else (`aterm_update::github::fetch_authoritative_release`).
 //!
 //! It is HALF of the client's chain, not all of it, and saying so precisely matters. The
 //! client admits a roster on two conditions: freshness, and a durable replay floor it
@@ -36,9 +35,8 @@
 
 //! # WIRED — and where
 //!
-//! This module used to carry a "pending wiring" note because `publish.rs` was owned by a
-//! concurrent workstream. It is wired now, at three call sites, and they are worth naming
-//! because the ORDER between them is the whole safety argument:
+//! The call sites are worth naming because the ORDER between them is the whole safety
+//! argument:
 //!
 //! * [`authorize_cut`] runs from `publish::preflight_signature_policy`, which runs with
 //!   the other PRE-CLAIM gates — before the ledger claim burns a single-use build number
@@ -58,10 +56,10 @@
 //!   serves — and from `publish::step_publish`, where it proves the pair `dist/` is about
 //!   to upload is one the signed appcast names.
 //!
-//! # The tier is ARMED in this tree (2026-08-15)
+//! # The tier is ARMED in this tree
 //!
 //! `pins::PAPER_MASTER_PUBKEYS` names the paper master, so every cut from this tree runs
-//! [`authorize_cut`] — v0.21.0 was the first, signed by m3's rostered key. Everything
+//! [`authorize_cut`]. Everything
 //! below is ALSO exercised by `tests/it/machine_roster.rs` with synthetic masters, so the
 //! rule set stays proven independently of the tree's own arming state.
 
@@ -212,7 +210,7 @@ impl RosterDocument {
 /// The client checks `valid_until` at a strictly LATER wall clock than the producer
 /// does — always, by the length of the cut plus however long a client waits to poll. A
 /// producer that admits a roster with one second left therefore publishes a head the
-/// entire fleet refuses (`Stale`) almost immediately, and `select_authoritative_release`
+/// entire fleet refuses (`Stale`) almost immediately, and `fetch_authoritative_release`
 /// has no fallback to an older release, so the fleet stops updating until someone cuts
 /// again under a re-signed roster.
 ///
@@ -258,10 +256,9 @@ pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 /// the generation every client that has checked for updates has ratcheted its floor to
 /// (`Floor::bump_and_write` ratchets on OBSERVATION of the asset), so it is the number a
 /// cut's attribution must reach — and it is NOT necessarily the number inside the head
-/// manifest: MEASURED 2026-08-18, a machine that joined the roster (seq 3) attached the
-/// new pair to the already-published v0.23.0/v0.24.0 releases, whose manifests still
-/// said `roster_seq = 2`; the pre-claim ratchet read the manifest, passed 2 ≥ 2, and the
-/// cut shipped an attribution every client refused with `SeqMismatch` for hours.
+/// manifest: a join attaches the new pair to already-published releases whose manifests
+/// still name the older `roster_seq`, and a ratchet that read the manifest once shipped
+/// an attribution every client refused with `SeqMismatch`.
 ///
 /// Anonymous (`https://github.com/<slug>/releases/latest/download/…`, the same seed
 /// path `provision` uses — no token, no API rate limit) and admitted under the committed
@@ -272,7 +269,7 @@ pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 /// AND its verified bytes. The bytes matter at EQUAL generation: two machines that
 /// each seeded from the same channel pair and each minted generation N+1 (both
 /// master-signed, each listing only itself) agree on the number and disagree on the
-/// document — a LINEAGE FORK that the number alone admits (2026-08-19 round-2 audit).
+/// document — a LINEAGE FORK that the number alone admits.
 /// [`roster_lineage_agrees`] compares the documents where the generations tie.
 pub(crate) fn channel_roster_document(
     slug: &str,
@@ -490,9 +487,8 @@ pub fn verify_published_roster(
     // (`Attribution::bind`: manifest.roster_seq <= roster.roster_seq). Recovery mirrors
     // the client: an OLDER asset than the manifest names, or no attribution at all,
     // is a roster the signed manifest does not name and is refused; a newer one is
-    // the channel's steady state after a join (2026-08-19 audit — equality here
-    // wedged `recover-lost` behind a lease forever once a join had re-dressed the
-    // origin release).
+    // the channel's steady state after a join (equality here would wedge
+    // `recover-lost` behind a lease once a join re-dressed the release).
     match roster_seq {
         Some(claimed) if claimed <= roster.roster_seq => {}
         _ => {
@@ -531,9 +527,7 @@ pub fn attribute(manifest: &mut Manifest, who: &Attribution) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`), held
-    /// byte-identical to the retired `base64` package's `general_purpose::STANDARD`
-    /// by `crates/aterm-codec/tests/base64_oracle.rs`.
+    /// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`).
     fn b64(raw: &[u8]) -> String {
         aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")
     }

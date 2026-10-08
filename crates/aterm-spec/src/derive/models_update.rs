@@ -96,6 +96,128 @@ pub fn native_update_rendezvous_claim_model() -> Model {
     }
 }
 
+/// The OUTGOING side of the same rendezvous (round eight of the update audit,
+/// U36): no descriptor leaves toward a dialer a same-uid process could stand in
+/// for, nothing is committed to a dialer LaunchServices disowns, a code check
+/// macOS did not answer turns no successor away, and a refusal is filed by its
+/// cause.
+///
+/// The claim secret is no proof of WHO dials: the successor's launch environment,
+/// where it travels, stays readable to every process of this uid
+/// (`KERN_PROCARGS2`). LaunchServices names the launched pid only when the app
+/// checks in, and a successor checks in after its grant, so the pid cannot gate
+/// the grant either. What a stranger cannot assert is the CODE it runs: the
+/// connection's audit token names the dialing process, and its code must meet
+/// the requirement the successor's does (`aterm-gui`'s
+/// `handoff_rendezvous::DialerCode`). From the dial until Commit, LaunchServices'
+/// answer still corroborates, and it DISOWNS the dialer when it names another
+/// pid, or says the process it launched exited before it checked in while the
+/// dialer lives.
+///
+/// The code check waits on macOS's code-signing service (`trustd`), which can
+/// stop answering (U36's review): an unanswered check is neither a pass nor a
+/// refusal. The gate HOLDS that dialer and checks again until it is answered or
+/// the dial deadline ends the wait; closing it would end the attempt for the
+/// machine's moment, since the successor exits at the end of file. And a
+/// successor the gate did turn away exits by its own rule (a failed claim exits
+/// before any window), so the attempt is filed by the refusal's cause — a check
+/// that did not happen is a passing failure, a refusal a verdict on the code
+/// that dialled — never as a death nobody explained.
+///
+/// State: `secret` — the dialer presented this attempt's claim; `code` — the
+/// code it runs meets the successor's requirement; `answered` — `trustd`
+/// answers the check of it; `disowned` — LaunchServices disowns it; `phase` —
+/// 0 holding the claim, 1 granted, 2 committed, 3 refused (before the grant the
+/// connection is closed and the dialer proven gone; after it, the dialer is
+/// killed and reaped), 4 the dial deadline ended the wait while the dialer was
+/// held for an unanswered check; `filed` — 0 not yet, 1 by the refusal's cause,
+/// 2 as a death nobody explained.
+///
+/// Mutants, each its own action and dead at `Buggy = 0`: `GrantOnSecretAlone`
+/// is the launched lane from 2026-09-14 to 2026-10-02 (the secret was the one
+/// gate before the grant), `CommitOverDisowning` its corroboration from
+/// 2026-09-29 (an "exited before it checked in" answer read, like any error, as
+/// corroborating the attested dialer), `RefuseUnanswered` the first code gate of
+/// 2026-10-02 (a check `trustd` did not answer closed the connection at once),
+/// and `FileAsUnexplainedDeath` its filing (the turned-away successor's exit
+/// read as a death before its dial, `ChildDied` with nothing observed). Tier-1
+/// (`aterm-gui`'s `launched_dialer_admission_conformance`) drives the real gate
+/// with real dialer processes, a hold through a `trustd` gate made overdue, the
+/// real corroboration with live, dead and unreaped dialers, and the real filing.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_rendezvous_admission_model() -> Model {
+    crate::ty_model! {
+        NativeUpdateRendezvousAdmission {
+            const Buggy = 0;
+            var secret = 1;
+            var code = 1;
+            var answered = 1;
+            var disowned = 0;
+            var phase = 0;
+            var filed = 0;
+
+            // The environment: what a dialer, trustd and LaunchServices may turn
+            // out to say.
+            action WrongSecret when (phase == 0 && secret == 1) {
+                secret = 0;
+            }
+            action CopiedSecretOtherCode when (phase == 0 && code == 1) {
+                code = 0;
+            }
+            action TrustdSilent when (phase == 0 && answered == 1) {
+                answered = 0;
+            }
+            action TrustdAnswers when (phase == 0 && answered == 0) {
+                answered = 1;
+            }
+            action LaunchServicesDisowns when (phase <= 1 && disowned == 0) {
+                disowned = 1;
+            }
+            // The outgoing process.
+            action Grant when (
+                phase == 0 && secret == 1 && code == 1 && answered == 1 && disowned == 0
+            ) {
+                phase = 1;
+            }
+            action Refuse when (
+                phase <= 1 && (secret == 0 || (answered == 1 && code == 0) || disowned == 1)
+            ) {
+                phase = 3;
+            }
+            action DeadlineWhileHeld when (phase == 0 && answered == 0) {
+                phase = 4;
+            }
+            action Commit when (phase == 1 && disowned == 0) {
+                phase = 2;
+            }
+            action FileByCause when (phase > 2 && filed == 0) {
+                filed = 1;
+            }
+            // Mutants, dead at Buggy = 0.
+            action GrantOnSecretAlone when (Buggy == 1 && phase == 0 && secret == 1) {
+                phase = 1;
+            }
+            action CommitOverDisowning when (Buggy == 1 && phase == 1) {
+                phase = 2;
+            }
+            action RefuseUnanswered when (Buggy == 1 && phase == 0 && answered == 0) {
+                phase = 3;
+            }
+            action FileAsUnexplainedDeath when (Buggy == 1 && phase == 3 && filed == 0) {
+                filed = 2;
+            }
+            invariant GrantOnlyToTheSuccessorsCode:
+                phase == 0 || phase > 2 || (secret == 1 && code == 1 && answered == 1);
+            invariant NoCommitToADisownedDialer: phase <= 1 || phase > 2 || disowned == 0;
+            invariant AnUnansweredCheckTurnsNoOneAway:
+                phase <= 2 || phase == 4 || secret == 0 || disowned == 1
+                    || (answered == 1 && code == 0);
+            invariant ARefusalIsFiledByItsCause: filed <= 1;
+        }
+    }
+}
+
 /// Admission and handoff policy for applying an already verified native update.
 ///
 /// A foreground terminal job is not dirty native UI state: the seamless handoff
@@ -1994,7 +2116,11 @@ pub fn native_update_status_reconciliation_model() -> Model {
 ///   class of `now` — the verdict never lapses.
 /// * `RecordStageFailure` / contract 2 (`BackoffSuppressesIffBeforeDeadline`):
 ///   after the backoff writer runs with deadline D, `suppresses` holds iff
-///   `now < D` — the reader's comparison direction, bound both ways.
+///   `now < D` — the reader's comparison direction, bound both ways. The one
+///   writer sets D from a verdict's schedule or, for a staging MOMENT, from the
+///   gentler one (round eight of the update audit, #62: a first moment's D is
+///   its own `now`); both are the same timed memo, so this action binds both,
+///   and the Tier-1 sweep drives both schedules.
 /// * `QuarantineVerdictLandsInTheQuarantineField` is the writer half alone:
 ///   the verdict must be recorded in the field the reader consults.
 ///
@@ -2272,10 +2398,12 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
             var proof_matched = 0;
             // Any mutable pre-Commit admission fact that turned false: a changed
             // session set or layout, a moved activity epoch, revoked native
-            // safety, a dead PTY peer, a lost Commit channel. They differ in the
-            // string they log and in whether automatic mode may retry; they do
-            // not differ in what they do to ownership, which is what this model
-            // is about.
+            // safety, a dead PTY peer, a lost Commit channel, a resident operator
+            // busy or unfenced at the Commit (round eight, #70 — once a
+            // precondition beside the admission, now two of its facts). They
+            // differ in the string they log and in whether automatic mode may
+            // retry; they do not differ in what they do to ownership, which is
+            // what this model is about.
             var revoked = 0;
             // The rollback WARRANT: the candidate is provably terminated, or was
             // never given anything. Nothing resumes a parked reader without it.
@@ -2601,6 +2729,19 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 ///   unmeasured_looks`, advanced only by an observation read since the last
 ///   look); `structural_latch` itself answers `Unmeasured`.
 ///
+/// * `TrialUnproven` — the latest facts read could not PROVE the installed
+///   bundle at all (round eight, #80: `spctl` past its ceiling on a captive
+///   portal, a passing refusal), so it observed nothing about whether the facts
+///   still name N; `room` is no reading then either (`unread = 2`). Such a read
+///   is no evidence the count is gone, so it spends none of `looks`; it has a
+///   bound of its own (#80's review): a due look over one asks for another
+///   observation and counts (`doubts`), and at `UnprovenLooks` the re-sample
+///   MOVES TO THE NEXT DAY (`day` cleared, still `owed`) — retried (L4), and
+///   never re-promised every 75 s while nothing can be proven (L5). The move is
+///   recorded (log, `update status`), not raised as a hold: it asks nothing of a
+///   person. A proven read (`TrialReadAgain`, or `TrialUnreadable`) decides as
+///   before.
+///
 /// A newer release outranks the day: a re-sample of N while a newer build
 /// waits would launch the older build for nothing. `AttemptFails` is the
 /// re-sample failing structurally again: the verdict stands, so it re-latches
@@ -2639,7 +2780,11 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 /// * where the count cannot be read, THE PROMISE KEPT FOREVER (before round
 ///   six): the look at the bound clears its count and keeps the re-sample
 ///   owed, asking for nothing — the notice goes on promising a re-sample no
-///   reading will earn (`NoRetryPromisedPastTheBound`).
+///   reading will earn (`NoRetryPromisedPastTheBound`);
+/// * where nothing can be proven, THE RE-PROMISE WITH NO BOUND (round eight #80
+///   as first landed): the look at the bound keeps the day due and asks again,
+///   as every look before it — the re-sample promised every 75 s for as long as
+///   the installed bundle cannot be checked (`UnprovenLooksAreBounded`).
 ///
 /// Liveness — that a refused release is, in the end, retired over — is Law
 /// 1's, checked on the apply ladder ([`native_update_apply_ladder_liveness`],
@@ -2655,18 +2800,26 @@ pub fn native_update_structural_latch_model() -> Model {
             // the lane stops waiting for it (the host's
             // `STRUCTURAL_TRIAL_UNMEASURED_LOOKS`, asserted equal in the bind).
             const UnreadLooks = 3;
+            // How many due looks in a row may find the installed bundle UNPROVEN
+            // before the day's re-sample moves to the next day (the host's
+            // `STRUCTURAL_TRIAL_UNPROVEN_LOOKS`, asserted equal in the bind).
+            const UnprovenLooks = 3;
             // 0 = the boot trial's room is not yet picked, 1 = running.
             var phase = 0;
             // One more launch of N keeps its boot trial under the revert
             // threshold (the sentinel's count, measured).
             var room = 0;
-            // The count can no longer be read: the installed facts stopped
+            // The count can no longer be read: 1 = the installed facts stopped
             // reporting N (a channel floor above it yanked it; round six,
-            // finding 55). `room` is then no reading at all.
+            // finding 55); 2 = the latest read could not PROVE the installed
+            // bundle at all (round eight, #80). `room` is then no reading at all.
             var unread = 0;
-            // Due looks in a row that found the count unreadable, each asking
-            // for an observation to read it.
+            // Due looks in a row that found the count unreadable (`unread == 1`),
+            // each asking for an observation to read it.
             var looks = 0;
+            // Due looks in a row over an unproven read (`unread == 2`), each
+            // asking for an observation that might prove it.
+            var doubts = 0;
             // The structural latch on build N holds.
             var latched = 1;
             // An observation the lane has not yet decided on.
@@ -2710,12 +2863,19 @@ pub fn native_update_structural_latch_model() -> Model {
                 pending = 1;
             }
             // The installed facts stop reporting N — an observation, so a look.
-            action TrialUnreadable when (phase == 1 && unread == 0 && superseded == 0) {
+            action TrialUnreadable when (phase == 1 && (unread == 0 || unread == 2) &&
+                superseded == 0) {
                 unread = 1;
                 pending = 1;
             }
+            // A read that could not prove the installed bundle at all — still a
+            // look, but no observation of N.
+            action TrialUnproven when (phase == 1 && unread <= 1 && superseded == 0) {
+                unread = 2;
+                pending = 1;
+            }
             // …and report it again: the count is read once more.
-            action TrialReadAgain when (phase == 1 && unread == 1) {
+            action TrialReadAgain when (phase == 1 && unread > 0) {
                 unread = 0;
                 pending = 1;
             }
@@ -2815,14 +2975,38 @@ pub fn native_update_structural_latch_model() -> Model {
                 looks = if (newer == 0 || newer_spent == 1) && day == 1 && owed == 1 &&
                     unread == 1 && looks <= UnreadLooks - 1 {
                     looks + 1
-                } else if unread == 1 &&
-                    ((newer == 1 && newer_spent == 0) || day == 0 || owed == 0) {
+                } else if (unread == 1 &&
+                    ((newer == 1 && newer_spent == 0) || day == 0 || owed == 0)) ||
+                    unread == 2 {
                     looks
                 } else {
                     0
                 };
+                // An unproven read's own count (round eight, #80's review): kept by
+                // a look that is not due, cleared by any proven read, and at the
+                // bound the day's re-sample moves to the next day — still owed,
+                // nothing asked. `Buggy`'s look at the bound (THE RE-PROMISE WITH
+                // NO BOUND) keeps the day due and asks again.
+                doubts = if (newer == 0 || newer_spent == 1) && day == 1 && owed == 1 &&
+                    unread == 2 &&
+                    (doubts <= UnprovenLooks - 1 || (Buggy == 1 && doubts == UnprovenLooks)) {
+                    doubts + 1
+                } else if unread == 2 &&
+                    ((newer == 1 && newer_spent == 0) || day == 0 || owed == 0) {
+                    doubts
+                } else {
+                    0
+                };
+                day = if Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
+                    owed == 1 && unread == 2 && doubts == UnprovenLooks {
+                    0
+                } else {
+                    day
+                };
                 pending = if (newer == 0 || newer_spent == 1) && day == 1 && owed == 1 &&
-                    unread == 1 && looks <= UnreadLooks - 1 {
+                    ((unread == 1 && looks <= UnreadLooks - 1) ||
+                        (unread == 2 && (doubts <= UnprovenLooks - 1 ||
+                            (Buggy == 1 && doubts == UnprovenLooks)))) {
                     1
                 } else {
                     0
@@ -2910,6 +3094,11 @@ pub fn native_update_structural_latch_model() -> Model {
                 } else {
                     owed <= 1
                 };
+            // A re-sample over reads that cannot prove the installed bundle is
+            // retried within a bound (round eight, #80's review): at
+            // `UnprovenLooks` due looks it moves to the next day, so no look
+            // past the bound promises it again (L5) — and none drops it (L4).
+            invariant UnprovenLooksAreBounded: doubts <= UnprovenLooks;
             // No automatic attempt spends the launch the boot trial reverts on:
             // without room the latch holds, or N is retired without a launch.
             invariant NeverSpendsTheRevertingLaunch:

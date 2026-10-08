@@ -1414,7 +1414,7 @@ mod tests {
         (0..cols).map(|x| span.tone(&surface, x).fill).collect()
     }
 
-    /// THE HONEST ENDS IN THE FLAT LOOK (ruling 55; review 2026-09-24).
+    /// THE HONEST ENDS IN THE FLAT LOOK (ruling 55).
     /// Under High Contrast every cell is whole — the fill or the track — and
     /// the first and last columns carry the gutters, so their CENTRES would
     /// leave a started pass an empty track (1 ‰ on an 80-column window) and
@@ -1462,7 +1462,7 @@ mod tests {
         }
     }
 
-    /// THE METER IS THE ROW, the MAPPING (ruling 55, 2026-09-23 — owner:
+    /// THE METER IS THE ROW, the MAPPING (ruling 55 — owner:
     /// *"make sure that 0% and 100% and similar concepts are mapped to the
     /// relative size of the screen with such top progress bars"* — amended by
     /// ruling 138: whole cells, smooth by TONE coverage). On a real 2000 px
@@ -1617,8 +1617,8 @@ mod tests {
         assert!(first && last, "it enters and leaves through the gutters");
     }
 
-    /// THE COMET ENTERS WITHOUT A STRAIGHT EDGE (review round 3, 2026-09-24,
-    /// re-pinned on whole-cell tones by ruling 138): through its first frames
+    /// THE COMET ENTERS WITHOUT A STRAIGHT EDGE (on whole-cell tones,
+    /// ruling 138): through its first frames
     /// the first column — the left gutter's — takes the entering head's
     /// COVERAGE, rising through intermediate tones frame by frame rather than
     /// switching on, and it never lights before the head has entered.

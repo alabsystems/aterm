@@ -4,19 +4,12 @@
 
 //! Stress stability tests for the terminal engine.
 //!
-//! These tests feed pathological parser input, extreme grid operations and
-//! wide characters through a Terminal and assert that it remains in a valid
-//! state afterward.
-//! They are gated behind the `long-tests` feature to avoid slowing CI.
+//! Pathological parser input, extreme grid operations and wide characters
+//! must not panic, and afterwards the cursor stays in bounds, the grid keeps
+//! its dimensions and content is not corrupted. Gated behind `long-tests`.
 //!
-//! Run with: cargo test -p aterm-core --test stress_stability --features long-tests
-//!
-//! ## What This Validates
-//!
-//! - No panics under extreme input
-//! - Cursor stays within grid bounds
-//! - Grid dimensions remain correct
-//! - Terminal processes arbitrary byte sequences without corruption
+//! Run with: `targo --unverified test -p aterm-core --test stress_stability
+//! --features long-tests`.
 
 #![cfg(feature = "long-tests")]
 

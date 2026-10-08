@@ -171,7 +171,7 @@
 //!   asserted the opposite (first that the site could not turn the selection on, then
 //!   that it "requires a selection already in progress"); both were false, and the
 //!   seam is recorded rather than argued about. `extend_selection_to` genuinely does
-//!   bail unless the selection is `Complete` (app_mouse.rs:2585), so it produces
+//!   bail unless the selection is `Complete`, so it produces
 //!   nothing to record. The three that DID turn it on
 //!   from off without a record — Select-All, a word/line click's PRESS, and a search
 //!   jump — now record at their own seams; the earlier text claimed they could not,
@@ -1243,14 +1243,11 @@ fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
     }
 }
 
-#[test]
-fn real_press_custody_conforms() {
-    let _ = run_conformance();
-}
-
-/// The `PressCustody` Tier-1 body, factored out so the `spec_xref_gate` can RUN it:
-/// the gate's "PressCustody is actively bound" claim then means the real engine and
-/// GUI seams were driven and checked, not merely that anchors exist.
+/// The `PressCustody` Tier-1 body, RUN by `spec_xref_gate`'s `spec_xref_closure` and
+/// by nothing else: the gate's "PressCustody is actively bound" claim then means the
+/// real engine and GUI seams were driven and checked, not merely that anchors exist.
+/// (A standalone test wrapper ran this same body a second time per gate run; it is
+/// gone.)
 pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
     // EXECUTION EVIDENCE. `step` drives each seam inside a one-step-wide window, so

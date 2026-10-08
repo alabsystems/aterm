@@ -47,17 +47,26 @@ use super::Model;
 /// the relaunch count (a SPACE guard: the brake's policy is
 /// [`keeper_relaunch_brake_model`]'s).
 ///
-/// `Buggy = 1` is six design defects: an EOF on a live window's link read as its
+/// `Buggy = 1` is eight design defects: an EOF on a live window's link read as its
 /// death (`LinkDrops`, `BuggyOfferOnEof`); the holder scan skipped at the offer
 /// (so an update's committed successor's masters are offered —
 /// `BuggyIgnorePending`); the keeper closing its copy when it offers
 /// (`BuggyMoveOnOffer`); a BYE read as a crash (`BuggyIgnoreBye`); a RELEASE
 /// forgotten, and the shell's liveness unread at the offer
-/// (`BuggyForgetRelease`); and a RELEASE from ONE of two claimants — the
+/// (`BuggyForgetRelease`); a RELEASE from ONE of two claimants — the
 /// outgoing window of an update, after its successor registered — closing the
 /// custody copy the other still depends on (`OutgoingReleasesA`,
 /// `BuggyReleaseEndsEveryClaim`: P2's open finding, reproduced here and fixed
-/// in `KeeperCore::release`). Each invariant is falsified by its own schedule.
+/// in `KeeperCore::release`); and the committed successor's quit read as a
+/// crash, its shells orphaned (`SuccessorQuits`, caught by
+/// `NoRelaunchAfterQuit`: P3's keeper, for a successor that never took part —
+/// its keeper off, a build before the keeper — which judged the hold by its
+/// holders alone; fixed in `KeeperCore::resolve_holds`); and the outgoing
+/// window's Commit read as a quit when its successor died first
+/// (`SuccessorCrashesFirst`, caught by `LossNeedsKeeperFaultA`/`B`: the
+/// marker cross-check alone closed the copies of every shell the update
+/// carried; fixed in `KeeperCore::peer_died`). Each invariant is falsified by
+/// its own schedule.
 /// Two more replay round seven's finding 65, whose Tier-1 bind is the
 /// conformance's negative control (no invariant here states liveness): an
 /// offer left with the relaunched window's dropped link instead of returned
@@ -68,11 +77,14 @@ use super::Model;
 /// its end yet, so it still claims every master it registered (`o_claims_a`).
 /// Its late RELEASE (`OutgoingReleasesA`), the successor's own tab close
 /// (`SuccessorClosesTabA`) and the keeper reading its EOF and exit
-/// (`OutgoingDrained`) interleave; the successor's crash waits for the drain
-/// (the outgoing window `_exit`s at Commit, so its drain is milliseconds).
-/// Those three are stated for master `a` only: the finding needs one master,
-/// and the `b` twins would take the `Buggy = 1` space past the interpreter's
-/// bound.
+/// (`OutgoingDrained`) interleave. The successor's crash or quit otherwise
+/// follows the drain (the outgoing window `_exit`s at Commit, so its drain is
+/// milliseconds) — except a crash within those milliseconds, whose end the
+/// keeper reads together with the drain (`SuccessorCrashesFirst`, one step:
+/// its states are the drain-then-crash ones, so the committed space is
+/// unchanged). Those are stated for master `a` only: the finding needs one
+/// master, and the `b` twins would take the `Buggy = 1` space past the
+/// interpreter's bound.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn pty_keeper_custody_model() -> Model {
@@ -230,7 +242,11 @@ pub fn pty_keeper_custody_model() -> Model {
                 w_reads_b = 0;
             }
             // Commit and the window's `_exit`, one step (`CommitAtomically`).
-            // A hold, never an orphan: the successor holds every master.
+            // A hold, never an orphan: the successor holds every master. The
+            // successor registers them; one that takes no part in the keeper
+            // (its keeper off, a build before the keeper) registers nothing,
+            // and the keeper holds them for it until it ends — the same step
+            // here, both driven by the Tier-1.
             action Commit when (w_live == 1 && s_live == 1 && pending == 1) {
                 w_live = 0;
                 w_holds_a = 0;
@@ -308,6 +324,51 @@ pub fn pty_keeper_custody_model() -> Model {
                 orphan_b = k_holds_b;
                 lost_a = if s_holds_a == 1 && k_holds_a == 0 && closed_a == 0 { 1 } else { lost_a };
                 lost_b = if s_holds_b == 1 && k_holds_b == 0 && closed_b == 0 { 1 } else { lost_b };
+            }
+            // THE SUCCESSOR DIES FIRST: it crashes within the Commit's
+            // milliseconds, before the keeper judged the outgoing window's
+            // drain, and the keeper judges both ends together (one step,
+            // whichever end it reads first, to the state the drain and then
+            // the crash reach). The outgoing window's `exit(0)`, its
+            // crash marker removed (handing off IS a clean end), is the
+            // Commit, not a quit whose BYE was lost: what it handed the dead
+            // successor is an orphan. The mutant reads it as that quit (§5.4
+            // row 3's cross-check, the successor unread): the keeper closes
+            // its copies and every shell the update carried is hung up.
+            action SuccessorCrashesFirst when (o_draining == 1 && s_live == 1 && committed == 1) {
+                o_draining = 0;
+                o_claims_a = 0;
+                s_live = 0;
+                s_holds_a = 0;
+                s_reads_a = 0;
+                s_holds_b = 0;
+                s_reads_b = 0;
+                k_holds_a = if closed_a == 1 || Buggy == 1 { 0 } else { k_holds_a };
+                k_holds_b = if Buggy == 1 { 0 } else { k_holds_b };
+                orphan_a = if closed_a == 1 || Buggy == 1 { 0 } else { k_holds_a };
+                orphan_b = if Buggy == 1 { 0 } else { k_holds_b };
+                lost_a = if s_holds_a == 1 && closed_a == 0 && (k_holds_a == 0 || Buggy == 1) { 1 } else { lost_a };
+                lost_b = if s_holds_b == 1 && closed_b == 0 && (k_holds_b == 0 || Buggy == 1) { 1 } else { lost_b };
+            }
+            // The person quits the committed successor. One that registered
+            // says BYE; one that takes no part says nothing, and the keeper
+            // reads its `exit(0)` after the outgoing window's clean Commit
+            // (§5.4 row 3, for the process the hold waited on). Either way a
+            // quit: the copies close and the shells are hung up, as today.
+            // The mutant reads the quit as a crash — P3's keeper, for a
+            // successor that took no part: it judged the hold by its holders
+            // alone and orphaned every shell the update carried.
+            action SuccessorQuits when (s_live == 1 && committed == 1 && o_draining == 0) {
+                s_live = 0;
+                s_holds_a = 0;
+                s_reads_a = 0;
+                s_holds_b = 0;
+                s_reads_b = 0;
+                bye = 1;
+                k_holds_a = if Buggy == 1 { k_holds_a } else { 0 };
+                k_holds_b = if Buggy == 1 { k_holds_b } else { 0 };
+                orphan_a = if Buggy == 1 { k_holds_a } else { 0 };
+                orphan_b = if Buggy == 1 { k_holds_b } else { 0 };
             }
             // The keeper brings a window back: it holds an orphan, no window or
             // successor is connected, no BYE was read, and the brake permits.

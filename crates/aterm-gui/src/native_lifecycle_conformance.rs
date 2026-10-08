@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use aterm_spec::derive::{Model, native_async_delivery_model, native_settings_singleton_model};
 use aterm_spec::interp::{State, admits};
 
+use crate::conformance_support::assert_sole_transition as assert_transition;
 use crate::document_store::DocumentStore;
 use crate::native_app::{
     AppEffect, AppEvent, AppKind, AppViewState, CompletionSink, ConfigPatch, ConfigPatchOutcome,
@@ -29,23 +30,6 @@ use crate::native_ui::ActionId;
 use crate::tab_model::{AppInstanceId, View, ViewId};
 use crate::update_screen::UpdateState;
 use crate::{App, WindowId};
-
-fn assert_transition(model: &Model, before: &State, after: &State, action: &'static str) {
-    assert_eq!(
-        model.successors(action, before).as_slice(),
-        std::slice::from_ref(after),
-        "shipping transition must conform specifically to {action}"
-    );
-    assert_eq!(admits(model, before, after), Some(action));
-    for invariant in &model.invariants {
-        assert!(
-            model.check_invariant(invariant.name, after),
-            "post-state violates {}::{}: {after:?}",
-            model.name,
-            invariant.name,
-        );
-    }
-}
 
 fn settings_instance_for_view(app: &App, view: ViewId) -> Option<AppInstanceId> {
     let View::Native(link) = app.view_store.get(view).copied()? else {
@@ -80,9 +64,8 @@ fn active_is_settings(app: &App, wid: WindowId) -> bool {
         .is_some_and(|tab| settings_instance_for_view(app, tab.focus).is_some())
 }
 
-/// Headless twin of the production `WindowEvent::Focused(true)` branch.  Every
-/// mutation here calls the same App bookkeeping seams; only the unavailable OS
-/// event object is omitted.
+/// Headless twin of the production `WindowEvent::Focused(true)` branch: the same App
+/// bookkeeping seams, minus the OS event object.
 fn focus_logical_window(app: &mut App, wid: WindowId) {
     assert!(app.windows.contains_key(&wid));
     if let Some(previous) = app.frontmost_window
@@ -231,11 +214,9 @@ fn real_app_settings_activation_conforms_in_two_windows_and_rejects_duplicates()
     assert!(!model.check_invariant("SingletonInstance", &duplicate));
     assert!(!model.check_invariant("OneImplicitViewWindowTwo", &duplicate));
 
-    // A cross-window focus steal (the model's `Buggy=1` OpenTwo: raising the
-    // window that already shows Settings instead of the requester) leaves window
-    // one frontmost over its Settings tab while window two asked, which the
-    // projection reads as `(requesting 2, focused 1)`. It cannot masquerade as a
-    // successful OpenTwo.
+    // A cross-window focus steal (the model's `Buggy=1` OpenTwo raises the window
+    // already showing Settings instead of the requester) projects as
+    // `(requesting 2, focused 1)`, so it cannot pass as a successful OpenTwo.
     let mut stolen_focus = after_repeat_two;
     stolen_focus.insert("focused_window", 1);
     assert_eq!(admits(&model, &before_repeat_two, &stolen_focus), None);
@@ -284,9 +265,8 @@ struct AsyncFacts {
     sink: i64,
     token_generation: i64,
     view_generation: i64,
-    /// Reductions of the latest issued operation's reply, OBSERVED: each time
-    /// the Settings reducer changed the view's feedback, or the config service
-    /// published a new revision, for that operation.
+    /// Observed reductions of the latest operation's reply: each change to the view's
+    /// feedback, or each new config-service revision, for that operation.
     reduced: i64,
 }
 
@@ -312,14 +292,13 @@ impl AsyncHarness {
         let mut runtime = NativeRuntime::new();
         let update = UpdateState::from_status(1, "0.1.0", None, false);
         let settings_instance = runtime
-            .insert_instance(NativeApp::Settings(SettingsApp::new(update)))
+            .insert_instance(NativeApp::Settings(Box::new(SettingsApp::new(update))))
             .expect("Settings instance");
         let settings_view = ViewId::from_stored(1);
         let mut settings_state = SettingsViewState::from_snapshot(&config_snapshot)
             .expect("Settings consumes the same canonical config snapshot");
-        // Shipping ALab provenance intentionally has no fabricated website.
-        // This conformance harness supplies one explicitly because its subject
-        // is the real optional OpenExternal reply lifecycle.
+        // Shipping provenance has no website; this harness adds one so the optional
+        // OpenExternal reply lifecycle can run.
         settings_state.about.add_test_site("example.test");
         runtime
             .attach_view(
@@ -662,10 +641,9 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
     let PendingReply::View(reply) = reply else {
         unreachable!();
     };
-    // A second delivery of the consumed reply, through the genuine router and
-    // reducer, with an outcome that WOULD change the feedback were it reduced:
-    // `finish_external`'s `pending.remove` guard finds no operation, and the
-    // view is untouched — no model step at all.
+    // Redelivering the consumed reply through the real router and reducer, with an
+    // outcome that would change the feedback: `finish_external` finds no pending
+    // operation and the view is untouched (no model step).
     harness.deliver_external(
         reply.operation,
         ExternalOpenOutcome::Denied {

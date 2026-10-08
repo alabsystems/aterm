@@ -7,103 +7,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm performance benchmarks (ROADMAP WS-K). Targets are RED until reproduced on the shipped binary."
+description = "aterm performance harnesses (the examples `xtask perf` runs)."
 
 [dev-dependencies]
-# The engine every bench, example and test drives. The library itself (the shared
-# corpora) names neither it nor aterm-grid.
 aterm-core = { workspace = true }
-# The resize/rewrap fence harness steps PendingScrollbackReflow directly (the
-# wasm pump's schedule) — the step types live in aterm-grid, not re-exported.
+# The resize/rewrap harness steps PendingScrollbackReflow directly.
 aterm-grid = { workspace = true }
-criterion = "0.5"
-# CPU rasterizer for the deterministic end-to-end (bytes -> pixels) bench.
-aterm-render = { workspace = true }
-# Competitor engines for honest, in-process, apples-to-apples comparison.
-alacritty_terminal = "0.26"  # Alacritty's full engine (parser+grid+state)
-vte = "0.15"                 # Alacritty's VT parser (parser-only reference)
-# WezTerm's published VT parser (parser-only floor; its full engine `wezterm-term`
-# is NOT published on crates.io, so only the parser layer is comparable in-process).
-termwiz = { version = "0.23", default-features = false }
-# Differential oracle (tests/differential.rs): property-based byte-stream
-# generation, aterm vs alacritty on identical input.
-proptest = { workspace = true }
-# The wasm renderer substrate, built for the HOST here: `wasm_frame_gate` prices
-# the WF-1 settled-frame skip against the same crate's ungated render loop. It
-# is an rlib as well as a cdylib, and its closure is platform-free, so it links
-# natively without a wasm32 toolchain.
-aterm-wasm = { path = "../aterm-wasm" }
-# The WebGL browser backend, built for the HOST here: `gpu_web_frame_gate` prices
-# its per-rAF-tick frame build (and the settled-frame gate that elides it) through
-# the crate's native `render_headless` seam. Like `aterm-wasm` it is an rlib as
-# well as a cdylib; the wgpu/WebGL closure is confined to its `cfg(target_arch =
-# "wasm32")` dependency table, so a native link pulls only the engine deps.
-aterm-gpu-web = { path = "../aterm-gpu-web" }
-# The policy-gate bench installs the SAME engine the shipping GUI installs
-# (`PolicyEngine::new(profiles::standard())`, aterm-gui/src/spawn.rs:733). Without
-# it, no bench in the tree ever takes the engine branch of a capability gate.
-aterm-policy = { workspace = true }
-
-[[bench]]
-name = "engine_throughput"
-harness = false
-
-[[bench]]
-name = "hyperlink_screen"
-harness = false
-
-[[bench]]
-name = "extras_erase"
-harness = false
-
-[[bench]]
-name = "scrolloff_extract"
-harness = false
-
-[[bench]]
-name = "comparative"
-harness = false
-
-[[bench]]
-name = "end_to_end"
-harness = false
-
-[[bench]]
-name = "wasm_frame_gate"
-harness = false
-
-# The drag half of the WF-1 gate: what a redundant `selection_extend` costs.
-[[bench]]
-name = "wasm_selection_drag"
-harness = false
-
-# The WebGL browser backend's per-rAF-tick frame build (engine-side half only —
-# the GL present is not measurable in this repo; see the bench's header).
-[[bench]]
-name = "gpu_web_frame_gate"
-harness = false
-
-[[bench]]
-name = "policy_gate"
-harness = false
-
-# The only target in the tree that attaches a tiered scrollback STORE, so the
-# only one that ever reaches `DeferredLine::materialize*` (row -> Line + attrs
-# `Rle`). Every other target builds `Terminal::new`, whose Grid has
-# `scrollback: None`, and therefore never builds a `Line` at all.
-[[bench]]
-name = "scrollback_materialize"
-harness = false
-
-# THE ONLY BENCH THAT MEASURES A PROCESS RATHER THAN A FUNCTION: what one
-# `exec()` of a built binary costs, and how much of it is dyld mapping
-# frameworks the route never calls. Not criterion — a criterion iteration would
-# BE a spawn — so it runs its own alternating exec loops and carries a two-sided
-# Mach-O load-command reach guard. It needs `cargo build --release --workspace
-# --bins` first and SKIPS cleanly (exit 0) when the binaries are absent.
-[[bench]]
-name = "startup_exec"
-harness = false
 
 [lints]
 workspace = true
+
+[lib]
+# No unit tests in src/; doctests still run.
+test = false

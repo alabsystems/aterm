@@ -12,6 +12,9 @@ description = "aterm — a native windowed terminal: winit presenting the aterm-
 [[bin]]
 name = "aterm-gui"
 path = "src/main.rs"
+# No test lives in main.rs (no #[test], no cfg(test), no `mod`); its libtest
+# harness ran 0 tests in every gate. Integration tests still get the binary.
+test = false
 
 # The Phase 1a redraw gate. A BINARY because `EventLoop` construction panics off
 # the process main thread and libtest runs every `#[test]` on a spawned one, so
@@ -177,16 +180,6 @@ a11y-accesskit = ["dep:accesskit", "dep:accesskit_winit"]
 # can run the suite (a bin gets no dev-dependencies). OFF by default: the shipped
 # GUI carries neither the gate nor the suite.
 control-conformance = ["aterm-control/conformance"]
-# Bench-only observation seam (src/bench_support.rs), the `test-open-probe`
-# precedent applied to this crate: `benches/frame_latency.rs` is an EXTERNAL
-# target, so it sees only the crate's public surface — but the frame-path
-# fixtures it must drive (`App::headless_for_test`, the stub sessions/tabs)
-# are `#[cfg(test)]` crate internals. This feature widens exactly those
-# fixture gates to `#[cfg(any(test, feature = "bench-support"))]` and compiles
-# the one public wrapper module the bench drives them through. OFF everywhere
-# except the bench target below (`required-features`); no shipping crate
-# enables it, so `cargo build -p aterm-gui` stays byte-identical.
-bench-support = []
 # DEVELOPMENT SEAMS in an optimized build: the `aterm_types::dev_seam!` reads this
 # crate makes (the `ATERM_DEBUG_*` screenshot seams, the handoff deadlines) and the
 # development settings (`[update] require_team_id`), forwarded to the updater and atpkg,
@@ -194,10 +187,12 @@ bench-support = []
 # `[packages]` prefix/account/repo links), to the renderers' own (the
 # `ATERM_GPU_*` / `ATERM_RASTERIZER` seams), to the PTY seam
 # (`ATERM_PTY_IDLE_POLL_US`, `ATERM_TRACE_BOOST`) and to the state-root rule
-# (`ATERM_STATE_HOME`, aterm-types). A debug build compiles them anyway. The
+# (`ATERM_STATE_HOME`, aterm-types) and to the harness's live-upgrade settle
+# (`ATERM_UPGRADE_QUIET_S`, aterm-agent). A debug build compiles them anyway. The
 # release cutter NEVER enables it — `aterm-release`'s buildplan pins that — so a
 # shipped binary reads none of them.
 dev-seams = [
+    "aterm-agent/dev-seams",
     "aterm-update/dev-seams",
     "atpkg/dev-seams",
     "aterm-gpu/dev-seams",
@@ -218,6 +213,10 @@ aterm-control = { workspace = true }
 # Durable event claims/WAL for the operator observer embedded in every normal
 # GUI/headless process. This crate remains host-agnostic and has no GUI edge.
 aterm-agent = { workspace = true }
+# The control client's ONE token reader (no-follow, regular file, bounded) and
+# its connect-then-read order, for this instance's own dials to a sibling. Not
+# a new edge in the BUILD graph: `aterm-agent` above already links it.
+aterm-ctl = { path = "../aterm-ctl" }
 # L0.5 semantic predicates: the `await match <re>` verb compiles its regex here,
 # so the engine core stays regex-free (RFC R2 purity).
 aterm-observe = { workspace = true }
@@ -278,6 +277,9 @@ aterm-hash = { workspace = true }
 # consumer of aterm-types in the same resolve too, which is how `aterm-ctl`
 # acquired AppKit; keep this edge featureless.
 aterm-types = { workspace = true }
+# The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin), already in
+# the graph via aterm-types.
+aterm-time = { workspace = true }
 # K-2: the winit→engine key map, so the GUI and the future native shell share one
 # table instead of an inline match that drifts.
 aterm-winit-keymap = { workspace = true }
@@ -329,7 +331,7 @@ serde = { workspace = true }
 # aterm-update already uses.
 # First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
 # untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
-# behind it; `serde_json` survives only as that crate's [dev-dependencies] oracle.
+# behind it.
 aterm-json = { workspace = true }
 # SHA-256 for the operator/seamless/config-completion proof digests and the
 # managed-model blob check. First-party; no third-party crypto in this binary.
@@ -364,11 +366,9 @@ aterm-png = { workspace = true }
 # the committed anchor in `aterm-update-core::pins`, never from the environment,
 # so the embedded record cannot disagree with the key actually trusted.
 aterm-update-core = { workspace = true }
-# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
-# to the retired `base64` package's `general_purpose::STANDARD` engine by
-# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
-# point every trust path uses: canonical padding REQUIRED and no trailing bits,
-# so a pinned key has exactly one spelling.
+# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# the entry point every trust path uses: canonical padding REQUIRED and no
+# trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
 aterm-digest = { workspace = true }
 # Windows only: compile + link the application .ico (assets/aterm.rc → assets/
@@ -392,6 +392,10 @@ aterm-control = { workspace = true, features = ["conformance"] }
 # Enables a path-filtered, thread-local counter at the actual visual-feed
 # platform-open seam. It is used only by same-read/ABA conformance tests.
 aterm-effects = { workspace = true, features = ["test-open-probe"] }
+# The seal on a persistent message hold has no public constructor: a fixture
+# that needs a bare `Hold::STANDING` / `Hold::asking(..)` takes them from this
+# feature, which lends it the engine's own adopted ask. TEST builds only.
+aterm-messages = { workspace = true, features = ["test-fixtures"] }
 # VISUAL CAPTURE (`message_band_visual_capture` and its #[ignore]d siblings): dump
 # real rendered frames to PNG so the chrome can be reviewed as pixels, not asserts —
 # the same pattern `aterm-gpu`'s rain screenshot harness uses. (Redundant with the
@@ -406,19 +410,6 @@ winit = { workspace = true, features = ["aterm-test-key-event"] }
 # `window_routing_model()`. Same model that is Tier-0 `ty check`ed in
 # aterm-spec, so the spec the conformance test writes cannot drift from it.
 aterm-spec = { workspace = true }
-# Property tests for the typography config mapping (`Config::text_shaping`).
-proptest = { workspace = true }
-# The frame-latency benchmark (`benches/frame_latency.rs`): the same harness the
-# aterm-effects per-frame benches ride. Until it landed the ~360k-line frame
-# path (keystroke-to-echo, PTY-flood-to-present) had NO bench target at all —
-# the audits' GUI-half findings (CF-6 driver, PET-03 gui) were unpriceable.
-criterion = "0.5"
-# The reflow-ceiling probe (`benches/reflow_smt_probe.rs`) drives the LZ4 block
-# codec directly — decompressing into a REUSED buffer, the shape the x86_64 table
-# in `app_render::reflow_worker_ceiling`'s doc was measured with — which
-# `aterm-scrollback`'s allocating wrapper cannot express. The crate is already in
-# this graph under aterm-scrollback, so this adds an edge, not a package.
-aterm-lz4 = { workspace = true }
 # TRUST_NATIVE_TLA Phase 2: the relocated `spec_xref_closure` gate lives in this
 # binary's TEST build (`#[cfg(test)] mod spec_xref_gate` in main.rs). It collects
 # the ISOLATION-family `#[refines]`/`#[spec_unmodeled]` anchors via `inventory`, so
@@ -435,6 +426,9 @@ aterm-lz4 = { workspace = true }
 # never projects a live session's grids by making that projection fail
 # (`checkpoint.carry_projection`). The production build keeps the const-false stub.
 aterm-core = { workspace = true, features = ["spec-anchors", "fault-injection"] }
+# `testing` exposes the debugger change's real order
+# (`consent::devtools_change_with_for_test`) to `debugger_access`'s Tier-1 bind.
+aterm-containment = { workspace = true, features = ["testing"] }
 aterm-sandbox = { workspace = true, features = ["spec-anchors"] }
 aterm-pty = { workspace = true, features = ["spec-anchors"] }
 aterm-gpu = { workspace = true, features = ["spec-anchors"] }
@@ -458,9 +452,10 @@ aterm-grid = { workspace = true, features = ["spec-anchors"] }
 # StreamingSearch machine's temporal half) AND its kani `proof_anchor!` records;
 # re-declared with `spec-anchors` ON so this gate's test binary collects both.
 aterm-search = { workspace = true, features = ["spec-anchors"] }
-# aterm-agent supplies the `#[refines]`/`#[spec_unmodeled]` anchors of four
-# derived machines — the live upgrade's ladder (`HarnessUpgradeLadder`) and
-# its goal pause (`HarnessUpgradeGoalPause`), the Claude Code footer's reader
+# aterm-agent supplies the `#[refines]`/`#[spec_unmodeled]` anchors of five
+# derived machines — the live upgrade's ladder (`HarnessUpgradeLadder`), its
+# goal pause (`HarnessUpgradeGoalPause`) and its progress
+# (`HarnessUpgradeProgress`), the Claude Code footer's reader
 # (`ClaudeFooterModel`) and the Codex rate-limit nudge's deciders
 # (`SupervisorCodexRateNudge`), each fully bound-or-waived —
 # re-declared here with `spec-anchors` ON so this gate's test binary collects
@@ -613,74 +608,6 @@ softbuffer = { version = "0.4", default-features = false, features = [
 # as of W13 it carries every macOS site this crate has. Not optional and not
 # feature-gated: it is the shipping path.
 aterm-objc = { workspace = true }
-
-# ORACLE ONLY (never in a shipped build). `security-framework` used to be a hard
-# macOS dependency for exactly two calls — Keychain get/set of the network-drive
-# token. Those are now `net_connections::keychain`, ~200 lines of direct
-# Security.framework `SecItem*` FFI, and the crate stays here purely as the
-# differential test's
-# reference implementation: `net_connections::keychain::tests` drives both
-# implementations against a live login keychain, in both directions, and asserts
-# they agree on stored bytes, on the add-vs-update branch, and on the exact
-# OSStatus of every failure. Retiring it removed 10,503 lines / 1 package from
-# the mac-arm graph.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-security-framework = "3"
-
-# The per-presented-frame cost of the GUI frame path, measured headless off the
-# same fixtures the unit tests drive (see the bench's own header for what a
-# headless frame can and cannot model). `required-features` keeps the seam out
-# of every default build — run it with
-#   cargo bench -p aterm-gui --features bench-support --bench frame_latency
-[[bench]]
-name = "frame_latency"
-harness = false
-required-features = ["bench-support"]
-
-# The WORKSPACE axis (multi-pane/tab/window scaling). `frame_latency`'s
-# `many_tabs_idle/N` prices `redraw_compose`, which sits BELOW `redraw_window`'s
-# wrapper and takes the strip fingerprint as a parameter — so its (true, good)
-# flat result says nothing about the four whole-workspace passes that live in
-# the wrapper, nor the two on the `Wake::Output` arm. This target prices those,
-# at 30 tabs x 4 panes. Same `bench-support` seam, same no-shipping-build law.
-[[bench]]
-name = "workspace_scaling"
-harness = false
-required-features = ["bench-support"]
-
-# The REFLOW-CEILING axis on a hyper-threaded host. `workspace_scaling` measured
-# the reflow pool's ceiling on Apple silicon, where physical cores == logical
-# CPUs; this probe is the instrument behind the x86_64 table in
-# `app_render::reflow_worker_ceiling`'s doc comment — what the workers past the
-# physical cores buy on the history-back drain and what they cost a
-# latency-sensitive thread's wakes. A MODEL of the settle, not the settle (see
-# its header). Same `bench-support` seam, same no-shipping-build law.
-[[bench]]
-name = "reflow_smt_probe"
-harness = false
-required-features = ["bench-support"]
-
-# The SUBSCRIBE (fleet observation) axis. Nothing priced it before: `frame_latency`
-# measures the render path and `workspace_scaling` the wrapper passes, while the
-# control socket's push loop — the thing a fleet orchestrator actually leans on —
-# had no bench target at all. This one prices the `events` DIGEST against the
-# variable its cost was found to track: RETAINED HISTORY DEPTH (completed blocks,
-# turn records, timeline events), not the live window. Same `bench-support` seam,
-# same no-shipping-build law.
-[[bench]]
-name = "subscribe_digest"
-harness = false
-required-features = ["bench-support"]
-
-# The INTROSPECTION axis: the styled frame an agent reads the screen with
-# (`screen`, `subscribe … cells`). `frame_latency` prices pixels and
-# `subscribe_digest` prices the event stream; the screen READ — gathered with the
-# terminal mutex held, so the engine waits on it — had no bench target at all.
-# Same `bench-support` seam, same no-shipping-build law.
-[[bench]]
-name = "styled_frame"
-harness = false
-required-features = ["bench-support"]
 
 [lints]
 workspace = true

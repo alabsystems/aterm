@@ -1,0 +1,11 @@
+# claude-code 2.1.284 · HAND-BUILT 2026-09-28 from the 2.1.284 binary's `c4e()`/`gt()` (UNMEASURED: where the two `event` notifications land is not captured — placed here as right-aligned hints above the composer, as the update banner is): the session wall's gutter row, then the armed auto-continue's two notifications, `limit-status` (`Usage limit reached · limit resets 3pm`) and `limit-next` (`Continuing automatically at 3pm · esc to cancel`) · a session wall Claude Code will continue by itself, 2.1.284's wording
+⏺ Suites are running; I'll report the number when it lands.
+  ⎿  You've hit your session limit · resets 3pm (America/Los_Angeles)
+
+✻ Cooked for 3m 2s · done 2:24 PM
+                                                                                           Usage limit reached · limit resets 3pm
+                                                                                     Continuing automatically at 3pm · esc to cancel
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

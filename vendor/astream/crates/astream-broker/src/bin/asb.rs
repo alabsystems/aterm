@@ -311,7 +311,7 @@ fn decode_hex(hex: &[u8], out: &mut [u8]) -> Result<(), String> {
             _ => None,
         }
     }
-    for (i, pair) in hex.chunks_exact(2).enumerate() {
+    for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         match (nibble(pair[0]), nibble(pair[1])) {
             (Some(hi), Some(lo)) => out[i] = (hi << 4) | lo,
             _ => return Err(format!("not valid hex at char {}", i * 2)),
@@ -1931,7 +1931,7 @@ mod tests {
         assert!(decode_hex(b"-1", &mut out).is_err());
         assert!(decode_hex(b" f", &mut out).is_err());
         let mut out32 = [0u8; 32];
-        assert!(decode_hex(&[b'+', b'f'].repeat(32), &mut out32).is_err());
+        assert!(decode_hex(&b"+f".repeat(32), &mut out32).is_err());
     }
 
     /// The persisted producer sequence rises from 1, survives the process, and

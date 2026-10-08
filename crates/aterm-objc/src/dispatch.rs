@@ -1,142 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! MAIN-QUEUE EXECUTION — `run_on_main`, the W10 capability.
+//! Main-queue execution: [`run_on_main`] runs a closure on the process main
+//! thread and returns its result. libdispatch only (part of `libSystem`), so no
+//! dependency or link flag.
 //!
-//! One entry point, [`run_on_main`], which runs a closure on the process main
-//! thread and hands back what it returned. It replaces
-//! `objc2_foundation::run_on_main` at `vendor/winit`'s `event.rs` and
-//! `monitor.rs`, and it is libdispatch only: no Foundation class, no selector,
-//! no framework binding. `libdispatch` is part of `libSystem`, already loaded
-//! in every aterm process, so this module adds no dependency and no link flag.
+//! # Pools and lifetimes
 //!
-//! # THE POOL AND LIFETIME STORY, SETTLED BEFORE THE API
+//! Autorelease pools are per-thread, and on the dispatched path the closure
+//! runs on the main thread, where nothing the caller pushed is in scope; the
+//! main run loop's pool drains after `dispatch_sync_f` has returned. So nothing
+//! that depends on a pool may cross the boundary:
 //!
-//! W9's `load_borrowed` was withdrawn because it minted a lifetime from a pool
-//! REFERENCE the caller named rather than from the pool the runtime actually
-//! used, and the judge's lesson was explicit: *build the pool/lifetime
-//! discipline before the API that mints lifetimes from it, not after.* This
-//! module is the first capability written under that rule, and `run_on_main` is
-//! a sharper case than `load_borrowed` was, because here the two pools are not
-//! merely nested — **they are on different threads.**
+//! * No `&AutoreleasePool` in the signature or handed to the closure (a pool
+//!   reference in scope of a generic `R` would let it mint a lifetime). The
+//!   closure receives only a [`MainThread`] witness, minted on the main thread
+//!   (it is `!Send`, so it cannot be smuggled in).
+//! * `R: Send` with no lifetime parameter; `F: Send`.
 //!
-//! Three facts decide the whole signature:
+//! The closure runs inside its own pool on both paths, so anything it
+//! autoreleases is released before `run_on_main` returns and the caller cannot
+//! tell which path ran. On the dispatched path the main queue's drain already
+//! wraps each callback in a pool; the explicit one keeps the guarantee from
+//! resting on that undocumented detail.
 //!
-//! 1. **Autorelease pools are per-thread.** On the dispatched path the closure
-//!    runs on the main thread, where *nothing* the calling thread has pushed is
-//!    in scope. A `&AutoreleasePool` the caller holds is not merely the wrong
-//!    pool, it is a pool on the wrong thread.
-//! 2. **The main thread's innermost pool outlives this call.** A block run from
-//!    the main queue lands inside whatever pool the main runloop has open for
-//!    that iteration, and that pool drains when the iteration ends — which is
-//!    AFTER `dispatch_sync_f` has returned and the calling thread has resumed.
-//!    So a `+0` value produced inside the closure would be freed at a moment
-//!    the caller cannot name, observe, or order against its own work.
-//! 3. **Nothing may therefore cross the boundary that depends on a pool.**
+//! # Re-entrancy: the main-thread case is a direct call
 //!
-//! From which the API follows, and every clause below is a consequence rather
-//! than a preference:
-//!
-//! * **No `&AutoreleasePool` in the signature, and none handed to the
-//!   closure.** The closure receives a [`MainThread`] witness and nothing else.
-//!   Passing it a pool reference would rebuild `load_borrowed`'s exact hole one
-//!   level out: the closure's return type is generic, so a pool reference in
-//!   scope is a lifetime the closure can put in `R`.
-//! * **`R: Send`, and no lifetime parameter on the function.** `R` travels from
-//!   the main thread back to the caller. A borrow of anything the main thread
-//!   autoreleased cannot make that trip, and `Send` plus the absence of any
-//!   lifetime to unify with is what stops it being tried.
-//! * **`F: Send`.** The closure travels the other way.
-//! * **`MainThread` is `!Send`** — so the witness cannot be captured by `f` and
-//!   smuggled in from the calling thread. It is minted INSIDE, on the thread it
-//!   describes, which is the only place it is true.
-//!
-//! ## The closure runs inside its own pool, on BOTH paths
-//!
-//! The two paths would otherwise have different pool semantics: on the direct
-//! path the caller's innermost pool is in scope, on the dispatched path the
-//! main runloop's is. That difference is invisible at the call site — it
-//! depends on which thread you happened to be on — and an API whose lifetime
-//! behaviour depends on invisible thread state is the shape F1 was about.
-//!
-//! So [`run_on_main`] pushes a pool around the closure on both paths. The
-//! resulting rule is one sentence and holds unconditionally: **anything
-//! autoreleased inside the closure is released before `run_on_main` returns,
-//! and the caller cannot tell which path ran.** It was MEASURED when this
-//! module landed (2026-09-02), not merely asserted: a driver autoreleased an
-//! object inside the closure on each path and asked a WEAK reference whether it
-//! was deallocated — a weak slot reads nil exactly when the object is gone,
-//! whereas `-retainCount` on a pointer that may already be freed is the read
-//! that SIGSEGV'd in W9's counterexample. No gate ever ran that driver and it
-//! was deleted on 2026-09-27, so nothing re-measures the pool rule today.
-//!
-//! ## ONLY THE DIRECT ARM WAS LOAD-BEARING — plant-verified
-//!
-//! Removing the pool from both paths failed the DIRECT arm and left the
-//! DISPATCHED arm passing. The dispatched arm was therefore **confirmatory, not
-//! discriminating**, and the reason is a libdispatch implementation detail: the
-//! main queue's run-loop drain wraps each callback in its own autorelease pool,
-//! so an object autoreleased inside a main-queue callback is released when that
-//! callback ends whether or not this module pushes anything.
-//!
-//! The pool is kept on that path regardless, and the reason is the F1 lesson
-//! rather than tidiness: the guarantee this module publishes must be OURS,
-//! discharged by code in this file, not inherited from an undocumented property
-//! of the platform's queue drain that no test here would notice changing.
-//!
-//! # THE RE-ENTRANCY TRAP, WHICH IS WHY THE MAIN-THREAD CASE IS A DIRECT CALL
-//!
-//! The main queue is a serial queue bound to the main thread. `dispatch_sync`
-//! to a serial queue blocks the caller until the queue reaches the work; when
-//! the caller IS the thread that queue runs on, the queue can never reach it.
-//!
-//! So [`run_on_main`] calls `f` DIRECTLY when it is already on the main thread.
-//! That is not a fast path, it is the only path that survives.
-//!
-//! ## What actually happens is a TRAP, not a hang — measured, and it matters
-//!
-//! W10's brief called this a deadlock, and on an older libdispatch it was one.
-//! **On this platform it is not.** Measured on Darwin 25.5 when this module
-//! landed: the naive call does not hang, it raises **SIGTRAP** (the child dies
-//! on signal 5, exit 133). Current libdispatch DETECTS the re-entrancy — it
-//! knows which thread owns the queue — and calls its crash handler rather than
-//! blocking for ever.
-//!
-//! The correction cuts both ways and both halves are worth knowing:
-//!
-//! * **The failure is louder than advertised.** It is not a mysterious freeze
-//!   to be diagnosed with a sampling profiler; it is an immediate, 100%
-//!   reproducible crash with libdispatch's own diagnostic ("BUG IN CLIENT OF
-//!   LIBDISPATCH: dispatch_sync called on queue already owned by current
-//!   thread") in the crash report.
-//! * **The branch is therefore MORE load-bearing, not less.** A hang needs an
-//!   unlucky schedule; this needs nothing. Every main-thread call site —
-//!   `monitor.rs`'s scale factor, `event.rs`'s keyboard type, both of which run
-//!   on the main thread in a normal winit app — would kill the process on its
-//!   first call.
-//!
-//! That measurement was a differential: the naive `dispatch_sync_f(main_q, …)`
-//! from the main thread, in a CHILD PROCESS, never returned (a hang and a signal
-//! both count — the property is "the naive call does not return"), while
-//! [`run_on_main`] from the same position exited 0; and `dispatch_sync_f` to a
-//! PRIVATE serial queue from the main thread returned normally, so the trap is
-//! about the main queue's thread binding and not about `dispatch_sync` in
-//! general.
-//!
-//! **What guards the branch now** is the bound drive,
-//! `tests/main_thread_bound_drive.rs`, a `harness = false` test the workspace
-//! test run executes. Its stage 1 drops a [`crate::MainThreadBound`] of a
-//! needs-drop value ON the main thread, which reaches `run_on_main` from
-//! exactly this position — a `run_on_main` that dispatched there would trap
-//! the test's process — and its stages 2, 4 and 6 drive the dispatched path
-//! from a worker.
+//! The main queue is serial and bound to the main thread, so
+//! `dispatch_sync_f(main_q, …)` from the main thread can never run. Current
+//! libdispatch detects this and traps (SIGTRAP, "dispatch_sync called on queue
+//! already owned by current thread"); `dispatch_sync_f` to a private serial
+//! queue from the main thread is fine. [`run_on_main`] therefore calls `f`
+//! directly on the main thread, which every winit call site hits.
+//! `tests/main_thread_bound_drive.rs` (`harness = false`) drives both the
+//! direct path (dropping a [`crate::MainThreadBound`] on the main thread) and
+//! the dispatched path from workers.
 //!
 //! # Panics do not cross the C frame
 //!
-//! Unwinding through `dispatch_sync_f` — a C frame — is undefined behaviour.
-//! The trampoline catches, ships the payload back through the job slot, and the
-//! CALLING thread resumes the unwind. A panicking closure therefore panics at
-//! the call site, on the caller's thread, with its original payload.
+//! Unwinding through `dispatch_sync_f` is undefined behaviour. The trampoline
+//! catches, ships the payload back through the job slot, and the calling
+//! thread resumes the unwind with the original payload.
 
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
@@ -144,34 +48,24 @@ use std::panic::AssertUnwindSafe;
 use crate::declare::MainThread;
 use crate::runtime::autoreleasepool;
 
-/// The opaque `dispatch_queue_t` the main queue's global symbol names.
-///
-/// Declared as a zero-sized opaque rather than mirrored: this module never
-/// reads a field of it, it only takes its address.
+/// The opaque `dispatch_queue_t` the main queue's global symbol names; only its
+/// address is used.
 #[repr(C)]
 struct DispatchObjectS {
     _opaque: [u8; 0],
 }
 
-// SAFETY: both symbols are libdispatch's, and libdispatch is part of
-// `libSystem`, which is linked into every process on this platform — the same
-// reason `objc_msgSend` needs no link attribute in `runtime.rs`.
+// SAFETY: both symbols are libdispatch's, part of `libSystem`, which every
+// process links.
 unsafe extern "C" {
-    /// The main queue, as a GLOBAL SYMBOL rather than a function call.
-    ///
-    /// `dispatch_get_main_queue()` is a header inline that evaluates to
-    /// `&_dispatch_main_q`, so there is no function to call and nothing to
-    /// cache: the address is the queue.
+    /// The main queue. `dispatch_get_main_queue()` is a header inline that
+    /// evaluates to `&_dispatch_main_q`, so the address is the queue.
     static _dispatch_main_q: DispatchObjectS;
 
-    /// `dispatch_sync_f(queue, context, work)` — the FUNCTION-POINTER form.
-    ///
-    /// Deliberately not the block form. A block would have to be heap-copied by
-    /// `_Block_copy` and would drag [`crate::RcBlock`]'s `Fn + 'static` bound in
-    /// with it, which forbids the borrowing `FnOnce` every call site here
-    /// actually has. `dispatch_sync_f` takes a bare `void *`, allocates
-    /// nothing, and — because it is SYNCHRONOUS — lets the context be a local
-    /// of the calling frame.
+    /// `dispatch_sync_f(queue, context, work)` — the function-pointer form. A
+    /// block would need `_Block_copy` and [`crate::RcBlock`]'s `Fn + 'static`
+    /// bound; this allocates nothing and, being synchronous, lets the context
+    /// be a local of the calling frame.
     fn dispatch_sync_f(
         queue: *const DispatchObjectS,
         context: *mut c_void,
@@ -179,39 +73,29 @@ unsafe extern "C" {
     );
 }
 
-/// The slot the trampoline and the caller share for one call.
-///
-/// Both fields are `Option` so the trampoline can MOVE the closure out and move
-/// the result in, and so "the main queue never ran our function" is
-/// distinguishable from "it ran and produced `None`" — the first would be a
-/// libdispatch contract violation and is reported as one rather than silently
-/// unwrapping.
+/// The slot the trampoline and the caller share for one call. Both fields are
+/// `Option` so the trampoline can move the closure out and the result in, and
+/// so "never ran" is distinguishable from "ran".
 struct Job<F, R> {
     /// Taken by the trampoline. `None` afterwards.
     f: Option<F>,
     /// Filled by the trampoline: `Ok(value)`, or the payload of a panic that
-    /// must be re-raised on the CALLING thread rather than unwound through C.
+    /// must be re-raised on the calling thread rather than unwound through C.
     out: Option<std::thread::Result<R>>,
 }
 
-/// The payload [`run_on_main`] re-raises on the CALLING thread when an
+/// The payload [`run_on_main`] re-raises on the calling thread when an
 /// `NSException` was contained inside the closure on the main thread.
 ///
-/// The closure has no value to return, and `run_on_main` has no `Result` to
-/// return it in, so the containment crosses back the way a panic does: as the
-/// payload of a `resume_unwind` on the caller's thread. The main thread itself
-/// CONTINUES — the exception was caught inside libdispatch's frame, reported
-/// through [`crate::exception`] against `"run_on_main"`, and released — and
-/// the caller's panic hook is not invoked (`resume_unwind` never runs it). A
-/// caller that wants to survive it wraps the call in `catch_unwind` and
-/// downcasts to this type.
+/// The main thread continues (the exception was caught, reported through
+/// [`crate::exception`] against `"run_on_main"`, and released); the caller
+/// gets a `resume_unwind` with this payload, which does not invoke the panic
+/// hook. To survive it, wrap the call in `catch_unwind` and downcast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContainedInRunOnMain {
-    /// The report's ordinal for THIS containment — the value
-    /// [`crate::contained_count`] took as the report incremented it, carried
-    /// out of the catch by [`crate::exception::Contained::ordinal`] rather
-    /// than re-read from the global counter afterwards (another thread's
-    /// containment in between would otherwise make it name the wrong report).
+    /// This containment's report ordinal, carried out of the catch by
+    /// [`crate::exception::Contained::ordinal`] (re-reading
+    /// [`crate::contained_count`] could name another thread's report).
     pub ordinal: u64,
 }
 
@@ -226,78 +110,41 @@ impl std::fmt::Display for ContainedInRunOnMain {
     }
 }
 
-/// What the main queue runs. `extern "C"`, so it must not unwind — and nothing
-/// does: a Rust panic is caught and carried back as data, and an
-/// `NSException` is contained inside and carried back the same way.
+/// What the main queue runs. `extern "C"`, so it must not unwind: a Rust panic
+/// is caught and carried back as data, and an `NSException` is contained and
+/// carried back the same way.
 ///
 /// # Safety
 /// `ctx` must be the address of a live `Job<F, R>` whose `f` is `Some`, and the
-/// caller must be blocked on `dispatch_sync_f` for the whole of this call — the
-/// two conditions that make the `&mut` below the only reference to that job.
+/// caller must be blocked on `dispatch_sync_f` for the whole call, which makes
+/// the `&mut` below unique.
 unsafe extern "C" fn trampoline<F, R>(ctx: *mut c_void)
 where
     F: FnOnce(MainThread) -> R,
 {
-    // SAFETY: the caller pins `ctx` to a live `Job<F, R>` and is blocked inside
-    // `dispatch_sync_f` until this returns, so nothing else can touch the job
-    // for the duration and this `&mut` is unique.
+    // SAFETY: `ctx` is a live `Job<F, R>` and the caller is blocked in
+    // `dispatch_sync_f` until this returns, so this `&mut` is unique.
     let job = unsafe { &mut *ctx.cast::<Job<F, R>>() };
     let Some(f) = job.f.take() else {
-        // Reachable only if libdispatch ran one submission twice, which would
-        // mean the closure — an `FnOnce` already moved out — had to be moved
-        // out again. There is nothing to run and nothing safe to report, so
-        // leave `out` as `None` and let the caller name it.
+        // Only if libdispatch ran one submission twice; leave `out` as `None`
+        // and let the caller report it.
         return;
     };
 
-    // `catch_unwind` is what keeps the unwind off the C frame above us. The
-    // closure is `FnOnce` and captures whatever it captures, so it is not
-    // `UnwindSafe` and cannot be; the assertion is discharged by the fact that
-    // nothing observes the captures after a panic — the payload goes back to
-    // the caller, which resumes the unwind and drops the job.
+    // Keeps the unwind off the C frame above. `AssertUnwindSafe` is discharged
+    // because nothing observes the captures after a panic: the payload goes
+    // back to the caller, which resumes the unwind and drops the job.
     let ran = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        // The witness is minted HERE, on the thread it describes, through the
-        // CHECKED constructor.
-        //
-        // `MainThread::new_unchecked` would save one `MainThread::new()` per
-        // off-main call and would be sound: `dispatch_sync_f` on the main queue
-        // runs its function on the main thread, because the main queue is bound
-        // to that thread and — unlike an ordinary serial queue — never migrates
-        // work to the caller. The check is kept anyway: in exchange this module
-        // contains no `unsafe` token whose justification is a claim about
-        // libdispatch's scheduler that a reader would have to re-derive. If the
-        // claim were ever false, this panics on the main thread of a live app
-        // instead of handing AppKit a witness that is a lie.
-        //
-        // WHAT IT COSTS, CORRECTED. This comment used to price the check as
-        // "one class-method `BOOL` per call at sites that run once per monitor
-        // query or once per keyboard-layout change". BOTH HALVES WERE WRONG,
-        // and the thirteenth pass measured each.
-        //
-        // * The COST is not one `BOOL` send. `MainThread::new()` is 18.2-18.7
-        //   ns/op in release, of which the send is 1.7-2.0 and the UNCACHED
-        //   `objc_getClass("NSThread")` in front of it is ~17 — see
-        //   [`crate::class`], which now carries the decomposition.
-        // * The FREQUENCY is not once per layout change. `event.rs:58` calls
-        //   `run_on_main` from `get_modifierless_char`, which
-        //   `create_key_event` calls at line 149 — i.e. once per KEY EVENT
-        //   whose `code_to_key` is unidentified, which is every ordinary
-        //   character key. `monitor.rs:261` is `scale_factor()`, which
-        //   `position()` also calls.
-        //
-        // 18 ns on a keystroke is not a regression anybody can feel, and it is
-        // recorded rather than optimised for exactly that reason. What is not
-        // acceptable is a stated cost that is 9% of the real one in a module
-        // whose argument is that its numbers are measured.
+        // The witness is minted here through the checked constructor. The
+        // unchecked one would be sound (the main queue always runs on the main
+        // thread), but the check avoids an `unsafe` resting on a claim about
+        // libdispatch's scheduler.
         let mt = MainThread::new()
             .expect("dispatch_sync_f on the main queue ran its function off the main thread");
-        // The pool the module docs promise, on the DISPATCHED path. The closure
-        // never sees it — a pool reference in scope of a generic `R` is exactly
-        // `load_borrowed`'s defect.
-        //
-        // The containment sits INSIDE the pool and INSIDE the `catch_unwind`,
-        // the measured order: an `NSException` out of `f` is caught here on
-        // the main thread, reported, and released before the pool pops.
+        // The pool from the module docs, on the dispatched path; the closure
+        // never sees it. Containment sits inside the pool and the
+        // `catch_unwind`, so an `NSException` out of `f` is caught on the main
+        // thread, reported, and released before the pool pops.
         autoreleasepool(|_pool| crate::exception::contain("run_on_main", || f(mt)))
     }));
     job.out = Some(match ran {
@@ -311,58 +158,34 @@ where
 
 /// Run `f` on the main thread and return what it produced.
 ///
-/// If the caller is already on the main thread, `f` runs directly — see the
-/// module docs for why that branch is the only non-hanging one, and for the
-/// differential that proves it. Otherwise `f` is submitted to the main queue
-/// with `dispatch_sync_f` and this call blocks until it has run.
+/// On the main thread `f` runs directly (see the module docs); otherwise it is
+/// submitted with `dispatch_sync_f` and this call blocks until it has run. `f`
+/// receives a [`MainThread`] witness and nothing else; anything it autoreleases
+/// is released before this returns, on either path.
 ///
-/// `f` receives a [`MainThread`] witness, minted on the main thread itself, and
-/// nothing else. It is deliberately not given an [`crate::AutoreleasePool`]
-/// reference: the module docs explain why a pool reference in scope of a
-/// generic return type is the defect W9 withdrew `load_borrowed` for. Anything
-/// `f` autoreleases is released before this function returns, on either path.
+/// # Blocking
 ///
-/// # Blocking, and the TWO ways this hangs
+/// Two situations hang silently (unlike the loud main-thread trap):
 ///
-/// This heading used to say "the one way", and the thirteenth pass measured a
-/// second. Both hang SILENTLY — no signal, no diagnostic — which is the
-/// opposite of the loud main-thread trap the module docs describe, and worth
-/// knowing precisely because the loud one is the one that gets remembered.
+/// 1. The main thread never services its queue. Only use this in a process
+///    whose main thread runs an event loop (`NSApplicationMain`,
+///    `CFRunLoopRun`, `dispatch_main`, winit's pump); a libtest binary's main
+///    thread is parked joining workers.
+/// 2. The main thread is inside a `run_on_main` closure (direct branch) and
+///    waits on a thread that calls `run_on_main`: that call dispatches to a
+///    queue nobody is draining. Reachable from safe code, e.g. a closure that
+///    spawns and joins a helper.
 ///
-/// 1. **The main thread never services its queue.** Off the main thread this
-///    blocks until the main thread reaches the main queue, so it is only
-///    appropriate in a process whose main thread runs an event loop —
-///    `NSApplicationMain`, `CFRunLoopRun`, `dispatch_main` or winit's pump. In
-///    a process whose main thread is doing something else (a libtest binary,
-///    whose main thread is parked joining worker threads) it blocks for as long
-///    as that lasts, which is why this capability's evidence is a DRIVER and
-///    not a unit test.
-/// 2. **The main thread is INSIDE a `run_on_main` closure and waiting on a
-///    thread that calls `run_on_main`.** The outer call took the direct branch,
-///    so the main thread is running the closure rather than draining its queue;
-///    the inner caller is genuinely off-main, so it takes the dispatch branch
-///    and waits for a queue nobody is draining. Reachable from 100% safe code
-///    with no `unsafe` token and no misuse of this API's contract — the closure
-///    merely spawned a helper and joined it.
-///
-/// Measured on Darwin 25.5, each in a child process under a 4-second watchdog:
-/// both are **still running when the watchdog fires**, where the main-thread
-/// re-entrancy this module branches around dies on SIGTRAP in microseconds.
-/// Neither is a defect in this function — both are `dispatch_sync`'s own
-/// semantics — but a caller who has read only the trap paragraph will expect a
-/// crash and get a freeze.
+/// Both are `dispatch_sync` semantics, not defects in this function.
 ///
 /// # Panics
 ///
-/// If `f` panics, the panic is caught on the main thread and re-raised here,
-/// with its original payload, on the calling thread — never unwound through
-/// libdispatch's C frame. If `f` raises an `NSException` (through a send, or
-/// through AppKit code it called), the exception is CONTAINED on the main
-/// thread — reported against `"run_on_main"` through [`crate::exception`],
-/// its Rust frames dropped, the main thread continuing — and re-raised here
-/// as a panic whose payload is [`ContainedInRunOnMain`]. Also panics if
-/// libdispatch fails to run the submitted function at all, which would be a
-/// contract violation rather than a misuse.
+/// If `f` panics, the panic is caught on the main thread and re-raised here
+/// with its original payload. If `f` raises an `NSException`, it is contained
+/// on the main thread (reported against `"run_on_main"` through
+/// [`crate::exception`], Rust frames dropped, main thread continuing) and
+/// re-raised here as a panic with payload [`ContainedInRunOnMain`]. Also
+/// panics if libdispatch never runs the submitted function.
 ///
 /// # Examples
 ///
@@ -376,16 +199,13 @@ where
     F: Send + FnOnce(MainThread) -> R,
     R: Send,
 {
+    // `MainThread::new` costs about 18 ns (mostly the uncached `objc_getClass`,
+    // see [`crate::class`]), paid on every ordinary character key event via
+    // winit's `get_modifierless_char`.
     if let Some(mt) = MainThread::new() {
-        // ALREADY ON THE MAIN THREAD — a direct call. `dispatch_sync_f` here
-        // would deadlock against the queue this very frame occupies.
-        //
-        // The pool wraps the closure on this path too, so that the pool
-        // semantics the module docs state do not depend on which thread the
-        // caller happened to be. THIS is the arm a pool plant could catch:
-        // with it removed, the direct arm failed and the dispatched arm did
-        // not (libdispatch pools its own main-queue callbacks). Measured, and
-        // recorded in the module docs.
+        // Already on the main thread: call directly, since `dispatch_sync_f`
+        // here would trap. The pool wraps the closure on this path too, so the
+        // pool semantics do not depend on the calling thread.
         return autoreleasepool(|_pool| f(mt));
     }
 
@@ -394,14 +214,11 @@ where
         out: None,
     };
 
-    // SAFETY: `&raw mut job` addresses a live local that outlives this call
-    // because `dispatch_sync_f` is SYNCHRONOUS — it returns only after the
-    // trampoline has run to completion, so the job cannot be dropped while
-    // libdispatch holds the pointer. `trampoline::<F, R>` is instantiated at
-    // exactly the `Job<F, R>` whose address is passed, and `job.f` is `Some`.
-    // The queue is libdispatch's own main-queue symbol, and the branch above
-    // has established this thread is NOT the main thread, so the sync cannot be
-    // re-entrant.
+    // SAFETY: `job` is a live local that outlives the call because
+    // `dispatch_sync_f` returns only after the trampoline has finished.
+    // `trampoline::<F, R>` matches the `Job<F, R>` passed, and `job.f` is
+    // `Some`. The branch above established this is not the main thread, so the
+    // sync is not re-entrant.
     unsafe {
         dispatch_sync_f(
             &raw const _dispatch_main_q,
@@ -412,7 +229,7 @@ where
 
     match job.out.take() {
         Some(Ok(value)) => value,
-        // Re-raise on THIS thread. The payload crossed as data; the unwind
+        // Re-raise on this thread. The payload crossed as data; the unwind
         // never crossed the C frame.
         Some(Err(payload)) => std::panic::resume_unwind(payload),
         None => panic!("dispatch_sync_f returned without running the submitted function"),

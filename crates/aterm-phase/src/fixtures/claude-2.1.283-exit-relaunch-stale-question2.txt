@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-27, `aterm ctl text` of a private headless aterm (150x50) · the turn of claude-2.1.283-exit-relaunch-stale-busy.txt three seconds on: an AskUserQuestion dialog of TWO questions drawn where the live frame was, the dead process's `esc to interrupt` footer still above the new launch card; the hosted loop keyed its first tab ~40 s after it was drawn and each later tab ~22 s apart while its whole-screen `await gone esc.to.interrupt` waited on that dead footer · user and host redacted at equal length, conversation id zeroed
+user@host-redacted-xxx proj % claude --model haiku
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   ~/scratch.noindex/stale-footer-busy-run/inst/proj
+
+
+❯ Reply with just the word hello.
+
+⏺ hello
+
+✻ Cogitated for 2s · done 10:25 AM
+
+❯ /exit
+
+✻ Creating…
+  ⎿  Tip: Use /statusline to set up a custom status line that will display beneath the input box
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt · ← for agents
+
+Resume this session with:
+claude --resume 00000000-0000-0000-0000-000000000000
+user@host-redacted-xxx proj % claude --model haiku
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   ~/scratch.noindex/stale-footer-busy-run/inst/proj
+
+
+❯ Use the AskUserQuestion tool ONCE with TWO questions in the same call: (1) which fruit do I prefer, options Apple and Pear (mark Pear as
+  recommended); (2) which season do I prefer, options Summer and Winter (mark Winter as recommended). Then reply with the two answers only.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Fruit  ☐ Season  ✔ Submit  →
+
+Which fruit do you prefer?
+
+❯ 1. Apple
+     A crisp, versatile fruit
+  2. Pear (Recommended)
+     A sweet, juicy fruit
+  3. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+

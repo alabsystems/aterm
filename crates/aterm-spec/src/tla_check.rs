@@ -12,12 +12,40 @@ use std::path::Path;
 
 /// Error parsing a TLA+ file.
 #[non_exhaustive]
-#[derive(Debug, aterm_error::Error)]
+#[derive(Debug)]
 pub enum TlaParseError {
-    #[error("failed to read TLA+ file: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("no MODULE declaration found in {path}")]
+    Io(std::io::Error),
     NoModule { path: String },
+}
+
+impl std::fmt::Display for TlaParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => {
+                f.write_str("failed to read TLA+ file: ")?;
+                std::fmt::Display::fmt(e, f)
+            }
+            Self::NoModule { path } => {
+                f.write_str("no MODULE declaration found in ")?;
+                f.write_str(path)
+            }
+        }
+    }
+}
+
+impl std::error::Error for TlaParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::NoModule { .. } => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for TlaParseError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 /// A parsed TLA+ specification with module name and extracted definitions.

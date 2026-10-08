@@ -1,69 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ATERM SIDE OF THE BRIDGE — a client for aterm's control protocol over
-//! one stream, framed the way the verb table says each verb is framed.
-//!
-//! Three framings, and getting them wrong is the classic control-socket bug:
+//! The aterm side of the bridge: a client for aterm's control protocol over one
+//! stream, framed the way the verb table says each verb is framed.
 //!
 //! * `Status` — one line. `deliver`, `hold`, `outbox sent`, `post`.
 //! * `Lines` — `OK <n> …` then exactly `n` lines. `inbox`, `sessions`.
 //! * `Bytes` — `OK <nbytes>` then exactly that many bytes. `outbox`, `inbox get`.
+//! * `Push` — `OK subscribe <n>` then `n` `sub` map rows, read like `Lines`.
 //!
-//! A client that read a `Status` reply as a row count parks forever on rows that
-//! never come; one that read a `Bytes` header as a row count reads the body as
-//! verbs. The framing per verb is [`aterm_types::control_verbs::framing_of`],
-//! and this client asks THAT rather than keeping its own table, so the two
-//! cannot drift.
+//! Misreading a framing parks forever on rows that never come or reads a body
+//! as verbs, so the framing comes from
+//! [`aterm_types::control_verbs::framing_of`], never a local table.
 //!
-//! ## Two ways in, and they are not equal
+//! ## Two ways in
 //!
-//! * An INHERITED descriptor (fds 3 and 4, [`aterm_uds::spawnfd`]). No handshake
-//!   is written because there is nothing to authenticate: the authority is the
-//!   descriptor, and the instance served it with `Scope::Bridge` before this
+//! * An inherited descriptor (fds 3 and 4, [`aterm_uds::spawnfd`]): the
+//!   descriptor is the credential, served with `Scope::Bridge` before this
 //!   process existed. This is the real bridge.
-//! * A `--sock` + token connection ([`Ctl::connect`]). An ordinary Owner client,
-//!   which is OBSERVER MODE: `whoami` answers `owner`, not `bridge`, so the
-//!   bridge-plane verbs are refused and the process says so rather than
-//!   pretending to deliver.
+//! * `--sock` + token ([`Ctl::connect`]): an ordinary Owner client, i.e.
+//!   observer mode — `whoami` answers `owner`, the bridge-plane verbs are
+//!   refused, and the process says so.
 //!
-//! ## THE REQUEST-LINE BOUND LIVES HERE, ON THE WRITER
+//! ## The request-line bound lives on the writer
 //!
-//! aterm's control server drops — silently, with no reply — any connection
-//! whose request line reaches its own `MAX_REQUEST_LINE`
-//! (`crates/aterm-gui/src/control.rs`). For the BRIDGE's connection that
-//! silence is a fleet-wide outage: losing it is aterm's fail-closed
-//! `bridge_lost` halt over every session the bridge governs, and nothing on
-//! this side would ever see the socket close, so nothing would relaunch.
+//! aterm's control server silently drops a connection whose request line
+//! reaches its `MAX_REQUEST_LINE` (`crates/aterm-gui/src/control.rs`). For the
+//! bridge that is aterm's fail-closed `bridge_lost` halt over every session,
+//! with nothing on this side seeing the close. So [`REQUEST_LINE_MAX`] is the
+//! one bound: [`Ctl::request_with_body`] refuses a longer line and writes
+//! nothing (stream framed, connection alive), and every caller that builds a
+//! variable-length line sizes the WHOLE line from it — not just its last field,
+//! or an attacker-sized earlier field leaves the line over the bound and the
+//! record with nowhere to go.
 //!
-//! Three components used to hold three different implicit limits for one value
-//! — the endpoint takes a 256 KiB `post` body, aterm control drops a 64 KiB
-//! request line, and the bridge built one line carrying a whole body. The
-//! disagreement is made IMPOSSIBLE rather than unlikely by putting the number
-//! in exactly one place, on the side that writes: [`REQUEST_LINE_MAX`] is the
-//! only bound in this crate, [`Ctl::request_with_body`] refuses to write a line
-//! past it (writing NOTHING, so the stream stays framed and the connection
-//! stays alive), and every caller that builds a variable-length line sizes THE
-//! WHOLE LINE from that same constant.
+//! ## A lost connection is latched, distinct from a refusal
 //!
-//! The whole line, and not its last field, because that distinction is where the
-//! first fix leaked. `deliver` sized only its `text=` budget from this number,
-//! computed AFTER an attacker-sized `via=` had already been appended: the
-//! subtraction saturated to zero, the body was cut to nothing, and the line was
-//! still over the bound. The refusal below worked exactly as designed — nothing
-//! written, lane alive — and the caller then filed a permanent local refusal as
-//! a transport failure and lost the record. A caller that measures only its tail
-//! has not sized its line from this constant, and a refusal this client hands
-//! back is only half a bound: the other half is the caller having somewhere to
-//! put a record it can never send.
-//!
-//! ## A LOST CONNECTION IS LATCHED, and it is a different failure from a refusal
-//!
-//! An I/O failure on this lane means the verb connection is gone. It is latched
-//! ([`Ctl::lost`]) so a caller cannot keep talking into a stream whose framing
-//! it can no longer trust, and so the bridge's run loop can tell "aterm went
-//! away" (exit, and let the supervisor relaunch) from "this one line was too
-//! long to send" (a local refusal that wrote nothing).
+//! An I/O failure latches [`Ctl::lost`], so nothing talks into a stream whose
+//! framing is unknown, and the run loop can tell "aterm went away" (exit and be
+//! relaunched) from "this line was too long" (a local refusal, nothing written).
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -73,46 +48,28 @@ use aterm_types::control_verbs::{framing_of, Framing};
 
 /// The largest request line this client will WRITE, newline excluded.
 ///
-/// aterm drops the connection at its own `MAX_REQUEST_LINE` = 64 KiB, counted
-/// over the line's bytes before the newline. This is one byte under that, so a
-/// line this client agrees to send can never be the line that kills the lane —
-/// the margin is deliberate, because an off-by-one in EITHER implementation
-/// would otherwise cost a fleet-wide halt rather than an error message.
+/// One byte under aterm's `MAX_REQUEST_LINE` (64 KiB, newline excluded): an
+/// off-by-one in either implementation must cost an error, not a fleet halt.
 pub const REQUEST_LINE_MAX: usize = 64 * 1024 - 1;
 
 /// The largest framed BODY this client will read, and the ceiling on the byte
 /// count a reply header may declare.
 ///
-/// ## A SERVER-DECLARED COUNT IS AN ALLOCATION REQUEST
+/// `OK <n>` is written by whatever is on the socket — and `notify` points this
+/// client at an operator-named `--sock`, which may be stale or squatted — so an
+/// unchecked count is an allocation request (`OK 18446744073709551615` aborts).
+/// `aterm-ctl`'s `MAX_BODY_BYTES` caps the same value for the same reason.
 ///
-/// `OK <n>` is a number written by whatever is on the other end of the socket,
-/// and `read_reply` used it to size a buffer before a single body byte had
-/// arrived. `OK 18446744073709551615` asked for 16 EB and aborted the process
-/// on allocation failure — not an error a caller could record, and on the
-/// bridge's own lane a latched `lost()` lane is exactly what the design wants
-/// instead. aterm's own client caps the same value for the same reason and says
-/// so (`aterm-ctl`'s `byte_count`/`MAX_BODY_BYTES`: "a hostile `OK <huge>`
-/// header"); this client, which `notify` points at a
-/// `--sock` path an OPERATOR names on the command line — a stale path, a
-/// same-uid process that grabbed the name, a desynchronised stream — had no
-/// equivalent.
-///
-/// The largest reply this client ever legitimately asks for is one `outbox`
-/// drain: the endpoint bounds that at `OUTBOX_DRAIN_BYTES_MAX` (4 MiB) plus the
-/// one post that crossed the budget (`BODY_MAX`, 256 KiB). 16 MiB is that with
-/// room for a rung that raises either, and far under the size at which a single
-/// allocation is itself the failure. It is a REFUSAL rather than a truncation:
-/// a body this client will not read is a framing disagreement, and reading part
-/// of one would desynchronise the stream.
+/// The largest legitimate reply is one `outbox` drain: `OUTBOX_DRAIN_BYTES_MAX`
+/// (4 MiB) plus one `BODY_MAX` (256 KiB) post; 16 MiB leaves headroom. Over it
+/// is a refusal, not a truncation: reading part of a body desynchronises the
+/// stream.
 pub const REPLY_BYTES_MAX: usize = 16 * 1024 * 1024;
 
 /// The most rows a `Lines`/`Push` reply may declare.
 ///
-/// The same hazard in the other unit: rows are read one at a time, so a huge
-/// count cannot over-read the stream, but `Vec::with_capacity` reserved for all
-/// of them up front. A million rows is past every real roster, `inbox` page and
-/// `outbox` listing this client asks for; the reserve is taken in small steps
-/// besides, so even a legitimate large count allocates as it arrives.
+/// Past every real roster, `inbox` page and `outbox` listing; the reserve is
+/// also taken in small steps, so a large count allocates as rows arrive.
 pub const REPLY_ROWS_MAX: usize = 1024 * 1024;
 
 /// One control connection.
@@ -185,24 +142,12 @@ impl Ctl {
     /// way the inherited number is closed).
     pub fn adopt(fd: RawFd) -> io::Result<Self> {
         inherited_socket(fd)?;
-        // THIS CALL REACHES THE CRATE'S ONE `unsafe` BLOCK — see
-        // [`unsafe_adopt`], which is where the obligation is discharged. The
-        // note used to say "SAFETY-adjacent, not an `unsafe` block", which was
-        // true of the three lines it labelled and false of the call they
-        // introduced; §11.2 puts raw-descriptor work in the `aterm-uds` cordon,
-        // and a reader auditing by that rule is told here that this file is the
-        // exception. `from_raw_fd` on an inherited number is the one place this
-        // crate takes ownership of a descriptor it did not create: exactly once
-        // per number, at startup, before anything else touches it.
-        //
-        // AND THE NUMBER ITSELF IS NOT KEPT. The launcher's `dup2` had to clear
-        // `FD_CLOEXEC` for it to survive the exec, and nothing sets it again, so
-        // a child this process spawns (`hostname`'s `uname -n`) inherited the
-        // bridge's aterm authority and kept aterm's end from reading EOF — the
-        // fail-closed halt — for as long as that child lived. `try_clone` is
-        // `F_DUPFD_CLOEXEC`: the connection moves to a flagged copy and the
-        // temporary's drop closes the unflagged number (the product fd-hygiene
-        // sweep of 2026-09-27).
+        // The crate's one `unsafe` block is in [`unsafe_adopt`]. The number
+        // itself is not kept: the launcher's `dup2` cleared `FD_CLOEXEC`, so a
+        // child this process spawns (`hostname`'s `uname -n`) would inherit the
+        // bridge's authority and keep aterm's end from reading EOF — the
+        // fail-closed halt. `try_clone` is `F_DUPFD_CLOEXEC`; the temporary's
+        // drop closes the unflagged number.
         let owned = unsafe_adopt(fd).try_clone()?;
         let stream = UnixStream::from(owned);
         Self::from_stream(stream)
@@ -232,7 +177,27 @@ impl Ctl {
         Self::authenticate(UnixStream::connect(sock)?, token)
     }
 
-    fn authenticate(stream: UnixStream, token: &str) -> io::Result<Self> {
+    /// [`Ctl::connect`] with the instance's Owner token beside the socket,
+    /// read only once the connect succeeded
+    /// ([`aterm_ctl::connect_then_read_token`]) — never a token read for an
+    /// earlier connection, which an update's successor at the same path
+    /// refuses `ERR auth`.
+    ///
+    /// # Errors
+    ///
+    /// The connect, the token read (`no Owner token: …`), or the write.
+    pub fn open(sock: &str) -> io::Result<Self> {
+        let (stream, token) = aterm_ctl::connect_then_read_token(sock)?;
+        let token = token.map_err(|e| io::Error::new(e.kind(), format!("no Owner token: {e}")))?;
+        Self::authenticate(stream, &token)
+    }
+
+    /// Present `token` on a connection just made.
+    ///
+    /// # Errors
+    ///
+    /// The stream cannot be cloned for the reader half, or the write fails.
+    pub(crate) fn authenticate(stream: UnixStream, token: &str) -> io::Result<Self> {
         let mut ctl = Self::from_stream(stream)?;
         ctl.writer.write_all(format!("AUTH {token}\n").as_bytes())?;
         ctl.writer.flush()?;
@@ -248,11 +213,9 @@ impl Ctl {
     /// Whether this connection has been LOST — an I/O failure on the lane, as
     /// opposed to a line this client refused to send.
     ///
-    /// The distinction is the whole reason the flag exists. A refusal
-    /// ([`io::ErrorKind::InvalidInput`], nothing written) is a message the
-    /// bridge records and carries on from; a loss is aterm going away, which is
-    /// the fail-closed halt already standing on every session this bridge
-    /// governs — the process must exit so its supervisor can relaunch it.
+    /// A refusal ([`io::ErrorKind::InvalidInput`], nothing written) is recorded
+    /// and carried on from; a loss is aterm going away, and the process must
+    /// exit so its supervisor can relaunch it.
     #[must_use]
     pub fn lost(&self) -> bool {
         self.lost
@@ -260,17 +223,15 @@ impl Ctl {
 
     /// Run one request, LATCHING the connection on an I/O failure.
     ///
-    /// A deadline that fired surfaces from the socket as `WouldBlock` on some
-    /// platforms and `TimedOut` on others, with a message ("Resource temporarily
-    /// unavailable") that names neither; it is reported as ONE kind and one
-    /// sentence, so a caller printing it says what happened.
+    /// A fired deadline surfaces as `WouldBlock` or `TimedOut` by platform, with
+    /// a message naming neither; both become one `TimedOut` that says so.
     fn guarded<T>(&mut self, r: io::Result<T>) -> io::Result<T> {
         r.map_err(|e| {
             self.lost = true;
             match e.kind() {
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "aterm did not answer within the lane's deadline",
+                    "aterm did not answer before the deadline",
                 ),
                 _ => e,
             }
@@ -294,27 +255,21 @@ impl Ctl {
     ///
     /// As [`Ctl::request`].
     pub fn request_with_body(&mut self, line: &str, body: &[u8]) -> io::Result<Reply> {
-        // THE BOUND, BEFORE A SINGLE BYTE MOVES. A line at or past aterm's own
-        // drop threshold is refused HERE and nothing is written: the stream
-        // stays framed, the connection stays alive, and the caller gets an
-        // error it can record instead of a fleet-wide silence it cannot see.
-        // `InvalidInput` and not a latched loss, because nothing was lost.
+        // Refused before a byte moves: `InvalidInput`, not a latched loss.
         if line.len() > REQUEST_LINE_MAX {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "a control request line of {} bytes is over the {REQUEST_LINE_MAX}-byte bound",
+                    "request line is {} bytes; max {REQUEST_LINE_MAX}",
                     line.len()
                 ),
             ));
         }
-        // A LOST LANE IS NEVER WRITTEN TO AGAIN. Its framing is unknown after a
-        // failed request, and a client that carried on would read the tail of
-        // one reply as the header of the next.
+        // A lost lane's framing is unknown: never write to it again.
         if self.lost {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "the aterm control connection was already lost",
+                "aterm control connection lost",
             ));
         }
         let sent = (|| {
@@ -347,18 +302,14 @@ impl Ctl {
 
     fn read_reply(&mut self, verb: &str, request: &str) -> io::Result<Reply> {
         let header = self.read_line()?;
-        // An `ERR` is always ONE line whatever the verb's framing is: the server
-        // never writes rows or a body behind a refusal, and a client that waited
-        // for them would hang on every error.
+        // An `ERR` is always one line, whatever the verb's framing.
         if !header.starts_with("OK") {
             return Ok(Reply::Status(header));
         }
         match framing_of(verb, request) {
             Framing::Lines | Framing::Push => {
                 let n = count_after_ok(&header, REPLY_ROWS_MAX)?;
-                // RESERVED IN SMALL STEPS, not for the declared count: the
-                // rows arrive one at a time and `read_line` fails at EOF, so
-                // the vector grows with what actually came.
+                // Reserved in small steps, not for the declared count.
                 let mut rows = Vec::with_capacity(n.min(256));
                 for _ in 0..n {
                     rows.push(self.read_line()?);
@@ -367,10 +318,8 @@ impl Ctl {
             }
             Framing::Bytes => {
                 let n = count_after_ok(&header, REPLY_BYTES_MAX)?;
-                // READ THROUGH A `take`, INTO A BUFFER THAT GROWS. Even under
-                // the ceiling, `vec![0u8; n]` hands a peer one allocation of
-                // whatever it declared before it has sent a byte; this reads
-                // what arrives and fails short exactly as `read_exact` did.
+                // Through a `take` into a growing buffer, so memory follows
+                // what arrives, not what was declared.
                 let mut body = Vec::new();
                 let read = std::io::Read::by_ref(&mut self.reader)
                     .take(n as u64)
@@ -378,7 +327,7 @@ impl Ctl {
                 if read != n {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        format!("a framed reply of {n} bytes ended after {read}"),
+                        format!("reply ended at {read} of {n} bytes"),
                     ));
                 }
                 Ok(Reply::Bytes { header, body })
@@ -390,25 +339,16 @@ impl Ctl {
 
 /// Take ownership of an inherited descriptor number.
 ///
-/// THE ONE `unsafe` BLOCK IN `aterm-link`, AND IT IS OUTSIDE THE CORDON §11.2
-/// NAMES. The design confines raw-descriptor work to `aterm-uds` — which already
-/// owns `spawnfd`, and therefore already places the very descriptor adopted here
-/// — so this block's right home is `aterm_uds::spawnfd::adopt`. Until it moves,
-/// the fact is written where a reader will meet it rather than left to a
-/// crate-wide "there is no unsafe here" that three docs used to make and that a
-/// one-file scan used to guard;
-/// `bridge::tests::the_crates_unsafe_surface_is_exactly_the_ctl_adoption` now
-/// reads every file this crate ships and fails on a SECOND block or a second
-/// call site.
+/// The one `unsafe` block in `aterm-link`, outside the `aterm-uds` cordon §11.2
+/// names; its right home is `aterm_uds::spawnfd`, which places this descriptor.
+/// `bridge::tests::the_crates_unsafe_surface_is_exactly_the_ctl_adoption` fails
+/// on a second block or call site.
 ///
-/// The obligation is [`FromRawFd`]'s — that the number is a live descriptor this
-/// process owns and that nothing else will close it. It holds by construction:
-/// the launcher `dup2`'d it into place before `exec` ([`aterm_uds::spawnfd`]),
-/// this is the only call site for that number, and it runs once at startup.
-/// The one case construction does not cover — a bridge started by hand, with
-/// nothing inherited — is checked, not assumed: [`Ctl::adopt`] asks
-/// [`inherited_socket`] first, so a number that is closed, or names a file,
-/// never reaches this block.
+/// [`FromRawFd`]'s obligation — a live descriptor this process owns that
+/// nothing else closes — holds by construction: the launcher `dup2`'d it into
+/// place before `exec`, this is the only call site, and it runs once at
+/// startup. A bridge started by hand with nothing inherited is checked, not
+/// assumed: [`Ctl::adopt`] asks [`inherited_socket`] first.
 fn unsafe_adopt(fd: RawFd) -> OwnedFd {
     // SAFETY: see the doc comment above — a live inherited descriptor, adopted
     // exactly once.
@@ -420,21 +360,17 @@ fn unsafe_adopt(fd: RawFd) -> OwnedFd {
 /// Linux (the `/proc/self/fd` magic link), so its metadata is the descriptor's
 /// `fstat` through a path — no `unsafe`, and no second owner of the number.
 ///
-/// Without it, a bridge started with nothing inherited (`aterm link serve`
-/// typed at a shell, no `--sock`) wrapped whatever sat at fd 3: nothing, and
-/// dropping the wrapper after the failed clone closed a descriptor that was
-/// never open — std aborts on that in a debug build — or a file this process
-/// had opened since, which a release build would silently close under its
-/// owner.
+/// Without it, a bridge typed at a shell would wrap whatever sat at fd 3 and
+/// close it on drop: a never-open number (std aborts in debug) or a file it
+/// does not own.
 fn inherited_socket(fd: RawFd) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     let meta = std::fs::metadata(format!("/dev/fd/{fd}")).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotConnected,
             format!(
-                "descriptor {fd} is not open ({e}): the bridge inherits its aterm \
-                 connection on fds 3 and 4 when aterm launches it; started by hand, \
-                 it needs --sock <path> --token-file <path>"
+                "descriptor {fd} is not open ({e}); outside aterm, pass \
+                 --sock <path> --token-file <path>"
             ),
         )
     })?;
@@ -443,7 +379,7 @@ fn inherited_socket(fd: RawFd) -> io::Result<()> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("descriptor {fd} is not a socket, so it is not an inherited aterm connection"),
+            format!("descriptor {fd} is not a socket"),
         ))
     }
 }
@@ -460,11 +396,8 @@ fn request_verb(line: &str) -> String {
 
 /// The number after `OK ` in a framed header, refused above `ceiling`.
 ///
-/// FAIL-CLOSED, AND WITH AN ERROR RATHER THAN A CLAMP: a count this client will
-/// not honour is a framing disagreement with whatever is on the socket, and
-/// reading `ceiling` bytes of a body that claims more would leave the stream
-/// desynchronised — the next header read would be the middle of a body. See
-/// [`REPLY_BYTES_MAX`].
+/// An error, not a clamp: reading `ceiling` bytes of a longer body would
+/// desynchronise the stream. See [`REPLY_BYTES_MAX`].
 fn count_after_ok(header: &str, ceiling: usize) -> io::Result<usize> {
     let n: usize = header
         .strip_prefix("OK ")
@@ -473,13 +406,13 @@ fn count_after_ok(header: &str, ceiling: usize) -> io::Result<usize> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("framed reply header without a count: {header:?}"),
+                format!("reply header has no count: {header:?}"),
             )
         })?;
     if n > ceiling {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("a framed reply declared {n}, over this client's {ceiling} ceiling"),
+            format!("reply declares {n}; max {ceiling}"),
         ));
     }
     Ok(n)
@@ -489,14 +422,8 @@ fn count_after_ok(header: &str, ceiling: usize) -> io::Result<usize> {
 mod tests {
     use super::*;
 
-    /// `adopt` refuses a number that names no open socket BEFORE taking
-    /// ownership of it. It used to wrap whatever sat at the number: with
-    /// nothing there, `try_clone` failed and dropping the wrapper closed a
-    /// descriptor that was never open — std's closed-descriptor assertion
-    /// aborted the process (three crash reports, 2026-09-01, `aterm link
-    /// serve` run with no inherited fds), and a release build would instead
-    /// have closed whatever the number named by then. A file at the number is
-    /// refused too, and stays its owner's.
+    /// `adopt` refuses a number that names no open socket before taking
+    /// ownership; a file at the number is refused and stays its owner's.
     #[test]
     fn adopt_refuses_a_number_that_names_no_open_socket() {
         // Far above any descriptor a test process opens (the lowest free
@@ -545,10 +472,8 @@ mod tests {
         }
     }
 
-    /// A round trip over a real socketpair, against a stub that answers each
-    /// framing. The point is the READER: rows counted, bytes read exactly, and a
-    /// second request on the same connection landing in the right place — which
-    /// only holds if the first reply was consumed to the byte.
+    /// Each framing is consumed to the byte, so the next request's reply lands
+    /// in the right place.
     #[test]
     fn every_framing_is_consumed_exactly() {
         let (near, far) = UnixStream::pair().expect("socketpair");
@@ -583,15 +508,8 @@ mod tests {
         server.join().expect("server thread");
     }
 
-    /// THE LINE BOUND IS ENFORCED ON THE WRITER, and it writes NOTHING.
-    ///
-    /// aterm drops a connection whose request line reaches its own 64 KiB
-    /// `MAX_REQUEST_LINE` — with no reply — and for the bridge's lane that
-    /// silence is a fleet-wide fail-closed halt. So an over-long line is
-    /// refused here, before a byte moves; the connection is NOT lost, and the
-    /// very next ordinary request on the same connection still works. A client
-    /// that had written the line and then discovered the drop could not say
-    /// either of those things.
+    /// An over-long line is refused without writing anything, and the
+    /// connection is not lost.
     #[test]
     fn an_over_long_request_line_is_refused_without_writing_and_the_lane_survives() {
         let (near, far) = UnixStream::pair().expect("socketpair");
@@ -631,17 +549,8 @@ mod tests {
         );
     }
 
-    /// **A SERVER-DECLARED COUNT IS REFUSED ABOVE THE CEILING, IN BOTH UNITS.**
-    ///
-    /// `OK <n>` is written by whatever is on the other end of the socket — and
-    /// `notify` points this client at a `--sock` path an
-    /// operator names, so "whatever" includes a stale path and a same-uid
-    /// process that grabbed the name. Sized straight into `vec![0u8; n]` the
-    /// bytes case ABORTS the process on allocation failure, which is not an
-    /// outcome any caller can record; the rows case reserved capacity for a
-    /// count no reply will ever carry. Both are framing disagreements and both
-    /// now answer `InvalidData`, leaving the caller a latched lane instead of a
-    /// core.
+    /// A server-declared count above the ceiling is refused (`InvalidData`) in
+    /// both units rather than allocated.
     #[test]
     fn a_hostile_reply_count_is_refused_rather_than_allocated() {
         for (verb, header) in [
@@ -665,12 +574,10 @@ mod tests {
             drop(ctl);
             server.join().expect("server thread");
         }
-        // AND A LEGITIMATE COUNT STILL READS. The ceiling is above every reply
-        // this client asks for; a body that is merely large is not hostile.
+        // A legitimate large count still reads.
         assert!(count_after_ok("OK 4194304", REPLY_BYTES_MAX).is_ok());
         assert!(count_after_ok("OK 12 hold=0", REPLY_ROWS_MAX).is_ok());
-        // A body SHORTER than its header claims is a framing error, not a short
-        // read the caller has to notice for itself.
+        // A body shorter than its header claims is an error.
         let (near, far) = UnixStream::pair().expect("socketpair");
         let server = std::thread::spawn(move || {
             let mut reader = BufReader::new(far.try_clone().expect("clone"));
@@ -688,10 +595,7 @@ mod tests {
         server.join().expect("server thread");
     }
 
-    /// A LOST LANE IS LATCHED. The first I/O failure marks the connection, and
-    /// every later request answers immediately rather than writing into a
-    /// stream whose framing is no longer known — which is what lets the bridge
-    /// tell "aterm went away" from "that one line was too long".
+    /// The first I/O failure latches the connection as lost.
     #[test]
     fn an_io_failure_latches_the_connection_as_lost() {
         let (near, far) = UnixStream::pair().expect("socketpair");
@@ -704,8 +608,7 @@ mod tests {
         assert_eq!(again.kind(), io::ErrorKind::BrokenPipe, "{again}");
     }
 
-    /// An `ERR` is one line whatever the verb's framing is. A reader that waited
-    /// for a body behind a refusal would hang on the first quota rejection.
+    /// An `ERR` is one line whatever the verb's framing is.
     #[test]
     fn an_error_reply_is_one_line_even_for_a_framed_verb() {
         let (near, far) = UnixStream::pair().expect("socketpair");

@@ -1,31 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! v2.2 **Kitty Log vocabulary registry** (docs/sparkle-words-v2-design.md
-//! §F4): the ONE CI-pinnable source shared by the recorder
-//! (`word_decorations`), the persistent store's TOML keys (aterm-gui
-//! `kitty_log`), the settings-page labels, and the genome decode — the
-//! the shared registry idiom (`ALL` + `config_key()` + `label()`).
+//! The Kitty Log vocabulary registry (docs/sparkle-words-v2-design.md §F4): the
+//! one source shared by the recorder (`word_decorations`), the persistent
+//! store's TOML keys (aterm-gui `kitty_log`), the settings labels and the
+//! genome decode, in the shared registry idiom (`ALL` + `config_key()` +
+//! `label()`).
 //!
-//! Aggregation key = `(KittyType, KittyMagic, primary LangId)` — never raw
-//! `Genome.magic` (raw magic would grow the log file without bound). The
-//! fallback CAUSE is its own dimension ([`KittyShownAs`]), never conflated
-//! with the type.
-//!
+//! Aggregation key = `(KittyType, KittyMagic, primary LangId)`, never raw
+//! `Genome.magic` (which would grow the log without bound). The fallback cause
+//! is its own dimension ([`KittyShownAs`]).
 
 use aterm_lexicon::LangSet;
 
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPH_IDS, GLYPHS, GlyphKind};
 use crate::genome::{CatAge, CatMagic};
 
-/// The exact, reusable visual identity of one collected cat. This is the small
-/// value carried from the word renderer into the Kitty Log and back into the
-/// cursor companion: semantic authored glyph ids plus integer palette/age axes,
-/// never pixels or a raw word/genome.
-///
-/// Keeping this `Copy + Eq` means discovery handling is allocation-free and a
-/// cursor frame can select a collected look with a handful of scalar copies;
-/// the existing [`crate::cat_baker::CatBaker`] remains the only art cache.
+/// The reusable visual identity of one collected cat, carried from the word
+/// renderer into the Kitty Log and back into the cursor companion: authored
+/// glyph ids plus integer palette/age axes, never pixels or a raw word/genome.
+/// `Copy + Eq`, so discovery handling is allocation-free;
+/// [`crate::cat_baker::CatBaker`] remains the only art cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KittyLook {
     /// Authored head or full-cat special.
@@ -52,35 +47,29 @@ impl Default for KittyLook {
     }
 }
 
-/// Salt keeping the launch kitty's identity in its own genome namespace,
-/// away from the word renderer's position-bearing occurrence seeds
-/// (`b"lnchKit\0"` as big-endian ASCII). One documented ASCII salt per
-/// identity namespace is the law here, so a future identity lane can never
-/// collide with this one by hash coincidence of the input spaces.
+/// Salt keeping the launch kitty's identity in its own genome namespace, apart
+/// from the word renderer's occurrence seeds (`b"lnchKit\0"` as big-endian
+/// ASCII). One ASCII salt per identity namespace, so namespaces cannot collide.
 const LAUNCH_LOOK_SALT: u64 = 0x6C6E_6368_4B69_7400;
 
-/// Salt keeping app-derived kitty identities in their own genome namespace —
-/// disjoint from both [`LAUNCH_LOOK_SALT`] and the word renderer's occurrence
-/// seeds (`b"appKitt\0"` as big-endian ASCII), so "the claude cat" can never
-/// collide with a launch kitty by hash coincidence of the input spaces.
+/// Salt keeping app-derived kitty identities in their own genome namespace,
+/// disjoint from [`LAUNCH_LOOK_SALT`] and the occurrence seeds (`b"appKitt\0"`
+/// as big-endian ASCII).
 const APP_LOOK_SALT: u64 = 0x6170_704B_6974_7400;
 
-/// Launcher tokens that are TRANSPARENT to app identity: when the first word
-/// of a commandline is one of these, the app is whatever comes next. The
-/// documented, deliberately small list — `sudo` (privilege wrapper), `env`
-/// (environment wrapper), `npx` (package runner; the tool being run is the
-/// identity, not the runner). Leading `VAR=value` assignments and `-flags`
-/// are likewise skipped as launcher plumbing, not apps.
+/// Launcher tokens transparent to app identity: when a commandline starts with
+/// one, the app is whatever comes next. `sudo`, `env`, `npx` (the tool run is
+/// the identity, not the runner). Leading `VAR=value` assignments and `-flags`
+/// are skipped too.
 const TRANSPARENT_PREFIXES: &[&str] = &["sudo", "env", "npx"];
 
-/// The first meaningful token of a shell commandline, basename'd and
-/// lowercased — the raw material for [`canonical_app_id`]. `None` when the
-/// commandline holds no identifiable program (empty, only assignments/flags).
+/// The first meaningful token of a shell commandline, basenamed and lowercased:
+/// the input to [`canonical_app_id`]. `None` when the commandline holds no
+/// identifiable program (empty, only assignments/flags).
 ///
-/// This is a whitespace-token approximation, not a shell parser: quoting is
-/// not interpreted (a commandline is identity input here, never executed).
-/// Both `/` and `\` count as path separators and a trailing `.exe` is
-/// stripped, so the same tool yields the same id across platforms.
+/// A whitespace-token approximation, not a shell parser: quoting is not
+/// interpreted. Both `/` and `\` are path separators and a trailing `.exe` is
+/// stripped, so a tool yields the same id on every platform.
 #[must_use]
 pub fn app_basename(commandline: &str) -> Option<String> {
     for token in commandline.split_whitespace() {
@@ -104,21 +93,18 @@ pub fn app_basename(commandline: &str) -> Option<String> {
     None
 }
 
-/// The canonical id every SHELL folds onto ([`canonical_app_id`]). A shell
-/// is not a program cat: at the prompt (and inside a nested shell) the pane
-/// wears the base cat — the launch kitty — so the host treats this id as
-/// "no program claim" rather than looking up a breed for it.
+/// The canonical id every shell folds onto ([`canonical_app_id`]). At the
+/// prompt the pane wears the launch kitty, so the host treats this id as "no
+/// program claim".
 pub const SHELL_APP_ID: &str = "shell";
 
-/// THE CANONICAL APP TABLE — the ONE place basenames become app identities,
-/// so every argv form of a flagship tool lands on the same kitty. Policy,
-/// kept small on purpose:
-///   • every shell is the SAME id ([`SHELL_APP_ID`]) — the prompt is home,
-///     and home wears the launch kitty regardless of which shell renders it;
-///   • the flagship AI coding tools get their canonical ids spelled out so a
-///     rename/wrapper (`claude.exe`, `/opt/bin/codex`) cannot fork the breed;
-///   • everything else IS its basename — unknown tools stay distinct and get
-///     the deterministic name-derived breed from [`KittyLook::for_app`].
+/// The canonical app table, where basenames become app identities so every argv
+/// form of a flagship tool lands on the same kitty:
+///   • every shell is [`SHELL_APP_ID`];
+///   • the flagship AI coding tools have spelled-out ids so a rename or wrapper
+///     (`claude.exe`, `/opt/bin/codex`) cannot fork the breed;
+///   • everything else is its basename, with the name-derived breed from
+///     [`KittyLook::for_app`].
 #[must_use]
 pub fn canonical_app_id(basename: &str) -> &str {
     match basename {
@@ -133,24 +119,17 @@ pub fn canonical_app_id(basename: &str) -> &str {
     }
 }
 
-/// FLAGSHIP BREEDS — hand-picked `(variant, coat, iris, age)` for the apps
-/// people live in, spread across distinct coat families so no two flagships
-/// can be mistaken for hash luck. Everything else goes through the
-/// [`APP_LOOK_SALT`] hash path in [`KittyLook::for_app`].
+/// Flagship breeds: hand-picked `(variant, coat, iris, age)` for the main apps,
+/// in distinct coat families. Everything else takes the [`APP_LOOK_SALT`] hash
+/// path in [`KittyLook::for_app`].
 ///
-/// The picks (COAT_RAMP / EYE_RAMP stops per `cat_baker` §5.3):
-///   • `claude` — S108 (one of the two tallest, roundest, lowest-eyed faces:
-///     open and friendly), bright-ginger coat 12 — the ramp's closest stop to
-///     Anthropic's warm terracotta — with warm copper iris 0.
-///   • `codex` — S117 (level, mid-set eyes: a precise, even gaze), clean
-///     white coat 15 with storm-teal iris 7: the cool counterpoint to claude.
-///   • `agy` — S122 (the only head in the roster with its own aspect ratio:
-///     one of a kind, like the house tool), blue-slate coat 3 — the ramp's
-///     blue notch — with sea-green iris 6, and the ADOLESCENT age band: the
-///     youngest tool in the pack, still growing.
-///
-/// (The shell's old charcoal tuxedo is gone: since the launch-kitty ruling the
-/// prompt wears the launch kitty, not a program cat.)
+/// The picks (COAT_RAMP / EYE_RAMP stops):
+///   • `claude`: S108 (tall, round, low-eyed: open and friendly), bright-ginger
+///     coat 12 (closest to warm terracotta), warm copper iris 0.
+///   • `codex`: S117 (level, mid-set eyes), clean white coat 15, storm-teal
+///     iris 7.
+///   • `agy`: S122 (the only head with its own aspect ratio), blue-slate coat 3,
+///     sea-green iris 6, adolescent age band.
 fn flagship_look(app_id: &str) -> Option<KittyLook> {
     let (variant, coat, iris, age) = match app_id {
         "claude" => (CatGlyphId::S108, 12, 0, CatAge::Adult),
@@ -171,35 +150,23 @@ fn flagship_look(app_id: &str) -> Option<KittyLook> {
 }
 
 impl KittyLook {
-    /// THE LAUNCH KITTY (owner ruling, 2026-08-17: *"it's too hard to have
-    /// the cat changing too much — let's have the cat generated at aterm
-    /// launch and per computer"*): the BASE companion breed for the whole
-    /// aterm process, decoded from a seed the host mints exactly once at
-    /// launch. It is what the prompt wears in every window and session until
-    /// aterm is launched again — the cat you see when no program has earned
-    /// the cursor.
+    /// The launch kitty: the base companion breed for the whole aterm process,
+    /// decoded from a seed the host mints once at launch. The prompt wears it
+    /// in every window and session until aterm launches again
+    /// (owner, 2026-08-17).
     ///
-    /// It replaces the per-session kitty (2026-07-26, a different breed per
-    /// tab) and the old "shell" program cat. The per-app kitties
-    /// ([`Self::for_app`], "the claude cat, the codex cat") stay — the owner
-    /// likes them — but ride ABOVE this base only after a program has held
-    /// the pane long enough (the host's tenure gate; the switch was what
-    /// felt abrupt, not the cats), and a pinned favourite outranks both: the
-    /// user choosing a cat is a reason, and only reasons may change the kitty.
+    /// Per-app kitties ([`Self::for_app`]) ride above it only after a program
+    /// has held the pane long enough (the host's tenure gate), and a pinned
+    /// favourite outranks both.
     ///
-    /// A pure function of the seed: same seed ⇒ same cat, byte-stable, on
-    /// every machine — nothing to persist, nothing to sync. The host owns
-    /// the seed's entropy (aterm-gui mints it from the audited CSPRNG at
-    /// `App` construction; tests pass a fixed seed), so this crate stays
-    /// clockless and dieless like every other engine in it.
+    /// A pure function of the seed: same seed, same cat, on every machine. The
+    /// host owns the entropy (aterm-gui mints it from the CSPRNG at `App`
+    /// construction; tests pass a fixed seed), so this crate stays clockless.
     ///
-    /// The axes are decoded through the ordinary v4 genome so the launch
-    /// kitty is drawn from exactly the same roster (head, coat, iris, age
-    /// band) the ambient word-cats roll from — no separate art path, no new
-    /// bake keys. `cat_variant_v4` indexes HEADS only, so the launch kitty
-    /// can never be a full-cat special (the maneki stays a discovery).
-    /// Accessories stay `None`: a bow or crown marks a COLLECTED cat, and
-    /// minting them for free here would devalue them.
+    /// Decoded through the ordinary v4 genome, so it comes from the same roster
+    /// (head, coat, iris, age band) as the word-cats. `cat_variant_v4` indexes
+    /// heads only, so it is never a full-cat special. Accessories stay `None`:
+    /// they mark collected cats.
     #[must_use]
     pub fn for_launch(seed: u64) -> Self {
         let gkey = crate::genome::mix(seed ^ LAUNCH_LOOK_SALT);
@@ -214,25 +181,17 @@ impl KittyLook {
         .normalized()
     }
 
-    /// THE APP KITTY (owner spec, 2026-08-07: "each major app gets its own
-    /// cursor kitty"; kept under the 2026-08-17 ruling — *"I like the
-    /// different cats"* — with the host's tenure gate deciding WHEN one is
-    /// worn): the deterministic breed for a canonical app id from
-    /// [`canonical_app_id`].
+    /// The app kitty: the deterministic breed for a canonical app id from
+    /// [`canonical_app_id`]; the host's tenure gate decides when it is worn
+    /// (owner, 2026-08-07).
     ///
-    /// Flagships (`claude`/`codex`/`agy`) wear the hand-picked
-    /// [`flagship_look`] tuples so the tools people live in look intentional;
-    /// every other app derives its look from the NAME — `form_hash` (the
-    /// lexicon's canonical FNV-1a-64) salted into its own namespace, decoded
-    /// through the ordinary v4 genome exactly like [`Self::for_launch`]. Same
-    /// app ⇒ same cat, on every machine, by construction — "the claude cat"
-    /// is recognizable everywhere — so there is nothing to persist and
-    /// nothing to sync. (Only the BASE cat is per launch/computer.)
+    /// Flagships (`claude`/`codex`/`agy`) use the [`flagship_look`] tuples; every
+    /// other app derives its look from the name (`form_hash`, the lexicon's
+    /// FNV-1a-64, salted into its own namespace) through the v4 genome like
+    /// [`Self::for_launch`]. Same app, same cat, on every machine.
     ///
-    /// Accessories stay `None` here for the same reason as the launch kitty:
-    /// a bow or crown marks a COLLECTED cat, and minting them for free would
-    /// devalue them. The roster is 25 heads × 16 coats × 8 irises × 4 ages =
-    /// 12,800 distinct looks.
+    /// Accessories stay `None` (they mark collected cats). The roster is 25
+    /// heads × 16 coats × 8 irises × 4 ages = 12,800 looks.
     #[must_use]
     pub fn for_app(app_id: &str) -> Self {
         if let Some(look) = flagship_look(app_id) {
@@ -251,9 +210,8 @@ impl KittyLook {
     }
 
     /// Clamp untrusted persisted indices and restore a renderable composition.
-    /// An accessory can never be a base glyph: old/corrupt ledgers degrade to
-    /// the default head instead of asking the baker to stretch an overlay into
-    /// a face. Full-cat specials cannot wear an accessory.
+    /// An accessory is never a base glyph (corrupt ledgers degrade to the
+    /// default head), and full-cat specials wear no accessory.
     #[must_use]
     pub fn normalized(mut self) -> Self {
         self.coat = self.coat.min(15);
@@ -277,38 +235,29 @@ impl KittyLook {
     }
 }
 
-/// THE SUFFICIENT-DIFFERENCE FLOOR for two coats, in [`coat_distance`]
-/// units (resolved-RGB Euclidean, 0–255 channels): below it, two coats are
-/// close enough that a costume swap between them reads as noise, and an
-/// arrival ceremony would announce nothing a viewer can see.
+/// The sufficient-difference floor for two coats in [`coat_distance`] units
+/// (resolved-RGB Euclidean, 0–255 channels): below it a costume swap reads as
+/// noise and an arrival ceremony would announce nothing visible.
 ///
-/// Derivation — measured over the live ramp and dark-background lift, not
-/// taste. 40 is the knee that:
-///   • catches all six dark-collapse pairs among coats {0,1,2,3} (post-lift
-///     they sit within 2.9 of each other, while raw ramp RGB claims up to
-///     105) and the six adjacent warm-ramp pairs (6,7) (7,8) (8,9) (9,10)
-///     (10,11) (11,12) — the similarity-ordered ramp's deliberate
-///     near-twins;
-///   • keeps every genuine family crossing: ginger-vs-cream (12,13) at
-///     59.8 stays sufficient (a floor of 60 would demote it);
-///   • demotes 22 of the 120 coat pairs — 1 856 of the 8 128 unordered
-///     pairs of the 128-cell `(coat, iris)` space, 22.8 %;
-///   • never touches a flagship: the claude/codex/agy trio's minimum
-///     pairwise [`coat_distance`] is 163.5 (claude–agy, on a dark
-///     background), 4× this floor — no flagship pair demotes under any
-///     candidate floor up to ~160.
+/// Derived from the live ramp and dark-background lift. 40 is the knee that:
+///   • catches all six dark-collapse pairs among coats {0,1,2,3} (within 2.9 of
+///     each other after the lift) and the six adjacent warm-ramp near-twins
+///     (6,7) … (11,12);
+///   • keeps genuine family crossings: ginger-vs-cream (12,13) at 59.8;
+///   • demotes 22 of the 120 coat pairs (1 856 of the 8 128 unordered pairs of
+///     the 128-cell `(coat, iris)` space, 22.8%);
+///   • never touches a flagship: the trio's minimum pairwise distance is 163.5
+///     (claude–agy, dark background), 4× this floor.
 pub const SUFFICIENT_DIFFERENCE: f32 = 40.0;
 
 /// The precomputed [`coat_distance`] table. Each cell is
 /// `min(dist(COAT_RAMP[a], COAT_RAMP[b]), dist(lift(COAT_RAMP[a]),
-/// lift(COAT_RAMP[b])))` — the minimum over the two background classes of
-/// the Euclidean RGB distance (0–255 channels) between the RESOLVED coat
-/// stops, where `lift` is `cat_baker`'s dark-background luminance rescue
-/// (bands 0|4, floor `COAT_MIN_LUM_DARK_BG`). Precomputed because the lift
-/// is bake-time float math (HSV + a luminance bisection), not
+/// lift(COAT_RAMP[b])))`: the minimum over the two background classes of the
+/// Euclidean RGB distance between resolved coat stops, where `lift` is
+/// `cat_baker`'s dark-background rescue (bands 0|4, floor
+/// `COAT_MIN_LUM_DARK_BG`). Precomputed because the lift is not
 /// const-evaluable; `coat_distance_table_is_pinned_to_the_live_lift`
-/// re-derives every cell from the living math, so the table cannot drift
-/// from the baker silently.
+/// re-derives every cell.
 #[rustfmt::skip]
 const COAT_DISTANCE: [[f32; 16]; 16] = [
     [
@@ -391,21 +340,17 @@ const COAT_DISTANCE: [[f32; 16]; 16] = [
     ],
 ];
 
-/// THE SUFFICIENT-DIFFERENCE METRIC: how far apart two coat stops actually
-/// look on glass, as the worst case over the two background classes —
-/// `min` of the raw-ramp RGB distance and the distance after `cat_baker`'s
-/// dark-background luminance rescue. The `min` is the law: the raw ramp
-/// LIES on dark themes (the rescue collapses coats 0–3 to within 2.9 of
-/// each other while their raw distances run 20.9–105.3), and a viewer on a
-/// dark background is the common case, so "visibly different" must hold on
-/// the background where the two coats are CLOSEST.
+/// How far apart two coat stops look on glass: the minimum over the two
+/// background classes of the raw-ramp RGB distance and the distance after
+/// `cat_baker`'s dark-background rescue. The rescue collapses coats 0–3 to
+/// within 2.9 of each other (raw 20.9–105.3), so "visibly different" must hold
+/// where the coats are closest.
 ///
-/// Deliberately NO iris term: the walking pet culls `GlyphRole::Iris`
-/// entirely below `pet_baker::FACE_DETAIL_MIN_H` (56 px tile height —
-/// every 1× display), so an iris term would certify pixel-identical pets
-/// as "visibly different". The pet's whole legible identity is its coat.
+/// No iris term: the walking pet culls `GlyphRole::Iris` below
+/// `pet_baker::FACE_DETAIL_MIN_H` (56 px tile height, every 1× display), so the
+/// pet's legible identity is its coat.
 ///
-/// Symmetric, zero on the diagonal; out-of-range indices clamp exactly as
+/// Symmetric, zero on the diagonal; out-of-range indices clamp as
 /// [`KittyLook::normalized`] clamps `coat`. Compare against
 /// [`SUFFICIENT_DIFFERENCE`].
 #[must_use]
@@ -451,10 +396,10 @@ pub fn age_from_key(key: &str) -> CatAge {
     }
 }
 
-/// The SHOWN kitty type — the Kitty Log vocabulary. cat-art v4 renders every
-/// cat as the authored peeking [`KittyType::HeadPeek`]; the remaining variants are
-/// FROZEN for `kitty-log.toml` serde compatibility (persisted rows key off
-/// [`KittyType::config_key`]) — the recorder never emits them any more.
+/// The shown kitty type, the Kitty Log vocabulary. Every cat renders as
+/// [`KittyType::HeadPeek`]; the other variants are kept for `kitty-log.toml`
+/// compatibility (rows key off [`KittyType::config_key`]) and are never
+/// recorded.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum KittyType {
     /// Head-only HeadPeek — the ONE type v4 records.
@@ -467,18 +412,17 @@ pub enum KittyType {
     HeadPawRight,
     /// FROZEN (serde compat): two-paw grip.
     HeadTwoPaws,
-    /// FROZEN (serde compat): the retired PawSingle pose.
+    /// Kept for serde compatibility: the PawSingle pose.
     PawSingle,
-    /// FROZEN (serde compat): the retired PawDouble (kneading) pose.
+    /// Kept for serde compatibility: the PawDouble (kneading) pose.
     PawDouble,
-    /// FROZEN (serde compat): the retired v1 paw glyph.
+    /// Kept for serde compatibility: the v1 paw glyph.
     PawClassic,
 }
 
 impl KittyType {
-    /// Every shown type, in registry order — the single source a generic
-    /// surface (log keys, settings rows, completeness denominators,
-    /// introspection) iterates without hardcoding the set.
+    /// Every shown type in registry order, for generic surfaces (log keys,
+    /// settings rows, completeness denominators, introspection).
     pub const ALL: [KittyType; 8] = [
         KittyType::HeadPeek,
         KittyType::HeadTilt,
@@ -590,19 +534,17 @@ impl KittyShownAs {
     }
 }
 
-/// [`KittySighting::traits`] bit: the identity carries heterochromia (§3.4,
-/// ~1/64). v2.6: recorded from the genome on head poses even when the sub-16
-/// cell size gate baked the plain build (§5.4 — the log is an identity
-/// record, not a pixel record).
+/// [`KittySighting::traits`] bit: the identity carries heterochromia (~1/64).
+/// Recorded from the genome on head poses even when the small-cell gate baked
+/// the plain build (the log records identity, not pixels).
 pub const TRAIT_HETEROCHROMIA: u8 = 1;
 /// [`KittySighting::traits`] bit: the identity carries an ear nick (~1/8;
 /// same v2.6 sub-16 note as heterochromia).
 pub const TRAIT_EAR_NICK: u8 = 1 << 1;
 /// [`KittySighting::traits`] bit: a forehead blaze was DISPLAYED (~1/8).
 pub const TRAIT_BLAZE: u8 = 1 << 2;
-/// [`KittySighting::traits`] bit: the shy build showed (bit 60; v3 texel
-/// trait — smaller 0.85·r buttons + blush + lowered catch-light, no lids —
-/// sparkle-words v3 design §2.1).
+/// [`KittySighting::traits`] bit: the shy build showed (genome bit 60: smaller
+/// 0.85·r buttons, blush, lowered catch-light).
 pub const TRAIT_SHY: u8 = 1 << 3;
 /// [`KittySighting::traits`] bit (v3 §2.1): the cat wore a Bow (1/32 of
 /// ordinary cats — accessories never stack on magic builds).
@@ -615,10 +557,8 @@ pub const TRAIT_WITCH_HAT: u8 = 1 << 6;
 /// [`KittySighting::traits`] bit (v3 §2.1): the Crown (1/1024).
 pub const TRAIT_CROWN: u8 = 1 << 7;
 
-/// Fold the §2.1 accessory decode ([`genome::cat_accessory`]) into the
-/// sighting's traits-u8 — the recorder ORs this into its existing trait
-/// assembly, so the accessory dimension rides the established channel (the
-/// Kitty Log persists it as four dedicated counters).
+/// Fold the accessory decode ([`genome::cat_accessory`]) into the sighting's
+/// traits byte; the Kitty Log persists it as four counters.
 ///
 /// [`genome::cat_accessory`]: crate::genome::cat_accessory
 #[cfg(test)]
@@ -634,9 +574,8 @@ pub fn accessory_trait_bits(acc: Option<crate::genome::Accessory>) -> u8 {
 }
 
 /// One recorded kitty sighting (§F4.2): everything the Kitty Log aggregates,
-/// SESSION-AGNOSTIC (no clocks — the store timestamps at flush) and free of
-/// raw genome words. Recorded once per episode, only on a present where the
-/// output actually landed; drained by the host via
+/// clockless (the store timestamps at flush) and free of raw genome words.
+/// Recorded once per episode on a present where the output landed; drained via
 /// `WordDecorations::drain_kitty_sightings`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KittySighting {
@@ -646,9 +585,8 @@ pub struct KittySighting {
     pub magic: KittyMagic,
     /// How it rendered (cat vs the three fallback causes).
     pub shown_as: KittyShownAs,
-    /// Every language claiming the matched surface (LangIds are lexicon-build
-    /// scoped — the store must persist lang CODE strings via
-    /// `Lexicon::lang_code`, never raw ids).
+    /// Every language claiming the matched surface. LangIds are lexicon-build
+    /// scoped, so the store persists codes via `Lexicon::lang_code`.
     pub langs: LangSet,
     /// Displayed-trait bits (`TRAIT_*`): set only when a head pose actually
     /// drew/applied the trait this episode.
@@ -691,15 +629,10 @@ mod tests {
         dist(raw_stop(a), raw_stop(b)).min(dist(lifted(a), lifted(b)))
     }
 
-    /// THE TABLE PIN: every cell of the precomputed [`COAT_DISTANCE`] table
-    /// equals the metric re-derived from the live ramp and the live
-    /// dark-background lift (`cat_baker::dark_bg_coat_stop`). If this
-    /// fails, `COAT_RAMP`, `COAT_MIN_LUM_DARK_BG` or the lift itself moved
-    /// and the table must be regenerated WITH it — the table is a cache of
-    /// the baker's law, never a second law. (Tolerance 0.01: the lift's
-    /// luminance bisection rides `powf`, which libm does not promise
-    /// correctly rounded across platforms; a real drift moves cells by
-    /// whole units.)
+    /// Every cell of [`COAT_DISTANCE`] equals the metric re-derived from the
+    /// live ramp and lift (`cat_baker::dark_bg_coat_stop`); the table is a
+    /// cache of the baker's law. Tolerance 0.01, since the lift's bisection
+    /// uses `powf`, which is not correctly rounded on every platform.
     #[test]
     fn coat_distance_table_is_pinned_to_the_live_lift() {
         for a in 0..16u8 {
@@ -714,11 +647,9 @@ mod tests {
         }
     }
 
-    /// THE DARK-COLLAPSE TRUTH: on dark backgrounds the luminance rescue
-    /// collapses coats {0,1,2,3} onto near-identical pale tones, so every
-    /// pair among them is insufficient — even where the raw ramp claims a
-    /// large distance ((0,3) is 105 raw and ~1 on glass). A raw-only
-    /// metric would certify exactly these swaps as worth a ceremony.
+    /// On dark backgrounds the rescue collapses coats {0,1,2,3} onto near-equal
+    /// pale tones, so every pair among them is insufficient, even (0,3) at 105
+    /// raw and ~1 on glass.
     #[test]
     fn dark_collapse_pairs_are_insufficient_where_raw_rgb_would_pass() {
         for (a, b) in [(0u8, 1u8), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
@@ -734,10 +665,9 @@ mod tests {
         );
     }
 
-    /// The flagship trio (claude 12, codex 15, agy 3) never demotes: every
-    /// pair clears [`SUFFICIENT_DIFFERENCE`] with 4× headroom, so the rate
-    /// law's sufficient-difference check changes nothing for the cats
-    /// people live in — by measurement, not by exemption.
+    /// The flagship trio (claude 12, codex 15, agy 3) clears
+    /// [`SUFFICIENT_DIFFERENCE`] with 4× headroom, by measurement rather than
+    /// exemption.
     #[test]
     fn flagship_trio_is_always_sufficiently_different() {
         let coats = [
@@ -758,9 +688,8 @@ mod tests {
         }
     }
 
-    /// The metric's shape: symmetric, zero on the diagonal, and out-of-range
-    /// indices clamp to the last stop exactly like `normalized()` clamps
-    /// `coat`.
+    /// The metric is symmetric, zero on the diagonal, and clamps out-of-range
+    /// indices like `normalized()`.
     #[test]
     fn coat_distance_is_symmetric_with_a_zero_diagonal() {
         for a in 0..16u8 {
@@ -842,9 +771,9 @@ mod tests {
         assert_eq!(dedup.len(), type_keys.len(), "keys must be unique");
     }
 
-    /// v3 §2.1: the accessory trait bits are pinned (16/32/64/128), disjoint
-    /// from the displayed-trait bits, and `accessory_trait_bits` maps the
-    /// genome decode onto exactly one of them.
+    /// The accessory trait bits are pinned (16/32/64/128), disjoint from the
+    /// displayed-trait bits, and `accessory_trait_bits` maps the decode onto
+    /// exactly one of them.
     #[test]
     fn accessory_trait_bits_are_pinned_and_disjoint() {
         use crate::genome::Accessory;
@@ -866,12 +795,9 @@ mod tests {
         }
     }
 
-    /// THE LAUNCH KITTY is a pure function of its seed: the same seed decodes
-    /// to the identical breed (byte-stable, on every machine — nothing to
-    /// persist), the result is already normalized (renderable by
-    /// construction), it is a HEAD (never a full-cat special — the maneki
-    /// stays a discovery), and it never mints an accessory (bows and crowns
-    /// mark COLLECTED cats).
+    /// The launch kitty is a pure function of its seed: same breed for the same
+    /// seed, already normalized, a head (never a full-cat special), and never
+    /// an accessory.
     #[test]
     fn launch_kitty_is_seed_pure_normalized_head_and_bare() {
         for seed in (0..4096u64).chain([u64::MAX, 0x8000_0000_0000_0000]) {
@@ -887,11 +813,8 @@ mod tests {
         }
     }
 
-    /// The seed genuinely SPREADS the roster: across a modest sweep the
-    /// breeds are well distributed (not vacuously stuck on a handful), and
-    /// no seed in the sweep lands on the one shared `KittyLook::default()` —
-    /// the "every install wears the same cat" regression the derived floor
-    /// exists to prevent.
+    /// The seed spreads the roster: across a sweep the breeds are well
+    /// distributed and none lands on `KittyLook::default()`.
     #[test]
     fn launch_kitties_spread_the_roster_and_avoid_the_shared_default() {
         let looks: Vec<KittyLook> = (0..64u64).map(KittyLook::for_launch).collect();
@@ -909,17 +832,10 @@ mod tests {
         );
     }
 
-    /// THE FOREVER PIN for the launch draw: [`KittyLook::for_launch`]
-    /// promises "same seed ⇒ same cat, on every machine". The purity and
-    /// spread assertions above cannot hold that promise up on their own —
-    /// they are invariant under a salt change or a genome-field reshuffle,
-    /// either of which would silently re-dress every launch kitty across
-    /// builds with every test green. These are today's exact draws (the
-    /// literal `(variant, coat, iris, age)` tuples); if this fails, the draw
-    /// pipeline ([`LAUNCH_LOOK_SALT`], `genome::mix`, the `cat_*_v4`
-    /// decoders) changed and the promise broke — a BREAKING change, not a
-    /// refactor. (A pinned favourite survives such a change; an unpinned
-    /// launch cat does not.)
+    /// Exact draws for fixed seeds: purity and spread cannot catch a salt
+    /// change or genome reshuffle, which would re-dress every launch kitty. A
+    /// failure here means the draw pipeline ([`LAUNCH_LOOK_SALT`], `genome::mix`,
+    /// the `cat_*_v4` decoders) changed, a breaking change.
     #[test]
     fn launch_draws_are_pinned_forever() {
         for (seed, (variant, coat, iris, age)) in [
@@ -936,9 +852,9 @@ mod tests {
         }
     }
 
-    /// The commandline → basename extraction: paths (both separators), case
-    /// folding, `.exe` stripping, and the documented transparent launcher
-    /// plumbing (`sudo`/`env`/`npx`, `VAR=value` assignments, `-flags`).
+    /// Commandline → basename extraction: paths (both separators), case
+    /// folding, `.exe` stripping, and launcher plumbing (`sudo`/`env`/`npx`,
+    /// `VAR=value`, `-flags`).
     #[test]
     fn app_basename_strips_paths_prefixes_and_case() {
         assert_eq!(app_basename("cargo build"), Some("cargo".into()));
@@ -973,10 +889,8 @@ mod tests {
         );
     }
 
-    /// The canonical table is policy: every shell is the ONE shell id (which
-    /// the host reads as "no program claim"), the flagships keep their
-    /// spelled-out ids, and an unknown basename is its own id (distinct,
-    /// deterministic).
+    /// Every shell maps to the one shell id, flagships keep their ids, and an
+    /// unknown basename is its own id.
     #[test]
     fn canonical_table_folds_shells_and_pins_flagships() {
         for shell in ["zsh", "bash", "fish", "sh", "pwsh", "nu"] {
@@ -988,10 +902,8 @@ mod tests {
         assert_eq!(canonical_app_id("somenewtool"), "somenewtool");
     }
 
-    /// The flagship breeds are FIXED tuples (never hash luck) and pairwise
-    /// distinct — pinned here so a ramp or roster refactor that would silently
-    /// re-dress the claude cat fails loudly instead. The shell has NO flagship
-    /// tuple any more: the prompt wears the launch kitty.
+    /// Flagship breeds are fixed, pairwise distinct tuples, so a ramp or roster
+    /// refactor cannot silently re-dress them. The shell has no flagship tuple.
     #[test]
     fn flagship_breeds_are_fixed_and_distinct() {
         let expect = [
@@ -1020,9 +932,8 @@ mod tests {
         );
     }
 
-    /// An unknown app derives its breed from the NAME and is stable: two
-    /// resolutions yield the identical tuple (a pure function — same app,
-    /// same cat, every machine), heads only, renderable.
+    /// An unknown app's breed derives from its name and is stable: heads only,
+    /// renderable.
     #[test]
     fn unknown_app_breed_is_name_derived_and_stable() {
         let first = KittyLook::for_app("somenewtool");
@@ -1036,9 +947,7 @@ mod tests {
         );
     }
 
-    /// `for_app` never mints an accessory — bows and crowns mark COLLECTED
-    /// cats (same law as the launch kitty), across flagships and the hash
-    /// path alike.
+    /// `for_app` never mints an accessory, for flagships and the hash path.
     #[test]
     fn for_app_never_emits_an_accessory() {
         for id in ["claude", "codex", "agy"] {
@@ -1048,27 +957,5 @@ mod tests {
             let name = format!("tool{n}");
             assert_eq!(KittyLook::for_app(&name).accessory, None, "{name}");
         }
-    }
-
-    /// The sighting stays `Copy` and clock-free (session-agnostic) — the
-    /// compile-time shape the host dedupe buffer relies on.
-    #[test]
-    fn sighting_is_copy() {
-        fn assert_copy<T: Copy>() {}
-        assert_copy::<KittySighting>();
-        let s = KittySighting {
-            kitty_type: KittyType::HeadPeek,
-            magic: KittyMagic::None,
-            shown_as: KittyShownAs::Cat,
-            langs: LangSet::EMPTY,
-            traits: TRAIT_SHY | TRAIT_BLAZE,
-            look: KittyLook {
-                coat: 3,
-                ..KittyLook::default()
-            },
-            ident: 42,
-        };
-        let t = s;
-        assert_eq!(s, t);
     }
 }

@@ -4,18 +4,20 @@
 //! Config-directory MARKER files — the small "the person already answered
 //! this" records that sit beside `aterm.toml`.
 //!
-//! Two surfaces keep one: the session-connections first-use notice
-//! (`connections`) and the macOS access card (`consent_card::MARKER`). (The
-//! first-launch admin card's marker went with that card, 2026-09-24; a
-//! `packages-admin-step-dismissed` file left beside `aterm.toml` is inert.)
-//! They share a threat model — a planted link, a directory, or an oversized
+//! Two surfaces read and write theirs here: the macOS access card
+//! (`consent_card::MARKER`) and the debugger-access change
+//! (`debugger_access::CHANGE_MARKER`, `OBSERVED_MARKER`). The session-connections
+//! first-use latch (`connections`) is an existence-only `create_new` file that needs
+//! neither reader nor writer. (The first-launch admin card's marker went with that
+//! card, 2026-09-24; a `packages-admin-step-dismissed` file left beside `aterm.toml`
+//! is inert.) Markers share a threat model — a planted link, a directory, or an oversized
 //! file at the marker path must be neither read through, written through, nor
 //! mistaken for a record — and until this module they shared it by copy. The
 //! rules, once:
 //!
 //! * **Reading** opens the path without following a final-component link and
 //!   checks the HANDLE (not a separate stat something could swap under) — the
-//!   same boundary the theme files use (`app_config::open_regular_theme_file`).
+//!   same boundary the theme files use (`aterm_effects::file_feed::read_bounded_regular_utf8`).
 //!   Anything that is not a regular file of at most `max_bytes` valid UTF-8 is
 //!   `None`: not a record this machine wrote, so the surface errs toward
 //!   disclosure and shows again.
@@ -28,21 +30,13 @@
 //!   (`InvalidInput`), never truncated: a truncated record would read as a
 //!   different answer.
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::Path;
 
 /// The marker's text, when a REGULAR, non-symlink file of at most `max_bytes`
 /// sits at `path`; `None` for everything else.
 pub(crate) fn read_marker(path: &Path, max_bytes: usize) -> Option<String> {
-    let file = crate::app_config::open_regular_theme_file(path).ok()?;
-    let mut bytes = Vec::with_capacity(256);
-    file.take((max_bytes + 1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > max_bytes {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
+    aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes).ok()
 }
 
 /// Record `text` at `path`, exclusively and atomically (see the module doc).
@@ -81,7 +75,10 @@ pub(crate) fn write_marker(path: &Path, text: &str, max_bytes: usize) -> std::io
     }
     let written = options
         .open(&tmp)
-        .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|()| f.sync_all()))
+        .and_then(|mut f| {
+            f.write_all(text.as_bytes())
+                .and_then(|()| crate::durable::sync_all(&f))
+        })
         .and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -113,10 +110,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "aterm-config-marker-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            aterm_time::since_epoch().unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir

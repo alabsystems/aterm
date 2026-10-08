@@ -34,8 +34,9 @@ use aterm_render::{
     DamageOutcome, DirtyDecision, Frame, Renderer, Theme, WindowCpu, compute_dirty_rows, rgb_to_u32,
 };
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u32> {
@@ -144,10 +145,7 @@ fn sat_add(dst: u32, premul: u32) -> u32 {
 /// quad's one-row cell band.
 #[test]
 fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(4, 12);
     term.process(b"\x1b[?25l");
@@ -237,10 +235,7 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
 /// `rain → cat → glyphs` order; cats walk on rain.
 #[test]
 fn rain_under_text_and_under_cats() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(2, 8);
     term.process("\x1b[?25l█".as_bytes());
@@ -282,10 +277,7 @@ fn rain_under_text_and_under_cats() {
 /// math over the rendered base frame, and it can only ever brighten a pixel.
 #[test]
 fn rain_add_is_saturating_add_and_only_brightens() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 10);
     term.process(b"\x1b[?25lglow");
@@ -349,10 +341,7 @@ fn rain_add_is_saturating_add_and_only_brightens() {
 /// equal a fresh full render of the same input, byte-for-byte.
 #[test]
 fn damaged_path_no_ghosting_as_rain_animates() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     // Glyph-free terminal (all background), like the cat/glow damaged-path
     // tests: glyph AA overhang across bands is a pre-existing snapshot quirk
@@ -568,10 +557,7 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
 /// framebuffer is byte-stable.
 #[test]
 fn unchanged_rain_gate_hits_with_byte_stable_framebuffer() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(4, 12);
     term.process(b"\x1b[?25l");

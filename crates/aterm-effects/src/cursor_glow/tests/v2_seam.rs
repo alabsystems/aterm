@@ -5,11 +5,10 @@
 
 use super::*;
 
-/// The frame-0 law at the seam (T2, §6): a 20-cell same-row nav move
-/// under v2 puts the meteor's train (`under`), its white heat (`out`) and
-/// its coma (`halos`) on glass on the very tick the caret is observed —
-/// and v1 lays NOTHING for it: no spark, no ZOOM, no starburst, no ring,
-/// no particle, no Sweep/Glide cue beside the engine's one meteor cue.
+/// The frame-0 law at the seam (T2, §6): a 20-cell same-row nav move puts the
+/// meteor's train (`under`), white heat (`out`) and coma (`halos`) on glass on
+/// the tick the caret is observed, with no spark, zoom, starburst, ring,
+/// particle or Sweep/Glide cue beside the engine's one meteor cue.
 #[test]
 fn a_v2_nav_jump_draws_the_meteor_on_the_observed_frame() {
     let g = geom();
@@ -68,11 +67,10 @@ fn a_v2_nav_jump_draws_the_meteor_on_the_observed_frame() {
     );
 }
 
-/// The cell `(row, col)`'s light on THIS frame: for every pixel column of
-/// the cell, the brightest premultiplied channel of any `under` quad over
-/// it, and the cell's light is the DARKEST of those columns — a cell
-/// shows its colour only when all of it does, and `ribbon_beam` emits
-/// nothing under one coverage step, so an unlit head end reads `0`.
+/// The cell `(row, col)`'s light on this frame: for every pixel column of the
+/// cell, the brightest premultiplied channel of any `under` quad over it; the
+/// cell's light is the darkest column. `ribbon_beam` emits nothing under one
+/// coverage step, so an unlit head end reads `0`.
 fn under_light_at(quads: &[GlowQuad], g: Geom, row: u16, col: u16) -> u32 {
     let (cw, ch) = (g.cw as u32, g.ch as u32);
     // The body reaches `1.10 ch` above the row and `0.305 ch` below it.
@@ -102,15 +100,9 @@ fn under_light_at(quads: &[GlowQuad], g: Geom, row: u16, col: u16) -> u32 {
         .unwrap_or(0)
 }
 
-/// `trail status` CLAIMS THE RIBBON IT LAYS (§17.2 seam point 12, and the
-/// paint-conformance bind that reads it): `ribbon_segments=` and
-/// `ribbon_hue_bands=` are the row's `ribbon_active` (`≥ 2 && ≥ 2`), and
-/// under v2 they must count v2's cells — a row that counted v1's sparks
-/// read `ribbon_segments=0 ribbon_hue_bands=0 ribbon_active=false` over a
-/// lit v2 ribbon (measured on the shipped-default paint rows, 2026-09-06:
-/// `ribbon_claimed=0 ribbon_bound=0` on every status frame). Its v1
-/// control — the same hand with the seam's flag off — died with v1 and
-/// the flag (phase 7).
+/// `trail status` claims the ribbon it lays (§17.2 seam point 12, read by the
+/// paint-conformance bind): `ribbon_segments=` and `ribbon_hue_bands=` count
+/// v2's cells and determine `ribbon_active` (`≥ 2 && ≥ 2`).
 #[test]
 fn under_v2_trail_status_claims_the_ribbon_it_lays() {
     let g = geom();
@@ -139,17 +131,12 @@ fn under_v2_trail_status_claims_the_ribbon_it_lays() {
     );
 }
 
-/// The frame-0 law for a TYPED key (T2, §2.1; §2.5's `edge-in` is the
-/// one sanctioned attack and it is v1's, KEPT — with v1's readable floor
-/// on the exact key frame): the frame that echoes the key already shows
-/// its ribbon cell. The host stamps the key at `note_typed_glyph(t_key)`;
-/// the echo's content present lands 0.2–0.4 ms later (measured live:
-/// capture-after keys 7 / 31 / 35 / 38), and the SAME `tick` that
-/// observes the caret's move must emit `under` light over the new cell —
-/// not the tick 17 ms later. "Shows" is v1's own bar: its
-/// `RAINBOW_BIRTH_EDGE_FLOOR` (0.35) put ~14/255 coverage on the key
-/// frame, and `1/255` is documented there as "technically resident but
-/// visually blank"; a quarter of the settled cell is the floor here.
+/// The frame-0 law for a typed key (T2, §2.1; §2.5's `edge-in` attack is kept,
+/// with its readable floor on the key frame): the frame that echoes the key
+/// already shows its ribbon cell. The host stamps the key at
+/// `note_typed_glyph(t_key)`; the echo lands 0.2–0.4 ms later, and the same
+/// `tick` that observes the caret's move must emit `under` light over the new
+/// cell. The floor is a quarter of the settled cell.
 #[test]
 fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     let g = geom();
@@ -191,20 +178,13 @@ fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     );
 }
 
-/// **A LINE STILL BEING TYPED HAS NO DARK CELL INSIDE ITS LIVE SPAN**
-/// (the owner's screenshot, 2026-09-08: "rainbow" lit, "theme" DARK,
-/// "truly" half lit, "magical" lit, "and" DARK, "specai" lit at the
-/// caret — "fix the black rainbow cursor trail gap"). The owner's
-/// sentence, 60 keys at a HUMAN 7 cps — fast words, a thinking pause
-/// before some of them, one slow word — each echo observed on the tick
-/// after its key, ticks at 60 Hz. On EVERY tick while the hand is still
-/// typing, every glyph cell from the first key to the caret's neighbour
-/// is a live ribbon cell: no hole inside the span, and no tail dropped
-/// while the hand has not stopped. FAILED before the cohort-shared life:
-/// a cell's life was priced once at birth from the spine, so a word typed
-/// at a dip (after a pause, or slowly) died BEFORE the hotter, older
-/// word beside it — a dark word inside the live span — and the oldest
-/// cells died on their own 1.7 s clock under a hand that had not lifted.
+/// A line still being typed has no dark cell inside its live span. A sentence
+/// of 60 keys at 7 cps (fast words, thinking pauses, one slow word), each echo
+/// observed on the tick after its key, ticks at 60 Hz: on every tick while the
+/// hand types, every glyph cell from the first key to the caret's neighbour is
+/// live. The cohort shares one life, so a word typed at a dip cannot die
+/// before an older, hotter word beside it, and the oldest cells do not die
+/// under a hand that has not lifted (owner, 2026-09-08).
 #[test]
 fn a_line_still_being_typed_has_no_dark_cell_inside_its_live_span() {
     let g = Geom {
@@ -283,9 +263,9 @@ fn a_line_still_being_typed_has_no_dark_cell_inside_its_live_span() {
     );
 }
 
-/// T6 at the seam: an engaged v2 with nothing live is EXACTLY zero —
-/// fingerprint 0, empty streams, no cadence, no deadline, not active, and
-/// the status row reports nothing on glass — so the loop parks.
+/// T6 at the seam: an engaged v2 with nothing live is exactly zero
+/// (fingerprint 0, empty streams, no cadence, no deadline, inactive, status
+/// reports nothing drawn), so the loop parks.
 #[test]
 fn v2_idle_is_exactly_zero() {
     let g = geom();
@@ -321,15 +301,11 @@ fn v2_idle_is_exactly_zero() {
     assert!(glow.drain_sound_cues().next().is_none());
 }
 
-/// THE SPELLING LAW AFTER THE DELETION (§17.3 phase 7): every spelling
-/// that names the rainbow kitty — the default, the pet, the bare word,
-/// `nyan`/`rainbow`, the flying/tall/underline presentations and the
-/// phase-3 `… v2` aliases — parses to `RainbowKitty`, and a FRESH engine
-/// engages v2 for it on its first drawing tick without being told: the
-/// hidden `v1` escape is gone, so `… v1` is an unknown word that falls
-/// back to `Lumen`, and there is no switch left to set. (Failed before
-/// the deletion on both counts: `rainbow kitty v1` parsed to the style,
-/// and a default engine drew v1 until the seam's flag was set.)
+/// Every spelling naming the rainbow kitty (the default, the pet, the bare
+/// word, `nyan`/`rainbow`, the flying/tall/underline presentations and the
+/// `… v2` aliases) parses to `RainbowKitty`, and a fresh engine engages v2 on
+/// its first drawing tick. `… v1` is an unknown word that falls back to
+/// `Lumen`.
 #[test]
 fn every_rainbow_kitty_spelling_engages_v2() {
     let g = geom();

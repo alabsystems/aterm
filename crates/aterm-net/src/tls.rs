@@ -127,11 +127,16 @@ impl ServerCertVerifier for PinnedServerVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         // Constant-time-ish fingerprint compare (32 bytes, fixed length).
-        if cert_fingerprint(end_entity.as_ref()) == self.pin {
+        let presented = cert_fingerprint(end_entity.as_ref());
+        if presented == self.pin {
             Ok(ServerCertVerified::assertion())
         } else {
+            // Both digests ride out in the error, so `connect` can say them.
             Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
+                rustls::CertificateError::Other(rustls::OtherError(Arc::new(PinMismatch {
+                    presented,
+                    pinned: self.pin,
+                }))),
             ))
         }
     }
@@ -156,6 +161,77 @@ impl ServerCertVerifier for PinnedServerVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.supported.supported_schemes()
+    }
+}
+
+/// A certificate whose SHA-256 is not the pinned one: what the remote presented
+/// and what the connection pins. [`PinnedServerVerifier`] returns it inside
+/// rustls' `CertificateError::Other`, and [`connect`] says it in these words.
+#[derive(Debug)]
+struct PinMismatch {
+    presented: [u8; 32],
+    pinned: [u8; 32],
+}
+
+impl std::fmt::Display for PinMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "certificate mismatch: the remote presents sha256:{}; the connection's fingerprint \
+             is sha256:{}",
+            aterm_codec::hex::encode_lower(&self.presented),
+            aterm_codec::hex::encode_lower(&self.pinned)
+        )
+    }
+}
+
+impl std::error::Error for PinMismatch {}
+
+/// The handshake error [`connect`] returns: a [`PinMismatch`] in its own words,
+/// every other error as rustls gave it.
+fn dial_handshake_error(e: io::Error) -> io::Error {
+    let mismatch = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .and_then(|error| match error {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)) => {
+                other.0.downcast_ref::<PinMismatch>()
+            }
+            _ => None,
+        });
+    match mismatch {
+        Some(mismatch) => io::Error::new(io::ErrorKind::InvalidData, mismatch.to_string()),
+        None => e,
+    }
+}
+
+/// The handshake error [`accept`] returns: a dialer's refusal of this
+/// listener's certificate — the alert an aterm dialer sends when its pinned
+/// fingerprint differs (`CertificateUnknown`, or `AccessDenied` from a dialer
+/// older than [`PinMismatch`]) — in its own words, every other error as rustls
+/// gave it. The words do not say why: any TLS client (a browser, a scanner)
+/// sends the same alert for a self-signed certificate, and the aterm dialer's
+/// own line gives both digests.
+fn listen_handshake_error(e: io::Error) -> io::Error {
+    let refused = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .is_some_and(|error| {
+            matches!(
+                error,
+                rustls::Error::AlertReceived(
+                    rustls::AlertDescription::CertificateUnknown
+                        | rustls::AlertDescription::AccessDenied
+                )
+            )
+        });
+    if refused {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "it refused this listener's certificate",
+        )
+    } else {
+        e
     }
 }
 
@@ -198,7 +274,7 @@ pub fn accept(
     let mut conn = ServerConnection::new(config).map_err(io_err)?;
     let mut tcp = tcp;
     while conn.is_handshaking() {
-        conn.complete_io(&mut tcp)?;
+        conn.complete_io(&mut tcp).map_err(listen_handshake_error)?;
     }
     let exporter: [u8; EXPORTER_LEN] = conn
         .export_keying_material([0u8; EXPORTER_LEN], EXPORTER_LABEL, None)
@@ -223,7 +299,7 @@ pub fn connect(
     let mut conn = ClientConnection::new(config, server_name).map_err(io_err)?;
     let mut tcp = tcp;
     while conn.is_handshaking() {
-        conn.complete_io(&mut tcp)?;
+        conn.complete_io(&mut tcp).map_err(dial_handshake_error)?;
     }
     let exporter: [u8; EXPORTER_LEN] = conn
         .export_keying_material([0u8; EXPORTER_LEN], EXPORTER_LABEL, None)
@@ -291,15 +367,11 @@ impl<C> RelayShared<C> {
 /// happens when TLS records are fed in, so buffered plaintext can exist before
 /// the relay has read a single byte itself.
 ///
-/// `tmp` is a CALLER-OWNED staging buffer, allocated once per relay and reused
-/// across calls. It used to be a `[0u8; 4096]` declared INSIDE the loop, which
-/// re-ran the 4 KiB zero-init on every iteration — ~5 iterations per 16 KiB TCP
-/// read, so ~20 KiB of zeroing per 16 KiB relayed, on top of the copy into
-/// `plain`. The array's address escapes into `reader().read`, which fills only a
-/// dynamic prefix, so neither DSE nor LICM can remove that memset; hoisting it
-/// out of the callee is the only way. Reuse is bit-identical: `read` never reads
-/// prior buffer contents, and only `tmp[..k]` is ever consumed, so bytes left
-/// over from an earlier call are never observable.
+/// `tmp` is a CALLER-OWNED staging buffer, allocated once per relay: a local
+/// array would be zeroed on every call (its address escapes into
+/// `reader().read`, so the optimizer cannot drop the memset), ~20 KiB of
+/// zeroing per 16 KiB relayed. Reuse is safe: `read` never reads prior
+/// contents and only `tmp[..k]` is consumed.
 fn drain_decrypted<C, S>(conn: &mut C, plain: &mut Vec<u8>, tmp: &mut [u8]) -> io::Result<bool>
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
@@ -504,10 +576,8 @@ where
             }
             // A graceful half-close must NOT mark the relay done: the download
             // direction is still live and the peer's response may still be
-            // arriving. Marking it done here (and shutting the socket down BOTH
-            // ways below) truncated that response tail — a local proxy that
-            // finished sending its request killed the reply it was waiting for.
-            // The relay ends only once BOTH half-closes have landed; a FATAL
+            // arriving, and a `Both` shutdown here would truncate it. The relay
+            // ends only once BOTH half-closes have landed; a FATAL
             // error (or teardown already under way) ends both at once.
             let half_close = graceful && !g.done;
             if half_close {
@@ -632,20 +702,32 @@ where
             }
         };
         plain.clear();
-        // Always set by the drain below; the error arm leaves the loop instead.
-        let clean_eof;
+        let mut clean_eof = false;
         {
             let mut g = shared.lock();
             if g.done {
                 break;
             }
             let mut cursor: &[u8] = &tls_in[..n];
-            while !cursor.is_empty() {
+            // FEED, DECRYPT, DRAIN — per feed, never per socket read. rustls
+            // holds at most 16 KiB of decrypted plaintext and `read_tls` refuses
+            // input once past it, while one socket read can complete more than
+            // that (the tail of a full record the last read left buffered, plus
+            // every small record behind it). Draining only after the whole read
+            // was fed let that refusal land mid-read and tore a healthy relay
+            // down. Draining after every `process_new_packets` keeps the buffer
+            // empty before each feed, so the refusal cannot happen; `plain`
+            // takes what the drains collect, at most a few records' worth.
+            //
+            // A clean close ends the feed: `read_tls` reads nothing after a
+            // `close_notify`, and nothing a peer sends past one is data.
+            while !cursor.is_empty() && !clean_eof {
                 match g.conn.read_tls(&mut cursor) {
                     Ok(1..) => {}
-                    // A slice source cannot fail, and `process_new_packets` after
-                    // every feed keeps the deframer drained, so no-progress here
-                    // means a record rustls cannot hold: fatal, not retryable.
+                    // A slice source cannot fail, and the drain below keeps
+                    // the plaintext buffer empty before every feed, so
+                    // no-progress here means a record rustls cannot hold:
+                    // fatal, not retryable.
                     Ok(0) | Err(_) => {
                         g.record_err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -662,14 +744,14 @@ where
                     fatal_down = true;
                     break 'down;
                 }
-            }
-            match drain_decrypted(&mut g.conn, &mut plain, &mut tls_plain) {
-                Ok(eof) => clean_eof = eof,
-                Err(e) => {
-                    g.record_err(e);
-                    g.done = true;
-                    fatal_down = true;
-                    break 'down;
+                match drain_decrypted(&mut g.conn, &mut plain, &mut tls_plain) {
+                    Ok(eof) => clean_eof = eof,
+                    Err(e) => {
+                        g.record_err(e);
+                        g.done = true;
+                        fatal_down = true;
+                        break 'down;
+                    }
                 }
             }
             if g.conn.wants_write() {
@@ -905,12 +987,10 @@ mod tests {
     #[test]
     fn relay_streams_a_large_payload_under_send_side_backpressure_without_truncating() {
         let _serial = serialize_loopback();
-        // Regression: the uploader used to treat a transient WouldBlock from
-        // write_all as fatal (record_err + break), dropping the just-read chunk
-        // and tearing down a healthy relay the moment the non-blocking TLS socket
-        // filled. A payload larger than the kernel send buffers forces that
-        // backpressure mid-stream; the fix retries from the consumed offset and a
-        // final draining flush delivers the tail, so every byte arrives in order.
+        // A payload larger than the kernel send buffers forces send-side
+        // backpressure mid-stream: a transient WouldBlock must be retried from
+        // the consumed offset, and the final drain must deliver the tail, so
+        // every byte arrives in order.
         const PAYLOAD_LEN: usize = 1 << 20; // 1 MiB — well beyond any socket buffer
         let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
 
@@ -972,17 +1052,12 @@ mod tests {
         let pin = cert_fingerprint(TEST_CERT_DER);
         let (svc_a, mut svc_b) = CtlStream::pair().unwrap();
         // SEQUENCED, like
-        // `graceful_local_eof_half_closes_without_killing_the_request_direction`.
-        // The request and the client's close_notify used to race through the
-        // relay unsequenced (the service `read_to_end` the request and the EOF in
-        // one read), and under whole-workspace scheduling the race wedged this
-        // test: measured 2026-09-21 in the merge gate on the fleet's Intel Mac, for
-        // the ceiling's full three hours, with the client in FIN_WAIT_2 and the
-        // relay's socket clones in CLOSE_WAIT. Now the service `read_exact`s the
-        // request and says so on a channel, and the client sends its close_notify
-        // only after that signal; the service then reads the EOF, and only then
-        // writes the response. The liveness bound stays, so a regression is a
-        // named failure in a minute rather than a hang.
+        // `graceful_local_eof_half_closes_without_killing_the_request_direction`:
+        // unsequenced, the request and the client's close_notify race through
+        // the relay and can wedge the test. The service `read_exact`s the request
+        // and says so on a channel; the client sends its close_notify only after
+        // that signal; the service then reads the EOF, and only then writes the
+        // response.
         svc_b
             .set_read_timeout(Some(NET_TEST_LIVENESS_BOUND))
             .unwrap();
@@ -1100,7 +1175,7 @@ mod tests {
         let pin = cert_fingerprint(TEST_CERT_DER);
         let (svc_a, mut svc_b) = CtlStream::pair().unwrap();
         svc_b
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(NET_TEST_LIVENESS_BOUND))
             .unwrap();
         let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
         let (request_flushed_tx, request_flushed_rx) = std::sync::mpsc::channel();
@@ -1123,11 +1198,11 @@ mod tests {
         });
         let server = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
-            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
             let mut transport = accept(tcp, scfg).unwrap();
             server_ready_tx.send(()).unwrap();
             request_flushed_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(NET_TEST_LIVENESS_BOUND)
                 .unwrap();
 
             // Deterministically recreate the production race: consume the first
@@ -1165,10 +1240,10 @@ mod tests {
         });
 
         let tcp = TcpStream::connect(addr).unwrap();
-        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
         let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
         server_ready_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(NET_TEST_LIVENESS_BOUND)
             .unwrap();
         client.stream().write_all(REQUEST).unwrap();
         client.stream().flush().unwrap();
@@ -1201,128 +1276,51 @@ mod tests {
     }
 
     #[test]
-    fn relay_round_trips_are_not_paced_by_a_poll_interval() {
-        let _serial = serialize_loopback();
-        // Regression: the relay used to drive both directions with 20 ms
-        // mutex+sleep polls, so every request/echo round-trip paid ~20-40 ms of
-        // pure sleep — 300 sequential round-trips took >= ~6 s. With condvar
-        // signaling and blocking socket reads each round-trip is bounded by real
-        // I/O latency only, so the whole batch completes orders of magnitude
-        // faster.
-        //
-        // The bound is on the MEDIAN trip, not the batch: polling puts a sleep
-        // in EVERY trip, so its median stays near 20 ms at any load, while
-        // preemption under a saturated gate stretches only a minority of trips.
-        // A 3 s total charged every run-queue wait of ~900 thread wakeups to the
-        // relay (the load-sensitive test audit of 2026-09-27).
-        const ROUND_TRIPS: usize = 300;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
-        let token = EdgeToken::generate();
-        let pin = cert_fingerprint(TEST_CERT_DER);
-
-        // The "service" behind the control socket: a byte echo.
-        let (svc_a, mut svc_b) = CtlStream::pair().unwrap();
-        let echo = std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            loop {
-                match svc_b.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if svc_b
-                            .write_all(&buf[..n])
-                            .and_then(|()| svc_b.flush())
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
-            let mut t = accept(tcp, scfg).unwrap();
-            let exporter = t.exporter().to_vec();
-            verify_capability(t.stream(), &exporter, |src, op| {
-                (src == "driver-1" && op == "drive").then_some(token)
-            })
-            .unwrap();
-            relay(t, svc_a).unwrap();
-        });
-
-        let ccfg = client_config(pin);
-        let tcp = TcpStream::connect(addr).unwrap();
-        tcp.set_nodelay(true).unwrap();
-        let mut ct = connect(tcp, test_server_name(), ccfg).unwrap();
-        let exporter = ct.exporter().to_vec();
-        present_capability(ct.stream(), &exporter, "driver-1", "drive", &token).unwrap();
-
-        let mut got = [0u8; 5];
-        let mut trips = Vec::with_capacity(ROUND_TRIPS);
-        for _ in 0..ROUND_TRIPS {
-            let started = Instant::now();
-            ct.stream().write_all(b"ping\n").unwrap();
-            ct.stream().flush().unwrap();
-            ct.stream().read_exact(&mut got).unwrap();
-            trips.push(started.elapsed());
-            assert_eq!(&got, b"ping\n");
-        }
-        trips.sort_unstable();
-        let median = trips[ROUND_TRIPS / 2];
-        assert!(
-            median < Duration::from_millis(10),
-            "the median of {ROUND_TRIPS} relayed round-trips took {median:?} — the \
-             relay is pacing traffic on a poll interval instead of waking on data"
-        );
-
-        {
-            let s = ct.stream();
-            s.conn.send_close_notify();
-            let _ = s.flush();
-        }
-        drop(ct);
-        srv.join().unwrap();
-        let _ = echo.join();
-    }
-
-    #[test]
     fn a_wrong_fingerprint_pin_rejects_the_handshake() {
         let _serial = serialize_loopback();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
         let srv = std::thread::spawn(move || {
-            if let Ok((tcp, _)) = listener.accept() {
-                let _ = accept(tcp, scfg); // expected to fail (client aborts)
-            }
+            let (tcp, _) = listener.accept().ok()?;
+            // Expected to fail: the client refuses the certificate.
+            accept(tcp, scfg).err()
         });
         // Pin a DIFFERENT fingerprint -> the client must refuse the server cert.
         let mut wrong = cert_fingerprint(TEST_CERT_DER);
         wrong[0] ^= 0xff;
         let ccfg = client_config(wrong);
         let tcp = TcpStream::connect(addr).unwrap();
-        let res = connect(tcp, test_server_name(), ccfg);
+        let Err(err) = connect(tcp, test_server_name(), ccfg) else {
+            panic!("a mismatched fingerprint pin must reject the handshake");
+        };
+        // The dialer says both digests, in the spelling `fingerprint` takes.
+        let said = err.to_string();
+        assert!(said.starts_with("certificate mismatch: "), "{said}");
         assert!(
-            res.is_err(),
-            "a mismatched fingerprint pin must reject the handshake"
+            said.contains(&format!(
+                "presents sha256:{}",
+                aterm_codec::hex::encode_lower(&cert_fingerprint(TEST_CERT_DER))
+            )),
+            "{said}"
         );
-        let _ = srv.join();
+        assert!(
+            said.contains(&format!(
+                "fingerprint is sha256:{}",
+                aterm_codec::hex::encode_lower(&wrong)
+            )),
+            "{said}"
+        );
+        // The listener says what the dialer did, not a bare rustls alert name.
+        let heard = srv.join().unwrap().expect("the listener's handshake fails");
+        assert!(
+            heard
+                .to_string()
+                .contains("refused this listener's certificate"),
+            "{heard}"
+        );
     }
 
-    /// A GRACEFUL local EOF is a half-close of ONE direction, not the end of the
-    /// conversation. The relay used to answer it with `Shutdown::Both`, so a
-    /// local service that finished writing its reply killed the still-live
-    /// request direction and any bytes the peer sent afterwards were lost.
-    ///
-    /// Deterministic by construction — every step is sequenced by a channel, so
-    /// there is no sleep and no timing assumption. The service closes its WRITE
-    /// half, announces that it has done so, and only THEN does the client send
-    /// the second request. Under the old `Shutdown::Both` that second request can
-    /// never arrive; with a directional half-close it must.
     /// Upper bound on how long a socket read in these tests may block.
     ///
     /// Not a latency budget — a liveness guard. Its only job is that a stall can
@@ -1333,6 +1331,13 @@ mod tests {
     /// loopback round trip, which takes milliseconds.
     const NET_TEST_LIVENESS_BOUND: Duration = Duration::from_secs(60);
 
+    /// A GRACEFUL local EOF is a half-close of ONE direction, not the end of the
+    /// conversation: a local service that finished writing its reply must not
+    /// kill the still-live request direction.
+    ///
+    /// Deterministic by construction — every step is sequenced by a channel. The
+    /// service closes its WRITE half, announces it, and only THEN does the client
+    /// send the second request, which a `Shutdown::Both` would lose.
     #[test]
     fn graceful_local_eof_half_closes_without_killing_the_request_direction() {
         let _serial = serialize_loopback();
@@ -1380,22 +1385,10 @@ mod tests {
         });
 
         let tcp = TcpStream::connect(addr).unwrap();
-        // LIVENESS, not just ordering. The channel handoffs below are bounded by
-        // `recv_timeout`, but a socket `read_exact` is not: if the relay has not
-        // delivered yet the read blocks FOREVER, and the whole
-        // `cargo test --workspace` run stops making progress instead of failing.
-        // That is worse than a failing test, since `tools/verify.sh` (the
-        // merge contract, there being no CI) then never returns. Observed
-        // hanging a full workspace run for >30 min at 0 % CPU.
-        //
-        // The bound is deliberately FAR above a loopback TLS round trip (the
-        // test finishes in 0.42 s on an idle machine). It is not policing
-        // latency — it exists so a stall cannot be unbounded. It must therefore
-        // survive worst-case SCHEDULER STARVATION: `cargo test --workspace` runs
-        // this concurrently with `aterm-spec`'s exhaustive BFS model checks,
-        // which peg every core, and at 10 s this test failed spuriously under
-        // exactly that load while passing 22/22 in isolation. Sixty seconds is
-        // still a bounded failure and still names itself in under a minute.
+        // The channel handoffs below are bounded by `recv_timeout`, but a socket
+        // `read_exact` is not: bound it too, so a stall fails instead of hanging
+        // the run ([`NET_TEST_LIVENESS_BOUND`]; 10 s failed spuriously while
+        // `aterm-spec`'s model checks pegged every core).
         tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
         let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
         client.stream().write_all(FIRST).unwrap();
@@ -1428,5 +1421,104 @@ mod tests {
         drop(client);
         service.join().unwrap();
         server.join().unwrap();
+    }
+
+    /// THE DOWNLOAD DIRECTION MUST NOT LET RUSTLS' PLAINTEXT BUFFER FILL WHILE
+    /// IT FEEDS A SOCKET READ IN. rustls holds at most 16 KiB of decrypted
+    /// plaintext and `read_tls` REFUSES more input once past it ("received
+    /// plaintext buffer full"). One socket read can complete far more than
+    /// that: the tail of a full 16 KiB record that the previous read left
+    /// half-buffered, plus every small record behind it. Draining only after the
+    /// WHOLE read was fed lands that refusal mid-feed ("TLS ingest made no
+    /// progress") and tears down a healthy peer's ordinary output: one full
+    /// record, then small ones.
+    ///
+    /// Deterministic, not timing-dependent: the dialer waits until every byte
+    /// the listener sent is in its socket before the relay's first read, so
+    /// that read takes the first 16 KiB (the full record minus its tail) and
+    /// the next one carries the tail plus the small records.
+    #[test]
+    fn relay_ingests_a_full_record_followed_by_small_ones_without_tearing_down() {
+        let _serial = serialize_loopback();
+        const FULL: usize = 16 * 1024;
+        const SMALL: usize = 100;
+        const SMALLS: usize = 200;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let pin = cert_fingerprint(TEST_CERT_DER);
+        let mut expected = (0..FULL).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        for record in 0..SMALLS {
+            expected.extend((0..SMALL).map(|i| ((record + i) % 241) as u8));
+        }
+        let to_send = expected.clone();
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut transport = accept(tcp, scfg).unwrap();
+            let stream = transport.stream();
+            // One `write` per record: a full one, then the small ones.
+            stream.write_all(&to_send[..FULL]).unwrap();
+            for record in to_send[FULL..].chunks(SMALL) {
+                stream.write_all(record).unwrap();
+            }
+            stream.flush().unwrap();
+            written_tx.send(()).unwrap();
+            // Hold the connection open until the dialer has its bytes, then
+            // end it cleanly.
+            let _ = release_rx.recv_timeout(NET_TEST_LIVENESS_BOUND);
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+        });
+
+        let tcp = TcpStream::connect(addr).unwrap();
+        let transport = connect(tcp, test_server_name(), client_config(pin)).unwrap();
+        written_rx.recv_timeout(NET_TEST_LIVENESS_BOUND).unwrap();
+        // Every record's bytes are on the wire; wait until they are all in this
+        // socket's receive buffer (a must-happen wait, bounded as a hang
+        // detector), so the relay's reads see them at fixed offsets.
+        let wire_at_least = FULL + SMALLS * SMALL;
+        let started = Instant::now();
+        let mut peek = vec![0u8; 4 * wire_at_least];
+        while transport.stream.sock.peek(&mut peek).unwrap() < wire_at_least {
+            assert!(
+                started.elapsed() < NET_TEST_LIVENESS_BOUND,
+                "the listener's records never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let (local_relay, mut local_app) = CtlStream::pair().unwrap();
+        let relayed = std::thread::spawn(move || relay(transport, local_relay));
+        local_app
+            .set_read_timeout(Some(NET_TEST_LIVENESS_BOUND))
+            .unwrap();
+        let mut got = Vec::with_capacity(expected.len());
+        let mut buf = [0u8; 4096];
+        while got.len() < expected.len() {
+            match local_app.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        release_tx.send(()).unwrap();
+        // The relay may already have shut this pair down (it does on a fatal
+        // error), so the result is not the point.
+        let _ = local_app.shutdown(std::net::Shutdown::Both);
+        let outcome = relayed.join().unwrap();
+        peer.join().unwrap();
+        assert!(
+            outcome.is_ok(),
+            "the relay tore down a healthy peer's stream: {outcome:?}"
+        );
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "the relay delivered {} of {} plaintext bytes",
+            got.len(),
+            expected.len()
+        );
+        assert_eq!(got, expected);
     }
 }

@@ -1,66 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The IN-GRID TAB CONTEXT MENU: the popup a right-click on an in-grid tab chip
-//! drops, painted as terminal cells over the frame the way every other piece of
-//! this app's own chrome is (the strip, the find bar, the config banner).
+//! The in-grid tab context menu: the popup a right-click on an in-grid tab chip opens,
+//! painted as terminal cells over the frame like the rest of aterm's chrome (strip,
+//! find bar, config banner).
 //!
-//! # Why this exists at all
-//!
-//! [`crate::session_chrome::compose_tab_menu`] has shipped a complete,
-//! unit-proved context-menu MODEL for every terminal tab since session-metadata
-//! stage 2 — identity headers, the timeline tail, then `Rename Session…` /
-//! `Copy Session ID` / `Copy CWD` / `Close Tab`. macOS renders it as a real
-//! `NSMenu` off the strip's `TabView`; off macOS the model was composed, stored
-//! on the toolbar handle, serialised by the `chrome` verb — and never shown to a
-//! human. A right-click on a Windows tab did NOTHING. This module is the missing
-//! renderer, so the same one model finally reaches the same glass on both
-//! platforms.
+//! It renders [`crate::session_chrome::compose_tab_menu`]'s model (identity headers,
+//! the timeline tail, then `Rename Session…` / `Copy Session ID` / `Copy CWD` /
+//! `Close Tab`) off macOS; macOS renders the same model as an `NSMenu` off the strip's
+//! `TabView`.
 //!
 //! # Why cells and not `TrackPopupMenu`
 //!
-//! The obvious Windows answer is a real `HMENU` + `TrackPopupMenu`: native look,
-//! native keyboard and accessibility, no painting at all. It was rejected, and
-//! the reason is mechanical rather than aesthetic:
+//! * `TrackPopupMenu` runs its own modal message loop, and every call site is inside
+//!   winit's event callback. The vendored runner takes the handler out of a `Cell`
+//!   during dispatch and routes `RedrawRequested` unbuffered to `call_event_handler`,
+//!   which panics on re-entry
+//!   (`vendor/winit/src/platform_impl/windows/event_loop/runner.rs`), so the
+//!   `WM_PAINT` after a popup would kill the app. (`drag_window()` is safe because
+//!   winit posts `WM_NCLBUTTONDOWN` and returns first; a popup at the pointer has no
+//!   equally cheap deferral point.)
+//! * No `HMENU` FFI exists in `crates/`, and adding one for one gesture is a new
+//!   surface.
+//! * The top half is a session identity card (emoji icon, description, relative-age
+//!   timeline), which reads as a broken menu when rendered as disabled system rows.
+//! * Everything around it (band, chip, `✕`, `+`) is themed cells; a system-tinted
+//!   popup would be the one visible seam.
 //!
-//! * `TrackPopupMenu` runs its OWN modal message loop. Every call site we have
-//!   is INSIDE winit's event callback (`on_mouse_input` / `on_key`), and the
-//!   vendored runner takes the handler out of a `Cell` for the duration of a
-//!   dispatch — `send_event` then routes `RedrawRequested` to
-//!   `call_event_handler` with NO buffering, whose `.expect("either event
-//!   handler is re-entrant (likely) …")` is a hard panic
-//!   (`vendor/winit/src/platform_impl/windows/event_loop/runner.rs`). A menu
-//!   pops a top-level window over ours; the `WM_PAINT` that follows would kill
-//!   the app. The existing `drag_window()` precedent is not a counter-example:
-//!   winit POSTS `WM_NCLBUTTONDOWN` and returns, so DefWindowProc's modal loop
-//!   starts after our handler has already unwound. There is no equally cheap
-//!   deferral point for a popup that must appear at the pointer, on the press.
-//! * Nothing in `crates/` speaks `HMENU` today, so this would also be a brand-new
-//!   FFI surface (`CreatePopupMenu`/`AppendMenuW`/`TrackPopupMenu`/`DestroyMenu`
-//!   plus `ClientToScreen` and an owner-window handle) for one gesture.
-//! * The menu's own content argues against it too: the top half is a session
-//!   IDENTITY card (emoji icon, an authored description, a relative-age timeline
-//!   tail). As `MFT_STRING | MFS_DISABLED` rows in a system menu that reads as a
-//!   broken menu; as a themed card it reads as what it is.
-//! * Everything the user is right-clicking — the band, the chip, its `✕`, the
-//!   `+` — is already OUR pixels in OUR theme (`theme is the source of identity`,
-//!   `native_appearance.rs`). A system-tinted popup hanging off a themed chip is
-//!   the one place the seam would show.
-//!
-//! What that costs us is honest and worth stating: no OS-level keyboard menu
-//! semantics for free (we implement Esc/arrows/Enter ourselves, below), and no
-//! UI-Automation menu role (the popup is grid cells; a screen reader sees the
-//! cells, not a `menu`). Accessibility parity would need the AccessKit tree to
-//! grow a node for this surface, which is deliberately left for the a11y lane
-//! rather than half-done here.
+//! Costs: Esc/arrows/Enter are implemented here, and there is no UI-Automation menu
+//! role (a screen reader sees cells); accessibility parity needs an AccessKit node.
 //!
 //! # Shape
 //!
-//! PURE by construction — geometry, hit-testing, keyboard stepping and the cell
-//! paint are all free functions over the model, so the hit-test ↔ paint ↔
-//! dispatch chain is unit-proved headlessly on every platform. The impure half
-//! (opening from a press, blitting into `input_scratch`, posting the chosen
-//! action) lives in `app_mouse.rs` / `app_render.rs` / `app_tabs.rs`.
+//! Geometry, hit-testing, keyboard stepping and cell paint are pure functions over
+//! the model, so the hit-test ↔ paint ↔ dispatch chain is unit-tested headlessly.
+//! Opening from a press, blitting into `input_scratch` and posting the chosen action
+//! live in `app_mouse.rs` / `app_render.rs` / `app_tabs.rs`.
 
 use aterm_core::terminal::RenderCell;
 use aterm_render::Theme;
@@ -74,55 +49,42 @@ const H_PAD: usize = 1;
 /// Narrowest the card may be, in CONTENT cells — a menu whose rows read
 /// `Copy…`/`Close…` is worse than one that runs a little wide.
 const MIN_CONTENT: usize = 16;
-/// Widest the card may be, in CONTENT cells. The identity header carries a
-/// user-authored description capped at 160 GRAPHEMES upstream
-/// ([`crate::session_chrome::DESCRIPTION_DISPLAY_MAX`]); a menu that grows to
-/// fit it would be a paragraph with a border. Headers ellipsize to this.
+/// Widest the card may be, in content cells. Headers (whose description can reach
+/// [`crate::session_chrome::DESCRIPTION_DISPLAY_MAX`] graphemes) ellipsize to this.
 const MAX_CONTENT: usize = 44;
 
-/// One OPEN tab context menu on one window.
+/// One open tab context menu on one window.
 ///
-/// `tab` is the STABLE [`TabId`] captured when the menu popped — never the
-/// index — for exactly the reason `Wake::TabMenuAction` documents: the menu can
-/// outlive a background exit or a control-socket `tab move`, and acting on
-/// "whatever sits in slot 3 now" would copy from, or close, a different live
-/// session. `index` is kept ALONGSIDE it purely as the paint anchor (which chip
-/// the card hangs under) and is allowed to go stale; every ACTION re-resolves
-/// through `tab`.
+/// `tab` is the stable [`TabId`] captured at pop time, never the index (see
+/// `Wake::TabMenuAction`): the menu can outlive a background exit or a control-socket
+/// `tab move`, and acting on "slot 3 now" would hit a different session. `index` is
+/// only the paint anchor (which chip the card hangs under) and may go stale; every
+/// action re-resolves through `tab`.
 pub(crate) struct TabMenu {
     /// The stable identity of the right-clicked tab — the dispatch subject.
     pub tab: TabId,
     /// The tab's position when the menu popped: the paint anchor only.
     pub index: usize,
-    /// The composed model, snapshotted at pop time. Snapshotted rather than
-    /// recomposed per frame because the card must not reflow (or re-order!)
-    /// under the pointer while a human is aiming at a row; the ACTIONS resolve
-    /// their payloads fresh at dispatch, so a long-open menu still copies the
-    /// current truth.
+    /// The composed model, snapshotted at pop time so the card never reflows under
+    /// the pointer; actions resolve their payloads fresh at dispatch.
     pub entries: Vec<TabMenuEntry>,
     /// The strip COLUMN the press landed on — the card's left edge wants to sit
     /// here, before clamping.
     pub anchor_col: u16,
-    /// The highlighted row (an index into `entries`), or `None` when the
-    /// pointer is off every action row. Seeded to the first enabled action when
-    /// the menu was opened from the KEYBOARD, and left `None` for a mouse open
-    /// (a menu that pops with a row pre-lit under a pointer that has not moved
-    /// yet invites a mis-click on Enter).
+    /// The highlighted row (index into `entries`), or `None` when the pointer is off
+    /// every action row. A keyboard open seeds the first enabled action; a mouse open
+    /// leaves `None` so Enter cannot hit a row the pointer never chose.
     pub highlight: Option<usize>,
-    /// Whether the highlight currently belongs to the KEYBOARD — set when
-    /// Shift+F10 / the Menu key opened the card (seeding the rule above), and
-    /// cleared the moment the pointer enters a row. While it is set, pointer
-    /// motion OFF the card leaves the highlight alone: a hand brushing the mouse
-    /// must not silently unselect the row a keyboard user is about to press ↵ on.
+    /// Whether the keyboard owns the highlight: set by a Shift+F10 / Menu key open,
+    /// cleared when the pointer enters a row. While set, pointer motion off the card
+    /// leaves the highlight alone.
     pub keyboard: bool,
 }
 
 impl TabMenu {
-    /// `controls tab-menu` (design §2.1 [v5]): the OPEN card's rows and cursor.
-    /// Item text is VERBATIM the `chrome` verb's per-tab mirror
-    /// ([`crate::session_chrome::menu_entry_mirror`]) so the two introspection
-    /// surfaces can never describe one menu differently — the same discipline
-    /// the palette's `controls menu` lines follow.
+    /// `controls tab-menu`: the open card's rows and cursor. Item text is the `chrome`
+    /// verb's per-tab mirror ([`crate::session_chrome::menu_entry_mirror`]) verbatim, so
+    /// both introspection surfaces describe the menu identically.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.entries.len() + 1);
         out.push(format!(
@@ -144,10 +106,9 @@ impl TabMenu {
     }
 }
 
-/// Where the card actually landed, in FRAME cell coordinates (the same axis the
-/// tab-strip splice works in: row 0 is the strip's first row). Recorded by the
-/// painter and read by the hit-test, so the two can never disagree about where
-/// the menu is — the rule `find_bar_hit` already follows.
+/// Where the card landed, in frame cell coordinates (row 0 is the strip's first row).
+/// Recorded by the painter and read by the hit-test so both agree, as with
+/// `find_bar_hit`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct MenuRect {
     pub row: usize,
@@ -157,20 +118,17 @@ pub(crate) struct MenuRect {
 }
 
 impl MenuRect {
-    /// Whether frame cell `(row, col)` is anywhere on the card — border
-    /// included. The card is modal-ish, so a press on its BORDER must be
-    /// swallowed, not fall through to the terminal underneath.
+    /// Whether frame cell `(row, col)` is on the card, border included; a press on the
+    /// border is swallowed, not passed to the terminal.
     #[must_use]
     pub(crate) fn contains(&self, row: usize, col: usize) -> bool {
         row >= self.row && row < self.row + self.h && col >= self.col && col < self.col + self.w
     }
 }
 
-/// Display cells one projected char occupies. Same table the terminal grid and
-/// the strip classify with ([`aterm_grapheme::char_width`]), clamped to one so a
-/// combining mark still owns a cell — the strip's rule, restated here because
-/// its helper is private and a second width policy is how two chrome surfaces
-/// drift apart.
+/// Display cells one char occupies, per [`aterm_grapheme::char_width`] clamped to at
+/// least one so a combining mark owns a cell (the strip's rule, restated because its
+/// helper is private).
 fn char_cells(c: char) -> usize {
     aterm_grapheme::char_width(c).max(1) as usize
 }
@@ -224,10 +182,8 @@ fn entry_text(entry: &TabMenuEntry) -> &str {
     }
 }
 
-/// Whether this entry is a row a click / Enter can ACTIVATE. Headers and
-/// separators are inert; a DISABLED action is inert too — it stays visible (a
-/// stable menu shape is learnable, `compose_tab_menu`'s stated rule) but is not
-/// selectable, exactly like a greyed `NSMenuItem`.
+/// Whether a click / Enter can activate this entry. Headers, separators and disabled
+/// actions are inert; disabled actions stay visible so the menu keeps its shape.
 #[must_use]
 pub(crate) fn is_selectable(entry: &TabMenuEntry) -> bool {
     matches!(
@@ -250,23 +206,18 @@ pub(crate) fn content_width(entries: &[TabMenuEntry]) -> usize {
         .clamp(MIN_CONTENT, MAX_CONTENT)
 }
 
-/// Place the card in FRAME cell coordinates.
+/// Place the card in frame cell coordinates.
 ///
-/// * `anchor_col` — the strip column the press landed on; the card's left edge
-///   starts there, so the menu hangs off the chip the user aimed at.
-/// * `strip_rows` — how many chrome rows the strip prepended; the card starts
-///   immediately below the band (Windows drops a tab menu under the tab, and it
-///   keeps the card off the band it was launched from).
-/// * `cols` / `frame_rows` — the composed frame's extent.
+/// * `anchor_col`: the strip column pressed; the card's left edge starts there.
+/// * `strip_rows`: chrome rows the strip prepended; the card starts right below.
+/// * `cols` / `frame_rows`: the composed frame's extent.
 ///
-/// Returns `None` when the frame simply cannot host a card (a window narrower
-/// than a border pair, or with no room below the strip) — the caller then
-/// declines to open rather than painting a sliver.
+/// Returns `None` when the frame cannot host a card (narrower than a border pair, or
+/// no room below the strip), and the caller does not open.
 ///
-/// The clamping rule is "prefer to stay whole": the card shifts LEFT to fit the
-/// right edge before it is allowed to shrink, and it shrinks only when even the
-/// flush-left placement overflows. Vertically it TRUNCATES rather than flipping
-/// above the strip — there is nothing above the strip but the strip.
+/// The card shifts left to fit the right edge before it shrinks, and shrinks only
+/// when even flush-left overflows. Vertically it truncates rather than flipping
+/// above the strip.
 #[must_use]
 pub(crate) fn place(
     entries: &[TabMenuEntry],
@@ -297,24 +248,19 @@ pub(crate) fn place(
     })
 }
 
-/// How many ENTRY rows the card at `rect` actually shows (its height minus the
-/// two border rows). A card the frame truncated shows a prefix of the model —
-/// the identity headers come first, so a short window keeps the identity and
-/// loses the tail, which is the wrong end to lose; see the note in
-/// [`entry_at_row`] for why it is still preferable to a scroller.
+/// Entry rows the card at `rect` shows (height minus two border rows). A truncated
+/// card shows a prefix of the model; see [`entry_at_row`] on why there is no scroller.
 #[must_use]
 pub(crate) fn visible_entries(rect: MenuRect) -> usize {
     rect.h.saturating_sub(2)
 }
 
-/// Which model entry frame `row` shows, or `None` for the border rows / a row
-/// past the truncation. Pure inverse of the painter's row walk.
+/// Which model entry frame `row` shows, or `None` for border rows and rows past the
+/// truncation. Inverse of the painter's row walk.
 ///
-/// There is deliberately NO scrolling: a context menu that scrolls is a list
-/// box. The model is bounded by construction (identity ≤ 4 lines, timeline ≤
-/// [`crate::session_chrome::TIMELINE_TAIL`], four actions), so the only way to
-/// truncate is a genuinely tiny window — where the right answer is fewer rows,
-/// not a scrollbar in a popup.
+/// No scrolling: the model is bounded (identity ≤ 4 lines, timeline ≤
+/// [`crate::session_chrome::TIMELINE_TAIL`], four actions), so truncation only happens
+/// in a tiny window, where fewer rows beat a scrollbar.
 #[must_use]
 pub(crate) fn entry_at_row(rect: MenuRect, row: usize) -> Option<usize> {
     if row <= rect.row || row + 1 >= rect.row + rect.h {
@@ -324,10 +270,9 @@ pub(crate) fn entry_at_row(rect: MenuRect, row: usize) -> Option<usize> {
     (i < visible_entries(rect)).then_some(i)
 }
 
-/// The entry a click at frame `(row, col)` activates: `Some(i)` only when the
-/// point is on a VISIBLE, SELECTABLE row of this card. Off the card, on a
-/// border, on a header/separator, or on a disabled action ⇒ `None` (the caller
-/// still swallows the press — see `MenuRect::contains`).
+/// The entry a click at frame `(row, col)` activates: `Some(i)` only on a visible,
+/// selectable row. Otherwise `None` (the caller still swallows presses on the card;
+/// see `MenuRect::contains`).
 #[must_use]
 pub(crate) fn action_at(
     rect: MenuRect,
@@ -348,11 +293,9 @@ pub(crate) fn first_selectable(entries: &[TabMenuEntry], limit: usize) -> Option
     entries.iter().take(limit).position(is_selectable)
 }
 
-/// Step the highlight one selectable row in `down`'s direction, WRAPPING at the
-/// ends (the menu convention everywhere, and the only sane behaviour for a
-/// four-item list). `from = None` enters at the first (or last) selectable row.
-/// `limit` is [`visible_entries`] — a truncated card never highlights a row it
-/// is not showing.
+/// Step the highlight one selectable row in `down`'s direction, wrapping at the
+/// ends. `from = None` enters at the first (or last) selectable row. `limit` is
+/// [`visible_entries`], so a truncated card never highlights a hidden row.
 #[must_use]
 pub(crate) fn step_selectable(
     entries: &[TabMenuEntry],
@@ -382,23 +325,17 @@ pub(crate) fn step_selectable(
     })
 }
 
-/// What one key press MEANS to an open card — the Win32 menu bindings, as a
-/// decision no route owns privately.
+/// What one key press means to an open card (the Win32 menu bindings).
 ///
-/// It exists because the card is driven from TWO places that must never
-/// disagree: the physical winit route (`App::on_key_tab_menu_mode`) and the
-/// engine-neutral convergence seam (`App::tab_menu_input_event`, where
-/// `aterm ctl key …` arrives). A controller and a hand pressing the same key
-/// have to move the same highlight, or the introspection mirror stops being a
-/// mirror.
+/// Shared by the winit route (`App::on_key_tab_menu_mode`) and the engine-neutral
+/// seam (`App::tab_menu_input_event`, where `aterm ctl key …` arrives) so a
+/// controller and a hand move the same highlight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuNav {
     /// ↵ / Space — run the highlighted row (or dismiss when nothing is lit).
     Activate,
-    /// Esc, and every key with no menu meaning: dismiss AND swallow. A menu is a
-    /// mode, so an unhandled keystroke must not both close the card and land in
-    /// the shell underneath. (Win32 spends those keys on mnemonics; we have no
-    /// mnemonic model, so the safe reading of an unknown key is "dismiss".)
+    /// Esc and every key with no menu meaning: dismiss and swallow, so a keystroke
+    /// never both closes the card and reaches the shell (there are no mnemonics).
     Dismiss,
     /// ↓ — step the highlight forward over enabled rows, wrapping.
     Down,
@@ -408,19 +345,15 @@ pub(crate) enum MenuNav {
     First,
     /// End — jump to the last enabled row.
     Last,
-    /// A bare MODIFIER or LOCK press: swallowed and otherwise IGNORED, card
-    /// stays. No Win32 menu closes because you rested a finger on Shift, and
-    /// reaching Shift+F10 to re-pop the card would otherwise dismiss it on the
-    /// Shift half of the very chord that opened it. The same key class
-    /// `is_bare_modifier_key` protects the rename field from, for the same
-    /// reason.
+    /// A bare modifier or lock press: swallowed, card stays. Otherwise the Shift half
+    /// of Shift+F10 would dismiss the card it re-opens (the same class
+    /// `is_bare_modifier_key` guards the rename field from).
     Inert,
 }
 
-/// The menu meaning of an ENGINE key. See [`MenuNav`].
+/// The menu meaning of an engine key. See [`MenuNav`].
 ///
-/// Numpad spellings are folded onto their navigation twins: a card driven from
-/// the number pad with NumLock off must step, not dismiss.
+/// Numpad keys fold onto their navigation twins, so a NumLock-off keypad steps.
 #[must_use]
 pub(crate) fn nav_for_key(key: &aterm_types::keyboard::Key) -> MenuNav {
     use aterm_types::keyboard::{Key, NamedKey as Nk};
@@ -440,11 +373,9 @@ pub(crate) fn nav_for_key(key: &aterm_types::keyboard::Key) -> MenuNav {
     }
 }
 
-/// The card's paint tones. Derived from the SAME `chrome_band::band_colors` the
-/// find bar / config banner / native backing rows use, so the popup is
-/// recognisably the same chrome family — but one shade further from the terminal
-/// background, because unlike those bands this card FLOATS over live output and
-/// has to read as lifted off it rather than spliced into it.
+/// The card's paint tones, derived from `chrome_band::band_colors` like the find bar
+/// and config banner, one shade further from the terminal background because the
+/// card floats over live output.
 struct MenuColors {
     band: BandColors,
     /// The card ground: the band tone pushed further from the terminal bg.
@@ -454,9 +385,7 @@ struct MenuColors {
     /// The highlighted row's ground + ink.
     sel_bg: [u8; 3],
     sel_fg: [u8; 3],
-    /// A DISABLED action's ink: dimmer than a header, because a header is
-    /// information and a greyed action is a promise the app is not keeping
-    /// right now.
+    /// A disabled action's ink, dimmer than a header.
     disabled: [u8; 3],
 }
 
@@ -480,9 +409,8 @@ fn menu_colors(theme: Theme) -> MenuColors {
         rule,
         sel_fg: chrome_band::ensure_contrast(value, sel_bg, 4.5),
         sel_bg,
-        // Held to 3:1 rather than 4.5:1 ON PURPOSE — a disabled row must read as
-        // unavailable, and AA-strength ink does not. 3:1 is the WCAG
-        // non-text/large floor, so it stays perceivable rather than vanishing.
+        // 3:1 (the WCAG non-text floor), not 4.5:1: a disabled row must read as
+        // unavailable yet stay perceivable.
         disabled: chrome_band::ensure_contrast(label, card_bg, 3.0),
         band: BandColors {
             label,
@@ -492,10 +420,9 @@ fn menu_colors(theme: Theme) -> MenuColors {
     }
 }
 
-/// Write `s` into `row` starting at `col`, stopping before `end`, emitting a
-/// real lead + continuation pair for width-2 chars (the strip's contract — a
-/// wide glyph that would straddle `end` is dropped whole rather than painting
-/// half a glyph over the border).
+/// Write `s` into `row` from `col`, stopping before `end`, emitting lead +
+/// continuation pairs for width-2 chars; a wide glyph that would straddle `end` is
+/// dropped whole.
 fn put_text(
     row: &mut [RenderCell],
     mut col: usize,
@@ -524,13 +451,11 @@ fn put_text(
     }
 }
 
-/// Paint the card: exactly `rect.h` rows of exactly `rect.w` cells, ready for
-/// the splice to blit at `(rect.row, rect.col)`.
+/// Paint the card: exactly `rect.h` rows of `rect.w` cells for the splice to blit at
+/// `(rect.row, rect.col)`.
 ///
-/// Box-drawing rules rather than a bare tinted block: this card floats over
-/// arbitrary terminal output, and a borderless tint is indistinguishable from a
-/// program's own colour run. `┌─┐│└┘├┤` are single-width in every width table we
-/// classify with, so the border costs exactly one cell a side.
+/// Box-drawing borders (`┌─┐│└┘├┤`, single-width in every width table used) keep the
+/// card distinct from a program's own colour runs.
 #[must_use]
 pub(crate) fn paint(
     rect: MenuRect,
@@ -602,31 +527,16 @@ pub(crate) fn paint(
     rows
 }
 
-/// A cell that renders as bare terminal ground — what the renderer already
-/// draws for a column a row does not materialize.
+/// A cell that renders as bare terminal ground, as the renderer draws columns a row
+/// does not materialize.
 ///
-/// This is NOT decoration: the engine TRIMS trailing blanks, so a blank
-/// terminal row arrives from `cell_frame_into` as a ZERO-LENGTH `Vec` and the
-/// renderer fills it from the frame's default background. A popup landing on a
-/// blank row (i.e. most of a fresh shell's screen) therefore has no cells to
-/// write into. The splice pads the row up to the card's right edge with this
-/// before writing, which reproduces exactly the pixels that were already there.
+/// The engine trims trailing blanks, so a blank row arrives from `cell_frame_into` as
+/// an empty `Vec`. The splice pads rows up to the card's right edge with this before
+/// writing, reproducing the pixels already there.
 ///
-/// `default_bg` is the frame's live OSC-11 background, or `COLOR_UNSET` when
-/// the program has not set one — in which case the theme's own background is
-/// what the renderer would have used. On a SPLIT the per-pane
-/// `default_bg_spans` could differ from this value (the frame carries ONE
-/// such background, panes notwithstanding); the pad is
-/// then off by the pane's own OSC 11, on cells the card is about to overwrite
-/// anyway except at the very edge. Reading the span set here would couple this
-/// splice to the composite's pane partition for a one-column effect.
-///
-/// scope-waiver: the phrase describes the scope of the CALLER'S `default_bg`
-/// argument — the one window-wide scalar this fn is handed — and does so in
-/// order to say it is the WRONG scope on a split, which is the opposite of
-/// claiming window-wide authority for anything declared here. `ground_cell` is
-/// a pure `(Theme, u32) -> RenderCell` mapping: it owns no state, enforces no
-/// budget, and no instance count of it can be wrong.
+/// `default_bg` is the frame's OSC-11 background, or `COLOR_UNSET` to use the theme's.
+/// On a split, a pane's own `default_bg_spans` value can differ; the pad is then off
+/// only on cells the card overwrites, except at the very edge.
 #[must_use]
 pub(crate) fn ground_cell(theme: Theme, default_bg: u32) -> RenderCell {
     let unpack = |c: u32| {
@@ -644,13 +554,9 @@ pub(crate) fn ground_cell(theme: Theme, default_bg: u32) -> RenderCell {
     chrome_band::cell(' ', unpack(theme.fg), unpack(bg), false, false)
 }
 
-/// The repaint fingerprint of an open menu — `0` when nothing is open, so the
-/// `RepaintKey` term is byte-identical to the pre-menu path while closed (the
-/// idle invariant every other `*_fp` term in that key holds to).
-///
-/// It must move on OPEN, on CLOSE, and on every highlight step: none of those
-/// dirty a terminal cell, so without this the settled-screen early-out would
-/// swallow the frame that draws the card and the frame that erases it.
+/// Repaint fingerprint of an open menu; `0` when closed so the `RepaintKey` term is
+/// idle. It moves on open, close and every highlight step, none of which dirty a
+/// terminal cell, so the settled-screen early-out cannot swallow those frames.
 #[must_use]
 pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -788,9 +694,8 @@ mod tests {
         assert_eq!(place(&[], 0, 100, 30, 1), None, "an empty model is no menu");
     }
 
-    /// The whole point of the bundle: a click at a pixel-derived cell resolves
-    /// through the SAME rect the painter used to the SAME model entry, and that
-    /// entry carries the action the dispatcher will run.
+    /// A click at a pixel-derived cell resolves through the painter's rect to the same
+    /// model entry, carrying the action the dispatcher runs.
     #[test]
     fn hit_test_resolves_to_the_models_own_action() {
         let m = model();
@@ -953,10 +858,8 @@ mod tests {
     }
 }
 
-/// C5 REMEDIATION — the shared key→meaning table. These are pure and run on
-/// every platform, because the table is what keeps the winit route and the
-/// control seam from drifting: if this file's answer changes, BOTH routes
-/// change together or neither does.
+/// The shared key→meaning table, which keeps the winit route and the control seam
+/// in agreement.
 #[cfg(test)]
 mod nav_tests {
     use super::{MenuNav, nav_for_key};
@@ -984,10 +887,8 @@ mod nav_tests {
         }
     }
 
-    /// A bare MODIFIER or LOCK press is INERT: swallowed, card untouched. No
-    /// Win32 menu closes because a finger rested on Shift — and reaching for
-    /// ⇧F10 to re-pop the card must not dismiss it on the ⇧ half of the very
-    /// chord that opens it.
+    /// A bare modifier or lock press is inert: swallowed, card untouched, so the Shift
+    /// half of ⇧F10 does not dismiss the card.
     #[test]
     fn bare_modifiers_and_locks_are_inert_not_a_dismiss() {
         for k in [

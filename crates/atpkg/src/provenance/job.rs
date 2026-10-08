@@ -11,9 +11,8 @@
 //!
 //! A submitter killed before the drop (a `kill -9`, a test under a timeout) leaves its label
 //! registered, so [`Job::prepare`] first stops every job of ours whose owning pid is gone and
-//! removes its scratch. The stems of the untracked lanes retired on 2026-09-24 are still
-//! recognized, so what an older build left behind — a bundle replica was about 51 MB — is
-//! reclaimed too.
+//! removes its scratch. The retired untracked lanes' stems are still recognized, so what
+//! an older build left behind (a bundle replica was about 51 MB) is reclaimed too.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -52,10 +51,7 @@ impl Job {
         sweep_dead_job_dirs(scratch);
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let nonce = aterm_time::since_epoch().map_or(0, |d| d.as_nanos() as u64);
         let name = format!("{stem}-{}-{seq}-{nonce:x}", std::process::id());
         let dir = scratch.join(&name);
         // `create_dir`, not `create_dir_all`: a directory already there under this name
@@ -78,7 +74,7 @@ impl Job {
         script: &str,
         args: &[&std::ffi::OsStr],
     ) -> Result<(), String> {
-        let out = std::process::Command::new("/bin/launchctl")
+        let out = aterm_uds::spawnfd::command("/bin/launchctl")
             .arg("submit")
             .args(["-l", &self.label])
             .arg("--")
@@ -146,7 +142,7 @@ impl Drop for Job {
     /// Remove the label and WAIT for launchd to forget it (a job that already removed its
     /// own costs one `launchctl list`), then the scratch.
     fn drop(&mut self) {
-        let _ = std::process::Command::new("/bin/launchctl")
+        let _ = aterm_uds::spawnfd::command("/bin/launchctl")
             .args(["remove", &self.label])
             .output();
         let started = Instant::now();
@@ -162,7 +158,7 @@ impl Drop for Job {
 /// and so is every label that is not ours ([`owner_pid_of_label`]). Best effort: a
 /// `launchctl` that cannot list is simply no sweep.
 fn stop_orphaned_jobs() {
-    let Ok(out) = std::process::Command::new("/bin/launchctl")
+    let Ok(out) = aterm_uds::spawnfd::command("/bin/launchctl")
         .arg("list")
         .output()
     else {
@@ -180,7 +176,7 @@ fn stop_orphaned_jobs() {
         if pid == me || pid_exists(pid) {
             continue;
         }
-        let _ = std::process::Command::new("/bin/launchctl")
+        let _ = aterm_uds::spawnfd::command("/bin/launchctl")
             .args(["remove", label])
             .output();
         stopped.push(label.to_string());
@@ -222,7 +218,7 @@ fn sweep_dead_job_dirs(scratch: &Path) {
 /// Whether launchd still lists `label` — `launchctl list <label>` fails for a label it
 /// does not have.
 fn label_is_listed(label: &str) -> bool {
-    std::process::Command::new("/bin/launchctl")
+    aterm_uds::spawnfd::command("/bin/launchctl")
         .args(["list", label])
         .output()
         .is_ok_and(|o| o.status.success())
@@ -234,11 +230,10 @@ fn label_is_listed(label: &str) -> bool {
 /// the answer decides what gets deleted.
 fn owner_pid_of_label(label: &str) -> Option<u32> {
     let rest = label.strip_prefix(LABEL_PREFIX)?;
-    // The integration tests deleted on 2026-09-24 submitted `test.<stem>[.<x>].<pid>` jobs
-    // (`test.clean.<pid>`, `test.view-write.<n>.<pid>` …). Nothing submits that shape any
-    // more, and a submitted job is respawned by launchd after every exit, so one left by a
-    // killed test run relaunched and throttled for days (five on m7, 2026-09-26). Its
-    // trailing pid is its owner; the dead-pid check decides.
+    // Retired integration tests submitted `test.<stem>[.<x>].<pid>` jobs (`test.clean.<pid>`,
+    // `test.view-write.<n>.<pid>` …). launchd respawns a submitted job after every exit, so
+    // one a killed run left relaunches indefinitely. Its trailing pid is its owner; the
+    // dead-pid check decides.
     if let Some(test) = rest.strip_prefix("test.") {
         let (stem, pid) = test.rsplit_once('.')?;
         return (!stem.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
@@ -280,10 +275,7 @@ mod tests {
     /// One that finishes answers the status it recorded, and its own label is gone with it.
     #[test]
     fn a_job_is_waited_for_within_its_bound_and_removed_on_every_path() {
-        let scratch =
-            std::env::temp_dir().join(format!("atpkg.platform.job.{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch).unwrap();
+        let scratch = crate::testdir::dir("atpkg.platform.job.");
 
         // Finishes: records 7, removes its own label.
         let mut job = Job::prepare(&scratch, "heal").unwrap();
@@ -293,7 +285,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(job.wait_for_status(Duration::from_secs(20)), Some(7));
+        assert_eq!(job.wait_for_status(Duration::from_secs(60)), Some(7));
         let label = job.label().to_string();
         drop(job);
         assert!(!label_is_listed(&label), "{label} removed itself");
@@ -301,9 +293,7 @@ mod tests {
         // Never finishes: the bound answers `None`, and the drop removes the label.
         let mut job = Job::prepare(&scratch, "heal").unwrap();
         job.submit("atpkg-test", "exec /bin/sleep 60", &[]).unwrap();
-        let started = Instant::now();
         assert_eq!(job.wait_for_status(Duration::from_millis(700)), None);
-        assert!(started.elapsed() < Duration::from_secs(5));
         let label = job.label().to_string();
         assert!(label_is_listed(&label), "still running before the drop");
         drop(job);
@@ -359,10 +349,7 @@ mod tests {
     #[test]
     fn the_dead_job_sweep_spares_a_foreign_directory_of_the_same_shape() {
         // Dots, not dashes: this scratch itself must never read as a job name.
-        let scratch =
-            std::env::temp_dir().join(format!("atpkg.sweep.scratch.{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch).unwrap();
+        let scratch = crate::testdir::dir("atpkg.sweep.scratch.");
         // A pid nothing runs under, measured rather than guessed and taken WITHOUT
         // spawning: macOS pids stay below 99999.
         let dead = (90_000..99_999u32)

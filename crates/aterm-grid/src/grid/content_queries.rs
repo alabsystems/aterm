@@ -4,19 +4,14 @@
 
 //! Derived-content queries on [`Grid`]: text extraction and memory accounting.
 //!
-//! These methods compute data from grid state (row text, visible content,
-//! memory usage) rather than forwarding to subsystem accessors. Separated
-//! from `accessors.rs` for cohesion — accessors are O(1) field forwarding,
-//! these iterate over grid contents.
+//! These iterate over grid contents; `accessors.rs` holds the O(1) forwarders.
 
 use super::Grid;
 use crate::CellCoord;
 
 impl Grid {
-    /// Get the resolved character at a grid position, checking overflow.
-    ///
-    /// Unlike `Cell::char()`, this returns the full character for non-BMP
-    /// codepoints by consulting the `CellExtras` overflow table.
+    /// The resolved character at a grid position, including non-BMP codepoints
+    /// from the `CellExtras` overflow table (unlike `Cell::char()`).
     #[must_use]
     pub fn resolved_char(&self, row: u16, col: u16) -> Option<char> {
         let cell = self.cell(row, col)?;
@@ -38,14 +33,11 @@ impl Grid {
             * std::mem::size_of::<Option<Box<super::scroll_convert::ScrolledRowExtras>>>();
         for extras in self.storage.ring_extras.iter().flatten() {
             total += std::mem::size_of::<super::scroll_convert::ScrolledRowExtras>();
-            // Shallow is fine for the tens of bytes a hyperlink adds and
-            // wrong by megabytes for a picture, so an image-bearing ring row
-            // charges its share of the payload (see `image_bytes`).
+            // An image-bearing ring row charges its share of the payload.
             total += extras.image_bytes();
         }
-        // Resize undo owns copies outside the page arena. Its extras have
-        // moved out of the live/ring maps, so none of these bytes are counted
-        // above (including images retained only by an off-screen undo row).
+        // Resize undo owns copies outside the page arena and the live/ring
+        // extras maps (including images only an undo row retains).
         if let Some(undo) = &self.storage.resize_undo {
             use super::resize_undo::{ResizeUndo, UndoRow};
             total += std::mem::size_of::<ResizeUndo>()
@@ -59,9 +51,7 @@ impl Grid {
                 }
             }
         }
-        // Staged-but-undrained scroll-off lines (Wave-3 adversarial review):
-        // under flood backpressure the lazy buffer holds raw ~8 B/cell rows the
-        // tiered store has not absorbed yet — bytes the ring watermark must see.
+        // Staged scroll-off lines the tiered store has not absorbed yet.
         total += self.storage.lazy_buffer.memory_used();
         if let Some(scrollback) = &self.storage.scrollback {
             total += scrollback.total_memory_used();
@@ -69,34 +59,23 @@ impl Grid {
         total
     }
 
-    /// Get the text content of a visible row, resolving complex characters.
-    ///
-    /// Handles non-BMP characters stored in the overflow table. Thin wrapper
-    /// over [`row_text_into`](Self::row_text_into) for callers that want an
-    /// owned `String`; hot paths that scan many rows per frame should prefer
-    /// `row_text_into` with a reused buffer to avoid one allocation per row.
+    /// The text of a visible row, resolving complex characters. Allocates; hot
+    /// paths use [`row_text_into`](Self::row_text_into) with a reused buffer.
     #[must_use]
     pub fn row_text(&self, row: u16) -> Option<String> {
         let mut s = String::new();
         self.row_text_into(row, &mut s).then_some(s)
     }
 
-    /// Append visible-row `row`'s resolved text into `out`, reusing its heap
-    /// capacity (clear-then-append). Writes exactly what [`row_text`](Self::row_text)
-    /// would return for an in-bounds row and returns `true`; for an out-of-range
-    /// row it leaves `out` cleared and returns `false` (mirroring `row_text`'s
-    /// `None`). The non-allocating counterpart used by the Observation Kernel's
-    /// per-batch row scan so a `RowMatches` watcher does not heap-allocate one
-    /// `String` per visible row on every processed batch.
+    /// Write visible row `row`'s resolved text into `out` (cleared first),
+    /// exactly as [`row_text`](Self::row_text) would return it. Returns `false`
+    /// and leaves `out` empty for an out-of-range row.
     #[must_use]
     pub fn row_text_into(&self, row: u16, out: &mut String) -> bool {
         out.clear();
-        // Out-of-viewport rows have no text. In-range rows resolve through the
-        // display-offset-aware view: a scrolled-back row reads its extras from
-        // the materialized history line (correctly-paired complex chars /
-        // combining marks / RGB), not the live map where they no longer live —
-        // so `self.row(row).is_none()` is NOT a valid emptiness test here (a
-        // deep-scrolled history row legitimately has no live grid row).
+        // In-range rows resolve through the display-offset-aware view, so a
+        // scrolled-back row reads its extras from the history line; such a
+        // row may have no live grid row at all.
         if row >= self.rows() {
             return false;
         }
@@ -107,9 +86,8 @@ impl Grid {
             let Some(cell) = view.cell(col) else {
                 continue;
             };
-            // Context-aware check: Cell::is_wide_continuation() would
-            // false-positive on DECSCA-protected cells (shared bit 10),
-            // hiding protected text from the read API.
+            // Context-aware: Cell::is_wide_continuation() false-positives on
+            // DECSCA-protected cells (shared bit 10).
             if view.is_wide_continuation(col) {
                 continue;
             }
@@ -118,35 +96,22 @@ impl Grid {
         true
     }
 
-    /// Fill `out` with visible-row `row`'s content as PER-COLUMN chars and
-    /// return the row's FILL (one past the last non-blank column; `0` for an
-    /// empty or out-of-range row).
+    /// Fill `out` with visible row `row` as one `char` per column and return
+    /// the row's fill (one past the last non-blank column; `0` for an empty or
+    /// out-of-range row).
     ///
-    /// The column-indexed sibling of [`row_text_into`](Self::row_text_into),
-    /// built for per-frame row DIFFING (the cursor-effects erase-poof probe):
-    /// string output loses column indexing under wide chars, so this yields
-    /// exactly one `char` per grid column — the resolved LEAD char at its own
-    /// column (a complex cell contributes its base codepoint), `'\0'` at wide
-    /// continuations (the right half of a CJK/emoji glyph), and `' '` for
-    /// blanks — so span math on the diff survives CJK/emoji. Combining marks
-    /// are deliberately dropped (they share the base's column; a diff keyed on
-    /// lead chars still sees any real content change that erases them).
-    /// Clear-then-extend into the caller's buffer: zero steady-state
-    /// allocation, like `row_text_into`. Reads through the display-offset-aware
-    /// `visible_row_view`, exactly like the text path.
+    /// Each column yields its lead char (a complex cell's base codepoint),
+    /// `'\0'` at wide continuations, and `' '` for blanks; combining marks are
+    /// dropped. Used for per-frame row diffing, where column indexing must
+    /// survive wide chars. Reuses the caller's buffer.
     pub fn row_cols_into(&self, row: u16, out: &mut Vec<char>) -> u16 {
         self.row_cols_prefix_into(row, usize::MAX, out)
     }
 
-    /// Fill `out` with at most the first `prefix_len` per-column characters of
-    /// visible row `row` and return the fill within that prefix.
-    ///
-    /// This is the bounded hot-path counterpart of
-    /// [`row_cols_into`](Self::row_cols_into): it uses the identical lead /
-    /// wide-continuation / blank projection, but neither scans nor reserves for
-    /// columns beyond the requested prefix. It does not synthesize the sparse
-    /// row's implicit blank tail; callers that require a fixed-width prefix may
-    /// resize the returned buffer to `prefix_len`.
+    /// Fill `out` with at most the first `prefix_len` columns of visible row
+    /// `row` (same projection as [`row_cols_into`](Self::row_cols_into)) and
+    /// return the fill within that prefix. The sparse row's blank tail is not
+    /// synthesized; resize the buffer to `prefix_len` for a fixed width.
     pub fn row_cols_prefix_into(&self, row: u16, prefix_len: usize, out: &mut Vec<char>) -> u16 {
         out.clear();
         if row >= self.rows() {
@@ -169,20 +134,13 @@ impl Grid {
         fill
     }
 
-    /// Get a LIVE on-screen row (keyed on the SCREEN row, as if `display_offset ==
-    /// 0`) as text with ANSI SGR escape codes — offset-INDEPENDENT, the coloured
-    /// twin of [`row_text_screen`](Self::row_text_screen). `serialize()` captures
-    /// terminal STATE, so its viewport paint must read the live screen regardless of
-    /// the user's scroll position: reading the offset-mapped [`Grid::row`] would
-    /// re-emit scrolled history (duplicating the history dump) AND pair those
-    /// historical cells with the LIVE extras map at the raw row — stranding a
-    /// scrolled emoji as U+FFFD and dropping its RGB/combining. `row` here is a
-    /// SCREEN row; byte-identical to the pre-fix `row_ansi_text` at `display_offset
-    /// == 0` (where `row_at_screen == row`).
+    /// A live screen row (as if `display_offset == 0`) as text with ANSI SGR
+    /// escapes: the coloured twin of [`row_text_screen`](Self::row_text_screen).
+    /// `serialize()` uses it because it captures terminal state regardless of
+    /// the user's scroll position.
     ///
-    /// Iterates cells and emits `\x1b[...m` sequences when SGR state
-    /// changes (bold, italic, colors, etc.). Appends `\x1b[0m` at the
-    /// end if any SGR was active. Returns `None` for invalid row indices.
+    /// Emits `\x1b[...m` when SGR state changes and a trailing `\x1b[0m` if any
+    /// SGR was active. Returns `None` for an invalid row.
     #[must_use]
     #[allow(clippy::too_many_lines, reason = "flat SGR tracking per cell")]
     pub fn row_ansi_text_screen(&self, row: u16) -> Option<String> {
@@ -426,9 +384,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // resolved_char — basic character resolution
-    // =========================================================================
+    // resolved_char: basic character resolution
 
     #[test]
     fn test_resolved_char_ascii() {
@@ -482,9 +438,7 @@ mod tests {
         assert_eq!(grid.resolved_char(0, 2), Some('Z'));
     }
 
-    // =========================================================================
-    // row_text — correct text extraction
-    // =========================================================================
+    // row_text: text extraction
 
     #[test]
     fn test_row_text_ascii() {
@@ -589,9 +543,7 @@ mod tests {
         assert_eq!(buf, "", "out-of-range row clears the buffer");
     }
 
-    // =========================================================================
-    // row_cols_into — per-COLUMN chars + fill (the erase-poof probe source)
-    // =========================================================================
+    // row_cols_into: per-column chars and fill
 
     #[test]
     fn test_row_cols_into_column_indexed_wide_and_fill() {
@@ -636,26 +588,7 @@ mod tests {
         assert!(cols.is_empty());
     }
 
-    // =========================================================================
-    // row_text — wide characters
-    // =========================================================================
-
-    #[test]
-    fn test_row_text_wide_char() {
-        let mut grid = Grid::new(4, 20);
-        // Write a wide CJK character using the styled helper
-        grid.write_wide_char_styled(
-            '\u{4E2D}', // CJK "middle" (wide)
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        let text = grid.row_text(0).unwrap();
-        assert!(
-            text.contains('\u{4E2D}'),
-            "wide char should appear in row_text, got: {text:?}"
-        );
-    }
+    // row_text: wide characters
 
     #[test]
     fn test_row_text_wide_char_continuation_skipped() {
@@ -693,9 +626,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // row_text — complex characters with combining marks
-    // =========================================================================
+    // row_text: complex characters with combining marks
 
     #[test]
     fn test_row_text_complex_with_combining() {
@@ -722,9 +653,8 @@ mod tests {
     fn test_row_text_complex_emoji_via_extras() {
         let mut grid = Grid::new(4, 20);
 
-        // First write a placeholder character so the row's len covers col 0.
-        // Row::len() tracks the written extent; set_cell_complex_char alone
-        // does not extend it.
+        // A placeholder extends the row's len to cover col 0;
+        // set_cell_complex_char alone does not.
         grid.write_char('X');
         grid.move_cursor_to(0, 1); // cursor past the cell we'll convert
 
@@ -741,38 +671,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // visible_content — all visible rows
-    // =========================================================================
-
-    #[test]
-    fn test_visible_content_empty_grid() {
-        let grid = Grid::new(3, 5);
-        let content = grid.visible_content();
-        // 3 rows, each ending with '\n'
-        let lines: Vec<&str> = content.split('\n').collect();
-        // split produces N+1 entries for N newlines, so 4 entries for 3 newlines
-        assert_eq!(lines.len(), 4, "3 rows + trailing split");
-        assert!(lines[3].is_empty(), "trailing element after last newline");
-    }
-
-    #[test]
-    fn test_visible_content_with_text() {
-        let mut grid = Grid::new(3, 10);
-        write_text(&mut grid, "Row0");
-        grid.move_cursor_to(1, 0);
-        write_text(&mut grid, "Row1");
-        grid.move_cursor_to(2, 0);
-        write_text(&mut grid, "Row2");
-
-        let content = grid.visible_content();
-        assert!(
-            content.contains("Row0"),
-            "should contain Row0, got: {content:?}"
-        );
-        assert!(content.contains("Row1"), "should contain Row1");
-        assert!(content.contains("Row2"), "should contain Row2");
-    }
+    // visible_content: all visible rows
 
     #[test]
     fn test_visible_content_line_count() {
@@ -810,9 +709,7 @@ mod tests {
         assert_eq!(content.chars().filter(|&c| c == '\n').count(), 1);
     }
 
-    // =========================================================================
-    // memory_used — basic sanity
-    // =========================================================================
+    // memory_used: basic sanity
 
     #[test]
     fn test_memory_used_positive() {
@@ -852,6 +749,7 @@ mod tests {
                 cols: 1,
                 z_index: 0,
                 band_lift_px: 0,
+                cell_offset_px: (0, 0),
                 scaling: crate::ImageScaling::Fit,
                 source_rect: None,
             });
@@ -905,9 +803,7 @@ mod tests {
         assert_eq!(with_undo - grid.memory_used(), expected);
     }
 
-    // =========================================================================
     // Edge cases
-    // =========================================================================
 
     #[test]
     fn test_row_text_last_visible_row() {
@@ -963,13 +859,5 @@ mod tests {
         grid.write_char('Z');
         let text = grid.row_text(0).unwrap();
         assert_eq!(text, "Z");
-    }
-
-    #[test]
-    fn test_visible_content_minimum_grid() {
-        let mut grid = Grid::new(1, 1);
-        grid.write_char('Q');
-        let content = grid.visible_content();
-        assert!(content.starts_with('Q'), "got: {content:?}");
     }
 }

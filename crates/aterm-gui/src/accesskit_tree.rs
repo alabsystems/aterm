@@ -8,21 +8,17 @@
 //! Manual publish through `native_accessibility`; the transient overlays build their own
 //! trees beside their painters.
 //!
-//! This module is the PURE mapping (model → `TreeUpdate`); it is unit-tested without any
-//! window/adapter. The `accesskit_winit::Adapter` that attaches it to a live window is the
-//! OS event-loop wiring (runtime-verified with a real screen reader), built on top of
-//! this seam.
+//! This module is the pure mapping (model → `TreeUpdate`), unit-tested without a window.
+//! The `accesskit_winit::Adapter` that attaches it to a live window is the event-loop
+//! wiring built on this seam.
 //!
-//! Gated behind the OFF-BY-DEFAULT `a11y-accesskit` feature (see this crate's
-//! `Cargo.toml`, which records why it left the default build). A stock Linux/Windows
-//! build compiles none of this and publishes no accessibility tree at all — there is
-//! no degraded fallback, because AccessKit is the only cross-platform publisher aterm
-//! has. Everything below is therefore reachable only from
-//! `cargo build -p aterm-gui --features a11y-accesskit`.
+//! Compiled under the `a11y_tree` cfg (`build.rs`): always on Linux, and on macOS and
+//! Windows only with the off-by-default `a11y-accesskit` feature (see this crate's
+//! `Cargo.toml`). A Windows build without it publishes no accessibility tree:
+//! AccessKit is aterm's only cross-platform publisher.
 
 // macOS: AccessKit's NSAccessibility provider and the `a11y-appkit` grid publisher both
-// claim the content view's accessibility tree — enabling both yields a corrupt/duplicated
-// VoiceOver tree, so they are mutually exclusive.
+// claim the content view's accessibility tree, so they are mutually exclusive.
 #[cfg(all(target_os = "macos", feature = "a11y-appkit"))]
 compile_error!(
     "features `a11y-appkit` and `a11y-accesskit` are mutually exclusive on macOS \
@@ -36,72 +32,56 @@ use accesskit::{
 
 /// The window's root accessibility node.
 const ROOT: NodeId = NodeId(0);
-/// DEFAULT-2: the `Role::Terminal` node under [`ROOT`] when NO overlay is open and the
-/// frame is ONE document — it carries the visible grid text so a screen reader reads the
-/// terminal itself. A composed split publishes one [`PANE_BASE`] document per pane
-/// instead, and this id is then absent from the tree.
+/// The `Role::Terminal` node under [`ROOT`] when no overlay is open and the frame is one
+/// document; it carries the visible grid text. A composed split publishes one
+/// [`PANE_BASE`] document per pane instead, and this id is then absent.
 const GRID: NodeId = NodeId(1);
 /// The in-grid tab strip's `Role::TabList` under [`ROOT`], published only when the strip
-/// is actually on screen AND is a switcher (≥ 2 tabs — a solo strip paints the window
-/// title, not a switcher, so publishing a one-item tab list would describe a control the
-/// user cannot see).
+/// is on screen and is a switcher (≥ 2 tabs; a solo strip paints the window title).
 const TAB_LIST: NodeId = NodeId(2);
 /// The find panel's `Role::SearchInput` under [`ROOT`], published only while find mode is
-/// live. It is a SECOND text document in the same tree, which is why it needs its own
-/// node: while the panel is up the keyboard belongs to the query field, not the grid, and
-/// a tree that says otherwise points a screen reader's caret at the wrong text.
+/// live: a second text document, because while the panel is up the keyboard belongs to
+/// the query field, not the grid.
 const FIND: NodeId = NodeId(3);
-/// The find field's single `Role::TextRun` — the child that turns [`FIND`] into a real
-/// text document (`accesskit_consumer::Node::supports_text_ranges` needs an input role
-/// PLUS a run), so the caret in the query is navigable rather than a name with no text.
+/// The find field's single `Role::TextRun`, which makes [`FIND`] a real text document
+/// (`accesskit_consumer::Node::supports_text_ranges` needs an input role plus a run), so
+/// the caret in the query is navigable.
 const FIND_RUN: NodeId = NodeId(4);
-/// Chrome MESSAGE nodes are `MESSAGE_BASE + `[`ChromeMessage::slot`]. A range of its own,
-/// well below [`TAB_BASE`], so [`tab_index_for`] refuses a message id and a screen
-/// reader's click on a status band can never be decoded as "switch to tab N".
-///
-/// The STATUS BANDS live in this range with every other chrome message rather than in one
-/// of their own: a band is the same kind of thing as the paste question and the config
-/// warning — something the window says to the user unasked — and one range means one
-/// announcement contract, one activation route and one slot round-trip to keep honest.
+/// Chrome message nodes are `MESSAGE_BASE + `[`ChromeMessage::slot`]. The range is well
+/// below [`TAB_BASE`], so [`tab_index_for`] refuses a message id and a click on a status
+/// band never decodes as "switch to tab N". Status bands share this range with every other
+/// chrome message: one announcement contract, one activation route, one slot round-trip.
 const MESSAGE_BASE: u64 = 1 << 20;
 /// Tab items are `TAB_BASE + tab_index`. A high, disjoint range so a tab id can never be
-/// mistaken for any other node by [`crate::app::App::on_accessibility_action`]'s routing.
+/// mistaken for any other node by [`crate::App::on_accessibility_action`]'s routing.
 const TAB_BASE: u64 = 1 << 40;
-/// One `Role::TextRun` per visible grid ROW — at `ROW_BASE + row_index * RUNS_PER_ROW`,
-/// plus one id per extra run a row wider than [`RUN_CHARS`] is split into. Disjoint from
-/// every other id range above, and STABLE across frames: AccessKit's consumer diffs the
-/// previous tree against the new one by node id, and it is precisely that diff which
-/// synthesises the `object:text-changed` and `object:text-caret-moved` events a screen
-/// reader listens for. Reusing row ids per frame is what makes "a line of output
-/// arrived" an insert event rather than a remove-and-add of the whole screen.
+/// One `Role::TextRun` per visible grid row at `ROW_BASE + row_index * RUNS_PER_ROW`, plus
+/// one id per extra run of a row wider than [`RUN_CHARS`]. Disjoint from every other range
+/// and stable across frames: AccessKit's consumer diffs trees by node id to synthesise the
+/// `object:text-changed` and `object:text-caret-moved` events, so a new line of output is
+/// an insert rather than a remove-and-add of the whole screen.
 const ROW_BASE: u64 = 1 << 48;
 
-/// Id space one terminal document may spend on its row runs. A composed split frame
-/// publishes one document PER PANE, and each needs row ids that stay stable while a
-/// sibling's row count changes — so the pane's slot, not its position in a flat list,
-/// picks the block. Slot 0 is the whole-screen document, so a single-pane frame mints
-/// exactly the ids it always did.
+/// Id space one terminal document may spend on its row runs. A split frame publishes one
+/// document per pane, and the pane's slot (not its list position) picks the block, so a
+/// sibling's row count changing never renumbers it. Slot 0 is the whole-screen document.
 const PANE_STRIDE: u64 = 1 << 32;
 
-/// Pane container nodes are `PANE_BASE + slot`. Deliberately ABOVE [`ROW_BASE`]: that is
-/// the same half-line [`tab_index_for`] already refuses, so a screen reader's click on a
-/// pane can never be decoded as "switch to tab N".
+/// Pane container nodes are `PANE_BASE + slot`, above [`ROW_BASE`] where
+/// [`tab_index_for`] already refuses, so a click on a pane never decodes as a tab switch.
 const PANE_BASE: u64 = 1 << 62;
 
-/// Characters per text run. AccessKit's word starts are `[u8]` and its consumer
-/// addresses them with a `u8` cast of the query offset, so 256 is the widest a
-/// run can be and still answer word queries correctly.
+/// Characters per text run. AccessKit's word starts are `[u8]` and its consumer casts the
+/// query offset to `u8`, so 256 is the widest a run can be and answer word queries right.
 const RUN_CHARS: usize = 256;
 
-/// Run-id stride per row: the id space a single row may spend on its runs. A
-/// row wider than `RUN_CHARS * RUNS_PER_ROW` characters would collide with the
-/// next row's ids, so the chunker stops there and the last run carries the
-/// remainder (a 65,536-column terminal is not a case worth id-space for).
+/// Run-id stride per row. A row wider than `RUN_CHARS * RUNS_PER_ROW` characters would
+/// collide with the next row's ids, so the chunker stops there and the last run carries
+/// the remainder.
 const RUNS_PER_ROW: u64 = 256;
 
 /// Split one row into runs no wider than [`RUN_CHARS`] characters, on character
-/// boundaries. A row that fits comes back as a single borrowed chunk, so the
-/// common case allocates one `String` exactly as it did before.
+/// boundaries. A row that fits comes back as a single chunk.
 fn row_chunks(line: &str) -> Vec<String> {
     let count = line.chars().count();
     if count <= RUN_CHARS {
@@ -137,20 +117,17 @@ pub(crate) fn empty_tree() -> TreeUpdate {
     }
 }
 
-/// Where the visible grid sits inside the window's client area, in PHYSICAL pixels —
-/// the coordinate space `accesskit_winit` publishes root window bounds in, so a node's
-/// `bounds` here lands on the same pixels the glyphs did.
+/// Where the visible grid sits in the window's client area, in physical pixels (the space
+/// `accesskit_winit` publishes root window bounds in), so node `bounds` land on the glyphs.
 ///
-/// Optional at the call site: without it the grid still exposes a complete AT-SPI `Text`
-/// interface (text, caret, line/word/character granularity); only the geometric extras —
-/// `Component` extents and `GetCharacterExtents` — are unavailable. Absent geometry is
-/// therefore a degradation, never a wrong answer.
+/// Optional: without it the grid still exposes a complete AT-SPI `Text` interface (text,
+/// caret, line/word/character granularity); only `Component` extents and
+/// `GetCharacterExtents` are unavailable.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct GridGeometry {
     /// Left edge of column 0, physical px from the client area's left edge.
     pub(crate) origin_x: f64,
-    /// Top edge of grid row 0 — BELOW the tab strip, matching the snapshot, which
-    /// drops the strip rows.
+    /// Top edge of grid row 0, below the tab strip (the snapshot drops the strip rows).
     pub(crate) origin_y: f64,
     /// One cell's advance width in physical px.
     pub(crate) cell_w: f64,
@@ -161,17 +138,16 @@ pub(crate) struct GridGeometry {
     pub(crate) strip_y: f64,
     /// Height of the whole strip band in physical px; `0.0` when no strip is drawn.
     pub(crate) strip_h: f64,
-    /// Top edge of the STATUS BAR band — directly below the strip, directly above
-    /// grid row 0. Equal to `origin_y` when no bar is up.
+    /// Top edge of the status bar band, directly below the strip and above grid row 0.
+    /// Equal to `origin_y` when no bar is up.
     pub(crate) bars_y: f64,
     /// Height of one bar row in physical px (each bar is exactly one row).
     pub(crate) bar_h: f64,
 }
 
-/// One publishable tab of the in-grid strip: the label the strip painted, whether it is
-/// the active tab, and its COLUMN span (`start_col..end_col`) taken straight from the
-/// cached `TabSegment` hit geometry the mouse uses — so the announced bounds and the
-/// clickable pixels are the same rectangle by construction.
+/// One publishable tab of the in-grid strip: the painted label, whether it is active, and
+/// its column span (`start_col..end_col`) from the cached `TabSegment` hit geometry the
+/// mouse uses, so announced bounds and clickable pixels are the same rectangle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GridTab {
     /// The tab's index in the window's tab set — the argument `switch_tab_in` takes.
@@ -186,24 +162,18 @@ pub(crate) struct GridTab {
     pub(crate) end_col: u16,
 }
 
-/// A PAINTED text selection, already expressed in one document's own row/column space
-/// with both ends clamped to the text those rows actually publish.
+/// A painted text selection in one document's own row/column space, both ends clamped to
+/// the text those rows publish.
 ///
-/// The columns come from the renderer's OWN per-row selection predicate
-/// (`aterm_core::render::RenderInput::selection_row_key`), which is the list the highlight
-/// band is drawn from — one source, not a second copy of the geometry free to drift as the
-/// selection rules change.
+/// The columns come from the renderer's per-row selection predicate
+/// (`aterm_core::render::RenderInput::selection_row_key`), the same source the highlight
+/// is drawn from. That span is content-independent, while `TextSelection::contains_cell`
+/// snaps a double-width glyph whole (see `selection_row_span_of`), so an edge on a wide
+/// lead paints its continuation one column past `hi`; a screen reader hears the glyph,
+/// not its pad cell.
 ///
-/// It is the same SOURCE, not exact equality at every edge, and the difference is worth
-/// naming: that span is content-independent, while `TextSelection::contains_cell` snaps a
-/// double-width glyph whole for every selection kind (see `aterm_core::render`'s own note
-/// on `selection_row_span_of`), so an edge landing on a wide LEAD paints the continuation
-/// one column past `hi`. A screen reader is then told about the glyph and not its pad
-/// cell, which is the right answer for text and one cell narrower than the tint.
-///
-/// `focus` is the END of the span, not the direction the drag went: the per-row predicate
-/// is normalised (it answers "which columns of this row are tinted"), and a screen reader
-/// reads the selected TEXT, which is direction-free.
+/// `focus` is the end of the span, not the drag direction: the predicate is normalised,
+/// and a screen reader reads the selected text, which is direction-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GridSpan {
     /// First selected cell, `(row, column)`.
@@ -212,17 +182,13 @@ pub(crate) struct GridSpan {
     pub(crate) focus: (usize, usize),
 }
 
-/// One visible SPLIT PANE as its own terminal document.
-///
-/// A composed split frame tiles every pane onto the same rows, so the whole-frame
-/// projection reads two unrelated programs' output spliced together on every line, with
-/// nothing to say which is which or which one the keyboard is in. One document per pane
-/// is the shape a screen reader can actually navigate.
+/// One visible split pane as its own terminal document. A composed split frame tiles
+/// every pane onto the same rows, so reading the whole frame splices unrelated programs'
+/// output together; one document per pane is navigable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GridPane {
-    /// This pane's id slot. Namespaces the pane's row runs ([`PANE_STRIDE`]) so a sibling
-    /// gaining or losing rows never renumbers this pane's lines out from under the
-    /// consumer's diff.
+    /// This pane's id slot. Namespaces its row runs ([`PANE_STRIDE`]) so a sibling gaining
+    /// or losing rows never renumbers this pane's lines under the consumer's diff.
     pub(crate) slot: usize,
     /// What a screen reader announces on entering the pane.
     pub(crate) label: String,
@@ -238,45 +204,37 @@ pub(crate) struct GridPane {
     pub(crate) selection: Option<GridSpan>,
 }
 
-/// The find panel's query FIELD, as a screen reader needs it.
-///
-/// The panel is painted as terminal cells over the grid, so its text is already inside
-/// the grid document — but as anonymous output, with the caret still parked on the shell
-/// prompt. That is the difference between "there is a search box on screen" and "you are
-/// typing in it".
+/// The find panel's query field. The panel is painted as terminal cells, so its text is
+/// already in the grid document, but as anonymous output with the caret on the shell
+/// prompt; this node says the user is typing in a search box.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GridFind {
     /// The live query, exactly as the well paints it.
     pub(crate) query: String,
-    /// The edit position as a CHARACTER index into `query` (the painter's caret).
+    /// The edit position as a character index into `query` (the painter's caret).
     pub(crate) caret: usize,
     /// The answer the panel shows — `match 2 of 7`, `no matches`, `bad regex` — plus the
     /// active modes, as the field's accessible description.
     pub(crate) status: String,
 }
 
-/// A CHROME MESSAGE the window shows the user without being asked — the one class of
-/// surface that a screen reader cannot discover by exploring, because by the time the
-/// user goes looking it is gone.
+/// A chrome message the window shows unasked: a surface a screen reader cannot discover
+/// by exploring, because it may be gone by then.
 ///
-/// Each variant owns a FIXED [`ChromeMessage::slot`], so its node id is the same from
-/// frame to frame while the message stands. That stability is what makes AccessKit's
-/// consumer emit "this region's text changed" rather than tearing one node down and
-/// building another — and on AT-SPI and UIA the announcement fires on exactly that
-/// name change.
+/// Each variant owns a fixed [`ChromeMessage::slot`], so its node id is stable while the
+/// message stands and AccessKit's consumer emits "text changed" (which is what AT-SPI and
+/// UIA announce) rather than replacing the node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChromeMessage {
-    /// The multi-line-paste CONFIRMATION band ([`crate::paste_banner`]) — the pastejacking
-    /// guard's only prompt on the platforms with no native alert. A question the user is
-    /// being asked; the loudest thing this tree ever says.
+    /// The multi-line-paste confirmation band ([`crate::paste_banner`]): the pastejacking
+    /// guard's prompt on platforms with no native alert. A question; the loudest thing
+    /// this tree says.
     PasteConfirm,
-    /// The close/quit CONFIRMATION band ([`crate::close_confirm`], Windows) — the
-    /// destructive-close question the native task-modal dialog used to ask. A
-    /// question, announced as one: the dialog it replaces was an accessible alert.
+    /// The close/quit confirmation band ([`crate::close_confirm`], Windows): a destructive
+    /// question, announced as an alert.
     CloseConfirm,
-    /// The MESSAGE BAND's top row (`crate::message_band`, design §3.5): one fixed slot
-    /// per band ROW, not per message — AccessKit then emits "text changed" on a name
-    /// change instead of tearing a node down and building another.
+    /// The message band's top row (`crate::message_band`): one fixed slot per band row,
+    /// not per message, so a name change is "text changed", not a new node.
     BandRow0,
     /// The band's second row.
     BandRow1,
@@ -285,7 +243,7 @@ pub(crate) enum ChromeMessage {
     /// The band's overflow row (`N more messages`): one link to Settings ▸ Messages.
     BandOverflow,
     /// One capsule of one band row: a button child of that row's node, named by the
-    /// capsule's FULL label.
+    /// capsule's full label.
     BandCapsule {
         /// The band row, 0 = topmost.
         row: u8,
@@ -293,9 +251,8 @@ pub(crate) enum ChromeMessage {
         /// implicit `Details ›` ([`capsule_index`] / [`capsule_action`]).
         index: u8,
     },
-    /// The PRESENCE band (`crate::presence`, round 19): who is driving this window's
-    /// session, its phase, its mail, its link — one row under the tab strip, spoken as
-    /// one sentence ("driven by manager, turn 41").
+    /// The presence band (`crate::presence`): who is driving this window's session, its
+    /// phase, mail and link, spoken as one sentence ("driven by manager, turn 41").
     PresenceStatus,
 }
 
@@ -328,12 +285,10 @@ pub(crate) fn capsule_action(index: u8) -> aterm_messages::ActionIndex {
 }
 
 impl ChromeMessage {
-    /// Every ROW-level message, in the order they are published — the order they are
-    /// painted down the window. Exhaustive for the row slots by construction: a new
-    /// variant that is not listed here is never published, and
-    /// [`ChromeMessage::from_node`] would not round-trip it, which is what the slot
-    /// round-trip test checks. Capsules are children of their row and decode by
-    /// arithmetic, not by this list.
+    /// Every row-level message in publish order (the painted order, top down). A variant
+    /// missing here is never published and [`ChromeMessage::from_node`] would not
+    /// round-trip it, which the slot round-trip test checks. Capsules are children of
+    /// their row and decode by arithmetic.
     pub(crate) const ORDER: [Self; 7] = [
         Self::PresenceStatus,
         Self::BandRow0,
@@ -364,15 +319,11 @@ impl ChromeMessage {
         }
     }
 
-    /// This message's permanent id slot. The band rows keep the retired status bars'
-    /// slots 3 and 4 for their first two rows (the same rows, the same place). Slots 0
-    /// and 2 are RETIRED: 0 was the transient card's (`notice.rs`, 2026-09-23 — its
-    /// producers are band rows, and Robi's tip bubble that survived it is a decoration,
-    /// never announced) and 2 the config band's (its warnings are band rows too).
-    /// Nothing is published at either and [`ChromeMessage::from_node`] decodes nothing
-    /// there, so a reader's stale activate on one is a no-op, never a different row.
-    /// The close confirmation (Windows) takes 8, the first slot after the band's
-    /// overflow row and below the capsule range.
+    /// This message's permanent id slot. The band's first two rows take slots 3 and 4.
+    /// Slots 0 and 2 are unused: nothing is published there and
+    /// [`ChromeMessage::from_node`] decodes nothing, so a stale activate on one is a no-op.
+    /// The close confirmation (Windows) takes 8, the first slot after the band's overflow
+    /// row and below the capsule range.
     const fn slot(self) -> u64 {
         match self {
             Self::PasteConfirm => 1,
@@ -395,7 +346,7 @@ impl ChromeMessage {
 
     /// Decode a screen reader's action target back to the message it names, or `None`
     /// when the id is not one of [`grid_tree`]'s message nodes. Rejects rather than
-    /// clamps: a stale request must be a no-op, never an answer to a different question.
+    /// clamps, so a stale request is a no-op.
     pub(crate) fn from_node(node: NodeId) -> Option<Self> {
         let slot = node.0.checked_sub(MESSAGE_BASE)?;
         if let Some(offset) = slot.checked_sub(CAPSULE_BASE) {
@@ -411,10 +362,9 @@ impl ChromeMessage {
         Self::ORDER.into_iter().find(|m| m.slot() == slot)
     }
 
-    /// How loudly this message interrupts. Only the two confirmations are assertive:
-    /// each is a question that stops something (the paste, the close) until it is
-    /// answered, and a polite announcement would queue behind whatever the terminal
-    /// is printing. Everything else is news, and news waits its turn.
+    /// How loudly this message interrupts. Only the two confirmations are assertive: each
+    /// stops something (the paste, the close) until answered, and a polite announcement
+    /// would queue behind terminal output. Everything else is polite.
     const fn politeness(self) -> Live {
         match self {
             Self::PasteConfirm | Self::CloseConfirm => Live::Assertive,
@@ -428,11 +378,9 @@ impl ChromeMessage {
     }
 
     /// The platform role. `Alert` reaches AT-SPI as `Notification` and `AlertDialog` as
-    /// `Alert`, which is the distinction between "here is some news" and "you are being
-    /// asked something"; a band row that warns OR ASKS (`alarm`) is an `Alert` — polite,
-    /// never assertive: only the paste and close confirmations stop anything — a
-    /// metered one a real `ProgressIndicator`, and one without a meter is a `Status`
-    /// (AT-SPI `StatusBar`).
+    /// `Alert` ("news" vs "being asked"). A band row that warns or asks (`alarm`) is a
+    /// polite `Alert`; a metered one is a `ProgressIndicator`; one without a meter is a
+    /// `Status` (AT-SPI `StatusBar`). Only the paste and close confirmations are dialogs.
     const fn role(self, metered: bool, alarm: bool) -> Role {
         match self {
             Self::PasteConfirm | Self::CloseConfirm => Role::AlertDialog,
@@ -458,7 +406,7 @@ impl ChromeMessage {
 /// node ([`push_message`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BandCapsule {
-    /// The FULL label (the painted form may be the short one).
+    /// The full label (the painted form may be the short one).
     pub(crate) label: &'static str,
     /// The first cell of the chip.
     pub(crate) col: usize,
@@ -468,13 +416,11 @@ pub(crate) struct BandCapsule {
     pub(crate) index: u8,
 }
 
-/// One chrome message as the frame actually shows it.
+/// One chrome message as the frame shows it.
 ///
-/// `text` is the SPOKEN sentence and `detail` is everything a reader may go and read but
-/// must not be interrupted with — because the announcement fires on the spoken sentence
-/// CHANGING, and a download whose percentage lives in the spoken half would say itself a
-/// hundred times on the way to 100%. Keeping the volatile figures in the description is
-/// what makes a live region informative instead of a flood.
+/// `text` is the spoken sentence; `detail` is what a reader may read but must not be
+/// interrupted with. Announcements fire when the spoken sentence changes, so volatile
+/// figures (a download's percentage) live in the description.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GridMessage {
     /// Which surface this is — and, through it, the node id, the role and the politeness.
@@ -485,45 +431,37 @@ pub(crate) struct GridMessage {
     pub(crate) detail: Option<String>,
     /// Determinate progress in `0..=1`, when the band draws a meter.
     pub(crate) progress: Option<f32>,
-    /// Work in flight with no fraction (the comet): an INDETERMINATE
-    /// progress indicator — the role, with no numeric value (design §10.10).
+    /// Work in flight with no fraction (the comet): an indeterminate progress indicator
+    /// (the role, with no numeric value).
     pub(crate) busy: bool,
     /// A warning, an error, or a question (an ask, a consequential capsule) — the row
     /// is an `Alert`, not a `Status`.
     pub(crate) alarm: bool,
-    /// A screen reader may activate this message — a band row's primary intent, a
-    /// capsule's. `false` for a card that only informs, so the tree never offers an
+    /// A screen reader may activate this message (a band row's primary intent, a
+    /// capsule's). `false` for a message that only informs, so the tree never offers an
     /// action the pixels do not have.
     pub(crate) activates: bool,
-    /// Which STATUS BAR row (0 = topmost) this message occupies, for the messages that
-    /// have one.
+    /// Which status bar row (0 = topmost) this message occupies, if any.
     ///
-    /// A status band RESERVES a row of its own between the strip and grid row 0, and
-    /// [`GridGeometry`] carries where that band starts and how tall a row is — so its
-    /// rectangle is a real place on the glass and a screen reader can route a click, a
-    /// magnifier can follow it, and a touch explorer can find it. `None` for every
-    /// message that has no rectangle worth publishing: the paste question overwrites
-    /// rows that belong to the grid document, so a rectangle there would put the
-    /// announcement on top of text that is not it.
+    /// A status band reserves its own row between the strip and grid row 0, and
+    /// [`GridGeometry`] knows where, so its rectangle is real for click routing,
+    /// magnifiers and touch exploration. `None` for a message with no rectangle worth
+    /// publishing: the paste question overwrites grid rows, so a rectangle there would
+    /// sit on text that is not it.
     pub(crate) bar_row: Option<usize>,
     /// The row's capsules, each published as a button child with its own rectangle.
     pub(crate) capsules: Vec<BandCapsule>,
 }
 
-/// Everything a frame publishes BESIDES its plain visible grid: the tab strip, the split
-/// panes it is composed from, the painted selection, the find field, and the chrome
-/// messages the window is currently showing.
-///
-/// One value rather than one parameter each, so a surface that grows an accessible
-/// counterpart later extends this struct instead of the whole call chain. `Default` is
-/// the honest description of an ordinary single-pane frame with nothing selected and no
-/// panel open.
+/// Everything a frame publishes besides its plain visible grid: the tab strip, split
+/// panes, painted selection, find field, and chrome messages. `Default` describes an
+/// ordinary single-pane frame with nothing selected and no panel open.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GridFrame<'a> {
     /// The in-grid tab strip, empty when it is not a switcher on screen.
     pub(crate) tabs: &'a [GridTab],
-    /// One entry per visible pane, EMPTY for a single-pane (or zoomed) frame — which is
-    /// then published exactly as it always was, as one whole-screen document.
+    /// One entry per visible pane; empty for a single-pane (or zoomed) frame, which is
+    /// published as one whole-screen document.
     pub(crate) panes: &'a [GridPane],
     /// The whole-screen document's painted selection. Only consulted when `panes` is
     /// empty; a split frame carries its selection per pane.
@@ -532,19 +470,13 @@ pub(crate) struct GridFrame<'a> {
     pub(crate) find: Option<&'a GridFind>,
     /// The chrome messages on screen right now, empty on an ordinary frame.
     pub(crate) messages: &'a [GridMessage],
-    /// The window's own CANONICAL title (`WindowState::current_title`).
+    /// The window's canonical title (`WindowState::current_title`), not necessarily the
+    /// caption bar's string: `apply_title` suppresses the chrome write while the close
+    /// warning or find status owns it.
     ///
-    /// Not always the string on the caption bar: `apply_title`'s title authority
-    /// suppresses the chrome write while the close warning or the find status owns it,
-    /// and a reader should hear what the window IS rather than whichever transient
-    /// message is borrowing its caption.
-    ///
-    /// This becomes the root's name, which is the name every assistive client reads for
-    /// the WINDOW (AT-SPI takes the root `Role::Window` node's name as the frame's; UIA
-    /// and NSAccessibility read it the same way). A constant "aterm" leaves a user with
-    /// five windows open unable to tell them apart by ear, while the sighted user has had
-    /// the running program and the cwd in the titlebar the whole time. Empty falls back
-    /// to the app name, so a window whose title has not been composed yet still has one.
+    /// It becomes the root's name, which AT-SPI, UIA and NSAccessibility read as the
+    /// window's, so several windows can be told apart by ear. Empty falls back to the app
+    /// name.
     pub(crate) window_title: &'a str,
 }
 
@@ -554,8 +486,8 @@ fn tab_node_id(index: usize) -> NodeId {
 }
 
 /// Decode a screen reader's action target back to a tab index, or `None` when the id is
-/// not one of [`grid_tree`]'s tab items. Rejects ids outside the tab range rather than
-/// clamping: a stale request must be a no-op, never a switch to the wrong tab.
+/// not one of [`grid_tree`]'s tab items. Rejects rather than clamps, so a stale request
+/// never switches to the wrong tab.
 pub(crate) fn tab_index_for(node: NodeId) -> Option<usize> {
     node.0
         .checked_sub(TAB_BASE)
@@ -563,18 +495,14 @@ pub(crate) fn tab_index_for(node: NodeId) -> Option<usize> {
         .map(|offset| offset as usize)
 }
 
-/// Word starts within one line, in CHARACTER indices, as AccessKit defines them: index 0
+/// Word starts within one line, in character indices, as AccessKit defines them: index 0
 /// always starts a word, and every non-whitespace character preceded by whitespace starts
-/// the next one (trailing whitespace stays with the word it follows, a line's leading
-/// whitespace is its own word). This is what gives a screen reader working
-/// `GetStringAtOffset(.., WORD_START)` on a terminal line.
+/// the next (trailing whitespace stays with its word; leading whitespace is its own word).
+/// This backs `GetStringAtOffset(.., WORD_START)`.
 ///
-/// The `[u8]` index space is why a run is capped at [`RUN_CHARS`] characters
-/// ([`row_chunks`]): the consumer addresses this list by casting the QUERY
-/// offset to `u8`, so a run longer than 256 characters answers word queries
-/// about the wrong word rather than merely losing precision. Within a run the
-/// indices are exact, and the `break` below is a belt-and-braces guard on an
-/// invariant the chunker already holds.
+/// The consumer addresses this `[u8]` list by casting the query offset to `u8`, so a run
+/// is capped at [`RUN_CHARS`] characters ([`row_chunks`]); within a run the indices are
+/// exact, and the `break` below only guards that invariant.
 fn word_starts_of(line: &str) -> Vec<u8> {
     let mut starts = vec![0u8];
     let mut prev_ws = false;
@@ -588,26 +516,20 @@ fn word_starts_of(line: &str) -> Vec<u8> {
     starts
 }
 
-/// The node id of run `chunk` of row `row` in the terminal document occupying id `slot`.
-///
-/// Slot 0 is the whole-screen document, so a single-pane frame mints exactly the ids it
-/// has always minted — which is what keeps AccessKit's consumer diffing "one line
-/// changed" rather than tearing down the screen.
+/// The node id of run `chunk` of row `row` in the terminal document in id `slot`. Slot 0
+/// is the whole-screen document.
 fn row_run_id(slot: usize, row: usize, chunk: usize) -> NodeId {
     NodeId(ROW_BASE + slot as u64 * PANE_STRIDE + row as u64 * RUNS_PER_ROW + chunk as u64)
 }
 
 /// A [`TextPosition`] naming column `col` of row `row` inside one terminal document.
 ///
-/// The column is clamped to the text the row actually publishes (its trailing blanks are
-/// trimmed away), so a position in a run of empty cells lands ON that row's hard line
-/// break rather than past the end of the node — AccessKit's own rule, and the same clamp
-/// [`crate::accessibility::AccessibleSnapshot::cursor_offset`] applies, so the AT-SPI
-/// `CaretOffset` and the macOS `AXSelectedTextRange` cannot diverge.
-///
-/// A position also names the RUN it sits in, not merely the row: a row wider than
-/// [`RUN_CHARS`] is published as several runs ([`row_chunks`]), and a column addressed
-/// against the row's FIRST run would be off the end of that node.
+/// The column is clamped to the text the row publishes (trailing blanks trimmed), so a
+/// position in empty cells lands on the row's hard line break, not past the node's end:
+/// AccessKit's rule, and the clamp
+/// [`crate::accessibility::AccessibleSnapshot::cursor_offset`] applies, so AT-SPI
+/// `CaretOffset` and macOS `AXSelectedTextRange` agree. The position names the run it
+/// sits in, since a row wider than [`RUN_CHARS`] is several runs ([`row_chunks`]).
 fn text_position(slot: usize, lines: &[&str], row: usize, col: usize) -> Option<TextPosition> {
     let line = lines.get(row)?;
     let trimmed = line.strip_suffix('\n').unwrap_or(line).chars().count();
@@ -619,24 +541,20 @@ fn text_position(slot: usize, lines: &[&str], row: usize, col: usize) -> Option<
     })
 }
 
-/// Emit ONE terminal document — a read-only `Role::Terminal` node plus one
-/// `Role::TextRun` child per visible row — and answer its node id.
+/// Emit one terminal document (a read-only `Role::Terminal` node plus one `Role::TextRun`
+/// child per visible row) and return its node id.
 ///
-/// The run children are what make the platform publish an AT-SPI `Text` interface
-/// (`accesskit_consumer::Node::supports_text_ranges` requires `Role::Terminal` PLUS at
-/// least one text run), which is the difference between a screen reader announcing the
-/// bare name "aterm terminal" and being able to read, review and navigate the screen by
-/// line, word and character.
+/// The runs make the platform publish an AT-SPI `Text` interface
+/// (`accesskit_consumer::Node::supports_text_ranges` requires `Role::Terminal` plus a
+/// run), so a screen reader can read the screen by line, word and character.
 ///
-/// `selection` outranks the cursor when both exist, because that is what a text control
-/// reports and what an assistive client announces: a live highlight IS the selection, and
-/// its far end IS the caret. With nothing selected the caret is published alone as a
-/// degenerate selection; with the cursor hidden (DECTCEM) and nothing selected, NO
-/// selection is published rather than a bogus one — AT-SPI then reports caret offset
-/// `-1`, which is the honest answer.
+/// `selection` outranks the cursor, as in any text control: the highlight is the
+/// selection and its far end the caret. With nothing selected the caret is a degenerate
+/// selection; with the cursor hidden (DECTCEM) and nothing selected, no selection is
+/// published (AT-SPI reports caret offset `-1`).
 ///
 /// `origin` is the document's top-left cell in the visible grid, so a split pane's
-/// announced rectangle is the rectangle it was painted into.
+/// rectangle is the one it was painted into.
 #[allow(
     clippy::too_many_arguments,
     reason = "one document's whole description"
@@ -651,24 +569,17 @@ fn push_terminal_document(
     geom: Option<GridGeometry>,
     selection: Option<GridSpan>,
 ) {
-    // One text run per visible row. `split_inclusive` keeps each row's terminating '\n'
-    // inside its run, which is exactly how AccessKit represents a hard line break: it is
-    // one character of the run, and a caret at end-of-line sits ON it, not past it.
+    // One text run per visible row. `split_inclusive` keeps each row's '\n' in its run,
+    // which is AccessKit's hard line break: one character, with an end-of-line caret on it.
     let lines: Vec<&str> = snap.value().split_inclusive('\n').collect();
     let mut row_ids: Vec<NodeId> = Vec::with_capacity(lines.len());
     let (row_off, col_off) = origin;
 
     for (row, line) in lines.iter().enumerate() {
-        // ONE RUN PER ROW, UNLESS THE ROW OUTRUNS u8 ADDRESSING. AccessKit
-        // carries word starts as `[u8]` AND the consumer addresses them by
-        // casting the QUERY offset to u8 (accesskit_consumer's
-        // `word_starts.binary_search(&(pos.character_index as u8))`), so on a
-        // row longer than 256 characters a query at column 281 wraps to 25 and
-        // answers about a different word entirely — measured on a 300-column
-        // instance. Capping the LIST cannot stop the query from wrapping; only
-        // keeping every run inside the addressable range can. So a wide row is
-        // split into consecutive runs, each its own text run with its own
-        // word starts, which is exactly what runs are for.
+        // One run per row unless the row exceeds u8 addressing: the consumer looks up
+        // word starts with `binary_search(&(pos.character_index as u8))`, so on a row
+        // over 256 characters a query wraps and answers about a different word. A wide
+        // row is therefore split into consecutive runs, each with its own word starts.
         for (chunk_index, chunk) in row_chunks(line).into_iter().enumerate() {
             let line = &chunk;
             let id = row_run_id(slot, row, chunk_index);
@@ -682,9 +593,9 @@ fn push_terminal_document(
             );
             run.set_word_starts(word_starts_of(line.strip_suffix('\n').unwrap_or(line)));
             if let Some(g) = geom {
-                // One character per cell (`push_visible_row` emits exactly one char per
-                // rendered cell, wide-glyph continuations included), so the character index
-                // IS the column. The hard line break is zero-width at the end of the row.
+                // One character per cell (`push_visible_row` emits one per rendered cell,
+                // wide-glyph continuations included), so the character index is the
+                // column. The hard line break is zero-width at the end of the row.
                 let mut positions: Vec<f32> = Vec::with_capacity(line.len());
                 let mut widths: Vec<f32> = Vec::with_capacity(line.len());
                 let col0 = chunk_index * RUN_CHARS;
@@ -709,9 +620,8 @@ fn push_terminal_document(
 
     let mut grid = Node::new(Role::Terminal);
     grid.set_label(label);
-    // Retained for the platforms whose "value" is a plain string (UIA, NSAccessibility);
-    // AT-SPI's Value interface is numeric and correctly ignores it, reading the text runs
-    // above through the Text interface instead.
+    // For platforms whose "value" is a plain string (UIA, NSAccessibility); AT-SPI's Value
+    // interface is numeric and ignores it, reading the text runs through Text instead.
     grid.set_value(snap.value().to_string());
     grid.set_read_only();
     grid.set_text_direction(TextDirection::LeftToRight);
@@ -742,12 +652,8 @@ fn push_terminal_document(
 }
 
 /// Emit the find panel's query field: a `Role::SearchInput` carrying the live query, its
-/// caret, and the panel's own answer as the accessible description.
-///
-/// The panel is painted as terminal cells, so its text is ALREADY inside the grid
-/// document — but only as anonymous output. Without this node a screen reader user who
-/// presses the find chord hears nothing change, keeps hearing the shell prompt's caret,
-/// and types into a field the tree never mentions.
+/// caret, and the panel's answer as the accessible description. Without it the painted
+/// panel is anonymous grid text and the reader's caret stays on the shell prompt.
 fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
     let mut run = Node::new(Role::TextRun);
     run.set_value(find.query.clone());
@@ -767,8 +673,8 @@ fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
         field.set_description(find.status.clone());
     }
     field.set_children(vec![FIND_RUN]);
-    // The caret in the QUERY, capped at its length: the field is one line, so it is one
-    // run and the character index is the caret index.
+    // The caret in the query, capped at its length: one line, one run, so the character
+    // index is the caret index.
     let caret = TextPosition {
         node: FIND_RUN,
         character_index: find.caret.min(find.query.chars().count()),
@@ -781,25 +687,19 @@ fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
     nodes.push((FIND, field));
 }
 
-/// Emit one chrome message as a LIVE REGION and answer its node id.
+/// Emit one chrome message as a live region and return its node id.
 ///
-/// THE ANNOUNCED STRING GOES IN BOTH THE NAME AND THE VALUE, because the three platforms
-/// read different halves and a node carrying one of them is audible on some and silent on
-/// the rest: `accesskit_atspi_common` announces the NAME (and only when the name changes),
-/// `accesskit_windows` raises `LiveRegionChanged` on the same name change and the reader
-/// then reads the name, while `accesskit_macos` announces the VALUE and raises nothing at
-/// all for a node that has none. `crate::native_accessibility::announce_live` states the
-/// same rule for the native tab apps' live regions.
+/// The announced string goes in both the name and the value: `accesskit_atspi_common`
+/// announces the name (on change), `accesskit_windows` raises `LiveRegionChanged` on the
+/// name change and reads the name, and `accesskit_macos` announces the value and raises
+/// nothing for a node without one. `crate::native_accessibility::announce_live` follows
+/// the same rule.
 ///
-/// `bounds` only for a message that HAS a rectangle — see [`GridMessage::bar_row`]. A
-/// floating card and a band spliced over grid rows are things the user is TOLD, not places
-/// on the glass, and a wrong rectangle would put the announcement somewhere the words are
-/// not; a status band reserves its own row and the geometry knows exactly where it is.
+/// `bounds` only for a message with a rectangle (see [`GridMessage::bar_row`]); a
+/// message spliced over grid rows is told, not placed.
 ///
-/// The message does NOT take focus, not even when it is assertive. Focus is the tree's
-/// statement of where the keyboard is, and the keyboard is still in the terminal — the
-/// paste confirmation is answered by Enter/Escape reaching the very grid this would have
-/// stolen focus from.
+/// The message never takes focus, even when assertive: the keyboard is still in the
+/// terminal, and the paste confirmation is answered by Enter/Escape reaching the grid.
 fn push_message(
     nodes: &mut Vec<(NodeId, Node)>,
     message: &GridMessage,
@@ -830,9 +730,8 @@ fn push_message(
             y1: y0 + g.bar_h,
         });
     }
-    // Each capsule is a BUTTON of its own, named by the full label (the painted
-    // form may be the abbreviation), bounded by its cells within the row's rect,
-    // and clickable — so a reader can press `Apply now` without pressing the row.
+    // Each capsule is its own button, named by the full label (the painted form may be
+    // abbreviated), bounded by its cells within the row, and clickable.
     if let Some(band_row) = message.message.band_row_index() {
         let mut children = Vec::with_capacity(message.capsules.len());
         for cap in &message.capsules {
@@ -859,10 +758,8 @@ fn push_message(
             node.set_children(children);
         }
     }
-    // A determinate meter as the platform's own numeric value, so AT-SPI publishes a
-    // `Value` interface on the progress bar and a reader can ask "how far along" instead
-    // of waiting for the next sentence. An absent fill leaves the node numerically
-    // unset, which is exactly how AccessKit spells an indeterminate progress bar.
+    // A determinate meter as a numeric value, so AT-SPI publishes a `Value` interface on
+    // the progress bar. No fill leaves the value unset: AccessKit's indeterminate bar.
     if let Some(fill) = message.progress {
         node.set_min_numeric_value(0.0);
         node.set_max_numeric_value(1.0);
@@ -875,29 +772,22 @@ fn push_message(
     id
 }
 
-/// DEFAULT-2: the accessibility tree for a plain terminal session (no overlay open).
+/// The accessibility tree for a plain terminal session (no overlay open).
 ///
-/// A `Role::Window` root parenting, in the order they are painted: the visible tab strip
-/// (when it is on screen and is a switcher), the chrome MESSAGES the window is currently
-/// showing ([`ChromeMessage`] — live regions, so they are spoken as they arrive rather
-/// than waiting to be found), the find panel's query field (while find mode is live), and
-/// the terminal itself — ONE read-only `Role::Terminal` document for an ordinary frame,
-/// or one PER VISIBLE PANE for a composed split, since a split frame's rows carry every
-/// pane side by side and read whole they are two unrelated programs' output spliced
-/// together.
+/// A `Role::Window` root parenting, in painted order: the visible tab strip (when on
+/// screen and a switcher), the chrome messages being shown ([`ChromeMessage`], live
+/// regions spoken as they arrive), the find field (while find mode is live), and the
+/// terminal: one read-only `Role::Terminal` document for an ordinary frame, or one per
+/// visible pane for a split.
 ///
-/// FOCUS is the tree's statement of where the keyboard is, and every assistive client
-/// reads it: the find field while the panel owns the keys, else the focused pane, else
-/// the single grid.
+/// Focus is where the keyboard is: the find field while the panel owns the keys, else
+/// the focused pane, else the single grid.
 ///
-/// The events follow from the structure, not from a second code path: AccessKit's consumer
-/// diffs this tree against the previously published one and synthesises
-/// `object:text-changed:insert` / `:delete` from the row text that actually changed and
-/// `object:text-caret-moved` from the selection focus that actually moved. That is why the
-/// row node ids ([`ROW_BASE`]) must stay stable across frames.
-///
-/// The grid text is the SAME snapshot the SIGUSR1 `.txt` capture and the AppKit publisher
-/// use, so the three never diverge.
+/// Events follow from the structure: AccessKit's consumer diffs this tree against the
+/// previous one and synthesises `object:text-changed:insert` / `:delete` and
+/// `object:text-caret-moved`, which is why row ids ([`ROW_BASE`]) stay stable across
+/// frames. The grid text is the same snapshot the SIGUSR1 `.txt` capture and the AppKit
+/// publisher use.
 pub(crate) fn grid_tree(
     snap: &crate::accessibility::AccessibleSnapshot,
     geom: Option<GridGeometry>,
@@ -909,9 +799,8 @@ pub(crate) fn grid_tree(
     let mut root_children: Vec<NodeId> =
         Vec::with_capacity(3 + frame.panes.len() + frame.messages.len());
 
-    // The tab strip, when one is on screen and switching between tabs is a thing the user
-    // can actually do. Each tab is focusable and clickable; the OS routes both back
-    // through `tab_index_for`.
+    // The tab strip, when on screen and a switcher. Each tab is focusable and clickable;
+    // the OS routes both back through `tab_index_for`.
     if !frame.tabs.is_empty() {
         let mut items: Vec<NodeId> = Vec::with_capacity(frame.tabs.len());
         for tab in frame.tabs {
@@ -951,9 +840,7 @@ pub(crate) fn grid_tree(
         root_children.push(TAB_LIST);
     }
 
-    // The chrome messages, in painted order, between the strip and the grid — which is
-    // where the status bands physically are, and a defensible place to meet the two
-    // surfaces that float above or overwrite the grid's top rows. They come BEFORE the
+    // The chrome messages, in painted order, between the strip and the grid, before the
     // terminal so a reader stepping into the window meets the interruption first.
     for message in ChromeMessage::ORDER
         .iter()
@@ -967,9 +854,8 @@ pub(crate) fn grid_tree(
         root_children.push(FIND);
     }
 
-    // One document per visible pane, or the whole composed screen as one when the frame
-    // is not split. A pane's slot (never its position in this list) picks its row-id
-    // block, so a sibling closing does not renumber a surviving pane's lines.
+    // One document per visible pane, or the whole screen as one. A pane's slot (never its
+    // list position) picks its row-id block.
     let mut focused_pane: Option<NodeId> = None;
     if frame.panes.is_empty() {
         push_terminal_document(
@@ -1003,7 +889,7 @@ pub(crate) fn grid_tree(
         }
     }
 
-    // Focus follows the KEYBOARD, which is what every assistive client reads it as: the
+    // Focus follows the keyboard: the
     // find field while the panel owns the keys, else the pane the keyboard is in. The
     // last child is the fallback — the single grid on an ordinary frame, and the last pane
     // on a split whose focus the layout could not name, which is a real node either way.
@@ -1035,9 +921,8 @@ pub(crate) fn grid_tree(
 mod tests {
     use super::*;
 
-    /// A real engine's visible grid, so every assertion below runs against the genuine
-    /// `AccessibleSnapshot::value()` (the anti-divergence anchor with the SIGUSR1 `.txt`
-    /// snapshot), not a hand-written string.
+    /// A real engine's visible grid, so assertions run against the genuine
+    /// `AccessibleSnapshot::value()` (shared with the SIGUSR1 `.txt` snapshot).
     fn live_grid(
         rows: u16,
         cols: u16,
@@ -1065,14 +950,11 @@ mod tests {
         bar_h: 18.0,
     };
 
-    /// THE BAND ROWS ARE NOT MUTE, AND THEY ARE SOMEWHERE. They reserve real terminal
-    /// rows and are the only announcement of work the user did not start (a toolchain
-    /// installing, an update downloading), so a tree that omitted them both described a
-    /// window taller than the one on glass and said nothing about the work. Published in
-    /// painted order between the strip and the grid, each carrying the band rectangle it
-    /// was drawn into — which is what lets a magnifier follow it and a click reach it —
-    /// while the surfaces with no fixed place on the glass carry none. Each capsule is a
-    /// button child bounded by its own cells.
+    /// Band rows are published and placed: they reserve real terminal rows and announce
+    /// work the user did not start (a toolchain installing, an update downloading). They
+    /// appear in painted order between the strip and the grid, each with the band
+    /// rectangle it was drawn into, while surfaces with no fixed place carry none. Each
+    /// capsule is a button child bounded by its own cells.
     #[test]
     fn a_status_band_is_published_where_it_is_painted() {
         let snap = live_grid(2, 20, b"hi", Some((0, 2)));
@@ -1161,9 +1043,8 @@ mod tests {
         );
     }
 
-    /// DEFAULT-2: `grid_tree` publishes the terminal grid as a read-only `Role::Terminal`
-    /// node under a `Role::Window` root, carrying the snapshot's visible text — what a
-    /// screen reader reads on a plain session.
+    /// `grid_tree` publishes the grid as a read-only `Role::Terminal` node under a
+    /// `Role::Window` root, carrying the snapshot's visible text.
     #[test]
     fn grid_tree_publishes_the_terminal_grid() {
         let snap = live_grid(2, 10, b"hello", Some((0, 5)));
@@ -1188,14 +1069,11 @@ mod tests {
         );
     }
 
-    /// THE POINT OF THIS MODULE'S TERMINAL BRANCH: the grid is a real text document, not
-    /// an opaque node with a name. `accesskit_consumer::Node::supports_text_ranges()` —
-    /// the exact predicate `accesskit_atspi_common` consults before it puts
-    /// `org.a11y.atspi.Text` on the node — requires `Role::Terminal` PLUS at least one
-    /// `Role::TextRun` child, so the row runs below are what turn "aterm terminal" into a
-    /// screen a blind user can read. One run per visible row, each carrying its own hard
-    /// line break as one character, and the runs concatenating BYTE-FOR-BYTE back to the
-    /// snapshot text.
+    /// The grid is a real text document: `accesskit_consumer::Node::supports_text_ranges()`
+    /// (which `accesskit_atspi_common` consults before exposing `org.a11y.atspi.Text`)
+    /// requires `Role::Terminal` plus a `Role::TextRun` child. One run per visible row,
+    /// each carrying its hard line break as one character, concatenating byte for byte
+    /// back to the snapshot text.
     #[test]
     fn terminal_node_publishes_one_text_run_per_row() {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
@@ -1239,11 +1117,9 @@ mod tests {
         assert!(rebuilt.starts_with("alpha\nbeta\n"), "sanity: {rebuilt:?}");
     }
 
-    /// The caret is a degenerate selection on the cursor's row run, at the cursor's
-    /// column, and it lands on exactly the offset `AccessibleSnapshot::cursor_offset`
-    /// reports — the number AT-SPI serves as `CaretOffset` and macOS as
-    /// `AXSelectedTextRange`. Both are derived here from the same clamped column, so the
-    /// two platforms cannot disagree about where the cursor is.
+    /// The caret is a degenerate selection on the cursor's row run at the cursor's column,
+    /// at exactly the offset `AccessibleSnapshot::cursor_offset` reports (AT-SPI's
+    /// `CaretOffset`, macOS's `AXSelectedTextRange`), so the platforms agree.
     #[test]
     fn caret_is_a_degenerate_selection_at_the_cursor() {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
@@ -1263,9 +1139,8 @@ mod tests {
         assert_eq!(snap.cursor_offset(), Some(10));
     }
 
-    /// A caret parked in a row's trailing blanks clamps ONTO that row's hard line break
-    /// (AccessKit's rule: "when the caret is at the end of such a line, the focus should
-    /// be on the line break, not after it"), matching `cursor_offset`'s own clamp.
+    /// A caret in a row's trailing blanks clamps onto that row's hard line break
+    /// (AccessKit's rule), matching `cursor_offset`'s own clamp.
     #[test]
     fn caret_in_trailing_blanks_clamps_onto_the_line_break() {
         let snap = live_grid(2, 20, b"hi", Some((0, 17)));
@@ -1283,8 +1158,8 @@ mod tests {
         );
     }
 
-    /// A hidden cursor (DECTCEM) publishes NO selection rather than a bogus one; AT-SPI
-    /// then reports caret offset -1, which is the honest answer.
+    /// A hidden cursor (DECTCEM) publishes no selection; AT-SPI then reports caret
+    /// offset -1.
     #[test]
     fn hidden_cursor_publishes_no_caret() {
         let snap = live_grid(2, 10, b"hello", None);
@@ -1293,16 +1168,9 @@ mod tests {
         assert_eq!(snap.cursor_offset(), None);
     }
 
-    /// Row node ids are STABLE across frames. This is what makes AccessKit's consumer diff
-    /// report "one line changed" (an `object:text-changed` insert/delete pair) instead of
-    /// tearing the whole screen down and rebuilding it, and it is the reason a screen
-    /// reader hears the new output line rather than the entire visible buffer.
-    /// A row wider than the `[u8]` word-index space is published as SEVERAL
-    /// runs. Measured before this: accesskit's consumer addresses word starts
-    /// by casting the query offset to `u8`, so on a 300-column row a query at
-    /// column 281 wrapped to 25 and answered about a different word. Capping
-    /// the list could not stop the query from wrapping; keeping every run
-    /// inside the addressable range can.
+    /// A row wider than the `[u8]` word-index space is published as several runs, each
+    /// inside the addressable range, so a query at column 281 of a 300-column row does
+    /// not wrap to a different word.
     #[test]
     fn a_row_wider_than_the_index_space_is_split_into_addressable_runs() {
         let cols: u16 = 300;
@@ -1362,9 +1230,9 @@ mod tests {
         );
     }
 
-    /// Per-character geometry: one cell per character, so the character index IS the
-    /// column, and the hard line break is zero-width at the end of the row. This is what
-    /// `GetCharacterExtents` and braille cursor routing read.
+    /// Per-character geometry: one cell per character, so the character index is the
+    /// column, and the hard line break is zero-width at the end of the row
+    /// (`GetCharacterExtents`, braille cursor routing).
     #[test]
     fn character_geometry_tracks_the_cell_grid() {
         let snap = live_grid(2, 10, b"abc", Some((0, 3)));
@@ -1417,9 +1285,8 @@ mod tests {
         );
     }
 
-    /// Word starts follow AccessKit's definition, which is what gives a screen reader a
-    /// working "read next word" on a terminal line: index 0 always starts a word, leading
-    /// whitespace is its own word, and trailing whitespace belongs to the word it follows.
+    /// Word starts follow AccessKit's definition: index 0 always starts a word, leading
+    /// whitespace is its own word, and trailing whitespace belongs to the word before it.
     #[test]
     fn word_starts_follow_the_accesskit_definition() {
         assert_eq!(word_starts_of("hello world"), [0, 6]);
@@ -1436,9 +1303,8 @@ mod tests {
     }
 
     /// The tab strip publishes as a `Role::TabList` of focusable, clickable `Role::Tab`
-    /// items carrying the strip's own labels and selection, with bounds taken from the
-    /// SAME segment spans the mouse hit-tests — and each item's id decodes back to the
-    /// index `switch_tab_in` takes.
+    /// items with the strip's labels and selection, bounds from the segment spans the
+    /// mouse hit-tests, and ids that decode back to the index `switch_tab_in` takes.
     #[test]
     fn tab_strip_publishes_as_a_tab_list() {
         let snap = live_grid(2, 40, b"hi", Some((0, 2)));
@@ -1501,11 +1367,9 @@ mod tests {
         );
     }
 
-    /// A PAINTED selection is published as the terminal's text selection, and it outranks
-    /// the caret — which is what an assistive client announces and what every other text
-    /// control reports. Before this the tree carried the caret alone, so a screen-reader
-    /// user who had just selected a line was told nothing about it (AT-SPI answered
-    /// `getNSelections() == 0` over a live highlight).
+    /// A painted selection is published as the terminal's text selection and outranks
+    /// the caret, as in any text control (AT-SPI `getNSelections()` is non-zero over a
+    /// live highlight).
     #[test]
     fn a_painted_selection_is_published_and_outranks_the_caret() {
         let snap = live_grid(3, 20, b"alpha\r\nbeta gamma", Some((2, 0)));
@@ -1537,9 +1401,8 @@ mod tests {
         assert_eq!(caret.focus.node, NodeId(ROW_BASE + 2 * RUNS_PER_ROW));
     }
 
-    /// A selection end parked in a row's trailing blanks clamps onto that row's hard line
-    /// break — the same clamp the caret takes, so the announced range never addresses a
-    /// character past the end of the run that carries it.
+    /// A selection end in a row's trailing blanks clamps onto the row's hard line break,
+    /// like the caret, so the range never addresses past the end of its run.
     #[test]
     fn a_selection_end_in_trailing_blanks_clamps_onto_the_line_break() {
         let snap = live_grid(2, 40, b"hi", Some((1, 0)));
@@ -1558,11 +1421,8 @@ mod tests {
         assert_eq!(sel.focus.character_index, 2, "clamped to \"hi\"");
     }
 
-    /// A COMPOSED SPLIT publishes one terminal document per pane instead of one whose rows
-    /// are two programs' output spliced together. Measured before this on a live instance:
-    /// a vertical split published a single `terminal` node whose every line read
-    /// `<left pane row>▐<right pane row>`, with nothing to say which half was which or
-    /// which one the keyboard was in.
+    /// A composed split publishes one terminal document per pane, not one whose rows read
+    /// `<left pane row>▐<right pane row>`.
     #[test]
     fn a_split_frame_publishes_one_terminal_document_per_pane() {
         // The whole composed row — what the single-document projection would publish.
@@ -1627,10 +1487,9 @@ mod tests {
             "focus names the pane the keyboard is in"
         );
 
-        // Each pane owns a disjoint block of row ids, so a sibling's rows can never be
-        // mistaken for this pane's lines by the consumer's diff.
-        // Slot 0 stays the WHOLE-SCREEN document's, so a split never reuses the ids the
-        // unsplit frame minted for text that is no longer there.
+        // Each pane owns a disjoint block of row ids, so the consumer's diff never
+        // mistakes a sibling's rows for this pane's. Slot 0 stays the whole-screen
+        // document's, so a split never reuses the unsplit frame's ids.
         assert_eq!(
             node(&update, left).children()[0],
             NodeId(ROW_BASE + PANE_STRIDE)
@@ -1651,11 +1510,9 @@ mod tests {
         );
     }
 
-    /// The find panel publishes a real `Role::SearchInput` carrying the live query, a
-    /// caret INSIDE it, and the panel's own answer — and it takes focus, because while the
-    /// panel is up the keyboard belongs to the query, not to the grid. Before this the
-    /// panel existed only as anonymous cells in the grid document and the published caret
-    /// stayed on the shell prompt.
+    /// The find panel publishes a `Role::SearchInput` carrying the live query, a caret
+    /// inside it and the panel's answer, and takes focus, since the keyboard belongs to
+    /// the query while the panel is up.
     #[test]
     fn the_find_field_is_a_text_input_that_owns_focus() {
         let snap = live_grid(2, 20, b"hello", Some((0, 5)));
@@ -1684,8 +1541,8 @@ mod tests {
         assert_eq!(field.description(), Some("match 1 of 3; case sensitive"));
         assert_eq!(field.children(), [FIND_RUN]);
         assert!(field.supports_action(Action::Focus));
-        // A run child is what makes the field a navigable text document
-        // (`supports_text_ranges` needs an input role PLUS a run).
+        // A run child makes the field a navigable text document
+        // (`supports_text_ranges` needs an input role plus a run).
         let run = node(&update, FIND_RUN);
         assert_eq!(run.role(), Role::TextRun);
         assert_eq!(run.value(), Some("hell"));
@@ -1715,13 +1572,9 @@ mod tests {
         }
     }
 
-    /// THE POINT OF A LIVE REGION: the three platforms announce different halves of the
-    /// node, so the sentence goes in BOTH. `accesskit_atspi_common` emits its
-    /// `Announcement` carrying the NAME and `accesskit_windows` raises
-    /// `LiveRegionChanged` for the reader to read the name — while `accesskit_macos`
-    /// announces the VALUE and raises nothing at all for a node without one. A message
-    /// that filled in one of them would be spoken on one operating system and silent on
-    /// the other two.
+    /// A live region carries its sentence in both name and value: `accesskit_atspi_common`
+    /// announces the name, `accesskit_windows` raises `LiveRegionChanged` and reads the
+    /// name, and `accesskit_macos` announces the value (and raises nothing without one).
     #[test]
     fn every_chrome_message_announces_the_same_sentence_by_name_and_by_value() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -1746,12 +1599,9 @@ mod tests {
         }
     }
 
-    /// FLOODING IS THE FAILURE MODE A LIVE REGION HAS. The announcement fires when the
-    /// spoken sentence CHANGES, so a download whose byte counter lived in that sentence
-    /// would say itself over and over on the way to 100%. The volatile figures belong in
-    /// the description — which is a property change on every platform and never an
-    /// announcement — and the meter in the node's own numeric value, where a reader can
-    /// ask for it instead of being told.
+    /// No flooding: announcements fire when the spoken sentence changes, so volatile
+    /// figures go in the description (a property change, never an announcement) and the
+    /// meter in the node's numeric value.
     #[test]
     fn a_status_band_keeps_its_volatile_figures_out_of_the_announcement() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -1794,10 +1644,9 @@ mod tests {
         assert_eq!(early.min_numeric_value(), Some(0.0));
         assert_eq!(early.max_numeric_value(), Some(1.0));
 
-        // No meter and no work in flight ⇒ a plain status band (AT-SPI StatusBar),
-        // left numerically unset. (A BUSY row is a value-less `ProgressIndicator`,
-        // ruling 142 — `an_indeterminate_row_is_a_busy_progress_indicator`; its
-        // spinner frame is paint, never part of what is announced.)
+        // No meter and no work in flight: a plain status band (AT-SPI StatusBar), left
+        // numerically unset. (A busy row is a value-less `ProgressIndicator`, see
+        // `an_indeterminate_row_is_a_busy_progress_indicator`; its spinner is paint only.)
         let flat = tree(&[message(
             ChromeMessage::BandRow1,
             "Installing ALab tools \u{00b7} starting\u{2026}",
@@ -1816,10 +1665,9 @@ mod tests {
         );
     }
 
-    /// AN INDETERMINATE ROW IS A BUSY PROGRESS INDICATOR (design §10.10): work in
-    /// flight with no fraction — the comet — is a `ProgressIndicator` with no numeric
-    /// value, which is how AccessKit spells an indeterminate progress bar; a warning
-    /// is still an `Alert`, busy or not.
+    /// An indeterminate row (work in flight with no fraction, the comet) is a
+    /// `ProgressIndicator` with no numeric value, AccessKit's indeterminate progress bar;
+    /// a warning is still an `Alert`, busy or not.
     #[test]
     fn an_indeterminate_row_is_a_busy_progress_indicator() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -1849,18 +1697,16 @@ mod tests {
         assert_eq!(node(&alarm, id).role(), Role::Alert);
     }
 
-    /// The multi-line-paste guard is a QUESTION, and on the platforms with no native
-    /// alert it is the only one asked. It reaches AT-SPI as a real `Alert` and interrupts
-    /// (assertive) — but it must not take focus: Enter and Escape answer it by reaching
-    /// the very grid a focus move would have taken them from.
+    /// The multi-line-paste guard is a question: a real AT-SPI `Alert`, assertive, that
+    /// does not take focus (Enter and Escape answer it by reaching the grid).
     #[test]
     fn the_paste_confirmation_interrupts_without_stealing_the_keyboard() {
         let snap = live_grid(2, 20, b"hi", Some((0, 2)));
-        // Built from the SAME two seams the painted band writes its title row from, so
-        // this pins the anti-drift property instead of restating one side of it.
+        // Built by the same builders the announcement uses; the literal description
+        // below pins what a screen reader hears.
         let asked = crate::paste_banner::question("one\ntwo\nthree\nfour\nfive\nsix\nseven");
         let messages = vec![GridMessage {
-            detail: Some(crate::paste_banner::ANSWER_KEYS.to_string()),
+            detail: Some(crate::paste_banner::announcement_detail()),
             ..message(ChromeMessage::PasteConfirm, &asked)
         }];
         let update = grid_tree(
@@ -1877,9 +1723,12 @@ mod tests {
         );
         assert_eq!(ask.role(), Role::AlertDialog, "AT-SPI Alert");
         assert_eq!(ask.live(), Some(Live::Assertive));
-        assert_eq!(ask.label(), Some("!  Paste 7 lines?"));
+        assert_eq!(ask.label(), Some("Paste 7 lines?"));
         assert_eq!(ask.label(), Some(asked.as_str()));
-        assert_eq!(ask.description(), Some(crate::paste_banner::ANSWER_KEYS));
+        assert_eq!(
+            ask.description(),
+            Some("Each line may run as a command. Enter pastes \u{00b7} Esc cancels")
+        );
         assert!(
             !ask.supports_action(Action::Click),
             "a generic activate names neither answer"
@@ -1887,11 +1736,9 @@ mod tests {
         assert_eq!(update.focus, GRID, "Enter still reaches the terminal");
     }
 
-    /// A message id round-trips to its own surface, is the SAME id from frame to frame
-    /// (which is what makes AccessKit diff "the region's text changed" rather than tear
-    /// the node down and build another — and the name change is exactly what fires the
-    /// announcement), and is refused by the tab decoder, so a reader's activate on a
-    /// status band can never be read as "switch to tab N".
+    /// A message id round-trips to its own surface, is the same from frame to frame (so
+    /// AccessKit diffs a name change, which fires the announcement), and is refused by the
+    /// tab decoder.
     #[test]
     fn message_ids_round_trip_are_stable_and_are_never_read_as_a_tab() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -1906,8 +1753,8 @@ mod tests {
             assert_eq!(ChromeMessage::from_node(id), Some(kind));
             assert_eq!(tab_index_for(id), None, "{kind:?} is not a tab");
         }
-        // The transient card's slot and the config band's are retired with them:
-        // tombstones no row is published at and no activate decodes to.
+        // Slots 0 and 2 are unused: no row is published there and no activate decodes
+        // to them.
         for (retired, what) in [
             (0, "retired Notice slot"),
             (2, "retired ConfigWarning slot"),
@@ -1986,11 +1833,8 @@ mod tests {
         assert_eq!(id_of(&first), id_of(&second), "one node, new words");
     }
 
-    /// The accessible WINDOW is named what the titlebar names it. Every assistive client
-    /// reads the root's name as the window's, and it is the only thing a user with
-    /// several aterm windows open has to tell them apart by ear — the sighted user has
-    /// had the running program and the cwd up there the whole time. An uncomposed title
-    /// falls back to the app name rather than publishing a nameless window.
+    /// The accessible window is named what the titlebar names it (assistive clients read
+    /// the root's name as the window's); an uncomposed title falls back to the app name.
     #[test]
     fn the_window_is_named_what_its_titlebar_names_it() {
         let snap = live_grid(2, 20, b"hi", None);

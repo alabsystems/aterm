@@ -2,23 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! The host-facing OSC 9 / 99 / 777 desktop-notification surface on
-//! [`AtermGpuTerminal`]: an authorization passthrough plus a poll drain,
-//! mirroring the `take_osc_events` pattern (JSON string out, `None` when
-//! empty). Mirrors the aterm-wasm crate — the GPU binding shares the same
-//! engine front-end, so the notification surface must match.
+//! [`AtermGpuTerminal`]: an authorization passthrough plus a poll drain in the
+//! `take_osc_events` style (JSON string out, `None` when empty). Mirrors
+//! aterm-wasm.
 //!
-//! The engine dispatches notifications ONLY through its host callbacks
-//! (`set_notification_callback` / `set_advanced_notification_callback`) and
-//! never queues them into the OSC app-event queue, so a poll-based web host
-//! had no way to receive them. The binding closes that gap by wiring both
-//! engine callbacks into a bounded queue at construction
+//! The engine dispatches notifications only through host callbacks, so the
+//! binding wires both callbacks into a bounded queue at construction
 //! ([`wire_notification_queue`]) that
 //! [`AtermGpuTerminal::take_notifications`] drains.
 //!
-//! The engine's authorization gate stays authoritative and fail-closed:
-//! until the host calls [`AtermGpuTerminal::authorize_notifications`] with
-//! `true`, the OSC 9/99/777 handlers return before any callback runs, so
-//! nothing ever enqueues — the queue never sees unauthorized notifications.
+//! The engine's authorization gate stays fail-closed: until
+//! [`AtermGpuTerminal::authorize_notifications`] is called with `true`, the
+//! handlers return before any callback runs, so nothing is queued.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -36,18 +31,14 @@ use crate::{json_string, AtermGpuTerminal};
 /// `Rc<RefCell<..>>` even though wasm is single-threaded).
 pub(crate) type NotificationQueue = Arc<Mutex<VecDeque<Notification>>>;
 
-/// Cap on undrained notifications. Matches the engine's own
-/// notification-domain cap (`MAX_PENDING_NOTIFICATIONS` in the OSC 99
-/// accumulator); overflow REFUSES the new notification (drop-new) — the same
-/// posture as the engine's `queue_osc_event` / response-buffer caps, which
-/// refuse new data rather than evict old.
+/// Cap on undrained notifications, matching the engine's
+/// `MAX_PENDING_NOTIFICATIONS`. Overflow drops the new notification, like the
+/// engine's other queue caps.
 pub(crate) const MAX_QUEUED_NOTIFICATIONS: usize = 64;
 
 /// Wire the terminal's simple (OSC 9) and advanced (OSC 99 / 777)
-/// notification callbacks into a fresh bounded queue, returning the drain
-/// handle. Called once at binding construction; the engine's fail-closed
-/// authorization default is untouched, so the callbacks stay unreachable
-/// until the host authorizes.
+/// notification callbacks into a fresh bounded queue and return the drain
+/// handle. Authorization stays fail-closed.
 pub(crate) fn wire_notification_queue(term: &mut Terminal) -> NotificationQueue {
     let queue: NotificationQueue = Arc::new(Mutex::new(VecDeque::new()));
     // OSC 9 carries a bare message string; native hosts surface it as a BODY
@@ -116,23 +107,17 @@ fn urgency_label(urgency: NotificationUrgency) -> &'static str {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl AtermGpuTerminal {
     /// Authorize (`true`) or revoke (`false`) OSC 9 / 99 / 777 desktop
-    /// notifications. The engine is fail-closed by default: until the host
-    /// authorizes, the notification handlers return before any dispatch, so
-    /// nothing reaches [`Self::take_notifications`]. Revoking restores that
-    /// default; already-queued notifications stay drainable (they were
-    /// authorized when dispatched).
+    /// notifications (fail-closed by default). Already-queued notifications
+    /// stay drainable after a revoke.
     pub fn authorize_notifications(&mut self, allowed: bool) {
         self.term.set_allow_notifications(allowed);
     }
 
-    /// Drain pending desktop notifications (queued since the last drain) as a
-    /// JSON array of `{"id","title","body","urgency"}` objects — string or
-    /// `null` fields, urgency ∈ `"low"|"normal"|"critical"`; `None` when
-    /// nothing is pending. OSC 9's bare message arrives as `body` with no
-    /// title (the native mapping); OSC 99/777 carry their structured
-    /// id/title/body. The queue is bounded (new notifications are dropped
-    /// beyond the cap until drained), so poll after `process` like
-    /// `take_osc_events`.
+    /// Drain pending desktop notifications as a JSON array of
+    /// `{"id","title","body","urgency"}` objects (string or `null` fields,
+    /// urgency ∈ `"low"|"normal"|"critical"`); `None` when nothing is pending.
+    /// OSC 9's bare message arrives as `body` with no title. The queue is
+    /// bounded, so poll after `process` like `take_osc_events`.
     pub fn take_notifications(&mut self) -> Option<String> {
         drain_notifications_json(&self.notifications)
     }

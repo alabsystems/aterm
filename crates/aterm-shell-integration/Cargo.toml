@@ -3,6 +3,9 @@
 
 [package]
 name = "aterm-shell-integration"
+# Integration tests are declared below, not discovered. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,9 +14,8 @@ description = "Shell integration (OSC 7/133/633) — extracted from aterm-core f
 
 [dependencies]
 # First-party, dependency-free SHA-256: the NAME of the per-build script folder
-# (`prepare`'s content address, 2026-09-24). Not a security boundary — a same-user
-# writer can do anything — but a collision-free one, so two builds whose scripts
-# differ never share a folder.
+# (`prepare`'s content address). Not a security boundary, but collision-free, so
+# two builds whose scripts differ never share a folder.
 aterm-digest = { workspace = true }
 
 # THE workspace's one audited entropy surface for the capability-nonce mint
@@ -24,25 +26,27 @@ aterm-digest = { workspace = true }
 [target.'cfg(any(unix, windows))'.dependencies]
 aterm-uds = { workspace = true }
 
-# THERE IS DELIBERATELY NO wasm32 DEPENDENCY TABLE HERE, and src/lib.rs's
-# `fill_nonce_entropy` carries the reasoning: the capability-nonce mint has one
-# caller in the workspace (crates/aterm-gui/src/spawn.rs, seeding a spawned
-# shell's environment) and a browser has no PTY to spawn, so the wasm arm was a
-# `getrandom = { version = "0.2", features = ["js"] }` row holding an entropy
-# bridge nothing could reach. The mint is `cfg(any(unix, windows))` now — it
-# exists exactly where `aterm_uds::rand` does, and adding a target means adding
-# its audited CSPRNG here first. Guarded by tools/grep_guard.sh B18.
+# Deliberately no wasm32 dependency table (it held a `getrandom` row with the
+# `js` feature, an entropy bridge nothing could reach): a browser spawns no shell, so the
+# nonce mint exists only where `aterm_uds::rand` does (src/lib.rs
+# `fill_nonce_entropy`). A new target adds its audited CSPRNG here first.
+# Guarded by tools/grep_guard.sh B18.
 
 [dev-dependencies]
 # The Containment write roots, which the script cache must lie outside
 # (`test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots`).
 aterm-containment = { workspace = true }
-aterm-tempfile = { workspace = true }
+# `stand_in`: the live fixtures' stand-in programs, one pre-assessed inode per body.
+aterm-tempfile = { workspace = true, features = ["stand-in"] }
 # The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
-# the two single-test-per-binary integration tests here must clear a shell var
+# the two env-clearing integration tests in shell_suite must clear a shell var
 # for the length of one call, and every mutation in the workspace routes through
 # that helper rather than a raw `set_var`/`remove_var`.
 aterm-log = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "shell_suite"
+path = "tests/shell_suite.rs"

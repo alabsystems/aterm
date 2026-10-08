@@ -46,7 +46,7 @@
 //! and writes `aterm.log` lines or a panic report lends them to the run.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use aterm_update::recovery_ledger::{
     EndClass, LaunchKind, Pressure, PrevRun, Row, Tri, Uptime, append_row, ledger_path, read_rows,
@@ -124,9 +124,7 @@ fn own_birth() -> Option<u64> {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    aterm_time::unix_secs().unwrap_or(0)
 }
 
 /// Record this launch in the ledger, on a thread of its own: the log scan reads up
@@ -590,22 +588,19 @@ mod tests {
         trial: 0,
     };
 
-    struct Scratch(PathBuf);
+    struct Scratch(aterm_tempfile::TempDir);
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "aterm-recovery-census-{tag}-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos())
-            ));
-            std::fs::create_dir_all(&dir).expect("scratch dir");
-            Self(dir)
+            Self(
+                aterm_tempfile::Builder::new()
+                    .prefix(&format!("aterm-recovery-census-{tag}-"))
+                    .tempdir()
+                    .expect("scratch dir"),
+            )
         }
         fn file(&self, name: &str, body: &str) -> PathBuf {
-            let path = self.0.join(name);
+            let path = self.0.path().join(name);
             std::fs::write(&path, body).expect("write fixture");
             path
         }
@@ -615,12 +610,6 @@ mod tests {
                 .map(|(secs, pid, body)| format!("{secs}.123 {pid} INFO aterm_gui: {body}\n"))
                 .collect();
             self.file("aterm.log", &text);
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -646,7 +635,7 @@ mod tests {
             launch: LaunchKind::Cold,
             prev: PrevRun::none(),
         };
-        append_row(&ledger_path(&s.0), &previous).expect("seed the ledger");
+        append_row(&ledger_path(s.0.path()), &previous).expect("seed the ledger");
     }
 
     fn marker(pid: u32, birth: u64) -> String {
@@ -665,7 +654,13 @@ mod tests {
             (BORN + 3600, 4242, QUIT_LINE),
             (BORN + 3601, 9999, "another process"),
         ]);
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::Clean);
         assert_eq!(row.prev.pid, Some(4242));
         assert_eq!(row.prev.build, Some(1_790_305_290));
@@ -690,7 +685,13 @@ mod tests {
             (BORN + 1, 4242, "watchdog armed"),
             (BORN + 70, 4242, "idle"),
         ]);
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::Clean);
         assert_eq!(
             row.prev.uptime,
@@ -715,7 +716,13 @@ mod tests {
                 "MAIN-THREAD STALL: no heartbeat for 5.1s while inside `UserEvent`",
             ),
         ]);
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::Killed);
         assert_eq!(
             row.prev.uptime,
@@ -743,7 +750,13 @@ mod tests {
             (BORN + 12, 4242, &format!("{PRESSURE_LINE} critical")),
             (BORN + 13, 4242, &format!("{PRESSURE_LINE} normal")),
         ]);
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::Killed);
         assert_eq!(row.prev.stall, Tri::No);
         assert_eq!(row.prev.pressure, Pressure::Normal);
@@ -757,7 +770,13 @@ mod tests {
             &format!("{}.seen", marker(4242, BORN)),
             "aterm: fatal signal 11\n",
         );
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::Signal(11));
         // The fixture was written now, so its mtime is now: the uptime is exact.
         assert_eq!(row.prev.uptime.map(|u| u.at_least), Some(false));
@@ -774,7 +793,13 @@ mod tests {
             &format!("{}.seen", marker(4242, BORN)),
             "aterm: fatal signal 6 \u{2014} crash marker written\n",
         );
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::Signal(6));
     }
 
@@ -793,7 +818,13 @@ mod tests {
             &format!("{}.seen", marker(4242, BORN)),
             "aterm: fatal signal 6\n",
         );
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::Panic);
         assert_eq!(
             row.prev.uptime,
@@ -812,7 +843,13 @@ mod tests {
         // its lines predate this run's birth.
         s.file(&format!("{}.seen", marker(4242, BORN - 86_400)), "");
         s.log(&[(BORN - 86_000, 4242, "MAIN-THREAD STALL: an old one")]);
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(
             row.prev.class,
             EndClass::Unknown,
@@ -833,13 +870,19 @@ mod tests {
             alive: Some((4242, BORN)),
             trial: 0,
         };
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &alive);
+        let row = census_row(s.0.path(), &me(5000), LaunchKind::Cold, BORN + 5000, &alive);
         assert_eq!(row.prev.class, EndClass::Running);
         let reused = Fake {
             alive: Some((4242, BORN + 4000)),
             trial: 0,
         };
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &reused);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &reused,
+        );
         assert_ne!(
             row.prev.class,
             EndClass::Running,
@@ -855,7 +898,13 @@ mod tests {
             alive: Some((4242, BORN)),
             trial: 1,
         };
-        let row = census_row(&s.0, &me(5000), LaunchKind::Successor, BORN + 700, &trial);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Successor,
+            BORN + 700,
+            &trial,
+        );
         assert_eq!(row.launch, LaunchKind::Successor);
         assert_eq!(row.prev.class, EndClass::Handoff);
         assert_eq!(row.prev.pid, Some(4242));
@@ -878,7 +927,13 @@ mod tests {
             ),
             "aterm: fatal signal 11\n",
         );
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(
             row.prev.class,
             EndClass::None,
@@ -887,7 +942,13 @@ mod tests {
         assert_eq!(row.prev.pid, None);
         // The daily driver's own marker beside it is still read.
         s.file(&format!("{}.seen", marker(777, BORN)), "");
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.pid, Some(777));
         assert_eq!(row.prev.class, EndClass::Killed);
     }
@@ -895,10 +956,22 @@ mod tests {
     #[test]
     fn the_first_row_classifies_the_newest_artifact_or_says_none() {
         let s = Scratch::new("first");
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::None);
         s.file(&format!("{}.seen", marker(777, BORN)), "");
-        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(row.prev.class, EndClass::Killed);
         assert_eq!(row.prev.pid, Some(777));
         assert_eq!(row.prev.build, None);
@@ -921,9 +994,15 @@ mod tests {
             version: "0.93.0".into(),
             ..me(5000)
         };
-        let first = census_row(&s.0, &old_image, LaunchKind::Cold, BORN + 5000, &NOBODY);
+        let first = census_row(
+            s.0.path(),
+            &old_image,
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
         assert_eq!(first.prev.pid, Some(4242));
-        append_row(&ledger_path(&s.0), &first).expect("append");
+        append_row(&ledger_path(s.0.path()), &first).expect("append");
         s.log(&[
             (BORN + 5001, 5000, "watchdog armed"),
             (BORN + 9000, 5000, "update apply: cold lane"),
@@ -934,7 +1013,7 @@ mod tests {
             alive: Some((5000, BORN + 5000)),
             trial: 0,
         };
-        let again = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 9002, &alive);
+        let again = census_row(s.0.path(), &me(5000), LaunchKind::Cold, BORN + 9002, &alive);
         assert_eq!(again.prev.pid, Some(5000), "the image it replaced");
         assert_eq!(again.prev.class, EndClass::Handoff);
         assert_eq!(again.prev.build, Some(1_790_300_000));
@@ -942,8 +1021,8 @@ mod tests {
         assert_eq!(again.prev.uptime.map(|u| u.secs), Some(4002));
         assert_eq!(again.prev.stall, Tri::No);
         // And the ledger then counts one end of 4242, not two.
-        append_row(&ledger_path(&s.0), &again).expect("append");
-        let rows = read_rows(&ledger_path(&s.0));
+        append_row(&ledger_path(s.0.path()), &again).expect("append");
+        let rows = read_rows(&ledger_path(s.0.path()));
         assert_eq!(
             rows.iter().filter(|r| r.prev.pid == Some(4242)).count(),
             1,

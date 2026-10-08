@@ -63,10 +63,14 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ApplyRetry {
     /// The cause is a PERSON's to change — the copy in /Applications is not the
-    /// signed release, so no lane can install over it (2026-09-14) — and no retry
-    /// will succeed until they do. The surfaces say the remedy instead of a
-    /// promise.
-    NeedsPerson,
+    /// signed release, so no lane can install over it (2026-09-14), or its
+    /// folder cannot be written by this user (round eight, finding 14) — and no
+    /// retry will succeed until they do. The surfaces say the remedy instead of
+    /// a promise, and the remedy is the one the standing block names
+    /// ([`PersonRemedy`]): never re-derived from whatever reason the ledger
+    /// booked last, which an attempt that failed for another reason before it
+    /// reached the refusal rewrites while the block stands.
+    NeedsPerson(PersonRemedy),
     /// The lane still intends this artifact: a live intent, or a latch with a lapse
     /// deadline, both of which `about_to_wait` comes back to. The honest advice is
     /// "nothing to do".
@@ -84,6 +88,74 @@ pub(crate) enum ApplyRetry {
     /// The manual-only latch holds with no lapse deadline (or automatic apply is
     /// switched off): this build moves only when the person asks it to.
     ManualOnly,
+    /// The stood-down build is the installed activation and its boot trial has
+    /// no launch to spare (`App::latched_activation_trial_spent`): any start,
+    /// the Version menu's included, is the one the trial rolls back, so no
+    /// surface asks for one. Only a newer release moves it.
+    NewerRelease,
+}
+
+/// WHAT A PERSON DOES about a refusal only a person can clear, carried by
+/// [`ApplyRetry::NeedsPerson`] from the block that answered it (round eight,
+/// finding 14's review).
+///
+/// It used to be read off the ledger's latest reason at render time. While a
+/// folder's block stands, the person's own retry can fail for an ordinary
+/// reason before the folder is asked (the apply lock's wait or the staged
+/// copy's `codesign` running past its budget, a capture refusal): the ledger
+/// then books that reason, the block rightly holds, and every surface sent
+/// the person to "install the signed release" — for a copy that is fine, into
+/// a folder they cannot write. The remedy is the block's; the CAUSE clause
+/// still says how the last attempt ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PersonRemedy {
+    /// The install location's folder cannot be written by this user
+    /// (`aterm_update::is_install_location_refusal`): move the app, or have an
+    /// administrator install the update. Reinstalling the signed release would
+    /// land in the same folder and be refused again.
+    MoveOrAskAdmin,
+    /// The installed copy cannot be the swap's rollback source, or this process
+    /// does not run from one: install the signed release.
+    InstallSignedRelease,
+}
+
+impl PersonRemedy {
+    /// The remedy a person's-to-clear `reason` names, for a surface that has the
+    /// refusal itself and no standing block to ask (the row of a person's press
+    /// whose failure took no block).
+    #[must_use]
+    pub(crate) fn of_refusal(reason: &str) -> Self {
+        if aterm_update::is_install_location_refusal(reason) {
+            Self::MoveOrAskAdmin
+        } else {
+            Self::InstallSignedRelease
+        }
+    }
+
+    /// The sentence, for a detail with a line to spend. It ends on the retry,
+    /// which verifies afresh: a cached refusal never answers a person's own
+    /// press.
+    #[must_use]
+    pub(crate) fn sentence(self) -> &'static str {
+        match self {
+            Self::MoveOrAskAdmin => {
+                "Move aterm to a folder you can write to, such as ~/Applications, or have an \
+                 administrator install the update, then retry."
+            }
+            Self::InstallSignedRelease => {
+                "Install the signed release from the release DMG, then retry."
+            }
+        }
+    }
+
+    /// The few words, for a menu row's tail.
+    #[must_use]
+    pub(crate) fn row_tail(self) -> &'static str {
+        match self {
+            Self::MoveOrAskAdmin => "move aterm or ask an admin",
+            Self::InstallSignedRelease => "install the signed release",
+        }
+    }
 }
 
 /// A STANDING apply-lane failure for the build a surface is currently offering.
@@ -119,7 +191,13 @@ pub(crate) struct ApplyTrouble {
 /// that was attempted and did not complete. It is deliberately not a guess at a
 /// mechanism — "it did not start" would be wrong for an adoption mismatch and for a
 /// preflight that went stale before anything was spawned.
-const GENERIC: (&str, &str) = ("it did not finish applying", "didn\u{2019}t finish");
+const GENERIC: (&str, &str) = ("it did not finish installing", "didn\u{2019}t finish");
+
+/// The open tabs' records over what one handover carries, in a person's
+/// words — the one capture refusal a record names the cause of
+/// (`update_words::capture_refused_waiting`), since closing tabs moves it.
+pub(crate) const TABS_OVER_HANDOVER: &str =
+    "too many tabs were open to move to the new version at once";
 
 /// The apply outcomes this program can actually name, as
 /// `(a substring of a real ledger reason, full clause, short clause)`.
@@ -225,6 +303,14 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "a session\u{2019}s screen could not be captured for the handover",
         "couldn\u{2019}t capture a session",
     ),
+    // A desk past a cap no update carries, which the refusal names
+    // (`restore::RestoreManifest::why_not_whole`): ahead of the generic row,
+    // as closing some is what moves it.
+    (
+        crate::restore::UPDATE_CAP_KEY,
+        "more was open than an update can carry",
+        "too much open",
+    ),
     (
         "the park's capture refused",
         "the open tabs could not be captured for the handover",
@@ -242,16 +328,21 @@ const CAUSES: &[(&str, &str, &str)] = &[
     // opened more while the successor held): something a person can act on.
     (
         "descriptor message carries",
-        "more tabs were open than one handover can carry",
+        TABS_OVER_HANDOVER,
         "too many tabs",
     ),
     // The same fact since the park reads the dialled claim's own limit (round
     // six of the update audit): one message or the chunked grant.
     (
         "descriptor grant carries",
-        "more tabs were open than one handover can carry",
+        TABS_OVER_HANDOVER,
         "too many tabs",
     ),
+    // The open tabs' records over the manifest's cap with every optional part
+    // shed (`WriteOutgoingFailure::ManifestOverCap`, round seven, item 108):
+    // ahead of the "authenticated handoff manifest" row it also contains, as
+    // closing tabs is what moves it.
+    ("records are over the", TABS_OVER_HANDOVER, "too many tabs"),
     // ── Preparation, all of it BEFORE any successor existed
     // (`send_handoff_preparation_failure` for the candidate's pre-park
     // verification; `send_handoff_producer_failure` and the park's own
@@ -279,6 +370,14 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "cannot be the rollback source",
         "the installed copy could not be verified for replacement",
         "installed copy did not verify",
+    ),
+    // ── The install's FOLDER cannot be written (round seven, #3):
+    // `install::install_location_refusal`, asked before the park. An admin-owned
+    // or MDM-managed /Applications run by a standard user.
+    (
+        aterm_update::INSTALL_LOCATION_REFUSAL_KEY,
+        "aterm could not write to the folder it is installed in",
+        "install folder not writable",
     ),
     (
         "does not run from an installed bundle",
@@ -396,6 +495,13 @@ fn clauses(reason: &str) -> (String, String) {
     (full.to_string(), short.to_string())
 }
 
+/// The full clause for a reason this program can NAME, or `None` — for a
+/// record that already says the attempt did not finish, where [`GENERIC`]
+/// would only repeat its title. The raw reason stays in aterm.log.
+pub(crate) fn named_clause(reason: &str) -> Option<&'static str> {
+    named_cause(reason).map(|(full, _)| full)
+}
+
 /// The [`CAUSES`] row this reason matches, if any. One scan, shared by [`clauses`]
 /// and [`ApplyTrouble::cause_is_named`], so "which clause do we say" and "did we
 /// recognise it" can never answer differently.
@@ -480,9 +586,11 @@ impl ApplyTrouble {
             }
             (ApplyRetry::Scheduled, None) => "It will try again by itself.".to_string(),
             (ApplyRetry::ManualOnly, _) => "It will not try again until you ask.".to_string(),
-            (ApplyRetry::NeedsPerson, _) => {
-                "Install the signed release from the release DMG, then retry.".to_string()
-            }
+            (ApplyRetry::NewerRelease, _) => format!(
+                "Starting it again would roll it back; {}.",
+                crate::update_words::NEWER_RELEASE_REPLACES
+            ),
+            (ApplyRetry::NeedsPerson(remedy), _) => remedy.sentence().to_string(),
         }
     }
 
@@ -512,16 +620,17 @@ impl ApplyTrouble {
 
     /// The one-line tail for a MENU ROW ("Install aterm vX — tried twice, didn't
     /// start; will try again"): a Version-menu item and the palette row that mirrors
-    /// it are single lines with no room for a sentence, and both are also the control
-    /// that retries, so the tail ends on what happens next — in the update row's
-    /// words (2026-09-23), never "apply".
+    /// it are single lines with no room for a sentence, and both are the control that
+    /// retries (a build on hold's row opens the details instead), so the tail ends on
+    /// what happens next, in the update row's words (2026-09-23), never "apply".
     #[must_use]
     pub(crate) fn row_tail(&self) -> String {
         let (_, short) = clauses(&self.reason);
         let next = match self.retry {
             ApplyRetry::Scheduled => "will try again",
             ApplyRetry::ManualOnly => "try again now",
-            ApplyRetry::NeedsPerson => "install the signed release",
+            ApplyRetry::NewerRelease => crate::update_words::NEWER_RELEASE_REPLACES,
+            ApplyRetry::NeedsPerson(remedy) => remedy.row_tail(),
         };
         format!("tried {}, {short}; {next}", times(self.attempts))
     }
@@ -534,7 +643,8 @@ impl ApplyTrouble {
         let next = match self.retry {
             ApplyRetry::Scheduled => "will try again",
             ApplyRetry::ManualOnly => "ask to retry",
-            ApplyRetry::NeedsPerson => "install the signed release",
+            ApplyRetry::NewerRelease => crate::update_words::NEWER_RELEASE_REPLACES,
+            ApplyRetry::NeedsPerson(remedy) => remedy.row_tail(),
         };
         format!("Tried {}, {short} \u{b7} {next}.", times(self.attempts))
     }
@@ -555,7 +665,7 @@ impl ApplyTrouble {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyRetry, ApplyTrouble, GENERIC, clauses, times};
+    use super::{ApplyRetry, ApplyTrouble, GENERIC, PersonRemedy, clauses, times};
 
     /// EVERY REASON THIS PROGRAM CAN ACTUALLY WRITE INTO `last_apply_error`, copied
     /// from the producers.
@@ -596,6 +706,10 @@ mod tests {
         // `send_handoff_preparation_failure`, every call site.
         "overlap handoff failed safely: installed bundle failed pre-park verification: \
          code object is not signed at all",
+        "overlap handoff failed safely: installed bundle failed pre-park verification: \
+         install location not writable: /Applications/aterm.app; this install cannot update \
+         itself: move aterm.app to a folder you can write to (such as ~/Applications), or \
+         have an administrator install the update",
         "overlap handoff failed safely: staged update failed pre-park verification: \
          staged build 9 is not newer than 9",
         "overlap handoff failed safely: could not persist the bounded handoff layout",
@@ -603,7 +717,8 @@ mod tests {
         "overlap handoff failed safely: handoff screen carry did not match the committed \
          screen digest",
         "overlap handoff failed safely: could not write the attempt-bound handoff layout",
-        "overlap handoff failed safely: handoff identity set exceeds the proof format",
+        "overlap handoff failed safely: handoff identity set of 4294967296 sessions exceeds \
+         the proof format",
         "overlap handoff failed safely: could not create the adoption-proof channel",
         "overlap handoff failed safely: could not create the handoff-commit channel",
         "overlap handoff failed safely: handoff process could not start: \
@@ -613,6 +728,9 @@ mod tests {
         // stand-downs.
         "overlap handoff failed safely: could not write the authenticated handoff manifest \
          (storage full)",
+        // `ManifestOverCap`, filed `CaptureRefused` (round seven, item 108).
+        "overlap handoff failed safely: could not write the authenticated handoff manifest \
+         (the open tabs' records are over the 4194304-byte limit one handover carries)",
         "overlap handoff failed safely: could not write the attempt-bound handoff layout \
          (write restore manifest: No space left on device (os error 28))",
         "overlap handoff failed safely: could not create the adoption-proof channel \
@@ -638,6 +756,13 @@ mod tests {
          handoff stayed in place; the lane retries once the desk changes",
         "overlap handoff failed safely: the park's capture refused: handoff layout could not \
          be committed canonically; the lane retries once the desk changes",
+        // A desk past a cap no update carries (`RestoreManifest::why_not_whole`).
+        "overlap handoff failed safely: the park's capture refused: 65 windows are open, more \
+         than the 64 an update can carry",
+        "the park's capture refused: 16500 tabs are open, more than the 16384 (64 windows of \
+         256) an update can carry",
+        "the park's capture refused: tab 1 of window 1 has 300 panes, more than the 256 in one \
+         tab an update can carry",
         "the park's capture refused session 7: visible checkpoint set could not be committed \
          canonically: duplicate local id 7; update handoff stayed in place",
         // `screen_digest_refs`, via the park: the refusal names the session, the
@@ -821,6 +946,18 @@ mod tests {
             ),
             "too many tabs"
         );
+        // The tabs' records over the manifest's cap: closing tabs moves it, so
+        // it is not the "could not be set up" its manifest half would match.
+        #[cfg(unix)]
+        {
+            let over_cap = format!(
+                "overlap handoff failed safely: could not write the authenticated handoff \
+                 manifest ({})",
+                crate::seamless::WriteOutgoingFailure::ManifestOverCap
+            );
+            assert_eq!(full(&over_cap), super::TABS_OVER_HANDOVER);
+            assert_eq!(short(&over_cap), "too many tabs");
+        }
         assert_eq!(
             full("overlap handoff failed safely: the outgoing process did not park within 120 s"),
             "the terminal was too busy to hand over"
@@ -850,6 +987,14 @@ mod tests {
                  not be committed canonically"
             ),
             "the open tabs could not be captured for the handover"
+        );
+        // …and a desk past a cap says so, not that it could not be captured.
+        assert_eq!(
+            full(
+                "overlap handoff failed safely: the park's capture refused: tab 1 of window 1 is \
+                 split 33 levels deep, more than the 31 an update can carry"
+            ),
+            "more was open than an update can carry"
         );
     }
 
@@ -1074,7 +1219,12 @@ mod tests {
                       /Applications/aterm.app: valid on disk\n/Applications/aterm.app: \
                       satisfies its Designated Requirement\ntest-requirement: code failed to \
                       satisfy specified code requirement(s); the terminal was left untouched";
-        let trouble = ApplyTrouble::new(6, reason, ApplyRetry::NeedsPerson).expect("trouble");
+        let trouble = ApplyTrouble::new(
+            6,
+            reason,
+            ApplyRetry::NeedsPerson(PersonRemedy::of_refusal(reason)),
+        )
+        .expect("trouble");
         let (full, short) = clauses(reason);
         assert!(
             trouble.cause_is_named(),
@@ -1101,6 +1251,92 @@ mod tests {
             !sentence.contains("try again by itself"),
             "a structural refusal must not promise a retry that cannot succeed: {sentence}"
         );
+    }
+
+    /// Round seven, #3: an install whose folder cannot be written is refused before
+    /// the park, as a person's to clear — and the remedy is to move the app or ask an
+    /// administrator, never to reinstall the signed release (which would land in the
+    /// same folder and be refused again).
+    #[test]
+    fn a_non_writable_install_location_names_its_own_remedy() {
+        let reason = "overlap handoff failed safely: installed bundle failed pre-park \
+                      verification: install location not writable: /Applications/aterm.app; \
+                      this install cannot update itself: move aterm.app to a folder you can \
+                      write to (such as ~/Applications), or have an administrator install the \
+                      update";
+        assert!(ApplyTrouble::needs_person(reason));
+        let trouble = ApplyTrouble::new(
+            1,
+            reason,
+            ApplyRetry::NeedsPerson(PersonRemedy::of_refusal(reason)),
+        )
+        .expect("trouble");
+        assert!(trouble.cause_is_named());
+        let (full, short) = clauses(reason);
+        assert_eq!(
+            full,
+            "aterm could not write to the folder it is installed in"
+        );
+        assert_eq!(short, "install folder not writable");
+        let sentence = trouble.sentence();
+        assert!(sentence.contains("~/Applications"), "{sentence}");
+        assert!(!sentence.contains("signed release"), "{sentence}");
+        assert!(trouble.row_tail().ends_with("move aterm or ask an admin"));
+        assert!(trouble.compact().contains("move aterm or ask an admin"));
+    }
+
+    /// ROUND EIGHT, FINDING 14'S REVIEW — THE REMEDY IS THE STANDING BLOCK'S, NOT
+    /// THE LATEST REASON'S. While a folder's block stands, the person's retry can
+    /// fail for an ordinary reason before the folder is asked, and the ledger
+    /// books that reason: read off it, the remedy became "install the signed
+    /// release", for a copy that is fine and a folder this user cannot write. The
+    /// cause clause still says how the last attempt ended; the next step is the
+    /// remedy the block carried in. CONTROL: the installed copy's block over the
+    /// same booking still says the signed release.
+    #[test]
+    fn a_standing_block_names_its_own_remedy_over_a_later_reason() {
+        let passing = "overlap handoff failed safely: staged update failed pre-park \
+                       verification: the staged update could not be verified just then: \
+                       codesign --verify ran past this apply's verification budget; treating as \
+                       a rejection (a passing condition, not a verdict on the update)";
+        assert!(aterm_update::is_passing_refusal(passing));
+        assert!(!ApplyTrouble::needs_person(passing));
+        for (remedy, says, never) in [
+            (
+                PersonRemedy::MoveOrAskAdmin,
+                (
+                    "Move aterm to a folder you can write to",
+                    "move aterm or ask an admin",
+                ),
+                "signed release",
+            ),
+            (
+                PersonRemedy::InstallSignedRelease,
+                (
+                    "Install the signed release from the release DMG, then retry.",
+                    "install the signed release",
+                ),
+                "Move aterm",
+            ),
+        ] {
+            let trouble =
+                ApplyTrouble::new(2, passing, ApplyRetry::NeedsPerson(remedy)).expect("trouble");
+            let sentence = trouble.sentence();
+            assert!(
+                sentence.contains("could not be checked just then") && sentence.contains(says.0),
+                "the last attempt's cause, then the block's remedy: {sentence}"
+            );
+            assert!(
+                trouble.row_tail().ends_with(says.1),
+                "{}",
+                trouble.row_tail()
+            );
+            assert!(trouble.compact().contains(says.1), "{}", trouble.compact());
+            for surface in [sentence, trouble.row_tail(), trouble.compact()] {
+                assert!(!surface.contains(never), "{remedy:?}: {surface}");
+                assert!(!surface.contains("by itself"), "{surface}");
+            }
+        }
     }
 
     /// A CHECK THAT DID NOT FINISH IS SAID AS A MOMENT, NEVER AS THE PERSON'S
@@ -1158,9 +1394,10 @@ mod tests {
             ),
         ] {
             for retry in [
-                ApplyRetry::NeedsPerson,
+                ApplyRetry::NeedsPerson(PersonRemedy::InstallSignedRelease),
                 ApplyRetry::Scheduled,
                 ApplyRetry::ManualOnly,
+                ApplyRetry::NewerRelease,
             ] {
                 let trouble = ApplyTrouble::new(2, reason, retry).expect("historical failure");
                 assert!(trouble.sentence().contains(historical));
@@ -1169,7 +1406,7 @@ mod tests {
                         surface
                             .to_lowercase()
                             .contains("install the signed release"),
-                        retry == ApplyRetry::NeedsPerson,
+                        matches!(retry, ApplyRetry::NeedsPerson(_)),
                         "historical reason cannot override current policy: {surface}"
                     );
                 }
@@ -1183,7 +1420,21 @@ mod tests {
                             .sentence()
                             .ends_with("It will not try again until you ask.")
                     ),
-                    ApplyRetry::NeedsPerson => assert!(!trouble.sentence().contains("by itself")),
+                    ApplyRetry::NewerRelease => {
+                        // No surface offers the start the boot trial rolls back.
+                        for surface in [trouble.sentence(), trouble.row_tail(), trouble.compact()] {
+                            assert!(
+                                surface.contains(crate::update_words::NEWER_RELEASE_REPLACES)
+                                    && !surface.contains("try again now")
+                                    && !surface.contains("ask")
+                                    && !surface.contains("retry"),
+                                "{surface}"
+                            );
+                        }
+                    }
+                    ApplyRetry::NeedsPerson(_) => {
+                        assert!(!trouble.sentence().contains("by itself"));
+                    }
                 }
             }
         }

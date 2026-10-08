@@ -55,13 +55,13 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
+use aterm_hash::{FNV64_OFFSET, fnv_mix_u64};
 
 /// The BYPASS GATE: whether stream fading may tint this frame at all — a pure,
 /// total function of the five facts the redraw has in hand. Every bypass is a
 /// bypass TO INSTANT (exact bytes), never to a different animation.
 ///
-/// * `enabled` — config `stream_fade` (absent-config default off; the generated
-///   starter file opts in explicitly).
+/// * `enabled` — config `stream_fade` (default off).
 /// * `input_hot` — a keystroke egress awaits its echo: typed characters must
 ///   land instantly (fading the echo would read as added latency).
 /// * `alt_screen` — full-screen programs (vim/less/htop) repaint in place;
@@ -175,14 +175,6 @@ fn tinted_fg(fg: [u8; 3], bg: [u8; 3], alpha: u8) -> [u8; 3] {
     ]
 }
 
-/// FNV-1a fold of one word into a running hash.
-fn fnv(mut h: u64, x: u64) -> u64 {
-    h ^= x;
-    h.wrapping_mul(0x0000_0100_0000_01B3)
-}
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-
 fn underline_id(u: UnderlineStyle) -> u64 {
     match u {
         UnderlineStyle::None => 0,
@@ -218,7 +210,7 @@ fn cell_fp(c: &RenderCell) -> u64 {
     // for each decoration channel that has one.
     let deco_color =
         |c: Option<[u8; 3]>| c.map_or(1 << 32, |rgb| u64::from(aterm_render::rgb_to_u32(rgb)));
-    let mut h = FNV_OFFSET;
+    let mut h = FNV64_OFFSET;
     for x in [
         u64::from(u32::from(c.ch)),
         u64::from(aterm_render::rgb_to_u32(c.fg)),
@@ -227,7 +219,7 @@ fn cell_fp(c: &RenderCell) -> u64 {
         deco_color(c.underline_color),
         deco_color(c.overline_color),
     ] {
-        h = fnv(h, x);
+        h = fnv_mix_u64(h, x);
     }
     h
 }
@@ -259,8 +251,9 @@ pub(crate) struct StreamFade {
     fp_scratch: Vec<u64>,
     born_scratch: Vec<Option<Instant>>,
     hash_scratch: Vec<u64>,
-    /// Previous frame's `row hash → row index` (first occurrence), rebuilt per
-    /// update from the resident map (reuses its allocation).
+    /// Previous frame's `row hash → row index` (first occurrence), rebuilt in
+    /// the resident map (reusing its allocation) by an update whose first
+    /// not-in-place row needs it; read only within that same update.
     row_of: HashMap<u64, usize>,
     /// The latest instant any live fade still needs frames (`max(born) +
     /// fade_ms`); `None` when everything is dry. Lets the scheduler poll
@@ -318,7 +311,7 @@ impl StreamFade {
         self.fp_scratch.reserve(rows * cols);
         self.hash_scratch.clear();
         for row in cells.iter() {
-            let mut rh = FNV_OFFSET;
+            let mut rh = FNV64_OFFSET;
             // `cell_frame_into` deliberately emits SPARSE inner rows: an omitted
             // tail is the terminal's implicit empty cell through the declared
             // `RenderInput.cols`, not a malformed/ragged frame. Fingerprint the
@@ -328,7 +321,7 @@ impl StreamFade {
             for col in 0..cols {
                 let f = row.get(col).map_or(0, cell_fp);
                 self.fp_scratch.push(f);
-                rh = fnv(rh, f);
+                rh = fnv_mix_u64(rh, f);
             }
             self.hash_scratch.push(rh);
         }
@@ -340,11 +333,10 @@ impl StreamFade {
         let mut active_until: Option<Instant> = None;
 
         if permitted && !rebaseline {
-            // 2) Scroll alignment: previous frame's row hash → row index.
-            self.row_of.clear();
-            for (i, h) in self.row_hash.iter().enumerate() {
-                self.row_of.entry(*h).or_insert(i);
-            }
+            // 2) Scroll alignment: previous frame's row hash → row index, built
+            // only once a row is not identical in place (a frame that changed
+            // no row never needs it).
+            let mut row_of_built = false;
             for r in 0..rows {
                 let nh = self.hash_scratch[r];
                 // Prefer the same viewport position (in-place identical row),
@@ -352,6 +344,13 @@ impl StreamFade {
                 let src = if self.row_hash.get(r) == Some(&nh) {
                     Some(r)
                 } else {
+                    if !row_of_built {
+                        row_of_built = true;
+                        self.row_of.clear();
+                        for (i, h) in self.row_hash.iter().enumerate() {
+                            self.row_of.entry(*h).or_insert(i);
+                        }
+                    }
                     self.row_of.get(&nh).copied()
                 };
                 let dst = r * cols;
@@ -679,6 +678,7 @@ mod tests {
             overline: false,
             underline_color: None,
             overline_color: None,
+            script: aterm_core::terminal::Script::Normal,
         }
     }
 

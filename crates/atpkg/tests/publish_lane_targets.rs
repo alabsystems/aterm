@@ -21,8 +21,9 @@
 //!      path, an asset name or an upload.
 //!
 //! `tools/test-linux-auto-atpkg.sh` is the behavioural twin that runs the lane against a
-//! stubbed channel; this is the cheap text check that needs no bash and notices when the
-//! client's target list grows. Hermetic: reads committed files under `CARGO_MANIFEST_DIR`.
+//! stubbed channel (one of the gate's delivery suites, so a missing one cannot pass); this
+//! is the cheap text check that needs no bash and notices when the client's target list
+//! grows. Hermetic: reads committed files under `CARGO_MANIFEST_DIR`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -163,18 +164,4 @@ fn a_shipping_lane_names_no_triple_outside_its_declaration() {
             offenders.join("\n")
         );
     }
-}
-
-/// The behavioural twin must exist and be runnable: this file reads the lane's TEXT, and
-/// text alone cannot prove the lane's decision table changed with it.
-#[test]
-fn the_behavioural_suite_for_the_linux_lane_is_present() {
-    let suite = repo_root().join("tools/test-linux-auto-atpkg.sh");
-    assert!(
-        suite.is_file(),
-        "tools/test-linux-auto-atpkg.sh is missing — it is the half of this guard that \
-         RUNS tools/linux-auto-atpkg.sh (stubbed channel, DRY_RUN, both host \
-         architectures) and reads the decision table it prints. Without it, the checks \
-         above only prove the source text looks right."
-    );
 }

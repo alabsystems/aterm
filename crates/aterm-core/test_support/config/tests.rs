@@ -13,8 +13,8 @@ fn test_default_config() {
     assert_eq!(config.cursor_style, CursorStyle::BlinkingBlock);
     assert!(config.cursor_blink);
     assert!(config.cursor_visible);
-    // #7929: default scrollback line limit raised to 100_000 to cap
-    // runaway stdout without requiring every integration to set a limit.
+    // The default line limit caps runaway stdout without every integration
+    // setting one.
     assert_eq!(
         config.scrollback_limit,
         Some(aterm_scrollback::DEFAULT_LINE_LIMIT)
@@ -36,12 +36,6 @@ fn test_config_equality() {
 }
 
 #[test]
-fn test_bidi_mode_default() {
-    let mode = BiDiMode::default();
-    assert_eq!(mode, BiDiMode::Implicit);
-}
-
-#[test]
 fn test_bidi_config_default() {
     let config = BiDiConfig::default();
     assert_eq!(config.mode, BiDiMode::Implicit);
@@ -54,11 +48,4 @@ fn test_bidi_config_disabled() {
     let config = BiDiConfig::disabled();
     assert_eq!(config.mode, BiDiMode::Disabled);
     assert!(!config.is_enabled());
-}
-
-#[test]
-fn test_terminal_config_bidi_default() {
-    let config = TerminalConfig::default();
-    assert_eq!(config.bidi.mode, BiDiMode::Implicit);
-    assert!(config.bidi.is_enabled());
 }

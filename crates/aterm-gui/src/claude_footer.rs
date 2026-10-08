@@ -33,6 +33,23 @@
 //!   Claude Code process is alive, so a passed wall leaves an idle footer.
 //!   Its reset is placed with a zone's offset AT an instant
 //!   ([`offset_at_cached`]).
+//! * THE ACCOUNT. Where `accounts.toml` lists two or more, `⎆ <label>` names
+//!   the roster row the process's login is (`accounts::footer_label`),
+//!   between the model and the path. The login is what the exec environment
+//!   of the image Claude Code REGISTERED says, read with its command line
+//!   once its registry row is seen ([`Identity`]) — never what a launcher
+//!   that became Claude Code in place was started with; the roster is the
+//!   resolver thread's own memo ([`RosterMemo`]), read again at most every
+//!   [`ROSTER_RECHECK`] and only when a footer read answers, so a label that
+//!   moved is on the glass one memo period after the next read. Nothing is
+//!   shown rather than guessed: an environment that was not read or reads
+//!   empty, a roster that is missing, refused or lists fewer than two, a
+//!   login no row names, a home of its own, a credential in the environment.
+//!   THE LIMITS: the resolver sees the environment's half only
+//!   (`accounts::ProcessLogin::of_env`), so a Claude Code that a settings
+//!   file or the vendor's profile store gives a credential is still
+//!   labelled; and one started under another `HOME` is named by the row with
+//!   no `dir` (`accounts::judged_label`).
 //! * A CLOSED TAB's fold goes when the tab does ([`stop_session`], from the
 //!   status observer's own retirement), not at the end of its watch; the
 //!   process's tail stays while the process lives ([`ProcessTails`]).
@@ -46,8 +63,14 @@
 //!   (`footer::rule_run`); any other ink there is Claude's and stays. Claude's own
 //!   footer row under the rule — its mode pill, `(shift+tab to cycle)`, `←
 //!   for agents`, `esc to interrupt`, its right-hand notices — is NEVER
-//!   written, colours included. The Claude lights (`crate::claude_lights`)
-//!   go in the same rule, left of the facts, rule glyphs between.
+//!   written, colours included. The facts are drawn QUIET (owner,
+//!   2026-09-30): `Script::Sub` — smaller and set low in the rule's cells,
+//!   below the vivid rail of the cursor trail under the composer row above
+//!   (`aterm_render::SUB_CEILING`) — in the rule's own gray
+//!   (`compose_rule`). `[claude_footer] usage = false` hides `Σ` (shown by
+//!   default), applied here and in the repaint key. The Claude lights
+//!   (`crate::claude_lights`) go in the same rule, left of the facts, rule
+//!   glyphs between.
 //! * WHAT IS NOT TOUCHED. The terminal GRID. `text`/`screen` read the engine
 //!   and keep Claude Code's real row, because aterm's own supervisor reads it
 //!   (`aterm_phase` busy detection keys on `esc to interrupt` there). `image`
@@ -72,6 +95,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use aterm_agent::harness::accounts;
 use aterm_agent::harness::footer::{self, FooterFacts, LaunchFacts};
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::RenderCell;
@@ -267,6 +291,9 @@ const WATCH_FOR: Duration = Duration::from_secs(10 * 60);
 /// a limit wall and its Claude Code process lives: a wall whose reset passes
 /// leaves the glass within this.
 const WALL_RECHECK: Duration = Duration::from_secs(60);
+
+/// How long the resolver's roster answers from its last read ([`RosterMemo`]).
+const ROSTER_RECHECK: Duration = Duration::from_secs(10);
 
 /// The re-read interval of a session last asked for at `asked`: the idle
 /// clock within its watch, the wall clock past it.
@@ -604,6 +631,8 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>) {
     let mut folds: HashMap<u64, footer::FooterCache> = HashMap::new();
     // Sessions whose published footer shows a limit wall.
     let mut walled: HashSet<u64> = HashSet::new();
+    // The accounts roster, for every session's label.
+    let mut roster = RosterMemo::default();
     // Per session: its latest job, when it was last ASKED for, and when it
     // was last READ — the idle re-reads ([`IDLE_RECHECK`]) run off this.
     loop {
@@ -650,6 +679,7 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>) {
             tails: &mut tails,
             folds: &mut folds,
             walled: &mut walled,
+            roster: &mut roster,
         };
         for job in latest {
             reads.resolve(&job);
@@ -669,12 +699,14 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>) {
 }
 
 /// The resolver's state one read touches: per session, the process known
-/// for it, its usage fold and its wall mark; per process, its tail.
+/// for it, its usage fold and its wall mark; per process, its tail; and the
+/// one roster.
 struct Reads<'a> {
     known: &'a mut HashMap<u64, Identity>,
     tails: &'a mut ProcessTails,
     folds: &'a mut HashMap<u64, footer::FooterCache>,
     walled: &'a mut HashSet<u64>,
+    roster: &'a mut RosterMemo,
 }
 
 impl Reads<'_> {
@@ -685,6 +717,7 @@ impl Reads<'_> {
             self.known,
             self.tails,
             self.folds.entry(job.session).or_default(),
+            self.roster,
             job.session,
             &job.timeline,
             job.pgid,
@@ -721,22 +754,27 @@ fn forget(
 /// What the resolver knows about one Claude Code process for its whole
 /// life: when the kernel started it (the pid-reuse guard), the Claude Code
 /// directory its environment named at exec, and what its own command line
-/// and environment say ([`footer::launch_facts_of`]). The directory costs
-/// one `KERN_PROCARGS2` read, so it is read once per process — per session,
-/// and again only when that session's foreground process is a different one
-/// (a new pid, or the same pid born again: a relaunch onto a newer build).
-/// The command line is read again whenever the registry names a new IMAGE
-/// (`startedAt`): an in-place exec keeps the pid and the kernel's start but
-/// not the argv.
+/// and environment say ([`footer::launch_facts_of`], [`login_of_args`]). The
+/// directory costs one `KERN_PROCARGS2` read, so it is read once per process
+/// — per session, and again only when that session's foreground process is a
+/// different one (a new pid, or the same pid born again: a relaunch onto a
+/// newer build). The command line and the login are read once the registry
+/// names an IMAGE (`startedAt`), and again whenever it names a new one: an
+/// in-place exec keeps the pid and the kernel's start but not the argv or
+/// the environment, so what was read before the row was written may be a
+/// launcher's (a shim named `claude` that sets variables and execs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Identity {
     pid: i32,
     started: Option<u64>,
     dir: Option<PathBuf>,
     launch: LaunchFacts,
-    /// The image (`startedAt`) `launch` was read for; `None` until a
-    /// registry entry named one.
+    /// The image (`startedAt`) `launch`, `login` and `argv` were read for;
+    /// `None` until a registry entry named one and that read answered.
     launch_for: Option<Option<u64>>,
+    /// What the process's exec environment says of its login; `None` where
+    /// it could not be read or reads empty. Read with `launch`.
+    login: Option<accounts::ProcessLogin>,
     /// The process's argv, `argv[0]` first, from the same `KERN_PROCARGS2`
     /// read as `launch` (empty where it could not be read): the launch flags
     /// the frozen-program remedy's resume line carries
@@ -767,7 +805,7 @@ fn process_args(pid: i32) -> Option<atpkg::caller_shell::ProcArgs> {
 
 /// `pid`'s Claude Code directory, from its own environment at exec; aterm's
 /// home when that environment cannot be read.
-fn claude_dir_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<PathBuf> {
+pub(crate) fn claude_dir_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<PathBuf> {
     match args {
         Some(args) => {
             footer::claude_dir_of(args.env_var("CLAUDE_CONFIG_DIR"), args.env_var("HOME"))
@@ -775,6 +813,70 @@ fn claude_dir_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<Pa
         None => aterm_types::dirs::home_dir().map(|home| home.join(".claude")),
     }
 }
+
+/// What a process's environment at exec says of its login
+/// ([`accounts::ProcessLogin::of_exec_env`]). `None` where it was not read,
+/// and where it reads empty.
+fn login_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<accounts::ProcessLogin> {
+    accounts::ProcessLogin::of_exec_env(&args?.env)
+}
+
+/// The accounts roster as the resolver last read it, for the footer's label
+/// ([`accounts::footer_label`]). The resolver thread's own: no lock, and a
+/// new aterm process starts with none.
+#[derive(Default)]
+struct RosterMemo {
+    /// When `load` was last asked.
+    read: Option<std::time::Instant>,
+    /// What it answered, where that lists two or more.
+    roster: Option<accounts::Roster>,
+}
+
+impl RosterMemo {
+    /// The roster, where it lists two or more; `load` is asked at most every
+    /// [`ROSTER_RECHECK`]. A load that fails is no roster until the next.
+    fn at(
+        &mut self,
+        now: std::time::Instant,
+        load: impl FnOnce() -> Option<accounts::Roster>,
+    ) -> Option<&accounts::Roster> {
+        if self
+            .read
+            .is_none_or(|at| now.saturating_duration_since(at) >= ROSTER_RECHECK)
+        {
+            self.read = Some(now);
+            self.roster = load().filter(accounts::Roster::several);
+        }
+        self.roster.as_ref()
+    }
+}
+
+/// The roster beside the `aterm.toml` this window loads
+/// ([`accounts::default_roster_path`]): one bounded read. `None` where there
+/// is no config path and where the file is refused; a missing file is the
+/// empty roster. Under test it reads nothing: a test hands [`RosterMemo`]
+/// its roster.
+fn live_roster() -> Option<accounts::Roster> {
+    if cfg!(test) {
+        return None;
+    }
+    accounts::Roster::load(&accounts::default_roster_path()?).ok()
+}
+
+/// What a read asks outside Claude Code's own files: a process's exec read
+/// and the accounts roster. The resolver asks the machine ([`LIVE`]); a test
+/// answers for it.
+#[derive(Clone, Copy)]
+struct Asks {
+    args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>,
+    roster: fn() -> Option<accounts::Roster>,
+}
+
+/// [`process_args`] and [`live_roster`].
+const LIVE: Asks = Asks {
+    args: process_args,
+    roster: live_roster,
+};
 
 /// [`resolve_into`], then wake the loop when the facts moved — and, when the
 /// moved facts carry a repository read the kernel refused with `EPERM`, post that
@@ -785,6 +887,7 @@ fn resolve_and_post(
     known: &mut HashMap<u64, Identity>,
     tails: &mut ProcessTails,
     fold: &mut footer::FooterCache,
+    roster: &mut RosterMemo,
     session: u64,
     timeline: &Arc<Mutex<SessionTimeline>>,
     pgid: i32,
@@ -795,19 +898,16 @@ fn resolve_and_post(
         .is_some_and(|id| id.pid == pgid && id.started.is_some() && id.started == started)
         .then(|| known.remove(&session))
         .flatten();
-    let mut identity = cached.unwrap_or_else(|| {
-        let args = process_args(pgid);
-        Identity {
-            pid: pgid,
-            started,
-            dir: claude_dir_of_args(args.as_ref()),
-            launch: args
-                .as_ref()
-                .map(|a| footer::launch_facts_of(&a.argv, &a.env))
-                .unwrap_or_default(),
-            launch_for: None,
-            argv: args.map(|a| a.argv).unwrap_or_default(),
-        }
+    // The directory alone is taken from this read: the rest is read once
+    // the registry names the image ([`resolve_into`]).
+    let mut identity = cached.unwrap_or_else(|| Identity {
+        pid: pgid,
+        started,
+        dir: claude_dir_of_args(process_args(pgid).as_ref()),
+        launch: LaunchFacts::default(),
+        launch_for: None,
+        login: None,
+        argv: Vec::new(),
     });
     let tail = tails.cache(
         session,
@@ -815,7 +915,7 @@ fn resolve_and_post(
         identity.started,
         std::time::Instant::now(),
     );
-    let (moved, shows_wall) = resolve_into(timeline, &mut identity, tail, fold);
+    let (moved, shows_wall) = resolve_into(timeline, &mut identity, tail, fold, roster, LIVE);
     // No directory is not remembered: a launch through the atpkg twin is
     // `/bin/sh` for its first milliseconds, whose environment macOS hides,
     // and the `exec` into Claude Code keeps both the pid and the start time
@@ -893,14 +993,19 @@ fn cached_offset(
 /// MOVED, carrying the working directory whose repository read was refused, if
 /// one was; and whether the footer the timeline now shows carries a limit
 /// wall. The file reads run before the (leaf) timeline lock is taken. A
-/// registry entry that names a new image re-reads the command line into
-/// `identity` first. The facts are read over the process's `tail`, the
-/// session's usage folded on in `fold`.
+/// registry entry that names an image `identity` was not read for reads the
+/// command line and the login into it first (`asks`). The facts are read
+/// over the process's `tail`, the session's usage folded on in `fold`; a
+/// read that answers is given its account from `roster`
+/// ([`accounts::footer_label`]), which is asked only then, and only for a
+/// process whose login was read.
 fn resolve_into(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
     tail: &mut footer::TailCache,
     fold: &mut footer::FooterCache,
+    roster: &mut RosterMemo,
+    asks: Asks,
 ) -> (Option<Option<PathBuf>>, bool) {
     // ONE footer read (`footer::read_pid`): one read of `sessions/<pid>.json`
     // feeds the model, the Σ, the wall and the frozen-program remedy's resume
@@ -915,28 +1020,49 @@ fn resolve_into(
         offset_at: &offset_at_cached,
     };
     let started = identity.started;
-    let facts = u32::try_from(identity.pid)
+    let mut facts = u32::try_from(identity.pid)
         .ok()
         .zip(identity.dir.clone())
         .and_then(|(pid, dir)| {
-            // The command line, read again when the entry names a new image
-            // (an in-place exec keeps the pid and the kernel's start).
+            // The command line and the login are the image's the entry
+            // names: read at its first row, and again when a row names a
+            // new one (an in-place exec keeps the pid and the kernel's
+            // start). A read that is refused says nothing of the image —
+            // never the last one's facts — and is asked again at the next.
             let launch = |entry: &footer::SessionEntry| {
                 if identity.launch_for != Some(entry.started_at) {
-                    if identity.launch_for.is_some() {
-                        let args = process_args(identity.pid);
-                        identity.launch = args
-                            .as_ref()
-                            .map(|a| footer::launch_facts_of(&a.argv, &a.env))
-                            .unwrap_or_default();
-                        identity.argv = args.map(|a| a.argv).unwrap_or_default();
+                    let args = (asks.args)(identity.pid);
+                    identity.launch = args
+                        .as_ref()
+                        .map(|a| footer::launch_facts_of(&a.argv, &a.env))
+                        .unwrap_or_default();
+                    identity.login = login_of_args(args.as_ref());
+                    if args.is_some() {
+                        identity.launch_for = Some(entry.started_at);
                     }
-                    identity.launch_for = Some(entry.started_at);
+                    identity.argv = args.map(|a| a.argv).unwrap_or_default();
                 }
                 (identity.launch.clone(), identity.argv.clone())
             };
-            footer::read_pid(&dir, pid, started, launch, tail, fold, &clock)
+            footer::read_pid(
+                &dir,
+                pid,
+                started,
+                launch,
+                tail,
+                fold,
+                &clock,
+                crate::harness_host::harness_state().as_deref(),
+            )
         });
+    // The account is laid in here: only this thread holds the process's
+    // login and the roster (`FooterFacts::account`).
+    if let (Some(facts), Some(who)) = (facts.as_mut(), identity.login.as_ref()) {
+        facts.account = roster
+            .at(std::time::Instant::now(), asks.roster)
+            .and_then(|listed| accounts::footer_label(listed, who))
+            .map(str::to_owned);
+    }
     let denied = facts.as_ref().and_then(|f| f.repo_read_denied.clone());
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     // One unreadable read of the SAME process — Claude rewrites its sessions
@@ -966,16 +1092,71 @@ fn shows_wall(timeline: &SessionTimeline) -> bool {
         .is_some_and(|usage| usage.wall.is_some())
 }
 
-/// A fingerprint of `facts` for the repaint key: `0` when there are none, so a
-/// frame with no footer keys exactly as it did before this module existed.
-pub(crate) fn fingerprint(facts: Option<&FooterFacts>) -> u64 {
+/// A fingerprint of `facts` AS SHOWN under the `[claude_footer] usage`
+/// switch ([`with_usage_switch`]) for the repaint key: `0` when there are
+/// none, so a frame with no footer keys exactly as it did before this module
+/// existed. Taken without a copy — it runs for every Claude Code pane on
+/// every frame — so with the switch off only the limit wall stands for the
+/// usage, and hidden tokens that keep growing do not move the key. The
+/// destructure names every field: a new one does not compile until it is
+/// hashed here.
+pub(crate) fn fingerprint(facts: Option<&FooterFacts>, usage: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let Some(facts) = facts else {
         return 0;
     };
+    let FooterFacts {
+        model,
+        effort,
+        path,
+        branch,
+        repo_read_denied,
+        version,
+        resume,
+        usage: usage_facts,
+        model_open,
+        effort_open,
+        effort_for,
+        owner,
+        upgrade,
+        account,
+    } = facts;
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    facts.hash(&mut h);
+    (
+        model,
+        effort,
+        path,
+        branch,
+        repo_read_denied,
+        version,
+        resume,
+    )
+        .hash(&mut h);
+    (model_open, effort_open, effort_for, owner, upgrade, account).hash(&mut h);
+    if usage {
+        usage_facts.hash(&mut h);
+    } else {
+        usage_facts
+            .as_ref()
+            .and_then(|u| u.wall.as_ref())
+            .hash(&mut h);
+    }
     h.finish() | 1
+}
+
+/// `facts` as the rule shows them under the `[claude_footer] usage` switch
+/// (`Config::claude_footer_usage`, on by default): off, the `Σ` segment's
+/// tokens and runtime are taken out and only a standing limit wall
+/// is kept (`UsageFacts::wall_only`). Applied where the pane is gathered and
+/// where the repaint key is taken, so hidden tokens that keep growing change
+/// neither the glass nor the key.
+fn with_usage_switch(facts: &mut FooterFacts, usage: bool) {
+    if !usage {
+        facts.usage = facts
+            .usage
+            .take()
+            .and_then(aterm_agent::harness::session_usage::UsageFacts::wall_only);
+    }
 }
 
 /// Which of the composer rule's pane columns aterm may cover: a PLAIN RULE
@@ -1019,9 +1200,17 @@ fn rule_mask(
 /// — stand at the LEFT end, then the rule's own glyphs (`rule`), then `
 /// <facts> ` at the right end; without lights, the facts alone, so a rule at
 /// rest is written only where the facts are. A group only when `fit` keeps
-/// it. Marks in `mark_fg`, values in the pane's own ink (`blank.fg`), on the
-/// pane's ground. The chips' place depends on nothing a title or the facts
-/// change: a chip stays under the pointer while its title comes and goes.
+/// it. The FACTS are aterm's annotation, set apart from the terminal's text
+/// and quieter than it (owner, 2026-09-30: "the typography needs to be
+/// distinct from other text and less emphasized" — and lower than the
+/// cursor trail that runs under the composer row above: the trail's vivid
+/// rail ends above `aterm_render::SUB_CEILING`, only its faint bed lobe at
+/// the caret reaching lower): drawn `Script::Sub`,
+/// smaller and set low in the rule's cells, values in Claude's own rule gray
+/// (`rule.fg`), marks in `mark_fg` mixed halfway toward it, on the pane's
+/// ground. The light chips stay full-size: they are pointed at and clicked.
+/// The chips' place depends on nothing a title or the facts change: a chip
+/// stays under the pointer while its title comes and goes.
 fn compose_rule(
     fit: &footer::RuleFit,
     block: Option<&crate::claude_lights::Block>,
@@ -1050,14 +1239,31 @@ fn compose_rule(
     }
     let mut facts: Vec<RenderCell> = Vec::new();
     if !fit.segments.is_empty() {
+        let quiet = |fg: [u8; 3]| RenderCell {
+            fg,
+            script: aterm_core::terminal::Script::Sub,
+            ..blank
+        };
+        let mark = quiet(std::array::from_fn(|i| {
+            ((u16::from(mark_fg[i]) + u16::from(rule.fg[i])) / 2) as u8
+        }));
+        let value = quiet(rule.fg);
         facts.push(blank);
         for (i, seg) in fit.segments.iter().enumerate() {
             if i > 0 {
                 facts.extend(std::iter::repeat_n(blank, footer::GAP));
             }
-            push_text(&mut facts, blank, [seg.mark], mark_fg);
+            push_text(&mut facts, mark, [seg.mark]);
             facts.push(blank);
-            push_text(&mut facts, blank, seg.text.chars(), blank.fg);
+            // The wall's `♻` (for "resets") is a mark inside its value.
+            for ch in seg.text.chars() {
+                let ink = if ch == footer::RESET_MARK {
+                    mark
+                } else {
+                    value
+                };
+                push_text(&mut facts, ink, [ch]);
+            }
         }
         facts.push(blank);
     }
@@ -1069,30 +1275,24 @@ fn compose_rule(
     (out, lights_at)
 }
 
-/// Append `text` in `fg` on `blank`'s ground, one cell per column: a wide
-/// char takes its lead cell and a continuation, and a char that occupies no
-/// column of its own (a combining mark, a control) is left out — a cell
-/// cannot carry one without the side channels this splice never writes.
-fn push_text(
-    out: &mut Vec<RenderCell>,
-    blank: RenderCell,
-    text: impl IntoIterator<Item = char>,
-    fg: [u8; 3],
-) {
+/// Append `text` in `ink`'s colours and rendition, one cell per column: a
+/// wide char takes its lead cell and a continuation, and a char that
+/// occupies no column of its own (a combining mark, a control) is left out —
+/// a cell cannot carry one without the side channels this splice never
+/// writes.
+fn push_text(out: &mut Vec<RenderCell>, ink: RenderCell, text: impl IntoIterator<Item = char>) {
     for ch in text {
         let cols = aterm_grapheme::char_width(ch);
         if cols == 0 || ch.is_control() {
             continue;
         }
-        let mut cell = blank;
-        cell.ch = ch;
-        cell.fg = fg;
-        out.push(cell);
+        out.push(RenderCell { ch, ..ink });
         if cols == 2 {
-            let mut half = blank;
-            half.wide = true;
-            half.fg = fg;
-            out.push(half);
+            out.push(RenderCell {
+                ch: ' ',
+                wide: true,
+                ..ink
+            });
         }
     }
 }
@@ -1324,11 +1524,9 @@ fn write_edits(
 }
 
 impl App {
-    /// The footer facts of every Claude Code session in `wid`'s visible plan,
-    /// and the lights' GUI state (`crate::claude_lights`) — the window's own,
-    /// and the fast latch kept on `App` (`App::claude_fast_latch`) wherever a
-    /// Claude Code pane shows — folded into one repaint-key term (`0` when none
-    /// shows).
+    /// The footer facts of every Claude Code session in `wid`'s visible plan
+    /// and the window's lights' GUI state (`crate::claude_lights`), folded
+    /// into one repaint-key term (`0` when none shows).
     ///
     /// scope-waiver: this is a derived repaint fingerprint of existing App
     /// state. The function owns no latch or budget; copying its scalar result
@@ -1342,6 +1540,7 @@ impl App {
             ws.claude_lights.fingerprint(std::time::Instant::now())
         });
         let mut claude = false;
+        let usage = self.config.claude_footer_usage();
         for leaf in &plan.leaves {
             let Some(session) = self
                 .view_store
@@ -1355,15 +1554,39 @@ impl App {
                 continue;
             };
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let shown = timeline.claude_footer_shown();
-            claude |= shown.is_some();
-            fp = fp.rotate_left(7) ^ fingerprint(shown.as_ref());
+            let facts = timeline.claude_footer();
+            claude |= facts.is_some();
+            // What the footer shows (`claude_footer_shown`) without its
+            // clone: `filled_from` returns `facts` unchanged unless a kept
+            // card can fill an open model or effort, so only then is the
+            // fill built and hashed; the usage switch is applied by the hash.
+            let card = facts
+                .filter(|f| f.model_open || f.effort_open)
+                .and_then(|_| timeline.claude_card());
+            let leaf = match (facts, card) {
+                (Some(f), Some(_)) => fingerprint(Some(&f.filled_from(card)), usage),
+                (facts, _) => fingerprint(facts, usage),
+            };
+            // So is the live upgrade's note ([`App::splice_claude_footer`]),
+            // laid in only where there are facts to lead: both its wordings,
+            // hashed beside the facts rather than cloned into them. Which one
+            // shows follows the composer, whose every change is a frame.
+            let note = timeline
+                .upgrade_note()
+                .filter(|_| facts.is_some())
+                .map_or(0, |note| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    note.hash(&mut h);
+                    h.finish()
+                });
+            fp = fp.rotate_left(7) ^ leaf ^ note.rotate_left(17);
         }
-        // The fast latch is App-wide: taken in one window, it changes the
-        // chips of every other window's Claude Code panes, which must repaint
-        // for it — an idle one would otherwise keep a stale, clickable chip.
+        // The `[claude_footer] usage` switch, live: a reload that flips it
+        // asks every window for a frame (the config apply), and this term
+        // lets it through the key.
         if claude {
-            fp ^= self.claude_fast_latch.generation().rotate_left(29);
+            fp ^= u64::from(usage).rotate_left(47);
         }
         fp
     }
@@ -1441,12 +1664,15 @@ impl App {
                         (
                             facts.filled_from(timeline.claude_card()),
                             open.then(|| facts.owner.clone()).flatten(),
+                            timeline.upgrade_note().cloned(),
                         )
                     })
                 };
-                let Some((mut shown, card_owner)) = shown else {
+                let Some((mut shown, card_owner, upgrade_note)) = shown else {
                     continue;
                 };
+                let usage = self.config.claude_footer_usage();
+                with_usage_switch(&mut shown, usage);
                 let blank = source.implicit_blank;
                 let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
                 let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
@@ -1485,7 +1711,7 @@ impl App {
                 // what the process started on. A card kept anew shows now.
                 if let Some(owner) = card_owner
                     && let Some(card) = crate::reader_guard::read_or_none(
-                        &format!("{session}"),
+                        session,
                         "Claude Code launch card",
                         &texts,
                         || footer::launch_card(&texts),
@@ -1498,6 +1724,7 @@ impl App {
                         && let Some(now) = timeline.claude_footer_shown()
                     {
                         shown = now;
+                        with_usage_switch(&mut shown, usage);
                     }
                 }
                 let on_glass = read
@@ -1522,6 +1749,18 @@ impl App {
                 let Some((frame_row, term_row, run, rule)) = rule else {
                     continue;
                 };
+                // The live upgrade's note for the person here leads the facts
+                // (`footer::FooterFacts::upgrade`), in the words the composer
+                // calls for as the ENGINE has it now — by the rule the move's
+                // gate reads it with (`App::claude_composer_now`: a dim
+                // suggestion is no draft) — and not while a turn runs there:
+                // the agent's own turn holds the move then, not the person.
+                shown.upgrade = upgrade_note.and_then(|note| {
+                    let (screen, empty) = self.claude_composer_now(session)?;
+                    (!screen.busy)
+                        .then(|| note.words(!empty).cloned())
+                        .flatten()
+                });
                 panes.push(FooterPane {
                     session,
                     frame_row,
@@ -1589,36 +1828,34 @@ impl App {
             }
             edits.push((pane.frame_row, col, cells, pane.blank));
         }
-        let written: Vec<(usize, usize)> = {
+        {
             let Some(ws) = self.windows.get_mut(&wid) else {
                 return;
             };
             ws.claude_footer_undo = write_edits(&mut ws.input_scratch, edits);
-            ws.claude_footer_undo
+            // Only a light the glass shows can be pointed at: a pane whose
+            // write was skipped (`write_edits`) records none — keyed by the
+            // edit's row AND column, since two panes side by side share a
+            // frame row.
+            let rows = ws
+                .claude_footer_undo
                 .as_ref()
-                .map(|record| {
-                    record
-                        .rows
-                        .iter()
-                        .map(|r| (r.frame_row, r.col_off))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        // Only a light the glass shows can be pointed at: a pane whose write
-        // was skipped (`write_edits`) records none — keyed by the edit's row
-        // AND column, since two panes side by side share a frame row.
+                .map(|record| &record.rows[..])
+                .unwrap_or_default();
+            lit.retain(|l| {
+                rows.iter()
+                    .any(|r| (r.frame_row, r.col_off) == (l.frame_row, l.col))
+            });
+        }
         for l in lit {
-            if written.contains(&(l.frame_row, l.col)) {
-                self.note_claude_light_hits(
-                    wid,
-                    l.session,
-                    l.frame_row,
-                    l.term_row,
-                    l.lights_col,
-                    &l.block,
-                );
-            }
+            self.note_claude_light_hits(
+                wid,
+                l.session,
+                l.frame_row,
+                l.term_row,
+                l.lights_col,
+                &l.block,
+            );
         }
     }
 
@@ -1629,6 +1866,13 @@ impl App {
         // The lights ride this wake too: a toggle's next step, its deadline
         // and a refusal's end all arrive here (`crate::claude_lights`).
         self.drain_claude_lights();
+        self.redraw_claude_footer(session);
+    }
+
+    /// Redraw every window that shows `session`'s footer — and nothing of
+    /// the lights' wake: what a live upgrade's note that moved asks for
+    /// (`App::apply_agent_upgrades`).
+    pub(crate) fn redraw_claude_footer(&self, session: u64) {
         let mut windows = self.windows_with_focused_session(session);
         for (wid, _) in self.tabs_viewing_session(session) {
             if !windows.contains(&wid) {
@@ -1673,13 +1917,11 @@ fn read_rule_row(rows: &[String]) -> FooterRead {
 /// grey. Behind the reader's panic fence, like every read of the pane.
 fn note_vendor_drift(session: u64, version: Option<&str>, rows: &[String]) {
     static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let unread = crate::reader_guard::read_or_none(
-        &format!("{session}"),
-        "Claude Code drift check",
-        rows,
-        || unread_pill_row(rows),
-    )
-    .flatten();
+    let unread =
+        crate::reader_guard::read_or_none(session, "Claude Code drift check", rows, || {
+            unread_pill_row(rows)
+        })
+        .flatten();
     let Some(row) = unread else {
         return;
     };
@@ -1725,10 +1967,7 @@ fn read_footer(
     rows: &[String],
     read: impl FnOnce(&[String]) -> FooterRead,
 ) -> FooterRead {
-    crate::reader_guard::read_or_none(&format!("{session}"), "Claude Code footer", rows, || {
-        read(rows)
-    })
-    .flatten()
+    crate::reader_guard::read_or_none(session, "Claude Code footer", rows, || read(rows)).flatten()
 }
 
 #[cfg(test)]
@@ -1736,9 +1975,9 @@ mod tests {
     use super::*;
 
     /// THE CHIPS NEVER TOUCH OTHER INK (main's 35d8c4ca7, 2026-09-28, a
-    /// private window on 2.1.284): drawn on Claude's mode row, the `○ fast`
-    /// chip was glued to the `◐ medium · /effort` tail Claude right-aligns
-    /// there in auto mode (`/effort○ fast`), and main kept one cell clear
+    /// private window on 2.1.284): drawn on Claude's mode row, a chip was
+    /// glued to the `◐ medium · /effort` tail Claude right-aligns there in
+    /// auto mode, and main kept one cell clear
     /// wherever the pane had slack. The chips are in the composer's bottom
     /// rule now, at its left end, and the rule's own layout pads them: at
     /// EVERY room the fit draws them in, with or without a title, beside the
@@ -1754,7 +1993,7 @@ mod tests {
         let rule = cell('\u{2500}', [90, 90, 90]);
         for facts in [facts(), facts_with_usage(), FooterFacts::default()] {
             for chips in [1usize, 6, 8, 14] {
-                for (title, short) in [("", ""), ("Fast: on  ", "on  ")] {
+                for (title, short) in [("", ""), ("Permission mode: plan  ", "plan  ")] {
                     let block = crate::claude_lights::Block::of_chips(
                         row_of(&"\u{25CB}".repeat(chips), [150, 150, 150]),
                         row_of(title, [150, 150, 150]),
@@ -2124,50 +2363,6 @@ mod tests {
         assert!(!Arc::ptr_eq(&held, &next));
     }
 
-    /// Manual cost diagnostic for a long Claude transcript with an unchanged
-    /// render revision. Run with `--ignored --nocapture` after changing this
-    /// path; the test above, rather than wall time, pins the behavior.
-    #[test]
-    #[ignore = "manual unchanged-frame cost diagnostic"]
-    fn pane_text_unchanged_frame_cost() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        const REPEATS: usize = 2_000;
-        let mut scratch = RenderInput::empty();
-        scratch.rows = 80;
-        scratch.cols = 160;
-        scratch.cells = vec![row_of(&"x".repeat(160), [0, 0, 0]); 80];
-        scratch.snapshot_seq = 42;
-        let region = PaneTextRegion {
-            strip: 0,
-            row_off: 0,
-            col_off: 0,
-            rows: 80,
-            cols: 160,
-        };
-        let start = Instant::now();
-        for _ in 0..REPEATS {
-            let rows: Vec<String> = scratch
-                .cells
-                .iter()
-                .map(|row| row.iter().map(|c| c.ch).collect())
-                .collect();
-            black_box(rows);
-        }
-        let rebuilt = start.elapsed();
-        let mut cache = PaneTextCache::default();
-        black_box(cache.rows(0, 7, &scratch, region));
-        let start = Instant::now();
-        for _ in 0..REPEATS {
-            black_box(cache.rows(0, 7, &scratch, region));
-        }
-        eprintln!(
-            "Claude pane text: rebuilt {rebuilt:?}, cached {:?}",
-            start.elapsed()
-        );
-    }
-
     fn vendor_frame(scratch: &mut RenderInput) {
         let bottom = scratch.rows - 1;
         let rule = "\u{2500}".repeat(scratch.cols);
@@ -2236,8 +2431,9 @@ mod tests {
     /// The owner's layout, exactly, written into a rule: one space either
     /// side, three cells between values, the rule's last glyph kept — the
     /// way Claude writes its top-effort tag, one space either side and a `─`
-    /// after it, into the rule above. Marks take the accent, values the
-    /// terminal's ink.
+    /// after it, into the rule above. The facts are set apart and quiet:
+    /// small and low (`Script::Sub`), values in the rule's own gray, marks in
+    /// the accent mixed halfway toward it.
     #[test]
     fn the_rule_carries_the_owners_footer() {
         let blank = cell(' ', [200, 200, 200]);
@@ -2249,8 +2445,19 @@ mod tests {
             text_of(&cells),
             " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "
         );
-        assert_eq!(cells[1].fg, [0, 128, 255], "the mark takes the accent");
-        assert_eq!(cells[3].fg, [200, 200, 200], "the value takes the ink");
+        assert_eq!(
+            cells[1].fg,
+            [30, 94, 157],
+            "the mark: the accent, toward the rule"
+        );
+        assert_eq!(cells[3].fg, rule.fg, "the value takes the rule's gray");
+        assert!(
+            [1, 3]
+                .iter()
+                .all(|&c| cells[c].script == aterm_core::terminal::Script::Sub),
+            "the facts are drawn small and low"
+        );
+        assert_eq!(cells[0].script, aterm_core::terminal::Script::Normal);
         assert_eq!(cells.len(), footer::segments_width(&fit.segments) + 2);
         // Nothing known: nothing written, no dangling pad.
         let none = footer::fit_rule(&FooterFacts::default(), 76, None);
@@ -2258,6 +2465,98 @@ mod tests {
             compose_rule(&none, None, rule, blank, [1, 1, 1], 76)
                 .0
                 .is_empty()
+        );
+    }
+
+    /// THE ACCOUNT ON THE GLASS: `⎆ <label>` stands between the model and the
+    /// path, drawn as every fact is — its mark in the marks' ink, its label
+    /// in the values' — whole or not at all (a clipped label would name
+    /// another account), beside exactly what a rule of that width shows with
+    /// no account: a rule one cell short drops it, the path still whole.
+    /// The same through the real splice, on the measured screen.
+    /// CONTROL: the same facts with no account read the string
+    /// `the_rule_carries_the_owners_footer` pins.
+    #[test]
+    fn the_rule_names_the_account_between_the_model_and_the_path() {
+        let blank = cell(' ', [200, 200, 200]);
+        let rule = cell('\u{2500}', [60, 60, 60]);
+        let listed = FooterFacts {
+            account: Some("work-2".into()),
+            ..facts()
+        };
+        let paint = |facts: &FooterFacts, room: usize| {
+            let fit = footer::fit_rule(facts, room, None);
+            compose_rule(&fit, None, rule, blank, [0, 128, 255], room).0
+        };
+        let plain = " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main ";
+        let named =
+            " \u{25C6} Opus 5.5 xhigh   \u{2386} work-2   \u{2302} ~/aterm   \u{2387} main ";
+        let cells = paint(&listed, 76);
+        assert_eq!(text_of(&cells), named);
+        let at = cells
+            .iter()
+            .position(|c| c.ch == footer::ACCOUNT_MARK)
+            .expect("the account's mark");
+        assert_eq!(
+            cells[at],
+            RenderCell {
+                ch: footer::ACCOUNT_MARK,
+                ..cells[1]
+            },
+            "the mark takes the marks' ink"
+        );
+        assert_eq!(
+            cells[at + 2],
+            RenderCell {
+                ch: 'w',
+                ..cells[3]
+            },
+            "the label takes the values' ink"
+        );
+        // Whole or not at all, at every width, and nothing else moves for it.
+        let whole = named.chars().count();
+        for room in 0..=whole {
+            let text = text_of(&paint(&listed, room));
+            let unnamed = text_of(&paint(&facts(), room));
+            if text.contains(footer::ACCOUNT_MARK) {
+                assert_eq!(
+                    text.replacen("   \u{2386} work-2", "", 1),
+                    unnamed,
+                    "{room}"
+                );
+            } else {
+                assert_eq!(text, unnamed, "{room}");
+            }
+        }
+        assert_eq!(text_of(&paint(&listed, whole)), named);
+        assert_eq!(text_of(&paint(&listed, whole - 1)), plain, "the path stays");
+        assert_eq!(
+            text_of(&paint(&listed, 29)),
+            " \u{25C6} Opus 5.5 xhigh   \u{2386} work-2 ",
+            "beside the model, where the path no longer fits"
+        );
+        // NEGATIVE CONTROL: no account, and no mark for one.
+        assert_eq!(text_of(&paint(&facts(), 76)), plain);
+
+        // The real splice, at 80 columns.
+        let (mut app, wid, session) = glass(80);
+        let rows = claude_rows("footer-bypass-idle", 80);
+        let bottom = aterm_phase::phase::composer_bottom(&rows).expect("the composer");
+        feed_rows(&app, session, &rows);
+        let shown = |app: &mut App, facts: FooterFacts| {
+            publish(app, session, facts);
+            frame(app, wid);
+            text_of(&app.windows[&wid].input_scratch.cells[strip(app, wid) + bottom])
+        };
+        let glass = shown(&mut app, listed);
+        assert!(
+            glass.ends_with(&format!("\u{2500}{named}\u{2500}")),
+            "{glass:?}"
+        );
+        let glass = shown(&mut app, facts());
+        assert!(
+            glass.ends_with(&format!("\u{2500}{plain}\u{2500}")),
+            "{glass:?}"
         );
     }
 
@@ -2300,7 +2599,7 @@ mod tests {
                         input: 48_000_000,
                         output: 310_000,
                     }],
-                    0,
+                    aterm_agent::harness::session_usage::More::default(),
                 ),
                 Some(Wall {
                     label: "5h",
@@ -2312,53 +2611,27 @@ mod tests {
         }
     }
 
-    /// IN THE RULE the tokens go first and a limit wall after every fact
-    /// but the model: where the whole run fits, the wall opens it and `Σ`
-    /// ends it, each mark in the accent; narrower, the tokens go whole, then
-    /// the path is cut, the branch, the path and the effort go, then the
-    /// model — the wall standing alone — and a rule too narrow for the wall
-    /// itself keeps the model rather than nothing.
+    /// Every fact's mark takes one ink, the wall's, its `♻` and `Σ`'s among
+    /// them; what a narrow rule gives up, and in what order, is
+    /// `footer::fit_rule`'s (its own tests).
     #[test]
-    fn a_short_rule_gives_up_the_tokens_first_and_the_wall_last() {
+    fn the_wall_and_usage_marks_take_the_marks_ink() {
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
         let facts = facts_with_usage();
-        let paint = |room| {
-            let fit = footer::fit_rule(&facts, room, None);
-            text_of(&compose_rule(&fit, None, rule, blank, [0, 128, 255], room).0)
-        };
-        let wall = "\u{29D7} 5h limit \u{00B7} resets 3pm";
-        let model = "\u{25C6} Opus 5.5 xhigh";
-        let full = format!(
-            " {wall}   {model}   \u{2302} ~/aterm   \u{2387} main   \u{03A3} opus 48M in 310k out "
-        );
-        let room = full.chars().count();
-        assert_eq!(paint(room), full);
+        let room = 200;
         let fit = footer::fit_rule(&facts, room, None);
         let cells = compose_rule(&fit, None, rule, blank, [0, 128, 255], room).0;
-        for mark in ['\u{29D7}', '\u{03A3}'] {
-            let at = text_of(&cells).chars().position(|c| c == mark).unwrap();
-            assert_eq!(cells[at].fg, [0, 128, 255], "{mark} takes the accent");
+        let ink = |mark: char| cells[text_of(&cells).chars().position(|c| c == mark).unwrap()];
+        for mark in ['\u{29D7}', footer::RESET_MARK, '\u{03A3}'] {
+            assert_eq!(
+                ink(mark),
+                RenderCell {
+                    ch: mark,
+                    ..ink('\u{25C6}')
+                }
+            );
         }
-        assert_eq!(
-            paint(room - 1),
-            format!(" {wall}   {model}   \u{2302} ~/aterm   \u{2387} main "),
-            "one cell short: the tokens go whole"
-        );
-        let only_wall = format!(" {wall} ");
-        assert_eq!(
-            paint(only_wall.chars().count() + 3),
-            only_wall,
-            "the wall is the last value standing beside the model's room"
-        );
-        // Too short for the wall itself: the WALL goes, and the model
-        // stays — never an empty rule while a limit stands.
-        assert_eq!(
-            paint(only_wall.chars().count() - 1),
-            format!(" {model} "),
-            "a rule too narrow for the wall keeps the model"
-        );
-        assert_eq!(paint(4), "", "too narrow for any value: none");
     }
 
     /// With the session's tokens in the rule, the TOKENS go before the path
@@ -2378,11 +2651,12 @@ mod tests {
                         input: 48_000_000,
                         output: 310_000,
                     }],
-                    0,
+                    aterm_agent::harness::session_usage::More::default(),
                 ),
                 None,
                 None,
-            ),
+            )
+            .map(|u| u.with_runtime(28_320_000)),
             ..facts()
         };
         let paint = |room| {
@@ -2391,12 +2665,18 @@ mod tests {
         };
         let whole =
             " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/src/github.com/someone/aterm   \u{2387} main";
-        let full = format!("{whole}   \u{03A3} opus 48M in 310k out ");
+        let full = format!("{whole}   \u{03A3} 7h52m \u{2191}48M \u{2193}310k ");
         assert_eq!(paint(full.chars().count()), full);
+        let runtime = format!("{whole}   \u{03A3} 7h52m ");
         assert_eq!(
             paint(full.chars().count() - 1),
+            runtime,
+            "the tokens go first, the runtime stays"
+        );
+        assert_eq!(
+            paint(runtime.chars().count() - 1),
             format!("{whole} "),
-            "the tokens go whole; the path stays whole"
+            "then the runtime; the path stays whole"
         );
         assert_eq!(
             paint(whole.chars().count()),
@@ -2499,6 +2779,7 @@ mod tests {
                     dir: None,
                     launch: LaunchFacts::default(),
                     launch_for: None,
+                    login: None,
                     argv: Vec::new(),
                 },
             );
@@ -2578,6 +2859,311 @@ mod tests {
             (vec![1], false, false),
             "the watched group's stop"
         );
+    }
+
+    /// A roster of two: this machine's own login and one with a directory.
+    fn two_accounts() -> accounts::Roster {
+        let row = |label: &str, dir: Option<&str>| accounts::Row {
+            label: label.into(),
+            class: accounts::Class::Dedicated,
+            dir: dir.map(str::to_owned),
+        };
+        accounts::Roster {
+            rows: vec![row("main", None), row("work-2", Some("/logins/work-2"))],
+        }
+    }
+
+    /// One process's exec read with `env` as its `KEY=value` entries.
+    fn args_of(env: &[&str]) -> atpkg::caller_shell::ProcArgs {
+        atpkg::caller_shell::ProcArgs {
+            argv: vec!["claude".into()],
+            env: env.iter().map(|kv| (*kv).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The exec read of a process under the login directory `dir`.
+    fn login_under(dir: &str) -> Option<accounts::ProcessLogin> {
+        let login = format!("{}={dir}", accounts::LOGIN_ENV);
+        login_of_args(Some(&args_of(&["HOME=/home/someone", &login])))
+    }
+
+    /// A Claude home under a fresh temp root, with the registry row of `pid`
+    /// naming the image `started_at`: `(root, home)`.
+    fn claude_home(name: &str, pid: i32, started_at: u64) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("aterm-gui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cwd, claude) = (root.join("work"), root.join("claude"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(claude.join("sessions")).unwrap();
+        std::fs::write(
+            claude.join(format!("sessions/{pid}.json")),
+            format!(
+                r#"{{"pid":{pid},"sessionId":"00000000-0000-4000-8000-000000000a01","cwd":"{}","startedAt":{},"version":"2.1.287"}}"#,
+                cwd.display(),
+                started_at * 1000 + 684
+            ),
+        )
+        .unwrap();
+        (root, claude)
+    }
+
+    /// The login is read only off an environment that WAS read: no read, and
+    /// one that reads empty, name no login — "no variable set" would say the
+    /// default one, and label a process nobody read. CONTROL: an environment
+    /// with only `HOME` in it is the default login, and one that names a
+    /// login names it.
+    #[test]
+    fn an_environment_that_was_not_read_names_no_login() {
+        assert_eq!(login_of_args(None), None, "no read");
+        assert_eq!(login_of_args(Some(&args_of(&[]))), None, "reads empty");
+        let roster = two_accounts();
+        let default = login_of_args(Some(&args_of(&["HOME=/home/someone"]))).expect("read");
+        assert_eq!(accounts::footer_label(&roster, &default), Some("main"));
+        let named = login_under("/logins/work-2").expect("read");
+        assert_eq!(accounts::footer_label(&roster, &named), Some("work-2"));
+        // The same read is the directory's, so what takes a process out of
+        // the default home is seen here too.
+        let own_home = login_of_args(Some(&args_of(&[
+            "HOME=/home/someone",
+            "CLAUDE_CONFIG_DIR=/elsewhere",
+        ])))
+        .expect("read");
+        assert_eq!(accounts::footer_label(&roster, &own_home), None);
+    }
+
+    /// The resolver's roster is read on the first ask, answered from memory
+    /// within [`ROSTER_RECHECK`] and read again after it: a footer read costs
+    /// no file read of its own, and a roster edited under a running window
+    /// shows within one period. CONTROLS: one row, a load that fails and an
+    /// empty roster are no roster — and are not asked again within the
+    /// period either.
+    #[test]
+    fn the_roster_is_read_at_most_every_recheck() {
+        let t0 = std::time::Instant::now();
+        let asked = std::cell::Cell::new(0);
+        let mut memo = RosterMemo::default();
+        let mut at = |now: std::time::Instant, answer: Option<accounts::Roster>| {
+            memo.at(now, || {
+                asked.set(asked.get() + 1);
+                answer
+            })
+            .cloned()
+        };
+        let two = two_accounts();
+        let mut three = two.clone();
+        three.rows.push(accounts::Row {
+            label: "pool-a".into(),
+            class: accounts::Class::Shared,
+            dir: Some("/logins/pool-a".into()),
+        });
+        let one = accounts::Roster {
+            rows: two.rows[..1].to_vec(),
+        };
+        assert_eq!(at(t0, Some(two.clone())), Some(two.clone()));
+        let within = t0 + ROSTER_RECHECK - Duration::from_millis(1);
+        assert_eq!(at(within, Some(three.clone())), Some(two.clone()), "kept");
+        assert_eq!(asked.get(), 1, "not read again within the period");
+        let t1 = t0 + ROSTER_RECHECK;
+        assert_eq!(at(t1, Some(three.clone())), Some(three), "read afresh");
+        assert_eq!(asked.get(), 2);
+        // NEGATIVE CONTROLS.
+        let t2 = t1 + ROSTER_RECHECK;
+        assert_eq!(at(t2, Some(one)), None, "one account: none to tell apart");
+        assert_eq!(
+            at(t2 + Duration::from_secs(1), Some(two.clone())),
+            None,
+            "no roster is an answer too, kept for the period"
+        );
+        assert_eq!(asked.get(), 3);
+        let t3 = t2 + ROSTER_RECHECK;
+        assert_eq!(at(t3, None), None, "a load that fails");
+        let t4 = t3 + ROSTER_RECHECK;
+        assert_eq!(
+            at(t4, Some(accounts::Roster::default())),
+            None,
+            "none listed"
+        );
+        let t5 = t4 + ROSTER_RECHECK;
+        assert_eq!(at(t5, Some(two.clone())), Some(two), "listed again");
+        assert_eq!(asked.get(), 6);
+    }
+
+    /// The exec read of a process on this machine's own login.
+    fn on_main(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
+        Some(args_of(&["HOME=/home/someone"]))
+    }
+
+    /// The exec read of a process under `work-2`'s login directory, started
+    /// as `claude --resume`.
+    fn on_work(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
+        let login = format!("{}=/logins/work-2", accounts::LOGIN_ENV);
+        Some(atpkg::caller_shell::ProcArgs {
+            argv: vec!["claude".into(), "--resume".into()],
+            ..args_of(&["HOME=/home/someone", &login])
+        })
+    }
+
+    /// An identity as [`resolve_and_post`] builds one: the directory, and
+    /// nothing read of the image yet.
+    fn unread(pid: i32, claude: &std::path::Path) -> Identity {
+        Identity {
+            pid,
+            started: None,
+            dir: Some(claude.to_path_buf()),
+            launch: LaunchFacts::default(),
+            launch_for: None,
+            login: None,
+            argv: Vec::new(),
+        }
+    }
+
+    /// One read of `identity`: the account the timeline then shows — `None`
+    /// for no footer, `Some(None)` for a footer that names no account.
+    fn account_after(
+        identity: &mut Identity,
+        roster: &mut RosterMemo,
+        asks: Asks,
+    ) -> Option<Option<String>> {
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        timeline.lock().unwrap().note_foreground_group(identity.pid);
+        resolve_into(
+            &timeline,
+            identity,
+            &mut footer::TailCache::default(),
+            &mut footer::FooterCache::default(),
+            roster,
+            asks,
+        );
+        let timeline = timeline.lock().unwrap();
+        timeline.claude_footer().map(|facts| facts.account.clone())
+    }
+
+    /// THE ACCOUNT IS LAID IN BY THE READ THAT ANSWERS: the published facts
+    /// carry the label of the row the process's login names. CONTROLS, each
+    /// publishing the same facts with no account: a login no row names; no
+    /// roster; an environment that reads empty, and an exec read that is
+    /// refused, for which the roster is not asked at all — and the refused
+    /// read is asked again at the next footer read, where its answer labels
+    /// the process. A read with no answer (no registry row) asks neither the
+    /// process nor the roster. No test reaches the machine's own roster or a
+    /// real process: each hands its own answers.
+    #[test]
+    fn a_read_that_answers_is_given_its_account() {
+        const PID: i32 = 4242;
+        let (root, claude) = claude_home("footer-account", PID, 1_790_607_848);
+        let listed = |args| Asks {
+            args,
+            roster: || Some(two_accounts()),
+        };
+        let unasked = |args| Asks {
+            args,
+            roster: || unreachable!("no login was read: the roster is not asked"),
+        };
+        let read = |asks: Asks| {
+            let mut memo = RosterMemo::default();
+            let account = account_after(&mut unread(PID, &claude), &mut memo, asks);
+            (account, memo.read.is_some())
+        };
+        assert_eq!(read(listed(on_work)), (Some(Some("work-2".into())), true));
+        assert_eq!(
+            read(listed(on_main)),
+            (Some(Some("main".into())), true),
+            "the default login is the row with no directory"
+        );
+        // NEGATIVE CONTROLS: the footer is published, and names no account.
+        let nobody = |_| {
+            let login = format!("{}=/logins/nobody", accounts::LOGIN_ENV);
+            Some(args_of(&["HOME=/home/someone", &login]))
+        };
+        assert_eq!(read(listed(nobody)), (Some(None), true), "no row names it");
+        let none = Asks {
+            args: on_main,
+            roster: || None,
+        };
+        assert_eq!(read(none), (Some(None), true), "no roster: asked, none");
+        assert_eq!(
+            read(unasked(|_| Some(args_of(&[])))),
+            (Some(None), false),
+            "an environment that reads empty"
+        );
+        // An exec read that is refused: no label, and the next read asks the
+        // process again.
+        let mut identity = unread(PID, &claude);
+        let mut memo = RosterMemo::default();
+        assert_eq!(
+            account_after(&mut identity, &mut memo, unasked(|_| None)),
+            Some(None)
+        );
+        assert_eq!(
+            identity.launch_for, None,
+            "not read: nothing is kept for it"
+        );
+        assert_eq!(
+            account_after(&mut identity, &mut memo, listed(on_main)),
+            Some(Some("main".into())),
+            "read at the next"
+        );
+        // A read with no answer (no registry row) asks nothing.
+        std::fs::remove_file(claude.join(format!("sessions/{PID}.json"))).unwrap();
+        let nothing = Asks {
+            args: |_| unreachable!("no registry row: the process is not read"),
+            roster: || unreachable!("no facts: the roster is not asked"),
+        };
+        assert_eq!(read(nothing), (None, false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE LOGIN IS THE REGISTERED IMAGE'S. What the process was started with
+    /// before Claude Code wrote its registry row may be a launcher's — a
+    /// shim named `claude` that sets its variables and execs in place, the
+    /// pid and the kernel's start kept — so the login and the command line
+    /// are read at the first row, whatever the identity held, and again when
+    /// a row names a new image. CONTROL: a row that names the same image
+    /// reads nothing (the process is not asked), and keeps what was read.
+    #[test]
+    fn the_login_is_the_registered_images() {
+        const PID: i32 = 4242;
+        const IMAGE: u64 = 1_790_607_848;
+        let (root, claude) = claude_home("footer-login", PID, IMAGE);
+        let listed = |args| Asks {
+            args,
+            roster: || Some(two_accounts()),
+        };
+        let mut memo = RosterMemo::default();
+        // What a read before the registry row held: the launcher's.
+        let mut identity = Identity {
+            login: login_of_args(on_main(PID).as_ref()),
+            argv: vec!["shim".into()],
+            ..unread(PID, &claude)
+        };
+        assert_eq!(
+            account_after(&mut identity, &mut memo, listed(on_work)),
+            Some(Some("work-2".into())),
+            "the first row: read again"
+        );
+        assert_eq!(identity.launch_for, Some(Some(IMAGE)));
+        assert_eq!(
+            identity.argv,
+            ["claude", "--resume"],
+            "its command line too"
+        );
+        // NEGATIVE CONTROL: the same image.
+        let same = listed(|_| unreachable!("the image was read: not again"));
+        assert_eq!(
+            account_after(&mut identity, &mut memo, same),
+            Some(Some("work-2".into()))
+        );
+        // A new image in place.
+        let _ = claude_home("footer-login", PID, IMAGE + 60);
+        assert_eq!(
+            account_after(&mut identity, &mut memo, listed(on_main)),
+            Some(Some("main".into())),
+            "a new image: read again"
+        );
+        assert_eq!(identity.launch_for, Some(Some(IMAGE + 60)));
+        assert_eq!(identity.argv, ["claude"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A rule cell counts as the rule's only while it is the rule's own glyph
@@ -2998,11 +3584,17 @@ mod tests {
                 usize::from(cols) - footer_text.chars().count() + 1,
                 "{label}: right-aligned"
             );
-            let accent = crate::chrome_band::band_colors(app.theme).accent;
-            let blank = app.windows[&wid].input_scratch.implicit_blank;
-            assert_eq!(rule[at].fg, accent, "{label}: the mark");
-            assert_eq!(rule[at + 2].fg, blank.fg, "{label}: the value");
             let glyph = *vendor[strip + bottom].last().unwrap();
+            assert_eq!(
+                rule[at + 2].fg,
+                glyph.fg,
+                "{label}: the value, in the rule's gray"
+            );
+            assert_eq!(
+                rule[at + 2].script,
+                aterm_core::terminal::Script::Sub,
+                "{label}: small and low"
+            );
             for (c, (was, now)) in vendor[strip + bottom].iter().zip(rule).enumerate() {
                 if was != now {
                     assert_eq!(*was, glyph, "{label}: col {c} was not a plain rule glyph");
@@ -3024,6 +3616,30 @@ mod tests {
                 assert_eq!(glass[strip + r], vendor[strip + r], "{label}: row {r}");
             }
         }
+        // The usage switch (`[claude_footer] usage`, default on): `Σ` shows
+        // beside a standing limit wall — and `usage = false` takes `Σ` away,
+        // the wall staying.
+        let (mut app, wid, session) = glass(150);
+        let rows = claude_rows("footer-bypass-idle", 150);
+        let bottom = aterm_phase::phase::composer_bottom(&rows).expect("the composer");
+        feed_rows(&app, session, &rows);
+        publish(&app, session, facts_with_usage());
+        frame(&mut app, wid);
+        let rule =
+            |app: &App| text_of(&app.windows[&wid].input_scratch.cells[strip(app, wid) + bottom]);
+        let shown = rule(&app);
+        assert!(
+            shown.contains('\u{29D7}') && shown.contains('\u{03A3}'),
+            "{shown:?}"
+        );
+        app.config.claude_footer =
+            Some(crate::app_config::ClaudeFooterConfig { usage: Some(false) });
+        frame(&mut app, wid);
+        let hidden = rule(&app);
+        assert!(
+            hidden.contains('\u{29D7}') && !hidden.contains('\u{03A3}'),
+            "{hidden:?}"
+        );
     }
 
     /// Nothing is painted where no composer is drawn: a dialog or a picker
@@ -3086,12 +3702,11 @@ mod tests {
             "a split pane gives a row to its title"
         );
         let rule = "\u{2500}".repeat(cols);
-        // Fast mode on (`↯` in the top rule): at rest, no light is drawn.
-        let top = format!("{} \u{21AF} \u{2500}", "\u{2500}".repeat(cols - 4));
+        // Bypass: at rest, no light is drawn.
         let rows: Vec<String> = (0..pane_rows - 4)
             .map(|_| String::new())
             .chain([
-                top,
+                rule.clone(),
                 "\u{276F} ".to_owned(),
                 rule,
                 "  \u{23F5}\u{23F5} bypass permissions on".to_owned(),
@@ -3282,13 +3897,213 @@ mod tests {
         );
     }
 
+    /// A MOVE THE PERSON HOLDS, ON THE GLASS (the owner, 2026-09-30,
+    /// s-61dfc15a: the agent answered READY, the restart waited on the owner
+    /// at the tab, and nothing on the screen said so): the upgrade host's row
+    /// for the tab puts its note first in the rule under the composer, in the
+    /// rule's mark ink, and the frame owes a repaint for it — in the words the
+    /// composer calls for as the engine has it: what holds the move while the
+    /// composer holds no draft (Claude Code's dim suggestion is none), the
+    /// draft's while one stands, through the look that finds the person
+    /// paused with it, and none once a row the draft held finds the composer
+    /// empty, nor while a turn runs. A look that only restamps the person
+    /// changes nothing a frame shows. The words are aterm-agent's
+    /// (`Row::pause_note`, pinned there); this pins where they go. NEGATIVE
+    /// CONTROLS: it goes once no look has seen the person, once the move is
+    /// under way, and for any other wait — the facts staying whole each time.
+    #[test]
+    fn a_move_the_person_holds_leads_the_rule_until_it_goes() {
+        use aterm_agent::harness::upgrade::Phase;
+        use aterm_agent::harness::upgrade_drive::Row;
+        let (mut app, wid, session) = glass(150);
+        let rows = claude_rows("footer-bypass-idle", 150);
+        let bottom = aterm_phase::phase::composer_bottom(&rows).unwrap();
+        let caret = rows
+            .iter()
+            .rposition(|r| r.starts_with('\u{276F}'))
+            .unwrap();
+        // The caret row as Claude Code draws it, the cursor where the
+        // fixture's is: its suggestion dim, a person's draft not.
+        let compose = |app: &App, text: &str, dim: bool| {
+            let sgr = if dim { "\x1b[2m" } else { "" };
+            let row = caret + 1;
+            let out = format!("\x1b[{row};1H\x1b[2K\u{276F} {sgr}{text}\x1b[0m\x1b[{row};3H");
+            let term = app.pool.get(session).expect("session").term.clone();
+            crate::term_lock(&term).process(out.as_bytes());
+        };
+        let suggestion = "Try \"refactor lib.rs\"";
+        feed_rows(&app, session, &rows);
+        compose(&app, suggestion, true);
+        publish(&app, session, facts());
+        let tab = {
+            let store = app.store.read().unwrap_or_else(|p| p.into_inner());
+            store
+                .by_local(session)
+                .expect("the front session")
+                .sid
+                .as_str()
+                .to_string()
+        };
+        let now = crate::upgrade_host::now_s();
+        let held = Row {
+            session: "conv".into(),
+            tab,
+            from: "2.1.285".into(),
+            to: "2.1.286".into(),
+            source: "managed".into(),
+            phase: Phase::Announced {
+                at_s: now - 600,
+                asks: 1,
+            },
+            behind_since: now - (5 * 3_600 + 38 * 60),
+            wait: "attended".into(),
+            wait_since: now - 20,
+            wait_seen: now - 5,
+            person_named: true,
+            ready: true,
+            ..Row::default()
+        };
+        let note = held.pause_note(now).expect("held by the person: noted");
+        let using = note.using.as_ref().expect("an empty composer's words");
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        let fp_before = app.claude_footer_fp(wid, &plan);
+        app.apply_agent_upgrades(vec![held.clone()]);
+        let fp_held = app.claude_footer_fp(wid, &plan);
+        assert_ne!(fp_held, fp_before, "the note repaints");
+        frame(&mut app, wid);
+        let strip = strip(&app, wid);
+        let rule = |app: &App| app.windows[&wid].input_scratch.cells[strip + bottom].clone();
+        let facts_text = "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main \u{2500}";
+        let led = |words: &str| format!(" \u{21E3} {words}   {facts_text}");
+        let text = text_of(&rule(&app));
+        assert!(text.ends_with(&led(&using.whole)), "{text:?}");
+        let at = text.chars().position(|c| c == '\u{21E3}').unwrap();
+        // The note's mark is one of the rule's marks: the same ink as the
+        // model's, not the values' gray.
+        let model_mark = text.chars().position(|c| c == '\u{25C6}').unwrap();
+        assert_eq!(
+            rule(&app)[at].fg,
+            rule(&app)[model_mark].fg,
+            "the note's mark"
+        );
+        assert_ne!(
+            rule(&app)[at].fg,
+            rule(&app)[at + 2].fg,
+            "a mark, not a value"
+        );
+        // A look that only restamps the person: no frame owed.
+        app.apply_agent_upgrades(vec![Row {
+            wait_seen: now,
+            ..held.clone()
+        }]);
+        assert_eq!(app.claude_footer_fp(wid, &plan), fp_held, "no churn");
+        // A person's draft in the composer: the draft's words — and the same
+        // through the look that finds them paused with it.
+        compose(&app, "fix the build", false);
+        frame(&mut app, wid);
+        let text = text_of(&rule(&app));
+        assert!(text.ends_with(&led(&note.draft.whole)), "typing: {text:?}");
+        let paused = Row {
+            wait: "draft".into(),
+            wait_seen: 0,
+            person_named: false,
+            ..held.clone()
+        };
+        app.apply_agent_upgrades(vec![paused.clone()]);
+        frame(&mut app, wid);
+        let text = text_of(&rule(&app));
+        assert!(text.ends_with(&led(&note.draft.whole)), "paused: {text:?}");
+        // The draft sent or cleared: nothing for an empty composer until the
+        // next look says what holds the move.
+        for (why, text, dim) in [("cleared", "", false), ("its suggestion", suggestion, true)] {
+            compose(&app, text, dim);
+            frame(&mut app, wid);
+            let text = text_of(&rule(&app));
+            assert!(!text.contains('\u{21E3}'), "{why}: {text:?}");
+            assert!(text.ends_with(&format!(" {facts_text}")), "{why}: {text:?}");
+        }
+        // A turn running holds the move, whatever the row says of the person.
+        let busy = claude_rows("footer-busy", 150);
+        let busy_bottom = aterm_phase::phase::composer_bottom(&busy).unwrap();
+        feed_rows(&app, session, &busy);
+        app.apply_agent_upgrades(vec![held.clone()]);
+        frame(&mut app, wid);
+        let text = text_of(&app.windows[&wid].input_scratch.cells[strip + busy_bottom]);
+        assert!(!text.contains('\u{21E3}'), "a turn runs: {text:?}");
+        assert!(text.contains(facts_text), "a turn runs: {text:?}");
+        feed_rows(&app, session, &rows);
+        compose(&app, suggestion, true);
+        // NEGATIVE CONTROLS: each takes the note down, the facts staying.
+        for (why, gone) in [
+            (
+                "no look has seen the person lately",
+                Row {
+                    person_named: false,
+                    ..held.clone()
+                },
+            ),
+            (
+                "the move is under way",
+                Row {
+                    phase: Phase::Exiting { at_s: now },
+                    ..held.clone()
+                },
+            ),
+            (
+                "its own work holds it",
+                Row {
+                    wait: "not-idle:busy".into(),
+                    ..held.clone()
+                },
+            ),
+        ] {
+            app.apply_agent_upgrades(vec![held.clone()]);
+            frame(&mut app, wid);
+            assert!(text_of(&rule(&app)).contains('\u{21E3}'), "{why}: held");
+            app.apply_agent_upgrades(vec![gone]);
+            assert_ne!(app.claude_footer_fp(wid, &plan), fp_held, "{why}: repaints");
+            frame(&mut app, wid);
+            let text = text_of(&rule(&app));
+            assert!(!text.contains('\u{21E3}'), "{why}: {text:?}");
+            assert!(text.ends_with(&format!(" {facts_text}")), "{why}: {text:?}");
+        }
+    }
+
     #[test]
     fn no_facts_keys_like_no_footer() {
-        assert_eq!(fingerprint(None), 0);
-        assert_ne!(fingerprint(Some(&facts())), 0);
+        assert_eq!(fingerprint(None, true), 0);
+        assert_ne!(fingerprint(Some(&facts()), false), 0);
         let mut other = facts();
         other.branch = Some("feature".into());
-        assert_ne!(fingerprint(Some(&facts())), fingerprint(Some(&other)));
+        assert_ne!(
+            fingerprint(Some(&facts()), true),
+            fingerprint(Some(&other), true)
+        );
+    }
+
+    /// A label that moves, appears or goes is a repaint: facts that differ
+    /// only in the account key differently, with the usage switch on or off,
+    /// and the timeline takes the label alone as a move, which the window's
+    /// own key lets through. CONTROL: equal accounts key equal.
+    #[test]
+    fn the_account_moves_the_repaint_key() {
+        let on = |label: &str| FooterFacts {
+            account: Some(label.into()),
+            ..facts()
+        };
+        for usage in [true, false] {
+            let key = |facts: &FooterFacts| fingerprint(Some(facts), usage);
+            assert_ne!(key(&on("main")), key(&on("work-2")), "another account");
+            assert_ne!(key(&on("main")), key(&facts()), "one where there was none");
+            assert_eq!(key(&on("main")), key(&on("main")), "the same account");
+        }
+        let (app, wid, session) = glass(80);
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        // `publish` holds the timeline to answering that the facts moved.
+        publish(&app, session, on("main"));
+        let main = app.claude_footer_fp(wid, &plan);
+        publish(&app, session, on("work-2"));
+        assert_ne!(app.claude_footer_fp(wid, &plan), main);
     }
 
     /// A PTY update between grid extraction and host chrome must not move the
@@ -3350,7 +4165,6 @@ mod tests {
             .iter()
             .position(|c| c.ch == '\u{25C6}')
             .expect("the extracted live frame still paints");
-        assert_eq!(footer[mark + 2].fg, extracted_blank.fg);
         assert_eq!(footer[mark + 2].bg, extracted_blank.bg);
 
         // A second paint of the retained scratch first undoes the footer and

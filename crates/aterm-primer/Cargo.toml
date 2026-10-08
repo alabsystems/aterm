@@ -20,6 +20,9 @@ aterm-tempfile = { workspace = true }
 # The env-hygiene sentence in the primer must name every deny prefix the real
 # sanitizer strips; the test pins it against `aterm_types::domain::ENV_DENY_PREFIXES`.
 aterm-types = { workspace = true }
+# The tests' scratch-directory stamp: the workspace's one epoch-clock read, already
+# in the test graph via aterm-types.
+aterm-time = { workspace = true }
 
 [lints]
 workspace = true

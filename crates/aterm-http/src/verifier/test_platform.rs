@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! TEST ONLY: what a test that needs the platform verifier to ANSWER uses to
+//! find out whether it will.
+//!
+//! Declared by `super::tests` as `verifier::test_platform`; its parent module
+//! has `PlatformVerifier` and `is_service_unanswered` in scope, which is all it
+//! names.
+//!
+//! [`trust_service_silent`] is the workspace's one probe and one skip line
+//! (`aterm_uds::deadline`, the `test-support` feature: a code check, through
+//! the same gate the shipped verifier evaluates under) PLUS, when that one
+//! answers, the exact call these tests depend on — one shipped certificate
+//! evaluation — because the two `trustd` round trips can diverge
+//! (`SecTrustEvaluateWithError` has been seen to hang while `security
+//! verify-cert` still answered). Each is asked once per process; a silent
+//! service costs the first ask its deadline, and every shipped evaluation
+//! after it is refused at once.
+
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use rustls::client::danger::ServerCertVerifier;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+pub(crate) use aterm_uds::deadline::notice_once;
+
+use super::{PlatformVerifier, is_service_unanswered};
+
+/// `true`, after [`notice_once`] of the shared skip line, when macOS's
+/// `trustd` does not answer a code check OR the shipped certificate
+/// evaluation; the caller then returns without asserting anything.
+pub(crate) fn trust_service_silent() -> bool {
+    aterm_uds::deadline::trust_service_silent() || shipped_evaluation_unanswered()
+}
+
+/// Whether the shipped verifier's evaluation of one chain went unanswered —
+/// asked once per process. Any chain that reaches the evaluation will do; the
+/// verdict is not the question, only whether there is one.
+fn shipped_evaluation_unanswered() -> bool {
+    static SILENT: OnceLock<bool> = OnceLock::new();
+    let silent = *SILENT.get_or_init(|| {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let Ok(verifier) = PlatformVerifier::new(provider) else {
+            // No platform verifier at all: the callers' own skips say so.
+            return false;
+        };
+        let leaf = CertificateDer::from(&include_bytes!("../testdata/tls/good.der")[..]);
+        let name = ServerName::try_from("test.aterm.invalid").expect("a usable server name");
+        let at = UnixTime::since_unix_epoch(Duration::from_secs(1_781_524_800));
+        match verifier.verify_server_cert(&leaf, &[], &name, &[], at) {
+            Err(error) => is_service_unanswered(&error),
+            Ok(_) => false,
+        }
+    });
+    if silent {
+        notice_once(aterm_uds::deadline::SKIPPED);
+    }
+    silent
+}

@@ -1,57 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// E7 WHOLE-ROW SCROLL BLIT — the GPU arm's byte-identity gate.
+// Whole-row scroll blit on the GPU: byte-identity gate.
 //
-// `compute_dirty_rows` returns `FullRepaint` for ordinary scrollback navigation
-// (display_offset AND the absolute anchor both shifted) even though the grid
-// merely slid by a known integer row delta. The CPU backend has always rescued
-// that verdict with `scroll_blit_plan` — memmove the retained rows, re-raster
-// only the newly-exposed strip — while the GPU present path re-encoded every
-// row of every scrolled frame. The GPU now consults the SAME planner and shifts
-// the offscreen's grid band with a staged texture-to-texture copy.
+// `compute_dirty_rows` returns `FullRepaint` for scrollback navigation even
+// though the grid slid by a known row delta. Like the CPU backend, the GPU
+// consults `scroll_blit_plan` and shifts the offscreen's grid band with a
+// staged texture-to-texture copy, re-rastering only the exposed strip.
 //
-// THE CONTRACT, and the only thing that makes the rescue admissible: a rescued
-// frame must be BYTE-IDENTICAL to a fresh full GPU repaint of the same input.
-// This is the same oracle pattern `scissor_repaint.rs` uses (a separate
-// GpuRenderer renders the input with Clear + every row), applied to the frame
-// class that oracle deliberately expected to fall back.
+// A rescued frame must be byte-identical to a fresh full GPU repaint of the
+// same input (the `scissor_repaint.rs` oracle). The fixture targets the two
+// hard seams: upward glyph overshoot at the exposed/retained boundary (the
+// OVERSHOOT_APRON_ROWS reconciliation; hence parentheses, pipes, underscores,
+// descenders) and wide (CJK) cells riding the shift. Both directions are
+// swept: into history (top strip exposed) and back (bottom strip exposed).
 //
-// The fixture is chosen to attack the two seams the CPU planner needed explicit
-// machinery for:
-//   * UPWARD GLYPH OVERSHOOT at the boundary between the re-rastered exposed
-//     strip and the rigidly-shifted retained region (the OVERSHOOT_APRON_ROWS
-//     reconciliation) — hence parentheses, pipes, underscores and descenders,
-//     which are the glyphs that overshoot their cell band;
-//   * WIDE (CJK) cells riding the retained rows across the shift.
-// Both scroll directions are swept: into history (top strip exposed) and back
-// toward the bottom (bottom strip exposed, the apron direction).
-//
-// Gated: no GPU or no system font => the test no-ops (returns).
+// No GPU or no system font: no-op.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{GpuRenderer, WindowGpu};
 use aterm_render::{RenderInput, Theme};
 
+use crate::common;
+
 const ROWS: usize = 10;
 const COLS: usize = 32;
 
-/// A fresh GpuRenderer (or skip-marker). Blocks on the lazy fallback parses so
-/// the reused renderer and every fresh oracle rasterize the CJK rows identically,
-/// and disables the wall-clock heat shimmer (two renders of one input can never
-/// byte-agree with it live) — the `scissor_repaint.rs` recipe.
+/// A fresh GpuRenderer (or skip-marker), with lazy fallback parses settled so
+/// every renderer rasterizes CJK identically, and the wall-clock heat shimmer
+/// off so two renders of one input can agree.
 fn fresh_gpu() -> Option<GpuRenderer> {
-    match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(mut g) => {
-            g.debug_block_on_lazy_fallbacks();
-            g.set_shimmer(false);
-            Some(g)
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            None
-        }
-    }
+    let mut g = common::gpu_or_skip(18.0, Theme::default())?;
+    g.debug_block_on_lazy_fallbacks();
+    g.set_shimmer(false);
+    Some(g)
 }
 
 /// The ground truth: a brand-new GpuRenderer renders `input` with a FULL repaint
@@ -64,17 +46,12 @@ fn fresh_render(input: &RenderInput) -> Vec<u32> {
 
 /// Deep scrollback whose rows carry overshooting glyphs and wide cells.
 ///
-/// `hide_cursor` is NOT what decides rescuability, though it looks like it should
-/// be. A history scroll does not move the cursor at all as the renderer sees it:
-/// `RenderInput::cursor_row` is the LIVE grid's viewport row and is independent of
-/// `display_offset` (measured — it stays put across `scroll_display`), so a plain
-/// scroll leaves every field `scroll_blit_plan`'s cursor clause compares equal and
-/// the frame is rescued with the cursor visible. The planner still handles the
-/// cursor's PIXELS moving, because the band shift relocates them: it marks both
-/// the re-stamp row and the blitted ghost row `input.cursor_row - da`. Hiding the
-/// cursor therefore only removes those two rows from the exposed strip's dirty
-/// set; the negative control lives in the test below, which moves the cursor for
-/// real.
+/// `hide_cursor` does not decide rescuability: `RenderInput::cursor_row` is
+/// the live grid's viewport row and does not change with `display_offset`, so
+/// a plain scroll is rescued with the cursor visible. The planner still
+/// handles the cursor's pixels moving with the band (re-stamp row and ghost
+/// row `input.cursor_row - da`); hiding it only removes those rows from the
+/// dirty set.
 fn scrollback_term(hide_cursor: bool) -> Terminal {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     if hide_cursor {
@@ -102,10 +79,9 @@ fn history_scroll_is_rescued_and_stays_byte_identical_to_a_full_repaint() {
 
     let mut rescued = 0u64;
     let mut checked = 0usize;
-    // INTO HISTORY (delta < 0, the TOP strip is exposed), then BACK TOWARD THE
-    // BOTTOM (delta > 0, the BOTTOM strip is exposed — the overshoot-apron
-    // direction). Different magnitudes so an odd pixel shift (the shade-phase
-    // parity clause) and an even one are both swept.
+    // Into history (delta < 0, top strip exposed), then back (delta > 0,
+    // bottom strip exposed, the apron direction). Different magnitudes sweep
+    // odd and even pixel shifts (the shade-phase parity clause).
     for (notches, step) in [(10, 3i32), (10, -2i32)] {
         for n in 0..notches {
             term.scroll_display(step);
@@ -121,11 +97,9 @@ fn history_scroll_is_rescued_and_stays_byte_identical_to_a_full_repaint() {
             );
         }
     }
-    // REACH: the rescue must actually carry the sweep, or the byte-identity
-    // assertions above proved nothing about it. A handful of notches legitimately
-    // refuse (the first notch after a direction change re-exposes the cursor
-    // clause, and a notch that lands on identical history content is a plain
-    // gate hit), so the floor is generous but non-trivial.
+    // Reach: the rescue must carry the sweep. Some notches legitimately refuse
+    // (the first after a direction change, or identical content hitting the
+    // gate), so the floor is generous but non-trivial.
     assert!(
         rescued >= 14,
         "the scroll-blit rescue barely fired ({rescued}/{checked} notches) — the \
@@ -137,11 +111,9 @@ fn history_scroll_is_rescued_and_stays_byte_identical_to_a_full_repaint() {
 #[test]
 fn a_cursor_that_really_moves_still_refuses_the_scroll_rescue() {
     let Some(mut gpu) = fresh_gpu() else { return };
-    // The refusal clause is about the cursor's GRID position changing, not about
-    // the viewport sliding under it. So move it for real — a CUP to a different
-    // row/column in the same frame that scrolls — which is the shape of a scroll
-    // arriving on the same tick as shell output. The frame must fall back to the
-    // always-correct full repaint, and must still match one.
+    // Move the cursor for real (a CUP in the same frame that scrolls, as when
+    // a scroll lands on the same tick as shell output). The frame must fall
+    // back to a full repaint and still match one.
     let mut term = scrollback_term(false);
     let mut win = WindowGpu::new();
     let input = term.cell_frame(ROWS, COLS);
@@ -167,11 +139,8 @@ fn a_cursor_that_really_moves_still_refuses_the_scroll_rescue() {
 #[test]
 fn a_visible_cursor_rides_the_rescue_and_stays_byte_identical() {
     let Some(mut gpu) = fresh_gpu() else { return };
-    // The POSITIVE half of the same clause, and the one that actually exercises
-    // the ghost-row machinery: with the cursor SHOWN, every rescued frame must
-    // erase the blitted cursor ghost at `cursor_row - da` and re-stamp a crisp
-    // cursor at `cursor_row`. A stale ghost or a missing stamp is a pixel
-    // difference the oracle catches immediately.
+    // With the cursor shown, every rescued frame must erase the blitted ghost
+    // at `cursor_row - da` and re-stamp the cursor at `cursor_row`.
     let mut term = scrollback_term(false);
     let mut win = WindowGpu::new();
     let input = term.cell_frame(ROWS, COLS);
@@ -205,21 +174,15 @@ fn a_visible_cursor_rides_the_rescue_and_stays_byte_identical() {
     eprintln!("gpu scroll-blit (cursor shown): {rescued} notches rescued");
 }
 
-/// THE RESCUE RIDES SUBMIT A (the armed Metal arm). Since the trackpad glide
-/// tracks 1:1 with a sub-row present on every delta, the whole-row rescue fires
-/// on EVERY row-step frame — once per row crossed while scrolling. It used to
-/// stage its two band copies on a command buffer of its own and park the UI
-/// thread on `waitUntilCompleted` before Submit A: an unbounded, per-row stall
-/// that no timer booked (`last_present_work_ns` charged it to compose). The
-/// copies now ride the armed encode's own command buffer ahead of the scissored
-/// pass, ordered by encode order and the one queue's commit order, so a rescued
-/// present parks on NOTHING it committed itself.
+/// On the armed Metal arm the rescue's band copies ride the armed encode's
+/// own command buffer ahead of the scissored pass (Submit A), so a rescued
+/// present never waits on a command buffer of its own. The whole-row rescue
+/// fires once per row crossed while scrolling.
 ///
-/// Both halves are asserted so silence cannot read as success: the inline-park
-/// count stays flat across the sweep (the negative), AND every rescue's copies
-/// were recorded into a Submit A (the positive — `encode_band_shifts` grows by
-/// exactly the rescues taken). The byte-identity oracle rides along: a copy
-/// that landed AFTER the pass, or on the wrong frame, is a pixel diff here.
+/// Both halves are asserted: the inline-park count stays flat across the
+/// sweep, and `encode_band_shifts` grows by exactly the rescues taken. The
+/// byte-identity oracle catches a copy that landed after the pass or on the
+/// wrong frame.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_rescued_scroll_present_parks_on_no_command_buffer_of_its_own() {

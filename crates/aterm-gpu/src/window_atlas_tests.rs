@@ -3,7 +3,7 @@
 
 //! Window-owned artwork: cache reuse, replacement and teardown on both backends.
 //! The bounded model describes two owners, each with two possible snapshots.
-//! Its mutant reproduces the former renderer-wide slot evicting the other owner.
+//! Its mutant is a renderer-wide slot that evicts the other owner.
 
 use super::{GpuRenderer, RenderInput, SceneAtlas, SpriteTex, WindowGpu};
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, SpriteQuad};
@@ -128,6 +128,7 @@ fn artwork_input(gpu: &GpuRenderer, tag: u8) -> RenderInput {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
+                cell_offset_px: (0, 0),
                 scaling: aterm_core::grid::extra::ImageScaling::Fit,
                 source_rect: None,
             }),
@@ -398,7 +399,7 @@ fn window_atlas_metal_reuses_distinct_artwork_and_releases_closed_windows() {
 
 /// Two owners can select either immutable snapshot. The physical upload count
 /// is the number of distinct live sources, including after one owner leaves.
-/// The mutant is the old per-window allocation of an already resident source.
+/// The mutant allocates per window for an already resident source.
 fn sharing_model() -> Model {
     aterm_spec::ty_model! {
         SharedWindowArtwork {

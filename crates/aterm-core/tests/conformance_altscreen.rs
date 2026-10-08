@@ -1,41 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Tier-1 trace conformance: bind the REAL `Terminal` alt-screen (DEC mode 1049)
-//! round-trip to the external `AltScreen.tla` design spec (TRUST_NATIVE_TLA Phase 2,
-//! terminal-emulator CORRECTNESS family).
+//! Tier-1 trace conformance: binds the real `Terminal` alt-screen (DEC mode
+//! 1049) round-trip to the `AltScreen.tla` design spec.
 //!
-//! `AltScreen.tla` is model-checked in the abstract by aterm-spec-models'
-//! `model_check.rs` (Tier-0: it proves `MainRestoredAfterRoundTrip` — after a
-//! 1049h…1049l round-trip the main cells AND the cursor are unchanged — and catches
-//! the aliasing/botched-restore defect at `Buggy=TRUE`). This test ties that to the
-//! code that runs: it drives the genuine shipping `Terminal` (the same
-//! `process(b"\x1b[?1049h")` / `\x1b[?1049l` path production uses) through a
-//! `WriteMain → Enter → Scribble → Leave` round-trip, projects each reachable
-//! `Terminal` state onto the spec variables `<<active, mainCell, altCell, cursor,
-//! savedCursor, entered, mainSaved>>`, and asks the real `ty` binary to confirm
-//! every observed transition is one the spec's `Next` admits.
+//! aterm-spec-models' `model_check.rs` proves `MainRestoredAfterRoundTrip` on
+//! the spec (after 1049h…1049l the main cells and cursor are unchanged) and
+//! catches the botched restore at `Buggy=TRUE`. This test drives the real
+//! `Terminal` through `WriteMain → Enter → Scribble → Leave` via `process`,
+//! projects each state onto `<<active, mainCell, altCell, cursor, savedCursor,
+//! entered, mainSaved>>`, and asks `ty` to confirm every transition is one the
+//! spec's `Next` admits.
 //!
-//! METHOD — strict per-transition validation (the window_routing template
-//! generalized to an EXTERNAL spec). Because `AltScreen` is multi-transition and
-//! `ty trace validate --spec` strictly checks only `Init` + the first transition,
-//! we pin `Init` to each step's predecessor by generating a per-transition variant
-//! of the COMMITTED `AltScreen.tla` whose `Init` HARDCODES `prev` (a mechanical
-//! `Init`-block rewrite — every action/invariant line is the committed text
-//! verbatim, so the actions cannot drift). A NEGATIVE control (a `Leave` that fails
-//! to restore the cursor — the `Buggy` defect) MUST be ty-REJECTED, so a pass is
-//! never vacuous.
+//! `ty trace validate --spec` checks only `Init` plus the first transition, so
+//! each transition is validated against a variant of the committed spec whose
+//! `Init` is pinned to the predecessor state (only the `Init` block is
+//! rewritten). A negative control (a `Leave` that fails to restore the cursor)
+//! must be rejected.
 //!
-//! PROJECTION (load-bearing, documented like window_routing's +1 remap): the 1-row,
-//! `Cells`-wide spec screen maps to a 1-row `Cells`-col real `Terminal`. A written
-//! glyph projects to a small int (`A`→1, `B`→2, blank→0 = the spec's `0..MaxVal`
-//! cell values); the spec `cursor`/`savedCursor` (`0..Cells`, 0 = home) project to
-//! the 1-based index of the cell just written (matching `WriteMain(c,v): cursor'=c`).
-//! `active` is `term.is_alternate_screen()`; the ghost `mainSaved` is the main cells
-//! captured at the first `Enter`, exactly as the spec's ghost does.
+//! Projection: the 1-row, `Cells`-wide spec screen maps to a 1-row real
+//! terminal; glyphs project to small ints (`A`→1, `B`→2, blank→0);
+//! `cursor`/`savedCursor` project to the 1-based index of the cell just
+//! written (matching `WriteMain(c,v): cursor'=c`); `active` is
+//! `term.is_alternate_screen()`; the ghost `mainSaved` is the main cells at the
+//! first `Enter`.
 //!
-//! `ty` is located by the same fixed canonical path search; absent `ty` the test
-//! FAILS (honesty ratchet, no skip path).
+//! Without `ty` on its canonical path the test fails; there is no skip.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,8 +37,8 @@ use aterm_spec::verify::ty_escalation;
 const CELLS: usize = 3;
 const MAXVAL: i64 = 2;
 
-// VERIFICATION GATE (honesty ratchet, batteries-on) in `aterm_spec::verify`:
-// verification is always required — an absent Trust `ty` FAILS the test with the
+// verification gate (honesty ratchet, batteries-on) in `aterm_spec::verify`:
+// verification is always required — an absent Trust `ty` fails the test with the
 // install hint (`aterm pkg install ty`).
 
 /// The abstract spec state — the projection target.
@@ -92,7 +82,7 @@ fn fn_literal(vals: &[i64]) -> String {
         .join(" @@ ")
 }
 
-/// A function VALUE in `ty`'s trace JSON form `{type:function,value:{domain,mapping}}`.
+/// A function value in `ty`'s trace JSON form `{type:function,value:{domain,mapping}}`.
 fn fn_json(vals: &[i64]) -> String {
     let domain: Vec<String> = (1..=vals.len())
         .map(|n| format!("{{\"type\":\"int\",\"value\":{n}}}"))
@@ -134,7 +124,7 @@ fn state_json(s: &AltState) -> String {
     )
 }
 
-/// The committed `AltScreen.tla` with `Init` HARDCODED to `prev` (so the validated
+/// The committed `AltScreen.tla` with `Init` hardcoded to `prev` (so the validated
 /// transition is the strict first step). Only the `Init ==` block is rewritten;
 /// every action/invariant line is the committed text verbatim.
 fn pinned_spec(committed: &str, prev: &AltState) -> String {
@@ -223,16 +213,15 @@ fn validate(
     )
     .expect("write cfg");
     std::fs::write(&trace_f, transition_trace(prev, next, action)).expect("write trace");
-    let out = Command::new(ty)
-        .arg("trace")
+    let mut cmd = Command::new(ty);
+    cmd.arg("trace")
         .arg("validate")
         .arg(&trace_f)
         .arg("--spec")
         .arg(&spec_f)
         .arg("--config")
-        .arg(&cfg_f)
-        .output()
-        .expect("run ty trace validate");
+        .arg(&cfg_f);
+    let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty trace validate");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -243,7 +232,7 @@ fn validate(
 
 #[test]
 fn real_altscreen_roundtrip_conforms_to_altscreen_spec() {
-    // TIERED (VERIFY-1): a committed hand-written `.tla` — external-tool
+    // tiered: a committed hand-written `.tla` — external-tool
     // obligation; runs only where the Trust toolchain is installed.
     let Some(ty) = ty_escalation("AltScreen conformance") else {
         return;
@@ -253,7 +242,7 @@ fn real_altscreen_roundtrip_conforms_to_altscreen_spec() {
     let dir = std::env::temp_dir().join(format!("aterm-altscreen-conf-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mk tempdir");
 
-    // A 1-row, CELLS-wide real Terminal, fresh on the MAIN screen.
+    // A 1-row, cells-wide real Terminal, fresh on the main screen.
     let mut term = Terminal::new(1, CELLS as u16);
     // Ensure we are on main and the screen is clear/home.
     term.process(b"\x1b[?1049l\x1b[2J\x1b[H");
@@ -312,7 +301,7 @@ fn real_altscreen_roundtrip_conforms_to_altscreen_spec() {
     validated += 1;
 
     // --- Scribble(c=2, v=2): print 'B' at alt col 1 → altCell[2]=2, cursor=2; main
-    //     MUST be untouched (the isolation the spec's MainRestoredAfterRoundTrip needs).
+    //     must be untouched (the isolation the spec's MainRestoredAfterRoundTrip needs).
     let prev = st.clone();
     term.process(b"\x1b[2G"); // alt cursor to col 1
     term.process(b"B");
@@ -345,10 +334,10 @@ fn real_altscreen_roundtrip_conforms_to_altscreen_spec() {
     );
     validated += 1;
 
-    // NEGATIVE CONTROL — the Buggy defect: a `Leave` that does NOT restore the cursor
+    // Negative control — the Buggy defect: a `Leave` that does not restore the cursor
     // (cursor held at the alt scribble position instead of savedCursor).
     // `MainRestoredAfterRoundTrip` forbids it (cursor != savedCursor while on main);
-    // ty MUST reject. `prev` is the post-Scribble state (alt, cursor=2, saved=1).
+    // ty must reject. `prev` is the post-Scribble state (alt, cursor=2, saved=1).
     let mut bad_next = prev.clone();
     bad_next.active_alt = false;
     bad_next.cursor = prev.cursor; // 2 — NOT restored to savedCursor (1)

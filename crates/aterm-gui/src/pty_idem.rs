@@ -137,8 +137,8 @@ pub(crate) const KEYED_VERBS: &[&str] = &["send", "key", "feed-bin", "turn"];
 /// names a sequence the BRIDGE has already consumed is still answered from the
 /// bridge's mark — `OK dup=1`, `ERR busy`, `ERR in-doubt` — because every one of
 /// those answers writes NOTHING, and "a consumed sequence is answered without
-/// writing, however it is asked" is the property `aterm-link`'s
-/// `a_consumed_sequence_is_answered_without_writing_however_it_is_asked` names
+/// writing, however it is asked" is the property `control.rs`'s
+/// `feed_idempotent_a_producer_is_namespaced_by_the_callers_authority` asserts
 /// and an operator debugging a stuck driver depends on. What a `Local` caller may
 /// never do is INSTALL a high-water in the bridge's namespace, which is the act
 /// that suppresses a write. The fallback is one-way: a `Bridge` claim never
@@ -578,7 +578,9 @@ fn refused_before_any_write(reply: &str) -> bool {
 }
 
 /// `OK skipped` — a guarded attempt (`key if=<re>`, `send if=<re>`) whose guard
-/// matched no visible row. It is an `OK` (a skipped guard is an answer, not an
+/// matched no visible row, and its fenced twins: `reason=changed` (`if-gen=`,
+/// `if-fp=`: the screen moved) and `reason=person` (`if-human=`: a person keyed
+/// since the read). It is an `OK` (a skipped guard is an answer, not an
 /// error) that WROTE NOTHING, decided under the terminal lock before any byte
 /// could move, so the sequence is given back: the driver's retry is re-evaluated
 /// against the live screen instead of being told `dup=1` for a press that never

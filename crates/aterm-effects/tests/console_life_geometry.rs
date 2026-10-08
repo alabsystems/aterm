@@ -68,18 +68,15 @@ impl Scene {
                 (y1 - y0) as f32 / f32::from(CELL_H),
                 (x1 - x0) as f32 / f32::from(CELL_W),
             );
-            // THE CARET'S OWN KEEP-OFF RING IS NOT "PROTECTED PIXELS" TO ITS
-            // ESCORT. `STATION_LEAD` seats the pet one cell past the caret,
-            // inside that 3x3 ring by construction — that is the shipped
-            // escort law and what the pet looked like at v0.76.0. Read
-            // strictly this assertion says the escort may never take its own
-            // station. Everything else the strict reading guards — a
-            // selection, an image, a row with no certified cell-to-pixel
-            // projection — still fails here, and the caret CELL itself stays
-            // uncovered at rest because the station law puts the body beside
-            // it, not on it.
+            // The caret's own keep-off ring is not protected pixels to its
+            // escort: `STATION_LEAD` seats the pet one cell past the caret,
+            // inside that 3x3 ring. Selections, images and uncertified rows
+            // still fail here, and the caret cell itself stays uncovered at
+            // rest because the station puts the body beside it.
             assert!(world.under_text_clearance_past_caret(rect, 0.0) == Some(true));
-            assert!(frame.under_ink || world.clear(rect, 0.0));
+            // Real ink under the drawn body is always in front of it. The
+            // caret's ring is protection, not ink: it does not send it under.
+            assert!(frame.under_ink || world.ink_clearance(rect, 0.0) == Some(true));
         }
         frame
     }

@@ -144,11 +144,23 @@ pub(crate) enum PreviewTrailCompanion {
     FlyingKitty,
 }
 
+/// The catalog a preview resolves a trail spelling against: always EMPTY, since a
+/// `pack:` preview carries its resolved data in [`CursorPreviewSpec::trail_pack`].
+/// Built once — resolution runs several times per presented frame, and a fresh
+/// catalog is a heap allocation each time.
+fn no_trail_packs() -> &'static crate::app_config::TrailPackCatalog {
+    static NO_TRAIL_PACKS: std::sync::LazyLock<crate::app_config::TrailPackCatalog> =
+        std::sync::LazyLock::new(Default::default);
+    &NO_TRAIL_PACKS
+}
+
 impl PreviewTrailStyle {
     #[cfg(test)]
     pub(crate) fn parse(value: &str) -> Self {
-        let empty = crate::app_config::TrailPackCatalog::default();
-        Self::from_resolution(value, crate::app_config::resolve_trail_style(value, &empty))
+        Self::from_resolution(
+            value,
+            crate::app_config::resolve_trail_style(value, no_trail_packs()),
+        )
     }
 
     pub(crate) fn from_resolution(
@@ -277,8 +289,7 @@ impl CursorPreviewSpec {
     /// keys on, so it keeps the user's spelling and case.
     pub(crate) fn effective_trail_style_raw(&self) -> &str {
         let raw = self.trail_style_raw.trim();
-        let empty = crate::app_config::TrailPackCatalog::default();
-        let resolved = crate::app_config::resolve_trail_style(raw, &empty);
+        let resolved = crate::app_config::resolve_trail_style(raw, no_trail_packs());
         if PreviewTrailStyle::from_resolution(raw, resolved) == self.trail_style {
             raw
         } else {
@@ -320,8 +331,7 @@ impl CursorPreviewSpec {
                     .then_some(crate::app_config::TrailStyleIssue::MissingPack),
             };
         }
-        let empty = crate::app_config::TrailPackCatalog::default();
-        crate::app_config::resolve_trail_style(self.effective_trail_style_raw(), &empty)
+        crate::app_config::resolve_trail_style(self.effective_trail_style_raw(), no_trail_packs())
     }
 
     fn resolved_trail_presentation(&self) -> crate::app_config::ResolvedTrailPresentation {
@@ -859,51 +869,16 @@ impl SettingsPreviewSpec {
     /// Return the exact cadence required by the pixels this spec can paint.
     /// Static, hidden, reduced-motion, and zero-intensity combinations return
     /// `None`, preserving aterm's pure-Wait idle contract.
-    pub(crate) fn animation(&self) -> PreviewAnimation {
-        self.animation_in_place()
-    }
-
-    /// `self.normalized().normalized_animation()` evaluated without
-    /// materializing the normalized spec.
     ///
-    /// The event loop probes the cadence for every window on every
-    /// `about_to_wait` turn, and the retained-raster key needs it once per
-    /// presented frame; neither wants the ~10 heap allocations `normalized()`
-    /// pays to produce a three-variant enum. Only the cursor lane actually
-    /// needs normalizing — `CursorPreviewSpec::normalized` allocates nothing
-    /// (its one clone is an `Option<Arc>` refcount, kept only for `Custom`) —
-    /// because `scene` and `reduced_motion` are copied verbatim and
+    /// Answered from the spec as it stands, normalized or not, without
+    /// materializing `normalized()`: the event loop probes the cadence for every
+    /// window on every `about_to_wait` turn, and the retained-raster key needs it
+    /// once per presented frame, so neither pays the ~10 heap allocations
+    /// `normalized()` costs to produce a three-variant enum. Nothing it reads
+    /// needs normalizing except a non-finite `intensity`, which collapses to 0.0
+    /// (no motion) here exactly as it does in paint;
     /// `millis_until_next_blink_edge` re-applies `% PHASE_CYCLE_MS` itself.
-    ///
-    /// INVARIANT: this must answer identically to `normalized_animation()` on
-    /// the normalized spec, so the scheduler cannot drift from the painter.
-    /// Normalizing the cursor is what makes that exact rather than approximate:
-    /// a non-finite `intensity` collapses to 0.0 (no motion) here exactly as it
-    /// does in paint. The `debug_assert_eq!` is the standing guard.
-    fn animation_in_place(&self) -> PreviewAnimation {
-        let animation = if self.reduced_motion || self.scene != PreviewScene::CursorMotion {
-            PreviewAnimation::None
-        } else {
-            let cursor = self.cursor.normalized();
-            if cursor.trail_enabled && cursor.has_resolved_trail() && cursor.intensity > 0.0 {
-                PreviewAnimation::Continuous
-            } else if cursor.blink && cursor.style != PreviewCursorStyle::Hidden {
-                PreviewAnimation::BlinkEdge {
-                    after_ms: self.millis_until_next_blink_edge(),
-                }
-            } else {
-                PreviewAnimation::None
-            }
-        };
-        debug_assert_eq!(
-            animation,
-            self.normalized().normalized_animation(),
-            "preview cadence must not depend on spec normalization"
-        );
-        animation
-    }
-
-    fn normalized_animation(&self) -> PreviewAnimation {
+    pub(crate) fn animation(&self) -> PreviewAnimation {
         if self.reduced_motion {
             return PreviewAnimation::None;
         }
@@ -920,7 +895,7 @@ impl SettingsPreviewSpec {
         }
         if self.cursor.trail_enabled
             && self.cursor.has_resolved_trail()
-            && self.cursor.intensity > 0.0
+            && finite_or(self.cursor.intensity, 0.0) > 0.0
         {
             return PreviewAnimation::Continuous;
         }
@@ -1076,7 +1051,7 @@ impl SettingsPreviewSpec {
                 let motion = if spec.reduction_suppresses_motion() {
                     "Static because Reduce Motion is active"
                 } else {
-                    match spec.normalized_animation() {
+                    match spec.animation() {
                         PreviewAnimation::Continuous => "Live",
                         PreviewAnimation::BlinkEdge { .. } => "Live cursor blink",
                         PreviewAnimation::None => "Static",
@@ -1119,7 +1094,7 @@ impl SettingsPreviewSpec {
     /// useful to developers but punishing when spoken by assistive technology.
     pub(crate) fn audit_value(&self) -> String {
         let spec = self.normalized();
-        let motion = match spec.normalized_animation() {
+        let motion = match spec.animation() {
             PreviewAnimation::None if spec.reduction_suppresses_motion() => {
                 "reduced motion; static"
             }
@@ -1467,7 +1442,7 @@ impl SettingsPreviewSpec {
         let cursor_visible = self.reduced_motion
             || !self.cursor.blink
             || (phase_ms / CURSOR_BLINK_HALF_MS).is_multiple_of(2);
-        match self.animation_in_place() {
+        match self.animation() {
             PreviewAnimation::Continuous => phase_ms.hash(&mut hash),
             PreviewAnimation::BlinkEdge { .. } => cursor_visible.hash(&mut hash),
             PreviewAnimation::None => 0_u64.hash(&mut hash),
@@ -1646,7 +1621,7 @@ impl SettingsPreviewSpec {
             TextWeight::Regular,
             TextFace::UiBold,
             rgba(
-                if matches!(spec.normalized_animation(), PreviewAnimation::Continuous) {
+                if matches!(spec.animation(), PreviewAnimation::Continuous) {
                     roles.success
                 } else {
                     roles.text_secondary
@@ -1754,7 +1729,7 @@ impl SettingsPreviewSpec {
         } else if self.reduction_suppresses_motion() {
             "Reduced motion".to_string()
         } else {
-            match self.normalized_animation() {
+            match self.animation() {
                 PreviewAnimation::None => match self.scene {
                     PreviewScene::Appearance => "Color sample".to_string(),
                     PreviewScene::Typography => "Text sample".to_string(),
@@ -1788,7 +1763,7 @@ impl SettingsPreviewSpec {
         } else if self.reduction_suppresses_motion() {
             "Reduced motion".to_string()
         } else {
-            match self.normalized_animation() {
+            match self.animation() {
                 PreviewAnimation::None => self.candidate_badge(),
                 PreviewAnimation::BlinkEdge { .. } => "Live blink".to_string(),
                 PreviewAnimation::Continuous => format!(

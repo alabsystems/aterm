@@ -57,14 +57,13 @@ aterm_types::bitflags! {
         const HAS_WIDE_CHARS = 1 << 5;
         /// This row contains at least one cell written with a StyleId
         /// (cell flag USES_STYLE_ID). Set by StyleId write paths and
-        /// propagated by Row::set; cleared by clear()/erase(). Enables
-        /// extract_row_extras to skip the per-cell style_id scan on plain-text
-        /// rows even when other rows in the grid use style interning (#7872).
+        /// propagated by Row::set; cleared by clear()/erase(). Lets
+        /// extract_row_extras skip the per-cell style_id scan on plain rows.
         const HAS_STYLE_ID = 1 << 6;
         /// Mask of DEC line attribute flags (DECDWL/DECDHL).
         ///
-        /// Erase operations clear character content but must preserve these
-        /// line attributes per VT420/VT510 spec and xterm behavior (#7497).
+        /// Erase operations clear character content but keep these line
+        /// attributes, per VT420/VT510 and xterm.
         const LINE_ATTRIBUTES = Self::DOUBLE_WIDTH.bits()
             | Self::DOUBLE_HEIGHT_TOP.bits()
             | Self::DOUBLE_HEIGHT_BOTTOM.bits();
@@ -104,9 +103,7 @@ impl Row {
     )]
     pub unsafe fn new(cols: u16, pages: &mut PageStore) -> Self {
         let mut cells = pages.alloc_cells(cols);
-        for cell in cells.iter_mut() {
-            *cell = Cell::EMPTY;
-        }
+        cells.fill(Cell::EMPTY);
         Self {
             cells,
             len: 0,
@@ -339,23 +336,23 @@ impl Row {
 
         let old_len = self.len as usize;
         let had_wide = self.flags.contains(RowFlags::HAS_WIDE_CHARS);
-        self.fixup_wide_chars_in_range(start_col, count);
+        if had_wide {
+            self.fixup_wide_chars_in_range(start_col, count);
+        }
         let end = start
             .saturating_add(usize::from(count))
             .min(self.cells.len());
         if end > start {
             self.flags |= RowFlags::DIRTY;
         }
-        // #7522 (write/fill path): fixup_wide_chars_in_range can clear a wide
-        // continuation at index `end` — ONE column past the returned slice — when
-        // the last covered cell is a WIDE head. Bulk callers only GROW len via
-        // update_len() and never see that past-range clear, so if the orphan was
-        // the row's tail content len is left stale-high (phantom trailing space in
-        // row_text/search/scrollback). Tighten here when a fixup emptied the old
-        // tail; the caller's subsequent update_len() still grows len for any
-        // content it writes into the range. Gated on had_wide (fixup only clears
-        // when HAS_WIDE_CHARS) so the ASCII-blast hot path stays branch-free, and
-        // recalculate_len_up_to never over-shrinks (never below real content).
+        // `fixup_wide_chars_in_range` can clear a wide continuation at `end`,
+        // one past the returned slice, when the last covered cell is a WIDE
+        // head. Bulk callers only grow len via update_len(), so if that orphan
+        // was the tail content len would stay stale-high (a phantom trailing
+        // space in row_text/search/scrollback). Tighten here; the caller's
+        // update_len() still grows len for what it writes. Gated on had_wide so
+        // the ASCII path stays branch-free; recalculate_len_up_to never
+        // over-shrinks.
         if had_wide && old_len > 0 && self.cells[old_len - 1].is_empty() {
             self.recalculate_len_up_to(old_len);
         }
@@ -390,9 +387,9 @@ impl Row {
             if cell.flags().contains(super::CellFlags::WIDE) {
                 new_flags |= RowFlags::HAS_WIDE_CHARS;
             }
-            // Propagate HAS_STYLE_ID so extract_row_extras can short-circuit
-            // on plain-text rows even after reflow/checkpoint restore copies
-            // style-interned cells via Row::set (#7872).
+            // Propagate HAS_STYLE_ID so extract_row_extras can short-circuit on
+            // plain rows even after reflow/checkpoint restore copies
+            // style-interned cells via Row::set.
             if cell.flags().contains(super::CellFlags::USES_STYLE_ID) {
                 new_flags |= RowFlags::HAS_STYLE_ID;
             }
@@ -403,30 +400,21 @@ impl Row {
         }
     }
 
-    /// Recalculate the len field by scanning up to `end`.
-    /// Settle `len` after a BULK wide-char run written through
+    /// Settle `len` after a bulk wide-char run written through
     /// [`Row::write_wide_char_packed_no_fixup`].
     ///
-    /// The checked single-glyph writer does this per glyph, and it is not only a
-    /// grow. Its else arm SHRINKS: a wide write can orphan a pre-existing wide
-    /// char's continuation, the fixup clears that cell, and if it was the row's
-    /// last content then `len` is left stale-high and a phantom trailing space
-    /// surfaces in `row_text`, search and scrollback — the #7522 len class,
-    /// closed on the write path. [`Row::update_len`] is grow-only and cannot
-    /// close it, so a run lane that only calls `update_len` reopens it.
+    /// A wide write can orphan an existing wide char's continuation; the
+    /// fixup clears it, and if it was the row's last content `len` must shrink
+    /// or a phantom trailing space shows in `row_text`, search and scrollback.
+    /// [`Row::update_len`] only grows, so run lanes call this instead.
     ///
-    /// Once per run is equivalent to once per glyph. The glyphs advance left to
-    /// right over cells the run itself owns, so only the final state can decide
-    /// `len`; and `recalculate_len_up_to` RESCANS rather than adjusting, so it
-    /// reaches the same answer from that end state as it would have from the
-    /// intermediate one.
+    /// Once per run equals once per glyph: glyphs advance left to right over
+    /// cells the run owns, and `recalculate_len_up_to` rescans, reaching the
+    /// same answer from the final state.
     ///
-    /// This is the WIDE-run half of a rule [`Row::cells_mut_with_fixup`] already
-    /// carries for the narrow one, in the same shape and for the same stated
-    /// reason ("bulk callers only GROW len via `update_len()` and never see that
-    /// past-range clear"). The narrow bulk writers were safe because they go
-    /// through that helper; the wide run lanes call `fixup_wide_chars_in_range`
-    /// directly and so bypassed the obligation with it.
+    /// The wide-run counterpart of the rule [`Row::cells_mut_with_fixup`]
+    /// applies for narrow bulk writes; the wide lanes call
+    /// `fixup_wide_chars_in_range` directly.
     pub fn settle_len_after_wide_run(&mut self, end_col: u16) {
         self.update_len(end_col);
         let len = self.len as usize;
@@ -448,13 +436,10 @@ impl Row {
 
     /// Recompute `len` by scanning the entire row for the last non-empty cell.
     ///
-    /// For callers that write cells via [`Row::set`] (whose len update is
-    /// grow-only) and may have overwritten the row's tail with blanks — e.g.
-    /// DECCRA `copy_rect`, which copies verbatim source blanks and blanks
-    /// orphaned wide halves. `set` never shrinks len, so such a caller must
-    /// recompute the true content extent afterward or the emptied tail is left
-    /// inside `len` (#7522 stale-high → phantom trailing spaces). Never
-    /// over-shrinks (it finds real content anywhere in the row).
+    /// For callers writing cells via [`Row::set`] (grow-only len) that may
+    /// have overwritten the tail with blanks, e.g. DECCRA `copy_rect` copying
+    /// source blanks and blanking orphaned wide halves; otherwise the emptied
+    /// tail stays inside `len` (phantom trailing spaces). Never over-shrinks.
     #[inline]
     pub(crate) fn recompute_len(&mut self) {
         self.recalculate_len_up_to(self.cells.len());
@@ -500,10 +485,9 @@ impl Row {
                 *last_cell = Cell::EMPTY;
                 cleared = true;
             }
-            // Note: We don't clear WIDE_CONTINUATION at position 0 because:
-            // 1. A true spacer cell would be at position 1 (following WIDE at 0)
-            // 2. WIDE_CONTINUATION shares bit with PROTECTED, so we'd incorrectly
-            //    clear protected cells (see #1286)
+            // WIDE_CONTINUATION at position 0 is not cleared: a true spacer
+            // would sit at position 1 (after WIDE at 0), and the bit is shared
+            // with PROTECTED, so clearing it would corrupt protected cells.
             if cleared {
                 self.recalculate_len_up_to(self.cells.len());
             }
@@ -545,9 +529,9 @@ impl Row {
     }
 
     /// An owned copy of this row that no [`PageStore`] backs, for a holder that
-    /// must outlive the grid's pages (`Grid`'s alt-screen resize undo: the
-    /// grid replaces its store wholesale on a width change, an ED 3 and a ring
-    /// eviction, and a `Row` kept across one of those would dangle).
+    /// must outlive the grid's pages (the alt-screen resize undo: the grid
+    /// replaces its store on a width change, an ED 3 and a ring eviction, so a
+    /// kept `Row` would dangle).
     pub(crate) fn snapshot(&self) -> RowSnapshot {
         RowSnapshot {
             cells: self.cells.to_vec().into_boxed_slice(),

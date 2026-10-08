@@ -256,71 +256,12 @@ pub fn includes(text: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// One `key = value` statement of a TOML document, with the table header it
-/// sits under (`[target.'cfg(unix)'.dependencies]` is `["target",
-/// "cfg(unix)", "dependencies"]`, and `[[bin]]` is `["bin"]`; empty at the
-/// top level).
-pub(crate) struct Statement {
-    pub(crate) table: Vec<String>,
-    pub(crate) key: Vec<String>,
-    pub(crate) value: Value,
-}
-
-/// Every statement of a TOML document, in order, read by the same small
-/// reader [`includes`] uses — and with the same rule: what it cannot parse is
-/// an `Err`, never a shorter list. The nearest-base gate reads main's
-/// manifests with it ([`crate::nearest`], 2026-09-28).
-///
-/// # Errors
-/// What in the document could not be read as TOML.
-pub(crate) fn statements(text: &str) -> Result<Vec<Statement>, String> {
-    let mut p = Toml {
-        b: text.as_bytes(),
-        i: 0,
-    };
-    let mut out = Vec::new();
-    let mut table: Vec<String> = Vec::new();
-    loop {
-        p.blank();
-        let Some(c) = p.peek() else { break };
-        if c == b'[' {
-            let array = p.b.get(p.i + 1) == Some(&b'[');
-            p.i += if array { 2 } else { 1 };
-            let key = p.key()?;
-            p.ws();
-            let closing: &[u8] = if array { b"]]" } else { b"]" };
-            if !p.b[p.i..].starts_with(closing) {
-                return Err(p.at("a table header is not closed"));
-            }
-            p.i += closing.len();
-            p.eol()?;
-            table = key;
-            continue;
-        }
-        let key = p.key()?;
-        p.ws();
-        if p.peek() != Some(b'=') {
-            return Err(p.at("a key is not followed by `=`"));
-        }
-        p.i += 1;
-        let value = p.value()?;
-        p.eol()?;
-        out.push(Statement {
-            table: table.clone(),
-            key,
-            value,
-        });
-    }
-    Ok(out)
-}
-
 /// A TOML value, as far as [`includes`] needs one: a string it can read
 /// verbatim (no escapes), an array, an inline table, or anything else.
 pub(crate) enum Value {
     Str(String),
-    /// A string spelled with escapes, as written (undecoded): never a value
-    /// a reader may use as the string it means, only one it may look inside.
-    Escaped(String),
+    /// A string spelled with escapes: never a value a reader may use.
+    Escaped,
     Array(Vec<Value>),
     Table(Vec<(Vec<String>, Value)>),
     Other,
@@ -465,7 +406,7 @@ impl Toml<'_> {
             Some(b'"' | b'\'') => {
                 let (s, escaped) = self.string()?;
                 Ok(if escaped {
-                    Value::Escaped(s)
+                    Value::Escaped
                 } else {
                     Value::Str(s)
                 })

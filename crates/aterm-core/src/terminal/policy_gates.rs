@@ -4,49 +4,25 @@
 
 //! Compiled per-gate policy decisions, resolved once per installed policy.
 //!
-//! # The waste this removes
+//! Several capability gates consult the [`PolicyEngine`] with a probe whose
+//! inputs are all constants (the response sink evaluates
+//! `ProbeKind::response_sink()` at [`OriginTag::Pty`] on every reply), so the
+//! verdict can change only when a policy is installed, replaced or cleared.
+//! [`PolicyGates`] resolves those probes once, at install time, into a table of
+//! [`BridgeDecision`]s; each dispatch is then a field read.
 //!
-//! Several capability gates in `terminal/` consult the [`PolicyEngine`] once per
-//! dispatched sequence with a probe whose every input is a **compile-time
-//! constant**. The response sink is the clearest case: `send_response` builds
-//! `ProbeKind::response_sink()` — the literal `Dcs { final_byte: 0 }` — at the
-//! literal origin [`OriginTag::Pty`], turns it into two heap `String`
-//! allocations, and walks the rule set, on **every reply**. Nothing in that
-//! computation varies between two calls under the same policy, so the answer can
-//! only change when a policy is installed, replaced, or cleared.
+//! A stale table would be a security defect, so [`PolicyState`] owns both the
+//! engine and the table, with private fields and two mutators
+//! ([`PolicyState::install`] and `PolicyState::clear`) that recompile the table
+//! in the same statement that changes the engine. "Engine changed, table did
+//! not" is not representable; the tests drive a real `Terminal` through every
+//! install/replace/clear order.
 //!
-//! [`PolicyGates`] resolves those constant probes once, at policy-install time,
-//! into a table of [`BridgeDecision`]s. The per-dispatch cost becomes a field
-//! read: no allocation, no hash lookup, no rule walk.
-//!
-//! # Why this cannot go stale
-//!
-//! A stale memo here would be a security defect, not a performance one: a gate
-//! could answer with a verdict from a policy that is no longer installed. The
-//! table is therefore **not** a field sitting next to the engine that callers
-//! must remember to refresh. [`PolicyState`] owns both, its fields are private
-//! to this module, and it exposes exactly two mutators —
-//! [`PolicyState::install`] and `PolicyState::clear` — each of which
-//! recompiles the table in the same statement that changes the engine. There is
-//! no way to reach the engine mutably from outside this module (and
-//! `PolicyEngine` itself has no in-place policy swap), so "the
-//! engine changed but the table did not" is not a representable state. That is
-//! the invariant the tests at the bottom of this file pin from the outside, by
-//! driving a real `Terminal` through every install/replace/clear order.
-//!
-//! # Why the memo is exactly equivalent
-//!
-//! [`PolicyEngine::evaluate`] takes `&self` and is side-effect-free: it reads
-//! the compiled rule set and returns a [`aterm_policy::Decision`]. It is a pure
-//! function of (policy, sequence, origin). Every gate compiled here holds
-//! sequence and origin fixed, and the policy is fixed for the lifetime of the
-//! table. Each gate's probe is built by the owning capability module's single
-//! probe constructor — the SAME function the per-dispatch path called — so the
-//! compiled verdict is by construction the verdict the removed call would have
-//! produced. A gate whose probe is not fully constant (XTWINOPS varies with
-//! `Ps`, shell integration with the subcommand) is keyed on the varying part,
-//! and any key outside the compiled range falls back to a live evaluation rather
-//! than being answered from a slot it does not own.
+//! The memo is exact: [`PolicyEngine::evaluate`] is a pure function of
+//! (policy, sequence, origin), and each gate's probe comes from the owning
+//! module's single probe constructor. Gates whose probe varies (XTWINOPS with
+//! `Ps`, shell integration with the subcommand) are keyed on the varying part,
+//! and keys outside the compiled range are evaluated live.
 
 use aterm_policy::engine::PolicyEngine;
 use aterm_policy::limits::{RateLimitSlot, TimeSource};
@@ -55,30 +31,20 @@ use aterm_policy::{OriginTag, RateLimit};
 use super::policy_bridge::{self, BridgeDecision};
 use super::response_capability::ProbeKind;
 
-/// The origin every compiled gate is resolved at.
-///
-/// This is a call-site fact, not a type guarantee: every production gate site
-/// passes the literal `OriginTag::Pty`. Compiling a gate at a fixed origin is
-/// only sound while that stays true, so the sites read this constant instead of
-/// spelling `Pty` again.
+/// The origin every compiled gate is resolved at. Every production gate site
+/// passes `OriginTag::Pty`, and compiling at a fixed origin is sound only while
+/// that holds, so the sites read this constant.
 pub(super) const GATE_ORIGIN: OriginTag = OriginTag::Pty;
 
-/// Largest XTWINOPS `Ps` the compiled table covers, inclusive.
-///
-/// xterm defines 1..=24 and `Ps` absent means 0, so this covers the whole
-/// defined opcode space. It deliberately does NOT cover the rest of the `u16`:
-/// `Ps` comes straight off the wire (`params.first().unwrap_or(0)`) and is
-/// attacker-controlled over the full range, while a policy may legitimately name
-/// any major (`"CSI 999 t"` parses fine). Answering an out-of-range `Ps` from a
-/// shared slot would therefore be wrong, so
-/// [`PolicyState::xtwinops_gate`] falls back to a live evaluation there.
+/// Largest XTWINOPS `Ps` the compiled table covers, inclusive: xterm defines
+/// 1..=24 and an absent `Ps` is 0. `Ps` comes off the wire over the whole
+/// `u16` and a policy may name any major, so
+/// [`PolicyState::xtwinops_gate`] evaluates out-of-range values live.
 const XTWINOPS_MAX_PS: u16 = 24;
 
-/// The rate-limit id the response sink debits, once per reply.
-///
-/// Named here rather than spelled at the call site because [`PolicyState`]
-/// resolves it to a [`RateLimitSlot`] at install time and `send_response` then
-/// debits that slot — the id string and its resolution must not drift apart.
+/// The rate-limit id the response sink debits once per reply. [`PolicyState`]
+/// resolves it to a [`RateLimitSlot`] at install time, so the id and its
+/// resolution share this one definition.
 pub(super) const RESPONSE_LIMIT_ID: &str = "response";
 
 /// Compiled XTWINOPS slots: `Ps` 0..=[`XTWINOPS_MAX_PS`].
@@ -87,14 +53,10 @@ const XTWINOPS_GATES: usize = XTWINOPS_MAX_PS as usize + 1;
 /// OSC majors the shell-integration gate covers, in table order.
 const SHELL_MAJORS: [u32; 2] = [133, 633];
 
-/// Subcommand letters the shell-integration table covers: `A`..=`Z`.
-///
-/// The probe's subcommand is `params[1]` (or a fabricated `"A"`), and an OSC
-/// param selector CAN discriminate on it (`"OSC 133;C"` parses), so the table is
-/// keyed on the subcommand and not on the major alone. Every mark the shipped
-/// preambles emit — 133 `A`/`B`/`C`/`D`, 633 `A`..`H`/`P` — is a single ASCII
-/// uppercase letter; anything else (a multi-byte subcommand, a lowercase one,
-/// non-UTF-8) is evaluated live rather than answered from a shared slot.
+/// Subcommand letters the shell-integration table covers: `A`..=`Z`. An OSC
+/// param selector can discriminate on the subcommand (`"OSC 133;C"`), so the
+/// table is keyed on it. The shipped preambles emit only single uppercase
+/// letters (133 `A`-`D`, 633 `A`-`H`/`P`); anything else is evaluated live.
 const SHELL_SUBCOMMANDS: usize = 26;
 
 /// The shell-integration gate verdict for one `(major, subcommand)`, live.
@@ -120,12 +82,9 @@ fn shell_slot(command: u32, subcommand: &str) -> Option<(usize, usize)> {
     Some((major, usize::from(byte - b'A')))
 }
 
-/// The XTWINOPS gate verdict for one `Ps`, evaluated live.
-///
-/// The single definition of that decision: [`PolicyState`] calls it once per
-/// covered `Ps` at install time and again on the out-of-range fallback path, and
-/// `window_auth`'s tests call it to check the capability mint against the same
-/// verdict production reads.
+/// The XTWINOPS gate verdict for one `Ps`, evaluated live: used by
+/// [`PolicyState`] at install time and on the out-of-range fallback, and by
+/// `window_auth`'s tests.
 #[must_use]
 pub(super) fn xtwinops_verdict(engine: Option<&PolicyEngine>, ps: u16) -> BridgeDecision {
     policy_bridge::engine_decision_deny_by_default_capability(
@@ -135,10 +94,9 @@ pub(super) fn xtwinops_verdict(engine: Option<&PolicyEngine>, ps: u16) -> Bridge
     )
 }
 
-/// Policy verdicts for the fixed capability gates, resolved once per policy.
-///
-/// One byte per gate. Copied out by value at the dispatch sites so a gate read
-/// never borrows the terminal.
+/// Policy verdicts for the fixed capability gates, resolved once per policy:
+/// one byte per gate, copied out by value so a gate read never borrows the
+/// terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PolicyGates {
     /// Verdict for the single `send_response` sink (`handler.rs`).
@@ -150,11 +108,9 @@ pub(super) struct PolicyGates {
 }
 
 impl PolicyGates {
-    /// Resolve every gate against `engine` (or against "no engine installed",
-    /// which every gate answers as [`BridgeDecision::Fallback`]).
-    ///
-    /// `pub(super)` so sibling modules' tests can build a table directly from an
-    /// engine and compare it against the per-dispatch path they replaced.
+    /// Resolve every gate against `engine` (with none installed every gate
+    /// answers [`BridgeDecision::Fallback`]). `pub(super)` so sibling modules'
+    /// tests can compare it with a live evaluation.
     pub(super) fn compile(engine: Option<&PolicyEngine>) -> Self {
         Self {
             response_sink: policy_bridge::engine_decision(
@@ -163,8 +119,8 @@ impl PolicyGates {
                 GATE_ORIGIN,
             ),
             // Deny-by-default capability sinks: a broad `response any = Execute`
-            // must NOT reopen them, which is why these use the
-            // wildcard-demoting bridge entry point (`policy_bridge` module docs).
+            // must not reopen them, hence the wildcard-demoting bridge entry
+            // point (see `policy_bridge`).
             osc52_set: policy_bridge::engine_decision_deny_by_default_capability(
                 engine,
                 &super::clipboard_auth::probe_osc52_set(),
@@ -178,8 +134,8 @@ impl PolicyGates {
         }
     }
 
-    /// Verdict for the response sink. See [`BridgeDecision::resolve`] for how
-    /// the caller folds it against its legacy boolean.
+    /// Verdict for the response sink; see [`BridgeDecision::resolve`] for how
+    /// callers fold it with their legacy boolean.
     pub(super) const fn response_sink(self) -> BridgeDecision {
         self.response_sink
     }
@@ -195,9 +151,8 @@ impl PolicyGates {
     }
 }
 
-/// The terminal's policy: the installed engine plus its compiled gate table.
-///
-/// The two are inseparable by construction — see the module docs.
+/// The terminal's policy: the installed engine plus its compiled gate table,
+/// inseparable by construction (see the module docs).
 #[derive(Debug)]
 pub(super) struct PolicyState {
     /// The installed engine, or `None` when the host has not installed a policy.
@@ -205,27 +160,18 @@ pub(super) struct PolicyState {
     /// Gate verdicts compiled from `engine`. Always in sync: the only writers
     /// are [`Self::install`] and `Self::clear`.
     gates: PolicyGates,
-    /// XTWINOPS verdicts for `Ps` 0..=[`XTWINOPS_MAX_PS`], compiled from
-    /// `engine` by the same two writers.
-    ///
-    /// Kept out of [`PolicyGates`] on purpose: `PolicyGates` is copied by value
-    /// at every gate read, and the response sink — the hottest of the gates —
-    /// should not carry a 25-byte table past it.
+    /// XTWINOPS verdicts for `Ps` 0..=[`XTWINOPS_MAX_PS`]. Kept out of
+    /// [`PolicyGates`] because that is copied at every gate read, including
+    /// the hot response sink.
     xtwinops: [BridgeDecision; XTWINOPS_GATES],
     /// OSC 133 / OSC 633 verdicts, indexed by [`SHELL_MAJORS`] then by
     /// subcommand letter. Compiled by the same two writers.
     shell: [[BridgeDecision; SHELL_SUBCOMMANDS]; SHELL_MAJORS.len()],
     /// The [`RESPONSE_LIMIT_ID`] bucket's slot in `engine`'s limiter set,
-    /// resolved by the same two writers.
-    ///
-    /// The gate tables above removed the per-reply rule walk from
-    /// `send_response`; this removes the other per-reply constant, the hash of
-    /// the literal `"response"` into the limiter set on EVERY reply. Same
-    /// staleness argument as the tables: the slot is recompiled in the
-    /// statement that changes the engine, so it always names a bucket of the
-    /// engine actually installed. `RateLimitSlot::UNDECLARED` (the [`Default`])
-    /// is the correct value with no engine, and also for a policy that
-    /// declares no `"response"` limit — both mean "unlimited".
+    /// recompiled with the engine so it always names a bucket of the installed
+    /// engine, and saves hashing `"response"` on every reply.
+    /// `RateLimitSlot::UNDECLARED` (the [`Default`]) means unlimited: no engine,
+    /// or no `"response"` limit declared.
     response_limit: RateLimitSlot,
 }
 
@@ -260,11 +206,9 @@ impl PolicyState {
         self.response_limit = RateLimitSlot::UNDECLARED;
     }
 
-    /// OSC 133 / OSC 633 gate verdict for this dispatch.
-    ///
-    /// O(1) table read for the `(major, subcommand-letter)` pairs shell
-    /// integration actually uses; a live evaluation — which allocates, exactly
-    /// as the old per-mark path always did — for anything outside it.
+    /// OSC 133 / OSC 633 gate verdict for this dispatch: a table read for the
+    /// `(major, subcommand-letter)` pairs shell integration uses, a live
+    /// evaluation otherwise.
     pub(super) fn shell_integration_gate(&self, command: u32, params: &[&[u8]]) -> BridgeDecision {
         let subcommand = super::shell_integration_auth::probe_subcommand(params);
         shell_slot(command, subcommand).map_or_else(
@@ -273,11 +217,8 @@ impl PolicyState {
         )
     }
 
-    /// XTWINOPS verdict for `ps`.
-    ///
-    /// O(1) table read inside the compiled range; a live evaluation outside it,
-    /// because `ps` is attacker-controlled over the whole `u16` and a policy may
-    /// name any major. See [`XTWINOPS_MAX_PS`].
+    /// XTWINOPS verdict for `ps`: a table read inside the compiled range, a
+    /// live evaluation outside it (see [`XTWINOPS_MAX_PS`]).
     pub(super) fn xtwinops_gate(&self, ps: u16) -> BridgeDecision {
         self.xtwinops
             .get(usize::from(ps))
@@ -298,12 +239,9 @@ impl PolicyState {
     }
 
     /// Debit a named rate-limit bucket, or `None` when no engine is installed
-    /// (the caller then uses its legacy limiter).
-    ///
-    /// Bucket state is the one thing a dispatch legitimately mutates in the
-    /// engine, and it cannot affect any gate verdict — [`PolicyEngine::evaluate`]
-    /// never reads the limiters. This is why `PolicyState` can hand out this
-    /// mutation while never handing out `&mut PolicyEngine`.
+    /// (the caller uses its legacy limiter). Bucket state is the one thing a
+    /// dispatch mutates in the engine, and [`PolicyEngine::evaluate`] never
+    /// reads it, so this is safe to expose without `&mut PolicyEngine`.
     pub(super) fn rate_limit_try_consume<T: TimeSource>(
         &mut self,
         id: &str,
@@ -315,17 +253,11 @@ impl PolicyState {
             .map(|engine| engine.rate_limit_try_consume(id, amount, clock))
     }
 
-    /// Debit the [`RESPONSE_LIMIT_ID`] bucket through its pre-resolved slot —
-    /// what [`Self::rate_limit_try_consume`] would answer for that id, without
-    /// hashing the literal on every reply.
-    ///
-    /// `None` still means "no engine installed", so `send_response` keeps
-    /// falling back to its legacy in-transient limiter unchanged.
-    ///
-    /// The engine is tested BEFORE the slot is read (disjoint field borrows
-    /// make that spelling legal), so the no-engine path does exactly the work
-    /// it did before this cache existed and cannot pay for a field it will not
-    /// use.
+    /// Debit the [`RESPONSE_LIMIT_ID`] bucket through its pre-resolved slot:
+    /// the same answer as [`Self::rate_limit_try_consume`] for that id. `None`
+    /// means no engine is installed, and `send_response` uses its legacy
+    /// limiter. The engine is checked before the slot is read, so the no-engine
+    /// path does no extra work.
     pub(super) fn response_rate_limit_try_consume<T: TimeSource>(
         &mut self,
         amount: u64,
@@ -376,60 +308,37 @@ impl Default for PolicyState {
 mod tests {
     use super::*;
     use crate::terminal::Terminal;
-    use aterm_policy::{Defaults, Policy, Profile, Response, Rule, SCHEMA_VERSION, profiles};
+    use aterm_policy::{Policy, Response, profiles};
 
     /// A policy whose single `*` rule gives `response` to every sequence from
     /// any origin — the coarsest way to flip the response-sink gate.
     fn wildcard_policy(response: Response) -> Policy {
-        Policy {
-            schema_version: SCHEMA_VERSION,
-            profile: Profile::Standard,
-            defaults: Defaults {
-                unmatched: Response::Warn,
-                shell_integration_require_nonce: false,
-            },
-            rules: vec![Rule {
-                sequence: "*".to_owned(),
-                origin_min: OriginTag::NetworkUntrusted,
-                response,
-                rate_limit: None,
-                prompt_id: None,
-            }],
-            rate_limits: vec![],
-        }
+        crate::terminal::policy_bridge::one_rule_policy(
+            "*",
+            response,
+            OriginTag::NetworkUntrusted,
+            Response::Warn,
+        )
     }
 
     /// A policy with one rule on an arbitrary selector, at an origin `Pty`
     /// dominates.
     fn policy_with_rule(sequence: &str, response: Response) -> Policy {
-        Policy {
-            schema_version: SCHEMA_VERSION,
-            profile: Profile::Standard,
-            defaults: Defaults {
-                unmatched: Response::Warn,
-                shell_integration_require_nonce: false,
-            },
-            rules: vec![Rule {
-                sequence: sequence.to_owned(),
-                origin_min: OriginTag::Pty,
-                response,
-                rate_limit: None,
-                prompt_id: None,
-            }],
-            rate_limits: vec![],
-        }
+        crate::terminal::policy_bridge::one_rule_policy(
+            sequence,
+            response,
+            OriginTag::Pty,
+            Response::Warn,
+        )
     }
 
     fn engine(response: Response) -> PolicyEngine {
         PolicyEngine::new(wildcard_policy(response))
     }
 
-    /// Drive one CPR request and report whether the terminal replied.
-    ///
-    /// This is the OBSERVABLE the staleness tests hang on: `\x1b[6n` reaches
-    /// `send_response`, which is the gate this table compiles. A stale table
-    /// shows up here as a reply that should have been suppressed (or a
-    /// suppression that should have been lifted).
+    /// Drive one CPR request and report whether the terminal replied: `\x1b[6n`
+    /// reaches `send_response`, so a stale table shows as a reply that should
+    /// have been suppressed or vice versa.
     fn replies(term: &mut Terminal) -> bool {
         term.process(b"\x1b[6n");
         term.take_response().is_some_and(|r| !r.is_empty())
@@ -476,9 +385,9 @@ mod tests {
         }
     }
 
-    /// A `response any = Execute` wildcard must NOT reopen the deny-by-default
-    /// clipboard sinks. This is the property `engine_decision_deny_by_default_
-    /// capability` exists for, and compiling the verdict must not lose it.
+    /// A `response any = Execute` wildcard does not reopen the deny-by-default
+    /// clipboard sinks (`engine_decision_deny_by_default_capability`), and the
+    /// compiled verdict keeps that.
     #[test]
     fn compiled_clipboard_gates_stay_deny_by_default_under_a_wildcard_allow() {
         let gates = PolicyGates::compile(Some(&engine(Response::Execute)));
@@ -496,9 +405,8 @@ mod tests {
         );
     }
 
-    /// Staleness, observed through the clipboard delegate rather than the
-    /// response buffer: a `OSC 52 set = Drop` policy must shut the write gate
-    /// the instant it is installed and reopen it the instant it is replaced.
+    /// Staleness through the clipboard delegate: an `OSC 52 set = Drop` policy
+    /// shuts the write gate when installed and reopens it when replaced.
     #[test]
     fn clipboard_gate_tracks_the_installed_policy() {
         use crate::terminal::{ClipboardAccess, ClipboardOperation};
@@ -557,13 +465,10 @@ mod tests {
         );
     }
 
-    /// The compiled table must agree with the per-dispatch mint it replaced,
-    /// for every profile and for policies on both sides of the decision.
-    ///
-    /// `mint_for_dispatch_with_engine` is the code that used to run on every
-    /// reply; keeping it as the oracle means a future change to probe shape or
-    /// to the bridge's wildcard-demotion rule that forgets this table fails
-    /// here instead of silently answering a gate from the wrong rule.
+    /// The compiled table agrees with a per-dispatch mint
+    /// (`mint_for_dispatch_with_engine`) for every profile and for policies on
+    /// both sides of the decision, so a change to probe shape or wildcard
+    /// demotion that forgets the table fails here.
     #[test]
     fn compiled_gate_matches_the_per_dispatch_mint() {
         use crate::terminal::response_capability::ResponseCapability;
@@ -664,43 +569,20 @@ mod tests {
         );
     }
 
-    /// AMB-1..4 AS A COUNT — the one thing the equivalence tests above cannot
-    /// see.
+    /// After a policy is installed, a burst of covered sequences reaches the
+    /// bridge zero times: the verdict-equivalence tests cannot see a gate that
+    /// went back to live evaluation, but this count can.
     ///
-    /// Every test in this module compares the compiled table's VERDICT against a
-    /// live evaluation's verdict. That is the right correctness gate and it is
-    /// exactly why none of them can notice the optimization going away: a gate
-    /// site that went back to minting a probe and walking the rule set per
-    /// dispatch would agree with the table on every input and pass all of them
-    /// green, while a DSR/DA flood paid ~40-50 ns per reply again at full parser
-    /// rate — before the rate-limit debit, so even replies that are then dropped
-    /// pay it.
+    /// Two-sided: uncovered sequences (an XTWINOPS `Ps` past the range, an OSC
+    /// 133 subcommand outside the letter table) must still be evaluated live, so
+    /// the counter is known to be connected.
     ///
-    /// So the count is the instrument: after a policy is installed, a burst of
-    /// covered sequences must reach the bridge ZERO times. This is
-    /// machine-independent and exact, unlike the timing lanes that measured the
-    /// win (51.2 -> 11.3 ns per gate), and it rides `cargo test`.
+    /// Per kind: the five compiled gates (`response_sink`, `osc52_query`,
+    /// `osc52_set`, XTWINOPS, shell) are read at separate sites. The shell gate
+    /// sits under `require_shell_integration_nonce`, off by default, so the
+    /// nonce is armed below or the burst's `OSC 133;A` would never reach it.
     ///
-    /// TWO-SIDED. An UNCOVERED sequence — an XTWINOPS `Ps` past the compiled
-    /// range, and an OSC 133 subcommand outside the compiled letter table — must
-    /// still be evaluated live, so the counter is proven to be reading the real
-    /// path rather than a path the burst never entered. Without that half, a
-    /// counter that had been accidentally disconnected would report zero and
-    /// this test would celebrate.
-    ///
-    /// PER-KIND, NOT IN AGGREGATE. Five gate KINDS are compiled here
-    /// (`response_sink`, `osc52_query`, `osc52_set`, the XTWINOPS table, the
-    /// shell table) and each is read at its OWN dispatch site, so "delete the
-    /// optimization and watch this go red" is only honest if it is checked ONE
-    /// KIND AT A TIME. It was not, when this test landed: sending the SHELL gate
-    /// alone back to a per-dispatch `shell_verdict` left this test GREEN,
-    /// because `Terminal::new` leaves `require_shell_integration_nonce` FALSE
-    /// and `shell_nonce_gate_ok` returns before it consults the gate at all —
-    /// the burst's `OSC 133;A` never reached AMB-3. Hence the nonce arming
-    /// below, which is load-bearing and not scene-setting.
-    ///
-    /// WHAT IT CANNOT CATCH: `evaluate` itself getting slower. Counts guard the
-    /// structure of a win, never its constant factor.
+    /// Counts guard the structure, not the cost of `evaluate` itself.
     #[test]
     fn an_installed_policy_costs_no_per_dispatch_evaluation_at_the_compiled_gates() {
         const NONCE: [u8; 32] = [0x5A; 32];
@@ -712,15 +594,13 @@ mod tests {
         let nonced_mark = format!("\x1b]133;A;{id}\x07").into_bytes();
 
         let mut term = Terminal::new(24, 80);
-        // ARM THE SHELL GATE. `shell_nonce_gate_ok` short-circuits on
-        // `!require_shell_integration_nonce` — the default posture — and the
-        // gate below it is then never read, so a burst against a bare terminal
-        // measures NOTHING for AMB-3. The nonce is authorized too, so the mark
-        // is a mark that really is processed rather than one dropped on the way.
+        // Arm the shell gate: `shell_nonce_gate_ok` returns early while
+        // `require_shell_integration_nonce` is off, so the gate would never be
+        // read. The nonce is authorized so the mark is really processed.
         term.authorize_shell_integration(NONCE);
         term.set_require_shell_integration_nonce(true);
         term.apply_policy_engine(PolicyEngine::new(profiles::standard()));
-        // The INSTALL itself compiles the whole table, which is the one place
+        // The install itself compiles the whole table, which is the one place
         // the evaluation is supposed to happen. Discard that.
         let compiled = crate::terminal::policy_bridge::take_engine_decisions();
         assert!(
@@ -731,21 +611,19 @@ mod tests {
 
         const BURST: usize = 32;
         for _ in 0..BURST {
-            // The response sink (AMB-2): CPR, the single sink all 31
+            // The response sink: CPR, the single sink all 31
             // reply-producing sequences share.
             term.process(b"\x1b[6n");
             let _ = term.take_response();
             // Primary DA — the same sink, a different producer.
             term.process(b"\x1b[c");
             let _ = term.take_response();
-            // OSC 52 query and set (AMB-1).
+            // OSC 52 query and set.
             term.process(b"\x1b]52;c;?\x07");
             term.process(b"\x1b]52;c;aGk=\x07");
             let _ = term.take_response();
-            // A shell-integration mark (AMB-3) and an in-range CSI t (AMB-4).
-            // NONCED: the gate sits UNDER the nonce-required check, so a bare
-            // `OSC 133;A` against a default terminal never reaches it and this
-            // line would cover nothing (see the per-kind note above).
+            // A shell-integration mark and an in-range CSI t. The mark is nonced
+            // because the gate sits under the nonce-required check.
             term.process(&nonced_mark);
             term.process(b"\x1b[18t");
             let _ = term.take_response();
@@ -766,8 +644,7 @@ mod tests {
              verdict changed, so nothing else in this file can see it."
         );
 
-        // THE OTHER SIDE: a `Ps` past the compiled range is documented to fall
-        // back to a live evaluation, and must still do one.
+        // A `Ps` past the compiled range still falls back to a live evaluation.
         term.process(format!("\x1b[{}t", XTWINOPS_MAX_PS + 1).as_bytes());
         let _ = term.take_response();
         assert!(
@@ -777,13 +654,10 @@ mod tests {
              nothing"
         );
 
-        // THE OTHER SIDE FOR THE SHELL KIND, which the XTWINOPS probe above
-        // cannot stand in for: they are different tables read at different
-        // dispatch sites, and this one sits under a mode bit that is off by
-        // default. A LOWERCASE subcommand is outside `shell_slot`'s compiled
-        // letters and is documented to fall back to a live evaluation, so a
-        // zero here means the burst's mark never reached AMB-3 either and its
-        // half of the count above proves nothing.
+        // The shell table's live fallback, checked separately from XTWINOPS
+        // (different table, different site, under a default-off mode bit): a
+        // lowercase subcommand is outside the compiled letters and evaluates
+        // live, proving the burst's mark reached the shell gate.
         term.process(format!("\x1b]133;z;{id}\x07").as_bytes());
         let _ = term.take_response();
         assert!(
@@ -806,9 +680,8 @@ mod tests {
         );
     }
 
-    /// Every covered `Ps` must read back exactly what a live evaluation says —
-    /// including under a policy that discriminates BY `Ps`, which is the case a
-    /// single shared slot would get wrong.
+    /// Every covered `Ps` reads back what a live evaluation says, including
+    /// under a policy that discriminates by `Ps`.
     #[test]
     fn xtwinops_table_matches_live_evaluation_for_every_covered_ps() {
         for policy in [
@@ -830,7 +703,7 @@ mod tests {
         }
 
         // The discriminating case, spelled out: `CSI 20 t = Execute` must open
-        // Ps 20 and ONLY Ps 20.
+        // Ps 20 and only Ps 20.
         let mut state = PolicyState::new();
         state.install(PolicyEngine::new(policy_with_rule(
             "CSI 20 t",
@@ -840,9 +713,8 @@ mod tests {
         assert_eq!(state.xtwinops_gate(21), BridgeDecision::Fallback);
     }
 
-    /// `Ps` is attacker-controlled over the whole `u16` and a policy may name any
-    /// major, so an out-of-range `Ps` must be evaluated for real rather than
-    /// answered from a shared slot.
+    /// An out-of-range `Ps` is evaluated live rather than answered from a
+    /// shared slot.
     #[test]
     fn xtwinops_out_of_range_ps_falls_back_to_live_evaluation() {
         let mut state = PolicyState::new();
@@ -872,7 +744,7 @@ mod tests {
     /// Staleness for XTWINOPS, observed through the emitted report.
     #[test]
     fn xtwinops_gate_tracks_the_installed_policy() {
-        // `allow_window_ops` stays at its shipping default (false), so the ONLY
+        // `allow_window_ops` stays at its shipping default (false), so the only
         // thing that can open CSI 18 t here is the policy.
         let reports = |term: &mut Terminal| {
             term.process(b"\x1b[18t");
@@ -915,9 +787,8 @@ mod tests {
         );
     }
 
-    /// Every covered `(major, subcommand)` must read back what a live evaluation
-    /// says — including under a policy that discriminates BY subcommand, which
-    /// is the case a major-only memo would get wrong.
+    /// Every covered `(major, subcommand)` reads back what a live evaluation
+    /// says, including under a policy that discriminates by subcommand.
     #[test]
     fn shell_table_matches_live_evaluation_for_every_covered_pair() {
         for policy in [
@@ -991,7 +862,7 @@ mod tests {
             BridgeDecision::Fallback
         );
 
-        // An uncovered MAJOR likewise falls through to a live evaluation.
+        // An uncovered major likewise falls through to a live evaluation.
         let mut state = PolicyState::new();
         state.install(PolicyEngine::new(policy_with_rule(
             "OSC 1337",
@@ -1164,9 +1035,9 @@ mod tests {
     #[test]
     fn response_slot_follows_the_id_not_the_declaration_order() {
         let clock = aterm_policy::limits::SystemClock;
-        // `response` is declared SECOND, behind a zero-capacity `palette`
-        // bucket that denies everything. A slot that indexed by position
-        // instead of by id would debit `palette` and deny every reply.
+        // `response` is declared second, behind a zero-capacity `palette`
+        // bucket; a slot indexed by position rather than id would deny every
+        // reply.
         let mut state = PolicyState::new();
         state.install(PolicyEngine::new(policy_with_limits(&[
             ("palette", 0),
@@ -1202,7 +1073,7 @@ mod tests {
              immediately"
         );
 
-        // Swap to a policy where the id sits at a DIFFERENT slot and has room.
+        // Swap to a policy where the id sits at a different slot and has room.
         term.apply_policy_engine(PolicyEngine::new(policy_with_limits(&[
             ("clipboard", 0),
             (RESPONSE_LIMIT_ID, 64 * 1024),

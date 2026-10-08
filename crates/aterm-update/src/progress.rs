@@ -6,8 +6,7 @@
 //!
 //! The updater downloads a release container by shelling `curl` into
 //! `Updates/download/<name>.part` and blocks until it exits, so no byte ever
-//! passes through this process — exactly atpkg's situation, and the answer is
-//! the same: a sibling thread stats the growing `.part` against the release
+//! passes through this process. A sibling thread stats the growing `.part` against the release
 //! asset's DECLARED size and reports through one process-wide observer. The
 //! observer is installed once by the host ([`set_progress_observer`]); every
 //! lane that runs a check in this process (the background loop, a manual
@@ -28,7 +27,7 @@
 //!
 //! * `bytes_total` is the asset's size as the download host answers a HEAD
 //!   for it ([`watch_download`]'s size probe, run BESIDE the download, never
-//!   before it: design ruling 226), and `0` until that answer lands or when it
+//!   before it), and `0` until that answer lands or when it
 //!   never does (offline, refused, a size past the download's own bound). A
 //!   host renders `0` as "unknown", never divides by it. The size only draws
 //!   the meter: what is installed is proved by the digest, as before.
@@ -69,6 +68,12 @@ pub enum Progress {
     /// A check that had begun downloading failed. `detail` is the same sentence
     /// `status.toml` records.
     Failed { detail: String },
+    /// The release this check had begun downloading is WITHHELD on this machine —
+    /// its signer was revoked, it was yanked, or it crash-looped here and was
+    /// quarantined — while the download ran. No failure and nothing to retry: the
+    /// next check refuses it before any download. `detail` is the `held: …` sentence
+    /// `status.toml` records.
+    Withheld { detail: String },
 }
 
 /// The host's observer: called on the updater's worker threads, must not block.
@@ -89,13 +94,14 @@ pub fn set_progress_observer(observer: ProgressNotify) {
     let _ = OBSERVER.set(observer);
 }
 
-/// Report one step. A no-op with no observer installed (every non-GUI process).
+/// Report one step: the heartbeat of a check in flight, and the host's observer
+/// when one is installed (the window; a terminal session has none).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn report(p: Progress) {
     if let Progress::Downloading { .. } = &p {
         DOWNLOAD_BEGAN.store(true, Ordering::Relaxed);
     }
-    // A check that is moving bytes is alive (plan P2-1): a container on a slow link
+    // A check that is moving bytes is alive: a container on a slow link
     // can take hours inside one check, and without this stamp the watchdog would
     // judge that honest download against a budget sized for everything else a
     // check does. Only a check in flight is re-stamped (`beat_progress`), so a
@@ -117,19 +123,23 @@ pub(crate) fn take_download_began() -> bool {
 
 /// Watch a growing `<dest>` (the curl sink) at 10 Hz while the download of
 /// `url` runs, reporting [`Progress::Downloading`] on every change of its size
-/// or of the known total; the guard stops and joins the poller on drop. With
-/// no observer installed nothing is spawned.
+/// or of the known total; the guard stops and joins the poller on drop.
 ///
 /// The first report (0 of an unknown total) is emitted synchronously, so a host sees
 /// the download begin even if curl finishes before the first poll. The total comes
 /// from [`asset_size`], a HEAD of the same asset run on its own thread BESIDE the
 /// download — the download never waits for it, and a probe still in flight when the
-/// download ends is simply not waited for (design ruling 226).
+/// download ends is simply not waited for.
+///
+/// THE POLLER RUNS WITH NO OBSERVER TOO: its reports re-stamp the checker's heartbeat
+/// while bytes move ([`report`]), and both machine-wide locks' holder beats live off
+/// that heartbeat, so a terminal session's slow download must not read as a stopped
+/// holder. Only the size probe, which draws nothing without a host, is left out.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn watch_download(dest: &Path, version: &str, url: &str) -> DownloadWatch {
     if OBSERVER.get().is_none() {
-        return DownloadWatch::inert();
+        return watch_with(dest, version, || None, Arc::new(report));
     }
     let url = url.to_string();
     watch_with(dest, version, move || asset_size(&url), Arc::new(report))
@@ -210,17 +220,6 @@ pub(crate) struct DownloadWatch {
 }
 
 #[cfg(any(target_os = "macos", test))]
-impl DownloadWatch {
-    /// A guard with nothing to stop (no observer installed).
-    fn inert() -> Self {
-        Self {
-            stop: Arc::new(AtomicBool::new(true)),
-            handle: None,
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
 impl Drop for DownloadWatch {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -234,10 +233,17 @@ impl Drop for DownloadWatch {
 mod tests {
     use super::*;
 
+    /// The process-wide download flag and heartbeat are shared: the tests that
+    /// report through [`report`] take turns.
+    static GLOBAL_REPORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The wrapper's gate: a download report arms it, taking it disarms it, and
     /// a report that is not a download leaves it alone.
     #[test]
     fn the_download_flag_is_set_by_a_download_report_and_consumed_once() {
+        let _turn = GLOBAL_REPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = take_download_began();
         report(Progress::Verifying {
             version: "0.1.0".into(),
@@ -252,17 +258,51 @@ mod tests {
         assert!(!take_download_began(), "consumed");
     }
 
-    /// With no observer, watching costs nothing: no thread, no reports.
+    /// A DOWNLOAD IN A TERMINAL SESSION KEEPS ITS CHECKER ALIVE.
+    /// No observer is installed in this test process — the session's shape — and
+    /// watching used to spawn nothing, so the heartbeat of a check that was
+    /// downloading never moved: past 65 minutes on a slow link it read stalled, and
+    /// the window booked the session as a stopped stage holder. Now every byte the
+    /// sink gains re-stamps a check in flight. The minute is a hang detector.
     #[test]
-    fn watching_without_an_observer_spawns_nothing() {
-        let dir = std::env::temp_dir();
-        let w = watch_download(
-            &dir.join("never-created.part"),
-            "0.1.0",
-            "https://example.invalid/aterm.zip",
+    fn a_download_with_no_observer_still_restamps_the_checking_heartbeat() {
+        use crate::checker_watch::{CheckerPhase, WATCH};
+        let _turn = GLOBAL_REPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            OBSERVER.get().is_none(),
+            "PRECONDITION: the session's shape"
         );
-        assert!(w.handle.is_none());
-        assert!(w.stop.load(Ordering::Acquire));
+        let dir = std::env::temp_dir().join(format!("aterm-update-beat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("aterm.zip.part");
+        let generation = WATCH.register(1_000);
+        assert!(WATCH.beat(generation, CheckerPhase::Checking));
+        let stamped = WATCH.snapshot().unwrap().at_secs;
+        let watch = watch_download(&part, "0.1.0", "https://example.invalid/aterm.zip");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut bytes = 0;
+        let moved = loop {
+            let beat = WATCH.snapshot().unwrap();
+            if beat.generation == generation && beat.at_secs > stamped {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            bytes += 4096;
+            std::fs::write(&part, vec![0u8; bytes]).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        drop(watch);
+        let _ = WATCH.supersede(generation);
+        let _ = take_download_began();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            moved,
+            "the bytes a session downloads must keep its checker's heartbeat fresh"
+        );
     }
 
     /// Every report a sink saw.

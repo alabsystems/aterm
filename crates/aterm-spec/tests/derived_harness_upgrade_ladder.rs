@@ -29,11 +29,14 @@ fn the_ladder_keeps_every_floor_and_counts_a_quiet_looking_pause() {
     );
     verify::prove_and_catch_scalar(&model, "harness upgrade ladder");
     // EVERY dead action is a negative control some invariant catches ALONE.
+    // The committed space's fired set is walked once, not once per action
+    // (it was 33 walks of the same 16,328 states).
+    let fired = interp::fired_actions(&interp::with_buggy(&model, 0));
     let dead: Vec<&str> = model
         .actions
         .iter()
         .map(|a| a.name)
-        .filter(|a| !interp::fired_actions(&interp::with_buggy(&model, 0)).contains(a))
+        .filter(|a| !fired.contains(a))
         .collect();
     assert_eq!(
         verify::audit_dead_negative_controls(&model, &dead),
@@ -253,6 +256,15 @@ fn the_upgrade_lands_under_fairness_and_catches_the_livelocks() {
             .any(|(m, l)| m.name == model.name && l.name == live.name)
     );
     verify::liveness_proves_and_catches_tiered(&model, &live, "HarnessUpgradeLadder lands");
+}
+
+/// Each livelock the test above catches is the cycle its mutant names — the
+/// interpreter's own cycles, read apart from the tiered proof so they are
+/// found while its `ty` runs rather than after them.
+#[test]
+fn each_livelock_is_the_cycle_its_mutant_names() {
+    let model = harness_upgrade_ladder_model();
+    let live = harness_upgrade_ladder_liveness();
     let moved = |state: &interp::State| state["behind"] == 0;
 
     // A person back within the grace for ever: nothing is stuck, and the move

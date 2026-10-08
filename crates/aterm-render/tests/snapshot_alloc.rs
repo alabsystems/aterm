@@ -100,10 +100,9 @@ fn owned_snapshots_transfer_pixels_without_a_full_frame_clone() {
         assert_eq!((owned.width, owned.height), dims);
         assert_eq!(owned.pixels, expected, "presented pixels at frac={frac}");
         assert_eq!(
-            allocations,
-            if frac == 0 { 1 } else { 2 },
-            "capture must allocate only its raster and, for fractional scroll, \
-             its translated present buffer; never a third ownership copy"
+            allocations, 1,
+            "capture must allocate only its raster: a fractional scroll's \
+             present is built straight from it in one pass, never a second copy"
         );
         eprintln!(
             "snapshot frac={frac}: {allocations} full-frame allocations, {bytes} bytes per frame"

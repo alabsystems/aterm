@@ -2,34 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The Unicode `Emoji_Presentation` property — the single source of truth for
-//! whether a bare code point (no variation selector) defaults to **emoji**
-//! (colour, wide) or **text** (monochrome, narrow) presentation.
+//! The Unicode `Emoji_Presentation` property: whether a bare code point (no
+//! variation selector) defaults to emoji (colour, wide) or text (monochrome,
+//! narrow) presentation.
 //!
-//! This is the property real terminals gate colour-vs-mono font selection on:
-//!   - Ghostty derives default presentation from `uucode.get(.is_emoji_presentation, cp)`
-//!     (`src/font/CodepointResolver.zig`): `.emoji` iff the property is set, else `.text`.
-//!   - iTerm2 tests membership in `emojiWithDefaultEmojiPresentation`
-//!     (`sources/Categories/NSCharacterSet+iTerm.m`) before ever consulting the
-//!     emoji font (`iTermAttributedStringBuilder.m`).
+//! Terminals gate colour-vs-mono font selection on this property (Ghostty's
+//! `CodepointResolver.zig`, iTerm2's `emojiWithDefaultEmojiPresentation`).
+//! Per UTS #51, `Emoji_Presentation=No` defaults to text even when
+//! `Emoji=Yes` (e.g. U+23FA ⏺) and goes colour only with VS16 (U+FE0F); a
+//! colour glyph existing in the emoji font is not sufficient.
 //!
-//! Per UTS #51, a code point with `Emoji_Presentation=No` defaults to TEXT even
-//! if it is `Emoji=Yes` (e.g. U+23FA ⏺ BLACK CIRCLE FOR RECORD — `Emoji=Yes`,
-//! `Emoji_Presentation=No`), and only renders as colour emoji when followed by
-//! VS16 (U+FE0F). Coverage of a colour glyph by the emoji font is NOT sufficient
-//! to choose emoji presentation — this property (or an explicit VS16) is the gate.
-//!
-//! Contrast with [`crate::is_emoji_char`], which answers the broader, fuzzier
-//! "is this in an emoji-ish block" question used for grapheme-width clustering.
-//! `is_emoji_presentation` is the precise, spec-exact default-presentation gate;
-//! the two are deliberately different sets and must not be conflated.
+//! [`crate::is_emoji_char`] answers the broader "emoji-ish block" question used
+//! for width clustering; the two sets differ on purpose.
 
 /// `Emoji_Presentation=Yes` ranges, inclusive `(lo, hi)`, sorted and disjoint.
 ///
-/// Source: Unicode 16.0.0 `emoji-data.txt` (the `Emoji_Presentation` property),
-/// the same UCD version the width/GCB tables in [`crate::tables`] are built from.
-/// Extracted and range-merged from the canonical data file; verified by the
-/// boundary tests below. Update by re-extracting from the matching UCD release.
+/// Source: Unicode 16.0.0 `emoji-data.txt`, the same UCD version as the
+/// tables in [`crate::tables`], range-merged and checked by the boundary tests
+/// below. Re-extract from the matching UCD release to update.
 static EMOJI_PRESENTATION: &[(u32, u32)] = &[
     (0x231A, 0x231B),
     (0x23E9, 0x23EC),
@@ -113,25 +103,141 @@ static EMOJI_PRESENTATION: &[(u32, u32)] = &[
     (0x1FAF0, 0x1FAF8),
 ];
 
-/// Whether `c` has the Unicode `Emoji_Presentation` property — i.e. a BARE
-/// occurrence (no following VS16) defaults to **emoji** (colour, wide)
-/// presentation rather than text.
+/// `Emoji=Yes` ranges that are `Emoji_Presentation=No`, inclusive `(lo, hi)`,
+/// sorted and disjoint: the emoji that default to TEXT and turn emoji with VS16.
 ///
-/// This is the precise gate a renderer should consult before selecting a
-/// colour-emoji face for a code point with no explicit VS16: `true` means the
-/// colour face is the correct default (🚀 ☔ ✨ ⭐); `false` means text is the
-/// default even when the colour font happens to carry a glyph (⏺ ⏸ ⏹ — these
-/// are `Emoji=Yes` but `Emoji_Presentation=No`, and need VS16 to go colour).
-///
-/// REQUIRES: nothing (total over all `char`).
-/// ENSURES: returns `true` iff `c`'s scalar value is in the Unicode
-/// `Emoji_Presentation=Yes` set.
-#[must_use]
-pub fn is_emoji_presentation(c: char) -> bool {
-    let cp = c as u32;
-    // The table is sorted and disjoint, so a single binary search by range
-    // settles membership: find the range whose `lo <= cp`, then check `cp <= hi`.
-    EMOJI_PRESENTATION
+/// Source: Unicode 16.0.0 `emoji-data.txt` (`Emoji` minus `Emoji_Presentation`),
+/// the same UCD version as [`EMOJI_PRESENTATION`]. These are exactly the
+/// text-default bases of `emoji-variation-sequences.txt`; every other base it
+/// lists is `Emoji_Presentation=Yes`, already wide. `tests/emoji_data.rs` checks
+/// both tables against the UCD file, every code point.
+static TEXT_DEFAULT_EMOJI: &[(u32, u32)] = &[
+    (0x0023, 0x0023),
+    (0x002A, 0x002A),
+    (0x0030, 0x0039),
+    (0x00A9, 0x00A9),
+    (0x00AE, 0x00AE),
+    (0x203C, 0x203C),
+    (0x2049, 0x2049),
+    (0x2122, 0x2122),
+    (0x2139, 0x2139),
+    (0x2194, 0x2199),
+    (0x21A9, 0x21AA),
+    (0x2328, 0x2328),
+    (0x23CF, 0x23CF),
+    (0x23ED, 0x23EF),
+    (0x23F1, 0x23F2),
+    (0x23F8, 0x23FA),
+    (0x24C2, 0x24C2),
+    (0x25AA, 0x25AB),
+    (0x25B6, 0x25B6),
+    (0x25C0, 0x25C0),
+    (0x25FB, 0x25FC),
+    (0x2600, 0x2604),
+    (0x260E, 0x260E),
+    (0x2611, 0x2611),
+    (0x2618, 0x2618),
+    (0x261D, 0x261D),
+    (0x2620, 0x2620),
+    (0x2622, 0x2623),
+    (0x2626, 0x2626),
+    (0x262A, 0x262A),
+    (0x262E, 0x262F),
+    (0x2638, 0x263A),
+    (0x2640, 0x2640),
+    (0x2642, 0x2642),
+    (0x265F, 0x2660),
+    (0x2663, 0x2663),
+    (0x2665, 0x2666),
+    (0x2668, 0x2668),
+    (0x267B, 0x267B),
+    (0x267E, 0x267E),
+    (0x2692, 0x2692),
+    (0x2694, 0x2697),
+    (0x2699, 0x2699),
+    (0x269B, 0x269C),
+    (0x26A0, 0x26A0),
+    (0x26A7, 0x26A7),
+    (0x26B0, 0x26B1),
+    (0x26C8, 0x26C8),
+    (0x26CF, 0x26CF),
+    (0x26D1, 0x26D1),
+    (0x26D3, 0x26D3),
+    (0x26E9, 0x26E9),
+    (0x26F0, 0x26F1),
+    (0x26F4, 0x26F4),
+    (0x26F7, 0x26F9),
+    (0x2702, 0x2702),
+    (0x2708, 0x2709),
+    (0x270C, 0x270D),
+    (0x270F, 0x270F),
+    (0x2712, 0x2712),
+    (0x2714, 0x2714),
+    (0x2716, 0x2716),
+    (0x271D, 0x271D),
+    (0x2721, 0x2721),
+    (0x2733, 0x2734),
+    (0x2744, 0x2744),
+    (0x2747, 0x2747),
+    (0x2763, 0x2764),
+    (0x27A1, 0x27A1),
+    (0x2934, 0x2935),
+    (0x2B05, 0x2B07),
+    (0x3030, 0x3030),
+    (0x303D, 0x303D),
+    (0x3297, 0x3297),
+    (0x3299, 0x3299),
+    (0x1F170, 0x1F171),
+    (0x1F17E, 0x1F17F),
+    (0x1F202, 0x1F202),
+    (0x1F237, 0x1F237),
+    (0x1F321, 0x1F321),
+    (0x1F324, 0x1F32C),
+    (0x1F336, 0x1F336),
+    (0x1F37D, 0x1F37D),
+    (0x1F396, 0x1F397),
+    (0x1F399, 0x1F39B),
+    (0x1F39E, 0x1F39F),
+    (0x1F3CB, 0x1F3CE),
+    (0x1F3D4, 0x1F3DF),
+    (0x1F3F3, 0x1F3F3),
+    (0x1F3F5, 0x1F3F5),
+    (0x1F3F7, 0x1F3F7),
+    (0x1F43F, 0x1F43F),
+    (0x1F441, 0x1F441),
+    (0x1F4FD, 0x1F4FD),
+    (0x1F549, 0x1F54A),
+    (0x1F56F, 0x1F570),
+    (0x1F573, 0x1F579),
+    (0x1F587, 0x1F587),
+    (0x1F58A, 0x1F58D),
+    (0x1F590, 0x1F590),
+    (0x1F5A5, 0x1F5A5),
+    (0x1F5A8, 0x1F5A8),
+    (0x1F5B1, 0x1F5B2),
+    (0x1F5BC, 0x1F5BC),
+    (0x1F5C2, 0x1F5C4),
+    (0x1F5D1, 0x1F5D3),
+    (0x1F5DC, 0x1F5DE),
+    (0x1F5E1, 0x1F5E1),
+    (0x1F5E3, 0x1F5E3),
+    (0x1F5E8, 0x1F5E8),
+    (0x1F5EF, 0x1F5EF),
+    (0x1F5F3, 0x1F5F3),
+    (0x1F5FA, 0x1F5FA),
+    (0x1F6CB, 0x1F6CB),
+    (0x1F6CD, 0x1F6CF),
+    (0x1F6E0, 0x1F6E5),
+    (0x1F6E9, 0x1F6E9),
+    (0x1F6F0, 0x1F6F0),
+    (0x1F6F3, 0x1F6F3),
+];
+
+/// Whether `cp` falls in one of `table`'s sorted, disjoint inclusive ranges.
+pub(crate) fn in_ranges(table: &[(u32, u32)], cp: u32) -> bool {
+    // Sorted and disjoint, so a single binary search by range settles
+    // membership: find the range whose `lo <= cp`, then check `cp <= hi`.
+    table
         .binary_search_by(|&(lo, hi)| {
             if cp < lo {
                 std::cmp::Ordering::Greater
@@ -144,63 +250,40 @@ pub fn is_emoji_presentation(c: char) -> bool {
         .is_ok()
 }
 
-/// Whether `c` is eligible for VS16 emoji-presentation WIDENING: it has the
-/// Unicode `Emoji` property but defaults to text presentation (width 1), so a
-/// following VS16 (U+FE0F) converts it to a 2-cell emoji-presentation cell.
+/// Whether `c` has the Unicode `Emoji_Presentation` property, i.e. a bare
+/// occurrence (no following VS16) defaults to emoji presentation.
 ///
-/// This is the single source of the eligibility set consumed by BOTH the live
-/// write path (`aterm-core` `widen_previous_cell_for_vs16`) and the scrollback
-/// materialization/reflow paths (`aterm-grid`), so a scrolled-back `❤️` keeps
-/// exactly the width the live grid gave it. Covers the common subset defined
-/// in Unicode Emoji data (UTS #51 emoji-data.txt, `Emoji` property).
+/// `true`: the colour face is the right default (🚀 ☔ ✨ ⭐). `false`: text is
+/// the default even if the colour font has a glyph (⏺ ⏸ ⏹ are `Emoji=Yes`,
+/// `Emoji_Presentation=No` and need VS16).
 ///
 /// REQUIRES: nothing (total over all `char`).
-/// ENSURES: `true` iff a bare-narrow occurrence of `c` should widen to 2 cells
-/// when followed by VS16.
+/// ENSURES: returns `true` iff `c`'s scalar value is in the Unicode
+/// `Emoji_Presentation=Yes` set.
+#[must_use]
+pub fn is_emoji_presentation(c: char) -> bool {
+    in_ranges(EMOJI_PRESENTATION, c as u32)
+}
+
+/// Whether VS16 (U+FE0F) makes `c` an emoji: `c` is `Emoji=Yes` but defaults
+/// to text (`Emoji_Presentation=No`), so it is one cell bare and two with VS16
+/// (`⬆️ ❤️ ©️ 1️⃣`). VS16 after anything else (`a️`, `✓️`) is an unsanctioned
+/// variation sequence and changes nothing; Unicode defines no emoji
+/// presentation for it.
+///
+/// The one rule for VS16 width: the live write path (`aterm-core`
+/// `widen_previous_cell_for_vs16`), the scrollback materialization/reflow paths
+/// (`aterm-grid`), the column walker ([`crate::GridColumns`]) and
+/// [`crate::grapheme_display_width`] all ask it, so a program that counts
+/// `⬆️` as two cells (`wcwidth`, `string-width`) finds its cursor where the grid
+/// put it, live or scrolled back.
+///
+/// REQUIRES: nothing (total over all `char`).
+/// ENSURES: `true` iff `c` is `Emoji=Yes` and `Emoji_Presentation=No` in
+/// Unicode 16.0.0.
 #[must_use]
 pub fn is_vs16_emoji_capable(c: char) -> bool {
-    let cp = c as u32;
-    match cp {
-        // Number sign, asterisk, digits 0-9 (keycap base characters)
-        0x0023 | 0x002A | 0x0030..=0x0039 => true,
-        // Copyright, Registered
-        0x00A9 | 0x00AE => true,
-        // Letterlike Symbols
-        0x2122 => true, // Trade Mark
-        0x2139 => true, // Information Source
-        // Arrows — select emoji
-        0x2194..=0x2199 => true, // Directional arrows
-        0x21A9 | 0x21AA => true, // Curved arrows
-        // Miscellaneous Technical — select emoji
-        0x231A | 0x231B => true, // Watch, Hourglass
-        0x2328 => true,          // Keyboard
-        0x23CF => true,          // Eject
-        0x23E9..=0x23F3 => true, // Various media controls
-        0x23F8..=0x23FA => true, // Pause, Record, etc.
-        // Double Exclamation Mark, Exclamation Question Mark
-        0x203C | 0x2049 => true,
-        // Enclosed Alphanumerics
-        0x24C2 => true, // Circled M
-        // Geometric Shapes
-        0x25AA | 0x25AB => true, // Small squares
-        0x25B6 | 0x25C0 => true, // Play buttons
-        0x25FB..=0x25FE => true, // Medium squares
-        // Miscellaneous Symbols (U+2600-U+26FF) — large emoji block
-        0x2600..=0x26FF => true,
-        // Dingbats (U+2700-U+27BF) — many emoji-capable chars
-        0x2700..=0x27BF => true,
-        // Supplemental Arrows-B
-        0x2934 | 0x2935 => true, // Curved arrows
-        // CJK Symbols
-        0x3030 => true, // Wavy Dash
-        0x303D => true, // Part Alternation Mark
-        // Enclosed CJK Letters
-        0x3297 => true, // Circled Ideograph Congratulation
-        0x3299 => true, // Circled Ideograph Secret
-        // Any SMP char that got width 1 from our lookup (rare edge case)
-        0x1F000..=0x1FFFF => true,
-        _ => false,
-    }
+    in_ranges(TEXT_DEFAULT_EMOJI, c as u32)
 }
 
 #[cfg(test)]
@@ -249,20 +332,22 @@ mod tests {
     }
 
     #[test]
-    fn table_is_sorted_and_disjoint() {
+    fn tables_are_sorted_and_disjoint() {
         // The binary search depends on this invariant; assert it holds so a
-        // future hand-edit of the table can't silently break membership.
-        for w in EMOJI_PRESENTATION.windows(2) {
-            assert!(w[0].0 <= w[0].1, "range not ordered lo<=hi: {:?}", w[0]);
-            assert!(
-                w[0].1 < w[1].0,
-                "ranges not strictly increasing/disjoint: {:?} then {:?}",
-                w[0],
-                w[1]
-            );
+        // future hand-edit of a table can't silently break membership.
+        for table in [EMOJI_PRESENTATION, TEXT_DEFAULT_EMOJI] {
+            for w in table.windows(2) {
+                assert!(w[0].0 <= w[0].1, "range not ordered lo<=hi: {:?}", w[0]);
+                assert!(
+                    w[0].1 < w[1].0,
+                    "ranges not strictly increasing/disjoint: {:?} then {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+            let last = table.last().unwrap();
+            assert!(last.0 <= last.1, "final range not ordered: {last:?}");
         }
-        let last = EMOJI_PRESENTATION.last().unwrap();
-        assert!(last.0 <= last.1, "final range not ordered: {last:?}");
     }
 
     #[test]

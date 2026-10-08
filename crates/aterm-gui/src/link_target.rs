@@ -13,6 +13,13 @@
 //! plus a splice that overwrites one frame row in place) rather than inventing a
 //! floating widget of its own.
 //!
+//! A plain-text URL needs no band: its visible text IS its destination. Except
+//! where part of it is painted so faintly that nobody can say where it ends — a
+//! tail a shade off its background reads as blank and still opens — so a plain
+//! URL with any cell under 3:1 earns the same band (`crate::plain_url_at`).
+//! Unlike an OSC 8 link's, it shows only while the link modifier is held: a
+//! plain URL is found only then, which is when the hand offers its click.
+//!
 //! It is DISCLOSURE ONLY. Nothing here gates, prompts, or changes what
 //! Cmd/ctrl-click opens — the security boundary for that stays `is_safe_url` at
 //! the point of action. What this closes is the gap where the only honest
@@ -58,7 +65,12 @@
 //!   host emphasizes the padding too and the hierarchy says nothing at all.
 //!   Marking only the last labels puts the weight on the answer.
 //! * **Userinfo cannot masquerade as the host**: `https://google.com@evil.example/`
-//!   emphasizes `evil.example`, because the host is what follows the LAST `@`.
+//!   emphasizes `evil.example`, because the host is what follows the LAST `@`
+//!   of the authority — found the way the browser that opens it finds it, over
+//!   the WHOLE URI ([`SCAN_BYTES`]). Userinfo has no length limit, so
+//!   `https://google.com.<1000 chars>@evil.example/` carries its host past any
+//!   shorter read. Where no host can be found at all, the band shows the scheme
+//!   and an ellipsis — never the head standing in for the host.
 //!
 //! # The seam has an ink of its own, so the caption may have two
 //!
@@ -100,12 +112,14 @@ const LEAD_IN_URL_CELLS: usize = 12;
 /// gave them.
 const MIN_URL_CELLS: usize = 8;
 
-/// How many characters of a URL are ever examined. A hostname is capped at 253
-/// characters by DNS, so no reachable host can be pushed past this; anything
-/// beyond it is path, query or padding, all of which the band elides anyway.
-/// The bound is what keeps an 8 KiB `OSC 8` URI (the engine's admission cap)
-/// from being expanded and scanned on the paint path.
-const SCAN_CHARS: usize = 1024;
+/// How many bytes of a URL are ever read: the engine's `OSC 8` admission cap
+/// (`MAX_HYPERLINK_URL_BYTES`), so every URI a program can attach is read
+/// whole. No shorter bound is safe — DNS caps a hostname, but the userinfo in
+/// front of it has no limit, and a host pushed past the read leaves the cut
+/// nothing to anchor on. The read is only a search for the ASCII delimiters
+/// [`host_span`] needs; [`safe_form`] spells out just the characters the band
+/// paints, so the paint path never expands 8 KiB.
+const SCAN_BYTES: usize = 8 * 1024;
 
 const HEX: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
@@ -132,8 +146,10 @@ const OPENS_TRACKED: &str = "ctrl+alt+click opens";
 /// "opens" there would be the caption's own small lie: the click is a no-op.
 const BLOCKED: &str = "blocked scheme";
 
-/// WHERE THE POINTER IS RESTING, when the cell under it carried an OSC 8
-/// hyperlink the last time the hover was resolved.
+/// WHERE THE POINTER IS RESTING, when the cell under it carried a destination
+/// to disclose the last time the hover was resolved: an OSC 8 hyperlink, or a
+/// plain-text URL part of which is painted too faintly to be sure where it
+/// ends (`crate::PlainUrl`).
 ///
 /// Deliberately NOT the URL and not a rendered caption: those are re-derived
 /// from the live grid at paint (see the module header). What is kept is the
@@ -259,19 +275,16 @@ fn emphasis_span(chars: &[char], host: &Range<usize>) -> Range<usize> {
     host.start + start..host.end
 }
 
-/// Re-spell `url` so that nothing in it can reorder, hide inside, or
+/// Re-spell `text` so that nothing in it can reorder, hide inside, or
 /// impersonate the rest of the line: printable ASCII survives verbatim, every
-/// other character becomes the percent-encoding of its UTF-8 bytes. Returns the
-/// safe form and whether the input ran past [`SCAN_CHARS`].
+/// other character becomes the percent-encoding of its UTF-8 bytes.
 ///
 /// Space is encoded too. A URL with a raw space is already refused by
 /// `is_safe_url`, and `%20` is what it would have to be spelled as to be one.
-fn safe_form(url: &str) -> (String, bool) {
-    let raw = url.trim();
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw.chars();
-    for ch in rest.by_ref().take(SCAN_CHARS) {
-        if matches!(ch, '\u{21}'..='\u{7e}') {
+fn safe_form(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if safe_width(ch) == 1 {
             out.push(ch);
         } else {
             let mut buf = [0u8; 4];
@@ -282,27 +295,56 @@ fn safe_form(url: &str) -> (String, bool) {
             }
         }
     }
-    (out, rest.next().is_some())
+    out
 }
 
-/// The range of the HOST inside an already-[`safe_form`]ed URL — the run that
-/// decides which site the link addresses, and therefore the run the band refuses
-/// to elide away. The safe form is pure ASCII, so its byte offsets are also its
-/// character offsets, which is the measure [`Caption::host`] carries.
+/// How many characters `ch` takes in the [`safe_form`]: one for printable
+/// ASCII, three (`%XX`) for each UTF-8 byte of anything else.
+fn safe_width(ch: char) -> usize {
+    if matches!(ch, '\u{21}'..='\u{7e}') {
+        1
+    } else {
+        3 * ch.len_utf8()
+    }
+}
+
+/// The byte range of the HOST inside a URL — the run that decides which site
+/// the link addresses, and therefore the run the band refuses to elide away.
+/// Every delimiter it looks for is ASCII, and an ASCII byte never occurs inside
+/// a multi-byte UTF-8 sequence, so it reads the raw URL without spelling it
+/// out; [`caption`] measures the result in the safe form's characters.
 ///
 /// For a `scheme://` form that is the authority with any `userinfo@` prefix
 /// removed (the `@` trick is the oldest way to make a URL read as a site it
 /// never touches). For a schemeless-authority form such as `mailto:` it is the
 /// recipient, up to the first `?`.
-fn host_span(safe: &str) -> Range<usize> {
-    let Some(colon) = safe.find(':') else {
-        return 0..safe.len(); // no scheme: the whole thing is the identity
+///
+/// A WHATWG SPECIAL scheme is read the way the browser that opens it reads it,
+/// because that parser — not RFC 3986 — decides where a click lands: any run of
+/// `/` and `\` after the colon is skipped (`https:///`, `https:\\` and a bare
+/// `https:` all start the authority there), and `\` ends the authority like
+/// `/`. `file` is special too, but it has a host grammar of its own and no
+/// click opens it, so it keeps the generic reading.
+fn host_span(url: &str) -> Range<usize> {
+    let Some(colon) = url.find(':') else {
+        return 0..url.len(); // no scheme: the whole thing is the identity
     };
-    let after = &safe[colon + 1..];
-    if let Some(authority) = after.strip_prefix("//") {
-        let start = colon + 3;
-        let end = start + authority.find(['/', '?', '#']).unwrap_or(authority.len());
-        let host_start = safe[start..end]
+    let after = &url[colon + 1..];
+    let special = ["http", "https", "ws", "wss", "ftp"]
+        .iter()
+        .any(|s| url[..colon].eq_ignore_ascii_case(s));
+    let (authority, ends): (Option<&str>, &[char]) = if special {
+        (
+            Some(after.trim_start_matches(['/', '\\'])),
+            &['/', '\\', '?', '#'],
+        )
+    } else {
+        (after.strip_prefix("//"), &['/', '?', '#'])
+    };
+    if let Some(authority) = authority {
+        let start = url.len() - authority.len();
+        let end = start + authority.find(ends).unwrap_or(authority.len());
+        let host_start = url[start..end]
             .rfind('@')
             .map_or(start, |at| start + at + 1);
         host_start..end
@@ -322,19 +364,30 @@ const ELLIPSIS: char = '\u{2026}';
 /// exists to prevent, so when the head does not reach the end of the host the
 /// window is anchored on the host's END instead and BOTH ends carry an
 /// ellipsis. Whatever the width, the labels that name the site are the last
-/// thing to go.
+/// thing to go — and a URL with no host to anchor on shows its scheme alone,
+/// because the head is not a host either.
 pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
-    let (safe, overlong) = safe_form(url);
-    let host = host_span(&safe);
-    // A URL cut off before its authority ever terminated cannot be shown to
-    // name a host at all, so nothing is emphasized rather than the wrong thing.
-    let host = if overlong && host.end == safe.len() {
-        0..0
-    } else {
-        host
-    };
-    if !overlong && safe.len() <= max_cells {
-        return Caption { text: safe, host };
+    let raw = url.trim();
+    let mut read = raw.len().min(SCAN_BYTES);
+    while !raw.is_char_boundary(read) {
+        read -= 1;
+    }
+    let span = host_span(&raw[..read]);
+    // A host is known when it has a character and its authority ENDED inside
+    // the read; one still running where the read stopped names nothing yet.
+    let known = !span.is_empty() && (span.end < read || read == raw.len());
+    // From here on, offsets are the SAFE form's: its characters, its cells.
+    let width = |text: &str| text.chars().map(safe_width).sum::<usize>();
+    let host_start = width(&raw[..span.start]);
+    let host = host_start..host_start + width(&raw[span.clone()]);
+    // The head, spelled out only as far as the band could ever show it.
+    let head_end = raw
+        .char_indices()
+        .nth(max_cells.saturating_add(1))
+        .map_or(raw.len(), |(at, _)| at);
+    let head = safe_form(&raw[..head_end]);
+    if head_end == raw.len() && head.len() <= max_cells {
+        return Caption { text: head, host };
     }
     match max_cells {
         0 => Caption {
@@ -345,12 +398,30 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
             text: ELLIPSIS.to_string(),
             host: 0..0,
         },
-        max if host.end < max => {
-            // The host ends inside the head, so the ordinary cut is honest.
-            let keep = (max - 1).min(safe.len());
-            let mut text: String = safe[..keep].to_string();
+        max if !known => {
+            // No host to anchor on, so nothing is emphasized and nothing past
+            // the scheme is shown: whatever follows it would stand where the
+            // host belongs. A scheme with a dot is legal and reads as a domain,
+            // so only a plain one is named.
+            let mut text = raw[..read]
+                .split_once(':')
+                .map(|(scheme, _)| scheme)
+                .filter(|scheme| {
+                    !scheme.is_empty()
+                        && scheme.len() + 2 <= max
+                        && scheme
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-'))
+                })
+                .map_or(String::new(), |scheme| format!("{scheme}:"));
             text.push(ELLIPSIS);
-            let host = host.start.min(keep)..host.end.min(keep);
+            Caption { text, host: 0..0 }
+        }
+        max if host.end < max => {
+            // The host ends inside the head, so the ordinary cut is honest. The
+            // head is longer than the band (that is why it is cut) and ASCII.
+            let mut text = head[..max - 1].to_string();
+            text.push(ELLIPSIS);
             Caption { text, host }
         }
         max => {
@@ -359,12 +430,23 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
             // that ends at its host has had nothing dropped after it, and an
             // ellipsis claiming a path that does not exist is the caption
             // telling its own small lie about the destination.
-            let after_host = host.end < safe.len();
+            let after_host = span.end < raw.len();
             let keep = if after_host { max - 2 } else { max - 1 };
+            // The last `keep` safe characters come from at most that many raw
+            // ones, so only those are spelled out.
+            let from = match keep.checked_sub(1) {
+                Some(back) => raw[..span.end]
+                    .char_indices()
+                    .rev()
+                    .nth(back)
+                    .map_or(0, |(at, _)| at),
+                None => span.end,
+            };
+            let tail = safe_form(&raw[from..span.end]);
             let start = host.end - keep;
             let mut text = String::with_capacity(max);
             text.push(ELLIPSIS);
-            text.push_str(&safe[start..host.end]);
+            text.push_str(&tail[tail.len() - keep..]);
             if after_host {
                 text.push(ELLIPSIS);
             }
@@ -538,6 +620,37 @@ mod tests {
         assert_eq!(cap.host_text(), "evil.example");
     }
 
+    /// THE BROWSER'S AUTHORITY, not RFC 3986's. For `http`/`https` the WHATWG
+    /// parser every browser runs skips any run of `/` and `\` after the scheme
+    /// and ends the authority at `\` as well as `/ ? #`, so a caption that read
+    /// `//` to `/` would bold `google.com` while a click lands on `evil.example`
+    /// — or, for `https:///`, find an empty host and fall back to the very
+    /// keep-the-head cut the module calls a forgery. Each expectation is what
+    /// node's `new URL(u).host` answers.
+    #[test]
+    fn a_special_schemes_host_is_the_one_the_browser_parses() {
+        for (url, want) in [
+            ("https:///evil.example/steal", "evil.example"),
+            ("https:\\\\evil.example/steal", "evil.example"),
+            ("HTTPS:/\\/evil.example", "evil.example"),
+            ("http:evil.example/x.google.com", "evil.example"),
+            ("https://evil.example\\.google.com/", "evil.example"),
+            ("https://evil.example\\@google.com/", "evil.example"),
+            ("https:///google.com@evil.example/", "evil.example"),
+        ] {
+            assert_eq!(caption(url, 200).host_text(), want, "{url}");
+        }
+        let pad = ".a".repeat(100);
+        for url in [
+            format!("https:///google.com{pad}.evil.example/"),
+            format!("https://evil.example\\{pad}.google.com/"),
+        ] {
+            let cap = caption(&url, 59);
+            assert_eq!(cap.emphasis_text(), "evil.example", "{:?}", cap.text);
+            assert!(!cap.text.starts_with("https:///google"), "{:?}", cap.text);
+        }
+    }
+
     /// A URL that fits is shown whole, and the host is still the emphasized run
     /// (port included — a port is part of which endpoint this reaches).
     #[test]
@@ -565,16 +678,38 @@ mod tests {
         assert_eq!(cap.host_text(), "evil.example");
     }
 
-    /// A URI whose authority never terminates inside [`SCAN_CHARS`] is not
-    /// shown to name any host: emphasizing the arbitrary point the scan stopped
-    /// at would invent a destination.
+    /// THE WHOLE URI IS READ. Userinfo comes before the host and has no length
+    /// limit, so a read that stopped at a fixed count found no host in
+    /// `https://google.com.a.a…@evil.example/` and fell back to the keep-the-head
+    /// cut the module calls a forgery; a run of slashes the browser skips did
+    /// the same with nothing at all. And a URI whose authority outruns even the
+    /// whole read names no host, so the band shows its scheme and nothing that
+    /// could stand where the host belongs. Each expected host is what node's
+    /// `new URL(u).host` answers.
     #[test]
-    fn an_authority_longer_than_the_scan_emphasizes_nothing() {
-        let url = format!("https://{}", "a".repeat(SCAN_CHARS * 2));
-        let cap = caption(&url, 60);
-        assert!(cap.host.is_empty(), "{:?}", cap.host);
-        assert!(cap.text.ends_with(ELLIPSIS));
-        assert_eq!(cap.text.chars().count(), 60);
+    fn the_host_is_found_however_far_into_the_uri_it_is_pushed() {
+        for url in [
+            format!("https://google.com{}@evil.example/", ".a".repeat(600)),
+            format!("https:{}evil.example/", "/".repeat(1100)),
+        ] {
+            for max in [59, 200] {
+                let cap = caption(&url, max);
+                assert_eq!(cap.host_text(), "evil.example", "@{max}: {:?}", cap.text);
+                assert_eq!(cap.emphasis_text(), "evil.example", "@{max}");
+                assert!(cap.text.starts_with(ELLIPSIS), "@{max}: {:?}", cap.text);
+            }
+        }
+        for url in [
+            format!("https://{}", "a".repeat(SCAN_BYTES * 2)),
+            format!(
+                "https://google.com{}@evil.example/",
+                ".a".repeat(SCAN_BYTES)
+            ),
+        ] {
+            let cap = caption(&url, 60);
+            assert_eq!(cap.text, "https:\u{2026}", "{:?}", cap.text);
+            assert!(cap.host.is_empty(), "{:?}", cap.host);
+        }
     }
 
     /// Degenerate widths must not panic and must never claim more than they

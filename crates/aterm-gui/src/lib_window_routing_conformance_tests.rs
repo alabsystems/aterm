@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+use super::*;
+use aterm_spec::derive::window_routing_model;
+use std::collections::BTreeMap;
+
+/// The real `App` projected onto `[win_count, frontmost, next_id, exited]`. `frontmost`
+/// and `next_id` are shifted by one, since the model reserves `0` for "no frontmost
+/// window" (`FrontmostLive`, `FrontmostAllocated`).
+fn project(app: &App, exited: bool) -> [i64; 4] {
+    let win_count = app.windows.len() as i64;
+    let frontmost = app.frontmost_window.map_or(0, |WindowId(n)| n as i64 + 1);
+    let next_id = app.next_window_id as i64 + 1;
+    [win_count, frontmost, next_id, exited as i64]
+}
+
+/// Run `ty trace validate` for one real transition; returns (conforms, output).
+/// The spec + cfg are DERIVED from the SAME `window_routing_model()` that Tier-0
+/// exhaustively checks. `transition_spec()` opens `Init`, so the trace's step 0
+/// is `prev`; the cfg overrides `MaxWin`/`MaxId` to LARGE bounds so a real
+/// multi-window run's guards never spuriously reject — `Buggy` stays 0 (the
+/// committed, correct close→exit discipline the real `App` implements).
+fn validate_transition(action_name: &str, prev: [i64; 4], next: [i64; 4]) -> (bool, String) {
+    // Tiered (`verify::validate_transition_tiered`): the in-process `Next` check always
+    // runs; `ty trace validate` also runs where installed, and the verdicts must agree.
+    let m = window_routing_model();
+    let st = |s: [i64; 4]| -> BTreeMap<&'static str, i64> {
+        [
+            ("win_count", s[0]),
+            ("frontmost", s[1]),
+            ("next_id", s[2]),
+            ("exited", s[3]),
+        ]
+        .into_iter()
+        .collect()
+    };
+    aterm_spec::verify::validate_transition_tiered(
+        &m,
+        &[("MaxWin", 1_000_000), ("MaxId", 1_000_000_000)],
+        &st(prev),
+        &st(next),
+        Some(action_name),
+        "App window-routing conformance",
+    )
+}
+
+/// The window-routing Tier-1 body, run only by `spec_xref_gate`'s `spec_xref_closure`,
+/// so the gate's claim holds: if the real close→exit routing diverges from
+/// `WindowRouting.Next`, this and the gate fail.
+pub(crate) fn run_conformance() {
+    // Unique per-CALL tempdir: a per-process dir would race on the shared
+    // spec/cfg/trace files with any other caller in this test binary (same
+    // `process::id()`); a monotonic counter makes each invocation's working
+    // dir distinct.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-winroute-conf-{}-{}",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("mk tempdir");
+
+    // Projection-drift guard: the initial headless projection must equal the model's
+    // `init_state` (1, 1, 2, 0) before any `ty` call.
+    let app0 = App::headless_for_test();
+    let init = window_routing_model().init_state();
+    let model_init = [
+        init["win_count"],
+        init["frontmost"],
+        init["next_id"],
+        init["exited"],
+    ];
+    assert_eq!(
+        project(&app0, false),
+        model_init,
+        "headless App initial projection must equal window_routing_model().init_state() \
+         — got {:?}, model init {:?} (the +1 frontmost/next_id remap is load-bearing)",
+        project(&app0, false),
+        model_init
+    );
+    assert_eq!(
+        model_init,
+        [1, 1, 2, 0],
+        "sanity: model init is the documented tuple"
+    );
+    drop(app0);
+
+    // Drive a real create/close sequence through the production seams and
+    // strictly validate each transition against the derived `Next`.
+    let mut app = App::headless_for_test();
+    let mut exited = false;
+    let mut validated = 0usize;
+
+    // --- CreateWindow: a 2nd window (real wid/session minting + install).
+    let prev = project(&app, exited);
+    let sid1 = app.next_session_id;
+    let _wid1 = app.insert_logical_window(stub_session(sid1), 24, 80);
+    assert!(
+        app.structural_invariants_ok(),
+        "invariants hold after 1st create"
+    );
+    let next = project(&app, false);
+    let (ok, out) = validate_transition("CreateWindow", prev, next);
+    assert!(
+        ok,
+        "real CreateWindow {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
+    );
+    validated += 1;
+
+    // --- CreateWindow: a 3rd window (a strictly-greater id; never reused).
+    let prev = next;
+    let sid2 = app.next_session_id;
+    let _wid2 = app.insert_logical_window(stub_session(sid2), 24, 80);
+    assert!(
+        app.structural_invariants_ok(),
+        "invariants hold after 2nd create"
+    );
+    let next = project(&app, false);
+    let (ok, out) = validate_transition("CreateWindow", prev, next);
+    assert!(
+        ok,
+        "real CreateWindow {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
+    );
+    validated += 1;
+
+    // ConnectedCreateWindow: a fourth window validated against the connections mint arm.
+    // The connected seam needs a real `ActiveEventLoop`, so drive the same logical mint
+    // it routes through (`create_window_logical` → `install_window_state`); the
+    // hosted-origin guard (`win_count > 0`) holds with three live windows. Origin
+    // resolution is pinned by `connected_spawn_tests`; negative control (d) keeps this
+    // non-vacuous.
+    let prev = next;
+    let sid3 = app.next_session_id;
+    let _wid3 = app.insert_logical_window(stub_session(sid3), 24, 80);
+    assert!(
+        app.structural_invariants_ok(),
+        "invariants hold after the connected window mint"
+    );
+    let next = project(&app, false);
+    let (ok, out) = validate_transition("ConnectedCreateWindow", prev, next);
+    assert!(
+        ok,
+        "real connected window mint {prev:?} -> {next:?} must conform to \
+         ConnectedCreateWindow\n--- ty ---\n{out}"
+    );
+    validated += 1;
+
+    // RaiseSession: raise session 0 while the newest window is frontmost, through the
+    // real `raise_session_by_id`. Headless there is no OS focus, so the step may be the
+    // admitted `frontmost' = frontmost` stutter; what is validated is that a raise never
+    // mints, destroys or exits. Negative control (c) keeps it non-vacuous.
+    let prev = next;
+    app.raise_session_by_id(0)
+        .expect("session 0 is hosted by the first window");
+    let next = project(&app, false);
+    let (ok, out) = validate_transition("RaiseSession", prev, next);
+    assert!(
+        ok,
+        "real RaiseSession {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
+    );
+    validated += 1;
+
+    // --- CloseWindow: a NON-last window (WindowId(0)). A survivor remains, so
+    // the app stays and exited is unchanged (still false).
+    let prev = next;
+    let outcome = app.close_window_logical(WindowId(0));
+    assert_eq!(
+        outcome,
+        CloseOutcome::Stay,
+        "closing a non-last window keeps the app"
+    );
+    assert!(
+        app.structural_invariants_ok(),
+        "invariants hold after a non-last close"
+    );
+    let next = project(&app, false);
+    let (ok, out) = validate_transition("CloseWindow", prev, next);
+    assert!(
+        ok,
+        "real CloseWindow (non-last) {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
+    );
+    validated += 1;
+
+    // CloseWindow on the frontmost (highest id) while a lower-id survivor remains: the
+    // app re-points to the lowest live id, which the model's nondeterministic re-point
+    // (`frontmost' \in 1..next_id-1`) admits. The teardown below never reaches this
+    // branch.
+    if app.windows.len() >= 2 {
+        let prev = project(&app, exited);
+        let front = app
+            .frontmost_window
+            .expect("a frontmost window exists with >=2 windows");
+        let outcome = app.close_window_logical(front);
+        assert_eq!(
+            outcome,
+            CloseOutcome::Stay,
+            "closing the frontmost with a survivor keeps the app"
+        );
+        assert!(
+            app.structural_invariants_ok(),
+            "invariants hold after a frontmost close"
+        );
+        let next = project(&app, exited);
+        let (ok, out) = validate_transition("CloseWindow", prev, next);
+        assert!(
+            ok,
+            "real CloseWindow (frontmost, survivor remains) {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
+        );
+        validated += 1;
+    }
+
+    // Close down to the last window, lowest id first; on `Exit` set `exited = true`.
+    // `structural_invariants_ok` needs a frontmost, so it is asserted only after creates.
+    while let Some(&wid) = app.windows.keys().next() {
+        let prev = project(&app, exited);
+        let outcome = app.close_window_logical(wid);
+        if matches!(outcome, CloseOutcome::Exit) {
+            exited = true;
+        }
+        let next = project(&app, exited);
+        let (ok, out) = validate_transition("CloseWindow", prev, next);
+        assert!(
+            ok,
+            "real CloseWindow {prev:?} -> {next:?} (outcome {outcome:?}) must conform\n--- ty ---\n{out}"
+        );
+        validated += 1;
+    }
+    assert!(app.windows.is_empty(), "every window closed");
+    assert!(exited, "closing the last window set exited (ExitIffEmpty)");
+
+    // Negative controls: each must be rejected, or the binding proves nothing.
+    //
+    // (a) Missed exit: closing the last window while `exited=0` (the `Buggy=1` defect).
+    let prev_missed = [1, 1, 2, 0];
+    let next_missed = [0, 0, 2, 0]; // win_count 1->0 but exited stays 0
+    let (ok, o) = validate_transition("CloseWindow", prev_missed, next_missed);
+    assert!(
+        !ok,
+        "NEGATIVE CONTROL (missed exit) {prev_missed:?} -> {next_missed:?} MUST be rejected \
+         — a CloseWindow to an empty set without exiting is the Buggy defect\n--- ty ---\n{o}"
+    );
+
+    // (b) Early exit: `exited=1` while a window remains (`ExitIffEmpty`).
+    let prev_early = [2, 1, 3, 0];
+    let next_early = [1, 1, 3, 1]; // win_count 2->1 (survivor) but exited flipped to 1
+    let (ok, o) = validate_transition("CloseWindow", prev_early, next_early);
+    assert!(
+        !ok,
+        "NEGATIVE CONTROL (early exit) {prev_early:?} -> {next_early:?} MUST be rejected \
+         — exiting while a window remains violates ExitIffEmpty\n--- ty ---\n{o}"
+    );
+
+    // (c) Raise to an unallocated id (`frontmost' = next_id`), which
+    // `FrontmostAllocated` and the action's `1..(next_id - 1)` range forbid.
+    let prev_raise = [2, 1, 3, 0];
+    let next_raise = [2, 3, 3, 0]; // frontmost -> 3 = next_id (unallocated)
+    let (ok, o) = validate_transition("RaiseSession", prev_raise, next_raise);
+    assert!(
+        !ok,
+        "NEGATIVE CONTROL (raise to unallocated) {prev_raise:?} -> {next_raise:?} MUST be \
+         rejected — frontmost may never re-point to a future/unallocated id\n--- ty ---\n{o}"
+    );
+
+    // (d) Connected mint after exit: the hosted-origin guard (`win_count > 0 /\ exited =
+    // 0`) forbids it.
+    let prev_dead = [0, 0, 2, 1];
+    let next_dead = [1, 2, 3, 1]; // a mint out of the exited state
+    let (ok, o) = validate_transition("ConnectedCreateWindow", prev_dead, next_dead);
+    assert!(
+        !ok,
+        "NEGATIVE CONTROL (connected mint after exit) {prev_dead:?} -> {next_dead:?} MUST be \
+         rejected — a connected window mint requires a live hosted origin\n--- ty ---\n{o}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    crate::logging::stderr_line!(
+        "App window-routing Tier-1 conformance: {validated} real transitions \
+         (2 CreateWindow + the ConnectedCreateWindow mint + a RaiseSession + the \
+         close-down-to-exit chain) strictly validated against the WindowRouting spec; \
+         negative controls (missed exit, early exit, raise-to-unallocated, \
+         mint-after-exit) all rejected."
+    );
+}

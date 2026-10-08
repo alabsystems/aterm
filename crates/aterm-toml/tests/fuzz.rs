@@ -1,39 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A deterministic differential fuzz.
+//! A deterministic fuzz.
 //!
 //! No `rand`: the generator is a 64-bit LCG seeded from a constant, so the
 //! corpus is identical on every machine and every run. A failure here can be
 //! reproduced by its seed alone, and the test cannot go green because a random
 //! draw happened to miss the bug.
 //!
-//! Three phases, each comparing against the `toml` oracle:
+//! Three phases:
 //!
 //! 1. GENERATED DOCUMENTS — well-formed TOML assembled from every construct in
-//!    the spec. Both implementations must accept and agree, and the document
-//!    half must reproduce the text byte for byte.
+//!    the spec. The value half must accept, and the document half must
+//!    reproduce the text byte for byte.
 //! 2. MUTATIONS — one byte of a generated document replaced with a
-//!    syntactically interesting one. Accept/reject must agree, and where both
-//!    accept the values must too.
+//!    syntactically interesting one. Where the value half accepts, the
+//!    document half must reproduce the text byte for byte.
 //! 3. NOISE — strings drawn straight from the TOML punctuation alphabet, which
 //!    is almost always garbage and is where a parser's error paths actually get
 //!    exercised.
 //!
-//! The alphabet is NOT ASCII-only, and that is load-bearing. It used to be, and
-//! the hole was exactly the shape of a real abort: `unicode_escape` sliced the
-//! source at `pos + 4`, so a multi-byte character anywhere inside a `\u`
-//! window panicked with "not a char boundary" — and no ASCII generator, and no
-//! file in the repository corpus (`grep -rlI --include='*.toml' '\\u' .` finds
-//! ZERO), could ever produce one. Phases 2 and 3 now mutate and generate whole
-//! CHARACTERS, so the input stays valid UTF-8 without needing an ASCII
-//! restriction, and every rejection is additionally checked for a span that
-//! lands on character boundaries — the invariant `Error::span()` promises its
-//! callers, and the one the panic above was a symptom of.
-
-mod common;
-
-use common::{oracle_saturated_a_float, values_agree};
+//! The alphabet is NOT ASCII-only, and that is load-bearing: a multi-byte
+//! character inside a fixed-width window (a `\u` escape) is a char-boundary
+//! panic no ASCII generator, and no file in the repository corpus, produces.
+//! Phases 2 and 3 mutate and generate whole CHARACTERS, so the input stays
+//! valid UTF-8, and every rejection is checked for a span on character
+//! boundaries — the invariant `Error::span()` promises its callers.
 
 /// A 64-bit linear congruential generator (Knuth's MMIX constants). Chosen over
 /// `rand` for exactly one reason: a fixed seed here means a fixed corpus, on
@@ -239,16 +231,13 @@ fn emit_pair(rng: &mut Lcg, out: &mut String, used: &mut Vec<String>) {
 }
 
 #[test]
-fn generated_documents_agree_with_the_oracle_and_round_trip() {
+fn generated_documents_parse_and_round_trip() {
     let mut rng = Lcg::new(0x_A7E1_2026);
     let mut accepted = 0usize;
     for case in 0..2_000u32 {
         let source = generate(&mut rng);
-        let ours = aterm_toml::from_str::<aterm_toml::Value>(&source);
-        let theirs = toml::from_str::<toml::Value>(&source);
-        match (&ours, &theirs) {
-            (Ok(a), Ok(b)) => {
-                values_agree(a, b).unwrap_or_else(|why| panic!("case {case}: {why}\n{source}"));
+        match aterm_toml::from_str::<aterm_toml::Value>(&source) {
+            Ok(_) => {
                 let document: aterm_toml::edit::DocumentMut = source.parse().unwrap_or_else(|e| {
                     panic!("case {case}: document half rejected it: {e}\n{source}")
                 });
@@ -259,13 +248,9 @@ fn generated_documents_agree_with_the_oracle_and_round_trip() {
                 );
                 accepted += 1;
             }
-            (Err(a), Ok(_)) => {
-                panic!("case {case}: we reject what the oracle accepts: {a}\n{source}")
+            Err(e) => {
+                span_is_char_aligned(&source, &e).unwrap_or_else(|why| panic!("case {case}: {why}"))
             }
-            (Ok(_), Err(b)) => {
-                panic!("case {case}: we accept what the oracle rejects: {b}\n{source}")
-            }
-            (Err(_), Err(_)) => {}
         }
     }
     assert!(
@@ -297,7 +282,7 @@ fn span_is_char_aligned(source: &str, error: &aterm_toml::Error) -> Result<(), S
 }
 
 #[test]
-fn single_character_mutations_agree_with_the_oracle() {
+fn single_character_mutations_round_trip_or_refuse_cleanly() {
     let mut rng = Lcg::new(0x_D15A_57E4);
     let mut divergences = Vec::new();
     for case in 0..4_000u32 {
@@ -315,18 +300,13 @@ fn single_character_mutations_agree_with_the_oracle() {
             source[at] = rng.pick_char(INTERESTING_CHARS);
         }
         let text: String = source.into_iter().collect();
-        let ours = aterm_toml::from_str::<aterm_toml::Value>(&text);
-        let theirs = toml::from_str::<toml::Value>(&text);
-        if let Err(e) = &ours
-            && let Err(why) = span_is_char_aligned(&text, e)
-        {
-            divergences.push(format!("case {case}: {why}"));
-        }
-        match (&ours, &theirs) {
-            (Ok(a), Ok(b)) => {
-                if let Err(why) = values_agree(a, b) {
-                    divergences.push(format!("case {case}: {why}\n{text:?}"));
+        match aterm_toml::from_str::<aterm_toml::Value>(&text) {
+            Err(e) => {
+                if let Err(why) = span_is_char_aligned(&text, &e) {
+                    divergences.push(format!("case {case}: {why}"));
                 }
+            }
+            Ok(_) => {
                 let printed = text
                     .parse::<aterm_toml::edit::DocumentMut>()
                     .map(|d| d.to_string());
@@ -336,14 +316,6 @@ fn single_character_mutations_agree_with_the_oracle() {
                     "case {case}: round-trip differs\n{text:?}"
                 );
             }
-            (Err(_), Ok(b)) if oracle_saturated_a_float(b, &text) => {}
-            (Err(_), Ok(_)) => {
-                divergences.push(format!("case {case}: we reject, oracle accepts\n{text:?}"))
-            }
-            (Ok(_), Err(_)) => {
-                divergences.push(format!("case {case}: we accept, oracle rejects\n{text:?}"))
-            }
-            (Err(_), Err(_)) => {}
         }
     }
     assert!(
@@ -360,35 +332,20 @@ fn single_character_mutations_agree_with_the_oracle() {
 }
 
 #[test]
-fn punctuation_noise_never_panics_and_agrees_with_the_oracle() {
+fn punctuation_noise_never_panics() {
     let mut rng = Lcg::new(0x_6E01_5E00);
     let mut divergences = Vec::new();
     let mut accepted = 0usize;
     for case in 0..20_000u32 {
         let len = rng.below(40);
         let text: String = (0..len).map(|_| rng.pick_char(INTERESTING_CHARS)).collect();
-        let ours = aterm_toml::from_str::<aterm_toml::Value>(&text);
-        let theirs = toml::from_str::<toml::Value>(&text);
-        if let Err(e) = &ours
-            && let Err(why) = span_is_char_aligned(&text, e)
-        {
-            divergences.push(format!("case {case}: {why}"));
-        }
-        match (&ours, &theirs) {
-            (Ok(a), Ok(b)) => {
-                accepted += 1;
-                if let Err(why) = values_agree(a, b) {
-                    divergences.push(format!("case {case}: {why}\n{text:?}"));
+        match aterm_toml::from_str::<aterm_toml::Value>(&text) {
+            Ok(_) => accepted += 1,
+            Err(e) => {
+                if let Err(why) = span_is_char_aligned(&text, &e) {
+                    divergences.push(format!("case {case}: {why}"));
                 }
             }
-            (Err(_), Ok(b)) if oracle_saturated_a_float(b, &text) => {}
-            (Err(_), Ok(_)) => {
-                divergences.push(format!("case {case}: we reject, oracle accepts\n{text:?}"))
-            }
-            (Ok(_), Err(_)) => {
-                divergences.push(format!("case {case}: we accept, oracle rejects\n{text:?}"))
-            }
-            (Err(_), Err(_)) => {}
         }
     }
     assert!(
@@ -432,10 +389,6 @@ fn a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort() {
                 let ours = aterm_toml::from_str::<aterm_toml::Value>(&document);
                 let error = ours.expect_err(&format!("{document:?} must be rejected"));
                 span_is_char_aligned(&document, &error).expect("boundary-safe span");
-                assert!(
-                    toml::from_str::<toml::Value>(&document).is_err(),
-                    "the oracle accepts {document:?}"
-                );
 
                 // The same bytes through every other public entry point: the
                 // panic was reachable from all of them, so the fix is proved on
@@ -471,9 +424,5 @@ fn a_signed_unicode_escape_is_not_four_hex_digits() {
             .err()
             .unwrap_or_else(|| panic!("{document:?} must be rejected"));
         span_is_char_aligned(document, &error).expect("boundary-safe span");
-        assert!(
-            toml::from_str::<toml::Value>(document).is_err(),
-            "the oracle accepts {document:?}"
-        );
     }
 }

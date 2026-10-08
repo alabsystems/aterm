@@ -1,45 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cat-art v4 codegen (docs/cat-art-v4-design.md §1): turn the semantic glyph asset
-//! TOMLs under `crates/aterm-effects/art/glyphs/` into the checked-in const drawlist
-//! module [`crate::cat_glyphs_gen`].
+//! Cat-art v4 codegen (docs/cat-art-v4-design.md §1): turns the semantic glyph
+//! asset TOMLs under `crates/aterm-effects/art/glyphs/` into the checked-in const
+//! drawlist module [`crate::cat_glyphs_gen`].
 //!
-//! This is the checked-in-codegen half of the repo's xtask/gate culture: the
-//! generator is a pure function [`generate_from_assets`] (asset texts → Rust source
-//! string), driven by the `gen_cat_glyphs` example — which reads the asset dir and
-//! hands the texts in — to (re)write the file, and pinned by the
-//! [`cat_glyphs_gen_matches_assets`](tests) drift test that regenerates into a
-//! string and asserts byte-equality with the checked-in file.
+//! The generator is a pure function, [`generate_from_assets`] (asset texts →
+//! Rust source), driven by the `gen_cat_glyphs` example to rewrite the file and
+//! pinned by the [`cat_glyphs_gen_matches_assets`](tests) drift test, which
+//! regenerates into a string and asserts byte-equality with the checked-in
+//! file.
 //!
-//! The generator opens no file itself. The SHIPPED engine names no `std::fs`
-//! (docs/ATERM_DESIGN.md §2.7; `tools/grep_guard.sh` lane 6a has fenced
-//! aterm-effects since 2026-08-30, the host-boundary design's Phase 0), so the
+//! The generator opens no file: the shipped engine names no `std::fs`
+//! (docs/ATERM_DESIGN.md §2.7; fenced by `tools/grep_guard.sh` lane 6a), so the
 //! `read_dir`/`read_to_string` half lives in `examples/support/asset_dir.rs`,
-//! compiled into the five `gen_*` example binaries and into this module's drift
-//! tests — a dev-only reader for a dev-only generator, and one reader for both.
+//! compiled into the `gen_*` examples and this module's drift tests.
 //!
-//! ## Two rosters, one parser
+//! ## Separate rosters, one parser
 //!
-//! [`generate_pet_from_assets`] runs the SAME parse/quantize/fail-closed path over the
-//! full-body cursor-pet poses in `art/pet/` and emits [`crate::pet_glyphs_gen`]. The
-//! pet deliberately does NOT join `GLYPHS`: every `GlyphKind::Special` there is a
-//! collectible roster row in the GUI's kitty log, and the spec model pins its
-//! `RosterCap` to `GLYPH_IDS.len()`, so 23 animation frames landing in that table
-//! would corrupt the collection. Only the *shape vocabulary* is shared — the pet
-//! module imports `GlyphDef`/`Layer`/`GlyphRole`/`Recolor`/`GlyphKind` from the cat
-//! module instead of redeclaring them, so one drawlist walker paints both rosters.
+//! [`generate_pet_from_assets`] (and the dog, animal and Robi generators) run
+//! the same parse/quantize/fail-closed path over their own asset dirs and emit
+//! separate modules such as [`crate::pet_glyphs_gen`]. They never join `GLYPHS`:
+//! every `GlyphKind::Special` there is a collectible row in the GUI's kitty log,
+//! and the spec model pins its `RosterCap` to `GLYPH_IDS.len()`. Only the shape
+//! vocabulary is shared: the other modules import
+//! `GlyphDef`/`Layer`/`GlyphRole`/`Recolor`/`GlyphKind` from the cat module, so
+//! one drawlist walker paints every roster.
 //!
 //! ## What crosses the boundary
 //!
-//! Only glyphs whose `kind` is a roster kind (`head`, `special`, `accessory`) and that
-//! are not `excluded = true` are emitted. The paw-print / decoration **props** (paws
-//! are removed, §0/§4) and the not-yet-promoted legacy sheet-2 imports are held
-//! out. Each path coordinate `(x, y)` in the glyph's `viewbox` pixel frame is
-//! normalized and quantized to the integer `0..=FIXED_ONE` frame
-//! (`round(x / vw * FIXED_ONE)`, clamped) so the whole drawlist is integer — `Eq`-safe,
-//! byte-deterministic. Floats live only here at bake/codegen time, never in the const
-//! data or any hashed key.
+//! Only glyphs of a roster kind (`head`, `special`, `accessory`) that are not
+//! `excluded = true` are emitted; paw-print and decoration props and unpromoted
+//! legacy imports are held out. Each path coordinate `(x, y)` in the glyph's
+//! `viewbox` frame is normalized and quantized to the integer `0..=FIXED_ONE`
+//! frame (`round(x / vw * FIXED_ONE)`, clamped), so the drawlist is integer,
+//! `Eq`-safe and byte-deterministic. Floats exist only at codegen time.
 
 use aterm_scene::vector::{FIXED_ONE, PathCmd};
 
@@ -47,10 +42,9 @@ use aterm_scene::vector::{FIXED_ONE, PathCmd};
 /// accessories). `prop` / `unknown` assets are held out (§0/§4/§8).
 const INCLUDED_KINDS: &[&str] = &["head", "special", "accessory"];
 
-/// Canonical `role` vocabulary → Rust variant, in a FIXED order (painter-role order of
-/// docs/cat-art-v4-design.md §0). The emitted `GlyphRole` enum is this list filtered to
-/// the roles the roster actually uses; an asset role outside this table is a hard error
-/// (register it here — the repo's fail-closed idiom).
+/// Canonical `role` vocabulary → Rust variant, in fixed painter-role order
+/// (docs/cat-art-v4-design.md §0). The emitted `GlyphRole` enum is this list
+/// filtered to roles the roster uses; an unknown asset role is a hard error.
 const ROLE_VOCAB: &[(&str, &str)] = &[
     ("outline", "Outline"),
     ("coat", "Coat"),
@@ -87,9 +81,9 @@ const KIND_VOCAB: &[(&str, &str)] = &[
     ("prop", "Prop"),
 ];
 
-/// The authored-asset boundary is deliberately path-only. Unknown keys fail
-/// closed for roster glyphs so a future `text`, `label`, or `font` field cannot
-/// be mistaken for shipping artwork or silently ignored by codegen.
+/// The authored-asset schema is path-only: unknown keys fail closed for roster
+/// glyphs, so a `text`, `label` or `font` field is never mistaken for artwork or
+/// silently ignored.
 const GLYPH_KEYS: &[&str] = &["id", "kind", "viewbox", "anchor", "layer", "excluded"];
 const ANCHOR_KEYS: &[&str] = &["eye_y", "center_x", "word_top", "attach"];
 const LAYER_KEYS: &[&str] = &["role", "ref_fill", "recolor", "paths"];
@@ -99,9 +93,9 @@ const LAYER_KEYS: &[&str] = &["role", "ref_fill", "recolor", "paths"];
 struct Layer {
     role: &'static str,
     recolor: &'static str,
-    /// The colour this layer had in the reference. `Recolor::Fixed` layers bake it
-    /// verbatim; `Coat`/`Iris` layers swap it for a ramp colour but keep it as the
-    /// fallback and for the shade derivation.
+    /// The layer's reference colour. `Recolor::Fixed` layers bake it verbatim;
+    /// `Coat`/`Iris` layers swap in a ramp colour but keep it as the fallback
+    /// and for the shade derivation.
     fill: u32,
     /// Each path is a sequence of `PathSeg` literal strings (e.g. `PathSeg::Move(1,2)`).
     paths: Vec<Vec<String>>,
@@ -123,12 +117,10 @@ struct Glyph {
     layers: Vec<Layer>,
 }
 
-/// Generate the full `cat_glyphs_gen.rs` source from the roster asset texts
-/// `assets` — `(file name, TOML text)` pairs, as the caller read them from
-/// `art/glyphs/` (the `gen_cat_glyphs` example; the drift test). Deterministic:
-/// assets are ordered (heads, specials, accessories; each by `id`) and every
-/// coordinate quantized by a pure integer rule. Returns `Err(msg)` on any
-/// malformed asset (fail-closed) so the drift test / generator never emits junk.
+/// Generate `cat_glyphs_gen.rs` from the roster asset texts `assets` (`(file
+/// name, TOML text)` pairs read from `art/glyphs/`). Deterministic: assets are
+/// ordered (heads, specials, accessories; each by `id`) and every coordinate is
+/// quantized by an integer rule.
 ///
 /// # Errors
 /// Any malformed TOML, unknown role/recolor/kind, missing viewbox/anchor, unknown
@@ -137,67 +129,50 @@ pub fn generate_from_assets(assets: &[(String, String)]) -> Result<String, Strin
     Ok(emit(&load_glyphs(assets)?))
 }
 
-/// Generate the full `pet_glyphs_gen.rs` source from the pose texts `assets` — the
-/// same parse, the same quantization, the same fail-closed key rejection as
-/// [`generate_from_assets`], but emitted as the SEPARATE `PetGlyphId` / `PET_GLYPHS`
-/// roster that reuses the cat module's types (see the module doc). The poses are all
-/// one kind, so the shared (kind, id) order collapses to a plain id order.
+/// Generate `pet_glyphs_gen.rs` from the pose texts `assets`: the same parse,
+/// quantization and key rejection as [`generate_from_assets`], emitted as the
+/// separate `PetGlyphId` / `PET_GLYPHS` roster reusing the cat module's types.
+/// The poses are one kind, so the order is by id.
 ///
 /// # Errors
-/// Identical to [`generate_from_assets`]: any malformed TOML, unknown
-/// role/recolor/kind, missing viewbox/anchor, unknown roster-schema key, unparseable
-/// path `d`-string, or colliding variant name.
+/// As [`generate_from_assets`].
 pub fn generate_pet_from_assets(assets: &[(String, String)]) -> Result<String, String> {
     Ok(emit_pet(&load_glyphs(assets)?))
 }
 
-/// Generate the full `dog_glyphs_gen.rs` source from the breed texts `assets` — the
-/// third roster on the same parse/quantize/fail-closed path. Like the pet, the dogs are
-/// a SEPARATE roster reusing the cat module's shape types: the typed-word dog cameo is
-/// not a collectible, so dog heads must never join `GLYPHS` (the kitty log's roster cap
-/// is pinned to `GLYPH_IDS.len()`).
+/// Generate `dog_glyphs_gen.rs` from the breed texts `assets`: a separate roster
+/// reusing the cat module's shape types (the dog cameo is not a collectible).
 ///
 /// # Errors
-/// Identical to [`generate_from_assets`]: any malformed TOML, unknown
-/// role/recolor/kind, missing viewbox/anchor, unknown roster-schema key, unparseable
-/// path `d`-string, or colliding variant name.
+/// As [`generate_from_assets`].
 pub fn generate_dog_from_assets(assets: &[(String, String)]) -> Result<String, String> {
     Ok(emit_dog(&load_glyphs(assets)?))
 }
 
-/// Generate the full `animal_glyphs_gen.rs` source from the species-head texts
-/// `assets` — the same parse, quantization, and fail-closed key rejection as
-/// [`generate_from_assets`], emitted as the FOURTH separate roster (`AnimalGlyphId` /
-/// `ANIMAL_GLYPHS`): one authored head per species for the ambient animal-word
-/// decoration. Separate for the same reason the pet roster is — these must never
-/// join the collectible cat table — plus one of its own: the asset `id` doubles as
-/// the lexicon's `species` key, so the roster also emits the key → id resolver.
+/// Generate `animal_glyphs_gen.rs` from the species-head texts `assets`: the
+/// separate `AnimalGlyphId` / `ANIMAL_GLYPHS` roster for the ambient animal-word
+/// decoration. The asset `id` doubles as the lexicon's `species` key, so it also
+/// emits the key → id resolver.
 ///
 /// # Errors
-/// Identical to [`generate_from_assets`].
+/// As [`generate_from_assets`].
 pub fn generate_animal_from_assets(assets: &[(String, String)]) -> Result<String, String> {
     Ok(emit_animal_roster(&load_glyphs(assets)?))
 }
 
-/// Generate the full `robi_glyphs_gen.rs` source from the pose texts `assets` —
-/// the helper-robot roster on the same parse/quantize/fail-closed path. Like the pet,
-/// Robi is a SEPARATE roster reusing the cat module's shape types: his poses are
-/// animation frames for the chrome-walking robot, never collectible rows, so they
-/// must not join `GLYPHS` (the kitty log's roster cap is pinned to `GLYPH_IDS.len()`).
+/// Generate `robi_glyphs_gen.rs` from the pose texts `assets`: a separate roster
+/// of the helper robot's animation frames, reusing the cat module's shape types.
 ///
 /// # Errors
-/// Identical to [`generate_from_assets`]: any malformed TOML, unknown
-/// role/recolor/kind, missing viewbox/anchor, unknown roster-schema key, unparseable
-/// path `d`-string, or colliding variant name.
+/// As [`generate_from_assets`].
 pub fn generate_robi_from_assets(assets: &[(String, String)]) -> Result<String, String> {
     Ok(emit_robi(&load_glyphs(assets)?))
 }
 
-/// Parse, order, and collision-check every roster asset text in `assets` — the half
-/// of codegen the rosters share verbatim. The texts are visited in file-name order
-/// whatever order the caller read them in, so the first error named is the same
-/// on every machine; non-roster kinds / `excluded = true` assets are dropped by
-/// [`glyph_from_doc`].
+/// Parse, order and collision-check every roster asset text in `assets`, shared
+/// by all rosters. Texts are visited in file-name order, so the first error
+/// named is the same everywhere; non-roster kinds and `excluded = true` assets
+/// are dropped by [`glyph_from_doc`].
 fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
     let mut files: Vec<&(String, String)> = assets.iter().collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -492,9 +467,8 @@ fn emit(glyphs: &[Glyph]) -> String {
     }
     s.push_str("}\n\n");
 
-    // Stable enum-value roster. Persistence stores the semantic `GlyphDef::id`
-    // string, then resolves it through this table; it never serializes a Rust
-    // discriminant whose ordinal could change when contributors add art.
+    // Stable roster: persistence stores the `GlyphDef::id` string and resolves
+    // it through this table, never a Rust discriminant that could shift.
     s.push_str("/// Every glyph id in [`GLYPHS`] order. Pair with `GLYPHS[i].id` for stable string lookup.\n");
     s.push_str("pub const GLYPH_IDS: &[CatGlyphId] = &[\n");
     for g in glyphs {
@@ -519,10 +493,9 @@ fn emit(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// Render the pet roster source. Same drawlist rows as [`emit`], but a separate
-/// `PetGlyphId` / `PET_GLYPH_IDS` / `PET_GLYPHS` roster that *imports* the cat module's
-/// shape types rather than redeclaring them — so the pet can never be mistaken for a
-/// collectible cat row, and there is exactly one `GlyphDef` shape in the crate.
+/// Render the pet roster source: [`emit`]'s drawlist rows as a separate
+/// `PetGlyphId` / `PET_GLYPH_IDS` / `PET_GLYPHS` roster that imports the cat
+/// module's shape types, so there is one `GlyphDef` shape in the crate.
 fn emit_pet(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(PET_HEADER);
@@ -561,10 +534,9 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// Render the dog roster source. Same drawlist rows as [`emit`], but a separate
-/// `DogGlyphId` / `DOG_GLYPH_IDS` / `DOG_GLYPHS` roster that *imports* the cat module's
-/// shape types rather than redeclaring them — the pet precedent applied to the typed
-/// dog cameo's breed selection.
+/// Render the dog roster source: [`emit`]'s drawlist rows as a separate
+/// `DogGlyphId` / `DOG_GLYPH_IDS` / `DOG_GLYPHS` roster importing the cat
+/// module's shape types.
 fn emit_dog(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(DOG_HEADER);
@@ -611,10 +583,9 @@ fn emit_dog(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// Render the ROBI roster source. Same drawlist rows as [`emit`], but a separate
-/// `RobiGlyphId` / `ROBI_GLYPH_IDS` / `ROBI_GLYPHS` roster that *imports* the cat
-/// module's shape types rather than redeclaring them — the pet precedent applied to
-/// the chrome-walking helper robot's animation frames.
+/// Render the Robi roster source: [`emit`]'s drawlist rows as a separate
+/// `RobiGlyphId` / `ROBI_GLYPH_IDS` / `ROBI_GLYPHS` roster importing the cat
+/// module's shape types.
 fn emit_robi(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(ROBI_HEADER);
@@ -668,9 +639,8 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     }
     s.push_str("}\n\n");
 
-    // Stable enum-value roster (same reason as the cat's GLYPH_IDS: species
-    // resolution goes through `ANIMAL_GLYPHS[i].id` strings, never a Rust
-    // discriminant).
+    // Stable roster: species resolve through `ANIMAL_GLYPHS[i].id` strings,
+    // never a Rust discriminant.
     s.push_str(
         "/// Every species id in [`ANIMAL_GLYPHS`] order. Pair with `ANIMAL_GLYPHS[i].id`\n",
     );
@@ -876,9 +846,8 @@ pub struct GlyphDef {
 
 ";
 
-/// The `gen_*` examples' asset-dir reader, compiled into the drift tests below so
-/// they regenerate from exactly the texts the generator binaries hand in
-/// (dev-only: the shipped engine reads no file — see the module doc).
+/// The `gen_*` examples' asset-dir reader, compiled into the drift tests so
+/// they regenerate from the same texts (dev-only; the engine reads no file).
 #[cfg(test)]
 #[path = "../examples/support/asset_dir.rs"]
 mod asset_dir;
@@ -914,9 +883,8 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/robi")
     }
 
-    /// The Robi roster's drift gate: regenerate the source from the assets and
-    /// assert it equals the checked-in `robi_glyphs_gen.rs`. Regenerate with
-    /// `cargo run -p aterm-effects --example gen_robi_glyphs` after touching any pose.
+    /// Robi drift gate: the regenerated source equals `robi_glyphs_gen.rs`.
+    /// Regenerate with `cargo run -p aterm-effects --example gen_robi_glyphs`.
     #[test]
     fn robi_glyphs_gen_matches_assets() {
         let generated = generate_robi_from_assets(&read_assets(&robi_dir()))
@@ -928,9 +896,8 @@ mod tests {
         );
     }
 
-    /// The animal roster's drift gate: regenerate the source from the assets and
-    /// assert it equals the checked-in `animal_glyphs_gen.rs`. Regenerate with
-    /// `cargo run -p aterm-effects --example gen_animal_glyphs` after touching any head.
+    /// Animal drift gate: the regenerated source equals `animal_glyphs_gen.rs`.
+    /// Regenerate with `cargo run -p aterm-effects --example gen_animal_glyphs`.
     #[test]
     fn animal_glyphs_gen_matches_assets() {
         let generated = generate_animal_from_assets(&read_assets(&animal_dir()))
@@ -942,9 +909,8 @@ mod tests {
         );
     }
 
-    /// The drift gate (§1): regenerate the source from the assets and assert it equals
-    /// the checked-in `cat_glyphs_gen.rs`. Regenerate with
-    /// `cargo run -p aterm-effects --example gen_cat_glyphs` after touching any asset.
+    /// Cat drift gate (§1): the regenerated source equals `cat_glyphs_gen.rs`.
+    /// Regenerate with `cargo run -p aterm-effects --example gen_cat_glyphs`.
     #[test]
     fn cat_glyphs_gen_matches_assets() {
         let generated =
@@ -956,9 +922,8 @@ mod tests {
         );
     }
 
-    /// The pet half of the same gate: regenerate the pet roster from `art/pet/` and
-    /// assert it equals the checked-in `pet_glyphs_gen.rs`. Regenerate with
-    /// `cargo run -p aterm-effects --example gen_pet_glyphs` after touching any pose.
+    /// Pet drift gate: the regenerated source equals `pet_glyphs_gen.rs`.
+    /// Regenerate with `cargo run -p aterm-effects --example gen_pet_glyphs`.
     #[test]
     fn pet_glyphs_gen_matches_assets() {
         let generated = generate_pet_from_assets(&read_assets(&pet_dir()))
@@ -975,9 +940,8 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/dogs")
     }
 
-    /// The dog third of the same gate: regenerate the breed roster from `art/dogs/`
-    /// and assert it equals the checked-in `dog_glyphs_gen.rs`. Regenerate with
-    /// `cargo run -p aterm-effects --example gen_dog_glyphs` after touching any breed.
+    /// Dog drift gate: the regenerated source equals `dog_glyphs_gen.rs`.
+    /// Regenerate with `cargo run -p aterm-effects --example gen_dog_glyphs`.
     #[test]
     fn dog_glyphs_gen_matches_assets() {
         let generated = generate_dog_from_assets(&read_assets(&dog_dir()))

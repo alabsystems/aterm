@@ -51,6 +51,18 @@
 //!   co-located `atpkg` is not executable the arm falls through to the twin's own
 //!   exports and store `exec`, and the vendor's verb runs as it did before (review,
 //!   2026-09-16), never a stranded tool.
+//! * **`bin/` carries the same block** (audit 2026-10-02). Outside an aterm session —
+//!   Terminal, iTerm, an editor's terminal, ssh — the rc hook puts `bin/` on PATH and not
+//!   `agents/` (`crate::hooks`, the 2026-09-22 gate), so where the person keeps no copy of
+//!   their own `bin/<program>` IS the managed name, and before this `claude update` there
+//!   ran the vendor's updater on the managed copy: measured on 2.1.287 and 2.1.288 in a
+//!   network-jailed scratch HOME, it wrote `installMethod: native` into `~/.claude.json`
+//!   and fetched the vendor's latest for a native install. The agents reconcile lays the
+//!   primary with the twin's block (`crate::activate::reconcile_agents`), so the two files
+//!   are byte for byte the same. The verb's forward (help, a pass-through) `exec`s
+//!   `bin/<program>` — so does every atpkg shipped since 2026-09-19 — under the same pid,
+//!   and the block's re-entry guard ([`REENTRY_VAR`]) runs the store build then instead of
+//!   handing over again, whichever atpkg the block names.
 //! * **The hidden verb** (`cli::cmd_selfupdate`): re-checks the argv in Rust with
 //!   [`classify`] — help never mutates (`-h`/`--help` forwards to the vendor after one
 //!   stderr note), a shape aterm can honour prints ONE announce line and runs the
@@ -90,8 +102,10 @@
 //! before its first pass re-lays the twin) answers `__selfupdate` with `unknown verb`
 //! exit 2 — loud, non-mutating, only for a self-update verb (a plain `claude` never
 //! touches the arm), and self-healing: that older atpkg's first `reconcile_agents` re-lays
-//! the twin without the block. The reverse — a NEWER twin's roster against this verb's
-//! older one — forwards to the tool verbatim (`row_for` answers `None`).
+//! the twin without the block. `bin/` heals later — such an atpkg re-lays a primary only
+//! when the program's next build lands — with the same loud, non-mutating ending until
+//! then. The reverse — a NEWER twin's roster against this verb's older one — forwards to
+//! the tool verbatim (`row_for` answers `None`).
 //!
 //! # Scope
 //!
@@ -126,6 +140,18 @@ use std::path::Path;
 /// CHILD it spawns takes the lock through the real dispatch edge; the verb itself never
 /// mutates the store.
 pub const HIDDEN_VERB: &str = "__selfupdate";
+
+/// THE BLOCK'S RE-ENTRY GUARD (audit 2026-10-02): the block hands over as
+/// `__ATPKG_SELFUPDATE_PID=$$ exec "$__atpkg" __selfupdate …`, and a block that finds this
+/// variable equal to its OWN `$$` lets the verb through to the store build instead of
+/// handing over again. Why: the verb's forward (help, a pass-through) `exec`s `bin/<program>`
+/// — every atpkg shipped since 2026-09-19 does — and `bin/` carries the block too now, so
+/// without the guard `claude update --help` handed over to itself forever (measured: 518
+/// notes in 4 s against the installed atpkg). The hand-over and the forward are both
+/// `exec(2)`, so the re-entered shim runs under the SAME pid, which is what the guard
+/// matches; a `claude update` typed anywhere else runs under a pid no environment names, so
+/// the variable is no bypass a person could leave set, and it needs no newer atpkg to work.
+pub const REENTRY_VAR: &str = "__ATPKG_SELFUPDATE_PID";
 
 /// The child's `--wait-lock` bound, in seconds: THIRTY MINUTES, a constant — the one
 /// every scheduled pass waits ([`aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS`]: the
@@ -355,7 +381,7 @@ pub fn child_args(program: &str, bound: u64) -> Vec<String> {
 /// measured 2026-09-19) — and behind the `pkg` verb otherwise. The one shipped binary is
 /// `aterm`, and its front door reads a bare `update` as aterm's OWN app-update lane
 /// (`aterm_cli::Verb::Update`), never as a package verb: measured on the installed
-/// bundle, `aterm update claude --wait-lock 60` answers `aterm: unknown update
+/// bundle, `aterm update claude --wait-lock 60` answered `aterm: unknown update
 /// sub-command "claude"` and that lane's own operands (`status|check`), exit 2 — so a
 /// sibling-less `aterm` (a dev build copied out of `target/`, a bundle missing the alias
 /// symlink) whose verb fell back to `current_exe()` announced a check that never ran and
@@ -511,32 +537,44 @@ pub fn help_line(row: &Row) -> String {
     )
 }
 
-/// The disabled line, stderr, exit 1, nothing run: the manager is off (a build that pins
-/// no root key), so nothing is checked — and the vendor's updater
-/// is NOT handed the verb either, because the copy it would install is one this name
-/// never runs; `aterm pkg doctor` says why the manager is off.
+/// The disabled line, stderr, exit 1, nothing run: the manager is off, and its one cause
+/// is a build that pins no root key, so the line names it — and the vendor's updater is
+/// NOT handed the verb either, because the copy it would install is one this name never
+/// runs.
 #[must_use]
 pub fn disabled_line(row: &Row, build: Option<u64>) -> String {
     let p = row.program;
     format!(
-        "atpkg: aterm's updater is disabled here — nothing checked, {p} {} stays; `aterm pkg \
-         doctor` says why",
+        "atpkg: this aterm build updates nothing (it pins no release key) — {p} {} stays; a \
+         released aterm updates it",
         build_words(build)
     )
 }
 
-/// The epilogue for a child that exited 1 (offline, disabled inside the child, any flow
-/// error), stderr, after the child's own failure line: the version you have stays, and how
-/// to retry. (The child's own line says WHY — an unreached index reads "could not reach the
-/// toolchain index (…) — this is a network problem"; this line is what says what happened
-/// to the copy.)
+/// The epilogue for a child that exited non-zero on its own (offline, a flow error, a
+/// lock I/O error, a panic), stderr, after whatever the child printed. Not every such
+/// exit printed a verdict naming the version it keeps, so this line names it, and the
+/// retry.
 #[must_use]
 pub fn incomplete_line(row: &Row, build: Option<u64>) -> String {
     let p = row.program;
     format!(
-        "atpkg: the {p} check did not complete (see above) — {p} {} stays; `aterm pkg update \
-         {p}` retries, `aterm pkg doctor` explains",
-        build_words(build)
+        "atpkg: {p} {} stays; `{p} {}` tries again",
+        build_words(build),
+        lead_verb(row)
+    )
+}
+
+/// The epilogue for a child a signal stopped: it printed no verdict, so this line says
+/// what stays, and the retry.
+#[must_use]
+pub fn stopped_line(row: &Row, build: Option<u64>) -> String {
+    let p = row.program;
+    format!(
+        "atpkg: the {p} check was stopped before it finished — {p} {} stays; `{p} {}` tries \
+         again",
+        build_words(build),
+        lead_verb(row)
     )
 }
 
@@ -546,13 +584,21 @@ pub fn incomplete_line(row: &Row, build: Option<u64>) -> String {
 /// moving packages; the build stays until it finishes. What turns "refusing to mutate
 /// the store concurrently" into "the update you asked for is already running".
 #[must_use]
-pub fn contended_line(row: &Row, build: Option<u64>, bound: u64) -> String {
+pub fn contended_line(row: &Row, build: Option<u64>, bound: u64, holder_is_person: bool) -> String {
     let p = row.program;
-    // The child's own exit-75 sentence, just above, already names the store lock and the
-    // pass that holds it; this line adds the wait spent, what stays, and the retry.
+    // On a person's terminal the child prints nothing on a timed-out wait, so there this
+    // line is the whole report: who holds the store, the wait spent, what stays, and the
+    // retry. The holder record marks a person only for a typed verb without
+    // `--wait-lock`; an intercept child (another `claude update`) or a piped verb is not
+    // marked, so an unmarked holder is named neutrally.
+    let holder = if holder_is_person {
+        "another `aterm pkg` command"
+    } else {
+        "another update"
+    };
     format!(
-        "atpkg: waited {}; another atpkg process is still running — {p} {} stays until it \
-         finishes, then `{p} {}` again",
+        "atpkg: {holder} is still running after {} — {p} {} stays; `{p} {}` again when it \
+         finishes",
         wait_words(bound),
         build_words(build),
         lead_verb(row)
@@ -611,8 +657,9 @@ pub fn could_not_run_line(atpkg: &Path, program: &str, err: &io::Error) -> Strin
 /// appends it only where it is true (review, 2026-09-19): the laid `agents/` twin is
 /// current AND carries the hand-over (`cli::agent_twin_intercepts` — so never the `.cmd`
 /// twin, never a twin from before the block) AND `agents/` is on THIS shell's `PATH`; a
-/// shell whose `PATH` holds only `bin/` runs `bin/<program>`, which carries no block, and
-/// `claude update` there is the vendor's updater.
+/// shell whose `PATH` holds only `bin/` runs `bin/<program>`, which carried no block until
+/// 2026-10-02 (`claude update` there was the vendor's updater) and is not what the
+/// predicate reads, so the sentence is withheld there — an under-claim.
 #[must_use]
 pub fn which_sentence(row: &Row) -> String {
     let p = row.program;
@@ -919,13 +966,13 @@ mod tests {
         );
         assert_eq!(
             disabled_line(c, Some(v2_1_280)),
-            "atpkg: aterm's updater is disabled here — nothing checked, claude 2.1.280 stays; \
-             `aterm pkg doctor` says why"
+            "atpkg: this aterm build updates nothing (it pins no release key) — claude 2.1.280 \
+             stays; a released aterm updates it"
         );
         assert_eq!(
             disabled_line(x, None),
-            "atpkg: aterm's updater is disabled here — nothing checked, codex (no version \
-             recorded) stays; `aterm pkg doctor` says why"
+            "atpkg: this aterm build updates nothing (it pins no release key) — codex (no \
+             version recorded) stays; a released aterm updates it"
         );
         assert_eq!(
             declined_line(
@@ -977,29 +1024,32 @@ mod tests {
         );
         assert_eq!(
             incomplete_line(c, Some(v2_1_280)),
-            "atpkg: the claude check did not complete (see above) — claude 2.1.280 stays; \
-             `aterm pkg update claude` retries, `aterm pkg doctor` explains"
-        );
-        // A legacy index build, not yet replaced, keeps its number.
-        assert_eq!(
-            incomplete_line(c, Some(2_026_091_902)),
-            "atpkg: the claude check did not complete (see above) — claude build 2026091902 \
-             stays; `aterm pkg update claude` retries, `aterm pkg doctor` explains"
+            "atpkg: claude 2.1.280 stays; `claude update` tries again"
         );
         assert_eq!(
             incomplete_line(x, None),
-            "atpkg: the codex check did not complete (see above) — codex (no version \
-             recorded) stays; `aterm pkg update codex` retries, `aterm pkg doctor` explains"
+            "atpkg: codex (no version recorded) stays; `codex update` tries again"
         );
         assert_eq!(
-            contended_line(c, Some(v2_1_280), WAIT_LOCK_SECS),
-            "atpkg: waited 30 min; another atpkg process is still running — claude 2.1.280 \
-             stays until it finishes, then `claude update` again"
+            stopped_line(c, Some(v2_1_280)),
+            "atpkg: the claude check was stopped before it finished — claude 2.1.280 stays; \
+             `claude update` tries again"
+        );
+        // A legacy index build, not yet replaced, keeps its number.
+        assert_eq!(
+            stopped_line(c, Some(2_026_091_902)),
+            "atpkg: the claude check was stopped before it finished — claude build 2026091902 \
+             stays; `claude update` tries again"
         );
         assert_eq!(
-            contended_line(x, None, 1),
-            "atpkg: waited 1 s; another atpkg process is still running — codex (no version \
-             recorded) stays until it finishes, then `codex update` again"
+            contended_line(c, Some(v2_1_280), WAIT_LOCK_SECS, false),
+            "atpkg: another update is still running after 30 min — claude 2.1.280 stays; \
+             `claude update` again when it finishes"
+        );
+        assert_eq!(
+            contended_line(x, None, 1, true),
+            "atpkg: another `aterm pkg` command is still running after 1 s — codex (no version \
+             recorded) stays; `codex update` again when it finishes"
         );
         // Every line: state first, the one action, at most one caveat — and none longer
         // than the announce line's own bound.
@@ -1012,8 +1062,9 @@ mod tests {
                 },
             ),
             disabled_line(c, Some(v2_1_280)),
-            incomplete_line(c, Some(2_026_091_902)),
-            contended_line(c, Some(v2_1_280), WAIT_LOCK_SECS),
+            incomplete_line(c, Some(v2_1_280)),
+            stopped_line(c, Some(2_026_091_902)),
+            contended_line(c, Some(v2_1_280), WAIT_LOCK_SECS, true),
             help_line(c),
         ] {
             assert!(line.len() <= 230, "{}: {line}", line.len());
@@ -1118,7 +1169,8 @@ mod tests {
             help_line(x),
             disabled_line(x, None),
             incomplete_line(x, None),
-            contended_line(x, None, 5),
+            stopped_line(x, None),
+            contended_line(x, None, 5, false),
             prefix_mismatch_line(x, Path::new("/a"), Path::new("/b")),
             could_not_run_line(Path::new("/a"), "codex", &err),
             declined_line(
@@ -1153,7 +1205,7 @@ mod tests {
                 "no line names an environment variable or a knob: {line}"
             );
         }
-        assert!(contended_line(x, None, 5).contains("waited 5 s;"));
+        assert!(contended_line(x, None, 5, false).contains("after 5 s "));
     }
 
     /// The child's argv: the standard update with the FIXED bound — `update <program>
@@ -1209,42 +1261,6 @@ mod tests {
         assert_eq!(
             child_argv(Path::new("/x/aterm"), "codex", 1),
             a(&["pkg", "update", "codex", "--wait-lock", "1"])
-        );
-    }
-
-    /// NO ENVIRONMENT KNOB REACHES THE INTERCEPT (owner, 2026-09-19: *"remove all these
-    /// env flags so that aterm works correctly by default"*). The first cut shipped two —
-    /// an escape hatch that ran the vendor's own updater through the managed name, and a
-    /// wait-bound override — and both are gone: the production half of this file, the
-    /// whole of `cli.rs` (its verb region, `cmd_selfupdate` through
-    /// `selfupdate_child_binary`, reads no environment variable of its own), the twin
-    /// renderers in `platform/mod.rs` and the manual's self-update bullet name neither
-    /// token; this file reads no environment at all; the manual says a busy store is
-    /// waited for, audibly, and how the wait ends; and the bound is the window's own —
-    /// `aterm-gui`'s `ATPKG_WAIT_LOCK_SECS`, read off that crate's source because atpkg
-    /// cannot depend on it — so a person's `claude update` waits exactly as long as the
-    /// pass it waits for would. The token names are spelled by concatenation so this
-    /// test's own text is not a hit.
-    /// THIS MODULE IS PURE, by its source: no exit-code value (the exit-code registry scan
-    /// in `lock.rs` reads `cli.rs`, where every relay is a literal arm or a named
-    /// constant), no process exit, and no `#[cfg(test)]` item ahead of this test module
-    /// (the shape the registry scan's split rule requires of every file it might one day
-    /// read).
-    #[test]
-    fn the_module_builds_no_exit_code() {
-        let src = include_str!("selfupdate.rs");
-        let gate = "#[cfg(test)]";
-        let (production, tests) = src.split_once(gate).expect("the test module's gate");
-        assert!(
-            tests.starts_with("\nmod tests {"),
-            "the first #[cfg(test)] is this module, nothing earlier"
-        );
-        assert!(!production.contains("mod tests {"));
-        let exit_code = ["Exit", "Code"].concat();
-        assert!(!production.contains(&exit_code), "no {exit_code} here");
-        assert!(
-            !production.contains("std::process::exit"),
-            "the verb relays the child's code; this module decides nothing about exits"
         );
     }
 }

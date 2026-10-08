@@ -28,20 +28,23 @@
 //!
 //! Each file keeps its own scratch prefix (so parallel test binaries never
 //! share a directory), its own launch arguments and its own readiness extras;
-//! [`boot_with`] takes them. The file that includes this module includes
-//! `support/launch_isolation.rs` as `launch_isolation` too.
+//! [`boot_with`] takes them. The `aterm ctl` client helpers ([`ctl`],
+//! [`ctl_ok`], [`field`], …) are here once for every live file. The file that
+//! includes this module includes `support/launch_isolation.rs` as
+//! `launch_isolation` and `support/child_output.rs` as `child_output` too.
 
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::launch_isolation;
+use crate::{child_output, launch_isolation};
 
-/// The socket-bind budget (the verify smoke's, tripled): GENEROUS, because it
-/// only turns a wedged boot into a named failure instead of a hung run.
-pub const SOCKET_POLLS: usize = 300;
+/// The socket-bind budget, a minute of [`POLL_GAP`]s: a hang detector
+/// (AGENTS.md), never a latency budget — it only turns a wedged boot into a
+/// named failure instead of a hung run, and a boot that listens ends it at once.
+pub const SOCKET_POLLS: usize = 600;
 pub const POLL_GAP: Duration = Duration::from_millis(100);
 
 /// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD; a base that would
@@ -67,7 +70,17 @@ impl Drop for Instance {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp);
+        // The session's shell outlives the instance by a moment — its PTY's
+        // hangup — and writes `home/.bash_history` as it goes: a file made
+        // after the walk began leaves the scratch world behind (measured:
+        // two of about 130 boots, 2026-09-26). Removed again until it is
+        // gone, bounded; once `home/` is gone nothing can write under it.
+        for _ in 0..40 {
+            if std::fs::remove_dir_all(&self.tmp).is_ok() || !self.tmp.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -180,7 +193,12 @@ pub fn boot_with(
             return None;
         }
     };
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    // The system's first-exec wait, paid here and not on the socket wait below
+    // ([`aterm_spec::wait::first_exec`]); `--help` is answered above the mode
+    // fork, before any setup.
+    aterm_spec::wait::first_exec(aterm, &["--help"]);
+    let mut cmd = Command::new(aterm);
     launch_isolation::apply(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .args(launch_isolation::control_sock(&tmp))
@@ -256,4 +274,211 @@ pub fn await_ready<T>(
         POLL_GAP * SOCKET_POLLS as u32,
         sock.display()
     );
+}
+
+/// A `ctl` client that has not exited by now is hung: past every minute-long
+/// hang wait a call makes, so a server-side `await` that times out answers
+/// before it is killed.
+pub const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// `aterm ctl --sock <sock> <args…>` against `inst`, in its scratch world,
+/// stdout and stderr piped — not yet spawned.
+pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
+    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    // The file [`boot_with`] ran before its launch, so one lookup; a file cargo
+    // has put there since is run here, before the client's clock.
+    aterm_spec::wait::first_exec(aterm, &["--help"]);
+    let mut cmd = Command::new(aterm);
+    cmd.arg("ctl")
+        .arg("--sock")
+        .arg(&inst.sock)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    launch_isolation::apply(&mut cmd, &inst.tmp);
+    cmd
+}
+
+/// One bounded `aterm ctl` call, read until it exits
+/// (`support/child_output.rs`: a sibling's spawn can hold its pipes open).
+///
+/// A call the instance never ACCEPTED is asked again, for up to
+/// [`aterm_spec::wait::MUST_HAPPEN`]. `aterm ctl` gives the accept phase 10 s
+/// (`ACCEPT_DEADLINE`, which `--timeout` can only shorten) and then exits 2
+/// with "the instance took no request, so none was sent" — nothing ran, so
+/// asking again cannot run anything twice. A loaded merge gate saw a live
+/// instance miss those 10 s once (`host_live_program`, 2026-10-05); a correctness
+/// test's wait for a listener that must answer is a hang detector, not a budget.
+pub fn ctl(inst: &Instance, args: &[&str]) -> Output {
+    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    loop {
+        let child = client_command(inst, args).spawn().expect("spawn aterm ctl");
+        let out = child_output::wait_and_read(child, Instant::now() + CLIENT_EXIT_DEADLINE)
+            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"));
+        let not_accepted = out.status.code() == Some(2)
+            && String::from_utf8_lossy(&out.stderr).contains("so none was sent");
+        if !not_accepted || Instant::now() >= give_up {
+            return out;
+        }
+    }
+}
+
+/// [`ctl`] that must succeed: its stdout.
+pub fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
+    let out = ctl(inst, args);
+    assert!(
+        out.status.success(),
+        "aterm ctl {args:?} failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8(out.stdout).expect("utf-8")
+}
+
+/// Put the executable script `text` at `path`, replacing whatever is there,
+/// and return once the file it names has been run: ONE FILE PER TEXT, kept
+/// under the build's `CARGO_TARGET_TMPDIR` by a digest of the text and
+/// hard-linked into place, and run once per process (`--version`, every
+/// output and input null) before any caller returns.
+///
+/// WHY. macOS assesses an executable file at its FIRST exec — per inode, one
+/// file at a time machine-wide — and every later exec of it, from any
+/// program and through any link, takes milliseconds (0.2 s idle and 6.6 s
+/// under a loaded gate, 2026-09-26; links to a file already run skip it,
+/// 2026-09-30). A first exec the PRODUCT made paid it where a test could not
+/// wait for it: the host's version probe of a fake twin (bounded at 5 s,
+/// `aterm_agent::harness::upgrade_drive`'s `VERSION_WAIT`), and a `/bin/sh`
+/// script still running from a path its replacement was renamed onto
+/// stopped at its next exec until that check ended (5.2 s to 8.5 s at a load
+/// of 15 to 50, 2026-10-04). So a test ran each fake it wrote once before
+/// the product met it — and wrote every fake anew: `host_live` paid the
+/// check 50 times a run for six texts, 0.15 s to 2.7 s each with its tests
+/// started together at a load of 10 to 30, three times in each upgrade test
+/// (measured 2026-10-05).
+///
+/// So every text a test writes the same way is one inode, checked once: by
+/// the first run of this build tree that met it, and run here once per
+/// process, a caller that finds it being run WAITING for that run to end. A
+/// TEXT THAT HOLDS A PATH IS SHARED BY NO ONE: a fake finds its scratch world
+/// from `$HOME` (`<root>/home`, `launch_isolation::apply`), as it finds its
+/// `.claude` there. The shared file is read-only, so a fake written over in
+/// place fails loudly instead of rewriting every test's: replace one through
+/// here, or by a rename, which swaps the link. A link that cannot be made
+/// (another filesystem) is a file of its own, run here once: slower, and as
+/// correct.
+///
+/// Every text given must answer `--version` at once, or end at once with
+/// nothing to draw and nothing written.
+///
+/// # Panics
+/// When `path`'s directory cannot be made or the script cannot be written: a
+/// test without its fake decides nothing.
+pub fn standin(path: &Path, text: &str) {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    static SHARED: Mutex<BTreeMap<String, Arc<OnceLock<Option<PathBuf>>>>> =
+        Mutex::new(BTreeMap::new());
+
+    let once = Arc::clone(
+        SHARED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(text.to_owned())
+            .or_default(),
+    );
+    let shared = once.get_or_init(|| {
+        let file = shared_file(text)?;
+        run_once(&file);
+        Some(file)
+    });
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+    let _ = std::fs::remove_file(path);
+    if shared
+        .as_ref()
+        .is_some_and(|file| std::fs::hard_link(file, path).is_ok())
+    {
+        return;
+    }
+    std::fs::write(path, text).expect("write the fake");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    run_once(path);
+}
+
+/// The build tree's read-only copy of `text` ([`standin`]): made by whichever
+/// process first needs it — written under a name of its own, then linked
+/// into place, so a concurrent maker finds it whole or makes it — and
+/// trusted only when it reads back as `text` (a digest is no proof) and is
+/// still read-only and executable: the mode is what keeps one test from
+/// writing every test's fake, so a file that lost it (a `chmod -R u+w` of the
+/// target dir, say) is not shared — the caller writes its own.
+fn shared_file(text: &str) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("aterm-live-standins");
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut digest = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut digest);
+    let name = format!("{:016x}-{}", digest.finish(), text.len());
+    let file = dir.join(&name);
+    let whole = |file: &Path| {
+        std::fs::metadata(file)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o777 == 0o555)
+            && std::fs::read(file).ok().as_deref() == Some(text.as_bytes())
+    };
+    if !whole(&file) {
+        let own = dir.join(format!(".{name}.{}", std::process::id()));
+        // A copy a killed run of this pid left behind is read-only too.
+        let _ = std::fs::remove_file(&own);
+        std::fs::write(&own, text).ok()?;
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o555)).ok()?;
+        let _ = std::fs::hard_link(&own, &file);
+        let _ = std::fs::remove_file(&own);
+    }
+    whole(&file).then_some(file)
+}
+
+/// Run `file` once, unbounded, `--version` its argument and every output and
+/// input null: the first exec the system checks ([`standin`]).
+fn run_once(file: &Path) {
+    let _ = Command::new(file)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// `key=value` out of a status/sessions line.
+pub fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|t| t.strip_prefix(prefix.as_str()))
+}
+
+/// The boot session's `(local, sid)` from `sessions`.
+pub fn boot_session(inst: &Instance) -> (u64, String) {
+    let body = ctl_ok(inst, &["sessions"]);
+    let row = body
+        .lines()
+        .find(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or_else(|| panic!("a session row: {body}"));
+    let mut toks = row.split_whitespace();
+    let local = toks.next().unwrap().parse().unwrap();
+    let sid = toks.next().unwrap().to_string();
+    (local, sid)
+}
+
+/// The session's `status` record.
+pub fn status(inst: &Instance, sid: &str) -> String {
+    ctl_ok(inst, &[&format!("@{sid}"), "status"])
+}
+
+/// Type one line into the session and submit it.
+pub fn type_line(inst: &Instance, sid: &str, line: &str) {
+    ctl_ok(inst, &[&format!("@{sid}"), "send", line]);
+    ctl_ok(inst, &[&format!("@{sid}"), "key", "enter"]);
 }

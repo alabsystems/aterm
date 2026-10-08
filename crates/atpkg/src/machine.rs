@@ -82,6 +82,10 @@ impl UniversalControlState {
     }
 }
 
+/// When the default policy turns Universal Control off on its own: one daily slot that the
+/// first window or terminal session claims ([`launch_apply_due`]) — not every window.
+const DAILY_OFF: &str = "aterm turns it off once a day, at the first window or terminal session";
+
 impl UniversalControlState {
     /// Fully disabled — BOTH keys true. One key alone is a half state the pass
     /// completes rather than reports as done.
@@ -95,14 +99,30 @@ impl UniversalControlState {
     /// `warn` when the pass is about to change it, `ok` when the policy says leave.
     #[must_use]
     pub fn doctor_line(&self, policy: UniversalControlPolicy) -> String {
+        self.line(policy, true)
+    }
+
+    /// [`Self::doctor_line`] without its `now:` action: the state alone, for a read whose
+    /// own verdict names the action (bare `aterm pkg machine`), so one screen never names
+    /// `aterm pkg machine apply` twice.
+    #[must_use]
+    pub fn state_line(&self, policy: UniversalControlPolicy) -> String {
+        self.line(policy, false)
+    }
+
+    fn line(&self, policy: UniversalControlPolicy, with_action: bool) -> String {
+        let now = if with_action {
+            " — now: `aterm pkg machine apply`"
+        } else {
+            ""
+        };
         if !self.measured {
             // Never "the OS default": nothing was measured, and the remedy is the same
             // either way, so say what is true and what happens next.
             return match policy {
-                UniversalControlPolicy::Off => "warn — Universal Control could not be read \
-                     on this host; the next aterm window (or the day's first terminal session) \
-                     disables it anyway — now: `aterm pkg machine apply`"
-                    .to_string(),
+                UniversalControlPolicy::Off => format!(
+                    "warn — Universal Control could not be read on this host; {DAILY_OFF}{now}"
+                ),
                 UniversalControlPolicy::Leave => {
                     "ok — Universal Control could not be read on this host, and [machine] \
                      universal_control = \"leave\" means nothing would be written either way"
@@ -111,9 +131,9 @@ impl UniversalControlState {
             };
         }
         if self.disabled() {
-            // THE REVERT ALONE DOES NOT HOLD. With the default policy the next aterm window
-            // (or the day's first terminal session) disables it again, so a line that offers
-            // only the two `defaults delete`s sends the reader to a change that lasts until
+            // THE REVERT ALONE DOES NOT HOLD. With the default policy the next daily apply
+            // (the day's first window or terminal session) disables it again, so a line that
+            // offers only the two `defaults delete`s sends the reader to a change that lasts until
             // then. The command stays byte-identical ([`UNIVERSAL_CONTROL_REVERT`] is
             // a contract string); the setting named before it is the half that makes it stick.
             let keep = match policy {
@@ -137,9 +157,8 @@ impl UniversalControlState {
         };
         match policy {
             UniversalControlPolicy::Off => format!(
-                "warn — Universal Control is {posture}; the next aterm window (or the day's \
-                 first terminal session) disables it — now: `aterm pkg machine apply`; keep \
-                 it: [machine] universal_control = \"leave\""
+                "warn — Universal Control is {posture}; {DAILY_OFF}, unless [machine] \
+                 universal_control = \"leave\"{now}"
             ),
             UniversalControlPolicy::Leave => format!(
                 "ok — Universal Control left {posture} ([machine] universal_control = \"leave\")"
@@ -353,6 +372,83 @@ impl HomePosture {
     }
 }
 
+/// The exposed cargo target dirs an apply leaves open, counted by why: one `atpkg machine`
+/// prints and the window's card renders through the same [`OpenSplit::words`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenSplit {
+    /// Not beside a Cargo.toml: only `aterm pkg noindex apply <dir>` by name moves one.
+    pub free_standing: usize,
+    /// Held by a running build: the next apply retries it.
+    pub busy: usize,
+    /// Refused otherwise (a destination in the way, a config that cannot be pointed).
+    pub refused: usize,
+}
+
+impl OpenSplit {
+    /// Sort one apply outcome into its bucket; `Planned`, `AlreadyExcluded`, a `Restored`
+    /// link (its directory hidden again) and a `Repaired` one count in none.
+    pub fn count(&mut self, outcome: &crate::noindex::Applied) {
+        use crate::noindex::Applied;
+        match outcome {
+            o if o.free_standing() => self.free_standing += 1,
+            o if o.held_by_build() => self.busy += 1,
+            Applied::Skipped { .. } | Applied::Failed { .. } => self.refused += 1,
+            Applied::Planned { .. }
+            | Applied::Migrated { .. }
+            | Applied::Restored { .. }
+            | Applied::Repaired { .. }
+            | Applied::AlreadyExcluded(_) => {}
+        }
+    }
+
+    /// The non-zero parts, `, `-joined: `2 free-standing (`aterm pkg noindex apply <dir>`),
+    /// 1 in a running build (the next apply retries it), …`. Empty when all are zero.
+    #[must_use]
+    pub fn words(self) -> String {
+        let mut parts = Vec::new();
+        if self.free_standing > 0 {
+            parts.push(format!(
+                "{} free-standing (`aterm pkg noindex apply <dir>` by name)",
+                self.free_standing
+            ));
+        }
+        if self.busy > 0 {
+            parts.push(format!(
+                "{} in a running build (the next apply retries it)",
+                self.busy
+            ));
+        }
+        if self.refused > 0 {
+            parts.push(format!(
+                "{} refused (`aterm pkg noindex apply <dir>` says why)",
+                self.refused
+            ));
+        }
+        parts.join(", ")
+    }
+}
+
+/// The verdict when the exposed dirs left are ones no apply hides: `stuck` of them, and why
+/// (`None` from a record written before the split was carried). `atpkg machine` prints it and
+/// the window's card shows it, so the two read the same.
+#[must_use]
+pub fn stay_open_verdict(stuck: usize, open: Option<OpenSplit>) -> String {
+    let words = open.map(OpenSplit::words).unwrap_or_default();
+    let now = if open.is_some_and(|o| o.busy > 0) {
+        " now"
+    } else {
+        ""
+    };
+    let head = format!(
+        "nothing an apply can do{now} — {stuck} cargo target dir(s) stay open to Spotlight"
+    );
+    if words.is_empty() {
+        head
+    } else {
+        format!("{head}: {words}")
+    }
+}
+
 /// What bare `atpkg machine` measured — the whole of it, as one record. Printed as the
 /// [`MACHINE_STATE_MARKER`](crate::cli::MACHINE_STATE_MARKER) line and parsed back by
 /// the window through [`parse_machine_state`], so the two cannot disagree about a
@@ -384,6 +480,10 @@ pub struct MachineState {
     /// OPTIONAL IN THE RECORD, and `false` when absent, so a reader from before this key
     /// existed keeps working and a record written by one still parses here.
     pub config_unreadable: bool,
+    /// Of the exposed, the ones an apply leaves open, by why ([`OpenSplit`]).
+    ///
+    /// OPTIONAL IN THE RECORD: `None` when a record from before these keys omits them.
+    pub open: Option<OpenSplit>,
 }
 
 /// What is left for an apply to do, if anything.
@@ -461,7 +561,13 @@ pub fn machine_state_line(s: &MachineState) -> String {
             "partial"
         },
         s.home.as_str(),
-    ) + if s.config_unreadable {
+    ) + &s.open.map_or(String::new(), |o| {
+        // APPENDED like `config=` below: a reader that predates these keys ignores them.
+        format!(
+            "; spotlight-free-standing={}; spotlight-busy={}; spotlight-refused={}",
+            o.free_standing, o.busy, o.refused
+        )
+    }) + if s.config_unreadable {
         // APPENDED, NEVER INSERTED: every key before this one keeps its place, so a
         // reader that predates the key sees the record it has always seen and this one
         // is simply ignored by it (`parse_machine_state` skips unknown keys).
@@ -486,6 +592,7 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     let mut scan = None;
     let mut home = None;
     let mut config_unreadable = false;
+    let (mut free_standing, mut busy, mut refused) = (None, None, None);
     for pair in body.split(';') {
         let Some((k, v)) = pair.trim().split_once('=') else {
             continue;
@@ -515,6 +622,10 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
             // Optional: absent means readable, which is what every record written
             // before this key existed means.
             "config" => config_unreadable = v == "unreadable",
+            // Optional, all three or none.
+            "spotlight-free-standing" => free_standing = v.parse::<usize>().ok(),
+            "spotlight-busy" => busy = v.parse::<usize>().ok(),
+            "spotlight-refused" => refused = v.parse::<usize>().ok(),
             _ => {}
         }
     }
@@ -528,6 +639,14 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
         scan_complete: scan?,
         home: home?,
         config_unreadable,
+        open: match (free_standing, busy, refused) {
+            (Some(free_standing), Some(busy), Some(refused)) => Some(OpenSplit {
+                free_standing,
+                busy,
+                refused,
+            }),
+            _ => None,
+        },
     })
 }
 
@@ -680,13 +799,7 @@ mod tests {
     /// window, whichever lane — spawns nothing until a day has passed.
     #[test]
     fn the_launch_apply_is_claimed_once_a_day() {
-        let prefix = std::env::temp_dir().join(format!(
-            "atpkg-machine-daily-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&prefix);
-        std::fs::create_dir_all(&prefix).unwrap();
+        let prefix = crate::testdir::dir("atpkg-machine-daily-");
         let layout = crate::store::Layout {
             prefix: prefix.clone(),
         };
@@ -710,13 +823,7 @@ mod tests {
     /// else does.
     #[test]
     fn a_private_state_root_skips_the_launch_apply_before_the_claim() {
-        let prefix = std::env::temp_dir().join(format!(
-            "atpkg-machine-private-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&prefix);
-        std::fs::create_dir_all(&prefix).unwrap();
+        let prefix = crate::testdir::dir("atpkg-machine-private-");
         let layout = crate::store::Layout {
             prefix: prefix.clone(),
         };
@@ -957,17 +1064,19 @@ mod tests {
         assert_eq!(default.posture(), UcPosture::Default);
         let line = default.doctor_line(UniversalControlPolicy::Off);
         assert!(line.starts_with("warn — "), "{line}");
-        // The promise, and the door: WHAT applies it — the next window, or the day's first
-        // terminal session, since the passes carry only an edit to the table (Phase 3;
+        // The promise, and the door: WHAT applies it — the day's first window or terminal
+        // session (one daily slot), since passes carry only an edit to the table (Phase 3;
         // "every pass disables it first thing" was the 2026-09-14 promise, and stopped
         // being true) and a session applies them once a day, not at every tab — and the
         // verb is how a person gets it NOW rather than then.
         assert!(
-            line.contains(
-                "the next aterm window (or the day's first terminal session) disables it"
-            ),
+            line.contains("aterm turns it off once a day, at the first window or terminal session"),
             "{line}"
         );
+        // The bare `machine` read carries the state alone; its verdict names the action.
+        let state = default.state_line(UniversalControlPolicy::Off);
+        assert!(!state.contains("aterm pkg machine apply"), "{state}");
+        assert!(state.contains("universal_control = \"leave\""), "{state}");
         assert!(!line.contains("every pass"), "{line}");
         assert!(line.contains("now: `aterm pkg machine apply`"), "{line}");
         assert!(
@@ -1048,6 +1157,11 @@ mod tests {
                         scan_complete: home != HomePosture::Mismatch,
                         home,
                         config_unreadable: uc == UcPosture::Unknown,
+                        open: (home == HomePosture::Account).then_some(OpenSplit {
+                            free_standing: 1,
+                            busy: 2,
+                            refused: 3,
+                        }),
                     };
                     let line = machine_state_line(&s);
                     assert_eq!(parse_machine_state(&line), Some(s.clone()), "{line}");
@@ -1061,6 +1175,31 @@ mod tests {
         assert!(parse_machine_state("universal-control=disabled; policy=off").is_none());
         assert!(parse_machine_state(&full.replace("home=account", "home=elsewhere")).is_none());
         assert!(parse_machine_state("").is_none());
+    }
+
+    /// The "nothing an apply can do" verdict both surfaces show: the split when the record
+    /// has one, "now" while a build holds a dir, and no dangling colon with no split.
+    #[test]
+    fn stay_open_verdict_names_the_split() {
+        assert_eq!(
+            stay_open_verdict(2, None),
+            "nothing an apply can do — 2 cargo target dir(s) stay open to Spotlight"
+        );
+        assert_eq!(
+            stay_open_verdict(2, Some(OpenSplit::default())),
+            "nothing an apply can do — 2 cargo target dir(s) stay open to Spotlight"
+        );
+        assert_eq!(
+            stay_open_verdict(
+                1,
+                Some(OpenSplit {
+                    busy: 1,
+                    ..OpenSplit::default()
+                })
+            ),
+            "nothing an apply can do now — 1 cargo target dir(s) stay open to Spotlight: 1 in \
+             a running build (the next apply retries it)"
+        );
     }
 
     /// The posture derivation: both keys = disabled, one key = partial, neither = the
@@ -1137,6 +1276,7 @@ mod tests {
             scan_complete: true,
             home: HomePosture::Mismatch,
             config_unreadable: false,
+            open: None,
         };
         assert_eq!(s.next(), None);
         // The other refusal: a config that does not parse cannot say whether either

@@ -1,46 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Sparkle-words v2 **supernova** emitters (docs/sparkle-words-v2-design.md §6).
+//! Sparkle-words nova emitters (docs/sparkle-words-v2-design.md §6).
 //!
-//! Everything here is a PURE function of `(t = now − ignition, genome, geometry)`
-//! — no stored phase, no per-frame state (§6.1). The host state machine
-//! (`word_decorations.rs`) owns ignition times, the flash limiter, and the
-//! one-nova-per-episode guard; this module turns a time offset into pixels:
+//! Everything here is a pure function of `(t = now − ignition, genome,
+//! geometry)`, with no stored phase (§6.1). The host (`word_decorations.rs`)
+//! owns ignition times, the flash limiter and the one-nova-per-episode guard;
+//! this module turns a time offset into pixels:
 //!
 //! * **Phase machine** (§6.1): `Armed → Dip → Flash → Ring → Debris → Ember →
-//!   Settled`, all windows fixed except the genome duration `D ∈ 1000..=1400 ms`.
-//! * **Ring + rays** (§6.3, the geometry-invariant budget): the ring is a true
-//!   circle rasterized as **exactly [`RING_BANDS`] row-band chord slabs** (exact
-//!   fixed-count subdivision — band *i* spans `[round(2r·i/30), round(2r·(i+1)/30))`
-//!   — NOT a ceiling step, which would yield 21/25/28 bands across cell sizes and
-//!   falsify the closed form; the §15.14 erratum). One uniform-coverage quad per
-//!   chord per band (the `emit_aa_slab` COVERAGE idiom — coverage × AA fraction
-//!   quantized once into `premul_rgb` — expressly not its 3-part emission shape);
-//!   a chromatic-fringe second ring at `R + chroma` rides the same bands with its
-//!   0.55 coverage folded into the per-band scalar; every quad is split at
-//!   cell-row boundaries by the sink (the mandatory `push_glow_rect` rule).
-//!   Rays step **exactly [`RAY_SAMPLES`] fixed samples** along their major axis
-//!   with `comet_beam`'s 2.5→1 px taper folded into per-sample coverage/width.
-//!   Closed form: `Q ≤ 392` at every cell size (§6.3), pinned by the
-//!   `nova_budget_geometry_invariant` regression below.
-//! * **Spend order** (§6.3): ring first, then rays (inner→outer, so a binding
-//!   cap drops OUTER slices), then the crown only when it fits whole — the crown
-//!   drops first and the ring is never gapped.
+//!   Settled`, windows fixed except the genome duration `D ∈ 1000..=1400 ms`.
+//! * **Ring and rays** (§6.3): the ring is a circle rasterized as exactly
+//!   [`RING_BANDS`] row-band chord slabs (band *i* spans
+//!   `[round(2r·i/30), round(2r·(i+1)/30))`, a fixed count so the closed form
+//!   holds at every cell size), one uniform-coverage quad per chord per band
+//!   (coverage × AA fraction quantized once into `premul_rgb`). A chromatic
+//!   fringe ring at `R + chroma` rides the same bands at 0.55 coverage; the
+//!   sink splits every quad at cell-row boundaries. Rays step exactly
+//!   [`RAY_SAMPLES`] fixed samples along their major axis with `comet_beam`'s
+//!   2.5→1 px taper folded into per-sample coverage/width. Closed form:
+//!   `Q ≤ 392` at every cell size, pinned by `nova_budget_geometry_invariant`.
+//! * **Spend order** (§6.3): ring first, then rays inner→outer (a binding cap
+//!   drops outer slices), then the crown only if it fits whole, so the ring is
+//!   never gapped.
 //! * **Magic variants** (§3.5/§6.1): **Quasar** replaces the rays with 2
-//!   vertical polar jets at doubled length (30 samples each); **Singularity**
+//!   vertical jets at double length (30 samples each); **Singularity**
 //!   time-reverses every radius (the ring contracts, debris falls inward) and
-//!   adds a ≤ 20-cell Over-blend `RingArc` darkening ring on the existing wdeco
-//!   machinery, ending in a dim violet ember.
+//!   adds a ≤ 20-cell Over-blend `RingArc` darkening ring, ending in a dim violet
+//!   ember.
 //! * **Blast coupling** (§6.5): `crossing_ms`/`pulse_env`/`constant_lum_toward`
-//!   give neighboring ink a one-shot ~150 ms chroma pulse at approximately
-//!   constant relative luminance — the |ΔL| ≤ 5 % bound is enforced **by
-//!   construction** (a luminance-matching bisection), asserted over the whole
-//!   deployed color table (8 palettes × every 4-bit hue-nudge code) in tests.
+//!   give neighbouring ink a one-shot ~150 ms chroma pulse at near-constant
+//!   relative luminance; |ΔL| ≤ 5% holds by construction (a luminance-matching
+//!   bisection), tested over all 8 palettes × every 4-bit hue-nudge code.
 //!
-//! Parity: quads are premultiplied `0x00RRGGBB` [`GlowQuad`]s — `premul_rgb`
-//! once host-side, `add_sat` == GPU One/One on the Unorm view (§8); debris and
-//! the Singularity ring ride the existing wdeco Add/Over parity machinery.
+//! Parity: quads are premultiplied `0x00RRGGBB` [`GlowQuad`]s (`premul_rgb`
+//! once host-side, `add_sat` equal to GPU One/One on the Unorm view); debris
+//! and the Singularity ring ride the wdeco Add/Over parity machinery.
 
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, WordDecoration, premul_rgb};
 use aterm_scene::{mix_rgb, smoothstep};
@@ -56,9 +51,8 @@ pub const FLASH_END_MS: u64 = 240;
 pub const RING_END_MS: u64 = 900;
 /// §6.1 debris window start (ms); it ends at the genome duration `D`.
 pub const DEBRIS_START_MS: u64 = 500;
-/// Label boundary between Ember and Settled (ms past `D`): emission is
-/// identical in both (the steady residual spark; zero quads) — Settled is the
-/// honest "the nova stream emits nothing" name once the window is long gone.
+/// Label boundary between Ember and Settled (ms past `D`): both emit the same
+/// (zero quads); Settled names the finished window.
 pub const EMBER_TAIL_MS: u64 = 500;
 
 /// §6.3 fixed ring band count (exact subdivision; the step scales, never this).
@@ -71,27 +65,20 @@ pub const JET_SAMPLES: usize = 30;
 pub const MAX_NOVA_QUADS_PER: usize = 512;
 /// §6.3 caps: concurrent animating novas (excess skips straight to Ember).
 pub const MAX_ACTIVE_NOVAS: usize = 3;
-/// §6.3 caps: the DECORATION producers' backstop on the shared `nova_add`
-/// channel — the ceiling `word_decorations` funds every classic nova and every
-/// supernova under (`MAX_NOVA_QUADS.saturating_sub(nova.len())`). It never binds
-/// on a genome-reachable frame: 3 × 392 = 1176 < 1536 at every cell size.
+/// §6.3 cap: the decoration producers' backstop on the shared `nova_add`
+/// channel (`word_decorations` funds every classic nova and supernova under
+/// `MAX_NOVA_QUADS.saturating_sub(nova.len())`). It never binds on a reachable
+/// frame: 3 × 392 = 1176 < 1536 at every cell size.
 ///
-/// NOT a bound on the channel TOTAL, and never was one. PRISM WAKE
-/// (`crate::output_streak`) is a SECOND producer, and the host appends its
-/// per-pane quads AFTER the decoration pass has finished spending — so they are
-/// neither funded by this budget nor visible to it, and the channel carries
-/// `decoration share + Σ panes streak share` (measured at ~2000 quads on four
-/// 200-column panes). Nothing downstream cares: the consumer
-/// (`aterm_render::Renderer::draw_nova` → `draw_flat_add`) walks the whole slice
-/// with no cap, no fixed buffer and no assert, and the host's channel is a
-/// resident scratch that grows once. Pinned in
-/// `aterm-effects/tests/nova_channel_budget.rs`.
+/// Not a bound on the channel total: prism wake (`crate::output_streak`)
+/// appends its per-pane quads after the decoration pass, outside this budget.
+/// The consumer (`aterm_render::Renderer::draw_nova` → `draw_flat_add`) walks
+/// the whole slice with no cap, and the host's channel is resident scratch.
+/// Pinned in `aterm-effects/tests/nova_channel_budget.rs`.
 pub const MAX_NOVA_QUADS: usize = 1536;
-/// §6.3 crown worst case (4 tapered spike chords + 2 core-beam chords, each
-/// band shorter than one cell ⇒ ≤ 2 row-split quads per chord) — the ≤ 12
-/// crown edge of the ay-CHC `Q ≤ 392` certificate, unchanged by the v2.1
-/// star-glint reshape. The crown is funded LAST and only whole, so it drops
-/// first under a cap.
+/// Crown worst case: 4 tapered spike chords + 2 core-beam chords, each band
+/// shorter than a cell so ≤ 2 row-split quads per chord; the ≤ 12 crown term of
+/// the `Q ≤ 392` bound. The crown is funded last and only whole.
 const CROWN_QUADS: usize = 12;
 /// §6.1 Singularity darkening-ring cell cap (Over-blend `RingArc` wdecos).
 pub const MAX_RING_ARC_CELLS: usize = 20;
@@ -100,15 +87,13 @@ pub const MAX_COUPLING_WORDS: usize = 16;
 /// §6.5 chroma-pulse window (ms) and amplitude cap.
 pub const PULSE_MS: u64 = 150;
 pub const PULSE_AMP: f32 = 0.35;
-/// §6.4 debris twinkle phase grid (ms): mote phases quantize to this shared
-/// grid so the REGION's combined onsets stay ≤ 3/s (per-mote periods alone
-/// would not bound 8–20 out-of-phase motes).
+/// Debris twinkle phase grid (ms): mote phases snap to this shared grid so the
+/// region's combined onsets stay ≤ 3/s (§6.4).
 pub const TWINKLE_GRID_MS: u64 = 350;
 
-/// §6.2 `NOVA_PALETTES[8]` verbatim: `(core, fringe)` as `0x00RRGGBB`,
-/// Gray-indexed (the genome's palette field is already Gray-decoded), so
-/// neighboring indices are similar tints:
-/// solar · ember · rose · violet · ion · plasma · aurora · emerald.
+/// `NOVA_PALETTES[8]` (§6.2): `(core, fringe)` as `0x00RRGGBB`, Gray-indexed so
+/// neighbouring indices are similar tints: solar · ember · rose · violet · ion ·
+/// plasma · aurora · emerald.
 pub const NOVA_PALETTES: [(u32, u32); 8] = [
     (0x00FF_F2C8, 0x00FF_9A3C), // solar
     (0x00FF_D8A0, 0x00FF_5C3C), // ember
@@ -125,11 +110,10 @@ pub fn palette(idx: u8) -> (u32, u32) {
     NOVA_PALETTES[usize::from(idx & 7)]
 }
 
-/// §6.1 phase, a pure function of `(t = now − ignition, D)`. `t < 0` is Armed
-/// (the limiter deferred the Dip start). Ring and Debris overlap in emission
-/// (the ring draws until [`RING_END_MS`] while debris flies from
-/// [`DEBRIS_START_MS`]); the label switches at debris onset. Monotone; no
-/// re-entry without a re-arm (true episode death, §3.6).
+/// The §6.1 phase, a pure function of `(t = now − ignition, D)`. `t < 0` is
+/// Armed (the limiter deferred the Dip). Ring and Debris overlap in emission
+/// (the ring draws until [`RING_END_MS`], debris from [`DEBRIS_START_MS`]); the
+/// label switches at debris onset. Monotone; no re-entry without a re-arm.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NovaPhase {
     Armed,
@@ -154,9 +138,8 @@ pub fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
     }
 }
 
-/// §6.1 Dip: the ink envelope multiplier at `t` — `1 − 0.35·smoothstep(p)`
-/// inside the dip window, `1.0` outside (the indrawn breath rides the ink
-/// channel; it costs no quads).
+/// The Dip's ink envelope multiplier at `t`: `1 − 0.35·smoothstep(p)` inside
+/// the dip window, `1.0` outside (rides the ink channel, no quads).
 pub fn dip_envelope(t_ms: u64) -> f32 {
     if t_ms >= DIP_MS {
         return 1.0;
@@ -170,9 +153,8 @@ pub struct NovaEnv {
     /// Grid extent in px (quads clamp here; the one-band split uses `cell_h`).
     pub grid_w: i32,
     pub grid_h: i32,
-    /// Row advance in px for THIS word's row (2× cell width on DECDWL rows, the
-    /// v1 DEC precedent — the center anchor and debris cells follow the row's
-    /// real advance).
+    /// Row advance in px for this word's row (2× cell width on DECDWL rows);
+    /// the centre anchor and debris cells follow it.
     pub cell_w: i32,
     pub cell_h: i32,
     /// Nova center, px (the word span's visual midpoint, row band center).
@@ -191,34 +173,24 @@ pub struct NovaEnv {
     pub seed: u64,
 }
 
-/// Per-shape quad counts of one [`emit_nova`] call (the §6.3 budget regression
-/// and the spend-order truncation tests read these; the §7.5 ledger's
-/// "Nova emit bound" row names this instrumentation as the runnable-now
-/// companion of the P6 ay-CHC certificate).
+/// Per-shape quad counts of one [`emit_nova`] call, read by the budget
+/// regression and the spend-order truncation tests.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct NovaCounts {
     pub ring: usize,
     pub rays: usize,
     pub crown: usize,
-    /// Major-axis ray samples that emitted ≥ 1 quad this frame, summed over
-    /// all rays. Each ray iterates EXACTLY [`RAY_SAMPLES`] (jets:
-    /// [`JET_SAMPLES`]) fixed samples, so `ray_samples == RAY_SAMPLES · N`
-    /// certifies no sample collapsed (`m1 <= m0`) or quantized to premul 0 —
-    /// the per-ray half of the §6.3/§13 fixed-count invariance regression.
+    /// Ray samples that emitted ≥ 1 quad this frame, summed over rays. Each ray
+    /// iterates exactly [`RAY_SAMPLES`] (jets: [`JET_SAMPLES`]) samples, so
+    /// `ray_samples == RAY_SAMPLES · N` shows no sample collapsed or quantized
+    /// to zero.
     pub ray_samples: usize,
 }
 
-/// A budgeted, grid-clamped, row-band-splitting [`GlowQuad`] sink — the
-/// `push_glow_rect` idiom (`cursor_glow::push_rect` twin) with the §6.3 quad
-/// budget enforced at the single push point, so truncation order is exactly
-/// emission order.
-///
-/// §7.5 ledger, "Nova emit bound (§6.3)" row: the `budget` truncation branch
-/// is the guard that row's P6 ay-CHC certificate (`Q ≤ 392` over the
-/// bounded-increment emit system, A8-shape HORN) will license demoting to
-/// `debug_assert!` + a cold backstop. Until that certificate is green in CI
-/// it stays a live guard — refuse, don't silently pass; the runnable-now
-/// companion is the `nova_budget_geometry_invariant` regression below.
+/// A budgeted, grid-clamped, row-band-splitting [`GlowQuad`] sink (the
+/// `cursor_glow::push_rect` idiom) with the quad budget enforced at the single
+/// push point, so truncation order is emission order. The budget branch stays
+/// a live guard; `nova_budget_geometry_invariant` checks it never binds.
 struct QuadSink<'a> {
     out: &'a mut Vec<GlowQuad>,
     grid_w: i32,
@@ -265,8 +237,8 @@ impl QuadSink<'_> {
     }
 
     /// One uniform-coverage chord quad: fractional x-extent folded into the
-    /// coverage (the `emit_aa_slab` coverage math), quantized ONCE through
-    /// `premul_rgb` — the single rounding point both backends then add.
+    /// coverage, quantized once through `premul_rgb`, the single rounding
+    /// point both backends then add.
     fn chord(&mut self, x0: f32, x1: f32, y0: i32, y1: i32, color: u32, cov: f32) {
         let xi0 = x0.floor() as i32;
         let xi1 = (x1.ceil() as i32).max(xi0 + 1);
@@ -299,13 +271,11 @@ pub fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f32, f32
     Some((r, 1.0 - q))
 }
 
-/// Ring/debris visibility floor (v2.1 polish): the dark palette fringes (ion
-/// `#6c8cff`, emerald `#7cd83c`, …) under-read as additive light on dark
-/// glass at driven intensity — the audit's "dim slate ring" gap against the
-/// demo's bright gold. Lift the fringe's relative luminance to ≥ 0.42 by
-/// stepping it toward the palette's own CORE (never plain white, so the
-/// warm/cool pair identity survives). Bright fringes pass through unchanged;
-/// deterministic (≤ 8 fixed steps), resolved once per emission call.
+/// Ring/debris visibility floor: dark palette fringes (ion `#6c8cff`, emerald
+/// `#7cd83c`, …) under-read as additive light on dark glass, so lift the
+/// fringe's relative luminance to ≥ 0.42 by stepping toward the palette's own
+/// core (never white, keeping the pair's identity). Bright fringes pass
+/// through; deterministic (≤ 8 fixed steps), resolved once per emission.
 pub fn vivid_fringe(core: u32, fringe: u32) -> u32 {
     const FLOOR: f32 = 0.42;
     let mut c = fringe;
@@ -318,9 +288,9 @@ pub fn vivid_fringe(core: u32, fringe: u32) -> u32 {
     c
 }
 
-/// §6.3 band count: exactly [`RING_BANDS`] whenever the vertical extent admits
-/// ≥ 2 px bands (`2r ≥ 60 px`, true from `cell_h = 14` at genome radii); below
-/// that it clamps to `⌊2r/2⌋` — FEWER quads, so the closed form still bounds.
+/// Band count: exactly [`RING_BANDS`] when the extent admits ≥ 2 px bands
+/// (`2r ≥ 60 px`, true from `cell_h = 14` at genome radii); below that
+/// `⌊2r/2⌋`, fewer quads, so the closed form still bounds.
 pub fn ring_band_count(extent_px: f32) -> usize {
     if extent_px >= 2.0 * RING_BANDS as f32 {
         RING_BANDS
@@ -330,10 +300,9 @@ pub fn ring_band_count(extent_px: f32) -> usize {
 }
 
 /// Emit one nova frame's additive quads (crown/ring/rays) in §6.3 spend order.
-/// `budget` is the per-nova cap (callers pass `min(MAX_NOVA_QUADS_PER,
-/// global-remaining)`); the debris and Singularity `RingArc` streams are
-/// separate (they ride the wdeco vec). Pure: same `(t, env, budget)` ⇒ same
-/// quads, byte for byte.
+/// `budget` is the per-nova cap (`min(MAX_NOVA_QUADS_PER, global-remaining)`);
+/// debris and the Singularity `RingArc` are separate wdeco streams. Pure: same
+/// `(t, env, budget)` gives the same quads.
 pub fn emit_nova(t_ms: u64, env: &NovaEnv, budget: usize, out: &mut Vec<GlowQuad>) -> NovaCounts {
     let mut counts = NovaCounts::default();
     let mut sink = QuadSink {
@@ -369,10 +338,10 @@ pub fn emit_nova(t_ms: u64, env: &NovaEnv, budget: usize, out: &mut Vec<GlowQuad
     counts
 }
 
-/// §6.3 ring: exactly-30-band chord slabs over the annulus, plus the chromatic
-/// fringe (a second ring at `R + chroma`, fringe tint, 0.55 coverage folded
-/// into the per-band scalar). ≤ 2 chords per band per ring by circle geometry;
-/// one uniform-coverage quad per chord (row-split by the sink).
+/// The ring: exactly-30-band chord slabs over the annulus plus the chromatic
+/// fringe (a second ring at `R + chroma`, fringe tint, 0.55 coverage). ≤ 2
+/// chords per band per ring; one uniform-coverage quad per chord (row-split by
+/// the sink).
 fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     let thick = env.feats.ring_thick;
     let chroma = env.feats.chroma;
@@ -385,8 +354,8 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     let extent = 2.0 * re;
     let bands = ring_band_count(extent);
     let top = env.cy as f32 - re;
-    // `√fade` holds the shockwave visibly bright through the mid-sweep (the
-    // v2.1 polish audit's "easy to miss mid-ring"); same 1 → 0 endpoints.
+    // `√fade` keeps the shockwave bright through the mid-sweep; same 1 → 0
+    // endpoints.
     let base_cov = (fade.max(0.0).sqrt() * env.intensity).clamp(0.0, 1.0);
     let fringe = vivid_fringe(env.core, env.fringe);
     let cxf = env.cx as f32;
@@ -420,14 +389,12 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     }
 }
 
-/// §6.3 rays: 5–8 genome rays (Quasar: 2 vertical jets, doubled length),
-/// each stepped at exactly [`RAY_SAMPLES`] (jets: [`JET_SAMPLES`]) fixed
-/// samples along its MAJOR axis — sample `j` spans
-/// `[round(Lm·j/N), round(Lm·(j+1)/N))` — with `comet_beam`'s 2.5→1 px taper
-/// folded into per-sample coverage/width (one uniform quad per sample, never
-/// per-pixel stepping). Samples emit inner→outer so a binding budget drops
-/// OUTER slices (§6.3 truncation order). Returns the number of samples that
-/// emitted ≥ 1 quad, summed over all rays ([`NovaCounts::ray_samples`]).
+/// Rays: 5–8 genome rays (Quasar: 2 vertical jets at double length), each
+/// stepped at exactly [`RAY_SAMPLES`] (jets: [`JET_SAMPLES`]) samples along its
+/// major axis (sample `j` spans `[round(Lm·j/N), round(Lm·(j+1)/N))`), with
+/// `comet_beam`'s 2.5→1 px taper folded into per-sample coverage/width. Samples
+/// emit inner→outer so a binding budget drops outer slices. Returns the samples
+/// that emitted ≥ 1 quad, summed over rays ([`NovaCounts::ray_samples`]).
 fn emit_rays(
     sink: &mut QuadSink<'_>,
     env: &NovaEnv,
@@ -519,16 +486,11 @@ fn emit_rays(
     emitted_samples
 }
 
-/// §6.1 crown: a white-hot 4-POINT STAR GLINT over the word center — a hot
-/// horizontal core beam through the word crossed by a tapering vertical
-/// spike, radial falloff and white-heat folded into per-band coverage/width/
-/// tint, ≤ 3×3 cells, envelope `sin(π·e/120)` — one rise-and-fall, never
-/// periodic. ≤ [`CROWN_QUADS`] after row splits (4 spike + 2 beam chords,
-/// each band shorter than one cell ⇒ ≤ 2 row-split quads per chord — the
-/// SAME ≤ 12 bound the §6.3 closed form and the ay-CHC crown edge pin). The
-/// v2.0 shape — K = 3 concentric stacked RECTS — read as nested gray boxes
-/// on glass, not a flash (the v2.1 polish audit); corrected here, same
-/// budget and envelope.
+/// The crown: a white-hot 4-point star glint over the word centre: a hot
+/// horizontal core beam crossed by a tapering vertical spike, with radial
+/// falloff and white heat folded into per-band coverage/width/tint, ≤ 3×3
+/// cells, envelope `sin(π·e/120)` (one rise and fall). ≤ [`CROWN_QUADS`] after
+/// row splits (4 spike + 2 beam chords, ≤ 2 quads each).
 fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     let e = (t_ms.saturating_sub(DIP_MS)) as f32 / (FLASH_END_MS - DIP_MS) as f32;
     let envl = (std::f32::consts::PI * e.clamp(0.0, 1.0)).sin();
@@ -536,9 +498,8 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let r = 1.3 * ch; // spike half-length (inside the ≤ 3-cell extent)
     let beam = 0.30 * ch; // core beam half-height
-    // Vertical spike: 2 tapered bands per side; width, coverage AND
-    // white-heat all fall toward the tips, so it reads as a hot needle
-    // cooling into the palette's warm core tint, not a gray column.
+    // Vertical spike: 2 tapered bands per side; width, coverage and white heat
+    // fall toward the tips, a hot needle cooling into the core tint.
     for (f0, f1) in [(0.0f32, 0.45f32), (0.45, 1.0)] {
         let q = 1.0 - (f0 + f1) * 0.5; // 1 at the beam → 0 at the tip
         let hw = 0.24 * ch * q * q + 0.8;
@@ -569,12 +530,10 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     }
 }
 
-/// §6.1 debris: 8–20 motes on analytic ballistic arcs (the `emit_particles`
-/// math — position is a closed form of age, zero stored state) riding the
-/// EXISTING wdeco Add stream, twinkling on the shared ≥ 350 ms phase grid
-/// (§6.4 item 4). Singularity reverses the arcs: motes fall INWARD from the
-/// rim to the collapse point. Deterministic from `(seed, mote index, t)`.
-/// Appends at most `cap` decorations.
+/// Debris: 8–20 motes on analytic ballistic arcs (position is a closed form of
+/// age) on the wdeco Add stream, twinkling on the shared ≥ 350 ms phase grid
+/// (§6.4). Singularity reverses the arcs: motes fall inward to the collapse
+/// point. Deterministic from `(seed, mote index, t)`. Appends at most `cap`.
 pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap: usize) {
     let d = u64::from(env.feats.duration_ms);
     if !(DEBRIS_START_MS..d).contains(&t_ms) {
@@ -623,9 +582,8 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
                 env.cy as f32 + vy * age + 0.5 * g * age * age,
             )
         };
-        // §6.4: twinkle phase LOCKED to the shared ≥ 350 ms grid — each mote's
-        // phase is 0 or TWINKLE_GRID_MS of the 2·grid period, so the region's
-        // combined onsets stay ≤ 3/s.
+        // Twinkle phase locked to the shared grid: each mote's phase is 0 or
+        // TWINKLE_GRID_MS of the 2·grid period, so combined onsets stay ≤ 3/s.
         let grid_phase = ((s >> 33) & 1) as f32 * 0.5;
         let tw = 0.35
             + 0.65
@@ -638,12 +596,9 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         if alpha <= 0.01 {
             continue;
         }
-        // OFF-GRID MOTES ARE CULLED, exactly as the supernova sibling culls
-        // its debris (supernova.rs `emit_super_decos`): the clamp below can
-        // only pin a cell index, and the residual then lands in dx/dy — whose
-        // contract is SUB-CELL jitter — so a mote past the grid edge rendered
-        // its star inside the window padding gutters, a region every quad
-        // stream is clamped away from (2026-09-01 audit).
+        // Off-grid motes are culled, as supernova debris is: clamping would
+        // pin only the cell index and push the residual into dx/dy (whose
+        // contract is sub-cell jitter), drawing into the padding gutters.
         if x < 0.0 || y < 0.0 || x >= env.grid_w as f32 || y >= env.grid_h as f32 {
             continue;
         }
@@ -668,11 +623,10 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     }
 }
 
-/// §6.1 Singularity darkening ring: ≤ [`MAX_RING_ARC_CELLS`] per-cell
-/// Over-blend [`DecoGlyph::RingArc`] wdecos on the cells the contracting ring
-/// passes through — `nova_add` is One/One additive and can only brighten, so
-/// the darkening rides the existing `wdeco_over` parity machinery. Row-major
-/// deterministic; appends nothing outside the ring window.
+/// The Singularity darkening ring: ≤ [`MAX_RING_ARC_CELLS`] per-cell Over
+/// [`DecoGlyph::RingArc`] wdecos on the cells the contracting ring crosses
+/// (`nova_add` is additive and can only brighten). Row-major and
+/// deterministic; nothing outside the ring window.
 pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap: usize) {
     let Some((r, fade)) = ring_radius(t_ms, env.r_max, true) else {
         return;
@@ -718,10 +672,9 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
 
 // ───────────────────────── §6.5 blast coupling ─────────────────────────
 
-/// The frame the expanding (or contracting) ring first crosses distance
-/// `dist` px from the nova center, in ms since ignition — the analytic
-/// inverse of [`ring_radius`]'s ease-out, so the pulse is a pure function of
-/// `(nova center, t, span)` with no stored state. `None` when the ring never
+/// When the expanding (or contracting) ring first crosses `dist` px from the
+/// centre, in ms since ignition: the analytic inverse of [`ring_radius`]'s
+/// ease-out, so the pulse needs no stored state. `None` when the ring never
 /// reaches `dist`.
 pub fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
     if !(0.0..=r_max).contains(&dist) || r_max <= 0.0 {
@@ -747,13 +700,12 @@ pub fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
     Some(smoothstep((2.0 * e.min(1.0 - e)).clamp(0.0, 1.0)))
 }
 
-/// §6.5's constant-luminance pairing, BY CONSTRUCTION: take `target`'s hue and
-/// saturation, then bisect value (and, when the hue can't reach a bright
-/// anchor at full value, saturation toward white) until the result's WCAG
-/// relative luminance matches `anchor`'s. Monotone in both knobs ⇒ the
-/// bisection converges; |ΔL| ≤ 5 % then holds for every (anchor, palette)
-/// pair — including every genome-hue-nudged anchor — which the §13 table test
-/// asserts numerically.
+/// Constant-luminance pairing by construction: take `target`'s hue and
+/// saturation, then bisect value (and, where the hue cannot reach a bright
+/// anchor at full value, saturation toward white) until the WCAG relative
+/// luminance matches `anchor`'s. Both knobs are monotone, so the bisection
+/// converges and |ΔL| ≤ 5% holds for every (anchor, palette) pair, as the table
+/// test checks.
 pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
     let want = relative_luminance(anchor);
     let (h, s, _) = rgb2hsv(target);
@@ -784,14 +736,11 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
     hsv2rgb(h, 0.5 * (lo + hi), 1.0)
 }
 
-/// The applied §6.5 pulse color: the anchor's hue/saturation shifted toward
-/// the palette `fringe` at amplitude `amp` (≤ [`PULSE_AMP`]), then
-/// luminance-matched BACK to the anchor — a hue/sat shift at approximately
-/// constant relative luminance, |ΔL| ≤ 5 % **by construction** (the bisection
-/// is the enforcement; the §13 table test measures it ≈ 0 over the whole
-/// deployed space). Gamma-space mixing alone would bow the luminance ~5 %
-/// above the bound on bright anchors, which is exactly why the match runs on
-/// the MIXED color, not just the tone endpoint.
+/// The applied pulse colour: the anchor's hue/saturation shifted toward
+/// `fringe` at amplitude `amp` (≤ [`PULSE_AMP`]), then luminance-matched back
+/// to the anchor, so |ΔL| ≤ 5% by construction. The match runs on the mixed
+/// colour because gamma-space mixing alone bows luminance past the bound on
+/// bright anchors.
 pub fn pulse_color(anchor: u32, fringe: u32, amp: f32) -> u32 {
     constant_lum_toward(anchor, mix_rgb(anchor, fringe, amp.clamp(0.0, PULSE_AMP)))
 }
@@ -848,41 +797,30 @@ mod tests {
         }
     }
 
-    /// §6.3/§13/§7.4 budget invariance (the v2.1 regression, robust form —
-    /// the deliberate replacement for U1's flaky "equal quad counts", §15.14):
-    /// at ch ∈ {14, 20, 40, 56} with the genome-max feature set,
+    /// Budget invariance at ch ∈ {14, 20, 40, 56} with the genome-max features:
     ///
-    ///   * band count == 30 (the emitter's own exact subdivision),
-    ///   * ray samples == 15 **per ray** (counted from the emission: every
-    ///     one of the 8 rays' 15 fixed samples emitted ≥ 1 quad),
-    ///   * total quads ≤ 392 at EVERY phase instant of the window,
-    ///   * the caps never bind: the per-nova 512 cap emission is
-    ///     byte-identical to an unbounded-budget emission, and
-    ///     3 × worst < 1536 (the global backstop, checked at compile time).
+    ///   * band count == 30,
+    ///   * 15 ray samples per ray (all 8 rays' samples emit ≥ 1 quad),
+    ///   * total quads ≤ 392 at every phase instant,
+    ///   * the caps never bind: the 512-capped emission equals the unbounded
+    ///     one, and 3 × worst < 1536 (checked at compile time).
     ///
-    /// Every counted number is printed in the assertion message, so a failure
-    /// shows the real geometry, not just a boolean. §7.5 ledger row "Nova
-    /// emit bound (§6.3)": this regression is the runnable-now companion of
-    /// the P6 ay-CHC certificate (Q ≤ 392 over the bounded-increment emit
-    /// system); until that certificate is green in CI, the [`QuadSink`]
-    /// truncation branch keeps its guard (refuse-don't-silently-pass).
+    /// Assertion messages print every counted number.
     #[test]
     fn nova_budget_geometry_invariant() {
         assert_eq!(RAY_SAMPLES, 15);
         for ch in [14i32, 20, 40, 56] {
             let env = env_at(ch, None);
-            // Exact subdivision keeps the count at 30 at every admitted size
-            // (a ⌈2r/30⌉ ceiling step would give 21/25/28 here — the §15.14
-            // binding-spec erratum this assertion pins).
+            // Exact subdivision keeps 30 bands at every admitted size (a
+            // ⌈2r/30⌉ ceiling step would give 21/25/28).
             let extent = 2.0 * (env.r_max + env.feats.chroma + 0.5 * env.feats.ring_thick);
             let bands = ring_band_count(extent);
             assert_eq!(
                 bands, 30,
                 "band count must be exactly 30 at ch={ch} (extent {extent:.1} px), counted {bands}"
             );
-            // Per-ray fixed samples, counted from the emission at the late
-            // ring (max ray length ⇒ every sample spans ≥ 1 px): 8 rays ×
-            // exactly 15 samples each, none collapsed, none quantized away.
+            // Per-ray fixed samples, counted at the late ring (max ray length,
+            // every sample ≥ 1 px): 8 rays × 15 samples, none lost.
             let mut late = Vec::new();
             let cl = emit_nova(860, &env, MAX_NOVA_QUADS_PER, &mut late);
             let nrays = usize::from(env.feats.rays);
@@ -952,9 +890,8 @@ mod tests {
         const { assert!(MAX_ACTIVE_NOVAS * 392 <= MAX_NOVA_QUADS) };
     }
 
-    /// §6.3 spend-order truncation: under a binding cap the ring is NEVER
-    /// gapped (its count matches the uncapped emission), rays lose their OUTER
-    /// slices, and the crown drops first (all-or-nothing).
+    /// Spend-order truncation: under a binding cap the ring is never gapped,
+    /// rays lose their outer slices, and the crown drops first, whole.
     #[test]
     fn spend_order_truncation_ring_first_crown_drops() {
         let env = env_at(20, None);
@@ -1016,9 +953,8 @@ mod tests {
         assert!((dip_envelope(120) - 1.0).abs() < 1e-6);
     }
 
-    /// §6.5 coupling determinism + the crossing inverse: same inputs ⇒ same
-    /// crossing frame; monotone in distance; the Singularity inverts (larger
-    /// distances cross EARLIER on a contracting ring).
+    /// Coupling determinism and the crossing inverse: same inputs give the same
+    /// crossing frame, monotone in distance, and inverted for the Singularity.
     #[test]
     fn coupling_crossing_is_deterministic_and_monotone() {
         let rm = 44.0f32;
@@ -1049,13 +985,10 @@ mod tests {
         assert!(pulse_env(450, 300).is_none());
     }
 
-    /// §6.4 item 7 / §13 `delta_L_bound_over_palette_table`: |ΔL| ≤ 5 % holds
-    /// for EVERY (ink anchor, nova palette) pair over the DEPLOYED color space
-    /// — every class base anchor and every palette endpoint anchor, under
-    /// every 4-bit hue-nudge code (16 per anchor ⇒ the full 256-code ink-pair
-    /// field is covered pairwise), toward every palette's fringe — both for
-    /// the paired tone itself and for the ≤ 0.35-amplitude mix actually
-    /// applied; plus the saturated-red check.
+    /// |ΔL| ≤ 5% for every (ink anchor, nova palette) pair over the deployed
+    /// colour space: every class base anchor and palette endpoint, under every
+    /// 4-bit hue-nudge code, toward every palette fringe, for the paired tone
+    /// and for the ≤ 0.35-amplitude mix applied; plus a saturated-red check.
     #[test]
     fn delta_l_bound_over_palette_table() {
         use crate::color_math::hue_nudge;
@@ -1102,9 +1035,8 @@ mod tests {
         }
     }
 
-    /// §6.1 Quasar smoke: rays are replaced by 2 vertical jets — every ray-
-    /// phase quad outside the ring annulus hugs the center column — at doubled
-    /// length (jets reach ~2× the ring radius) with ≤ 60 quads per jet.
+    /// Quasar: rays are replaced by 2 vertical jets hugging the centre column
+    /// outside the ring annulus, reaching ~2× the ring radius, ≤ 60 quads each.
     #[test]
     fn quasar_jets_are_vertical_and_doubled() {
         let env = env_at(20, Some(NovaMagic::Quasar));
@@ -1149,9 +1081,8 @@ mod tests {
         );
     }
 
-    /// §6.1 Singularity smoke: the ring CONTRACTS (radius shrinks over the
-    /// window) and the darkening ring emits ≤ 20 per-cell Over RingArc wdecos
-    /// that follow it inward.
+    /// Singularity: the ring contracts, and the darkening ring emits ≤ 20
+    /// per-cell Over RingArc wdecos following it inward.
     #[test]
     fn singularity_contracts_and_darkens() {
         let env = env_at(20, Some(NovaMagic::Singularity));
@@ -1212,11 +1143,8 @@ mod tests {
             out.len()
         );
         assert!(out.iter().all(|d| matches!(d.blend, DecoBlend::Add)));
-        // Phase-grid lock: with the envelope factored per-mote at two instants
-        // half a grid apart, each mote's twinkle multiplier must land on one
-        // of exactly two grid phases — verified structurally: the per-mote
-        // phase bit yields at most 2 distinct alpha values at fixed t for
-        // motes sharing fade (same t) and intensity, modulo the color mix.
+        // Phase-grid lock: at fixed t, motes sharing fade and intensity show at
+        // most 2 distinct twinkle phases (modulo the colour mix).
         let phases: std::collections::BTreeSet<u64> = (0..u64::from(env.feats.debris))
             .map(|m| (mix(env.seed ^ m.wrapping_mul(0xA24B_AED4_963E_E407)) >> 33) & 1)
             .collect();

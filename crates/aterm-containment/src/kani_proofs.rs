@@ -4,12 +4,9 @@
 
 //! Kani bounded model checking proofs for the containment policy mapping.
 //!
-//! These harnesses are `#[cfg(kani)]`-gated (the module itself is declared
-//! under `#[cfg(kani)]` in `lib.rs`), so a plain `cargo build`/`cargo test`
-//! COMPILES THEM OUT ENTIRELY and discharges nothing. They are discharged only
-//! by trust-mc run deliberately via the opt-in `scripts/verify-kani-proofs.sh`;
-//! the unit tests in `policy.rs` and `mode.rs` pin the same table in the default
-//! test lane. The properties:
+//! `#[cfg(kani)]`-gated, so ordinary builds and tests compile them out; they
+//! run only via the opt-in `scripts/verify-kani-proofs.sh` (trust-mc). The unit
+//! tests in `policy.rs` and `mode.rs` pin the same table. Properties:
 //! - Mode ordering agrees with the numeric level
 //! - Capabilities match mode (policy consistency)
 //! - Monotonic capabilities (downgrade never increases any capability)
@@ -64,12 +61,10 @@ fn mode_ordering_matches_level_encoding() {
 
 /// For every mode, the policy functions return exactly the documented values
 /// for all 4 × 3 = 12 mappings.
-// Asserted via the per-field policy functions directly (not `caps.field as u8`):
-// `capabilities(mode)` is `Capabilities { network: network(mode), .. }` by
-// construction, so the obligation is identical, but trust-mc drops the enum-field
-// discriminant on a `field as u8` cast of a struct returned from an enum-arg fn
-// (`loaded-aggregate-extract-field`). Three fields stay under the ≤4-per-harness
-// bound that keeps AY's symbolic-mode blowup well inside the cap.
+// Asserted via the per-field policy functions rather than `caps.field as u8`:
+// trust-mc drops the enum discriminant on such a cast of a struct returned
+// from an enum-arg fn (`loaded-aggregate-extract-field`). Three fields keep
+// the harness within the symbolic-mode bound.
 #[kani::proof]
 fn capabilities_match_mode_policy() {
     let level: u8 = kani::any();
@@ -108,11 +103,9 @@ fn capabilities_match_mode_policy() {
 // Property 3: Monotonic capabilities (MonotonicCapabilities)
 // -----------------------------------------------------------------------
 
-/// For any two modes where `lower <= higher`, every capability of
-/// `lower` is ≤ the corresponding capability of `higher`.
-///
-/// Capabilities only decrease when mode decreases. This proves the contrapositive: no single capability can increase when
-/// mode decreases.
+/// For any two modes where `lower <= higher`, every capability of `lower` is
+/// ≤ the corresponding capability of `higher`: no capability increases when
+/// the mode decreases.
 #[kani::proof]
 fn monotonic_capabilities_for_all_mode_pairs() {
     let a: u8 = kani::any();
@@ -161,11 +154,8 @@ fn containment_mode_is_maximally_restrictive() {
 // Property 5: Non-escalation — downgrade never increases any capability
 // -----------------------------------------------------------------------
 
-/// For any pair of modes where `from > to` (downgrade), every capability
-/// of the target mode is strictly ≤ the source mode. No escalation possible
-/// through mode downgrade.
-///
-/// NonEscalation — mode can NEVER increase in capability.
+/// For any pair of modes where `from > to` (downgrade), every capability of
+/// the target mode is ≤ the source mode's (`NonEscalation`).
 #[kani::proof]
 fn downgrade_never_escalates_any_capability() {
     let from: u8 = kani::any();

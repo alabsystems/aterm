@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared by `bridge_e2e.rs`: one guarded broker, one headless aterm, one real
-//! bridge child between them, and the bounded waits that keep the whole thing
-//! deterministic.
+//! Shared by the `world` suite and `two_nodes_sealed.rs`: one guarded broker,
+//! one headless aterm, one real bridge child between them, and the bounded
+//! waits that keep the whole thing deterministic.
 //!
 //! Every suite in `tests/` mounts this file, so it carries NO `#[test]` of its own:
 //! one would run once per mounting binary. Its self-tests live in
-//! `tests/harness_self.rs`, which runs them once.
+//! `tests/world/harness_self.rs`, which runs them once.
 //!
 //! NOTHING HERE SLEEPS AS SYNCHRONISATION. Every wait is `until <observable
 //! state>`, bounded by [`DEADLINE`] — and that bound is a HANG DETECTOR, not a
@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use astream_broker::{Broker, BrokerHandle, Client};
 use aterm_link::ctl::{Ctl, Reply};
@@ -31,12 +31,7 @@ pub const SECRET: &[u8] = b"a3-bridge-e2e-secret";
 pub const FLEET: &str = "f1";
 
 /// The ceiling on every wait. Generous on purpose — see the module note.
-pub const DEADLINE: Duration = Duration::from_secs(60);
-
-/// How long a poll waits between observations of a process's state. Not a
-/// synchronisation primitive: the assertion is the OBSERVATION, and this only
-/// keeps the poll from spinning a core.
-const POLL_GAP: Duration = Duration::from_millis(10);
+pub const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD. Every path here is built
 /// short enough with margin, and this is the check that says so out loud rather
@@ -67,23 +62,7 @@ pub fn until<T>(what: &str, f: impl FnMut() -> Option<T>) -> T {
 /// USE IT ONLY WHERE THE PERIOD IS REAL, and say which one in the call. It is
 /// still a hang detector: nothing here sleeps as synchronisation, and a bridge
 /// that never publishes still fails, just later.
-///
-/// # Panics
-///
-/// After `budget`, naming what was being waited for.
-pub fn until_within<T>(budget: Duration, what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + budget;
-    loop {
-        if let Some(v) = f() {
-            return v;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {budget:?} waiting for: {what}"
-        );
-        std::thread::sleep(POLL_GAP);
-    }
-}
+pub use aterm_spec::wait::until_within;
 
 /// The budget for something the bridge's periodic backstop publishes.
 ///
@@ -93,6 +72,38 @@ pub fn until_within<T>(budget: Duration, what: &str, mut f: impl FnMut() -> Opti
 /// milliseconds. It is [`DEADLINE`]'s argument applied to a slower clock: the
 /// only thing the number decides is how long a WEDGED run takes to be named.
 pub const PERIODIC_DEADLINE: Duration = Duration::from_secs(180);
+
+/// The bound on ONE control-verb reply: [`DEADLINE`] for the verb's own wait
+/// (`--wait=60000`, `--wait-ack=60000`, `timeout=60000` — each a minute's hang
+/// detector of its own) plus [`DEADLINE`] for the reply. A HANG DETECTOR like
+/// every other bound here: an instance that accepts a connection and never
+/// answers fails the test naming the verb, instead of holding its live slot for
+/// ever.
+pub const VERB_DEADLINE: Duration = Duration::from_secs(2 * DEADLINE.as_secs());
+
+/// Connect to an instance's control socket and authenticate, with every read
+/// and write on the connection bounded by `bound`. `Ctl`'s reader half is a
+/// `dup` of the same socket, so the socket's timeouts bound it too.
+///
+/// # Errors
+///
+/// The connect, the write of the token, or setting a timeout.
+pub fn connect_within(sock: &str, token: &str, bound: Duration) -> std::io::Result<Ctl> {
+    let ctl = Ctl::connect(sock, token)?;
+    ctl.get_ref().set_read_timeout(Some(bound))?;
+    ctl.get_ref().set_write_timeout(Some(bound))?;
+    Ok(ctl)
+}
+
+/// [`connect_within`] at [`VERB_DEADLINE`] — the connection every test verb goes
+/// over.
+///
+/// # Errors
+///
+/// As [`connect_within`].
+pub fn connect(sock: &str, token: &str) -> std::io::Result<Ctl> {
+    connect_within(sock, token, VERB_DEADLINE)
+}
 
 /// How many full stacks may be COMING UP at once inside one test binary.
 ///
@@ -137,8 +148,6 @@ impl Drop for BootPermit {
     }
 }
 
-/// Take a boot permit, waiting for one if [`max_concurrent_boots`] are already
-/// out.
 /// Refuse to start on a machine that is still running a PREVIOUS run's daemons.
 ///
 /// Every world here spawns real `aterm-gui --headless` and `aterm-link serve` children.
@@ -166,12 +175,9 @@ impl Drop for BootPermit {
 /// * OF THIS CHECKOUT ([`this_checkouts`]): every daemon this harness starts runs a
 ///   binary of this checkout's own build ([`gui_binary`], cargo's `aterm-link`) — in any
 ///   target dir of its tree (`target/`, `target-gui/`, …: a killed run of ANY lane
-///   leaves one behind), or out of tree where `$CARGO_TARGET_DIR` put this run's. Until
-///   2026-09-27 the rule read only the executable's NAME, so another worktree's live
-///   suite — its own `aterm-gui --headless`, from its own `target/` — answered COULD
-///   NOT RUN here, and parallel sessions (several work this repo at once, each in its
-///   own worktree) had to switch the guard off to run at all. A worktree NESTED in this
-///   checkout is another checkout, and its daemons are its own.
+///   leaves one behind), or out of tree where `$CARGO_TARGET_DIR` put this run's. Another
+///   worktree's live suite is not a stray here; a worktree NESTED in this checkout is
+///   another checkout, and its daemons are its own.
 ///
 /// `$ATERM_LINK_ALLOW_STRAYS=1` opts out, for the one honest case left — a developer
 /// deliberately running two suites at once IN ONE CHECKOUT and willing to read the
@@ -183,9 +189,8 @@ fn refuse_a_dirty_machine() {
     // indistinguishable from a previous run's by `pgrep` alone — asking every time
     // turns a correct guard into one that fails its own suite. At the first boot
     // nothing of this run exists yet, so anything alive then is genuinely someone
-    // else's. The ANSWER is kept (2026-09-23): until then only the first boot
-    // refused and every later world booted beside the strays, so the rest of the
-    // binary measured them after all and its reds read as findings.
+    // else's. The ANSWER is kept so every later world refuses too, rather than
+    // booting beside the strays.
     static STRAYS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(strays) = STRAYS.get_or_init(strays_now) else {
         return;
@@ -212,7 +217,7 @@ fn refuse_a_dirty_machine() {
 /// and was filtered away, and the stray count was unconditionally zero — a guard that
 /// could not fire, shipped as a guard. It survived because a guard that never fires
 /// and a machine that is always clean look identical from the outside. Hence
-/// `self_check_age_reader` (`tests/harness_self.rs`), which asserts this function can
+/// `self_check_age_reader` (`tests/world/harness_self.rs`), which asserts this function can
 /// read a real process.
 ///
 /// `etime` is POSIX and prints `[[dd-]hh:]mm:ss`.
@@ -255,8 +260,7 @@ pub fn process_command(pid: &str) -> String {
 /// running it — and elsewhere the first text mapping `lsof` names, the executable's own
 /// vnode. NOT `ps -o comm=`: on macOS that is the name the process was started BY — a
 /// bare `aterm-gui` when a PATH search found it, `target/debug/aterm-gui` when a
-/// relative path did — which says nothing of whose build it is (measured 2026-09-27: a
-/// stray started as `target-gui/…/aterm-gui` read as nobody's).
+/// relative path did — which says nothing of whose build it is.
 pub fn process_exe(pid: &str) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -343,11 +347,9 @@ pub fn is_stray(
 /// than guessing).
 ///
 /// A DAEMON IS THE BINARY, NOT A MENTION OF IT. `pgrep -f` matches the whole command
-/// line, so a shell whose script merely NAMES a pattern matched too: on 2026-09-26
-/// another session's `zsh -c '... pgrep -f 'aterm-gui --headless' ...'` wait loop read
-/// as three stray daemons, and every e2e suite here answered COULD NOT RUN on a
-/// machine running no daemon at all. So a candidate counts only when its executable is
-/// the pattern's own binary — and, since 2026-09-27, THIS checkout's build of it.
+/// line, so a shell whose script merely NAMES a pattern (another session's `pgrep -f`
+/// wait loop) matches too. A candidate counts only when its executable is the
+/// pattern's own binary, and THIS checkout's build of it.
 fn strays_now() -> Option<String> {
     if std::env::var_os("ATERM_LINK_ALLOW_STRAYS").is_some() {
         return None;
@@ -391,8 +393,160 @@ fn strays_now() -> Option<String> {
     (!strays.is_empty()).then(|| strays.join(", "))
 }
 
+/// How many TESTS may hold live stacks at once inside one test binary.
+///
+/// [`max_concurrent_boots`] bounds the interval where stacks are coming up; this
+/// bounds how many are UP. In one binary every stack test is eligible at once,
+/// up to libtest's thread count, beside scenarios that hold an outage open or
+/// let a deadline pass on the wall clock (`receipt_edge_cases.rs`). Measured at
+/// load ~40 on 18 cores (2026-09-23): uncapped, 12 headless guis at peak and a
+/// red `exactly_once::post_key_is_exactly_once_across_a_bridge_and_a_broker_restart`
+/// ("ERR fabric stalled") that passes alone; capped, 9 at peak and 3 of 3 green.
+/// So the cap is half the cores, never more than 11 (the most any one suite
+/// file holds).
+fn max_live_stack_tests() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 11))
+}
+
+/// The gate [`take_live_slot`] hands out: how many tests hold a slot, and who waits.
+///
+/// SERVED IN NAME ORDER, NOT WAKE ORDER (2026-10-05). A bare condvar wakes
+/// whichever waiter the scheduler picks, so at the binary's start the tests
+/// libtest launches together (fourteen in the gate) raced for the slots, and the
+/// suite's long pole — sorted first on purpose (`tests/world/main.rs`) — waited
+/// 3.1 s of a 35.0 s run behind tests started beside it. libtest names each
+/// test's thread after the test, so a slot goes to the waiting test whose name
+/// sorts first: the order libtest starts the tests in is the order they get
+/// stacks.
+#[derive(Default)]
+struct LiveGate {
+    /// Tests holding a slot.
+    held: usize,
+    /// `(thread name, arrival)` of every test waiting for one, least served
+    /// first; the arrival keeps two unnamed threads apart.
+    waiting: std::collections::BTreeSet<(String, u64)>,
+    arrivals: u64,
+}
+
+fn live_gate() -> &'static (std::sync::Mutex<LiveGate>, std::sync::Condvar) {
+    static GATE: std::sync::OnceLock<(std::sync::Mutex<LiveGate>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default)
+}
+
+/// A test thread's claim on one of [`max_live_stack_tests`] slots.
+///
+/// PER TEST, NOT PER STACK: a test that boots two worlds, or a fleet's second
+/// node, takes one slot for all of them, so a test holding a slot never waits on
+/// another slot (no test can wedge the binary half-booted). The slot lives in a
+/// thread-local and is released when the thread exits — libtest runs each test
+/// on its own thread, and a panicking test's thread still exits, so a failure
+/// gives its slot back.
+struct LiveSlot;
+
+impl Drop for LiveSlot {
+    fn drop(&mut self) {
+        let (lock, cv) = live_gate();
+        let mut gate = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate.held = gate.held.saturating_sub(1);
+        // ALL: only the waiting name that sorts first may take it, and it is not
+        // the one a `notify_one` would pick.
+        cv.notify_all();
+    }
+}
+
+thread_local! {
+    static LIVE_SLOT: std::cell::RefCell<Option<LiveSlot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A test's place in the [`LiveGate`] queue, taken by [`queue_for_live_slot`]
+/// and given back when dropped — so a test that panics before its turn (the
+/// stray refusal) never leaves a name the rest of the binary waits behind.
+struct Queued(Option<(String, u64)>);
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        if let Some(me) = self.0.take() {
+            let (lock, cv) = live_gate();
+            let mut gate = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            gate.waiting.remove(&me);
+            cv.notify_all();
+        }
+    }
+}
+
+/// Join the live-slot queue under this test's name, or `None` when the calling
+/// test already holds a slot (idempotent per thread).
+fn queue_for_live_slot() -> Option<Queued> {
+    if LIVE_SLOT.with(|s| s.borrow().is_some()) {
+        return None;
+    }
+    let (lock, _) = live_gate();
+    let mut gate = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gate.arrivals += 1;
+    let me = (
+        std::thread::current()
+            .name()
+            .unwrap_or_default()
+            .to_string(),
+        gate.arrivals,
+    );
+    gate.waiting.insert(me.clone());
+    Some(Queued(Some(me)))
+}
+
+/// Wait for the queued test's turn and a free slot ([`max_live_stack_tests`]),
+/// then hold it for the rest of the test.
+fn take_live_slot(mut queued: Queued) {
+    let me = queued.0.take().expect("a queued test holds its place");
+    let (lock, cv) = live_gate();
+    let cap = max_live_stack_tests();
+    let mut gate = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while gate.held >= cap || gate.waiting.first() != Some(&me) {
+        gate = cv
+            .wait(gate)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    gate.waiting.remove(&me);
+    gate.held += 1;
+    drop(gate);
+    // The next name in order may find a slot still free.
+    cv.notify_all();
+    LIVE_SLOT.with(|s| *s.borrow_mut() = Some(LiveSlot));
+}
+
+/// Take a boot permit, waiting for one if [`max_concurrent_boots`] are already
+/// out. The calling test first takes its live slot ([`take_live_slot`]) —
+/// always before a boot permit, never while holding one, so the two gates
+/// cannot deadlock.
+///
+/// IT QUEUES BEFORE THE STRAY CHECK. The first test to get here runs
+/// [`refuse_a_dirty_machine`]'s `pgrep`/`ps`/`lsof` walk while every test
+/// libtest launched beside it blocks on its answer, then all of them are let
+/// go at once; queued first, they are already in [`LiveGate`]'s name order
+/// when that happens, rather than in whatever order the release wakes them.
+///
+/// AND IT RESOLVES THE BINARY BEFORE IT TAKES ANYTHING. [`gui_binary`]'s stale
+/// guard may wait up to [`RELINK_PATIENCE`] for a racing link; that verdict is
+/// reached once per process while the test holds only its place in the queue,
+/// never inside a permit (a stale binary would otherwise hold every permit for
+/// five minutes per boot), and a stale binary fails every boot at once.
 pub fn boot_permit() -> BootPermit {
+    let queued = queue_for_live_slot();
     refuse_a_dirty_machine();
+    let _ = gui_binary();
+    if let Some(queued) = queued {
+        take_live_slot(queued);
+    }
     let (lock, cv) = boot_gate();
     let cap = max_concurrent_boots();
     let mut n = lock
@@ -405,6 +559,131 @@ pub fn boot_permit() -> BootPermit {
     }
     *n += 1;
     BootPermit
+}
+
+/// A child killed and reaped when dropped, so a bounded wait on it that fails
+/// never leaves it running. A kill after a normal exit is a no-op: `Child`
+/// knows it was reaped.
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Read `pipe` to its end on a thread of its own, so the read can be bounded.
+fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// `cmd.output()` with its waits bounded by [`DEADLINE`] — the exit, and then
+/// each pipe's end — for a child CLI a test runs to completion. stdin is
+/// `/dev/null`, as `output` makes it.
+///
+/// `Command::output` waits for ever: a CLI that wedged parked its test, and the
+/// live slot that test held, for the rest of the run. Every wait the CLIs these
+/// suites drive make of their own is seconds, so a minute is pure slack; a
+/// child still running at the deadline is killed and the test fails naming
+/// `what`.
+///
+/// # Panics
+///
+/// The spawn failed, the child outlived [`DEADLINE`], or a pipe stayed open a
+/// [`DEADLINE`] past its exit (a process it started still holds it).
+pub fn output_within(cmd: &mut Command, what: &str) -> std::process::Output {
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+    wait_output_within(child, what)
+}
+
+/// `child.wait_with_output()` with its waits bounded by [`DEADLINE`], as
+/// [`output_within`] bounds them: for a child the test spawned itself because
+/// it needed more than `output` gives (a piped stdin it writes and closes
+/// first). A piped stdout or stderr is read to its end; one not piped answers
+/// empty. A child still running at the deadline is killed and the test fails
+/// naming `what`.
+///
+/// # Panics
+///
+/// The child outlived [`DEADLINE`], or a pipe stayed open a [`DEADLINE`] past
+/// its exit (a process it started still holds it).
+pub fn wait_output_within(child: Child, what: &str) -> std::process::Output {
+    let mut child = Reaped(child);
+    let stdout = child.0.stdout.take().map(drain);
+    let stderr = child.0.stderr.take().map(drain);
+    let status = until(&format!("{what} to exit"), || {
+        child.0.try_wait().ok().flatten()
+    });
+    let read = |rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>, pipe: &str| {
+        rx.map_or_else(Vec::new, |rx| {
+            rx.recv_timeout(DEADLINE).unwrap_or_else(|_| {
+                panic!("{what} exited ({status}) but its {pipe} stayed open past {DEADLINE:?}")
+            })
+        })
+    };
+    std::process::Output {
+        status,
+        stdout: read(stdout, "stdout"),
+        stderr: read(stderr, "stderr"),
+    }
+}
+
+/// A broker client on `sock` whose every read and write is bounded by
+/// [`VERB_DEADLINE`] — a HANG DETECTOR, like [`connect`]'s: a broker that
+/// accepts and never answers fails the test at the call that waited, instead
+/// of parking it, and the live slot it holds, for ever.
+///
+/// # Panics
+///
+/// The connect, or setting a timeout, failed.
+pub fn broker_client(sock: impl AsRef<Path>) -> Client {
+    let sock = sock.as_ref();
+    let s = std::os::unix::net::UnixStream::connect(sock)
+        .unwrap_or_else(|e| panic!("connect to the broker at {}: {e}", sock.display()));
+    s.set_read_timeout(Some(VERB_DEADLINE))
+        .and_then(|()| s.set_write_timeout(Some(VERB_DEADLINE)))
+        .expect("bound the broker connection");
+    Client::from_stream(s)
+}
+
+/// The first line `child` prints on its (piped) stdout — a readiness line —
+/// bounded by [`DEADLINE`]. A child that prints nothing by then is killed and
+/// the test fails naming `what`; one that exits first answers an empty line,
+/// which the caller's assertion on the line then names.
+///
+/// The pipe is CLOSED after that one line, the way a supervisor's readiness
+/// probe may close it: a child that dies writing a later line has a bug of its
+/// own (`fabric_cli::a_broker_whose_stdout_reader_left_keeps_serving`).
+///
+/// # Panics
+///
+/// The child's stdout was not piped, or no line came within [`DEADLINE`].
+pub fn first_line_within(child: &mut Child, what: &str) -> String {
+    use std::io::BufRead;
+    let out = child.stdout.take().expect("the child's stdout is piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(out).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    rx.recv_timeout(DEADLINE).unwrap_or_else(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("timed out after {DEADLINE:?} waiting for: {what}")
+    })
 }
 
 /// Mint one capability and render it as a `--cap-file` line.
@@ -474,22 +753,14 @@ pub fn node_grants(node: &str) -> Vec<String> {
 /// and whenever it was invented. The exceptions are NAMED rather than assumed —
 /// the caller re-sets `ATERM_FABRIC_COMMAND` after this runs (the grid is the
 /// `--lines`/`--columns` flags). Automatic update checks and the package lane are switched off by
-/// the fixture CONFIG ([`FIXTURE_GUI_CONFIG`]), the way a person switches them off —
-/// the environment vetoes that used to be set here are gone (2026-09-23) — and the
-/// reroute's stubs land under the scratch HOME. A variable
+/// the fixture CONFIG ([`FIXTURE_GUI_CONFIG`]), the way a person switches them off,
+/// and the reroute's stubs land under the scratch HOME. A variable
 /// the test wants is one the test states; a variable it inherits is one nobody
 /// chose.
 ///
-/// AND THE PRICE OF THAT TRADE, stated because the next deny-by-default written
-/// in this tree will meet it: **a deny-by-default that runs after its allow-list
-/// deletes the allow-list.** `Command` applies env operations in order, so this
-/// must be called immediately after `Command::new` and never at the end of the
-/// builder chain — which is where all three call sites had the enumerated
-/// version, harmlessly, because a list of eleven names it did not set could not
-/// collide with three it did. Converting an enumeration into a derivation buys
-/// completeness and takes on SEQUENCING as a new obligation; the enumerated
-/// version's one virtue was that it could not get the order wrong. Get it wrong
-/// here and three suites go red with no error pointing anywhere near the cause.
+/// **A deny-by-default that runs after its allow-list deletes the allow-list.**
+/// `Command` applies env operations in order, so this must be called
+/// immediately after `Command::new`, never at the end of the builder chain.
 pub fn prepare_gui_environment(cmd: &mut Command) {
     for (name, _) in std::env::vars_os() {
         if name.to_string_lossy().starts_with("ATERM_") {
@@ -502,8 +773,7 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
 /// process (`aterm_uds::lifeline::arm_for_process`): the instance's `Drop`
 /// still kills it on every ordinary exit, and when this process dies without
 /// one — a SIGKILLed runner, a `timeout` — the kernel cuts the lifeline and the
-/// instance shuts itself down instead of outliving the run (gap #36; the
-/// [`strays_now`] guard above is what a leaked one used to trip). Call after
+/// instance shuts itself down instead of outliving the run (gap #36). Call after
 /// `.stdin(..)`, before `spawn`. `dir` is the world's scratch root: the FIFO's
 /// name lives there only until both ends are open.
 ///
@@ -614,11 +884,7 @@ unsafe extern "C" {
 /// a skip — a rung that silently passed because its subject was not built would
 /// be worth nothing.
 ///
-/// THE WORKSPACE ROOT IS TWO LEVELS UP, not one. Until 2026-09-10 this crate was
-/// its own workspace at the repo root, so `CARGO_MANIFEST_DIR/..` WAS the root;
-/// it is now `crates/aterm-link`, and the one-level walk pointed at
-/// `crates/target`, a directory that has never existed. Every e2e test failed
-/// with "build it first" against a binary that was already built.
+/// THE WORKSPACE ROOT IS TWO LEVELS UP (`crates/aterm-link`), not one.
 /// The `--tcp [--key-file …]` flags a CHILD process needs to reach this fixture,
 /// matched to how [`Fleet::boot`] served it. Without `sealed` the fixture serves
 /// plaintext loopback, and a child handed `--key-file` would be refused by its
@@ -667,8 +933,42 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The aterm-gui binary every world boots ([`built_binary`]), judged once.
+///
+/// DECIDED ONCE PER PROCESS, like [`refuse_a_dirty_machine`]'s stray check: the
+/// first caller finds the binary and judges it ([`built_binary`]), every later
+/// caller reads that verdict — the path, or the same refusal at once. Asked per
+/// boot, a stale binary cost [`RELINK_PATIENCE`] per test (see [`boot_permit`]).
 pub fn gui_binary() -> PathBuf {
-    built_binary("aterm-gui", "aterm-gui", "ATERM_GUI_BIN")
+    static GUI: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    GUI.get_or_init(|| try_built_binary("aterm-gui", "aterm-gui", "ATERM_GUI_BIN"))
+        .clone()
+        .unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// [`gui_binary`] for a launch about to happen. It, and cargo's `aterm-link`
+/// that a world's gui starts as its bridge, are each run once first
+/// ([`aterm_spec::wait::first_exec`]): `aterm-gui --version` prints and exits
+/// in its CLI parse, before the logger, the config, a socket or the event
+/// loop. So the system's first-exec wait on a just-built binary (64 s
+/// measured for a debug `aterm-gui`) is paid here, unclocked, and not inside
+/// [`DEADLINE`]. Call it right before the spawn: cargo puts a new file at
+/// the binary's path on every invocation, so only the file there now is the
+/// one launched.
+pub fn gui_to_launch() -> PathBuf {
+    let gui = gui_binary();
+    aterm_spec::wait::first_exec(&gui, &["--version"]);
+    link_to_launch();
+    gui
+}
+
+/// Cargo's `aterm-link` for a launch about to happen, run once first with
+/// `--help`, which `cli::dispatch` answers with its usage ([`gui_to_launch`]
+/// says why).
+pub fn link_to_launch() -> &'static str {
+    let link = env!("CARGO_BIN_EXE_aterm-link");
+    aterm_spec::wait::first_exec(Path::new(link), &["--help"]);
+    link
 }
 
 /// Every directory cargo may have put this workspace's binaries in, nearest first: the
@@ -713,26 +1013,35 @@ pub fn target_dirs() -> Vec<PathBuf> {
 /// The workspace binary `name` (built by crate `krate`): `$env_var` when set, else the
 /// first build under [`target_dirs`] (debug before release in each), refused when STALE
 /// by [`refuse_a_stale_binary`].
+///
+/// # Panics
+///
+/// When the binary is missing or stale, with the command that fixes it.
 pub fn built_binary(name: &str, krate: &str, env_var: &str) -> PathBuf {
+    try_built_binary(name, krate, env_var).unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// [`built_binary`]'s verdict as a value, so [`gui_binary`] can keep it.
+fn try_built_binary(name: &str, krate: &str, env_var: &str) -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var(env_var) {
-        return PathBuf::from(p);
+        return Ok(PathBuf::from(p));
     }
     let dirs = target_dirs();
     for dir in &dirs {
         for profile in ["debug", "release"] {
             let p = dir.join(profile).join(name);
             if p.exists() {
-                refuse_a_stale_binary(&p, krate, env_var);
-                return p;
+                stale_binary_verdict(&p, krate, env_var)?;
+                return Ok(p);
             }
         }
     }
     let searched: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
-    panic!(
+    Err(format!(
         "{name} was not found under any of [{}] — build it first \
          (`targo --unverified build -p {krate}`) or set ${env_var}",
         searched.join(", ")
-    );
+    ))
 }
 
 /// Refuse a binary OLDER than ANY source that compiles into it — for EVERY binary
@@ -744,14 +1053,8 @@ pub fn built_binary(name: &str, krate: &str, env_var: &str) -> PathBuf {
 /// and anyone who edits `crates/aterm-gui` and immediately runs a test in this crate is
 /// measuring the PREVIOUS binary with their own test file compiled fresh against it.
 ///
-/// That is not hypothetical. It was caught with the binary four to six minutes behind
-/// two of the three files a red suite was being used to accuse, and it cost hours of
-/// chasing a defect in code that was not running.
-///
-/// `gui_binary`'s own doc already argues the principle for the MISSING case: "a rung
-/// that silently passed because its subject was not built would be worth nothing". A
-/// STALE subject is the same failure in better clothes — worse, because it looks built.
-/// So this refuses it the same way, with the same command to fix it.
+/// A STALE subject is the MISSING case `gui_binary` refuses, except that it looks
+/// built, so this refuses it the same way, with the same command to fix it.
 ///
 /// `$ATERM_GUI_BIN` is exempt: naming a binary explicitly is a deliberate act (the CI
 /// lane and the cross-worktree runs both do it), and second-guessing it would break the
@@ -759,14 +1062,7 @@ pub fn built_binary(name: &str, krate: &str, env_var: &str) -> PathBuf {
 ///
 /// ## IT IS EVERY SOURCE IN THE BINARY, NOT ONE CRATE'S
 ///
-/// This used to walk exactly `crates/aterm-gui/src`, which is not "the sources it is
-/// supposed to be": `aterm-gui` links ~80 local crates, and an edit to any of them is a
-/// stale binary the guard could not see. Two of the modules the round it was written for
-/// was auditing lived in them — `crates/aterm-uds/src/spawnfd.rs` and
-/// `crates/aterm-types/src/control_verbs.rs` — so the guard added to stop an auditor
-/// chasing a defect in code that is not running did not cover half of what was being
-/// audited.
-///
+/// `aterm-gui` links ~80 local crates, and an edit to any of them is a stale binary.
 /// The input set is CARGO'S OWN, read from the depfile it writes beside the binary
 /// (`target/<profile>/aterm-gui.d`): one make-style line naming every file the compile
 /// consumed, transitively, assets and generated sources included. Deriving it any other
@@ -793,24 +1089,34 @@ pub fn built_binary(name: &str, krate: &str, env_var: &str) -> PathBuf {
 ///
 /// ## AND IT IS EVERY FOUND BINARY, NOT JUST aterm-gui
 ///
-/// `aterm-gui` was the one this was written for, so it was written as
-/// `refuse_a_stale_binary` and wired into [`gui_binary`] alone. This crate USED TO FIND a
-/// second binary the same way and for the same reason — `glance_and_tui.rs`'s
-/// `ctl_binary`, whose own doc invoked the same doctrine ("a rung that passed because its
-/// subject was not built would be worth nothing") and then did not check the stale half.
-/// Round 21 deleted that file with the TUI it drove; the doctrine and the one guard
-/// stay. When that
-/// was noticed, `target/debug/aterm-ctl` was FOUR AND A HALF HOURS behind
-/// `crates/aterm-types/src/control_verbs.rs` — the very file the round was auditing —
-/// and the glance/tui e2e was driving it green. One guard, taking the crate name and
-/// the `$…_BIN` exemption as arguments, is what makes "every found binary" checkable
-/// instead of "the one somebody remembered".
+/// One guard, taking the crate name and the `$…_BIN` exemption as arguments, is
+/// what makes "every found binary" checkable instead of "the one somebody
+/// remembered".
 pub fn refuse_a_stale_binary(bin: &std::path::Path, krate: &str, env_var: &str) {
+    if let Err(why) = stale_binary_verdict(bin, krate, env_var) {
+        panic!("{why}");
+    }
+}
+
+/// How long [`refuse_a_stale_binary`] lets a racing relink catch up before it
+/// names the binary stale.
+///
+/// FIVE MINUTES, because the thing being waited for is a LINK measured at 90 s
+/// in a release's own gate (source 21:55:53, binary 21:57:23) on a machine
+/// saturated by the workspace build — a 90 s patience missed it by seconds. The
+/// number bounds how long a genuinely stale binary takes to be NAMED, not how
+/// long the suite is willing to be wrong: a binary that never becomes current
+/// still fails, with the same message. It is paid at most once per process
+/// ([`gui_binary`]), and never while a boot permit or a live slot is held.
+pub const RELINK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// [`refuse_a_stale_binary`]'s verdict as a value: `Err` is the refusal.
+fn stale_binary_verdict(bin: &std::path::Path, krate: &str, env_var: &str) -> Result<(), String> {
     if std::env::var_os(env_var).is_some() {
-        return;
+        return Ok(());
     }
     let Ok(built) = std::fs::metadata(bin).and_then(|m| m.modified()) else {
-        return;
+        return Ok(());
     };
     // AND IT WAITS FOR THE RELINK BEFORE IT ACCUSES. Under `targo test --workspace`
     // the BIN target this suite drives is not a dependency of any test target, so
@@ -823,13 +1129,7 @@ pub fn refuse_a_stale_binary(bin: &std::path::Path, krate: &str, env_var: &str) 
     // same bargain every hang detector in this harness makes.
     let mut built = built;
     if let Some((changed, _)) = newest_input(bin, krate) {
-        // FIVE MINUTES, because the thing being waited for is a LINK measured at 90 s
-        // in this release's own gate (source 21:55:53, binary 21:57:23) on a machine
-        // saturated by the workspace build — a 90 s patience missed it by seconds. The
-        // number bounds how long a genuinely stale binary takes to be NAMED, not how
-        // long the suite is willing to be wrong: a binary that never becomes current
-        // still fails, with the same message.
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let until = std::time::Instant::now() + RELINK_PATIENCE;
         while changed > built && std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(250));
             match std::fs::metadata(bin).and_then(|m| m.modified()) {
@@ -838,17 +1138,61 @@ pub fn refuse_a_stale_binary(bin: &std::path::Path, krate: &str, env_var: &str) 
             }
         }
     }
-    if let Some((changed, path)) = newest_input(bin, krate) {
-        assert!(
-            changed <= built,
+    match newest_input(bin, krate) {
+        Some((changed, path)) if changed > built => Err(format!(
             "{krate} is STALE: {} changed after the binary at {} was built. This suite \
              would drive the PREVIOUS {krate} with your test compiled fresh against it, \
              which reads as a defect in code that is not running. Rebuild it \
              (`targo --unverified build -p {krate}`) or name one with ${env_var}.",
             path.display(),
             bin.display()
-        );
+        )),
+        _ => Ok(()),
     }
+}
+
+/// A binary cargo built as a DEPENDENCY (aterm-gui for its own integration
+/// tests, under `targo test --workspace`) has no `<bin>.d` beside it: cargo copies
+/// it out of `deps/`, where its depfile names only the binary's own root
+/// (`main.rs`). What it is really built from is that root plus the crate's
+/// library, which cargo rewrites (`deps/lib<crate>-*.rlib`) whenever a source the
+/// binary compiles changes — and never for a file only `cfg(test)` compiles. So
+/// this answers the depfile's inputs plus the newest such rlib, found through the
+/// `deps/` artifact that matches the binary's size and mtime. `None` when there is
+/// no such artifact, and the caller walks the sources instead (which reads a
+/// test-only file's edit as a stale binary).
+fn built_as_a_dependency(bin: &std::path::Path, krate: &str) -> Option<Vec<PathBuf>> {
+    let meta = std::fs::metadata(bin).ok()?;
+    let (len, modified) = (meta.len(), meta.modified().ok()?);
+    let deps = bin.parent()?.join("deps");
+    let stem = krate.replace('-', "_");
+    let mut inputs = None;
+    let mut newest_rlib: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&deps).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&format!("lib{stem}-")) && name.ends_with(".rlib") {
+            if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
+                if newest_rlib.as_ref().is_none_or(|(seen, _)| t > *seen) {
+                    newest_rlib = Some((t, path.clone()));
+                }
+            }
+        } else if name.starts_with(&format!("{stem}-")) && !name.contains('.') {
+            let same = entry
+                .metadata()
+                .ok()
+                .is_some_and(|m| m.len() == len && m.modified().ok() == Some(modified));
+            if same {
+                let text = std::fs::read_to_string(path.with_extension("d")).ok()?;
+                inputs = Some(depfile_inputs(&text, &target_root(bin)));
+            }
+        }
+    }
+    let mut inputs = inputs?;
+    inputs.extend(newest_rlib.map(|(_, path)| path));
+    Some(inputs)
 }
 
 /// The newest file that compiles into `bin`, and its path — cargo's depfile if there is
@@ -864,12 +1208,10 @@ pub fn newest_input(
         .ok()
         .map(|text| depfile_inputs(&text, &target_root(bin)))
         .filter(|paths| !paths.is_empty());
-    let paths = match from_depfile {
+    let paths = match from_depfile.or_else(|| built_as_a_dependency(bin, krate)) {
         Some(paths) => paths,
         None => {
-            // Same two-level walk as `workspace_root`: this crate moved from the
-            // repo root into `crates/` on 2026-09-10, so a one-level `..` plus
-            // `crates` resolved to `crates/crates/<krate>/src`.
+            // Same two-level walk as `workspace_root`.
             let src = workspace_root().join("crates").join(krate).join("src");
             let mut found = Vec::new();
             let mut stack = vec![src];
@@ -990,7 +1332,7 @@ impl World {
     /// broker this harness serves — a path nothing listens on, or a stub the
     /// test serves itself. `broker` and `handle` are `None`; `broker_sock` is
     /// that path. Nothing here waits for `fabric=connected`, which such a
-    /// world may never reach: that is what the round-13 link tests are about.
+    /// world may never reach: that is what the `link_state` tests are about.
     pub fn boot_at(
         tag: &str,
         accept_from: &[&str],
@@ -1000,8 +1342,8 @@ impl World {
         Self::boot_full(tag, accept_from, env, broker_at, &[], None)
     }
 
-    /// [`World::boot`] with extra flags on the bridge's `serve` line (round
-    /// 13's `--presence minimal`, say).
+    /// [`World::boot`] with extra flags on the bridge's `serve` line
+    /// (`--presence minimal`, say).
     pub fn boot_flags(tag: &str, extra_serve_flags: &[&str]) -> Self {
         Self::boot_full(tag, &[], &[], None, extra_serve_flags, None)
     }
@@ -1092,7 +1434,7 @@ impl World {
         let gui_log = tmp.join("gui.log");
         let out = std::fs::File::create(&gui_log).expect("gui log");
         let err = out.try_clone().expect("gui log clone");
-        let mut cmd = Command::new(gui_binary());
+        let mut cmd = Command::new(gui_to_launch());
         // BEFORE the explicit `.env` calls below, never after: `Command`
         // applies env operations in order, so a blanket removal that ran last
         // would delete the three variables this harness deliberately sets.
@@ -1126,13 +1468,14 @@ impl World {
             state,
             gui_log,
         };
-        world.token = World::wait_for_token_at(&world.ctl_sock);
+        let gui = world.gui.as_mut().expect("the gui just spawned");
+        world.token = World::wait_for_token_of(&world.ctl_sock, gui, &world.gui_log);
         world
     }
 
     /// A fresh authenticated control connection.
     pub fn ctl(&self) -> Ctl {
-        Ctl::connect(&self.ctl_sock, &self.token).expect("connect to aterm")
+        connect(&self.ctl_sock, &self.token).expect("connect to aterm")
     }
 
     /// Run one verb and return the reply.
@@ -1146,7 +1489,7 @@ impl World {
     /// publish under any producer id. That is what lets a test forge the records
     /// the bridge must refuse.
     pub fn god(&self) -> Client {
-        let mut c = Client::connect(&self.broker_sock).expect("connect to the broker");
+        let mut c = broker_client(&self.broker_sock);
         let cap = astream_cap::mint(SECRET, &format!("/f/{FLEET}/>")).expect("mint the god cap");
         c.attach(&cap.filter, &cap.tag).expect("attach the god cap");
         c
@@ -1173,17 +1516,7 @@ impl World {
 
     /// Every session aterm hosts, as `(local, sid, nonce)`.
     pub fn sessions(&self) -> Vec<(u64, String, String)> {
-        self.verb("sessions")
-            .rows()
-            .iter()
-            .filter_map(|row| {
-                let f: Vec<&str> = row.split_whitespace().collect();
-                let local = f.first()?.parse().ok()?;
-                let sid = (*f.get(1)?).to_string();
-                let nonce = f.iter().find_map(|t| t.strip_prefix("nonce="))?.to_string();
-                Some((local, sid, nonce))
-            })
-            .collect()
+        session_rows(&self.verb("sessions"))
     }
 
     /// The boot session's sid, and one more spawned beside it. A3 is a ONE-NODE
@@ -1221,7 +1554,7 @@ impl World {
         self.token = World::wait_for_token_at(&self.ctl_sock);
         let log = std::fs::File::create(self.tmp.join("sibling.log")).expect("sibling log");
         let err = log.try_clone().expect("sibling log clone");
-        let mut cmd = Command::new(gui_binary());
+        let mut cmd = Command::new(gui_to_launch());
         prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&self.tmp))
@@ -1233,24 +1566,19 @@ impl World {
             .stdout(log)
             .stderr(err);
         arm_lifeline(&mut cmd, &self.tmp);
-        let child = cmd.spawn().expect("launch a sibling aterm-gui --headless");
+        let mut child = cmd.spawn().expect("launch a sibling aterm-gui --headless");
         let sock = self
             .tmp
             .join(format!("run/aterm/aterm-{}.sock", child.id()))
             .to_string_lossy()
             .into_owned();
-        let token = World::wait_for_token_at(&sock);
+        let token = World::wait_for_token_of(&sock, &mut child, &self.tmp.join("sibling.log"));
         Sibling { child, sock, token }
     }
 
     /// This session's `inbox` rows (`--peek`, so the watermarks do not move).
     pub fn inbox(&self, sid: &str) -> Vec<String> {
-        self.verb(&format!("@{sid} inbox --peek"))
-            .rows()
-            .iter()
-            .filter(|r| r.starts_with("msg "))
-            .cloned()
-            .collect()
+        inbox_rows(&self.verb(&format!("@{sid} inbox --peek")))
     }
 
     /// The bridge child's pid, from its state dir.
@@ -1273,15 +1601,20 @@ impl World {
     /// `undeliverable` the fabric publishes about a session — which is most of
     /// them. The whole `pub/<node>/` subtree is read and the `ev` leaves kept.
     pub fn ev(&self) -> Vec<String> {
+        self.ev_on(&format!("/f/{FLEET}/pub/{}/>", self.node))
+    }
+
+    /// Every `ev` record under one face or filter, newest last — a single
+    /// owner's (`subject::session_face`, `subject::node_face`) where
+    /// [`World::ev`] reads them all.
+    pub fn ev_on(&self, filter: &str) -> Vec<String> {
         let mut c = self.god();
-        ev_rows(&mut c, &format!("/f/{FLEET}/pub/{}/>", self.node))
+        ev_rows(&mut c, filter)
     }
 
     /// The tail of aterm's own log, for a failure message.
     pub fn log_tail(&self) -> String {
-        let body = std::fs::read_to_string(&self.gui_log).unwrap_or_default();
-        let lines: Vec<&str> = body.lines().collect();
-        lines[lines.len().saturating_sub(20)..].join("\n")
+        log_tail_of(&self.gui_log)
     }
 }
 
@@ -1308,6 +1641,163 @@ fn ev_rows<C: EvFetch>(conn: &mut C, filter: &str) -> Vec<String> {
         }
         from = next;
     }
+}
+
+/// A `sessions` reply as `(local, sid, nonce)` rows. Shared by
+/// [`World::sessions`] and [`Node::sessions`].
+fn session_rows(reply: &Reply) -> Vec<(u64, String, String)> {
+    reply
+        .rows()
+        .iter()
+        .filter_map(|row| {
+            let f: Vec<&str> = row.split_whitespace().collect();
+            let local = f.first()?.parse().ok()?;
+            let sid = (*f.get(1)?).to_string();
+            let nonce = f.iter().find_map(|t| t.strip_prefix("nonce="))?.to_string();
+            Some((local, sid, nonce))
+        })
+        .collect()
+}
+
+/// The `msg` rows of an `inbox --peek` reply. Shared by [`World::inbox`] and
+/// [`Node::inbox`].
+fn inbox_rows(reply: &Reply) -> Vec<String> {
+    reply
+        .rows()
+        .iter()
+        .filter(|r| r.starts_with("msg "))
+        .cloned()
+        .collect()
+}
+
+/// The last 20 lines of an aterm log, for a failure message.
+fn log_tail_of(path: &Path) -> String {
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = body.lines().collect();
+    lines[lines.len().saturating_sub(20)..].join("\n")
+}
+
+/// `key=` of a whitespace-token line.
+pub use aterm_link::fabric::kv;
+
+/// The offset an `OK <id> off=<n> …` header names.
+pub fn off_of(header: &str) -> u64 {
+    kv(header, "off")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("a landing offset in: {header}"))
+}
+
+/// The row id of `sid`'s `inbox` row at broker offset `off`, `--peek` so nothing
+/// is marked — the row a recipient is about to acknowledge.
+pub fn id_at_off(w: &World, sid: &str, off: u64) -> Option<u64> {
+    w.inbox(sid).into_iter().find_map(|r| {
+        (kv(&r, "off") == Some(&off.to_string()))
+            .then(|| r.split_whitespace().nth(1)?.parse().ok())
+            .flatten()
+    })
+}
+
+/// One record for [`publish_pipelined`]: `(producer_id, producer_seq, subject,
+/// body)`, exactly the arguments of `Client::publish`.
+pub type Record = (u64, u64, String, Vec<u8>);
+
+/// Publish `records` in order on `conn`, as a loop of `conn.publish` would, and
+/// answer each one's `(offset, deduped)` in that order — with the acks read
+/// BEHIND the sends (astream's pipelined publish), never one round trip each.
+///
+/// WHY. Every world's broker is `open_guarded`, which is `Durability::Strict`:
+/// an ack is an fsync, and a test that seeds a backlog one blocking `publish`
+/// at a time pays one fsync per record. Measured 2026-10-05: `x2`'s 560 fillers
+/// took 5.9 s of its 7.2 s alone (10.5 ms a record), and the world suite seeds
+/// 2,806 records that way — ~30 s of live-stack time spent waiting on the disk,
+/// more under the gate's compile I/O. In flight together the publishes share
+/// group-commit fsyncs (`Client::send_publish`'s contract): the same 560 land
+/// in 77 ms.
+///
+/// THE SAME RECORDS IN THE SAME ORDER. One connection, requests sent in
+/// `records` order, and the broker appends and acks a connection's requests in
+/// the order they arrive: every record gets the offset the serial loop would
+/// have given it relative to the others, under the same `(producer, seq)` key.
+/// What changes is only how fast they land relative to the bridge reading
+/// them — which the serial loop never fixed either.
+///
+/// The window stays well under `Client::MAX_PIPELINE_WINDOW`, so the
+/// interleaved send/receive cannot wedge the connection.
+///
+/// # Panics
+///
+/// A record the broker refused or a transport failure, naming the record's
+/// index and subject — as the loop's `expect` did.
+pub fn publish_pipelined(conn: &mut Client, records: &[Record]) -> Vec<(u64, bool)> {
+    const WINDOW: usize = 128;
+    let mut acks = Vec::with_capacity(records.len());
+    let mut sent = 0;
+    while acks.len() < records.len() {
+        while sent < records.len() && sent - acks.len() < WINDOW {
+            let (producer, seq, subject, body) = &records[sent];
+            conn.send_publish(*producer, *seq, subject, body)
+                .unwrap_or_else(|e| panic!("publish record {sent} on {subject}: {e}"));
+            sent += 1;
+        }
+        let i = acks.len();
+        let ack = conn
+            .recv_publish_ack()
+            .unwrap_or_else(|e| panic!("publish record {i} on {}: {e}", records[i].2));
+        acks.push(ack);
+    }
+    acks
+}
+
+/// Every record currently on the fleet's broadcast subtree.
+pub fn say_records(w: &World) -> Vec<(u64, String, String)> {
+    let filter = format!("/f/{FLEET}/pub/*/*/say/>");
+    let mut c = w.god();
+    let mut out = Vec::new();
+    let mut from = 0u64;
+    loop {
+        let (rows, (next, head)) = c.fetch(from, &filter, 256).expect("fetch the say subtree");
+        for (off, subject, body) in rows {
+            out.push((off, subject, String::from_utf8_lossy(&body).into_owned()));
+        }
+        if next >= head {
+            return out;
+        }
+        from = next.max(from + 1);
+    }
+}
+
+/// The rows of a session's ring that arrived on `topic`.
+pub fn topic_rows(w: &World, sid: &str, topic: &str) -> Vec<String> {
+    w.inbox(sid)
+        .into_iter()
+        .filter(|r| r.contains(&format!(" topic={topic} ")))
+        .collect()
+}
+
+/// `Some` once the BRIDGE holds `topic` for `sid`: its persisted cursors, one
+/// topic per line.
+pub fn bridge_holds(w: &World, sid: &str, topic: &str) -> Option<()> {
+    std::fs::read_to_string(w.state.join(format!("topics/{sid}")))
+        .ok()?
+        .lines()
+        .any(|l| l.split(' ').next() == Some(topic))
+        .then_some(())
+}
+
+/// The session's presence row on the bus, as its body.
+pub fn presence_body(w: &World, sid: &str) -> Option<String> {
+    let subject = format!("/f/{FLEET}/pub/{}/{sid}/presence", w.node);
+    let mut c = w.god();
+    let (rows, _) = c.last(&subject, "", 8).ok()?;
+    rows.iter()
+        .find(|(_, s, _)| *s == subject)
+        .map(|(_, _, b)| String::from_utf8_lossy(b).into_owned())
+}
+
+/// A file's permission bits.
+pub fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777
 }
 
 /// One page of a `Fetch`: the rows, then the mark's `(next, head)`.
@@ -1369,7 +1859,7 @@ impl World {
             .open(&w.gui_log)
             .expect("gui log");
         let err = out.try_clone().expect("gui log clone");
-        let mut cmd = Command::new(gui_binary());
+        let mut cmd = Command::new(gui_to_launch());
         // BEFORE the explicit `.env` calls below, never after: `Command`
         // applies env operations in order, so a blanket removal that ran last
         // would delete the three variables this harness deliberately sets.
@@ -1400,16 +1890,48 @@ impl World {
     /// [`refuse_a_gui_that_cannot_launch_a_bridge`] checks. Both on the same
     /// connection, in the same round, so the wait costs what it always did.
     pub fn wait_for_token_at(sock: &str) -> String {
+        Self::wait_for_token(sock, None)
+    }
+
+    /// [`World::wait_for_token_at`] for the instance this test just spawned as
+    /// `child`, logging to `log`: a child that EXITS before it answers fails the
+    /// wait at once, naming its exit status and its log's tail, rather than
+    /// leaving the test to poll a socket nobody will ever bind until the
+    /// deadline. A wait that FAILS kills and reaps `child` before it re-raises,
+    /// so an instance alive but never answering does not outlive its test.
+    pub fn wait_for_token_of(sock: &str, child: &mut Child, log: &Path) -> String {
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::wait_for_token(sock, Some((&mut *child, log)))
+        }));
+        waited.unwrap_or_else(|why| {
+            let _ = child.kill();
+            let _ = child.wait();
+            std::panic::resume_unwind(why)
+        })
+    }
+
+    fn wait_for_token(sock: &str, mut spawned: Option<(&mut Child, &Path)>) -> String {
         let sock = sock.to_string();
         let (token, version, status) =
             until("aterm-gui to bind and answer on its control socket", || {
+                if let Some((child, log)) = spawned.as_mut() {
+                    if let Ok(Some(exit)) = child.try_wait() {
+                        panic!(
+                            "aterm-gui exited ({exit}) before it answered on {sock}; its log:\n{}",
+                            log_tail_of(log)
+                        );
+                    }
+                }
                 let path = aterm_uds::latest::token_path_for_sock(&sock)?;
                 let token = std::fs::read_to_string(path).ok()?;
                 let token = token.trim().to_string();
                 if token.is_empty() {
                     return None;
                 }
-                let mut ctl = Ctl::connect(&sock, &token).ok()?;
+                // Bounded by the probe's own deadline: an instance that accepts
+                // and never answers ends this round, and the wait, rather than
+                // parking it in a read for ever.
+                let mut ctl = connect_within(&sock, &token, DEADLINE).ok()?;
                 let version = ctl.request("version").ok()?;
                 if !version.ok() {
                     return None;
@@ -1460,10 +1982,8 @@ impl Drop for Sibling {
 /// stranger. MEASURED 2026-08-31: one full run of this crate's e2e suites spawns
 /// dozens of GUIs and produced a dialog storm the operator had to click through.
 ///
-/// A scratch `$HOME` fixes it at the cause and is what a hermetic e2e wanted
-/// anyway: the suites already redirect `XDG_RUNTIME_DIR` and `XDG_CONFIG_HOME`
-/// into `tmp`, and `$HOME` was simply the one that was missed. Nothing here
-/// needs the developer's home — every path these tests read is under `tmp`.
+/// A scratch `$HOME` fixes it at the cause: nothing here needs the developer's
+/// home — every path these tests read is under `tmp`.
 fn scratch_home(tmp: &std::path::Path) -> std::path::PathBuf {
     let home = tmp.join("home");
     // Created eagerly: a `$HOME` that does not exist is a different failure mode
@@ -1478,47 +1998,20 @@ fn scratch_home(tmp: &std::path::Path) -> std::path::PathBuf {
 /// THIS IS THE FOURTH CASE, and the first three do not reach it.
 /// [`gui_binary`] refuses a MISSING binary; [`refuse_a_stale_binary`] refuses one
 /// older than any source cargo compiled into it; [`refuse_a_dirty_machine`]
-/// refuses a previous run's daemons. TWO GAPS SURVIVE all three, and both were measured
-/// on 2026-08-31 rather than reasoned about:
-///
-///  * `$ATERM_GUI_BIN` is set. [`refuse_a_stale_binary`] deliberately exempts an
-///    explicitly named binary — naming one is a decision, and a guard that
-///    second-guesses it gets switched off. Pointed at a pre-launcher aterm, the
-///    eleven `bridge_e2e` tests failed here in 1.95 s WITH this check and would
-///    have taken eleven times [`DEADLINE`] without it.
-///  * The binary's mtime is newer than every source and it still predates the
-///    launcher — a copy, a restore, or a `release`-profile artifact. Measured:
-///    a 2026-08-28 binary copied into place with a fresh mtime produced a
-///    60.66 s timeout on one `bridge_e2e` test, and a 2.33 s named refusal with
-///    this check.
-///
-/// WHAT SUCH A BINARY IS. `crates/aterm-gui/src/fabric_launch.rs` — the launcher
-/// that reads `$ATERM_FABRIC_COMMAND` and spawns the bridge — landed in
-/// a0970345c on 2026-08-29. The 0.63.0 binary above answers
-/// `grep -ac ATERM_FABRIC_COMMAND` = 0: it spawns no bridge and never can. So a
-/// test booted a full stack and waited the whole of [`DEADLINE`] for
-/// `fabric=connected` that could not arrive — a red that reads as a broken
-/// bridge and is nothing of the kind. Before fc48302c4 (2026-08-31) that was the
-/// DEFAULT path and 53 of this crate's 60 e2e tests failed exactly that way at
-/// ~60 s each; the stale-binary refusal closed the default, and this closes what
-/// it exempts.
+/// refuses a previous run's daemons. Two gaps survive all three: `$ATERM_GUI_BIN`
+/// names a binary (exempt from the stale check on purpose), or a binary whose mtime
+/// is newer than every source still predates the launcher (a copy, a restore, a
+/// `release` artifact). Such a binary spawns no bridge, so every test would wait
+/// the whole of [`DEADLINE`] for a `fabric=connected` that cannot arrive.
 ///
 /// THE INSTANCE IS ASKED, not the binary inspected. An aterm carrying the
-/// launcher always answers `status` with a `fabric=` token, in every state the
-/// bridge can be in — measured 2026-08-31 against `target/debug/aterm-gui` at
-/// f188df942eaf: `fabric=absent` with no command configured, `fabric=disconnected`
-/// with `ATERM_FABRIC_COMMAND=/usr/bin/false`, `fabric=connected` with a child
-/// that stays up. An aterm that predates the launcher has no such token in its
-/// `status` header at all (measured on the 0.63.0 binary above), and that
-/// absence is the whole test.
+/// launcher (`crates/aterm-gui/src/fabric_launch.rs`) answers `status` with a
+/// `fabric=` token in every state the bridge can be in (`absent`,
+/// `disconnected`, `connected`); one that predates it has no such token, and
+/// that absence is the whole test.
 ///
-/// IT REFUSES, IT DOES NOT SKIP, and that half is deliberate. This machine can
-/// run the suite — one `targo --unverified build -p aterm-gui` later the first
-/// `bridge_e2e` test passed in 2.03 s — so the honest report is a fast, named
-/// failure, not a green run whose subject was never built. It is the same
-/// doctrine `gui_binary` applies to a missing binary and `refuse_a_stale_binary` to
-/// an old one, applied to a binary that is present, fresh, and still cannot be
-/// the subject.
+/// IT REFUSES, IT DOES NOT SKIP: the honest report is a fast, named failure,
+/// not a green run whose subject was never built.
 ///
 /// AND IT SWALLOWS NOTHING. The token's PRESENCE is the only thing asserted, so
 /// every real bridge failure on an aterm that can launch one — a bridge that
@@ -1692,12 +2185,11 @@ impl Fleet {
     /// filesystem scan, so it works from a host that hosts nothing (§7).
     pub fn ls(&self) -> String {
         let cap = self.cap_file("ls", &[format!("ro:/f/{FLEET}/pub/>")]);
-        let out = Command::new(env!("CARGO_BIN_EXE_aterm-link"))
-            .args(["ls", "--fleet", FLEET, "--broker", &self.addr])
+        let mut cmd = Command::new(link_to_launch());
+        cmd.args(["ls", "--fleet", FLEET, "--broker", &self.addr])
             .args(fleet_child_flags(&self.key_file))
-            .args(["--cap-file", cap.to_string_lossy().as_ref()])
-            .output()
-            .expect("run aterm-link ls");
+            .args(["--cap-file", cap.to_string_lossy().as_ref()]);
+        let out = output_within(&mut cmd, "aterm-link ls");
         assert!(
             out.status.success(),
             "aterm-link ls failed: {}",
@@ -1808,8 +2300,8 @@ impl Node {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
         };
-        me.gui = Some(me.spawn_gui());
-        me.token = World::wait_for_token_at(&me.ctl_sock);
+        let gui = me.gui.insert(me.spawn_gui());
+        me.token = World::wait_for_token_of(&me.ctl_sock, gui, &me.gui_log);
         me
     }
 
@@ -1820,7 +2312,7 @@ impl Node {
             .open(&self.gui_log)
             .expect("gui log");
         let err = out.try_clone().expect("gui log clone");
-        let mut cmd = Command::new(gui_binary());
+        let mut cmd = Command::new(gui_to_launch());
         // BEFORE the explicit `.env` calls below, never after: `Command`
         // applies env operations in order, so a blanket removal that ran last
         // would delete the three variables this harness deliberately sets.
@@ -1844,7 +2336,7 @@ impl Node {
 
     /// A fresh authenticated control connection.
     pub fn ctl(&self) -> Ctl {
-        Ctl::connect(&self.ctl_sock, &self.token).expect("connect to aterm")
+        connect(&self.ctl_sock, &self.token).expect("connect to aterm")
     }
 
     /// Run one verb and return the reply.
@@ -1874,17 +2366,7 @@ impl Node {
 
     /// Every session aterm hosts, as `(local, sid, nonce)`.
     pub fn sessions(&self) -> Vec<(u64, String, String)> {
-        self.verb("sessions")
-            .rows()
-            .iter()
-            .filter_map(|row| {
-                let f: Vec<&str> = row.split_whitespace().collect();
-                let local = f.first()?.parse().ok()?;
-                let sid = (*f.get(1)?).to_string();
-                let nonce = f.iter().find_map(|t| t.strip_prefix("nonce="))?.to_string();
-                Some((local, sid, nonce))
-            })
-            .collect()
+        session_rows(&self.verb("sessions"))
     }
 
     /// The boot session's `(sid, nonce)`, once the bridge has seen it.
@@ -1898,12 +2380,7 @@ impl Node {
 
     /// This session's `inbox` rows (`--peek`, so the watermarks do not move).
     pub fn inbox(&self, sid: &str) -> Vec<String> {
-        self.verb(&format!("@{sid} inbox --peek"))
-            .rows()
-            .iter()
-            .filter(|r| r.starts_with("msg "))
-            .cloned()
-            .collect()
+        inbox_rows(&self.verb(&format!("@{sid} inbox --peek")))
     }
 
     /// Every `ev` record this node has published, newest last — over EVERY `ev`
@@ -1915,8 +2392,6 @@ impl Node {
 
     /// The tail of this node's aterm log, for a failure message.
     pub fn log_tail(&self) -> String {
-        let body = std::fs::read_to_string(&self.gui_log).unwrap_or_default();
-        let lines: Vec<&str> = body.lines().collect();
-        lines[lines.len().saturating_sub(20)..].join("\n")
+        log_tail_of(&self.gui_log)
     }
 }

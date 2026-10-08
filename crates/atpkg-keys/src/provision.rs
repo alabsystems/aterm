@@ -6,10 +6,9 @@
 //!
 //! # What this module is for
 //!
-//! Arming the roster tier used to be six manual steps, three of which were "copy 44 base64
-//! characters into `pins.rs` by hand". Every one of those was a chance to paste the wrong
-//! 44 characters into the file that decides what the whole fleet trusts. The two verbs
-//! built on this module reduce the human's job to writing one phrase on paper:
+//! No step asks a human to copy 44 base64 characters into `pins.rs`, the file that decides
+//! what the whole fleet trusts. The two verbs built on this module reduce the human's job
+//! to writing one phrase on paper:
 //!
 //! * `setup` — the FIRST machine. Generates the master, prints the phrase once, arms
 //!   `pins::PAPER_MASTER_PUBKEYS`, mints this machine's keypair, and creates the
@@ -21,9 +20,8 @@
 //! # THE ROSTER IS THE ONLY GRANT
 //!
 //! A minted machine is authorized by the master-signed roster and by nothing else — there
-//! is no compiled-in channel keyset (the pre-roster K1 keyset was retired 2026-09-23, with
-//! the installs older than v0.21.0 that verified under it). So neither verb edits any
-//! anchor but the master's, and every grant it makes is one `machine-revoke` can take back.
+//! is no compiled-in channel keyset. So neither verb edits any anchor but the master's,
+//! and every grant it makes is one `machine-revoke` can take back.
 //!
 //! # The split, and why the secret is not in this module's signatures
 //!
@@ -43,15 +41,15 @@
 //!
 //! 1. [`preflight`] — every refusal that can be made before a secret exists. It reads, it
 //!    validates, it writes nothing. `setup` meeting an already-armed anchor stops here.
-//! 2. [`plan`] — compute the ENTIRE result in memory: the new `pins.rs` text (both edits),
+//! 2. [`plan`] — compute the ENTIRE result in memory: the new `pins.rs` text (the master anchor's edit),
 //!    the machine keypair, the roster document and its master signature. Still no writes.
 //!    Everything that can fail on bad input fails here, with the working tree untouched.
 //! 3. [`write_pins`] then [`write_rest`] — two writes of pre-computed bytes. The anchor
-//!    file goes first and is verified by re-reading it, because `setup`'s caller prints the
-//!    phrase between the two: a master that is armed but never printed is unrecoverable,
-//!    while a phrase printed against a durable anchor can always be finished with `join`.
+//!    file goes first and is verified by re-reading it, because the machine key and roster
+//!    [`write_rest`] writes depend on it. `setup` shows the phrase and proves its
+//!    transcription before either write (`main.rs`'s `provision`).
 //!
-//! # THE ROSTER IS A PAIR, AND A CRASH USED TO BE ABLE TO TEAR IT
+//! # THE ROSTER IS A PAIR, AND A CRASH MUST NOT TEAR IT
 //!
 //! Phase 3's roster half is not one write but two — `aterm-machines.toml` and its
 //! detached `.sig`, meaningful only together — so it gets its own machinery: one
@@ -210,14 +208,10 @@ pub fn reject_name(r: &RosterReject) -> String {
 
 /// Whether the caller may legitimately be the FIRST mint when no roster is on disk.
 ///
-/// This exists because the "may a fresh roster be started?" decision used to live only in
-/// [`preflight`], while the code that actually STARTS one ([`load_roster`]'s fresh branch)
-/// keyed on nothing but file absence. `join`'s refusal was therefore a check at one point
-/// in time, not an invariant: a roster deleted in the window between preflight and
-/// [`plan`] (the operator is typing 64 characters; `dist/` is gitignored and a concurrent
-/// cleanup can sweep both files) sailed straight into the fresh branch and minted the
-/// same-sequence fork the refusal exists to prevent. The mode makes the invariant hold at
-/// the point of USE.
+/// A check in [`preflight`] alone holds at one point in time: a roster deleted between
+/// preflight and [`plan`] (`dist/` is gitignored; a concurrent cleanup can sweep both
+/// files) would reach [`load_roster`]'s fresh branch and mint a same-sequence fork. The
+/// mode makes the invariant hold at the point of USE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterExpectation {
     /// The roster must already be on disk — `join`'s position, always: a committed master
@@ -1054,17 +1048,14 @@ impl std::fmt::Debug for Preflight {
 ///
 /// Nothing here writes a FILE, and nothing here needs the master. That ordering is the
 /// whole point: an operator who is going to be refused should be refused before they type
-/// 64 characters, and `setup` meeting an already-armed anchor must stop before it generates
+/// the phrase, and `setup` meeting an already-armed anchor must stop before it generates
 /// a second master — generating one silently would strand the first, and the paper holding
 /// the first is the only copy that exists.
 ///
 /// It does create missing DIRECTORIES, which is the one deliberate exception and is here
 /// rather than later for exactly the reason above. `$HOME/.aterm` does not exist on a fresh
-/// machine — the first machine, which is what `setup` is for — and creating the machine key
-/// inside it used to fail ENOENT at the last step of a run that had already armed the
-/// anchor and published a master-signed roster naming a machine whose key was never
-/// written. An `mkdir -p` before any of that is the whole fix, and a failure here costs an
-/// error message.
+/// machine; creating it here means a failure costs an error message, not a run that has
+/// already armed the anchor and published a roster naming a machine with no key.
 pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, String> {
     vet_machine_id(id)?;
 
@@ -1243,7 +1234,7 @@ pub struct Planned {
     verb: Verb,
     id: String,
     paths: Paths,
-    /// The complete new text of `pins.rs`. `None` when neither anchor needed changing —
+    /// The complete new text of `pins.rs`. `None` when the anchor needed no change —
     /// the idempotent re-run.
     pins_text: Option<String>,
     /// The anchor file's bytes as they were when this run read them. Carried so the write
@@ -1312,8 +1303,8 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
     let (machine_pkcs8, machine_pubkey) = crate::generate()?;
 
     // The hierarchy must not collapse: a master that also signs releases lives on the
-    // release machine, which is exactly the arrangement the one-key design was retired
-    // for. A fresh Ed25519 collision is not a realistic accident, but it is checked
+    // release machine, which is exactly the arrangement the roster exists to prevent.
+    // A fresh Ed25519 collision is not a realistic accident, but it is checked
     // rather than assumed.
     if machine_pubkey == master_pubkey {
         return Err("the freshly minted machine key is the paper master; refusing".to_string());
@@ -1406,10 +1397,9 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
 
 /// WRITE THE ANCHOR FILE, THEN PROVE IT LANDED.
 ///
-/// Separated from [`write_rest`] because `setup` prints the paper phrase between the two.
-/// A master armed in the file but never shown to the owner is unrecoverable; a phrase
-/// shown against a durable anchor can always be finished later with `join`. So the anchor
-/// is durable first, and only then is the secret put on the screen.
+/// Separated from [`write_rest`] and run first because the machine key and roster that
+/// [`write_rest`] writes depend on a durable anchor. `setup` shows the paper phrase and
+/// proves its transcription before either write (`main.rs`'s `provision`).
 ///
 /// The verification re-reads the FILE, not the string that was just built. Building
 /// correct text and getting it onto a disk are two different claims, and a short write, a
@@ -1419,7 +1409,7 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
 ///
 /// The new text is a whole-file image built from a snapshot [`preflight`] took, and
 /// preflight runs BEFORE the human types the phrase. `join`'s window is therefore as long
-/// as it takes to type 64 characters, and this repository has other agents and other
+/// as it takes to type 52 characters, and this repository has other agents and other
 /// sessions writing to it. Writing the snapshot back would silently REVERT anything that
 /// landed in between — including, in the worst case, a reviewed commit retiring a
 /// compromised channel key, which would be resurrected into the keyset by a run that then
@@ -1517,21 +1507,15 @@ impl std::fmt::Debug for Report {
 
 /// Write the machine's own two files, then the roster and its master signature.
 ///
-/// # The secret key goes FIRST, and that order is a correction
+/// # The secret key goes FIRST
 ///
-/// It used to go last, on the reasoning that a failure would then leave "either the roster
-/// names this machine and its key exists, or neither". The reasoning was right and the
-/// order implemented the opposite of it: creating the key is the step most likely to fail
-/// (a missing directory, a permission, an existing file), and when it failed the roster had
-/// already been signed and published naming a machine whose key had just been discarded —
-/// a signed document asserting something false, plus a keyset slot spent on a public key
-/// with no private half.
+/// Creating the key is the step most likely to fail (a missing directory, a permission, an
+/// existing file). Key last would leave a published, signed roster naming a machine whose
+/// key was discarded. Key first, the worst case is a key nothing has authorized yet: no
+/// signed document says anything untrue, and the error message names the recovery.
+/// `create_new` guarantees an existing key is never clobbered.
 ///
-/// Reversed, the worst case is a machine that holds a key nothing has authorized yet. No
-/// signed document says anything untrue, and the recovery is two commands the error message
-/// names. `create_new` still guarantees an existing key is never clobbered.
-///
-/// The roster half now runs under [`lock_roster`], so the recovery advice branches on the
+/// The roster half runs under [`lock_roster`], so the recovery advice branches on the
 /// redo transaction's commit point: before it, undo the key; after it, KEEP the key,
 /// because the pair that authorizes it is durable and the next run installs it.
 pub fn write_rest(planned: Planned) -> Result<Report, String> {
@@ -1719,10 +1703,9 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     })
 }
 
-/// The closing output: DONE, then NEXT. Owner rulings 2026-08-14/15: facts and next
-/// actions only — what happened and what to do, one line each; every load-bearing
-/// caveat rides as a clause on the step it guards, never as its own section. Pure so
-/// tests read what the operator reads.
+/// The closing output: DONE, then NEXT. Owner ruling: facts and next actions only — what
+/// happened and what to do, one line each; every load-bearing caveat rides as a clause on
+/// the step it guards, never as its own section. Pure so tests read what the operator reads.
 #[must_use]
 pub fn render_report(r: &Report) -> Vec<String> {
     let mut out = Vec::new();
@@ -1823,12 +1806,9 @@ mod tests {
     /// 2026-08-04T00:00:00Z.
     const NOW: u64 = 1_785_801_600;
 
-    /// A private scratch directory for one test, removed if it already exists.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("atpkg-keys-provision").join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    /// A private scratch directory for one test, removed when the test ends.
+    fn scratch(name: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-keys-provision-{name}-"))
     }
 
     /// A `pins.rs` fixture with the master anchor's empty shape. Deliberately a COPY: the tests write
@@ -2054,7 +2034,7 @@ mod tests {
     }
 
     /// THE PREFLIGHT REFUSAL IS NOT THE ENFORCEMENT: a roster that vanishes BETWEEN
-    /// preflight and plan — the operator is typing 64 characters, and the pair lives
+    /// preflight and plan — the operator is typing 52 characters, and the pair lives
     /// under gitignored `dist/`, where a concurrent cleanup can sweep both files — must
     /// be refused at the point of use, not sailed into the fresh-mint branch. Before
     /// this held, exactly that window minted a second same-sequence master-signed
@@ -2488,10 +2468,7 @@ mod tests {
 
     /// THE MACHINE KEY'S DIRECTORY IS CREATED BEFORE ANY SECRET EXISTS.
     ///
-    /// `$HOME/.aterm` does not exist on a fresh machine — the first machine, the one
-    /// `setup` is for. Creating the key there used to fail ENOENT at the very last step,
-    /// after the anchor had been armed, the phrase shown and a master-signed roster
-    /// published naming a machine whose private key was discarded with the process.
+    /// `$HOME/.aterm` does not exist on a fresh machine — the one `setup` is for.
     #[test]
     fn a_run_creates_the_directories_its_key_and_roster_need() {
         let dir = scratch("missing-dirs");
@@ -2719,10 +2696,9 @@ mod tests {
     /// THE ANCHOR FILE IS NOT REPLACED BY A SNAPSHOT SOMEBODY ELSE HAS SINCE EDITED.
     ///
     /// The plan is computed from bytes read in `preflight`, and for `join` that read happens
-    /// before the human types 64 characters. A `git checkout`, a rebase, an editor or
-    /// another agent landing in that window used to be silently reverted by the write —
-    /// including, in the worst case, a reviewed commit retiring a compromised master, which
-    /// would be resurrected into the anchor by a run that reported success.
+    /// before the human types the phrase. A `git checkout`, a rebase, an editor or another
+    /// agent landing in that window must not be reverted by the write — in the worst case
+    /// a reviewed commit retiring a compromised master.
     #[test]
     fn write_pins_refuses_a_file_that_changed_under_it() {
         let dir = scratch("stale-snapshot");
@@ -2827,8 +2803,7 @@ mod tests {
     }
 
     /// IDEMPOTENCE AT THE VERB LEVEL: re-arming the SAME master is a no-op rather than a
-    /// second entry. (The channel keyset is no longer written by either verb, so the
-    /// append that used to be exercised here is the master's.)
+    /// second entry in the master anchor.
     #[test]
     fn a_second_pass_over_an_already_listed_key_adds_no_second_entry() {
         let dir = scratch("idempotent-verb");

@@ -147,11 +147,7 @@ mod tests {
     fn pending_shim_rename_wakes_waiter_and_exposes_tool() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!(
-            "atpkg-pending-wake-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let dir = crate::testdir::dir("atpkg-pending-wake-");
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         let layout = Layout {
             prefix: dir.clone(),
@@ -173,8 +169,8 @@ mod tests {
 
         // The rename can finish BEFORE the wait starts. The registered watch
         // must retain that event rather than sleeping out the fallback.
-        assert!(wake.wait(Duration::from_secs(1)));
+        assert!(wake.wait(aterm_spec::wait::MUST_HAPPEN));
         assert_eq!(crate::which(&layout, "ty"), Some(target));
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

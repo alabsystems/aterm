@@ -1,36 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Sparkle-words v2 **genome** (docs/sparkle-words-v2-design.md §3): the
+//! The sparkle-words genome (docs/sparkle-words-v2-design.md §3): the
 //! deterministic (word form, surrounding words) → effect-parameters channel.
 //!
-//! * **`simhash_ctx`** (§3.2) — a weighted SimHash over the ±4 reading-order
-//!   neighbor tokens plus the matched word's own `form_hash`. Locality by
-//!   construction: editing one nearby word flips only the bits where that
-//!   voter was pivotal, so similar sentences yield similar genomes (a plain
-//!   avalanche hash fails this). Allocation-free: the caller passes resident
-//!   scratch ([`VoteScratch`] + two `String`s); it runs **only on a persist-map
-//!   miss** (word_decorations.rs §3.6), never on the per-frame path.
-//! * **`gray_decode` / `field`** (§3.3, verbatim) — features are disjoint bit
-//!   fields of `gkey = seed ^ ctx_fp`, each decoded through inverse Gray, so a
-//!   context edit never carries across a field boundary and a bit-0 flip moves
-//!   a feature exactly ±1 table step (bit k reflects within its 2^(k+1) block —
-//!   the honest §3.3 property, pinned by `gray_decode_locality`).
-//! * **`cat_features` / `nova_features`** (§3.4, authoritative bit layout) —
-//!   decoded on demand, never stored. The table/ramp *contents* (COAT_RAMP,
-//!   EYE_RAMP, NOVA_PALETTES) are P3/P4 art; the decoders return indices and
-//!   scalar parameters.
-//! * **`cat_magic` / `nova_magic`** (§3.5) — the rare-variant channel:
-//!   `magic = mix(ctx_fp ^ form_hash ^ SALT)` folds in NO ident/column/row, so
-//!   the same sentence yields the same magic outcome at any indentation.
+//! * **`simhash_ctx`** (§3.2): a weighted SimHash over the ±4 reading-order
+//!   neighbour tokens plus the word's own `form_hash`. Editing one nearby word
+//!   flips only the bits where that voter was pivotal, so similar sentences
+//!   give similar genomes. Allocation-free (the caller passes resident scratch:
+//!   [`VoteScratch`] and two `String`s); runs only on a persist-map miss, never
+//!   per frame.
+//! * **`gray_decode` / `field`** (§3.3): features are disjoint bit fields of
+//!   `gkey = seed ^ ctx_fp`, each Gray-decoded, so a context edit never crosses
+//!   a field boundary and a bit-0 flip moves a feature exactly ±1 step (pinned
+//!   by `gray_decode_locality`).
+//! * **cat / nova features** (§3.4): decoded on demand, never stored; the
+//!   decoders return indices and scalars, the palettes live elsewhere.
+//! * **`cat_magic` / `nova_magic`** (§3.5): the rare-variant channel,
+//!   `magic = mix(ctx_fp ^ form_hash ^ SALT)`, with no indent, column or row
+//!   folded in, so the same sentence gives the same outcome at any indentation.
 
 use aterm_lexicon::{Class, fold_into, is_interior_joiner, is_token_char};
 
 use crate::cat_glyphs_gen::{CatGlyphId, HEADS};
 
-/// §3.3: the frozen 16-byte genome, computed once on a persist-map miss and
-/// copied forward on every hit (word_decorations.rs). `gkey` folds in the
-/// occurrence seed (position-bearing, §15.2); `magic` deliberately does not.
+/// The frozen 16-byte genome, computed once on a persist-map miss and copied
+/// forward on every hit (word_decorations.rs). `gkey` folds in the
+/// position-bearing occurrence seed; `magic` does not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Genome {
     /// `seed ^ ctx_fp` — the feature-field source (§3.4 layouts).
@@ -56,14 +52,12 @@ pub fn mix(seed: u64) -> u64 {
 
 /// Distance weights `w(d) = [4, 2, 2, 1][d - 1]` for the d-th token on each side.
 const CTX_WEIGHTS: [i32; 4] = [4, 2, 2, 1];
-/// The matched word's own `form_hash` vote weight (§3.2: `cat` and `kitten` in
-/// identical surroundings are siblings, not twins; a bare word with no
-/// neighbors still gets a locality-bearing vote).
+/// The matched word's own `form_hash` vote weight: `cat` and `kitten` in the
+/// same surroundings differ, and a bare word still gets a vote.
 const FORM_WEIGHT: i32 = 3;
 
-/// §3.2 vote accumulator, newtyped so the owning struct keeps
-/// `#[derive(Default)]` (`[i32; 64]` itself carries no `Default` impl).
-/// Resident scratch on `WordDecorations` — zero allocation, ever.
+/// The vote accumulator, newtyped so the owning struct can derive `Default`.
+/// Resident scratch on `WordDecorations`.
 pub struct VoteScratch(pub [i32; 64]);
 
 impl Default for VoteScratch {
@@ -72,17 +66,13 @@ impl Default for VoteScratch {
     }
 }
 
-/// Which §3.2 kernel computes `ctx_fp` (the §7.5 gating rule, restated at the
-/// switch): the bit-sliced kernel ([`simhash_ctx_bitsliced`]) is SHIPPED,
-/// licensed by its green equivalence certificate — the ay QF_BV single-column
-/// miter + lane-independence lift
-/// (`crates/aterm-spec-models/proofs/ay/sparkle_v2/`, re-checked fail-closed
-/// by `aterm-spec/tests/sparkle_v2_ay_certificates.rs`) plus the in-tree
-/// 10k-voter-set property battery below (measured 13.4× on the persist-miss
-/// path; see PROOF_CARRYING_PERFORMANCE.md §7.5). The REFERENCE vote loop
-/// stays the oracle the battery compares against. Refuse, don't silently
-/// pass: if that gate ever goes red, flip this const back to `Reference` in
-/// the same change that reds it (§15.15).
+/// Which kernel computes `ctx_fp`. The bit-sliced kernel
+/// ([`simhash_ctx_bitsliced`]) ships, licensed by its equivalence
+/// certificate: the ay QF_BV single-column miter plus lane-independence lift
+/// (`crates/aterm-spec-models/proofs/ay/sparkle_v2/`, re-checked fail-closed by
+/// `aterm-spec/tests/sparkle_v2_ay_certificates.rs`) and the 10k-voter-set
+/// battery below. The reference vote loop is the battery's oracle. If that gate
+/// goes red, switch this back to `Reference` in the same change.
 pub const SIMHASH_KERNEL: SimhashKernel = SimhashKernel::BitSliced;
 
 /// §3.2 kernel selector — see [`SIMHASH_KERNEL`].
@@ -117,11 +107,10 @@ pub fn simhash_ctx(
     }
 }
 
-/// §3.2 context fingerprint, REFERENCE kernel: weighted SimHash over up to 4
-/// tokens on each side of the match span `[start, end)` (char indices into
-/// `chars`, one physical row — the walk never crosses a row by construction)
-/// plus the match's own `form_hash` at weight 3. `tok`/`folded` are resident
-/// caller scratch, so the walk allocates nothing after warmup. Runs only on a
+/// Context fingerprint, reference kernel: weighted SimHash over up to 4 tokens
+/// each side of the match span `[start, end)` (char indices into `chars`, one
+/// physical row) plus the match's `form_hash` at weight 3. `tok`/`folded` are
+/// resident scratch, so nothing allocates after warmup. Runs only on a
 /// persist-map miss.
 pub fn simhash_ctx_reference(
     chars: &[char],
@@ -173,10 +162,9 @@ fn cast_vote(votes: &mut [i32; 64], h: u64, w: i32) {
     }
 }
 
-/// Fold one candidate token, apply the §3.2 filter (votes only if alphabetic
-/// and ≥ 2 folded chars — digits, punctuation, and single letters are silent,
-/// so ticking clocks and spinners contribute nothing even at birth), then cast
-/// `h_t = mix(fnv(folded chars))` at weight `w`.
+/// Fold one candidate token, apply the filter (votes only if alphabetic with
+/// ≥ 2 folded chars, so digits, punctuation, clocks and spinners are silent),
+/// then cast `h_t = mix(fnv(folded chars))` at weight `w`.
 fn vote_token(
     tok_chars: &[char],
     w: i32,
@@ -189,9 +177,8 @@ fn vote_token(
     }
 }
 
-/// The fold + §3.2 filter + FNV/mix shared by BOTH kernels: `Some(h_t)` when
-/// the token votes, `None` when it is silent (non-alphabetic or < 2 folded
-/// chars). One implementation, so the kernels cannot drift on the filter.
+/// The fold, filter and FNV/mix shared by both kernels: `Some(h_t)` when the
+/// token votes, `None` when silent. One implementation, so the kernels agree.
 fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) -> Option<u64> {
     tok.clear();
     tok.extend(tok_chars.iter().copied());
@@ -207,18 +194,17 @@ fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) ->
     if len < 2 {
         return None;
     }
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = aterm_hash::FNV64_OFFSET;
     for c in folded.chars() {
-        h ^= c as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        h = aterm_hash::fnv_mix_u64(h, c as u64);
     }
     Some(mix(h))
 }
 
-/// Next token to the right of char index `pos`: skip non-token chars, then take
-/// the maximal token run using the scanner's own predicate + interior-joiner
-/// rule (`cat's` / `cat-like` are single tokens — aterm-lexicon `token_end`
-/// semantics). Returns `[s, e)` or `None` past end-of-row.
+/// Next token right of char index `pos`: skip non-token chars, then take the
+/// maximal token run using the scanner's predicate and interior-joiner rule
+/// (`cat's` / `cat-like` are one token, as in aterm-lexicon's `token_end`).
+/// Returns `[s, e)` or `None` past end-of-row.
 fn token_right(chars: &[char], mut pos: usize) -> Option<(usize, usize)> {
     let n = chars.len();
     while pos < n && !is_token_char(chars[pos]) {
@@ -265,41 +251,38 @@ fn token_left(chars: &[char], mut pos: usize) -> Option<(usize, usize)> {
     Some((s, e))
 }
 
-// ──────────── §3.2 bit-sliced kernel (v2.1, certificate-gated) ────────────
+// ──────────── Bit-sliced kernel (certificate-gated) ────────────
 //
-// The reference vote loop re-expressed as a carry-save-adder network over u64
-// lanes: lane i of every word is bit i of the fingerprint, so all 64 majority
-// columns are computed at once. The weights {4, 3, 2, 1} are binary-decomposed
-// into three bit-planes (§3.2: ≤ 3 / ≤ 5 / ≤ 2 inputs feeding a 5-bit-per-lane
-// CSA), and the signed majority `vote[i] >= 0` is taken in its equivalent
-// unsigned threshold form `2·S ≥ W` (S = per-lane sum of PRESENT set-bit
-// weights, W = present weight total — a scalar function of the presence mask;
-// ties → 1, matching the reference exactly).
+// The reference vote loop as a carry-save-adder network over u64 lanes: lane i
+// of every word is bit i of the fingerprint, so all 64 majority columns are
+// computed at once. Weights {4, 3, 2, 1} split into three bit-planes (≤ 3 / ≤ 5
+// / ≤ 2 inputs feeding a 5-bit-per-lane CSA), and the signed majority
+// `vote[i] >= 0` is taken as the unsigned threshold `2·S ≥ W` (S = per-lane sum
+// of present set-bit weights, W = present weight total; ties → 1, as in the
+// reference).
 //
-// LANE-INDEPENDENCE SIDE CONDITION (the §7.5 lift obligation, checked by
-// review + the equivalence battery): every op on voter data below is LANE-WISE
-// bitwise (XOR/AND/OR/NOT) — no u64 add/sub/shift ever touches voter words, so
-// no carry can cross lanes and the single-column certificate
+// Lane independence: every op on voter data is lane-wise bitwise (XOR/AND/OR/
+// NOT); no add, sub or shift touches voter words, so no carry crosses lanes and
+// the single-column certificate
 // (`proofs/ay/sparkle_v2/simhash_column_lemma.smt2`) lifts to all 64 lanes.
-// (`W`/`T` are scalar controls derived from the presence mask only; the
-// threshold bits enter the lanes as broadcast constant masks.)
+// `W`/`T` are scalars from the presence mask; threshold bits enter the lanes as
+// broadcast masks.
 
 /// The §3.2 voter slots in fixed order: `[form(3), right d1..4 (4,2,2,1),
 /// left d1..4 (4,2,2,1)]`.
 pub const SIMHASH_SLOT_WEIGHTS: [i32; 9] = [FORM_WEIGHT, 4, 2, 2, 1, 4, 2, 2, 1];
 
-/// A fully-collected §3.2 voter set: slot `i`'s token hash + a presence mask
-/// (bit `i` set ⇒ slot `i` votes at `SIMHASH_SLOT_WEIGHTS[i]`). Absent slots
-/// (no token at that distance, or a filter-silenced token) do not vote.
+/// A collected voter set: slot `i`'s token hash and a presence mask (bit `i`
+/// set means slot `i` votes at `SIMHASH_SLOT_WEIGHTS[i]`). Absent slots (no
+/// token at that distance, or filtered) do not vote.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct VoterSet {
     pub hash: [u64; 9],
     pub present: u16,
 }
 
-/// Reference majority over a collected [`VoterSet`] — byte-for-byte the
-/// `cast_vote` + signed-majority fold of [`simhash_ctx_reference`], factored
-/// so the equivalence battery and `bench_simhash_bitsliced` compare the two
+/// Reference majority over a [`VoterSet`]: the `cast_vote` + signed-majority
+/// fold of [`simhash_ctx_reference`], factored so the battery compares both
 /// kernels on identical inputs.
 #[cfg(test)]
 pub fn simhash_majority_reference(v: &VoterSet) -> u64 {
@@ -323,9 +306,9 @@ fn csa(a: u64, b: u64, c: u64) -> (u64, u64) {
     (a ^ b ^ c, (a & b) | (c & (a ^ b)))
 }
 
-/// §3.2 bit-sliced majority: the carry-save adder network. Pure function of
-/// the voter set; equals `simhash_majority_reference` on every input (the
-/// §7.5 certificate + the 10k-set property battery below).
+/// Bit-sliced majority via the carry-save adder network. Equals
+/// `simhash_majority_reference` on every input (the certificate and the 10k-set
+/// battery below).
 pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     // Masked lanes: an absent voter contributes no set bits (and, below, no
     // weight to W) — exactly the reference's "does not vote".
@@ -376,9 +359,9 @@ pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     ge
 }
 
-/// Collect the §3.2 voter set for a match span — the same token walk, filter,
-/// and hash as [`simhash_ctx_reference`] (shared via [`token_vote_hash`]),
-/// materialized instead of cast.
+/// Collect the voter set for a match span: the same walk, filter and hash as
+/// [`simhash_ctx_reference`] (via [`token_vote_hash`]), materialized instead of
+/// cast.
 fn collect_ctx_voters(
     chars: &[char],
     start: usize,
@@ -417,9 +400,8 @@ fn collect_ctx_voters(
     v
 }
 
-/// §3.2 context fingerprint, BIT-SLICED kernel (v2.1): the same walk + filter
-/// as the reference, majority taken by [`simhash_majority_bitsliced`]. NOT the
-/// live default — see [`SIMHASH_KERNEL`] and the §7.5 gating rule.
+/// Context fingerprint, bit-sliced kernel: the reference's walk and filter,
+/// majority by [`simhash_majority_bitsliced`]. Selected by [`SIMHASH_KERNEL`].
 pub fn simhash_ctx_bitsliced(
     chars: &[char],
     start: usize,
@@ -451,9 +433,7 @@ pub fn field(gkey: u64, lo: u32, n: u32) -> u64 {
     gray_decode((gkey >> lo) & ((1u64 << n) - 1))
 }
 
-/// Gray ENCODE (the exact inverse of [`gray_decode`]): `g = b ^ (b >> 1)`.
-/// v2.2 uses it to write the POST-§5.2-forcing paw count back into a bake art
-/// key, so forced and rolled identities that DRAW the same share a tile.
+/// Gray encode, the inverse of [`gray_decode`]: `g = b ^ (b >> 1)`.
 #[cfg(test)]
 pub fn gray_encode(b: u64) -> u64 {
     b ^ (b >> 1)
@@ -530,15 +510,12 @@ pub fn nova_features(g: u64) -> NovaFeatures {
     }
 }
 
-/// §3.4 single-field decodes, for the per-frame sites that read ONE feature
-/// of a genome that never changes for the life of its episode (audit
-/// driver-04): the burst-mutex predicate and the residual-fade windows read
-/// `duration_ms`, the ember/ink tints read `palette`, and the ignition-grant
-/// radius reads `radius`. Each used to pay the whole 9-field [`nova_features`]
-/// decode per occurrence per frame. The expressions are copied VERBATIM from
-/// the corresponding rows above and pinned bit-for-bit by
-/// `nova_single_field_accessors_match_full_decode` — a drift here is a silent
-/// visual change (a wrong window or a wrong tint), not a perf bug.
+/// Single-field nova decodes for per-frame sites that read one feature of a
+/// genome fixed for its episode: the burst-mutex predicate and residual-fade
+/// windows read `duration_ms`, the ember/ink tints `palette`, the ignition-grant
+/// radius `radius`, instead of the full [`nova_features`] decode. The
+/// expressions match the rows above and are pinned bit-for-bit by
+/// `nova_single_field_accessors_match_full_decode`.
 pub fn nova_duration_ms(g: u64) -> u32 {
     1000 + field(g, 9, 2) as u32 * 400 / 3
 }
@@ -553,10 +530,10 @@ pub fn nova_radius(g: u64) -> f32 {
     1.6 + field(g, 5, 2) as f32 * 0.2
 }
 
-/// §4.2/§3.4: the Gray-decoded ink-pair hue-nudge codes for a class. Profanity
-/// reads the NOVA layout window (bits 19..26); every other ink-bearing class —
-/// including `emphasis`, pinned by §4.2 — reads the CAT layout window
-/// (bits 26..33). Each 4-bit code maps to a hue rotation in `-18°..=+18°`.
+/// The Gray-decoded ink-pair hue-nudge codes for a class. Profanity reads the
+/// nova window (bits 19..26); every other ink-bearing class, `emphasis`
+/// included, reads the cat window (bits 26..33). Each 4-bit code maps to a hue
+/// rotation in `-18°..=+18°`.
 pub fn ink_pair_nudges(class: Class, gkey: u64) -> (u8, u8) {
     let lo = if class == Class::Profanity { 19 } else { 26 };
     (field(gkey, lo, 4) as u8, field(gkey, lo + 4, 4) as u8)
@@ -611,9 +588,8 @@ pub fn nova_magic(magic: u64) -> Option<NovaMagic> {
     }
 }
 
-/// v3 rare accessory (sparkle-words v3 design §2.1) — worn only by ordinary
-/// ([`cat_magic`] `== None`) cats; the gate is structural in
-/// [`cat_accessory`].
+/// A rare accessory, worn only by ordinary ([`cat_magic`] `== None`) cats; the
+/// gate is structural in [`cat_accessory`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[cfg(test)]
 pub enum Accessory {
@@ -627,11 +603,9 @@ pub enum Accessory {
     Crown,
 }
 
-/// §2.1 accessory window: `(magic >> 24) % 4096` — a fresh window,
-/// independent of the `% 4096` cat window and the `>> 12` nova window.
-/// Structurally `None` for any magic-build cat (accessories never stack on
-/// Fortune/Nebula/Butterfly/Sakura); rates tests therefore CONDITION on
-/// `cat_magic == None` (the marginal is `(4033/4096)·rate`).
+/// Accessory window `(magic >> 24) % 4096`, independent of the `% 4096` cat
+/// window and the `>> 12` nova window. `None` for any magic-build cat, so rate
+/// tests condition on `cat_magic == None` (marginal `(4033/4096)·rate`).
 #[cfg(test)]
 pub fn cat_accessory(magic: u64) -> Option<Accessory> {
     if cat_magic(magic).is_some() {
@@ -646,14 +620,12 @@ pub fn cat_accessory(magic: u64) -> Option<Accessory> {
     }
 }
 
-// ──────────────────── cat-art v4 genome selectors (design §3) ────────────────────
+// ──────────────────── Cat-art v4 genome selectors ────────────────────
 //
-// The v4 gkey field layout (docs/cat-art-v4-design.md §3) reindexes the low
-// bits onto the authored-glyph roster: a variant picks a HEAD, the coat/iris
-// ramps recolor the `Recolor::Coat`/`Recolor::Iris` layers, and the age band
-// scales the body. These decode ALONGSIDE the v2/v3 `cat_features` (kept live
-// for the procedural path until the Cleanup phase) — same `field`/Gray decode,
-// a fresh bit assignment:
+// The v4 gkey layout (docs/cat-art-v4-design.md §3) maps the low bits onto the
+// authored-glyph roster: a variant picks a head, the coat/iris ramps recolour
+// the `Recolor::Coat`/`Recolor::Iris` layers, and the age band scales the body.
+// Same `field`/Gray decode:
 //
 //   | bits  | field   | maps to                                   |
 //   |-------|---------|-------------------------------------------|
@@ -663,19 +635,17 @@ pub fn cat_accessory(magic: u64) -> Option<Accessory> {
 //   | 13–14 | age     | body scale (0.82/0.93/1.04/1.15)          |
 //   | 34–63 | head spill | independent entropy for tail tickets   |
 
-/// Reduce the independent 30-bit head-spill field onto `[0, upper)` with
-/// multiply-high. This is constant-time, allocation-free, and its finite-domain
-/// discrepancy is at most one ticket out of 2^30.
+/// Reduce the 30-bit head-spill field onto `[0, upper)` by multiply-high:
+/// constant-time, allocation-free, discrepancy at most one ticket in 2^30.
 #[inline]
 fn scale_head_spill(entropy: u64, upper: usize) -> usize {
     ((u128::from(entropy) * upper as u128) >> 30) as usize
 }
 
-/// v4 §3: the authored HEAD this genome wears. The largest complete multiple
-/// of the roster in the Gray-decoded 6-bit field supplies an equal number of
-/// primary tickets to every head. A tail ticket takes exactly one draw from the
-/// dedicated Gray-decoded bits 34–63; coat, iris, age, motion, and ink fields
-/// therefore cannot change the head. There is no loop, allocation, or unbounded
+/// The authored head this genome wears. The largest complete multiple of the
+/// roster in the Gray-decoded 6-bit field gives every head an equal number of
+/// primary tickets; a tail ticket takes one draw from Gray-decoded bits 34–63,
+/// so coat, iris, age, motion and ink fields cannot change the head. No loop or
 /// rejection.
 #[inline]
 fn cat_variant_index_v4(gkey: u64) -> usize {
@@ -695,10 +665,9 @@ pub fn cat_variant_v4(gkey: u64) -> CatGlyphId {
     HEADS[cat_variant_index_v4(gkey)]
 }
 
-/// v4 §3: the `(coat, iris)` ramp indices for this genome — `coat = field(6,4)`
-/// (0..=15, a `COAT_RAMP` stop) and `iris = field(10,3)` (0..=7, an `EYE_RAMP`
-/// stop). Returns the raw indices (the `Eq`-safe `BakeKeyV4` fields); the baker
-/// resolves them to colours through `ResolvedFills::from_indices`.
+/// The `(coat, iris)` ramp indices: `coat = field(6,4)` (0..=15, a `COAT_RAMP`
+/// stop) and `iris = field(10,3)` (0..=7, an `EYE_RAMP` stop). The baker
+/// resolves them via `ResolvedFills::from_indices`.
 #[must_use]
 pub fn cat_fills_v4(gkey: u64) -> (u8, u8) {
     (field(gkey, 6, 4) as u8, field(gkey, 10, 3) as u8)
@@ -711,14 +680,13 @@ pub fn cat_age_v4(gkey: u64) -> CatAge {
     AGES[field(gkey, 13, 2) as usize]
 }
 
-/// v4 §3 special window (`magic % 4096`): a special glyph REPLACES the head
-/// (its own `word_top` anchor drives the peek). Per the resolved-blocker
-/// remap, Fortune → the maneki-neko; the other rare windows fold onto the seven
-/// remaining authored specials (witch / sleeping / yarn / Toastbyte / tuxedo /
-/// tabby-bell / fluffy). `None` = an ordinary head.
+/// The special window (`magic % 4096`): a special glyph replaces the head (its
+/// `word_top` anchor drives the peek). Maneki-neko, then seven authored specials
+/// (witch / sleeping / yarn / Toastbyte / tuxedo / tabby-bell / fluffy). `None`
+/// is an ordinary head.
 ///
-/// Windows over `magic % 4096`: Maneki `0..=7` (8/4096 = 1/512), then seven
-/// specials at 4/4096 (1/1024) each in `8..=35`.
+/// Windows over `magic % 4096`: Maneki `0..=7` (1/512), then the seven at
+/// 4/4096 (1/1024) each in `8..=35`.
 #[must_use]
 pub fn special_variant_v4(magic: u64) -> Option<CatGlyphId> {
     match magic % 4096 {
@@ -734,16 +702,12 @@ pub fn special_variant_v4(magic: u64) -> Option<CatGlyphId> {
     }
 }
 
-/// v4 §3 overlay-accessory window (`(magic >> 24) % 4096`): the three authored
-/// accessory glyphs OVERLAY the chosen head (Bow left-ear, Crown dome crest,
-/// Bell collar/chin). The v2/v3 Sunglasses + WitchHat windows are RETIRED
-/// (folded into no-accessory — no hat/glasses overlay glyph exists; the witch
-/// LOOK ships as [`CatGlyphId::SpecWitch`]). Structurally `None` for any
-/// special-build cat (an accessory never stacks on a special), so callers
-/// condition rates on `special_variant_v4 == None`.
+/// The overlay-accessory window (`(magic >> 24) % 4096`): Bow (left ear), Crown
+/// (dome crest) or Bell (collar) overlaid on the head. `None` for any special
+/// build, so callers condition rates on `special_variant_v4 == None`.
 ///
-/// Windows over `(magic >> 24) % 4096`: Bow `0..=127` (128/4096 = 1/32),
-/// Crown `128..=131` (4/4096 = 1/1024), Bell `132..=147` (16/4096 = 1/256).
+/// Windows: Bow `0..=127` (1/32), Crown `128..=131` (1/1024), Bell `132..=147`
+/// (1/256).
 #[must_use]
 pub fn accessory_variant_v4(magic: u64) -> Option<CatGlyphId> {
     if special_variant_v4(magic).is_some() {
@@ -761,9 +725,9 @@ pub fn accessory_variant_v4(magic: u64) -> Option<CatGlyphId> {
 mod tests {
     use super::*;
 
-    /// `(lo, n)` of every Gray-decoded field in the cat-art v4 CAT layout (§3):
-    /// variant / coat / iris / age over bits 0..=14, plus the still-live ink-pair
-    /// hue-nudge window (bits 26..=33).
+    /// `(lo, n)` of every Gray-decoded field in the v4 cat layout: variant / coat
+    /// / iris / age over bits 0..=14, plus the ink-pair hue-nudge window (bits
+    /// 26..=33).
     const CAT_GRAY_FIELDS: &[(u32, u32)] = &[
         (0, 6),  // variant (index into HEADS)
         (6, 4),  // coat (COAT_RAMP index)
@@ -863,10 +827,9 @@ mod tests {
         assert_eq!(a, b, "digit/punct churn must not move a single bit");
     }
 
-    /// §13 `gray_decode_locality` (the honest §3.3 property): flipping bit 0 of
-    /// each field moves that feature EXACTLY ±1 step; flipping bit k stays a
-    /// bounded block reflection (mean |Δstep| under the pinned bound); and every
-    /// flip stays inside its own field (no carry into a neighbor).
+    /// `gray_decode_locality`: flipping bit 0 of a field moves it exactly ±1
+    /// step; flipping bit k is a bounded block reflection (mean |Δstep| under
+    /// the bound); no flip leaves its field.
     #[test]
     fn gray_decode_locality() {
         let fields = all_fields();
@@ -886,10 +849,9 @@ mod tests {
                     "bit-0 flip at lo={lo} n={n} must move exactly 1 step"
                 );
             }
-            // (b) mean |Δstep| over random single-bit flips within the field is
-            // under the pinned bound. Exact expectation over uniform values is
-            // (2^n − 1)/n (bit k reflects a 2^(k+1) block ⇒ mean 2^k); pin at
-            // 1.2× to absorb sampling noise from the deterministic stream.
+            // (b) Mean |Δstep| over random single-bit flips is under the bound:
+            // the exact expectation is (2^n − 1)/n; pinned at 1.2× for sampling
+            // noise.
             let mut total = 0i64;
             let mut count = 0i64;
             for &g in &gkeys {
@@ -932,12 +894,10 @@ mod tests {
         }
     }
 
-    /// §13 `magic_windows_hit_expected_rates`: 1e6 synthetic contexts land each
-    /// still-live §3.5 magic window (cat Fortune/Nebula/Butterfly/Sakura — the
-    /// Kitty-Log magic bucket + dwell bonus — and nova Quasar/Singularity) within
-    /// 3σ of its design rate, and every value of every Gray field is observed
-    /// (reachability). The v4 special/accessory windows are covered by
-    /// [`v4_magic_windows_hit_expected_rates`].
+    /// 1e6 synthetic contexts land each §3.5 magic window (cat
+    /// Fortune/Nebula/Butterfly/Sakura, nova Quasar/Singularity) within 3σ of
+    /// its rate, and every value of every Gray field is reachable. The v4
+    /// windows are covered by [`v4_magic_windows_hit_expected_rates`].
     #[test]
     fn magic_windows_hit_expected_rates() {
         const N: u64 = 1_000_000;
@@ -1001,11 +961,9 @@ mod tests {
         assert!(rot_seen.iter().all(|&b| b), "nova rot raw field unreached");
     }
 
-    /// cat-art v4 §3: the special/accessory magic windows land within 3σ of
-    /// their remapped design rates, accessories conditioned on the ordinary
-    /// (`special_variant_v4 == None`) build, every head lands within 5σ of its
-    /// uniform 1/HEADS rate, and every v4 low-field value is reachable. The
-    /// Sunglasses + WitchHat windows are retired — folded into no-accessory.
+    /// The v4 special/accessory windows land within 3σ of their rates
+    /// (accessories conditioned on `special_variant_v4 == None`), every head
+    /// within 5σ of 1/HEADS, and every v4 low-field value is reachable.
     #[test]
     fn v4_magic_windows_hit_expected_rates() {
         use crate::cat_glyphs_gen::HEADS;
@@ -1156,9 +1114,8 @@ mod tests {
 
     #[test]
     fn v4_head_spill_is_independent_of_coat_iris_age_motion_and_ink() {
-        // Tail tickets are the only ones that consult spill entropy. For every
-        // one, changing any documented non-head field below bit 34 must leave
-        // the selected head unchanged.
+        // Only tail tickets consult spill entropy; for each, changing any
+        // non-head field below bit 34 must leave the head unchanged.
         for raw_variant in 0..64u64 {
             if field(raw_variant, 0, 6) < 50 {
                 continue;
@@ -1186,9 +1143,8 @@ mod tests {
         }
     }
 
-    /// The cat-art v4 §3 selectors + the nova decoder honor their documented
-    /// ranges/reachability at the field extremes: every HEAD variant, every coat
-    /// / iris / age band, and the nova feature ranges.
+    /// The v4 selectors and the nova decoder honour their ranges at the field
+    /// extremes: every head, coat, iris and age band, and the nova ranges.
     #[test]
     fn feature_decoders_cover_documented_ranges() {
         use crate::cat_glyphs_gen::HEADS;
@@ -1224,12 +1180,9 @@ mod tests {
         assert_eq!(rays, (5, 8), "rays span 5..=8");
     }
 
-    /// The single-field nova accessors ARE the corresponding rows of
-    /// [`nova_features`] — bit-for-bit, over the same `mix` stream the range
-    /// test sweeps. This equality is what makes substituting them at the hot
-    /// per-frame sites invisible on the glass: same duration ⇒ same burst and
-    /// fade windows, same palette ⇒ same tints, same radius ⇒ same rings.
-    /// (`to_bits` on the radius so the pin is exact, not epsilon-close.)
+    /// The single-field nova accessors equal the matching rows of
+    /// [`nova_features`] bit-for-bit over the range test's `mix` stream
+    /// (`to_bits` on the radius).
     #[test]
     fn nova_single_field_accessors_match_full_decode() {
         for i in 0..8192u64 {
@@ -1255,12 +1208,10 @@ mod tests {
         v
     }
 
-    /// §3.2/§7.5 equivalence battery: the bit-sliced CSA kernel equals the
-    /// reference vote loop over 10k random voter sets PLUS the edge cases —
-    /// 0/1/9 voters, all-equal hashes, and deliberate tie patterns (the
-    /// ties-→-1 clause is exactly where a threshold off-by-one would hide).
-    /// This is the runnable-now half of the certificate; the ay QF_BV column
-    /// lemma (proofs/ay/sparkle_v2/) is the full-domain half.
+    /// The bit-sliced CSA kernel equals the reference over 10k random voter sets
+    /// plus edge cases: 0/1/9 voters, all-equal hashes, and tie patterns (where
+    /// a threshold off-by-one would hide). The ay QF_BV column lemma
+    /// (proofs/ay/sparkle_v2/) is the full-domain half.
     #[test]
     fn simhash_bitsliced_equals_reference_over_voter_sets() {
         let eq = |v: &VoterSet, label: &str| {
@@ -1295,8 +1246,8 @@ mod tests {
             assert_eq!(simhash_majority_bitsliced(&v), v.hash[0]);
         }
         // Tie patterns: two equal-weight voters with complementary hashes
-        // (per-bit sum 0 ⇒ ties resolve to 1 on BOTH kernels), across every
-        // equal-weight slot pair and hash pattern.
+        // (per-bit sum 0, ties resolve to 1 on both kernels), across every
+        // equal-weight slot pair.
         for (a, b) in [(2usize, 3usize), (2, 6), (3, 7), (6, 7), (1, 5), (4, 8)] {
             for i in 0..64u64 {
                 let mut v = VoterSet {
@@ -1335,9 +1286,8 @@ mod tests {
         }
     }
 
-    /// The end-to-end siblings agree: same token walk, same filter, same
-    /// majority — over real text incl. bare words, clock/spinner-silenced
-    /// contexts, and joiner tokens.
+    /// End to end the kernels agree over real text, including bare words,
+    /// clock/spinner-silenced contexts and joiner tokens.
     #[test]
     fn simhash_ctx_bitsliced_matches_reference_kernel_on_text() {
         let texts: &[(&str, &str)] = &[
@@ -1360,58 +1310,6 @@ mod tests {
                 assert_eq!(reference, bitsliced, "kernels diverged on {text:?}");
             }
         }
-    }
-
-    /// §7.4 `bench_simhash_bitsliced`: reference vs bit-sliced kernel on
-    /// identical voter sets. The delta is honestly labeled sub-µs (§3.2 — the
-    /// row exists to keep the certified-optimization claim measured, §15.15).
-    /// Timing-sensitive, so it follows the repo's manual-timing idiom:
-    ///
-    /// ```sh
-    /// cargo test -p aterm-effects --release bench_simhash_bitsliced -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "perf gate (design §7.4): run manually in --release with --ignored --nocapture"]
-    fn bench_simhash_bitsliced() {
-        use std::hint::black_box;
-        use std::time::{Duration, Instant};
-        const SETS: usize = 1024;
-        const ITERS: usize = 200;
-        let sets: Vec<VoterSet> = (0..SETS as u64)
-            .map(|i| voter_set(i, ((mix(i) & 0x1FF) as u16) | 1))
-            .collect();
-        let mut t_ref = Vec::with_capacity(ITERS);
-        let mut t_bs = Vec::with_capacity(ITERS);
-        let (mut acc_r, mut acc_b) = (0u64, 0u64);
-        for _ in 0..ITERS {
-            let s = Instant::now();
-            for v in &sets {
-                acc_r ^= simhash_majority_reference(black_box(v));
-            }
-            t_ref.push(s.elapsed());
-            let s = Instant::now();
-            for v in &sets {
-                acc_b ^= simhash_majority_bitsliced(black_box(v));
-            }
-            t_bs.push(s.elapsed());
-        }
-        assert_eq!(acc_r, acc_b, "kernels must agree on the benched inputs");
-        t_ref.sort();
-        t_bs.sort();
-        let (mr, mb) = (t_ref[ITERS / 2], t_bs[ITERS / 2]);
-        let per = |d: Duration| d.as_nanos() as f64 / SETS as f64;
-        println!(
-            "bench_simhash_bitsliced: reference median {mr:?} ({:.1} ns/set), \
-             bit-sliced median {mb:?} ({:.1} ns/set) over {ITERS} x {SETS}-set passes \
-             (speedup {:.1}x; both kernels honestly sub-µs per set)",
-            per(mr),
-            per(mb),
-            per(mr) / per(mb)
-        );
-        assert!(
-            mb <= mr,
-            "the bit-sliced kernel must not be slower than the reference (bs {mb:?} vs ref {mr:?})"
-        );
     }
 
     #[test]

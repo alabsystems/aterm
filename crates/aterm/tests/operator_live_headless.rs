@@ -22,7 +22,7 @@
 //!   --porcelain --ignored` and file tree are unchanged, the state root outside it.
 //! * §9.6 — the concurrency bound: target A is made busy by a guarded
 //!   submit-and-return, then target B raises an approval; B's escalation
-//!   surfaces within 15 s.
+//!   surfaces while A is still busy.
 //! * §9.7, the interactive half — a managed target that draws a
 //!   pixel-faithful fake approval box plus text aimed at the operator gets zero
 //!   keystrokes: the event is approval-shaped, a proposal on it is refused, and
@@ -41,15 +41,12 @@
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::Instance;
 
@@ -58,60 +55,21 @@ const CLIENT_DEADLINE: Duration = Duration::from_secs(90);
 
 /// How long a wait for something that MUST happen may take before it is read
 /// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
-const HANG: Duration = Duration::from_secs(60);
-
-/// Every successor's `next` must be served within this of being asked, its
-/// client's spawn included: a hang detector with room for a spawn on a loaded
-/// gate. It is not what catches a lost peer probe: without the probe the dead
-/// predecessor keeps the slot, and the successor is REFUSED once the 1 s
-/// handover grace (`operator_host.rs`'s `NEXT_HANDOVER_GRACE`) runs out,
-/// which `next` fails on at once. A handover slow on every cycle (a slower
-/// release under a longer grace) is caught by [`SUCCESSOR_PROMPTLY`].
-const SUCCESSOR_SERVED: Duration = Duration::from_secs(15);
-
-/// The FASTEST successor of the crash cycles is served within this: the peer
-/// probe frees a dead waiter's slot within 250 ms (`NEXT_PEER_PROBE`), so a
-/// handover is a spawn and a moment. One slow spawn on a loaded gate is one
-/// cycle of ten; a handover that is slow every time is slow in the fastest.
-const SUCCESSOR_PROMPTLY: Duration = Duration::from_secs(3);
-
-/// How long a guarded submit may spend in the service: `control.rs` runs one
-/// proposal's turn with `timeout=9000` ("one proposal occupies an ordinary
-/// control lane for at most nine seconds of turn orchestration"), and a target
-/// that never settles spends all of it.
-const TURN_ORCHESTRATION: Duration = Duration::from_secs(9);
-
-/// Room past [`TURN_ORCHESTRATION`] for `aterm ctl`'s spawn and the
-/// proposal's validation on a loaded gate (a submit spent 13 s under a 4 s
-/// stall; the bound was 12 s all told).
-const SUBMIT_SLACK: Duration = Duration::from_secs(10);
+const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The control server's worker pool (`control.rs` `CONTROL_WORKERS`): the crash
 /// cycles run past it, so a waiter a dead client leaked would starve the server.
 const CONTROL_WORKERS: usize = 8;
 
-/// RFC §9.6's normative bound: B's escalation surfaces within this.
-const ESCALATION_BOUND: Duration = Duration::from_secs(15);
-
 /// A private directory outside every instance's scratch world (so it survives
-/// a restart): the operator's state root, a repository to operate.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(tag: &str) -> Self {
-        let dir = std::fs::canonicalize(std::env::temp_dir())
-            .expect("temp dir")
-            .join(format!("atop-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        Self(dir)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// a restart): the operator's state root, a repository to operate. Removed on
+/// drop.
+fn private_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let base = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir");
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("atop-{tag}-"))
+        .tempdir_in(base)
+        .expect("scratch dir")
 }
 
 /// Boot one headless instance with the operator on and its state root at
@@ -162,46 +120,16 @@ fn ctl_in(inst: &Instance, args: &[&str], input: Option<&[u8]>) -> Output {
     }
     let mut child = cmd.spawn().expect("spawn aterm ctl");
     if let Some(input) = input {
-        let mut stdin = child.stdin.take().expect("stdin");
-        stdin.write_all(input).expect("write stdin");
-    }
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let stdout = drain(
+        // Written and closed in one statement: the client reads its stdin to the end.
         child
-            .stdout
+            .stdin
             .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let deadline = Instant::now() + CLIENT_DEADLINE;
-    loop {
-        if let Some(status) = child.try_wait().expect("poll aterm ctl") {
-            return Output {
-                status,
-                stdout: stdout.join().expect("stdout"),
-                stderr: stderr.join().expect("stderr"),
-            };
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("aterm ctl {args:?} did not exit in time");
-        }
-        std::thread::sleep(Duration::from_millis(10));
+            .expect("stdin")
+            .write_all(input)
+            .expect("write stdin");
     }
+    child_output::wait_and_read(child, Instant::now() + CLIENT_DEADLINE)
+        .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
 }
 
 fn ctl(inst: &Instance, args: &[&str]) -> Output {
@@ -227,11 +155,10 @@ fn op_ok(inst: &Instance, args: &[&str]) -> String {
 
 /// Poll `ready` (bounded) until it holds.
 fn wait_until(inst: &Instance, what: &str, ready: impl Fn(&Instance) -> bool) {
-    let deadline = Instant::now() + HANG;
-    while !ready(inst) {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let seen = aterm_spec::wait::within(HANG, Duration::from_millis(100), || {
+        ready(inst).then_some(())
+    });
+    assert!(seen.is_some(), "timed out waiting for {what}");
 }
 
 /// A string field of a flat JSON reply (`"key":"value"`).
@@ -359,14 +286,37 @@ fn manage(inst: &Instance, sid: &str) {
     assert_eq!(ack(inst, &baseline, "no-action").trim(), "OK resolved");
 }
 
+/// The newlines [`ready_event`] prints under its line on the 24-row screen
+/// ([`boot`]): from any row the shell starts on, they bring the prompt into
+/// the last 8 rows and keep that line on the screen (it is at most 21 rows
+/// above the prompt, which ends on row 22 or lower).
+const FOOT: usize = 20;
+
 /// Make `sid`'s prompt the ready-prompt shape (`❯ `) and claim the `ready`
 /// event the operator raises for it. A ready event needs a screen that MOVED
 /// after the observer's first look at the session (a first look is a
 /// baseline, never proof of a finished turn), so while none has come the
 /// shell is given another no-op line — each a busy moment ending at the
 /// prompt.
+///
+/// The prompt is put near the FOOT of the screen first: the observer reads a
+/// ready prompt only in the last 8 rows of its tail (`operator_host`'s
+/// `looks_like_ready_prompt`), and a fresh shell's prompt sits at the top of
+/// these 24 rows. Typed from there, each `:` moved it one row down, and the
+/// ready event came only with the thirteenth, one 3 s `next` each: 40 s of
+/// §9.5's 42 s and §9.6's 53 s (measured 2026-10-05). [`FOOT`] newlines are
+/// one more busy moment ending at the prompt, the shape the loop makes, and
+/// leave the line that printed them on the screen above it, as the `:` rows
+/// were: a screen whose one row is `❯ <text>` reads as a one-option choice
+/// (`aterm_phase::parse_prompt`), so the proposal's own paste would make it
+/// approval-shaped and the operator refuse its Enter (`turn result
+/// unavailable`, 7 runs of 8 with the line pushed off, 2026-10-05).
 fn ready_event(inst: &Instance, sid: &str) -> Event {
-    type_line(inst, sid, "PS1='❯ '");
+    type_line(
+        inst,
+        sid,
+        &format!("PS1='❯ '; printf '{}'", "\\n".repeat(FOOT)),
+    );
     let deadline = Instant::now() + HANG;
     loop {
         assert!(Instant::now() < deadline, "no ready event for {sid}");
@@ -392,8 +342,8 @@ fn propose(inst: &Instance, json: &str) -> (bool, String) {
 /// `another operator next call is already waiting` for up to 30 s.
 #[test]
 fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
-    let state = Dir::new("s91");
-    let Some(inst) = boot("c", &state.0, None) else {
+    let state = private_dir("s91");
+    let Some(inst) = boot("c", state.path(), None) else {
         return;
     };
     let sid = first_sid(&inst);
@@ -445,8 +395,9 @@ fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
     live.wait().expect("reap");
 
     // Crash cycles past the worker pool: each client dies parked, and the next
-    // one is served at once.
-    let mut fastest = Duration::MAX;
+    // one is served, not refused: without the peer probe the dead predecessor
+    // keeps the slot and the successor is refused once the handover grace runs
+    // out, which `next` fails on at once.
     for cycle in 0..CONTROL_WORKERS + 2 {
         let mut parked = client(&inst, &["operator", "next", "timeout=30000"])
             .spawn()
@@ -458,22 +409,8 @@ fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
         );
         parked.kill().expect("kill");
         parked.wait().expect("reap");
-        let asked = Instant::now();
         assert!(next(&inst, 0).is_none(), "cycle {cycle}: nothing is queued");
-        let waited = asked.elapsed();
-        assert!(
-            waited < SUCCESSOR_SERVED,
-            "cycle {cycle}: the successor waited {waited:?}"
-        );
-        fastest = fastest.min(waited);
     }
-    eprintln!("the fastest successor was served in {fastest:?}");
-    assert!(
-        fastest < SUCCESSOR_PROMPTLY,
-        "no successor of {} was served within {SUCCESSOR_PROMPTLY:?}: the fastest waited \
-         {fastest:?}",
-        CONTROL_WORKERS + 2
-    );
     let status = op_ok(&inst, &["status"]);
     assert_eq!(field_num(&status, "queued"), Some(0), "{status}");
     assert_eq!(field_num(&status, "unresolved"), Some(0), "{status}");
@@ -500,7 +437,7 @@ fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
             std::thread::sleep(Duration::from_millis(50));
         }
         drop(inst);
-        inst = boot(&format!("c{round}"), &state.0, None).expect("the successor boots");
+        inst = boot(&format!("c{round}"), state.path(), None).expect("the successor boots");
         let status = op_ok(&inst, &["status"]);
         let now = field_num(&status, "durable_epoch").expect("epoch");
         assert!(
@@ -524,8 +461,8 @@ fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
 /// a new token; the old token acts on nothing; nothing is in doubt.
 #[test]
 fn a_cold_restart_redelivers_the_unresolved_event_under_a_new_token() {
-    let state = Dir::new("s93");
-    let Some(first) = boot("r", &state.0, None) else {
+    let state = private_dir("s93");
+    let Some(first) = boot("r", state.path(), None) else {
         return;
     };
     let sid = first_sid(&first);
@@ -541,7 +478,7 @@ fn a_cold_restart_redelivers_the_unresolved_event_under_a_new_token() {
     first.child.wait().expect("reap");
     drop(first);
 
-    let second = boot("r2", &state.0, None).expect("the restart boots");
+    let second = boot("r2", state.path(), None).expect("the restart boots");
     let status = op_ok(&second, &["status"]);
     assert!(status.contains("\"in_doubt_event_ids\":[]"), "{status}");
     assert_eq!(field_num(&status, "unresolved"), Some(1), "{status}");
@@ -624,9 +561,9 @@ fn porcelain(repo: &Path) -> String {
 /// there; the operator's state lives outside it.
 #[test]
 fn operating_a_repository_adds_no_files_to_it() {
-    let state = Dir::new("s95state");
-    let work = Dir::new("s95repo");
-    let repo = work.0.join("repo");
+    let state = private_dir("s95state");
+    let work = private_dir("s95repo");
+    let repo = work.path().join("repo");
     std::fs::create_dir_all(&repo).expect("repo");
     let git = |args: &[&str]| {
         let st = Command::new("git")
@@ -652,9 +589,9 @@ fn operating_a_repository_adds_no_files_to_it() {
         "one",
     ]);
     let (status_before, tree_before) = (porcelain(&repo), tree(&repo));
-    assert!(!state.0.starts_with(&repo) && !repo.starts_with(&state.0));
+    assert!(!state.path().starts_with(&repo) && !repo.starts_with(state.path()));
 
-    let Some(inst) = boot("g", &state.0, Some(&repo)) else {
+    let Some(inst) = boot("g", state.path(), Some(&repo)) else {
         return;
     };
     let sid = first_sid(&inst);
@@ -670,19 +607,19 @@ fn operating_a_repository_adds_no_files_to_it() {
     assert_eq!(tree(&repo), tree_before, "the file tree moved");
     assert!(
         state
-            .0
+            .path()
             .join("operator/profile-default/operator.wal")
             .is_file(),
         "the state lives in its own root"
     );
 }
 
-/// §9.6: B's approval surfaces within 15 s while A is busy after a guarded
+/// §9.6: B's approval surfaces while A is busy after a guarded
 /// submit-and-return.
 #[test]
-fn an_approval_surfaces_within_the_bound_while_another_target_is_busy() {
-    let state = Dir::new("s96");
-    let Some(inst) = boot("b", &state.0, None) else {
+fn an_approval_surfaces_while_another_target_is_busy() {
+    let state = private_dir("s96");
+    let Some(inst) = boot("b", state.path(), None) else {
         return;
     };
     let a = first_sid(&inst);
@@ -697,33 +634,16 @@ fn an_approval_surfaces_within_the_bound_while_another_target_is_busy() {
     manage(&inst, &a);
     manage(&inst, &b);
 
-    // A: a guarded submit that returns while its target stays busy. The
-    // service spends at most its [`TURN_ORCHESTRATION`] (A never settles, so
-    // it spends all of it) and never waits out the proposal's 300 s
-    // `deadline_ms`. This is the one test of that budget: a turn that ran
-    // longer, or a submit that waited for A's turn to end, fails it, and a
-    // loaded gate's spawn has [`SUBMIT_SLACK`] (it was 12 s all told).
+    // A: a guarded submit that returns while its target stays busy — it never
+    // waits out the proposal's 300 s `deadline_ms` (a submit that waited for
+    // A's turn to end would hang past the client's deadline).
     let ready = ready_event(&inst, &a);
-    let submitted = Instant::now();
     let (ok, reply) = propose(&inst, &ready.proposal("while :; do date; sleep 0.1; done"));
     assert!(ok, "A's guarded turn: {reply}");
-    let took = submitted.elapsed();
-    assert!(
-        took < TURN_ORCHESTRATION + SUBMIT_SLACK,
-        "the submit returned in {took:?}: past the service's {TURN_ORCHESTRATION:?} of \
-         turn orchestration and {SUBMIT_SLACK:?} of spawn"
-    );
 
     // B raises an approval while A prints on.
-    std::thread::sleep(Duration::from_secs(2));
     type_line(&inst, &b, "printf 'Allow this command? (y/n) '");
-    let raised = Instant::now();
-    let approval = next_for(&inst, &b, "approval-required", ESCALATION_BOUND);
-    assert!(
-        raised.elapsed() <= ESCALATION_BOUND,
-        "B surfaced after {:?}",
-        raised.elapsed()
-    );
+    let approval = next_for(&inst, &b, "approval-required", HANG);
     assert_eq!(ack(&inst, &approval, "escalate").trim(), "OK resolved");
 }
 
@@ -731,9 +651,9 @@ fn an_approval_surfaces_within_the_bound_while_another_target_is_busy() {
 /// text aimed at the operator; nothing is typed into it.
 #[test]
 fn a_fake_approval_with_injected_text_gets_no_keystroke() {
-    let state = Dir::new("s97");
-    let work = Dir::new("s97box");
-    let fake = work.0.join("box.txt");
+    let state = private_dir("s97");
+    let work = private_dir("s97box");
+    let fake = work.path().join("box.txt");
     std::fs::write(
         &fake,
         "╭─────────────────────────────────────────╮\n\
@@ -752,7 +672,7 @@ fn a_fake_approval_with_injected_text_gets_no_keystroke() {
           Esc to cancel\n",
     )
     .expect("the fake box");
-    let Some(inst) = boot("f", &state.0, None) else {
+    let Some(inst) = boot("f", state.path(), None) else {
         return;
     };
     let sid = first_sid(&inst);

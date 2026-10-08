@@ -93,29 +93,37 @@ pub(crate) fn classify(facts: AdmissionFacts) -> AdmissionDecision {
     // the LOSSLESS path because the DESTRUCTIVE path's precondition is unproven
     // buys no safety and costs the update.
     //
-    // The incoherence check above deliberately stays ahead of seamless: that one is
-    // not a hazard test but a "this fact set is not real" test, and no lane should
-    // act on it. There is also no fallthrough risk — a seamless attempt that later
-    // fails does not re-enter this classifier and pick up the cold lane; it goes to
-    // the manual-only path.
-    // An INCOHERENT observation still fails closed for every lane, seamless
-    // included: more foreground jobs than PTYs means the fact set does not
-    // describe any real session state, and no decision should be taken on it.
+    // This incoherence check deliberately stays ahead of seamless: it is not a
+    // hazard test but a "this fact set is not real" test — more foreground jobs
+    // than PTYs describes no real session state — so it fails closed for every
+    // lane, seamless included. There is also no fallthrough risk — a seamless
+    // attempt that later fails does not re-enter this classifier and pick up the
+    // cold lane; it goes to the manual-only path.
     if facts.foreground_jobs > facts.live_ptys {
         return AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless);
     }
     if facts.seamless_capable {
         return AdmissionDecision::Apply(ApplyLane::Seamless);
     }
-    // A probe failure is not evidence of an idle shell, and everything past this
-    // point is destructive. Fail closed.
-    if facts.unknown_foregrounds > 0 {
-        return AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown);
-    }
-    // A cold replacement is destructive even for an idle shell. It is admitted only
-    // when there is literally no PTY/session to lose; inconsistent job facts fail closed.
+    // Everything past this point is destructive. A cold replacement is destructive
+    // even for an idle shell, so it is admitted only when there is literally no
+    // PTY/session to lose; inconsistent job facts fail closed.
+    //
+    // THE LIVE-SESSION BLOCK COMES BEFORE THE PROBE'S (round eight of the update
+    // audit, U26). With the seamless lane gone, every live terminal blocks whatever
+    // its foreground is, so an unreadable foreground decides nothing here: it only
+    // chose the words. Checked first, it named a state nothing the person does can
+    // prove ("could not be proven safe") in place of the refusal that carries why
+    // the handoff is unavailable and what restores it (`--headless`, an unowned
+    // control socket), and the recorded reason flipped between the two across
+    // retries as the probe answered.
     if facts.live_ptys > 0 || facts.foreground_jobs > 0 {
         return AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless);
+    }
+    // A probe failure with no live PTY is no state a desk can be in (the probe runs
+    // once per live PTY): not evidence of an idle shell. Fail closed.
+    if facts.unknown_foregrounds > 0 {
+        return AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown);
     }
     AdmissionDecision::Apply(ApplyLane::Cold)
 }
@@ -186,7 +194,18 @@ mod tests {
                 unknown_foregrounds: 1,
                 ..facts()
             }),
-            AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown)
+            AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown),
+            "an unreadable foreground with no live PTY fails closed"
+        );
+        assert_eq!(
+            classify(AdmissionFacts {
+                live_ptys: 2,
+                unknown_foregrounds: 1,
+                ..facts()
+            }),
+            AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless),
+            "without the seamless lane every live terminal blocks, its foreground read or \
+             not: the refusal that says why the handoff is unavailable (U26)"
         );
         assert_eq!(
             classify(AdmissionFacts {

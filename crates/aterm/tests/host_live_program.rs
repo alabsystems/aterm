@@ -25,17 +25,12 @@
 
 #![cfg(unix)]
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::headless_boot;
 
-use headless_boot::Instance;
+use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_line};
 
 /// Boot one headless instance ([`headless_boot::boot`]: `None` is an environment
 /// refusal; a product that cannot start fails the test). Wide enough that the
@@ -49,10 +44,6 @@ fn boot(tag: &str) -> Option<Instance> {
     )
 }
 
-/// A client that has not exited by now is hung: past every [`HANG`] wait a
-/// call makes, so a wait that times out answers before it is killed.
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
-
 /// How long a wait for something that MUST happen may take before it is read
 /// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
 /// Every one is BELOW the shim's life ([`write_shim`]'s `sleep`): a shim that
@@ -60,94 +51,6 @@ const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
 /// would read as their pass.
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
-
-fn client_command(inst: &Instance, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    cmd.arg("ctl")
-        .arg("--sock")
-        .arg(&inst.sock)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    launch_isolation::apply(&mut cmd, &inst.tmp);
-    cmd
-}
-
-/// One bounded `aterm ctl --sock <sock> <args…>` call.
-fn ctl(inst: &Instance, args: &[&str]) -> Output {
-    let mut child = client_command(inst, args).spawn().expect("spawn aterm ctl");
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + CLIENT_EXIT_DEADLINE;
-    loop {
-        match child.try_wait().expect("poll aterm ctl") {
-            Some(status) => {
-                return Output {
-                    status,
-                    stdout: stdout.join().expect("stdout drain"),
-                    stderr: stderr.join().expect("stderr drain"),
-                };
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("aterm ctl {args:?} did not exit in time");
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
-}
-
-fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
-    let out = ctl(inst, args);
-    assert!(
-        out.status.success(),
-        "aterm ctl {args:?} failed: stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    String::from_utf8(out.stdout).expect("utf-8")
-}
-
-/// `key=value` out of a status/sessions line.
-fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}=");
-    line.split_whitespace()
-        .find_map(|t| t.strip_prefix(prefix.as_str()))
-}
-
-/// The boot session's `(local, sid)` from `sessions`.
-fn boot_session(inst: &Instance) -> (u64, String) {
-    let body = ctl_ok(inst, &["sessions"]);
-    let row = body
-        .lines()
-        .find(|l| l.starts_with(|c: char| c.is_ascii_digit()))
-        .unwrap_or_else(|| panic!("a session row: {body}"));
-    let mut toks = row.split_whitespace();
-    let local = toks.next().unwrap().parse().unwrap();
-    let sid = toks.next().unwrap().to_string();
-    (local, sid)
-}
-
-fn status(inst: &Instance, sid: &str) -> String {
-    ctl_ok(inst, &[&format!("@{sid}"), "status"])
-}
-
-/// Type one line into the session and submit it.
-fn type_line(inst: &Instance, sid: &str, line: &str) {
-    ctl_ok(inst, &[&format!("@{sid}"), "send", line]);
-    ctl_ok(inst, &[&format!("@{sid}"), "key", "enter"]);
-}
 
 /// Poll `status` until `pred` holds, returning the matching record, or panic
 /// with the last record after `within`.

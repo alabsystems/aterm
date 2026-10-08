@@ -101,7 +101,7 @@ fn codex_scroll_keeps_footer_metadata_on_its_content_in_parser_order() {
     term.add_named_mark("footer");
     term.add_annotation("footer annotation");
 
-    // Finish with a new OSC marker in the SAME parser batch. Existing anchors
+    // Finish with a new OSC marker in the same parser batch. Existing anchors
     // must move with the protected footer, while this post-scroll anchor must
     // be created directly in the new coordinate space (and never shifted twice).
     let mut batch = CODEX_INSERT.to_vec();
@@ -203,13 +203,10 @@ fn codex_scroll_repins_viewport_and_piecewise_reanchors_active_selection() {
     );
 }
 
-/// PARAGRAPH-BREAK regression: Codex streams "A", a blank separator line
-/// (displayed by printing nothing), then "B" through its insert-history
-/// protocol, one scroll per committed line. Once "A" has been archived, the
-/// blank separator is displaced ALONE — it must follow "A" into history as
-/// an empty line. (Pre-fix, the never-written gate keyed on `Row::len == 0`
-/// for the whole displaced set, which also holds for a blank separator, so
-/// the paragraph break silently vanished from the transcript.)
+/// Codex streams "A", a blank separator line, then "B" through its
+/// insert-history protocol, one scroll per line. Once "A" is archived the
+/// blank separator is displaced alone and must follow it into history as an
+/// empty line.
 #[test]
 fn codex_streamed_blank_separator_line_is_archived() {
     let mut term = Terminal::new(5, 10);
@@ -242,12 +239,9 @@ fn codex_streamed_blank_separator_line_is_archived() {
     }
 }
 
-/// FULLSCREEN-GROW regression (owner report, 2026-07-22), two halves.
-///
-/// Half 1 — a FRESH Codex session scrolls its top-anchored region while the
-/// physical top rows are still never-written: those displaced blank rows
-/// must NOT mint history (pre-fix they filled the ring with blanks that a
-/// later rows-grow revealed as a dead black band above the content).
+/// Fullscreen grow, half 1: a fresh Codex session scrolls its top-anchored
+/// region while the top rows are never-written; those displaced blank rows
+/// must not mint history.
 #[test]
 fn codex_fresh_session_never_written_scrolls_mint_no_history() {
     let mut term = Terminal::new(24, 80);
@@ -262,12 +256,10 @@ fn codex_fresh_session_never_written_scrolls_mint_no_history() {
     );
 }
 
-/// Half 2 — a RUNNING Codex session (UI block painted from the top, real
-/// transcript archived through its region inserts) grows rows on the
-/// window -> fullscreen hop. The reveal must surface the REAL transcript at
-/// the very top (no blank band above the content), and the cursor must ride
-/// its content line down through the reveal so the post-SIGWINCH repaint and
-/// CPR answers anchor correctly.
+/// Fullscreen grow, half 2: a running Codex session grows rows. The reveal
+/// surfaces the real transcript at the top with no blank band, and the cursor
+/// rides its content line down so post-SIGWINCH repaints and CPR answers
+/// anchor correctly.
 #[test]
 fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
     let mut term = Terminal::new(24, 80);
@@ -286,7 +278,7 @@ fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
         let seq = format!("\x1b[{};1H{text}", row + 1);
         term.process(seq.as_bytes());
     }
-    // Three insert-history scrolls displace the top three WRITTEN rows.
+    // Three insert-history scrolls displace the top three written rows.
     for i in 0..3u8 {
         let seq = format!("\x1b[1;20r\x1b[20;1H\r\nT{i}\x1b[r");
         term.process(seq.as_bytes());
@@ -302,7 +294,7 @@ fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
     // Window -> fullscreen: rows-only grow.
     term.resize(72, 80);
 
-    // The reveal surfaces the REAL transcript at the top: revealed rows
+    // The reveal surfaces the real transcript at the top: revealed rows
     // hold the archived lines, in order, starting at visual row 0 — no
     // blank band above the content.
     for (row, expected) in ["codex-banner", "model: gpt", "dir: ~/aterm"]

@@ -1,50 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// EMBERFORGE "dark glyph cores" CPU/GPU byte parity — the two P6 consumer
-// streams end-to-end: `RenderInput.glow_under` (flame-BODY One/One additive
-// light drawn BETWEEN the cell background fill and the glyph ink: the GPU
-// parts its base pass around a Unorm glow_under pass, the CPU runs phase B3
-// between the bg/sprite phases and the fg phase) and `RenderInput.char_fg`
-// (per-cell FINAL glyph-ink overrides charring engulfed letterforms toward
-// ember-black at the shared ink fg seam, before the legibility floors).
+// CPU/GPU byte parity for two fire streams: `RenderInput.glow_under` (flame
+// body, One/One light drawn between the cell background and the glyph ink; the
+// GPU splits its base pass around a Unorm pass, the CPU runs phase B3) and
+// `RenderInput.char_fg` (per-cell final ink overrides charring engulfed glyphs,
+// applied before the legibility floors).
 //
 // Covered:
-//   * base frames WITHOUT the streams are byte-exact CPU==GPU (delta 0), so
-//     the measured deltas are effect-only;
-//   * char_fg ALONE over block text is byte-exact UNGATED (a pure fg
-//     substitution through the ordinary glyph path — no additive involved);
-//   * a SYNTHETIC glow_under field over CHARRED block text — varied colours,
-//     multiple rows, quads clipped at the grid edges — is BYTE-EXACT, and the
-//     silhouette law holds on both backends (the charred stroke is darker
-//     than the lit background beside it);
-//   * the damaged/cached path: a body quad MOVING while the charring sweeps
-//     must miss the GPU dirty gate and re-render byte-exactly (the prev∪cur
-//     row discipline);
-//   * char_fg FOLLOWS INTO LINE DECORATIONS on both backends: a charred
-//     underline / undercurl / strike / overline is byte-identical to the same
-//     text recoloured via SGR truecolor fg, WITHIN each backend;
-//   * an emptied pair (`clear_overlays`) restores the bare GPU frame (the
-//     glow_under + char_fg row of `tests/empty_channels_gpu.rs`).
+//   * base frames without the streams are byte-exact (delta 0);
+//   * char_fg alone over block text is byte-exact on any adapter;
+//   * a synthetic glow_under field over charred text (varied colours, several
+//     rows, edge-clipped quads) is byte-exact, and the charred stroke is darker
+//     than the lit background on both backends;
+//   * a moving body quad misses the GPU dirty gate and re-renders exactly;
+//   * char_fg reaches line decorations: a charred underline, undercurl, strike
+//     or overline equals the same text recoloured via SGR truecolour fg,
+//     within each backend;
+//   * emptied streams restore the bare GPU frame.
 //
-// Gated: no GPU or no font -> the tests no-op (return), like the other parity
-// gates. Byte-exact additive gates additionally skip on downlevel
-// (sRGB-offscreen) adapters via `additive_is_byte_exact`, the glow idiom.
+// Skips without a GPU or font; byte-exact additive checks also skip on
+// downlevel adapters (`additive_is_byte_exact`).
 
 use aterm_core::render::{CharFg, GlowBlend, GlowQuad};
 use aterm_core::terminal::Terminal;
 use aterm_render::{BeamClip, RibbonVertex, Theme, WindowCpu};
 
-mod common;
-use common::{assert_byte_exact, backends, bb, gg, max_channel_delta, rr};
+use crate::common::{assert_byte_exact, backends, bb, block_text_term, gg, max_channel_delta, rr};
 
 fn luma(p: u32) -> i32 {
     rr(p) + gg(p) + bb(p)
 }
 
-/// One legal flame-body quad: a grid-interior rect clamped to the grid and to
-/// its single row band (the GlowQuad producer contract). Returns `None` for a
-/// fully-clipped rect.
+/// One flame-body quad clamped to the grid and its single row band, or `None`
+/// when fully clipped.
 fn emit_under(
     row: usize,
     x0: i64,
@@ -72,12 +61,10 @@ fn emit_under(
     })
 }
 
-/// THE glow_under + char_fg parity pin. The base frame is procedural
-/// full-block glyphs — byte-exact CPU==GPU (delta 0) — so the deltas below are
-/// the streams' alone. char_fg alone must stay byte-exact UNGATED (ordinary
-/// glyph path); the combined engulfed frame must be byte-exact wherever the
-/// additive contract is (native Unorm offscreen), and the silhouette law must
-/// hold on BOTH backends.
+/// glow_under and char_fg parity over procedural full-block glyphs (a delta-0
+/// base): char_fg alone is byte-exact on any adapter; the combined frame is
+/// byte-exact where the additive contract holds; and the charred core is the
+/// darkest thing in the fire on both backends.
 #[test]
 fn glow_under_char_fg_field_is_byte_exact_over_text() {
     let theme = Theme::default();
@@ -86,13 +73,9 @@ fn glow_under_char_fg_field_is_byte_exact_over_text() {
     };
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
     // Hidden cursor + procedural block rows: a byte-exact base with TEXT under
     // the fire (blocks render identically on both backends — delta 0).
-    term.process("\x1b[?25l".as_bytes());
-    for r in 1..8usize {
-        term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
-    }
+    let mut term = block_text_term(rows, cols, 1..8);
     let (cw, ch) = cpu.cell_size();
     let grid_w = cols * cw;
 
@@ -185,11 +168,8 @@ fn glow_under_char_fg_field_is_byte_exact_over_text() {
         eprintln!("SKIP byte-exact glow_under gate: downlevel sRGB offscreen (linear add)");
     }
 
-    // (d) THE SILHOUETTE LAW, on both backends: inside the row-2 body quad the
-    // charred block stroke (col 3) is darker than the lit background beside
-    // the text (row 2 has blocks only up to col 29; col 2 is an uncharred
-    // block, so sample the charred cell vs the SAME row's lit block one cell
-    // over — the charred core must be the darkest thing in the fire).
+    // (d) Inside the row-2 body quad, the charred block (col 3) is darker than
+    // the lit uncharred block beside it.
     for (name, f) in [("CPU", &cpu_f), ("GPU", &gpu_f)] {
         let pad = (f.width - cols * cw) / 2;
         let y_mid = pad + 2 * ch + ch / 2;
@@ -205,12 +185,9 @@ fn glow_under_char_fg_field_is_byte_exact_over_text() {
     }
 }
 
-/// DAMAGED/CACHED-PATH parity: the per-frame presentation hot path
-/// (`render_input_cached` on persistent renderer+window per backend). Frame A
-/// engulfs row 1 (body quad + charred cells, priming both caches); frame B
-/// MOVES the fire to row 4 — a real change that must MISS the GPU dirty gate,
-/// repaint the prev∪cur rows (`glow_under_changed` + `char_fg_changed`), and
-/// land byte-exact on both backends.
+/// Cached-path parity via `render_input_cached`: frame A engulfs row 1, frame
+/// B moves the fire to row 4, which must miss the GPU dirty gate, repaint the
+/// previous and current rows, and match on both backends.
 #[test]
 fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
     let theme = Theme::default();
@@ -303,42 +280,28 @@ fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
     }
 }
 
-/// char_fg FOLLOWS INTO LINE DECORATIONS, on BOTH backends. A decoration is a
-/// decoration OF the glyph's ink, and the substituted colour is re-derived at
-/// three independent sites — CPU pass 3 (solid rects), CPU pass 3b (the AA
-/// undercurl, a separate pass) and the GPU deco loop. Until this fixture every
-/// char_fg test drew blocks and flames with no SGR styling and every decoration
-/// test drew SGR styling with no overlay stream, so the `None`-with-char_fg arm
-/// at a decorated cell was never taken on either backend — the same shape that
-/// produced the confirmed ink-vs-curl divergence one stream over.
+/// char_fg reaches line decorations on both backends. The substituted colour
+/// is derived at three sites (CPU pass 3, CPU pass 3b undercurl, the GPU deco
+/// loop). Within each backend a charred frame must equal the same text
+/// recoloured via SGR 38;2 (not a cross-backend gate, since glyph AA is under
+/// the ≤8 bar).
 ///
-/// The proof is the `ink_gpu_matches_cpu` idiom, WITHIN each backend: a charred
-/// frame must be byte-identical to the same text recoloured via SGR 38;2. That
-/// form is deliberately not a cross-backend byte gate — real glyph AA lives
-/// under the suite's <=8 delta bar, not at 0 — but a char_fg-only difference
-/// must add exactly zero on each side, which is the property at risk here.
-///
-/// Row 1 is the per-site isolate: its cells are SPACES, so the decoration is
-/// the only ink in them. Col 2 (solid underline) and col 4 (undercurl) must
-/// each change when char_fg lands; col 0's explicit SGR 58 underline colour
-/// must not move (`deco_inks`'s explicit arms ignore the operand).
+/// Row 1 isolates each site with spaces: the solid underline (col 2) and
+/// undercurl (col 4) change when char_fg lands; the explicit SGR 58 underline
+/// colour (col 0) does not.
 #[test]
 fn char_fg_follows_into_line_decorations_on_both_backends() {
     let theme = Theme::default();
     let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    // Deterministic parity: neither backend may compare a provisional `.notdef`
-    // frame against a real glyph (the ink_gpu_matches_cpu discipline).
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (2usize, 12usize);
     let charred_fg = 0x007C_C8FFu32;
 
-    // Row 0: underlined x, curly-underlined w, struck s, overlined o.
-    // Row 1: the deco-only isolates — SGR 58 underlined space (col 0), plain
-    // underlined space (col 2), curly-underlined space (col 4).
+    // Row 0: underlined x, curly-underlined w, struck s, overlined o. Row 1:
+    // SGR 58 underlined space (col 0), underlined space (col 2), curly space
+    // (col 4).
     let mut term_a = Terminal::new(rows as u16, cols as u16);
     term_a.process(
         "\x1b[?25l\x1b[4mx\x1b[24m \x1b[4:3mw\x1b[24m \x1b[9ms\x1b[29m \
@@ -429,27 +392,15 @@ fn char_fg_follows_into_line_decorations_on_both_backends() {
     );
 }
 
-/// **THE SOURCE-OVER BED, BYTE FOR BYTE.** The rainbow bed composites
-/// `GlowQuad::alpha > 0` — premultiplied SOURCE-OVER, `src + dst·(1 − a)` — while
-/// every other flat stream on this pipeline keeps `alpha == 0` and stays
-/// `One`/`One`. This is the gate that says the two modes ride ONE pipeline
-/// without either one moving: a MIXED field of both, over real text, in one
-/// frame.
+/// Source-over and additive glow quads on one pipeline: the rainbow bed uses
+/// `GlowQuad::alpha > 0` (premultiplied source-over), everything else
+/// `alpha == 0` (One/One). A mixed field over real text checks:
 ///
-/// Three claims, and the second is the one a delta-only test would miss.
-///
-/// 1. **PARITY.** The CPU's [`aterm_render::over_premul`] and the GPU's
-///    `One`/`OneMinusSrcAlpha` land the identical byte, on the same
-///    plain-Unorm offscreen and under the same gate the additive streams take.
-/// 2. **THE ADDITIVE HALF DID NOT MOVE.** The same additive-only field renders
-///    byte-identically to what it renders with the source-over quads removed —
-///    so `alpha == 0` really is `One`/`One`, and switching the pipeline's blend
-///    state cost the historical streams nothing.
-/// 3. **THE MODES ARE DISTINGUISHABLE.** A source-over quad and an additive
-///    quad carrying the SAME premultiplied colour over the same ground must
-///    produce DIFFERENT pixels (the source-over one darker, by exactly the
-///    ground it displaced), or the test would pass on a build that ignored
-///    `alpha` entirely.
+/// 1. Parity: CPU [`aterm_render::over_premul`] and GPU
+///    `One`/`OneMinusSrcAlpha` give identical bytes under the additive gate.
+/// 2. The additive half renders identically with the source-over quads removed.
+/// 3. A source-over and an additive quad with the same premultiplied colour
+///    differ (the source-over one darker by the displaced ground).
 #[test]
 fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
     let theme = Theme::default();
@@ -458,11 +409,7 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
     };
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process("\x1b[?25l".as_bytes());
-    for r in 1..8usize {
-        term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
-    }
+    let mut term = block_text_term(rows, cols, 1..8);
     let (cw, ch) = cpu.cell_size();
     let grid_w = cols * cw;
 
@@ -477,14 +424,10 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
         "procedural-block base must be byte-exact so the stream deltas are effect-only"
     );
 
-    // **RIGHT OF THE TEXT, DELIBERATELY.** The procedural rows are full-block
-    // glyphs out to column 29, and the bed draws UNDER the glyph pass — a quad
-    // beneath a solid block is completely hidden, and every clause below would
-    // pass vacuously on pixels the mark never reached. Columns 30..40 are bare
-    // ground on every row, which is where a bed is actually visible and where
-    // the mode difference can be read.
+    // Columns 30..40 are bare ground (the block text ends at 29, and the bed
+    // draws under glyphs), so the quads are visible there.
     //
-    // The ADDITIVE half, alone. Rows 2-3, `alpha == 0`.
+    // The additive half alone: rows 2-3, `alpha == 0`.
     let mut add_only: Vec<GlowQuad> = Vec::new();
     for (r, x0, x1, color) in [
         (2usize, (30 * cw) as i64, (38 * cw) as i64, 0x0080_4010u32),
@@ -496,9 +439,8 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
     add_input.glow_under = add_only.clone();
     let cpu_add = cpu.render_input(&add_input);
 
-    // …and the SOURCE-OVER half beside it, on rows the additive half does not
-    // touch, at opacities spanning the bed's real range (the shipped ceiling is
-    // `RAINBOW_UNDER_COV_CAP`, 120 of 255) plus the two ends of the byte.
+    // The source-over half on other rows, at opacities across the bed's range
+    // (ceiling `RAINBOW_UNDER_COV_CAP`, 120 of 255) plus both byte extremes.
     let mut mixed = add_only.clone();
     for (r, x0, x1, color, alpha) in [
         (
@@ -527,12 +469,8 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
     let cpu_mix = cpu.render_input(&input);
     let gpu_mix = gpu.render_input(&mut win, &input, None);
 
-    // 2. THE ADDITIVE HALF DID NOT MOVE. Rows 2-3 carry only `alpha == 0`
-    //    quads, and they must read exactly what they read with the source-over
-    //    quads absent — the pixels, not a tolerance.
-    // `glow_under` is a WINDOW-ABSOLUTE stream and `emit_under` writes
-    // `y = row * ch` into it, so the bands below are window rows and take NO
-    // pad offset — the quads land exactly where the emitter put them.
+    // 2. Rows 2-3 (additive only) match the frame without source-over quads.
+    //    `glow_under` is window-absolute, so bands take no pad offset.
     let add_band = 2 * ch..4 * ch;
     assert_eq!(
         cpu_mix.pixels[add_band.start * cpu_mix.width..add_band.end * cpu_mix.width],
@@ -544,9 +482,8 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
         "the mixed field must actually paint (non-vacuous)"
     );
 
-    // 3. THE MODES ARE DISTINGUISHABLE. Same premultiplied colour, same
-    //    geometry, one with `alpha` and one without: the source-over frame must
-    //    differ, and differ DOWNWARD, by the ground it displaced.
+    // 3. Same colour and geometry with and without `alpha`: the source-over
+    //    frame differs, and is darker by the displaced ground.
     let same_but_additive: Vec<GlowQuad> = input
         .glow_under
         .iter()
@@ -589,11 +526,8 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
          DISPLACES the ground where the twin ADDS to it ({lower} of {sampled})"
     );
 
-    // 1. PARITY, on the same gate the additive streams take: byte-exact holds on
-    //    a plain-Unorm offscreen; the downlevel sRGB offscreen folds the blend
-    //    into linear, which is the glow idiom's accepted approximation and
-    //    applies to `OneMinusSrcAlpha` for exactly the same reason it applies to
-    //    `One`.
+    // 1. Parity under the additive gate; on a downlevel sRGB offscreen the
+    //    blend happens in linear, for `OneMinusSrcAlpha` as for `One`.
     let delta = max_channel_delta(&cpu_mix.pixels, &gpu_mix.pixels);
     eprintln!(
         "mixed additive + source-over glow_under GPU vs CPU max per-channel delta = {delta} \
@@ -616,21 +550,12 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
     }
 }
 
-/// **THE TRANSPOSED RIBBON TWIN THROUGH THE GPU, BYTE FOR BYTE** — the
-/// `glow_under_parity` pin spec D15 / §6.1 / §17.3 (the phase-1 gate) name
-/// beside `ribbon_beam_v`. Every other fixture in this file emits whole
-/// row-band rects; the twin's stream is a different SHAPE — one-pixel-wide
-/// columns as tall as a slab, split at every cell-row edge into `row`-tagged
-/// pieces — and that shape had never been through the GPU's dirty gate,
-/// scissor and blend. Two trains rasterized by the SAME `ribbon_beam_v` the
-/// meteor calls: a device-vertical one flying DOWN (head first, so every
-/// segment is reversed) composited source-over as the bed is, and a steep
-/// diagonal flying up composited additive as the light is. The base frame is
-/// byte-exact, so the train frame's delta is the twin's alone; then the
-/// cached hot path with the train moving ONE ROW between frames — a real
-/// change that must MISS the dirty gate, repaint prev∪cur, and land
-/// byte-exact and equal to a fresh render, over pieces that are several rows
-/// tall rather than one.
+/// The transposed ribbon (`ribbon_beam_v`) through the GPU, byte for byte:
+/// one-pixel-wide columns as tall as a slab, split at cell-row edges into
+/// row-tagged pieces. A vertical train flying down (source-over) and a steep
+/// diagonal flying up (additive) over a byte-exact base, then the cached path
+/// with the trains moved one row: it must miss the dirty gate, repaint
+/// previous and current rows, and equal a fresh render.
 #[test]
 fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
     let theme = Theme::default();
@@ -639,14 +564,9 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
     };
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process("\x1b[?25l".as_bytes());
-    for r in 1..8usize {
-        term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
-    }
+    let mut term = block_text_term(rows, cols, 1..8);
     let (cw, ch) = cpu.cell_size();
-    // `glow_under` is WINDOW-ABSOLUTE and this fixture's window IS the grid, so
-    // the effects box is the grid box with its bands anchored at 0.
+    // The window is the grid, so the effects box is the grid box anchored at 0.
     let clip = BeamClip::grid(cols * cw, rows * ch, ch);
 
     let base_input = term.cell_frame(rows, cols);
@@ -673,9 +593,8 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
         lift_span: 0.0,
     };
     let (cw_f, ch_f) = (cw as f32, ch as f32);
-    // The trains, at a row offset `dy` (px) so the cached-path half can move
-    // them by exactly one row. Both keep to columns 30..40, the bare ground
-    // right of the block text where a bed is actually visible.
+    // Trains offset by `dy` px so the cached half can move them one row; both
+    // stay in columns 30..40 (bare ground).
     let trains = |dy: f32| -> Vec<GlowQuad> {
         let mut quads = Vec::new();
         // Vertical, head at the BOTTOM: every segment is `b.x < a.x`.
@@ -710,9 +629,8 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
         quads
     };
     let quads = trains(0.0);
-    // Non-vacuous, and the twin's own shape: one device column per quad, pieces
-    // taller than one row, split at band edges (some shorter than the stride),
-    // both blend modes present, several row bands touched.
+    // One device column per quad, pieces taller than one row and split at band
+    // edges, both blend modes, several row bands.
     assert!(quads.iter().all(|q| q.w == 1));
     assert!(
         quads.iter().any(|q| q.h > 1),
@@ -754,8 +672,8 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
         eprintln!("SKIP byte-exact ribbon_beam_v gate: downlevel sRGB offscreen");
     }
 
-    // THE CACHED HOT PATH: frame A primes both caches, frame B moves the trains
-    // one row down.
+    // Cached path: frame A primes both caches, frame B moves the trains down one
+    // row.
     let mut win_cpu = WindowCpu::new();
     let mut win_gpu = aterm_gpu::WindowGpu::new();
     let mut in_a = term.cell_frame(rows, cols);
@@ -799,34 +717,24 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
     }
 }
 
-/// THE BED IS NEVER BOOSTED OR BLOOMED (design §L5, "white is hot").
+/// The `under` bed is never boosted or bloomed: the HDR crown and the bloom
+/// read only the `out` stream. With a bed pale enough to triple if boosted:
 ///
-/// The EDR crown prices `out` fragments by their white part and the bloom
-/// splits white from chroma — both of which run over the `out` stream ALONE.
-/// The `under` bed (the ribbon under text, `RAINBOW_UNDER_COV_CAP` 236) is
-/// composited into the offscreen between the cell fill and the glyph ink and is
-/// handed to NEITHER pass, which is what keeps the 5.25:1 body-contrast law a
-/// property of the SDR frame the ledger already priced. Measured with a bed so
-/// pale that it would triple if the crown ever saw it:
+///   * the crowned present differs from the pass-less one only inside the
+///     `out` quad;
+///   * a bed-only frame is identical with bloom on and off (the halo pass does
+///     not run);
+///   * with an `out` core the bloom paints, and still no bed pixel moves.
 ///
-///   * the crowned present differs from the pass-less present ONLY inside the
-///     `out` quad — every bed pixel is bit-identical;
-///   * a bed-only frame is bit-identical with the bloom on and off (the bed is
-///     not a bloom SOURCE — the halo pass does not even run for it);
-///   * with an `out` core present the bloom does paint (non-vacuity), and still
-///     no bed pixel moves.
-///
-/// The boost is proven LIVE in the same frame by measuring it: the core's
-/// emission must equal `lin x (1 + 2*smoothstep(0.35, 0.60, white))`, not the
-/// flat reference emission — so this is a law about a pass that is running, not
-/// about one that is absent.
+/// The core's emission equals `lin x (1 + 2*smoothstep(0.35, 0.60, white))`,
+/// proving the boost pass ran.
 #[test]
 fn the_bed_is_never_boosted_or_bloomed() {
     let theme = Theme::default();
     let Some((_cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    // The EDR crown drives the wgpu present stand-in (the WGPU ORACLE arm).
+    // The HDR crown drives the wgpu present stand-in (wgpu oracle arm).
     #[cfg(target_os = "macos")]
     gpu.disarm_metal_for_oracle();
     gpu.set_hdr_glow(true);
@@ -846,15 +754,14 @@ fn the_bed_is_never_boosted_or_bloomed() {
     let (cw, ch) = gpu.cell_size();
     let grid_w = cols * cw;
 
-    // THE BED: three full rows of near-white ribbon under the text. Its white
-    // part is 0.78 — factor 3.0, the cap — so a bed that reached the crown
-    // could not hide.
+    // The bed: three rows of near-white ribbon under the text (white part 0.78,
+    // boost factor 3.0).
     let bed: Vec<GlowQuad> = (1..4usize)
         .filter_map(|r| emit_under(r, 0, grid_w as i64, ch, grid_w, 0x00C8_C8C8))
         .collect();
     assert_eq!(bed.len(), 3, "three bed rows");
 
-    // THE CORE: one white `out` quad, the field m1 core's composited peak.
+    // The core: one white `out` quad, the field m1 core's composited peak.
     let core = GlowQuad {
         row: 6,
         x: (4 * cw) as u16,
@@ -880,7 +787,7 @@ fn the_bed_is_never_boosted_or_bloomed() {
     let mut both = bed_only.clone();
     both.cursor_glow_add = vec![core];
 
-    // (a) THE CROWN. Only the `out` quad may move between the pass-less and
+    // (a) The crown. Only the `out` quad may move between the pass-less and
     // the crowned present.
     let (plain, w, h) = gpu.present_hdr_for_test(&mut win, &both, false);
     let (lit, _, _) = gpu.present_hdr_for_test(&mut win, &both, true);
@@ -927,9 +834,8 @@ fn the_bed_is_never_boosted_or_bloomed() {
         "the core's own emission must be the §L5 whitened one ({got} vs {want})"
     );
 
-    // (b) THE BLOOM. A bed-only frame is bit-identical with the halo on and
-    // off: the bed is not a bloom source, and with an empty `out` stream the
-    // pass does not run at all.
+    // (b) A bed-only frame is identical with the halo on and off; with an
+    // empty `out` stream the pass does not run.
     let bed_dark = gpu.render_input(&mut win, &bed_only, None);
     gpu.set_bloom(true);
     let bed_bloomed = gpu.render_input(&mut win, &bed_only, None);
@@ -938,9 +844,8 @@ fn the_bed_is_never_boosted_or_bloomed() {
         "the bed alone must never bloom — the halo pass has no `under` source"
     );
 
-    // (c) With an `out` core the bloom DOES paint (non-vacuity) — and still not
-    // one bed pixel moves. The halo's reach is the composite scissor: the glow
-    // bbox dilated by (2*radius + 1) * DOWNSCALE px, 12 px at the shipped 2.2.
+    // (c) With an `out` core the bloom paints, and no bed pixel moves. The
+    // halo reaches (2*radius + 1) * DOWNSCALE px past the glow bbox.
     gpu.set_bloom(false);
     let both_dark = gpu.render_input(&mut win, &both, None);
     gpu.set_bloom(true);
@@ -990,40 +895,25 @@ fn the_bed_is_never_boosted_or_bloomed() {
     );
 }
 
-/// **A GRADIENT QUAD IS BYTE-EXACT ACROSS THE BACKENDS** (2026-09-21,
-/// `GlowQuad::color2`). The CPU rasterizer ramps a quad's colour AND opacity
-/// per column with `aterm_render::glow_lerp`'s integer law; the GPU's
-/// `fs_glow` computes the same law from the exact instance bytes (`Uint8x4`,
-/// never the rasterizer's float interpolant). This pins the two to each other
-/// over every width the ribbon emits — `1, 2, 3, 7, 15, 40` px, the 15 being
-/// the owner's whole-cell slab — and every ramp shape the producers use:
+/// A gradient quad (`GlowQuad::color2`) is byte-exact across backends: the CPU
+/// ramps colour and opacity per column with `aterm_render::glow_lerp`'s integer
+/// law and `fs_glow` computes the same law from the instance bytes. Widths
+/// `1, 2, 3, 7, 15, 40` px and ramps:
 ///
-/// * colour ramp WITH an opacity ramp `1 → 236` (source-over, fading in);
-/// * the mirror, `236 → 1` (fading out to the additive floor);
-/// * `alpha == 0` at BOTH ends with a colour ramp (additive light — the
-///   aurora's own shape);
-/// * equal non-zero alpha at both ends, colour-only ramp (a paint bed of one
-///   opacity changing hue).
+/// * colour with opacity `1 → 236` (source-over, fading in);
+/// * the mirror `236 → 1`;
+/// * `alpha == 0` at both ends with a colour ramp (additive);
+/// * equal non-zero alpha, colour-only ramp.
 ///
-/// The premises are the source-over pin's: block glyphs out to column 29, the
-/// field on bare ground to their right, a byte-exact base so every delta is
-/// the field's; and a flat control — the same field with `color2 == color`,
-/// `alpha2 == alpha` — is byte-exact too, so the gradient path and the flat
-/// path are both held, and the non-vacuity clause shows the gradient field
-/// differs from its flat twin (the ramp really is drawn).
+/// A flat control (`color2 == color`, `alpha2 == alpha`) is also byte-exact,
+/// and the gradient field differs from it.
 #[test]
 fn gradient_glow_under_is_byte_exact_cpu_vs_gpu() {
     gradient_glow_under_parity(false);
 }
 
-/// [`gradient_glow_under_is_byte_exact_cpu_vs_gpu`] through the WGPU ORACLE
-/// arm (macOS: `disarm_metal_for_oracle`; elsewhere the wgpu path is the
-/// renderer, and the test above already runs it). The WGSL `fs_glow` is the
-/// live glow shader on every non-macOS backend, and until 2026-09-22 nothing
-/// on a Mac executed it: replacing its gradient law with the left colour left
-/// the whole aterm-gpu suite green (the review's mutation H). This runs the
-/// same field, the same widths and the same flat control through naga's
-/// translation of that WGSL.
+/// [`gradient_glow_under_is_byte_exact_cpu_vs_gpu`] through the wgpu oracle arm
+/// on macOS, so the WGSL `fs_glow` (the live shader off macOS) runs here too.
 #[cfg(target_os = "macos")]
 #[test]
 fn gradient_glow_under_is_byte_exact_cpu_vs_wgpu_oracle() {
@@ -1043,11 +933,7 @@ fn gradient_glow_under_parity(oracle: bool) {
     let _ = oracle;
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (12usize, 40usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process("\x1b[?25l".as_bytes());
-    for r in 1..11usize {
-        term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
-    }
+    let mut term = block_text_term(rows, cols, 1..11);
     let (cw, ch) = cpu.cell_size();
     let grid_w = cols * cw;
 
@@ -1060,11 +946,9 @@ fn gradient_glow_under_parity(oracle: bool) {
         "procedural-block base must be byte-exact so the stream deltas are effect-only"
     );
 
-    // The field: on each row, the six widths side by side (one bare column
-    // between them) from column 30, each quad ramping `(rgb0, a0)` → `(rgb1,
-    // a1)`. The colours are PREMULTIPLIED by their end's own coverage, as
-    // every producer premultiplies (a source-over end never exceeds its
-    // alpha); an additive end is premultiplied by a coverage of its own.
+    // Per row, the six widths side by side from column 30, each ramping
+    // `(rgb0, a0)` to `(rgb1, a1)`, colours premultiplied by their end's
+    // coverage as producers do.
     const WIDTHS: [u16; 6] = [1, 2, 3, 7, 15, 40];
     let ramps: [(u32, u32, u8, u8); 8] = [
         (0x00FF_4020, 0x0020_40FF, 1, 236),

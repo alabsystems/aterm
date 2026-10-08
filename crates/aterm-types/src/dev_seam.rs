@@ -4,10 +4,8 @@
 //! DEVELOPMENT SEAMS: the environment variables a developer or a test may use to
 //! repoint or instrument aterm, and that a shipped binary does not read at all.
 //!
-//! The owner's rule (2026-09-22, verbatim): *"I want the one true best batteries
-//! included default on path. Delete alternatives. in the future, we could add
-//! settings, but NOT ENV VARS those are for development."* So an environment variable
-//! that changes what aterm does is either internal protocol (a parent handing its own
+//! The owner's rule: settings, NOT env vars, for anything a user tunes. An environment
+//! variable that changes what aterm does is either internal protocol (a parent handing its own
 //! child something), a build stamp, or one of these seams — and a seam compiles only
 //! under `cfg(any(debug_assertions, feature = "dev-seams"))`. `debug_assertions` is on
 //! in every dev and test build and off in `--release`; the `dev-seams` feature exists

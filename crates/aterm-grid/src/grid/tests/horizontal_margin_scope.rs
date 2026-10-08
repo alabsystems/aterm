@@ -4,35 +4,21 @@
 
 //! Which operations DECSLRM's horizontal margins bound, and which they do not.
 //!
-//! VT510 draws the line with one sentence per page, and the two sentences are
-//! opposites:
-//! - erase IN PLACE — EL, ECH and ED each carry "works inside or outside the
-//!   scrolling margins";
-//! - SHIFT data sideways — ICH and DCH each carry "has no effect outside the
-//!   scrolling margins".
+//! VT510 splits them: in-place erases (EL, ECH, ED) "work inside or outside the
+//! scrolling margins", while sideways shifts (ICH, DCH) have "no effect outside
+//! the scrolling margins". xterm, Ghostty, iTerm2 and WezTerm implement exactly
+//! that split (xterm's `ClearRight`/`ClearLeft`/`ClearLine` never consult
+//! `ScrnLeftMargin`; `ScrnInsertChar`/`ScrnDeleteChar` open with both margins).
 //!
-//! DECSLRM's page is what makes those "scrolling margins" these margins ("sets
-//! the left and right margins to define the scrolling region"). xterm, Ghostty,
-//! iTerm2 and WezTerm all implement exactly that split, each showing both halves
-//! in one file: xterm's `ClearRight`/`ClearLeft`/`ClearLine` (util.c) bound by
-//! `MaxCols`/column 0 and never call `ScrnLeftMargin`, while `ScrnInsertChar` /
-//! `ScrnDeleteChar` (screen.c) open with both margins.
-//!
-//! aterm used to clamp EL 0/1/2, DECSEL 0/1/2 and ECH to the margins, citing the
-//! VT510 spec for a claim the VT510 ECH page contradicts word for word. Nothing
-//! pinned the clamp, so these tests pin its ABSENCE — and the ICH/DCH and
-//! DECIC/DECDC cases pin the other half, so removing a clamp here can never be
-//! mistaken for a licence to remove those. The rest of that half is pinned
-//! where it already lived: IL/DL's rectangular shift inside the margins by
-//! `scroll_region::region_ops` (`grid_insert_lines_margined_rectangular_shift`,
-//! `grid_delete_lines_margined_rectangular_shift`), and autowrap to the left
-//! margin by aterm-conformance `vt_categories3::declrmm_autowrap_wraps_to_left_margin`.
+//! These tests pin both halves: EL, DECSEL, ECH and ED are unbounded; ICH/DCH
+//! and DECIC/DECDC keep their margins. IL/DL's rectangular shift is pinned in
+//! `scroll_region::region_ops`, and autowrap to the left margin in
+//! aterm-conformance `vt_categories3::declrmm_autowrap_wraps_to_left_margin`.
 
 use super::super::*;
 
-/// Row 0 of a 3x20 grid filled with 'X', then DECSLRM margins armed at columns
-/// 4..=10. The fill happens FIRST so the writes themselves are unmargined and
-/// every one of the 20 columns really holds an 'X'.
+/// Row 0 of a 3x20 grid filled with 'X' (before margins, so every column holds
+/// one), then DECSLRM margins at columns 4..=10.
 fn filled_row_with_margins() -> Grid {
     let mut grid = Grid::new(3, 20);
     for _ in 0..20 {
@@ -54,15 +40,10 @@ fn assert_kept(grid: &Grid, col: u16, why: &str) {
     assert_eq!(grid.cell(0, col).unwrap().char(), 'X', "col {col}: {why}");
 }
 
-// ===========================================================================
-// EL — the in-place erase class. NOT bounded by DECSLRM.
-// ===========================================================================
+// EL: the in-place erase class, not bounded by DECSLRM.
 
-/// EL 0 runs to the ROW's edge, straight past the right margin.
-///
-/// xterm `do_erase_line` case 0 -> `ClearRight`, bounded by `MaxCols(screen)`;
-/// Ghostty `eraseLine`'s right span is `{x, self.cols}`; iTerm2 uses
-/// `size.width - 1`. Column 19 is nine columns right of the margin at 10.
+/// EL 0 runs to the row's edge, past the right margin (xterm `ClearRight`
+/// bounded by `MaxCols`; Ghostty and iTerm2 likewise).
 #[test]
 fn el0_erases_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -75,9 +56,7 @@ fn el0_erases_past_the_right_margin() {
     assert_blank(&grid, 19, "EL 0 runs to the end of the row");
 }
 
-/// EL 1 opens at COLUMN 0, not at the left margin.
-///
-/// xterm `ClearLeft` starts at column 0; Ghostty's EL 1 span is `{0, x + 1}`.
+/// EL 1 starts at column 0, not at the left margin (xterm `ClearLeft`).
 #[test]
 fn el1_erases_left_of_the_left_margin() {
     let mut grid = filled_row_with_margins();
@@ -89,7 +68,7 @@ fn el1_erases_left_of_the_left_margin() {
     assert_kept(&grid, 7, "EL 1 never touches the right of the cursor");
 }
 
-/// EL 2 erases the WHOLE row, not the margin span.
+/// EL 2 erases the whole row, not the margin span.
 #[test]
 fn el2_erases_the_whole_row_not_the_margin_span() {
     let mut grid = filled_row_with_margins();
@@ -103,9 +82,7 @@ fn el2_erases_the_whole_row_not_the_margin_span() {
     );
 }
 
-// ===========================================================================
-// DECSEL — the same spans, with protection honoured inside them.
-// ===========================================================================
+// DECSEL: the same spans, with protection honoured inside them.
 
 /// DECSEL 0 shares EL 0's span: xterm reaches `ClearRight` for both, the
 /// protection split happening inside `ClearInLine2`, not in the bounds.
@@ -140,16 +117,10 @@ fn decsel2_erases_the_whole_row_not_the_margin_span() {
     assert_blank(&grid, 19, "DECSEL 2 reaches right of the right margin");
 }
 
-// ===========================================================================
-// ECH — the same class, and upstream literally the same function as EL 0.
-// ===========================================================================
+// ECH: the same class (xterm's `do_erase_char` calls `ClearRight`).
 
-/// ECH erases `count` cells from the cursor regardless of the right margin.
-///
-/// VT510's ECH page: "ECH works inside or outside the scrolling margins."
-/// xterm's `do_erase_char` is a call to `ClearRight` — the EL 0 function —
-/// so an ECH bounded by the margins while EL 0 was not would be incoherent
-/// upstream as well as wrong. Ghostty bounds by `self.cols - cursor.x`.
+/// ECH erases `count` cells from the cursor regardless of the right margin
+/// (VT510: "ECH works inside or outside the scrolling margins").
 #[test]
 fn ech_erases_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -173,9 +144,7 @@ fn ech_count_is_clipped_by_the_row_edge() {
     assert_kept(&grid, 5, "and nothing left of the cursor moves");
 }
 
-// ===========================================================================
-// ED — already correct before this round; pinned so it stays that way.
-// ===========================================================================
+// ED
 
 /// ED 0's cursor row is erased to the row edge, margins or not.
 #[test]
@@ -197,13 +166,10 @@ fn ed1_erases_the_cursor_row_from_column_zero() {
     assert_kept(&grid, 7, "and stops after the cursor");
 }
 
-// ===========================================================================
-// ICH / DCH — the OTHER half of the split. These KEEP their margins.
-// ===========================================================================
+// ICH / DCH keep their margins.
 
-/// ICH shifts within the margins: cells right of the right margin do not move,
-/// and nothing falls off the row's end. VT510 ICH: "ICH has no effect outside
-/// the scrolling margins."
+/// ICH shifts within the margins: cells right of the right margin do not move
+/// and nothing falls off the row's end.
 #[test]
 fn ich_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);
@@ -223,7 +189,7 @@ fn ich_still_shifts_only_within_the_margins() {
     );
 }
 
-/// DCH likewise: the fill lands at the RIGHT MARGIN, not at the row edge.
+/// DCH likewise: the fill lands at the right margin, not at the row edge.
 #[test]
 fn dch_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);
@@ -246,13 +212,10 @@ fn dch_still_shifts_only_within_the_margins() {
     );
 }
 
-// ===========================================================================
-// DECIC / DECDC — column shifts. These KEEP their margins too.
-// ===========================================================================
+// DECIC / DECDC keep their margins too.
 
-/// DECIC shifts only the margin span: the columns pushed past the right margin
-/// are lost, and the cell right of the right margin does not move. DEC STD 070
-/// scopes DECIC to the scrolling margins, like ICH.
+/// DECIC shifts only the margin span: columns pushed past the right margin are
+/// lost and the cell right of the margin does not move (DEC STD 070).
 #[test]
 fn decic_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);
@@ -286,8 +249,8 @@ fn decic_still_shifts_only_within_the_margins() {
     );
 }
 
-/// DECDC likewise: the blank columns open at the RIGHT MARGIN, not at the row
-/// edge, and nothing right of the margin is pulled in.
+/// DECDC likewise: blank columns open at the right margin, and nothing right of
+/// the margin is pulled in.
 #[test]
 fn decdc_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);

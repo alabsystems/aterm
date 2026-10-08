@@ -2,21 +2,14 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Algorithm audit: boundary condition, correctness, and API-contract tests.
-//!
-//! Tests grid-level operations at their boundary conditions:
-//! - Erase display modes (ED 0/1/2) with cursor at edges
-//! - Erase line modes (EL 0/1/2) with cursor at edges
-//! - Line feed / reverse line feed with scroll regions
-//! - write_ascii_blast cell content verification
-//! - Carriage return correctness
-//! - Erase rect boundary clamping
-//! - History line API ordering (ring buffer and tiered)
-//! - Complex char overflow, cell extras, damage tracking
-//!
-//! Part of #2128 (grid test coverage) and algorithm_audit phase.
+//! Boundary condition, correctness and API-contract tests for grid operations:
+//! ED/EL modes with the cursor at edges, line feed / reverse line feed with
+//! scroll regions, write_ascii_blast content, carriage return, erase-rect
+//! clamping, history line ordering (ring and tiered), complex char overflow,
+//! cell extras and damage tracking.
 
 use super::super::*;
+use crate::grid::test_support::write_marker_line;
 
 mod erase;
 mod history_extras;
@@ -34,14 +27,6 @@ fn fill_grid_rows(grid: &mut Grid, rows: u16) {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
-}
-
-/// Write a single marker char on a new line.
-fn write_marker_line(grid: &mut Grid, marker: char) {
-    grid.carriage_return();
-    grid.write_char(marker);
-    grid.carriage_return();
-    grid.line_feed();
 }
 
 /// Build a 6×5 grid with scroll region [1,3] and content A-F on rows 0-5.

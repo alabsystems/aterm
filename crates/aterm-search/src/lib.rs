@@ -40,8 +40,7 @@
 //! - TLA+ spec: derived `StreamingSearch` machine
 //!   (`aterm_spec::derive::streaming_search_model()`) — proven at build time by
 //!   this crate's `build.rs` temporal gate, bound to the real engine in
-//!   `tests/conformance_streaming.rs` (supersedes the never-committed hand
-//!   `StreamingSearch.tla`)
+//!   `tests/conformance_streaming.rs`
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
@@ -74,8 +73,6 @@ mod tests;
 
 #[cfg(kani)]
 mod proofs;
-
-// ffi_kani_gaps removed (#5887): all three harnesses were null-guard proofs.
 
 /// Terminal search that integrates with Grid and Scrollback.
 ///
@@ -365,7 +362,6 @@ impl TerminalSearch {
         after_line: usize,
         after_col: usize,
     ) -> Option<SearchMatch> {
-        // Use optimized range query starting from after_line
         self.index
             .search_from_line(query, after_line)
             .find(|m| m.line > after_line || (m.line == after_line && m.start_col > after_col))
@@ -452,10 +448,6 @@ impl TerminalSearch {
     /// qualifying match. `inclusive` controls whether a match exactly at the
     /// anchor qualifies; `wrap` retries from the opposite buffer edge when the
     /// directional suffix/prefix has no match.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "public compatibility surface: each search-policy flag is independently meaningful"
-    )]
     pub fn find_direction_opts(
         &self,
         query: &str,

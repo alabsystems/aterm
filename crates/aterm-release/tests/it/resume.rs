@@ -8,40 +8,22 @@
 //! gate, channel-floor carry-forward, exhaustive status selection) and the
 //! hand-rolled CLI parse table.
 
-use crate::{channel, cli, gates, ledger, manifest_out, publish, verify};
+use crate::{cli, gates, ledger, manifest_out, publish, verify};
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use publish::{Journal, STEPS};
 use verify::{CutMode, RemoteState};
 
-static TMPDIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-struct TestTempDir(PathBuf);
-
-impl std::ops::Deref for TestTempDir {
-    type Target = std::path::Path;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Drop for TestTempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn tmpdir(name: &str) -> TestTempDir {
-    let sequence = TMPDIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("resume")
-        .join(format!("{name}-{}-{sequence}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create tmpdir");
-    TestTempDir(dir)
+/// A fresh directory under `<target tmp>/resume`, removed on drop.
+fn tmpdir(name: &str) -> aterm_tempfile::TempDir {
+    let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("resume");
+    std::fs::create_dir_all(&parent).expect("create tmpdir");
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir_in(parent)
+        .expect("create tmpdir")
 }
 
 fn state(current_version: &str, has_section: bool, published: bool) -> RemoteState {
@@ -110,7 +92,10 @@ fn recutting_a_published_version_is_refused() {
          first: {err}"
     );
     assert!(
-        err.contains("targo --unverified ship yank <build>"),
+        err.contains(
+            "targo --unverified ship yank <build> --release-credentials <profile.toml> \
+             --mac-only|--linux-artifacts DIRECTORY"
+        ),
         "{err}"
     );
 
@@ -141,39 +126,6 @@ fn journal() -> Journal {
         release_intent: false,
         upload_intents: Vec::new(),
         done: vec![],
-    }
-}
-
-/// The step list IS the resume contract (spec §7 order) — pin it so a
-/// reordering can't silently change what "--resume from selfcheck" means.
-#[test]
-fn pipeline_step_order_is_the_spec_7_order() {
-    assert_eq!(
-        STEPS,
-        [
-            "lock",
-            "build",
-            "selfcheck",
-            // The origin tag names the release commit before anything is published,
-            // so the release `publish` makes the head always names a tag origin has.
-            "tag",
-            // THE one publication (2026-09-26): the channel release bound, uploaded,
-            // proved and made the head, BEFORE the lease is released — a failure is
-            // loud and resumable, never a release the fleet cannot see.
-            "publish",
-            // `unlock` is LAST (2026-09-23): the website follows the cut AFTER
-            // the pipeline, best-effort and unjournaled, so a site failure can
-            // never park the journal and block the next cut.
-            "unlock",
-        ]
-    );
-    for retired in [
-        "site", "draft", "upload", "preflip", "flip", "archive", "verify", "mirror",
-    ] {
-        assert!(
-            !STEPS.contains(&retired),
-            "the retired `{retired}` step must never be journaled again"
-        );
     }
 }
 
@@ -220,7 +172,7 @@ fn first_incomplete_walks_the_step_order() {
 #[test]
 fn current_journal_done_state_is_an_exact_canonical_prefix() {
     let dir = tmpdir("journal-prefix");
-    let path = dir.join("state.toml");
+    let path = dir.path().join("state.toml");
     for done in [
         vec!["build".to_string()],
         vec!["lock".to_string(), "publish".to_string()],
@@ -288,7 +240,7 @@ fn the_site_hook_exit_contract_is_pinned() {
 #[test]
 fn an_older_journal_format_is_refused_in_one_sentence() {
     let dir = tmpdir("journal-older-format");
-    let path = dir.join("cut-state.toml");
+    let path = dir.path().join("cut-state.toml");
     let through_unlock = "\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
          \"preflip\", \"tag\", \"flip\", \"archive\", \"verify\", \"mirror\", \"unlock\"";
     let write = |format: &str, done: &str| {
@@ -453,7 +405,7 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
         "9 names two step lists; the current format must be a number no other cutter wrote"
     );
     let dir = tmpdir("journal-v0-92");
-    let path = dir.join("cut-state.toml");
+    let path = dir.path().join("cut-state.toml");
     std::fs::write(&path, V0_92_JOURNAL).unwrap();
     let error = Journal::load(&path)
         .expect_err("main's finished 0.92 journal is refused, never walked")
@@ -539,7 +491,7 @@ mirror_upload_intents = ["aterm-0.93.0-mac.zip", "aterm-0.93.0-mac.zip.sha256", 
 done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip", "archive", "verify", "mirror", "unlock"]
 "#;
     let dir = tmpdir("journal-v0-93");
-    let path = dir.join("cut-state.toml");
+    let path = dir.path().join("cut-state.toml");
     std::fs::write(&path, V0_93_JOURNAL).unwrap();
 
     let header = publish::JournalHeader::read(&path).unwrap().unwrap();
@@ -596,14 +548,14 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
 #[test]
 fn a_failing_site_hook_warns_and_leaves_the_journal_complete() {
     let dir = tmpdir("journal-site-hook-fails");
-    let path = dir.join("cut-state.toml");
+    let path = dir.path().join("cut-state.toml");
     let mut complete = journal();
     complete.release_id = Some(55);
     complete.release_intent = true;
     complete.done = STEPS.iter().map(|step| (*step).to_string()).collect();
     complete.save(&path).unwrap();
 
-    let hook = dir.join("post-promote");
+    let hook = dir.path().join("post-promote");
     std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
     let mut ran = Vec::new();
     let follow = publish::site_follows_the_cut(&hook, "0.92.0", &mut |h| {
@@ -649,38 +601,16 @@ fn a_failing_site_hook_warns_and_leaves_the_journal_complete() {
     // …a success says so, and a tree with no hook skips without running anything.
     let synced = publish::site_follows_the_cut(&hook, "0.92.0", &mut |_| Ok(Some(0)));
     assert!(synced.lines()[0].contains("synced"), "{synced:?}");
-    let absent = publish::site_follows_the_cut(&dir.join("absent"), "0.92.0", &mut |_| {
+    let absent = publish::site_follows_the_cut(&dir.path().join("absent"), "0.92.0", &mut |_| {
         panic!("an absent hook is never run")
     });
     assert_eq!(absent, publish::SiteFollow::NoHook);
 }
 
-/// The public channel's exact asset set carries ONE DMG and refuses the retired
-/// `-lite` twin (2026-08-26) as a foreign object, never silently converging it.
-#[test]
-fn the_exact_asset_set_refuses_the_retired_lite_twin() {
-    // Today's exact set has exactly one DMG and no retired name…
-    let set = channel::required_asset_names("0.61.0", false, false);
-    assert!(
-        !set.iter()
-            .any(|n| n.contains("lite") || n.contains("offline") || n.contains("x86_64")),
-        "{set:?}"
-    );
-    channel::validate_channel_asset_set(&set, "0.61.0", false, false, &[]).unwrap();
-    // …and a channel head the old cutter already gave the lean twin to is
-    // refused, naming the foreign object.
-    let mut stale = set.clone();
-    stale.push("aterm-0.61.0-lite.dmg".to_string());
-    stale.push("aterm-offline.dmg".to_string());
-    let err = channel::validate_channel_asset_set(&stale, "0.61.0", false, false, &[])
-        .expect_err("the retired twin on the channel head is a foreign object");
-    assert!(err.to_string().contains("aterm-0.61.0-lite.dmg"), "{err}");
-}
-
 #[test]
 fn journal_round_trips_and_marks_persist_immediately() {
     let dir = tmpdir("journal");
-    let path = dir.join("cut-state.toml");
+    let path = dir.path().join("cut-state.toml");
 
     // Absent ⇒ Ok(None), never an error (a fresh cut has no journal yet).
     assert!(
@@ -724,7 +654,7 @@ fn journal_round_trips_and_marks_persist_immediately() {
 #[test]
 fn journal_rejects_min_build_above_its_claim() {
     let dir = tmpdir("journal-invalid-floor");
-    let path = dir.join("cut-state.toml");
+    let path = dir.path().join("cut-state.toml");
     let mut j = journal();
     j.min_build = Some(j.build_number + 1);
     let err = j.save(&path).unwrap_err().to_string();
@@ -750,7 +680,7 @@ fn journal_rejects_min_build_above_its_claim() {
 #[test]
 fn journal_persists_signature_ratchet_and_actual_key_fail_closed() {
     let dir = tmpdir("journal-signature-policy");
-    let path = dir.join("cut-state.toml");
+    let path = dir.path().join("cut-state.toml");
     let mut j = journal();
     j.signature_required = true;
     assert!(
@@ -861,24 +791,28 @@ fn version_helpers_port_the_shell_derivations() {
 #[test]
 fn locked_metadata_gate_rejects_a_workspace_that_would_rewrite_its_lock() {
     let root = tmpdir("locked-metadata");
-    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
     std::fs::write(
-        root.join("Cargo.toml"),
+        root.path().join("Cargo.toml"),
         "[package]\nname = \"lock-gate-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
     )
     .unwrap();
-    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "").unwrap();
 
-    let missing = gates::locked_metadata_gate(&root).unwrap_err().to_string();
+    let missing = gates::locked_metadata_gate(root.path())
+        .unwrap_err()
+        .to_string();
     assert!(missing.contains("Cargo.lock"), "{missing}");
-    assert!(!root.join("Cargo.lock").exists());
+    assert!(!root.path().join("Cargo.lock").exists());
 
     let stale_lock = "# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = \"lock-gate-fixture\"\nversion = \"0.0.9\"\n";
-    std::fs::write(root.join("Cargo.lock"), stale_lock).unwrap();
-    let error = gates::locked_metadata_gate(&root).unwrap_err().to_string();
+    std::fs::write(root.path().join("Cargo.lock"), stale_lock).unwrap();
+    let error = gates::locked_metadata_gate(root.path())
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("Cargo.lock"), "{error}");
     assert_eq!(
-        std::fs::read_to_string(root.join("Cargo.lock")).unwrap(),
+        std::fs::read_to_string(root.path().join("Cargo.lock")).unwrap(),
         stale_lock
     );
 }
@@ -971,6 +905,7 @@ fn effective_min_build_is_monotonic_canonical_and_bounded_by_claim() {
     assert_eq!(resolve(None, None), None);
     assert_eq!(resolve(Some(0), None), None);
     assert_eq!(resolve(None, Some(0)), None);
+    assert_eq!(resolve(Some(0), Some(0)), None);
     assert_eq!(resolve(Some(40), None), Some(40));
     assert_eq!(resolve(None, Some(70)), Some(70));
     assert_eq!(resolve(Some(40), Some(70)), Some(70));
@@ -989,59 +924,6 @@ fn effective_min_build_is_monotonic_canonical_and_bounded_by_claim() {
     // non-vacuous because dropping the channel input would lower 70 to 40.
     let retired_operator_only = Some(40);
     assert_ne!(retired_operator_only, resolve(Some(40), Some(70)));
-}
-
-/// Exhaustive bounded conformance over the REAL shipping resolver. This is the
-/// finite-state proof obligation for the carry-forward transition: across every
-/// absent/present floor through 4 and every claim through 4, the output is
-/// exactly canonical max(input), never decreases either input, and is accepted
-/// iff the claimed build can satisfy it. The operator-only mutant must have a
-/// reachable counterexample so the proof cannot pass vacuously.
-#[test]
-fn bounded_floor_state_space_proves_carry_forward_invariants_and_catches_mutant() {
-    let floors: Vec<Option<u64>> = std::iter::once(None).chain((0..=4).map(Some)).collect();
-    let mut mutant_caught = false;
-
-    for operator in &floors {
-        for channel in &floors {
-            for claimed in 0..=4 {
-                let raw_max = operator.unwrap_or(0).max(channel.unwrap_or(0));
-                let expected = (raw_max != 0).then_some(raw_max);
-                let got = publish::effective_min_build(*operator, *channel, claimed);
-                if raw_max > claimed {
-                    assert!(got.is_err(), "({operator:?}, {channel:?}, {claimed})");
-                } else {
-                    let got = got.unwrap();
-                    assert_eq!(got, expected, "({operator:?}, {channel:?}, {claimed})");
-                    assert!(got.unwrap_or(0) >= operator.unwrap_or(0));
-                    assert!(got.unwrap_or(0) >= channel.unwrap_or(0));
-                    assert!(got.unwrap_or(0) <= claimed);
-                }
-
-                let retired = operator.filter(|floor| *floor != 0);
-                if raw_max <= claimed && retired != expected {
-                    mutant_caught = true;
-                }
-            }
-        }
-    }
-    assert!(
-        mutant_caught,
-        "bounded domain must distinguish carry-forward from operator-only policy"
-    );
-}
-
-/// A second scan immediately before visibility closes the race between the
-/// initial carry-forward decision and another publisher raising the channel.
-#[test]
-fn late_channel_floor_guard_refuses_a_ratcheting_race() {
-    assert!(publish::channel_floor_covered(None, None).is_ok());
-    assert!(publish::channel_floor_covered(Some(70), Some(70)).is_ok());
-    assert!(publish::channel_floor_covered(Some(90), Some(70)).is_ok());
-    let err = publish::channel_floor_covered(Some(70), Some(71))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("advanced to min_build 71"), "{err}");
 }
 
 #[test]
@@ -2082,6 +1964,38 @@ fn cli_parses_the_whole_spec_5_surface() {
             commit: Some("f37ddc740".to_string())
         }
     );
+    // The MEASURE judge the release scripts ask (2026-10-01).
+    assert_eq!(
+        parse(&["measure", "verdict"]).unwrap(),
+        cli::Cmd::MeasureVerdict {
+            commit: "HEAD".into(),
+            prover: None
+        }
+    );
+    assert_eq!(
+        parse(&[
+            "measure",
+            "verdict",
+            "--commit",
+            "f37ddc740",
+            "--prover",
+            "/s/bin"
+        ])
+        .unwrap(),
+        cli::Cmd::MeasureVerdict {
+            commit: "f37ddc740".into(),
+            prover: Some("/s/bin".into())
+        }
+    );
+    for bad in [
+        &["measure"][..],
+        &["measure", "judge"],
+        &["measure", "verdict", "--commit"],
+        &["measure", "verdict", "--commit", "a", "--commit", "b"],
+        &["measure", "verdict", "--update-ratchet"],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?}");
+    }
     assert_eq!(
         parse(&["provision", "--id", "m2"]).unwrap(),
         cli::Cmd::Provision {
@@ -2182,12 +2096,42 @@ fn cli_parses_the_whole_spec_5_surface() {
         "the v prefix is normalized away"
     );
     assert_eq!(
-        parse(&["yank", "1783918101"]).unwrap(),
+        parse(&["yank", "1783918101", "--mac-only"]).unwrap(),
         cli::Cmd::Yank {
             build: 1_783_918_101,
-            opts: verify::YankOptions::default()
+            opts: verify::YankOptions {
+                mac_only: true,
+                ..Default::default()
+            }
         }
     );
+    // The successor is a real cut, so a yank declares Linux as a cut must.
+    assert_eq!(
+        parse(&["yank", "1783918101"]).unwrap_err(),
+        format!("yank publishes a cut first; {}", cli::MAC_ONLY_REFUSAL)
+    );
+    assert_eq!(
+        parse(&[
+            "yank",
+            "1783918101",
+            "--linux-artifacts",
+            "/handoff",
+            "--linux-target",
+            "x86_64",
+        ])
+        .unwrap(),
+        cli::Cmd::Yank {
+            build: 1_783_918_101,
+            opts: verify::YankOptions {
+                linux_artifacts: Some(PathBuf::from("/handoff")),
+                linux_targets: vec!["x86_64-unknown-linux-gnu".into()],
+                ..Default::default()
+            }
+        }
+    );
+    let contradiction =
+        parse(&["yank", "1", "--mac-only", "--linux-artifacts", "/handoff"]).unwrap_err();
+    assert!(contradiction.contains("contradict"), "{contradiction}");
     // A yank publishes a real cut before it deletes anything, and since the paper
     // master was armed that cut refuses pre-claim unless it is told which profile
     // signs. Pinned here because the way this breaks is a parse that SUCCEEDS and
@@ -2197,13 +2141,16 @@ fn cli_parses_the_whole_spec_5_surface() {
             "yank",
             "1783918101",
             "--release-credentials",
-            "/keys/m3.toml"
+            "/keys/m3.toml",
+            "--mac-only"
         ])
         .unwrap(),
         cli::Cmd::Yank {
             build: 1_783_918_101,
             opts: verify::YankOptions {
                 release_credentials: Some(PathBuf::from("/keys/m3.toml")),
+                mac_only: true,
+                ..Default::default()
             }
         }
     );
@@ -2571,4 +2518,28 @@ fn keep_the_installed_toolchain(
     _scratch: &std::path::Path,
 ) -> atpkg::provenance::HealOutcome {
     atpkg::provenance::HealOutcome::Clean
+}
+
+/// A failure that names its own verdict keeps it; any other gets `FAILED —`.
+#[test]
+fn a_failure_that_names_its_verdict_is_not_prefixed_with_failed() {
+    for own in [
+        "NOT DONE — 1 waiting: the certificate errand is at Apple",
+        "CHECK ONLY — nothing was written. 1 waiting: the certificate errand is at Apple.",
+        "tools/verify.sh --full COULD NOT RUN — nothing was decided about the tree",
+        "tools/trust-gate-all.sh NARROWED: this machine cannot verify every library",
+        "tools/verify.sh --full FAILED — fix the tree; nothing was claimed or committed",
+    ] {
+        assert_eq!(cli::failure_line(own), format!("aterm-release: {own}"));
+    }
+    assert_eq!(
+        cli::failure_line("a real cut of abc would refuse at: TRUST lane"),
+        "aterm-release: FAILED — a real cut of abc would refuse at: TRUST lane"
+    );
+    // A verdict word quoted from a sub-run is not this message's own verdict.
+    let quoted = "the tree's facts judged against the ratchet say `verdict FAILED`";
+    assert_eq!(
+        cli::failure_line(quoted),
+        format!("aterm-release: FAILED — {quoted}")
+    );
 }

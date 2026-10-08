@@ -10,6 +10,9 @@
 
 [package]
 name = "aterm-lz4"
+# Integration tests are declared below, not discovered. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 description = "Vendored block-mode subset of lz4_flex for aterm. MIT/Apache-2.0."
 version.workspace = true
 edition.workspace = true
@@ -23,10 +26,9 @@ path = "src/lib.rs"
 
 [dependencies]
 
-[dev-dependencies]
-# Upstream lz4_flex uses proptest for fastcpy property tests; keeping it as
-# a dev-dep lets vendor refreshes land without edits to the inline tests.
-proptest = { workspace = true }
-
 [lints]
 workspace = true
+
+[[test]]
+name = "lz4_suite"
+path = "tests/lz4_suite.rs"

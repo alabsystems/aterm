@@ -1,0 +1,13 @@
+# claude-code 2.1.284 · HAND-BUILT 2026-09-28 (no live capture yet): the transcript-share ask over an idle worker, rows from the render code (Ele) checked against the store binary's literals; the framing rows are the real captures' (survey-open.txt)
+  Free disk is 31 GiB.
+
+✻ Cooked for 52m 54s · done 12:31 PM
+
+⏺ Can Anthropic look at your session transcript to help us improve Claude Code?
+  https://code.claude.com/docs/en/data-usage#session-quality-surveys
+  y: Yes    n: No     d: Don't ask again
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active

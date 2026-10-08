@@ -1,25 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! DIFFERENTIAL ORACLE for the SGR rendition path.
+//! Differential oracle for the SGR rendition path.
 //!
-//! `handle_sgr` / `csi_dispatch_sgr_fast` route the SAME rendition through a
-//! dozen different shapes: single-param fast paths, the 3-param 256-colour
-//! shape, the 4-param attribute+256-colour shape, the 5- and 10-param truecolour
-//! shapes, the colon (ISO 8613-3) sub-parameter path, and the generic loop.
-//! Historically each shape called its own `update_style_id_*` specialization,
-//! and those specializations differed in WHICH cached fields they refreshed —
-//! which is exactly how a rendition can be "set" and still paint the previous
-//! colour (the `\x1b[39;49m` staleness the old fast path documented in
-//! handler_sgr.rs, and the `update_fg_cache_indexed` cache-hit arm that never
-//! refreshed `cached_has_style_extras`).
+//! `handle_sgr` / `csi_dispatch_sgr_fast` route the same rendition through a
+//! dozen shapes: single-param fast paths, the 3-param 256-colour shape, the
+//! 4-param attribute+256-colour shape, the 5- and 10-param truecolour shapes,
+//! the colon (ISO 8613-3) sub-parameter path, and the generic loop.
 //!
-//! This suite pins the invariant those specializations must satisfy and that no
-//! per-shape test can: **two byte sequences that denote the same rendition must
-//! render identically, and must arm the same background for erase/scroll (BCE,
-//! #7522)**. It is written to hold on BOTH sides of the style-interner deletion —
-//! it asserts observable rendition behaviour, never a `StyleId` — so it doubles
-//! as the parity gate for that change.
+//! Invariant: two byte sequences that denote the same rendition render
+//! identically and arm the same background for erase/scroll (BCE). It asserts
+//! observable rendition behaviour only, never internal style ids.
 
 use aterm_core::terminal::{RenderCell, Terminal};
 
@@ -28,19 +19,13 @@ const COLS: u16 = 20;
 
 /// Column 0 of `row`, as the engine itself resolves it.
 ///
-/// `render_row` returns one `RenderCell` per STORED column, and a grid row is
-/// sparse: a row an erase left at its default background stores no cells at all,
-/// so `first()` is `None`. That absence is not a missing observable — it IS the
-/// observable. `implicit_blank_render_cell` is the engine's own answer for an
-/// unmaterialized column (the same value hosts pad snapshot rows with), resolved
-/// through the same palette / default-colour / DECSCNM path as a stored cell. So
-/// an armed BCE background shows up as a stored cell carrying it, an unarmed one
-/// as the implicit blank, and the two are directly comparable.
-///
-/// The original helpers called `.expect("row N has cells")` here, which made
-/// every BCE assertion below panic before it could compare anything — on BOTH
-/// sides of the interner deletion. The BCE half of this oracle had never once
-/// run until this was fixed.
+/// A grid row is sparse: a row an erase left at its default background stores
+/// no cells, so `render_row(..).first()` is `None`, and that absence is the
+/// observable. `implicit_blank_render_cell` is the engine's answer for an
+/// unmaterialized column (what hosts pad snapshot rows with), resolved through
+/// the same palette / default-colour / DECSCNM path as a stored cell, so an
+/// armed BCE background (a stored cell) and an unarmed one (the implicit blank)
+/// compare directly.
 fn cell_at(t: &Terminal, row: usize) -> RenderCell {
     t.render_row(row)
         .first()
@@ -58,7 +43,7 @@ fn cell_after(seq: &str) -> RenderCell {
 }
 
 /// Feed `seq`, then erase the whole screen, and return the rendered cell at
-/// (1, 0) — a cell the erase FILLED, never one the writer touched. This is the
+/// (1, 0) — a cell the erase filled, never one the writer touched. This is the
 /// BCE cursor template's observable: `set_cursor_template` is what makes an
 /// erase (and a scroll, and an autowrap) inherit the current background.
 fn erased_cell_after(seq: &str) -> RenderCell {
@@ -70,7 +55,7 @@ fn erased_cell_after(seq: &str) -> RenderCell {
 }
 
 /// Feed `seq`, then scroll one line in at the bottom via LF on the last row.
-/// The scrolled-in blank is filled from the same template (#7522).
+/// The scrolled-in blank is filled from the same template.
 fn scrolled_in_cell_after(seq: &str) -> RenderCell {
     let mut t = Terminal::new(ROWS, COLS);
     t.process(b"\x1b[H");
@@ -81,7 +66,7 @@ fn scrolled_in_cell_after(seq: &str) -> RenderCell {
     cell_at(&t, usize::from(ROWS - 1))
 }
 
-/// Every entry denotes ONE rendition written two ways. Left is the shape with a
+/// Every entry denotes one rendition written two ways. Left is the shape with a
 /// dedicated fast path; right reaches the same state by another route (a second
 /// CSI, the colon form, or a shape that falls through to the generic loop).
 const EQUIVALENT_ENCODINGS: &[(&str, &str, &str)] = &[
@@ -188,12 +173,9 @@ fn erase_after_bg_sgr_inherits_that_background() {
 
 #[test]
 fn indexed_fg_after_truecolour_fg_is_not_contaminated() {
-    // The rendition cache used to be refreshed by TWO different code paths
-    // depending on whether the interner's L1/L2 probe hit: the hit arm called
-    // `update_fg_cache_indexed`, which left `cached_has_style_extras` at its
-    // previous value. Priming the cache with the indexed rendition, spending one
-    // rendition on truecolour, and returning to the indexed one is exactly the
-    // sequence that took the hit arm with a stale RGB flag in tow.
+    // Prime the rendition cache with an indexed rendition, spend one on
+    // truecolour, and return to the indexed one: the cached style-extras flag
+    // must follow.
     let mut t = Terminal::new(ROWS, COLS);
     t.process(b"\x1b[H\x1b[38;5;1mA");
     t.process(b"\r\n\x1b[38;2;9;9;9mB");
@@ -217,7 +199,7 @@ fn indexed_fg_after_truecolour_fg_is_not_contaminated() {
 
 #[test]
 fn many_distinct_truecolours_all_render_exactly() {
-    // Renditions are stored INLINE in the cell (plus the extras RGB ring for
+    // Renditions are stored inline in the cell (plus the extras RGB ring for
     // 24-bit overflow); no per-terminal style table is consulted, so the number
     // of distinct colours a session has already used cannot change what a cell
     // paints. 5 000 distinct triples is far past any cache-sized working set.
@@ -235,7 +217,7 @@ fn many_distinct_truecolours_all_render_exactly() {
             sampled.push((n, [r, g, b]));
         }
     }
-    // Re-drive each sampled colour LAST so it owns the cell, and assert it
+    // Re-drive each sampled colour last so it owns the cell, and assert it
     // paints exactly — a late-session rendition must not be degraded.
     for (n, rgb) in sampled {
         t.process(b"\x1b[H");

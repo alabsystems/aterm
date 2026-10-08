@@ -361,20 +361,20 @@ impl TableLike for InlineTable {
     fn contains_key(&self, key: &str) -> bool {
         self.items.contains_key(key)
     }
+    /// A `[header]` table or array of tables is converted to its inline
+    /// spelling on the way in. An inline table can hold only values, and the
+    /// encoder prints only values inside `{ … }`, so an `Item::Table` stored
+    /// as-is was dropped from the output along with everything under it: a
+    /// walk that vivifies `sparkle_words.profanity` as `Item::Table` beneath
+    /// `sparkle_words = { … }` saved a file identical to the one it read.
     fn insert(&mut self, key: &str, item: Item) -> Option<Item> {
-        self.items.insert(Key::new(key), item)
+        self.items.insert(Key::new(key), inline_item(item))
     }
     fn remove(&mut self, key: &str) -> Option<Item> {
         self.items.remove(key)
     }
     fn len(&self) -> usize {
         self.items.len()
-    }
-    fn is_dotted(&self) -> bool {
-        self.dotted
-    }
-    fn set_dotted(&mut self, dotted: bool) {
-        self.dotted = dotted;
     }
     fn decor(&self) -> &Decor {
         &self.decor
@@ -388,6 +388,37 @@ impl TableLike for InlineTable {
     fn as_inline_table(&self) -> Option<&InlineTable> {
         Some(self)
     }
+}
+
+/// `item` in a form an inline table can hold: a `[header]` table becomes an
+/// inline table and an array of tables an array of inline tables, recursively;
+/// every other item is returned unchanged.
+fn inline_item(item: Item) -> Item {
+    match item {
+        Item::Table(table) => Item::Value(Value::InlineTable(table_to_inline(table))),
+        Item::ArrayOfTables(array) => Item::Value(Value::Array(
+            array
+                .values
+                .into_iter()
+                .map(|table| Value::InlineTable(table_to_inline(table)))
+                .collect(),
+        )),
+        other => other,
+    }
+}
+
+/// The inline spelling of a `[header]` table. Its entries keep their keys; its
+/// header decor, span and `implicit` flag describe a header line, which an
+/// inline table does not have, so they are dropped. `dotted` means the same
+/// thing in both spellings (the entries print on the parent's lines as dotted
+/// keys) and is kept.
+fn table_to_inline(table: super::Table) -> InlineTable {
+    let mut out = InlineTable::new();
+    out.dotted = table.dotted;
+    for (key, item) in table.items.into_entries() {
+        out.items.insert(key, inline_item(item));
+    }
+    out
 }
 
 impl core::str::FromStr for Value {

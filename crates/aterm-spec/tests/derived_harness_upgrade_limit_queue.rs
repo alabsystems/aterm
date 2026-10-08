@@ -18,44 +18,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::walk::{only, reachable, walk};
 use aterm_spec::derive::{Model, harness_upgrade_limit_queue_model};
 use aterm_spec::{interp, verify};
 
 type S = BTreeMap<&'static str, i64>;
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
-
-fn run(m: &Model, actions: &[&str]) -> S {
-    let mut s = m.init_state();
-    for action in actions {
-        assert!(m.fire(action, &mut s), "{action} at {s:?}");
-    }
-    s
-}
-
-/// Every state `m` reaches, invariants unchecked.
-fn reachable(m: &Model) -> Vec<S> {
-    let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([m.init_state()]);
-    let mut out = Vec::new();
-    while let Some(s) = queue.pop_front() {
-        if !seen.insert(s.clone()) {
-            continue;
-        }
-        for a in &m.actions {
-            let mut next = s.clone();
-            if m.fire(a.name, &mut next) {
-                queue.push_back(next);
-            }
-        }
-        out.push(s);
-    }
-    out
-}
 
 const INVARIANTS: [&str; 5] = [
     "NeverTwoAsksUntaken",
@@ -258,7 +225,7 @@ fn the_owners_report_as_it_ran_is_the_caught_negative_control() {
     );
     // The first stacked notice: the committed upgrade waits behind the queue
     // while the limit's word holds.
-    let queued = run(
+    let queued = walk(
         &m,
         &["LimitHits", "Clear", "BoundPasses", "Announce", "Clear"],
     );
@@ -283,7 +250,7 @@ fn the_owners_report_as_it_ran_is_the_caught_negative_control() {
 #[test]
 fn the_report_now_waits_types_again_rests_and_types_once_more() {
     let m = harness_upgrade_limit_queue_model();
-    let mut s = run(&m, &["LimitHits", "BoundPasses", "Clear", "Announce"]);
+    let mut s = walk(&m, &["LimitHits", "BoundPasses", "Clear", "Announce"]);
     assert_eq!((s["asks"], s["untaken"], s["took"]), (1, 1, 0));
     for quiet in STEPS.iter().chain(&["NowAsks"]) {
         assert!(
@@ -361,7 +328,7 @@ fn the_report_now_waits_types_again_rests_and_types_once_more() {
     assert_eq!((s["phase"], s["asks"], s["took"], s["spent"]), (2, 4, 4, 0));
 
     // The limit over by the time the copy goes: it is read, one ask taken.
-    let mut s = run(&m, &["LimitHits", "BoundPasses", "Clear", "Announce"]);
+    let mut s = walk(&m, &["LimitHits", "BoundPasses", "Clear", "Announce"]);
     for action in ["LimitEnds", "BoundPasses", "Clear", "Retype"] {
         assert!(m.fire(action, &mut s), "{action}: {s:?}");
     }
@@ -387,7 +354,7 @@ fn the_report_now_waits_types_again_rests_and_types_once_more() {
 /// rests in all, the transcript's word running out after every one. The
 /// rest each took (1: shorter than a day, 2: a day), and the state after.
 fn days_at_the_limit(m: &Model, n: usize) -> (Vec<i64>, S) {
-    let mut s = run(m, &["LimitHits", "BoundPasses", "Clear", "Announce"]);
+    let mut s = walk(m, &["LimitHits", "BoundPasses", "Clear", "Announce"]);
     for _ in 0..2 {
         for action in ["BoundPasses", "Clear", "Retype"] {
             assert!(m.fire(action, &mut s), "{action}: {s:?}");

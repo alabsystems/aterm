@@ -6,8 +6,7 @@
 //! §3.3, D9). Each is queued here with the wall clock at queue time and
 //! posted into the center at the next park (`App::drain_message_inbox`), so
 //! a message minted before the center exists still carries the instant it
-//! happened. The producers, every one of them (`message_reporters` builds
-//! the words):
+//! happened. The producers (`message_reporters` builds the words) include:
 //!
 //! * the startup config warnings, one message per family, and the crash
 //!   message — `run()` collects them before `App` is constructed (lib.rs,
@@ -22,14 +21,19 @@
 //!   DirectComposition refusal (`app_window`), and the live-reload "not at
 //!   launch" arm inside an `AppRt` chrome call handed only a `&Window`
 //!   (`platform_win`; R6);
-//! * the font family the backend build thread could not admit (lib.rs;
-//!   the `config.font-family` row);
+//! * the font family the backend build thread could not admit, said at the
+//!   backend join (`say_font_family_rejected`, lib.rs; the
+//!   `config.font-family` row);
 //! * the dead accessibility publisher — the PANIC HOOK, on the publisher's
 //!   own thread (`a11y_backend::report_failure`; R8);
 //! * the GPU-lost row — on the loop thread, but MID-RECOVERY, inside
 //!   `App::recover_from_gpu_loss_with` before the CPU renderer is in the
 //!   backend slot, so the row lands at the next park rather than re-gridding
-//!   every window through a dead GPU (`app_render`; R7).
+//!   every window through a dead GPU (`app_render`; R7);
+//! * the fabric-lost advisory — the bridge-loss sweep, on the fabric thread
+//!   (`fabric::bridge_lost`);
+//! * the restored agents that did not come back — the harness host's resume
+//!   attempts (`harness_host::say_restored_missed`).
 //!
 //! A `Mutex<Vec<_>>` behind an `AtomicBool`, so the drain — which runs on
 //! EVERY park — is one atomic load (`Acquire`, pairing with the producer's

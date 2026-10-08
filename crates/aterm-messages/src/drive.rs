@@ -46,7 +46,8 @@ use crate::{Instant, MAX_ROWS, MessageCenter};
 // ---- the center-wide step ---------------------------------------------------
 
 /// What one step of the band commits against: the instant, the handoff
-/// freeze, and the rows the grids can spare.
+/// freeze, the rows the grids can spare, and the windows' chrome regrow
+/// floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Commit {
     /// The step's instant (the host's clock, read once).
@@ -58,6 +59,13 @@ pub struct Commit {
     pub afford: u16,
     /// The row count the host's geometry reserves now.
     pub reserved: u16,
+    /// THE WINDOWS' CHROME REGROW FLOOR ([`crate::chrome`], ruling 414,
+    /// proposed): the latest [`crate::chrome::RegrowFloor::floor`] of every
+    /// window the band's re-grid resizes ([`crate::chrome::latest`]) — a quiet
+    /// shrink waits it, so another source's rise just before it (a presence
+    /// row's birth) is never undone by the band inside the settle. A host with
+    /// one surface and no other chrome source (the web) hands `None`.
+    pub floor: Option<Instant>,
 }
 
 /// What one step changed.
@@ -73,9 +81,15 @@ pub struct Committed {
 }
 
 /// Commit the row count (never under a freeze): the center's hysteresis
-/// over what the grids afford, and the count the host re-grids to — `Some`
-/// when it moved or disagrees with [`Commit::reserved`].
+/// over what the grids afford, its quiet shrink held to [`Commit::floor`],
+/// and the count the host re-grids to — `Some` when it moved or disagrees
+/// with [`Commit::reserved`]. A count above [`Commit::reserved`] is a RISE
+/// the host notes on every window it re-grids
+/// ([`crate::chrome::is_rise`]).
 pub fn commit(center: &mut MessageCenter, c: Commit) -> Option<u16> {
+    // Handed in first, frozen or not, so the state deadline reads the floor
+    // of the latest step.
+    center.set_regrow_floor(c.floor);
     if c.frozen {
         return None;
     }
@@ -184,6 +198,22 @@ pub struct Lay {
 }
 
 impl Lay {
+    /// A web page's layout (ruling 332): no `$HOME` to abbreviate, and the
+    /// links withheld until the page has a Details view. The native window's
+    /// is its own (`aterm-gui`'s `message_band::band_lay`).
+    #[must_use]
+    pub fn web(cols: usize, details: bool) -> Self {
+        Self {
+            cols,
+            links: if details {
+                Links::Painted
+            } else {
+                Links::Withheld
+            },
+            home: || None,
+        }
+    }
+
     /// The width law's layout of `center` at this view's width.
     #[must_use]
     pub fn presentation(&self, center: &MessageCenter) -> Presentation {
@@ -386,20 +416,6 @@ impl View {
         }
         self.next_frame(center, lay, now, look)
             .is_some_and(|d| d <= now || self.motion.is_none())
-    }
-
-    /// The next change read from `from` over the KEPT layout — no memo, no
-    /// past guard: the web module's rule (ruling 337, F4). `None` with no
-    /// layout kept.
-    #[must_use]
-    pub fn deadline_from(
-        &self,
-        center: &MessageCenter,
-        from: Instant,
-        look: Look,
-    ) -> Option<Instant> {
-        let (_, _, p) = self.layout.as_ref()?;
-        self.scan(center, p, from, look)
     }
 
     /// The band's repaint term for this view ([`paint::band_fp`]): the

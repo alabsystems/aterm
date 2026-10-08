@@ -2,23 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Reflow utility functions and copy-time extras remapping.
-//!
-//! Pure helper functions (chunk boundary computation, cell copying) plus
-//! optional source-coordinate tracking for preserving `CellExtras` during
-//! reflow (#3977). Extracted from `reflow.rs` to stay under the 500-line
-//! file limit.
+//! Reflow helpers (chunk boundaries, cell copying) and source-coordinate
+//! tracking that preserves `CellExtras` across reflow.
 
 use crate::CellExtra;
 use crate::CellFlags;
 #[cfg(any(test, feature = "testing"))]
 use crate::test_counters::count_reflow_cell_ops;
 
-/// How to map a copied cell's source index back to its original [`CellCoord`]
-/// during reflow extras-remapping. A STRAIGHT single-row copy is pure index
-/// arithmetic (`Row(r)` → `CellCoord::new(r, col)`), so it needs no allocation —
-/// only the continuation-MERGE path, which concatenates cells from several source
-/// rows into one buffer, needs the explicit per-index `Coords` table.
+/// Maps a copied cell's source index back to its [`CellCoord`] during extras
+/// remapping. A single-row copy is index arithmetic (`Row(r)`); only the
+/// continuation merge, which concatenates several source rows, needs the
+/// per-index `Coords` table.
 #[derive(Clone, Copy)]
 pub(super) enum ExtrasSource<'a> {
     /// No extras to remap (the source row had none) — `remap_copied_extra` no-ops.
@@ -99,10 +94,7 @@ fn remap_copied_extra(
     let Some(old_extras) = extras_ctx.old_extras else {
         return;
     };
-    // Resolve the source coord: single-row copies compute it (no per-row Vec); the
-    // merge path indexes its concatenated table. Byte-identical to the old
-    // `source_coords.get(src_index)` — a single-row table WAS `CellCoord::new(row,
-    // src_index)`, and copies never pass an out-of-range index for that row.
+    // Single-row copies compute the coord; the merge path indexes its table.
     let coord = match extras_ctx.source {
         ExtrasSource::None => return,
         ExtrasSource::Row(r) => CellCoord::new(r, row_u16(src_index)),
@@ -112,11 +104,10 @@ fn remap_copied_extra(
         },
     };
 
-    // Structured extras and rings can BOTH contribute to one cell: the parser
-    // keeps an emoji's base in the complex ring and its ZWJ/skin-tone suffix in
-    // the map's combining marks. Returning after copying the map loses the base
-    // when reflow retires the rings. Preserve full stored strings, supplement
-    // missing bases, and resolve RGB ring-first as the live renderer does.
+    // Structured extras and rings can both contribute to one cell (an emoji's
+    // base in the complex ring, its ZWJ/skin-tone suffix in the map's combining
+    // marks). Keep full stored strings, supplement missing bases, and resolve
+    // RGB ring-first as the renderer does.
     let stored = old_extras.get(coord);
     let complex = if stored.and_then(CellExtra::complex_char).is_none() {
         old_extras.complex_codepoint_for(coord.row, coord.col)
@@ -164,20 +155,17 @@ pub(super) fn copy_cells_to_row(
     for (src_index, cell) in cells[cell_offset..actual_end].iter().enumerate() {
         if cell.flags().contains(CellFlags::WIDE) && new_cols < 2 {
             new_row.set(j, crate::Cell::EMPTY);
-            // Cell::EMPTY is_empty() == true, so Row::set() doesn't advance
-            // row.len. Force len forward so the replacement space is visible
-            // to row_text(), Display, and merge_continuation_rows (#7567).
+            // Cell::EMPTY does not advance row.len via set(); force it so the
+            // replacement space is visible to row_text() and merges.
             new_row.update_len(j.saturating_add(1));
             j += 1;
             skip_next_spacer = true;
         } else if skip_next_spacer && cell.flags().contains(CellFlags::WIDE_CONTINUATION) {
             skip_next_spacer = false;
         } else if cell.flags().contains(CellFlags::WIDE) && j.saturating_add(1) == new_cols {
-            // A wide head in the destination's last column has nowhere to put
-            // its continuation. The chunked reflow never gets here
-            // (`adjust_chunk_boundary` ends the chunk before the pair), but the
-            // in-place DECDWL/DECDHL truncation does. Blank it, as
-            // `Row::resize` does, rather than leave a dangling WIDE cell.
+            // A wide head in the last column has nowhere for its continuation
+            // (reachable from the in-place DECDWL/DECDHL truncation); blank it as
+            // `Row::resize` does.
             new_row.set(j, crate::Cell::EMPTY);
             j = j.saturating_add(1);
             skip_next_spacer = true;
@@ -193,11 +181,8 @@ pub(super) fn copy_cells_to_row(
     }
 }
 
-/// Chunk non-empty cells into new-width rows with cursor tracking.
-///
-/// The first emitted row is NOT marked wrapped; subsequent rows (from chunking
-/// wider content) are marked wrapped. Caller sets the first row's wrapped flag
-/// if needed by checking `new_rows[first_idx]` after this returns.
+/// Chunk non-empty cells into new-width rows with cursor tracking. Rows after
+/// the first are marked wrapped; the caller sets the first row's flag.
 pub(super) fn chunk_cells_to_rows(
     cells: &[crate::Cell],
     new_cols: u16,
@@ -282,9 +267,7 @@ mod tests {
         assert_ne!(old.get(coord).unwrap().bg_rgb(), copied.bg_rgb());
     }
 
-    // =========================================================================
     // adjust_chunk_boundary
-    // =========================================================================
 
     #[test]
     fn adjust_chunk_boundary_no_wide_chars() {
@@ -348,9 +331,8 @@ mod tests {
 
     #[test]
     fn adjust_chunk_boundary_forward_progress_single_cell() {
-        // When actual_end == cell_offset after backup, ensure forward progress.
-        // Wide char at position 0, chunk_end=1: cells[0] is WIDE -> back up to 0.
-        // But actual_end == cell_offset (0), so force forward to min(2, len).
+        // A wide char at 0 with chunk_end=1 backs up to cell_offset, so the
+        // chunk is forced forward to min(2, len).
         let cells = [
             Cell::with_style(
                 'W',
@@ -390,9 +372,7 @@ mod tests {
         assert_eq!(adjust_chunk_boundary(&cells, 0, 0), 0);
     }
 
-    // =========================================================================
     // cursor_in_chunk
-    // =========================================================================
 
     #[test]
     fn cursor_in_chunk_within_range() {
@@ -410,7 +390,7 @@ mod tests {
     #[test]
     fn cursor_in_chunk_at_end_non_last() {
         // cursor at offset 5 in chunk [0..5), not last chunk (cells_len=10).
-        // 5 is NOT < 5, so not in range.
+        // 5 is not < 5, so not in range.
         let result = cursor_in_chunk(5, 10, 0, 5, 0);
         assert_eq!(result, None);
     }
@@ -437,25 +417,20 @@ mod tests {
 
     #[test]
     fn cursor_in_chunk_clamped_to_cells_len() {
-        // cursor_logical_offset > cells_len gets clamped.
-        // clamped = min(100, 10) = 10. chunk [5..10), last chunk.
-        // 10 <= 10 (last), so in range.
+        // cursor_logical_offset clamps to cells_len (10); the last chunk
+        // [5..10) includes 10.
         let result = cursor_in_chunk(100, 10, 5, 10, 3);
         assert_eq!(result, Some((3, 5)));
     }
 
     #[test]
     fn cursor_in_chunk_zero_length_cells() {
-        // cells_len=0, chunk [0..0), cursor at 0.
-        // clamped = 0, is_last_chunk = (0 == 0) = true.
-        // in_range = (0 >= 0) && (0 <= 0) = true.
+        // cells_len=0, chunk [0..0), cursor 0: the last chunk includes it.
         let result = cursor_in_chunk(0, 0, 0, 0, 0);
         assert_eq!(result, Some((0, 0)));
     }
 
-    // =========================================================================
     // source_coords_for_row
-    // =========================================================================
 
     #[test]
     fn source_coords_for_row_basic() {
@@ -487,9 +462,7 @@ mod tests {
         assert_eq!(coords[79], CellCoord::new(3, 79));
     }
 
-    // =========================================================================
     // copy_cells_to_row — requires Row allocation
-    // =========================================================================
 
     #[test]
     fn copy_cells_to_row_basic_ascii() {
@@ -585,9 +558,7 @@ mod tests {
         assert!(new_row.is_empty());
     }
 
-    // =========================================================================
     // chunk_cells_to_rows — requires PageStore/Row allocation
-    // =========================================================================
 
     #[test]
     fn chunk_cells_to_rows_single_chunk() {
@@ -616,7 +587,7 @@ mod tests {
         assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);
         assert_eq!(new_rows[0].get(1).unwrap().char_data(), 'B' as u16);
         assert_eq!(new_rows[0].get(2).unwrap().char_data(), 'C' as u16);
-        // First row should NOT be wrapped.
+        // First row should not be wrapped.
         assert!(!new_rows[0].is_wrapped());
     }
 
@@ -653,7 +624,7 @@ mod tests {
         assert_eq!(new_rows[0].get(1).unwrap().char_data(), 'B' as u16);
         assert_eq!(new_rows[1].get(0).unwrap().char_data(), 'C' as u16);
         assert_eq!(new_rows[1].get(1).unwrap().char_data(), 'D' as u16);
-        // First row NOT wrapped, second IS wrapped.
+        // First row not wrapped, second is wrapped.
         assert!(!new_rows[0].is_wrapped());
         assert!(new_rows[1].is_wrapped());
     }
@@ -742,9 +713,7 @@ mod tests {
             new_extras: &mut new_extras,
         };
 
-        // Cursor at offset 4 (past end). cells_len=4, last chunk [2..4).
-        // clamped = min(4,4) = 4. Last chunk: 4 <= 4 -> in range.
-        // Row = 1, col = 4 - 2 = 2.
+        // Cursor at 4 (past end) is in the last chunk [2..4): row 1, col 2.
         chunk_cells_to_rows(
             &cells,
             2,

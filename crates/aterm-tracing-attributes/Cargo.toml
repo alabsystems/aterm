@@ -18,6 +18,10 @@ description = "Pass-through #[instrument] for the aterm `tracing` shim (replaces
 
 [lib]
 proc-macro = true
+# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
+# gate while still being linked and executed. Off; doctests are governed
+# separately and still run.
+test = false
 
 [dependencies]
 # None, deliberately. Upstream `tracing-attributes` pulls proc-macro2 + quote +

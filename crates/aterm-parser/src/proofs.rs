@@ -19,7 +19,7 @@ impl ActionSink for NullSink {
     fn dcs_unhook(&mut self, _: bool) {}
     fn apc_start(&mut self) {}
     fn apc_put(&mut self, _: u8) {}
-    fn apc_end(&mut self) {}
+    fn apc_end(&mut self, _canceled: bool) {}
 }
 
 #[kani::proof]
@@ -581,9 +581,7 @@ fn transition_table_lookup_safe() {
 //
 // These three model the SHAPE of the chunk loops in `simd.rs` (a `while offset
 // + chunk <= len` walk, then a scalar tail); they do not call `simd.rs`, so they
-// prove the arithmetic of that shape, not the shipped loop. A fourth,
-// `simd_pointer_within_bounds`, asserted its own loop guard inside the loop and
-// so proved nothing; it was deleted on 2026-09-27.
+// prove the arithmetic of that shape, not the shipped loop.
 
 /// Proof FV-SIMD-1: AVX2 offset arithmetic cannot overflow.
 ///
@@ -746,129 +744,64 @@ fn simd_avx2_bias_correct() {
     );
 }
 
-// =============================================================================
-// F11-3 (#7941): CSI parameter byte classification
-// =============================================================================
-//
-// LEDGER NOTE: `simd_csi` has no production caller (the speculative parameter
-// pre-parse was removed from `parse_csi_general`, 2026-07; the module is
-// `#[cfg(test)]`), and its NEON scan no longer ends in an `unreachable!()`:
-// 904d99a5c replaced the intrinsics classifier with a safe chunk scan whose
-// `has_end` chunk falls through to `scalar_tail`. The harness that "proved"
-// that `unreachable!()` dead recomputed the predicate it checked and asserted
-// it equal to itself; it was deleted on 2026-09-27 (PROOF_CARRYING_PERFORMANCE
-// A4). What stays is the per-byte algebra below, a standing proof any future
-// bulk CSI parameter parser would have to re-establish — not a claim about
-// shipped code.
-
-/// Every u8 value is classified in exactly one of three buckets: digit
-/// `[0x30, 0x39]`, delimiter `{0x3A, 0x3B}`, or non-param — and the chunk
-/// scan's per-lane end test (`b < 0x30 || b > 0x3B`, `simd_csi.rs`'s
-/// `has_end`) fires exactly on the non-param bucket.
-#[kani::proof]
-fn csi_simd_byte_classification_exhaustive() {
-    let b: u8 = kani::any();
-
-    let is_digit = b.is_ascii_digit();
-    let is_delim = b == b';' || b == b':';
-    let is_non_param = !is_digit && !is_delim;
-
-    // Exactly one of the three branches matches.
-    let bucket_count = u32::from(is_digit) + u32::from(is_delim) + u32::from(is_non_param);
-    kani::assert(
-        bucket_count == 1,
-        "every byte falls into exactly one of {digit, delim, non-param}",
-    );
-
-    // The SIMD `has_end` predicate (b < 0x30 || b > 0x3B) fires iff the
-    // byte is non-param. This closes the gap with the NEON reduction.
-    let has_end_for_this_lane = b < 0x30 || b > 0x3B;
-    kani::assert(
-        has_end_for_this_lane == is_non_param,
-        "per-lane has_end test matches non-param classification",
-    );
-}
-
 // ----------------------------------------------------------------------------
-// OSC bulk fast-path equivalence (#7864) — formal SPECIFICATION of the audit's
-// "OSC data loss" finding.
+// OSC bulk copy (#7864): the audit's "OSC data loss" finding, proved false.
 //
-// The `advance_fast` SIMD path contains a BULK OSC copy: in `OscString` state it
-// scans to the first C0 control at position `n`, copies `min(n, capacity_left)`
-// bytes into `osc_data`, then advances past all `n` bytes. An audit flagged this
-// as data loss vs. the byte-by-byte `advance` path; three independent adversarial
-// reviewers then proved it EQUIVALENT (the skipped `[copy_len, n)` bytes are all
-// >= 0x20 data bytes that the byte-by-byte path also drops once
-// `osc_data.len() == MAX_OSC_DATA`), and a unit-test parity battery
-// (`tests/batch.rs`) confirms it on concrete inputs.
-//
-// These harnesses ENCODE that equivalence + the cap invariant as `#[kani::proof]`
-// obligations for trust-mc. Both carry `#[kani::unwind(11)]`, so they are
-// config-required and the gate's `--config-free` floor
-// (`scripts/verify-kani-proofs.sh`) SKIPS them; they run only when invoked
-// explicitly. Last measured 2026-09-25 with the atpkg store's trust-mc (build
-// 20065), run without `--config-free`: `osc_fast_path_matches_byte_by_byte`
-// is INCONCLUSIVE and `osc_data_respects_cap_invariant` was killed by the
-// script's 16 GB RSS guard — trust-mc cannot yet model the SIMD `advance_fast`
-// body (needed from $HOME/trust: SIMD/NEON intrinsic modelling). Neither is an
-// aterm defect. The property is guaranteed today by the concrete parity
-// battery in `tests/batch.rs`; the harnesses stay so they discharge when
-// trust-mc can model the body.
+// In `OscString` the bulk path (`advance_string_states_bulk`) scans to the first
+// control byte at position `n` and appends `osc_bulk_copy_len(len, n)` of the `n`
+// data bytes before it; the per-byte path's `OscPut` pushes each one only while
+// `osc_put_keeps(osc_data.len())`, the guard the arm calls and the lemma uses, so
+// a change to either function lands inside the proof. It proves, for EVERY buffer
+// length and run length (no `Vec`, no loop, no unwind bound), that the two keep
+// exactly the same bytes and that the cap holds. The scan itself is the scalar loop
+// under `cfg(kani)` and is covered by the `simd_*` proofs; `tests/batch.rs`
+// drives both paths across the cap on concrete input.
 // ----------------------------------------------------------------------------
 
-/// `advance_fast` (bulk OSC copy) is observably identical to byte-by-byte
-/// `advance` for any OSC sequence: same parser state and same `osc_data` buffer.
-/// `0x1B 0x5D` (ESC ]) drives both parsers into `OscString`; the symbolic body
-/// then exercises data bytes, BEL/ST terminators mid-stream, and trailing bytes.
+/// Per byte, the bulk copy keeps what `OscPut` keeps. With `L(i)` the buffer
+/// length before data byte `i` on the per-byte path — `min(len + i, MAX)`, by
+/// induction over `OscPut`'s guarded push (base and step checked here) — byte
+/// `i` is pushed iff `osc_put_keeps(L(i))`, and the bulk copy keeps it iff
+/// `i < copy_len`. The two lengths after the run agree, and neither exceeds the
+/// cap.
+///
+/// Plain locals, not closures: with `L` as a closure, trust-mc 20065's solver
+/// was left undecided after ~110 s at load ~100 (2026-09-30), where this form
+/// proves in 40-55 s.
 #[kani::proof]
-#[kani::unwind(11)]
-fn osc_fast_path_matches_byte_by_byte() {
-    let body: [u8; 6] = kani::any();
-    let mut input = [0u8; 8];
-    input[0] = 0x1B; // ESC
-    input[1] = b']'; // OSC introducer
-    input[2..8].copy_from_slice(&body);
+fn osc_bulk_copy_matches_per_byte_puts() {
+    let len: usize = kani::any();
+    let n: usize = kani::any();
+    let i: usize = kani::any();
+    kani::assume(len <= MAX_OSC_DATA);
+    // A slice is at most isize::MAX bytes, so `len + n` cannot wrap.
+    kani::assume(n <= isize::MAX as usize);
+    kani::assume(i < n);
 
-    let mut p_slow = Parser::new();
-    let mut s_slow = NullSink;
-    p_slow.advance(&input, &mut s_slow);
-
-    let mut p_fast = Parser::new();
-    let mut s_fast = NullSink;
-    p_fast.advance_fast(&input, &mut s_fast);
-
-    kani::assert(
-        (p_slow.state as u8) == (p_fast.state as u8),
-        "OSC bulk fast path leaves the same parser state as byte-by-byte",
-    );
-    kani::assert(
-        p_slow.osc_data == p_fast.osc_data,
-        "OSC bulk fast path accumulates the same osc_data as byte-by-byte",
-    );
-}
-
-/// The OSC buffer cap is an invariant of BOTH paths: `osc_data` never exceeds
-/// `MAX_OSC_DATA` regardless of input (the bulk copy uses `n.min(capacity_left)`
-/// and the per-byte path guards `len < MAX_OSC_DATA`). Proving the bound is
-/// preserved guarantees the 8 MiB cap (raised from 64 KiB so real inline images
-/// survive the parser) can never be a memory-safety footgun.
-#[kani::proof]
-#[kani::unwind(11)]
-fn osc_data_respects_cap_invariant() {
-    let body: [u8; 6] = kani::any();
-    let mut input = [0u8; 8];
-    input[0] = 0x1B;
-    input[1] = b']';
-    input[2..8].copy_from_slice(&body);
-
-    let mut p = Parser::new();
-    let mut sink = NullSink;
-    p.advance_fast(&input, &mut sink);
+    let copy_len = crate::dispatch::osc_bulk_copy_len(len, n);
+    // L(i), L(i + 1) and L(n), with L(k) = min(len + k, MAX).
+    let before = (len + i).min(MAX_OSC_DATA);
+    let after = (len + i + 1).min(MAX_OSC_DATA);
+    let at_end = (len + n).min(MAX_OSC_DATA);
+    let pushed = crate::dispatch::osc_put_keeps(before);
 
     kani::assert(
-        p.osc_data.len() <= MAX_OSC_DATA,
-        "osc_data never exceeds MAX_OSC_DATA after the bulk fast path",
+        len.min(MAX_OSC_DATA) == len,
+        "L(0) is the buffer before the run",
     );
+    kani::assert(
+        after == if pushed { before + 1 } else { before },
+        "OscPut takes L(i) to L(i + 1)",
+    );
+    kani::assert(
+        pushed == (i < copy_len),
+        "the bulk copy keeps byte i exactly when OscPut pushes it",
+    );
+    kani::assert(
+        len + copy_len == at_end,
+        "both paths end the run with the same buffer length",
+    );
+    kani::assert(len + copy_len <= MAX_OSC_DATA, "the cap holds");
 }
 
 /// Build an arbitrary VALID parser state (a symbolic `State` enum discriminant
@@ -955,27 +888,10 @@ fn process_byte_inner_preserves_invariant() {
 /// 14 succeed, the invariant is inductive under `process_byte_inner`, which is
 /// the mathematical content a `stub_verified` modular proof relies on.
 ///
-/// STATUS 2026-09-26 (managed trust-mc 20065 + ay 8256): no longer OOMs —
+/// STATUS (measured 2026-09-26, managed trust-mc 20065 + ay 8256):
 /// `pbpi_csi_ignore` finishes in ~170 s at 1.6 GB peak with 21/21 checks
 /// SUCCESS and is demoted by the same unmodelled `process_byte_dispatch` call
-/// as the contract harness above. The 2026-06-19 root cause below is the
-/// record of what the encoding work since then changed.
-///
-/// Known blocker as of 2026-06-19 (root-caused via full ay-pipeline
-/// instrumentation): each per-state VC bit-blasts to ~495 K clauses / ~179 K
-/// bv-vars; ALL encoding phases finish in <90 s / <1 GB, and the OOM is the SAT
-/// SOLVE proving UNSAT (a valid state's invariant holds → exhaustive search).
-/// The cost is NOT the symbolic byte (a CONCRETE (state,byte) VC is actually
-/// LARGER and still OOMs), NOT the selector-over-`ite` fold (encoding size is
-/// identical with/without it), and NOT array axioms (0 selects →
-/// `generate_array_bv_axioms` early-returns). It is the PER-VC OVERHEAD of the
-/// trust-mc `Parser`-struct + heap/array DATATYPE RECONSTRUCTION: even a TRIVIAL
-/// VC (CsiIgnore + 0x41, where post == pre) has ~179 K bv-vars and OOMs. So the
-/// real fix is encoding-side — trust-mc's `codegen_ay` modeling the `Parser`
-/// struct / `ArrayVec`/`Vec` / heap more compactly (fewer bit-blasted vars per
-/// VC) — i.e. the goal's "close the trust-mc/ay encoding gap on the
-/// Vec/datatype-reconstruction path". These harnesses are the decomposition
-/// scaffolding that will discharge once that overhead is reduced.
+/// as the contract harness above.
 #[cfg(kani)]
 fn assert_process_byte_preserves_invariant(state: State) {
     let mut parser = Parser::kani_stub();
@@ -1066,6 +982,7 @@ fn restore_carry_yields_valid_state() {
         osc_overflowed: kani::any(),
         utf8_tail: any_vec(UTF8_TAIL_MAX + 1),
         utf8_expected: kani::any(),
+        string_utf8_tail: any_vec(UTF8_TAIL_MAX + 1),
     };
     let mut parser = Parser::kani_stub();
     match parser.restore_carry(&carry) {
@@ -1097,6 +1014,11 @@ fn restore_carry_yields_valid_state() {
                     || (parser.state == State::Ground && parser.utf8_len < parser.utf8_expected),
                 "a UTF-8 tail only at Ground, and still incomplete",
             );
+            kani::assert(
+                parser.string_utf8 == crate::utf8::Utf8Prefix::NONE
+                    || matches!(parser.state, State::DcsIgnore | State::SosPmApcString),
+                "a string's UTF-8 head only in a string",
+            );
             let byte: u8 = kani::any();
             let mut sink = NullSink;
             parser.advance(&[byte], &mut sink);
@@ -1108,6 +1030,7 @@ fn restore_carry_yields_valid_state() {
                     && parser.params.is_empty()
                     && parser.intermediates.is_empty()
                     && parser.utf8_len == 0
+                    && parser.string_utf8 == crate::utf8::Utf8Prefix::NONE
                     && !parser.osc_discard,
                 "a refusal installs nothing",
             );

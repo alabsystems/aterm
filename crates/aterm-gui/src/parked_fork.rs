@@ -1,23 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the fork→exec window, made deterministic.
+//! Test-only: makes the fork→exec window deterministic.
 //!
-//! A `flock` belongs to the open file DESCRIPTION, and a child any thread of
-//! this process forks holds a copy of every descriptor — close-on-exec ones
-//! included — until it execs. So a lock released only by closing its `File`
-//! stays taken in that copy for the child's whole fork→exec window, and the
-//! next single `try_lock` of it is refused for a lock nobody holds. `LOCK_UN`
-//! ([`crate::native_document_host::HeldAdvisoryLock`]) strips the lock from
-//! the description itself, the child's copy included.
+//! A `flock` belongs to the open file description, and a child forked by any
+//! thread holds a copy of every descriptor (close-on-exec ones included) until
+//! it execs. A lock released only by closing its `File` therefore stays held in
+//! that copy for the child's fork→exec window, and a single `try_lock` is
+//! refused for a lock nobody holds. `LOCK_UN`
+//! ([`crate::native_document_host::HeldAdvisoryLock`]) strips the lock from the
+//! description itself, the child's copy included.
 //!
-//! [`ParkedChild::fork`] makes that child for real: `/bin/sh`, forked from a
-//! thread of its own, whose pre-exec hook says it exists and then waits short
-//! of `execve` until [`ParkedChild::release`]. [`arm_at`] puts the fork INSIDE
-//! a product hold: the `n`-th [`fork_if_armed`] site the arming thread reaches
-//! — each is placed just after a lock is taken — forks the child while that
-//! lock is held, which is the interleaving a sibling's spawn loses in the full
-//! suite, and a pty fork loses in the product.
+//! [`ParkedChild::fork`] forks `/bin/sh` from its own thread; its pre-exec hook
+//! reports that it exists and then waits short of `execve` until
+//! [`ParkedChild::release`]. [`arm_at`] places the fork inside a held lock: the
+//! `n`-th [`fork_if_armed`] site the arming thread reaches (each sits just after
+//! a lock is taken) forks the child while that lock is held.
 
 use std::cell::RefCell;
 use std::io::{PipeWriter, Read as _, Write as _};
@@ -130,8 +128,8 @@ thread_local! {
     static ARMED: RefCell<Option<Arm>> = const { RefCell::new(None) };
 }
 
-/// While this lives, the `n`-th (1-based) [`fork_if_armed`] site THIS thread
-/// reaches forks a [`ParkedChild`] — once.
+/// While this lives, the `n`-th (1-based) [`fork_if_armed`] site this thread
+/// reaches forks a [`ParkedChild`], once.
 pub(crate) struct Armed(());
 
 /// Arm this thread (see [`Armed`]).

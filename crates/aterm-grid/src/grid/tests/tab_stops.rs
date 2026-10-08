@@ -271,11 +271,8 @@ fn grid_resize_preserves_tab_stops() {
         grid.storage.tab_stops[5],
         "Custom tab stop at column 5 should be preserved"
     );
-    // ...AND THE WIDEN INVENTS NONE. TBC 3 said "no stop at any column"; a
-    // window getting wider is not an application asking for stops back. xterm
-    // clears its whole (fixed-size) tab bitmap on TBC 3 and `ScreenResize`
-    // never re-seeds it — the resurrection here was an artifact of aterm
-    // materializing the array lazily at the current width.
+    // And the widen invents none: TBC 3 means no stop at any column, and a
+    // wider window is not a request for stops (xterm never re-seeds its bitmap).
     assert!(
         !grid.storage.tab_stops[48],
         "a widen must not resurrect a default stop the application cleared"
@@ -288,10 +285,8 @@ fn grid_resize_preserves_tab_stops() {
 
 #[test]
 fn grid_widen_still_seeds_defaults_when_no_one_cleared_them() {
-    // The other half of the rule: a grid whose default every-8 stops are intact
-    // must GAIN them in the columns a widen adds, or a tab past the old width
-    // would run to the right edge. (This is what xterm gets for free from a
-    // tab bitmap that is 1024 columns wide from the start.)
+    // A grid whose default every-8 stops are intact gains them in the columns a
+    // widen adds, so a tab past the old width does not run to the right edge.
     let mut grid = Grid::new(24, 40);
     grid.resize(24, 80);
     assert!(grid.storage.tab_stops[48], "default stop at 48 after widen");
@@ -312,9 +307,7 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
     assert!(model.fire("SetCustomFutureStop", &mut state));
     source.resize(6, 40);
     assert!(model.fire("ShrinkSourceNarrow", &mut state));
-    // The backing array outlives the shrink and still covers column 96. (TBC 3
-    // widens it to MAX_GRID_COLS so a later grow cannot re-seed cleared stops,
-    // so this is a lower bound, not an equality.)
+    // The backing array outlives the shrink and still covers column 96.
     assert!(source.tab_stops().len() >= 120);
     assert!(source.tab_stops()[96]);
 
@@ -352,15 +345,11 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
     );
     assert_eq!(oversize_rejected.get("rejected"), Some(&1));
 
-    // Negative control: the pre-`46fc93f5a` restore body, replayed on a real
-    // destination as narrow as the model's (`cols == Narrow`, 40 real columns)
-    // beside the shipping restore on an identical one. The old body admitted a
-    // vector of any length and copied whatever prefix overlapped the
-    // destination's own stops; the shipping one refuses both invalid sizes.
-    // Projected onto the admission fields — did the destination take the
-    // vector, and did it keep its own width (`restored_len == cols`) — the
-    // pre-fix grid is exactly the model's `Buggy=1` admission, which the
-    // covering/bounded window rejects.
+    // Negative control: a restore that admits a vector of any length and copies
+    // the overlapping prefix, replayed on a 40-column destination beside the
+    // shipping restore. Projected onto the admission fields (did it take the
+    // vector, did it keep its width), it is the model's `Buggy=1` admission,
+    // which the covering/bounded window rejects.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     for (stops, invalid, reject) in [
         (vec![false; 39], &undersize, "RejectUndersizeProjection"),
@@ -452,26 +441,12 @@ fn grid_tab_stop_positions() {
     assert_eq!(positions, vec![5, 10, 20]);
 }
 
-// ===========================================================================
-// CBT and the DECSLRM left margin — gated on ORIGIN MODE, not on DECLRMM
-// ===========================================================================
+// CBT and the DECSLRM left margin: gated on origin mode, not on DECLRMM.
 //
-// VT510's CBT page names no margin at all: "If an attempt is made to move the
-// active position past the first character position on the line, then the
-// active position stays at column one." DECOM is the page that turns "column
-// one" into "the left margin": set, "the cursor cannot move outside of the
-// margins"; reset, "the cursor can move outside of the margins".
-//
-// xterm composes them exactly so — tabs.c `TabToPrevStop` clamps to
-// `ScrnLeftMargin` only inside `if (xw->flags & ORIGIN)` — and Ghostty says it
-// in a comment: `// With origin mode enabled, our leftmost limit is the left
-// margin.` (`horizontalTabBack`). `ScrnLeftMargin` is 0 unless DECLRMM is on,
-// so both flags must be set for the margin to bind.
-//
-// aterm used to gate on DECLRMM alone, justified in-code as "matching CUB
-// behavior". That is the inference both xterm and Ghostty declined to make:
-// each clamps CUB on the left margin unconditionally and still leaves CBT
-// origin-gated, in the same file.
+// VT510's CBT stops at column one; DECOM turns "column one" into "the left
+// margin". xterm's `TabToPrevStop` clamps to `ScrnLeftMargin` only under
+// ORIGIN, and Ghostty's `horizontalTabBack` likewise. `ScrnLeftMargin` is 0
+// unless DECLRMM is on, so both flags must be set for the margin to bind.
 
 /// A 3x40 grid with DECSLRM margins at columns 10..=30 and the default tab
 /// stops (every 8: 8, 16, 24, 32).
@@ -483,7 +458,7 @@ fn grid_with_margins_at_10_30() -> Grid {
     grid
 }
 
-/// DECLRMM alone does NOT make the left margin bind: without origin mode the
+/// DECLRMM alone does not make the left margin bind: without origin mode the
 /// back tab runs past it to the real stop at column 8.
 #[test]
 fn cbt_ignores_the_left_margin_without_origin_mode() {
@@ -516,15 +491,9 @@ fn cbt_clamps_to_the_left_margin_under_origin_mode() {
     );
 }
 
-/// A cursor ALREADY LEFT of the left margin is not dragged rightwards onto it.
-///
-/// xterm does drag it (`if (next_column < left) next_column = left;` then
-/// `set_cur_col`), which makes a BACKWARD tab move the cursor FORWARD. Ghostty
-/// structurally cannot — its bound is the loop guard `if (x <= left_limit)
-/// return;` — and pins the case in `test "Terminal: horizontal tab back with
-/// cursor before left margin"`. CBT is backward motion by definition, so the
-/// cursor stands still. (aterm used to send it to column 0 here, i.e. FURTHER
-/// outside the margin the active DECOM says it may not leave.)
+/// A cursor already left of the left margin is not dragged onto it: CBT is
+/// backward motion, so the cursor stands still (as in Ghostty; xterm drags it
+/// forward).
 #[test]
 fn cbt_left_of_the_left_margin_never_moves_the_cursor() {
     let mut grid = grid_with_margins_at_10_30();
@@ -556,19 +525,11 @@ fn cbt_without_declrmm_is_the_plain_back_tab_in_either_mode() {
     }
 }
 
-/// CHT is deliberately NOT changed to match xterm here.
+/// CHT with the cursor right of the right margin never moves backward.
 ///
-/// xterm's `TabToNextStop` (tabs.c) computes the destination and then clamps it
-/// DOWN to `rgt_marg`, so a CHT with the cursor already right of the right
-/// margin moves the cursor BACKWARD — a forward tab that goes backwards. It is
-/// a defect, not a convention: xterm's own `CursorForward` (cursor.c) handles
-/// the identical situation with `if (screen->cur_col > max) max = screen->max_col;`,
-/// the escape `TabToNextStop` lacks, and `CursorBack` states the rule in
-/// English ("if the cursor is already before the left-margin, we have to let it
-/// go"). Ghostty avoids it structurally (`while (cursor.x < scrolling_region.right)`)
-/// and iTerm2 patched it explicitly. aterm's `tab_margin` uses the row edge when
-/// the cursor is outside the margins, so it never moved backward either — this
-/// test is the pin that keeps it that way.
+/// xterm's `TabToNextStop` clamps the destination down to `rgt_marg`, a defect
+/// its own `CursorForward` avoids; Ghostty and iTerm2 avoid it too. aterm's
+/// `tab_margin` uses the row edge when the cursor is outside the margins.
 #[test]
 fn cht_right_of_the_right_margin_never_moves_the_cursor_backward() {
     let mut grid = grid_with_margins_at_10_30();

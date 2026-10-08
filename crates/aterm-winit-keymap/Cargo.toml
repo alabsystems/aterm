@@ -14,14 +14,14 @@
 # Foundation and libobjc. Those are load commands dyld maps and initialises
 # before the first instruction of `main`, on a route that cannot call a symbol in
 # any of them. Measured on this box: ~3.36 ms per exec with them, ~1.7 ms
-# without (crates/aterm-bench/benches/startup_exec.rs).
+# without.
 #
 # A separate crate is the version of that intent Cargo actually enforces: nothing
 # can unify a dependency edge that does not exist. `aterm-types` now has no
 # mention of winit anywhere in its manifest, so no future feature flag can drag
 # the window's platform stack back into a verb client.
 #
-# The code is unchanged from `aterm-types/src/keyboard/winit_map.rs` (K-2) and
+# The code began as `aterm-types/src/keyboard/winit_map.rs` (K-2) and
 # still exists for the same reason it always did: the GUI and the future native
 # shell share ONE table instead of each hand-rolling an inline match that drifts.
 

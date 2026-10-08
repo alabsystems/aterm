@@ -111,7 +111,7 @@ pub fn shaping_min_run(has_user_features: bool) -> usize {
 ///   "merged" (N:1) convention where the whole ligature collapses to ONE wide
 ///   glyph. Admitted ONLY when `admit_collapsed` is set (a config flag, default
 ///   off), because it requires the raster-slicing render path (rasterize the wide
-///   glyph once, slice its coverage at `cell_w` boundaries — [`slice_tile_bands`]).
+///   glyph once, slice its coverage at `cell_w` boundaries — [`extract_cell_slice`]).
 ///
 /// Anything else — a partial collapse (`1 < n_out < n_in`), an expansion
 /// (`n_out > n_in`), or a collapse while `admit_collapsed` is off — is
@@ -155,90 +155,6 @@ pub fn classify_shape(n_in: usize, n_out: usize, admit_collapsed: bool) -> Shape
     }
 }
 
-/// A tile's column band within a wide ligature raster: source columns `[x0, x1)`
-/// (M4 — ligature slicing). Under the 1:1 NEAREST placement the render path uses,
-/// these are equivalently the DEST columns of the tile at the run's origin, so the
-/// same band drives both the coverage copy and the per-cell blit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TileBand {
-    /// First source/dest column of the band (inclusive).
-    pub x0: usize,
-    /// One past the last column of the band (exclusive).
-    pub x1: usize,
-}
-
-impl TileBand {
-    /// The band width in pixels (`x1 - x0`). Always `> 0` for a band produced by
-    /// [`slice_tile_bands`].
-    #[must_use]
-    pub const fn width(self) -> usize {
-        self.x1 - self.x0
-    }
-}
-
-/// Partition a wide ligature raster `raster_w` px wide into per-cell tile bands at
-/// `cell_w` boundaries (M4 — ligature slicing). Band `k` is
-/// `[k*cell_w, min((k+1)*cell_w, raster_w))`; the final band absorbs any remainder
-/// when `raster_w` is not a whole multiple of `cell_w`. The bands are contiguous,
-/// pairwise DISJOINT, and COVER `[0, raster_w)` EXACTLY — the same partition law
-/// the W4 [`crate::clip_span`] intersection proves for the cursor cut-out — so
-/// concatenating the extracted tiles ([`extract_tile`]) reproduces the original
-/// raster byte-for-byte. Empty for a degenerate `raster_w == 0` or `cell_w == 0`
-/// (the caller keeps the 1:1 path).
-///
-/// PURE + total, so the partition is exhaustively verifiable over an odd/even size
-/// lattice (`tests/ligature_slice.rs::slice_partition_is_disjoint_and_complete`) —
-/// ty has no multiplication, so this arithmetic law is an L0 lattice test, not a ty
-/// model (see the M4 PROVE bullets).
-#[must_use]
-pub fn slice_tile_bands(raster_w: usize, cell_w: usize) -> Vec<TileBand> {
-    if raster_w == 0 || cell_w == 0 {
-        return Vec::new();
-    }
-    let mut bands = Vec::with_capacity(raster_w / cell_w + 1);
-    let mut x0 = 0usize;
-    while x0 < raster_w {
-        // saturating_add keeps a pathological cell_w near usize::MAX from wrapping;
-        // .min(raster_w) clamps the final band to the raster edge (remainder).
-        let x1 = x0.saturating_add(cell_w).min(raster_w);
-        bands.push(TileBand { x0, x1 });
-        x0 = x1;
-    }
-    bands
-}
-
-/// Copy the sub-columns `[band.x0, band.x1)` of every row of a `raster_w × height`
-/// coverage raster into a tight `band.width() × height` tile (M4 — ligature
-/// slicing). The row-major byte layout is preserved, so the resulting tile is an
-/// ordinary coverage bitmap the blitter draws at the band's dest column.
-///
-/// Returns an empty `Vec` for a degenerate band/raster (a band exceeding the
-/// raster bounds, a `height` of 0, or a byte slice too short) — the caller keeps
-/// the 1:1 path rather than reading out of bounds. For a well-formed
-/// `(raster, raster_w, height)` and a `band` from [`slice_tile_bands`] over the
-/// same `raster_w`, concatenating every tile back at its band offset reproduces
-/// the raster exactly (proved by `tests/ligature_slice.rs`).
-#[must_use]
-pub fn extract_tile(raster: &[u8], raster_w: usize, height: usize, band: TileBand) -> Vec<u8> {
-    let tw = band.x1.saturating_sub(band.x0);
-    // Reject a malformed band/raster instead of panicking on an out-of-range slice.
-    if tw == 0
-        || raster_w == 0
-        || band.x1 > raster_w
-        || height == 0
-        || raster.len() < raster_w.saturating_mul(height)
-    {
-        return Vec::new();
-    }
-    let mut tile = vec![0u8; tw * height];
-    for row in 0..height {
-        let src = row * raster_w + band.x0;
-        let dst = row * tw;
-        tile[dst..dst + tw].copy_from_slice(&raster[src..src + tw]);
-    }
-    tile
-}
-
 /// What to draw at one column of a row, resolved by [`plan_row_runs`].
 ///
 /// `Ligated` carries the primary-face glyph id rustybuzz produced for this
@@ -269,7 +185,7 @@ pub enum ColumnGlyph {
 }
 
 /// The result of shaping one coalesced run, returned by the [`plan_row_runs`]
-/// `shape` closure and by [`shape_ligature_run`] (M4).
+/// `shape` closure (M4).
 ///
 /// - `PerColumn` — the Fira/JetBrains 1:1 "spacer convention": one gid per input
 ///   cell, `Some(gid)` for a column whose glyph shaping CHANGED, `None` to keep it
@@ -298,16 +214,10 @@ pub const LIG_SLICE_MAX: usize = 64;
 /// bearing `xmin` (M4 — Cascadia N:1 slicing). Tile column `j` is source column
 /// `k*cell_w + j - xmin` of the raster, or 0 where that falls outside
 /// `[0, raster_w)` — so blitting the returned tile at the cell's dest column
-/// reproduces the wide glyph's coverage over exactly that cell.
-///
-/// This is [`extract_tile`] over the RUN-NORMALIZED band
-/// `[k*cell_w, (k+1)*cell_w)` — the raster conceptually shifted right by `xmin`
-/// into run-origin space, where band `k` (from [`slice_tile_bands`]) lands on
-/// cell `k` — specialized to one cell so no full-width normalized buffer is
-/// materialized. The partition law [`slice_tile_bands`] proves therefore carries:
-/// concatenating `extract_cell_slice` for `k = 0..n` (with `n*cell_w >= xmin +
-/// raster_w`), dropping the leading `xmin` pad, reproduces the raster exactly
-/// (proved in `tests/ligature_slice.rs`).
+/// reproduces the wide glyph's coverage over exactly that cell. Concatenating the
+/// tiles for `k = 0..n` (with `n*cell_w >= xmin + raster_w`), dropping the leading
+/// `xmin` pad, reproduces the raster exactly
+/// (`extract_cell_slice_reassembles_wide_raster`).
 ///
 /// Returns an empty `Vec` for a degenerate `cell_w == 0`, `height == 0`, or a
 /// byte slice too short — the caller keeps the per-cell path rather than reading
@@ -358,94 +268,8 @@ pub fn cell_is_shapeable(cell: &RenderCell, has_cluster: bool, image_covered: bo
         && !cell.text_presentation
         && !has_cluster
         && !image_covered
-}
-
-/// Shape one run string with the resolved `features` list and return a PER-COLUMN
-/// plan: `Some(gid)` for a column whose glyph shaping CHANGED (draw the shaped
-/// primary glyph), `None` for a column to leave on the per-cell path (its glyph was
-/// unchanged, or the primary face lacks it so it must route to a fallback). The whole
-/// result is `None` when nothing changed (byte-identical to the per-cell path) or the
-/// shape is not grid-monospace (collapsing/proportional).
-///
-/// `features` is the prebuilt rustybuzz feature array (see
-/// [`build_feature_list`]): the base `liga`+`calt` pair plus the user's
-/// OpenType `font_features`. It is built ONCE where the shaping config is
-/// resolved and passed in by reference, so no feature allocation happens on the
-/// per-run hot path. When the user supplied no features this is just the base
-/// `[liga, calt]` pair — identical to the pre-feature behaviour.
-///
-/// The run must be all single-`char` cells on a monospace cadence (the caller
-/// guarantees this via [`cell_is_shapeable`] over BMP operator chars). Shaping is
-/// accepted ONLY when it yields exactly one output glyph per input `char` (a
-/// collapsing/proportional result — `infos.len() != run_chars.len()` — is rejected)
-/// AND it actually changed a glyph vs the plain cmap (the `!changed` decline). Each
-/// accepted glyph is then blitted at its column's monospace origin
-/// ([`ColumnGlyph::Ligated`]), so the grid cadence is preserved by PLACEMENT — the
-/// per-glyph advance is not consulted. Monospace ligature/stylistic fonts emit
-/// equal-advance glyphs, so this holds in practice for the fonts the planner runs on.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn shape_ligature_run(
-    rb_bytes: &[u8],
-    index: u32,
-    run: &str,
-    run_chars: &[char],
-    enable: bool,
-    admit_collapsed: bool,
-    features: &[rustybuzz::Feature],
-    variations: &[rustybuzz::Variation],
-) -> Option<ShapedRun> {
-    // Convenience wrapper: parse then delegate. The per-frame hot path
-    // ([`crate::Renderer::row_glyph_plan`]) does NOT come through here — it builds
-    // the `Face` at most once per row and uses [`RowShaper`] to reuse compatible
-    // plans and cleared shaping buffers across cache misses. This byte-slice form
-    // remains for tests and one-shot callers.
-    //
-    // `index` selects the face inside a collection (W6: a styled run can shape
-    // from a `.ttc` sibling at index > 0); a plain file is always index 0. W9:
-    // shape at the SAME variation coords the rasterizer instantiates
-    // (`Renderer::rb_variations` — the single coord source), so a feature-
-    // variation substitution can never select a glyph the raster path wouldn't.
-    // Empty for non-variable faces (the common path, unchanged). The hot path in
-    // `row_glyph_plan` applies the identical index+variations when it builds its
-    // per-row face, then constructs its [`RowShaper`].
-    let mut face = rustybuzz::Face::from_slice(rb_bytes, index)?;
-    if !variations.is_empty() {
-        face.set_variations(variations);
-    }
-    shape_ligature_run_with_face(&face, run, run_chars, enable, admit_collapsed, features)
-}
-
-/// [`shape_ligature_run`] on an ALREADY-PARSED face. Shaping semantics are identical;
-/// only the `Face::from_slice` cost moves to the caller. The row planner uses
-/// `RowShaper` to reuse shaping plans and buffers as well as the face.
-///
-/// The caller is responsible for building `face` at the correct collection
-/// `index` (W6) and applying the variation coords (W9) BEFORE calling this — the
-/// byte-slice [`shape_ligature_run`] wrapper does exactly that; the per-row hot
-/// path in `row_glyph_plan` builds its cached face the same way.
-#[must_use]
-pub fn shape_ligature_run_with_face(
-    face: &rustybuzz::Face,
-    run: &str,
-    run_chars: &[char],
-    enable: bool,
-    admit_collapsed: bool,
-    features: &[rustybuzz::Feature],
-) -> Option<ShapedRun> {
-    // A run normally needs ≥2 cells (nothing to ligate in one cell). But when the
-    // caller supplies USER features (the list grows past the 2-element `liga`/`calt`
-    // base), a SINGLE-cell substitution is meaningful — `zero` on a lone `0`, `ss01`
-    // on a one-letter token — so allow length-1 runs in that case. The `!changed`
-    // decline below still makes a non-substituting single cell a no-op.
-    let min_run = if features.len() > 2 { 1 } else { 2 };
-    if !enable || run_chars.len() < min_run {
-        return None;
-    }
-    let mut buf = rustybuzz::UnicodeBuffer::new();
-    buf.push_str(run);
-    let shaped = rustybuzz::shape(face, features, buf);
-    map_shaped_run(face, run, run_chars, admit_collapsed, shaped.glyph_infos())
+        // A script cell (aterm's own chrome) is drawn glyph by glyph, small.
+        && cell.script == aterm_core::terminal::Script::Normal
 }
 
 /// One row's fixed font instance and feature list. The renderer already parses
@@ -474,6 +298,13 @@ impl<'a> RowShaper<'a> {
         }
     }
 
+    /// Shape one run string and return its grid plan. Accepted ONLY when the
+    /// shape yields one output glyph per input `char` ([`ShapedRun::PerColumn`])
+    /// or, with `admit_collapsed`, one wide glyph for the whole run
+    /// ([`ShapedRun::Collapsed`]), AND it changed a glyph vs the plain cmap (the
+    /// `!changed` decline, byte-identical to the per-cell path). Each accepted
+    /// glyph is placed at its column's monospace origin, so the grid cadence is
+    /// preserved by PLACEMENT and the per-glyph advance is not consulted.
     pub(crate) fn shape(
         &mut self,
         run: &str,
@@ -481,6 +312,8 @@ impl<'a> RowShaper<'a> {
         admit_collapsed: bool,
         scratch: &mut rustybuzz::UnicodeBuffer,
     ) -> Option<ShapedRun> {
+        // Nothing ligates in one cell, but user features past the base `liga`/`calt`
+        // pair can substitute one (`zero` on a lone `0`).
         let min_run = if self.features.len() > 2 { 1 } else { 2 };
         if run_chars.len() < min_run {
             return None;
@@ -621,10 +454,8 @@ fn map_shaped_run(
             b += ch.len_utf8();
         }
     }
-    // ONE buffer where there used to be two (`gids` + `out`): start every column at
-    // `Some(0)` — the old `vec![0u16; n]` zero fill — overwrite with the shaped gid
-    // here, then demote the UNCHANGED columns to `None` in the cmap pass below. The
-    // values written are identical to the old two-buffer form, one allocation less.
+    // Start every column at `Some(0)`, overwrite with the shaped gid here, then
+    // demote the UNCHANGED columns to `None` in the cmap pass below.
     let mut out: Vec<Option<u16>> = vec![Some(0u16); n];
     for info in infos {
         let gid = u16::try_from(info.glyph_id).ok()?;
@@ -674,7 +505,7 @@ fn map_shaped_run(
 }
 
 /// Whether the primary face's `GSUB` table advertises a programming-ligature
-/// feature (`liga` or `calt`) — the only features [`shape_ligature_run`] turns on.
+/// feature (`liga` or `calt`) — the only features the run shaper turns on.
 ///
 /// A font with neither feature can produce NO substitution under those features,
 /// so rustybuzz would return exactly the cmap glyph ids the per-cell path already
@@ -683,40 +514,32 @@ fn map_shaped_run(
 /// the whole run-coalescing + rustybuzz path for non-ligature fonts — byte-identical
 /// output, no per-frame shaping cost.
 ///
-/// Iterates the `GSUB` feature list LINEARLY (FeatureList records are stored in
-/// arbitrary, not tag-sorted, order, so a binary `find` could miss a present tag).
 /// `false` when there is no `GSUB` table or the bytes don't parse as a face.
 #[must_use]
 pub fn font_has_ligature_features(rb_bytes: &[u8]) -> bool {
-    let Some(face) = rustybuzz::Face::from_slice(rb_bytes, 0) else {
-        return false;
-    };
-    let Some(gsub) = face.tables().gsub else {
-        return false;
-    };
-    let liga = Tag::from_bytes(b"liga");
-    let calt = Tag::from_bytes(b"calt");
-    gsub.features
-        .into_iter()
-        .any(|f| f.tag == liga || f.tag == calt)
+    gsub_has(rb_bytes, |t| {
+        t == Tag::from_bytes(b"liga") || t == Tag::from_bytes(b"calt")
+    })
 }
 
 /// Whether the primary face's `GSUB` table advertises `tag` (e.g. `zero`, `ss01`,
 /// `cv01`). A face with no `GSUB` (e.g. Apple's Menlo/Monaco) advertises
 /// NOTHING, so a configured feature can never substitute a glyph: rustybuzz returns
-/// the plain cmap ids and [`shape_ligature_run`]'s `!changed` decline keeps the run
+/// the plain cmap ids and the run shaper's `!changed` decline keeps the run
 /// per-cell. Used for the GUI's "font_features had no effect on this font" diagnostic
 /// so a configured-but-unsupported feature is a warning, not a silent no-op.
 #[must_use]
 pub fn font_advertises_feature(rb_bytes: &[u8], tag: [u8; 4]) -> bool {
-    let Some(face) = rustybuzz::Face::from_slice(rb_bytes, 0) else {
-        return false;
-    };
-    let Some(gsub) = face.tables().gsub else {
-        return false;
-    };
-    let want = Tag::from_bytes(&tag);
-    gsub.features.into_iter().any(|f| f.tag == want)
+    gsub_has(rb_bytes, |t| t == Tag::from_bytes(&tag))
+}
+
+/// Whether face 0's `GSUB` feature list holds a tag `hit` accepts. LINEAR: FeatureList
+/// records are stored in arbitrary, not tag-sorted, order, so a binary `find` could
+/// miss a present tag.
+fn gsub_has(rb_bytes: &[u8], hit: impl Fn(Tag) -> bool) -> bool {
+    rustybuzz::Face::from_slice(rb_bytes, 0)
+        .and_then(|face| face.tables().gsub)
+        .is_some_and(|gsub| gsub.features.into_iter().any(|f| hit(f.tag)))
 }
 
 /// Build the per-column glyph plan for one row of `cells`.
@@ -765,10 +588,6 @@ pub fn plan_row_runs<S, F, R>(
     out.resize(cols, ColumnGlyph::PerCell);
     let n = cols.min(cells.len());
     let mut c: usize = 0;
-    // Reuse the caller-owned scratch (cleared per run below) instead of a fresh
-    // `String`/`Vec<char>` per row per frame.
-    run.clear();
-    run_chars.clear();
     while c < n {
         if !shapeable.get(c).copied().unwrap_or(false) {
             c = c.saturating_add(1);
@@ -911,17 +730,7 @@ mod tests {
                         assert_eq!(scratch.script(), rustybuzz::script::UNKNOWN);
                         assert_eq!(scratch.language(), None);
                         let chars = run.chars().collect::<Vec<_>>();
-                        let actual = shaper.shape(run, &chars, true, &mut scratch);
-                        let expected = shape_ligature_run_with_face(
-                            &shaper.face,
-                            run,
-                            &chars,
-                            true,
-                            true,
-                            features,
-                        );
-                        assert_eq!(actual, expected, "mapped columns: {run}");
-                        changed_glyphs |= actual.is_some();
+                        changed_glyphs |= shaper.shape(run, &chars, true, &mut scratch).is_some();
                     }
                 }
             }
@@ -1062,6 +871,7 @@ mod tests {
             overline: false,
             underline_color: None,
             overline_color: None,
+            script: aterm_core::terminal::Script::Normal,
         }
     }
 
@@ -1184,30 +994,6 @@ mod tests {
         assert_eq!(out[3], ColumnGlyph::Ligated(911));
     }
 
-    /// M4 — `slice_tile_bands` produces a contiguous, disjoint, complete partition;
-    /// a non-multiple width leaves the remainder in the final (narrower) band.
-    #[test]
-    fn slice_tile_bands_partitions_exactly() {
-        // Exact multiple: three equal cells.
-        let bands = slice_tile_bands(30, 10);
-        assert_eq!(
-            bands,
-            vec![
-                TileBand { x0: 0, x1: 10 },
-                TileBand { x0: 10, x1: 20 },
-                TileBand { x0: 20, x1: 30 },
-            ]
-        );
-        // Remainder: the final band is narrower than cell_w (non-vacuity control
-        // for the remainder branch).
-        let bands = slice_tile_bands(25, 10);
-        assert_eq!(bands.last().copied(), Some(TileBand { x0: 20, x1: 25 }));
-        assert_eq!(bands.last().unwrap().width(), 5);
-        // Degenerate inputs yield no bands (caller keeps the 1:1 path).
-        assert!(slice_tile_bands(0, 10).is_empty());
-        assert!(slice_tile_bands(30, 0).is_empty());
-    }
-
     /// M4 — a `Collapsed` shape result expands to `n` `LigatedSlice` columns over
     /// the run, each carrying the wide gid and its cell index `k`. The columns
     /// OUTSIDE the run stay `PerCell` (byte-identical to no-ligature). This is the
@@ -1321,27 +1107,6 @@ mod tests {
         assert!(extract_cell_slice(&raster, raster_w, height, 0, 0, 0).is_empty());
         assert!(extract_cell_slice(&raster, raster_w, 0, 0, cell_w, 0).is_empty());
         assert!(extract_cell_slice(&[], raster_w, height, 0, cell_w, 0).is_empty());
-    }
-
-    /// M4 — `extract_cell_slice` with `xmin == 0` and a raster that is an exact
-    /// multiple of `cell_w` is EXACTLY `extract_tile` over the matching band: the
-    /// specialization is consistent with the general slicing primitive.
-    #[test]
-    fn extract_cell_slice_matches_extract_tile_when_aligned() {
-        let (cell_w, height, n) = (8usize, 3usize, 3usize);
-        let raster_w = n * cell_w;
-        let raster: Vec<u8> = (0..raster_w * height)
-            .map(|i| (i % 251 + 1) as u8)
-            .collect();
-        let bands = slice_tile_bands(raster_w, cell_w);
-        for (k, &band) in bands.iter().enumerate().take(n) {
-            let via_slice = extract_cell_slice(&raster, raster_w, height, 0, cell_w, k);
-            let via_tile = extract_tile(&raster, raster_w, height, band);
-            assert_eq!(
-                via_slice, via_tile,
-                "aligned slice k={k} must equal extract_tile"
-            );
-        }
     }
 }
 

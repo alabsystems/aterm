@@ -3,6 +3,10 @@
 
 [package]
 name = "aterm-lexicon"
+# Integration tests are declared below, not discovered: the files are modules of
+# one suite binary where they can share a process. With autotests off a
+# `tests/*.rs` file listed nowhere never compiles.
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,14 +18,14 @@ serde = { workspace = true }
 aterm-toml = { workspace = true }
 aterm-hash = { workspace = true }
 
-[dev-dependencies]
-# Tests use only std + the crate itself; `benches/cjk_scan.rs` prices the
-# no-space-script scan arm (nothing else in the tree reaches it).
-criterion = "0.5"
-
-[[bench]]
-name = "cjk_scan"
-harness = false
-
 [lints]
 workspace = true
+
+[[test]]
+name = "lexicon_suite"
+path = "tests/lexicon_suite.rs"
+
+# Alone: the exact-allocation pins own a counting #[global_allocator].
+[[test]]
+name = "lexicon_alloc"
+path = "tests/lexicon_alloc.rs"

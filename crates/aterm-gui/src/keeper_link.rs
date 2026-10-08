@@ -36,7 +36,7 @@
 
 #[cfg(unix)]
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(unix)]
 use std::sync::{Arc, Mutex, Weak};
 #[cfg(unix)]
@@ -53,6 +53,20 @@ use aterm_keeper::wire::{Birth, Frame, MarkerRef, MasterHeader};
 /// reads before anything else, so a window with the keeper off pays one
 /// relaxed load per spawn, close and exit.
 static ON: AtomicBool = AtomicBool::new(false);
+
+/// THE UPDATE'S PARENT (`0`: none), which a candidate's adopted sessions
+/// were the parent's sessions of: set once at boot ([`set_predecessor`]), read
+/// by every registration ([`registration_tag`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+static PREDECESSOR: AtomicU32 = AtomicU32::new(0);
+
+/// This launch is an update's candidate whose parent is `pid`: its adopted
+/// sessions' registrations name the parent's session each one was
+/// ([`Tag::handed`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn set_predecessor(pid: u32) {
+    PREDECESSOR.store(pid, Ordering::Relaxed);
+}
 
 /// How often the META pump looks at the registered terminals: the design's
 /// 250 ms debounce (§5.3 step 2) — at most four METAs a second per terminal,
@@ -174,6 +188,12 @@ fn live_link() -> Option<Arc<KeeperLink>> {
 pub(crate) struct Claim {
     rdev: u64,
     owner: Option<u32>,
+    /// The update's parent's (window, session id) this shell was, when its
+    /// registrant adopted it in an update ([`Tag::handed`]).
+    handed: Option<(u32, u64)>,
+    /// The pair the crash journal image its registrant took over keys it by,
+    /// when that image was older than its parent's ([`Tag::keyed`]).
+    keyed: Option<(u32, u64)>,
     armed: bool,
 }
 
@@ -184,13 +204,38 @@ impl Claim {
         Self {
             rdev,
             owner,
+            handed: None,
+            keyed: None,
             armed: true,
+        }
+    }
+
+    /// The obligation for the offered master `rdev`, whose registration said
+    /// `tag`: its window, and the parent's session it was.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn of_tag(rdev: u64, tag: &Tag) -> Self {
+        Self {
+            handed: tag.handed,
+            keyed: tag.keyed,
+            ..Self::new(rdev, tag.owner)
         }
     }
 
     /// The window that registered the master (the tag's `owner`).
     pub(crate) fn owner(&self) -> Option<u32> {
         self.owner
+    }
+
+    /// The update's parent's (window, session id) the shell was
+    /// ([`Tag::handed`]).
+    pub(crate) fn handed(&self) -> Option<(u32, u64)> {
+        self.handed
+    }
+
+    /// The pair the crash journal image its registrant took over keys the
+    /// shell by ([`Tag::keyed`]).
+    pub(crate) fn keyed(&self) -> Option<(u32, u64)> {
+        self.keyed
     }
 
     /// The offered master's device (a test names a claim by it).
@@ -263,10 +308,44 @@ fn release_unclaimed(rdev: u64) {
 /// id-matching (`take_handed_off_shell`, the orphan net's identity, the
 /// agent's "filled by a live shell") then matches only a window's own shells.
 /// A shell with no owner, or one not from the keeper, matches nothing.
+///
+/// AN UPDATE'S SUCCESSOR RE-TAGS WHAT IT ADOPTED (round seven of the update
+/// audit, finding 5's second review). At its Commit the successor registers
+/// every adopted shell under ITS window and ITS pool id — a counter that
+/// starts over in it — and the keeper keeps only the latest tag. Its crash
+/// journal is still the PARENT's image, taken over at Commit, whose leaves
+/// carry the parent's ids until the successor's own first image replaces it.
+/// So such a registration also names the parent's (window, id) the shell was
+/// ([`Claim::handed`]), and a shell whose own (owner, id) no leaf carries takes
+/// the leaf that names that pair: a successor that dies between its Commit
+/// and its first image gets every pane its own live shell back — the agent's
+/// pane included, so the agent is never relaunched beside itself.
+///
+/// AND ITS OWN IMAGE NAMES WHAT IT WAS HANDED (round eight of the update
+/// audit, finding 46). Once the successor has published its own image, its
+/// leaves carry its own ids; if its re-registration never reached the keeper
+/// (a link that did not start, a crash inside the delivery), the keeper still
+/// holds the parent's tag, which names neither. So the image's header names,
+/// for each such leaf, the pairs it was handed as
+/// (`crash_journal::JournalHeader::handed`, `handed` here: by the image's
+/// writer), and a shell held under one of those pairs takes that leaf —
+/// never over a leaf whose own pair it is.
+///
+/// AND THE IMAGE'S OWN PAIR, ANY NUMBER OF UPDATES ON (round seven of the
+/// update audit, leftover I2b; finding 209, `docs/DESIGN-pty-keeper-2026-09-26.md`
+/// §5.5). `handed` names the registrant's PARENT only. In a chain G → P → S
+/// whose image is still G's when S takes it over (P's first image failed to
+/// write, and P's desk did not change before it updated again), S's shells
+/// named P's pairs, matched none of G's leaves, and went to the orphan net.
+/// So P's handoff record says the pair the image it still holds keys each
+/// shell by (`SessionRecord::journal_key`, `App::journal_keys`), S's
+/// registration names it ([`Claim::keyed`]), and a shell whose own and
+/// parent's pairs match no leaf takes the leaf that names that one.
 pub(crate) fn place_by_owner(
     shells: &mut [crate::spawn::Adopted],
     layout: Option<&mut crate::restore::RestoreManifest>,
     writers: &[Option<u32>],
+    handed: &[(u32, crate::crash_journal::Handed)],
 ) {
     use crate::restore::{PaneLayout, RestoredSplitTree, RestoredView};
     let mut ids = std::collections::BTreeMap::<(Option<u32>, u64), u64>::new();
@@ -312,9 +391,25 @@ pub(crate) fn place_by_owner(
     }
     // Ids no leaf carries, above every one a leaf does.
     let mut unnamed = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+    // A leaf's earlier pairs, after every leaf's own: one never takes the key
+    // of a leaf whose own pair it is.
+    for (writer, pair) in handed {
+        if let Some(&leaf) = ids.get(&(Some(*writer), pair.id)) {
+            ids.entry((Some(pair.pid), pair.was)).or_insert(leaf);
+        }
+    }
     for shell in shells {
-        let owned = shell.keeper.as_ref().and_then(Claim::owner);
-        shell.local_id = match owned.and_then(|owner| ids.get(&(Some(owner), shell.local_id))) {
+        let claim = shell.keeper.as_ref();
+        let own = claim
+            .and_then(Claim::owner)
+            .and_then(|owner| ids.get(&(Some(owner), shell.local_id)));
+        let was = claim
+            .and_then(Claim::handed)
+            .and_then(|(owner, id)| ids.get(&(Some(owner), id)));
+        let keyed = claim
+            .and_then(Claim::keyed)
+            .and_then(|(owner, id)| ids.get(&(Some(owner), id)));
+        shell.local_id = match own.or(was).or(keyed) {
             Some(&id) => id,
             None => {
                 unnamed += 1;
@@ -344,7 +439,7 @@ fn build() -> String {
     format!(
         "{}+{}",
         aterm_types::version::APP_VERSION,
-        crate::build_info::BUILD_NUMBER
+        crate::build_info::build_number()
     )
 }
 
@@ -444,6 +539,11 @@ fn boot_unix(candidate: bool) -> Recovery {
         aterm_log::info!("keeper: armed; this update candidate registers at its Commit");
         return Recovery::default();
     }
+    // Room for what the HELLO hands over, before it does (round seven,
+    // finding 26's review): each adopted session holds about four
+    // descriptors, and a cold launch runs at launchd's soft 256.
+    #[cfg(target_os = "macos")]
+    crate::handoff_rendezvous::raise_descriptor_limit_for_recovery();
     let mut recovery = Recovery::default();
     let booted = match KeeperClient::connect(&socket, &identity, Duration::from_secs(2)) {
         Ok(client) => match client.hello_app_marked(&build(), marker()) {
@@ -557,6 +657,21 @@ pub(crate) struct Tag {
     pub(crate) rekey: bool,
     pub(crate) loader: bool,
     pub(crate) frozen: bool,
+    /// THE PARENT'S NAME FOR IT (additive, `handed=<pid>:<id>`; a build that
+    /// predates it ignores the key): an update's successor that adopted this
+    /// shell names the parent window and the parent's pool id it had there,
+    /// which the parent's crash journal — taken over at Commit — still keys
+    /// its pane by ([`place_by_owner`]).
+    pub(crate) handed: Option<(u32, u64)>,
+    /// THE IMAGE'S NAME FOR IT (additive, `keyed=<pid>:<id>`; a build that
+    /// predates it ignores the key; round seven of the update audit, leftover
+    /// I2b): when the parent's journal still held an image OLDER than the
+    /// parent's own — the parent took its own parent's over and never
+    /// replaced it — the (window, id) that image keys this shell's pane by,
+    /// which the parent carried in its handoff record
+    /// (`SessionRecord::journal_key`). `handed` alone names only one
+    /// generation back, and that image's leaves carry none of its ids.
+    pub(crate) keyed: Option<(u32, u64)>,
 }
 
 impl Tag {
@@ -579,6 +694,12 @@ impl Tag {
         }
         if let Some(identity) = &self.identity {
             put("identity", identity);
+        }
+        if let Some((owner, id)) = self.handed {
+            put("handed", &format!("{owner}:{id}"));
+        }
+        if let Some((owner, id)) = self.keyed {
+            put("keyed", &format!("{owner}:{id}"));
         }
         for (k, on) in [
             ("rekey", self.rekey),
@@ -612,6 +733,12 @@ impl Tag {
                 "rekey" => tag.rekey = v == "1",
                 "loader" => tag.loader = v == "1",
                 "frozen" => tag.frozen = v == "1",
+                "handed" => {
+                    tag.handed = v
+                        .split_once(':')
+                        .and_then(|(owner, id)| Some((owner.parse().ok()?, id.parse().ok()?)));
+                }
+                "keyed" => tag.keyed = crate::session_store::parse_journal_key(v),
                 _ => {}
             }
         }
@@ -620,7 +747,7 @@ impl Tag {
 }
 
 /// `s-<hex>`, at most 64 characters: the shape every sid this build mints.
-fn valid_sid(s: &str) -> bool {
+pub(crate) fn valid_sid(s: &str) -> bool {
     s.len() <= 64
         && s.strip_prefix("s-")
             .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -691,7 +818,7 @@ fn admit_recovered(
     let sid = tag.sid.clone().ok_or("carries no session id")?;
     Ok(crate::spawn::Adopted {
         // From here the master is released if it becomes no session.
-        keeper: Some(Claim::new(header.rdev, tag.owner)),
+        keeper: Some(Claim::of_tag(header.rdev, &tag)),
         local_id: header.local_id,
         master,
         pid,
@@ -714,8 +841,10 @@ fn admit_recovered(
         attention_owners: Vec::new(),
         claim_grace: false,
         outgoing_build: None,
+        render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
+        journal_key: None,
     })
 }
 
@@ -778,14 +907,8 @@ fn register_unix(session: &crate::Session) -> bool {
         return false;
     };
     let local_id = session.id;
-    let tag = Tag {
-        sid: Some(session.ctx.self_id.as_str().to_string()),
-        owner: Some(std::process::id()),
-        identity: session.identity.clone().filter(|l| valid_label(l)),
-        rekey: session.rekey_channel,
-        loader: session.body_loader,
-        frozen: session.frozen_path,
-    };
+    let predecessor = Some(PREDECESSOR.load(Ordering::Relaxed)).filter(|&pid| pid != 0);
+    let tag = registration_tag(session, std::process::id(), predecessor);
     let op = LinkOp::Register {
         master,
         header: MasterHeader {
@@ -813,6 +936,28 @@ fn register_unix(session: &crate::Session) -> bool {
         Phase::Off => {}
     }
     true
+}
+
+/// What `session`'s registration by window `own_pid` says of it: its sid,
+/// its window, its identity and channels — and, for a shell this window
+/// adopted in an update from `predecessor`, the parent's (window, id) it was
+/// ([`Tag::handed`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn registration_tag(
+    session: &crate::Session,
+    own_pid: u32,
+    predecessor: Option<u32>,
+) -> Tag {
+    Tag {
+        sid: Some(session.ctx.self_id.as_str().to_string()),
+        owner: Some(own_pid),
+        identity: session.identity.clone().filter(|l| valid_label(l)),
+        rekey: session.rekey_channel,
+        loader: session.body_loader,
+        frozen: session.frozen_path,
+        handed: predecessor.zip(session.handoff_local_id),
+        keyed: session.journal_key,
+    }
 }
 
 /// RELEASE (`Session::drop`): the tab or pane closed; the keeper closes its
@@ -992,15 +1137,18 @@ mod tests {
             rekey: true,
             loader: false,
             frozen: true,
+            handed: Some((4141, 7)),
+            keyed: Some((4040, 3)),
         };
         assert_eq!(Tag::decode(&tag.encode()), Some(tag));
         assert_eq!(Tag::decode(b"v=2\nsid=s-00\n"), None, "another version");
         let hostile =
-            Tag::decode(b"v=1\nsid=../../x\nidentity=a b\nowner=zz\nnew=1\n").expect("v1");
+            Tag::decode(b"v=1\nsid=../../x\nidentity=a b\nowner=zz\nhanded=1\nkeyed=0:1\nnew=1\n")
+                .expect("v1");
         assert_eq!(
             hostile,
             Tag::default(),
-            "a sid, label or owner that is not one is dropped; unknown keys ignored"
+            "a sid, label, owner or parent that is not one is dropped; unknown keys ignored"
         );
         assert!(tag_under_the_wire_bound());
     }
@@ -1013,6 +1161,8 @@ mod tests {
             rekey: true,
             loader: true,
             frozen: true,
+            handed: Some((u32::MAX, u64::MAX)),
+            keyed: Some((u32::MAX, u64::MAX)),
         };
         let bytes = long.encode();
         Tag::decode(&bytes).is_some_and(|t| t == long) && bytes.len() <= aterm_keeper::wire::MAX_TAG
@@ -1177,6 +1327,23 @@ mod tests {
             .expect("the Commit registers");
         assert!(adopt < activate && activate - adopt < 1_000, "beside it");
         assert_eq!(lib.matches("keeper_link::activate()").count(), 1);
+        // The candidate's registrations name the parent's session (finding 5's
+        // second review): the parent is named beside the journal's take-over,
+        // at boot, and every registration reads it.
+        let lane = lib
+            .find("crash_journal.set_predecessor(parent.pid(), parent.birth_unix_nanos());")
+            .expect("the journal's predecessor");
+        let named = lib
+            .find("keeper_link::set_predecessor(parent.pid());")
+            .expect("the keeper's predecessor");
+        assert!(lane < named && named - lane < 600, "beside it");
+        let own = include_str!("keeper_link.rs");
+        let register = &own[own.find("fn register_unix(").expect("register_unix")..];
+        assert!(
+            register[..register.find("\n}\n").expect("its end")]
+                .contains("registration_tag(session, std::process::id(), predecessor)"),
+            "every registration is tagged by `registration_tag`"
+        );
     }
 
     /// P3 REVIEW — A CANDIDATE IS AN ADMITTED PAIR, NOT THE VARIABLES. A
@@ -1231,6 +1398,22 @@ mod tests {
             "a recovered shell's reader is never deferred to a Commit that will not come"
         );
         assert!(spawn.contains("crate::keeper_link::register(&session, keeper_claim);"));
+
+        // ROOM FOR THE RECOVERY (round seven, finding 26's review): the soft
+        // descriptor limit is raised before the HELLO hands any master over,
+        // as a handoff's claim raises it before it dials.
+        let own = code(include_str!("keeper_link.rs"));
+        let body = &own[own.find("fn boot_unix(").expect("boot_unix")..];
+        let raise = body
+            .find("crate::handoff_rendezvous::raise_descriptor_limit_for_recovery();")
+            .expect("the recovery raises the limit");
+        let hello = body.find(".hello_app_marked(").expect("the HELLO");
+        assert!(raise < hello, "raised before the HELLO");
+        let candidate = body.find("if candidate {").expect("the candidate's return");
+        assert!(
+            candidate < raise,
+            "a candidate takes no offers and raises nothing here"
+        );
     }
 
     /// A real PTY whose shell leads it: `/bin/sh` parked in a `sleep`, and
@@ -1302,6 +1485,8 @@ mod tests {
             rekey: true,
             loader: false,
             frozen: false,
+            handed: None,
+            keyed: None,
         }
         .encode()
     }
@@ -1427,5 +1612,81 @@ mod tests {
             "a meta without the handoff's keys is none"
         );
         assert!(crate::seamless::recovered_checkpoint(b"", &mut used).is_none());
+    }
+
+    /// THE META CARRIES NO IN-FLIGHT OUTPUT STATE (round eight of the update
+    /// audit, finding 502's review). The pump resends the META only when the
+    /// modes change, so at a crash it may be hours old: an OSC 8 link open when
+    /// it was sampled, closed since, would link everything the program prints
+    /// after the recovery, and a long URI alone pushed a 100-column alt-screen
+    /// tab's META past `MAX_META`, so none was sent at all. `keeper_meta`
+    /// sends none of that state, and `recovered_checkpoint` takes none from a
+    /// META that holds it (nor a partial sequence), whichever window sent it.
+    #[cfg(unix)]
+    #[test]
+    fn the_meta_carries_no_in_flight_output_state() {
+        let mut t = Terminal::new(30, 100);
+        t.process(b"\x1b[?1049h\x1b[?2004h\x1b[31m\x1b[#{\x1b[?7s");
+        let uri = format!("https://example.com/{}", "a".repeat(4000));
+        t.process(format!("\x1b]8;id=k;{uri}\x1b\\linked").as_bytes());
+        assert_eq!(
+            t.current_hyperlink().map(AsRef::as_ref),
+            Some(uri.as_str()),
+            "PRECONDITION: the link is open"
+        );
+        let full = t.carry_meta_abandoning_partial();
+        assert!(
+            full.output_state.hyperlink.is_some() && !full.output_state.sgr_stack.is_empty(),
+            "PRECONDITION: the handoff's meta holds the in-flight state"
+        );
+        assert!(
+            aterm_json::to_string(&full).expect("json").len() > aterm_keeper::wire::MAX_META,
+            "NON-VACUITY: with it the META would not fit"
+        );
+
+        let meta = crate::seamless::keeper_meta(&t).expect("fits");
+        assert!(meta.len() <= aterm_keeper::wire::MAX_META);
+        let text = String::from_utf8(meta.clone()).expect("utf-8");
+        assert!(!text.contains("\"output_state\""), "{text}");
+        let mut used = 0;
+        let cp = crate::seamless::recovered_checkpoint(&meta, &mut used).expect("a checkpoint");
+        assert!(cp.modes.bracketed_paste, "the modes still cross");
+        assert!(cp.output_state.is_default());
+        let mut recovered = Terminal::from_checkpoint(&cp);
+        assert_eq!(recovered.current_hyperlink(), None, "no link reopened");
+        let at = recovered.cursor();
+        recovered.process(b"later");
+        assert_eq!(
+            recovered.hyperlink_at(at.row, at.col),
+            None,
+            "later output is not linked"
+        );
+
+        // A META that does hold it (another window's, or one sent mid-sequence):
+        // the recovery takes neither the state nor the partial sequence.
+        t.process(b"\x1b[3");
+        let mut stale = t.carry_meta_abandoning_partial();
+        stale.shell_integration_nonce = None;
+        assert!(
+            stale.parser.is_some() && !stale.output_state.is_default(),
+            "PRECONDITION"
+        );
+        let stale = aterm_json::to_string(&stale).expect("json").into_bytes();
+        let cp = crate::seamless::recovered_checkpoint(&stale, &mut used).expect("a checkpoint");
+        assert!(cp.output_state.is_default(), "no in-flight output state");
+        assert!(cp.parser.is_none(), "no partial sequence");
+        let mut recovered = Terminal::from_checkpoint(&cp);
+        assert_eq!(recovered.current_hyperlink(), None);
+        let at = recovered.cursor();
+        recovered.process(b"later");
+        assert_eq!(recovered.hyperlink_at(at.row, at.col), None);
+        assert!(
+            recovered
+                .row_text(usize::from(at.row))
+                .unwrap_or_default()
+                .trim_end()
+                .ends_with("later"),
+            "no partial CSI swallowed the text"
+        );
     }
 }

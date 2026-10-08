@@ -163,8 +163,8 @@ fn resize_row_reuse_conforms() {
     }
     assert_eq!(seen.len(), actions.len());
 
-    // The historical shrink discarded its unique allocation token. The same
-    // actual allocation census projected with that lost token breaks ownership.
+    // A shrink that discards its unique allocation token breaks ownership in
+    // the same allocation census.
     let mutant = interp::with_buggy(&model, 1);
     let mut state = mutant.init_state();
     assert!(mutant.fire("Shrink", &mut state));

@@ -118,7 +118,7 @@ impl<V: Host> AgentPhase<V> {
 /// the host reads it into [`Facts::lease`] from the SAME read that forms the
 /// hand, and again, LIVE, for [`super::drive::Desk::lease_mark`]. Words
 /// formed under one mark are never committed to a window's geometry under
-/// another (2026-09-28, the drive module's `commit_rows`): every change of
+/// another (the drive module's `commit_rows`): every change of
 /// the lease posts a wake, and that wake re-derives them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LeaseMark {
@@ -267,6 +267,32 @@ pub struct TurnFact {
     pub carried: bool,
 }
 
+/// WHO ANSWERS THE WALL the agent is at ([`Facts::wall_answer`]): a fact of
+/// the HOST — aterm's own harness holds the session and has a plan for the
+/// wall — which the screen cannot show.
+///
+/// The owner's rule: *"Don't continue to persist alerts to the
+/// user that are not actionable."* A wall the harness resumes by itself (a
+/// limit waited out to its reset, a 529 retried, a full context compacted) is
+/// a RECORD — the row says when — not a stop: no red rim, no filled diamond
+/// saying "Agent can't continue" for the three hours the harness is about to
+/// spend resuming it. A wall nobody answers keeps the stop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WallAnswer {
+    /// Nobody: no supervisor, the owner's switch off, a lost login, a
+    /// critical-memory banner. The wall stands for a person to see.
+    #[default]
+    Nobody,
+    /// The harness resumes it by itself (or Claude Code does, with the harness
+    /// the net under it).
+    Harness,
+    /// The harness resumes it, slowly, and a person can lift it faster: a
+    /// reset-less model bucket, a spend limit no reset ends. `action` is the
+    /// ONE thing to do, a static phrase (`/model to switch`, `add credits`);
+    /// the row says it, calm — never an interruption.
+    HarnessAsks(&'static str),
+}
+
 /// Everything one refresh reads. Built by the host from the session's own
 /// state; pure data so the model is testable without a store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,6 +346,10 @@ pub struct Facts<V: Host> {
     /// input. Ranks [`Level::Limited`] and takes the phase slot as `frozen`
     /// (or `stopped`) — ahead of typed attention.
     pub input_stall: Option<V::Stall>,
+    /// Who answers the agent's wall, if it is at one ([`WallAnswer`]).
+    /// Read every refresh: a claim that arrives or lapses moves it without a
+    /// new agent reading.
+    pub wall_answer: WallAnswer,
 }
 
 impl<V: Host> Default for Facts<V> {
@@ -340,6 +370,7 @@ impl<V: Host> Default for Facts<V> {
             link: Link::Absent,
             turn: None,
             input_stall: None,
+            wall_answer: WallAnswer::Nobody,
         }
     }
 }
@@ -526,6 +557,8 @@ pub struct Slot<V: Host> {
     pub turn: Option<TurnFact>,
     /// [`Facts::input_stall`].
     pub input_stall: Option<V::Stall>,
+    /// [`Facts::wall_answer`].
+    pub wall_answer: WallAnswer,
     /// When the last turn SETTLED (the Success tone's 2 s window).
     pub settled_at: Option<Instant>,
     /// When a stop (hold or limit) began, for the story's stop duration.
@@ -554,8 +587,8 @@ pub struct Slot<V: Host> {
     /// the session at either end: every point it notes is aterm's.
     noting_aterm: bool,
     /// The story up to this seq is CLOSED: the agent it was about left the
-    /// session, so it is no longer news to hold the row for (2026-09-24,
-    /// D10). Every window's watermark is read as at least this.
+    /// session, so it is no longer news to hold the row for. Every window's
+    /// watermark is read as at least this.
     story_closed: u64,
     /// The last TOLD point (`ctl story`), with its text: the phase slot reads
     /// it for [`TOLD_FLASH`] after its instant, then returns to the phase.
@@ -583,6 +616,7 @@ impl<V: Host> Slot<V> {
             link: Link::Absent,
             turn: None,
             input_stall: None,
+            wall_answer: WallAnswer::Nobody,
             settled_at: None,
             stop_began: None,
             baselined: false,
@@ -670,6 +704,10 @@ impl<V: Host> Slot<V> {
         }
         if self.attention_told_elsewhere != facts.attention_told_elsewhere {
             self.attention_told_elsewhere = facts.attention_told_elsewhere;
+            changed = true;
+        }
+        if self.wall_answer != facts.wall_answer {
+            self.wall_answer = facts.wall_answer;
             changed = true;
         }
         if self.shell.map(|s| s.0) != facts.shell.map(|s| s.0) {
@@ -826,14 +864,25 @@ impl<V: Host> Slot<V> {
             return Level::Hold;
         }
         // A program that reads nothing is stopped as surely as one at a
-        // wall, whatever its screen still shows (2026-09-24).
+        // wall, whatever its screen still shows.
         if self.input_stall.is_some() {
             return Level::Limited;
         }
-        if matches!(
+        // A wall the harness answers is a record, not a stop (`WallAnswer`):
+        // it stands at `Note` — the row is there, with its reset and its
+        // countdown, and no rim, no filled diamond and no warn tone say
+        // "Agent can't continue" while the harness resumes it. Whatever else
+        // ranks higher (a prompt, a hand, a story) still does.
+        let handled_wall = matches!(
             self.agent.as_ref().map(|a| &a.phase),
             Some(AgentPhase::Wall { .. })
-        ) {
+        ) && self.wall_answer != WallAnswer::Nobody;
+        if !handled_wall
+            && matches!(
+                self.agent.as_ref().map(|a| &a.phase),
+                Some(AgentPhase::Wall { .. })
+            )
+        {
             return Level::Limited;
         }
         if (attention && self.attention.is_some())
@@ -864,6 +913,7 @@ impl<V: Host> Slot<V> {
             || self.mail.queued > 0
             || self.mail.dropped > 0
             || matches!(self.link, Link::Stalled { .. } | Link::Disconnected)
+            || handled_wall
         {
             return Level::Note;
         }

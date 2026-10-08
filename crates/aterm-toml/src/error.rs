@@ -3,13 +3,9 @@
 
 //! The ONE error type for both halves of the crate.
 //!
-//! `toml` splits its errors into `toml::de::Error` and `toml::ser::Error` and
-//! `toml_edit` adds a third (`TomlError`); all three carry the same two pieces
-//! of information — a message and an optional byte span into the source — and
-//! every consumer in this tree uses them the same way (`error.span()` to
-//! underline a diagnostic, `error.to_string()` for the text). One type,
-//! re-exported under the three historical names, keeps that surface without
-//! three near-identical definitions.
+//! A message plus an optional byte span into the source: consumers call
+//! `error.span()` to underline a diagnostic and `error.to_string()` for the
+//! text. Parse, deserialize and serialize failures all use it.
 
 use core::fmt;
 use core::ops::Range;

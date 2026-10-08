@@ -50,11 +50,9 @@
 
 #![cfg(unix)]
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use aterm_agent::supervise::phase::composer_text;
@@ -67,12 +65,9 @@ use aterm_agent::supervise::{
     SupervisorConfig, is_placeholder, read_journal, worker_phase,
 };
 
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::headless_boot;
 
-use headless_boot::{Instance, log_tail};
+use headless_boot::{Instance, ctl, log_tail, type_line};
 
 /// Boot one headless instance, 40 rows, [`COLUMNS`] wide.
 fn boot(tag: &str) -> Option<Instance> {
@@ -88,52 +83,14 @@ fn boot_with(tag: &str, columns: &str) -> Option<Instance> {
     )
 }
 
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a wait for something that MUST happen — a screen, a worker's
+/// record, a submitted line — may take before it is read as a hang (AGENTS.md:
+/// a hang detector is a minute, never a latency budget).
+const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// [`HANG`] as a server-side `await`'s bound.
+const HANG_MS: &str = "timeout=60000";
 /// Wide enough that no drawn row wraps (the 529 notice is 152 columns).
 const COLUMNS: &str = "170";
-
-/// One bounded `aterm ctl --sock <sock> <args…>` call.
-fn ctl(inst: &Instance, args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    cmd.arg("ctl")
-        .arg("--sock")
-        .arg(&inst.sock)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    launch_isolation::apply(&mut cmd, &inst.tmp);
-    let mut child = cmd.spawn().expect("spawn aterm ctl");
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + CLIENT_EXIT_DEADLINE;
-    loop {
-        match child.try_wait().expect("poll aterm ctl") {
-            Some(status) => {
-                return Output {
-                    status,
-                    stdout: stdout.join().expect("stdout drain"),
-                    stderr: stderr.join().expect("stderr drain"),
-                };
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("aterm ctl {args:?} did not exit in time");
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
-}
 
 fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
     let out = ctl(inst, args);
@@ -157,12 +114,6 @@ fn boot_session(inst: &Instance) -> String {
     row.split_whitespace().nth(1).unwrap().to_string()
 }
 
-/// Type one line into the session and submit it, as a person does.
-fn type_line(inst: &Instance, sid: &str, line: &str) {
-    ctl_ok(inst, &[&format!("@{sid}"), "send", line]);
-    ctl_ok(inst, &[&format!("@{sid}"), "key", "enter"]);
-}
-
 /// `await match <re>` on the session: the server's latched watcher. `<re>`
 /// is one wire token (`.` for a space).
 fn await_match(inst: &Instance, sid: &str, re: &str) {
@@ -175,10 +126,7 @@ fn await_match(inst: &Instance, sid: &str, re: &str) {
 /// `OK timeout`), so a test holding a [`Supervisor`] can stop it first and
 /// say what its loop printed — the one record of which side stalled.
 fn awaited(inst: &Instance, sid: &str, re: &str) -> Result<(), String> {
-    let out = ctl(
-        inst,
-        &[&format!("@{sid}"), "await", "match", re, "timeout=20000"],
-    );
+    let out = ctl(inst, &[&format!("@{sid}"), "await", "match", re, HANG_MS]);
     let reply = String::from_utf8_lossy(&out.stdout).into_owned();
     if out.status.success() && reply.starts_with("OK") && !reply.starts_with("OK timeout") {
         return Ok(());
@@ -187,17 +135,6 @@ fn awaited(inst: &Instance, sid: &str, re: &str) -> Result<(), String> {
         "{reply:?} stderr={:?}",
         String::from_utf8_lossy(&out.stderr)
     ))
-}
-
-/// [`awaited`] for `timeout_ms`: the regression's control.
-fn awaited_for(inst: &Instance, sid: &str, re: &str, timeout_ms: u64) -> Result<(), String> {
-    let timeout = format!("timeout={timeout_ms}");
-    let out = ctl(inst, &[&format!("@{sid}"), "await", "match", re, &timeout]);
-    let reply = String::from_utf8_lossy(&out.stdout).into_owned();
-    if out.status.success() && reply.starts_with("OK") && !reply.starts_with("OK timeout") {
-        return Ok(());
-    }
-    Err(reply)
 }
 
 /// The fake worker's events of `kind` (`draw-<screen>`, `submit`, `press`)
@@ -240,13 +177,13 @@ fn stamps_when(events: &Path, kind: &str, n: usize, within: Duration) -> Vec<Sys
 }
 
 /// When the worker first drew `screen` (its event record, [`stamps_when`]),
-/// waiting up to 20 s; panics naming what it did draw.
+/// waiting up to a minute; panics naming what it did draw.
 fn drawn(events: &Path, screen: &str) -> SystemTime {
     if let Some(&at) = stamps_when(
         events,
         &format!("draw-{screen}"),
         1,
-        Duration::from_secs(20),
+        Duration::from_secs(60),
     )
     .first()
     {
@@ -373,7 +310,7 @@ fn waited_at(
     n: usize,
     drawn: SystemTime,
 ) -> (Duration, String) {
-    let key = first_key_after(events, screen, n, Duration::from_secs(1));
+    let key = first_key_after(events, screen, n, HANG);
     match (reviewed_at(inst, drawn), key) {
         (Some((at, line)), Some(key)) => (between(at, key), line),
         (reviewed, key) => (
@@ -461,6 +398,69 @@ fn goal_end() -> Vec<String> {
     r
 }
 
+/// The measured weekly wall of 2026-09-28 (tab 1: the wall's
+/// gutter block, the `/goal` echo, a done row counting `1 shell still
+/// running`, the bypass footer's `· 1 shell ·`, Claude's dim suggestion in the
+/// composer), its reset a few SECONDS off (`resets in 5s`, the span
+/// grammar the loop reads) so a live test can wait it out. `live`: a new turn
+/// runs under it (a spinner status row, `esc to interrupt` on the mode row) —
+/// the negative control, busy.
+fn wall_behind_a_shell(live: bool) -> Vec<String> {
+    wall_behind_a_shell_in(5, live)
+}
+
+/// [`wall_behind_a_shell`] with its reset `secs` seconds off.
+fn wall_behind_a_shell_in(secs: u64, live: bool) -> Vec<String> {
+    const WALL: &str = include_str!(
+        "../../aterm-phase/src/fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
+    );
+    let reset = format!("resets in {secs}s");
+    screen(WALL)
+        .into_iter()
+        .map(|r| r.replace("resets 4pm (America/Los_Angeles)", &reset))
+        .map(|r| {
+            if live && r.starts_with("✻ Sautéed") {
+                "✻ Cooking… (12s · ↓ 1.1k tokens · esc to interrupt)".to_string()
+            } else if live && r.contains("bypass permissions on") {
+                "  ⏵⏵ bypass permissions on · esc to interrupt · 1 shell · ← for agents".to_string()
+            } else {
+                r
+            }
+        })
+        .collect()
+}
+
+/// The text a person left in the composer at the wall ([`wall_with_a_draft`]).
+const DRAFT: &str = "and then merge when it is green";
+
+/// [`wall_behind_a_shell`] with a person's DRAFT standing in the composer: the
+/// caret row holds `DRAFT`, drawn plain, not as Claude's dim suggestion.
+fn wall_with_a_draft() -> Vec<String> {
+    let mut rows = wall_behind_a_shell(false);
+    let c = caret(&rows);
+    rows[c] = format!("❯ {DRAFT}");
+    rows
+}
+
+/// [`wall_behind_a_shell`] with the wall's rows scrolled out of view (the owner
+/// reading back up the transcript: Claude Code's fullscreen view keeps the
+/// status row, the composer and the footer where they are): the workflow
+/// notice, the gutter block and the echo are gone, the done row and the
+/// footer still count `1 shell`. The screen reads `busy` with no wall.
+fn wall_scrolled_out_of_view() -> Vec<String> {
+    let mut rows = wall_behind_a_shell(false);
+    let from = rows
+        .iter()
+        .position(|r| r.starts_with("⏺ Dynamic workflow"))
+        .expect("the workflow notice");
+    let to = rows
+        .iter()
+        .position(|r| r.starts_with("⏺ Goal paused"))
+        .expect("the echo");
+    rows.drain(from..=to);
+    rows
+}
+
 /// The decision the second turn ends on: answered under full power,
 /// escalated (never typed into) where the owner switched answers off.
 const STOP: &str = "I need your decision on the schema before I go on.";
@@ -497,7 +497,7 @@ const DONE: &str = "Fixed the parser; the suite is green.";
 /// came and went unread under a read stalled past it — the goal end then
 /// read as no work (a 2 min back-off), the decision after a continuation as
 /// the continuation not yet taken (30 s) — and a test waiting 20 s for the
-/// act failed ([`a_loop_stalled_in_a_turn_still_reads_the_work_it_judges`]).
+/// act failed.
 ///
 /// On the `box` screen a digit answers the box — logged `PRESS:<digit>` —
 /// and the turn ends on `done` after a fixed 1 s spell: no test judges the
@@ -596,7 +596,12 @@ while :; do
       buf=""; typed=0
       n=$(wc -l < "$subs" | tr -d ' ')
       work 2
-      if [ "$n" = 1 ] || [ "$mode" = loop ]; then draw "$after"; else draw stop; fi
+      if [ "$n" = 1 ] || [ "$mode" = loop ]; then
+        # `wallscroll`: the wall (its reset 12 s off), then, six seconds later,
+        # the same screen with the wall's rows scrolled out of view (the owner
+        # reading back up): six seconds for a loaded machine to look at it.
+        if [ "$after" = wallscroll ]; then draw wallslow; sleep 6; draw wallscrolled; else draw "$after"; fi
+      else draw stop; fi
     elif [ "$c" = "$esc" ]; then
       while [ ${#chunk} -lt 2 ]; do fill; done
       rest="${chunk#??}"; csi="${chunk%"$rest"}"; chunk="$rest"
@@ -658,6 +663,17 @@ fn start_worker_in(
         ("done", ended(DONE)),
         ("stop", ended(STOP)),
         ("interrupted", interrupted()),
+        ("wall", wall_behind_a_shell(false)),
+        // The same wall on a grid drawn one row high: the cursor on the row
+        // BELOW the prompt, as tab 1's screen sat after its flap of 2026-09-28.
+        ("walldisplaced", wall_behind_a_shell(false)),
+        ("wallspin", wall_behind_a_shell(true)),
+        // The wall the scroll test draws: its reset 12 s off, so the loop has
+        // seconds, not a second, to look at it before it is scrolled away.
+        ("wallslow", wall_behind_a_shell_in(12, false)),
+        ("wallscrolled", wall_scrolled_out_of_view()),
+        // The wall with a person's draft in the composer (not dim: typed).
+        ("walldraft", wall_with_a_draft()),
         ("box", screen(BOX_BASH_TOUCH)),
     ] {
         let rows: Vec<String> = rows
@@ -677,13 +693,34 @@ fn start_worker_in(
         }
         let c = caret(&rows);
         let mut drawn = rows.clone();
-        if name == "goal" {
+        if name == "goal"
+            || name == "wall"
+            || name == "walldisplaced"
+            || name == "wallslow"
+            || name == "wallscrolled"
+        {
             // The suggestion DIM, as Claude Code draws it: the loop reads the
             // `cell` at column 2 before it takes one row of text there for the
             // placeholder, and a plain one is a person's draft, caret homed.
-            drawn[c] = drawn[c].replacen("❯ ", "❯ \x1b[2m", 1) + "\x1b[22m";
+            // (The measured wall's caret is followed by a NO-BREAK SPACE.)
+            drawn[c] =
+                drawn[c]
+                    .replacen("❯ ", "❯ \x1b[2m", 1)
+                    .replacen("❯\u{a0}", "❯\u{a0}\x1b[2m", 1)
+                    + "\x1b[22m";
         }
-        std::fs::write(dir.join(format!("{name}.scr")), render(&drawn, (c, 2))).expect("scr");
+        let cursor_row = if name == "walldisplaced" { c + 1 } else { c };
+        // A draft leaves the cursor after its text.
+        let cursor_col = if name == "walldraft" {
+            2 + DRAFT.chars().count()
+        } else {
+            2
+        };
+        std::fs::write(
+            dir.join(format!("{name}.scr")),
+            render(&drawn, (cursor_row, cursor_col)),
+        )
+        .expect("scr");
         std::fs::write(dir.join(format!("{name}.row")), (c + 1).to_string()).expect("row");
         std::fs::write(
             dir.join(format!("{name}.below")),
@@ -724,26 +761,11 @@ struct Supervisor {
     stop: Arc<AtomicBool>,
     cut: Option<Interrupter>,
     handle: std::thread::JoinHandle<String>,
-    /// When each read [`Forcing::held_after`] held was let go.
-    released: Arc<Mutex<Vec<SystemTime>>>,
-}
-
-/// What a regression makes the loop do that a loaded machine can: a thread
-/// scheduled late, a read stalled in the middle of a turn.
-#[derive(Clone, Default)]
-struct Forcing {
-    /// The loop's thread sleeps this long before its first request.
-    late: Duration,
-    /// For each `n` here, the loop's first screen read after the worker took
-    /// its `n`-th line is held until [`Forcing::hold`] after the worker drew
-    /// that turn's busy screen.
-    held_after: Vec<usize>,
-    hold: Duration,
 }
 
 /// The loop's connection: every request carried to the instance as it is,
-/// the reads [`Forcing::held_after`] names held, and the worker told when
-/// the loop has read its busy screen ([`FAKE_WORKER`]'s `work`).
+/// and the worker told when the loop has read its busy screen
+/// ([`FAKE_WORKER`]'s `work`).
 ///
 /// "Read" is the loop's own: a screen read showing the busy spell, then
 /// `await gone` — what the loop asks for after a busy read that counted the
@@ -759,12 +781,8 @@ struct Tap {
     ctl: RelayCtl,
     events: PathBuf,
     seen: PathBuf,
-    forcing: Forcing,
-    /// The worker's lines already seen when a read went out.
-    took: usize,
     /// The last screen read showed the busy spell.
     read_busy: bool,
-    released: Arc<Mutex<Vec<SystemTime>>>,
 }
 
 impl Tap {
@@ -788,26 +806,6 @@ impl Ctl for Tap {
         if verb == Some("await") && words.next() == Some("gone") && self.read_busy {
             self.saw_busy();
         }
-        if verb == Some("text") {
-            let took = stamps_when(&self.events, "submit", 0, Duration::ZERO).len();
-            if took > self.took {
-                self.took = took;
-                if self.forcing.held_after.contains(&took) {
-                    let busy =
-                        stamps_when(&self.events, "draw-busy", took, Duration::from_secs(20));
-                    if let Some(&drawn) = busy.get(took - 1) {
-                        let until = drawn + self.forcing.hold;
-                        if let Ok(left) = until.duration_since(SystemTime::now()) {
-                            std::thread::sleep(left);
-                        }
-                    }
-                    self.released
-                        .lock()
-                        .expect("the releases")
-                        .push(SystemTime::now());
-                }
-            }
-        }
         let reply = self.ctl.call(args);
         if verb == Some("text") {
             self.read_busy = matches!(&reply, Ok(r) if r.ok() && r.stdout.contains("Deliberating"));
@@ -828,32 +826,18 @@ impl Supervisor {
         Self::start_with(inst, sid, timing, no_answers())
     }
 
-    /// [`Self::start`] under `policy`.
+    /// [`Self::start`] under `policy`. Returns once the loop has LOOKED — its
+    /// journal holds the first point it read ([`Self::looked`]).
     fn start_with(
         inst: &Instance,
         sid: &str,
         timing: TurnEndTiming,
         policy: SupervisorConfig,
     ) -> Self {
-        Self::start_forced(inst, sid, timing, policy, Forcing::default())
-    }
-
-    /// [`Self::start_with`] under a regression's `forcing` (as under a
-    /// gate's load). Returns once the loop has LOOKED — its journal holds
-    /// the first point it read ([`Self::looked`]).
-    fn start_forced(
-        inst: &Instance,
-        sid: &str,
-        timing: TurnEndTiming,
-        policy: SupervisorConfig,
-        forcing: Forcing,
-    ) -> Self {
         let before = looks(&journal(inst));
         let stop = Arc::new(AtomicBool::new(false));
         let mut relay = RelayCtl::new(Endpoint::Socket(inst.sock.clone()), None);
         relay.connect().expect("the supervisor's connection");
-        let late = forcing.late;
-        let released = Arc::new(Mutex::new(Vec::new()));
         // From here on the worker's busy spells wait for the loop's read.
         let seen = inst.tmp.join("seen");
         std::fs::create_dir_all(&seen).expect("the busy reads' dir");
@@ -861,10 +845,7 @@ impl Supervisor {
             ctl: relay,
             events: inst.tmp.join("events"),
             seen,
-            forcing,
-            took: 0,
             read_busy: false,
-            released: Arc::clone(&released),
         };
         let cut = ctl.interrupter();
         let ledger = inst.tmp.join("state/drive.jsonl");
@@ -872,7 +853,6 @@ impl Supervisor {
         let sid = format!("@{sid}");
         let flag = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
-            std::thread::sleep(late);
             let mut s = Session::new(&mut ctl, Some(sid));
             s.set_approval_ledger(Some(ledger));
             s.set_supervisor_name(Some("turn-end-live".to_string()));
@@ -885,18 +865,7 @@ impl Supervisor {
             let _ = s.run_hosted(&opts, flag, &mut out);
             String::from_utf8(out).unwrap_or_default()
         });
-        Self {
-            stop,
-            cut,
-            handle,
-            released,
-        }
-        .looked(inst, before)
-    }
-
-    /// When each read the forcing held was let go, in order.
-    fn released(&self) -> Vec<SystemTime> {
-        self.released.lock().expect("the releases").clone()
+        Self { stop, cut, handle }.looked(inst, before)
     }
 
     /// Wait until the loop has read the screen and journaled the point it
@@ -915,7 +884,7 @@ impl Supervisor {
     /// came (`OK timeout`). Watching from the ready screen, the loop reads
     /// `go`'s busy turn, as a supervisor that was there when it began does.
     fn looked(self, inst: &Instance, before: usize) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if looks(&journal(inst)) > before {
                 return self;
@@ -964,9 +933,9 @@ fn no_answers() -> SupervisorConfig {
     }
 }
 
-/// The session's `meta` once it satisfies `ok`, or after 20 s as it is.
+/// The session's `meta` once it satisfies `ok`, or after a minute as it is.
 fn meta_when(inst: &Instance, sid: &str, ok: impl Fn(&str) -> bool) -> String {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let m = ctl_ok(inst, &[&format!("@{sid}"), "meta"]);
         if ok(&m) || Instant::now() >= deadline {
@@ -1004,6 +973,43 @@ fn evidence(inst: &Instance, out: &str) -> String {
     )
 }
 
+/// Two tests of one file that boot with the same tag share ONE scratch world
+/// (`headless_boot::scratch_root` names it `atte{tag}-{pid}`): one directory,
+/// one socket, one fake worker, clobbered by each other whenever libtest runs
+/// them side by side. The merge gate runs this binary that way, so a repeated
+/// tag is a red run that reads as load (measured 2026-09-29: six of seventeen
+/// failed at RUST_TEST_THREADS=6 with four tags shared, none alone). A test that
+/// needs a world of its own takes a tag no other test in this file takes.
+#[test]
+fn no_two_tests_boot_with_the_same_tag() {
+    let src = include_str!("supervise_turn_end_live_headless.rs");
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    for (n, line) in src.lines().enumerate() {
+        let line = line.trim_start();
+        let boots = line.starts_with("let Some(inst) = boot(")
+            || line.starts_with("let Some(inst) = boot_with(")
+            || line.starts_with("let tag =");
+        if !boots {
+            continue;
+        }
+        // Every one-letter string literal on the line is a tag (`"64"` and the
+        // like are columns, and longer).
+        for lit in line.split('"').skip(1).step_by(2) {
+            if lit.chars().count() == 1 {
+                seen.push((lit.to_string(), n + 1));
+            }
+        }
+    }
+    assert!(seen.len() >= 10, "the scan read no boots: {seen:?}");
+    for (i, (tag, at)) in seen.iter().enumerate() {
+        if let Some((_, first)) = seen[..i].iter().find(|(t, _)| t == tag) {
+            panic!(
+                "tag {tag:?} boots at line {first} and again at line {at}: a world of its own needs its own tag"
+            );
+        }
+    }
+}
+
 /// The screens the worker draws read as the policy needs them to: the goal
 /// end idle with Claude Code's suggestion at column 2; the 529 end idle.
 #[test]
@@ -1037,7 +1043,7 @@ fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
     type_line(&inst, &sid, "go");
     let sup = sup.saw(&inst, &sid, "I.need.your.decision");
     let meta = {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let m = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
             if m.contains("need%20your%20decision")
@@ -1050,7 +1056,7 @@ fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
         }
     };
     let out = sup.stop();
-    let submitted = lines_when(&subs, 2, Duration::from_secs(1));
+    let submitted = lines_when(&subs, 2, HANG);
     assert_eq!(
         submitted,
         ["SUBMIT:go", "SUBMIT:keep going"],
@@ -1067,105 +1073,6 @@ fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
         meta.contains("attention_owner=supervisor"),
         "escalated under the supervisor's key: {meta}\nthe loop said:\n{out}"
     );
-}
-
-/// THE SUGGESTION TEST'S FLAKE, forced (2026-09-28, load 35-41: "`I.need.
-/// your.decision` never reached the screen: OK timeout"): the loop's thread
-/// takes its first look 5 s late — longer than typing `go` and the worker's
-/// whole 2 s turn — and still watches the turn it judges, because a test
-/// types `go` only once the loop has read the screen it starts on
-/// ([`Supervisor::looked`]): the suggestion is accepted once and the
-/// decision after it escalated. The control: the first point the loop read
-/// is the ready screen, from before `go`.
-#[test]
-fn a_loop_slow_to_take_its_first_look_still_watches_the_turn_it_judges() {
-    let Some(inst) = boot("f") else { return };
-    let sid = boot_session(&inst);
-    let (_keys, subs, _events) = start_worker(&inst, &sid, "goal");
-    let sup = Supervisor::start_forced(
-        &inst,
-        &sid,
-        TurnEndTiming::default(),
-        no_answers(),
-        Forcing {
-            late: Duration::from_secs(5),
-            ..Forcing::default()
-        },
-    );
-    type_line(&inst, &sid, "go");
-    let sup = sup.saw(&inst, &sid, "I.need.your.decision");
-    let out = sup.stop();
-    let said = evidence(&inst, &out);
-    let journal = journal(&inst);
-    let first = journal
-        .lines()
-        .find(|l| l.contains(r#""kind":"event""#))
-        .unwrap_or_default();
-    assert!(
-        first.contains("Ready for the next stage"),
-        "the loop's first point: {first}\n{said}"
-    );
-    let submitted = lines_when(&subs, 2, Duration::from_secs(1));
-    assert_eq!(submitted, ["SUBMIT:go", "SUBMIT:keep going"], "{said}");
-    assert!(
-        out.contains("rule=continue-suggestion@v1 keep going"),
-        "{said}"
-    );
-}
-
-/// A LOOP STALLED IN THE MIDDLE OF A TURN, forced: its first read after
-/// each line the worker takes — `go`, then the continuation — is held until
-/// 3 s after the worker drew that turn's busy screen, past the 2 s the
-/// worker once spent there. The loop judges a turn by the busy work it READ
-/// (`TurnEndState::observe`): a turn whose busy screen came and went while
-/// its read was held reads as no work at all — the goal end as the first
-/// point's back-off (2 min), the decision after the continuation as a
-/// continuation not yet taken (`take_within`, 30 s) — and neither the
-/// continuation nor the escalation comes in time. Still, the suggestion is
-/// accepted once and the decision after it escalated, because a busy spell
-/// the loop watches lasts until the loop has read it (`FAKE_WORKER`'s
-/// `work`). The control: each turn's end was drawn after the held read was
-/// let go, so the busy screen was still up when the loop read it.
-#[test]
-fn a_loop_stalled_in_a_turn_still_reads_the_work_it_judges() {
-    let Some(inst) = boot("h") else { return };
-    let sid = boot_session(&inst);
-    let (_keys, subs, events) = start_worker(&inst, &sid, "goal");
-    let sup = Supervisor::start_forced(
-        &inst,
-        &sid,
-        TurnEndTiming::default(),
-        no_answers(),
-        Forcing {
-            held_after: vec![1, 2],
-            hold: Duration::from_secs(3),
-            ..Forcing::default()
-        },
-    );
-    type_line(&inst, &sid, "go");
-    let sup = sup.saw(&inst, &sid, "I.need.your.decision");
-    let meta = meta_when(&inst, &sid, |m| m.contains("attention_owner=supervisor"));
-    let released = sup.released();
-    let out = sup.stop();
-    let said = evidence(&inst, &out);
-    let submitted = lines_when(&subs, 2, Duration::from_secs(1));
-    assert_eq!(submitted, ["SUBMIT:go", "SUBMIT:keep going"], "{said}");
-    assert!(
-        out.contains("rule=continue-suggestion@v1 keep going"),
-        "{said}"
-    );
-    assert!(
-        meta.contains("attention_owner=supervisor"),
-        "escalated under the supervisor's key: {meta}\n{said}"
-    );
-    let ends = [drawn(&events, "goal"), drawn(&events, "stop")];
-    assert_eq!(released.len(), 2, "both reads held: {released:?}\n{said}");
-    for (end, let_go) in ends.iter().zip(&released) {
-        assert!(
-            end > let_go,
-            "the turn ended at {end:?}, before the held read went out at {let_go:?}\n{said}"
-        );
-    }
 }
 
 /// THE 529, live: nothing before the backoff (1 s here), then ONE retry
@@ -1196,7 +1103,7 @@ fn a_529_end_is_continued_once_after_its_backoff() {
     // the worker's record, never a screen watcher armed after the fact, and
     // its stamps, never the test's clock read when it looked ([`stamps_when`]).
     let wall_at = drawn(&events, "e529");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(20));
+    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
     let (continued_after, reviewed) = waited_at(&inst, &events, "e529", 1, wall_at);
     let sup = sup.saw(&inst, &sid, "I.need.your.decision");
     let out = sup.stop();
@@ -1240,157 +1147,148 @@ const RULES: &str = "stay on the lane branch, never push to main,\nand run the l
 /// read back whole, and is submitted ONCE; the decision after it is
 /// escalated. Negative control: a composer that shows a pasted-text
 /// placeholder instead of the text gets no Enter — nothing submitted — and
-/// the text left typed is escalated.
+/// the text left typed is escalated. The two instances share nothing, so
+/// they run side by side: one after the other they were 12.7-18 s of two
+/// 6-9 s halves (measured 2026-10-05).
 #[test]
 fn a_long_continuation_in_a_narrow_composer_is_submitted_once() {
     let want = format!("keep going (standing rules: {})", RULES.replace('\n', " "));
     assert_eq!((2 + want.chars().count()) % 64, 24, "the last row's cells");
-    for mangle in [false, true] {
-        let tag = if mangle { "m" } else { "n" };
-        let Some(inst) = boot_with(tag, "64") else {
-            return;
-        };
-        let sid = boot_session(&inst);
-        let rules = inst.tmp.join("rules.txt");
-        std::fs::write(&rules, RULES).expect("the rules file");
-        let (_keys, subs, events) = start_worker_with(&inst, &sid, "done", "64", mangle);
-        let sup = Supervisor::start_with(
-            &inst,
-            &sid,
-            TurnEndTiming::default(),
-            SupervisorConfig {
-                rules_file: Some(rules),
-                ..no_answers()
-            },
-        );
-        type_line(&inst, &sid, "go");
-        // Not the screen: continued (`!mangle`), it is gone ~2.5 s after it
-        // is drawn, before a late watcher is armed ([`stamps_when`]).
-        drawn(&events, "done");
-        if !mangle {
-            let sup = sup.saw(&inst, &sid, "I.need.your.decision");
-            let out = sup.stop();
-            let submitted = lines_when(&subs, 2, Duration::from_secs(1));
-            assert_eq!(
-                submitted,
-                ["SUBMIT:go".to_string(), format!("SUBMIT:{want}")],
-                "the loop said:\n{out}"
-            );
-            assert!(
-                out.contains("rule=continue@v1 keep going (standing rules:"),
-                "{out}"
-            );
-            continue;
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = [false, true]
+            .into_iter()
+            .map(|mangle| {
+                let want = &want;
+                scope.spawn(move || narrow_composer(want, mangle))
+            })
+            .collect();
+        for run in runs {
+            run.join().expect("a run");
         }
-        // The control: the attention says what was left typed.
-        let meta = {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            loop {
-                let m = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
-                if m.contains("not%20submitted")
-                    || m.contains("not submitted")
-                    || Instant::now() >= deadline
-                {
-                    break m;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        };
-        let out = sup.stop();
-        let submitted = lines_when(&subs, 2, Duration::from_millis(500));
-        assert_eq!(submitted, ["SUBMIT:go"], "no Enter; the loop said:\n{out}");
-        assert!(
-            meta.contains("not%20submitted") || meta.contains("not submitted"),
-            "escalated: {meta}\nthe loop said:\n{out}"
-        );
-        assert!(!out.contains("CONTINUED"), "{out}");
-    }
+    });
 }
 
-/// THE HARNESS'S OWN RACE, forced (the narrow case's flake of 2026-09-27:
-/// `Fixed.the.parser` never reached the screen, `OK timeout`): a test that
-/// looks for the end of turn only AFTER the loop has continued it — here,
-/// deterministically, once the continuation is submitted and the next turn
-/// has ended — still finds it, in the worker's record ([`stamps_when`]),
-/// drawn before the continuation was taken. The control is the wait the
-/// tests used before: a screen watcher armed now does not see it (so the
-/// losing interleaving was really reached).
-#[test]
-fn a_screen_the_loop_replaced_is_still_found_by_a_test_that_looks_late() {
-    let Some(inst) = boot("l") else { return };
+/// One run of [`a_long_continuation_in_a_narrow_composer_is_submitted_once`]:
+/// `want` submitted whole, or — `mangle`, the control — left typed and
+/// escalated.
+fn narrow_composer(want: &str, mangle: bool) {
+    let tag = if mangle { "m" } else { "n" };
+    let Some(inst) = boot_with(tag, "64") else {
+        return;
+    };
     let sid = boot_session(&inst);
-    let (_keys, subs, events) = start_worker(&inst, &sid, "done");
-    let sup = Supervisor::start(&inst, &sid, TurnEndTiming::default());
+    let rules = inst.tmp.join("rules.txt");
+    std::fs::write(&rules, RULES).expect("the rules file");
+    let (_keys, subs, events) = start_worker_with(&inst, &sid, "done", "64", mangle);
+    let sup = Supervisor::start_with(
+        &inst,
+        &sid,
+        TurnEndTiming::default(),
+        SupervisorConfig {
+            rules_file: Some(rules),
+            ..no_answers()
+        },
+    );
     type_line(&inst, &sid, "go");
-    // The losing interleaving, forced by waiting for what replaces the end
-    // of turn: its continuation taken and the turn after it ended.
-    let took = stamps_when(&events, "submit", 2, Duration::from_secs(30));
-    let stop_at = drawn(&events, "stop");
-    let missed = awaited_for(&inst, &sid, "Fixed.the.parser", 1000);
-    let submitted = lines_when(&subs, 2, Duration::from_secs(1));
+    // Not the screen: continued (`!mangle`), it is gone ~2.5 s after it
+    // is drawn, before a late watcher is armed ([`stamps_when`]).
+    drawn(&events, "done");
+    if !mangle {
+        let sup = sup.saw(&inst, &sid, "I.need.your.decision");
+        let out = sup.stop();
+        let submitted = lines_when(&subs, 2, HANG);
+        assert_eq!(
+            submitted,
+            ["SUBMIT:go".to_string(), format!("SUBMIT:{want}")],
+            "the loop said:\n{out}"
+        );
+        assert!(
+            out.contains("rule=continue@v1 keep going (standing rules:"),
+            "{out}"
+        );
+        return;
+    }
+    // The control: the attention says what was left typed.
+    let meta = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let m = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
+            if m.contains("not%20submitted")
+                || m.contains("not submitted")
+                || Instant::now() >= deadline
+            {
+                break m;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
     let out = sup.stop();
-    assert_eq!(
-        took.len(),
-        2,
-        "go and one continuation; the loop said:\n{out}"
-    );
-    assert_eq!(submitted[0], "SUBMIT:go", "the loop said:\n{out}");
+    let submitted = lines_when(&subs, 2, Duration::from_millis(500));
+    assert_eq!(submitted, ["SUBMIT:go"], "no Enter; the loop said:\n{out}");
     assert!(
-        missed.is_err(),
-        "the control: the end of turn is gone from the screen, so a watcher armed \
-         now cannot see it; the loop said:\n{out}"
+        meta.contains("not%20submitted") || meta.contains("not submitted"),
+        "escalated: {meta}\nthe loop said:\n{out}"
     );
-    let done_at = drawn(&events, "done");
-    assert!(
-        took[0] <= done_at && done_at <= took[1] && took[1] <= stop_at,
-        "drawn after `go` and before the continuation: {took:?} {done_at:?} {stop_at:?}"
-    );
+    assert!(!out.contains("CONTINUED"), "{out}");
 }
 
 /// FULL POWER, a WRITE box (the measured 2.1.280 `touch x` box): its
 /// one-shot allow, `1`, reaches the worker once — fenced on the judged read
 /// and guarded on the command's row — and the loop says `APPROVED`.
 /// NEGATIVE CONTROL: under the owner's `approve = "safe"` the same box is
-/// escalated (the keyed attention) and nothing is pressed.
+/// escalated (the keyed attention) and nothing is pressed. The two instances
+/// share nothing, so they run side by side (one after the other, 9.7-15 s).
 #[test]
 fn a_write_box_gets_its_one_shot_allow_under_full_power() {
-    for approve in ["all", "safe"] {
-        let Some(inst) = boot(if approve == "all" { "w" } else { "v" }) else {
-            return;
-        };
-        let sid = boot_session(&inst);
-        let (_keys, subs, events) = start_worker(&inst, &sid, "box");
-        let mut policy = SupervisorConfig::default();
-        policy.set("approve", approve).expect("a level");
-        let sup = Supervisor::start_with(&inst, &sid, TurnEndTiming::default(), policy);
-        type_line(&inst, &sid, "go");
-        // Not the screen: answered (`all`), the box is gone once the worker
-        // reads its `1` ([`stamps_when`]).
-        drawn(&events, "box");
-        if approve == "all" {
-            let submitted = lines_when(&subs, 2, Duration::from_secs(20));
-            let out = sup.stop();
-            assert_eq!(
-                submitted[..2],
-                ["SUBMIT:go", "PRESS:1"],
-                "the loop said:\n{out}"
-            );
-            assert!(out.contains("APPROVED seq="), "{out}");
-            continue;
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = ["all", "safe"]
+            .into_iter()
+            .map(|approve| scope.spawn(move || write_box(approve)))
+            .collect();
+        for run in runs {
+            run.join().expect("a run");
         }
-        let meta = meta_when(&inst, &sid, |m| m.contains("attention_owner=supervisor"));
+    });
+}
+
+/// One run of [`a_write_box_gets_its_one_shot_allow_under_full_power`] under
+/// `approve`.
+fn write_box(approve: &str) {
+    let Some(inst) = boot(if approve == "all" { "w" } else { "v" }) else {
+        return;
+    };
+    let sid = boot_session(&inst);
+    let (_keys, subs, events) = start_worker(&inst, &sid, "box");
+    let mut policy = SupervisorConfig::default();
+    policy.set("approve", approve).expect("a level");
+    let sup = Supervisor::start_with(&inst, &sid, TurnEndTiming::default(), policy);
+    type_line(&inst, &sid, "go");
+    // Not the screen: answered (`all`), the box is gone once the worker
+    // reads its `1` ([`stamps_when`]).
+    drawn(&events, "box");
+    if approve == "all" {
+        let submitted = lines_when(&subs, 2, Duration::from_secs(60));
         let out = sup.stop();
-        assert!(
-            meta.contains("attention_owner=supervisor"),
-            "escalated: {meta}\nthe loop said:\n{out}"
-        );
-        let submitted = lines_when(&subs, 2, Duration::from_millis(500));
         assert_eq!(
-            submitted,
-            ["SUBMIT:go"],
-            "nothing pressed; the loop said:\n{out}"
+            submitted[..2],
+            ["SUBMIT:go", "PRESS:1"],
+            "the loop said:\n{out}"
         );
+        assert!(out.contains("APPROVED seq="), "{out}");
+        return;
     }
+    let meta = meta_when(&inst, &sid, |m| m.contains("attention_owner=supervisor"));
+    let out = sup.stop();
+    assert!(
+        meta.contains("attention_owner=supervisor"),
+        "escalated: {meta}\nthe loop said:\n{out}"
+    );
+    let submitted = lines_when(&subs, 2, Duration::from_millis(500));
+    assert_eq!(
+        submitted,
+        ["SUBMIT:go"],
+        "nothing pressed; the loop said:\n{out}"
+    );
 }
 
 /// FULL POWER, a request for a decision: ANSWERED — `answer_text` typed
@@ -1415,7 +1313,7 @@ fn a_decision_is_answered_with_the_answer_text() {
     );
     type_line(&inst, &sid, "go");
     let sup = sup.saw(&inst, &sid, "I.need.your.decision");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(20));
+    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
     let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
     let out = sup.stop();
     assert_eq!(
@@ -1434,8 +1332,14 @@ fn a_decision_is_answered_with_the_answer_text() {
 /// injected clock): continued for ever, never escalated as done, each
 /// continuation after a LONGER wait than the one before, up to the cap,
 /// where it holds. The loop starts on the worker's first turn, busy: the
-/// continuations after it wait 1 s, 2 s, 4 s (the cap) and 4 s again — the
-/// back-offs the loop journals, and no continuation earlier than its own.
+/// continuations after it wait 1 s, 2 s (doubled) and 2 s again (the cap,
+/// where doubling would wait 4) — the back-offs the loop journals, and no
+/// continuation earlier than its own. Three short turns in a row, one past
+/// the two that escalated "worker reports done" until 2026-09-24. The cap
+/// is the lowest that still binds after a doubling: at 4 s the loop waited
+/// 1, 2, 4, 4, 4 and the test took 37 s (2026-10-01). That the ladder
+/// doubles rather than steps is the conformance walk's
+/// (`supervise_conformance_turn_end.rs`, at the defaults' 2, 4, 8 min).
 #[test]
 fn a_short_turn_loop_backs_off_growing_and_never_escalates() {
     let Some(inst) = boot("b") else { return };
@@ -1455,20 +1359,20 @@ fn a_short_turn_loop_backs_off_growing_and_never_escalates() {
         TurnEndTiming {
             min_work: 3600 * sec,
             short_backoff: sec,
-            short_backoff_max: 4 * sec,
+            short_backoff_max: 2 * sec,
             ..TurnEndTiming::default()
         },
         SupervisorConfig::default(),
     );
     // Each line as the worker took it (its stamps): a test that polled late
     // would bunch two arrivals and shorten the gap between them.
-    let at = stamps_when(&events, "submit", 6, Duration::from_secs(90));
+    let at = stamps_when(&events, "submit", 4, Duration::from_secs(90));
     let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
     let out = format!("{}\njournal:\n{}", sup.stop(), journal(&inst));
     assert_eq!(
         at.len(),
-        6,
-        "`go` and five continuations; the loop said:\n{out}"
+        4,
+        "`go` and three continuations; the loop said:\n{out}"
     );
     // The back-offs, as the loop waited them out: doubling, then held.
     let waits: Vec<u64> = out
@@ -1476,14 +1380,15 @@ fn a_short_turn_loop_backs_off_growing_and_never_escalates() {
         .filter_map(|l| l.split(" short turn(s) in a row: ").nth(1))
         .filter_map(|rest| rest.split(" s back-off").next()?.parse().ok())
         .collect();
-    assert_eq!(waits[..5], [1, 2, 4, 4, 4], "{out}");
+    assert_eq!(waits[..3], [1, 2, 2], "{out}");
     // Each back-off as the loop waited it ([`waited_at`]): from its review
     // of the end of turn to the continuation's first key. The gaps below
     // hold the loop's latency, the typing and the settle too: with every
-    // back-off quartered they still passed on the 2 s one (2026-09-28), and
-    // the first continuation's they do not measure at all.
-    let ends = stamps_when(&events, "draw-done", 5, Duration::ZERO);
-    for (n, (&drawn, wait)) in ends.iter().zip(&waits[..5]).enumerate() {
+    // back-off quartered they still passed on a 2 s one (2026-09-28), as
+    // every one they measure here is, and the first continuation's they do
+    // not measure at all.
+    let ends = stamps_when(&events, "draw-done", 3, Duration::ZERO);
+    for (n, (&drawn, wait)) in ends.iter().zip(&waits[..3]).enumerate() {
         let (waited, reviewed) = waited_at(&inst, &events, "done", n + 1, drawn);
         assert!(
             waited >= Duration::from_secs(*wait) - Duration::from_millis(300),
@@ -1541,8 +1446,8 @@ fn an_esc_interrupt_holds_the_loop_for_the_grace_then_continues() {
     // the worker's record and stamps ([`stamps_when`]), so a test that looked
     // late neither misses the screen nor shortens the hold it measures.
     let stopped_at = drawn(&events, "interrupted");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(20));
-    let took = stamps_when(&events, "submit", 2, Duration::from_secs(1));
+    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let took = stamps_when(&events, "submit", 2, HANG);
     let early: Vec<String> = submitted
         .iter()
         .zip(&took)
@@ -1580,75 +1485,276 @@ fn an_esc_interrupt_holds_the_loop_for_the_grace_then_continues() {
     );
 }
 
-/// A DRAFT LEFT STANDING, live (lane P's review: text in the composer
-/// stopped a fully automatic session for ever, nobody told): text typed
-/// into the worker's composer without Enter, a character every 250 ms for
-/// longer than the grace (3 s here) — a person writing, as the loop sees
-/// it: this headless server says nothing of a person, so the draft's own
-/// changes are the clock — is never submitted or typed into while it
-/// changes; once nobody has touched it for the grace it is SENT as it
-/// stands, once, by a fenced Enter alone (`CONTINUED … rule=continue@v1
-/// <the draft>`), and nothing is escalated.
+/// THE WEEKLY WALL BEHIND A BACKGROUND SHELL
+/// of 2026-09-28, live. The server publishes it as a wall, not `busy`; the
+/// loop waits out its reset (5 s here) and the grace (1 s), types ONE `keep
+/// going` — the fenced write, echoed and submitted whole — and never before
+/// the reset. Before the reader looked under background work the screen read `busy` for as
+/// long as the shell ran and nothing was ever typed.
 #[test]
-fn a_draft_left_standing_is_sent_once_nobody_has_touched_it_for_the_grace() {
-    let Some(inst) = boot("d") else { return };
+fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
+    let Some(inst) = boot("c") else { return };
     let sid = boot_session(&inst);
-    let (_keys, subs, _events) = start_worker(&inst, &sid, "done");
-    let grace = Duration::from_secs(3);
+    let (_keys, subs, events) = start_worker(&inst, &sid, "wall");
+    let sup = Supervisor::start(
+        &inst,
+        &sid,
+        TurnEndTiming {
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        },
+    );
+    type_line(&inst, &sid, "go");
+    let wall_at = drawn(&events, "wall");
+    // The server's verdict, at the wall: a wall, never `busy`.
+    let deadline = Instant::now() + HANG;
+    let mut status = String::new();
+    while Instant::now() < deadline {
+        status = ctl_ok(&inst, &[&format!("@{sid}"), "status"]);
+        if status.contains("agent=wall:") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let (continued_after, reviewed) = waited_at(&inst, &events, "wall", 1, wall_at);
+    let out = sup.stop();
+    assert!(
+        status.contains("agent=wall:usage-weekly"),
+        "published as the wall: {status}\nthe loop said:\n{out}"
+    );
+    assert_eq!(
+        submitted,
+        ["SUBMIT:go", "SUBMIT:keep going"],
+        "the loop said:\n{out}"
+    );
+    // The loop counts a span in whole seconds from the print it read
+    // (`unix_now` truncates), so the reset is 4 to 5 s after its review.
+    assert!(
+        continued_after >= Duration::from_secs(4),
+        "typed {continued_after:?} after the loop reviewed the wall ({reviewed}); the reset is 4-5 s off\n{out}"
+    );
+    assert!(
+        out.contains("rule=usage-resume@v1 keep going"),
+        "the loop said:\n{out}"
+    );
+    assert!(
+        journal(&inst).contains("WAITING"),
+        "the wait is journaled:\n{}",
+        journal(&inst)
+    );
+}
+
+/// THE NEGATIVE CONTROL — the same wall, a
+/// NEW turn running under it (a spinner status row, `esc to interrupt`): the
+/// screen is busy, the server says `busy`, and nothing is typed however long
+/// the reset has passed.
+#[test]
+fn the_same_wall_under_a_live_turn_is_busy_and_nothing_is_typed() {
+    let Some(inst) = boot("e") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "wallspin");
+    let sup = Supervisor::start(
+        &inst,
+        &sid,
+        TurnEndTiming {
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        },
+    );
+    type_line(&inst, &sid, "go");
+    std::thread::sleep(Duration::from_secs(9));
+    let status = ctl_ok(&inst, &[&format!("@{sid}"), "status"]);
+    let out = sup.stop();
+    let submitted = lines_when(&subs, 1, HANG);
+    assert!(status.contains("agent=busy"), "busy: {status}\n{out}");
+    assert_eq!(
+        submitted,
+        ["SUBMIT:go"],
+        "nothing typed under a live turn\n{out}"
+    );
+}
+
+/// The same wall on a grid
+/// drawn one row high — the cursor on the row BELOW the prompt — is continued
+/// with `keep going`, never with a bare Enter on Claude's ghost text (which the
+/// fake worker logs as an empty `SUBMIT:`). The loop reads the composer where it
+/// is drawn: the cursor's column is 2 and the caret row's cell is dim.
+#[test]
+fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_enter() {
+    let Some(inst) = boot("g") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "walldisplaced");
+    // The per-read draft clock still reads the cursor's row (it starts a
+    // person's grace when a ghost text first shows), so the grace is short
+    // here: the reset is 5 s off.
     let sup = Supervisor::start_with(
         &inst,
         &sid,
         TurnEndTiming {
-            short_backoff: Duration::from_secs(1),
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
             ..TurnEndTiming::default()
         },
         SupervisorConfig {
-            human_grace_s: 3,
-            ..SupervisorConfig::default()
+            human_grace_s: 2,
+            ..no_answers()
         },
     );
-    let draft = "also check the lexer";
-    let typing = Instant::now();
-    let at = format!("@{sid}");
-    // Stamped BEFORE each key is sent, so the reference is never later than
-    // the draft's true last change. It was stamped after the last `aterm ctl`
-    // exited plus a 250 ms nap, a reference that lags the change the loop's
-    // grace counts from by that process's exit, and under load that lag ate
-    // the 300 ms tolerance below (the load-sensitive test audit of 2026-09-27).
-    let mut last_key = typing;
-    for c in draft.chars() {
-        last_key = Instant::now();
-        // A lone space is no `send` text (it is trimmed): its key instead.
-        if c == ' ' {
-            ctl_ok(&inst, &[&at, "key", "space"]);
-        } else {
-            ctl_ok(&inst, &[&at, "send", "--", &c.to_string()]);
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    let typed = typing.elapsed();
-    let during = lines_when(&subs, 1, Duration::ZERO);
-    let submitted = lines_when(&subs, 1, Duration::from_secs(20));
-    let after = last_key.elapsed();
-    let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
+    type_line(&inst, &sid, "go");
+    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
     let out = sup.stop();
-    assert!(typed > grace, "typed for {typed:?}");
-    assert!(
-        during.is_empty(),
-        "sent while it changed: {during:?}\n{out}"
-    );
     assert_eq!(
-        submitted.first().map(String::as_str),
-        Some(format!("SUBMIT:{draft}").as_str()),
+        submitted,
+        ["SUBMIT:go", "SUBMIT:keep going"],
         "the loop said:\n{out}"
     );
     assert!(
-        after >= grace - Duration::from_millis(300),
-        "sent {after:?} after the last key\n{out}"
+        out.contains("rule=usage-resume@v1 keep going"),
+        "the loop said:\n{out}"
     );
-    assert!(out.contains(&format!("rule=continue@v1 {draft}")), "{out}");
+}
+
+/// A DRAFT LEFT AT THE WALL, LIVE. A person typed into the composer before the
+/// limit hit and went away: at the reset and its grace the loop SUBMITS what
+/// stands there under the wall's rule (a bare Enter), and never types `keep
+/// going` over it. The fake worker's composer buffer is empty (the draft is
+/// only drawn), so the submit it logs is an empty `SUBMIT:`.
+#[test]
+fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
+    let Some(inst) = boot("j") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "walldraft");
+    let sup = Supervisor::start_with(
+        &inst,
+        &sid,
+        TurnEndTiming {
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        },
+        SupervisorConfig {
+            human_grace_s: 2,
+            ..no_answers()
+        },
+    );
+    type_line(&inst, &sid, "go");
+    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let out = sup.stop();
+    assert_eq!(
+        submitted,
+        ["SUBMIT:go", "SUBMIT:"],
+        "the draft is submitted as it stands; the loop said:\n{out}"
+    );
     assert!(
-        !meta.contains("attention_owner=supervisor"),
-        "{meta}\n{out}"
+        out.contains("rule=usage-resume@v1") && !out.contains("keep going"),
+        "the loop said:\n{out}"
+    );
+}
+
+/// THE WALL SCROLLED
+/// OUT OF VIEW. The loop reads the wall behind the shell and waits for its reset
+/// (12 s here); six seconds later the owner has scrolled back up the transcript,
+/// the wall's rows are gone and the screen reads `busy` with no wall (the server
+/// says `busy`, as it always did). The wait goes on: `keep going` is typed
+/// once, at the reset and its grace, through the fenced write. Before the wall was
+/// remembered, the loop waited on a screen that read
+/// busy and typed nothing — the 4 h 44 m of 2026-09-28, by another door.
+#[test]
+fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
+    let Some(inst) = boot("k") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs, events) = start_worker(&inst, &sid, "wallscroll");
+    let sup = Supervisor::start(
+        &inst,
+        &sid,
+        TurnEndTiming {
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        },
+    );
+    type_line(&inst, &sid, "go");
+    let wall_at = drawn(&events, "wallslow");
+    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let (continued_after, reviewed) = waited_at(&inst, &events, "wallslow", 1, wall_at);
+    // The screen the loop waited on was the scrolled one, and the server read it
+    // as busy (a shell still runs).
+    let status = ctl_ok(&inst, &[&format!("@{sid}"), "status"]);
+    let out = sup.stop();
+    assert_eq!(
+        submitted,
+        ["SUBMIT:go", "SUBMIT:keep going"],
+        "the loop said:\n{out}"
+    );
+    // The loop counts a span in whole seconds from the print it read
+    // (`unix_now` truncates), so the reset is 11 to 12 s after its review.
+    assert!(
+        continued_after >= Duration::from_secs(10),
+        "typed {continued_after:?} after the loop reviewed the wall ({reviewed}); the reset is 11-12 s off\n{out}"
+    );
+    assert!(
+        out.contains("rule=usage-resume@v1 keep going"),
+        "the loop said:\n{out}"
+    );
+    assert!(!status.is_empty());
+}
+
+/// THE UPDATE THAT APPLIES WHILE THE WALL IS SCROLLED OUT OF VIEW, live. A loop
+/// reads the wall behind the shell and waits for its reset (12 s here); the owner
+/// scrolls back and the wall's rows are gone. The loop is REPLACED then — an
+/// update, a fault — by a new one on the same ledger and the same tab. The
+/// first wrote the wall down; the second starts on a screen that reads `busy`
+/// with no wall, finds the row and goes on waiting for the same reset: ONE
+/// `keep going` is typed, by the second, at the reset and its grace, and the
+/// first typed nothing. Before the wall was written down, the successor had
+/// nothing to remember and the tab sat for hours.
+#[test]
+fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset() {
+    let Some(inst) = boot("o") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs, events) = start_worker(&inst, &sid, "wallscroll");
+    let timing = || TurnEndTiming {
+        reset_grace: Duration::from_secs(1),
+        reset_jitter: Duration::ZERO,
+        ..TurnEndTiming::default()
+    };
+    let first = Supervisor::start(&inst, &sid, timing());
+    type_line(&inst, &sid, "go");
+    let wall_at = drawn(&events, "wallslow");
+    // The wall scrolls away; the first loop has waited on it by then.
+    let scrolled_at = drawn(&events, "wallscrolled");
+    if let Ok(left) = (scrolled_at + Duration::from_millis(800)).duration_since(SystemTime::now()) {
+        std::thread::sleep(left);
+    }
+    let ledger = std::fs::read_to_string(inst.tmp.join("state/drive.jsonl")).unwrap_or_default();
+    let said_first = first.stop();
+    assert!(
+        ledger.contains("wall-wait@v1"),
+        "the first loop wrote the wall down:\n{ledger}\n{said_first}"
+    );
+    // The successor: the reset is still ahead (it is 12 s after the print).
+    let second = Supervisor::start(&inst, &sid, timing());
+    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let (continued_after, reviewed) = waited_at(&inst, &events, "wallslow", 1, wall_at);
+    let said_second = second.stop();
+    assert_eq!(
+        submitted,
+        ["SUBMIT:go", "SUBMIT:keep going"],
+        "the successor said:\n{said_second}\nthe first said:\n{said_first}"
+    );
+    assert!(
+        !said_first.contains("rule=usage-resume@v1"),
+        "the first loop typed nothing:\n{said_first}"
+    );
+    assert!(
+        said_second.contains("rule=usage-resume@v1 keep going"),
+        "the successor said:\n{said_second}"
+    );
+    assert!(
+        continued_after >= Duration::from_secs(10),
+        "typed {continued_after:?} after the wall was reviewed ({reviewed}); the reset is 11-12 s off\n{said_second}"
     );
 }

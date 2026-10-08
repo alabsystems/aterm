@@ -1,55 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The front door's WINDOWING grammar and routing POLICY — `aterm new-tab`,
-//! `aterm new-window`, `aterm split-pane`, and the one rule that decides whether
-//! such a request starts a process or is handed to the aterm already running.
+//! The front door's windowing grammar and routing policy: `aterm new-tab`,
+//! `aterm new-window`, `aterm split-pane`, and the rule that decides whether a
+//! request starts a process or is handed to a running aterm (via the control
+//! socket's `spawn` verb), in the style of Windows Terminal's `wt`.
 //!
-//! ## Why this exists
+//! This is a configurable policy, not a single-instance mutex: several
+//! instances co-existing is a supported configuration (an agent may run its own
+//! on its own `--control-sock`), so a second instance is never prevented, only
+//! not started when the operator asked for attach behaviour and an instance is
+//! reachable.
 //!
-//! On Windows the established convention is Windows Terminal's: `wt` from any
-//! shell routes into the running instance, and `wt new-tab -d <dir>` is how a
-//! script, a file-manager verb, or a taskbar task opens a terminal *where you
-//! already are*. aterm had the capability and none of the front door: the
-//! control socket has answered `spawn cwd=<path>` from any shell for a long
-//! time (that is exactly what `aterm ctl spawn` does), but the `aterm` command
-//! itself only ever knew how to become a brand-new process.
+//! The default is `new_window` (WT's `useNew`), which is the plain launch
+//! behaviour on every platform.
 //!
-//! ## Policy, not a mutex
-//!
-//! The obvious Windows shape — `CreateMutexW` at startup, and the loser posts
-//! its argv to the winner — was considered and REJECTED. aterm is not a
-//! one-window app: `fleet_watch` is a whole sibling-discovery subsystem, the
-//! control socket already enumerates every live instance deterministically, and
-//! several instances co-existing is a supported, used configuration (an agent
-//! launches its own instance on its own `--control-sock`). A named mutex
-//! would make "there can be only one" a process-lifetime FACT enforced below
-//! all of that, instead of a preference the operator states. So the second
-//! instance is never prevented from existing — it is simply not *started* when
-//! the operator asked for attach behaviour and an instance is reachable.
-//!
-//! ## The default is `new_window`, deliberately
-//!
-//! WT itself defaults to `windowingBehavior: useNew`, and — more importantly —
-//! `new_window` is byte-for-byte today's behaviour on every platform. Flipping
-//! the default would change what happens when an existing user types `aterm`,
-//! which is precisely the class of surprise a terminal must not spring. Both
-//! policies are implemented; the safe one ships on.
-//!
-//! Everything in this module is PURE — a parse and a three-input decision — so
-//! the grammar and the routing rule are unit-testable without a socket, a
-//! window, or a config file.
+//! Everything here is pure (a parse and a three-input decision), unit-testable
+//! without a socket, window or config file.
 
-/// Where a windowing request should be served.
-///
-/// The whole routing decision is [`route_launch`]; this is its result. Two
-/// variants and no third: "forward, and if that fails start one anyway" is a
-/// FALLBACK the caller applies after a forward errors, not a route — modelling
-/// it here would hide a real failure (an instance that answered `ERR`) behind a
-/// silently different outcome.
+/// Where a windowing request should be served; the result of [`route_launch`].
+/// "Forward, else start one" is a fallback the caller applies after a forward
+/// errors, not a route, so a real failure is not hidden.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum WindowRoute {
-    /// Start a new aterm window in THIS process (today's behaviour).
+    /// Start a new aterm window in this process.
     Spawn,
     /// Hand the request to the running instance over the control socket and exit.
     Forward,
@@ -59,24 +33,18 @@ pub enum WindowRoute {
 /// `new-tab` / `split-pane`) should do when an aterm is already running.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum WindowingBehavior {
-    /// Every launch is its own window and its own process. THE DEFAULT — this
-    /// is what aterm has always done, so an existing install cannot change
-    /// behaviour by upgrading into this feature.
+    /// Every launch is its own window and process. The default.
     #[default]
     NewWindow,
     /// A launch joins the running instance (a new tab there) and exits; with no
-    /// instance reachable it starts one, so the FIRST launch still works.
+    /// instance reachable it starts one, so the first launch still works.
     Attach,
 }
 
 impl WindowingBehavior {
     /// Parse one config value, case-insensitively and trimmed. `None` for an
-    /// unrecognized spelling so the caller can say so out loud rather than
-    /// silently picking a behaviour the operator did not ask for.
-    ///
-    /// The `useNew` / `useExisting` aliases are Windows Terminal's own spellings
-    /// for the same two choices. Someone porting a `settings.json` habit should
-    /// not have to discover that aterm renamed the values.
+    /// unrecognized spelling so the caller can report it. Windows Terminal's
+    /// `useNew` / `useExisting` are accepted as aliases.
     #[must_use]
     pub fn parse(raw: &str) -> Option<WindowingBehavior> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -91,40 +59,34 @@ impl WindowingBehavior {
     }
 }
 
-/// What kind of terminal the invocation asked for. The routing input that is
-/// NOT a policy: three of these come from an explicit verb, the fourth is a
-/// plain `aterm` launch that carries no other instruction.
+/// What kind of terminal the invocation asked for: three explicit verbs, or a
+/// plain `aterm` launch.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum LaunchIntent {
     /// `aterm new-tab` — a tab, wherever the policy says tabs go.
     NewTab,
-    /// `aterm new-window` — a window, unconditionally. The escape hatch that
-    /// makes `attach` safe to turn on: there is always a way to say "no, a
-    /// SEPARATE one", and it is the same word Windows Terminal uses.
+    /// `aterm new-window`: a window, unconditionally, so `attach` always has an
+    /// escape (the same word Windows Terminal uses).
     NewWindow,
     /// `aterm split-pane` — a pane beside the focused one.
     SplitPane,
-    /// A bare window launch with nothing else asked of it (no `-e`, no
-    /// `--headless`, no diagnostics). Only THIS shape is policy-eligible; see
-    /// [`plain_launch_is_policy_eligible`] for why the gate is so narrow.
+    /// A bare window launch with nothing else asked of it (no `-e`,
+    /// `--headless`, diagnostics). The only policy-eligible plain shape; see
+    /// [`plain_launch_is_policy_eligible`].
     Plain,
 }
 
-/// THE ROUTING DECISION. Pure: policy + what was asked + whether anyone is home.
+/// The routing decision. Pure: policy + what was asked + whether an instance
+/// is reachable.
 ///
-/// * `NewWindow` is never forwarded. A verb that names the outcome outranks a
-///   preference about the outcome — otherwise `attach` would be a trap with no
-///   way out, and the jump list's "New Window" task would be a lie.
-/// * `NewTab` / `SplitPane` / `Plain` forward only under `attach`, and only when
-///   an instance actually answered. Under the default `new_window` they spawn,
-///   which is exactly what they do today.
-/// * Nothing reachable always means spawn — the first launch of the day must
-///   work identically under both policies.
+/// * `NewWindow` is never forwarded: a verb naming the outcome outranks the
+///   preference.
+/// * `NewTab` / `SplitPane` / `Plain` forward only under `attach` and only when
+///   an instance answered; under `new_window` they spawn.
+/// * Nothing reachable always means spawn.
 ///
-/// A `SplitPane` that spawns has nothing to split (a brand-new window is one
-/// pane). That is not a bug being papered over: it is what `wt split-pane`
-/// does under `useNew` too, and the caller says so on stderr rather than
-/// pretending a split happened.
+/// A `SplitPane` that spawns has nothing to split (as `wt split-pane` under
+/// `useNew`); the caller says so on stderr.
 #[must_use]
 pub fn route_launch(
     intent: LaunchIntent,
@@ -170,46 +132,24 @@ impl SplitOrientation {
 pub struct WindowRequest {
     /// What was asked for.
     pub intent: LaunchIntent,
-    /// The `-d <dir>` starting directory, already made ABSOLUTE by the caller's
-    /// own cwd. Absolute is not cosmetic: the request may be served by a process
-    /// whose working directory is somewhere else entirely, so a relative path
-    /// would land in a different place depending on who answered it.
+    /// The `-d <dir>` starting directory, already made absolute, since the
+    /// serving process may have a different working directory.
     pub dir: Option<String>,
-    /// `split-pane`'s orientation; meaningless for the other verbs and ignored
-    /// there rather than rejected (a caller building requests generically should
-    /// not have to special-case the field).
+    /// `split-pane`'s orientation; ignored (not rejected) for other verbs.
     pub split: SplitOrientation,
 }
 
 impl WindowRequest {
-    /// The control-socket request line that asks a RUNNING instance to serve
-    /// this — the `spawn` verb, which opens a tab in the frontmost window
-    /// (`spawn split=<v|h>` splits the focused pane instead).
+    /// The control-socket request line asking a running instance to serve
+    /// this: `spawn` opens a tab in the frontmost window (`spawn split=<v|h>`
+    /// splits the focused pane).
     ///
-    /// The cwd is quoted ONLY WHEN IT HAS TO BE — i.e. when it contains
-    /// whitespace. The control protocol is newline-delimited and otherwise
-    /// whitespace-split, so `cwd=C:\Program Files\Git` would arrive as two
-    /// tokens and be rejected as a usage error, which is most of the Windows
-    /// paths anyone actually types; `cwd="…"` is the additive form the server
-    /// learned alongside this grammar.
+    /// The cwd is quoted (`cwd="…"`) only when it contains whitespace, since the
+    /// protocol is whitespace-split; the unquoted form also reaches older
+    /// servers, which take the value verbatim, quotes included.
     ///
-    /// Quoting only on demand is a MIXED-VERSION rule, not tidiness. A new front
-    /// door can be talking to an instance that has been running since before the
-    /// quoted form existed (an upgrade replaces the binary; it does not restart
-    /// the windows). That older server strips `cwd=` and takes the rest
-    /// verbatim, quotes included, so an unconditionally-quoted space-free path
-    /// would open a tab in a directory literally named `"C:\Windows"`. Emitting
-    /// the byte-identical historical form whenever it is legal means the common
-    /// case is exactly as correct against an old server as against a new one,
-    /// and only the case that ALREADY failed there (a path with a space) depends
-    /// on the new parser.
-    ///
-    /// Returns `Err` for a directory that cannot be framed at all: a `"` (which
-    /// no Windows path may contain) would close the quoted value early, and a
-    /// newline would inject a SECOND authenticated verb into the stream. Both
-    /// are refused loudly here rather than encoded — the alternative, an escape
-    /// vocabulary in the wire format, is a protocol change this feature does not
-    /// need.
+    /// Returns `Err` for a directory that cannot be framed: a `"` would close
+    /// the quoted value and a newline would inject a second authenticated verb.
     pub fn control_request(&self) -> Result<String, String> {
         let mut line = String::from("spawn");
         if self.intent == LaunchIntent::SplitPane {
@@ -237,11 +177,8 @@ impl WindowRequest {
         Ok(line)
     }
 
-    /// The argument list for the SPAWN route — the window library's own
-    /// `-d/--working-directory` flag, so the started window opens where the
-    /// forwarded tab would have. Deliberately nothing else: the spawn arm must
-    /// stay byte-identical to `aterm --window [-d <dir>]`, the path every one of
-    /// these verbs already had before the grammar existed.
+    /// The argument list for the spawn route: only the window's own
+    /// `-d/--working-directory`, so it matches `aterm --window [-d <dir>]`.
     #[must_use]
     pub fn window_args(&self) -> Vec<std::ffi::OsString> {
         match &self.dir {
@@ -259,29 +196,25 @@ impl WindowRequest {
 pub fn window_verb_usage(verb: &str) -> String {
     let mut s = String::from("usage: aterm ");
     s.push_str(verb);
-    s.push_str(" [-d <dir>]");
     if verb == "split-pane" {
         s.push_str(" [-H|-V]");
     }
+    s.push_str(" [-d <dir>]");
     s
 }
 
-/// Parse `aterm <verb> [args…]` — the wt-shaped grammar.
+/// Parse `aterm <verb> [args…]`, the wt-shaped grammar.
 ///
 /// `-d <dir>` / `-d=<dir>` / `--directory` / `--working-directory` /
-/// `--startingDirectory` all name the starting directory. The long spellings
-/// are aterm's own (`--working-directory` is the window library's flag, so the
-/// front door and the window agree) plus Windows Terminal's
-/// (`--startingDirectory`), because the whole point of this grammar is that a
-/// `wt` habit works here.
+/// `--startingDirectory` all name the starting directory (aterm's window flag
+/// plus Windows Terminal's spelling).
 ///
-/// `resolve_dir` turns the raw argument into the absolute path the request will
-/// carry — injected rather than called so the parse stays pure and testable
-/// with no filesystem. It returns `Err(message)` for a value that is not a
-/// usable directory.
+/// `resolve_dir` turns the raw argument into the absolute path the request
+/// carries (injected so the parse stays pure); it returns `Err(message)` for a
+/// value that is not a usable directory.
 ///
-/// Unknown options are REFUSED, not ignored. A silently dropped `-d` opens a
-/// terminal in the wrong directory, which looks like the verb worked.
+/// Unknown options are refused, not ignored: a dropped `-d` would open in the
+/// wrong directory.
 pub fn parse_window_request<F>(
     verb: &str,
     args: &[std::ffi::OsString],
@@ -350,63 +283,38 @@ where
     Ok(WindowRequest { intent, dir, split })
 }
 
-/// The AMBIENT facts the plain-launch gate consults, gathered by the caller so
-/// [`plain_launch_is_policy_eligible`] itself stays a pure function of its
-/// inputs. A struct rather than a row of bare booleans because each one is a
-/// separate hazard with its own reason, and a call site reading
-/// `(scan, true, false)` says nothing about which is which.
+/// The ambient facts the plain-launch gate consults, gathered by the caller so
+/// [`plain_launch_is_policy_eligible`] stays pure. Named fields rather than
+/// bare booleans, one per hazard.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct LaunchEnv {
-    /// `$ATERM_UPDATED_FROM` is set — this process is an update SUCCESSOR,
+    /// `$ATERM_UPDATED_FROM` is set — this process is an update successor,
     /// re-spawned by the outgoing one with its argv verbatim to finish an apply.
     pub updated_from: bool,
 }
 
-/// The `-d <dir>` spellings a PLAIN launch may carry and still be policy-eligible.
-///
-/// Deliberately just the two the window's own parser accepts (`crates/aterm-gui/
-/// src/cli.rs`), and NOT the wider set the explicit verbs take (`--directory`,
-/// `--startingDirectory`, and the `=`-joined forms). The verbs can afford the
-/// wider grammar because the front door resolves the value itself and hands the
-/// spawned window a canonical `-d <dir>`; a plain launch is passed through
-/// VERBATIM on the spawn route, so a spelling the window rejects must not be
-/// eligible either — otherwise the same argv opens a terminal under `attach` and
-/// dies with "unknown option" under the default, which is the one thing a
-/// routing policy must never do.
+/// The `-d <dir>` spellings a plain launch may carry and stay policy-eligible:
+/// only the two the window's parser accepts (`crates/aterm-gui/src/cli.rs`). A
+/// plain launch is passed through verbatim on the spawn route, so a spelling
+/// the window rejects must not be forwardable under `attach` either.
 const PLAIN_LAUNCH_DIR_FLAGS: &[&str] = &["-d", "--working-directory"];
 
-/// Whether a plain (verb-less) window launch may be routed by policy at all.
+/// Whether a plain (verb-less) window launch may be routed by policy.
 ///
-/// The gate is deliberately paranoid, and every excluded token is a real hazard
-/// rather than a hypothetical one:
+/// Excluded, each for a concrete reason:
 ///
-/// * `-e` / `--command` / `--` open a payload boundary — a whole child command
-///   line. `spawn` cannot carry one, so forwarding would silently drop the
-///   command the operator asked to run.
-/// * `--headless` asks for an engine + control socket with no window.
-///   Forwarding would answer with a TAB in someone's window — the exact opposite
-///   — and CI would hang waiting for a process that already exited. It is an
-///   unrecognized token below, so it fails closed; the flag is the one spelling
-///   (no environment variable arms headless, 2026-09-24).
-/// * `--diagnose` is the release gates' probe; it must measure THIS process.
-/// * `$ATERM_UPDATED_FROM` marks an update SUCCESSOR: the outgoing process
-///   re-spawns itself with its own argv verbatim to complete an apply. Under
-///   `attach` that successor would forward into the very instance that is
-///   tearing itself down (or, worse, into a sibling) and the update would never
-///   land. A relaunch of a window is not a request for a terminal.
-/// * Anything else unrecognized (`--containment`, a future flag) fails CLOSED to
-///   spawning, because spawning is what it does today.
+/// * `-e` / `--command` / `--` carry a child command line `spawn` cannot.
+/// * `--headless` wants an engine + socket with no window; forwarding would
+///   open a tab somewhere and leave CI waiting.
+/// * `--diagnose` is the release gates' probe and must measure this process.
+/// * `$ATERM_UPDATED_FROM` marks an update successor re-spawning with its own
+///   argv; forwarding it would stop the update from landing.
+/// * Anything else unrecognized fails closed to spawning.
 ///
-/// `--window` IS eligible: it names the MODE (window rather than session), not
-/// the destination, and it is the documented way to ask for the window from a
-/// script. `-d <dir>` is eligible because the forward carries it exactly — but
-/// only in the spellings the window itself understands; see
-/// `PLAIN_LAUNCH_DIR_FLAGS`.
-///
-/// The OTHER OS-driven relaunch — `RegisterApplicationRestart`, which Windows
-/// fires after a Restart-Manager reboot *and* after a crash or hang — needs no
-/// entry here: it registers the `new-window` VERB, which [`route_launch`] never
-/// forwards under any policy, so it never reaches this gate at all.
+/// `--window` is eligible (it names the mode, not the destination), as is
+/// `-d <dir>` in `PLAIN_LAUNCH_DIR_FLAGS` spellings. Windows'
+/// `RegisterApplicationRestart` relaunch registers the `new-window` verb, which
+/// is never forwarded, so it never reaches this gate.
 #[must_use]
 pub fn plain_launch_is_policy_eligible(scan: &[std::ffi::OsString], env: LaunchEnv) -> bool {
     if env.updated_from {
@@ -429,13 +337,8 @@ pub fn plain_launch_is_policy_eligible(scan: &[std::ffi::OsString], env: LaunchE
     true
 }
 
-/// The `-d <dir>` operand of a plain launch, in the spellings
-/// [`plain_launch_is_policy_eligible`] accepts — the RAW value, for the caller to
-/// resolve against its own working directory.
-///
-/// Shares `PLAIN_LAUNCH_DIR_FLAGS` with the gate on purpose: the two questions
-/// ("may this launch be routed" and "where does it want to open") must never
-/// disagree about what a directory flag looks like.
+/// The raw `-d <dir>` operand of a plain launch, for the caller to resolve.
+/// Shares `PLAIN_LAUNCH_DIR_FLAGS` with the gate so the two agree.
 #[must_use]
 pub fn plain_launch_dir_operand(scan: &[std::ffi::OsString]) -> Option<String> {
     let mut it = scan.iter();
@@ -464,9 +367,9 @@ mod tests {
     }
 
     #[test]
-    fn the_default_policy_is_todays_behaviour() {
+    fn the_default_policy_is_new_window() {
         assert_eq!(WindowingBehavior::default(), WindowingBehavior::NewWindow);
-        // An unrecognized value must NOT silently become `attach`: a typo in
+        // An unrecognized value must not silently become `attach`: a typo in
         // aterm.toml may not change where terminals open.
         assert_eq!(WindowingBehavior::parse("join-please"), None);
     }
@@ -495,9 +398,9 @@ mod tests {
         }
     }
 
-    /// THE ROUTING TABLE, every cell of it. Twelve combinations, no ambiguity.
+    /// Every cell of the routing table.
     #[test]
-    fn routing_is_the_whole_two_by_four_table() {
+    fn routing_is_the_whole_table() {
         use LaunchIntent::{NewTab, NewWindow, Plain, SplitPane};
         use WindowRoute::{Forward, Spawn};
         use WindowingBehavior::{Attach, NewWindow as PolicyNewWindow};
@@ -508,14 +411,18 @@ mod tests {
             (NewTab, Attach, true, Forward),
             (NewTab, Attach, false, Spawn),
             (SplitPane, PolicyNewWindow, true, Spawn),
+            (SplitPane, PolicyNewWindow, false, Spawn),
             (SplitPane, Attach, true, Forward),
             (SplitPane, Attach, false, Spawn),
             (Plain, PolicyNewWindow, true, Spawn),
+            (Plain, PolicyNewWindow, false, Spawn),
             (Plain, Attach, true, Forward),
             (Plain, Attach, false, Spawn),
-            // The escape hatch: NEVER forwarded, under either policy.
+            // The escape hatch: never forwarded, under either policy.
             (NewWindow, Attach, true, Spawn),
+            (NewWindow, Attach, false, Spawn),
             (NewWindow, PolicyNewWindow, true, Spawn),
+            (NewWindow, PolicyNewWindow, false, Spawn),
         ];
         for (intent, behavior, reachable, expected) in cases {
             assert_eq!(
@@ -523,24 +430,6 @@ mod tests {
                 expected,
                 "{intent:?} under {behavior:?} with reachable={reachable}"
             );
-        }
-    }
-
-    #[test]
-    fn the_default_policy_never_forwards_anything() {
-        for intent in [
-            LaunchIntent::NewTab,
-            LaunchIntent::NewWindow,
-            LaunchIntent::SplitPane,
-            LaunchIntent::Plain,
-        ] {
-            for reachable in [true, false] {
-                assert_eq!(
-                    route_launch(intent, WindowingBehavior::default(), reachable),
-                    WindowRoute::Spawn,
-                    "the shipped default must be byte-identical to today for {intent:?}"
-                );
-            }
         }
     }
 
@@ -616,9 +505,8 @@ mod tests {
         };
         assert_eq!(plain.control_request().unwrap(), "spawn\n");
 
-        // A space-free path is emitted in the HISTORICAL, unquoted form, so an
-        // instance older than this feature serves it correctly (see the method's
-        // mixed-version note).
+        // A space-free path uses the unquoted form, which older instances
+        // also serve.
         let simple = WindowRequest {
             intent: LaunchIntent::NewTab,
             dir: Some(r"C:\Windows".to_string()),
@@ -649,9 +537,8 @@ mod tests {
         );
     }
 
-    /// A newline in the value would inject a second authenticated verb into a
-    /// newline-delimited protocol; a quote would close the value early. Both are
-    /// refused before a byte reaches the socket.
+    /// A newline (second verb injection) or a quote (early close) in the value
+    /// is refused before reaching the socket.
     #[test]
     fn an_unframeable_directory_is_refused_not_encoded() {
         for hostile in ["/tmp/a\nspawn", "/tmp/a\rb", "/tmp/\"quoted\""] {
@@ -684,7 +571,7 @@ mod tests {
     }
 
     /// The narrow gate. Everything that is not a bare window launch spawns,
-    /// under EITHER policy — these are the invocations a forward would corrupt.
+    /// under either policy — these are the invocations a forward would corrupt.
     #[test]
     fn only_a_bare_window_launch_is_policy_eligible() {
         let plain = LaunchEnv::default();
@@ -703,6 +590,7 @@ mod tests {
             &["--command", "vim"][..],
             &["--"][..],
             &["--headless"][..],
+            &["--window", "-d", "/tmp", "--headless"][..],
             &["--diagnose"][..],
             &["--containment", "user"][..],
             &["-d"][..], // a dangling flag: refuse rather than guess
@@ -722,32 +610,9 @@ mod tests {
         ));
     }
 
-    /// `--headless` anywhere before the payload makes a launch ineligible: a
-    /// forwarded headless launch answers with a tab in someone's window and
-    /// leaves CI waiting for a control socket that will never exist.
-    #[test]
-    fn a_headless_launch_is_never_policy_eligible() {
-        for argv in [&[][..], &["--window"][..], &["--window", "-d", "/tmp"][..]] {
-            assert!(
-                plain_launch_is_policy_eligible(&args(argv), LaunchEnv::default()),
-                "{argv:?} is the eligible shape without the flag"
-            );
-            let mut headless = argv.to_vec();
-            headless.push("--headless");
-            assert!(
-                !plain_launch_is_policy_eligible(&args(&headless), LaunchEnv::default()),
-                "{headless:?} must never be forwarded"
-            );
-        }
-    }
-
-    /// The gate and the window's OWN parser must agree about what a directory
-    /// flag looks like, or one argv takes two different outcomes: forwarded
-    /// under `attach`, "unknown option" under the default. `crates/aterm-gui/
-    /// src/cli.rs` knows `-d` and `--working-directory` and nothing else — no
-    /// `=`-joined form, no wt spelling — so those are the only two a PLAIN launch
-    /// may carry through the gate. (The explicit verbs still take the wider
-    /// grammar: they resolve the value themselves and hand the window `-d`.)
+    /// A plain launch is eligible only with the window parser's own directory
+    /// flags (`-d`, `--working-directory`), so one argv never gets two outcomes.
+    /// The explicit verbs still take the wider grammar.
     #[test]
     fn the_plain_gate_only_knows_the_directory_flags_the_window_parses() {
         let plain = LaunchEnv::default();

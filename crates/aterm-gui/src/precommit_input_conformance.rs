@@ -33,6 +33,7 @@ use winit::event::WindowEvent;
 use winit::keyboard::ModifiersState;
 
 use crate::WindowId;
+use crate::conformance_support::schedules;
 
 /// What the Commit arm left behind, read at the moment it ran.
 #[derive(Clone, Copy)]
@@ -161,38 +162,6 @@ impl Rig {
 
 const ACTIONS: &[&str] = &["Type", "LoseFocus", "Drop", "Settle"];
 
-/// Every schedule of the committed model up to `depth` steps that cannot be
-/// extended inside it: the full enumeration, not a hand-picked few.
-fn schedules(model: &Model, depth: usize) -> Vec<Vec<&'static str>> {
-    fn walk(
-        model: &Model,
-        state: &State,
-        prefix: &mut Vec<&'static str>,
-        depth: usize,
-        out: &mut Vec<Vec<&'static str>>,
-    ) {
-        let enabled: Vec<&'static str> = ACTIONS
-            .iter()
-            .copied()
-            .filter(|action| model.action_enabled(action, state))
-            .collect();
-        if prefix.len() == depth || enabled.is_empty() {
-            out.push(prefix.clone());
-            return;
-        }
-        for action in enabled {
-            let mut next = state.clone();
-            assert!(model.fire(action, &mut next));
-            prefix.push(action);
-            walk(model, &next, prefix, depth, out);
-            prefix.pop();
-        }
-    }
-    let mut out = Vec::new();
-    walk(model, &model.init_state(), &mut Vec::new(), depth, &mut out);
-    out
-}
-
 /// One real step, projected: `(before, action, after)`.
 type Step = (State, &'static str, State);
 
@@ -246,7 +215,7 @@ fn the_real_pre_commit_queue_conforms_to_the_model() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let model = native_update_precommit_input_model();
-    let all = schedules(&model, 4);
+    let all = schedules(&model, ACTIONS, 4);
     assert!(
         all.len() > 40,
         "the enumeration reaches the schedules it exists for: {}",

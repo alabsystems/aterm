@@ -5,9 +5,8 @@
 
 /// Build a `&'static CStr` from tokens, checked at compile time.
 ///
-/// `cstr!("NSObject")` and `cstr!(stringify!(NSObject))` both work; a name with
-/// an interior NUL is a compile error, which is the same property
-/// `metal/ffi.rs` gets from taking `c"…"` literals.
+/// `cstr!("NSObject")` and `cstr!(stringify!(NSObject))` both work; an interior
+/// NUL is a compile error.
 #[macro_export]
 macro_rules! cstr {
     ($($tok:tt)*) => {
@@ -34,10 +33,10 @@ macro_rules! __aterm_objc_ret {
     };
 }
 
-/// A selector's token stream as the ONE string the runtime knows it by —
+/// A selector's token stream as the one string the runtime knows it by —
 /// `@sel(toolbar:itemForItemIdentifier:)` becomes
-/// `"toolbar:itemForItemIdentifier:"` — spelled exactly as [`crate::sel!`]
-/// spells it, so a containment report names the selector, not the Rust `fn`.
+/// `"toolbar:itemForItemIdentifier:"`, spelled as [`crate::sel!`] spells it —
+/// so a containment report names the selector, not the Rust `fn`.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __aterm_objc_sel_str {
@@ -46,20 +45,16 @@ macro_rules! __aterm_objc_sel_str {
     };
 }
 
-/// The body of a declared method's trampoline, by containment policy.
+/// The body of a declared method's trampoline, by containment policy, chosen by
+/// the marker after `@sel(…)`:
 ///
-/// Two arms, chosen by the marker written after `@sel(…)`:
-///
-/// * none — the default: the call runs under [`crate::exception::contain`],
-///   an `NSException` raised inside it is reported against the selector and
-///   the trampoline answers [`crate::exception::inert`] — the all-zero value,
-///   which for every type this crate crosses the C ABI with means "nothing
-///   happened". The return type must be [`crate::InertZero`].
-/// * `@abort_on_exception` — the call runs bare: an `NSException` reaches the
-///   `catch_unwind` outside, which Rust cannot catch, and the process aborts
-///   exactly as it did before containment existed. For a selector whose zero
-///   is a real answer rather than an inert one, or a return type with no
-///   inert zero.
+/// * none (default): the call runs under [`crate::exception::contain`]; an
+///   `NSException` is reported against the selector and the trampoline returns
+///   [`crate::exception::inert`], the all-zero value. The return type must be
+///   [`crate::InertZero`].
+/// * `@abort_on_exception`: the call runs bare, so an `NSException` reaches the
+///   outer `catch_unwind` and the process aborts. For selectors whose zero is
+///   a real answer, or return types with no inert zero.
 ///
 /// Any other marker is a compile error naming the two that exist.
 #[doc(hidden)]
@@ -95,12 +90,10 @@ macro_rules! __aterm_objc_method_call {
 
 /// Count the `:` tokens in a selector's token stream.
 ///
-/// The arity of an Objective-C selector IS its colon count, and the runtime
-/// reads the argument list from the type ENCODING beside it — two facts that a
-/// macro can be made to reconcile, and that [`declare_class!`] does reconcile
-/// in a `const` block. Without it `@sel(noArgsAtAll)` over `fn(&self, n: i64)`
-/// compiles clean and registers `"v@:q"`: a one-argument encoding on a
-/// colon-free selector, which AppKit will happily read arity from.
+/// A selector's arity is its colon count, while the runtime reads the argument
+/// list from the encoding; [`declare_class!`] reconciles the two in a `const`
+/// block, so `@sel(noArgsAtAll)` over `fn(&self, n: i64)` does not register
+/// `"v@:q"`.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __aterm_objc_colons {
@@ -119,9 +112,8 @@ macro_rules! __aterm_objc_count {
 
 /// Define an Objective-C class at runtime.
 ///
-/// This is aterm's replacement for objc2's `declare_class!`, shaped by what the
-/// seven real sites in `aterm-gui` do rather than by objc2's surface — see
-/// [`crate::declare`] for that inventory.
+/// aterm's replacement for objc2's `declare_class!`, shaped by the declared
+/// classes in `aterm-gui` and `vendor/winit` (see [`crate::declare`]).
 ///
 /// ```ignore
 /// aterm_objc::declare_class! {
@@ -140,57 +132,34 @@ macro_rules! __aterm_objc_count {
 ///
 /// # What it generates
 ///
-/// * An opaque, zero-sized, `!Send`/`!Sync` marker type named `$name`, which is
-///   only ever reached through a reference to a live instance.
-/// * `$name::class()` — registers the pair on first call (`OnceLock`, so exactly
-///   once per process) and returns the class.
+/// * An opaque, zero-sized, `!Send`/`!Sync` marker type named `$name`, reached
+///   only through a reference to a live instance.
+/// * `$name::class()` — registers the pair once per process (`OnceLock`) and
+///   returns it.
 /// * `$name::alloc_init(mtm, ivars)` — `+alloc`, store the ivars, `-init`,
-///   against a [`crate::MainThread`] witness. The ivars
-///   are stored BEFORE `init` runs, deliberately: a superclass `init` may send
-///   overridden methods back to the instance (`NSView -initWithFrame:` calls
-///   `updateTrackingAreas` on some paths), and those methods read `ivars()`.
+///   against a [`crate::MainThread`] witness. Ivars are stored before `init`
+///   because a superclass `init` may call overridden methods that read
+///   `ivars()` (`NSView -initWithFrame:` can send `updateTrackingAreas`).
 /// * `$name::ivars()` — `&Ivars`, at the registered ivar offset.
-/// * `-dealloc` — drops the Rust ivars, then `[super dealloc]`. Generated
-///   unconditionally, because that is the ONLY thing any of the seven real
-///   sites needs from `dealloc`.
-/// * One `extern "C"` trampoline per `@sel(…)` method, each with the correct
-///   Objective-C type encoding, each wrapped in a panic guard (unwinding out
-///   of an ObjC frame is undefined behaviour, so a Rust panic aborts with the
-///   method's name), and each CONTAINING an `NSException` raised inside it —
-///   the exception is reported against the selector through
-///   [`crate::exception`], every Rust `Drop` on the unwound frames runs, and
-///   the method answers the inert zero of its return type. A method whose
-///   zero is not inert writes `@abort_on_exception` after its `@sel(…)` and
-///   keeps the abort; `-dealloc` always keeps it.
+/// * `-dealloc` — drops the Rust ivars, then `[super dealloc]`.
+/// * One `extern "C"` trampoline per `@sel(…)` method, with the correct type
+///   encoding and a panic guard (a Rust panic aborts with the method's name).
+///   An `NSException` raised inside is contained through [`crate::exception`]:
+///   Rust `Drop`s on the unwound frames run and the method returns the inert
+///   zero of its return type. `@abort_on_exception` after `@sel(…)` keeps the
+///   abort; `-dealloc` always does.
 ///
-/// # Divergences from objc2, and why
+/// # Differences from objc2
 ///
-/// * **`@sel(name:)` not `#[method(name:)]`** — FORCED, not chosen. objc2 reads
-///   its attribute with a proc macro; a `macro_rules!` arm that matches
-///   `$(#[$m:meta])* #[sel(…)]` is locally ambiguous, because `sel(bump)` is
-///   itself a valid `meta` and the parser cannot tell the last doc comment from
-///   the selector. A leading `@` cannot start an attribute, so the ambiguity
-///   disappears and doc comments keep their natural position above the method.
-///   The selector spelling itself is unchanged — same `stringify!`-per-token
-///   trick, so `@sel(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:)`
-///   is written exactly as objc2 writes it, and — since the arity fix below —
-///   means what it says at three arguments as well as one.
-/// * **No `type Mutability`, but the WITNESS it carried is back.** objc2 uses
-///   the parameter to drive `Send`/`Sync`, its `&mut` story — and, through
-///   `mutability::MainThreadOnly`, to make `alloc` reachable only from a
-///   `MainThreadMarker`. This macro dropped all three, on the argument that
-///   [`crate::Retained`] is unconditionally `!Send` so the parameter had one
-///   useful value. That argument covers where an instance may TRAVEL and says
-///   nothing about where one may be BORN, and the difference was provable: a
-///   declared class registered, instantiated and DEALLOCATED on a spawned
-///   thread with no witness, no `unsafe` at the call site and no diagnostic,
-///   running the ivar type's Rust destructor there. `alloc_init` and
-///   `alloc_ivars` now take a [`crate::MainThread`], so that program does not
-///   compile. `Send`/`Sync` stay structural (the generated marker type is
-///   `!Send`) and interior mutability stays spelled the Rust way, in the ivar
-///   type (`Cell`, `RefCell`) — which is what all seven sites already do.
-///
-///   Instantiating without asking the thread question is a compile error:
+/// * `@sel(name:)`, not `#[method(name:)]`: in `macro_rules!`,
+///   `$(#[$m:meta])* #[sel(…)]` is ambiguous because `sel(bump)` is itself a
+///   valid `meta`. A leading `@` cannot start an attribute. Selector spelling
+///   is otherwise objc2's.
+/// * No `type Mutability`. `Send`/`Sync` are structural (the marker is
+///   `!Send`) and interior mutability lives in the ivar type (`Cell`,
+///   `RefCell`). The main-thread gate it provided is the [`crate::MainThread`]
+///   parameter of `alloc_init`/`alloc_ivars`; instantiating without one does
+///   not compile:
 ///
 ///   ```compile_fail
 ///   aterm_objc::declare_class! {
@@ -205,48 +174,29 @@ macro_rules! __aterm_objc_count {
 ///   // `alloc_init` takes a `MainThread` witness first.
 ///   let _ = DocNoWitness::alloc_init(());
 ///   ```
-/// * **One ivar, not a struct of them** — see [`crate::declare`].
-/// * **`&self` is captured as an `ident`, not matched literally** — macro
-///   hygiene: a `self` token emitted from the macro's own definition lives in
-///   the macro's syntax context, so a body written at the call site could not
-///   name it (`error[E0424]: expected value, found module \`self\``). Capturing
-///   the receiver as `$slf:ident` carries the call site's own `self` through.
-/// * **A written initialised flag** — see [`crate::IvarSlot`].
+/// * One ivar, not a struct of them — see [`crate::declare`].
+/// * `&self` is captured as an `ident`: a `self` token emitted by the macro
+///   lives in the macro's hygiene context, so a call-site body could not name
+///   it (`E0424`).
+/// * A written initialised flag — see [`crate::IvarSlot`].
 ///
 /// # Safety
 ///
-/// Declaring a class is unsafe work the macro does on your behalf; what it
-/// CANNOT check, and what the caller therefore owes:
+/// What the macro cannot check and the caller owes:
 ///
-/// * `$super` must name a class that is linked into the binary, and must be a
-///   legal superclass to add ivars to (every non-fragile ObjC class is).
-/// * ~~A `@sel(…)` name must match its Rust signature … the macro cannot count
-///   the colons for you.~~ IT NOW DOES: the expansion carries a `const` block
-///   asserting that the selector's colon count equals the number of declared
-///   arguments, so `@sel(noArgsAtAll)` over `fn(&self, n: i64)` — which used to
-///   compile and register the one-argument encoding `"v@:q"` against a
-///   colon-free selector — is a compile error naming both halves. The check
-///   lives in the same expansion as the encoding it guards.
-/// * A method's argument types must be the ones the framework actually passes.
-///   This is the same obligation [`crate::msg`] imposes in the other direction.
-/// * `NAME` must be globally unique in the process. Registration panics rather
-///   than silently returning nil if it is not.
-/// * ~~`Ivars` may be any Rust type.~~ NOT ANY: a type whose slot needs more
-///   than 16-byte alignment is now a compile error, because
-///   `class_createInstance` allocates the instance with a `malloc` that
-///   guarantees exactly 16 and the slot sits at a fixed offset from that base.
-///   This was reachable with no `unsafe` token at the call site and is `S4`'s
-///   second half — see [`crate::ClassBuilder::add_rust_ivar`] for the
-///   measurement.
-/// * ~~A method may take any number of arguments.~~ Fourteen, because a send
-///   needs a [`crate::MsgFn`] prototype and that trait is implemented up to
-///   sixteen parameters counting `self` and `_cmd`. Wider used to REGISTER and
-///   be unreachable from Rust; it is now a compile error naming the ceiling.
+/// * `$super` must be linked into the binary and a legal superclass to add
+///   ivars to (every non-fragile ObjC class is).
+/// * A method's argument types must be the ones the framework actually passes
+///   (the mirror of [`crate::msg`]'s obligation).
+/// * `NAME` must be unique in the process; registration panics otherwise.
 ///
-/// # The colon count is CHECKED, and more than one argument works
+/// Checked at compile time: the selector's colon count equals the argument
+/// count; `Ivars` is aligned to at most 16 bytes (`S4`, see
+/// [`crate::ClassBuilder::add_rust_ivar`]); a method has at most fourteen
+/// arguments ([`crate::MsgFn`]'s ceiling), so everything registered is
+/// sendable from Rust.
 ///
-/// The two properties are one expansion, which is why they are one section.
-/// An arity disagreement is a compile error naming both halves:
+/// An arity mismatch:
 ///
 /// ```compile_fail
 /// aterm_objc::declare_class! {
@@ -263,14 +213,7 @@ macro_rules! __aterm_objc_count {
 /// }
 /// ```
 ///
-/// # The ceiling is a compile error at the DECLARE end too
-///
-/// A method wider than [`crate::MsgFn`]'s sixteen parameters — `self`, `_cmd`
-/// and fourteen arguments — used to REGISTER, answer `respondsToSelector:` with
-/// `YES` and dispatch from Objective-C, while `msg()` refused to build a
-/// prototype for it. That is a method the runtime can reach and Rust cannot,
-/// which is D1's and F1's trap a third time, and it is now refused where it is
-/// written:
+/// A method wider than the ceiling:
 ///
 /// ```compile_fail
 /// aterm_objc::declare_class! {
@@ -290,12 +233,8 @@ macro_rules! __aterm_objc_count {
 /// }
 /// ```
 ///
-/// Fourteen — the ceiling exactly — still compiles, registers and sends; see
-/// `tests/adversary_w2c.rs`.
-///
-/// The identical class with the colon its argument requires compiles, and so
-/// do two and three arguments — the shapes that used to fail with
-/// `error: no rules expected ';'` before the encoding call was fixed:
+/// Fourteen arguments compile, register and send (`tests/adversary_w2c.rs`).
+/// Matched arities of one, two and three arguments:
 ///
 /// ```
 /// # use aterm_objc::{Bool, Id, Sel};
@@ -343,10 +282,9 @@ macro_rules! declare_class {
             _not_thread_safe: ::core::marker::PhantomData<*const u8>,
         }
 
-        // SAFETY: `$name` is a zero-sized opaque marker that is only ever
-        // reached through a reference to a live instance of the class
-        // `class()` registers, and `class()` registers exactly that class,
-        // exactly once, before any instance can exist.
+        // SAFETY: `$name` is a zero-sized marker reached only through a
+        // reference to a live instance of the class `class()` registers, once,
+        // before any instance can exist.
         unsafe impl $crate::ClassType for $name {
             const NAME: &'static str = $objc_name;
 
@@ -365,11 +303,9 @@ macro_rules! declare_class {
                         $crate::cstr!(::core::stringify!($super)),
                         $crate::cstr!($objc_name),
                     );
-                    // `class_createInstance` gives the instance base 16-byte
-                    // alignment and nothing more, so the ivar slot cannot
-                    // out-align that. `add_rust_ivar` carries the same
-                    // assertion; this one is here so the error names the CLASS.
-                    // See `S4` in the crate's soundness list.
+                    // The instance base is only 16-aligned, so the ivar slot
+                    // cannot be more (`S4`). `add_rust_ivar` asserts the same;
+                    // this copy makes the error name the class.
                     const {
                         ::core::assert!(
                             ::core::mem::align_of::<$crate::IvarSlot<$ivars>>() <= 16,
@@ -387,38 +323,22 @@ macro_rules! declare_class {
                     $($( __b.add_protocol($crate::cstr!(::core::stringify!($proto))); )*)?
 
                     // -dealloc: drop the Rust ivars, then [super dealloc].
-                    //
-                    // NOT CONTAINED, by design: an `NSException` out of the
-                    // ivar drop or `[super dealloc]` reaches the guard below,
-                    // which Rust cannot catch, and the process aborts. A
-                    // half-deallocated object is not a state to continue
-                    // from. (The super send is `"C-unwind"` like every other,
-                    // so the frames above it still run their drops first.)
+                    // Not contained: an `NSException` here aborts, since a
+                    // half-deallocated object is no state to continue from.
+                    // The super send is `"C-unwind"`, so frames above it still
+                    // run their drops.
                     {
                         unsafe extern "C" fn __dealloc(__this: $crate::Id, _cmd: $crate::Sel) {
                             let __guard = ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(|| {
-                                    // NOT `$name::meta()`. -dealloc is
-                                    // REGISTERED here but RUNS later, on an
-                                    // instance — which cannot exist until
-                                    // `class()` has returned, i.e. until this
-                                    // very `get_or_init` has completed. So the
-                                    // cell is always initialised by the time
-                                    // this runs and the accessor would take
-                                    // its fast path... but the call still sits
-                                    // lexically inside the initializer, and
-                                    // OB-19's census is name-based by design:
-                                    // it reads this as an initializer that
-                                    // re-enters its own cell and fails the L0
-                                    // freeze gate, which has no waiver.
-                                    // `get()` is the gate's own prescribed
-                                    // repair ("if the nested read is only a
-                                    // cache peek, use the non-blocking
-                                    // `get()`"), and it is the stronger
-                                    // spelling regardless: a peek that can
-                                    // never block cannot park a -dealloc on
-                                    // the main thread, whatever a future edit
-                                    // does to the initializer above it.
+                                    // `get()`, not `$name::meta()`: -dealloc
+                                    // runs only on an instance, which exists
+                                    // only after `class()` returned, so the
+                                    // cell is set. A non-blocking peek also
+                                    // satisfies the lazy-init reentrancy
+                                    // census, which reads any call inside the
+                                    // initializer as re-entry, and can never
+                                    // park a -dealloc on the main thread.
                                     let __meta = META.get().expect(
                                         "-dealloc runs only on an instance, \
                                          which cannot exist before the class \
@@ -431,15 +351,15 @@ macro_rules! declare_class {
                                             .expose_provenance()
                                             .wrapping_add_signed(__meta.ivar_offset()),
                                     );
-                                    // SAFETY: `__this` is the instance the
-                                    // runtime is deallocating, so the slot is
-                                    // live, writable and unaliased; `dispose`
-                                    // itself tolerates a never-written slot.
+                                    // SAFETY: `__this` is being deallocated,
+                                    // so the slot is live, writable and
+                                    // unaliased; `dispose` tolerates a
+                                    // never-written slot.
                                     unsafe { $crate::IvarSlot::<$ivars>::dispose(__slot) };
-                                    // SAFETY: `__this` is the instance being
-                                    // deallocated and `__meta.class()` is the
-                                    // class that DEFINES this `dealloc`, so the
-                                    // super send starts at the right place.
+                                    // SAFETY: `__this` is being deallocated
+                                    // and `__meta.class()` defines this
+                                    // `dealloc`, so the super send starts at
+                                    // its superclass.
                                     unsafe {
                                         $crate::send_super_dealloc(__this, __meta.class());
                                     }
@@ -450,9 +370,8 @@ macro_rules! declare_class {
                             }
                         }
                         // SAFETY: `__dealloc` is `extern "C"` with the exact
-                        // `-(void)dealloc` prototype `(id, SEL)`, matches the
-                        // encoding passed beside it, and cannot unwind (the
-                        // guard above aborts instead).
+                        // `-(void)dealloc` prototype `(id, SEL)`, matches its
+                        // encoding, and cannot unwind (the guard aborts).
                         unsafe {
                             __b.add_method(
                                 $crate::sel!(dealloc),
@@ -463,17 +382,11 @@ macro_rules! declare_class {
                     }
 
                     $({
-                        // The selector's colon count IS its arity, and the
-                        // encoding below is written from the Rust argument
-                        // types. Reconcile the two HERE, at compile time,
-                        // rather than letting AppKit discover the disagreement
-                        // through `NSMethodSignature` at run time.
-                        // The SEND end has always refused a method wider than
-                        // `MsgFn`'s sixteen parameters; the DECLARE end had no
-                        // ceiling at all, so a fifteen-argument method
-                        // registered, answered `respondsToSelector:` YES, and
-                        // was unreachable from Rust. Both ends now stop in the
-                        // same place.
+                        // The selector's colon count is its arity, and the
+                        // encoding below comes from the Rust argument types:
+                        // reconcile them at compile time. Also cap the arity at
+                        // `MsgFn`'s sixteen parameters, so every registered
+                        // method is sendable from Rust.
                         const {
                             ::core::assert!(
                                 $crate::__aterm_objc_count!($($arg)*) + 2 <= 16,
@@ -507,17 +420,14 @@ macro_rules! declare_class {
                                 ),
                             )
                         };
-                        // THE ORDER IS MEASURED: `catch_unwind` OUTSIDE,
-                        // the Objective-C `@try` INSIDE. A Rust panic is not
-                        // swallowed by `@catch (id)` — it runs its drops,
-                        // crosses the wrapper, and lands on the outer guard,
-                        // so the abort-on-panic policy and its exact message
-                        // survive. An `NSException` is caught by the inner
-                        // wrapper, after every Rust `Drop` between the raise
-                        // and this frame has run, and the method answers its
-                        // inert zero (or, under `@abort_on_exception`, the
-                        // exception reaches the outer guard and aborts as it
-                        // always did). See `crate::exception`.
+                        // `catch_unwind` outside, Objective-C `@try` inside. A
+                        // Rust panic is not swallowed by `@catch (id)`: it runs
+                        // its drops and aborts at the outer guard with its
+                        // message. An `NSException` is caught by the inner
+                        // wrapper after every Rust `Drop` between the raise and
+                        // here has run, and the method returns its inert zero
+                        // (under `@abort_on_exception` it reaches the outer
+                        // guard and aborts). See `crate::exception`.
                         unsafe extern "C" fn __tramp(
                             __this: $crate::Id,
                             _cmd: $crate::Sel,
@@ -526,16 +436,12 @@ macro_rules! declare_class {
                             let __guard = ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(move || {
                                     // SAFETY: the runtime delivers a message
-                                    // only to a live instance of the class that
-                                    // declares the method or of a SUBCLASS of
-                                    // it — never to nil, which short-circuits
-                                    // before any IMP runs — so `__this` is
-                                    // non-null and addresses one. A subclass
-                                    // instance is equally fine here: ivars sit
-                                    // at the offset the runtime assigned to
-                                    // THIS class, which subclassing does not
-                                    // move. `$name` is a zero-sized marker, so
-                                    // the reference borrows no bytes of its own.
+                                    // only to a live instance of the declaring
+                                    // class or a subclass (nil short-circuits
+                                    // before any IMP), and subclassing does not
+                                    // move this class's ivar offset. `$name` is
+                                    // zero-sized, so the reference borrows no
+                                    // bytes of its own.
                                     let __self: &$name =
                                         unsafe { &*__this.cast::<$name>().cast_const() };
                                     $crate::__aterm_objc_method_call!(
@@ -556,21 +462,14 @@ macro_rules! declare_class {
                         }
                         // SAFETY: `__tramp` is `extern "C"` with the
                         // `(id, SEL, ..)` prototype the runtime calls, its
-                        // encoding is derived from those same Rust types, and
-                        // it cannot unwind: a Rust panic aborts at the guard
-                        // above, and an NSException is contained inside it.
+                        // encoding comes from the same Rust types, and it cannot
+                        // unwind (panics abort; NSExceptions are contained).
                         unsafe {
                             __b.add_method(
                                 $crate::sel!($($sel_tok)+),
                                 __tramp as *const ::core::ffi::c_void,
-                                // ONE semicolon, then a COMMA-separated list.
-                                // This used to be `$(; $argty)*`, which emits
-                                // `Ret ; A ; B` at arity 2 and does not match
-                                // `method_encoding!`'s pattern at all: every
-                                // two-argument class failed with
-                                // `error: no rules expected ';'` pointing at
-                                // the whole invocation. Nothing in the crate
-                                // took more than one argument, so it shipped.
+                                // One semicolon, then a comma-separated list,
+                                // as `method_encoding!` expects.
                                 &$crate::method_encoding!(
                                     $crate::__aterm_objc_ret!($($ret)?) ; $($argty),*
                                 ),
@@ -589,14 +488,13 @@ macro_rules! declare_class {
                 $crate::Id::from_ptr(::core::ptr::from_ref(self).cast_mut().cast())
             }
 
-            /// The `objc_super` a `[super …]` send from THIS class needs.
+            /// The `objc_super` a `[super …]` send from this class needs.
             #[inline]
             #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis fn super_receiver(&self) -> $crate::ObjcSuper {
-                // SAFETY: `self` borrows a live instance and `Self::meta()`
-                // returns the registered class that declares this method, so
-                // both arguments are live and the pair is the correct one for
-                // a `[super …]` send from here.
+                // SAFETY: `self` borrows a live instance and `Self::meta()` is
+                // the registered class declaring this method: the right pair
+                // for a `[super …]` send from here.
                 unsafe { $crate::super_of(self.as_id(), Self::meta().class()) }
             }
 
@@ -612,59 +510,34 @@ macro_rules! declare_class {
                 );
                 // SAFETY: `self` borrows a live instance, so the slot at the
                 // registered offset is aligned, readable and live for the
-                // borrow. Whether it was WRITTEN is checked by `IvarSlot::get`
-                // itself, in release builds too — see the note there on
-                // instances Objective-C code creates without `alloc_init`.
+                // borrow. `IvarSlot::get` checks it was written, in release too.
                 unsafe { $crate::IvarSlot::get(__slot) }
             }
 
-            /// `+alloc` and store `ivars`, returning the +1 but UNINITIALISED
+            /// `+alloc` and store `ivars`, returning the +1 but uninitialised
             /// instance — the first half of [`Self::alloc_init`], for a class
-            /// whose designated initializer is not `-init`.
+            /// whose designated initializer is not `-init` (e.g. `NSView`'s
+            /// `-initWithFrame:`).
             ///
-            /// # Why this exists
-            ///
-            /// `alloc_init` sends `-init`, which is right for the four
-            /// `NSObject` subclasses in the tree and WRONG for the two `NSView`
-            /// ones: a view's designated initializer is `-initWithFrame:`, and
-            /// `NSView` documents that its subclasses must go through it.
-            /// Nothing in W1 needed a non-`NSObject` superclass, so nothing
-            /// noticed; the `aterm-gui` port did, immediately, and winit's five
-            /// declared classes include `NSView` and `NSWindow` subclasses that
-            /// will need it too.
-            ///
-            /// The ivars are stored BEFORE the initializer runs, which is the
-            /// same order `alloc_init` uses and for the same reason: a
-            /// superclass `init` may send overridden methods back to the
-            /// instance (`NSView -initWithFrame:` sends `updateTrackingAreas`
-            /// on some paths) and those methods read `ivars()`.
-            ///
-            /// # The witness
-            ///
-            /// `_mtm` is unused at run time and load-bearing at compile time:
-            /// it is the parameter that makes "was the thread question asked?"
-            /// a type error rather than a convention. See
-            /// [`crate::MainThread`] for what it does and does not promise.
+            /// Ivars are stored before the initializer runs, as in
+            /// `alloc_init`. `_mtm` is unused at run time; it makes a missing
+            /// main-thread check a type error (see [`crate::MainThread`]).
             ///
             /// # Safety
             ///
-            /// The returned reference is +1 and NOT initialised. The caller
-            /// must send it exactly one designated initializer and adopt that
-            /// initializer's +1 result (or release the instance). Using it
-            /// before initialisation, initialising it twice, or dropping it on
-            /// the floor are all the caller's to avoid — which is why
-            /// [`Self::alloc_init`] exists and should be preferred whenever
-            /// `-init` is the right initializer.
+            /// The returned reference is +1 and not initialised. The caller must
+            /// send it exactly one designated initializer and adopt that
+            /// initializer's +1 result (or release the instance). Prefer
+            /// [`Self::alloc_init`] when `-init` is the right initializer.
             #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis unsafe fn alloc_ivars(
                 _mtm: $crate::MainThread,
                 ivars: $ivars,
             ) -> $crate::Id {
                 let __meta = Self::meta();
-                // SAFETY: `+alloc` on a registered class returns a +1,
-                // zero-filled instance or nil; the ivar slot inside it is
-                // therefore unwritten, which is exactly `IvarSlot::init`'s
-                // precondition.
+                // SAFETY: `+alloc` on a registered class returns a +1 zeroed
+                // instance or nil, so the ivar slot is unwritten, as
+                // `IvarSlot::init` requires.
                 unsafe {
                     let __alloc: unsafe extern "C-unwind" fn(
                         $crate::ClassPtr,
@@ -685,20 +558,18 @@ macro_rules! declare_class {
             }
 
             /// `+alloc`, store `ivars`, `-init`. `None` if either returns nil.
-            ///
             /// `mtm` is the [`crate::MainThread`] witness every instantiation
-            /// owes; it is consumed for its type and nothing else.
+            /// owes.
             #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis fn alloc_init(
                 mtm: $crate::MainThread,
                 ivars: $ivars,
             ) -> ::core::option::Option<$crate::Retained<Self>> {
-                // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one
-                // designated initializer, and `-init` is NSObject's — the right
-                // one for every class whose superclass chain does not override
-                // it with a stricter designated initializer. It consumes that
-                // +1 and returns the initialised +1 (or nil, having released
-                // it, in which case `dealloc` already dropped the ivars).
+                // SAFETY: `alloc_ivars` returns a +1 instance owing one
+                // designated initializer, and `-init` is NSObject's, right for
+                // any class whose chain does not require a stricter one. It
+                // consumes the +1 and returns +1 or nil (having released it,
+                // so `dealloc` already dropped the ivars).
                 unsafe {
                     let __raw = Self::alloc_ivars(mtm, ivars);
                     if __raw.is_null() {
@@ -715,15 +586,10 @@ macro_rules! declare_class {
 
             $(
                 $(#[$mmeta])*
-                // `non_snake_case` because a method is named for its selector;
-                // `dead_code` because the runtime, not Rust, is the caller;
-                // `too_many_arguments` because the ARITY IS THE SELECTOR'S and
-                // the user has no way to suppress it — the lint would fire with
-                // its span inside this expansion, so an `#[allow]` written at
-                // the `declare_class!` call site does not reach it and the only
-                // place that can silence it is here. AppKit's widest
-                // initializer is ten arguments; clippy's default ceiling is
-                // seven.
+                // `non_snake_case`: methods are named for their selectors;
+                // `dead_code`: the runtime is the caller; `too_many_arguments`:
+                // the arity is the selector's, and the lint fires inside this
+                // expansion where a call-site `#[allow]` cannot reach it.
                 #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
                 fn $method(& $slf $(, $arg: $argty)*) $(-> $ret)? $body
             )*

@@ -1178,7 +1178,7 @@ mod tests {
             }),
             StartOutcome::Started
         );
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while state.is_live() && Instant::now() < deadline {
             state.drain();
             std::thread::yield_now();

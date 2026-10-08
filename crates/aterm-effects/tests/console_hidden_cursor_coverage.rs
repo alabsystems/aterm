@@ -28,7 +28,10 @@ fn tick_with_surface(
     *now += Duration::from_millis(16);
     let mut input = term.cell_frame(usize::from(rows), usize::from(cols));
     if incoherent {
-        input.scroll_frac_px = 1;
+        // A snapshot extracted before a scroll the facts already saw: the
+        // observation refuses it. (A sub-row scroll offset is coherent — the
+        // renderer translates the pet's sprite with the grid band.)
+        input.base_y += 1;
     }
     let facts = PetWorldFacts::read(term, 7);
     brain.observe_console(&input, &facts, PetPane::full(&input));
@@ -83,7 +86,11 @@ fn check_hidden(rows: u16, cols: u16, caret: (u16, u16)) {
     );
     // Losing one observation must not lose the remembered sampling center.
     let unknown = tick_with_surface(&mut term, &mut brain, &mut now, rows, cols, true);
-    assert_eq!(unknown.alpha, 0);
+    assert_eq!(
+        unknown.alpha, hidden.alpha,
+        "an unknown frame holds the body on glass rather than blinking it"
+    );
+    assert!((unknown.col - hidden.col).abs() < 0.01 && (unknown.row - hidden.row).abs() < 0.01);
     let recovered = tick(&mut term, &mut brain, &mut now, rows, cols);
     assert_eq!(recovered.alpha, hidden.alpha);
     assert!((recovered.col - hidden.col).abs() < 0.01 && (recovered.row - hidden.row).abs() < 0.01);

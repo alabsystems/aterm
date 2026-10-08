@@ -5,14 +5,12 @@
 
 use super::*;
 
-/// TYPED RE-ANCHOR LAW (the Claude Code line-fill fix): a typed-hinted
-/// one-row move beyond the typed advance — an Ink input box rewrapping its
-/// INSET prompt, launching from the interior right edge and landing right
-/// of column 1, so the bare-terminal SHAPE detector misses — is CONTINUED
-/// TYPING for EVERY style: no fire meteor, no rainbow ZOOM, no lightning
-/// bolt, no landing ring, no jump-scale particle burst, and the only new
-/// wake is the single landing spark. The paired flare stays cold (nothing
-/// slams), so the next keystrokes on the new line don't erupt.
+/// Typed re-anchor law: a typed-hinted one-row move beyond the typed advance
+/// (an Ink input box rewrapping its inset prompt, launching from the interior
+/// right edge and landing right of column 1, which the bare-terminal shape
+/// detector misses) is continued typing for every style: no fire meteor,
+/// rainbow zoom, lightning bolt, landing ring or jump-scale particle burst, and
+/// the only new wake is the single landing spark. The paired flare stays cold.
 #[test]
 fn claude_code_wrap_reanchors_all_styles() {
     let g = geom(); // rows:6 cols:40 — the Ink wrap is (4,36) -> (5,3)
@@ -61,9 +59,8 @@ fn claude_code_wrap_reanchors_all_styles() {
             "{style:?}: a typed re-anchor never slams the flare ({})",
             glow.flare
         );
-        // The wake is the single landing spark — nothing swept across the
-        // cells the caret never travelled (right of the landing, or the
-        // interpolated diagonal back to the old row's right edge).
+        // The wake is the single landing spark: nothing swept across cells
+        // the caret never travelled.
         assert!(
             !glow.sparks.iter().any(|s| s.row == 5 && s.col > 3),
             "{style:?}: no wrap smear right of the landing: {:?}",
@@ -73,11 +70,9 @@ fn claude_code_wrap_reanchors_all_styles() {
                 .map(|s| s.col)
                 .collect::<Vec<_>>()
         );
-        // …and none on the DEPARTED row either: a half-regression that
-        // sweeps only the old row would otherwise pass (adversarial
-        // review). The first tick lays no wake (spawn needs a previous
-        // position), so after both ticks the only legitimate spark is the
-        // landing cell.
+        // …and none on the departed row either. The first tick lays no wake
+        // (spawn needs a previous position), so after both ticks the only
+        // legitimate spark is the landing cell.
         assert!(
             !glow.sparks.iter().any(|s| s.row == 4),
             "{style:?}: no smear on the departed row: {:?}",
@@ -136,11 +131,10 @@ fn bridged_two_cell_move_is_byte_identical_with_hint() {
     );
 }
 
-/// BOX-GROWTH WRAP morphology (live-verified in Claude Code): the
-/// bottom-anchored input box grows a row up, so the caret's terminal row
-/// stays constant while its column jumps. An explicitly admitted typed
-/// preview plus repaint blink re-anchors without a meteor, and the same
-/// shape with no press behind it stays wholly dark.
+/// Box-growth wrap morphology: the bottom-anchored input box grows a row up,
+/// so the caret's terminal row stays constant while its column jumps. An
+/// admitted typed preview plus repaint blink re-anchors without a meteor; the
+/// same shape with no press behind it stays dark.
 #[test]
 fn box_growth_preview_reanchors_but_cold_output_stays_dark() {
     let g = geom();
@@ -197,9 +191,8 @@ fn synthetic_alt_without_blink_keeps_the_jump() {
         "admitted alt-screen preview + no blink: the fire meteor still flies"
     );
 
-    // (The rainbow kitty arms of this law died with v1: the ZOOM streak
-    // was v1's; v2's meteor has its own admission laws in
-    // `rainbow_kitty::meteor`.)
+    // Rainbow kitty's meteor has its own admission laws in
+    // `rainbow_kitty::meteor`.
     let mut cc = CursorGlow::default();
     cc.note_context(true);
     cc.tick(Some((4, 36)), t0, &cfg(GlowStyle::Fire, true), g, &mut out);

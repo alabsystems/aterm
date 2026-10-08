@@ -22,13 +22,8 @@
 //! goes in AS-IS: run this AFTER `sign::sign_app` (both containers freeze the
 //! app's bytes), and hand the DMG to `sign::sign_and_notarize_dmg` next.
 //!
-//! RETIRED 2026-08-26 (owner direction: ONE lean self-provisioning macOS
-//! download): the batteries-included seed and with it the whole restage
-//! family — the seed-stripping zip stage, the per-arch `aterm-<v>-x86_64.dmg`
-//! filter (`create_arch_filtered`), the `aterm-<v>-lite.dmg` twin
-//! (`create_lite`) and the post-restage codesign/Gatekeeper re-proof. The
-//! bundle `bundle::assemble` hands over carries no seed, so both containers
-//! image it exactly as signed, with nothing subtracted.
+//! ONE lean self-provisioning macOS download: the bundle carries no toolchain
+//! seed, so both containers image it exactly as signed, with nothing subtracted.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,9 +43,7 @@ pub struct Packaged {
 /// The artifact name MUST stay `aterm-{short}.dmg` — it is the exact asset
 /// name written into the manifest's `dmg`/`url` fields, and every installed
 /// client resolves its download by that name (a mismatch 404s the whole
-/// fleet's update). The BYTES under the name are the lean app: nothing in the
-/// deployed fleet ever required them to carry a toolchain seed, and since
-/// 2026-08-26 nothing does.
+/// fleet's update). The BYTES under the name are the lean app.
 pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Packaged, String> {
     if !app.is_dir() {
         return Err(format!(
@@ -68,10 +61,8 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
     // mounted image offers the standard drag-to-install gesture even without
     // create-dmg's decorated window. The stage lives under dist/ (same
     // filesystem, so the moves below are renames) and is removed on every exit
-    // path. Its NAME begins with a dot, which is what actually keeps it out of
-    // Spotlight — measured 2026-09-02, a dot-hidden directory and its whole
-    // subtree are absent from the index, while a `.metadata_never_index` marker file
-    // is inert (crates/atpkg/src/noindex.rs).
+    // path. Its NAME begins with a dot, which is what keeps it out of Spotlight
+    // (MEASURED: a `.metadata_never_index` marker is inert; crates/atpkg/src/noindex.rs).
     let stage = out_dir.join(format!(".dmg-stage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;
@@ -113,9 +104,8 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
 /// name written into the manifest's `zip` field, and the client re-derives that
 /// same string from the release tag and refuses anything else.
 ///
-/// Archives the bundle AS SIGNED (and, on the active Apple tier, as stapled):
-/// the seed-stripping restage that used to run here is retired with the seed
-/// itself, so the bytes `ditto` reads are exactly the bytes the DMG carries.
+/// Archives the bundle AS SIGNED (and, on the active Apple tier, as stapled), so
+/// the bytes `ditto` reads are exactly the bytes the DMG carries.
 pub fn create_zip(app: &Path, out_dir: &Path, short_version: &str) -> Result<Packaged, String> {
     if !app.is_dir() {
         return Err(format!(
@@ -179,16 +169,10 @@ fn build_in_stage(app: &Path, stage: &Path, volname: &str, dmg: &Path) -> Result
     std::os::unix::fs::symlink("/Applications", stage.join("Applications"))
         .map_err(|e| format!("symlink /Applications: {e}"))?;
 
-    // THE PLAIN IMAGE, AND ONLY IT (2026-09-23). A decorated Finder window — the
-    // app on the left, the /Applications alias on the right — was attempted on
-    // every cut from 2026-08-30 and never shipped from the documented launcher: a
-    // UDRW image attached `-nobrowse`, then an AppleScript addressed to the
-    // mounted disk, and every launcher cut logged "DMG window layout skipped"
-    // and cut this image anyway (v0.91.0: `Finder got an error: Can't get disk
-    // "aterm 0.91.0". (-1728)`). A step that fails on every run and reports it in
-    // one `==>` line is not a feature, so it is gone, with its escape hatch
-    // (`ATERM_DMG_NO_WINDOW`). The drag gesture is still offered: the stage
-    // carries the /Applications symlink beside the app.
+    // THE PLAIN IMAGE, AND ONLY IT. A decorated Finder window (AppleScript against
+    // the mounted disk) failed on every launcher cut (`Finder got an error: Can't
+    // get disk … (-1728)`). The drag gesture is still offered: the stage carries
+    // the /Applications symlink beside the app.
     println!("==> hdiutil create {} (UDZO)", dmg.display());
     run_quiet(
         Command::new("hdiutil")
@@ -226,11 +210,7 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(aterm_codec::hex::encode_lower(&hasher.finalize()))
 }
 
 fn run_quiet(cmd: &mut Command, what: &str) -> Result<(), String> {

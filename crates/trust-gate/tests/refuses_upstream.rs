@@ -51,14 +51,14 @@ fn write_exec(path: &Path, body: &str) {
 }
 
 /// A standalone package holding this crate's build.rs + src/gate.rs, with an
-/// empty lib and the repo's compiler-scoped opt-out (so a Trust compiler builds
-/// the script exactly as the workspace does — batteries-off). Fresh per case.
+/// empty lib and no cargo config: like the workspace's since 2026-10-07, it
+/// carries no verification off-switch, and the nested build names its lane on
+/// the command line instead ([`build`]). Fresh per case.
 fn scaffold(name: &str) -> PathBuf {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("trust-gate-e2e-{name}"));
     let _ = fs::remove_dir_all(&root);
     let pkg = root.join("pkg");
     fs::create_dir_all(pkg.join("src")).unwrap();
-    fs::create_dir_all(pkg.join(".cargo")).unwrap();
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     fs::copy(here.join("build.rs"), pkg.join("build.rs")).unwrap();
     fs::copy(here.join("src/gate.rs"), pkg.join("src/gate.rs")).unwrap();
@@ -66,11 +66,6 @@ fn scaffold(name: &str) -> PathBuf {
     fs::write(
         pkg.join("Cargo.toml"),
         "[package]\nname = \"trust-gate-e2e\"\nversion = \"0.0.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n[workspace]\n",
-    )
-    .unwrap();
-    fs::write(
-        pkg.join(".cargo/config.toml"),
-        "[target.'cfg(trust_verify)']\nrustflags = [\"-Ztrust-verify=off\"]\n",
     )
     .unwrap();
     root
@@ -115,13 +110,21 @@ fn build(root: &Path, rustc: &Path, path: &str) -> (bool, String) {
     // Targo propagation is unavailable on this platform" is the outer run's
     // own warning about this). The nested build selects the unverified lane
     // explicitly; the gate in build.rs runs either way, which is what these
-    // tests are about. Stock cargo takes no such flag and gets none.
+    // tests are about. Any other driver (a Trust toolchain's compat `cargo`,
+    // which refuses `--unverified`) names the same lane with one cfg-scoped
+    // `--config` appending the off-switch, which a stock compiler — no
+    // `trust_verify` cfg — never applies.
     let is_targo = cargo
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with("targo"));
     if is_targo {
         cmd.arg("--unverified");
+    } else {
+        cmd.args([
+            "--config",
+            "target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-verify=off\"]",
+        ]);
     }
     let out = cmd
         .args(["build", "-q"])
@@ -161,7 +164,10 @@ fn upstream_shaped_compiler_is_refused_and_names_the_installer_without_aterm() {
         text.contains(INSTALL_URL),
         "no aterm on PATH ⇒ the installer:\n{text}"
     );
-    assert!(!text.contains("aterm pkg doctor"), "not doctor:\n{text}");
+    assert!(
+        !text.contains("targo --unverified build"),
+        "not targo:\n{text}"
+    );
     assert!(
         !text.contains("only accepted on the nightly compiler"),
         "the -Z flag must never be the error:\n{text}"
@@ -169,8 +175,8 @@ fn upstream_shaped_compiler_is_refused_and_names_the_installer_without_aterm() {
 }
 
 #[test]
-fn upstream_shaped_compiler_is_refused_and_names_doctor_with_aterm_on_path() {
-    let root = scaffold("doctor");
+fn upstream_shaped_compiler_is_refused_and_names_targo_with_aterm_on_path() {
+    let root = scaffold("targo");
     let wrapper = upstream_shaped_wrapper(&root);
     // An `aterm` on the child's PATH — any executable file by that name.
     let bin = root.join("bin");
@@ -181,8 +187,8 @@ fn upstream_shaped_compiler_is_refused_and_names_doctor_with_aterm_on_path() {
     assert!(!ok, "the nested build must FAIL:\n{text}");
     assert!(text.contains(REFUSAL_HEAD), "{text}");
     assert!(
-        text.contains("aterm pkg doctor"),
-        "aterm on PATH ⇒ doctor:\n{text}"
+        text.contains("fix:  targo --unverified build"),
+        "aterm on PATH ⇒ targo:\n{text}"
     );
     assert!(!text.contains(INSTALL_URL), "not the installer:\n{text}");
 }

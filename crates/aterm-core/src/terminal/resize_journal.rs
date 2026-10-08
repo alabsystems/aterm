@@ -5,56 +5,42 @@
 //! The engine's resize journal and its screen-replacement counters.
 //!
 //! Only the engine knows what a resize did to the rows an application painted.
-//! A rows-only shrink on the alternate screen, with a non-blank bottom row and
-//! the cursor below row 0, demotes the TOP row. The alt grid keeps no history
-//! (`max_scrollback = 0`), so the row is dropped, and the following grow appends
-//! a blank row at the bottom. A 64→63→64 flap therefore leaves the whole screen
-//! one row higher than the app painted it. The app repaints only when its
-//! SIGWINCH handler reads a CHANGED size. When both resizes land before the
-//! handler runs, it reads 64 == 64, skips the repaint, and its later diff frames
-//! land on the shifted content for good (measured 2026-09-28 against a live
-//! Claude Code session, one flap in 52).
+//! A rows-only shrink on the alternate screen (non-blank bottom row, cursor
+//! below row 0) drops the top row, since the alt grid keeps no history, and the
+//! following grow appends a blank row: a 64→63→64 flap leaves the screen one
+//! row higher than the app painted it. If both halves land before the app's
+//! SIGWINCH handler runs, it reads an unchanged size and never repaints.
 //!
-//! The grid now undoes such a flap when nothing was drawn between its halves
-//! (`aterm_grid`'s resize undo: the shrink keeps the rows it took off, the grow
-//! hands them back), and the report says so (`stashed`, `restored_top`,
-//! `restored_bottom`). A flap the app drew into keeps the shift, and the app,
-//! having drawn at the changed size, repaints.
+//! The grid undoes such a flap when nothing was drawn between its halves
+//! (`aterm_grid`'s resize undo), and the report says so (`stashed`,
+//! `restored_top`, `restored_bottom`); a flap the app drew into keeps the
+//! shift, and the app, having drawn at the changed size, repaints.
 //!
-//! A host cannot see this from the geometry, which is unchanged across the
-//! flap, nor from a per-read watermark, which misses a flap that lands between
-//! two PTY reads. So the engine records each resize itself, in order, including
-//! both halves of such a flap:
+//! A host cannot see a flap from the geometry or from a per-read watermark, so
+//! the engine records each resize itself:
 //!
 //! * [`ResizeReport`]: the from/to geometry, the active screen, whether a DEC
-//!   2026 frame was open, and every arm of the grid's row accounting
+//!   2026 frame was open, and the grid's row accounting
 //!   ([`aterm_grid::ResizeShape`]).
 //! * The journal: the newest [`RESIZE_JOURNAL_CAP`] reports, keyed by a
-//!   1-based ordinal that never resets for this engine's lifetime. A reader
-//!   holds its last ordinal and asks for what came after it through
-//!   [`Terminal::resize_journal_since`]. An overrun is COUNTED, never silent.
-//! * The engine's LIFETIME token ([`Terminal::resize_lifetime`]): unique per
-//!   engine built in this process, so a reader that holds an ordinal can tell a
-//!   copy it took late (a lower ordinal of the SAME lifetime: stale) from a
-//!   restored engine (another lifetime, whose ordinals restart at 0).
-//! * Two monotonic counters of the operations that repaint a displaced screen
-//!   from scratch: [`Terminal::full_clear_count`] (ED 2, and ED 0 issued with
-//!   the cursor home) and [`Terminal::screen_replaced_count`] (alternate screen
-//!   enter and exit, RIS). A reader compares each against its value in a report
-//!   to learn whether the app healed the screen afterwards
-//!   ([`ResizeReport::healed_by`]). ED 3 is not one: it erases the history
-//!   behind the screen and leaves every visible row where it is.
+//!   1-based ordinal that never resets for this engine's lifetime, read through
+//!   [`Terminal::resize_journal_since`]. An overrun is counted, never silent.
+//! * The lifetime token ([`Terminal::resize_lifetime`]): unique per engine in
+//!   this process, so a reader tells a stale copy (lower ordinal, same
+//!   lifetime) from a restored engine (another lifetime, ordinals from 0).
+//! * Two monotonic counters of operations that repaint a displaced screen:
+//!   [`Terminal::full_clear_count`] (ED 2, and ED 0 with the cursor home) and
+//!   [`Terminal::screen_replaced_count`] (alternate screen enter/exit, RIS). A
+//!   reader compares them with a report's values to learn whether the app
+//!   healed the screen ([`ResizeReport::healed_by`]). ED 3 is not one: it
+//!   leaves every visible row in place.
 //!
-//! PURE, like the rest of the engine. No clock is read here (`grep_guard` C3):
-//! the ordinal and `content_seq` order a resize against output, and the host
-//! stamps wall time. Nothing here is checkpointed. A restored engine starts at
-//! ordinal 0 under a new lifetime token, and a reader keys on ordinal deltas
-//! within one lifetime; a watermark past the current ordinal is read as 0 (see
-//! [`Terminal::resize_journal_since`]).
-//! No hot-path cost: a resize is already O(viewport), and the counters sit in
-//! the rare ED and screen-switch handlers.
+//! No clock is read here (`grep_guard` C3): the ordinal and `content_seq` order
+//! a resize against output, and the host stamps wall time. Nothing is
+//! checkpointed; a watermark past the current ordinal reads as 0.
 
 use super::Terminal;
+use crate::grid::ResizePolicy;
 
 #[cfg(test)]
 #[path = "resize_journal_tests.rs"]
@@ -71,7 +57,7 @@ pub const RESIZE_JOURNAL_CAP: usize = 16;
 /// [`RESIZE_JOURNAL_CAP`] in ordinal arithmetic (a lossless widening).
 const CAP_U64: u64 = RESIZE_JOURNAL_CAP as u64;
 
-/// One resize as the engine applied it to the ACTIVE grid.
+/// One resize as the engine applied it to the active grid.
 ///
 /// `from`/`to` are `(rows, cols)`. `to` is after the grid's ingress clamp, so
 /// it is the geometry the grid really took. Every call is recorded, including
@@ -95,12 +81,12 @@ pub struct ResizeReport {
     pub in_sync: bool,
     /// Trailing blank rows below the cursor dropped by a shrink (nothing moved).
     pub trimmed: u16,
-    /// Top rows demoted into history by a shrink: every surviving row moved UP
+    /// Top rows demoted into history by a shrink: every surviving row moved up
     /// by this count.
     pub demoted: u16,
     /// Bottom rows pushed off the screen with nothing above them moving.
     pub pushed: u16,
-    /// History lines a grow revealed at the top: every row moved DOWN by this
+    /// History lines a grow revealed at the top: every row moved down by this
     /// count.
     pub revealed: u16,
     /// Blank rows a grow appended at the bottom (nothing moved).
@@ -119,12 +105,12 @@ pub struct ResizeReport {
     /// A width change rewrapped the grid (a primary-screen reflow), which
     /// renumbers rows wholesale, so the counts above are not a displacement.
     pub reflowed: bool,
-    /// The active grid's content sequence (`Terminal::content_seq`) AFTER the
+    /// The active grid's content sequence (`Terminal::content_seq`) after the
     /// resize. A resize re-lays the grid out, so it advances this by itself
     /// (once, or more when a width change pulls history back): compare a live
     /// `content_seq` against it to learn whether the app drew since.
     pub content_seq: u64,
-    /// The active grid's content sequence BEFORE the resize. Equal to the
+    /// The active grid's content sequence before the resize. Equal to the
     /// previous report's `content_seq` exactly when nothing changed the screen
     /// between the two resizes (see [`ResizeReport::adjoins`]).
     pub content_seq_before: u64,
@@ -136,7 +122,7 @@ pub struct ResizeReport {
 
 impl ResizeReport {
     /// Rows this resize moved the painted content by: `revealed - demoted`.
-    /// Negative means the content moved UP. Meaningful when `reflowed` is
+    /// Negative means the content moved up. Meaningful when `reflowed` is
     /// false; a rewrap moves rows on its own. Rows the resize undo handed back
     /// to the top are in `revealed`, so a quiet alt-screen flap sums to 0 just
     /// as a primary-screen one does.
@@ -157,7 +143,7 @@ impl ResizeReport {
     /// the alternate screen keeps no history, so a demoted row is dropped, and
     /// a later grow appends blanks rather than revealing it. Not lossy when the
     /// resize undo kept the rows (`stashed`): a grow back with nothing drawn in
-    /// between hands them back. Decided when THIS resize ran, so it is a
+    /// between hands them back. Decided when this resize ran, so it is a
     /// promise, not an outcome: any output before the grow back (even a
     /// spinner frame from an app that never saw the smaller size), an alt
     /// switch, a reset or a checkpoint restore drops the undo and the rows are
@@ -183,7 +169,7 @@ impl ResizeReport {
     /// The screen this resize displaced has since been repainted from scratch:
     /// `full_clears`/`screen_replaced` are the engine's
     /// [`Terminal::full_clear_count`] and [`Terminal::screen_replaced_count`]
-    /// read later, and either one advanced PAST this report's. Both counters
+    /// read later, and either one advanced past this report's. Both counters
     /// only grow, so a reading taken before this resize (a stale one, lower)
     /// can never pass for a heal; compare readings of one engine lifetime only
     /// ([`Terminal::resize_lifetime`]).
@@ -201,6 +187,10 @@ pub(super) struct ResizeOrigin {
     alt: bool,
     in_sync: bool,
     content_seq: u64,
+    /// The resize ran under [`ResizePolicy::Native`]: the grid is the frame and
+    /// keeps the resize undo. Under ConPTY conhost repaints the viewport after
+    /// every resize, so such a session never accrues render debt.
+    native: bool,
 }
 
 /// The active selection a grid resize undo will put back
@@ -238,7 +228,7 @@ pub(super) struct ResizeJournal {
 static NEXT_LIFETIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Default for ResizeJournal {
-    /// An empty journal with a FRESH lifetime token: every engine built (new,
+    /// An empty journal with a fresh lifetime token: every engine built (new,
     /// restored from a checkpoint) gets its own.
     fn default() -> Self {
         Self {
@@ -280,10 +270,10 @@ impl ResizeJournal {
 }
 
 /// Is an ED (`CSI Ps J`) with parameter `mode`, issued with the cursor at
-/// `(row, col)`, a FULL clear of the visible screen?
+/// `(row, col)`, a full clear of the visible screen?
 ///
 /// ED 2 erases the whole screen. ED 0 erases from the cursor to the end, which
-/// is the whole screen only from the home position. ED 3 is NOT one: it erases
+/// is the whole screen only from the home position. ED 3 is not one: it erases
 /// the scrollback and leaves every visible row where it is (on the alternate
 /// screen, which has none, it changes nothing a displaced screen shows); a
 /// clearing app sends it together with ED 2, which counts. EL, ED 1 and DECSED
@@ -299,8 +289,9 @@ pub(super) fn is_full_clear(mode: u16, row: u16, col: u16) -> bool {
 impl Terminal {
     /// Capture the pre-resize facts for this resize's [`ResizeReport`]. Called
     /// by both resize entry points before either grid is resized.
-    pub(super) fn resize_origin(&self) -> ResizeOrigin {
+    pub(super) fn resize_origin(&self, policy: ResizePolicy) -> ResizeOrigin {
         ResizeOrigin {
+            native: matches!(policy, ResizePolicy::Native),
             from: (self.grid.rows(), self.grid.cols()),
             alt: self.modes.alternate_screen,
             in_sync: self.modes.synchronized_output,
@@ -308,9 +299,6 @@ impl Terminal {
         }
     }
 
-    /// Journal the resize that just ran: drain the ACTIVE grid's row accounting
-    /// and push one report. The saved grid records its own shape too, but only
-    /// the screen the app is painting is journalled.
     /// Keep the active selection whole across a flap the grid undoes: record
     /// it as it stood before the first shrink of a resize undo, keep that record
     /// only while the same undo stays open and nothing moved the selection
@@ -353,6 +341,9 @@ impl Terminal {
         });
     }
 
+    /// Journal the resize that just ran: drain the active grid's row accounting
+    /// and push one report. The saved grid records its own shape too, but only
+    /// the screen the app is painting is journalled.
     pub(super) fn journal_resize(&mut self, origin: ResizeOrigin) {
         let shape = self.grid.take_last_resize_shape();
         let report = ResizeReport {
@@ -375,7 +366,41 @@ impl Terminal {
             full_clears: self.transient.full_clears,
             screen_replaced: self.transient.screen_replaced,
         };
+        // The engine's render debt: what the program has not repainted. Only the
+        // alternate screen is app-addressed (the primary is history-backed and
+        // moves with its cursor), a rewrap renumbers rows on its own, and under
+        // ConPTY the host repaints the viewport itself.
+        if origin.native && report.alt && !report.reflowed {
+            let (shift, pushed) = self.transient.render_debt;
+            self.transient.render_debt = (
+                shift.saturating_add(report.shift()),
+                pushed.saturating_add(report.net_pushed()),
+            );
+        }
         self.resize_journal.push(report);
+    }
+
+    /// The rows the alternate screen owes its program since the screen was last
+    /// repainted from scratch: `(shift, pushed)`, the sums of
+    /// [`ResizeReport::shift`] and [`ResizeReport::net_pushed`] over the
+    /// alternate-screen, non-reflowed resizes run under `ResizePolicy::Native`.
+    /// `(0, 0)` when nothing is owed, `(-1, 0)` when every row sits one higher
+    /// than the program drew it. Zeroed by a full clear (ED 2, a home ED 0), an
+    /// alternate-screen switch and a reset; exact however far the journal has
+    /// been overrun, so a missed report can never hide a displacement.
+    #[must_use]
+    pub fn render_debt(&self) -> (i32, i32) {
+        self.transient.render_debt
+    }
+
+    /// Carry a predecessor's render debt across a handoff: called once, right
+    /// after a checkpoint restore, and only while the alternate screen is up
+    /// (the debt is about that screen's rows). Any later full clear, screen
+    /// switch or reset zeroes it as usual.
+    pub fn seed_render_debt(&mut self, shift: i32, pushed: i32) {
+        if self.modes.alternate_screen {
+            self.transient.render_debt = (shift, pushed);
+        }
     }
 
     /// How many resizes this engine has applied: the newest journal ordinal, 0
@@ -386,11 +411,11 @@ impl Terminal {
         self.resize_journal.ordinal
     }
 
-    /// This engine's LIFETIME token: unique among the engines this process
-    /// built (a counter, never 0) and fixed for the engine's life. Ordinals, `content_seq` and the two heal counters compare only
-    /// within one lifetime: a reader that holds a reading of another lifetime
-    /// (a restored engine) starts over rather than read a lower ordinal as a
-    /// stale copy of this one.
+    /// This engine's lifetime token: unique among the engines this process
+    /// built (a counter, never 0) and fixed for the engine's life. Ordinals,
+    /// `content_seq` and the two heal counters compare only within one
+    /// lifetime: a reader holding a reading of another lifetime (a restored
+    /// engine) starts over rather than read a lower ordinal as a stale copy.
     #[must_use]
     pub fn resize_lifetime(&self) -> u64 {
         self.resize_journal.lifetime
@@ -401,7 +426,7 @@ impl Terminal {
     /// [`RESIZE_JOURNAL_CAP`] behind).
     ///
     /// Pass 0 for everything retained, or the last ordinal already read. A
-    /// watermark PAST [`resize_ordinal`](Self::resize_ordinal) was taken from
+    /// watermark past [`resize_ordinal`](Self::resize_ordinal) was taken from
     /// another engine lifetime (a restored engine restarts at 0), so it is read
     /// as 0 instead of hiding the new engine's resizes.
     #[must_use]

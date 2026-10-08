@@ -5,8 +5,7 @@
 //! Shell integration types for OSC 7 / 133 / 633 / 1337 protocol support.
 //!
 //! Provides data types for command marks, terminal marks, annotations,
-//! and shell events. Extracted from `aterm-core/src/terminal/shell.rs`
-//! to break circular dependencies (Part of #5663, #2341).
+//! and shell events.
 
 /// Get current time as milliseconds since Unix epoch.
 ///
@@ -27,7 +26,7 @@ pub fn current_time_ms() -> Option<u64> {
 /// or `end` precedes `start` (an inconsistent pair is not a zero duration).
 ///
 /// The one rule behind every OSC 133 phase duration on [`CommandMark`] and
-/// `OutputBlock`, which used to carry six identical copies of this `match`.
+/// `OutputBlock`.
 #[must_use]
 pub(crate) fn elapsed_ms(start: Option<u64>, end: Option<u64>) -> Option<u64> {
     match (start, end) {

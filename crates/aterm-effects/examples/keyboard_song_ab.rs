@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! KEYBOARD-SONG A/B — the bench for the THREE THINGS the owner asked for
-//! (2026-08-26/28): a delete that POOFS, a spacebar that is a low musical
-//! downbeat, and typing that reads as "a little fun song" for ten minutes
-//! rather than twenty seconds.
-//!
-//! It exists because `typing_voice_ab` CANNOT audit that request: its shared
-//! `typing_script` contains ZERO `SoundKind::Space` cues (only Typed / Jump /
-//! Backspace), so the one gesture the owner named is invisible to it. This
-//! bench types REAL PROSE — every space is a [`SoundKind::Space`], every
-//! newline a [`SoundKind::Jump`] — at realistic rates, with the edit and
-//! whitespace corner cases spelled out.
+//! Keyboard-song A/B bench: a delete that poofs, a spacebar that is a low
+//! musical downbeat, and typing that reads as a pleasant song over long
+//! sessions. It types real prose (every space a [`SoundKind::Space`], every
+//! newline a [`SoundKind::Jump`]) at realistic rates, with the edit and
+//! whitespace corner cases spelled out (owner, 2026-08-26).
 //!
 //!   targo --unverified run --release -p aterm-effects \
 //!       --example keyboard_song_ab -- <out_dir> \
@@ -20,66 +14,35 @@
 //!       [--timbre plain|bloom|hue|room] [--jitterfix ship|j0|j1] [--metronome]
 //!       [--census] [--probes] [--scripts] [--text "<s>"]
 //!
-//! `--scripts` renders THE LISTENING REEL's fixed scripts (see [`SCRIPTS`]) and
-//! `--text "<s>"` renders one line of the caller's own, both through the
-//! product's own key path — a bare Shift ahead of every shifted run, a keyed
-//! Return as [`SoundKind::Enter`] — and writes one TSV row per take.
+//! `--scripts` renders the listening reel's fixed scripts ([`SCRIPTS`]) and
+//! `--text "<s>"` one line of the caller's own, both through the product's key
+//! path (a bare Shift ahead of every shifted run, Return as
+//! [`SoundKind::Enter`]), writing one TSV row per take.
 //!
-//! `--metronome` types the prose scene as a STRICT metronome — no sentence
-//! rest, no line-ending beat, no paragraph think — the way the census types
-//! it, so a WAV pair at two rates is the census's own tempo-invariance claim
-//! made audible (design §8's first open question). The default keeps the
-//! rests, because a person takes them.
+//! `--metronome` types the prose scene as a strict metronome (no rests), as
+//! the census does, so a WAV pair at two rates makes tempo invariance audible.
 //!
-//! # THE STAMP (2026-09-08) — why every WAV before this date was evidence of
-//! # nothing
+//! Every cue goes through [`TrailSynth::push_meta`] with its scripted press
+//! time, so the melody runs on the shipping clock (bare `push` would fall back
+//! to the 512-frame block clock).
 //!
-//! This bench used to call bare [`TrailSynth::push`]. `EventMeta::default()`
-//! leaves `at_ms = 0`, and rainbow kitty v2's `v2_at_ms` reads `0` as "no host
-//! stamp" and falls back to the synth's own 512-frame block clock. So the
-//! melody's own clock — under the shipped engine a 220 ms step gate, and under
-//! the derived line the inter-key interval the whole contour is read from —
-//! HAD NEVER BEEN EXERCISED BY THIS BENCH at the resolution a hand types at:
-//! every cue drained into one block carried one identical timestamp. It now
-//! calls
-//! [`TrailSynth::push_meta`] with the cue's own scripted press time, so the
-//! clock under test is the shipping clock.
+//! Every WAV is stereo: left is the synth, right a 2 ms 2 kHz tick at each
+//! key's press time (−20 dBFS). The music channel carries [`PRE_ROLL_FRAMES`]
+//! of leading silence (the host's queue depth), so the file shows the real
+//! finger-to-note offset.
 //!
-//! # THE CLICK TRACK — an ear cannot judge alignment from a mono file
+//! `--census` sweeps 3-14 cps, clean and at ±25 % jitter, over several
+//! corpora, reporting keys, steps, distinct-pitch %, melody notes/s, silent
+//! keys and a hash of the degree sequence, read off the engine's own
+//! [`aterm_effects::trail_sound::MelodyV2`] hooks.
 //!
-//! Every WAV is now STEREO: **left is the synth, right is a 2 ms 2 kHz tick at
-//! each key's own scripted press time** at −20 dBFS. The music channel — and
-//! only the music channel — carries [`PRE_ROLL_FRAMES`] of leading silence,
-//! the two buffers the host's audio queue already has rendered ahead of a
-//! fresh cue (`trail_audio::BUFFER_COUNT − 1` × `BUFFER_FRAMES` = 1024 frames
-//! = 21.3 ms at 48 kHz). The file therefore carries the REAL perceived offset
-//! between finger and note, and the two channels line up under each other in
-//! any editor. "The notes don't align with the keystrokes" is a measurement
-//! here, not an opinion.
-//!
-//! # THE CENSUS — `--census`, and it needs no ear
-//!
-//! Sweeps 3 / 4 / 4.5 / 5 / 6 / 8 / 10 / 14 cps, clean and at ±25 % jitter,
-//! over three corpora, and reports what the melody law did to each: keys,
-//! steps, distinct-pitch %, melody notes/s, SILENT keys and a hash of the
-//! degree sequence itself — read off the engine's
-//! own [`aterm_effects::trail_sound::MelodyV2`] hooks rather than re-derived,
-//! so the bench cannot drift from the law it measures.
-//!
-//! Renders each scenario at BOTH the host default volume (0.4) and 1.0, with
-//! NO independent normalisation — the two sides of an A/B are only comparable
-//! if the gain staging is identical, so the writer is a straight float dump of
-//! whatever the synth produced. The `--tag` names the render (`current` vs
-//! `proposed`); filenames are `<tag>-<scenario>-v<volume>.wav`.
-//!
-//! Reported per scenario: PITCHED onsets/second (a tonality test, so a noise
-//! poof is not counted as a note), pre-clip peak (the soft clipper is
-//! inverted, so the number is the real headroom the mix asked for), post-clip
-//! peak, RMS, crest, max live voices, voice steals, and the render time as a
-//! realtime factor. Plus a GESTURE probe table (Typed / Space / Backspace /
-//! Shift / Land in isolation from one settled melody state) carrying each
-//! gesture's spectral centroid, high-band fraction, tonality and peak — which
-//! is where "the erase is airy and above the keystroke" is a MEASUREMENT.
+//! Each scenario renders at the host default volume (0.4) and 1.0 with no
+//! normalisation, so A/B sides share gain staging. Filenames are
+//! `<tag>-<scenario>-v<volume>.wav`. Reported per scenario: pitched onsets/s,
+//! pre-clip peak (the soft clipper is inverted), post-clip peak, RMS, crest,
+//! max live voices, voice steals and realtime factor, plus a gesture probe
+//! table (Typed / Space / Backspace / Shift / Land from one settled melody
+//! state) with spectral centroid, high-band fraction, tonality and peak.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -99,12 +62,10 @@ const SEED: u32 = 0x50_4F_4F_46; // "POOF"
 /// so the render's cue quantisation matches the shipping one.
 const BLOCK: usize = 512;
 
-/// The two audio buffers the host's output queue already holds rendered when
-/// a fresh cue arrives — `trail_audio::BUFFER_COUNT − 1` (3 − 1) times
-/// `BUFFER_FRAMES` (512). 1024 frames = 21.3 ms at 48 kHz, and it is the
-/// steady-state distance between a finger and the note it asked for. Prepended
-/// to the MUSIC channel alone, so the click track keeps the key's own time and
-/// the file carries the offset rather than hiding it.
+/// The two audio buffers the host's output queue holds rendered when a fresh
+/// cue arrives: `(BUFFER_COUNT − 1) × BUFFER_FRAMES` = 1024 frames = 21.3 ms at
+/// 48 kHz, the steady-state finger-to-note distance. Prepended to the music
+/// channel only, so the click track keeps the key's own time.
 const PRE_ROLL_FRAMES: usize = 2 * BLOCK;
 
 /// One scripted cue — a key press, with everything the shipping seam would
@@ -118,36 +79,26 @@ struct Cue {
     gesture: SoundGesture,
     pan: f32,
     heat: f32,
-    /// [`SoundEvent::shifted`] — the host-priced "this glyph was typed with
-    /// Shift held". The scripts below set it exactly where a person's hand
-    /// would: capitals and shifted symbols.
+    /// [`SoundEvent::shifted`]: set on capitals and shifted symbols.
     shifted: bool,
-    /// THE CHARACTER THE KEY PUT ON SCREEN, which the old tuple threw away.
-    /// `'\0'` where no glyph backs the cue — a bare Shift, a held Backspace.
-    /// The melody is DERIVED from what was typed (R2), so the bench hands the
-    /// engine the character through the two slots the host seam fills:
-    /// [`EventMeta::glyph_class`] and [`EventMeta::rank`].
+    /// The character the key put on screen (`'\0'` where no glyph backs the
+    /// cue: a bare Shift, a held Backspace). The melody is derived from what
+    /// was typed, so the bench passes it through [`EventMeta::glyph_class`]
+    /// and [`EventMeta::rank`].
     ch: char,
 }
 
 impl Cue {
-    /// THE KEY'S OWN TIME on the host input clock, ms — the number the
-    /// melody's gate reads and the number the click track ticks at. One
-    /// definition, so the census's `algn` column compares the engine's stamp
-    /// against the same clock the cue was pushed with rather than a second
-    /// rounding of it.
-    ///
-    /// `0` means "no host stamp" to `v2_at_ms`, so the first millisecond of a
-    /// take is pushed to 1 rather than silently falling back to the block
-    /// clock.
+    /// The key's time on the host input clock, ms: what the melody's gate reads
+    /// and the click track ticks at. `0` means "no host stamp" to `v2_at_ms`,
+    /// so the first millisecond is pushed as 1.
     fn at_ms(self) -> u32 {
         ((self.t * 1000.0) as u32).max(1)
     }
 
     /// The host side-car for this press.
     fn meta(self) -> EventMeta {
-        // A KEY AT A PASSWORD PROMPT (2026-09-27): the host's one stamp —
-        // class `SECRET`, rank 0 — whatever the key was.
+        // A key at a password prompt: the host stamps class `SECRET`, rank 0.
         if self.ch == SECRET_CH {
             return EventMeta {
                 at_ms: self.at_ms(),
@@ -157,12 +108,8 @@ impl Cue {
         }
         EventMeta {
             at_ms: self.at_ms(),
-            // THE GLYPH CLASS and THE ALPHABET RANK — what the derived melody
-            // and the class voices know about WHAT was typed. Both through
-            // the engine's own producers, never a second copy of either
-            // table: a bench that carried its own alphabet (or its own idea
-            // of which marks knock) could agree with a melody the shipping
-            // code does not play.
+            // Glyph class and alphabet rank through the engine's own
+            // producers, so the bench cannot disagree with the shipping tables.
             glyph_class: aterm_effects::trail_sound::typed_glyph_class(
                 (self.ch != '\0').then_some(self.ch),
             ),
@@ -175,18 +122,16 @@ impl Cue {
             // The bench renders on its own grid: cues land ON a block
             // boundary by construction, so there is no pre-roll to hand over.
             block_lead_s: 0.0,
-            // §22's FLOW HEAT. The bench plays the COLD box: flow is a
-            // state the hand earns at the keyboard, and a scripted take
-            // has no hand. 0.0 is the identity.
+            // Flow heat: a scripted take has no hand, so it plays the cold box
+            // (0.0 is the identity).
             flow: 0.0,
         }
     }
 }
 
-/// [`Cue::ch`] for a key typed at a canonical no-echo prompt (2026-09-27;
-/// owner: *"password: fix to all same tone"*). Not a glyph — the bench's
-/// spelling of the host's `SECRET` stamp, in the private-use area so no
-/// script text can type it by accident.
+/// [`Cue::ch`] for a key typed at a no-echo prompt: the bench's spelling of the
+/// host's `SECRET` stamp, in the private-use area so no script can type it
+/// (owner, 2026-09-27).
 const SECRET_CH: char = '\u{E000}';
 
 /// The glyphs a US layout cannot produce without Shift.
@@ -194,9 +139,8 @@ fn needs_shift(ch: char) -> bool {
     ch.is_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch)
 }
 
-/// A deterministic xorshift32. The jitter has to be a PERFORMANCE, not noise:
-/// `--seed N` twice must render byte-identically (§7 step 2d's `cmp` test) and
-/// two seeds must be two different hands on one text (§7 step 2c).
+/// A deterministic xorshift32: `--seed N` twice renders byte-identically and
+/// two seeds are two different hands on one text.
 struct Rng(u32);
 
 impl Rng {
@@ -220,17 +164,10 @@ impl Rng {
     }
 }
 
-/// THE HAND: a typing rate and how much it wobbles.
-///
-/// Human inter-key gaps at prose speed carry ±25 %, and the DELETED step gate
-/// was a HARD threshold on that jittery signal — at 4.4 cps a ±10 ms wobble
-/// flipped a key across the 220 ms boundary between "a new note" and "a muted
-/// repeat of the last one". That is why the jitter is a first-class dial here
-/// and not a garnish: it was the axis the aliasing lived on, and it is now the
-/// axis the CONTOUR lives on — the derived line reads the same wobble as an
-/// accelerating or a hesitating hand ([`ACCEL_SHARE`] in the engine), so the
-/// jitter column is what proves the melody is generated from the typing
-/// pattern rather than merely triggered by it.
+/// The hand: a typing rate and how much it wobbles. Human inter-key gaps at
+/// prose speed carry ±25 %, and the derived line reads that wobble as an
+/// accelerating or hesitating hand ([`ACCEL_SHARE`] in the engine), so the
+/// jitter column shows the melody is generated from the typing pattern.
 struct Hand {
     cps: f32,
     /// Fractional, so 0.25 is ±25 %.
@@ -268,9 +205,8 @@ impl Hand {
 // The scripts — real text, real spaces
 // ---------------------------------------------------------------------------
 
-/// The prose corpus. Ordinary English at ordinary word lengths, so the SPACE
-/// cadence is the real one (~2 per second at 10 cps) rather than a synthetic
-/// grid. Paragraph breaks are blank lines; every `\n` is an Enter.
+/// The prose corpus: ordinary English at ordinary word lengths, so the space
+/// cadence is real (~2 per second at 10 cps). Every `\n` is an Enter.
 const PROSE: &str = "\
 the renderer keeps one atlas per face and never uploads a glyph twice.\n\
 when the shaper hands back a run we look up each cluster, and only the\n\
@@ -323,13 +259,10 @@ fn type_text(cues: &mut Vec<Cue>, t0: f32, hand: &mut Hand, text: &str, heat: f3
     t
 }
 
-/// Type `text` as a STRICT METRONOME: one cue per character at the hand's own
-/// interval and NOTHING else — no sentence rest, no line-ending beat.
-///
-/// The census exists to read the melody law at ONE rate, and a rest is a
-/// different law on a different clock (`PHRASE_PAUSE_MS`'s resolution). Mixing
-/// the two smears the numbers the census is for. The ear's takes keep
-/// [`type_text`]'s rests, because a person takes them.
+/// Type `text` as a strict metronome: one cue per character at the hand's
+/// interval and no rests. The census reads the melody at one rate, and a rest
+/// is a different rule on a different clock (`PHRASE_PAUSE_MS`). The ear's
+/// takes keep [`type_text`]'s rests.
 fn type_metronome(cues: &mut Vec<Cue>, t0: f32, hand: &mut Hand, text: &str, heat: f32) -> f32 {
     let mut t = t0;
     let mut col = 0.0f32;
@@ -358,12 +291,9 @@ fn type_metronome(cues: &mut Vec<Cue>, t0: f32, hand: &mut Hand, text: &str, hea
     t
 }
 
-/// 60 s of realistic prose at 10 cps with the pauses a typist actually takes,
-/// looping the corpus until the window is full.
-///
-/// `metronome` drops every rest — the same script [`census_row`] types, so
-/// the take's first 403 keys ARE the census's `prose` row for that rate and
-/// the row's `seq` says whether two takes play the same degrees.
+/// 60 s of realistic prose at 10 cps with a typist's pauses, looping the
+/// corpus. `metronome` drops every rest, so the take's first 403 keys are the
+/// census's `prose` row for that rate.
 fn scenario_prose(cps: f32, jitter: f32, seed: u32, metronome: bool) -> Scenario {
     let mut cues = Vec::new();
     let mut hand = Hand::new(cps, jitter, seed);
@@ -385,23 +315,13 @@ fn scenario_prose(cps: f32, jitter: f32, seed: u32, metronome: bool) -> Scenario
     }
 }
 
-/// THE EDIT SCENARIO — the deletion cases the owner named, in one pass:
-/// `type 12 → delete 12` three times, then twenty alternating type/delete
-/// pairs, then a HELD backspace (30 Hz auto-repeat, the rate the min-gap
-/// governor actually has to survive).
+/// The edit scenario: `type 12 → delete 12` three times, then twenty
+/// alternating type/delete pairs, then a held backspace (30 Hz auto-repeat,
+/// the rate the min-gap governor has to survive).
 fn scenario_edit() -> Scenario {
-    /// THE WORD THIS SCENARIO WRITES, ERASES AND WRITES AGAIN — twelve
-    /// letters, one per key of a lap, so a lap is exactly the twelve presses
-    /// the script already had.
-    ///
-    /// It used to be twelve of the letter `x`. That was harmless while the
-    /// melody walked a pre-composed verse and the character reached nothing,
-    /// and it became a lie the day the line was DERIVED from the glyph: a
-    /// doubled letter is a stride of zero by §3.1, so twelve `x`s are twelve
-    /// re-strikes of ONE note, and the reel pair this scenario exists to make
-    /// — "type / delete / retype: the melody un-writes, one note per key both
-    /// ways" — had no melody in it to un-write. A fixture that types one
-    /// letter cannot demonstrate a melody derived from the letters.
+    /// The word this scenario writes, erases and writes again: twelve distinct
+    /// letters, one per key of a lap, so the retyped melody has notes to
+    /// un-write (a repeated letter would be a stride of zero).
     const EDIT_WORD: &str = "unmistakable";
     let mut cues = Vec::new();
     let mut t = 0.5f32;
@@ -436,10 +356,9 @@ fn scenario_edit() -> Scenario {
         t += 0.7;
     }
     t += 0.6;
-    // Alternating: the case where a poof must not be swallowed by the
-    // keystroke inside the global min-gap. The letters keep advancing through
-    // the word, so the twenty keys are twenty notes and a swallowed one is
-    // audible as a hole rather than as more of the same pitch.
+    // Alternating: a poof must not be swallowed by the keystroke inside the
+    // global min-gap. The letters advance through the word, so a swallowed
+    // note is audible as a hole.
     for i in 0..20 {
         push(&mut cues, t, SoundKind::Typed, 0.0, word[i % word.len()]);
         t += 0.09;
@@ -460,9 +379,8 @@ fn scenario_edit() -> Scenario {
     }
 }
 
-/// THE WHITESPACE SCENARIO — ordinary word spaces, then the pathological
-/// cases: single-letter words (`a a a a`), four-space indentation, and an
-/// eight-space run. The coalescing law is audible here or nowhere.
+/// The whitespace scenario: ordinary word spaces, then single-letter words
+/// (`a a a a`), four-space indentation and an eight-space run.
 fn scenario_space() -> Scenario {
     let mut cues = Vec::new();
     let mut t = 0.5f32;
@@ -489,13 +407,9 @@ fn scenario_space() -> Scenario {
     }
 }
 
-/// THE SHIFT SCENARIO — the owner's "when doing a shift-key press (not the
-/// shift, but the shifted key) make it higher pitched", as an A/B you can hear
-/// inside one file.
-///
-/// Three passes over the SAME words: all lower case, then Capitalised, then
-/// SHOUTED. The pitch difference is the whole point, so the words, the cadence
-/// and the pans are identical across the three — only `shifted` moves.
+/// The shift scenario: three passes over the same words (lower case,
+/// Capitalised, SHOUTED) with identical cadence and pans, so only `shifted`
+/// moves.
 fn scenario_shift() -> Scenario {
     let mut cues = Vec::new();
     let mut t = 0.5f32;
@@ -524,22 +438,15 @@ fn scenario_shift() -> Scenario {
     }
 }
 
-/// THE ROTATION SCENARIO — the owner's 2026-08-31 ask, as a take you can hear:
-/// "when pressing shift, the tone should rotate, same for space."
+/// The rotation scenario: does a repeated Shift or Space rotate its tone?
+/// (owner, 2026-08-31)
 ///
-/// Two halves, deliberately sparse so every gesture is separable and can be
-/// PITCHED from the render rather than argued about:
-///
-/// - A. THE DRONE CASE. Twenty BARE [`SoundKind::Shift`] presses, 0.45 s
-///   apart, with nothing else sounding and the pan held at centre — so the
-///   column nudge is constant and the melody never steps. Whatever pitch
-///   variety is here is the lift's OWN, which is exactly the thing the owner
-///   says is missing. Every other scenario in this bench sets `shifted` on
-///   capitals and cues no bare modifier at all, so this case has never been
-///   measured before.
-/// - B. THE WORD CLOCK. Twenty-four words of prose at 9 cps — two laps of an
-///   eight-step bass walk, two of a twelve — so a walk that returns to its
-///   root too soon shows up as a repeat inside the take.
+/// - A. Twenty bare [`SoundKind::Shift`] presses 0.45 s apart, alone and
+///   centred, so the melody never steps and any pitch variety is the ting's
+///   own.
+/// - B. Twenty-four words of prose at 9 cps (two laps of an eight-step bass
+///   walk, two of a twelve), so a walk returning to its root too soon shows
+///   as a repeat.
 fn scenario_rotate() -> Scenario {
     let mut cues = Vec::new();
     let mut t = 0.5f32;
@@ -550,9 +457,7 @@ fn scenario_rotate() -> Scenario {
             pan: 0.0,
             heat: 0.5,
             shifted: false,
-            // A BARE MODIFIER PUTS NO GLYPH ON SCREEN. This is defect (i) of
-            // §2.3 made visible in the script: a cue with no character behind
-            // it that nonetheless sings a pitched note.
+            // A bare modifier puts no glyph on screen.
             ch: '\0',
         });
         t += 0.45;
@@ -577,15 +482,8 @@ fn scenario_rotate() -> Scenario {
 /// A 20 cps BURST — twice the sustained rate the governor is tuned for, six
 /// seconds of it, with spaces at real word cadence.
 fn scenario_burst() -> Scenario {
-    /// THE LETTERS THE BURST IS MADE OF — real text, cycled, spaces removed
-    /// because the script cues its own on the sixth key.
-    ///
-    /// It used to be the letter `x`, once per key. Under a derived line that
-    /// makes every key of the burst a doubled letter and therefore a
-    /// re-strike of one pitch, which would have handed the owner a reel pair
-    /// captioned "every key is now its own note" playing three notes a second
-    /// under twelve onsets. The rate, the pan sweep, the heat and the word
-    /// cadence are all exactly as they were; only the glyph is real.
+    /// The letters the burst is made of: real text, cycled, spaces removed
+    /// (the script cues its own on the sixth key), so each key is its own note.
     const BURST_LETTERS: &str = "therendererkeepsoneatlasperfaceandneveruploadsaglyphtwice";
     let letters: Vec<char> = BURST_LETTERS.chars().collect();
     let mut cues = Vec::new();
@@ -625,25 +523,21 @@ fn scenario_burst() -> Scenario {
     }
 }
 
-/// THE PATHOLOGICAL SCENARIO — the text that could make a siren.
-///
-/// The melody is to be DERIVED from what you typed (R2), and a derivation is
-/// only as good as its worst input. Held letters, a digit run, four bare
-/// exclamation marks, a base64 blob with no words in it, and a repeated word:
-/// text with no prosody, no word rhythm and long runs of one character, typed
-/// fast. If the derivation turns any of these into a klaxon, an alarm clock or
-/// a machine gun, it is here that it shows — not in a paragraph of English.
+/// The pathological scenario: held letters, a digit run, bare exclamation
+/// marks, a base64 blob and a repeated word, typed fast. Text with no prosody
+/// and long runs of one character is where a derived melody would turn into a
+/// siren or machine gun.
 fn scenario_pathological() -> Scenario {
     let mut cues = Vec::new();
     let mut t = 0.5f32;
     let hand = &mut Hand::steady(12.0);
-    // A HELD LETTER at auto-repeat speed — one character, thirty times.
+    // A held letter at auto-repeat speed, thirty times.
     t = type_metronome(&mut cues, t, hand, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0.6);
     t += 0.7;
     // DIGITS, which the glyph class separates from letters.
     t = type_metronome(&mut cues, t, hand, "0123456789 0123456789", 0.6);
     t += 0.7;
-    // THE HERO GLYPH, four times, alone.
+    // The hero glyph, four times, alone.
     t = type_metronome(&mut cues, t, hand, "!!!!", 0.6);
     t += 0.7;
     // A BASE64 BLOB: capitals, digits and punctuation with no word shape at
@@ -660,8 +554,7 @@ fn scenario_pathological() -> Scenario {
     // must not turn into a drone.
     t = type_metronome(&mut cues, t, hand, "the the the the the the the the ", 0.6);
     t += 0.7;
-    // AND THE SAME TEXT SLOW, so the take carries the pathological material at
-    // both ends of the speed range.
+    // The same text slow, so both ends of the speed range are covered.
     t = type_metronome(&mut cues, t, &mut Hand::steady(3.5), "!!!! 999 aaaa", 0.6);
     Scenario {
         name: "pathological".into(),
@@ -672,22 +565,12 @@ fn scenario_pathological() -> Scenario {
 }
 
 // ---------------------------------------------------------------------------
-// THE LISTENING REEL — `--scripts` / `--text`, the product's own key path
+// The listening reel: `--scripts` / `--text`, the product's own key path
 // ---------------------------------------------------------------------------
 //
-// 2026-09-20. The owner re-ruled the instrument by ear — "the shift key tone
-// is harsh and doesn't sound musical. I want the shift key press to sound
-// like a high "ting" like how the space bar is a low tone and it needs to
-// sound musical. I want shifted characters to sound more like FORTE in a
-// piano versus just a higher tone. I want some kind of musically matching
-// yet distict sound for numbers and symbols, and I want musical phrasing to
-// organically feel like it comes from punctuation choice." — and an ear
-// needs a BEFORE and an AFTER of one fixed text, typed the way the product
-// hears it. No scenario above is that: `type_text` sets `shifted` on a
-// capital and cues NO bare Shift (only `shift_census` ever did), and it
-// plays a newline as the PTY's [`SoundKind::Jump`] where a person's Return
-// is the keyed [`SoundKind::Enter`]. So the reel has its own typist, and the
-// shipped scenarios keep theirs byte for byte.
+// Fixed texts typed the way the product hears them, for before/after
+// listening: a bare Shift ahead of each shifted run and Return as the keyed
+// [`SoundKind::Enter`]. The scenarios above keep their own typist.
 
 /// One fixed script of the reel.
 struct Script {
@@ -700,8 +583,8 @@ struct Script {
 const SCRIPT_PROSE: &str =
     "Hello, World! Is this it? Yes; it is: 3.14 (roughly) - well-known, done.\n";
 
-/// THE FIXED SCRIPTS. `shift-space`, `prose-lower` and `password` are not text constants
-/// and are built in [`script_scenario`].
+/// The fixed scripts. `shift-space`, `prose-lower` and `password` are built in
+/// [`script_scenario`].
 const SCRIPTS: [Script; 5] = [
     Script {
         name: "prose",
@@ -720,9 +603,9 @@ const SCRIPTS: [Script; 5] = [
         name: "digits",
         text: "0123456789 2026 42 3.14159 10,000 v0.88.0",
     },
-    // Round two of the punctuation phrasing (2026-09-27): a quotation that
-    // lifts and comes home, an aside said sotto voce inside it, a question
-    // whose Return lands on the G — then a full stop's Return on the C.
+    // Punctuation phrasing: a quotation that lifts and comes home, an aside
+    // inside it, a question whose Return lands on the G, then a full stop's
+    // Return on the C.
     Script {
         name: "phrasing",
         text: "She said \"wait (not yet) please?\"\nok.\n",
@@ -736,9 +619,8 @@ const SCRIPT_CPS: [f32; 2] = [6.0, 10.0];
 /// Enter's bell, a ting) has rung out before the file ends.
 const SCRIPT_TAIL_S: f32 = 2.5;
 
-/// `prose-lower`: the reel's sentence lowercased with its marks stripped and
-/// the spaces that leaves doubled collapsed — the plain-typing reference the
-/// code script's loudness is read against (spec C1).
+/// `prose-lower`: the reel's sentence lowercased with marks stripped and
+/// doubled spaces collapsed; the plain-typing loudness reference.
 fn prose_lower() -> String {
     let mut out = String::new();
     for ch in SCRIPT_PROSE.chars() {
@@ -751,9 +633,8 @@ fn prose_lower() -> String {
     out
 }
 
-/// A script as cues, plus the windows its TING + WORD-HEAD CAPITAL pairs
-/// sound in (the Shift's press to [`CREST_AFTER_CAPITAL_S`] past the letter)
-/// — the one place two of the loudest voices in the instrument stack.
+/// A script as cues, plus the windows its ting + word-head capital pairs sound
+/// in (the Shift's press to [`CREST_AFTER_CAPITAL_S`] past the letter).
 struct ScriptTake {
     scenario: Scenario,
     crest_windows: Vec<(f32, f32)>,
@@ -763,21 +644,17 @@ struct ScriptTake {
 /// the ring that swells 60 ms behind it.
 const CREST_AFTER_CAPITAL_S: f32 = 0.150;
 
-/// TYPE `text` THE WAY THE PRODUCT HEARS IT:
+/// Type `text` the way the product hears it:
 ///
 /// - one bare [`SoundKind::Shift`] cue [`CAPITAL_SHIFT_LEAD_MS`] before each
-///   MAXIMAL run of [`needs_shift`] characters — the hand holds Shift across
-///   a run and lets go for anything unshifted, the Space included (the
-///   `shift_census` precedent, which is how the host mints a capital);
+///   maximal run of [`needs_shift`] characters (the hand holds Shift across a
+///   run and lets go for anything unshifted, Space included);
 /// - `\n` is a keyed Return: [`SoundKind::Enter`] with the column as its
-///   flight distance, never the PTY's Jump;
-/// - every cue stamped through [`Cue::meta`], so `at_ms >= 1` and the class
-///   and rank are the engine's own.
+///   flight distance;
+/// - every cue stamped through [`Cue::meta`].
 ///
-/// A sentence rests only where a sentence ENDS — a `.` `!` `?` with
-/// whitespace or the end of the text behind it. [`type_text`] rests after
-/// every `.`, which is right for its prose corpus and wrong here: it would
-/// put half a second inside `3.14` and `self.v2.walk`, and no hand does.
+/// A sentence rests only where it ends (`.` `!` `?` followed by whitespace or
+/// the end), not inside `3.14` or `self.v2.walk`.
 fn type_script(name: String, text: &str, cps: f32, seed: u32) -> ScriptTake {
     let mut cues = Vec::new();
     let mut crest_windows = Vec::new();
@@ -831,9 +708,7 @@ fn type_script(name: String, text: &str, cps: f32, seed: u32) -> ScriptTake {
             t += 0.55; // sentence rest
         }
     }
-    // A Shift's lead can put it before the key ahead of it in time only if
-    // the hand were faster than the lead; sort anyway (stable), so the cue
-    // list is in press order whatever the rate.
+    // Sort (stable) so the cue list is in press order at any rate.
     cues.sort_by(|a, b| a.t.partial_cmp(&b.t).expect("finite cue times"));
     ScriptTake {
         scenario: Scenario {
@@ -879,13 +754,11 @@ fn script_shift_space(name: String) -> ScriptTake {
     }
 }
 
-/// `password`: a `sudo` line typed at the shell, a password typed at its
-/// no-echo prompt, the Return, and a line typed after it. The password is
-/// what the host sends since 2026-09-27 (owner: *"password: fix to all same
-/// tone"*): every key a `Typed` cue stamped `SECRET` — the space too —
-/// unshifted, at one pan (the caret does not move at a prompt that does not
-/// echo), and no bare Shift before its capitals. The line after it should
-/// sound as if the password had never been typed.
+/// `password`: a `sudo` line, a password typed at its no-echo prompt, the
+/// Return, and a line after it. The password is what the host sends: every
+/// key a `Typed` cue stamped `SECRET` (the space too), unshifted, at one pan,
+/// with no bare Shift. The following line should sound as if the password
+/// had never been typed (owner, 2026-09-27).
 const PASSWORD_BEFORE: &str = "sudo make install\n";
 const PASSWORD: &str = "Correct Horse 42!";
 const PASSWORD_AFTER: &str = "done, it built.\n";
@@ -941,9 +814,9 @@ fn script_password(name: String, cps: f32, seed: u32) -> ScriptTake {
     }
 }
 
-/// THE REEL: every script at every rate and both volumes, one WAV and one
-/// TSV row per take. `text` is `--text`'s one line, rendered INSTEAD of the
-/// fixed scripts; `rates` is [`SCRIPT_CPS`] unless `--cps` named one.
+/// The reel: every script at every rate and both volumes, one WAV and one TSV
+/// row per take. `text` (`--text`) replaces the fixed scripts; `rates` is
+/// [`SCRIPT_CPS`] unless `--cps` named one.
 #[allow(clippy::too_many_arguments)]
 fn script_reel(
     out: &std::path::Path,
@@ -969,9 +842,8 @@ fn script_reel(
             None => SCRIPTS
                 .iter()
                 .map(|s| type_script(label(s.name), s.text, cps, seed))
-                // The rate does not reach `shift-space` (its cues are 0.45 s
-                // apart by definition); it is rendered under both so the
-                // reel is one grid of files.
+                // `shift-space` is rate-independent; it is rendered under both
+                // so the reel is one grid.
                 .chain([script_shift_space(label("shift-space"))])
                 .chain([type_script(label("prose-lower"), &lower, cps, seed)])
                 .chain([script_password(label("password"), cps, seed)])
@@ -1050,44 +922,28 @@ struct Rendered {
     max_voices: usize,
     steals: u32,
     render_s: f64,
-    /// THE DEGREE THE LINE SOUNDED ON EVERY TYPED KEY of this take, read off
-    /// `MelodyV2::walk` as the render ran.
-    ///
-    /// **This is what settles "renders without a siren", and the audio
-    /// columns are not.** No spectral column can refute a siren: `range st`
-    /// is wide whether the line is a phrase or a ramp, `centroid` is an
-    /// average over both, and an envelope detector cannot even resolve
-    /// overlapping notes at prose density. A siren is a property of the
-    /// SEQUENCE — a ramp that never turns, a register it walks out of, one
-    /// degree it sits on — so it is settled on the sequence.
+    /// The degree the line sounded on every typed key, read off
+    /// `MelodyV2::walk` during the render. A siren (a ramp that never turns, a
+    /// register walked out of, one degree sat on) is a property of the
+    /// sequence, which no spectral column can refute, so it is judged here.
     degrees: Vec<i8>,
 }
 
-/// WHERE A CUE'S VOICE IS ALLOWED TO START, relative to the key.
-///
-/// The shipping host renders whole 512-frame blocks and applies every queued
-/// cue at a block boundary, so a key that lands mid-block starts 0–10.7 ms
-/// late — a uniform jitter completely uncorrelated with the melody's own
-/// clock. §7 step 2b puts the two candidate repairs on one click track and
-/// lets the owner pick by ear.
+/// Where a cue's voice is allowed to start, relative to the key. The host
+/// renders whole 512-frame blocks and applies queued cues at block
+/// boundaries, so a mid-block key starts 0–10.7 ms late, a jitter
+/// uncorrelated with the melody's clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BlockFix {
     /// TODAY. The cue is applied at the first block boundary at or after its
     /// press time: 0–10.7 ms late, and a different amount every key.
     Ship,
-    /// J0 — ZERO ADDED LATENCY. The onset lands on the key's own sample.
-    ///
-    /// The bench reaches this by splitting the render at the cue's frame,
-    /// which is the BEST CASE of the repair: a real j0 inside the host would
-    /// place the voice at a block boundary with its clock already advanced,
-    /// which also costs up to 10.7 ms off the head of the mallet. What the
-    /// click track settles here is the ALIGNMENT; the mallet's truncation is
-    /// the part that has to be judged on the engine once `block_lead_s`
-    /// exists.
+    /// Zero added latency: the onset lands on the key's own sample. The bench
+    /// splits the render at the cue's frame, the best case; a host j0 would
+    /// also truncate up to 10.7 ms off the mallet's head.
     J0,
-    /// J1 — A CONSTANT +10.7 ms, mallet intact. Every onset is exactly one
-    /// block late, so the jitter is zero and the offset is a constant an ear
-    /// adapts to within a phrase.
+    /// A constant +10.7 ms with the mallet intact: every onset exactly one
+    /// block late, so the jitter is zero.
     J1,
 }
 
@@ -1114,24 +970,19 @@ impl BlockFix {
     }
 }
 
-/// **IS THIS TAKE A SIREN?** — §8 step 3's third proof, computed on the
-/// sequence the take actually played.
+/// Whether this take is a siren, computed on the sequence it played.
 ///
-/// A siren is a ramp: the line climbs (or falls) without turning, or walks
-/// out of its register, or sits on one note. Each of those is a property of
-/// the DEGREE SEQUENCE and of nothing else, and each has a closed guarantee
-/// behind it in `rainbow_kitty_v2.rs` — reflection at `TUNE_DEG_LO/HI`,
-/// `MELODY_RUN_MAX` inverting the fourth identical stride, gravity pulling
-/// toward `MELODY_CENTRE_DEG`. This reads the three back off a rendered take,
-/// so the render is a check and not just a smoke test.
+/// A siren climbs or falls without turning, walks out of its register, or
+/// sits on one note. Each has a guarantee in `rainbow_kitty_v2.rs`
+/// (reflection at `TUNE_DEG_LO/HI`, `MELODY_RUN_MAX` inverting the fourth
+/// identical stride, gravity toward `MELODY_CENTRE_DEG`); this reads them back.
 ///
-/// Returned: the longest run of identical strides, how many degrees of the
-/// nine the line visited, the largest share any one degree took (%), and how
-/// many degrees fell outside the register.
+/// Returns the longest run of identical strides, how many of the nine degrees
+/// the line visited, the largest share any one degree took (%), and how many
+/// degrees fell outside the register.
 fn siren_verdict(degrees: &[i8]) -> (usize, usize, f64, usize) {
-    // The TUNE register, `rainbow_kitty_v2::TUNE_DEG_LO..=TUNE_DEG_HI`. Not
-    // importable from an example, so it is written once here and the `out`
-    // count is what catches a change to it.
+    // The tune register (`rainbow_kitty_v2::TUNE_DEG_LO..=TUNE_DEG_HI`), not
+    // importable from an example; the `out` count catches a change to it.
     const DEG_LO: i8 = 0;
     const DEG_HI: i8 = 8;
     let out = degrees
@@ -1188,9 +1039,7 @@ fn render(
     while f < frames {
         while cue_i < sc.cues.len() && spawn[cue_i] <= f {
             let cue = sc.cues[cue_i];
-            // THE STAMP. `push_meta`, not `push`: the melody's contour is
-            // derived from THIS number, so a bench that leaves it at 0 tests
-            // the block clock and reports it as the melody.
+            // `push_meta`, not `push`: the contour is derived from this stamp.
             synth.push_meta(
                 SoundEvent {
                     style,
@@ -1211,10 +1060,9 @@ fn render(
             }
             cue_i += 1;
         }
-        // Render to the next event or the next 512-frame boundary, whichever
-        // comes first. Under `BlockFix::Ship` every spawn frame IS a boundary,
-        // so this is the shipping cadence exactly; the two repairs are the
-        // only thing that ever splits a block.
+        // Render to the next event or 512-frame boundary. Under
+        // `BlockFix::Ship` every spawn frame is a boundary; only the two
+        // repairs split a block.
         let next_block = (f / BLOCK + 1) * BLOCK;
         let next_cue = spawn.get(cue_i).copied().unwrap_or(usize::MAX);
         let to = frames.min(next_block).min(next_cue);
@@ -1239,10 +1087,9 @@ fn render(
 // Measurement
 // ---------------------------------------------------------------------------
 
-/// Invert the synth's output saturator, so the reported PEAK is the level the
-/// mix actually asked for rather than what the clipper let through.
-/// `soft_clip(x) = x·(27+x²)/(27+9x²)`, clamped to ±0.98 — strictly increasing
-/// where it is not clamped, so three Newton steps from `y` converge.
+/// Invert the synth's output saturator so the reported peak is what the mix
+/// asked for. `soft_clip(x) = x·(27+x²)/(27+9x²)`, clamped to ±0.98, is
+/// strictly increasing where unclamped, so three Newton steps converge.
 fn pre_clip(y: f32) -> f32 {
     let s = y.signum();
     let y = y.abs();
@@ -1334,10 +1181,9 @@ fn mag_at(x: &[f32], start: usize) -> Vec<f32> {
         .collect()
 }
 
-/// TONALITY of one window: the loudest bin in 150..4500 Hz over the MEDIAN bin
-/// in the same band. A struck tone is a spike over a quiet floor (ratio in the
-/// tens); a band-passed noise burst is a broad hump (ratio near unity). The
-/// threshold below is what separates "a note" from "a poof".
+/// Tonality of one window: the loudest bin in 150..4500 Hz over the median bin
+/// in that band. A struck tone spikes over a quiet floor (tens); band-passed
+/// noise is a broad hump (near unity).
 fn tonality(mag: &[f32]) -> f64 {
     let hz_per_bin = f64::from(SR) / FFT_N as f64;
     let k0 = (150.0 / hz_per_bin) as usize;
@@ -1352,83 +1198,34 @@ fn tonality(mag: &[f32]) -> f64 {
     peak / med
 }
 
-/// A window is a PITCHED note when its spectrum spikes this far over its own
-/// band median. Fitted between the two populations, not guessed: a rendered
-/// glass-bell keystroke reads in the hundreds, the erase poof in the low tens.
+/// A window is a pitched note when its spectrum spikes this far over its band
+/// median: between a keystroke (hundreds) and the erase poof (low tens).
 const PITCHED_TONALITY: f64 = 60.0;
 
-/// The scene table's onset detector: a note announces itself by a rise of
-/// 1.35× over the decay it lands on, and nothing counts inside 35 ms of the
-/// last — under the 50 ms spacing of the fastest script here, over the
-/// sub-octave beat of one note.
+/// The scene table's onset detector: a rise of 1.35× over the decay it lands
+/// on, with a 35 ms refractory (under the fastest script's 50 ms spacing).
 const SCENE_ONSET: (usize, f32) = (35, 1.35);
 
-/// THE FINE CENSUS, for §8 step 4's rows only. The proof has to be able to
-/// SEE the sounds it says are gone: the bare Shift's lift landed 30-100 ms
-/// before the capital, and the octave echo 25 ms behind it (the retired
-/// `ECHO_DELAY_S`) at −8 dB — so the refractory is 10 ms, and the rise is
-/// 1.12, which is what a −8 dB voice adds to a decaying note's envelope
-/// (incoherent: √(1 + 0.4²) = 1.08 at the same level, more where the letter
-/// has already decayed). Measured on both engines over the rise ratio, same
-/// rows, same seed (`Capital` = Shift then the letter 60 ms on):
+/// The fine onset census, for the gesture-probe rows only: a 10 ms refractory
+/// and a 1.12× rise, fine enough to see a second strike or an echo tens of ms
+/// behind a key.
 ///
-/// ```text
-/// rise        1.35  1.20  1.12  1.08  1.05
-/// Capital old    2     2     3     7    13    (v0.76.0: lift + letter + echo)
-/// Capital 09-10  1     1     1     1     1    (the 2026-09-10 tree: one strike, one ring)
-/// Typed   09-10  1     1     1     1     8
-/// Typed@cyan     1     1     1     2    10    (1.08: the bloom's own 12 ms swell)
-/// ```
+/// A capital (Shift's ting, then the letter 60 ms on) is judged on the scene
+/// census instead: the ting rings through the strike, and two lattice
+/// partials a consonant interval apart ripple the summed envelope at their
+/// difference frequency, which this detector's 2.67 ms window counts as
+/// extra rises. The exact statements are the unit pins
+/// `a_capital_is_one_strike_with_a_lifted_degree_and_one_ring` and
+/// `a_bare_shift_is_a_ting_that_never_steps`.
 ///
-/// So the instrument is coarse and its window is narrow: at 1.12 it sees the
-/// old engine's echo and not the new bloom's swell; at 1.08 it counts the
-/// swell; at 1.05 it counts the tine's own partial beat. It refuted the old
-/// engine (3 ≠ 1, and the lift is 2 ≠ 1 at every ratio) and passed that one,
-/// which is what §8 asked of it — the EXACT statements are the unit pins
-/// `a_capital_is_one_strike_with_a_lifted_degree_and_one_ring` (one TUNE
-/// voice, nothing at 25 ms, ONE ring at 2f swelling in 60 ms on — no rise
-/// this census can count) and `a_bare_shift_is_a_ting_that_never_steps`
-/// (one GRAFT voice, a lone P1: since 2026-09-10 the Shift IS an onset of
-/// its own, which is why the `Capital` row reads 2 KEYS on the scene
-/// census). At the scene detector's 35 ms the census read `Capital 1` on
-/// the old engine too — the finding that made this constant.
-///
-/// RE-MEASURED 2026-09-16 FOR THE TING (the review caught the table above
-/// standing as this tree's record when it was not). Same rows, same seed,
-/// vol 0.4, the music box, the census over the unlimited difference:
-///
-/// ```text
-/// rise        1.35  1.20  1.12  1.08  1.05
-/// Capital        2     5     7    12    17    (this tree: the ting rings THROUGH the strike)
-/// Typed          1     1     1     1     2
-/// Typed@cyan     1     1     1     1     2
-/// Shift          1     1     1     1     1    (the ting alone: one strike)
-/// ```
-///
-/// The `Capital` row is not seven arrivals: it is two — the ting, then the
-/// strike 60 ms on — with the ting still at 0.49 of its peak when the strike
-/// lands, and two lattice partials a consonant interval apart ripple the
-/// summed envelope at their difference frequency (≥ 100 Hz here). A 2.67 ms
-/// RMS window counts that ripple as a rise once per refractory at 1.12 and
-/// finer (dumped: a smooth 10 ms envelope, −31 −29 −30 −31 −32 −33 −26 −24 …
-/// dB, exactly two arrivals). So since 2026-09-16 the `Capital` verdict is
-/// taken on the SCENE census ([`SCENE_ONSET`]: 35 ms, 1.35×), which reads
-/// the two keys, and the fine census stays on the `Typed` rows, where "one
-/// onset" is still what it proves. A ting-aware fine census (skip the 15 ms
-/// after each cue) would let `Capital` come back to this detector; the
-/// scene census answers the question §8 step 4 actually asks.
-///
-/// VALID ONLY ABOVE THE BASS: the 2.7 ms RMS window holds a full period of
-/// the tune's lowest note (261 Hz) but rides the waveform of the bass dyad
-/// under a Space or a Kill (65-130 Hz) and counts every cycle, so the fine
-/// census is taken only on the rows [`Probe::census`] marks.
+/// Valid only above the bass: the 2.7 ms window rides the waveform of the
+/// bass dyad under a Space or a Kill (65-130 Hz), so it is taken only on rows
+/// [`Probe::census`] marks.
 const FINE_ONSET: (usize, f32) = (10, 1.12);
 
-/// Onset frames. RISE detection, not threshold crossing: at 10 cps the notes
-/// are 100 ms apart under 100-300 ms tails, so the envelope NEVER returns to a
-/// floor between them and a re-arming threshold counts one note per burst
-/// (measured: 1.2 onsets/s on a 10 cps script). Only the derivative separates
-/// them. A 2.7 ms RMS window smooths the pulse/sub-octave beat; the caller
+/// Onset frames by rise detection, not threshold crossing: at 10 cps the
+/// envelope never returns to a floor between notes, so only the derivative
+/// separates them. A 2.7 ms RMS window smooths the partial beat; the caller
 /// names the (refractory ms, rise ratio) pair: [`SCENE_ONSET`] or
 /// [`FINE_ONSET`].
 fn onsets(x: &[f32], from: usize, to: usize, (refractory_ms, rise): (usize, f32)) -> Vec<usize> {
@@ -1448,9 +1245,8 @@ fn onsets(x: &[f32], from: usize, to: usize, (refractory_ms, rise): (usize, f32)
         if env[i] <= floor {
             continue;
         }
-        // The first audible window is an onset by definition (its attack is
-        // shorter than one window); after that a note announces itself by a
-        // rise over the decay it lands on.
+        // The first audible window is an onset; after that a note announces
+        // itself by a rise over the decay it lands on.
         if !(i == 0 || env[i] > env[i - 1] * rise) {
             continue;
         }
@@ -1496,7 +1292,7 @@ struct Bands {
     centroid_hz: f64,
     /// Over 2 kHz.
     hi2: f64,
-    /// Over 6 kHz — the "harsh" band of the 2026-09-20 ruling (spec F9/C2).
+    /// Energy share over 6 kHz, the "harsh" band.
     hi6: f64,
     /// 2.8–5.6 kHz, the ear's most sensitive octave (spec F13).
     presence: f64,
@@ -1565,23 +1361,20 @@ struct Row {
     volume: f32,
     onsets_hz: f64,
     pitched_hz: f64,
-    /// PITCHED onsets per second whose note DIFFERS from the previous
-    /// pitched onset's by more than a semitone — i.e. how often the melody
-    /// actually MOVES. `pitched_hz` counts accompaniment too; this is the
-    /// number a listener hears as "the tune".
+    /// Pitched onsets per second whose note differs from the previous one by
+    /// more than a semitone: how often the melody moves (`pitched_hz` counts
+    /// accompaniment too).
     melody_hz: f64,
-    /// …and the complement: the share of pitched onsets that repeat the
-    /// previous note (accompaniment, by design — not the drone the melody
-    /// generator was rewritten to remove).
+    /// The share of pitched onsets repeating the previous note
+    /// (accompaniment).
     repeat_pct: f64,
     pre_peak_db: f64,
     peak_db: f64,
     rms_db: f64,
     crest_db: f64,
     centroid_hz: f64,
-    /// The NOTE RANGE the melody actually used, in semitones between its
-    /// lowest and highest pitched onset — "how wide is the tune", which is the
-    /// number the owner's "a greater range of notes" ask lives in.
+    /// The note range the melody used, in semitones between its lowest and
+    /// highest pitched onset.
     range_st: f64,
     note_lo_hz: f64,
     note_hi_hz: f64,
@@ -1595,10 +1388,8 @@ fn analyze(name: &str, volume: f32, r: &Rendered, window: (f32, f32)) -> Row {
     let to = ((window.1 * SR as f32) as usize).min(r.mono.len());
     let seg = &r.mono[from..to];
     let ons = onsets(&r.mono, from, to, SCENE_ONSET);
-    // Pitch each onset once: the tonality test says whether it is a note at
-    // all, the peak partial says WHICH note. `SETTLE` past the onset, so the
-    // family's ~12 ms contour bend has landed and the pitch read is the note
-    // the gesture lands ON rather than the one it scoops through.
+    // Pitch each onset once, `SETTLE` past it so the ~12 ms contour bend has
+    // landed: tonality says whether it is a note, the peak partial which note.
     const SETTLE: usize = SR as usize / 40;
     let notes: Vec<f64> = ons
         .iter()
@@ -1667,19 +1458,16 @@ struct ProbeRow {
     hi_frac: f64,
     tonality: f64,
     voices: usize,
-    /// How many onsets the gesture's own body carries by the scene table's
-    /// detector ([`SCENE_ONSET`]), over the gesture's DIFFERENCE signal taken
-    /// before the bus limiter (see [`probe`]).
+    /// Onsets in the gesture's own body by the scene detector ([`SCENE_ONSET`]),
+    /// over the difference signal taken before the bus limiter (see [`probe`]).
     onsets: usize,
-    /// THE FINE CENSUS (§8 step 4's proof): the same body counted by
-    /// [`FINE_ONSET`], on the rows it is valid for. A capital used to read
-    /// three sounds — the lift, the letter, an octave echo 25 ms behind it;
-    /// it must read ONE.
+    /// The same body counted by [`FINE_ONSET`], on the rows it is valid for. A
+    /// capital must read one strike.
     fine: Option<usize>,
     /// The [`EventMeta::glyph_class`] the row's key was stamped with.
     class: u8,
-    /// Energy share over 6 kHz, and the 2.8–5.6 kHz octave's own level —
-    /// the two readings the 2026-09-20 ruling's "harsh" is measured on.
+    /// Energy share over 6 kHz, and the 2.8–5.6 kHz octave's level: the
+    /// "harsh" readings.
     hi6_frac: f64,
     presence_db: f64,
 }
@@ -1694,61 +1482,46 @@ struct Probe {
     /// The live hue on the event (`Typed@cyan` is the bright end of the arc,
     /// where §3.3's bloom is loudest and the 1600 Hz ceiling has to hold).
     hue: f32,
-    /// THE MODIFIER'S OWN CUE FIRST: a bare-Shift `SoundKind::Shift` at the
-    /// segment's start, the gesture [`CAPITAL_SHIFT_LEAD_MS`] later — which
-    /// is how the host mints a capital (`app_input.rs` fires the lift on the
-    /// modifier's own keydown, the shifted letter follows on its own key).
-    /// Without it the row was one cue and §2.3's first onset was never in it.
+    /// The modifier's own cue first: a bare Shift at the segment start, the
+    /// gesture [`CAPITAL_SHIFT_LEAD_MS`] later, as the host mints a capital (the
+    /// lift fires on the modifier's keydown).
     lift: bool,
     /// Take the [`FINE_ONSET`] census on this row — valid only where the
     /// gesture has no bass under it (see the constant).
     census: bool,
-    /// PRESSES of the gesture in this row, [`RUN_TAP_MS`] apart — the
-    /// `Space×4` row is a four-space indent tapped at 10/s, so the run's
-    /// tail (the indent steps of 2026-09-16) is measured beside its head.
-    /// 1 everywhere else.
+    /// Presses of the gesture in this row, [`RUN_TAP_MS`] apart (`Space×4` is
+    /// a four-space indent tapped at 10/s, so the run's tail is measured beside
+    /// its head); 1 elsewhere.
     run: u8,
-    /// THE CHARACTER THE KEY PUT ON SCREEN (2026-09-20), so the row stamps
-    /// the real [`EventMeta::glyph_class`] and [`EventMeta::rank`] through
-    /// the engine's own producers. `None` is the old row: class 0, rank 0 —
-    /// "a letter, no key" — which is why a digit or a mark could never be
-    /// probed before this field existed.
+    /// The character the key put on screen, so the row stamps the real
+    /// [`EventMeta::glyph_class`] and [`EventMeta::rank`]. `None` means class 0,
+    /// rank 0 ("a letter, no key").
     ch: Option<char>,
-    /// KEYS TYPED INTO THE SETTLED STATE before the gesture, in BOTH takes —
-    /// so they cancel in the difference and only set the context the gesture
-    /// lands in: `"A"` makes the row the INTERIOR of a shifted run, `" "` a
-    /// word head. Each is a real key (its own class, rank and shiftedness),
-    /// one settle interval apart; a letter here takes the place of one
-    /// settling keystroke so the row still lands on the bar's accent.
+    /// Keys typed into the settled state before the gesture, in both takes, so
+    /// they cancel in the difference and only set context: `"A"` makes the row
+    /// the interior of a shifted run, `" "` a word head. A letter here takes
+    /// one settling keystroke's place so the row still lands on the accent.
     prefix: &'static str,
 }
 
-/// The tap rate of a multi-press probe row: 100 ms, a hand tapping space
-/// four times for an indent (8-12 taps/s is the range the indent step's own
-/// gate is fitted against).
+/// Tap interval of a multi-press probe row: 100 ms, a hand tapping an indent
+/// (the indent step's gate is fitted to 8-12 taps/s).
 const RUN_TAP_MS: usize = 100;
 
-/// How long a hand holds Shift before the letter lands: §2.3 measured the
-/// lift arriving 30-100 ms ahead of the capital it precedes.
+/// How long a hand holds Shift before the letter lands (the lift arrives
+/// 30-100 ms ahead of the capital).
 const CAPITAL_SHIFT_LEAD_MS: usize = 60;
 
 /// The settling keystrokes before every probe row (see [`probe`]): three,
 /// so the row lands on the bar's accent.
 const PROBE_SETTLE: usize = 3;
 
-/// THE WALK REFERENCE for the ting's verdict (2026-09-16, on the review).
-/// The `Typed` row is ONE degree of the melody, and a v1 palette's letter
-/// walks its own fixed roof: at the row's degree the plain accent spreads
-/// over 4.5 dB across the palettes (Lumen −23.9 dBFS, Comet −19.4) and over
-/// 9 dB across the degrees of one palette (Comet −17.8..−27.1), while the
-/// ting — designed before the palette dispatch — sits at one level under
-/// all of them (−25.6..−26.8). Read against the one row, the ting's
-/// "−3 dB re the letter" was Lumen's luck at one degree and Comet's −7.2
-/// at the same one. So the verdict's letter is the MEAN of the `Typed`
-/// peak over these settle counts — the row's own accent and the next three
-/// accents of the walk (the engine's `a_capital_is_louder_at_every_degree_
-/// of_the_walk` fixture, on its accent slots) — and the row itself stays in
-/// the table as what one degree reads.
+/// The walk reference for the ting's verdict. The `Typed` row is one degree of
+/// the melody, and a letter's level varies by several dB across palettes and
+/// degrees while the ting's does not. So the reference letter is the mean
+/// `Typed` peak over these settle counts: the row's own accent and the next
+/// three accents of the walk (as the engine's
+/// `a_capital_is_louder_at_every_degree_of_the_walk` fixture uses).
 const PROBE_WALK_SETTLES: [usize; 4] = [PROBE_SETTLE, 6, 9, 12];
 
 /// One gesture's takes: its row, and the four monos the row was scored on.
@@ -1764,41 +1537,20 @@ struct Take {
     pre_alone: Vec<f32>,
 }
 
-/// One gesture alone, from one settled melody state, measured as a
-/// DIFFERENCE: the settled synth is rendered twice, once with the gesture
-/// pushed and once left alone, and the row is scored on `with − without`.
-/// Both runs share the seed and the settling keys, so everything the
-/// gesture did not cause cancels sample for sample — in particular the third
-/// settling key's 340 ms bloom tail, which under the shipping stops was
-/// louder than a felt Shift and had the `Shift` row reporting the BLOOM's
-/// tonality (221) and spectrum (hi>2k 0.997) instead of the thump's. What
-/// remains is the gesture's own body, and a sound the gesture DAMPED shows
-/// up in it too (as the negative of the ring it cut), which is correct: that
-/// is part of what the key did. The reel keeps the raw `with` render, which
-/// is what the ear hears.
+/// One gesture alone from one settled melody state, measured as a
+/// difference: the settled synth is rendered with and without the gesture,
+/// and the row is scored on `with − without`. Both runs share the seed and
+/// settling keys, so everything the gesture did not cause (such as a settling
+/// key's bloom tail) cancels; a sound the gesture damped shows up as the
+/// negative of what it cut. The reel keeps the raw `with` render.
 ///
-/// THE ONSET CENSUS IS TAKEN BEFORE THE BUS LIMITER. `with − without` is
-/// "the gesture's own contribution" only through a LINEAR bus, and the bus
-/// has one stage with memory: §9.7's peak limiter (−14 dBFS ceiling, 0.5 ms
-/// attack, 80 ms release). Over the ceiling its gain moves a strike's
-/// envelope by about a decibel inside the strike's first 15 ms — a dip on
-/// the peak's window and a recovery on the next — and the fine census, whose
-/// rise ratio is a decibel ([`FINE_ONSET`]), counted that recovery as a
-/// strike no key minted. Measured 2026-09-12 (`--dump-probes`, the two
-/// domains censused side by side): at host volume 1.0 the `Capital` row's
-/// limiter gain — the bus take's RMS window over the unlimited take's — was
-/// 1.0000 through the letter's first window, 0.921 on its 69.3 ms window and
-/// 0.946 on the 72.0 ms one, so the bus difference rose ×1.135 there where
-/// the unlimited difference rose ×1.105, and the row read 3 onsets at 1.0
-/// (+0, +58.7, +72.0 ms) against 2 at 0.4 — a level-dependent count, which
-/// no count of events can be. The row's peak is −12.6 dBFS before the
-/// limiter (−13.0 after), over the ceiling; `Typed`'s −14.3 sits under it,
-/// which is why that row never showed it. So both takes are rendered
-/// TWICE: once on the shipping bus, for the reel and the level and spectrum
-/// columns (a −6 dB law and a centroid law are about what reaches the ear),
-/// and once with the limiter out ([`TrailSynth::set_bus_limiter`]) for the
-/// onset columns, which count what the instrument minted. `soft_clip` stays
-/// in on both: memoryless and compressive, it can only lower a rise ratio.
+/// The onset census is taken before the bus limiter: `with − without` isolates
+/// the gesture only through a linear bus, and the limiter's gain moves a
+/// strike's envelope by about a decibel, which the fine census would count as
+/// a strike. So both takes render twice: on the shipping bus for the reel,
+/// level and spectrum columns, and with the limiter out
+/// ([`TrailSynth::set_bus_limiter`]) for the onset columns. `soft_clip` stays
+/// in on both (memoryless and compressive, it can only lower a rise ratio).
 ///
 /// Returns the row and the four takes.
 fn probe(
@@ -1830,26 +1582,17 @@ fn probe(
         rank: aterm_effects::trail_sound::typed_glyph_rank(ch),
         pan_from: 0.0,
         block_lead_s: 0.0,
-        // §22's FLOW HEAT. The bench plays the COLD box: flow is a
-        // state the hand earns at the keyboard, and a scripted take
-        // has no hand. 0.0 is the identity.
+        // Flow heat: a scripted take plays the cold box (0.0 is the identity).
         flow: 0.0,
     };
-    // THREE settling keystrokes ([`PROBE_SETTLE`]), ~340 ms apart: enough
-    // that the previous note's tail is dead, and — since the bar's accents
-    // fall every third keystroke — enough that the PROBE itself lands on an
-    // accent. A gesture measured on a ghost slot would be reported against
-    // the accompaniment rather than against the tune. `settle` is a
-    // multiple of three for the same reason wherever a caller varies it
-    // ([`PROBE_WALK_SETTLES`]: the same accent, three more degrees of the
-    // walk).
+    // Three settling keystrokes ([`PROBE_SETTLE`]), ~340 ms apart: the previous
+    // tail is dead, and the probe lands on an accent (every third keystroke),
+    // so it is measured against the tune, not the accompaniment. Callers vary
+    // `settle` in multiples of three ([`PROBE_WALK_SETTLES`]).
     //
-    // Stamped, like every other push in this bench: at 341 ms apart the
-    // settling keys are three unhurried notes — but only if the engine is
-    // reading a real clock. Unstamped they collapse onto the block clock and
-    // the probe is measured from a state the shipping engine never reaches.
-    // A letter in the prefix takes one settling keystroke's place, so the
-    // row still lands on the accent; a Space is not a keystroke of the bar.
+    // Stamped like every push here, or the settling keys collapse onto the
+    // block clock. A letter in the prefix takes one settling keystroke's place;
+    // a Space is not a keystroke of the bar.
     let settle = settle.saturating_sub(p.prefix.chars().filter(|c| *c != ' ').count());
     let settled = |limiter: bool| {
         let mut synth = TrailSynth::new(SR as f32, seed);
@@ -1860,8 +1603,7 @@ fn probe(
             synth.push_meta(ev(SoundKind::Typed, false), stamp(i * 16_384, None));
             synth.render(&mut warm);
         }
-        // THE CONTEXT KEYS ([`Probe::prefix`]), one settle interval apart,
-        // each a real key with its own class, rank and shiftedness.
+        // The context keys ([`Probe::prefix`]), one settle interval apart.
         for (i, ch) in p.prefix.chars().enumerate() {
             let kind = if ch == ' ' {
                 SoundKind::Space
@@ -1885,10 +1627,8 @@ fn probe(
 
     // The pair of takes, on the bus as given.
     let takes = |limiter: bool| -> (Vec<f32>, Vec<f32>, usize) {
-        // WITH the gesture. The lift, when the row carries one, is its own
-        // cue at the segment's first frame; the gesture lands
-        // CAPITAL_SHIFT_LEAD_MS of rendered audio later, stamped that much
-        // later, exactly as two host pushes would arrive.
+        // With the gesture. A lift is its own cue at the segment's first frame;
+        // the gesture lands CAPITAL_SHIFT_LEAD_MS later, stamped accordingly.
         let mut synth = settled(limiter);
         let mut stereo = vec![0.0f32; frames * CHANNELS];
         let t0 = (settle + p.prefix.chars().count()) * 16_384;
@@ -1900,9 +1640,8 @@ fn probe(
         }
         synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + at, p.ch));
         let voices = synth.live_voices();
-        // A multi-press row: the later presses land RUN_TAP_MS apart, each
-        // stamped at its own time, the audio rendered between them exactly
-        // as the host would.
+        // A multi-press row: later presses land RUN_TAP_MS apart, each stamped
+        // at its own time with audio rendered between them.
         let mut cursor = at;
         for _ in 1..p.run.max(1) {
             let next = cursor + SR as usize * RUN_TAP_MS / 1000;
@@ -1933,9 +1672,8 @@ fn probe(
     let bands = spectrum_bands(&mono, start, end);
     let (centroid, hi) = (bands.centroid_hz, bands.hi2);
     let body_rms = rms(&mono[start..end]);
-    // The onset census over the whole half second: a second sound anywhere
-    // behind the key — an echo, a lift, a tap — counts against the gesture.
-    // Counted BEFORE the bus limiter (see above): events, not the ceiling.
+    // Onset census over the whole half second (before the bus limiter): any
+    // second sound behind the key counts against the gesture.
     let count = |law| onsets(&body, 0, body.len(), law).len();
     let row = ProbeRow {
         name: p.label.to_string(),
@@ -1960,9 +1698,8 @@ fn probe(
     }
 }
 
-/// The gesture probes, back to back with 400 ms of air between them — the
-/// file to open FIRST, because it is where a keystroke, a downbeat and an
-/// erase can be heard against each other rather than one at a time.
+/// The gesture probes back to back with 400 ms of air between them: a
+/// keystroke, a downbeat and an erase heard against each other.
 fn probe_reel(
     voice: SoundVoice,
     style: GlowStyle,
@@ -1973,9 +1710,8 @@ fn probe_reel(
     let gap = vec![0.0f32; SR as usize * 2 / 5];
     let mut reel = Vec::new();
     let mut takes = Vec::new();
-    // Each probe's gesture fires on the FIRST frame of its own segment (a
-    // row with a lift: the Shift there, the gesture CAPITAL_SHIFT_LEAD_MS
-    // on), so the reel's click track is exact rather than detected.
+    // Each gesture fires on its segment's first frame (a lift row: the Shift
+    // there, the gesture CAPITAL_SHIFT_LEAD_MS on), so the click track is exact.
     let mut marks = Vec::new();
     for p in &PROBES {
         let t = reel.len() as f32 / SR as f32;
@@ -2001,10 +1737,9 @@ fn probe_reel(
     (takes, reel, marks)
 }
 
-/// The gestures the probe table and the reel cover, in reel order. `Capital`
-/// is the host's whole gesture — the bare Shift's cue, then the shifted
-/// `Typed` 60 ms on — and it is in the table because §8 step 4's proof is
-/// stated on it: under the shipped engine that pair was THREE onsets.
+/// The gestures the probe table and reel cover, in reel order. `Capital` is
+/// the host's whole gesture: the bare Shift's cue, then the shifted `Typed`
+/// 60 ms on.
 const PROBES: [Probe; 28] = [
     Probe {
         label: "Typed",
@@ -2127,17 +1862,11 @@ const PROBES: [Probe; 28] = [
         ch: None,
         prefix: "",
     },
-    // THE CHAR-CARRYING ROWS (2026-09-20, for the owner's re-ruling of that
-    // day: "the shift key tone is harsh … shifted characters to sound more
-    // like FORTE … some kind of musically matching yet distict sound for
-    // numbers and symbols … phrasing … from punctuation choice"). Every row
-    // above stamps class 0 / rank 0, so no digit, no mark and no capital in
-    // a known CONTEXT had ever been probed. A mark's row is the mark's own
-    // voice: `shifted` is what a US layout needs for the glyph, and there is
-    // no lift, so the ting is not in the difference. The three capitals are
-    // the three contexts a capital can land in — a word head (the Shift's
-    // ting, then `B` after a Space), mid-word (the same after a letter) and
-    // the interior of a shifted run (`B` after a shifted `A`, no new Shift).
+    // Character-carrying rows: digits, marks and capitals in known contexts.
+    // A mark's row is its own voice (`shifted` as a US layout needs, no lift).
+    // The three capitals are the three contexts one can land in: a word head
+    // (ting, then `B` after a Space), mid-word (after a letter), and the
+    // interior of a shifted run (`B` after a shifted `A`, no new Shift).
     Probe {
         label: "Digit1",
         kind: SoundKind::Typed,
@@ -2328,26 +2057,18 @@ const PROBES: [Probe; 28] = [
 ];
 
 // ---------------------------------------------------------------------------
-// The ROTATION table — does a repeated gesture repeat its NOTE?
+// The rotation table: does a repeated gesture repeat its note?
 // ---------------------------------------------------------------------------
 //
-// The scene table above cannot answer this. `pitch/s` and `rept%` are computed
-// over EVERY pitched onset in the mix, so a drone underneath a moving melody
-// reads as a moving melody; and the gesture probe fires each gesture exactly
-// ONCE, which is the one number of presses at which nothing can be shown to
-// repeat. The owner's ask is about the SECOND press and the eighth, so the
-// measurement has to follow one gesture across a take.
-//
-// Pitched at the SCRIPT'S OWN CUE TIMES rather than by onset detection: the
-// script knows when every Shift and every Space was pressed, so there is no
-// question of which onset belongs to which gesture, and a gesture that fell
-// under the governor's min-gap simply reads as its neighbour's tail (and is
-// dropped by the prominence test below) instead of shifting every later
-// reading by one.
+// The scene table mixes every pitched onset, so a drone under a moving melody
+// reads as moving, and the gesture probe fires each gesture once. So this
+// follows one gesture across a take, pitched at the script's own cue times: a
+// gesture swallowed by the min-gap reads as its neighbour's tail and is
+// dropped by the prominence test.
 
-/// Two pitches are THE SAME NOTE within this many cents. A quarter tone: wider
-/// than the FFT's own resolution at these frequencies, far narrower than the
-/// smallest step the pentatonic lattice can make (~2 semitones).
+/// Two pitches are the same note within this many cents: a quarter tone,
+/// wider than the FFT's resolution here and far narrower than the lattice's
+/// smallest step (~2 semitones).
 const SAME_NOTE_CENTS: f64 = 50.0;
 
 struct Rotation {
@@ -2355,20 +2076,16 @@ struct Rotation {
     hz: Vec<f64>,
     /// Distinct notes sounded, at [`SAME_NOTE_CENTS`] resolution.
     distinct: usize,
-    /// The CLOSEST recurrence: the fewest events between two soundings of one
-    /// note. `None` when no note recurred in the take at all. THIS is the
-    /// number the ask lives in — "rotate" means this is large, not merely that
-    /// `distinct > 1`.
+    /// The closest recurrence: the fewest events between two soundings of one
+    /// note, `None` when no note recurred. "Rotates" means this is large.
     min_repeat: Option<usize>,
 }
 
 /// Pitch one gesture at each of `cues` (seconds), reading the loudest partial
-/// in `lo..hi` — the register the gesture is known to live in, which is what
-/// keeps a bass root from being read as the letter over it and vice versa.
+/// in `lo..hi`, the gesture's register (so a bass root is not read as the
+/// letter over it).
 fn rotation_of(name: &str, mono: &[f32], cues: &[f32], lo: f32, hi: f32) -> Rotation {
-    // Past the family's ~12 ms contour bend, so the reading is the note the
-    // gesture LANDS on rather than the one it scoops through — the same
-    // settle the scene table's pitch reads use.
+    // Past the ~12 ms contour bend, as the scene table's pitch reads are.
     const SETTLE: usize = SR as usize / 40;
     let mut hz = Vec::new();
     for &t in cues {
@@ -2377,9 +2094,9 @@ fn rotation_of(name: &str, mono: &[f32], cues: &[f32], lo: f32, hi: f32) -> Rota
             continue;
         }
         let m = mag_at(mono, s);
-        // PROMINENCE, not tonality: the band is already narrow, so the test
-        // that matters is whether this gesture actually spoke here or whether
-        // the window holds nothing but a neighbour's decay.
+        // Prominence, not tonality: the band is narrow, so the question is
+        // whether this gesture spoke here or the window holds only a
+        // neighbour's decay.
         let band_peak = peak_hz(&m, lo, hi);
         if band_peak <= 0.0 || tonality(&m) < 8.0 {
             continue;
@@ -2423,11 +2140,9 @@ fn cue_times(sc: &Scenario, kind: SoundKind) -> Vec<f32> {
 // WAV
 // ---------------------------------------------------------------------------
 
-/// THE CLICK: 2 ms of 2 kHz under a raised-cosine window, at −20 dBFS.
-///
-/// Short enough that its own onset is unambiguous at 48 kHz, windowed so it
-/// has no click of its own to confuse the eye in an editor, and 20 dB down so
-/// it never competes with the music channel it is there to measure.
+/// The click: 2 ms of 2 kHz under a raised-cosine window at −20 dBFS. Short
+/// enough to be unambiguous at 48 kHz, windowed so it has no click of its own,
+/// and quiet enough not to compete with the music channel.
 const CLICK_HZ: f32 = 2_000.0;
 const CLICK_MS: f32 = 2.0;
 const CLICK_LEVEL: f32 = 0.1;
@@ -2454,15 +2169,10 @@ fn click_track(cues: &[Cue], frames: usize) -> Vec<f32> {
     click
 }
 
-/// 32-bit float STEREO, written VERBATIM — no normalisation, no dither. An
-/// A/B whose two sides are independently normalised is not an A/B, and that
-/// rule is unchanged: the click rides its own channel and never touches the
-/// music's gain staging.
-///
-/// LEFT is the synth, delayed by [`PRE_ROLL_FRAMES`]; RIGHT is `click`, at the
-/// keys' own times. The delay is the host's real steady-state queue depth, so
-/// the horizontal distance between a tick and the note under it in an editor
-/// IS the offset the owner hears.
+/// 32-bit float stereo, written verbatim (no normalisation, no dither), so
+/// A/B sides share gain staging. Left is the synth, delayed by
+/// [`PRE_ROLL_FRAMES`] (the host's steady-state queue depth); right is
+/// `click` at the keys' own times.
 fn wav_bytes(mono: &[f32], click: &[f32]) -> Vec<u8> {
     let frames = (mono.len() + PRE_ROLL_FRAMES).max(click.len());
     let data_len = (frames * CHANNELS * 4) as u32;
@@ -2492,9 +2202,9 @@ fn wav_bytes(mono: &[f32], click: &[f32]) -> Vec<u8> {
     w
 }
 
-/// An ALIGNED float WAV: every channel on the same clock from frame 0 — no
-/// pre-roll, no click — so a reader can subtract one from another sample for
-/// sample. `--dump-probes` writes the gesture takes this way.
+/// An aligned float WAV: every channel on one clock from frame 0 (no pre-roll,
+/// no click), so channels can be subtracted sample for sample.
+/// `--dump-probes` writes the gesture takes this way.
 fn wav_aligned(chans: &[&[f32]]) -> Vec<u8> {
     let n = chans.len();
     let frames = chans.iter().map(|c| c.len()).max().unwrap_or(0);
@@ -2521,24 +2231,16 @@ fn wav_aligned(chans: &[&[f32]]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// THE CENSUS — what the melody law does to a hand, with no ear in the loop
+// The census: what the melody rule does to a hand, with no ear in the loop
 // ---------------------------------------------------------------------------
 //
-// R1 says one keystroke is one melody step at every typing speed. That is a
-// falsifiable claim about a pure function of the key times, so it is settled
-// here — offline, in a second, before a single WAV is rendered — rather than
-// argued about.
-//
-// The numbers are read off the ENGINE'S OWN state after every push
+// One keystroke is one melody step at every typing speed: a falsifiable claim
+// about a pure function of the key times, settled offline before any WAV is
+// rendered. The numbers are read off the engine's own state after every push
 // (`MelodyV2::steps`, `last_onset_ms`, `walk`), never re-derived from the
-// constants: a census that carried its own copy of the law could agree with a
-// design that the shipping code does not implement, which is exactly the
-// failure this whole exercise is recovering from.
+// constants.
 
-/// The rates swept, characters per second. 4.5 straddled the DELETED 220 ms
-/// gate (222 ms per key), which is where a ±25 % wobble used to decide whether
-/// a key was a note at all; it is kept as the row where a regression would
-/// show first.
+/// The rates swept, characters per second.
 const CENSUS_CPS: [f32; 8] = [3.0, 4.0, 4.5, 5.0, 6.0, 8.0, 10.0, 14.0];
 
 /// The jitter columns: a metronome, and a hand.
@@ -2554,86 +2256,46 @@ struct CensusRow {
     /// Keys that moved `MelodyV2::steps` — the melody advanced. Under R1
     /// this must equal `keys` on every row, at every rate, for ever.
     steps: usize,
-    /// Keys whose sounding degree DIFFERS from the previous key's. This is
-    /// the number "the melody moved" lives in: a re-strike repeats the last
-    /// pitch, and so, occasionally, does a rest cadence.
+    /// Keys whose sounding degree differs from the previous key's: how often
+    /// the melody moved.
     distinct: usize,
-    /// **THE REPEAT LEDGER**, and it is what discharges the §8 proof rather
-    /// than what excuses it.
+    /// The repeat ledger: every key that repeated is charged to a cause the
+    /// design names, and the residual (`stall`) must be zero. A doubled letter
+    /// asks for a repeated note, so "100 % distinct" is stated as "every key
+    /// moved or repeated for a named reason".
     ///
-    /// §8 step 3 asks for "100 % distinct". §3.1 of the same document keeps
-    /// `Touch::ReStrike` and defines it as "a stride of zero — a genuinely
-    /// repeated pitch, from a doubled letter". Both cannot be true of the
-    /// same column: a corpus that types `ll` has ASKED for two of the same
-    /// note, and an engine that refused would be overwriting the text
-    /// instead of deriving from it. So the census does not report one number
-    /// and argue about the remainder — it ACCOUNTS for every key that
-    /// repeated, against the causes the design itself names, and the residual
-    /// is the number that must be zero.
-    ///
-    /// `dbl` — the previous typed key had the same alphabet rank. §3.1's
-    /// `Touch::ReStrike`, exactly, and the only repeat the text asked for.
+    /// `dbl`: the previous typed key had the same alphabet rank
+    /// (`Touch::ReStrike`), the only repeat the text asked for.
     dbl: usize,
-    /// `head` — a word head whose chord snap landed on the degree the last
-    /// word ended on: a COMMON TONE across a chord change, which is voice
-    /// leading and not a stall.
+    /// `head`: a word head whose chord snap landed on the degree the last word
+    /// ended on (a common tone across a chord change).
     head: usize,
-    /// `subj` — the line answering its own subject on an interval the
-    /// subject genuinely latched as a unison. §3.1 asks for exactly this
-    /// replay, and a subject is entitled to a repeated note (so is every
-    /// subject ever written); what it is NOT entitled to is a unison it never
-    /// heard, which is what the session's first key used to hand it.
+    /// `subj`: the line answering its subject on an interval the subject
+    /// latched as a unison.
     subj: usize,
-    /// `phr` — THE MARK PHRASED IT (2026-09-21; owner, 2026-09-20: "I want
-    /// musical phrasing to organically feel like it comes from punctuation
-    /// choice"). A dash is a TIE and repeats by definition; the token's
-    /// steering mark may arrive on the cadence degree the line already
-    /// stands on (a full stop on the C it had reached); a closing bracket may
-    /// already be where its opener was. All three are the TEXT's doing — the
-    /// mark was typed — and before that ruling all three read as `stall`.
+    /// `phr`: a punctuation mark phrased it. A dash is a tie and repeats; a
+    /// steering mark may land on the cadence degree the line already stands
+    /// on; a closing bracket may already be where its opener was.
     phr: usize,
-    /// `stall` — a repeat with no cause the design names: gravity cancelling
-    /// a real stride, a fold sending a real distance to zero, a reflection
-    /// landing back on the note it left. Every one of these is the engine
-    /// standing still while the hand moved, which is the DEFECT this whole
-    /// change exists to remove, in miniature.
-    ///
-    /// **THIS COLUMN IS THE §8 PROOF.** `stall == 0` on every row is "100 %
-    /// distinct" in the only form that is simultaneously true, checkable and
-    /// worth having: every key either moved the melody's pitch, or repeated
-    /// it for a reason written down in §3.1.
+    /// `stall`: a repeat with no named cause (gravity cancelling a stride, a
+    /// fold sending a distance to zero, a reflection landing on the note it
+    /// left). Must be zero on every row.
     stall: usize,
     /// Keys that made NO SOUND AT ALL — a re-strike inside
     /// `RESTRIKE_COALESCE_MS`, which advanced the state in silence.
     silent: usize,
-    /// **DOES THE NOTE CARRY THE KEY'S OWN TIME?** The largest gap, in ms,
-    /// between a key's scripted press time and the time stamped on the onset
-    /// the mixer actually made for it (`MelodyV2::last_onset_ms`, written
-    /// AFTER the TUNE spawn returned a slot).
-    ///
-    /// This is "do the notes align with the keystrokes" as a NUMBER, settled
-    /// in the one domain where it is decidable. An envelope detector run over
-    /// the rendered music channel cannot resolve overlapping notes at prose
-    /// density and returns the same ratio for any take you give it; this
-    /// reads what the engine did, per key, and cannot be fooled by density.
-    ///
-    /// A STAMPED ROW MUST READ 0, and the assert below says so. `blockclk`
-    /// reads the 512-frame block quantisation (up to 10.7 ms) because an
-    /// unstamped push has no key time to carry — which is the whole point of
-    /// keeping it in the table, and is the same defect the host still has at
-    /// `app_render.rs`'s frame drain, at frame granularity.
+    /// The largest gap, in ms, between a key's scripted press time and the time
+    /// stamped on the onset the mixer made for it (`MelodyV2::last_onset_ms`).
+    /// Alignment as a number, read per key from the engine rather than from a
+    /// density-blind envelope detector. A stamped row must read 0 (asserted);
+    /// `blockclk` shows the 512-frame block quantisation (up to 10.7 ms).
     algn_ms: u32,
     /// The wall time the typing occupied, seconds.
     span_s: f64,
-    /// A HASH OF THE DEGREE SEQUENCE ITSELF — FNV-1a over the walk after
-    /// every typed key.
-    ///
-    /// This is the column that survived the gate's deletion. With every key
-    /// stepping, `dist%` and `silent` are saturated on every row and can no
-    /// longer tell two clocks apart; the SEQUENCE still can, because the
-    /// derived contour reads the inter-key gap and a quantised clock reports
-    /// a different gap. It is also what makes a determinism claim readable
-    /// off one line: two runs that agree here played the same tune.
+    /// FNV-1a hash of the degree sequence (the walk after every typed key).
+    /// With every key stepping, `dist%` and `silent` saturate, but the derived
+    /// contour reads the inter-key gap, so the sequence still tells two clocks
+    /// apart; two runs agreeing here played the same tune.
     seq: u64,
 }
 
@@ -2656,8 +2318,7 @@ impl CensusRow {
 }
 
 /// Type `text` as a metronome at `cps` with `jitter`, push it through the
-/// SHIPPING engine exactly as a take is rendered, and count what the melody
-/// did.
+/// shipping engine as a take is rendered, and count what the melody did.
 #[allow(clippy::too_many_arguments)]
 fn census_row(
     corpus: &'static str,
@@ -2697,13 +2358,11 @@ fn census_row(
             let typed = cue.gesture == SoundGesture::Trail(SoundKind::Typed);
             let m = synth.melody_v2();
             let (was_step, was_onset, was_walk) = (m.steps(), m.last_onset_ms(), m.walk());
-            // Read BEFORE the push, because `word_pos` moves on it: this key
-            // is a word head iff nothing has been typed since the last Space
-            // or Enter, which is the same predicate the engine branches on.
+            // Read before the push (`word_pos` moves on it): a word head iff
+            // nothing was typed since the last Space or Enter.
             let was_head = m.word_pos() == 0;
-            // The engine's own replay predicate, read before the push:
-            // `!word_head && motif_play > 0`. A word head is never a replay —
-            // it is the chord tone the subject is answered ONTO.
+            // The engine's replay predicate, read before the push: a word head
+            // is never a replay.
             let was_answer = !was_head && m.motif_answering();
             // The token's steering budget, read before the push: a key that
             // takes it false → true IS the steering mark.
@@ -2725,10 +2384,8 @@ fn census_row(
             if stamped {
                 synth.push_meta(ev, cue.meta());
             } else {
-                // THE OLD BENCH, kept alive as a control: bare `push` leaves
-                // `at_ms = 0`, `v2_at_ms` falls back to the synth's 512-frame
-                // block clock, and the gate is measured on a 10.667 ms grid
-                // that has nothing to do with the hand.
+                // Control: bare `push` leaves `at_ms = 0`, so the melody runs
+                // on the 512-frame block clock.
                 synth.push(ev);
             }
             if typed {
@@ -2747,13 +2404,10 @@ fn census_row(
                 if keys == 1 || m.walk() != was_walk {
                     distinct += 1;
                 } else {
-                    // IT REPEATED. Which of the design's own causes was it?
-                    // Charged to the BRANCH THAT PRODUCED THE DEGREE, not to
-                    // the first plausible story: an answered interval never
-                    // consulted the alphabet, so it cannot be charged to a
-                    // doubled letter even when the text happens to have one.
-                    // The mark's override runs LAST in the engine, so where
-                    // it fired it is the branch that produced the degree.
+                    // It repeated: charge the branch that produced the degree.
+                    // An answered interval never consulted the alphabet, so it
+                    // is never charged to a doubled letter. The mark's override
+                    // runs last, so where it fired it produced the degree.
                     let class = aterm_effects::trail_sound::typed_glyph_class(
                         (cue.ch != '\0').then_some(cue.ch),
                     );
@@ -2787,9 +2441,8 @@ fn census_row(
         synth.render(&mut stereo[..n * CHANNELS]);
         f += n;
     }
-    // The typing's own duration: first press to last press, plus the one
-    // nominal interval the last key occupies. For a metronome that is exactly
-    // `cues.len() / cps`, so notes/s is directly comparable to cps.
+    // First press to last press plus the last key's nominal interval; for a
+    // metronome that is `cues.len() / cps`, so notes/s compares to cps.
     let span_s = match (cues.first(), cues.last()) {
         (Some(a), Some(b)) => f64::from(b.t - a.t) + f64::from(1.0 / cps),
         _ => 0.0,
@@ -2815,15 +2468,12 @@ fn census_row(
 
 /// The census sweep, printed.
 #[allow(clippy::too_many_arguments)]
-/// **THE SPACE-HEAD CENSUS** — "i don't always hear the space bar?" (the
-/// owner, 2026-09-16), as a count. Types the prose scenario at 6, 8 and 10
-/// cps, clean and with ±25 % hand jitter, through the engine exactly as
-/// [`render`] does, and for every Space cue asks the synth whether the push
-/// SPAWNED anything: a word-boundary HEAD that spawns nothing was thinned by
-/// v1's keystroke governor (`MIN_GAP`) or refused by a v2 lane; a run TAIL
-/// that spawns nothing likewise. Prints heads, silent heads, tails, silent
-/// tails, and the shortest letter→space gap the hand produced, per row. The
-/// engine under test is the one the flags name (the music box by default).
+/// Space-head census: types the prose scenario at 6, 8 and 10 cps, clean and
+/// at ±25 % jitter, through the engine as [`render`] does, and asks for every
+/// Space whether the push spawned anything. A silent head was thinned by v1's
+/// keystroke governor (`MIN_GAP`) or refused by a v2 lane. Prints heads,
+/// silent heads, tails, silent tails and the shortest letter→space gap per
+/// row, on the engine the flags name.
 fn space_census(
     seed: u32,
     voice: SoundVoice,
@@ -2906,16 +2556,11 @@ fn space_census(
     }
 }
 
-/// THE SHIFT CENSUS (the review of 2026-09-16 — see the engine's
-/// `SHIFT_MIN_GAP`): the prose scenarios again, with every third word's first
-/// letter CAPITALISED and a bare `Shift` cue `lead` ms ahead of each capital
-/// (the host's measured 30-100 ms lead), counting the Shifts the engine left
-/// silent — a ting that spawned no voice. The lead is measured from the
-/// capital, so the Shift lands `IOI − lead` after the key BEFORE it: at 10
-/// cps with a 60 ms lead that is 40 ms, inside the keystroke governor's
-/// 45 ms. `min gap` is the shortest gap from the previous cue to a Shift the
-/// hand produced. The music box has no keystroke governor, so its rows read
-/// 0 by construction; the v1 rows are the measurement.
+/// Shift census (see the engine's `SHIFT_MIN_GAP`): the prose scenarios with
+/// every third word capitalised and a bare `Shift` `lead` ms ahead of each
+/// capital, counting Shifts the engine left silent. At 10 cps with a 60 ms
+/// lead the Shift lands 40 ms after the previous key, inside the keystroke
+/// governor's 45 ms. The music box has no governor, so its rows read 0.
 fn shift_census(
     seed: u32,
     voice: SoundVoice,
@@ -2930,11 +2575,9 @@ fn shift_census(
         voice,
         style
     );
-    // `in gap` counts the Shifts that landed inside the keystroke governor's
-    // [`MIN_GAP`] of the cue before them — exactly the ones the governor
-    // silenced while the bare Shift was still gated on it (before 2026-09-16's
-    // `SHIFT_MIN_GAP`), so the column is the BEFORE number and `silent` the
-    // AFTER, on one run.
+    // `in gap`: Shifts inside the keystroke governor's [`MIN_GAP`] of the cue
+    // before them (what a governor-gated Shift would lose); `silent`: what the
+    // engine actually left silent.
     println!(
         "{:>4} {:>6} {:>5} {:>6} {:>6} {:>6} {:>9}",
         "cps", "jitter", "lead", "shifts", "in gap", "silent", "min gap"
@@ -3030,47 +2673,26 @@ fn census(
     bed: bool,
     timbre: Timbre,
 ) {
-    // TWO CORPORA, and the difference between them is the point.
+    // Corpora:
     //
-    // `letters` is the prose with its spaces and line feeds removed: a pure
-    // key stream, which isolates the melody law. It is the column the §2.6
-    // predictions were stated in, because the deleted gate's arithmetic there
-    // was exactly `floor(220 / (1000/cps))` and nothing else.
+    // `letters`: the prose with spaces and line feeds removed, a pure key
+    // stream that isolates the melody rule.
     //
-    // `prose` is the same text with every space a `Space` and every newline a
-    // `Jump`. Neither is a derived note, but both eat wall time and both move
-    // the harmony, so the gap between two TYPED keys across a word boundary is
-    // wider and the contour reads differently. It is the realistic column.
-    // …and `blockclk` is `letters` again, pushed the way this bench pushed
-    // for its whole life before 2026-09-08: bare `push`, no stamp, the melody
-    // clock quantised to whatever grid the voice is spawned on. It is a
-    // CONTROL, not a candidate.
+    // `prose`: the same text with spaces as `Space` and newlines as `Jump`.
+    // Neither is a derived note, but both take time and move the harmony, so
+    // this is the realistic column.
     //
-    // WHAT THE CONTROL REFUTES CHANGED WHEN THE GATE DIED, and the change is
-    // the whole point of the exercise. Under the gate, `blockclk` disagreed
-    // with `letters` in `dist%`: a quantised clock crossed a 220 ms threshold
-    // on different keys, and at 4.5 cps clean it read 83.4 % against the
-    // stamped 100.0 %. With every key now stepping, `dist%` is 100 and
-    // `silent` is 0 in BOTH columns and neither can tell the two clocks apart.
-    // The `seq` column can, and more sharply than the old one ever did: the
-    // derived contour reads the inter-key GAP on every single key, so
-    // quantising the clock to a 10.667 ms grid changes the tune everywhere
-    // rather than at a threshold. `blockclk` must differ from `letters` in
-    // `seq` on EVERY row.
-    //
-    // IT ONLY REFUTES UNDER `spawn Ship`, and the reason is worth stating
-    // because it is easy to read the table the wrong way. The unstamped clock
-    // is the spawn grid, so `--jitterfix` moves the control as well as the
-    // take. Under J0 the spawn IS the cue's own sample, so the block clock and
-    // the hand's clock coincide BY CONSTRUCTION and the control converges on
-    // `letters` while the stamp is perfectly sound. The census says so on
-    // stdout when the spawn is not Ship.
+    // `blockclk`: `letters` pushed with bare `push`, no stamp, so the melody
+    // clock is quantised to the spawn grid. A control: the derived contour
+    // reads the inter-key gap on every key, so `blockclk` must differ from
+    // `letters` in `seq` on every row. It only does under `spawn Ship`: under
+    // J0 the spawn is the cue's own sample, so the two clocks coincide by
+    // construction (the census says so when the spawn is not Ship).
     let letters: String = PROSE.chars().filter(|c| !c.is_whitespace()).collect();
-    // `phrase` (2026-09-21): the reel's own sentence and its line of code,
-    // three times over — every phrase mark, capitals, a decimal, a bracket
-    // pair, a tie, `::` and a dotted path — so the ledger and R1 are read on
-    // the keys the phrasing acts on, at every rate and under the jittered
-    // hand. (`prose` has only `.` and `,`.)
+    // `phrase`: the reel's sentence and line of code three times over (every
+    // phrase mark, capitals, a decimal, brackets, a tie, `::` and a dotted
+    // path), so the ledger is read on the keys phrasing acts on. (`prose` has
+    // only `.` and `,`.)
     let phrase: String = [SCRIPTS[0].text, SCRIPTS[1].text].concat().repeat(3);
     let corpora: [(&'static str, &str, bool); 4] = [
         ("letters", &letters, true),
@@ -3113,9 +2735,7 @@ fn census(
                 let r = census_row(
                     corpus, text, cps, jitter, seed, voice, style, fix, bed, stamped, timbre,
                 );
-                // THE LEDGER MUST SUM. If it ever does not, a repeat has a
-                // cause the census cannot name, and every percentage below it
-                // is describing something other than what happened.
+                // The ledger must sum, or a repeat has an unnamed cause.
                 assert_eq!(
                     r.distinct + r.dbl + r.head + r.subj + r.phr + r.stall,
                     r.keys,
@@ -3123,8 +2743,7 @@ fn census(
                      {corpus} {cps} cps {:.0}% jitter",
                     jitter * 100.0
                 );
-                // A STAMPED ROW'S NOTE CARRIES THE KEY'S OWN TIME, exactly.
-                // This is the alignment claim, asserted rather than heard.
+                // A stamped row's note carries the key's own time, exactly.
                 if stamped {
                     assert_eq!(
                         r.algn_ms,
@@ -3220,18 +2839,15 @@ fn census(
 }
 
 // ---------------------------------------------------------------------------
-// The timbre ladder's seam (§7 step 3)
+// The timbre ladder's seam
 // ---------------------------------------------------------------------------
 
-/// Which instrument the take is rendered on — one variable per file, so the
-/// owner can say where to stop. Each rung is the previous one plus exactly
-/// one of §3.3's additions, pulled through [`TrailSynth::set_v2_timbre_stops`]
-/// on the very same engine: `plain` is the derived line through the shipped
-/// tine (the control), `bloom` adds the 3f/4f/6f bloom, `hue` couples the
-/// bloom's air and pan and the note's roof to the live hue, and `room` — the
-/// full proposal and what ships — adds the Enter/rest air cloud and the
-/// answering voice. `room` is the default; a render without `--timbre` is the
-/// instrument the user gets.
+/// Which instrument the take is rendered on, one addition per rung via
+/// [`TrailSynth::set_v2_timbre_stops`] on the same engine: `plain` is the
+/// derived line through the tine (the control), `bloom` adds the 3f/4f/6f
+/// bloom, `hue` couples the bloom's air, pan and the note's roof to the live
+/// hue, and `room` (the default, what ships) adds the Enter/rest air cloud and
+/// the answering voice.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Timbre {
     Plain,
@@ -3304,19 +2920,11 @@ fn main() {
     let mut timbre_named = false;
     let mut want_probes = false;
     let mut dump_probes = false;
-    // **J1 IS WHAT SHIPS, SO IT IS WHAT THE BENCH RENDERS** (the panel's Q3
-    // ruling, 2026-09-09; §9). The host already sets
-    // `EventMeta::block_lead_s` on every `push_meta`
-    // (`aterm_gui::trail_audio::…::push_meta`) and the engine already spends
-    // it at `v.t = -(v.delay + self.block_lead_s)`, which puts every onset a
-    // constant one block after its press: J1, live, today. `Ship` here was
-    // modelling the block clock as it behaved BEFORE that wire existed, so a
-    // default of `Ship` meant every reel measured a jitter the product does
-    // not have. The ruling took J1 over J0 on the transient — J0's 0-10.7 ms
-    // bite out of the mallet's head varies with block phase, i.e. randomly
-    // per key, which trades a constant nobody can hear for an attack
-    // brightness that changes on every note — so the bench's default is now
-    // the shipping behaviour and `--jitterfix ship` is the historical one.
+    // J1 is what ships, so it is the default: the host sets
+    // `EventMeta::block_lead_s` on every `push_meta` and the engine puts every
+    // onset a constant one block after its press. J0 would take a
+    // block-phase-dependent bite out of each mallet's attack.
+    // `--jitterfix ship` models the block clock without that lead.
     let mut fix = BlockFix::J1;
     let mut want_census = false;
     let mut want_space_census = false;
@@ -3448,9 +3056,7 @@ fn main() {
         census(seed, voice, style, fix, bed, timbre);
         return;
     }
-    // Each census is its own flag (2026-09-16, on the review: the shift
-    // census used to ride `--space-census` unnamed); both may be asked for
-    // in one run.
+    // Each census is its own flag; both may run together.
     if want_space_census || want_shift_census {
         if want_space_census {
             space_census(seed, voice, style, fix, bed, timbre);
@@ -3537,10 +3143,8 @@ fn main() {
                     share,
                     outside,
                 ));
-                // THE LIFT is read in the melody's register, THE BASS in its
-                // own [220, 440) band — the register map's two bands are
-                // disjoint, which is the whole reason a space can be pitched
-                // out of a take that is otherwise made of letters.
+                // The lift is read in the melody's register, the bass in its
+                // own [220, 440) band; the two bands are disjoint.
                 let shifts = cue_times(sc, SoundKind::Shift);
                 if !shifts.is_empty() {
                     rots.push(rotation_of(
@@ -3640,10 +3244,9 @@ fn main() {
     );
     let mut siren_free = true;
     for (name, keys, worst, visited, share, outside) in &sirens {
-        // The three closed guarantees, read back: MELODY_RUN_MAX inverts the
-        // fourth identical stride, reflection keeps the line in the register,
-        // and gravity plus the register keep it off one note. A take with
-        // fewer than a handful of keys says nothing either way.
+        // The three guarantees, read back: MELODY_RUN_MAX inverts the fourth
+        // identical stride, reflection keeps the line in register, gravity
+        // keeps it off one note. Fewer than a handful of keys says nothing.
         let thin = *keys < 20;
         let ok = *outside == 0 && *worst <= 3 && (thin || (*share < 50.0 && *visited >= 5));
         siren_free &= ok;
@@ -3687,9 +3290,8 @@ fn main() {
     probe_tables(&out, &tag, voice, style, seed, timbre, dump_probes);
 }
 
-/// THE GESTURE PROBE TABLE AND REEL, at both volumes — one gesture alone from
-/// one settled melody state. Split out so `--probes` can print §8 step 4's
-/// onset census and step 6's centroid without rendering seven scenes first.
+/// The gesture probe table and reel at both volumes, split out so `--probes`
+/// prints the onset census and centroid without rendering the scenes.
 fn probe_tables(
     out: &std::path::Path,
     tag: &str,
@@ -3701,9 +3303,8 @@ fn probe_tables(
 ) {
     for volume in [0.4f32, 1.0] {
         println!("\n== gesture probes (isolated, vol {volume}) ==");
-        // `class` is the stamped [`EventMeta::glyph_class`] (0 on every row
-        // that carries no char); `hi>6k` and `2.8-5.6k` are the two readings
-        // the 2026-09-20 ruling's "harsh" is measured on.
+        // `class` is the stamped [`EventMeta::glyph_class`] (0 where no char);
+        // `hi>6k` and `2.8-5.6k` are the "harsh" readings.
         println!(
             "{:<20} {:>5} {:>8} {:>8} {:>9} {:>8} {:>8} {:>9} {:>9} {:>6} {:>6} {:>5}",
             "gesture",
@@ -3738,36 +3339,22 @@ fn probe_tables(
                 p.fine.map_or("-".to_string(), |n| n.to_string())
             );
         }
-        // §8 STEP 4, RE-RULED 2026-09-10 (the owner: "a sound effect for the
-        // shift key and shifted keys"), read off the table. A KEYSTROKE is
-        // still one onset by the FINE census (`Typed 1`; a Caps-Lock capital
-        // — the `CapsLockA` row, when the table carries it — rings but does
-        // not strike twice, its ring swelling on a 30 ms attack). The
-        // `Capital` row is TWO KEYS — the bare Shift's pickup and the shifted
-        // letter 60 ms on — and reads 2. And the bare Shift SINGS BY DESIGN:
-        // a pitched pickup on the lattice at −6 dB re the keystroke, where
-        // the 2026-09-08 felt mallet measured −61 dBFS (≈ −39 dB re Typed)
-        // and was what the owner could not hear. See [`FINE_ONSET`] for the
-        // census on both engines.
+        // A keystroke is one onset by the fine census (`Typed 1`; a Caps-Lock
+        // capital rings but does not strike twice). `Capital` is two keys (the
+        // bare Shift's ting and the letter 60 ms on) and reads 2. The bare
+        // Shift sings by design.
         let find = |name: &str| probes.iter().find(|p| p.name == name);
         let fine_of = |name: &str| find(name).and_then(|p| p.fine).unwrap_or(0);
         let typed = fine_of("Typed");
-        // THE CAPITAL IS COUNTED ON THE SCENE CENSUS since 2026-09-16: the
-        // ting now rings THROUGH the capital's strike, and two lattice
-        // partials a consonant interval apart ripple the envelope at their
-        // difference frequency (≥ 100 Hz here — a difference tone, not a
-        // second strike), which the fine census's 2.67 ms window counts as
-        // rises every refractory (measured 6-7 on the room and plain rungs
-        // alike, with a smooth 10 ms envelope: −31 −29 −30 −31 −32 −33 −26
-        // −24 … dB, exactly two arrivals). The 35 ms / 1.35× scene census
-        // reads the two keys.
+        // The capital is counted on the scene census: the ting rings through
+        // the strike, and the partials' difference tone (≥ 100 Hz) reads as
+        // extra rises on the fine census (see [`FINE_ONSET`]).
         let capital = find("Capital").map_or(0, |p| p.onsets);
         let caps_lock = find("CapsLockA").and_then(|p| p.fine);
         let shift_tonality = find("Shift").map_or(0.0, |p| p.tonality);
         let shift_pitched = shift_tonality >= PITCHED_TONALITY;
-        // The ting is read against the WALK-MEAN letter ([`PROBE_WALK_SETTLES`]):
-        // three more `Typed` takes on the next accents of the walk, averaged
-        // in dB with the row's own.
+        // The ting is read against the walk-mean letter
+        // ([`PROBE_WALK_SETTLES`]), averaged in dB with the row's own.
         let typed_walk_db = {
             let rows: Vec<f64> = PROBE_WALK_SETTLES
                 .iter()
@@ -3784,24 +3371,10 @@ fn probe_tables(
             rows.iter().sum::<f64>() / rows.len() as f64
         };
         let shift_re_typed = find("Shift").map_or(f64::NAN, |s| s.peak_db - typed_walk_db);
-        // RE-RULED 2026-09-16 (the owner: "there is no 'shift' tone … it is
-        // supposed to be a 'ting'"): the bare Shift is the TING at the
-        // Space's own tier, −3 dB re the keystroke, in both engines. The
-        // −6 dB pickup this replaces measured −28.22 dBFS against Typed's
-        // −22.10 on this very row (music box, vol 0.4) and was cut 60 ms in
-        // by the capital it announced. "The keystroke" is the walk mean
-        // since the same day's review (`typed_walk_db` above): against the
-        // one row Comet read −7.16 dB and passed nothing, and the number
-        // was the row's degree, not the ting.
-        //
-        // RE-RULED 2026-09-20 FOR THE MUSIC BOX (the owner: "the shift key
-        // tone is harsh and doesn't sound musical. I want the shift key press
-        // to sound like a high "ting" like how the space bar is a low tone
-        // and it needs to sound musical"): its ting is a 200 ms FM-free bell
-        // on a tone of the live chord, and a note that rings 2.4× as long is
-        // as present 1.5 dB lower — −4.5 ± 1.0 dB re the walk-mean Typed. The
-        // v1 palettes keep the 85 ms ting and the 2026-09-16 window with it
-        // (Lumen reads −2.33, which the music box's window would call red).
+        // The bare Shift is a ting. On the v1 palettes it sits at the Space's
+        // tier, −3 dB re the walk-mean keystroke. The music box's ting is a
+        // 200 ms FM-free bell on a tone of the live chord; ringing 2.4× as long,
+        // it is as present 1.5 dB lower: −4.5 ± 1.0 dB re the walk-mean Typed.
         let music_box = match voice {
             SoundVoice::RainbowKittyV2 | SoundVoice::Of(GlowStyle::RainbowKitty) => true,
             SoundVoice::Style => style == GlowStyle::RainbowKitty,
@@ -3818,12 +3391,9 @@ fn probe_tables(
         let shift_level_ok =
             (shift_re_typed - SHIFT_RE_TYPED_TARGET_DB).abs() <= SHIFT_RE_TYPED_TOL_DB;
         let caps_lock_ok = caps_lock.is_none_or(|n| n == 1);
-        // THE TING'S OWN LINE, on both engines: §8 is the music box's
-        // acceptance and its Typed clause ("a keystroke is one onset", the
-        // fine census) has always read red on the v1 palettes — Lumen's
-        // keystroke counts 20 fine rises — so the ting's verdict is stated on
-        // its own, where a v1 run can read it green (Lumen after the
-        // 2026-09-16 refit: −2.33 dB re Typed, under its own Space's peak).
+        // The ting's own line on both engines: the Typed clause ("a keystroke
+        // is one onset") reads red on the v1 palettes, so the ting's verdict
+        // is stated separately.
         println!(
             "ting ({ruled}): Shift {shift_re_typed:+.2} dB re the walk-mean Typed \
              ({typed_walk_db:.2} dBFS over settle {PROBE_WALK_SETTLES:?}; the row's own \
@@ -3860,18 +3430,11 @@ fn probe_tables(
                 "§8 STEP 4 (2026-09-10) FAILS: a keystroke is not one onset"
             }
         );
-        // FORTE, NOT HIGHER (RE-RULED 2026-09-20 — the owner: "I want
-        // shifted characters to sound more like FORTE in a piano versus just
-        // a higher tone"). The SAME-PITCH CHECK: the `Capital-run-interior`
-        // row's key (`B` after a shifted `A` — inside a shifted run, so the
-        // walk's own accent does not fire) against its lowercase twin from
-        // the same settled state (`b` after that `A`). The two derive ONE
-        // degree, so since this ruling they must read ONE note: on the
-        // 2026-09-19 tree the capital struck an octave over it and this line
-        // read +1200 cents. Read 25 ms past the onset,
-        // like every pitch in this bench (past the ~12 ms contour settle); the
-        // `Capital` census above is
-        // unmoved by the ruling and still reads 2 (the ting, then the key).
+        // Forte, not higher: the `Capital-run-interior` row's `B` (inside a
+        // shifted run, so the walk's accent does not fire) against its
+        // lowercase twin `b` from the same settled state. Both derive one
+        // degree, so they must read one note. Read 25 ms past the onset, as
+        // every pitch here.
         if let Some(interior) = PROBES.iter().find(|p| p.label == "Capital-run-interior") {
             let twin = Probe {
                 label: "run-interior twin",
@@ -3909,46 +3472,18 @@ fn probe_tables(
                 }
             );
         }
-        // THE SPACE HEAD IS HEARD (RE-RULED 2026-09-16 — the owner: "i
-        // don't always hear the space bar?"). The 2026-09-10 fit ("felt,
-        // not heard") measured on this row, music box, vol 0.4: Space
-        // −30.82 dBFS against Typed's −22.10 — 8.7 dB under the letter,
-        // centroid 303 Hz, energy over 2 kHz 0.000 — a spectrum a laptop
-        // speaker rolls off. The re-fit (`rainbow_kitty_v2::BASS_LEVEL`
-        // −4 dB re the step, the head breath's twinkle
-        // `SPACE_TWINKLE_LEVEL`, the breath's roof) puts the head at the
-        // ting's tier and under the letter: −4..−5 dB re Typed with top.
-        // Verdict on both engines: −6.5..0 dB re Typed (the ladder test's
-        // "never over the letter" is the ceiling), centroid ≥ 450 Hz and at
-        // least a fiftieth of the energy over 2 kHz. Lumen's own space (the
-        // 2026-08-31 twinkle) reads −2.1 dB / 585 Hz / 0.026 here.
+        // The space head must be heard: −6.5..0 dB re the walk-mean Typed
+        // (never over the letter), centroid ≥ 450 Hz, and at least a fiftieth
+        // of the energy over 2 kHz (a laptop speaker rolls off a bare bass).
+        // The letter is the walk mean because the v1 downbeat is a fixed bass
+        // root while the letter walks its palette's roof; the row's own
+        // reading is printed beside it.
         //
-        // THE LETTER IS THE WALK MEAN (2026-09-16, the audit's fourth
-        // observation) — `typed_walk_db` above, the ting line's own
-        // instrument. Read against the one row the verdict was the row's
-        // degree, not the space: the v1 downbeat is a FIXED bass root (its
-        // pitch and level do not walk) while the letter walks its palette's
-        // roof, so the same Space read −2.11 dB re the row on the bench's
-        // seed and −6.85 (Lumen) / −7.52 (Comet) re the same-seed letter on
-        // one other seed each — off the window on luck alone. The row's own
-        // reading is still printed beside it, as the ting line prints its.
-        //
-        // THE THREE CLAUSES ARE THE ENGINE'S (2026-09-17): `trail_sound`'s
-        // `SPACE_HEAD_RE_TYPED_DB`, `SPACE_HEAD_CENTROID_FLOOR_HZ` and
-        // `SPACE_HEAD_HI_FLOOR`, read here and by its own pin
-        // (`the_space_head_is_heard_with_top_on_every_v1_voice`) so the two
-        // instruments cannot drift apart. That day's finding: this line read
-        // NO TOP on Comet (420 Hz) and Laser (440) — and the cause was the
-        // ROOT, not the palette: the v1 head's twinkle rode 16× a root that
-        // the two A anchors fold to the floor of the [220, 440) register, and
-        // every other voice's walk visits the same floor on later words.
-        // The twinkle is folded into one sparkle band now
-        // (`SPACE_TWINKLE_LO_HZ`) and lifted 2.1 dB; this row reads Comet
-        // 420 → 575 Hz / 0.033 → 0.047 at −4.51 dB, Laser 440 → 596 at
-        // −2.68, Lumen 585 → 625 at −2.93.
-        // The engine states them in f64 so nothing is widened here: an f32
-        // `0.02` widened printed as `0.019999999552965164` in the NO TOP
-        // string (review, 2026-09-17).
+        // The three clauses are the engine's (`trail_sound`'s
+        // `SPACE_HEAD_RE_TYPED_DB`, `SPACE_HEAD_CENTROID_FLOOR_HZ`,
+        // `SPACE_HEAD_HI_FLOOR`), shared with its pin
+        // `the_space_head_is_heard_with_top_on_every_v1_voice`, in f64 so
+        // nothing is widened in the printout.
         let (space_re_typed_lo_db, space_re_typed_hi_db) = SPACE_HEAD_RE_TYPED_DB;
         if let (Some(sp), Some(t)) = (find("Space"), find("Typed")) {
             let re = sp.peak_db - typed_walk_db;
@@ -3978,9 +3513,8 @@ fn probe_tables(
                 }
             );
         }
-        // §8 STEP 6's PROOF, on the same row: the bloomed Typed probe's
-        // centroid sits in §3.3's 1250-1400 Hz window and UNDER 1600 Hz, past
-        // which the bloom has become the glass bell the v2 train retired.
+        // The bloomed Typed probe's centroid sits in the 1250-1400 Hz window
+        // and under 1600 Hz, past which the bloom becomes a glass bell.
         for name in ["Typed", "Typed@cyan"] {
             let Some(p) = probes.iter().find(|p| p.name == name) else {
                 continue;
@@ -4002,12 +3536,10 @@ fn probe_tables(
             );
         }
         if dump {
-            // THE TAKES THEMSELVES, for an instrument other than this one:
-            // per gesture, the `with` take on the LEFT and the `without` take
-            // on the RIGHT, sample-aligned (no pre-roll, no click), once on
-            // the shipping bus and once with the limiter out — so a reader
-            // can subtract them and take any census it likes on either
-            // domain, and hear with/without as an A/B.
+            // The takes themselves, for other tools: per gesture, `with` on
+            // the left and `without` on the right, sample-aligned, once on the
+            // shipping bus and once with the limiter out, so any census can be
+            // taken on either domain.
             for t in &takes {
                 for (domain, with, alone) in [
                     ("bus", &t.bus_with, &t.bus_alone),

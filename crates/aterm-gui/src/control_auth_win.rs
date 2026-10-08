@@ -65,28 +65,6 @@ pub(crate) fn legacy_socket_dirs() -> Vec<PathBuf> {
     base.map(|b| b.join("aterm")).into_iter().collect()
 }
 
-/// Atomically (re)point the `latest` alias — a regular POINTER FILE on
-/// Windows (contents = the relative instance sock name) — at this instance's
-/// socket. Same temp-name + rename publish as the Unix symlink; best-effort.
-pub(crate) fn publish_latest_link(link: &Path, sock_path: &str) {
-    aterm_uds::latest::publish(link, sock_path);
-}
-
-/// Generate 32 CSPRNG bytes (`BCryptGenRandom`, system-preferred RNG) as a
-/// 64-char lowercase hex string, or `None` when entropy is unavailable (the
-/// caller must then refuse to start the socket — fail closed).
-#[must_use]
-pub(crate) fn random_token_hex() -> Option<String> {
-    let mut buf = [0u8; 32];
-    aterm_uds::rand::fill(&mut buf).ok()?;
-    let mut hex = String::with_capacity(64);
-    for b in buf {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{b:02x}");
-    }
-    Some(hex)
-}
-
 /// Provision the capability token: fresh token, written through
 /// `create_new(true)` after an unlink-first, and returned as hex. The token
 /// rotates every launch — a leaked token from a prior run is worthless.
@@ -101,7 +79,7 @@ pub(crate) fn random_token_hex() -> Option<String> {
 #[must_use]
 pub(crate) fn provision_token(path: &Path) -> Option<String> {
     use std::io::Write;
-    let token = random_token_hex()?;
+    let token = super::random_token_hex()?;
     let _ = std::fs::remove_file(path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)

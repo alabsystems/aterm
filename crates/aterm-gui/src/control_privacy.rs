@@ -1,70 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl privacy` — the macOS consent posture in one hop, plus the
-//! instance half of the two additive `status` fields and the `await consent`
-//! predicate (design §5.1/§5.2/§5.3).
+//! `aterm ctl privacy`: the macOS consent posture in one hop, plus the instance
+//! half of the two `status` consent fields and the `await consent` predicate
+//! (design §5.1–§5.3).
 //!
-//! # What this module may and may not touch
-//!
-//! Everything the OS can be asked about consent arrives through
-//! [`ConsentProbes`] — a bundle of injected function pointers with an INERT
-//! arm. A headless-constructible `App` is exactly what a unit test is, and on
-//! 2026-08-17 a test binary's first `WindowServer` touch made `tccd` `readdir`
-//! a 1.1-million-entry `target/debug/deps` until `WindowServer` was killed
-//! (`AGENTS.md` rule 5, `tools/grep_guard.sh` B9). So the pattern here is the
-//! `lock_modifiers` / `user_input_recent` one, for the same reason: a windowed
-//! instance gets the live arms, a headless instance and every unit test get
-//! arms that answer `unknown` without a syscall.
-//!
-//! The consequence is stated rather than hidden: a `--headless` instance
-//! ANSWERS this verb (that is why the row is `AnyScopeMeta`), but its
-//! `full_disk_access=` reads `unknown` with `probe=refused_disabled` — the
-//! probe was deliberately not consulted, which is a different fact from a
-//! denial and is spelled differently.
+//! Every OS consent question goes through [`ConsentProbes`], injected function
+//! pointers with an inert arm: a windowed instance gets the live arms; a
+//! headless instance and every unit test get arms that answer `unknown` without
+//! a syscall, so no test binary reaches `tccd` or `WindowServer` (`AGENTS.md`,
+//! `tools/grep_guard.sh` B9). A `--headless` instance still answers the verb,
+//! with `full_disk_access=unknown probe=refused_disabled`: not consulted, which
+//! is distinct from a denial.
 //!
 //! Live reads are asynchronous: a cold, invalidated or expired observation
 //! reports `full_disk_access=unknown probe=pending probe_age_ms=-` (JSON age
-//! `null`). One instance-owned worker refreshes it and wakes the GUI; even a
-//! stalled probe cannot create additional workers. Freshness and retry spacing
-//! have a 500 ms floor, including when the configured interval is zero.
+//! `null`). One instance-owned worker refreshes it and wakes the GUI; a stalled
+//! probe cannot spawn more workers. Freshness and retry spacing have a 500 ms
+//! floor.
 //!
-//! # No protected-folder literal lives here
+//! Protected paths come only from `aterm_containment::consent`
+//! (`protected_roots`, `Folder::path`); this module holds no path literals
+//! (guard B13).
 //!
-//! Every protected path comes from `aterm_containment::consent` as already
-//! resolved data (`protected_roots`, `Folder::path`). This module writes none
-//! of its own — the B13 rule, and the reason the guard block passes on the
-//! commit that adds the feature.
-//!
-//! # What is deliberately NOT claimed
-//!
-//! Spikes S1 (grant scope) and S4 (which services a grant covers) have not
-//! been run, so `SpikeEvidence::UNMEASURED` is what the join sees:
-//! A completed grant establishes `fda_scope=this_process` and Apple's
-//! documented `app-data` coverage for that host. It does not establish
-//! inherited-session or per-folder access: `prompt_possible` remains `yes`
-//! while those claims are unmeasured, and no folder is reported covered.
+//! Grant scope and service coverage (spikes S1, S4) are unmeasured
+//! (`SpikeEvidence::UNMEASURED`): a completed grant establishes
+//! `fda_scope=this_process` and Apple's documented `app-data` coverage for that
+//! host, but not inherited-session or per-folder access, so `prompt_possible`
+//! stays `yes` and no folder is reported covered.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+use aterm_types::MutexExt as _;
 use std::time::{Duration, Instant};
 
 use aterm_containment::consent::{
-    self, Attribution, Claimants, ConsentKey, ConsentPosture, DrClass, FdaProbe, FdaState, Folder,
-    FsConsent, PostureInputs, ProbeGate, ProbeLabel, Responsible, ResponsibleError, SpikeEvidence,
-    plist_string, read_plist_text,
+    self, Attribution, Claimants, ConsentKey, ConsentPosture, DebuggerMode, DebuggerProbe,
+    DebuggerProbeLabel, DevToolProbe, DevToolProbeLabel, DrClass, FdaProbe, FdaState, Folder,
+    FsConsent, PostureInputs, ProbeGate, ProbeLabel, Responsible, ResponsibleError, SelfHardening,
+    SpikeEvidence, TrashOffer, plist_string, read_plist_text,
 };
 use aterm_control::wire::{json_ok, json_str_field, pct_encode};
 use winit::event_loop::EventLoopProxy;
 
 use crate::control::control_media::MainHopError;
+use crate::control::{Scope, cross_session_authorized};
 use crate::{App, Wake};
 
-/// The TCC service classes a Full Disk Access grant is claimed — by Apple, not
-/// by measurement — to subsume. App-data follows the observing host's completed
-/// grant and Apple's documented rule. Other classes remain `unmeasured` until
-/// §7 S4 measures them, except [`NEVER_COVERED`]: see [`covers_split`].
+/// The TCC service classes a Full Disk Access grant is claimed (by Apple) to
+/// subsume. App-data follows the host's completed grant; others stay
+/// `unmeasured` until §7 S4, except [`NEVER_COVERED`] (see [`covers_split`]).
 const SERVICES: &[&str] = &[
     "documents",
     "desktop",
@@ -73,32 +60,19 @@ const SERVICES: &[&str] = &[
     "removable-volumes",
     "app-data",
     "file-provider-domains",
-    // The three promptable classes Full Disk Access does NOT subsume, each with
-    // its own System Settings pane (`Privacy_Photos`, the media library, and App
-    // Management). They were absent from this roster until 2026-09-19, so the
-    // verb could not report them even as `uncovered` — and a service the posture
-    // verb cannot name is one an agent reading the verb concludes cannot happen.
-    // Not hypothetical: the reference machine already carries
-    // `kTCCServiceMediaLibrary | com.aterm.aterm | auth_value=2`, so a media
-    // library dialog has been answered for aterm at least once, and §3.4's
-    // 2026-09-07 amendment recorded it as the fifth of five prompts in six
-    // seconds. They are NOT folder rows: `folder_names` stays the four
-    // `Folder::ALL` items plus the two volume classes.
+    // The three promptable classes Full Disk Access does not subsume, each with
+    // its own System Settings pane. They are not folder rows.
     "media-library",
     "photos",
     "app-bundles",
 ];
 
-/// The service classes Full Disk Access does NOT reliably cover, by the
-/// design's own record (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.4:
-/// EPERM despite FDA has been reported under `~/Library/CloudStorage` /
-/// FileProvider domains). Always `uncovered`, measured or not.
+/// The service classes Full Disk Access does not reliably cover
+/// (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.4). Always `uncovered`.
 const NEVER_COVERED: &[&str] = &[
     "file-provider-domains",
-    // Each of these is its own consent service with its own Settings pane, and
-    // Apple's Full Disk Access rule subsumes none of them. `unmeasured` would be
-    // the wrong bucket: this is not "we have not looked", it is "the grant does
-    // not reach here", which is exactly what `uncovered` means (§3.4 amendment).
+    // Separate consent services that the FDA rule does not subsume: the grant
+    // does not reach them, so `uncovered`, not `unmeasured`.
     "media-library",
     "photos",
     "app-bundles",
@@ -136,22 +110,17 @@ const NO_SELECTOR: &str = "ERR privacy is instance-wide and takes no selector\n"
 /// observation. A complete tuple always begins with `fs_consent=`.
 const PENDING_CONSENT_TUPLE: &str = "consent-probe-pending";
 
-// ---------------------------------------------------------------------------
 // The injected probes
-// ---------------------------------------------------------------------------
 
-/// THE FENCE. Every OS question this feature asks goes through one of these
-/// function pointers, injected at `App` construction exactly like
-/// `App::lock_modifiers` and `App::user_input_recent`.
+/// Every OS question this feature asks goes through one of these function
+/// pointers, injected at `App` construction like `App::lock_modifiers`.
 ///
-/// * [`ConsentProbes::live`] — a WINDOWED instance: the real probes.
-/// * [`ConsentProbes::inert`] — a headless instance and every unit test:
-///   answers without performing a syscall.
+/// * [`ConsentProbes::live`]: a windowed instance, the real probes.
+/// * [`ConsentProbes::inert`]: a headless instance and every unit test; no
+///   syscall.
 ///
-/// `fda` additionally passes through `consent::probe_fda`'s own in-bundle
-/// guard, so even the live arm refuses from a binary outside a `.app`. The two
-/// gates are deliberately redundant: this one is the GUI's, and the module's is
-/// the one that also protects the bundled CLI (design §3.3 guardrails 1 and 2).
+/// `fda` also passes `consent::probe_fda`'s own in-bundle guard, which also
+/// protects the bundled CLI (design §3.3 guardrails 1 and 2).
 #[derive(Clone, Copy)]
 pub(crate) struct ConsentProbes {
     /// One `open(TCC.db, O_RDONLY | O_CLOEXEC)`, fd closed at once, contents never
@@ -166,11 +135,33 @@ pub(crate) struct ConsentProbes {
     /// `codesign` per candidate, so it takes the same fence as the others and
     /// its inert arm reads nothing at all.
     census: fn(&str) -> Claimants,
-    /// Whether these are the live arms. Read only by the `Debug` impl and the
-    /// tests: the `observer` row never carries it, because the inert arms
-    /// answer with labels the row already renders as `off` (`RefusedDisabled`,
-    /// `Unsupported` — see [`observer_fda_value`]) — a probe that was never
-    /// consulted is not a probe that answered no.
+    /// The debugger rule (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
+    /// §3.2): `DevToolsSecurity -status` (no dialog) plus the directory
+    /// membership query. Spawns a process, so it is fenced; the inert arm
+    /// spawns nothing.
+    debugger: fn(ProbeGate) -> DebuggerProbe,
+    /// This process's own code-signing flags (`csops`): whether a same-user
+    /// debugger could attach to aterm itself. A syscall about our own image,
+    /// but an OS call all the same, so it is injected like the rest.
+    hardening: fn() -> SelfHardening,
+    /// The Developer Tools list (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
+    /// §9.1): one bounded `/usr/bin/log show` of tccd's own answers for the
+    /// bundle id given. Spawns a process, so it is fenced; the inert arm
+    /// spawns nothing.
+    devtools: fn(ProbeGate, &str) -> DevToolProbe,
+    /// The bundle id the Developer Tools row asks about: the running bundle's
+    /// `CFBundleIdentifier` once the identity is warm, never a literal. Not an
+    /// OS question; injected so a test can name a subject without warming the
+    /// process-wide identity. The reading thread calls only this one.
+    subject: fn() -> Option<&'static str>,
+    /// The same bundle id, reading the identity first when nothing has yet:
+    /// that read may run `codesign` (50–150 ms), so only the
+    /// `aterm-devtools-probe` worker calls it, when [`Self::subject`] found the
+    /// identity cold. The inert arms never read it.
+    warm_subject: fn() -> Option<&'static str>,
+    /// Whether these are the live arms. Read only by `Debug` and tests; the
+    /// `observer` row renders the inert arms' labels as `off`
+    /// ([`observer_fda_value`]).
     live: bool,
 }
 
@@ -180,6 +171,25 @@ fn inert_census(_bundle_id: &str) -> Claimants {
     Claimants::default()
 }
 
+/// The inert debugger arm: `DevToolsSecurity` was deliberately not consulted,
+/// so `mode=unknown member=unknown` with `probe=refused_disabled` — the same
+/// reading, for the same reason, as [`inert_fda_probe`].
+fn inert_debugger(_gate: ProbeGate) -> DebuggerProbe {
+    DebuggerProbe::refused(DebuggerProbeLabel::RefusedDisabled)
+}
+
+/// The inert hardening arm: the flags were not read, which is `unknown`.
+fn inert_hardening() -> SelfHardening {
+    SelfHardening::Unknown
+}
+
+/// The inert Developer Tools arm: tccd's log was deliberately not read, so
+/// `state=unknown probe=refused_disabled`, for the same reason as
+/// [`inert_fda_probe`].
+fn inert_devtools(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+    DevToolProbe::refused(DevToolProbeLabel::RefusedDisabled)
+}
+
 impl ConsentProbes {
     /// The windowed instance's arms.
     pub(crate) const fn live() -> Self {
@@ -187,6 +197,11 @@ impl ConsentProbes {
             fda: consent::probe_fda,
             responsible: consent::responsible_pid_detailed,
             census: consent::claimants_for,
+            debugger: consent::probe_debugger,
+            hardening: consent::self_hardening,
+            devtools: consent::probe_devtool,
+            subject: running_bundle_id_if_warm,
+            warm_subject: running_bundle_id,
             live: true,
         }
     }
@@ -197,6 +212,11 @@ impl ConsentProbes {
             fda: inert_fda_probe,
             responsible: inert_responsible,
             census: inert_census,
+            debugger: inert_debugger,
+            hardening: inert_hardening,
+            devtools: inert_devtools,
+            subject: running_bundle_id_if_warm,
+            warm_subject: running_bundle_id_if_warm,
             live: false,
         }
     }
@@ -214,6 +234,11 @@ impl ConsentProbes {
                 fda: unsupported_fda_probe,
                 responsible: inert_responsible,
                 census: inert_census,
+                debugger: unsupported_debugger_probe,
+                hardening: inert_hardening,
+                devtools: unsupported_devtools_probe,
+                subject: running_bundle_id_if_warm,
+                warm_subject: running_bundle_id_if_warm,
                 live: false,
             }
         }
@@ -239,6 +264,26 @@ fn unsupported_fda_probe(gate: ProbeGate) -> FdaProbe {
     })
 }
 
+/// There is no `DevToolsSecurity` off macOS. A closed gate still reads as
+/// configuration, exactly as [`unsupported_fda_probe`] does.
+fn unsupported_debugger_probe(gate: ProbeGate) -> DebuggerProbe {
+    DebuggerProbe::refused(if gate.permits() {
+        DebuggerProbeLabel::UnsupportedPlatform
+    } else {
+        DebuggerProbeLabel::RefusedDisabled
+    })
+}
+
+/// There is no Developer Tools list off macOS. A closed gate still reads as
+/// configuration, exactly as [`unsupported_fda_probe`] does.
+fn unsupported_devtools_probe(gate: ProbeGate, _subject: &str) -> DevToolProbe {
+    DevToolProbe::refused(if gate.permits() {
+        DevToolProbeLabel::UnsupportedPlatform
+    } else {
+        DevToolProbeLabel::RefusedDisabled
+    })
+}
+
 /// The inert Full Disk Access arm: the probe was deliberately not consulted.
 /// `refused_disabled` rather than `refused_out_of_bundle` because the reason is
 /// this instance's configuration, not where its executable happens to live.
@@ -251,9 +296,7 @@ fn inert_responsible(_pid: i32) -> Result<i32, ResponsibleError> {
     Err(ResponsibleError::Unsupported)
 }
 
-// ---------------------------------------------------------------------------
 // Instance-owned consent state
-// ---------------------------------------------------------------------------
 
 /// Minimum freshness and timer spacing. A zero configured interval must not
 /// turn completion wakes into an endless probe/complete/probe loop. A blocked
@@ -285,32 +328,257 @@ struct ProbeSlot {
     retry_after: Option<Instant>,
 }
 
-/// The claimant census's slot: at most one worker, a failed spawn cannot loop,
-/// and a completed answer is kept and served while a refresh runs.
+/// One answer a bounded worker computes off the event loop: at most one worker
+/// in flight, a failed spawn cannot loop, and a completed answer is served
+/// with its age while a refresh runs. The claimant census and the debugger
+/// rule are instances of it.
 ///
-/// It is NOT retired by [`ConsentState::invalidate`], which focus and config
-/// changes call: neither changes which bundles are on disk. It refreshes on
-/// [`CENSUS_TTL`].
-#[derive(Debug, Default)]
-struct CensusSlot {
+/// `generation` is bumped by [`Self::retire`]; a worker dispatched under an
+/// older one publishes nothing. `in_flight` and `retry_after` survive a
+/// retirement, so focus churn can neither multiply workers nor relaunch a
+/// quickly finished one inside [`PROBE_RETRY_FLOOR`].
+#[derive(Debug)]
+struct TtlSlot<E> {
     in_flight: bool,
-    /// Bumped by [`ConsentState::invalidate_census`]; a worker dispatched
-    /// under an older one publishes nothing.
     generation: u64,
-    entry: Option<CensusEntry>,
+    /// The last published answer and the instant it was published.
+    entry: Option<(E, Instant)>,
     retry_after: Option<Instant>,
 }
 
-#[derive(Debug)]
-struct CensusEntry {
-    claimants: Claimants,
-    completed_at: Instant,
+impl<E> Default for TtlSlot<E> {
+    fn default() -> Self {
+        Self {
+            in_flight: false,
+            generation: 0,
+            entry: None,
+            retry_after: None,
+        }
+    }
+}
+
+impl<E: Clone> TtlSlot<E> {
+    /// The cached answer with its age, and, when that answer is missing or at
+    /// least `ttl` old, no worker is out and the retry floor has passed, the
+    /// generation of the worker this call claims ([`Self::begin`]). The caller
+    /// spawns that worker with no lock held.
+    fn serve(&mut self, now: Instant, ttl: Duration) -> (Option<(E, Duration)>, Option<u64>) {
+        let answer = self.cached(now);
+        let stale = answer.as_ref().is_none_or(|(_, age)| *age >= ttl);
+        let admitted = stale && !self.in_flight && !self.retry_after.is_some_and(|at| now < at);
+        (answer, admitted.then(|| self.begin(now)))
+    }
+
+    /// The cached answer with its age, claiming nothing.
+    fn cached(&self, now: Instant) -> Option<(E, Duration)> {
+        self.entry
+            .as_ref()
+            .map(|(value, at)| (value.clone(), now.saturating_duration_since(*at)))
+    }
+}
+
+impl<E> TtlSlot<E> {
+    /// Claim the one worker slot and arm the retry floor; the worker publishes
+    /// under the generation returned.
+    fn begin(&mut self, now: Instant) -> u64 {
+        self.in_flight = true;
+        self.retry_after = Some(now + PROBE_RETRY_FLOOR);
+        self.generation
+    }
+
+    /// The worker's publication: it always releases the slot, and publishes
+    /// only under the generation it was dispatched with.
+    fn complete(&mut self, generation: u64, value: E, now: Instant) {
+        self.in_flight = false;
+        if self.generation == generation {
+            self.entry = Some((value, now));
+        }
+    }
+
+    /// Forget the answer; a worker already out publishes nothing.
+    fn retire(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entry = None;
+    }
+
+    /// The OS refused the worker thread: no worker owns the slot, so release it
+    /// and let a later read retry once the floor [`Self::begin`] armed passes.
+    fn spawn_failed(&mut self) {
+        self.in_flight = false;
+    }
+}
+
+/// Run `work` on a named worker for a dispatch [`TtlSlot::serve`] claimed. A
+/// thread the OS refuses releases the slot ([`TtlSlot::spawn_failed`]).
+fn spawn_slot_worker<E>(
+    slot: &Mutex<TtlSlot<E>>,
+    name: &str,
+    work: impl FnOnce() + Send + 'static,
+) {
+    if std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(work)
+        .is_err()
+    {
+        slot.lock_or_recover().spawn_failed();
+    }
 }
 
 /// How long a census answer is served before a read refreshes it. The census
 /// is about bundles on disk, which rarely change, and each refresh runs
-/// `codesign` once per copy of the app.
+/// `codesign` once per copy of the app. The census slot is not retired by
+/// [`ConsentState::invalidate`] (focus and config do not change bundles on
+/// disk).
 const CENSUS_TTL: Duration = Duration::from_secs(60);
+
+/// The debugger slot's answer: the probe and aterm's own hardening.
+#[derive(Clone, Copy, Debug)]
+struct DebuggerEntry {
+    probe: DebuggerProbe,
+    self_hardened: SelfHardening,
+}
+
+/// How long a debugger answer is served before a read refreshes it. The rule
+/// changes only when an administrator changes it, and focus gain retires the
+/// answer sooner ([`ConsentState::invalidate_debugger`]). Only the `privacy`
+/// verb's full report and the Security page dispatch it.
+const DEBUGGER_TTL: Duration = Duration::from_secs(60);
+
+/// How long a Developer Tools answer is served before a read refreshes it.
+/// tccd's answer changes only when the owner changes the list in System
+/// Settings, and then only shows on the next new program, so a read every two
+/// minutes while someone looks is enough; focus gain retires the answer sooner
+/// ([`ConsentState::invalidate_devtools`]). Each refresh is one `log show`
+/// (0.86 s wall for a 10-minute window, measured 2026-10-07).
+const DEVTOOLS_TTL: Duration = Duration::from_secs(120);
+
+/// The Developer Tools slot's answer: the probe, and the bundle id it was
+/// about, which the worker resolved when the reading thread found the identity
+/// cold (`None`: no usable one, and the probe is `refused_no_subject`).
+#[derive(Clone, Copy, Debug)]
+struct DevToolsEntry {
+    probe: DevToolProbe,
+    subject: Option<&'static str>,
+}
+
+/// What the `devtools` row reports: the probe, how long ago it completed, and
+/// how old tccd's newest answer was when this row was read (`None` with no
+/// sample: pending, refused, or no answer in the window).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DevToolsRow {
+    probe: DevToolProbe,
+    /// The bundle id the row is about (`subject=`), when there is one.
+    subject: Option<&'static str>,
+    probe_age_ms: Option<u128>,
+    answer_age_ms: Option<u64>,
+}
+
+impl DevToolsRow {
+    /// Nothing learned, for `label`'s reason.
+    const fn refused(label: DevToolProbeLabel, subject: Option<&'static str>) -> Self {
+        Self {
+            probe: DevToolProbe::refused(label),
+            subject,
+            probe_age_ms: None,
+            answer_age_ms: None,
+        }
+    }
+
+    /// A published answer, aged against the two clocks it is read with: the
+    /// slot's monotonic stamp for the probe, the wall clock for tccd's own
+    /// timestamp (a stamp in the future is age 0).
+    fn from_probe(
+        probe: DevToolProbe,
+        subject: Option<&'static str>,
+        age: Duration,
+        now_ms: i64,
+    ) -> Self {
+        let completed = !probe.label.refused() && probe.label != DevToolProbeLabel::Pending;
+        Self {
+            probe,
+            subject,
+            probe_age_ms: completed.then_some(age.as_millis()),
+            answer_age_ms: probe
+                .answered_at_ms
+                .map(|at| consent::devtool_answer_age_ms(at, now_ms)),
+        }
+    }
+
+    /// No answer yet: the probe is still out (or never dispatched).
+    pub(crate) fn pending(&self) -> bool {
+        self.probe.label == DevToolProbeLabel::Pending
+    }
+
+    /// The probe this row reports.
+    pub(crate) const fn probe(&self) -> DevToolProbe {
+        self.probe
+    }
+
+    /// How old tccd's newest answer was when this row was read.
+    pub(crate) const fn answer_age_ms(&self) -> Option<u64> {
+        self.answer_age_ms
+    }
+}
+
+/// The wall clock as unix milliseconds, for aging tccd's own timestamps. A
+/// clock before 1970 reads 0, which ages every answer to 0 rather than
+/// inventing an age.
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// What the `debugger` row reports: the probe, aterm's own hardening, and the
+/// answer's age (`None` while pending or refused — no sample, no age).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DebuggerRow {
+    probe: DebuggerProbe,
+    self_hardened: SelfHardening,
+    probe_age_ms: Option<u128>,
+}
+
+impl DebuggerRow {
+    /// Nothing learned, for `label`'s reason: every fact `unknown`.
+    const fn refused(label: DebuggerProbeLabel) -> Self {
+        Self {
+            probe: DebuggerProbe::refused(label),
+            self_hardened: SelfHardening::Unknown,
+            probe_age_ms: None,
+        }
+    }
+
+    /// A published answer, with its age only when a probe actually completed.
+    fn from_entry(entry: DebuggerEntry, age: Duration) -> Self {
+        Self {
+            probe: entry.probe,
+            self_hardened: entry.self_hardened,
+            probe_age_ms: completed_debugger_age_ms(entry.probe.label, age),
+        }
+    }
+
+    /// No answer yet: the probe is still out (or never dispatched).
+    pub(crate) fn pending(&self) -> bool {
+        self.probe.label == DebuggerProbeLabel::Pending
+    }
+
+    /// The probe this row reports.
+    pub(crate) const fn probe(&self) -> DebuggerProbe {
+        self.probe
+    }
+
+    /// aterm's own hardening, as this row reports it.
+    pub(crate) const fn self_hardened(&self) -> SelfHardening {
+        self.self_hardened
+    }
+}
+
+/// The debugger probe's age only when a probe actually completed.
+fn completed_debugger_age_ms(label: DebuggerProbeLabel, age: Duration) -> Option<u128> {
+    (!label.refused() && label != DebuggerProbeLabel::Pending).then_some(age.as_millis())
+}
 
 #[derive(Default)]
 struct SharedProbe {
@@ -319,25 +587,64 @@ struct SharedProbe {
     /// A spawn failure can be published without waiting for the slot mutex.
     failed_request: AtomicU64,
     slot: Mutex<ProbeSlot>,
-    census: Mutex<CensusSlot>,
+    census: Mutex<TtlSlot<Claimants>>,
     wake: OnceLock<ProbeWake>,
+    debugger: Mutex<TtlSlot<DebuggerEntry>>,
+    /// The debugger worker's own completion wake (`Wake::DebuggerProbeReady`),
+    /// kept apart from [`Self::wake`] so a debugger answer never ticks the
+    /// Full Disk Access card.
+    debugger_wake: OnceLock<ProbeWake>,
+    /// This process's hardening, read by the first debugger worker and kept:
+    /// the two bits it reads are fixed at exec. Never read on the event loop.
+    hardening: OnceLock<SelfHardening>,
+    devtools: Mutex<TtlSlot<DevToolsEntry>>,
+    /// The Developer Tools worker's own completion wake
+    /// (`Wake::DevToolsProbeReady`), apart from the other two for the same
+    /// reason the debugger's is.
+    devtools_wake: OnceLock<ProbeWake>,
 }
 
 impl SharedProbe {
     /// The census's publication seam. The worker runs `codesign` with no lock
     /// held and only then takes the mutex.
     fn complete_census(&self, generation: u64, claimants: Claimants, now: Instant) {
-        {
-            let mut slot = self.census.lock().unwrap_or_else(|p| p.into_inner());
-            slot.in_flight = false;
-            if slot.generation == generation {
-                slot.entry = Some(CensusEntry {
-                    claimants,
-                    completed_at: now,
-                });
-            }
-        }
+        self.census
+            .lock_or_recover()
+            .complete(generation, claimants, now);
         if let Some(wake) = self.wake.get() {
+            wake();
+        }
+    }
+
+    /// The debugger worker's publication seam. `DevToolsSecurity` has already
+    /// exited when this runs; no syscall happens under the lock.
+    fn complete_debugger(
+        &self,
+        generation: u64,
+        probe: DebuggerProbe,
+        self_hardened: SelfHardening,
+        now: Instant,
+    ) {
+        self.debugger.lock_or_recover().complete(
+            generation,
+            DebuggerEntry {
+                probe,
+                self_hardened,
+            },
+            now,
+        );
+        if let Some(wake) = self.debugger_wake.get() {
+            wake();
+        }
+    }
+
+    /// The Developer Tools worker's publication seam. `log` has already exited
+    /// when this runs; nothing is spawned under the lock.
+    fn complete_devtools(&self, generation: u64, entry: DevToolsEntry, now: Instant) {
+        self.devtools
+            .lock_or_recover()
+            .complete(generation, entry, now);
+        if let Some(wake) = self.devtools_wake.get() {
             wake();
         }
     }
@@ -370,12 +677,10 @@ impl SharedProbe {
 }
 
 /// Instance-owned, nonblocking Full Disk Access observation. Only the worker
-/// invokes the live FDA probe. Reads return Unknown/Pending until a current
-/// result exists; an expired grant is never served while refreshing.
-///
-/// There is at most one in-flight worker per instance, including across
-/// activation, identity and policy invalidation. A stuck syscall therefore
-/// cannot multiply threads. A successor starts with no cached observation.
+/// invokes the live FDA probe; reads return Unknown/Pending until a current
+/// result exists, and an expired grant is never served while refreshing. At
+/// most one worker is in flight per instance, across every invalidation. A
+/// successor starts with no cached observation.
 pub(crate) struct ConsentState {
     probes: ConsentProbes,
     shared: Arc<SharedProbe>,
@@ -412,28 +717,22 @@ impl ConsentState {
     /// The census slot's generation, for the host's wake test.
     #[cfg(test)]
     pub(crate) fn census_generation_for_test(&self) -> u64 {
-        self.shared
-            .census
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .generation
+        self.shared.census.lock_or_recover().generation
     }
 
     /// Forget the census answer after the bundles on disk changed under it (a
     /// *Move to Trash*). A worker already out publishes nothing, and the next
     /// read dispatches a fresh one without waiting out the retry floor.
     pub(crate) fn invalidate_census(&self) {
-        let mut slot = self.shared.census.lock().unwrap_or_else(|p| p.into_inner());
-        slot.generation = slot.generation.wrapping_add(1);
-        slot.entry = None;
+        let mut slot = self.shared.census.lock_or_recover();
+        slot.retire();
         slot.retry_after = None;
     }
 
-    /// The claimant census, never computed on this thread. Returns the last
-    /// answer with its age (served even while a refresh runs), and whether no
-    /// answer exists yet. `(None, false)` — `census=off` — when the privacy
-    /// posture is disabled, the instance is inert, or there is no bundle id to
-    /// ask about.
+    /// The claimant census, never computed on this thread: the last answer
+    /// with its age (served while a refresh runs), and whether no answer exists
+    /// yet. `(None, false)` (`census=off`) when the posture is disabled, the
+    /// instance is inert, or there is no bundle id.
     pub(crate) fn claimants(
         &self,
         bundle_id: Option<&str>,
@@ -442,41 +741,225 @@ impl ConsentState {
         let Some(bundle_id) = bundle_id.filter(|_| enabled && self.probes.live) else {
             return (None, false);
         };
-        let now = Instant::now();
-        let (answer, dispatch, generation) = {
-            let mut slot = self.shared.census.lock().unwrap_or_else(|p| p.into_inner());
-            let answer = slot.entry.as_ref().map(|e| {
-                (
-                    e.claimants.clone(),
-                    now.saturating_duration_since(e.completed_at),
-                )
-            });
-            let stale = answer.as_ref().is_none_or(|(_, age)| *age >= CENSUS_TTL);
-            let dispatch = stale && !slot.in_flight && !slot.retry_after.is_some_and(|at| now < at);
-            if dispatch {
-                slot.in_flight = true;
-                slot.retry_after = Some(now + PROBE_RETRY_FLOOR);
-            }
-            (answer, dispatch, slot.generation)
-        };
-        if dispatch {
+        let (answer, dispatch) = self
+            .shared
+            .census
+            .lock_or_recover()
+            .serve(Instant::now(), CENSUS_TTL);
+        if let Some(generation) = dispatch {
             let shared = Arc::clone(&self.shared);
             let census = self.probes.census;
             let id = bundle_id.to_owned();
-            let spawned = std::thread::Builder::new()
-                .name("aterm-claimant-census".to_owned())
-                .spawn(move || {
-                    let answer = census(&id);
-                    shared.complete_census(generation, answer, Instant::now());
-                });
-            if spawned.is_err() {
-                // No worker owns the slot: release it so a later read retries.
-                let mut slot = self.shared.census.lock().unwrap_or_else(|p| p.into_inner());
-                slot.in_flight = false;
-            }
+            spawn_slot_worker(&self.shared.census, "aterm-claimant-census", move || {
+                let answer = census(&id);
+                shared.complete_census(generation, answer, Instant::now());
+            });
         }
         let pending = answer.is_none();
         (answer, pending)
+    }
+
+    /// Install once after the GUI event-loop proxy exists: the debugger
+    /// worker's completion wake (`Wake::DebuggerProbeReady`).
+    pub(crate) fn set_debugger_wake(&self, wake: ProbeWake) {
+        let _ = self.shared.debugger_wake.set(wake);
+    }
+
+    /// Retire the debugger answer: window focus gain, and a closed gate. A
+    /// worker already out publishes nothing. The in-flight bit and the retry
+    /// floor survive, as they do for [`Self::invalidate`], so focus churn can
+    /// neither multiply workers nor relaunch a quickly finished probe.
+    pub(crate) fn invalidate_debugger(&self) {
+        self.shared.debugger.lock_or_recover().retire();
+    }
+
+    /// The debugger row, never computed on this thread. A live instance serves
+    /// the last answer with its age and dispatches one worker when there is
+    /// none or it is older than [`DEBUGGER_TTL`] (`probe=pending` until the
+    /// first answer). A closed gate answers `refused_disabled`; an inert or
+    /// unsupported instance answers from its syscall-free arm.
+    pub(crate) fn debugger(&self, gate: ProbeGate) -> DebuggerRow {
+        if !gate.permits() {
+            // Policy wins before a warm answer, and retires it: a lane turned
+            // back on asks again rather than serving what it saw before.
+            self.invalidate_debugger();
+            return DebuggerRow::refused(DebuggerProbeLabel::RefusedDisabled);
+        }
+        if !self.probes.live {
+            return DebuggerRow {
+                probe: (self.probes.debugger)(gate),
+                self_hardened: (self.probes.hardening)(),
+                probe_age_ms: None,
+            };
+        }
+        let (answer, dispatch) = self
+            .shared
+            .debugger
+            .lock_or_recover()
+            .serve(Instant::now(), DEBUGGER_TTL);
+        if let Some(generation) = dispatch {
+            let shared = Arc::clone(&self.shared);
+            let probe = self.probes.debugger;
+            let hardening = self.probes.hardening;
+            spawn_slot_worker(&self.shared.debugger, "aterm-debugger-probe", move || {
+                // Responsive: the worker publishes under the slot mutex the
+                // UI thread's `privacy` read contends, and nearly all of its
+                // life is a wait on one short child.
+                crate::qos::set_self(crate::qos::Role::Responsive);
+                let answer = probe(gate);
+                let self_hardened = *shared.hardening.get_or_init(hardening);
+                shared.complete_debugger(generation, answer, self_hardened, Instant::now());
+            });
+        }
+        answer.map_or(
+            DebuggerRow::refused(DebuggerProbeLabel::Pending),
+            |(entry, age)| DebuggerRow::from_entry(entry, age),
+        )
+    }
+
+    /// The debugger row's cached answer WITHOUT dispatching anything: `None`
+    /// while a live instance holds no answer. For the change lane's completion
+    /// wake (`Wake::DebuggerProbeReady`), which must never turn a probe that
+    /// published nothing — a retired generation — into a new probe. A closed
+    /// gate reads `refused_disabled`, and an inert or unsupported instance
+    /// answers from its syscall-free arm, exactly as [`Self::debugger`] does.
+    pub(crate) fn debugger_cached(&self, gate: ProbeGate) -> Option<DebuggerRow> {
+        if !gate.permits() {
+            return Some(DebuggerRow::refused(DebuggerProbeLabel::RefusedDisabled));
+        }
+        if !self.probes.live {
+            return Some(DebuggerRow {
+                probe: (self.probes.debugger)(gate),
+                self_hardened: (self.probes.hardening)(),
+                probe_age_ms: None,
+            });
+        }
+        self.shared
+            .debugger
+            .lock_or_recover()
+            .cached(Instant::now())
+            .map(|(entry, age)| DebuggerRow::from_entry(entry, age))
+    }
+
+    /// Install once after the GUI event-loop proxy exists: the Developer Tools
+    /// worker's completion wake (`Wake::DevToolsProbeReady`).
+    pub(crate) fn set_devtools_wake(&self, wake: ProbeWake) {
+        let _ = self.shared.devtools_wake.set(wake);
+    }
+
+    /// Retire the Developer Tools answer: window focus gain (the owner coming
+    /// back from System Settings), a closed gate, and `observer = false`. A
+    /// worker already out publishes nothing; the in-flight bit and the retry
+    /// floor survive, as for [`Self::invalidate_debugger`]. It starts nothing.
+    pub(crate) fn invalidate_devtools(&self) {
+        self.shared.devtools.lock_or_recover().retire();
+    }
+
+    /// The Developer Tools row, never computed on this thread, about the
+    /// running bundle's identifier. A closed gate answers `refused_disabled`
+    /// and `observer_off` (`[privacy] observer = false`) answers
+    /// `refused_observer_off`, each retiring a warm answer; an inert or
+    /// unsupported instance answers from its spawn-free arm; a warm identity
+    /// whose bundle id is unusable answers `refused_no_subject`. A live
+    /// instance serves the last answer with its ages and dispatches one
+    /// `aterm-devtools-probe` worker when there is none or it is older than
+    /// [`DEVTOOLS_TTL`], under the retry floor (`probe=pending` until the
+    /// first answer). The reading thread only looks at the identity (the
+    /// `subject` arm); when it is cold the worker reads it (`warm_subject`)
+    /// and answers `refused_no_subject` only if it holds no usable bundle id.
+    pub(crate) fn devtools(&self, gate: ProbeGate, observer_off: bool) -> DevToolsRow {
+        self.devtools_read(gate, observer_off, true)
+    }
+
+    /// [`Self::devtools`] WITHOUT dispatching anything: the cached answer, or
+    /// `probe=pending` while a live instance holds none. For a Security page
+    /// that is not on screen (a background tab, an occluded or minimized
+    /// window), which must not keep a `log show` running every
+    /// [`DEVTOOLS_TTL`]. The refusals, and the retirement a closed gate or
+    /// `observer = false` makes, are [`Self::devtools`]'s, so policy wins on
+    /// either read.
+    pub(crate) fn devtools_cached(&self, gate: ProbeGate, observer_off: bool) -> DevToolsRow {
+        self.devtools_read(gate, observer_off, false)
+    }
+
+    fn devtools_read(&self, gate: ProbeGate, observer_off: bool, dispatch: bool) -> DevToolsRow {
+        let known = (self.probes.subject)();
+        if !gate.permits() {
+            self.invalidate_devtools();
+            return DevToolsRow::refused(DevToolProbeLabel::RefusedDisabled, known);
+        }
+        if observer_off {
+            self.invalidate_devtools();
+            return DevToolsRow::refused(DevToolProbeLabel::RefusedObserverOff, known);
+        }
+        if !self.probes.live {
+            return DevToolsRow::from_probe(
+                (self.probes.devtools)(gate, known.unwrap_or_default()),
+                known,
+                Duration::ZERO,
+                unix_now_ms(),
+            );
+        }
+        // A warm identity says what it is now (`known`); a cold one (`None`)
+        // is read on the worker, never here.
+        if known.is_some_and(|id| !consent::devtool_subject_is_usable(id)) {
+            return DevToolsRow::refused(DevToolProbeLabel::RefusedNoSubject, known);
+        }
+        let now = Instant::now();
+        let answer = if dispatch {
+            let (answer, generation) = self
+                .shared
+                .devtools
+                .lock_or_recover()
+                .serve(now, DEVTOOLS_TTL);
+            if let Some(generation) = generation {
+                let shared = Arc::clone(&self.shared);
+                let probe = self.probes.devtools;
+                let warm_subject = self.probes.warm_subject;
+                spawn_slot_worker(&self.shared.devtools, "aterm-devtools-probe", move || {
+                    let subject = known.or_else(warm_subject);
+                    let read = match subject.filter(|id| consent::devtool_subject_is_usable(id)) {
+                        Some(id) => probe(gate, id),
+                        None => DevToolProbe::refused(DevToolProbeLabel::RefusedNoSubject),
+                    };
+                    shared.complete_devtools(
+                        generation,
+                        DevToolsEntry {
+                            probe: read,
+                            subject,
+                        },
+                        Instant::now(),
+                    );
+                });
+            }
+            answer
+        } else {
+            self.shared.devtools.lock_or_recover().cached(now)
+        };
+        answer.map_or(
+            DevToolsRow::refused(DevToolProbeLabel::Pending, known),
+            |(entry, age)| DevToolsRow::from_probe(entry.probe, entry.subject, age, unix_now_ms()),
+        )
+    }
+
+    /// Give a headless test instance live-flagged Developer Tools arms: the
+    /// injected probe and subject, and nothing that reaches the OS.
+    #[cfg(test)]
+    pub(crate) fn set_devtools_arms_for_test(
+        &mut self,
+        devtools: fn(ProbeGate, &str) -> DevToolProbe,
+        subject: fn() -> Option<&'static str>,
+    ) {
+        self.probes.live = true;
+        self.probes.devtools = devtools;
+        self.probes.subject = subject;
+    }
+
+    /// No Developer Tools worker out and no answer held.
+    #[cfg(test)]
+    pub(crate) fn devtools_slot_idle_for_test(&self) -> bool {
+        let slot = self.shared.devtools.lock_or_recover();
+        !slot.in_flight && slot.entry.is_none()
     }
 
     /// A future-only deadline for an active observer. Completion normally
@@ -632,9 +1115,7 @@ impl std::fmt::Debug for ConsentState {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The signing identity a grant is keyed to
-// ---------------------------------------------------------------------------
 
 /// The code identity macOS keys a TCC grant to. Read ONCE per process: the
 /// running binary's identity cannot change under it.
@@ -688,24 +1169,17 @@ fn cache_bundle() -> &'static PathBuf {
     BUNDLE.get_or_init(|| consent::cache_bundle_for(running_exe()))
 }
 
-/// The running process's signing identity, read at most once.
-///
-/// Deliberately resolved on the CONTROL thread (`cmd_privacy` warms it before
-/// the main-thread hop): it may spawn `codesign`, which is a 50–150 ms stall
-/// that must never land on the event loop. It touches neither `tccd` nor
-/// `WindowServer`, and it does nothing at all unless the running executable
-/// resolves inside a `.app` — so a test binary never spawns anything.
+/// The running process's signing identity, read at most once, on the control
+/// thread (`cmd_privacy` warms it before the main-thread hop): it may spawn
+/// `codesign`, a 50–150 ms stall. It touches neither `tccd` nor `WindowServer`,
+/// and does nothing unless the executable is inside a `.app`.
 pub(crate) fn signing_identity() -> &'static SigningIdentity {
     identity_cell().get_or_init(read_signing_identity)
 }
 
-/// The identity ONLY if it has already been read.
-///
-/// This is what the event loop uses. Reading the identity may spawn
-/// `codesign`, a 50–150 ms stall that must never land on the main thread, so
-/// the main-thread paths degrade to [`SigningIdentity::unknown`] until a
-/// control-thread verb has warmed it — and `cmd_privacy` warms it before its
-/// own hop, so the posture readout never sees the cold value.
+/// The identity only if already read. The event loop uses this: until a
+/// control-thread verb warmed it, main-thread paths see
+/// [`SigningIdentity::unknown`].
 fn signing_identity_if_warm() -> &'static SigningIdentity {
     identity_cell()
         .get()
@@ -718,18 +1192,25 @@ pub(crate) fn running_bundle_id_if_warm() -> Option<&'static str> {
     signing_identity_if_warm().bundle_id.as_deref()
 }
 
+/// Whether the running executable sits inside a `.app` bundle: a pure path
+/// test (no file is read, nothing spawns), so the event loop may ask it before
+/// the identity is warm. An unbundled run has no bundle id to be a dialog's
+/// subject.
+pub(crate) fn running_from_bundle() -> bool {
+    consent::app_bundle_root(running_exe()).is_some()
+}
+
 fn identity_cell() -> &'static OnceLock<SigningIdentity> {
     static IDENTITY: OnceLock<SigningIdentity> = OnceLock::new();
     &IDENTITY
 }
 
-/// The running bundle's `CFBundleIdentifier`, or `None` when the running
-/// executable is not inside a `.app` (or its `Info.plist` may not be read).
-///
-/// Callers that need an identity string must treat `None` as "no identity to
-/// claim" and omit the claim, never substitute the release channel's id — that
-/// is the whole point of reading it (design §3.1 blast radius).
-#[cfg(target_os = "macos")]
+/// The running bundle's `CFBundleIdentifier`, or `None` when the executable is
+/// not inside a `.app`, its `Info.plist` names none or cannot be read, or the
+/// bundle sits under a protected root, whose `Info.plist` aterm declines to
+/// read (`read_signing_identity`). Callers omit the claim on `None`; never
+/// substitute the release channel's id (design §3.1). It reads the identity
+/// when nothing has yet, so never on the event loop.
 pub(crate) fn running_bundle_id() -> Option<&'static str> {
     signing_identity().bundle_id.as_deref()
 }
@@ -763,10 +1244,8 @@ fn read_signing_identity() -> SigningIdentity {
     }
 }
 
-/// Whether an `Info.plist`'s text carries the `ATermDevBuild` mark — the same
-/// key and the same fail-open reading as `aterm_update`'s own predicate, which
-/// is not reachable from here. Fails OPEN: anything unclear is "not a dev
-/// build", so a corrupt plist can never invent a dev identity for a release.
+/// Whether an `Info.plist`'s text carries the `ATermDevBuild` mark, read as
+/// `aterm_update` does. Fails open: anything unclear is not a dev build.
 fn plist_marks_dev_build(text: &str) -> bool {
     plist_string(text, "ATermDevBuild").is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
@@ -789,9 +1268,7 @@ fn os_version() -> Option<&'static str> {
         .as_deref()
 }
 
-// ---------------------------------------------------------------------------
 // The snapshot
-// ---------------------------------------------------------------------------
 
 /// One live session's consent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -804,6 +1281,59 @@ pub(crate) struct SessionRow {
     fs_consent: FsConsent,
     /// The shell-integration cwd, unencoded. `None` when unreported.
     cwd: Option<String>,
+}
+
+/// Where the Full Disk Access question stands, for the `access_card` line of
+/// the report (`consent_card::report_state` and the record). Pure data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AccessCardReport {
+    /// `quiet`, `asked`, `opened`, `granted` or `declined`.
+    pub(crate) state: &'static str,
+    /// The four unix-second facts the record holds.
+    pub(crate) record: crate::consent_card::AccessRecord,
+    /// Need events counted in this process (dialogs macOS showed for a program
+    /// of this aterm, or refused reads).
+    pub(crate) needs: u32,
+}
+
+impl AccessCardReport {
+    /// When the question may be asked again: a week after it was asked.
+    fn renew_at(&self) -> Option<u64> {
+        self.record
+            .asked_at
+            .map(|at| at.saturating_add(crate::consent_card::RENEW_AFTER.as_secs()))
+    }
+
+    fn opt(value: Option<u64>) -> String {
+        value.map_or_else(|| "-".to_string(), |v| v.to_string())
+    }
+
+    /// The `access_card` row.
+    fn line(&self) -> String {
+        format!(
+            "access_card state={} asked_at={} opened_at={} verified_at={} renew_at={} needs={}",
+            self.state,
+            Self::opt(self.record.asked_at),
+            Self::opt(self.record.opened_at),
+            Self::opt(self.record.verified_at),
+            Self::opt(self.renew_at()),
+            self.needs,
+        )
+    }
+
+    /// The `access_card` object of the JSON form (flat keys).
+    fn json(&self) -> String {
+        let num = |value: Option<u64>| value.map_or_else(|| "null".to_string(), |v| v.to_string());
+        format!(
+            "{{{},\"asked_at\":{},\"opened_at\":{},\"verified_at\":{},\"renew_at\":{},\"needs\":{}}}",
+            json_str_field("state", self.state),
+            num(self.record.asked_at),
+            num(self.record.opened_at),
+            num(self.record.verified_at),
+            num(self.renew_at()),
+            self.needs,
+        )
+    }
 }
 
 /// The whole posture, assembled once and rendered two ways. Pure data: the
@@ -820,10 +1350,9 @@ pub(crate) struct PrivacySnapshot {
     install: &'static str,
     /// The canonical path this process runs from, when it can be read.
     running: Option<String>,
-    /// Whether macOS can still FIND the code this process's grants are keyed
-    /// to. `running=` above is the exec-time path, frozen for the life of the
-    /// process, so it reads healthy in exactly the state where the bundle was
-    /// renamed or deleted under a live process — which an in-place apply does.
+    /// Whether macOS can still find the code this process's grants are keyed
+    /// to. `running=` is the exec-time path, which reads healthy even after the
+    /// bundle was renamed or deleted under the process (an in-place apply).
     anchor: aterm_containment::ImageAnchor,
     fda: FdaState,
     probe: ProbeLabel,
@@ -836,19 +1365,23 @@ pub(crate) struct PrivacySnapshot {
     protected: Vec<String>,
     warmup: &'static str,
     warmup_last_ms: Option<u128>,
-    /// Per-service folder state, in `folder_names` order, and where it came
-    /// from. Until 2026-09-19 the `folder` row was a LITERAL — every name was
-    /// emitted `unknown` with `source=none` unconditionally, in both renderers,
-    /// so a warm-up the owner asked for and an EPERM aterm observed were both
-    /// discarded before they reached the wire. The row said the same thing on
-    /// every machine in every posture, which is indistinguishable from a
-    /// measurement that happened to find nothing.
+    /// The debugger rule (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
+    /// §4.1): an Authorization Services right, not a TCC grant, so it joins no
+    /// coverage bucket and never feeds `prompt_possible`.
+    debugger: DebuggerRow,
+    /// The Developer Tools list (debugger design §9.1): tccd's newest answer
+    /// for this bundle id, read from tccd's own log. TCC, but never a file
+    /// grant, so it joins no coverage bucket and never feeds `prompt_possible`.
+    devtools: DevToolsRow,
+    /// Per-service folder state, in `folder_names` order, and its source.
     folders: Vec<(&'static str, &'static str)>,
     folder_source: String,
     observer_fda: &'static str,
     observer_responsible: &'static str,
     /// The `observer log=` token: `off` unless `[privacy] observer` asked.
     observer_log: &'static str,
+    /// Where the Full Disk Access question stands (`access_card` row).
+    access_card: AccessCardReport,
     /// Every bundle on disk claiming this process's `CFBundleIdentifier`
     /// (`aterm_containment::consent`, "The claimant census") and the answer's
     /// age. The only row about the TCC record rather than this process.
@@ -856,15 +1389,14 @@ pub(crate) struct PrivacySnapshot {
     /// No census answer exists yet — `census=pending`, as opposed to `off`.
     census_pending: bool,
     /// Whether `/usr/bin/trash` is on this Mac: without it the Security panel
-    /// offers no move, and the note does not say it does.
+    /// offers no move, and no row reads `trash=offered`.
     trash_tool: bool,
 }
 
-/// The `covers=` / `uncovered=` / `unmeasured=` split — THREE buckets, because
-/// "not measured" is not "measured as not covered". App-data uses Apple's
-/// documented FDA rule and the observing host's confirmed grant. Other
-/// services remain unmeasured until §7 S4 establishes their coverage. The
-/// [`NEVER_COVERED`] bucket remains separate even after that measurement.
+/// The `covers=` / `uncovered=` / `unmeasured=` split; "not measured" is not
+/// "measured as not covered". App-data uses Apple's documented FDA rule and the
+/// host's confirmed grant; other services stay unmeasured until §7 S4.
+/// [`NEVER_COVERED`] stays separate regardless.
 pub(crate) fn covers_split(fda: FdaState, evidence: SpikeEvidence) -> CoverageSplit {
     let never = |s: &&&str| NEVER_COVERED.contains(s);
     let uncovered: Vec<&'static str> = SERVICES.iter().filter(never).copied().collect();
@@ -932,27 +1464,19 @@ fn install_posture_once() -> &'static (&'static str, Option<String>) {
     ONCE.get_or_init(install_posture_rows)
 }
 
-/// The `install=` token and `running=` path: the same classification the
-/// first-open doctor makes on macOS (`aterm_update::which_copy::posture_from`),
-/// read off this process's canonical executable path; off macOS there is no
-/// bundle, so the token is `not-a-bundle` by construction. Pure path work; no TCC.
-///
-/// Canonicalized on unix only, for the reason `which_copy::observe` records:
-/// on Windows `canonicalize` answers a verbatim `\\?\C:\…` spelling nobody
-/// types, and the row is read by a human.
+/// The `install=` token and `running=` path: the first-open doctor's
+/// classification (`aterm_update::which_copy::posture_from`) of this process's
+/// canonical executable path on macOS; `not-a-bundle` elsewhere. No TCC.
+/// Canonicalized on unix only: Windows answers a verbatim `\\?\C:\…` path.
 fn install_posture_rows() -> (&'static str, Option<String>) {
     let Ok(exe) = std::env::current_exe() else {
         return ("unknown", None);
     };
     #[cfg(unix)]
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    // `which_copy::posture_from` is macOS-only, like the `bundle` module it comes
-    // from — App Translocation and mounted images are Gatekeeper/DMG phenomena.
-    // Off macOS there is no `.app` at all: the running copy is a plain binary on
-    // PATH, which is exactly what `InstallPosture::NotABundle` documents
-    // ("nothing is wrong; there is simply no bundle"). Say that, with the path,
-    // rather than fail to compile — this call site was the one non-gated consumer,
-    // and it kept every Linux build of aterm-gui red from 2026-09-10.
+    // `which_copy::posture_from` is macOS-only (translocation and mounted
+    // images are Gatekeeper/DMG phenomena). Elsewhere the running copy is a
+    // plain binary: `InstallPosture::NotABundle`.
     #[cfg(target_os = "macos")]
     let token = match aterm_update::which_copy::posture_from(&exe) {
         aterm_update::which_copy::InstallPosture::Installed => "installed",
@@ -965,10 +1489,9 @@ fn install_posture_rows() -> (&'static str, Option<String>) {
     (token, Some(exe.to_string_lossy().into_owned()))
 }
 
-/// The `observer fda=` value: `off` when the probe was deliberately not
-/// consulted, `unavailable` when it was permitted but could not run, `ok` when
-/// a syscall actually produced the answer. `unavailable` is a THIRD value —
-/// not `off`, and not `false`.
+/// The `observer fda=` value: `off` when deliberately not consulted,
+/// `unavailable` when permitted but unable to run, `ok` when a syscall
+/// answered.
 fn observer_fda_value(probe: ProbeLabel) -> &'static str {
     match probe {
         ProbeLabel::RefusedDisabled => "off",
@@ -1022,11 +1545,28 @@ fn opt(value: Option<&str>) -> String {
 const NOTE: &str =
     "unknown means not observed, not denied: reading a folder is what raises the prompt";
 
+/// `pending=` on the `debugger` row and `taskport=` on the `observer` row: the
+/// authd lane that would fill them (design §3.7, P2) does not exist, so `off`
+/// (not watching), never `no`. The fields it would fill read unset.
+const TASKPORT_WATCH: &str = "off";
+
+/// `remediate debugger=`: a PLACE where a human acts, never a command (commit
+/// d034733c6 removed `reset=` for handing in-session agents a command). It is
+/// the place the design names (§4.1): aterm's own Settings ▸ Security, whose
+/// debugger row carries the owner's "Allow debugger access…" press — confirmed
+/// in aterm's alert, after which macOS should ask for an administrator in its
+/// own dialog (spike D2 has not measured it); an agent can answer neither. An enable token here would be the hazard `reset=` was.
+const DEBUGGER_REMEDIATE: &str = "aterm-settings:security";
+
+/// `remediate devtools=`: a PLACE, never a command. The Developer Tools list
+/// changes only in System Settings, by a human (`+`, then the switch); aterm
+/// adds nothing to it, and no command a program could run does either.
+const DEVTOOLS_REMEDIATE: &str = "settings:Privacy_DevTools";
+
 impl PrivacySnapshot {
-    /// The census rows: a summary, then one line per CONFLICTING copy (at most
-    /// `MAX_CLAIMANT_ROWS`, the summary keeping the true totals). A copy that
-    /// shares the running requirement cannot reset a grant, so it is counted
-    /// and not listed.
+    /// The census rows: a summary, then one line per conflicting copy (at most
+    /// `MAX_CLAIMANT_ROWS`; the summary keeps true totals). A copy sharing the
+    /// running requirement cannot reset a grant, so it is counted, not listed.
     fn claimant_lines(&self) -> Vec<String> {
         let Some((census, age)) = &self.claimants else {
             let state = if self.census_pending {
@@ -1045,13 +1585,17 @@ impl PrivacySnapshot {
             yes_no(census.sole_claimant()),
             age.as_millis(),
         )];
-        for claimant in conflicting.iter().take(consent::MAX_CLAIMANT_ROWS) {
+        // Each row says whether the panel's button takes the copy, and if not
+        // why, by the rule the button reads (`TrashOffer`).
+        let listed = census.listed(self.trash_tool);
+        for (claimant, offer) in &listed {
             out.push(format!(
-                "claimant path={} signing={} dr={} team={} conflicts=yes",
+                "claimant path={} signing={} dr={} team={} conflicts=yes trash={}",
                 pct_encode(&claimant.path.to_string_lossy()),
                 claimant.signing,
                 claimant.dr.as_str(),
                 opt(claimant.team.as_deref()),
+                offer.as_str(),
             ));
         }
         if conflicting.len() > consent::MAX_CLAIMANT_ROWS {
@@ -1062,18 +1606,25 @@ impl PrivacySnapshot {
             ));
         }
         if !conflicting.is_empty() {
-            // The same rule the panel's button is drawn from, so the note never
-            // sends a reader to a button that is not there.
+            // The note names the Trash only beside a row that reads offered, and
+            // points at those rows rather than restating the rule.
             let n = conflicting.len();
-            let (copies, them) = if n == 1 {
-                ("1 other copy of aterm is".to_string(), "it")
+            let (copies, them, marked) = if n == 1 {
+                ("1 other copy of aterm is".to_string(), "it", "it")
             } else {
-                (format!("{n} other copies of aterm are"), "them")
+                (
+                    format!("{n} other copies of aterm are"),
+                    "them",
+                    "the ones marked trash=offered",
+                )
             };
-            let remedy = if self.trash_tool && !census.offered_for_trash().is_empty() {
+            let remedy = if listed
+                .iter()
+                .any(|(_, offer)| *offer == TrashOffer::Offered)
+            {
                 format!(
-                    "Settings \u{25b8} Security lists {them} and offers to move the ad-hoc or \
-                     unsigned ones to the Trash"
+                    "Settings \u{25b8} Security lists {them} and offers to move {marked} to the \
+                     Trash"
                 )
             } else {
                 format!("Settings \u{25b8} Security lists {them}")
@@ -1108,9 +1659,9 @@ impl PrivacySnapshot {
             .count()
     }
 
-    /// The line body. `OK <n>` counts exactly these rows, and every live
-    /// session contributes exactly one of them — there is no truncation, so
-    /// `sessions_total=` always equals the number of `session` rows.
+    /// The line body. `OK <n>` counts these rows; every live session adds
+    /// exactly one, with no truncation, so `sessions_total=` equals the number
+    /// of `session` rows.
     pub(crate) fn lines(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.sessions.len() + 14);
         out.push("schema=1".to_string());
@@ -1131,10 +1682,8 @@ impl PrivacySnapshot {
                 .dev_build
                 .map_or_else(|| "-".to_string(), |d| d.to_string()),
         ));
-        // WHERE THIS PROCESS IS RUNNING FROM (2026-09-10): a grant is keyed to
-        // the bundle at a path, so an install posture the doctor would flag —
-        // translocated, a mounted image — is a grant that cannot apply, and
-        // the owner deserves to read that on the same report as the grant.
+        // Where this process runs from: a grant is keyed to the bundle at a
+        // path, so a translocated or mounted-image posture cannot use one.
         out.push(format!(
             "install={} running={} anchor={}",
             self.install,
@@ -1208,18 +1757,48 @@ impl PrivacySnapshot {
                 .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
         ));
         out.push(format!(
-            "observer fda={} responsible={} log={}",
-            self.observer_fda, self.observer_responsible, self.observer_log,
+            "debugger mode={} member={} self_hardened={} right={} probe={} probe_age_ms={} \
+             pending={TASKPORT_WATCH} pending_right=- pending_age_ms=- last=- watch_ms=-",
+            self.debugger.probe.mode.as_str(),
+            self.debugger.probe.member.as_str(),
+            self.debugger.self_hardened.as_str(),
+            consent::TASKPORT_DEBUG_RIGHT,
+            self.debugger.probe.label.as_str(),
+            self.debugger
+                .probe_age_ms
+                .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
+        ));
+        let num = |value: Option<u64>| value.map_or_else(|| "-".to_string(), |n| n.to_string());
+        let devtools = self.devtools.probe;
+        out.push(format!(
+            "devtools state={} subject={} requests={} not_allowed={} answer_age_ms={} \
+             window_s={} probe={} probe_age_ms={}",
+            devtools.state.as_str(),
+            opt(self.devtools.subject),
+            num(devtools.requests.map(u64::from)),
+            num(devtools.not_allowed.map(u64::from)),
+            num(self.devtools.answer_age_ms),
+            consent::DEVTOOL_WINDOW_S,
+            devtools.label.as_str(),
+            self.devtools
+                .probe_age_ms
+                .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
         ));
         out.push(format!(
-            "remediate fda={} files={}",
+            "observer fda={} responsible={} log={} taskport={TASKPORT_WATCH}",
+            self.observer_fda, self.observer_responsible, self.observer_log,
+        ));
+        out.push(self.access_card.line());
+        out.push(format!(
+            "remediate fda={} files={} debugger={} devtools={}",
             pct_encode("settings:Privacy_AllFiles"),
             pct_encode("settings:Privacy_FilesAndFolders"),
+            pct_encode(DEBUGGER_REMEDIATE),
+            pct_encode(DEVTOOLS_REMEDIATE),
         ));
-        // A grant that cannot be VALIDATED is not a grant, and the rest of the
-        // report cannot show it: `full_disk_access=` is the probe's answer, and
-        // the probe gates on the exec-time path, which a swap leaves pointing
-        // at a healthy new bundle. Say it in words, on its own row.
+        // A grant that cannot be validated: `full_disk_access=` gates on the
+        // exec-time path, which a swap leaves pointing at a healthy bundle, so
+        // say it on its own row.
         if self.anchor.grant_unverifiable() {
             let gone = if self.anchor == aterm_containment::ImageAnchor::Deleted {
                 "deleted"
@@ -1260,6 +1839,20 @@ impl PrivacySnapshot {
     }
 }
 
+/// The debugger tuple `await consent kind=debugger` arms on and latches a
+/// change against: `debugger_mode=` alone in this build (`debugger_pending=`
+/// joins when aterm watches for a waiting password request, design §4.4). A
+/// reading that observed no mode — a probe still out, a closed gate, a refused
+/// or failed run, an inert instance — is not an observation: it reads as the
+/// internal pending marker, so it can neither arm the baseline nor latch.
+fn debugger_tuple_line(probe: DebuggerProbe) -> String {
+    if probe.mode == DebuggerMode::Unknown {
+        PENDING_CONSENT_TUPLE.to_string()
+    } else {
+        format!("debugger_mode={}", probe.mode.as_str())
+    }
+}
+
 /// Every name on the `folder` row: the consent module's own roster (the three
 /// `$HOME` folders it resolves, then `app-data` — every other app's own data,
 /// promptable and resettable exactly as a folder is), then the two volume
@@ -1272,27 +1865,19 @@ fn folder_names() -> Vec<&'static str> {
 
 /// The per-service folder state, and the provenance token that qualifies it.
 ///
-/// PURE, and the only place the join exists. Two sources, in strict precedence:
+/// Pure; the only place the join exists. Two sources, in strict precedence:
 ///
-/// 1. **What aterm actually observed.** A warm-up row the owner asked for is an
-///    observation of *this* host's access and outranks everything, including a
-///    held grant: if the owner warmed Documents and got `EPERM`, the row says
+/// 1. **What aterm observed.** A warm-up row the owner asked for outranks
+///    everything, including a held grant: an `EPERM` on Documents reads
 ///    `denied` whatever the coverage rule claims.
-/// 2. **Measured coverage.** A service §7 S4 has proved a held grant suppresses
-///    becomes `covered-by-fda` — the value §3.4 reserves for exactly this and
-///    which nothing in the tree could emit before 2026-09-19. It is gated on the
-///    service being in `covers` for the CURRENT posture, so it appears only
-///    while the grant is actually held and observed.
+/// 2. **Measured coverage.** A service §7 S4 proved a held grant suppresses
+///    reads `covered-by-fda`, only while it is in `covers` for the current
+///    posture.
 ///
-/// Everything else is `unknown`, and `unknown` remains the default rather than a
-/// verdict: reading a folder to learn whether it is readable is the very act
-/// that raises the prompt (§3.4). The two volume classes have no `$HOME`-relative
-/// path and no warm-up row, so they can only ever be `unknown` here.
-///
-/// What this must NOT do is infer a per-folder verdict from the grant for a
-/// service S4 never measured. Documents, Desktop and Downloads stay `unknown`
-/// under a held grant, because S4 could not isolate them on the reference
-/// machine — they already carried explicit rows there.
+/// Everything else is `unknown`: reading a folder to learn whether it is
+/// readable is what raises the prompt (§3.4). The volume classes have no path
+/// or warm-up row, so they are always `unknown`. Unmeasured folders
+/// (Documents, Desktop, Downloads) stay `unknown` under a held grant.
 fn folder_state(
     name: &str,
     warmup: &[(Folder, crate::consent_warmup::WarmupRow)],
@@ -1311,10 +1896,8 @@ fn folder_state(
     "unknown"
 }
 
-/// Which sources contributed a non-`unknown` folder state, in a fixed order.
-///
-/// `none` when nothing did — the honest reading of a row that is all `unknown`,
-/// and the only value this could ever take before the row carried real state.
+/// Which sources contributed a non-`unknown` folder state, in a fixed order;
+/// `none` when nothing did.
 fn folder_source(states: &[(&'static str, &'static str)]) -> String {
     let mut sources: Vec<&'static str> = Vec::new();
     if states
@@ -1427,16 +2010,17 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         ),
         Some((census, age)) => {
             let conflicting = census.conflicting();
-            let conflicts: Vec<String> = conflicting
-                .iter()
-                .take(consent::MAX_CLAIMANT_ROWS)
-                .map(|claimant| {
+            let conflicts: Vec<String> = census
+                .listed(snapshot.trash_tool)
+                .into_iter()
+                .map(|(claimant, offer)| {
                     format!(
-                        "{{{},{},{},\"team\":{}}}",
+                        "{{{},{},{},\"team\":{},{}}}",
                         json_str_field("path", &claimant.path.to_string_lossy()),
                         json_str_field("signing", claimant.signing),
                         json_str_field("dr", claimant.dr.as_str()),
                         json_opt(claimant.team.as_deref()),
+                        json_str_field("trash", offer.as_str()),
                     )
                 })
                 .collect();
@@ -1501,18 +2085,58 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
             .warmup_last_ms
             .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
     );
+    // The debugger rule, with the same keys in every state: what was not
+    // observed is null, as the text form prints `-`.
     let _ = write!(
         body,
-        "\"observers\":{{{},{},{}}},",
+        "\"debugger\":{{{},{},{},{},{},\"probe_age_ms\":{},{},\"pending_right\":null,\
+         \"pending_age_ms\":null,\"last\":null,\"watch_ms\":null}},",
+        json_str_field("mode", snapshot.debugger.probe.mode.as_str()),
+        json_str_field("member", snapshot.debugger.probe.member.as_str()),
+        json_str_field("self_hardened", snapshot.debugger.self_hardened.as_str()),
+        json_str_field("right", consent::TASKPORT_DEBUG_RIGHT),
+        json_str_field("probe", snapshot.debugger.probe.label.as_str()),
+        snapshot
+            .debugger
+            .probe_age_ms
+            .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
+        json_str_field("pending", TASKPORT_WATCH),
+    );
+    // The Developer Tools list, with the same keys in every state.
+    let num = |value: Option<u64>| value.map_or_else(|| "null".to_string(), |n| n.to_string());
+    let devtools = snapshot.devtools.probe;
+    let _ = write!(
+        body,
+        "\"devtools\":{{{},\"subject\":{},\"requests\":{},\"not_allowed\":{},\
+         \"answer_age_ms\":{},\"window_s\":{},{},\"probe_age_ms\":{}}},",
+        json_str_field("state", devtools.state.as_str()),
+        json_opt(snapshot.devtools.subject),
+        num(devtools.requests.map(u64::from)),
+        num(devtools.not_allowed.map(u64::from)),
+        num(snapshot.devtools.answer_age_ms),
+        consent::DEVTOOL_WINDOW_S,
+        json_str_field("probe", devtools.label.as_str()),
+        snapshot
+            .devtools
+            .probe_age_ms
+            .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
+    );
+    let _ = write!(body, "\"access_card\":{},", snapshot.access_card.json());
+    let _ = write!(
+        body,
+        "\"observers\":{{{},{},{},{}}},",
         json_str_field("fda", snapshot.observer_fda),
         json_str_field("responsible", snapshot.observer_responsible),
         json_str_field("log", snapshot.observer_log),
+        json_str_field("taskport", TASKPORT_WATCH),
     );
     let _ = write!(
         body,
-        "\"remediate\":{{{},{}}},",
+        "\"remediate\":{{{},{},{},{}}},",
         json_str_field("fda", "settings:Privacy_AllFiles"),
         json_str_field("files", "settings:Privacy_FilesAndFolders"),
+        json_str_field("debugger", DEBUGGER_REMEDIATE),
+        json_str_field("devtools", DEVTOOLS_REMEDIATE),
     );
     let _ = write!(body, "{}}}", json_str_field("note", NOTE));
     json_ok(&body)
@@ -1539,9 +2163,7 @@ fn json_str_array(items: &[&str]) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // The main-thread read
-// ---------------------------------------------------------------------------
 
 /// Which shape of the posture the main thread should assemble.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1552,6 +2174,10 @@ pub(crate) enum PrivacyForm {
     Json,
     /// One session's consent tuple, for `await consent`.
     Tuple(u64),
+    /// The debugger rule's tuple, for `await consent kind=debugger`, read
+    /// through one session so a wait on an exited session ends `ERR exited`.
+    /// The fact is instance-level; the session only addresses the waiter.
+    DebuggerTuple(u64),
 }
 
 /// Internal reply metadata: the worker must not infer readiness by parsing
@@ -1568,8 +2194,38 @@ impl App {
     /// NO dialog: the Full Disk Access probe reads state that already exists,
     /// and nothing here is inferred from anything else — in particular no
     /// folder's state is ever derived from the grant.
-    pub(crate) fn read_privacy(&self, form: PrivacyForm) -> PrivacyRead {
+    ///
+    /// `scope` decides WHICH sessions it reports: those `scope` may read with
+    /// the verb's own op. Owner-class scopes see every session; an edge sees
+    /// only the sessions it holds a read edge into, because each row (sid,
+    /// cwd, responsible pid) is a fact `status` shows one session at a time to
+    /// whoever may read it — and the whole set is the roster `sessions`,
+    /// `flows` and `subscribe sessions` withhold from an edge. The
+    /// instance-wide posture is the same for every scope.
+    pub(crate) fn read_privacy(&self, form: PrivacyForm, scope: Scope) -> PrivacyRead {
         let policy = self.consent_policy();
+        if let PrivacyForm::DebuggerTuple(target) = form {
+            // Nothing of the Full Disk Access posture is read: this waiter's
+            // evidence is the debugger slot alone, and an exited session ends
+            // the wait whatever the slot holds.
+            if self.pool.get(target).is_none() {
+                return PrivacyRead {
+                    lines: Vec::new(),
+                    pending: false,
+                };
+            }
+            // The slot's own discipline, never a probe per poll: the cached
+            // answer is served, and the ONE bounded worker is dispatched only
+            // when that answer is older than `DEBUGGER_TTL` or something
+            // retired it (focus gain, the owner's change re-probing), under
+            // the retry floor. A 500 ms poll therefore spawns at most one
+            // `-status` run per TTL of its own accord.
+            let row = self.consent.debugger(policy.gate);
+            return PrivacyRead {
+                lines: vec![debugger_tuple_line(row.probe())],
+                pending: row.pending(),
+            };
+        }
         let identity = signing_identity_if_warm();
         let (probe, age) = self
             .consent
@@ -1584,6 +2240,9 @@ impl App {
             let Some(session) = self.pool.get(id) else {
                 continue;
             };
+            if !cross_session_authorized(scope, "privacy", &session.ctx) {
+                continue;
+            }
             // `[privacy] report_attribution = false` removes a COLUMN, not a
             // verdict: the SPI is simply not consulted, and the observer row
             // says `off` rather than pretending it answered.
@@ -1599,9 +2258,8 @@ impl App {
                 adoption: policy.adoption(session_attribution(session)),
                 fda: probe.state,
                 responsible,
-                // No production site observes a per-session EPERM yet: the
-                // warm-up (§3.5) and aterm's own file work (§3.6) are the two
-                // that will, and the join is table-tested on both values.
+                // No production site observes a per-session EPERM yet (the
+                // warm-up §3.5 and aterm's own file work §3.6 will).
                 observed_eperm: false,
                 evidence: SpikeEvidence::UNMEASURED,
             });
@@ -1634,11 +2292,18 @@ impl App {
         let (claimants, census_pending) = self
             .consent
             .claimants(identity.bundle_id.as_deref(), policy.enabled);
-        // The folder row's real state. `rows()` is `&self` and does NOT drain —
-        // same discipline as `last_pass_ms()` below, because `read_privacy` may
-        // not consume a pass the Security panel has not folded yet. `covers` is
-        // computed from the SAME split `lines()` renders, so the two can never
-        // disagree about whether a service is covered.
+        // The debugger rule, from its own slot: a full report may dispatch its
+        // bounded worker, and nothing on the `status`/tuple path above does.
+        let debugger = self.consent.debugger(policy.gate);
+        // The Developer Tools list, from its own slot, about the RUNNING
+        // bundle's identifier: only this full report (and the visible Security
+        // page) may dispatch its `log show`, never `status`, a tuple or a poll.
+        let devtools = self
+            .consent
+            .devtools(policy.gate, self.config.privacy_observer_off());
+        // The folder row's state. `rows()` does not drain (a pass the Security
+        // panel has not folded yet must not be consumed). `covers` comes from
+        // the same split `lines()` renders.
         let evidence = SpikeEvidence::UNMEASURED;
         let split = covers_split(probe.state, evidence);
         let warmup_rows = self.consent_warmup.rows();
@@ -1653,9 +2318,8 @@ impl App {
             identity: identity.clone(),
             install,
             running,
-            // Read FRESH on every report, never memoized: it changes under a
-            // running process. One `proc_pidpath` — no protected location, no
-            // dialog.
+            // Read fresh on every report: it changes under a running process.
+            // One `proc_pidpath`; no dialog.
             anchor: aterm_containment::image_anchor(),
             fda: probe.state,
             probe: probe.label,
@@ -1669,17 +2333,18 @@ impl App {
             } else {
                 "none"
             },
-            protected: policy
-                .protected
+            protected: self
+                .config
+                .privacy_protected_roots()
                 .iter()
                 .map(|p| crate::app_tabs::home_abbreviated(&p.to_string_lossy()))
                 .collect(),
             warmup: self.config.privacy_warmup().as_str(),
-            // The warm-up's own completion stamp (design §3.5), supplied by the
-            // Security panel's change. Read WITHOUT draining: `read_privacy` is
-            // `&self`, and a pass that finished but whose poke has not been
-            // folded yet is reported on the next read rather than made up here.
+            // The warm-up's completion stamp (design §3.5), read without
+            // draining: an unfolded pass is reported on the next read.
             warmup_last_ms: self.consent_warmup.last_pass_ms(),
+            debugger,
+            devtools,
             folders,
             folder_source: folder_source_token,
             claimants,
@@ -1688,26 +2353,29 @@ impl App {
             observer_fda: observer_fda_value(probe.label),
             observer_responsible: observer_responsible_value(&answers),
             observer_log: self.privacy_observer_log(),
+            access_card: self.access_card_report(probe.state),
         };
         let lines = match form {
             PrivacyForm::Json => vec![cmd_privacy_json(&snapshot)],
-            PrivacyForm::Lines | PrivacyForm::Tuple(_) => snapshot.lines(),
+            PrivacyForm::Lines | PrivacyForm::Tuple(_) | PrivacyForm::DebuggerTuple(_) => {
+                snapshot.lines()
+            }
         };
         PrivacyRead {
             lines,
             // A first census (no answer yet) takes the same bounded wait as a
-            // cold probe, so a one-shot read gets the row rather than `pending`.
-            pending: probe.label == ProbeLabel::Pending || census_pending,
+            // cold probe, so a one-shot read gets the row rather than `pending`;
+            // so do a first debugger read and a first Developer Tools read.
+            pending: probe.label == ProbeLabel::Pending
+                || census_pending
+                || debugger.pending()
+                || devtools.pending(),
         }
     }
 
-    /// The Security panel's slice of the posture (design §3.4).
-    ///
-    /// The SAME state `privacy` reports — the cached probe, the identity only
-    /// if a control-thread verb already warmed it, and the `[privacy]` master
-    /// switch — assembled for a renderer instead of for a wire. Consent probes
-    /// run on the worker, executable posture is cached once, and this never
-    /// spawns `codesign`; a cold identity degrades to `DrClass::Unknown`, which
+    /// The Security panel's slice of the posture (design §3.4): the same
+    /// state `privacy` reports, assembled for a renderer. Never spawns
+    /// `codesign`; a cold identity degrades to `DrClass::Unknown`, which
     /// suppresses no repair and promises no durability.
     pub(crate) fn consent_panel_facts(&self) -> ConsentPanelFacts {
         let identity = signing_identity_if_warm();
@@ -1741,11 +2409,9 @@ impl App {
         }
     }
 
-    /// THIS instance's own adoption record: `adopted` when it took over its
-    /// predecessor's running shells across an in-place apply, `live`
-    /// otherwise — `adopted` even when its own session 0 is a fresh bootstrap
-    /// (a window 0 with no terminal pane). Per-session attribution is reported
-    /// per session.
+    /// This instance's adoption record: `adopted` when it took over its
+    /// predecessor's shells across an in-place apply (even when its session 0
+    /// is a fresh bootstrap), `live` otherwise.
     fn instance_attribution(&self) -> Attribution {
         if self.handoff_successor {
             Attribution::Adopted
@@ -1773,11 +2439,9 @@ impl App {
     }
 }
 
-/// What the Security panel needs from the consent model, as pure data.
-///
-/// A compact projection of [`PrivacySnapshot`]: the panel needs installation
-/// posture and session counts, not individual session/cwd rows or containment
-/// paths. Its service coverage comes from the shared [`covers_split`].
+/// What the Security panel needs from the consent model, as pure data: a
+/// compact projection of [`PrivacySnapshot`] (posture and session counts), with
+/// service coverage from [`covers_split`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConsentPanelFacts {
     /// `[privacy] enabled`. `false` means aterm asked nothing.
@@ -1802,9 +2466,7 @@ pub(crate) struct ConsentPanelFacts {
     pub(crate) sessions_adopted: usize,
 }
 
-// ---------------------------------------------------------------------------
 // The two additive `status` fields (design §5.2)
-// ---------------------------------------------------------------------------
 
 /// What the `status` record adds for one session: two fields and one
 /// `reasons=` token. Additive — `schema=1` does not move.
@@ -1812,10 +2474,9 @@ pub(crate) struct ConsentPanelFacts {
 pub(crate) struct SessionConsent {
     /// aterm's OWN adoption record for this session.
     pub(crate) attribution: Attribution,
-    /// `covered` requires the grant AND `attribution=live` AND a measured
-    /// coverage; `denied` requires an EPERM aterm itself observed for this
-    /// session. Everything else is `unknown`. Because §7 S4 has not been run,
-    /// `covered` is currently unreachable — and that is correct.
+    /// `covered` requires the grant, `attribution=live` and measured coverage;
+    /// `denied` requires an EPERM aterm observed for this session; otherwise
+    /// `unknown`. With §7 S4 unmeasured, `covered` is unreachable.
     pub(crate) fs_consent: FsConsent,
     /// Whether the `consent_at_risk` reason token is emitted.
     pub(crate) at_risk: bool,
@@ -1838,9 +2499,6 @@ struct ConsentPolicy {
     gate: ProbeGate,
     /// `probe_interval_ms`.
     interval: Duration,
-    /// `protected_roots`, already resolved to absolute paths by the consent
-    /// module — this crate holds no protected-path literal of its own.
-    protected: Vec<PathBuf>,
     /// `report_attribution`.
     report_attribution: bool,
     /// The master switch.
@@ -1848,10 +2506,8 @@ struct ConsentPolicy {
 }
 
 impl ConsentPolicy {
-    /// With the lane switched off every consent field reads `unknown` — the
-    /// honest word for "aterm stopped looking", which is a different claim
-    /// from `denied`. That includes the adoption record, which is otherwise
-    /// reported verbatim.
+    /// With the lane off every consent field reads `unknown` ("aterm stopped
+    /// looking", not `denied`), including the adoption record.
     const fn adoption(&self, observed: Attribution) -> Attribution {
         if self.enabled {
             observed
@@ -1867,7 +2523,6 @@ impl App {
         ConsentPolicy {
             gate: self.config.privacy_probe_gate(),
             interval: Duration::from_millis(self.config.privacy_probe_interval_ms()),
-            protected: self.config.privacy_protected_roots(),
             report_attribution: self.config.privacy_enabled()
                 && self.config.privacy_report_attribution(),
             enabled: self.config.privacy_enabled(),
@@ -1885,14 +2540,10 @@ impl App {
         )
     }
 
-    /// The consent fields for one session's `status` record.
-    ///
-    /// Runs on the event loop under a poll, so it never blocks: it takes the
-    /// cached probe — refreshed by one `open(TCC.db)` at most once per
-    /// `probe_interval_ms`, never by `codesign` — and the identity only if
-    /// already warm, and `cwd` is passed in by the caller — which already holds
-    /// (or failed to take) that session's terminal lock, and must not be asked
-    /// to take it twice.
+    /// The consent fields for one session's `status` record. Runs on the event
+    /// loop under a poll, so it never blocks: the cached probe, the identity
+    /// only if warm, and a `cwd` from the caller, which already holds (or
+    /// failed to take) the session's terminal lock.
     pub(crate) fn session_consent(&self, session: u64, cwd: Option<&str>) -> SessionConsent {
         let Some(pooled) = self.pool.get(session) else {
             return SessionConsent::unknown();
@@ -1906,11 +2557,8 @@ impl App {
         let posture = ConsentPosture::join(PostureInputs {
             adoption: policy.adoption(session_attribution(pooled)),
             fda: probe.state,
-            // The responsibility SPI is NOT consulted here. `status` is a poll
-            // verb, and the corroboration changes neither field it produces —
-            // `attribution` is the adoption record verbatim and `fs_consent`
-            // never reads it — so a per-poll syscall would buy nothing. The
-            // `privacy` verb reports the corroboration, once, per session.
+            // The responsibility SPI is not consulted on this poll path: it
+            // changes neither field. The `privacy` verb reports it.
             responsible: Responsible::Unknown,
             // See `read_privacy`: no production site observes a per-session
             // EPERM yet, and the join is table-tested on both values.
@@ -1920,19 +2568,23 @@ impl App {
         SessionConsent {
             attribution: posture.attribution,
             fs_consent: posture.fs_consent,
-            at_risk: consent_at_risk(posture.fs_consent, cwd, &policy.protected),
+            // Resolve the protected roots only when they can decide the
+            // answer (a cwd is known and not covered).
+            at_risk: cwd.is_some()
+                && !matches!(posture.fs_consent, FsConsent::Covered)
+                && consent_at_risk(
+                    posture.fs_consent,
+                    cwd,
+                    &self.config.privacy_protected_roots(),
+                ),
         }
     }
 }
 
-/// THE `consent_at_risk` CONJUNCTION (design §3.6): this session's
-/// `fs_consent` is not `covered`, AND its shell-integration cwd is under a
-/// protected root.
-///
-/// Two observed facts joined. It is NOT a claim that a dialog is showing —
-/// aterm cannot see one — and it is simply not emitted when the cwd is
-/// unknown, which is whenever shell integration is absent. Pure and lexical:
-/// no path is touched to decide it.
+/// `consent_at_risk` (design §3.6): this session's `fs_consent` is not
+/// `covered` and its shell-integration cwd is under a protected root. Not a
+/// claim that a dialog is showing; not emitted when the cwd is unknown. Pure
+/// and lexical.
 pub(crate) fn consent_at_risk(
     fs_consent: FsConsent,
     cwd: Option<&str>,
@@ -1945,9 +2597,9 @@ pub(crate) fn consent_at_risk(
         && consent::is_under_protected_root(Path::new(cwd), protected)
 }
 
-/// One session's attribution, from aterm's OWN adoption record — the handoff
-/// id the successor stamped on every shell it inherited (`spawn::Adopted`),
-/// never from the responsibility SPI (design §3.9 pt 1).
+/// One session's attribution, from aterm's own adoption record (the handoff id
+/// stamped on each inherited shell, `spawn::Adopted`), never from the
+/// responsibility SPI (design §3.9).
 fn session_attribution(session: &crate::Session) -> Attribution {
     if session.handoff_local_id.is_some() {
         Attribution::Adopted
@@ -1956,11 +2608,9 @@ fn session_attribution(session: &crate::Session) -> Attribution {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The verb
-// ---------------------------------------------------------------------------
 
-/// `privacy [--json]` — the macOS consent posture, instance-wide.
+/// `privacy [--json]`: the macOS consent posture, instance-wide.
 ///
 /// Runs on a control worker: it warms the signing identity HERE (it may spawn
 /// `codesign`, which must never land on the event loop) and then takes the one
@@ -1968,7 +2618,7 @@ fn session_attribution(session: &crate::Session) -> Attribution {
 /// observation gets a short, bounded wait HERE, never on the GUI thread. Thus
 /// occasional calls do not report only Pending by always arriving after the
 /// cache's freshness interval.
-pub(crate) fn cmd_privacy(rest: &str, proxy: &EventLoopProxy<Wake>) -> String {
+pub(crate) fn cmd_privacy(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String {
     let form = match parse_privacy_form(rest) {
         Ok(form) => form,
         Err(usage) => return usage,
@@ -1978,6 +2628,7 @@ pub(crate) fn cmd_privacy(rest: &str, proxy: &EventLoopProxy<Wake>) -> String {
     let _ = signing_identity();
     let first = match crate::control::control_media::call_main(proxy, |tx| Wake::ReadPrivacy {
         form,
+        scope,
         reply: tx,
     }) {
         Ok(read) => read,
@@ -1987,7 +2638,11 @@ pub(crate) fn cmd_privacy(rest: &str, proxy: &EventLoopProxy<Wake>) -> String {
         first,
         |remaining| {
             crate::control::control_media::call_main_within(proxy, remaining, |tx| {
-                Wake::ReadPrivacy { form, reply: tx }
+                Wake::ReadPrivacy {
+                    form,
+                    scope,
+                    reply: tx,
+                }
             })
         },
         Instant::now,
@@ -2264,10 +2919,8 @@ mod privacy_read_tests {
     }
 }
 
-/// The verb's whole grammar: an optional `--json` (or bare `json`) flag and
-/// nothing else. A guessed modifier is an honest `ERR usage`, never a silently
-/// ignored token that leaves the caller unable to tell a wrong guess from a
-/// no-op.
+/// The verb's grammar: an optional `--json` (or bare `json`) flag and nothing
+/// else; anything else is `ERR usage`.
 fn parse_privacy_form(rest: &str) -> Result<PrivacyForm, String> {
     let mut json = false;
     let mut unknown: Vec<&str> = Vec::new();
@@ -2358,24 +3011,44 @@ impl ConsentWait {
     }
 }
 
-/// `await consent [timeout=<ms>]` — wait for THIS session's observed tuple to
-/// change. A pending refresh is not a change. On a cold cache, the first
-/// completed observation establishes the baseline; it cannot itself satisfy
-/// the wait. The timeout remains anchored to the original request.
+/// `await consent [kind=debugger] [timeout=<ms>]` — wait for an observed
+/// tuple to change. Bare, it is THIS session's Full Disk Access tuple
+/// (`fs_consent= fda= attribution=`), untouched by the debugger form so its
+/// waiters are never woken by debugger churn. `kind=debugger` is the debugger
+/// rule's tuple (`debugger_mode=`, design §4.4), addressed through the session
+/// only so the wait ends `ERR exited` with it.
+///
+/// A pending refresh is not a change. On a cold cache, the first completed
+/// observation establishes the baseline; it cannot itself satisfy the wait.
+/// The timeout remains anchored to the original request.
 ///
 /// A latch says aterm's own posture CHANGED. It does NOT say a human answered
 /// a dialog: aterm cannot observe the answer.
-pub(crate) fn cmd_await_consent(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
-    let timeout_ms = match parse_consent_timeout(rest) {
-        Ok(ms) => ms,
+pub(crate) fn cmd_await_consent(
+    proxy: &EventLoopProxy<Wake>,
+    scope: Scope,
+    session: u64,
+    rest: &str,
+) -> String {
+    let args = match parse_consent_args(rest) {
+        Ok(args) => args,
         Err(usage) => return usage,
     };
     let armed = Instant::now();
-    let mut wait = ConsentWait::new(armed, Duration::from_millis(timeout_ms));
-    let _ = signing_identity();
+    let mut wait = ConsentWait::new(armed, Duration::from_millis(args.timeout_ms));
+    let form = match args.kind {
+        ConsentKind::Fda => {
+            // The FDA tuple's probe keys on the signing identity; warm it off
+            // the event loop. The debugger form reads no identity.
+            let _ = signing_identity();
+            PrivacyForm::Tuple(session)
+        }
+        ConsentKind::Debugger => PrivacyForm::DebuggerTuple(session),
+    };
     let sample = |proxy: &EventLoopProxy<Wake>| -> Result<ConsentObservation, String> {
         match crate::control::control_media::call_main(proxy, |tx| Wake::ReadPrivacy {
-            form: PrivacyForm::Tuple(session),
+            form,
+            scope,
             reply: tx,
         }) {
             Ok(read) => Ok(consent_observation(read.lines)),
@@ -2410,37 +3083,101 @@ pub(crate) fn cmd_await_consent(proxy: &EventLoopProxy<Wake>, session: u64, rest
     }
 }
 
-/// `timeout=<ms>` / `timeout <ms>`, defaulting to [`AWAIT_CONSENT_DEFAULT_MS`]
-/// and capped at [`AWAIT_MAX_MS`], the ceiling the rest of the wait family
-/// shares.
-fn parse_consent_timeout(rest: &str) -> Result<u64, String> {
-    const USAGE: &str = "ERR usage: await consent [timeout=<ms>]\n";
+/// Which tuple `await consent` waits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsentKind {
+    /// This session's Full Disk Access tuple — the bare form.
+    Fda,
+    /// The debugger rule's tuple — `kind=debugger`.
+    Debugger,
+}
+
+/// `await consent`'s parsed arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConsentArgs {
+    kind: ConsentKind,
+    timeout_ms: u64,
+}
+
+/// `[kind=debugger] [timeout=<ms> | timeout <ms>]` in any order. The timeout
+/// defaults to [`AWAIT_CONSENT_DEFAULT_MS`] for both kinds and is capped at
+/// [`AWAIT_MAX_MS`], the ceiling the rest of the wait family shares. Any other
+/// token — including a `kind=` this build does not know — is the usage line,
+/// so an agent learns the form is unsupported instead of waiting on the wrong
+/// tuple.
+fn parse_consent_args(rest: &str) -> Result<ConsentArgs, String> {
+    const USAGE: &str = "ERR usage: await consent [kind=debugger] [timeout=<ms>]\n";
     let toks: Vec<&str> = rest.split_whitespace().collect();
-    let mut timeout = AWAIT_CONSENT_DEFAULT_MS;
+    let mut args = ConsentArgs {
+        kind: ConsentKind::Fda,
+        timeout_ms: AWAIT_CONSENT_DEFAULT_MS,
+    };
     let mut i = 0;
     // `consent` itself is the leading token the caller already matched on.
     if toks.first() == Some(&"consent") {
         i = 1;
     }
     while i < toks.len() {
-        if let Some(v) = toks[i].strip_prefix("timeout=") {
-            timeout = v.parse().map_err(|_| USAGE.to_string())?;
+        if toks[i] == "kind=debugger" {
+            args.kind = ConsentKind::Debugger;
+            i += 1;
+        } else if let Some(v) = toks[i].strip_prefix("timeout=") {
+            args.timeout_ms = v.parse().map_err(|_| USAGE.to_string())?;
             i += 1;
         } else if toks[i] == "timeout" && i + 1 < toks.len() {
-            timeout = toks[i + 1].parse().map_err(|_| USAGE.to_string())?;
+            args.timeout_ms = toks[i + 1].parse().map_err(|_| USAGE.to_string())?;
             i += 2;
         } else {
             return Err(USAGE.to_string());
         }
     }
-    Ok(timeout.min(AWAIT_MAX_MS))
+    args.timeout_ms = args.timeout_ms.min(AWAIT_MAX_MS);
+    Ok(args)
 }
 
 #[cfg(test)]
 mod tests {
-    use aterm_containment::consent::{FdaScope, ProbeOutcome};
+    use aterm_containment::consent::{DebuggerMember, FdaScope, ProbeOutcome};
 
     use super::*;
+
+    /// The debugger row the fixture carries: design §4.1's example, the
+    /// installed release build on a Mac with developer mode off.
+    const FIXTURE_DEBUGGER: DebuggerRow = DebuggerRow {
+        probe: DebuggerProbe {
+            mode: DebuggerMode::Disabled,
+            member: DebuggerMember::Admin,
+            label: DebuggerProbeLabel::StatusOk,
+        },
+        self_hardened: SelfHardening::Hardened,
+        probe_age_ms: Some(1204),
+    };
+
+    /// The exact `debugger` line [`FIXTURE_DEBUGGER`] renders.
+    const FIXTURE_DEBUGGER_LINE: &str = "debugger mode=disabled member=admin self_hardened=yes \
+         right=system.privilege.taskport.debug probe=status_ok probe_age_ms=1204 pending=off \
+         pending_right=- pending_age_ms=- last=- watch_ms=-";
+
+    /// The Developer Tools row the fixture carries: the design's example, the
+    /// installed release build, not on the list, during a build that started
+    /// 233 new programs in the window.
+    const FIXTURE_DEVTOOLS: DevToolsRow = DevToolsRow {
+        probe: DevToolProbe {
+            state: aterm_containment::DevToolState::Unlisted,
+            label: DevToolProbeLabel::Observed,
+            requests: Some(233),
+            not_allowed: Some(233),
+            answered_at_ms: Some(1_791_381_501_820),
+        },
+        subject: Some("com.aterm.aterm"),
+        probe_age_ms: Some(812),
+        answer_age_ms: Some(4100),
+    };
+
+    /// The exact `devtools` line [`FIXTURE_DEVTOOLS`] renders.
+    const FIXTURE_DEVTOOLS_LINE: &str = "devtools state=unlisted subject=com.aterm.aterm \
+         requests=233 not_allowed=233 answer_age_ms=4100 window_s=600 probe=observed \
+         probe_age_ms=812";
 
     /// A snapshot with no OS in it, so the wire format is a total function of
     /// data a test can name.
@@ -2507,26 +3244,27 @@ mod tests {
             protected: vec!["~/one".to_string(), "~/two".to_string()],
             warmup: "on-request",
             warmup_last_ms: None,
+            debugger: FIXTURE_DEBUGGER,
+            devtools: FIXTURE_DEVTOOLS,
             observer_fda: "ok",
             observer_responsible: "ok",
             observer_log: "off",
+            access_card: AccessCardReport {
+                state: "quiet",
+                record: crate::consent_card::AccessRecord::default(),
+                needs: 0,
+            },
         }
     }
 
-    /// THE GATE TEST (design §3.3 guardrail 2). A headless-constructed `App` is
-    /// exactly what a unit test is, and it must reach `tccd` through nothing.
-    ///
-    /// The assertion is on the LABEL, not merely on `unknown`, because that is
-    /// what distinguishes the two arms: the live arm run from this very test
-    /// binary would answer `refused_out_of_bundle` (the consent module's own
-    /// in-bundle guard catching it), while the inert arm answers
-    /// `refused_disabled` — the probe was never consulted at all. Seeing
-    /// `refused_disabled` here is therefore positive evidence that the inert
-    /// arm is the one wired, not just that nothing blew up.
+    /// A headless-constructed `App` reaches `tccd` through nothing (design
+    /// §3.3 guardrail 2). The label proves the inert arm is wired: the live arm
+    /// from a test binary would answer `refused_out_of_bundle`, the inert arm
+    /// `refused_disabled`.
     #[test]
     fn a_headless_app_wires_the_inert_consent_probe_arm() {
         let app = crate::App::headless_for_test();
-        let lines = app.read_privacy(PrivacyForm::Lines).lines;
+        let lines = app.read_privacy(PrivacyForm::Lines, Scope::Owner).lines;
         let fda = lines
             .iter()
             .find(|l| l.starts_with("full_disk_access="))
@@ -2551,21 +3289,102 @@ mod tests {
             observer.contains("responsible=off"),
             "so is the responsibility SPI: {observer}"
         );
+        assert!(
+            observer.ends_with(" taskport=off"),
+            "no authd lane watches in P0: {observer}"
+        );
+        // The debugger arm is inert too (`refused_disabled`), with no worker.
+        let debugger = lines
+            .iter()
+            .find(|l| l.starts_with("debugger "))
+            .expect("the posture carries a debugger row");
+        assert!(
+            debugger.starts_with(
+                "debugger mode=unknown member=unknown self_hardened=unknown \
+                 right=system.privilege.taskport.debug probe=refused_disabled probe_age_ms=- \
+                 pending=off "
+            ),
+            "the INERT debugger arm must be the wired one: {debugger}"
+        );
+        // So is the Developer Tools arm: no `log show` from a headless App.
+        let devtools = lines
+            .iter()
+            .find(|l| l.starts_with("devtools "))
+            .expect("the posture carries a devtools row");
+        assert_eq!(
+            devtools,
+            "devtools state=unknown subject=- requests=- not_allowed=- answer_age_ms=- \
+             window_s=600 probe=refused_disabled probe_age_ms=-",
+            "the INERT devtools arm must be the wired one"
+        );
+        assert!(!app.read_privacy(PrivacyForm::Lines, Scope::Owner).pending);
     }
 
-    /// The line body's exact shape, and the `OK <n>` arithmetic behind it: the
-    /// count is the number of rows, and every live session contributes exactly
-    /// one `session` row — never truncated, so `sessions_total=` and the row
-    /// count can never disagree.
+    /// An edge is shown only the sessions it may read — never the roster
+    /// `sessions` withholds from it. Owner sees every session; an edge holding
+    /// a read edge into one sibling sees that row alone, in both forms; a
+    /// write-only edge, or a token no table knows, sees none. The
+    /// instance-wide posture is answered to all of them.
+    #[test]
+    fn an_edge_sees_only_the_sessions_it_may_read() {
+        use aterm_session::{EdgeToken, Op, SessionId};
+        let mut app = crate::App::headless_for_test();
+        let sibling = app.pool.insert(crate::stub_session(1));
+        let grant = |app: &crate::App, op: Op| {
+            let ctx = &app.pool.get(sibling).expect("the sibling").ctx;
+            let mut table = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
+            table.grant(SessionId::new("s-src"), ctx.self_id.clone(), op, ctx.nonce)
+        };
+        let read = Scope::Edge(grant(&app, Op::ReadScreen));
+        let write = Scope::Edge(grant(&app, Op::WriteInput));
+        let sibling_sid = app
+            .pool
+            .get(sibling)
+            .expect("sid")
+            .ctx
+            .self_id
+            .as_str()
+            .to_string();
+        let rows = |scope: Scope| -> Vec<String> {
+            let lines = app.read_privacy(PrivacyForm::Lines, scope).lines;
+            assert!(
+                lines.iter().any(|l| l.starts_with("full_disk_access=")),
+                "the instance-wide posture answers every scope: {lines:?}"
+            );
+            lines
+                .into_iter()
+                .filter(|l| l.starts_with("session "))
+                .collect()
+        };
+        assert_eq!(rows(Scope::Owner).len(), 2, "Owner sees every session");
+        let seen = rows(read);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].starts_with(&format!("session sid={sibling_sid} ")),
+            "{seen:?}"
+        );
+        assert!(rows(write).is_empty(), "a write edge reads no session");
+        assert!(rows(Scope::Edge(EdgeToken::generate())).is_empty());
+        let json = app.read_privacy(PrivacyForm::Json, read).lines.concat();
+        assert_eq!(json.matches("\"sid\":").count(), 1, "{json}");
+        assert!(json.contains(&sibling_sid), "{json}");
+    }
+
+    /// The line body's exact shape: `OK <n>` counts rows, and every live
+    /// session contributes exactly one `session` row.
     #[test]
     fn the_line_body_is_the_documented_shape_and_ok_n_counts_it() {
         let lines = snapshot(4, FdaState::Denied, SpikeEvidence::UNMEASURED).lines();
-        // 17 fixed rows (2026-09-10: `install=` and `unmeasured=` joined the 14;
-        // 2026-09-22: the `claimants=` census summary joined them). The census
+        // 19 fixed rows (2026-09-10: `install=` and `unmeasured=` joined the 14;
+        // 2026-09-22: the `claimants=` census summary joined them; 2026-09-28:
+        // the `access_card` row). The census
         // adds ONE row in the ordinary posture — a per-claimant line appears
         // only when a copy on disk actually conflicts, which is the state that
         // destroys a grant and the only one worth a line of its own.
-        assert_eq!(lines.len(), 4 + 17, "17 fixed rows plus one per session");
+        // 2026-09-29: the `debugger` row joined them, after `warmup=`; the
+        // `access_card` row follows `observer`. 2026-10-07: the `devtools`
+        // row, after `debugger`.
+        assert_eq!(lines.len(), 4 + 20, "20 fixed rows plus one per session");
         assert_eq!(lines[0], "schema=1");
         assert_eq!(lines[1], "platform=macos os=26.6.2");
         assert_eq!(
@@ -2582,9 +3401,7 @@ mod tests {
             "full_disk_access=denied probe=open_eperm probe_age_ms=1840 fda_scope=unknown"
         );
         assert_eq!(lines[5], "covers=-");
-        // Derived from NEVER_COVERED rather than spelled out, so adding a
-        // service that the grant provably does not reach cannot silently
-        // disagree with the roster it is read from.
+        // Derived from NEVER_COVERED so the row cannot disagree with it.
         assert_eq!(lines[6], format!("uncovered={}", NEVER_COVERED.join(",")));
         assert!(
             lines[7].starts_with("unmeasured=documents,"),
@@ -2592,10 +3409,8 @@ mod tests {
             lines[7]
         );
         // The census summary sits between the folder roster and
-        // `prompt_possible=`: "what else on this disk claims my identifier" is
-        // the last thing said about the GRANT before the report turns to
-        // sessions. On a fixture whose census has not answered, every field is
-        // `-` and the state is named — never a count it has not established.
+        // `prompt_possible=`. Unanswered, every field is `-` and the state is
+        // named.
         assert_eq!(lines[9], "claimants=- conflicting=- census=off");
         assert_eq!(lines[10], "prompt_possible=yes");
         assert_eq!(
@@ -2614,9 +3429,92 @@ mod tests {
              field and leaves ascii-graphic bytes such as `/` alone"
         );
         assert!(session_rows[1].as_str().contains("attribution=adopted"));
+        // The debugger row sits after `warmup=` and before `observer`: the
+        // last fact reported, then who is watching, then where to act.
+        let at = |prefix: &str| {
+            lines
+                .iter()
+                .position(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no {prefix} row in {lines:?}"))
+        };
+        let debugger = at("debugger ");
+        assert_eq!(lines[debugger], FIXTURE_DEBUGGER_LINE);
+        assert_eq!(debugger, at("warmup=") + 1);
+        let devtools = at("devtools ");
+        assert_eq!(lines[devtools], FIXTURE_DEVTOOLS_LINE);
+        assert_eq!(devtools, debugger + 1);
+        assert_eq!(devtools + 1, at("observer "));
         assert!(lines.last().expect("a note row").starts_with("note "));
         // The header the handler writes is the row count.
-        assert_eq!(format!("OK {}", lines.len()), "OK 21");
+        assert_eq!(format!("OK {}", lines.len()), "OK 24");
+    }
+
+    /// The `access_card` row says whether the Full Disk Access question was
+    /// asked, opened or answered, and when, in both renderings; `renew_at` is
+    /// a week after the ask; unset is `-` (null in JSON).
+    #[test]
+    fn the_access_card_row_reports_the_question_in_both_renderings() {
+        use crate::consent_card::{AccessRecord, RENEW_AFTER, report_state};
+        let quiet = snapshot(0, FdaState::Denied, SpikeEvidence::UNMEASURED);
+        assert!(
+            quiet.lines().iter().any(|l| l
+                == "access_card state=quiet asked_at=- opened_at=- verified_at=- renew_at=- needs=0"),
+            "{:?}",
+            quiet.lines()
+        );
+        let record = AccessRecord {
+            asked_at: Some(1_000),
+            opened_at: Some(2_000),
+            verified_at: None,
+            verified_build: Some(7),
+        };
+        let mut asked = snapshot(0, FdaState::Denied, SpikeEvidence::UNMEASURED);
+        asked.access_card = AccessCardReport {
+            state: report_state(None, &record, FdaState::Denied, 3_000),
+            record,
+            needs: 3,
+        };
+        let week = 1_000 + RENEW_AFTER.as_secs();
+        let expected = format!(
+            "access_card state=opened asked_at=1000 opened_at=2000 verified_at=- \
+             renew_at={week} needs=3"
+        );
+        assert!(asked.lines().contains(&expected), "{:?}", asked.lines());
+        let json = cmd_privacy_json(&asked);
+        assert!(
+            json.contains(&format!(
+                "\"access_card\":{{\"state\":\"opened\",\"asked_at\":1000,\"opened_at\":2000,\
+                 \"verified_at\":null,\"renew_at\":{week},\"needs\":3}}"
+            )),
+            "{json}"
+        );
+        // The state token, from the marker, the record and the window's probe.
+        use crate::consent_card::Marker;
+        let none = AccessRecord::default();
+        assert_eq!(report_state(None, &none, FdaState::Denied, 5), "quiet");
+        assert_eq!(
+            report_state(Some(Marker::NotNow), &record, FdaState::Granted, 5),
+            "declined"
+        );
+        assert_eq!(report_state(None, &record, FdaState::Granted, 5), "granted");
+        let only_asked = AccessRecord {
+            asked_at: Some(1_000),
+            ..none
+        };
+        assert_eq!(
+            report_state(None, &only_asked, FdaState::Denied, 1_500),
+            "asked"
+        );
+        assert_eq!(
+            report_state(
+                None,
+                &only_asked,
+                FdaState::Denied,
+                1_000 + RENEW_AFTER.as_secs()
+            ),
+            "quiet",
+            "an ask a week old is spent"
+        );
     }
 
     fn census_answer(found: Vec<aterm_containment::consent::Claimant>) -> Claimants {
@@ -2639,14 +3537,13 @@ mod tests {
             signing,
             team: None,
             running,
+            links: Vec::new(),
         }
     }
 
-    /// The census never runs on the reading thread, a completed answer is
-    /// served until [`CENSUS_TTL`], and focus/config `invalidate()` leaves it
-    /// alone (neither changes the disk). The
-    /// fixture counts its own runs, so "served from the slot" is proved by the
-    /// census NOT running again. The wait is the completion wake, not a spin.
+    /// The census never runs on the reading thread, an answer is served until
+    /// [`CENSUS_TTL`], and `invalidate()` leaves it alone. The fixture counts
+    /// its runs, so a served answer shows as no new run.
     #[test]
     fn the_census_runs_on_a_worker_and_survives_focus_and_config_invalidation() {
         use std::sync::atomic::AtomicUsize;
@@ -2664,7 +3561,7 @@ mod tests {
             let _ = tx.send(());
         }));
         let wait = || {
-            rx.recv_timeout(Duration::from_secs(10))
+            rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
                 .expect("the worker publishes")
         };
 
@@ -2716,7 +3613,7 @@ mod tests {
             let _ = tx.send(());
         }));
         let wait = || {
-            rx.recv_timeout(Duration::from_secs(10))
+            rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
                 .expect("the worker publishes")
         };
         assert_eq!(state.claimants(Some("x"), true), (None, true));
@@ -2749,43 +3646,88 @@ mod tests {
         assert_eq!(RAN.load(Ordering::Acquire), 0);
     }
 
-    /// The census rows in the state that destroys a grant: a Developer-ID
-    /// install with two ad-hoc copies beside it. The summary carries the true
-    /// totals, each differing copy gets a line, the running copy is the
-    /// reference and not a finding, and the mechanism is stated once.
+    /// The census rows when a grant is at risk: a Developer-ID install with
+    /// three ad-hoc copies — a rollback, a dev build a link leads to and one
+    /// whose requirement is not its cdhash. The summary has true totals, each
+    /// differing copy gets a line, the running copy is the reference, and the
+    /// mechanism is stated once. Every row says whether Settings ▸ Security's
+    /// *Move to Trash* takes it, and in both forms of the verb only the copy
+    /// the move itself takes (`Claimants::retirable`) reads as offered: none
+    /// without the tool, beside an unstable running copy, or past the rows.
     #[test]
     fn the_census_rows_name_every_conflicting_copy_and_say_why_it_matters() {
         let mut snap = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
-        snap.claimants = Some((
-            census_answer(vec![
-                claimant(
-                    "/Applications/aterm.app",
-                    DrClass::Identity,
-                    "developer-id",
-                    true,
-                ),
-                claimant(
-                    "/Applications/aterm.app.rollback",
-                    DrClass::Cdhash,
-                    "adhoc",
-                    false,
-                ),
-                claimant("/Users//a/aterm-backup.app", DrClass::Cdhash, "adhoc", false),
-            ]),
-            Duration::from_millis(1200),
-        ));
+        let mut linked = claimant("/Users//a/dev/aterm.app", DrClass::Cdhash, "adhoc", false);
+        linked.links = vec![PathBuf::from("/Applications/aterm-dev.app")];
+        let census = census_answer(vec![
+            claimant(
+                "/Applications/aterm.app",
+                DrClass::Identity,
+                "developer-id",
+                true,
+            ),
+            claimant(
+                "/Applications/aterm.app.rollback",
+                DrClass::Cdhash,
+                "adhoc",
+                false,
+            ),
+            linked,
+            claimant(
+                "/Users//a/pinned/aterm.app",
+                DrClass::Unknown,
+                "adhoc",
+                false,
+            ),
+        ]);
+        // What the move itself takes: its fresh check before each move.
+        let moved: Vec<PathBuf> = census.retirable().iter().map(|c| c.path.clone()).collect();
+        assert_eq!(moved, [PathBuf::from("/Applications/aterm.app.rollback")]);
+        snap.claimants = Some((census, Duration::from_millis(1200)));
+        // The copies the verb reads as offered, in the text rows and in the
+        // JSON's conflicts, each of which must say one way or the other.
+        let offered = |snap: &PrivacySnapshot| -> Vec<PathBuf> {
+            let text: Vec<PathBuf> = snap
+                .lines()
+                .iter()
+                .filter_map(|line| line.strip_prefix("claimant path="))
+                .filter_map(|row| {
+                    let (path, fields) = row.split_once(' ').expect("fields");
+                    let trash = fields
+                        .split(' ')
+                        .find_map(|field| field.strip_prefix("trash="))
+                        .expect("every row says whether the Trash takes it");
+                    (trash == "offered").then(|| PathBuf::from(path))
+                })
+                .collect();
+            let json: aterm_json::Value =
+                aterm_json::from_str(cmd_privacy_json(snap).lines().nth(1).expect("JSON body"))
+                    .expect("the JSON parses");
+            let json: Vec<PathBuf> = json["census"]["conflicts"]
+                .as_array()
+                .expect("an answered census lists its conflicts")
+                .iter()
+                .filter_map(|row| {
+                    let trash = row["trash"]
+                        .as_str()
+                        .expect("every conflict says whether the Trash takes it");
+                    (trash == "offered").then(|| PathBuf::from(row["path"].as_str().expect("path")))
+                })
+                .collect();
+            assert_eq!(text, json, "both forms read one rule");
+            text
+        };
+        let note = |snap: &PrivacySnapshot| -> String {
+            snap.lines()
+                .into_iter()
+                .find(|l| l.contains("signed%20differently"))
+                .expect("the conflicting census explains itself")
+        };
+        assert_eq!(offered(&snap), moved, "only what the move takes is offered");
         let lines = snap.lines();
         assert!(
             lines.contains(
-                &"claimants=3 conflicting=2 census=complete sole=no age_ms=1200".to_string()
-            ),
-            "{lines:?}"
-        );
-        assert!(
-            lines.contains(
-                &"claimant path=/Applications/aterm.app.rollback signing=adhoc dr=cdhash \
-                  team=- conflicts=yes"
-                    .to_string()
+                &"claimants=4 conflicting=3 census=complete sole=no age_ms=1200".to_string()
             ),
             "{lines:?}"
         );
@@ -2795,32 +3737,19 @@ mod tests {
                 .any(|l| l.starts_with("claimant path=/Applications/aterm.app ")),
             "the running copy is the reference: {lines:?}"
         );
-        let note = lines
-            .iter()
-            .find(|l| l.contains("signed%20differently"))
-            .expect("the conflicting census explains itself");
-        assert!(note.starts_with("note 2%20other%20copies"), "{note}");
-        assert!(note.contains("resets%20access"), "{note}");
-        // The remedy is the panel's own rule, and it is the whole ending of the
-        // note: offered here (the tool is present and an ad-hoc copy sits
-        // beside a Developer-ID running one) …
-        let lists_only = pct_encode("every copy; Settings \u{25b8} Security lists them");
-        let offers = pct_encode(
-            "every copy; Settings \u{25b8} Security lists them and offers to move the ad-hoc \
-             or unsigned ones to the Trash",
-        );
-        assert!(note.ends_with(&offers), "{note}");
-        // … and without the tool the note only says the panel lists it.
+        let said = note(&snap);
+        assert!(said.starts_with("note 3%20other%20copies"), "{said}");
+        assert!(said.contains("resets%20access"), "{said}");
+        // The note sends a reader to the Trash only when a row is offered.
+        assert!(said.contains("Trash"), "{said}");
+
+        // Without the tool nothing is offered …
         let mut without_tool = snap.clone();
         without_tool.trash_tool = false;
-        let listed = without_tool
-            .lines()
-            .into_iter()
-            .find(|l| l.contains("signed%20differently"))
-            .expect("the note");
-        assert!(listed.ends_with(&lists_only), "{listed}");
-        // … and with the tool but nothing offerable — the running copy is itself
-        // ad hoc, so a conflicting copy may be the real release — it lists only.
+        assert_eq!(offered(&without_tool), Vec::<PathBuf>::new());
+        assert!(!note(&without_tool).contains("Trash"));
+        // … nor beside a running copy that is itself ad hoc, where a
+        // conflicting copy may be the real release …
         let mut unstable = snap.clone();
         unstable.claimants = Some((
             census_answer(vec![
@@ -2829,21 +3758,13 @@ mod tests {
             ]),
             Duration::from_millis(1),
         ));
-        let listed = unstable
-            .lines()
-            .into_iter()
-            .find(|l| l.contains("signed%20differently"))
-            .expect("the note");
         assert!(unstable.trash_tool, "the tool is present");
-        assert!(listed.starts_with("note 1%20other%20copy%20of"), "{listed}");
-        assert!(
-            listed.ends_with(&pct_encode(
-                "every copy; Settings \u{25b8} Security lists it"
-            )),
-            "{listed}"
-        );
-        // … and with the tool and a retirable copy that sits past the listed
-        // rows: the panel offers only what it lists, so the note lists only.
+        assert_eq!(offered(&unstable), Vec::<PathBuf>::new());
+        let said = note(&unstable);
+        assert!(said.starts_with("note 1%20other%20copy%20of"), "{said}");
+        assert!(!said.contains("Trash"), "{said}");
+        // … nor a retirable copy past the listed rows: the panel offers only
+        // what it lists.
         let mut past_the_rows = snap.clone();
         let mut found = vec![claimant(
             "/Applications/aterm.app",
@@ -2866,15 +3787,8 @@ mod tests {
             false,
         ));
         past_the_rows.claimants = Some((census_answer(found), Duration::from_millis(1)));
-        let listed = past_the_rows
-            .lines()
-            .into_iter()
-            .find(|l| l.contains("signed%20differently"))
-            .expect("the note");
-        assert!(
-            listed.ends_with(&lists_only),
-            "a copy past the listed rows is not offered: {listed}"
-        );
+        assert_eq!(offered(&past_the_rows), Vec::<PathBuf>::new());
+        assert!(!note(&past_the_rows).contains("Trash"));
     }
 
     /// A lone install says `sole=yes` and adds nothing beyond the summary.
@@ -3043,10 +3957,11 @@ mod tests {
             fda_coverage_measured: true,
             handoff_attribution_measured: false,
             fda_scope: FdaScope::ThisProcess,
+            ..SpikeEvidence::UNMEASURED
         };
         let lines = snapshot(1, FdaState::Granted, measured).lines();
-        // Measured: everything moves to `covers` EXCEPT the class the design
-        // records as not reliably covered, which stays `uncovered`.
+        // Measured: everything moves to `covers` except the class recorded as
+        // not reliably covered.
         assert!(lines.contains(&format!(
             "covers={}",
             SERVICES
@@ -3068,24 +3983,14 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("fda_scope=this_process")));
     }
 
-    /// An UNMEASURED folder's state is never inferred from the grant. Testing a
-    /// folder is the act that raises the prompt, so the only honest answer
-    /// before an access was observed is `unknown` — whatever Full Disk Access
-    /// says.
-    ///
-    /// NARROWED 2026-09-19, not deleted. This tripwire was written when §7 S4
-    /// was unrun and no service had measured coverage; it fired on the very
-    /// commit that gave `app-data` a measurement, which is what a tripwire is
-    /// for. §3.4's rule is the one that survives: when the grant is held, ONLY
-    /// the services S4 proved covered become `covered-by-fda`, and the rest stay
-    /// `unknown`. So the ban now names the four still-unmeasured rows
-    /// explicitly rather than every row, and it would fire again the moment one
-    /// of them started reading `covered-by-fda` without its own measurement.
+    /// An unmeasured folder's state is never inferred from the grant: before an
+    /// observed access the only answer is `unknown`. Under a held grant only
+    /// services S4 proved covered read `covered-by-fda`; the four unmeasured
+    /// rows stay `unknown`.
     #[test]
     fn no_unmeasured_folder_state_is_ever_inferred_from_the_grant() {
-        // Documents/Desktop/Downloads could not be isolated by S4 (the
-        // reference machine already carried explicit rows for all three), and
-        // the two volume classes were never exercised.
+        // S4 could not isolate Documents/Desktop/Downloads, and never exercised
+        // the two volume classes.
         const STILL_UNMEASURED: &[&str] = &[
             "documents",
             "desktop",
@@ -3121,22 +4026,16 @@ mod tests {
         }
     }
 
-    /// An observation aterm actually made outranks the coverage rule, and a
-    /// warm-up row reaches the wire at all.
-    ///
-    /// Before 2026-09-19 the `folder` row was a literal, so the owner could warm
-    /// Documents, take an `EPERM`, and the verb would still report `unknown`
-    /// with `source=none` — discarding the one observation in the whole design
-    /// that is allowed to move a folder off `unknown`.
+    /// An observation aterm made outranks the coverage rule, and a warm-up row
+    /// reaches the wire.
     #[test]
     fn an_observed_warmup_row_outranks_the_coverage_rule_and_reaches_the_wire() {
         use crate::consent_warmup::WarmupRow;
         let warmed = [
             (Folder::Documents, WarmupRow::Denied),
             (Folder::Desktop, WarmupRow::Allowed),
-            // An observed denial for the very class the grant is measured to
-            // cover must WIN: the grant is a rule, this is a measurement of
-            // this host.
+            // An observed denial for a class the grant is measured to cover
+            // wins: the grant is a rule, this is a measurement.
             (Folder::AppData, WarmupRow::Denied),
         ];
         let lines =
@@ -3165,10 +4064,8 @@ mod tests {
         assert!(folder.ends_with(" source=warmup"), "{folder}");
     }
 
-    /// `unavailable` is a THIRD value: not `off`, and not `false`. `off` is a
-    /// probe deliberately not consulted; `unavailable` is one that could not
-    /// answer. Collapsing them would report a configuration choice as a
-    /// missing capability, or worse, as a denial.
+    /// `unavailable` is distinct from `off` and `false`: `off` is a probe not
+    /// consulted, `unavailable` one that could not answer.
     #[test]
     fn unavailable_is_distinct_from_off_and_from_a_negative_answer() {
         assert_eq!(observer_fda_value(ProbeLabel::RefusedDisabled), "off");
@@ -3202,10 +4099,8 @@ mod tests {
         assert_eq!(observer_responsible_value(&[]), "off");
     }
 
-    /// The `consent_at_risk` conjunction (§3.6), and the case it must stay
-    /// silent on: an unknown cwd, which is every session without shell
-    /// integration. Silence there is the point — a token emitted on missing
-    /// evidence would be a guess.
+    /// The `consent_at_risk` conjunction (§3.6), and silence on an unknown cwd
+    /// (every session without shell integration).
     #[test]
     fn consent_at_risk_is_a_conjunction_and_is_silent_without_a_cwd() {
         let roots = vec![PathBuf::from("/u/me/Protected"), PathBuf::from("/vol")];
@@ -3236,9 +4131,8 @@ mod tests {
         ));
     }
 
-    /// An ADOPTED session reports `unknown` and NEVER `denied` (design §3.9
-    /// pt 3), and its `attribution` comes from aterm's own handoff record — not
-    /// from the responsibility SPI, which is not consulted on this path at all.
+    /// An adopted session reports `unknown`, never `denied` (design §3.9), and
+    /// its `attribution` comes from aterm's handoff record, not the SPI.
     #[test]
     fn an_adopted_session_is_attributed_from_the_handoff_record_and_never_denied() {
         let mut app = crate::App::headless_for_test();
@@ -3270,9 +4164,8 @@ mod tests {
         assert_eq!(gone.fs_consent, FsConsent::Unknown);
     }
 
-    /// A successor inherits NOTHING: the consent state is instance-owned, so a
-    /// freshly constructed `App` starts with an empty probe cache whatever the
-    /// predecessor had learned.
+    /// A successor inherits nothing: a fresh `App` starts with an empty probe
+    /// cache.
     #[test]
     fn a_fresh_instance_inherits_no_probe_cache() {
         let state = ConsentState::inert();
@@ -3282,6 +4175,815 @@ mod tests {
         assert!(
             format!("{successor:?}").contains("cache_empty: true"),
             "a successor's cache starts empty"
+        );
+    }
+
+    /// A counting debugger arm for the slot tests: it answers like a Mac with
+    /// developer mode off and spawns nothing. Each test owns its own counter.
+    fn fake_debugger(runs: &std::sync::atomic::AtomicUsize) -> DebuggerProbe {
+        runs.fetch_add(1, Ordering::AcqRel);
+        DebuggerProbe {
+            mode: DebuggerMode::Disabled,
+            member: DebuggerMember::Admin,
+            label: DebuggerProbeLabel::StatusOk,
+        }
+    }
+
+    /// The debugger probe never runs on the reading thread: a cold read is
+    /// `probe=pending` and dispatches one worker; an answer is served with its
+    /// age within [`DEBUGGER_TTL`]; [`ConsentState::invalidate_debugger`]
+    /// retires it and the FDA `invalidate()` does not.
+    #[test]
+    fn the_debugger_probe_runs_on_a_worker_and_focus_gain_retires_it() {
+        use std::sync::atomic::AtomicUsize;
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        static HARDENING_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counting(_gate: ProbeGate) -> DebuggerProbe {
+            fake_debugger(&RUNS)
+        }
+        fn hardened() -> SelfHardening {
+            HARDENING_READS.fetch_add(1, Ordering::AcqRel);
+            SelfHardening::NotHardened
+        }
+        let mut state = ConsentState::inert();
+        state.probes.live = true;
+        state.probes.debugger = counting;
+        state.probes.hardening = hardened;
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_debugger_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let wait = || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the worker publishes")
+        };
+
+        let cold = state.debugger(ProbeGate::on());
+        assert_eq!(cold, DebuggerRow::refused(DebuggerProbeLabel::Pending));
+        assert!(cold.pending(), "the reading thread never waits");
+        wait();
+        let warm = state.debugger(ProbeGate::on());
+        assert_eq!(warm.probe.mode, DebuggerMode::Disabled);
+        assert_eq!(warm.probe.member, DebuggerMember::Admin);
+        assert_eq!(warm.self_hardened, SelfHardening::NotHardened);
+        assert!(warm.probe_age_ms.is_some(), "a completed probe has an age");
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+
+        state.invalidate();
+        assert!(!state.debugger(ProbeGate::on()).pending());
+        assert_eq!(RUNS.load(Ordering::Acquire), 1, "served, not rerun");
+
+        state.invalidate_debugger();
+        // The retry floor survives focus churn; step past it rather than race.
+        state
+            .shared
+            .debugger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retry_after = None;
+        assert!(state.debugger(ProbeGate::on()).pending());
+        wait();
+        assert!(!state.debugger(ProbeGate::on()).pending());
+        assert_eq!(RUNS.load(Ordering::Acquire), 2);
+        assert_eq!(
+            HARDENING_READS.load(Ordering::Acquire),
+            1,
+            "the hardening bits are fixed at exec: read once"
+        );
+    }
+
+    /// A debugger worker in flight when focus retires the answer publishes
+    /// nothing, and releases the slot so the next read dispatches again.
+    #[test]
+    fn a_debugger_probe_out_when_focus_returns_publishes_nothing() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn held(_gate: ProbeGate) -> DebuggerProbe {
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            fake_debugger(&RUNS)
+        }
+        let mut state = ConsentState::inert();
+        state.probes.live = true;
+        state.probes.debugger = held;
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_debugger_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let wait = || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the worker publishes")
+        };
+
+        assert!(state.debugger(ProbeGate::on()).pending());
+        state.invalidate_debugger();
+        // Still one worker: a read while it is out dispatches nothing more.
+        assert!(state.debugger(ProbeGate::on()).pending());
+        RELEASE.store(true, Ordering::Release);
+        wait();
+        assert!(
+            state
+                .shared
+                .debugger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry
+                .is_none(),
+            "an answer from before the focus edge is not published"
+        );
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+    }
+
+    /// `[privacy] enabled = false`: the debugger row reads `unknown` with
+    /// `probe=refused_disabled pending=off` (design §4.1) and consults nothing;
+    /// a warm answer is retired, so re-enabling asks again.
+    #[test]
+    fn the_master_switch_makes_the_debugger_row_unknown() {
+        use std::sync::atomic::AtomicUsize;
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        static HARDENING_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counting(_gate: ProbeGate) -> DebuggerProbe {
+            fake_debugger(&RUNS)
+        }
+        fn hardened() -> SelfHardening {
+            HARDENING_READS.fetch_add(1, Ordering::AcqRel);
+            SelfHardening::Hardened
+        }
+        let mut app = crate::App::headless_for_test();
+        app.consent.probes.live = true;
+        app.consent.probes.debugger = counting;
+        app.consent.probes.hardening = hardened;
+        app.config.privacy = Some(crate::app_config::PrivacyConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        let lines = app.read_privacy(PrivacyForm::Lines, Scope::Owner).lines;
+        let debugger = lines
+            .iter()
+            .find(|l| l.starts_with("debugger "))
+            .expect("the posture carries a debugger row");
+        assert_eq!(
+            debugger,
+            "debugger mode=unknown member=unknown self_hardened=unknown \
+             right=system.privilege.taskport.debug probe=refused_disabled probe_age_ms=- \
+             pending=off pending_right=- pending_age_ms=- last=- watch_ms=-"
+        );
+        let json = app
+            .read_privacy(PrivacyForm::Json, Scope::Owner)
+            .lines
+            .concat();
+        assert!(
+            json.contains(
+                "\"debugger\":{\"mode\":\"unknown\",\"member\":\"unknown\",\
+                 \"self_hardened\":\"unknown\",\"right\":\"system.privilege.taskport.debug\",\
+                 \"probe\":\"refused_disabled\",\"probe_age_ms\":null,\"pending\":\"off\","
+            ),
+            "{json}"
+        );
+        assert_eq!(RUNS.load(Ordering::Acquire), 0, "nothing was spawned");
+        assert_eq!(HARDENING_READS.load(Ordering::Acquire), 0);
+
+        // A warm answer does not survive the switch.
+        let state = &app.consent;
+        state
+            .shared
+            .debugger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry = Some((
+            DebuggerEntry {
+                probe: fake_debugger(&AtomicUsize::new(0)),
+                self_hardened: SelfHardening::Hardened,
+            },
+            Instant::now(),
+        ));
+        let closed = ProbeGate {
+            enabled: false,
+            check: true,
+        };
+        assert_eq!(
+            state.debugger(closed),
+            DebuggerRow::refused(DebuggerProbeLabel::RefusedDisabled)
+        );
+        assert!(
+            state
+                .shared
+                .debugger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry
+                .is_none(),
+            "the closed gate retired the warm answer"
+        );
+        assert_eq!(RUNS.load(Ordering::Acquire), 0);
+    }
+
+    /// Only the full report dispatches the debugger worker (design §8 P0 item
+    /// 2): the FDA `await consent` tuple and `status`'s `session_consent` are
+    /// polled, and neither may start a `DevToolsSecurity -status` run or read
+    /// the hardening bits, even with the gate open and live-flagged counting
+    /// arms. The positive control is the same App's `Lines` read, which does
+    /// dispatch — so the silence before it is the path, not a closed gate.
+    /// (`await consent kind=debugger` asks the slot, under its TTL: see
+    /// [`await_consent_kind_debugger_latches_on_a_mode_change_without_a_probe_per_poll`].)
+    #[test]
+    fn the_polled_consent_paths_never_dispatch_the_debugger_probe() {
+        use std::sync::atomic::AtomicUsize;
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        static HARDENING_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counting(_gate: ProbeGate) -> DebuggerProbe {
+            fake_debugger(&RUNS)
+        }
+        fn hardened() -> SelfHardening {
+            HARDENING_READS.fetch_add(1, Ordering::AcqRel);
+            SelfHardening::Hardened
+        }
+        let mut app = crate::App::headless_for_test();
+        app.consent.probes.live = true;
+        app.consent.probes.debugger = counting;
+        app.consent.probes.hardening = hardened;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.consent.set_debugger_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        assert!(
+            app.consent_policy().gate.permits(),
+            "the gate is open, so only the path can keep the probe quiet"
+        );
+        let slot_idle = |app: &crate::App| {
+            let slot = app
+                .consent
+                .shared
+                .debugger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            !slot.in_flight && slot.entry.is_none()
+        };
+
+        for _ in 0..3 {
+            let _ = app.read_privacy(PrivacyForm::Tuple(0), Scope::Owner);
+            let _ = app.session_consent(0, None);
+        }
+        assert_eq!(RUNS.load(Ordering::Acquire), 0, "a poll spawned the probe");
+        assert_eq!(HARDENING_READS.load(Ordering::Acquire), 0);
+        assert!(slot_idle(&app), "a poll left a debugger worker in flight");
+
+        // The positive control: the full report dispatches exactly one.
+        let _ = app.read_privacy(PrivacyForm::Lines, Scope::Owner);
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the full report's worker publishes");
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+        assert!(!slot_idle(&app), "the full report's answer is cached");
+    }
+
+    /// What the fake Developer Tools arm reports: tccd's newest answer was
+    /// `unlisted`, three new programs in the window, the newest at `at_ms`.
+    fn fake_devtools(runs: &std::sync::atomic::AtomicUsize, at_ms: i64) -> DevToolProbe {
+        runs.fetch_add(1, Ordering::AcqRel);
+        DevToolProbe {
+            state: aterm_containment::DevToolState::Unlisted,
+            label: DevToolProbeLabel::Observed,
+            requests: Some(3),
+            not_allowed: Some(3),
+            answered_at_ms: Some(at_ms),
+        }
+    }
+
+    /// The subject the fakes ask about.
+    fn fake_subject() -> Option<&'static str> {
+        Some("com.example.subject")
+    }
+
+    /// The Developer Tools probe never runs on the reading thread: a cold read
+    /// is `probe=pending` and dispatches one `aterm-devtools-probe` worker for
+    /// the subject; an answer is served with both ages within
+    /// [`DEVTOOLS_TTL`]; [`ConsentState::invalidate_devtools`] (focus gain)
+    /// retires it, and neither the FDA `invalidate()` nor the debugger's does.
+    #[test]
+    fn the_devtools_probe_runs_on_a_worker_and_focus_gain_retires_it() {
+        use std::sync::atomic::AtomicUsize;
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        static SUBJECT_SEEN: Mutex<Option<String>> = Mutex::new(None);
+        fn counting(_gate: ProbeGate, subject: &str) -> DevToolProbe {
+            *SUBJECT_SEEN.lock().unwrap_or_else(|p| p.into_inner()) = Some(subject.to_owned());
+            // Two minutes before the clock the row is read with.
+            fake_devtools(&RUNS, unix_now_ms() - 120_000)
+        }
+        let mut state = ConsentState::inert();
+        state.probes.live = true;
+        state.probes.devtools = counting;
+        state.probes.subject = fake_subject;
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_devtools_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let wait = || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the worker publishes")
+        };
+
+        let cold = state.devtools(ProbeGate::on(), false);
+        assert!(cold.pending(), "the reading thread never waits");
+        assert_eq!(cold.probe.state, aterm_containment::DevToolState::Unknown);
+        wait();
+        let warm = state.devtools(ProbeGate::on(), false);
+        assert_eq!(warm.probe.state, aterm_containment::DevToolState::Unlisted);
+        assert_eq!(warm.probe.requests, Some(3));
+        assert!(warm.probe_age_ms.is_some(), "a completed probe has an age");
+        let answer_age = warm.answer_age_ms.expect("tccd's answer has an age");
+        assert!(
+            answer_age >= 120_000,
+            "aged against the wall clock: {answer_age}"
+        );
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+        assert_eq!(
+            SUBJECT_SEEN
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_deref(),
+            Some("com.example.subject"),
+            "the worker asks about the subject arm's bundle id"
+        );
+
+        state.invalidate();
+        state.invalidate_debugger();
+        assert!(!state.devtools(ProbeGate::on(), false).pending());
+        assert_eq!(RUNS.load(Ordering::Acquire), 1, "served, not rerun");
+
+        state.invalidate_devtools();
+        // The retry floor survives focus churn; step past it rather than race.
+        state.shared.devtools.lock_or_recover().retry_after = None;
+        assert!(state.devtools(ProbeGate::on(), false).pending());
+        wait();
+        assert!(!state.devtools(ProbeGate::on(), false).pending());
+        assert_eq!(RUNS.load(Ordering::Acquire), 2);
+
+        // Past the TTL one worker refreshes it, the stale answer served
+        // meanwhile.
+        {
+            let mut slot = state.shared.devtools.lock_or_recover();
+            let entry = slot.entry.as_mut().expect("a cached answer");
+            entry.1 = Instant::now()
+                .checked_sub(DEVTOOLS_TTL + Duration::from_secs(1))
+                .expect("the clock is past one TTL");
+            slot.retry_after = None;
+        }
+        for _ in 0..5 {
+            assert!(!state.devtools(ProbeGate::on(), false).pending());
+        }
+        wait();
+        assert_eq!(RUNS.load(Ordering::Acquire), 3, "one refresh per TTL");
+    }
+
+    /// `[privacy] enabled = false` (or `check = false`) makes the row
+    /// `refused_disabled`, `[privacy] observer = false` makes it
+    /// `refused_observer_off`, and no usable bundle id makes it
+    /// `refused_no_subject` (a cold identity only after the worker read it):
+    /// each reads `state=unknown`, runs nothing, and a warm answer does not
+    /// survive the first two. The same live-flagged counting arm DOES run
+    /// once all three allow it, so the silence is the policy.
+    #[test]
+    fn the_master_switch_and_observer_off_make_the_devtools_row_unknown() {
+        use std::sync::atomic::AtomicUsize;
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn counting(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+            fake_devtools(&RUNS, 0)
+        }
+        fn no_subject() -> Option<&'static str> {
+            None
+        }
+        fn unusable_subject() -> Option<&'static str> {
+            Some("a b")
+        }
+        let mut app = crate::App::headless_for_test();
+        app.consent.probes.live = true;
+        app.consent.probes.devtools = counting;
+        app.consent.probes.subject = fake_subject;
+        let row = |app: &crate::App| {
+            app.read_privacy(PrivacyForm::Lines, Scope::Owner)
+                .lines
+                .into_iter()
+                .find(|l| l.starts_with("devtools "))
+                .expect("the posture carries a devtools row")
+        };
+        let refused = |label: &str| {
+            format!(
+                "devtools state=unknown subject=com.example.subject requests=- not_allowed=- \
+                 answer_age_ms=- window_s=600 probe={label} probe_age_ms=-"
+            )
+        };
+        let warm = |app: &crate::App| {
+            app.consent.shared.devtools.lock_or_recover().entry = Some((
+                DevToolsEntry {
+                    probe: fake_devtools(&AtomicUsize::new(0), 0),
+                    subject: fake_subject(),
+                },
+                Instant::now(),
+            ));
+        };
+        let cold = |app: &crate::App| {
+            app.consent
+                .shared
+                .devtools
+                .lock_or_recover()
+                .entry
+                .is_none()
+        };
+
+        for privacy in [
+            crate::app_config::PrivacyConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            crate::app_config::PrivacyConfig {
+                check: Some(false),
+                ..Default::default()
+            },
+        ] {
+            app.config.privacy = Some(privacy);
+            warm(&app);
+            assert_eq!(row(&app), refused("refused_disabled"));
+            assert!(cold(&app), "the closed gate retired the warm answer");
+        }
+        app.config.privacy = Some(crate::app_config::PrivacyConfig {
+            observer: Some(false),
+            ..Default::default()
+        });
+        warm(&app);
+        assert_eq!(row(&app), refused("refused_observer_off"));
+        assert!(cold(&app), "observer = false retired the warm answer");
+        let json = app
+            .read_privacy(PrivacyForm::Json, Scope::Owner)
+            .lines
+            .concat();
+        assert!(
+            json.contains("\"probe\":\"refused_observer_off\",\"probe_age_ms\":null}"),
+            "{json}"
+        );
+        app.config.privacy = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.consent.set_devtools_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        // A warm identity with an unusable id refuses on the reading thread.
+        app.consent.probes.subject = unusable_subject;
+        assert!(
+            row(&app).contains(" probe=refused_no_subject "),
+            "{}",
+            row(&app)
+        );
+        assert!(
+            app.consent.devtools_slot_idle_for_test(),
+            "no worker was dispatched for it"
+        );
+        // A cold one is read on the worker, which finds no bundle id.
+        app.consent.probes.subject = no_subject;
+        app.consent.probes.warm_subject = no_subject;
+        assert!(row(&app).contains(" probe=pending "), "{}", row(&app));
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the worker publishes");
+        assert!(
+            row(&app).contains(" subject=- ") && row(&app).contains(" probe=refused_no_subject "),
+            "{}",
+            row(&app)
+        );
+        assert_eq!(RUNS.load(Ordering::Acquire), 0, "nothing was spawned");
+
+        // The positive control: the same App, everything allowing it, runs it.
+        app.consent.probes.subject = fake_subject;
+        app.consent.invalidate_devtools();
+        app.consent.shared.devtools.lock_or_recover().retry_after = None;
+        assert!(row(&app).contains(" probe=pending "), "{}", row(&app));
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the worker publishes");
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+        assert!(row(&app).contains(" probe=observed "), "{}", row(&app));
+    }
+
+    /// The identity is read on the Developer Tools worker, never on the
+    /// reading thread: with the `subject` arm cold (`None`), as it is on a
+    /// window whose access card never ran, the row is `pending`, and the worker
+    /// reads the warming arm and runs the probe for that bundle id; the row
+    /// then names it. The negative control: a warming arm with no bundle id
+    /// answers `refused_no_subject` and runs no probe.
+    #[test]
+    fn a_cold_identity_is_read_on_the_devtools_worker() {
+        use std::sync::atomic::AtomicUsize;
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        static WARMS: AtomicUsize = AtomicUsize::new(0);
+        static SUBJECT_SEEN: Mutex<Option<String>> = Mutex::new(None);
+        fn counting(_gate: ProbeGate, subject: &str) -> DevToolProbe {
+            *SUBJECT_SEEN.lock().unwrap_or_else(|p| p.into_inner()) = Some(subject.to_owned());
+            fake_devtools(&RUNS, 0)
+        }
+        fn cold_identity() -> Option<&'static str> {
+            None
+        }
+        fn warming() -> Option<&'static str> {
+            WARMS.fetch_add(1, Ordering::AcqRel);
+            fake_subject()
+        }
+        fn warming_to_nothing() -> Option<&'static str> {
+            WARMS.fetch_add(1, Ordering::AcqRel);
+            None
+        }
+        let mut state = ConsentState::inert();
+        state.set_devtools_arms_for_test(counting, cold_identity);
+        state.probes.warm_subject = warming;
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_devtools_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let wait = || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the worker publishes")
+        };
+
+        let first = state.devtools(ProbeGate::on(), false);
+        assert!(first.pending(), "a cold identity is not refused: {first:?}");
+        assert_eq!(first.subject, None);
+        wait();
+        let warm = state.devtools(ProbeGate::on(), false);
+        assert_eq!(warm.probe.label, DevToolProbeLabel::Observed);
+        assert_eq!(
+            warm.subject,
+            Some("com.example.subject"),
+            "the row names what the worker asked about"
+        );
+        assert_eq!(
+            SUBJECT_SEEN
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_deref(),
+            Some("com.example.subject")
+        );
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+        assert_eq!(WARMS.load(Ordering::Acquire), 1);
+
+        // The negative control: the identity holds no bundle id.
+        state.probes.warm_subject = warming_to_nothing;
+        state.invalidate_devtools();
+        state.shared.devtools.lock_or_recover().retry_after = None;
+        assert!(state.devtools(ProbeGate::on(), false).pending());
+        wait();
+        let none = state.devtools(ProbeGate::on(), false);
+        assert_eq!(
+            none.probe,
+            DevToolProbe::refused(DevToolProbeLabel::RefusedNoSubject)
+        );
+        assert_eq!(none.subject, None);
+        assert_eq!(WARMS.load(Ordering::Acquire), 2);
+        assert_eq!(RUNS.load(Ordering::Acquire), 1, "no bundle id, no log show");
+    }
+
+    /// Only the full report (and the visible Security page) dispatches the
+    /// Developer Tools worker: `status`'s `session_consent`, the FDA `await
+    /// consent` tuple, the debugger tuple, `debugger_cached` and
+    /// `devtools_cached` (a hidden Security page's read) are polled,
+    /// and none may start a `log show`, even with the gate open, the observer
+    /// on, a subject and a live-flagged counting arm. The positive control is
+    /// the same App's `Lines` read, which does dispatch.
+    #[test]
+    fn the_polled_consent_paths_never_dispatch_the_devtools_probe() {
+        use std::sync::atomic::AtomicUsize;
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn counting(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+            fake_devtools(&RUNS, 0)
+        }
+        fn quiet_debugger(_gate: ProbeGate) -> DebuggerProbe {
+            DebuggerProbe::refused(DebuggerProbeLabel::StatusUnrecognized)
+        }
+        let mut app = crate::App::headless_for_test();
+        app.consent.probes.live = true;
+        app.consent.probes.devtools = counting;
+        app.consent.probes.debugger = quiet_debugger;
+        app.consent.probes.subject = fake_subject;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.consent.set_devtools_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        assert!(app.consent_policy().gate.permits());
+        let slot_idle = |app: &crate::App| {
+            let slot = app.consent.shared.devtools.lock_or_recover();
+            !slot.in_flight && slot.entry.is_none()
+        };
+        for _ in 0..3 {
+            let _ = app.read_privacy(PrivacyForm::Tuple(0), Scope::Owner);
+            let _ = app.read_privacy(PrivacyForm::DebuggerTuple(0), Scope::Owner);
+            let _ = app.session_consent(0, None);
+            let _ = app.consent.debugger_cached(ProbeGate::on());
+            let _ = app.consent.devtools_cached(ProbeGate::on(), false);
+        }
+        assert_eq!(RUNS.load(Ordering::Acquire), 0, "a poll spawned the probe");
+        assert!(slot_idle(&app), "a poll left a devtools worker in flight");
+
+        let _ = app.read_privacy(PrivacyForm::Lines, Scope::Owner);
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the full report's worker publishes");
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+        assert!(!slot_idle(&app), "the full report's answer is cached");
+    }
+
+    /// `await consent kind=debugger` end to end on the read path, with a fake
+    /// probe arm standing in for `DevToolsSecurity -status`: a cold slot is
+    /// pending and arms nothing; the first completed reading is the baseline
+    /// and cannot latch; twenty more polls inside `DEBUGGER_TTL` run the probe
+    /// no further time; a retired answer (the owner's change re-probing, or
+    /// focus gain) is pending again, not a change; and the re-read that
+    /// reports another mode latches `debugger_mode=enabled`. An answer past
+    /// the TTL is refreshed by one worker, however many polls ask. The FDA
+    /// tuple the same App serves never moves with it, and a wait addressed
+    /// through a session that is gone is `Exited`.
+    #[test]
+    fn await_consent_kind_debugger_latches_on_a_mode_change_without_a_probe_per_poll() {
+        use std::sync::atomic::{AtomicU8, AtomicUsize};
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        /// 0 = disabled, 1 = enabled: what the fake `-status` reports.
+        static MODE: AtomicU8 = AtomicU8::new(0);
+        fn fake_status(_gate: ProbeGate) -> DebuggerProbe {
+            RUNS.fetch_add(1, Ordering::AcqRel);
+            DebuggerProbe {
+                mode: if MODE.load(Ordering::Acquire) == 0 {
+                    DebuggerMode::Disabled
+                } else {
+                    DebuggerMode::Enabled
+                },
+                member: DebuggerMember::Admin,
+                label: DebuggerProbeLabel::StatusOk,
+            }
+        }
+        fn hardened() -> SelfHardening {
+            SelfHardening::Hardened
+        }
+        let mut app = crate::App::headless_for_test();
+        app.consent.probes.live = true;
+        app.consent.probes.debugger = fake_status;
+        app.consent.probes.hardening = hardened;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.consent.set_debugger_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let published = || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the worker publishes")
+        };
+        // Step past the retry floor rather than race it.
+        let clear_floor = |app: &crate::App| {
+            app.consent
+                .shared
+                .debugger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retry_after = None;
+        };
+        let observe = |app: &crate::App| {
+            consent_observation(
+                app.read_privacy(PrivacyForm::DebuggerTuple(0), Scope::Owner)
+                    .lines,
+            )
+        };
+        let now = Instant::now();
+        let mut wait = ConsentWait::new(now, Duration::from_secs(300));
+
+        // Cold: pending, and pending never arms the baseline.
+        assert_eq!(observe(&app), ConsentObservation::Pending);
+        assert_eq!(
+            wait.observe_at(ConsentObservation::Pending, now),
+            ConsentWaitDecision::Wait
+        );
+        published();
+        // The first completed reading arms the baseline; it cannot latch.
+        let baseline = observe(&app);
+        assert_eq!(
+            baseline,
+            ConsentObservation::Complete("debugger_mode=disabled".to_string())
+        );
+        assert_eq!(wait.observe_at(baseline, now), ConsentWaitDecision::Wait);
+        // Polls inside the TTL are served from the slot: no probe per poll,
+        // even with the rule changed underneath (only a re-read can see it).
+        MODE.store(1, Ordering::Release);
+        for _ in 0..20 {
+            clear_floor(&app);
+            let same = observe(&app);
+            assert_eq!(wait.observe_at(same, now), ConsentWaitDecision::Wait);
+        }
+        assert_eq!(RUNS.load(Ordering::Acquire), 1, "a poll spawned the probe");
+
+        // The owner's change re-probes by retiring the answer: pending again,
+        // which is not a change, then the fresh reading latches.
+        app.consent.invalidate_debugger();
+        clear_floor(&app);
+        let retired = observe(&app);
+        assert_eq!(retired, ConsentObservation::Pending);
+        assert_eq!(wait.observe_at(retired, now), ConsentWaitDecision::Wait);
+        published();
+        let fresh = observe(&app);
+        assert_eq!(
+            wait.observe_at(fresh, now),
+            ConsentWaitDecision::Changed("debugger_mode=enabled".to_string())
+        );
+        assert_eq!(RUNS.load(Ordering::Acquire), 2);
+
+        // Past the TTL, one worker refreshes the answer (served, with its age,
+        // meanwhile), however many polls ask while it is out.
+        {
+            let mut slot = app
+                .consent
+                .shared
+                .debugger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let entry = slot.entry.as_mut().expect("a cached answer");
+            entry.1 = Instant::now()
+                .checked_sub(DEBUGGER_TTL + Duration::from_secs(1))
+                .expect("the clock is past one TTL");
+            slot.retry_after = None;
+        }
+        for _ in 0..5 {
+            assert_eq!(
+                observe(&app),
+                ConsentObservation::Complete("debugger_mode=enabled".to_string()),
+                "a stale answer is served while it refreshes"
+            );
+        }
+        published();
+        assert_eq!(RUNS.load(Ordering::Acquire), 3, "one refresh per TTL");
+
+        // The FDA tuple is untouched by debugger churn, so its waiters are
+        // never woken by it.
+        assert!(
+            !app.read_privacy(PrivacyForm::Tuple(0), Scope::Owner)
+                .lines
+                .concat()
+                .contains("debugger"),
+            "the FDA tuple carries no debugger field"
+        );
+        // A session that is gone ends the wait.
+        assert_eq!(
+            consent_observation(
+                app.read_privacy(PrivacyForm::DebuggerTuple(999), Scope::Owner)
+                    .lines
+            ),
+            ConsentObservation::Exited
+        );
+        assert_eq!(
+            wait.observe_at(ConsentObservation::Exited, now),
+            ConsentWaitDecision::Exited
+        );
+    }
+
+    /// A closed gate and an inert (headless) instance never read the rule, so
+    /// `await consent kind=debugger` can only time out there: no reading ever
+    /// arms a baseline, and nothing is spawned.
+    #[test]
+    fn await_consent_kind_debugger_never_latches_without_a_reading() {
+        let app = crate::App::headless_for_test();
+        assert!(
+            !app.consent.probes.live,
+            "a headless app has the inert arms"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                consent_observation(
+                    app.read_privacy(PrivacyForm::DebuggerTuple(0), Scope::Owner)
+                        .lines
+                ),
+                ConsentObservation::Pending
+            );
+        }
+        let mut closed = crate::App::headless_for_test();
+        closed.consent.probes.live = true;
+        closed.config.privacy = Some(crate::app_config::PrivacyConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(
+            consent_observation(
+                closed
+                    .read_privacy(PrivacyForm::DebuggerTuple(0), Scope::Owner)
+                    .lines
+            ),
+            ConsentObservation::Pending
+        );
+        assert!(
+            closed
+                .consent
+                .shared
+                .debugger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry
+                .is_none()
+                && !closed
+                    .consent
+                    .shared
+                    .debugger
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .in_flight,
+            "a closed gate dispatches nothing"
         );
     }
 
@@ -3333,7 +5035,7 @@ mod tests {
         assert_eq!(off.fs_consent, FsConsent::Unknown);
         assert!(!off.at_risk);
 
-        let lines = app.read_privacy(PrivacyForm::Lines).lines;
+        let lines = app.read_privacy(PrivacyForm::Lines, Scope::Owner).lines;
         assert!(
             lines
                 .iter()
@@ -3352,10 +5054,9 @@ mod tests {
         );
     }
 
-    /// The `[privacy]` resolvers are the ones consulted — not a constant in
-    /// this file. `warmup=` echoes the configured mode, and
-    /// `report_attribution = false` removes the corroboration COLUMN (the
-    /// observer row says `off`) without touching any verdict.
+    /// The `[privacy]` resolvers are consulted: `warmup=` echoes the configured
+    /// mode, and `report_attribution = false` removes the corroboration column
+    /// (observer `off`) without touching any verdict.
     #[test]
     fn the_report_reads_the_privacy_config_section() {
         let mut app = crate::App::headless_for_test();
@@ -3364,7 +5065,7 @@ mod tests {
             report_attribution: Some(false),
             ..Default::default()
         });
-        let lines = app.read_privacy(PrivacyForm::Lines).lines;
+        let lines = app.read_privacy(PrivacyForm::Lines, Scope::Owner).lines;
         assert!(
             lines.iter().any(|l| l.starts_with("warmup=never ")),
             "{lines:?}"
@@ -3385,15 +5086,8 @@ mod tests {
         );
     }
 
-    /// The three services added 2026-09-19 are on the roster, are reported
-    /// `uncovered` in EVERY posture, and are not folder rows.
-    ///
-    /// Each has its own System Settings pane and Full Disk Access subsumes none
-    /// of them, so `unmeasured` would be the wrong bucket even after §7 S4 —
-    /// this is "the grant does not reach here", not "we have not looked". The
-    /// roster was silent about all three until today, which is how a class the
-    /// owner had already been prompted for (the media library) could be
-    /// invisible to the verb an agent reads to decide whether a wall exists.
+    /// The three services Full Disk Access never subsumes are on the roster,
+    /// `uncovered` in every posture, and not folder rows.
     #[test]
     fn the_three_services_fda_does_not_subsume_are_named_and_never_covered() {
         for service in ["media-library", "photos", "app-bundles"] {
@@ -3410,8 +5104,7 @@ mod tests {
                 "{service} is not a folder row: it has no $HOME-relative path"
             );
         }
-        // True in every posture, measured or not, granted or not — that is what
-        // separates `uncovered` from `unmeasured`.
+        // In every posture: what separates `uncovered` from `unmeasured`.
         for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
             for evidence in [
                 SpikeEvidence::UNMEASURED,
@@ -3419,6 +5112,7 @@ mod tests {
                     fda_coverage_measured: true,
                     handoff_attribution_measured: false,
                     fda_scope: FdaScope::ThisProcess,
+                    ..SpikeEvidence::UNMEASURED
                 },
             ] {
                 let split = covers_split(fda, evidence);
@@ -3431,10 +5125,9 @@ mod tests {
         }
     }
 
-    /// A grant that cannot be VALIDATED is reported as such, on its own row:
-    /// `running=` is the exec-time path and reads healthy after a swap, and
-    /// `full_disk_access=granted` can be true at the same moment and mean
-    /// nothing, so the note keys on the anchor rather than the probe.
+    /// A grant that cannot be validated gets its own row, keyed on the anchor:
+    /// `running=` and `full_disk_access=granted` can both read healthy after a
+    /// swap.
     #[test]
     fn an_unvalidatable_identity_is_reported_and_does_not_hide_behind_a_granted_probe() {
         use aterm_containment::ImageAnchor;
@@ -3509,21 +5202,26 @@ mod tests {
         }
     }
 
-    /// The observer row reports the observer's own state (`off` by default,
-    /// never a fixed `unavailable`), the remediate row names only the two
-    /// Settings panes, and the closing note is pct-encoded like every other
-    /// free-text row.
+    /// The observer row reports its own state (`off` by default), the remediate
+    /// row names only places (three Settings panes and aterm's Security page),
+    /// and the closing note is pct-encoded.
     #[test]
     fn the_observer_remediate_and_note_rows_say_what_is_true() {
         let lines = snapshot(1, FdaState::Denied, SpikeEvidence::UNMEASURED).lines();
         assert!(
-            lines.contains(&"observer fda=ok responsible=ok log=off".to_string()),
+            lines.contains(&"observer fda=ok responsible=ok log=off taskport=off".to_string()),
             "{lines:?}"
         );
+        // `debugger=` names a place in aterm, never a command: an enable token
+        // would hand an in-session agent the switch (design §4.1). The place is
+        // the Security page's debugger row, where only the owner's press acts.
+        // `devtools=` is the System Settings list only a human changes: no
+        // command a program could run adds aterm to it.
         assert!(
             lines.contains(
                 &"remediate fda=settings:Privacy_AllFiles \
-                  files=settings:Privacy_FilesAndFolders"
+                  files=settings:Privacy_FilesAndFolders debugger=aterm-settings:security \
+                  devtools=settings:Privacy_DevTools"
                     .to_string()
             ),
             "{lines:?}"
@@ -3550,11 +5248,76 @@ mod tests {
         for key in [
             "\"folders\":{",
             "\"sessions\":[",
+            "\"debugger\":{",
+            "\"devtools\":{",
             "\"observers\":{",
             "\"remediate\":{",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }
+        // The devtools object follows the debugger's, as the text row does.
+        assert!(
+            json.contains(
+                "\"devtools\":{\"state\":\"unlisted\",\"subject\":\"com.aterm.aterm\",\
+                 \"requests\":233,\"not_allowed\":233,\"answer_age_ms\":4100,\"window_s\":600,\
+                 \"probe\":\"observed\",\"probe_age_ms\":812},"
+            ),
+            "{json}"
+        );
+        // The debugger object sits where the text row does: after `warmup`,
+        // before `observers`.
+        let at = |key: &str| json.find(key).unwrap_or_else(|| panic!("{key} in {json}"));
+        assert!(at("\"warmup\":{") < at("\"debugger\":{"), "{json}");
+        assert!(at("\"debugger\":{") < at("\"devtools\":{"), "{json}");
+        assert!(at("\"devtools\":{") < at("\"observers\":{"), "{json}");
+        assert!(
+            json.contains(
+                "\"debugger\":{\"mode\":\"disabled\",\"member\":\"admin\",\"self_hardened\":\"yes\",\
+                 \"right\":\"system.privilege.taskport.debug\",\"probe\":\"status_ok\",\
+                 \"probe_age_ms\":1204,\"pending\":\"off\",\"pending_right\":null,\
+                 \"pending_age_ms\":null,\"last\":null,\"watch_ms\":null},"
+            ),
+            "{json}"
+        );
+        assert!(
+            json.contains(
+                "\"observers\":{\"fda\":\"ok\",\"responsible\":\"ok\",\"log\":\"off\",\
+                 \"taskport\":\"off\"},"
+            ),
+            "{json}"
+        );
+        assert!(
+            json.contains(
+                "\"remediate\":{\"fda\":\"settings:Privacy_AllFiles\",\
+                 \"files\":\"settings:Privacy_FilesAndFolders\",\
+                 \"debugger\":\"aterm-settings:security\",\
+                 \"devtools\":\"settings:Privacy_DevTools\"},"
+            ),
+            "{json}"
+        );
+        // The same keys in every state: a row with nothing observed carries
+        // null where the text form prints `-`, and drops no key.
+        let mut unobserved = snapshot(2, FdaState::Denied, SpikeEvidence::UNMEASURED);
+        unobserved.debugger = DebuggerRow::refused(DebuggerProbeLabel::Pending);
+        unobserved.devtools = DevToolsRow::refused(DevToolProbeLabel::Pending, None);
+        let pending = cmd_privacy_json(&unobserved);
+        assert!(
+            pending.contains(
+                "\"devtools\":{\"state\":\"unknown\",\"subject\":null,\"requests\":null,\
+                 \"not_allowed\":null,\"answer_age_ms\":null,\"window_s\":600,\
+                 \"probe\":\"pending\",\"probe_age_ms\":null},"
+            ),
+            "{pending}"
+        );
+        assert!(
+            pending.contains(
+                "\"debugger\":{\"mode\":\"unknown\",\"member\":\"unknown\",\
+                 \"self_hardened\":\"unknown\",\"right\":\"system.privilege.taskport.debug\",\
+                 \"probe\":\"pending\",\"probe_age_ms\":null,\"pending\":\"off\",\
+                 \"pending_right\":null,\"pending_age_ms\":null,\"last\":null,\"watch_ms\":null},"
+            ),
+            "{pending}"
+        );
         assert!(json.contains("\"cwd\":\"/Users//a b/src\""), "{json}");
         assert!(json.contains("\"sessions_total\":2"), "{json}");
         assert!(json.contains("\"prompt_possible\":true"), "{json}");
@@ -3608,9 +5371,8 @@ mod tests {
         }
     }
 
-    /// The verb's grammar: the flag in both spellings, and an honest usage
-    /// error for anything else — a caller must be able to tell a wrong guess
-    /// from a no-op.
+    /// The verb's grammar: the flag in both spellings, and a usage error for
+    /// anything else.
     #[test]
     fn the_verb_takes_only_the_json_flag() {
         assert_eq!(parse_privacy_form(""), Ok(PrivacyForm::Lines));
@@ -3624,20 +5386,101 @@ mod tests {
 
     /// `await consent`'s deadline: finite by default (the dialog it waits
     /// behind never expires), capped with the rest of the wait family, and
-    /// accepting both spellings the family uses.
+    /// accepting both spellings the family uses — for either kind.
     #[test]
     fn await_consent_has_a_finite_default_and_a_shared_ceiling() {
-        assert_eq!(parse_consent_timeout("consent"), Ok(300_000));
-        assert_eq!(parse_consent_timeout(""), Ok(300_000));
-        assert_eq!(parse_consent_timeout("consent timeout=1500"), Ok(1_500));
-        assert_eq!(parse_consent_timeout("consent timeout 1500"), Ok(1_500));
+        let fda = |timeout_ms| {
+            Ok(ConsentArgs {
+                kind: ConsentKind::Fda,
+                timeout_ms,
+            })
+        };
+        let debugger = |timeout_ms| {
+            Ok(ConsentArgs {
+                kind: ConsentKind::Debugger,
+                timeout_ms,
+            })
+        };
+        assert_eq!(parse_consent_args("consent"), fda(300_000));
+        assert_eq!(parse_consent_args(""), fda(300_000));
+        assert_eq!(parse_consent_args("consent timeout=1500"), fda(1_500));
+        assert_eq!(parse_consent_args("consent timeout 1500"), fda(1_500));
         assert_eq!(
-            parse_consent_timeout("consent timeout=99999999"),
-            Ok(600_000),
+            parse_consent_args("consent timeout=99999999"),
+            fda(600_000),
             "capped with `await`/`ready`"
         );
-        assert!(parse_consent_timeout("consent idle 10").is_err());
-        assert!(parse_consent_timeout("consent timeout=soon").is_err());
+        assert!(parse_consent_args("consent idle 10").is_err());
+        assert!(parse_consent_args("consent timeout=soon").is_err());
+
+        // `kind=debugger`, in either order, with the same default and cap.
+        assert_eq!(
+            parse_consent_args("consent kind=debugger"),
+            debugger(300_000)
+        );
+        assert_eq!(
+            parse_consent_args("consent kind=debugger timeout=2500"),
+            debugger(2_500)
+        );
+        assert_eq!(
+            parse_consent_args("consent timeout 2500 kind=debugger"),
+            debugger(2_500)
+        );
+        assert_eq!(
+            parse_consent_args("consent kind=debugger timeout=99999999"),
+            debugger(600_000)
+        );
+        // An unknown kind, or `kind` spelt apart, is the usage line — never a
+        // silent fall back to the FDA tuple.
+        let usage = "ERR usage: await consent [kind=debugger] [timeout=<ms>]\n".to_string();
+        for bad in [
+            "consent kind=fda",
+            "consent kind=",
+            "consent kind debugger",
+            "consent kind=Debugger",
+            "consent kind=debugger timeout=soon",
+        ] {
+            assert_eq!(parse_consent_args(bad), Err(usage.clone()), "{bad:?}");
+        }
+    }
+
+    /// The debugger tuple is `debugger_mode=` alone, and a reading that
+    /// observed no mode is the internal pending marker — which the waiter
+    /// treats as neither a baseline nor a change.
+    #[test]
+    fn the_debugger_tuple_is_the_observed_mode_only() {
+        let probe = |mode, label| DebuggerProbe {
+            mode,
+            member: DebuggerMember::Admin,
+            label,
+        };
+        assert_eq!(
+            debugger_tuple_line(probe(DebuggerMode::Disabled, DebuggerProbeLabel::StatusOk)),
+            "debugger_mode=disabled"
+        );
+        assert_eq!(
+            debugger_tuple_line(probe(DebuggerMode::Enabled, DebuggerProbeLabel::StatusOk)),
+            "debugger_mode=enabled"
+        );
+        assert_eq!(
+            debugger_tuple_line(probe(
+                DebuggerMode::Unrecognized,
+                DebuggerProbeLabel::StatusOk
+            )),
+            "debugger_mode=unrecognized"
+        );
+        for label in [
+            DebuggerProbeLabel::Pending,
+            DebuggerProbeLabel::RefusedDisabled,
+            DebuggerProbeLabel::TimedOut,
+            DebuggerProbeLabel::StatusUnrecognized,
+        ] {
+            assert_eq!(
+                consent_observation(vec![debugger_tuple_line(DebuggerProbe::refused(label))]),
+                ConsentObservation::Pending,
+                "{label:?} observed no mode"
+            );
+        }
     }
 
     /// The tuple `await consent` arms on is the three values the contract
@@ -3727,6 +5570,27 @@ mod tests {
             (probes.responsible)(1),
             Err(ResponsibleError::Unsupported),
             "the SPI is not consulted either"
+        );
+        // Nor is `DevToolsSecurity`, nor `csops`: the inert debugger arms name
+        // a configuration, never an answer about the rule.
+        assert_eq!(
+            (probes.debugger)(ProbeGate::on()),
+            DebuggerProbe::refused(DebuggerProbeLabel::RefusedDisabled)
+        );
+        assert_eq!((probes.hardening)(), SelfHardening::Unknown);
+        // The off-macOS arm says `unsupported_platform`, and a closed gate
+        // still reads as configuration.
+        assert_eq!(
+            unsupported_debugger_probe(ProbeGate::on()).label,
+            DebuggerProbeLabel::UnsupportedPlatform
+        );
+        assert_eq!(
+            unsupported_debugger_probe(ProbeGate {
+                enabled: false,
+                check: true
+            })
+            .label,
+            DebuggerProbeLabel::RefusedDisabled
         );
         // `for_instance` picks the arm from the one bit that decides it.
         assert!(!ConsentProbes::for_instance(true).live);
@@ -3879,9 +5743,8 @@ mod asynchronous_probe_tests {
                     state.next_refresh_deadline(at, ttl),
                     Some(now + PROBE_RETRY_FLOOR)
                 );
-                // Historical invalidation cleared the deadline. Projecting
-                // that implementation makes the model fail before another
-                // worker could even be admitted.
+                // An invalidation that clears the deadline fails the model
+                // before another worker could be admitted.
                 let mut cleared_floor = expected.clone();
                 cleared_floor.insert("ready", 1);
                 assert!(!model.check_invariant("FloorSurvivesInvalidation", &cleared_floor));
@@ -4347,7 +6210,7 @@ mod asynchronous_probe_tests {
         fixture.entered.send(()).unwrap();
         fixture
             .release
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .unwrap();
         grant()
     }
@@ -4376,7 +6239,9 @@ mod asynchronous_probe_tests {
             state.fda(ProbeGate::on(), ttl, "dr").0.label,
             ProbeLabel::Pending
         );
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        entered_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap();
         // There is no elapsed-time assertion: reaching the release below while
         // the worker waits is the nonblocking witness, even on a loaded box.
         for _ in 0..100 {
@@ -4389,7 +6254,7 @@ mod asynchronous_probe_tests {
         assert!(state.shared.slot.lock().unwrap().in_flight);
         assert_eq!(BLOCKED_CALLS.load(Ordering::SeqCst), 1);
         release_tx.send(()).unwrap();
-        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        done_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
         assert!(!state.shared.slot.lock().unwrap().in_flight);
         assert!(
             state.shared.slot.lock().unwrap().entry.is_none(),

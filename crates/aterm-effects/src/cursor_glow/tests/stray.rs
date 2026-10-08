@@ -5,27 +5,16 @@
 
 use super::*;
 
-// ---- THE STRAY THE FRESH HINT LICENSES ---------------------
+// ---- The stray a fresh hint could license ---------------------
 //
-// The anti-stray control above covers two arms — "no key at all" and "a
-// STALE hint". The THIRD arm was never written: a hint that is FRESH and
-// that the key never spent, because the key moved nothing (Ctrl-E at the
-// end of the line — D11's own named case) or because its echo has not
-// landed yet. For 250 ms after such a press the program's OWN caret
-// relocation wore the key's licence.
-//
-// THE FIRST FIX-UP'S PROBE FIXED ONE TIMING and passed by construction:
-// it presented the caret at rest until 100 ms after the press, the one
-// value in the neighbourhood past `NAV_NOOP_SETTLE_MS` = 80. That bound
-// can only bite once a presented frame CATCHES the caret at rest more
-// than 80 ms after the press — and a spinner that repaints sooner (a PTY
-// round trip is 12-40 ms and the hide follows it) never lets it. So the
-// probe is swept over the SETTLE window — how long frames still see the
-// caret at rest before the repaint hides it — and over the LANDING time.
-// What the sweep found: no bound on TIME separates a relocation inside
-// the echo window from the echo itself; the cross-row strays are refused
-// by SHAPE (`BridgeReach::line_start`), and the same-row one is Ctrl-A's
-// own frames and stays licensed, which the last law below says plainly.
+// Beyond "no key" and "a stale hint", a fresh hint the key never spent (the
+// key moved nothing, e.g. Ctrl-E at end of line, or its echo has not landed)
+// must not license the program's own caret relocation. The probe is swept
+// over the settle window (how long frames still see the caret at rest before
+// the repaint hides it) and the landing time. No time bound separates a
+// relocation inside the echo window from the echo itself: cross-row strays
+// are refused by shape (`BridgeReach::line_start`), and the same-row case is
+// indistinguishable from Ctrl-A's own frames and stays licensed.
 
 /// Which key, if any, stands behind the relocation the probe replays.
 #[derive(Clone, Copy, Debug)]
@@ -35,10 +24,9 @@ enum StrayArm {
     /// (B) The pinned control's twin: a TYPED key, whose bridge is capped
     /// at `HIDE_BRIDGE_TYPED_MAX_DIST` and cannot reach the target.
     TypedKey,
-    /// (C) THE DEFECT: a NAVIGATION key that moved nothing — the caret
-    /// sits at its own cell for as long as the settle window says — and
-    /// then the app's spinner repaint hides and re-shows the caret
-    /// somewhere else, inside the 250 ms licence window.
+    /// (C) A navigation key that moved nothing: the caret sits at its own
+    /// cell for the settle window, then the app's spinner repaint hides and
+    /// re-shows it elsewhere, inside the licence window.
     NavKeyThatMovedNothing,
 }
 
@@ -64,14 +52,11 @@ impl StrayTiming {
     }
 }
 
-/// What one probe arm produced: the light engine's spawns and voices, and
-/// the classic bed's VERDICT on the same relocation. The two engines are
-/// driven through the SAME frames because they must make the same source
-/// decision — the opaque bed and the additive light desynchronize on any
-/// move they disagree about. The bed's verdict is a tally, not a pixel
-/// count: a nav-paired move lays no comet by design, so its cells read 0
-/// whether it bridged the landing or refused it (the first fix-up's arm
-/// was vacuous for exactly that reason).
+/// What one probe arm produced: the light engine's spawns and voices, and the
+/// classic bed's verdict on the same relocation. Both are driven through the
+/// same frames because they must make the same source decision. The bed's
+/// verdict is a tally, not a pixel count: a nav-paired move lays no comet, so
+/// its cells read 0 whether it bridged the landing or refused it.
 #[derive(Default, PartialEq, Eq, Debug)]
 struct StrayOutcome {
     spawns: u64,
@@ -203,12 +188,10 @@ fn stray_probe(arm: StrayArm, target: (u16, u16), timing: StrayTiming) -> StrayO
     }
 }
 
-/// The bed's verdict is not vacuous: the SAME probe, driven through the
-/// Ink shape the nav bridge exists for — a word key whose echo lands
-/// across a hide, four cells on — reads one BRIDGED relocation in the
-/// classic bed and one licensed spawn in the light. Without this control
-/// the trail arm of the laws below could return to reading 0 for every
-/// reason at once.
+/// The bed's verdict is not vacuous: the same probe driven through the Ink
+/// shape the nav bridge exists for (a word key whose echo lands across a hide,
+/// four cells on) reads one bridged relocation in the classic bed and one
+/// licensed spawn in the light.
 #[test]
 fn the_stray_probe_s_bed_bridges_a_real_word_hop_across_a_repaint() {
     let mut bed = StrayBed::new();
@@ -232,18 +215,13 @@ fn the_stray_probe_s_bed_bridges_a_real_word_hop_across_a_repaint() {
     assert!(bed.cells.is_empty());
 }
 
-/// (7) A FRESH NAV HINT IS NOT A LICENCE FOR THE PROGRAM'S OWN CROSS-ROW
-/// RELOCATION, AT ANY REPAINT PHASE.
+/// (7) A fresh nav hint does not license the program's own cross-row
+/// relocation, at any repaint phase.
 ///
-/// Three arms over one identical relocation, swept over the settle window
-/// (0 to 100 ms: from a hide that lands before any frame could catch the
-/// caret at rest, to the first fix-up's single timing) and over five
-/// targets — four inside the 4-row ceiling, where geometry alone admits
-/// them, and the owner's measured `(2,42)->(9,3)` beyond it. Arms A and B
-/// are the standing law. Arm C was RED at every settle at or below 80 ms
-/// on the four near targets before the line-gesture shape: `(4,90)`,
-/// `(5,88)` and `(6,3)` each minted 1 spawn and 1 meteor, and `(0,30)`
-/// the same, with `aterm ctl trail` naming the key as the author.
+/// Three arms over one relocation, swept over the settle window (0 to 100 ms)
+/// and five targets: four inside the 4-row ceiling, where geometry alone
+/// admits them, and `(2,42)->(9,3)` beyond it. Arm C is refused by the
+/// line-gesture shape.
 #[test]
 fn a_nav_key_that_moved_nothing_licenses_no_cross_row_relocation_at_any_repaint_phase() {
     let targets = [
@@ -271,20 +249,15 @@ fn a_nav_key_that_moved_nothing_licenses_no_cross_row_relocation_at_any_repaint_
     }
 }
 
-/// (8) …AND THE SAME-ROW ONE IS CTRL-A'S OWN FRAMES. From `(2,42)`, a
-/// hidden→visible landing at `(2,3)` under a fresh nav hint is exactly
-/// what Ctrl-A on a Claude Code line looks like through an Ink repaint
-/// (the box starts at column 2-3), and `(2,99)` is Ctrl-E's; no frame,
-/// and no byte the host sees, separates a spinner that re-laid the caret
-/// there from the key's echo. So THIS LAW STATES THE RESIDUAL RATHER THAN
-/// HIDING IT: inside the echo window the landing is LICENSED — that is
-/// the word-move fix, and narrowing it would silence Ctrl-A across every
-/// repaint — and only the clock refuses it: a frame that saw the caret
-/// still at rest more than `NAV_NOOP_SETTLE_MS` after the press, or a
-/// landing later than `NAV_BRIDGE_LANDING_MS`. The exposure that remains
-/// is a relocation along the caret's own row, or one row off it, inside
-/// 150 ms of a nav key that moved nothing, when no frame caught the caret
-/// at rest first. The 250 ms it was before this round is 150 now.
+/// (8) The same-row relocation is Ctrl-A's own frames. From `(2,42)`, a
+/// hidden→visible landing at `(2,3)` under a fresh nav hint is exactly Ctrl-A
+/// on a Claude Code line through an Ink repaint, and `(2,99)` is Ctrl-E's; no
+/// byte the host sees separates them. So this law states the residual: inside
+/// the echo window the landing is licensed, and only the clock refuses it (a
+/// frame that saw the caret at rest more than `NAV_NOOP_SETTLE_MS` after the
+/// press, or a landing later than `NAV_BRIDGE_LANDING_MS`). The remaining
+/// exposure is a relocation on the caret's row or one row off, within 150 ms
+/// of a nav key that moved nothing, when no frame caught the caret at rest.
 #[test]
 fn a_same_row_landing_inside_the_echo_window_is_ctrl_a_s_shape_and_only_the_clock_refuses_it() {
     let ms = |settle, landing| StrayTiming { settle, landing };
@@ -327,12 +300,9 @@ fn a_same_row_landing_inside_the_echo_window_is_ctrl_a_s_shape_and_only_the_cloc
     }
 }
 
-/// (9) …AND A REFUSED STRAY MUST NOT EAT THE STAMP. The worst face of the
-/// defect: the stray consumed the nav hint, so the word hop the owner
-/// actually pressed landed a frame later UNLICENSED and SILENT — the very
-/// failure the nav bridge exists to fix, defeated in its own shape. Driven
-/// at the first fix-up's timing AND under a fast repaint, on the review's
-/// two near faces.
+/// (9) A refused stray must not eat the stamp, or the word hop actually
+/// pressed would land a frame later unlicensed and silent. Driven at a slow
+/// and a fast repaint, on the two near faces.
 #[test]
 fn a_refused_stray_leaves_the_word_key_its_own_licence() {
     for (target, settle) in [((9u16, 3u16), 100u64), ((5, 88), 40), ((6, 3), 0)] {
@@ -369,10 +339,9 @@ fn a_refused_stray_leaves_the_word_key_its_own_licence() {
     }
 }
 
-/// (10) AUTOREPEAT: holding Option+Left at the start of the line re-stamps
-/// the hint every 33 ms, so the caret is never seen at rest for 80 ms
-/// after a press and the settle bound structurally cannot bite. The
-/// repaint's relocation three rows down is refused by SHAPE alone.
+/// (10) Autorepeat: holding Option+Left at line start re-stamps the hint every
+/// 33 ms, so the settle bound cannot bite; the repaint's relocation three
+/// rows down is refused by shape alone.
 #[test]
 fn a_held_word_key_at_the_line_start_licenses_no_relocation_the_repaint_makes() {
     let mut bed = StrayBed::new();

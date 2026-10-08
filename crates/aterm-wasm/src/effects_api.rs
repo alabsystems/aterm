@@ -480,10 +480,8 @@ impl AtermTerminal {
     /// (supernova/sparkle), feline (peeking cat/paw), emphasis (ink-only;
     /// effective only while ink is enabled).
     ///
-    /// The third argument was the orca class's gate. The class was deleted on
-    /// 2026-09-27 (it had been suspended, so the gate already did nothing);
-    /// the argument is accepted and ignored so an embedder's existing
-    /// four-argument call keeps `emphasis` in the fourth position.
+    /// The third argument (the deleted orca class's gate) is ignored; it keeps
+    /// `emphasis` fourth for existing four-argument callers.
     pub fn set_sparkle_classes(
         &mut self,
         profanity: bool,

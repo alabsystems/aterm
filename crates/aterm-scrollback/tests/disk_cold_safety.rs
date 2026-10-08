@@ -72,7 +72,7 @@ fn find_last_page_data_offset(path: &std::path::Path) -> Option<u64> {
 }
 
 /// Corrupt the last page's compressed data in a `.dtrm` file by overwriting
-/// bytes *after* the Zstd frame magic (so `scan_and_repair_pages` still
+/// bytes *after* the Zstd frame magic (so `scan_pages` still
 /// accepts the page header, but decompression fails).
 fn corrupt_last_page_payload(path: &std::path::Path) {
     let data_offset =

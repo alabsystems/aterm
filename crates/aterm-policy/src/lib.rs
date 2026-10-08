@@ -27,17 +27,6 @@
 //! unmatched-default response, pinned by the refinement tests in `tests.rs`. See
 //! [`profiles::permissive`], [`profiles::standard`], [`profiles::hardened`].
 //!
-//! ## OriginTag
-//!
-//! The [`OriginTag`] enum is defined locally in this crate — its own 8-variant
-//! escape-gating trust lattice, deliberately NOT a re-export of the 6-variant
-//! `aterm_provenance::OriginTag` (a separate byte-taint lattice). The two have
-//! different bottoms ON PURPOSE: here `NetworkUntrusted` is the bottom and is
-//! load-bearing (the default profiles use it as the "allow from any origin"
-//! floor); in provenance the catch-all `Pty` is the bottom. The order is pinned by
-//! exhaustive proofs in `tests.rs`. `aterm-policy` does not depend on
-//! `aterm-provenance`. See the type-level note on [`OriginTag`] for the rationale.
-//!
 //! # Example
 //!
 //! ```
@@ -72,31 +61,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 // OriginTag — the policy engine's trust lattice.
 // ---------------------------------------------------------------------------
 
-/// The policy engine's trust tier for [`Rule::origin_min`] — its own lattice,
-/// deliberately NOT a re-export of `aterm_provenance::OriginTag`.
+/// The policy engine's trust tier for [`Rule::origin_min`].
 ///
-/// The original #8000 plan was to make this a re-export of the provenance tag.
-/// That is the wrong move and is deliberately not done: the two are SEPARATE
-/// lattices for SEPARATE subsystems, and forcing them together would break real
-/// behavior, not just rename a type.
-///
-/// - `aterm_provenance::OriginTag` (the byte-taint framework) has 6 variants and
-///   makes `Pty` — its catch-all for unclear provenance — the bottom.
-/// - This lattice (escape-sequence gating) has 8 variants (it additionally models
-///   `UserTyped` and `PtySafe`) and makes **`NetworkUntrusted` the bottom**.
-///
-/// `NetworkUntrusted` being the bottom here is **LOAD-BEARING, not incidental**:
-/// the default profiles use `origin_min = NetworkUntrusted` as the "allow from any
-/// origin" floor (e.g. the permissive `response any` rule — see `profiles.rs`).
-/// Flipping it to match provenance would silently re-gate every such rule. The
-/// escape-policy threat model here is "explicitly-remote bytes are the least
-/// trusted"; provenance's is "the unclassified catch-all is the least trusted".
-/// Both are coherent for their own purpose, so the lattices stay distinct.
-///
-/// The order is pinned by exhaustive proofs in `tests.rs`
-/// (`host_is_the_top_and_networkuntrusted_is_the_bottom`,
-/// `dominates_agrees_with_trust_rank_everywhere`, …): any accidental reordering or
-/// rank collision fails the suite rather than silently shifting policy outcomes.
+/// `NetworkUntrusted` being the bottom is load-bearing: the built-in profiles
+/// use `origin_min = NetworkUntrusted` as the "allow from any origin" floor.
+/// The order is pinned by exhaustive proofs in `tests.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 #[non_exhaustive]
@@ -111,8 +80,7 @@ pub enum OriginTag {
     /// the user).
     User,
     /// User-typed input that has passed the bracketed-paste / shell-prompt
-    /// gate — equivalent to User in the current scaffold (#8000 will split
-    /// these cleanly).
+    /// gate. Ranked just below `User`.
     UserTyped,
     /// Local AI agent acting on the user's behalf (e.g. AI Assistant, AI Model).
     Ai,
@@ -129,12 +97,6 @@ pub enum OriginTag {
 
 impl OriginTag {
     /// Numeric rank used by [`Self::dominates`]. Lower number = more trusted.
-    ///
-    /// The rank ordering is fixed by the doc comments on each variant: `Host`
-    /// dominates every other origin, `NetworkUntrusted` is subordinate to every
-    /// other origin. NOTE: this bottom element differs from
-    /// `aterm_provenance::OriginTag` (whose bottom is `Pty`) — the two lattices
-    /// are not interchangeable; see the type-level note on [`OriginTag`].
     #[must_use]
     pub const fn trust_rank(self) -> u8 {
         match self {
@@ -225,8 +187,7 @@ pub struct Defaults {
     pub unmatched: Response,
     /// Whether OSC 133 / OSC 633 shell-integration sequences require a
     /// 64-hex-digit nonce. Mirrors
-    /// `TerminalModes::require_shell_integration_nonce` during the deprecation
-    /// window (§6.4).
+    /// `TerminalModes::require_shell_integration_nonce` (§6.4).
     #[serde(default)]
     pub shell_integration_require_nonce: bool,
 }
@@ -245,8 +206,8 @@ pub struct Defaults {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
-    /// Sequence selector. Parsed by `SequenceSelector::parse`.
-    /// Currently stored as the raw string form.
+    /// Sequence selector in its raw string form; compiled by
+    /// [`selector::SequenceSelector::parse`].
     pub sequence: String,
     /// Minimum acceptable origin. Origins that dominate this tag are admitted;
     /// subordinate origins fall through to the next rule.
@@ -268,8 +229,7 @@ pub struct Rule {
 
 /// Named token-bucket configuration (§3.1).
 ///
-/// Mirrors the existing response + OSC 4/21 bucket constants. Bucket state is
-/// owned by the engine's `RateLimiterSet`; this struct is purely the schema.
+/// Schema only; bucket state lives in the engine's [`limits::RateLimiterSet`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimit {
@@ -314,15 +274,12 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Serialize this policy as a TOML string. Used for at-rest config files
-    /// and for round-trip testing (§5.1).
+    /// Serialize this policy as a TOML string (§5.1).
     ///
     /// # Errors
     ///
     /// Returns [`aterm_toml::ser::Error`] if the policy contains a shape the TOML
-    /// serializer cannot represent. No policy derived from a built-in
-    /// profile can produce such a shape; only operator-constructed values
-    /// can fail serialization.
+    /// serializer cannot represent. No built-in profile does.
     pub fn to_toml(&self) -> Result<String, aterm_toml::ser::Error> {
         aterm_toml::to_string(self)
     }

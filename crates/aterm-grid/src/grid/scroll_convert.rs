@@ -4,16 +4,14 @@
 
 //! Row-to-line conversion for scrollback.
 //!
-//! Converts between visible grid rows and scrollback [`Line`]s.
-//! Used by scroll operations when pushing rows to or recovering rows from
-//! the scrollback buffer.
+//! Converts between visible grid rows and scrollback [`Line`]s for scroll
+//! operations pushing rows to, or recovering rows from, the scrollback.
 //!
-//! ## Lazy Scrollback Promotion
+//! ## Lazy scrollback promotion
 //!
-//! [`DeferredLine`] captures a grid row's raw cell bytes + extras at scroll
-//! time via O(1) memcpy, deferring the O(cols) text/attrs conversion until
-//! the line is actually read. This eliminates the `row_to_line_with_stored_extras`
-//! bottleneck during burst output when scrollback is never read.
+//! [`DeferredLine`] captures a grid row's raw cell bytes and extras at scroll
+//! time with a memcpy, deferring the O(cols) text/attrs conversion until the
+//! line is read, so burst output never read back skips the conversion.
 
 use std::cell::OnceCell;
 use std::collections::VecDeque;
@@ -25,6 +23,7 @@ use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColor
 
 use super::Grid;
 use crate::Cell;
+use crate::CellExtra;
 use crate::CellFlags;
 use crate::PackedColor;
 use crate::Row;
@@ -33,11 +32,11 @@ use crate::{CellCoord, CellExtras};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Process-global "headless scrollback-text-only" toggle (default off). When on,
-/// the scroll path skips per-cell extras extraction so scrollback keeps text but
-/// not colour/style — a ~10% throughput win for headless embeddings that read
-/// scrollback as text. Process-global (not per-grid) because an embedding is
-/// uniformly headless or GUI; aterm's GUI never enables it.
+/// Process-global headless scrollback-text-only toggle (default off). When on,
+/// the scroll path skips per-cell extras extraction, so scrollback keeps text
+/// but not colour/style: a throughput win for headless embeddings that read
+/// scrollback as text. Process-global because an embedding is uniformly
+/// headless or GUI; aterm's GUI never enables it.
 static SCROLLBACK_TEXT_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable the headless scrollback-text-only fast path (see
@@ -57,17 +56,14 @@ pub fn scrollback_text_only() -> bool {
 /// blank right half of a CJK glyph), as opposed to a DECSCA-protected cell.
 ///
 /// `PROTECTED` and `WIDE_CONTINUATION` share bit 10, so the raw
-/// `Cell::is_wide_continuation()` returns `true` for both. Row→line
-/// materialization SKIPS continuation spacers — if it skipped protected cells
-/// too, every DECSCA-protected character would vanish from scrollback (and thus
-/// from `line`/search/copy of history). A true spacer has bit 10 set, is not
-/// itself `WIDE`, and immediately follows a `WIDE` main cell.
+/// `Cell::is_wide_continuation()` returns `true` for both. Materialization
+/// skips spacers; skipping protected cells too would drop them from
+/// scrollback (and `line`/search/copy of history). A true spacer has bit 10
+/// set, is not itself `WIDE`, and follows a `WIDE` main cell.
 #[inline]
 // `pub(in crate::grid)`: the ring fast materializer
-// (`scroll_materialize::materialize_from_row_extras`) must skip EXACTLY the
-// cells this skips, or its columns diverge from the Line round trip's. Shared,
-// not re-implemented — a second copy of this predicate is a silent divergence
-// waiting to happen.
+// (`scroll_materialize::materialize_from_row_extras`) must skip exactly the
+// cells this skips, so it shares this predicate.
 pub(in crate::grid) fn is_spacer(cells: &[Cell], idx: usize) -> bool {
     cells[idx].is_wide_continuation()
         && !cells[idx].is_wide()
@@ -79,7 +75,7 @@ pub(in crate::grid) fn is_spacer(cells: &[Cell], idx: usize) -> bool {
 /// lives in the overflow table, a wide cell or a continuation spacer makes
 /// [`is_spacer`] consult its neighbour, and `PROTECTED` shares its bit with
 /// `WIDE_CONTINUATION` so it rides along (conservatively — a protected cell
-/// simply takes the old path).
+/// takes the per-cell path).
 const RUN_DISQUALIFY: CellFlags =
     CellFlags(CellFlags::COMPLEX.0 | CellFlags::WIDE.0 | CellFlags::WIDE_CONTINUATION.0);
 
@@ -103,22 +99,15 @@ fn cell_attrs_of(cell: &Cell) -> CellAttrs {
     CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits())
 }
 
-/// **THE PLAIN RUN** (2026-09-14, the performance audit) — append the maximal
-/// run of cells at `from` that need no per-cell decision, and return where it
-/// ended.
+/// Append the maximal run of cells at `from` that need no per-cell decision,
+/// and return where it ended.
 ///
-/// Scroll-off materialization walked one cell at a time: an [`is_spacer`] that
-/// peeks at the neighbour, a `char()` decode, two `Option` colour maps and an
-/// RLE compare, per cell, per scrolled line. Ordinary output is not shaped like
-/// that — it is runs of printable ASCII under one attribute — so a run is found
-/// once and then costs one `push_str` and ONE [`AttrRunBuilder::extend`]
-/// instead of `n` of each. Cells that do not qualify (wide, complex, a
-/// continuation spacer, a non-ASCII or control codepoint, or a change of
-/// attributes) fall through to the caller's per-cell body unchanged, so the
-/// emitted `Line` is byte-identical either way.
-///
-/// Measured on `scrollback_materialize`, interleaved: `plain_ring`
-/// 3.82 → 3.19 ms/MiB (−16.4%), `plain_ring_hot` 3.46 → 2.77 (−20%).
+/// Ordinary output is runs of printable ASCII under one attribute, so a run is
+/// found once and costs one `push_str` and one [`AttrRunBuilder::extend`]
+/// instead of a per-cell [`is_spacer`] peek, `char()` decode, colour maps and
+/// RLE compare. Cells that do not qualify (wide, complex, a continuation
+/// spacer, a non-ASCII or control codepoint, or an attribute change) fall
+/// through to the caller's per-cell body, so the emitted `Line` is identical.
 #[inline]
 fn append_plain_run(
     cells: &[Cell],
@@ -164,20 +153,16 @@ fn append_plain_run(
 }
 
 /// Whether any cell in `cells` carries something
-/// [`Grid::extract_row_extras_into`] could extract WITHOUT the extras map: a
-/// style id to resolve against the table, a complex-char codepoint, or an RGB
-/// overflow colour.
+/// [`Grid::extract_row_extras_into`] could extract without the extras map: a
+/// style id, a complex-char codepoint, or an RGB overflow colour.
 ///
-/// Deliberately does NOT test `Cell::has_extras()`. This is only ever consulted
-/// when the map is EMPTY, where `extras.get(coord)` returns `None` for every
-/// column no matter what that flag says — so ignoring it is exact, and it also
-/// means a STALE flag (bulk clears leave those behind by design, see
-/// `grid/proofs_kani_extras_invariants.rs`) cannot defeat the gate.
+/// Does not test `Cell::has_extras()`: this is consulted only when the map
+/// holds no entry on the row, where every lookup returns `None` regardless,
+/// so ignoring the flag is exact and a stale flag (bulk clears leave them;
+/// see `grid/proofs_kani_extras_invariants.rs`) cannot defeat the gate.
 ///
-/// Branch-free fold (`|`, not `||`): the case this exists for is the row that
-/// has nothing, which visits every cell either way, so an unconditional
-/// accumulate beats a short-circuit whose branch is unpredictable. All four
-/// tests are bit tests on the 8-byte cell the loop is already streaming.
+/// Branch-free fold (`|`, not `||`): the common row has nothing and visits
+/// every cell anyway, so accumulating beats an unpredictable short-circuit.
 #[inline]
 fn row_has_extractable_cells(cells: &[Cell]) -> bool {
     let mut found = false;
@@ -201,11 +186,10 @@ const _: () = assert!(std::mem::size_of::<Cell>() == 8);
 ///
 /// ## Memory
 ///
-/// For an 80-column ASCII row: ~640 bytes of cell data (heap Vec),
-/// plus the `ScrolledRowExtras` (often `None` for plain text). This is
-/// larger than the ~160-byte `Line` equivalent, but the deferred line is
-/// short-lived — it converts on first read or drains in bulk when the lazy
-/// buffer exceeds its threshold.
+/// For an 80-column ASCII row: ~640 bytes of cell data plus the
+/// `ScrolledRowExtras` (often `None`), larger than the ~160-byte `Line`, but
+/// short-lived: it converts on first read or drains in bulk when the lazy
+/// buffer passes its threshold.
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredLine {
     /// Raw cell data, copied from the Row at scroll time.
@@ -223,34 +207,26 @@ pub(crate) struct DeferredLine {
 }
 
 impl DeferredLine {
-    /// Create a deferred line by snapshotting a Row's cell data into `scratch`
-    /// — a recycled cell body from the [`CellPool`], or `Vec::new()` when the
-    /// caller has none.
+    /// Create a deferred line by snapshotting a Row's cells into `scratch`, a
+    /// recycled cell body from the [`CellPool`] (or `Vec::new()`).
     ///
-    /// This is O(cells) memcpy but avoids the O(cols) text extraction,
-    /// RLE attribute building, and String allocation of full conversion.
-    ///
-    /// LATENCY: taking the body from the pool instead of `to_vec()`-ing a fresh
-    /// one removes one malloc (and later one free) PER SCROLLED LINE from
-    /// inside the PTY reader's `term_lock` hold — the hold the UI thread's
-    /// keystroke-echo present waits behind. `clear` + `extend_from_slice` fully
-    /// defines both the length and every element from the row slice, so a
-    /// recycled body carries NO state from its previous line: content is
-    /// byte-identical to the old `to_vec()`.
+    /// O(cells) memcpy, avoiding text extraction, RLE attribute building and
+    /// String allocation. Using a pooled body keeps malloc/free out of the PTY
+    /// reader's `term_lock` hold, which the UI's keystroke echo waits on.
+    /// `clear` + `extend_from_slice` fully defines the body from the row, so a
+    /// recycled body carries no state from its previous line.
     pub(crate) fn new(row: &Row, extras: ScrolledRowExtras, scratch: Vec<Cell>) -> Self {
         // Box only when there is something to carry — the `None ⟺ empty`
         // encoding `heap_memory_used` and the materialize readers depend on.
         Self::new_boxed(row, (!extras.is_empty()).then(|| Box::new(extras)), scratch)
     }
 
-    /// [`new`](Self::new) for a caller that ALREADY owns the extras in a `Box`.
+    /// [`new`](Self::new) for a caller that already owns the extras in a `Box`.
     ///
     /// The tiered scroll-off path pops the evicted row's extras out of
-    /// `ring_extras` as an `Option<Box<ScrolledRowExtras>>` and hands them
-    /// straight here, so the value is never moved out of its box only to be
-    /// re-boxed — one `Box` malloc AND one free removed per extras-carrying
-    /// scrolled line, from inside the PTY reader's `term_lock` hold (the same
-    /// hold the [`CellPool`] exists to keep the allocator out of).
+    /// `ring_extras` as an `Option<Box<ScrolledRowExtras>>` and passes them
+    /// here, avoiding an unbox/re-box per scrolled line inside the reader's
+    /// `term_lock` hold.
     pub(crate) fn new_boxed(
         row: &Row,
         extras: Option<Box<ScrolledRowExtras>>,
@@ -264,10 +240,9 @@ impl DeferredLine {
         Self {
             cells: scratch,
             len,
-            // `filter` keeps the `None ⟺ empty` encoding exactly as the old
-            // `is_empty()` test did: an empty box is dropped rather than stored,
-            // so `heap_memory_used` (which adds a flat struct size for `Some`)
-            // and the two `materialize` readers see the same shape as before.
+            // `filter` keeps the `None ⟺ empty` encoding: an empty box is
+            // dropped rather than stored, which `heap_memory_used` and the
+            // `materialize` readers rely on.
             extras: extras.filter(|b| !b.is_empty()),
             wrapped: row.is_wrapped(),
             cached: OnceCell::new(),
@@ -282,17 +257,16 @@ impl DeferredLine {
         self.cached.get_or_init(|| self.materialize())
     }
 
-    /// Estimated HEAP bytes owned by this deferred line (excludes
-    /// `size_of::<DeferredLine>()` itself — the container counts that via its
-    /// backing capacity). Extras are counted shallow, matching the
-    /// `ring_extras` convention in `Grid::memory_used`.
+    /// Estimated heap bytes owned by this deferred line (excluding
+    /// `size_of::<DeferredLine>()`, which the container counts via its
+    /// capacity). Extras are counted shallow, as in `Grid::memory_used`'s
+    /// `ring_extras` convention.
     pub(crate) fn heap_memory_used(&self) -> usize {
         let mut total = self.cells.capacity() * std::mem::size_of::<Cell>();
         if let Some(extras) = self.extras.as_deref() {
             total += std::mem::size_of::<ScrolledRowExtras>();
-            // …plus this row's share of any inline-image payload it staged: the
-            // shallow convention would hide a whole screenshot from the ring
-            // byte watermark for as long as the buffer goes undrained.
+            // Plus this row's share of any inline-image payload, which the
+            // shallow convention would hide from the ring byte watermark.
             total += extras.image_bytes();
         }
         if let Some(line) = self.cached.get() {
@@ -301,12 +275,11 @@ impl DeferredLine {
         total
     }
 
-    /// What staging this line costs, fixed for as long as it is staged: its
-    /// slot in the buffer's spine, its cell body's CAPACITY (a recycled body
-    /// can be larger than the row it now holds) and its extras. The lazily
-    /// materialized `cached` line is left out on purpose — it appears only when
-    /// something reads the row, and a figure that moved under `&self` could
-    /// not be kept as a running sum.
+    /// What staging this line costs, fixed while it is staged: its spine slot,
+    /// its cell body's capacity (a recycled body can exceed the row) and its
+    /// extras. The lazily materialized `cached` line is excluded: it appears
+    /// only on read, and a figure that moves under `&self` could not be kept as
+    /// a running sum.
     pub(crate) fn staged_bytes(&self) -> usize {
         let mut total =
             std::mem::size_of::<Self>() + self.cells.capacity() * std::mem::size_of::<Cell>();
@@ -316,26 +289,20 @@ impl DeferredLine {
         total
     }
 
-    /// Convert into an owned [`Line`], consuming the deferred line AND its cell
-    /// body. Test-only: every production consumption site goes through
-    /// [`into_line_recycled`](Self::into_line_recycled) so the body comes back to
-    /// the pool — a non-recycling variant on the flood path would silently
-    /// reintroduce the per-newline free/malloc this pool exists to remove.
+    /// Convert into an owned [`Line`], consuming the deferred line and its cell
+    /// body. Test-only: production uses
+    /// [`into_line_recycled`](Self::into_line_recycled), which returns the body
+    /// to the pool.
     ///
-    /// Returns the cached line if already materialized, otherwise performs
-    /// the conversion.
+    /// Returns the cached line if already materialized, otherwise converts.
     #[cfg(test)]
     pub(crate) fn into_line(self) -> Line {
         self.into_line_and_body().0
     }
 
-    /// [`into_line`](Self::into_line), returning the now-free cell body to
-    /// `pool` for the next scroll-off to fill.
-    ///
-    /// Every consumption site the flood path reaches goes through here: without
-    /// it the bodies the reader just allocated are handed straight back to the
-    /// allocator at drain time, and the next 256/1000 scrolled lines malloc
-    /// again inside the reader's lock hold.
+    /// [`into_line`](Self::into_line), returning the freed cell body to `pool`
+    /// for the next scroll-off. Every consumption site on the flood path uses
+    /// this, so drained bodies are reused instead of freed and reallocated.
     pub(crate) fn into_line_recycled(self, pool: &mut CellPool) -> Line {
         let (line, body) = self.into_line_and_body();
         pool.put(body);
@@ -343,10 +310,8 @@ impl DeferredLine {
     }
 
     /// Shared body of the two `into_line` forms: yields the materialized line
-    /// AND the cell `Vec` it was built from (already emptied of meaning — the
-    /// caller either drops it or pools it). Taking the body out FIRST keeps the
-    /// already-cached early-return recycling too; that path owns a body just as
-    /// much as the materializing one.
+    /// and the cell `Vec` it was built from, for the caller to drop or pool.
+    /// Taking the body out first lets the cached early-return recycle too.
     fn into_line_and_body(mut self) -> (Line, Vec<Cell>) {
         let body = std::mem::take(&mut self.cells);
 
@@ -395,11 +360,8 @@ impl DeferredLine {
             return line;
         }
 
-        // Delegate to the same conversion logic used by the eager path.
-        // Build a temporary view that mimics what row_to_line_with_stored_extras does.
         let cells = &self.cells[..self.len as usize];
 
-        // Fast path: no extras.
         if extras.is_empty() {
             return Self::materialize_no_extras(cells, self.wrapped);
         }
@@ -502,67 +464,51 @@ pub(crate) struct LazyBuffer {
     /// Pending deferred lines, ordered oldest to newest.
     lines: VecDeque<DeferredLine>,
     /// Free-list of cell bodies recycled between deferred lines (see
-    /// [`CellPool`]). Lives HERE, not beside the buffer, so every producer and
-    /// every consumer of a `DeferredLine` is on the recycling path by
-    /// construction — a future consumption site cannot silently forget to
-    /// return the body, and the pool's bytes fold into
-    /// [`memory_used`](Self::memory_used) automatically.
+    /// [`CellPool`]). Kept inside the buffer so every producer and consumer of
+    /// a `DeferredLine` is on the recycling path, and the pool's bytes are
+    /// counted in [`memory_used`](Self::memory_used).
     pool: CellPool,
     /// The hole the flood path has cut at the FRONT of `lines`, if one is open
     /// (see [`FloodCut`]). Logically the buffer's oldest row: `len`, `get_line`
     /// and both drains present it as one marker line ahead of `lines`.
     cut: Option<FloodCut>,
     /// Running sum of [`DeferredLine::staged_bytes`] over `lines`: what the
-    /// staged rows ACTUALLY hold, kept O(1) so the flood path can weigh the
+    /// staged rows actually hold, kept O(1) so the flood path can weigh the
     /// backlog against the store's memory headroom on every scrolled row.
     ///
-    /// WHY a measured sum and not `rows × cols`: a staged row copies only the
-    /// row's OCCUPIED cells (`Row::len`), so a flood of short lines costs a
-    /// fraction of the width. Charging the full width capped a 120k-line burst
-    /// of `seq`-sized lines at 200 columns to ~42k rows while the grid used
-    /// under 22 MB of its 100 MB budget (review of 2026-09-27, measured on the
-    /// real engine): the depth loss the budget exists to prevent, only moved
-    /// to wide windows.
+    /// A staged row copies only the row's occupied cells (`Row::len`), so a
+    /// flood of short lines costs a fraction of `rows × cols`; charging the full
+    /// width would cap short-line floods in wide windows far below the budget.
     staged_bytes: usize,
     /// Rows staged since the last bounded drain opportunity took the count
     /// ([`take_arrivals`](Self::take_arrivals)): the stream's rate as the
-    /// host's drain sees it, which is what `Grid::trickle_lazy_bounded`
-    /// decides on. Arrivals, not drops: a cut that opened late in an interval
-    /// has dropped only a few rows by the next opportunity while the stream is
-    /// still delivering thousands.
+    /// host's drain sees it, used by `Grid::trickle_lazy_bounded`. Arrivals,
+    /// not drops: a cut opened late in an interval has dropped few rows while
+    /// the stream still delivers thousands.
     arrivals_since_drain: u64,
 }
 
-/// A hole at the front of the staged lines — the lines the flood path dropped
-/// from the buffer's oldest end ([`LazyBuffer::shed_oldest`],
-/// [`LazyBuffer::drop_oldest`]) — remembered so it is shown as ONE marker row
-/// in their place instead of closing up silently.
+/// A hole at the front of the staged lines (the lines the flood path dropped
+/// from the oldest end via [`LazyBuffer::shed_oldest`] /
+/// [`LazyBuffer::drop_oldest`]), shown as one marker row in their place
+/// instead of closing up silently.
 ///
-/// WHY it lives INSIDE the buffer rather than as a count on the grid: every
-/// reader of staged history already walks this buffer — `get_line` (which
-/// `Grid::try_get_history_line` reaches WITHOUT draining first), `len`, and
-/// the two drains that the compression worker, the reflow re-attach and the
-/// offload paths all consume through. A slot here is seen by all of them by
-/// construction; a count kept beside the buffer would have to be taught to
-/// each reader, and the audit that found the 91k-line silent hole (2026-09-22:
-/// 120k lines printed into a 100k scrollback, 28.5k kept, no indication
-/// anywhere) is exactly what one forgotten reader looks like.
+/// Kept inside the buffer because every reader of staged history already
+/// walks it: `get_line` (reached by `Grid::try_get_history_line` without
+/// draining), `len`, and the two drains used by the compression worker, the
+/// reflow re-attach and the offload paths. A count kept beside the buffer
+/// would have to be taught to each reader.
 ///
-/// WHY a count and not a pre-built line: the flood path drops once per
-/// scrolled row while the reader holds the term lock, so moving the cut must
-/// cost an integer store. The marker line is built on first READ and thrown
-/// away whenever the count moves, so a cut nobody looks at mid-flood never
-/// builds one.
+/// A count rather than a pre-built line: the flood path moves the cut once per
+/// scrolled row under the term lock, so it must be an integer store. The
+/// marker line is built on first read and discarded when the count moves.
 #[derive(Debug, Default)]
 struct FloodCut {
-    /// Lines missing here that the configured line limit would still hold —
-    /// what the marker says. Moves while the cut is open: it grows as the
-    /// flood drops rows the limit would keep, and shrinks when the limit's
-    /// window slides past the hole's oldest rows (they would be gone by now
-    /// anyway, so naming them would be a lie). A drain that reaches the front
-    /// closes the cut, and a later drop opens a NEW cut behind the promoted
-    /// lines — so each marker names the hole that sits before the lines after
-    /// it.
+    /// Lines missing here that the configured line limit would still hold (what
+    /// the marker says). Grows as the flood drops rows the limit would keep,
+    /// and shrinks when the limit's window slides past the hole's oldest rows.
+    /// A drain reaching the front closes the cut; a later drop opens a new cut
+    /// behind the promoted lines.
     dropped: u64,
     /// The largest `dropped` this cut has reached: the grid's loss counter
     /// grows by each new peak, so a count that shrinks and grows back is not
@@ -587,8 +533,8 @@ impl FloodCut {
     }
 
     /// Make the marker name `dropped` lines (any built marker line is then
-    /// stale). Returns how far that raised the cut's PEAK — the lines to add
-    /// to the grid's loss counter.
+    /// stale). Returns how far that raised the cut's peak: the lines to add to
+    /// the grid's loss counter.
     fn set(&mut self, dropped: u64) -> u64 {
         if dropped != self.dropped {
             self.dropped = dropped;
@@ -605,21 +551,15 @@ impl FloodCut {
 /// this, not on the wording after the count.
 pub(crate) const FLOOD_MARKER_PREFIX: &str = "— aterm dropped ";
 
-/// The ONE row that stands in for `dropped` lines lost at a flood cut.
+/// The one row that stands in for `dropped` lines lost at a flood cut.
 ///
-/// The state, then the one thing the user can do about it (the house rule
-/// for user-facing lines, with no mechanism talk): the lines are gone from
-/// here, output came too fast to keep, and a file is the way to keep all of
-/// a stream that large. Rendered DIM: the grid has no system-row style, and
-/// dim is the one attribute every theme paints as "not the program's
-/// output". Kept within 80 columns for any count up to seven digits, so it is
-/// one row at the default width; the count comes first, so a narrower window
-/// that clips the row still shows it. Otherwise ordinary text, deliberately:
-/// `search`, `copy` and `line` find it like any other history row, so an agent
-/// that searched for the missing lines and found nothing can search for
-/// `aterm dropped` and learn why. The count is the whole point — a marker with
-/// a wrong count would be a second lie on top of the hole — so it is only ever
-/// built from the cut's own counter.
+/// States that lines are gone, that output came too fast to keep, and that a
+/// file is the way to keep a stream that large. Rendered dim (the grid has no
+/// system-row style, and dim reads as "not the program's output"). Fits 80
+/// columns for counts up to seven digits, count first so a clipped row still
+/// shows it. Otherwise ordinary text, so `search`, `copy` and `line` find it
+/// (searching `aterm dropped` explains a missing match). Built only from the
+/// cut's own counter, so the count is always right.
 pub(crate) fn flood_marker_line(dropped: u64) -> Line {
     let noun = if dropped == 1 { "line" } else { "lines" };
     let text = format!(
@@ -643,25 +583,18 @@ const DRAIN_THRESHOLD: usize = 1000;
 
 /// Bounded free-list of `Vec<Cell>` bodies, recycled between deferred lines.
 ///
-/// WHY: every row that scrolls off the ring into tiered scrollback becomes a
-/// `DeferredLine`, whose cell snapshot used to be a fresh `to_vec()` — one
-/// malloc now, one free at drain time, PER NEWLINE. That malloc runs inside the
-/// single `term_lock` hold the PTY reader takes for a whole read batch: at 80
-/// columns a 64 KiB batch is ~800 newlines, so ~800 malloc/free pairs sit on the
-/// hold that the UI thread's keystroke-echo present is blocked behind. The
-/// bodies are strictly transient (staged, materialized, freed), so handing them
-/// back to the next scroll-off costs nothing and removes the allocator from the
-/// per-newline path entirely.
+/// Every row scrolling off the ring becomes a `DeferredLine` with a cell
+/// snapshot. Allocating it fresh would put one malloc and one free per newline
+/// inside the PTY reader's `term_lock` hold for a whole read batch, which the
+/// UI's keystroke echo waits behind. The bodies are transient, so handing them
+/// to the next scroll-off removes the allocator from the per-newline path.
 ///
-/// BOUND: production takes one body per scrolled line; consumption returns them
-/// in batches (the GUI compression worker drains 256 at a time, the inline drain
-/// up to `DRAIN_THRESHOLD`). So the pool is fullest right after a drain and
-/// empty just before the next one — the bodies in flight (staged + pooled) stay
-/// roughly constant rather than being new footprint. It is capped twice anyway,
-/// by buffer COUNT and by total pooled CELLS, so neither a very deep backlog nor
-/// a very wide window can turn the free-list into idle megabytes; whatever it
-/// does hold is reported through [`LazyBuffer::memory_used`], so the ring byte
-/// watermark still sees it.
+/// Bound: production takes one body per scrolled line; consumption returns
+/// them in batches (the compression worker drains 256 at a time, the inline
+/// drain up to `DRAIN_THRESHOLD`), so bodies in flight stay roughly constant.
+/// Capped by buffer count and by total pooled cells, so a deep backlog or a
+/// wide window cannot turn it into idle megabytes; what it holds is reported
+/// through [`LazyBuffer::memory_used`].
 #[derive(Debug, Default)]
 pub(crate) struct CellPool {
     /// Emptied cell bodies awaiting reuse (LIFO: the most recently returned
@@ -673,11 +606,9 @@ pub(crate) struct CellPool {
     pooled_cells: usize,
 }
 
-/// Free-list depth cap. Sized off the DRAIN BATCH, not the visible row count:
-/// the GUI's off-thread compression worker returns 256 bodies per batch, so a
-/// visible-rows-sized pool (~50) would recycle a fifth of them and leave the
-/// rest to the allocator — the malloc storm this pool exists to remove would
-/// mostly survive. Two batches of headroom absorbs a worker that wakes late.
+/// Free-list depth cap, sized off the drain batch: the compression worker
+/// returns 256 bodies per batch, so this holds two batches of headroom for a
+/// worker that wakes late.
 const POOL_MAX_BUFFERS: usize = 512;
 
 /// Total pooled cells cap — 512 KiB of `Cell` bodies. The count cap alone is a
@@ -772,11 +703,10 @@ impl LazyBuffer {
         std::mem::take(&mut self.arrivals_since_drain)
     }
 
-    /// Snapshot `row` into a POOLED cell body and stage it.
+    /// Snapshot `row` into a pooled cell body and stage it.
     ///
     /// The allocation-free counterpart of `push(DeferredLine::new(..))` and the
-    /// only form the scroll-off path should use: it is what keeps the malloc out
-    /// of the reader's `term_lock` hold (see [`CellPool`]).
+    /// form the scroll-off path uses (see [`CellPool`]).
     #[inline]
     pub(crate) fn push_row(&mut self, row: &Row, extras: ScrolledRowExtras) {
         let scratch = self.pool.take();
@@ -784,9 +714,8 @@ impl LazyBuffer {
     }
 
     /// [`push_row`](Self::push_row) for a caller that already owns the extras in
-    /// a `Box` — the tiered scroll-off path, which pops them out of
-    /// `ring_extras`. See [`DeferredLine::new_boxed`]: the box is moved through
-    /// whole instead of being unboxed and re-boxed.
+    /// a `Box` (the tiered scroll-off path, popping them from `ring_extras`);
+    /// see [`DeferredLine::new_boxed`].
     #[inline]
     pub(crate) fn push_row_boxed(&mut self, row: &Row, extras: Option<Box<ScrolledRowExtras>>) {
         let scratch = self.pool.take();
@@ -824,14 +753,13 @@ impl LazyBuffer {
         self.lines.len()
     }
 
-    /// How many of the OLDEST staged rows must go for the rest to fit in
-    /// `budget` bytes (measured as the `staged_bytes` field sums them), never
-    /// taking the buffer below `keep` rows (the marker counts as one, as in
+    /// How many of the oldest staged rows must go for the rest to fit in
+    /// `budget` bytes (as the `staged_bytes` field sums them), never taking the
+    /// buffer below `keep` rows (the marker counts as one, as in
     /// [`len`](Self::len)).
     ///
-    /// O(1) while the backlog fits; otherwise one step per row returned, and
-    /// each of those rows is then dropped — so the flood path's per-newline
-    /// cost stays amortized O(1) however the row sizes vary.
+    /// O(1) while the backlog fits; otherwise one step per row returned, each
+    /// then dropped, so the flood path stays amortized O(1) per newline.
     #[must_use]
     pub(crate) fn front_rows_over(&self, budget: usize, keep: usize) -> usize {
         let mut excess = self.staged_bytes.saturating_sub(budget);
@@ -877,10 +805,9 @@ impl LazyBuffer {
     ///
     /// Returns an iterator of Lines in oldest-to-newest order.
     pub(crate) fn drain_all(&mut self) -> impl Iterator<Item = Line> + '_ {
-        // An open cut is the OLDEST row: it goes first, so the store receives
-        // the marker exactly where the hole is — after whatever it already
-        // holds, before the first surviving staged line. Taking it closes the
-        // cut; a later drop opens a new one behind these promoted lines.
+        // An open cut is the oldest row: it goes first, so the store gets the
+        // marker where the hole is. Taking it closes the cut; a later drop opens
+        // a new one behind these promoted lines.
         let marker = self.cut.take().map(FloodCut::into_line);
         // Every staged row leaves, consumed or not: `VecDeque::Drain` removes
         // the whole range when it is dropped.
@@ -896,14 +823,12 @@ impl LazyBuffer {
         )
     }
 
-    /// Drain up to `n` of the OLDEST pending lines (front of the buffer),
+    /// Drain up to `n` of the oldest pending lines (front of the buffer),
     /// converting each to a materialized [`Line`], in oldest-to-newest order.
     ///
-    /// The bounded counterpart of [`drain_all`](Self::drain_all): THRU-5's
-    /// off-thread compression worker drains the backlog in bounded batches so
-    /// each term-lock hold stays short, instead of the reader thread paying a
-    /// whole ~1000-line compression spike inline on its PTY-drain critical path.
-    /// `n` is clamped to the buffer length, so front-to-`n` is always valid.
+    /// The bounded counterpart of [`drain_all`](Self::drain_all), used by the
+    /// off-thread compression worker so each term-lock hold stays short. `n` is
+    /// clamped to the buffer length.
     pub(crate) fn drain_front(&mut self, n: usize) -> impl Iterator<Item = Line> + '_ {
         let n = n.min(self.len());
         // The marker is the oldest row, so a batch that takes anything takes
@@ -944,11 +869,9 @@ impl LazyBuffer {
 
     /// Clear all pending lines, and release the recycling pool with them.
     ///
-    /// Every caller is a history-INVALIDATING path (scrollback erase, store
-    /// detach with nothing to drain into, resize drain) — never the flood path —
-    /// so the right behaviour is to hand the memory back rather than keep a
-    /// cache alive across a "user cleared history" event. The pool refills for
-    /// free on the next drain.
+    /// Every caller invalidates history (scrollback erase, store detach with
+    /// nothing to drain into, resize drain), never the flood path, so the
+    /// memory goes back to the allocator. The pool refills on the next drain.
     pub(crate) fn clear(&mut self) {
         self.lines.clear();
         self.staged_bytes = 0;
@@ -960,12 +883,9 @@ impl LazyBuffer {
 
     /// Drop the recycled cell bodies without touching the staged lines.
     ///
-    /// Called on a WIDTH change: pooled capacities were sized for the old
-    /// column count, so reusing them afterwards is either wasted memory (width
-    /// shrank) or a guaranteed realloc on first fill (width grew). Note this is
-    /// a footprint guard, NOT a correctness one — `DeferredLine::new` clears and
-    /// refills the body from the row slice, so a stale-width body could never
-    /// leak old content into a line.
+    /// Called on a width change: pooled capacities were sized for the old
+    /// column count, so reuse would waste memory or realloc. A footprint guard
+    /// only: `DeferredLine::new` refills the body from the row slice.
     pub(crate) fn clear_pool(&mut self) {
         self.pool.clear();
     }
@@ -976,16 +896,11 @@ impl LazyBuffer {
         self.pool.len()
     }
 
-    /// Drop the `n` oldest deferred lines (front of the buffer) without
-    /// materializing them, as a LOSS: the hole they leave is opened (or
-    /// widened) as the buffer's flood cut, so every reader sees one marker row
-    /// naming exactly how many lines are missing there. Bounds the buffer
-    /// while the tiered store is detached for a reflow and cannot absorb it
-    /// (audit #4), where there is no telling which rows the limit would keep.
-    ///
-    /// Returns the lines to add to the grid's loss counter (every line dropped
-    /// here, unless the cut had shrunk below its peak), so the counter and the
-    /// markers stay one account.
+    /// Drop the `n` oldest deferred lines without materializing them, as a
+    /// loss: the hole opens (or widens) the buffer's flood cut, so readers see
+    /// one marker row naming how many lines are missing. Bounds the buffer
+    /// while the tiered store is detached for a reflow, where there is no
+    /// telling which rows the limit would keep.
     pub(crate) fn drop_oldest(&mut self, n: usize) -> u64 {
         let n = self.discard_front(n) as u64;
         if n == 0 {
@@ -1013,15 +928,12 @@ impl LazyBuffer {
         self.cut.get_or_insert_with(FloodCut::default).set(hole)
     }
 
-    /// Hand back the deque spine a flood grew. `VecDeque::drain` never shrinks
-    /// the allocation, so a burst that staged ~90k rows would otherwise keep
-    /// ~90k × `size_of::<DeferredLine>()` (~10 MB) of empty spine for the life
-    /// of the session — a footprint, where the staging cap promises only a
-    /// peak. Shrinks only past 4× the larger of the live length and the drain
-    /// threshold, and then to 2× it, so the steady inline drain (~1000 rows
-    /// every ~1000 rows) never reallocates and a long post-flood drain gives
-    /// the memory back in a handful of geometric steps. Call it after a
-    /// drain's iterator has been consumed.
+    /// Hand back the deque spine a flood grew: `VecDeque::drain` never shrinks,
+    /// so a burst staging ~90k rows would otherwise keep ~10 MB of empty spine
+    /// for the session. Shrinks only past 4× the larger of the live length and
+    /// the drain threshold, and then to 2× it, so the steady inline drain never
+    /// reallocates and a long post-flood drain returns memory in a few
+    /// geometric steps. Call after a drain's iterator has been consumed.
     pub(crate) fn release_spine_slack(&mut self) {
         let floor = self.lines.len().max(DRAIN_THRESHOLD);
         if self.lines.capacity() > floor.saturating_mul(4) {
@@ -1040,10 +952,8 @@ impl LazyBuffer {
     /// the cut. Returns how many were discarded.
     fn discard_front(&mut self, n: usize) -> usize {
         let n = n.min(self.lines.len());
-        // Recycle even here: this is the FLOOD path (the compression worker fell
-        // behind), i.e. exactly when the reader is allocating a body per newline
-        // under its lock. Dropping these bodies to the allocator instead would
-        // leave the pool dry precisely when it is needed most.
+        // Recycle here too: this is the flood path, exactly when the reader is
+        // taking a body per newline and the pool is most needed.
         let pool = &mut self.pool;
         for mut deferred in self.lines.drain(..n) {
             // Weighed before the body is taken: its capacity is part of it.
@@ -1053,20 +963,16 @@ impl LazyBuffer {
         n
     }
 
-    /// Estimated bytes held by the staged (not yet drained) lines: the
-    /// backing `VecDeque` capacity plus each deferred line's heap (Wave-3
-    /// adversarial review: under flood backpressure this buffer holds up to
-    /// the THRU-5 cap of raw ~8 B/cell rows — real memory the ring byte
-    /// watermark previously could not see). O(staged) per call; the buffer
-    /// is drain-bounded, and this runs only on poll-time accounting queries.
+    /// Estimated bytes held by the staged (not yet drained) lines: the backing
+    /// `VecDeque` capacity plus each deferred line's heap, so the ring byte
+    /// watermark sees the backlog under flood backpressure. O(staged) per call;
+    /// used only by poll-time accounting.
     pub(crate) fn memory_used(&self) -> usize {
         let mut total = self.lines.capacity() * std::mem::size_of::<DeferredLine>();
         for line in &self.lines {
             total += line.heap_memory_used();
         }
-        // Bodies parked in the recycling pool are REAL retained heap (bounded by
-        // POOL_MAX_CELLS) — same reason the staged lines are counted: memory the
-        // ring byte watermark must be able to see.
+        // Pooled bodies are real retained heap (bounded by POOL_MAX_CELLS).
         total += self.pool.memory_used();
         // An open cut is a counter plus, once read, one short line.
         if let Some(cut) = &self.cut {
@@ -1084,10 +990,9 @@ impl Default for LazyBuffer {
 
 /// Attach a row's coalesced inline-image spans to the [`Line`] it produced.
 ///
-/// Called from EVERY line-producing site, the zero-length short circuits
-/// included: `place_image` writes no glyph, so an image-only row has
-/// `len == 0` and takes those short circuits — skipping one is precisely how a
-/// picture goes missing between the ring tier and the tiered store.
+/// Called from every line-producing site, including the zero-length short
+/// circuits: `place_image` writes no glyph, so an image-only row has `len == 0`
+/// and would otherwise lose its picture between the ring and the store.
 ///
 /// The clone is one refcount bump per span; the raster is never copied.
 fn attach_image_spans(line: &mut Line, extras: &ScrolledRowExtras) {
@@ -1098,10 +1003,9 @@ fn attach_image_spans(line: &mut Line, extras: &ScrolledRowExtras) {
 
 /// Preserved CellExtras data for a ring buffer scrollback row.
 ///
-/// When rows scroll from the visible grid into ring buffer scrollback,
-/// their CellExtras are extracted before `shift_rows_up_by` discards them.
-/// This extends the #4149 hyperlink-only pattern to also capture complex
-/// chars, combining marks, and RGB colors (#4215).
+/// When rows scroll from the visible grid into ring buffer scrollback, their
+/// CellExtras (hyperlinks, complex chars, combining marks, RGB colors) are
+/// extracted before `shift_rows_up_by` discards them.
 ///
 /// Fields are sorted by physical column for cursor-based lookup during
 /// line reconstruction.
@@ -1126,14 +1030,10 @@ pub struct ScrolledRowExtras {
     /// against the live palette at render time, matching the live cell. Rare
     /// (SGR 58 is seldom used), so this is empty for essentially all rows.
     pub underline_colors: Vec<(u16, u32)>,
-    /// Inline-image spans (iTerm2 OSC 1337 / sixel), already coalesced into one
-    /// span per contiguous run of columns painting one footprint row.
-    ///
-    /// Coalesced HERE rather than kept per column (the shape `underline_colors`
-    /// uses) because an image covers a RECTANGLE: a full-width footprint row
-    /// would otherwise cost one `Arc` bump plus a tuple per column, per row, for
-    /// geometry a single span states exactly. Empty for every row that carries
-    /// no picture, which is essentially all of them.
+    /// Inline-image spans (iTerm2 OSC 1337 / sixel), coalesced into one span
+    /// per contiguous run of columns painting one footprint row. An image
+    /// covers a rectangle, so a span states a full-width footprint row with one
+    /// `Arc` bump instead of one per column. Empty for rows without a picture.
     pub images: Vec<ImageSpan>,
 }
 
@@ -1173,8 +1073,7 @@ impl ScrolledRowExtras {
 
     /// True when all fields are empty (common case: plain ASCII text).
     ///
-    /// Used to avoid allocating a boxed extras struct for rows that have
-    /// no overflow data, saving 120 bytes per plain-text ring buffer row.
+    /// Lets plain-text rows skip allocating a boxed extras struct.
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.hyperlinks.is_empty()
@@ -1188,13 +1087,11 @@ impl ScrolledRowExtras {
 
     /// This row's share of the inline-image payloads it holds.
     ///
-    /// The rest of a `ScrolledRowExtras` is accounted SHALLOW by its holders
+    /// The rest of a `ScrolledRowExtras` is accounted shallow by its holders
     /// (`Grid::memory_used`'s `ring_extras` walk, `DeferredLine`), which is fine
-    /// for the tens of bytes a hyperlink or a combining mark adds — and wrong by
-    /// megabytes for a screenshot. This is the same per-row share
-    /// [`ImageSpan::memory_used`] charges a `Line`, so a footprint sitting in
-    /// the ring or staged in the lazy buffer costs the byte watermark exactly
-    /// what it will cost once it reaches the tiered store.
+    /// for small extras but not for a screenshot. This uses the same per-row
+    /// share [`ImageSpan::memory_used`] charges a `Line`, so a footprint costs
+    /// the byte watermark the same in the ring, staging or the tiered store.
     #[must_use]
     pub(crate) fn image_bytes(&self) -> usize {
         let mut total = 0usize;
@@ -1219,12 +1116,10 @@ impl ScrolledRowExtras {
 }
 
 /// Monotone read cursors over the four column-sorted `ScrolledRowExtras`
-/// vectors. They are CURSORS, not lookups: each advances only when its next
-/// entry's column matches the column being emitted, so an entry for a skipped
-/// (spacer) column, or an out-of-order entry, is simply never consumed. The
-/// ring fast materializer shares this state and the same three consumers below,
-/// so it inherits that behaviour instead of re-deriving it with random access
-/// — which would differ exactly where the data is unusual.
+/// vectors. Each advances only when its next entry's column matches the
+/// column being emitted, so an entry for a skipped (spacer) column or an
+/// out-of-order entry is never consumed. The ring fast materializer shares
+/// this state and consumers, so it behaves identically.
 #[derive(Default)]
 pub(in crate::grid) struct RowToLineCursorState {
     complex_idx: usize,
@@ -1244,22 +1139,18 @@ impl Grid {
 
     /// Convert a Row to a Line using pre-extracted CellExtras data.
     ///
-    /// Used for ring buffer scrollback rows whose extras were preserved
-    /// in `ring_extras` at scroll time (#4149, #4215).
-    ///
-    /// Uses extracted complex chars, combining marks, and resolved colors
-    /// instead of placeholder values. RGB overflow colors and StyleId colors
-    /// are both pre-resolved into the extras vectors at extraction time.
+    /// Used for ring buffer scrollback rows whose extras were preserved in
+    /// `ring_extras` at scroll time. RGB overflow and StyleId colors are
+    /// pre-resolved into the extras vectors at extraction time.
     pub(crate) fn row_to_line_with_stored_extras(row: &Row, extras: &ScrolledRowExtras) -> Line {
         Self::row_to_line_with_stored_extras_at_len(row, extras, row.len())
     }
 
-    /// [`Self::row_to_line_with_stored_extras`] with an explicit cell count —
-    /// the width-reflow seams pass the FULL row width for a row whose logical
-    /// line CONTINUES on the next physical row (fixwave5): autowrap filled
-    /// such a row to its last column, so its trailing blank cells are real
-    /// content, and the default `row.len()` trim would erode one mid-line
-    /// space per chunk boundary on every width sweep.
+    /// [`Self::row_to_line_with_stored_extras`] with an explicit cell count.
+    /// The width-reflow seams pass the full row width for a row whose logical
+    /// line continues on the next row: autowrap filled it, so trailing blanks
+    /// are content, and trimming to `row.len()` would erode one space per chunk
+    /// boundary on every width sweep.
     pub(crate) fn row_to_line_with_stored_extras_at_len(
         row: &Row,
         extras: &ScrolledRowExtras,
@@ -1278,9 +1169,8 @@ impl Grid {
             return line;
         }
 
-        // Fast path: no extras (common case for plain text).
-        // Skips per-cell extras lookup, overflow resolution, combining marks,
-        // and hyperlink cloning. ~40% faster for 80-col ASCII rows.
+        // Fast path: no extras (common for plain text). Skips per-cell extras
+        // lookup, overflow resolution, combining marks and hyperlink cloning.
         if extras.is_empty() {
             return Self::row_to_line_no_extras(row, len);
         }
@@ -1383,11 +1273,9 @@ impl Grid {
         line
     }
 
-    /// Extract all CellExtras data from a row before shift_rows_up_by discards them.
-    ///
-    /// Captures hyperlinks (#4149), complex chars, combining marks, RGB
-    /// colors (#4215), and StyleId-resolved colors (#5890) so they survive
-    /// the transition into ring buffer scrollback.
+    /// Extract all CellExtras data from a row before shift_rows_up_by discards
+    /// them: hyperlinks, complex chars, combining marks, RGB colors and
+    /// StyleId-resolved colors, so they survive into ring buffer scrollback.
     pub(crate) fn extract_row_extras(
         row: &Row,
         extras: &CellExtras,
@@ -1411,100 +1299,74 @@ impl Grid {
         styles: &StyleTable,
     ) {
         result.clear();
-        // Headless scrollback-text-only mode (opt-in, default off): skip
-        // per-cell colour/style extraction on scroll. ~faster on colour-heavy
-        // floods. Only for embeddings that read scrollback as text (e.g. Orca's
-        // text-only serialize_ansi). OSC-8 hyperlink spans are STILL collected
-        // (a cheap hyperlink-only pass) so links that scroll off-screen remain
-        // recoverable from scrollback. The visible grid is untouched, so
-        // visible_sha and the differential oracle are unaffected. Inline images
-        // are NOT collected in this mode, for the same reason colours are not:
-        // an embedding that reads scrollback as text has no use for a raster,
-        // and carrying one would be the single largest thing this mode drags
-        // through the lock.
+        // Headless scrollback-text-only mode (opt-in): skip per-cell
+        // colour/style extraction on scroll, for embeddings that read
+        // scrollback as text. OSC-8 hyperlink spans are still collected (a
+        // cheap pass) so off-screen links stay recoverable; inline images are
+        // not. The visible grid is untouched.
         if scrollback_text_only() {
             Self::extract_hyperlinks_only_into(result, row, extras, row_idx);
             return;
         }
-        // INLINE IMAGES FIRST, and over the full physical width — every gate
-        // below is driven by `row.len()`, the write high-water mark, and
-        // `place_image` writes no glyph, so a row that carries nothing but a
-        // picture has `len == 0` and would fall out of this function before any
-        // of its image cells were looked at. That is exactly how the image used
-        // to die at the top of the screen.
+        // Inline images first, over the full physical width: every gate below
+        // is driven by `row.len()`, and `place_image` writes no glyph, so an
+        // image-only row has `len == 0` and would return before its image cells
+        // were seen.
         Self::extract_image_spans_into(result, row, extras, row_idx);
         let len = row.len() as usize;
         if len == 0 {
             return;
         }
 
-        // Quick check: skip iteration when no overflow data exists.
-        // StyleId cells need resolution even without CellExtras, so check both.
-        // The per-row HAS_STYLE_ID flag avoids scanning cells on plain-text
-        // rows even when other rows in the grid use style interning (#7872).
-        // Previously this used a grid-level sticky flag that forced every
-        // scrolled row to scan, even if only a prompt row ever had styles.
+        // Skip iteration when no overflow data exists. StyleId cells need
+        // resolution even without CellExtras, so check both; the per-row
+        // HAS_STYLE_ID flag avoids scanning plain rows.
         //
-        // Use has_any_data() instead of is_empty() to account for ring-buffer-only
-        // entries (complex chars, RGB colors) that bypass the HashMap on the write
-        // hot path. is_empty() only checks the HashMap and would silently drop
-        // ring-buffer data on scroll.
+        // `has_any_data()` rather than `is_empty()`: ring-only entries (complex
+        // chars, RGB colors) bypass the HashMap on the write path and would
+        // otherwise be dropped on scroll.
         //
-        // NOTE for the next reader: `has_style_id()` is a TEST/KANI-only signal
-        // in practice. `RowFlags::HAS_STYLE_ID` is only ever ORIGINATED by
-        // `row/style_id_write.rs`, which is `#[cfg(any(test, kani))]`
-        // (`Row::set` merely propagates the bit). So in
-        // the shipped binary this short-circuit rests entirely on
-        // `has_any_data()` — do not build an optimization on the assumption that
-        // a styled production row reports `has_style_id()`.
+        // `RowFlags::HAS_STYLE_ID` is only originated by
+        // `row/style_id_write.rs` (test/kani-only), so in the shipped binary
+        // this short-circuit rests on `has_any_data()` alone.
         if !extras.has_any_data() && !row.has_style_id() {
             return;
         }
 
-        // ROW-LOCAL GATE for the map-empty case.
+        // Whether the map can hold an entry on this row. `false` is exact
+        // (`map_may_have_row`): every `extras.get` below would miss, so the
+        // walk skips those probes. With a handful of entries elsewhere on the
+        // screen, one scan of the map replaces `len` hash probes per scrolled
+        // row. An empty map is always `false`.
+        let probe_map = extras.map_may_have_row(row_idx, len);
+
+        // Row-local gate for rows with no map entry.
         //
-        // The grid-global gate above is STICKY: `has_any_data()` is
-        // `!data.is_empty() || complex_ring.is_some() || rgb_ring.is_some()`, and
-        // the two dense rings are allocated on the first truecolor / non-BMP
-        // write ANYWHERE in the grid and are never freed. One coloured shell
-        // prompt therefore signs every plain row that scrolls off for the rest of
-        // the session up to the two O(cols) passes below — the reserve count and
-        // the per-cell walk with its `is_spacer` neighbour peek and its
-        // `extras.get(coord)` probe — inside the PTY reader's `term_lock` hold.
+        // The gate above is sticky: `has_any_data()` includes the dense rings,
+        // which are allocated on the first truecolor / non-BMP write anywhere
+        // and never freed, so one coloured prompt would send every later plain
+        // row through the two O(cols) passes below inside the PTY reader's
+        // `term_lock` hold.
         //
-        // When the MAP is empty, that whole pass can produce nothing unless a
-        // cell says so: every remaining source is announced by the cell's own
-        // bits — USES_STYLE_ID (style table), COMPLEX (char ring), fg/bg RGB
-        // overflow modes (colour ring) — and those bits are written by the very
-        // operation that fills the ring, so the fold is EXACT. No new flag to
-        // keep in sync, and no dependency on the `HAS_EXTRAS` ⇔ entry invariant
-        // (which this branch does not need: an empty map answers `None` for
-        // every column regardless).
-        //
-        // If the map is NON-empty nothing changes — an entry can sit on any row
-        // and only the walk can find it, so that case runs exactly as before.
-        if extras.is_empty() && !row_has_extractable_cells(&row.as_slice()[..len]) {
+        // With no map entry on the row, the only remaining sources are
+        // announced by the cell's own bits (USES_STYLE_ID, COMPLEX, fg/bg RGB
+        // overflow modes), written by the same operations that fill the rings,
+        // so this check is exact. With an entry on the row the walk runs.
+        if !probe_map && !row_has_extractable_cells(&row.as_slice()[..len]) {
             return;
         }
 
-        // Pre-size the rgb vectors: RGB-overflow rows and style-id rows both
-        // otherwise pay repeated growth reallocs (4 → 8 → …) per Vec on the
-        // scroll hot path. Counting is one cheap pass over the L1-resident
-        // cells; skipped when the (recycled) vectors already have capacity.
+        // Pre-size the rgb vectors so RGB-overflow and style-id rows do not pay
+        // repeated growth reallocs on the scroll path; one counting pass over
+        // the cells, skipped when recycled vectors already have capacity.
         //
-        // The gate deliberately does NOT test `row.has_style_id()` (see the note
-        // above: that flag is test/kani-only). Gating on it made this whole block
-        // dead in the shipped binary and left every truecolor row re-growing
-        // `rgb_fg`/`rgb_bg` from capacity 0 — plain truecolor writes go through
-        // `set_rgb_ring_range`, which sets no row flag.
+        // Not gated on `row.has_style_id()` (test/kani-only; plain truecolor
+        // writes via `set_rgb_ring_range` set no row flag).
         //
-        // fg and bg overflow independently (`set_rgb_ring_range` takes them as
-        // separate `Option`s), so count them separately — reserving both from one
-        // combined count would leave wasted capacity riding into the ring for the
-        // line's lifetime, invisible to `DeferredLine::heap_memory_used` (which
-        // accounts extras shallow). The counts are an upper bound (`fg_rgb_for`
-        // can return `None` if the ring evicted the entry); over-reserving by a
-        // few is harmless, and it never under-reserves.
+        // fg and bg overflow independently, so count them separately: extra
+        // capacity would ride into the ring unseen by
+        // `DeferredLine::heap_memory_used` (shallow extras). The counts are an
+        // upper bound (the ring may have evicted an entry), which is harmless.
         if result.rgb_fg.capacity() == 0 || result.rgb_bg.capacity() == 0 {
             let cap_cells = &row.as_slice()[..len];
             let (mut n_fg, mut n_bg) = (0usize, 0usize);
@@ -1550,7 +1412,7 @@ impl Grid {
             let coord = CellCoord::new(row_idx, col_u16);
 
             // StyleId cells: resolve colors from the style table now, before
-            // the cell scrolls off and loses access to the table (#5890).
+            // the cell scrolls off and loses access to the table.
             if cell.uses_style_id() {
                 let sid = cell.style_id();
                 let resolved = match last_style {
@@ -1600,24 +1462,23 @@ impl Grid {
                 result.rgb_bg.push((col_u16, rgb));
             }
 
-            if let Some(extra) = extras.get(coord) {
-                // Combining marks (#4215)
+            if let Some(extra) = probe_map.then(|| extras.get(coord)).flatten() {
+                // Combining marks
                 if !extra.combining().is_empty() {
                     result
                         .combining
                         .push((col_u16, SmallVec::from_slice(extra.combining())));
                 }
 
-                // SGR 58 underline colour: capture the PACKED form (indexed or
-                // RGB) so it survives into scrollback and re-resolves against the
-                // live palette on restore, exactly like the live cell (#7445).
+                // SGR 58 underline colour: capture the packed form (indexed or
+                // RGB) so it re-resolves against the live palette on restore,
+                // like the live cell.
                 if let Some(packed) = extra.underline_color_u32() {
                     result.underline_colors.push((col_u16, packed));
                 }
 
-                // Hyperlink span coalescing (#4149, #4390)
-                // Use col_u16 (physical column) to match restore_hyperlinks.
-                // Extract both URL and ID from the OSC 8 sequence.
+                // Hyperlink span coalescing, keyed by physical column
+                // (col_u16) to match restore_hyperlinks; carries URL and ID.
                 let url = extra.hyperlink().cloned();
                 let id = extra.hyperlink_id().cloned();
                 match (&current_span, url) {
@@ -1661,21 +1522,22 @@ impl Grid {
     /// Coalesce this row's inline-image cells into [`ImageSpan`]s, so a
     /// placement survives the row's trip into scrollback.
     ///
-    /// Scans the FULL physical width (`Row::cols`), not `Row::len()`: an image
-    /// cell carries only a `CellExtra` — `place_image` writes no glyph — so the
-    /// picture lives at columns the length-bounded text walk never visits, and
-    /// on an image-only row `len` is 0. This is the same reason
-    /// `Terminal::images_row_into` scans `0..grid.cols()` on the render side.
+    /// Scans the full physical width (`Row::cols`), not `Row::len()`: an image
+    /// cell carries only a `CellExtra` (`place_image` writes no glyph), so an
+    /// image-only row has `len` 0. `Terminal::images_row_into` scans
+    /// `0..grid.cols()` on the render side for the same reason.
     ///
-    /// Two gates keep the scan off every other row: the collection's sticky
-    /// [`CellExtras::any_image`] flag (false for any session that has never
-    /// drawn a picture — one bool per scrolled row), and then the cell's own
-    /// `HAS_EXTRAS` bit, so the map is probed only where an extra exists at all.
+    /// Two gates keep the scan off other rows: the sticky
+    /// [`CellExtras::any_image`] flag (one bool per scrolled row for sessions
+    /// that never drew a picture), then each cell's `HAS_EXTRAS` bit.
     ///
-    /// Cells are coalesced left to right while they stay on the SAME placement
-    /// (`Arc::ptr_eq`), the same footprint row, and consecutive footprint
-    /// columns — so one span per footprint row in the ordinary case, and a break
-    /// wherever an overwrite or a clipped edge really did interrupt the picture.
+    /// Cells of each image layer coalesce left to right while they stay on the
+    /// same placement (`Arc::ptr_eq` and Kitty tag), footprint row and
+    /// consecutive footprint columns: one span per layer per footprint row
+    /// normally, with a break where an overwrite or clipped edge interrupted
+    /// the picture. Spans are stored in
+    /// [`ImageRef::draw_key`](crate::ImageRef::draw_key) order, the order the
+    /// restore stacks them.
     fn extract_image_spans_into(
         result: &mut ScrolledRowExtras,
         row: &Row,
@@ -1686,74 +1548,65 @@ impl Grid {
             return;
         }
         let cells = row.as_slice();
-        // Open run: (start_col, image_row, first_cell_col, next expected
-        // footprint column, payload).
-        let mut open: Option<(u16, u16, u16, u16, Arc<aterm_types::ImageData>)> = None;
+        // Open runs, each the span it will close as plus the footprint column
+        // its next cell must paint.
+        let mut open: Vec<(ImageSpan, u16)> = Vec::new();
+        let mut done: Vec<ImageSpan> = Vec::new();
+        let continues = |(span, next): &(ImageSpan, u16), layer: &crate::ImageRef| {
+            Arc::ptr_eq(&span.image, &layer.image)
+                && span.kitty == layer.kitty
+                && span.image_row == layer.cell_row
+                && *next == layer.cell_col
+        };
         for (physical_col, cell) in cells.iter().enumerate() {
             let Ok(col_u16) = u16::try_from(physical_col) else {
                 break;
             };
-            // The image ref lives in the map, and the map is only ever probed
+            // The image refs live in the map, and the map is only ever probed
             // for a cell whose own flag says it has an entry.
-            let found = if cell.has_extras() {
+            let layers = if cell.has_extras() {
                 extras
                     .get(CellCoord::new(row_idx, col_u16))
-                    .and_then(|e| e.image())
+                    .map_or(&[][..], CellExtra::images)
             } else {
-                None
+                &[]
             };
-            match (&open, found) {
-                (Some((start, img_row, first, next_cell_col, payload)), Some(iref))
-                    if Arc::ptr_eq(payload, &iref.image)
-                        && iref.cell_row == *img_row
-                        && iref.cell_col == *next_cell_col =>
-                {
-                    // Contiguous continuation of the run: extend by rebuilding
-                    // the tuple with the next expected footprint column.
-                    open = Some((
-                        *start,
-                        *img_row,
-                        *first,
-                        next_cell_col.saturating_add(1),
-                        Arc::clone(payload),
-                    ));
+            // Close every run this column does not continue.
+            let mut at = 0;
+            while at < open.len() {
+                if layers.iter().any(|layer| continues(&open[at], layer)) {
+                    at += 1;
+                } else {
+                    let (mut span, _) = open.swap_remove(at);
+                    span.end_col = col_u16;
+                    done.push(span);
                 }
-                (Some((start, img_row, first, _, payload)), next) => {
-                    result.images.push(ImageSpan::new(
-                        *start,
-                        col_u16,
-                        *img_row,
-                        *first,
-                        Arc::clone(payload),
-                    ));
-                    open = next.map(|iref| {
-                        (
+            }
+            for layer in layers {
+                if let Some(run) = open.iter_mut().find(|run| continues(run, layer)) {
+                    run.1 = run.1.saturating_add(1);
+                } else {
+                    let span = ImageSpan {
+                        kitty: layer.kitty,
+                        ..ImageSpan::new(
                             col_u16,
-                            iref.cell_row,
-                            iref.cell_col,
-                            iref.cell_col.saturating_add(1),
-                            Arc::clone(&iref.image),
+                            col_u16,
+                            layer.cell_row,
+                            layer.cell_col,
+                            Arc::clone(&layer.image),
                         )
-                    });
+                    };
+                    open.push((span, layer.cell_col.saturating_add(1)));
                 }
-                (None, Some(iref)) => {
-                    open = Some((
-                        col_u16,
-                        iref.cell_row,
-                        iref.cell_col,
-                        iref.cell_col.saturating_add(1),
-                        Arc::clone(&iref.image),
-                    ));
-                }
-                (None, None) => {}
             }
         }
-        if let Some((start, img_row, first, _, payload)) = open {
-            let end_col = u16::try_from(cells.len()).unwrap_or(u16::MAX);
-            result
-                .images
-                .push(ImageSpan::new(start, end_col, img_row, first, payload));
-        }
+        let end_col = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+        done.extend(open.into_iter().map(|(mut span, _)| {
+            span.end_col = end_col;
+            span
+        }));
+        done.sort_by_key(|span| aterm_types::layer_order(span.image.z_index, span.kitty));
+        result.images.extend(done);
     }
 
     /// Hyperlink-only extraction for the scrollback-text-only fast path: coalesce
@@ -1811,10 +1664,9 @@ impl Grid {
 
     /// Convert a Row to a Line, preserving all CellExtras data.
     ///
-    /// Test-only: production code uses `row_to_line_with_stored_extras` which
-    /// takes pre-extracted extras from `ring_extras` (#4149, #4215).
-    ///
-    /// This function extracts extras and builds the line in one step.
+    /// Test-only: production uses `row_to_line_with_stored_extras`, which takes
+    /// pre-extracted extras from `ring_extras`. This extracts and builds in one
+    /// step.
     #[cfg(test)]
     pub(crate) fn row_to_line_with_hyperlinks(
         row: &Row,
@@ -1836,9 +1688,8 @@ fn push_cell_text(
 ) -> usize {
     if !cell.is_complex() {
         // NUL (empty cell) → space, matching row_text() in content_queries.rs
-        // and Row::fmt in row/fmt.rs. Without this, search finds different
-        // content for the same row depending on whether it's visible or in
-        // scrollback (#7471).
+        // and Row::fmt in row/fmt.rs, so search sees the same content visible
+        // or in scrollback.
         let ch = cell.char();
         text.push(if ch == '\0' { ' ' } else { ch });
         return 1;
@@ -1889,9 +1740,9 @@ pub(in crate::grid) fn next_combining<'a>(
 }
 
 /// Resolve one channel of a cell's colour the way the Line serializer does:
-/// inline when the cell carries it, else the column's PRE-RESOLVED stored RGB
-/// (extraction already resolved RGB overflow AND `StyleId` at scroll time,
-/// #5890), else the default. Shared with the ring fast materializer.
+/// inline when the cell carries it, else the column's pre-resolved stored RGB
+/// (extraction resolved RGB overflow and `StyleId` at scroll time), else the
+/// default. Shared with the ring fast materializer.
 pub(in crate::grid) fn resolve_cell_color(
     needs_stored: bool,
     inline_raw: u32,
@@ -1915,28 +1766,22 @@ pub(in crate::grid) fn resolve_cell_color(
     }
 }
 
-/// Accumulates a materializing line's attribute runs, allocating NOTHING until
-/// a second distinct `CellAttrs` actually appears.
+/// Accumulates a materializing line's attribute runs, allocating nothing until
+/// a second distinct `CellAttrs` appears.
 ///
-/// WHY: `Line::from_parts` throws the whole `Rle` away when it holds zero runs
-/// or one DEFAULT run — which is the shape of every plain-text line, the
-/// commonest thing a terminal ever scrolls. The old code still built that `Rle`
-/// in full: the first `push` allocated its `runs` vector, every later cell went
-/// through `push` -> `extend_with` -> `remaining_capacity` -> `runs.last_mut()`,
-/// and the finished object was dropped unread. Holding the open run in two
-/// locals instead makes the plain line allocation-free and turns the per-cell
-/// step into one comparison.
+/// `Line::from_parts` discards an `Rle` with zero runs or one default run,
+/// which is every plain-text line. Holding the open run in two locals makes
+/// that case allocation-free and the per-cell step one comparison.
 ///
-/// EQUIVALENCE. The emitted `Rle` is run-for-run identical to the old one in
-/// every case `from_parts` KEEPS, and the only case it differs is the one
-/// `from_parts` discards:
-///   * no cells             -> 0 runs (was: 0 runs)          -> `attrs = None`
-///   * one DEFAULT run      -> 0 runs (was: 1 default run)   -> `attrs = None`
-///   * one non-default run  -> 1 run  (was: 1 run, same)     -> stored
-///   * two or more runs     -> same runs, same order         -> stored
+/// The emitted `Rle` matches a push-per-cell `Rle` in every case
+/// `from_parts` keeps:
+///   * no cells             -> 0 runs                          -> `attrs = None`
+///   * one default run      -> 0 runs (push-per-cell: 1 run)   -> `attrs = None`
+///   * one non-default run  -> 1 run                           -> stored
+///   * two or more runs     -> same runs, same order           -> stored
 ///
-/// A spill only happens on a value CHANGE, so a spilled builder always emits at
-/// least two runs and can never collapse back into the discarded shape.
+/// A spill only happens on a value change, so a spilled builder always emits
+/// at least two runs.
 struct AttrRunBuilder {
     /// Runs already closed out. Empty (and unallocated) until the first spill.
     rle: Rle<CellAttrs>,
@@ -1971,29 +1816,24 @@ impl AttrRunBuilder {
         self.extend(attrs, 1);
     }
 
-    /// PER-CELL HOT PATH — keep it to one comparison and one add.
+    /// Per-cell hot path: one comparison and one add.
     ///
-    /// The `len == 0` case needs no test of its own: a fresh builder's open run
-    /// is `(DEFAULT, 0)`, so a default first cell merges (giving `(DEFAULT, n)`,
-    /// which is right) and a styled first cell falls into `open_new_run`, which
-    /// flushes nothing because `len` is 0.
+    /// `len == 0` needs no separate test: a fresh builder's open run is
+    /// `(DEFAULT, 0)`, so a default first cell merges and a styled one goes to
+    /// `open_new_run`, which flushes nothing.
     ///
-    /// `open_new_run` is deliberately a SEPARATE, non-inlined function: folding
-    /// its `Rle::extend_with` call into this one made the whole thing too big to
-    /// inline into the per-cell materialization loop, and the measured result
-    /// was a 6-11% REGRESSION on the very workloads this change exists to speed
-    /// up. The split is what makes the fast path a straight-line compare.
+    /// `open_new_run` is a separate non-inlined function: folding its
+    /// `Rle::extend_with` in here made this too big to inline into the
+    /// per-cell materialization loop, which measurably regressed it.
     #[inline]
     fn extend(&mut self, attrs: CellAttrs, count: u32) {
         if count == 0 {
             return;
         }
         if self.value == attrs {
-            // A row is at most `u16::MAX` cells wide and each cell contributes a
-            // bounded number of characters, so this sum cannot reach `u32::MAX`;
-            // the saturating form just discharges the overflow obligation, and
-            // `Rle::extend_with` clamps to the remaining capacity at flush
-            // exactly as the old per-cell pushes did.
+            // A row is at most `u16::MAX` cells with bounded characters each, so
+            // this cannot reach `u32::MAX`; saturating discharges the overflow
+            // obligation, and `Rle::extend_with` clamps at flush.
             self.len = self.len.saturating_add(count);
             return;
         }
@@ -2025,10 +1865,9 @@ impl AttrRunBuilder {
 }
 
 fn push_repeated_attrs(attrs_rle: &mut AttrRunBuilder, attrs: CellAttrs, char_count: usize) {
-    // `char_count` copies of ONE value is one run by construction, so hand the
-    // builder the count instead of looping a per-character push. Identical
-    // result: a loop of single pushes clamps each to `min(1, remaining)` for a
-    // total of `min(n, remaining)`, which is what one counted extend does.
+    // `char_count` copies of one value is one run, so extend by the count
+    // instead of pushing per character (same clamping to the remaining
+    // capacity).
     attrs_rle.extend(attrs, u32::try_from(char_count).unwrap_or(u32::MAX));
 }
 
@@ -2074,8 +1913,8 @@ pub(in crate::grid) fn coalesce_underline_spans(per_col: &[(u16, u32)]) -> Vec<U
 mod plain_run_equivalence_tests {
     use super::*;
 
-    // The loop before 90ea59df5, deliberately independent of append_plain_run
-    // and cell_attrs_of. It is the reference for both shipping entry points.
+    // A per-cell reference loop, independent of append_plain_run and
+    // cell_attrs_of, checked against both shipping entry points.
     fn old_cell_loop(cells: &[Cell], wrapped: bool) -> Line {
         let mut text = String::new();
         let mut attrs = AttrRunBuilder::empty();
@@ -2224,12 +2063,10 @@ mod extract_gate_tests {
     use super::*;
     use crate::{CellFlags, PackedColor};
 
-    /// The map-empty gate must never produce a FALSE NEGATIVE: a row whose only
-    /// datum is an RGB colour in the dense ring still has to extract it.
-    ///
-    /// This is the shape `set_range_uniform`'s RGB-only fast path produces — the
-    /// value in the ring, the mode bit on the cell, nothing in the map — i.e.
-    /// exactly the state the new gate reasons about.
+    /// The map-empty gate never gives a false negative: a row whose only datum
+    /// is an RGB colour in the dense ring (as `set_range_uniform`'s RGB-only
+    /// path leaves it: value in the ring, mode bit on the cell, nothing in the
+    /// map) still extracts it.
     #[test]
     fn map_empty_row_with_ring_rgb_still_extracts() {
         let mut grid = Grid::new(3, 8);
@@ -2260,11 +2097,8 @@ mod extract_gate_tests {
         );
     }
 
-    /// An armed ring somewhere else in the grid must not change WHAT a plain row
-    /// extracts — only what it costs. Before the gate, that armed ring put this
-    /// row through the full per-cell pass; after it, the row is decided from its
-    /// own cells. The extracted result is empty either way, and that identity is
-    /// the whole behaviour claim.
+    /// An armed ring elsewhere in the grid changes only the cost of extracting
+    /// a plain row, not the result, which is empty either way.
     #[test]
     fn armed_ring_does_not_change_a_plain_row() {
         let mut grid = Grid::new(3, 8);

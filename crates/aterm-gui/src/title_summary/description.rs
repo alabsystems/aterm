@@ -167,7 +167,7 @@ fn completion_description(command: &str, exit_code: Option<i32>) -> String {
             .unwrap_or(running.as_str());
         return normalize_description(&format!(
             "{} failed (exit {})",
-            uppercase_first(subject),
+            crate::update_words::capitalize_first(subject),
             exit_code.unwrap_or_default()
         ));
     }
@@ -278,14 +278,6 @@ fn cwd_label(cwd: &str) -> String {
         .filter(|part| !part.is_empty())
         .unwrap_or(trimmed)
         .to_string()
-}
-
-fn uppercase_first(value: &str) -> String {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    first.to_uppercase().chain(chars).collect()
 }
 
 /// The uncached full composition. Durable OSC/session metadata remains complete
@@ -412,12 +404,16 @@ pub(super) fn is_generic_description(text: &str) -> bool {
 }
 
 pub(super) fn bounded_text(text: &str, max_chars: usize) -> String {
-    text.chars()
+    let mut out: String = text
+        .chars()
         .filter(|ch| !ch.is_control() && !is_bidi_control(*ch))
         .take(max_chars)
-        .collect::<String>()
-        .trim()
-        .to_string()
+        .collect();
+    // `trim` in place: the same cut points, without a second String.
+    out.truncate(out.trim_end().len());
+    let lead = out.len() - out.trim_start().len();
+    out.drain(..lead);
+    out
 }
 
 /// Sanitize `text` to one canonical line and cap it at `max_graphemes`

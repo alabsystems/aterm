@@ -1,13 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE CRASH JOURNAL (PTY keeper P1, `docs/DESIGN-pty-keeper-2026-09-26.md`
-//! §5.5): the layout a window keeps on disk for as long as it runs, so a run
-//! that does not end cleanly — killed, a fatal signal, a panic — leaves the next
-//! launch something to reopen. Until this existed the only saved layout was the
-//! one written at the last QUIT (`restore::write`), and the next boot consumed it,
-//! so a crashed run left nothing behind: every window, tab and folder went with
-//! the shells.
+//! The crash journal: the layout a window keeps on disk while it runs, so a run
+//! that ends uncleanly (killed, a fatal signal, a panic) leaves the next launch
+//! something to reopen (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.5).
 //!
 //! WHAT IT HOLDS is `session.toml`'s content — the same [`RestoreManifest`], the
 //! same codec, so a journal is itself a valid `session.toml` — plus a `[journal]`
@@ -21,46 +17,41 @@
 //! in the `[journal]` table alone, which leaves had a program other than their
 //! shell running and its name as `status program=` publishes it
 //! ([`JournalHeader::programs`], D16), so a relaunch whose tabs sat at their
-//! prompts lost nothing and says so quietly.
+//! prompts lost nothing and says so quietly; and, on an update's successor,
+//! the pairs each leaf it was handed had before ([`JournalHeader::handed`]).
 //!
-//! WHERE: `journal-<pid>-<nanos>.toml` beside `session.toml`, `0600`, with
-//! `journal-<pid>-<nanos>.lock` beside it. The lock is created under a pending
-//! name, `flock`ed, then renamed into place — the crash marker's pattern
-//! (`crash_signal::markers::create_locked`) — and held for the writer's life, so
-//! another launch tells a live writer's journal from a dead one's by trying it.
-//! Every image is published by a create-new temporary (`O_NOFOLLOW`, `0600`), an
-//! `fsync`, a `rename` over the name and a directory `fsync`: a death mid-write
-//! leaves the previous image whole, and nothing is ever written through a link.
+//! ACROSS AN UPDATE'S COMMIT the image has one owner at every instant: the
+//! successor takes the parent's over before any of its code reads the live
+//! sessions ([`Lane::take_over_at_commit`]), and its own images carry forward
+//! what it took over until it has facts of its own ([`Lane::carry_forward`];
+//! round eight of the update audit, findings 45, 46 and 76).
 //!
-//! WHEN (the writer, [`Lane`]): at most once per [`MIN_WRITE_INTERVAL`], only
-//! when the captured layout differs from the last one written, and nothing while
-//! idle — a capture runs only after a wake that was not a timer (input, a window
-//! event, PTY output, a control request) and at the trailing edge of the
-//! interval. It follows `restore_session` exactly as the quit-time restore does:
-//! off, or headless, and nothing is written (and a journal already written is
-//! withdrawn); a clean quit removes it once the quit's own layout is written.
+//! Files: `journal-<pid>-<nanos>.toml` (`0600`) and a `.lock` beside
+//! `session.toml`. The lock is created under a pending name, `flock`ed and
+//! renamed into place, and held for the writer's life, so a claim tells a live
+//! writer from a dead one by trying it. Each image is a create-new `O_NOFOLLOW`
+//! temporary, `fsync`ed and renamed over the name, then the directory is
+//! `fsync`ed: a death mid-write leaves the previous image whole.
 //!
-//! WHO READS IT ([`claim_at_boot`]): the next launch that reads `session.toml`.
-//! A journal whose writer still holds its lock is never touched. A dead writer's
-//! journal is TAKEN by renaming it to a claim name — the rename is the single-use
-//! point, so of two launches racing for it one finds nothing — and reopened only
-//! when (a) there is no quit layout to reopen, (b) its writer's end was unclean by
-//! that run's crash marker ([`classify_death`]: a panic report, a signal banner,
-//! or an empty marker its dead owner never removed — every clean exit removes
-//! its own), and (c) the brake lets it through: a writer that had itself
-//! reopened a crash journal and then CRASHED within [`PROBATION`] is skipped,
-//! and so is one that was STOPPED within it for the second time in a row
-//! ([`JournalHeader::second_chance`], ruling 285) — a kill is no evidence that
-//! the layout stops aterm (day five, D18: a SIGKILL 70 s after a relaunch
-//! dropped both tabs for good), but a layout that hangs aterm until it is
-//! force-quit is, the second time. So a layout that stops aterm cannot loop,
-//! and one that was merely killed comes back once more. Anything else
-//! taken is set aside with a line in the log; an unclean end's journal that
-//! cannot be read, and one the brake skips, are said on the band as well.
+//! Writing ([`Lane`]): at most once per [`MIN_WRITE_INTERVAL`], only when the
+//! layout changed, and never while idle. It follows `restore_session` (off or
+//! headless: nothing written, an existing journal withdrawn); a clean quit
+//! removes it after writing its own layout.
 //!
-//! The derived machine is `CrashJournalClaim`
-//! (`aterm_spec::derive::crash_journal_claim_model`); Tier-1 is
-//! `crash_journal_conformance.rs`.
+//! Claiming ([`claim_at_boot`]): a journal whose writer holds its lock is never
+//! touched. A dead writer's journal is taken by renaming it to a claim name
+//! (single use), and reopened only when (a) it fits the window cap behind the
+//! last quit's `session.toml`, (b) the writer's crash marker says the end was
+//! unclean ([`classify_death`]), and (c) the brake allows it: a writer that
+//! reopened a crash journal and then crashed within [`PROBATION`], or was
+//! stopped within it twice in a row ([`JournalHeader::second_chance`]), is
+//! skipped, so a layout that stops aterm cannot loop. Anything else taken is set
+//! aside with a log line; unreadable and skipped journals of unclean ends are
+//! also reported on the band, and an unreadable one is kept as
+//! `journal-<pid>-<nanos>.unreadable` (the newest few) for its row to name.
+//!
+//! Model: `CrashJournalClaim` (`aterm_spec::derive::crash_journal_claim_model`);
+//! Tier-1: `crash_journal_conformance.rs`.
 #![cfg_attr(
     not(unix),
     allow(
@@ -71,6 +62,8 @@
 )]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -81,12 +74,9 @@ use crate::restore::RestoreManifest;
 /// capture: a capture that finds nothing new still waits it out.
 pub(crate) const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// At most one journal write per this interval when nothing but titles moved.
-/// A program that animates its title — an agent's spinner — changes it many
-/// times a second, and at the layout's own interval that was a write every 2 s
-/// for as long as it ran (measured 2026-09-26: a 10 Hz title, 24 writes in
-/// 50 s). A title is the least of what a restore carries: the shell sets its
-/// own the moment it starts.
+/// At most one journal write per this interval when only titles changed: an
+/// agent's spinner changes its title many times a second, and the shell resets
+/// its title on start anyway.
 pub(crate) const TITLE_WRITE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a launch that reopened a crash journal must run before its own
@@ -118,11 +108,10 @@ impl JournalId {
         }
     }
 
-    /// THIS run's journal: named for the start its crash marker carries
-    /// (`crash_signal::own_marker_nanos`), so a claim finds exactly that marker
-    /// — under its consumed `.seen` name too, when a launch that does not
-    /// claim read the evidence first ([`classify_death`]). A run with no armed
-    /// marker is named for now, which reads its marker as before.
+    /// This run's journal, named for the start its crash marker carries
+    /// (`crash_signal::own_marker_nanos`) so a claim finds exactly that marker,
+    /// also under its consumed `.seen` name ([`classify_death`]). A run with no
+    /// armed marker is named for now.
     pub(crate) fn of_this_run(pid: u32) -> Self {
         #[cfg(unix)]
         let start = crate::crash_signal::own_marker_nanos();
@@ -156,7 +145,28 @@ impl JournalId {
         Self::parse_stem(name.strip_prefix(NAME_PREFIX)?.strip_suffix(".lock")?)
     }
 
-    fn parse_stem(stem: &str) -> Option<Self> {
+    /// `journal-<pid>-<nanos>.unreadable`: an image a claim could not read,
+    /// kept aside for the person its row names it to. No claim parses it and
+    /// no sweep of leftovers takes it.
+    pub(crate) fn unreadable_name(self) -> String {
+        format!("{NAME_PREFIX}{}-{}.unreadable", self.pid, self.nanos)
+    }
+
+    /// Parse a [`Self::unreadable_name`]; `None` for anything else.
+    fn parse_unreadable(name: &str) -> Option<Self> {
+        Self::parse_stem(
+            name.strip_prefix(NAME_PREFIX)?
+                .strip_suffix(".unreadable")?,
+        )
+    }
+
+    /// `<pid>-<nanos>`: the run a quit's `session.toml` names
+    /// (`restore::write_quit`), which [`Self::parse_stem`] reads back.
+    pub(crate) fn stem(self) -> String {
+        format!("{}-{}", self.pid, self.nanos)
+    }
+
+    pub(crate) fn parse_stem(stem: &str) -> Option<Self> {
         let (pid, nanos) = stem.split_once('-')?;
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         if !digits(pid) || !digits(nanos) {
@@ -182,9 +192,7 @@ fn unix_nanos(time: SystemTime) -> u128 {
 }
 
 /// The journal's own table: who wrote it, and whether it is on probation.
-/// Every field is additive (`serde(default)`), so a journal written by another
-/// build — an older one before an update, a newer one before a rollback —
-/// reads.
+/// Every field is `serde(default)`, so another build's journal reads.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct JournalHeader {
     #[serde(default)]
@@ -198,25 +206,57 @@ pub(crate) struct JournalHeader {
     /// [`PROBATION`] when this image was written.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) probation: bool,
-    /// THE SECOND CHANCE (ruling 285; additive, absent = `false`): the
-    /// writer's own boot reopened a journal whose writer had been on
-    /// probation and was STOPPED (killed, not crashed) — the brake let that
-    /// layout through once. Meaningful only with [`Self::probation`]: a
-    /// writer that dies inside its probation with this mark is skipped
-    /// however it died, so a layout that hangs aterm until it is force-quit
-    /// comes back at most once more.
+    /// The writer's boot reopened a journal whose writer was on probation and
+    /// was stopped (not crashed). With [`Self::probation`], a writer that dies
+    /// inside its probation with this mark is skipped however it died, so a
+    /// layout that hangs aterm comes back at most once more.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) second_chance: bool,
-    /// THE PROGRAMS (D16, ruling 282; additive, absent tolerated): every
-    /// terminal leaf whose foreground was a job — a program other than its
-    /// login shell at the prompt — when this image was captured, by its place
-    /// in the layout. ABSENT is UNKNOWN (a writer from before this field): the
-    /// reopened row keeps saying the programs were lost. PRESENT AND EMPTY is
-    /// the quiet case: every leaf sat at its shell's prompt, so a relaunch lost
-    /// nothing a person was running.
+    /// Every terminal leaf whose foreground was a program other than its shell
+    /// when the image was captured. `None` is unknown (the row says programs
+    /// were lost); empty means every leaf sat at its prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) programs: Option<Vec<LeafProgram>>,
+    /// The writing build names its run in `session.toml` at quit
+    /// (`restore::write_quit`), so this image is never an unstamped quit
+    /// layout's own run's ([`QuitLayout::may_be_its_run`]). `false` for an older
+    /// build's image, or one a successor adopted and has not rewritten. A mark
+    /// rather than the `build` string, since a dev build number is a commit date.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) stamps_quit: bool,
+    /// THE SHELLS THIS WRITER WAS HANDED (round eight of the update audit,
+    /// finding 46; additive, absent = none): for each leaf whose session an
+    /// update's parent handed the writer, the `(pid, id)` pairs it had in the
+    /// windows before — its parent's first, then the pair the parent's record
+    /// said its journal's image keyed it by (`SessionRecord::journal_key`, when
+    /// that image was not the parent's own), then what that parent's own image
+    /// said it had been handed as, at most [`MAX_HANDED_GENERATIONS`]. The
+    /// PTY keeper holds a shell under the LAST registration that reached it,
+    /// which is a parent's while the successor's own never arrived (a link
+    /// that did not start, a crash inside the delivery), so a claim places a
+    /// kept shell by these pairs as well as by the leaf's own id
+    /// (`keeper_link::place_by_owner`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) handed: Vec<Handed>,
 }
+
+/// One pair a leaf's session had before an update handed it on
+/// ([`JournalHeader::handed`]): the image's leaf `id` (its writer's pool id)
+/// was shell `was` of the window process `pid`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Handed {
+    #[serde(default)]
+    pub(crate) id: u64,
+    #[serde(default)]
+    pub(crate) pid: u32,
+    #[serde(default)]
+    pub(crate) was: u64,
+}
+
+/// How many updates back a leaf names the pairs it was handed as
+/// ([`JournalHeader::handed`]): each one is a successor whose keeper
+/// registration never reached the keeper, in a row.
+pub(crate) const MAX_HANDED_GENERATIONS: usize = 8;
 
 /// One terminal leaf that had a program running (D16): the window and tab it
 /// sits in (their places in the image's own layout, `restored_tabs` order),
@@ -230,13 +270,17 @@ pub(crate) struct LeafProgram {
     pub(crate) tab: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) program: String,
-    /// P6a (ruling 293; additive, absent = `false`): this leaf's restore
-    /// carries its agent's relaunch record ([`crate::restore::TerminalLeafRestore::agent`]),
-    /// so the program is that agent, which the next launch relaunches on its
-    /// conversation ([`Reopened::resumed`]) instead of losing it. An older
-    /// writer's entry reads as a program lost, as it always did.
+    /// This leaf's restore carries its agent's relaunch record
+    /// ([`crate::restore::TerminalLeafRestore::agent`]), so the program is that
+    /// agent, relaunched on its conversation ([`Reopened::resumed`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) agent: bool,
+    /// This leaf's session was already captured at an earlier leaf of the same
+    /// image (a session shown in two windows): its tab counts, its program
+    /// does not count again ([`Reopened::lost_given`]). `false` in an older
+    /// writer's image, whose every entry counts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) again: bool,
 }
 
 /// The most leaves' programs one image names: every leaf a layout may carry
@@ -246,9 +290,8 @@ const MAX_PROGRAM_ENTRIES: usize = 4096;
 /// The longest program name kept from a journal (`session_program`'s cap).
 const MAX_PROGRAM_NAME: usize = 32;
 
-/// A journal is operator-writable: keep at most [`MAX_PROGRAM_ENTRIES`], and
-/// a name only when it is the token `status program=` would publish (else it
-/// reads as unnamed — the program still ran).
+/// A journal is operator-writable: keep at most [`MAX_PROGRAM_ENTRIES`], and a
+/// name only when it is a token `status program=` would publish (else unnamed).
 fn sanitize_programs(programs: &mut Vec<LeafProgram>) {
     programs.truncate(MAX_PROGRAM_ENTRIES);
     for entry in programs.iter_mut() {
@@ -270,6 +313,31 @@ impl JournalHeader {
         self
     }
 
+    /// This header naming the pairs its leaves were handed as
+    /// ([`Self::handed`]).
+    pub(crate) fn with_handed(mut self, handed: Vec<Handed>) -> Self {
+        self.handed = handed;
+        self
+    }
+
+    /// WHOSE POOL IDS THE IMAGE'S LEAVES CARRY: the process that wrote the
+    /// image, which its header names — not the process whose name the journal
+    /// file has (`id`). The two differ after an update's Commit: the successor
+    /// renames its parent's image onto its own name ([`JournalOwner::adopt`]),
+    /// and until it publishes its own, the leaves still carry the PARENT's
+    /// `session.id`s. Keying them by the successor would let a parent leaf 3
+    /// take the successor's session 3, a different shell (round seven of the
+    /// update audit, finding 5's review). The successor's Commit re-registers
+    /// the parent's shells in the keeper under its own (window, id), and each
+    /// such registration also names the parent's pair it was
+    /// (`keeper_link::Tag::handed`), which is what matches these leaves (its
+    /// second review). A header with no pid (a writer from before the field)
+    /// is its file's own.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn image_writer(&self, id: JournalId) -> u32 {
+        if self.pid == 0 { id.pid } else { self.pid }
+    }
+
     /// This process's header, written now.
     pub(crate) fn now(pid: u32, probation: bool) -> Self {
         Self {
@@ -277,16 +345,14 @@ impl JournalHeader {
             build: format!(
                 "{} ({})",
                 aterm_types::version::APP_VERSION,
-                crate::build_info::BUILD_NUMBER
+                crate::build_info::build_number()
             ),
-            written_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| {
-                    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-                }),
+            written_unix_ms: aterm_time::unix_millis().unwrap_or(0),
             probation,
             second_chance: false,
             programs: None,
+            stamps_quit: true,
+            handed: Vec::new(),
         }
     }
 
@@ -303,9 +369,9 @@ struct HeaderDoc {
     journal: JournalHeader,
 }
 
-/// One journal image: the layout exactly as `session.toml` holds it, then the
-/// `[journal]` table — a new top-level table after the layout's own, so the
-/// text parses as a `session.toml` too.
+/// One journal image: the layout as `session.toml` holds it, then the
+/// `[journal]` table as a new top-level table, so the text parses as a
+/// `session.toml` too.
 pub(crate) fn encode(manifest: &RestoreManifest, header: &JournalHeader) -> Result<String, String> {
     let mut text = manifest.to_toml()?;
     let head = aterm_toml::to_string(&HeaderDoc {
@@ -329,6 +395,10 @@ pub(crate) fn decode(text: &str) -> Result<(JournalHeader, RestoreManifest), Str
     if let Some(programs) = header.programs.as_mut() {
         sanitize_programs(programs);
     }
+    // Operator-writable too: at most every generation of every leaf.
+    header
+        .handed
+        .truncate(MAX_PROGRAM_ENTRIES * MAX_HANDED_GENERATIONS);
     let manifest = RestoreManifest::from_toml(text)
         .ok_or_else(|| "its layout is not one this build reads".to_string())?;
     Ok((header, manifest))
@@ -389,14 +459,17 @@ pub(crate) struct Reopened {
     /// the PTY keeper kept is matched only to its own writer's leaves
     /// (`keeper_link::place_by_owner`).
     pub(crate) writers: Vec<u32>,
+    /// What each writer's leaves were handed as ([`JournalHeader::handed`]),
+    /// by the writer: a kept shell the keeper still holds under one of those
+    /// pairs fills that leaf too (round eight of the update audit, finding 46).
+    pub(crate) handed: Vec<(u32, Handed)>,
     /// The leaves that had a program running, their windows counted in this
     /// merged layout; `None` when any source journal did not say (an older
     /// writer's), which reads as today's "programs lost" (D16, ruling 282).
     pub(crate) programs: Option<Vec<LeafProgram>>,
-    /// A source journal's writer was itself on probation and was stopped
-    /// (ruling 285): the brake let it through once, and this launch's own
-    /// journal carries [`JournalHeader::second_chance`] through its
-    /// probation.
+    /// A source journal's writer was on probation and was stopped: the brake
+    /// let it through once, and this launch's journal carries
+    /// [`JournalHeader::second_chance`] through its probation.
     pub(crate) second_chance: bool,
 }
 
@@ -406,7 +479,8 @@ pub(crate) struct Reopened {
 pub(crate) struct Lost {
     pub(crate) tabs: usize,
     pub(crate) named: Vec<String>,
-    /// Leaves whose program's name was not resolved yet.
+    /// Programs whose name was not resolved yet, one per session however many
+    /// tabs showed it ([`LeafProgram::again`]).
     pub(crate) unnamed: usize,
 }
 
@@ -445,35 +519,50 @@ impl Reopened {
         (windows, tabs)
     }
 
-    /// THE AGENTS THAT COME BACK (P6a, ruling 293): one `(window, tab)` per
-    /// terminal leaf whose restore carries an agent the next launch
-    /// relaunches on its conversation — when it relaunches at all
-    /// (`relaunching`: the supervisor host will,
-    /// [`crate::harness_host::HostHandle::relaunches_restored`]) and the
-    /// record is one the relaunch brings back
-    /// ([`crate::restore::AgentRestore::resumes`]). In layout order.
+    /// One `(window, tab)` per agent the next launch relaunches on its
+    /// conversation, at the first terminal leaf that names it, in layout
+    /// order: only when `relaunching`
+    /// ([`crate::harness_host::HostHandle::relaunches_restored`]) and the record
+    /// resumes ([`crate::restore::AgentRestore::resumes`]). A session shown in
+    /// two windows names its agent on both leaves, and it is relaunched once,
+    /// at the first ([`crate::restore::AgentRestore::ran_as`]).
     pub(crate) fn resumed(&self, relaunching: bool) -> Vec<(u32, u32)> {
-        fn walk(
-            node: &crate::restore::RestoredSplitTree,
+        self.resuming_leaves(relaunching, true)
+    }
+
+    /// [`Self::resumed`], or with `once` false one `(window, tab)` per LEAF
+    /// naming such an agent: a co-viewed session's second leaf too, whose
+    /// agent comes back at the first ([`Self::lost_given`]).
+    fn resuming_leaves(&self, relaunching: bool, once: bool) -> Vec<(u32, u32)> {
+        fn walk<'a>(
+            node: &'a crate::restore::RestoredSplitTree,
             place: (u32, u32),
+            seen: &mut Option<Vec<(u32, &'a str)>>,
             out: &mut Vec<(u32, u32)>,
         ) {
             match node {
                 crate::restore::RestoredSplitTree::Leaf {
                     view: crate::restore::RestoredView::Terminal(leaf),
                 } => {
-                    if leaf
+                    if let Some(agent) = leaf
                         .agent
                         .as_deref()
-                        .is_some_and(crate::restore::AgentRestore::resumes)
+                        .filter(|agent| agent.resumes())
+                        .filter(|agent| {
+                            seen.as_ref()
+                                .is_none_or(|seen| !seen.contains(&agent.ran_as()))
+                        })
                     {
+                        if let Some(seen) = seen {
+                            seen.push(agent.ran_as());
+                        }
                         out.push(place);
                     }
                 }
                 crate::restore::RestoredSplitTree::Leaf { .. } => {}
                 crate::restore::RestoredSplitTree::Split { first, second, .. } => {
-                    walk(first, place, out);
-                    walk(second, place, out);
+                    walk(first, place, seen, out);
+                    walk(second, place, seen, out);
                 }
             }
         }
@@ -481,27 +570,24 @@ impl Reopened {
         if !relaunching {
             return out;
         }
+        let mut seen = once.then(Vec::new);
         for (window, layout) in self.manifest.windows.iter().enumerate() {
             for (tab, restored) in layout.restored_tabs.iter().enumerate() {
                 let place = (
                     u32::try_from(window).unwrap_or(u32::MAX),
                     u32::try_from(tab).unwrap_or(u32::MAX),
                 );
-                walk(&restored.root, place, &mut out);
+                walk(&restored.root, place, &mut seen, &mut out);
             }
         }
         out
     }
 
-    /// The layout's terminal panes that name a folder no shell can start in
-    /// (`not_found`: the check the spawn itself makes,
-    /// [`crate::spawn_folder::folder_fault`]) — what the reopened row counts
-    /// rather than claim every tab came back in its folder (audit #7 finding
-    /// 48). The tree a window restores from: its canonical tabs, else the
-    /// legacy mirror (`restore_into_window`). A pane a program held
-    /// ([`crate::restore::TerminalLeafRestore::folder_may_be_remote`]) counts
-    /// apart, as [`PanesWithoutFolder::unasked`]: its restore does not ask for
-    /// that folder.
+    /// The layout's terminal panes whose folder no shell can start in
+    /// (`not_found`, the spawn's own check [`crate::spawn_folder::folder_fault`]),
+    /// counted from each window's canonical tabs, else its legacy mirror. Panes
+    /// a program held ([`crate::restore::TerminalLeafRestore::folder_may_be_remote`])
+    /// count apart as [`PanesWithoutFolder::unasked`].
     pub(crate) fn panes_without_folder(
         &self,
         not_found: impl Fn(&str) -> bool,
@@ -553,15 +639,16 @@ impl Reopened {
     }
 
     /// What was lost with the programs, or `None` when the journals did not
-    /// say (today's wording). A leaf is counted only when its window and tab
-    /// are in the layout reopened; two programs in one tab's splits are one
-    /// tab. An agent the next launch relaunches on its conversation
-    /// (`relaunching`, [`Self::resumed`]) is not lost (P6a, ruling 293): an
-    /// entry the writer marked as its leaf's agent ([`LeafProgram::agent`])
-    /// is left out, as many in a tab as that tab has agents coming back.
+    /// say. A leaf counts only when its window and tab are reopened; programs in
+    /// one tab's splits count as one tab. Agents relaunched on their
+    /// conversation (`relaunching`, [`Self::resumed`]) are not lost: entries
+    /// marked [`LeafProgram::agent`] are left out, up to the count of that
+    /// tab's leaves naming one — a co-viewed session's second leaf too, its
+    /// agent relaunched at the first. Every other program counts in every tab
+    /// that showed it, and once among the programs ([`LeafProgram::again`]).
     pub(crate) fn lost_given(&self, relaunching: bool) -> Option<Lost> {
         let programs = self.programs.as_ref()?;
-        let mut coming_back = self.resumed(relaunching);
+        let mut coming_back = self.resuming_leaves(relaunching, false);
         let mut tabs = Vec::new();
         let mut named: Vec<String> = Vec::new();
         let mut unnamed = 0usize;
@@ -583,6 +670,9 @@ impl Reopened {
             if !tabs.contains(&(entry.window, entry.tab)) {
                 tabs.push((entry.window, entry.tab));
             }
+            if entry.again {
+                continue;
+            }
             if entry.program.is_empty() {
                 unnamed += 1;
             } else if !named.contains(&entry.program) {
@@ -602,18 +692,19 @@ impl Reopened {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Note {
     /// It could not be read (a torn file after a power loss, a newer schema, a
-    /// planted link): set aside.
+    /// planted link): set aside, and kept at `path`
+    /// ([`JournalId::unreadable_name`]); `None`, a link or a file that could
+    /// not be kept, is gone.
     Unreadable {
         id: JournalId,
         class: DeathClass,
-        path: PathBuf,
+        path: Option<PathBuf>,
         error: String,
     },
-    /// Its writer had reopened a crash journal and CRASHED within
-    /// [`PROBATION`], or was stopped within it a second time in a row
-    /// ([`JournalHeader::second_chance`]): skipped, so a layout that stops
-    /// aterm cannot loop. What the skipped layout held rides along for the
-    /// row (day five, D18: it named nothing).
+    /// The writer reopened a crash journal and crashed within [`PROBATION`],
+    /// or was stopped within it twice in a row ([`JournalHeader::second_chance`]):
+    /// skipped, so a layout that stops aterm cannot loop. Carries what the
+    /// skipped layout held, for the row.
     Relapsed {
         id: JournalId,
         class: DeathClass,
@@ -636,11 +727,109 @@ pub(crate) struct BootClaim {
     pub(crate) set_aside: Vec<(JournalId, &'static str)>,
 }
 
-/// The journal directory: beside `session.toml`, so it follows a development
-/// build's `ATERM_STATE_HOME` as the manifest does (ruling 406: an instance with its
-/// own state root never claims another's journals). `None` when no data dir
-/// resolves, or when that seam is relative or empty (then nothing is claimed
-/// and the journal is off: ruling 408).
+/// The last quit's `session.toml` a launch reopens before any crash journal:
+/// how many windows it holds, the run that wrote it, when it names one
+/// (`restore::quit_run_of`), the runs of the other instances' desks it holds
+/// behind that one's (`restore::quit_also_of`), its shape ([`desk_shape`]),
+/// and when it was written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct QuitLayout {
+    pub(crate) windows: usize,
+    pub(crate) run: Option<JournalId>,
+    pub(crate) also: Vec<JournalId>,
+    /// Every window's tab count, in order: what an unstamped quit layout (which
+    /// names no run) is matched against.
+    pub(crate) shape: Vec<usize>,
+    /// When the quit wrote it, Unix milliseconds (`None`: unknown). A quit
+    /// writes its layout after its journal's last image, so an image dated
+    /// later (beyond [`QUIT_DATE_SLACK_MS`]) is never that quit's own.
+    pub(crate) written_unix_ms: Option<u64>,
+}
+
+/// How much later than an unstamped quit layout's date a journal image may be
+/// and still be that quit's own: the layout's date is a file mtime (HFS+
+/// truncates up to 1 s, FAT up to 2 s), the image's is milliseconds.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const QUIT_DATE_SLACK_MS: u64 = 2_000;
+
+impl QuitLayout {
+    /// The quit layout `manifest` (`None`: no quit layout), written by `run`
+    /// at `written_unix_ms`.
+    pub(crate) fn of(
+        manifest: Option<&RestoreManifest>,
+        run: Option<JournalId>,
+        written_unix_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            windows: manifest.map_or(0, |manifest| manifest.windows.len()),
+            run,
+            also: Vec::new(),
+            shape: manifest.map(desk_shape).unwrap_or_default(),
+            written_unix_ms: manifest.and(written_unix_ms),
+        }
+    }
+
+    /// This quit layout, holding behind its own quit's desk those of the
+    /// other runs `also` names by stem (`restore::quit_also_of`).
+    pub(crate) fn holding(mut self, also: &[String]) -> Self {
+        self.also = also
+            .iter()
+            .filter_map(|run| JournalId::parse_stem(run))
+            .collect();
+        self
+    }
+
+    /// Whether run `id`'s desk is in this quit layout, its own quit's or one
+    /// it kept: a journal `id` left is then that quit's own, cut short.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn names(&self, id: JournalId) -> bool {
+        self.run == Some(id) || self.also.contains(&id)
+    }
+
+    /// A quit layout is there and names no run: an older build wrote it
+    /// (before the `[quit] run` stamp).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn unstamped(&self) -> bool {
+        self.windows > 0 && self.run.is_none()
+    }
+
+    /// Whether an image of `manifest` with `header` can be this unstamped
+    /// quit's own run's, left when the quit was cut short before its journal
+    /// went. All three must hold:
+    ///
+    /// - its writer does not stamp its quits ([`JournalHeader::stamps_quit`]);
+    /// - the desk has the quit layout's shape;
+    /// - the image is no newer than the layout (within [`QUIT_DATE_SLACK_MS`]);
+    ///   a layout of unknown date skips this test.
+    ///
+    /// An unmarked same-shape image written before the quit by another instance
+    /// also passes and is set aside: nothing on disk tells it apart.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn may_be_its_run(&self, header: &JournalHeader, manifest: &RestoreManifest) -> bool {
+        self.unstamped()
+            && !header.stamps_quit
+            && desk_shape(manifest) == self.shape
+            && self.written_unix_ms.is_none_or(|quit| {
+                header.written_unix_ms <= quit.saturating_add(QUIT_DATE_SLACK_MS)
+            })
+    }
+}
+
+/// A layout's shape: every window's tab count (terminal, legacy and native), in
+/// window order.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn desk_shape(manifest: &RestoreManifest) -> Vec<usize> {
+    manifest
+        .windows
+        .iter()
+        .map(|window| window.restored_tabs.len() + window.tabs.len() + window.native_tabs.len())
+        .collect()
+}
+
+/// The journal directory, beside `session.toml` (so it follows a dev build's
+/// `ATERM_STATE_HOME`). `None` when no data dir resolves or that override is
+/// relative or empty; then nothing is claimed and the journal is off.
 pub(crate) fn journal_dir() -> Option<PathBuf> {
     crate::restore::manifest_path().and_then(|path| path.parent().map(Path::to_path_buf))
 }
@@ -655,7 +844,7 @@ pub(crate) fn claim_at_boot(
     _dir: &Path,
     _evidence: &Evidence<'_>,
     _own_pid: u32,
-    _quit_layout: bool,
+    _quit: QuitLayout,
 ) -> BootClaim {
     BootClaim::default()
 }
@@ -673,19 +862,24 @@ mod unix {
 
     use super::{
         BootClaim, DeathClass, Evidence, JournalHeader, JournalId, MAX_JOURNAL_BYTES, NAME_PREFIX,
-        Note, Reopened, decode, encode, unix_nanos,
+        Note, QuitLayout, Reopened, decode, encode, unix_nanos,
     };
     use crate::crash_signal::markers::{self, Owner};
+    use crate::durable::fsync;
     use crate::restore::RestoreManifest;
 
-    /// THE WRITER'S HALF: this process's journal, its lifetime lock held.
+    /// The writer's half: this process's journal, its lifetime lock held.
     #[derive(Debug)]
     pub(crate) struct JournalOwner {
         dir: PathBuf,
         id: JournalId,
         /// The `flock` on `journal-<pid>-<nanos>.lock`, held until this process
-        /// ends (however it ends) or [`Self::retire`] runs. Close-on-exec: a
-        /// shell this process spawns must not keep it alive.
+        /// ends (however it ends) or [`Self::retire`] runs. Close-on-exec, and
+        /// let go by `LOCK_UN` when the owner drops in-process (`retire`, the
+        /// writer thread's end), so a child forked meanwhile that has yet to
+        /// `exec` does not keep it. A SIGKILL runs no drop: the kernel frees
+        /// the lock once every copy of its description closes, so such a child
+        /// keeps it until its `exec` — the window the claim reads as live.
         _lock: OwnedFd,
     }
 
@@ -712,6 +906,63 @@ mod unix {
             })
         }
 
+        /// THE SUCCESSOR'S TAKE-OVER AT COMMIT (round seven of the update
+        /// audit, findings 5 and 27): arm this process's journal as
+        /// [`Self::create`] does, then move the newest journal of
+        /// `predecessor` — the update's parent, whose `_exit` after Commit is a
+        /// clean end that leaves its image behind — onto this journal's name by
+        /// one `rename`. From that instant the layout the parent last wrote is
+        /// THIS run's image, judged by THIS run's crash evidence: a successor
+        /// that dies before its own first image leaves the desk to reopen
+        /// instead of two runs that each look clean, and no parent journal is
+        /// left behind to pile up, one per update, until a cold launch. Its
+        /// own next image replaces it as any rewrite does. `Ok(None)`: the
+        /// parent left no image (it wrote none, or `restore_session` was off).
+        ///
+        /// ONLY WHAT MUST COME BEFORE ANY READER (finding 45's review): the
+        /// Commit waiter runs this before it releases the adopted readers, so
+        /// it is one lock created, one directory read and one rename — a death
+        /// of this process undoes no rename. Making it durable and clearing the
+        /// parent's lock come after the readers run ([`settle_adoption`]).
+        ///
+        /// `born` is the parent's start (unix nanos); a journal of the same pid
+        /// named earlier is an older run's unclaimed crash, and is left for the
+        /// next claim. One second of slack absorbs a clock step; `None` bounds
+        /// nothing.
+        #[cfg_attr(
+            test,
+            aterm_spec::refines(
+                machine = "CrashJournalClaim",
+                action = "Adopt",
+                project = "aterm_gui::crash_journal_conformance::Rig::project"
+            )
+        )]
+        pub(crate) fn adopt(
+            dir: &Path,
+            id: JournalId,
+            predecessor: u32,
+            born: Option<u128>,
+        ) -> Result<(Self, Option<JournalId>), String> {
+            const SLACK_NANOS: u128 = 1_000_000_000;
+            let owner = Self::create(dir, id)?;
+            let not_before = born.map_or(0, |born| born.saturating_sub(SLACK_NANOS));
+            let parent = fs::read_dir(dir)
+                .map_err(|error| format!("read {}: {error}", dir.display()))?
+                .flatten()
+                .filter_map(|entry| JournalId::parse(entry.file_name().to_str()?))
+                .filter(|found| {
+                    found.pid == predecessor && *found != id && found.nanos >= not_before
+                })
+                .max();
+            let Some(parent) = parent else {
+                return Ok((owner, None));
+            };
+            let from = dir.join(parent.file_name());
+            fs::rename(&from, owner.path())
+                .map_err(|error| format!("take {}: {error}", from.display()))?;
+            Ok((owner, Some(parent)))
+        }
+
         #[cfg(test)]
         pub(crate) fn id(&self) -> JournalId {
             self.id
@@ -722,11 +973,9 @@ mod unix {
             self.dir.join(self.id.file_name())
         }
 
-        /// Publish one image: a create-new, no-follow, `0600` temporary, its
-        /// bytes `fsync`ed, renamed over the journal's name, the directory
-        /// `fsync`ed. The name holds the previous whole image until the rename,
-        /// and the rename replaces a link rather than writing through it. The
-        /// probation mark rides the header, so a settle is a publish too.
+        /// Publish one image: create-new, no-follow `0600` temporary, `fsync`,
+        /// rename over the journal's name, directory `fsync`. The probation mark
+        /// rides the header, so settling probation is a publish too.
         #[cfg_attr(
             test,
             aterm_spec::refines(
@@ -758,10 +1007,9 @@ mod unix {
             remove_if_present(&self.path())
         }
 
-        /// THE CLEAN QUIT: remove the image, then the lock file, then release
-        /// the lock. In that order: a death between the steps leaves a dead lock
-        /// with no image, which the next claim clears, never an image with no
-        /// lock to try.
+        /// The clean quit: remove the image, then the lock file, then release
+        /// the lock. A death between steps leaves a dead lock with no image,
+        /// never an image with no lock to try.
         #[cfg_attr(
             test,
             aterm_spec::refines(
@@ -776,6 +1024,60 @@ mod unix {
             let _ = sync_dir(&self.dir);
             drop(self);
             removed
+        }
+    }
+
+    impl Drop for JournalOwner {
+        /// The lock goes the moment the owner does, by `LOCK_UN` and not by
+        /// the close alone (the product fd-hygiene sweep of 2026-09-27,
+        /// `native_document_host::HeldAdvisoryLock`): a child any thread of
+        /// this process forked while the lock was held keeps a copy of its
+        /// description until that child's `exec`, and a lock released only by
+        /// the close stays taken on that copy for the child's whole fork→exec
+        /// window — which a child that demoted itself first (the managed
+        /// Ollama daemon's spawn did, until its parent took the demotion
+        /// after the exec) stretched past ten seconds on a loaded host. `LOCK_UN` strips the
+        /// lock from the description itself, the child's copy included.
+        fn drop(&mut self) {
+            // SAFETY: `flock` on the descriptor this owner holds open until
+            // its field drops right after; LOCK_UN never waits.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the release: LOCK_UN before the descriptor closes"
+            )]
+            unsafe {
+                libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN)
+            };
+        }
+    }
+
+    /// THE TAKE-OVER'S SECOND HALF, once the readers run
+    /// ([`JournalOwner::adopt`] took `parent`'s journal into `dir`): the
+    /// rename made durable (the directory `fsync`ed: a power loss can undo
+    /// it, a death of this process cannot), and the parent's lock removed
+    /// once nobody holds it. Answers that lock while its owner still does —
+    /// microseconds after the Commit the parent is still inside its `_exit`'s
+    /// teardown — for the writer to clear later ([`clear_dead_lock`]): an
+    /// updated-in-place daily driver never retires the journal it hands off,
+    /// so nothing else would before a cold launch, one stray lock per update
+    /// (finding 45's review; finding 65's class).
+    pub(crate) fn settle_adoption(dir: &Path, parent: JournalId) -> Option<PathBuf> {
+        let _ = sync_dir(dir);
+        let lock = dir.join(parent.lock_name());
+        (!clear_dead_lock(&lock)).then_some(lock)
+    }
+
+    /// Remove `lock` if nobody holds it. `false` while somebody does (it is
+    /// still to clear); `true` once it is gone, or it is nothing to clear (no
+    /// such file, or none this probe can open).
+    pub(crate) fn clear_dead_lock(lock: &Path) -> bool {
+        match markers::probe(lock) {
+            Owner::Live => false,
+            Owner::Dead => {
+                let _ = fs::remove_file(lock);
+                true
+            }
+            Owner::Unknown => true,
         }
     }
 
@@ -813,20 +1115,6 @@ mod unix {
         result
     }
 
-    /// A plain `fsync(2)`, not std's `F_FULLFSYNC`: the journal exists for a
-    /// PROCESS death, which the page cache already survives; this orders the
-    /// bytes before the rename for a machine that loses power too, without
-    /// flushing the drive's cache every two seconds while a layout moves. A
-    /// torn image after a power loss is read as unreadable and said.
-    fn fsync(file: &File) -> std::io::Result<()> {
-        // SAFETY: `fsync` on a descriptor this `File` owns for the call.
-        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
-
     fn sync_dir(dir: &Path) -> std::io::Result<()> {
         fsync(&File::open(dir)?)
     }
@@ -849,19 +1137,6 @@ mod unix {
         Err("could not allocate a journal temporary".to_string())
     }
 
-    /// Whether `pid` names a live process (`kill(pid, 0)`; `EPERM` is alive).
-    fn pid_alive(pid: u32) -> bool {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        if pid <= 0 {
-            return false;
-        }
-        // SAFETY: signal 0 performs the existence and permission checks only.
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-
     /// Whether `id`'s writer is gone: its lock can be taken, or — its lock file
     /// missing — its pid names no process. A lock that cannot be tried for
     /// another reason is no evidence, and the journal is left alone.
@@ -872,38 +1147,52 @@ mod unix {
             Owner::Live => false,
             Owner::Unknown => {
                 matches!(fs::symlink_metadata(&lock), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-                    && !pid_alive(id.pid)
+                    && !aterm_uds::process::pid_alive(id.pid)
             }
         }
     }
 
-    /// HOW `id`'S WRITER ENDED, by its run's crash evidence in the log dir —
-    /// `None` when nothing says the end was unclean, which is what every clean
-    /// exit leaves: `atexit` and `clean_exit_now` remove the run's own crash
-    /// marker (the quit, and the update parent's `_exit` after Commit). Only
-    /// evidence of THIS run counts: a marker of the same pid named for a later
-    /// start than the journal's (a later process that reused the pid) is not
-    /// its, and everything older was consumed or swept at the writer's own
-    /// windowed boot.
+    /// How `id`'s writer ended, from its run's crash evidence in the log dir;
+    /// `None` when nothing says the end was unclean (every clean exit removes
+    /// its marker). Only this run's evidence counts:
     ///
-    /// * a panic report `crash-<pid>.log` written after the journal's start —
-    ///   [`DeathClass::Panic`] (the unwind ran `atexit`, so no marker is left);
-    /// * the run's marker `crash-marker-<pid>-<nanos>-*.log`, the newest named
-    ///   no later than the journal: non-empty — [`DeathClass::Signal`]; empty —
-    ///   [`DeathClass::Killed`] (its owner is dead, and never removed it);
-    /// * a legacy non-empty `crash-signal-<pid>-<nanos>.log` — a signal;
-    /// * a dead empty marker of the run that this launch's own install-time
-    ///   sweep removed before the claim (a dev or test start's, which is no row
-    ///   but is still this evidence) — killed;
-    /// * the run's OWN marker, exactly (its `<nanos>` is the journal's, which
-    ///   [`super::JournalId::of_this_run`] names it for), under the `.seen` name
-    ///   an earlier windowed launch that did not claim gave it when it read the
-    ///   evidence — an update's successor, a launch with `restore_session` off —
-    ///   by its length as above. Only the exact marker: an older run of the same
-    ///   pid keeps its consumed marker for eight launches. A consumed PANIC
-    ///   report is not read: a worker thread's panic files one while the
-    ///   process lives on, so one under `.seen` says nothing about the end.
-    pub(crate) fn classify_death(evidence: &Evidence<'_>, id: JournalId) -> Option<DeathClass> {
+    /// * a panic report `crash-<pid>.log` written after the journal's start:
+    ///   [`DeathClass::Panic`];
+    /// * the run's marker `crash-marker-<pid>-<nanos>-*.log` (newest named no
+    ///   later than the journal): non-empty is [`DeathClass::Signal`], empty is
+    ///   [`DeathClass::Killed`];
+    /// * a legacy non-empty `crash-signal-<pid>-<nanos>.log`: a signal;
+    /// * an empty marker of the run that this launch's install-time sweep
+    ///   removed: killed;
+    /// * the run's own marker exactly (its `<nanos>` is the journal's, see
+    ///   [`super::JournalId::of_this_run`]) under the `.seen` name an earlier
+    ///   non-claiming launch gave it, classified by length as above;
+    /// * a consumed `crash-<pid>.log.seen` whose first line marks a main-thread
+    ///   panic (`logging::MAIN_THREAD_PANIC`): [`DeathClass::Panic`]. A worker
+    ///   thread's panic says nothing about the end.
+    ///
+    /// A panic report is named by pid alone, so it counts only for its own
+    /// run. One that NAMES its run (`logging::REPORT_RUN`: the start its
+    /// crash marker is named for, which the journal is named for too) counts
+    /// for exactly that run (round eight of the update audit, finding 47: a
+    /// later headless run of the pid leaves no journal, and no marker once
+    /// its unwind or a sweep removed it, so nothing else bounds it). One from
+    /// a build before the mark counts only inside the run's own lifetime:
+    /// written no earlier than the journal's start and BEFORE the start of any
+    /// later run of the same pid this claim knows of (`next_run`: a later
+    /// journal of that pid in the directory; any later crash marker of it,
+    /// consumed or not, in the log dir; and any this launch's own install
+    /// sweep removed, finding 47). A process that reused the pid and panicked
+    /// is that process's end, never this run's (round seven of the update
+    /// audit, finding 27).
+    ///
+    /// `next_run`: the start of the next run of `id`'s pid the caller knows of
+    /// (`None`: none).
+    pub(crate) fn classify_death(
+        evidence: &Evidence<'_>,
+        id: JournalId,
+        next_run: Option<u128>,
+    ) -> Option<DeathClass> {
         let mut class = evidence
             .swept
             .iter()
@@ -915,12 +1204,26 @@ mod unix {
         let Ok(entries) = fs::read_dir(log_dir) else {
             return class;
         };
-        let armed = std::time::UNIX_EPOCH
-            + std::time::Duration::from_nanos(u64::try_from(id.nanos).unwrap_or(u64::MAX));
+        let at = |nanos: u128| {
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+        };
+        let armed = at(id.nanos);
         let panic_report = format!("crash-{}.log", id.pid);
+        let consumed_report = format!("{panic_report}.seen");
         let legacy_prefix = format!("crash-signal-{}-", id.pid);
         let mut own_marker: Option<(u128, u64)> = None;
         let mut own_consumed: Option<u64> = None;
+        let mut next_run = evidence
+            .swept
+            .iter()
+            .filter(|marker| marker.pid == id.pid && marker.nanos > id.nanos)
+            .map(|marker| marker.nanos)
+            .chain(next_run)
+            .min();
+        // A panic report of this pid, and whether it is a consumed one's: judged
+        // once every later run of the pid has been seen.
+        let mut reports: Vec<(std::time::SystemTime, bool, PathBuf)> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -929,11 +1232,16 @@ mod unix {
             if !meta.file_type().is_file() {
                 continue;
             }
-            if name == panic_report {
-                if meta.len() > 0 && meta.modified().is_ok_and(|modified| modified >= armed) {
-                    class = class.max(Some(DeathClass::Panic));
+            if name == panic_report || name == consumed_report {
+                if meta.len() > 0
+                    && let Ok(modified) = meta.modified()
+                {
+                    reports.push((modified, name == consumed_report, entry.path()));
                 }
             } else if let Some(marker) = markers::parse(name) {
+                if marker.pid == id.pid && marker.nanos > id.nanos {
+                    next_run = Some(next_run.map_or(marker.nanos, |n| n.min(marker.nanos)));
+                }
                 if marker.pid == id.pid
                     && marker.nanos <= id.nanos
                     && own_marker.is_none_or(|(nanos, _)| marker.nanos > nanos)
@@ -941,6 +1249,9 @@ mod unix {
                     own_marker = Some((marker.nanos, meta.len()));
                 }
             } else if let Some(consumed) = name.strip_suffix(".seen").and_then(markers::parse) {
+                if consumed.pid == id.pid && consumed.nanos > id.nanos {
+                    next_run = Some(next_run.map_or(consumed.nanos, |n| n.min(consumed.nanos)));
+                }
                 if consumed.pid == id.pid && consumed.nanos == id.nanos {
                     own_consumed = Some(meta.len());
                 }
@@ -953,6 +1264,16 @@ mod unix {
             {
                 class = class.max(Some(DeathClass::Signal));
             }
+        }
+        let its_run = |modified: std::time::SystemTime, run: Option<u128>| match run {
+            Some(run) => run == id.nanos,
+            None => modified >= armed && next_run.is_none_or(|n| modified < at(n)),
+        };
+        if reports.iter().any(|(modified, consumed, path)| {
+            let head = crate::logging::panic_report_head(path);
+            its_run(*modified, head.run) && (!consumed || head.main_thread)
+        }) {
+            class = class.max(Some(DeathClass::Panic));
         }
         if let Some(len) = own_marker.map(|(_, len)| len).or(own_consumed) {
             class = class.max(Some(if len > 0 {
@@ -996,6 +1317,12 @@ mod unix {
         Ok(text)
     }
 
+    /// Read the image at `path` (a journal this run owns): bounded, no link
+    /// followed, decoded.
+    pub(crate) fn read_image(path: &Path) -> Result<(JournalHeader, RestoreManifest), String> {
+        read_taken(path).and_then(|text| decode(&text))
+    }
+
     /// One candidate an unclean end left.
     struct Candidate {
         id: JournalId,
@@ -1004,17 +1331,26 @@ mod unix {
         manifest: RestoreManifest,
     }
 
-    /// THE READER'S HALF: take every dead writer's journal in `dir` and decide
-    /// what this launch reopens (the rules on this module). `quit_layout` is
-    /// whether this launch already has the last quit's `session.toml` to
-    /// reopen, which wins; `own_pid` names this launch's claim temporaries.
+    /// The reader's half: take every dead writer's journal in `dir` and decide
+    /// what this launch reopens (rules in the module docs). `quit` is the last
+    /// quit's `session.toml`, reopened first; reopened journals join behind it
+    /// within the window cap. `own_pid` names this launch's claim temporaries.
+    ///
+    /// `session.toml` may be another instance's quit, so a crashed desk still
+    /// comes back behind it, except the journal of a run whose desk it holds
+    /// ([`QuitLayout::names`]: the run that wrote it, or one whose quit it
+    /// kept): a quit cut short after writing `session.toml` leaves its
+    /// journal and marker, and reopening both would open every window twice.
+    /// An older build's quit names no run; then a journal from a non-stamping
+    /// writer with the same shape ([`super::desk_shape`]) and no newer than the
+    /// layout is set aside ([`QuitLayout::may_be_its_run`]).
     ///
     /// Every journal taken is renamed away before it is read and removed after,
-    /// so it is single-use whatever this launch then does — a crash mid-restore
-    /// cannot reopen it again, and a second launch racing this one finds
-    /// nothing under the name. A journal whose writer's lock is held is never
-    /// renamed. Leftovers of dead writers and dead claimers (a lock with no
-    /// journal, a write temporary, a claim file) are cleared on the way.
+    /// so it is single-use even if this launch crashes mid-restore; one of an
+    /// unclean end that cannot be read is kept aside instead
+    /// ([`keep_unreadable`]), for its row to name. Leftovers of
+    /// dead writers and claimers (lock without journal, write temporary, claim
+    /// file) are cleared on the way.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -1027,7 +1363,7 @@ mod unix {
         dir: &Path,
         evidence: &Evidence<'_>,
         own_pid: u32,
-        quit_layout: bool,
+        quit: QuitLayout,
     ) -> BootClaim {
         let mut claim = BootClaim::default();
         let Ok(entries) = fs::read_dir(dir) else {
@@ -1049,7 +1385,7 @@ mod unix {
         }
         journals.sort_unstable();
         let mut candidates = Vec::new();
-        for id in journals {
+        for &id in &journals {
             if !writer_dead(dir, id) {
                 continue;
             }
@@ -1059,14 +1395,24 @@ mod unix {
             claim.taken.push(id);
             let _ = fs::remove_file(dir.join(id.lock_name()));
             let read = read_taken(&taken);
-            let _ = fs::remove_file(&taken);
-            if quit_layout {
-                claim
-                    .set_aside
-                    .push((id, "the last quit's layout was reopened instead"));
+            if quit.names(id) {
+                let _ = fs::remove_file(&taken);
+                claim.set_aside.push((
+                    id,
+                    "its own run's quit layout reopens instead (the quit was cut short before \
+                     the journal went)",
+                ));
                 continue;
             }
-            let Some(class) = classify_death(evidence, id) else {
+            // The start of the next run of this pid with a journal here; a
+            // pid-only panic report after it is that run's.
+            let next_run = journals
+                .iter()
+                .filter(|other| other.pid == id.pid && other.nanos > id.nanos)
+                .map(|other| other.nanos)
+                .min();
+            let Some(class) = classify_death(evidence, id, next_run) else {
+                let _ = fs::remove_file(&taken);
                 claim
                     .set_aside
                     .push((id, "no crash evidence of its run (a clean end leaves none)"));
@@ -1076,7 +1422,7 @@ mod unix {
                 Err(error) => claim.notes.push(Note::Unreadable {
                     id,
                     class,
-                    path: dir.join(id.file_name()),
+                    path: keep_unreadable(dir, id, &taken),
                     error,
                 }),
                 // THE BRAKE (ruling 285): a crash inside the probation, or a
@@ -1085,10 +1431,11 @@ mod unix {
                     if header.probation && (class.crashed() || header.second_chance) =>
                 {
                     let skipped = Reopened {
-                        writers: vec![id.pid; manifest.windows.len()],
+                        writers: vec![header.image_writer(id); manifest.windows.len()],
                         manifest,
                         class,
                         sources: vec![id],
+                        handed: Vec::new(),
                         programs: header.programs,
                         second_chance: header.second_chance,
                     };
@@ -1104,6 +1451,17 @@ mod unix {
                 Ok((_, manifest)) if manifest.is_empty() => {
                     claim.set_aside.push((id, "its layout was empty"));
                 }
+                // An older build's quit, cut short: its `session.toml` names no
+                // run, so its own journal is judged by writer, shape and date
+                // (`QuitLayout::may_be_its_run`) and set aside; any other desk
+                // comes back behind it.
+                Ok((header, manifest)) if quit.may_be_its_run(&header, &manifest) => {
+                    claim.set_aside.push((
+                        id,
+                        "its desk is the quit layout's, which an older build wrote without \
+                         naming its run (a quit cut short before its journal went)",
+                    ));
+                }
                 Ok((header, manifest)) => candidates.push(Candidate {
                     id,
                     class,
@@ -1111,6 +1469,9 @@ mod unix {
                     manifest,
                 }),
             }
+            // Single use: read and judged, the claim goes (one kept aside is
+            // gone from this name already).
+            let _ = fs::remove_file(&taken);
         }
         // A dead writer's lock with no journal beside it (it died before its
         // first image, or between the quit's two removals).
@@ -1120,7 +1481,7 @@ mod unix {
             }
         }
         clear_leftovers(dir, &leftovers);
-        claim.reopened = merge(candidates, &mut claim.set_aside);
+        claim.reopened = merge(candidates, quit.windows, &mut claim.set_aside);
         let _ = sync_dir(dir);
         claim
     }
@@ -1154,6 +1515,49 @@ mod unix {
         Err(())
     }
 
+    /// How many unreadable images [`keep_unreadable`] keeps aside.
+    pub(super) const KEEP_UNREADABLE: usize = 4;
+
+    /// Keep `taken`, the claim of `id`'s image that could not be read, aside as
+    /// [`JournalId::unreadable_name`] (`0600`), and return where: a newer build
+    /// may still read it, and a torn one is mostly whole. Only a regular file
+    /// with no other name is kept, never a link (a hard link's other name is
+    /// another file of the person's, never to be chmodded or named), and only
+    /// the newest [`KEEP_UNREADABLE`] by their run's start stay. `None` when it
+    /// is not kept; the claim then goes as every other does.
+    fn keep_unreadable(dir: &Path, id: JournalId, taken: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(taken)
+            .ok()?;
+        let kept = dir.join(id.unreadable_name());
+        let private = file
+            .metadata()
+            .is_ok_and(|meta| meta.file_type().is_file() && meta.nlink() == 1)
+            && file
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .is_ok();
+        if !private || fs::rename(taken, &kept).is_err() {
+            return None;
+        }
+        let mut aside: Vec<(JournalId, PathBuf)> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let other = JournalId::parse_unreadable(entry.file_name().to_str()?)?;
+                Some((other, entry.path()))
+            })
+            .collect();
+        aside.sort_unstable_by_key(|(other, _)| std::cmp::Reverse(other.nanos));
+        for (_, path) in aside.into_iter().skip(KEEP_UNREADABLE) {
+            let _ = fs::remove_file(path);
+        }
+        kept.exists().then_some(kept)
+    }
+
     /// Clear the dotted leftovers of writers and claimers that are gone: a
     /// write temporary whose journal's writer is dead, a claim file whose
     /// claimer is, a pending lock nobody holds.
@@ -1168,7 +1572,7 @@ mod unix {
                         .split('-')
                         .next()
                         .and_then(|pid| pid.parse::<u32>().ok())
-                        .is_some_and(|pid| !pid_alive(pid))
+                        .is_some_and(|pid| !aterm_uds::process::pid_alive(pid))
                 } else if rest.ends_with(".lock.pending") {
                     markers::probe(&path) == Owner::Dead
                 } else {
@@ -1184,9 +1588,11 @@ mod unix {
     }
 
     /// Every candidate's windows in one layout, newest writer first, up to the
-    /// window cap a layout may carry; `None` with none.
+    /// window cap a layout may carry beside the `quit_windows` the last quit's
+    /// layout holds; `None` with none.
     fn merge(
         mut candidates: Vec<Candidate>,
+        quit_windows: usize,
         set_aside: &mut Vec<(JournalId, &'static str)>,
     ) -> Option<Reopened> {
         candidates.sort_by(|a, b| {
@@ -1197,13 +1603,17 @@ mod unix {
         let mut windows = Vec::new();
         let mut sources = Vec::new();
         let mut writers = Vec::new();
+        let mut handed = Vec::new();
         let mut programs = Some(Vec::new());
         let mut second_chance = false;
         for candidate in candidates {
-            if windows.len() + candidate.manifest.windows.len() > crate::restore::MAX_WINDOWS {
+            if quit_windows + windows.len() + candidate.manifest.windows.len()
+                > crate::restore::MAX_WINDOWS
+            {
                 set_aside.push((candidate.id, "more windows than a layout carries"));
                 continue;
             }
+            let writer = candidate.header.image_writer(candidate.id);
             // One source that did not say makes the whole layout unknown.
             let offset = u32::try_from(windows.len()).unwrap_or(u32::MAX);
             programs = programs
@@ -1218,21 +1628,329 @@ mod unix {
             // A writer on probation that reached here was stopped, once
             // (the brake skipped every other): this is its second chance.
             second_chance |= candidate.header.probation;
+            handed.extend(candidate.header.handed.iter().map(|pair| (writer, *pair)));
             sources.push(candidate.id);
             writers.extend(std::iter::repeat_n(
-                candidate.id.pid,
+                writer,
                 candidate.manifest.windows.len(),
             ));
             windows.extend(candidate.manifest.windows);
+        }
+        if sources.is_empty() {
+            return None;
         }
         Some(Reopened {
             manifest: RestoreManifest::new(windows),
             class,
             sources,
             writers,
+            handed,
             programs,
             second_chance,
         })
+    }
+}
+
+/// THE COMMIT'S TAKE-OVER, run by the Commit waiter around its release of the
+/// adopted readers (round eight of the update audit, finding 45;
+/// [`Lane::take_over_at_commit`]). `Send`: it crosses to that thread, and its
+/// result comes back through the lane's slot, so a Commit wake lost or late
+/// leaves the journal armed (its lock is held as long as the lane lives).
+#[derive(Debug)]
+pub(crate) struct TakeOver {
+    dir: PathBuf,
+    id: JournalId,
+    predecessor: u32,
+    born: Option<u128>,
+    slot: TakeOverSlot,
+}
+
+/// Where a [`TakeOver`] the waiter ran waits for the Commit's wake. The
+/// field is named, as every lock's receiver is, for the lock-order census.
+#[derive(Clone, Debug, Default)]
+struct TakeOverSlot {
+    taken_over: Arc<Mutex<Option<Result<Taken, String>>>>,
+}
+
+/// What a take-over took: the armed journal, the parent's journal it renamed
+/// onto it, that image as it read (`None`: no image, or none that reads), and
+/// the parent's lock while the parent still held it ([`unix::settle_adoption`]).
+#[derive(Debug)]
+struct Taken {
+    owner: writer::Owned,
+    journal: Option<JournalId>,
+    image: Option<(JournalHeader, RestoreManifest)>,
+    parent_lock: Option<PathBuf>,
+}
+
+/// A take-over's first half, done: this run's journal armed, the parent's
+/// image renamed onto it.
+struct Armed {
+    dir: PathBuf,
+    owner: writer::Owned,
+    journal: Option<JournalId>,
+}
+
+impl TakeOver {
+    /// THE WAITER'S TAKE-OVER, AROUND THE READERS' RELEASE (`release`; finding
+    /// 45's review): first only what must come before any reader runs —
+    /// this run's journal armed and the parent's image renamed onto it
+    /// ([`JournalOwner::adopt`]: one lock created, one directory read, one
+    /// rename) — then `release`, then the rest ([`Armed::settle`]: the
+    /// directory `fsync`, the parent's lock, the image read back and
+    /// decoded), whose result waits in the slot for the Commit's wake
+    /// ([`Lane::adopt_predecessor`]). Never unwinds and always calls
+    /// `release`, once: a panic in either half is an `Err` in the slot, so
+    /// the waiter still resumes the host and sends the wake — an irreversible
+    /// Commit never becomes a dead reader pipeline.
+    pub(crate) fn run(self, release: impl FnOnce()) {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let slot = self.slot.clone();
+        let armed = catch_unwind(AssertUnwindSafe(|| self.arm()));
+        release();
+        let taken = match armed {
+            Ok(Ok(armed)) => catch_unwind(AssertUnwindSafe(|| armed.settle()))
+                .map_err(|_| "its read-back panicked".to_string()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("it panicked".to_string()),
+        };
+        *slot
+            .taken_over
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(taken);
+    }
+
+    /// Both halves at once: the Commit's wake, when no waiter ran them.
+    fn take(self) -> Result<Taken, String> {
+        self.arm().map(Armed::settle)
+    }
+
+    /// Arm this run's journal and rename the parent's newest image onto it
+    /// ([`JournalOwner::adopt`]).
+    fn arm(self) -> Result<Armed, String> {
+        #[cfg(unix)]
+        {
+            let (owner, journal) =
+                JournalOwner::adopt(&self.dir, self.id, self.predecessor, self.born)?;
+            Ok(Armed {
+                dir: self.dir,
+                owner,
+                journal,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self.id, self.predecessor, self.born);
+            Ok(Armed {
+                dir: self.dir,
+                owner: (),
+                journal: None,
+            })
+        }
+    }
+}
+
+impl Armed {
+    /// The rest of the take-over ([`unix::settle_adoption`]), then the image
+    /// read back for what this run carries forward ([`Lane::carry_forward`]).
+    fn settle(self) -> Taken {
+        #[cfg(unix)]
+        {
+            let parent_lock = self
+                .journal
+                .and_then(|parent| unix::settle_adoption(&self.dir, parent));
+            let image = self
+                .journal
+                .and_then(|_| unix::read_image(&self.owner.path()).ok());
+            Taken {
+                owner: self.owner,
+                journal: self.journal,
+                image,
+                parent_lock,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.dir;
+            Taken {
+                owner: self.owner,
+                journal: self.journal,
+                image: None,
+                parent_lock: None,
+            }
+        }
+    }
+}
+
+/// What this run took over at its Commit ([`Lane::carry_forward`]).
+#[derive(Debug, Default)]
+struct Inherited {
+    /// The update's parent: the pid the shells it handed were keyed by.
+    parent: u32,
+    /// What the parent's image said of each of its shells, by the parent's
+    /// pool id. Empty when it left none of its own: no image, one that does
+    /// not read, or one it had taken over itself and not rewritten yet, whose
+    /// leaves carry an older window's ids.
+    leaves: std::collections::BTreeMap<u64, InheritedLeaf>,
+}
+
+/// One parent leaf, as its image said it.
+#[derive(Debug, Default)]
+struct InheritedLeaf {
+    cwd: Option<String>,
+    title: String,
+    agent: Option<Box<crate::restore::AgentRestore>>,
+    /// The pairs that image said this shell had been handed as, in order.
+    handed: Vec<(u32, u64)>,
+}
+
+impl Inherited {
+    /// What `parent`'s `image` (taken from its journal `journal`) says.
+    fn of(
+        parent: u32,
+        journal: Option<JournalId>,
+        image: Option<(JournalHeader, RestoreManifest)>,
+    ) -> Self {
+        use crate::restore::{RestoredSplitTree, RestoredView};
+        fn collect(node: RestoredSplitTree, out: &mut Vec<(u64, InheritedLeaf)>) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(leaf),
+                } => {
+                    if let Some(id) = leaf.local_id {
+                        out.push((
+                            id,
+                            InheritedLeaf {
+                                cwd: leaf.cwd,
+                                title: leaf.title,
+                                agent: leaf.agent,
+                                handed: Vec::new(),
+                            },
+                        ));
+                    }
+                }
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    collect(*first, out);
+                    collect(*second, out);
+                }
+            }
+        }
+        let mut inherited = Self {
+            parent,
+            leaves: std::collections::BTreeMap::new(),
+        };
+        let (Some(journal), Some((header, manifest))) = (journal, image) else {
+            return inherited;
+        };
+        if header.image_writer(journal) != parent {
+            return inherited;
+        }
+        let mut leaves = Vec::new();
+        for window in manifest.windows {
+            for tab in window.restored_tabs {
+                collect(tab.root, &mut leaves);
+            }
+        }
+        inherited.leaves = leaves.into_iter().collect();
+        for pair in header.handed {
+            if let Some(leaf) = inherited.leaves.get_mut(&pair.id) {
+                leaf.handed.push((pair.pid, pair.was));
+            }
+        }
+        inherited
+    }
+}
+
+/// One session the update's parent handed this run, as a capture sees it
+/// ([`Lane::carry_forward`]): the parent's pool id for it, what this run's
+/// own status read says runs in it, and the pair the parent's record said its
+/// journal's image keyed it by, when that image was not the parent's own
+/// (`SessionRecord::journal_key`; round seven's leftover I2b).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HandedSession {
+    pub(crate) was: u64,
+    pub(crate) runs: Runs,
+    pub(crate) keyed: Option<(u32, u64)>,
+}
+
+/// What this run's own status read says runs in a session
+/// (`session_timeline::AgentPublication`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Runs {
+    /// Nothing read yet.
+    Unread,
+    /// An agent the supervisor hosts (`harness_host::agent_of`).
+    Agent(aterm_phase::Program),
+    /// A program that is no such agent (the shell at its prompt, vim, ssh).
+    Other,
+}
+
+impl Runs {
+    /// Whether the agent `record` describes may still be the one running.
+    fn may_be(self, record: &crate::restore::AgentRestore) -> bool {
+        let kind = if record.codex.is_some() {
+            aterm_phase::Program::Codex
+        } else {
+            aterm_phase::Program::Claude
+        };
+        match self {
+            Self::Unread => true,
+            Self::Agent(program) => program == kind,
+            Self::Other => false,
+        }
+    }
+}
+
+/// Visit every terminal leaf of `manifest` (`leaf`), then the folder and
+/// title its legacy mirror (`WindowLayout::tabs`) keeps for each leaf, by the
+/// leaf's `local_id` (`mirror`).
+fn each_terminal_leaf(
+    manifest: &mut RestoreManifest,
+    leaf: &mut dyn FnMut(&mut crate::restore::TerminalLeafRestore),
+    mirror: &mut dyn FnMut(u64, &mut Option<String>, &mut String),
+) {
+    use crate::restore::{PaneLayout, RestoredSplitTree, RestoredView};
+    fn tree(
+        node: &mut RestoredSplitTree,
+        leaf: &mut dyn FnMut(&mut crate::restore::TerminalLeafRestore),
+    ) {
+        match node {
+            RestoredSplitTree::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } => leaf(terminal),
+            RestoredSplitTree::Leaf { .. } => {}
+            RestoredSplitTree::Split { first, second, .. } => {
+                tree(first, leaf);
+                tree(second, leaf);
+            }
+        }
+    }
+    fn legacy(
+        node: &mut PaneLayout,
+        mirror: &mut dyn FnMut(u64, &mut Option<String>, &mut String),
+    ) {
+        match node {
+            PaneLayout::Leaf {
+                cwd,
+                title,
+                local_id: Some(id),
+                ..
+            } => mirror(*id, cwd, title),
+            PaneLayout::Leaf { .. } => {}
+            PaneLayout::Split { first, second, .. } => {
+                legacy(first, mirror);
+                legacy(second, mirror);
+            }
+        }
+    }
+    for window in &mut manifest.windows {
+        for tab in &mut window.restored_tabs {
+            tree(&mut tab.root, leaf);
+        }
+        for pane in &mut window.tabs {
+            legacy(pane, mirror);
+        }
     }
 }
 
@@ -1263,6 +1981,34 @@ pub(crate) struct Lane {
     /// more capture is owed at that interval's end.
     title_owed: bool,
     writer: Option<writer::Writer>,
+    /// This run's journal's name, fixed at its first use.
+    id: Option<JournalId>,
+    /// The update's parent whose journal this run takes over at Commit
+    /// ([`Self::adopt_predecessor`]): its pid and start when known. `None` when
+    /// not a successor, and after the take.
+    predecessor: Option<(u32, Option<u128>)>,
+    /// Where the Commit waiter leaves the take-over it ran before it released
+    /// the readers ([`TakeOver::run`]), for the Commit's wake to install.
+    take_over: Option<TakeOverSlot>,
+    /// The journal holds the parent's image, taken at Commit, and this run has
+    /// not published its own yet: a withdraw must still take it down.
+    adopted: bool,
+    /// What this run took over at its Commit and carries forward until it
+    /// has facts of its own ([`Self::carry_forward`]); `None` for a launch
+    /// that is no handoff's successor.
+    inherited: Option<Inherited>,
+    /// The pairs the last capture's leaves were handed as
+    /// ([`JournalHeader::handed`], [`Self::carry_forward`]).
+    handed: Vec<Handed>,
+    /// WHAT THE DISK HOLDS (round seven of the update audit, leftover I2b):
+    /// `true` from a take-over that found the parent's image until the writer
+    /// has REALLY replaced it — published an image of this run's own, or
+    /// withdrawn it. Not [`Self::adopted`], which clears when an image is
+    /// handed to the writer: the write can fail (a full disk), and a failed
+    /// image is not written again until the desk changes, so the parent's
+    /// image can stay the journal's for the rest of this run
+    /// ([`Self::inherited_image_parent`]).
+    inherited_on_disk: Arc<AtomicBool>,
     /// Images handed to the writer (the M9 write count).
     pub(crate) writes: u64,
     /// Captures taken.
@@ -1277,6 +2023,8 @@ struct Written {
     /// The leaves that had a program running (D16): a program starting or
     /// ending is a change worth an image, like a moved folder.
     programs: Vec<LeafProgram>,
+    /// What its leaves were handed as ([`JournalHeader::handed`]).
+    handed: Vec<Handed>,
 }
 
 impl Lane {
@@ -1293,16 +2041,264 @@ impl Lane {
             published_at: None,
             title_owed: false,
             writer: None,
+            id: None,
+            predecessor: None,
+            take_over: None,
+            adopted: false,
+            inherited: None,
+            handed: Vec::new(),
+            inherited_on_disk: Arc::new(AtomicBool::new(false)),
             writes: 0,
             captures: 0,
         }
     }
 
-    /// A lane that never writes (the test App's, which the frame-latency bench
-    /// builds too).
-    #[cfg(any(test, feature = "bench-support"))]
+    /// This run's journal id ([`JournalId::of_this_run`]), named once.
+    fn run_id(&mut self) -> JournalId {
+        let pid = self.pid;
+        *self.id.get_or_insert_with(|| JournalId::of_this_run(pid))
+    }
+
+    /// The run a quit's `session.toml` names (`restore::write_quit`): this
+    /// run's journal id, or `None` for an inert lane, which writes none.
+    pub(crate) fn run(&mut self) -> Option<JournalId> {
+        self.dir.is_some().then(|| self.run_id())
+    }
+
+    /// This run's journal id, for a test that plays its crash marker.
+    #[cfg(test)]
+    pub(crate) fn journal_id(&mut self) -> JournalId {
+        self.run_id()
+    }
+
+    /// This launch is an update's candidate whose parent is `pid`, started at
+    /// `born` (unix nanos, when known): at its Commit it takes that run's
+    /// journal over ([`Self::adopt_predecessor`]).
+    pub(crate) fn set_predecessor(&mut self, pid: u32, born: Option<u128>) {
+        self.predecessor = Some((pid, born));
+    }
+
+    /// THE COMMIT'S TAKE-OVER, PREPARED (round eight of the update audit,
+    /// finding 45): what the Commit waiter runs FIRST, its rename before it
+    /// releases the adopted readers ([`TakeOver::run`]) — from the instant
+    /// this run's code reads the live sessions' output, the parent's image is
+    /// this run's, judged by this run's crash evidence. Its wake installs the
+    /// result ([`Self::adopt_predecessor`]). `None` where
+    /// [`Self::adopt_predecessor`] would take nothing: an inert lane, a launch
+    /// that is no handoff's successor, `restore_session` off, a journal
+    /// already armed.
+    pub(crate) fn take_over_at_commit(&mut self, restore_session: bool) -> Option<TakeOver> {
+        let (predecessor, born) = self.predecessor?;
+        let dir = self.dir.clone()?;
+        if !restore_session || self.writer.is_some() {
+            return None;
+        }
+        let slot = TakeOverSlot::default();
+        self.take_over = Some(slot.clone());
+        Some(TakeOver {
+            dir,
+            id: self.run_id(),
+            predecessor,
+            born,
+            slot,
+        })
+    }
+
+    /// THE COMMIT'S TAKE-OVER (round seven of the update audit, findings 5 and
+    /// 27): the parent `_exit`s cleanly after Commit and leaves its journal,
+    /// while this run writes nothing until its first capture after Commit —
+    /// so a successor that died in between left the parent's layout judged by
+    /// the parent's clean end, and nothing of its own: the whole desk was lost.
+    /// So this run arms its journal and renames the parent's image onto it
+    /// ([`JournalOwner::adopt`]): one lock created and one rename, no wait —
+    /// done by the Commit waiter before any adopted reader runs, its
+    /// read-back after ([`Self::take_over_at_commit`], finding 45 and its
+    /// review), and here, at the Commit's wake, installed; or done here when
+    /// no waiter ran one. The writer it starts clears the parent's lock once
+    /// the parent's `_exit` has let it go. A no-op for an inert lane, for a
+    /// launch that is no handoff's successor, after the first call, and when
+    /// `restore_session` is off (the parent withdrew its image then; a
+    /// take-over the waiter ran is installed whatever the setting says now,
+    /// and the next capture withdraws it). Answers the
+    /// parent journal it took, for the log.
+    pub(crate) fn adopt_predecessor(&mut self, restore_session: bool) -> Option<JournalId> {
+        let (predecessor, born) = self.predecessor.take()?;
+        let dir = self.dir.clone()?;
+        let ran = self.take_over.take().and_then(|slot| {
+            slot.taken_over
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        });
+        let taken = match ran {
+            Some(ran) => ran,
+            None if !restore_session || self.writer.is_some() => return None,
+            None => TakeOver {
+                dir: dir.clone(),
+                id: self.run_id(),
+                predecessor,
+                born,
+                slot: TakeOverSlot::default(),
+            }
+            .take(),
+        };
+        let taken = match taken {
+            Ok(taken) => taken,
+            Err(error) => {
+                aterm_log::warn!("crash journal: the update's parent's not taken over ({error})");
+                return None;
+            }
+        };
+        let id = self.run_id();
+        self.inherited_on_disk
+            .store(taken.journal.is_some(), Ordering::Release);
+        self.writer = Some(writer::Writer::spawn_owning(
+            dir,
+            id,
+            taken.owner,
+            taken.parent_lock,
+            Arc::clone(&self.inherited_on_disk),
+        ));
+        self.adopted = taken.journal.is_some();
+        self.inherited = Some(Inherited::of(predecessor, taken.journal, taken.image));
+        taken.journal
+    }
+
+    /// THE SUCCESSOR'S IMAGE CARRIES FORWARD WHAT IT TOOK OVER, UNTIL IT HAS
+    /// FACTS OF ITS OWN (round eight of the update audit, findings 46 and
+    /// 76). The first capture after Commit replaced the parent's image with
+    /// one built only of this process's own state, which has not caught up
+    /// yet: its supervisor host publishes an agent's relaunch record only once
+    /// a worker attached (45 s after an update from a build that writes no
+    /// claim), and a busy engine answers no folder and no title — so a crash
+    /// in those seconds reopened the desk but relaunched no conversation, in
+    /// `$HOME`, although the image it replaced had all of it. And its leaves
+    /// named only this run's pool ids, while the PTY keeper may still hold
+    /// each kept shell under the parent's (the successor's re-registration
+    /// had not reached it): no pane took its shell, and every agent was
+    /// relaunched beside its still-running original.
+    ///
+    /// So, on each terminal leaf of `manifest` whose session the parent
+    /// handed this run (`adopted`: the parent's pool id, and what this run's
+    /// own status read says runs there):
+    ///
+    /// * the pairs it was handed as — the parent's `(pid, id)`, then the pair
+    ///   the parent's record said its journal keyed it by
+    ///   ([`HandedSession::keyed`]), then what the parent's image said that
+    ///   shell had been handed as — are this image's
+    ///   [`JournalHeader::handed`], always: a correspondence, never stale;
+    /// * the parent image's agent record, until this run has a fact of its
+    ///   own about that tab: its host published a record
+    ///   ([`crate::restore::RestoreManifest::fill_agents`] filled the leaf), or
+    ///   its status read says another program holds it ([`Runs`]). Once one
+    ///   capture has, the parent's record is gone for good — a later capture
+    ///   whose host has none again (the person ended that agent and started
+    ///   another, or `/resume`d another conversation, and the new worker has
+    ///   not published) must not name the conversation that was ended;
+    /// * the parent image's folder and title, on a leaf whose capture met its
+    ///   engine busy (both empty) — on its first capture only: from then on
+    ///   an image of this run's own has carried that leaf, and `offer` heals
+    ///   from that one (after a withdraw, from nothing, as any run's does —
+    ///   never from the parent's folder, hours old by then).
+    pub(crate) fn carry_forward(
+        &mut self,
+        manifest: &mut RestoreManifest,
+        adopted: &dyn Fn(u64) -> Option<HandedSession>,
+    ) {
+        self.handed.clear();
+        let Some(inherited) = self.inherited.as_ref() else {
+            return;
+        };
+        let parent_leaf = |id: u64| {
+            let session = adopted(id)?;
+            Some((session, inherited.leaves.get(&session.was)))
+        };
+        let heal =
+            |before: Option<&InheritedLeaf>, cwd: &mut Option<String>, title: &mut String| {
+                if cwd.is_none()
+                    && title.is_empty()
+                    && let Some(before) = before
+                {
+                    cwd.clone_from(&before.cwd);
+                    title.clone_from(&before.title);
+                }
+            };
+        let handed = &mut self.handed;
+        // The parent leaves this capture carried, and those whose agent this
+        // run now knows itself: what they carried is spent once the pass is
+        // done (the legacy mirror below reads the same leaf after its tree).
+        let mut carried = Vec::new();
+        let mut known_agent = Vec::new();
+        each_terminal_leaf(
+            manifest,
+            &mut |leaf| {
+                let Some(id) = leaf.local_id else {
+                    return;
+                };
+                let Some((session, before)) = parent_leaf(id) else {
+                    return;
+                };
+                carried.push(session.was);
+                handed.extend(
+                    std::iter::once((inherited.parent, session.was))
+                        .chain(session.keyed)
+                        .chain(
+                            before
+                                .into_iter()
+                                .flat_map(|leaf| leaf.handed.iter().copied()),
+                        )
+                        .take(MAX_HANDED_GENERATIONS)
+                        .map(|(pid, was)| Handed { id, pid, was }),
+                );
+                if let Some(record) = before.and_then(|before| before.agent.as_ref()) {
+                    if leaf.agent.is_some() || !session.runs.may_be(record) {
+                        known_agent.push(session.was);
+                    } else {
+                        leaf.agent = Some(record.clone());
+                        // What holds the pane is that agent, which runs here.
+                        leaf.held = false;
+                    }
+                }
+                heal(before, &mut leaf.cwd, &mut leaf.title);
+            },
+            &mut |id, cwd, title| heal(parent_leaf(id).and_then(|(_, before)| before), cwd, title),
+        );
+        let Some(inherited) = self.inherited.as_mut() else {
+            return;
+        };
+        for was in known_agent {
+            if let Some(leaf) = inherited.leaves.get_mut(&was) {
+                leaf.agent = None;
+            }
+        }
+        for was in carried {
+            if let Some(leaf) = inherited.leaves.get_mut(&was) {
+                leaf.cwd = None;
+                leaf.title.clear();
+            }
+        }
+    }
+
+    /// A lane that never writes (the test App's).
+    #[cfg(test)]
     pub(crate) fn inert() -> Self {
         Self::new(None, 0)
+    }
+
+    /// THE UPDATE'S PARENT WHOSE TAKEN-OVER IMAGE IS STILL THIS RUN'S JOURNAL,
+    /// or `None` (round seven of the update audit, leftover I2b): this run took
+    /// its parent's journal over at Commit and has not yet replaced that image
+    /// on disk ([`Self::inherited_on_disk`]). Its leaves then key each shell
+    /// the parent handed this run by the parent's pair — or by an older one
+    /// the parent's own record named, when the parent had not replaced its
+    /// own parent's image either — so this run's next handoff must say which
+    /// (`SessionRecord::journal_key`): its successor's keeper registration
+    /// names only this run's pair, which no leaf of that image carries.
+    pub(crate) fn inherited_image_parent(&self) -> Option<u32> {
+        self.inherited_on_disk
+            .load(Ordering::Acquire)
+            .then(|| self.inherited.as_ref().map(|inherited| inherited.parent))
+            .flatten()
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -1321,10 +2317,9 @@ impl Lane {
         std::mem::take(&mut self.dirty)
     }
 
-    /// This launch reopened a crash journal at `now`: its own journal carries
-    /// the probation mark until [`PROBATION`] has passed — marked a second
-    /// chance's when the brake let that journal through once
-    /// ([`Reopened::second_chance`], ruling 285).
+    /// This launch reopened a crash journal at `now`: its journal carries the
+    /// probation mark until [`PROBATION`] passes, as a second chance when
+    /// [`Reopened::second_chance`].
     pub(crate) fn begin_probation(&mut self, now: Instant, second_chance: bool) {
         self.probation_until = Some(now + PROBATION);
         self.second_chance = second_chance;
@@ -1364,8 +2359,10 @@ impl Lane {
     /// mark has changed — and when only titles differ, not before
     /// [`TITLE_WRITE_INTERVAL`] since the last image (the capture is owed then
     /// instead). `programs` names the leaves that had a program running
-    /// ([`JournalHeader::programs`]); a change there is never title-only.
-    /// Answers whether it was handed over.
+    /// ([`JournalHeader::programs`]); a change there is never title-only. The
+    /// pairs the capture's leaves were handed as, which
+    /// [`Self::carry_forward`] found, ride the header
+    /// ([`JournalHeader::handed`]). Answers whether it was handed over.
     pub(crate) fn offer(
         &mut self,
         mut manifest: RestoreManifest,
@@ -1382,6 +2379,7 @@ impl Lane {
             manifest,
             probation: self.on_probation(now),
             programs,
+            handed: std::mem::take(&mut self.handed),
         };
         if self.last.as_ref() == Some(&written) {
             self.title_owed = false;
@@ -1390,6 +2388,7 @@ impl Lane {
         if let Some(last) = &self.last
             && last.probation == written.probation
             && last.programs == written.programs
+            && last.handed == written.handed
             && same_but_titles(&last.manifest, &written.manifest)
             && self
                 .published_at
@@ -1403,12 +2402,14 @@ impl Lane {
         };
         let header = JournalHeader::now(self.pid, written.probation)
             .with_second_chance(written.probation && self.second_chance)
-            .with_programs(written.programs.clone());
-        let pid = self.pid;
-        let writer = self
-            .writer
-            .get_or_insert_with(|| writer::Writer::spawn(dir, JournalId::of_this_run(pid)));
+            .with_programs(written.programs.clone())
+            .with_handed(written.handed.clone());
+        let id = self.run_id();
+        let writer = self.writer.get_or_insert_with(|| {
+            writer::Writer::spawn(dir, id, Arc::clone(&self.inherited_on_disk))
+        });
         writer.publish(written.manifest.clone(), header);
+        self.adopted = false;
         self.last = Some(written);
         self.published_at = Some(now);
         self.title_owed = false;
@@ -1420,7 +2421,8 @@ impl Lane {
     /// down (the lock stays, so the journal can come back).
     pub(crate) fn withdraw(&mut self) {
         self.title_owed = false;
-        if self.last.take().is_some() {
+        let written = self.last.take().is_some();
+        if std::mem::take(&mut self.adopted) || written {
             if let Some(writer) = self.writer.as_ref() {
                 writer.withdraw();
             }
@@ -1430,10 +2432,9 @@ impl Lane {
         }
     }
 
-    /// The next instant the loop must wake for this lane — the trailing edge
-    /// of a pending capture, the end of probation with a marked image, an owed
-    /// title — each no earlier than the write interval allows, and never one
-    /// already past, which the capture that is due now consumes.
+    /// The next instant the loop must wake for this lane (a pending capture's
+    /// trailing edge, probation end, an owed title), no earlier than the write
+    /// interval allows and never in the past.
     pub(crate) fn next_wake(&self, now: Instant) -> Option<Instant> {
         self.dir.as_ref()?;
         let floor = |at: Instant| self.not_before.map_or(at, |not_before| not_before.max(at));
@@ -1449,11 +2450,11 @@ impl Lane {
             .min()
     }
 
-    /// THE CLEAN QUIT'S HALF: remove this process's journal and wait for it,
-    /// at most `patience` (a wedged disk must not hold the exit). A lane that
-    /// never wrote has nothing to remove.
+    /// The clean quit's half: remove this process's journal, waiting at most
+    /// `patience`. A lane that never wrote has nothing to remove.
     pub(crate) fn retire(&mut self, patience: Duration) -> Result<(), String> {
         self.last = None;
+        self.adopted = false;
         match self.writer.take() {
             Some(writer) => writer.retire(patience),
             None => Ok(()),
@@ -1502,9 +2503,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
 }
 
 /// Give each terminal leaf of `fresh` whose cwd and title both came back empty
-/// — the signature of a capture that met its engine busy — what `last` had for
-/// the same session. A program cannot un-report a directory, so an empty cwd
-/// after a reported one is always the busy engine, never news.
+/// (a capture that met its engine busy) what `last` had for the same session.
 fn heal_busy_leaves(fresh: &mut RestoreManifest, last: &RestoreManifest) {
     use std::collections::BTreeMap;
 
@@ -1616,11 +2615,48 @@ mod writer {
     }
 
     impl Writer {
-        pub(super) fn spawn(dir: PathBuf, id: JournalId) -> Self {
+        pub(super) fn spawn(dir: PathBuf, id: JournalId, inherited: Inherited) -> Self {
+            Self::start(dir, id, None, None, inherited)
+        }
+
+        /// A writer that owns `owner`, the journal its caller armed already
+        /// ([`super::Lane::adopt_predecessor`]), and clears `parent_lock` —
+        /// the update's parent's, which it still held at the take-over — once
+        /// nobody holds it (checked at each job until then).
+        #[cfg(unix)]
+        pub(super) fn spawn_owning(
+            dir: PathBuf,
+            id: JournalId,
+            owner: super::JournalOwner,
+            parent_lock: Option<PathBuf>,
+            inherited: Inherited,
+        ) -> Self {
+            Self::start(dir, id, Some(owner), parent_lock, inherited)
+        }
+
+        /// No journal to own off unix.
+        #[cfg(not(unix))]
+        pub(super) fn spawn_owning(
+            dir: PathBuf,
+            id: JournalId,
+            _owner: (),
+            _parent_lock: Option<PathBuf>,
+            inherited: Inherited,
+        ) -> Self {
+            Self::start(dir, id, None, None, inherited)
+        }
+
+        fn start(
+            dir: PathBuf,
+            id: JournalId,
+            owner: Option<Owned>,
+            parent_lock: Option<PathBuf>,
+            inherited: Inherited,
+        ) -> Self {
             let (tx, rx) = mpsc::channel::<Job>();
             let thread = std::thread::Builder::new()
                 .name("aterm-crash-journal".into())
-                .spawn(move || run(&dir, id, &rx))
+                .spawn(move || run(&dir, id, &rx, owner, parent_lock, &inherited))
                 .map_err(|error| {
                     aterm_log::warn!("crash journal: writer thread not spawned ({error})");
                 })
@@ -1656,10 +2692,30 @@ mod writer {
         }
     }
 
+    /// Whether the journal still holds the image its lane took over at Commit
+    /// (`Lane::inherited_on_disk`): the writer clears it once that image is
+    /// really gone — replaced by one of this run's own, or withdrawn.
+    pub(super) type Inherited = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+    /// The journal a writer owns: the lock and the name it publishes under.
     #[cfg(unix)]
-    fn run(dir: &std::path::Path, id: JournalId, rx: &mpsc::Receiver<Job>) {
+    pub(super) type Owned = super::JournalOwner;
+    #[cfg(not(unix))]
+    pub(super) type Owned = ();
+
+    #[cfg(unix)]
+    fn run(
+        dir: &std::path::Path,
+        id: JournalId,
+        rx: &mpsc::Receiver<Job>,
+        owner: Option<Owned>,
+        parent_lock: Option<PathBuf>,
+        inherited: &Inherited,
+    ) {
+        use std::sync::atomic::Ordering;
         crate::qos::set_self(crate::qos::Role::Background);
-        let mut owner: Option<super::JournalOwner> = None;
+        let mut owner = owner;
+        let mut parent_lock = parent_lock;
         let mut said = false;
         while let Ok(mut job) = rx.recv() {
             // The newest state wins: a burst of images is one write, and a
@@ -1667,6 +2723,13 @@ mod writer {
             // later one. A retire is always the last job sent.
             while let Ok(next) = rx.try_recv() {
                 job = next;
+            }
+            // The update's parent's lock, once its `_exit` let it go.
+            if parent_lock
+                .as_deref()
+                .is_some_and(super::unix::clear_dead_lock)
+            {
+                parent_lock = None;
             }
             match job {
                 Job::Publish(manifest, header) => {
@@ -1680,21 +2743,25 @@ mod writer {
                             Err(_) => {}
                         }
                     }
-                    if let Some(owner) = owner.as_ref()
-                        && let Err(error) = owner.publish(&manifest, &header)
-                        && !said
+                    match owner
+                        .as_ref()
+                        .map(|owner| owner.publish(&manifest, &header))
                     {
-                        said = true;
-                        aterm_log::warn!("crash journal: not written ({error})");
+                        Some(Ok(())) => inherited.store(false, Ordering::Release),
+                        Some(Err(error)) if !said => {
+                            said = true;
+                            aterm_log::warn!("crash journal: not written ({error})");
+                        }
+                        Some(Err(_)) | None => {}
                     }
                 }
-                Job::Withdraw => {
-                    if let Some(owner) = owner.as_ref()
-                        && let Err(error) = owner.withdraw()
-                    {
+                Job::Withdraw => match owner.as_ref().map(super::JournalOwner::withdraw) {
+                    Some(Ok(())) => inherited.store(false, Ordering::Release),
+                    Some(Err(error)) => {
                         aterm_log::warn!("crash journal: not withdrawn ({error})");
                     }
-                }
+                    None => {}
+                },
                 Job::Retire(reply) => {
                     let _ = reply.send(owner.take().map_or(Ok(()), super::JournalOwner::retire));
                     return;
@@ -1704,7 +2771,14 @@ mod writer {
     }
 
     #[cfg(not(unix))]
-    fn run(_dir: &std::path::Path, _id: JournalId, rx: &mpsc::Receiver<Job>) {
+    fn run(
+        _dir: &std::path::Path,
+        _id: JournalId,
+        rx: &mpsc::Receiver<Job>,
+        _owner: Option<Owned>,
+        _parent_lock: Option<PathBuf>,
+        _inherited: &Inherited,
+    ) {
         while let Ok(job) = rx.recv() {
             if let Job::Retire(reply) = job {
                 let _ = reply.send(Ok(()));
@@ -1714,9 +2788,8 @@ mod writer {
     }
 }
 
-/// The layouts the tests build, on EVERY platform: `message_reporters`'
-/// tests draw a reopened layout with them, and those compile off unix too,
-/// where [`tests`] (the unix lane's files, locks and claim) does not exist.
+/// Test layouts, on every platform: `message_reporters`' tests use them and
+/// compile off unix, where [`tests`] does not exist.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use crate::restore::{self, RestoreManifest};
@@ -1751,6 +2824,8 @@ pub(crate) mod fixtures {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            inner_px: None,
+            presence_row: false,
             show: restore::WindowShow::UNKNOWN,
             tabs: Vec::new(),
             native_tabs: Vec::new(),
@@ -1774,10 +2849,12 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use aterm_spec::wait::MUST_HAPPEN;
+
     pub(crate) use super::fixtures::layout;
     use super::{
         BootClaim, DeathClass, Evidence, JournalHeader, JournalId, JournalOwner, Lane,
-        MIN_WRITE_INTERVAL, Note, PROBATION, PanesWithoutFolder, TITLE_WRITE_INTERVAL,
+        MIN_WRITE_INTERVAL, Note, PROBATION, PanesWithoutFolder, QuitLayout, TITLE_WRITE_INTERVAL,
         claim_at_boot, classify_death, decode, encode, same_but_titles,
     };
     use crate::crash_signal::{MarkerOwner, markers};
@@ -1807,7 +2884,7 @@ pub(crate) mod tests {
 
     /// A pid that WAS a process and is not one any more.
     pub(crate) fn reaped_pid() -> u32 {
-        let mut child = std::process::Command::new("/usr/bin/true")
+        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
             .spawn()
             .expect("spawn /usr/bin/true");
         let pid = child.id();
@@ -1815,9 +2892,8 @@ pub(crate) mod tests {
         pid
     }
 
-    /// The crash marker a run arms at start: empty, named for its pid and its
-    /// start — the start its journal is named for too
-    /// (`JournalId::of_this_run`).
+    /// The empty crash marker a run arms at start, named for its pid and the
+    /// start its journal is named for (`JournalId::of_this_run`).
     pub(crate) fn marker(logs: &Path, id: JournalId) -> PathBuf {
         let path = logs.join(markers::file_name(id.pid, id.nanos, MarkerOwner::Other));
         std::fs::write(&path, b"").unwrap();
@@ -1860,21 +2936,46 @@ pub(crate) mod tests {
         owner
     }
 
+    /// An older build's header, dated now, without
+    /// [`JournalHeader::stamps_quit`].
+    fn older_header(pid: u32) -> JournalHeader {
+        JournalHeader {
+            build: "0.98.0 (1790607299)".to_string(),
+            stamps_quit: false,
+            ..JournalHeader::now(pid, false)
+        }
+    }
+
+    /// [`run`] by an older build ([`older_header`]), its image dated `at`
+    /// (Unix ms; `None`: now).
+    fn run_by_older_build(
+        dir: &Path,
+        logs: &Path,
+        manifest: &RestoreManifest,
+        at: Option<u64>,
+    ) -> JournalOwner {
+        let id = JournalId::now(reaped_pid());
+        marker(logs, id);
+        let owner = JournalOwner::create(dir, id).expect("armed");
+        let mut header = older_header(id.pid);
+        header.written_unix_ms = at.unwrap_or(header.written_unix_ms);
+        owner.publish(manifest, &header).expect("published");
+        owner
+    }
+
     fn vim_in(window: u32, tab: u32) -> super::LeafProgram {
         super::LeafProgram {
             window,
             tab,
             program: "vim".to_string(),
             agent: false,
+            again: false,
         }
     }
 
-    /// D16 (ruling 282), TIER-1 through the real journal: an image whose
-    /// writer said no leaf ran a program is written, the writer killed, the
-    /// journal claimed and read back, and the reopened row is a RECORD. The
-    /// negative controls through the same files: a leaf that ran vim keeps the
-    /// warning and names it, and an image with no word on programs (an older
-    /// writer's) reads as today's "programs lost".
+    /// Through the real journal: an image saying no leaf ran a program reopens
+    /// as a record; a leaf that ran vim keeps the warning and names it; an
+    /// image with no word on programs reads as "programs lost".
     #[test]
     fn a_relaunch_whose_tabs_sat_at_their_prompts_is_quiet_through_the_journal() {
         use crate::message_reporters::{
@@ -1897,14 +2998,14 @@ pub(crate) mod tests {
             "`programs = []` round-trips"
         );
         let row =
-            journal_reopened_message(&quiet, None, None, None, false, PanesWithoutFolder::NONE);
+            journal_reopened_message(&quiet, None, None, None, false, PanesWithoutFolder::NONE, 0);
         assert_eq!((row.severity, row.hold), (Severity::Info, Hold::LogOnly));
         assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN);
 
         let lost = reopen(Some(vec![vim_in(0, 1)]));
         assert_eq!(lost.programs, Some(vec![vim_in(0, 1)]));
         let row =
-            journal_reopened_message(&lost, None, None, None, false, PanesWithoutFolder::NONE);
+            journal_reopened_message(&lost, None, None, None, false, PanesWithoutFolder::NONE, 0);
         assert_eq!(row.severity, Severity::Warn);
         assert_ne!(row.hold, Hold::LogOnly);
         assert!(row.detail[0].starts_with("vim was running in 1 of 2 tabs"));
@@ -1912,23 +3013,16 @@ pub(crate) mod tests {
         let older = reopen(None);
         assert_eq!(older.programs, None);
         let row =
-            journal_reopened_message(&older, None, None, None, false, PanesWithoutFolder::NONE);
+            journal_reopened_message(&older, None, None, None, false, PanesWithoutFolder::NONE, 0);
         assert_eq!(row.severity, Severity::Warn);
         assert_eq!(row.detail[0], JOURNAL_LOSS);
     }
 
-    /// AUDIT #7 FINDING 48, TIER-1 through the real journal: a layout whose
-    /// second tab's folder is gone by the time it is reopened is written, the
-    /// writer killed, the journal claimed and read back — and the reopened row
-    /// COUNTS the pane that could not open its folder, by the check the spawn
-    /// itself makes (`spawn_folder::folder_fault`), instead of saying both
-    /// tabs came back in their folders, and the loss sentence above it no
-    /// longer says ONLY the scrollback was lost (audit #8). NEGATIVE CONTROL
-    /// through the same files: with both folders there the row reads as it
-    /// always did. The same pane while ssh held it is not counted, and the
-    /// row claims no folders: that folder may be another machine's, and its
-    /// shell starts in the default folder (audit #8) — unless the pane
-    /// carries the agent aterm hosted there, which ran on this machine.
+    /// Through the real journal: a pane whose folder is gone at reopen is
+    /// counted by the spawn's own check (`spawn_folder::folder_fault`), and the
+    /// loss sentence no longer says only scrollback was lost. With both folders
+    /// present the row reads as usual. A pane ssh held is not counted and the
+    /// row claims no folders, unless it carries an aterm-hosted agent.
     #[test]
     fn a_reopened_layout_counts_the_panes_whose_folder_is_gone() {
         use crate::message_reporters::{
@@ -1958,7 +3052,7 @@ pub(crate) mod tests {
             PanesWithoutFolder::NONE
         );
         let row =
-            journal_reopened_message(&whole, None, None, None, false, PanesWithoutFolder::NONE);
+            journal_reopened_message(&whole, None, None, None, false, PanesWithoutFolder::NONE, 0);
         assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN);
         assert_eq!(
             row.detail[1],
@@ -1969,7 +3063,7 @@ pub(crate) mod tests {
         let reopened = reopen();
         let homeless = reopened.panes_without_folder(spawn_verdict);
         assert_eq!(homeless, counted(1, 0), "the tab whose folder is gone");
-        let row = journal_reopened_message(&reopened, None, None, None, false, homeless);
+        let row = journal_reopened_message(&reopened, None, None, None, false, homeless, 0);
         assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN_FOLDERLESS);
         assert_eq!(
             row.detail[1],
@@ -1983,9 +3077,8 @@ pub(crate) mod tests {
             row.detail
         );
 
-        // The same pane while ssh held it (audit #8): that folder may be
-        // another machine's, so it is not counted, and the restored line
-        // claims no folders. `held` rides the journal's files.
+        // The same pane while ssh held it: its folder may be remote, so it is
+        // not counted and the row claims no folders.
         let mut ssh = manifest.clone();
         if let restore::RestoredSplitTree::Leaf {
             view: restore::RestoredView::Terminal(leaf),
@@ -1999,6 +3092,7 @@ pub(crate) mod tests {
                 tab: 1,
                 program: "ssh".to_string(),
                 agent: false,
+                again: false,
             }]
         };
         let reopened = reopen_from(&ssh, ssh_ran());
@@ -2013,7 +3107,7 @@ pub(crate) mod tests {
         );
         let unasked = reopened.panes_without_folder(spawn_verdict);
         assert_eq!(unasked, counted(0, 1));
-        let row = journal_reopened_message(&reopened, None, None, None, false, unasked);
+        let row = journal_reopened_message(&reopened, None, None, None, false, unasked, 0);
         assert!(
             row.detail[0].starts_with("ssh was running in 1 of 2 tabs"),
             "{:?}",
@@ -2047,12 +3141,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// AUDIT #7 FINDING 48 — EVERY PANE OF THE TREE A WINDOW RESTORES FROM is
-    /// counted: the second pane of a split tab whose folder is gone, and the
-    /// legacy mirror's panes when a window has no canonical tabs (split or
-    /// not). NEGATIVE CONTROLS: the same layouts with every folder there count
-    /// nothing, and a window that HAS canonical tabs is counted from them
-    /// alone, never from its legacy mirror too.
+    /// Every pane of the tree a window restores from is counted: a split tab's
+    /// second pane, and the legacy mirror's panes when no canonical tabs exist.
+    /// With every folder present nothing counts, and a window with canonical
+    /// tabs is never counted from its legacy mirror too.
     #[test]
     fn every_pane_of_the_restored_tree_is_counted_split_and_legacy() {
         use restore::{PaneLayout, RestoredSplitTree, SplitKind};
@@ -2061,6 +3153,7 @@ pub(crate) mod tests {
             class: DeathClass::Killed,
             sources: vec![JournalId { pid: 9, nanos: 9 }],
             writers: vec![9],
+            handed: Vec::new(),
             programs: None,
             second_chance: false,
         };
@@ -2122,17 +3215,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// P6a, RULING 293 — TIER-1 through the real journal: a killed run whose
-    /// tab 2 hosted Claude (its leaf carries the relaunch record and the
-    /// capture marked its program as that agent) is written, the writer
-    /// killed, the journal claimed and read back, and the reopened row says
-    /// what comes back. With the relaunch on and nothing else running it is a
-    /// RECORD: only scrollback was lost. Beside a lost vim the warning names
-    /// vim and its sentence says aterm starts Claude again. NEGATIVE CONTROLS through the
-    /// same files: with the relaunch off (the harness off, or headless) the
-    /// agent is a program lost as before; an agent that never registered a
-    /// conversation is lost too (the relaunch refuses it); and an entry
-    /// marked as an agent in a tab whose leaf carries none counts as lost.
+    /// Through the real journal: a killed run whose tab 2 hosted Claude reopens
+    /// as a record (only scrollback lost) with the relaunch on; beside a lost
+    /// vim the warning names vim and says Claude starts again. With the
+    /// relaunch off, an agent without a conversation, or an agent entry in a
+    /// tab whose leaf has no record, the agent counts as lost.
     #[test]
     fn an_agent_the_relaunch_brings_back_is_not_lost_through_the_journal() {
         use crate::message_reporters::{JOURNAL_ONLY_SCROLLBACK, journal_reopened_message};
@@ -2152,6 +3239,7 @@ pub(crate) mod tests {
             tab,
             program: "claude".to_string(),
             agent: true,
+            again: false,
         };
         let reopen = |agent: Option<restore::AgentRestore>, programs: Vec<super::LeafProgram>| {
             let mut manifest = layout(&[("/work/a", "zsh"), ("/work/b", "claude")]);
@@ -2171,7 +3259,8 @@ pub(crate) mod tests {
             "`agent = true` round-trips"
         );
         assert_eq!(only.resumed(true), vec![(0, 1)]);
-        let row = journal_reopened_message(&only, None, None, None, true, PanesWithoutFolder::NONE);
+        let row =
+            journal_reopened_message(&only, None, None, None, true, PanesWithoutFolder::NONE, 0);
         assert_eq!((row.severity, row.hold), (Severity::Info, Hold::LogOnly));
         assert_eq!(row.title, "Tabs restored after aterm stopped");
         assert_eq!(
@@ -2191,7 +3280,7 @@ pub(crate) mod tests {
             vec![vim_in(0, 0), agent_in(1)],
         );
         let row =
-            journal_reopened_message(&beside, None, None, None, true, PanesWithoutFolder::NONE);
+            journal_reopened_message(&beside, None, None, None, true, PanesWithoutFolder::NONE, 0);
         assert_eq!(row.severity, Severity::Warn);
         assert_eq!(row.title, "Tabs restored, vim lost");
         // One sentence (ruling 314): the agent coming back rides detail[0],
@@ -2209,9 +3298,9 @@ pub(crate) mod tests {
             row.detail
         );
 
-        // NEGATIVE CONTROLS.
+        // Negative controls.
         let off =
-            journal_reopened_message(&only, None, None, None, false, PanesWithoutFolder::NONE);
+            journal_reopened_message(&only, None, None, None, false, PanesWithoutFolder::NONE, 0);
         assert_eq!(off.severity, Severity::Warn);
         assert_eq!(off.title, "Tabs restored, claude lost");
         assert!(
@@ -2228,17 +3317,25 @@ pub(crate) mod tests {
             None,
             true,
             PanesWithoutFolder::NONE,
+            0,
         );
         assert_eq!(row.title, "Tabs restored, claude lost");
         let planted = reopen(None, vec![agent_in(1)]);
-        let row =
-            journal_reopened_message(&planted, None, None, None, true, PanesWithoutFolder::NONE);
+        let row = journal_reopened_message(
+            &planted,
+            None,
+            None,
+            None,
+            true,
+            PanesWithoutFolder::NONE,
+            0,
+        );
         assert_eq!(row.title, "Tabs restored, claude lost");
     }
 
     /// Two dead writers' journals merge: each one's leaves keep their own
-    /// window (rebased into the merged layout), and ONE journal that did not
-    /// say makes the whole relaunch unknown — never quiet.
+    /// window (rebased), and one journal that did not say makes the whole
+    /// relaunch unknown.
     #[test]
     fn merged_journals_rebase_their_programs_and_one_silent_writer_is_unknown() {
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
@@ -2290,37 +3387,80 @@ pub(crate) mod tests {
             tab: 0,
             program: "s-1234 `rm -rf`".to_string(),
             agent: false,
+            again: false,
         }]);
         let text = encode(&layout(&[("/a", "zsh")]), &header).unwrap();
         let (read, _) = decode(&text).unwrap();
         assert_eq!(read.programs.unwrap()[0].program, "");
     }
 
-    /// The owner dies with no exit path (a SIGKILL): its lock goes with it.
-    /// Waits for the release itself — the lock's open file description can
-    /// outlive this `drop` for as long as a child another test thread forked in
-    /// the meantime has not reached its `exec` (close-on-exec closes it there).
-    pub(crate) fn die(owner: JournalOwner) {
-        let lock = owner.path().with_file_name(owner.id().lock_name());
-        drop(owner);
-        await_released(&lock);
+    /// One unnamed job whose session two tabs showed: the later leaf's mark
+    /// survives the journal, and the job counts in both tabs as one program.
+    /// An older writer's image, which never marks a leaf, counts every entry.
+    #[test]
+    fn a_co_viewed_program_counts_once_through_the_journal() {
+        let job = |tab: u32, again: bool| super::LeafProgram {
+            window: 0,
+            tab,
+            program: String::new(),
+            agent: false,
+            again,
+        };
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        die(run_said(
+            dir.path(),
+            logs.path(),
+            &layout(&[("/a", "zsh"), ("/a", "zsh")]),
+            Some(vec![job(0, false), job(1, true)]),
+        ));
+        let reopened = claim_here(dir.path(), logs.path())
+            .reopened
+            .expect("reopened");
+        assert_eq!(
+            reopened.programs,
+            Some(vec![job(0, false), job(1, true)]),
+            "`again = true` round-trips"
+        );
+        let lost = |tabs, unnamed| {
+            Some(super::Lost {
+                tabs,
+                named: Vec::new(),
+                unnamed,
+            })
+        };
+        assert_eq!(reopened.lost(), lost(2, 1));
+        let older = super::Reopened {
+            programs: Some(vec![job(0, false), job(1, false)]),
+            ..reopened
+        };
+        assert_eq!(older.lost(), lost(2, 2));
     }
 
-    /// Wait until nobody holds `lock` (bounded: a failure, never a skip).
+    /// The owner dies with no exit path (a SIGKILL): its lock goes with it,
+    /// at once, whatever child a sibling test forked meanwhile
+    /// ([`JournalOwner`]'s drop).
+    pub(crate) fn die(owner: JournalOwner) {
+        drop(owner);
+    }
+
+    /// Wait until the writer thread a dropped [`Lane`] leaves behind has
+    /// dropped its journal, and the lock with it: a thread hand-off that must
+    /// happen, so a hang detector of [`MUST_HAPPEN`], never a latency budget.
     pub(crate) fn await_released(lock: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while markers::probe(lock) == markers::Owner::Live {
-            assert!(
-                Instant::now() < deadline,
-                "{} still held 10 s after its owner went",
-                lock.display()
-            );
-            std::thread::yield_now();
-        }
+        aterm_spec::wait::until_within(
+            MUST_HAPPEN,
+            "the dead lane's journal lock released",
+            || (markers::probe(lock) != markers::Owner::Live).then_some(()),
+        );
     }
 
     fn claim_here(dir: &Path, logs: &Path) -> BootClaim {
-        claim_at_boot(dir, &evidence(logs), std::process::id(), false)
+        claim_at_boot(
+            dir,
+            &evidence(logs),
+            std::process::id(),
+            QuitLayout::default(),
+        )
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -2349,6 +3489,7 @@ pub(crate) mod tests {
             ".journal-4242-7.toml",
             "session.toml",
             "journal-4242-7.toml.seen",
+            "journal-4242-7.unreadable",
         ] {
             assert_eq!(JournalId::parse(stranger), None, "{stranger}");
         }
@@ -2369,9 +3510,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE CASE THIS EXISTS FOR: a run that was killed (its lock gone with it,
-    /// its crash marker left empty) is reopened — its tabs, in their folders —
-    /// and taken once: the next launch finds nothing.
+    /// A killed run is reopened (tabs, folders) and taken once: the next launch
+    /// finds nothing.
     #[test]
     fn a_killed_runs_journal_reopens_once() {
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
@@ -2392,9 +3532,32 @@ pub(crate) mod tests {
             names(dir.path())
         );
         assert_eq!(
-            claim_at_boot(dir.path(), &evidence(logs.path()), 1, false),
+            claim_at_boot(dir.path(), &evidence(logs.path()), 1, QuitLayout::default()),
             BootClaim::default()
         );
+    }
+
+    /// A DEAD OWNER'S LOCK IS FREE AT ONCE, even while a child forked under it
+    /// has yet to exec. Released by the close alone it stayed taken on that
+    /// child's copy of the description, and a claim in the window skipped the
+    /// dead run's journal as a live one's: the full suite's conformance runner
+    /// waited out a sibling test's background-band fork (the managed Ollama
+    /// daemon's) past ten seconds. The fork is made for real while the lock is
+    /// held, and parked short of its exec through the claim.
+    #[test]
+    fn a_dead_owners_lock_is_free_while_a_child_forked_under_it_has_yet_to_exec() {
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let owner = run(dir.path(), logs.path(), &layout(&[("/a", "zsh")]), false);
+        let id = owner.id();
+        let child = crate::parked_fork::ParkedChild::fork();
+        die(owner);
+        let claim = claim_here(dir.path(), logs.path());
+        assert!(
+            child.still_parked(),
+            "the claim ran while the child had yet to exec"
+        );
+        child.release();
+        assert_eq!(claim.taken, vec![id], "the dead run's journal is taken");
     }
 
     /// P6a (2026-09-27): a killed run's journal brings back, on the leaf whose
@@ -2436,10 +3599,9 @@ pub(crate) mod tests {
         assert_eq!(agents, vec![None, Some(claude)]);
     }
 
-    /// A clean quit removes its journal (and its lock): nothing to reopen. A
-    /// run whose crash marker went with a clean `_exit` — the update parent's
-    /// after Commit — leaves its journal behind, and it is taken and set aside,
-    /// never reopened.
+    /// A clean quit removes its journal and lock. A run whose marker went with
+    /// a clean `_exit` (the update parent after Commit) leaves its journal,
+    /// which is taken and set aside, never reopened.
     #[test]
     fn a_clean_end_is_never_reopened() {
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
@@ -2463,10 +3625,9 @@ pub(crate) mod tests {
         assert!(names(dir.path()).is_empty());
     }
 
-    /// A RUNNING window's journal is never taken, by any number of launches;
-    /// of two launches racing for a dead one, one takes it and the other finds
-    /// nothing. NEGATIVE CONTROL: the same journal with its owner dead is
-    /// taken — the lock, not the file's existence, is what kept it.
+    /// A running window's journal is never taken; of two launches racing for a
+    /// dead one, one takes it. With the owner dead the same journal is taken:
+    /// the lock, not the file, protects it.
     #[test]
     fn a_second_instance_never_steals_a_journal() {
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
@@ -2506,8 +3667,8 @@ pub(crate) mod tests {
         assert_eq!(taken, 1, "one image, one taker");
     }
 
-    /// A crash, then an UPDATE: the journal an older build wrote — another
-    /// build string, the legacy layout schema — reopens on this one.
+    /// A journal from an older build (other build string, legacy layout
+    /// schema) reopens on this one.
     #[test]
     fn another_builds_journal_reopens() {
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
@@ -2533,26 +3694,64 @@ pub(crate) mod tests {
         );
     }
 
-    /// An unreadable journal of an unclean end is set aside and SAID; a
-    /// journal planted as a link is never followed. NEGATIVE CONTROL: the same
-    /// kind of run with a whole image reopens.
+    /// An unreadable journal of an unclean end is reported and kept aside where
+    /// its row says, never read again; a journal planted as a link is never
+    /// followed nor kept. A whole image reopens.
     #[test]
     fn an_unreadable_journal_is_said_and_never_followed() {
+        use std::os::unix::fs::PermissionsExt as _;
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
         let owner = run(dir.path(), logs.path(), &layout(&[("/torn", "zsh")]), false);
         let (id, path) = (owner.id(), owner.path());
         die(owner);
-        std::fs::write(&path, b"schema = 2\n[[windows]\n").unwrap();
+        let torn: &[u8] = b"schema = 2\n[[windows]\n";
+        std::fs::write(&path, torn).unwrap();
+        // Older images kept aside before: only the newest few stay.
+        let older: Vec<String> = (1..=super::unix::KEEP_UNREADABLE as u128)
+            .map(|nanos| JournalId { pid: 1, nanos }.unreadable_name())
+            .collect();
+        for name in &older {
+            std::fs::write(dir.path().join(name), torn).unwrap();
+        }
         let claim = claim_here(dir.path(), logs.path());
         assert_eq!(claim.reopened, None);
-        assert!(
-            matches!(
-                &claim.notes[..],
-                [Note::Unreadable { id: noted, class: DeathClass::Killed, .. }] if *noted == id
-            ),
-            "{:?}",
-            claim.notes
+        let kept = match &claim.notes[..] {
+            [
+                Note::Unreadable {
+                    id: noted,
+                    class: DeathClass::Killed,
+                    path: Some(path),
+                    ..
+                },
+            ] if *noted == id => path.clone(),
+            notes => panic!("{notes:?}"),
+        };
+        assert_eq!(
+            std::fs::read(&kept).ok().as_deref(),
+            Some(torn),
+            "the row names the image, kept aside: {}",
+            kept.display()
         );
+        assert_eq!(
+            std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mut aside = older[1..].to_vec();
+        aside.push(id.unreadable_name());
+        aside.sort();
+        let listed = |dir: &Path| -> Vec<String> {
+            names(dir)
+                .into_iter()
+                .filter(|name| name.ends_with(".unreadable"))
+                .collect()
+        };
+        assert_eq!(listed(dir.path()), aside);
+        let again = claim_here(dir.path(), logs.path());
+        assert!(
+            again.taken.is_empty() && again.notes.is_empty(),
+            "{again:?}"
+        );
+        assert_eq!(listed(dir.path()), aside, "no claim takes or sweeps one");
 
         let secret = scratch("cj-secret");
         let target = secret.path().join("elsewhere.toml");
@@ -2572,8 +3771,40 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(&target, &path).unwrap();
         let claim = claim_here(dir.path(), logs.path());
         assert_eq!(claim.reopened, None, "a link is never followed");
-        assert!(matches!(&claim.notes[..], [Note::Unreadable { .. }]));
+        assert!(matches!(
+            &claim.notes[..],
+            [Note::Unreadable { path: None, .. }]
+        ));
         assert!(target.exists(), "the link's target is untouched");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_type().unwrap().is_symlink()),
+            "a link is never kept: {:?}",
+            names(dir.path())
+        );
+        // Nor a hard link: its other name is another of the person's files.
+        let theirs = secret.path().join("notes.txt");
+        std::fs::write(&theirs, torn).unwrap();
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let owner = run(dir.path(), logs.path(), &layout(&[("/y", "zsh")]), false);
+        let path = owner.path();
+        die(owner);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&theirs, &path).unwrap();
+        let claim = claim_here(dir.path(), logs.path());
+        assert!(
+            matches!(&claim.notes[..], [Note::Unreadable { path: None, .. }]),
+            "{:?}",
+            claim.notes
+        );
+        assert_eq!(
+            std::fs::metadata(&theirs).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the other name's file is untouched"
+        );
+        assert_eq!(listed(dir.path()), aside, "a hard link is never kept");
 
         die(run(
             dir.path(),
@@ -2587,12 +3818,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE BRAKE (ruling 285): a journal written by a launch that had
-    /// reopened a crash journal and CRASHED within its 90 s is skipped and
-    /// said, naming what the skipped layout held; one that was STOPPED within
-    /// them (a kill, day five's D18) comes back once — marked a second chance
-    /// — and a second stop in a row inside the next 90 s is skipped too.
-    /// NEGATIVE CONTROL: the same launch's journal after it settled reopens.
+    /// The brake: a launch that reopened a crash journal and crashed within
+    /// its probation is skipped and reported, naming what the layout held; one
+    /// stopped within it comes back once as a second chance, and a second stop
+    /// in a row is skipped. After probation settles, the journal reopens.
     #[test]
     fn a_relapse_inside_probation_is_skipped_and_said() {
         use super::LeafProgram;
@@ -2602,6 +3831,7 @@ pub(crate) mod tests {
                 tab: 1,
                 program: "Python".to_string(),
                 agent: false,
+                again: false,
             }])
         };
         // Written on probation, `second_chance` as given, ended by `banner`
@@ -2707,7 +3937,44 @@ pub(crate) mod tests {
 
     /// The last quit's layout wins: every dead journal is taken and set aside.
     #[test]
-    fn a_quit_layout_sets_every_journal_aside() {
+    fn a_quit_layout_does_not_set_a_crashed_desk_aside() {
+        // Another instance's quit left `session.toml` (one window), then the
+        // five-window desk crashed: the claim reopens the crashed desk behind
+        // the quit layout, and a clean end's journal is still set aside.
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let desk: Vec<RestoreManifest> = (0..5)
+            .map(|i| layout(&[(format!("/w{i}").as_str(), "zsh")]))
+            .collect();
+        let desk = RestoreManifest::new(desk.into_iter().flat_map(|m| m.windows).collect());
+        let crashed = run(dir.path(), logs.path(), &desk, false);
+        let crashed_id = crashed.id();
+        die(crashed);
+        let clean = JournalId::now(reaped_pid());
+        let owner = JournalOwner::create(dir.path(), clean).expect("armed");
+        owner
+            .publish(
+                &layout(&[("/clean", "zsh")]),
+                &JournalHeader::now(clean.pid, false),
+            )
+            .expect("published");
+        die(owner); // no marker: a clean end
+        let claim = claim_at_boot(
+            dir.path(),
+            &evidence(logs.path()),
+            1,
+            QuitLayout::of(Some(&layout(&[("/quit", "zsh")])), None, None),
+        );
+        let reopened = claim.reopened.expect("the crashed desk comes back");
+        assert_eq!(reopened.sources, vec![crashed_id]);
+        assert_eq!(
+            cwds(&reopened.manifest),
+            vec!["/w0", "/w1", "/w2", "/w3", "/w4"]
+        );
+        assert!(claim.set_aside.iter().any(|(id, _)| *id == clean));
+        assert_eq!(claim.taken.len(), 2);
+        assert!(names(dir.path()).is_empty());
+        // Beside a quit layout at the window cap, the crashed desk does not fit:
+        // set aside, as a layout over the cap always was.
         let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
         die(run(
             dir.path(),
@@ -2715,10 +3982,20 @@ pub(crate) mod tests {
             &layout(&[("/a", "zsh")]),
             false,
         ));
-        let claim = claim_at_boot(dir.path(), &evidence(logs.path()), 1, true);
+        let claim = claim_at_boot(
+            dir.path(),
+            &evidence(logs.path()),
+            1,
+            QuitLayout {
+                windows: crate::restore::MAX_WINDOWS,
+                run: None,
+                also: Vec::new(),
+                shape: vec![2; crate::restore::MAX_WINDOWS],
+                written_unix_ms: None,
+            },
+        );
         assert_eq!(claim.reopened, None);
-        assert_eq!(claim.taken.len(), 1);
-        assert!(names(dir.path()).is_empty());
+        assert_eq!(claim.set_aside.len(), 1, "{:?}", claim.set_aside);
     }
 
     /// Two windows that died together (a WindowServer death takes every GUI
@@ -2751,11 +4028,10 @@ pub(crate) mod tests {
         assert_eq!(reopened.writers, vec![newer_id.pid, older_id.pid]);
     }
 
-    /// The run's own evidence, and only its: a panic report written after the
-    /// journal was armed, a signal banner in its marker, an empty marker left or
-    /// swept at this launch's install. A marker of the same pid armed AFTER the
-    /// journal (a later process that reused the pid) and a panic report older
-    /// than the journal are not this run's.
+    /// Only the run's own evidence counts: a panic report after the journal
+    /// was armed, a signal banner in its marker, an empty marker left or swept.
+    /// A same-pid marker armed after the journal, or an older panic report, do
+    /// not.
     #[test]
     fn the_death_class_is_read_from_the_runs_own_evidence() {
         let logs = scratch("cj-logs");
@@ -2765,7 +4041,7 @@ pub(crate) mod tests {
             swept: &[],
         };
         assert_eq!(
-            classify_death(&none, id),
+            classify_death(&none, id, None),
             None,
             "a clean exit leaves nothing"
         );
@@ -2774,24 +4050,28 @@ pub(crate) mod tests {
             .path()
             .join(markers::file_name(id.pid, id.nanos + 1, MarkerOwner::App));
         std::fs::write(&later, b"").unwrap();
-        assert_eq!(classify_death(&none, id), None, "a later process's marker");
+        assert_eq!(
+            classify_death(&none, id, None),
+            None,
+            "a later process's marker"
+        );
         std::fs::remove_file(&later).unwrap();
 
         let own = marker(logs.path(), id);
-        assert_eq!(classify_death(&none, id), Some(DeathClass::Killed));
+        assert_eq!(classify_death(&none, id, None), Some(DeathClass::Killed));
         std::fs::write(&own, b"aterm: fatal signal 11").unwrap();
-        assert_eq!(classify_death(&none, id), Some(DeathClass::Signal));
+        assert_eq!(classify_death(&none, id, None), Some(DeathClass::Signal));
         std::fs::remove_file(&own).unwrap();
 
         let report = logs.path().join(format!("crash-{}.log", id.pid));
         std::fs::write(&report, b"aterm-gui crashed").unwrap();
-        assert_eq!(classify_death(&none, id), Some(DeathClass::Panic));
+        assert_eq!(classify_death(&none, id, None), Some(DeathClass::Panic));
         let before = JournalId {
             pid: id.pid,
             nanos: super::unix_nanos(std::time::SystemTime::now()) + 60_000_000_000,
         };
         assert_eq!(
-            classify_death(&none, before),
+            classify_death(&none, before, None),
             None,
             "a report older than the journal is not its run's"
         );
@@ -2806,21 +4086,1132 @@ pub(crate) mod tests {
             log_dir: Some(logs.path()),
             swept: &swept,
         };
-        assert_eq!(classify_death(&with_sweep, id), Some(DeathClass::Killed));
+        assert_eq!(
+            classify_death(&with_sweep, id, None),
+            Some(DeathClass::Killed)
+        );
     }
 
-    /// A CRASH WHOSE EVIDENCE ANOTHER LAUNCH READ FIRST. Two instances; one is
-    /// killed (or takes a fatal signal), and before anyone relaunches it the
-    /// other one's seamless update boots a successor. That successor does not
-    /// claim (it adopts), but its boot still reads every run's crash and kill
-    /// evidence (`take_kill_evidence`/`take_crash_evidence`), renaming the dead
-    /// run's marker to `.seen`. The next launch that claims must still reopen
-    /// the dead run's layout: its journal is named for its run's start
-    /// (`JournalId::of_this_run`), so the claim finds exactly that marker under
-    /// its consumed name. Before this, the claim read only live names, set the
-    /// journal aside as a clean end and deleted it. NEGATIVE CONTROL: an
-    /// EARLIER run of the same pid whose consumed marker is still kept is not
-    /// this run's evidence — a clean hand-off's journal beside it stays aside.
+    /// A panic report as the panic hook files it for `pid`: its first line
+    /// marked when the panic was on the main thread.
+    fn panic_report(logs: &Path, pid: u32, main_thread: bool) -> PathBuf {
+        let path = logs.join(format!("crash-{pid}.log"));
+        let mark = if main_thread {
+            crate::logging::MAIN_THREAD_PANIC
+        } else {
+            ""
+        };
+        std::fs::write(
+            &path,
+            format!("aterm-gui 0.1.0 crashed at unix 1.000{mark}\npanicked at x\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    /// A main-thread panic whose report another launch consumed (renamed
+    /// `.seen`) first still reopens the desk: `atexit` removed the marker, so
+    /// the report is the only evidence. A consumed worker-thread panic report
+    /// is no evidence of the end.
+    #[test]
+    fn a_main_thread_panic_whose_report_another_launch_read_first_still_reopens() {
+        for main_thread in [true, false] {
+            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+            let id = JournalId::now(reaped_pid());
+            let owner = JournalOwner::create(dir.path(), id).expect("armed");
+            owner
+                .publish(
+                    &layout(&[("/a", "zsh"), ("/b", "claude")]),
+                    &JournalHeader::now(id.pid, false),
+                )
+                .expect("published");
+            // No marker: the unwind ran `atexit`.
+            die(owner);
+            panic_report(logs.path(), id.pid, main_thread);
+            assert!(
+                crate::logging::take_crash_evidence_in(logs.path(), None).is_some(),
+                "another launch reads the report first"
+            );
+            assert!(
+                logs.path()
+                    .join(format!("crash-{}.log.seen", id.pid))
+                    .exists(),
+                "PRECONDITION: consumed"
+            );
+            let claim = claim_here(dir.path(), logs.path());
+            if main_thread {
+                let reopened = claim.reopened.expect("the crashed desk comes back");
+                assert_eq!(reopened.class, DeathClass::Panic);
+                assert_eq!(cwds(&reopened.manifest), vec!["/a", "/b"]);
+            } else {
+                assert_eq!(claim.reopened, None, "a worker's panic says nothing");
+                assert_eq!(claim.set_aside.len(), 1, "{:?}", claim.set_aside);
+            }
+        }
+    }
+
+    /// A pid-only panic report belongs to its own run: a later process reusing
+    /// the pid that panicked does not reopen the earlier, handed-off journal.
+    /// The later run's own crash is reopened as a panic.
+    #[test]
+    fn a_handed_off_journal_is_not_reopened_by_a_later_run_of_the_same_pid() {
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let pid = reaped_pid();
+        let stale = JournalId::now(pid);
+        let owner = JournalOwner::create(dir.path(), stale).expect("armed");
+        owner
+            .publish(
+                &layout(&[("/stale", "zsh")]),
+                &JournalHeader::now(pid, false),
+            )
+            .expect("published");
+        die(owner); // the hand-off: clean, the marker removed, the image left
+        let mut live = JournalId::now(pid);
+        while live.nanos <= stale.nanos {
+            live = JournalId::now(pid);
+        }
+        let owner = JournalOwner::create(dir.path(), live).expect("armed");
+        owner
+            .publish(
+                &layout(&[("/live", "zsh")]),
+                &JournalHeader::now(pid, false),
+            )
+            .expect("published");
+        die(owner);
+        panic_report(logs.path(), pid, true);
+        let claim = claim_here(dir.path(), logs.path());
+        let reopened = claim.reopened.expect("the crashed run comes back");
+        assert_eq!(reopened.class, DeathClass::Panic);
+        assert_eq!(reopened.sources, vec![live]);
+        assert_eq!(cwds(&reopened.manifest), vec!["/live"]);
+        assert!(
+            claim.set_aside.iter().any(|(id, _)| *id == stale),
+            "{:?}",
+            claim.set_aside
+        );
+        // The same bound from a later marker of the pid, with no journal.
+        let logs = scratch("cj-logs");
+        let id = JournalId::now(reaped_pid());
+        let later = logs
+            .path()
+            .join(markers::file_name(id.pid, id.nanos + 1, MarkerOwner::App));
+        std::fs::write(&later, b"").unwrap();
+        panic_report(logs.path(), id.pid, true);
+        assert_eq!(
+            classify_death(&evidence(logs.path()), id, None),
+            None,
+            "a report written after a later run of the pid started is that run's"
+        );
+    }
+
+    /// ROUND EIGHT OF THE UPDATE AUDIT, FINDING 47: A LATER RUN THAT LEFT NO
+    /// JOURNAL STILL BOUNDS A PID-ONLY REPORT. Every update before 0.101 left
+    /// the parent's journal behind as a clean end. Later a headless run reused
+    /// the pid, panicked on a worker thread and was SIGKILLed: its report and
+    /// a dead empty marker are left, and the next windowed launch's own
+    /// install sweep removed the marker before the claim (`evidence.swept`).
+    /// That run started after the stale journal's, so its report is not the
+    /// stale run's end, and the weeks-old desk stays set aside.
+    ///
+    /// RED before the fix: `next_run` came from the directories alone, so the
+    /// report counted as the stale run's panic and the desk reopened.
+    #[test]
+    fn a_later_run_swept_at_install_bounds_a_pid_only_report() {
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let stale = JournalId::now(reaped_pid());
+        let owner = JournalOwner::create(dir.path(), stale).expect("armed");
+        owner
+            .publish(
+                &layout(&[("/stale", "zsh")]),
+                &JournalHeader::now(stale.pid, false),
+            )
+            .expect("published");
+        die(owner); // the hand-off: clean, the marker removed, the image left
+        // A build before the run mark: the report names no run. It is written
+        // after the later run started, which is all its pid says of it.
+        panic_report(logs.path(), stale.pid, false);
+        let swept = [markers::MarkerName {
+            pid: stale.pid,
+            nanos: stale.nanos + 1,
+            owner: MarkerOwner::Other,
+        }];
+        let claim = claim_at_boot(
+            dir.path(),
+            &Evidence {
+                log_dir: Some(logs.path()),
+                swept: &swept,
+            },
+            std::process::id(),
+            QuitLayout::default(),
+        );
+        assert_eq!(claim.reopened, None, "the later run's report is its own");
+        assert_eq!(
+            claim.set_aside,
+            vec![(
+                stale,
+                "no crash evidence of its run (a clean end leaves none)"
+            )]
+        );
+        // NEGATIVE CONTROL: with no later run known, the report is the
+        // stale run's (a pid-only report from before the mark).
+        assert_eq!(
+            classify_death(&evidence(logs.path()), stale, None),
+            Some(DeathClass::Panic)
+        );
+    }
+
+    /// Finding 47's second case: a later headless run of the pid panicked on
+    /// its MAIN thread — the unwind's `atexit` removed its marker, and a
+    /// windowed launch that does not claim consumed the report — so nothing
+    /// of that run is left to bound it. The report names its run
+    /// (`logging::REPORT_RUN`), and counts for that run only. NEGATIVE
+    /// CONTROL: a report naming the journal's own run is its panic.
+    #[test]
+    fn a_report_that_names_its_run_is_that_runs_only() {
+        for (named, reopens) in [(false, false), (true, true)] {
+            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+            let stale = JournalId::now(reaped_pid());
+            let owner = JournalOwner::create(dir.path(), stale).expect("armed");
+            owner
+                .publish(
+                    &layout(&[("/stale", "zsh")]),
+                    &JournalHeader::now(stale.pid, false),
+                )
+                .expect("published");
+            die(owner);
+            let run = if named { stale.nanos } else { stale.nanos + 1 };
+            crate::logging::write_crash_report(
+                &logs.path().join(format!("crash-{}.log", stale.pid)),
+                true,
+                Some(run),
+                &"panicked at x",
+                &"bt",
+            )
+            .expect("the report");
+            assert!(
+                crate::logging::take_crash_evidence_in(logs.path(), None).is_some(),
+                "another launch reads the report first"
+            );
+            let claim = claim_here(dir.path(), logs.path());
+            assert_eq!(
+                claim.reopened.as_ref().map(|reopened| reopened.class),
+                reopens.then_some(DeathClass::Panic),
+                "a report of run {run} for the journal of run {}",
+                stale.nanos
+            );
+        }
+    }
+
+    /// ROUND SEVEN OF THE UPDATE AUDIT, FINDING 5: A SUCCESSOR THAT DIES
+    /// BEFORE ITS FIRST IMAGE. The update's parent `_exit`s cleanly after
+    /// Commit and leaves its journal; the successor wrote nothing before
+    /// Commit and dies (a panic, a signal, a kill) in the Commit handler or
+    /// before its writer published. The next claim must reopen the desk, by the
+    /// successor's evidence: first thing at Commit the successor takes the
+    /// parent's image over as its own (`Lane::adopt_predecessor`). And the
+    /// parent's journal is gone from the directory at once (finding 27: one
+    /// was left behind per update until a cold launch).
+    ///
+    /// RED before the fix: nothing took the parent's journal, which the claim
+    /// set aside as a clean end ("no crash evidence of its run").
+    #[test]
+    fn a_successor_crash_before_its_first_image_reopens_the_predecessors_layout() {
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let parent = JournalId::now(reaped_pid());
+        let owner = JournalOwner::create(dir.path(), parent).expect("armed");
+        owner
+            .publish(
+                &layout(&[("/a", "zsh"), ("/b", "claude")]),
+                &JournalHeader::now(parent.pid, false),
+            )
+            .expect("published");
+        die(owner); // the hand-off: `clean_exit_now` removed its marker
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        lane.set_predecessor(parent.pid, None);
+        let own = lane.journal_id();
+        marker(logs.path(), own); // the successor's run, armed at its start
+        assert_eq!(
+            lane.adopt_predecessor(true),
+            Some(parent),
+            "taken at Commit"
+        );
+        assert_eq!(lane.adopt_predecessor(true), None, "once");
+        assert_eq!(
+            names(dir.path()),
+            vec![own.lock_name(), own.file_name()],
+            "the parent's journal is this run's now, and its dead lock is gone"
+        );
+        // The successor dies before its first capture: the kernel releases
+        // its lock, and its marker stays empty (a kill).
+        drop(lane);
+        await_released(&dir.path().join(own.lock_name()));
+        let claim = claim_here(dir.path(), logs.path());
+        let reopened = claim.reopened.expect("the desk comes back");
+        assert_eq!(reopened.class, DeathClass::Killed);
+        assert_eq!(reopened.sources, vec![own]);
+        assert_eq!(cwds(&reopened.manifest), vec!["/a", "/b"]);
+    }
+
+    /// ROUND EIGHT OF THE UPDATE AUDIT, FINDING 45: A COMMITTED SUCCESSOR
+    /// THAT DIES BEFORE ITS COMMIT WAKE. The Commit waiter's first act is the
+    /// one the waiter really runs (`release_committed_readers`): the adopted
+    /// readers are released, and this build's carried parser and first frames
+    /// run on the output queued during the freeze — the most exposed moment a
+    /// new build has. A successor that dies there, before the main thread
+    /// handles `Wake::ActivateCommittedHandoff`, must still leave the desk to
+    /// reopen: the journal is this run's from the instant any reader runs.
+    /// A reader on the gate sees it under this run's name when it wakes.
+    ///
+    /// RED before the fix: the waiter released the readers first and the
+    /// take-over waited for the wake, so nothing took the parent's journal —
+    /// set aside as a clean end ("no crash evidence of its run").
+    #[test]
+    fn a_committed_successor_that_dies_before_its_commit_wake_still_reopens_the_desk() {
+        use std::sync::atomic::AtomicBool;
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let parent = JournalId::now(reaped_pid());
+        let owner = JournalOwner::create(dir.path(), parent).expect("armed");
+        owner
+            .publish(
+                &layout(&[("/a", "zsh"), ("/b", "claude")]),
+                &JournalHeader::now(parent.pid, false),
+            )
+            .expect("published");
+        die(owner); // the hand-off: `clean_exit_now` removed its marker
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        lane.set_predecessor(parent.pid, Some(parent.nanos));
+        let own = lane.journal_id();
+        marker(logs.path(), own); // the successor's run, armed at its start
+        // Prepared with the proof, before the waiter exists.
+        let journal = lane.take_over_at_commit(true);
+        assert!(
+            journal.is_some(),
+            "a successor's lane prepares its take-over"
+        );
+        let gate = crate::spawn::DeferredReaderGate::closed();
+        let reader = {
+            let gate = gate.clone();
+            let image = dir.path().join(own.file_name());
+            std::thread::spawn(move || {
+                assert!(gate.wait_until_released(&AtomicBool::new(false)));
+                image.exists()
+            })
+        };
+        // The Commit arrived: the waiter's first act.
+        crate::release_committed_readers(journal, &gate);
+        assert!(
+            reader.join().expect("the reader"),
+            "a released reader runs only once the journal is this run's"
+        );
+        // The successor dies on that first output: no Commit wake ran.
+        drop(lane);
+        await_released(&dir.path().join(own.lock_name()));
+        let claim = claim_here(dir.path(), logs.path());
+        let reopened = claim.reopened.expect("the desk comes back");
+        assert_eq!(reopened.class, DeathClass::Killed);
+        assert_eq!(reopened.sources, vec![own]);
+        assert_eq!(cwds(&reopened.manifest), vec!["/a", "/b"]);
+        assert!(claim.set_aside.is_empty(), "{:?}", claim.set_aside);
+    }
+
+    /// Finding 45, the wake's half: the take-over the waiter ran is what the
+    /// Commit wake installs — one journal, owned by this run's writer, the
+    /// parent's taken once — and with no waiter run (a lane that prepared
+    /// none), the wake takes it over itself, as before.
+    #[test]
+    fn the_commit_wake_installs_the_take_over_its_waiter_ran() {
+        for waiter in [true, false] {
+            let dir = scratch("cj-dir");
+            let parent = JournalId::now(reaped_pid());
+            let owner = JournalOwner::create(dir.path(), parent).expect("armed");
+            owner
+                .publish(
+                    &layout(&[("/a", "zsh")]),
+                    &JournalHeader::now(parent.pid, false),
+                )
+                .expect("published");
+            die(owner);
+            let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+            lane.set_predecessor(parent.pid, Some(parent.nanos));
+            let own = lane.journal_id();
+            if waiter {
+                lane.take_over_at_commit(true).expect("prepared").run(|| {});
+                assert_eq!(
+                    names(dir.path()),
+                    vec![own.lock_name(), own.file_name()],
+                    "the waiter took it over"
+                );
+            }
+            assert_eq!(
+                lane.adopt_predecessor(true),
+                Some(parent),
+                "waiter={waiter}"
+            );
+            assert_eq!(lane.adopt_predecessor(true), None, "once");
+            assert_eq!(
+                names(dir.path()),
+                vec![own.lock_name(), own.file_name()],
+                "waiter={waiter}"
+            );
+            assert_eq!(
+                markers::probe(&dir.path().join(own.lock_name())),
+                markers::Owner::Live,
+                "waiter={waiter}: the writer holds this run's journal"
+            );
+            lane.retire(MUST_HAPPEN).expect("retired");
+            assert!(names(dir.path()).is_empty(), "waiter={waiter}");
+        }
+    }
+
+    /// The update's parent's journal in `dir`, published and still held: its
+    /// owner, for the test to end when the parent's `_exit` would.
+    fn a_parents_journal(dir: &Path, desk: &RestoreManifest) -> (JournalId, JournalOwner) {
+        let parent = JournalId::now(reaped_pid());
+        let owner = JournalOwner::create(dir, parent).expect("armed");
+        owner
+            .publish(desk, &JournalHeader::now(parent.pid, false))
+            .expect("published");
+        (parent, owner)
+    }
+
+    /// FINDING 45'S REVIEW — THE READERS GO ONCE THE RENAME STANDS, NOT ONCE
+    /// THE WHOLE TAKE-OVER HAS. Everything the Commit waiter ran before its
+    /// release of the adopted readers is the person's frozen window: only the
+    /// journal armed and the parent's image renamed onto it may come first.
+    /// The directory `fsync`, the image read back and decoded (up to 8 MiB),
+    /// and handing that result to the Commit's wake come after. Here that
+    /// hand-off cannot complete (the test holds the slot it fills), and the
+    /// readers must go anyway; and the rest of the take-over sees the release
+    /// before it does anything: the parent's dead lock is still there.
+    ///
+    /// RED before the fix: the waiter ran the whole take-over, its slot
+    /// included, then released the gate — which this hang detector never sees.
+    #[test]
+    fn the_waiter_releases_the_readers_once_the_rename_stands() {
+        let dir = scratch("cj-dir");
+        let (parent, owner) = a_parents_journal(dir.path(), &layout(&[("/a", "zsh")]));
+        die(owner);
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        lane.set_predecessor(parent.pid, Some(parent.nanos));
+        let own = lane.journal_id();
+        let journal = lane.take_over_at_commit(true).expect("prepared");
+        let slot = journal.slot.clone();
+        let held = slot
+            .taken_over
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let gate = crate::spawn::DeferredReaderGate::closed();
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || crate::release_committed_readers(Some(journal), &gate))
+        };
+        aterm_spec::wait::until_within(
+            MUST_HAPPEN,
+            "the readers released while the take-over's result waits",
+            || gate.is_released().then_some(()),
+        );
+        assert!(
+            dir.path().join(own.file_name()).exists(),
+            "the rename came first"
+        );
+        drop(held);
+        waiter.join().expect("the waiter");
+        assert_eq!(lane.adopt_predecessor(true), Some(parent));
+        lane.retire(MUST_HAPPEN).expect("retired");
+        assert!(names(dir.path()).is_empty());
+
+        // At the release, nothing after the rename has run yet.
+        let dir = scratch("cj-dir");
+        let (parent, owner) = a_parents_journal(dir.path(), &layout(&[("/a", "zsh")]));
+        die(owner);
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        lane.set_predecessor(parent.pid, Some(parent.nanos));
+        let own = lane.journal_id();
+        let mut seen = None;
+        lane.take_over_at_commit(true)
+            .expect("prepared")
+            .run(|| seen = Some(names(dir.path())));
+        let mut expected = vec![parent.lock_name(), own.lock_name(), own.file_name()];
+        expected.sort();
+        assert_eq!(seen, Some(expected), "renamed, its parent's lock not swept");
+        assert_eq!(names(dir.path()), vec![own.lock_name(), own.file_name()]);
+    }
+
+    /// FINDING 45'S REVIEW — THE PARENT'S LOCK GOES EVEN WHEN THE PARENT STILL
+    /// HELD IT AT THE TAKE-OVER. The waiter takes over microseconds after the
+    /// Commit, while the parent is still inside its `_exit`'s teardown and
+    /// holds its journal's lock, so the take-over cannot remove it. An
+    /// updated-in-place daily driver never retires the journal it hands off,
+    /// so nothing else removed it before a cold launch: one stray lock per
+    /// update. The successor's writer clears it once the parent has let it go:
+    /// at its first image (the daily driver's case), or at its quit.
+    ///
+    /// RED before the fix: `journal-<parent>.lock` stayed in both cases.
+    #[test]
+    fn the_parents_lock_goes_once_its_exit_lets_it_go() {
+        for first_image in [true, false] {
+            let dir = scratch("cj-dir");
+            let (parent, owner) = a_parents_journal(dir.path(), &layout(&[("/a", "zsh")]));
+            let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+            lane.set_predecessor(parent.pid, Some(parent.nanos));
+            let own = lane.journal_id();
+            // The Commit arrived; the parent is still tearing down.
+            lane.take_over_at_commit(true).expect("prepared").run(|| {});
+            let mut held = vec![parent.lock_name(), own.lock_name(), own.file_name()];
+            held.sort();
+            assert_eq!(names(dir.path()), held, "a lock still held stays");
+            die(owner); // its `_exit` completes
+            assert_eq!(lane.adopt_predecessor(true), Some(parent));
+            if first_image {
+                assert!(lane.offer(layout(&[("/b", "zsh")]), Vec::new(), Instant::now()));
+                // The whole directory, not the lock alone: the writer clears
+                // the lock BEFORE it writes the image, so the lock's going
+                // can be seen while the image's temporary file still stands.
+                let settled = vec![own.lock_name(), own.file_name()];
+                aterm_spec::wait::until_within(
+                    MUST_HAPPEN,
+                    "the writer clears the parent's lock",
+                    || (names(dir.path()) == settled).then_some(()),
+                );
+            }
+            lane.retire(MUST_HAPPEN).expect("retired");
+            assert!(
+                names(dir.path()).is_empty(),
+                "first_image={first_image}: {:?}",
+                names(dir.path())
+            );
+        }
+    }
+
+    /// THE TAKEN-OVER IMAGE IS NAMED UNTIL THE WRITER REALLY REPLACES IT
+    /// (round seven of the update audit, leftover I2b): from a take-over that
+    /// found the parent's image, `inherited_image_parent` names the parent, and
+    /// it goes on naming it after this run's first image is merely handed to
+    /// the writer — `adopted` clears there, and that write can fail — until the
+    /// writer has published an image of this run's own. A launch that took
+    /// nothing over names nobody.
+    #[test]
+    fn the_taken_over_image_is_named_until_the_writer_replaces_it() {
+        let dir = scratch("cj-dir");
+        let (parent, owner) = a_parents_journal(dir.path(), &layout(&[("/a", "zsh")]));
+        die(owner);
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        assert_eq!(
+            lane.inherited_image_parent(),
+            None,
+            "nothing taken over yet"
+        );
+        lane.set_predecessor(parent.pid, Some(parent.nanos));
+        assert_eq!(lane.adopt_predecessor(true), Some(parent));
+        assert_eq!(lane.inherited_image_parent(), Some(parent.pid));
+        assert!(lane.offer(layout(&[("/b", "zsh")]), Vec::new(), Instant::now()));
+        aterm_spec::wait::until_within(
+            MUST_HAPPEN,
+            "the writer replaces the parent's image",
+            || lane.inherited_image_parent().is_none().then_some(()),
+        );
+        lane.retire(MUST_HAPPEN).expect("retired");
+
+        let fresh = scratch("cj-fresh");
+        let fresh = Lane::new(Some(fresh.path().to_path_buf()), reaped_pid());
+        assert_eq!(fresh.inherited_image_parent(), None, "no successor");
+    }
+
+    /// FINDING 76'S REVIEW — WHAT THE SUCCESSOR CARRIES FROM ITS PARENT ENDS
+    /// AT ITS OWN FIRST FACT, FOR GOOD. The parent's image names Claude on
+    /// conversation `C-parent` in the parent's shell 1, which is this run's
+    /// session 0. Once one capture of this run had a fact of its own about
+    /// that tab — its host's record `D-own`, or its status read seeing the
+    /// shell back at its prompt — a later capture whose host has no record
+    /// (the person ended that agent and started another, or `/resume`d
+    /// another conversation; the new worker has not published) and whose
+    /// status read says Claude again must not name `C-parent`: a crash then
+    /// relaunched the conversation the person had ended. Likewise the
+    /// parent's folder heals a busy leaf on its first capture only: turned
+    /// off and on again (a withdraw), a busy leaf is not given the parent's
+    /// folder, hours old by then. NEGATIVE CONTROL: with no fact of its own
+    /// yet (the status read unread, then Claude), `C-parent` stands.
+    ///
+    /// RED before the fix: the second capture named `C-parent` after each own
+    /// fact, and the folder after the withdraw was the parent's `/b`.
+    #[test]
+    fn a_successors_own_fact_about_a_tab_ends_what_it_carries_for_good() {
+        use super::{HandedSession, Runs};
+        let record = |session: &str| restore::AgentRestore {
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            program: "/opt/claude/bin/claude".into(),
+            argv: vec!["/opt/claude/bin/claude".into()],
+            session: Some(session.into()),
+            cwd: "/b".into(),
+            version: Some("2.1.283".into()),
+            codex: None,
+        };
+        let successor = || {
+            let dir = scratch("cj-dir");
+            let mut desk = layout(&[("/a", "zsh"), ("/b", "claude")]);
+            desk.fill_agents(&|id| (id == 1).then(|| record("C-parent")));
+            let (parent, owner) = a_parents_journal(dir.path(), &desk);
+            die(owner);
+            let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+            lane.set_predecessor(parent.pid, Some(parent.nanos));
+            assert_eq!(lane.adopt_predecessor(true), Some(parent));
+            (dir, lane)
+        };
+        // One capture as `tick_crash_journal` takes it: this run's session 0
+        // is the parent's shell 1 and its 1 the parent's 0; `host` is the
+        // record this run's host published for session 0, `runs` what its
+        // status read says runs there; `busy`: session 0's engine answered
+        // no folder and no title. Answers session 0's conversation and folder.
+        let capture = |lane: &mut Lane, host: Option<&str>, runs: Runs, busy: bool| {
+            let mut manifest = layout(&[("/own-b", "claude"), ("/own-a", "zsh")]);
+            if busy {
+                let restore::RestoredSplitTree::Leaf {
+                    view: restore::RestoredView::Terminal(leaf),
+                } = &mut manifest.windows[0].restored_tabs[0].root
+                else {
+                    unreachable!("a terminal leaf")
+                };
+                leaf.cwd = None;
+                leaf.title.clear();
+            }
+            manifest.fill_agents(&|id| (id == 0).then_some(host).flatten().map(record));
+            lane.carry_forward(&mut manifest, &|id| {
+                (id <= 1).then_some(HandedSession {
+                    was: 1 - id,
+                    runs: if id == 0 { runs } else { Runs::Other },
+                    keyed: None,
+                })
+            });
+            let restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(leaf),
+            } = &manifest.windows[0].restored_tabs[0].root
+            else {
+                unreachable!("a terminal leaf")
+            };
+            let seen = (
+                leaf.agent.as_ref().and_then(|agent| agent.session.clone()),
+                leaf.cwd.clone(),
+            );
+            lane.offer(manifest, Vec::new(), Instant::now());
+            seen
+        };
+        let claude = Runs::Agent(aterm_phase::Program::Claude);
+        for (fact, host, runs) in [
+            ("its host's record", Some("D-own"), claude),
+            ("the shell at its prompt", None, Runs::Other),
+        ] {
+            let (_dir, mut lane) = successor();
+            let first = capture(&mut lane, host, runs, false);
+            assert_eq!(first.0, host.map(str::to_string), "{fact}: this run's own");
+            assert_eq!(
+                capture(&mut lane, None, claude, false).0,
+                None,
+                "{fact}: the parent's conversation is not named again"
+            );
+        }
+
+        // NEGATIVE CONTROL: no fact of this run's own yet.
+        let (_dir, mut lane) = successor();
+        for runs in [Runs::Unread, claude] {
+            assert_eq!(
+                capture(&mut lane, None, runs, false).0.as_deref(),
+                Some("C-parent"),
+                "{runs:?}: the parent's record stands"
+            );
+        }
+
+        // The folder: the parent's on the first capture, never after.
+        let (_dir, mut lane) = successor();
+        assert_eq!(
+            capture(&mut lane, None, Runs::Unread, true).1.as_deref(),
+            Some("/b"),
+            "a busy first capture keeps the parent's folder"
+        );
+        lane.withdraw();
+        assert_eq!(
+            capture(&mut lane, None, Runs::Unread, true).1,
+            None,
+            "after a withdraw, not the parent's folder"
+        );
+    }
+
+    /// ROUND SEVEN, FINDING 5'S REVIEW: the take-over takes only the parent
+    /// RUN's journal. An older crashed run that had the parent's pid left a
+    /// journal no cold boot has claimed yet; the parent itself left none (it
+    /// never published). The successor, told when its parent started, takes
+    /// nothing, and the older desk is still offered to the next claim.
+    /// NEGATIVE CONTROL: told the pid alone (the defect, and a fork-link
+    /// attestation's case), it takes the older desk as its own image.
+    #[test]
+    fn a_take_over_never_takes_an_older_run_of_the_parents_pid() {
+        let setup = || {
+            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+            let pid = reaped_pid();
+            let older = JournalId::now(pid);
+            marker(logs.path(), older); // its crash evidence: a kill
+            let owner = JournalOwner::create(dir.path(), older).expect("armed");
+            owner
+                .publish(
+                    &layout(&[("/older", "zsh")]),
+                    &JournalHeader::now(pid, false),
+                )
+                .expect("published");
+            die(owner);
+            (dir, logs, older)
+        };
+        let (dir, logs, older) = setup();
+        // The parent started ten seconds after the older run's journal.
+        let born = older.nanos + 10_000_000_000;
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        lane.set_predecessor(older.pid, Some(born));
+        let own = lane.journal_id();
+        assert_eq!(lane.adopt_predecessor(true), None, "not the parent run's");
+        drop(lane);
+        await_released(&dir.path().join(own.lock_name()));
+        let claim = claim_here(dir.path(), logs.path());
+        let reopened = claim.reopened.expect("the older desk is still offered");
+        assert_eq!(reopened.sources, vec![older]);
+        assert_eq!(cwds(&reopened.manifest), vec!["/older"]);
+
+        let (dir, _logs, older) = setup();
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        lane.set_predecessor(older.pid, None);
+        assert_eq!(
+            lane.adopt_predecessor(true),
+            Some(older),
+            "the pid alone takes the older desk"
+        );
+    }
+
+    /// A taken-over image's leaves carry the parent's pool ids until the
+    /// successor publishes, so the claim names the header's writer, not the
+    /// file's (`keeper_link::place_by_owner`).
+    #[test]
+    fn a_taken_over_image_names_the_parent_as_its_leaves_writer() {
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let parent = JournalId::now(reaped_pid());
+        let owner = JournalOwner::create(dir.path(), parent).expect("armed");
+        owner
+            .publish(
+                &layout(&[("/a", "zsh"), ("/b", "zsh")]),
+                &JournalHeader::now(parent.pid, false),
+            )
+            .expect("published");
+        die(owner);
+        let successor = reaped_pid();
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), successor);
+        lane.set_predecessor(parent.pid, Some(parent.nanos));
+        let own = lane.journal_id();
+        marker(logs.path(), own);
+        assert_eq!(lane.adopt_predecessor(true), Some(parent));
+        drop(lane);
+        await_released(&dir.path().join(own.lock_name()));
+        let reopened = claim_here(dir.path(), logs.path())
+            .reopened
+            .expect("the desk comes back");
+        assert_eq!(reopened.sources, vec![own], "judged as the successor's run");
+        assert_eq!(
+            reopened.writers,
+            vec![parent.pid],
+            "its leaves are the parent's"
+        );
+        // A header with no pid (a writer from before the field) is its file's.
+        assert_eq!(
+            JournalHeader {
+                pid: 0,
+                ..JournalHeader::now(1, false)
+            }
+            .image_writer(own),
+            own.pid
+        );
+    }
+
+    /// A quit cut short: the run wrote a stamped `session.toml` and was killed
+    /// before its journal went. The claim sets that journal aside instead of
+    /// opening every window twice; another crashed desk still comes back
+    /// behind the quit's.
+    ///
+    /// An older build's unstamped quit is matched by desk shape instead, with
+    /// the same result. Without the shape rule, the quit's own journal is
+    /// reopened (the doubled desk).
+    #[test]
+    fn a_quit_cut_short_before_its_journal_went_opens_its_desk_once() {
+        let setup = |stamped: bool| {
+            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+            let desk = layout(&[("/desk", "zsh"), ("/agent", "claude")]);
+            let quitting = if stamped {
+                run(dir.path(), logs.path(), &desk, false)
+            } else {
+                run_by_older_build(dir.path(), logs.path(), &desk, None)
+            };
+            let id = quitting.id();
+            let session = dir.path().join("session.toml");
+            let stem = id.stem();
+            restore::write_quit_to(&session, &desk, stamped.then_some(stem.as_str()))
+                .expect("the quit's layout");
+            die(quitting); // killed between the layout write and the retire
+            let other = run(
+                dir.path(),
+                logs.path(),
+                &layout(&[("/other", "zsh")]),
+                false,
+            );
+            let other_id = other.id();
+            die(other);
+            let taken = restore::take_quit_from(&session).expect("the quit layout");
+            let quit = QuitLayout::of(
+                Some(&taken.manifest),
+                taken.run.as_deref().and_then(JournalId::parse_stem),
+                taken.written_unix_ms,
+            );
+            assert!(quit.written_unix_ms.is_some(), "the layout is dated");
+            let claim = claim_at_boot(dir.path(), &evidence(logs.path()), 1, quit.clone());
+            (claim, quit, id, other_id)
+        };
+        let (claim, quit, id, other) = setup(true);
+        assert_eq!(quit.run, Some(id), "the quit names its run");
+        let reopened = claim.reopened.expect("the other desk comes back");
+        assert_eq!(
+            reopened.sources,
+            vec![other],
+            "the quit's own desk opens once"
+        );
+        assert_eq!(cwds(&reopened.manifest), vec!["/other"]);
+        assert!(claim.set_aside.iter().any(|(set, _)| *set == id));
+        assert!(claim.taken.contains(&id), "and it is gone, single-use");
+
+        let (claim, quit, id, other) = setup(false);
+        assert_eq!(quit.run, None);
+        assert_eq!(quit.shape, vec![2]);
+        let reopened = claim.reopened.expect("the other desk comes back");
+        assert_eq!(
+            reopened.sources,
+            vec![other],
+            "an older build's quit, cut short, opens its desk once too"
+        );
+        assert!(claim.set_aside.iter().any(|(set, _)| *set == id));
+        assert!(claim.taken.contains(&id), "and it is gone, single-use");
+
+        // Control: with the shape rule blinded (a quit layout of another
+        // shape) the quitting run's journal reopens behind the quit.
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let quitting = run_by_older_build(
+            dir.path(),
+            logs.path(),
+            &layout(&[("/desk", "zsh"), ("/agent", "claude")]),
+            None,
+        );
+        let id = quitting.id();
+        die(quitting);
+        let blind = QuitLayout {
+            windows: 1,
+            run: None,
+            also: Vec::new(),
+            shape: vec![3],
+            written_unix_ms: None,
+        };
+        let reopened = claim_at_boot(dir.path(), &evidence(logs.path()), 1, blind)
+            .reopened
+            .expect("reopened");
+        assert_eq!(reopened.sources, vec![id], "the doubled desk");
+
+        // The same shape is not the same desk: an older build's quit left one
+        // window of two tabs; later an unmarked desk of the same shape crashed.
+        // Its image is hours newer than the quit layout, so it comes back and
+        // only the quit's own journal is set aside. Control: with the layout's
+        // date unknown, the shape alone sets the newer desk aside.
+        let newer_desk = |dated: bool| {
+            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+            let desk = layout(&[("/desk", "zsh"), ("/agent", "claude")]);
+            let quit_at = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
+            let quit_ms = u64::try_from(
+                quit_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after the epoch")
+                    .as_millis(),
+            )
+            .expect("fits");
+            let owner = run_by_older_build(dir.path(), logs.path(), &desk, Some(quit_ms + 900));
+            let quitting = owner.id();
+            let session = dir.path().join("session.toml");
+            restore::write_quit_to(&session, &desk, None).expect("the quit's layout");
+            std::fs::File::options()
+                .write(true)
+                .open(&session)
+                .and_then(|file| file.set_modified(quit_at))
+                .expect("dated hours ago");
+            die(owner);
+            let crashed = run_by_older_build(
+                dir.path(),
+                logs.path(),
+                &layout(&[("/work", "zsh"), ("/work", "claude")]),
+                None,
+            );
+            let crashed_id = crashed.id();
+            die(crashed);
+            let taken = restore::take_quit_from(&session).expect("the quit layout");
+            assert_eq!(taken.run, None, "an older build's quit names no run");
+            assert_eq!(
+                taken.written_unix_ms.map(|ms| ms / 1000),
+                Some(quit_ms / 1000),
+                "dated by its file"
+            );
+            let quit = QuitLayout::of(
+                Some(&taken.manifest),
+                None,
+                taken.written_unix_ms.filter(|_| dated),
+            );
+            let claim = claim_at_boot(dir.path(), &evidence(logs.path()), 1, quit);
+            (claim, quitting, crashed_id)
+        };
+        let (claim, quitting, crashed) = newer_desk(true);
+        let reopened = claim.reopened.expect("the newer desk comes back");
+        assert_eq!(reopened.sources, vec![crashed], "behind the quit, once");
+        assert_eq!(cwds(&reopened.manifest), vec!["/work", "/work"]);
+        assert!(
+            claim.set_aside.iter().any(|(set, _)| *set == quitting),
+            "the quit's own journal is still set aside: {:?}",
+            claim.set_aside
+        );
+
+        let (claim, quitting, crashed) = newer_desk(false);
+        assert_eq!(claim.reopened, None, "the control: the newer desk is lost");
+        for id in [quitting, crashed] {
+            assert!(claim.set_aside.iter().any(|(set, _)| *set == id));
+        }
+    }
+
+    /// TWO INSTANCES QUIT IN TURN (restore audit, 2026-10-02). Every windowed
+    /// launch takes `session.toml` at boot, so of two instances running, the
+    /// second to quit replaced the first one's desk: gone, its journal
+    /// retired by its own quit. A quit keeps every other instance's desk
+    /// behind its own, by run, and so does the cold update lane's take-back
+    /// of a layout no relaunch used (which took the whole file); the first
+    /// quit, cut short, has its journal set aside by its run, so each desk
+    /// opens once. NEGATIVE CONTROL: an unstamped write (the tests'
+    /// `write_to`, Windows' end-session flush) replaces.
+    ///
+    /// RED before the fix: the next launch reopened `/b/one` alone.
+    #[test]
+    fn a_quit_beside_another_instances_quit_keeps_both_desks_once() {
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let session = dir.path().join("session.toml");
+        let a_desk = RestoreManifest::new(
+            layout(&[("/a/one", "zsh")])
+                .windows
+                .into_iter()
+                .chain(layout(&[("/a/two", "zsh")]).windows)
+                .collect(),
+        );
+        let b_desk = layout(&[("/b/one", "zsh")]);
+        let a = run(dir.path(), logs.path(), &a_desk, false);
+        let b = run(dir.path(), logs.path(), &b_desk, false);
+        let (a_id, b_id) = (a.id(), b.id());
+        // A quits first, cut short between its layout and its retire.
+        restore::write_quit_to(&session, &a_desk, Some(&a_id.stem())).expect("A's layout");
+        die(a);
+        // B's update leaves its layout for a relaunch that does not start, and
+        // takes it back: A's desk waits on, still A's.
+        restore::write_quit_to(&session, &b_desk, Some(&b_id.stem())).expect("B's update");
+        restore::unwrite_quit_to(&session, Some(&b_id.stem())).expect("taken back");
+        let waiting = std::fs::read_to_string(&session).expect("A's desk waits");
+        assert_eq!(restore::quit_run_of(&waiting), Some(a_id.stem()));
+        // B quits after it, whole.
+        restore::write_quit_to(&session, &b_desk, Some(&b_id.stem())).expect("B's layout");
+        b.retire().expect("B retired");
+
+        let taken = restore::take_quit_from(&session).expect("the quit layout");
+        assert_eq!(
+            cwds(&taken.manifest),
+            ["/b/one", "/a/one", "/a/two"],
+            "both desks, the later quit's first"
+        );
+        let quit = QuitLayout::of(
+            Some(&taken.manifest),
+            taken.run.as_deref().and_then(JournalId::parse_stem),
+            taken.written_unix_ms,
+        )
+        .holding(&taken.also);
+        let claim = claim_at_boot(dir.path(), &evidence(logs.path()), 1, quit);
+        assert_eq!(claim.taken, vec![a_id]);
+        assert_eq!(
+            claim.reopened, None,
+            "A's journal is its quit's, whose desk is in the layout: never a second A"
+        );
+
+        restore::write_quit_to(&session, &a_desk, None).expect("unstamped");
+        restore::write_quit_to(&session, &b_desk, None).expect("unstamped");
+        assert_eq!(
+            cwds(&restore::take_from(&session).expect("the layout")),
+            ["/b/one"]
+        );
+    }
+
+    /// A desk whose build stamps its quits is never an older quit's own: an
+    /// older instance W quits with the idle desk D's shape and is cut short,
+    /// then D is killed. D's image matches shape and date but carries
+    /// [`JournalHeader::stamps_quit`], so it comes back behind the quit while
+    /// W's journal is set aside. Control: without the mark, D's desk is set
+    /// aside.
+    #[test]
+    fn a_desk_whose_build_stamps_its_quits_is_never_an_older_quits_own() {
+        let now_ms = || {
+            u64::try_from(
+                aterm_time::since_epoch()
+                    .expect("after the epoch")
+                    .as_millis(),
+            )
+            .expect("fits")
+        };
+        let scenario = |marked: bool| {
+            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+            let idle_since = now_ms() - 3_600_000;
+            let driver_desk = layout(&[("/work", "zsh"), ("/work", "claude")]);
+            let driver = JournalId::now(reaped_pid());
+            marker(logs.path(), driver);
+            let owner = JournalOwner::create(dir.path(), driver).expect("armed");
+            let header = if marked {
+                JournalHeader::now(driver.pid, false)
+            } else {
+                older_header(driver.pid)
+            };
+            owner
+                .publish(
+                    &driver_desk,
+                    &JournalHeader {
+                        written_unix_ms: idle_since,
+                        ..header
+                    },
+                )
+                .expect("published");
+            let desk = layout(&[("/desk", "zsh"), ("/agent", "claude")]);
+            let older = run_by_older_build(dir.path(), logs.path(), &desk, None);
+            let quitting = older.id();
+            let session = dir.path().join("session.toml");
+            restore::write_quit_to(&session, &desk, None).expect("the older quit's layout");
+            die(older); // cut short before its journal went
+            die(owner); // then the daily driver is killed
+            let taken = restore::take_quit_from(&session).expect("the quit layout");
+            assert_eq!(taken.run, None, "an older build's quit names no run");
+            let quit = QuitLayout::of(Some(&taken.manifest), None, taken.written_unix_ms);
+            assert!(
+                quit.written_unix_ms
+                    .is_some_and(|at| at > idle_since + super::QUIT_DATE_SLACK_MS),
+                "the driver's image is older than the quit layout"
+            );
+            assert_eq!(
+                quit.shape,
+                super::desk_shape(&driver_desk),
+                "and has its shape"
+            );
+            let claim = claim_at_boot(dir.path(), &evidence(logs.path()), 1, quit);
+            (claim, quitting, driver)
+        };
+        let (claim, quitting, driver) = scenario(true);
+        let reopened = claim.reopened.expect("the driver's desk comes back");
+        assert_eq!(reopened.sources, vec![driver], "behind the quit, once");
+        assert_eq!(cwds(&reopened.manifest), vec!["/work", "/work"]);
+        assert!(
+            claim.set_aside.iter().any(|(set, _)| *set == quitting),
+            "the older quit's own journal is still set aside: {:?}",
+            claim.set_aside
+        );
+
+        let (claim, quitting, driver) = scenario(false);
+        assert_eq!(
+            claim.reopened, None,
+            "the control: the driver's desk is lost"
+        );
+        for id in [quitting, driver] {
+            assert!(claim.set_aside.iter().any(|(set, _)| *set == id));
+            assert!(claim.taken.contains(&id), "taken, so gone");
+        }
+
+        // The mark on the wire: this build writes it, an older image reads
+        // without it, and an unmarked header writes no key.
+        let desk = layout(&[("/w", "zsh")]);
+        let ours = encode(&desk, &JournalHeader::now(7, false)).expect("encoded");
+        assert!(ours.contains("stamps_quit = true"), "{ours}");
+        assert!(decode(&ours).expect("decoded").0.stamps_quit);
+        let theirs = encode(&desk, &older_header(7)).expect("encoded");
+        assert!(!theirs.contains("stamps_quit"), "{theirs}");
+        assert!(!decode(&theirs).expect("decoded").0.stamps_quit);
+    }
+
+    /// The take-over's other ends: the successor's own image replaces the
+    /// parent's, and its clean quit removes both the journal and its lock;
+    /// with `restore_session` off, or a parent that left no image, nothing is
+    /// taken and nothing is armed.
+    #[test]
+    fn a_taken_over_journal_is_rewritten_and_retired_as_the_successor_s_own() {
+        let dir = scratch("cj-dir");
+        let parent = JournalId::now(reaped_pid());
+        let owner = JournalOwner::create(dir.path(), parent).expect("armed");
+        owner
+            .publish(
+                &layout(&[("/a", "zsh")]),
+                &JournalHeader::now(parent.pid, false),
+            )
+            .expect("published");
+        die(owner);
+        let mut off = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        off.set_predecessor(parent.pid, None);
+        assert_eq!(off.adopt_predecessor(false), None, "restore_session off");
+        let mut none = Lane::new(Some(dir.path().to_path_buf()), reaped_pid());
+        none.set_predecessor(reaped_pid(), None);
+        assert_eq!(none.adopt_predecessor(true), None, "a parent with no image");
+        assert!(none.retire(MUST_HAPPEN).is_ok());
+        assert_eq!(
+            names(dir.path()),
+            vec![parent.lock_name(), parent.file_name()],
+            "neither touched the parent's journal, and the second removed its own lock"
+        );
+
+        let mut lane = Lane::new(Some(dir.path().to_path_buf()), std::process::id());
+        lane.set_predecessor(parent.pid, None);
+        let own = lane.journal_id();
+        assert_eq!(lane.adopt_predecessor(true), Some(parent));
+        assert!(lane.offer(layout(&[("/mine", "zsh")]), Vec::new(), Instant::now()));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let text = std::fs::read_to_string(dir.path().join(own.file_name())).unwrap();
+            if cwds(&decode(&text).unwrap().1) == ["/mine"] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the successor's image replaces it"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(lane.retire(MUST_HAPPEN).is_ok());
+        assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
+    }
+
+    /// A crashed desk of 65 windows comes back as its first 64, not as an
+    /// unreadable image.
+    #[test]
+    fn a_crashed_desk_past_the_window_cap_reopens_what_fits() {
+        let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+        let desk = RestoreManifest::new(
+            (0..=crate::restore::MAX_WINDOWS)
+                .flat_map(|i| layout(&[(format!("/w{i}").as_str(), "zsh")]).windows)
+                .collect(),
+        );
+        die(run(dir.path(), logs.path(), &desk, false));
+        let claim = claim_here(dir.path(), logs.path());
+        assert!(claim.notes.is_empty(), "{:?}", claim.notes);
+        let reopened = claim.reopened.expect("reopened");
+        assert_eq!(reopened.manifest.windows.len(), crate::restore::MAX_WINDOWS);
+        assert_eq!(cwds(&reopened.manifest)[0], "/w0");
+    }
+
+    /// A crash whose marker another launch consumed first (renamed `.seen` by
+    /// an update successor's boot) still reopens: the journal is named for its
+    /// run's start (`JournalId::of_this_run`), so the claim finds that exact
+    /// marker. An earlier run of the same pid with a kept consumed marker is
+    /// not this run's evidence.
     #[test]
     fn a_crash_whose_evidence_another_launch_read_first_still_reopens() {
         for (banner, class) in [
@@ -2846,9 +5237,10 @@ pub(crate) mod tests {
             die(owner);
             // The update's successor boots: it reads the evidence, claims nothing.
             let read = if banner.is_empty() {
-                crate::logging::take_kill_evidence_in(logs.path(), std::process::id()).is_some()
+                crate::logging::take_kill_evidence_in(logs.path(), std::process::id(), None)
+                    .is_some()
             } else {
-                crate::logging::take_crash_evidence_in(logs.path()).is_some()
+                crate::logging::take_crash_evidence_in(logs.path(), None).is_some()
             };
             assert!(
                 read && !own.exists(),
@@ -2882,6 +5274,104 @@ pub(crate) mod tests {
         assert_eq!(claim.taken, vec![id]);
     }
 
+    /// ROUND EIGHT, U59: A KILLED RUN'S CONSUMED MARKER SURVIVES THE PRUNE
+    /// UNTIL ITS JOURNAL IS CLAIMED. An update successor's boot reads the
+    /// evidence of a run it does not claim (renaming its empty marker `.seen`),
+    /// and every later windowed launch prunes the consumed reports to the
+    /// newest eight by mtime — and a killed run's marker is dated at its START,
+    /// so it is the first to go. The next cold launch then found no evidence and
+    /// set the killed desk aside as a clean end. The prune now keeps the
+    /// consumed evidence of every run whose journal still waits for a claim.
+    /// CONTROLS: with no prune in between the desk reopens; and once claimed,
+    /// the next prune lets the marker go.
+    ///
+    /// RED before the fix: the second launch's prune removed the marker, and
+    /// the claim set the journal aside ("no crash evidence of its run").
+    #[test]
+    fn a_killed_runs_consumed_marker_survives_the_prune_until_its_claim() {
+        let three_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 24 * 3600);
+        let killed_desk = |dir: &Path, logs: &Path| {
+            let id = JournalId::now(reaped_pid());
+            let marker = logs.join(markers::file_name(id.pid, id.nanos, MarkerOwner::App));
+            std::fs::write(&marker, b"").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&marker)
+                .and_then(|file| file.set_modified(three_days_ago))
+                .expect("dated at the run's start");
+            let owner = JournalOwner::create(dir, id).expect("armed");
+            owner
+                .publish(
+                    &layout(&[("/a", "zsh")]),
+                    &JournalHeader::now(id.pid, false),
+                )
+                .expect("published");
+            die(owner);
+            (id, marker)
+        };
+        let reports_since = |logs: &Path| {
+            for n in 0..crate::logging::KEEP_SEEN_CRASH_REPORTS {
+                std::fs::write(
+                    logs.join(format!("crash-{}.log.seen", 4_000_000 + n)),
+                    b"thread 'worker' panicked",
+                )
+                .unwrap();
+            }
+        };
+        for prune_between in [false, true] {
+            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+            let (id, marker) = killed_desk(dir.path(), logs.path());
+            // Eight newer consumed reports: other processes' panics, other
+            // killed runs.
+            reports_since(logs.path());
+            // Another instance's update successor boots: it reads B's marker
+            // (the only one it consumes, so this pass names and keeps it) and
+            // claims no journal.
+            assert!(
+                crate::logging::take_kill_evidence_in(
+                    logs.path(),
+                    std::process::id(),
+                    Some(dir.path())
+                )
+                .is_some(),
+                "PRECONDITION: the successor reads the killed run's marker"
+            );
+            let seen = marker.with_file_name(format!(
+                "{}.seen",
+                marker.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(seen.exists(), "PRECONDITION: consumed, not removed");
+            if prune_between {
+                // The next windowed launch: another successor, which prunes
+                // with nothing of B's named.
+                let _ = crate::logging::take_crash_evidence_in(logs.path(), Some(dir.path()));
+                assert!(
+                    seen.exists(),
+                    "THE PRUNE KEPT THE MARKER OF A RUN WHOSE JOURNAL WAITS"
+                );
+            }
+            let claim = claim_here(dir.path(), logs.path());
+            let reopened = claim.reopened.unwrap_or_else(|| {
+                panic!(
+                    "prune between = {prune_between}: set aside as {:?}",
+                    claim.set_aside
+                )
+            });
+            assert_eq!(reopened.class, DeathClass::Killed);
+            assert_eq!(cwds(&reopened.manifest), vec!["/a"]);
+            assert_eq!(claim.taken, vec![id]);
+            if prune_between {
+                // Claimed: the next prune keeps no more than it ever did.
+                let _ = crate::logging::take_crash_evidence_in(logs.path(), Some(dir.path()));
+                assert!(
+                    !seen.exists(),
+                    "once claimed, the marker ages out as before"
+                );
+            }
+        }
+    }
+
     /// Leftovers of the dead are cleared; a live writer's are not.
     #[test]
     fn a_claim_clears_the_dead_writers_leftovers() {
@@ -2905,10 +5395,9 @@ pub(crate) mod tests {
         assert!(dir.path().join(live.id().lock_name()).exists());
     }
 
-    /// NO LOSS (`CrashJournalClaim`'s `NoLoss`, on the real kernel): a reader
-    /// racing a writer that rewrites the image hundreds of times finds a whole
-    /// image under the name at every read — the rename replaces the old image in
-    /// one step, so a death at any instant of a rewrite leaves one to reopen.
+    /// No loss (`CrashJournalClaim`'s `NoLoss` on the real kernel): a reader
+    /// racing a writer that rewrites hundreds of times always finds a whole
+    /// image, since the rename replaces the old one in one step.
     #[test]
     fn a_rewrite_never_leaves_the_name_without_a_whole_image() {
         let dir = scratch("cj-noloss");
@@ -2964,7 +5453,7 @@ pub(crate) mod tests {
         };
         assert!(at("crash_journal::claim_at_boot(") < at("logging::take_crash_evidence()"));
         assert!(at("crash_journal::claim_at_boot(") < at("logging::take_kill_evidence()"));
-        assert!(at("restore::write(&manifest)") < at(".retire(std::time::Duration"));
+        assert!(at("restore::write_quit(") < at(".retire(std::time::Duration"));
     }
 
     /// Images are private and published whole: `0600`, no temporary left.
@@ -2985,9 +5474,9 @@ pub(crate) mod tests {
         owner.retire().unwrap();
     }
 
-    /// THE WRITE RATE: nothing while idle, at most one image per interval,
-    /// only when the layout moved, the trailing edge woken for, a busy leaf's
-    /// cwd and title kept, and the probation mark settled by a rewrite.
+    /// The write rate: nothing while idle, at most one image per interval, only
+    /// on change, the trailing edge woken for, a busy leaf's cwd and title
+    /// kept, and the probation mark settled by a rewrite.
     #[test]
     fn the_lane_writes_only_changes_at_the_bounded_rate() {
         let dir = scratch("cj-lane");
@@ -3030,7 +5519,7 @@ pub(crate) mod tests {
         let t4 = t3 + MIN_WRITE_INTERVAL;
         assert!(lane.offer(layout(&[("/a", "zsh"), ("/b", "zsh")]), Vec::new(), t4));
         assert_eq!(lane.writes, 2);
-        lane.retire(Duration::from_secs(5)).unwrap();
+        lane.retire(MUST_HAPPEN).unwrap();
 
         // Probation: marked while it runs, rewritten unmarked at its end.
         let mut lane = Lane::new(Some(dir.path().to_path_buf()), std::process::id());
@@ -3044,19 +5533,15 @@ pub(crate) mod tests {
             "the same layout, rewritten without the mark"
         );
         assert_eq!(lane.next_wake(t0 + PROBATION), None);
-        lane.retire(Duration::from_secs(5)).unwrap();
+        lane.retire(MUST_HAPPEN).unwrap();
         assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
     }
 
-    /// A TITLE THAT NEVER STOPS (an agent's spinner) is written once per
-    /// [`TITLE_WRITE_INTERVAL`], not once per capture; the last title is not
-    /// lost — the capture it is owed comes at the interval's end, woken for
-    /// even with nothing else moving; and a layout change inside the interval
-    /// is still written at the layout's own rate. NEGATIVE CONTROL: the same
-    /// spinner's captures are every one a change.
-    /// A program starting or ending in a leaf is a change worth an image even
-    /// inside the title interval (D16): the journal must not keep saying a tab
-    /// sat at its prompt while vim ran in it.
+    /// A never-ending title change (an agent's spinner) is written once per
+    /// [`TITLE_WRITE_INTERVAL`]; the last title is written at the interval's
+    /// end, and a layout change inside the interval is written at the layout's
+    /// rate. A program starting or ending in a leaf is written even inside the
+    /// title interval. Control: the spinner's captures are each a change.
     #[test]
     fn a_program_starting_is_written_like_a_moved_folder() {
         let dir = scratch("cj-lane");
@@ -3078,7 +5563,7 @@ pub(crate) mod tests {
             lane.offer(layout(&[("/a", "vim")]), Vec::new(), t3),
             "it ended: written"
         );
-        lane.retire(Duration::from_secs(5)).expect("retired");
+        lane.retire(MUST_HAPPEN).expect("retired");
     }
 
     #[test]
@@ -3125,7 +5610,7 @@ pub(crate) mod tests {
         assert!(lane.capture_due(due));
         assert!(lane.offer(layout(&[("/a", "done"), ("/b", "zsh")]), Vec::new(), due));
         assert_eq!(lane.next_wake(due), None);
-        lane.retire(Duration::from_secs(5)).unwrap();
+        lane.retire(MUST_HAPPEN).unwrap();
     }
 
     /// The writer thread publishes what the lane hands it, as this process,
@@ -3135,7 +5620,7 @@ pub(crate) mod tests {
         let dir = scratch("cj-thread");
         let mut lane = Lane::new(Some(dir.path().to_path_buf()), std::process::id());
         assert!(lane.offer(layout(&[("/t", "zsh")]), Vec::new(), Instant::now()));
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + MUST_HAPPEN;
         let journal = loop {
             let found = names(dir.path())
                 .into_iter()
@@ -3155,7 +5640,7 @@ pub(crate) mod tests {
             markers::Owner::Live,
             "the writer holds its lock"
         );
-        lane.retire(Duration::from_secs(5)).unwrap();
+        lane.retire(MUST_HAPPEN).unwrap();
         assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
     }
 }

@@ -33,7 +33,7 @@ use atpkg::reroute::{PASSTHROUGH_ENV, REROUTE_DIR_ENV};
 const FAKE_EXIT: i32 = 3;
 
 struct Fixture {
-    root: PathBuf,
+    _root: aterm_tempfile::TempDir,
     home: PathBuf,
     config_home: PathBuf,
     reroute: PathBuf,
@@ -47,11 +47,12 @@ struct Fixture {
 
 impl Fixture {
     fn new(case: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("atpkg-hook-reroute-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
-        let config_home = root.join("config");
+        let root = aterm_tempfile::Builder::new()
+            .prefix(&format!("atpkg-hook-reroute-{case}-"))
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
+        let config_home = root.path().join("config");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&config_home).unwrap();
         let layout = atpkg::store::Layout {
@@ -80,10 +81,11 @@ impl Fixture {
                 "cargo",
                 Path::new(env!("CARGO_BIN_EXE_atpkg")),
                 &reroute,
+                false,
             ),
         );
-        let usr_local = root.join("fake/usr/local/bin");
-        let homebrew = root.join("fake/opt/homebrew/bin");
+        let usr_local = root.path().join("fake/usr/local/bin");
+        let homebrew = root.path().join("fake/opt/homebrew/bin");
         std::fs::create_dir_all(&usr_local).unwrap();
         std::fs::create_dir_all(&homebrew).unwrap();
         write_executable(
@@ -91,7 +93,7 @@ impl Fixture {
             &format!("#!/bin/sh\necho \"homebrew-style cargo: $*\"\nexit {FAKE_EXIT}\n"),
         );
         Self {
-            root,
+            _root: root,
             home,
             config_home,
             reroute,
@@ -145,12 +147,6 @@ impl Fixture {
         let dir = self.config_home.join("aterm");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("aterm.toml"), "[reroute]\nannounce = false\n").unwrap();
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -491,7 +487,7 @@ fn inside_aterm_a_bare_cargo_is_announced_and_then_runs_upstream_with_its_exit_c
     let atpkg::reroute::Policy::Signpost { lanes, .. } = row.policy else {
         panic!("cargo is a SIGNPOST row: {row:?}");
     };
-    let signpost = atpkg::reroute::signpost_message(row, lanes, &args, None);
+    let signpost = atpkg::reroute::signpost_message_in(row, lanes, &args, None, None);
     for lane in ["targo --unverified build --x", "targo trust build --x"] {
         assert!(signpost.contains(lane), "{signpost}");
     }
@@ -656,4 +652,89 @@ fn fish_and_powershell_lead_reroute_then_agents_inside_aterm() {
     let escaped = fish_path(&[("ATERM_CHILD", "1"), (PASSTHROUGH_ENV, "1")]);
     assert_eq!(escaped[0], a, "fish: {escaped:?}");
     assert_eq!(count(&escaped, &fx.reroute), 0, "fish: {escaped:?}");
+}
+
+/// EVERY STUB RUNS SOMETHING (owner, 2026-09-29: *"make these rules informative and concise
+/// warnings for the AI, not extra blockers"*), through the REAL `atpkg __reroute` and the
+/// REAL stubs: `rustfmt` with no trustfmt installed runs the upstream copy after one line
+/// naming `aterm pkg install trust`, and `z3` runs upstream after one line naming `ay` —
+/// each with the fake's own exit code. `[reroute] strict = true` in the temp `aterm.toml`
+/// puts the refusals back: 127 with the install line, and z3's exit 2 naming its path.
+#[test]
+fn a_missing_trust_tool_and_z3_run_upstream_and_strict_restores_the_refusals() {
+    let fx = Fixture::new("never-refuse");
+    for name in ["rustfmt", "z3"] {
+        write_executable(
+            &fx.reroute.join(name),
+            &atpkg::reroute::stub_body_sh(
+                name,
+                Path::new(env!("CARGO_BIN_EXE_atpkg")),
+                &fx.reroute,
+                false,
+            ),
+        );
+        write_executable(
+            &fx.homebrew.join(name),
+            &format!("#!/bin/sh\necho \"upstream {name}: $*\"\nexit {FAKE_EXIT}\n"),
+        );
+    }
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        Fixture::s(&fx.reroute),
+        Fixture::s(&fx.homebrew)
+    );
+    let call = |command: &str| -> (String, String, Option<i32>) {
+        let out = Command::new("/bin/sh")
+            .args(["-c", command])
+            .current_dir(&fx.home)
+            .env_clear()
+            .env("HOME", &fx.home)
+            .env("XDG_CONFIG_HOME", &fx.config_home)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).trim_end().to_owned(),
+            out.status.code(),
+        )
+    };
+    // THE DEFAULT: both run, after one line each.
+    assert_eq!(
+        call("rustfmt src/x.rs"),
+        (
+            "upstream rustfmt: src/x.rs\n".to_owned(),
+            atpkg::reroute::fallback_not_installed_message("rustfmt", "trustfmt", "trust"),
+            Some(FAKE_EXIT)
+        )
+    );
+    assert_eq!(
+        call("z3 -in"),
+        (
+            "upstream z3: -in\n".to_owned(),
+            // No `ay` in this store: the line names the command that installs it.
+            atpkg::reroute::oracle_notice("z3", "ay", Some("`aterm pkg install ay` installs it")),
+            Some(FAKE_EXIT)
+        )
+    );
+    // STRICT: the refusals of before, byte for byte, and nothing upstream ran.
+    let dir = fx.config_home.join("aterm");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("aterm.toml"), "[reroute]\nstrict = true\n").unwrap();
+    assert_eq!(
+        call("rustfmt src/x.rs"),
+        (
+            String::new(),
+            atpkg::reroute::not_installed_message("rustfmt", "trustfmt", "trust"),
+            Some(127)
+        )
+    );
+    assert_eq!(
+        call("z3 -in"),
+        (
+            String::new(),
+            atpkg::reroute::oracle_message("z3", Some(&fx.homebrew.join("z3"))),
+            Some(i32::from(atpkg::reroute::REFUSAL_EXIT))
+        )
+    );
 }

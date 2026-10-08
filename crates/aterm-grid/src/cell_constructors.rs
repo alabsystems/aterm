@@ -3,19 +3,14 @@
 // Author: Andrew Yates
 
 //! Cell constructor methods.
-//!
-//! Extracted from `cell.rs` to keep the main file focused on accessors
-//! and predicates.
 
 #[cfg(any(test, kani))]
 use super::super::style::StyleId;
 use super::{Cell, CellFlags, PackedColor, PackedColors};
 
 impl Cell {
-    /// Rebuild a cell from raw checkpoint storage.
-    ///
-    /// This preserves the in-memory cell layout exactly, including
-    /// `USES_STYLE_ID` and `COMPLEX` payloads.
+    /// Rebuild a cell from raw checkpoint storage, preserving the in-memory
+    /// layout exactly (including `USES_STYLE_ID` and `COMPLEX` payloads).
     #[must_use]
     #[inline]
     #[cfg(test)]
@@ -39,14 +34,12 @@ impl Cell {
         }
     }
 
-    /// FAST PATH: Create a styled cell from an ASCII byte.
+    /// Fast path: a styled cell from an ASCII byte, with no char translation or
+    /// width check.
     ///
     /// # Preconditions (caller must verify)
     /// - `byte` is printable ASCII (0x20..=0x7E)
     /// - `colors` is already packed (no RGB overflow needed)
-    ///
-    /// This creates a Cell directly without char translation or width checks,
-    /// ideal for bulk ASCII writes with a known style.
     #[must_use]
     #[inline]
     pub const fn from_ascii_styled(byte: u8, colors: PackedColors, flags: CellFlags) -> Self {
@@ -57,10 +50,8 @@ impl Cell {
         }
     }
 
-    /// Create a new cell from a character.
-    ///
-    /// For BMP characters (U+0000-U+FFFF), stores directly.
-    /// For non-BMP characters, caller should use overflow mechanism.
+    /// Create a cell from a character. BMP characters are stored directly;
+    /// non-BMP characters need the overflow mechanism.
     #[must_use]
     #[inline]
     #[allow(
@@ -85,10 +76,8 @@ impl Cell {
         }
     }
 
-    /// Create a new cell with colors and flags.
-    ///
-    /// Note: For RGB colors, the colors should be set up to indicate RGB mode,
-    /// and actual RGB values stored in CellExtras overflow.
+    /// Create a cell with colours and flags. For RGB, the colours mark RGB
+    /// mode and the values live in the CellExtras overflow.
     #[must_use]
     #[inline]
     #[allow(
@@ -103,7 +92,7 @@ impl Cell {
             '\u{FFFD}' as u16
         };
 
-        // Convert legacy PackedColor to PackedColors
+        // Convert the PackedColor pair to PackedColors.
         let colors = Self::convert_legacy_colors(fg, bg);
 
         Self {
@@ -113,11 +102,8 @@ impl Cell {
         }
     }
 
-    /// Reconstruct a cell from its raw field values (checkpoint restore, #6030).
-    ///
-    /// This bypasses codepoint validation and color conversion, restoring the
-    /// exact Cell representation that was serialized. Required for lossless
-    /// round-trip of COMPLEX cells (overflow indices) and StyleId cells.
+    /// Reconstruct a cell from its raw field values (checkpoint restore),
+    /// bypassing validation so COMPLEX and StyleId cells round-trip losslessly.
     #[must_use]
     #[inline]
     pub const fn from_raw_parts(char_data: u16, colors: PackedColors, flags: CellFlags) -> Self {
@@ -128,16 +114,15 @@ impl Cell {
         }
     }
 
-    /// Convert PackedColor pair to PackedColors format.
-    ///
-    /// Public helper for bulk operations that need to pre-compute colors.
+    /// Convert a PackedColor pair to PackedColors (for bulk operations that
+    /// pre-compute colours).
     #[must_use]
     #[inline]
     pub const fn convert_colors(fg: PackedColor, bg: PackedColor) -> PackedColors {
         Self::convert_legacy_colors(fg, bg)
     }
 
-    /// Convert legacy PackedColor pair to new PackedColors format.
+    /// Convert a PackedColor pair to PackedColors.
     #[inline]
     const fn convert_legacy_colors(fg: PackedColor, bg: PackedColor) -> PackedColors {
         let mut colors = PackedColors::DEFAULT;
@@ -163,9 +148,8 @@ impl Cell {
         colors
     }
 
-    /// Create a cell with overflow index for complex character (test/kani-only).
-    ///
-    /// The actual character string is stored in CellExtras.
+    /// Create a cell with an overflow index for a complex character; the string
+    /// lives in CellExtras.
     #[cfg(any(test, kani))]
     #[must_use]
     #[inline]
@@ -177,22 +161,16 @@ impl Cell {
         }
     }
 
-    /// Create a cell with a StyleId reference instead of inline colors.
+    /// Create a cell referencing a StyleTable entry instead of inline colours.
     ///
-    /// This is the Ghostty-style approach for memory-efficient style storage.
-    /// The StyleId references a style in the StyleTable, which stores the
-    /// actual colors and attributes.
+    /// `cell_flags` holds cell-specific flags only (WIDE, WIDE_CONTINUATION,
+    /// PROTECTED); style attributes come from the StyleTable at render time.
     ///
-    /// The `cell_flags` parameter should contain cell-specific flags only
-    /// (WIDE, WIDE_CONTINUATION, PROTECTED). Style attributes (BOLD, ITALIC,
-    /// etc.) are stored in the StyleTable and will be retrieved at render time.
+    /// # Memory layout
     ///
-    /// # Memory Layout
-    ///
-    /// When using StyleId:
     /// - `colors.0` low 16 bits: StyleId value
     /// - `colors.0` high 16 bits: reserved (for RGB overflow index)
-    /// - `flags`: has USES_STYLE_ID set, plus cell-specific flags
+    /// - `flags`: USES_STYLE_ID plus cell-specific flags
     #[cfg(any(test, kani, feature = "testing"))]
     #[must_use]
     #[inline]
@@ -221,12 +199,11 @@ impl Cell {
         }
     }
 
-    /// Create a styled cell from an ASCII byte with StyleId.
+    /// A styled cell from an ASCII byte with a StyleId (the hot path for ASCII
+    /// output with style interning).
     ///
     /// # Preconditions (caller must verify)
     /// - `byte` is printable ASCII (0x20..=0x7E)
-    ///
-    /// This is the hot path for ASCII output with style interning.
     #[cfg(any(test, kani))]
     #[must_use]
     #[inline]
@@ -251,10 +228,8 @@ mod tests {
     use super::super::super::style::StyleId;
     use super::{Cell, CellFlags, PackedColor, PackedColors};
 
-    // =========================================================================
     // EMPTY / default / from_ascii_fast / from_ascii_styled / new / with_style,
     // and the from_raw_parts / from_checkpoint_raw round trips
-    // =========================================================================
 
     /// Assert one side of `colors` reads back as the legacy `want` colour.
     fn assert_side_matches(
@@ -399,9 +374,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // convert_colors / convert_legacy_colors
-    // =========================================================================
 
     #[test]
     fn test_convert_colors_default_default() {
@@ -439,9 +412,7 @@ mod tests {
         assert!(packed.bg_is_rgb());
     }
 
-    // =========================================================================
     // with_overflow_index — complex character overflow
-    // =========================================================================
 
     #[test]
     fn test_with_overflow_index_sets_complex_flag() {
@@ -476,9 +447,7 @@ mod tests {
         assert_eq!(cell.codepoint(), 0xFFFD);
     }
 
-    // =========================================================================
     // with_style_id — StyleId interning
-    // =========================================================================
 
     #[test]
     fn test_with_style_id_sets_uses_style_id_flag() {
@@ -523,9 +492,7 @@ mod tests {
         assert_eq!(cell.style_id().raw(), u16::MAX);
     }
 
-    // =========================================================================
     // from_ascii_with_style_id — ASCII + StyleId hot path
-    // =========================================================================
 
     #[test]
     fn test_from_ascii_with_style_id_stores_byte() {
@@ -550,9 +517,7 @@ mod tests {
         assert!(cell.flags().contains(CellFlags::USES_STYLE_ID));
     }
 
-    // =========================================================================
     // Cross-constructor consistency
-    // =========================================================================
 
     #[test]
     fn test_from_ascii_fast_matches_new_for_ascii() {

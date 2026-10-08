@@ -4,16 +4,13 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::all)]
-// F11-4 (#7941): production unwrap() is forbidden; tests opt out uniformly at the
+// Production unwrap() is forbidden; tests opt out uniformly at the
 // crate root so a missing per-module allow can't silently slip past clippy.
 #![deny(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-//! Terminal grid model: Grid, cells, rows, styles, damage tracking, page storage.
-//!
-//! This crate owns the terminal grid model including `Grid`, `GridStorage`,
-//! `MaterializedRow`, and all production `impl Grid` methods. Leaf types
-//! (Cell, Row, Style, Damage, etc.) and the Grid itself live here.
+//! Terminal grid model: `Grid`, `GridStorage`, `MaterializedRow`, cells, rows,
+//! styles, damage tracking and page storage.
 
 pub mod cell;
 pub(crate) mod cell_colors;
@@ -23,13 +20,9 @@ pub mod damage;
 pub mod extra;
 pub mod extra_collection;
 mod extra_collection_shifts;
-/// Page-backed storage internals.
-///
-/// Crate-internal in production builds. Accessible to downstream crate tests
-/// via `feature = "testing"` so `PageStore::alloc_slice` and `PageSlice`
-/// remain available for property tests and Kani scaffolding.
-/// Production consumers use [`Row`] and [`PageStore`] (re-exported at crate
-/// root) as their safe API boundary (#5573).
+/// Page-backed storage internals. Exposed under `feature = "testing"` for
+/// downstream property tests and Kani; production uses [`Row`] and
+/// [`PageStore`] (re-exported at the crate root).
 #[cfg(any(test, kani, feature = "testing"))]
 pub mod page;
 #[cfg(not(any(test, kani, feature = "testing")))]
@@ -47,13 +40,10 @@ pub(crate) mod test_counters;
 #[cfg(feature = "testing")]
 pub mod test_counters;
 
-// TRUST_NATIVE_TLA §4 (Phase 4): the kani-half of the unified verifier ledger.
-//
-// UN-GATED w.r.t. `cfg(kani)` (the ring-buffer harnesses in `grid/proofs_kani_ring.rs`
-// are `#[cfg(kani)]` and dormant under stock cargo). The `proof_anchor!` REGISTRATIONS
-// must NOT share that gate — they name the harnesses by string and are gated ONLY by the
-// `spec-anchors` feature (or `test`), so they register in normal/test builds. See the
-// module doc for the mapping.
+// The Kani half of the verifier ledger. The ring harnesses in
+// `grid/proofs_kani_ring.rs` are `#[cfg(kani)]`; these `proof_anchor!`
+// registrations name them by string and are gated only by `spec-anchors` (or
+// `test`), so they register in normal builds.
 #[cfg(any(test, feature = "spec-anchors"))]
 mod spec_proof_anchors;
 
@@ -76,7 +66,7 @@ pub use damage::{
 pub use extra::is_combining_mark;
 pub use extra::{
     CellCoord, CellExtra, CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling,
-    KittyPlacementTag, SourceRect, UniformExtras,
+    KittyPlacementTag, MAX_IMAGE_LAYERS, SourceRect, UniformExtras,
 };
 pub use page::PageStore;
 pub use pin::GenerationTracker;
@@ -89,7 +79,7 @@ pub use page::PageId;
 #[cfg(any(test, feature = "testing", kani))]
 pub use pin::{Generation, Pin, PinnedRange};
 
-// Batch 2A: cursor, scroll region, and grid state types.
+// Cursor, scroll region, and grid state types.
 pub use cursor::{Cursor, SavedCursor};
 pub use scroll_region::{HorizontalMargins, ScrollRegion};
 pub use state::{
@@ -109,11 +99,9 @@ pub fn row_u16(idx: usize) -> u16 {
     idx.try_into().unwrap_or(u16::MAX)
 }
 
-/// Maximum visible rows a [`Grid`] will hold.
-///
-/// Ingress bound (design §5.8): a hostile `u16::MAX × u16::MAX` resize asks
-/// for ~4.3 billion cells, an allocation bomb. Constructors and
-/// [`Grid::resize`] clamp both dimensions to `1..=MAX_GRID_ROWS/COLS`.
+/// Maximum visible rows a [`Grid`] will hold. Constructors and
+/// [`Grid::resize`] clamp both dimensions to `1..=MAX_GRID_ROWS/COLS`, so a
+/// hostile `u16::MAX × u16::MAX` resize cannot allocate billions of cells.
 pub const MAX_GRID_ROWS: u16 = 4096;
 
 /// Maximum columns a [`Grid`] will hold; see [`MAX_GRID_ROWS`].

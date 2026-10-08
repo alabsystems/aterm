@@ -3,13 +3,11 @@
 
 //! Tier-1 conformance for versioned native Settings transactions.
 //!
-//! The test drives the genuine `aterm-toml`-backed service and independently
-//! projects its revisions and semantic values into `NativeConfigTransaction`.
-//! Pending request and undo metadata belong to the controller/test driver, and
-//! `accepted`/`external_edits` count the service's `Applied` answers and the
-//! external edits it was handed; the canonical key values and the revision always
-//! come from the shipping service, so `RevisionCountsWrites` checks that the
-//! service mints exactly one revision per write.
+//! Drives the real `aterm-toml`-backed service and projects its revisions and values
+//! into `NativeConfigTransaction`. Pending-request and undo metadata come from the
+//! test driver; `accepted`/`external_edits` count the service's `Applied` answers and
+//! the external edits handed to it; key values and revisions always come from the
+//! service, so `RevisionCountsWrites` checks one revision per write.
 
 #![cfg(test)]
 
@@ -20,6 +18,7 @@ use aterm_spec::derive::{
 };
 use aterm_spec::interp::{State, admits};
 
+use crate::conformance_support::assert_sole_transition as assert_transition;
 use crate::native_config_service::{
     ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ConfigSnapshot, ExpectedValue, UndoToken,
     VersionedConfigService,
@@ -104,23 +103,6 @@ fn project(
     state.insert("stale_overwrite", 0);
     state.insert("partial_reset", 0);
     state
-}
-
-fn assert_transition(model: &Model, before: &State, after: &State, action: &'static str) {
-    assert_eq!(
-        model.successors(action, before).as_slice(),
-        std::slice::from_ref(after),
-        "real transition must conform specifically to {action}"
-    );
-    assert_eq!(admits(model, before, after), Some(action));
-    for invariant in &model.invariants {
-        assert!(
-            model.check_invariant(invariant.name, after),
-            "post-state violates {}::{}: {after:?}",
-            model.name,
-            invariant.name,
-        );
-    }
 }
 
 #[test]
@@ -277,9 +259,8 @@ fn settings_manual_handoff_conforms_for_selection_fallback_reuse_and_path_author
     fallback.insert("completion_ready", 1);
     assert_transition(&model, &selected, &fallback, "SeedAbsentKey");
 
-    // The third action is bound independently because the model deliberately
-    // caps one trace at two requests. Search targets use the same shipping host
-    // resolver and select the exact matching bytes.
+    // The third action is bound separately because the model caps a trace at two
+    // requests. Search targets use the shipping host resolver and exact bytes.
     let decision = crate::app_documents::config_editor_reveal_decision(
         source,
         &ConfigEditorTarget::Search("Nord".to_string()),
@@ -404,9 +385,8 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert_transition(&model, &before_undo, &after_undo, "UndoPatchA");
     assert_eq!(after_undo["revision"], before_undo["revision"] + 1);
 
-    // Negative control: the undo reaches the same bump through `patch`; skipped,
-    // it publishes under the revision it found — which every open Settings view
-    // would discard as a snapshot it already holds.
+    // Negative control: the undo reaches the same bump through `patch`; skipped, it
+    // publishes under the revision it found, which open Settings views discard.
     let mut unpublished_undo = after_undo.clone();
     unpublished_undo.insert("revision", before_undo["revision"]);
     assert_eq!(
@@ -534,12 +514,10 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert!(!model.check_invariant("AtomicResetVisibility", &partial_reset));
 }
 
-/// Tier-1 bind for the shared filesystem commit authority. Both interleavings
-/// go through the shipping hosts: Manual uses the real Editor save reducer and
-/// `finish_native_document_save`; Settings uses `save_prefs_snapshot` followed
-/// by `finish_native_config_write`. This test therefore checks not just the
-/// atomic primitive, but the production completion code that publishes its
-/// proof into the process-global config service.
+/// Tier-1 bind for the shared filesystem commit authority, through the shipping hosts:
+/// Manual uses the Editor save reducer and `finish_native_document_save`; Settings uses
+/// `save_prefs_snapshot` then `finish_native_config_write`. Covers the completion code
+/// that publishes into the process-global config service, not just the atomic write.
 #[test]
 fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() {
     use crate::app_native::NativeConfigOrigin;
@@ -702,10 +680,9 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
         "theme = \"Nord\"\n"
     );
 
-    // One final config symlink is an admitted, identity-bound capability. The
-    // model first admits that stable baseline, then advances both its link and
-    // target generations when the real link is replaced. Resolution must conflict
-    // without redirecting bytes.
+    // A final config symlink is an admitted, identity-bound capability: the model
+    // admits the baseline, then advances link and target generations when the real
+    // link is replaced. Resolution must conflict without redirecting bytes.
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -762,7 +739,7 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
     let _ = std::fs::remove_dir_all(root);
 }
 
-fn trail_pack_asset(name: &str) -> String {
+pub(crate) fn trail_pack_asset(name: &str) -> String {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../aterm-effects/assets/trail-packs")
         .join(name)
@@ -789,27 +766,23 @@ fn trail_config(path: &str, id: &str, theme: &str, kitty_sprite: &str) -> String
 }
 
 struct KittyFixtures {
-    root: std::path::PathBuf,
+    _root: aterm_tempfile::TempDir,
     sources: [String; 3],
 }
 
 impl KittyFixtures {
     fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let root = std::env::temp_dir().join(format!(
-            "aterm-config-assets-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&root).expect("create asset fixture root");
+        let root = aterm_tempfile::Builder::new()
+            .prefix("aterm-config-assets-")
+            .tempdir()
+            .expect("create asset fixture root");
         let colors = [
             [0xf0, 0x33, 0x55, 0xff],
             [0x33, 0xf0, 0x88, 0xff],
             [0x44, 0x77, 0xf0, 0xff],
         ];
         let sources = std::array::from_fn(|index| {
-            let path = root.join(format!("nyan-{index}.png"));
+            let path = root.path().join(format!("nyan-{index}.png"));
             let mut rgba = Vec::with_capacity(8);
             rgba.extend_from_slice(&colors[index]);
             rgba.extend_from_slice(&colors[index]);
@@ -818,20 +791,16 @@ impl KittyFixtures {
             std::fs::write(&path, png).expect("write fixture sprite");
             path.to_string_lossy().into_owned()
         });
-        Self { root, sources }
+        Self {
+            _root: root,
+            sources,
+        }
     }
 }
 
-impl Drop for KittyFixtures {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-/// Render one deterministic classic companion through the effects state that
-/// the live/capture config installer populated. Returning the addressed atlas
-/// texel as well as the destination proves parity of both placement and source
-/// pixels; comparing only the retained `Arc` would let a stale atlas key pass.
+/// Render one deterministic classic companion through the effects state the config
+/// installer populated. Returns the addressed atlas texel with the destination so both
+/// placement and source pixels are compared (a retained `Arc` alone passes stale keys).
 fn installed_custom_kitty_projection(
     app: &mut crate::App,
     wid: crate::WindowId,
@@ -846,16 +815,15 @@ fn installed_custom_kitty_projection(
         rows: ws.rows,
         cols: ws.cols,
     };
-    // A presented frame admits exactly ONE companion body (the effects
-    // engine's one-body law), and the headless host has already spent this
-    // frame's claim and bake budget on its own render. Open a fresh host
-    // frame, as `app_render` does once per presented frame, so this probe
-    // is that frame's single emission rather than a refused second body.
-    ws.word_decos.begin_host_frame();
+    // A presented frame admits one companion body and the headless host already spent
+    // this frame's budget; open a fresh host frame (as `app_render` does per frame) so
+    // this probe is that frame's single emission.
+    ws.fx.decos_mut().begin_host_frame();
     let cursor = (3, 5);
     let mut free = Vec::new();
     let fp = ws
-        .word_decos
+        .fx
+        .decos_mut()
         .kitty_cursor(
             aterm_effects::word_decorations::KittyCursorFrame {
                 geom,
@@ -874,7 +842,7 @@ fn installed_custom_kitty_projection(
     assert_ne!(fp, 0, "custom kitty contributes a repaint identity");
     assert_eq!(free.len(), 1, "custom source emits one body");
     let sprite = free[0];
-    let atlas = ws.word_decos.free_atlas().expect("custom kitty atlas");
+    let atlas = ws.fx.decos_mut().free_atlas().expect("custom kitty atlas");
     let offset = (usize::from(sprite.ay) * atlas.width as usize + usize::from(sprite.ax)) * 4;
     let pixel =
         <[u8; 4]>::try_from(&atlas.rgba[offset..offset + 4]).expect("addressed custom atlas texel");
@@ -977,10 +945,8 @@ fn config_catalog_projection(
                 snapshot.assets.sparkle_spec_consumers.as_ref(),
             ) {
                 (Some(candidate), Some(observed)) => std::sync::Arc::ptr_eq(candidate, observed),
-                // Preliminary catalogs are never consumer-publishable, but
-                // retaining an identity here keeps diagnostic projections
-                // total and makes their incompleteness fail the consistency
-                // predicate above.
+                // Preliminary catalogs are never publishable; keeping an identity here
+                // keeps diagnostic projections total so the predicate above fails them.
                 (None, None) => std::sync::Arc::ptr_eq(candidate, &snapshot.assets),
                 _ => false,
             }
@@ -1012,13 +978,11 @@ fn config_catalog_projection(
     state
 }
 
-/// Tier-1 binding for the revisioned snapshot/catalog protocol. This drives the
-/// genuine config reducer, Settings runtime, live host/window installer, and
-/// capture preparation seam. Every consumer receives the exact same outer Arc;
-/// independent stale-Trail and stale-rainbow kitty negative controls prove the path-asset
-/// aggregate is not vacuous. Theme-directory staleness has its own parsed-catalog
-/// Tier-1 test below because config edits deliberately retain that independent
-/// immutable catalog.
+/// Tier-1 binding for the revisioned snapshot/catalog protocol through the config
+/// reducer, Settings runtime, live host/window installer and capture preparation. Every
+/// consumer receives the same outer Arc; stale-Trail and stale-rainbow kitty negative
+/// controls keep the path-asset aggregate non-vacuous. Theme-directory staleness has
+/// its own test below, since config edits retain that catalog.
 #[test]
 fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delivery() {
     use std::sync::Arc;
@@ -1153,9 +1117,11 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
 
     let mut runtime = NativeRuntime::new();
     let instance = runtime
-        .insert_instance(NativeApp::Settings(SettingsApp::new_at_config_revision(
-            UpdateState::from_status(1, "test", None, false),
-            initial.revision,
+        .insert_instance(NativeApp::Settings(Box::new(
+            SettingsApp::new_at_config_revision(
+                UpdateState::from_status(1, "test", None, false),
+                initial.revision,
+            ),
         )))
         .unwrap();
     let mut views = ViewStore::default();
@@ -1218,9 +1184,8 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         before_publish = after_publish;
     }
 
-    // Delete every authored PNG after config admission. The genuine live and
-    // capture paths below must continue to install the retained Ready Arc; any
-    // accidental presentation-time reopen/decode would now fail deterministically.
+    // Delete every authored PNG after admission: the live and capture paths must
+    // install the retained Ready Arc, so any presentation-time reopen would fail.
     for source in &sprites.sources {
         std::fs::remove_file(source).expect("remove admitted source before presentation");
     }
@@ -1260,12 +1225,13 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         external.assets.kitty_sprite.fingerprint()
     );
     assert_eq!(
-        window.word_decos.kitty_sprite_source_fingerprint(),
+        window.fx.decos().kitty_sprite_source_fingerprint(),
         Some(*fp)
     );
     assert!(Arc::ptr_eq(
         window
-            .word_decos
+            .fx
+            .decos()
             .kitty_sprite_rgba()
             .expect("installed RGBA"),
         rgba
@@ -1290,10 +1256,9 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     );
     assert_transition(&model, &before_publish, &after_live, "PublishLive");
 
-    // Negative control: a live host installed from a worker-prepared generation
-    // before the service admits it runs a config nobody published — here the
-    // external generation, installed while the service still held the patch.
-    // The genuine host above holds exactly the admitted snapshot's `Arc`.
+    // Negative control: a live host installed from a worker-prepared generation before
+    // the service admits it runs an unpublished config (the external generation, while
+    // the service still holds the patch). The real host holds the admitted `Arc`.
     let unadmitted = aterm_spec::interp::with_buggy(&model, 1)
         .successors("PublishLiveUnadmitted", &patched_state)
         .into_iter()
@@ -1309,10 +1274,11 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         let window = app.windows.get_mut(&wid).expect("headless window");
         window.installed_config_assets = None;
         window
-            .word_decos
+            .fx
+            .decos_mut()
             .set_kitty_sprite_source(aterm_effects::word_decorations::KittySpriteSource::BuiltIn);
     }
-    app.splice_word_decorations(wid, std::time::Instant::now());
+    app.capture_words(wid, std::time::Instant::now());
     let capture_assets = app
         .windows
         .get(&wid)
@@ -1333,7 +1299,8 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     ));
     assert!(Arc::ptr_eq(
         app.windows[&wid]
-            .word_decos
+            .fx
+            .decos()
             .kitty_sprite_rgba()
             .expect("capture RGBA"),
         rgba
@@ -1366,6 +1333,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         text: Arc::clone(&external.text),
         config: Arc::clone(&external.config),
         semantic_values: Arc::clone(&external.semantic_values),
+        disk_faults: Arc::clone(&external.disk_faults),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&initial.assets.trail_packs),
             kitty_sprite: external.assets.kitty_sprite.clone(),
@@ -1397,6 +1365,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         text: Arc::clone(&external.text),
         config: Arc::clone(&external.config),
         semantic_values: Arc::clone(&external.semantic_values),
+        disk_faults: Arc::clone(&external.disk_faults),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&external.assets.trail_packs),
             kitty_sprite: initial.assets.kitty_sprite.clone(),
@@ -1420,15 +1389,15 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert_eq!(admits(&model, &patched_state, &stale_kitty_state), None);
     assert!(!model.check_invariant("SnapshotAtomic", &stale_kitty_state));
 
-    // Independent negative control 3: every visual asset from the external
-    // generation paired with the stale initial custom-spec projection must be
-    // rejected even though both payloads are immutable and well-typed.
+    // Negative control 3: external-generation visual assets paired with the stale
+    // initial custom-spec projection must be rejected.
     let stale_sparkle = ConfigSnapshot {
         revision: external.revision,
         analysis_generation: external.analysis_generation,
         text: Arc::clone(&external.text),
         config: Arc::clone(&external.config),
         semantic_values: Arc::clone(&external.semantic_values),
+        disk_faults: Arc::clone(&external.disk_faults),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&external.assets.trail_packs),
             kitty_sprite: external.assets.kitty_sprite.clone(),
@@ -1453,9 +1422,8 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert!(!model.check_invariant("SnapshotAtomic", &stale_sparkle_state));
 }
 
-/// Tier-1 binding for the byte-identical external refresh arm: a referenced
-/// manifest can change while `aterm.toml` does not. The service must publish a
-/// new complete snapshot generation rather than retaining the old catalog.
+/// Tier-1 binding for the byte-identical external refresh: a referenced manifest
+/// changes while `aterm.toml` does not, and the service publishes a new snapshot.
 #[test]
 fn byte_equal_external_refresh_conforms_to_atomic_catalog_model() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1514,9 +1482,8 @@ fn byte_equal_external_refresh_conforms_to_atomic_catalog_model() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Tier-1 binding for the background theme-directory refresh. The worker hands
-/// the reducer a fully parsed immutable catalog; the reducer advances one outer
-/// config snapshot and every consumer-visible generation moves atomically.
+/// Tier-1 binding for the background theme-directory refresh: the reducer receives a
+/// parsed catalog and advances one outer snapshot, moving every generation atomically.
 #[test]
 fn parsed_theme_catalog_refresh_conforms_to_atomic_catalog_model() {
     use std::sync::Arc;

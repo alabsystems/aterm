@@ -219,11 +219,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::NewWindowWithIdentity => spec("window.new_with_identity", S::App, A::Owner, C::Any),
         M::NewTabWithIdentity => spec("tab.new_with_identity", S::Window, A::Owner, C::Any),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
-        // THE FABRIC MENU (round 19, SPEC19 §9). Fleet is the map's twin (the
-        // Fabric menu's route to it) — Owner for the same aggregated disclosure
-        // reason as `view.connections`.
-        M::Fleet => spec("view.fleet", S::App, A::Owner, C::Any),
-        // A session's mail metadata on the human's screen: Owner (the same
+        // THE FABRIC MENU (round 19, SPEC19 §9). A session's mail metadata on the human's screen: Owner (the same
         // class as the map), terminal content (the inbox is a session's).
         M::Inbox => spec("session.inbox.open", S::Tab, A::Owner, C::Terminal),
         // Converges on `App::open_session_ledger`.

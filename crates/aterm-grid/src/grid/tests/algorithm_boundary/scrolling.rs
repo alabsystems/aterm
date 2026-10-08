@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Line feed / reverse line feed with scroll regions.
-//!
-//! Migrated from aterm-core as part of #6556 Batch 2.
 
 use super::*;
 
@@ -315,8 +313,7 @@ fn line_feed_full_screen_region_scrolls_with_scrollback() {
     assert!(grid.row(2).unwrap().is_empty());
 }
 
-// Algorithm audit: scroll region boundary conditions
-// ========================================================================
+// Scroll region boundary conditions
 
 /// Scroll region up with n == region_size clears all rows in the region.
 #[test]
@@ -403,10 +400,9 @@ fn scroll_region_up_two_row() {
     assert_eq!(grid.cell(4, 0).unwrap().char(), 'E', "row 4 preserved");
 }
 
-/// advance_autowrap_line with cursor below scroll region at screen bottom
-/// must NOT scroll — xterm xtermIndex with `cur_row > bot_marg` is
-/// CursorDown, which clamps at `max_row`. The wrap only returns the cursor
-/// to column 0 of the last row, where output keeps overwriting in place.
+/// advance_autowrap_line with the cursor below the scroll region at the screen
+/// bottom does not scroll (xterm's CursorDown clamps at `max_row`); the cursor
+/// returns to column 0 of the last row.
 #[test]
 fn write_char_wrap_below_scroll_region_at_screen_bottom_does_not_scroll() {
     let mut grid = Grid::with_scrollback(5, 5, 10);
@@ -440,8 +436,7 @@ fn write_char_wrap_below_scroll_region_at_screen_bottom_does_not_scroll() {
     grid.assert_invariants();
 }
 
-/// Regression test for #5019: scroll_display followed by line_feed at bottom
-/// of scroll region must not panic.
+/// scroll_display then line_feed at the bottom of a scroll region does not panic.
 #[test]
 fn line_feed_after_scroll_display_resets_offset() {
     let mut grid = Grid::with_scrollback(10, 10, 20);
@@ -496,8 +491,8 @@ fn reverse_line_feed_after_scroll_display_resets_offset() {
     grid.assert_invariants();
 }
 
-/// Regression test for #5019: write_char_wrap at end of line in a scroll
-/// region with nonzero display_offset must not panic.
+/// write_char_wrap at end of line in a scroll region with a nonzero
+/// display_offset does not panic.
 #[test]
 fn write_char_wrap_after_scroll_display_resets_offset() {
     let mut grid = Grid::with_scrollback(10, 10, 20);
@@ -524,8 +519,7 @@ fn write_char_wrap_after_scroll_display_resets_offset() {
     grid.assert_invariants();
 }
 
-/// Regression test for #5019: scroll_region_up called directly with nonzero
-/// display_offset must self-heal.
+/// scroll_region_up with a nonzero display_offset self-heals.
 #[test]
 fn scroll_region_up_direct_with_nonzero_display_offset() {
     let mut grid = Grid::with_scrollback(10, 10, 20);
@@ -562,9 +556,7 @@ fn scroll_region_degenerate_top_equals_bottom() {
     );
 }
 
-// ========================================================================
-// Targeted damage: mark_rows instead of mark_full (#5561)
-// ========================================================================
+// Targeted damage: mark_rows instead of mark_full
 
 /// scroll_to_bottom with small display_offset marks only bottom rows dirty.
 #[test]
@@ -683,9 +675,7 @@ fn erase_to_end_of_screen_targeted_damage() {
     }
 }
 
-// ========================================================================
-// Mixed Phase 1 + Phase 2 scroll_up boundary (#4335 algorithm_audit)
-// ========================================================================
+// Mixed Phase 1 + Phase 2 scroll_up boundary
 
 /// A single scroll_up(n) call where n > rows_until_capacity exercises both
 /// Phase 1 (growth) and Phase 2 (reuse) in the same invocation.
@@ -780,9 +770,7 @@ fn scroll_up_mixed_phase_scrollback_content() {
     grid.assert_invariants();
 }
 
-// ========================================================================
-// Degenerate single-row scroll region: top == bottom (#7751)
-// ========================================================================
+// Degenerate single-row scroll region: top == bottom
 
 /// scroll_region_up with top == bottom must be a no-op: line content preserved.
 #[test]
@@ -790,9 +778,7 @@ fn scroll_region_up_top_equals_bottom_is_noop() {
     let mut grid = Grid::new(6, 10);
     fill_grid_rows(&mut grid, 6);
 
-    // Bypass set_scroll_region validation to create a degenerate region
-    // where top == bottom. Normal DECSTBM rejects this, but direct callers
-    // of scroll_region_up could hit it with programmatic regions.
+    // Bypass set_scroll_region validation (DECSTBM rejects top == bottom).
     grid.storage.cursor_state.scroll_region = ScrollRegion { top: 3, bottom: 3 };
 
     grid.scroll_region_up(1);
@@ -868,7 +854,7 @@ fn scroll_region_down_margined_top_equals_bottom_is_noop() {
     grid.assert_invariants();
 }
 
-/// Normal scroll_region_up with top < bottom still works (regression check).
+/// Normal scroll_region_up with top < bottom still works.
 #[test]
 fn scroll_region_up_normal_still_works() {
     let mut grid = Grid::new(6, 10);
@@ -894,7 +880,7 @@ fn scroll_region_up_normal_still_works() {
     grid.assert_invariants();
 }
 
-/// Normal scroll_region_down with top < bottom still works (regression check).
+/// Normal scroll_region_down with top < bottom still works.
 #[test]
 fn scroll_region_down_normal_still_works() {
     let mut grid = Grid::new(6, 10);

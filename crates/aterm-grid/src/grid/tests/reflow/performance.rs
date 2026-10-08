@@ -8,13 +8,9 @@
 use super::super::super::*;
 use crate::test_counters::take_reflow_row_ops;
 
-/// Reflow shrink from 100 cols → 1 col visits each source row exactly once.
-///
-/// The output will have `visible_rows * 100` rows (each cell becomes its own row),
-/// but the reflow loop should iterate the source rows in O(visible_rows), not
-/// O(output_rows). The per-row chunking in `chunk_cells_to_rows` is linear in
-/// content length, so total work is O(visible_rows * cols) = O(cells), which is
-/// the minimum for touching all content.
+/// Reflow shrink from 100 cols to 1 visits each source row once: total work is
+/// O(visible_rows * cols), linear in content, though the output has
+/// `visible_rows * 100` rows.
 #[test]
 fn reflow_shrink_extreme_ratio_is_linear_in_source_rows() {
     let _ = take_reflow_row_ops(); // reset counter
@@ -41,9 +37,8 @@ fn reflow_shrink_extreme_ratio_is_linear_in_source_rows() {
         "reflow shrink should visit each source row exactly once, got {ops}"
     );
 
-    // After #7410 scrollback-push, the cursor (at col 99 → row 99 after
-    // shrink) must remain visible. Rows 0..90 are pushed to scrollback,
-    // so visible rows 0..9 correspond to original columns 90..99.
+    // The cursor (col 99 → row 99) stays visible: rows 0..90 go to scrollback,
+    // so visible rows 0..9 hold original columns 90..99.
     for i in 0..10u16 {
         let char_index = 90 + i;
         let expected = (b'A' + (char_index % 26) as u8) as char;
@@ -57,12 +52,8 @@ fn reflow_shrink_extreme_ratio_is_linear_in_source_rows() {
     grid.assert_invariants();
 }
 
-/// Reflow grow from 1 col → 10 cols merges continuation rows efficiently.
-///
-/// The merge buffer pattern concatenates continuation rows in a single pass,
-/// meaning the outer loop iterates over logical lines (merged groups + individual
-/// rows), not over every source row. This is O(logical_lines) ≤ O(source_rows),
-/// which is strictly better when there are long wrapped lines.
+/// Reflow grow from 1 col to 10 merges continuation rows in one pass: the outer
+/// loop runs per logical line, not per source row.
 #[test]
 fn reflow_grow_extreme_ratio_merges_continuations() {
     let _ = take_reflow_row_ops(); // reset counter
@@ -82,9 +73,7 @@ fn reflow_grow_extreme_ratio_merges_continuations() {
     grid.resize(rows, 10); // grow back
 
     let ops = take_reflow_row_ops();
-    // The merge optimization means fewer outer-loop iterations than source rows:
-    // 10 continuation rows (from "ABCDEFGHIJ") merge into 1 logical line = 1 op,
-    // plus 10 empty rows = 10 ops, total = 11.
+    // 10 continuation rows merge into 1 logical line, plus 10 empty rows: 11.
     assert!(
         ops <= usize::from(visible_after_shrink),
         "reflow grow ops ({ops}) should not exceed source row count ({visible_after_shrink})"
@@ -101,12 +90,8 @@ fn reflow_grow_extreme_ratio_merges_continuations() {
     grid.assert_invariants();
 }
 
-/// Cursor on the last row survives an extreme shrink/grow round trip.
-///
-/// Verifies the fix from #3975: both grow and shrink paths now initialize
-/// cursor to (cursor_row, cursor_col), so cursor on a high row number
-/// is preserved through the round trip (modulo clamping to grid bounds).
-/// Uses scrollback to prevent content loss during extreme shrink.
+/// A cursor on the last row survives an extreme shrink/grow round trip (modulo
+/// clamping); scrollback keeps the content.
 #[test]
 fn reflow_extreme_resize_preserves_cursor_on_last_row() {
     let rows: u16 = 10;
@@ -164,12 +149,8 @@ fn reflow_extreme_resize_preserves_cursor_on_last_row() {
     );
 }
 
-/// Verify that shrink pre-allocation estimate doesn't cause excessive reallocs.
-///
-/// For a full grid (all cells have content), shrinking from `old_cols` to `new_cols`
-/// should produce approximately `visible_rows * old_cols / new_cols` output rows.
-/// The pre-allocation estimate should cover this without needing more than one
-/// reallocation (Vec's doubling strategy).
+/// The shrink pre-allocation estimate (`visible_rows * old_cols / new_cols`
+/// rows for a full grid) avoids repeated reallocation.
 #[test]
 fn reflow_shrink_preallocation_adequate() {
     let rows: u16 = 5;
@@ -185,15 +166,11 @@ fn reflow_shrink_preallocation_adequate() {
 
     grid.resize(rows, new_cols);
 
-    // After shrink: 50 chars / 5 cols = 10 rows from the one filled row
-    // Plus 4 empty rows → total should be 14, but clamped to visible_rows
-    // The key assertion: grid invariants hold and no content was lost
+    // Invariants hold and no content was lost.
     grid.assert_invariants();
 
-    // After #7410 scrollback-push, the cursor (at col 49 → row 9 after
-    // shrink to 5 cols) must remain visible. With 5 visible rows, rows
-    // 0..4 are pushed to scrollback. Visible row 0 = chars at positions
-    // 25..29 = "ZABCD".
+    // The cursor (col 49 → row 9 at 5 cols) stays visible: rows 0..4 go to
+    // scrollback, so visible row 0 is chars 25..29, "ZABCD".
     let row0_text = grid.row(0).unwrap().to_string();
     assert_eq!(
         row0_text, "ZABCD",

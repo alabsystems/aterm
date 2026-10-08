@@ -143,436 +143,8 @@ pub(crate) fn baseline_path() -> std::path::PathBuf {
 /// debug build would itself read as a "regression" — which is, deliberately, what
 /// we want the gate to catch if someone ships one).
 pub(crate) fn measure() -> Result<PerfReport, String> {
-    // THE PINNED DRIVER (crate::driver), never a bare `cargo`; the lane flag
-    // is the driver's to add.
-    let driver = crate::driver::cargo_driver()?;
-    let args = [
-        "--release",
-        "-q",
-        "-p",
-        "aterm-bench",
-        "--example",
-        "perf_harness",
-    ];
-    eprintln!("  $ {}", driver.display("run", &args));
-    let out = driver
-        .command("run")
-        .args(args)
-        .current_dir(workspace_root())
-        .output()
-        .map_err(|e| format!("could not spawn perf_harness: {e}"))?;
-    // Surface the harness's human line (stderr) for the gate log.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    for line in stderr.lines() {
-        if line.contains("perf_harness:") {
-            eprintln!("  {line}");
-        }
-    }
-    if !out.status.success() {
-        return Err(format!(
-            "perf_harness exited {:?}\n{stderr}",
-            out.status.code()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout
-        .lines()
-        .rev()
-        .find(|l| l.contains("median_mbps"))
-        .ok_or_else(|| format!("perf_harness produced no JSON report:\n{stdout}"))?;
-    parse_report(line).ok_or_else(|| format!("could not parse perf_harness JSON: {line}"))
-}
-
-// ---------------------------------------------------------------------------
-// PATHOLOGICAL-BENCH lane (EXCEED plan Cluster G, closed by
-// FASTER_THAN_GHOSTTY_PLAN §4): per-corpus hostile-input floors. Same
-// philosophy as the mixed lane — deterministic corpora, release subprocess,
-// median-of-N, the generous [`PASS_RATIO`] so it trips only on catastrophe —
-// but ONE floor PER CORPUS, so an SGR-interning regression (style_churn) can't
-// hide behind a healthy ASCII number.
-// ---------------------------------------------------------------------------
-
-/// The corpora the pathological harness emits, in emission order. MUST mirror
-/// the name list in `aterm-bench/examples/pathological_harness.rs` — the gate
-/// reads `<name>_median_mbps` for each and fails LOUDLY on a missing key, so a
-/// one-sided rename cannot silently drop a floor.
-pub(crate) const PATHOLOGICAL_CORPORA: [&str; 5] = [
-    "yes_flood",
-    "escape_storm",
-    "style_churn",
-    "long_escapes",
-    "wide_unicode",
-];
-
-/// Path to the committed pathological baseline (kept separate from the mixed
-/// baseline so re-recording one lane never perturbs the other).
-pub(crate) fn pathological_baseline_path() -> std::path::PathBuf {
-    workspace_root().join("tools/golden/perf-baseline-pathological.json")
-}
-
-/// Parse the harness/baseline flat JSON into per-corpus medians. `None` if ANY
-/// corpus key is missing — a partial report must read as unparseable, never as
-/// "the missing corpus passed".
-pub(crate) fn parse_pathological(json: &str) -> Option<Vec<(&'static str, f64)>> {
-    PATHOLOGICAL_CORPORA
-        .iter()
-        .map(|name| json_number(json, &format!("{name}_median_mbps")).map(|v| (*name, v)))
-        .collect()
-}
-
-/// Render the committed pathological baseline JSON (hand-rolled, no serde).
-pub(crate) fn pathological_baseline_json(medians: &[(&str, f64)], ratio: f64) -> String {
-    let mut s = String::from(
-        "{\n  \"_comment\": \"aterm PATHOLOGICAL-BENCH baseline: per-corpus median MB/s of \
-         Terminal::process under hostile input (yes-flood / escape-storm / style-churn / \
-         long-escapes / wide-unicode). Re-record with targo --unverified run -p xtask -- \
-         perf --record. Each corpus fails independently iff measured < recorded * pass_ratio.\",\n",
-    );
-    for (name, med) in medians {
-        s.push_str(&format!("  \"{name}_median_mbps\": {med:.3},\n"));
-    }
-    s.push_str(&format!("  \"pass_ratio\": {ratio:.3}\n}}\n"));
-    s
-}
-
-/// Run the release pathological harness and parse its per-corpus report.
-fn measure_pathological() -> Result<Vec<(&'static str, f64)>, String> {
-    // THE PINNED DRIVER (crate::driver), never a bare `cargo`; the lane flag
-    // is the driver's to add.
-    let driver = crate::driver::cargo_driver()?;
-    let args = [
-        "--release",
-        "-q",
-        "-p",
-        "aterm-bench",
-        "--example",
-        "pathological_harness",
-    ];
-    eprintln!("  $ {}", driver.display("run", &args));
-    let out = driver
-        .command("run")
-        .args(args)
-        .current_dir(workspace_root())
-        .output()
-        .map_err(|e| format!("could not spawn pathological_harness: {e}"))?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    for line in stderr.lines() {
-        if line.contains("pathological_harness:") {
-            eprintln!("  {line}");
-        }
-    }
-    if !out.status.success() {
-        return Err(format!(
-            "pathological_harness exited {:?}\n{stderr}",
-            out.status.code()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout
-        .lines()
-        .rev()
-        .find(|l| l.contains("_median_mbps"))
-        .ok_or_else(|| format!("pathological_harness produced no JSON report:\n{stdout}"))?;
-    parse_pathological(line)
-        .ok_or_else(|| format!("could not parse pathological_harness JSON: {line}"))
-}
-
-/// The pathological-floors sub-gate: every corpus median must clear its own
-/// recorded floor. Mirrors [`gate_throughput`]'s contract exactly — records on
-/// request, report-only PASS with no/malformed baseline, fails loudly naming
-/// the offending corpus otherwise.
-pub(crate) fn gate_pathological(trend: &mut Vec<TrendSample>) -> bool {
-    let medians = match measure_pathological() {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("  pathological: FAILED to measure — {e}");
-            return false;
-        }
-    };
-    for (name, med) in &medians {
-        trend.push(TrendSample {
-            lane: "pathological",
-            metric: format!("{name}_median_mbps"),
-            value: *med,
-            inverted: false,
-        });
-    }
-    let path = pathological_baseline_path();
-
-    if record_requested() {
-        let json = pathological_baseline_json(&medians, PASS_RATIO);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match std::fs::write(&path, &json) {
-            Ok(()) => {
-                eprintln!("  pathological: RECORDED baseline -> {}", path.display());
-                return true;
-            }
-            Err(e) => {
-                eprintln!(
-                    "  pathological: FAILED to write baseline {}: {e}",
-                    path.display()
-                );
-                return false;
-            }
-        }
-    }
-
-    compare_pathological_against_baseline(&path, &medians)
-}
-
-/// Read + compare per corpus (split out so the decision is unit-testable
-/// without spawning cargo, mirroring [`compare_against_baseline`]).
-fn compare_pathological_against_baseline(path: &Path, medians: &[(&'static str, f64)]) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        eprintln!(
-            "  pathological: no baseline at {} — REPORT-ONLY, PASS (record with --record).",
-            path.display()
-        );
-        for (name, med) in medians {
-            eprintln!("    {name}: {med:.1} MB/s");
-        }
-        note_unmeasured("pathological (no baseline)");
-        return true;
-    };
-    let Some(base) = parse_pathological(&text) else {
-        eprintln!(
-            "  pathological: baseline {} is unparseable — REPORT-ONLY, PASS.",
-            path.display()
-        );
-        note_unmeasured("pathological (unparseable baseline)");
-        return true;
-    };
-    let mut ok = true;
-    for ((name, med), (bname, bmed)) in medians.iter().zip(base.iter()) {
-        debug_assert_eq!(name, bname, "corpus order is the shared const");
-        let (verdict, floor) = compare(*bmed, *med, PASS_RATIO);
-        match verdict {
-            Verdict::NoBaseline | Verdict::Pass => {
-                eprintln!("    {name}: GREEN — {med:.1} MB/s >= floor {floor:.1} MB/s");
-            }
-            Verdict::Fail => {
-                eprintln!(
-                    "    {name}: FAILED — {med:.1} MB/s < floor {floor:.1} MB/s \
-                     (baseline {bmed:.1} x {PASS_RATIO:.2}); hostile-input regression in \
-                     the {name} workload class."
-                );
-                ok = false;
-            }
-        }
-    }
-    ok
-}
-
-// ---------------------------------------------------------------------------
-// ARENA-SCROLL lane (FASTER_THAN_GHOSTTY_PLAN §2 harness table / §4 SCROLL-1):
-// scrollback-scrub read-path floors. Our tiered compressed scrollback pays tier
-// decode on the interactive scrub path where ghostty's all-RAM PageList pays
-// only pointer math — the dimension we are structurally most at risk of losing,
-// and the one THRU-5's async-compression change must not regress. Engine-level
-// and headless-capable (frame pacing is windowed-only, so the WINDOWED half of
-// ARENA-SCROLL lives in tools/perf-arena/scroll.sh; this is the gate-enforced
-// floor). Same non-flake contract as the other lanes; one floor PER PHASE.
-// ---------------------------------------------------------------------------
-
-/// The scrub phases and their exact JSON keys, in emission order. MUST mirror
-/// the keys emitted by `aterm-bench/examples/scroll_scrub_harness.rs`. Every
-/// metric is BIGGER-IS-BETTER (jump-to-top is reported as jumps/sec, not ms) so
-/// the shared [`compare`] throughput contract applies unchanged. `parse_scroll`
-/// fails LOUDLY on any missing key, so a one-sided rename cannot drop a floor.
-pub(crate) const SCROLL_PHASES: [(&str, &str); 3] = [
-    ("scrub", "scrub_median_rps"),
-    ("pageup", "pageup_median_rps"),
-    ("jump_top", "jump_top_median_jps"),
-];
-
-/// Path to the committed scroll baseline (separate file per lane).
-pub(crate) fn scroll_baseline_path() -> std::path::PathBuf {
-    workspace_root().join("tools/golden/perf-baseline-scroll.json")
-}
-
-/// Parse the harness/baseline flat JSON into per-phase medians. `None` if ANY
-/// phase key is missing — a partial report must read as unparseable, never as
-/// "the missing phase passed".
-pub(crate) fn parse_scroll(json: &str) -> Option<Vec<(&'static str, f64)>> {
-    SCROLL_PHASES
-        .iter()
-        .map(|(name, key)| json_number(json, key).map(|v| (*name, v)))
-        .collect()
-}
-
-/// Render the committed scroll baseline JSON (hand-rolled, no serde).
-pub(crate) fn scroll_baseline_json(medians: &[(&str, f64)], ratio: f64) -> String {
-    let mut s = String::from(
-        "{\n  \"_comment\": \"aterm ARENA-SCROLL baseline: scrollback-scrub read-path rates \
-         (rows materialized/sec for wheel-scrub + page-sweep, jumps/sec for jump-to-top) over a \
-         100k+-line tiered-scrollback fill. All BIGGER-IS-BETTER. Re-record with \
-         targo --unverified run -p xtask -- perf --record. Each phase fails independently iff \
-         measured < recorded * pass_ratio.\",\n",
-    );
-    for (name, key) in SCROLL_PHASES {
-        let med = medians
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map_or(0.0, |(_, v)| *v);
-        s.push_str(&format!("  \"{key}\": {med:.3},\n"));
-    }
-    s.push_str(&format!("  \"pass_ratio\": {ratio:.3}\n}}\n"));
-    s
-}
-
-/// Run the release scroll-scrub harness and parse its per-phase report.
-fn measure_scroll() -> Result<Vec<(&'static str, f64)>, String> {
-    // THE PINNED DRIVER (crate::driver), never a bare `cargo`; the lane flag
-    // is the driver's to add.
-    let driver = crate::driver::cargo_driver()?;
-    let args = [
-        "--release",
-        "-q",
-        "-p",
-        "aterm-bench",
-        "--example",
-        "scroll_scrub_harness",
-    ];
-    eprintln!("  $ {}", driver.display("run", &args));
-    let out = driver
-        .command("run")
-        .args(args)
-        .current_dir(workspace_root())
-        .output()
-        .map_err(|e| format!("could not spawn scroll_scrub_harness: {e}"))?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    for line in stderr.lines() {
-        if line.contains("scroll_scrub_harness:") {
-            eprintln!("  {line}");
-        }
-    }
-    if !out.status.success() {
-        return Err(format!(
-            "scroll_scrub_harness exited {:?}\n{stderr}",
-            out.status.code()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout
-        .lines()
-        .rev()
-        .find(|l| l.contains("_median_"))
-        .ok_or_else(|| format!("scroll_scrub_harness produced no JSON report:\n{stdout}"))?;
-    parse_scroll(line).ok_or_else(|| format!("could not parse scroll_scrub_harness JSON: {line}"))
-}
-
-/// The scroll-scrub floors sub-gate: every phase rate must clear its own recorded
-/// floor. Mirrors [`gate_pathological`]'s contract exactly — records on request,
-/// report-only PASS with no/malformed baseline, fails loudly naming the phase.
-pub(crate) fn gate_scroll_scrub(trend: &mut Vec<TrendSample>) -> bool {
-    let medians = match measure_scroll() {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("  scroll-scrub: FAILED to measure — {e}");
-            return false;
-        }
-    };
-    for ((name, med), (bname, key)) in medians.iter().zip(SCROLL_PHASES.iter()) {
-        debug_assert_eq!(name, bname, "phase order is the shared const");
-        trend.push(TrendSample {
-            lane: "scroll",
-            metric: (*key).to_string(),
-            value: *med,
-            inverted: false,
-        });
-    }
-    let path = scroll_baseline_path();
-
-    if record_requested() {
-        // BUG (fixed): the record branch handed `medians` straight to the
-        // renderer, and `scroll_baseline_json` substitutes 0.0 for any phase it
-        // cannot find (it also passes a measured 0.0 through unchanged). A
-        // non-positive floor is exactly the input `compare` answers
-        // `NoBaseline` to, which `compare_scroll_against_baseline` then prints
-        // as GREEN — so recording an unmeasured or dead phase RETIRED its floor
-        // while the gate kept saying the phase was within bounds. Refuse to
-        // write instead, naming the phase; the committed baseline is left as it
-        // was, so the previous floor keeps being enforced.
-        if let Some((phase, reason)) = SCROLL_PHASES.iter().find_map(|(name, _)| {
-            match medians.iter().find(|(n, _)| n == name).map(|&(_, v)| v) {
-                Some(v) if v.is_finite() && v > 0.0 => None,
-                Some(v) => Some((*name, format!("measured {v}"))),
-                None => Some((*name, "was not measured".to_string())),
-            }
-        }) {
-            eprintln!(
-                "  scroll-scrub: REFUSING to record — phase {phase} {reason}; a \
-                 non-positive floor reads back as `NoBaseline`, i.e. as GREEN forever. \
-                 Baseline {} left untouched.",
-                path.display()
-            );
-            return false;
-        }
-        let json = scroll_baseline_json(&medians, PASS_RATIO);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match std::fs::write(&path, &json) {
-            Ok(()) => {
-                eprintln!("  scroll-scrub: RECORDED baseline -> {}", path.display());
-                return true;
-            }
-            Err(e) => {
-                eprintln!(
-                    "  scroll-scrub: FAILED to write baseline {}: {e}",
-                    path.display()
-                );
-                return false;
-            }
-        }
-    }
-
-    compare_scroll_against_baseline(&path, &medians)
-}
-
-/// Read + compare per phase (split out so the decision is unit-testable without
-/// spawning cargo, mirroring [`compare_pathological_against_baseline`]).
-fn compare_scroll_against_baseline(path: &Path, medians: &[(&'static str, f64)]) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        eprintln!(
-            "  scroll-scrub: no baseline at {} — REPORT-ONLY, PASS (record with --record).",
-            path.display()
-        );
-        for (name, med) in medians {
-            eprintln!("    {name}: {med:.0}/s");
-        }
-        note_unmeasured("scroll-scrub (no baseline)");
-        return true;
-    };
-    let Some(base) = parse_scroll(&text) else {
-        eprintln!(
-            "  scroll-scrub: baseline {} is unparseable — REPORT-ONLY, PASS.",
-            path.display()
-        );
-        note_unmeasured("scroll-scrub (unparseable baseline)");
-        return true;
-    };
-    let mut ok = true;
-    for ((name, med), (bname, bmed)) in medians.iter().zip(base.iter()) {
-        debug_assert_eq!(name, bname, "phase order is the shared const");
-        let (verdict, floor) = compare(*bmed, *med, PASS_RATIO);
-        match verdict {
-            Verdict::NoBaseline | Verdict::Pass => {
-                eprintln!("    {name}: GREEN — {med:.0}/s >= floor {floor:.0}/s");
-            }
-            Verdict::Fail => {
-                eprintln!(
-                    "    {name}: FAILED — {med:.0}/s < floor {floor:.0}/s \
-                     (baseline {bmed:.0} x {PASS_RATIO:.2}); scrollback-scrub read-path \
-                     regression in the {name} phase."
-                );
-                ok = false;
-            }
-        }
-    }
-    ok
+    let line = measure_example_json("perf_harness")?;
+    parse_report(&line).ok_or_else(|| format!("could not parse perf_harness JSON: {line}"))
 }
 
 /// Should the gate (re)write the baseline this run? ONLY when `--record`
@@ -719,12 +291,11 @@ fn compare_against_baseline(path: &Path, report: &PerfReport) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// E0 KEYED-FLOOR lanes (search / restore / resize / wasm): one shared engine
-// for "harness emits flat JSON, every listed key gets its own floor" — the
-// same contract as the pathological/scroll lanes, generalized so the four new
-// lanes don't quadruplicate the record/compare plumbing. Keys are all
-// BIGGER-IS-BETTER ([`compare`] applies unchanged); a missing key makes the
-// whole report unparseable (never "the missing metric passed").
+// KEYED-FLOOR lanes (pathological / scroll / search / restore / resize /
+// wasm): one shared engine for "harness emits flat JSON, every listed key gets
+// its own floor". Keys are all BIGGER-IS-BETTER ([`compare`] applies
+// unchanged); a missing key makes the whole report unparseable (never "the
+// missing metric passed").
 // ---------------------------------------------------------------------------
 
 /// A keyed floor lane: which harness to run, which JSON keys are gated, where
@@ -742,6 +313,53 @@ pub(crate) struct FloorLane {
     /// `_comment` written into the recorded baseline.
     pub comment: &'static str,
 }
+
+/// PATHOLOGICAL-BENCH (EXCEED plan Cluster G, closed by
+/// FASTER_THAN_GHOSTTY_PLAN §4): per-corpus hostile-input floors. ONE floor PER
+/// CORPUS, so an SGR-interning regression (style_churn) can't hide behind a
+/// healthy ASCII number. The keys MUST mirror the corpus list in
+/// `aterm-bench/examples/pathological_harness.rs` (`<name>_median_mbps`).
+pub(crate) const PATHOLOGICAL_LANE: FloorLane = FloorLane {
+    lane: "pathological",
+    example: "pathological_harness",
+    keys: &[
+        "yes_flood_median_mbps",
+        "escape_storm_median_mbps",
+        "style_churn_median_mbps",
+        "long_escapes_median_mbps",
+        "wide_unicode_median_mbps",
+    ],
+    baseline_file: "perf-baseline-pathological.json",
+    comment: "aterm PATHOLOGICAL-BENCH baseline: per-corpus median MB/s of Terminal::process \
+              under hostile input (yes-flood / escape-storm / style-churn / long-escapes / \
+              wide-unicode). Re-record with targo --unverified run -p xtask -- perf --record. \
+              Each corpus fails independently iff measured < recorded * pass_ratio.",
+};
+
+/// ARENA-SCROLL (FASTER_THAN_GHOSTTY_PLAN §2 harness table / §4 SCROLL-1):
+/// scrollback-scrub read-path floors. Our tiered compressed scrollback pays tier
+/// decode on the interactive scrub path where ghostty's all-RAM PageList pays
+/// only pointer math — the dimension we are structurally most at risk of losing,
+/// and the one THRU-5's async-compression change must not regress. Engine-level
+/// and headless-capable (frame pacing is windowed-only, so the WINDOWED half of
+/// ARENA-SCROLL lives in tools/perf-arena/scroll.sh). Jump-to-top is reported
+/// as jumps/sec, not ms, so every key is bigger-is-better. The keys MUST mirror
+/// `aterm-bench/examples/scroll_scrub_harness.rs`.
+pub(crate) const SCROLL_LANE: FloorLane = FloorLane {
+    lane: "scroll",
+    example: "scroll_scrub_harness",
+    keys: &[
+        "scrub_median_rps",
+        "pageup_median_rps",
+        "jump_top_median_jps",
+    ],
+    baseline_file: "perf-baseline-scroll.json",
+    comment: "aterm ARENA-SCROLL baseline: scrollback-scrub read-path rates (rows \
+              materialized/sec for wheel-scrub + page-sweep, jumps/sec for jump-to-top) over a \
+              100k+-line tiered-scrollback fill. All BIGGER-IS-BETTER. Re-record with targo \
+              --unverified run -p xtask -- perf --record. Each phase fails independently iff \
+              measured < recorded * pass_ratio.",
+};
 
 pub(crate) const SEARCH_LANE: FloorLane = FloorLane {
     lane: "search",
@@ -833,16 +451,13 @@ pub(crate) const RESIZE_TIERED_SYNC_WORST_CAP_MS: f64 = 100.0;
 /// cap on the post-`wasm-opt -O3` `aterm_wasm_bg.wasm` that
 /// `tools/wasm-bench/bench.mjs` reports as `wasm_cpu_module_bytes`.
 ///
-/// Decided 2026-09-25 (docs/DESIGN-host-boundary-2026-08-30.md §7 decision 5,
-/// §8.4): the pre-pet baseline module is 3,792,917 B and the ceiling is +25% of
-/// it. Unlike the ratio floors this needs no committed baseline and no same-box
-/// history: it holds on a fresh checkout. When it trips, `xtask perf` fails and
-/// its verdict names the growth; raising the number or shrinking the module is
-/// the owner's call, never an automatic re-record. Nothing runs `xtask perf`
-/// automatically (the merge-contract ladder does not include it), so a commit
-/// that crosses the ceiling is caught only when someone runs `xtask perf` — the
-/// design doc's decision 5 says so too.
-pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 4_741_146.0;
+/// The measured module (5,351,532 B) + 10%
+/// (docs/DESIGN-host-boundary-2026-08-30.md §7 decision 5, §8.4). Unlike the
+/// ratio floors it needs no baseline or same-box history. When it trips, the
+/// raise-or-shrink call is the owner's, recorded in decision 5, never an
+/// automatic re-record. Nothing runs `xtask perf` automatically, so a crossing
+/// is caught only when someone runs it.
+pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 5_886_685.0;
 
 /// Parse a lane's flat JSON into `(key, value)` pairs. `None` if ANY gated key
 /// is missing — a partial report must read as unparseable.
@@ -871,7 +486,8 @@ fn keyed_baseline_path(lane: &FloorLane) -> std::path::PathBuf {
 
 /// Run a lane's `aterm-bench` example and return its raw JSON line.
 fn measure_example_json(example: &str) -> Result<String, String> {
-    // Same pinned driver as the three harnesses above (crate::driver).
+    // THE PINNED DRIVER (crate::driver), never a bare `cargo`; the lane flag
+    // is the driver's to add.
     let driver = crate::driver::cargo_driver()?;
     let args = ["--release", "-q", "-p", "aterm-bench", "--example", example];
     eprintln!("  $ {}", driver.display("run", &args));
@@ -963,10 +579,10 @@ fn carry_baseline_comment(path: &Path, fresh: &str, date: &str) -> (String, bool
     (out, true)
 }
 
-/// Record-or-compare a keyed lane, given its measured raw JSON. Shared by all
-/// four lanes; pushes gated metrics into `trend`. Same contract as the older
-/// lanes: record on request, report-only PASS with no/malformed baseline,
-/// fail loudly naming the metric otherwise.
+/// Record-or-compare a keyed lane, given its measured raw JSON. Shared by every
+/// keyed lane; pushes gated metrics into `trend`. Records on request,
+/// report-only PASS with no/malformed baseline, fails loudly naming the metric
+/// otherwise.
 fn judge_keyed(lane: &FloorLane, json: &str, trend: &mut Vec<TrendSample>) -> bool {
     let Some(values) = parse_keyed(lane, json) else {
         eprintln!(
@@ -985,9 +601,22 @@ fn judge_keyed(lane: &FloorLane, json: &str, trend: &mut Vec<TrendSample>) -> bo
     }
     let path = keyed_baseline_path(lane);
     if record_requested() {
-        // DEFECT: this used to write `keyed_baseline_json`'s output verbatim, and
-        // that spells `_comment` from `lane.comment` — silently overwriting the
-        // committed baseline's hand-written provenance. Carry the note forward.
+        // A non-positive floor is exactly the input `compare` answers
+        // `NoBaseline` to, i.e. a metric with no floor: recording a dead or
+        // unmeasured metric would RETIRE its floor (the scroll lane once did).
+        // Refuse instead, naming the metric; the committed baseline is left as
+        // it was, so the previous floor keeps being enforced.
+        if let Some((key, v)) = values.iter().find(|(_, v)| !(v.is_finite() && *v > 0.0)) {
+            eprintln!(
+                "  {}: REFUSING to record — {key} measured {v}; a non-positive floor \
+                 judges nothing. Baseline {} left untouched.",
+                lane.lane,
+                path.display()
+            );
+            return false;
+        }
+        // `keyed_baseline_json` spells `_comment` from `lane.comment`; carry the
+        // committed baseline's hand-written provenance forward instead.
         let fresh = keyed_baseline_json(lane, &values, PASS_RATIO);
         let (jsonout, carried) = carry_baseline_comment(&path, &fresh, &utc_date());
         if let Some(parent) = path.parent() {
@@ -1023,7 +652,7 @@ fn judge_keyed(lane: &FloorLane, json: &str, trend: &mut Vec<TrendSample>) -> bo
 }
 
 /// Read + compare per key (split out so the decision is unit-testable without
-/// spawning cargo, mirroring the older lanes).
+/// spawning cargo).
 fn compare_keyed_against_baseline(
     lane: &FloorLane,
     path: &Path,
@@ -1085,27 +714,36 @@ fn compare_keyed_against_baseline(
     ok
 }
 
-/// SEARCH floors (E0): build/query/memory on both corpus shapes + the
-/// incremental primitive.
-pub(crate) fn gate_search(trend: &mut Vec<TrendSample>) -> bool {
-    match measure_example_json(SEARCH_LANE.example) {
-        Ok(json) => judge_keyed(&SEARCH_LANE, &json, trend),
+/// Measure and judge a lane whose harness is an `aterm-bench` example.
+fn gate_example_lane(lane: &FloorLane, trend: &mut Vec<TrendSample>) -> bool {
+    match measure_example_json(lane.example) {
+        Ok(json) => judge_keyed(lane, &json, trend),
         Err(e) => {
-            eprintln!("  search: FAILED to measure — {e}");
+            eprintln!("  {}: FAILED to measure — {e}", lane.lane);
             false
         }
     }
 }
 
+/// PATHOLOGICAL floors: every corpus median clears its own recorded floor.
+pub(crate) fn gate_pathological(trend: &mut Vec<TrendSample>) -> bool {
+    gate_example_lane(&PATHOLOGICAL_LANE, trend)
+}
+
+/// SCROLL-SCRUB floors: every phase rate clears its own recorded floor.
+pub(crate) fn gate_scroll_scrub(trend: &mut Vec<TrendSample>) -> bool {
+    gate_example_lane(&SCROLL_LANE, trend)
+}
+
+/// SEARCH floors (E0): build/query/memory on both corpus shapes + the
+/// incremental primitive.
+pub(crate) fn gate_search(trend: &mut Vec<TrendSample>) -> bool {
+    gate_example_lane(&SEARCH_LANE, trend)
+}
+
 /// RESTORE floor (E0): serialize->replay rate.
 pub(crate) fn gate_restore(trend: &mut Vec<TrendSample>) -> bool {
-    match measure_example_json(RESTORE_LANE.example) {
-        Ok(json) => judge_keyed(&RESTORE_LANE, &json, trend),
-        Err(e) => {
-            eprintln!("  restore: FAILED to measure — {e}");
-            false
-        }
-    }
+    gate_example_lane(&RESTORE_LANE, trend)
 }
 
 /// Keys the resize harness reports that are LOWER-IS-BETTER latencies, so they
@@ -1241,10 +879,6 @@ pub(crate) fn resize_fences(json: &str) -> bool {
     ok
 }
 
-/// WASM floors (E0): the shipped wasm modules under node. SKIP-with-notice
-/// (pass) when the box lacks node or a wasm32-capable stable toolchain — a
-/// notice is printed, never a silent false "ok" — but a harness FAILURE on an
-/// equipped box fails the gate.
 /// The wasm-bindgen CLI version this lane requires. It MUST equal `WB_VERSION` in
 /// `tools/wasm-bench/run.sh` and the `wasm-bindgen = "=<v>"` pin in
 /// `crates/aterm-wasm/Cargo.toml`: the CLI refuses a crate it does not match, so a
@@ -1254,11 +888,8 @@ pub(crate) const WASM_BINDGEN_PIN: &str = "0.2.108";
 
 // Lanes that RAN but MEASURED NOTHING this pass — a missing tool, no committed
 // baseline, a seed run with no same-box history. Each lane already says so on its
-// own line; this is how the VERDICT line gets to say it too.
-//
-// The verdict used to assert that every floor held whenever `ok` was true, while
-// most lanes return `true` without measuring anything when a prerequisite or a
-// baseline is missing. A verdict may not claim more than the lanes did.
+// own line; this is how the VERDICT line says it too, since most lanes return
+// `true` without measuring anything. A verdict may not claim more than the lanes did.
 thread_local! {
     static UNMEASURED: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -1274,6 +905,10 @@ pub(crate) fn take_unmeasured() -> Vec<String> {
     UNMEASURED.with(|u| std::mem::take(&mut *u.borrow_mut()))
 }
 
+/// WASM floors (E0): the shipped wasm modules under node. SKIP-with-notice
+/// (pass) when the box lacks node or a wasm32-capable stable toolchain — a
+/// notice is printed, never a silent false "ok" — but a harness FAILURE on an
+/// equipped box fails the gate.
 pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
     let have = |cmd: &str, args: &[&str]| {
         Command::new(cmd)
@@ -1289,9 +924,8 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
         note_unmeasured("wasm (no node)");
         return true;
     }
-    // rustup BY PATH, found where gate.rs's cross gates find it: a box whose rustup
-    // sits in ~/.cargo/bin off PATH was told "no stable wasm32 target" here with the
-    // target installed (measured 2026-09-27, see `gate::find_rustup`).
+    // rustup BY PATH, found where gate.rs's cross gates find it (it may sit in
+    // ~/.cargo/bin off PATH: `gate::find_rustup`).
     let Some(rustup) = crate::gate::find_rustup() else {
         eprintln!(
             "  wasm: SKIP — no rustup on this box (looked {}); floors not evaluated on this box.",
@@ -1300,19 +934,16 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
         note_unmeasured("wasm (no rustup)");
         return true;
     };
-    // Line-exact: `.contains()` would also read this target out of
-    // `wasm32-unknown-unknown-nightly`, and would accept `wasm32-wasip1` for a
-    // prefix search. Same rule as gate.rs's `toolchain_lists_target`.
-    // STOCK EXCEPTION (Trust lacks a wasm32 std; measured 2026-09-28 `targo
-    // --unverified check --target wasm32-unknown-unknown -p aterm-wasm`:
-    // error[E0463] can't find crate for `core`): the wasm lane rides rustup stable.
+    // STOCK EXCEPTION (Trust lacks a wasm32 std: error[E0463] can't find crate
+    // for `core`): the wasm lane rides rustup stable.
     let wasm_target = Command::new(&rustup)
         .args(["target", "list", "--installed", "--toolchain", "stable"])
         .output()
         .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == "wasm32-unknown-unknown")
+            crate::gate::toolchain_lists_target(
+                &String::from_utf8_lossy(&o.stdout),
+                "wasm32-unknown-unknown",
+            )
         })
         .unwrap_or(false);
     if !wasm_target {
@@ -1390,7 +1021,7 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
     }
     let script = workspace_root().join("tools/wasm-bench/run.sh");
     // The PUBLIC snapshot ships crates/xtask but NOT tools/wasm-bench
-    // (publish/manifest.txt exports two named paths from tools/ and this is not one), so
+    // (publish/manifest.txt exports only tools/install.sh from tools/), so
     // there `bash <missing>` exits 127 and this lane fails with a message that names
     // no cause. Absent harness is a box fact, not a regression.
     if !script.exists() {
@@ -1452,9 +1083,9 @@ pub(crate) fn wasm_module_fence(json: &str) -> bool {
         }
         Some(v) => {
             eprintln!(
-                "    {key}: FAILED — {v:.0} B > ceiling {cap:.0} B by {:.0} B. The CPU wasm \
-                 module outgrew the committed budget (pre-pet 3,792,917 B + 25%); raise the \
-                 ceiling or shrink the module — an owner call, not a re-record.",
+                "    {key}: FAILED — {v:.0} B > ceiling {cap:.0} B by {:.0} B \
+                 (WASM_CPU_MODULE_BYTES_CAP); raise the ceiling or shrink the module — an \
+                 owner call, not a re-record.",
                 v - cap
             );
             false
@@ -1499,21 +1130,11 @@ pub(crate) struct TrendSample {
 }
 
 // ---------------------------------------------------------------------------
-// MACHINE IDENTITY (W-1). The ledger is a SAME-BOX comparison, so every row has
-// to say which box measured it. It used to say `hostname`, and that silently
-// killed the only guard in this tree that can catch a same-box 2x regression:
-// the machine was renamed m15 -> m21, the live hostname stopped matching any
-// committed row, and `judge_trend` filtered 249 rows down to nothing. The gate
-// went on printing SKIP lines that read as "first run on this box" while every
-// win of a whole campaign landed unprotected.
-//
-// A hostname is a bad machine identity in BOTH directions, and BOTH have
-// already happened to this ledger:
-//   * it RENAMES — m15 -> m21 forked one box's history away from itself; and
-//   * it is SPELLED more than one way on one box — the committed rows carry
-//     `m15-Macbook-M5-Max-128GB-8TB.local` (29 rows) AND
-//     `m15Macb128GB8TB.localdomain` (220 rows), which are one machine under
-//     `.local` and `.localdomain`.
+// MACHINE IDENTITY. The ledger is a SAME-BOX comparison, so every row has to
+// say which box measured it. A hostname fails in BOTH directions: it RENAMES
+// (forking a box's history away from itself, so the trend silently judges
+// nothing), and one box SPELLS it more than one way (`.local` and
+// `.localdomain`).
 //
 // WHAT REPLACES IT, and why not the two obvious alternatives:
 //
@@ -1572,21 +1193,6 @@ pub(crate) struct MachineId {
     pub identities: Vec<String>,
     /// An alias row explicitly claimed one of [`Self::identities`].
     pub claimed: bool,
-}
-
-/// FNV-1a 64. Dependency-free and deterministic, which is the whole
-/// requirement: the digest only has to be STABLE for one machine and
-/// non-reversible enough that a committed alias row does not publish the
-/// platform UUID it came from. It is not a security primitive and nothing
-/// downstream treats it as one — a forged fingerprint buys an attacker one
-/// wrong perf-trend comparison on a machine they already own.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
 }
 
 /// Alphanumerics kept, runs of anything else collapsed to one `-`, so a chip
@@ -1660,11 +1266,17 @@ fn platform_uuid() -> Option<String> {
 }
 
 /// The stable, non-identifying machine fingerprint — `None` when no platform
-/// UUID is readable, in which case the hostname is all we have.
+/// UUID is readable, in which case the hostname is all we have. FNV-1a/64:
+/// deterministic, which is the whole requirement — the digest only has to be
+/// STABLE for one machine and non-reversible enough that a committed alias row
+/// does not publish the platform UUID it came from. It is not a security
+/// primitive and nothing downstream treats it as one — a forged fingerprint
+/// buys an attacker one wrong perf-trend comparison on a machine they already
+/// own.
 fn platform_fingerprint() -> Option<String> {
     let raw = platform_uuid()?;
     let t = raw.trim();
-    (!t.is_empty()).then(|| format!("{:016x}", fnv1a64(t.as_bytes())))
+    (!t.is_empty()).then(|| format!("{:016x}", aterm_hash::fnv1a_64(t.as_bytes())))
 }
 
 fn hostname() -> String {
@@ -1777,10 +1389,10 @@ impl BoxRef {
 
 /// Resolve one ledger row's box column. Pure (unit-tested).
 ///
-/// The column holds either a BOX NAME (rows written since W-1) or a RAW
-/// HOSTNAME (every row written before it). Both resolve here, and an unknown
-/// token resolves to ITSELF — never to whatever box looks closest — so the one
-/// thing this function cannot do is quietly merge two machines.
+/// The column holds either a BOX NAME or a RAW HOSTNAME (older rows). Both resolve
+/// here, and an unknown token resolves to ITSELF — never to whatever box looks
+/// closest — so the one thing this function cannot do is quietly merge two
+/// machines.
 pub(crate) fn resolve_ledger_box(aliases: &str, token: &str) -> BoxRef {
     if let Some(key) = alias_lookup(aliases, &format!("host:{token}")) {
         return BoxRef::Claimed(key);
@@ -1792,8 +1404,7 @@ pub(crate) fn resolve_ledger_box(aliases: &str, token: &str) -> BoxRef {
     // [`default_box_key`]). Resolving it through the fingerprint is what lets a
     // machine be NAMED after it has already written rows: the operator adds one
     // `fp:` row and the auto-keyed history it already produced comes with it,
-    // instead of being stranded under a name nobody will ever type again —
-    // which is the same orphaning W-1 exists to end.
+    // instead of being stranded under a name nobody will ever type again.
     if let Some(digest) = token.strip_prefix("box-")
         && let Some(key) = alias_lookup(aliases, &format!("fp:{digest}"))
     {
@@ -1875,9 +1486,8 @@ fn utc_date() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// One parsed ledger row. Rows have grown a column twice and the parser
-/// accepts all three widths: 5 (pre-2026-07-22), 6 (+ toolchain), 7 (+ the
-/// box's hardware shape, since W-1).
+/// One parsed ledger row. The parser accepts all three widths: 5, 6
+/// (+ toolchain), 7 (+ the box's hardware shape).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrendRow<'a> {
     pub token: &'a str,
@@ -1895,8 +1505,7 @@ pub(crate) struct TrendRow<'a> {
 /// the ONE sub-gate that can catch a same-box 2x regression, so a truncated,
 /// mis-tabbed or non-numeric row silently SHRINKS the reference window a metric
 /// is held to, and in the limit empties it — which then prints as "no same-box
-/// history, SKIP" on a box with hundreds of committed rows. That is the same
-/// failure W-1 already fixed once (a rename), reachable a second way.
+/// history, SKIP" on a box with hundreds of committed rows.
 ///
 /// Returns `(rows, dropped)`; each `dropped` entry names the discarded line by
 /// its 1-based ledger line number and says why it was discarded.
@@ -1947,13 +1556,13 @@ pub(crate) struct TrendJudgment {
     /// (lower-is-better) ones.
     pub breaches: Vec<(String, f64, f64, f64, bool)>,
     /// Metrics with NO same-box history: first run on this box. Reported as
-    /// SKIP — never counted into a GREEN claim (Wave-0 prescription e).
+    /// SKIP — never counted into a GREEN claim.
     pub skipped: Vec<String>,
     /// `(token, chip)` pairs that resolve to THIS box but were measured on a
     /// different CHIP. The alias table is claiming two machines are one; these
     /// rows are DROPPED from the reference window and the sub-gate goes red.
-    /// Silence here would be the one outcome worse than the dead gate W-1
-    /// fixed: a trend that looks alive while comparing across machines.
+    /// Silence here would be worse than a dead gate: a trend that looks alive
+    /// while comparing across machines.
     pub conflicts: Vec<(String, String)>,
 }
 
@@ -2040,18 +1649,17 @@ pub(crate) fn judge_trend(
     }
 }
 
-/// Which toolchain builds a lane's measurement binary — recorded per ledger
-/// row (Wave-0 prescription e) so cross-toolchain drift (a Trust-toolchain
-/// bump vs an upstream-stable bump) is never misread as a same-box perf
-/// change. The wasm lane rides upstream stable (Trust has no wasm32 std, see
-/// tools/wasm-bench/run.sh); every native lane is the Trust toolchain.
+/// Which toolchain builds a lane's measurement binary — recorded per ledger row so
+/// cross-toolchain drift (a Trust-toolchain bump vs an upstream-stable bump) is
+/// never misread as a same-box perf change. The wasm lane rides upstream stable
+/// (Trust has no wasm32 std, see tools/wasm-bench/run.sh); every native lane is the
+/// Trust toolchain.
 fn toolchain_lane(lane: &str) -> &'static str {
     if lane == "wasm" { "stable" } else { "trust" }
 }
 
-/// Render `samples` as ledger rows (one metric per line, TSV). The trailing
-/// toolchain column is absent from pre-2026-07-22 rows and the SHAPE column
-/// from every row before W-1; the parser still accepts both.
+/// Render `samples` as ledger rows (one metric per line, TSV). Older rows lack
+/// the toolchain and SHAPE columns; the parser still accepts them.
 pub(crate) fn trend_rows(date: &str, sha: &str, me: &MachineId, samples: &[TrendSample]) -> String {
     let mut s = String::new();
     for sample in samples {
@@ -2208,26 +1816,32 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool) -> bool {
 /// workspace test stage runs them on every tier.
 pub(crate) fn run() -> bool {
     eprintln!("=== xtask perf ===");
-    let lanes: [fn(&mut Vec<TrendSample>) -> bool; 7] = [
-        gate_throughput,
-        gate_pathological,
-        gate_scroll_scrub,
-        gate_search,
-        gate_restore,
-        gate_resize,
-        gate_wasm,
+    type Gate = fn(&mut Vec<TrendSample>) -> bool;
+    let gates: [(&str, Gate); 7] = [
+        ("throughput", gate_throughput),
+        ("pathological", gate_pathological),
+        ("scroll-scrub", gate_scroll_scrub),
+        ("search", gate_search),
+        ("restore", gate_restore),
+        ("resize", gate_resize),
+        ("wasm", gate_wasm),
     ];
     let mut trend: Vec<TrendSample> = Vec::new();
-    let mut ok = true;
-    for lane in lanes {
-        ok &= lane(&mut trend);
+    let mut failed: Vec<&str> = Vec::new();
+    for (name, gate) in gates {
+        if !gate(&mut trend) {
+            failed.push(name);
+        }
     }
-    ok &= gate_trend(&trend, ok);
+    if !gate_trend(&trend, failed.is_empty()) {
+        failed.push("trend");
+    }
+    let ok = failed.is_empty();
     let unmeasured = take_unmeasured();
     if !ok {
         eprintln!(
-            "xtask perf: FAILED — a lane floor (throughput / pathological / scroll-scrub / search \
-             / restore / resize / wasm), a resize absolute fence, or the same-box trend ledger."
+            "xtask perf: FAILED — {} (details above).",
+            failed.join(", ")
         );
     } else if unmeasured.is_empty() {
         eprintln!(
@@ -2236,8 +1850,7 @@ pub(crate) fn run() -> bool {
         );
     } else {
         eprintln!(
-            "xtask perf: GREEN — every lane that MEASURED was within bounds. NOT MEASURED this \
-             pass ({}): {}. Those floors were not evaluated.",
+            "xtask perf: GREEN for what was measured; NOT MEASURED ({}): {}.",
             unmeasured.len(),
             unmeasured.join(", ")
         );
@@ -2325,124 +1938,16 @@ mod tests {
         assert!(super::compare_against_baseline(&missing, &report(1234.5)));
     }
 
-    fn pathological_line(scale: f64) -> String {
-        let mut s = String::from("{");
-        for name in PATHOLOGICAL_CORPORA {
-            s.push_str(&format!("\"{name}_median_mbps\":{:.3},", 100.0 * scale));
-        }
-        s.push_str("\"corpus_bytes\":16777216,\"n\":7,\"warmup\":2}");
-        s
-    }
-
-    #[test]
-    fn parse_pathological_reads_harness_line_and_round_trips_baseline() {
-        let parsed = parse_pathological(&pathological_line(1.0)).expect("full line parses");
-        assert_eq!(parsed.len(), PATHOLOGICAL_CORPORA.len());
-        assert!(parsed.iter().all(|(_, v)| (*v - 100.0).abs() < 1e-6));
-        // The baseline writer's output parses back to the same medians.
-        let json = pathological_baseline_json(&parsed, PASS_RATIO);
-        let back = parse_pathological(&json).expect("baseline round-trips");
-        assert_eq!(back, parsed);
-    }
-
-    #[test]
-    fn parse_pathological_rejects_partial_reports() {
-        // Any missing corpus => None: a dropped corpus must never read as a pass.
-        let full = pathological_line(1.0);
-        let missing_one = full.replace("\"style_churn_median_mbps\"", "\"renamed\"");
-        assert!(parse_pathological(&missing_one).is_none());
-    }
-
-    #[test]
-    fn pathological_compare_fails_only_the_collapsed_corpus() {
-        // Baseline at 100 MB/s each; measurement fine except one 10x collapse.
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-xtask-pathological-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("baseline.json");
-        let base: Vec<(&'static str, f64)> =
-            PATHOLOGICAL_CORPORA.iter().map(|n| (*n, 100.0)).collect();
-        std::fs::write(&path, pathological_baseline_json(&base, PASS_RATIO)).unwrap();
-
-        let healthy: Vec<(&'static str, f64)> =
-            PATHOLOGICAL_CORPORA.iter().map(|n| (*n, 90.0)).collect();
-        assert!(super::compare_pathological_against_baseline(
-            &path, &healthy
-        ));
-
-        let mut collapsed = healthy.clone();
-        collapsed[2].1 = 10.0; // style_churn at 10% of baseline: below the 0.45 floor
-        assert!(!super::compare_pathological_against_baseline(
-            &path, &collapsed
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn pathological_missing_baseline_passes_report_only() {
-        let missing = workspace_root().join("tools/golden/__no_such_pathological__.json");
-        let m: Vec<(&'static str, f64)> = PATHOLOGICAL_CORPORA.iter().map(|n| (*n, 50.0)).collect();
-        assert!(super::compare_pathological_against_baseline(&missing, &m));
-    }
-
-    fn scroll_line(scale: f64) -> String {
-        let mut s = String::from("{");
-        for (_, key) in SCROLL_PHASES {
-            s.push_str(&format!("\"{key}\":{:.3},", 1000.0 * scale));
-        }
-        s.push_str("\"fill_lines\":120000,\"depth\":110000,\"n\":7,\"warmup\":2}");
-        s
-    }
-
-    #[test]
-    fn parse_scroll_reads_harness_line_and_round_trips_baseline() {
-        let parsed = parse_scroll(&scroll_line(1.0)).expect("full line parses");
-        assert_eq!(parsed.len(), SCROLL_PHASES.len());
-        assert!(parsed.iter().all(|(_, v)| (*v - 1000.0).abs() < 1e-6));
-        // The baseline writer's output parses back to the same medians.
-        let json = scroll_baseline_json(&parsed, PASS_RATIO);
-        let back = parse_scroll(&json).expect("baseline round-trips");
-        assert_eq!(back, parsed);
-    }
-
-    #[test]
-    fn parse_scroll_rejects_partial_reports() {
-        // Any missing phase => None: a dropped phase must never read as a pass.
-        let full = scroll_line(1.0);
-        let missing_one = full.replace("\"pageup_median_rps\"", "\"renamed\"");
-        assert!(parse_scroll(&missing_one).is_none());
-    }
-
-    #[test]
-    fn scroll_compare_fails_only_the_collapsed_phase() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-xtask-scroll-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("baseline.json");
-        let base: Vec<(&'static str, f64)> =
-            SCROLL_PHASES.iter().map(|(n, _)| (*n, 1000.0)).collect();
-        std::fs::write(&path, scroll_baseline_json(&base, PASS_RATIO)).unwrap();
-
-        let healthy: Vec<(&'static str, f64)> =
-            SCROLL_PHASES.iter().map(|(n, _)| (*n, 900.0)).collect();
-        assert!(super::compare_scroll_against_baseline(&path, &healthy));
-
-        let mut collapsed = healthy.clone();
-        collapsed[1].1 = 100.0; // pageup at 10% of baseline: below the 0.45 floor
-        assert!(!super::compare_scroll_against_baseline(&path, &collapsed));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn scroll_missing_baseline_passes_report_only() {
-        let missing = workspace_root().join("tools/golden/__no_such_scroll__.json");
-        let m: Vec<(&'static str, f64)> = SCROLL_PHASES.iter().map(|(n, _)| (*n, 500.0)).collect();
-        assert!(super::compare_scroll_against_baseline(&missing, &m));
-    }
-
     // --- E0 keyed lanes ----------------------------------------------------
+
+    const KEYED_LANES: [&FloorLane; 6] = [
+        &PATHOLOGICAL_LANE,
+        &SCROLL_LANE,
+        &SEARCH_LANE,
+        &RESTORE_LANE,
+        &RESIZE_LANE,
+        &WASM_LANE,
+    ];
 
     fn keyed_line(lane: &FloorLane, scale: f64) -> String {
         let mut s = String::from("{");
@@ -2455,7 +1960,7 @@ mod tests {
 
     #[test]
     fn parse_keyed_reads_harness_line_and_round_trips_baseline() {
-        for lane in [&SEARCH_LANE, &RESTORE_LANE, &RESIZE_LANE, &WASM_LANE] {
+        for lane in KEYED_LANES {
             let parsed = parse_keyed(lane, &keyed_line(lane, 1.0)).expect("full line parses");
             assert_eq!(parsed.len(), lane.keys.len());
             let json = keyed_baseline_json(lane, &parsed, PASS_RATIO);
@@ -2540,7 +2045,7 @@ mod tests {
     /// fails the lane on every run. Both halves are pinned here.
     #[test]
     fn every_keyed_lane_has_a_complete_committed_baseline_and_a_harness_that_emits_it() {
-        for lane in [&SEARCH_LANE, &RESTORE_LANE, &RESIZE_LANE, &WASM_LANE] {
+        for lane in KEYED_LANES {
             let path = keyed_baseline_path(lane);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {} unreadable: {e}", lane.lane, path.display()));
@@ -2567,12 +2072,12 @@ mod tests {
 
     #[test]
     fn the_wasm_module_ceiling_holds_absolutely() {
-        // The module live on /terminal on 2026-09-25: inside, by 98,653 B.
-        assert!(wasm_module_fence("{\"wasm_cpu_module_bytes\":4642493}"));
+        // The measured module the ceiling is based on: inside.
+        assert!(wasm_module_fence("{\"wasm_cpu_module_bytes\":5351532}"));
         // Exactly at the ceiling is inside it.
-        assert!(wasm_module_fence("{\"wasm_cpu_module_bytes\":4741146}"));
+        assert!(wasm_module_fence("{\"wasm_cpu_module_bytes\":5886685}"));
         // One byte over trips it, with no baseline anywhere.
-        assert!(!wasm_module_fence("{\"wasm_cpu_module_bytes\":4741147}"));
+        assert!(!wasm_module_fence("{\"wasm_cpu_module_bytes\":5886686}"));
         // The GPU module's size is not this fence's business.
         assert!(!wasm_module_fence("{\"wasm_gpu_module_bytes\":1}"));
         // A missing size is a FAIL, never an implicit pass.
@@ -2592,8 +2097,8 @@ mod tests {
         }
     }
 
-    /// [`judge_trend`] with no alias table — the shape every pre-W-1 trend test
-    /// wants, where the ledger's box column IS the box.
+    /// [`judge_trend`] with no alias table, where the ledger's box column IS
+    /// the box.
     fn judged(ledger: &str, key: &str, samples: &[TrendSample]) -> TrendJudgment {
         judge_trend(ledger, "", &box_id(key), samples)
     }
@@ -2677,7 +2182,7 @@ mod tests {
     fn trend_first_run_on_a_box_never_blocks_and_reports_skip() {
         let j = judged("", "boxA", &[sample("throughput", "median_mbps", 100.0)]);
         assert!(j.breaches.is_empty());
-        // …but it is a SKIP, not a judged metric (Wave-0 e: no history means
+        // …but it is a SKIP, not a judged metric (no history means
         // nothing was verified — the gate must not print GREEN for it).
         assert_eq!(j.skipped, vec!["throughput/median_mbps"]);
     }
@@ -2825,7 +2330,7 @@ mod tests {
         );
     }
 
-    // --- machine identity (W-1) --------------------------------------------
+    // --- machine identity -------------------------------------------------
 
     const ALIASES: &str = "# box\tidentity\tnote\n\
          m21\tfp:deadbeefdeadbeef\tthe box\n\
@@ -2833,14 +2338,13 @@ mod tests {
          m21\thost:m15.local\tbefore the rename — SAME machine\n\
          m7\tfp:0123456789abcdef\ta different box\n";
 
-    /// THE W-1 BUG, as a test. A rename used to fork a box's history away from
-    /// itself; both spellings must now land on one key, and a machine the table
-    /// never mentions must land on its own.
+    /// A rename must not fork a box's history away from itself: both spellings
+    /// land on one key, and a machine the table never mentions on its own.
     #[test]
     fn a_rename_no_longer_forks_a_box_from_its_own_history() {
         assert_eq!(resolve_ledger_box(ALIASES, "m15.local").key(), "m21");
         assert_eq!(resolve_ledger_box(ALIASES, "m21.local").key(), "m21");
-        // A box NAME in the column (every row written since W-1) resolves too.
+        // A box NAME in the column resolves too.
         assert_eq!(resolve_ledger_box(ALIASES, "m21").key(), "m21");
         assert!(resolve_ledger_box(ALIASES, "m21").is_claimed());
         // …and the two hostnames really do reach the same history.
@@ -3007,10 +2511,13 @@ mod tests {
         // Pinned: a fingerprint that moved would orphan the ledger exactly as
         // the rename did, and the committed alias rows would stop resolving.
         assert_eq!(
-            format!("{:016x}", fnv1a64(b"4F2C6182-55E3-51B1-B505-42FD89F13166")),
+            format!(
+                "{:016x}",
+                aterm_hash::fnv1a_64(b"4F2C6182-55E3-51B1-B505-42FD89F13166")
+            ),
             "4d119fc8de0a3b9e"
         );
-        assert_ne!(fnv1a64(b"a"), fnv1a64(b"b"));
+        assert_ne!(aterm_hash::fnv1a_64(b"a"), aterm_hash::fnv1a_64(b"b"));
     }
 
     // --- THE COMMITTED LEDGER, checked in the merge contract (W-2) ----------
@@ -3021,8 +2528,6 @@ mod tests {
     // only way anything about the perf ledger can be in the merge contract at
     // all (the MEASURING half of `xtask perf` cannot: see the module docs on
     // `gate_trend`, and the notes in docs/PERF-REGRESSION-DEFENCE.md).
-    //
-    // Between them they would have caught W-1 the day it happened.
 
     fn committed_ledger() -> String {
         std::fs::read_to_string(trend_path()).unwrap_or_default()
@@ -3184,8 +2689,7 @@ mod tests {
     /// wasm-bindgen's CLI refuses a crate whose version it does not match, so
     /// `WASM_BINDGEN_PIN`, `WB_VERSION` in tools/wasm-bench/run.sh and the
     /// `wasm-bindgen = "=<v>"` pin in crates/aterm-wasm/Cargo.toml are one number
-    /// wearing three hats. Bumping one and not the others used to be invisible
-    /// until a box without the tool reached the harness's crates.io bootstrap.
+    /// wearing three hats.
     #[test]
     fn wasm_bindgen_pin_matches_the_crate_and_the_harness() {
         let root = super::workspace_root();

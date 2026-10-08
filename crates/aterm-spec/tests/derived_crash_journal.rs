@@ -7,22 +7,9 @@
 //! invariant; the owner's ends are walked the way a person meets them. Tier-1 is
 //! `aterm-gui/src/crash_journal_conformance.rs`.
 
-use aterm_spec::derive::{Model, crash_journal_claim_model};
+use crate::walk::{only, walk};
+use aterm_spec::derive::crash_journal_claim_model;
 use aterm_spec::{interp, verify};
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
-
-fn walk(m: &Model, actions: &[&str]) -> interp::State {
-    let mut state = m.init_state();
-    for action in actions {
-        assert!(m.fire(action, &mut state), "{action}: {state:?}");
-    }
-    state
-}
 
 #[test]
 fn crash_journal_claim_proves_and_catches() {
@@ -41,6 +28,7 @@ fn crash_journal_claim_proves_and_catches() {
         "Write",
         "Settle",
         "Quit",
+        "WriteQuitLayout",
         "HandOff",
         "Die",
         "Crash",
@@ -56,6 +44,9 @@ fn crash_journal_claim_proves_and_catches() {
         !committed.contains(&"FinishWrite"),
         "a committed write is one step: {committed:?}"
     );
+    for action in ["Adopt", "SuccessorDies"] {
+        assert!(committed.contains(&action), "{action}: {committed:?}");
+    }
     verify::prove_and_catch_scalar(
         &model,
         "crash journal: taken once, never live, only after an unclean end, never looped, never lost",
@@ -96,6 +87,38 @@ fn crash_journal_claim_walks_the_ends_the_way_a_person_meets_them() {
         (handed_off["claims"], handed_off["applied"]),
         (1, 0),
         "the update parent's journal is taken and set aside: {handed_off:?}"
+    );
+
+    // A quit cut short after its `session.toml` and before its journal went
+    // (finding 48's review): the journal is taken and set aside — its desk
+    // comes back once, as the quit layout — however the run then died.
+    for end in ["Die", "Crash"] {
+        let cut = walk(&m, &["BootFresh", "Write", "WriteQuitLayout", end, "Claim"]);
+        assert_eq!(
+            (cut["claims"], cut["applied"]),
+            (1, 0),
+            "a quit cut short by {end} is not reopened twice: {cut:?}"
+        );
+    }
+
+    // ROUND EIGHT, FINDING 45: the successor runs on the live sessions only
+    // once the parent's image is its own, so it can end before the take-over
+    // only when there was nothing to take; after it, its end is the owner's.
+    let waiting = walk(&m, &["BootFresh", "Write", "HandOff"]);
+    assert!(
+        !m.action_enabled("SuccessorDies", &waiting),
+        "the successor takes the image over before it runs: {waiting:?}"
+    );
+    let nothing_to_take = walk(&m, &["BootFresh", "HandOff", "SuccessorDies"]);
+    assert_eq!(nothing_to_take["lost"], 0, "{nothing_to_take:?}");
+    let adopted_died = walk(
+        &m,
+        &["BootFresh", "Write", "HandOff", "Adopt", "Die", "Claim"],
+    );
+    assert_eq!(
+        (adopted_died["applied"], adopted_died["lost"]),
+        (1, 0),
+        "a successor killed after its take-over reopens the desk: {adopted_died:?}"
     );
 
     let running = walk(&m, &["BootFresh", "Write"]);
@@ -198,6 +221,27 @@ fn crash_journal_claim_the_defects_are_caught_on_every_invariant() {
         (1, 1, 0),
         "a published layout gone when its owner died mid-rewrite: {lost:?}"
     );
+
+    // ROUND EIGHT OF THE UPDATE AUDIT, FINDING 45: the Commit waiter that
+    // releases the readers before the take-over runs the new build on the
+    // live sessions while the desk on disk is the parent's clean end; a death
+    // there loses it.
+    let released_first = walk(
+        &m,
+        &[
+            "BootFresh",
+            "Write",
+            "FinishWrite",
+            "HandOff",
+            "SuccessorDies",
+        ],
+    );
+    assert_eq!(
+        (released_first["lost"], released_first["image"]),
+        (1, 1),
+        "the parent's image left behind a dead successor: {released_first:?}"
+    );
+    assert!(!m.check_invariant("NoLoss", &released_first));
 
     assert!(verify::uncaught_invariants(&crash_journal_claim_model()).is_empty());
 }

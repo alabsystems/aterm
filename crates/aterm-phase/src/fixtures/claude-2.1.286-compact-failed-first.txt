@@ -1,0 +1,36 @@
+# claude-code 2.1.286 · MEASURED 2026-10-01, `aterm ctl text` of a private headless aterm (144x50) on origin/main 9215c99b1, the managed 2.1.286 launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL` pointing at a local stub of the API · the FIRST failed `/compact` after that wall (the stub 400s the compaction request too): `❯ /compact` over `⎿  Compaction failed · conversation could not be reduced below the context limit`, no done row after it, the wall's own row history above the echo · scratch path redacted at equal length
+ ▐▛███▛█   Claude Code v2.1.286
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ first normal turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Cooked for 0s · done 1:31 AM
+
+❯ second normal turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Brewed for 0s · done 1:31 AM
+
+❯ third normal turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 3)
+
+✻ Worked for 0s · done 1:31 AM
+
+❯ fourth turn: the stub says the prompt is too long
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Baked for 0s · done 1:31 AM
+
+❯ /compact
+  ⎿  Compaction failed · conversation could not be reduced below the context limit
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

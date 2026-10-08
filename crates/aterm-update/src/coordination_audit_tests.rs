@@ -1,18 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Multi-process coordination audit (2026-09-14): laws the shared `Updates/`
-//! ledgers must obey when the window, N terminal-session checkers and a one-shot
-//! `aterm update check` all read and write them. Every test here was RED against
-//! the tree it was written on; the wrong behaviour each pins is named on the test.
+//! Laws the shared `Updates/` ledgers obey when the window, N terminal-session
+//! checkers and a one-shot `aterm update check` all read and write them.
 
 use std::path::PathBuf;
 
 use crate::health::Health;
 
-// The two ledger laws this audit also found — an apply-lane status write is not a
-// completed check, and a stamp ahead of the clock defers nothing — are pinned against
-// the check receipt in `check_channel_audit_tests.rs`.
+// An apply-lane status write is not a completed check, and a stamp ahead of the
+// clock defers nothing: both are pinned in `check_channel_audit_tests.rs`.
 
 fn health_path(name: &str) -> PathBuf {
     let dir =
@@ -22,21 +19,12 @@ fn health_path(name: &str) -> PathBuf {
     dir.join("health.toml")
 }
 
-/// FINDING: a sibling process still running an OLDER build expires the apply
-/// streak the window recorded on the build actually installed.
-///
-/// `expire_stale_apply_streak` runs at the top of EVERY process's check
-/// (`check_and_stage_inner`), and zeroes the streak whenever the caller's build
-/// differs from `last_apply_failure_build`. Its premise — "the machine moved" —
-/// holds for a process on a NEWER build. It does not hold for a straggler: an
-/// `aterm` session launched before a seamless self-update keeps running the old
-/// image for days (`bundle::resolve` still names `/Applications/aterm.app`, so its
-/// checker loop runs), and each of its checks erases the window's live streak.
-/// `failing_applies` then never reaches `PERSISTENT_AFTER`, the "auto-update is
-/// failing" notice never fires, `aterm-ctl update status` prints
-/// `failing_applies=0` beside a lane that fails every attempt, and
-/// `apply_failures_for_target` — the count the handoff's freeze budget reads —
-/// restarts from zero.
+/// A sibling process still running an OLDER build cannot expire the apply streak
+/// recorded on the installed build. `expire_stale_apply_streak` runs at the top of
+/// every process's check; a straggler session launched before a self-update keeps
+/// running the old image for days, and erasing the streak from it would keep
+/// `failing_applies` below `PERSISTENT_AFTER` and reset the freeze budget's
+/// `apply_failures_for_target`.
 #[test]
 fn an_older_sibling_process_cannot_expire_the_apply_streak_a_newer_build_recorded() {
     let p = health_path("straggler");

@@ -40,30 +40,77 @@ mod keychain;
 pub(crate) const KEYCHAIN_SERVICE: &str = "aterm-net-drive";
 
 /// Look up a saved connection by name (re-reads `aterm.toml`, so edits need no
-/// restart). `None` if there is no `[[net.connections]]` entry with that `name`,
-/// or the name is not a valid connection name (so it can never be dialed/stored).
-pub(crate) fn resolve(name: &str) -> Option<Connection> {
+/// restart). `Err` says why none matched: the name is not a usable connection
+/// name (so it can never be dialed/stored), `aterm.toml` does not load, or no
+/// `[[net.connections]]` record carries it.
+pub(crate) fn resolve(name: &str) -> Result<Connection, String> {
     if !valid_connection_name(name) {
-        return None;
+        return Err(format!(
+            "'{}' is not a usable connection name ([A-Za-z0-9_-] only)",
+            name.escape_debug()
+        ));
     }
-    let config = crate::app_config::load_config();
-    config.net?.connections.into_iter().find(|c| c.name == name)
+    pick_connection(name, saved_connections()?)
 }
 
-/// All DIALABLE saved connection names — only valid names, so `dial-list` never
-/// advertises a name `dial` would then reject.
-pub(crate) fn names() -> Vec<String> {
-    crate::app_config::load_config()
-        .net
-        .map(|net| dialable_names(net.connections))
-        .unwrap_or_default()
+/// The `dial-list` answer's text: every DIALABLE saved connection name — only
+/// valid names, so it never advertises a name `dial` would then reject — or
+/// why there is none. `Err`: `aterm.toml` does not load.
+pub(crate) fn dial_list() -> Result<String, String> {
+    Ok(dial_list_text(&saved_connections()?))
 }
 
-fn dialable_names(connections: Vec<Connection>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+fn dial_list_text(connections: &[Connection]) -> String {
+    let names = dialable_names(connections);
+    if connections.is_empty() {
+        "(no connections — add [[net.connections]] to aterm.toml)".to_owned()
+    } else if names.is_empty() {
+        "(no usable connection name — [[net.connections]] names are [A-Za-z0-9_-] only)".to_owned()
+    } else {
+        names.join(" ")
+    }
+}
+
+/// The `[[net.connections]]` records `aterm.toml` holds now.
+fn saved_connections() -> Result<Vec<Connection>, String> {
+    crate::app_config::net_config_now()
+        .map(|net| net.map(|net| net.connections).unwrap_or_default())
+        .map_err(|reason| {
+            format!("aterm.toml does not load ({reason}), so no connection can be read")
+        })
+}
+
+/// The record named `name` among `connections`, or why there is none.
+fn pick_connection(name: &str, connections: Vec<Connection>) -> Result<Connection, String> {
+    if connections.is_empty() {
+        return Err(format!(
+            "no connection '{name}': aterm.toml has no [[net.connections]]"
+        ));
+    }
+    let names = dialable_names(&connections);
     connections
         .into_iter()
-        .map(|connection| connection.name)
+        .find(|c| c.name == name)
+        .ok_or_else(|| {
+            if names.is_empty() {
+                format!(
+                    "no connection '{name}': no [[net.connections]] name in aterm.toml is \
+                     usable ([A-Za-z0-9_-] only)"
+                )
+            } else {
+                format!(
+                    "unknown connection '{name}' (configured: {})",
+                    names.join(", ")
+                )
+            }
+        })
+}
+
+fn dialable_names(connections: &[Connection]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    connections
+        .iter()
+        .map(|connection| connection.name.clone())
         .filter(|name| valid_connection_name(name) && seen.insert(name.clone()))
         .collect()
 }
@@ -178,9 +225,10 @@ pub(crate) fn resolve_token(conn: &Connection) -> Result<EdgeToken, String> {
             }
             Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => {} // not stored → try a file
             Err(e) => {
+                // `e` is the Security framework's own sentence for the status
+                // (`User interaction is not allowed.`): it names the cause.
                 return Err(format!(
-                    "Keychain error reading the token for '{}' ({e}); is the keychain locked \
-                     or access denied?",
+                    "Keychain could not read the drive token for '{}': {e}",
                     conn.name
                 ));
             }
@@ -196,26 +244,37 @@ pub(crate) fn resolve_token(conn: &Connection) -> Result<EdgeToken, String> {
     Err(provision_hint(&conn.name))
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The conventional `<directory>/<name>.token` that `dial-token` writes off
+/// macOS. Every error names the real path; only a file that does not exist gets
+/// the provisioning hint — one that exists and is refused (its mode, its
+/// contents) says what to fix instead. Compiled on macOS for its tests.
+#[cfg(any(test, not(target_os = "macos")))]
 fn resolve_conventional_file_token(
     conn: &Connection,
     directory: &std::path::Path,
 ) -> Result<EdgeToken, String> {
-    token_from_path(
-        &directory.join(format!("{}.token", conn.name)),
-        &format!("stored token for '{}'", conn.name),
-    )
-    .map_err(|error| format!("{error}; {}", provision_hint(&conn.name)))
+    let path = directory.join(format!("{}.token", conn.name));
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "no drive token for '{}' ({} does not exist); run: {}",
+            conn.name,
+            path.display(),
+            provision_command(&conn.name)
+        )),
+        _ => token_from_path(&path, &path.display().to_string()),
+    }
 }
 
+/// The connection's explicit `token_file`: its errors name the key it set.
 fn token_from_file(path: &str) -> Result<EdgeToken, String> {
-    token_from_path(&expand_tilde(path), path)
+    token_from_path(&expand_tilde(path), path).map_err(|e| format!("token_file {e}"))
 }
 
+/// Read the token at `path`; every error starts with `label` (the path as the
+/// reader knows it) and says nothing about which setting named it.
 fn token_from_path(path: &std::path::Path, label: &str) -> Result<EdgeToken, String> {
     let hex = read_token_file(path, label)?;
-    EdgeToken::from_hex(hex.trim())
-        .ok_or_else(|| format!("token_file {label} does not contain 64-char hex"))
+    EdgeToken::from_hex(hex.trim()).ok_or_else(|| format!("{label} does not contain 64-char hex"))
 }
 
 /// Upper bound on a `token_file` read. A legit token file is one 64-char hex line
@@ -242,29 +301,27 @@ fn read_token_file(p: &std::path::Path, path: &str) -> Result<String, String> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(p)
-        .map_err(|e| format!("token_file {path}: {e}"))?;
-    let meta = f
-        .metadata()
-        .map_err(|e| format!("token_file {path}: {e}"))?;
+        .map_err(|e| format!("{path}: {e}"))?;
+    let meta = f.metadata().map_err(|e| format!("{path}: {e}"))?;
     if !meta.file_type().is_file() {
         return Err(format!(
-            "token_file {path} is not a regular file (FIFO/device/directory refused)"
+            "{path} is not a regular file (FIFO/device/directory refused)"
         ));
     }
     let mode = meta.mode();
     if mode & 0o077 != 0 {
         return Err(format!(
-            "token_file {path} is group/world-accessible (mode {:o}); run `chmod 600 {path}`",
+            "{path} is group/world-accessible (mode {:o}); run `chmod 600 {path}`",
             mode & 0o777
         ));
     }
     let mut hex = String::new();
     f.take(TOKEN_FILE_MAX + 1)
         .read_to_string(&mut hex)
-        .map_err(|e| format!("token_file {path}: {e}"))?;
+        .map_err(|e| format!("{path}: {e}"))?;
     if hex.len() as u64 > TOKEN_FILE_MAX {
         return Err(format!(
-            "token_file {path} exceeds {TOKEN_FILE_MAX} bytes; not a token file"
+            "{path} exceeds {TOKEN_FILE_MAX} bytes; not a token file"
         ));
     }
     Ok(hex)
@@ -287,22 +344,20 @@ fn read_token_file(p: &std::path::Path, path: &str) -> Result<String, String> {
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(p)
-        .map_err(|e| format!("token_file {path}: {e}"))?;
-    let meta = f
-        .metadata()
-        .map_err(|e| format!("token_file {path}: {e}"))?;
+        .map_err(|e| format!("{path}: {e}"))?;
+    let meta = f.metadata().map_err(|e| format!("{path}: {e}"))?;
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(format!(
-            "token_file {path} is not a regular file (symlink/junction refused)"
+            "{path} is not a regular file (symlink/junction refused)"
         ));
     }
     let mut hex = String::new();
     f.take(TOKEN_FILE_MAX + 1)
         .read_to_string(&mut hex)
-        .map_err(|e| format!("token_file {path}: {e}"))?;
+        .map_err(|e| format!("{path}: {e}"))?;
     if hex.len() as u64 > TOKEN_FILE_MAX {
         return Err(format!(
-            "token_file {path} exceeds {TOKEN_FILE_MAX} bytes; not a token file"
+            "{path} exceeds {TOKEN_FILE_MAX} bytes; not a token file"
         ));
     }
     Ok(hex)
@@ -311,7 +366,7 @@ fn read_token_file(p: &std::path::Path, path: &str) -> Result<String, String> {
 #[cfg(not(any(unix, windows)))]
 fn read_token_file(p: &std::path::Path, path: &str) -> Result<String, String> {
     aterm_effects::file_feed::read_bounded_regular_utf8(p, TOKEN_FILE_MAX as usize)
-        .map_err(|e| format!("token_file {path}: {e}"))
+        .map_err(|e| format!("{path}: {e}"))
 }
 
 /// Provision a connection's drive token: into the macOS Keychain, else a 0600
@@ -329,7 +384,7 @@ pub(crate) fn store_token(name: &str, token_hex: &str) -> Result<String, String>
     }
     let token_hex = token_hex.trim();
     if EdgeToken::from_hex(token_hex).is_none() {
-        return Err("token must be 64-char hex (the remote's control token)".to_owned());
+        return Err(format!("token must be 64 hex digits {WHERE_THE_TOKEN_IS}"));
     }
     #[cfg(target_os = "macos")]
     {
@@ -417,17 +472,7 @@ pub(crate) fn dial_relay(
     client: &aterm_uds::CtlStream,
     prebuffer: &[u8],
 ) -> Result<(), String> {
-    let conn = resolve(name).ok_or_else(|| {
-        let avail = names();
-        if avail.is_empty() {
-            format!("unknown connection '{name}' (no [[net.connections]] in aterm.toml)")
-        } else {
-            format!(
-                "unknown connection '{name}' (configured: {})",
-                avail.join(", ")
-            )
-        }
-    })?;
+    let conn = resolve(name)?;
     let token = resolve_token(&conn)?;
     let pin = parse_fingerprint(&conn.fingerprint)
         .ok_or_else(|| format!("connection '{name}': fingerprint must be 64-char hex"))?;
@@ -463,23 +508,45 @@ pub(crate) fn dial_relay(
     aterm_net::drive::dial_and_relay_probed(
         &conn.host, ccfg, "dial", "drive", &token, prebuffer, local, endpoint, probe,
     )
-    .map_err(|e| format!("{}: {e}", conn.host))
+    .map_err(|e| dial_error(&conn, &e))
 }
 
-fn provision_hint(name: &str) -> String {
-    let dest = if cfg!(target_os = "macos") {
-        "stored in the macOS Keychain"
-    } else if cfg!(windows) {
-        "writes a token file under %APPDATA%\\aterm\\net"
+/// A failed dial's words: the host, then what happened. A refused drive token
+/// carries its remedy, since the connection's name is known only here.
+fn dial_error(conn: &Connection, e: &std::io::Error) -> String {
+    if aterm_net::is_token_refused(e) {
+        format!(
+            "{}: the remote refused the drive token for '{}'; re-provision it: {}",
+            conn.host,
+            conn.name,
+            provision_command(&conn.name)
+        )
     } else {
-        "writes a 0600 file"
-    };
+        format!("{}: {e}", conn.host)
+    }
+}
+
+/// `dial` with no drive token for `name`.
+fn provision_hint(name: &str) -> String {
     format!(
-        "no drive token for '{name}'. Provision it once with: \
-         aterm-ctl dial-token {name} <remote-control-token>  \
-         ({dest}), or set `token_file` on the connection."
+        "no drive token for '{name}'; run: {}",
+        provision_command(name)
     )
 }
+
+/// The one command that provisions `name`'s drive token, and where its value
+/// is: the listener checks its persistent drive token (`net_listen`'s lookup) —
+/// the per-launch control token only when that file is unusable. Its startup
+/// line prints the token (minted this launch, or per-launch) or names the file
+/// holding it, so that is where the person looks.
+fn provision_command(name: &str) -> String {
+    format!("aterm ctl dial-token {name} <token> {WHERE_THE_TOKEN_IS}")
+}
+
+/// Where a client finds the remote's drive token, true for every way the
+/// listener can come by it.
+const WHERE_THE_TOKEN_IS: &str =
+    "(the remote's listener prints it, or the file holding it, at startup)";
 
 #[cfg(test)]
 mod tests {
@@ -549,7 +616,7 @@ mod tests {
             expect_nonce: None,
         };
         assert_eq!(
-            dialable_names(vec![
+            dialable_names(&[
                 connection("work"),
                 connection("bad name"),
                 connection("work"),
@@ -557,6 +624,173 @@ mod tests {
             ]),
             ["work", "home"],
             "first configured name wins and output order remains stable"
+        );
+    }
+
+    /// `dial` and `dial-list` say why no connection matched, and never claim
+    /// "no [[net.connections]]" when the table is there: its only names are
+    /// unusable, or the file does not parse at all.
+    #[test]
+    fn no_match_is_said_as_the_case_it_is() {
+        let connection = |name: &str| Connection {
+            name: name.to_string(),
+            host: "127.0.0.1:7100".to_string(),
+            fingerprint: "00".repeat(32),
+            token_file: None,
+            sid: None,
+            expect_nonce: None,
+        };
+        assert_eq!(
+            pick_connection("work", Vec::new()).err().as_deref(),
+            Some("no connection 'work': aterm.toml has no [[net.connections]]")
+        );
+        assert_eq!(
+            pick_connection("work", vec![connection("work.box")])
+                .err()
+                .as_deref(),
+            Some(
+                "no connection 'work': no [[net.connections]] name in aterm.toml is usable \
+                 ([A-Za-z0-9_-] only)"
+            )
+        );
+        assert_eq!(
+            pick_connection("work", vec![connection("home"), connection("lab")])
+                .err()
+                .as_deref(),
+            Some("unknown connection 'work' (configured: home, lab)")
+        );
+        assert_eq!(
+            pick_connection("work", vec![connection("work")])
+                .map(|c| c.name)
+                .ok()
+                .as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            resolve("work.box").err().as_deref(),
+            Some("'work.box' is not a usable connection name ([A-Za-z0-9_-] only)")
+        );
+
+        assert_eq!(
+            dial_list_text(&[]),
+            "(no connections — add [[net.connections]] to aterm.toml)"
+        );
+        assert_eq!(
+            dial_list_text(&[connection("work.box")]),
+            "(no usable connection name — [[net.connections]] names are [A-Za-z0-9_-] only)"
+        );
+        assert_eq!(
+            dial_list_text(&[connection("work"), connection("home")]),
+            "work home"
+        );
+
+        // A file that does not parse says so, on one line, with the line it
+        // broke on — the stand-in config it used to fall back to has no `[net]`.
+        let broken = "[[net.connections]]\nname = \"work\"\nhost = \n";
+        let reason = crate::app_config::net_config_from_text(broken)
+            .err()
+            .expect("a broken file does not parse");
+        assert!(reason.starts_with("line 3: "), "{reason}");
+        assert!(!reason.contains('\n'), "{reason}");
+        let whole = "[[net.connections]]\nname = \"work\"\nhost = \"h:1\"\nfingerprint = \"x\"\n";
+        let net = crate::app_config::net_config_from_text(whole)
+            .unwrap()
+            .expect("the table is read");
+        assert_eq!(dialable_names(&net.connections), ["work"]);
+    }
+
+    /// The conventional `<name>.token` (what `dial-token` writes off macOS): each
+    /// refusal names the real path — never a label like `stored token for 'work'`
+    /// where a path belongs — and only a missing file is told to provision.
+    #[test]
+    #[cfg(unix)]
+    fn a_conventional_token_file_refusal_names_its_real_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-conventional-token-words-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let connection = Connection {
+            name: "work".to_string(),
+            host: "127.0.0.1:7100".to_string(),
+            fingerprint: "00".repeat(32),
+            token_file: None,
+            sid: None,
+            expect_nonce: None,
+        };
+        let path = dir.join("work.token");
+        let shown = path.display().to_string();
+
+        let missing = resolve_conventional_file_token(&connection, &dir).unwrap_err();
+        assert_eq!(
+            missing,
+            format!(
+                "no drive token for 'work' ({shown} does not exist); run: aterm ctl dial-token \
+                 work <token> (the remote's listener prints it, or the file holding it, at \
+                 startup)"
+            )
+        );
+
+        std::fs::write(&path, "cd".repeat(32)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let open = resolve_conventional_file_token(&connection, &dir).unwrap_err();
+        assert_eq!(
+            open,
+            format!("{shown} is group/world-accessible (mode 644); run `chmod 600 {shown}`")
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            resolve_conventional_file_token(&connection, &dir)
+                .unwrap()
+                .to_hex(),
+            "cd".repeat(32)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `dial-token` and the missing-token hint send the person to the remote
+    /// listener's startup line — it prints the token it checks, or names the
+    /// file holding it — never to the remote's control token, which a listener
+    /// with a usable drive token file answers DENIED.
+    #[test]
+    fn the_provisioning_words_point_at_the_listeners_startup_line() {
+        let bad = store_token("work", "not-hex").unwrap_err();
+        assert_eq!(
+            bad,
+            "token must be 64 hex digits (the remote's listener prints it, or the file holding \
+             it, at startup)"
+        );
+        let hint = provision_hint("work");
+        assert!(
+            hint.starts_with("no drive token for 'work'; run: aterm ctl dial-token work <token>"),
+            "{hint}"
+        );
+        assert!(!hint.contains("control"), "{hint}");
+        let conn = Connection {
+            name: "work".to_string(),
+            host: "work.example:7100".to_string(),
+            fingerprint: "00".repeat(32),
+            token_file: None,
+            sid: None,
+            expect_nonce: None,
+        };
+        let refused = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            aterm_net::TokenRefused,
+        );
+        assert_eq!(
+            dial_error(&conn, &refused),
+            "work.example:7100: the remote refused the drive token for 'work'; re-provision it: \
+             aterm ctl dial-token work <token> (the remote's listener prints it, or the file \
+             holding it, at startup)"
+        );
+        let other = std::io::Error::other("connection refused");
+        assert_eq!(
+            dial_error(&conn, &other),
+            "work.example:7100: connection refused"
         );
     }
 

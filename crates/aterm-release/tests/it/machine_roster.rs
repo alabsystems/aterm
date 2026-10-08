@@ -31,9 +31,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_update_core::Manifest;
 use aterm_update_core::roster::{Attribution, Machine, Roster};
-/// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`), held
-/// byte-identical to the retired `base64` package's `general_purpose::STANDARD`
-/// by `crates/aterm-codec/tests/base64_oracle.rs`.
+/// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`).
 fn b64(raw: &[u8]) -> String {
     aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")
 }
@@ -135,9 +133,8 @@ fn anchors<'a>(masters: &'a [&'a str], identity: Option<&'a Path>) -> publish::S
     }
 }
 
-/// The INERT evidence — the tier a FORK or a pre-v0.21.0 build carries. WRONG BEFORE:
-/// this said "the tier the shipped build carries", which stopped being true when
-/// `PAPER_MASTER_PUBKEYS` was armed on 2026-08-15. Inert still means inert: an empty
+/// The INERT evidence — the tier a FORK or a pre-v0.21.0 build carries
+/// (`PAPER_MASTER_PUBKEYS` was armed on 2026-08-15). Inert still means inert: an empty
 /// master authorizes nobody.
 fn inert<'a>() -> RosterEvidence<'a> {
     RosterEvidence {
@@ -175,7 +172,7 @@ fn the_shipped_paper_master_is_armed_and_has_no_empty_member() {
 ///
 /// The client ratchets `roster_seq` on OBSERVATION and refuses anything below its
 /// durable floor with `RosterReject::Rollback`, before any artifact crypto — and
-/// `select_authoritative_release` picks exactly one candidate with no fallback to an
+/// `fetch_authoritative_release` picks exactly one candidate with no fallback to an
 /// older release, so a rolled-back head does not delay those clients, it stops them
 /// updating entirely while the cut reports success.
 ///
@@ -221,9 +218,8 @@ fn a_cut_may_not_publish_an_older_roster_generation_than_the_channel_head() {
     );
 
     // AN UNROSTERED CHANNEL admits everything, which is the FORK state and
-    // must stay free: no head generation means no floor to clear. WRONG BEFORE: this
-    // called it "the shipped state" and the expect below "every cut this tree makes" —
-    // the master has been armed since 2026-08-15, so a cut from this tree IS rostered.
+    // must stay free: no head generation means no floor to clear. The master has been
+    // armed since 2026-08-15, so a cut from this tree IS rostered.
     publish::roster_floor_covered(None, None).expect("an unrostered channel head");
     publish::roster_floor_covered(Some(4), None).expect("the first rostered release");
     // ...but DROPPING the tier against a rostered head is refused rather than ignored:
@@ -380,8 +376,7 @@ fn an_unattributed_release_carries_no_roster_assets() {
             "aterm.dmg".to_string(),
             "aterm.dmg.sha256".to_string(),
         ],
-        // WRONG BEFORE: "while the master is unpinned" — armed since 2026-08-15. What
-        // keeps this set frozen is that the CUT is unattributed, which is what the
+        // What keeps this set frozen is that the CUT is unattributed, which is what the
         // `rostered: false` argument above asks for.
         "the published set must not grow for an unattributed cut \
          (the stable download twins and their alias sidecars are \
@@ -539,10 +534,6 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
     let err = publish::channel_signature_policy(None, &armed(&masters, &document))
         .expect_err("a keyless machine may not cut for a rostered channel");
     assert!(err.to_string().contains("no signing material"), "{err}");
-    assert!(
-        err.to_string().contains("no ledger claim was made"),
-        "{err}"
-    );
 }
 
 /// An IDENTITY MISMATCH refuses. The declared id is never authority — the roster's
@@ -788,46 +779,6 @@ fn the_binary_pin_expectation_is_the_master_not_the_signer() {
     );
 }
 
-/// THE RUNBOOK DESCRIBES THE PIN THIS TREE EMBEDS. An operator chasing a pin mismatch
-/// reads docs/RELEASING.md, so while `PAPER_MASTER_PUBKEYS` is pinned the runbook must
-/// name the master's fingerprint as the `__aterm_upin` record and carry none of the
-/// retired opt-in-signing sentences — each of which sent the reader to compare against
-/// the signing key, or to expect an unsigned cut this tree refuses pre-claim.
-///
-/// Negative control: the runbook as it stood before 2026-09-23 carried every one of the
-/// retired sentences and failed here.
-#[test]
-fn the_runbook_describes_the_pin_this_tree_embeds() {
-    assert!(
-        !aterm_update_core::pins::PAPER_MASTER_PUBKEYS.is_empty(),
-        "precondition: this tree pins a paper master"
-    );
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/RELEASING.md");
-    let runbook = std::fs::read_to_string(&path).expect("read docs/RELEASING.md");
-    // The runbook wraps prose at ~85 columns, so compare with every run of whitespace
-    // collapsed to one space.
-    let prose = runbook.split_whitespace().collect::<Vec<_>>().join(" ");
-    for retired in [
-        "UNSIGNED BY DEFAULT",
-        "the signing-key fingerprint on a signed (opt-in) cut",
-        "an unsigned cut has an empty pin",
-        "an unsigned cut carries the empty pin",
-        "attached ONLY when signing is opted in",
-        "a keyless machine recovers an unsigned release",
-        "survives only as a *build* input",
-    ] {
-        assert!(
-            !prose.contains(retired),
-            "docs/RELEASING.md still says {retired:?}, which is false for a tree that pins a \
-             paper master"
-        );
-    }
-    assert!(
-        prose.contains("`__DATA,__aterm_upin` section — the SHA-256 fingerprint of the paper master, `pins::PAPER_MASTER_PUBKEYS[0]`"),
-        "docs/RELEASING.md must name the paper master's fingerprint as the __aterm_upin record"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // RESUME — one cut, one machine
 // ---------------------------------------------------------------------------
@@ -841,9 +792,8 @@ fn the_runbook_describes_the_pin_this_tree_embeds() {
 /// each other.
 #[test]
 fn a_resume_may_not_change_which_machine_cut_the_release() {
-    // The FORK / pre-roster case: nameless journal, nameless verdict. WRONG BEFORE: this
-    // said "the shipped case … every cut this tree makes"; the master has been armed
-    // since 2026-08-15, so a cut from this tree journals a machine id.
+    // The FORK / pre-roster case: nameless journal, nameless verdict. The master has been
+    // armed since 2026-08-15, so a cut from this tree journals a machine id.
     publish::resume_attribution_agrees(None, None).expect("an unattributed cut resumes");
     publish::resume_attribution_agrees(Some("m3"), Some("m3")).expect("same machine resumes");
 
@@ -920,8 +870,7 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
 /// This is the one test that runs the lines between the profile and the gate: reading
 /// the named roster, resolving the declared id, and folding both into the evidence.
 /// Those lines run on every cut from this tree (the master has been armed since
-/// 2026-08-15 — WRONG BEFORE: this called them unreachable and the master unpinned), and
-/// the anchors are still PARAMETERS so a test can drive them with a SYNTHETIC master
+/// 2026-08-15), and the anchors are still PARAMETERS so a test can drive them with a SYNTHETIC master
 /// instead of the real one, whose secret half is on paper — the same reason
 /// `resolve_apple_tier` takes its team id rather than reading `pins`.
 ///

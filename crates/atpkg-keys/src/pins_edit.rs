@@ -7,12 +7,11 @@
 //!
 //! # Why this exists at all, given what it touches
 //!
-//! `pins.rs` is the file that decides what every shipped binary trusts. Until now the
-//! owner hand-edited it: read 44 base64 characters off a terminal, paste them into the
-//! anchor list, hope the paste was exact. That is a transcription step in the one place a
-//! transcription error is unrecoverable — a mangled anchor either bricks the channel or,
-//! worse, arms it with a key nobody holds. So the transcription is removed, and the
-//! removal is only an improvement if the writer is *more* careful than a human, not less.
+//! `pins.rs` is the file that decides what every shipped binary trusts. Hand-pasting 44
+//! base64 characters into it is a transcription step in the one place a transcription
+//! error is unrecoverable — a mangled anchor either bricks the channel or arms it with a
+//! key nobody holds. Replacing the human is only an improvement if the writer is *more*
+//! careful than a human, not less.
 //!
 //! # The five rules this writer obeys, and what each one is defending
 //!
@@ -49,6 +48,8 @@
 //!
 //! It does not commit, does not stage, and does not know what git is. Arming a trust
 //! anchor is a reviewed act: the tool edits the working tree and prints the diff to read.
+
+use crate::fsio::concat;
 
 /// The paper-master anchor's constant name — the one trust anchor this writer edits.
 pub const MASTER_ANCHOR: &str = "PAPER_MASTER_PUBKEYS";
@@ -135,25 +136,14 @@ impl Anchor {
     }
 }
 
-/// Build a message by concatenation. Same reason as the CLI's own helper: `format!`
-/// expands to inlined unsafe `fmt::Arguments` machinery that Trust cannot model and
-/// charges to the caller.
-fn cat(parts: &[&str]) -> String {
-    let mut s = String::new();
-    for p in parts {
-        s.push_str(p);
-    }
-    s
-}
-
 /// Refuse a value that is not a base64 Ed25519 public key, BEFORE it can reach the file.
 ///
-/// This is the same check `pins::tests::anchors_are_well_formed_base64_ed25519` runs, done
+/// This is the same check `pins::tests::the_master_is_a_well_formed_base64_ed25519_key` runs, done
 /// early: a truncated paste that lands in the file fails closed at runtime with no hint
 /// that the VALUE, not the state, is wrong — and by then it is committed.
 pub fn vet_key(key: &str) -> Result<(), String> {
     if key.len() != KEY_B64_LEN {
-        return Err(cat(&[
+        return Err(concat(&[
             "refusing to write \"",
             key,
             "\" into a trust anchor: an Ed25519 public key is exactly 44 base64 \
@@ -162,7 +152,7 @@ pub fn vet_key(key: &str) -> Result<(), String> {
         ]));
     }
     if !key.ends_with('=') {
-        return Err(cat(&[
+        return Err(concat(&[
             "refusing to write \"",
             key,
             "\" into a trust anchor: a 32-byte base64 key ends with one '=' of padding",
@@ -172,7 +162,7 @@ pub fn vet_key(key: &str) -> Result<(), String> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
     {
-        return Err(cat(&[
+        return Err(concat(&[
             "refusing to write \"",
             key,
             "\" into a trust anchor: it contains a non-base64 character",
@@ -257,7 +247,7 @@ fn lines_with_spans(src: &str) -> Vec<(&str, Span)> {
 /// them is guessed at.
 pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
     let lines = lines_with_spans(src);
-    let decl_prefix = cat(&["pub const ", name, ":"]);
+    let decl_prefix = concat(&["pub const ", name, ":"]);
 
     // A top-level item starts at column 0. Requiring that is what keeps this from ever
     // matching the constant's own name inside its (very long) doc comment.
@@ -272,7 +262,7 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
         }
     }
     if count == 0 {
-        return Err(cat(&[
+        return Err(concat(&[
             "no `pub const ",
             name,
             ": &[&str] = …` declaration at column 0 — this is not the pins.rs this tool \
@@ -280,7 +270,7 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
         ]));
     }
     if count > 1 {
-        return Err(cat(&[
+        return Err(concat(&[
             "found ",
             &count.to_string(),
             " declarations of `",
@@ -297,8 +287,8 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
         "\n"
     };
 
-    let open = cat(&["pub const ", name, ": &[&str] = &["]);
-    let empty = cat(&[open.as_str(), "];"]);
+    let open = concat(&["pub const ", name, ": &[&str] = &["]);
+    let empty = concat(&[open.as_str(), "];"]);
     let trimmed_decl = decl_text.trim_end();
     if trimmed_decl == empty {
         return Ok(Anchor {
@@ -311,7 +301,7 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
         });
     }
     if trimmed_decl != open {
-        return Err(cat(&[
+        return Err(concat(&[
             "the declaration of `",
             name,
             "` is spelled `",
@@ -354,7 +344,7 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
                 members.push(m);
             }
             None => {
-                return Err(cat(&[
+                return Err(concat(&[
                     "the body of `",
                     name,
                     "` contains a line this writer does not recognise: `",
@@ -365,7 +355,7 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
             }
         }
     }
-    Err(cat(&[
+    Err(concat(&[
         "`",
         name,
         "` opens a `&[` block that is never closed by a `];` at column 0 — refusing to \
@@ -424,7 +414,7 @@ pub fn append_member(
     // bad one would hide that rather than fix it.
     for (i, m) in anchor.members.iter().enumerate() {
         if m.is_empty() {
-            return Err(cat(&[
+            return Err(concat(&[
                 name,
                 "[",
                 &i.to_string(),
@@ -441,7 +431,7 @@ pub fn append_member(
         });
     }
     if anchor.members.len() + 1 > max_members {
-        return Err(cat(&[
+        return Err(concat(&[
             name,
             " already holds ",
             &anchor.members.len().to_string(),
@@ -508,10 +498,8 @@ pub fn append_member(
     // by the time it fires, the damaged bytes are on disk and the anchor may already be
     // armed. This is the same parse run against the string while it is still in memory, so
     // a plan this module cannot read back is refused with the working tree untouched.
-    // It is what turns the trailing-whitespace indent bug from "the anchor file is now not
-    // Rust" into "the run stopped and wrote nothing".
     verify_members(&text, name, &members).map_err(|e| {
-        cat(&[
+        concat(&[
             "the edit this writer planned for `",
             name,
             "` does not read back as the value it intended (",
@@ -537,10 +525,10 @@ pub fn append_member(
 /// "nothing has been written" and "the file on disk may be damaged" are opposite
 /// instructions and printing the wrong one is worse than printing neither.
 pub fn verify_members(src: &str, name: &str, expected: &[String]) -> Result<(), String> {
-    let anchor =
-        read_anchor(src, name).map_err(|e| cat(&["`", name, "` could not be read back: ", &e]))?;
+    let anchor = read_anchor(src, name)
+        .map_err(|e| concat(&["`", name, "` could not be read back: ", &e]))?;
     if anchor.members.len() != expected.len() {
-        return Err(cat(&[
+        return Err(concat(&[
             "`",
             name,
             "` holds ",
@@ -552,7 +540,7 @@ pub fn verify_members(src: &str, name: &str, expected: &[String]) -> Result<(), 
     }
     for (i, (got, want)) in anchor.members.iter().zip(expected.iter()).enumerate() {
         if got != want {
-            return Err(cat(&[
+            return Err(concat(&[
                 "`",
                 name,
                 "[",
@@ -752,12 +740,9 @@ mod tests {
 
     /// TRAILING WHITESPACE ON A NEIGHBOURING LINE DOES NOT REACH THE APPENDED ONE.
     ///
-    /// The indent used to be `text.len() - text.trim().len()` bytes taken from the START of
-    /// the line, so trailing whitespace lengthened the slice into the line's CONTENT. Three
-    /// spaces after an existing key made the indent `    "cw`, and every line this writer
-    /// emitted carried those bytes as its prefix — a `pins.rs` that is not Rust, written
-    /// over a trust anchor, and (in `setup`) discovered only after the anchor had been
-    /// armed with a master whose phrase the operator had not yet been shown.
+    /// An indent measured as `text.len() - text.trim().len()` from the START of the line
+    /// would count trailing whitespace and slice into the line's CONTENT, emitting a
+    /// `pins.rs` that is not Rust over a trust anchor.
     #[test]
     fn trailing_whitespace_on_a_neighbouring_line_does_not_poison_the_indent() {
         // Trailing whitespace after the comment, after the key, and after the declaration.

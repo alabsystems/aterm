@@ -4,9 +4,7 @@
 
 use super::*;
 
-// ========================================================================
 // Direct tests for unsafe get_unchecked / get_unchecked_mut
-// ========================================================================
 
 #[test]
 fn get_unchecked_valid_read() {

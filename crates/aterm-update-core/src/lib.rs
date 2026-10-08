@@ -38,7 +38,7 @@
 
 pub mod cdn;
 pub mod codesign;
-/// The successor's signed handoff policy (plan P0-5): the release cutter seals it into
+/// The successor's signed handoff policy: the release cutter seals it into
 /// the bundle, the outgoing build reads it from the verified candidate.
 pub mod handoff_policy;
 pub mod linux;
@@ -51,6 +51,7 @@ pub mod seal_guard;
 pub mod settings;
 pub mod tag;
 
+mod durable;
 mod hash;
 mod http;
 mod privatedir;
@@ -59,26 +60,26 @@ mod source;
 mod sys;
 
 pub use hash::sha256_file;
+#[cfg(all(unix, not(target_os = "linux")))]
+pub use hash::{shasum_command, shasum_digest};
 pub use http::{
     HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, VendorResponse, download_bytes,
-    download_error_is_not_found, download_error_is_rate_limit, download_to, download_to_resumable,
-    download_to_resumable_https_only, head_no_redirect, head_no_redirect_quick,
-    vendor_content_length, vendor_download_to, vendor_get, vendor_get_hint,
+    download_error_is_local_write, download_error_is_not_found, download_error_is_rate_limit,
+    download_to, download_to_resumable, download_to_resumable_https_only, head_no_redirect,
+    head_no_redirect_quick, vendor_content_length, vendor_download_to, vendor_get, vendor_get_hint,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;
 pub use roster::{Attribution, Machine, Roster, RosterReject, VerifiedRoster, verify_roster};
-pub use sentinel::Sentinel;
+pub use sentinel::{LaunchName, Sentinel};
 pub use source::{
-    ATPKG_INDEX_OWNER, DEFAULT_OWNER, DEFAULT_REPO, PUBLISH_OWNER, PUBLISH_REPO, Source,
-    is_valid_slug, pick_slug,
+    ATPKG_INDEX_OWNER, DEFAULT_OWNER, DEFAULT_REPO, PUBLISH_OWNER, PUBLISH_REPO,
+    REPOINT_IS_A_DEV_SEAM, Source, is_valid_slug, pick_slug,
 };
 pub use sys::{FileLock, same_volume};
 
-/// Emit a non-fatal updater warning to the app log. Routed through `aterm_log` (the
-/// global logger `aterm-gui` installs), with the same `aterm-update:` prefix the
-/// rest of the updater uses, so the output is unchanged. A no-op if no logger is
-/// installed (e.g. a dev harness).
+/// Emit a non-fatal updater warning to the app log (`aterm_log`, with the updater's
+/// `aterm-update:` prefix). A no-op if no logger is installed (e.g. a dev harness).
 pub(crate) fn warn(msg: &str) {
     aterm_log::warn!("aterm-update: {msg}");
 }

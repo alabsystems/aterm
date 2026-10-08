@@ -698,21 +698,14 @@ fn percent_decode(value: &str) -> Result<String, DocumentHostError> {
         if index + 2 >= bytes.len() {
             return Err(DocumentHostError::InvalidEncoding);
         }
-        let high = hex(bytes[index + 1]).ok_or(DocumentHostError::InvalidEncoding)?;
-        let low = hex(bytes[index + 2]).ok_or(DocumentHostError::InvalidEncoding)?;
+        let high =
+            aterm_codec::hex::nibble(bytes[index + 1]).ok_or(DocumentHostError::InvalidEncoding)?;
+        let low =
+            aterm_codec::hex::nibble(bytes[index + 2]).ok_or(DocumentHostError::InvalidEncoding)?;
         decoded.push(high << 4 | low);
         index += 3;
     }
     String::from_utf8(decoded).map_err(|_| DocumentHostError::InvalidEncoding)
-}
-
-const fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 pub(crate) fn path_to_file_uri(path: &Path) -> Result<String, DocumentHostError> {
@@ -1512,10 +1505,11 @@ fn write_lock_busy() -> String {
 ///     SYNCHRONOUSLY on the event-loop thread, where every millisecond was a dropped
 ///     frame on a keypress; that caller is gone. 25 ms is ~1.5 frames and ~20x the
 ///     worst measured fork window.
-///  2. `held_save_lock_returns_busy_and_retry_commits` asserts
-///     `started.elapsed() < Duration::from_secs(1)` around a whole commit. That is an
-///     absolute wall-clock deadline, and this repo has been bitten twice by such
-///     deadlines crossing under full-suite load. 25 ms spends 2.5% of it.
+///  2. No clock holds it small. `held_save_lock_returns_busy_and_retry_commits`
+///     bounds a whole refused commit by a hang detector (a minute), which catches a
+///     refusal that BLOCKS, not one that is merely slow: its old `< 1 s` deadline
+///     crossed under full-suite load twice. The size is pinned without a clock, by
+///     `the_event_loop_budget_stays_in_the_sibling_write_lock_class` (two frames).
 ///
 /// MITIGATION for a proven hazard, NOT a proven cure for the
 /// `repeated_save_during_inflight_checkpoint_persists_the_latest_sequence` flake: the
@@ -1523,8 +1517,8 @@ fn write_lock_busy() -> String {
 ///
 /// READ THE 200-ROUND FIGURE ABOVE AS "ORDINARY LOAD", NOT AS "WORST CASE". The same
 /// window measured at n=20000 under deliberately pathological load (loadavg 118 on 18
-/// cores) is p50 4.5 ms, p99 206 ms, MAX 523 ms — `aterm-pty/src/unix.rs:739-744`
-/// times exactly this interval, fork to the `O_CLOEXEC` status pipe's EOF at `execve`.
+/// cores) is p50 4.5 ms, p99 206 ms, MAX 523 ms — `aterm_pty`'s `EXEC_STATUS_BUDGET`
+/// doc times exactly this interval, fork to the `O_CLOEXEC` status pipe's EOF at `execve`.
 /// 25 ms does not cover that tail and is not asked to: on this path the tail is
 /// absorbed by [`PREFLIGHT_RETRY_BUDGET`], which re-runs the whole side-effect-free
 /// preflight (lock acquisition included) for up to 500 ms. A caller with no such
@@ -1547,8 +1541,8 @@ pub(crate) enum AdvisoryLockRefusal {
 
 /// THE bounded advisory-lock retry for this crate. Every `flock` contender —
 /// [`acquire_write_lock_within`] here, `native_document_journal::take_journal_lock`
-/// there — goes through this one loop with its own budget; there is no second
-/// implementation of the policy below.
+/// and `debugger_access::take_change_lock` there — goes through this one loop with
+/// its own budget; there is no second implementation of the policy below.
 ///
 /// Riding out a refusal at all is not optional. `flock(2)` binds to the OPEN FILE
 /// DESCRIPTION, not the process: "file descriptors duplicated through dup(2) or
@@ -1556,7 +1550,7 @@ pub(crate) enum AdvisoryLockRefusal {
 /// references to a single lock". A peer that forks while this lock is held hands the
 /// child a reference the holder's own `File::drop` cannot release, so the lock stays
 /// taken for the child's whole fork->execve window even with `O_CLOEXEC` set — and
-/// aterm forks for every shell (`aterm-pty/src/unix.rs:1698`, a hand-rolled `forkpty`).
+/// aterm forks for every shell (`aterm_pty::spawn_shell_with_pid`, a hand-rolled `forkpty`).
 /// A single-shot `try_lock` reports that residue as another owner, which is both a
 /// false diagnosis and a lost write.
 ///
@@ -1576,18 +1570,19 @@ pub(crate) enum AdvisoryLockRefusal {
 ///  * The budget is a CEILING, never a floor: `budget` is the most this can cost,
 ///    and the caller — not this function — decides how much its thread can afford.
 pub(crate) fn acquire_advisory_lock_within(
-    lock_file: &File,
+    mut lock_file: File,
     budget: std::time::Duration,
-) -> Result<(), AdvisoryLockRefusal> {
+) -> Result<HeldAdvisoryLock, AdvisoryLockRefusal> {
     let deadline = std::time::Instant::now() + budget;
     let mut backoff = std::time::Duration::from_millis(1);
     loop {
-        match lock_file.try_lock() {
-            Ok(()) => return Ok(()),
-            Err(std::fs::TryLockError::Error(error)) => {
+        match HeldAdvisoryLock::try_lock_keeping(lock_file) {
+            Ok(held) => return Ok(held),
+            Err((_, std::fs::TryLockError::Error(error))) => {
                 return Err(AdvisoryLockRefusal::Failed(error));
             }
-            Err(std::fs::TryLockError::WouldBlock) => {
+            Err((refused, std::fs::TryLockError::WouldBlock)) => {
+                lock_file = refused;
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     return Err(AdvisoryLockRefusal::Busy);
@@ -1599,9 +1594,13 @@ pub(crate) fn acquire_advisory_lock_within(
     }
 }
 
-/// An advisory lock this crate took — through [`acquire_advisory_lock_within`], or
-/// a single `try_lock` (the Kitty Log's ledger pair, `aterm.log`'s rotation lock)
-/// — released by `LOCK_UN` when this drops, not by the close alone. The retry
+/// An advisory lock this crate took — through [`acquire_advisory_lock_within`],
+/// [`Self::try_lock`] (the Kitty Log's ledger pair, `aterm.log`'s rotation lock, the
+/// dead-instance sweep's lease probe) or [`Self::lock`] (the restore manifest) —
+/// released by `LOCK_UN` when this drops, not by the close alone. Take a lock
+/// through these and it is never held by a bare `File`: everywhere else the
+/// workspace's `clippy.toml` fences `File::lock`/`try_lock` (the flock release
+/// rule). The retry
 /// above rides out a PEER'S fork residue; this removes OUR OWN. A child another
 /// thread forks while the lock is held holds a copy of every descriptor until it
 /// execs, so a lock released only by the close stays taken on that copy for the
@@ -1612,12 +1611,50 @@ pub(crate) fn acquire_advisory_lock_within(
 /// `LOCK_UN` releases the open file description itself, the child's copy included
 /// (the product fd-hygiene sweep of 2026-09-27). One `Drop` covers every exit,
 /// early refusals included.
+#[derive(Debug)]
 pub(crate) struct HeldAdvisoryLock(File);
 
 impl HeldAdvisoryLock {
-    /// Adopt `lock_file`, which the caller has just locked.
-    pub(crate) fn adopt(lock_file: File) -> Self {
-        Self(lock_file)
+    /// Take `lock_file`'s exclusive lock without waiting: the held guard, or why
+    /// not (`WouldBlock` when another description holds it). A refused file is
+    /// dropped holding nothing.
+    pub(crate) fn try_lock(lock_file: File) -> Result<Self, std::fs::TryLockError> {
+        Self::try_lock_keeping(lock_file).map_err(|(_, refusal)| refusal)
+    }
+
+    /// [`Self::try_lock`], handing a refused file back beside the refusal: for a
+    /// caller that waits and tries the same description again.
+    pub(crate) fn try_lock_keeping(lock_file: File) -> Result<Self, (File, std::fs::TryLockError)> {
+        // The ascription is the lock-order census's File evidence.
+        let lock_file: std::fs::File = lock_file;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        let taken = lock_file.try_lock();
+        match taken {
+            Ok(()) => Ok(Self(lock_file)),
+            Err(refusal) => Err((lock_file, refusal)),
+        }
+    }
+
+    /// Take `lock_file`'s exclusive lock, WAITING for a holder to let go.
+    pub(crate) fn lock(lock_file: File) -> std::io::Result<Self> {
+        // The ascription is the lock-order census's File evidence.
+        let lock_file: std::fs::File = lock_file;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        lock_file.lock()?;
+        Ok(Self(lock_file))
+    }
+
+    /// The locked file: what the holder reads or writes under the lock (the
+    /// edge-token secret), and what a test copies to stand in for a forked
+    /// child's copy of the description.
+    pub(crate) fn file(&self) -> &File {
+        &self.0
     }
 }
 
@@ -1629,14 +1666,17 @@ impl Drop for HeldAdvisoryLock {
 
 /// The save path's rendering of [`acquire_advisory_lock_within`]: same loop, same
 /// rules, this module's vocabulary.
-fn acquire_write_lock_within(lock_file: &File, budget: std::time::Duration) -> Result<(), String> {
+fn acquire_write_lock_within(
+    lock_file: File,
+    budget: std::time::Duration,
+) -> Result<HeldAdvisoryLock, String> {
     acquire_advisory_lock_within(lock_file, budget).map_err(|refusal| match refusal {
         AdvisoryLockRefusal::Busy => write_lock_busy(),
         AdvisoryLockRefusal::Failed(error) => format!("could not acquire save lock: {error}"),
     })
 }
 
-fn acquire_write_lock(lock_file: &File) -> Result<(), String> {
+fn acquire_write_lock(lock_file: File) -> Result<HeldAdvisoryLock, String> {
     acquire_write_lock_within(lock_file, WRITE_LOCK_RETRY_BUDGET)
 }
 
@@ -1674,8 +1714,8 @@ fn acquire_write_lock(lock_file: &File) -> Result<(), String> {
 /// ms measured), so 500 ms is roughly 2x the worst observed hold rather than an
 /// arbitrary ceiling; an uncontended save never sleeps at all and is byte-for-byte as
 /// fast as before. And the alternative is not a faster save — it is a FAILED one:
-/// app_documents.rs:1710 turns a Preflight failure into a terminal error and :1765
-/// drops `pending_saves`, so the user's latest edits are silently never written. A
+/// `App::finish_native_document_save` turns a Preflight failure into a terminal error
+/// and drops `pending_saves`, so the user's latest edits are silently never written. A
 /// bounded hitch beats losing an edit.
 const PREFLIGHT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -1716,11 +1756,10 @@ fn lock_and_verify_target(
     let lock_path = parent.join(format!(".{}.aterm-write.lock", name.to_string_lossy()));
     let lock_file = open_write_lock(&lock_path)
         .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
-    acquire_write_lock(&lock_file)
-        .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
     // Every refusal below re-enters the preflight retry, whose next take must not
-    // meet this attempt's own fork residue.
-    let lock = HeldAdvisoryLock::adopt(lock_file);
+    // meet this attempt's own fork residue: the guard releases by LOCK_UN.
+    let lock = acquire_write_lock(lock_file)
+        .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
 
     if let Err(error) = validate_atomic_target(target) {
         return Err(atomic_validation_failure(
@@ -1796,7 +1835,7 @@ fn commit_atomic_bytes_with_seed(
         }
         file.write_all(bytes)
             .map_err(|error| atomic_failed(AtomicSaveStage::WriteTemporary, error.to_string()))?;
-        file.sync_all()
+        crate::durable::sync_all(&file)
             .map_err(|error| atomic_failed(AtomicSaveStage::SyncTemporary, error.to_string()))?;
         drop(file);
 
@@ -1916,9 +1955,7 @@ fn create_unique_temporary(
 fn next_temporary_seed() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
+    let nanos = aterm_time::since_epoch().map_or(0, |duration| duration.as_nanos() as u64);
     ordinal ^ nanos.rotate_left(17)
 }
 
@@ -1968,20 +2005,37 @@ fn atomic_published_unverified(
     }
 }
 
+/// Flush a directory entry change to the device. Shared with the draft journal
+/// (`native_document_journal`), whose replace path takes the same barrier.
+/// `O_NOFOLLOW` costs nothing here: a save's parent comes from a canonical,
+/// symlink-free target path.
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    crate::durable::sync_all(
+        &OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?,
+    )
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> std::io::Result<()> {
     // Windows rename durability is provided by the file replacement path; opening a
     // directory as a normal File is not portable there.
     Ok(())
 }
 
+/// Publish `temporary` at `target`: replace it when it existed, or create it only
+/// if it is still absent. Shared with the draft journal.
 #[cfg(not(windows))]
-fn replace_file(temporary: &Path, target: &Path, target_existed: bool) -> std::io::Result<()> {
+pub(crate) fn replace_file(
+    temporary: &Path,
+    target: &Path,
+    target_existed: bool,
+) -> std::io::Result<()> {
     if target_existed {
         fs::rename(temporary, target)
     } else {
@@ -1994,7 +2048,11 @@ fn replace_file(temporary: &Path, target: &Path, target_existed: bool) -> std::i
 }
 
 #[cfg(windows)]
-fn replace_file(temporary: &Path, target: &Path, target_existed: bool) -> std::io::Result<()> {
+pub(crate) fn replace_file(
+    temporary: &Path,
+    target: &Path,
+    target_existed: bool,
+) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
 
     const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
@@ -2022,7 +2080,7 @@ fn replace_file(temporary: &Path, target: &Path, target_existed: bool) -> std::i
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    // ReplaceFileW requires an existing destination. A first config save instead
+    // ReplaceFileW requires an existing destination. A first save instead
     // publishes the same-directory temporary with MoveFileExW; omitting
     // MOVEFILE_REPLACE_EXISTING also preserves the missing-file CAS if another
     // writer creates the destination after our final observation.
@@ -2272,7 +2330,7 @@ mod tests {
 
         const CHILD: &str = "ATERM_DOCUMENT_FIFO_TEST_CHILD";
         const PATH: &str = "ATERM_DOCUMENT_FIFO_TEST_PATH";
-        // The child says WHEN it reached the FIFO calls, so the deadline below bounds those
+        // The child says WHEN it reached the FIFO calls, so the wait below is for those
         // calls and not this machine's process startup. See the parent half for what that
         // cost measured.
         let started_marker = |fifo: &Path| fifo.with_file_name("child-reached-the-fifo");
@@ -2296,68 +2354,34 @@ mod tests {
         // SAFETY: `path_c` is a live NUL-terminated pathname and mkfifo retains
         // no pointer. The private path does not exist.
         assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
-        let test_name = std::thread::current()
-            .name()
-            .expect("test harness names the current test")
-            .to_string();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test_name, "--nocapture"])
-            .env(CHILD, "1")
-            .env(PATH, &path)
-            .spawn()
-            .unwrap();
-        // TWO BOUNDS, because they answer different questions and only one of them is this
+        let mut child = crate::test_alone::StandIn::this_test();
+        child.command().env(CHILD, "1").env(PATH, &path);
+        let mut child = [child.spawn()];
+        // TWO WAITS, because they answer different questions and only one of them is this
         // test's subject. What it guards is that opening a writerless FIFO does not block
-        // FOR EVER, so the 3 s below starts when the child says it got there — the marker
+        // FOR EVER, so the second wait starts when the child says it got there — the marker
         // it writes as its first act. Timing the child's whole life instead conflated the
-        // block with the cost of spawning a fresh copy of this test binary, and on a loaded
-        // 4-core Intel Mac (the merge gate runs six cargo lanes at once) that cost alone
-        // passed 3 s: measured 2026-09-17, the gate failed here with "blocked past the
-        // deadline" while the same test passed 3 runs in 1.4–3.7 s on the quiet machine.
-        // The startup bound is generous and says what it means when it fires: a child that
-        // never reaches the calls is a different defect from one that hangs in them.
+        // block with the cost of spawning a fresh copy of this test binary (measured
+        // 2026-09-17: a loaded gate failed a 3 s bound on that cost alone). Each is a hang
+        // detector, never a latency budget, and says what it means when it fires: a child
+        // that never reaches the calls is a different defect from one that hangs in them.
         let marker = started_marker(&path);
-        let start_by = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        let reached = loop {
-            if marker.exists() {
-                break true;
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                // It ended without ever writing the marker: report its status, not a hang.
-                panic!(
-                    "the child exited ({status:?}) before it reached the FIFO calls — the \
-                     marker {} was never written",
-                    marker.display()
-                );
-            }
-            if std::time::Instant::now() >= start_by {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        assert!(
-            reached,
-            "the child never reached the FIFO calls within 120 s — a startup problem on this \
-             host, not the blocking open this test guards"
+        crate::test_alone::until_or_ended("the child reaches the FIFO calls", &mut child, || {
+            marker.exists()
+        });
+        let [mut child] = child;
+        let returned = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(5),
+            || child.exited().then_some(()),
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success());
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
-                    "writerless FIFO observation blocked past the deadline: the child reached \
-                     the calls and did not return from them within 3 s"
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        assert!(
+            returned.is_some(),
+            "writerless FIFO observation blocked: the child reached the calls and did not \
+             return from them within {:?}",
+            aterm_spec::wait::MUST_HAPPEN
+        );
+        child.passed();
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2386,10 +2410,13 @@ mod tests {
                 message,
             } if message.contains("regular non-link")
         ));
-        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
-        // bound catches it and only the report latency changes. 1s is the bound this
-        // repo has already watched cross under full-suite load (cb8c0cff).
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // Refuses-without-BLOCKING: opening the FIFO for write parks FOREVER (no
+        // reader comes), so this is a hang detector, never a latency budget. 1 s
+        // crossed under full-suite load (cb8c0cff).
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the FIFO save lock parked the commit"
+        );
         assert_eq!(fs::read(&path).unwrap(), b"before");
 
         fs::remove_file(&lock_path).unwrap();
@@ -2416,8 +2443,10 @@ mod tests {
 
     /// A holder that never releases is still refused, and the loop really ran.
     /// Deliberately NO absolute wall-clock upper bound: that assertion class is the one
-    /// full-suite load has already crossed twice in this crate, and the sub-second
-    /// refusal contract is already owned by `held_save_lock_returns_busy_and_retry_commits`.
+    /// full-suite load has already crossed twice in this crate. The refusal that
+    /// must not BLOCK is `held_save_lock_returns_busy_and_retry_commits`'s, judged by
+    /// a hang detector; the budget's size is pinned without a clock by
+    /// `native_document_journal`'s `the_event_loop_budget_stays_in_the_sibling_write_lock_class`.
     #[test]
     fn a_persistent_save_lock_holder_is_refused_after_the_bounded_budget() {
         let path = unique_file("persistent-save-lock", b"before");
@@ -2425,13 +2454,14 @@ mod tests {
             ".{}.aterm-write.lock",
             path.file_name().unwrap().to_string_lossy()
         ));
-        let held = open_write_lock(&lock_path).unwrap();
-        held.lock().unwrap();
+        let held = HeldAdvisoryLock::lock(open_write_lock(&lock_path).unwrap()).unwrap();
         let probe = open_write_lock(&lock_path).unwrap();
 
         let budget = std::time::Duration::from_millis(30);
         let started = std::time::Instant::now();
-        let message = acquire_write_lock_within(&probe, budget).unwrap_err();
+        let Err(message) = acquire_write_lock_within(probe, budget) else {
+            panic!("a held save lock must be refused");
+        };
         let elapsed = started.elapsed();
 
         assert!(message.contains("busy") && message.contains("retry Save"));
@@ -2445,9 +2475,9 @@ mod tests {
     }
 
     /// The actual regression: a holder that releases INSIDE the budget is ridden out
-    /// instead of refusing the save. Budget is 30s against a 20ms hold (1500x headroom)
-    /// so no scheduler stall can turn this into a false FAIL; the bounded-refusal half
-    /// is pinned deterministically by the test above.
+    /// instead of refusing the save. The budget is a hang detector's minute against
+    /// a 20ms hold, so no scheduler stall can turn this into a false FAIL; the
+    /// bounded-refusal half is pinned deterministically by the test above.
     #[test]
     fn a_transient_save_lock_holder_is_ridden_out_instead_of_refusing_the_save() {
         let path = unique_file("transient-save-lock", b"before");
@@ -2456,14 +2486,13 @@ mod tests {
             path.file_name().unwrap().to_string_lossy()
         ));
         // Stands in for a forked child holding an inherited reference to this OFD.
-        let held = open_write_lock(&lock_path).unwrap();
-        held.lock().unwrap();
+        let held = HeldAdvisoryLock::lock(open_write_lock(&lock_path).unwrap()).unwrap();
         let probe = open_write_lock(&lock_path).unwrap();
 
         let (entered, saw_entry) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             entered.send(()).unwrap();
-            acquire_write_lock_within(&probe, std::time::Duration::from_secs(30))
+            acquire_write_lock_within(probe, aterm_spec::wait::MUST_HAPPEN)
         });
         saw_entry.recv().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -2482,8 +2511,7 @@ mod tests {
             ".{}.aterm-write.lock",
             path.file_name().unwrap().to_string_lossy()
         ));
-        let held = open_write_lock(&lock_path).unwrap();
-        held.lock().unwrap();
+        let held = HeldAdvisoryLock::lock(open_write_lock(&lock_path).unwrap()).unwrap();
 
         let started = std::time::Instant::now();
         assert!(matches!(
@@ -2493,16 +2521,20 @@ mod tests {
                 message,
             } if message.contains("busy") && message.contains("retry Save")
         ));
-        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
-        // bound catches it and only the report latency changes. 1s is the bound this
-        // repo has already watched cross under full-suite load (cb8c0cff).
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // Refuses-without-BLOCKING: a blocking `flock` on a lock nobody releases
+        // parks FOREVER, so this is a hang detector, never a latency budget; the
+        // retry budget's size is pinned by a constant, not by this clock. 1 s
+        // crossed under full-suite load (cb8c0cff).
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the held save lock parked the commit"
+        );
         assert_eq!(fs::read(&path).unwrap(), b"before");
 
-        // Released by LOCK_UN, not by the close alone: a fork's copy outlives the
-        // close until its exec (measured up to 523 ms here), and the retry's
-        // preflight gives up after 500 ms (the fd-copy sweep of 2026-09-27).
-        held.unlock().expect("release the write lock");
+        // Released by LOCK_UN (the guard's drop), not by the close alone: a fork's
+        // copy outlives the close until its exec (measured up to 523 ms here), and
+        // the retry's preflight gives up after 500 ms (the fd-copy sweep of
+        // 2026-09-27).
         drop(held);
         assert!(matches!(
             commit_atomic_bytes(&contents.baseline, b"after"),
@@ -2535,9 +2567,9 @@ mod tests {
         // Released by `LOCK_UN` (the guard's drop) while the forked copy lives.
         drop(held);
 
-        let next = open_write_lock(&lock_path).unwrap();
+        let next = HeldAdvisoryLock::try_lock(open_write_lock(&lock_path).unwrap());
         assert!(
-            next.try_lock().is_ok(),
+            next.is_ok(),
             "the save lock outlived its hold on the forked copy of its description"
         );
         drop(next);
@@ -2885,8 +2917,13 @@ mod tests {
             ".{}.aterm-write.lock",
             path.file_name().unwrap().to_string_lossy()
         ));
-        let holder = open_write_lock(&lock_path).unwrap();
-        acquire_write_lock(&holder).unwrap();
+        // The holder lets go by `LOCK_UN` (the guard's drop), not by the close
+        // alone: a child a sibling test forks while it holds the lock keeps a copy
+        // of its description until it execs — up to 523 ms at the measured tail,
+        // past the 500 ms preflight retry this test sizes `HELD` against — and a
+        // close-only release left the lock held there, so the save read busy for a
+        // holder that had let go.
+        let holder = acquire_write_lock(open_write_lock(&lock_path).unwrap()).unwrap();
         // Taken BEFORE the spawn: the release is then at or after `started +
         // HELD` by construction, so `waited >= HELD` below is exact.
         let started = std::time::Instant::now();
@@ -3217,43 +3254,33 @@ mod tests {
             return;
         }
 
-        let test_name = std::thread::current()
-            .name()
-            .expect("test harness names the current test")
-            .to_string();
         let root =
             std::env::temp_dir().join(format!("aterm-config-process-race-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let path = root.join("aterm.toml");
         fs::write(&path, "winner = \"none\"\n").unwrap();
-        let mut children = Vec::new();
-        for role in ["manual", "settings"] {
-            children.push(
-                std::process::Command::new(std::env::current_exe().unwrap())
-                    .arg("--exact")
-                    .arg(&test_name)
-                    .arg("--nocapture")
+        // Each racer is this very test as a stand-in, which must run exactly
+        // this test and pass it.
+        let mut children: Vec<_> = ["manual", "settings"]
+            .into_iter()
+            .map(|role| {
+                let mut child = crate::test_alone::StandIn::this_test();
+                child
+                    .command()
                     .env(CHILD, role)
-                    .env("ATERM_CONFIG_COMMIT_TEST_PATH", &path)
-                    .spawn()
-                    .unwrap(),
-            );
-        }
-        let deadline = std::time::Instant::now() + HANG;
-        while ["manual", "settings"]
-            .iter()
-            .any(|role| !root.join(format!("ready-{role}")).exists())
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "children never reached barrier"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+                    .env("ATERM_CONFIG_COMMIT_TEST_PATH", &path);
+                child.spawn()
+            })
+            .collect();
+        crate::test_alone::until_or_ended("both racers reach the barrier", &mut children, || {
+            ["manual", "settings"]
+                .iter()
+                .all(|role| root.join(format!("ready-{role}")).exists())
+        });
         fs::write(root.join("go"), b"go").unwrap();
-        for mut child in children {
-            assert!(child.wait().unwrap().success());
+        for child in children {
+            child.passed();
         }
         let results = ["manual", "settings"]
             .map(|role| fs::read_to_string(root.join(format!("result-{role}"))).unwrap());

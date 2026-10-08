@@ -29,14 +29,16 @@ const ROWS: usize = 2;
 const COLS: usize = 4;
 
 /// The renderer at `line_height` (1.0 is the default cell box).
-fn renderer(line_height: f32) -> Option<Renderer> {
-    Renderer::from_system(18.0, Theme::default()).map(|mut r| {
-        // Deterministic pixels: block on the lazy fallback parses so a parse
-        // landing between two renders cannot recolour a frame.
-        r.debug_block_on_lazy_fallbacks();
-        r.set_line_height(line_height);
-        r
-    })
+fn renderer(line_height: f32) -> Renderer {
+    Renderer::from_system(18.0, Theme::default())
+        .map(|mut r| {
+            // Deterministic pixels: block on the lazy fallback parses so a parse
+            // landing between two renders cannot recolour a frame.
+            r.debug_block_on_lazy_fallbacks();
+            r.set_line_height(line_height);
+            r
+        })
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// `text` at row 1, column 0, cursor hidden. Row 0 stays empty: it is the band
@@ -68,10 +70,7 @@ fn band(rend: &Renderer) -> (usize, usize) {
 #[test]
 fn second_above_mark_is_lifted_and_stays_in_the_band() {
     for line_height in [1.0, 2.0] {
-        let Some(mut rend) = renderer(line_height) else {
-            eprintln!("SKIP: no system monospace font");
-            return;
-        };
+        let mut rend = renderer(line_height);
         let bare = frame(&mut rend, "e");
         let one = frame(&mut rend, "e\u{0301}");
         let two = frame(&mut rend, "e\u{0301}\u{0301}");
@@ -110,10 +109,7 @@ fn second_above_mark_is_lifted_and_stays_in_the_band() {
 
 #[test]
 fn a_whole_lift_leaves_an_ink_free_row_and_the_first_mark_untouched() {
-    let Some(mut rend) = renderer(2.0) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer(2.0);
     let bare = frame(&mut rend, "e");
     let one = frame(&mut rend, "e\u{0301}");
     let two = frame(&mut rend, "e\u{0301}\u{0301}");
@@ -138,10 +134,7 @@ fn a_whole_lift_leaves_an_ink_free_row_and_the_first_mark_untouched() {
 
 #[test]
 fn acute_over_circumflex_are_two_separate_bands() {
-    let Some(mut rend) = renderer(2.0) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer(2.0);
     let bare = frame(&mut rend, "e");
     let rows = differing_rows(&frame(&mut rend, "e\u{0302}\u{0301}"), &bare);
     eprintln!("circumflex + acute rows {rows:?}");
@@ -157,10 +150,7 @@ fn acute_over_circumflex_are_two_separate_bands() {
 #[test]
 fn second_below_mark_is_dropped_as_far_as_the_descent_allows() {
     for line_height in [1.0, 2.0] {
-        let Some(mut rend) = renderer(line_height) else {
-            eprintln!("SKIP: no system monospace font");
-            return;
-        };
+        let mut rend = renderer(line_height);
         let bare = frame(&mut rend, "e");
         let rows_one = differing_rows(&frame(&mut rend, "e\u{0323}"), &bare);
         let rows_two = differing_rows(&frame(&mut rend, "e\u{0323}\u{0323}"), &bare);
@@ -207,10 +197,7 @@ fn second_below_mark_is_dropped_as_far_as_the_descent_allows() {
 /// visible in the log rather than silently making the sibling tests vacuous.
 #[test]
 fn the_stack_is_placed_by_ink_not_by_the_reported_raster_box() {
-    let Some(mut rend) = renderer(2.0) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut rend = renderer(2.0);
     let key = rend.glyph_key('\u{0323}');
     let img = rend.glyph_image(key);
     let (gh, ymin) = (img.height() as i32, img.ymin());

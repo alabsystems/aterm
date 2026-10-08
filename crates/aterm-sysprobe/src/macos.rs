@@ -171,19 +171,7 @@ fn rusage_of(pid: i32, numer: u32, denom: u32) -> Usage {
 
 /// One process's parent, uid and `comm`.
 fn ident(pid: i32) -> Option<Ident> {
-    // SAFETY: plain integers and bytes; all-zero is valid.
-    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is writable for `SHORT_INFO_SIZE` bytes, the size passed.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDT_SHORTBSDINFO,
-            0,
-            (&raw mut info).cast::<c_void>(),
-            SHORT_INFO_SIZE as c_int,
-        )
-    };
-    (usize::try_from(n).ok() == Some(SHORT_INFO_SIZE)).then(|| Ident {
+    short_info(pid).map(|info| Ident {
         ppid: info.pbsi_ppid,
         uid: info.pbsi_uid,
         comm: c_text(&info.pbsi_comm),
@@ -220,10 +208,30 @@ pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
 /// One process's executable path, read into a [`PATH_CAP`] buffer.
 fn path(pid: i32) -> Option<String> {
     let mut buf = [0u8; PATH_CAP];
+    let n = path_into(pid, &mut buf)?;
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// One process's executable path as the kernel holds it (`proc_pidpath`),
+/// bytes intact; `None` when the call is refused (the process is gone or not
+/// ours) or answers no absolute path.
+pub(crate) fn process_path(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    let mut buf = [0u8; PATH_CAP];
+    let n = path_into(pid, &mut buf)?;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&buf[..n]));
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
+/// `proc_pidpath` into `buf`: the length it wrote, `None` when it wrote none.
+fn path_into(pid: i32, buf: &mut [u8; PATH_CAP]) -> Option<usize> {
     // SAFETY: `buf` is writable for `PATH_CAP` bytes, the size passed.
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast::<c_void>(), PATH_CAP as u32) };
-    let n = usize::try_from(n).ok().filter(|n| *n > 0)?;
-    Some(String::from_utf8_lossy(&buf[..n.min(PATH_CAP)]).into_owned())
+    usize::try_from(n)
+        .ok()
+        .filter(|n| *n > 0)
+        .map(|n| n.min(PATH_CAP))
 }
 
 /// `NSProcessInfo` `thermalState` and `isLowPowerModeEnabled`.
@@ -249,6 +257,143 @@ fn heat_and_power() -> (Option<crate::Thermal>, Option<bool>) {
             (thermal, low)
         }
     })
+}
+
+/// `PROC_PGRP_ONLY` (`sys/proc_info.h`): `proc_listpids`' filter for the
+/// members of one process group.
+const PROC_PGRP_ONLY: u32 = 2;
+
+unsafe extern "C" {
+    /// libproc's `proc_listpids` (`libproc.h`): the pids `kind`/`typeinfo`
+    /// select, written into `buffer`; returns the number of BYTES written
+    /// (`proc_listallpids`, which the first-party `libc` declares, returns a
+    /// count). Declared here because the first-party `libc` does not.
+    fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: c_int) -> c_int;
+}
+
+/// One process's short BSD info, whole or `None`.
+fn short_info(pid: i32) -> Option<ProcBsdShortInfo> {
+    // SAFETY: plain integers and bytes; all-zero is valid.
+    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is writable for `SHORT_INFO_SIZE` bytes, the size passed.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&raw mut info).cast::<c_void>(),
+            SHORT_INFO_SIZE as c_int,
+        )
+    };
+    (usize::try_from(n).ok() == Some(SHORT_INFO_SIZE) && info.pbsi_pid == pid.unsigned_abs())
+        .then_some(info)
+}
+
+/// [`crate::group_memory`] on macOS: `pid`'s group from its short info, the
+/// group's members from `proc_listpids(PROC_PGRP_ONLY)` (at most
+/// [`crate::MAX_GROUP_PIDS`]), each one's footprint from `proc_pid_rusage`.
+/// A member gone or refused meanwhile is skipped; a group none of whose
+/// members could be measured is `None`.
+pub(crate) fn group_memory(pid: u32) -> Option<crate::GroupMemory> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    let pgid = short_info(pid)?.pbsi_pgid;
+    if pgid == 0 {
+        return None;
+    }
+    let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
+    let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call
+    // returns how many bytes it wrote.
+    let n = unsafe { proc_listpids(PROC_PGRP_ONLY, pgid, pids.as_mut_ptr().cast(), bytes) };
+    let n = usize::try_from(n).ok()? / std::mem::size_of::<c_int>();
+    let (mut kib, mut measured) = (0u64, 0u32);
+    for &member in pids.iter().take(n.min(crate::MAX_GROUP_PIDS)) {
+        if member <= 0 {
+            continue;
+        }
+        if let Usage::Measured { footprint_kib, .. } = rusage_of(member, 1, 1) {
+            kib = kib.saturating_add(footprint_kib);
+            measured += 1;
+        }
+    }
+    (measured > 0).then_some(crate::GroupMemory {
+        pgid,
+        footprint_mib: kib / 1024,
+        measured,
+    })
+}
+
+/// [`crate::physical_memory_mib`] on macOS: `hw.memsize`.
+pub(crate) fn physical_memory_mib() -> Option<u64> {
+    sysctl_int(c"hw.memsize")
+        .and_then(|b| u64::try_from(b).ok())
+        .map(|b| b >> 20)
+        .filter(|mib| *mib > 0)
+}
+
+/// [`crate::memory_pressure`] on macOS.
+pub(crate) fn memory_pressure() -> Option<crate::MemoryLevel> {
+    sysctl_int(c"kern.memorystatus_vm_pressure_level").and_then(pressure_of)
+}
+
+/// One `host_statistics64(HOST_VM_INFO64)` of the host; `None` where the
+/// kernel refused it.
+fn vm_statistics() -> Option<libc::vm_statistics64> {
+    // SAFETY: all-integer struct; all-zero is valid.
+    let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    // Upstream's count IS this layout's size in words (38, rev1), so the
+    // kernel writes nothing past it (see the struct's note in `libc`).
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: `vm` is writable for `count` words, the count passed in.
+    let kr = unsafe {
+        libc::host_statistics64(
+            host_port(),
+            libc::HOST_VM_INFO64,
+            (&raw mut vm).cast::<libc::integer_t>(),
+            &raw mut count,
+        )
+    };
+    (kr == 0).then_some(vm)
+}
+
+/// [`crate::machine_memory`] on macOS: one `HOST_VM_INFO64` read, sized by
+/// `vm.pagesize`.
+pub(crate) fn machine_memory() -> Option<crate::MachineMemory> {
+    let page_bytes = sysctl_int(c"vm.pagesize").and_then(|b| u64::try_from(b).ok())?;
+    let vm = vm_statistics()?;
+    let available_mib = crate::available_mib_of(
+        u64::from(vm.free_count),
+        u64::from(vm.inactive_count),
+        u64::from(vm.purgeable_count),
+        page_bytes,
+        physical_memory_mib(),
+    )?;
+    let used_mib = crate::used_mib_of(
+        u64::from(vm.internal_page_count),
+        u64::from(vm.purgeable_count),
+        u64::from(vm.wire_count),
+        u64::from(vm.compressor_page_count),
+        page_bytes,
+    )?;
+    Some(crate::MachineMemory {
+        available_mib,
+        used_mib: u64::from(used_mib),
+    })
+}
+
+/// [`crate::swapped_kib`] on macOS: `HOST_VM_INFO64`'s swapins plus
+/// swapouts, in `vm.pagesize` pages, as KiB.
+pub(crate) fn swapped_kib() -> Option<u64> {
+    let page_kib = sysctl_int(c"vm.pagesize")
+        .and_then(|b| u64::try_from(b).ok())
+        .map(|b| b / 1024)
+        .filter(|k| *k > 0)?;
+    let vm = vm_statistics()?;
+    Some(
+        vm.swapins
+            .saturating_add(vm.swapouts)
+            .saturating_mul(page_kib),
+    )
 }
 
 /// The macOS samplers.
@@ -320,23 +465,9 @@ impl Mac {
 
     /// Pages swapped in plus out since boot, and memory in use (MiB).
     fn vm_info(&self) -> (Option<u64>, Option<u32>) {
-        // SAFETY: all-integer struct; all-zero is valid.
-        let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
-        // Upstream's count IS this layout's size in words (38, rev1), so the
-        // kernel writes nothing past it (see the struct's note in `libc`).
-        let mut count = libc::HOST_VM_INFO64_COUNT;
-        // SAFETY: `vm` is writable for `count` words, the count passed in.
-        let kr = unsafe {
-            libc::host_statistics64(
-                self.host,
-                libc::HOST_VM_INFO64,
-                (&raw mut vm).cast::<libc::integer_t>(),
-                &raw mut count,
-            )
-        };
-        if kr != 0 {
+        let Some(vm) = vm_statistics() else {
             return (None, None);
-        }
+        };
         let (i, o) = (vm.swapins, vm.swapouts);
         let used = used_mib_of(
             u64::from(vm.internal_page_count),

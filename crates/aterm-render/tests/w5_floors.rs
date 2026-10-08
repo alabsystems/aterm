@@ -11,21 +11,19 @@
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{
-    DefaultBgSpan, Renderer, Theme, floor_cursor_fill, floor_min_contrast_fg, underline_rects,
+    DefaultBgSpan, Renderer, Theme, floor_cursor_fill, floor_min_contrast_fg, underline_rects_into,
 };
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// An OSC-12-style cursor colour EQUAL to the cell bg: invisible with the knob
 /// off (byte-identical pre-W5 behavior), floored to a visible fill with it on.
 #[test]
 fn block_cursor_near_bg_is_floored_visible() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let mut term = Terminal::new(2, 4);
     // Steady block; one space cell with bg #202020; cursor back on it (CUP).
@@ -66,10 +64,7 @@ fn block_cursor_near_bg_is_floored_visible() {
 
 #[test]
 fn sparse_block_cursor_uses_its_pane_default_for_contrast() {
-    let Some(mut renderer) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut renderer = renderer();
     let (cw, ch) = renderer.cell_size();
     let (rows, cols) = (2usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -104,10 +99,7 @@ fn sparse_block_cursor_uses_its_pane_default_for_contrast() {
 /// and stays raw (byte-identical) when it is off.
 #[test]
 fn underline_routes_through_the_min_contrast_floor() {
-    let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let mut term = Terminal::new(2, 8);
     // Cell bg #202020 with an underlined fg only slightly lighter — legible to
@@ -117,7 +109,9 @@ fn underline_routes_through_the_min_contrast_floor() {
     let fg = 0x0030_3030u32;
     let bg = 0x0020_2020u32;
 
-    let rects = underline_rects(
+    let mut rects = Vec::new();
+    underline_rects_into(
+        &mut rects,
         aterm_core::terminal::UnderlineStyle::Single,
         0,
         0,

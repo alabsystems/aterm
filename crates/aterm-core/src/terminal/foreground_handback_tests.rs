@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tests for [`Terminal::foreground_handback`] — the 2026-09-25 "crashed tab"
-//! (a Claude Code killed while it held the terminal left alt screen, kitty
-//! flags, modifyOtherKeys, mouse tracking, focus, 2026 and a hidden cursor
-//! armed under the shell that reclaimed it).
+//! Tests for [`Terminal::foreground_handback`]: a program killed while it held
+//! the terminal (alt screen, kitty flags, modifyOtherKeys, mouse tracking,
+//! focus, 2026, a hidden cursor) must not leave those modes armed under the
+//! shell that reclaims it.
 
 use aterm_types::keyboard::{Key, Modifiers, encode_key};
 use aterm_types::mouse::{MouseEncoding, MouseMode};
@@ -17,9 +17,9 @@ fn ctrl7(t: &Terminal) -> Vec<u8> {
     encode_key(&Key::Character('7'), Modifiers::CTRL, t.keyboard_mode())
 }
 
-/// The owner's hand-typed reproduction of the incident, in either kitty order
-/// (push after entering the alt screen, as Claude Code does, or before it).
-/// Ends mid-OSC (a title write torn by the kill).
+/// A killed Claude Code session's terminal, in either kitty order (push after
+/// entering the alt screen, as Claude Code does, or before it). Ends mid-OSC (a
+/// title write torn by the kill).
 fn dead_claude(push_after: bool) -> Terminal {
     let mut t = Terminal::new(24, 80);
     t.process(b"% claude\r\n");
@@ -38,7 +38,7 @@ fn dead_claude(push_after: bool) -> Terminal {
 fn projection(t: &Terminal) -> impl PartialEq + core::fmt::Debug + use<> {
     let region = t.grid().scroll_region();
     let mut kitty = t.kitty_keyboard.snapshot();
-    // The INACTIVE alt slot is never touched (plan R7); after an alt round trip
+    // The inactive alt slot is never touched; after an alt round trip
     // it reads `Some(0)` where a fresh terminal reads `None` — the same flags.
     if kitty.alt_saved_flags.is_some_and(|f| f.bits() == 0) {
         kitty.alt_saved_flags = None;
@@ -128,7 +128,11 @@ fn foreground_handback_incident_is_handed_back_once_in_both_kitty_orders() {
         // The shell's own post-reclaim setup lands after the handback and wins.
         t.process(b"zsh: killed     claude\r\n% \x1b[?2004h");
         assert!(t.modes().bracketed_paste, "zle's 2004h survives");
-        assert!(!t.program_owns_terminal());
+        assert_eq!(
+            t.program_evidence(),
+            super::evidence::BRACKETED_PASTE,
+            "only zle's own 2004 is left, which the host gives the live shell"
+        );
     }
 }
 
@@ -146,6 +150,7 @@ fn foreground_handback_single_evidence_modes_each_open_the_gate() {
         b"\x1b[?2048h",
         b"\x1b[?2031h",
         b"\x1b[?1004h",
+        b"\x1b[?2004h",
         b"\x1b[>1u",
         b"\x1b[=1u",
         b"\x1b[>4;1m",
@@ -335,10 +340,8 @@ fn foreground_handback_replays_to_the_live_state() {
     }
 }
 
-/// 2026-09-25 review: every handback used to emit `?1007l` whenever 1007 was
-/// on, so aterm-gui's default-ON alternate scroll (Audit M5) was lost at the
-/// first handback and the wheel stopped scrolling `less` for good. 1007 now
-/// goes back to the HOST's value.
+/// A handback returns mode 1007 (alternate scroll) to the host's value rather
+/// than resetting it, so the wheel keeps scrolling `less`.
 #[test]
 fn foreground_handback_restores_alternate_scroll_to_the_host_value() {
     // The host turned 1007 on; a program that never touched it died hidden.
@@ -358,13 +361,13 @@ fn foreground_handback_restores_alternate_scroll_to_the_host_value() {
     );
     assert!(t.modes().alternate_scroll, "the host's ON survives");
 
-    // A program switched it off and died: it comes back ON.
+    // A program switched it off and died: it comes back on.
     t.process(b"\x1b[?1007l\x1b[?1049h");
     let h = t.foreground_handback().expect("alt screen");
     assert!(h.reverted.contains(&"alternate-scroll"), "{:?}", h.reverted);
     assert!(t.modes().alternate_scroll);
 
-    // With no host baseline the power-on OFF is the target, as before.
+    // With no host baseline the power-on off is the target, as before.
     let mut t = Terminal::new(24, 80);
     t.process(b"\x1b[?1007h\x1b[?25l");
     t.foreground_handback().expect("hidden cursor");
@@ -394,13 +397,10 @@ fn foreground_handback_scoped_without_modes_only_cancels_a_torn_sequence() {
     );
 }
 
-/// Kitty flags pushed on the MAIN screen before `?1049h` are the program's
-/// input bit even while the alt screen hides them (final review of the
-/// handback, 2026-09-25). A program that pushed, entered the alt screen and
-/// died with no other input mode was reported as owning display bits only,
-/// so it was not handed back; the flags came back live when the shell left
-/// the alt screen with a builtin, and Ctrl+7 reached the prompt as CSI-u.
-/// NEGATIVE CONTROL: the same program that never pushed owns no input bit.
+/// Kitty flags pushed on the main screen before `?1049h` count as the
+/// program's input bit even while the alt screen hides them, so a program that
+/// pushed, entered the alt screen and died is handed back. Negative control:
+/// the same program without the push owns no input bit.
 #[test]
 fn foreground_handback_main_screen_kitty_flags_under_the_alt_screen_are_evidence() {
     let mut t = Terminal::new(24, 80);
@@ -423,17 +423,37 @@ fn foreground_handback_main_screen_kitty_flags_under_the_alt_screen_are_evidence
     );
 }
 
+/// PG1 (docs/AUDIT-side-effects-2026-10-07.md): a `cat` of a file at a prompt
+/// that does not parse the brackets (macOS `/bin/bash` 3.2, dash) plants the
+/// clipboard with OSC 52 and arms 2004. Left on, the next Cmd-V skipped the
+/// multi-line paste guard, and bash ran every pasted line. The `?2004h` is an
+/// input bit, so `cat`'s exit hands it back.
+#[test]
+fn foreground_handback_a_one_shot_that_armed_bracketed_paste_is_handed_back() {
+    let mut t = Terminal::new(24, 80);
+    t.process(b"bash-3.2$ ");
+    assert_eq!(t.take_evidence_asserted(), 0);
+    // OSC 52 with "true\ntouch /tmp/x\n", then the 2004 the reader never asked for.
+    t.process(b"\x1b]52;c;dHJ1ZQp0b3VjaCAvdG1wL3gK\x07\x1b[?2004hREADME\r\n");
+    assert_ne!(
+        t.take_evidence_asserted() & super::evidence::INPUT,
+        0,
+        "?2004h asserts an input bit"
+    );
+    let h = t.foreground_handback().expect("the gone one-shot's 2004");
+    assert_eq!(h.reverted, vec!["paste"]);
+    assert!(!t.modes().bracketed_paste);
+}
+
 // ---------------------------------------------------------------------------
-// THE MANUAL RESET (2026-09-26): `Terminal::manual_handback`, the engine half
-// of the `reset` control verb and Edit ▸ Reset Terminal.
+// The manual reset: `Terminal::manual_handback`, the engine half of the
+// `reset` control verb and Edit ▸ Reset Terminal.
 // ---------------------------------------------------------------------------
 
-/// The live session the 2026-09-26 audit found (window pid 6874, sid 0 at
-/// `~/publication`): a zsh prompt drawn under the incident's modes, armed
-/// before the automatic handback existed, so the only holder the reader ever
-/// saw was the live zsh. Scrollback first, so the test can prove the reset
-/// never touches it; the second value is the main screen's scrollback line
-/// count before the modes were armed (the alt screen has none of its own).
+/// A live zsh prompt drawn under a dead program's modes, where the only holder
+/// the reader sees is the live shell. Returns the terminal and the main
+/// screen's scrollback line count before the modes were armed, so tests can
+/// prove the reset never touches the scrollback.
 fn stuck_live_prompt() -> (Terminal, usize) {
     let sb = aterm_scrollback::Scrollback::new(64, 512, 8_000_000);
     let mut t = Terminal::with_scrollback(24, 80, 64, sb);
@@ -447,9 +467,9 @@ fn stuck_live_prompt() -> (Terminal, usize) {
 }
 
 /// A shifted charset, an open OSC 8 link and a torn escape sequence carry no
-/// evidence at all: the automatic handback cannot reach them, the manual one
-/// hands every one back. NEGATIVE CONTROL built in: the gated path on an
-/// identical terminal sends only the torn sequence's `CAN`.
+/// evidence: the automatic handback cannot reach them, the manual one hands
+/// each back. Negative control: the gated path on an identical terminal sends
+/// only the torn sequence's `CAN`.
 #[test]
 fn manual_handback_reaches_what_the_evidence_gate_cannot() {
     let arm = |t: &mut Terminal| {
@@ -546,17 +566,14 @@ fn manual_handback_is_idempotent_and_replays_to_the_live_state() {
     );
 }
 
-/// The ASSERTED evidence (2026-09-27, the handback lane under load 59-65):
-/// every setter of an evidence bit is reported, even over a mode already in
-/// force, and each call takes what it reports. The host gives a re-armed bit
-/// to the group that re-armed it; before, a job that armed mouse tracking
-/// over a stale `?1000h` was invisible (the evidence stayed `MOUSE`), so it
-/// never owned the bit and its death handed nothing back.
+/// Every setter of an evidence bit is reported, even over a mode already in
+/// force, and each call takes what it reports, so a job that re-arms mouse
+/// tracking over a stale `?1000h` owns the bit and its death hands it back.
 #[test]
 fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
     use super::evidence::{
-        ALT_SCREEN, COLOR_SCHEME_REPORTS, CURSOR_HIDDEN, FOCUS, FORMAT_OTHER_KEYS, KITTY,
-        MODIFY_OTHER_KEYS, MOUSE, SIZE_REPORTS, SYNC, VT52,
+        ALT_SCREEN, BRACKETED_PASTE, COLOR_SCHEME_REPORTS, CURSOR_HIDDEN, FOCUS, FORMAT_OTHER_KEYS,
+        KITTY, MODIFY_OTHER_KEYS, MOUSE, SIZE_REPORTS, SYNC, VT52,
     };
     let mut t = Terminal::new(24, 80);
     assert_eq!(
@@ -591,6 +608,7 @@ fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
         (b"\x1b[?2048h", SIZE_REPORTS),
         (b"\x1b[?2031h", COLOR_SCHEME_REPORTS),
         (b"\x1b[?1004h", FOCUS),
+        (b"\x1b[?2004h", BRACKETED_PASTE),
         (b"\x1b[>1u", KITTY),
         (b"\x1b[>0u", KITTY),
         (b"\x1b[=5;1u", KITTY),
@@ -610,14 +628,14 @@ fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
         ALT_SCREEN | MOUSE | CURSOR_HIDDEN
     );
 
-    // NEGATIVE CONTROL: disarms, a kitty pop, a kitty set to zero flags, a
+    // Negative control: disarms, a kitty pop, a kitty set to zero flags, a
     // zero modifyOtherKeys and evidence-free modes assert nothing.
     let mut t = Terminal::new(24, 80);
     t.process(b"\x1b[?1049h\x1b[>1u\x1b[?1003h\x1b[>4;2m");
     t.take_evidence_asserted();
     t.process(
         b"\x1b[?1003l\x1b[?1000l\x1b[?1049l\x1b[?25h\x1b[?2026l\x1b[<u\x1b[=0;1u\x1b[>4;0m\
-          \x1b[>4m\x1b[>4;0f\x1b[?2004h\x1b[?1006h\x1b[?1h\x1b=\x1b[?7l\x1b[?1007h",
+          \x1b[>4m\x1b[>4;0f\x1b[?2004l\x1b[?1006h\x1b[?1h\x1b=\x1b[?7l\x1b[?1007h",
     );
     assert_eq!(t.take_evidence_asserted(), 0);
 }

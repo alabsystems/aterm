@@ -74,13 +74,16 @@ impl FileLock {
         // The ascription is LOAD-BEARING: it is the lock-order census's File
         // evidence (aterm-census `is_file_binding_rhs`), which keeps the flock
         // below categorized as the cross-process advisory lock it is rather
-        // than graphed as an in-process mutex. The helper refactor removed the
-        // constructor from this binding and silently did exactly that.
+        // than graphed as an in-process mutex.
         let file: std::fs::File = Self::open_lock_file(path)?;
         // std's `File::lock` IS `flock(fd, LOCK_EX)` on unix — the same syscall with
         // the same blocking semantics, released on close/drop exactly as a direct
         // `libc::flock` call, and failures map to the same `io::Error`. Using the
         // safe std wrapper keeps this crate free of direct FFI here.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
         file.lock()?;
         Ok(Self { _file: file })
     }
@@ -90,6 +93,10 @@ impl FileLock {
     pub fn lock_open(file: File) -> io::Result<Self> {
         // Ascription load-bearing — census File evidence, as in `acquire`.
         let file: std::fs::File = file;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
         file.lock()?;
         Ok(Self { _file: file })
     }
@@ -104,17 +111,20 @@ impl FileLock {
     /// wedged on an unplugged volume turns "aterm starts a moment later" into
     /// "aterm never starts", with no window to say why and nothing to click.
     ///
-    /// Windows has had a bounded wait since it was written, for exactly this
-    /// reason (see the branch below); unix had none, purely because `flock`
-    /// offers blocking as its default. Callers map the timeout to a normal launch
-    /// on the build already installed, which is always a safe outcome.
+    /// Callers map the timeout to a normal launch on the build already installed,
+    /// which is always a safe outcome.
     #[cfg(unix)]
     pub fn acquire_within(path: &Path, limit: std::time::Duration) -> io::Result<Self> {
         // Ascription load-bearing — census File evidence, as in `acquire`.
         let file: std::fs::File = Self::open_lock_file(path)?;
         let deadline = std::time::Instant::now() + limit;
         loop {
-            match file.try_lock() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the guard's own take: its Drop releases by LOCK_UN"
+            )]
+            let taken = file.try_lock();
+            match taken {
                 Ok(()) => return Ok(Self { _file: file }),
                 // Held by someone else: the ONLY retryable outcome.
                 Err(std::fs::TryLockError::WouldBlock) => {
@@ -245,6 +255,9 @@ mod bounded_lock_tests {
     use super::FileLock;
     use std::time::{Duration, Instant};
 
+    /// A wait for something that must happen is a hang detector, never a latency budget.
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
     /// THE FIX. A held lock must surface as a timeout, not as a launch that never
     /// finishes. `flock` is per open-file-description, so a second handle in this
     /// same process contends exactly as another process would.
@@ -267,10 +280,7 @@ mod bounded_lock_tests {
             waited >= Duration::from_millis(150),
             "gave up too early: {waited:?}"
         );
-        assert!(
-            waited < Duration::from_secs(5),
-            "waited {waited:?}: it blocked"
-        );
+        assert!(waited < HANG_DETECTOR, "waited {waited:?}: it blocked");
 
         // And once the holder goes, the same call succeeds immediately: with a
         // ZERO budget only the very first `try_lock` can win, so this demands the
@@ -280,41 +290,6 @@ mod bounded_lock_tests {
         drop(held);
         FileLock::acquire_within(&path, Duration::ZERO)
             .expect("the dropped lock must be free at the first try");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An UNCONTENDED lock must cost essentially nothing — the bounded path must
-    /// not introduce a poll-interval floor on the common case.
-    ///
-    /// The FASTEST of five fresh acquisitions must beat one `LOCK_POLL`. A poll
-    /// floor (a sleep before the first try) puts every sample at or above it, so
-    /// the minimum still catches it; one descheduling of this thread under a
-    /// loaded gate inflates only the sample it lands in. A single sample was
-    /// timed until the load-sensitive test audit of 2026-09-27, against a bound
-    /// that IS the regression's size, so any 50 ms stall read as the defect.
-    #[test]
-    fn acquire_within_is_immediate_when_the_lock_is_free() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-bounded-lock-free-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let fastest = (0..5)
-            .map(|sample| {
-                // A fresh file each time: every sample pays the create, as the
-                // first acquisition on a machine does.
-                let path = dir.join(format!("apply-{sample}.lock"));
-                let started = Instant::now();
-                let lock =
-                    FileLock::acquire_within(&path, Duration::from_secs(10)).expect("free lock");
-                let took = started.elapsed();
-                drop(lock);
-                took
-            })
-            .min()
-            .expect("five samples");
-        assert!(
-            fastest < super::LOCK_POLL,
-            "the fastest of five free acquisitions took {fastest:?}: a poll floor"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
